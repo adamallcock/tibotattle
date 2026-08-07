@@ -380,7 +380,9 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
   assertSameOrigin(request);
   const mode = configuredEnrollmentMode(env);
   assertAdmissionBindings(env);
-  if (mode === "disabled") throw new ApiError(503, "ENROLLMENT_DISABLED");
+  // "disabled" pauses NEW participation only. An identity that already links
+  // to a participant reattaches below without creating anything, so the
+  // refusal moves to the fresh-enrollment fall-through instead of the door.
   await assertCollectionControl(env.USAGE_MONITOR_DB, "enrollment");
   await assertAttemptAllowed(
     env.ENROLLMENT_RATE_LIMIT,
@@ -479,6 +481,9 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
       { deviceBootstrap: deviceBootstrapRequested },
     )
     : null;
+  if (reattached === null && mode === "disabled") {
+    throw new ApiError(503, "ENROLLMENT_DISABLED");
+  }
   const inviteGrant = reattached === null && mode === "invite_only"
     ? await parseInviteGrant(Reflect.get(body.value, "inviteCode"))
     : null;
@@ -585,16 +590,13 @@ const SIGNIN_NOT_COMPLETED_MESSAGE =
 const SIGNIN_CALLBACK_APP_OPEN_URL = "usagemonitor://open";
 
 /**
- * A disabled enrollment mode is an explicit release/incident containment
- * state, not merely a final rejection at the enrollment write. Refuse before
- * allocating a handoff row or redirecting a person to a provider: otherwise a
- * disabled production service would still consume the global admission budget
- * and lead people through an OAuth ceremony it cannot complete.
+ * A disabled enrollment mode pauses NEW participation only; an existing
+ * participant's identity reattaches through this same OAuth ceremony, so the
+ * ceremony must stay open while the mode is disabled. The fresh-enrollment
+ * refusal happens at the enrollment write, after the reattach check.
  */
 async function assertHostedSignInStartAllowed(env: Env): Promise<void> {
-  if (configuredEnrollmentMode(env) === "disabled") {
-    throw new ApiError(503, "ENROLLMENT_DISABLED");
-  }
+  configuredEnrollmentMode(env);
   // The collection control is the other operator containment switch. Check it
   // before an edge budget, coordinated admission slot, or provider redirect so
   // a temporarily paused service cannot create stranded OAuth handoffs.

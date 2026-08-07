@@ -5307,6 +5307,39 @@ describe("synthetic usage monitor service", () => {
       }
     });
 
+    it("reattaches an existing identity under disabled mode and refuses a new one", async () => {
+      // Disabled mode pauses NEW participation only: an identity already
+      // linked to a participant signs back in and reattaches; an identity
+      // with no link is refused at the enrollment write.
+      const linkKey = await sha256Hex("test-hosted-identity\0disabled-reattach");
+      const first = await identityEnroll(linkKey);
+      expect(first.status).toBe(201);
+      const firstBody = await first.json<{ participantId: string }>();
+
+      const disabledEnv = identityBindings({
+        ENROLLMENT_MODE: "disabled",
+      } as unknown as Partial<Env>);
+      const reattached = await identityEnroll(linkKey, "google", disabledEnv);
+      expect(reattached.status).toBe(201);
+      const reattachedBody = await reattached.json<{ participantId: string }>();
+      expect(reattachedBody.participantId).toBe(firstBody.participantId);
+
+      const fresh = await identityEnroll(
+        await sha256Hex("test-hosted-identity\0disabled-new-identity"),
+        "google",
+        disabledEnv,
+      );
+      expect(fresh.status).toBe(503);
+      await expect(fresh.json()).resolves.toMatchObject({
+        error: { code: "ENROLLMENT_DISABLED" },
+      });
+
+      const count = await testBindings().USAGE_MONITOR_DB.prepare(
+        "SELECT COUNT(*) AS total FROM participants",
+      ).first<{ total: number }>();
+      expect(count?.total).toBe(1);
+    });
+
     it("refuses reattachment during deletion and unlinks after deletion", async () => {
       const subject = "google-subject-deleting";
       const linkKey = await sha256Hex(`test-hosted-identity\0${subject}`);

@@ -293,6 +293,22 @@ body.native-dashboard #setup-card { display: none !important; }
   text-transform: uppercase;
 }
 .state-dot { width: 7px; height: 7px; border-radius: var(--radius-round); background: currentColor; }
+.history-index-badge {
+  display: inline-flex;
+  align-items: center;
+  width: max-content;
+  padding: .38rem .62rem;
+  color: var(--amber);
+  background: var(--amber-soft);
+  border: 1px solid rgba(129, 87, 24, .22);
+  border-radius: var(--radius-pill);
+  font-size: .67rem;
+  font-weight: var(--weight-bold);
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  font-variant-numeric: tabular-nums;
+}
+@media (max-width: 700px) { .history-index-badge { display: none; } }
 .state-stale { color: var(--amber); background: var(--amber-soft); }
 .state-setup { color: var(--amber); background: var(--amber-soft); }
 .state-live, .state-local { color: var(--green-text); background: var(--green-soft); }
@@ -1099,7 +1115,7 @@ h2 {
  * this before you read the figure". Neither is an error colour, because
  * neither is an error.
  */
-.index-progress {
+.history-index-badge {
   display: grid;
   gap: var(--space-2);
   margin-block: var(--space-4) 0;
@@ -1108,18 +1124,18 @@ h2 {
   border-inline-start: 3px solid var(--blue);
   background: var(--blue-soft);
 }
-.index-progress-headline { margin: 0; color: #31536d; font-size: .8rem; font-weight: var(--weight-strong); }
-.index-progress-detail { margin: 0; color: #31536d; font-size: .74rem; line-height: 1.5; }
-.index-progress-track {
+.history-index-badge-headline { margin: 0; color: #31536d; font-size: .8rem; font-weight: var(--weight-strong); }
+.history-index-badge-detail { margin: 0; color: #31536d; font-size: .74rem; line-height: 1.5; }
+.history-index-badge-track {
   height: 7px;
   overflow: hidden;
   border-radius: var(--radius-pill);
   background: rgba(49, 95, 132, .18);
 }
-.index-progress-track i { display: block; height: 100%; border-radius: inherit; background: var(--blue); }
+.history-index-badge-track i { display: block; height: 100%; border-radius: inherit; background: var(--blue); }
 /* An active pass is the one state where motion is truthful: something really
    is advancing. A paused index stays still rather than implying work. */
-.index-progress.active .index-progress-track i { animation: index-progress-pulse 1.6s ease-in-out infinite; }
+.history-index-badge.active .history-index-badge-track i { animation: index-progress-pulse 1.6s ease-in-out infinite; }
 @keyframes index-progress-pulse { 50% { opacity: .55; } }
 
 .evidence-warnings { display: grid; gap: var(--space-2); margin-block: var(--space-4) 0; padding: 0; list-style: none; }
@@ -1138,7 +1154,7 @@ h2 {
   color: #31536d;
 }
 @media (prefers-reduced-motion: reduce) {
-  .index-progress.active .index-progress-track i { animation: none; }
+  .history-index-badge.active .history-index-badge-track i { animation: none; }
 }
 
 .component-list { display: grid; gap: 10px; }

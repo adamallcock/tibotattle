@@ -636,16 +636,20 @@ describe("hosted Google sign-in", () => {
     expect(tokenCalls).toHaveLength(0);
   });
 
-  it("does not allocate a Google handoff while enrollment is contained", async () => {
+  it("keeps the Google ceremony open under disabled mode but not the incident brake", async () => {
+    // Disabled enrollment MODE pauses new sign-ups only; the ceremony stays
+    // open because an existing participant reattaches through it. Only the
+    // collection-control incident brake refuses the ceremony itself.
     const disabled = await json(
       "/api/v1/identity/google/start",
       {},
       bindings({ ENROLLMENT_MODE: "disabled" }),
     );
-    expect(disabled.status).toBe(503);
-    expect(await disabled.json()).toMatchObject({
-      error: { code: "ENROLLMENT_DISABLED" },
-    });
+    expect(disabled.status).toBe(200);
+    const allocated = await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM google_signin_handoffs",
+    ).first<{ total: number }>();
+    expect(allocated?.total).toBe(1);
 
     await bindings().USAGE_MONITOR_DB.prepare(
       `UPDATE collection_controls
@@ -663,7 +667,7 @@ describe("hosted Google sign-in", () => {
     const rows = await bindings().USAGE_MONITOR_DB.prepare(
       "SELECT COUNT(*) AS total FROM google_signin_handoffs",
     ).first<{ total: number }>();
-    expect(rows?.total).toBe(0);
+    expect(rows?.total).toBe(1);
     expect(tokenCalls).toHaveLength(0);
   });
 

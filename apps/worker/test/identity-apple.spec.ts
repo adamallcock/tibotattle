@@ -772,20 +772,19 @@ describe("web Sign in with Apple", () => {
     expect(rows?.total).toBe(0);
   });
 
-  it("does not allocate an Apple handoff while enrollment mode is disabled", async () => {
+  it("keeps the Apple ceremony open while enrollment mode is disabled", async () => {
+    // Disabled mode pauses new sign-ups at the enrollment write; the ceremony
+    // stays open because an existing participant reattaches through it.
     const response = await json(
       "/api/v1/identity/apple/start",
       {},
       bindings({ ENROLLMENT_MODE: "disabled" }),
     );
-    expect(response.status).toBe(503);
-    expect(await response.json()).toMatchObject({
-      error: { code: "ENROLLMENT_DISABLED" },
-    });
+    expect(response.status).toBe(200);
     const rows = await bindings().USAGE_MONITOR_DB.prepare(
       "SELECT COUNT(*) AS total FROM apple_signin_handoffs",
     ).first<{ total: number }>();
-    expect(rows?.total).toBe(0);
+    expect(rows?.total).toBe(1);
     expect(tokenCalls).toHaveLength(0);
   });
 

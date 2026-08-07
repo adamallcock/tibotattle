@@ -595,6 +595,31 @@ function setGlobalState(state, { companionReachable = false } = {}) {
   renderGlobalState();
 }
 
+// The state pill said "Fresh" while the history index was one-third built,
+// because quota observation freshness and index completeness are different
+// facts. This badge states the second fact until it stops being true.
+function renderHistoryIndexBadge(data) {
+  const badge = $("#history-index-badge");
+  if (!badge) return;
+  const history = data?.pricing?.historyCoverage
+    ?? data?.accounting?.historyCoverage
+    ?? null;
+  const indexed = finite(history?.indexedSourceCount, null);
+  const total = finite(history?.sourceCount, null);
+  const complete = history?.status === "complete"
+    || (indexed !== null && total !== null && total > 0 && indexed >= total);
+  if (data?.mode === "demo" || complete
+      || indexed === null || total === null || total <= 0) {
+    badge.hidden = true;
+    return;
+  }
+  badge.hidden = false;
+  setRawText(badge, t("status.indexingHistory", {
+    indexed: compact(indexed),
+    total: compact(total),
+  }));
+}
+
 function renderGlobalState() {
   if (!globalState) return;
   const keys = {
@@ -856,6 +881,7 @@ function renderDashboard(data) {
   setGlobalState(data.state, {
     companionReachable: data.mode !== "demo"
   });
+  renderHistoryIndexBadge(data);
   $("#latest-observation").textContent = data.freshness.latestObservedAt
     ? formatAge(data.freshness.ageSeconds ?? (Date.now() - Date.parse(data.freshness.latestObservedAt)) / 1000)
     : "No timestamp";
@@ -1519,11 +1545,11 @@ const SHARE_CARD_VALUE_MIN_SIZE = 34;
 // The plot has 94 px of fixed axis padding, so anything shorter cannot carry
 // an honest chart. This lower bound prevents a caveat from collapsing the
 // evidence region into a zero-height plot.
-const SHARE_CARD_TREND_MIN_HEIGHT = 142;
+const SHARE_CARD_TREND_MIN_HEIGHT = 168;
 // The chart is the evidence on the image, not decorative garnish. Reserve a
 // meaningful vertical lane for it instead of compressing it below three cards
 // and a verbose footer.
-const SHARE_CARD_TREND_MAX_HEIGHT = 290;
+const SHARE_CARD_TREND_MAX_HEIGHT = 340;
 // Identifier-shaped only, exactly as a diagnostic code is: no space, no
 // slash, no separator that could carry a path or a folder name.
 const SHARE_CARD_REGISTRY_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/u;
@@ -1766,7 +1792,25 @@ function buildShareCard(data, {
     && lower !== null && lower > 0
     && upper !== null && upper > 0;
 
+  // The allowance estimate leads: it is the card's headline claim, and the
+  // title promises it (owner-directed reorder, 2026-08-07).
   const stats = [
+    {
+      label: isWeeklyWindow
+        ? t("share.stat.estimatedAllowance")
+        : t("share.stat.estimatedAllowanceUnavailable"),
+      value: hasCapacity ? formatMoney(capacity, 0) : t("share.value.notEstimable"),
+      detail: !isWeeklyWindow
+        ? t("share.detail.notApplicableToWindow")
+        : hasRange
+        ? t("share.detail.resetRange", {
+          lower: formatMoney(lower, 0),
+          upper: formatMoney(upper, 0),
+        })
+        : hasCapacity
+          ? t("share.detail.noAcrossResetRange")
+          : t("share.detail.notEnoughMatchedWindows"),
+    },
     {
       label: t("share.stat.allowanceLeft"),
       value: remaining === null ? t("share.value.notObserved") : formatPercent(remaining),
@@ -1784,22 +1828,6 @@ function buildShareCard(data, {
       detail: spend === null
         ? t("share.detail.noPricedUsage")
         : t("share.detail.activityPeriod", { period }),
-    },
-    {
-      label: isWeeklyWindow
-        ? t("share.stat.estimatedAllowance")
-        : t("share.stat.estimatedAllowanceUnavailable"),
-      value: hasCapacity ? formatMoney(capacity, 0) : t("share.value.notEstimable"),
-      detail: !isWeeklyWindow
-        ? t("share.detail.notApplicableToWindow")
-        : hasRange
-        ? t("share.detail.resetRange", {
-          lower: formatMoney(lower, 0),
-          upper: formatMoney(upper, 0),
-        })
-        : hasCapacity
-          ? t("share.detail.noAcrossResetRange")
-          : t("share.detail.notEnoughMatchedWindows"),
     },
   ];
 
@@ -2270,14 +2298,12 @@ function drawShareCard(canvas, card) {
     .flatMap((caveat) => shareCardWrap(context, caveat, inner - 20, 2))
     .slice(0, SHARE_CARD_MAX_CAVEAT_LINES);
   const caveatStep = 23;
-  // The footer zone holds the two smallest lines on the card — the checkable
-  // diagnostic reference and the fixed footer. A timeline renders this card at
-  // 504px wide (0.42 of its coordinate space), and at the old 12px/13px those
-  // lines printed at 5.0px/5.5px: the reference was the least legible thing on
-  // the image. They are drawn at 22px (9.2px at 504px), and the rule sits at
-  // -70.5 rather than -58.5 so two lines at that size still clear the card's
-  // bottom edge (owner-directed legibility fix, 2026-08-06).
-  const ruleY = SHARE_CARD_HEIGHT - 70.5;
+  // The footer zone now holds one deliberately quiet line: the checkable
+  // diagnostic reference. The fixed footer sentence is gone and the debug
+  // line dropped from 22px to 15px (owner-directed, 2026-08-07: "debug text
+  // is way too big", superseding the 2026-08-06 legibility bump), which
+  // returns the reclaimed height to the chart above.
+  const ruleY = SHARE_CARD_HEIGHT - 44.5;
   const caveatTop = caveatLines.length === 0
     ? ruleY - 8
     : ruleY - 22 - (caveatLines.length - 1) * caveatStep;
@@ -2336,22 +2362,11 @@ function drawShareCard(canvas, card) {
   context.stroke();
 
   context.fillStyle = "#65706b";
-  context.font = shareCardFont(500, 22);
+  context.font = shareCardFont(500, 15);
   context.fillText(
     shareCardFit(context, card.identifierLine, inner),
     margin,
-    ruleY + 30,
-  );
-  context.fillStyle = "#65706b";
-  context.font = shareCardFont(500, 22);
-  context.fillText(
-    shareCardFit(
-      context,
-      t("share.footer"),
-      inner,
-    ),
-    margin,
-    ruleY + 58,
+    ruleY + 26,
   );
   return true;
 }
@@ -6409,6 +6424,8 @@ async function requestRefresh() {
     let consecutiveStatusFailures = 0;
     let outcome = "running";
     let finalErrorCode = null;
+    let finalFailedStep = null;
+    let finalFailureCode = null;
     let pollCount = 0;
     let timeoutSettlementNoted = false;
     while (pollingBudget.hasTime()
@@ -6428,6 +6445,8 @@ async function requestRefresh() {
       const refresh = status?.refresh ?? {};
       outcome = refresh.status ?? "failed";
       finalErrorCode = refresh.errorCode ?? null;
+      finalFailedStep = refresh.failedStep ?? finalFailedStep;
+      finalFailureCode = refresh.failureCode ?? finalFailureCode;
       const progress = refresh.progress ?? refresh.result?.indexing ?? null;
       const archiveScanning = progress?.kind === "archive_index";
       if (archiveScanning && !archiveHistoryScanActive) {
@@ -6524,7 +6543,19 @@ async function requestRefresh() {
       });
       return;
     }
-    if (outcome !== "succeeded") throw new Error("The local refresh did not complete successfully.");
+    if (outcome !== "succeeded") {
+      // The companion stamps failures with a fixed step name and a bounded
+      // machine code; carrying them here is the difference between "it did
+      // not finish" and something a person can act on.
+      const failureDetail = [finalFailedStep, finalFailureCode]
+        .filter(Boolean).join(" · ");
+      const failure = new Error(failureDetail
+        ? `The local refresh failed at: ${failureDetail}.`
+        : "The local refresh did not complete successfully.");
+      if (finalFailureCode) failure.code = finalFailureCode;
+      failure.refreshFailureDetail = failureDetail || null;
+      throw failure;
+    }
     archiveHistoryScanActive = false;
     button.textContent = "Loading updated evidence…";
     await loadLocalDashboard();
@@ -6549,7 +6580,9 @@ async function requestRefresh() {
       fallback: continuationLimitReached
         ? "TiboTattle stopped this one-click analysis rather than repeatedly reading a very large history. Your available headline and previously verified results remain usable; you can run the analysis again later from its durable checkpoint."
         : refreshAccepted
-          ? "The analysis was accepted, but it did not reach a verified completion state. Existing evidence is still available and no partial accounting result replaced it."
+          ? (error?.refreshFailureDetail
+            ? `The analysis failed at: ${error.refreshFailureDetail}. Existing evidence is still available and no partial accounting result replaced it.`
+            : "The analysis was accepted, but it did not reach a verified completion state. Existing evidence is still available and no partial accounting result replaced it.")
         : "The local companion may be offline, busy, or rejecting this request. Existing evidence has not been altered.",
     });
     showConnectionNotice({
@@ -7056,12 +7089,22 @@ function hasCommunitySession() {
 }
 
 function hostedEnrollmentIsPaused() {
-  // A server-authenticated existing participant may still pair an already
-  // authorised Mac while new enrollment is contained. Do not make a session
-  // holder repeat a social login merely because new enrollment is paused.
+  // Only the operator's collection-control incident brake closes the door
+  // for everyone. A routine "disabled" enrollment mode pauses NEW sign-ups
+  // at the service's enrollment write, while the sign-in ceremony stays open
+  // so an existing contributor can reattach - the service decides which one
+  // this identity is.
   if (hasCommunitySession()) return false;
-  return communityServiceHealth?.collectionControls?.enrollment === false
-    || communityServiceHealth?.enrollmentMode === "disabled";
+  const controls = communityServiceHealth?.collectionControls;
+  return controls != null
+    && controls.state !== "operational"
+    && controls.enrollment === false;
+}
+
+function hostedNewEnrollmentIsPaused() {
+  // Informational, never a lockout: new sign-ups are paused, but signing in
+  // still reconnects an existing contributor.
+  return communityServiceHealth?.enrollmentMode === "disabled";
 }
 
 function hostedSignInRequired() {
@@ -7116,6 +7159,11 @@ function renderHostedIdentity() {
   // from its key rather than from its rendered text.
   if (enrollmentPaused) {
     setLocalizedText(googleUnavailable, "contribution.enrollmentPaused");
+  } else if (hostedNewEnrollmentIsPaused() && !signedIn && !googleUnavailableNow) {
+    // The buttons stay enabled: sign-in reconnects an existing contributor
+    // even while new sign-ups are paused.
+    googleUnavailable.hidden = false;
+    setLocalizedText(googleUnavailable, "contribution.newEnrollmentPausedSignInWorks");
   } else {
     setProductText(googleUnavailable, serviceConfigured
       ? "Hosted sign-in is not configured for this build."

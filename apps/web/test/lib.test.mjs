@@ -6607,7 +6607,6 @@ test("a posted results card can carry only fixed copy and formatted figures", as
       "card.trendLabel.toLocaleUpperCase(localization.locale())",
       "formatMoney(value, axisDigits)",
       "line",
-      "shareCardFit( context, t(\"share.footer\"), inner, )",
       "shareCardFit(context, card.identifierLine, inner)",
       "shareCardFit(context, card.relationshipNote, inner - 20)",
       "shareCardFit(context, card.subtitle, inner)",
@@ -7025,8 +7024,8 @@ test("a posted results card states a figure in full and marks a fixture as one",
     "the shared SVG tick alignment is translated to a valid Canvas alignment",
   );
   assert.doesNotMatch(section, /shareCardTrendDateTicks|shareCardTrendAxis/u);
-  assert.match(section, /const SHARE_CARD_TREND_MAX_HEIGHT = 290;/u);
-  assert.match(section, /const SHARE_CARD_TREND_MIN_HEIGHT = 142;/u);
+  assert.match(section, /const SHARE_CARD_TREND_MAX_HEIGHT = 340;/u);
+  assert.match(section, /const SHARE_CARD_TREND_MIN_HEIGHT = 168;/u);
   // Only the qualifications that can change interpretation survive on a
   // social image; the full evidence remains in the local app.
   assert.match(appSource, /const SHARE_CARD_MAX_CAVEATS = 2;/u);
