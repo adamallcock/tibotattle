@@ -58,6 +58,18 @@ function localFailure(code) {
   return { ok: false, code };
 }
 
+function boundedExcerpt(text) {
+  const value = typeof text === "string" ? text.trim() : "";
+  return value.length > 2000 ? `${value.slice(0, 2000)}…` : value;
+}
+
+// A bare PRODUCTION_MIGRATION_STATE_UNKNOWN told the operator nothing about
+// which of the gate's reads failed or why; every undeterminable outcome now
+// names the database, the stage that failed, and what that stage produced.
+function migrationStateUnknown(detail) {
+  return { ok: false, code: "PRODUCTION_MIGRATION_STATE_UNKNOWN", detail };
+}
+
 // Production D1 migration gate
 // (docs/governance/2026-08-07-production-deploy-migration-gate.md): the
 // dangerous part of a routine deploy is a schema migration riding along
@@ -126,7 +138,11 @@ export async function determinePendingProductionMigrations({
       local = null;
     }
     if (!Array.isArray(local)) {
-      return localFailure("PRODUCTION_MIGRATION_STATE_UNKNOWN");
+      return migrationStateUnknown({
+        stage: "local-migration-inventory",
+        binding: database.binding,
+        migrationsDir: database.migrationsDir,
+      });
     }
     let query;
     try {
@@ -150,24 +166,60 @@ export async function determinePendingProductionMigrations({
           maxBuffer: 4 * 1024 * 1024,
         },
       );
-    } catch {
-      return localFailure("PRODUCTION_MIGRATION_STATE_UNKNOWN");
+    } catch (error) {
+      return migrationStateUnknown({
+        stage: "wrangler-spawn",
+        binding: database.binding,
+        error: boundedExcerpt(error?.message ?? String(error)),
+      });
     }
     if (query?.error || query?.status !== 0) {
-      return localFailure("PRODUCTION_MIGRATION_STATE_UNKNOWN");
+      return migrationStateUnknown({
+        stage: "wrangler-exit",
+        binding: database.binding,
+        status: query?.status ?? null,
+        stderr: boundedExcerpt(query?.stderr),
+        ...(query?.error
+          ? { error: boundedExcerpt(query.error?.message ?? String(query.error)) }
+          : {}),
+      });
     }
-    const rows = parseD1ExecuteRows(
-      typeof query?.stdout === "string" ? query.stdout : "",
-    );
-    if (!Array.isArray(rows)
-        || !rows.every((row, index) => Number(row?.id) === index + 1
-          && typeof row?.name === "string")) {
-      return localFailure("PRODUCTION_MIGRATION_STATE_UNKNOWN");
+    const stdout = typeof query?.stdout === "string" ? query.stdout : "";
+    const rows = parseD1ExecuteRows(stdout);
+    if (!Array.isArray(rows)) {
+      return migrationStateUnknown({
+        stage: "ledger-parse",
+        binding: database.binding,
+        stdout: boundedExcerpt(stdout),
+        stderr: boundedExcerpt(query?.stderr),
+      });
+    }
+    if (!rows.every((row, index) => Number(row?.id) === index + 1
+      && typeof row?.name === "string")) {
+      return migrationStateUnknown({
+        stage: "ledger-sequence",
+        binding: database.binding,
+        rowCount: rows.length,
+      });
     }
     const applied = rows.map((row) => row.name);
     if (applied.length > local.length
         || !applied.every((name, index) => name === local[index])) {
-      return localFailure("PRODUCTION_MIGRATION_LEDGER_DRIFT");
+      const index = applied.findIndex((name, at) => name !== local[at]);
+      return {
+        ok: false,
+        code: "PRODUCTION_MIGRATION_LEDGER_DRIFT",
+        detail: {
+          binding: database.binding,
+          appliedCount: applied.length,
+          localCount: local.length,
+          firstMismatch: {
+            index,
+            applied: applied[index],
+            local: local[index] ?? null,
+          },
+        },
+      };
     }
     for (const name of local.slice(applied.length)) {
       pending.push(`${database.binding}:${name}`);
@@ -671,10 +723,10 @@ async function runProductionDeploymentFromSnapshot({
   if (!pendingCheck?.ok) {
     return pendingCheck?.code
       ? pendingCheck
-      : localFailure("PRODUCTION_MIGRATION_STATE_UNKNOWN");
+      : migrationStateUnknown({ stage: "gate-result" });
   }
   if (!Array.isArray(pendingCheck.pending)) {
-    return localFailure("PRODUCTION_MIGRATION_STATE_UNKNOWN");
+    return migrationStateUnknown({ stage: "gate-pending-list" });
   }
   const migrationGate = assessMigrationGate({
     pending: pendingCheck.pending,

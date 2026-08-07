@@ -905,6 +905,16 @@ test("pending-migration discovery fails closed on unreadable, drifted, or undete
   assert.deepEqual(unknownRemote, {
     ok: false,
     code: "PRODUCTION_MIGRATION_LEDGER_DRIFT",
+    detail: {
+      binding: "USAGE_MONITOR_DB",
+      appliedCount: 1,
+      localCount: 2,
+      firstMismatch: {
+        index: 0,
+        applied: "9999_not_in_checkout.sql",
+        local: "0001_first.sql",
+      },
+    },
   });
 
   const remoteAhead = await determinePendingProductionMigrations({
@@ -922,6 +932,16 @@ test("pending-migration discovery fails closed on unreadable, drifted, or undete
   assert.deepEqual(remoteAhead, {
     ok: false,
     code: "PRODUCTION_MIGRATION_LEDGER_DRIFT",
+    detail: {
+      binding: "USAGE_MONITOR_DB",
+      appliedCount: 3,
+      localCount: 2,
+      firstMismatch: {
+        index: 2,
+        applied: "0003_unknown.sql",
+        local: null,
+      },
+    },
   });
 
   const queryFailure = await determinePendingProductionMigrations({
@@ -932,6 +952,12 @@ test("pending-migration discovery fails closed on unreadable, drifted, or undete
   assert.deepEqual(queryFailure, {
     ok: false,
     code: "PRODUCTION_MIGRATION_STATE_UNKNOWN",
+    detail: {
+      stage: "wrangler-exit",
+      binding: "USAGE_MONITOR_DB",
+      status: 1,
+      stderr: "unauthorized",
+    },
   });
 
   const malformedOutput = await determinePendingProductionMigrations({
@@ -942,6 +968,12 @@ test("pending-migration discovery fails closed on unreadable, drifted, or undete
   assert.deepEqual(malformedOutput, {
     ok: false,
     code: "PRODUCTION_MIGRATION_STATE_UNKNOWN",
+    detail: {
+      stage: "ledger-parse",
+      binding: "USAGE_MONITOR_DB",
+      stdout: "not-json",
+      stderr: "",
+    },
   });
 
   const nonSequentialLedger = await determinePendingProductionMigrations({
@@ -955,6 +987,11 @@ test("pending-migration discovery fails closed on unreadable, drifted, or undete
   assert.deepEqual(nonSequentialLedger, {
     ok: false,
     code: "PRODUCTION_MIGRATION_STATE_UNKNOWN",
+    detail: {
+      stage: "ledger-sequence",
+      binding: "USAGE_MONITOR_DB",
+      rowCount: 1,
+    },
   });
 
   await rm(join(workerDirectory, "deletion-ledger-migrations"), {
@@ -974,6 +1011,11 @@ test("pending-migration discovery fails closed on unreadable, drifted, or undete
   assert.deepEqual(missingDirectory, {
     ok: false,
     code: "PRODUCTION_MIGRATION_STATE_UNKNOWN",
+    detail: {
+      stage: "local-migration-inventory",
+      binding: "DELETION_LEDGER",
+      migrationsDir: "deletion-ledger-migrations",
+    },
   });
 });
 
