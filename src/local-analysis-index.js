@@ -681,21 +681,42 @@ async function projectSources(
   return { sources, reusedCount };
 }
 
-function configureDatabase(
+// PRAGMA journal_mode returns a result row, so issuing it through exec()
+// prepares the statement without ever stepping it: SQLite discards the
+// requested change and the connection silently keeps its previous journal.
+// (synchronous and locking_mode return no row and do take effect through
+// exec().) The journal mode must be stepped via prepare().get() and the
+// granted mode verified -- a runtime that refuses the request would otherwise
+// leave staging paying for the on-disk rollback journal it asked not to have.
+function setJournalMode(database, mode) {
+  const granted = database
+    .prepare(`PRAGMA journal_mode = ${mode}`)
+    .get()?.journal_mode;
+  if (granted !== mode.toLowerCase()) {
+    throw fixedError("local_analysis_index_journal_mode_refused");
+  }
+}
+
+export function configureDatabase(
   database,
   { readOnly = false, staging = false } = {},
 ) {
   if (!readOnly) {
-    database.exec(staging
-      ? `
-        PRAGMA journal_mode=OFF;
+    if (staging) {
+      // journal_mode=OFF is refused by the bundled SQLite (readback stays
+      // "delete"). MEMORY is granted, and bounds the rollback journal to one
+      // in-memory commit batch instead of a journal file written to disk.
+      setJournalMode(database, "MEMORY");
+      database.exec(`
         PRAGMA synchronous=OFF;
         PRAGMA locking_mode=EXCLUSIVE;
-      `
-      : `
-        PRAGMA journal_mode=DELETE;
-        PRAGMA synchronous=FULL;
       `);
+    } else {
+      // DELETE+FULL measured faster than WAL on this workload; keep it, but
+      // step the journal mode with readback for the same silent-no-op reason.
+      setJournalMode(database, "DELETE");
+      database.exec("PRAGMA synchronous=FULL;");
+    }
   }
   database.exec(`
     PRAGMA foreign_keys=ON;
@@ -2029,6 +2050,13 @@ async function deriveChangedSources({
         });
       }
     }
+    // The quota iterator advances only while token rows still trail it, so
+    // quota rows past the final drained offset leave the statement mid-step.
+    // An un-reset statement holds a read transaction on the extracted shard
+    // schema, and the later DETACH then fails with "database extract_N is
+    // locked" -- observed on the real corpus, dependent on row order and on
+    // whether garbage collection happened to finalize the abandoned iterator.
+    quotaIterator.return();
     for (const released of leadingQuotaGate.flush()) {
       await commitQuota(released);
     }

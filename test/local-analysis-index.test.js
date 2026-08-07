@@ -16,6 +16,7 @@ import { DatabaseSync } from "node:sqlite";
 import { scanCodexLogEvents } from "../src/codex-log-scan.js";
 import { recognizedExportModelId } from "../src/export/index.js";
 import {
+  configureDatabase,
   createIndexedCodexLogScan,
   inspectLocalAnalysisIndex,
   LOCAL_ANALYSIS_INDEX_PARSER_VERSION,
@@ -827,4 +828,118 @@ test("the canonical SQLite accounting state never falls back to an index project
     errorCode: "cache_invalid",
     cache: null,
   });
+});
+
+// PRAGMA journal_mode returns a result row, so issuing it through exec()
+// prepares the statement without stepping it and the requested change is
+// silently discarded. These tests assert the mode SQLite actually granted,
+// read back after configuration -- not that a write was attempted.
+test("configureDatabase grants a MEMORY journal in staging and DELETE+FULL durably, verified by readback", async () => {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-journal-mode-"));
+  try {
+    const stagingDatabase = new DatabaseSync(join(root, "staging.sqlite"));
+    try {
+      configureDatabase(stagingDatabase, { staging: true });
+      assert.equal(
+        stagingDatabase.prepare("PRAGMA journal_mode").get().journal_mode,
+        "memory",
+      );
+      assert.equal(
+        Number(stagingDatabase.prepare("PRAGMA synchronous").get().synchronous),
+        0,
+      );
+      assert.equal(
+        stagingDatabase.prepare("PRAGMA locking_mode").get().locking_mode,
+        "exclusive",
+      );
+    } finally {
+      stagingDatabase.close();
+    }
+
+    // Start the durable connection in WAL so the DELETE readback proves the
+    // pragma took effect rather than observing the fresh-database default.
+    const durableDatabase = new DatabaseSync(join(root, "durable.sqlite"));
+    try {
+      assert.equal(
+        durableDatabase.prepare("PRAGMA journal_mode = WAL").get().journal_mode,
+        "wal",
+      );
+      configureDatabase(durableDatabase, { staging: false });
+      assert.equal(
+        durableDatabase.prepare("PRAGMA journal_mode").get().journal_mode,
+        "delete",
+      );
+      assert.equal(
+        Number(durableDatabase.prepare("PRAGMA synchronous").get().synchronous),
+        2,
+      );
+    } finally {
+      durableDatabase.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// A fork child whose tail is entirely replayed parent rows leaves the
+// interleaved quota statement mid-step: every row `continue`s past the drain,
+// the statement keeps a read transaction on the extracted shard schema, and
+// the DETACH after the derivation commit fails with "database extract_N is
+// locked" unless the iterator is explicitly closed. Observed on the real
+// corpus; whether it surfaced depended on garbage-collection timing.
+test("a fork child that only replays parent rows still lets the shard detach", async () => {
+  const { root, codexHome, childPath } = await fixture();
+  await writeFile(childPath, `${[
+    JSON.stringify({
+      timestamp: "2026-07-24T12:03:00.000Z",
+      type: "session_meta",
+      payload: {
+        id: "PRIVATE_CHILD",
+        forked_from_id: "PRIVATE_PARENT",
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-24T12:03:00.010Z",
+      type: "turn_context",
+      payload: { model: "gpt-5.6-sol" },
+    }),
+    // Replays of the parent's cumulative snapshots, and nothing after them.
+    token(
+      "2026-07-24T12:03:01.000Z",
+      usage(100, 20),
+      usage(100, 20),
+      10,
+    ),
+    token(
+      "2026-07-24T12:03:02.000Z",
+      usage(160, 35),
+      usage(60, 15),
+      12,
+    ),
+  ].join("\n")}\n`);
+  const refreshed = await refreshLocalAnalysisIndex({
+    indexFile: join(root, "local-analysis-index-replay-tail.sqlite"),
+    secretFile: join(root, "local-analysis-index-replay-tail-secret"),
+    codexHome,
+    startAt: START_AT,
+    endAt: END_AT,
+    workerCount: 1,
+    chunkBytes: CHUNK_BYTES,
+  });
+  assert.equal(refreshed.status, "built");
+  assert.equal(refreshed.coverage.status, "complete");
+});
+
+test("configureDatabase throws when the runtime refuses the requested journal mode", () => {
+  // Models a runtime that answers every journal_mode request with "delete",
+  // exactly how the bundled SQLite refuses journal_mode=OFF. A silently
+  // degraded journal is the defect this guard exists to catch.
+  const refusingDatabase = {
+    prepare: () => ({ get: () => ({ journal_mode: "delete" }) }),
+    exec: () => {},
+  };
+  assert.throws(
+    () => configureDatabase(refusingDatabase, { staging: true }),
+    { code: "local_analysis_index_journal_mode_refused" },
+  );
 });
