@@ -15,17 +15,23 @@
   --white: #fffef9;
   --ink: #17211e;
   --text: #17211e;
-  --muted: #65706b;
+  --muted: #57625c;
   --line: rgba(23, 33, 30, .14);
   --line-strong: rgba(23, 33, 30, .2);
   --green: #174f45;
   --green-2: #2d7466;
+  /* Branding direction A additions (2026-08-07). `--green-text` is the ok-chip
+     ink on green-soft, 5.25:1 (AA). `--chart-accent` is verdigris for chart
+     strokes and large text only - 3.86:1 on paper, deliberately below the
+     small-text bar, so never use it for body copy. */
+  --green-text: #256a5b;
+  --chart-accent: #3e8577;
   --green-soft: #dfece6;
-  --rust: #a9492f;
+  --rust: #97402a;
   --rust-soft: #f4e4de;
-  --amber: #9a6a24;
+  --amber: #815718;
   --amber-soft: #f4ead7;
-  --blue: #315f84;
+  --blue: #2c5878;
   --blue-soft: #e0eaf1;
 
   /* Surfaces. Every panel, card and tile picks one of these four so nothing
@@ -152,6 +158,13 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
   font-weight: var(--weight-bold);
   text-decoration: none;
 }
+/* Direction A wordmark: serif at semibold beside the untouched icon. */
+.brand > span {
+  font-family: var(--serif);
+  font-size: 1.05rem;
+  font-weight: var(--weight-medium);
+  letter-spacing: .01em;
+}
 .brand-icon {
   display: block;
   width: 30px;
@@ -270,7 +283,7 @@ body.native-dashboard #setup-card { display: none !important; }
   gap: .45rem;
   width: max-content;
   padding: .38rem .62rem;
-  color: var(--green);
+  color: var(--green-text);
   background: var(--green-soft);
   border: 1px solid rgba(23, 79, 69, .18);
   border-radius: var(--radius-pill);
@@ -282,7 +295,7 @@ body.native-dashboard #setup-card { display: none !important; }
 .state-dot { width: 7px; height: 7px; border-radius: var(--radius-round); background: currentColor; }
 .state-stale { color: var(--amber); background: var(--amber-soft); }
 .state-setup { color: var(--amber); background: var(--amber-soft); }
-.state-live, .state-local { color: var(--green); background: var(--green-soft); }
+.state-live, .state-local { color: var(--green-text); background: var(--green-soft); }
 .state-updating { color: var(--amber); background: var(--amber-soft); }
 .state-insufficient, .state-offline { color: var(--rust); background: var(--rust-soft); }
 .state-demo { color: var(--blue); background: var(--blue-soft); }
@@ -3061,3 +3074,5 @@ footer {
 [data-dashboard-page].dashboard-page-inactive {
   display: none !important;
 }
+
+.share-toast-action { margin-inline-start: .75rem; flex: 0 0 auto; }

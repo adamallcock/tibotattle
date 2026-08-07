@@ -1499,6 +1499,10 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         (TiboTattleLocalization.LanguagePreference) -> Void
     private var allowedPort: Int?
     private var pendingDashboardURL: URL?
+    /// The in-flight download's chosen destination, promoted to
+    /// `latestCompletedDownload` only when WebKit reports it finished.
+    private var pendingDownloadDestination: URL?
+    private var latestCompletedDownload: URL?
     private var viewportPreparationAttempts = 0
     /// False while the view holds no dashboard, so the blank page loaded on
     /// teardown can never be reported as a dashboard that opened.
@@ -1539,6 +1543,10 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         configuration.userContentController.add(
             self,
             name: "tibotattleLocalization"
+        )
+        configuration.userContentController.add(
+            self,
+            name: "tibotattleDownloads"
         )
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -1734,9 +1742,20 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
+        guard message.frameInfo.isMainFrame,
+              let payload = message.body as? [String: Any]
+        else {
+            return
+        }
+        if message.name == "tibotattleDownloads" {
+            // The page asks; the shell acts. The path never crosses the
+            // bridge in either direction.
+            if payload["type"] as? String == "reveal-latest-download" {
+                revealLatestDownload()
+            }
+            return
+        }
         guard message.name == "tibotattleLocalization",
-              message.frameInfo.isMainFrame,
-              let payload = message.body as? [String: Any],
               payload["type"] as? String == "set-language-preference",
               let rawPreference = payload["preference"] as? String,
               let preference = TiboTattleLocalization.LanguagePreference(
@@ -1972,13 +1991,43 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         suggestedFilename: String,
         completionHandler: @escaping (URL?) -> Void
     ) {
-        completionHandler(Self.downloadsDestination(for: suggestedFilename))
+        let destination = Self.downloadsDestination(for: suggestedFilename)
+        pendingDownloadDestination = destination
+        completionHandler(destination)
+    }
+
+    func downloadDidFinish(_ download: WKDownload) {
+        // Only a completed download may ever be revealed. The destination is
+        // promoted here, not at decide time, so the page's "Show in Finder"
+        // can never point at a partial file.
+        latestCompletedDownload = pendingDownloadDestination
+        pendingDownloadDestination = nil
     }
 
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        pendingDownloadDestination = nil
         // A file that could not be saved is not a dashboard that failed, so
         // the open page is left exactly as it is.
         onDownloadFailure()
+    }
+
+    /// Reveal the last finished download, or fall back to opening the
+    /// Downloads folder when none finished yet - the honest nearest thing,
+    /// never an error for a file that is still being written.
+    func revealLatestDownload() {
+        if let url = latestCompletedDownload,
+           FileManager.default.fileExists(atPath: url.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+            return
+        }
+        if let downloads = try? FileManager.default.url(
+            for: .downloadsDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: false
+        ) {
+            NSWorkspace.shared.open(downloads)
+        }
     }
 
     /// A page-supplied filename is untrusted, so only a bounded, separator-free

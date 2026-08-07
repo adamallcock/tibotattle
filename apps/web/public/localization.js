@@ -202,6 +202,7 @@ export const WEB_MESSAGES = Object.freeze({
   "dashboard.quota.windowOther": ["Other observed allowance", "其他观测到的额度", "Otra asignación observada"],
   "dashboard.quota.providerPlan": ["Provider-reported plan: {plan}", "提供方报告的方案：{plan}", "Plan informado por el proveedor: {plan}"],
   "dashboard.quota.providerPlanUnavailable": ["Provider-reported plan unavailable", "提供方报告的方案不可用", "Plan informado por el proveedor no disponible"],
+  "shareCard.showInFinder": ["Show in Finder", "在访达中显示", "Mostrar en Finder"],
   "dashboard.quota.remaining": ["{value} remaining", "剩余 {value}", "{value} restante"],
   "dashboard.quota.used": ["{value} used", "已使用 {value}", "{value} usado"],
   "dashboard.quota.usedUnknown": ["Used unknown", "已用量未知", "Uso desconocido"],

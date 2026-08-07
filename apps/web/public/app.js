@@ -2393,11 +2393,22 @@ function dismissShareCardToast() {
   toast.hidden = true;
 }
 
-function showShareCardToast(text) {
+function showShareCardToast(text, { actionLabel = "", onAction = null } = {}) {
   const toast = $("#share-card-toast");
   dismissShareCardToast();
   toast.hidden = false;
   toast.textContent = text;
+  // An optional single action, used by Save to reveal the file. The button is
+  // only ever offered when a caller verified the capability exists, so the
+  // toast never shows a control that cannot act.
+  if (actionLabel !== "" && typeof onAction === "function") {
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = "button button-quiet compact share-toast-action";
+    action.textContent = actionLabel;
+    action.addEventListener("click", onAction);
+    toast.append(action);
+  }
   shareCardToastHoldTimer = setTimeout(() => {
     toast.classList.add("share-toast-leaving");
     shareCardToastLeaveTimer = setTimeout(
@@ -2505,9 +2516,17 @@ function downloadShareCard() {
     link.download = shareCardFileName(card);
     link.click();
     URL.revokeObjectURL(url);
-    setShareCardStatus(
-      `Saved as ${shareCardFileName(card)}. Reference ${card.reference} is printed on the image.`,
-    );
+    const saved = `Saved as ${shareCardFileName(card)}. Reference ${card.reference} is printed on the image.`;
+    // Reveal is native-only: the shell tracks where the download landed and
+    // shows it in Finder itself, so the page never learns a filesystem path.
+    // In a plain browser the button is absent rather than disabled.
+    const bridge = document.body.classList.contains("native-dashboard")
+      ? window.webkit?.messageHandlers?.tibotattleDownloads
+      : undefined;
+    showShareCardToast(saved, bridge ? {
+      actionLabel: t("shareCard.showInFinder"),
+      onAction: () => bridge.postMessage({ type: "reveal-latest-download" }),
+    } : {});
   });
 }
 
