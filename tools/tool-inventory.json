@@ -246,7 +246,7 @@
       "stableAliasReason": null,
       "additionalAliases": [],
       "callers": [
-        "test/macos-updater.test.js"
+        "test/publish-sparkle-update.test.js"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": null,
