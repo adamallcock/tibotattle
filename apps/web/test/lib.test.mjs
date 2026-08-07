@@ -4101,7 +4101,15 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /https:\/\/tibotattle\.com\/#community/u);
   assert.match(html, /id="community-connect-consent"/u);
   assert.match(html, /id="prepare-contribution"/u);
-  assert.match(html, /id="sync-inspect"/u);
+  // Re-pinned 2026-08-07 (guided-journey redesign): the separate "Review
+  // summary" button revealed exactly the facts the summary card already
+  // printed, so the click was the defect and is collapsed — the card verifies
+  // itself. The review-token GATE survives: Send still requires the exact
+  // local verification (pinned in the concise-review test below). The journey
+  // strip states each stage's measured state at the top of the community
+  // section.
+  assert.doesNotMatch(html, /id="sync-inspect"/u);
+  assert.match(html, /id="community-journey"/u);
   assert.match(html, /id="sync-run-once"/u);
   for (const retiredControl of [
     'id="central-state"',
@@ -5248,7 +5256,11 @@ test("community UI stays focused on one reviewed destination", async () => {
   assert.match(html, /id="community"/u);
   assert.match(html, /id="community-connect-consent"/u);
   assert.match(html, /id="community-contribution-disclosure"/u);
-  assert.match(html, /id="sync-inspect"/u);
+  // Re-pinned 2026-08-07 (guided-journey redesign): the reveal button is
+  // collapsed — the summary card is the review — and the only review control
+  // left is the explicit re-check offered after a failed verification.
+  assert.doesNotMatch(html, /id="sync-inspect"/u);
+  assert.match(html, /id="sync-review-retry"/u);
   assert.match(html, /id="sync-run-once"/u);
   assert.match(html, /See what the community published/u);
   assert.match(html, /https:\/\/tibotattle\.com\/#community/u);
@@ -5362,7 +5374,13 @@ test("primary contribution journey connects the Mac for one reviewed send withou
   assert.match(appSource, /localClient\.pairContributionDevice\(pairing\.pairingCode\)/u);
   assert.doesNotMatch(appSource, /recoveryCode/u);
   assert.doesNotMatch(appSource, /armAutomaticContributionAfterReviewedSend/u);
-  assert.match(appSource, /inspectNextContribution/u);
+  // Re-pinned 2026-08-07 (guided-journey redesign): the connect chain's local
+  // review step is now the same self-verification the summary card performs
+  // (`reviewPreparedSummary`); the old `inspectNextContribution` button
+  // handler is gone with the redundant click. The verification itself — and
+  // the token it mints — is unchanged.
+  assert.match(appSource, /reviewPreparedSummary/u);
+  assert.doesNotMatch(appSource, /inspectNextContribution/u);
   assert.match(appSource, /pairing = null;/u);
   assert.match(
     appSource,
@@ -5387,7 +5405,10 @@ test("post-results contribution CTA is explicit while technical and deletion con
   assert.match(html, /https:\/\/tibotattle\.com\/#community/u);
   assert.match(html, /id="community-contribution-disclosure"/u);
   assert.match(html, /id="prepare-contribution"/u);
-  assert.match(html, /id="sync-inspect"/u);
+  // Re-pinned 2026-08-07 (guided-journey redesign): the reveal click is
+  // collapsed; the summary card is the review and Send remains the one
+  // explicit action.
+  assert.doesNotMatch(html, /id="sync-inspect"/u);
   assert.match(html, /id="sync-run-once"/u);
   assert.doesNotMatch(html, /automatic-contribution|contribution-history|backend|browser validation|JSON export|download-participant/iu);
 });
@@ -5445,8 +5466,23 @@ test("contribution UI prepares a concise local review before one explicit send",
   assert.match(html, /id="sync-next-records"/u);
   assert.match(html, /id="sync-next-cost"/u);
   assert.match(html, /id="sync-next-bytes"/u);
-  assert.match(html, /Review summary/u);
+  // Re-pinned 2026-08-07 (guided-journey redesign): "Review summary" was a
+  // button that revealed the facts already printed on this card, so the card
+  // now states that it IS the review and verifies itself. The GATE is the
+  // contract and survives the collapsed click, pinned here three ways: the
+  // exact local verification still runs, Send still refuses without a ready
+  // review, and the send still carries the minted review token.
+  assert.match(html, /This summary is the review/u);
   assert.match(html, /Send summary/u);
+  assert.match(appSource, /function maybeReviewPreparedSummary\(\)/u);
+  assert.match(
+    appSource,
+    /error\.code = "review_required_before_send"/u,
+  );
+  assert.match(
+    appSource,
+    /runContributionSyncOnce\(\s*contributionSyncExactReview\.reviewToken/u,
+  );
   assert.match(appSource, /validateContributionForUpload\(value\.payload\)/u);
   assert.doesNotMatch(appSource, /renderCollector|renderIndexProgress|collector-details|index-progress/u);
   assert.match(appSource, /prepareLocalContribution/);
@@ -5465,6 +5501,121 @@ test("contribution UI prepares a concise local review before one explicit send",
   assert.doesNotMatch(appSource, /sessionStorage|localStorage|accessToken|Bearer/);
   assert.match(html, /See what the community published/u);
   assert.doesNotMatch(appSource, /loadCommunityResults\(\).*renderSharedCommunitySnapshot/su);
+});
+
+test("the community journey states its stages and gates effort behind sign-in and connection", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  // The four stages, in journey order, at the top of the community section:
+  // app/companion → index building → evidence → sign in & connect.
+  const stagePositions = ["app", "index", "evidence", "community"].map((name) => {
+    const id = `id="journey-stage-${name}"`;
+    assert.match(html, new RegExp(id, "u"));
+    assert.match(html, new RegExp(`id="journey-stage-${name}-state"`, "u"));
+    assert.match(html, new RegExp(`id="journey-stage-${name}-detail"`, "u"));
+    return html.indexOf(id);
+  });
+  assert.deepEqual(stagePositions, [...stagePositions].sort((a, b) => a - b));
+  // Authorization state is visible before the action buttons: the strip
+  // precedes the sign-in block, which precedes the prepare/review disclosure.
+  const journeyPosition = html.indexOf('id="community-journey"');
+  const signInPosition = html.indexOf('id="identity-signin"');
+  const disclosurePosition = html.indexOf('id="community-contribution-disclosure"');
+  assert.ok(journeyPosition >= 0 && journeyPosition < signInPosition);
+  assert.ok(signInPosition < disclosurePosition);
+  // Stage detail lines are measured facts: the index stage reuses the exact
+  // counted-sources statement the history progress surface reports.
+  assert.match(
+    appSource,
+    /stage\("index", "progress", "dashboard\.history\.indexingSources", \{/u,
+  );
+  // Sign-in and connection come BEFORE any effort is invested: upload
+  // authority is claimed only from measured facts, both prepare and send are
+  // disabled with a stated reason until it exists, and the reason names the
+  // missing step (sign-in versus connection).
+  assert.match(appSource, /function communityUploadAuthorityEvidence\(\)/u);
+  assert.match(appSource, /communityDevicePaired\s*\|\| finite\(contributionSyncStatus\?\.counts\?\.accepted, 0\) > 0/u);
+  assert.match(appSource, /\|\| !authorized;/u);
+  assert.match(appSource, /"syncGate\.signInFirst"\s*:\s*"syncGate\.connectFirst"/u);
+  assert.match(appSource, /"prepareGate\.signInFirst"\s*:\s*"prepareGate\.connectFirst"/u);
+  assert.match(html, /id="sync-gate-reason"/u);
+  // A build with no contribution service keeps local preparation: there is
+  // nothing to sign into and nothing can send.
+  assert.match(
+    appSource,
+    /return !contributionServiceConfigured\(\) \|\| communityUploadAuthorityEvidence\(\);/u,
+  );
+  assert.match(styles, /\.journey-stage \{/u);
+});
+
+test("a prepared summary verifies itself once and failure retries stay explicit", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  // The summary card is the review: a ready prepared set triggers the exact
+  // local verification without a reveal click…
+  assert.match(appSource, /updateContributionSyncButtons\(\);\s*\n\s*maybeReviewPreparedSummary\(\);/u);
+  // …but only once per prepared set, so a failed verification cannot loop; a
+  // retry is an explicit action again.
+  assert.match(appSource, /if \(key === null \|\| key === contributionSyncAutoReviewedKey\) return;/u);
+  assert.match(appSource, /sync-review-retry/u);
+  // The verification waits for the same authorization Send needs, so a local
+  // mutation that mints a send token never runs for an unauthorized page.
+  assert.match(
+    appSource,
+    /if \(!communityAuthorizationSatisfied\(\)\) return;\s*\n\s*const key = preparedSummaryIdentity\(\);/u,
+  );
+  // A send, and a fresh preparation, both invalidate the once-per-set marker:
+  // whatever the queue offers next must verify itself again.
+  assert.match(
+    appSource,
+    /contributionSyncAutoReviewedKey = null;\s*\n\s*await refreshContributionSyncControls\(\);/u,
+  );
+  assert.match(
+    appSource,
+    /clearContributionSyncExactReview\(\);\s*\n[\s\S]{0,220}?contributionSyncAutoReviewedKey = null;/u,
+  );
+});
+
+test("the approve-once consent surface lights up only with the advertised v1.0 sync capability", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const clientSource = await readFile(new URL("../public/data-client.js", import.meta.url), "utf8");
+  // Hidden in markup, and rendered only when the local companion's health
+  // payload advertises exactly the v1.0 contract. Today it does not, so the
+  // improved prepare/review flow remains the journey and no UI claims an
+  // automatic upload exists before the transport does.
+  assert.match(html, /id="incremental-consent"[^>]*hidden/u);
+  assert.match(
+    appSource,
+    /const INCREMENTAL_SYNC_CONTRACT = "telemetry-contribution-v1\.0";/u,
+  );
+  assert.match(
+    appSource,
+    /localCompanionHealth\?\.capabilities\?\.incrementalContributionSync\s*\n?\s*=== INCREMENTAL_SYNC_CONTRACT/u,
+  );
+  assert.match(
+    appSource,
+    /if \(!incrementalSyncCapabilityAdvertised\(\)\) \{\s*\n\s*surface\.hidden = true;/u,
+  );
+  // Approval covers the kind of data, once, and keeps the review-bootstrap
+  // requirement: one verified real instance — the same review token that
+  // gates Send — must exist before approval can be given or recorded.
+  assert.match(html, /Approval is asked once\./u);
+  assert.match(
+    appSource,
+    /approve\.disabled = incrementalConsentBusy\s*\n\s*\|\| incrementalConsentApproved\s*\n\s*\|\| !reviewVerified/u,
+  );
+  assert.match(
+    appSource,
+    /approveIncrementalContribution\(\s*\n?\s*contributionSyncExactReview\.reviewToken/u,
+  );
+  assert.match(
+    clientSource,
+    /localContributionMutation\("incremental-approve", \{\s*\n\s*reviewToken,/u,
+  );
+  // Fail closed: anything but a confirmed approval is reported as a failure,
+  // never rendered as an enabled auto-upload.
+  assert.match(appSource, /result\?\.status !== "approved"/u);
 });
 
 test("foreground sync results expose all bounded outcomes and flag zero-accept passes", async () => {

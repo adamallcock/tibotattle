@@ -695,6 +695,45 @@
         aria-hidden="true"
         inert
       >
+        <!--
+          The guided journey, stated as stages with visible state. Every chip
+          and detail line is rendered from measured facts: companion health,
+          the counted index sources, the freshness of local evidence, and the
+          sign-in / connection state. Sign-in and connection are stage four,
+          shown before any effort is invested below, so nobody prepares and
+          reviews a summary only to discover Send needs a login somewhere
+          else on the page.
+        -->
+        <ol class="journey-stages" id="community-journey" aria-label="Contribution journey stages" data-i18n-aria-label="aria.contributionJourney">
+          <li class="journey-stage" id="journey-stage-app">
+            <p class="journey-stage-head">
+              <span class="journey-stage-name">Mac app &amp; companion</span>
+              <span class="evidence-chip neutral journey-stage-state" id="journey-stage-app-state">—</span>
+            </p>
+            <p class="journey-stage-detail" id="journey-stage-app-detail"></p>
+          </li>
+          <li class="journey-stage" id="journey-stage-index">
+            <p class="journey-stage-head">
+              <span class="journey-stage-name">Local usage index</span>
+              <span class="evidence-chip neutral journey-stage-state" id="journey-stage-index-state">—</span>
+            </p>
+            <p class="journey-stage-detail" id="journey-stage-index-detail"></p>
+          </li>
+          <li class="journey-stage" id="journey-stage-evidence">
+            <p class="journey-stage-head">
+              <span class="journey-stage-name">Local evidence</span>
+              <span class="evidence-chip neutral journey-stage-state" id="journey-stage-evidence-state">—</span>
+            </p>
+            <p class="journey-stage-detail" id="journey-stage-evidence-detail"></p>
+          </li>
+          <li class="journey-stage" id="journey-stage-community">
+            <p class="journey-stage-head">
+              <span class="journey-stage-name">Sign in &amp; connect</span>
+              <span class="evidence-chip neutral journey-stage-state" id="journey-stage-community-state">—</span>
+            </p>
+            <p class="journey-stage-detail" id="journey-stage-community-detail"></p>
+          </li>
+        </ol>
         <div class="contribution-cta-copy">
           <p class="eyebrow">Optional</p>
           <h2 id="contribution-cta-title">Share one anonymous summary</h2>
@@ -823,6 +862,59 @@
           <p class="community-public-evidence">
             <a href="https://tibotattle.com/#community" target="_blank" rel="noopener">See what the community published</a>
           </p>
+          <!--
+            The approve-once consent surface for the incremental full-history
+            contribution model (telemetry-contribution-v1.0). It stays out of
+            the document until the local companion's health payload advertises
+            the v1.0 sync capability, because until that transport exists this
+            surface would describe an upload that cannot happen. No dead
+            toggles: the section is hidden, not disabled.
+          -->
+          <section class="panel incremental-consent" id="incremental-consent" aria-labelledby="incremental-consent-title" hidden>
+            <div class="panel-heading">
+              <div>
+                <p class="panel-kicker">Approve once</p>
+                <h3 id="incremental-consent-title">Automatic full-history contribution</h3>
+              </div>
+              <span class="evidence-chip neutral" id="incremental-consent-state">Not approved</span>
+            </div>
+            <p class="annotation">
+              This build's companion supports incremental upload. Approval
+              covers the kind of data, once — after it, your full history
+              uploads and stays current without per-batch review.
+            </p>
+            <ul class="incremental-consent-facts">
+              <li>Your full usage history uploads first; new events then upload roughly every 6 hours.</li>
+              <li>Community estimates recompute when your data or corrections to it arrive, including for past months.</li>
+              <li>Deletion removes everything you contributed, always.</li>
+            </ul>
+            <details class="contribution-categories">
+              <summary>The exact kind of data covered</summary>
+              <div>
+                <p>
+                  Covered: token counts, model identifiers or keyed
+                  fingerprints, tier, surface and outcome categories,
+                  timestamps, quota percentages, tool-class counts per
+                  session, and stable pseudonymous session identifiers.
+                </p>
+                <p>
+                  Never covered: prompts, responses, file names, paths,
+                  commands, or any account identifier.
+                </p>
+              </div>
+            </details>
+            <div class="contribution-cta-buttons">
+              <button class="button button-primary" id="incremental-consent-approve" type="button" disabled>
+                Approve this kind of data
+              </button>
+            </div>
+            <p class="annotation" id="incremental-consent-gate"></p>
+            <p class="annotation">
+              Approval is asked once. Only a change to the kind of data or the
+              destination asks again.
+            </p>
+            <p class="participant-action-status" id="incremental-consent-status" role="status" hidden></p>
+          </section>
           <details class="journey-disclosure community-review" id="community-contribution-disclosure">
             <summary>
               <span>
@@ -863,13 +955,21 @@
                   Nothing is sent until you have looked at the summary and pressed Send.
                 </p>
               </div>
+              <!--
+                The summary card is the review. A separate "Review summary"
+                button used to reveal exactly the facts already printed here,
+                so the click was pure friction; it is collapsed. The review
+                GATE survives unchanged: TiboTattle still verifies this exact
+                prepared set on this Mac and mints a one-use review token, and
+                Send stays disabled until that verification succeeds.
+              -->
               <div class="sync-next-card" id="sync-next-card">
                 <div class="panel-heading compact-heading">
                   <div>
                     <p class="panel-kicker">Your summary</p>
-                    <h3 id="sync-next-title">Review before sending</h3>
+                    <h3 id="sync-next-title">This summary is the review</h3>
                   </div>
-                  <span class="evidence-chip neutral" id="sync-next-state">Not reviewed yet</span>
+                  <span class="evidence-chip neutral" id="sync-next-state">Checking…</span>
                 </div>
                 <dl class="summary-facts sync-next-facts">
                   <div><dt>Time covered</dt><dd id="sync-next-coverage">—</dd></div>
@@ -878,15 +978,24 @@
                   <div><dt>Upload size</dt><dd id="sync-next-bytes">—</dd></div>
                 </dl>
                 <div class="sync-actions" aria-label="Contribution review controls" data-i18n-aria-label="aria.foregroundContributionControls">
-                  <button class="button button-secondary" id="sync-inspect" type="button">
-                    Review summary
-                  </button>
-                  <button class="button button-primary" id="sync-run-once" type="button">
+                  <button class="button button-primary" id="sync-run-once" type="button" disabled>
                     Send summary
                   </button>
+                  <button class="button button-quiet" id="sync-review-retry" type="button" hidden>
+                    Check summary again
+                  </button>
                 </div>
+                <!--
+                  Why Send is off, stated where Send is. This line is the fix
+                  for "clicking submit says it fails, because it needs a
+                  login": the missing sign-in or connection is named here,
+                  before any click, instead of after a failed send.
+                -->
+                <p class="annotation sync-gate-reason" id="sync-gate-reason" role="status" hidden></p>
                 <p class="annotation">
-                  Send stays off until you have looked at this summary.
+                  Send unlocks only after these exact figures are verified on
+                  this Mac. What you see summarized here is exactly what would
+                  be sent.
                 </p>
                 <p class="participant-action-status" id="sync-action-status" role="status" hidden></p>
               </div>

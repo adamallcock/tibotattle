@@ -3131,6 +3131,24 @@ export class LocalCompanionClient {
     return this.localContributionMutation("sync-inspect-exact");
   }
 
+  /**
+   * Record the approve-once consent for the incremental full-history
+   * contribution model (telemetry-contribution-v1.0). The route is fixed and
+   * only ever called when the companion's health payload advertises the v1.0
+   * sync capability; the review token proves one verified real instance of
+   * the covered data was on screen, which is the first-run review-bootstrap
+   * requirement carried into the approve-once model.
+   */
+  async approveIncrementalContribution(reviewToken) {
+    if (typeof reviewToken !== "string"
+        || !/^[A-Za-z0-9_-]{43}$/u.test(reviewToken)) {
+      throw new TypeError("Incremental consent requires a valid review token.");
+    }
+    return this.localContributionMutation("incremental-approve", {
+      reviewToken,
+    });
+  }
+
   localContributionMutation(path, body = {}) {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/contribution/${path}`, {
       method: "POST",
