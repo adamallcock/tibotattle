@@ -2039,21 +2039,43 @@ private enum NativeDashboardDestination: String, CaseIterable {
     }
 }
 
-/// `NSSplitView` owns the frame of each arranged pane.  A WKWebView is not a
-/// reliable arranged child itself: on a live first launch, Auto Layout can
-/// retain the zero frame it had before the split view received a window.  This
-/// pane makes the ownership explicit and gives WebKit its final frame during
-/// every AppKit layout pass.
+/// `NSSplitView` owns the frame of each pane — now by way of the
+/// `NSSplitViewController` that vends it.  A WKWebView is not a reliable pane
+/// root itself: on a live first launch, Auto Layout can retain the zero frame
+/// it had before the split view received a window.  This pane makes the
+/// ownership explicit and gives WebKit its final frame during every AppKit
+/// layout pass.
+///
+/// `NSSplitViewController` positions the pane, and the pane positions WebKit.
+/// That is the same one-way relationship the hand-rolled `NSSplitView` had, and
+/// it is still the reason WebKit is not laid out by Auto Layout: the frame is
+/// assigned synchronously in `layout()` rather than left to a constraint pass
+/// that has, twice, resolved to zero before the window existed.
 @MainActor
 private final class NativeDashboardReportPane: NSView {
+    /// `--paper` from the dashboard stylesheet. The report document has no
+    /// dark variant, so a fixed value is the honest match. Painting it here
+    /// means no system grey is ever visible in the strip the title bar
+    /// reserves, or in the instant before WebKit has drawn.
+    private static let paper = NSColor(
+        srgbRed: 0xF5 / 255,
+        green: 0xF1 / 255,
+        blue: 0xE8 / 255,
+        alpha: 1
+    )
+
     private let webView: WKWebView
 
     init(webView: WKWebView) {
         self.webView = webView
         super.init(frame: .zero)
-        translatesAutoresizingMaskIntoConstraints = true
+        wantsLayer = true
+        layer?.backgroundColor = Self.paper.cgColor
         webView.translatesAutoresizingMaskIntoConstraints = true
-        webView.autoresizingMask = [.width, .height]
+        // Deliberately no autoresizing mask.  The pane now insets WebKit by
+        // its own safe area, and a mask would spring the view back to the full
+        // bounds on every resize until the next layout pass caught up.
+        webView.autoresizingMask = []
         fitWebViewToBounds()
         addSubview(webView)
     }
@@ -2077,13 +2099,67 @@ private final class NativeDashboardReportPane: NSView {
         fitWebViewToBounds()
     }
 
+    /// The frame WebKit is currently displaying at, expressed in `reference`'s
+    /// coordinates. The chrome smoke mode reads the real frame here rather
+    /// than trusting the pane to describe itself.
+    func webViewFrame(in reference: NSView) -> NSRect {
+        reference.convert(webView.bounds, from: webView)
+    }
+
     @discardableResult
     func fitWebViewToBounds() -> Bool {
-        let frame = bounds.integral
+        // This pane runs the full height of the window so the sidebar beside
+        // it can carry its vibrancy up behind the title bar. The report is a
+        // fixed document rather than a scroll view that tucks under a toolbar,
+        // so WebKit is inset by the safe area the system reserves instead of
+        // having its first screenful hidden by it.
+        let inset = safeAreaInsets
+        var frame = bounds
+        frame.origin.x += inset.left
+        frame.origin.y += inset.bottom
+        frame.size.width -= inset.left + inset.right
+        frame.size.height -= inset.top + inset.bottom
+        frame = frame.integral
         guard frame.width > 0, frame.height > 0 else { return false }
         webView.frame = frame
         webView.setNeedsDisplay(frame)
         return true
+    }
+}
+
+/// The window the app really opens, held open for measurement. `owner` keeps
+/// the delegate that built the window alive for as long as the probe is.
+@MainActor
+private struct NativeDashboardChromeProbe {
+    let owner: AnyObject
+    let window: NSWindow
+    let container: NSView
+    let launcherColumn: NSView
+    let chrome: NativeDashboardChrome
+}
+
+/// Real frames read back from a laid-out dashboard window. Every field is a
+/// measurement, not a value the chrome reports about itself, so the smoke mode
+/// that consumes them cannot pass by asserting on its own intentions.
+private struct NativeDashboardChromeMetrics {
+    let chrome: NSRect
+    let sidebarPane: NSRect
+    /// Where the sidebar's own rows sit. The pane runs behind the title bar;
+    /// the rows inside it must not.
+    let sidebarRows: NSRect
+    let reportPane: NSRect
+    let reportSafeArea: NSEdgeInsets
+    let webView: NSRect
+    let dividerThickness: CGFloat
+    let sidebarMaterial: NSVisualEffectView.Material
+    let sidebarBlending: NSVisualEffectView.BlendingMode
+    let sidebarState: NSVisualEffectView.State
+
+    /// Horizontal distance between the sidebar's trailing edge and the
+    /// report's leading edge. A native sidebar app has no gap here beyond the
+    /// divider itself.
+    var paneGap: CGFloat {
+        abs(reportPane.minX - sidebarPane.maxX)
     }
 }
 
@@ -2092,15 +2168,38 @@ private final class NativeDashboardReportPane: NSView {
 /// sidebar here, while the window's unified toolbar owns status, refresh,
 /// sharing, and settings. Keeping that chrome outside WebKit preserves normal
 /// Mac behavior without replacing the report itself.
+///
+/// This is an `NSSplitViewController` with a real
+/// `NSSplitViewItem(sidebarWithViewController:)` rather than a hand-arranged
+/// `NSSplitView`. The sidebar item is what gives the window full-height sidebar
+/// vibrancy behind the title bar, the system's inset and rounded sidebar
+/// content, enforced minimum and maximum sidebar widths, and the standard
+/// collapse behaviour. The previous code re-implemented the first of those,
+/// approximated the third, and had neither of the other two: measured in a real
+/// 1180x892 window, its sidebar spanned only 844pt and stopped 24pt below the
+/// title bar, which is the hard horizontal seam across the top of the window
+/// the owner reported.
 @MainActor
-private final class NativeDashboardChrome: NSView {
+private final class NativeDashboardChrome: NSSplitViewController {
     /// How the sidebar blends. `.behindWindow` samples the desktop, which is
     /// the native sidebar look; `.withinWindow` renders an opaque strip that
     /// blends with this window's own content. Owner-selected treatment lives
     /// here alone so it can be reversed without touching layout.
     private static let sidebarBlendingMode: NSVisualEffectView.BlendingMode = .behindWindow
+    /// A sidebar item rests at its minimum thickness unless something outweighs
+    /// the item's own holding priority, and a width constraint strong enough to
+    /// do that also resists the user's own divider drag. Measured across
+    /// priorities 250 to 999, the only two outcomes are "rests at the minimum"
+    /// and "pinned". So the resting width is expressed as the minimum, which is
+    /// the 216pt the sidebar was always meant to open at, and the range the
+    /// user can actually use runs upward from there — plus the system's own
+    /// collapse for the narrow case.
+    private static let sidebarMinimumThickness: CGFloat = 216
+    private static let sidebarMaximumThickness: CGFloat = 280
+    private static let reportMinimumThickness: CGFloat = 420
 
     private let sidebar = NSVisualEffectView()
+    private let pageStack = NSStackView()
     private let reportPane: NativeDashboardReportPane
     private var pageButtons: [NativeDashboardDestination: NSButton] = [:]
 
@@ -2108,12 +2207,11 @@ private final class NativeDashboardChrome: NSView {
 
     init(webView: WKWebView) {
         reportPane = NativeDashboardReportPane(webView: webView)
-        super.init(frame: .zero)
-        translatesAutoresizingMaskIntoConstraints = false
+        super.init(nibName: nil, bundle: nil)
 
         sidebar.material = .sidebar
         // `.sidebar` material has nothing to sample when it blends with the
-        // window, because the report pane behind it is an opaque cream web
+        // window, because the report pane beside it is an opaque cream web
         // view; the result reads as flat grey against a warm canvas. Sampling
         // the desktop is what Finder and Mail do, and it is the whole reason
         // the material exists. Flip this one constant to `.withinWindow` for an
@@ -2123,13 +2221,14 @@ private final class NativeDashboardChrome: NSView {
         // background is a tell that the surface is not really native; the
         // system desaturates it with the rest of the window.
         sidebar.state = .followsWindowActiveState
-        sidebar.translatesAutoresizingMaskIntoConstraints = false
 
-        let pageStack = NSStackView()
         pageStack.orientation = .vertical
-        pageStack.alignment = .leading
+        // Rows fill the sidebar's width the way every native sidebar's do. The
+        // previous fixed 192pt row width was wider than the 190pt sidebar it
+        // sat in, so the two constraints fought on every layout pass.
+        pageStack.alignment = .width
         pageStack.spacing = 3
-        pageStack.edgeInsets = NSEdgeInsets(top: 18, left: 12, bottom: 18, right: 12)
+        pageStack.edgeInsets = NSEdgeInsets(top: 10, left: 8, bottom: 18, right: 8)
         pageStack.translatesAutoresizingMaskIntoConstraints = false
         for destination in NativeDashboardDestination.allCases {
             let button = NSButton(
@@ -2149,38 +2248,49 @@ private final class NativeDashboardChrome: NSView {
             button.contentTintColor = .secondaryLabelColor
             button.font = .systemFont(ofSize: 13, weight: .medium)
             button.translatesAutoresizingMaskIntoConstraints = false
-            button.heightAnchor.constraint(equalToConstant: 34).isActive = true
-            button.widthAnchor.constraint(equalToConstant: 192).isActive = true
+            button.heightAnchor.constraint(equalToConstant: 30).isActive = true
             pageStack.addArrangedSubview(button)
             pageButtons[destination] = button
         }
         sidebar.addSubview(pageStack)
 
-        // Keep WebKit inside a pane that follows NSSplitView's frame directly.
-        // This is intentionally not an Auto Layout relationship: AppKit
-        // resizes split panes by changing their frames, and this pane mirrors
-        // that frame to WebKit synchronously in `layout()`.
-        let split = NSSplitView()
-        split.isVertical = true
-        split.dividerStyle = .thin
-        split.translatesAutoresizingMaskIntoConstraints = false
-        split.addArrangedSubview(sidebar)
-        split.addArrangedSubview(reportPane)
-        split.setHoldingPriority(.defaultHigh, forSubviewAt: 0)
-        split.setPosition(216, ofDividerAt: 0)
-
-        addSubview(split)
+        let sidebarController = NSViewController()
+        sidebarController.view = sidebar
         NSLayoutConstraint.activate([
             pageStack.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
             pageStack.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
-            pageStack.topAnchor.constraint(equalTo: sidebar.topAnchor),
-            split.leadingAnchor.constraint(equalTo: leadingAnchor),
-            split.trailingAnchor.constraint(equalTo: trailingAnchor),
-            split.topAnchor.constraint(equalTo: topAnchor),
-            split.bottomAnchor.constraint(equalTo: bottomAnchor),
-            sidebar.widthAnchor.constraint(greaterThanOrEqualToConstant: 190),
-            sidebar.widthAnchor.constraint(lessThanOrEqualToConstant: 250),
+            // The sidebar itself runs behind the title bar; its rows must not.
+            // The system publishes exactly how much room the title bar wants
+            // as this view's safe area, so the rows follow that rather than a
+            // guessed constant that would break in full screen.
+            pageStack.topAnchor.constraint(
+                equalTo: sidebar.safeAreaLayoutGuide.topAnchor
+            ),
         ])
+
+        let sidebarItem = NSSplitViewItem(
+            sidebarWithViewController: sidebarController
+        )
+        sidebarItem.minimumThickness = Self.sidebarMinimumThickness
+        sidebarItem.maximumThickness = Self.sidebarMaximumThickness
+        sidebarItem.canCollapse = true
+        // The sidebar holds its width while the report absorbs the resize.
+        sidebarItem.holdingPriority = .defaultHigh
+        addSplitViewItem(sidebarItem)
+
+        // Keep WebKit inside a pane whose frame the split view controller owns.
+        // This is intentionally not an Auto Layout relationship for the web
+        // view: the pane mirrors its own resolved frame to WebKit
+        // synchronously in `layout()`.
+        let reportController = NSViewController()
+        reportController.view = reportPane
+        let reportItem = NSSplitViewItem(viewController: reportController)
+        reportItem.minimumThickness = Self.reportMinimumThickness
+        reportItem.canCollapse = false
+        addSplitViewItem(reportItem)
+
+        splitView.isVertical = true
+        splitView.dividerStyle = .thin
         select(.overview)
     }
 
@@ -2213,10 +2323,49 @@ private final class NativeDashboardChrome: NSView {
     }
     @discardableResult
     func prepareReportViewport() -> Bool {
-        window?.contentView?.layoutSubtreeIfNeeded()
-        layoutSubtreeIfNeeded()
+        view.window?.contentView?.layoutSubtreeIfNeeded()
+        view.layoutSubtreeIfNeeded()
         reportPane.layoutSubtreeIfNeeded()
         return reportPane.fitWebViewToBounds()
+    }
+
+    /// Walks up from `view` to the subview the split view itself positions.
+    /// A pane's own root can be inset inside that subview by the system, so a
+    /// measurement of "where the split put this pane" has to be taken here and
+    /// not on whichever child happens to be convenient.
+    private static func arrangedPane(
+        for view: NSView,
+        in splitView: NSSplitView
+    ) -> NSView {
+        var candidate = view
+        while let parent = candidate.superview, parent !== splitView {
+            candidate = parent
+        }
+        return candidate
+    }
+
+    /// Reads the laid-out chrome back in `reference`'s coordinates.
+    func measure(in reference: NSView) -> NativeDashboardChromeMetrics {
+        let sidebarPane = Self.arrangedPane(for: sidebar, in: splitView)
+        let reportArranged = Self.arrangedPane(for: reportPane, in: splitView)
+        return NativeDashboardChromeMetrics(
+            chrome: reference.convert(splitView.bounds, from: splitView),
+            sidebarPane: reference.convert(
+                sidebarPane.bounds,
+                from: sidebarPane
+            ),
+            sidebarRows: reference.convert(pageStack.bounds, from: pageStack),
+            reportPane: reference.convert(
+                reportArranged.bounds,
+                from: reportArranged
+            ),
+            reportSafeArea: reportPane.safeAreaInsets,
+            webView: reportPane.webViewFrame(in: reference),
+            dividerThickness: splitView.dividerThickness,
+            sidebarMaterial: sidebar.material,
+            sidebarBlending: sidebar.blendingMode,
+            sidebarState: sidebar.state
+        )
     }
     @objc private func selectDestination(_ sender: NSButton) {
         guard let rawValue = sender.identifier?.rawValue,
@@ -2274,6 +2423,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private let nativeEvidenceReader = LocalCompanionEvidenceReader()
     private var quotaNotificationCoordinator: QuotaNotificationCoordinator?
     private var nativeDashboardChrome: NativeDashboardChrome?
+    private var dashboardContentController: NSViewController?
+    private weak var launcherColumn: NSStackView?
     private weak var nativeStatusRefreshButton: NSButton?
     private weak var nativeStatusToolbarItem: NSToolbarItem?
     private weak var nativeShareToolbarItem: NSToolbarItem?
@@ -2286,13 +2437,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     /// Opaque companion token for the particular refresh this surface started
     /// or joined. It is never persisted or exposed in UI/notification text.
     private var nativeRefreshID: String?
-    private static let toolbarStatusRefreshIdentifier = NSToolbarItem.Identifier(
+    static let toolbarStatusRefreshIdentifier = NSToolbarItem.Identifier(
         "com.usagemonitor.local.dashboard-status-refresh"
     )
-    private static let toolbarShareIdentifier = NSToolbarItem.Identifier(
+    static let toolbarShareIdentifier = NSToolbarItem.Identifier(
         "com.usagemonitor.local.dashboard-share"
     )
-    private static let toolbarSettingsIdentifier = NSToolbarItem.Identifier(
+    static let toolbarSettingsIdentifier = NSToolbarItem.Identifier(
         "com.usagemonitor.local.dashboard-settings"
     )
     private let statusLabel = NSTextField(labelWithString:
@@ -2686,6 +2837,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             actionRow.addView(button, in: .trailing)
         }
 
+        // The launcher surface is an ordinary padded column. It is the only
+        // part of this window that still wants a margin: the dashboard below
+        // is a sidebar app and owns the window edge to edge.
         let layout = NSStackView()
         layout.orientation = .vertical
         layout.alignment = .leading
@@ -2698,21 +2852,35 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         )
         layout.translatesAutoresizingMaskIntoConstraints = false
         layout.addArrangedSubview(statusStack)
-        layout.addArrangedSubview(dashboardContainer)
+        // The dashboard used to be this column's middle row, and it was that
+        // row's low vertical hugging that pushed the recovery controls to the
+        // bottom of the window. The dashboard is no longer inside the column,
+        // so the spacer takes over that one job.
+        let launcherSpacer = NSView()
+        launcherSpacer.translatesAutoresizingMaskIntoConstraints = false
+        launcherSpacer.setContentHuggingPriority(.defaultLow, for: .vertical)
+        launcherSpacer.setContentCompressionResistancePriority(
+            .defaultLow,
+            for: .vertical
+        )
+        layout.addArrangedSubview(launcherSpacer)
         layout.addArrangedSubview(actionRow)
 
+        launcherColumn = layout
         let content = NSView()
         content.addSubview(layout)
+        content.addSubview(dashboardContainer)
         NSLayoutConstraint.activate([
             layout.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             layout.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            layout.topAnchor.constraint(equalTo: content.topAnchor),
+            // The window carries `.fullSizeContentView`, so the launcher
+            // column starts below whatever the title bar reserves rather than
+            // sliding underneath the toolbar.
+            layout.topAnchor.constraint(
+                equalTo: content.safeAreaLayoutGuide.topAnchor
+            ),
             layout.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             statusStack.widthAnchor.constraint(
-                equalTo: layout.widthAnchor,
-                constant: -56
-            ),
-            dashboardContainer.widthAnchor.constraint(
                 equalTo: layout.widthAnchor,
                 constant: -56
             ),
@@ -2720,18 +2888,46 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 equalTo: layout.widthAnchor,
                 constant: -56
             ),
+            launcherSpacer.widthAnchor.constraint(
+                equalTo: layout.widthAnchor,
+                constant: -56
+            ),
+            // The dashboard is the window. Anything less and the sidebar
+            // cannot reach the title bar or the window's rounded corners, and
+            // the report floats in a margin.
+            dashboardContainer.leadingAnchor.constraint(
+                equalTo: content.leadingAnchor
+            ),
+            dashboardContainer.trailingAnchor.constraint(
+                equalTo: content.trailingAnchor
+            ),
+            dashboardContainer.topAnchor.constraint(
+                equalTo: content.topAnchor
+            ),
+            dashboardContainer.bottomAnchor.constraint(
+                equalTo: content.bottomAnchor
+            ),
         ])
 
         let newWindow = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1_180, height: 860),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: Self.dashboardWindowStyleMask,
             backing: .buffered,
             defer: false
         )
         newWindow.title = BundledProduct.displayName
         newWindow.toolbar = makeDashboardToolbar()
         newWindow.toolbarStyle = .unified
-        newWindow.contentView = content
+        // A content *view controller* so the split view controller has a
+        // parent to be a child of. `NSSplitViewController` only gets the
+        // system's sidebar treatment when it is inside a view-controller
+        // hierarchy; measured, an embedded child controller is treated exactly
+        // like a window's own content controller.
+        let contentController = NSViewController()
+        contentController.view = content
+        newWindow.contentViewController = contentController
+        dashboardContentController = contentController
+        newWindow.setContentSize(NSSize(width: 1_180, height: 860))
         newWindow.contentMinSize = NSSize(width: 900, height: 420)
         newWindow.isReleasedWhenClosed = false
         newWindow.delegate = self
@@ -2740,6 +2936,21 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         window = newWindow
         NSApp.activate(ignoringOtherApps: true)
     }
+
+    /// `.fullSizeContentView` is the setting that lets the sidebar split item
+    /// carry its material up behind the title bar. Measured on macOS 26:
+    /// without it the split view stops at `contentLayoutRect`, the system
+    /// draws no per-pane title bar background, and the panes report a zero
+    /// safe-area inset — that is, the sidebar is cut off at the top exactly as
+    /// reported. With it the sidebar's pane spans the full window height and
+    /// the report pane is handed a 66pt title bar inset to respect.
+    private static let dashboardWindowStyleMask: NSWindow.StyleMask = [
+        .titled,
+        .closable,
+        .miniaturizable,
+        .resizable,
+        .fullSizeContentView,
+    ]
 
     private func makeDashboardToolbar() -> NSToolbar {
         let toolbar = NSToolbar(
@@ -2986,6 +3197,70 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         """)
     }
 
+    /// Puts the native chrome into the dashboard area of the window. Both the
+    /// live dashboard and the chrome smoke mode go through here, so the guard
+    /// measures the frame the app really installs.
+    @discardableResult
+    private func installDashboardChrome(
+        webView: WKWebView
+    ) -> NativeDashboardChrome {
+        let chrome = NativeDashboardChrome(webView: webView)
+        dashboardContentController?.addChild(chrome)
+        let chromeView = chrome.view
+        chromeView.translatesAutoresizingMaskIntoConstraints = false
+        dashboardContainer.addSubview(chromeView)
+        NSLayoutConstraint.activate([
+            chromeView.leadingAnchor.constraint(
+                equalTo: dashboardContainer.leadingAnchor
+            ),
+            chromeView.trailingAnchor.constraint(
+                equalTo: dashboardContainer.trailingAnchor
+            ),
+            chromeView.topAnchor.constraint(
+                equalTo: dashboardContainer.topAnchor
+            ),
+            chromeView.bottomAnchor.constraint(
+                equalTo: dashboardContainer.bottomAnchor
+            ),
+            chromeView.heightAnchor.constraint(
+                greaterThanOrEqualToConstant: 320
+            ),
+        ])
+        nativeDashboardChrome = chrome
+        return chrome
+    }
+
+    /// Builds the shipped dashboard window and installs the native chrome
+    /// without starting a companion or loading a page. This is the seam the
+    /// chrome smoke mode drives: it exercises `createWindow()` and
+    /// `installDashboardChrome(webView:)` themselves rather than a replica of
+    /// them, so a layout regression cannot hide behind a test-only assembly.
+    static func makeDashboardChromeProbe(
+        webView: WKWebView
+    ) -> NativeDashboardChromeProbe? {
+        let delegate = AppDelegate(
+            semanticOpenTarget: SemanticOpenTarget(
+                scheme: BundledProduct.appOpenScheme,
+                host: BundledProduct.appOpenHost,
+                canonicalURL: BundledProduct.appOpenURL
+            )
+        )
+        delegate.createWindow()
+        guard let window = delegate.window else { return nil }
+        let chrome = delegate.installDashboardChrome(webView: webView)
+        delegate.dashboardContainer.isHidden = false
+        delegate.statusStack.isHidden = true
+        delegate.actionRow.isHidden = true
+        guard let launcherColumn = delegate.launcherColumn else { return nil }
+        return NativeDashboardChromeProbe(
+            owner: delegate,
+            window: window,
+            container: delegate.dashboardContainer,
+            launcherColumn: launcherColumn,
+            chrome: chrome
+        )
+    }
+
     /// The dashboard runs inside a native AppKit shell.  The HTML stays a
     /// local report surface, while page selection and refresh are normal Mac
     /// controls rather than more web chrome inside a launcher.
@@ -3009,30 +3284,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                     self?.changeLanguagePreference(preference)
                 }
             )
-            let chrome = NativeDashboardChrome(webView: created.webView)
+            let chrome = installDashboardChrome(webView: created.webView)
             chrome.onNavigate = { [weak self] destination in
                 self?.navigateNativeDashboard(to: destination)
             }
-            dashboardContainer.addSubview(chrome)
-            NSLayoutConstraint.activate([
-                chrome.leadingAnchor.constraint(
-                    equalTo: dashboardContainer.leadingAnchor
-                ),
-                chrome.trailingAnchor.constraint(
-                    equalTo: dashboardContainer.trailingAnchor
-                ),
-                chrome.topAnchor.constraint(
-                    equalTo: dashboardContainer.topAnchor
-                ),
-                chrome.bottomAnchor.constraint(
-                    equalTo: dashboardContainer.bottomAnchor
-                ),
-                chrome.heightAnchor.constraint(
-                    greaterThanOrEqualToConstant: 320
-                ),
-            ])
             dashboardWebHost = created
-            nativeDashboardChrome = chrome
             return created
         }()
         statusLabel.stringValue = TiboTattleLocalization.string(
@@ -6603,9 +6859,10 @@ private enum NativeDashboardLayoutSmokeTest {
             backing: .buffered,
             defer: false
         )
-        window.contentView = chrome
+        window.contentViewController = chrome
+        window.setContentSize(NSSize(width: 1_180, height: 860))
         window.displayIfNeeded()
-        chrome.layoutSubtreeIfNeeded()
+        chrome.view.layoutSubtreeIfNeeded()
         let webFrame = host.webView.frame
         guard webFrame.width >= 600, webFrame.height >= 600 else {
             FileHandle.standardError.write(
@@ -6619,6 +6876,298 @@ private enum NativeDashboardLayoutSmokeTest {
                 + "web_height=\(Int(webFrame.height))"
         )
         return 0
+    }
+}
+
+/// Opens the shipped dashboard window and measures the chrome in it. This is
+/// the guard for the reported "the menu is not seamless, not rounded, and not
+/// even the right size" defect, and the three things it pins are the three
+/// things that were wrong:
+///
+/// 1. the chrome filled only an inset region of the window, so the dashboard
+///    floated inside a margin instead of being the window;
+/// 2. the sidebar began below the title bar, so its vibrancy was cut by a hard
+///    horizontal seam across the top of the window;
+/// 3. the window did not carry `.fullSizeContentView`, which is the setting
+///    that lets a sidebar split item run its material up behind the title bar
+///    at all.
+///
+/// None of that is visible in source text - the old code reads as a perfectly
+/// ordinary split view pinned to its container's edges. It is only visible in
+/// the frames a real window assigns, so this measures them.
+@MainActor
+private enum NativeDashboardChromeLayoutSmokeTest {
+    private static let resizedContentSize = NSSize(width: 1_040, height: 700)
+
+    static func run() -> Int32 {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        let host = DashboardWebHost(
+            onLoaded: {},
+            onFailure: { _ in },
+            onDownloadFailure: {},
+            openExternally: { _ in },
+            onNavigation: { _ in },
+            onLanguagePreferenceChange: { _ in }
+        )
+        guard let probe = AppDelegate.makeDashboardChromeProbe(
+            webView: host.webView
+        ) else {
+            FileHandle.standardError.write(Data(
+                "macOS dashboard chrome smoke failed: no window\n".utf8
+            ))
+            return 1
+        }
+        let window = probe.window
+        guard let content = window.contentView else {
+            FileHandle.standardError.write(Data(
+                "macOS dashboard chrome smoke failed: no content view\n".utf8
+            ))
+            return 1
+        }
+
+        func settle() {
+            window.layoutIfNeeded()
+            window.displayIfNeeded()
+            content.layoutSubtreeIfNeeded()
+        }
+        settle()
+
+        var failures: [String] = []
+        let initial = evaluate(
+            window: window,
+            content: content,
+            container: probe.container,
+            launcherColumn: probe.launcherColumn,
+            metrics: probe.chrome.measure(in: content),
+            label: "initial",
+            failures: &failures
+        )
+        // Read while the window is still at its opening size: the title bar
+        // rect moves with the window, so this cannot be sampled after resizing.
+        let behindTitleBar = initial.sidebarPane.maxY
+            - window.contentLayoutRect.maxY
+
+        // A pane that only happens to be right at the size the window opened
+        // at is not a pane that tracks the split. WebKit here is deliberately
+        // not laid out by Auto Layout, so the resize is the case that matters.
+        window.setContentSize(resizedContentSize)
+        settle()
+        let resized = evaluate(
+            window: window,
+            content: content,
+            container: probe.container,
+            launcherColumn: probe.launcherColumn,
+            metrics: probe.chrome.measure(in: content),
+            label: "resized",
+            failures: &failures
+        )
+        if abs(resized.webView.width - initial.webView.width) < 1 {
+            failures.append(
+                "web pane did not follow the resize "
+                    + "(width stayed \(Int(resized.webView.width)))"
+            )
+        }
+
+        guard failures.isEmpty else {
+            FileHandle.standardError.write(Data(
+                ("macOS dashboard chrome smoke failed\n"
+                    + failures.map { "  - \($0)\n" }.joined()).utf8
+            ))
+            return 1
+        }
+        print(
+            "USAGE_MONITOR_MACOS_DASHBOARD_CHROME "
+                + "full_size_content=true "
+                + "chrome_fills_window=true "
+                + "sidebar_full_height=true "
+                + "sidebar_behind_titlebar=\(Int(behindTitleBar.rounded())) "
+                + "pane_gap=\(Int(initial.paneGap.rounded())) "
+                + "sidebar_width=\(Int(initial.sidebarPane.width.rounded())) "
+                + "web_width=\(Int(initial.webView.width.rounded())) "
+                + "web_height=\(Int(initial.webView.height.rounded())) "
+                + "resized_web_width="
+                + "\(Int(resized.webView.width.rounded())) "
+                + "resized_web_height="
+                + "\(Int(resized.webView.height.rounded())) "
+                + "vibrancy=sidebar,behind-window,follows-window-active-state"
+        )
+        return 0
+    }
+
+    private static func evaluate(
+        window: NSWindow,
+        content: NSView,
+        container: NSView,
+        launcherColumn: NSView,
+        metrics: NativeDashboardChromeMetrics,
+        label: String,
+        failures: inout [String]
+    ) -> NativeDashboardChromeMetrics {
+        let tolerance: CGFloat = 0.5
+        let bounds = content.bounds
+        let titleBar = window.contentLayoutRect
+
+        func require(_ condition: Bool, _ message: @autoclosure () -> String) {
+            if !condition { failures.append("[\(label)] \(message())") }
+        }
+
+        // The window itself. Without `.fullSizeContentView` no arrangement of
+        // subviews can put anything behind the title bar.
+        require(
+            window.styleMask.contains(.fullSizeContentView),
+            "window lacks .fullSizeContentView, so nothing can sit behind the "
+                + "title bar"
+        )
+        require(
+            window.toolbarStyle == .unified,
+            "toolbar style is \(window.toolbarStyle.rawValue), not unified"
+        )
+
+        // 1. The dashboard is the window, not a panel floating inside it.
+        let containerFrame = content.convert(container.bounds, from: container)
+        require(
+            abs(containerFrame.minX - bounds.minX) <= tolerance
+                && abs(containerFrame.maxX - bounds.maxX) <= tolerance
+                && abs(containerFrame.minY - bounds.minY) <= tolerance
+                && abs(containerFrame.maxY - bounds.maxY) <= tolerance,
+            "dashboard area \(rect(containerFrame)) does not fill the window "
+                + "content \(rect(bounds))"
+        )
+        require(
+            abs(metrics.chrome.width - bounds.width) <= tolerance
+                && abs(metrics.chrome.height - bounds.height) <= tolerance,
+            "chrome \(rect(metrics.chrome)) does not fill the window content "
+                + "\(rect(bounds))"
+        )
+
+        // 2. The sidebar runs the full height of the window content and keeps
+        // going above the title bar's own layout rect. That second half is the
+        // seam: a sidebar that stops at `contentLayoutRect.maxY` is exactly the
+        // hard horizontal line the owner reported.
+        require(
+            abs(metrics.sidebarPane.minY - bounds.minY) <= tolerance
+                && abs(metrics.sidebarPane.maxY - bounds.maxY) <= tolerance,
+            "sidebar \(rect(metrics.sidebarPane)) does not span the full "
+                + "window content height \(Int(bounds.height))"
+        )
+        require(
+            metrics.sidebarPane.maxY >= titleBar.maxY + 1,
+            "sidebar stops at \(Int(metrics.sidebarPane.maxY)) but the title "
+                + "bar starts at \(Int(titleBar.maxY)), so it does not run "
+                + "behind the title bar"
+        )
+        require(
+            metrics.sidebarPane.width >= 190
+                && metrics.sidebarPane.width <= 288,
+            "sidebar width \(Int(metrics.sidebarPane.width)) is outside the "
+                + "190-288 band"
+        )
+        // The material runs behind the title bar; the rows in it must not, or
+        // the first destination is hidden under the toolbar.
+        require(
+            metrics.sidebarRows.maxY <= titleBar.maxY + tolerance,
+            "sidebar rows top \(Int(metrics.sidebarRows.maxY)) is above the "
+                + "title bar's content rect \(Int(titleBar.maxY))"
+        )
+        require(
+            metrics.sidebarRows.maxY >= titleBar.maxY - 24,
+            "sidebar rows start \(Int(titleBar.maxY - metrics.sidebarRows.maxY))"
+                + "pt below the title bar, which is a gap, not an inset"
+        )
+
+        // 3. Sidebar and report meet: same span, no gap beyond the divider.
+        require(
+            metrics.paneGap <= max(metrics.dividerThickness, 1) + tolerance,
+            "gap of \(metrics.paneGap) between the sidebar and the report "
+                + "exceeds the \(metrics.dividerThickness)pt divider"
+        )
+        require(
+            abs(metrics.reportPane.minY - metrics.sidebarPane.minY)
+                <= tolerance
+                && abs(metrics.reportPane.maxY - metrics.sidebarPane.maxY)
+                <= tolerance,
+            "sidebar \(rect(metrics.sidebarPane)) and report "
+                + "\(rect(metrics.reportPane)) do not share a vertical span"
+        )
+
+        // 4. WebKit tracks the split pane it was given, inset by whatever the
+        // system reserves for the title bar so the report is never underneath
+        // the toolbar. A blank or mis-sized dashboard is what this catches.
+        require(
+            abs(metrics.webView.minX - metrics.reportPane.minX) <= tolerance
+                && abs(metrics.webView.width - metrics.reportPane.width)
+                <= tolerance
+                && abs(metrics.webView.minY - metrics.reportPane.minY)
+                <= tolerance,
+            "web pane \(rect(metrics.webView)) does not track the report pane "
+                + "\(rect(metrics.reportPane))"
+        )
+        require(
+            abs(
+                metrics.webView.maxY
+                    - (metrics.reportPane.maxY - metrics.reportSafeArea.top)
+            ) <= tolerance,
+            "web pane top \(Int(metrics.webView.maxY)) does not honour the "
+                + "\(Int(metrics.reportSafeArea.top))pt title bar inset of the "
+                + "report pane \(rect(metrics.reportPane))"
+        )
+        require(
+            metrics.webView.maxY <= titleBar.maxY + tolerance,
+            "web pane top \(Int(metrics.webView.maxY)) is above the title "
+                + "bar's content rect \(Int(titleBar.maxY)), so the report is "
+                + "hidden under the toolbar"
+        )
+        require(
+            metrics.webView.width >= 400 && metrics.webView.height >= 300,
+            "web pane \(rect(metrics.webView)) is too small to render a report"
+        )
+
+        // 5. Making the content full size moves the launcher surface too. Its
+        // status text must still start below the toolbar rather than sliding
+        // underneath it.
+        let launcher = content.convert(
+            launcherColumn.bounds,
+            from: launcherColumn
+        )
+        require(
+            launcher.maxY <= titleBar.maxY + tolerance,
+            "launcher column top \(Int(launcher.maxY)) is above the title "
+                + "bar's content rect \(Int(titleBar.maxY))"
+        )
+
+        // 6. The unified toolbar and the three items it carries.
+        let toolbarItems = window.toolbar?.items.map(\.itemIdentifier) ?? []
+        for expected in [
+            AppDelegate.toolbarStatusRefreshIdentifier,
+            AppDelegate.toolbarShareIdentifier,
+            AppDelegate.toolbarSettingsIdentifier,
+        ] where !toolbarItems.contains(expected) {
+            failures.append(
+                "[\(label)] toolbar is missing \(expected.rawValue)"
+            )
+        }
+
+        // 7. The vibrancy treatment the owner picked.
+        require(
+            metrics.sidebarMaterial == .sidebar,
+            "sidebar material is \(metrics.sidebarMaterial.rawValue)"
+        )
+        require(
+            metrics.sidebarBlending == .behindWindow,
+            "sidebar blending is \(metrics.sidebarBlending.rawValue)"
+        )
+        require(
+            metrics.sidebarState == .followsWindowActiveState,
+            "sidebar vibrancy state is \(metrics.sidebarState.rawValue), not "
+                + "followsWindowActiveState"
+        )
+        return metrics
+    }
+
+    private static func rect(_ value: NSRect) -> String {
+        "(\(Int(value.minX)),\(Int(value.minY)) "
+            + "\(Int(value.width))x\(Int(value.height)))"
     }
 }
 
@@ -6721,6 +7270,9 @@ private struct UsageMonitorMain {
         }
         if arguments.contains("--native-settings-layout-smoke-test") {
             exit(NativeSettingsLayoutSmokeTest.run())
+        }
+        if arguments.contains("--native-dashboard-chrome-smoke-test") {
+            exit(NativeDashboardChromeLayoutSmokeTest.run())
         }
         if arguments.contains("--native-dashboard-layout-smoke-test") {
             exit(MainActor.assumeIsolated {

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { createReadStream, watch } from "node:fs";
+import { watch } from "node:fs";
 import { mkdir, open, opendir, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -25,10 +25,12 @@ import {
 import {
   stableJson,
 } from "./storage.js";
+import { forEachRolloutLine } from "./rollout-line-reader.js";
 import {
   acquireLocalCollectorStateLock,
   commitLocalCollectorState,
   defaultLocalCollectorStatePath,
+  openLocalCollectorStateSession,
   prepareLocalCollectorState,
   readLocalCollectorCheckpoint,
   saveLocalCollectorCheckpoint,
@@ -39,6 +41,32 @@ const RECORD_SCHEMA_VERSION = "0.3";
 const MAX_RECENT_EVENT_KEYS = 5_000;
 const MAX_ACCOUNT_SCOPE_MARKER_AGE_MS = 5 * 60_000;
 const MAX_BUFFERED_ROLLOUT_LINE_BYTES = 16 * 1024 * 1024;
+// Every line the collector can act on is tiny. Measured across the largest
+// rollout files (36,395 relevant lines): the longest `turn_context` was 2 KiB,
+// `token_count` 1 KiB, `thread_settings_applied` 1 KiB — not one relevant line
+// reached 64 KiB. The 80 MiB lines in those same files are `compacted`,
+// `response_item` and `agent_reasoning` records, which are never parsed.
+//
+// So a line above this cap is provably not one of ours, and is stepped over
+// without ever being buffered or concatenated. That is what makes peak memory
+// independent of rollout file size: a 15.34 GiB single file costs no more than
+// a small one. `MAX_BUFFERED_ROLLOUT_LINE_BYTES` remains the separate,
+// far larger allowance for realigning a cursor onto a line boundary.
+const MAX_RELEVANT_ROLLOUT_LINE_BYTES = 64 * 1024;
+// Matched against the raw line buffer, so an irrelevant line is rejected by a
+// SIMD memchr rather than by decoding it to a JavaScript string first.
+//
+// `"custom_tool_call"` replaces a bare `tool_call` substring test. The loose
+// marker matched large records that were never going to classify as a tool
+// call, and tightening it was worth 6.8s of cumulative scan time across the
+// corpus on its own.
+const ROLLOUT_LINE_NEEDLES = Object.freeze([
+  Buffer.from('"turn_context"'),
+  Buffer.from('"token_count"'),
+  Buffer.from('"thread_settings_applied"'),
+  Buffer.from('"function_call"'),
+  Buffer.from('"custom_tool_call"'),
+]);
 const MAX_RECORD_BATCH_SIZE = 1_000;
 const MAX_RECENT_TAIL_BYTES = 768 * 1024 * 1024;
 const MAX_RECENT_PRELUDE_BYTES = 32 * 1024 * 1024;
@@ -551,69 +579,27 @@ function cursorKey(metadata) {
 }
 
 async function forEachCompleteLine(path, offset, size, onLine, {
-  maximumBufferedLineBytes = MAX_BUFFERED_ROLLOUT_LINE_BYTES,
-  highWaterMark = 256 * 1024,
+  maximumBufferedLineBytes = MAX_RELEVANT_ROLLOUT_LINE_BYTES,
+  highWaterMark = 1024 * 1024,
   signal = null,
 } = {}) {
-  if (size <= offset) {
-    return {
-      nextOffset: offset,
-      partialDeferred: false,
-      oversizedLinesSkipped: 0,
-      aborted: signal?.aborted === true,
-    };
-  }
-  const input = createReadStream(path, { start: offset, end: size - 1, highWaterMark });
-  let lineChunks = [];
-  let lineBytes = 0;
-  let skippingOversized = false;
-  let absolutePosition = offset;
-  let nextOffset = offset;
   let oversizedLinesSkipped = 0;
-  let aborted = false;
-
-  function appendSegment(segment) {
-    if (skippingOversized || segment.length === 0) return;
-    lineBytes += segment.length;
-    if (lineBytes > maximumBufferedLineBytes) {
-      lineChunks = [];
-      skippingOversized = true;
-      return;
-    }
-    lineChunks.push(segment);
-  }
-
-  for await (const chunk of input) {
-    if (signal?.aborted) {
-      aborted = true;
-      break;
-    }
-    let segmentStart = 0;
-    for (let index = 0; index < chunk.length; index += 1) {
-      if (signal?.aborted) {
-        aborted = true;
-        break;
-      }
-      if (chunk[index] !== 0x0a) continue;
-      appendSegment(chunk.subarray(segmentStart, index));
-      const lineEndOffset = absolutePosition + index + 1;
-      if (skippingOversized) oversizedLinesSkipped += 1;
-      else await onLine(Buffer.concat(lineChunks, lineBytes).toString("utf8"), lineEndOffset);
-      lineChunks = [];
-      lineBytes = 0;
-      skippingOversized = false;
-      nextOffset = lineEndOffset;
-      segmentStart = index + 1;
-    }
-    if (aborted) break;
-    appendSegment(chunk.subarray(segmentStart));
-    absolutePosition += chunk.length;
-  }
+  const read = await forEachRolloutLine(path, {
+    start: offset,
+    end: size,
+    maximumLineBytes: maximumBufferedLineBytes,
+    highWaterMark,
+    signal,
+    onLine: async (line, lineEndOffset, partial) => {
+      if (partial) oversizedLinesSkipped += 1;
+      await onLine(line, lineEndOffset, partial);
+    },
+  });
   return {
-    nextOffset,
-    partialDeferred: !aborted && absolutePosition > nextOffset,
+    nextOffset: read.nextOffset,
+    partialDeferred: read.partialDeferred,
     oversizedLinesSkipped,
-    aborted,
+    aborted: read.aborted,
   };
 }
 
@@ -833,6 +819,15 @@ export async function ingestRolloutUpdates({
       throw new TypeError(`${name} must be a positive safe integer`);
     }
   }
+  // A caller may make the relevant-line cap tighter than the measured 64 KiB
+  // ceiling but never looser: the bound is what keeps peak memory independent
+  // of rollout file size, so it is not a knob a caller can give away.
+  // `maximumBufferedLineBytes` continues to govern cursor realignment, which
+  // legitimately needs a much larger allowance.
+  const relevantLineBytes = Math.min(
+    maximumBufferedLineBytes,
+    MAX_RELEVANT_ROLLOUT_LINE_BYTES,
+  );
   const recentSinceAt = recentBackfillSinceAt === null
     ? null
     : canonicalInstant(recentBackfillSinceAt, "recentBackfillSinceAt");
@@ -1055,15 +1050,33 @@ export async function ingestRolloutUpdates({
     let firstRelevantMs = Number.POSITIVE_INFINITY;
     let lastRelevantMs = Date.parse(state.recentTail?.lastScannedAt);
     let timestampOrderViolated = state.recentTail?.timestampOrderViolated === true;
-    const chunk = await forEachCompleteLine(file.path, state.offset, file.metadata.size, async (line, lineEndOffset) => {
+    const chunk = await forEachCompleteLine(file.path, state.offset, file.metadata.size, async (line, lineEndOffset, partial) => {
       state.offset = lineEndOffset;
       markChanged();
-      if (!line) return;
+      if (line.length === 0) return;
       checkpoint.diagnostics.completeLinesRead += 1;
-      if (!line.includes('"turn_context"') && !line.includes('"token_count"') && !line.includes('"thread_settings_applied"') && !line.includes('"function_call"') && !line.includes("tool_call")) return;
+      // Byte-level relevance test. The overwhelming majority of rollout lines
+      // are irrelevant, and matching on the raw buffer means they are never
+      // decoded to UTF-8 at all.
+      if (!ROLLOUT_LINE_NEEDLES.some((needle) => line.includes(needle))) return;
+      if (partial) {
+        // Degrade, don't discard. A relevant line above the cap has already
+        // been counted as oversized; salvage only the model carried forward
+        // from `turn_context`, so a truncated record cannot silently reset the
+        // model for every later event in the file. Token counters are never
+        // guessed at here: a partial cumulative total would corrupt the delta
+        // baseline for the rest of the file, and a wrong number is worse than
+        // a missing one.
+        const prefix = line.toString("utf8");
+        if (prefix.includes('"turn_context"')) {
+          const salvaged = /"model"\s*:\s*"([A-Za-z0-9._:-]{1,64})"/u.exec(prefix);
+          if (salvaged !== null) state.currentModel = salvaged[1];
+        }
+        return;
+      }
       let raw;
       try {
-        raw = JSON.parse(line);
+        raw = JSON.parse(line.toString("utf8"));
       } catch {
         checkpoint.diagnostics.malformedLines += 1;
         return;
@@ -1094,7 +1107,7 @@ export async function ingestRolloutUpdates({
       maximumBufferedRecords = Math.max(maximumBufferedRecords, recordBatch.length);
       if (safe.windows?.length > 0) checkpoint.lastQuotaObservedAt = safe.observedAt;
       if (recordBatch.length >= maximumRecordBatchSize) await flushRecordBatch();
-    }, { maximumBufferedLineBytes, signal });
+    }, { maximumBufferedLineBytes: relevantLineBytes, signal });
     if (chunk.partialDeferred) checkpoint.diagnostics.partialLinesDeferred += 1;
     checkpoint.diagnostics.oversizedLinesSkipped = (checkpoint.diagnostics.oversizedLinesSkipped ?? 0) + chunk.oversizedLinesSkipped;
     if (chunk.nextOffset !== state.offset) {
@@ -1422,14 +1435,25 @@ export async function runCollectorOnce({
   const release = await acquireLocalCollectorStateLock(stateFile, { clock });
   let client = null;
   let abortClient = null;
+  // One open connection for the whole run instead of one per batch, and one
+  // integrity check plus one fsync at the end instead of one per batch. The
+  // per-batch `PRAGMA quick_check` reads every page of the store, so it grew
+  // with the store: 636-663 ms of a 754 ms batch on the live 1.7 GB state.
+  // Only the built-in write path can be pooled this way; an injected
+  // `commitState` or `saveState` keeps its exact previous behaviour.
+  const pooled = commitState === commitLocalCollectorState
+    && saveState === saveLocalCollectorCheckpoint
+    ? await openLocalCollectorStateSession({ stateFile, clock })
+    : null;
+  let sessionSettled = false;
   try {
     const nowIso = new Date(clock()).toISOString();
     const existing = await readLocalCollectorCheckpoint({ stateFile });
     const saveCheckpoint = async () => {
-      await saveState({ stateFile, checkpoint, clock });
+      await saveState({ stateFile, checkpoint, clock, session: pooled });
     };
     const commitRecords = async (records) => {
-      await commitState({ stateFile, records, checkpoint, clock });
+      await commitState({ stateFile, records, checkpoint, clock, session: pooled });
     };
     const requestedBackfillStart = backfill
       ? (backfillSinceAt ?? "1970-01-01T00:00:00.000Z")
@@ -1658,10 +1682,25 @@ export async function runCollectorOnce({
       indexing: cloneIndexing(checkpoint.indexing),
       diagnostics: publicDiagnostics(checkpoint.diagnostics),
     };
+    if (pooled !== null) {
+      sessionSettled = true;
+      await pooled.close();
+    }
     return resultStateProperties(result, { stateFile });
   } finally {
     signal?.removeEventListener("abort", abortClient);
     client?.close();
+    if (pooled !== null && !sessionSettled) {
+      sessionSettled = true;
+      // A run that is exiting through an error path still owes the store its
+      // settle: everything already committed stays committed, and the
+      // integrity check is not skipped just because the run did not finish.
+      try {
+        await pooled.close();
+      } catch {
+        await pooled.abort().catch(() => {});
+      }
+    }
     await release();
   }
 }

@@ -945,19 +945,31 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     ["overview", "weekly", "trends", "method", "community"],
   );
   assert.match(source, /private final class NativeDashboardReportPane/u);
-  assert.match(source, /NSSplitView\(\)/u);
+  // The chrome is an NSSplitViewController with a real sidebar item, so the
+  // split view is vended by AppKit rather than constructed here. That is what
+  // gives the sidebar its system vibrancy, rounding and full-height behaviour;
+  // the geometry it produces is asserted by the measured chrome smoke below.
+  assert.match(source, /class NativeDashboardChrome: NSSplitViewController/u);
+  assert.match(source, /NSSplitViewItem\(sidebarWithViewController:/u);
   assert.match(
     source,
     /reportPane = NativeDashboardReportPane\(webView: webView\)/u,
   );
-  assert.match(source, /webView\.autoresizingMask = \[\.width, \.height\]/u);
+  // The web view must NOT carry an autoresizing mask: the pane runs full
+  // height so the sidebar can reach the title bar, and a mask fights the
+  // safe-area inset applied on resize. That the web view still tracks its
+  // pane is asserted by measurement in the chrome smoke rather than by the
+  // presence of a mask.
+  assert.match(source, /webView\.autoresizingMask = \[\]/u);
+  assert.doesNotMatch(source, /webView\.autoresizingMask = \[\.width/u);
   assert.match(source, /override func layout\(\) \{[\s\S]*?fitWebViewToBounds\(\)/u);
   assert.match(source, /webView\.frame = frame/u);
   assert.match(source, /private func loadWhenViewportIsReady\(\)/u);
   assert.match(source, /viewport\.width >= 120, viewport\.height >= 120/u);
   assert.match(source, /nativeDashboardChrome\?\.prepareReportViewport\(\)/u);
   assert.match(source, /document\.querySelector\('#main'\)\?\.innerText/u);
-  assert.match(source, /split\.addArrangedSubview\(reportPane\)/u);
+  assert.match(source, /addSplitViewItem\(reportItem\)/u);
+  assert.doesNotMatch(source, /addSplitViewItem\(webView\)/u);
   assert.doesNotMatch(source, /split\.addArrangedSubview\(webView\)/u);
   assert.match(source, /newWindow\.toolbar = makeDashboardToolbar\(\)/u);
   assert.match(source, /newWindow\.toolbarStyle = \.unified/u);
@@ -1094,7 +1106,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.equal(
     source.match(/setActivationPolicy\(\.accessory\)/gu)?.length,
-    2,
+    3,
     "only isolated AppKit smoke modes may use accessory activation",
   );
   for (const forbidden of [
@@ -1288,22 +1300,31 @@ test("unified toolbar preserves the rich loopback report and single authority", 
   );
   // The standard AppKit window (and its traffic lights) remains; the toolbar
   // is a presentation layer on top of the existing embedded WebKit report.
+  // Pin the DASHBOARD window's own style mask. The previous literal regex
+  // also matched an unrelated window literal inside a smoke test, so it kept
+  // passing while no longer describing the dashboard at all.
+  // `.fullSizeContentView` is what lets the sidebar run behind the title bar.
+  assert.match(source, /dashboardWindowStyleMask: NSWindow\.StyleMask = \[/u);
   assert.match(
     source,
-    /styleMask: \[\.titled, \.closable, \.miniaturizable, \.resizable\]/u,
+    /dashboardWindowStyleMask: NSWindow\.StyleMask = \[[^\]]*\.fullSizeContentView/u,
   );
+  assert.match(source, /styleMask: Self\.dashboardWindowStyleMask/u);
   assert.match(
     source,
     /newWindow\.toolbar = makeDashboardToolbar\(\)\s*\n\s*newWindow\.toolbarStyle = \.unified/u,
   );
 
   const chrome = source.match(
-    /private final class NativeDashboardChrome: NSView \{([\s\S]*?)\n\}\n\n@MainActor\nprivate final class AppDelegate/u,
+    /private final class NativeDashboardChrome: NSSplitViewController \{([\s\S]*?)\n\}\n\n@MainActor\nprivate final class AppDelegate/u,
   )?.[1];
   assert.ok(chrome, "native dashboard chrome should be present");
   // Removing the old in-content header prevents a second refresh/status row;
   // the existing sidebar and report stay in place beneath the toolbar.
-  assert.match(chrome, /split\.topAnchor\.constraint\(equalTo: topAnchor\)/u);
+  // The split controller owns pane geometry now, so there is no hand-written
+  // top constraint. The genuine behaviour this block protects - no second
+  // in-content refresh/status row - is asserted below and is unchanged.
+  assert.match(chrome, /addSplitViewItem\(sidebarItem\)/u);
   assert.doesNotMatch(chrome, /\bheader\b/u);
   assert.doesNotMatch(chrome, /onRefresh/u);
 

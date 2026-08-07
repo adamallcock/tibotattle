@@ -214,6 +214,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/reporting/index.js",
   "src/reporting/monitoring-quality.js",
   "src/reporting/weekly-calibration.js",
+  "src/rollout-line-reader.js",
   "src/storage.js",
   "src/telemetry-contribution-builder.js",
   "src/telemetry-prepared-set.js",

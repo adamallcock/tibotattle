@@ -111,7 +111,8 @@
     "tools:root-workspace:check": "node ./scripts/check-root-workspace-hygiene.mjs",
     "tools:inventory:check": "node ./tools/operations/check-tool-inventory.mjs",
     "architecture:check": "node ./scripts/check-architecture-boundaries.mjs",
-    "check": "npm test && npm run product:check"
+    "check": "npm test && npm run product:check",
+    "index:rebuild": "node ./scripts/rebuild-local-unified-index.mjs"
   },
   "dependencies": {
     "@app-usagemonitor/accounting": "workspace:*",

@@ -978,6 +978,21 @@
       "provenance": null,
       "provenanceReason": "The migration moves only known ignored historical report outputs into owner-only local state after an explicit SHA-256-reviewed apply step.",
       "legacyPaths": []
+    },
+    {
+      "classification": "shipped_product_operation",
+      "owner": "local_analysis",
+      "canonicalPath": "scripts/rebuild-local-unified-index.mjs",
+      "stableAlias": "index:rebuild",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": "docs/design/2026-08-06-unified-local-index-schema.md",
+      "provenanceReason": null,
+      "legacyPaths": []
     }
   ]
 }
