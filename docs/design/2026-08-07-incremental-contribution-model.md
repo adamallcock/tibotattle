@@ -640,16 +640,26 @@ then the worker sync endpoints.
 
 ## 10. Open questions that genuinely need the owner
 
-1. **Admission budget constants** (§7): the abuse bound. Proposal to accept or
-   adjust: steady-state 250 envelopes/device/day; first-sync allowance 3,000
-   envelopes/device/day for the first 7 days after device registration.
+1. RESOLVED 2026-08-07, owner deferring to the maintainer: circuit breakers,
+   not quotas - 2,000 envelopes/device/day steady state and 20,000/device/day
+   for the first 7 days after device registration. Sized against the real
+   index: a full first sync is ~5,720 envelopes (462,503 usage events +
+   681,216 deduplicated quota observations at 200/envelope), so first sync
+   fits inside one budget-day and steady state (~50-110/day) keeps 20-40x
+   headroom. The bound exists solely so a resend-looping client or a script
+   cannot run up the D1/R2 bill unbounded.
 2. **Quota stream depth**: recommend uploading the deduplicated
    `quota_observation` series (what the unified index stores), not the raw
    per-sighting fact stream — roughly halves first-sync volume. Confirm.
-3. **Activity markers**: the unified index has no activity-marker table, so
-   v1.0 as designed retires the record kind. If the shared-pool activity
-   bounds they provided still matter, the index needs a table first. Recommend
-   retiring.
+3. RESOLVED 2026-08-07: activity markers are retired from transport and the
+   manual CLI ritual is deprecated to the roadmap. The invisible-surface
+   problem they addressed is narrower than the vocabulary implied - the owner
+   clarifies that plain ChatGPT web chat is free and consumes nothing, that
+   ChatGPT Work via the web is the cloud surface, and that a phone remoting
+   into the desktop is captured by the local logs - and the meaningful gap
+   that remains should eventually be covered by something automatic or
+   one-click, not by a CLI command that measured usage shows was run exactly
+   zero times.
 4. RESOLVED 2026-08-07: the owner ruled session identifiers travel as the raw
    provider-issued `session_uuid`, and the pseudonym machinery is deleted
    entirely. The field-purpose matrix states they are provider-issued
