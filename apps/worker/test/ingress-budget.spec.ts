@@ -111,6 +111,64 @@ describe("UploadIngressBudget", () => {
     expect(outcomes.filter((outcome) => !outcome.allowed)).toHaveLength(2);
   });
 
+  it("reports pressure and bounded denial counters without admitting work", async () => {
+    const budget = await freshBudget("test-upload-ingress-status-v1");
+    const policy: UploadIngressBudgetPolicy = {
+      maximumConcurrent: 1,
+      maximumStartsPerMinute: 1,
+      burst: 2,
+      leaseMilliseconds: 10_000,
+    };
+
+    const fresh = await budget.status(policy);
+    expect(fresh).toEqual({
+      activeLeases: 0,
+      maximumConcurrent: 1,
+      availableStartTokens: 2,
+      burst: 2,
+      concurrencyDenials: 0,
+      startRateDenials: 0,
+      lastDeniedAtEpoch: null,
+    });
+
+    const lease = await budget.acquire(policy);
+    expect(lease.allowed).toBe(true);
+    const concurrencyDenied = await budget.acquire(policy);
+    expect(concurrencyDenied.allowed).toBe(false);
+
+    const underLoad = await budget.status(policy);
+    expect(underLoad).toMatchObject({
+      activeLeases: 1,
+      concurrencyDenials: 1,
+      startRateDenials: 0,
+    });
+    expect(underLoad.lastDeniedAtEpoch).not.toBeNull();
+
+    await budget.release(lease.leaseId!);
+    const second = await budget.acquire(policy);
+    expect(second.allowed).toBe(true);
+    await budget.release(second.leaseId!);
+    // Both burst tokens are consumed and replenish at one start per minute,
+    // so the next attempt must be a start-rate denial, not a concurrency one.
+    const rateDenied = await budget.acquire(policy);
+    expect(rateDenied.allowed).toBe(false);
+
+    const drained = await budget.status(policy);
+    expect(drained).toMatchObject({
+      activeLeases: 0,
+      availableStartTokens: 0,
+      concurrencyDenials: 1,
+      startRateDenials: 1,
+    });
+
+    // A status read is not an admission: nothing above changed lease state,
+    // and the counters survive unrelated acquire/release traffic.
+    const after = await budget.status(policy);
+    expect(after.activeLeases).toBe(0);
+    expect(after.concurrencyDenials).toBe(1);
+    expect(after.startRateDenials).toBe(1);
+  });
+
   it("renews only a live opaque lease", async () => {
     const budget = await freshBudget("test-upload-ingress-renew-v1");
     const policy: UploadIngressBudgetPolicy = {

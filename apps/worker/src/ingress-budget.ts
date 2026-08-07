@@ -13,14 +13,35 @@ export interface UploadIngressBudgetDecision {
   retryAfterSeconds: number;
 }
 
+/**
+ * A read-only pressure snapshot for the owner operations surface. It contains
+ * capacity numbers and content-free denial counters only — never a lease ID,
+ * IP, participant, or request detail.
+ */
+export interface UploadIngressBudgetStatus {
+  activeLeases: number;
+  maximumConcurrent: number;
+  availableStartTokens: number;
+  burst: number;
+  concurrencyDenials: number;
+  startRateDenials: number;
+  lastDeniedAtEpoch: number | null;
+}
+
 interface StoredIngressBudget {
   schemaVersion: "upload-ingress-budget-v0.1";
   tokens: number;
   updatedAt: number;
   leases: Record<string, number>;
+  concurrencyDenials: number;
+  startRateDenials: number;
+  lastDeniedAtEpoch: number | null;
 }
 
 const STATE_KEY = "upload-ingress-budget-state-v0.1";
+// Counters exist to show pressure, not to account precisely forever. A hard
+// ceiling keeps the stored value a small bounded integer under any flood.
+const MAX_DENIAL_COUNT = 1_000_000_000;
 const LEASE_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
@@ -46,7 +67,26 @@ function emptyState(now: number, policy: UploadIngressBudgetPolicy): StoredIngre
     tokens: policy.burst,
     updatedAt: now,
     leases: {},
+    concurrencyDenials: 0,
+    startRateDenials: 0,
+    lastDeniedAtEpoch: null,
   };
+}
+
+function parseDenialCount(value: unknown): number {
+  if (value === undefined) return 0;
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new TypeError("Invalid upload ingress budget state");
+  }
+  return Math.min(MAX_DENIAL_COUNT, value as number);
+}
+
+function parseLastDeniedAt(value: unknown): number | null {
+  if (value === undefined || value === null) return null;
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new TypeError("Invalid upload ingress budget state");
+  }
+  return value as number;
 }
 
 function parseState(
@@ -89,7 +129,22 @@ function parseState(
     tokens: Math.min(policy.burst, tokens),
     updatedAt,
     leases: Object.fromEntries(leases),
+    // Older stored records predate the denial counters; absence means zero
+    // observed denials, not corruption.
+    concurrencyDenials: parseDenialCount(candidate.concurrencyDenials),
+    startRateDenials: parseDenialCount(candidate.startRateDenials),
+    lastDeniedAtEpoch: parseLastDeniedAt(candidate.lastDeniedAtEpoch),
   };
+}
+
+function recordDenial(
+  state: StoredIngressBudget,
+  kind: "concurrency" | "startRate",
+  now: number,
+): void {
+  const field = kind === "concurrency" ? "concurrencyDenials" : "startRateDenials";
+  state[field] = Math.min(MAX_DENIAL_COUNT, state[field] + 1);
+  state.lastDeniedAtEpoch = now;
 }
 
 function replenishTokens(
@@ -146,6 +201,7 @@ export class UploadIngressBudget extends DurableObject<Env> {
       replenishTokens(state, now, policy);
       dropExpiredLeases(state, now);
       if (Object.keys(state.leases).length >= policy.maximumConcurrent) {
+        recordDenial(state, "concurrency", now);
         await storage.put(STATE_KEY, state);
         return {
           allowed: false,
@@ -154,6 +210,7 @@ export class UploadIngressBudget extends DurableObject<Env> {
         };
       }
       if (state.tokens < 1) {
+        recordDenial(state, "startRate", now);
         await storage.put(STATE_KEY, state);
         return {
           allowed: false,
@@ -212,6 +269,35 @@ export class UploadIngressBudget extends DurableObject<Env> {
       dropExpiredLeases(state, now);
       await storage.put(STATE_KEY, state);
       return true;
+    });
+  }
+
+  /**
+   * A read-only pressure snapshot for the owner operations surface. Like
+   * `probe`, it performs the routine lease/token maintenance so the numbers it
+   * reports are current, but it never admits work or issues a lease.
+   */
+  async status(policy: UploadIngressBudgetPolicy): Promise<UploadIngressBudgetStatus> {
+    assertPolicy(policy);
+    return this.ctx.storage.transaction(async (storage) => {
+      const now = Date.now();
+      const state = parseState(
+        await storage.get<StoredIngressBudget>(STATE_KEY),
+        now,
+        policy,
+      );
+      replenishTokens(state, now, policy);
+      dropExpiredLeases(state, now);
+      await storage.put(STATE_KEY, state);
+      return {
+        activeLeases: Object.keys(state.leases).length,
+        maximumConcurrent: policy.maximumConcurrent,
+        availableStartTokens: Math.min(policy.burst, Math.floor(state.tokens)),
+        burst: policy.burst,
+        concurrencyDenials: state.concurrencyDenials,
+        startRateDenials: state.startRateDenials,
+        lastDeniedAtEpoch: state.lastDeniedAtEpoch,
+      };
     });
   }
 

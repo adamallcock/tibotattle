@@ -89,6 +89,16 @@
         </section>
       </div>
 
+      <section class="admin-section" aria-labelledby="ingress-title">
+        <p class="eyebrow">Upload ingress</p>
+        <h2 id="ingress-title">Ingress pressure</h2>
+        <p class="admin-copy">
+          Shared upload budget state: in-flight leases against the concurrency
+          cap, remaining start tokens, and content-free denial counters.
+        </p>
+        <div class="admin-card" id="ingress-status" aria-live="polite"></div>
+      </section>
+
       <section class="admin-section" aria-labelledby="readiness-title">
         <p class="eyebrow">Lifecycle and publication</p>
         <h2 id="readiness-title">Operational readiness</h2>
@@ -123,6 +133,13 @@
           </table>
           <p class="admin-empty" id="error-empty">No retained errors in the window.</p>
           <div id="diagnostic-lookup" class="diagnostic-lookup" hidden></div>
+        </div>
+        <div class="admin-card admin-table-wrap">
+          <table>
+            <thead><tr><th>Reference</th><th>Route</th><th>Error</th><th>Status</th><th>Time</th></tr></thead>
+            <tbody id="recent-diagnostic-rows"></tbody>
+          </table>
+          <p class="admin-empty" id="recent-diagnostic-empty">No sampled failures retained.</p>
         </div>
       </section>
 

@@ -11,14 +11,35 @@
     "publication": true
   },
   "counts": {
-    "participants": { "active": 5, "total": 6, "bounded": false },
+    "participants": {
+      "active": 5,
+      "total": 6,
+      "bounded": false,
+      "enrolledLast24Hours": 1,
+      "enrolledLast7Days": 3
+    },
     "contributions": {
-      "telemetry": { "accepted": 9, "total": 10, "bounded": false },
+      "telemetry": {
+        "accepted": 9,
+        "total": 10,
+        "bounded": false,
+        "acceptedLast24Hours": 2,
+        "acceptedLast7Days": 6
+      },
       "storedTelemetryRecords": 22,
       "storedTelemetryRecordsBounded": false
     },
     "pendingQuarantineObjects": 1,
     "pendingQuarantineObjectsBounded": false
+  },
+  "ingress": {
+    "activeLeases": 3,
+    "maximumConcurrent": 16,
+    "availableStartTokens": 240,
+    "burst": 300,
+    "concurrencyDenials": 4,
+    "startRateDenials": 2,
+    "lastDeniedAt": "2026-08-02T09:15:00.000Z"
   },
   "lifecycle": {
     "state": "completed",
@@ -43,6 +64,13 @@
       "occurrences": 2,
       "ratePerDay": 0.29,
       "latestAt": "2026-08-02T10:00:00.000Z"
+    }],
+    "recentDiagnostics": [{
+      "requestId": "019fc0b7-6c19-7b40-bda0-a1a1d7202100",
+      "routeClass": "admin_overview",
+      "errorCode": "BACKEND_STORAGE_UNAVAILABLE",
+      "status": 503,
+      "occurredAt": "2026-08-02T10:00:00.000Z"
     }],
     "lookup": null
   },

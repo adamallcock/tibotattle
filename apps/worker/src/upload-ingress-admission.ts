@@ -4,6 +4,7 @@ import type { BoundedBodyReadPolicy } from "./bounded-body";
 import {
   type UploadIngressBudgetDecision,
   type UploadIngressBudgetPolicy,
+  type UploadIngressBudgetStatus,
 } from "./ingress-budget";
 import { assertDeferredUploadQueueIngress } from "./queue-ingress-stub";
 
@@ -115,6 +116,7 @@ function configuredBudgetStub(env: Env): {
   probe: (policy: UploadIngressBudgetPolicy) => Promise<boolean>;
   release: (leaseId: string) => Promise<void>;
   renew: (leaseId: string, policy: UploadIngressBudgetPolicy) => Promise<boolean>;
+  status: (policy: UploadIngressBudgetPolicy) => Promise<UploadIngressBudgetStatus>;
 } {
   return configuredNamespace(env).getByName(
     UPLOAD_INGRESS_BUDGET_OBJECT_NAME,
@@ -123,6 +125,7 @@ function configuredBudgetStub(env: Env): {
     probe: (policy: UploadIngressBudgetPolicy) => Promise<boolean>;
     release: (leaseId: string) => Promise<void>;
     renew: (leaseId: string, policy: UploadIngressBudgetPolicy) => Promise<boolean>;
+    status: (policy: UploadIngressBudgetPolicy) => Promise<UploadIngressBudgetStatus>;
   };
 }
 
@@ -169,6 +172,72 @@ export async function acquireUploadIngressLease(env: Env): Promise<UploadIngress
     throw unavailable();
   }
   return { leaseId: decision.leaseId, policy };
+}
+
+/** ISO-timestamped ingress pressure for the owner operations overview. */
+export interface UploadIngressStatus {
+  readonly activeLeases: number;
+  readonly maximumConcurrent: number;
+  readonly availableStartTokens: number;
+  readonly burst: number;
+  readonly concurrencyDenials: number;
+  readonly startRateDenials: number;
+  readonly lastDeniedAt: string | null;
+}
+
+function boundedStatusCount(value: unknown, maximum: number): value is number {
+  return Number.isSafeInteger(value)
+    && (value as number) >= 0
+    && (value as number) <= maximum;
+}
+
+function validStatus(value: unknown): value is UploadIngressBudgetStatus {
+  if (value === null || typeof value !== "object") return false;
+  const lastDeniedAtEpoch = Reflect.get(value, "lastDeniedAtEpoch");
+  return boundedStatusCount(Reflect.get(value, "activeLeases"), 64)
+    && boundedStatusCount(Reflect.get(value, "maximumConcurrent"), 64)
+    && boundedStatusCount(Reflect.get(value, "availableStartTokens"), 1_200)
+    && boundedStatusCount(Reflect.get(value, "burst"), 1_200)
+    && boundedStatusCount(Reflect.get(value, "concurrencyDenials"), Number.MAX_SAFE_INTEGER)
+    && boundedStatusCount(Reflect.get(value, "startRateDenials"), Number.MAX_SAFE_INTEGER)
+    && (lastDeniedAtEpoch === null
+      || boundedStatusCount(lastDeniedAtEpoch, Number.MAX_SAFE_INTEGER));
+}
+
+/**
+ * Best-effort read of the shared ingress budget for the owner operations
+ * overview. The overview must stay readable during containment or before the
+ * budget binding is configured, so every failure degrades to `null` rather
+ * than failing the whole authenticated read.
+ */
+export async function readUploadIngressStatus(
+  env: Env,
+): Promise<UploadIngressStatus | null> {
+  let policy: UploadIngressBudgetPolicy;
+  let stub: ReturnType<typeof configuredBudgetStub>;
+  try {
+    policy = configuredPolicy(env);
+    stub = configuredBudgetStub(env);
+  } catch {
+    return null;
+  }
+  try {
+    const status = await stub.status(policy);
+    if (!validStatus(status)) return null;
+    return Object.freeze({
+      activeLeases: status.activeLeases,
+      maximumConcurrent: status.maximumConcurrent,
+      availableStartTokens: status.availableStartTokens,
+      burst: status.burst,
+      concurrencyDenials: status.concurrencyDenials,
+      startRateDenials: status.startRateDenials,
+      lastDeniedAt: status.lastDeniedAtEpoch === null
+        ? null
+        : new Date(status.lastDeniedAtEpoch).toISOString(),
+    });
+  } catch {
+    return null;
+  }
 }
 
 export async function probeUploadIngressBudget(env: Env): Promise<void> {

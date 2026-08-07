@@ -58,7 +58,9 @@ function renderCounts(overview) {
   const counts = overview.counts;
   const metrics = [
     ["Active participants", count(counts.participants.active, counts.participants.bounded), `${count(counts.participants.total, counts.participants.bounded)} total`],
+    ["Enrolled last 24h", count(counts.participants.enrolledLast24Hours), `${count(counts.participants.enrolledLast7Days)} in the last 7 days`],
     ["Telemetry contributions", count(counts.contributions.telemetry.accepted, counts.contributions.telemetry.bounded), `${count(counts.contributions.telemetry.total, counts.contributions.telemetry.bounded)} total`],
+    ["Accepted last 24h", count(counts.contributions.telemetry.acceptedLast24Hours), `${count(counts.contributions.telemetry.acceptedLast7Days)} in the last 7 days`],
     ["Stored telemetry records", count(counts.contributions.storedTelemetryRecords, counts.contributions.storedTelemetryRecordsBounded), "content-free metadata rows"],
     ["Pending quarantine", count(counts.pendingQuarantineObjects, counts.pendingQuarantineObjectsBounded), "objects awaiting reconciliation"],
   ];
@@ -83,6 +85,32 @@ function renderControls(controls) {
   $("#service-state").textContent = `${controls.state}, revision ${controls.revision}`;
 }
 
+function statusLine(label, value) {
+  const line = document.createElement("p");
+  const name = document.createElement("strong");
+  name.textContent = `${label}: `;
+  line.append(name, document.createTextNode(value));
+  return line;
+}
+
+function renderIngress(ingress) {
+  const card = $("#ingress-status");
+  if (ingress === null) {
+    card.replaceChildren(statusLine(
+      "Upload ingress budget",
+      "unavailable — the budget binding is not configured or unreachable",
+    ));
+    return;
+  }
+  card.replaceChildren(
+    statusLine("Active leases", `${ingress.activeLeases} of ${ingress.maximumConcurrent}`),
+    statusLine("Available start tokens", `${ingress.availableStartTokens} of ${ingress.burst}`),
+    statusLine("Concurrency denials", text(ingress.concurrencyDenials)),
+    statusLine("Start-rate denials", text(ingress.startRateDenials)),
+    statusLine("Last denied", formatTime(ingress.lastDeniedAt)),
+  );
+}
+
 function renderErrors(errors) {
   const body = $("#error-groups");
   body.replaceChildren(...errors.groups.map((group) => tableRow([
@@ -92,6 +120,16 @@ function renderErrors(errors) {
     formatTime(group.latestAt),
   ])));
   $("#error-empty").hidden = errors.groups.length !== 0;
+  $("#recent-diagnostic-rows").replaceChildren(
+    ...errors.recentDiagnostics.map((diagnostic) => tableRow([
+      diagnostic.requestId,
+      diagnostic.routeClass,
+      diagnostic.errorCode,
+      diagnostic.status,
+      formatTime(diagnostic.occurredAt),
+    ])),
+  );
+  $("#recent-diagnostic-empty").hidden = errors.recentDiagnostics.length !== 0;
   const lookup = $("#diagnostic-lookup");
   if (errors.lookup) {
     lookup.textContent = `${errors.lookup.requestId}: ${errors.lookup.errorCode} on ${errors.lookup.routeClass} at ${formatTime(errors.lookup.occurredAt)}`;
@@ -115,13 +153,7 @@ function renderOperational(overview) {
       ["Historical rebuild queue", text(overview.pendingHistoricalRebuilds)],
       ["Last maintenance", formatTime(lifecycle.maintenanceRunAt)],
       ["Failure code", text(lifecycle.failureCode)],
-    ].map(([label, value]) => {
-      const line = document.createElement("p");
-      const name = document.createElement("strong");
-      name.textContent = `${label}: `;
-      line.append(name, document.createTextNode(value));
-      return line;
-    }),
+    ].map(([label, value]) => statusLine(label, value)),
   );
   const rows = overview.snapshots || [];
   $("#snapshot-rows").replaceChildren(...rows.map((snapshot) => tableRow([
@@ -147,6 +179,7 @@ function render(overview) {
   renderCounts(overview);
   renderControls(overview.collection);
   renderOperational(overview);
+  renderIngress(overview.ingress);
   renderErrors(overview.errors);
   renderAudit(overview.audit);
   $("#last-refresh").textContent = formatTime(overview.generatedAt);

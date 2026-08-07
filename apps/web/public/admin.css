@@ -17,6 +17,7 @@
 .admin-field select, .diagnostic-form input { min-height: 40px; padding: .5rem .65rem; border: 1px solid var(--line); border-radius: .3rem; color: var(--ink); background: var(--white); }
 .admin-form button { justify-self: start; margin-top: 5px; }
 .admin-result { min-height: 1.4em; margin-bottom: 0; }
+.admin-section > .admin-card + .admin-card { margin-top: 14px; }
 .admin-table-wrap { overflow-x: auto; }
 .admin-table-wrap table { width: 100%; border-collapse: collapse; font-size: .74rem; }
 .admin-table-wrap th { color: var(--muted); font-size: .65rem; letter-spacing: .04em; text-align: left; text-transform: uppercase; }

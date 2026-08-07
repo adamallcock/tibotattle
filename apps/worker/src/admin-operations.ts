@@ -3,6 +3,7 @@ import { sha256Hex } from "./crypto";
 import { ApiError } from "./errors";
 import { readQuarantineReconciliationStatus } from "./quarantine-reconciliation";
 import { parseStoredJson } from "./stored-record";
+import type { UploadIngressStatus } from "./upload-ingress-admission";
 
 const ADMIN_IDENTITY_DOMAIN = "app-usagemonitor/admin-actor/v1\0";
 const DIAGNOSTIC_RETENTION_DAYS = 30;
@@ -26,6 +27,11 @@ export interface AdminOverviewOptions {
   readonly enrollmentMode: string;
   readonly accountScopedIngestMode: string;
   readonly diagnosticReference?: string;
+  /**
+   * Upload-ingress pressure read separately from the budget Durable Object;
+   * `null` keeps the overview readable when that binding is unavailable.
+   */
+  readonly ingress?: UploadIngressStatus | null;
   readonly nowEpoch?: number;
 }
 
@@ -35,6 +41,10 @@ interface CountRow {
   deleting?: number;
   accepted?: number;
   processing?: number;
+  enrolled_last_24h?: number;
+  enrolled_last_7d?: number;
+  accepted_last_24h?: number;
+  accepted_last_7d?: number;
 }
 
 interface BoundedCount {
@@ -383,6 +393,9 @@ export async function readAdminOverview(
   const since = new Date(
     nowEpoch - 24 * 60 * 60 * 1_000,
   ).toISOString();
+  const sinceWeek = new Date(
+    nowEpoch - 7 * 24 * 60 * 60 * 1_000,
+  ).toISOString();
   const diagnosticSince = new Date(
     nowEpoch - DIAGNOSTIC_RETENTION_DAYS * 24 * 60 * 60 * 1_000,
   ).toISOString();
@@ -408,11 +421,12 @@ export async function readAdminOverview(
       `SELECT COUNT(*) AS total,
               SUM(CASE WHEN state = 'active' THEN 1 ELSE 0 END) AS active,
               SUM(CASE WHEN state = 'deleting' THEN 1 ELSE 0 END) AS deleting,
-              SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS processing
+              SUM(CASE WHEN created_at >= ?1 THEN 1 ELSE 0 END) AS enrolled_last_24h,
+              SUM(CASE WHEN created_at >= ?2 THEN 1 ELSE 0 END) AS enrolled_last_7d
          FROM (
-           SELECT state, created_at FROM participants ORDER BY id LIMIT ?
+           SELECT state, created_at FROM participants ORDER BY id LIMIT ?3
          )`,
-    ).bind(since, MAX_ADMIN_AGGREGATE_ROWS).first<CountRow>(),
+    ).bind(since, sinceWeek, MAX_ADMIN_AGGREGATE_ROWS).first<CountRow>(),
     db.prepare(
       `SELECT COUNT(*) AS total,
               SUM(CASE WHEN status = 'accepted_synthetic' THEN 1 ELSE 0 END) AS accepted,
@@ -424,11 +438,15 @@ export async function readAdminOverview(
     db.prepare(
       `SELECT COUNT(*) AS total,
               SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END) AS accepted,
-              SUM(CASE WHEN status = 'deleting' THEN 1 ELSE 0 END) AS deleting
+              SUM(CASE WHEN status = 'deleting' THEN 1 ELSE 0 END) AS deleting,
+              SUM(CASE WHEN status = 'accepted' AND created_at >= ?1 THEN 1 ELSE 0 END)
+                AS accepted_last_24h,
+              SUM(CASE WHEN status = 'accepted' AND created_at >= ?2 THEN 1 ELSE 0 END)
+                AS accepted_last_7d
          FROM (
-           SELECT status FROM telemetry_contributions ORDER BY id LIMIT ?
+           SELECT status, created_at FROM telemetry_contributions ORDER BY id LIMIT ?3
          )`,
-    ).bind(MAX_ADMIN_AGGREGATE_ROWS).first<CountRow>(),
+    ).bind(since, sinceWeek, MAX_ADMIN_AGGREGATE_ROWS).first<CountRow>(),
     db.prepare(
       "SELECT COUNT(*) AS total FROM (SELECT 1 FROM telemetry_records LIMIT ?)",
     ).bind(MAX_ADMIN_AGGREGATE_ROWS).first<CountRow>(),
@@ -515,7 +533,8 @@ export async function readAdminOverview(
         bounded: boundedCount(participants).bounded,
         active: Number(participants.active ?? 0),
         deleting: Number(participants.deleting ?? 0),
-        enrolledLast24Hours: Number(participants.processing ?? 0),
+        enrolledLast24Hours: Number(participants.enrolled_last_24h ?? 0),
+        enrolledLast7Days: Number(participants.enrolled_last_7d ?? 0),
       },
       contributions: {
         synthetic: {
@@ -529,6 +548,8 @@ export async function readAdminOverview(
           bounded: boundedCount(telemetryContributions).bounded,
           accepted: Number(telemetryContributions.accepted ?? 0),
           deleting: Number(telemetryContributions.deleting ?? 0),
+          acceptedLast24Hours: Number(telemetryContributions.accepted_last_24h ?? 0),
+          acceptedLast7Days: Number(telemetryContributions.accepted_last_7d ?? 0),
         },
         storedTelemetryRecords: boundedCount(telemetryRecords).total,
         storedTelemetryRecordsBounded: boundedCount(telemetryRecords).bounded,
@@ -549,6 +570,7 @@ export async function readAdminOverview(
       failureCode: retention.failure_code,
     },
     reconciliation,
+    ingress: options.ingress ?? null,
     deletionLedger: {
       total: boundedCount(deletionTombstones).total,
       bounded: boundedCount(deletionTombstones).bounded,

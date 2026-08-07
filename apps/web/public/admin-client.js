@@ -100,12 +100,28 @@ function projectOverviewCounts(value) {
       active: count(participants.active, "ADMIN_OVERVIEW_INVALID"),
       total: count(participants.total, "ADMIN_OVERVIEW_INVALID"),
       bounded: boolean(participants.bounded, "ADMIN_OVERVIEW_INVALID"),
+      enrolledLast24Hours: count(
+        participants.enrolledLast24Hours,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      enrolledLast7Days: count(
+        participants.enrolledLast7Days,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
     }),
     contributions: Object.freeze({
       telemetry: Object.freeze({
         accepted: count(telemetry.accepted, "ADMIN_OVERVIEW_INVALID"),
         total: count(telemetry.total, "ADMIN_OVERVIEW_INVALID"),
         bounded: boolean(telemetry.bounded, "ADMIN_OVERVIEW_INVALID"),
+        acceptedLast24Hours: count(
+          telemetry.acceptedLast24Hours,
+          "ADMIN_OVERVIEW_INVALID",
+        ),
+        acceptedLast7Days: count(
+          telemetry.acceptedLast7Days,
+          "ADMIN_OVERVIEW_INVALID",
+        ),
       }),
       storedTelemetryRecords: count(
         contributions.storedTelemetryRecords,
@@ -162,6 +178,34 @@ function projectReconciliation(value) {
   });
 }
 
+/**
+ * The ingress budget is a separate Durable Object; the Worker deliberately
+ * reports `null` when it is unconfigured or unreachable so the rest of the
+ * overview stays renderable. `null` is therefore a valid projected value.
+ */
+function projectIngress(value) {
+  if (value === null || value === undefined) return null;
+  const ingress = record(value, "ADMIN_OVERVIEW_INVALID");
+  return Object.freeze({
+    activeLeases: count(ingress.activeLeases, "ADMIN_OVERVIEW_INVALID"),
+    maximumConcurrent: positiveInteger(
+      ingress.maximumConcurrent,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    availableStartTokens: count(
+      ingress.availableStartTokens,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    burst: positiveInteger(ingress.burst, "ADMIN_OVERVIEW_INVALID"),
+    concurrencyDenials: count(
+      ingress.concurrencyDenials,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    startRateDenials: count(ingress.startRateDenials, "ADMIN_OVERVIEW_INVALID"),
+    lastDeniedAt: nullableString(ingress.lastDeniedAt, "ADMIN_OVERVIEW_INVALID"),
+  });
+}
+
 function projectErrors(value) {
   const errors = record(value, "ADMIN_OVERVIEW_INVALID");
   const groups = array(errors.groups, "ADMIN_OVERVIEW_INVALID").map((value) => {
@@ -186,7 +230,29 @@ function projectErrors(value) {
       occurredAt: string(lookup.occurredAt, "ADMIN_OVERVIEW_INVALID"),
     });
   };
-  return Object.freeze({ groups: Object.freeze(groups), lookup: projectLookup(errors.lookup) });
+  const recentDiagnostics = array(
+    errors.recentDiagnostics,
+    "ADMIN_OVERVIEW_INVALID",
+  ).map((value) => {
+    const diagnostic = record(value, "ADMIN_OVERVIEW_INVALID");
+    if (!Number.isSafeInteger(diagnostic.status)
+        || diagnostic.status < 100
+        || diagnostic.status > 599) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
+    return Object.freeze({
+      requestId: string(diagnostic.requestId, "ADMIN_OVERVIEW_INVALID"),
+      routeClass: string(diagnostic.routeClass, "ADMIN_OVERVIEW_INVALID"),
+      errorCode: string(diagnostic.errorCode, "ADMIN_OVERVIEW_INVALID"),
+      status: diagnostic.status,
+      occurredAt: string(diagnostic.occurredAt, "ADMIN_OVERVIEW_INVALID"),
+    });
+  });
+  return Object.freeze({
+    groups: Object.freeze(groups),
+    recentDiagnostics: Object.freeze(recentDiagnostics),
+    lookup: projectLookup(errors.lookup),
+  });
 }
 
 /**
@@ -232,6 +298,7 @@ export function projectAdminOverview(value) {
     counts: projectOverviewCounts(overview.counts),
     lifecycle: projectLifecycle(overview.lifecycle),
     reconciliation: projectReconciliation(overview.reconciliation),
+    ingress: projectIngress(overview.ingress),
     snapshots: Object.freeze(snapshots),
     pendingHistoricalRebuilds: count(
       overview.pendingHistoricalRebuilds,

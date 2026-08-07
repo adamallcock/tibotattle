@@ -2194,7 +2194,10 @@ describe("synthetic usage monitor service", () => {
       ownerEnv,
     );
     expect(overview.status).toBe(200);
-    await expect(overview.json()).resolves.toMatchObject({
+    const overviewBody = await overview.json<{
+      ingress: { lastDeniedAt: unknown } | null;
+    }>();
+    expect(overviewBody).toMatchObject({
       schemaVersion: "admin-overview-v0.1",
       collection: {
         state: "operational",
@@ -2204,13 +2207,51 @@ describe("synthetic usage monitor service", () => {
         publication: true,
       },
       counts: {
-        participants: { active: 1 },
+        participants: {
+          active: 1,
+          enrolledLast24Hours: 1,
+          enrolledLast7Days: 1,
+        },
         contributions: {
-          telemetry: { total: 0 },
+          telemetry: {
+            total: 0,
+            acceptedLast24Hours: 0,
+            acceptedLast7Days: 0,
+          },
           storedTelemetryRecords: 0,
         },
       },
+      // The shared Durable Object runtime may carry leases or denials from
+      // sibling tests; only the configured capacities are deterministic here.
+      ingress: {
+        maximumConcurrent: 64,
+        burst: 1200,
+        activeLeases: expect.any(Number),
+        availableStartTokens: expect.any(Number),
+        concurrencyDenials: expect.any(Number),
+        startRateDenials: expect.any(Number),
+      },
       errors: { sampled: true, capacity: 256 },
+    });
+    expect([null, expect.any(String)]).toContainEqual(
+      overviewBody.ingress?.lastDeniedAt,
+    );
+
+    // Losing the ingress budget binding must degrade the pressure section to
+    // null, never take the rest of the authenticated overview down.
+    const overviewWithoutBudget = await api(
+      "/api/v1/admin/overview",
+      { headers: personalHeaders(participant) },
+      testBindings({
+        ADMIN_IDENTITY_LINK_KEY: adminIdentityKey,
+        UPLOAD_INGRESS_BUDGET:
+          undefined as unknown as Env["UPLOAD_INGRESS_BUDGET"],
+      }),
+    );
+    expect(overviewWithoutBudget.status).toBe(200);
+    await expect(overviewWithoutBudget.json()).resolves.toMatchObject({
+      schemaVersion: "admin-overview-v0.1",
+      ingress: null,
     });
 
     const csrfRejected = await api(

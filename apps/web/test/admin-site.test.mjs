@@ -41,11 +41,14 @@ function fakeDocument() {
     "notice",
     "counts",
     "service-state",
+    "ingress-status",
     "lifecycle-status",
     "snapshot-rows",
     "snapshot-empty",
     "error-groups",
     "error-empty",
+    "recent-diagnostic-rows",
+    "recent-diagnostic-empty",
     "diagnostic-lookup",
     "diagnostic-reference",
     "audit-rows",
@@ -121,7 +124,8 @@ test("admin tables preserve row order, text rendering, and empty states", async 
   const emptyOverview = {
     ...overview,
     snapshots: [],
-    errors: { ...overview.errors, groups: [] },
+    ingress: null,
+    errors: { ...overview.errors, groups: [], recentDiagnostics: [] },
     audit: [],
   };
   const responses = [
@@ -160,6 +164,28 @@ test("admin tables preserve row order, text rendering, and empty states", async 
       formatReportingTime(snapshot.releasedAt),
     ]]);
 
+    const diagnostic = overview.errors.recentDiagnostics[0];
+    assert.deepEqual(tableTexts(documentRef, "recent-diagnostic-rows"), [[
+      diagnostic.requestId,
+      diagnostic.routeClass,
+      diagnostic.errorCode,
+      String(diagnostic.status),
+      formatReportingTime(diagnostic.occurredAt),
+    ]]);
+
+    const ingress = overview.ingress;
+    assert.deepEqual(
+      documentRef.byId.get("ingress-status").children.map((line) =>
+        line.children.map((node) => node.textContent)),
+      [
+        ["Active leases: ", `${ingress.activeLeases} of ${ingress.maximumConcurrent}`],
+        ["Available start tokens: ", `${ingress.availableStartTokens} of ${ingress.burst}`],
+        ["Concurrency denials: ", String(ingress.concurrencyDenials)],
+        ["Start-rate denials: ", String(ingress.startRateDenials)],
+        ["Last denied: ", formatReportingTime(ingress.lastDeniedAt)],
+      ],
+    );
+
     const audit = overview.audit[0];
     assert.deepEqual(tableTexts(documentRef, "audit-rows"), [
       [
@@ -177,14 +203,25 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     ]);
     assert.equal(documentRef.byId.get("snapshot-empty").hidden, true);
     assert.equal(documentRef.byId.get("error-empty").hidden, true);
+    assert.equal(documentRef.byId.get("recent-diagnostic-empty").hidden, true);
 
     await documentRef.byId.get("refresh").listeners.get("click")();
     assert.equal(fetchCount, 4);
     assert.deepEqual(tableTexts(documentRef, "error-groups"), []);
     assert.deepEqual(tableTexts(documentRef, "snapshot-rows"), []);
     assert.deepEqual(tableTexts(documentRef, "audit-rows"), []);
+    assert.deepEqual(tableTexts(documentRef, "recent-diagnostic-rows"), []);
     assert.equal(documentRef.byId.get("snapshot-empty").hidden, false);
     assert.equal(documentRef.byId.get("error-empty").hidden, false);
+    assert.equal(documentRef.byId.get("recent-diagnostic-empty").hidden, false);
+    assert.deepEqual(
+      documentRef.byId.get("ingress-status").children.map((line) =>
+        line.children.map((node) => node.textContent)),
+      [[
+        "Upload ingress budget: ",
+        "unavailable — the budget binding is not configured or unreachable",
+      ]],
+    );
   } finally {
     if (previousDocument === undefined) delete globalThis.document;
     else globalThis.document = previousDocument;
