@@ -1203,6 +1203,18 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
     source,
     /func notifyHostedSignInReturn\(\) \{[\s\S]*?window\.dispatchEvent\(new Event\('tibotattle:hosted-sign-in-return'\)\)/u,
   );
+  // The shell takes the foreground refresh cadence away from the page, so it
+  // owes the page a signal when a refresh finished. Without it the document
+  // keeps rendering the snapshot it loaded with while the toolbar reports the
+  // refresh complete, and the window asserts a freshness it does not have.
+  assert.match(
+    source,
+    /func notifyLocalEvidenceUpdated\(\) \{[\s\S]*?window\.dispatchEvent\(new Event\('tibotattle:local-evidence-updated'\)\)/u,
+  );
+  assert.match(
+    source,
+    /private func finishNativeRefresh\(title: String, refreshEnabled: Bool\) \{[\s\S]*?dashboardWebHost\?\.notifyLocalEvidenceUpdated\(\)/u,
+  );
   assert.match(
     source,
     /decisionHandler\(\.cancel\)\s*\n\s*openExternally\(url\)/u,

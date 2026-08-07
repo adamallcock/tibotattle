@@ -6879,3 +6879,73 @@ test("a posted results card states a figure in full and marks a fixture as one",
     /<canvas\s+id="share-card-canvas"[\s\S]*?width="1200"\s*\n\s*height="800"/u,
   );
 });
+
+test("a refresh finished by the native shell makes the page re-read its evidence", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+
+  // Inside the app window the page's own return-visit refresh stands down, so
+  // nothing else moves the rendered numbers off the snapshot the document
+  // loaded with. This listener is the only thing that does.
+  assert.match(
+    appSource,
+    /window\.addEventListener\("tibotattle:local-evidence-updated", \(\) => \{\s*\n\s*void reloadLocalEvidenceAfterNativeRefresh\(\);/u,
+  );
+  assert.match(
+    appSource,
+    /async function reloadLocalEvidenceAfterNativeRefresh\(\) \{[\s\S]*?await loadQuickResultDashboard\(\);/u,
+  );
+  // A refresh this page is already driving re-renders on its own completion; a
+  // second overlapping read would only race it.
+  assert.match(
+    appSource,
+    /async function reloadLocalEvidenceAfterNativeRefresh\(\) \{[\s\S]*?if \(nativeEvidenceReloadInFlight \|\| localRefreshInProgress \|\| localActionBusy\) \{\s*\n\s*return;/u,
+  );
+  // And the reason the shell has to send that signal at all is unchanged: the
+  // web return-visit timer must not race the native one.
+  assert.match(
+    appSource,
+    /function scheduleReturningUserRefresh\(\) \{[\s\S]*?if \(runsInsideNativeDashboard\(\)\) return;/u,
+  );
+});
+
+test("a chart says so when its series does not reach back as far as its label", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+
+  // Both trend charts carry the statement; both are drawn from the same
+  // retained usage series and both are labelled by their own range control.
+  assert.match(html, /<p class="series-coverage" id="timeline-coverage" role="status" hidden><\/p>/u);
+  assert.match(html, /<p class="series-coverage" id="usage-timeline-coverage" role="status" hidden><\/p>/u);
+  assert.match(
+    appSource,
+    /renderSeriesCoverage\(\s*\$\("#timeline-coverage"\),\s*data,\s*activeCalibrationRangeDays,\s*\)/u,
+  );
+  assert.match(
+    appSource,
+    /renderSeriesCoverage\(\s*\$\("#usage-timeline-coverage"\),\s*data,\s*activeUsageRangeDays,\s*\)/u,
+  );
+
+  // "All" claims everything retained, so it is covered by definition.
+  assert.match(appSource, /const ALL_HISTORY_RANGE_DAYS = 36_500;/u);
+  assert.match(
+    appSource,
+    /if \(!Number\.isFinite\(rangeDays\) \|\| rangeDays >= ALL_HISTORY_RANGE_DAYS\) return null;/u,
+  );
+  // Measured against the extent of the retained series, not the first drawn
+  // point: an idle night inside a covered week is not a missing week.
+  assert.match(
+    appSource,
+    /function seriesCoverageShortfall\(data, rangeDays\) \{[\s\S]*?const earliestMs = Date\.parse\(usage\[0\]\.startAt \?\? usage\[0\]\.endAt\);/u,
+  );
+  assert.match(
+    appSource,
+    /function seriesCoverageShortfall\(data, rangeDays\) \{[\s\S]*?if \(coveredMs >= claimedMs \* SERIES_COVERAGE_TOLERANCE\) return null;/u,
+  );
+
+  // A withheld accounting cache is named, because it is repairable and because
+  // the existing warning for that state speaks only about prices.
+  assert.match(
+    appSource,
+    /data\?\.pricing\?\.accountingCacheStatus === "unavailable"\s*\n\s*\? "dashboard\.series\.shortOfRangeWithheldCache"\s*\n\s*: "dashboard\.series\.shortOfRange"/u,
+  );
+});

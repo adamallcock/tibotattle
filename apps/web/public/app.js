@@ -2352,6 +2352,80 @@ function timelineCutoffMs(data, rangeDays) {
     : latestMs - rangeDays * 24 * 60 * 60 * 1_000;
 }
 
+// The "All" range button claims everything retained, so it is covered by
+// definition and is the one range that cannot fall short.
+const ALL_HISTORY_RANGE_DAYS = 36_500;
+// A retained series legitimately begins a bucket or so inside the requested
+// window, so only a real shortfall is reported rather than rounding.
+const SERIES_COVERAGE_TOLERANCE = 0.95;
+
+/**
+ * How much of the labelled range the retained series can actually cover.
+ *
+ * A range control labels the chart with a period; the series behind that label
+ * can reach back far less far, and a line chart cannot show the difference
+ * between "nothing happened then" and "that time is missing". Two different
+ * things produce it and neither is visible: the evidence may simply not go back
+ * that far, and a rejected accounting cache makes the companion fall back to a
+ * much smaller live collector projection. Rebuilding identical evidence with
+ * the cache withheld took the usage series from 1,716 points spanning 30.9 days
+ * to 589 spanning 16.7, and the quota series from 10,000 points spanning 30.9
+ * days to 940 spanning 10.1, while the only warning the dashboard offered was
+ * about prices.
+ *
+ * The comparison is against the extent of the retained series, not against the
+ * first drawn point. An idle night at the start of a selected week leaves the
+ * first bucket hours inside the window while the week itself is fully covered
+ * by evidence; that is an honest label, and reporting it would bury the case
+ * where the evidence really does stop short.
+ *
+ * Returns null when the label is honest.
+ */
+function seriesCoverageShortfall(data, rangeDays) {
+  if (!Number.isFinite(rangeDays) || rangeDays >= ALL_HISTORY_RANGE_DAYS) return null;
+  const usage = data?.timeline?.usage;
+  if (!Array.isArray(usage) || usage.length === 0) return null;
+  const latestMs = latestTimelineObservationMs(data);
+  // The series is ascending by time - the rolling-window walk in
+  // `liveTimelinePoints` and the `at(-1)` read above both depend on it - so the
+  // earliest retained observation is the head, not a scan on every pan frame.
+  const earliestMs = Date.parse(usage[0].startAt ?? usage[0].endAt);
+  if (latestMs === null || !Number.isFinite(earliestMs)) return null;
+  const claimedMs = rangeDays * 24 * 60 * 60 * 1_000;
+  const coveredMs = Math.max(0, latestMs - earliestMs);
+  if (coveredMs >= claimedMs * SERIES_COVERAGE_TOLERANCE) return null;
+  return { claimedMs, coveredMs };
+}
+
+/**
+ * State the shortfall next to the chart that is understating its own history.
+ *
+ * When the cause is known it is named: a withheld accounting cache is
+ * repairable by a local replay, and saying only that prices are withheld leaves
+ * the reader to interpret two thirds of their history vanishing as a quiet
+ * month.
+ */
+function renderSeriesCoverage(element, data, rangeDays) {
+  if (!element) return;
+  const shortfall = seriesCoverageShortfall(data, rangeDays);
+  if (shortfall === null) {
+    element.hidden = true;
+    setRawText(element, "");
+    return;
+  }
+  element.hidden = false;
+  setLocalizedText(
+    element,
+    data?.pricing?.accountingCacheStatus === "unavailable"
+      ? "dashboard.series.shortOfRangeWithheldCache"
+      : "dashboard.series.shortOfRange",
+    {
+      claimed: formatSpanLength(shortfall.claimedMs),
+      covered: formatSpanLength(shortfall.coveredMs),
+    },
+  );
+}
+
 function timelineBounds(points) {
   let startMs = Number.POSITIVE_INFINITY;
   let endMs = Number.NEGATIVE_INFINITY;
@@ -2929,6 +3003,11 @@ function renderUsageTimeline(data) {
   setLocalizedText($("#usage-timeline-copy"), "chart.timeZoneNote", {
     timeZone: formatTimeZoneLabel(),
   });
+  renderSeriesCoverage(
+    $("#usage-timeline-coverage"),
+    data,
+    activeUsageRangeDays,
+  );
   const summary = $("#usage-timeline-summary");
   clear(summary);
   const total = visiblePoints.reduce((sum, row) => sum + row.apiCostUsd, 0);
@@ -3156,6 +3235,11 @@ function renderTimeline(data) {
     }));
     bindTimelineInteractions(shell, points, viewport);
   }
+  renderSeriesCoverage(
+    $("#timeline-coverage"),
+    data,
+    activeCalibrationRangeDays,
+  );
   renderTimelineSummary(data, visiblePoints);
   renderTimelineConfidence(points, visiblePoints, usingLive, viewport);
   renderResiduals(data, visiblePoints, viewport);
@@ -6110,10 +6194,41 @@ async function checkLocalSetup() {
   }
 }
 
+let nativeEvidenceReloadInFlight = false;
+
+/**
+ * Re-read the companion's fragments after the native shell finished a refresh.
+ *
+ * In a browser, `requestRefresh` drives the refresh itself and re-renders when
+ * it completes. Inside the app that path stands down (see
+ * `scheduleReturningUserRefresh` below), so this is the only thing that moves
+ * the rendered numbers off the snapshot the page loaded with. Without it the
+ * dashboard keeps showing the pre-refresh figures while the toolbar reports
+ * the refresh finished - the UI asserting a freshness it does not have.
+ */
+async function reloadLocalEvidenceAfterNativeRefresh() {
+  // A refresh started from this page re-renders on its own completion, and a
+  // second overlapping read would only race it.
+  if (nativeEvidenceReloadInFlight || localRefreshInProgress || localActionBusy) {
+    return;
+  }
+  nativeEvidenceReloadInFlight = true;
+  try {
+    await loadQuickResultDashboard();
+  } catch {
+    // A failed re-read leaves the previous numbers on screen rather than
+    // blanking them. The next finished refresh signals again.
+  } finally {
+    nativeEvidenceReloadInFlight = false;
+  }
+}
+
 function scheduleReturningUserRefresh() {
   // The native macOS shell owns the foreground cadence. Running both the web
   // return-visit timer and the native timer races the same bounded companion
   // request, which can surface a harmless 409 as a confusing dashboard error.
+  // What the shell owes in return is a signal when its refresh finished, which
+  // `tibotattle:local-evidence-updated` carries.
   if (runsInsideNativeDashboard()) return;
   const priorEvidence = dashboard?.mode !== "demo"
     && Boolean(
@@ -7584,6 +7699,9 @@ $("#identity-signout").addEventListener("click", () => {
 $("#identity-signin-check").addEventListener("click", checkHostedSignInNow);
 $("#identity-signin-cancel").addEventListener("click", cancelHostedSignIn);
 window.addEventListener("tibotattle:hosted-sign-in-return", checkHostedSignInNow);
+window.addEventListener("tibotattle:local-evidence-updated", () => {
+  void reloadLocalEvidenceAfterNativeRefresh();
+});
 $("#community-connect-consent").addEventListener(
   "change",
   updateCommunityConnectButton

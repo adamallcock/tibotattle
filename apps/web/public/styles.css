@@ -1279,6 +1279,10 @@ h2 {
 .chart-summary-grid strong { display: block; margin-top: var(--space-1); font-size: .84rem; }
 .timeline-confidence { margin: var(--space-4) 0 0; padding: var(--space-3) var(--pad-tile); color: var(--muted); border-inline-start: 3px solid var(--line); background: var(--surface-quiet); font-size: .75rem; }
 .timeline-confidence.low { color: #784d25; border-inline-start-color: var(--rust); background: var(--rust-soft); }
+/* A chart drawing less history than its own label claims. Marked like a low
+   confidence note rather than a neutral caption: the reader is looking at a
+   picture that understates its subject. */
+.series-coverage { margin: var(--space-4) 0 0; padding: var(--space-3) var(--pad-tile); color: #784d25; border-inline-start: 3px solid var(--rust); background: var(--rust-soft); font-size: .75rem; }
 .lower-charts { grid-template-columns: 1fr; margin-top: 18px; }
 .table-wrap { width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius-sm); }
 table { width: 100%; border-collapse: collapse; font-size: .73rem; }

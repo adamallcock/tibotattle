@@ -270,6 +270,18 @@ export const WEB_MESSAGES = Object.freeze({
   "dashboard.calibration.withoutRange": ["The central fit implies a full 100-point allowance near {amount} API equivalent, but there is not yet a usable across-reset range. This is not a provider-published dollar cap.", "中心拟合表明完整的 100 点额度约为 {amount} 的 API 等价值，但尚无可用的跨重置区间。这不是提供商公布的美元上限。", "El ajuste central implica una asignación completa de 100 puntos cercana a {amount} de equivalente de API, pero todavía no hay un intervalo utilizable entre restablecimientos. No es un límite monetario publicado por el proveedor."],
   "dashboard.timeWindow.fifteenMinutes": ["15-minute", "15 分钟", "15 minutos"],
   "dashboard.timeWindow.hours": ["{count}-hour", "{count} 小时", "{count} horas"],
+  // A chart labelled with a range it does not actually cover. The reader is
+  // otherwise left to read a truncated series as a quiet month.
+  "dashboard.series.shortOfRange": [
+    "This chart is labelled {claimed} but the retained series only reaches back {covered}. Nothing older is drawn.",
+    "此图表标注为 {claimed}，但保留的序列仅回溯 {covered}。更早的数据未绘制。",
+    "Este gráfico está etiquetado como {claimed}, pero la serie conservada solo abarca {covered}. No se dibuja nada anterior.",
+  ],
+  "dashboard.series.shortOfRangeWithheldCache": [
+    "This chart is labelled {claimed} but the retained series only reaches back {covered}. Cached accounting is withheld, so the trend is drawn from the smaller live collector projection until a local analysis rebuilds it.",
+    "此图表标注为 {claimed}，但保留的序列仅回溯 {covered}。缓存的核算数据已被暂缓使用，因此在本地分析重建之前，趋势图使用范围更小的实时采集投影绘制。",
+    "Este gráfico está etiquetado como {claimed}, pero la serie conservada solo abarca {covered}. La contabilidad en caché está retenida, así que la tendencia se dibuja a partir de la proyección en vivo del recolector, más pequeña, hasta que un análisis local la reconstruya.",
+  ],
   "dashboard.timeline.title": ["{window} rolling quota change versus cost-implied change", "{window} 滚动额度变化与成本推断变化的对比", "Cambio móvil de cuota de {window} frente al cambio implícito por coste"],
   "dashboard.timeline.liveCopy": ["Usage changes and quota movement shown in {timeZone}.", "使用变化和额度变化显示为 {timeZone}。", "Los cambios de uso y de cuota se muestran en {timeZone}."],
   "dashboard.timeline.historicalCopy": ["Historical local calibration artifact from {generatedAt} · recent quota snapshots are too sparse to bracket {window} endpoints", "来自 {generatedAt} 的历史本地校准产物 · 最近的额度快照过于稀疏，无法界定 {window} 的端点", "Artefacto histórico de calibración local de {generatedAt} · las instantáneas recientes de cuota son demasiado escasas para acotar los extremos de {window}"],

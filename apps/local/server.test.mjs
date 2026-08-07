@@ -992,6 +992,7 @@ test("initialization failure retains the lock until idempotent automatic shutdow
   const initializationError = new Error("simulated initialization failure");
   let stopCalls = 0;
   let restarted;
+  let failedStart;
   let observedFailure;
   const automaticContributionController = {
     async start() {
@@ -1024,21 +1025,41 @@ test("initialization failure retains the lock until idempotent automatic shutdow
     port: 0,
   };
   try {
-    observedFailure = assert.rejects(
-      startLocalCompanionServer({
-        ...baseOptions,
-        dataStore: {
-          ...fakeStore(),
-          async initialize() {
-            throw initializationError;
-          },
+    // The snapshot build now runs behind an already-open port, so a build that
+    // fails is surfaced on `snapshotReady` instead of on the start call. Every
+    // consequence of that failure is unchanged: automatic contribution stops
+    // exactly once, the instance lock is held until that cleanup finishes, and
+    // no second instance may start in the meantime.
+    failedStart = await startLocalCompanionServer({
+      ...baseOptions,
+      dataStore: {
+        ...fakeStore(),
+        async initialize() {
+          throw initializationError;
         },
-        automaticContributionController,
-      }),
+      },
+      automaticContributionController,
+    });
+    observedFailure = assert.rejects(
+      failedStart.snapshotReady,
       (error) => error === initializationError,
     );
     await stopStarted.promise;
     assert.equal(stopCalls, 1);
+
+    // The port is open, so the failure has to be readable rather than silent:
+    // readiness names it, and every route that would have to project the
+    // missing snapshot refuses instead of answering with an empty one.
+    const failedHealth = await fetch(
+      `http://127.0.0.1:${failedStart.port}/api/local/health`,
+    ).then((response) => response.json());
+    assert.equal(failedHealth.status, "ready");
+    assert.equal(failedHealth.snapshot.status, "failed");
+    const failedOverview = await fetch(
+      `http://127.0.0.1:${failedStart.port}/api/local/overview`,
+    );
+    assert.equal(failedOverview.status, 503);
+    assert.equal((await failedOverview.json()).error.code, "snapshot_unavailable");
 
     await assert.rejects(
       startLocalCompanionServer({
@@ -1053,6 +1074,8 @@ test("initialization failure retains the lock until idempotent automatic shutdow
     await observedFailure;
     observedFailure = null;
     assert.equal(stopCalls, 1);
+    await failedStart.close();
+    failedStart = null;
     await assert.rejects(
       lstat(join(
         files.stateRoot,
@@ -1076,8 +1099,76 @@ test("initialization failure retains the lock until idempotent automatic shutdow
     cleanupBarrier.resolve();
     await Promise.allSettled([
       observedFailure,
+      failedStart?.close(),
       restarted?.close(),
     ].filter(Boolean));
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("the port and readiness answer before the first snapshot is built", async () => {
+  const files = await fixture();
+  const buildStarted = deferred();
+  const buildBarrier = deferred();
+  const store = fakeStore();
+  let app;
+  try {
+    const startedAt = Date.now();
+    app = await startLocalCompanionServer({
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: {
+        ...store,
+        async initialize() {
+          buildStarted.resolve();
+          await buildBarrier.promise;
+        },
+      },
+      refreshRunner: async () => ({}),
+      port: 0,
+    });
+    const base = `http://127.0.0.1:${app.port}`;
+    await buildStarted.promise;
+
+    // Listening, and honest about what is not ready yet. Before the port moved
+    // ahead of the build this request could not even be sent: a real install
+    // spends seconds here, and a rejected accounting cache spends long enough
+    // to exceed the launcher's own startup budget and have the companion
+    // killed before it could finish.
+    const health = await fetch(`${base}/api/local/health`)
+      .then((response) => response.json());
+    assert.equal(health.status, "ready");
+    assert.deepEqual(health.snapshot, { status: "building", errorCode: null });
+    assert.ok(
+      Date.now() - startedAt < 5_000,
+      "readiness must answer without waiting for the snapshot build",
+    );
+    assert.equal((await fetch(`${base}/`)).status, 200);
+
+    // A route that reads the snapshot waits for the build rather than
+    // projecting a half-built one.
+    let overviewSettled = false;
+    const overview = fetch(`${base}/api/local/overview`)
+      .then((response) => {
+        overviewSettled = true;
+        return response;
+      });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(overviewSettled, false);
+
+    buildBarrier.resolve();
+    assert.equal((await overview).status, 200);
+    await app.snapshotReady;
+    assert.deepEqual(
+      (await fetch(`${base}/api/local/health`)
+        .then((response) => response.json())).snapshot,
+      { status: "ready", errorCode: null },
+    );
+  } finally {
+    buildBarrier.resolve();
+    await app?.close();
     await rm(files.root, { recursive: true });
   }
 });

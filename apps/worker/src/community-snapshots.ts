@@ -6,6 +6,7 @@ import {
   COMMUNITY_WEEKLY_POLICY_VERSION,
 } from "./constants";
 import { APP_PRICE_REGISTRY_MANIFEST } from "@app-usagemonitor/accounting";
+import { canonicalJson } from "./canonical-json";
 import { sha256Hex } from "./crypto";
 import {
   TELEMETRY_MODEL_IDS,
@@ -154,10 +155,6 @@ interface ParticipantCellRow {
   output_reasoning_tokens: number | null;
   output_combined_tokens: number | null;
   tool_units: number | null;
-}
-
-function stableJson(value: unknown): string {
-  return JSON.stringify(value);
 }
 
 function validPolicyNumber(value: unknown): value is number {
@@ -736,7 +733,7 @@ async function buildCommunityWeeklySnapshotForPeriod(
     });
     payload = { ...base, releaseStatus: "published", cells };
   }
-  const payloadJson = stableJson(payload);
+  const payloadJson = canonicalJson(payload);
   const payloadHash = await sha256Hex(payloadJson);
   const results = await db.batch([
     db.prepare(
@@ -887,7 +884,7 @@ export async function readLatestCommunityWeeklySnapshot(
   ).first<SnapshotRow>();
   if (!row) {
     return Object.freeze({
-      payloadJson: stableJson({
+      payloadJson: canonicalJson({
         schemaVersion: SNAPSHOT_SCHEMA_VERSION,
         releaseStatus: "not_yet_published",
         reason: "stable_snapshot_unavailable",
@@ -899,7 +896,7 @@ export async function readLatestCommunityWeeklySnapshot(
   }
   if (row.release_state === "withdrawn") {
     return Object.freeze({
-      payloadJson: stableJson({
+      payloadJson: canonicalJson({
         schemaVersion: SNAPSHOT_SCHEMA_VERSION,
         releaseStatus: "withdrawn",
         snapshotId: row.snapshot_id,

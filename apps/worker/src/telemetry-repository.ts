@@ -1,3 +1,4 @@
+import { canonicalJson } from "./canonical-json";
 import { sha256Hex } from "./crypto";
 import {
   MAX_TELEMETRY_CONTRIBUTIONS_PER_ADMISSION_WINDOW,
@@ -157,15 +158,6 @@ export async function telemetryContributionAdmission(
   };
 }
 
-function stableJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-  if (typeof value === "object" && value !== null) {
-    return `{${Object.keys(value as Record<string, unknown>).sort()
-      .map((key) => `${JSON.stringify(key)}:${stableJson(Reflect.get(value, key))}`).join(",")}}`;
-  }
-  return JSON.stringify(value);
-}
-
 export async function telemetryEnvelopeDigest(envelope: TelemetryEnvelope): Promise<string> {
   return sha256Hex([
     envelope.schemaVersion,
@@ -177,7 +169,7 @@ export async function telemetryEnvelopeDigest(envelope: TelemetryEnvelope): Prom
 }
 
 export async function telemetryPlaintextDigest(record: unknown): Promise<string> {
-  return sha256Hex(stableJson(record));
+  return sha256Hex(canonicalJson(record));
 }
 
 export async function existingTelemetryContribution(
@@ -397,8 +389,8 @@ function usageStatement(
     serverPricing.methodVersion,
     serverPricing.registryVersion,
     serverPricing.registrySha256,
-    stableJson(serverPricing.selectedPriceCardIds),
-    stableJson(serverPricing.unpricedReasonCodes),
+    canonicalJson(serverPricing.selectedPriceCardIds),
+    canonicalJson(serverPricing.unpricedReasonCodes),
     serverPricing.priceEpochBasis,
     serverPricing.tierBasis,
     serverPricing.apiServiceTier,
@@ -407,7 +399,7 @@ function usageStatement(
     transport?.datasetId ?? null,
     transport?.accountTrackId ?? "unattributed",
     transport?.policyEpoch ?? null,
-    transport?.recordJson ?? stableJson(row),
+    transport?.recordJson ?? canonicalJson(row),
   ), occurrenceLink(
     db,
     participantId,
@@ -453,7 +445,7 @@ function quotaStatement(
     transport?.datasetId ?? null,
     transport?.accountTrackId ?? "unattributed",
     transport?.policyEpoch ?? null,
-    transport?.recordJson ?? stableJson(row),
+    transport?.recordJson ?? canonicalJson(row),
   ), occurrenceLink(
     db,
     participantId,
@@ -493,7 +485,7 @@ function markerStatement(
     transport?.datasetId ?? null,
     transport?.accountTrackId ?? "unattributed",
     transport?.policyEpoch ?? null,
-    transport?.recordJson ?? stableJson(row),
+    transport?.recordJson ?? canonicalJson(row),
   ), occurrenceLink(
     db,
     participantId,
@@ -559,7 +551,7 @@ export async function insertTelemetryContribution(
         datasetId: transport.datasetId,
         policyEpoch: transport.policyEpoch,
         ...(transport.usage.get(row.eventId)
-          ?? { accountTrackId: "unattributed", recordJson: stableJson(row) }),
+          ?? { accountTrackId: "unattributed", recordJson: canonicalJson(row) }),
       } : undefined,
     )),
     ...record.quotaSnapshots.map((row) => quotaStatement(
@@ -571,7 +563,7 @@ export async function insertTelemetryContribution(
         datasetId: transport.datasetId,
         policyEpoch: transport.policyEpoch,
         ...(transport.quota.get(row.snapshotId)
-          ?? { accountTrackId: "unattributed", recordJson: stableJson(row) }),
+          ?? { accountTrackId: "unattributed", recordJson: canonicalJson(row) }),
       } : undefined,
     )),
     ...record.activityMarkers.map((row) => markerStatement(
@@ -583,7 +575,7 @@ export async function insertTelemetryContribution(
         datasetId: transport.datasetId,
         policyEpoch: transport.policyEpoch,
         ...(transport.activity.get(row.markerId)
-          ?? { accountTrackId: "unattributed", recordJson: stableJson(row) }),
+          ?? { accountTrackId: "unattributed", recordJson: canonicalJson(row) }),
       } : undefined,
     )),
   ];
@@ -1714,88 +1706,6 @@ export async function personalStats(db: D1Database, participantId: string): Prom
         accountContinuity: "not_transmitted",
       };
     }),
-    insights: insights(totals, speedRow?.fast ?? 0, speedRow?.priced ?? 0),
-    generatedAt: new Date().toISOString(),
-  };
-}
-
-export async function communityStats(
-  db: D1Database,
-  minimumParticipants: number,
-  { eligibleOnly = false }: { eligibleOnly?: boolean } = {},
-): Promise<object> {
-  const eligibilityPredicate = eligibleOnly
-    ? "participant_id IN (SELECT participant_id FROM participant_community_eligibility)"
-    : "1 = 1";
-  const participantRow = await db.prepare(
-    `SELECT COUNT(DISTINCT participant_id) AS total FROM telemetry_records
-      WHERE ${eligibilityPredicate}`,
-  ).first<{ total: number }>();
-  const participantCount = participantRow?.total ?? 0;
-  if (participantCount < minimumParticipants) {
-    return {
-      schemaVersion: "community-stats-v0.1",
-      publicationStatus: "development_diagnostic_not_publication_safe",
-      suppressed: true,
-      participantCount,
-      minimumParticipants,
-      cohortEligibility: eligibleOnly ? "grant_backed" : "all_enrolled",
-      reason: "minimum_cohort_not_met",
-    };
-  }
-  const [totalRow, breakdown, daily, speedRow] = await Promise.all([
-    db.prepare(`${TOTALS_SQL} WHERE ${eligibilityPredicate}`).first<CountsRow>(),
-    db.prepare(
-      `SELECT provider, model_id AS modelId, COUNT(*) AS events,
-        COUNT(DISTINCT participant_id) AS participants,
-        COALESCE(SUM(input_uncached_tokens), 0) AS inputUncachedTokens,
-        COALESCE(SUM(input_cache_read_tokens), 0) AS inputCacheReadTokens,
-        COALESCE(SUM(output_text_tokens), 0) AS outputTextTokens,
-        COALESCE(SUM(output_reasoning_tokens), 0) AS outputReasoningTokens
-       FROM telemetry_records WHERE record_kind = 'usage' AND ${eligibilityPredicate}
-       GROUP BY provider, model_id HAVING COUNT(DISTINCT participant_id) >= ?
-       ORDER BY events DESC, provider, model_id LIMIT 50`,
-    ).bind(minimumParticipants).all(),
-    db.prepare(
-      `SELECT substr(observed_at, 1, 10) AS day, COUNT(*) AS events,
-        COUNT(DISTINCT participant_id) AS participants,
-        COALESCE(SUM(COALESCE(input_uncached_tokens, 0)
-          + COALESCE(input_cache_read_tokens, 0) + COALESCE(input_cache_write_tokens, 0)
-          + COALESCE(output_text_tokens, 0) + COALESCE(output_reasoning_tokens, 0)
-          + COALESCE(output_combined_tokens, 0)), 0) AS tokens
-       FROM telemetry_records WHERE record_kind = 'usage' AND ${eligibilityPredicate}
-       GROUP BY day HAVING COUNT(DISTINCT participant_id) >= ?
-       ORDER BY day DESC LIMIT 180`,
-    ).bind(minimumParticipants).all(),
-    db.prepare(
-      `SELECT
-        SUM(CASE WHEN speed_mode = 'fast' THEN 1 ELSE 0 END) AS fast,
-        SUM(CASE WHEN estimated_api_cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS priced
-       FROM telemetry_records WHERE record_kind = 'usage' AND ${eligibilityPredicate}`,
-    ).first<{ fast: number; priced: number }>(),
-  ]);
-  const totals = totalRow ?? zeroCounts();
-  return {
-    schemaVersion: "community-stats-v0.1",
-    publicationStatus: "development_diagnostic_not_publication_safe",
-    suppressed: false,
-    participantCount,
-    minimumParticipants,
-    cohortEligibility: eligibleOnly ? "grant_backed" : "all_enrolled",
-    totals: {
-      usageEvents: totals.usage_events,
-      quotaSnapshots: totals.quota_snapshots,
-      activityMarkers: totals.activity_markers,
-      inputUncachedTokens: totals.input_uncached_tokens,
-      inputCacheReadTokens: totals.input_cache_read_tokens,
-      inputCacheWriteTokens: totals.input_cache_write_tokens,
-      outputTextTokens: totals.output_text_tokens,
-      outputReasoningTokens: totals.output_reasoning_tokens,
-      outputCombinedTokens: totals.output_combined_tokens,
-      toolUnits: totals.tool_units,
-    },
-    byModel: breakdown.results,
-    daily: [...daily.results].reverse(),
     insights: insights(totals, speedRow?.fast ?? 0, speedRow?.priced ?? 0),
     generatedAt: new Date().toISOString(),
   };

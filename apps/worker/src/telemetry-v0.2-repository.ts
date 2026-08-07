@@ -8,6 +8,7 @@ import {
   validateTelemetryContributionV02,
   type TelemetryContributionV02,
 } from "./telemetry-v0.2";
+import { canonicalJson } from "./canonical-json";
 import { ApiError } from "./errors";
 import { parseStoredRecordJson } from "./stored-record";
 
@@ -54,16 +55,6 @@ function transportMetadata(record: TelemetryContributionV02): TelemetryTransport
       },
     ])),
   };
-}
-
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  if (value && typeof value === "object") {
-    return `{${Object.keys(value as Record<string, unknown>).sort()
-      .map((key) => `${JSON.stringify(key)}:${canonicalJson(Reflect.get(value, key))}`)
-      .join(",")}}`;
-  }
-  return JSON.stringify(value);
 }
 
 async function assertOccurrenceCompatibility(

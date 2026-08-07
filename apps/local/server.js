@@ -266,6 +266,14 @@ const API_ROUTES = new Set([
   "/api/local/accounting/fast-mode-preference",
 ]);
 
+// The two routes that must answer while the first snapshot is still being
+// built: readiness, and the channel used to report that a start went wrong.
+// Everything else in API_ROUTES reads the snapshot and waits for it.
+const SNAPSHOT_INDEPENDENT_API_ROUTES = new Set([
+  "/api/local/health",
+  "/api/local/diagnostics/note",
+]);
+
 
 function jsonBody(value) {
   return Buffer.from(JSON.stringify(value));
@@ -2256,7 +2264,14 @@ function createPreparedLocalCompanionServer({
   let automaticContributionInstanceLock = null;
   let automaticContributionInstanceLockRelease = null;
   let automaticContributionShutdown = null;
-  let initializationPromise = null;
+  let instanceLockPromise = null;
+  let snapshotPromise = null;
+  // Building the first snapshot reads the whole retained collector state, which
+  // is seconds of work on a large install. The port is opened before that work
+  // starts, so this is the only record of whether the in-memory snapshot the
+  // read routes project from actually exists yet. It is reported verbatim by
+  // /api/local/health rather than being smoothed into "ready".
+  let snapshotState = { status: "building", errorCode: null };
   const releaseAutomaticContributionInstanceLock = () => {
     if (automaticContributionInstanceLockRelease !== null) {
       return automaticContributionInstanceLockRelease;
@@ -2276,6 +2291,61 @@ function createPreparedLocalCompanionServer({
       })();
     }
     return automaticContributionShutdown;
+  };
+  // Single-instance exclusion is cheap (one lock file) and must still be
+  // decided before this process is allowed to accept requests, so it stays on
+  // the pre-listen path. Only the snapshot build moves behind the port.
+  const acquireInstanceLock = () => {
+    if (instanceLockPromise === null) {
+      instanceLockPromise = (async () => {
+        automaticContributionInstanceLock =
+          await acquireAutomaticContributionInstanceLock({
+            lockFile: statePaths.automaticContributionLockFile,
+          });
+      })();
+    }
+    return instanceLockPromise;
+  };
+  // Resolved the moment the outcome of the first build is known. A failing
+  // build still finishes stopping automatic contribution before it rethrows -
+  // the instance lock must outlive that cleanup - but a request waiting to read
+  // the snapshot is answered as soon as the answer exists, not held behind
+  // someone else's teardown.
+  let announceSnapshotOutcome = null;
+  const snapshotOutcome = new Promise((resolveOutcome) => {
+    announceSnapshotOutcome = resolveOutcome;
+  });
+  const buildSnapshot = () => {
+    if (snapshotPromise === null) {
+      snapshotPromise = (async () => {
+        try {
+          await dataStore.initialize();
+          await automaticContribution.start();
+          snapshotState = { status: "ready", errorCode: null };
+          announceSnapshotOutcome();
+        } catch (error) {
+          snapshotState = {
+            status: "failed",
+            errorCode: typeof error?.code === "string"
+              && /^[a-z0-9_]{1,64}$/u.test(error.code)
+              ? error.code
+              : "snapshot_unavailable",
+          };
+          announceSnapshotOutcome();
+          await shutdownAutomaticContribution().catch(() => {});
+          throw error;
+        }
+      })();
+    }
+    return snapshotPromise;
+  };
+  // Read routes wait for the first build instead of projecting an empty or
+  // half-built snapshot. A build that failed is reported as a failure rather
+  // than waited on forever.
+  const whenSnapshotSettled = async () => {
+    buildSnapshot().catch(() => {});
+    await snapshotOutcome;
+    return snapshotState;
   };
   const refresh = new LocalCompanionRefreshController({
     runner: refreshRunner,
@@ -2378,6 +2448,18 @@ function createPreparedLocalCompanionServer({
         sendError(response, 404, "not_found");
         return;
       }
+      // The listening port no longer proves the snapshot exists: it is opened
+      // first so the window, its static assets, and readiness answer at once.
+      // Every route that reads the snapshot therefore waits for the first build
+      // here, and a build that failed is refused rather than answered with an
+      // empty projection. Health and the diagnostic note stay outside the gate
+      // precisely so a slow or failed build can still be observed.
+      if (path.startsWith("/api/") && !SNAPSHOT_INDEPENDENT_API_ROUTES.has(path)) {
+        if ((await whenSnapshotSettled()).status !== "ready") {
+          sendError(response, 503, "snapshot_unavailable");
+          return;
+        }
+      }
 
       if (path === "/api/local/health") {
         if (request.method !== "GET") {
@@ -2387,6 +2469,14 @@ function createPreparedLocalCompanionServer({
         send(response, 200, {
           schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
           status: "ready",
+          // `status` above states that this loopback surface is answering, which
+          // it now does from the first millisecond. Whether the evidence
+          // snapshot behind the read routes exists yet is a separate fact, and
+          // it is stated separately rather than being folded into that word.
+          snapshot: {
+            status: snapshotState.status,
+            errorCode: snapshotState.errorCode,
+          },
           mode: "loopback_real_local_evidence",
           remoteUploadEnabled: false,
           capabilities: {
@@ -3117,23 +3207,12 @@ function createPreparedLocalCompanionServer({
     automaticContribution,
     [PARENT_WATCHDOG_PID]: parentWatchdogPid,
     async initialize() {
-      if (initializationPromise === null) {
-        initializationPromise = (async () => {
-          automaticContributionInstanceLock =
-            await acquireAutomaticContributionInstanceLock({
-              lockFile: statePaths.automaticContributionLockFile,
-            });
-          try {
-            await dataStore.initialize();
-            await automaticContribution.start();
-          } catch (error) {
-            await shutdownAutomaticContribution().catch(() => {});
-            throw error;
-          }
-        })();
-      }
-      return initializationPromise;
+      await acquireInstanceLock();
+      await buildSnapshot();
     },
+    acquireInstanceLock,
+    buildSnapshot,
+    snapshotStatus: () => ({ ...snapshotState }),
     shutdownAutomaticContribution,
   };
 }
@@ -3160,7 +3239,14 @@ export async function startLocalCompanionServer({
     terminateProcess: terminateProcessOnParentDeath,
   });
   try {
-    await app.initialize();
+    // Single-instance exclusion still decides whether this process may serve at
+    // all, so it stays ahead of listen(). The snapshot build does not: it used
+    // to hold the port shut for the 3-7 s it takes to read the retained
+    // collector state on a real install, and for far longer when a rejected
+    // accounting cache forces a full re-price - long enough to exceed the
+    // launcher's own startup budget and have the companion killed before it
+    // could finish repairing itself.
+    await app.acquireInstanceLock();
     if (!declaredParentIsCurrent(expectedParentPid)) {
       throw parentWatchdogConfigurationError();
     }
@@ -3180,10 +3266,16 @@ export async function startLocalCompanionServer({
     await app.shutdownAutomaticContribution().catch(() => {});
     throw error;
   }
+  // Started behind the open port. The read routes await this same promise, and
+  // a failure is surfaced through `snapshotReady` rather than being swallowed:
+  // it still stops automatic contribution and releases the instance lock.
+  const snapshotReady = app.buildSnapshot();
+  snapshotReady.catch(() => {});
   return {
     ...app,
     host,
     port: actualPort(app.server),
+    snapshotReady,
     close: async () => {
       parentWatchdog.stop();
       await closeHttpServer(app.server);
@@ -3210,6 +3302,19 @@ if (process.argv[1]
       () => process.exit(1),
     );
   };
+  // A snapshot that cannot be built leaves nothing for the read routes to
+  // project, so the process still exits and the host still sees a failed
+  // companion - the same outcome as before the port moved ahead of the build,
+  // reported once the port is open rather than in place of opening it.
+  app.snapshotReady.catch(() => {
+    if (closing) return;
+    closing = true;
+    app.server.closeAllConnections?.();
+    void app.close().then(
+      () => process.exit(1),
+      () => process.exit(1),
+    );
+  });
   process.once("SIGINT", close);
   process.once("SIGTERM", close);
 }

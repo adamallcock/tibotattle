@@ -101,6 +101,21 @@ CREATE TABLE ingest_run(
   received_at_ms INTEGER NOT NULL,
   parser_version_id INTEGER NOT NULL REFERENCES parser_version);
 
+-- One row per Codex session. Revised 2026-08-07: the session identifier was
+-- going to live on every usage_event, which was wrong in both directions. As
+-- a raw 36-char UUID it cost ~61 MB across 1,934,526 events; as a per-event
+-- HMAC it cost 17.8 s of hashing on a full-history upload, since the owner
+-- intends bulk incremental contribution rather than a 200-record sample. A
+-- pseudonym is a property of a session, not of an event: 3,709 sessions cost
+-- 34 ms to hash once, and usage_event carries a 4-byte foreign key instead of
+-- 36 bytes of text. Cheaper than storing the raw UUID per row, and the upload
+-- reads a value that is already computed.
+CREATE TABLE session(
+  id INTEGER PRIMARY KEY,
+  session_uuid TEXT NOT NULL UNIQUE,  -- raw; derives the rollout filename
+  upload_pseudonym BLOB NOT NULL,     -- HMAC(device_salt, session_uuid)
+  archived INTEGER NOT NULL);         -- hint only; corrected on a miss
+
 CREATE TABLE model(
   id INTEGER PRIMARY KEY,
   model_id TEXT NOT NULL UNIQUE,
@@ -150,8 +165,7 @@ CREATE TABLE usage_event(
   observed_at_ms INTEGER NOT NULL,
   ingest_run_id INTEGER NOT NULL REFERENCES ingest_run,
   parser_version_id INTEGER NOT NULL REFERENCES parser_version,
-  session_id TEXT NOT NULL,          -- raw Codex session UUID; pseudonymized
-                                     -- at upload, never stored hashed
+  session_pk INTEGER NOT NULL REFERENCES session,
   account_scope_id INTEGER NOT NULL REFERENCES account_scope,
   model_id INTEGER NOT NULL REFERENCES model,
   tier_id INTEGER NOT NULL REFERENCES tier_semantics,
@@ -172,13 +186,13 @@ CREATE TABLE usage_event(
   total_input_context INTEGER);      -- provider-reported, nullable
 
 CREATE TABLE tool_class_count(
-  session_id TEXT NOT NULL,
+  session_pk INTEGER NOT NULL REFERENCES session,
   tool_class TEXT NOT NULL,
   count INTEGER NOT NULL,
-  PRIMARY KEY(session_id, tool_class));
+  PRIMARY KEY(session_pk, tool_class));
 
 CREATE INDEX usage_event_observed ON usage_event(observed_at_ms);
-CREATE INDEX usage_event_session ON usage_event(session_id);
+CREATE INDEX usage_event_session ON usage_event(session_pk);
 ```
 
 Field names are chosen so nothing reads as content. `output_text_tokens`

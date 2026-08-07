@@ -1687,6 +1687,23 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         )
     }
 
+    /// A finished refresh has replaced the companion's snapshot, so the numbers
+    /// this document is showing are the ones from before it ran.
+    ///
+    /// The page's own return-visit refresh stands down inside this window
+    /// because the shell owns the foreground cadence. Owning that cadence has
+    /// to include saying when it produced something new: without this the
+    /// toolbar reports the refresh finished while the dashboard underneath
+    /// still renders the pre-refresh snapshot. Signalled rather than reloaded,
+    /// for the same reason as the hosted sign-in return above - a reload would
+    /// discard the document's in-memory state.
+    func notifyLocalEvidenceUpdated() {
+        guard hasDashboardTarget else { return }
+        webView.evaluateJavaScript(
+            "window.dispatchEvent(new Event('tibotattle:local-evidence-updated'));"
+        )
+    }
+
     /// Change the copy in the existing loopback document without reloading it.
     /// In particular, this must not disturb the in-memory hosted-sign-in
     /// handoff that is signalled separately above.
@@ -3509,6 +3526,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             isRefreshing: false,
             refreshEnabled: refreshEnabled
         )
+        // Before the toolbar is allowed to claim a state, the document that is
+        // showing the numbers is told to re-read them. Every terminal outcome
+        // signals, not just the successful one: a rejected or unreachable
+        // refresh still leaves the page asserting a freshness this window can
+        // no longer vouch for.
+        dashboardWebHost?.notifyLocalEvidenceUpdated()
         scheduleNativeRefresh()
     }
 
