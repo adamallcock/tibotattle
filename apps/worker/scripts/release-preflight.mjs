@@ -208,15 +208,27 @@ function configuredIdentityLinkSecretVersion(environment) {
   return typeof value === "string" && IDENTITY_LINK_SECRET_VERSION_PATTERN.test(value);
 }
 
+// Owner decision 2026-08-07: production enrollment is OPEN. The preflight
+// verifies the production mode is a reviewed hosted value (never the
+// development-only local_open) with the unreleased ingest surfaces still
+// closed - it no longer demands a closed enrollment door.
+function reviewedProductionEnvironment(environment) {
+  const vars = objectRecord(environment?.vars);
+  return Boolean(objectRecord(environment)
+    && vars?.ENVIRONMENT === "production"
+    && ["disabled", "invite_only", "open"].includes(vars?.ENROLLMENT_MODE)
+    && vars.ACCOUNT_SCOPED_INGEST_MODE === "disabled"
+    && vars.UPLOAD_INGRESS_QUEUE_MODE === "disabled");
+}
+
 export function assessDisabledEnrollmentConfiguration(config) {
   const checks = {
     stagingEnrollmentDisabled: disabledEnvironment(
       config?.env?.staging,
       "staging",
     ),
-    productionEnrollmentDisabled: disabledEnvironment(
+    productionEnrollmentModeReviewed: reviewedProductionEnvironment(
       config?.env?.production,
-      "production",
     ),
     stagingIdentityLinkSecretVersionConfigured:
       configuredIdentityLinkSecretVersion(config?.env?.staging),

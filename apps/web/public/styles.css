@@ -1660,7 +1660,17 @@ tbody tr:last-child td { border-bottom: 0; }
 .compact-metric { min-height: 150px; }
 .compact-metric .metric-value { margin: 16px 0 8px; font-size: 2rem; }
 .accounting-component-grid { margin-bottom: 18px; }
-.accounting-models-panel table { table-layout: fixed; }
+/* The model name owns the slack; numeric columns hug the right edge with
+   tabular digits. Fixed layout starved the name column into wrapping while
+   opening a void before the numbers (owner-reported, 2026-08-07). */
+.accounting-models-panel table { table-layout: auto; }
+.accounting-models-panel th:first-child,
+.accounting-models-panel td:first-child { width: 100%; white-space: nowrap; }
+.accounting-models-panel th:not(:first-child),
+.accounting-models-panel td:not(:first-child) {
+  text-align: end;
+  font-variant-numeric: tabular-nums;
+}
 .accounting-models-panel th:first-child,
 .accounting-models-panel td:first-child {
   width: 42%;
@@ -1975,12 +1985,14 @@ h2 { font-size: clamp(2rem, 3.8vw, 3.25rem); }
 footer {
   display: flex;
   justify-content: space-between;
+  align-items: baseline;
   gap: 20px;
-  padding: 30px 0 45px;
+  padding: 14px 0 18px;
   border-top: 1px solid var(--line);
   color: var(--muted);
-  font-size: .7rem;
+  font-size: .68rem;
 }
+footer p { margin: 0; }
 .noscript { position: fixed; inset: auto 0 0; padding: 1rem; color: white; background: var(--rust); text-align: center; }
 
 @media (max-width: 1050px) {

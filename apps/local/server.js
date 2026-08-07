@@ -30,6 +30,15 @@ import {
   createAutomaticContributionController,
 } from "../../src/automatic-contribution.js";
 import {
+  createIncrementalContributionSyncController,
+} from "../../src/incremental-contribution.js";
+import {
+  runIncrementalContributionSyncOnce,
+} from "../../src/contribution-incremental-sync.js";
+import {
+  TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+} from "../../src/contribution/telemetry-v1-chunks.js";
+import {
   createFastModePreferenceController,
 } from "../../src/fast-mode-preference.js";
 import {
@@ -267,6 +276,8 @@ const API_ROUTES = new Set([
   "/api/local/contribution/automatic-settings",
   "/api/local/contribution/automatic-enable",
   "/api/local/contribution/automatic-disable",
+  "/api/local/contribution/incremental-status",
+  "/api/local/contribution/incremental-approve",
   "/api/local/accounting/fast-mode-preference",
 ]);
 
@@ -1492,6 +1503,88 @@ function syncRunProjection(value) {
   };
 }
 
+const INCREMENTAL_SYNC_OUTCOME_CODE = /^[a-z][a-z0-9_]{0,63}$/u;
+const INCREMENTAL_SYNC_DAY = /^\d{4}-\d{2}-\d{2}$/u;
+
+/**
+ * The bounded status the dashboard's incremental surface reads: consent
+ * state, cursor progress as day counts and the acknowledged watermark day,
+ * pause reason as a fixed code. No path, no content, no identifier.
+ */
+function incrementalSyncStatusProjection(value, { configured = false } = {}) {
+  const consent = value?.consent;
+  const valid = value?.schemaVersion
+      === "incremental-contribution-sync-status-v1.0"
+    && typeof value?.paused === "boolean"
+    && typeof value?.running === "boolean"
+    && consent && typeof consent === "object"
+    && typeof consent.approved === "boolean"
+    && typeof consent.current === "boolean";
+  const projected = {
+    schemaVersion: "local-incremental-contribution-sync-v1.0",
+    status: valid
+      ? "available"
+      : configured ? "unavailable" : "not_configured",
+    contractVersion: TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+    consent: { approved: false, current: false, consentedAt: null },
+    paused: false,
+    pausedReason: null,
+    running: false,
+    progress: null,
+    lastAttemptAt: null,
+    nextAttemptAt: null,
+    lastOutcome: null,
+    includesContent: false,
+    includesPaths: false,
+    includesIdentifiers: false,
+    includesCredentials: false,
+  };
+  if (!valid) return projected;
+  const progress = value.progress;
+  const progressValid = progress !== null
+    && typeof progress === "object"
+    && [progress.daysTotal, progress.daysSynced, progress.daysPending,
+      progress.chunksUploaded].every(isNonNegativeInteger)
+    && (progress.acknowledgedThroughDay === null
+      || (typeof progress.acknowledgedThroughDay === "string"
+        && INCREMENTAL_SYNC_DAY.test(progress.acknowledgedThroughDay)));
+  const outcome = value.lastOutcome;
+  const outcomeValid = outcome !== null
+    && typeof outcome === "object"
+    && nullableInstant(outcome.at) !== null
+    && INCREMENTAL_SYNC_OUTCOME_CODE.test(outcome.code ?? "")
+    && ["succeeded", "partial", "failed", "paused"].includes(outcome.status);
+  return {
+    ...projected,
+    status: "available",
+    consent: {
+      approved: consent.approved,
+      current: consent.current,
+      consentedAt: nullableInstant(consent.consentedAt),
+    },
+    paused: value.paused,
+    pausedReason: value.paused
+      && INCREMENTAL_SYNC_OUTCOME_CODE.test(value.pausedReason ?? "")
+      ? value.pausedReason
+      : null,
+    running: value.running,
+    progress: progressValid
+      ? {
+        daysTotal: progress.daysTotal,
+        daysSynced: progress.daysSynced,
+        daysPending: progress.daysPending,
+        chunksUploaded: progress.chunksUploaded,
+        acknowledgedThroughDay: progress.acknowledgedThroughDay,
+      }
+      : null,
+    lastAttemptAt: nullableInstant(value.lastAttemptAt),
+    nextAttemptAt: nullableInstant(value.nextAttemptAt),
+    lastOutcome: outcomeValid
+      ? { at: nullableInstant(outcome.at), code: outcome.code, status: outcome.status }
+      : null,
+  };
+}
+
 const PREPARATION_ERROR_CODES = new Set([
   "coverage_unavailable",
   "coverage_invalid",
@@ -1918,6 +2011,7 @@ function createPreparedLocalCompanionServer({
   contributionSyncTimeoutMs = 60_000,
   automaticContributionController = null,
   automaticContributionOptions = {},
+  incrementalContributionController = null,
   onError = () => {},
 } = {}) {
   if (!environment || typeof environment !== "object"
@@ -2274,6 +2368,57 @@ function createPreparedLocalCompanionServer({
       uploadRunner: runAutomaticContributionUpload,
       maintenanceRunner: runAutomaticContributionRetirement,
     });
+  if (incrementalContributionController !== null
+      && (!incrementalContributionController
+        || typeof incrementalContributionController !== "object"
+        || typeof incrementalContributionController.start !== "function"
+        || typeof incrementalContributionController.stop !== "function"
+        || typeof incrementalContributionController.inspect !== "function"
+        || typeof incrementalContributionController.approve !== "function"
+        || typeof incrementalContributionController.resume !== "function")) {
+    throw new TypeError("incrementalContributionController is invalid");
+  }
+  // The telemetry-contribution-v1.0 incremental sync, additive beside the
+  // v0.1 prepared-set path. Configured only when a contribution service
+  // origin exists; the health capability additionally requires the unified
+  // index file to be present, because the index is the upload source.
+  const incrementalContribution = incrementalContributionController
+    ?? (contributionServiceOrigin === null
+      ? null
+      : createIncrementalContributionSyncController({
+        settingsFile: statePaths.incrementalContributionSyncSettingsFile,
+        destinationOrigin: contributionServiceOrigin,
+        runner: async ({ signal }) => {
+          if (contributionSyncInProgress
+              || contributionDeviceDisconnectInProgress) {
+            const error = new Error("sync_in_progress");
+            error.code = "sync_in_progress";
+            error.retryable = true;
+            throw error;
+          }
+          contributionSyncInProgress = true;
+          try {
+            const backend = await createContributionDeviceBackend();
+            return await runIncrementalContributionSyncOnce({
+              indexFile: statePaths.unifiedIndexFile,
+              origin: contributionServiceOrigin,
+              backend,
+              stateFile: statePaths.contributionDeviceStateFile,
+              signal,
+            });
+          } finally {
+            contributionSyncInProgress = false;
+          }
+        },
+      }));
+  const unifiedIndexPresent = async () => {
+    try {
+      const metadata = await lstat(statePaths.unifiedIndexFile);
+      return metadata.isFile() && !metadata.isSymbolicLink();
+    } catch {
+      return false;
+    }
+  };
   let automaticContributionInstanceLock = null;
   let automaticContributionInstanceLockRelease = null;
   let automaticContributionShutdown = null;
@@ -2300,6 +2445,11 @@ function createPreparedLocalCompanionServer({
     if (automaticContributionShutdown === null) {
       automaticContributionShutdown = (async () => {
         await automaticContribution.stop();
+        try {
+          await incrementalContribution?.stop();
+        } catch {
+          onError("incremental_contribution_stop_failed");
+        }
         await releaseAutomaticContributionInstanceLock();
       })();
     }
@@ -2334,6 +2484,13 @@ function createPreparedLocalCompanionServer({
         try {
           await dataStore.initialize();
           await automaticContribution.start();
+          // v1.0 incremental sync starts beside the v0.1 scheduler; a
+          // failure here must never take the v0.1 path or the snapshot down.
+          try {
+            await incrementalContribution?.start();
+          } catch {
+            onError("incremental_contribution_start_failed");
+          }
           snapshotState = { status: "ready", errorCode: null };
           announceSnapshotOutcome();
         } catch (error) {
@@ -2479,6 +2636,13 @@ function createPreparedLocalCompanionServer({
           sendError(response, 405, "method_not_allowed");
           return;
         }
+        // The dashboard's approve-once surface lights up only when this
+        // advertises exactly the v1.0 contract: a configured contribution
+        // service origin AND an existing unified index (the upload source).
+        const incrementalSyncCapability = incrementalContribution !== null
+          && await unifiedIndexPresent()
+          ? TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION
+          : false;
         send(response, 200, {
           schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
           status: "ready",
@@ -2507,6 +2671,7 @@ function createPreparedLocalCompanionServer({
               contributionDeviceDisconnectConfigured,
             contributionSyncExactReview: syncExactReviewConfigured,
             contributionSyncActions: syncDeliveryConfigured,
+            incrementalContributionSync: incrementalSyncCapability,
             centralServiceProxy: centralProxy.enabled,
             centralParticipantRelay: participantRelay.enabled,
             arbitraryPathAccess: false,
@@ -2744,6 +2909,78 @@ function createPreparedLocalCompanionServer({
         }
         return;
       }
+      if (path === "/api/local/contribution/incremental-status") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        if (incrementalContribution === null) {
+          send(response, 200, incrementalSyncStatusProjection(null, {
+            configured: false,
+          }));
+          return;
+        }
+        let status;
+        try {
+          status = await incrementalContribution.inspect();
+        } catch {
+          status = null;
+        }
+        send(response, 200, incrementalSyncStatusProjection(status, {
+          configured: true,
+        }));
+        return;
+      }
+      if (path === "/api/local/contribution/incremental-approve") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        // Approve-once consent for the v1.0 incremental model. The review
+        // token proves one verified real instance of the covered data was on
+        // screen (the review-bootstrap requirement carried into the
+        // approve-once flow); it is single-use, exactly like sync-once.
+        const reviewToken = await authorizeReviewedContributionMutation(
+          request,
+          response,
+          "incremental_consent_not_authorized",
+        );
+        if (reviewToken === null) return;
+        if (incrementalContribution === null) {
+          sendError(response, 409, "incremental_sync_not_configured");
+          return;
+        }
+        const authorization = reviewedContributionAuthorization;
+        reviewedContributionAuthorization = null;
+        if (authorization === null
+            || authorization.expiresAt < Date.now()
+            || authorization.reviewToken !== reviewToken) {
+          sendError(response, 409, "review_expired_or_changed");
+          return;
+        }
+        let approved;
+        try {
+          approved = await incrementalContribution.approve();
+        } catch {
+          sendError(response, 500, "incremental_consent_failed");
+          return;
+        }
+        if (approved?.consent?.approved !== true
+            || approved?.consent?.current !== true
+            || nullableInstant(approved.consent.consentedAt) === null) {
+          sendError(response, 500, "incremental_consent_failed");
+          return;
+        }
+        send(response, 200, {
+          schemaVersion: "local-incremental-contribution-consent-v1.0",
+          status: "approved",
+          contractVersion: TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+          consentedAt: nullableInstant(approved.consent.consentedAt),
+          includesIdentifiers: false,
+          includesCredentials: false,
+        });
+        return;
+      }
       if (path === "/api/local/accounting/fast-mode-preference") {
         if (request.method === "GET") {
           try {
@@ -2856,6 +3093,13 @@ function createPreparedLocalCompanionServer({
           // queue if this resume fails.
           try {
             await setContributionPaused({ paused: false });
+          } catch {
+            // deliberately ignored
+          }
+          // The v1.0 incremental sync pauses on the same trigger and is
+          // cured by the same pairing, equally best-effort.
+          try {
+            await incrementalContribution?.resume();
           } catch {
             // deliberately ignored
           }

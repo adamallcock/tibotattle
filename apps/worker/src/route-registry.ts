@@ -64,6 +64,14 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
     id: "device_disconnect",
   },
   {
+    pathname: "/api/v1/device/sync/state",
+    id: "device_sync_state",
+  },
+  {
+    pathname: "/api/v1/device/sync/manifest",
+    id: "device_sync_manifest",
+  },
+  {
     pathname: "/api/v1/me/devices",
     id: "participant_devices",
   },

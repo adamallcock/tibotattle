@@ -453,7 +453,6 @@ export const WEB_MESSAGES = Object.freeze({
   "share.detail.resetRange": ["Observed reset range {lower}–{upper}", "观测到的重置范围 {lower}–{upper}", "Rango de restablecimiento observado: {lower}–{upper}"],
   "share.detail.noAcrossResetRange": ["no across-reset range yet", "尚无跨重置范围", "aún no hay intervalo entre restablecimientos"],
   "share.detail.notEnoughMatchedWindows": ["not enough matched windows yet", "尚无足够的匹配窗口", "aún no hay suficientes ventanas coincidentes"],
-  "share.relationship": ["Activity sums all events in {period}; the estimate is one seven-day allowance.", "活动汇总了{period}的全部事件；估计值是一份七天额度。", "La actividad suma todos los eventos de {period}; la estimación corresponde a una asignación de siete días."],
   "share.caveat.demo": ["Labeled demo data: an illustrative fixture, not measured usage.", "已标记的演示数据：示例性装置，不是测得的使用量。", "Datos de demostración etiquetados: una muestra ilustrativa, no uso medido."],
   "share.caveat.unweighted": ["Not a complete total: {amount} of Standard-rate cost could not be speed-weighted and is excluded rather than counted at 1x.", "不是完整总额：{amount} 的 Standard 费率成本无法按速度加权，因此被排除而不是按 1 倍计入。", "No es un total completo: {amount} de coste a tarifa Standard no pudo ponderarse por velocidad y se excluye en lugar de contarse a 1×."],
   "share.caveat.noWeighted": ["No usage could be speed-weighted, so this is the unchanged Standard-rate total.", "没有使用量可按速度加权，因此这是未变动的 Standard 费率总额。", "No se pudo ponderar ningún uso por velocidad, por lo que este es el total sin cambios a tarifa Standard."],

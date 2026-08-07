@@ -99,6 +99,172 @@ private enum NativeDashboardEvidenceState: Equatable {
     case lifecycleUnavailable
 }
 
+/// Unified-history indexing coverage from the companion's own overview
+/// payload. While the local index is still advancing, the toolbar pill shows
+/// these two counts verbatim; nothing here is estimated or carried forward.
+private struct NativeHistoryIndexingCoverage: Equatable {
+    let indexedSourceCount: Int
+    let sourceCount: Int
+
+    var isComplete: Bool {
+        indexedSourceCount >= sourceCount
+    }
+}
+
+/// One bounded read of the companion's overview coverage. `notIndexing`
+/// means the payload was readable but carries no real indexing progress to
+/// narrate (demo data, or no coverage block at all); a `nil` observation from
+/// the reader means the endpoint was unreadable and the previous observation
+/// is kept rather than invented.
+private enum NativeHistoryIndexingObservation: Equatable {
+    case indexing(NativeHistoryIndexingCoverage)
+    case notIndexing
+}
+
+/// Terminal identity of the companion's last explicit refresh, from its own
+/// `/api/local/refresh` receipt. The step name is admitted only from the
+/// companion's closed refresh-step vocabulary, so the pill can never carry
+/// free-form failure text.
+private struct NativeRefreshFailure: Equatable {
+    let failedStep: String?
+}
+
+private enum NativeRefreshTerminalObservation: Equatable {
+    case failed(step: String?)
+    case notFailed
+}
+
+/// Fixed pill vocabulary for the two states the shared localization table
+/// does not carry. Deliberately content-free: fixed words plus locale-
+/// formatted counts, or a step name from the closed vocabulary above.
+private enum NativeToolbarStatusText {
+    static func indexing(
+        indexedSourceCount: Int,
+        sourceCount: Int
+    ) -> String {
+        let formatter = TiboTattleLocalization.decimalNumberFormatter(
+            maximumFractionDigits: 0
+        )
+        let indexed = formatter.string(
+            from: NSNumber(value: indexedSourceCount)
+        ) ?? String(indexedSourceCount)
+        let total = formatter.string(
+            from: NSNumber(value: sourceCount)
+        ) ?? String(sourceCount)
+        return "Indexing \(indexed) of \(total)"
+    }
+
+    static func refreshFailed(step: String?) -> String {
+        guard let step else { return "Refresh failed" }
+        return "Refresh failed: \(step)"
+    }
+}
+
+/// Toolbar-pill facts the shared menu-bar projection intentionally leaves
+/// behind: unified-history indexing coverage from the overview payload, and
+/// the terminal failure identity of the companion's last explicit refresh.
+/// Both reads reuse the already-audited loopback reader — same session, same
+/// headers, same size cap — so no second network route is introduced.
+private extension LocalCompanionEvidenceReader {
+    /// The companion's fixed refresh-step vocabulary. An unrecognized step is
+    /// dropped rather than shown, keeping the pill content-free.
+    static let refreshFailureSteps: Set<String> = [
+        "collector",
+        "accounting",
+        "archive_index",
+        "unified_index",
+        "assemble",
+    ]
+
+    func readHistoryIndexingCoverage(
+        base: URL,
+        completion: @escaping (NativeHistoryIndexingObservation?) -> Void
+    ) {
+        guard let url = loopbackEndpoint(base, path: "/api/local/overview")
+        else {
+            completion(nil)
+            return
+        }
+        let task = session.dataTask(with: request(url, method: "GET")) {
+            data, response, _ in
+            let observation = Self.acceptedPayload(data, response)
+                .flatMap(Self.decodeHistoryIndexingObservation)
+            DispatchQueue.main.async { completion(observation) }
+        }
+        task.resume()
+    }
+
+    func readRefreshTerminalObservation(
+        base: URL,
+        completion: @escaping (NativeRefreshTerminalObservation?) -> Void
+    ) {
+        guard let url = loopbackEndpoint(base, path: "/api/local/refresh")
+        else {
+            completion(nil)
+            return
+        }
+        let task = session.dataTask(with: request(url, method: "GET")) {
+            data, response, _ in
+            let observation = Self.acceptedPayload(data, response)
+                .flatMap(Self.decodeRefreshTerminalObservation)
+            DispatchQueue.main.async { completion(observation) }
+        }
+        task.resume()
+    }
+
+    static func decodeHistoryIndexingObservation(
+        _ data: Data
+    ) -> NativeHistoryIndexingObservation? {
+        guard let root = try? JSONSerialization.jsonObject(with: data)
+            as? [String: Any]
+        else {
+            return nil
+        }
+        // A demo payload may advertise synthetic coverage; the pill only
+        // narrates the real local index.
+        if let mode = root["mode"] as? String,
+           ["demo", "synthetic"].contains(mode) {
+            return .notIndexing
+        }
+        let history = (root["coverage"] as? [String: Any])?["history"]
+            as? [String: Any]
+            ?? (root["pricing"] as? [String: Any])?["historyCoverage"]
+            as? [String: Any]
+        guard let history,
+              let indexed = (history["indexedSourceCount"] as? NSNumber)?
+                .intValue,
+              let total = (history["sourceCount"] as? NSNumber)?.intValue,
+              indexed >= 0,
+              total >= 0
+        else {
+            return .notIndexing
+        }
+        return .indexing(NativeHistoryIndexingCoverage(
+            indexedSourceCount: indexed,
+            sourceCount: total
+        ))
+    }
+
+    static func decodeRefreshTerminalObservation(
+        _ data: Data
+    ) -> NativeRefreshTerminalObservation? {
+        guard let root = try? JSONSerialization.jsonObject(with: data)
+            as? [String: Any],
+            let refresh = root["refresh"] as? [String: Any],
+            let status = refresh["status"] as? String
+        else {
+            return nil
+        }
+        guard status == "failed" else { return .notFailed }
+        let step = refresh["failedStep"] as? String
+        return .failed(
+            step: step.flatMap {
+                Self.refreshFailureSteps.contains($0) ? $0 : nil
+            }
+        )
+    }
+}
+
 private enum NativeRefreshIntervalPreference {
     static let defaultsKey = "tibotattle.refresh-interval.v1"
     static let defaultSeconds = 5 * 60
@@ -2229,6 +2395,61 @@ private struct NativeDashboardChromeMetrics {
     }
 }
 
+/// The product's brand palette as native dynamic colors. Values mirror the
+/// web report's tokens (`--paper: #f5f1e8` and `--green: #174f45` in
+/// apps/web/public/styles.css) so the native chrome and the embedded report
+/// read as one surface. The dark appearance keeps the same family: the
+/// accent is lifted for contrast and the paper wash becomes a deep-green
+/// cast rather than a glaring cream sheet.
+private enum NativeBrandPalette {
+    /// Web accent #174f45, lifted for dark backgrounds.
+    static let accent = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(
+                srgbRed: 122 / 255,
+                green: 184 / 255,
+                blue: 170 / 255,
+                alpha: 1
+            )
+            : NSColor(
+                srgbRed: 23 / 255,
+                green: 79 / 255,
+                blue: 69 / 255,
+                alpha: 1
+            )
+    }
+
+    /// Web background #f5f1e8, washed over the system sidebar material so
+    /// vibrancy still reads through it.
+    static let sidebarWash = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(
+                srgbRed: 23 / 255,
+                green: 79 / 255,
+                blue: 69 / 255,
+                alpha: 0.22
+            )
+            : NSColor(
+                srgbRed: 245 / 255,
+                green: 241 / 255,
+                blue: 232 / 255,
+                alpha: 0.55
+            )
+    }
+}
+
+/// Lays the brand's paper wash over the system sidebar material. A layer's
+/// background color does not track appearance changes on its own, so the
+/// wash re-resolves its dynamic color in `updateLayer`, which AppKit calls
+/// with this view's effective appearance current.
+private final class NativeSidebarBrandWash: NSView {
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        layer?.backgroundColor = NativeBrandPalette.sidebarWash.cgColor
+    }
+}
+
 /// The native frame for the loopback dashboard. WebKit remains responsible for
 /// the rich charts and accessible, selectable report content. AppKit owns the
 /// sidebar here, while the window's unified toolbar owns status, refresh,
@@ -2252,22 +2473,35 @@ private final class NativeDashboardChrome: NSSplitViewController {
     /// blends with this window's own content. Owner-selected treatment lives
     /// here alone so it can be reversed without touching layout.
     private static let sidebarBlendingMode: NSVisualEffectView.BlendingMode = .behindWindow
-    /// A sidebar item rests at its minimum thickness unless something outweighs
-    /// the item's own holding priority, and a width constraint strong enough to
-    /// do that also resists the user's own divider drag. Measured across
-    /// priorities 250 to 999, the only two outcomes are "rests at the minimum"
-    /// and "pinned". So the resting width is expressed as the minimum, which is
-    /// the 216pt the sidebar was always meant to open at, and the range the
-    /// user can actually use runs upward from there — plus the system's own
-    /// collapse for the narrow case.
-    private static let sidebarMinimumThickness: CGFloat = 216
-    private static let sidebarMaximumThickness: CGFloat = 280
+    /// The divider is a real control, not an affordance: the split enforces
+    /// these bounds while the user drags it, and the chosen width survives
+    /// relaunch through the split view's own autosave. A first launch, with
+    /// nothing to restore, opens at the resting width the sidebar was always
+    /// meant to open at. Internal, not private, so the layout smoke asserts
+    /// against the same numbers the chrome enforces.
+    static let sidebarMinimumThickness: CGFloat = 180
+    static let sidebarMaximumThickness: CGFloat = 320
+    static let sidebarRestingThickness: CGFloat = 216
     private static let reportMinimumThickness: CGFloat = 420
+    /// AppKit applies a divider drag at `dragThatCannotResizeWindow` (490).
+    /// The previous `.defaultHigh` (750) holding priority outranked the drag
+    /// itself, which is why the seam showed a resize cursor but refused to
+    /// move — a divider that lies. 260 sits below the drag so the user wins,
+    /// and above the report item's default 250 so a window resize stretches
+    /// the report rather than the sidebar.
+    private static let sidebarHoldingPriority = NSLayoutConstraint.Priority(260)
+    private static let splitAutosaveName = "com.usagemonitor.local.dashboard-split.v1"
+    /// One-time marker that the resting width has been seeded. After this,
+    /// the autosaved divider position is the user's own and is never fought.
+    private static let splitSeededDefaultsKey =
+        "tibotattle.dashboard-split-seeded.v1"
 
     private let sidebar = NSVisualEffectView()
+    private let sidebarWash = NativeSidebarBrandWash()
     private let pageStack = NSStackView()
     private let reportPane: NativeDashboardReportPane
     private var pageButtons: [NativeDashboardDestination: NSButton] = [:]
+    private var restingWidthSeeded = false
 
     var onNavigate: ((NativeDashboardDestination) -> Void)?
 
@@ -2287,6 +2521,13 @@ private final class NativeDashboardChrome: NSSplitViewController {
         // background is a tell that the surface is not really native; the
         // system desaturates it with the rest of the window.
         sidebar.state = .followsWindowActiveState
+
+        // The brand wash sits between the material and the rows: the report
+        // beside this pane renders on the web palette's warm paper, and an
+        // untinted grey strip against it looks like someone else's app.
+        sidebarWash.wantsLayer = true
+        sidebarWash.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.addSubview(sidebarWash)
 
         pageStack.orientation = .vertical
         // Rows fill the sidebar's width the way every native sidebar's do. The
@@ -2323,6 +2564,15 @@ private final class NativeDashboardChrome: NSSplitViewController {
         let sidebarController = NSViewController()
         sidebarController.view = sidebar
         NSLayoutConstraint.activate([
+            // The wash covers the whole material, title-bar run included.
+            sidebarWash.leadingAnchor.constraint(
+                equalTo: sidebar.leadingAnchor
+            ),
+            sidebarWash.trailingAnchor.constraint(
+                equalTo: sidebar.trailingAnchor
+            ),
+            sidebarWash.topAnchor.constraint(equalTo: sidebar.topAnchor),
+            sidebarWash.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
             pageStack.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
             pageStack.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
             // The sidebar itself runs behind the title bar; its rows must not.
@@ -2340,8 +2590,9 @@ private final class NativeDashboardChrome: NSSplitViewController {
         sidebarItem.minimumThickness = Self.sidebarMinimumThickness
         sidebarItem.maximumThickness = Self.sidebarMaximumThickness
         sidebarItem.canCollapse = true
-        // The sidebar holds its width while the report absorbs the resize.
-        sidebarItem.holdingPriority = .defaultHigh
+        // Low enough that the user's own divider drag wins; see the note on
+        // `sidebarHoldingPriority`.
+        sidebarItem.holdingPriority = Self.sidebarHoldingPriority
         addSplitViewItem(sidebarItem)
 
         // Keep WebKit inside a pane whose frame the split view controller owns.
@@ -2357,6 +2608,9 @@ private final class NativeDashboardChrome: NSSplitViewController {
 
         splitView.isVertical = true
         splitView.dividerStyle = .thin
+        // The split view's own autosave carries the dragged width across
+        // launches; nothing else records or replays divider geometry.
+        splitView.autosaveName = Self.splitAutosaveName
         select(.overview)
     }
 
@@ -2364,12 +2618,32 @@ private final class NativeDashboardChrome: NSSplitViewController {
         nil
     }
 
+    /// The very first launch has no autosaved divider to restore, and plain
+    /// constraint solving would rest the sidebar at its 180pt minimum. Seed
+    /// the designed 216pt opening width exactly once; every later launch
+    /// restores whatever width the user actually chose.
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        guard !restingWidthSeeded else { return }
+        restingWidthSeeded = true
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: Self.splitSeededDefaultsKey) else {
+            return
+        }
+        defaults.set(true, forKey: Self.splitSeededDefaultsKey)
+        view.layoutSubtreeIfNeeded()
+        splitView.setPosition(Self.sidebarRestingThickness, ofDividerAt: 0)
+    }
+
     func select(_ destination: NativeDashboardDestination) {
         for (candidate, button) in pageButtons {
             let selected = candidate == destination
             button.state = selected ? .on : .off
+            // The selected row carries the product's deep-green accent, the
+            // same accent the web report uses, instead of the user's system
+            // accent color.
             button.contentTintColor = selected
-                ? .controlAccentColor
+                ? NativeBrandPalette.accent
                 : .secondaryLabelColor
             button.font = .systemFont(
                 ofSize: 13,
@@ -2500,6 +2774,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private var nativeRefreshInFlight = false
     private var nativeEvidenceState: NativeDashboardEvidenceState = .unknown
     private var nativeEvidenceObservedAt: Date?
+    /// The companion's own history-index coverage and terminal refresh
+    /// receipt. Both are observations, never inferences: each is replaced
+    /// only by a successful loopback re-read of the companion's payloads.
+    private var nativeHistoryIndexingCoverage: NativeHistoryIndexingCoverage?
+    private var nativeRefreshFailure: NativeRefreshFailure?
+    private var nativeIndexingCoveragePoll: DispatchWorkItem?
     /// Opaque companion token for the particular refresh this surface started
     /// or joined. It is never persisted or exposed in UI/notification text.
     private var nativeRefreshID: String?
@@ -2982,6 +3262,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             defer: false
         )
         newWindow.title = BundledProduct.displayName
+        // The plain text title yields to a small native brand row — the
+        // bundle's own app icon beside the wordmark in the brand's deep
+        // green — mirroring the web report's brand row. The window keeps its
+        // title for Mission Control, the window menu, and accessibility;
+        // only the titlebar's text drawing is replaced.
+        newWindow.titleVisibility = .hidden
+        newWindow.addTitlebarAccessoryViewController(
+            Self.makeTitlebarBrandAccessory()
+        )
         newWindow.toolbar = makeDashboardToolbar()
         newWindow.toolbarStyle = .unified
         // A content *view controller* so the split view controller has a
@@ -3017,6 +3306,41 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         .resizable,
         .fullSizeContentView,
     ]
+
+    /// The titlebar's brand row: the bundle's own app icon at title-bar
+    /// scale beside the product wordmark in the brand's deep green — the
+    /// native sibling of the web report's brand row. A titlebar accessory
+    /// keeps this modest: no web view, no new image asset, no custom window
+    /// drawing, and the icon is the exact icon macOS already shows for this
+    /// app.
+    private static func makeTitlebarBrandAccessory()
+        -> NSTitlebarAccessoryViewController {
+        let icon = NSImageView(image: NSApp.applicationIconImage)
+        icon.imageScaling = .scaleProportionallyDown
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            icon.widthAnchor.constraint(equalToConstant: 18),
+            icon.heightAnchor.constraint(equalToConstant: 18),
+        ])
+        let wordmark = NSTextField(
+            labelWithString: BundledProduct.displayName
+        )
+        wordmark.font = .systemFont(ofSize: 13, weight: .semibold)
+        wordmark.textColor = NativeBrandPalette.accent
+        let row = NSStackView(views: [icon, wordmark])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 6
+        row.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 6)
+        // Titlebar accessories are sized from the view's frame, not from a
+        // constraint relationship with the titlebar.
+        row.layoutSubtreeIfNeeded()
+        row.frame = NSRect(origin: .zero, size: row.fittingSize)
+        let accessory = NSTitlebarAccessoryViewController()
+        accessory.view = row
+        accessory.layoutAttribute = .left
+        return accessory
+    }
 
     private func makeDashboardToolbar() -> NSToolbar {
         let toolbar = NSToolbar(
@@ -3444,6 +3768,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             return
         }
         cancelNativeRefreshSchedule()
+        cancelNativeIndexingCoveragePoll()
         nativeRefreshInFlight = true
         updateNativeToolbar(
             title: automatic
@@ -3555,7 +3880,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                         base: base,
                         expectedRefreshID: expectedRefreshID
                     )
-                    self.finishNativeRefresh(title: title, refreshEnabled: true)
+                    // The pill's terminal state is decided only after the
+                    // companion's own coverage counts and refresh receipt
+                    // have been re-read; a failed pass or a still-building
+                    // index then takes the title over the evidence prose.
+                    self.readNativeToolbarStatusFacts(base: base) { [weak self] in
+                        self?.finishNativeRefresh(
+                            title: title,
+                            refreshEnabled: true
+                        )
+                    }
                 }
             }
         }
@@ -3582,6 +3916,42 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         // no longer vouch for.
         dashboardWebHost?.notifyLocalEvidenceUpdated()
         scheduleNativeRefresh()
+        scheduleNativeIndexingCoveragePoll()
+    }
+
+    /// One bounded loopback read of the two pill-only companion facts. A
+    /// readable payload replaces the stored observation entirely; an
+    /// unreadable endpoint keeps the previous observation rather than
+    /// inventing a state.
+    private func readNativeToolbarStatusFacts(
+        base: URL,
+        completion: @escaping () -> Void
+    ) {
+        nativeEvidenceReader.readHistoryIndexingCoverage(base: base) { [weak self] observation in
+            guard let self, !self.quitting else { return }
+            switch observation {
+            case let .indexing(coverage):
+                self.nativeHistoryIndexingCoverage = coverage
+            case .notIndexing:
+                self.nativeHistoryIndexingCoverage = nil
+            case nil:
+                break
+            }
+            self.nativeEvidenceReader.readRefreshTerminalObservation(base: base) { [weak self] terminal in
+                guard let self, !self.quitting else { return }
+                switch terminal {
+                case let .failed(step):
+                    self.nativeRefreshFailure = NativeRefreshFailure(
+                        failedStep: step
+                    )
+                case .notFailed:
+                    self.nativeRefreshFailure = nil
+                case nil:
+                    break
+                }
+                completion()
+            }
+        }
     }
 
     /// The notification coordinator only observes the terminal receipt from
@@ -3629,6 +3999,57 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private func cancelNativeRefreshSchedule() {
         nativeRefreshSchedule?.cancel()
         nativeRefreshSchedule = nil
+    }
+
+    /// While the history index is still advancing, the idle pill re-reads
+    /// the companion's coverage counts on a short foreground cadence so
+    /// "Indexing n of m" tracks reality between refreshes. The poll exists
+    /// only between an incomplete coverage observation and the first
+    /// complete one: it is cancelled when a refresh starts, when the
+    /// companion goes away, and on quit, and it never creates a timer,
+    /// helper, daemon, or background polling path.
+    private static let indexingCoveragePollSeconds = 30
+
+    private func scheduleNativeIndexingCoveragePoll() {
+        cancelNativeIndexingCoveragePoll()
+        guard !quitting,
+              dashboardURL != nil,
+              let coverage = nativeHistoryIndexingCoverage,
+              !coverage.isComplete
+        else {
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.quitting, !self.nativeRefreshInFlight,
+                  let dashboardURL = self.dashboardURL
+            else {
+                return
+            }
+            self.readNativeToolbarStatusFacts(base: dashboardURL) { [weak self] in
+                guard let self, !self.quitting, !self.nativeRefreshInFlight
+                else {
+                    return
+                }
+                self.updateNativeToolbar(
+                    title: TiboTattleLocalization.string(
+                        .nativeDashboardStatus
+                    ),
+                    isRefreshing: false,
+                    refreshEnabled: self.dashboardURL != nil
+                )
+                self.scheduleNativeIndexingCoveragePoll()
+            }
+        }
+        nativeIndexingCoveragePoll = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .seconds(Self.indexingCoveragePollSeconds),
+            execute: work
+        )
+    }
+
+    private func cancelNativeIndexingCoveragePoll() {
+        nativeIndexingCoveragePoll?.cancel()
+        nativeIndexingCoveragePoll = nil
     }
 
     /// The launcher has a native window as well as a web dashboard. Supplying
@@ -3766,6 +4187,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         actionRow.isHidden = false
         openInBrowserButton.isEnabled = false
         cancelNativeRefreshPoll()
+        cancelNativeIndexingCoveragePoll()
+        // Every teardown that hides the dashboard also loses the companion
+        // that reported these two facts, so the pill may not keep narrating
+        // an index build or a failed refresh it can no longer observe.
+        nativeHistoryIndexingCoverage = nil
+        nativeRefreshFailure = nil
         nativeRefreshInFlight = false
         nativeRefreshID = nil
         dashboardWebHost?.stop()
@@ -3861,6 +4288,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         dashboardURL = url
         nativeEvidenceState = .unknown
         nativeEvidenceObservedAt = nil
+        // A restarted companion invalidates any earlier coverage counts and
+        // refresh receipt; the refresh below re-reads both from the new
+        // process before the pill claims either again.
+        nativeHistoryIndexingCoverage = nil
+        nativeRefreshFailure = nil
+        cancelNativeIndexingCoveragePoll()
         lastLifecycleStatus = "Ready"
         lastFailureCode = nil
         lastRecoverySuggestion = nil
@@ -4092,6 +4525,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func nativeToolbarEvidenceTitle(fallback: String) -> String {
+        // The companion's own refresh receipt and index coverage outrank the
+        // evidence prose: a failed pass must say it failed, and a history
+        // index that is still building must narrate its real progress rather
+        // than hiding behind a bare "Status". Once coverage is complete and
+        // the last refresh succeeded, the existing vocabulary returns.
+        if let failure = nativeRefreshFailure {
+            return NativeToolbarStatusText.refreshFailed(
+                step: failure.failedStep
+            )
+        }
+        if let coverage = nativeHistoryIndexingCoverage, !coverage.isComplete {
+            return NativeToolbarStatusText.indexing(
+                indexedSourceCount: coverage.indexedSourceCount,
+                sourceCount: coverage.sourceCount
+            )
+        }
         switch nativeEvidenceState {
         case .live:
             return TiboTattleLocalization.string(.nativeDashboardFresh)
@@ -5646,6 +6095,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         startupTimeout?.cancel()
         cancelNativeRefreshPoll()
         cancelNativeRefreshSchedule()
+        cancelNativeIndexingCoveragePoll()
         nativeEvidenceReader.invalidate()
         // Released here so the status item can never outlive the companion it
         // reports on. The companion itself is stopped by the graceful
@@ -7129,11 +7579,16 @@ private enum NativeDashboardChromeLayoutSmokeTest {
                 + "bar starts at \(Int(titleBar.maxY)), so it does not run "
                 + "behind the title bar"
         )
+        // The band is the chrome's own drag range: whatever width the split
+        // rests at or restores must fall inside what the divider enforces.
         require(
-            metrics.sidebarPane.width >= 190
-                && metrics.sidebarPane.width <= 288,
+            metrics.sidebarPane.width
+                >= NativeDashboardChrome.sidebarMinimumThickness - 1
+                && metrics.sidebarPane.width
+                <= NativeDashboardChrome.sidebarMaximumThickness + 8,
             "sidebar width \(Int(metrics.sidebarPane.width)) is outside the "
-                + "190-288 band"
+                + "\(Int(NativeDashboardChrome.sidebarMinimumThickness))-"
+                + "\(Int(NativeDashboardChrome.sidebarMaximumThickness)) band"
         )
         // The material runs behind the title bar; the rows in it must not, or
         // the first destination is hidden under the toolbar.

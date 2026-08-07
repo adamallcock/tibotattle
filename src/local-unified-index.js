@@ -41,16 +41,25 @@ export const LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION =
 
 const INDEX_APPLICATION_ID = 0x554d5549;
 // Version 2 (2026-08-07) widens version 1 with the two incremental-ingest
-// tables below: `source_cursor` and `lineage_snapshot`. The widening is purely
-// additive, so a version-1 index opened writable is migrated in place — its
-// rows survive, which matters because rows whose rollout files have rotated
-// away can never be rebuilt. A version-1 index opened read-only stays valid as
-// it is: readers never touch the new tables.
-const INDEX_USER_VERSION = 2;
-const MIGRATABLE_USER_VERSIONS = new Set([1, 2]);
+// tables below: `source_cursor` and `lineage_snapshot`. Version 3 (2026-08-07)
+// adds `session_identity`, the raw provider-issued session UUID beside its
+// local join key: the owner ruled that session identifiers travel raw in
+// telemetry-contribution-v1.0, and the HMAC join key cannot be inverted, so
+// the raw identifier has to be recorded at ingest time. Each widening is
+// purely additive, so an older index opened writable is migrated in place —
+// its rows survive, which matters because rows whose rollout files have
+// rotated away can never be rebuilt. An older index opened read-only stays
+// valid as it is: readers never touch the new tables.
+const INDEX_USER_VERSION = 3;
+const MIGRATABLE_USER_VERSIONS = new Set([1, 2, 3]);
 const SECRET_BYTES = 32;
 const MAX_SECRET_BYTES = 256;
 const DEFAULT_COMMIT_ROWS = 10_000;
+// The one shape a stored raw session identity may take: the provider-issued
+// UUID. Deliberately narrower than the transport regex so a filename-shaped
+// rollout-key fallback can never be recorded as an identity.
+export const RAW_SESSION_UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
 // Both enums are ordinals into the telemetry contract's fixed member lists.
 // Their order is part of the on-disk format: append only, never reorder.
@@ -230,6 +239,18 @@ const SCHEMA = `
     session_local BLOB NOT NULL,
     snapshot_local BLOB NOT NULL,
     PRIMARY KEY(session_local, snapshot_local)) STRICT, WITHOUT ROWID;
+
+  -- Raw provider-issued session identity beside its local join key (schema
+  -- widening of 2026-08-07, version 3). Owner decision: session identifiers
+  -- travel RAW in telemetry-contribution-v1.0 — the UUID is a provider-issued
+  -- pseudonymous identifier already sitting in filenames on this disk, so the
+  -- hash defends nothing. Only a strictly UUID-shaped lineage session id is
+  -- ever recorded here: a rollout-key fallback is filename-shaped and must
+  -- never be stored. Sessions indexed before this widening whose sources have
+  -- rotated away simply have no row.
+  CREATE TABLE IF NOT EXISTS session_identity(
+    session_local BLOB PRIMARY KEY,
+    session_uuid TEXT NOT NULL) STRICT;
 
   CREATE INDEX IF NOT EXISTS usage_event_observed
     ON usage_event(observed_at_ms);
@@ -441,8 +462,8 @@ function migrateDatabase(database) {
   if (!MIGRATABLE_USER_VERSIONS.has(userVersion)) {
     throw fixedError("local_unified_index_schema_invalid");
   }
-  // Version 1 -> 2 is additive: create the incremental-ingest tables and stamp
-  // the new version. Existing rows are untouched by construction.
+  // Every migration is additive: create the widened tables and stamp the new
+  // version. Existing rows are untouched by construction.
   database.exec(`
     ${SCHEMA}
     PRAGMA user_version=${INDEX_USER_VERSION};
@@ -623,6 +644,9 @@ export function createUnifiedIndexWriter(database, {
         ingest_run_id = excluded.ingest_run_id`),
     lineageSnapshot: database.prepare(`
       INSERT INTO lineage_snapshot(session_local, snapshot_local)
+      VALUES (?, ?) ON CONFLICT DO NOTHING`),
+    sessionIdentity: database.prepare(`
+      INSERT INTO session_identity(session_local, session_uuid)
       VALUES (?, ?) ON CONFLICT DO NOTHING`),
     meta: database.prepare(`
       INSERT INTO meta(key, value) VALUES (?, ?)
@@ -878,6 +902,25 @@ export function createUnifiedIndexWriter(database, {
       begin();
       statements.lineageSnapshot.run(sessionLocalKey, snapshotLocalKey);
       step();
+    },
+
+    /**
+     * Record the raw provider-issued session UUID beside its local join key.
+     * Only a strictly UUID-shaped identifier is accepted: the ingest paths
+     * fall back to the rollout key when a source declares no session id, and
+     * that fallback is filename-shaped, which must never be stored — this
+     * store is the transport source for `sessionUuid` under
+     * telemetry-contribution-v1.0. Returns whether a row was recorded.
+     */
+    recordSessionIdentity(sessionLocalKey, sessionUuid) {
+      if (typeof sessionUuid !== "string"
+          || !RAW_SESSION_UUID.test(sessionUuid)) {
+        return false;
+      }
+      begin();
+      statements.sessionIdentity.run(sessionLocalKey, sessionUuid);
+      step();
+      return true;
     },
 
     writeMeta(key, value) {

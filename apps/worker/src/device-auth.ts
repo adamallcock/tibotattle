@@ -2,6 +2,9 @@ import {
   ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
   DEVICE_CREDENTIAL_TTL_MILLISECONDS,
   DEVICE_PAIRING_TTL_MILLISECONDS,
+  INCREMENTAL_TELEMETRY_FIELD_DICTIONARY_VERSION,
+  INCREMENTAL_TELEMETRY_SCHEMA_VERSION,
+  ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION,
   ONGOING_TELEMETRY_CONSENT_VERSION,
   ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
   TELEMETRY_CONSENT_VERSION,
@@ -88,14 +91,17 @@ export interface DeviceUploadClaim {
   authorizationKind: "device";
 }
 
+export type DeviceTransportConsentVersion =
+  | typeof ONGOING_TELEMETRY_CONSENT_VERSION
+  | typeof ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION
+  | typeof ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION;
+
 export interface DevicePairingMaterial {
   id: string;
   participantId: string;
   issuedBySessionId: string;
   secretHash: Uint8Array;
-  transportConsentVersion:
-    | typeof ONGOING_TELEMETRY_CONSENT_VERSION
-    | typeof ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION;
+  transportConsentVersion: DeviceTransportConsentVersion;
   pairingCode: string;
   issuedAt: string;
   expiresAt: string;
@@ -166,6 +172,24 @@ function ongoingConsentForParticipant(
     return ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION;
   }
   return null;
+}
+
+/**
+ * The v1.0 incremental-contribution transport consent is only grantable by a
+ * fully consented telemetry participant; every other pairing keeps carrying
+ * exactly the ongoing consent its participant enrollment maps to.
+ */
+function transportConsentAllowedForParticipant(
+  participantConsentVersion: string,
+  transportConsentVersion: string,
+): boolean {
+  if (transportConsentVersion
+      === ongoingConsentForParticipant(participantConsentVersion)) {
+    return true;
+  }
+  return transportConsentVersion
+      === ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION
+    && participantConsentVersion === TELEMETRY_CONSENT_VERSION;
 }
 
 function bytes(value: ArrayBuffer): Uint8Array {
@@ -278,11 +302,20 @@ export async function createDevicePairingMaterial(
   sessionId: string,
   participantConsentVersion: string,
   nowEpoch = Date.now(),
+  requestedTransportConsentVersion?: DeviceTransportConsentVersion,
 ): Promise<DevicePairingMaterial> {
-  const ongoingConsentVersion = ongoingConsentForParticipant(
+  const mappedConsentVersion = ongoingConsentForParticipant(
     participantConsentVersion,
   );
-  if (!ongoingConsentVersion) throw new ApiError(400, "TELEMETRY_REQUIRED");
+  if (!mappedConsentVersion) throw new ApiError(400, "TELEMETRY_REQUIRED");
+  const ongoingConsentVersion =
+    requestedTransportConsentVersion ?? mappedConsentVersion;
+  if (!transportConsentAllowedForParticipant(
+    participantConsentVersion,
+    ongoingConsentVersion,
+  )) {
+    throw new ApiError(400, "TELEMETRY_REQUIRED");
+  }
   const id = crypto.randomUUID();
   const secret = randomSecret(32);
   const issuedAt = new Date(nowEpoch).toISOString();
@@ -339,7 +372,13 @@ export function devicePairingInsert(
   ).bind(
     material.id,
     material.secretHash,
-    ONGOING_TELEMETRY_CONSENT_VERSION,
+    // The pinned consent column carries the v1.0 identifier for a v1.0
+    // pairing (design doc section 8, item 8); v0.x pairings keep recording
+    // the original ongoing consent identifier.
+    material.transportConsentVersion
+        === ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION
+      ? ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION
+      : ONGOING_TELEMETRY_CONSENT_VERSION,
     material.transportConsentVersion,
     material.issuedAt,
     material.expiresAt,
@@ -408,6 +447,7 @@ export async function createDevicePairing(
   participantConsentVersion: string,
   nowEpoch = Date.now(),
   policyOverrides: Partial<DeviceLifecyclePolicy> = {},
+  requestedTransportConsentVersion?: DeviceTransportConsentVersion,
 ): Promise<{ pairingCode: string; expiresAt: string }> {
   const policy = lifecyclePolicy(policyOverrides);
   const material = await createDevicePairingMaterial(
@@ -415,6 +455,7 @@ export async function createDevicePairing(
     sessionId,
     participantConsentVersion,
     nowEpoch,
+    requestedTransportConsentVersion,
   );
   const result = await devicePairingInsert(
     db,
@@ -524,8 +565,10 @@ export async function claimDevicePairing(
   )
       || !row
       || row.participant_state !== "active"
-      || ongoingConsentForParticipant(row.participant_consent_version)
-        !== row.transport_consent_version
+      || !transportConsentAllowedForParticipant(
+        row.participant_consent_version,
+        row.transport_consent_version,
+      )
       || !futureInstant(row.expires_at, nowEpoch)) {
     throw new ApiError(401, "PAIRING_AUTH_INVALID");
   }
@@ -614,6 +657,36 @@ export async function claimDevicePairing(
         deviceId,
         claimWindowStart,
         policy.pairingClaimLimit,
+      ),
+      // A v1.0-consented pairing claim is the server-recorded consent-once
+      // grant for this device: the participant approved the field
+      // dictionary in their authenticated session when the pairing was
+      // issued, and the claim binds that approval to the device identity.
+      // Uploads later compare against this record; they never create it.
+      db.prepare(
+        `INSERT INTO telemetry_v1_device_consents (
+          participant_id, device_id, telemetry_schema_version,
+          field_dictionary_version, privacy_contract_version, consented_at
+        )
+        SELECT pairing.participant_id, ?, ?, ?, ?, ?
+          FROM device_pairings pairing
+         WHERE pairing.id = ?
+           AND pairing.transport_consent_version = ?
+           AND EXISTS (
+             SELECT 1 FROM device_credentials device
+              WHERE device.id = ?
+                AND device.paired_via_pairing_id = pairing.id
+           )
+        ON CONFLICT (participant_id, device_id) DO NOTHING`,
+      ).bind(
+        deviceId,
+        INCREMENTAL_TELEMETRY_SCHEMA_VERSION,
+        INCREMENTAL_TELEMETRY_FIELD_DICTIONARY_VERSION,
+        ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION,
+        issuedAt,
+        parsed.id,
+        ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION,
+        deviceId,
       ),
     ]);
   } catch (error) {

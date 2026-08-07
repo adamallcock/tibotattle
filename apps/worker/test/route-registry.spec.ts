@@ -31,6 +31,8 @@ const EXACT_ROUTES = [
   ["/api/v1/device-pairings/claim", "device_pairing_claim"],
   ["/api/v1/device/upload-authorizations", "device_upload_authorization"],
   ["/api/v1/device/disconnect", "device_disconnect"],
+  ["/api/v1/device/sync/state", "device_sync_state"],
+  ["/api/v1/device/sync/manifest", "device_sync_manifest"],
   ["/api/v1/me/devices", "participant_devices"],
   ["/api/v1/me/devices/revoke", "participant_device_revocation"],
   ["/api/v1/envelope-key", "envelope_key"],
@@ -47,7 +49,7 @@ const EXACT_ROUTES = [
 
 describe("Worker route registry", () => {
   it("recognizes every exact route and preserves stable log classifications", () => {
-    expect(EXACT_ROUTES).toHaveLength(34);
+    expect(EXACT_ROUTES).toHaveLength(36);
     expect(WORKER_ROUTE_POLICY).toEqual(
       EXACT_ROUTES.map(([pathname, id]) => ({ pathname, id })),
     );

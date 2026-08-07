@@ -1549,7 +1549,7 @@ const SHARE_CARD_TREND_MIN_HEIGHT = 168;
 // The chart is the evidence on the image, not decorative garnish. Reserve a
 // meaningful vertical lane for it instead of compressing it below three cards
 // and a verbose footer.
-const SHARE_CARD_TREND_MAX_HEIGHT = 340;
+const SHARE_CARD_TREND_MAX_HEIGHT = 420;
 // Identifier-shaped only, exactly as a diagnostic code is: no space, no
 // slash, no separator that could carry a path or a folder name.
 const SHARE_CARD_REGISTRY_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/u;
@@ -1831,13 +1831,10 @@ function buildShareCard(data, {
     },
   ];
 
-  const relationshipNote = isWeeklyWindow && spend !== null && hasCapacity
-    ? t("share.relationship", { period })
-    : "";
-
   // Assembled from the same state the panels report, strongest qualification
-  // first. The distinct activity-versus-allowance explanation lives directly
-  // under the figures above, so it is never displaced by a shorter caveat.
+  // first. The old separate activity-versus-allowance sentence is gone
+  // (owner-directed, 2026-08-07): each stat's own detail line already names
+  // its denominator, and the reclaimed row belongs to the chart.
   const caveats = [];
   if (isDemo) {
     caveats.push(t("share.caveat.demo"));
@@ -1878,7 +1875,6 @@ function buildShareCard(data, {
       : t("share.subtitle.local"),
     badge: isDemo ? t("share.badge.demo") : "",
     stats: Object.freeze(stats.map((stat) => Object.freeze({ ...stat }))),
-    relationshipNote,
     // Reset-fit history is an explicitly seven-day model. It is never drawn
     // behind a five-hour or provider-reported generic allowance window.
     trend: isWeeklyWindow ? shareCardTrend(history) : null,
@@ -2207,17 +2203,20 @@ function drawShareCard(canvas, card) {
   context.lineWidth = 2;
   context.strokeRect(1, 1, SHARE_CARD_WIDTH - 2, SHARE_CARD_HEIGHT - 2);
 
-  drawShareCardBrand(context, margin, 68);
+  // Header band (owner-directed tightening, 2026-08-07): brand, title and
+  // subtitle sit in 170px instead of the old 207px, and every reclaimed pixel
+  // below goes to the chart.
+  drawShareCardBrand(context, margin, 54);
   context.textBaseline = "alphabetic";
   context.fillStyle = "#17211e";
   context.font = shareCardFont(800, 25);
-  context.fillText("TiboTattle", margin + 52, 77);
+  context.fillText("TiboTattle", margin + 52, 63);
   if (card.badge !== "") {
     drawShareCardBadge(
       context,
       card.badge,
       margin + 68 + context.measureText("TiboTattle").width,
-      75,
+      61,
     );
   }
 
@@ -2225,21 +2224,21 @@ function drawShareCard(canvas, card) {
   context.font = shareCardFont(700, 20);
   context.fillStyle = "#65706b";
   if (card.home !== "") {
-    context.fillText(card.home, SHARE_CARD_WIDTH - margin, 77);
+    context.fillText(card.home, SHARE_CARD_WIDTH - margin, 63);
   }
   context.textAlign = "left";
 
   context.fillStyle = "#17211e";
-  context.font = shareCardFont(500, 52, "serif");
-  context.fillText(shareCardFit(context, card.title, inner), margin, 158);
-  context.font = shareCardFont(600, 21);
+  context.font = shareCardFont(500, 50, "serif");
+  context.fillText(shareCardFit(context, card.title, inner), margin, 126);
+  context.font = shareCardFont(600, 20);
   context.fillStyle = "#65706b";
-  context.fillText(shareCardFit(context, card.subtitle, inner), margin, 192);
+  context.fillText(shareCardFit(context, card.subtitle, inner), margin, 156);
 
   const gap = 22;
   const columnWidth = (inner - gap * 2) / 3;
-  const statTop = 207;
-  const statHeight = 165;
+  const statTop = 176;
+  const statHeight = 152;
   const padding = 20;
   const textWidth = columnWidth - padding * 2;
   const valueSize = shareCardValueSize(
@@ -2256,65 +2255,40 @@ function drawShareCard(canvas, card) {
       context, stat.label.toLocaleUpperCase(localization.locale()), textWidth, 2,
     );
     labelLines.forEach((line, lineIndex) => {
-      context.fillText(line, x + padding, statTop + 34 + lineIndex * 19);
+      context.fillText(line, x + padding, statTop + 32 + lineIndex * 19);
     });
     context.fillStyle = "#174f45";
     context.font = shareCardFont(500, valueSize, "serif");
     context.fillText(
       shareCardFit(context, stat.value, textWidth),
       x + padding,
-      statTop + 104,
+      statTop + 98,
     );
     context.fillStyle = "#65706b";
-    context.font = shareCardFont(600, 17);
+    context.font = shareCardFont(600, 16);
     shareCardWrap(context, stat.detail, textWidth, 2).forEach((line, lineIndex) => {
-      context.fillText(line, x + padding, statTop + 132 + lineIndex * 20);
+      context.fillText(line, x + padding, statTop + 126 + lineIndex * 20);
     });
   });
 
-  // A short comparison note sits directly beneath the figures because the
-  // rolling activity total and the single-allowance estimate are intentionally
-  // not comparable measurements. It is visual context, not a fine-print
-  // caveat, so it stays readable when a card is seen outside the dashboard.
-  const relationshipTop = statTop + statHeight + 21;
-  if (card.relationshipNote !== "") {
-    context.fillStyle = "rgba(23, 79, 69, .3)";
-    context.fillRect(margin, relationshipTop - 14, 3, 22);
-    context.fillStyle = "#65706b";
-    context.font = shareCardFont(600, 15);
-    context.fillText(
-      shareCardFit(context, card.relationshipNote, inner - 20),
-      margin + 18,
-      relationshipTop,
-    );
-  }
-
   // Qualifications are reserved only for incomplete data. A complete card
   // gives the plot its natural visual weight instead of spending the lower
-  // third on generic methodology copy.
+  // third on generic methodology copy. The old activity-versus-allowance
+  // sentence row is gone with its field (owner-directed, 2026-08-07).
   context.font = shareCardFont(500, 17);
   const caveatLines = card.caveats
     .slice(0, SHARE_CARD_MAX_CAVEATS)
     .flatMap((caveat) => shareCardWrap(context, caveat, inner - 20, 2))
     .slice(0, SHARE_CARD_MAX_CAVEAT_LINES);
   const caveatStep = 23;
-  // The footer zone now holds one deliberately quiet line: the checkable
-  // diagnostic reference. The fixed footer sentence is gone and the debug
-  // line dropped from 22px to 15px (owner-directed, 2026-08-07: "debug text
-  // is way too big", superseding the 2026-08-06 legibility bump), which
-  // returns the reclaimed height to the chart above.
+  // The footer zone holds one deliberately quiet 15px line: the checkable
+  // diagnostic reference (owner-directed, 2026-08-07, superseding the
+  // 2026-08-06 legibility bump). Every reclaimed pixel goes to the chart.
   const ruleY = SHARE_CARD_HEIGHT - 44.5;
   const caveatTop = caveatLines.length === 0
     ? ruleY - 8
     : ruleY - 22 - (caveatLines.length - 1) * caveatStep;
-  // 62, not 48: at 48 the relationship note's ink bottom (y=395.82) overlapped
-  // the trend label's ink top (y=395.16) and the note's accent bar cut through
-  // the label's first glyph. No value inside the old 48px budget cleared the
-  // collision; 62 is the measured minimum that does, at the cost of 12px of
-  // chart height on a card that carries the note (owner-reported, 2026-08-06).
-  const trendTop = card.relationshipNote === ""
-    ? statTop + statHeight + 36
-    : statTop + statHeight + 62;
+  const trendTop = statTop + statHeight + 34;
   const trendHeight = Math.min(
     SHARE_CARD_TREND_MAX_HEIGHT,
     Math.max(SHARE_CARD_TREND_MIN_HEIGHT, caveatTop - 30 - trendTop),
@@ -4900,12 +4874,24 @@ function allowanceHistoryAxis(points) {
   const padding = (high - low) * .1;
   low -= padding;
   high += padding;
+  // Tick values a person could have chosen: snap outward to a 1/2/2.5/5-step
+  // grid instead of slicing the raw data range into equal fourths, which
+  // printed amounts like $1,006 and $2,447 on a dollar axis.
+  const rawStep = (high - low) / 4;
+  const magnitude = 10 ** Math.floor(Math.log10(rawStep));
+  const step = [1, 2, 2.5, 5, 10]
+    .map((base) => base * magnitude)
+    .find((candidate) => candidate >= rawStep) ?? rawStep;
+  const firstTick = Math.max(0, Math.floor(low / step) * step);
+  const lastTick = Math.ceil(high / step) * step;
+  const ticks = [];
+  for (let value = lastTick; value >= firstTick - step / 2; value -= step) {
+    ticks.push(Math.round(value * 100) / 100);
+  }
   return Object.freeze({
-    low,
-    high,
-    ticks: Object.freeze(
-      Array.from({ length: 5 }, (_, index) => high - index / 4 * (high - low)),
-    ),
+    low: firstTick,
+    high: lastTick,
+    ticks: Object.freeze(ticks),
   });
 }
 

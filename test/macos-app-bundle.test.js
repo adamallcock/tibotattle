@@ -1366,6 +1366,152 @@ test("unified toolbar preserves the rich loopback report and single authority", 
   );
 });
 
+test("toolbar pill narrates the real index build and terminal refresh failure", async () => {
+  const source = await readFile(SWIFT_SOURCE, "utf8");
+  // Deliberately re-pinned pill vocabulary: while the unified history index
+  // is incomplete the idle pill says "Indexing <n> of <m>", and a refresh the
+  // companion reports as failed says so. Both strings stay content-free -
+  // fixed words plus locale-formatted counts, or a step name from the
+  // companion's closed refresh-step vocabulary, never free-form text.
+  assert.match(source, /return "Indexing \\\(indexed\) of \\\(total\)"/u);
+  assert.match(source, /guard let step else \{ return "Refresh failed" \}/u);
+  assert.match(source, /return "Refresh failed: \\\(step\)"/u);
+  // Counts render with thousands separators and no abbreviation.
+  assert.match(
+    source,
+    /private enum NativeToolbarStatusText \{[\s\S]*?decimalNumberFormatter\(\s*maximumFractionDigits: 0\s*\)/u,
+  );
+  // Failure identity first, then real indexing progress, outrank the
+  // evidence prose; complete coverage plus a non-failed refresh restores
+  // the existing "Fresh"/"Stale"/"Status" vocabulary untouched.
+  assert.match(
+    source,
+    /private func nativeToolbarEvidenceTitle\(fallback: String\) -> String \{[\s\S]*?if let failure = nativeRefreshFailure \{[\s\S]*?if let coverage = nativeHistoryIndexingCoverage, !coverage\.isComplete \{[\s\S]*?switch nativeEvidenceState \{/u,
+  );
+  // The step vocabulary is closed on the client as well: an unrecognized
+  // step renders as plain "Refresh failed".
+  assert.match(
+    source,
+    /static let refreshFailureSteps: Set<String> = \[\s*"collector",\s*"accounting",\s*"archive_index",\s*"unified_index",\s*"assemble",\s*\]/u,
+  );
+  // Coverage is the companion's own overview payload: coverage.history
+  // first, the pricing historyCoverage mirror second, and demo/synthetic
+  // payloads never narrate indexing.
+  assert.match(
+    source,
+    /\(root\["coverage"\] as\? \[String: Any\]\)\?\["history"\][\s\S]*?\(root\["pricing"\] as\? \[String: Any\]\)\?\["historyCoverage"\]/u,
+  );
+  assert.match(source, /\["demo", "synthetic"\]\.contains\(mode\)/u);
+  // The failure receipt comes from /api/local/refresh, and only a "failed"
+  // status may claim a failure.
+  assert.match(
+    source,
+    /guard status == "failed" else \{ return \.notFailed \}/u,
+  );
+  // Both reads reuse the already-audited loopback reader rather than adding
+  // a second session or network route.
+  assert.match(source, /private extension LocalCompanionEvidenceReader \{/u);
+  // A refresh terminal re-reads both facts before the pill claims a state.
+  assert.match(
+    source,
+    /readNativeToolbarStatusFacts\(base: base\) \{ \[weak self\] in\s*\n\s*self\?\.finishNativeRefresh\(/u,
+  );
+  // While coverage is incomplete the idle pill re-reads it on a bounded
+  // 30-second foreground cadence; a refresh start, coverage completion,
+  // dashboard teardown, and quit all stop the poll, and it never becomes a
+  // timer, helper, daemon, or background polling path.
+  assert.match(source, /private static let indexingCoveragePollSeconds = 30/u);
+  assert.match(
+    source,
+    /private func scheduleNativeIndexingCoveragePoll\(\) \{[\s\S]*?let coverage = nativeHistoryIndexingCoverage,\s*\n\s*!coverage\.isComplete/u,
+  );
+  assert.match(
+    source,
+    /cancelNativeRefreshSchedule\(\)\s*\n\s*cancelNativeIndexingCoveragePoll\(\)\s*\n\s*nativeRefreshInFlight = true/u,
+  );
+  assert.match(
+    source,
+    /func applicationWillTerminate\(_ notification: Notification\) \{[\s\S]*?cancelNativeIndexingCoveragePoll\(\)/u,
+  );
+});
+
+test("dashboard sidebar resizes for real, wears the brand palette, and the titlebar carries the brand row", async () => {
+  const source = await readFile(SWIFT_SOURCE, "utf8");
+  // 1. The divider is a real control. AppKit applies a divider drag at
+  // priority 490 (dragThatCannotResizeWindow); the previous .defaultHigh
+  // (750) holding priority outranked the user's own drag, which is the
+  // seam-that-lies the owner reported: a resize cursor over a divider that
+  // refuses to move.
+  assert.match(source, /static let sidebarMinimumThickness: CGFloat = 180/u);
+  assert.match(source, /static let sidebarMaximumThickness: CGFloat = 320/u);
+  assert.match(source, /static let sidebarRestingThickness: CGFloat = 216/u);
+  assert.match(
+    source,
+    /private static let sidebarHoldingPriority = NSLayoutConstraint\.Priority\(260\)/u,
+  );
+  assert.match(
+    source,
+    /sidebarItem\.holdingPriority = Self\.sidebarHoldingPriority/u,
+  );
+  assert.doesNotMatch(source, /sidebarItem\.holdingPriority = \.defaultHigh/u);
+  // The chosen width survives relaunch through the split view's own
+  // autosave, and the designed 216pt opening width is seeded exactly once
+  // so later launches never fight the user's chosen width.
+  assert.match(source, /splitView\.autosaveName = Self\.splitAutosaveName/u);
+  assert.match(source, /"com\.usagemonitor\.local\.dashboard-split\.v1"/u);
+  assert.match(
+    source,
+    /override func viewDidAppear\(\) \{[\s\S]*?splitView\.setPosition\(Self\.sidebarRestingThickness, ofDividerAt: 0\)/u,
+  );
+  // The layout smoke asserts the same band the chrome enforces rather than
+  // a drifting literal.
+  assert.match(
+    source,
+    /NativeDashboardChrome\.sidebarMinimumThickness - 1/u,
+  );
+  // 2. The sidebar carries the web report's warm-paper palette over the
+  // system material, and the selected row uses the brand's deep green
+  // instead of the user's system accent. Both mirror the web tokens
+  // --paper #f5f1e8 and --green #174f45 and resolve per appearance.
+  assert.match(source, /private enum NativeBrandPalette/u);
+  assert.match(
+    source,
+    /srgbRed: 245 \/ 255,\s*\n\s*green: 241 \/ 255,\s*\n\s*blue: 232 \/ 255/u,
+  );
+  assert.match(
+    source,
+    /srgbRed: 23 \/ 255,\s*\n\s*green: 79 \/ 255,\s*\n\s*blue: 69 \/ 255/u,
+  );
+  assert.match(source, /private final class NativeSidebarBrandWash: NSView/u);
+  assert.match(source, /sidebar\.addSubview\(sidebarWash\)/u);
+  assert.match(
+    source,
+    /override func updateLayer\(\) \{\s*\n\s*layer\?\.backgroundColor = NativeBrandPalette\.sidebarWash\.cgColor/u,
+  );
+  assert.match(
+    source,
+    /button\.contentTintColor = selected\s*\n\s*\? NativeBrandPalette\.accent/u,
+  );
+  // 3. The titlebar shows the brand row - the bundle's own icon beside the
+  // wordmark in brand green - as a native accessory. The window keeps its
+  // title for Mission Control, the window menu, and accessibility; only
+  // the titlebar's text drawing is replaced, and nothing about the row is
+  // a web view.
+  assert.match(source, /newWindow\.titleVisibility = \.hidden/u);
+  assert.match(
+    source,
+    /newWindow\.addTitlebarAccessoryViewController\(\s*\n\s*Self\.makeTitlebarBrandAccessory\(\)/u,
+  );
+  const accessory = source.match(
+    /private static func makeTitlebarBrandAccessory\(\)[\s\S]*?\n    \}/u,
+  )?.[0] ?? "";
+  assert.ok(accessory, "titlebar brand accessory factory should be present");
+  assert.match(accessory, /NSImageView\(image: NSApp\.applicationIconImage\)/u);
+  assert.match(accessory, /wordmark\.textColor = NativeBrandPalette\.accent/u);
+  assert.match(accessory, /accessory\.layoutAttribute = \.left/u);
+  assert.doesNotMatch(accessory, /WKWebView|WebKit/u);
+});
+
 test("menu-bar status item degrades honestly and never invents allowance evidence", async () => {
   const source = await readFile(MENU_BAR_STATUS_SOURCE, "utf8");
   assert.match(source, /import AppKit/u);

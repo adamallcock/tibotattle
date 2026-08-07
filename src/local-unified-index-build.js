@@ -454,6 +454,10 @@ export async function rebuildLocalUnifiedIndex({
         finalModel: null,
         finalEffort: null,
       };
+      // The raw session UUID travels in v1.0 contribution records (owner
+      // decision). The writer refuses anything that is not UUID-shaped, so a
+      // rollout-key fallback id is never recorded.
+      writer.recordSessionIdentity(state.sessionLocal, sessionId);
       sourceState.set(key, state);
     }
     return state;

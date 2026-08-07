@@ -44,6 +44,15 @@ export const ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION =
   "privacy-safe-telemetry-v0.2";
 export const ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION =
   "ongoing-privacy-safe-telemetry-v0.2";
+// telemetry-contribution-v1.0 consent identifiers (incremental contribution
+// model). The field dictionary identifier is pinned here until the contract
+// package freezes the regenerated v1.0 registry.
+export const INCREMENTAL_TELEMETRY_SCHEMA_VERSION =
+  "telemetry-contribution-v1.0";
+export const INCREMENTAL_TELEMETRY_FIELD_DICTIONARY_VERSION =
+  "telemetry-v1.0-registry-2026-08-07.1";
+export const ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION =
+  "ongoing-privacy-safe-telemetry-v1.0";
 export const ENROLLMENT_MODES = ["local_open", "open", "invite_only", "disabled"] as const;
 
 export const JSON_HEADERS = {

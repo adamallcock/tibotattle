@@ -272,11 +272,10 @@
       "vars": {
         "ENVIRONMENT": "production",
         "PUBLIC_ORIGIN": "https://tibotattle.com",
-        // Keep public enrollment fail-closed until the production release
-        // checklist, provider portal verification, and abuse-monitoring gate
-        // have been explicitly approved. The Worker still supports the
-        // friction-light hosted handoff when that controlled release occurs.
-        "ENROLLMENT_MODE": "disabled",
+        // Owner decision 2026-08-07: community enrollment is OPEN. The
+        // containment-era "disabled" default was never a product choice, and
+        // the operator collection-control row remains the incident brake.
+        "ENROLLMENT_MODE": "open",
         "ACCOUNT_SCOPED_INGEST_MODE": "disabled",
         "UPLOAD_INGRESS_QUEUE_MODE": "disabled",
         "UPLOAD_INGRESS_MAX_CONCURRENT": "8",

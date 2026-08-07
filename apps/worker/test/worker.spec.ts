@@ -2062,6 +2062,11 @@ describe("synthetic usage monitor service", () => {
           status: "implementation_disabled",
           externalParticipantsAuthorized: false,
         },
+        incrementalContribution: {
+          schemaVersion: "telemetry-contribution-v1.0",
+          status: "implementation_ready",
+          externalParticipantsAuthorized: false,
+        },
       },
       capabilities: {
         encryptedUpload: true,

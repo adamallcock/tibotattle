@@ -211,6 +211,10 @@ export async function ingestLocalUnifiedIndexIncrement({
       let cached = sessionLocals.get(sessionId);
       if (cached === undefined) {
         cached = sessionLocal(deviceSalt, sessionId);
+        // The raw session UUID travels in v1.0 contribution records (owner
+        // decision). The writer refuses anything that is not UUID-shaped, so
+        // a rollout-key fallback id is never recorded.
+        writer.recordSessionIdentity(cached, sessionId);
         sessionLocals.set(sessionId, cached);
       }
       return cached;

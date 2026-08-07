@@ -1,6 +1,7 @@
 import { sha256Hex } from "./crypto";
 import { ApiError } from "./errors";
 import { finishParticipantDeletion } from "./repository";
+import { telemetryV1ChunkR2KeyPage } from "./telemetry-v1-repository";
 import { QUARANTINE_RETENTION_MILLISECONDS } from "./constants";
 
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
@@ -33,10 +34,19 @@ interface ParticipantRow {
 }
 
 interface QuarantineObjectRow {
-  source: "synthetic" | "telemetry";
+  source: "synthetic" | "telemetry" | "telemetry_v1";
   id: string;
   r2_key: string;
 }
+
+const QUARANTINE_SOURCE_TABLES: Record<
+  QuarantineObjectRow["source"],
+  string
+> = {
+  synthetic: "contributions",
+  telemetry: "telemetry_contributions",
+  telemetry_v1: "telemetry_v1_chunks",
+};
 
 export interface LifecyclePassResult {
   quarantineCutoffAt: string;
@@ -425,6 +435,21 @@ async function suppressRestoredParticipant(
   ).bind(participantId).run();
   const keys = await participantQuarantineKeys(db, participantId);
   if (keys.length > 0) await quarantine.delete(keys);
+  // v1.0 chunk journals can far exceed the bounded v0.1 key scan above, so
+  // their quarantine objects purge through a dedicated page loop.
+  let chunkCursor: { createdAt: string; chunkRowId: string } | null = null;
+  let chunkPages = 0;
+  do {
+    const page = await telemetryV1ChunkR2KeyPage(db, participantId, chunkCursor);
+    if (page.rows.length > 0) {
+      await quarantine.delete(page.rows.map((row) => row.r2Key));
+    }
+    chunkCursor = page.nextCursor;
+    chunkPages += 1;
+    if (chunkPages > MAX_LIFECYCLE_ROWS / 100) {
+      throw new ApiError(503, "LIFECYCLE_BOUNDS_EXCEEDED");
+    }
+  } while (chunkCursor);
   const participant = await db.prepare(
     `SELECT identity_link_key
        FROM participants
@@ -519,9 +544,13 @@ async function dueQuarantineObjects(
      SELECT 'telemetry' AS source, id, r2_key
        FROM telemetry_contributions
       WHERE quarantine_deleted_at IS NULL AND created_at <= ?
+     UNION ALL
+     SELECT 'telemetry_v1' AS source, id, r2_key
+       FROM telemetry_v1_chunks
+      WHERE quarantine_deleted_at IS NULL AND created_at <= ?
      ORDER BY id
      LIMIT ?`,
-  ).bind(cutoffAt, cutoffAt, QUARANTINE_DELETE_BATCH_SIZE + 1)
+  ).bind(cutoffAt, cutoffAt, cutoffAt, QUARANTINE_DELETE_BATCH_SIZE + 1)
     .all<QuarantineObjectRow>();
   return result.results;
 }
@@ -540,9 +569,7 @@ async function deleteDueQuarantineObjects(
   await quarantine.delete(batch.map((row) => row.r2_key));
   const deletedAt = new Date().toISOString();
   const updates = batch.map((row) => db.prepare(
-    `UPDATE ${row.source === "synthetic"
-      ? "contributions"
-      : "telemetry_contributions"}
+    `UPDATE ${QUARANTINE_SOURCE_TABLES[row.source]}
         SET quarantine_deleted_at = ?
       WHERE id = ? AND quarantine_deleted_at IS NULL`,
   ).bind(deletedAt, row.id));

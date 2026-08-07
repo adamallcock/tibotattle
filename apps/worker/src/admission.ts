@@ -34,7 +34,12 @@ export function configuredEnrollmentMode(env: Env): EnrollmentMode {
   return mode as EnrollmentMode;
 }
 
-type AttemptPurpose = "enrollment" | "sign_in_start" | "recovery" | "device_disconnect";
+type AttemptPurpose =
+  | "enrollment"
+  | "sign_in_start"
+  | "recovery"
+  | "device_disconnect"
+  | "device_sync";
 type RateLimitPurpose = AttemptPurpose
   | "public_aggregate_read"
   | "upload_authorization"

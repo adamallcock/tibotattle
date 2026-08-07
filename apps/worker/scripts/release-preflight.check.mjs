@@ -240,18 +240,30 @@ async function standardFixture({
   return { calls, primaryMigrations, spawn };
 }
 
-test("disabled enrollment config is required and reports booleans only", () => {
+test("enrollment config review requires reviewed modes and reports booleans only", () => {
   const config = safeConfig();
   assert.deepEqual(assessDisabledEnrollmentConfiguration(config), {
     ok: true,
     checks: {
       stagingEnrollmentDisabled: true,
-      productionEnrollmentDisabled: true,
+      productionEnrollmentModeReviewed: true,
       stagingIdentityLinkSecretVersionConfigured: true,
       productionIdentityLinkSecretVersionConfigured: true,
     },
     blockers: [],
   });
+  // Production may run any reviewed hosted mode - open included (owner
+  // decision 2026-08-07) - but never the development-only local_open.
+  config.env.production.vars.ENROLLMENT_MODE = "open";
+  assert.equal(assessDisabledEnrollmentConfiguration(config).ok, true);
+  config.env.production.vars.ENROLLMENT_MODE = "local_open";
+  const productionBlocked = assessDisabledEnrollmentConfiguration(config);
+  assert.equal(productionBlocked.ok, false);
+  assert.deepEqual(
+    productionBlocked.blockers,
+    ["CONFIG_PRODUCTION_ENROLLMENT_MODE_REVIEWED"],
+  );
+  config.env.production.vars.ENROLLMENT_MODE = "disabled";
   config.env.staging.vars.ENROLLMENT_MODE = "local_open";
   const blocked = assessDisabledEnrollmentConfiguration(config);
   assert.equal(blocked.ok, false);

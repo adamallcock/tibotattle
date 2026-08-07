@@ -33,6 +33,7 @@ import {
   MAX_PARTICIPANT_PROFILE_HISTORY_ITEMS,
   MAX_REQUEST_BYTES,
   MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT,
+  ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION,
   ONGOING_TELEMETRY_CONSENT_VERSION,
   ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
   QUARANTINE_RETENTION_MILLISECONDS,
@@ -80,6 +81,7 @@ import {
   purgeStaleDeviceLifecycleRows,
   recordDeviceUploadReceipt,
   revokeParticipantDevice,
+  type DeviceTransportConsentVersion,
 } from "./device-auth";
 import {
   ApiError,
@@ -228,6 +230,34 @@ function telemetryContributionLimitError(
     },
   });
 }
+import {
+  MAX_TELEMETRY_V1_CHUNK_CANONICAL_BYTES,
+  TELEMETRY_V1_ENVELOPE_SCHEMA_VERSION,
+  assertTelemetryV1ConsentCurrent,
+  parseTelemetryV1Chunk,
+  validateTelemetryV1Envelope,
+} from "./telemetry-v1";
+import {
+  MAX_SYNC_MANIFEST_RANGE_DAYS,
+  currentTelemetryV1Chunk,
+  existingTelemetryV1ChunkByEnvelopeDigest,
+  insertTelemetryV1Chunk,
+  telemetryV1AcknowledgedThroughDay,
+  telemetryV1ChunkAdmission,
+  telemetryV1ChunkAdmissionError,
+  telemetryV1ChunkCount,
+  telemetryV1ChunkId,
+  telemetryV1ChunkR2KeyPage,
+  telemetryV1DeviceConsentCurrent,
+  telemetryV1DeviceForUploadAuthorization,
+  telemetryV1SyncManifest,
+  telemetryV1SyncState,
+  type TelemetryV1ChunkRow,
+} from "./telemetry-v1-repository";
+import {
+  rebuildPendingCommunityDailyAggregates,
+} from "./community-daily-aggregates";
+import { canonicalJson } from "./canonical-json";
 import {
   insertTelemetryContributionV02,
 } from "./telemetry-v0.2-repository";
@@ -1500,15 +1530,23 @@ async function handleDevicePairing(request: Request, env: Env): Promise<Response
     throw new ApiError(400, "TELEMETRY_REQUIRED");
   }
   const body = await readBoundedJson(request);
+  const requestedConsentVersion = Reflect.get(body.value ?? {}, "consentVersion");
+  // A telemetry participant may request either the deployed v0.1 ongoing
+  // consent or the v1.0 incremental-contribution consent; the account-scoped
+  // preview keeps its own single identifier. The pairing records the choice
+  // server-side, which is what the v1.0 chunk path later verifies against.
+  const allowedConsentVersions = accountScoped
+    ? [ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION]
+    : [
+      ONGOING_TELEMETRY_CONSENT_VERSION,
+      ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION,
+    ];
   if (typeof body.value !== "object"
       || body.value === null
       || Array.isArray(body.value)
       || Object.keys(body.value).length !== 2
-      || Reflect.get(body.value, "consentVersion") !== (
-        accountScoped
-          ? ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION
-          : ONGOING_TELEMETRY_CONSENT_VERSION
-      )
+      || typeof requestedConsentVersion !== "string"
+      || !allowedConsentVersions.includes(requestedConsentVersion)
       || Reflect.get(body.value, "ongoingUpload") !== true) {
     throw new ApiError(400, "BODY_INVALID");
   }
@@ -1518,6 +1556,9 @@ async function handleDevicePairing(request: Request, env: Env): Promise<Response
       session.participantId,
       session.sessionId,
       session.consentVersion,
+      undefined,
+      undefined,
+      requestedConsentVersion as DeviceTransportConsentVersion,
     ),
     201,
     { vary: "Cookie" },
@@ -1967,6 +2008,316 @@ async function handleTelemetryContribution(
   }
 }
 
+async function telemetryV1ChunkReceipt(
+  env: Env,
+  row: TelemetryV1ChunkRow,
+  deviceId: string,
+): Promise<Response> {
+  const acknowledgedThroughDay = await telemetryV1AcknowledgedThroughDay(
+    env.USAGE_MONITOR_DB,
+    row.participant_id,
+    deviceId,
+  );
+  return jsonResponse(
+    {
+      schemaVersion: "telemetry-chunk-receipt-v1.0",
+      contributionId: row.id,
+      chunkId: telemetryV1ChunkId(row),
+      chunkRevision: row.revision,
+      status: row.superseded_at === null ? "accepted" : "superseded",
+      replayed: true,
+      recordCounts: {
+        declared: row.record_count,
+        accepted: row.accepted_record_count,
+      },
+      acknowledgedThroughDay,
+    },
+    202,
+    { "idempotency-replayed": "true" },
+  );
+}
+
+/**
+ * telemetry-contribution-v1.0 incremental chunk ingest. Additive alongside
+ * the deployed v0.1 prepared-sample path: v1.0 envelopes carry their own
+ * schema version, so the v0.1 branch is untouched. Chunks are
+ * device-authenticated only — the cursor is keyed (participant, device) and
+ * a browser session has no device identity.
+ */
+async function handleTelemetryV1Contribution(
+  body: { raw: string; value: unknown },
+  participant: { id: string; consentVersion: string },
+  uploadAuthorization: {
+    authorizationId: string;
+    authorizationKind: "session" | "device";
+  },
+  env: Env,
+): Promise<Response> {
+  if (uploadAuthorization.authorizationKind !== "device") {
+    throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+  }
+  if (participant.consentVersion !== TELEMETRY_CONSENT_VERSION) {
+    throw new ApiError(400, "TELEMETRY_REQUIRED");
+  }
+  const envelope = validateTelemetryV1Envelope(body.value);
+  const envelopeDigestValue = await telemetryEnvelopeDigest(envelope);
+  const deviceId = await telemetryV1DeviceForUploadAuthorization(
+    env.USAGE_MONITOR_DB,
+    uploadAuthorization.authorizationId,
+  );
+  if (deviceId === null) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+  const envelopeReplay = await existingTelemetryV1ChunkByEnvelopeDigest(
+    env.USAGE_MONITOR_DB,
+    participant.id,
+    envelopeDigestValue,
+  );
+  if (envelopeReplay) {
+    return telemetryV1ChunkReceipt(env, envelopeReplay, deviceId);
+  }
+
+  const plaintext = await decryptSyntheticEnvelope(
+    envelope,
+    env.ENVELOPE_PUBLIC_JWK,
+    env.ENVELOPE_PRIVATE_JWK,
+  );
+  const chunk = parseTelemetryV1Chunk(plaintext);
+  // Consent once, granted server-side: the chunk's declared consent must
+  // equal the currently required identifiers AND the grant this device's
+  // pairing claim recorded. An upload can never create or repair the grant.
+  assertTelemetryV1ConsentCurrent(chunk.consent);
+  if (!await telemetryV1DeviceConsentCurrent(
+    env.USAGE_MONITOR_DB,
+    participant.id,
+    deviceId,
+  )) {
+    throw new ApiError(403, "TELEMETRY_CONSENT_INVALID");
+  }
+  // The digest identity is the canonical minified JSON array of the chunk's
+  // records — the same serialization the client computes — so replay and
+  // supersession compare content, not envelope bytes.
+  const canonicalRecords = canonicalJson(chunk.records);
+  if (new TextEncoder().encode(canonicalRecords).byteLength
+      > MAX_TELEMETRY_V1_CHUNK_CANONICAL_BYTES) {
+    throw new ApiError(400, "CHUNK_INVALID");
+  }
+  if (await sha256Hex(canonicalRecords) !== chunk.chunkDigest) {
+    throw new ApiError(400, "CHUNK_DIGEST_MISMATCH");
+  }
+  const current = await currentTelemetryV1Chunk(
+    env.USAGE_MONITOR_DB,
+    participant.id,
+    deviceId,
+    chunk.stream,
+    chunk.chunkDay,
+    chunk.chunkSeq,
+  );
+  // Content replay is scoped to the FULL chunk identity: only this exact
+  // (device, stream, day, seq) chunk with an equal digest is a replay. An
+  // equal digest anywhere else is a coincidence and proceeds as an insert.
+  if (current && current.chunk_digest === chunk.chunkDigest) {
+    return telemetryV1ChunkReceipt(env, current, deviceId);
+  }
+  // Same-digest replay answered above, so a declared revision must extend
+  // the current one by exactly one; anything else means the client's cursor
+  // disagrees with the journal and must re-fetch the manifest.
+  if (current
+    ? chunk.chunkRevision !== current.revision + 1
+    : chunk.chunkRevision !== 1) {
+    throw new ApiError(409, "CHUNK_REVISION_CONFLICT");
+  }
+  const admission = await telemetryV1ChunkAdmission(
+    env.USAGE_MONITOR_DB,
+    participant.id,
+    deviceId,
+  );
+  if (admission.state === "exhausted") {
+    throw telemetryV1ChunkAdmissionError(admission);
+  }
+
+  const chunkRowId = `chunk:${crypto.randomUUID()}`;
+  const r2Key = `telemetry/v1-${crypto.randomUUID()}`;
+  const createdAt = new Date().toISOString();
+  await putTrackedQuarantineObject(
+    env.USAGE_MONITOR_DB,
+    env.QUARANTINE,
+    {
+      contributionId: chunkRowId,
+      objectKind: "telemetry",
+      r2Key,
+      registeredAt: createdAt,
+    },
+    JSON.stringify(envelope),
+    {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: {
+        contributionId: chunkRowId,
+        schemaVersion: TELEMETRY_V1_ENVELOPE_SCHEMA_VERSION,
+        plaintextSchemaVersion: chunk.schemaVersion,
+        synthetic: "false",
+      },
+    },
+  );
+  try {
+    const result = await insertTelemetryV1Chunk(env.USAGE_MONITOR_DB, {
+      participantId: participant.id,
+      deviceId,
+      deviceUploadAuthorizationId: uploadAuthorization.authorizationId,
+      chunkRowId,
+      r2Key,
+      envelopeDigest: envelopeDigestValue,
+      chunk,
+      supersedes: current,
+      createdAt,
+    });
+    const [acknowledgedThroughDay, settledAdmission] = await Promise.all([
+      telemetryV1AcknowledgedThroughDay(
+        env.USAGE_MONITOR_DB,
+        participant.id,
+        deviceId,
+      ),
+      telemetryV1ChunkAdmission(env.USAGE_MONITOR_DB, participant.id, deviceId),
+    ]);
+    return jsonResponse({
+      schemaVersion: "telemetry-chunk-receipt-v1.0",
+      contributionId: chunkRowId,
+      chunkId: chunk.chunkId,
+      chunkRevision: chunk.chunkRevision,
+      status: "accepted",
+      supersededRevision: current?.revision ?? null,
+      recordCounts: {
+        declared: chunk.records.length,
+        accepted: result.acceptedRecords,
+      },
+      acknowledgedThroughDay,
+      admission: settledAdmission,
+    }, 202);
+  } catch (error) {
+    // The journal batch can have committed before this response was built.
+    // A found current row with this exact identity and digest makes this an
+    // indeterminate, committed outcome; only a proven-absent row permits
+    // removing the orphaned quarantine object.
+    const replay = await currentTelemetryV1Chunk(
+      env.USAGE_MONITOR_DB,
+      participant.id,
+      deviceId,
+      chunk.stream,
+      chunk.chunkDay,
+      chunk.chunkSeq,
+    );
+    if (replay && replay.chunk_digest === chunk.chunkDigest) {
+      return telemetryV1ChunkReceipt(env, replay, deviceId);
+    }
+    try {
+      await env.QUARANTINE.delete(r2Key);
+      await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, {
+        contributionId: chunkRowId,
+        r2Key,
+      });
+    } catch {
+      // The reconciliation registration remains durable by design.
+    }
+    // Trigger aborts and constraint races already carry their typed codes
+    // from the repository mapping; only untyped failures fall through to
+    // the admission recheck that distinguishes a raced budget exhaustion
+    // from a genuine internal error.
+    if (error instanceof ApiError) throw error;
+    const retryAdmission = await telemetryV1ChunkAdmission(
+      env.USAGE_MONITOR_DB,
+      participant.id,
+      deviceId,
+    );
+    if (retryAdmission.state === "exhausted") {
+      throw telemetryV1ChunkAdmissionError(retryAdmission);
+    }
+    throw error;
+  }
+}
+
+const SYNC_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
+const DAY_MILLISECONDS = 24 * 60 * 60 * 1000;
+
+/**
+ * Shared admission and authentication for the v1.0 cursor read endpoints.
+ * The device bearer is the sole authority, exactly as for upload
+ * registration; a browser cookie on these endpoints is always a mistake.
+ */
+async function deviceSyncPrincipal(
+  request: Request,
+  env: Env,
+): Promise<{ participantId: string; deviceId: string }> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  assertAdmissionBindings(env);
+  await assertAttemptAllowed(
+    env.RECOVERY_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "device_sync",
+  );
+  if (request.headers.has("cookie")) {
+    throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  }
+  const device = await authenticateDevice(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("authorization"),
+  );
+  if (await hasDeletionTombstone(env.DELETION_LEDGER, device.participantId)) {
+    throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  }
+  return { participantId: device.participantId, deviceId: device.deviceId };
+}
+
+async function handleDeviceSyncState(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const device = await deviceSyncPrincipal(request, env);
+  const [state, admission] = await Promise.all([
+    telemetryV1SyncState(
+      env.USAGE_MONITOR_DB,
+      device.participantId,
+      device.deviceId,
+    ),
+    telemetryV1ChunkAdmission(
+      env.USAGE_MONITOR_DB,
+      device.participantId,
+      device.deviceId,
+    ),
+  ]);
+  return jsonResponse({ ...state, admission });
+}
+
+async function handleDeviceSyncManifest(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const device = await deviceSyncPrincipal(request, env);
+  const url = new URL(request.url);
+  const fromDay = url.searchParams.get("fromDay");
+  const toDay = url.searchParams.get("toDay");
+  if (fromDay === null || toDay === null
+      || !SYNC_DAY_PATTERN.test(fromDay) || !SYNC_DAY_PATTERN.test(toDay)) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const fromEpoch = Date.parse(`${fromDay}T00:00:00.000Z`);
+  const toEpoch = Date.parse(`${toDay}T00:00:00.000Z`);
+  if (!Number.isFinite(fromEpoch) || !Number.isFinite(toEpoch)
+      || fromEpoch > toEpoch) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  if ((toEpoch - fromEpoch) / DAY_MILLISECONDS + 1
+      > MAX_SYNC_MANIFEST_RANGE_DAYS) {
+    throw new ApiError(400, "SYNC_RANGE_TOO_LARGE");
+  }
+  return jsonResponse(await telemetryV1SyncManifest(
+    env.USAGE_MONITOR_DB,
+    device.participantId,
+    device.deviceId,
+    fromDay,
+    toDay,
+  ));
+}
+
 async function handleContribution(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
   assertUploadIngressConfiguration(env);
@@ -2027,9 +2378,12 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
       throw new ApiError(401, "UPLOAD_AUTH_INVALID");
     }
     await heartbeat.assertActive();
-    const response = Reflect.get(body.value, "schemaVersion") === "telemetry-envelope-v0.1"
+    const declaredEnvelopeVersion = Reflect.get(body.value, "schemaVersion");
+    const response = declaredEnvelopeVersion === "telemetry-envelope-v0.1"
       ? await handleTelemetryContribution(request, body, participant, claimed, env)
-      : await handleSyntheticContribution(body, participant, claimed, env);
+      : declaredEnvelopeVersion === TELEMETRY_V1_ENVELOPE_SCHEMA_VERSION
+        ? await handleTelemetryV1Contribution(body, participant, claimed, env)
+        : await handleSyntheticContribution(body, participant, claimed, env);
     await heartbeat.assertActive();
     const receipt = await response.clone().json<{ contributionId?: unknown }>();
     if (typeof receipt.contributionId !== "string") {
@@ -2278,6 +2632,10 @@ async function handleDelete(request: Request, env: Env): Promise<Response> {
     env.USAGE_MONITOR_DB,
     session.participantId,
   );
+  const telemetryV1Total = await telemetryV1ChunkCount(
+    env.USAGE_MONITOR_DB,
+    session.participantId,
+  );
   const syntheticR2Keys = contributions.map((row) => row.r2_key);
   if (syntheticR2Keys.length > 0) {
     await env.QUARANTINE.delete(syntheticR2Keys);
@@ -2294,18 +2652,36 @@ async function handleDelete(request: Request, env: Env): Promise<Response> {
     }
     cursor = page.nextCursor;
   } while (cursor);
+  let chunkCursor: { createdAt: string; chunkRowId: string } | null = null;
+  do {
+    const page = await telemetryV1ChunkR2KeyPage(
+      env.USAGE_MONITOR_DB,
+      session.participantId,
+      chunkCursor,
+    );
+    if (page.rows.length > 0) {
+      await env.QUARANTINE.delete(page.rows.map((row) => row.r2Key));
+    }
+    chunkCursor = page.nextCursor;
+  } while (chunkCursor);
   const currentTelemetryTotal = await telemetryContributionCount(
     env.USAGE_MONITOR_DB,
     session.participantId,
   );
-  if (currentTelemetryTotal !== telemetryTotal) {
+  const currentTelemetryV1Total = await telemetryV1ChunkCount(
+    env.USAGE_MONITOR_DB,
+    session.participantId,
+  );
+  if (currentTelemetryTotal !== telemetryTotal
+      || currentTelemetryV1Total !== telemetryV1Total) {
     throw new ApiError(409, "UPLOAD_IN_PROGRESS");
   }
   await finishParticipantDeletion(env.USAGE_MONITOR_DB, session.participantId);
   return jsonResponse({
     deleted: true,
     participantId: session.participantId,
-    contributionsDeleted: contributions.length + telemetryTotal,
+    contributionsDeleted: contributions.length + telemetryTotal
+      + telemetryV1Total,
   }, 200, { "set-cookie": clearedSessionCookie(), vary: "Cookie" });
 }
 
@@ -2591,8 +2967,9 @@ interface RetentionReadinessRow {
 
 async function aggregateRebuildComplete(db: D1Database): Promise<boolean> {
   const row = await db.prepare(
-    `SELECT EXISTS (
-      SELECT 1 FROM community_weekly_snapshot_rebuilds
+    `SELECT (
+      EXISTS (SELECT 1 FROM community_weekly_snapshot_rebuilds)
+      OR EXISTS (SELECT 1 FROM community_daily_aggregate_rebuilds)
     ) AS pending`,
   ).first<{ pending: number }>();
   if (row?.pending !== 0 && row?.pending !== 1) {
@@ -2732,6 +3109,10 @@ async function routeApi(
       return handleDeviceUploadAuthorization(request, env);
     case "device_disconnect":
       return handleDeviceDisconnect(request, env);
+    case "device_sync_state":
+      return handleDeviceSyncState(request, env);
+    case "device_sync_manifest":
+      return handleDeviceSyncManifest(request, env);
     case "participant_devices":
       return handleDevices(request, env);
     case "participant_device_revocation":
@@ -2829,6 +3210,11 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
             status: configuredAccountScopedIngestMode(env) === "local_preview"
               ? "local_preview_loopback_only"
               : "implementation_disabled",
+            externalParticipantsAuthorized: false,
+          },
+          incrementalContribution: {
+            schemaVersion: "telemetry-contribution-v1.0",
+            status: "implementation_ready",
             externalParticipantsAuthorized: false,
           },
         },
@@ -3134,7 +3520,12 @@ export async function runScheduledMaintenance(
         env.USAGE_MONITOR_DB,
         scheduledTime,
       );
-      rebuildComplete = !rebuild.remaining;
+      await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
+      const dailyRebuild = await rebuildPendingCommunityDailyAggregates(
+        env.USAGE_MONITOR_DB,
+        scheduledTime,
+      );
+      rebuildComplete = !rebuild.remaining && !dailyRebuild.remaining;
     } else {
       rebuildComplete = await aggregateRebuildComplete(
         env.USAGE_MONITOR_DB,

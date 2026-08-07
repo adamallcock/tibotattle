@@ -783,13 +783,14 @@ test("a version-1 index is migrated additively, never rebuilt", async () => {
     await build(root);
     // Regress the file to version 1: drop the widened tables, stamp the old
     // user_version. This is byte-equivalent to an index produced before the
-    // 2026-08-07 widening.
+    // 2026-08-07 widenings.
     {
       const { DatabaseSync } = await import("node:sqlite");
       const raw = new DatabaseSync(join(root, "index.sqlite"));
       raw.exec(`
         DROP TABLE source_cursor;
         DROP TABLE lineage_snapshot;
+        DROP TABLE session_identity;
         PRAGMA user_version=1;
       `);
       raw.close();
@@ -806,7 +807,7 @@ test("a version-1 index is migrated additively, never rebuilt", async () => {
     const writable = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: false });
     assert.equal(
       Number(writable.prepare("PRAGMA user_version").get().user_version),
-      2,
+      3,
     );
     assert.equal(
       Number(writable.prepare("SELECT COUNT(*) AS c FROM usage_event").get().c),

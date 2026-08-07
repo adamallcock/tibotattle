@@ -6608,7 +6608,6 @@ test("a posted results card can carry only fixed copy and formatted figures", as
       "formatMoney(value, axisDigits)",
       "line",
       "shareCardFit(context, card.identifierLine, inner)",
-      "shareCardFit(context, card.relationshipNote, inner - 20)",
       "shareCardFit(context, card.subtitle, inner)",
       "shareCardFit(context, card.title, inner)",
       "shareCardFit(context, stat.value, textWidth)",
@@ -6983,21 +6982,11 @@ test("a posted results card states a figure in full and marks a fixture as one",
     section,
     /const trendHeight = Math\.min\(\s*\n\s*SHARE_CARD_TREND_MAX_HEIGHT,\s*\n\s*Math\.max\(SHARE_CARD_TREND_MIN_HEIGHT, caveatTop - 30 - trendTop\),\s*\n\s*\);/u,
   );
-  // Re-pinned from 48 to 62 (owner-directed fix, 2026-08-06): at 48 the
-  // relationship note's ink bottom (y=395.82) overlapped the trend label's ink
-  // top (y=395.16) and the note's accent bar was drawn through the label's
-  // "7". A prior investigation proved no clearing value exists inside the 48px
-  // budget; 62 is the measured minimum with real clearance, costing a card
-  // that carries the note 12px of chart height.
-  assert.match(
-    section,
-    /const trendTop = card\.relationshipNote === ""\s*\n\s*\? statTop \+ statHeight \+ 36\s*\n\s*: statTop \+ statHeight \+ 62;/u,
-  );
-  assert.match(section, /relationshipNote,/u);
-  // The image makes the incomparable denominators explicit rather than
-  // suggesting that seven days of recorded events is a single allowance. A
-  // generic provider window keeps its own denominator and says that the
-  // seven-day estimate is unavailable rather than borrowing a weekly fit.
+  // Re-pinned 2026-08-07 (owner-directed card v3): the separate
+  // activity-versus-allowance sentence row is gone — each stat's own detail
+  // line names its denominator — and the chart takes the reclaimed height.
+  assert.match(section, /const trendTop = statTop \+ statHeight \+ 34;/u);
+  assert.doesNotMatch(section, /relationshipNote/u);
   assert.match(section, /label: t\("share\.stat\.recordedActivity"\),/u);
   assert.match(
     section,
@@ -7006,11 +6995,6 @@ test("a posted results card states a figure in full and marks a fixture as one",
   assert.match(
     section,
     /detail: !isWeeklyWindow\s*\n\s*\? t\("share\.detail\.notApplicableToWindow"\)/u,
-  );
-  assert.match(section, /const relationshipNote = isWeeklyWindow && spend !== null && hasCapacity/u);
-  assert.match(
-    section,
-    /t\("share\.relationship", \{ period \}\)/u,
   );
   // The social image reuses the date landmarks and vertical domain from the
   // Allowance estimate history, instead of inventing a compact-card axis.
@@ -7024,7 +7008,7 @@ test("a posted results card states a figure in full and marks a fixture as one",
     "the shared SVG tick alignment is translated to a valid Canvas alignment",
   );
   assert.doesNotMatch(section, /shareCardTrendDateTicks|shareCardTrendAxis/u);
-  assert.match(section, /const SHARE_CARD_TREND_MAX_HEIGHT = 340;/u);
+  assert.match(section, /const SHARE_CARD_TREND_MAX_HEIGHT = 420;/u);
   assert.match(section, /const SHARE_CARD_TREND_MIN_HEIGHT = 168;/u);
   // Only the qualifications that can change interpretation survive on a
   // social image; the full evidence remains in the local app.

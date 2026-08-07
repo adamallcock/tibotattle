@@ -182,6 +182,11 @@ export function localCompanionStatePaths(stateRoot) {
       "private",
       "automatic-contribution-v0.1.lock",
     ),
+    incrementalContributionSyncSettingsFile: join(
+      selected,
+      "private",
+      "incremental-contribution-sync-v1.json",
+    ),
     fastModePreferenceFile: join(
       selected,
       "private",

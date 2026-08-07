@@ -305,6 +305,7 @@ test("loopback server exposes only fixed API, static, and report routes", async 
       contributionDeviceDisconnect: false,
       contributionSyncExactReview: true,
       contributionSyncActions: false,
+      incrementalContributionSync: false,
       centralServiceProxy: false,
       centralParticipantRelay: false,
       arbitraryPathAccess: false,
