@@ -2567,6 +2567,10 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
     assert.equal(previewCalls, 0);
     const pairingCode =
       "um_pair_00000000-0000-4000-8000-000000000000.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    // Pause the queue the way a device_unavailable sync outcome would. A
+    // refused pairing must leave it paused; a successful pairing is the cure
+    // and must resume it without a separate dashboard action.
+    pausedState = true;
     const unauthorizedPairing = await fetch(
       `${base}/api/local/contribution/device-pair`,
       {
@@ -2577,6 +2581,7 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
     );
     assert.equal(unauthorizedPairing.status, 403);
     assert.equal(pairedCode, null);
+    assert.equal(pausedState, true);
     const paired = await fetch(
       `${base}/api/local/contribution/device-pair`,
       {
@@ -2586,6 +2591,7 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
       },
     ).then((response) => response.json());
     assert.equal(pairedCode, pairingCode);
+    assert.equal(pausedState, false);
     assert.deepEqual(paired, {
       schemaVersion: "local-contribution-device-pairing-v0.1",
       status: "paired",
@@ -2789,6 +2795,11 @@ test("stale contribution-device credentials return fixed recovery guidance witho
     const connectSource = appSource.match(
       /async function connectCommunityContribution\(\) \{([\s\S]*?)\n\}\n/u,
     )?.[1] ?? "";
+    // Failure handling was centralized: every connect failure routes through
+    // reportContributionConnectFailure, and the recovery contract lives there.
+    const reportFailureSource = appSource.match(
+      /async function reportContributionConnectFailure\([\s\S]*?\) \{([\s\S]*?)\n\}\n/u,
+    )?.[1] ?? "";
     const recoverySource = appSource.match(
       /async function renderContributionDeviceRecovery\(status, \{ error \} = \{\}\) \{([\s\S]*?)\n\}\n\nconst DEVICE_CREDENTIAL_RESET_CONFIRMATION/u,
     )?.[1] ?? "";
@@ -2796,7 +2807,8 @@ test("stale contribution-device credentials return fixed recovery guidance witho
     assert.match(htmlSource, /id="community"[^>]*data-dashboard-page="community"/u);
     assert.doesNotMatch(htmlSource, /id="data"[^>]*data-dashboard-page/u);
     assert.doesNotMatch(htmlSource, /data-nav="data"/u);
-    assert.match(connectSource, /if \(contributionDeviceRecoveryIsRequired\(error\)\) \{\s*\n\s*await renderContributionDeviceRecovery\(status, \{ error \}\);/u);
+    assert.match(connectSource, /reportContributionConnectFailure\(status, error/u);
+    assert.match(reportFailureSource, /if \(contributionDeviceRecoveryIsRequired\(error\)\) \{\s*\n\s*await renderContributionDeviceRecovery\(status, \{ error \}\);/u);
     assert.match(recoverySource, /id = "reset-device-credential"/u);
     assert.match(recoverySource, /leftover contribution-device credential/u);
     assert.doesNotMatch(recoverySource, /showFailure\(/u);

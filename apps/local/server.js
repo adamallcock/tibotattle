@@ -2849,6 +2849,16 @@ function createPreparedLocalCompanionServer({
               || expiresAt === null) {
             throw new Error("pairing response invalid");
           }
+          // The sync queue auto-pauses when the service reports the device
+          // credential invalid (device_unavailable); a successful pairing is
+          // the cure, so it resumes here. Best-effort: the pairing itself
+          // succeeded, and the sync status surface still reports a paused
+          // queue if this resume fails.
+          try {
+            await setContributionPaused({ paused: false });
+          } catch {
+            // deliberately ignored
+          }
           send(response, 200, {
             schemaVersion: "local-contribution-device-pairing-v0.1",
             status: "paired",
