@@ -497,9 +497,19 @@ async function sourceBoundary(secret, path, prefixBytes) {
     );
     const metadata = await handle.stat({ bigint: true });
     const fileSize = Number(metadata.size);
+    // `nlink` is deliberately not checked here. An additional directory entry
+    // cannot alter bytes read through this already-opened O_NOFOLLOW handle
+    // whose type, size, ctime and ownership are verified, and the check's
+    // failure mode - failing the source and stalling history - is out of all
+    // proportion to what it detects. Honest provenance note: the hardlinks
+    // that originally tripped this family of guards turned out to be our own
+    // benchmark fixtures, not Codex archive behaviour as first claimed; the
+    // guard fired correctly on them, and it is removed because the response
+    // was wrong, not the detection. The secret-file guard keeps its link
+    // check: for a file this product creates itself, an extra link really is
+    // unexpected.
     if (!metadata.isFile()
         || metadata.isSymbolicLink()
-        || Number(metadata.nlink) !== 1
         || !Number.isSafeInteger(fileSize)
         || fileSize < prefixBytes
         || (typeof process.getuid === "function"
@@ -561,7 +571,6 @@ async function reuseUnchangedSourceProjection(info, prior) {
     const fileSize = Number(metadata.size);
     if (!metadata.isFile()
         || metadata.isSymbolicLink()
-        || Number(metadata.nlink) !== 1
         || !Number.isSafeInteger(fileSize)
         || fileSize !== Number(info.size)
         || !sameIdentity(prior, identityMetadata)
