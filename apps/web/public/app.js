@@ -9,12 +9,10 @@ import {
   CODEX_WEEKLY_ALLOWANCE_MINUTES,
   demoDashboard,
   isValidQuotaWindowDuration,
-  normalizeParticipantHistory,
   selectPrimaryCodexQuotaWindow
 } from "./data-client.js";
 import {
   DIAGNOSTIC_REFERENCE_PATTERN,
-  contributionBatchAdmission,
   createDiagnosticReference,
   createQuotaTimelineLookup,
   createRefreshPollingBudget,
@@ -109,15 +107,20 @@ let contributionSyncBusy = false;
 // retrying is an explicit action again after a failure.
 let contributionSyncAutoReviewedKey = null;
 // Approval state for the approve-once incremental consent surface. It exists
-// only while the companion advertises the v1.0 sync capability; this page
-// holds nothing durable about it.
+// only while the companion advertises the v1.0 sync capability. The page
+// itself holds nothing durable: the approved flag is re-read from the
+// companion's incremental-status projection, which also feeds the modest
+// days-synced/paused/last-error status line under the surface.
 let incrementalConsentApproved = false;
 let incrementalConsentBusy = false;
+let incrementalSyncStatus = null;
+// The invisible review bootstrap prepares one real instance of the covered
+// data at most once per queue state, so a failing preparation cannot loop;
+// trying again is the explicit "Check again" action.
+let incrementalReviewPrepareAttempted = false;
 let fastModePreference = null;
 let fastModePreferenceBusy = false;
-let participantContributionAdmission = null;
 let localOnboarding = null;
-let contributionPreparationBusy = false;
 let communityConnectBusy = false;
 // True once this Mac has actually been paired as an upload-only device in
 // this session. The primary button is named for what it will do next, so it
@@ -136,7 +139,6 @@ let activeHostedSignIn = null;
 // configured, so these stay false until a start attempt says otherwise.
 let appleSignInUnavailable = false;
 let googleSignInUnavailable = false;
-let activeContributionLookbackHours = 24;
 let localActionBusy = false;
 let localRefreshInProgress = false;
 let localRefreshCancelRequested = false;
@@ -332,9 +334,6 @@ function setJourneyState(state) {
   for (const element of document.querySelectorAll("[data-requires-evidence]")) {
     element.hidden = !hasEvidence;
   }
-  if (!hasEvidence) {
-    $("#community-contribution-disclosure")?.removeAttribute("open");
-  }
 }
 
 function localAnalysisAllowed(value = localOnboarding) {
@@ -380,11 +379,10 @@ function updateLocalActionButtons() {
 function setCommunitySession(value) {
   communitySession = value;
   if (!value) {
-    participantContributionAdmission = null;
     // Losing the session means the next primary action is a connection again,
     // not a review of something this Mac can no longer send.
     communityDevicePaired = false;
-    renderContributionPreparationEstimate();
+    renderContributionActionState();
   }
 }
 
@@ -888,9 +886,9 @@ function renderDashboard(data) {
   $("#data-source").textContent = data.mode === "demo"
     ? "Illustrative fixture — not your usage"
     : `${formatLocal(data.freshness.latestObservedAt)} · local companion`;
-  setLocalizedText($("#schema-version"), "dashboard.contract", {
-    version: data.schemaVersion,
-  });
+  // The footer's "Dashboard contract" line is gone (owner-directed,
+  // 2026-08-08): the version stays machine-discoverable on data.schemaVersion
+  // and in the share card's text transcript, and was never a user fact.
 
   if (data.mode === "demo") {
     showConnectionNotice({
@@ -941,7 +939,6 @@ function renderDashboard(data) {
   renderTimeline(data);
   renderWeekly(data);
   renderAccounting(data);
-  renderContributionPreparationEstimate();
   renderCommunityJourney();
 }
 
@@ -1548,8 +1545,10 @@ const SHARE_CARD_VALUE_MIN_SIZE = 34;
 const SHARE_CARD_TREND_MIN_HEIGHT = 168;
 // The chart is the evidence on the image, not decorative garnish. Reserve a
 // meaningful vertical lane for it instead of compressing it below three cards
-// and a verbose footer.
-const SHARE_CARD_TREND_MAX_HEIGHT = 420;
+// and a verbose footer. Raised 420 → 472 (owner-directed, 2026-08-08): the
+// identifier footer and its rule are gone from the image, and every one of
+// those reclaimed pixels belongs to the plot.
+const SHARE_CARD_TREND_MAX_HEIGHT = 472;
 // Identifier-shaped only, exactly as a diagnostic code is: no space, no
 // slash, no separator that could carry a path or a folder name.
 const SHARE_CARD_REGISTRY_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/u;
@@ -1735,6 +1734,17 @@ function shareCardTrend(history) {
     }),
     xTicks: Object.freeze([...(history?.xTicks ?? [])]),
     count: points.length,
+    // The population the count sentence names. The page headline counts the
+    // whole corpus while the chart draws the filtered subset; the card used
+    // to print only the subset count, which read as a different dataset. The
+    // shared history model carries the corpus size and the filter it applied,
+    // so the card can state "{shown} of {total}" exactly like the hero.
+    totalCount: Math.max(
+      points.length,
+      finite(history?.totalCount, points.length),
+    ),
+    spanFloorPp: finite(history?.spanFloorPp, 0),
+    rangeDays: finite(history?.rangeDays),
     firstDateLabel: points[0].dateLabel,
     lastDateLabel: points[points.length - 1].dateLabel,
   });
@@ -1862,6 +1872,7 @@ function buildShareCard(data, {
     }),
   ].filter((part) => part !== "");
 
+  const trend = isWeeklyWindow ? shareCardTrend(history) : null;
   return Object.freeze({
     reference,
     isDemo,
@@ -1877,8 +1888,13 @@ function buildShareCard(data, {
     stats: Object.freeze(stats.map((stat) => Object.freeze({ ...stat }))),
     // Reset-fit history is an explicitly seven-day model. It is never drawn
     // behind a five-hour or provider-reported generic allowance window.
-    trend: isWeeklyWindow ? shareCardTrend(history) : null,
+    trend,
     trendLabel: t("share.trend.label"),
+    // The count sentence mirrors the Allowance hero's phrasing: shown of
+    // total, plus the range and span filter the shared model applied. A bare
+    // subset count beside the page's corpus count read as two different
+    // datasets (owner review, 2026-08-08).
+    trendCount: trend === null ? "" : shareCardTrendCountLabel(trend),
     trendEmpty: isWeeklyWindow
       ? t("share.trend.empty")
       : t("share.trend.unavailableForWindow"),
@@ -1889,7 +1905,36 @@ function buildShareCard(data, {
     identifierLine: identifiers.join(" · "),
     contractVersion,
     home,
+    // Drawn at the image's top-right corner in place of the home host
+    // (owner-directed, 2026-08-08). Empty when the build is unversioned, so
+    // the corner is blank rather than carrying an invented number.
+    versionLabel: appVersion === ""
+      ? ""
+      : t("share.identifier.version", { version: appVersion }),
   });
+}
+
+/**
+ * The plotted history's population sentence: shown of total, with the fixed
+ * range vocabulary and the span floor the shared model applied. Only numbers
+ * and fixed copy can reach it.
+ */
+function shareCardTrendCountLabel(trend) {
+  const range = trend.rangeDays === null
+    || trend.rangeDays >= ALL_HISTORY_RANGE_DAYS
+    ? t("share.range.all")
+    : t("share.range.days", { days: formatNumber(trend.rangeDays) });
+  const values = {
+    range,
+    shown: formatNumber(trend.count),
+    total: formatNumber(trend.totalCount),
+  };
+  return trend.spanFloorPp > 0
+    ? t("share.trend.countWithFloor", {
+      ...values,
+      span: formatNumber(trend.spanFloorPp),
+    })
+    : t("share.trend.countAnySpan", values);
 }
 
 /**
@@ -1928,7 +1973,9 @@ function shareCardTrendText(card) {
     })
     : t("share.text.trendPopulated", {
       end: card.trend.lastDateLabel,
-      fits: tPlural("share.resetFit", card.trend.count),
+      // The same shown-of-total sentence the image prints, so the text
+      // transcript and the picture state one population.
+      fits: card.trendCount,
       high: formatMoney(card.trend.high, 0),
       label: card.trendLabel,
       low: formatMoney(card.trend.low, 0),
@@ -2220,11 +2267,15 @@ function drawShareCard(canvas, card) {
     );
   }
 
+  // The top-right corner names the build that produced these figures
+  // (owner-directed, 2026-08-08): the app version replaced the home host,
+  // which already reaches a reader through the text transcript's "More at"
+  // line. An unversioned build leaves the corner blank.
   context.textAlign = "right";
   context.font = shareCardFont(700, 20);
   context.fillStyle = "#65706b";
-  if (card.home !== "") {
-    context.fillText(card.home, SHARE_CARD_WIDTH - margin, 63);
+  if (card.versionLabel !== "") {
+    context.fillText(card.versionLabel, SHARE_CARD_WIDTH - margin, 63);
   }
   context.textAlign = "left";
 
@@ -2281,13 +2332,15 @@ function drawShareCard(canvas, card) {
     .flatMap((caveat) => shareCardWrap(context, caveat, inner - 20, 2))
     .slice(0, SHARE_CARD_MAX_CAVEAT_LINES);
   const caveatStep = 23;
-  // The footer zone holds one deliberately quiet 15px line: the checkable
-  // diagnostic reference (owner-directed, 2026-08-07, superseding the
-  // 2026-08-06 legibility bump). Every reclaimed pixel goes to the chart.
-  const ruleY = SHARE_CARD_HEIGHT - 44.5;
+  // The identifier/debug footer and its rule are gone from the image
+  // (owner-directed, 2026-08-08). The reference still reaches a reader
+  // through the text transcript, the saved file's name, and the chip beside
+  // the card; on the picture, every reclaimed pixel belongs to the chart.
+  // Caveats, when present, now anchor directly above the card's bottom edge.
+  const caveatBaseY = SHARE_CARD_HEIGHT - 26;
   const caveatTop = caveatLines.length === 0
-    ? ruleY - 8
-    : ruleY - 22 - (caveatLines.length - 1) * caveatStep;
+    ? caveatBaseY + 22
+    : caveatBaseY - (caveatLines.length - 1) * caveatStep;
   const trendTop = statTop + statHeight + 34;
   const trendHeight = Math.min(
     SHARE_CARD_TREND_MAX_HEIGHT,
@@ -2300,10 +2353,10 @@ function drawShareCard(canvas, card) {
     margin,
     trendTop - 14,
   );
-  if (card.trend !== null) {
+  if (card.trendCount !== "") {
     context.textAlign = "right";
     context.fillText(
-      tPlural("share.resetFit", card.trend.count),
+      card.trendCount,
       SHARE_CARD_WIDTH - margin,
       trendTop - 14,
     );
@@ -2327,21 +2380,6 @@ function drawShareCard(canvas, card) {
       caveatY += caveatStep;
     }
   }
-
-  context.strokeStyle = "rgba(23, 33, 30, .16)";
-  context.lineWidth = 1;
-  context.beginPath();
-  context.moveTo(margin, ruleY);
-  context.lineTo(SHARE_CARD_WIDTH - margin, ruleY);
-  context.stroke();
-
-  context.fillStyle = "#65706b";
-  context.font = shareCardFont(500, 15);
-  context.fillText(
-    shareCardFit(context, card.identifierLine, inner),
-    margin,
-    ruleY + 26,
-  );
   return true;
 }
 
@@ -2505,7 +2543,9 @@ function downloadShareCard() {
     link.download = shareCardFileName(card);
     link.click();
     URL.revokeObjectURL(url);
-    const saved = `Saved as ${shareCardFileName(card)}. Reference ${card.reference} is printed on the image.`;
+    // The image no longer prints the reference (owner-directed, 2026-08-08),
+    // so the claim moved with the fact: the file name carries it.
+    const saved = `Saved as ${shareCardFileName(card)}. The file name carries reference ${card.reference}.`;
     // Reveal is native-only: the shell tracks where the download landed and
     // shows it in Finder itself, so the page never learns a filesystem path.
     // In a plain browser the button is absent rather than disabled.
@@ -2545,7 +2585,7 @@ function copyShareCardImage() {
       // fresh confirmation.
       setShareCardStatus("");
       showShareCardToast(
-        `Copied. Paste it anywhere; reference ${card.reference} is printed on the image.`,
+        `Copied. Paste it anywhere; reference ${card.reference} identifies these figures.`,
       );
     } catch {
       setShareCardStatus(
@@ -4222,11 +4262,16 @@ function lineChart({
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
   svg.setAttribute("role", "img");
-  const titleNode = document.createElementNS(svg.namespaceURI, "title");
-  setRawText(titleNode, chartText(title, "title"));
-  const descNode = document.createElementNS(svg.namespaceURI, "desc");
-  setRawText(descNode, chartText(description, "description"));
-  svg.append(titleNode, descNode);
+  // The chart's accessible name and description live on aria attributes
+  // rather than a root <title>/<desc> pair: a root <title> also acts as a
+  // delayed grey native tooltip over every hover target inside the SVG, which
+  // is the double-tooltip the owner removed (2026-08-08). Both strings still
+  // pass through chartText, so hardcoded English still cannot reach them.
+  svg.setAttribute("aria-label", chartText(title, "title"));
+  const chartDescription = chartText(description, "description");
+  if (chartDescription !== "") {
+    svg.setAttribute("aria-description", chartDescription);
+  }
 
   const tooltipWidth = 330;
   const tooltipHeight = 48;
@@ -4474,9 +4519,10 @@ function lineChart({
       const bandHeading = chartText(confidence.label, "confidence label");
       const bandDetail = `${bandFormat(bandLow)}–${bandFormat(bandHigh)}`;
       const bandCaption = chartSeriesCaption(bandHeading, bandDetail);
-      const bandTitle = document.createElementNS(svg.namespaceURI, "title");
-      setRawText(bandTitle, bandCaption);
-      polygon.append(bandTitle);
+      // No native <title> here: the styled hover tooltip already shows this
+      // caption immediately, and the browser's delayed grey tooltip repeated
+      // it (owner-reported double tooltip, 2026-08-08). The caption stays on
+      // aria-label for assistive technology.
       const middlePoint = confidencePoints[Math.floor(confidencePoints.length / 2)];
       bindChartInteraction({
         element: polygon,
@@ -4578,9 +4624,9 @@ function lineChart({
           )
           : "";
         const caption = [heading, detail].filter(Boolean).join(" · ");
-        const lineTitle = document.createElementNS(svg.namespaceURI, "title");
-        setRawText(lineTitle, caption);
-        path.append(lineTitle);
+        // The styled hover is the one tooltip; a native <title> repeated it
+        // after a delay as the grey system tooltip. The caption survives on
+        // aria-label.
         bindChartInteraction({
           element: path,
           heading,
@@ -4634,13 +4680,11 @@ function lineChart({
           timestamp ? formatChartTimestamp(timestamp) : null,
         ].filter(Boolean).join(" · ");
         const caption = [heading, detail].filter(Boolean).join(" · ");
-        if (item.tooltip !== false) {
-          const markerTitle = document.createElementNS(svg.namespaceURI, "title");
-          setRawText(markerTitle, caption);
-          marker.append(markerTitle);
-        }
-        // A hover title alone is mouse-only, so focusable markers carry the
-        // identical sentence to the keyboard and to assistive technology.
+        // Deliberately no native <title> on a point: the styled hover shows
+        // this caption immediately, and the browser's delayed grey tooltip
+        // then repeated it word for word (owner-reported double tooltip,
+        // 2026-08-08). Keyboard and assistive technology keep the identical
+        // sentence through the aria-label below.
         bindChartInteraction({
           element: marker,
           heading,
@@ -4692,9 +4736,8 @@ function lineChart({
           )
           : "";
         const caption = [heading, detail].filter(Boolean).join(" · ");
-        const lineTitle = document.createElementNS(svg.namespaceURI, "title");
-        setRawText(lineTitle, caption);
-        path.append(lineTitle);
+        // Same rule as the primary series: the styled hover owns the
+        // tooltip, aria-label owns the accessible name, no native <title>.
         bindChartInteraction({
           element: path,
           heading,
@@ -4733,11 +4776,7 @@ function lineChart({
         const heading = chartSeriesCaption(item.label, format(value));
         const detail = point.timestamp ? formatChartTimestamp(point.timestamp) : "";
         const caption = [heading, detail].filter(Boolean).join(" · ");
-        if (item.tooltip !== false) {
-          const markerTitle = document.createElementNS(svg.namespaceURI, "title");
-          setRawText(markerTitle, caption);
-          marker.append(markerTitle);
-        }
+        // No native <title>: the styled hover is the one tooltip on a point.
         bindChartInteraction({
           element: marker,
           heading,
@@ -4827,14 +4866,29 @@ function allowanceHistoryChartModel(data, {
     .sort((left, right) => left.at - right.at);
   const latestObservedAt = allPoints.at(-1)?.at ?? null;
   const validRangeDays = Number.isFinite(rangeDays) && rangeDays > 0 ? rangeDays : null;
+  const boundedRangeDays = validRangeDays !== null
+    && validRangeDays < ALL_HISTORY_RANGE_DAYS
+    ? validRangeDays
+    : null;
   const cutoffAt = latestObservedAt === null || validRangeDays === null
     ? Number.NEGATIVE_INFINITY
     : latestObservedAt - validRangeDays * 24 * 60 * 60 * 1_000;
-  const points = allPoints.filter((point) => (
-    point.at >= cutoffAt
-      && (activeWeeklyMinimumObservedSpanPp === 0
-        || (point.observedSpanPp !== null
-          && point.observedSpanPp >= activeWeeklyMinimumObservedSpanPp))
+  // A 7-day window over a roughly weekly per-reset series holds one or two
+  // fits at most, and the shared span slider then filtered those away almost
+  // every time, so the 7d button was near-guaranteed to show an empty chart
+  // (estimator audit, 2026-08-08). Short ranges therefore relax the span
+  // floor to zero: every fit in range draws, with short observations keeping
+  // their outlined diagnostic styling. The effective floor travels with the
+  // model so the hero sentence, the chart caption, and the share card all
+  // describe the filter that actually applied.
+  const spanFloorPp = boundedRangeDays !== null && boundedRangeDays <= 7
+    ? 0
+    : activeWeeklyMinimumObservedSpanPp;
+  const inRange = allPoints.filter((point) => point.at >= cutoffAt);
+  const points = inRange.filter((point) => (
+    spanFloorPp === 0
+      || (point.observedSpanPp !== null
+        && point.observedSpanPp >= spanFloorPp)
   ));
   const axis = allowanceHistoryAxis(points);
   return Object.freeze({
@@ -4842,6 +4896,15 @@ function allowanceHistoryChartModel(data, {
     points: Object.freeze(points),
     axis,
     xTicks: allowanceHistoryDateTicks(points),
+    // The population facts the sentences around this model state: the corpus
+    // size, how many fits fall in the selected range, the span floor that was
+    // actually applied, the bounded range (null for "All"), and the newest
+    // fit the range is anchored at.
+    totalCount: allPoints.length,
+    inRangeCount: inRange.length,
+    spanFloorPp,
+    rangeDays: boundedRangeDays,
+    anchorAt: latestObservedAt,
   });
 }
 
@@ -4935,13 +4998,17 @@ function weeklySpanLabel() {
     });
 }
 
-function weeklySpanSentenceLabel() {
-  return activeWeeklyMinimumObservedSpanPp === 0
+// Sentences describe the floor the model actually applied, not the slider
+// position: a short range relaxes the floor to zero, and a caption that kept
+// naming the slider's floor would describe points the chart is not drawing.
+function spanFloorSentenceLabel(spanFloorPp) {
+  return spanFloorPp === 0
     ? t("weekly.span.none")
     : t("weekly.span.minimum", {
-      span: formatDecimal(activeWeeklyMinimumObservedSpanPp, 0),
+      span: formatDecimal(spanFloorPp, 0),
     });
 }
+
 
 function weeklyObservedSeriesLabel() {
   return activeWeeklyMinimumObservedSpanPp === 0
@@ -5032,7 +5099,7 @@ function renderAllowanceHistoryChart(history) {
     description: {
       key: "weekly.chart.description",
       values: {
-        span: weeklySpanSentenceLabel(),
+        span: spanFloorSentenceLabel(history.spanFloorPp),
         timeZone: formatTimeZoneLabel(),
       },
     },
@@ -5350,7 +5417,14 @@ function renderWeekly(data) {
       qualifying: formatDecimal(qualifying, 0),
       shown: formatDecimal(chartValues.length, 0),
       total: formatDecimal(values.length, 0),
-      span: weeklySpanSentenceLabel(),
+      // The floor the model actually applied — a short range relaxes it —
+      // and the newest fit the range is anchored at, so "7d" reads as seven
+      // days back from that fit rather than from today (estimator audit,
+      // 2026-08-08).
+      span: spanFloorSentenceLabel(history.spanFloorPp),
+      anchor: history.anchorAt === null
+        ? "—"
+        : shareCardDateLabel(history.anchorAt),
     })
     : t("weekly.headline.pending");
 
@@ -5365,7 +5439,21 @@ function renderWeekly(data) {
   if (!chartValues.length) {
     empty.hidden = false;
     shell.hidden = true;
-    setLocalizedText(empty, "weekly.chart.empty");
+    // An empty chart names its reason instead of the generic sentence: either
+    // no fits fall in the selected range at all, or fits are in range and the
+    // span floor filtered every one of them (estimator audit, 2026-08-08).
+    if (values.length === 0) {
+      setLocalizedText(empty, "weekly.chart.empty");
+    } else if (history.inRangeCount === 0) {
+      setLocalizedText(empty, "weekly.chart.emptyRange");
+    } else {
+      setLocalizedPluralText(
+        empty,
+        "weekly.chart.emptyBelowFloor",
+        history.inRangeCount,
+        { span: formatDecimal(history.spanFloorPp, 0) },
+      );
+    }
   } else {
     empty.hidden = true;
     shell.hidden = false;
@@ -5873,9 +5961,14 @@ function renderContributionSyncStatus(status) {
     counts: {},
   };
   contributionSyncStatus = value;
-  updateContributionSyncButtons();
+  renderContributionActionState();
 }
 
+// The legacy "Prepare and review a contribution" surface is gone
+// (owner-directed, 2026-08-08): the prepared-set queue no longer renders its
+// own card. The queue still matters — it is the review bootstrap behind the
+// approve-once surface and the evidence of a previously accepted upload — so
+// its state is stored and the consent surface re-renders from it.
 function renderContributionSyncPreview(preview) {
   const value = preview ?? {
     status: "unavailable",
@@ -5883,58 +5976,13 @@ function renderContributionSyncPreview(preview) {
     item: null
   };
   contributionSyncPreview = value;
-  if (!$("#sync-next-state")) {
-    updateContributionSyncButtons();
-    return;
-  }
-  const labels = {
-    ready: "Ready to review",
-    retry_wait: "Waiting to retry",
-    paused: "Paused",
-    empty: "Nothing waiting",
-    not_configured: "Not set up",
-    unavailable: "Unavailable"
-  };
-  const chip = $("#sync-next-state");
-  const state = value.status === "available"
-    ? value.state
-    : value.status;
-  // A direct write, so the registry entry a localized ready-state label left
-  // behind must be dropped first: otherwise a later language switch would
-  // resurrect that stale label over this queue state.
-  forgetLocalizedNode(chip);
-  chip.textContent = labels[state] ?? "Unavailable";
-  chip.className = state === "ready"
-    ? "evidence-chip"
-    : "evidence-chip neutral";
-  if (!value.item) {
-    $("#sync-next-coverage").textContent = value.status === "not_configured"
-      ? "This build cannot store a prepared summary."
-      : "—";
-    $("#sync-next-records").textContent = "—";
-    $("#sync-next-cost").textContent = "—";
-    $("#sync-next-bytes").textContent = "—";
-    updateContributionSyncButtons();
-    return;
-  }
-  const item = value.item;
-  $("#sync-next-coverage").textContent =
-    `${formatLocal(item.coveredAt.startAt)} – ${formatLocal(item.coveredAt.endAt)}`;
-  $("#sync-next-records").textContent =
-    `${compact(item.recordCounts.total)} total · ${compact(item.recordCounts.usageEvents)} usage · ${compact(item.recordCounts.quotaSnapshots)} quota`;
- $("#sync-next-cost").textContent =
-    `${item.accounting.estimatedApiCostUsd === null ? "No estimate" : formatApiMoney(Number(item.accounting.estimatedApiCostUsd))} · ${t("accounting.pricing.coverageShort", {
-      percent: formatPercent(item.accounting.pricedEventCoveragePercent, 1),
-    })}`;
-  $("#sync-next-bytes").textContent =
-    `Up to ${compact(item.reservedUploadBytes)} bytes; ${compact(item.preparedBytes)} bytes ready to send`;
-  updateContributionSyncButtons();
+  renderContributionActionState();
   maybeReviewPreparedSummary();
 }
 
 // Whether this build is paired with a hosted contribution service at all. A
-// build without one has nothing to sign into or connect to, so the local
-// prepare-and-review flow stays available there and only sending is off.
+// build without one has nothing to sign into or connect to, and — with the
+// approve-once surface as the only contribution flow — nothing to approve.
 function contributionServiceConfigured() {
   return localCompanionHealth?.capabilities?.contributionDevicePairing === true;
 }
@@ -5959,82 +6007,21 @@ function communityAuthorizationSatisfied() {
   return !contributionServiceConfigured() || communityUploadAuthorityEvidence();
 }
 
-function updateContributionSyncButtons() {
-  const available = contributionSyncPreview?.status === "available";
-  const paused = contributionSyncStatus?.paused === true;
-  const send = $("#sync-run-once");
-  const retry = $("#sync-review-retry");
-  const reason = $("#sync-gate-reason");
-  const chip = $("#sync-next-state");
-  if (!send) return;
-  const authorized = communityAuthorizationSatisfied();
-  const summaryReady = available
-    && contributionSyncPreview?.state === "ready"
-    && contributionSyncPreview?.item != null;
-  const reviewVerified = contributionSyncExactReview?.state === "ready";
-  // The review-token gate is the contract and it survives the collapsed
-  // button: Send stays off until the exact prepared set has been verified on
-  // this Mac, and the send itself still travels with that review token.
-  send.disabled = contributionSyncBusy
-    || !available
-    || contributionSyncPreview?.deliveryConfigured !== true
-    || contributionSyncPreview?.state !== "ready"
-    || !reviewVerified
-    || paused
-    || !authorized;
-  if (retry) retry.disabled = contributionSyncBusy;
-  // Why Send is off, stated in gate order next to Send itself, so the missing
-  // step is named before any click instead of by a failed upload afterwards.
-  if (reason) {
-    if (!authorized) {
-      setLocalizedText(reason, hostedSignInRequired()
-        ? "syncGate.signInFirst"
-        : "syncGate.connectFirst");
-      reason.hidden = false;
-    } else if (paused) {
-      setLocalizedText(reason, "syncGate.paused");
-      reason.hidden = false;
-    } else if (!summaryReady) {
-      setLocalizedText(reason, "syncGate.prepareFirst");
-      reason.hidden = false;
-    } else if (contributionSyncPreview?.deliveryConfigured !== true) {
-      setLocalizedText(reason, "syncGate.notConfigured");
-      reason.hidden = false;
-    } else if (!reviewVerified) {
-      setLocalizedText(reason, "syncGate.verifying");
-      reason.hidden = false;
-    } else {
-      forgetLocalizedNode(reason);
-      reason.hidden = true;
-      reason.textContent = "";
-    }
-  }
-  // The chip on the summary card states the verification, not merely the
-  // queue: a ready set that has not passed the exact local check must not be
-  // labelled as if it had.
-  if (chip && summaryReady) {
-    if (reviewVerified) {
-      // "Ready to send" is claimed only where sending is actually possible; a
-      // build with no delivery keeps the honest local-only wording.
-      setLocalizedText(chip,
-        contributionSyncPreview?.deliveryConfigured === true && authorized && !paused
-          ? "syncState.readyToSend"
-          : "syncState.verifiedLocalOnly");
-      chip.className = "evidence-chip";
-    } else {
-      setLocalizedText(
-        chip,
-        contributionSyncBusy ? "syncState.verifying" : "syncState.awaitingVerification",
-      );
-      chip.className = "evidence-chip neutral";
-    }
-  }
+// One re-render entry point for everything the contribution state feeds now
+// that the legacy send card is gone: the approve-once surface and the
+// journey strip. (This replaces updateContributionSyncButtons; the send
+// button, its gate line and its chip were removed with the prepare flow,
+// owner-directed 2026-08-08.)
+function renderContributionActionState() {
   renderIncrementalConsent();
   renderCommunityJourney();
 }
 
-function showContributionSyncAction(message, error = false) {
-  const status = $("#sync-action-status");
+// The approve-once surface's own status line. It inherits the role the old
+// #sync-action-status played for the send card: verification progress, and
+// each failure with its quotable reference.
+function showIncrementalReviewStatus(message, error = false) {
+  const status = $("#incremental-consent-status");
   if (!status) return;
   status.hidden = false;
   // A direct write over a node the keyed variant may have registered.
@@ -6043,30 +6030,12 @@ function showContributionSyncAction(message, error = false) {
   status.classList.toggle("error", error);
 }
 
-function showContributionSyncActionKey(key, values = {}) {
-  const status = $("#sync-action-status");
+function showIncrementalReviewStatusKey(key, values = {}) {
+  const status = $("#incremental-consent-status");
   if (!status) return;
   status.hidden = false;
   status.classList.remove("error");
   setLocalizedText(status, key, values);
-}
-
-function contributionSyncPassResult(result) {
-  const needsAttention = result.status === "completed"
-    && result.accepted === 0
-    && result.retryable + result.rejected > 0;
-  const counts =
-    `${compact(result.accepted)} accepted, ${compact(result.retryable)} waiting to retry, ${compact(result.rejected)} rejected`;
-  const bandwidth =
-    `${compact(result.reservedUploadBytes)} bytes were set aside for the upload${result.bandwidthLimited ? ", and it stopped at that limit" : ""}`;
-  const guidance = needsAttention
-    ? " Nothing was accepted. Connect this Mac again before retrying: this Mac may need to be paired as an upload-only device. These counts do not identify the exact server-side reason."
-    : "";
-  return {
-    message:
-      `Send ${result.status}: ${compact(result.processed)} tried; ${counts}. ${bandwidth}.${guidance}`,
-    needsAttention
-  };
 }
 
 function clearContributionSyncExactReview() {
@@ -6107,62 +6076,10 @@ async function refreshContributionSyncControls() {
   renderContributionSyncPreview(preview);
 }
 
-async function runContributionSyncAction(action) {
-  if (action !== "run") return;
-  if (contributionSyncBusy) return;
-  contributionSyncBusy = true;
-  let acceptedContribution = false;
-  updateContributionSyncButtons();
-  showContributionSyncAction("Sending now. This runs once and then stops.");
-  try {
-    if (action === "run") {
-      if (contributionSyncExactReview?.state !== "ready") {
-        const error = new Error("exact review required");
-        error.code = "review_required_before_send";
-        throw error;
-      }
-      const result = await localClient.runContributionSyncOnce(
-        contributionSyncExactReview.reviewToken
-      );
-      if (result.status === "unavailable") {
-        const error = new Error("sync unavailable");
-        error.code = "sync_unavailable";
-        throw error;
-      }
-      const outcome = contributionSyncPassResult(result);
-      acceptedContribution = result.status === "completed"
-        && Number.isSafeInteger(result.accepted)
-        && result.accepted > 0;
-      showContributionSyncAction(outcome.message, outcome.needsAttention);
-    }
-    // The send consumed or invalidated the review token, so whatever set the
-    // queue offers next — including the same set after a refused pass — must
-    // verify itself again.
-    contributionSyncAutoReviewedKey = null;
-    await refreshContributionSyncControls();
-    if (acceptedContribution) await loadCommunityResults();
-  } catch (error) {
-    if (contributionDeviceRecoveryIsRequired(error)) {
-      await renderContributionDeviceRecovery($("#community-connect-status"), {
-        error
-      });
-      showContributionSyncAction(
-        "Delivery stopped because this Mac has a leftover device credential. Durable queue state was retained; the repair is offered above.",
-        true
-      );
-    } else {
-      showContributionSyncAction((await describeFailure({
-        surface: "contribution_send",
-        error,
-        fallback:
-          "The local companion rejected or could not complete this action. Durable queue state was retained."
-      })).text, true);
-    }
-  } finally {
-    contributionSyncBusy = false;
-    updateContributionSyncButtons();
-  }
-}
+// The manual "Send summary" action is gone with the prepare-and-review
+// surface (owner-directed, 2026-08-08). After the approve-once consent, the
+// companion's incremental engine uploads by itself; the page only reflects
+// that engine's bounded status line.
 
 /**
  * A stable identity for the currently prepared set, from its own printed
@@ -6181,36 +6098,134 @@ function preparedSummaryIdentity() {
 }
 
 /**
- * The summary card is the review, so a ready prepared set verifies itself:
- * the page runs the exact local check that mints the one-use review token as
- * soon as the set is on screen, instead of hiding that same check behind a
- * button that revealed nothing new. The token gate itself is unchanged —
- * Send remains disabled until this verification succeeds, and the send
- * carries the token.
+ * The invisible review bootstrap behind the approve-once surface.
+ *
+ * The approve gate keeps the review-bootstrap requirement — one verified
+ * real instance of the covered data on screen before approval can be given —
+ * but the owner removed every user-facing preparation step with the legacy
+ * prepare flow (2026-08-08). So the page produces that instance itself: a
+ * ready prepared set verifies itself exactly as before, and an empty queue
+ * triggers one silent local preparation whose result then verifies itself.
+ * The token gate is unchanged — Approve stays disabled until the exact local
+ * verification succeeds, and the approval carries the minted token.
  */
 function maybeReviewPreparedSummary() {
-  if (contributionSyncBusy) return;
-  if (contributionSyncPreview?.status !== "available"
-      || contributionSyncPreview?.state !== "ready"
-      || contributionSyncPreview?.item == null) return;
-  if (contributionSyncExactReview?.state === "ready") return;
+  if (contributionSyncBusy || incrementalConsentBusy) return;
+  // The token feeds only the approve-once consent now, so nothing prepares
+  // or verifies on a build without the capability or after approval.
+  if (!incrementalSyncCapabilityAdvertised() || incrementalConsentApproved) return;
   // Verification is worth running only where its outcome can matter: it is a
-  // local mutation that mints a send token, so it waits for the same
-  // authorization Send itself needs.
+  // local mutation that mints a consent token, so it waits for the same
+  // authorization Approve itself needs.
   if (!communityAuthorizationSatisfied()) return;
+  if (contributionSyncPreview?.status !== "available") return;
+  if (contributionSyncPreview.state !== "ready"
+      || contributionSyncPreview.item == null) {
+    maybePrepareIncrementalReviewInstance();
+    return;
+  }
+  if (contributionSyncExactReview?.state === "ready") return;
   const key = preparedSummaryIdentity();
   if (key === null || key === contributionSyncAutoReviewedKey) return;
   contributionSyncAutoReviewedKey = key;
   void reviewPreparedSummary({ refreshFirst: false });
 }
 
+/**
+ * One silent preparation per queue state, and only when the queue is truly
+ * empty: retry-wait, paused, and not-configured states are real conditions
+ * that a fresh preparation would not change. A failed attempt never loops;
+ * "Check again" on the approve card is the explicit retry.
+ */
+function maybePrepareIncrementalReviewInstance() {
+  if (contributionSyncPreview?.state !== "empty") return;
+  if (incrementalReviewPrepareAttempted) return;
+  incrementalReviewPrepareAttempted = true;
+  void prepareIncrementalReviewInstance();
+}
+
+async function prepareIncrementalReviewInstance() {
+  if (contributionSyncBusy) return;
+  contributionSyncBusy = true;
+  const retry = $("#incremental-review-retry");
+  if (retry) retry.hidden = true;
+  renderContributionActionState();
+  showIncrementalReviewStatusKey("consent.preparingReview");
+  clearContributionSyncExactReview();
+  // A fresh preparation may reproduce byte-identical facts; it must still
+  // verify itself again, so the once-per-set marker is cleared with the token.
+  contributionSyncAutoReviewedKey = null;
+  let preparedCommitted = false;
+  try {
+    let prepared;
+    try {
+      prepared = await localClient.prepareContribution({ lookbackHours: 24 });
+    } catch (error) {
+      // A very active day can exceed the fixed reviewed-set safety bound at
+      // 24 hours. The lookback was only ever a size guard — never a consent
+      // decision — so the bootstrap narrows to the latest hour by itself
+      // instead of surfacing a window picker the owner removed.
+      if (error?.code !== "export_too_large") throw error;
+      prepared = await localClient.prepareContribution({ lookbackHours: 1 });
+    }
+    if (prepared.status !== "prepared") {
+      const error = new Error("Preparation did not return a verified contribution.");
+      error.code = "preparation_failed";
+      throw error;
+    }
+    // The busy flag this preparation holds makes the refresh's automatic
+    // verification pass bail out, so the pass is re-run explicitly below
+    // once the flag is released.
+    await refreshContributionSyncControls();
+    preparedCommitted = true;
+  } catch (error) {
+    if (retry) retry.hidden = false;
+    showIncrementalReviewStatus((await describeFailure({
+      surface: "contribution_prepare",
+      error,
+      messages: INCREMENTAL_PREPARATION_ERROR_COPY,
+      fallback:
+        "A privacy-verified instance of the covered data could not be prepared. No upload occurred and incomplete staging is ignored by the queue."
+    })).text, true);
+  } finally {
+    contributionSyncBusy = false;
+    renderContributionActionState();
+  }
+  if (preparedCommitted) maybeReviewPreparedSummary();
+}
+
+// Fixed sentences for the silent preparation's own failure codes. They speak
+// on the approve card, so each names the reader's actual next action there.
+const INCREMENTAL_PREPARATION_ERROR_COPY = {
+  identity_unavailable:
+    "The local Keychain identity is unavailable. Open Keychain Access, select the login Keychain, unlock it, then choose Check again. Do not reset, delete, rotate, or broaden access to the identity. No upload occurred.",
+  coverage_unavailable:
+    "No usable local coverage is available yet. Analyze local usage first, then choose Check again. No upload occurred.",
+  coverage_invalid:
+    "The available local coverage is not usable for a contribution yet. No upload occurred.",
+  no_safe_records:
+    "No privacy-safe records were found in the recent local evidence. Analyze local usage again later. No upload occurred.",
+  export_too_large:
+    "Even the latest hour exceeded a fixed reviewed-set safety bound. Nothing was truncated or uploaded.",
+  privacy_verification_failed:
+    "Privacy verification rejected the prepared data, so it was not queued or uploaded.",
+  preparation_in_progress:
+    "A local preparation is already running. Nothing has been uploaded.",
+  review_archive_invalid:
+    "TiboTattle could not save the copy you would review, so nothing was queued and nothing was uploaded.",
+  prepared_spool_invalid:
+    "The place TiboTattle keeps a prepared instance on this Mac is not usable, so nothing was queued and nothing was uploaded.",
+  preparation_failed:
+    "A privacy-verified instance of the covered data could not be prepared. No upload occurred and incomplete staging is ignored by the queue.",
+};
+
 async function reviewPreparedSummary({ refreshFirst = true } = {}) {
   if (contributionSyncBusy) return;
   contributionSyncBusy = true;
-  const retry = $("#sync-review-retry");
+  const retry = $("#incremental-review-retry");
   if (retry) retry.hidden = true;
-  updateContributionSyncButtons();
-  showContributionSyncActionKey("syncStatus.verifyingSummary");
+  renderContributionActionState();
+  showIncrementalReviewStatusKey("syncStatus.verifyingSummary");
   try {
     // Preview discovery commits newly prepared sets to the queue, so an
     // explicit re-check refreshes first; the automatic verification is
@@ -6219,23 +6234,38 @@ async function reviewPreparedSummary({ refreshFirst = true } = {}) {
     const review = await localClient.contributionSyncExactReview();
     renderContributionSyncExactReview(review);
     contributionSyncAutoReviewedKey = preparedSummaryIdentity();
-    showContributionSyncActionKey("syncStatus.summaryVerified");
+    showIncrementalReviewStatusKey("syncStatus.summaryVerified");
   } catch (error) {
     // A bare `catch {}` discarded the only evidence of what actually failed
     // and printed one sentence for every cause. Surface the real one, and
     // offer the explicit re-check: automatic verification never retries a
     // failure by itself.
     if (retry) retry.hidden = false;
-    showContributionSyncAction((await describeFailure({
+    showIncrementalReviewStatus((await describeFailure({
       surface: "contribution_prepare",
       error,
       fallback:
-        "The prepared summary could not be verified on this Mac. Nothing was uploaded."
+        "The prepared instance could not be verified on this Mac. Nothing was uploaded."
     })).text, true);
   } finally {
     contributionSyncBusy = false;
-    updateContributionSyncButtons();
+    renderContributionActionState();
   }
+}
+
+/**
+ * The explicit retry behind "Check again": clear the once-only markers, then
+ * re-read the queue. The render that follows re-runs the same automatic
+ * bootstrap — verify a ready set, or prepare one silently when the queue is
+ * empty — so recovery walks exactly the path the happy case walks.
+ */
+async function retryIncrementalReviewBootstrap() {
+  if (contributionSyncBusy) return;
+  incrementalReviewPrepareAttempted = false;
+  contributionSyncAutoReviewedKey = null;
+  const retry = $("#incremental-review-retry");
+  if (retry) retry.hidden = true;
+  await refreshContributionSyncControls();
 }
 
 /**
@@ -6283,8 +6313,11 @@ async function loadLocalDashboard() {
     // on a capability it carries. Without this re-render they keep the
     // disabled state bootstrap gave them when the capability was still unknown.
     renderHostedIdentity();
-    renderPreparationIdentity(localHealth);
     renderContributionSyncStatus(sync.status);
+    // Consent state is read from the companion before the queue renders, so
+    // an already-approved Mac never re-prepares a review instance it no
+    // longer needs.
+    await loadIncrementalSyncStatus();
     renderContributionSyncPreview(sync.preview);
     renderLocalOnboarding(onboarding);
   } catch {
@@ -6296,8 +6329,8 @@ async function loadLocalDashboard() {
     dashboard = null;
     renderHostedIdentity();
     renderContributionSyncStatus(null);
+    await loadIncrementalSyncStatus();
     renderContributionSyncPreview(null);
-    renderPreparationIdentity(null);
     renderLocalOnboarding(onboarding);
     renderDashboardUnavailableState(
       localHealth ? "dashboard-unavailable" : "companion-unavailable",
@@ -6308,38 +6341,11 @@ async function loadLocalDashboard() {
   }
 }
 
-/**
- * Say something only when the reader has to do something about it.
- *
- * This used to be a permanent "Preparation identity: Keychain checked on
- * prepare" chip. That is an implementation note: it never changed anyone's
- * next action. The one case that does — TiboTattle cannot reach the login
- * Keychain, so preparing will fail until it is unlocked — is now the only case
- * that speaks.
- */
-function renderPreparationIdentity(health) {
-  const notice = $("#preparation-identity");
-  if (!notice) return;
-  const mode = health?.capabilities?.contributionPreparationIdentityMode;
-  if (mode === "production_keychain") {
-    notice.hidden = true;
-    setRawText(notice, "");
-    return;
-  }
-  notice.hidden = false;
-  if (mode === "development_file_override"
-      || mode === "development_environment_override") {
-    setProductText(
-      notice,
-      "This is a development build. It signs summaries with a file on this Mac instead of your login Keychain.",
-    );
-    return;
-  }
-  setProductText(
-    notice,
-    "TiboTattle cannot reach your Mac's login Keychain, so preparing a summary will fail. Open Keychain Access, unlock the login Keychain, then try again. Do not delete or reset the entry.",
-  );
-}
+// The "preparation identity" Keychain notice left with the prepare surface it
+// annotated (owner-directed, 2026-08-08). The one case that still matters —
+// the login Keychain is unreachable, so the silent review bootstrap will
+// fail — speaks through that bootstrap's own identity_unavailable sentence
+// on the approve card.
 
 function renderDashboardSkeleton() {
   const container = $("#quota-cards");
@@ -7013,7 +7019,9 @@ const LOCAL_COMPANION_ERROR_COPY = {
  * The reference is fresh WebCrypto randomness, never derived from anything the
  * user typed or the service returned. The page waits for the local diagnostics
  * POST and claims the write only after the companion confirms it; when that
- * confirmation fails, the reference remains visible without the write claim.
+ * confirmation fails, the reference remains visible without the write claim,
+ * and a companion that answered yet refused the note is reported to the
+ * console rather than blending into an unreachable one.
  * The sentence itself always comes from a map written here or from the caller's
  * fallback; no server string is ever rendered.
  */
@@ -7022,6 +7030,11 @@ async function describeFailure({ surface, error, messages = {}, fallback }) {
   const code = diagnosticErrorCode(error?.code);
   const requestId = serviceRequestId(error?.requestId);
   let writtenToLocalLog = false;
+  // "recorded" | "refused" | "unreachable": a companion that answered without
+  // confirming this exact reference refused the note, which is a contract
+  // break between this build and the companion; only a request that never got
+  // an answer counts as unreachable.
+  let localNote = "unreachable";
   try {
     const recorded = await localClient.recordDiagnosticNote({
       reference,
@@ -7031,9 +7044,20 @@ async function describeFailure({ surface, error, messages = {}, fallback }) {
     });
     writtenToLocalLog = recorded?.status === "recorded"
       && recorded.reference === reference;
-  } catch {
+    localNote = writtenToLocalLog ? "recorded" : "refused";
+  } catch (noteError) {
     // The reference remains useful even when the local companion cannot write
     // its diagnostics log. Do not claim a write that was not confirmed.
+    localNote = typeof noteError?.status === "number"
+      ? "refused"
+      : "unreachable";
+  }
+  if (localNote === "refused") {
+    // Never silent: a running companion that declines this page's own note
+    // means the reference shown below cannot be looked up later.
+    console.error(
+      `Diagnostic note ${reference} was refused by the local companion.`
+    );
   }
   const explanation = fixedCopy(messages, code)
     ?? fixedCopy(SERVICE_ERROR_COPY, code)
@@ -7048,6 +7072,7 @@ async function describeFailure({ surface, error, messages = {}, fallback }) {
     reference,
     requestId,
     code,
+    localNote,
     text: trailer === "" ? explanation : `${explanation} ${trailer}`
   });
 }
@@ -7478,14 +7503,19 @@ function updateCommunityConnectButton() {
   const connected = communityContributionIsConnected();
   consent.disabled = false;
   // Consent gates the network action only. Once this Mac is connected the
-  // button opens a local review, which needs no further consent and must not
-  // become unreachable when the consent box is cleared.
+  // button routes to the approve-once surface — the only contribution flow —
+  // which needs no further consent and must not become unreachable when the
+  // consent box is cleared. A connected Mac on a build without the v1.0
+  // capability has nothing left to do here, so the button says so and rests.
   button.disabled = communityConnectBusy
+    || (connected && !incrementalSyncCapabilityAdvertised())
     || (!connected
       && (enrollmentPaused || hostedSignInRequired() || !consent.checked));
   if (!communityConnectBusy) {
     if (connected) {
-      setProductText(button, "Review contribution");
+      setProductText(button, incrementalSyncCapabilityAdvertised()
+        ? "Review and approve"
+        : "Connected");
     } else if (enrollmentPaused) {
       setLocalizedText(button, "contribution.enrollmentPausedButton");
     } else if (hostedSignInRequired()) {
@@ -7545,9 +7575,10 @@ function renderCommunityJourney() {
   if (dashboard && dashboard.mode !== "demo" && history?.status === "complete") {
     stage("index", "done", "journey.index.complete");
   } else if (dashboard && dashboard.mode !== "demo" && totalSources > 0) {
-    stage("index", "progress", "dashboard.history.indexingSources", {
-      bytesIndexed: formatBytes(history.indexedBytes),
-      bytesTotal: formatBytes(history.sourceBytes),
+    // The same measured counts the history progress surface reports, stated
+    // as one short sentence: the two-sentence byte breakdown wrapped this
+    // card to eight lines (owner-directed tightening, 2026-08-08).
+    stage("index", "progress", "journey.index.progress", {
       indexed: formatNumber(finite(history.indexedSourceCount, 0)),
       total: formatNumber(totalSources),
     });
@@ -7566,13 +7597,21 @@ function renderCommunityJourney() {
     stage("evidence", "action", "journey.evidence.missing");
   }
 
-  // 4 — sign in and connect, before any effort is invested below.
+  // 4 — sign in and connect, before any effort is invested below. Once this
+  // Mac is connected the line states the final flow's remaining truth:
+  // approve once, then it syncs automatically.
   if (localCompanionHealth === null) {
     stage("community", "waiting", "journey.community.waitingCompanion");
   } else if (!contributionServiceConfigured()) {
     stage("community", "waiting", "journey.community.noService");
   } else if (communityUploadAuthorityEvidence()) {
-    stage("community", "done", "journey.community.connected");
+    if (!incrementalSyncCapabilityAdvertised()) {
+      stage("community", "done", "journey.community.connected");
+    } else if (incrementalConsentApproved) {
+      stage("community", "done", "journey.community.syncing");
+    } else {
+      stage("community", "action", "journey.community.approveNext");
+    }
   } else if (hostedEnrollmentIsPaused()) {
     stage("community", "waiting", "journey.community.paused");
   } else if (hostedSignInRequired()) {
@@ -7613,6 +7652,7 @@ function renderIncrementalConsent() {
   const gate = $("#incremental-consent-gate");
   const chip = $("#incremental-consent-state");
   const reviewVerified = contributionSyncExactReview?.state === "ready";
+  const authorized = communityAuthorizationSatisfied();
   setLocalizedText(chip, incrementalConsentApproved
     ? "consent.stateApproved"
     : "consent.stateNotApproved");
@@ -7622,17 +7662,115 @@ function renderIncrementalConsent() {
   approve.disabled = incrementalConsentBusy
     || incrementalConsentApproved
     || !reviewVerified
-    || !communityAuthorizationSatisfied();
+    || !authorized;
+  // The review the approve gate requires, on screen: the verified prepared
+  // instance's own facts. They come from the same queue item the one-use
+  // token was minted for, and they leave with approval — the card then
+  // describes the running sync instead.
+  const facts = $("#incremental-review-facts");
+  const item = contributionSyncPreview?.item;
+  if (facts) {
+    const show = !incrementalConsentApproved && reviewVerified && item != null;
+    facts.hidden = !show;
+    if (show) {
+      setRawText(
+        $("#incremental-review-coverage"),
+        `${formatLocal(item.coveredAt.startAt)} – ${formatLocal(item.coveredAt.endAt)}`,
+      );
+      setRawText(
+        $("#incremental-review-records"),
+        `${compact(item.recordCounts.total)} total · ${compact(item.recordCounts.usageEvents)} usage · ${compact(item.recordCounts.quotaSnapshots)} quota`,
+      );
+      setRawText(
+        $("#incremental-review-bytes"),
+        `${compact(item.preparedBytes)} bytes, verified on this Mac`,
+      );
+    }
+  }
   if (incrementalConsentApproved) {
     forgetLocalizedNode(gate);
     gate.textContent = "";
     gate.hidden = true;
   } else {
     gate.hidden = false;
-    setLocalizedText(gate, reviewVerified
-      ? "consent.readyToApprove"
-      : "consent.reviewFirst");
+    // Why Approve is off, stated where Approve is, in gate order: the
+    // missing sign-in or connection first, then the in-flight review.
+    setLocalizedText(gate, !authorized
+      ? (hostedSignInRequired()
+        ? "consent.signInFirst"
+        : "consent.connectFirst")
+      : reviewVerified
+        ? "consent.readyToApprove"
+        : "consent.reviewFirst");
   }
+  renderIncrementalSyncStatusLine();
+}
+
+/**
+ * The modest status line for the approved sync, from the companion's bounded
+ * incremental-status projection: days synced and pending, the paused reason
+ * code, and the last error code. Every value is a number or a fixed
+ * vocabulary code the projection validated; no path, content, or identifier
+ * can reach this line.
+ */
+function renderIncrementalSyncStatusLine() {
+  const line = $("#incremental-sync-status");
+  if (!line) return;
+  if (!incrementalSyncCapabilityAdvertised()
+      || !incrementalConsentApproved
+      || incrementalSyncStatus?.status !== "available") {
+    forgetLocalizedNode(line);
+    line.textContent = "";
+    line.hidden = true;
+    return;
+  }
+  const progress = incrementalSyncStatus.progress;
+  const parts = [
+    progress === null
+      ? t("consent.syncNoProgress")
+      : t("consent.syncProgress", {
+        pending: formatNumber(progress.daysPending),
+        synced: formatNumber(progress.daysSynced),
+        total: formatNumber(progress.daysTotal),
+      }),
+  ];
+  if (incrementalSyncStatus.paused) {
+    parts.push(t("consent.syncPaused", {
+      reason: incrementalSyncStatus.pausedReason ?? "unknown",
+    }));
+  }
+  const outcome = incrementalSyncStatus.lastOutcome;
+  if (outcome !== null && outcome.status !== "succeeded") {
+    parts.push(t("consent.syncLastError", { code: outcome.code }));
+  }
+  // A composed multi-part sentence: raw write, like the other composed
+  // status lines, so a stale registry entry cannot resurrect over it.
+  setRawText(line, parts.join(" "));
+  line.hidden = false;
+}
+
+/**
+ * Re-read the bounded incremental sync status. It carries the durable
+ * consent verdict — so an approved Mac renders as approved after a reload —
+ * and the progress facts the status line prints.
+ */
+async function loadIncrementalSyncStatus() {
+  if (!incrementalSyncCapabilityAdvertised()) {
+    incrementalSyncStatus = null;
+    incrementalConsentApproved = false;
+    renderContributionActionState();
+    return;
+  }
+  incrementalSyncStatus = await localClient.incrementalContributionSyncStatus();
+  // Only an available projection may change the consent verdict: a transient
+  // read failure normalizes to a fail-closed shape whose false consent must
+  // not un-approve a Mac the companion just recorded an approval for.
+  if (incrementalSyncStatus?.status === "available") {
+    incrementalConsentApproved =
+      incrementalSyncStatus.consent.approved === true
+      && incrementalSyncStatus.consent.current === true;
+  }
+  renderContributionActionState();
 }
 
 async function approveIncrementalContribution() {
@@ -7660,6 +7798,9 @@ async function approveIncrementalContribution() {
     }
     incrementalConsentApproved = true;
     setLocalizedText(status, "consent.approved");
+    // The engine starts uploading on its own after approval; read its
+    // bounded status once so the days-synced line appears immediately.
+    await loadIncrementalSyncStatus().catch(() => {});
   } catch (error) {
     await showFailure(status, {
       surface: "automatic_contribution",
@@ -7669,14 +7810,16 @@ async function approveIncrementalContribution() {
     });
   } finally {
     incrementalConsentBusy = false;
-    renderIncrementalConsent();
+    renderContributionActionState();
   }
 }
 
-// The primary button routes to whichever action its current label names.
+// The primary button routes to whichever action its current label names:
+// connect this Mac, or open the approve-once surface — the only contribution
+// flow (owner-directed, 2026-08-08).
 async function runCommunityPrimaryAction() {
   if (communityContributionIsConnected()) {
-    openContributionReview();
+    openIncrementalConsent();
     return;
   }
   await connectCommunityContribution();
@@ -7826,26 +7969,16 @@ const CONTRIBUTION_CONNECT_STEPS = Object.freeze({
     failure:
       "The pairing was not completed, so this Mac is not connected. Nothing was uploaded; retrying is safe.",
   }),
+  // The two local follow-up steps that used to follow — preparing and
+  // verifying a reviewable summary — moved into the approve card's own
+  // invisible bootstrap when the prepare surface was removed (owner-directed,
+  // 2026-08-08), so their failures now report on that card instead of here.
   queue_refresh: Object.freeze({
     connects: false,
     progress: "Reading the local contribution queue…",
     stopped: "This Mac is connected. Reading its local contribution queue did not finish.",
     failure:
-      "Nothing was uploaded. Use Prepare and review below to try again.",
-  }),
-  local_preparation: Object.freeze({
-    connects: false,
-    progress: "Preparing a local summary for you to review…",
-    stopped: "This Mac is connected. Preparing a local summary did not finish.",
-    failure:
-      "Nothing was uploaded. Choose a shorter window under Prepare and review below.",
-  }),
-  local_review: Object.freeze({
-    connects: false,
-    progress: "Verifying the prepared summary…",
-    stopped: "This Mac is connected and a summary was prepared. Verifying that summary did not finish.",
-    failure:
-      "Nothing was uploaded. Use Check summary again below.",
+      "Nothing was uploaded. The approve card below updates once the local queue can be read; retrying is safe.",
   }),
 });
 
@@ -7878,12 +8011,13 @@ function contributionConnectStepOf(error) {
     : null;
 }
 
-function openContributionReview() {
-  const disclosure = $("#community-contribution-disclosure");
-  if (disclosure) disclosure.open = true;
-  const review = $("#contribution-review");
-  review?.scrollIntoView?.({ block: "start", behavior: "instant" });
-  const heading = review?.querySelector?.("h3");
+// Bring the reader to the approve-once surface — the only contribution flow.
+// (openContributionReview left with the prepare disclosure it opened.)
+function openIncrementalConsent() {
+  const surface = $("#incremental-consent");
+  if (!surface || surface.hidden) return;
+  surface.scrollIntoView?.({ block: "start", behavior: "instant" });
+  const heading = surface.querySelector?.("h3");
   if (heading) {
     heading.setAttribute("tabindex", "-1");
     heading.focus?.({ preventScroll: true });
@@ -7985,6 +8119,9 @@ async function connectCommunityContribution() {
   // --- Connected. Everything below is local follow-up. --------------------
   // A failure here is not a connection failure and must never be reported as
   // one: the pairing stands, and the user can retry the local step alone.
+  // The queue refresh re-renders the approve-once surface, whose invisible
+  // bootstrap then prepares and verifies the reviewable instance by itself —
+  // the old explicit local_preparation/local_review steps live there now.
   $("#community-connect-consent").checked = false;
   communityConnectBusy = false;
   updateCommunityConnectButton();
@@ -7995,27 +8132,12 @@ async function connectCommunityContribution() {
         loadCommunityResults(),
       ]);
     });
-    openContributionReview();
-    await contributionConnectStep(
-      "local_preparation",
-      status,
-      () => prepareLocalContribution(),
-    );
-    // The summary card verifies itself when the prepared set lands, so this
-    // step usually finds the verification already done and only covers the
-    // case where that automatic pass has not run yet.
-    if (contributionSyncPreview?.state === "ready"
-        && contributionSyncExactReview?.state !== "ready") {
-      await contributionConnectStep(
-        "local_review",
-        status,
-        () => reviewPreparedSummary({ refreshFirst: false }),
-      );
-    }
+    openIncrementalConsent();
     status.hidden = false;
     status.className = "participant-action-status";
-    status.textContent =
-      "Connected. Look at the summary below before deciding whether to send it. Nothing will repeat automatically.";
+    status.textContent = incrementalSyncCapabilityAdvertised()
+      ? "Connected. Review the covered data on the approve card below; approval is asked once and nothing uploads without it."
+      : "Connected. This build has no automatic contribution to approve, and nothing uploads by itself.";
   } catch (error) {
     await reportContributionConnectFailure(status, error, {
       enrollmentAttemptedWithHostedIdentity: false,
@@ -8067,250 +8189,25 @@ async function reportContributionConnectFailure(status, error, {
   }
 }
 
-function contributionPreparationEstimate(
-  data = dashboard,
-  lookbackHours = activeContributionLookbackHours,
-  admission = participantContributionAdmission,
-) {
-  if (!data || data.mode === "demo") return null;
-  const referenceMs = Date.parse(data.freshness?.latestObservedAt);
-  const endMs = Number.isFinite(referenceMs) ? referenceMs : Date.now();
-  const startMs = endMs - lookbackHours * 60 * 60 * 1_000;
-  const usageEvents = (data.timeline?.usage ?? []).reduce((total, row) => {
-    const rowEnd = Date.parse(row.endAt);
-    return Number.isFinite(rowEnd) && rowEnd >= startMs && rowEnd <= endMs
-      ? total + Math.max(0, Math.floor(finite(row.usageEvents, 0)))
-      : total;
-  }, 0);
-  const quotaSnapshots = (data.timeline?.quota ?? []).filter((row) => {
-    const observed = Date.parse(row.observedAt);
-    return Number.isFinite(observed) && observed >= startMs && observed <= endMs;
-  }).length;
-  const records = usageEvents + quotaSnapshots;
-  const batches = records > 0 ? Math.ceil(records / 200) : 0;
-  const batchAdmission = contributionBatchAdmission({
-    estimatedBatches: batches,
-    participantAdmission: admission,
-  });
-  return {
-    usageEvents,
-    quotaSnapshots,
-    records,
-    batches,
-    maximumSerializedBytes: batches * 1_310_720,
-    localReviewLimit: batchAdmission.localReviewLimit,
-    admissionKnown: batchAdmission.admissionKnown,
-    remainingBatches: batchAdmission.remainingBatches,
-    maximumBatches: batchAdmission.maximumBatches,
-    renewsAt: batchAdmission.renewsAt,
-    effectiveBatchLimit: batchAdmission.effectiveBatchLimit,
-    exceedsLocalReviewLimit: batchAdmission.exceedsLocalReviewLimit,
-    exceedsParticipantAdmission:
-      batchAdmission.exceedsParticipantAdmission,
-    tooLarge: batchAdmission.blocked,
-    partial: ![
-      "recent_7d_complete",
-      "recent_7d_partial",
-      "prospective_only",
-    ].includes(data.collector?.indexing?.status),
-  };
-}
-
-function renderContributionPreparationEstimate() {
-  const element = $("#preparation-estimate");
-  const button = $("#prepare-contribution");
-  const estimate = contributionPreparationEstimate();
-  if (!element || !button) return null;
-  // Sign-in and connection come before any effort is invested: on a build
-  // with a contribution service, preparing waits until this Mac holds upload
-  // authority, and the reason is stated where the button is. A build with no
-  // service keeps local preparation — nothing can send there anyway.
-  if (!communityAuthorizationSatisfied()) {
-    setLocalizedText(element, hostedSignInRequired()
-      ? "prepareGate.signInFirst"
-      : "prepareGate.connectFirst");
-    if (!contributionPreparationBusy) button.disabled = true;
-    return null;
-  }
-  forgetLocalizedNode(element);
-  if (!estimate) {
-    element.textContent =
-      "Analyze your local usage first to see how much would be included.";
-    if (!contributionPreparationBusy) button.disabled = false;
-    return null;
-  }
-  if (estimate.records === 0) {
-    element.textContent =
-      "Nothing to share in this period. Choose a longer period, or analyze your local usage again.";
-  } else {
-    const coverage = estimate.partial
-      ? " The local index is partial, so the exact count may be higher."
-      : "";
-    const renews = estimate.renewsAt
-      ? ` The participant allowance renews ${formatLocal(estimate.renewsAt)}.`
-      : "";
-    if (estimate.exceedsParticipantAdmission) {
-      element.textContent = estimate.remainingBatches === 0
-        ? `This participant has no community batch allowance remaining.${renews} Wait for renewal before preparing another reviewed set. No local preparation or upload has started.`
-        : `Preflight estimates ${compact(estimate.batches)} batches, above this participant’s ${compact(estimate.remainingBatches)} remaining community batch${estimate.remainingBatches === 1 ? "" : "es"}.${renews} Choose a shorter window or wait for renewal before preparing.${coverage}`;
-    } else if (estimate.exceedsLocalReviewLimit) {
-      element.textContent =
-        `Preflight estimates ${compact(estimate.records)} records across ${compact(estimate.batches)} batches, above the local ${compact(estimate.localReviewLimit)}-batch reviewed-set safety cap. Choose a shorter window before preparing.${coverage}`;
-    } else {
-      const admission = estimate.admissionKnown
-        ? ` This participant has ${compact(estimate.remainingBatches)} of ${compact(estimate.maximumBatches)} community batches remaining${estimate.renewsAt ? ` until ${formatLocal(estimate.renewsAt)}` : ""}.`
-        : " Community batch allowance is unknown until this Mac is connected; the service checks it again before accepting any upload.";
-      element.textContent =
-        `Preflight estimates ${compact(estimate.records)} records across about ${compact(estimate.batches)} batch${estimate.batches === 1 ? "" : "es"} (${compact(estimate.maximumSerializedBytes)} bytes worst-case). Exact counts and bytes are independently verified before queueing; no wall-clock ETA is inferred from record count.${admission}${coverage}`;
-    }
-  }
-  if (!contributionPreparationBusy) {
-    button.disabled = estimate.records === 0 || estimate.tooLarge;
-  }
-  return estimate;
-}
-
-async function prepareLocalContribution() {
-  if (contributionPreparationBusy) return;
-  // The connect flow calls this only after pairing, so this guard fires only
-  // for a direct click that raced the gate; it repeats the same reason.
-  if (!communityAuthorizationSatisfied()) {
-    const status = $("#prepare-contribution-status");
-    status.classList.add("error");
-    setLocalizedText(status, hostedSignInRequired()
-      ? "prepareGate.signInFirst"
-      : "prepareGate.connectFirst");
-    return;
-  }
-  const estimate = renderContributionPreparationEstimate();
-  if (estimate?.tooLarge) {
-    const status = $("#prepare-contribution-status");
-    forgetLocalizedNode(status);
-    status.classList.add("error");
-    status.textContent = estimate.exceedsParticipantAdmission
-      ? `This interval is estimated to exceed the participant’s remaining community allowance${estimate.renewsAt ? `, which renews ${formatLocal(estimate.renewsAt)}` : ""}. Choose a shorter window or wait for renewal. No preparation or upload started.`
-      : "This interval is estimated to exceed the local 100-batch reviewed-set safety cap. Choose a shorter window. No preparation or upload started.";
-    return;
-  }
-  contributionPreparationBusy = true;
-  const button = $("#prepare-contribution");
-  const status = $("#prepare-contribution-status");
-  // The gate above may have registered a localized sentence on this node; the
-  // direct writes below own it again.
-  forgetLocalizedNode(status);
-  button.disabled = true;
-  button.textContent = "Preparing locally…";
-  status.classList.remove("error");
-  const lookbackLabel = activeContributionLookbackHours === 1
-    ? "latest hour"
-    : activeContributionLookbackHours === 24
-      ? "last 24 hours"
-      : "last seven days";
-  status.textContent =
-    `Building and independently verifying content-free evidence from the ${lookbackLabel}. No network upload is performed.`;
-  clearContributionSyncExactReview();
-  // A fresh preparation may reproduce byte-identical facts; it must still
-  // verify itself again, so the once-per-set marker is cleared with the token.
-  contributionSyncAutoReviewedKey = null;
-  try {
-    const result = await localClient.prepareContribution({
-      lookbackHours: activeContributionLookbackHours,
-    });
-    if (result.status !== "prepared") {
-      const error = new Error("Preparation did not return a verified contribution.");
-      error.code = "preparation_failed";
-      throw error;
-    }
-    const records = result.recordCounts.usageEvents
-      + result.recordCounts.quotaSnapshots
-      + result.recordCounts.activityMarkers;
-    const coveredLabel = result.coveredAt?.startAt && result.coveredAt?.endAt
-      ? ` covering ${formatLocal(result.coveredAt.startAt)} through ${formatLocal(result.coveredAt.endAt)}`
-      : "";
-    status.textContent =
-      `Prepared ${compact(result.prepared.batchCount)} verified batch${result.prepared.batchCount === 1 ? "" : "es"} with ${compact(records)} safe records (${compact(result.prepared.bytes)} bytes)${coveredLabel}. Nothing was uploaded.`;
-    await refreshContributionSyncControls();
-  } catch (error) {
-    status.classList.add("error");
-    const preparationMessages = {
-      identity_unavailable:
-        "The local Keychain identity is unavailable. Open Keychain Access, select the login Keychain, unlock it, then retry. Do not reset, delete, rotate, or broaden access to the identity. No upload occurred.",
-      coverage_unavailable:
-        "No usable local coverage is available yet. Analyze local usage first. No upload occurred.",
-      coverage_invalid:
-        "The selected local coverage interval is not usable for a contribution. No upload occurred.",
-      no_safe_records:
-        "No privacy-safe records were found in the selected interval. No upload occurred.",
-      export_too_large:
-        activeContributionLookbackHours > 24
-          ? "Seven days exceeded the current single reviewed-set safety cap. Try 24 hours; on a very active history, use 1 hour. Nothing was truncated or uploaded."
-          : activeContributionLookbackHours === 24
-            ? "This high-activity 24-hour interval exceeded the current single reviewed-set safety cap. Choose 1 hour. Nothing was truncated or uploaded; longer dense intervals need the planned locally aggregated export format."
-            : "The latest hour exceeded a fixed reviewed-set safety bound. Nothing was truncated or uploaded.",
-      privacy_verification_failed:
-        "Privacy verification rejected the prepared data, so it was not queued or uploaded.",
-      preparation_in_progress:
-        "A local preparation is already running. Nothing has been uploaded.",
-      review_archive_invalid:
-        "TiboTattle could not save the copy you would review, so nothing was queued and nothing was uploaded.",
-      prepared_spool_invalid:
-        "The place TiboTattle keeps a prepared summary on this Mac is not usable, so nothing was queued and nothing was uploaded.",
-      preparation_failed:
-        "A privacy-verified contribution could not be prepared. No upload occurred and incomplete staging is ignored by the queue."
-    };
-    status.textContent = (await describeFailure({
-      surface: "contribution_prepare",
-      error,
-      messages: preparationMessages,
-      fallback:
-        "A privacy-verified contribution could not be prepared. No upload occurred and incomplete staging is ignored by the queue."
-    })).text;
-  } finally {
-    contributionPreparationBusy = false;
-    button.disabled = false;
-    button.textContent = activeContributionLookbackHours === 1
-      ? "Prepare and review latest hour"
-      : activeContributionLookbackHours === 24
-        ? "Prepare and review last 24 hours"
-        : "Prepare and review last 7 days";
-    renderContributionPreparationEstimate();
-  }
-}
+// The preparation preflight estimate and its lookback picker left with the
+// prepare surface (owner-directed, 2026-08-08). Size limits are enforced by
+// the companion itself during the silent review bootstrap, which narrows the
+// window on export_too_large instead of asking the reader to.
 
 async function loadCommunityResults() {
   const centralConfigured = localCompanionHealth === null
     || localCompanionHealth?.capabilities?.centralServiceProxy === true;
   if (!centralConfigured) {
-    participantContributionAdmission = null;
     communityServiceHealth = null;
     renderHostedIdentity();
-    renderContributionPreparationEstimate();
     return;
   }
   try {
-    const [healthResult, profileResult] = await Promise.allSettled([
-      communityClient.health(),
-      communitySession?.csrfToken
-        ? communityClient.participantProfile()
-        : Promise.resolve(null),
-    ]);
-    communityServiceHealth = healthResult.status === "fulfilled"
-      ? healthResult.value
-      : null;
-    renderHostedIdentity();
-    const normalizedProfile = normalizeParticipantHistory(
-      profileResult.status === "fulfilled" ? profileResult.value : null,
-    );
-    participantContributionAdmission = normalizedProfile.state === "ready"
-      ? normalizedProfile.contributionAdmission
-      : null;
-    renderContributionPreparationEstimate();
+    communityServiceHealth = await communityClient.health();
   } catch {
-    participantContributionAdmission = null;
     communityServiceHealth = null;
-    renderHostedIdentity();
-    renderContributionPreparationEstimate();
   }
+  renderHostedIdentity();
 }
 
 async function restoreCommunitySession() {
@@ -8340,22 +8237,6 @@ $("#open-installed-app").addEventListener("click", openInstalledApp);
 $("#connection-check").addEventListener("click", checkLocalSetup);
 $("#companion-check").addEventListener("click", checkLocalSetup);
 $("#setup-check-again").addEventListener("click", checkLocalSetup);
-$("#contribution-lookback-controls").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-lookback-hours]");
-  if (!button || contributionPreparationBusy) return;
-  activeContributionLookbackHours = Number(button.dataset.lookbackHours);
-  for (const control of $("#contribution-lookback-controls").querySelectorAll("button")) {
-    const active = control === button;
-    control.classList.toggle("active", active);
-    control.setAttribute("aria-pressed", String(active));
-  }
-  $("#prepare-contribution").textContent = activeContributionLookbackHours === 1
-    ? "Prepare and review latest hour"
-    : activeContributionLookbackHours === 24
-      ? "Prepare and review last 24 hours"
-      : "Prepare and review last 7 days";
-  renderContributionPreparationEstimate();
-});
 $("#identity-google-signin").addEventListener("click", () => {
   void beginHostedSignIn("google");
 });
@@ -8387,14 +8268,13 @@ $("#contribution-not-now").addEventListener("click", () => {
   status.textContent =
     "Nothing will be contributed. Your local reporting continues unchanged.";
 });
-$("#prepare-contribution").addEventListener("click", prepareLocalContribution);
 $("#demo-button").addEventListener("click", () => renderDashboard(demoDashboard()));
-// The redundant reveal click is gone: the summary card verifies itself, and
-// the only review control left is the explicit re-check after a failure.
-$("#sync-review-retry").addEventListener("click", () => {
-  void reviewPreparedSummary();
+// The prepare, lookback, and send controls left with the legacy prepare flow
+// (owner-directed, 2026-08-08). The approve card's only companion control is
+// the error-recovery re-check for its invisible review bootstrap.
+$("#incremental-review-retry").addEventListener("click", () => {
+  void retryIncrementalReviewBootstrap();
 });
-$("#sync-run-once").addEventListener("click", () => runContributionSyncAction("run"));
 $("#incremental-consent-approve").addEventListener("click", () => {
   void approveIncrementalContribution();
 });

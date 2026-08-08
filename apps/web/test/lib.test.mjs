@@ -53,6 +53,7 @@ import {
   normalizeContributionSyncStatus,
   normalizeContributionSyncPreview,
   normalizeContributionSyncRun,
+  normalizeIncrementalContributionSyncStatus,
   normalizeContributionDeletionReceipt,
   normalizeBackendReadiness,
   normalizeAutomaticContributionStatus,
@@ -337,7 +338,8 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
     "document", "ResizeObserver", "adaptiveChartTickCount", "finite",
     "formatChartTimestamp", "formatMoney", "formatDecimal", "formatPercent",
     "formatPp", "formatChartTimeLabel", "formatTimeZoneLabel", "timelineStatusKey",
-    "setRawText", "setLocalizedText", "t", "tPlural", "shareCardDateLabel",
+    "setRawText", "setLocalizedText", "setLocalizedPluralText", "t", "tPlural",
+    "shareCardDateLabel", "ALL_HISTORY_RANGE_DAYS",
     "$", "clear", "node", "formatLocal", "renderWeeklyPaceForecast",
     "activeWeeklyRangeDays", "activeWeeklyMinimumObservedSpanPp",
     `${section}\nreturn renderWeekly;`,
@@ -356,9 +358,13 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
     (status) => `chart.status.${status}`,
     (target, value) => { target.textContent = String(value); },
     (target, key, values = {}) => { target.textContent = translate(key, values, locale); },
+    (target, key, count, values = {}) => {
+      target.textContent = translatePlural(key, count, values, locale);
+    },
     (key, values = {}) => translate(key, values, locale),
     (key, count, values = {}) => translatePlural(key, count, values, locale),
     (at) => new Date(at).toISOString().slice(0, 10),
+    36_500,
     element,
     () => {},
     () => ({ append() {}, textContent: "" }),
@@ -374,6 +380,7 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
     range: element("#weekly-range").textContent,
     explanation: element("#weekly-explanation").textContent,
     timeZone: element("#weekly-chart-timezone").textContent,
+    empty: element("#weekly-empty"),
   };
 }
 
@@ -4100,17 +4107,19 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /id="community"/u);
   assert.match(html, /https:\/\/tibotattle\.com\/#community/u);
   assert.match(html, /id="community-connect-consent"/u);
-  assert.match(html, /id="prepare-contribution"/u);
-  // Re-pinned 2026-08-07 (guided-journey redesign): the separate "Review
-  // summary" button revealed exactly the facts the summary card already
-  // printed, so the click was the defect and is collapsed — the card verifies
-  // itself. The review-token GATE survives: Send still requires the exact
-  // local verification (pinned in the concise-review test below). The journey
-  // strip states each stage's measured state at the top of the community
-  // section.
+  // Re-pinned 2026-08-08 (owner-directed): the legacy prepare-and-review
+  // flow — lookback picker, prepare button, summary card and Send — is
+  // removed outright, extending the sync-inspect tombstone to the whole
+  // surface. The approve-once card (telemetry-contribution-v1.0) is the ONLY
+  // contribution flow; its review bootstrap runs invisibly and the
+  // review-token GATE survives on Approve (pinned in the approve-once test
+  // below). The journey strip still states each stage's measured state.
   assert.doesNotMatch(html, /id="sync-inspect"/u);
+  assert.doesNotMatch(html, /id="prepare-contribution"/u);
+  assert.doesNotMatch(html, /id="sync-run-once"/u);
+  assert.doesNotMatch(html, /id="community-contribution-disclosure"/u);
   assert.match(html, /id="community-journey"/u);
-  assert.match(html, /id="sync-run-once"/u);
+  assert.match(html, /id="incremental-consent"/u);
   for (const retiredControl of [
     'id="central-state"',
     'id="backend"',
@@ -4200,8 +4209,10 @@ test("first run is a truthful install and local preflight journey", async () => 
   assert.match(html, /id="setup-check-again"/u);
   assert.match(html, /id="refresh-button"[^>]*disabled/u);
   assert.match(html, /data-requires-evidence/u);
-  assert.match(html, /id="community-contribution-disclosure"/u);
-  assert.match(html, /Nothing sends automatically/u);
+  // Re-pinned 2026-08-08 (owner-directed): the prepare-and-review disclosure
+  // is gone; the approve-once card carries the no-silent-upload promise now.
+  assert.doesNotMatch(html, /id="community-contribution-disclosure"/u);
+  assert.match(html, /Approval is asked once\./u);
   assert.match(styles, /native-dashboard #setup-card/u);
   assert.match(appSource, /card\.hidden = true;[\s\S]*?card\.setAttribute\("aria-hidden", "true"\)/u);
 
@@ -4323,7 +4334,9 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.doesNotMatch(appSource, /accounting\.pricing\.evidenceStarts/);
   assert.match(styles, /native-dashboard #setup-card/);
   assert.match(appSource, /timelineStatusLabel/);
-  assert.match(appSource, /recent_7d_partial/);
+  // The `recent_7d_partial` pin lived in the preparation preflight estimate,
+  // which left with the prepare flow (owner-directed, 2026-08-08); partial
+  // index handling stays pinned through the coverage labels below.
   assert.match(appSource, /historyCoverageLabel|thirtyDayCoverageWarning/u);
   assert.match(appSource, /chart\.status\.resetOrTrackChange/u);
   assert.match(appSource, /chart\.status\.backwardOrAmbiguous/u);
@@ -4331,8 +4344,10 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.match(html, /id="calibration-range-controls"/);
   assert.match(html, /id="weekly-range-controls"/);
   assert.match(html, /id="weekly-partial-legend"/);
-  assert.match(html, /id="contribution-lookback-controls"/);
-  assert.match(html, /Prepare and review last 24 hours/);
+  // Re-pinned 2026-08-08 (owner-directed): the contribution lookback picker
+  // and prepare button are removed with the legacy prepare flow.
+  assert.doesNotMatch(html, /id="contribution-lookback-controls"/);
+  assert.doesNotMatch(html, /Prepare and review last 24 hours/);
   // Owner decision 2026-08-06: the calibration chart leads Trends and its
   // disclosure is open by default. The previous assertion pinned the opposite
   // order, on the reviewed consumer hierarchy that a first-time reader should
@@ -4355,7 +4370,10 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.doesNotMatch(appSource, /activeWindowHours/u);
   assert.match(appSource, /row\?\.last_observed_at \?\? row\?\.first_observed_at/);
   assert.match(appSource, /label: \{ key: "weekly\.series\.shortObservation" \}/u);
-  assert.match(appSource, /lookbackHours: activeContributionLookbackHours/);
+  // The user-selected lookback left with the prepare flow (owner-directed,
+  // 2026-08-08): the silent review bootstrap owns the fixed 24h→1h fallback.
+  assert.match(appSource, /lookbackHours: 24/);
+  assert.doesNotMatch(appSource, /activeContributionLookbackHours/u);
   assert.match(styles, /interactive-chart/);
   assert.match(styles, /chart-status-missing/);
   assert.match(styles, /touch-action: pan-y/);
@@ -4527,10 +4545,29 @@ test("the weekly headline is a stable all-data median and says so on screen", as
   for (const view of views) {
     assert.match(view.explanation, /never moves with the controls below/u);
     assert.match(view.explanation, /drawing \d+ of 52 estimates/u);
+    // The range is anchored at the newest fit, and the sentence says so
+    // (estimator audit, 2026-08-08): "7d" is seven days back from that fit,
+    // not from today.
+    assert.match(view.explanation, /anchored at the newest fit \(2026-07-29\)/u);
   }
-  assert.match(views[0].explanation, /drawing 1 of 52/u);
+  // Re-pinned 2026-08-08 (estimator audit): a 7-day window over a per-reset
+  // series holds one or two fits, so the short range relaxes the span floor
+  // to zero instead of filtering the window near-empty. Both weekly fits in
+  // range draw — the 22pp one as an outlined short observation — and the
+  // sentence names the relaxed floor.
+  assert.match(views[0].explanation, /drawing 2 of 52/u);
+  assert.match(views[0].explanation, /any length/u);
   assert.match(views[2].explanation, /drawing 34 of 52/u);
   assert.match(views[3].explanation, /drawing 52 of 52/u);
+  // An empty chart names its reason with numbers instead of the generic
+  // sentence (estimator audit, 2026-08-08): at a 90pp floor every fit in
+  // range is filtered, and the message says exactly that.
+  assert.equal(views[4].empty.hidden, false);
+  assert.equal(
+    views[4].empty.textContent,
+    "52 fits are in range, all below the 90pp span floor.",
+  );
+  assert.equal(views[0].empty.hidden, true);
   assert.equal(views[0].timeZone, "Times shown in Eastern Time.");
 
   const spanish = await renderWeeklyHero(data, { span: 50, rangeDays: 31, locale: "es" });
@@ -4877,7 +4914,11 @@ test("weekly points carry measured ranges with pointer and keyboard detail", asy
   assert.match(appSource, /weekly\.point\.detail/u);
   assert.match(appSource, /if \(errorBars\.tooltip !== false\)/u);
   assert.match(styles, /\.chart-error-bar-weekly \.chart-error-bar-line/u);
-  assert.match(html, /Each reset estimate is shown with the range supported/u);
+  // Re-pinned 2026-08-08 (estimator audit): the caption stopped presenting
+  // the within-reset slope spread as a supported/measured range and now names
+  // it a slope-agreement diagnostic, matching the calibration report.
+  assert.match(html, /Each reset estimate is drawn with its slope-agreement range/u);
+  assert.match(html, /a within-reset disagreement diagnostic,\s*\n?\s*not a confidence interval/u);
   // The assertion `/markers: false,\s*hitTargets: true/` used to sit here. It
   // asserted the defect: it required the allowance chart's reset estimates to
   // be drawn as invisible hit targets, so restoring the owner's plotted points
@@ -5196,7 +5237,11 @@ test("weekly details keep reset evidence concise and do not present speed covera
   const tableSource = tableMatch[1];
 
   assert.match(html, /<summary>See individual usage changes<\/summary>/u);
-  assert.match(html, /<th scope="col">Observed<\/th>[\s\S]*?<th scope="col">Observed span<\/th>[\s\S]*?<th scope="col">Estimate<\/th>[\s\S]*?<th scope="col">Measured range<\/th>[\s\S]*?<th scope="col">Status<\/th>/u);
+  // Re-pinned 2026-08-08 (estimator audit): the per-reset bars are the
+  // p10–p90 spread of pairwise slopes WITHIN a reset — a disagreement
+  // diagnostic. Every surface now calls them the slope-agreement range
+  // instead of a measured range, which overclaimed a confidence interval.
+  assert.match(html, /<th scope="col">Observed<\/th>[\s\S]*?<th scope="col">Observed span<\/th>[\s\S]*?<th scope="col">Estimate<\/th>[\s\S]*?<th scope="col">Slope-agreement range<\/th>[\s\S]*?<th scope="col">Status<\/th>/u);
   assert.doesNotMatch(html, /Evidence available \/ reset due|Speed known|Known speed coverage/u);
   assert.doesNotMatch(tableSource, /resetDueAt|speedCoverage|known_speed_fraction/u);
   assert.match(tableSource, /weekly\.table\.wellObserved/u);
@@ -5255,38 +5300,54 @@ test("community UI stays focused on one reviewed destination", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   assert.match(html, /id="community"/u);
   assert.match(html, /id="community-connect-consent"/u);
-  assert.match(html, /id="community-contribution-disclosure"/u);
-  // Re-pinned 2026-08-07 (guided-journey redesign): the reveal button is
-  // collapsed — the summary card is the review — and the only review control
-  // left is the explicit re-check offered after a failed verification.
+  // Re-pinned 2026-08-08 (owner-directed): the prepare-and-review disclosure
+  // is removed outright — the approve-once surface is the one reviewed
+  // destination. The only review control left is the error-recovery re-check
+  // for the invisible bootstrap, and it lives on the approve card.
   assert.doesNotMatch(html, /id="sync-inspect"/u);
-  assert.match(html, /id="sync-review-retry"/u);
-  assert.match(html, /id="sync-run-once"/u);
+  assert.doesNotMatch(html, /id="community-contribution-disclosure"/u);
+  assert.doesNotMatch(html, /id="sync-review-retry"/u);
+  assert.doesNotMatch(html, /id="sync-run-once"/u);
+  assert.match(html, /id="incremental-consent"/u);
+  assert.match(html, /id="incremental-review-retry"[^>]*hidden/u);
   assert.match(html, /See what the community published/u);
   assert.match(html, /https:\/\/tibotattle\.com\/#community/u);
   assert.doesNotMatch(html, /Community backend readiness|data lifecycle|Your contributed evidence/iu);
   assert.doesNotMatch(appSource, /renderBackendHealth|renderPersonalStats|renderCommunitySnapshot/u);
-  assert.doesNotMatch(appSource, /backend-readiness-note|central-state|automatic-contribution/u);
+  assert.doesNotMatch(appSource, /backend-readiness-note|central-state|automatic-contribution-toggle/u);
 });
 
-test("local contribution preparation exposes fixed lookbacks and fails dense weeks closed", async () => {
+test("the invisible review bootstrap keeps fixed lookbacks and fails dense days closed", async () => {
+  // Re-pinned 2026-08-08 (owner-directed): the user-facing lookback picker is
+  // gone with the prepare flow. The silent bootstrap still uses only the
+  // fixed windows — 24 hours, narrowing to the latest hour when the
+  // reviewed-set safety cap trips — and still fails closed rather than
+  // truncating.
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  for (const hours of [1, 24, 168]) {
-    assert.match(html, new RegExp(`data-lookback-hours="${hours}"`));
-  }
-  const defaultControl =
-    html.match(/<button[^>]*data-lookback-hours="24"[^>]*>/u)?.[0] ?? "";
-  assert.match(defaultControl, /\bactive\b/u);
-  assert.match(defaultControl, /aria-pressed="true"/u);
-  assert.match(appSource, /let activeContributionLookbackHours = 24;/u);
+  assert.doesNotMatch(html, /data-lookback-hours=/u);
+  assert.doesNotMatch(appSource, /activeContributionLookbackHours/u);
   assert.match(
     appSource,
+    /prepared = await localClient\.prepareContribution\(\{ lookbackHours: 24 \}\);/u,
+  );
+  assert.match(
+    appSource,
+    /if \(error\?\.code !== "export_too_large"\) throw error;\s*\n\s*prepared = await localClient\.prepareContribution\(\{ lookbackHours: 1 \}\);/u,
+  );
+  // The bootstrap announces itself as a local, non-uploading step through the
+  // consent card's own localized status line.
+  assert.match(
+    appSource,
+    /showIncrementalReviewStatusKey\("consent\.preparingReview"\)/u,
+  );
+  assert.match(
+    translate("consent.preparingReview"),
     /No network upload is performed\./u,
   );
   assert.match(
     appSource,
-    /Seven days exceeded the current single reviewed-set safety cap\. Try 24 hours; on a very active history, use 1 hour\. Nothing was truncated or uploaded\./u,
+    /Even the latest hour exceeded a fixed reviewed-set safety bound\. Nothing was truncated or uploaded\./u,
   );
 });
 
@@ -5318,21 +5379,20 @@ test("new enrollment pairs immediately and intentionally discards recovery capab
   assert.doesNotMatch(appSource, /showRecoveryCodeOnce/u);
 });
 
-test("contribution preflight explains estimated work and blocks over 100 batches", async () => {
+test("the browser-side preparation preflight is retired with the prepare flow", async () => {
+  // Tombstone, re-pinned 2026-08-08 (owner-directed): the preflight estimate,
+  // its participant-admission math, and its advisory copy described the
+  // removed user-facing prepare surface. Size limits stay enforced — by the
+  // companion during the silent review bootstrap, which fails closed and
+  // narrows the fixed window instead of asking the reader to.
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  assert.match(html, /id="preparation-estimate"/u);
-  assert.match(appSource, /function contributionPreparationEstimate\(/u);
-  assert.match(appSource, /maximumSerializedBytes: batches \* 1_310_720/u);
-  assert.match(appSource, /participantContributionAdmission/u);
-  assert.match(appSource, /remainingBatches/u);
-  assert.match(appSource, /renewsAt/u);
-  assert.match(appSource, /contributionBatchAdmission\(/u);
-  assert.match(appSource, /tooLarge: batchAdmission\.blocked/u);
-  assert.match(appSource, /above this participant’s/u);
-  assert.match(appSource, /Community batch allowance is unknown/u);
-  assert.match(appSource, /no wall-clock ETA is inferred/u);
-  assert.match(appSource, /No preparation or upload started/u);
+  assert.doesNotMatch(html, /id="preparation-estimate"/u);
+  assert.doesNotMatch(appSource, /contributionPreparationEstimate/u);
+  assert.doesNotMatch(appSource, /participantContributionAdmission/u);
+  assert.doesNotMatch(appSource, /contributionBatchAdmission\(/u);
+  assert.doesNotMatch(appSource, /no wall-clock ETA is inferred/u);
+  assert.match(appSource, /INCREMENTAL_PREPARATION_ERROR_COPY/u);
 });
 
 test("primary contribution journey connects the Mac for one reviewed send without exposing a pairing code", async () => {
@@ -5345,9 +5405,12 @@ test("primary contribution journey connects the Mac for one reviewed send withou
   ]) {
     assert.match(html, new RegExp(`id="${id}"`, "u"));
   }
-  assert.match(html, /Share one anonymous summary/u);
-  assert.match(html, /You see it\s+before anything is sent/u);
-  assert.match(html, /I want to review a summary and decide whether to send it/u);
+  // Re-pinned 2026-08-08 (owner-directed): the pitch copy states the final
+  // flow — sign in → connect → approve once → syncs automatically.
+  assert.match(html, /Contribute anonymous usage data/u);
+  assert.match(html, /approve once\./u);
+  assert.match(html, /You see the covered data before anything is sent/u);
+  assert.match(html, /I want to review the covered data and decide whether to approve it/u);
   // The primary button names the network action it performs.
   assert.match(html, /id="connect-community"[\s\S]{0,80}Connect this Mac/u);
   const consentTag =
@@ -5374,17 +5437,17 @@ test("primary contribution journey connects the Mac for one reviewed send withou
   assert.match(appSource, /localClient\.pairContributionDevice\(pairing\.pairingCode\)/u);
   assert.doesNotMatch(appSource, /recoveryCode/u);
   assert.doesNotMatch(appSource, /armAutomaticContributionAfterReviewedSend/u);
-  // Re-pinned 2026-08-07 (guided-journey redesign): the connect chain's local
-  // review step is now the same self-verification the summary card performs
-  // (`reviewPreparedSummary`); the old `inspectNextContribution` button
-  // handler is gone with the redundant click. The verification itself — and
-  // the token it mints — is unchanged.
+  // Re-pinned 2026-08-08 (owner-directed): after pairing, the connect flow
+  // routes the reader to the approve-once surface, whose invisible bootstrap
+  // owns preparation and the exact self-verification (`reviewPreparedSummary`
+  // — the minted-token gate is unchanged and pinned in the approve-once
+  // test). The old `inspectNextContribution` reveal stays gone.
   assert.match(appSource, /reviewPreparedSummary/u);
   assert.doesNotMatch(appSource, /inspectNextContribution/u);
   assert.match(appSource, /pairing = null;/u);
   assert.match(
     appSource,
-    /Nothing will repeat automatically/u,
+    /approval is asked once and nothing uploads without it/u,
   );
 });
 
@@ -5395,39 +5458,44 @@ test("post-results contribution CTA is explicit while technical and deletion con
   assert.ok(communityPosition >= 0 && communityPosition < footerPosition);
   assert.doesNotMatch(html, /id="data"|id="coverage"|data-nav="data"|Data &amp; Privacy|05 · READING THE ESTIMATE|When to treat this as an estimate/iu);
   assert.match(html, /What leaves this Mac — and what never does/u);
-  assert.match(html, /Help improve community estimates by sharing one summary\./u);
+  assert.match(html, /Help improve community estimates: sign in, connect this Mac, and\s*\n?\s*approve once\./u);
   assert.match(html, /Shared: times, token counts, model names/u);
   assert.match(html, /Never shared: anything you typed or a model wrote/u);
   assert.match(html, /Contributing uses your Google or Apple sign-in/u);
-  assert.match(html, /I want to review a summary and decide whether to send it/u);
+  assert.match(html, /I want to review the covered data and decide whether to approve it/u);
   assert.match(html, /id="contribution-not-now"/u);
   assert.match(html, /See what the community published/u);
   assert.match(html, /https:\/\/tibotattle\.com\/#community/u);
-  assert.match(html, /id="community-contribution-disclosure"/u);
-  assert.match(html, /id="prepare-contribution"/u);
-  // Re-pinned 2026-08-07 (guided-journey redesign): the reveal click is
-  // collapsed; the summary card is the review and Send remains the one
-  // explicit action.
+  // Re-pinned 2026-08-08 (owner-directed): the prepare/review disclosure and
+  // its Send button are removed; approving once on the consent card is the
+  // one explicit action.
   assert.doesNotMatch(html, /id="sync-inspect"/u);
-  assert.match(html, /id="sync-run-once"/u);
+  assert.doesNotMatch(html, /id="community-contribution-disclosure"/u);
+  assert.doesNotMatch(html, /id="prepare-contribution"/u);
+  assert.doesNotMatch(html, /id="sync-run-once"/u);
+  assert.match(html, /id="incremental-consent-approve"/u);
   assert.doesNotMatch(html, /automatic-contribution|contribution-history|backend|browser validation|JSON export|download-participant/iu);
 });
 
-test("the primary contribution journey never enables a recurring schedule", async () => {
+test("the page never schedules uploads itself; recurrence is the approved companion engine", async () => {
+  // Re-pinned 2026-08-08 (owner-directed): the manual one-shot send left with
+  // the prepare flow, so the page now performs NO uploads at all. The only
+  // recurring sync is the companion's incremental engine, and it runs only
+  // behind the recorded approve-once consent; this page merely reflects its
+  // bounded status and never arms, schedules, or persists anything.
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const connectBody = appSource.match(
     /async function connectCommunityContribution\(\) \{([\s\S]*?)\n\}/u,
   )?.[1] ?? "";
-  const runBody = appSource.match(
-    /async function runContributionSyncAction\(action\) \{([\s\S]*?)\n\}/u,
-  )?.[1] ?? "";
   assert.doesNotMatch(connectBody, /armAutomaticContributionAfterReviewedSend\(\)/u);
   assert.doesNotMatch(connectBody, /enableAutomaticContributionAfterReviewedSend\(\)/u);
-  assert.match(runBody, /localClient\.runContributionSyncOnce\(/u);
-  assert.doesNotMatch(runBody, /enableAutomaticContributionAfterReviewedSend/u);
+  assert.doesNotMatch(appSource, /runContributionSyncAction|runContributionSyncOnce/u);
   assert.doesNotMatch(appSource, /Automatic contribution is now on every 6 hours/u);
   assert.doesNotMatch(appSource, /sessionStorage|localStorage/u);
   assert.doesNotMatch(appSource, /automaticContributionStatus|enableAutomaticContribution|disableAutomaticContribution/u);
+  // The status line is read-only: a GET the client normalizes fail-closed.
+  assert.match(appSource, /localClient\.incrementalContributionSyncStatus\(\)/u);
+  assert.doesNotMatch(appSource, /setInterval\(/u);
 });
 
 test("stale local device conflicts name the leftover credential and offer the repair", async () => {
@@ -5455,40 +5523,29 @@ test("stale local device conflicts name the leftover credential and offer the re
   );
 });
 
-test("contribution UI prepares a concise local review before one explicit send", async () => {
+test("the approve card shows one verified review instance before one explicit approval", async () => {
+  // Re-pinned 2026-08-08 (owner-directed): the concise review moved onto the
+  // approve-once card. The GATE is the contract and survives the removed
+  // prepare surface, pinned three ways: the exact local verification still
+  // runs and is validated field by field, Approve still refuses without a
+  // ready review, and the approval still carries the minted review token.
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   assert.match(html, /id="community-connect-consent"/u);
-  assert.match(html, /id="community-contribution-disclosure"/u);
-  assert.match(html, /id="preparation-identity"/u);
-  assert.match(html, /id="contribution-lookback-controls"/u);
-  assert.match(html, /id="sync-next-coverage"/u);
-  assert.match(html, /id="sync-next-records"/u);
-  assert.match(html, /id="sync-next-cost"/u);
-  assert.match(html, /id="sync-next-bytes"/u);
-  // Re-pinned 2026-08-07 (guided-journey redesign): "Review summary" was a
-  // button that revealed the facts already printed on this card, so the card
-  // now states that it IS the review and verifies itself. The GATE is the
-  // contract and survives the collapsed click, pinned here three ways: the
-  // exact local verification still runs, Send still refuses without a ready
-  // review, and the send still carries the minted review token.
-  assert.match(html, /This summary is the review/u);
-  assert.match(html, /Send summary/u);
+  assert.doesNotMatch(html, /id="community-contribution-disclosure"/u);
+  assert.doesNotMatch(html, /id="preparation-identity"/u);
+  assert.doesNotMatch(html, /id="contribution-lookback-controls"/u);
+  assert.doesNotMatch(html, /id="sync-next-coverage"|id="sync-next-records"|id="sync-next-cost"|id="sync-next-bytes"/u);
+  assert.match(html, /id="incremental-review-facts"[^>]*hidden/u);
+  assert.match(html, /id="incremental-review-coverage"/u);
+  assert.match(html, /id="incremental-review-records"/u);
+  assert.match(html, /id="incremental-review-bytes"/u);
+  assert.doesNotMatch(html, /Send summary/u);
   assert.match(appSource, /function maybeReviewPreparedSummary\(\)/u);
-  assert.match(
-    appSource,
-    /error\.code = "review_required_before_send"/u,
-  );
-  assert.match(
-    appSource,
-    /runContributionSyncOnce\(\s*contributionSyncExactReview\.reviewToken/u,
-  );
   assert.match(appSource, /validateContributionForUpload\(value\.payload\)/u);
-  assert.doesNotMatch(appSource, /renderCollector|renderIndexProgress|collector-details|index-progress/u);
-  assert.match(appSource, /prepareLocalContribution/);
-  assert.match(appSource, /localClient\.prepareContribution\(\{\s*lookbackHours: activeContributionLookbackHours/s);
   assert.match(appSource, /localClient\.contributionSyncExactReview\(\)/u);
-  assert.match(appSource, /localClient\.runContributionSyncOnce\(/u);
+  assert.match(appSource, /localClient\.prepareContribution\(\{ lookbackHours: 24 \}\)/u);
+  assert.doesNotMatch(appSource, /renderCollector|renderIndexProgress|collector-details|index-progress/u);
   assert.doesNotMatch(appSource, /createTelemetryEnvelope|registerUpload|contributeSerialized|parseSafeExport|selectedContributionValidated|JSON\.stringify\(payload, null, 2\)/u);
   assert.doesNotMatch(appSource, /renderPersonalStats|renderBackendHealth|renderSharedCommunitySnapshot|renderSelectedContributionInspection/u);
   assert.doesNotMatch(html, /id="contribution-file"|id="selected-contribution-inspection"|JSON export|browser validation/iu);
@@ -5518,30 +5575,52 @@ test("the community journey states its stages and gates effort behind sign-in an
   });
   assert.deepEqual(stagePositions, [...stagePositions].sort((a, b) => a - b));
   // Authorization state is visible before the action buttons: the strip
-  // precedes the sign-in block, which precedes the prepare/review disclosure.
+  // precedes the sign-in block, which precedes the approve-once surface
+  // (re-pinned 2026-08-08: the prepare/review disclosure is removed).
   const journeyPosition = html.indexOf('id="community-journey"');
   const signInPosition = html.indexOf('id="identity-signin"');
-  const disclosurePosition = html.indexOf('id="community-contribution-disclosure"');
+  const consentPosition = html.indexOf('id="incremental-consent"');
   assert.ok(journeyPosition >= 0 && journeyPosition < signInPosition);
-  assert.ok(signInPosition < disclosurePosition);
-  // Stage detail lines are measured facts: the index stage reuses the exact
-  // counted-sources statement the history progress surface reports.
+  assert.ok(signInPosition < consentPosition);
+  // Stage detail lines are measured facts, each one short sentence
+  // (owner-directed tightening, 2026-08-08): the index stage states the same
+  // counted sources the history progress surface reports, without the
+  // two-sentence byte breakdown that wrapped the card to eight lines.
   assert.match(
     appSource,
-    /stage\("index", "progress", "dashboard\.history\.indexingSources", \{/u,
+    /stage\("index", "progress", "journey\.index\.progress", \{/u,
   );
+  for (const locale of SUPPORTED_LOCALES) {
+    for (const key of [
+      "journey.app.connected",
+      "journey.app.missing",
+      "journey.index.complete",
+      "journey.index.waiting",
+      "journey.community.signInFirst",
+      "journey.community.connectNext",
+      "journey.community.approveNext",
+      "journey.community.syncing",
+      "journey.community.noService",
+      "journey.community.paused",
+    ]) {
+      const copy = translate(key, {}, locale);
+      assert.ok(copy.length > 0 && copy.length <= 90, `${locale} ${key} stays short: ${copy}`);
+    }
+  }
+  // The connected stage states the approve-once flow's remaining truth.
+  assert.match(appSource, /stage\("community", "action", "journey\.community\.approveNext"\)/u);
+  assert.match(appSource, /stage\("community", "done", "journey\.community\.syncing"\)/u);
   // Sign-in and connection come BEFORE any effort is invested: upload
-  // authority is claimed only from measured facts, both prepare and send are
-  // disabled with a stated reason until it exists, and the reason names the
-  // missing step (sign-in versus connection).
+  // authority is claimed only from measured facts, Approve is disabled with a
+  // stated reason until it exists, and the reason names the missing step
+  // (sign-in versus connection) on the approve card's own gate line.
   assert.match(appSource, /function communityUploadAuthorityEvidence\(\)/u);
   assert.match(appSource, /communityDevicePaired\s*\|\| finite\(contributionSyncStatus\?\.counts\?\.accepted, 0\) > 0/u);
   assert.match(appSource, /\|\| !authorized;/u);
-  assert.match(appSource, /"syncGate\.signInFirst"\s*:\s*"syncGate\.connectFirst"/u);
-  assert.match(appSource, /"prepareGate\.signInFirst"\s*:\s*"prepareGate\.connectFirst"/u);
-  assert.match(html, /id="sync-gate-reason"/u);
-  // A build with no contribution service keeps local preparation: there is
-  // nothing to sign into and nothing can send.
+  assert.match(appSource, /"consent\.signInFirst"\s*:\s*"consent\.connectFirst"/u);
+  assert.match(html, /id="incremental-consent-gate"/u);
+  // A build with no contribution service has nothing to sign into, nothing
+  // to approve, and nothing that can send.
   assert.match(
     appSource,
     /return !contributionServiceConfigured\(\) \|\| communityUploadAuthorityEvidence\(\);/u,
@@ -5549,30 +5628,34 @@ test("the community journey states its stages and gates effort behind sign-in an
   assert.match(styles, /\.journey-stage \{/u);
 });
 
-test("a prepared summary verifies itself once and failure retries stay explicit", async () => {
+test("a prepared review instance verifies itself once and failure retries stay explicit", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  // The summary card is the review: a ready prepared set triggers the exact
-  // local verification without a reveal click…
-  assert.match(appSource, /updateContributionSyncButtons\(\);\s*\n\s*maybeReviewPreparedSummary\(\);/u);
+  // Re-pinned 2026-08-08 (owner-directed): the approve card is the review. A
+  // ready prepared set still triggers the exact local verification without a
+  // reveal click…
+  assert.match(appSource, /renderContributionActionState\(\);\s*\n\s*maybeReviewPreparedSummary\(\);/u);
   // …but only once per prepared set, so a failed verification cannot loop; a
-  // retry is an explicit action again.
+  // retry is an explicit action again ("Check again" on the approve card).
   assert.match(appSource, /if \(key === null \|\| key === contributionSyncAutoReviewedKey\) return;/u);
-  assert.match(appSource, /sync-review-retry/u);
-  // The verification waits for the same authorization Send needs, so a local
-  // mutation that mints a send token never runs for an unauthorized page.
+  assert.match(appSource, /incremental-review-retry/u);
+  // The silent preparation is equally loop-proof: once per queue state.
+  assert.match(appSource, /if \(incrementalReviewPrepareAttempted\) return;\s*\n\s*incrementalReviewPrepareAttempted = true;/u);
+  // The verification waits for the same authorization Approve needs, so a
+  // local mutation that mints a consent token never runs for an unauthorized
+  // page — and never at all on a build without the v1.0 capability.
   assert.match(
     appSource,
-    /if \(!communityAuthorizationSatisfied\(\)\) return;\s*\n\s*const key = preparedSummaryIdentity\(\);/u,
+    /if \(!communityAuthorizationSatisfied\(\)\) return;/u,
   );
-  // A send, and a fresh preparation, both invalidate the once-per-set marker:
+  assert.match(
+    appSource,
+    /if \(!incrementalSyncCapabilityAdvertised\(\) \|\| incrementalConsentApproved\) return;/u,
+  );
+  // A fresh preparation invalidates the once-per-set marker with the token:
   // whatever the queue offers next must verify itself again.
   assert.match(
     appSource,
-    /contributionSyncAutoReviewedKey = null;\s*\n\s*await refreshContributionSyncControls\(\);/u,
-  );
-  assert.match(
-    appSource,
-    /clearContributionSyncExactReview\(\);\s*\n[\s\S]{0,220}?contributionSyncAutoReviewedKey = null;/u,
+    /clearContributionSyncExactReview\(\);\s*\n[\s\S]{0,240}?contributionSyncAutoReviewedKey = null;/u,
   );
 });
 
@@ -5618,27 +5701,93 @@ test("the approve-once consent surface lights up only with the advertised v1.0 s
   assert.match(appSource, /result\?\.status !== "approved"/u);
 });
 
-test("foreground sync results expose all bounded outcomes and flag zero-accept passes", async () => {
+test("the foreground send and its pass formatter are retired; the sync status line is bounded", async () => {
+  // Tombstone, re-pinned 2026-08-08 (owner-directed): the manual send and its
+  // accepted/retry/rejected pass summary described the removed Send button.
+  // What replaced them is the approved companion engine's status line, and it
+  // may carry only counted days and fixed-vocabulary codes.
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  const formatterMatch = appSource.match(
-    /function contributionSyncPassResult\(result\) \{([\s\S]*?)\n\}\n\nfunction clearContributionSyncExactReview/u,
-  );
-  assert.ok(formatterMatch, "foreground sync result formatter is available for contract review");
-  const formatterSource = formatterMatch[1];
+  const clientSource = await readFile(new URL("../public/data-client.js", import.meta.url), "utf8");
+  assert.doesNotMatch(appSource, /contributionSyncPassResult|showContributionSyncAction\(/u);
+  assert.doesNotMatch(appSource, /waiting to retry,/u);
+  assert.match(appSource, /function renderIncrementalSyncStatusLine\(\)/u);
+  assert.match(appSource, /consent\.syncProgress/u);
+  assert.match(appSource, /consent\.syncPaused/u);
+  assert.match(appSource, /consent\.syncLastError/u);
+  // The projection is validated fail-closed in the client: schema, flags, and
+  // fixed code shapes; a malformed payload renders as unavailable, never as
+  // invented progress.
   assert.match(
-    formatterSource,
-    /result\.status === "completed"[\s\S]*result\.accepted === 0[\s\S]*result\.retryable \+ result\.rejected > 0/u,
+    clientSource,
+    /export function normalizeIncrementalContributionSyncStatus\(payload\)/u,
   );
-  assert.match(formatterSource, /accepted,[\s\S]*waiting to retry,[\s\S]*rejected/u);
-  assert.match(formatterSource, /may need to be paired as an upload-only device/u);
-  assert.match(formatterSource, /do not identify the exact server-side reason/u);
+  assert.match(clientSource, /INCREMENTAL_SYNC_CODE_PATTERN = \/\^\[a-z\]\[a-z0-9_\]\{0,63\}\$\/u;/u);
   assert.match(
-    appSource,
-    /showContributionSyncAction\(outcome\.message, outcome\.needsAttention\)/u,
+    clientSource,
+    /payload\?\.includesContent !== false\s*\n\s*\|\| payload\?\.includesPaths !== false\s*\n\s*\|\| payload\?\.includesIdentifiers !== false\s*\n\s*\|\| payload\?\.includesCredentials !== false/u,
   );
-  assert.match(
-    appSource,
-    /acceptedContribution = result\.status === "completed"[\s\S]*if \(acceptedContribution\) await loadCommunityResults\(\)/u,
+  assert.deepEqual(normalizeIncrementalContributionSyncStatus(null).status, "unavailable");
+  assert.deepEqual(
+    normalizeIncrementalContributionSyncStatus({
+      schemaVersion: "local-incremental-contribution-sync-v1.0",
+      status: "available",
+      contractVersion: "telemetry-contribution-v1.0",
+      consent: { approved: true, current: true, consentedAt: "2026-08-08T10:00:00.000Z" },
+      paused: true,
+      pausedReason: "quota_exhausted",
+      running: false,
+      progress: {
+        daysTotal: 14,
+        daysSynced: 12,
+        daysPending: 2,
+        chunksUploaded: 40,
+        acknowledgedThroughDay: "2026-08-06",
+      },
+      lastAttemptAt: "2026-08-08T09:00:00.000Z",
+      nextAttemptAt: "2026-08-08T15:00:00.000Z",
+      lastOutcome: { at: "2026-08-08T09:00:00.000Z", code: "upload_quota", status: "failed" },
+      includesContent: false,
+      includesPaths: false,
+      includesIdentifiers: false,
+      includesCredentials: false,
+    }),
+    {
+      status: "available",
+      consent: { approved: true, current: true, consentedAt: "2026-08-08T10:00:00.000Z" },
+      paused: true,
+      pausedReason: "quota_exhausted",
+      running: false,
+      progress: {
+        daysTotal: 14,
+        daysSynced: 12,
+        daysPending: 2,
+        chunksUploaded: 40,
+        acknowledgedThroughDay: "2026-08-06",
+      },
+      lastAttemptAt: "2026-08-08T09:00:00.000Z",
+      nextAttemptAt: "2026-08-08T15:00:00.000Z",
+      lastOutcome: { at: "2026-08-08T09:00:00.000Z", code: "upload_quota", status: "failed" },
+    },
+  );
+  // A free-form paused reason or outcome code never reaches the page.
+  assert.equal(
+    normalizeIncrementalContributionSyncStatus({
+      schemaVersion: "local-incremental-contribution-sync-v1.0",
+      status: "available",
+      consent: { approved: true, current: true, consentedAt: null },
+      paused: true,
+      pausedReason: "failed at /Users/private/state.json",
+      running: false,
+      progress: null,
+      lastAttemptAt: null,
+      nextAttemptAt: null,
+      lastOutcome: null,
+      includesContent: false,
+      includesPaths: false,
+      includesIdentifiers: false,
+      includesCredentials: false,
+    }).pausedReason,
+    null,
   );
 });
 
@@ -5862,6 +6011,52 @@ test("failed diagnostic writes reject and leave the user with only the reference
     }),
     "Reference TT-7QF3K2.",
   );
+});
+
+test("clients never invoke browser-native fetch with themselves as receiver", async () => {
+  // Window.fetch is receiver-sensitive: Blink throws "Illegal invocation" and
+  // WebKit "Can only call Window.fetch on instances of Window" when it is
+  // called as a property of anything else. Node's fetch tolerates any
+  // receiver, which is exactly how this regression stayed invisible to tests
+  // while every diagnostic note died in the page before a request was made.
+  function receiverStrictFetch(url, options = {}) {
+    if (this !== undefined && this !== globalThis) {
+      throw new TypeError("Illegal invocation");
+    }
+    receiverStrictFetch.calls.push({ url, options });
+    return Promise.resolve(new Response(JSON.stringify({
+      schemaVersion: "local-diagnostic-note-v0.1",
+      status: "recorded",
+      reference: "TT-7QF3K2",
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+  }
+  receiverStrictFetch.calls = [];
+  const local = new LocalCompanionClient({ fetchImpl: receiverStrictFetch });
+  assert.deepEqual(
+    await local.recordDiagnosticNote({
+      reference: "TT-7QF3K2",
+      surface: "hosted_identity",
+      code: "",
+      requestId: "",
+    }),
+    { status: "recorded", reference: "TT-7QF3K2" },
+  );
+  assert.equal(receiverStrictFetch.calls.length, 1);
+
+  function receiverStrictReady(url, options = {}) {
+    if (this !== undefined && this !== globalThis) {
+      throw new TypeError("Illegal invocation");
+    }
+    return Promise.resolve(new Response(JSON.stringify({
+      status: "ready",
+      checks: {},
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+  }
+  const community = new CommunityClient({ fetchImpl: receiverStrictReady });
+  // The stub's minimal body normalizes to the fail-closed unavailable shape;
+  // what matters here is that the request was made at all instead of dying
+  // on the receiver check.
+  assert.equal((await community.readiness()).state, "unavailable");
 });
 
 test("the device credential repair is explicit, local-only, and fails closed", async () => {
@@ -6242,11 +6437,13 @@ test("result panels show the number and its caveat, not the service plumbing", a
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   assert.match(html, /id="community"/u);
-  assert.match(html, /Help improve community estimates by sharing one summary/u);
+  assert.match(html, /Help improve community estimates: sign in, connect this Mac, and\s*\n?\s*approve once\./u);
   assert.match(html, /See what the community published/u);
   assert.match(html, /https:\/\/tibotattle\.com\/#community/u);
-  assert.match(html, /id="sync-next-coverage"/u);
-  assert.match(html, /id="sync-next-cost"/u);
+  // Re-pinned 2026-08-08 (owner-directed): the concise figures live on the
+  // approve card's verified review instance now.
+  assert.match(html, /id="incremental-review-coverage"/u);
+  assert.match(html, /id="incremental-review-bytes"/u);
   assert.doesNotMatch(html, /community-snapshot-provenance|backend-service-detail|backend-readiness-note|result-panels|contribution-history/iu);
   assert.doesNotMatch(appSource, /renderBackendHealth|renderPersonalStats|renderSharedCommunitySnapshot|community-snapshot-service-detail/u);
 });
@@ -6454,6 +6651,15 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
   assert.match(describe, /writtenToLocalLog = recorded\?\.status === "recorded"/u);
   assert.match(describe, /writtenToLocalLog,/u);
   assert.doesNotMatch(describe, /void localClient\.recordDiagnosticNote/u);
+  // A companion that answered without confirming the note refused it, and a
+  // refusal is reported rather than blending into an unreachable companion.
+  assert.match(describe, /localNote = writtenToLocalLog \? "recorded" : "refused";/u);
+  assert.match(
+    describe,
+    /localNote = typeof noteError\?\.status === "number"\s*\n\s*\? "refused"\s*\n\s*: "unreachable";/u,
+  );
+  assert.match(describe, /if \(localNote === "refused"\) \{\s*\n[\s\S]*?console\.error\(/u);
+  assert.match(describe, /localNote,/u);
 
   // The connect fallback no longer names three unrelated things to check.
   const connect = appSource.match(
@@ -6474,16 +6680,22 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
   assert.match(connect, /contributionConnectStep\(\s*"service_check"/u);
   assert.match(connect, /contributionConnectStep\(\s*"hosted_enrollment"/u);
   assert.match(connect, /contributionConnectStep\(\s*"device_pairing"/u);
+  // Re-pinned 2026-08-08 (owner-directed): the local_preparation and
+  // local_review follow-up steps moved into the approve card's invisible
+  // bootstrap, which reports its own failures there with the same
+  // fixed-vocabulary preparation codes.
   for (const stepId of Object.keys({
     service_check: 0,
     hosted_enrollment: 0,
     device_pairing: 0,
     queue_refresh: 0,
-    local_preparation: 0,
-    local_review: 0,
   })) {
     assert.match(appSource, new RegExp(`${stepId}: Object\\.freeze\\(\\{`, "u"));
   }
+  assert.doesNotMatch(appSource, /local_preparation: Object\.freeze\(\{|local_review: Object\.freeze\(\{/u);
+  assert.match(appSource, /INCREMENTAL_PREPARATION_ERROR_COPY = \{/u);
+  assert.match(appSource, /identity_unavailable:/u);
+  assert.match(appSource, /coverage_unavailable:/u);
   for (const code of [
     "BODY_INVALID",
     "CONTENT_TYPE_INVALID",
@@ -6526,10 +6738,13 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
       `${surface} is a fixed diagnostic surface`,
     );
   }
+  // Re-pinned 2026-08-08 (owner-directed): the manual send journey is gone,
+  // so no page action files against contribution_send any more; the
+  // approve-once consent files against automatic_contribution instead.
   for (const journey of [
     "contribution_connect",
     "contribution_prepare",
-    "contribution_send",
+    "automatic_contribution",
     "hosted_identity",
     "fast_mode_preference",
   ]) {
@@ -6596,22 +6811,26 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   // payload string cannot reach the canvas without failing this list. A
   // prompt, a response, a file path, a folder name, a URL, an account
   // identifier or an email would all have to arrive as one of these.
+  // Re-pinned 2026-08-08 (owner-directed card v4): the identifier/debug line
+  // left the image (it survives in the text transcript, the file name, and
+  // the chip beside the card), the top-right corner prints the app version
+  // instead of the home host, and the trend corner states the shown-of-total
+  // population sentence rather than a bare subset count.
   assert.deepEqual(
     [...new Set(firstArguments(section, "context.fillText("))].sort(),
     [
       "\"TiboTattle\"",
       "badge",
-      "card.home",
+      "card.trendCount",
       "card.trendEmpty",
       "card.trendEmptyDetail",
       "card.trendLabel.toLocaleUpperCase(localization.locale())",
+      "card.versionLabel",
       "formatMoney(value, axisDigits)",
       "line",
-      "shareCardFit(context, card.identifierLine, inner)",
       "shareCardFit(context, card.subtitle, inner)",
       "shareCardFit(context, card.title, inner)",
       "shareCardFit(context, stat.value, textWidth)",
-      "tPlural(\"share.resetFit\", card.trend.count)",
       "tick.label",
       "xAxisLabel",
       "yAxisLabel",
@@ -6725,7 +6944,21 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   );
   assert.match(
     section,
-    /trend: isWeeklyWindow \? shareCardTrend\(history\) : null,/u,
+    /const trend = isWeeklyWindow \? shareCardTrend\(history\) : null;/u,
+  );
+  // The population sentence is composed only from the frozen trend's numbers
+  // and fixed range/span vocabulary.
+  assert.match(
+    section,
+    /trendCount: trend === null \? "" : shareCardTrendCountLabel\(trend\),/u,
+  );
+  assert.match(
+    section,
+    /\? t\("share\.trend\.countWithFloor", \{/u,
+  );
+  assert.match(
+    section,
+    /: t\("share\.trend\.countAnySpan", values\);/u,
   );
   assert.match(
     section,
@@ -6900,19 +7133,24 @@ test("a posted results card always carries a diagnostic-format reference", async
     /if \(signature !== shareCardSignature \|\| shareCardReference === ""\) \{/u,
   );
 
-  // It is printed on the image itself, first in the identifier line, and it
-  // names the saved file so a downloaded card stays matched to it.
+  // Re-pinned 2026-08-08 (owner-directed): the identifier line no longer
+  // paints on the image — the reference reaches a reader through the text
+  // transcript's trailer, the saved file's name, and the chip beside the
+  // card — and the toasts stopped claiming otherwise.
   assert.match(section, /const identifiers = \[\s*\n\s*t\("share\.identifier\.debug", \{ reference \}\),/u);
   assert.match(section, /t\("share\.identifier\.version", \{/u);
   assert.doesNotMatch(section, /price table \$\{registryVersion\}/u);
+  assert.doesNotMatch(section, /fillText\(\s*\n?\s*shareCardFit\(context, card\.identifierLine/u);
+  assert.match(section, /identifierLine: identifiers\.join\(" · "\),/u);
   assert.match(
     section,
     /return `tibotattle-results-\$\{card\.reference\}\.png`;/u,
   );
   assert.match(
     section,
-    /Reference \$\{card\.reference\} is printed on the image/u,
+    /The file name carries reference \$\{card\.reference\}\./u,
   );
+  assert.doesNotMatch(section, /is printed on the image/u);
 
   // The same reference remains visible beside the card without duplicating a
   // full transcript of an image that is already the share surface.
@@ -6974,10 +7212,18 @@ test("a posted results card states a figure in full and marks a fixture as one",
 
   // The history takes exactly the room the qualifications leave, but a card
   // without material qualifications is allowed to use that visual height.
+  // Re-pinned 2026-08-08 (owner-directed): the identifier footer and its rule
+  // are gone from the image, so caveats anchor at the card's bottom edge and
+  // the reclaimed footer band belongs to the chart.
   assert.match(
     section,
-    /const caveatTop = caveatLines\.length === 0\s*\n\s*\? ruleY - 8\s*\n\s*: ruleY - 22 - \(caveatLines\.length - 1\) \* caveatStep;/u,
+    /const caveatBaseY = SHARE_CARD_HEIGHT - 26;/u,
   );
+  assert.match(
+    section,
+    /const caveatTop = caveatLines\.length === 0\s*\n\s*\? caveatBaseY \+ 22\s*\n\s*: caveatBaseY - \(caveatLines\.length - 1\) \* caveatStep;/u,
+  );
+  assert.doesNotMatch(section, /ruleY/u);
   assert.match(
     section,
     /const trendHeight = Math\.min\(\s*\n\s*SHARE_CARD_TREND_MAX_HEIGHT,\s*\n\s*Math\.max\(SHARE_CARD_TREND_MIN_HEIGHT, caveatTop - 30 - trendTop\),\s*\n\s*\);/u,
@@ -7008,7 +7254,9 @@ test("a posted results card states a figure in full and marks a fixture as one",
     "the shared SVG tick alignment is translated to a valid Canvas alignment",
   );
   assert.doesNotMatch(section, /shareCardTrendDateTicks|shareCardTrendAxis/u);
-  assert.match(section, /const SHARE_CARD_TREND_MAX_HEIGHT = 420;/u);
+  // 420 → 472 (owner-directed, 2026-08-08): the retired identifier footer's
+  // vertical band goes to the plot's ceiling.
+  assert.match(section, /const SHARE_CARD_TREND_MAX_HEIGHT = 472;/u);
   assert.match(section, /const SHARE_CARD_TREND_MIN_HEIGHT = 168;/u);
   // Only the qualifications that can change interpretation survive on a
   // social image; the full evidence remains in the local app.

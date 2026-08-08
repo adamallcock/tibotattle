@@ -32,6 +32,12 @@ import {
   LocalCompanionClient,
 } from "../web/public/data-client.js";
 import {
+  createDiagnosticReference,
+  diagnosticErrorCode,
+  diagnosticSurface,
+  serviceRequestId,
+} from "../web/public/lib.js";
+import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
 } from "../../src/platform/export-identity-keychain.js";
 import {
@@ -3372,6 +3378,103 @@ test("diagnostic notes are bounded, fixed-vocabulary, and land in a local log", 
     assert.equal(recordedText.includes("/Users/private"), false);
     assert.equal(recordedText.includes("arbitrary_journey"), false);
     assert.equal(recordedText.split("\n").filter(Boolean).length, 2);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("the dashboard's own sign-in failure note lands in the diagnostics log", async () => {
+  const files = await fixture();
+  const diagnosticsLogFile = join(files.stateRoot, "diagnostics-v0.1.log");
+  let now = Date.parse("2026-08-07T10:00:00.000Z");
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    diagnosticsLogFile,
+    clock: () => now,
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    // Browser-faithful fetch: receiver-sensitive exactly like Window.fetch
+    // (Blink throws "Illegal invocation", WebKit "Can only call Window.fetch
+    // on instances of Window" when it is invoked as a property of anything),
+    // resolving the dashboard's relative route against this server and
+    // stamping the Origin header a browser adds to every same-origin POST.
+    // A client that regresses to calling its stored fetch as a method fails
+    // here before any request is made — exactly as it would on a real page.
+    function browserFetch(url, options = {}) {
+      if (this !== undefined && this !== globalThis) {
+        throw new TypeError("Illegal invocation");
+      }
+      return fetch(`${base}${url}`, {
+        ...options,
+        headers: {
+          ...options.headers,
+          Origin: base,
+        },
+      });
+    }
+    const client = new LocalCompanionClient({ fetchImpl: browserFetch });
+
+    // The exact note describeFailure files for a failed hosted sign-in whose
+    // error never got a service answer: a page-minted reference, the fixed
+    // hosted_identity surface, and empty validated code and request id (the
+    // client replaces the empty code with its fixed "unknown").
+    const offlineReference = createDiagnosticReference();
+    const offline = await client.recordDiagnosticNote({
+      reference: offlineReference,
+      surface: diagnosticSurface("hosted_identity"),
+      code: diagnosticErrorCode(undefined),
+      requestId: serviceRequestId(undefined),
+    });
+    assert.deepEqual(offline, {
+      status: "recorded",
+      reference: offlineReference,
+    });
+
+    // The same journey when the service answered with its fixed error shape:
+    // the code and request id travel exactly as validated from that answer.
+    now = Date.parse("2026-08-07T10:01:00.000Z");
+    const answeredReference = createDiagnosticReference();
+    const answered = await client.recordDiagnosticNote({
+      reference: answeredReference,
+      surface: diagnosticSurface("hosted_identity"),
+      code: diagnosticErrorCode("INTERNAL_ERROR"),
+      requestId: serviceRequestId("0f2c7a11-4b93-4bb2-9a7c-1c0d2e3f4a5b"),
+    });
+    assert.deepEqual(answered, {
+      status: "recorded",
+      reference: answeredReference,
+    });
+
+    const lines = (await readFile(diagnosticsLogFile, "utf8"))
+      .trimEnd()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(lines, [
+      {
+        schemaVersion: "local-diagnostic-note-v0.1",
+        recordedAt: "2026-08-07T10:00:00.000Z",
+        reference: offlineReference,
+        surface: "hosted_identity",
+        code: "unknown",
+        requestId: "",
+      },
+      {
+        schemaVersion: "local-diagnostic-note-v0.1",
+        recordedAt: "2026-08-07T10:01:00.000Z",
+        reference: answeredReference,
+        surface: "hosted_identity",
+        code: "INTERNAL_ERROR",
+        requestId: "0f2c7a11-4b93-4bb2-9a7c-1c0d2e3f4a5b",
+      },
+    ]);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });

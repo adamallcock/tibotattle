@@ -752,7 +752,6 @@ h1 {
   box-shadow: 0 18px 46px rgba(21, 40, 35, .07);
 }
 .contribution-cta > .community-public-evidence,
-.contribution-cta > .community-review,
 .contribution-cta > .journey-stages,
 .contribution-cta > .incremental-consent {
   grid-column: 1 / -1;
@@ -766,7 +765,11 @@ h1 {
  */
 .journey-stages {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  /* 240px minimum (owner-directed, 2026-08-08): at 200px the four cards'
+     detail sentences wrapped to as many as eight lines. Wider columns plus
+     the one-sentence copy keep each card to a line or two, and below the
+     four-up width the grid folds to two-up instead of overflowing. */
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
   gap: var(--space-3);
   margin: 0;
   padding: 0;
@@ -802,17 +805,16 @@ h1 {
 }
 .journey-stage-detail {
   margin: 0;
+  overflow-wrap: break-word;
   color: var(--muted);
-  font-size: .72rem;
-  line-height: 1.5;
+  font-size: .68rem;
+  line-height: 1.45;
 }
 .journey-stage-done { border-color: rgba(23, 79, 69, .35); }
 .journey-stage-action {
   border-color: rgba(154, 106, 36, .45);
   background: var(--surface-quiet);
 }
-/* Why Send is off, printed beside Send itself rather than after a failure. */
-.sync-gate-reason { color: var(--amber); font-weight: var(--weight-semibold); }
 /* The approve-once consent surface for the incremental contribution model. */
 .incremental-consent { display: grid; gap: var(--space-3); }
 .incremental-consent-facts {
@@ -840,12 +842,6 @@ h1 {
   text-underline-offset: 3px;
 }
 .community-public-evidence a:hover { text-decoration-color: currentColor; }
-/* The review disclosure is a panel in its own right, not a grid cell. */
-.contribution-cta > .community-review {
-  margin-top: 0;
-  border-color: rgba(23, 79, 69, .22);
-  background: var(--surface-raised);
-}
 .contribution-cta h2 { font-size: clamp(2.5rem, 4.5vw, 4.25rem); }
 .contribution-cta-copy > p:not(.eyebrow) {
   max-width: 58ch;
@@ -1623,6 +1619,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .weekly-history-chart svg { min-width: 0; height: clamp(270px, 30vw, 330px); }
 .legend-dot.weekly-center { background: var(--green); }
 .legend-dot.weekly-range { height: 9px; background: rgba(49, 95, 132, .2); }
+.legend-dot.weekly-error-bar { height: 9px; width: 3px; border-radius: 2px; background: rgba(49, 95, 132, .78); }
 .legend-dot.weekly-mature {
   width: 9px;
   height: 9px;
@@ -1857,30 +1854,17 @@ h2 { font-size: clamp(2rem, 3.8vw, 3.25rem); }
 .consent-row input { width: 17px; height: 17px; margin-top: 2px; accent-color: var(--green); }
 .consent-row span { display: flex; flex-direction: column; font-size: .73rem; }
 .consent-row small { color: var(--muted); }
-.sync-next-card { margin-top: var(--space-5); padding: var(--pad-tile); border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-quiet); }
-.preparation-readiness { margin-bottom: 12px; font-size: .78rem; }
-.preparation-window {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin-bottom: 12px;
-}
+/* The prepare-and-review card's styles left with it (owner-directed,
+   2026-08-08); the approve-once surface below is the only contribution flow. */
 .compact-heading h4 { margin: 0; font-family: var(--serif); font-size: 1rem; font-weight: var(--weight-display); }
-.sync-next-facts { grid-template-columns: repeat(4, 1fr); margin-bottom: 12px; }
-.sync-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
-.sync-actions .button { min-height: 38px; }
-.community-connect,
-.local-preparation {
+.community-connect {
   margin: var(--space-4) 0;
   padding: var(--pad-tile);
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
   background: var(--surface-quiet);
 }
-.community-connect .control-label,
-.local-preparation > .control-label {
+.community-connect .control-label {
   display: block;
   margin-bottom: 12px;
   color: var(--green-2);
@@ -1889,8 +1873,9 @@ h2 { font-size: clamp(2rem, 3.8vw, 3.25rem); }
   letter-spacing: .06em;
   text-transform: uppercase;
 }
-.community-connect .participant-action-status,
-.local-preparation .participant-action-status { margin-bottom: 0; }
+.community-connect .participant-action-status { margin-bottom: 0; }
+/* The verified review instance on the approve card: three compact facts. */
+.incremental-review-facts { grid-template-columns: repeat(3, 1fr); margin: 0; }
 .summary-facts { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--space-2); margin: var(--space-5) 0; }
 .sync-facts { grid-template-columns: repeat(3, 1fr); }
 .summary-facts > div { min-width: 0; padding: var(--pad-tile); border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-quiet); }
@@ -2055,9 +2040,6 @@ footer p { margin: 0; }
   .page-heading, .section-heading, .section-heading.split, .weekly-hero, .weekly-pace-forecast, .setup-card, .companion-setup, .contribution-cta { grid-template-columns: 1fr; gap: 24px; }
   .companion-setup-actions { grid-column: 1; }
   .journey-disclosure > summary { align-items: flex-start; flex-direction: column; }
-  .journey-disclosure > .sync-next-card {
-    margin-inline: 14px;
-  }
   #cancel-refresh.button.compact { display: inline-flex; }
   .page-heading { padding-top: 38px; }
   .community-site .community-trust-grid { grid-template-columns: 1fr; }

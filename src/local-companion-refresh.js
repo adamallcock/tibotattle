@@ -549,7 +549,13 @@ export function createLocalCollectorRefreshRunner({
           codexHome,
           ...(stateFile === null ? {} : { stateFile }),
           now: clock,
-          windowDays: 31,
+          // 93 is the validator's ceiling and covers this corpus's full
+          // history (mid-May onward). Stopgap for the owner-reported
+          // "All time equals 30d" defect: the calibration corpus was bounded
+          // by this scan window, not by the range buttons. The real fix -
+          // deriving calibration transitions from the unified index - is
+          // tracked as follow-up.
+          windowDays: 93,
           declaredSpeedBaselines,
           signal,
         });

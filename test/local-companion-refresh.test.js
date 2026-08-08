@@ -778,7 +778,9 @@ test("local refresh forwards its AbortSignal into replay-safe accounting", async
   assert.equal(accountingOptions.codexHome, "/private/codex-home");
   assert.equal(accountingOptions.stateFile, "/private/local-collector-state.sqlite");
   assert.equal(accountingOptions.now, clock);
-  assert.equal(accountingOptions.windowDays, 31);
+  // Re-pinned 31 -> 93 (2026-08-08): the calibration corpus follows this scan
+  // window, and 31 made "All time" identical to 30d on the Allowance page.
+  assert.equal(accountingOptions.windowDays, 93);
   assert.equal(accountingOptions.signal, controller.signal);
   assert.deepEqual(result.accounting, {
     status: "replay_safe",

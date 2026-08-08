@@ -345,7 +345,11 @@ test("localizer is root-bounded, preserves raw-data boundaries, and never interp
   // regex is the wrong instrument for "chart text is localized". The
   // behavioural cover lives in apps/web/test/lib.test.mjs, where lineChart is
   // rendered with a fake document and its SVG text is read back.
-  assert.match(appSource, /setRawText\(markerTitle, caption\)/u);
+  // Re-pinned 2026-08-08: native SVG <title> markers were removed outright
+  // (they produced a duplicate grey tooltip beside the styled hover, owner
+  // report). Marker accessibility is aria-label based now and behaviourally
+  // covered in apps/web/test/lib.test.mjs.
+  assert.doesNotMatch(appSource, /setRawText\(markerTitle, caption\)/u);
   assert.match(appSource, /function renderDashboardUnavailableState\(/u);
   assert.match(appSource, /setLocalizedText\(\$\("#data-source"\), "dashboard\.unavailable\.noRealUsage"\)/u);
   assert.doesNotMatch(appSource, /translateText\("Range unavailable"\)/u);

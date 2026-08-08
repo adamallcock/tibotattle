@@ -176,7 +176,6 @@ export const WEB_MESSAGES = Object.freeze({
   "dashboard.comparison.mae": ["MAE {value} pp", "平均绝对误差 {value} 个百分点", "EMA de {value} pp"],
   "dashboard.comparison.latestMovement": ["{residual} separates the observed and cost-implied movement in the latest matched window.", "最新匹配窗口中，观测变化与成本推断变化相差 {residual}。", "{residual} separa el movimiento observado del implícito por coste en la última ventana coincidente."],
   "dashboard.comparison.seriesBand": ["Across the series, {percent} of points fall inside the modeled 80% band.", "在整个序列中，{percent} 的点落在建模的 80% 区间内。", "En la serie, el {percent} de los puntos cae dentro de la banda modelada del 80 %."],
-  "dashboard.contract": ["Dashboard contract: {version}", "仪表板契约：{version}", "Contrato del panel: {version}"],
   "dashboard.unavailable.backendOnlyOrigin": ["Backend-only origin", "仅后端来源", "Origen solo de backend"],
   "dashboard.unavailable.companionUnavailable": ["Companion unavailable", "伴随程序不可用", "Acompañante no disponible"],
   "dashboard.unavailable.noRealUsage": ["No real usage is displayed", "未显示真实使用情况", "No se muestra uso real"],
@@ -391,7 +390,7 @@ export const WEB_MESSAGES = Object.freeze({
   "weekly.headline.insufficient": ["Insufficient evidence", "证据不足", "Evidencia insuficiente"],
   "weekly.headline.range": ["80% across-reset range, all data: {lower}–{upper}", "全部数据的 80% 跨重置区间：{lower}–{upper}", "Intervalo del 80 % entre restablecimientos, todos los datos: {lower}–{upper}"],
   "weekly.headline.rangeUnavailable": ["No evidence interval available", "没有可用的证据区间", "No hay intervalo de evidencia disponible"],
-  "weekly.headline.relationship": ["The headline is the median of all {qualifying} qualifying reset estimates and never moves with the controls below. The chart is currently drawing {shown} of {total} estimates: the selected range, with observed quota spans of {span}.", "标题为全部 {qualifying} 个合格重置估计的中位数，不会随下方控件变化。图表当前绘制 {total} 个估计中的 {shown} 个：所选范围，且观测额度跨度为{span}。", "El titular es la mediana de las {qualifying} estimaciones de restablecimiento válidas y nunca cambia con los controles de abajo. El gráfico dibuja actualmente {shown} de {total} estimaciones: el intervalo seleccionado, con intervalos de cuota observada de {span}."],
+  "weekly.headline.relationship": ["The headline is the median of all {qualifying} qualifying reset estimates and never moves with the controls below. The chart is currently drawing {shown} of {total} estimates: the selected range, anchored at the newest fit ({anchor}), with observed quota spans of {span}.", "标题为全部 {qualifying} 个合格重置估计的中位数，不会随下方控件变化。图表当前绘制 {total} 个估计中的 {shown} 个：所选范围以最新拟合（{anchor}）为锚点，且观测额度跨度为{span}。", "El titular es la mediana de las {qualifying} estimaciones de restablecimiento válidas y nunca cambia con los controles de abajo. El gráfico dibuja actualmente {shown} de {total} estimaciones: el intervalo seleccionado, anclado en el ajuste más reciente ({anchor}), con intervalos de cuota observada de {span}."],
   "weekly.headline.pending": ["The estimate will appear when enough quota transitions can be matched to priced usage. The headline will then summarize all data, while the controls below filter only the chart.", "当有足够的额度变化可以与已定价的使用量匹配时，估计值就会出现。届时标题将汇总全部数据，而下方控件只会筛选图表。", "La estimación aparecerá cuando haya suficientes transiciones de cuota que puedan asociarse a uso con precio. Entonces el titular resumirá todos los datos, mientras que los controles de abajo solo filtran el gráfico."],
   "weekly.span.all": ["All spans", "全部跨度", "Todos los intervalos"],
   // The slider's own readout says "All spans"; a sentence has to say the same
@@ -403,11 +402,15 @@ export const WEB_MESSAGES = Object.freeze({
   "weekly.series.wellObserved": ["Observed across {span}+ points", "跨 {span}+ 个点观测", "Observado en {span}+ puntos"],
   "weekly.series.shortObservation": ["Short observation", "观测跨度较短", "Observación corta"],
   "weekly.series.acrossResetRange": ["80% across-reset range", "80% 跨重置区间", "Intervalo del 80 % entre restablecimientos"],
-  "weekly.series.measuredRange": ["Measured range", "测量区间", "Intervalo medido"],
-  "weekly.point.detail": ["{span} observed · measured range {low}–{high}", "已观测 {span} · 测量区间 {low}–{high}", "{span} observado · intervalo medido {low}–{high}"],
+  // Honest name (estimator audit, 2026-08-08): the per-reset bars are the
+  // p10–p90 spread of pairwise slopes WITHIN a reset — a disagreement
+  // diagnostic, not a measured confidence interval.
+  "weekly.series.measuredRange": ["Slope-agreement range", "斜率一致性区间", "Intervalo de concordancia de pendientes"],
+  "weekly.point.detail": ["{span} observed · slope-agreement range {low}–{high}", "已观测 {span} · 斜率一致性区间 {low}–{high}", "{span} observado · concordancia de pendientes {low}–{high}"],
   "weekly.chart.title": ["Seven-day allowance estimate history", "七天额度估计历史", "Historial de estimaciones de la asignación de siete días"],
-  "weekly.chart.description": ["One estimate per observed seven-day reset, each with an observed quota span of {span}. The flat line is the all-data median that the headline reports. Measured ranges stay available on hover and focus. Times are shown in {timeZone}.", "每个观测到的七天重置对应一个估计，其观测额度跨度为{span}。水平线是标题所报告的全部数据中位数。测量区间在悬停和聚焦时仍可查看。时间显示为 {timeZone}。", "Una estimación por cada restablecimiento de siete días observado, cada una con un intervalo de cuota observada de {span}. La línea plana es la mediana de todos los datos que informa el titular. Los intervalos medidos siguen disponibles al pasar el cursor y al enfocar. Las horas se muestran en {timeZone}."],
+  "weekly.chart.description": ["One estimate per observed seven-day reset, each with an observed quota span of {span}. The flat line is the all-data median that the headline reports. Slope-agreement ranges stay available on hover and focus. Times are shown in {timeZone}.", "每个观测到的七天重置对应一个估计，其观测额度跨度为{span}。水平线是标题所报告的全部数据中位数。斜率一致性区间在悬停和聚焦时仍可查看。时间显示为 {timeZone}。", "Una estimación por cada restablecimiento de siete días observado, cada una con un intervalo de cuota observada de {span}. La línea plana es la mediana de todos los datos que informa el titular. Los intervalos de concordancia de pendientes siguen disponibles al pasar el cursor y al enfocar. Las horas se muestran en {timeZone}."],
   "weekly.chart.empty": ["No weekly estimates loaded.", "未加载每周估计。", "No se cargaron estimaciones semanales."],
+  "weekly.chart.emptyRange": ["No reset estimates fall inside the selected range.", "所选范围内没有任何重置估计。", "Ninguna estimación de restablecimiento cae dentro del intervalo seleccionado."],
   "weekly.table.empty": ["No weekly evidence loaded.", "未加载每周证据。", "No se cargó evidencia semanal."],
   "weekly.table.wellObserved": ["Well observed", "观测充分", "Bien observado"],
   "weekly.table.spanNotRecorded": ["Span not recorded", "未记录跨度", "Intervalo no registrado"],
@@ -475,6 +478,10 @@ export const WEB_MESSAGES = Object.freeze({
   "share.text.figure": ["{label}: {value} — {detail}.", "{label}：{value} — {detail}。", "{label}: {value} — {detail}."],
   "share.text.header": ["TiboTattle — {title}. {subtitle}", "TiboTattle — {title}。{subtitle}", "TiboTattle — {title}. {subtitle}"],
   "share.text.contract": ["{identifier} · contract {version}", "{identifier} · 契约 {version}", "{identifier} · contrato {version}"],
+  "share.range.all": ["all history", "全部历史", "todo el historial"],
+  "share.range.days": ["{days}d", "{days} 天", "{days} d"],
+  "share.trend.countWithFloor": ["{shown} of {total} reset fits ({range}, ≥{span}pp span)", "{total} 个重置拟合中显示 {shown} 个（{range}，跨度 ≥{span}pp）", "{shown} de {total} ajustes de restablecimiento ({range}, intervalo ≥{span}pp)"],
+  "share.trend.countAnySpan": ["{shown} of {total} reset fits ({range}, any span)", "{total} 个重置拟合中显示 {shown} 个（{range}，任意跨度）", "{shown} de {total} ajustes de restablecimiento ({range}, cualquier intervalo)"],
   "share.text.trailer": ["{trailer}.", "{trailer}。", "{trailer}."],
   "share.text.more": ["More at {home}", "更多信息：{home}", "Más en {home}"],
   "share.text.trendEmpty": ["{label}: {empty} {detail}", "{label}：{empty}{detail}", "{label}: {empty} {detail}"],
@@ -521,22 +528,25 @@ export const WEB_MESSAGES = Object.freeze({
   "aria.calibrationZoomPan": ["Calibration zoom and pan", "校准缩放和平移", "Zoom y desplazamiento de calibración"],
   "aria.calibrationLegend": ["Calibration chart legend", "校准图图例", "Leyenda del gráfico de calibración"],
   "aria.accountingPeriod": ["Accounting period", "核算期间", "Período contable"],
-  "aria.contributionLookback": ["Contribution preparation lookback", "贡献准备回溯范围", "Período retrospectivo de preparación de contribución"],
-  "aria.foregroundContributionControls": ["Foreground contribution controls", "前台贡献控制", "Controles de contribución en primer plano"],
   "aria.contributionJourney": ["Contribution journey stages", "贡献流程阶段", "Etapas del recorrido de contribución"],
   "journey.state.done": ["Done", "已完成", "Hecho"],
   "journey.state.inProgress": ["In progress", "进行中", "En curso"],
   "journey.state.actionNeeded": ["Action needed", "需要操作", "Acción necesaria"],
   "journey.state.waiting": ["Waiting", "等待中", "En espera"],
   "journey.app.connected": [
-    "The TiboTattle companion on this Mac is answering.",
-    "这台 Mac 上的 TiboTattle 伴随程序正在响应。",
-    "El acompañante de TiboTattle en este Mac está respondiendo.",
+    "The Mac app's companion is answering.",
+    "Mac 应用的伴随程序正在响应。",
+    "El acompañante de la app está respondiendo.",
   ],
   "journey.app.missing": [
-    "Open TiboTattle from Applications and use its in-app window.",
-    "请从“应用程序”打开 TiboTattle，并使用其应用内窗口。",
-    "Abre TiboTattle desde Aplicaciones y usa su ventana integrada.",
+    "Open TiboTattle from Applications.",
+    "请从“应用程序”打开 TiboTattle。",
+    "Abre TiboTattle desde Aplicaciones.",
+  ],
+  "journey.index.progress": [
+    "Indexing {indexed} of {total} sources.",
+    "正在索引 {total} 个来源中的第 {indexed} 个。",
+    "Indexando {indexed} de {total} fuentes.",
   ],
   "journey.index.complete": [
     "The discovered history is fully indexed.",
@@ -564,80 +574,44 @@ export const WEB_MESSAGES = Object.freeze({
     "Analiza el uso local para generar evidencia.",
   ],
   "journey.community.waitingCompanion": [
-    "Waiting for the Mac app and its companion first.",
-    "请先等待 Mac 应用及其伴随程序。",
-    "Primero se espera la app para Mac y su acompañante.",
+    "Waiting for the Mac app first.",
+    "请先等待 Mac 应用。",
+    "Primero se espera la app para Mac.",
   ],
   "journey.community.noService": [
-    "This build has no contribution service, so nothing can be sent. Local review still works.",
-    "此构建没有贡献服务，因此无法发送任何内容。本地审阅仍然可用。",
-    "Esta compilación no tiene servicio de contribución, así que no se puede enviar nada. La revisión local sigue funcionando.",
+    "This build has no contribution service.",
+    "此构建没有贡献服务。",
+    "Esta compilación no tiene servicio de contribución.",
   ],
   "journey.community.paused": [
-    "New community sign-ups are paused. Nothing can be sent.",
-    "社区新注册已暂停。无法发送任何内容。",
-    "Las nuevas inscripciones a la comunidad están en pausa. No se puede enviar nada.",
+    "New community sign-ups are paused.",
+    "社区新注册已暂停。",
+    "Las nuevas inscripciones a la comunidad están en pausa.",
   ],
   "journey.community.signInFirst": [
-    "Sign in with Google or Apple below before anything else. Send stays off without it.",
-    "请先在下方使用 Google 或 Apple 登录。未登录时“发送”保持关闭。",
-    "Primero inicia sesión abajo con Google o Apple. Enviar permanece desactivado sin ello.",
+    "Sign in below with Google or Apple.",
+    "请在下方使用 Google 或 Apple 登录。",
+    "Inicia sesión abajo con Google o Apple.",
   ],
   "journey.community.connectNext": [
-    "Signed in. Connect this Mac below as an upload-only device.",
-    "已登录。请在下方将这台 Mac 连接为仅上传设备。",
-    "Sesión iniciada. Conecta este Mac abajo como dispositivo solo de carga.",
+    "Signed in — connect this Mac below.",
+    "已登录——请在下方连接这台 Mac。",
+    "Sesión iniciada: conecta este Mac abajo.",
   ],
   "journey.community.connected": [
-    "Connected. A prepared summary verifies below, then you decide whether to send it.",
-    "已连接。准备好的摘要将在下方完成校验，然后由你决定是否发送。",
-    "Conectado. El resumen preparado se verifica abajo y tú decides si enviarlo.",
+    "Connected.",
+    "已连接。",
+    "Conectado.",
   ],
-  "syncGate.signInFirst": [
-    "Sign in at the top of this section first. Nothing can send without it.",
-    "请先在本区域顶部登录。未登录时无法发送任何内容。",
-    "Primero inicia sesión en la parte superior de esta sección. Sin ello no se puede enviar nada.",
+  "journey.community.approveNext": [
+    "Connected — approve once below.",
+    "已连接——请在下方核准一次。",
+    "Conectado: aprueba una vez abajo.",
   ],
-  "syncGate.connectFirst": [
-    "Connect this Mac at the top of this section first. Nothing can send without it.",
-    "请先在本区域顶部连接这台 Mac。未连接时无法发送任何内容。",
-    "Primero conecta este Mac en la parte superior de esta sección. Sin ello no se puede enviar nada.",
-  ],
-  "syncGate.prepareFirst": [
-    "Prepare a summary above first. Nothing is selected to send.",
-    "请先在上方准备一份摘要。尚未选择要发送的内容。",
-    "Primero prepara un resumen arriba. No hay nada seleccionado para enviar.",
-  ],
-  "syncGate.notConfigured": [
-    "This build has no contribution delivery configured, so there is nothing to send.",
-    "此构建未配置贡献投递，因此没有可发送的内容。",
-    "Esta compilación no tiene configurada la entrega de contribuciones, así que no hay nada que enviar.",
-  ],
-  "syncGate.verifying": [
-    "Verifying this exact summary on this Mac…",
-    "正在这台 Mac 上校验这份摘要…",
-    "Verificando este resumen exacto en este Mac…",
-  ],
-  "syncGate.paused": [
-    "Delivery is paused on this Mac. Nothing sends until it is resumed.",
-    "这台 Mac 上的投递已暂停。恢复之前不会发送任何内容。",
-    "La entrega está en pausa en este Mac. No se envía nada hasta reanudarla.",
-  ],
-  "syncState.readyToSend": [
-    "Verified · ready to send",
-    "已校验 · 可发送",
-    "Verificado · listo para enviar",
-  ],
-  "syncState.verifying": ["Verifying…", "正在校验…", "Verificando…"],
-  "syncState.verifiedLocalOnly": [
-    "Verified locally",
-    "已在本地校验",
-    "Verificado localmente",
-  ],
-  "syncState.awaitingVerification": [
-    "Prepared · not verified",
-    "已准备 · 未校验",
-    "Preparado · sin verificar",
+  "journey.community.syncing": [
+    "Approved — your history syncs automatically.",
+    "已核准——你的历史将自动同步。",
+    "Aprobado: tu historial se sincroniza automáticamente.",
   ],
   "syncStatus.verifyingSummary": [
     "Verifying the prepared summary on this Mac. Nothing is sent while it is checked.",
@@ -645,29 +619,54 @@ export const WEB_MESSAGES = Object.freeze({
     "Verificando el resumen preparado en este Mac. No se envía nada mientras se comprueba.",
   ],
   "syncStatus.summaryVerified": [
-    "The exact summary above is verified on this Mac. Nothing sends unless you press Send.",
-    "上方的确切摘要已在这台 Mac 上完成校验。除非你按下“发送”，否则不会发送任何内容。",
-    "El resumen exacto de arriba está verificado en este Mac. No se envía nada a menos que pulses Enviar.",
-  ],
-  "prepareGate.signInFirst": [
-    "Sign in and connect this Mac above first, so nothing you prepare can hit a sign-in wall at send time.",
-    "请先在上方登录并连接这台 Mac，这样你准备的内容在发送时才不会被登录要求拦住。",
-    "Primero inicia sesión y conecta este Mac arriba, para que nada de lo que prepares choque con un muro de inicio de sesión al enviar.",
-  ],
-  "prepareGate.connectFirst": [
-    "Connect this Mac above first. Preparing stays local, and this order means Send cannot fail afterwards for a missing connection.",
-    "请先在上方连接这台 Mac。准备仍然在本地进行；这一顺序保证“发送”不会在之后因缺少连接而失败。",
-    "Primero conecta este Mac arriba. La preparación sigue siendo local, y este orden evita que Enviar falle después por falta de conexión.",
+    "The covered data shown above is verified on this Mac. Nothing uploads without your approval.",
+    "上方显示的涵盖数据已在这台 Mac 上完成校验。未经你的核准不会上传任何内容。",
+    "Los datos cubiertos mostrados arriba están verificados en este Mac. No se sube nada sin tu aprobación.",
   ],
   "consent.reviewFirst": [
-    "Review one prepared summary below first: you approve the kind of data by seeing one real instance of it.",
-    "请先在下方审阅一份已准备的摘要：你通过查看一个真实实例来核准这种数据类型。",
-    "Primero revisa un resumen preparado abajo: apruebas el tipo de datos viendo una instancia real.",
+    "TiboTattle is preparing and verifying one real instance of the covered data on this Mac for you to review. Nothing is uploaded.",
+    "TiboTattle 正在这台 Mac 上准备并校验一份涵盖数据的真实实例供你审阅。不会上传任何内容。",
+    "TiboTattle está preparando y verificando en este Mac una instancia real de los datos cubiertos para que la revises. No se sube nada.",
   ],
   "consent.readyToApprove": [
-    "A verified summary is ready below. Approving covers this kind of data from now on.",
-    "下方已有一份经校验的摘要。核准后即涵盖今后同类数据。",
-    "Hay un resumen verificado abajo. Aprobar cubre este tipo de datos de ahora en adelante.",
+    "The verified instance above is the review. Approving covers this kind of data from now on.",
+    "上方经校验的实例即为审阅内容。核准后即涵盖今后同类数据。",
+    "La instancia verificada de arriba es la revisión. Aprobar cubre este tipo de datos de ahora en adelante.",
+  ],
+  "consent.signInFirst": [
+    "Sign in at the top of this section first. Nothing can upload without it.",
+    "请先在本区域顶部登录。未登录时无法上传任何内容。",
+    "Primero inicia sesión en la parte superior de esta sección. Sin ello no se puede subir nada.",
+  ],
+  "consent.connectFirst": [
+    "Connect this Mac at the top of this section first. Nothing can upload without it.",
+    "请先在本区域顶部连接这台 Mac。未连接时无法上传任何内容。",
+    "Primero conecta este Mac en la parte superior de esta sección. Sin ello no se puede subir nada.",
+  ],
+  "consent.preparingReview": [
+    "Preparing one real instance of the covered data on this Mac for you to review. No network upload is performed.",
+    "正在这台 Mac 上准备一份涵盖数据的真实实例供你审阅。不会执行任何网络上传。",
+    "Preparando en este Mac una instancia real de los datos cubiertos para que la revises. No se realiza ninguna subida de red.",
+  ],
+  "consent.syncProgress": [
+    "Sync: {synced} of {total} days synced · {pending} pending.",
+    "同步：{total} 天中已同步 {synced} 天 · 待同步 {pending} 天。",
+    "Sincronización: {synced} de {total} días sincronizados · {pending} pendientes.",
+  ],
+  "consent.syncNoProgress": [
+    "Sync: waiting for the first pass.",
+    "同步：正在等待首次运行。",
+    "Sincronización: esperando la primera pasada.",
+  ],
+  "consent.syncPaused": [
+    "Paused: {reason}.",
+    "已暂停：{reason}。",
+    "En pausa: {reason}.",
+  ],
+  "consent.syncLastError": [
+    "Last error: {code}.",
+    "最近错误：{code}。",
+    "Último error: {code}.",
   ],
   "consent.approving": [
     "Recording your approval on this Mac…",
@@ -880,6 +879,12 @@ export const WEB_PLURAL_MESSAGES = Object.freeze({
     one: ["{count} reset fit", "{count} 个重置拟合", "{count} ajuste de restablecimiento"],
     other: ["{count} reset fits", "{count} 个重置拟合", "{count} ajustes de restablecimiento"],
   }),
+  // The Allowance history chart's honest empty reason: fits exist in the
+  // selected range, and the span floor filtered every one of them.
+  "weekly.chart.emptyBelowFloor": Object.freeze({
+    one: ["{count} fit is in range, below the {span}pp span floor.", "范围内有 {count} 个拟合，低于 {span}pp 跨度下限。", "{count} ajuste está en el intervalo, por debajo del umbral de {span}pp."],
+    other: ["{count} fits are in range, all below the {span}pp span floor.", "范围内有 {count} 个拟合，全部低于 {span}pp 跨度下限。", "{count} ajustes están en el intervalo, todos por debajo del umbral de {span}pp."],
+  }),
 });
 
 export function translatePlural(
@@ -934,6 +939,22 @@ export function pseudoLocalize(value) {
 // test keeps this catalog complete for both shipped HTML entry points; new DOM
 // code should instead use a semantic `t` key above.
 export const LEGACY_TEXT_CATALOG = Object.freeze({
+  // The single approve-once contribution flow (2026-08-08).
+  "Contribute anonymous usage data": ["贡献匿名使用数据", "Contribuir datos de uso anónimos"],
+  "Help improve community estimates: sign in, connect this Mac, and approve once. You see the covered data before anything is sent; after approval it stays current automatically.": [
+    "帮助改进社区估计：登录、连接这台 Mac，并批准一次。发送任何内容之前你都会先看到所涵盖的数据；批准后它会自动保持最新。",
+    "Ayuda a mejorar las estimaciones comunitarias: inicia sesión, conecta este Mac y aprueba una sola vez. Ves los datos cubiertos antes de que se envíe nada; tras la aprobación se mantienen al día automáticamente.",
+  ],
+  "I want to review the covered data and decide whether to approve it.": [
+    "我想先审阅所涵盖的数据，再决定是否批准。",
+    "Quiero revisar los datos cubiertos y decidir si los apruebo.",
+  ],
+  // Allowance history: the honest error-bar naming (2026-08-08).
+  "Slope-agreement range": ["斜率一致性区间", "Intervalo de concordancia de pendientes"],
+  "Each reset estimate is drawn with its slope-agreement range: the spread of slopes from different pairs of observed quota boundaries within that reset. It is a within-reset disagreement diagnostic, not a confidence interval.": [
+    "每个重置估计都带有其斜率一致性区间：由该重置内观测到的不同额度边界配对形成的斜率分布。它是重置内部的一致性诊断，而不是置信区间。",
+    "Cada estimación de restablecimiento se dibuja con su intervalo de concordancia de pendientes: la dispersión de pendientes de distintos pares de límites de cuota observados dentro de ese restablecimiento. Es un diagnóstico de discrepancia interna, no un intervalo de confianza.",
+  ],
   // The community guided journey: stage names, the collapsed review card, and
   // the approve-once incremental consent surface.
   "Mac app & companion": ["Mac 应用与伴随程序", "App para Mac y acompañante"],

@@ -448,8 +448,13 @@ test("the dashboard keeps contribution review local while the public site owns d
     assert.doesNotMatch(appHtml, new RegExp(retiredControl, "u"), retiredControl);
   }
   assert.match(appHtml, /id="community-connect-consent"/u);
-  assert.match(appHtml, /id="prepare-contribution"/u);
-  assert.match(appHtml, /id="sync-run-once"/u);
+  // Re-pinned 2026-08-08 (owner-directed): the legacy prepare-and-review flow
+  // is removed outright. The approve-once surface is the only contribution
+  // flow, so the dashboard's local destination is now the consent card.
+  assert.doesNotMatch(appHtml, /id="prepare-contribution"/u);
+  assert.doesNotMatch(appHtml, /id="sync-run-once"/u);
+  assert.match(appHtml, /id="incremental-consent"/u);
+  assert.match(appHtml, /id="incremental-consent-approve"/u);
 });
 
 test("the community view degrades honestly without a service or a published week", () => {

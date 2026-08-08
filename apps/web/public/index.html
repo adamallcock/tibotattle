@@ -345,46 +345,6 @@
           </article>
         </div>
 
-        <article class="panel share-panel" id="share-panel">
-          <div class="panel-heading">
-            <div>
-              <p class="panel-kicker">Share</p>
-              <h3>A results card you can post</h3>
-            </div>
-            <span class="evidence-chip" id="share-card-reference">Reference pending</span>
-          </div>
-          <p class="annotation">
-            A ready-to-post image of the three headline figures. It contains no
-            prompts, responses, paths, account details, or raw activity.
-          </p>
-          <div class="share-preview">
-            <canvas
-              id="share-card-canvas"
-              role="img"
-              width="1200"
-              height="800"
-              aria-label="A results card is generated once local evidence is available."
-              data-i18n-aria-label="aria.shareCard"
-            ></canvas>
-          </div>
-          <div class="share-actions">
-            <button class="button button-primary" id="share-card-download" type="button" disabled>
-              Save image
-            </button>
-            <button class="button button-secondary" id="share-card-copy" type="button" disabled>
-              Copy image
-            </button>
-          </div>
-          <!--
-            Transient confirmation for a completed copy: it appears, holds a
-            few seconds, and leaves, instead of accumulating as permanent page
-            text under the card. A role="status" live region like the action
-            statuses elsewhere on this page, and it carries no focusable
-            content, so it cannot trap focus.
-          -->
-          <p class="share-toast" id="share-card-toast" role="status" hidden></p>
-          <p class="participant-action-status" id="share-card-status" role="status" hidden></p>
-        </article>
       </section>
 
       <section class="dashboard-section lead-section dashboard-page-inactive" id="weekly" aria-labelledby="weekly-title" data-dashboard-page="weekly" data-requires-evidence aria-hidden="true" inert>
@@ -427,11 +387,22 @@
             <span><i class="legend-dot weekly-center"></i>All-data median</span>
             <span><i class="legend-dot weekly-mature"></i><span id="weekly-span-legend">Observed across 50+ points</span></span>
             <span id="weekly-partial-legend" hidden><i class="legend-dot weekly-partial"></i>Short observation</span>
+            <span><i class="legend-dot weekly-error-bar"></i>Slope-agreement range</span>
           </div>
           <div class="chart-empty small" id="weekly-empty">No weekly estimates loaded.</div>
           <div class="chart-shell weekly-history-chart" id="weekly-chart" hidden></div>
+          <!--
+            Honest naming for the per-reset bars: they are the 10th-to-90th
+            percentile spread of slopes formed from different pairs of observed
+            quota boundaries WITHIN one reset — a disagreement diagnostic. The
+            calibration report states the same thing; calling it a measured or
+            confidence range here overclaimed.
+          -->
           <p class="annotation">
-            Each reset estimate is shown with the range supported by that reset’s observations.
+            Each reset estimate is drawn with its slope-agreement range: the
+            spread of slopes from different pairs of observed quota boundaries
+            within that reset. It is a within-reset disagreement diagnostic,
+            not a confidence interval.
           </p>
           <!-- The zone is named once per chart, from the reader's own system
                zone, instead of being repeated on every tick and tooltip. -->
@@ -448,7 +419,7 @@
                   <th scope="col">Observed</th>
                   <th scope="col">Observed span</th>
                   <th scope="col">Estimate</th>
-                  <th scope="col">Measured range</th>
+                  <th scope="col">Slope-agreement range</th>
                   <th scope="col">Status</th>
                 </tr>
               </thead>
@@ -458,6 +429,53 @@
             </table>
           </div>
         </details>
+
+        <!--
+          Owner-directed 2026-08-08: the shareable results card lives at the
+          bottom of the Allowance page. Its headline figure and plotted
+          history are this page's estimate, so the card sits under the
+          evidence it summarizes rather than on the Overview.
+        -->
+        <article class="panel share-panel" id="share-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Share</p>
+              <h3>A results card you can post</h3>
+            </div>
+            <span class="evidence-chip" id="share-card-reference">Reference pending</span>
+          </div>
+          <p class="annotation">
+            A ready-to-post image of the three headline figures. It contains no
+            prompts, responses, paths, account details, or raw activity.
+          </p>
+          <div class="share-preview">
+            <canvas
+              id="share-card-canvas"
+              role="img"
+              width="1200"
+              height="800"
+              aria-label="A results card is generated once local evidence is available."
+              data-i18n-aria-label="aria.shareCard"
+            ></canvas>
+          </div>
+          <div class="share-actions">
+            <button class="button button-primary" id="share-card-download" type="button" disabled>
+              Save image
+            </button>
+            <button class="button button-secondary" id="share-card-copy" type="button" disabled>
+              Copy image
+            </button>
+          </div>
+          <!--
+            Transient confirmation for a completed copy: it appears, holds a
+            few seconds, and leaves, instead of accumulating as permanent page
+            text under the card. A role="status" live region like the action
+            statuses elsewhere on this page, and it carries no focusable
+            content, so it cannot trap focus.
+          -->
+          <p class="share-toast" id="share-card-toast" role="status" hidden></p>
+          <p class="participant-action-status" id="share-card-status" role="status" hidden></p>
+        </article>
       </section>
 
       <section class="dashboard-section dashboard-page-inactive" id="timeline" aria-labelledby="timeline-title" data-dashboard-page="trends" data-requires-evidence aria-hidden="true" inert>
@@ -700,10 +718,10 @@
           The guided journey, stated as stages with visible state. Every chip
           and detail line is rendered from measured facts: companion health,
           the counted index sources, the freshness of local evidence, and the
-          sign-in / connection state. Sign-in and connection are stage four,
-          shown before any effort is invested below, so nobody prepares and
-          reviews a summary only to discover Send needs a login somewhere
-          else on the page.
+          sign-in / connection state. Each detail line is one short sentence
+          (owner-directed 2026-08-08: the previous multi-clause copy wrapped
+          to eight lines at typical widths), and the whole journey states the
+          final flow: sign in → connect → approve once → syncs automatically.
         -->
         <ol class="journey-stages" id="community-journey" aria-label="Contribution journey stages" data-i18n-aria-label="aria.contributionJourney">
           <li class="journey-stage" id="journey-stage-app">
@@ -737,10 +755,11 @@
         </ol>
         <div class="contribution-cta-copy">
           <p class="eyebrow">Optional</p>
-          <h2 id="contribution-cta-title">Share one anonymous summary</h2>
+          <h2 id="contribution-cta-title">Contribute anonymous usage data</h2>
           <p>
-            Help improve community estimates by sharing one summary. You see it
-            before anything is sent.
+            Help improve community estimates: sign in, connect this Mac, and
+            approve once. You see the covered data before anything is sent;
+            after approval it stays current automatically.
           </p>
           <details class="contribution-categories">
             <summary>What leaves this Mac — and what never does</summary>
@@ -837,7 +856,7 @@
           <label class="consent-row contribution-primary-consent">
             <input id="community-connect-consent" type="checkbox">
             <span>
-              <strong>I want to review a summary and decide whether to send it.</strong>
+              <strong>I want to review the covered data and decide whether to approve it.</strong>
             </span>
           </label>
           <div class="contribution-cta-buttons">
@@ -870,6 +889,15 @@
             the v1.0 sync capability, because until that transport exists this
             surface would describe an upload that cannot happen. No dead
             toggles: the section is hidden, not disabled.
+
+            Owner-directed 2026-08-08: this is the ONLY contribution flow.
+            The legacy "Prepare and review a contribution" disclosure — the
+            lookback picker, the prepare button and the manual send card —
+            is removed, not hidden. The review-bootstrap the approve gate
+            still requires (one verified real instance of the covered data on
+            screen) is produced invisibly: the page prepares and verifies it
+            by itself and renders the result below, so the reader meets one
+            review and one Approve button, never preparation steps.
           -->
           <section class="panel incremental-consent" id="incremental-consent" aria-labelledby="incremental-consent-title" hidden>
             <div class="panel-heading">
@@ -904,9 +932,27 @@
                 </p>
               </div>
             </details>
+            <!--
+              One verified real instance of the covered data, prepared and
+              verified on this Mac by the page itself. These facts are the
+              review the approve gate requires; they appear once the local
+              verification succeeds and are never a step the reader performs.
+            -->
+            <dl class="summary-facts incremental-review-facts" id="incremental-review-facts" hidden>
+              <div><dt>Time covered</dt><dd id="incremental-review-coverage">—</dd></div>
+              <div><dt>Items included</dt><dd id="incremental-review-records">—</dd></div>
+              <div><dt>Upload size</dt><dd id="incremental-review-bytes">—</dd></div>
+            </dl>
             <div class="contribution-cta-buttons">
               <button class="button button-primary" id="incremental-consent-approve" type="button" disabled>
                 Approve this kind of data
+              </button>
+              <!--
+                Error recovery only: hidden until the invisible review
+                bootstrap fails, so the happy path stays a single button.
+              -->
+              <button class="button button-quiet" id="incremental-review-retry" type="button" hidden>
+                Check again
               </button>
             </div>
             <p class="annotation" id="incremental-consent-gate"></p>
@@ -915,100 +961,26 @@
               destination asks again.
             </p>
             <p class="participant-action-status" id="incremental-consent-status" role="status" hidden></p>
+            <!--
+              The modest status line for the running sync after approval:
+              days synced and pending, the paused reason, and the last error
+              code, all from the companion's bounded incremental-status
+              projection. No path, no content, no identifier.
+            -->
+            <p class="annotation" id="incremental-sync-status" role="status" hidden></p>
           </section>
-          <details class="journey-disclosure community-review" id="community-contribution-disclosure">
-            <summary>
-              <span>
-                <span class="panel-kicker">Review before sending</span>
-                <strong>Prepare and review a contribution</strong>
-              </span>
-              <span class="evidence-chip neutral">Nothing sends automatically</span>
-            </summary>
-            <article class="panel contribution-panel" id="contribution-review">
-              <p class="annotation">
-                Everything here happens on your Mac. Sending is a separate
-                button you press after you have looked at the summary.
-              </p>
-              <div class="local-preparation">
-                <p class="control-label">Prepare a summary</p>
-                <!--
-                  Only shown when the reader has to do something about it. A
-                  chip that says the Keychain will be checked later does not
-                  change anyone's next action.
-                -->
-                <p class="notice notice-warning preparation-readiness" id="preparation-identity" hidden></p>
-                <div class="preparation-window">
-                  <span class="control-label">How much to include</span>
-                  <div class="segmented-control" id="contribution-lookback-controls" aria-label="Contribution preparation lookback" data-i18n-aria-label="aria.contributionLookback">
-                    <button type="button" data-lookback-hours="1">1 hour</button>
-                    <button type="button" data-lookback-hours="24" class="active" aria-pressed="true">24 hours</button>
-                    <button type="button" data-lookback-hours="168">7 days</button>
-                  </div>
-                </div>
-                <p class="annotation" id="preparation-estimate">
-                  Analyze your local usage first to see how much would be
-                  included.
-                </p>
-                <button class="button button-secondary" id="prepare-contribution" type="button">
-                  Prepare and review last 24 hours
-                </button>
-                <p class="participant-action-status" id="prepare-contribution-status" role="status">
-                  Nothing is sent until you have looked at the summary and pressed Send.
-                </p>
-              </div>
-              <!--
-                The summary card is the review. A separate "Review summary"
-                button used to reveal exactly the facts already printed here,
-                so the click was pure friction; it is collapsed. The review
-                GATE survives unchanged: TiboTattle still verifies this exact
-                prepared set on this Mac and mints a one-use review token, and
-                Send stays disabled until that verification succeeds.
-              -->
-              <div class="sync-next-card" id="sync-next-card">
-                <div class="panel-heading compact-heading">
-                  <div>
-                    <p class="panel-kicker">Your summary</p>
-                    <h3 id="sync-next-title">This summary is the review</h3>
-                  </div>
-                  <span class="evidence-chip neutral" id="sync-next-state">Checking…</span>
-                </div>
-                <dl class="summary-facts sync-next-facts">
-                  <div><dt>Time covered</dt><dd id="sync-next-coverage">—</dd></div>
-                  <div><dt>Items included</dt><dd id="sync-next-records">—</dd></div>
-                  <div><dt>API-price estimate</dt><dd id="sync-next-cost">—</dd></div>
-                  <div><dt>Upload size</dt><dd id="sync-next-bytes">—</dd></div>
-                </dl>
-                <div class="sync-actions" aria-label="Contribution review controls" data-i18n-aria-label="aria.foregroundContributionControls">
-                  <button class="button button-primary" id="sync-run-once" type="button" disabled>
-                    Send summary
-                  </button>
-                  <button class="button button-quiet" id="sync-review-retry" type="button" hidden>
-                    Check summary again
-                  </button>
-                </div>
-                <!--
-                  Why Send is off, stated where Send is. This line is the fix
-                  for "clicking submit says it fails, because it needs a
-                  login": the missing sign-in or connection is named here,
-                  before any click, instead of after a failed send.
-                -->
-                <p class="annotation sync-gate-reason" id="sync-gate-reason" role="status" hidden></p>
-                <p class="annotation">
-                  Send unlocks only after these exact figures are verified on
-                  this Mac. What you see summarized here is exactly what would
-                  be sent.
-                </p>
-                <p class="participant-action-status" id="sync-action-status" role="status" hidden></p>
-              </div>
-            </article>
-          </details>
       </section>
 
     </main>
 
+    <!--
+      Owner-directed 2026-08-08: the "Dashboard contract: …" line is gone from
+      the user-facing footer. The contract version stays discoverable to
+      machines through the payload itself (data.schemaVersion) and on the
+      share card's text transcript; it was never a fact a reader acts on.
+    -->
     <footer data-i18n-legacy-root>
       <p>TiboTattle · not affiliated with OpenAI or Thibault Sottiaux</p>
-      <p id="schema-version">Dashboard contract: waiting</p>
     </footer>
       </div>
     </div>

@@ -621,6 +621,102 @@ export function normalizeContributionSyncStatus(payload) {
   };
 }
 
+// The bounded incremental-status projection the approve-once surface reads:
+// consent verdict, day-count progress, pause reason and last outcome as
+// fixed-vocabulary codes. Anything else in the payload fails the read closed.
+const INCREMENTAL_SYNC_STATUS_SCHEMA_VERSION =
+  "local-incremental-contribution-sync-v1.0";
+const INCREMENTAL_SYNC_CODE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/u;
+const INCREMENTAL_SYNC_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
+
+export function normalizeIncrementalContributionSyncStatus(payload) {
+  const unavailable = Object.freeze({
+    status: "unavailable",
+    consent: Object.freeze({ approved: false, current: false, consentedAt: "" }),
+    paused: false,
+    pausedReason: null,
+    running: false,
+    progress: null,
+    lastAttemptAt: "",
+    nextAttemptAt: "",
+    lastOutcome: null
+  });
+  if (payload?.schemaVersion !== INCREMENTAL_SYNC_STATUS_SCHEMA_VERSION
+      || payload?.status !== "available"
+      || typeof payload?.paused !== "boolean"
+      || typeof payload?.running !== "boolean"
+      || typeof payload?.consent?.approved !== "boolean"
+      || typeof payload?.consent?.current !== "boolean"
+      || payload?.includesContent !== false
+      || payload?.includesPaths !== false
+      || payload?.includesIdentifiers !== false
+      || payload?.includesCredentials !== false) {
+    return unavailable;
+  }
+  const consentedAt = text(payload.consent.consentedAt, "");
+  const lastAttemptAt = text(payload.lastAttemptAt, "");
+  const nextAttemptAt = text(payload.nextAttemptAt, "");
+  if ((consentedAt && !Number.isFinite(Date.parse(consentedAt)))
+      || (lastAttemptAt && !Number.isFinite(Date.parse(lastAttemptAt)))
+      || (nextAttemptAt && !Number.isFinite(Date.parse(nextAttemptAt)))) {
+    return unavailable;
+  }
+  const rawProgress = payload.progress;
+  let progress = null;
+  if (rawProgress !== null && rawProgress !== undefined) {
+    const daysTotal = count(rawProgress.daysTotal, null);
+    const daysSynced = count(rawProgress.daysSynced, null);
+    const daysPending = count(rawProgress.daysPending, null);
+    const chunksUploaded = count(rawProgress.chunksUploaded, null);
+    const acknowledgedThroughDay = rawProgress.acknowledgedThroughDay ?? null;
+    if (daysTotal === null || daysSynced === null || daysPending === null
+        || chunksUploaded === null
+        || (acknowledgedThroughDay !== null
+          && !INCREMENTAL_SYNC_DAY_PATTERN.test(acknowledgedThroughDay))) {
+      return unavailable;
+    }
+    progress = Object.freeze({
+      daysTotal,
+      daysSynced,
+      daysPending,
+      chunksUploaded,
+      acknowledgedThroughDay
+    });
+  }
+  const rawOutcome = payload.lastOutcome;
+  let lastOutcome = null;
+  if (rawOutcome !== null && rawOutcome !== undefined) {
+    if (!Number.isFinite(Date.parse(rawOutcome.at ?? ""))
+        || !INCREMENTAL_SYNC_CODE_PATTERN.test(rawOutcome.code ?? "")
+        || !["succeeded", "partial", "failed", "paused"].includes(rawOutcome.status)) {
+      return unavailable;
+    }
+    lastOutcome = Object.freeze({
+      at: rawOutcome.at,
+      code: rawOutcome.code,
+      status: rawOutcome.status
+    });
+  }
+  return Object.freeze({
+    status: "available",
+    consent: Object.freeze({
+      approved: payload.consent.approved,
+      current: payload.consent.current,
+      consentedAt
+    }),
+    paused: payload.paused,
+    pausedReason: payload.paused
+      && INCREMENTAL_SYNC_CODE_PATTERN.test(payload.pausedReason ?? "")
+      ? payload.pausedReason
+      : null,
+    running: payload.running,
+    progress,
+    lastAttemptAt,
+    nextAttemptAt,
+    lastOutcome
+  });
+}
+
 export function normalizeAutomaticContributionStatus(payload) {
   const unavailable = Object.freeze({
     state: "unavailable",
@@ -2808,7 +2904,12 @@ export function normalizeBackendReadiness(payload) {
 
 export class LocalCompanionClient {
   constructor({ fetchImpl = globalThis.fetch } = {}) {
-    this.fetchImpl = fetchImpl;
+    // Browser-native fetch is receiver-sensitive: invoked as a property of
+    // this client it throws "Illegal invocation" (WebKit: "Can only call
+    // Window.fetch on instances of Window") before any request leaves the
+    // page. Hold a detached wrapper so every method may call
+    // this.fetchImpl(...) directly.
+    this.fetchImpl = (...args) => fetchImpl(...args);
     // Set once the companion has answered 404/405 for the consolidated
     // endpoint, so the negotiation is not repeated on every later load.
     this.consolidatedUnavailable = false;
@@ -3020,6 +3121,25 @@ export class LocalCompanionClient {
     }
   }
 
+  /**
+   * The bounded status of the approved incremental full-history sync: the
+   * durable consent verdict, day-count progress, the paused reason and the
+   * last outcome, every code from a fixed vocabulary. A GET with no side
+   * effects; a failed read normalizes to the fail-closed unavailable shape.
+   */
+  async incrementalContributionSyncStatus() {
+    try {
+      return normalizeIncrementalContributionSyncStatus(
+        await fetchJson(
+          this.fetchImpl,
+          `${LOCAL_ROOT}/contribution/incremental-status`
+        )
+      );
+    } catch {
+      return normalizeIncrementalContributionSyncStatus(null);
+    }
+  }
+
   async pairContributionDevice(pairingCode) {
     const response = await this.fetchImpl(
       `${LOCAL_ROOT}/contribution/device-pair`,
@@ -3219,7 +3339,9 @@ export class CommunityClient {
     getCsrfToken = () => null,
     getParticipantId = () => null
   } = {}) {
-    this.fetchImpl = fetchImpl;
+    // Detached for the same reason as LocalCompanionClient: browser-native
+    // fetch throws when invoked with this client as its receiver.
+    this.fetchImpl = (...args) => fetchImpl(...args);
     this.getCsrfToken = getCsrfToken;
     this.getParticipantId = getParticipantId;
     this.pendingRecovery = null;
@@ -3248,10 +3370,7 @@ export class CommunityClient {
   }
 
   async readiness() {
-    // Browser-native fetch is receiver-sensitive. Calling it as a property of
-    // this client can throw "Illegal invocation" before any request is made.
-    const fetchImpl = this.fetchImpl;
-    const response = await fetchImpl("/api/ready", {
+    const response = await this.fetchImpl("/api/ready", {
       headers: { Accept: "application/json" }
     });
     if (![200, 503].includes(response.status)) {

@@ -2450,6 +2450,167 @@ private final class NativeSidebarBrandWash: NSView {
     }
 }
 
+/// Hosts the titlebar brand row and keeps it on the titlebar controls' own
+/// axis. AppKit stretches a `.left` accessory to the full titlebar container
+/// — measured 66pt tall on macOS 26 under the unified toolbar — while the
+/// traffic lights and the toolbar's own controls centre on the 52pt toolbar
+/// row at the top of that container, so centring the brand in the accessory's
+/// own bounds sat it a visible 7pt low. The close button is public API
+/// (`standardWindowButton(_:)`) and is the row every other titlebar control
+/// aligns with, so layout measures its centre and matches it, falling back to
+/// this view's own centre when the button is absent.
+private final class NativeTitlebarBrandRow: NSView {
+    private let content: NSView
+
+    init(content: NSView) {
+        self.content = content
+        super.init(frame: NSRect(origin: .zero, size: content.fittingSize))
+        addSubview(content)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        let size = content.fittingSize
+        var centerY = bounds.midY
+        if let anchor = window?.standardWindowButton(.closeButton),
+           let anchorSuperview = anchor.superview {
+            let anchorInWindow = anchorSuperview.convert(
+                anchor.frame,
+                to: nil
+            )
+            centerY = convert(anchorInWindow, from: nil).midY
+        }
+        content.frame = NSRect(
+            x: 0,
+            y: (centerY - size.height / 2).rounded(),
+            width: size.width,
+            height: size.height
+        )
+    }
+}
+
+/// One toolbar status-pill colorway: the title-and-glyph tint plus the pill
+/// fill. Values mirror the web report's state-pill tokens in
+/// apps/web/public/styles.css — `.state-live` (--green #174f45 on
+/// --green-soft #dfece6), `.state-updating` (--amber #815718 on --amber-soft
+/// #f4ead7), and `.state-offline` (--rust #97402a on --rust-soft #f4e4de) —
+/// so the native pill and the web pill read as the same control. The dark
+/// appearance lifts each text tone the way NativeBrandPalette lifts the
+/// accent, and thins the fill to a wash so the pill stays legible on the
+/// dark unified toolbar.
+private struct NativeToolbarStatusColor {
+    let text: NSColor
+    let background: NSColor
+
+    /// Fresh, live evidence. Web `.state-live`.
+    static let fresh = NativeToolbarStatusColor(
+        text: stateColor(
+            light: (red: 23, green: 79, blue: 69, alpha: 1),
+            dark: (red: 122, green: 184, blue: 170, alpha: 1)
+        ),
+        background: stateColor(
+            light: (red: 223, green: 236, blue: 230, alpha: 1),
+            dark: (red: 122, green: 184, blue: 170, alpha: 0.16)
+        )
+    )
+
+    /// A running refresh or a history index still building. Web
+    /// `.state-updating`.
+    static let busy = NativeToolbarStatusColor(
+        text: stateColor(
+            light: (red: 129, green: 87, blue: 24, alpha: 1),
+            dark: (red: 214, green: 166, blue: 92, alpha: 1)
+        ),
+        background: stateColor(
+            light: (red: 244, green: 234, blue: 215, alpha: 1),
+            dark: (red: 214, green: 166, blue: 92, alpha: 0.16)
+        )
+    )
+
+    /// The companion reported the last refresh failed. Web `.state-offline`.
+    static let failed = NativeToolbarStatusColor(
+        text: stateColor(
+            light: (red: 151, green: 64, blue: 42, alpha: 1),
+            dark: (red: 224, green: 138, blue: 109, alpha: 1)
+        ),
+        background: stateColor(
+            light: (red: 244, green: 228, blue: 222, alpha: 1),
+            dark: (red: 224, green: 138, blue: 109, alpha: 0.18)
+        )
+    )
+
+    /// Evidence that is stale, unread, or not yet known: the system's own
+    /// secondary tone on a bare fill, claiming nothing.
+    static let idle = NativeToolbarStatusColor(
+        text: .secondaryLabelColor,
+        background: stateColor(
+            light: (red: 0, green: 0, blue: 0, alpha: 0.05),
+            dark: (red: 255, green: 255, blue: 255, alpha: 0.08)
+        )
+    )
+
+    private static func stateColor(
+        light: (red: CGFloat, green: CGFloat, blue: CGFloat, alpha: CGFloat),
+        dark: (red: CGFloat, green: CGFloat, blue: CGFloat, alpha: CGFloat)
+    ) -> NSColor {
+        NSColor(name: nil) { appearance in
+            let tone = appearance.bestMatch(
+                from: [.darkAqua, .aqua]
+            ) == .darkAqua ? dark : light
+            return NSColor(
+                srgbRed: tone.red / 255,
+                green: tone.green / 255,
+                blue: tone.blue / 255,
+                alpha: tone.alpha
+            )
+        }
+    }
+}
+
+/// The toolbar status control's pill dressing. An `NSButton` bezel refuses
+/// `contentTintColor` for its title — measured, the textured bezel rendered
+/// the state words in plain label black — so the button rides borderless
+/// inside this view, which owns the rounded state-colored fill and hairline.
+/// The fill re-resolves its dynamic colors in `updateLayer`, which AppKit
+/// calls with this view's effective appearance current — the same appearance
+/// seam NativeSidebarBrandWash uses.
+private final class NativeToolbarStatusPill: NSView {
+    var colorway: NativeToolbarStatusColor = .idle {
+        didSet { needsDisplay = true }
+    }
+
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        guard let layer else { return }
+        layer.backgroundColor = colorway.background.cgColor
+        layer.borderColor = colorway.text.cgColor.copy(alpha: 0.22)
+        layer.borderWidth = 1
+        layer.cornerRadius = bounds.height / 2
+    }
+
+    override func layout() {
+        super.layout()
+        layer?.cornerRadius = bounds.height / 2
+    }
+}
+
 /// The native frame for the loopback dashboard. WebKit remains responsible for
 /// the rich charts and accessible, selectable report content. AppKit owns the
 /// sidebar here, while the window's unified toolbar owns status, refresh,
@@ -2766,6 +2927,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private var dashboardContentController: NSViewController?
     private weak var launcherColumn: NSStackView?
     private weak var nativeStatusRefreshButton: NSButton?
+    private weak var nativeStatusPill: NativeToolbarStatusPill?
     private weak var nativeStatusToolbarItem: NSToolbarItem?
     private weak var nativeShareToolbarItem: NSToolbarItem?
     private weak var nativeSettingsToolbarItem: NSToolbarItem?
@@ -3333,11 +3495,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         row.spacing = 6
         row.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 6)
         // Titlebar accessories are sized from the view's frame, not from a
-        // constraint relationship with the titlebar.
+        // constraint relationship with the titlebar. AppKit then stretches a
+        // left accessory to the full titlebar container height — taller than
+        // the toolbar row the traffic lights centre on — so the stack rides
+        // inside NativeTitlebarBrandRow, which re-centres it on the
+        // traffic-light axis instead of the container's own midline.
         row.layoutSubtreeIfNeeded()
         row.frame = NSRect(origin: .zero, size: row.fittingSize)
         let accessory = NSTitlebarAccessoryViewController()
-        accessory.view = row
+        accessory.view = NativeTitlebarBrandRow(content: row)
         accessory.layoutAttribute = .left
         return accessory
     }
@@ -3398,7 +3564,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 target: self,
                 action: #selector(refreshDashboardFromToolbar)
             )
-            button.bezelStyle = .texturedRounded
+            // Borderless: a bezel draws its own background and refuses
+            // contentTintColor for the title, which is exactly the
+            // plain-black pill the owner reported. The state-colored fill
+            // belongs to the NativeToolbarStatusPill the button rides in.
+            button.isBordered = false
             button.imagePosition = .imageLeading
             button.alignment = .left
             button.font = .systemFont(ofSize: 12, weight: .medium)
@@ -3418,8 +3588,31 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             button.widthAnchor.constraint(
                 lessThanOrEqualToConstant: 320
             ).isActive = true
-            item.view = button
+            let pill = NativeToolbarStatusPill()
+            pill.translatesAutoresizingMaskIntoConstraints = false
+            button.translatesAutoresizingMaskIntoConstraints = false
+            pill.addSubview(button)
+            NSLayoutConstraint.activate([
+                button.leadingAnchor.constraint(
+                    equalTo: pill.leadingAnchor,
+                    constant: 12
+                ),
+                button.trailingAnchor.constraint(
+                    equalTo: pill.trailingAnchor,
+                    constant: -12
+                ),
+                button.topAnchor.constraint(
+                    equalTo: pill.topAnchor,
+                    constant: 5
+                ),
+                button.bottomAnchor.constraint(
+                    equalTo: pill.bottomAnchor,
+                    constant: -5
+                ),
+            ])
+            item.view = pill
             nativeStatusRefreshButton = button
+            nativeStatusPill = pill
             nativeStatusToolbarItem = item
             updateNativeToolbar(
                 title: nativeToolbarEvidenceTitle(
@@ -3490,20 +3683,34 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         )
         nativeStatusRefreshButton?.isEnabled = refreshEnabled && !isRefreshing
         nativeStatusRefreshButton?.setAccessibilityLabel(statusTitle)
-        nativeStatusRefreshButton?.contentTintColor =
-            nativeToolbarStatusColor(isRefreshing: isRefreshing)
+        let colorway = nativeToolbarStatusColor(isRefreshing: isRefreshing)
+        nativeStatusRefreshButton?.contentTintColor = colorway.text
+        nativeStatusPill?.colorway = colorway
         nativeShareToolbarItem?.isEnabled = dashboardWebViewShowing
     }
 
-    private func nativeToolbarStatusColor(isRefreshing: Bool) -> NSColor {
+    /// The pill's colorway follows nativeToolbarEvidenceTitle's own
+    /// precedence — a running refresh, then a terminal failure, then an
+    /// incomplete history index, and only then the evidence state — so the
+    /// color never claims a state the words do not.
+    private func nativeToolbarStatusColor(
+        isRefreshing: Bool
+    ) -> NativeToolbarStatusColor {
         if isRefreshing {
-            return .systemYellow
+            return .busy
+        }
+        if nativeRefreshFailure != nil {
+            return .failed
+        }
+        if let coverage = nativeHistoryIndexingCoverage,
+           !coverage.isComplete {
+            return .busy
         }
         switch nativeEvidenceState {
         case .live:
-            return .systemGreen
+            return .fresh
         case .stale, .unknown, .readFailed, .lifecycleUnavailable:
-            return .secondaryLabelColor
+            return .idle
         }
     }
 
@@ -3530,8 +3737,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 )
         )
         nativeStatusRefreshButton?.setAccessibilityLabel(statusTitle)
-        nativeStatusRefreshButton?.contentTintColor =
-            nativeToolbarStatusColor(isRefreshing: nativeRefreshInFlight)
+        let colorway = nativeToolbarStatusColor(
+            isRefreshing: nativeRefreshInFlight
+        )
+        nativeStatusRefreshButton?.contentTintColor = colorway.text
+        nativeStatusPill?.colorway = colorway
         nativeStatusToolbarItem?.label = TiboTattleLocalization.string(
             .nativeDashboardRefreshUsage
         )

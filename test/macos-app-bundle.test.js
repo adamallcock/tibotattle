@@ -1012,8 +1012,26 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /newWindow\.setContentSize\(NSSize\(width: 760, height: 620\)\)/u);
   assert.match(source, /nativeStatusRefreshButton\?\.contentTintColor/u);
   assert.match(source, /nativeToolbarStatusColor\(isRefreshing:/u);
-  assert.match(source, /\.systemYellow/u);
-  assert.match(source, /\.systemGreen/u);
+  // Deliberately re-pinned 2026-08-08: the status pill dropped the system
+  // tints (.systemYellow/.systemGreen never reached a bezelled title anyway)
+  // for the web dashboard's state-pill palette — green #174f45 for fresh,
+  // amber #815718 for running/indexing, rust #97402a for a failed refresh —
+  // resolved per appearance and painted as a rounded fill behind a
+  // borderless, tint-aware button.
+  assert.match(source, /private struct NativeToolbarStatusColor/u);
+  assert.match(source, /light: \(red: 23, green: 79, blue: 69, alpha: 1\)/u);
+  assert.match(source, /light: \(red: 129, green: 87, blue: 24, alpha: 1\)/u);
+  assert.match(source, /light: \(red: 151, green: 64, blue: 42, alpha: 1\)/u);
+  assert.match(source, /private final class NativeToolbarStatusPill: NSView/u);
+  assert.match(source, /button\.isBordered = false/u);
+  assert.doesNotMatch(source, /\.systemYellow|\.systemGreen/u);
+  // The colorway mirrors the title's own precedence: a running refresh,
+  // then a terminal failure, then an incomplete index, then evidence.
+  assert.match(
+    source,
+    /private func nativeToolbarStatusColor\([\s\S]*?if isRefreshing \{[\s\S]*?return \.busy[\s\S]*?if nativeRefreshFailure != nil \{[\s\S]*?return \.failed[\s\S]*?!coverage\.isComplete \{[\s\S]*?return \.busy[\s\S]*?case \.live:[\s\S]*?return \.fresh/u,
+  );
+  assert.match(source, /nativeStatusPill\?\.colorway = colorway/u);
   assert.match(source, /nativeDashboardFresh/u);
   assert.match(source, /nativeDashboardNeedsRefresh/u);
   assert.match(
@@ -1510,6 +1528,28 @@ test("dashboard sidebar resizes for real, wears the brand palette, and the title
   assert.match(accessory, /wordmark\.textColor = NativeBrandPalette\.accent/u);
   assert.match(accessory, /accessory\.layoutAttribute = \.left/u);
   assert.doesNotMatch(accessory, /WKWebView|WebKit/u);
+  // Deliberately re-pinned 2026-08-08: AppKit stretches a left accessory to
+  // the full titlebar container (66pt on macOS 26) while the traffic lights
+  // and toolbar controls centre on the toolbar row at its top, which sat the
+  // brand a visible 7pt low. The row now rides in NativeTitlebarBrandRow,
+  // which centres it on the close button's own measured axis.
+  assert.match(
+    accessory,
+    /accessory\.view = NativeTitlebarBrandRow\(content: row\)/u,
+  );
+  const brandRow = source.match(
+    /private final class NativeTitlebarBrandRow: NSView \{[\s\S]*?\n\}/u,
+  )?.[0] ?? "";
+  assert.ok(brandRow, "titlebar brand row container should be present");
+  assert.match(
+    brandRow,
+    /window\?\.standardWindowButton\(\.closeButton\)/u,
+  );
+  assert.match(brandRow, /centerY = convert\(anchorInWindow, from: nil\)\.midY/u);
+  assert.match(
+    brandRow,
+    /y: \(centerY - size\.height \/ 2\)\.rounded\(\)/u,
+  );
 });
 
 test("menu-bar status item degrades honestly and never invents allowance evidence", async () => {
