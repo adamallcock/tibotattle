@@ -3587,9 +3587,17 @@ export class CommunityClient {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        // Re-pinned 2026-08-08 (v1.0 wiring): a telemetry participant's
+        // pairing requests the v1.0 incremental consent identifier. The
+        // Worker pins it on the pairing, and the companion's CLAIM of that
+        // pairing is what records the server-side consent-once grant that
+        // every v1.0 chunk upload is verified against — a pairing still
+        // carrying "ongoing-privacy-safe-telemetry-v0.1" leaves every upload
+        // refused 403 TELEMETRY_CONSENT_INVALID. The account-scoped preview
+        // keeps its own single identifier.
         consentVersion: accountScoped
           ? "ongoing-privacy-safe-telemetry-v0.2"
-          : "ongoing-privacy-safe-telemetry-v0.1",
+          : "ongoing-privacy-safe-telemetry-v1.0",
         ongoingUpload: true
       })
     }));

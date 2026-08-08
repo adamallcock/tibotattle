@@ -100,7 +100,9 @@ function fakeStore() {
 }
 
 function fakeIncrementalController() {
-  const calls = { start: 0, stop: 0, approve: 0, resume: 0, inspect: 0 };
+  const calls = {
+    start: 0, stop: 0, approve: 0, resume: 0, inspect: 0, runDue: 0,
+  };
   let approved = false;
   const projection = () => ({
     schemaVersion: "incremental-contribution-sync-status-v1.0",
@@ -148,7 +150,19 @@ function fakeIncrementalController() {
       calls.resume += 1;
       return projection();
     },
+    async runDue() {
+      calls.runDue += 1;
+      return projection();
+    },
   };
+}
+
+// The immediate-first-pass kicks are fire-and-forget on the response path
+// (2026-08-08), so give the event loop a few turns before counting them.
+async function settleKicks() {
+  for (let turn = 0; turn < 8; turn += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
 }
 
 async function fixture() {
@@ -384,6 +398,11 @@ test("approve-once requires the review token minted by an exact review, exactly 
       includesCredentials: false,
     });
     assert.equal(controller.calls.approve, 1);
+    // 2026-08-08 (owner-directed immediate first pass): the approval must
+    // become a running sync pass in this process tick, not a pending timer —
+    // the route fires the controller's own due-run right after it answers.
+    await settleKicks();
+    assert.equal(controller.calls.runDue >= 1, true);
 
     // Single use: the same token cannot approve twice.
     const replay = await fetch(
@@ -467,6 +486,10 @@ test("an unconfigured companion refuses the approval and a device pairing resume
     // The cure for a device_unavailable auto-pause is the same pairing that
     // cures the v0.1 queue.
     assert.equal(controller.calls.resume, 1);
+    // 2026-08-08: a fresh pairing also translates into a prompt sync attempt
+    // — the re-pair path must not leave its first pass waiting on a timer.
+    await settleKicks();
+    assert.equal(controller.calls.runDue >= 1, true);
   } finally {
     await paired.close();
     await rm(files.root, { recursive: true });

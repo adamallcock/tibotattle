@@ -27,6 +27,13 @@ const EARLY_HEADLINE_RECENT_TAIL_BYTES = 4 * 1024 * 1024;
 const EARLY_HEADLINE_RECENT_PRELUDE_BYTES = 512 * 1024;
 const EARLY_HEADLINE_BUFFERED_LINE_BYTES = 1024 * 1024;
 const MAX_REUSABLE_ACCOUNTING_CACHE_AGE_MS = 30 * 60 * 1_000;
+// Standing owner rule (2026-08-08, after five rounds of cap-shuffling): NEVER
+// introduce or retain small data-window caps — a history limit is either
+// absent or extreme (365+ days), never convenience-sized. 31 and 93 were both
+// wrong. This window now bounds only the periods/timeline scan; the
+// calibration corpus itself is sourced from the unified index (no time bound
+// at all) whenever that index is present.
+const ACCOUNTING_SCAN_WINDOW_DAYS = 365;
 const INDEXING_MODES = new Set(["recent_7d", "prospective"]);
 const INDEXING_STATUSES = new Set([
   "recent_7d_indexing",
@@ -516,6 +523,34 @@ export function createLocalCollectorRefreshRunner({
     const accountingMayRun = completedIndex === null
       || ["recent_7d_complete", "recent_7d_partial", "prospective_only"]
         .includes(completedIndex.status);
+    let unifiedIndex = null;
+    refreshStep = "unified_index";
+    if (refreshUnifiedIndex !== null && signal?.aborted !== true) {
+      // The unified index advances by its cursors, so this ordinarily reads
+      // only appended bytes. It runs BEFORE accounting so the full-history
+      // calibration corpus the accounting rebuild reads from the index
+      // already includes this pass's collection. A failure here must never
+      // block collection or quota reporting: the snapshot degrades honestly
+      // to the bounded window and says so.
+      try {
+        unifiedIndex = publicUnifiedIndexResult(await refreshUnifiedIndex({
+          codexHome,
+          ...(unifiedIndexFile === null ? {} : { indexFile: unifiedIndexFile }),
+          ...(unifiedIndexSecretFile === null
+            ? {}
+            : { secretFile: unifiedIndexSecretFile }),
+          signal,
+        }));
+      } catch (error) {
+        unifiedIndex = {
+          status: "failed",
+          errorCode: typeof error?.code === "string"
+              && error.code.startsWith("local_unified_index_")
+            ? error.code
+            : "local_unified_index_refresh_failed",
+        };
+      }
+    }
     let accounting = null;
     let accountingRefreshStatus = null;
     refreshStep = "accounting";
@@ -549,13 +584,14 @@ export function createLocalCollectorRefreshRunner({
           codexHome,
           ...(stateFile === null ? {} : { stateFile }),
           now: clock,
-          // 93 is the validator's ceiling and covers this corpus's full
-          // history (mid-May onward). Stopgap for the owner-reported
-          // "All time equals 30d" defect: the calibration corpus was bounded
-          // by this scan window, not by the range buttons. The real fix -
-          // deriving calibration transitions from the unified index - is
-          // tracked as follow-up.
-          windowDays: 93,
+          // The scan window bounds only the periods/timeline scan and obeys
+          // the standing rule above: extreme, never convenience-sized. The
+          // calibration corpus does not follow this window at all when the
+          // unified index is present — the rebuild reads the full indexed
+          // history through `unifiedIndexFile` and falls back to this window
+          // only when the index is missing or unreadable.
+          windowDays: ACCOUNTING_SCAN_WINDOW_DAYS,
+          ...(unifiedIndexFile === null ? {} : { unifiedIndexFile }),
           declaredSpeedBaselines,
           signal,
         });
@@ -589,32 +625,6 @@ export function createLocalCollectorRefreshRunner({
         now: clock,
         signal,
       });
-    }
-    let unifiedIndex = null;
-    refreshStep = "unified_index";
-    if (refreshUnifiedIndex !== null && signal?.aborted !== true) {
-      // The unified index advances by its cursors, so this ordinarily reads
-      // only appended bytes. A failure here must never block collection or
-      // quota reporting: the snapshot degrades honestly to the bounded window
-      // and says so.
-      try {
-        unifiedIndex = publicUnifiedIndexResult(await refreshUnifiedIndex({
-          codexHome,
-          ...(unifiedIndexFile === null ? {} : { indexFile: unifiedIndexFile }),
-          ...(unifiedIndexSecretFile === null
-            ? {}
-            : { secretFile: unifiedIndexSecretFile }),
-          signal,
-        }));
-      } catch (error) {
-        unifiedIndex = {
-          status: "failed",
-          errorCode: typeof error?.code === "string"
-              && error.code.startsWith("local_unified_index_")
-            ? error.code
-            : "local_unified_index_refresh_failed",
-        };
-      }
     }
     refreshStep = "assemble";
     if (collectorResourceLimitDeferred) throwCollectorResourceLimit();

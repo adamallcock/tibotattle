@@ -14,6 +14,10 @@ import {
   readLocalCollectorAccountingCache,
   writeLocalCollectorAccountingCache,
 } from "../src/local-collector-state.js";
+import {
+  createUnifiedIndexWriter,
+  openLocalUnifiedIndex,
+} from "../src/local-unified-index.js";
 import { buildRollingQuotaComparisons } from "@app-usagemonitor/quota-analysis";
 
 // The previous JSON paths are test-fixture names only. The wrappers prove the
@@ -319,7 +323,10 @@ test("projects replay-safe diagnostics and aggregates costs, dimensions, and 15-
   const cache = await buildReplaySafeAccountingCache({
     codexHome: "/private/example-codex-home",
     now: () => NOW,
-    windowDays: 31,
+    // Re-pinned 31 -> 365 (2026-08-08): the standing owner rule forbids
+    // convenience-sized history windows outright, so 365 is now the smallest
+    // window the builder accepts.
+    windowDays: 365,
     scan: async (options) => {
       observedScanOptions = options;
       return scanner(events)(options);
@@ -340,7 +347,8 @@ test("projects replay-safe diagnostics and aggregates costs, dimensions, and 15-
     missingLineageParents: 2,
   });
   assert.equal(observedScanOptions.codexHome, "/private/example-codex-home");
-  assert.equal(observedScanOptions.startAt, "2026-06-26T12:00:00.000Z");
+  // Re-pinned (2026-08-08): 365 days back from NOW, not 31.
+  assert.equal(observedScanOptions.startAt, "2025-07-27T12:00:00.000Z");
   assert.equal(observedScanOptions.endAt, "2026-07-27T12:00:00.000Z");
 
   const latest = period(cache, "24h");
@@ -459,9 +467,17 @@ test("projects replay-safe diagnostics and aggregates costs, dimensions, and 15-
     ],
   );
   assert.equal(cache.timeline[2].apiPriceEquivalentUsd, 53);
+  // Re-pinned (2026-08-08): the input receipt now names its corpus source and
+  // covered span, so full-history unified sourcing is distinguishable from
+  // the windowed fallback.
   assert.deepEqual(cache.weeklyCalibrationInput, {
     status: "complete",
     encoding: "accounting_compact_v2",
+    source: "windowed_scan",
+    coveredAt: {
+      startAt: "2025-07-27T12:00:00.000Z",
+      endAt: "2026-07-27T12:00:00.000Z",
+    },
     retainedUsageEvents: 4,
     retainedWeeklySnapshots: 0,
     estimatedRetainedBytes: 1_024,
@@ -679,7 +695,8 @@ test("the same lineage-aware scan produces a bounded weekly calibration summary"
   ];
   const cache = await buildReplaySafeAccountingCache({
     now: () => Date.parse("2026-08-20T12:00:00.000Z"),
-    windowDays: 31,
+    // Re-pinned 31 -> 365 (2026-08-08): the window floor is now 365 days.
+    windowDays: 365,
     scan: async ({ onUsage, onRateLimitSnapshot }) => {
       for (const [resetIndex, resetStart] of resetStarts.entries()) {
         const resetsAt = (resetStart + 7 * 24 * 60 * 60 * 1_000) / 1_000;
@@ -744,6 +761,213 @@ test("the same lineage-aware scan produces a bounded weekly calibration summary"
   ]) {
     assert.equal(serialized.includes(forbidden), false);
   }
+});
+
+// Fixture unified index for the full-history calibration tests: the same
+// three-reset shape the windowed calibration test uses, written as typed
+// rows. Each boundary carries one usage event so the derived transitions are
+// calibration-eligible.
+async function writeUnifiedCalibrationFixture(indexFile, {
+  resets,
+  boundaries = 10,
+}) {
+  const database = openLocalUnifiedIndex(indexFile, { create: true });
+  const writer = createUnifiedIndexWriter(database, {
+    contractVersion: "unified-calibration-test-v1",
+  });
+  const modelId = writer.internModel("gpt-5.6-terra", "recognized");
+  const tierId = writer.internTier({
+    apiServiceTier: "unknown",
+    billingSurface: "unknown",
+    codexSpeedMode: "unknown",
+    tierSource: "unknown",
+    providerTierRaw: null,
+  });
+  const surfaceId = writer.internSurface({
+    agentScope: "unknown",
+    surface: "unknown",
+    threadSource: "unknown",
+    lineageDisposition: "unknown",
+  });
+  const accountScopeId = writer.internAccountScope({
+    status: "unavailable",
+    reason: null,
+    planType: null,
+    scopeLocal: null,
+  });
+  const sessionLocal = Buffer.alloc(32, 7);
+  let eventNumber = 0;
+  for (const [resetIndex, resetStartMs] of resets.entries()) {
+    const resetsAtMs = resetStartMs + 7 * 24 * 60 * 60 * 1_000;
+    for (let boundary = 0; boundary < boundaries; boundary += 1) {
+      const observedMs = resetStartMs + boundary * 60 * 60 * 1_000;
+      if (boundary > 0) {
+        eventNumber += 1;
+        writer.writeUsageEvent({
+          eventKey: Buffer.from(`unified-calibration-event-${eventNumber}`),
+          observedAtMs: observedMs,
+          sessionLocal,
+          accountScopeId,
+          modelId,
+          tierId,
+          surfaceId,
+          reasoningEffort: 8,
+          outcome: 5,
+          tokensInUncached: 1_000_000 + resetIndex * 100_000,
+        });
+      }
+      writer.internQuota({
+        observedAtMs: observedMs,
+        limitId: "codex",
+        slot: "secondary",
+        planType: "pro",
+        usedPercent: boundary,
+        resetsAtMs,
+        durationMins: 10_080,
+      });
+    }
+  }
+  await writer.close({ integrityCheck: true, fsyncPath: indexFile });
+}
+
+// Standing owner rule (2026-08-08): with a unified index covering N months,
+// the calibration corpus spans all N months. The fixture resets sit MORE than
+// a year before "now" — outside every representable scan window — and the
+// scan itself returns nothing, so an estimate can only come from the index.
+test("the unified index supplies the full-history calibration corpus with no scan window", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-unified-calibration-"));
+  const indexFile = join(directory, "local-unified-index-v1.sqlite");
+  await writeUnifiedCalibrationFixture(indexFile, {
+    resets: [
+      Date.parse("2025-05-01T00:00:00.000Z"),
+      Date.parse("2025-05-08T00:00:00.000Z"),
+      Date.parse("2025-05-15T00:00:00.000Z"),
+    ],
+  });
+
+  const cache = await buildReplaySafeAccountingCache({
+    now: () => Date.parse("2026-08-20T12:00:00.000Z"),
+    unifiedIndexFile: indexFile,
+    scan: scanner([]),
+  });
+
+  assert.equal(cache.weeklyCalibrationInput.source, "unified_index");
+  assert.deepEqual(cache.weeklyCalibrationInput.coveredAt, {
+    startAt: "2025-05-01T00:00:00.000Z",
+    endAt: "2026-08-20T12:00:00.000Z",
+  });
+  assert.equal(cache.weeklyCalibrationInput.retainedUsageEvents, 27);
+  assert.equal(cache.weeklyCalibration.status, "estimated");
+  assert.equal(cache.weeklyCalibration.estimate.qualifyingResets, 3);
+  assert.equal(cache.weeklyCalibration.recentResets.length, 3);
+  assert.equal(
+    cache.weeklyCalibration.recentResets[0].firstObservedAt,
+    "2025-05-01T00:00:00.000Z",
+  );
+  // The cache's own scan coverage stays the requested window; only the
+  // calibration corpus escapes it.
+  assert.equal(cache.coveredAt.endAt, "2026-08-20T12:00:00.000Z");
+  assert.equal(cache.schemaVersion, REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION);
+});
+
+test("a missing or empty unified index degrades honestly to the windowed corpus", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-unified-fallback-"));
+  const missing = await buildReplaySafeAccountingCache({
+    now: () => NOW,
+    unifiedIndexFile: join(directory, "never-written.sqlite"),
+    scan: scanner([
+      usageEvent({
+        timestamp: "2026-07-27T11:55:00.000Z",
+        components: { input_uncached_tokens: 1_000_000 },
+      }),
+    ]),
+  });
+  assert.equal(missing.weeklyCalibrationInput.source, "windowed_scan");
+  assert.equal(missing.weeklyCalibrationInput.retainedUsageEvents, 1);
+
+  // An index that exists but holds no usage rows yet (first refresh mid-build)
+  // must also fall back rather than presenting an empty corpus as history.
+  const emptyIndexFile = join(directory, "empty-index.sqlite");
+  await writeUnifiedCalibrationFixture(emptyIndexFile, { resets: [] });
+  const empty = await buildReplaySafeAccountingCache({
+    now: () => NOW,
+    unifiedIndexFile: emptyIndexFile,
+    scan: scanner([
+      usageEvent({
+        timestamp: "2026-07-27T11:55:00.000Z",
+        components: { input_uncached_tokens: 1_000_000 },
+      }),
+    ]),
+  });
+  assert.equal(empty.weeklyCalibrationInput.source, "windowed_scan");
+});
+
+// Standing owner rule (2026-08-08): NEVER convenience-sized history windows.
+// 31 and 93 — the two values that were actually shipped — must now be
+// unrepresentable, not merely unused.
+test("convenience-sized scan windows are rejected outright", async () => {
+  for (const windowDays of [31, 93, 364]) {
+    await assert.rejects(
+      buildReplaySafeAccountingCache({
+        now: () => NOW,
+        windowDays,
+        scan: scanner([]),
+      }),
+      /Replay-safe accounting options are invalid/u,
+      `windowDays ${windowDays}`,
+    );
+  }
+});
+
+// The transition miner refuses more than 10,000 derived rows per call; the
+// real corpus already holds ~18k weekly transitions. The derivation is
+// batched by reset-window group, so a series past the single-call ceiling
+// must succeed and keep every transition.
+test("weekly transition derivation crosses the single-call row ceiling by group batching", async () => {
+  const resetStarts = [
+    Date.parse("2026-05-28T00:00:00.000Z"),
+    Date.parse("2026-06-04T00:00:00.000Z"),
+    Date.parse("2026-06-11T00:00:00.000Z"),
+    Date.parse("2026-06-18T00:00:00.000Z"),
+  ];
+  const boundariesPerReset = 3_001;
+  const cache = await buildReplaySafeAccountingCache({
+    now: () => Date.parse("2026-08-20T12:00:00.000Z"),
+    scan: async ({ onRateLimitSnapshot }) => {
+      for (const resetStart of resetStarts) {
+        const resetsAt = (resetStart + 7 * 24 * 60 * 60 * 1_000) / 1_000;
+        for (let boundary = 0; boundary < boundariesPerReset; boundary += 1) {
+          const observedMs = resetStart + boundary * 60_000;
+          onRateLimitSnapshot({
+            timestamp: new Date(observedMs).toISOString(),
+            timestampMs: observedMs,
+            window: {
+              provider: "openai_codex",
+              planType: "pro",
+              limitId: "codex",
+              slot: "secondary",
+              windowDurationMins: 10_080,
+              resetsAt,
+              usedPercent: Number((boundary / 100).toFixed(2)),
+            },
+          });
+        }
+      }
+      return { diagnostics: {} };
+    },
+  });
+
+  // 4 groups x 3,000 percent changes = 12,000 transitions — strictly more
+  // than one derivation call may return, so this passes only through the
+  // group-batched path, with every transition retained.
+  assert.equal(
+    cache.weeklyCalibration.sourceCounts.weeklyTransitions,
+    12_000,
+  );
+  assert.equal(
+    cache.weeklyCalibration.sourceCounts.rateLimitSnapshots,
+    4 * boundariesPerReset,
+  );
 });
 
 test("retains exact deterministic quota points for comparison brackets", async () => {
@@ -912,7 +1136,9 @@ test("retains duplicate-rich quota history across 31 days under the cap", async 
 
   const build = async (orderedSnapshots) => buildReplaySafeAccountingCache({
     now: () => Date.parse("2026-08-01T00:00:00.000Z"),
-    windowDays: 31,
+    // Re-pinned 31 -> 365 (2026-08-08): the window floor is now 365 days; the
+    // fixture still spans 31 days of observations.
+    windowDays: 365,
     scan: async ({ onRateLimitSnapshot }) => {
       for (const snapshot of orderedSnapshots) {
         onRateLimitSnapshot(snapshot);
@@ -984,7 +1210,9 @@ test("churn-rich quota history stays inside the cap and still spans the range", 
 
   const build = async (orderedSnapshots) => buildReplaySafeAccountingCache({
     now: () => Date.parse("2026-08-01T00:00:00.000Z"),
-    windowDays: 31,
+    // Re-pinned 31 -> 365 (2026-08-08): the window floor is now 365 days; the
+    // fixture still spans 31 days of observations.
+    windowDays: 365,
     scan: async ({ onRateLimitSnapshot }) => {
       for (const snapshot of orderedSnapshots) {
         onRateLimitSnapshot(snapshot);

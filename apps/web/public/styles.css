@@ -752,8 +752,7 @@ h1 {
   box-shadow: 0 18px 46px rgba(21, 40, 35, .07);
 }
 .contribution-cta > .community-public-evidence,
-.contribution-cta > .journey-stages,
-.contribution-cta > .incremental-consent {
+.contribution-cta > .journey-stages {
   grid-column: 1 / -1;
   min-width: 0;
 }
@@ -963,12 +962,28 @@ h1 {
   font-size: .68rem;
 }
 .identity-account .button { flex: none; margin-inline-start: auto; }
-/* Doubled so it still wins against the shared `.consent-row` surface, which is
-   declared later in this sheet at the same specificity. */
-.consent-row.contribution-primary-consent {
+/* (.contribution-primary-consent left with the connect checkbox it styled,
+   owner-directed 2026-08-08: the explicit approval IS the consent now.) */
+/*
+ * One surface (owner-directed, 2026-08-08): the approve ceremony sits inside
+ * the action card, directly under sign-in, instead of being a second card
+ * the reader scrolls to. The inner panel chrome is stripped so the sign-in
+ * block and the ceremony read as one surface.
+ */
+.contribution-cta-action .incremental-consent {
   margin-top: var(--space-4);
-  border-color: rgba(23, 79, 69, .3);
-  background: var(--green-soft);
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+/* The deletion control keeps its distance from the primary action: a quiet
+   row under its own rule, never beside Approve. */
+.incremental-delete-row {
+  margin-top: var(--space-2);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--line);
 }
 .contribution-cta-buttons {
   display: flex;

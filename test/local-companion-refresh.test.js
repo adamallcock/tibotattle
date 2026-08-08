@@ -749,6 +749,7 @@ test("local refresh forwards its AbortSignal into replay-safe accounting", async
   const runner = createLocalCollectorRefreshRunner({
     codexHome: "/private/codex-home",
     stateFile: "/private/local-collector-state.sqlite",
+    unifiedIndexFile: "/private/local-unified-index-v1.sqlite",
     clock,
     selectAccountObservationSecret: () => ({
       loadAccountObservationSecret: async () => Buffer.alloc(32, 8),
@@ -778,9 +779,15 @@ test("local refresh forwards its AbortSignal into replay-safe accounting", async
   assert.equal(accountingOptions.codexHome, "/private/codex-home");
   assert.equal(accountingOptions.stateFile, "/private/local-collector-state.sqlite");
   assert.equal(accountingOptions.now, clock);
-  // Re-pinned 31 -> 93 (2026-08-08): the calibration corpus follows this scan
-  // window, and 31 made "All time" identical to 30d on the Allowance page.
-  assert.equal(accountingOptions.windowDays, 93);
+  // Re-pinned 93 -> 365 (2026-08-08): the standing owner rule forbids
+  // convenience-sized history windows (31 and 93 were both wrong). The
+  // calibration corpus no longer follows this window at all when the unified
+  // index is present, so the rebuild also receives the index path.
+  assert.equal(accountingOptions.windowDays, 365);
+  assert.equal(
+    accountingOptions.unifiedIndexFile,
+    "/private/local-unified-index-v1.sqlite",
+  );
   assert.equal(accountingOptions.signal, controller.signal);
   assert.deepEqual(result.accounting, {
     status: "replay_safe",
@@ -789,6 +796,57 @@ test("local refresh forwards its AbortSignal into replay-safe accounting", async
     events: 17,
     forkReplayEventsExcluded: 29,
   });
+});
+
+// The unified-index increment must land BEFORE the accounting rebuild: the
+// rebuild sources its full-history calibration corpus from that index, so the
+// old order left the calibration one refresh behind the collection it
+// belonged to.
+test("the unified index advances before accounting reads it for calibration", async () => {
+  const order = [];
+  const runner = createLocalCollectorRefreshRunner({
+    unifiedIndexFile: "/private/local-unified-index-v1.sqlite",
+    unifiedIndexSecretFile: "/private/local-unified-index-device-salt-v1",
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 1,
+      filesDiscovered: 1,
+      refresh: { attempted: true, recordWritten: true, errorCode: null },
+      indexing: COMPLETE_INDEX,
+    }),
+    refreshUnifiedIndex: async (options) => {
+      order.push(["unified_index", options.indexFile, options.secretFile]);
+      return {
+        status: "ingested",
+        sources: 1,
+        sourcesTouched: 1,
+        insertedUsageEvents: 1,
+        totalUsageEvents: 1,
+        bytesScanned: 10,
+        wallMs: 1,
+      };
+    },
+    refreshAccounting: async () => {
+      order.push(["accounting"]);
+      return {
+        generatedAt: "2026-07-23T12:00:00.000Z",
+        periods: [],
+        diagnostics: {},
+      };
+    },
+  });
+
+  const result = await runner();
+
+  assert.deepEqual(order.map(([step]) => step), ["unified_index", "accounting"]);
+  assert.deepEqual(order[0].slice(1), [
+    "/private/local-unified-index-v1.sqlite",
+    "/private/local-unified-index-device-salt-v1",
+  ]);
+  assert.equal(result.unifiedIndex.status, "ingested");
+  assert.equal(result.accounting.refreshStatus, "rebuilt");
 });
 
 test("an aborted zero-write refresh does not bypass accounting cancellation through reuse", async () => {

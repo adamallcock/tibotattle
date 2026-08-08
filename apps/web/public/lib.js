@@ -418,7 +418,11 @@ export const DIAGNOSTIC_SURFACES = Object.freeze([
   "fast_mode_preference",
   "hosted_identity",
   "hosted_privacy",
-  "local_refresh"
+  "local_refresh",
+  // 2026-08-08 (deletion honesty): the "Delete my contributions" action files
+  // its failures like every other journey. The companion accepts the same
+  // fixed name.
+  "participant_deletion"
 ]);
 const DIAGNOSTIC_SURFACE_SET = new Set(DIAGNOSTIC_SURFACES);
 // The same shape the Worker mints with crypto.randomUUID.

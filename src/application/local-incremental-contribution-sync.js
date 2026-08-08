@@ -483,12 +483,29 @@ class IncrementalContributionSyncController {
   /**
    * Clear an auto-pause. Wired to the same cure as the v0.1 queue: a
    * successful device pairing resumes delivery.
+   *
+   * 2026-08-08 (owner-directed immediate first pass): a successful pairing is
+   * not only the cure for an auto-pause — it is fresh upload authority. A
+   * controller that is mid retry-backoff rather than paused (for example
+   * after the service refused uploads for a pairing that carried the v0.1
+   * consent) would otherwise sit out the remainder of a ladder it has
+   * already lost, and the user would read "waiting" for up to an hour after
+   * the repair. Re-pairing now also pulls the next attempt to the present;
+   * the schedule gate still requires current consent before anything runs.
    */
   async resume() {
     if (!this.#initialized) await this.initialize();
     return this.#serialize(async () => {
       if (!this.#settingsAvailable) fail("settings_unavailable");
-      if (!this.#settings.paused) return this.#project();
+      if (!this.#settings.paused) {
+        if (this.#consentCurrent() && this.#settings.nextAttemptAt !== null) {
+          this.#settings.retryCount = 0;
+          this.#settings.nextAttemptAt = this.#nowIso();
+          await this.#persist();
+          this.#schedule();
+        }
+        return this.#project();
+      }
       this.#settings.paused = false;
       this.#settings.pausedReason = null;
       this.#settings.retryCount = 0;

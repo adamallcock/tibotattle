@@ -409,32 +409,14 @@
           <p class="annotation" id="weekly-chart-timezone"></p>
         </article>
 
-        <details class="panel weekly-table-panel evidence-disclosure">
-          <summary>See individual usage changes</summary>
-          <div class="table-wrap">
-            <table>
-              <caption class="sr-only">Individual seven-day reset estimates</caption>
-              <thead>
-                <tr>
-                  <th scope="col">Observed</th>
-                  <th scope="col">Observed span</th>
-                  <th scope="col">Estimate</th>
-                  <th scope="col">Slope-agreement range</th>
-                  <th scope="col">Status</th>
-                </tr>
-              </thead>
-              <tbody id="weekly-table">
-                <tr><td colspan="5" class="empty-cell">No weekly evidence loaded.</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </details>
-
         <!--
-          Owner-directed 2026-08-08: the shareable results card lives at the
-          bottom of the Allowance page. Its headline figure and plotted
-          history are this page's estimate, so the card sits under the
-          evidence it summarizes rather than on the Overview.
+          Owner-directed 2026-08-08 (second round): the shareable results card
+          sits directly under the history chart it summarizes, ABOVE the
+          "See individual usage changes" disclosure. The reference chip is
+          gone from the header — the reference travels in the saved file name
+          only — and the caption states the card's population honestly: it is
+          re-rendered with the chart, so it always matches the active date
+          range and minimum observed-span filter.
         -->
         <article class="panel share-panel" id="share-panel">
           <div class="panel-heading">
@@ -442,8 +424,11 @@
               <p class="panel-kicker">Share</p>
               <h3>A results card you can post</h3>
             </div>
-            <span class="evidence-chip" id="share-card-reference">Reference pending</span>
           </div>
+          <p class="annotation">
+            The card matches the chart above: its plotted history follows the
+            active date range and minimum observed-span filter.
+          </p>
           <p class="annotation">
             A ready-to-post image of the three headline figures. It contains no
             prompts, responses, paths, account details, or raw activity.
@@ -476,6 +461,27 @@
           <p class="share-toast" id="share-card-toast" role="status" hidden></p>
           <p class="participant-action-status" id="share-card-status" role="status" hidden></p>
         </article>
+
+        <details class="panel weekly-table-panel evidence-disclosure">
+          <summary>See individual usage changes</summary>
+          <div class="table-wrap">
+            <table>
+              <caption class="sr-only">Individual seven-day reset estimates</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Observed</th>
+                  <th scope="col">Observed span</th>
+                  <th scope="col">Estimate</th>
+                  <th scope="col">Slope-agreement range</th>
+                  <th scope="col">Status</th>
+                </tr>
+              </thead>
+              <tbody id="weekly-table">
+                <tr><td colspan="5" class="empty-cell">No weekly evidence loaded.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
       </section>
 
       <section class="dashboard-section dashboard-page-inactive" id="timeline" aria-labelledby="timeline-title" data-dashboard-page="trends" data-requires-evidence aria-hidden="true" inert>
@@ -747,7 +753,7 @@
           </li>
           <li class="journey-stage" id="journey-stage-community">
             <p class="journey-stage-head">
-              <span class="journey-stage-name">Sign in &amp; connect</span>
+              <span class="journey-stage-name">Sign in &amp; approve</span>
               <span class="evidence-chip neutral journey-stage-state" id="journey-stage-community-state">—</span>
             </p>
             <p class="journey-stage-detail" id="journey-stage-community-detail"></p>
@@ -757,9 +763,9 @@
           <p class="eyebrow">Optional</p>
           <h2 id="contribution-cta-title">Contribute anonymous usage data</h2>
           <p>
-            Help improve community estimates: sign in, connect this Mac, and
-            approve once. You see the covered data before anything is sent;
-            after approval it stays current automatically.
+            Help improve community estimates: sign in, then approve once. You
+            see the covered data before anything is sent; after approval it
+            stays current automatically.
           </p>
           <details class="contribution-categories">
             <summary>What leaves this Mac — and what never does</summary>
@@ -853,51 +859,25 @@
             </p>
             <p class="participant-action-status" id="identity-signin-status" role="status" hidden></p>
           </div>
-          <label class="consent-row contribution-primary-consent">
-            <input id="community-connect-consent" type="checkbox">
-            <span>
-              <strong>I want to review the covered data and decide whether to approve it.</strong>
-            </span>
-          </label>
-          <div class="contribution-cta-buttons">
-            <!--
-              This button performs network enrollment and device pairing. It
-              is named for that. Reviewing is a separate, local action, and the
-              button only offers it once this Mac is actually connected.
-            -->
-            <button class="button button-primary" id="connect-community" type="button" disabled>
-              Connect this Mac
-            </button>
-            <button class="button button-quiet" id="contribution-not-now" type="button">
-              Not now
-            </button>
-          </div>
-          <p class="participant-action-status" id="community-connect-status" role="status" hidden></p>
-        </div>
-
           <!--
-            What the community published lives on the website. It is a link,
-            not a second explanation of the same thing inside the app.
-          -->
-          <p class="community-public-evidence">
-            <a href="https://tibotattle.com/#community" target="_blank" rel="noopener">See what the community published</a>
-          </p>
-          <!--
-            The approve-once consent surface for the incremental full-history
-            contribution model (telemetry-contribution-v1.0). It stays out of
-            the document until the local companion's health payload advertises
-            the v1.0 sync capability, because until that transport exists this
-            surface would describe an upload that cannot happen. No dead
-            toggles: the section is hidden, not disabled.
+            One surface (owner-directed 2026-08-08): the connect card and the
+            approve card are collapsed into this single ceremony, directly
+            under sign-in — no scrolling between two cards. A user does:
+            Sign in → Review and approve. Nothing else. The single button
+            mints the pairing WITH the v1.0 consent (the server session is
+            already held), has the companion claim it — the claim records the
+            server-side consent-once grant — then records the local
+            approve-once consent with the review token and starts the first
+            sync pass immediately.
 
-            Owner-directed 2026-08-08: this is the ONLY contribution flow.
-            The legacy "Prepare and review a contribution" disclosure — the
-            lookback picker, the prepare button and the manual send card —
-            is removed, not hidden. The review-bootstrap the approve gate
-            still requires (one verified real instance of the covered data on
-            screen) is produced invisibly: the page prepares and verifies it
-            by itself and renders the result below, so the reader meets one
-            review and one Approve button, never preparation steps.
+            The surface stays out of the document until the local companion's
+            health payload advertises the v1.0 sync capability, because until
+            that transport exists it would describe an upload that cannot
+            happen. The review-bootstrap the approve gate requires (one
+            verified real instance of the covered data on screen) is produced
+            invisibly: the page prepares and verifies it by itself and
+            renders the facts below, so the reader meets one review and one
+            button, never preparation steps.
           -->
           <section class="panel incremental-consent" id="incremental-consent" aria-labelledby="incremental-consent-title" hidden>
             <div class="panel-heading">
@@ -908,14 +888,12 @@
               <span class="evidence-chip neutral" id="incremental-consent-state">Not approved</span>
             </div>
             <p class="annotation">
-              This build's companion supports incremental upload. Approval
-              covers the kind of data, once — after it, your full history
-              uploads and stays current without per-batch review.
+              Approval covers the kind of data, once — after it, your full
+              history uploads and stays current without per-batch review.
             </p>
             <ul class="incremental-consent-facts">
               <li>Your full usage history uploads first; new events then upload roughly every 6 hours.</li>
               <li>Community estimates recompute when your data or corrections to it arrive, including for past months.</li>
-              <li>Deletion removes everything you contributed, always.</li>
             </ul>
             <details class="contribution-categories">
               <summary>The exact kind of data covered</summary>
@@ -945,7 +923,7 @@
             </dl>
             <div class="contribution-cta-buttons">
               <button class="button button-primary" id="incremental-consent-approve" type="button" disabled>
-                Approve this kind of data
+                Review and approve
               </button>
               <!--
                 Error recovery only: hidden until the invisible review
@@ -963,12 +941,36 @@
             <p class="participant-action-status" id="incremental-consent-status" role="status" hidden></p>
             <!--
               The modest status line for the running sync after approval:
-              days synced and pending, the paused reason, and the last error
-              code, all from the companion's bounded incremental-status
-              projection. No path, no content, no identifier.
+              live first-pass progress as day counts, the paused reason, and
+              the last error code, all from the companion's bounded
+              incremental-status projection. No path, no content, no
+              identifier.
             -->
             <p class="annotation" id="incremental-sync-status" role="status" hidden></p>
+            <!--
+              Deletion honesty (owner-directed 2026-08-08): the card used to
+              state "Deletion removes everything you contributed, always."
+              with no control behind it. The sentence is gone; in its place
+              is the working control — the service's participant deletion
+              (DELETE /api/v1/me) removes accepted chunks and stored uploads
+              and tombstones the account. The button appears only with a live
+              contribution session, because deletion requires one.
+            -->
+            <div class="contribution-cta-buttons incremental-delete-row">
+              <button class="button button-quiet" id="delete-contributions" type="button" hidden>
+                Delete my contributions
+              </button>
+            </div>
           </section>
+        </div>
+
+          <!--
+            What the community published lives on the website. It is a link,
+            not a second explanation of the same thing inside the app.
+          -->
+          <p class="community-public-evidence">
+            <a href="https://tibotattle.com/#community" target="_blank" rel="noopener">See what the community published</a>
+          </p>
       </section>
 
     </main>

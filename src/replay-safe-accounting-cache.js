@@ -1,6 +1,8 @@
+import { lstat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { scanCodexLogEvents } from "./codex-log-scan.js";
+import { openLocalUnifiedIndex } from "./local-unified-index.js";
 import { declaredSpeedModeAt } from "./codex-speed-baseline.js";
 import {
   createIndexedCodexLogScan,
@@ -50,18 +52,29 @@ import {
 } from "./reporting/index.js";
 import { fastQuotaMultiplier } from "./application/index.js";
 
-// v0.4 adds per-model allowance-track and API-price-applicability state, and
-// the combined `modelUsage` row set. A v0.3 cache cannot be upgraded in place
-// because it never recorded which track a model belonged to, so it is
-// withheld and rebuilt rather than rendered with the fields missing.
+// v0.4 added per-model allowance-track and API-price-applicability state, and
+// the combined `modelUsage` row set. v0.5 (2026-08-08) sources the weekly
+// calibration transition corpus from the unified local index when one is
+// present — the corpus then spans the whole indexed history rather than the
+// scan window — and records that provenance in `weeklyCalibrationInput.source`
+// and `.coveredAt`. A v0.4 cache's calibration was silently bounded by its
+// scan window, so it is withheld and rebuilt rather than shown as full
+// history.
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
-  "local-replay-safe-accounting-v0.4";
+  "local-replay-safe-accounting-v0.5";
 
 const HISTORICAL_PRICE_EPOCH_BASIS =
   "event_time_when_registry_has_effective_evidence";
 
 const MAX_CACHE_BYTES = 16 * 1024 * 1024;
-const DEFAULT_WINDOW_DAYS = 31;
+// Standing owner rule (2026-08-08, stated after five rounds of cap-shuffling):
+// NEVER introduce or retain small data-window caps. A history limit is either
+// absent or extreme (365+ days), never convenience-sized — 31 and 93 were
+// both wrong. The floor makes a convenience-sized window unrepresentable; the
+// ceiling is a ten-year typo guard, not a data-window policy.
+const MINIMUM_WINDOW_DAYS = 365;
+const MAXIMUM_WINDOW_DAYS = 3_653;
+const DEFAULT_WINDOW_DAYS = MINIMUM_WINDOW_DAYS;
 const TIMELINE_BUCKET_MS = 15 * 60 * 1_000;
 const MAX_QUOTA_TIMELINE_ROWS = 10_000;
 const WEEKLY_WINDOW_MINUTES = SEVEN_DAY_WINDOW_MINUTES;
@@ -1454,6 +1467,493 @@ export function defaultReplaySafeAccountingCachePath(
   return defaultLocalCollectorStatePath(root);
 }
 
+function cooperativeYield() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+function firstIndexAtLeast(values, target) {
+  let low = 0;
+  let high = values.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (values[middle] < target) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function firstIndexAbove(values, target) {
+  let low = 0;
+  let high = values.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (values[middle] <= target) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+// Mirror of the transition miner's windowKey over the compact snapshot
+// encoding [timestamp, timestampMs, provider, planType, limitId, slot,
+// windowDurationMins, resetsAt, usedPercent]. Transitions are derived from
+// consecutive snapshots WITHIN one of these groups, never across groups,
+// which is what makes the batched derivation below exact.
+function compactSnapshotGroupKey(row) {
+  return [row[2], row[3], row[4], row[5], row[6], row[7]].join("|");
+}
+
+// The transition miner refuses more than 10,000 derived rows per call — a
+// structural memory-safety ceiling owned by codex-transition-miner.js, not a
+// data-window policy. A full unbounded history legitimately holds more (the
+// real corpus measured 18,176 weekly transitions over its first 82 days), so
+// the derivation is partitioned by reset-window group and each batch stays
+// under the ceiling with headroom. Cumulative aggregations are
+// difference-based over each window's own span, so deriving disjoint group
+// batches against a usage slice that covers every window start in the batch
+// reproduces the unbatched result exactly.
+const CALIBRATION_BATCH_TRANSITION_BUDGET = 8_000;
+
+async function deriveBoundedWeeklyCalibrationSeries({
+  startAt,
+  endAt,
+  rawUsageEvents,
+  rateLimitSnapshots,
+  diagnostics,
+  signal,
+  resourceCheck,
+}) {
+  const derive = (usage, snapshots) => deriveCodexTransitionSeriesCooperatively({
+    startAt,
+    endAt,
+    rawUsageEvents: usage,
+    rateLimitSnapshots: snapshots,
+    diagnostics,
+    includeSnapshotIntervals: false,
+    windowDurationMins: WEEKLY_WINDOW_MINUTES,
+    signal,
+    consumeInputs: true,
+    includeNormalizedInputs: false,
+    inputEncoding: "accounting_prepriced_compact_v2",
+    resourceCheck,
+  });
+
+  // Group the compact snapshots exactly as the miner will, and count the
+  // transitions each group will derive: within a group the miner walks
+  // deduplicated snapshots in (time, percent) order and emits one transition
+  // per consecutive percent change, so this count is exact, not an estimate.
+  const groups = new Map();
+  for (let index = 0; index < rateLimitSnapshots.length; index += 1) {
+    if (index % 8_192 === 0) {
+      throwIfAborted(signal);
+      resourceCheck?.();
+      await cooperativeYield();
+    }
+    const row = rateLimitSnapshots[index];
+    if (!Array.isArray(row) || row.length !== 9) continue;
+    const key = compactSnapshotGroupKey(row);
+    let group = groups.get(key);
+    if (group === undefined) {
+      group = { rows: [], dedupe: new Set(), deduped: [] };
+      groups.set(key, group);
+    }
+    group.rows.push(row);
+    const dedupeKey = `${row[0]}|${row[8]}`;
+    if (!group.dedupe.has(dedupeKey)) {
+      group.dedupe.add(dedupeKey);
+      group.deduped.push(row);
+    }
+  }
+  let totalTransitions = 0;
+  for (const group of groups.values()) {
+    const ordered = [...group.deduped].sort(
+      (left, right) => left[1] - right[1] || left[8] - right[8],
+    );
+    let transitions = 0;
+    for (let index = 1; index < ordered.length; index += 1) {
+      if (ordered[index][8] !== ordered[index - 1][8]) transitions += 1;
+    }
+    const durationMins = Number(ordered[0]?.[6]);
+    const resetsAt = Number(ordered[0]?.[7]);
+    const windowStartMs = (resetsAt - durationMins * 60) * 1_000;
+    group.transitions = transitions;
+    group.sliceStartMs = Number.isFinite(windowStartMs)
+      ? windowStartMs
+      : Number.NEGATIVE_INFINITY;
+    group.firstMs = Number(ordered[0]?.[1] ?? 0);
+    group.lastMs = Number(ordered.at(-1)?.[1] ?? 0);
+    totalTransitions += transitions;
+  }
+  throwIfAborted(signal);
+  resourceCheck?.();
+
+  if (totalTransitions <= CALIBRATION_BATCH_TRANSITION_BUDGET) {
+    const series = await derive(rawUsageEvents, rateLimitSnapshots);
+    return {
+      transitions: series.transitions,
+      deduplicatedSnapshotCount: series.deduplicatedSnapshotCount,
+    };
+  }
+
+  // Sort the compact usage rows once so every batch can take the contiguous
+  // slice that covers its groups' windows. Rows without a parseable timestamp
+  // would be dropped by the miner's own normalization, so excluding them here
+  // changes nothing.
+  const stamped = [];
+  for (let index = 0; index < rawUsageEvents.length; index += 1) {
+    if (index % 8_192 === 0) {
+      throwIfAborted(signal);
+      resourceCheck?.();
+      await cooperativeYield();
+    }
+    const observedMs = Date.parse(rawUsageEvents[index]?.[0]);
+    if (Number.isFinite(observedMs)) stamped.push([observedMs, index]);
+  }
+  stamped.sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+  const sortedUsage = stamped.map(([, index]) => rawUsageEvents[index]);
+  const sortedMs = stamped.map(([observedMs]) => observedMs);
+  stamped.length = 0;
+
+  const orderedGroups = [...groups.values()].sort((left, right) => (
+    left.sliceStartMs - right.sliceStartMs
+    || left.firstMs - right.firstMs
+    || left.lastMs - right.lastMs
+  ));
+  const batches = [];
+  let current = null;
+  for (const group of orderedGroups) {
+    if (current === null
+        || (current.groups.length > 0
+          && current.transitions + group.transitions
+            > CALIBRATION_BATCH_TRANSITION_BUDGET)) {
+      current = {
+        groups: [],
+        transitions: 0,
+        sliceStartMs: Number.POSITIVE_INFINITY,
+        sliceEndMs: Number.NEGATIVE_INFINITY,
+      };
+      batches.push(current);
+    }
+    current.groups.push(group);
+    current.transitions += group.transitions;
+    current.sliceStartMs = Math.min(current.sliceStartMs, group.sliceStartMs);
+    current.sliceEndMs = Math.max(current.sliceEndMs, group.lastMs);
+  }
+
+  const transitions = [];
+  let deduplicatedSnapshotCount = 0;
+  for (const batch of batches) {
+    throwIfAborted(signal);
+    resourceCheck?.();
+    const low = batch.sliceStartMs === Number.NEGATIVE_INFINITY
+      ? 0
+      : firstIndexAtLeast(sortedMs, batch.sliceStartMs);
+    const high = firstIndexAbove(sortedMs, batch.sliceEndMs);
+    const usageSlice = sortedUsage.slice(low, high);
+    const snapshotSlice = [];
+    for (const group of batch.groups) snapshotSlice.push(...group.rows);
+    const series = await derive(usageSlice, snapshotSlice);
+    transitions.push(...series.transitions);
+    deduplicatedSnapshotCount += series.deduplicatedSnapshotCount;
+  }
+  rawUsageEvents.length = 0;
+  rateLimitSnapshots.length = 0;
+  transitions.sort((left, right) => left.eventTime.localeCompare(right.eventTime)
+    || left.resetIdentity.localeCompare(right.resetIdentity)
+    || left.slot.localeCompare(right.slot));
+  return { transitions, deduplicatedSnapshotCount };
+}
+
+const UNIFIED_CALIBRATION_READ_BATCH_ROWS = 20_000;
+
+/**
+ * Cheap usability probe for the unified calibration corpus, run BEFORE the
+ * scan so the scan can skip retaining its own window-bounded transition
+ * inputs. The corpus itself is materialized only AFTER the scan finishes:
+ * holding both the corpus and the scan's working set at once measured past
+ * the accounting RSS ceiling on the real dev corpus, while sequencing them
+ * keeps the peak to whichever is larger.
+ */
+async function probeUnifiedCalibrationCorpus(indexFile) {
+  let metadata;
+  try {
+    metadata = await lstat(indexFile);
+  } catch {
+    return false;
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()) return false;
+  let database;
+  try {
+    database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+  } catch {
+    return false;
+  }
+  try {
+    const hasUsage = database.prepare(
+      "SELECT 1 AS present FROM usage_event LIMIT 1",
+    ).get()?.present === 1;
+    const hasWeeklyQuota = database.prepare(`
+      SELECT 1 AS present FROM quota_observation
+      WHERE limit_id = 'codex' AND duration_mins = ?
+        AND used_percent IS NOT NULL AND resets_at_ms IS NOT NULL
+      LIMIT 1`).get(WEEKLY_WINDOW_MINUTES)?.present === 1;
+    return hasUsage && hasWeeklyQuota;
+  } catch {
+    return false;
+  } finally {
+    database.close();
+  }
+}
+
+/**
+ * The full-history weekly-calibration corpus, read from the unified local
+ * index in the same compact pre-priced encoding the windowed scan retains.
+ *
+ * This is what removes the calibration's data window: `usage_event` and
+ * `quota_observation` have no lower time bound, so the corpus spans everything
+ * ever indexed. The only remaining bound is the transition miner's structural
+ * input ceiling (750k usage events — count-based memory safety owned by
+ * codex-transition-miner.js, not a day window; it covers years of typical use
+ * and 130+ days of the heaviest observed usage). When the corpus exceeds it,
+ * the newest rows are retained and the returned `coveredAt` names the span
+ * honestly.
+ *
+ * Quota rows are collapsed to the first and last observation of each
+ * unchanged (window, percent) run before retention. The miner derives a
+ * transition only where the displayed percent changes between consecutive
+ * observations of one window, so this collapse is transition-lossless while
+ * shrinking hundreds of thousands of repeated readings to the boundaries the
+ * calibration actually uses.
+ *
+ * Failures degrade to `null` — the caller falls back to the windowed corpus —
+ * except aborts and the build's own resource-guard errors, which propagate.
+ */
+async function readUnifiedIndexCalibrationCorpus({
+  indexFile,
+  endMs,
+  limits,
+  signal,
+  checkRuntimeMemory,
+}) {
+  let metadata;
+  try {
+    metadata = await lstat(indexFile);
+  } catch {
+    return null;
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()) return null;
+  let database;
+  try {
+    database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+  } catch {
+    return null;
+  }
+  try {
+    const usageGraceMs = endMs + 5 * 60_000;
+    const usageCount = Number(database.prepare(
+      "SELECT COUNT(*) AS c FROM usage_event WHERE observed_at_ms <= ?",
+    ).get(usageGraceMs)?.c ?? 0);
+    if (usageCount === 0) return null;
+    let retainedStartMs = null;
+    if (usageCount > limits.usageEvents) {
+      const cutoff = database.prepare(`
+        SELECT observed_at_ms AS ms FROM usage_event
+        WHERE observed_at_ms <= ?
+        ORDER BY observed_at_ms DESC
+        LIMIT 1 OFFSET ?`).get(usageGraceMs, limits.usageEvents - 1);
+      retainedStartMs = Number(cutoff?.ms);
+      if (!Number.isSafeInteger(retainedStartMs)) return null;
+    }
+
+    const price = createAccountingPricer();
+    const usageStatement = database.prepare(`
+      SELECT u.rowid AS row_id,
+             u.observed_at_ms AS observed_at_ms,
+             m.model_id AS model_id,
+             t.codex_speed_mode AS codex_speed_mode,
+             t.api_service_tier AS api_service_tier,
+             u.tokens_in_uncached AS tokens_in_uncached,
+             u.tokens_in_cache_read AS tokens_in_cache_read,
+             u.tokens_in_cache_write AS tokens_in_cache_write,
+             u.tokens_out_text AS tokens_out_text,
+             u.tokens_out_reasoning AS tokens_out_reasoning,
+             u.tokens_out_combined AS tokens_out_combined,
+             u.total_input_context AS total_input_context
+      FROM usage_event u
+      JOIN model m ON m.id = u.model_id
+      JOIN tier_semantics t ON t.id = u.tier_id
+      WHERE u.rowid > ? AND u.observed_at_ms >= ? AND u.observed_at_ms <= ?
+      ORDER BY u.rowid
+      LIMIT ${UNIFIED_CALIBRATION_READ_BATCH_ROWS}`);
+    const stampedUsage = [];
+    let processed = 0;
+    let afterRowId = -1;
+    const lowerBoundMs = retainedStartMs ?? -1;
+    for (;;) {
+      const batch = usageStatement.all(afterRowId, lowerBoundMs, usageGraceMs);
+      if (batch.length === 0) break;
+      for (const row of batch) {
+        processed += 1;
+        if (processed % ACCOUNTING_RSS_CHECK_INTERVAL === 0) {
+          throwIfAborted(signal);
+          checkRuntimeMemory();
+          await cooperativeYield();
+        }
+        const observedMs = Number(row.observed_at_ms);
+        if (!Number.isSafeInteger(observedMs)) continue;
+        const tokenValue = (value) => (
+          Number.isSafeInteger(Number(value)) && Number(value) >= 0
+            ? Number(value)
+            : 0
+        );
+        const rawEvent = {
+          timestamp: new Date(observedMs).toISOString(),
+          model: row.model_id,
+          // NULL means "the record did not report a total"; it must stay
+          // absent so the pricer bands by the summed input components exactly
+          // as it does on the scan path, instead of reading NULL as zero.
+          ...(row.total_input_context === null
+            ? {}
+            : { totalInputContextTokens: Number(row.total_input_context) }),
+          components: {
+            input_uncached_tokens: tokenValue(row.tokens_in_uncached),
+            input_cache_read_tokens: tokenValue(row.tokens_in_cache_read),
+            input_cache_write_tokens: tokenValue(row.tokens_in_cache_write),
+            output_text_tokens: tokenValue(row.tokens_out_text),
+            output_reasoning_tokens: tokenValue(row.tokens_out_reasoning),
+            output_combined_tokens: tokenValue(row.tokens_out_combined),
+          },
+          tierSemantics: {
+            codexSpeedMode: row.codex_speed_mode,
+            apiServiceTier: row.api_service_tier,
+          },
+        };
+        const event = eventProjection(rawEvent, price);
+        // The calibration corpus mirrors the scan retention exactly: no
+        // zero-token rows, and no separately metered Spark rows.
+        if (event === null || event.isSpark) continue;
+        stampedUsage.push([
+          observedMs,
+          transitionUsageProjection(rawEvent, event),
+        ]);
+      }
+      afterRowId = Number(batch.at(-1).row_id);
+      if (batch.length < UNIFIED_CALIBRATION_READ_BATCH_ROWS) break;
+    }
+    if (stampedUsage.length === 0) return null;
+    stampedUsage.sort((left, right) => left[0] - right[0]);
+    if (stampedUsage.length > limits.usageEvents) {
+      stampedUsage.splice(0, stampedUsage.length - limits.usageEvents);
+    }
+    const firstUsageMs = stampedUsage[0][0];
+    const rawUsageEvents = stampedUsage.map(([, row]) => row);
+    stampedUsage.length = 0;
+
+    const snapshotLowerMs = retainedStartMs === null
+      ? -1
+      : firstUsageMs;
+    const snapshotStatement = database.prepare(`
+      SELECT observed_at_ms, slot, plan_type, used_percent, resets_at_ms
+      FROM quota_observation
+      WHERE limit_id = 'codex' AND duration_mins = ?
+        AND used_percent IS NOT NULL AND resets_at_ms IS NOT NULL
+        AND observed_at_ms >= ? AND observed_at_ms <= ?
+      ORDER BY observed_at_ms, id`);
+    const weeklyRateLimitSnapshots = [];
+    let firstSnapshotMs = null;
+    const groupRuns = new Map();
+    const emit = (pending) => {
+      weeklyRateLimitSnapshots.push(weeklyRateLimitProjection({
+        timestamp: new Date(pending.observedMs).toISOString(),
+        timestampMs: pending.observedMs,
+        window: {
+          provider: "openai_codex",
+          planType: pending.planType,
+          limitId: "codex",
+          slot: pending.slot,
+          windowDurationMins: WEEKLY_WINDOW_MINUTES,
+          resetsAt: pending.resetsAtSec,
+          usedPercent: pending.usedPercent,
+        },
+      }));
+    };
+    for (const row of snapshotStatement.iterate(
+      WEEKLY_WINDOW_MINUTES,
+      snapshotLowerMs,
+      endMs,
+    )) {
+      processed += 1;
+      if (processed % ACCOUNTING_RSS_CHECK_INTERVAL === 0) {
+        throwIfAborted(signal);
+        checkRuntimeMemory();
+        await cooperativeYield();
+      }
+      const observedMs = Number(row.observed_at_ms);
+      const resetsAtSec = Math.floor(Number(row.resets_at_ms) / 1_000);
+      const usedPercent = Number(row.used_percent);
+      if (!Number.isSafeInteger(observedMs)
+          || !Number.isSafeInteger(resetsAtSec)
+          || resetsAtSec <= 0
+          || !Number.isFinite(usedPercent)) continue;
+      if (firstSnapshotMs === null) firstSnapshotMs = observedMs;
+      const projected = {
+        observedMs,
+        slot: row.slot,
+        planType: typeof row.plan_type === "string" && row.plan_type.length > 0
+          ? row.plan_type
+          : "unknown",
+        usedPercent,
+        resetsAtSec,
+      };
+      const groupKey = `${projected.slot}\0${projected.planType}\0${resetsAtSec}`;
+      const run = groupRuns.get(groupKey);
+      if (run !== undefined && run.usedPercent === usedPercent) {
+        // Same displayed state as the previous observation of this window:
+        // remember it as the run's pending last row, emit it only when the
+        // state changes or the stream ends.
+        run.pending = projected;
+        continue;
+      }
+      if (run?.pending) emit(run.pending);
+      emit(projected);
+      groupRuns.set(groupKey, { usedPercent, pending: null });
+    }
+    for (const run of groupRuns.values()) {
+      if (run.pending) emit(run.pending);
+    }
+    if (weeklyRateLimitSnapshots.length === 0) return null;
+    if (weeklyRateLimitSnapshots.length > limits.weeklySnapshots
+        || rawUsageEvents.length + weeklyRateLimitSnapshots.length
+          > limits.combinedInputs
+        || rawUsageEvents.length * COMPACT_USAGE_RETAINED_BYTES
+          + weeklyRateLimitSnapshots.length * COMPACT_SNAPSHOT_RETAINED_BYTES
+          > limits.retainedBytes) {
+      return null;
+    }
+    throwIfAborted(signal);
+    checkRuntimeMemory();
+    const coveredStartMs = firstSnapshotMs === null
+      ? firstUsageMs
+      : Math.min(firstUsageMs, firstSnapshotMs);
+    return {
+      rawUsageEvents,
+      weeklyRateLimitSnapshots,
+      coveredAt: {
+        startAt: new Date(coveredStartMs).toISOString(),
+        endAt: new Date(endMs).toISOString(),
+      },
+    };
+  } catch (error) {
+    if (error?.name === "AbortError"
+        || (typeof error?.code === "string"
+          && error.code.startsWith("accounting_"))) {
+      throw error;
+    }
+    return null;
+  } finally {
+    database.close();
+  }
+}
+
 export async function buildReplaySafeAccountingCache({
   codexHome = join(homedir(), ".codex"),
   now = () => Date.now(),
@@ -1464,6 +1964,11 @@ export async function buildReplaySafeAccountingCache({
   // it was actually observed over, so a reading can never reach back before it
   // happened. An absent or unreadable ledger is simply no coverage.
   declaredSpeedBaselines = [],
+  // The unified local index. When present and readable, the weekly
+  // calibration transition corpus is read from it — the full indexed history,
+  // with no time window at all — and the scan-window corpus becomes the
+  // fallback for machines that do not have the index yet.
+  unifiedIndexFile = null,
   transitionResourceLimits: requestedTransitionResourceLimits = null,
   rss = () => process.memoryUsage().rss,
   maximumRssBytes = MAX_ACCOUNTING_RSS_BYTES,
@@ -1471,8 +1976,10 @@ export async function buildReplaySafeAccountingCache({
   const endMs = now();
   if (!Number.isFinite(endMs)
       || !Number.isSafeInteger(windowDays)
-      || windowDays < 1
-      || windowDays > 93
+      || windowDays < MINIMUM_WINDOW_DAYS
+      || windowDays > MAXIMUM_WINDOW_DAYS
+      || (unifiedIndexFile !== null
+        && (typeof unifiedIndexFile !== "string" || unifiedIndexFile.length < 1))
       || typeof scan !== "function"
       || !validAbortSignal(signal)
       || typeof rss !== "function"
@@ -1502,6 +2009,16 @@ export async function buildReplaySafeAccountingCache({
     requestedTransitionResourceLimits,
   );
   throwIfAborted(signal);
+  // Whether the unified index can supply the full-history calibration corpus.
+  // Probed before the scan so the scan skips retaining its own window-bounded
+  // transition inputs; the corpus itself is materialized only after the scan,
+  // keeping the two working sets sequential rather than resident together. A
+  // missing or unusable index degrades to the windowed corpus here; it never
+  // fails the build.
+  const useUnifiedCalibration = unifiedIndexFile !== null
+    && await probeUnifiedCalibrationCorpus(unifiedIndexFile);
+  const retainWindowedCalibrationInputs = !useUnifiedCalibration;
+  throwIfAborted(signal);
   const startMs = endMs - windowDays * 24 * 60 * 60 * 1_000;
   const starts = {
     "24h": endMs - 24 * 60 * 60 * 1_000,
@@ -1527,6 +2044,16 @@ export async function buildReplaySafeAccountingCache({
   const price = createAccountingPricer();
   let retainedTransitionBytes = 0;
   let retainedTransitionInputs = 0;
+  // When the unified index supplies the calibration corpus, the scan retains
+  // no transition inputs of its own; this counter only preserves the periodic
+  // RSS check cadence the reserve path would otherwise provide.
+  let unretainedCalibrationInputs = 0;
+  const observeUnretainedCalibrationInput = () => {
+    unretainedCalibrationInputs += 1;
+    if (unretainedCalibrationInputs % ACCOUNTING_RSS_CHECK_INTERVAL === 0) {
+      checkRuntimeMemory();
+    }
+  };
   const reserveTransitionInput = (kind) => {
     const usageCount = rawUsageEvents.length + retainedSparkUsageEvents;
     const snapshotCount = weeklyRateLimitSnapshots.length
@@ -1574,16 +2101,22 @@ export async function buildReplaySafeAccountingCache({
         event.declaredSpeed = event.speed === "unknown"
           ? declaredSpeedModeAt(baselines, observedMs) ?? "unknown"
           : "unknown";
-        reserveTransitionInput("usage");
+        if (retainWindowedCalibrationInputs) {
+          reserveTransitionInput("usage");
+        } else {
+          observeUnretainedCalibrationInput();
+        }
         if (event.isSpark) {
-          retainedSparkUsageEvents += 1;
+          if (retainWindowedCalibrationInputs) retainedSparkUsageEvents += 1;
           for (const [id, period] of periods) {
             if (observedMs >= starts[id]) addEvent(period, event);
           }
           addTimelineEvent(sparkTimeline, event);
           return;
         }
-        rawUsageEvents.push(transitionUsageProjection(rawEvent, event));
+        if (retainWindowedCalibrationInputs) {
+          rawUsageEvents.push(transitionUsageProjection(rawEvent, event));
+        }
         for (const [id, period] of periods) {
           if (observedMs >= starts[id]) addEvent(period, event);
         }
@@ -1602,8 +2135,12 @@ export async function buildReplaySafeAccountingCache({
         if (window?.limitId === "codex-spark"
             && window.provider === "openai_codex"
             && isValidQuotaWindowDuration(window.windowDurationMins)) {
-          reserveTransitionInput("snapshot");
-          retainedSparkSnapshotInputs += 1;
+          if (retainWindowedCalibrationInputs) {
+            reserveTransitionInput("snapshot");
+            retainedSparkSnapshotInputs += 1;
+          } else {
+            observeUnretainedCalibrationInput();
+          }
           retainQuotaTimeline(
             sparkQuotaTimelineBuckets,
             snapshot,
@@ -1613,8 +2150,12 @@ export async function buildReplaySafeAccountingCache({
         }
         if (window?.limitId === "codex"
             && window.windowDurationMins === WEEKLY_WINDOW_MINUTES) {
-          reserveTransitionInput("snapshot");
-          weeklyRateLimitSnapshots.push(weeklyRateLimitProjection(snapshot));
+          if (retainWindowedCalibrationInputs) {
+            reserveTransitionInput("snapshot");
+            weeklyRateLimitSnapshots.push(weeklyRateLimitProjection(snapshot));
+          } else {
+            observeUnretainedCalibrationInput();
+          }
           retainQuotaTimeline(
             weeklyQuotaTimelineBuckets,
             snapshot,
@@ -1632,23 +2173,57 @@ export async function buildReplaySafeAccountingCache({
   }
   throwIfAborted(signal);
   checkRuntimeMemory();
-  const retainedUsageEvents = rawUsageEvents.length + retainedSparkUsageEvents;
-  const retainedWeeklySnapshots = weeklyRateLimitSnapshots.length
-    + retainedSparkSnapshotInputs;
+  let unifiedCalibration = null;
+  if (useUnifiedCalibration) {
+    unifiedCalibration = await readUnifiedIndexCalibrationCorpus({
+      indexFile: unifiedIndexFile,
+      endMs,
+      limits,
+      signal,
+      checkRuntimeMemory,
+    });
+    // The probe accepted this index, so the scan retained no windowed
+    // fallback corpus. If the full read then fails, the only honest outputs
+    // are a typed failure or a calibration falsely labelled complete-but-
+    // empty; fail closed, and the next refresh re-probes from scratch.
+    if (unifiedCalibration === null) {
+      throw fixedError("accounting_calibration_corpus_unavailable");
+    }
+  }
+  const retainedUsageEvents = retainWindowedCalibrationInputs
+    ? rawUsageEvents.length + retainedSparkUsageEvents
+    : unifiedCalibration.rawUsageEvents.length;
+  const retainedWeeklySnapshots = retainWindowedCalibrationInputs
+    ? weeklyRateLimitSnapshots.length + retainedSparkSnapshotInputs
+    : unifiedCalibration.weeklyRateLimitSnapshots.length;
+  const calibrationRetainedBytes = retainWindowedCalibrationInputs
+    ? retainedTransitionBytes
+    : retainedUsageEvents * COMPACT_USAGE_RETAINED_BYTES
+      + retainedWeeklySnapshots * COMPACT_SNAPSHOT_RETAINED_BYTES;
+  const calibrationCoveredAt = {
+    startAt: retainWindowedCalibrationInputs
+      ? new Date(startMs).toISOString()
+      : unifiedCalibration.coveredAt.startAt,
+    endAt: new Date(endMs).toISOString(),
+  };
   let transitionSeries;
   try {
-    transitionSeries = await deriveCodexTransitionSeriesCooperatively({
-      startAt: new Date(startMs).toISOString(),
-      endAt: new Date(endMs).toISOString(),
-      rawUsageEvents,
-      rateLimitSnapshots: weeklyRateLimitSnapshots,
-      diagnostics: scanned?.diagnostics ?? {},
-      includeSnapshotIntervals: false,
-      windowDurationMins: WEEKLY_WINDOW_MINUTES,
+    transitionSeries = await deriveBoundedWeeklyCalibrationSeries({
+      startAt: calibrationCoveredAt.startAt,
+      endAt: calibrationCoveredAt.endAt,
+      rawUsageEvents: retainWindowedCalibrationInputs
+        ? rawUsageEvents
+        : unifiedCalibration.rawUsageEvents,
+      rateLimitSnapshots: retainWindowedCalibrationInputs
+        ? weeklyRateLimitSnapshots
+        : unifiedCalibration.weeklyRateLimitSnapshots,
+      // The scan diagnostics describe the windowed raw-log pass; the unified
+      // corpus was fork-replay-suppressed at ingest, so its transitions do
+      // not restate scan-level counts as their own.
+      diagnostics: retainWindowedCalibrationInputs
+        ? scanned?.diagnostics ?? {}
+        : {},
       signal,
-      consumeInputs: true,
-      includeNormalizedInputs: false,
-      inputEncoding: "accounting_prepriced_compact_v2",
       resourceCheck: checkRuntimeMemory,
     });
   } catch (error) {
@@ -1670,8 +2245,8 @@ export async function buildReplaySafeAccountingCache({
   const weeklyCalibration = projectBoundedWeeklyCalibrationSummary({
     parserVersion: PARSER_VERSION,
     scope: {
-      startAt: new Date(startMs).toISOString(),
-      endAt: new Date(endMs).toISOString(),
+      startAt: calibrationCoveredAt.startAt,
+      endAt: calibrationCoveredAt.endAt,
       snapshotIntervalsIncluded: false,
     },
     pricing: {
@@ -1715,9 +2290,17 @@ export async function buildReplaySafeAccountingCache({
     weeklyCalibrationInput: {
       status: "complete",
       encoding: "accounting_compact_v2",
+      // Which corpus fed the calibration: the whole unified index when it is
+      // present, the scan window only as the fallback. `coveredAt` states the
+      // span that corpus actually reaches, so a reader can tell full history
+      // from a bounded window instead of guessing.
+      source: retainWindowedCalibrationInputs
+        ? "windowed_scan"
+        : "unified_index",
+      coveredAt: calibrationCoveredAt,
       retainedUsageEvents,
       retainedWeeklySnapshots,
-      estimatedRetainedBytes: retainedTransitionBytes,
+      estimatedRetainedBytes: calibrationRetainedBytes,
       limits,
     },
     diagnostics: publicDiagnostics(scanned?.diagnostics),
@@ -1783,6 +2366,11 @@ function validWeeklyCalibrationInput(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)
       || value.status !== "complete"
       || value.encoding !== "accounting_compact_v2"
+      || !["unified_index", "windowed_scan"].includes(value.source)
+      || canonicalInstant(value.coveredAt?.startAt) === null
+      || canonicalInstant(value.coveredAt?.endAt) === null
+      || Date.parse(value.coveredAt.startAt)
+        > Date.parse(value.coveredAt.endAt)
       || !Number.isSafeInteger(value.retainedUsageEvents)
       || value.retainedUsageEvents < 0
       || !Number.isSafeInteger(value.retainedWeeklySnapshots)

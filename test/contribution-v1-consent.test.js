@@ -241,6 +241,76 @@ test("retryable failures back off exponentially and reset on success", async () 
   assert.equal(recovered.lastOutcome.code, "synced");
 });
 
+test("re-pairing mid retry-backoff pulls the next attempt to the present (2026-08-08)", async () => {
+  // Owner-directed immediate first pass: a successful device pairing is
+  // fresh upload authority, not just the cure for an auto-pause. A
+  // controller mid retry-backoff (for example after the service refused
+  // uploads for a claim that carried the v0.1 consent) must not sit out the
+  // remainder of a ladder it has already lost, so resume() on an unpaused
+  // controller re-arms an immediate attempt.
+  const { controller, runs, nowIso } = harness({
+    outcomes: [
+      runOutcome({
+        status: "failed",
+        daysSynced: 0,
+        daysPending: 2,
+        chunksUploaded: 0,
+        failure: {
+          code: "service_unavailable",
+          retryable: true,
+          deviceUnavailable: false,
+          retryAfterMilliseconds: null,
+        },
+      }),
+      runOutcome(),
+    ],
+  });
+  await controller.start();
+  await controller.approve();
+  const failed = await controller.runDue();
+  assert.equal(failed.paused, false);
+  assert.ok(Date.parse(failed.nextAttemptAt) > Date.parse(nowIso()));
+  // No waiting out the backoff: the pairing cure re-arms the schedule now,
+  // and the retry ladder starts over for the fresh authority.
+  const resumed = await controller.resume();
+  assert.equal(resumed.nextAttemptAt, nowIso());
+  await controller.runDue();
+  assert.equal(runs.length, 2);
+});
+
+test("a refused consent grant pauses with the exact consent_rejected reason (2026-08-08)", async () => {
+  // The fixed-vocabulary code the dashboard's transparent re-pair keys on: a
+  // 403 TELEMETRY_CONSENT_INVALID upload surfaces as consent_rejected, the
+  // engine pauses, and the pairing cure (resume) reopens the schedule.
+  const { controller, runs } = harness({
+    outcomes: [
+      runOutcome({
+        status: "failed",
+        daysSynced: 0,
+        daysPending: 2,
+        chunksUploaded: 0,
+        failure: {
+          code: "consent_rejected",
+          retryable: false,
+          deviceUnavailable: false,
+          retryAfterMilliseconds: null,
+        },
+      }),
+      runOutcome(),
+    ],
+  });
+  await controller.start();
+  await controller.approve();
+  const paused = await controller.runDue();
+  assert.equal(paused.paused, true);
+  assert.equal(paused.pausedReason, "consent_rejected");
+  assert.equal(paused.nextAttemptAt, null);
+  const resumed = await controller.resume();
+  assert.equal(resumed.paused, false);
+  await controller.runDue();
+  assert.equal(runs.length, 2);
+});
+
 test("consent recorded for another destination is not current here, and halts sync", async () => {
   const storage = fakeStorage();
   const other = harness({

@@ -2793,7 +2793,13 @@ test("community adapter separates cookie sessions from one-use upload authority"
   assert.equal(calls[6].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
   assert.equal(calls[7].url, "/api/v1/me/device-pairings");
   assert.equal(calls[7].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
-  assert.match(calls[7].options.body, /ongoing-privacy-safe-telemetry-v0\.1/);
+  // Re-pinned 2026-08-08 (v1.0 wiring): a telemetry participant's pairing now
+  // requests the v1.0 incremental consent identifier. The companion's CLAIM
+  // of this pairing is what records the server-side consent-once grant that
+  // v1.0 chunk uploads are verified against; the v0.1 identifier here left
+  // production refusing every upload with 403 TELEMETRY_CONSENT_INVALID.
+  assert.match(calls[7].options.body, /ongoing-privacy-safe-telemetry-v1\.0/);
+  assert.doesNotMatch(calls[7].options.body, /ongoing-privacy-safe-telemetry-v0\.1/);
   assert.equal(calls[8].url, "/api/v1/me/devices");
   assert.equal(calls[9].url, "/api/v1/me/devices/revoke");
   assert.equal(calls[9].options.method, "POST");
@@ -3347,9 +3353,12 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
 
   assert.match(appSource, /function configuredGoogleClientId\(\)/u);
   assert.match(appSource, /function hostedSignInRequired\(\)/u);
+  // Re-pinned 2026-08-08 (one-step flow): the standalone connect button is
+  // gone, so the sign-in gate now holds on the merged ceremony's single
+  // button instead.
   assert.match(
     appSource,
-    /button\.disabled = communityConnectBusy[\s\S]{0,240}?hostedSignInRequired\(\)/u,
+    /approve\.disabled = busy[\s\S]{0,240}?hostedSignInRequired\(\)/u,
   );
   assert.match(appSource, /identity: hostedIdentity/u);
   // Both providers run the same server-owned handoff: a start that returns an
@@ -4106,8 +4115,14 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /Seven-day allowance remaining/u);
   assert.match(html, /id="community"/u);
   assert.match(html, /https:\/\/tibotattle\.com\/#community/u);
-  assert.match(html, /id="community-connect-consent"/u);
-  // Re-pinned 2026-08-08 (owner-directed): the legacy prepare-and-review
+  // Re-pinned 2026-08-08 (owner-directed, second round): the connect card is
+  // merged into the approve surface — the consent checkbox and the separate
+  // connect button are gone. After sign-in the single Review-and-approve
+  // button is the one contribution action, and the explicit approval IS the
+  // consent.
+  assert.doesNotMatch(html, /id="community-connect-consent"/u);
+  assert.doesNotMatch(html, /id="connect-community"/u);
+  // Earlier same-day re-pin: the legacy prepare-and-review
   // flow — lookback picker, prepare button, summary card and Send — is
   // removed outright, extending the sync-inspect tombstone to the whole
   // surface. The approve-once card (telemetry-contribution-v1.0) is the ONLY
@@ -5299,8 +5314,11 @@ test("community UI stays focused on one reviewed destination", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   assert.match(html, /id="community"/u);
-  assert.match(html, /id="community-connect-consent"/u);
-  // Re-pinned 2026-08-08 (owner-directed): the prepare-and-review disclosure
+  // Re-pinned 2026-08-08 (owner-directed, second round): the connect-consent
+  // checkbox left with the connect card — the merged surface's explicit
+  // Review-and-approve action is the consent.
+  assert.doesNotMatch(html, /id="community-connect-consent"/u);
+  // Earlier same-day re-pin: the prepare-and-review disclosure
   // is removed outright — the approve-once surface is the one reviewed
   // destination. The only review control left is the error-recovery re-check
   // for the invisible bootstrap, and it lives on the approve card.
@@ -5368,11 +5386,17 @@ test("new enrollment pairs immediately and intentionally discards recovery capab
   assert.doesNotMatch(html, /id="copy-recovery"/u);
   assert.doesNotMatch(html, /id="acknowledge-recovery"/u);
   assert.doesNotMatch(html, /id="recover-form"/u);
+  // Re-pinned 2026-08-08 (owner-directed, one-step flow): enrollment lives in
+  // the merged ceremony now, and it deliberately does NOT take the Worker's
+  // device-bootstrap pairing — that pairing may only carry the v0.1 ongoing
+  // consent. The ceremony enrolls, then mints the pairing separately with the
+  // fresh session so it carries the v1.0 consent, and pairs immediately.
   const enrollmentBody = appSource.match(
-    /async function connectCommunityContribution\(\) \{([\s\S]*?)\n\}/u,
+    /async function approveIncrementalContribution\(\) \{([\s\S]*?)\n\}/u,
   )?.[1] ?? "";
   assert.doesNotMatch(enrollmentBody, /recoveryCode/u);
-  assert.match(enrollmentBody, /return enrollment\.pairing;/u);
+  assert.match(enrollmentBody, /\{ deviceBootstrap: false, identity: hostedIdentity \}/u);
+  assert.match(enrollmentBody, /return communityClient\.createDevicePairing\(false\);/u);
   assert.match(enrollmentBody, /finishCommunityDevicePairing\(pairing, status\)/u);
   assert.doesNotMatch(appSource, /pendingCommunityPairing/u);
   assert.doesNotMatch(appSource, /acknowledgeRecoveryAndConnect/u);
@@ -5395,37 +5419,41 @@ test("the browser-side preparation preflight is retired with the prepare flow", 
   assert.match(appSource, /INCREMENTAL_PREPARATION_ERROR_COPY/u);
 });
 
-test("primary contribution journey connects the Mac for one reviewed send without exposing a pairing code", async () => {
+test("primary contribution journey is one review-and-approve ceremony without exposing a pairing code", async () => {
+  // Re-pinned 2026-08-08 (owner-directed, second round): the connect card is
+  // gone. After sign-in there is exactly ONE action — the Review-and-approve
+  // ceremony — which mints the v1.0-consent pairing with the held session,
+  // has the companion claim it (the claim records the server-side grant),
+  // records the local approve-once consent with the review token, and the
+  // first sync pass starts immediately.
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   for (const id of [
     "community-connect-consent",
     "connect-community",
     "community-connect-status",
+    "contribution-not-now",
   ]) {
-    assert.match(html, new RegExp(`id="${id}"`, "u"));
+    assert.doesNotMatch(html, new RegExp(`id="${id}"`, "u"), id);
   }
-  // Re-pinned 2026-08-08 (owner-directed): the pitch copy states the final
-  // flow — sign in → connect → approve once → syncs automatically.
   assert.match(html, /Contribute anonymous usage data/u);
-  assert.match(html, /approve once\./u);
-  assert.match(html, /You see the covered data before anything is sent/u);
-  assert.match(html, /I want to review the covered data and decide whether to approve it/u);
-  // The primary button names the network action it performs.
-  assert.match(html, /id="connect-community"[\s\S]{0,80}Connect this Mac/u);
-  const consentTag =
-    html.match(/<input id="community-connect-consent"[^>]*>/u)?.[0] ?? "";
-  assert.doesNotMatch(consentTag, /\bchecked\b/u);
+  assert.match(html, /then approve once\./u);
+  assert.match(html, /You\s*\n?\s*see the covered data before anything is sent/u);
+  // The single button names the whole ceremony.
+  assert.match(html, /id="incremental-consent-approve"[\s\S]{0,80}Review and approve/u);
   assert.doesNotMatch(html, /every 6 hours while the app is open/u);
-  assert.match(appSource, /async function connectCommunityContribution\(\)/u);
+  assert.match(appSource, /async function approveIncrementalContribution\(\)/u);
   assert.match(
     appSource,
     /let enrollmentAttemptedWithHostedIdentity = false;\s*\n\s*let enrollmentEstablished = false;/u,
   );
+  // Enrollment never requests the Worker's bootstrap pairing (v0.1-consent
+  // only); the pairing is minted separately so it carries the v1.0 consent.
   assert.match(
     appSource,
-    /\{ deviceBootstrap: true, identity: hostedIdentity \}/u,
+    /\{ deviceBootstrap: false, identity: hostedIdentity \}/u,
   );
+  assert.doesNotMatch(appSource, /deviceBootstrap: true/u);
   assert.match(
     appSource,
     /enrollmentAttemptedWithHostedIdentity = hostedIdentity !== null;[\s\S]{0,240}?await communityClient\.enroll/u,
@@ -5437,18 +5465,14 @@ test("primary contribution journey connects the Mac for one reviewed send withou
   assert.match(appSource, /localClient\.pairContributionDevice\(pairing\.pairingCode\)/u);
   assert.doesNotMatch(appSource, /recoveryCode/u);
   assert.doesNotMatch(appSource, /armAutomaticContributionAfterReviewedSend/u);
-  // Re-pinned 2026-08-08 (owner-directed): after pairing, the connect flow
-  // routes the reader to the approve-once surface, whose invisible bootstrap
-  // owns preparation and the exact self-verification (`reviewPreparedSummary`
-  // — the minted-token gate is unchanged and pinned in the approve-once
-  // test). The old `inspectNextContribution` reveal stays gone.
+  // The invisible bootstrap owns preparation and the exact self-verification
+  // (`reviewPreparedSummary` — the minted-token gate is unchanged and pinned
+  // in the approve-once test). The old `inspectNextContribution` reveal
+  // stays gone.
   assert.match(appSource, /reviewPreparedSummary/u);
   assert.doesNotMatch(appSource, /inspectNextContribution/u);
   assert.match(appSource, /pairing = null;/u);
-  assert.match(
-    appSource,
-    /approval is asked once and nothing uploads without it/u,
-  );
+  assert.match(html, /Approval is asked once\./u);
 });
 
 test("post-results contribution CTA is explicit while technical and deletion controls stay quiet", async () => {
@@ -5458,15 +5482,18 @@ test("post-results contribution CTA is explicit while technical and deletion con
   assert.ok(communityPosition >= 0 && communityPosition < footerPosition);
   assert.doesNotMatch(html, /id="data"|id="coverage"|data-nav="data"|Data &amp; Privacy|05 · READING THE ESTIMATE|When to treat this as an estimate/iu);
   assert.match(html, /What leaves this Mac — and what never does/u);
-  assert.match(html, /Help improve community estimates: sign in, connect this Mac, and\s*\n?\s*approve once\./u);
+  // Re-pinned 2026-08-08 (owner-directed, second round): the pitch states the
+  // final two-step journey — sign in, then approve once. The connect step,
+  // its checkbox, and "Not now" left with the merged surface.
+  assert.match(html, /Help improve community estimates: sign in, then approve once\./u);
+  assert.doesNotMatch(html, /I want to review the covered data and decide whether to approve it/u);
+  assert.doesNotMatch(html, /id="contribution-not-now"/u);
   assert.match(html, /Shared: times, token counts, model names/u);
   assert.match(html, /Never shared: anything you typed or a model wrote/u);
   assert.match(html, /Contributing uses your Google or Apple sign-in/u);
-  assert.match(html, /I want to review the covered data and decide whether to approve it/u);
-  assert.match(html, /id="contribution-not-now"/u);
   assert.match(html, /See what the community published/u);
   assert.match(html, /https:\/\/tibotattle\.com\/#community/u);
-  // Re-pinned 2026-08-08 (owner-directed): the prepare/review disclosure and
+  // Earlier same-day re-pin: the prepare/review disclosure and
   // its Send button are removed; approving once on the consent card is the
   // one explicit action.
   assert.doesNotMatch(html, /id="sync-inspect"/u);
@@ -5531,7 +5558,9 @@ test("the approve card shows one verified review instance before one explicit ap
   // ready review, and the approval still carries the minted review token.
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  assert.match(html, /id="community-connect-consent"/u);
+  // Re-pinned 2026-08-08 (one-step flow): the connect checkbox is gone; the
+  // explicit approval on the merged surface is the consent.
+  assert.doesNotMatch(html, /id="community-connect-consent"/u);
   assert.doesNotMatch(html, /id="community-contribution-disclosure"/u);
   assert.doesNotMatch(html, /id="preparation-identity"/u);
   assert.doesNotMatch(html, /id="contribution-lookback-controls"/u);
@@ -5565,7 +5594,7 @@ test("the community journey states its stages and gates effort behind sign-in an
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
   // The four stages, in journey order, at the top of the community section:
-  // app/companion → index building → evidence → sign in & connect.
+  // app/companion → index building → evidence → sign in & approve.
   const stagePositions = ["app", "index", "evidence", "community"].map((name) => {
     const id = `id="journey-stage-${name}"`;
     assert.match(html, new RegExp(id, "u"));
@@ -5590,6 +5619,10 @@ test("the community journey states its stages and gates effort behind sign-in an
     appSource,
     /stage\("index", "progress", "journey\.index\.progress", \{/u,
   );
+  // Re-pinned 2026-08-08 (one-step flow): journey.community.connectNext left
+  // with the connect step; the signed-in state points straight at the single
+  // Review-and-approve action, and waitingIndex covers a companion that has
+  // not advertised the v1.0 transport yet.
   for (const locale of SUPPORTED_LOCALES) {
     for (const key of [
       "journey.app.connected",
@@ -5597,7 +5630,7 @@ test("the community journey states its stages and gates effort behind sign-in an
       "journey.index.complete",
       "journey.index.waiting",
       "journey.community.signInFirst",
-      "journey.community.connectNext",
+      "journey.community.waitingIndex",
       "journey.community.approveNext",
       "journey.community.syncing",
       "journey.community.noService",
@@ -5607,24 +5640,20 @@ test("the community journey states its stages and gates effort behind sign-in an
       assert.ok(copy.length > 0 && copy.length <= 90, `${locale} ${key} stays short: ${copy}`);
     }
   }
-  // The connected stage states the approve-once flow's remaining truth.
+  // The signed-in stage states the one remaining action; the approved stage
+  // states the flow's remaining truth.
   assert.match(appSource, /stage\("community", "action", "journey\.community\.approveNext"\)/u);
   assert.match(appSource, /stage\("community", "done", "journey\.community\.syncing"\)/u);
-  // Sign-in and connection come BEFORE any effort is invested: upload
-  // authority is claimed only from measured facts, Approve is disabled with a
-  // stated reason until it exists, and the reason names the missing step
-  // (sign-in versus connection) on the approve card's own gate line.
+  // Sign-in comes BEFORE any effort is invested: the single button is
+  // disabled with a stated reason on its own gate line until sign-in exists.
+  // Connection is no longer a stated prerequisite — the ceremony performs the
+  // pairing itself (re-pinned 2026-08-08).
   assert.match(appSource, /function communityUploadAuthorityEvidence\(\)/u);
   assert.match(appSource, /communityDevicePaired\s*\|\| finite\(contributionSyncStatus\?\.counts\?\.accepted, 0\) > 0/u);
-  assert.match(appSource, /\|\| !authorized;/u);
-  assert.match(appSource, /"consent\.signInFirst"\s*:\s*"consent\.connectFirst"/u);
+  assert.match(appSource, /\|\| hostedSignInRequired\(\);/u);
+  assert.match(appSource, /\? "consent\.signInFirst"/u);
+  assert.doesNotMatch(appSource, /consent\.connectFirst/u);
   assert.match(html, /id="incremental-consent-gate"/u);
-  // A build with no contribution service has nothing to sign into, nothing
-  // to approve, and nothing that can send.
-  assert.match(
-    appSource,
-    /return !contributionServiceConfigured\(\) \|\| communityUploadAuthorityEvidence\(\);/u,
-  );
   assert.match(styles, /\.journey-stage \{/u);
 });
 
@@ -5640,13 +5669,12 @@ test("a prepared review instance verifies itself once and failure retries stay e
   assert.match(appSource, /incremental-review-retry/u);
   // The silent preparation is equally loop-proof: once per queue state.
   assert.match(appSource, /if \(incrementalReviewPrepareAttempted\) return;\s*\n\s*incrementalReviewPrepareAttempted = true;/u);
-  // The verification waits for the same authorization Approve needs, so a
-  // local mutation that mints a consent token never runs for an unauthorized
-  // page — and never at all on a build without the v1.0 capability.
-  assert.match(
-    appSource,
-    /if \(!communityAuthorizationSatisfied\(\)\) return;/u,
-  );
+  // Re-pinned 2026-08-08 (one-step flow): the bootstrap no longer waits for
+  // pairing — pairing happens INSIDE the single Review-and-approve
+  // interaction, so the verified facts must already be on screen when it
+  // begins. The bootstrap stays purely local and still never runs on a build
+  // without the v1.0 capability or after approval.
+  assert.doesNotMatch(appSource, /communityAuthorizationSatisfied\(\)/u);
   assert.match(
     appSource,
     /if \(!incrementalSyncCapabilityAdvertised\(\) \|\| incrementalConsentApproved\) return;/u,
@@ -5681,12 +5709,19 @@ test("the approve-once consent surface lights up only with the advertised v1.0 s
     /if \(!incrementalSyncCapabilityAdvertised\(\)\) \{\s*\n\s*surface\.hidden = true;/u,
   );
   // Approval covers the kind of data, once, and keeps the review-bootstrap
-  // requirement: one verified real instance — the same review token that
-  // gates Send — must exist before approval can be given or recorded.
+  // requirement: one verified real instance must exist before a fresh
+  // approval can be given or recorded. Re-pinned 2026-08-08 (one-step flow):
+  // the gate now also admits the transparent re-pair — a Mac whose recorded
+  // approval stands but whose claim carried the v0.1 consent — and holds the
+  // button closed until sign-in exists, because the same click pairs.
   assert.match(html, /Approval is asked once\./u);
   assert.match(
     appSource,
-    /approve\.disabled = incrementalConsentBusy\s*\n\s*\|\| incrementalConsentApproved\s*\n\s*\|\| !reviewVerified/u,
+    /approve\.disabled = busy\s*\n\s*\|\| \(incrementalConsentApproved && !repairNeeded\)\s*\n\s*\|\| \(!incrementalConsentApproved && !reviewVerified\)\s*\n\s*\|\| hostedSignInRequired\(\);/u,
+  );
+  assert.match(
+    appSource,
+    /if \(needsLocalApproval && contributionSyncExactReview\?\.state !== "ready"\) \{/u,
   );
   assert.match(
     appSource,
@@ -6437,7 +6472,8 @@ test("result panels show the number and its caveat, not the service plumbing", a
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   assert.match(html, /id="community"/u);
-  assert.match(html, /Help improve community estimates: sign in, connect this Mac, and\s*\n?\s*approve once\./u);
+  // Re-pinned 2026-08-08 (one-step flow): sign in, then approve once.
+  assert.match(html, /Help improve community estimates: sign in, then approve once\./u);
   assert.match(html, /See what the community published/u);
   assert.match(html, /https:\/\/tibotattle\.com\/#community/u);
   // Re-pinned 2026-08-08 (owner-directed): the concise figures live on the
@@ -6661,11 +6697,13 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
   assert.match(describe, /if \(localNote === "refused"\) \{\s*\n[\s\S]*?console\.error\(/u);
   assert.match(describe, /localNote,/u);
 
-  // The connect fallback no longer names three unrelated things to check.
+  // The connect steps live inside the merged ceremony now (re-pinned
+  // 2026-08-08, one-step flow), and its fallback still never names three
+  // unrelated things to check.
   const connect = appSource.match(
-    /async function connectCommunityContribution\(\) \{([\s\S]*?)\n\}\n/u,
+    /async function approveIncrementalContribution\(\) \{([\s\S]*?)\n\}\n/u,
   )?.[1];
-  assert.ok(connect, "the connect journey is available");
+  assert.ok(connect, "the merged ceremony is available");
   assert.doesNotMatch(connect, /Check the invitation/u);
   assert.doesNotMatch(
     connect,
@@ -6680,19 +6718,21 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
   assert.match(connect, /contributionConnectStep\(\s*"service_check"/u);
   assert.match(connect, /contributionConnectStep\(\s*"hosted_enrollment"/u);
   assert.match(connect, /contributionConnectStep\(\s*"device_pairing"/u);
-  // Re-pinned 2026-08-08 (owner-directed): the local_preparation and
-  // local_review follow-up steps moved into the approve card's invisible
-  // bootstrap, which reports its own failures there with the same
+  // Re-pinned 2026-08-08 (owner-directed, second round): queue_refresh left
+  // with the separate connect flow — the merged ceremony's invisible
+  // bootstrap owns the queue and reports its own failures with the same
   // fixed-vocabulary preparation codes.
   for (const stepId of Object.keys({
     service_check: 0,
     hosted_enrollment: 0,
     device_pairing: 0,
-    queue_refresh: 0,
   })) {
     assert.match(appSource, new RegExp(`${stepId}: Object\\.freeze\\(\\{`, "u"));
   }
-  assert.doesNotMatch(appSource, /local_preparation: Object\.freeze\(\{|local_review: Object\.freeze\(\{/u);
+  assert.doesNotMatch(
+    appSource,
+    /local_preparation: Object\.freeze\(\{|local_review: Object\.freeze\(\{|queue_refresh: Object\.freeze\(\{/u,
+  );
   assert.match(appSource, /INCREMENTAL_PREPARATION_ERROR_COPY = \{/u);
   assert.match(appSource, /identity_unavailable:/u);
   assert.match(appSource, /coverage_unavailable:/u);
@@ -7051,6 +7091,25 @@ test("a posted results card can carry only fixed copy and formatted figures", as
     html,
     /It contains no\s*\n?\s*prompts, responses, paths, account details, or raw activity/u,
   );
+  // Re-pinned 2026-08-08 (owner-directed, second round): the share panel sits
+  // ABOVE the "See individual usage changes" disclosure, and its caption
+  // states the card's population — the chart's active range and span filter.
+  // The claim is kept true in code: the range and span controls re-render the
+  // card along with the chart.
+  const sharePosition = html.indexOf('id="share-panel"');
+  const disclosurePosition = html.indexOf(
+    "<summary>See individual usage changes</summary>",
+  );
+  assert.ok(sharePosition >= 0 && disclosurePosition >= 0);
+  assert.ok(sharePosition < disclosurePosition);
+  assert.match(
+    html,
+    /The card matches the chart above: its plotted history follows the\s*\n?\s*active date range and minimum observed-span filter\./u,
+  );
+  assert.match(
+    appSource,
+    /renderWeekly\(dashboard\);\s*\n[\s\S]{0,240}?renderShareCard\(dashboard\);/u,
+  );
 });
 
 test("the posted allowance graph uses the exact history model from the dashboard", async () => {
@@ -7135,8 +7194,8 @@ test("a posted results card always carries a diagnostic-format reference", async
 
   // Re-pinned 2026-08-08 (owner-directed): the identifier line no longer
   // paints on the image — the reference reaches a reader through the text
-  // transcript's trailer, the saved file's name, and the chip beside the
-  // card — and the toasts stopped claiming otherwise.
+  // transcript's trailer and the saved file's name — and the toasts stopped
+  // claiming otherwise.
   assert.match(section, /const identifiers = \[\s*\n\s*t\("share\.identifier\.debug", \{ reference \}\),/u);
   assert.match(section, /t\("share\.identifier\.version", \{/u);
   assert.doesNotMatch(section, /price table \$\{registryVersion\}/u);
@@ -7152,11 +7211,12 @@ test("a posted results card always carries a diagnostic-format reference", async
   );
   assert.doesNotMatch(section, /is printed on the image/u);
 
-  // The same reference remains visible beside the card without duplicating a
-  // full transcript of an image that is already the share surface.
-  assert.match(section, /\$\("#share-card-reference"\)\.textContent = shareCard\.reference;/u);
+  // Re-pinned 2026-08-08 (owner-directed, second round): the "TT-XXXXXX"
+  // header chip is gone from the panel — a code the reader could not act on.
+  // The reference still travels with every saved file's name.
+  assert.doesNotMatch(section, /share-card-reference/u);
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
-  assert.match(html, /id="share-card-reference"/u);
+  assert.doesNotMatch(html, /id="share-card-reference"/u);
   assert.doesNotMatch(html, /id="share-card-readout"/u);
 });
 

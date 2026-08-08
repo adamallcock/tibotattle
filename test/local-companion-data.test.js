@@ -1055,7 +1055,9 @@ test("live weekly cache replaces the repo artifact and labels historical account
     await refreshReplaySafeAccountingCache({
       stateFile,
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
-      windowDays: 31,
+      // Re-pinned 31 -> 365 (2026-08-08): the standing owner rule forbids
+      // convenience-sized history windows, so 365 is the smallest accepted.
+      windowDays: 365,
       scan: async ({ onUsage, onRateLimitSnapshot }) => {
         onUsage({
           timestamp: "2026-07-25T10:00:00.000Z",
@@ -1156,7 +1158,9 @@ test("malformed live weekly reset rows fail closed without crashing the dashboar
     await refreshReplaySafeAccountingCache({
       stateFile,
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
-      windowDays: 31,
+      // Re-pinned 31 -> 365 (2026-08-08): the standing owner rule forbids
+      // convenience-sized history windows, so 365 is the smallest accepted.
+      windowDays: 365,
       scan: async () => ({ diagnostics: {} }),
     });
     const cache = (await readLocalCollectorAccountingCache({ stateFile })).cache;

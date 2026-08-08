@@ -593,20 +593,20 @@ export const WEB_MESSAGES = Object.freeze({
     "请在下方使用 Google 或 Apple 登录。",
     "Inicia sesión abajo con Google o Apple.",
   ],
-  "journey.community.connectNext": [
-    "Signed in — connect this Mac below.",
-    "已登录——请在下方连接这台 Mac。",
-    "Sesión iniciada: conecta este Mac abajo.",
-  ],
   "journey.community.connected": [
     "Connected.",
     "已连接。",
     "Conectado.",
   ],
+  "journey.community.waitingIndex": [
+    "Approval opens once the local index is ready.",
+    "本地索引就绪后即可核准。",
+    "La aprobación se abre cuando el índice local esté listo.",
+  ],
   "journey.community.approveNext": [
-    "Connected — approve once below.",
-    "已连接——请在下方核准一次。",
-    "Conectado: aprueba una vez abajo.",
+    "Signed in — review and approve below.",
+    "已登录——请在下方审阅并核准。",
+    "Sesión iniciada: revisa y aprueba abajo.",
   ],
   "journey.community.syncing": [
     "Approved — your history syncs automatically.",
@@ -634,14 +634,9 @@ export const WEB_MESSAGES = Object.freeze({
     "La instancia verificada de arriba es la revisión. Aprobar cubre este tipo de datos de ahora en adelante.",
   ],
   "consent.signInFirst": [
-    "Sign in at the top of this section first. Nothing can upload without it.",
-    "请先在本区域顶部登录。未登录时无法上传任何内容。",
-    "Primero inicia sesión en la parte superior de esta sección. Sin ello no se puede subir nada.",
-  ],
-  "consent.connectFirst": [
-    "Connect this Mac at the top of this section first. Nothing can upload without it.",
-    "请先在本区域顶部连接这台 Mac。未连接时无法上传任何内容。",
-    "Primero conecta este Mac en la parte superior de esta sección. Sin ello no se puede subir nada.",
+    "Sign in above first. Nothing can upload without it.",
+    "请先在上方登录。未登录时无法上传任何内容。",
+    "Primero inicia sesión arriba. Sin ello no se puede subir nada.",
   ],
   "consent.preparingReview": [
     "Preparing one real instance of the covered data on this Mac for you to review. No network upload is performed.",
@@ -653,10 +648,25 @@ export const WEB_MESSAGES = Object.freeze({
     "同步：{total} 天中已同步 {synced} 天 · 待同步 {pending} 天。",
     "Sincronización: {synced} de {total} días sincronizados · {pending} pendientes.",
   ],
-  "consent.syncNoProgress": [
-    "Sync: waiting for the first pass.",
-    "同步：正在等待首次运行。",
-    "Sincronización: esperando la primera pasada.",
+  "consent.syncStarting": [
+    "Sync: starting the first pass…",
+    "同步：正在启动首次运行…",
+    "Sincronización: iniciando la primera pasada…",
+  ],
+  "consent.syncUploading": [
+    "Uploading day {current} of {total}…",
+    "正在上传第 {current} 天（共 {total} 天）…",
+    "Subiendo el día {current} de {total}…",
+  ],
+  "consent.syncRefreshingAuthority": [
+    "Sync: refreshing this Mac's upload authorization…",
+    "同步：正在刷新这台 Mac 的上传授权…",
+    "Sincronización: actualizando la autorización de subida de este Mac…",
+  ],
+  "consent.authorityRefreshed": [
+    "This Mac's contribution authorization is refreshed. Uploads continue automatically.",
+    "这台 Mac 的贡献授权已刷新。上传将自动继续。",
+    "La autorización de contribución de este Mac se ha actualizado. Las subidas continúan automáticamente.",
   ],
   "consent.syncPaused": [
     "Paused: {reason}.",
@@ -941,13 +951,16 @@ export function pseudoLocalize(value) {
 export const LEGACY_TEXT_CATALOG = Object.freeze({
   // The single approve-once contribution flow (2026-08-08).
   "Contribute anonymous usage data": ["贡献匿名使用数据", "Contribuir datos de uso anónimos"],
-  "Help improve community estimates: sign in, connect this Mac, and approve once. You see the covered data before anything is sent; after approval it stays current automatically.": [
-    "帮助改进社区估计：登录、连接这台 Mac，并批准一次。发送任何内容之前你都会先看到所涵盖的数据；批准后它会自动保持最新。",
-    "Ayuda a mejorar las estimaciones comunitarias: inicia sesión, conecta este Mac y aprueba una sola vez. Ves los datos cubiertos antes de que se envíe nada; tras la aprobación se mantienen al día automáticamente.",
+  // One-step flow (owner-directed 2026-08-08): sign in, then approve once.
+  "Help improve community estimates: sign in, then approve once. You see the covered data before anything is sent; after approval it stays current automatically.": [
+    "帮助改进社区估计：登录后核准一次即可。发送任何内容之前你都会先看到所涵盖的数据；核准后它会自动保持最新。",
+    "Ayuda a mejorar las estimaciones comunitarias: inicia sesión y aprueba una sola vez. Ves los datos cubiertos antes de que se envíe nada; tras la aprobación se mantienen al día automáticamente.",
   ],
-  "I want to review the covered data and decide whether to approve it.": [
-    "我想先审阅所涵盖的数据，再决定是否批准。",
-    "Quiero revisar los datos cubiertos y decidir si los apruebo.",
+  // Share panel caption (owner-directed 2026-08-08): the card follows the
+  // chart's active filters, and the code re-renders it with the chart.
+  "The card matches the chart above: its plotted history follows the active date range and minimum observed-span filter.": [
+    "该卡片与上方图表一致：其绘制的历史遵循当前生效的日期范围和最低观测跨度筛选。",
+    "La tarjeta coincide con el gráfico de arriba: su historial trazado sigue el intervalo de fechas activo y el filtro de intervalo mínimo observado.",
   ],
   // Allowance history: the honest error-bar naming (2026-08-08).
   "Slope-agreement range": ["斜率一致性区间", "Intervalo de concordancia de pendientes"],
@@ -960,21 +973,23 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Mac app & companion": ["Mac 应用与伴随程序", "App para Mac y acompañante"],
   "Local usage index": ["本地使用索引", "Índice de uso local"],
   "Local evidence": ["本地证据", "Evidencia local"],
-  "Sign in & connect": ["登录并连接", "Iniciar sesión y conectar"],
+  "Sign in & approve": ["登录并核准", "Iniciar sesión y aprobar"],
   "This summary is the review": ["这份摘要就是审阅", "Este resumen es la revisión"],
   "Check summary again": ["再次检查摘要", "Volver a comprobar el resumen"],
   "Send unlocks only after these exact figures are verified on this Mac. What you see summarized here is exactly what would be sent.": ["只有在这台 Mac 上校验完这些确切数字后，“发送”才会解锁。你在此看到的摘要内容正是将要发送的内容。", "Enviar se desbloquea solo después de que estas cifras exactas se verifiquen en este Mac. Lo que ves resumido aquí es exactamente lo que se enviaría."],
   "Approve once": ["一次核准", "Aprobar una vez"],
   "Automatic full-history contribution": ["自动贡献完整历史", "Contribución automática del historial completo"],
   "Not approved": ["未核准", "No aprobado"],
-  "This build's companion supports incremental upload. Approval covers the kind of data, once — after it, your full history uploads and stays current without per-batch review.": ["此构建的伴随程序支持增量上传。核准针对数据类型，只需一次——此后你的完整历史会上传并保持最新，无需逐批审阅。", "El acompañante de esta compilación admite carga incremental. La aprobación cubre el tipo de datos, una sola vez; después, tu historial completo se carga y se mantiene al día sin revisión por lotes."],
+  "Approval covers the kind of data, once — after it, your full history uploads and stays current without per-batch review.": ["核准针对数据类型，只需一次——此后你的完整历史会上传并保持最新，无需逐批审阅。", "La aprobación cubre el tipo de datos, una sola vez; después, tu historial completo se carga y se mantiene al día sin revisión por lotes."],
   "Your full usage history uploads first; new events then upload roughly every 6 hours.": ["首先上传你的完整使用历史；此后新事件大约每 6 小时上传一次。", "Primero se carga tu historial de uso completo; luego los eventos nuevos se cargan aproximadamente cada 6 horas."],
   "Community estimates recompute when your data or corrections to it arrive, including for past months.": ["当你的数据或对它的更正到达时，社区估计会重新计算，包括过去的月份。", "Las estimaciones comunitarias se recalculan cuando llegan tus datos o correcciones, incluso para meses pasados."],
-  "Deletion removes everything you contributed, always.": ["删除会移除你贡献的所有内容，任何时候都是如此。", "La eliminación quita todo lo que aportaste, siempre."],
+  // Deletion honesty (2026-08-08): the standing promise sentence left the
+  // card; the working control below replaced it.
+  "Delete my contributions": ["删除我的贡献", "Eliminar mis contribuciones"],
   "The exact kind of data covered": ["涵盖的数据类型明细", "El tipo exacto de datos cubiertos"],
   "Covered: token counts, model identifiers or keyed fingerprints, tier, surface and outcome categories, timestamps, quota percentages, tool-class counts per session, and stable pseudonymous session identifiers.": ["涵盖：令牌数量、模型标识符或密钥指纹、层级、界面与结果类别、时间戳、额度百分比、每个会话的工具类别计数，以及稳定的化名会话标识符。", "Cubierto: recuentos de tokens, identificadores de modelo o huellas con clave, categorías de nivel, superficie y resultado, marcas de tiempo, porcentajes de cuota, recuentos de clases de herramientas por sesión e identificadores de sesión seudónimos estables."],
   "Never covered: prompts, responses, file names, paths, commands, or any account identifier.": ["绝不涵盖：提示词、回复、文件名、路径、命令或任何帐户标识符。", "Nunca cubierto: indicaciones, respuestas, nombres de archivo, rutas, comandos ni ningún identificador de cuenta."],
-  "Approve this kind of data": ["核准这类数据", "Aprobar este tipo de datos"],
+  "Review and approve": ["审阅并核准", "Revisar y aprobar"],
   "Approval is asked once. Only a change to the kind of data or the destination asks again.": ["核准只询问一次。只有数据类型或目的地发生变化时才会再次询问。", "La aprobación se pide una sola vez. Solo un cambio en el tipo de datos o el destino vuelve a preguntar."],
   "Minimum observed quota span": ["最低观测额度跨度", "Intervalo mínimo de cuota observado"],
   "50+ pp": ["50+ 个百分点", "50+ pp"],

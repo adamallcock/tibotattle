@@ -2799,8 +2799,12 @@ test("stale contribution-device credentials return fixed recovery guidance witho
       new URL("../web/public/index.html", import.meta.url),
       "utf8",
     );
+    // Re-pinned 2026-08-08 (owner-directed one-step flow): the pairing steps
+    // live inside the merged Review-and-approve ceremony now, and they report
+    // on the merged surface's own status line — the separate connect card and
+    // its #community-connect-status are gone.
     const connectSource = appSource.match(
-      /async function connectCommunityContribution\(\) \{([\s\S]*?)\n\}\n/u,
+      /async function approveIncrementalContribution\(\) \{([\s\S]*?)\n\}\n/u,
     )?.[1] ?? "";
     // Failure handling was centralized: every connect failure routes through
     // reportContributionConnectFailure, and the recovery contract lives there.
@@ -2810,7 +2814,8 @@ test("stale contribution-device credentials return fixed recovery guidance witho
     const recoverySource = appSource.match(
       /async function renderContributionDeviceRecovery\(status, \{ error \} = \{\}\) \{([\s\S]*?)\n\}\n\nconst DEVICE_CREDENTIAL_RESET_CONFIRMATION/u,
     )?.[1] ?? "";
-    assert.match(htmlSource, /id="community-connect-status"/u);
+    assert.doesNotMatch(htmlSource, /id="community-connect-status"/u);
+    assert.match(htmlSource, /id="incremental-consent-status"/u);
     assert.match(htmlSource, /id="community"[^>]*data-dashboard-page="community"/u);
     assert.doesNotMatch(htmlSource, /id="data"[^>]*data-dashboard-page/u);
     assert.doesNotMatch(htmlSource, /data-nav="data"/u);

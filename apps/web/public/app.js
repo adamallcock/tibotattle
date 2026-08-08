@@ -118,15 +118,29 @@ let incrementalSyncStatus = null;
 // data at most once per queue state, so a failing preparation cannot loop;
 // trying again is the explicit "Check again" action.
 let incrementalReviewPrepareAttempted = false;
+// One silent authorization repair per page load (owner-directed 2026-08-08):
+// a Mac whose earlier pairing carried the v0.1 consent has no server-side
+// v1.0 grant, so its uploads pause with consent_rejected. When the page holds
+// the session, it re-runs the pairing ceremony with the v1.0 consent by
+// itself — once — instead of surfacing a failure the user cannot act on.
+let incrementalRepairAttempted = false;
+// The short read-only polling loop behind the live first-pass status line.
+// setTimeout-chained (never an interval), bounded, and it only ever performs
+// the same GET the page performs on load.
+let incrementalSyncPollTimer = null;
+let incrementalSyncPollCount = 0;
 let fastModePreference = null;
 let fastModePreferenceBusy = false;
 let localOnboarding = null;
 let communityConnectBusy = false;
 // True once this Mac has actually been paired as an upload-only device in
-// this session. The primary button is named for what it will do next, so it
-// has to know whether the next action is a network connection or a local
-// review.
+// this session.
 let communityDevicePaired = false;
+// True once THIS session claimed a pairing that carried the v1.0 incremental
+// consent — the claim is what records the server-side consent-once grant. A
+// v0.1-era credential or a previously accepted upload is deliberately not
+// enough: the ceremony re-pairs unless this exact evidence exists.
+let communityDevicePairedV1 = false;
 // The opaque sign-in proof lives only in this module-scoped memory; it is
 // never persisted to storage and disappears with the tab.
 let hostedIdentity = null;
@@ -2495,7 +2509,9 @@ function renderShareCard(data) {
     home: shareCardHome(),
     history,
   });
-  $("#share-card-reference").textContent = shareCard.reference;
+  // The header's reference chip is gone (owner-directed, 2026-08-08): the
+  // reference still exists — the saved file name carries it — but the panel
+  // header no longer prints a code the reader cannot act on.
   canvas.setAttribute("aria-label", shareCardText(shareCard));
   if (!drawShareCard(canvas, shareCard)) {
     shareCard = null;
@@ -6000,21 +6016,18 @@ function communityUploadAuthorityEvidence() {
     || Boolean(contributionSyncStatus?.lastAcceptedAt);
 }
 
-// Sign-in and connection come before any effort is invested. A build with no
-// contribution service is exempt: preparing stays a purely local review there
-// and sending is separately impossible.
-function communityAuthorizationSatisfied() {
-  return !contributionServiceConfigured() || communityUploadAuthorityEvidence();
-}
+// (communityAuthorizationSatisfied left with the two-card flow, owner-directed
+// 2026-08-08: the review bootstrap is purely local and no longer waits for
+// pairing, and the single ceremony performs the pairing itself.)
 
 // One re-render entry point for everything the contribution state feeds now
 // that the legacy send card is gone: the approve-once surface and the
-// journey strip. (This replaces updateContributionSyncButtons; the send
-// button, its gate line and its chip were removed with the prepare flow,
-// owner-directed 2026-08-08.)
+// journey strip. It also gives the silent authorization repair its chance —
+// the repair is guarded to run at most once per page load.
 function renderContributionActionState() {
   renderIncrementalConsent();
   renderCommunityJourney();
+  maybeRepairIncrementalAuthorization();
 }
 
 // The approve-once surface's own status line. It inherits the role the old
@@ -6114,10 +6127,12 @@ function maybeReviewPreparedSummary() {
   // The token feeds only the approve-once consent now, so nothing prepares
   // or verifies on a build without the capability or after approval.
   if (!incrementalSyncCapabilityAdvertised() || incrementalConsentApproved) return;
-  // Verification is worth running only where its outcome can matter: it is a
-  // local mutation that mints a consent token, so it waits for the same
-  // authorization Approve itself needs.
-  if (!communityAuthorizationSatisfied()) return;
+  // The bootstrap no longer waits for pairing (owner-directed 2026-08-08,
+  // one-step flow): pairing now happens INSIDE the single Review-and-approve
+  // interaction, so the facts must already be on screen when that interaction
+  // begins. The bootstrap is purely local — prepare and verify on this Mac,
+  // no network — and the minted token still only ever feeds the explicit
+  // approval.
   if (contributionSyncPreview?.status !== "available") return;
   if (contributionSyncPreview.state !== "ready"
       || contributionSyncPreview.item == null) {
@@ -7217,7 +7232,10 @@ function renderHostedIdentity() {
   chip.className = signedIn
     ? "evidence-chip"
     : "evidence-chip neutral";
-  updateCommunityConnectButton();
+  // Sign-in state gates the single approve ceremony, so the merged surface
+  // and the journey strip re-render with it (owner-directed 2026-08-08: the
+  // separate connect button this used to refresh is gone).
+  renderContributionActionState();
 }
 
 // A completed hosted handoff is memory-only, but enrollment also creates an
@@ -7488,44 +7506,10 @@ async function beginHostedSignIn(providerId) {
   }
 }
 
-// Whether the primary button's next action is a local one. Reviewing is
-// local; connecting is not. The label has to say which, because the two are
-// not interchangeable and a user who is asked to "review" does not expect a
-// network enrollment.
-function communityContributionIsConnected() {
-  return hasCommunitySession() && communityDevicePaired;
-}
-
-function updateCommunityConnectButton() {
-  const button = $("#connect-community");
-  const consent = $("#community-connect-consent");
-  const enrollmentPaused = hostedEnrollmentIsPaused();
-  const connected = communityContributionIsConnected();
-  consent.disabled = false;
-  // Consent gates the network action only. Once this Mac is connected the
-  // button routes to the approve-once surface — the only contribution flow —
-  // which needs no further consent and must not become unreachable when the
-  // consent box is cleared. A connected Mac on a build without the v1.0
-  // capability has nothing left to do here, so the button says so and rests.
-  button.disabled = communityConnectBusy
-    || (connected && !incrementalSyncCapabilityAdvertised())
-    || (!connected
-      && (enrollmentPaused || hostedSignInRequired() || !consent.checked));
-  if (!communityConnectBusy) {
-    if (connected) {
-      setProductText(button, incrementalSyncCapabilityAdvertised()
-        ? "Review and approve"
-        : "Connected");
-    } else if (enrollmentPaused) {
-      setLocalizedText(button, "contribution.enrollmentPausedButton");
-    } else if (hostedSignInRequired()) {
-      setProductText(button, "Sign in above to contribute");
-    } else {
-      setProductText(button, "Connect this Mac");
-    }
-  }
-  renderCommunityJourney();
-}
+// (communityContributionIsConnected and updateCommunityConnectButton left
+// with the separate connect card, owner-directed 2026-08-08: the one-step
+// ceremony pairs and approves in the same interaction, so there is no
+// standalone connect button to label or gate any more.)
 
 // The chip vocabulary of the journey strip. Four states, each an honest
 // summary of the detail line beside it: finished, measurably under way,
@@ -7597,27 +7581,31 @@ function renderCommunityJourney() {
     stage("evidence", "action", "journey.evidence.missing");
   }
 
-  // 4 — sign in and connect, before any effort is invested below. Once this
-  // Mac is connected the line states the final flow's remaining truth:
-  // approve once, then it syncs automatically.
+  // 4 — sign in, then the single review-and-approve ceremony (owner-directed
+  // 2026-08-08: connecting is no longer a user-visible step — the ceremony
+  // pairs this Mac itself). Once approval stands the line states the flow's
+  // remaining truth: it syncs automatically.
   if (localCompanionHealth === null) {
     stage("community", "waiting", "journey.community.waitingCompanion");
   } else if (!contributionServiceConfigured()) {
     stage("community", "waiting", "journey.community.noService");
-  } else if (communityUploadAuthorityEvidence()) {
-    if (!incrementalSyncCapabilityAdvertised()) {
+  } else if (!incrementalSyncCapabilityAdvertised()) {
+    // A build whose companion does not advertise the v1.0 transport has no
+    // in-page ceremony; a Mac already holding upload authority still reads
+    // as connected rather than pending.
+    if (communityUploadAuthorityEvidence()) {
       stage("community", "done", "journey.community.connected");
-    } else if (incrementalConsentApproved) {
-      stage("community", "done", "journey.community.syncing");
     } else {
-      stage("community", "action", "journey.community.approveNext");
+      stage("community", "waiting", "journey.community.waitingIndex");
     }
+  } else if (incrementalConsentApproved) {
+    stage("community", "done", "journey.community.syncing");
   } else if (hostedEnrollmentIsPaused()) {
     stage("community", "waiting", "journey.community.paused");
   } else if (hostedSignInRequired()) {
     stage("community", "action", "journey.community.signInFirst");
   } else {
-    stage("community", "action", "journey.community.connectNext");
+    stage("community", "action", "journey.community.approveNext");
   }
 }
 
@@ -7634,11 +7622,22 @@ function incrementalSyncCapabilityAdvertised() {
 }
 
 /**
- * The approve-once consent surface. Approval covers the KIND of data, once;
- * the first approval keeps the existing review-bootstrap requirement — one
- * verified real instance of the data is on screen before approval can be
- * given — so the review-token gate carries into the approve-once model
- * unchanged.
+ * Whether the service refused this Mac's uploads for want of the v1.0
+ * consent-once grant. The engine pauses with exactly this fixed reason when
+ * an upload comes back 403 TELEMETRY_CONSENT_INVALID — the mark of a pairing
+ * that was claimed carrying the v0.1 consent, so no grant was recorded.
+ */
+function incrementalGrantRejected() {
+  return incrementalSyncStatus?.status === "available"
+    && incrementalSyncStatus.pausedReason === "consent_rejected";
+}
+
+/**
+ * The one merged surface (owner-directed 2026-08-08). Approval covers the
+ * KIND of data, once, and the first approval keeps the review-bootstrap
+ * requirement — one verified real instance of the data is on screen before
+ * approval can be given. The single button also owns the pairing ceremony:
+ * sign-in is the only prerequisite it states.
  */
 function renderIncrementalConsent() {
   const surface = $("#incremental-consent");
@@ -7652,17 +7651,26 @@ function renderIncrementalConsent() {
   const gate = $("#incremental-consent-gate");
   const chip = $("#incremental-consent-state");
   const reviewVerified = contributionSyncExactReview?.state === "ready";
-  const authorized = communityAuthorizationSatisfied();
+  const busy = incrementalConsentBusy || communityConnectBusy;
+  // A recorded approval whose claim carried the v0.1 consent re-opens the
+  // same single action (the transparent re-pair). The chip stays "Approved":
+  // the user's approval stands; only the transport authorization re-runs.
+  const repairNeeded = incrementalConsentApproved && incrementalGrantRejected();
   setLocalizedText(chip, incrementalConsentApproved
     ? "consent.stateApproved"
     : "consent.stateNotApproved");
   chip.className = incrementalConsentApproved
     ? "evidence-chip"
     : "evidence-chip neutral";
-  approve.disabled = incrementalConsentBusy
-    || incrementalConsentApproved
-    || !reviewVerified
-    || !authorized;
+  approve.disabled = busy
+    || (incrementalConsentApproved && !repairNeeded)
+    || (!incrementalConsentApproved && !reviewVerified)
+    || hostedSignInRequired();
+  const remove = $("#delete-contributions");
+  if (remove) {
+    remove.hidden = !hasCommunitySession();
+    remove.disabled = busy;
+  }
   // The review the approve gate requires, on screen: the verified prepared
   // instance's own facts. They come from the same queue item the one-use
   // token was minted for, and they leave with approval — the card then
@@ -7687,18 +7695,19 @@ function renderIncrementalConsent() {
       );
     }
   }
-  if (incrementalConsentApproved) {
+  if (incrementalConsentApproved && !(repairNeeded && hostedSignInRequired())) {
     forgetLocalizedNode(gate);
     gate.textContent = "";
     gate.hidden = true;
   } else {
     gate.hidden = false;
-    // Why Approve is off, stated where Approve is, in gate order: the
-    // missing sign-in or connection first, then the in-flight review.
-    setLocalizedText(gate, !authorized
-      ? (hostedSignInRequired()
-        ? "consent.signInFirst"
-        : "consent.connectFirst")
+    // Why the button is off, stated where the button is, in gate order: the
+    // missing sign-in first, then the in-flight review. Connection is no
+    // longer a stated prerequisite — the ceremony performs it itself. A
+    // signed-out Mac that needs the transparent re-pair states the sign-in
+    // requirement too: the silent repair needs the session.
+    setLocalizedText(gate, hostedSignInRequired()
+      ? "consent.signInFirst"
       : reviewVerified
         ? "consent.readyToApprove"
         : "consent.reviewFirst");
@@ -7707,11 +7716,15 @@ function renderIncrementalConsent() {
 }
 
 /**
- * The modest status line for the approved sync, from the companion's bounded
- * incremental-status projection: days synced and pending, the paused reason
- * code, and the last error code. Every value is a number or a fixed
- * vocabulary code the projection validated; no path, content, or identifier
- * can reach this line.
+ * The status line for the approved sync, from the companion's bounded
+ * incremental-status projection: live first-pass progress as day counts, the
+ * paused reason code, and the last error code. Every value is a number or a
+ * fixed vocabulary code the projection validated; no path, content, or
+ * identifier can reach this line.
+ *
+ * Re-pinned 2026-08-08 (owner-directed): approval starts the first pass
+ * immediately and the page polls this projection while it runs, so the line
+ * shows "Uploading day 3 of 82…" instead of an indefinite "waiting".
  */
 function renderIncrementalSyncStatusLine() {
   const line = $("#incremental-sync-status");
@@ -7724,29 +7737,86 @@ function renderIncrementalSyncStatusLine() {
     line.hidden = true;
     return;
   }
+  // The transparent re-pair state renders as the routine it is — an
+  // authorization refresh — never as a failure the user must interpret. When
+  // the page cannot run the refresh yet (signed out), the gate line asks for
+  // sign-in and this line stays quiet rather than claiming work in progress.
+  if (incrementalGrantRejected()) {
+    if (hostedSignInRequired()) {
+      forgetLocalizedNode(line);
+      line.textContent = "";
+      line.hidden = true;
+      return;
+    }
+    setRawText(line, t("consent.syncRefreshingAuthority"));
+    line.hidden = false;
+    return;
+  }
   const progress = incrementalSyncStatus.progress;
-  const parts = [
-    progress === null
-      ? t("consent.syncNoProgress")
-      : t("consent.syncProgress", {
-        pending: formatNumber(progress.daysPending),
-        synced: formatNumber(progress.daysSynced),
-        total: formatNumber(progress.daysTotal),
-      }),
-  ];
+  const parts = [];
+  if (progress === null) {
+    parts.push(t("consent.syncStarting"));
+  } else if (progress.daysPending > 0 && !incrementalSyncStatus.paused) {
+    // Mid catch-up: the day currently being uploaded, from the settled pass
+    // counts the engine reports between its bounded passes.
+    parts.push(t("consent.syncUploading", {
+      current: formatNumber(Math.min(progress.daysSynced + 1, progress.daysTotal)),
+      total: formatNumber(progress.daysTotal),
+    }));
+  } else {
+    parts.push(t("consent.syncProgress", {
+      pending: formatNumber(progress.daysPending),
+      synced: formatNumber(progress.daysSynced),
+      total: formatNumber(progress.daysTotal),
+    }));
+  }
   if (incrementalSyncStatus.paused) {
     parts.push(t("consent.syncPaused", {
       reason: incrementalSyncStatus.pausedReason ?? "unknown",
     }));
   }
   const outcome = incrementalSyncStatus.lastOutcome;
-  if (outcome !== null && outcome.status !== "succeeded") {
+  // A bounded partial pass is progress, not an error; only a failed or
+  // paused outcome earns the "Last error" clause (2026-08-08).
+  if (outcome !== null && ["failed", "paused"].includes(outcome.status)) {
     parts.push(t("consent.syncLastError", { code: outcome.code }));
   }
   // A composed multi-part sentence: raw write, like the other composed
   // status lines, so a stale registry entry cannot resurrect over it.
   setRawText(line, parts.join(" "));
   line.hidden = false;
+}
+
+// The live-progress poll behind the first pass (owner-directed 2026-08-08).
+// A chained setTimeout — never an interval — that repeats the same bounded
+// GET the page performs on load, while there is measurable movement to show:
+// a running pass, a first pass that has not settled yet, or pending days
+// between bounded passes. It stops on pause, on completion, and at a fixed
+// budget, so an idle dashboard never polls forever.
+const INCREMENTAL_SYNC_POLL_INTERVAL_MS = 4_000;
+const INCREMENTAL_SYNC_POLL_LIMIT = 450;
+
+function incrementalSyncPollWorthwhile() {
+  if (!incrementalSyncCapabilityAdvertised() || !incrementalConsentApproved) {
+    return false;
+  }
+  const status = incrementalSyncStatus;
+  if (status?.status !== "available" || status.paused) return false;
+  if (status.running) return true;
+  if (status.progress === null) return true;
+  return status.progress.daysPending > 0;
+}
+
+function scheduleIncrementalSyncStatusPoll({ reset = false } = {}) {
+  if (reset) incrementalSyncPollCount = 0;
+  if (incrementalSyncPollTimer !== null) return;
+  if (!incrementalSyncPollWorthwhile()) return;
+  if (incrementalSyncPollCount >= INCREMENTAL_SYNC_POLL_LIMIT) return;
+  incrementalSyncPollTimer = window.setTimeout(() => {
+    incrementalSyncPollTimer = null;
+    incrementalSyncPollCount += 1;
+    void loadIncrementalSyncStatus().catch(() => {});
+  }, INCREMENTAL_SYNC_POLL_INTERVAL_MS);
 }
 
 /**
@@ -7771,58 +7841,232 @@ async function loadIncrementalSyncStatus() {
       && incrementalSyncStatus.consent.current === true;
   }
   renderContributionActionState();
+  scheduleIncrementalSyncStatusPoll();
 }
 
+/**
+ * The one-step ceremony (owner-directed, 2026-08-08): a single "Review and
+ * approve" interaction does everything after sign-in. It mints the pairing
+ * WITH the v1.0 consent identifier (the server session is already held), has
+ * the companion claim it — the claim is what records the server-side
+ * consent-once grant every chunk upload is verified against — then records
+ * the local approve-once consent with the review token, and the companion
+ * starts the first sync pass immediately.
+ *
+ * The same ceremony is the transparent re-pair path: a Mac whose earlier
+ * claim carried the v0.1 consent has no grant, so its uploads pause with
+ * consent_rejected. Re-running the ceremony re-pairs with the v1.0 consent
+ * and skips the local approval it already holds — nothing is reported as a
+ * failure, because nothing the user did failed.
+ */
 async function approveIncrementalContribution() {
-  if (incrementalConsentBusy || !incrementalSyncCapabilityAdvertised()) return;
+  if (incrementalConsentBusy || communityConnectBusy
+      || !incrementalSyncCapabilityAdvertised()) {
+    return;
+  }
   const status = $("#incremental-consent-status");
-  if (contributionSyncExactReview?.state !== "ready") {
+  const needsLocalApproval = !incrementalConsentApproved;
+  if (needsLocalApproval && contributionSyncExactReview?.state !== "ready") {
     status.hidden = false;
     status.className = "participant-action-status error";
     setLocalizedText(status, "consent.reviewFirst");
     return;
   }
+  if (hostedEnrollmentIsPaused()) {
+    status.hidden = false;
+    status.className = "participant-action-status error";
+    setLocalizedText(status, "contribution.enrollmentPausedNoUpload");
+    return;
+  }
+  if (hostedSignInRequired()) {
+    status.hidden = false;
+    status.className = "participant-action-status error";
+    setLocalizedText(status, "consent.signInFirst");
+    return;
+  }
   incrementalConsentBusy = true;
-  renderIncrementalConsent();
-  status.hidden = false;
-  status.className = "participant-action-status";
-  setLocalizedText(status, "consent.approving");
+  // A hosted proof is intentionally one-use. If enrollment itself fails, the
+  // page must not claim the same proof can be retried: it is dropped and the
+  // next action is a fresh browser sign-in. Failures after a session is
+  // established can be retried without authenticating again.
+  let enrollmentAttemptedWithHostedIdentity = false;
+  let enrollmentEstablished = false;
+  renderContributionActionState();
   try {
-    const result = await localClient.approveIncrementalContribution(
-      contributionSyncExactReview.reviewToken
-    );
-    if (result?.status !== "approved") {
-      const error = new Error("The local companion did not record the approval.");
-      error.code = "incremental_consent_failed";
-      throw error;
+    // --- Upload authority, inside the same interaction. -------------------
+    // Only a v1.0-consent claim made by THIS session proves the server-side
+    // grant exists; anything less re-pairs. The claim is idempotent for a
+    // valid credential and the companion resumes its engine on pairing, so
+    // re-pairing is safe even when a grant already existed.
+    if (!communityDevicePairedV1) {
+      await contributionConnectStep("service_check", status, () => {
+        if (localCompanionHealth?.capabilities?.contributionDevicePairing !== true) {
+          const error = new Error(
+            "The local app is not connected to a configured contribution service."
+          );
+          error.code = "contribution_device_pairing_not_configured";
+          throw error;
+        }
+      });
+      let pairing;
+      if (communitySession?.csrfToken) {
+        pairing = await contributionConnectStep(
+          "hosted_enrollment",
+          status,
+          () => communityClient.createDevicePairing(false),
+        );
+      } else {
+        // This page never collects or sends an invitation code. The Worker
+        // is the authority on whether its current enrollment mode admits
+        // this hosted proof; a paused service fails before the browser
+        // OAuth start. The enrollment deliberately does NOT request the
+        // device bootstrap: the Worker's bootstrap pairing may only carry
+        // the v0.1 ongoing consent, so the pairing is minted separately
+        // with the session the enrollment just established — the one route
+        // that can carry the v1.0 consent (2026-08-08).
+        enrollmentAttemptedWithHostedIdentity = hostedIdentity !== null;
+        pairing = await contributionConnectStep("hosted_enrollment", status, async () => {
+          const enrollment = await communityClient.enroll(
+            null,
+            "telemetry-contribution-v0.1",
+            { deviceBootstrap: false, identity: hostedIdentity }
+          );
+          if (enrollment?.schemaVersion !== "participant-bootstrap-v0.1"
+              || typeof enrollment?.csrfToken !== "string") {
+            const error = new Error(
+              "The contribution service did not establish pseudonymous access."
+            );
+            error.code = "enrollment_response_invalid";
+            throw error;
+          }
+          setCommunitySession({
+            csrfToken: enrollment.csrfToken,
+            participantId: enrollment.participantId ?? null,
+            consentVersion: "privacy-safe-telemetry-v0.1"
+          });
+          enrollmentEstablished = true;
+          return communityClient.createDevicePairing(false);
+        });
+      }
+      await contributionConnectStep(
+        "device_pairing",
+        status,
+        () => finishCommunityDevicePairing(pairing, status),
+      );
+      pairing = null;
+      communityDevicePairedV1 = true;
     }
-    incrementalConsentApproved = true;
-    setLocalizedText(status, "consent.approved");
-    // The engine starts uploading on its own after approval; read its
-    // bounded status once so the days-synced line appears immediately.
+    // --- Local consent, and the first pass starts now. --------------------
+    if (needsLocalApproval) {
+      status.hidden = false;
+      status.className = "participant-action-status";
+      setLocalizedText(status, "consent.approving");
+      const result = await localClient.approveIncrementalContribution(
+        contributionSyncExactReview.reviewToken
+      );
+      if (result?.status !== "approved") {
+        const error = new Error("The local companion did not record the approval.");
+        error.code = "incremental_consent_failed";
+        throw error;
+      }
+      incrementalConsentApproved = true;
+      setLocalizedText(status, "consent.approved");
+    } else {
+      // The transparent re-pair: the local approval already stands, the
+      // fresh claim recorded the grant, and the companion's pairing route
+      // resumed and kicked the engine. Say what happened, not "failed".
+      status.hidden = false;
+      status.className = "participant-action-status";
+      setLocalizedText(status, "consent.authorityRefreshed");
+    }
+    // The companion starts the first pass immediately on approval; read the
+    // bounded status now and keep polling so the line shows live progress.
     await loadIncrementalSyncStatus().catch(() => {});
+    scheduleIncrementalSyncStatusPoll({ reset: true });
   } catch (error) {
-    await showFailure(status, {
-      surface: "automatic_contribution",
-      error,
-      fallback:
-        "The approval could not be recorded on this Mac, so nothing changed and nothing uploads automatically."
-    });
+    if (contributionConnectStepOf(error) !== null
+        || contributionDeviceRecoveryIsRequired(error)) {
+      await reportContributionConnectFailure(status, error, {
+        enrollmentAttemptedWithHostedIdentity,
+        enrollmentEstablished,
+      });
+    } else {
+      await showFailure(status, {
+        surface: "automatic_contribution",
+        error,
+        fallback:
+          "The approval could not be recorded on this Mac, so nothing changed and nothing uploads automatically."
+      });
+    }
   } finally {
     incrementalConsentBusy = false;
     renderContributionActionState();
   }
 }
 
-// The primary button routes to whichever action its current label names:
-// connect this Mac, or open the approve-once surface — the only contribution
-// flow (owner-directed, 2026-08-08).
-async function runCommunityPrimaryAction() {
-  if (communityContributionIsConnected()) {
-    openIncrementalConsent();
-    return;
+/**
+ * The silent authorization repair (owner-directed, 2026-08-08): when the
+ * engine reports consent_rejected — the first upload came back 403
+ * TELEMETRY_CONSENT_INVALID because the earlier claim carried the v0.1
+ * consent — and this page holds the session, the ceremony re-runs by itself,
+ * once per page load. The user approved this exact kind of data already; the
+ * re-pair is transport repair, not a new decision, so it must not read as a
+ * failure or ask again.
+ */
+function maybeRepairIncrementalAuthorization() {
+  if (incrementalRepairAttempted) return;
+  if (incrementalConsentBusy || communityConnectBusy) return;
+  if (!incrementalSyncCapabilityAdvertised()) return;
+  if (!incrementalConsentApproved || !incrementalGrantRejected()) return;
+  if (!hasCommunitySession()) return;
+  incrementalRepairAttempted = true;
+  void approveIncrementalContribution();
+}
+
+// Deletion honesty (owner-directed, 2026-08-08): the card no longer states a
+// deletion promise without a control behind it. This is the control — the
+// service's participant deletion (DELETE /api/v1/me), which purges accepted
+// chunks and stored uploads and tombstones the account. It needs the live
+// session, asks for explicit confirmation, and touches nothing local.
+const CONTRIBUTION_DELETION_CONFIRMATION =
+  "Delete everything you contributed?\n\nThe service deletes your contributed usage data and this account's records, and this Mac's upload authority stops working. Local reporting on this Mac is unchanged. This cannot be undone.";
+
+async function deleteCommunityContributions() {
+  if (incrementalConsentBusy || communityConnectBusy) return;
+  if (!hasCommunitySession()) return;
+  if (!window.confirm(CONTRIBUTION_DELETION_CONFIRMATION)) return;
+  const status = $("#incremental-consent-status");
+  incrementalConsentBusy = true;
+  renderContributionActionState();
+  status.hidden = false;
+  status.className = "participant-action-status";
+  setProductText(status, "Deleting your contributed data from the service…");
+  try {
+    await communityClient.deleteParticipant();
+    // The account is tombstoned server-side: the session, the sign-in proof
+    // and this Mac's pairing evidence are all dead with it.
+    hostedIdentity = null;
+    setCommunitySession(null);
+    communityDevicePairedV1 = false;
+    status.hidden = false;
+    status.className = "participant-action-status";
+    setProductText(
+      status,
+      "Deleted. The service removed your contributed data and this account's records. Local reporting on this Mac is unchanged.",
+    );
+    renderHostedIdentity();
+    await loadIncrementalSyncStatus().catch(() => {});
+  } catch (error) {
+    await showFailure(status, {
+      surface: "participant_deletion",
+      error,
+      fallback:
+        "The service did not confirm the deletion, so nothing is assumed deleted. Try again."
+    });
+  } finally {
+    incrementalConsentBusy = false;
+    renderContributionActionState();
   }
-  await connectCommunityContribution();
 }
 
 function contributionDeviceRecoveryIsRequired(error) {
@@ -7870,7 +8114,7 @@ async function renderContributionDeviceRecovery(status, { error } = {}) {
     node(
       "p",
       "annotation",
-      "Resetting clears only that unusable credential and its local record. Then connect this Mac again."
+      "Resetting clears only that unusable credential and its local record. Then choose Review and approve again."
     ),
     actions
   );
@@ -7881,11 +8125,13 @@ const DEVICE_CREDENTIAL_RESET_CONFIRMATION =
   "Clear this Mac's unusable contribution-device credential?\n\nThis clears only the leftover credential in this Mac's Keychain and its local record. Local reporting is unchanged.";
 
 async function resetContributionDeviceCredential() {
-  if (communityConnectBusy) return;
+  if (communityConnectBusy || incrementalConsentBusy) return;
   if (!window.confirm(DEVICE_CREDENTIAL_RESET_CONFIRMATION)) return;
-  const status = $("#community-connect-status");
+  // The recovery reports on the merged ceremony's own status line
+  // (owner-directed 2026-08-08: the separate connect card is gone).
+  const status = $("#incremental-consent-status");
   communityConnectBusy = true;
-  updateCommunityConnectButton();
+  renderContributionActionState();
   status.hidden = false;
   status.className = "participant-action-status";
   status.textContent = "Clearing the unusable local device credential…";
@@ -7899,8 +8145,8 @@ async function resetContributionDeviceCredential() {
       throw error;
     }
     status.textContent = result.status === "already_absent"
-      ? "No leftover device credential was present. Choose Contribute to connect this Mac."
-      : "The leftover device credential was cleared. Choose Contribute to connect this Mac again.";
+      ? "No leftover device credential was present. Choose Review and approve to continue."
+      : "The leftover device credential was cleared. Choose Review and approve again.";
   } catch (error) {
     await showFailure(status, {
       surface: "device_credential_reset",
@@ -7910,7 +8156,7 @@ async function resetContributionDeviceCredential() {
     });
   } finally {
     communityConnectBusy = false;
-    updateCommunityConnectButton();
+    renderContributionActionState();
   }
 }
 
@@ -7969,17 +8215,9 @@ const CONTRIBUTION_CONNECT_STEPS = Object.freeze({
     failure:
       "The pairing was not completed, so this Mac is not connected. Nothing was uploaded; retrying is safe.",
   }),
-  // The two local follow-up steps that used to follow — preparing and
-  // verifying a reviewable summary — moved into the approve card's own
-  // invisible bootstrap when the prepare surface was removed (owner-directed,
-  // 2026-08-08), so their failures now report on that card instead of here.
-  queue_refresh: Object.freeze({
-    connects: false,
-    progress: "Reading the local contribution queue…",
-    stopped: "This Mac is connected. Reading its local contribution queue did not finish.",
-    failure:
-      "Nothing was uploaded. The approve card below updates once the local queue can be read; retrying is safe.",
-  }),
+  // The queue_refresh follow-up step left with the separate connect flow
+  // (owner-directed, 2026-08-08): the merged ceremony's review bootstrap owns
+  // the queue and reports its own failures on the same surface.
 });
 
 /**
@@ -8011,140 +8249,10 @@ function contributionConnectStepOf(error) {
     : null;
 }
 
-// Bring the reader to the approve-once surface — the only contribution flow.
-// (openContributionReview left with the prepare disclosure it opened.)
-function openIncrementalConsent() {
-  const surface = $("#incremental-consent");
-  if (!surface || surface.hidden) return;
-  surface.scrollIntoView?.({ block: "start", behavior: "instant" });
-  const heading = surface.querySelector?.("h3");
-  if (heading) {
-    heading.setAttribute("tabindex", "-1");
-    heading.focus?.({ preventScroll: true });
-  }
-}
-
-async function connectCommunityContribution() {
-  if (communityConnectBusy) return;
-  const status = $("#community-connect-status");
-  if (hostedEnrollmentIsPaused()) {
-    status.hidden = false;
-    status.className = "participant-action-status error";
-    setLocalizedText(status, "contribution.enrollmentPausedNoUpload");
-    return;
-  }
-  if (hostedSignInRequired()) {
-    status.hidden = false;
-    status.className = "participant-action-status error";
-    status.textContent =
-      "Sign in first: hosted participation requires Google or Apple sign-in above. Local-only use needs no account, and nothing was uploaded.";
-    return;
-  }
-  let pairing = null;
-  // A hosted proof is intentionally one-use. If enrollment itself fails, do
-  // not leave the page claiming that the same proof can safely be retried:
-  // drop it from this memory-only page and make the next action a fresh
-  // browser sign-in. Failures after a session is established are different —
-  // the user can retry those local pairing steps without authenticating again.
-  let enrollmentAttemptedWithHostedIdentity = false;
-  let enrollmentEstablished = false;
-  communityConnectBusy = true;
-  setProductText($("#connect-community"), "Connecting…");
-  updateCommunityConnectButton();
-  try {
-    // --- Connection steps. Each one owns its own failure. -----------------
-    await contributionConnectStep("service_check", status, () => {
-      if (localCompanionHealth?.capabilities?.contributionDevicePairing !== true) {
-        const error = new Error(
-          "The local app is not connected to a configured contribution service."
-        );
-        error.code = "contribution_device_pairing_not_configured";
-        throw error;
-      }
-    });
-    if (communitySession?.csrfToken) {
-      pairing = await contributionConnectStep(
-        "hosted_enrollment",
-        status,
-        () => communityClient.createDevicePairing(false),
-      );
-    } else {
-      // This page never collects or sends an invitation code. The Worker is
-      // the authority on whether its current enrollment mode admits this
-      // hosted proof; a paused service fails before the browser OAuth start.
-      enrollmentAttemptedWithHostedIdentity = hostedIdentity !== null;
-      pairing = await contributionConnectStep("hosted_enrollment", status, async () => {
-        const enrollment = await communityClient.enroll(
-          null,
-          "telemetry-contribution-v0.1",
-          { deviceBootstrap: true, identity: hostedIdentity }
-        );
-        if (enrollment?.schemaVersion !== "participant-bootstrap-v0.1"
-            || enrollment?.state !== "pairing_ready"
-            || typeof enrollment?.csrfToken !== "string"
-            || typeof enrollment?.pairing?.pairingCode !== "string") {
-          // A codeless throw always fell through to the generic fallback.
-          // Name the condition so the page can explain this exact one.
-          const error = new Error(
-            "The contribution service did not establish paired pseudonymous access."
-          );
-          error.code = "enrollment_response_invalid";
-          throw error;
-        }
-        setCommunitySession({
-          csrfToken: enrollment.csrfToken,
-          participantId: enrollment.participantId ?? null,
-          consentVersion: "privacy-safe-telemetry-v0.1"
-        });
-        enrollmentEstablished = true;
-        return enrollment.pairing;
-      });
-    }
-    await contributionConnectStep(
-      "device_pairing",
-      status,
-      () => finishCommunityDevicePairing(pairing, status),
-    );
-  } catch (error) {
-    await reportContributionConnectFailure(status, error, {
-      enrollmentAttemptedWithHostedIdentity,
-      enrollmentEstablished,
-    });
-    pairing = null;
-    communityConnectBusy = false;
-    updateCommunityConnectButton();
-    return;
-  }
-  pairing = null;
-  // --- Connected. Everything below is local follow-up. --------------------
-  // A failure here is not a connection failure and must never be reported as
-  // one: the pairing stands, and the user can retry the local step alone.
-  // The queue refresh re-renders the approve-once surface, whose invisible
-  // bootstrap then prepares and verifies the reviewable instance by itself —
-  // the old explicit local_preparation/local_review steps live there now.
-  $("#community-connect-consent").checked = false;
-  communityConnectBusy = false;
-  updateCommunityConnectButton();
-  try {
-    await contributionConnectStep("queue_refresh", status, async () => {
-      await Promise.all([
-        refreshContributionSyncControls(),
-        loadCommunityResults(),
-      ]);
-    });
-    openIncrementalConsent();
-    status.hidden = false;
-    status.className = "participant-action-status";
-    status.textContent = incrementalSyncCapabilityAdvertised()
-      ? "Connected. Review the covered data on the approve card below; approval is asked once and nothing uploads without it."
-      : "Connected. This build has no automatic contribution to approve, and nothing uploads by itself.";
-  } catch (error) {
-    await reportContributionConnectFailure(status, error, {
-      enrollmentAttemptedWithHostedIdentity: false,
-      enrollmentEstablished: true,
-    });
-  }
-}
+// (connectCommunityContribution and its openIncrementalConsent routing left
+// with the two-card flow, owner-directed 2026-08-08: the merged ceremony in
+// approveIncrementalContribution owns enrollment, the v1.0-consent pairing,
+// and the local approval in one interaction.)
 
 /**
  * Report one connect failure, naming the step it came from.
@@ -8252,22 +8360,10 @@ window.addEventListener("tibotattle:hosted-sign-in-return", checkHostedSignInNow
 window.addEventListener("tibotattle:local-evidence-updated", () => {
   void reloadLocalEvidenceAfterNativeRefresh();
 });
-$("#community-connect-consent").addEventListener(
-  "change",
-  updateCommunityConnectButton
-);
-$("#connect-community").addEventListener("click", () => {
-  void runCommunityPrimaryAction();
-});
-$("#contribution-not-now").addEventListener("click", () => {
-  $("#community-connect-consent").checked = false;
-  updateCommunityConnectButton();
-  const status = $("#community-connect-status");
-  status.hidden = false;
-  status.className = "participant-action-status";
-  status.textContent =
-    "Nothing will be contributed. Your local reporting continues unchanged.";
-});
+// The connect-consent checkbox, the connect button and "Not now" left with
+// the two-card flow (owner-directed, 2026-08-08): after sign-in, the single
+// Review-and-approve button below is the one contribution action, and its
+// explicit approval is the consent.
 $("#demo-button").addEventListener("click", () => renderDashboard(demoDashboard()));
 // The prepare, lookback, and send controls left with the legacy prepare flow
 // (owner-directed, 2026-08-08). The approve card's only companion control is
@@ -8277,6 +8373,9 @@ $("#incremental-review-retry").addEventListener("click", () => {
 });
 $("#incremental-consent-approve").addEventListener("click", () => {
   void approveIncrementalContribution();
+});
+$("#delete-contributions").addEventListener("click", () => {
+  void deleteCommunityContributions();
 });
 $("#range-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-days]");
@@ -8368,11 +8467,16 @@ $("#weekly-range-controls").addEventListener("click", (event) => {
     control.setAttribute("aria-pressed", String(active));
   }
   renderWeekly(dashboard);
+  // The share card plots the same filtered history (owner-directed
+  // 2026-08-08): it re-renders with the chart, so its caption's claim — the
+  // card matches the active range and span filter — is always true.
+  renderShareCard(dashboard);
 });
 $("#weekly-span-control").addEventListener("input", (event) => {
   if (!dashboard) return;
   activeWeeklyMinimumObservedSpanPp = Math.min(99, Math.max(0, Number(event.target.value)));
   renderWeekly(dashboard);
+  renderShareCard(dashboard);
 });
 $("#accounting-period-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-period]");

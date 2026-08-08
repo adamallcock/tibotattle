@@ -447,8 +447,11 @@ test("the dashboard keeps contribution review local while the public site owns d
   ]) {
     assert.doesNotMatch(appHtml, new RegExp(retiredControl, "u"), retiredControl);
   }
-  assert.match(appHtml, /id="community-connect-consent"/u);
-  // Re-pinned 2026-08-08 (owner-directed): the legacy prepare-and-review flow
+  // Re-pinned 2026-08-08 (owner-directed, second round): the connect-consent
+  // checkbox left with the connect card — the merged surface's explicit
+  // Review-and-approve action is the consent.
+  assert.doesNotMatch(appHtml, /id="community-connect-consent"/u);
+  // Earlier same-day re-pin: the legacy prepare-and-review flow
   // is removed outright. The approve-once surface is the only contribution
   // flow, so the dashboard's local destination is now the consent card.
   assert.doesNotMatch(appHtml, /id="prepare-contribution"/u);

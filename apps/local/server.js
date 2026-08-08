@@ -171,6 +171,9 @@ const DIAGNOSTIC_SURFACES = new Set([
   "hosted_identity",
   "hosted_privacy",
   "local_refresh",
+  // 2026-08-08 (deletion honesty): the dashboard's "Delete my contributions"
+  // action files its failures like every other journey.
+  "participant_deletion",
 ]);
 // Identifier-shaped fixed codes only: SCREAMING_SNAKE from the contribution
 // service, lower_snake from this companion. Neither shape can carry a
@@ -2977,6 +2980,19 @@ function createPreparedLocalCompanionServer({
           includesIdentifiers: false,
           includesCredentials: false,
         });
+        // 2026-08-08 (owner-directed immediate first pass): approval must
+        // become a running sync pass now, not a pending timer the user cannot
+        // see — production showed "waiting for the first pass" indefinitely.
+        // The controller's approve() already schedules an immediate attempt;
+        // this explicit due-run starts it in this tick while respecting the
+        // controller's own serialization and the shared v0.1 sync lock (a
+        // concurrent pass fails that run closed and the bounded retry ladder
+        // re-runs it). Best-effort by design: the scheduled attempt survives.
+        try {
+          void incrementalContribution.runDue?.()?.catch?.(() => {});
+        } catch {
+          // deliberately ignored
+        }
         return;
       }
       if (path === "/api/local/accounting/fast-mode-preference") {
@@ -3098,6 +3114,16 @@ function createPreparedLocalCompanionServer({
           // cured by the same pairing, equally best-effort.
           try {
             await incrementalContribution?.resume();
+          } catch {
+            // deliberately ignored
+          }
+          // 2026-08-08 (owner-directed): a fresh pairing translates into a
+          // prompt sync attempt too — the re-pair path (a v0.1-consent claim
+          // being replaced by a v1.0 one) must not leave its first pass
+          // waiting on a timer the user cannot see. Same serialization
+          // guarantees as the approval kick above.
+          try {
+            void incrementalContribution?.runDue?.()?.catch?.(() => {});
           } catch {
             // deliberately ignored
           }

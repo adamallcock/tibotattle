@@ -812,7 +812,10 @@ test("the canonical SQLite accounting state never falls back to an index project
     indexSecretFile,
     codexHome,
     now: () => nowMs,
-    windowDays: 1,
+    // Re-pinned 1 -> 365 (2026-08-08): the standing owner rule forbids
+    // convenience-sized history windows, so 365 is the smallest accepted.
+    // The fixture corpus is tiny either way.
+    windowDays: 365,
     indexWorkerCount: 2,
     indexChunkBytes: 4 * 1024 * 1024,
   });
