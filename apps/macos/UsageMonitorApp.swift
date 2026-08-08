@@ -2577,18 +2577,35 @@ private struct NativeToolbarStatusColor {
 
 /// The toolbar status control's pill dressing. An `NSButton` bezel refuses
 /// `contentTintColor` for its title — measured, the textured bezel rendered
-/// the state words in plain label black — so the button rides borderless
-/// inside this view, which owns the rounded state-colored fill and hairline.
-/// The fill re-resolves its dynamic colors in `updateLayer`, which AppKit
-/// calls with this view's effective appearance current — the same appearance
-/// seam NativeSidebarBrandWash uses.
-private final class NativeToolbarStatusPill: NSView {
+/// the state words in plain label black — so the title button rides
+/// borderless inside this view, which owns the rounded state-colored fill
+/// and hairline. The fill re-resolves its dynamic colors in `updateLayer`,
+/// which AppKit calls with this view's effective appearance current — the
+/// same appearance seam NativeSidebarBrandWash uses.
+///
+/// The pill is itself an inert borderless `NSButton`, not a plain `NSView`,
+/// and that choice is load-bearing on macOS 26: the toolbar wraps a
+/// custom-view item in its own Liquid Glass capsule — measured, an
+/// `NSToolbarPlatterView` hosting an `NSGlassEffectView`, a frosted platter
+/// 11pt taller than the pill that reads as the white halo the owner
+/// reported. The item viewer only asks AppKit's own buttons whether they
+/// want glass — a plain `NSView` is misted over regardless, even when it
+/// implements the private preference selector — and a borderless button is
+/// the one shape that declines the platter through public API alone. The
+/// button is pure dressing: empty title, no action, refusing key focus,
+/// invisible to accessibility. The inner title button stays the real
+/// control.
+private final class NativeToolbarStatusPill: NSButton {
     var colorway: NativeToolbarStatusColor = .idle {
         didSet { needsDisplay = true }
     }
 
     init() {
         super.init(frame: .zero)
+        title = ""
+        isBordered = false
+        refusesFirstResponder = true
+        setAccessibilityElement(false)
         wantsLayer = true
     }
 

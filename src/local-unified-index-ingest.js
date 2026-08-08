@@ -16,6 +16,7 @@ import {
   createUnifiedIndexWriter,
   defaultLocalUnifiedIndexPath,
   defaultLocalUnifiedIndexSecretPath,
+  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
   openLocalUnifiedIndex,
   readOrCreateDeviceSalt,
   sessionLocal,
@@ -56,13 +57,21 @@ function fixedError(code) {
 
 function loadCursors(database) {
   const cursors = new Map();
+  // The cursor's ingest run names the parser version its rows were derived
+  // under. A LEFT JOIN keeps a cursor loadable even if its run row is somehow
+  // missing; a NULL parser_version then reads as "unknown", which classifies
+  // as a forced rescan — the safe direction.
   const rows = database.prepare(`
-    SELECT source_local, session_local, scanned_bytes, size_bytes, mtime_ms,
-           snapshots_persisted, turn_context_seen, carry_model, carry_effort,
-           carry_tier_raw, carry_tier_observed_at_ms, carry_total_input,
-           carry_total_cached, carry_total_cache_write, carry_total_output,
-           carry_total_reasoning, carry_total_total
-    FROM source_cursor`).all();
+    SELECT sc.source_local, sc.session_local, sc.scanned_bytes, sc.size_bytes,
+           sc.mtime_ms, sc.snapshots_persisted, sc.turn_context_seen,
+           sc.carry_model, sc.carry_effort, sc.carry_tier_raw,
+           sc.carry_tier_observed_at_ms, sc.carry_total_input,
+           sc.carry_total_cached, sc.carry_total_cache_write,
+           sc.carry_total_output, sc.carry_total_reasoning,
+           sc.carry_total_total, pv.parser_version AS parser_version
+    FROM source_cursor sc
+    LEFT JOIN ingest_run ir ON ir.id = sc.ingest_run_id
+    LEFT JOIN parser_version pv ON pv.id = ir.parser_version_id`).all();
   for (const row of rows) {
     cursors.set(Buffer.from(row.source_local).toString("hex"), row);
   }
@@ -102,14 +111,21 @@ function carriedTier(cursor) {
  * - `touch`: nothing appended but the file was touched; refresh the cursor's
  *   change-detection fields without reading a byte.
  * - `resume`: the file grew; scan from the cursor with carried state.
- * - `rescan`: no cursor, or the file shrank (rotation/truncation); scan whole.
+ * - `rescan`: no cursor, or the file shrank (rotation/truncation), or the
+ *   cursor was stamped by an older parser version (`reason:
+ *   "parser_version"`) — the stored rows may be poisoned by the old
+ *   derivation, so the whole file is re-derived and its old rows replaced.
  */
-export function classifySource(info, cursor) {
+export function classifySource(info, cursor, expectedParserVersion = null) {
   const size = Number(info.size ?? 0);
   // Cursors store whole milliseconds; filesystems report fractions. Compare
   // at the stored precision or every unchanged file reads as touched.
   const mtimeMs = Math.floor(Number(info.mtimeMs ?? 0));
   if (cursor === undefined) return { mode: "rescan" };
+  if (expectedParserVersion !== null
+      && cursor.parser_version !== expectedParserVersion) {
+    return { mode: "rescan", reason: "parser_version" };
+  }
   const cursorSize = Number(cursor.size_bytes);
   const cursorMtime = Number(cursor.mtime_ms);
   if (size === cursorSize) {
@@ -189,6 +205,8 @@ export async function ingestLocalUnifiedIndexIncrement({
       sourcesTouched: 0,
       sourcesResumed: 0,
       sourcesRescanned: 0,
+      sourcesReparsedForParserVersion: 0,
+      usageRowsDeletedForReparse: 0,
       sourcesScanned: 0,
       bytesScanned: 0,
       relevantLines: 0,
@@ -198,6 +216,7 @@ export async function ingestLocalUnifiedIndexIncrement({
       oversizedLines: 0,
       forkReplayEventsSkipped: 0,
       unattributedForkReplayEventsSkipped: 0,
+      cumulativeCounterRegressions: 0,
       lineageSnapshotLookups: 0,
       peakRetainedSnapshotKeys: 0,
     };
@@ -222,6 +241,40 @@ export async function ingestLocalUnifiedIndexIncrement({
     // Final carried state for sources scanned in THIS pass, keyed by session
     // id, so a child scanned after its parent seeds from the freshest values.
     const finalBySessionId = new Map();
+
+    // Parser-version healing. A cursor stamped by an older parser version
+    // names a source whose stored rows were derived by the old (possibly
+    // poisoned) logic. Re-derived rows share their event keys with the old
+    // ones — the key is (session, byte offset, observed-at), not the token
+    // values — so `ON CONFLICT DO NOTHING` would silently keep the poison.
+    // Delete those sessions' rows up front, before anything is scanned, so
+    // the forced whole-file rescans below re-insert clean values. Rows whose
+    // rollout files have rotated away have no discovered source here and are
+    // untouched, exactly as the parser-version design records.
+    {
+      const deleteSessionUsage = database.prepare(
+        "DELETE FROM usage_event WHERE session_local = ?",
+      );
+      const healedSessions = new Set();
+      for (const info of infos) {
+        const cursor = cursors.get(
+          sourceLocal(deviceSalt, info.rolloutKey).toString("hex"),
+        );
+        if (cursor === undefined) continue;
+        if (cursor.parser_version === LOCAL_UNIFIED_INDEX_PARSER_VERSION) {
+          continue;
+        }
+        diagnostics.sourcesReparsedForParserVersion += 1;
+        const sessionKey = cursor.session_local === null
+          ? localForSession(info.lineage?.sessionId ?? info.rolloutKey)
+          : Buffer.from(cursor.session_local);
+        const sessionHex = sessionKey.toString("hex");
+        if (healedSessions.has(sessionHex)) continue;
+        healedSessions.add(sessionHex);
+        diagnostics.usageRowsDeletedForReparse +=
+          Number(deleteSessionUsage.run(sessionKey).changes ?? 0);
+      }
+    }
 
     function seedForNew(info) {
       const parentId = info.lineage?.parentId;
@@ -262,7 +315,14 @@ export async function ingestLocalUnifiedIndexIncrement({
         cursor: cursors.get(
           sourceLocal(deviceSalt, info.rolloutKey).toString("hex"),
         ),
-      })).map((plan) => ({ ...plan, ...classifySource(plan.info, plan.cursor) }));
+      })).map((plan) => ({
+        ...plan,
+        ...classifySource(
+          plan.info,
+          plan.cursor,
+          LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+        ),
+      }));
       const planBySessionId = new Map();
       for (const plan of plans) {
         if (plan.info.lineage?.sessionId) {
@@ -408,6 +468,8 @@ export async function ingestLocalUnifiedIndexIncrement({
             += outcome.diagnostics.forkReplayEventsSkipped;
           diagnostics.unattributedForkReplayEventsSkipped
             += outcome.diagnostics.unattributedForkReplayEventsSkipped;
+          diagnostics.cumulativeCounterRegressions
+            += outcome.diagnostics.cumulativeCounterRegressions;
           diagnostics.peakRetainedSnapshotKeys = Math.max(
             diagnostics.peakRetainedSnapshotKeys,
             snapshots.retainedKeys,

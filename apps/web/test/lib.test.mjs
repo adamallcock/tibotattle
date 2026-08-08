@@ -80,6 +80,7 @@ import {
 import {
   adaptiveChartTickCount,
   classifyTimelineEvidence,
+  finite,
   formatChartTimestamp,
   formatLocal,
   formatReportingTime,
@@ -341,6 +342,9 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
     "setRawText", "setLocalizedText", "setLocalizedPluralText", "t", "tPlural",
     "shareCardDateLabel", "ALL_HISTORY_RANGE_DAYS",
     "$", "clear", "node", "formatLocal", "renderWeeklyPaceForecast",
+    // renderWeekly owns the share-card re-render (owner-verified regression,
+    // 2026-08-08), so the hero harness stubs it like the other renderers.
+    "renderShareCard",
     "activeWeeklyRangeDays", "activeWeeklyMinimumObservedSpanPp",
     `${section}\nreturn renderWeekly;`,
   )(
@@ -369,6 +373,7 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
     () => {},
     () => ({ append() {}, textContent: "" }),
     (value) => new Date(value).toISOString().slice(0, 10),
+    () => {},
     () => {},
     rangeDays,
     span,
@@ -5651,7 +5656,14 @@ test("the community journey states its stages and gates effort behind sign-in an
   assert.match(appSource, /function communityUploadAuthorityEvidence\(\)/u);
   assert.match(appSource, /communityDevicePaired\s*\|\| finite\(contributionSyncStatus\?\.counts\?\.accepted, 0\) > 0/u);
   assert.match(appSource, /\|\| hostedSignInRequired\(\);/u);
-  assert.match(appSource, /\? "consent\.signInFirst"/u);
+  // Re-pinned 2026-08-08 (repair fallback): a signed-out Mac that needs the
+  // transparent re-pair names the repair's own next step on the gate line —
+  // sign in again, and connecting resumes by itself — while a Mac that never
+  // approved keeps the plain sign-in-first sentence.
+  assert.match(
+    appSource,
+    /\? repairNeeded\s*\n\s*\? "consent\.signInAgainToFinish"\s*\n\s*: "consent\.signInFirst"/u,
+  );
   assert.doesNotMatch(appSource, /consent\.connectFirst/u);
   assert.match(html, /id="incremental-consent-gate"/u);
   assert.match(styles, /\.journey-stage \{/u);
@@ -7087,15 +7099,16 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   // The page makes the same promise beside the card.
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   assert.match(html, /id="share-panel"/u);
+  // Re-pinned 2026-08-08 (third round): tolerate the caption's own wrapping —
+  // the promise itself is what is pinned, not the line break positions.
   assert.match(
     html,
-    /It contains no\s*\n?\s*prompts, responses, paths, account details, or raw activity/u,
+    /It contains no\s+prompts, responses, paths, account details, or raw\s+activity/u,
   );
-  // Re-pinned 2026-08-08 (owner-directed, second round): the share panel sits
-  // ABOVE the "See individual usage changes" disclosure, and its caption
-  // states the card's population — the chart's active range and span filter.
-  // The claim is kept true in code: the range and span controls re-render the
-  // card along with the chart.
+  // Re-pinned 2026-08-08 (owner-directed, third round): the share panel sits
+  // ABOVE the "See individual usage changes" disclosure, and its header is
+  // the title plus ONE caption sentence — the filter promise and the privacy
+  // promise together, with the earlier multi-paragraph explainer gone.
   const sharePosition = html.indexOf('id="share-panel"');
   const disclosurePosition = html.indexOf(
     "<summary>See individual usage changes</summary>",
@@ -7104,12 +7117,30 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   assert.ok(sharePosition < disclosurePosition);
   assert.match(
     html,
-    /The card matches the chart above: its plotted history follows the\s*\n?\s*active date range and minimum observed-span filter\./u,
+    /The card follows the chart’s active date range and span filter\.\s*\n?\s*It contains no\s*\n?\s*prompts, responses, paths, account details, or raw\s*\n?\s*activity\./u,
   );
+  const sharePanelHtml = html.slice(
+    sharePosition,
+    html.indexOf('class="share-preview"', sharePosition),
+  );
+  assert.equal(
+    (sharePanelHtml.match(/class="annotation"/gu) ?? []).length,
+    1,
+    "the share panel header carries exactly one caption paragraph",
+  );
+  assert.doesNotMatch(
+    html,
+    /A ready-to-post image of the three headline figures\./u,
+  );
+  // The chart renderer owns the card re-render (owner-verified regression,
+  // 2026-08-08): renderWeekly ends by redrawing the card from the SAME
+  // history model it drew, and the range/span handlers rely on that instead
+  // of each carrying its own card call that a new path could forget.
   assert.match(
     appSource,
-    /renderWeekly\(dashboard\);\s*\n[\s\S]{0,240}?renderShareCard\(dashboard\);/u,
+    /renderWeeklyTable\(values\);\s*\n[\s\S]{0,640}?renderShareCard\(data, \{ history \}\);\s*\n\}/u,
   );
+  assert.doesNotMatch(appSource, /renderShareCard\(dashboard\);/u);
 });
 
 test("the posted allowance graph uses the exact history model from the dashboard", async () => {
@@ -7130,7 +7161,10 @@ test("the posted allowance graph uses the exact history model from the dashboard
   assert.match(appSource, /shell\.replaceChildren\(renderAllowanceHistoryChart\(history\)\);/u);
   assert.match(
     section,
-    /const isWeeklyWindow = shareCardWindowKind\(allowanceWindow\) === "seven_day";\s*\n\s*const history = isWeeklyWindow \? allowanceHistoryChartModel\(data\) : null;\s*\n\s*const trend = isWeeklyWindow \? shareCardTrend\(history\) : null;/u,
+    // Re-pinned 2026-08-08 (owner-verified regression): the chart renderer
+    // hands its own model in; the card derives one only when rendered
+    // standalone, and both reads share the active-filter state.
+    /const isWeeklyWindow = shareCardWindowKind\(allowanceWindow\) === "seven_day";\s*\n\s*const history = isWeeklyWindow\s*\n\s*\? sharedHistory \?\? allowanceHistoryChartModel\(data\)\s*\n\s*: null;\s*\n\s*const trend = isWeeklyWindow \? shareCardTrend\(history\) : null;/u,
   );
   assert.match(
     section,
@@ -7185,7 +7219,10 @@ test("a posted results card always carries a diagnostic-format reference", async
   }
   assert.match(
     section,
-    /const isWeeklyWindow = shareCardWindowKind\(allowanceWindow\) === "seven_day";\s*\n\s*const history = isWeeklyWindow \? allowanceHistoryChartModel\(data\) : null;\s*\n\s*const trend = isWeeklyWindow \? shareCardTrend\(history\) : null;/u,
+    // Re-pinned 2026-08-08 (owner-verified regression): the chart renderer
+    // hands its own model in; the card derives one only when rendered
+    // standalone, and both reads share the active-filter state.
+    /const isWeeklyWindow = shareCardWindowKind\(allowanceWindow\) === "seven_day";\s*\n\s*const history = isWeeklyWindow\s*\n\s*\? sharedHistory \?\? allowanceHistoryChartModel\(data\)\s*\n\s*: null;\s*\n\s*const trend = isWeeklyWindow \? shareCardTrend\(history\) : null;/u,
   );
   assert.match(
     section,
@@ -7401,4 +7438,379 @@ test("a chart says so when its series does not reach back as far as its label", 
     appSource,
     /data\?\.pricing\?\.accountingCacheStatus === "unavailable"\s*\n\s*\? "dashboard\.series\.shortOfRangeWithheldCache"\s*\n\s*: "dashboard\.series\.shortOfRange"/u,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Session-rejected repair fallback (owner-reported repair loop, 2026-08-08).
+// A stored session the service no longer recognizes must produce ONE sign-in
+// gate, never a repeated step-2 failure paragraph, and the ceremony must
+// resume by itself after the next sign-in.
+// ---------------------------------------------------------------------------
+
+test("a session-rejected repair clears the dead session and renders one sign-in gate", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+
+  // The exact session-rejection vocabulary: the service's three codes for a
+  // session or CSRF confirmation it does not recognize, and nothing else —
+  // a paused service or a refused pairing must keep its own step sentence.
+  const codes = appSource.match(
+    /const CONTRIBUTION_SESSION_REJECTION_CODES = new Set\(\[([\s\S]*?)\]\);/u,
+  )?.[1];
+  assert.ok(codes, "the session-rejection vocabulary is available");
+  assert.deepEqual(
+    [...codes.matchAll(/"([A-Z_]+)"/gu)].map((match) => match[1]).sort(),
+    ["AUTH_INVALID", "AUTH_REQUIRED", "CSRF_INVALID"],
+  );
+
+  // The ceremony's catch routes a session rejection to the gate BEFORE the
+  // step reporter, so the step-2 failure paragraph cannot render for it.
+  assert.match(
+    appSource,
+    /if \(contributionConnectStepOf\(error\) !== null\s*\n\s*&& contributionSessionWasRejected\(error\)\) \{[\s\S]{0,420}?renderContributionSessionSignInGate\(status\);\s*\n\s*\} else if \(contributionConnectStepOf\(error\) !== null\s*\n\s*\|\| contributionDeviceRecoveryIsRequired\(error\)\) \{/u,
+  );
+
+  // The gate clears every piece of the dead authority — the identity proof,
+  // the session, and this session's pairing claim — and speaks in the calm
+  // register, never the error class.
+  const gate = appSource.match(
+    /function renderContributionSessionSignInGate\(status\) \{([\s\S]*?)\n\}/u,
+  )?.[1];
+  assert.ok(gate, "the sign-in gate renderer is available");
+  assert.match(gate, /hostedIdentity = null;/u);
+  assert.match(gate, /communityDevicePairedV1 = false;/u);
+  assert.match(gate, /setCommunitySession\(null\);/u);
+  assert.match(gate, /status\.className = "participant-action-status";/u);
+  assert.doesNotMatch(gate, /participant-action-status error/u);
+  assert.match(gate, /setLocalizedText\(status, "consent\.signInAgainToFinish"\);/u);
+  assert.match(gate, /renderHostedIdentity\(\);/u);
+
+  // One repair per load stays guarded, and the automatic repair cannot re-run
+  // against the cleared session, so the loop is structurally impossible.
+  assert.match(
+    appSource,
+    /if \(incrementalRepairAttempted\) return;[\s\S]{0,320}?incrementalRepairAttempted = true;/u,
+  );
+
+  // After the promised sign-in, the ceremony resumes without another click —
+  // and ONLY for the repair: a Mac that never approved keeps its explicit
+  // Review-and-approve action.
+  assert.match(
+    appSource,
+    /foregroundNativeDashboardAfterSignIn\(\);\s*\n\s*resumeContributionCeremonyAfterSignIn\(\);/u,
+  );
+  const resume = appSource.match(
+    /function resumeContributionCeremonyAfterSignIn\(\) \{([\s\S]*?)\n\}/u,
+  )?.[1];
+  assert.ok(resume, "the post-sign-in resume hook is available");
+  assert.match(resume, /if \(!incrementalConsentApproved \|\| !incrementalGrantRejected\(\)\) return;/u);
+  assert.match(resume, /void approveIncrementalContribution\(\);/u);
+
+  // The gate copy exists in every supported locale and names the one action.
+  for (const locale of SUPPORTED_LOCALES) {
+    const copy = translate("consent.signInAgainToFinish", {}, locale);
+    assert.ok(copy.trim().length > 0, `${locale} carries the sign-in gate copy`);
+  }
+  assert.match(
+    translate("consent.signInAgainToFinish", {}, "en-US"),
+    /^Sign in again to finish connecting this Mac\./u,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Exact-windows pagination (owner-directed, 2026-08-08): ten rows per page
+// over the FULL merged inspection list, with the shown range stated as
+// "N–M of T" and the page index clamped inside the renderer.
+// ---------------------------------------------------------------------------
+
+async function loadResidualInspectionTable({ rows, page = 0 }) {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("function renderResidualInspectionTable()");
+  const end = appSource.indexOf("\n// A tick label's resolution", start);
+  assert.ok(start >= 0 && end > start, "the inspection-table renderer is available");
+  const section = appSource.slice(start, end);
+
+  const elements = new Map();
+  const element = (id) => {
+    if (!elements.has(id)) {
+      elements.set(id, {
+        id,
+        textContent: "",
+        hidden: false,
+        disabled: false,
+        children: [],
+        append(...appended) { this.children.push(...appended); },
+      });
+    }
+    return elements.get(id);
+  };
+  const state = { page };
+  Function(
+    "$", "clear", "node", "t", "setLocalizedText",
+    "formatNumber", "formatChartTimestamp", "formatPp", "timelineStatusLabel",
+    "residualInspectionRows", "state",
+    `const RESIDUAL_TABLE_PAGE_SIZE = 10;
+let residualTablePage = state.page;
+${section}
+renderResidualInspectionTable();
+state.page = residualTablePage;`,
+  )(
+    (selector) => element(selector),
+    (target) => { target.children = []; },
+    (tag, className = "", text = "") => ({
+      tag,
+      className,
+      textContent: text,
+      children: [],
+      append(...appended) { this.children.push(...appended); },
+    }),
+    (key) => `[${key}]`,
+    (target, key, values = {}) => {
+      target.textContent = `[${key}] ${JSON.stringify(values)}`;
+    },
+    (value) => String(value),
+    (value) => String(value),
+    (value) => value === null ? "—" : `${value} pp`,
+    (status) => `status:${status}`,
+    rows,
+    state,
+  );
+  return {
+    page: state.page,
+    table: element("#residual-table"),
+    pagination: element("#residual-pagination"),
+    status: element("#residual-page-status"),
+    previous: element("#residual-page-prev"),
+    next: element("#residual-page-next"),
+  };
+}
+
+test("the exact-windows table pages ten rows at a time and states the shown range", async () => {
+  const rows = Array.from({ length: 25 }, (_, index) => ({
+    timestamp: new Date(Date.UTC(2026, 7, 1, index)).toISOString(),
+    observed: index,
+    expected: 1,
+    residual: index - 1,
+    status: "matched",
+  }));
+
+  const first = await loadResidualInspectionTable({ rows, page: 0 });
+  assert.equal(first.table.children.length, 10);
+  assert.equal(first.pagination.hidden, false);
+  assert.equal(
+    first.status.textContent,
+    '[residual.table.page] {"start":"1","end":"10","total":"25"}',
+  );
+  assert.equal(first.previous.disabled, true);
+  assert.equal(first.next.disabled, false);
+
+  const last = await loadResidualInspectionTable({ rows, page: 2 });
+  assert.equal(last.table.children.length, 5);
+  assert.equal(
+    last.status.textContent,
+    '[residual.table.page] {"start":"21","end":"25","total":"25"}',
+  );
+  assert.equal(last.previous.disabled, false);
+  assert.equal(last.next.disabled, true);
+
+  // A page index that outlived its row set clamps instead of rendering blank.
+  const clamped = await loadResidualInspectionTable({ rows, page: 99 });
+  assert.equal(clamped.page, 2);
+  assert.equal(clamped.table.children.length, 5);
+
+  // No rows: the empty sentence renders and the pager leaves the page.
+  const empty = await loadResidualInspectionTable({ rows: [], page: 0 });
+  assert.equal(empty.pagination.hidden, true);
+  assert.equal(empty.table.children.length, 1);
+  assert.equal(empty.table.children[0].children[0].textContent, "[residual.table.empty]");
+});
+
+test("the inspection list keeps every row and restarts paging when the selection changes", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+
+  // Pagination replaced the eight-row cap: the merge takes both halves whole.
+  assert.match(
+    appSource,
+    /const inspection = balancedInspectionRows\(\s*unmatched,\s*largest,\s*unmatched\.length \+ largest\.length,\s*\);/u,
+  );
+  assert.doesNotMatch(appSource, /balancedInspectionRows\(unmatched, largest, 8\)/u);
+  // A changed selection restarts at the first page.
+  assert.match(
+    appSource,
+    /if \(signature !== residualInspectionSignature\) \{\s*\n\s*residualInspectionSignature = signature;\s*\n\s*residualTablePage = 0;\s*\n\s*\}/u,
+  );
+  // The pager's controls exist on the page, and the Prev/Next labels carry
+  // legacy translations for the static inventory.
+  assert.match(html, /id="residual-pagination"/u);
+  assert.match(html, /id="residual-page-prev"/u);
+  assert.match(html, /id="residual-page-next"/u);
+  assert.match(html, /id="residual-page-status"[^>]*role="status"/u);
+  for (const locale of SUPPORTED_LOCALES) {
+    const range = translate(
+      "residual.table.page",
+      { start: "11", end: "20", total: "40" },
+      locale,
+    );
+    assert.ok(range.includes("11") && range.includes("20") && range.includes("40"), `${locale} pager range names all three figures`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Cumulative residual view (owner-directed, 2026-08-08): a per-bucket
+// non-overlapping running sum, re-anchored at each reset boundary or track
+// change, plus the signed-AUC "Cumulative drift" stat beside MAE and peak.
+// ---------------------------------------------------------------------------
+
+async function loadLiveTimelinePoints() {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("function mainWeeklyQuotaTrack(rows) {");
+  const end = appSource.indexOf("\nfunction groupedUsageTimeline(");
+  assert.ok(start >= 0 && end > start, "liveTimelinePoints is available");
+  const section = appSource.slice(start, end);
+  return Function(
+    "finite",
+    "timelineCutoffMs",
+    "createQuotaTimelineLookup",
+    "classifyTimelineEvidence",
+    "isPrimaryCodexWeeklyQuotaWindow",
+    "CALIBRATION_WINDOW_HOURS",
+    "activeCalibrationRangeDays",
+    `${section}\nreturn liveTimelinePoints;`,
+  )(
+    finite,
+    () => Number.NEGATIVE_INFINITY,
+    createQuotaTimelineLookup,
+    classifyTimelineEvidence,
+    isPrimaryCodexWeeklyQuotaWindow,
+    3,
+    36_500,
+  );
+}
+
+test("cumulative drift sums non-overlapping buckets and re-anchors at each reset boundary", async () => {
+  const liveTimelinePoints = await loadLiveTimelinePoints();
+  const hour = (index) => new Date(Date.UTC(2026, 7, 5, index)).toISOString();
+  const quotaRow = (index, usedPercent, resetAt) => ({
+    observedAt: hour(index),
+    limitId: "codex",
+    durationMinutes: 10_080,
+    slot: "primary",
+    usedPercent,
+    remainingPercent: 100 - usedPercent,
+    resetAt,
+  });
+  const firstReset = "2026-08-10T00:00:00.000Z";
+  const secondReset = "2026-08-17T00:00:00.000Z";
+  const data = {
+    weekly: { summary: { median_weekly_value_usd: 1_000 } },
+    gradient: { summary: {} },
+    timeline: {
+      usage: Array.from({ length: 9 }, (_, index) => ({
+        startAt: hour(index),
+        endAt: hour(index + 1),
+        apiPriceEquivalentUsd: 50,
+        usageEvents: 5,
+      })),
+      quota: [
+        quotaRow(1, 10, firstReset),
+        quotaRow(2, 22, firstReset),
+        quotaRow(3, 24, firstReset),
+        // The provider moved to the next reset window: the accumulation must
+        // restart at zero rather than bridging the discontinuity.
+        quotaRow(4, 1, secondReset),
+        quotaRow(5, 2, secondReset),
+      ],
+    },
+  };
+  const points = liveTimelinePoints(data);
+  assert.equal(points.length, 9);
+  // $50 of each hourly bucket against a $1,000 capacity implies 5 pp; the
+  // observed quota rows move 12 pp then 2 pp, so the drift runs +7 then
+  // decays; the boundary at hour 4 re-anchors to exactly zero; a quota
+  // bracket older than the 3-hour freshness bound suspends the line (null)
+  // instead of letting the static observation read as ever-growing drift.
+  assert.deepEqual(
+    points.map((point) => point.cumulativeResidual),
+    [0, 7, 4, 0, -4, -9, -14, -19, null],
+  );
+});
+
+test("the residual panel draws the cumulative line and states the signed-AUC drift", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+
+  // The second series reads the model's cumulative key with its own honest
+  // label; the residual series keeps its own.
+  assert.match(
+    appSource,
+    /key: "cumulativeResidual",\s*\n\s*className: "chart-line-expected",\s*\n\s*label: \{ key: "chart\.residual\.cumulativeSeries" \},/u,
+  );
+  // The stat sits beside MAE and peak, live view integrating the visible
+  // residuals and the historical view reporting the artifact's own figure.
+  assert.match(
+    appSource,
+    /t\("dashboard\.summary\.cumulativeDrift"\),\s*\n\s*t\("dashboard\.summary\.cumulativeDriftExplanation"\),\s*\n\s*formatSignedPpHours\(\s*\n?\s*live \? liveSignedAuc : summary\.rolling_signed_auc_pp_hours,?\s*\n?\s*\),/u,
+  );
+  // The panel names the semantics beside the chart, and the annotation is in
+  // the legacy inventory (checked by the static-copy test).
+  assert.match(
+    html,
+    /The second line is cumulative drift: the running sum of each\s*\n?\s*bucket’s observed-minus-expected movement, restarted at every\s*\n?\s*window boundary or track change\./u,
+  );
+  for (const locale of SUPPORTED_LOCALES) {
+    for (const key of [
+      "chart.residual.cumulativeSeries",
+      "dashboard.summary.cumulativeDrift",
+      "dashboard.summary.cumulativeDriftExplanation",
+    ]) {
+      assert.ok(
+        translate(key, {}, locale).trim().length > 0,
+        `${locale} carries ${key}`,
+      );
+    }
+    assert.ok(
+      translate("format.ppHours", { value: "+4.0" }, locale).includes("+4.0"),
+      `${locale} pp·h figure keeps its signed value`,
+    );
+  }
+});
+
+test("the signed AUC stat integrates observed-minus-expected trapezoids over hours", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("function signedResidualAucPpHours(matched) {");
+  const end = appSource.indexOf("\nfunction renderTimelineSummary", start);
+  assert.ok(start >= 0 && end > start, "the signed AUC helper is available");
+  const scope = Function(
+    "finite",
+    "pointTimestampMs",
+    "t",
+    "formatDecimal",
+    `${appSource.slice(start, end)}\nreturn { signedResidualAucPpHours, formatSignedPpHours };`,
+  )(
+    finite,
+    (point) => point.timestampMs,
+    (key, values) => `[${key}] ${values.value}`,
+    (value, digits = 0) => Number(value).toFixed(digits),
+  );
+  const base = Date.UTC(2026, 7, 5, 0);
+  const point = (hours, observed, expected) => ({
+    timestampMs: base + hours * 3_600_000,
+    observed,
+    expected,
+  });
+  // Two hours between residuals of +1 and +3 pp integrates to +4 pp·h — the
+  // exact trapezoid buildRollingResidual uses for the artifact summary.
+  assert.equal(
+    scope.signedResidualAucPpHours([point(0, 2, 1), point(2, 4, 1)]),
+    4,
+  );
+  // A backwards or zero-length gap contributes nothing rather than NaN.
+  assert.equal(
+    scope.signedResidualAucPpHours([point(0, 2, 1), point(0, 4, 1)]),
+    0,
+  );
+  assert.equal(scope.signedResidualAucPpHours([point(0, 2, 1)]), null);
+  assert.equal(scope.formatSignedPpHours(null), "—");
+  assert.equal(scope.formatSignedPpHours(4), "[format.ppHours] +4.0");
+  assert.equal(scope.formatSignedPpHours(-2.5), "[format.ppHours] -2.5");
 });

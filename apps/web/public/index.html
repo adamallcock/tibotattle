@@ -410,13 +410,12 @@
         </article>
 
         <!--
-          Owner-directed 2026-08-08 (second round): the shareable results card
-          sits directly under the history chart it summarizes, ABOVE the
-          "See individual usage changes" disclosure. The reference chip is
-          gone from the header — the reference travels in the saved file name
-          only — and the caption states the card's population honestly: it is
-          re-rendered with the chart, so it always matches the active date
-          range and minimum observed-span filter.
+          Owner-directed 2026-08-08 (third round): the header above the card
+          is title plus ONE short caption. The earlier two-paragraph explainer
+          is gone; the surviving sentence keeps the two promises a reader must
+          have before posting — the card follows the chart's active filters,
+          and nothing private is on it. The reference still travels in the
+          saved file name only.
         -->
         <article class="panel share-panel" id="share-panel">
           <div class="panel-heading">
@@ -426,12 +425,9 @@
             </div>
           </div>
           <p class="annotation">
-            The card matches the chart above: its plotted history follows the
-            active date range and minimum observed-span filter.
-          </p>
-          <p class="annotation">
-            A ready-to-post image of the three headline figures. It contains no
-            prompts, responses, paths, account details, or raw activity.
+            The card follows the chart’s active date range and span filter.
+            It contains no prompts, responses, paths, account details, or raw
+            activity.
           </p>
           <div class="share-preview">
             <canvas
@@ -554,6 +550,17 @@
               movement implied by local usage changes. Quiet periods with no
               activity and no quota change are neutral, not errors.
             </p>
+            <!--
+              The designed cumulative view (owner-directed, 2026-08-08). The
+              sentence names the semantics honestly: a per-bucket
+              non-overlapping running sum, restarted at every reset boundary
+              or track change, drawn only where live reset annotations exist.
+            -->
+            <p class="annotation">
+              The second line is cumulative drift: the running sum of each
+              bucket’s observed-minus-expected movement, restarted at every
+              window boundary or track change.
+            </p>
             <div class="chart-empty small" id="residual-empty">No residual evidence loaded.</div>
             <div class="chart-shell compact-chart" id="residual-chart" hidden></div>
             <p class="timeline-confidence" id="residual-coverage" role="status"></p>
@@ -581,6 +588,18 @@
                   <tr><td colspan="5" class="empty-cell">No periods loaded.</td></tr>
                 </tbody>
               </table>
+            </div>
+            <!--
+              Simple pagination (owner-directed, 2026-08-08): ten rows per
+              page over the full merged inspection list, with the shown range
+              stated as "N–M of T". The status span is written by the
+              renderer, so it starts empty rather than carrying placeholder
+              copy.
+            -->
+            <div class="table-pagination" id="residual-pagination" hidden>
+              <button class="button button-quiet compact" id="residual-page-prev" type="button" disabled>Previous</button>
+              <span class="table-pagination-status" id="residual-page-status" role="status"></span>
+              <button class="button button-quiet compact" id="residual-page-next" type="button" disabled>Next</button>
             </div>
           </article>
         </div>

@@ -71,6 +71,18 @@ function subtract(current, previous) {
   return result;
 }
 
+// Tolerance when deciding that a cumulative delta "materially exceeds" the
+// co-reported per-turn `last_token_usage`. Counters are exact integers written
+// by one process, so this absorbs only rounding/reporting noise — it is not a
+// plausibility band. Mirrors the reviewed provider parser exactly
+// (src/providers/codex/log-parser.js); keep the two identical. The defect the
+// pair guards against was measured on the live corpus: two cumulative streams
+// interleaving line-by-line within one rollout (~5.5236B vs ~5.5224B, both
+// climbing) plus mid-file counter resets, which the old delta derivation
+// charged as ~378 phantom events totaling 13.02B tokens in one session while
+// `last_token_usage` stayed honest throughout.
+const CUMULATIVE_DELTA_VS_LAST_TOLERANCE_TOKENS = 16;
+
 function sameUsage(left, right) {
   return TOKEN_KEYS.every((key) => left[key] === right[key]);
 }
@@ -214,6 +226,24 @@ export async function extractRolloutUsage(path, {
   let turnContextSeenHere = seedTurnContextSeen === true;
   let tierState = seedTier;
   let previousTotals = seedTotals;
+  // Set when the cumulative baseline was re-anchored on a counter regression.
+  // Until the next positive swing is derived, the delta from the new anchor
+  // may span two interleaved streams, so that swing charges only its own
+  // per-turn value when one is present. Transient within one scan: a cursor
+  // resume that split exactly at a regression falls back to rule 1 (material
+  // excess over `last`), which covers every measured gap.
+  let reAnchored = false;
+
+  // Every movement of the cumulative baseline goes through here, including
+  // the fork-replay skip paths, so a regression under a replayed prefix still
+  // counts as stream-switch evidence.
+  function rebaseTotals(total) {
+    if (previousTotals !== null
+        && total.total_tokens < previousTotals.total_tokens) {
+      reAnchored = true;
+    }
+    previousTotals = total;
+  }
   const diagnostics = {
     relevantLines: 0,
     malformedLines: 0,
@@ -224,6 +254,7 @@ export async function extractRolloutUsage(path, {
     tokenCounts: 0,
     forkReplayEventsSkipped: 0,
     unattributedForkReplayEventsSkipped: 0,
+    cumulativeCounterRegressions: 0,
     tierEvents: 0,
     modelSeededFromLineage: 0,
     modelMissing: 0,
@@ -272,7 +303,7 @@ export async function extractRolloutUsage(path, {
         if (salvaged === null) return;
         diagnostics.salvagedRecords += 1;
         const delta = subtract(salvaged, previousTotals);
-        previousTotals = salvaged;
+        rebaseTotals(salvaged);
         // A degraded record still obeys the fork boundary. Only rule 2 is
         // available here: rule 1 needs the `last_token_usage` half of the
         // snapshot key, which a truncated record may not carry, and guessing
@@ -282,6 +313,10 @@ export async function extractRolloutUsage(path, {
           return;
         }
         if (delta.total_tokens <= 0) return;
+        // A truncated record carries no per-turn value, so after a counter
+        // regression the best available charge is the delta from the new
+        // anchor — which this already is.
+        reAnchored = false;
         await onEvent({
           observedAtMs,
           sourceOffset: lineEndOffset,
@@ -367,7 +402,7 @@ export async function extractRolloutUsage(path, {
       // total as if it were one enormous turn.
       const snapshotKey = cumulativeSnapshotKey(total, last);
       if (isFork && snapshotKey !== null && inheritedSnapshots?.has(snapshotKey)) {
-        if (total) previousTotals = total;
+        if (total) rebaseTotals(total);
         diagnostics.forkReplayEventsSkipped += 1;
         return;
       }
@@ -376,19 +411,47 @@ export async function extractRolloutUsage(path, {
       // by rule 2 is.
       if (snapshotKey !== null) collectSnapshots?.add(snapshotKey);
       if (isFork && !turnContextSeenHere) {
-        if (total) previousTotals = total;
+        if (total) rebaseTotals(total);
         diagnostics.unattributedForkReplayEventsSkipped += 1;
         return;
       }
 
       let usage = null;
       if (total) {
+        const first = previousTotals === null;
+        const regressed = !first
+          && total.total_tokens < previousTotals.total_tokens;
         const delta = subtract(total, previousTotals);
-        if (previousTotals === null) usage = last;
-        else if (delta.total_tokens > 0) {
-          usage = last && sameUsage(last, delta) ? last : delta;
-        }
+        const chargePerTurnOnly = reAnchored;
         previousTotals = total;
+        if (regressed) {
+          // A cumulative counter never legitimately goes down: this is a
+          // stream switch or a mid-file reset. Re-anchor without charging any
+          // swing. The row itself is still a real turn when it co-reports a
+          // per-turn value — measured on the live corpus, every regressed
+          // row's total equals its own stream's prior total plus its own
+          // `last_token_usage` — so that per-turn value, and only it, is
+          // charged.
+          reAnchored = true;
+          diagnostics.cumulativeCounterRegressions += 1;
+          if (last && last.total_tokens > 0) usage = last;
+        } else if (first) {
+          usage = last;
+        } else if (delta.total_tokens > 0) {
+          if (last && (sameUsage(last, delta)
+              || chargePerTurnOnly
+              || delta.total_tokens
+                > last.total_tokens + CUMULATIVE_DELTA_VS_LAST_TOLERANCE_TOKENS)) {
+            // Either the per-turn value confirms the delta, or the delta
+            // materially exceeds it (an inter-stream gap, not spend), or the
+            // baseline was just re-anchored after a regression. In every
+            // case the honest charge is the per-turn value.
+            usage = last;
+          } else {
+            usage = delta;
+          }
+          reAnchored = false;
+        }
       } else {
         usage = last;
       }

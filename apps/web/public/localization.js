@@ -371,8 +371,12 @@ export const WEB_MESSAGES = Object.freeze({
   "chart.unit.week": ["week", "周", "semana"],
   "chart.unit.interval": ["interval", "间隔", "intervalo"],
   "chart.residual.series": ["Residual", "残差", "Residuo"],
+  // The cumulative view (owner-directed, 2026-08-08): a running per-bucket
+  // sum re-anchored at each reset boundary or track change, named as exactly
+  // that.
+  "chart.residual.cumulativeSeries": ["Cumulative drift since boundary", "自边界以来的累计漂移", "Deriva acumulada desde el límite"],
   "chart.residual.title": ["Quota movement residuals", "额度变化残差", "Residuos del movimiento de cuota"],
-  "chart.residual.description": ["Observed quota change minus the API-cost-implied change, over the same date range as the calibration chart. Windows with no computable residual are left as shaded gaps. Times are shown in {timeZone}.", "观测到的额度变化减去按 API 成本推断的变化，日期范围与校准图相同。没有可计算残差的窗口保留为阴影缺口。时间显示为 {timeZone}。", "Cambio de cuota observado menos el cambio implícito por coste de API, en el mismo intervalo de fechas que el gráfico de calibración. Las ventanas sin residuo calculable quedan como huecos sombreados. Las horas se muestran en {timeZone}."],
+  "chart.residual.description": ["Observed quota change minus the API-cost-implied change, over the same date range as the calibration chart. Windows with no computable residual are left as shaded gaps. The cumulative line sums each bucket's observed-minus-expected movement and restarts at every window boundary or track change. Times are shown in {timeZone}.", "观测到的额度变化减去按 API 成本推断的变化，日期范围与校准图相同。没有可计算残差的窗口保留为阴影缺口。累计线将每个分桶的“观测减预期”变化相加，并在每个窗口边界或额度轨道变化处重新开始。时间显示为 {timeZone}。", "Cambio de cuota observado menos el cambio implícito por coste de API, en el mismo intervalo de fechas que el gráfico de calibración. Las ventanas sin residuo calculable quedan como huecos sombreados. La línea acumulada suma el movimiento observado menos esperado de cada intervalo y se reinicia en cada límite de ventana o cambio de seguimiento. Las horas se muestran en {timeZone}."],
   "chart.status.matched": ["Matched quota bracket", "匹配的额度区间", "Intervalo de cuota coincidente"],
   "chart.status.inactive": ["No local activity or quota movement", "没有本地活动或额度变化", "Sin actividad local ni movimiento de cuota"],
   "chart.status.unpricedLocalActivity": ["Usage change without reviewed price", "没有经审核价格的使用变化", "Cambio de uso sin precio revisado"],
@@ -416,6 +420,18 @@ export const WEB_MESSAGES = Object.freeze({
   "weekly.table.spanNotRecorded": ["Span not recorded", "未记录跨度", "Intervalo no registrado"],
   "residual.table.notComparable": ["Not comparable", "不可比较", "No comparable"],
   "residual.table.empty": ["No periods loaded.", "未加载任何时段。", "No se cargaron períodos."],
+  // The exact-windows pager (owner-directed, 2026-08-08): the shown range of
+  // the full merged inspection list.
+  "residual.table.page": ["{start}–{end} of {total}", "第 {start}–{end} 项，共 {total} 项", "{start}–{end} de {total}"],
+  // The signed-AUC drift figure beside MAE and peak (owner-directed,
+  // 2026-08-08). The unit is percentage-point-hours.
+  "dashboard.summary.cumulativeDrift": ["Cumulative drift", "累计漂移", "Deriva acumulada"],
+  "dashboard.summary.cumulativeDriftExplanation": [
+    "The signed area under the visible residual series: observed-minus-expected percentage points integrated over hours. Positive means observed quota movement ran ahead of what recorded cost implies.",
+    "可见残差序列下的带符号面积：以小时积分的“观测减预期”百分点。为正表示观测到的额度变化超过了记录成本所推断的变化。",
+    "El área con signo bajo la serie de residuos visible: puntos porcentuales observados menos esperados integrados en horas. Un valor positivo significa que el movimiento de cuota observado superó lo que implica el coste registrado.",
+  ],
+  "format.ppHours": ["{value} pp·h", "{value} 个百分点·小时", "{value} pp·h"],
   "contribution.signInCancelled": ["{provider} sign-in was cancelled. Nothing was uploaded.", "已取消 {provider} 登录。未上传任何内容。", "Se canceló el inicio de sesión con {provider}. No se cargó nada."],
   "contribution.signInStarting": ["Starting {provider} sign-in…", "正在开始 {provider} 登录…", "Iniciando sesión con {provider}…"],
   "contribution.signInIncomplete": ["{provider} sign-in did not complete. Nothing was uploaded. You can try again.", "{provider} 登录未完成。未上传任何内容。你可以重试。", "El inicio de sesión con {provider} no se completó. No se cargó nada. Puedes intentarlo de nuevo."],
@@ -637,6 +653,16 @@ export const WEB_MESSAGES = Object.freeze({
     "Sign in above first. Nothing can upload without it.",
     "请先在上方登录。未登录时无法上传任何内容。",
     "Primero inicia sesión arriba. Sin ello no se puede subir nada.",
+  ],
+  // The repair fallback (owner-reported repair loop, 2026-08-08): the service
+  // rejected the stored session, so the page cleared it and asks for the one
+  // action that fixes it. Deliberately not failure copy — nothing the user
+  // did failed, the approval stands, and the ceremony resumes by itself after
+  // the sign-in.
+  "consent.signInAgainToFinish": [
+    "Sign in again to finish connecting this Mac. Your approval still stands, and connecting resumes automatically after you sign in. Nothing was uploaded.",
+    "请重新登录以完成这台 Mac 的连接。你的核准仍然有效，登录后连接会自动继续。未上传任何内容。",
+    "Inicia sesión de nuevo para terminar de conectar este Mac. Tu aprobación sigue vigente y la conexión se reanuda automáticamente tras iniciar sesión. No se cargó nada.",
   ],
   "consent.preparingReview": [
     "Preparing one real instance of the covered data on this Mac for you to review. No network upload is performed.",
@@ -956,11 +982,12 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
     "帮助改进社区估计：登录后核准一次即可。发送任何内容之前你都会先看到所涵盖的数据；核准后它会自动保持最新。",
     "Ayuda a mejorar las estimaciones comunitarias: inicia sesión y aprueba una sola vez. Ves los datos cubiertos antes de que se envíe nada; tras la aprobación se mantienen al día automáticamente.",
   ],
-  // Share panel caption (owner-directed 2026-08-08): the card follows the
-  // chart's active filters, and the code re-renders it with the chart.
-  "The card matches the chart above: its plotted history follows the active date range and minimum observed-span filter.": [
-    "该卡片与上方图表一致：其绘制的历史遵循当前生效的日期范围和最低观测跨度筛选。",
-    "La tarjeta coincide con el gráfico de arriba: su historial trazado sigue el intervalo de fechas activo y el filtro de intervalo mínimo observado.",
+  // Share panel caption (owner-directed 2026-08-08, third round): the header
+  // above the card is title plus this ONE sentence — the filter promise and
+  // the privacy promise together.
+  "The card follows the chart’s active date range and span filter. It contains no prompts, responses, paths, account details, or raw activity.": [
+    "卡片遵循图表当前生效的日期范围和跨度筛选。其中不含提示词、回复、路径、帐户详情或原始活动。",
+    "La tarjeta sigue el intervalo de fechas activo y el filtro de span del gráfico. No contiene indicaciones, respuestas, rutas, detalles de cuenta ni actividad sin procesar.",
   ],
   // Allowance history: the honest error-bar naming (2026-08-08).
   "Slope-agreement range": ["斜率一致性区间", "Intervalo de concordancia de pendientes"],
@@ -1241,7 +1268,15 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "This fit uses API prices as a measuring stick. It is not a provider-published dollar allowance.": ["此拟合将 API 价格用作衡量标尺。它不是提供商发布的美元额度。", "Este ajuste usa precios de API como regla de medida. No es un límite en dólares publicado por el proveedor."],
   "A results card you can post": ["可发布的结果卡片", "Una tarjeta de resultados que puedes publicar"],
   "Reference pending": ["参考待定", "Referencia pendiente"],
-  "A ready-to-post image of the three headline figures. It contains no prompts, responses, paths, account details, or raw activity.": ["包含三个摘要数字的可直接发布图像。其中不含提示词、回复、路径、帐户详情或原始活动。", "Una imagen lista para publicar de las tres cifras principales. No contiene indicaciones, respuestas, rutas, detalles de cuenta ni actividad sin procesar."],
+  // The exact-windows pager (owner-directed, 2026-08-08).
+  "Previous": ["上一页", "Anterior"],
+  "Next": ["下一页", "Siguiente"],
+  // The residual panel's cumulative line, named with its exact semantics
+  // (owner-directed, 2026-08-08).
+  "The second line is cumulative drift: the running sum of each bucket’s observed-minus-expected movement, restarted at every window boundary or track change.": [
+    "第二条线是累计漂移：每个分桶“观测减预期”变化的累计和，在每个窗口边界或额度轨道变化处重新开始。",
+    "La segunda línea es la deriva acumulada: la suma corrida del movimiento observado menos esperado de cada intervalo, reiniciada en cada límite de ventana o cambio de seguimiento.",
+  ],
   "A results card is generated once local evidence is available.": ["本地证据可用后会生成结果卡片。", "Se genera una tarjeta de resultados cuando hay evidencia local disponible."],
   "02 · Weekly allowance": ["02 · 每周额度", "02 · Límite semanal"],
   "Our best estimate of the seven-day limit": ["我们对七天限额的最佳估计", "Nuestra mejor estimación del límite de siete días"],

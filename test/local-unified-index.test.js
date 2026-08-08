@@ -20,6 +20,7 @@ import {
 } from "../src/local-unified-index-ingest.js";
 import {
   inspectLocalUnifiedIndex,
+  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
   localDigest,
   openLocalUnifiedIndex,
   OUTCOMES,
@@ -839,4 +840,96 @@ test("classifySource maps growth, touch, shrink and novelty to the right work", 
     classifySource(info, { size_bytes: 160, mtime_ms: 5 }),
     { mode: "rescan" },
   );
+});
+
+test("classifySource forces a whole-file rescan for cursors stamped by an older parser", () => {
+  const info = { size: 100, mtimeMs: 5 };
+  // An up-to-date cursor keeps its cheap classification.
+  assert.deepEqual(
+    classifySource(
+      info,
+      { size_bytes: 100, mtime_ms: 5, parser_version: LOCAL_UNIFIED_INDEX_PARSER_VERSION },
+      LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+    ),
+    { mode: "skip" },
+  );
+  // A cursor stamped by an older parser is re-derived regardless of size or
+  // mtime — skip, touch and resume are all overridden.
+  for (const cursor of [
+    { size_bytes: 100, mtime_ms: 5, parser_version: "unified-rollout-typed-v1" },
+    { size_bytes: 100, mtime_ms: 4, parser_version: "unified-rollout-typed-v1" },
+    { size_bytes: 60, mtime_ms: 5, parser_version: "unified-rollout-typed-v1" },
+    // A cursor whose run row is missing reads as unknown, the safe direction.
+    { size_bytes: 100, mtime_ms: 5, parser_version: null },
+  ]) {
+    assert.deepEqual(
+      classifySource(info, cursor, LOCAL_UNIFIED_INDEX_PARSER_VERSION),
+      { mode: "rescan", reason: "parser_version" },
+    );
+  }
+});
+
+test("a parser-version bump re-derives poisoned sources and replaces their rows", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-aaaa.jsonl": [
+      sessionMeta("session-a"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20)),
+    ],
+  });
+  const ingest = () => ingestLocalUnifiedIndexIncrement({
+    codexHome: root,
+    indexFile: join(root, "index.sqlite"),
+    secretFile: join(root, "salt"),
+    contractVersion: CONTRACT,
+  });
+  try {
+    const first = await ingest();
+    assert.equal(first.insertedUsageEvents, 2);
+    assert.equal(first.sourcesReparsedForParserVersion, 0);
+
+    // Regress the index to an older-parser state: restamp the parser_version
+    // dimension row the cursor's ingest run references, and poison the stored
+    // token values the way the old delta derivation did. Event keys are
+    // (session, offset, observed-at), so without deletion the rescan's
+    // ON CONFLICT DO NOTHING would silently keep these phantom values.
+    {
+      const raw = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: false });
+      raw.prepare(
+        "UPDATE parser_version SET parser_version = 'unified-rollout-typed-v1'",
+      ).run();
+      raw.prepare(
+        "UPDATE usage_event SET tokens_in_uncached = 5420000000",
+      ).run();
+      raw.close();
+    }
+
+    const healed = await ingest();
+    assert.equal(healed.sourcesReparsedForParserVersion, 1);
+    assert.equal(healed.usageRowsDeletedForReparse, 2);
+    assert.equal(healed.sourcesRescanned, 1);
+    assert.equal(healed.insertedUsageEvents, 2, "rows are re-derived, not kept");
+    assert.equal(healed.totalUsageEvents, 2);
+
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      const totals = database.prepare(`
+        SELECT SUM(tokens_in_uncached) AS iu, MAX(tokens_in_uncached) AS max_iu
+        FROM usage_event`).get();
+      assert.equal(Number(totals.iu), 300, "the phantom values are gone");
+      assert.equal(Number(totals.max_iu), 200);
+    } finally {
+      database.close();
+    }
+
+    // The healed cursor is stamped with the current parser version, so the
+    // next pass is quiet again.
+    const settled = await ingest();
+    assert.equal(settled.sourcesReparsedForParserVersion, 0);
+    assert.equal(settled.sourcesSkipped, 1);
+    assert.equal(settled.insertedUsageEvents, 0);
+  } finally {
+    await rm(root, { recursive: true });
+  }
 });

@@ -15,6 +15,18 @@ import {
 } from "./log-normalization.js";
 import { normalizeProviderTier } from "./tier-normalization.js";
 
+// Tolerance when deciding that a cumulative delta "materially exceeds" the
+// co-reported per-turn `last_token_usage`. The counters are exact integers
+// written by one process, so this absorbs only rounding/reporting noise; it is
+// deliberately not a plausibility band. Measured on the live corpus
+// (~/.codex sessions from Jun 16), two cumulative streams interleave
+// line-by-line within one rollout (~5.5236B vs ~5.5224B, both climbing) and
+// counters reset mid-file; charging the inter-stream swing as a delta
+// materialized ~378 phantom events totaling 13.02B tokens in one session,
+// while `last_token_usage` stayed honest (125k-240k per turn) throughout.
+// Restated in src/local-unified-index-extract.js; keep the two identical.
+export const CUMULATIVE_DELTA_VS_LAST_TOLERANCE_TOKENS = 16;
+
 export function createCodexLogParser({ lineReader }) {
   function boundedScannerLines(
     source,
@@ -158,9 +170,26 @@ export function createCodexLogParser({ lineReader }) {
     let currentModel = null;
     let previousTotals = null;
     let previousTotalsPresence = null;
+    // Set when the cumulative baseline was re-anchored on a counter
+    // regression. Until the next positive swing is derived, the delta from
+    // the new anchor may span two interleaved streams, so that swing charges
+    // only its own per-turn value when one is present.
+    let reAnchored = false;
     const openTaskIds = new Set();
     let sourceRecordOrdinal = 0;
     const leadingRateLimitGate = createLeadingRateLimitGate();
+
+    // Every movement of the cumulative baseline goes through here, including
+    // the skip paths, so a regression observed outside the requested interval
+    // or under a replayed fork prefix still counts as stream-switch evidence.
+    function rebaseTotals(total, totalPresence) {
+      if (previousTotals !== null
+          && total.total_tokens < previousTotals.total_tokens) {
+        reAnchored = true;
+      }
+      previousTotals = total;
+      previousTotalsPresence = totalPresence;
+    }
 
     // Whether a source's leading reading is trustworthy is a property of the
     // source, not of the requested interval, so readings outside the interval
@@ -269,26 +298,17 @@ export function createCodexLogParser({ lineReader }) {
       const cumulativeKey = cumulativeSnapshotKey(total, last);
       if (cumulativeKey) rolloutSnapshots.add(cumulativeKey);
       if (forked && cumulativeKey && inheritedSnapshots.has(cumulativeKey)) {
-        if (total) {
-          previousTotals = total;
-          previousTotalsPresence = totalPresence;
-        }
+        if (total) rebaseTotals(total, totalPresence);
         if (timestampMs >= startMs && timestampMs <= endMs) diagnostics.forkReplayEventsSkipped += 1;
         continue;
       }
       if (timestampMs < startMs || timestampMs > endMs) {
-        if (total) {
-          previousTotals = total;
-          previousTotalsPresence = totalPresence;
-        }
+        if (total) rebaseTotals(total, totalPresence);
         await gateUnobservedRateLimits(record.payload, timestampMs);
         continue;
       }
       if (forked && currentModel === null) {
-        if (total) {
-          previousTotals = total;
-          previousTotalsPresence = totalPresence;
-        }
+        if (total) rebaseTotals(total, totalPresence);
         diagnostics.unattributedForkReplayEventsSkipped += 1;
         continue;
       }
@@ -311,23 +331,54 @@ export function createCodexLogParser({ lineReader }) {
       let usage = null;
       let usagePresence = null;
       if (total) {
+        const firstCumulativeRecord = previousTotals === null;
+        const regressed = !firstCumulativeRecord
+          && total.total_tokens < previousTotals.total_tokens;
         const delta = subtractUsage(total, previousTotals);
         const deltaPresence = deltaComponentPresence(totalPresence, previousTotalsPresence);
-        const firstCumulativeRecord = previousTotals === null;
+        const chargePerTurnOnly = reAnchored;
         previousTotals = total;
         previousTotalsPresence = totalPresence;
-        if (firstCumulativeRecord) {
+        if (regressed) {
+          // A cumulative counter never legitimately goes down: this is a
+          // stream switch or a mid-file reset. Re-anchor without charging any
+          // swing. The row itself is still a real turn when it co-reports a
+          // per-turn value — measured on the live corpus, every regressed
+          // row's total equals its own stream's prior total plus its own
+          // `last_token_usage` — so that per-turn value, and only it, is
+          // charged.
+          reAnchored = true;
+          diagnostics.cumulativeCounterRegressions =
+            (diagnostics.cumulativeCounterRegressions ?? 0) + 1;
+          if (last && last.total_tokens > 0) {
+            usage = last;
+            usagePresence = lastPresence;
+          }
+        } else if (firstCumulativeRecord) {
           usage = last ?? delta;
           usagePresence = last ? lastPresence : deltaPresence;
         } else if (delta.total_tokens > 0) {
           if (last && sameUsage(last, delta)) {
             usage = last;
             usagePresence = lastPresence;
+          } else if (last && (chargePerTurnOnly
+              || delta.total_tokens
+                > last.total_tokens + CUMULATIVE_DELTA_VS_LAST_TOLERANCE_TOKENS)) {
+            // The cumulative delta materially exceeds the co-reported
+            // per-turn value (or the baseline was just re-anchored after a
+            // regression): the excess is an inter-stream gap, not spend.
+            // Charge the honest per-turn value.
+            usage = last;
+            usagePresence = lastPresence;
+            diagnostics.lastVsCumulativeMismatches += 1;
+            diagnostics.crossStreamDeltasSuppressed =
+              (diagnostics.crossStreamDeltasSuppressed ?? 0) + 1;
           } else {
             usage = delta;
             usagePresence = deltaPresence;
             if (last) diagnostics.lastVsCumulativeMismatches += 1;
           }
+          reAnchored = false;
         } else if (last && last.total_tokens > 0) {
           diagnostics.duplicateSnapshotsSkipped += 1;
         }

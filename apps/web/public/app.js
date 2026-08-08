@@ -90,6 +90,16 @@ let timelineViewport = null;
 let usageTimelineViewport = null;
 let timelinePointerStart = null;
 let usagePointerStart = null;
+// The exact-windows inspection table pages through its full merged row set
+// (owner-directed 2026-08-08) instead of capping at eight rows: ten rows per
+// page, newest first, with the shown range stated as "N–M of T". The rows are
+// re-derived on every timeline render; the page index is clamped there and
+// returns to the first page whenever the underlying selection changes shape,
+// so Prev/Next can never show a stale slice of a different selection.
+const RESIDUAL_TABLE_PAGE_SIZE = 10;
+let residualTablePage = 0;
+let residualInspectionRows = [];
+let residualInspectionSignature = "";
 let localCompanionHealth = null;
 // This is an optional, short-lived rendering hint from the public health
 // endpoint. The Worker remains authoritative; a missing or stale health read
@@ -948,7 +958,8 @@ function renderDashboard(data) {
   renderEvidenceWarnings(data);
   renderPricing(data);
   renderComparison(data);
-  renderShareCard(data);
+  // The share card renders inside renderWeekly, from the same history model
+  // as the chart it summarizes (owner-verified regression, 2026-08-08).
   renderUsageTimeline(data);
   renderTimeline(data);
   renderWeekly(data);
@@ -2474,12 +2485,21 @@ function updateShareCardActions() {
  *
  * A fresh reference is minted whenever the figures change, so one posted image
  * and one reference always describe the same numbers.
+ *
+ * Owner-verified regression fix (2026-08-08): the chart renderer hands its
+ * OWN history model in through `history`, so the card and the chart are two
+ * renderings of one model instance. A card that derived its own model relied
+ * on every caller re-rendering it after every filter change — the coupling
+ * that broke. Standalone calls (the brand-image late load) still derive the
+ * model themselves and read the same active-filter state.
  */
-function renderShareCard(data) {
+function renderShareCard(data, { history: sharedHistory = null } = {}) {
   const canvas = $("#share-card-canvas");
   const allowanceWindow = shareCardWindow(data?.quotaWindows ?? []);
   const isWeeklyWindow = shareCardWindowKind(allowanceWindow) === "seven_day";
-  const history = isWeeklyWindow ? allowanceHistoryChartModel(data) : null;
+  const history = isWeeklyWindow
+    ? sharedHistory ?? allowanceHistoryChartModel(data)
+    : null;
   const trend = isWeeklyWindow ? shareCardTrend(history) : null;
   const signature = JSON.stringify([
     data?.mode,
@@ -3041,11 +3061,25 @@ function liveTimelinePoints(
   let startIndex = 0;
   let rollingCost = 0;
   let rollingEvents = 0;
+  // Cumulative drift (owner-directed, 2026-08-08): the running sum of
+  // per-bucket observed-minus-expected movement since the last reset boundary
+  // or track change — the same signed observed-versus-expected accumulation
+  // the reporting module's signed AUC integrates (see buildRollingResidual in
+  // src/simple-quota-gradient.js), expressed over NON-OVERLAPPING usage
+  // buckets so the rolling windows above can never double-count an hour. The
+  // sum re-anchors at each boundary: within one reset it answers "how far
+  // ahead of the cost-implied line has observed quota movement run since this
+  // reset began". Honesty guards: no capacity or no quota row means no value,
+  // and a stale quota bracket suspends the line rather than letting a static
+  // observation read as growing negative drift.
+  let driftAnchor = null;
+  let driftCostUsd = 0;
   for (let index = 0; index < usage.length; index += 1) {
     const current = usage[index];
     const endMs = Date.parse(current.endAt);
     rollingCost += current.apiPriceEquivalentUsd;
     rollingEvents += current.usageEvents;
+    driftCostUsd += current.apiPriceEquivalentUsd;
     while (startIndex <= index
         && Date.parse(usage[startIndex].endAt) <= endMs - windowMs) {
       rollingCost -= usage[startIndex].apiPriceEquivalentUsd;
@@ -3078,12 +3112,30 @@ function liveTimelinePoints(
       usageEvents: rollingEvents,
       apiCostUsd: rollingCost,
     });
+    let cumulativeResidual = null;
+    if (capacity !== null && capacity > 0
+        && after !== null
+        && Number.isFinite(finite(after.usedPercent))
+        && endMs - afterMatch.timestampMs <= maximumBracketGapMs) {
+      if (driftAnchor === null
+          || !sameResetBoundary(driftAnchor.resetAt, after.resetAt)) {
+        // A boundary or track change re-anchors the accumulation: drift is
+        // zero by definition at the first observation of a new reset.
+        driftAnchor = { resetAt: after.resetAt, usedPercent: after.usedPercent };
+        driftCostUsd = 0;
+        cumulativeResidual = 0;
+      } else {
+        cumulativeResidual = after.usedPercent - driftAnchor.usedPercent
+          - driftCostUsd / capacity * 100;
+      }
+    }
     points.push({
       timestamp: current.endAt,
       timestampMs: endMs,
       observed,
       expected,
       residual: evidence.residual,
+      cumulativeResidual,
       apiCostUsd: Math.max(0, rollingCost),
       usageEvents: Math.max(0, rollingEvents),
       status: evidence.status,
@@ -3676,6 +3728,40 @@ function bindTimelineInteractions(shell, points, viewport) {
   };
 }
 
+/**
+ * The signed observed-minus-expected area under a matched residual series, in
+ * percentage-point-hours. Trapezoidal over consecutive matched points, the
+ * same integration buildRollingResidual performs for the artifact summary in
+ * src/simple-quota-gradient.js: positive means observed quota movement ran
+ * ahead of what recorded cost implies across the covered span.
+ */
+function signedResidualAucPpHours(matched) {
+  if (!Array.isArray(matched) || matched.length < 2) return null;
+  let area = 0;
+  for (let index = 1; index < matched.length; index += 1) {
+    const prior = matched[index - 1];
+    const current = matched[index];
+    const elapsedHours =
+      (pointTimestampMs(current) - pointTimestampMs(prior)) / 3_600_000;
+    if (!Number.isFinite(elapsedHours) || elapsedHours <= 0) continue;
+    area += elapsedHours
+      * ((prior.observed - prior.expected) + (current.observed - current.expected))
+      / 2;
+  }
+  return area;
+}
+
+// A signed pp·hours figure keeps its sign visible: "+" is printed explicitly
+// because the sign IS the finding — which side of the cost-implied line the
+// observed movement accumulated on.
+function formatSignedPpHours(value) {
+  const number = finite(value);
+  if (number === null) return "—";
+  return t("format.ppHours", {
+    value: `${number < 0 ? "" : "+"}${formatDecimal(number, 1)}`,
+  });
+}
+
 function renderTimelineSummary(data, points) {
   const summary = data.gradient.summary ?? {};
   const sensitivity = data.gradient.windowSensitivity.find((row) => finite(row.smoothing_hours ?? row.window_hours ?? row.hours) === CALIBRATION_WINDOW_HOURS);
@@ -3688,6 +3774,12 @@ function renderTimelineSummary(data, points) {
   const livePeak = matched.length
     ? Math.max(...matched.map((row) => Math.abs(row.observed - row.expected)))
     : null;
+  // Signed AUC over the visible matched residuals (owner-directed,
+  // 2026-08-08): the trapezoidal observed-minus-expected integral in
+  // pp·hours, exactly as buildRollingResidual computes it for the artifact
+  // summary in src/simple-quota-gradient.js. The historical view reports the
+  // artifact's own whole-history figure instead of re-deriving one.
+  const liveSignedAuc = signedResidualAucPpHours(matched);
   const values = [
     [
       "Matched windows",
@@ -3703,6 +3795,13 @@ function renderTimelineSummary(data, points) {
       "Peak residual",
       "The largest absolute observed-versus-calculated difference in the selected calibration view.",
       formatPp(live ? livePeak : summary.rolling_peak_absolute_residual_pp),
+    ],
+    [
+      t("dashboard.summary.cumulativeDrift"),
+      t("dashboard.summary.cumulativeDriftExplanation"),
+      formatSignedPpHours(
+        live ? liveSignedAuc : summary.rolling_signed_auc_pp_hours,
+      ),
     ],
     [
       "Usable quota coverage",
@@ -3857,6 +3956,19 @@ function renderResiduals(data, points, viewport = null) {
         label: { key: "chart.residual.series" },
         pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
         format: formatPp,
+      }, {
+        // The designed cumulative view (owner-directed, 2026-08-08): the
+        // running sum of per-bucket observed-minus-expected movement,
+        // re-anchored at each reset boundary or track change — computed in
+        // liveTimelinePoints beside the evidence it reads. Live points only:
+        // the historical artifact view carries no per-window reset
+        // annotations, so its rows have no such key and this series simply
+        // draws nothing there instead of inventing anchors.
+        key: "cumulativeResidual",
+        className: "chart-line-expected",
+        label: { key: "chart.residual.cumulativeSeries" },
+        pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+        format: formatPp,
       }],
       yLabel: { key: "dashboard.timeline.percentagePoints" },
       title: { key: "chart.residual.title" },
@@ -3873,8 +3985,6 @@ function renderResiduals(data, points, viewport = null) {
     }));
   }
   renderResidualCoverage(residuals, computed);
-  const table = $("#residual-table");
-  clear(table);
   const unmatched = points
     .filter((point) => point.timestamp && point.status
       && !["matched", "inactive"].includes(point.status))
@@ -3882,14 +3992,42 @@ function renderResiduals(data, points, viewport = null) {
   const largest = [...computed]
     .sort((a, b) => Math.abs(b.residual) - Math.abs(a.residual));
   // Both halves of this table matter: the windows that could not be compared,
-  // and the comparable windows whose residual is largest. Concatenating an
-  // unbounded unmatched list ahead of the residuals meant that whenever more
-  // than eight windows were excluded — the normal case — the slice consumed
-  // every row and each one printed "Not comparable". Give each half its own
-  // reserved share of the eight rows, and let either half claim the slack the
-  // other does not use.
-  const inspection = balancedInspectionRows(unmatched, largest, 8);
-  if (!inspection.length) {
+  // and the comparable windows whose residual is largest. Pagination replaced
+  // the old eight-row cap (owner-directed, 2026-08-08): nothing is dropped
+  // any more — the merge keeps every row from both halves, deduplicated by
+  // timestamp and ordered newest first, and the reader pages through it ten
+  // rows at a time.
+  const inspection = balancedInspectionRows(
+    unmatched,
+    largest,
+    unmatched.length + largest.length,
+  );
+  // A changed selection restarts at the first page: the page index describes
+  // a position within ONE row set, and surviving a range change would show an
+  // arbitrary slice of a different one.
+  const signature = `${inspection.length}`
+    + `:${inspection[0]?.timestamp ?? ""}`
+    + `:${inspection.at(-1)?.timestamp ?? ""}`;
+  if (signature !== residualInspectionSignature) {
+    residualInspectionSignature = signature;
+    residualTablePage = 0;
+  }
+  residualInspectionRows = inspection;
+  renderResidualInspectionTable();
+}
+
+/**
+ * One page of the exact-windows inspection table, plus the pager beneath it.
+ * Rendered from the module-held row set so Prev/Next can redraw the table
+ * without re-deriving the timeline.
+ */
+function renderResidualInspectionTable() {
+  const table = $("#residual-table");
+  clear(table);
+  const rows = residualInspectionRows;
+  const pagination = $("#residual-pagination");
+  if (!rows.length) {
+    if (pagination) pagination.hidden = true;
     const row = node("tr");
     const cell = node("td", "empty-cell", t("residual.table.empty"));
     cell.colSpan = 5;
@@ -3897,7 +4035,11 @@ function renderResiduals(data, points, viewport = null) {
     table.append(row);
     return;
   }
-  for (const item of inspection) {
+  const pageCount = Math.ceil(rows.length / RESIDUAL_TABLE_PAGE_SIZE);
+  residualTablePage = Math.min(Math.max(0, residualTablePage), pageCount - 1);
+  const start = residualTablePage * RESIDUAL_TABLE_PAGE_SIZE;
+  const pageRows = rows.slice(start, start + RESIDUAL_TABLE_PAGE_SIZE);
+  for (const item of pageRows) {
     const row = node("tr");
     const residual = item.observed === null || item.expected === null
       ? null
@@ -3911,6 +4053,17 @@ function renderResiduals(data, points, viewport = null) {
     );
     table.append(row);
   }
+  if (!pagination) return;
+  pagination.hidden = false;
+  setLocalizedText($("#residual-page-status"), "residual.table.page", {
+    start: formatNumber(start + 1),
+    end: formatNumber(start + pageRows.length),
+    total: formatNumber(rows.length),
+  });
+  const previous = $("#residual-page-prev");
+  const next = $("#residual-page-next");
+  if (previous) previous.disabled = residualTablePage === 0;
+  if (next) next.disabled = residualTablePage >= pageCount - 1;
 }
 
 // A tick label's resolution follows the span the axis actually covers, so
@@ -5476,6 +5629,14 @@ function renderWeekly(data) {
     shell.replaceChildren(renderAllowanceHistoryChart(history));
   }
   renderWeeklyTable(values);
+  // The chart renderer owns the card re-render (owner-verified regression,
+  // 2026-08-08). The old wiring re-rendered the card only where a caller
+  // remembered to, so a path that redrew the chart without the extra call
+  // left the card describing the previous filters. Every path that renders
+  // the allowance history — the range buttons, the span slider, a dashboard
+  // load, a locale change — now redraws the card from the SAME model
+  // instance, so the two surfaces cannot disagree.
+  renderShareCard(data, { history });
 }
 
 function renderWeeklyTable(values) {
@@ -7464,6 +7625,7 @@ async function beginHostedSignIn(providerId) {
         status.textContent = flow.signedIn;
         renderHostedIdentity();
         foregroundNativeDashboardAfterSignIn();
+        resumeContributionCeremonyAfterSignIn();
         return;
       }
       if (poll + 1 < HOSTED_SIGNIN_POLL_ATTEMPTS) {
@@ -7704,10 +7866,13 @@ function renderIncrementalConsent() {
     // Why the button is off, stated where the button is, in gate order: the
     // missing sign-in first, then the in-flight review. Connection is no
     // longer a stated prerequisite — the ceremony performs it itself. A
-    // signed-out Mac that needs the transparent re-pair states the sign-in
-    // requirement too: the silent repair needs the session.
+    // signed-out Mac that needs the transparent re-pair names the repair's
+    // own next step (owner-reported repair loop, 2026-08-08): sign in again,
+    // and connecting resumes by itself.
     setLocalizedText(gate, hostedSignInRequired()
-      ? "consent.signInFirst"
+      ? repairNeeded
+        ? "consent.signInAgainToFinish"
+        : "consent.signInFirst"
       : reviewVerified
         ? "consent.readyToApprove"
         : "consent.reviewFirst");
@@ -7985,6 +8150,13 @@ async function approveIncrementalContribution() {
     scheduleIncrementalSyncStatusPoll({ reset: true });
   } catch (error) {
     if (contributionConnectStepOf(error) !== null
+        && contributionSessionWasRejected(error)) {
+      // The stored session was rejected mid-ceremony. This is the repair
+      // loop's root (owner-reported, 2026-08-08): failure copy here repeated
+      // on every load while the dead session survived. Render the sign-in
+      // gate instead — once signed in, the ceremony resumes automatically.
+      renderContributionSessionSignInGate(status);
+    } else if (contributionConnectStepOf(error) !== null
         || contributionDeviceRecoveryIsRequired(error)) {
       await reportContributionConnectFailure(status, error, {
         enrollmentAttemptedWithHostedIdentity,
@@ -8020,6 +8192,22 @@ function maybeRepairIncrementalAuthorization() {
   if (!incrementalConsentApproved || !incrementalGrantRejected()) return;
   if (!hasCommunitySession()) return;
   incrementalRepairAttempted = true;
+  void approveIncrementalContribution();
+}
+
+/**
+ * After a completed hosted sign-in, finish what the sign-in was for
+ * (owner-reported repair loop, 2026-08-08): a Mac whose approval stands but
+ * whose upload authority was refused resumes the connect ceremony immediately
+ * with the fresh proof — the promised "sign in again to finish connecting
+ * this Mac" journey ends here without another click. Only the repair path
+ * resumes automatically; a Mac that never approved still gets its explicit
+ * Review-and-approve action.
+ */
+function resumeContributionCeremonyAfterSignIn() {
+  if (!incrementalSyncCapabilityAdvertised()) return;
+  if (!incrementalConsentApproved || !incrementalGrantRejected()) return;
+  if (incrementalConsentBusy || communityConnectBusy) return;
   void approveIncrementalContribution();
 }
 
@@ -8076,6 +8264,49 @@ function contributionDeviceRecoveryIsRequired(error) {
   } catch {
     return false;
   }
+}
+
+// The service's three session-rejection codes: the stored browser session or
+// its CSRF confirmation was not recognized — a session that predates the last
+// service deploy, or one that expired server-side. Nothing about the user's
+// approval or this Mac's queue is wrong when one of these comes back, so the
+// honest next step is a fresh sign-in, never a retry with the same dead
+// session (owner-reported repair loop, 2026-08-08).
+const CONTRIBUTION_SESSION_REJECTION_CODES = new Set([
+  "AUTH_REQUIRED",
+  "AUTH_INVALID",
+  "CSRF_INVALID",
+]);
+
+function contributionSessionWasRejected(error) {
+  try {
+    return CONTRIBUTION_SESSION_REJECTION_CODES.has(error?.code);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The one fallback for a rejected stored session (owner-reported repair loop,
+ * 2026-08-08). The silent repair used to treat a session-rejected pairing
+ * mint as a terminal step-2 failure, keep the dead session, and repeat the
+ * identical failure on every load. A rejected session is not a failure the
+ * user must interpret: clear the dead session and the stale identity proof,
+ * say the one action that fixes it, and render the sign-in gate. The user's
+ * approval still stands, and after the next sign-in the ceremony resumes by
+ * itself — see resumeContributionCeremonyAfterSignIn.
+ */
+function renderContributionSessionSignInGate(status) {
+  hostedIdentity = null;
+  communityDevicePairedV1 = false;
+  // Clearing the session re-renders the approve surface, whose gate line now
+  // asks for the sign-in; the guarded auto-repair cannot re-run without a
+  // session, so this cannot loop.
+  setCommunitySession(null);
+  status.hidden = false;
+  status.className = "participant-action-status";
+  setLocalizedText(status, "consent.signInAgainToFinish");
+  renderHostedIdentity();
 }
 
 async function renderContributionDeviceRecovery(status, { error } = {}) {
@@ -8445,6 +8676,17 @@ $("#timeline-reset-zoom").addEventListener("click", () => {
   resetTimelineViewport();
   if (dashboard) renderTimeline(dashboard);
 });
+// The exact-windows pager (owner-directed, 2026-08-08). The page index is
+// clamped inside the renderer, so a click at either end can never leave the
+// row set.
+$("#residual-page-prev").addEventListener("click", () => {
+  residualTablePage -= 1;
+  renderResidualInspectionTable();
+});
+$("#residual-page-next").addEventListener("click", () => {
+  residualTablePage += 1;
+  renderResidualInspectionTable();
+});
 $("#usage-group-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-group]");
   if (!button || !dashboard || !usageGroupingsForRange().includes(button.dataset.group)) return;
@@ -8466,17 +8708,15 @@ $("#weekly-range-controls").addEventListener("click", (event) => {
     control.classList.toggle("active", active);
     control.setAttribute("aria-pressed", String(active));
   }
+  // renderWeekly itself re-renders the share card from the same model
+  // (owner-verified regression, 2026-08-08), so a control cannot redraw the
+  // chart while leaving the card on the previous filters.
   renderWeekly(dashboard);
-  // The share card plots the same filtered history (owner-directed
-  // 2026-08-08): it re-renders with the chart, so its caption's claim — the
-  // card matches the active range and span filter — is always true.
-  renderShareCard(dashboard);
 });
 $("#weekly-span-control").addEventListener("input", (event) => {
   if (!dashboard) return;
   activeWeeklyMinimumObservedSpanPp = Math.min(99, Math.max(0, Number(event.target.value)));
   renderWeekly(dashboard);
-  renderShareCard(dashboard);
 });
 $("#accounting-period-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-period]");

@@ -29,15 +29,25 @@ export const LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v1";
 // Stamped onto every row. A parser change re-scans only the affected rows'
 // source files; rows whose rollout files have rotated away keep their
 // last-good values and stay visibly marked as older-parser output.
-export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v1";
+//
+// v2 (2026-08-08): the delta derivation now recognises interleaved cumulative
+// counter streams and mid-file counter resets — a counter regression
+// re-anchors without charging, and a cumulative delta that materially exceeds
+// the co-reported per-turn `last_token_usage` charges the per-turn value
+// instead of the inter-stream gap. Rows derived under v1 can carry phantom
+// spend (measured: 13.02B phantom tokens in one session), so the incremental
+// ingest forces a whole-file rescan of any source whose cursor was stamped by
+// an older parser version.
+export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v2";
 
 // A row salvaged from a line that exceeded the bounded-line cap carries this
 // parser version instead. The agreed schema has no "partial" column and the
 // `outcome` enum is fixed by the telemetry contract, so the row-level parser
 // stamp — which decision 4 of the design exists to provide — is where a
-// degraded row is recorded.
+// degraded row is recorded. Kept in lockstep with the main constant: salvaged
+// rows run the same delta derivation.
 export const LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v1-partial";
+  "unified-rollout-typed-v2-partial";
 
 const INDEX_APPLICATION_ID = 0x554d5549;
 // Version 2 (2026-08-07) widens version 1 with the two incremental-ingest

@@ -1022,7 +1022,20 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /light: \(red: 23, green: 79, blue: 69, alpha: 1\)/u);
   assert.match(source, /light: \(red: 129, green: 87, blue: 24, alpha: 1\)/u);
   assert.match(source, /light: \(red: 151, green: 64, blue: 42, alpha: 1\)/u);
-  assert.match(source, /private final class NativeToolbarStatusPill: NSView/u);
+  // Deliberately re-pinned 2026-08-08: the pill dressing is an inert
+  // borderless NSButton, not a plain NSView. On macOS 26 the toolbar wraps a
+  // custom-view item in its own Liquid Glass platter (NSToolbarPlatterView
+  // hosting an NSGlassEffectView, 11pt taller than the pill), which rendered
+  // as the white halo the owner reported. AppKit only asks its own buttons
+  // whether they want glass — a borderless button declines the platter
+  // through public API; a plain NSView is misted over regardless. The pill
+  // button stays pure dressing: empty title, no action, no key focus, no
+  // accessibility element — the inner title button remains the control.
+  assert.match(source, /private final class NativeToolbarStatusPill: NSButton/u);
+  assert.match(
+    source,
+    /private final class NativeToolbarStatusPill: NSButton[\s\S]*?title = ""[\s\S]*?isBordered = false[\s\S]*?refusesFirstResponder = true[\s\S]*?setAccessibilityElement\(false\)[\s\S]*?wantsLayer = true/u,
+  );
   assert.match(source, /button\.isBordered = false/u);
   assert.doesNotMatch(source, /\.systemYellow|\.systemGreen/u);
   // The colorway mirrors the title's own precedence: a running refresh,

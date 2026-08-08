@@ -1482,6 +1482,9 @@ tbody tr:last-child td { border-bottom: 0; }
 .empty-cell { padding: 30px; color: var(--muted); text-align: center; }
 .positive { color: var(--rust); font-weight: var(--weight-semibold); }
 .negative { color: var(--green); font-weight: var(--weight-semibold); }
+/* The exact-windows pager (owner-directed, 2026-08-08). */
+.table-pagination { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); margin-top: var(--space-3); }
+.table-pagination-status { color: var(--muted); font-size: .73rem; }
 
 .weekly-hero {
   display: grid;
