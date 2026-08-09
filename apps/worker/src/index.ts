@@ -52,6 +52,12 @@ import {
   type AdminAction,
   type CollectionControlReason,
 } from "./admin-operations";
+import { verifyAdminAccessAssertion } from "./admin-access";
+import {
+  adminHostname,
+  adminUiResponse,
+  isAdminSurfacePath,
+} from "./admin-ui";
 import {
   buildCommunityWeeklySnapshot,
   readLatestCommunityWeeklySnapshot,
@@ -255,6 +261,7 @@ import {
   type TelemetryV1ChunkRow,
 } from "./telemetry-v1-repository";
 import {
+  readPublishedCommunityDailyAggregates,
   rebuildPendingCommunityDailyAggregates,
 } from "./community-daily-aggregates";
 import { canonicalJson } from "./canonical-json";
@@ -2890,6 +2897,82 @@ async function handleCommunityStats(request: Request, env: Env): Promise<Respons
   return new Response(snapshot.payloadJson, { headers });
 }
 
+const COMMUNITY_DAILY_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
+const COMMUNITY_DAILY_MAX_RANGE_DAYS = 366;
+const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
+
+function communityDailyRangeDay(value: string | null): string {
+  if (value === null || !COMMUNITY_DAILY_DAY_PATTERN.test(value)) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const epoch = Date.parse(`${value}T00:00:00.000Z`);
+  // The round-trip comparison rejects calendar-impossible dates such as
+  // 2026-02-31 that Date.parse silently normalizes.
+  if (!Number.isFinite(epoch)
+      || new Date(epoch).toISOString().slice(0, 10) !== value) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  return value;
+}
+
+async function handleCommunityDaily(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "publication");
+  await assertPublicAggregateReadAllowed(env.PUBLIC_READ_RATE_LIMIT, request, env);
+  const parameters = new URL(request.url).searchParams;
+  for (const name of parameters.keys()) {
+    if (name !== "from" && name !== "to") {
+      throw new ApiError(400, "BODY_INVALID");
+    }
+  }
+  const from = communityDailyRangeDay(parameters.get("from"));
+  const to = communityDailyRangeDay(parameters.get("to"));
+  const rangeDays = 1 + Math.round(
+    (Date.parse(`${to}T00:00:00.000Z`) - Date.parse(`${from}T00:00:00.000Z`))
+      / MILLISECONDS_PER_DAY,
+  );
+  if (rangeDays < 1 || rangeDays > COMMUNITY_DAILY_MAX_RANGE_DAYS) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const rows = await readPublishedCommunityDailyAggregates(
+    env.USAGE_MONITOR_DB,
+    from,
+    to,
+  );
+  const days = rows.map((row) => {
+    let payload: unknown;
+    try {
+      payload = JSON.parse(row.payload_json);
+    } catch {
+      // Published rows are hash-stamped and immutable; an unparseable payload
+      // is storage corruption, not a client problem.
+      throw new ApiError(500, "INTERNAL_ERROR");
+    }
+    return {
+      day: row.day,
+      revision: row.revision,
+      releasedAt: row.released_at,
+      payload,
+    };
+  });
+  return jsonResponse(
+    {
+      schemaVersion: "community-daily-read-v1.0",
+      from,
+      to,
+      days,
+    },
+    200,
+    // Every returned revision is immutable, but the latest-revision selection
+    // is not: withdrawal and late-data recomputation both move it. A modest
+    // shared lifetime keeps the read cheap without pinning a stale revision.
+    { "cache-control": "public, max-age=300" },
+  );
+}
+
 const CONTRIBUTION_ID_PATTERN =
   /^contribution:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
@@ -3131,6 +3214,8 @@ async function routeApi(
       return handleStats(request, env);
     case "community_stats":
       return handleCommunityStats(request, env);
+    case "community_daily":
+      return handleCommunityDaily(request, env);
     case "participant":
       if (request.method === "DELETE") return handleDelete(request, env);
       return handleMe(request, env);
@@ -3143,6 +3228,24 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   const url = new URL(request.url);
   const route = matchWorkerRoute(url.pathname);
   try {
+    // Hostname split for the owner-only admin surface. When PUBLIC_ORIGIN is
+    // pinned, the admin UI and /api/v1/admin/* exist solely on
+    // admin.<public host> behind Cloudflare Access; every request there must
+    // carry a verifiable Cf-Access-Jwt-Assertion (defense in depth beneath
+    // the edge policy), and the public origin keeps its deliberate 404s.
+    // Development environments pin no PUBLIC_ORIGIN and are unchanged.
+    const configuredAdminHostname = adminHostname(env);
+    if (configuredAdminHostname !== null) {
+      if (url.hostname === configuredAdminHostname) {
+        await verifyAdminAccessAssertion(request, env);
+        const adminUi = adminUiResponse(request.method, url.pathname);
+        if (adminUi !== null) return adminUi;
+      } else if (isAdminSurfacePath(url.pathname)
+        || (route.kind === "exact"
+          && (route.id === "admin_overview" || route.id === "admin_action"))) {
+        throw new ApiError(404, "NOT_FOUND");
+      }
+    }
     if (route.id === "ready") {
       return noStore(await handleReady(request, env));
     }
@@ -3237,7 +3340,9 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (route.id === "unknown_api") throw new ApiError(404, "NOT_FOUND");
     if (route.id !== "asset") {
       const response = await routeApi(request, env, route.id);
-      return route.id === "community_stats" ? response : noStore(response);
+      return route.id === "community_stats" || route.id === "community_daily"
+        ? response
+        : noStore(response);
     }
     const asset = await env.ASSETS.fetch(request);
     const headers = new Headers(asset.headers);

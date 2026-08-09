@@ -116,6 +116,10 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
     id: "community_stats",
   },
   {
+    pathname: "/api/v1/community/daily",
+    id: "community_daily",
+  },
+  {
     pathname: "/api/v1/me",
     id: "participant",
   },

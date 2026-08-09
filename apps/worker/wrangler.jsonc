@@ -255,7 +255,12 @@
       // the TLS certificates for both hostnames on deploy.
       "routes": [
         { "pattern": "tibotattle.com", "custom_domain": true },
-        { "pattern": "www.tibotattle.com", "custom_domain": true }
+        { "pattern": "www.tibotattle.com", "custom_domain": true },
+        // Owner-only operations hostname. The Worker serves the admin UI and
+        // /api/v1/admin/* exclusively here, behind the Cloudflare Access
+        // application for admin.tibotattle.com (Google login, allow-policy
+        // pinned to the owner). The public hostnames keep their 404s.
+        { "pattern": "admin.tibotattle.com", "custom_domain": true }
       ],
       "preview_urls": false,
       "cache": {
@@ -295,7 +300,14 @@
         // and the audience the returned id_token is verified against.
         "APPLE_SERVICES_ID": "com.usagemonitor.web",
         "APPLE_KEY_ID": "L58X7J2J7A",
-        "APPLE_TEAM_ID": "43RTH622SB"
+        "APPLE_TEAM_ID": "43RTH622SB",
+        // Cloudflare Access binding for admin.tibotattle.com. Both values are
+        // deliberately empty placeholders: until the owner fills the Zero
+        // Trust team domain (for example "yourteam.cloudflareaccess.com") and
+        // the Access application AUD tag, every admin-host request fails
+        // closed with ADMIN_NOT_CONFIGURED. Neither value is a secret.
+        "ACCESS_TEAM_DOMAIN": "",
+        "ACCESS_AUD": ""
       },
       "secrets": {
         // The owner-specific ADMIN_IDENTITY_LINK_KEY is intentionally not a

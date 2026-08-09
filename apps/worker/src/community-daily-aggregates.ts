@@ -269,3 +269,37 @@ export async function readLatestCommunityDailyAggregate(
       LIMIT 1`,
   ).bind(day).first<LatestCommunityDailyAggregateRow>();
 }
+
+export interface PublishedCommunityDailyAggregateRow {
+  day: string;
+  revision: number;
+  payload_json: string;
+  released_at: string;
+}
+
+/**
+ * The public daily read: for every day in the inclusive range, the highest
+ * published revision. Days whose revisions are all withdrawn simply do not
+ * appear — a withdrawal (participant deletion, 0031 trigger) must leave no
+ * readable trace, and the pending rebuild republishes the day as the next
+ * revision when its surviving sources allow.
+ */
+export async function readPublishedCommunityDailyAggregates(
+  db: D1Database,
+  fromDay: string,
+  toDay: string,
+): Promise<PublishedCommunityDailyAggregateRow[]> {
+  const rows = await db.prepare(
+    `SELECT a.day, a.revision, a.payload_json, a.released_at
+       FROM community_daily_aggregates a
+       JOIN (
+         SELECT day, MAX(revision) AS revision
+           FROM community_daily_aggregates
+          WHERE day >= ? AND day <= ? AND release_state = 'published'
+          GROUP BY day
+       ) latest ON latest.day = a.day AND latest.revision = a.revision
+      WHERE a.release_state = 'published'
+      ORDER BY a.day ASC`,
+  ).bind(fromDay, toDay).all<PublishedCommunityDailyAggregateRow>();
+  return rows.results;
+}

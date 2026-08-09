@@ -12,7 +12,10 @@
 // the community table are the same modules the in-app dashboard entry uses.
 
 import { PublicCommunityClient } from "./community-data.js";
-import { renderCommunitySnapshot } from "./community-view.js";
+import {
+  renderCommunityDailySeries,
+  renderCommunitySnapshot,
+} from "./community-view.js";
 import {
   renderInstallerJourney,
 } from "./install-cta.js";
@@ -46,6 +49,8 @@ const publicRequestIdPattern =
 let lastCommunitySnapshotPayload = null;
 let lastCommunitySnapshotFailure = null;
 let communitySnapshotSettled = false;
+let lastCommunityDailyPayload = null;
+let communityDailySettled = false;
 const communityClient = new PublicCommunityClient();
 
 function publicErrorCode(candidate) {
@@ -142,6 +147,15 @@ function renderCommunityResult({ payload, failure = null }) {
   return state;
 }
 
+function renderCommunityDailyResult(payload) {
+  return renderCommunityDailySeries({
+    documentRef: document,
+    container: $("#community-daily-result"),
+    stateNode: $("#community-daily-state"),
+    payload,
+  });
+}
+
 async function loadCommunitySnapshot() {
   let payload = null;
   let failure = null;
@@ -159,9 +173,24 @@ async function loadCommunitySnapshot() {
   renderCommunityResult({ payload, failure });
 }
 
+async function loadCommunityDailySeries() {
+  let payload = null;
+  try {
+    payload = await communityClient.communityDaily();
+  } catch {
+    // A failed request renders the fixed unavailable state; the daily series
+    // repeats no failure identifiers because the weekly panel already does.
+    payload = null;
+  }
+  lastCommunityDailyPayload = payload;
+  communityDailySettled = true;
+  renderCommunityDailyResult(payload);
+}
+
 if (typeof document !== "undefined") {
   renderPublicInstallerJourney();
   void loadCommunitySnapshot();
+  void loadCommunityDailySeries();
   window.addEventListener("tibotattle:locale-change", (event) => {
     setFormattingLocale(event.detail?.formatLocale ?? localization.formatLocale());
     setMessageLocale(event.detail?.locale ?? localization.locale());
@@ -171,6 +200,9 @@ if (typeof document !== "undefined") {
         payload: lastCommunitySnapshotPayload,
         failure: lastCommunitySnapshotFailure,
       });
+    }
+    if (communityDailySettled) {
+      renderCommunityDailyResult(lastCommunityDailyPayload);
     }
     localization.localizeTree();
   });

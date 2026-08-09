@@ -23,6 +23,10 @@ test("reviewed deployment endpoint manifest is internally coherent", () => {
     DEPLOYMENT_ENDPOINTS.public.routeHosts,
     ["tibotattle.com", "www.tibotattle.com"],
   );
+  assert.deepEqual(DEPLOYMENT_ENDPOINTS.admin, {
+    host: "admin.tibotattle.com",
+    origin: "https://admin.tibotattle.com",
+  });
   assert.equal(assertDeploymentEndpoints(), DEPLOYMENT_ENDPOINTS);
 });
 
@@ -30,12 +34,17 @@ test("Worker endpoint projection rejects an independent public origin", () => {
   const configuration = {
     env: {
       production: {
-        routes: DEPLOYMENT_ENDPOINTS.public.routeHosts.map((pattern) => ({
+        routes: [
+          ...DEPLOYMENT_ENDPOINTS.public.routeHosts,
+          DEPLOYMENT_ENDPOINTS.admin.host,
+        ].map((pattern) => ({
           custom_domain: true,
           pattern,
         })),
         vars: {
           PUBLIC_ORIGIN: DEPLOYMENT_ENDPOINTS.public.origin,
+          ACCESS_TEAM_DOMAIN: "",
+          ACCESS_AUD: "",
         },
       },
     },
@@ -44,6 +53,35 @@ test("Worker endpoint projection rejects an independent public origin", () => {
   configuration.env.production.vars.PUBLIC_ORIGIN = "https://other.example";
   assert.throws(
     () => validateWorkerDeploymentEndpoints(configuration),
+    { code: "DEPLOYMENT_ENDPOINTS_MISMATCH" },
+  );
+  configuration.env.production.vars.PUBLIC_ORIGIN =
+    DEPLOYMENT_ENDPOINTS.public.origin;
+
+  // Dropping the admin custom domain or its Access variable slots must fail:
+  // the admin surface only ships alongside its Zero Trust binding.
+  const withoutAdminRoute = {
+    env: {
+      production: {
+        ...configuration.env.production,
+        routes: configuration.env.production.routes.slice(0, 2),
+      },
+    },
+  };
+  assert.throws(
+    () => validateWorkerDeploymentEndpoints(withoutAdminRoute),
+    { code: "DEPLOYMENT_ENDPOINTS_MISMATCH" },
+  );
+  const withoutAccessVars = {
+    env: {
+      production: {
+        ...configuration.env.production,
+        vars: { PUBLIC_ORIGIN: DEPLOYMENT_ENDPOINTS.public.origin },
+      },
+    },
+  };
+  assert.throws(
+    () => validateWorkerDeploymentEndpoints(withoutAccessVars),
     { code: "DEPLOYMENT_ENDPOINTS_MISMATCH" },
   );
 });
@@ -89,10 +127,11 @@ test("checked-in deployment endpoint consumers match the reviewed manifest", asy
     objectPrefix: "releases",
     r2Bucket: DEPLOYMENT_ENDPOINTS.sparkle.r2Bucket,
   });
-  assert.deepEqual(
-    checked.worker.routeHosts,
-    DEPLOYMENT_ENDPOINTS.public.routeHosts,
-  );
+  assert.deepEqual(checked.worker.routeHosts, [
+    ...DEPLOYMENT_ENDPOINTS.public.routeHosts,
+    DEPLOYMENT_ENDPOINTS.admin.host,
+  ]);
+  assert.equal(checked.worker.adminHost, DEPLOYMENT_ENDPOINTS.admin.host);
   assert.deepEqual(checked.gates.checkedScripts, [
     "deploy:dry",
     "production:deploy",

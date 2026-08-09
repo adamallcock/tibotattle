@@ -2,7 +2,10 @@
 // website can show it honestly. The local app and public site render it from
 // this single module.
 
-import { normalizeCommunitySnapshot } from "./community-data.js";
+import {
+  normalizeCommunityDailySeries,
+  normalizeCommunitySnapshot,
+} from "./community-data.js";
 import {
   compact,
   createDomHelpers,
@@ -60,6 +63,140 @@ const COMMUNITY_METRIC_MESSAGE_KEYS = Object.freeze({
   outputCombinedTokens: "community.metric.combinedOutput",
   toolUnits: "community.metric.toolUnits",
 });
+
+/**
+ * Fixed copy for the day-partitioned series states. Same policy as the
+ * weekly snapshot copy above: no degraded state may leave an empty panel.
+ */
+export const COMMUNITY_DAILY_STATE_COPY = Object.freeze({
+  service_unavailable:
+    "Daily community activity is temporarily unavailable. This does not tell us whether any day has been published.",
+  unsupported_schema:
+    "The daily community series cannot be displayed safely with this version of TiboTattle.",
+  none_published:
+    "No daily community activity has been published for the year window yet.",
+});
+
+const COMMUNITY_DAILY_STATE_KEYS = Object.freeze({
+  service_unavailable: "community.daily.state.serviceUnavailable",
+  unsupported_schema: "community.daily.state.unsupportedSchema",
+  none_published: "community.daily.state.nonePublished",
+});
+
+const COMMUNITY_DAILY_COLUMN_KEYS = Object.freeze([
+  "community.daily.day",
+  "community.metric.usageEvents",
+  "community.daily.quotaObservations",
+  "community.daily.contributingDevices",
+  "community.metric.combinedOutput",
+  "community.daily.revision",
+  "community.released",
+]);
+
+/**
+ * Renders the day-partitioned community series: the latest published
+ * revision per day inside the requested year window. Revision freshness is
+ * first-class — every row carries its revision and release time, and the
+ * headline names the latest published day's revision and age — because a day
+ * here is never sealed: late contributions replace it with a new revision.
+ */
+export function renderCommunityDailySeries({
+  documentRef,
+  container,
+  stateNode = null,
+  payload,
+  now = Date.now(),
+}) {
+  const { clear, node } = createDomHelpers(documentRef);
+  const locale = documentRef?.documentElement?.lang ?? "en-US";
+  const t = (key, values = {}) => translate(key, values, locale);
+  clear(container);
+  const series = normalizeCommunityDailySeries(payload);
+  if (stateNode) {
+    stateNode.textContent = series.state === "published"
+      ? t("community.daily.seriesAvailable")
+      : t("community.daily.seriesUnavailable");
+    stateNode.className = series.state === "published"
+      ? "evidence-chip"
+      : "evidence-chip neutral";
+  }
+  if (series.state !== "published") {
+    container.append(node("p", "", t(COMMUNITY_DAILY_STATE_KEYS[series.state])));
+    return series.state;
+  }
+
+  const latest = series.days[series.days.length - 1];
+  const quality = node("dl", "snapshot-quality-grid");
+  for (const [term, value] of [
+    [t("community.daily.latestDay"), formatLocal(latest.day, { dateOnly: true })],
+    [t("community.daily.revision"), `r${latest.revision}`],
+    [t("community.released"), formatLocal(latest.releasedAt)],
+    [
+      t("community.daily.revisionAge"),
+      formatAge(Math.max(0, (now - Date.parse(latest.releasedAt)) / 1_000)),
+    ],
+    [t("community.daily.publishedDays"), compact(series.days.length)],
+  ]) {
+    const item = node("div");
+    item.append(node("dt", "", term), node("dd", "", value));
+    quality.append(item);
+  }
+  container.append(quality);
+  container.append(node(
+    "p",
+    "snapshot-disclosure",
+    t("community.daily.recomputeNote"),
+  ));
+
+  const breakdown = node("details", "journey-disclosure snapshot-breakdown");
+  const summary = node("summary");
+  summary.append(node(
+    "span",
+    "",
+    t("community.daily.detailedDays", { count: compact(series.days.length) }),
+  ));
+  breakdown.append(summary);
+  const wrap = node("div", "table-wrap snapshot-table");
+  const table = documentRef.createElement("table");
+  const caption = node("caption", "sr-only", t("community.daily.metricsCaption"));
+  const thead = documentRef.createElement("thead");
+  const header = documentRef.createElement("tr");
+  for (const key of COMMUNITY_DAILY_COLUMN_KEYS) {
+    const th = documentRef.createElement("th");
+    th.scope = "col";
+    th.textContent = t(key);
+    header.append(th);
+  }
+  thead.append(header);
+  const tbody = documentRef.createElement("tbody");
+  // Most recent day first: freshness is what a reader scans for.
+  for (const day of [...series.days].reverse()) {
+    const row = documentRef.createElement("tr");
+    const identity = documentRef.createElement("th");
+    identity.scope = "row";
+    identity.setAttribute("data-i18n-skip", "");
+    identity.textContent = day.day;
+    row.append(identity);
+    for (const value of [
+      compact(day.totals.usageEvents),
+      compact(day.totals.quotaObservations),
+      compact(day.totals.contributingDevices),
+      compact(day.totals.outputCombinedTokens),
+      `r${day.revision}`,
+      formatLocal(day.releasedAt),
+    ]) {
+      const td = documentRef.createElement("td");
+      td.textContent = value;
+      row.append(td);
+    }
+    tbody.append(row);
+  }
+  table.append(caption, thead, tbody);
+  wrap.append(table);
+  breakdown.append(wrap);
+  container.append(breakdown);
+  return series.state;
+}
 
 /**
  * The current weekly contract publishes activity cells, not allowance

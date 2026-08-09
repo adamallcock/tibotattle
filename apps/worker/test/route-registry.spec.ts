@@ -44,12 +44,13 @@ const EXACT_ROUTES = [
   ["/api/v1/me/insights", "participant_stats"],
   ["/api/v1/stats/aggregate", "community_stats"],
   ["/api/v1/community/insights", "community_stats"],
+  ["/api/v1/community/daily", "community_daily"],
   ["/api/v1/me", "participant"],
 ] as const;
 
 describe("Worker route registry", () => {
   it("recognizes every exact route and preserves stable log classifications", () => {
-    expect(EXACT_ROUTES).toHaveLength(36);
+    expect(EXACT_ROUTES).toHaveLength(37);
     expect(WORKER_ROUTE_POLICY).toEqual(
       EXACT_ROUTES.map(([pathname, id]) => ({ pathname, id })),
     );

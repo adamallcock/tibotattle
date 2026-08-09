@@ -1,6 +1,7 @@
 import { JSON_HEADERS } from "./constants";
 
 export type ErrorCode =
+  | "ACCESS_REQUIRED"
   | "ACCOUNT_SCOPED_CONFIGURATION_INVALID"
   | "ACCOUNT_SCOPED_INGEST_DISABLED"
   | "ACCOUNT_SCOPED_LOCAL_ONLY"

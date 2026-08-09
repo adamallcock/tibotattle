@@ -46,8 +46,19 @@ const sparkleUpdateOriginURL = canonicalHttpsOrigin(
   sparkleUpdateOrigin,
   "Sparkle update origin",
 );
+// The owner-only operations hostname. It is served by the same Worker but is
+// deliberately not a public route host: the admin surface exists only here,
+// behind the Cloudflare Access application for this exact hostname.
+const adminOriginURL = canonicalHttpsOrigin(
+  `https://admin.${publicOriginURL.host}`,
+  "admin origin",
+);
 
 export const DEPLOYMENT_ENDPOINTS = Object.freeze({
+  admin: Object.freeze({
+    host: adminOriginURL.host,
+    origin: adminOriginURL.origin,
+  }),
   public: Object.freeze({
     origin: publicOriginURL.origin,
     routeHosts: Object.freeze([
@@ -83,6 +94,16 @@ export function assertDeploymentEndpoints(
     [reviewedPublicOrigin.host, `www.${reviewedPublicOrigin.host}`],
     "public route hosts",
   );
+  const reviewedAdminOrigin = canonicalHttpsOrigin(
+    endpoints.admin?.origin,
+    "admin origin",
+  );
+  if (endpoints.admin?.host !== `admin.${reviewedPublicOrigin.host}`
+      || reviewedAdminOrigin.host !== endpoints.admin.host) {
+    throw new TypeError(
+      "admin host must be the admin subdomain of the public origin",
+    );
+  }
   if (endpoints.sparkle?.appcastURL
       !== new URL("/appcast.xml", reviewedSparkleOrigin).href) {
     throw new TypeError("Sparkle appcast URL must be derived from its origin");

@@ -257,8 +257,22 @@ export function validateWorkerDeploymentEndpoints(
   }
   const routeHosts = production.routes?.map((route) =>
     route?.custom_domain === true ? route.pattern : null);
-  exactArray(routeHosts, endpoints.public.routeHosts, "Worker custom domains");
+  // The reviewed production custom domains are the public hosts plus the
+  // admin hostname the Cloudflare Access application protects.
+  exactArray(
+    routeHosts,
+    [...endpoints.public.routeHosts, endpoints.admin.host],
+    "Worker custom domains",
+  );
+  // The Access binding variables must exist in production, even as empty
+  // fail-closed placeholders, so the admin hostname can never route without
+  // a reviewed Zero Trust configuration slot.
+  if (typeof production.vars?.ACCESS_TEAM_DOMAIN !== "string"
+      || typeof production.vars?.ACCESS_AUD !== "string") {
+    fail("Worker production vars must declare ACCESS_TEAM_DOMAIN and ACCESS_AUD");
+  }
   return Object.freeze({
+    adminHost: endpoints.admin.host,
     publicOrigin: production.vars.PUBLIC_ORIGIN,
     routeHosts: Object.freeze([...routeHosts]),
   });

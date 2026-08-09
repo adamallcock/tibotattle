@@ -233,8 +233,131 @@ export function normalizeCommunitySnapshot(payload) {
   };
 }
 
-async function fetchCommunitySnapshot(fetchImpl) {
-  const response = await fetchImpl(`${COMMUNITY_ROOT}/stats/aggregate`, {
+export const COMMUNITY_DAILY_READ_SCHEMA_VERSION = "community-daily-read-v1.0";
+const COMMUNITY_DAILY_AGGREGATE_SCHEMA_VERSION =
+  "community-daily-aggregate-v1.0";
+const COMMUNITY_DAILY_POLICY_VERSION = "community-daily-v1.0";
+// Standing rule: read windows are absent or a full year, never
+// convenience-sized. The endpoint's inclusive bound is 366 days.
+export const COMMUNITY_DAILY_WINDOW_DAYS = 366;
+const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
+const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
+const COMMUNITY_DAILY_TOTAL_FIELDS = Object.freeze([
+  "contributingParticipants",
+  "contributingDevices",
+  "usageEvents",
+  "quotaObservations",
+  "sessionDimensions",
+  "inputUncachedTokens",
+  "inputCacheReadTokens",
+  "inputCacheWriteTokens",
+  "outputTextTokens",
+  "outputReasoningTokens",
+  "outputCombinedTokens",
+]);
+
+function dayString(value) {
+  return typeof value === "string" && DAY_PATTERN.test(value) ? value : null;
+}
+
+/**
+ * The inclusive year window ending today (UTC): 366 days, the endpoint's
+ * exact bound, so late-arriving history recomputations stay visible instead
+ * of a shorter convenience window hiding them.
+ */
+export function communityDailyWindow(nowMs = Date.now()) {
+  const to = new Date(nowMs).toISOString().slice(0, 10);
+  const from = new Date(
+    nowMs - (COMMUNITY_DAILY_WINDOW_DAYS - 1) * MILLISECONDS_PER_DAY,
+  ).toISOString().slice(0, 10);
+  return { from, to };
+}
+
+function normalizedDailyTotals(candidate) {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return null;
+  }
+  const totals = {};
+  for (const field of COMMUNITY_DAILY_TOTAL_FIELDS) {
+    const value = finite(candidate[field], null);
+    if (value === null || !Number.isSafeInteger(value) || value < 0) {
+      return null;
+    }
+    totals[field] = value;
+  }
+  return totals;
+}
+
+function normalizedDailyDay(candidate) {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return null;
+  }
+  const day = dayString(candidate.day);
+  const revision = finite(candidate.revision, null);
+  const releasedAt = text(candidate.releasedAt, "");
+  const payload = candidate.payload;
+  if (day === null
+      || !Number.isSafeInteger(revision)
+      || revision < 1
+      || releasedAt === ""
+      || !payload
+      || typeof payload !== "object"
+      || Array.isArray(payload)) {
+    return null;
+  }
+  // The per-day payload is the immutable published revision. The read wrapper
+  // repeats day/revision; a disagreement means the response cannot be trusted.
+  if (payload.schemaVersion !== COMMUNITY_DAILY_AGGREGATE_SCHEMA_VERSION
+      || payload.policyVersion !== COMMUNITY_DAILY_POLICY_VERSION
+      || payload.immutableRevision !== true
+      || payload.recomputesOnLateData !== true
+      || payload.day !== day
+      || payload.revision !== revision) {
+    return null;
+  }
+  const totals = normalizedDailyTotals(payload.totals);
+  if (totals === null) return null;
+  return { day, revision, releasedAt, totals };
+}
+
+/**
+ * Normalizes one /community/daily response into a closed, render-safe shape.
+ * Anything the page would have to guess about — schema drift, invalid days,
+ * out-of-order series — collapses to `unsupported_schema` rather than a
+ * partially trusted render.
+ */
+export function normalizeCommunityDailySeries(payload) {
+  if (!payload) return { state: "service_unavailable", days: [] };
+  const from = dayString(payload.from);
+  const to = dayString(payload.to);
+  if (payload.schemaVersion !== COMMUNITY_DAILY_READ_SCHEMA_VERSION
+      || from === null
+      || to === null
+      || !Array.isArray(payload.days)
+      || payload.days.length > COMMUNITY_DAILY_WINDOW_DAYS) {
+    return { state: "unsupported_schema", days: [] };
+  }
+  const days = [];
+  for (const candidate of payload.days) {
+    const normalized = normalizedDailyDay(candidate);
+    if (normalized === null
+        || normalized.day < from
+        || normalized.day > to
+        || (days.length > 0 && normalized.day <= days[days.length - 1].day)) {
+      return { state: "unsupported_schema", days: [] };
+    }
+    days.push(normalized);
+  }
+  return {
+    state: days.length === 0 ? "none_published" : "published",
+    from,
+    to,
+    days,
+  };
+}
+
+async function readPublicJson(fetchImpl, path) {
+  const response = await fetchImpl(path, {
     headers: { Accept: "application/json" },
   });
   if (!response.ok) {
@@ -255,6 +378,18 @@ async function fetchCommunitySnapshot(fetchImpl) {
   return response.status === 204 ? null : response.json();
 }
 
+function fetchCommunitySnapshot(fetchImpl) {
+  return readPublicJson(fetchImpl, `${COMMUNITY_ROOT}/stats/aggregate`);
+}
+
+function fetchCommunityDaily(fetchImpl, nowMs) {
+  const { from, to } = communityDailyWindow(nowMs);
+  return readPublicJson(
+    fetchImpl,
+    `${COMMUNITY_ROOT}/community/daily?from=${from}&to=${to}`,
+  );
+}
+
 export class PublicCommunityClient {
   constructor({ fetchImpl = globalThis.fetch } = {}) {
     if (typeof fetchImpl !== "function") {
@@ -266,5 +401,10 @@ export class PublicCommunityClient {
   communityStats() {
     const fetchImpl = this.fetchImpl;
     return fetchCommunitySnapshot(fetchImpl);
+  }
+
+  communityDaily({ nowMs = Date.now() } = {}) {
+    const fetchImpl = this.fetchImpl;
+    return fetchCommunityDaily(fetchImpl, nowMs);
   }
 }

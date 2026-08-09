@@ -3,11 +3,16 @@ import { test } from "node:test";
 import { readFile } from "node:fs/promises";
 
 import {
+  COMMUNITY_DAILY_READ_SCHEMA_VERSION,
+  COMMUNITY_DAILY_WINDOW_DAYS,
   COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
   PublicCommunityClient,
+  communityDailyWindow,
+  normalizeCommunityDailySeries,
 } from "../public/community-data.js";
 import {
   COMMUNITY_METRIC_LABELS,
+  renderCommunityDailySeries,
   renderCommunitySnapshot,
 } from "../public/community-view.js";
 import {
@@ -244,10 +249,10 @@ test("the public site presents only the install call to action and the community
   }
 });
 
-test("the public community client exposes one read-only aggregate request", async () => {
+test("the public community client exposes only read-only aggregate requests", async () => {
   assert.deepEqual(
     Object.getOwnPropertyNames(PublicCommunityClient.prototype).sort(),
-    ["communityStats", "constructor"],
+    ["communityDaily", "communityStats", "constructor"],
   );
   const calls = [];
   const payload = { releaseStatus: "not_yet_published" };
@@ -564,6 +569,246 @@ test("a published community week renders its support gate, provenance, and cells
     bare.descendants().some(({ tag }) => tag === "table"),
     true,
   );
+});
+
+function publishedDailyDay(day, revision, overrides = {}) {
+  return {
+    day,
+    revision,
+    releasedAt: "2026-08-08T01:00:00.000Z",
+    payload: {
+      schemaVersion: "community-daily-aggregate-v1.0",
+      aggregateId: `community-daily:${day}:r${revision}`,
+      day,
+      revision,
+      releasedAt: "2026-08-08T01:00:00.000Z",
+      immutableRevision: true,
+      recomputesOnLateData: true,
+      policyVersion: "community-daily-v1.0",
+      suppression: "none_daily_grain_by_owner_decision",
+      totals: {
+        contributingParticipants: 3,
+        contributingDevices: 4,
+        usageEvents: 120,
+        quotaObservations: 6,
+        sessionDimensions: 2,
+        inputUncachedTokens: 1000,
+        inputCacheReadTokens: 0,
+        inputCacheWriteTokens: 0,
+        outputTextTokens: 400,
+        outputReasoningTokens: 100,
+        outputCombinedTokens: 500,
+      },
+      cellsTruncated: false,
+      cells: [],
+      ...overrides.payload,
+    },
+    ...Object.fromEntries(
+      Object.entries(overrides).filter(([key]) => key !== "payload"),
+    ),
+  };
+}
+
+function publishedDailySeries(overrides = {}) {
+  return {
+    schemaVersion: COMMUNITY_DAILY_READ_SCHEMA_VERSION,
+    from: "2025-08-08",
+    to: "2026-08-08",
+    days: [
+      publishedDailyDay("2026-08-06", 1),
+      publishedDailyDay("2026-08-07", 2),
+    ],
+    ...overrides,
+  };
+}
+
+test("the public daily client requests exactly the inclusive year window", async () => {
+  const calls = [];
+  const payload = publishedDailySeries();
+  const client = new PublicCommunityClient({
+    fetchImpl: async (...args) => {
+      calls.push(args);
+      return { ok: true, status: 200, json: async () => payload };
+    },
+  });
+  const nowMs = Date.parse("2026-08-08T12:00:00.000Z");
+  assert.equal(await client.communityDaily({ nowMs }), payload);
+  const { from, to } = communityDailyWindow(nowMs);
+  assert.equal(to, "2026-08-08");
+  assert.equal(
+    (Date.parse(`${to}T00:00:00.000Z`) - Date.parse(`${from}T00:00:00.000Z`))
+      / 86_400_000
+      + 1,
+    COMMUNITY_DAILY_WINDOW_DAYS,
+    "the requested window is the endpoint's full inclusive bound, never a convenience size",
+  );
+  assert.deepEqual(calls, [[
+    `/api/v1/community/daily?from=${from}&to=${to}`,
+    { headers: { Accept: "application/json" } },
+  ]]);
+});
+
+test("the daily series normalizer accepts only the closed published contract", () => {
+  assert.equal(
+    normalizeCommunityDailySeries(null).state,
+    "service_unavailable",
+  );
+  assert.equal(
+    normalizeCommunityDailySeries({ schemaVersion: "community-daily-read-v0.9" })
+      .state,
+    "unsupported_schema",
+  );
+  assert.equal(
+    normalizeCommunityDailySeries(publishedDailySeries({ days: [] })).state,
+    "none_published",
+  );
+
+  const published = normalizeCommunityDailySeries(publishedDailySeries());
+  assert.equal(published.state, "published");
+  assert.deepEqual(
+    published.days.map(({ day, revision }) => ({ day, revision })),
+    [
+      { day: "2026-08-06", revision: 1 },
+      { day: "2026-08-07", revision: 2 },
+    ],
+  );
+  assert.equal(published.days[1].totals.usageEvents, 120);
+
+  for (const [label, hostile] of [
+    [
+      "out-of-order days",
+      publishedDailySeries({
+        days: [
+          publishedDailyDay("2026-08-07", 2),
+          publishedDailyDay("2026-08-06", 1),
+        ],
+      }),
+    ],
+    [
+      "wrapper and payload revision disagreement",
+      publishedDailySeries({
+        days: [publishedDailyDay("2026-08-06", 2, { payload: { revision: 1 } })],
+      }),
+    ],
+    [
+      "mutable revision claim",
+      publishedDailySeries({
+        days: [
+          publishedDailyDay("2026-08-06", 1, {
+            payload: { immutableRevision: false },
+          }),
+        ],
+      }),
+    ],
+    [
+      "negative total",
+      publishedDailySeries({
+        days: [
+          publishedDailyDay("2026-08-06", 1, {
+            payload: {
+              totals: {
+                ...publishedDailyDay("2026-08-06", 1).payload.totals,
+                usageEvents: -1,
+              },
+            },
+          }),
+        ],
+      }),
+    ],
+    [
+      "day outside the requested range",
+      publishedDailySeries({ days: [publishedDailyDay("2027-01-01", 1)] }),
+    ],
+  ]) {
+    assert.equal(
+      normalizeCommunityDailySeries(hostile).state,
+      "unsupported_schema",
+      label,
+    );
+  }
+});
+
+test("a published daily series renders revision freshness, latest-first", () => {
+  const documentRef = fakeDocument();
+  const container = documentRef.createElement("div");
+  const stateNode = documentRef.createElement("span");
+  const state = renderCommunityDailySeries({
+    documentRef,
+    container,
+    stateNode,
+    payload: publishedDailySeries(),
+    now: Date.parse("2026-08-08T03:00:00.000Z"),
+  });
+  assert.equal(state, "published");
+  assert.equal(stateNode.textContent, "Daily series available");
+  assert.match(container.text, /Latest published day/u);
+  assert.match(container.text, /r2/u);
+  assert.match(container.text, /Revision age/u);
+  assert.match(container.text, /Published days in window/u);
+  assert.match(container.text, /never edit history/u);
+  const table = container.descendants().find(({ tag }) => tag === "table");
+  assert.ok(table, "a published daily series renders its table");
+  const columnLabels = table
+    .descendants()
+    .filter((element) => element.tag === "th")
+    .map(({ textContent }) => textContent);
+  for (const label of [
+    "Day",
+    "Usage events",
+    "Quota observations",
+    "Contributing devices",
+    "Combined output",
+    "Revision",
+    "Released",
+  ]) {
+    assert.equal(columnLabels.includes(label), true, label);
+  }
+  const bodyRows = table
+    .descendants()
+    .filter((element) => element.tag === "tr")
+    .slice(1);
+  assert.equal(bodyRows.length, 2);
+  assert.equal(bodyRows[0].children[0].textContent, "2026-08-07");
+  assert.equal(bodyRows[1].children[0].textContent, "2026-08-06");
+  assert.match(bodyRows[0].text, /r2/u);
+});
+
+test("the daily series degrades honestly without a service or published days", () => {
+  for (const [payload, expectedState, marker] of [
+    [null, "service_unavailable", /temporarily unavailable/u],
+    [{ schemaVersion: "wrong" }, "unsupported_schema", /cannot be displayed safely/u],
+    [publishedDailySeries({ days: [] }), "none_published", /No daily community activity/u],
+  ]) {
+    const documentRef = fakeDocument();
+    const container = documentRef.createElement("div");
+    const stateNode = documentRef.createElement("span");
+    const state = renderCommunityDailySeries({
+      documentRef,
+      container,
+      stateNode,
+      payload,
+    });
+    assert.equal(state, expectedState);
+    assert.equal(stateNode.textContent, "Daily series unavailable");
+    assert.equal(stateNode.className, "evidence-chip neutral");
+    assert.match(container.text, marker, expectedState);
+    assert.equal(
+      container.descendants().some(({ tag }) => tag === "table"),
+      false,
+      expectedState,
+    );
+  }
+});
+
+test("the public site hosts the daily series containers", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
+  assert.match(html, /id="community-daily-result"/u);
+  assert.match(html, /id="community-daily-state"/u);
+  assert.match(html, /Daily activity series/u);
+  assert.match(html, /latest published revision/u);
+  const source = await readFile(SITE_SOURCE, "utf8");
+  assert.match(source, /renderCommunityDailySeries/u);
+  assert.match(source, /communityDaily\(\)/u);
 });
 
 test("the install card refuses a partially injected release", () => {

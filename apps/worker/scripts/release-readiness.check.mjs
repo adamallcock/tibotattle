@@ -159,6 +159,12 @@ test("canonical endpoint drift fails closed without probing or echoing drifted v
     "other.example.test",
     "www.other.example.test",
   ];
+  // Keep the drifted manifest internally coherent (admin follows the public
+  // host) so this test still exercises the drift path, not shape validation.
+  endpoints.admin = {
+    host: "admin.other.example.test",
+    origin: "https://admin.other.example.test",
+  };
   let fetchCalls = 0;
   const result = await verifyReleaseReadiness({
     endpoints,
