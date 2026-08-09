@@ -629,6 +629,19 @@ export const WEB_MESSAGES = Object.freeze({
     "已核准——你的历史将自动同步。",
     "Aprobado: tu historial se sincroniza automáticamente.",
   ],
+  // The pending re-pair's two honest stage lines (owner-reported
+  // contradictory state, 2026-08-08): "done · syncing" may not render while
+  // the approve card is asking for a sign-in.
+  "journey.community.signInAgain": [
+    "Sign in again to finish reconnecting this Mac.",
+    "请重新登录以完成这台 Mac 的重新连接。",
+    "Inicia sesión de nuevo para terminar de reconectar este Mac.",
+  ],
+  "journey.community.refreshingAuthority": [
+    "Refreshing this Mac's upload authorization…",
+    "正在刷新这台 Mac 的上传授权…",
+    "Actualizando la autorización de subida de este Mac…",
+  ],
   "syncStatus.verifyingSummary": [
     "Verifying the prepared summary on this Mac. Nothing is sent while it is checked.",
     "正在这台 Mac 上校验已准备的摘要。检查期间不会发送任何内容。",

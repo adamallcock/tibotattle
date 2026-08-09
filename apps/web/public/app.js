@@ -7760,6 +7760,17 @@ function renderCommunityJourney() {
     } else {
       stage("community", "waiting", "journey.community.waitingIndex");
     }
+  } else if (incrementalConsentApproved && incrementalGrantRejected()) {
+    // The transparent re-pair is pending, so this stage must not claim
+    // "done · syncing" while the approve card is asking for a sign-in
+    // (owner-reported contradictory state, 2026-08-08). One truth: a missing
+    // sign-in is the reader's action; otherwise the authorization refresh is
+    // simply in flight.
+    if (hostedSignInRequired()) {
+      stage("community", "action", "journey.community.signInAgain");
+    } else {
+      stage("community", "progress", "journey.community.refreshingAuthority");
+    }
   } else if (incrementalConsentApproved) {
     stage("community", "done", "journey.community.syncing");
   } else if (hostedEnrollmentIsPaused()) {
@@ -8074,7 +8085,16 @@ async function approveIncrementalContribution() {
         }
       });
       let pairing;
-      if (communitySession?.csrfToken) {
+      // A pending sign-in proof ALWAYS establishes its own fresh session
+      // first (owner-reported resume bug, 2026-08-08): after a
+      // session-rejected repair, any stored csrfToken is either gone or
+      // exactly the credential the service just refused, and minting the
+      // pairing with it burned the sign-in behind repeated AUTH_REQUIRED
+      // failures the user had already fixed by signing in. The stored
+      // session mints directly only when NO proof is in hand, so the
+      // post-sign-in order is fixed: enroll with the proof, adopt the
+      // session it returns, then mint and claim the v1.0 pairing.
+      if (hostedIdentity === null && communitySession?.csrfToken) {
         pairing = await contributionConnectStep(
           "hosted_enrollment",
           status,
@@ -8299,6 +8319,11 @@ function contributionSessionWasRejected(error) {
 function renderContributionSessionSignInGate(status) {
   hostedIdentity = null;
   communityDevicePairedV1 = false;
+  // Any auth rejection consumes this load's one automatic attempt: after the
+  // gate, only an explicit user action — completing a sign-in, or pressing
+  // Review and approve — may run the ceremony again (owner-reported repeated
+  // AUTH_REQUIRED burst, 2026-08-08).
+  incrementalRepairAttempted = true;
   // Clearing the session re-renders the approve surface, whose gate line now
   // asks for the sign-in; the guarded auto-repair cannot re-run without a
   // session, so this cannot loop.
@@ -8306,6 +8331,16 @@ function renderContributionSessionSignInGate(status) {
   status.hidden = false;
   status.className = "participant-action-status";
   setLocalizedText(status, "consent.signInAgainToFinish");
+  // One truth about being signed in (owner-reported contradictory state,
+  // 2026-08-08): the identity card's status line is rewritten too, so a
+  // stale "Signed in with Google" sentence cannot sit beside a "Not signed
+  // in" chip after the proof and session were cleared.
+  const identityStatus = $("#identity-signin-status");
+  if (identityStatus) {
+    identityStatus.hidden = false;
+    identityStatus.className = "participant-action-status";
+    setLocalizedText(identityStatus, "consent.signInAgainToFinish");
+  }
   renderHostedIdentity();
 }
 

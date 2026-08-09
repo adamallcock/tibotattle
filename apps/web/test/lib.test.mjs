@@ -7814,3 +7814,276 @@ test("the signed AUC stat integrates observed-minus-expected trapezoids over hou
   assert.equal(scope.formatSignedPpHours(4), "[format.ppHours] +4.0");
   assert.equal(scope.formatSignedPpHours(-2.5), "[format.ppHours] -2.5");
 });
+
+// ---------------------------------------------------------------------------
+// The post-sign-in resume drives the real client over a fake service
+// (owner-reported resume bug, 2026-08-08): after a session-rejected repair,
+// the completed sign-in proof must enroll FIRST, adopt the fresh session, and
+// only then mint and claim the v1.0 pairing — never mint against the stored
+// csrfToken the service just refused.
+// ---------------------------------------------------------------------------
+
+async function loadContributionCeremony(harness) {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("async function approveIncrementalContribution() {");
+  const end = appSource.indexOf("async function loadCommunityResults() {");
+  assert.ok(start >= 0 && end > start, "the contribution ceremony is available");
+  const section = appSource.slice(start, end);
+
+  const elements = new Map();
+  const element = (id) => {
+    if (!elements.has(id)) {
+      elements.set(id, {
+        id,
+        hidden: true,
+        className: "",
+        textContent: "",
+        localizedKeys: [],
+        replaceChildren() {},
+        append() {},
+      });
+    }
+    return elements.get(id);
+  };
+  harness.elements = element;
+  harness.sessions = [];
+  harness.localCalls = [];
+  harness.fetchCalls = [];
+
+  const fakeFetch = async (url, options = {}) => {
+    const headers = options.headers ?? {};
+    harness.fetchCalls.push({
+      url,
+      method: options.method ?? "GET",
+      csrf: headers["X-Usage-Monitor-CSRF"] ?? null,
+      body: typeof options.body === "string" ? JSON.parse(options.body) : null,
+    });
+    const scripted = harness.responses.shift();
+    assert.ok(scripted, `an unscripted request reached the fake service: ${url}`);
+    return {
+      ok: scripted.status < 400,
+      status: scripted.status,
+      json: async () => scripted.payload,
+    };
+  };
+  const communityClient = new CommunityClient({
+    fetchImpl: fakeFetch,
+    getCsrfToken: () => harness.session?.csrfToken ?? null,
+    getParticipantId: () => harness.session?.participantId ?? null,
+  });
+  const localClient = {
+    async pairContributionDevice(code) {
+      harness.localCalls.push({ pairContributionDevice: code });
+      return { status: "paired", expiresAt: "2026-08-09T00:00:00.000Z" };
+    },
+  };
+
+  return Function(
+    "harness", "$", "setProductText", "setLocalizedText",
+    "renderContributionActionState", "renderHostedIdentity",
+    "localCompanionHealth", "communityClient", "localClient",
+    "loadIncrementalSyncStatus", "scheduleIncrementalSyncStatusPoll",
+    "showFailure", "describeFailure", "formatLocal", "t", "node",
+    `let incrementalConsentBusy = false;
+let communityConnectBusy = false;
+let communityDevicePaired = false;
+let communityDevicePairedV1 = false;
+let incrementalRepairAttempted = false;
+let hostedIdentity = harness.identity;
+let communitySession = harness.session;
+let incrementalConsentApproved = harness.approved;
+let contributionSyncExactReview = null;
+function hasCommunitySession() {
+  return typeof communitySession?.csrfToken === "string"
+    && communitySession.csrfToken.length > 0;
+}
+function setCommunitySession(value) {
+  communitySession = value;
+  harness.session = value;
+  harness.sessions.push(value ? { ...value } : null);
+  if (!value) {
+    communityDevicePaired = false;
+    renderContributionActionState();
+  }
+}
+function incrementalSyncCapabilityAdvertised() { return true; }
+function incrementalGrantRejected() { return harness.grantRejected; }
+function hostedEnrollmentIsPaused() { return false; }
+function hostedSignInRequired() { return false; }
+${section}
+return {
+  approveIncrementalContribution,
+  maybeRepairIncrementalAuthorization,
+  resumeContributionCeremonyAfterSignIn,
+  state: () => ({
+    hostedIdentity,
+    communitySession,
+    communityDevicePairedV1,
+    incrementalConsentApproved,
+    incrementalRepairAttempted,
+    incrementalConsentBusy,
+  }),
+};`,
+  )(
+    harness,
+    element,
+    (target, text) => { target.textContent = text; },
+    (target, key, values = {}) => {
+      target.localizedKeys.push(key);
+      target.textContent = `[${key}] ${JSON.stringify(values)}`;
+    },
+    () => { harness.renders = (harness.renders ?? 0) + 1; },
+    () => { harness.identityRenders = (harness.identityRenders ?? 0) + 1; },
+    { capabilities: { contributionDevicePairing: true } },
+    communityClient,
+    localClient,
+    async () => {},
+    () => {},
+    async () => {},
+    async () => ({ text: "described" }),
+    (value) => String(value),
+    (key) => `[${key}]`,
+    () => ({ append() {}, textContent: "" }),
+  );
+}
+
+async function settleCeremony(scope, harness, { untilFetchCount }) {
+  for (let tick = 0; tick < 40; tick += 1) {
+    await new Promise((resolveTick) => setTimeout(resolveTick, 0));
+    if (harness.fetchCalls.length >= untilFetchCount
+        && scope.state().incrementalConsentBusy === false) {
+      return;
+    }
+  }
+}
+
+test("the post-sign-in resume enrolls with the proof first, then mints and claims the v1.0 pairing", async () => {
+  const proof = "a".repeat(64);
+  const harness = {
+    identity: { provider: "google", proof },
+    // The stored session is exactly the credential the service just refused.
+    // It must never reach the wire while the proof is in hand.
+    session: { csrfToken: "stale-csrf", participantId: "old", consentVersion: null },
+    approved: true,
+    grantRejected: true,
+    responses: [
+      {
+        status: 200,
+        payload: {
+          schemaVersion: "participant-bootstrap-v0.1",
+          csrfToken: "fresh-csrf",
+          participantId: "participant-1",
+        },
+      },
+      { status: 201, payload: { pairingCode: "pc-1" } },
+    ],
+  };
+  const scope = await loadContributionCeremony(harness);
+  scope.resumeContributionCeremonyAfterSignIn();
+  await settleCeremony(scope, harness, { untilFetchCount: 2 });
+
+  // The exact ordered wire sequence: enroll with the identity proof and no
+  // CSRF, then the pairing mint under the FRESH session's token with the
+  // v1.0 consent identifier, then the local one-use claim.
+  assert.deepEqual(
+    harness.fetchCalls.map((call) => [call.url, call.method, call.csrf]),
+    [
+      ["/api/v1/enroll", "POST", null],
+      ["/api/v1/me/device-pairings", "POST", "fresh-csrf"],
+    ],
+  );
+  assert.deepEqual(harness.fetchCalls[0].body.identity, { provider: "google", proof });
+  assert.equal(harness.fetchCalls[0].body.consentVersion, "privacy-safe-telemetry-v0.1");
+  assert.equal(harness.fetchCalls[0].body.deviceBootstrap, undefined);
+  assert.deepEqual(harness.fetchCalls[1].body, {
+    consentVersion: "ongoing-privacy-safe-telemetry-v1.0",
+    ongoingUpload: true,
+  });
+  assert.equal(
+    harness.fetchCalls.some((call) => call.csrf === "stale-csrf"),
+    false,
+    "the rejected stored csrfToken never reaches the wire",
+  );
+  assert.deepEqual(harness.localCalls, [{ pairContributionDevice: "pc-1" }]);
+
+  // The settled state is consistent: fresh session adopted, pairing claimed,
+  // approval untouched, and the status line reports the routine refresh.
+  const state = scope.state();
+  assert.equal(state.communitySession?.csrfToken, "fresh-csrf");
+  assert.equal(state.communityDevicePairedV1, true);
+  assert.equal(state.incrementalConsentApproved, true);
+  assert.ok(
+    harness.elements("#incremental-consent-status").localizedKeys
+      .includes("consent.authorityRefreshed"),
+  );
+});
+
+test("a session-rejected mint gates once and cannot repeat within the load", async () => {
+  const harness = {
+    identity: null,
+    session: { csrfToken: "stale-csrf", participantId: "old", consentVersion: null },
+    approved: true,
+    grantRejected: true,
+    responses: [
+      { status: 401, payload: { error: { code: "AUTH_REQUIRED" } } },
+    ],
+  };
+  const scope = await loadContributionCeremony(harness);
+  // With no pending proof, the silent repair mints with the stored session —
+  // the service rejects it.
+  scope.maybeRepairIncrementalAuthorization();
+  await settleCeremony(scope, harness, { untilFetchCount: 1 });
+
+  assert.deepEqual(
+    harness.fetchCalls.map((call) => [call.url, call.csrf]),
+    [["/api/v1/me/device-pairings", "stale-csrf"]],
+  );
+  const state = scope.state();
+  assert.equal(state.communitySession, null, "the dead session is cleared");
+  assert.equal(state.hostedIdentity, null);
+  assert.equal(state.incrementalRepairAttempted, true);
+  // Both status surfaces speak the same sentence in the calm register, so the
+  // identity card cannot contradict the approve card.
+  for (const id of ["#incremental-consent-status", "#identity-signin-status"]) {
+    const surface = harness.elements(id);
+    assert.ok(surface.localizedKeys.includes("consent.signInAgainToFinish"), id);
+    assert.equal(surface.className, "participant-action-status");
+  }
+
+  // No repeat within the load: the guarded repair cannot fire again, with or
+  // without the render cycle that follows a cleared session.
+  scope.maybeRepairIncrementalAuthorization();
+  scope.maybeRepairIncrementalAuthorization();
+  await settleCeremony(scope, harness, { untilFetchCount: 1 });
+  assert.equal(harness.fetchCalls.length, 1, "exactly one rejected mint, ever");
+});
+
+test("the journey's community stage cannot claim done while the re-pair is pending", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  // The repair branch renders BEFORE the approved-done branch, splitting on
+  // the same sign-in question the approve card's gate asks.
+  assert.match(
+    appSource,
+    /\} else if \(incrementalConsentApproved && incrementalGrantRejected\(\)\) \{[\s\S]{0,640}?stage\("community", "action", "journey\.community\.signInAgain"\);[\s\S]{0,240}?stage\("community", "progress", "journey\.community\.refreshingAuthority"\);[\s\S]{0,240}?\} else if \(incrementalConsentApproved\) \{\s*\n\s*stage\("community", "done", "journey\.community\.syncing"\);/u,
+  );
+  // A pending sign-in proof always re-enrolls; the stored csrfToken mints
+  // directly only when no proof is in hand.
+  assert.match(
+    appSource,
+    /if \(hostedIdentity === null && communitySession\?\.csrfToken\) \{/u,
+  );
+  // The gate reconciles the identity card's status line too.
+  assert.match(
+    appSource,
+    /function renderContributionSessionSignInGate\(status\) \{[\s\S]*?\$\("#identity-signin-status"\)/u,
+  );
+  for (const locale of SUPPORTED_LOCALES) {
+    for (const key of [
+      "journey.community.signInAgain",
+      "journey.community.refreshingAuthority",
+    ]) {
+      const copy = translate(key, {}, locale);
+      assert.ok(copy.length > 0 && copy.length <= 90, `${locale} ${key} stays short`);
+    }
+  }
+});
