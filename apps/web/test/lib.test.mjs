@@ -3399,9 +3399,12 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   assert.match(pollBody, /HOSTED_SIGNIN_POLL_ATTEMPTS/u);
   assert.match(pollBody, /error\?\.code !== "IDENTITY_RESULT_PENDING"/u);
   assert.match(pollBody, /if \(attempt\.returnedToApp\)/u);
+  // Re-pinned 2026-08-08 (owner-reported silent failure): a returned-to-app
+  // callback whose result stays pending is referenced and logged through
+  // showFailure instead of rendering copy with no diagnostic note behind it.
   assert.match(
     pollBody,
-    /"contribution\.signInIncomplete"/u,
+    /if \(attempt\.returnedToApp\) \{[\s\S]{0,640}?await showFailure\(status, \{[\s\S]{0,240}?IDENTITY_RESULT_PENDING:/u,
   );
   assert.match(pollBody, /openHostedSignInInBrowser\(request\.authorizeUrl\)/u);
   assert.match(pollBody, /waitForHostedSignInPoll\(attempt\)/u);
@@ -5382,7 +5385,13 @@ test("return visits schedule one bounded checkpoint refresh after cached results
   assert.match(appSource, /returnRefreshDeferrals < 20/u);
   assert.match(appSource, /Cached results are ready/u);
   assert.match(appSource, /checking for new local evidence from the last verified checkpoint/u);
-  assert.match(appSource, /await loadCommunityResults\(\);\s*scheduleReturningUserRefresh\(\);/su);
+  // Re-pinned 2026-08-08 (owner-reported orphaned proof): the bootstrap now
+  // collects a pre-reload sign-in handoff between the community read and the
+  // checkpoint refresh.
+  assert.match(
+    appSource,
+    /await loadCommunityResults\(\);[\s\S]{0,360}?void resumePendingHostedSignIn\(\);\s*\n\s*scheduleReturningUserRefresh\(\);/u,
+  );
 });
 
 test("new enrollment pairs immediately and intentionally discards recovery capability", async () => {
@@ -5509,6 +5518,30 @@ test("post-results contribution CTA is explicit while technical and deletion con
   assert.doesNotMatch(html, /automatic-contribution|contribution-history|backend|browser validation|JSON export|download-participant/iu);
 });
 
+/**
+ * app.js with the pending sign-in handoff store cut out (owner-reported
+ * orphaned proof, 2026-08-08). Web storage remains forbidden everywhere else:
+ * the ONLY thing this page may persist is the five-minute single-use
+ * read-back handle {provider, state, startedAt} — never a proof, a session,
+ * or anything upload-related — and these three helpers are its only home.
+ */
+function appSourceOutsidePendingHandoffStore(appSource) {
+  const start = appSource.indexOf(
+    "// The pending sign-in handoff survives a dashboard reload",
+  );
+  const end = appSource.indexOf("// One resume at a time;", start);
+  assert.ok(start >= 0 && end > start, "the pending handoff store is available");
+  const store = appSource.slice(start, end);
+  // The persisted record carries exactly the read-back handle and nothing else.
+  assert.match(
+    store,
+    /JSON\.stringify\(\{ provider: providerId, state, startedAt: Date\.now\(\) \}\)/u,
+  );
+  const storeCode = store.replace(/^\s*\/\/[^\n]*$/gmu, "");
+  assert.doesNotMatch(storeCode, /proof|csrf|token(?!s)|localStorage/iu);
+  return appSource.slice(0, start) + appSource.slice(end);
+}
+
 test("the page never schedules uploads itself; recurrence is the approved companion engine", async () => {
   // Re-pinned 2026-08-08 (owner-directed): the manual one-shot send left with
   // the prepare flow, so the page now performs NO uploads at all. The only
@@ -5523,7 +5556,13 @@ test("the page never schedules uploads itself; recurrence is the approved compan
   assert.doesNotMatch(connectBody, /enableAutomaticContributionAfterReviewedSend\(\)/u);
   assert.doesNotMatch(appSource, /runContributionSyncAction|runContributionSyncOnce/u);
   assert.doesNotMatch(appSource, /Automatic contribution is now on every 6 hours/u);
-  assert.doesNotMatch(appSource, /sessionStorage|localStorage/u);
+  // Re-pinned 2026-08-08 (owner-reported orphaned proof): web storage stays
+  // forbidden everywhere except the pending sign-in handoff store, whose
+  // record the helper above verifies holds only the read-back handle.
+  assert.doesNotMatch(
+    appSourceOutsidePendingHandoffStore(appSource),
+    /sessionStorage|localStorage/u,
+  );
   assert.doesNotMatch(appSource, /automaticContributionStatus|enableAutomaticContribution|disableAutomaticContribution/u);
   // The status line is read-only: a GET the client normalizes fail-closed.
   assert.match(appSource, /localClient\.incrementalContributionSyncStatus\(\)/u);
@@ -5589,7 +5628,14 @@ test("the approve card shows one verified review instance before one explicit ap
     appSource,
     /communityClient\.enroll\(\s*null,\s*"telemetry-contribution-v0\.1",/u,
   );
-  assert.doesNotMatch(appSource, /sessionStorage|localStorage|accessToken|Bearer/);
+  // Re-pinned 2026-08-08 (owner-reported orphaned proof): credentials stay
+  // out of the page entirely, and web storage is allowed only inside the
+  // pending sign-in handoff store, which persists just the read-back handle.
+  assert.doesNotMatch(appSource, /accessToken|Bearer/u);
+  assert.doesNotMatch(
+    appSourceOutsidePendingHandoffStore(appSource),
+    /sessionStorage|localStorage/u,
+  );
   assert.match(html, /See what the community published/u);
   assert.doesNotMatch(appSource, /loadCommunityResults\(\).*renderSharedCommunitySnapshot/su);
 });
@@ -8086,4 +8132,248 @@ test("the journey's community stage cannot claim done while the re-pair is pendi
       assert.ok(copy.length > 0 && copy.length <= 90, `${locale} ${key} stays short`);
     }
   }
+});
+
+// ---------------------------------------------------------------------------
+// The persisted sign-in handoff (owner-reported orphaned proof, 2026-08-08):
+// a server-side COMPLETED sign-in expired unread because the read-back state
+// token lived only in page memory across a dashboard reload, and the failure
+// left no diagnostic note. The pending handoff now survives in sessionStorage
+// from the moment the browser opens, is collected on load and on every
+// reactivation, and every terminal read-back failure is referenced and
+// logged.
+// ---------------------------------------------------------------------------
+
+function fakeSessionStorage(seed = {}) {
+  const values = new Map(Object.entries(seed));
+  return {
+    values,
+    getItem(key) { return values.get(key) ?? null; },
+    setItem(key, value) { values.set(key, String(value)); },
+    removeItem(key) { values.delete(key); },
+  };
+}
+
+async function loadHostedSignInResume(harness) {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("// The service holds a completed sign-in for five minutes");
+  const end = appSource.indexOf("async function beginHostedSignIn(providerId) {");
+  assert.ok(start >= 0 && end > start, "the sign-in resume section is available");
+  const section = appSource.slice(start, end);
+
+  const status = {
+    hidden: true,
+    className: "",
+    textContent: "",
+    localizedKeys: [],
+  };
+  harness.status = status;
+  harness.failures = [];
+  harness.resumedCeremony = 0;
+  harness.identityRenders = 0;
+
+  return Function(
+    "harness", "window", "document", "$", "setLocalizedText",
+    "renderHostedIdentity", "showFailure", "hostedIdentityErrorCopy",
+    "resumeContributionCeremonyAfterSignIn", "communityClient",
+    `let hostedIdentity = null;
+let hostedIdentityBusy = false;
+let activeHostedSignIn = null;
+let googleSignInUnavailable = false;
+let appleSignInUnavailable = false;
+${section}
+return {
+  resumePendingHostedSignIn,
+  readPendingHostedSignIn,
+  persistPendingHostedSignIn,
+  HOSTED_SIGNIN_HANDOFF_VALIDITY_MS,
+  PENDING_HOSTED_SIGNIN_STORAGE_KEY,
+  state: () => ({ hostedIdentity, hostedIdentityBusy, activeHostedSignIn }),
+};`,
+  )(
+    harness,
+    { sessionStorage: harness.storage, location: { assign() {} }, open() {} },
+    {
+      documentElement: { classList: { contains: () => false } },
+      body: { classList: { contains: () => false } },
+    },
+    () => status,
+    (target, key, values = {}) => {
+      target.localizedKeys.push(key);
+      target.textContent = `[${key}] ${JSON.stringify(values)}`;
+    },
+    () => { harness.identityRenders += 1; },
+    async (target, options) => {
+      harness.failures.push({
+        surface: options.surface,
+        code: options.error?.code ?? null,
+        message: options.messages?.[options.error?.code] ?? options.fallback,
+      });
+      target.hidden = false;
+      target.className = "participant-action-status error";
+      target.textContent = String(
+        options.messages?.[options.error?.code] ?? options.fallback,
+      );
+      return { reference: "TT-TESTED", text: target.textContent };
+    },
+    () => null,
+    () => { harness.resumedCeremony += 1; },
+    {
+      identityGoogleResult: (state) => harness.result(state),
+      identityAppleResult: (state) => harness.result(state),
+    },
+  );
+}
+
+test("a reload between sign-in start and callback still claims the proof", async () => {
+  const storage = fakeSessionStorage();
+  // The pre-reload page persisted the handoff the moment it opened the
+  // browser; this scope is the fresh page after the reload, carrying only
+  // what sessionStorage kept.
+  storage.setItem(
+    "tibotattle.pending-hosted-sign-in.v1",
+    JSON.stringify({
+      provider: "google",
+      state: "s".repeat(64),
+      startedAt: Date.now() - 30_000,
+    }),
+  );
+  const harness = {
+    storage,
+    result: async (state) => {
+      assert.equal(state, "s".repeat(64));
+      return { provider: "google", proof: "b".repeat(64) };
+    },
+  };
+  const scope = await loadHostedSignInResume(harness);
+  await scope.resumePendingHostedSignIn();
+
+  assert.deepEqual(scope.state().hostedIdentity, {
+    provider: "google",
+    proof: "b".repeat(64),
+  });
+  assert.equal(
+    storage.getItem("tibotattle.pending-hosted-sign-in.v1"),
+    null,
+    "a collected handoff is cleared",
+  );
+  assert.equal(harness.resumedCeremony, 1, "the repair ceremony resumes after the claim");
+  assert.equal(harness.failures.length, 0);
+  assert.match(harness.status.textContent, /^Signed in with Google\./u);
+});
+
+test("an expired handoff shows the expiry copy and logs a diagnostic note", async () => {
+  const storage = fakeSessionStorage();
+  const scopeProbe = await loadHostedSignInResume({ storage, result: async () => null });
+  storage.setItem(
+    "tibotattle.pending-hosted-sign-in.v1",
+    JSON.stringify({
+      provider: "google",
+      state: "s".repeat(64),
+      startedAt: Date.now() - scopeProbe.HOSTED_SIGNIN_HANDOFF_VALIDITY_MS - 1_000,
+    }),
+  );
+  const harness = {
+    storage,
+    result: async () => {
+      throw new Error("the expired handoff must never be read back");
+    },
+  };
+  const scope = await loadHostedSignInResume(harness);
+  await scope.resumePendingHostedSignIn();
+
+  assert.equal(storage.getItem("tibotattle.pending-hosted-sign-in.v1"), null);
+  assert.equal(scope.state().hostedIdentity, null);
+  assert.deepEqual(harness.failures, [{
+    surface: "hosted_identity",
+    code: "HOSTED_SIGNIN_HANDOFF_EXPIRED",
+    message:
+      "The completed Google sign-in expired before this Mac could collect it. Nothing was uploaded; sign in again.",
+  }], "the expiry is referenced and logged, distinguished from a service error");
+  assert.equal(harness.status.className, "participant-action-status error");
+});
+
+test("a definite service verdict clears the handoff and logs; an unreachable service keeps it", async () => {
+  const storage = fakeSessionStorage();
+  const record = JSON.stringify({
+    provider: "apple",
+    state: "s".repeat(64),
+    startedAt: Date.now() - 5_000,
+  });
+
+  // Unreachable: no code, no HTTP status — keep the record, log nothing.
+  storage.setItem("tibotattle.pending-hosted-sign-in.v1", record);
+  const transient = {
+    storage,
+    result: async () => { throw new TypeError("Load failed"); },
+  };
+  const transientScope = await loadHostedSignInResume(transient);
+  await transientScope.resumePendingHostedSignIn();
+  assert.equal(storage.getItem("tibotattle.pending-hosted-sign-in.v1"), record);
+  assert.equal(transient.failures.length, 0);
+
+  // Verdict: a coded rejection retires the record and is logged.
+  const verdict = {
+    storage,
+    result: async () => {
+      const error = new Error("Request failed (403).");
+      error.status = 403;
+      error.code = "IDENTITY_TOKEN_INVALID";
+      throw error;
+    },
+  };
+  const verdictScope = await loadHostedSignInResume(verdict);
+  await verdictScope.resumePendingHostedSignIn();
+  assert.equal(storage.getItem("tibotattle.pending-hosted-sign-in.v1"), null);
+  assert.equal(verdict.failures.length, 1);
+  assert.equal(verdict.failures[0].surface, "hosted_identity");
+  assert.equal(verdict.failures[0].code, "IDENTITY_TOKEN_INVALID");
+});
+
+test("the handoff persists the moment the browser opens and every activation retries it", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  // The exact persistence key, versioned like the other product storage keys.
+  assert.match(
+    appSource,
+    /const PENDING_HOSTED_SIGNIN_STORAGE_KEY = "tibotattle\.pending-hosted-sign-in\.v1";/u,
+  );
+  // Persisted BEFORE the authorize URL leaves for the browser.
+  assert.match(
+    appSource,
+    /persistPendingHostedSignIn\(providerId, request\.state\);[\s\S]{0,240}?openHostedSignInInBrowser\(request\.authorizeUrl\);/u,
+  );
+  // Collected on load and on every reactivation surface.
+  assert.match(
+    appSource,
+    /void resumePendingHostedSignIn\(\);[\s\S]{0,240}?scheduleReturningUserRefresh\(\);/u,
+  );
+  assert.match(
+    appSource,
+    /window\.addEventListener\("tibotattle:hosted-sign-in-return", \(\) => \{\s*\n\s*void resumePendingHostedSignIn\(\);/u,
+  );
+  assert.match(
+    appSource,
+    /document\.addEventListener\("visibilitychange", \(\) => \{\s*\n\s*if \(document\.visibilityState === "visible"\) void resumePendingHostedSignIn\(\);/u,
+  );
+  assert.match(
+    appSource,
+    /window\.addEventListener\("focus", \(\) => \{\s*\n\s*void resumePendingHostedSignIn\(\);/u,
+  );
+  // Cleared on success, cancel, timeout, and definite verdicts — never left
+  // to resurrect a finished or abandoned sign-in.
+  const pollBody =
+    appSource.match(/async function beginHostedSignIn\([\s\S]*?\n\}/u)?.[0] ?? "";
+  assert.match(
+    pollBody,
+    /if \(identity !== null\) \{[\s\S]{0,240}?clearPendingHostedSignIn\(\);/u,
+  );
+  assert.match(pollBody, /clearPendingHostedSignIn\(\);\s*\n\s*await showFailure\(status, \{\s*\n\s*surface: "hosted_identity",\s*\n\s*error: null,/u);
+  const cancelBody =
+    appSource.match(/function cancelHostedSignIn\(\)\s*\{[\s\S]*?\n\}/u)?.[0] ?? "";
+  assert.match(cancelBody, /clearPendingHostedSignIn\(\);/u);
+  // The validity window is the service's own five-minute hold.
+  assert.match(
+    appSource,
+    /const HOSTED_SIGNIN_HANDOFF_VALIDITY_MS =\s*\n\s*HOSTED_SIGNIN_POLL_ATTEMPTS \* HOSTED_SIGNIN_POLL_INTERVAL_MS;/u,
+  );
 });

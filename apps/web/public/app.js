@@ -7443,6 +7443,11 @@ async function signOutHostedIdentity() {
 // password and a second factor.
 const HOSTED_SIGNIN_POLL_ATTEMPTS = 150;
 const HOSTED_SIGNIN_POLL_INTERVAL_MS = 2_000;
+// The service-side hold, stated once: the poll budget IS the validity window,
+// and the persisted pending handoff below uses the same bound so this page
+// never claims a proof the service has already discarded.
+const HOSTED_SIGNIN_HANDOFF_VALIDITY_MS =
+  HOSTED_SIGNIN_POLL_ATTEMPTS * HOSTED_SIGNIN_POLL_INTERVAL_MS;
 
 // The packaged Mac app stamps this fixed marker before any dashboard script
 // runs. A normal browser keeps the dashboard page open in a second tab while
@@ -7515,6 +7520,9 @@ function cancelHostedSignIn() {
   attempt.cancelled = true;
   activeHostedSignIn = null;
   hostedIdentityBusy = false;
+  // An explicit cancel is a user decision: the persisted handoff must not
+  // resurrect this sign-in on the next reactivation.
+  clearPendingHostedSignIn();
   attempt.wake?.();
   const status = $("#identity-signin-status");
   status.hidden = false;
@@ -7572,9 +7580,153 @@ const HOSTED_SIGNIN_FLOWS = {
   },
 };
 
+// The pending sign-in handoff survives a dashboard reload (owner-reported
+// orphaned proof, 2026-08-08: a server-side COMPLETED Google sign-in expired
+// unread because the state token needed to collect it lived only in page
+// memory, and the native deep-link reactivation reloaded the page). The
+// moment the browser is opened, {provider, state, startedAt} is persisted to
+// sessionStorage — tab-scoped and gone when the tab closes, holding only the
+// single-use five-minute read-back handle, never a proof or a session. These
+// three helpers are the ONLY place this page touches web storage; the source
+// contract test cuts this block out and holds the rest of the file to zero.
+const PENDING_HOSTED_SIGNIN_STORAGE_KEY = "tibotattle.pending-hosted-sign-in.v1";
+
+function persistPendingHostedSignIn(providerId, state) {
+  try {
+    window.sessionStorage?.setItem(
+      PENDING_HOSTED_SIGNIN_STORAGE_KEY,
+      JSON.stringify({ provider: providerId, state, startedAt: Date.now() }),
+    );
+  } catch {
+    // Storage being unavailable only removes the reload resilience; the live
+    // poll still collects the proof exactly as before.
+  }
+}
+
+function clearPendingHostedSignIn() {
+  try {
+    window.sessionStorage?.removeItem(PENDING_HOSTED_SIGNIN_STORAGE_KEY);
+  } catch {
+    // Nothing to clear when storage is unavailable.
+  }
+}
+
+function readPendingHostedSignIn() {
+  try {
+    const raw = window.sessionStorage?.getItem(PENDING_HOSTED_SIGNIN_STORAGE_KEY);
+    if (typeof raw !== "string" || raw === "") return null;
+    const value = JSON.parse(raw);
+    // The state token keeps the exact shape the service mints (the same
+    // bound the client's own read-back enforces), so a corrupt record is
+    // discarded here instead of failing the read-back forever.
+    if (!Object.hasOwn(HOSTED_SIGNIN_FLOWS, value?.provider ?? "")
+        || typeof value?.state !== "string"
+        || !/^[A-Za-z0-9_-]{43,128}$/u.test(value.state)
+        || !Number.isFinite(value?.startedAt)) {
+      clearPendingHostedSignIn();
+      return null;
+    }
+    return value;
+  } catch {
+    clearPendingHostedSignIn();
+    return null;
+  }
+}
+
+// One resume at a time; re-entrant activations (load + focus + deep link in
+// the same second) must not race two read-backs of the one-time result.
+let pendingHostedSignInResumeInFlight = false;
+
+/**
+ * Collect a sign-in this page started but never read back (owner-reported
+ * orphaned proof, 2026-08-08). Runs on load and on every reactivation —
+ * deep-link return, visibilitychange to visible, window focus — and reads the
+ * persisted handoff's result with a couple of bounded retries inside the
+ * five-minute validity window. Success completes the identical journey the
+ * live poll would have: identity adopted, record cleared, and the pending
+ * repair ceremony resumed. A proof that expired unread, or a definite service
+ * verdict, is reported through describeFailure so a reference and request id
+ * reach the local diagnostics log; an unreachable service leaves the record
+ * for the next activation instead of logging a note per focus change.
+ */
+async function resumePendingHostedSignIn({ retries = 2 } = {}) {
+  if (pendingHostedSignInResumeInFlight) return;
+  if (hostedIdentityBusy || activeHostedSignIn !== null || hostedIdentity !== null) {
+    return;
+  }
+  const pending = readPendingHostedSignIn();
+  if (pending === null) return;
+  const flow = HOSTED_SIGNIN_FLOWS[pending.provider];
+  const status = $("#identity-signin-status");
+  if (Date.now() - pending.startedAt > HOSTED_SIGNIN_HANDOFF_VALIDITY_MS) {
+    clearPendingHostedSignIn();
+    const error = new Error("The completed sign-in expired before this Mac collected it.");
+    error.code = "HOSTED_SIGNIN_HANDOFF_EXPIRED";
+    await showFailure(status, {
+      surface: "hosted_identity",
+      error,
+      messages: {
+        HOSTED_SIGNIN_HANDOFF_EXPIRED:
+          `The completed ${flow.label} sign-in expired before this Mac could collect it. Nothing was uploaded; sign in again.`,
+      },
+      fallback: flow.failed,
+    });
+    renderHostedIdentity();
+    return;
+  }
+  pendingHostedSignInResumeInFlight = true;
+  try {
+    for (let attemptIndex = 0; attemptIndex <= retries; attemptIndex += 1) {
+      let identity = null;
+      try {
+        identity = await flow.result(pending.state);
+      } catch (error) {
+        if (error?.code === "IDENTITY_RESULT_PENDING") {
+          // The provider has not returned yet; retry shortly, then leave the
+          // record for the next activation inside the validity window.
+          identity = null;
+        } else if (error?.code === undefined && error?.status === undefined) {
+          // Unreachable service: not a verdict on the proof. Keep the record
+          // and try again on the next activation rather than logging a note
+          // per focus change.
+          return;
+        } else {
+          clearPendingHostedSignIn();
+          await showFailure(status, {
+            surface: "hosted_identity",
+            error,
+            fallback: hostedIdentityErrorCopy(error) ?? flow.failed,
+          });
+          renderHostedIdentity();
+          return;
+        }
+      }
+      if (identity !== null) {
+        clearPendingHostedSignIn();
+        hostedIdentity = identity;
+        status.hidden = false;
+        status.className = "participant-action-status";
+        status.textContent = flow.signedIn;
+        renderHostedIdentity();
+        foregroundNativeDashboardAfterSignIn();
+        resumeContributionCeremonyAfterSignIn();
+        return;
+      }
+      if (attemptIndex < retries) {
+        await new Promise((resolveWait) => {
+          setTimeout(resolveWait, HOSTED_SIGNIN_POLL_INTERVAL_MS);
+        });
+      }
+    }
+  } finally {
+    pendingHostedSignInResumeInFlight = false;
+  }
+}
+
 async function beginHostedSignIn(providerId) {
   const flow = HOSTED_SIGNIN_FLOWS[providerId];
-  if (flow === undefined || hostedIdentityBusy || hostedIdentity !== null) {
+  if (flow === undefined || hostedIdentityBusy || hostedIdentity !== null
+      || pendingHostedSignInResumeInFlight) {
     return;
   }
   const status = $("#identity-signin-status");
@@ -7595,6 +7747,11 @@ async function beginHostedSignIn(providerId) {
   });
   try {
     const request = await flow.start();
+    // Persisted BEFORE the browser opens: from this moment a completed
+    // sign-in exists server-side that only this state token can collect, so
+    // the token must survive a dashboard reload (owner-reported orphaned
+    // proof, 2026-08-08).
+    persistPendingHostedSignIn(providerId, request.state);
     openHostedSignInInBrowser(request.authorizeUrl);
     status.textContent = flow.waiting;
     for (let poll = 0; poll < HOSTED_SIGNIN_POLL_ATTEMPTS; poll += 1) {
@@ -7609,16 +7766,26 @@ async function beginHostedSignIn(providerId) {
         // into IDENTITY_TOKEN_INVALID; this branch preserves the same safe UI
         // outcome while a previously deployed service still reports pending.
         if (attempt.returnedToApp) {
-          status.hidden = false;
-          status.className = "participant-action-status";
-          setLocalizedText(status, "contribution.signInIncomplete", {
-            provider: flow.label,
+          // A completed callback whose result stays pending is a read-back
+          // failure the user acted on, so it is referenced and logged like
+          // one (owner-reported silent failure, 2026-08-08) instead of
+          // rendering copy with no diagnostic note behind it.
+          clearPendingHostedSignIn();
+          await showFailure(status, {
+            surface: "hosted_identity",
+            error,
+            messages: {
+              IDENTITY_RESULT_PENDING:
+                `${flow.label} sign-in did not complete. Nothing was uploaded. You can try again.`,
+            },
+            fallback: flow.failed,
           });
           return;
         }
       }
       if (identity !== null) {
         if (attempt.cancelled || activeHostedSignIn !== attempt) return;
+        clearPendingHostedSignIn();
         hostedIdentity = identity;
         activeHostedSignIn = null;
         hostedIdentityBusy = false;
@@ -7633,7 +7800,10 @@ async function beginHostedSignIn(providerId) {
       }
     }
     // A bounded poll that ran out is still a failed action from the user's
-    // side, so it is referenced and logged like any other.
+    // side, so it is referenced and logged like any other. The poll budget IS
+    // the handoff's validity window, so the persisted record is expired with
+    // it.
+    clearPendingHostedSignIn();
     await showFailure(status, {
       surface: "hosted_identity",
       error: null,
@@ -7641,6 +7811,12 @@ async function beginHostedSignIn(providerId) {
     });
   } catch (error) {
     if (attempt.cancelled || activeHostedSignIn !== attempt) return;
+    // A definite verdict (a coded or HTTP-status failure) retires the
+    // persisted handoff; a transient unreachable-service throw keeps it, so
+    // the reactivation resume can still collect the proof inside its window.
+    if (error?.code !== undefined || error?.status !== undefined) {
+      clearPendingHostedSignIn();
+    }
     const unconfigured = error?.code === "IDENTITY_CONFIGURATION_INVALID";
     if (unconfigured) flow.markUnavailable();
     await showFailure(status, {
@@ -8623,6 +8799,20 @@ $("#identity-signout").addEventListener("click", () => {
 $("#identity-signin-check").addEventListener("click", checkHostedSignInNow);
 $("#identity-signin-cancel").addEventListener("click", cancelHostedSignIn);
 window.addEventListener("tibotattle:hosted-sign-in-return", checkHostedSignInNow);
+// Reactivation hooks for the persisted handoff (owner-reported orphaned
+// proof, 2026-08-08): the deep-link return, the page becoming visible again,
+// and the window regaining focus each try to collect a pending sign-in this
+// page (or its pre-reload incarnation) started. The resume self-guards, so
+// overlapping activations cannot race the one-time read-back.
+window.addEventListener("tibotattle:hosted-sign-in-return", () => {
+  void resumePendingHostedSignIn();
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") void resumePendingHostedSignIn();
+});
+window.addEventListener("focus", () => {
+  void resumePendingHostedSignIn();
+});
 window.addEventListener("tibotattle:local-evidence-updated", () => {
   void reloadLocalEvidenceAfterNativeRefresh();
 });
@@ -8809,6 +8999,10 @@ async function bootstrapDashboard() {
     await restoreCommunitySession();
   }
   await loadCommunityResults();
+  // A sign-in the pre-reload page started but never read back is collected
+  // now, while its five-minute handoff is still valid (owner-reported
+  // orphaned proof, 2026-08-08).
+  void resumePendingHostedSignIn();
   scheduleReturningUserRefresh();
 }
 
