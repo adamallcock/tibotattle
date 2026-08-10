@@ -5,7 +5,13 @@ import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
   ExportIdentityKeychainError,
   KEYTAR_DARWIN_ARM64_SHA256,
+  KEYTAR_SIGNING_CODE_IDENTIFIER,
+  KEYTAR_SIGNING_TEAM_IDENTIFIER,
   createExportIdentityKeychainBackend,
+  deleteExportIdentityKeychainItemByAttributes,
+  exportIdentityKeychainAttributeDeleteArguments,
+  keytarSignedBindingRequirement,
+  keytarSignedBindingVerificationArguments,
   loadExportIdentityKeychainBinding,
 } from "../src/export-identity-keychain.js";
 
@@ -139,6 +145,7 @@ test("native loader rejects unsupported platforms, architectures, paths, hashes,
       architecture: "arm64",
       resolveBinding: () => fakePath,
       readBinding: () => validBytes,
+      runVerificationCommand: () => ({ status: 1 }),
     }),
     assertKeychainError("binding_integrity"),
   );
@@ -153,6 +160,98 @@ test("native loader rejects unsupported platforms, architectures, paths, hashes,
     }),
     assertKeychainError("invalid_configuration"),
   );
+});
+
+test("the audited bytes load without ever invoking signature verification", () => {
+  const actualPath = require.resolve("@github/keytar/prebuilds/darwin-arm64/keytar.node");
+  const fakeBinding = memoryBinding();
+  const loaded = loadExportIdentityKeychainBinding({
+    platform: "darwin",
+    architecture: "arm64",
+    resolveBinding: () => actualPath,
+    requireBinding: () => fakeBinding,
+    runVerificationCommand: () => {
+      throw new Error("the byte-pinned path must not shell out");
+    },
+  });
+  assert.equal(loaded, fakeBinding);
+});
+
+test("a signed derivative loads only through the exact designated-requirement verification (2026-08-10)", () => {
+  // The Developer ID pipeline re-signs keytar.node in place, so a production
+  // install can never match the audited byte pin — the first signed Sparkle
+  // update proved that live as a total Keychain outage. Signed bytes are
+  // accepted if and only if codesign proves the team-and-identifier
+  // designated requirement, which is stable across every properly signed
+  // build.
+  const fakePath = "/private/tmp/prebuilds/darwin-arm64/keytar.node";
+  const signedBytes = Buffer.from("signed-derivative-of-the-audited-binding");
+  const fakeBinding = memoryBinding();
+  const invocations = [];
+  const loaded = loadExportIdentityKeychainBinding({
+    platform: "darwin",
+    architecture: "arm64",
+    resolveBinding: () => fakePath,
+    readBinding: () => signedBytes,
+    requireBinding: () => fakeBinding,
+    runVerificationCommand: (command, commandArguments) => {
+      invocations.push([command, commandArguments]);
+      return { status: 0 };
+    },
+  });
+  assert.equal(loaded, fakeBinding);
+  assert.equal(invocations.length, 1);
+  assert.equal(invocations[0][0], "/usr/bin/codesign");
+  assert.deepEqual([...invocations[0][1]], [
+    "--verify",
+    "--strict",
+    "-R=anchor apple generic"
+      + ' and certificate leaf[subject.OU] = "43RTH622SB"'
+      + ' and identifier "keytar"',
+    "--",
+    fakePath,
+  ]);
+  assert.equal(KEYTAR_SIGNING_TEAM_IDENTIFIER, "43RTH622SB");
+  assert.equal(KEYTAR_SIGNING_CODE_IDENTIFIER, "keytar");
+  assert.equal(
+    `-R=${keytarSignedBindingRequirement()}`,
+    invocations[0][1][2],
+  );
+  assert.deepEqual(
+    [...keytarSignedBindingVerificationArguments(fakePath)],
+    [...invocations[0][1]],
+  );
+});
+
+test("unaudited bytes that fail signature verification stay failed closed and content-free", () => {
+  const canary = "DO-NOT-LEAK-codesign-outcome";
+  const fakePath = "/private/tmp/prebuilds/darwin-arm64/keytar.node";
+  const unauditedBytes = Buffer.from("not-the-audited-native-binding");
+  for (const runVerificationCommand of [
+    () => ({ status: 3 }),
+    () => ({ status: 1 }),
+    () => ({ status: null }),
+    () => null,
+    () => "satisfied",
+    () => { throw new Error(canary); },
+  ]) {
+    assert.throws(
+      () => loadExportIdentityKeychainBinding({
+        platform: "darwin",
+        architecture: "arm64",
+        resolveBinding: () => fakePath,
+        readBinding: () => unauditedBytes,
+        requireBinding: () => memoryBinding(),
+        runVerificationCommand,
+      }),
+      (error) => {
+        assertKeychainError("binding_integrity")(error);
+        assert.equal(error.stack.includes(canary), false);
+        assert.equal(JSON.stringify(error).includes(canary), false);
+        return true;
+      },
+    );
+  }
 });
 
 test("native loader binding failures are content-free", () => {
@@ -434,4 +533,81 @@ test("invalid inputs and native operation failures never disclose credentials or
       assertKeychainError("invalid_secret"),
     );
   }
+});
+
+test("attribute delete constructs the exact security invocation and never needs the native binding", () => {
+  // The repair path for a credential the ordinary backend cannot read: an
+  // attribute-addressed delete never decrypts the item, so it works with a
+  // broken access control list and even when keytar cannot load (both
+  // observed live 2026-08-10).
+  assert.deepEqual([...exportIdentityKeychainAttributeDeleteArguments(DEVICE_CAPABILITY)], [
+    "delete-generic-password",
+    "-s",
+    "app-usagemonitor.contribution-device.v1",
+    "-a",
+    "installation",
+  ]);
+  const invocations = [];
+  const outcome = deleteExportIdentityKeychainItemByAttributes(DEVICE_CAPABILITY, {
+    platform: "darwin",
+    runCommand: (command, commandArguments) => {
+      invocations.push([command, commandArguments]);
+      return { status: 0 };
+    },
+  });
+  assert.equal(outcome, "deleted");
+  assert.equal(invocations.length, 1);
+  assert.equal(invocations[0][0], "/usr/bin/security");
+  assert.deepEqual(
+    [...invocations[0][1]],
+    [...exportIdentityKeychainAttributeDeleteArguments(DEVICE_CAPABILITY)],
+  );
+});
+
+test("attribute delete reports an absent item honestly and fails closed on anything else", () => {
+  const canary = "DO-NOT-LEAK-security-outcome";
+  // errSecItemNotFound (exit 44) is the one non-zero status with a meaning:
+  // there was nothing to delete.
+  assert.equal(
+    deleteExportIdentityKeychainItemByAttributes(DEVICE_CAPABILITY, {
+      platform: "darwin",
+      runCommand: () => ({ status: 44 }),
+    }),
+    "missing",
+  );
+  for (const runCommand of [
+    () => ({ status: 1 }),
+    () => ({ status: null }),
+    () => null,
+    () => "deleted",
+    () => { throw new Error(canary); },
+  ]) {
+    assert.throws(
+      () => deleteExportIdentityKeychainItemByAttributes(DEVICE_CAPABILITY, {
+        platform: "darwin",
+        runCommand,
+      }),
+      (error) => {
+        assertKeychainError("operation_failed")(error);
+        const rendered = `${error.stack}\n${JSON.stringify(error)}`;
+        assert.equal(rendered.includes(canary), false);
+        assert.equal(rendered.includes(DEVICE_CAPABILITY.service), false);
+        return true;
+      },
+    );
+  }
+  assert.throws(
+    () => deleteExportIdentityKeychainItemByAttributes({ ...DEVICE_CAPABILITY }, {
+      platform: "darwin",
+      runCommand: () => ({ status: 0 }),
+    }),
+    assertKeychainError("invalid_capability"),
+  );
+  assert.throws(
+    () => deleteExportIdentityKeychainItemByAttributes(DEVICE_CAPABILITY, {
+      platform: "linux",
+      runCommand: () => ({ status: 0 }),
+    }),
+    assertKeychainError("unsupported_platform"),
+  );
 });

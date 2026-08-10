@@ -746,14 +746,21 @@ class IncrementalContributionSyncController {
               : "response_invalid",
           });
         }
-        this.#settings.progress = {
-          daysTotal: runOutcome.daysTotal,
-          daysSynced: runOutcome.daysSynced,
-          daysPending: runOutcome.daysPending,
-          chunksUploaded: (this.#settings.progress?.chunksUploaded ?? 0)
-            + runOutcome.chunksUploaded,
-          acknowledgedThroughDay: runOutcome.acknowledgedThroughDay ?? null,
-        };
+        // An outcome with networkActivity === false describes a pass that
+        // never ran (the wiring shaping a pre-engine capability failure into
+        // the device_unavailable pause). It measured nothing, so its zeroed
+        // counts must not overwrite the last honest progress the dashboard
+        // shows beside the pause.
+        if (runOutcome.networkActivity !== false) {
+          this.#settings.progress = {
+            daysTotal: runOutcome.daysTotal,
+            daysSynced: runOutcome.daysSynced,
+            daysPending: runOutcome.daysPending,
+            chunksUploaded: (this.#settings.progress?.chunksUploaded ?? 0)
+              + runOutcome.chunksUploaded,
+            acknowledgedThroughDay: runOutcome.acknowledgedThroughDay ?? null,
+          };
+        }
       } else {
         this.#settings.progress = {
           daysTotal: runOutcome.daysTotal,

@@ -65,6 +65,7 @@ import {
 } from "../../src/contribution-device-capability.js";
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+  deleteExportIdentityKeychainItemByAttributes,
 } from "../../src/platform/export-identity-keychain.js";
 import {
   claimContributionDevicePairing,
@@ -414,45 +415,76 @@ async function appendDiagnosticNote({
 /**
  * Clear this Mac's leftover contribution-device credential.
  *
- * This is the narrow repair for one specific local fault: a Keychain secret
- * whose binding state file is gone, which leaves the ordinary capability layer
- * unable to read or replace it. Exactly two local things are removed — the
+ * This is the narrow repair for the local faults that leave the ordinary
+ * capability layer unable to read or replace the credential: a Keychain
+ * secret whose binding state file is gone, an access control list a Sparkle
+ * update no longer satisfies, or a capability backend that cannot even be
+ * constructed. When the backend can read the secret, the exact-value delete
+ * is kept; when it cannot — the exact disease this route cures — the
+ * credential is deleted by its fixed attributes instead, which never needs
+ * the secret (verified live 2026-08-10). Only local things are removed: the
  * app-usagemonitor.contribution-device.v1 / installation Keychain entry and
- * the binding state file. It contacts no network, revokes no hosted device,
- * and deletes no contributed metadata; the hosted side is unaware of it.
+ * the binding state file (plus its pre-rename legacy twin, whose leftover
+ * would otherwise wedge the next pairing). It contacts no network, revokes
+ * no hosted device, and deletes no contributed metadata; the hosted side is
+ * unaware of it.
  */
 async function resetContributionDeviceCredentialLocally({
   backend,
   stateFile,
+  legacyStateFile = null,
+  attributeDelete = () => deleteExportIdentityKeychainItemByAttributes(
+    CONTRIBUTION_DEVICE_KEYCHAIN_CAPABILITY,
+  ),
 }) {
   let stored = null;
   let expected = null;
-  let credential = "already_missing";
-  try {
-    stored = await backend.read(CONTRIBUTION_DEVICE_KEYCHAIN_CAPABILITY);
-    if (stored !== null) {
-      expected = Buffer.from(stored);
-      const outcome = await backend.deleteExact(
-        CONTRIBUTION_DEVICE_KEYCHAIN_CAPABILITY,
-        expected,
-      );
-      if (outcome !== "deleted" && outcome !== "missing") {
-        throw new Error("device credential was not removed");
+  let credential = null;
+  let conflicted = false;
+  if (backend !== null) {
+    try {
+      stored = await backend.read(CONTRIBUTION_DEVICE_KEYCHAIN_CAPABILITY);
+      if (stored === null) {
+        credential = "already_missing";
+      } else {
+        expected = Buffer.from(stored);
+        const outcome = await backend.deleteExact(
+          CONTRIBUTION_DEVICE_KEYCHAIN_CAPABILITY,
+          expected,
+        );
+        if (outcome === "conflict") {
+          conflicted = true;
+        } else if (outcome === "deleted" || outcome === "missing") {
+          credential = outcome === "deleted" ? "deleted" : "already_missing";
+        }
       }
-      credential = outcome === "deleted" ? "deleted" : "already_missing";
+    } catch {
+      // The read (or the read inside the exact delete) is the operation the
+      // broken state cannot perform. Fall through to the attribute delete.
+    } finally {
+      if (Buffer.isBuffer(stored)) stored.fill(0);
+      expected?.fill(0);
     }
-  } finally {
-    if (Buffer.isBuffer(stored)) stored.fill(0);
-    expected?.fill(0);
   }
-  let binding = "already_missing";
-  let current = null;
-  try {
-    current = await lstat(stateFile);
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
+  // A conflict means a concurrent operation wrote a fresh credential between
+  // the read and the delete; falling through to the attribute delete would
+  // erase that newcomer, so the reset refuses instead.
+  if (conflicted) throw new Error("device credential changed during reset");
+  if (credential === null) {
+    const outcome = await attributeDelete();
+    if (outcome !== "deleted" && outcome !== "missing") {
+      throw new Error("device credential was not removed");
+    }
+    credential = outcome === "deleted" ? "deleted" : "already_missing";
   }
-  if (current !== null) {
+  const removeOwnerOnlyBindingFile = async (file) => {
+    let current = null;
+    try {
+      current = await lstat(file);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    if (current === null) return "already_missing";
     if (!current.isFile()
         || current.isSymbolicLink()
         || current.nlink !== 1
@@ -461,8 +493,13 @@ async function resetContributionDeviceCredentialLocally({
           && current.uid !== process.getuid())) {
       throw new Error("device binding state file is not owner-only");
     }
-    await unlink(stateFile);
-    binding = "removed";
+    await unlink(file);
+    return "removed";
+  };
+  let binding = await removeOwnerOnlyBindingFile(stateFile);
+  if (legacyStateFile !== null) {
+    const legacy = await removeOwnerOnlyBindingFile(legacyStateFile);
+    if (legacy === "removed") binding = "removed";
   }
   return Object.freeze({
     status: credential === "already_missing" && binding === "already_missing"
@@ -1540,6 +1577,53 @@ function unifiedIndexBusyError(error) {
 }
 
 /**
+ * A thrown contribution-device capability failure — the same family the sync
+ * engine itself maps to its device_unavailable outcome. The wiring can hit
+ * this family before the engine exists (constructing the Keychain backend,
+ * or migrating the legacy binding file), so the same mapping must live here
+ * too.
+ */
+function contributionDeviceCapabilityFailure(error) {
+  try {
+    return typeof error?.code === "string"
+      && error.code.startsWith("contribution_device_");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The engine's own device_unavailable failure shape for a pass that never
+ * ran: the controller pauses with the exact reason the dashboard's
+ * re-approve repair path keys on, instead of walking an anonymous run_failed
+ * retry ladder forever (observed live 2026-08-10, after a Sparkle update
+ * left the credential unreadable). networkActivity is false — no counts were
+ * measured, so the controller must not let these zeros overwrite the last
+ * honest progress.
+ */
+function deviceUnavailableIncrementalRunOutcome() {
+  return Object.freeze({
+    schemaVersion: "incremental-contribution-sync-run-v1.0",
+    status: "failed",
+    daysTotal: 0,
+    daysSynced: 0,
+    daysPending: 0,
+    chunksUploaded: 0,
+    chunksSkipped: 0,
+    recordsUploaded: 0,
+    acknowledgedThroughDay: null,
+    orphanChunkIds: Object.freeze([]),
+    failure: Object.freeze({
+      code: "device_unavailable",
+      retryable: false,
+      deviceUnavailable: true,
+      retryAfterMilliseconds: null,
+    }),
+    networkActivity: false,
+  });
+}
+
+/**
  * The bounded status the dashboard's incremental surface reads: consent
  * state, cursor progress as day counts and the acknowledged watermark day,
  * pause reason as a fixed code. No path, no content, no identifier.
@@ -2043,6 +2127,7 @@ function createPreparedLocalCompanionServer({
     createProductionContributionDeviceBackend,
   contributionDevicePairingProvider = null,
   contributionDeviceCredentialResetRunner = null,
+  contributionDeviceCredentialAttributeDelete = null,
   contributionDeviceDisconnectRunner = null,
   diagnosticNoteRecorder = null,
   clock = () => Date.now(),
@@ -2144,6 +2229,8 @@ function createPreparedLocalCompanionServer({
         && typeof contributionDevicePairingProvider !== "function")
       || (contributionDeviceCredentialResetRunner !== null
         && typeof contributionDeviceCredentialResetRunner !== "function")
+      || (contributionDeviceCredentialAttributeDelete !== null
+        && typeof contributionDeviceCredentialAttributeDelete !== "function")
       || (contributionDeviceDisconnectRunner !== null
         && typeof contributionDeviceDisconnectRunner !== "function")
       || (contributionSyncNextProvider !== null
@@ -2194,16 +2281,29 @@ function createPreparedLocalCompanionServer({
           },
         });
       });
-  // Purely local repair: it needs the Keychain backend and the binding state
-  // file, never a contribution service origin, so it stays available even when
-  // no service is configured.
+  // Purely local repair: it needs at most the Keychain backend and the
+  // binding state files, never a contribution service origin, so it stays
+  // available even when no service is configured. The backend is best-effort
+  // here — when the capability layer itself is the fault (observed live
+  // 2026-08-10: the signed native binding failed its integrity pin, so even
+  // constructing the backend threw), the repair proceeds by attribute delete
+  // rather than refusing to run.
   const resetContributionDeviceCredential =
     contributionDeviceCredentialResetRunner
     ?? (async () => {
-      const backend = await createContributionDeviceBackend();
+      let backend = null;
+      try {
+        backend = await createContributionDeviceBackend();
+      } catch {
+        backend = null;
+      }
       return resetContributionDeviceCredentialLocally({
         backend,
         stateFile: statePaths.contributionDeviceStateFile,
+        legacyStateFile: legacyContributionDeviceStateFile,
+        ...(contributionDeviceCredentialAttributeDelete === null
+          ? {}
+          : { attributeDelete: contributionDeviceCredentialAttributeDelete }),
       });
     });
   // Disconnect revokes the remote bearer before removing its local binding.
@@ -2462,6 +2562,17 @@ function createPreparedLocalCompanionServer({
               busy.code = "index_busy";
               busy.retryable = true;
               throw busy;
+            }
+            // 2026-08-10 (observed live): the Keychain capability failed
+            // before the engine could shape it — the backend factory threw
+            // once a Sparkle update invalidated the audited binding — and
+            // the controller looped anonymous run_failed retries against a
+            // fault no retry can fix. The engine already owns the honest
+            // state for exactly this family; hand it over as the
+            // device_unavailable pause so the dashboard shows the
+            // re-approve repair path.
+            if (contributionDeviceCapabilityFailure(error)) {
+              return deviceUnavailableIncrementalRunOutcome();
             }
             throw error;
           } finally {

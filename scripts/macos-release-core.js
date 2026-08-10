@@ -52,6 +52,10 @@ import {
   buildMacOSReleaseCandidate,
   validateMacOSPreviewApp,
 } from "./build-macos-app.js";
+import {
+  KEYTAR_DARWIN_ARM64_SHA256,
+  keytarSignedBindingVerificationArguments,
+} from "../src/export-identity-keychain.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
@@ -1673,7 +1677,33 @@ export async function developerIDSignMacOSApp(appPath, {
   sign(`${SPARKLE_FRAMEWORK_PREFIX}/Versions/B/Autoupdate`);
   sign(`${SPARKLE_FRAMEWORK_PREFIX}/Versions/B/Updater.app`);
   sign(SPARKLE_FRAMEWORK_PREFIX);
+  // Signing rewrites the Mach-O, so the runtime keychain loader cannot pin
+  // signed bytes; it accepts a signed binding through its designated
+  // requirement instead. The audit therefore lives here: the bytes about to
+  // be signed must be exactly the audited npm artifact, and after signing
+  // the shipped binary must satisfy the very requirement the loader tests.
+  const keytarBindingPath = join(
+    inspected.appPath,
+    ...KEYTAR_EXECUTABLE.split("/"),
+  );
+  const stagedKeytarDigest = createHash("sha256")
+    .update(await readFile(keytarBindingPath))
+    .digest("hex");
+  if (stagedKeytarDigest !== KEYTAR_DARWIN_ARM64_SHA256) {
+    fail(
+      "Keytar native binding staged for signing is not the audited artifact",
+      "MACOS_KEYTAR_BINDING_UNAUDITED",
+    );
+  }
   sign(KEYTAR_EXECUTABLE);
+  commandRunner("/usr/bin/codesign", [
+    ...keytarSignedBindingVerificationArguments(keytarBindingPath),
+  ], {
+    env: releaseEnvironment(),
+    failureMessage:
+      "Signed keytar binding does not satisfy the runtime designated requirement",
+    secrets,
+  });
   await validateNodeRuntimeEntitlements();
   sign(NODE_EXECUTABLE, { entitlements: NODE_ENTITLEMENTS });
   // The app bundle carries no entitlements of its own. Sign in with Apple is
