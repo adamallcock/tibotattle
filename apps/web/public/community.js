@@ -80,6 +80,12 @@ export function setPublicDailyPresentation(documentRef, state, {
   for (const element of [hero, panelStatus]) {
     if (element) element.textContent = presentation[0];
   }
+  // The hero dot's green heartbeat means "live evidence loaded", so it keys
+  // off the same presentation truthiness as the evidence chip below.
+  const heroLink = hero?.closest?.(".community-inline") ?? null;
+  if (heroLink) {
+    heroLink.setAttribute("data-live", presentation[1] ? "true" : "false");
+  }
   if (panelState) {
     panelState.textContent = presentation[0];
     panelState.className = presentation[1]

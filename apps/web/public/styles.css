@@ -1951,6 +1951,39 @@ h2 { font-size: clamp(2rem, 3.8vw, 3.25rem); }
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
+/* Narrow layouts: each day becomes a labelled card instead of forcing a
+   920px table into a sideways scroll. */
+@media (max-width: 640px) {
+  .snapshot-table table { min-width: 0; width: 100%; }
+  .snapshot-table thead { display: none; }
+  .snapshot-table tbody, .snapshot-table tr, .snapshot-table td,
+  .snapshot-table tbody th { display: block; }
+  .snapshot-table tr {
+    margin-bottom: 12px;
+    border: 1px solid var(--line, rgba(0, 0, 0, .12));
+    border-radius: 10px;
+    padding: 10px 12px;
+  }
+  .snapshot-table tbody th[scope="row"] {
+    font-size: .95rem;
+    padding: 0 0 6px;
+    border-bottom: 1px solid var(--line, rgba(0, 0, 0, .12));
+    margin-bottom: 6px;
+  }
+  .snapshot-table td {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 3px 0;
+    white-space: normal;
+  }
+  .snapshot-table td::before {
+    content: attr(data-label);
+    opacity: .7;
+    font-size: .8rem;
+  }
+  .snapshot-table td.numeric { text-align: right; }
+}
 .participant-action-status.error { color: var(--rust); }
 
 /* Public landing hierarchy. Keep the community surface intentionally small;
@@ -2395,6 +2428,24 @@ footer p { margin: 0; }
   border-radius: var(--radius-round);
   background: rgba(255, 253, 247, .5);
   box-shadow: 0 0 0 4px rgba(255, 253, 247, .08);
+}
+/* Live-evidence heartbeat: the dot turns green and pulses once the daily
+   series has actually loaded (community.js stamps data-community-state). */
+.community-site [data-community-state="published"] .community-dot,
+.community-site .community-inline[data-live="true"] .community-dot {
+  background: #4ade80;
+  animation: community-dot-pulse 2.4s ease-in-out infinite;
+}
+@keyframes community-dot-pulse {
+  0%, 100% { box-shadow: 0 0 0 3px rgba(74, 222, 128, .15); }
+  50% { box-shadow: 0 0 0 7px rgba(74, 222, 128, .35); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .community-site [data-community-state="published"] .community-dot,
+  .community-site .community-inline[data-live="true"] .community-dot {
+    animation: none;
+    box-shadow: 0 0 0 5px rgba(74, 222, 128, .25);
+  }
 }
 .community-site .product-window {
   position: relative;

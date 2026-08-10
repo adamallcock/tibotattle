@@ -1237,7 +1237,6 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "See where your Codex allowance stands.": ["查看你的 Codex 额度状况。", "Consulta el estado de tu límite de Codex."],
   "TiboTattle is a private Mac app that estimates how much of your seven-day Codex allowance remains and shows how your usage changes over time. Your personal dashboard is calculated on your Mac.": ["TiboTattle 是一款私密的 Mac 应用，可估算你的 Codex 七天额度还剩多少，并展示使用情况随时间的变化。你的个人仪表板会在 Mac 上计算。", "TiboTattle es una app privada para Mac que estima cuánto queda de tu límite de Codex de siete días y muestra cómo cambia tu uso con el tiempo. Tu panel personal se calcula en tu Mac."],
   "Public download coming soon.": ["公开下载即将推出。", "La descarga pública estará disponible pronto."],
-  "We will make the signed Mac installer available here when it is ready.": ["已签名的 Mac 安装程序准备就绪后，我们会在此提供下载。", "Ofreceremos aquí el instalador firmado para Mac cuando esté listo."],
   "Latest community evidence": ["最新社区证据", "Evidencia comunitaria más reciente"],
   "Install the Mac app": ["安装 Mac 应用", "Instala la app para Mac"],
   "Open TiboTattle and let it calculate your Codex usage locally.": ["打开 TiboTattle，让它在本地计算你的 Codex 使用情况。", "Abre TiboTattle y deja que calcule tu uso de Codex de forma local."],

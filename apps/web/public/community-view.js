@@ -480,6 +480,12 @@ export function renderCommunityDailySeries({
       if (COMMUNITY_DAILY_NUMERIC_COLUMNS.has(index + 1)) {
         td.className = "numeric";
       }
+      // Narrow layouts stack each row into a labelled card; the label is the
+      // translated column header carried on the cell itself.
+      td.setAttribute(
+        "data-label",
+        t(COMMUNITY_DAILY_COLUMN_KEYS[index + 1] ?? ""),
+      );
       td.textContent = value;
       row.append(td);
     });
