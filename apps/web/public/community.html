@@ -7,10 +7,10 @@
     <meta name="theme-color" content="#082f2a">
     <!--
       This is the public website surface. It introduces the Mac app, offers
-      its verified installer, and shows the published community snapshot. Everything
-      that needs the local companion — the personal dashboard, contribution
-      preparation and upload, and hosted sign-in — lives in the app itself, so
-      no control here can render dead.
+      its verified installer, and shows the published daily community activity
+      series. Everything that needs the local companion — the personal
+      dashboard, contribution preparation and upload, and hosted sign-in —
+      lives in the app itself, so no control here can render dead.
 
       Release packaging replaces every empty release slot below only after it
       verifies the selected installer and social-preview artifacts. Keeping any
@@ -153,9 +153,9 @@
           </div>
 
           <a class="community-inline" href="#community">
-            <span class="community-dot" id="community-snapshot-dot" aria-hidden="true"></span>
+            <span class="community-dot" aria-hidden="true"></span>
             <span>Latest community evidence</span>
-            <strong id="community-snapshot-hero">Checking snapshot</strong>
+            <strong id="community-daily-hero">Checking daily activity</strong>
           </a>
         </div>
 
@@ -228,18 +228,18 @@
       >
         <div class="community-proof-heading">
           <div>
-            <h2 id="community-title">Community activity snapshot</h2>
-            <p>When available, this is a delayed, anonymous activity summary from people who chose to contribute.</p>
+            <h2 id="community-title">Community daily activity</h2>
+            <p>When available, this is a delayed, anonymous daily activity series from people who chose to contribute. A late contribution never edits history: it publishes a replacement revision for its day.</p>
             <p class="annotation">
               Personal dashboards and contributions stay in the Mac app.
             </p>
           </div>
           <div class="community-estimate-summary">
-            <span class="evidence-chip neutral" id="community-snapshot-panel-state">
-              Checking snapshot
+            <span class="evidence-chip neutral" id="community-daily-panel-state">
+              Checking daily activity
             </span>
-            <div id="community-snapshot-status" role="status">
-              <p>Checking for the latest delayed aggregate snapshot…</p>
+            <div id="community-daily-status" role="status">
+              <p>Checking for published daily activity…</p>
             </div>
           </div>
         </div>
@@ -247,30 +247,6 @@
         <details class="community-method">
           <summary>See community activity details</summary>
           <div class="community-method-body">
-            <div class="activity-heading">
-              <div>
-                <h3>Published activity</h3>
-                <p>Delayed, rounded totals for the published reporting period.</p>
-              </div>
-              <span class="evidence-chip neutral" id="community-service-state">
-                Checking service
-              </span>
-            </div>
-            <div class="result-summary" id="community-result">
-              <p>Checking for the latest delayed aggregate snapshot…</p>
-            </div>
-            <details class="journey-disclosure service-detail-disclosure" id="community-snapshot-provenance">
-              <summary><strong>Snapshot and source details</strong></summary>
-              <div class="service-detail-body">
-                <div id="community-snapshot-service-detail"></div>
-                <p class="annotation">
-                  Values are delayed, rounded activity totals supplied by
-                  contributors. This page does not turn them into a personal
-                  reading or a statement about everyone.
-                </p>
-              </div>
-            </details>
-
             <div class="activity-heading">
               <div>
                 <h3>Daily activity series</h3>
@@ -330,7 +306,7 @@
 
     <noscript>
       <div class="noscript">
-        Turn on JavaScript to check download availability and the public community snapshot.
+        Turn on JavaScript to check download availability and the published daily community activity.
       </div>
     </noscript>
   </body>

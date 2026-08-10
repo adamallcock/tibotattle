@@ -1,9 +1,11 @@
 // Public, read-only community data boundary.
 //
-// This module intentionally knows only the released aggregate endpoint and
-// the closed snapshot contract. The app's local companion, identity,
-// contribution, and deletion clients remain in data-client.js and are not part
-// of the public website's module graph.
+// This module intentionally knows only the released aggregate contracts. The
+// public website reads the day-partitioned series alone; the sealed weekly
+// snapshot normalizer below is retained because the app's data-client.js still
+// interprets that contract. The app's local companion, identity, contribution,
+// and deletion clients remain in data-client.js and are not part of the public
+// website's module graph.
 
 const COMMUNITY_ROOT = "/api/v1";
 const SAFE_ERROR_CODE_PATTERN =
@@ -378,10 +380,6 @@ async function readPublicJson(fetchImpl, path) {
   return response.status === 204 ? null : response.json();
 }
 
-function fetchCommunitySnapshot(fetchImpl) {
-  return readPublicJson(fetchImpl, `${COMMUNITY_ROOT}/stats/aggregate`);
-}
-
 function fetchCommunityDaily(fetchImpl, nowMs) {
   const { from, to } = communityDailyWindow(nowMs);
   return readPublicJson(
@@ -396,11 +394,6 @@ export class PublicCommunityClient {
       throw new TypeError("Public community fetch implementation must be a function.");
     }
     this.fetchImpl = fetchImpl;
-  }
-
-  communityStats() {
-    const fetchImpl = this.fetchImpl;
-    return fetchCommunitySnapshot(fetchImpl);
   }
 
   communityDaily({ nowMs = Date.now() } = {}) {

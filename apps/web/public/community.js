@@ -1,21 +1,17 @@
 // Entry point for the public website.
 //
 // The website introduces the Mac app, offers its verified installer, and
-// renders the community aggregate view. All three work with no local companion.
-// Everything that
-// needs the companion — the personal dashboard, contribution preparation and
-// upload, hosted sign-in, participant deletion — is deliberately absent here
-// and lives in the Mac app's own window, so this page can never show a control
-// that cannot work.
+// renders the community daily activity series. All three work with no local
+// companion. Everything that needs the companion — the personal dashboard,
+// contribution preparation and upload, hosted sign-in, participant deletion —
+// is deliberately absent here and lives in the Mac app's own window, so this
+// page can never show a control that cannot work.
 //
 // Every rendering routine below is imported, not copied: the install card and
-// the community table are the same modules the in-app dashboard entry uses.
+// the community view are the same modules the in-app dashboard entry uses.
 
 import { PublicCommunityClient } from "./community-data.js";
-import {
-  renderCommunityDailySeries,
-  renderCommunitySnapshot,
-} from "./community-view.js";
+import { renderCommunityDailySeries } from "./community-view.js";
 import {
   renderInstallerJourney,
 } from "./install-cta.js";
@@ -46,10 +42,8 @@ const publicErrorCodePattern =
   /^(?:[A-Z][A-Z0-9_]{1,63}|[a-z][a-z0-9_]{1,63})$/u;
 const publicRequestIdPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
-let lastCommunitySnapshotPayload = null;
-let lastCommunitySnapshotFailure = null;
-let communitySnapshotSettled = false;
 let lastCommunityDailyPayload = null;
+let lastCommunityDailyFailure = null;
 let communityDailySettled = false;
 const communityClient = new PublicCommunityClient();
 
@@ -66,39 +60,31 @@ function publicRequestId(candidate) {
 }
 
 /**
- * The badge describes the reader-facing snapshot state, not transport health.
- * The renderer below retains the precise safe state copy in the panel body.
+ * The badge describes the reader-facing daily-series state, not transport
+ * health. The renderer retains the precise safe state copy in the panel body.
  */
-export function setPublicSnapshotPresentation(documentRef, state, {
+export function setPublicDailyPresentation(documentRef, state, {
   failed = false,
 } = {}) {
-  const chip = documentRef.querySelector("#community-service-state");
   const title = documentRef.querySelector("#community-title");
-  const hero = documentRef.querySelector("#community-snapshot-hero");
-  const panelState = documentRef.querySelector("#community-snapshot-panel-state");
-  const panelStatus = documentRef.querySelector("#community-snapshot-status");
-  if (title) title.textContent = t("community.snapshotTitle");
-  if (failed || state === "service_unavailable") {
-    chip.textContent = t("community.snapshotUnavailable");
-    chip.className = "evidence-chip neutral";
-    for (const element of [hero, panelState, panelStatus]) {
-      if (element) element.textContent = t("community.snapshotUnavailable");
-    }
-    return;
-  }
-  const presentation = {
-    published: [t("community.snapshotAvailable"), true],
-    published_partial: [t("community.snapshotPartlyAvailable"), true],
-    not_yet_published: [t("community.noSnapshotPublished"), false],
-    withdrawn: [t("community.snapshotWithdrawn"), false],
-    suppressed: [t("community.noSnapshotReleased"), false],
-    unsupported_schema: [t("community.snapshotUnavailableShort"), false],
-    development_unsafe: [t("community.snapshotUnavailableShort"), false],
-  }[state] ?? [t("community.snapshotUnavailableShort"), false];
-  chip.textContent = presentation[0];
-  chip.className = presentation[1] ? "evidence-chip" : "evidence-chip neutral";
-  for (const element of [hero, panelState, panelStatus]) {
+  const hero = documentRef.querySelector("#community-daily-hero");
+  const panelState = documentRef.querySelector("#community-daily-panel-state");
+  const panelStatus = documentRef.querySelector("#community-daily-status");
+  if (title) title.textContent = t("community.daily.title");
+  const presentation = failed || state === "service_unavailable"
+    ? [t("community.daily.seriesUnavailable"), false]
+    : {
+      published: [t("community.daily.seriesAvailable"), true],
+      none_published: [t("community.daily.noneYet"), false],
+    }[state] ?? [t("community.daily.seriesUnavailable"), false];
+  for (const element of [hero, panelStatus]) {
     if (element) element.textContent = presentation[0];
+  }
+  if (panelState) {
+    panelState.textContent = presentation[0];
+    panelState.className = presentation[1]
+      ? "evidence-chip"
+      : "evidence-chip neutral";
   }
 }
 
@@ -115,28 +101,24 @@ function renderPublicInstallerJourney() {
   return release;
 }
 
-function renderCommunityResult({ payload, failure = null }) {
-  const container = $("#community-result");
-  const detail = $("#community-snapshot-service-detail");
-  const state = renderCommunitySnapshot({
+function renderCommunityDailyResult({ payload, failure = null }) {
+  const container = $("#community-daily-result");
+  const state = renderCommunityDailySeries({
     documentRef: document,
     container,
-    detail,
+    stateNode: $("#community-daily-state"),
     payload,
   });
   $("#community").dataset.communityState = state;
-  if (failure === null) {
-    setPublicSnapshotPresentation(document, state);
-    return state;
-  }
-  setPublicSnapshotPresentation(document, state, { failed: true });
+  setPublicDailyPresentation(document, state, { failed: failure !== null });
+  if (failure === null) return state;
   // Only the fixed, content-free identifiers the service itself returned are
   // repeated back. This page files no diagnostic note: there is no local
   // companion here to file one with.
   const code = publicErrorCode(failure?.code);
   const requestId = publicRequestId(failure?.requestId);
   const sentences = [
-    t("community.failedLoad"),
+    t("community.daily.failedLoad"),
   ];
   if (code !== "") sentences.push(t("community.reportedCause", { code: code.replace(/_/gu, " ") }));
   if (requestId !== "") sentences.push(t("community.serviceReference", { reference: requestId }));
@@ -147,62 +129,35 @@ function renderCommunityResult({ payload, failure = null }) {
   return state;
 }
 
-function renderCommunityDailyResult(payload) {
-  return renderCommunityDailySeries({
-    documentRef: document,
-    container: $("#community-daily-result"),
-    stateNode: $("#community-daily-state"),
-    payload,
-  });
-}
-
-async function loadCommunitySnapshot() {
+async function loadCommunityDailySeries() {
   let payload = null;
   let failure = null;
   try {
-    payload = await communityClient.communityStats();
+    payload = await communityClient.communityDaily();
   } catch (error) {
     failure = error;
   }
   // A null payload renders the fixed "service unavailable" state, which is
   // separate from a service that answered and has published nothing yet. Keep
   // the settled failure too so a language switch rerenders its safe copy.
-  lastCommunitySnapshotPayload = payload;
-  lastCommunitySnapshotFailure = failure;
-  communitySnapshotSettled = true;
-  renderCommunityResult({ payload, failure });
-}
-
-async function loadCommunityDailySeries() {
-  let payload = null;
-  try {
-    payload = await communityClient.communityDaily();
-  } catch {
-    // A failed request renders the fixed unavailable state; the daily series
-    // repeats no failure identifiers because the weekly panel already does.
-    payload = null;
-  }
   lastCommunityDailyPayload = payload;
+  lastCommunityDailyFailure = failure;
   communityDailySettled = true;
-  renderCommunityDailyResult(payload);
+  renderCommunityDailyResult({ payload, failure });
 }
 
 if (typeof document !== "undefined") {
   renderPublicInstallerJourney();
-  void loadCommunitySnapshot();
   void loadCommunityDailySeries();
   window.addEventListener("tibotattle:locale-change", (event) => {
     setFormattingLocale(event.detail?.formatLocale ?? localization.formatLocale());
     setMessageLocale(event.detail?.locale ?? localization.locale());
     renderPublicInstallerJourney();
-    if (communitySnapshotSettled) {
-      renderCommunityResult({
-        payload: lastCommunitySnapshotPayload,
-        failure: lastCommunitySnapshotFailure,
-      });
-    }
     if (communityDailySettled) {
-      renderCommunityDailyResult(lastCommunityDailyPayload);
+      renderCommunityDailyResult({
+        payload: lastCommunityDailyPayload,
+        failure: lastCommunityDailyFailure,
+      });
     }
     localization.localizeTree();
   });

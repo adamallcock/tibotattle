@@ -291,8 +291,11 @@ async function serveReleaseOutput(output) {
 }
 
 function assertPublicEntryClaimBoundary(html, label = "public entry") {
-  assert.match(html, /Community activity snapshot/u, label);
+  assert.match(html, /Community daily activity/u, label);
   assert.match(html, /delayed, aggregate activity/u, label);
+  // The retired sealed-snapshot presentation must not resurface on the
+  // published site: daily revisions are the only public activity surface.
+  assert.doesNotMatch(html, /snapshot/iu, label);
   assert.doesNotMatch(
     html,
     /Community seven-day estimate|community allowance|community estimate|community capacity|best guess|privacy[- ]reviewed|privacy and quality checks|privacy-safe community/u,
@@ -531,7 +534,7 @@ test("public static routes keep root, community, docs, privacy, and fallback out
     }
   }
   assert.match(root, /<h1 id="install-title">See where your Codex allowance stands\.<\/h1>/u);
-  assert.match(root, /id="community-result"/u);
+  assert.match(root, /id="community-daily-result"/u);
   assert.match(root, /id="installer-unavailable-action"[\s\S]*disabled/u);
   assert.match(root, /Public download coming soon\./u);
   assert.equal(community, root, "the community route must use the public entry alias");
@@ -725,9 +728,9 @@ test("checked-in public source satisfies the complete release contract", async (
   // The install call to action and the community view are present; the
   // companion-only dashboard surfaces are not.
   assert.match(html, /id="installer-link"/u);
-  assert.match(html, /id="community-result"/u);
+  assert.match(html, /id="community-daily-result"/u);
   assert.match(html, /src="\.\/community\.js"/u);
-  assert.match(html, /id="community-title">Community activity snapshot<\/h2>/u);
+  assert.match(html, /id="community-title">Community daily activity<\/h2>/u);
   const publishedHtml = [html, docsHtml, privacyHtml].join("\n");
   for (
     const dashboardOnly of [
@@ -790,7 +793,10 @@ test("checked-in public source satisfies the complete release contract", async (
     );
   }
   assert.match(publishedJavaScript, /COMMUNITY_ROOT = "\/api\/v1"/u);
-  assert.match(publishedJavaScript, /stats\/aggregate/u);
+  assert.match(publishedJavaScript, /community\/daily/u);
+  // The public entry no longer requests the sealed weekly aggregate; the
+  // published JavaScript must not carry that URL.
+  assert.doesNotMatch(publishedJavaScript, /stats\/aggregate/u);
   assert.doesNotMatch(
     html,
     /<meta name="usage-monitor-installer-bytes" content="">/u,
