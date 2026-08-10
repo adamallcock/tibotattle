@@ -283,6 +283,7 @@ const API_ROUTES = new Set([
   "/api/local/contribution/automatic-disable",
   "/api/local/contribution/incremental-status",
   "/api/local/contribution/incremental-approve",
+  "/api/local/contribution/incremental-run",
   "/api/local/accounting/fast-mode-preference",
 ]);
 
@@ -1522,6 +1523,23 @@ const INCREMENTAL_SYNC_OUTCOME_CODE = /^[a-z][a-z0-9_]{0,63}$/u;
 const INCREMENTAL_SYNC_DAY = /^\d{4}-\d{2}-\d{2}$/u;
 
 /**
+ * A sqlite error that means the unified index is momentarily held by another
+ * local writer (the foreground refresh/indexer ingesting rollouts) — primary
+ * result codes SQLITE_BUSY (5) and SQLITE_LOCKED (6), including their
+ * extended variants in the low byte. Everything else (corruption, missing
+ * table, I/O) is NOT coordination and must keep failing loudly.
+ */
+function unifiedIndexBusyError(error) {
+  if (error?.code !== "ERR_SQLITE_ERROR") return false;
+  if (Number.isSafeInteger(error.errcode)) {
+    const primary = error.errcode & 0xff;
+    return primary === 5 || primary === 6;
+  }
+  return /database is locked|database table is locked/iu
+    .test(typeof error.message === "string" ? error.message : "");
+}
+
+/**
  * The bounded status the dashboard's incremental surface reads: consent
  * state, cursor progress as day counts and the acknowledged watermark day,
  * pause reason as a fixed code. No path, no content, no identifier.
@@ -2431,6 +2449,21 @@ function createPreparedLocalCompanionServer({
               stateFile: statePaths.contributionDeviceStateFile,
               signal,
             });
+          } catch (error) {
+            // 2026-08-10 (observed live): a foreground ingest writing the
+            // unified index while a pass reads it surfaced as an anonymous
+            // run_failed with an escalating ladder. It is expected local
+            // coordination — name it, mark it retryable-soon, and let the
+            // controller retry within the pending minute.
+            if (unifiedIndexBusyError(error)) {
+              const busy = new Error(
+                "unified index momentarily held by another local writer",
+              );
+              busy.code = "index_busy";
+              busy.retryable = true;
+              throw busy;
+            }
+            throw error;
           } finally {
             contributionSyncInProgress = false;
           }
@@ -3061,6 +3094,46 @@ function createPreparedLocalCompanionServer({
         } catch {
           // deliberately ignored
         }
+        return;
+      }
+      if (path === "/api/local/contribution/incremental-run") {
+        // 2026-08-10 (observed live): during the first 86-day backfill the
+        // operator's only lever against an inherited retry backoff was
+        // waiting it out — resume() was reachable only through the
+        // device-pair route. This is that lever: reset the ladder, schedule
+        // now, and start the due pass in this tick. No consent bypass —
+        // resume() re-arms nothing without current consent, and the honest
+        // projection below reports exactly what it did or refused to do.
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        if (!await authorizeLocalMutation(
+          request,
+          response,
+          "sync_control_not_authorized",
+        )) return;
+        if (incrementalContribution === null) {
+          sendError(response, 409, "incremental_sync_not_configured");
+          return;
+        }
+        let status;
+        try {
+          status = await incrementalContribution.resume();
+        } catch {
+          sendError(response, 500, "sync_control_failed");
+          return;
+        }
+        // Same best-effort immediate pass as the approval and re-pair kicks:
+        // the scheduled attempt survives if this tick's run fails closed.
+        try {
+          void incrementalContribution.runDue?.()?.catch?.(() => {});
+        } catch {
+          // deliberately ignored
+        }
+        send(response, 200, incrementalSyncStatusProjection(status, {
+          configured: true,
+        }));
         return;
       }
       if (path === "/api/local/accounting/fast-mode-preference") {

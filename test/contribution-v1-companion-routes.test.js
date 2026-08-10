@@ -495,3 +495,89 @@ test("an unconfigured companion refuses the approval and a device pairing resume
     await rm(files.root, { recursive: true });
   }
 });
+
+test("the local kick route resumes the schedule now and starts a due pass (2026-08-10)", async () => {
+  // The operator's lever against an inherited retry backoff: during the live
+  // 86-day backfill stall, resume() was reachable only through device-pair,
+  // and the only alternative was waiting the ladder out.
+  const files = await fixture();
+
+  // Unconfigured companion: the route exists and refuses honestly.
+  const bare = await startApp(files);
+  try {
+    const base = `http://127.0.0.1:${bare.port}`;
+    const refused = await fetch(
+      `${base}/api/local/contribution/incremental-run`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1",
+          Origin: base,
+        },
+        body: "{}",
+      },
+    );
+    assert.equal(refused.status, 409);
+    assert.equal(
+      (await refused.json()).error.code,
+      "incremental_sync_not_configured",
+    );
+  } finally {
+    await bare.close();
+  }
+
+  const controller = fakeIncrementalController();
+  const app = await startApp(files, {
+    incrementalContributionController: controller,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+
+    // Guarded exactly like the other sync controls: POST only, same-origin
+    // first-party callers only.
+    assert.equal(
+      (await fetch(`${base}/api/local/contribution/incremental-run`)).status,
+      405,
+    );
+    const foreign = await fetch(
+      `${base}/api/local/contribution/incremental-run`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      },
+    );
+    assert.equal(foreign.status, 403);
+    assert.equal(controller.calls.resume, 0);
+
+    await controller.approve();
+    const response = await fetch(
+      `${base}/api/local/contribution/incremental-run`,
+      { method: "POST", headers, body: "{}" },
+    );
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    assert.equal(body.includes(PRIVATE_CANARY), false);
+    const status = JSON.parse(body);
+    assert.equal(
+      status.schemaVersion,
+      "local-incremental-contribution-sync-v1.0",
+    );
+    assert.equal(status.status, "available");
+    assert.equal(status.consent.approved, true);
+    // resume() reset the ladder and re-armed the schedule...
+    assert.equal(controller.calls.resume, 1);
+    // ...and the due pass starts in this tick, not on a timer.
+    await settleKicks();
+    assert.equal(controller.calls.runDue >= 1, true);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
