@@ -32,6 +32,10 @@ import {
   readStableReleaseManifest,
   validateMacOSDMG,
 } from "./macos-release-core.js";
+import {
+  hasSparkleSignedFeedTrailer,
+  validateSignedSparkleFeed,
+} from "./sparkle-signed-feed-validation.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
@@ -611,6 +615,57 @@ export function validateCandidateAppcastShape(text, channelName, {
   assertCanonicalStableAppcast(text, channel, enclosures, appcastPolicy);
   assertDeltaEnclosurePlacement(text, enclosures);
   return enclosures;
+}
+
+/**
+ * 2026-08-10 incident preflight. Every installed stable client ships
+ * SURequireSignedFeed=true, so the moment an unsigned appcast document goes
+ * live the entire fleet shows "The update feed is improperly signed and
+ * could not be validated" and stops updating. Refuse an unsigned stable
+ * candidate outright, before any network call; and when the candidate does
+ * carry the generate_appcast `sparkle-signatures` trailer, validate it
+ * completely (trailer well-formedness, declared length, Ed25519 envelope,
+ * the exact official document shape the Worker guard accepts, and enclosure
+ * consistency with the release DMG bytes) with named failure reasons.
+ *
+ * Scoped to the reviewed full-only stable policy: the injectable
+ * delta-enabled policy seam (specs only) bypasses this preflight because
+ * scripts/sparkle-signed-feed-validation.js must be extended for a
+ * delta-carrying signed feed before that policy flip can ever land.
+ */
+function assertStableCandidateFeedSigned({
+  appcastText,
+  channel,
+  dmgBytes,
+  dmgFileName,
+  dmgSha256,
+  manifest,
+  sparklePublicKey,
+}) {
+  if (!hasSparkleSignedFeedTrailer(appcastText)) {
+    fail(
+      "Stable appcast candidate is not feed-signed: installed clients set SURequireSignedFeed and would refuse it. Generate the stable appcast with scripts/generate-sparkle-appcast.js --channel stable, which drives the pinned official generate_appcast and embeds the signed sparkle-signatures trailer.",
+      "SPARKLE_UPDATE_STABLE_FEED_UNSIGNED",
+    );
+  }
+  const validated = validateSignedSparkleFeed({
+    appcastText,
+    dmg: {
+      bytes: dmgBytes,
+      fileName: dmgFileName,
+      sha256: dmgSha256,
+      size: dmgBytes.length,
+    },
+    objectPrefix: channel.sparkle.objectPrefix,
+    publicEdKey: sparklePublicKey.encoded,
+    updateOrigin: channel.sparkle.origin,
+  });
+  if (validated.bundleVersion !== manifest.bundleVersion) {
+    fail(
+      `Signed stable appcast advertises bundle version ${validated.bundleVersion} but the release manifest records ${manifest.bundleVersion}`,
+      "SPARKLE_UPDATE_APPCAST_VERSION_MISMATCH",
+    );
+  }
 }
 
 function immutableObjectKeys({ bundleVersion, fileName, sha256, channel }) {
@@ -1682,6 +1737,18 @@ export async function publishSparkleUpdate({
   const appcastBytes = await readFile(appcast.path);
   if (appcastBytes.length !== appcast.size) {
     fail("Appcast changed while it was being read");
+  }
+  if (releaseChannel.name === "stable"
+      && appcastPolicy.allowDeltaFrom !== true) {
+    assertStableCandidateFeedSigned({
+      appcastText: appcastBytes.toString("utf8"),
+      channel: releaseChannel,
+      dmgBytes: dmgWithSha256.bytes,
+      dmgFileName: basename(dmg.path),
+      dmgSha256: observedDMGSha256,
+      manifest,
+      sparklePublicKey: normalizedSparklePublicKey,
+    });
   }
   const appcastUpdate = validateAppcast(
     appcastBytes.toString("utf8"),
