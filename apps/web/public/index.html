@@ -766,35 +766,20 @@
         inert
       >
         <!--
-          The guided journey, stated as stages with visible state. Every chip
-          and detail line is rendered from measured facts: companion health,
-          the counted index sources, the freshness of local evidence, and the
-          sign-in / connection state. Each detail line is one short sentence
-          (owner-directed 2026-08-08: the previous multi-clause copy wrapped
-          to eight lines at typical widths), and the whole journey states the
-          final flow: sign in → connect → approve once → syncs automatically.
+          The guided journey, stated as stages with visible state, rendered
+          from measured facts. Trimmed to two boxes (owner-directed,
+          2026-08-10): the "Mac app & companion" box was self-referential —
+          this dashboard rendering at all already proves the companion
+          answers — and the "Local evidence" observation time is a fact, not
+          a stage, so it now rides as the index box's second clause.
         -->
         <ol class="journey-stages" id="community-journey" aria-label="Contribution journey stages" data-i18n-aria-label="aria.contributionJourney">
-          <li class="journey-stage" id="journey-stage-app">
-            <p class="journey-stage-head">
-              <span class="journey-stage-name">Mac app &amp; companion</span>
-              <span class="evidence-chip neutral journey-stage-state" id="journey-stage-app-state">—</span>
-            </p>
-            <p class="journey-stage-detail" id="journey-stage-app-detail"></p>
-          </li>
           <li class="journey-stage" id="journey-stage-index">
             <p class="journey-stage-head">
               <span class="journey-stage-name">Local usage index</span>
               <span class="evidence-chip neutral journey-stage-state" id="journey-stage-index-state">—</span>
             </p>
             <p class="journey-stage-detail" id="journey-stage-index-detail"></p>
-          </li>
-          <li class="journey-stage" id="journey-stage-evidence">
-            <p class="journey-stage-head">
-              <span class="journey-stage-name">Local evidence</span>
-              <span class="evidence-chip neutral journey-stage-state" id="journey-stage-evidence-state">—</span>
-            </p>
-            <p class="journey-stage-detail" id="journey-stage-evidence-detail"></p>
           </li>
           <li class="journey-stage" id="journey-stage-community">
             <p class="journey-stage-head">

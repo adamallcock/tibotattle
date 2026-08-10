@@ -733,15 +733,15 @@ h1 {
 /*
  * (27) The guided journey, stated as numbered stages with visible state. Each
  * card carries a chip (done / in progress / waiting / action needed) and one
- * measured detail line, so the order of the work — app, index, evidence,
- * sign-in and connection — is on screen before any effort is invested below.
+ * measured detail line. Two boxes since 2026-08-10 (owner-directed): the
+ * companion box was self-referential and the evidence time is the index
+ * box's second clause, so the strip fits one comfortable row.
  */
 .journey-stages {
   display: grid;
-  /* 240px minimum (owner-directed, 2026-08-08): at 200px the four cards'
-     detail sentences wrapped to as many as eight lines. Wider columns plus
-     the one-sentence copy keep each card to a line or two, and below the
-     four-up width the grid folds to two-up instead of overflowing. */
+  /* 240px minimum (owner-directed, 2026-08-08): narrower columns wrapped the
+     detail sentences to as many as eight lines. With two cards this folds to
+     one column only on genuinely narrow screens. */
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
   gap: var(--space-3);
   margin: 0;

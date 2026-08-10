@@ -8207,12 +8207,14 @@ const JOURNEY_STATE_KEYS = Object.freeze({
 });
 
 /**
- * The guided journey as explicit stages with visible state: app/companion →
- * index building → evidence → community. Every line is rendered from a
- * measured fact — companion health, the counted index sources (the same
- * numbers as the history progress surface), evidence freshness, and the
- * sign-in/connection facts — and each stage says plainly whether it is done,
- * in progress with real numbers, or blocked and by what.
+ * The guided journey as explicit stages with visible state: index building →
+ * community. Every line is rendered from a measured fact — the counted index
+ * sources (the same numbers as the history progress surface), evidence
+ * freshness, and the sign-in/connection facts. Trimmed from four boxes to
+ * two (owner-directed, 2026-08-10): the "Mac app & companion" box was
+ * self-referential — this dashboard rendering at all proves the companion
+ * answers — and the "Local evidence" observation time is a fact, not a
+ * stage, so it rides as the index box's second clause.
  */
 function renderCommunityJourney() {
   if (!$("#community-journey")) return;
@@ -8228,45 +8230,46 @@ function renderCommunityJourney() {
     item.className = `journey-stage journey-stage-${state}`;
   };
 
-  // 1 — the Mac app and its loopback companion.
-  if (localCompanionHealth !== null) {
-    stage("app", "done", "journey.app.connected");
-  } else {
-    stage("app", "action", "journey.app.missing");
-  }
-
-  // 2 — the local index, with the same measured counts the history progress
-  // surface reports. Nothing here estimates a finish time.
+  // 1 — the local index, with the same measured counts the history progress
+  // surface reports, plus the newest local observation as the same line's
+  // second fact. Nothing here estimates a finish time.
   const history = dashboard?.pricing?.historyCoverage
     ?? dashboard?.accounting?.historyCoverage
     ?? null;
   const totalSources = finite(history?.sourceCount, 0);
+  const observedAt = dashboard && dashboard.mode !== "demo"
+    && dashboard.freshness?.latestObservedAt
+    ? formatLocal(dashboard.freshness.latestObservedAt)
+    : null;
   if (dashboard && dashboard.mode !== "demo" && history?.status === "complete") {
-    stage("index", "done", "journey.index.complete");
+    if (observedAt === null) {
+      stage("index", "done", "journey.index.complete");
+    } else {
+      stage("index", "done", "journey.index.completeWithEvidence", {
+        time: observedAt,
+      });
+    }
   } else if (dashboard && dashboard.mode !== "demo" && totalSources > 0) {
     // The same measured counts the history progress surface reports, stated
     // as one short sentence: the two-sentence byte breakdown wrapped this
     // card to eight lines (owner-directed tightening, 2026-08-08).
-    stage("index", "progress", "journey.index.progress", {
+    const counts = {
       indexed: formatNumber(finite(history.indexedSourceCount, 0)),
       total: formatNumber(totalSources),
-    });
+    };
+    if (observedAt === null) {
+      stage("index", "progress", "journey.index.progress", counts);
+    } else {
+      stage("index", "progress", "journey.index.progressWithEvidence", {
+        ...counts,
+        time: observedAt,
+      });
+    }
   } else {
     stage("index", "waiting", "journey.index.waiting");
   }
 
-  // 3 — local evidence.
-  if (dashboard && dashboard.mode !== "demo" && dashboard.freshness?.latestObservedAt) {
-    stage("evidence", "done", "journey.evidence.ready", {
-      time: formatLocal(dashboard.freshness.latestObservedAt),
-    });
-  } else if (dashboard?.mode === "demo") {
-    stage("evidence", "action", "journey.evidence.demo");
-  } else {
-    stage("evidence", "action", "journey.evidence.missing");
-  }
-
-  // 4 — sign in, then the single review-and-approve ceremony (owner-directed
+  // 2 — sign in, then the single review-and-approve ceremony (owner-directed
   // 2026-08-08: connecting is no longer a user-visible step — the ceremony
   // pairs this Mac itself). Once approval stands the line states the flow's
   // remaining truth: it syncs automatically.

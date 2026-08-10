@@ -5929,9 +5929,12 @@ test("the community journey states its stages and gates effort behind sign-in an
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
-  // The four stages, in journey order, at the top of the community section:
-  // app/companion → index building → evidence → sign in & approve.
-  const stagePositions = ["app", "index", "evidence", "community"].map((name) => {
+  // Two stages, in journey order, at the top of the community section
+  // (owner-directed 2026-08-10): index building → sign in & approve. The
+  // "Mac app & companion" box was self-referential — the dashboard rendering
+  // at all proves the companion answers — and the "Local evidence"
+  // observation time rides as the index box's second clause.
+  const stagePositions = ["index", "community"].map((name) => {
     const id = `id="journey-stage-${name}"`;
     assert.match(html, new RegExp(id, "u"));
     assert.match(html, new RegExp(`id="journey-stage-${name}-state"`, "u"));
@@ -5939,6 +5942,12 @@ test("the community journey states its stages and gates effort behind sign-in an
     return html.indexOf(id);
   });
   assert.deepEqual(stagePositions, [...stagePositions].sort((a, b) => a - b));
+  assert.doesNotMatch(html, /journey-stage-app|journey-stage-evidence/u);
+  assert.doesNotMatch(appSource, /journey\.app\.|journey\.evidence\./u);
+  assert.match(
+    appSource,
+    /stage\("index", "done", "journey\.index\.completeWithEvidence", \{/u,
+  );
   // Authorization state is visible before the action buttons: the strip
   // precedes the sign-in block, which precedes the approve-once surface
   // (re-pinned 2026-08-08: the prepare/review disclosure is removed).
@@ -5953,7 +5962,7 @@ test("the community journey states its stages and gates effort behind sign-in an
   // two-sentence byte breakdown that wrapped the card to eight lines.
   assert.match(
     appSource,
-    /stage\("index", "progress", "journey\.index\.progress", \{/u,
+    /stage\("index", "progress", "journey\.index\.progress", counts\);/u,
   );
   // Re-pinned 2026-08-08 (one-step flow): journey.community.connectNext left
   // with the connect step; the signed-in state points straight at the single
@@ -5961,9 +5970,9 @@ test("the community journey states its stages and gates effort behind sign-in an
   // not advertised the v1.0 transport yet.
   for (const locale of SUPPORTED_LOCALES) {
     for (const key of [
-      "journey.app.connected",
-      "journey.app.missing",
       "journey.index.complete",
+      "journey.index.completeWithEvidence",
+      "journey.index.progressWithEvidence",
       "journey.index.waiting",
       "journey.community.signInFirst",
       "journey.community.waitingIndex",

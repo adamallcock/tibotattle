@@ -657,45 +657,34 @@ export const WEB_MESSAGES = Object.freeze({
   "journey.state.inProgress": ["In progress", "进行中", "En curso"],
   "journey.state.actionNeeded": ["Action needed", "需要操作", "Acción necesaria"],
   "journey.state.waiting": ["Waiting", "等待中", "En espera"],
-  "journey.app.connected": [
-    "The Mac app's companion is answering.",
-    "Mac 应用的伴随程序正在响应。",
-    "El acompañante de la app está respondiendo.",
-  ],
-  "journey.app.missing": [
-    "Open TiboTattle from Applications.",
-    "请从“应用程序”打开 TiboTattle。",
-    "Abre TiboTattle desde Aplicaciones.",
-  ],
+  // The journey strip is two boxes (owner-directed, 2026-08-10): the
+  // "Mac app & companion" stage was self-referential and its keys left with
+  // it, and the "Local evidence" observation time now rides as the index
+  // line's second clause via the …WithEvidence variants below.
   "journey.index.progress": [
     "Indexing {indexed} of {total} sources.",
     "正在索引 {total} 个来源中的第 {indexed} 个。",
     "Indexando {indexed} de {total} fuentes.",
+  ],
+  "journey.index.progressWithEvidence": [
+    "Indexing {indexed} of {total} sources · latest observation {time}.",
+    "正在索引 {total} 个来源中的第 {indexed} 个 · 最新观测 {time}。",
+    "Indexando {indexed} de {total} fuentes · última observación {time}.",
   ],
   "journey.index.complete": [
     "The discovered history is fully indexed.",
     "已发现的历史记录已全部编入索引。",
     "El historial descubierto está completamente indexado.",
   ],
+  "journey.index.completeWithEvidence": [
+    "History indexed · latest observation {time}.",
+    "历史已索引 · 最新观测 {time}。",
+    "Historial indexado · última observación {time}.",
+  ],
   "journey.index.waiting": [
     "Waiting for the first local analysis.",
     "正在等待第一次本地分析。",
     "A la espera del primer análisis local.",
-  ],
-  "journey.evidence.ready": [
-    "Latest observation {time}.",
-    "最新观测：{time}。",
-    "Última observación: {time}.",
-  ],
-  "journey.evidence.demo": [
-    "Labeled demo figures, not your usage.",
-    "这是带标注的演示数据，不是你的使用情况。",
-    "Cifras de demostración etiquetadas, no tu uso.",
-  ],
-  "journey.evidence.missing": [
-    "Analyze local usage to build evidence.",
-    "请分析本地使用情况以建立证据。",
-    "Analiza el uso local para generar evidencia.",
   ],
   "journey.community.waitingCompanion": [
     "Waiting for the Mac app first.",
@@ -1072,9 +1061,7 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   ],
   // The community guided journey: stage names, the collapsed review card, and
   // the approve-once incremental consent surface.
-  "Mac app & companion": ["Mac 应用与伴随程序", "App para Mac y acompañante"],
   "Local usage index": ["本地使用索引", "Índice de uso local"],
-  "Local evidence": ["本地证据", "Evidencia local"],
   "Sign in & approve": ["登录并核准", "Iniciar sesión y aprobar"],
   "This summary is the review": ["这份摘要就是审阅", "Este resumen es la revisión"],
   "Check summary again": ["再次检查摘要", "Volver a comprobar el resumen"],
