@@ -543,6 +543,11 @@ export const WEB_MESSAGES = Object.freeze({
     "在检测到的 {total} 个时段中显示最显著的 {shown} 个。",
     "Mostrando los {shown} más amplios de {total} períodos detectados.",
   ],
+  "divergence.methodCaveat": [
+    "Known limitation: the expected line prices every model at one blended rate, so a stretch dominated by a single model can read as divergence. A per-model expected line is planned.",
+    "已知局限：预期线以单一混合费率为所有模型计价，因此以单一模型为主的时段可能显示为背离。按模型区分的预期线已在计划中。",
+    "Limitación conocida: la línea esperada valora todos los modelos con una única tarifa combinada, por lo que un período dominado por un solo modelo puede aparecer como divergencia. Está prevista una línea esperada por modelo.",
+  ],
   "divergence.speed.fast": ["fast", "快速", "rápida"],
   "divergence.speed.standard": ["standard", "标准", "estándar"],
   "divergence.speed.unknown": ["unknown", "未知", "desconocida"],

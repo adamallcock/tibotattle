@@ -4368,6 +4368,7 @@ function renderDivergencePeriods(data, points) {
   const list = $("#divergence-list");
   const empty = $("#divergence-empty");
   const summary = $("#divergence-summary");
+  const caveat = $("#divergence-caveat");
   if (!list || !empty || !summary) return;
   clear(list);
 
@@ -4378,6 +4379,7 @@ function renderDivergencePeriods(data, points) {
   if (!result.periods.length) {
     list.hidden = true;
     summary.hidden = true;
+    if (caveat) caveat.hidden = true;
     empty.hidden = false;
     // "Nothing diverged" and "there is no drift series to judge" are different
     // facts: the historical artifact view carries no per-window reset anchors,
@@ -4392,6 +4394,15 @@ function renderDivergencePeriods(data, points) {
   empty.hidden = true;
   list.hidden = false;
   summary.hidden = false;
+  // Honest-estimator label (2026-08-10): the constant-rate expected line
+  // reads model-mix shifts as divergence (established by the full-history
+  // deviation investigation — sol-heavy stretches imply ~$2,300/100pp and
+  // terra-heavy ~$1,100 against one blended constant). Until the per-model
+  // expected line ships, every listed period carries this caveat.
+  if (caveat) {
+    caveat.hidden = false;
+    setLocalizedText(caveat, "divergence.methodCaveat");
+  }
   if (result.truncated) {
     setLocalizedText(summary, "divergence.truncated", {
       shown: formatNumber(result.periods.length),
