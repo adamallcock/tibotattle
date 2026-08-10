@@ -103,13 +103,16 @@ export function weeklyPaceSnapshotsFromCollectorRecord(record) {
   });
 }
 
+// Track identity is (limit, duration) plus reset/plan facets. Slot is a
+// server-assigned UI role — the weekly window flipped secondary -> primary
+// around 2026-07-06 — so it stays visible metadata on the snapshot but never
+// splits one continuous track's observations.
 function sameTrack(left, right) {
   return left.accountTrackId === right.accountTrackId
     && left.provider === right.provider
     && left.planType === right.planType
     && left.planVariant === right.planVariant
     && left.limitId === right.limitId
-    && left.slot === right.slot
     && left.windowDurationMinutes === right.windowDurationMinutes
     && left.resetsAt === right.resetsAt
     && left.policyEpoch === right.policyEpoch;

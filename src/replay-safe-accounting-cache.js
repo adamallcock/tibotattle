@@ -654,11 +654,16 @@ function quotaTimelineTrackBucketKey(row) {
   // Preserve the exact observed point. Collapsing to a 15-minute bucket can
   // erase the closest points to an exact comparison endpoint and manufacture
   // an otherwise avoidable missing-bracket status.
-  return `${observedMs}:${row.limitId}:${row.slot}:${row.durationMinutes}`;
+  return `${observedMs}:${row.limitId}:${row.durationMinutes}`;
 }
 
+// Track identity is (limitId, duration). The provider's primary/secondary
+// slots are server-assigned UI roles — the weekly window flipped from
+// `secondary` to `primary` around 2026-07-06 — so slot stays on the row as
+// display provenance but never keys a track: keying on it split one
+// continuous weekly series into two tracks at the flip.
 function quotaTimelineTrackKey(row) {
-  return `${row.limitId}:${row.slot}:${row.durationMinutes}`;
+  return `${row.limitId}:${row.durationMinutes}`;
 }
 
 function quotaTimelineBucketKey(row) {
@@ -677,10 +682,16 @@ function quotaTimelineStateKey(row) {
 }
 
 function quotaTimelineRowTieBreak(row) {
+  // Percent is zero-padded so the string compare is numeric: between two
+  // same-instant readings of one track the lower displayed percentage wins.
+  // Slot is deliberately LAST: it is display provenance, not identity, and
+  // only breaks the tie when the state is otherwise identical so retention
+  // stays order-independent.
   return [
     row.planType,
-    row.usedPercent.toFixed(3),
+    row.usedPercent.toFixed(3).padStart(7, "0"),
     row.resetAt,
+    row.slot,
   ].join("\0");
 }
 
@@ -821,9 +832,10 @@ function quotaTimelineRangeAnchors(sortedRows) {
 }
 
 // Time stratification alone is not enough when several tracks share the range:
-// at equal timestamps one slot always sorts first, so a single stratified pass
-// can spend the whole budget on that slot and erase the other one. Give every
-// track its own stratified share and interleave them.
+// at equal timestamps one track always sorts first, so a single stratified
+// pass can spend the whole budget on that track and erase the other one. Give
+// every (limitId, duration) track its own stratified share and interleave
+// them.
 function selectTrackBalancedQuotaTimelineRows(rows, maximum, rangeRows) {
   if (rows.length <= maximum) return rows;
   const byTrack = new Map();
@@ -1002,6 +1014,10 @@ function weeklyPaceSnapshotProjection(snapshot) {
   };
 }
 
+// Slot is deliberately absent: it is a server-assigned UI role, and the
+// weekly window flipped secondary -> primary around 2026-07-06. Keeping it in
+// the track key excluded the pre-flip observations from the pace history of
+// what is one continuous (limit, duration, reset) track.
 function paceTrackKey(row, includeReset = true) {
   return [
     row.accountTrackId,
@@ -1009,7 +1025,6 @@ function paceTrackKey(row, includeReset = true) {
     row.planType,
     row.planVariant,
     row.limitId,
-    row.slot,
     row.windowDurationMinutes,
     ...(includeReset ? [row.resetsAt] : []),
     row.policyEpoch,
@@ -1659,6 +1674,7 @@ async function deriveBoundedWeeklyCalibrationSeries({
   rateLimitSnapshots.length = 0;
   transitions.sort((left, right) => left.eventTime.localeCompare(right.eventTime)
     || left.resetIdentity.localeCompare(right.resetIdentity)
+    || left.windowDurationMins - right.windowDurationMins
     || left.slot.localeCompare(right.slot));
   return { transitions, deduplicatedSnapshotCount };
 }
@@ -1904,7 +1920,10 @@ async function readUnifiedIndexCalibrationCorpus({
         usedPercent,
         resetsAtSec,
       };
-      const groupKey = `${projected.slot}\0${projected.planType}\0${resetsAtSec}`;
+      // Slot is a UI role, not identity: a run of identical displayed states
+      // that crosses the server-side slot flip is still one run of the same
+      // (limit, duration, reset) window.
+      const groupKey = `${projected.planType}\0${resetsAtSec}`;
       const run = groupRuns.get(groupKey);
       if (run !== undefined && run.usedPercent === usedPercent) {
         // Same displayed state as the previous observation of this window:

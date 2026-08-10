@@ -150,10 +150,14 @@ function knownScope(row) {
     && Boolean(row.planType && row.planType !== "unknown");
 }
 
+// Slot is retained as a row field but excluded from partitions: it is a
+// server-assigned UI role (the weekly window flipped secondary -> primary
+// around 2026-07-06), so partition identity is (limit, duration) with
+// resetsAt as the instance facet.
 function resetPartition(row) {
   return [
     row.accountScopeId ?? "unattributed", row.planVariant ?? "unknown", row.provider ?? "unknown",
-    row.planType ?? "unknown", row.limitId ?? "unknown", row.slot ?? "unknown",
+    row.planType ?? "unknown", row.limitId ?? "unknown",
     row.windowDurationMins ?? "unknown", row.resetsAt ?? "unknown",
   ].join("\u001f");
 }
@@ -161,7 +165,7 @@ function resetPartition(row) {
 function basePartition(row) {
   return [
     row.accountScopeId ?? "unattributed", row.planVariant ?? "unknown", row.provider ?? "unknown",
-    row.planType ?? "unknown", row.limitId ?? "unknown", row.slot ?? "unknown",
+    row.planType ?? "unknown", row.limitId ?? "unknown",
     row.windowDurationMins ?? "unknown",
   ].join("\u001f");
 }

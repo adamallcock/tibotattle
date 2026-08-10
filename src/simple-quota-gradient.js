@@ -48,13 +48,15 @@ function mainWeeklyReset(intervals) {
   const counts = new Map();
   for (const interval of intervals) {
     if (interval.windowDurationMins !== WEEKLY_WINDOW_MINS || !Number.isFinite(interval.resetsAt)) continue;
+    // Slot is a server-assigned UI role, not identity: the weekly window
+    // flipped secondary -> primary around 2026-07-06 and must remain one
+    // series. Identity is (limit, duration) with resetsAt as instance facet.
     const key = [
       interval.accountScopeId ?? "unattributed",
       interval.planVariant ?? "unknown",
       interval.provider,
       interval.planType,
       interval.limitId,
-      interval.slot,
       interval.windowDurationMins,
       interval.resetsAt,
     ].join("|");
@@ -71,7 +73,6 @@ function sameReset(row, selected) {
     && row.provider === selected.provider
     && row.planType === selected.planType
     && row.limitId === selected.limitId
-    && row.slot === selected.slot
     && row.windowDurationMins === selected.windowDurationMins
     && row.resetsAt === selected.resetsAt;
 }

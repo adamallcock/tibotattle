@@ -20,6 +20,10 @@ function median(values) {
   return quantile(values, 0.5);
 }
 
+// Slot is deliberately not part of series identity: it is a server-assigned
+// UI role, and the weekly window flipped secondary -> primary around
+// 2026-07-06. Identity is (limit, duration) with resetsAt as the instance
+// facet; the group's first-row slot is kept downstream as display provenance.
 function exactGroupKey(transition) {
   return [
     transition.accountScopeId ?? "unattributed",
@@ -27,7 +31,6 @@ function exactGroupKey(transition) {
     transition.provider,
     transition.planType,
     transition.limitId,
-    transition.slot,
     transition.windowDurationMins,
     transition.resetsAt,
   ].join("|");
@@ -151,7 +154,7 @@ function summarizeExactGroup(transitions) {
 function selectDuplicateResetGroups(groups) {
   const classifications = new Map();
   for (const group of groups) {
-    const key = [group.accountScopeId, group.planVariant, group.provider, group.planType, group.limitId, group.slot, group.windowDurationMins].join("|");
+    const key = [group.accountScopeId, group.planVariant, group.provider, group.planType, group.limitId, group.windowDurationMins].join("|");
     const list = classifications.get(key) ?? [];
     list.push(group);
     classifications.set(key, list);
@@ -197,7 +200,7 @@ export function analyzeWeeklyLimitHistory(dataset) {
     .sort((left, right) => left.firstObservedAt.localeCompare(right.firstObservedAt) || left.resetsAt - right.resetsAt);
   const usablePartitions = new Map();
   for (const group of allUsable) {
-    const key = [group.accountScopeId, group.planVariant, group.provider, group.planType, group.limitId, group.slot, group.windowDurationMins].join("|");
+    const key = [group.accountScopeId, group.planVariant, group.provider, group.planType, group.limitId, group.windowDurationMins].join("|");
     const values = usablePartitions.get(key) ?? [];
     values.push(group);
     usablePartitions.set(key, values);

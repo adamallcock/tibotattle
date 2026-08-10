@@ -14,6 +14,10 @@ const endAt = "2026-07-24T13:51:29.000Z";
 const weeklyWindowMins = SEVEN_DAY_WINDOW_MINUTES;
 const july13Reset = 1_784_487_650;
 
+// Slot is deliberately absent: it is a server-assigned UI role that flipped
+// secondary -> primary for the weekly window around 2026-07-06. Keying on it
+// would fail to join a diagnostic summarized under one slot with intervals
+// mined under the other. Identity is (limit, duration) plus reset facets.
 function seriesKey(row) {
   return [
     row.accountScopeId ?? "unattributed",
@@ -21,7 +25,6 @@ function seriesKey(row) {
     row.provider,
     row.planType,
     row.limitId,
-    row.slot,
     row.windowDurationMins,
     row.resetsAt,
   ].join("|");
