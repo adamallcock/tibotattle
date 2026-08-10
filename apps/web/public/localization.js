@@ -412,6 +412,7 @@ export const WEB_MESSAGES = Object.freeze({
   // The exact-windows pager (owner-directed, 2026-08-08): the shown range of
   // the full merged inspection list.
   "residual.table.page": ["{start}–{end} of {total}", "第 {start}–{end} 项，共 {total} 项", "{start}–{end} de {total}"],
+  "weekly.table.page": ["{start}–{end} of {total}", "第 {start}–{end} 项，共 {total} 项", "{start}–{end} de {total}"],
   // The signed-AUC drift figure beside MAE and peak (owner-directed,
   // 2026-08-08). The unit is percentage-point-hours.
   "dashboard.summary.cumulativeDrift": ["Cumulative drift", "累计漂移", "Deriva acumulada"],

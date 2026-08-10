@@ -347,7 +347,8 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
     "formatPp", "formatChartTimeLabel", "formatTimeZoneLabel", "timelineStatusKey",
     "setRawText", "setLocalizedText", "setLocalizedPluralText", "t", "tPlural",
     "shareCardDateLabel", "ALL_HISTORY_RANGE_DAYS",
-    "$", "clear", "node", "formatLocal", "renderWeeklyPaceForecast",
+    "$", "clear", "node", "formatLocal", "formatNumber",
+    "renderWeeklyPaceForecast",
     // renderWeekly owns the share-card re-render (owner-verified regression,
     // 2026-08-08), so the hero harness stubs it like the other renderers.
     "renderShareCard",
@@ -379,6 +380,7 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
     () => {},
     () => ({ append() {}, textContent: "" }),
     (value) => new Date(value).toISOString().slice(0, 10),
+    (value) => String(value),
     () => {},
     () => {},
     rangeDays,
@@ -5536,8 +5538,10 @@ test("the weekly allowance chart leads the dashboard", async () => {
 test("weekly details keep reset evidence concise and do not present speed coverage as known", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  // Both halves of the paginated presentation (owner-directed 2026-08-10):
+  // the row-set holder and the page renderer beneath it.
   const tableMatch = appSource.match(
-    /function renderWeeklyTable\(values\) \{([\s\S]*?)\n\}/u,
+    /function renderWeeklyTable\(values\) \{([\s\S]*?)\nfunction accountingPeriod\(data\)/u,
   );
   assert.ok(tableMatch, "renderWeeklyTable source is available for contract review");
   const tableSource = tableMatch[1];

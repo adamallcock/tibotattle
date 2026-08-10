@@ -485,6 +485,17 @@
               </tbody>
             </table>
           </div>
+          <!--
+            Pagination over the full reset-estimate row set (owner-directed,
+            2026-08-10): twenty rows per page, newest first, replacing the old
+            newest-fourteen truncation. Same pager idiom as the exact-windows
+            inspection table; the status span is written by the renderer.
+          -->
+          <div class="table-pagination" id="weekly-table-pagination" hidden>
+            <button class="button button-quiet compact" id="weekly-table-prev" type="button" disabled>Previous</button>
+            <span class="table-pagination-status" id="weekly-table-status" role="status"></span>
+            <button class="button button-quiet compact" id="weekly-table-next" type="button" disabled>Next</button>
+          </div>
         </details>
       </section>
 

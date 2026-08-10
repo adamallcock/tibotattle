@@ -5994,10 +5994,41 @@ function renderWeekly(data) {
   renderShareCard(data, { history });
 }
 
+// The Allowance page's reset-estimate table pages through its full row set
+// (owner-directed 2026-08-10) instead of truncating to the newest fourteen:
+// twenty rows per page, newest first, same pager idiom as the exact-windows
+// inspection table. The state lives beside its renderers so the render
+// harness that extracts this section gets the whole mechanism.
+const WEEKLY_TABLE_PAGE_SIZE = 20;
+let weeklyTablePage = 0;
+let weeklyTableRows = [];
+let weeklyTableSignature = "";
+
 function renderWeeklyTable(values) {
+  // Newest first over the FULL set: the old `.slice(-14)` silently dropped
+  // every earlier reset estimate. A changed row set restarts at the first
+  // page, exactly like the exact-windows inspection table: a page index only
+  // describes a position within one row set.
+  const rows = [...values].reverse();
+  const signature = `${rows.length}`
+    + `:${rows[0]?.timestamp ?? ""}`
+    + `:${rows.at(-1)?.timestamp ?? ""}`;
+  if (signature !== weeklyTableSignature) {
+    weeklyTableSignature = signature;
+    weeklyTablePage = 0;
+  }
+  weeklyTableRows = rows;
+  renderWeeklyTablePage();
+}
+
+function renderWeeklyTablePage() {
   const table = $("#weekly-table");
+  if (!table) return;
   clear(table);
-  if (!values.length) {
+  const rows = weeklyTableRows;
+  const pagination = $("#weekly-table-pagination");
+  if (!rows.length) {
+    if (pagination) pagination.hidden = true;
     const row = node("tr");
     const cell = node("td", "empty-cell", t("weekly.table.empty"));
     cell.colSpan = 5;
@@ -6005,7 +6036,11 @@ function renderWeeklyTable(values) {
     table.append(row);
     return;
   }
-  for (const row of values.slice(-14).reverse()) {
+  const pageCount = Math.ceil(rows.length / WEEKLY_TABLE_PAGE_SIZE);
+  weeklyTablePage = Math.min(Math.max(0, weeklyTablePage), pageCount - 1);
+  const start = weeklyTablePage * WEEKLY_TABLE_PAGE_SIZE;
+  const pageRows = rows.slice(start, start + WEEKLY_TABLE_PAGE_SIZE);
+  for (const row of pageRows) {
     const span = row.observedSpanPp ?? finite(row.displayed_span_pp);
     const status = isWellObservedWeeklyFit(span)
       ? t("weekly.table.wellObserved")
@@ -6023,6 +6058,19 @@ function renderWeeklyTable(values) {
     );
     table.append(tr);
   }
+  if (!pagination) return;
+  // The pager renders only when there is something to page through; a set
+  // that fits one page keeps the plain table.
+  pagination.hidden = pageCount <= 1;
+  setLocalizedText($("#weekly-table-status"), "weekly.table.page", {
+    start: formatNumber(start + 1),
+    end: formatNumber(start + pageRows.length),
+    total: formatNumber(rows.length),
+  });
+  const previous = $("#weekly-table-prev");
+  const next = $("#weekly-table-next");
+  if (previous) previous.disabled = weeklyTablePage === 0;
+  if (next) next.disabled = weeklyTablePage >= pageCount - 1;
 }
 
 function accountingPeriod(data) {
@@ -9438,6 +9486,15 @@ $("#residual-page-prev").addEventListener("click", () => {
 $("#residual-page-next").addEventListener("click", () => {
   residualTablePage += 1;
   renderResidualInspectionTable();
+});
+// Same clamped-in-renderer rule for the Allowance page's reset-estimate table.
+$("#weekly-table-prev").addEventListener("click", () => {
+  weeklyTablePage -= 1;
+  renderWeeklyTablePage();
+});
+$("#weekly-table-next").addEventListener("click", () => {
+  weeklyTablePage += 1;
+  renderWeeklyTablePage();
 });
 $("#usage-group-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-group]");
