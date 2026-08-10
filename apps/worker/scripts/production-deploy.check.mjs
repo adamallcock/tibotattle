@@ -37,6 +37,11 @@ const HEALTH_URL = `${DEPLOYMENT_ENDPOINTS.public.origin}/api/health`;
 const PUBLIC_ROOT_URL = `${DEPLOYMENT_ENDPOINTS.public.origin}/`;
 const FIXTURE_PRIMARY_MIGRATION = "0001_fixture_schema.sql";
 const FIXTURE_LEDGER_MIGRATION = "0001_fixture_ledger.sql";
+// The fixed dependency-tree digest the mocked-snapshot options carry; the
+// matching mocked dependencyDigestCheck returns the same value so the pre- and
+// post-Wrangler reverification passes. Real-snapshot tests override the check
+// with the real digest function instead.
+const FIXTURE_DEPENDENCY_DIGEST = "f".repeat(64);
 
 function git(root, arguments_) {
   return execFileSync("/usr/bin/git", ["-C", root, ...arguments_], {
@@ -174,8 +179,11 @@ function options(overrides = {}) {
     createSourceSnapshot: async () => ({
       repositoryRoot: "/immutable/repository",
       workerDirectory: "/immutable/repository/apps/worker",
+      dependencyDigest: FIXTURE_DEPENDENCY_DIGEST,
+      dependencyPath: "/immutable/repository/apps/worker/node_modules",
       cleanup: async () => {},
     }),
+    dependencyDigestCheck: async () => FIXTURE_DEPENDENCY_DIGEST,
     releasePreflight: async () => ({
       state: "ready",
       blockers: [],
@@ -213,6 +221,7 @@ test("production deployment creates a real top-level Git snapshot and passes the
     ).trim() === "",
     migrationGateCheck: null,
     createSourceSnapshot: undefined,
+    dependencyDigestCheck: undefined,
     stageAssets: async (value) => {
       stageCalls.push(value);
       const staged = await stageProductionAssets(value);
@@ -321,6 +330,9 @@ test("production deployment fails closed when the snapshot dependency link is re
         expectedTarget = await readlink(dependencyLink);
         return snapshot;
       },
+      // Use the real dependency digest so the pre-/post-Wrangler reverification
+      // matches the real snapshot; the link is repointed only later, at cleanup.
+      dependencyDigestCheck: undefined,
       releasePreflight: async () => ({ state: "ready", blockers: [] }),
       checkWorkspacePackages: async () => {},
       checkEndpoints: async () => {},
@@ -364,6 +376,54 @@ test("production deployment fails closed when the snapshot dependency link is re
       }
     }
   }
+});
+
+test("production deployment fails closed when the dependency tree digest changes before Wrangler", async () => {
+  let spawned = false;
+  const result = await runProductionDeployment(options({
+    // The snapshot recorded FIXTURE_DEPENDENCY_DIGEST; the tree now digests to a
+    // different value, modelling a post-snapshot compromise of the mutable
+    // node_modules the deploy would otherwise execute from.
+    dependencyDigestCheck: async () => "a".repeat(64),
+    releasePreflight: async () => ({ state: "ready", blockers: [] }),
+    checkWorkspacePackages: async () => {},
+    checkEndpoints: async () => {},
+    stageAssets: async () => {},
+    healthRecheck: async () => ({ ok: true, code: null }),
+    spawn: () => {
+      spawned = true;
+      return { status: 0, stdout: "deployed", stderr: "" };
+    },
+  }));
+  assert.deepEqual(result, {
+    ok: false,
+    code: "PRODUCTION_DEPENDENCY_TREE_DIGEST_MISMATCH",
+  });
+  // The mismatch is caught before Wrangler runs: no deploy is executed.
+  assert.equal(spawned, false);
+});
+
+test("production deployment fails closed when the dependency tree cannot be reverified", async () => {
+  let spawned = false;
+  const result = await runProductionDeployment(options({
+    dependencyDigestCheck: async () => {
+      throw new Error("dependency tree unreadable");
+    },
+    releasePreflight: async () => ({ state: "ready", blockers: [] }),
+    checkWorkspacePackages: async () => {},
+    checkEndpoints: async () => {},
+    stageAssets: async () => {},
+    healthRecheck: async () => ({ ok: true, code: null }),
+    spawn: () => {
+      spawned = true;
+      return { status: 0 };
+    },
+  }));
+  assert.deepEqual(result, {
+    ok: false,
+    code: "PRODUCTION_DEPENDENCY_TREE_VERIFICATION_FAILED",
+  });
+  assert.equal(spawned, false);
 });
 
 test("production deployment fails closed when generated release output is a symlink", async (t) => {
@@ -456,6 +516,8 @@ test("production deployment fails closed when immutable source snapshot setup or
     createSourceSnapshot: async () => ({
       repositoryRoot: "/immutable/repository",
       workerDirectory: "/immutable/repository/apps/worker",
+      dependencyDigest: FIXTURE_DEPENDENCY_DIGEST,
+      dependencyPath: "/immutable/repository/apps/worker/node_modules",
       cleanup: async () => {
         throw new Error("snapshot cleanup failed");
       },

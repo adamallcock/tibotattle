@@ -1,4 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import {
   cp,
@@ -391,6 +392,55 @@ async function requireAbsent(path, label) {
   throw new Error(`${label} must not already exist.`);
 }
 
+/**
+ * A deterministic content-and-structure digest of a dependency tree. The root
+ * is realpath-resolved, so a symlinked node_modules digests the bytes of its
+ * target. Entries are visited in a fixed sorted order and file content, symlink
+ * targets, sizes, and directory structure all contribute, so any post-snapshot
+ * mutation of the mutable dependency tree produces a different digest. Symlinks
+ * are recorded by target string rather than followed, so internal `.bin` links
+ * and cycles neither escape the tree nor double-count content.
+ *
+ * This is the mitigation for the ignored-node_modules gap: the snapshot records
+ * this digest, and the deploy path reverifies it immediately before and after
+ * Wrangler runs, binding the exact dependency bytes across the race window that
+ * the source revalidation alone does not cover.
+ */
+export async function dependencyTreeDigest(rootPath) {
+  const resolvedRoot = realpathSync(rootPath);
+  const hash = createHash("sha256");
+  async function walk(absolute, relativePath) {
+    const entries = await readdir(absolute, { withFileTypes: true });
+    entries.sort((left, right) => (
+      left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+    ));
+    for (const entry of entries) {
+      const childAbsolute = join(absolute, entry.name);
+      const childRelative = relativePath === ""
+        ? entry.name
+        : `${relativePath}/${entry.name}`;
+      const info = await lstat(childAbsolute);
+      if (info.isSymbolicLink()) {
+        hash.update(`L\0${childRelative}\0${await readlink(childAbsolute)}\0`);
+      } else if (info.isDirectory()) {
+        hash.update(`D\0${childRelative}\0`);
+        await walk(childAbsolute, childRelative);
+      } else if (info.isFile()) {
+        const fileHash = createHash("sha256")
+          .update(await readFile(childAbsolute))
+          .digest("hex");
+        hash.update(`F\0${childRelative}\0${info.size}\0${fileHash}\0`);
+      } else {
+        // A device, socket, or fifo has no reviewable content; its presence in a
+        // dependency tree is itself part of the structure being pinned.
+        hash.update(`O\0${childRelative}\0`);
+      }
+    }
+  }
+  await walk(resolvedRoot, "");
+  return hash.digest("hex");
+}
+
 async function verifySnapshotDependencyLink({
   dependencyPath,
   expectedTarget,
@@ -497,10 +547,17 @@ export async function createImmutableSourceSnapshot({
       dependencyDestination,
       "dir",
     );
+    // Record an immutable digest of the linked dependency tree. The deploy path
+    // reverifies this before and after Wrangler runs, so a compromise of the
+    // mutable node_modules after this point is detected and fails the deploy
+    // closed rather than crossing into release execution or the bundle.
+    const dependencyDigest = await dependencyTreeDigest(dependencyDestination);
 
     return {
       repositoryRoot: snapshotRoot,
       workerDirectory: snapshotWorker,
+      dependencyDigest,
+      dependencyPath: dependencyDestination,
       git: (root, arguments_) => runSnapshotGit(
         snapshotGitExclude,
         root,
@@ -704,6 +761,9 @@ async function runProductionDeploymentFromSnapshot({
   sourceCommit,
   snapshotRepositoryRoot,
   snapshotGit,
+  snapshotDependencyDigest,
+  snapshotDependencyPath,
+  dependencyDigestCheck = dependencyTreeDigest,
   sourceCheckDirectory,
   sourceCommitCheck = checkedOutSourceCommit,
   sourceTreeCleanCheck = checkedOutSourceTreeClean,
@@ -712,6 +772,23 @@ async function runProductionDeploymentFromSnapshot({
   healthRecheck = recheckProductionHealth,
   publicSurfaceRecheck = recheckProductionPublicSurface,
 }) {
+  // The dependency tree the deploy executes from is not under Git provenance, so
+  // it is bound by digest instead: reverify it against the snapshot digest
+  // immediately before and after Wrangler, so a mutation of the mutable tree
+  // between snapshot and execution fails closed rather than crossing into the
+  // release. Any read failure is also fail-closed.
+  const verifyDependencyDigest = async () => {
+    let current;
+    try {
+      current = await dependencyDigestCheck(snapshotDependencyPath);
+    } catch {
+      return localFailure("PRODUCTION_DEPENDENCY_TREE_VERIFICATION_FAILED");
+    }
+    if (current !== snapshotDependencyDigest) {
+      return localFailure("PRODUCTION_DEPENDENCY_TREE_DIGEST_MISMATCH");
+    }
+    return null;
+  };
   // Migration gate: the deploy source is the snapshot, so pending migrations
   // are computed from the snapshot's migration directories against the remote
   // production ledgers before any other gate runs.
@@ -821,6 +898,11 @@ async function runProductionDeploymentFromSnapshot({
   });
   if (!deploySource.ok) return deploySource;
 
+  // Same deployment boundary as the source recheck: bind the dependency bytes
+  // immediately before Wrangler executes them.
+  const preDeployDependency = await verifyDependencyDigest();
+  if (preDeployDependency) return preDeployDependency;
+
   let deployment;
   try {
     deployment = spawn(
@@ -842,6 +924,10 @@ async function runProductionDeploymentFromSnapshot({
     sourceTreeCleanCheck,
   });
   if (!postDeploySource.ok) return postDeploySource;
+  // Reverify the dependency tree after bundling, so a mutation concurrent with
+  // the Wrangler run is caught before the deploy is reported successful.
+  const postDeployDependency = await verifyDependencyDigest();
+  if (postDeployDependency) return postDeployDependency;
   if (deployment?.error || deployment?.status !== 0) {
     return localFailure("PRODUCTION_DEPLOY_FAILED");
   }
@@ -916,6 +1002,7 @@ export async function runProductionDeployment({
   sourceCommitCheck = checkedOutSourceCommit,
   sourceTreeCleanCheck = checkedOutSourceTreeClean,
   createSourceSnapshot = createImmutableSourceSnapshot,
+  dependencyDigestCheck = dependencyTreeDigest,
   releasePreflight = productionReleasePreflight,
   fetchImpl = globalThis.fetch,
   healthRecheck = recheckProductionHealth,
@@ -949,6 +1036,8 @@ export async function runProductionDeployment({
   if (!snapshot
       || typeof snapshot.repositoryRoot !== "string"
       || typeof snapshot.workerDirectory !== "string"
+      || typeof snapshot.dependencyDigest !== "string"
+      || typeof snapshot.dependencyPath !== "string"
       || typeof snapshot.cleanup !== "function") {
     if (typeof snapshot?.cleanup === "function") {
       try {
@@ -968,6 +1057,9 @@ export async function runProductionDeployment({
       workerDirectory: snapshot.workerDirectory,
       snapshotRepositoryRoot: snapshot.repositoryRoot,
       snapshotGit: snapshot.git,
+      snapshotDependencyDigest: snapshot.dependencyDigest,
+      snapshotDependencyPath: snapshot.dependencyPath,
+      dependencyDigestCheck,
       sourceCheckDirectory: workerDirectory,
       sourceCommit,
       spawn,
