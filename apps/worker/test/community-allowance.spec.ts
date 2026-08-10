@@ -155,6 +155,7 @@ function quotaSnapshot(
   index: number,
   observedTime: string,
   usedPercent: number,
+  planVariant = "pro-20x",
 ): Record<string, unknown> {
   return {
     schemaVersion: "quota-snapshot-v0.2",
@@ -163,7 +164,7 @@ function quotaSnapshot(
     receivedTime: new Date(Date.parse(observedTime) + 1_000).toISOString(),
     provider: "openai_codex",
     planType: "pro",
-    planVariant: "pro-20x",
+    planVariant,
     limitId: "codex",
     slot: "seven_day",
     usedPercent,
@@ -182,7 +183,7 @@ function quotaSnapshot(
  * snapshots (nine boundaries, 40pp displayed span) with a fully priced usage
  * event between each pair, all within one reset and one complete dataset.
  */
-function calibratableContribution(): Record<string, unknown> {
+function calibratableContribution(planVariant = "pro-20x"): Record<string, unknown> {
   const startMs = Date.parse("2026-07-25T12:00:00.000Z");
   const quotaSnapshots = [];
   const usageEvents = [];
@@ -191,6 +192,7 @@ function calibratableContribution(): Record<string, unknown> {
       index,
       new Date(startMs + index * 5 * 60_000).toISOString(),
       10 + index * 5,
+      planVariant,
     ));
     if (index < 8) {
       usageEvents.push(usageEvent(
@@ -398,7 +400,9 @@ describe("summarizeCommunityAllowanceDay", () => {
     const summary = summarizeCommunityAllowanceDay(fits, "2026-08-08");
     expect(summary.fitCount).toBe(2);
     expect(summary.centralUsd).toBe(20);
-    expect(summary.basis).toBe("seven_day_codex_trailing_30d");
+    expect(summary.basis).toBe("seven_day_codex_pro20x_trailing_30d");
+    expect(summary.planType).toBe("pro");
+    expect(summary.planVariant).toBe("pro-20x");
     expect(summary.trailingDays).toBe(30);
     expect(summary.windowDurationMinutes).toBe(10_080);
     expect(summary.limitId).toBe("codex");
@@ -486,7 +490,9 @@ describe("community allowance in the daily aggregate", () => {
     expect(contributionPayload.schemaVersion)
       .toBe("community-daily-aggregate-v1.0");
     expect(contributionPayload.allowance).toMatchObject({
-      basis: "seven_day_codex_trailing_30d",
+      basis: "seven_day_codex_pro20x_trailing_30d",
+      planType: "pro",
+      planVariant: "pro-20x",
       qualification: "shared_reset_fit_gates_no_span_floor",
       spanFloorPp: 0,
       fitCount: 1,
@@ -508,6 +514,74 @@ describe("community allowance in the daily aggregate", () => {
       centralUsd: null,
       band80Usd: null,
     });
+  });
+
+  it("excludes fits from other plan cohorts: the series is one plan, not a pool", async () => {
+    const participant = await enrolledParticipant();
+    // The identical calibratable series, but observed on a pro-5x track: the
+    // fit gates pass, yet the published Pro (20x) series must not absorb a
+    // smaller plan's allowance into its median.
+    const accepted = await upload(
+      participant,
+      calibratableContribution("pro-5x"),
+    );
+    expect(accepted.status, await accepted.clone().text()).toBe(202);
+    expect(await collectCommunityAllowanceFits(db())).toHaveLength(0);
+  });
+
+  it("re-enqueues published days whose allowance drifts when late v0.2 fits arrive", async () => {
+    // A day publishes before any v0.2 contribution exists: honest empty block.
+    await enqueueDailyRebuild("2026-07-25");
+    const initial = await rebuildPendingCommunityDailyAggregates(
+      db(),
+      Date.parse("2026-08-09T00:00:00.000Z"),
+    );
+    expect(initial).toMatchObject({ processed: 1, remaining: false });
+    const before = JSON.parse(
+      (await readLatestCommunityDailyAggregate(db(), "2026-07-25"))!
+        .payload_json,
+    ) as { revision: number; allowance: { fitCount: number } };
+    expect(before.revision).toBe(1);
+    expect(before.allowance.fitCount).toBe(0);
+
+    // A late v0.2 contribution lands. Nothing in the v0.2 path touches the
+    // rebuild queue (the 0031 trigger watches v1 chunks only) — the drift
+    // reconciliation in the rebuild pass is what must catch this.
+    const participant = await enrolledParticipant();
+    const accepted = await upload(participant, calibratableContribution());
+    expect(accepted.status, await accepted.clone().text()).toBe(202);
+    const queued = await db().prepare(
+      "SELECT COUNT(*) AS total FROM community_daily_aggregate_rebuilds",
+    ).first<{ total: number }>();
+    expect(queued?.total).toBe(0);
+
+    const reconciled = await rebuildPendingCommunityDailyAggregates(
+      db(),
+      Date.parse("2026-08-09T01:00:00.000Z"),
+    );
+    expect(reconciled).toMatchObject({
+      processed: 1,
+      remaining: false,
+      aggregateIds: ["community-daily:2026-07-25:r2"],
+    });
+    const after = JSON.parse(
+      (await readLatestCommunityDailyAggregate(db(), "2026-07-25"))!
+        .payload_json,
+    ) as {
+      revision: number;
+      allowance: { fitCount: number; centralUsd: number | null };
+    };
+    expect(after.revision).toBe(2);
+    expect(after.allowance.fitCount).toBe(1);
+    expect(after.allowance.centralUsd).toBeGreaterThan(0);
+
+    // Convergent: with the republished block matching the corpus, a further
+    // pass finds no drift and rebuilds nothing.
+    const settled = await rebuildPendingCommunityDailyAggregates(
+      db(),
+      Date.parse("2026-08-09T02:00:00.000Z"),
+    );
+    expect(settled).toMatchObject({ processed: 0, remaining: false });
   });
 
   it("excludes participants who are no longer active from the fit corpus", async () => {

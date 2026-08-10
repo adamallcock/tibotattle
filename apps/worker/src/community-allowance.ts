@@ -19,9 +19,19 @@ import { accountScopedQuotaAnalysis } from "./quota-analysis";
  * shared package's fit gates with no display-side span floor (the app's
  * allowance page applies an additional 50pp floor at render time; this series
  * publishes `spanFloorPp: 0` so the two counts are never conflated).
+ *
+ * Plan-cohort discipline, matching the weekly snapshots' cohort keying: an
+ * allowance is a property of one plan, so mixing plan cohorts would publish
+ * a median of two different products the moment a second cohort contributes.
+ * The series is therefore pinned to a single declared cohort — the basis
+ * string names it, the block carries `planType`/`planVariant`, and fits from
+ * any other cohort never enter the corpus. Widening beyond one cohort means
+ * publishing per-cohort blocks under new basis strings, never pooling.
  */
 
-export const COMMUNITY_ALLOWANCE_BASIS = "seven_day_codex_trailing_30d";
+export const COMMUNITY_ALLOWANCE_BASIS = "seven_day_codex_pro20x_trailing_30d";
+export const COMMUNITY_ALLOWANCE_PLAN_TYPE = "pro";
+export const COMMUNITY_ALLOWANCE_PLAN_VARIANT = "pro-20x";
 export const COMMUNITY_ALLOWANCE_TRAILING_DAYS = 30;
 export const COMMUNITY_ALLOWANCE_QUALIFICATION =
   "shared_reset_fit_gates_no_span_floor";
@@ -41,6 +51,8 @@ export interface CommunityAllowanceFit {
 export interface CommunityDailyAllowance {
   basis: typeof COMMUNITY_ALLOWANCE_BASIS;
   limitId: "codex";
+  planType: typeof COMMUNITY_ALLOWANCE_PLAN_TYPE;
+  planVariant: typeof COMMUNITY_ALLOWANCE_PLAN_VARIANT;
   windowDurationMinutes: number;
   trailingDays: number;
   qualification: typeof COMMUNITY_ALLOWANCE_QUALIFICATION;
@@ -64,6 +76,7 @@ interface AnalysisCalibrationTrack {
 }
 
 interface AnalysisTrack {
+  continuity?: { planType?: unknown; planVariant?: unknown };
   calibration?: { tracks?: AnalysisCalibrationTrack[] };
 }
 
@@ -120,6 +133,12 @@ export async function collectCommunityAllowanceFits(
     ) as AnalysisResult;
     if (analysis.status !== "ready" || !Array.isArray(analysis.tracks)) continue;
     for (const track of analysis.tracks) {
+      // Plan-cohort pin: fits from any other cohort are a different product's
+      // allowance and must never enter this corpus (see module doc).
+      if (track.continuity?.planType !== COMMUNITY_ALLOWANCE_PLAN_TYPE
+          || track.continuity?.planVariant !== COMMUNITY_ALLOWANCE_PLAN_VARIANT) {
+        continue;
+      }
       const calibrationTracks = track.calibration?.tracks;
       if (!Array.isArray(calibrationTracks)) continue;
       for (const calibrationTrack of calibrationTracks) {
@@ -183,6 +202,8 @@ export function summarizeCommunityAllowanceDay(
   return {
     basis: COMMUNITY_ALLOWANCE_BASIS,
     limitId: "codex",
+    planType: COMMUNITY_ALLOWANCE_PLAN_TYPE,
+    planVariant: COMMUNITY_ALLOWANCE_PLAN_VARIANT,
     windowDurationMinutes: SEVEN_DAY_WINDOW_MINUTES,
     trailingDays: COMMUNITY_ALLOWANCE_TRAILING_DAYS,
     qualification: COMMUNITY_ALLOWANCE_QUALIFICATION,

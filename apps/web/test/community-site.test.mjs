@@ -399,7 +399,7 @@ test("unavailable community activity uses the compact public state", async () =>
   );
   assert.match(
     html,
-    /When available, this leads with the fitted seven-day Codex allowance in API-price-equivalent dollars across every contributing account, from delayed, anonymous contributions\./u,
+    /When available, this leads with the fitted seven-day Codex allowance in API-price-equivalent dollars across every contributing account on the Codex Pro \(20x\) plan, from delayed, anonymous contributions\. Other plan cohorts are never mixed into this series\./u,
   );
   assert.doesNotMatch(
     html,
@@ -957,8 +957,10 @@ test("the daily chart keeps an all-zero output series on the baseline", () => {
 
 function allowanceBlock(overrides = {}) {
   return {
-    basis: "seven_day_codex_trailing_30d",
+    basis: "seven_day_codex_pro20x_trailing_30d",
     limitId: "codex",
+    planType: "pro",
+    planVariant: "pro-20x",
     windowDurationMinutes: 10_080,
     trailingDays: 30,
     qualification: "shared_reset_fit_gates_no_span_floor",
@@ -1014,6 +1016,13 @@ test("the daily normalizer treats the allowance block as additive and per-day", 
   // malformed.
   for (const [label, hostile] of [
     ["unknown basis", allowanceBlock({ basis: "five_hour_trailing_7d" })],
+    // A different plan cohort is a different product's allowance; the page's
+    // copy names the Pro (20x) cohort, so the block must not render under it.
+    ["different plan cohort", allowanceBlock({ planVariant: "pro-5x" })],
+    ["cohort-less pooled block", allowanceBlock({
+      planType: undefined,
+      planVariant: undefined,
+    })],
     ["negative fit count", allowanceBlock({ fitCount: -1 })],
     ["missing central with fits", allowanceBlock({ centralUsd: null })],
     ["zero-dollar central", allowanceBlock({ centralUsd: 0 })],
