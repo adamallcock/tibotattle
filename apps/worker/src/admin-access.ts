@@ -140,10 +140,15 @@ function environmentJwksFetcher(env: Env): JwksFetcher | undefined {
 async function fetchAccessJwks(jwksUrl: string): Promise<JsonWebKeySet> {
   let response: Response;
   try {
+    // workerd rejects redirect:"error" outright ("won't be implemented …
+    // use manual and check the response status code") — with it, this fetch
+    // threw a TypeError on EVERY admin request and the verifier never ran.
+    // "manual" preserves the fail-closed intent: a redirect surfaces as a
+    // non-ok status and is refused below.
     response = await fetch(jwksUrl, {
       method: "GET",
       headers: { accept: "application/json" },
-      redirect: "error",
+      redirect: "manual",
       signal: AbortSignal.timeout(JWKS_REQUEST_TIMEOUT_MILLISECONDS),
     });
   } catch (error) {
