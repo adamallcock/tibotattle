@@ -1,4 +1,9 @@
 import { canonicalJson } from "./canonical-json";
+import {
+  collectCommunityAllowanceFits,
+  summarizeCommunityAllowanceDay,
+} from "./community-allowance";
+import type { CommunityAllowanceFit } from "./community-allowance";
 import { sha256Hex } from "./crypto";
 
 /**
@@ -48,10 +53,31 @@ interface DailyCellRow {
   output_combined_tokens: number;
 }
 
+/**
+ * Provider for the cross-participant allowance fits, keyed by the mutation
+ * epoch the requesting build read its sources under. The collection walks
+ * every active participant's v0.2 corpus, so a cron pass computes it once and
+ * shares it across the ≤24 day builds of that pass; a mid-pass epoch bump
+ * (participant deletion) invalidates the cache and the next build recollects
+ * against the surviving corpus.
+ */
+type AllowanceFitsForEpoch = (epoch: number) => Promise<CommunityAllowanceFit[]>;
+
+function memoizedAllowanceFits(db: D1Database): AllowanceFitsForEpoch {
+  let cached: { epoch: number; fits: CommunityAllowanceFit[] } | null = null;
+  return async (epoch: number) => {
+    if (cached === null || cached.epoch !== epoch) {
+      cached = { epoch, fits: await collectCommunityAllowanceFits(db) };
+    }
+    return cached.fits;
+  };
+}
+
 async function buildCommunityDailyAggregate(
   db: D1Database,
   rebuild: DailyRebuildRow,
   scheduledTime: number,
+  allowanceFitsForEpoch: AllowanceFitsForEpoch,
 ): Promise<{ state: "built" | "conflicted"; aggregateId: string }> {
   const { day } = rebuild;
   // Bind the build to the mutation epoch it read its sources under, exactly
@@ -124,6 +150,13 @@ async function buildCommunityDailyAggregate(
   if (!Number.isSafeInteger(revision) || revision < 1) {
     throw new Error("invalid community daily aggregate revision");
   }
+  // The allowance block is additive on schema v1.0: the site normalizer
+  // treats a missing or invalid block as per-day-absent, so older published
+  // revisions without it stay renderable and old clients ignore it entirely.
+  const allowance = summarizeCommunityAllowanceDay(
+    await allowanceFitsForEpoch(buildEpoch),
+    day,
+  );
   const aggregateId = `community-daily:${day}:r${revision}`;
   const releasedAt = new Date(scheduledTime).toISOString();
   const cellRows = cells.results.slice(0, MAX_DAILY_AGGREGATE_CELLS);
@@ -139,6 +172,10 @@ async function buildCommunityDailyAggregate(
     recomputesOnLateData: true,
     policyVersion: COMMUNITY_DAILY_POLICY_VERSION,
     suppression: "none_daily_grain_by_owner_decision",
+    // Aggregate dollar-equivalent estimates and participant counts are
+    // explicitly owner-approved for publication; no per-account identifier
+    // exists anywhere in this block.
+    allowance,
     totals: {
       contributingParticipants: Number(totals?.contributing_participants ?? 0),
       contributingDevices: Number(totals?.contributing_devices ?? 0),
@@ -244,8 +281,14 @@ export async function rebuildPendingCommunityDailyAggregates(
   ).bind(maximumRebuilds + 1).all<DailyRebuildRow>();
   const aggregateIds: string[] = [];
   let processed = 0;
+  const allowanceFitsForEpoch = memoizedAllowanceFits(db);
   for (const row of rows.results.slice(0, maximumRebuilds)) {
-    const result = await buildCommunityDailyAggregate(db, row, scheduledTime);
+    const result = await buildCommunityDailyAggregate(
+      db,
+      row,
+      scheduledTime,
+      allowanceFitsForEpoch,
+    );
     processed += 1;
     aggregateIds.push(result.aggregateId);
   }
