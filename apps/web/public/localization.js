@@ -867,7 +867,7 @@ export const WEB_MESSAGES = Object.freeze({
   "community.serviceReference": ["Service reference {reference}.", "服务参考：{reference}。", "Referencia del servicio {reference}."],
   "community.released": ["Released", "已发布", "Publicado"],
   "community.metric.usageEvents": ["Usage events", "使用事件", "Eventos de uso"],
-  "community.metric.combinedOutput": ["Combined output", "合并输出", "Salida combinada"],
+  "community.metric.combinedOutput": ["Output tokens", "输出 token", "Tokens de salida"],
   "community.daily.state.serviceUnavailable": ["Daily community activity is temporarily unavailable. This does not tell us whether any day has been published.", "每日社区活动暂时不可用。这并不能说明是否已发布任何日期。", "La actividad comunitaria diaria no está disponible temporalmente. Esto no indica si se ha publicado algún día."],
   "community.daily.state.unsupportedSchema": ["The daily community series cannot be displayed safely with this version of TiboTattle.", "此版本的 TiboTattle 无法安全显示每日社区序列。", "La serie comunitaria diaria no se puede mostrar de forma segura con esta versión de TiboTattle."],
   "community.daily.state.nonePublished": ["No daily community activity has been published for the year window yet.", "此一年窗口内尚未发布任何每日社区活动。", "Todavía no se ha publicado actividad comunitaria diaria para la ventana anual."],

@@ -39,9 +39,27 @@ const COMMUNITY_DAILY_COLUMN_KEYS = Object.freeze([
   "community.daily.quotaObservations",
   "community.daily.contributingDevices",
   "community.metric.combinedOutput",
-  "community.daily.revision",
   "community.released",
 ]);
+// Header indexes that carry numbers; they right-align with tabular digits so
+// magnitudes line up down a column.
+const COMMUNITY_DAILY_NUMERIC_COLUMNS = Object.freeze(new Set([1, 2, 3, 4]));
+
+/**
+ * One unit for a whole column, chosen from the column maximum: mixing 44 and
+ * 1.4K in the same column reads as a magnitude error, so every cell shares
+ * the scale even when a single row would round to 0.0.
+ */
+export function communityDailyColumnFormatter(values) {
+  const maximum = Math.max(0, ...values);
+  if (maximum >= 1_000_000) {
+    return (value) => `${(value / 1_000_000).toFixed(1)}M`;
+  }
+  if (maximum >= 1_000) {
+    return (value) => `${(value / 1_000).toFixed(1)}K`;
+  }
+  return (value) => String(value);
+}
 
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
 const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
@@ -418,14 +436,30 @@ export function renderCommunityDailySeries({
   const caption = node("caption", "sr-only", t("community.daily.metricsCaption"));
   const thead = documentRef.createElement("thead");
   const header = documentRef.createElement("tr");
-  for (const key of COMMUNITY_DAILY_COLUMN_KEYS) {
+  COMMUNITY_DAILY_COLUMN_KEYS.forEach((key, index) => {
     const th = documentRef.createElement("th");
     th.scope = "col";
+    if (COMMUNITY_DAILY_NUMERIC_COLUMNS.has(index)) {
+      th.className = "numeric";
+    }
     th.textContent = t(key);
     header.append(th);
-  }
+  });
   thead.append(header);
   const tbody = documentRef.createElement("tbody");
+  const formatColumn = (values) => communityDailyColumnFormatter(values);
+  const formatUsageEvents = formatColumn(
+    series.days.map((day) => day.totals.usageEvents),
+  );
+  const formatQuotaObservations = formatColumn(
+    series.days.map((day) => day.totals.quotaObservations),
+  );
+  const formatContributingDevices = formatColumn(
+    series.days.map((day) => day.totals.contributingDevices),
+  );
+  const formatOutputTokens = formatColumn(
+    series.days.map((day) => day.totals.outputCombinedTokens),
+  );
   // Most recent day first: freshness is what a reader scans for.
   for (const day of [...series.days].reverse()) {
     const row = documentRef.createElement("tr");
@@ -434,18 +468,21 @@ export function renderCommunityDailySeries({
     identity.setAttribute("data-i18n-skip", "");
     identity.textContent = day.day;
     row.append(identity);
-    for (const value of [
-      compact(day.totals.usageEvents),
-      compact(day.totals.quotaObservations),
-      compact(day.totals.contributingDevices),
-      compact(day.totals.outputCombinedTokens),
-      `r${day.revision}`,
+    const cells = [
+      formatUsageEvents(day.totals.usageEvents),
+      formatQuotaObservations(day.totals.quotaObservations),
+      formatContributingDevices(day.totals.contributingDevices),
+      formatOutputTokens(day.totals.outputCombinedTokens),
       formatLocal(day.releasedAt),
-    ]) {
+    ];
+    cells.forEach((value, index) => {
       const td = documentRef.createElement("td");
+      if (COMMUNITY_DAILY_NUMERIC_COLUMNS.has(index + 1)) {
+        td.className = "numeric";
+      }
       td.textContent = value;
       row.append(td);
-    }
+    });
     tbody.append(row);
   }
   table.append(caption, thead, tbody);

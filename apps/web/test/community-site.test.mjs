@@ -13,6 +13,7 @@ import {
 } from "../public/community-data.js";
 import {
   buildCommunityDailyChartModel,
+  communityDailyColumnFormatter,
   renderCommunityDailySeries,
 } from "../public/community-view.js";
 import {
@@ -722,7 +723,7 @@ test("a published daily series renders revision freshness, latest-first", () => 
   assert.equal(dots.length, 2, "a sparse series marks every output point with a dot");
   assert.match(container.text, /still filling/u);
   assert.match(container.text, /Usage events/u);
-  assert.match(container.text, /Combined output/u);
+  assert.match(container.text, /Output tokens/u);
 
   const table = container.descendants().find(({ tag }) => tag === "table");
   assert.ok(table, "a published daily series renders its table");
@@ -735,12 +736,14 @@ test("a published daily series renders revision freshness, latest-first", () => 
     "Usage events",
     "Quota observations",
     "Contributing devices",
-    "Combined output",
-    "Revision",
+    "Output tokens",
     "Released",
   ]) {
     assert.equal(columnLabels.includes(label), true, label);
   }
+  // The revision column is gone from the table; revision freshness lives in
+  // the summary grid above (asserted earlier in this test).
+  assert.equal(columnLabels.includes("Revision"), false);
   const bodyRows = table
     .descendants()
     .filter((element) => element.tag === "tr")
@@ -748,7 +751,27 @@ test("a published daily series renders revision freshness, latest-first", () => 
   assert.equal(bodyRows.length, 2);
   assert.equal(bodyRows[0].children[0].textContent, "2026-08-07");
   assert.equal(bodyRows[1].children[0].textContent, "2026-08-06");
-  assert.match(bodyRows[0].text, /r2/u);
+  assert.doesNotMatch(bodyRows[0].text, /\br2\b/u);
+  // Numeric cells right-align via the shared class and keep one unit per
+  // column (these fixtures stay below 1K, so plain integers).
+  const numericCells = bodyRows[0].children
+    .filter((cell) => cell.className === "numeric");
+  assert.equal(numericCells.length, 4);
+});
+
+test("daily table columns share one unit chosen from the column maximum", () => {
+  const format = communityDailyColumnFormatter([44, 986, 1_700]);
+  assert.deepEqual(
+    [44, 986, 1_700].map(format),
+    ["0.0K", "1.0K", "1.7K"],
+  );
+  const plain = communityDailyColumnFormatter([1, 44, 986]);
+  assert.deepEqual([1, 44, 986].map(plain), ["1", "44", "986"]);
+  const millions = communityDailyColumnFormatter([950_000, 2_400_000]);
+  assert.deepEqual(
+    [950_000, 2_400_000].map(millions),
+    ["0.9M", "2.4M"],
+  );
 });
 
 test("the daily series degrades honestly without a service or published days", () => {

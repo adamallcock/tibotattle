@@ -1947,6 +1947,10 @@ h2 { font-size: clamp(2rem, 3.8vw, 3.25rem); }
 .snapshot-table { margin-top: 14px; }
 .snapshot-table table { min-width: 920px; }
 .snapshot-table th, .snapshot-table td { white-space: nowrap; }
+.snapshot-table th.numeric, .snapshot-table td.numeric {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
 .participant-action-status.error { color: var(--rust); }
 
 /* Public landing hierarchy. Keep the community surface intentionally small;
