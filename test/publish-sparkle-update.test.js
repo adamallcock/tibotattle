@@ -519,7 +519,7 @@ test("validates an explicitly supplied canonical signed update without invoking 
       channel: "stable",
       expectedBundleIdentifier: "com.usagemonitor.local",
       expectedBundleVersion: "1",
-      expectedShortVersion: "0.1.0",
+      expectedShortVersion: RELEASE_VERSION,
       production: true,
     }]]);
   } finally {
@@ -1333,11 +1333,24 @@ test("rejects a stable Sparkle delta before any remote mutation", async () => {
   }
 });
 
-test("rejects a changed equal-version live appcast before any remote mutation", async () => {
+test("rejects an equal-version live appcast whose enclosure differs before any remote mutation", async () => {
   const candidate = await createReleaseFixture({ bundleVersion: "2" });
   const previous = await createReleaseFixture({ bundleVersion: "1" });
   const candidateAppcast = await readFile(candidate.appcastPath, "utf8");
-  const currentAppcast = Buffer.from(`${candidateAppcast} `);
+  // Same version, different enclosure signature: this is an artifact swap
+  // under an already-published version, not a document-only re-publication
+  // (for example a feed re-sign), so it must stay refused even with
+  // --replace-appcast.
+  const signatureMatch = candidateAppcast.match(
+    /sparkle:edSignature="([^"]+)"/u,
+  );
+  assert.equal(typeof signatureMatch?.[1], "string");
+  const alteredSignature = Buffer.alloc(64, 7).toString("base64");
+  assert.notEqual(alteredSignature, signatureMatch[1]);
+  const currentAppcast = Buffer.from(candidateAppcast.replace(
+    signatureMatch[0],
+    `sparkle:edSignature="${alteredSignature}"`,
+  ));
   const runner = remoteObjectRunner(new Map([
     [`${APPROVED_R2_BUCKET}/appcast.xml`, currentAppcast],
   ]));

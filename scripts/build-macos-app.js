@@ -3488,6 +3488,35 @@ async function buildApplication(stageApp, centralService, {
   return manifest;
 }
 
+/// The export compatibility manifest pins the exact implementation identity
+/// (including packageVersion) that produced it, and the export schema enforces
+/// that pin with a const. A version bump without `npm run telemetry:generate`
+/// (plus the schema const moving in the same change) ships an app whose export
+/// paths throw at runtime, so the build refuses a stale manifest outright.
+async function assertCurrentExportCompatibilityManifest() {
+  const manifestPath = join(
+    REPOSITORY_ROOT,
+    "generated",
+    "telemetry-v0.1-compatibility.json",
+  );
+  let manifest;
+  try {
+    manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  } catch {
+    fail(
+      "Export compatibility manifest is missing or unreadable; run npm run telemetry:generate",
+      "MACOS_EXPORT_COMPATIBILITY_MANIFEST_UNREADABLE",
+    );
+  }
+  const manifestVersion = manifest?.implementation?.packageVersion;
+  if (manifestVersion !== RELEASE_VERSION) {
+    fail(
+      `Export compatibility manifest declares packageVersion ${manifestVersion ?? "unknown"} but the release version is ${RELEASE_VERSION}; bump the packageVersion const in schemas/telemetry-v0.1/compatibility.schema.json and run npm run telemetry:generate`,
+      "MACOS_EXPORT_COMPATIBILITY_MANIFEST_STALE",
+    );
+  }
+}
+
 export async function buildMacOSApp({
   output,
   centralOrigin = null,
@@ -3505,6 +3534,7 @@ export async function buildMacOSApp({
   releaseAuthorization = null,
 }) {
   const selectedBuildProfile = normalizeMacOSBuildProfile(buildProfile);
+  await assertCurrentExportCompatibilityManifest();
   if (externalDistribution && previewDistribution) {
     fail(
       "Production and preview distribution channels are mutually exclusive",
