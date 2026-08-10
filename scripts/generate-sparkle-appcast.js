@@ -1,14 +1,32 @@
 #!/usr/bin/env node
 /**
  * Generate the canonical single-item Sparkle appcast for one signed release
- * artifact, producing EdDSA-signed BinaryDelta updates from locally retained
- * prior versions.
+ * artifact.
+ *
+ * STABLE CHANNEL (feed-signed, official tool only): production apps ship with
+ * SURequireSignedFeed=true, so Sparkle 2.9.3 refuses any appcast document
+ * that does not end with the embedded `sparkle-signatures` trailer comment —
+ * an Ed25519 signature over every byte of the document before the comment
+ * (see Sparkle's SPUExtractSignedFeed.m). A hand-built appcast published on
+ * 2026-08-10 broke every installed updater with "The update feed is
+ * improperly signed and could not be validated". The stable path therefore
+ * drives the pinned `.release-deps/SparkleTools/generate_appcast` binary
+ * (integrity-verified via inspectPinnedSparkleTools): the release DMG is
+ * staged ALONE in a temporary directory, the tool runs with the
+ * deterministic content-addressed `--download-url-prefix`, and its output is
+ * adopted byte-for-byte after local validation
+ * (scripts/sparkle-signed-feed-validation.js mirrors the Worker guard's
+ * official-shape parser and verifies both Ed25519 signatures). The
+ * hand-built renderSparkleAppcast below must NEVER be the stable-feed path.
+ *
+ * NON-STABLE CHANNELS keep the reviewed minimal shape and locally generated
+ * EdDSA-signed BinaryDelta updates from retained prior versions.
  *
  * This is signing-gate machinery: it runs where the operator already runs
- * Sparkle's offline `sign_update` today, and signs with exactly that key path
- * (the operator Keychain by default, or `--ed-key-file` exactly as
- * `sign_update` accepts it). It never generates a key, never uploads
- * anything, and never contacts the network. The publisher
+ * Sparkle's offline signing tools today, and signs with exactly that key
+ * path (the operator Keychain by default, or `--ed-key-file` exactly as the
+ * Sparkle tools accept it — pass it through for CI). It never generates a
+ * key, never uploads anything, and never contacts the network. The publisher
  * (`publish-sparkle-update.js`) later validates and uploads whatever this
  * script emits.
  *
@@ -37,6 +55,7 @@ import {
   cp,
   lstat,
   mkdir,
+  mkdtemp,
   readdir,
   readFile,
   readlink,
@@ -45,15 +64,16 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   SPARKLE_TOOLS_DIRECTORY_NAME,
   inspectPinnedSparkleTools,
 } from "./macos-updater-core.js";
-import { CANONICAL_STABLE_APPCAST_POLICY } from "../config/sparkle-appcast-policy.js";
 import { resolveReleaseChannel } from "../config/release-channels.js";
 import { validateCandidateAppcastShape } from "./publish-sparkle-update.js";
+import { validateSignedSparkleFeed } from "./sparkle-signed-feed-validation.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
@@ -91,6 +111,7 @@ const TOOL_ENV = Object.freeze({
 const SIGN_TIMEOUT_MS = 120_000;
 const DELTA_TIMEOUT_MS = 900_000;
 const PLIST_TIMEOUT_MS = 30_000;
+const GENERATE_APPCAST_TIMEOUT_MS = 900_000;
 
 function fail(message, code = "SPARKLE_APPCAST_GENERATION_INVALID") {
   const error = new Error(message);
@@ -454,6 +475,118 @@ function enclosureURL(channel, bundleVersion, digest, fileName) {
   return `${channel.sparkle.origin}/${channel.sparkle.objectPrefix}/${bundleVersion}/${digest}/${fileName}`;
 }
 
+function defaultRunGenerateAppcastTool({
+  appcastOutputPath,
+  downloadURLPrefix,
+  edKeyFile,
+  generateAppcastPath,
+  stagingDirectory,
+}) {
+  // Verified working recipe (2026-08-10): the pinned generate_appcast reads
+  // the EdDSA private key from the macOS Keychain silently (or from
+  // --ed-key-file in CI), reads SURequireSignedFeed from the app inside the
+  // staged DMG, and appends the signed sparkle-signatures trailer itself.
+  runTool(generateAppcastPath, [
+    ...(edKeyFile === null ? [] : ["--ed-key-file", edKeyFile]),
+    "--download-url-prefix",
+    downloadURLPrefix,
+    "-o",
+    appcastOutputPath,
+    stagingDirectory,
+  ], { label: "generate_appcast", timeout: GENERATE_APPCAST_TIMEOUT_MS });
+}
+
+/**
+ * Produce the stable channel's feed-signed appcast by driving the pinned
+ * official Sparkle generate_appcast binary, then validating its output
+ * locally before it is adopted. The DMG is staged ALONE so the tool cannot
+ * pick up stray archives or generate deltas (stable delta publication is
+ * policy-disabled), and the emitted bytes are adopted verbatim — re-writing
+ * even one byte would invalidate the embedded feed signature.
+ */
+async function generateOfficialSignedStableAppcast({
+  channel,
+  dmg,
+  dmgFileName,
+  generateAppcastPath,
+  options,
+  runGenerateAppcastTool,
+}) {
+  const downloadURLPrefix = `${channel.sparkle.origin}/${channel.sparkle.objectPrefix}/${options.bundleVersion}/${dmg.sha256}/`;
+  const workRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "tibotattle-signed-appcast-"),
+  );
+  try {
+    const stagingDirectory = join(workRoot, "staging");
+    const outputDirectory = join(workRoot, "out");
+    await mkdir(stagingDirectory);
+    await mkdir(outputDirectory);
+    await writeFile(join(stagingDirectory, dmgFileName), dmg.bytes);
+    const appcastOutputPath = join(outputDirectory, "appcast.xml");
+    await runGenerateAppcastTool({
+      appcastOutputPath,
+      downloadURLPrefix,
+      edKeyFile: options.edKeyFile,
+      generateAppcastPath,
+      stagingDirectory,
+    });
+    const bytes = await readFile(appcastOutputPath).catch(() => null);
+    if (bytes === null) {
+      fail(
+        "generate_appcast completed without producing the signed appcast document",
+        "SPARKLE_APPCAST_TOOL_FAILED",
+      );
+    }
+    const text = bytes.toString("utf8");
+    // Local mirror of the Worker guard's official-shape parser plus both
+    // Ed25519 signature checks (feed envelope and DMG enclosure); named
+    // failure codes explain exactly which property broke.
+    const validated = validateSignedSparkleFeed({
+      appcastText: text,
+      dmg: {
+        bytes: dmg.bytes,
+        fileName: dmgFileName,
+        sha256: dmg.sha256,
+        size: dmg.size,
+      },
+      objectPrefix: channel.sparkle.objectPrefix,
+      publicEdKey: options.sparklePublicEdKey,
+      updateOrigin: channel.sparkle.origin,
+    });
+    if (validated.bundleVersion !== options.bundleVersion) {
+      fail(
+        `generate_appcast emitted sparkle:version ${validated.bundleVersion} but --bundle-version is ${options.bundleVersion}; the DMG does not contain the expected app`,
+        "SPARKLE_APPCAST_GENERATION_INVALID",
+      );
+    }
+    if (options.shortVersion !== null
+        && validated.shortVersion !== options.shortVersion) {
+      fail(
+        `generate_appcast emitted short version ${validated.shortVersion} but --short-version is ${options.shortVersion}`,
+        "SPARKLE_APPCAST_GENERATION_INVALID",
+      );
+    }
+    const expectedURL = enclosureURL(
+      channel,
+      options.bundleVersion,
+      dmg.sha256,
+      dmgFileName,
+    );
+    if (validated.enclosure.url !== expectedURL) {
+      fail(
+        `generate_appcast emitted enclosure URL ${validated.enclosure.url}; expected the content-addressed ${expectedURL}`,
+        "SPARKLE_APPCAST_GENERATION_INVALID",
+      );
+    }
+    // Self-check with the exact validation the publisher applies, so a
+    // generated appcast can never be shaped in a way the publisher rejects.
+    validateCandidateAppcastShape(text, channel.name);
+    return Object.freeze({ bytes, validated });
+  } finally {
+    await rm(workRoot, { recursive: true, force: true });
+  }
+}
+
 export function renderSparkleAppcast({
   bundleVersion,
   deltas,
@@ -467,17 +600,23 @@ export function renderSparkleAppcast({
     ? ""
     : `<sparkle:deltas>\n${deltas.map((delta) =>
       `<enclosure url="${delta.url}" sparkle:deltaFrom="${delta.deltaFrom}" length="${delta.size}" type="${DELTA_ENCLOSURE_CONTENT_TYPE}" sparkle:edSignature="${delta.signature}" />`).join("\n")}\n</sparkle:deltas>\n`;
-  // The Worker's atomic appcast guard (sparkle-appcast-guard.ts) accepts
-  // ONLY the elements rss > channel > item > enclosure — no version/title
-  // child elements, no text content — and the enclosure must carry exactly
-  // url, length, sparkle:version, sparkle:edSignature (no type attribute).
-  // Sparkle reads the version from the enclosure attribute, so the one
-  // reviewed minimal shape serves both the updater and the guard. Discovered
-  // on the first real stable publication (2026-08-10): the previous
-  // element-style emission was refused 422 CANDIDATE_INVALID. NOTE: the
-  // delta block below still emits a <sparkle:deltas> wrapper the guard would
-  // refuse; stable-channel deltas are disabled by the reviewed policy, and
-  // enabling them requires extending the guard's parser first.
+  // NON-STABLE / TEST SHAPE ONLY. This hand-built minimal document is NOT
+  // feed-signed, and every production build ships SURequireSignedFeed=true:
+  // Sparkle refuses any feed without the generate_appcast signature trailer
+  // ("The update feed is improperly signed and could not be validated" —
+  // this broke every installed stable updater on 2026-08-10). The stable
+  // published feed therefore always comes from the pinned generate_appcast
+  // binary via generateOfficialSignedStableAppcast; renderSparkleAppcast
+  // remains only for non-stable channels and test fixtures.
+  //
+  // The Worker's atomic appcast guard (sparkle-appcast-guard.ts) minimal
+  // fallback accepts ONLY the elements rss > channel > item > enclosure — no
+  // version/title child elements, no text content — and the enclosure must
+  // carry exactly url, length, sparkle:version, sparkle:edSignature (no type
+  // attribute). NOTE: the delta block below still emits a <sparkle:deltas>
+  // wrapper the guard would refuse; stable-channel deltas are disabled by
+  // the reviewed policy, and enabling them requires extending the guard's
+  // parser first.
   void shortVersionElement;
   return `<?xml version="1.0" encoding="utf-8"?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0"><channel><item>
@@ -594,10 +733,73 @@ export async function generateSparkleAppcast(options) {
   if (existingOutput !== null && !options.replace) {
     fail(`Refusing to overwrite ${options.output} without --replace`);
   }
-  const tools = await inspectPinnedSparkleTools(options.sparkleTools);
+  // Test-only seam: not reachable from the CLI argument parser. When a spec
+  // injects a fake generate_appcast (tests cannot drive the real Keychain
+  // signing path), the pinned-tool integrity inspection is skipped because
+  // the pinned binary is not executed.
+  const injectedGenerateAppcastTool =
+    typeof options.runGenerateAppcastTool === "function"
+      ? options.runGenerateAppcastTool
+      : null;
+  const tools = channel.name === "stable" && injectedGenerateAppcastTool !== null
+    ? null
+    : await inspectPinnedSparkleTools(options.sparkleTools);
   const toolPath = (name) => tools.tools.find(
     (tool) => tool.name === name,
   ).path;
+
+  if (channel.name === "stable") {
+    // SURequireSignedFeed: the installed stable fleet refuses any feed the
+    // official generate_appcast did not sign, so the hand-built
+    // renderSparkleAppcast is forbidden here (2026-08-10 incident). Stable
+    // deltas stay policy-disabled; staging the DMG alone guarantees the tool
+    // emits a full-only feed, while the archive is still retained below so
+    // delta machinery stays ready for the reviewed policy/guard change.
+    if (options.sparklePublicEdKey === null) {
+      warn([
+        "--sparkle-public-ed-key was not supplied: the generated stable feed's Ed25519 signatures cannot be verified locally.",
+        "Supply the reviewed public key so a signing-key mix-up fails here instead of on every installed client.",
+      ]);
+    }
+    const official = await generateOfficialSignedStableAppcast({
+      channel,
+      dmg,
+      dmgFileName,
+      generateAppcastPath: injectedGenerateAppcastTool === null
+        ? toolPath("generate_appcast")
+        : null,
+      options,
+      runGenerateAppcastTool:
+        injectedGenerateAppcastTool ?? defaultRunGenerateAppcastTool,
+    });
+    await writeFile(options.output, official.bytes);
+    let retained = null;
+    if (!options.skipRetain) {
+      retained = await retainCandidateArchive({
+        appPath: options.appPath,
+        archiveRoot: options.archiveRoot,
+        bundleVersion: options.bundleVersion,
+        channelName: channel.name,
+        dmg,
+        maxRetained: options.maxDeltas + 1,
+        shortVersion: options.shortVersion,
+      });
+    }
+    return Object.freeze({
+      appcastPath: options.output,
+      channel: channel.name,
+      deltas: Object.freeze([]),
+      feedSigned: true,
+      full: Object.freeze({
+        fileName: dmgFileName,
+        sha256: dmg.sha256,
+        signature: official.validated.enclosure.signature,
+        size: dmg.size,
+        url: official.validated.enclosure.url,
+      }),
+      retained,
+    });
+  }
 
   // Sign the full DMG through the exact operator key path used today.
   const fullSignature = signArtifact(
@@ -619,80 +821,73 @@ export async function generateSparkleAppcast(options) {
     url: enclosureURL(channel, options.bundleVersion, dmg.sha256, dmgFileName),
   });
 
-  const deltasAllowedByPolicy = channel.name !== "stable"
-    || CANONICAL_STABLE_APPCAST_POLICY.allowDeltaFrom === true;
+  // Only non-stable channels reach this point (the stable channel returned
+  // above through the official signed-feed path), so the reviewed stable
+  // policy gate reduces to the retained-archive delta flow.
   let deltas = [];
-  let archiveState = null;
-  if (!deltasAllowedByPolicy) {
+  const archiveState = await discoverRetainedVersions({
+    archiveRoot: options.archiveRoot,
+    candidateBundleVersion: options.bundleVersion,
+    channelName: channel.name,
+    maxDeltas: options.maxDeltas,
+  });
+  if (!archiveState.available || archiveState.priors.length === 0) {
     warn([
-      `Sparkle delta publication is disabled for the ${channel.name} channel by the reviewed canonical appcast policy (allowDeltaFrom: false in config/sparkle-appcast-policy.js).`,
-      "Emitting a FULL-ONLY appcast. The archive is still retained so deltas start flowing the moment the reviewed policy and Worker guard change lands.",
+      `No retained prior archive found under ${join(options.archiveRoot, channel.name)}.`,
+      "Emitting a FULL-ONLY appcast: every client will download the complete DMG for this update.",
+      "This is expected for the first release of a channel and never blocks a release.",
+      "To restore deltas for the next release, keep the archive this run retains (or re-seed it from the previous release's app bundle).",
     ]);
-  } else {
-    archiveState = await discoverRetainedVersions({
-      archiveRoot: options.archiveRoot,
-      candidateBundleVersion: options.bundleVersion,
-      channelName: channel.name,
-      maxDeltas: options.maxDeltas,
-    });
-    if (!archiveState.available || archiveState.priors.length === 0) {
-      warn([
-        `No retained prior archive found under ${join(options.archiveRoot, channel.name)}.`,
-        "Emitting a FULL-ONLY appcast: every client will download the complete DMG for this update.",
-        "This is expected for the first release of a channel and never blocks a release.",
-        "To restore deltas for the next release, keep the archive this run retains (or re-seed it from the previous release's app bundle).",
-      ]);
+  }
+  const deltaBaseName = dmgFileName.slice(0, -".dmg".length);
+  for (const prior of archiveState.priors ?? []) {
+    const deltaFileName =
+      `${deltaBaseName}-from-${prior.bundleVersion}.delta`;
+    if (!SAFE_DELTA_FILE_NAME_PATTERN.test(deltaFileName)) {
+      fail(`Generated delta file name is unsafe: ${deltaFileName}`);
     }
-    const deltaBaseName = dmgFileName.slice(0, -".dmg".length);
-    for (const prior of archiveState.priors ?? []) {
-      const deltaFileName =
-        `${deltaBaseName}-from-${prior.bundleVersion}.delta`;
-      if (!SAFE_DELTA_FILE_NAME_PATTERN.test(deltaFileName)) {
-        fail(`Generated delta file name is unsafe: ${deltaFileName}`);
-      }
-      const deltaPath = join(dirname(dmg.path), deltaFileName);
-      await rm(deltaPath, { force: true });
-      runTool(toolPath("BinaryDelta"), [
-        "create",
-        prior.appPath,
-        options.appPath,
+    const deltaPath = join(dirname(dmg.path), deltaFileName);
+    await rm(deltaPath, { force: true });
+    runTool(toolPath("BinaryDelta"), [
+      "create",
+      prior.appPath,
+      options.appPath,
+      deltaPath,
+    ], { label: `BinaryDelta create ${deltaFileName}`, timeout: DELTA_TIMEOUT_MS });
+    if (!options.skipApplyCheck) {
+      await assertDeltaApplies({
+        binaryDeltaPath: toolPath("BinaryDelta"),
+        candidateAppPath: options.appPath,
         deltaPath,
-      ], { label: `BinaryDelta create ${deltaFileName}`, timeout: DELTA_TIMEOUT_MS });
-      if (!options.skipApplyCheck) {
-        await assertDeltaApplies({
-          binaryDeltaPath: toolPath("BinaryDelta"),
-          candidateAppPath: options.appPath,
-          deltaPath,
-          priorAppPath: prior.appPath,
-        });
-      }
-      const deltaFile = await readRegularFile(deltaPath, "Generated delta");
-      const deltaSignature = signArtifact(
-        toolPath("sign_update"),
-        deltaPath,
-        options.edKeyFile,
-      );
-      assertLocalSignature({
-        bytes: deltaFile.bytes,
-        label: `Delta from ${prior.bundleVersion}`,
-        publicKey,
-        signature: deltaSignature,
+        priorAppPath: prior.appPath,
       });
-      deltas.push(Object.freeze({
-        deltaFrom: prior.bundleVersion,
-        fileName: deltaFileName,
-        path: deltaPath,
-        sha256: deltaFile.sha256,
-        signature: deltaSignature,
-        size: deltaFile.size,
-        url: enclosureURL(
-          channel,
-          options.bundleVersion,
-          deltaFile.sha256,
-          deltaFileName,
-        ),
-      }));
     }
+    const deltaFile = await readRegularFile(deltaPath, "Generated delta");
+    const deltaSignature = signArtifact(
+      toolPath("sign_update"),
+      deltaPath,
+      options.edKeyFile,
+    );
+    assertLocalSignature({
+      bytes: deltaFile.bytes,
+      label: `Delta from ${prior.bundleVersion}`,
+      publicKey,
+      signature: deltaSignature,
+    });
+    deltas.push(Object.freeze({
+      deltaFrom: prior.bundleVersion,
+      fileName: deltaFileName,
+      path: deltaPath,
+      sha256: deltaFile.sha256,
+      signature: deltaSignature,
+      size: deltaFile.size,
+      url: enclosureURL(
+        channel,
+        options.bundleVersion,
+        deltaFile.sha256,
+        deltaFileName,
+      ),
+    }));
   }
   deltas = Object.freeze(deltas);
 
@@ -734,6 +929,11 @@ export async function main(argv) {
   const result = await generateSparkleAppcast(options);
   console.log(`Sparkle appcast generated: ${result.appcastPath}`);
   console.log(`Channel: ${result.channel}`);
+  if (result.feedSigned === true) {
+    console.log(
+      "Feed signature: embedded sparkle-signatures trailer (official generate_appcast output, validated locally)",
+    );
+  }
   console.log(
     `Full DMG: ${result.full.fileName} (${result.full.size} bytes)`,
   );
