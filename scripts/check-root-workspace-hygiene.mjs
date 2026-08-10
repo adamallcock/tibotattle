@@ -20,6 +20,7 @@ export const ROOT_WORKSPACE_POLICY = Object.freeze({
     ".gitattributes",
     ".gitignore",
     ".gitleaksignore",
+    "CONTRIBUTING.md",
     "LICENSE",
     "README.md",
     "package.json",
