@@ -268,6 +268,17 @@ export async function verifyAdminAccessAssertion(
   const nowMs = options.nowMs ?? Date.now();
 
   const token = request.headers.get(ACCESS_JWT_HEADER);
+  // Coarse, non-sensitive observability (2026-08-09): the response never says
+  // which check refused, which left an authenticated operator's rejection
+  // undiagnosable. This logs only presence/shape and the claim mismatch
+  // category to the Worker's own observability stream — never token bytes,
+  // signatures, or identity. Remove once admin sign-in is confirmed working.
+  console.warn("admin-access-attempt", JSON.stringify({
+    hasHeader: token !== null,
+    segments: typeof token === "string" ? token.split(".").length : 0,
+    teamDomain: configuration.teamDomain,
+    audiencePrefix: configuration.audience.slice(0, 8),
+  }));
   if (token === null
       || token.length === 0
       || token.length > MAXIMUM_TOKEN_BYTES) {
@@ -307,11 +318,21 @@ export async function verifyAdminAccessAssertion(
   const claims = decodeJsonSegment(segments[1]);
   const nowSeconds = Math.floor(nowMs / 1000);
   const expiry = claims.exp;
-  if (claims.iss !== configuration.issuer
-      || !audienceMatches(claims.aud, configuration.audience)
-      || typeof expiry !== "number"
-      || !Number.isFinite(expiry)
-      || nowSeconds > expiry + CLOCK_SKEW_SECONDS) {
+  const issuerOk = claims.iss === configuration.issuer;
+  const audienceOk = audienceMatches(claims.aud, configuration.audience);
+  const expiryOk = typeof expiry === "number"
+    && Number.isFinite(expiry)
+    && nowSeconds <= expiry + CLOCK_SKEW_SECONDS;
+  if (!issuerOk || !audienceOk || !expiryOk) {
+    // Signature already verified; only claim shape is wrong. Log the category
+    // (not the values) so a misconfigured issuer/audience is diagnosable.
+    console.warn("admin-access-claims", JSON.stringify({
+      issuerOk,
+      audienceOk,
+      expiryOk,
+      issuerType: typeof claims.iss,
+      audType: Array.isArray(claims.aud) ? "array" : typeof claims.aud,
+    }));
     accessDenied();
   }
   const notBefore = claims.nbf;
