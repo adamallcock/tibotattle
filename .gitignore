@@ -67,3 +67,7 @@ apps/macos/.build/
 
 # Retained prior releases for Sparkle delta generation (local artifacts).
 .release-archive/
+
+# Per-machine Claude Code state: local permission settings and agent worktrees.
+.claude/settings.local.json
+.claude/worktrees/
