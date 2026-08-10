@@ -306,7 +306,24 @@
         // "TiboTattle admin" self-hosted Access app (Google-only IdP, policy
         // restricted to the owner email). Neither value is a secret.
         "ACCESS_TEAM_DOMAIN": "tibotattle.cloudflareaccess.com",
-        "ACCESS_AUD": "3ffbc68d303a9da74f462a685b788c57935c65024df4e9b144e1c872598bb61c"
+        "ACCESS_AUD": "3ffbc68d303a9da74f462a685b788c57935c65024df4e9b144e1c872598bb61c",
+        // Sparkle atomic appcast guard (sparkle-appcast-guard.ts): every
+        // value below must equal the reviewed release contract
+        // (sparkle-release-contract.json) or the guard fails closed as
+        // misconfigured. The write token itself is the separately
+        // provisioned SPARKLE_APPCAST_GUARD_TOKEN secret; the public key
+        // pin is the app's own Sparkle Ed25519 public key and the SHA-256
+        // of its decoded 32 bytes.
+        "SPARKLE_APPCAST_GUARD_MODE": "enabled",
+        "SPARKLE_APPCAST_GUARD_CHANNEL": "stable",
+        "SPARKLE_APPCAST_GUARD_BUCKET": "tibotattle-updates",
+        "SPARKLE_APPCAST_GUARD_APPCAST_KEY": "appcast.xml",
+        "SPARKLE_APPCAST_GUARD_ENDPOINT_PATH": "/api/v1/internal/release/appcast",
+        "SPARKLE_APPCAST_GUARD_CONTENT_TYPE": "application/xml; charset=utf-8",
+        "SPARKLE_APPCAST_GUARD_CACHE_CONTROL": "public, max-age=300, must-revalidate",
+        "SPARKLE_APPCAST_GUARD_MAX_XML_BYTES": "1048576",
+        "SPARKLE_APPCAST_GUARD_PUBLIC_ED_KEY": "jhgPwmvWLMr7TGURJUoi6sXias7YP1F+hejZawKVTGw=",
+        "SPARKLE_APPCAST_GUARD_PUBLIC_ED_KEY_SHA256": "ae8a8e00311a4cfc1e7e7f2eedcf7fa53d6bc197997c912a0b8f908e54a28fbf"
       },
       "secrets": {
         // The owner-specific ADMIN_IDENTITY_LINK_KEY is intentionally not a
@@ -394,6 +411,14 @@
         {
           "binding": "QUARANTINE",
           "bucket_name": "app-usagemonitor-production-quarantine"
+        },
+        {
+          // Sparkle release artifacts: updates.tibotattle.com is this
+          // bucket's R2 custom domain; the atomic appcast guard is the only
+          // writer (apps/worker/src/sparkle-appcast-guard.ts, contract in
+          // sparkle-release-contract.json).
+          "binding": "SPARKLE_RELEASES",
+          "bucket_name": "tibotattle-updates"
         }
       ],
       "assets": {
