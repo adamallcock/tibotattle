@@ -554,13 +554,18 @@ export const WEB_MESSAGES = Object.freeze({
   "contribution.signOutCompleted": ["Signed out. Sign in again with Google or Apple when you want to contribute.", "已退出登录。想继续贡献时，请使用 Google 或 Apple 再次登录。", "Sesión cerrada. Inicia sesión de nuevo con Google o Apple cuando quieras contribuir."],
   "contribution.signOutUnfinished": ["This unfinished sign-in was forgotten. No server session or metadata was created. Sign in again with Google or Apple when you want to contribute.", "这次未完成的登录已被忘记。没有创建服务器会话或元数据。想继续贡献时，请使用 Google 或 Apple 再次登录。", "Este inicio de sesión incompleto se olvidó. No se creó ninguna sesión de servidor ni metadatos. Inicia sesión de nuevo con Google o Apple cuando quieras contribuir."],
   "contribution.signOutFailed": ["The service could not confirm sign-out, so you are still signed in. Nothing was changed; check your connection and try again.", "服务无法确认退出登录，因此你仍处于登录状态。没有任何更改；请检查连接后重试。", "El servicio no pudo confirmar el cierre de sesión, por lo que sigues con la sesión iniciada. No se cambió nada; comprueba tu conexión e inténtalo de nuevo."],
-  "share.period.allRetained": ["all retained evidence", "全部保留证据", "toda la evidencia conservada"],
-  "share.period.cachedThirtyOneDay": ["the cached 31-day window", "缓存的 31 天窗口", "la ventana en caché de 31 días"],
-  "share.period.cachedThirtyOneDayCollector": ["the cached 31-day collector window", "缓存的 31 天收集器窗口", "la ventana del recopilador en caché de 31 días"],
-  "share.period.lastDay": ["the last 24 hours", "过去 24 小时", "las últimas 24 horas"],
-  "share.period.lastThirtyDays": ["the last 30 days", "过去 30 天", "los últimos 30 días"],
-  "share.period.lastSevenDays": ["the last 7 days", "过去 7 天", "los últimos 7 días"],
-  "share.period.recorded": ["the recorded period", "记录的期间", "el período registrado"],
+  // Standalone capitalized forms (owner-directed, 2026-08-10): the period is
+  // now the whole detail line under Recorded activity — the "event-time API
+  // equivalent" caption is gone — so the mid-sentence "the …" phrasing left
+  // with it. allRecorded is the range-selected "All" label.
+  "share.period.allRecorded": ["All recorded history", "所有记录的历史", "Todo el historial registrado"],
+  "share.period.allRetained": ["All retained evidence", "全部保留证据", "Toda la evidencia conservada"],
+  "share.period.cachedThirtyOneDay": ["Cached 31-day window", "缓存的 31 天窗口", "Ventana en caché de 31 días"],
+  "share.period.cachedThirtyOneDayCollector": ["Cached 31-day collector window", "缓存的 31 天收集器窗口", "Ventana del recopilador en caché de 31 días"],
+  "share.period.lastDay": ["Last 24 hours", "过去 24 小时", "Últimas 24 horas"],
+  "share.period.lastThirtyDays": ["Last 30 days", "过去 30 天", "Últimos 30 días"],
+  "share.period.lastSevenDays": ["Last 7 days", "过去 7 天", "Últimos 7 días"],
+  "share.period.recorded": ["Recorded period", "记录的期间", "Período registrado"],
   "share.window.fiveHour": ["five-hour allowance", "五小时额度", "asignación de cinco horas"],
   "share.window.other": ["observed allowance window", "观测到的额度窗口", "ventana de asignación observada"],
   "share.window.providerReportedDuration": ["provider-reported {duration} window", "提供方报告的 {duration} 窗口", "ventana de {duration} informada por el proveedor"],
@@ -576,7 +581,6 @@ export const WEB_MESSAGES = Object.freeze({
   "share.detail.ofWindow": ["of the {window}", "属于{window}", "de la {window}"],
   "share.detail.notApplicableToWindow": ["not calculated for this allowance window", "不针对该额度窗口计算", "no se calcula para esta ventana de asignación"],
   "share.detail.noPricedUsage": ["no priced usage was recorded", "未记录到已定价的使用量", "no se registró uso con precio"],
-  "share.detail.activityPeriod": ["{period} · event-time API equivalent", "{period} · 按事件时间计算的 API 等价值", "{period} · equivalente de API en el momento del evento"],
   "share.detail.resetRange": ["Observed reset range {lower}–{upper}", "观测到的重置范围 {lower}–{upper}", "Rango de restablecimiento observado: {lower}–{upper}"],
   "share.detail.noAcrossResetRange": ["no across-reset range yet", "尚无跨重置范围", "aún no hay intervalo entre restablecimientos"],
   "share.detail.notEnoughMatchedWindows": ["not enough matched windows yet", "尚无足够的匹配窗口", "aún no hay suficientes ventanas coincidentes"],

@@ -1740,13 +1740,18 @@ function buildShareCard(data, {
   home = "",
   contractVersion = "",
   history = null,
+  activity = null,
 } = {}) {
   if (!DIAGNOSTIC_REFERENCE_PATTERN.test(reference ?? "")) {
     throw new TypeError("A results card requires a minted reference.");
   }
   const isDemo = data?.mode === "demo";
   const pricing = data?.pricing ?? {};
-  const fastMode = pricing.fastMode ?? {};
+  // The activity figure follows the usage chart's selected date range
+  // (owner-directed, 2026-08-10) whenever the accounting periods carry that
+  // range; the pricing fallback preserves the old 7-day-selected behavior
+  // for payloads without per-period accounting (the demo fixture among them).
+  const fastMode = activity?.fastMode ?? pricing.fastMode ?? {};
   // The share card's third figure is specifically the weekly reset fit. Do
   // not substitute the older general-gradient summary here: both are API-price
   // equivalents, but their evidence source and denominator are different.
@@ -1757,11 +1762,19 @@ function buildShareCard(data, {
   const remaining = finite(allowanceWindow?.remainingPercent);
   const windowLabel = shareCardWindowLabel(allowanceWindow);
 
-  const weighted = finite(pricing.quotaWeightedTotalCostUsd);
+  const weighted = activity !== null
+    ? activity.quotaWeightedTotalCostUsd
+    : finite(pricing.quotaWeightedTotalCostUsd);
   const useWeighted = weighted !== null && fastMode.weightingStatus !== "unknown";
-  const spend = useWeighted ? weighted : finite(pricing.totalCostUsd);
+  const spend = useWeighted
+    ? weighted
+    : activity !== null
+      ? activity.totalCostUsd
+      : finite(pricing.totalCostUsd);
   const excluded = finite(fastMode.unweightedUnknownApiPriceEquivalentUsd, 0);
-  const period = shareCardPeriodLabel(pricing.periodLabel);
+  const period = activity !== null
+    ? t(activity.labelKey)
+    : shareCardPeriodLabel(pricing.periodLabel);
 
   const capacity = isWeeklyWindow ? finite(
     summary.median_weekly_value_usd ?? summary.medianWeeklyValueUsd,
@@ -1810,9 +1823,10 @@ function buildShareCard(data, {
       // allowance without being a billing error or an allowance overrun.
       label: t("share.stat.recordedActivity"),
       value: spend === null ? t("share.value.notAvailable") : formatMoney(spend, 0),
-      detail: spend === null
-        ? t("share.detail.noPricedUsage")
-        : t("share.detail.activityPeriod", { period }),
+      // The "event-time API equivalent" caption is gone (owner-directed,
+      // 2026-08-10): the detail line states the selected range and nothing
+      // else.
+      detail: spend === null ? t("share.detail.noPricedUsage") : period,
     },
   ];
 
@@ -1834,7 +1848,11 @@ function buildShareCard(data, {
   } else if (fastMode.weightingStatus !== "complete") {
     caveats.push(t("share.caveat.fastPartial"));
   }
-  const coverage = finite(pricing.coveragePercent);
+  // The caveat qualifies the figure actually printed, so it reads the same
+  // selected range the activity stat does.
+  const coverage = activity !== null
+    ? activity.coveragePercent
+    : finite(pricing.coveragePercent);
   if (coverage !== null && coverage < 100) {
     caveats.push(t("share.caveat.coverage", {
       percent: formatPercent(coverage, 1),
@@ -2443,6 +2461,39 @@ function updateShareCardActions() {
  * that broke. Standalone calls (the brand-image late load) still derive the
  * model themselves and read the same active-filter state.
  */
+// The share card's activity figure follows the usage chart's selected date
+// range (owner-directed, 2026-08-10). The selection is structural — period
+// ids and fixed message keys — so no free-form label can reach the image,
+// and "All" states the honest denominator: everything recorded, not one
+// bounded window.
+const SHARE_CARD_RANGE_PERIODS = Object.freeze({
+  1: Object.freeze({ id: "24h", labelKey: "share.period.lastDay" }),
+  7: Object.freeze({ id: "7d", labelKey: "share.period.lastSevenDays" }),
+  30: Object.freeze({ id: "30d", labelKey: "share.period.lastThirtyDays" }),
+});
+
+function shareCardActivitySelection(data, rangeDays) {
+  const selected = SHARE_CARD_RANGE_PERIODS[rangeDays]
+    ?? { id: "all", labelKey: "share.period.allRecorded" };
+  const period = (Array.isArray(data?.accounting?.periods)
+    ? data.accounting.periods
+    : []).find((row) => row?.periodId === selected.id) ?? null;
+  if (period === null) return null;
+  const events = finite(period.events, 0);
+  const priced = finite(period.pricingCoverage?.fullyPricedEvents, 0)
+    + finite(period.pricingCoverage?.partiallyPricedEvents, 0);
+  return {
+    labelKey: selected.labelKey,
+    totalCostUsd: finite(period.apiPriceEquivalentUsd),
+    quotaWeightedTotalCostUsd:
+      finite(period.quotaWeightedApiPriceEquivalentUsd),
+    fastMode: period.fastMode ?? {},
+    coveragePercent: events > 0
+      ? Number(((priced / events) * 100).toFixed(6))
+      : null,
+  };
+}
+
 function renderShareCard(data, { history: sharedHistory = null } = {}) {
   const canvas = $("#share-card-canvas");
   const allowanceWindow = shareCardWindow(data?.quotaWindows ?? []);
@@ -2451,6 +2502,7 @@ function renderShareCard(data, { history: sharedHistory = null } = {}) {
     ? sharedHistory ?? allowanceHistoryChartModel(data)
     : null;
   const trend = isWeeklyWindow ? shareCardTrend(history) : null;
+  const activity = shareCardActivitySelection(data, activeUsageRangeDays);
   const signature = JSON.stringify([
     data?.mode,
     shareCardWindowKind(allowanceWindow),
@@ -2461,6 +2513,10 @@ function renderShareCard(data, { history: sharedHistory = null } = {}) {
     finite(data?.pricing?.coveragePercent),
     data?.pricing?.fastMode?.weightingStatus ?? "",
     finite(data?.pricing?.fastMode?.unweightedUnknownApiPriceEquivalentUsd, 0),
+    // A changed range selection is a different card: the activity figure,
+    // its label, and its coverage caveat all follow it.
+    activeUsageRangeDays,
+    activity,
     finite(data?.weekly?.summary?.median_weekly_value_usd
       ?? data?.weekly?.summary?.medianWeeklyValueUsd),
     // The plotted history is on the image too, so any change to the canonical
@@ -2478,6 +2534,7 @@ function renderShareCard(data, { history: sharedHistory = null } = {}) {
     contractVersion: shareCardRegistryVersion(data?.schemaVersion),
     home: shareCardHome(),
     history,
+    activity,
   });
   // The header's reference chip is gone (owner-directed, 2026-08-08): the
   // reference still exists — the saved file name carries it — but the panel
@@ -9312,6 +9369,12 @@ $("#range-controls").addEventListener("click", (event) => {
   resetUsageTimelineViewport();
   renderUsageTimeline(dashboard);
   renderComparison(dashboard);
+  // The share card's activity figure follows this same selection
+  // (owner-directed, 2026-08-10). The chart renderer owns the card
+  // re-render, so this goes through renderWeekly — the same rule the weekly
+  // range and span handlers follow — rather than a direct card call a new
+  // path could forget.
+  renderWeekly(dashboard);
 });
 $("#usage-zoom-in").addEventListener("click", () => {
   if (!dashboard) return;

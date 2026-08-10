@@ -7240,11 +7240,17 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   // The whole of the dashboard the card is allowed to see. Everything here is
   // a number, a fixed enumeration, or a version identifier; no field carries
   // user text, and a card that started reading one would fail this list.
+  // data.accounting.periods joined 2026-08-10 (owner-directed): the activity
+  // figure follows the usage chart's selected range, and the selection reads
+  // only per-period numbers, the fastMode enum, and pricing-coverage counts,
+  // then labels the range through fixed message keys — never a payload label.
   assert.deepEqual(
     [...new Set(
       [...section.matchAll(/data\??\.[A-Za-z]+(?:\?\.[A-Za-z]+)*/gu)].map((match) => match[0]),
     )].sort(),
     [
+      "data.accounting",
+      "data?.accounting?.periods",
       "data?.mode",
       "data?.pricing",
       "data?.pricing?.coveragePercent",
@@ -7400,7 +7406,17 @@ test("a posted results card can carry only fixed copy and formatted figures", as
       "Recorded period",
     ],
   );
-  assert.match(section, /const period = shareCardPeriodLabel\(pricing\.periodLabel\);/u);
+  // The range-selected label comes from the fixed SHARE_CARD_RANGE_PERIODS
+  // key map (owner-directed, 2026-08-10); the payload's own period label
+  // remains the fallback and still passes through the fixed vocabulary.
+  assert.match(
+    section,
+    /const period = activity !== null\s*\n\s*\? t\(activity\.labelKey\)\s*\n\s*: shareCardPeriodLabel\(pricing\.periodLabel\);/u,
+  );
+  assert.match(
+    section,
+    /const SHARE_CARD_RANGE_PERIODS = Object\.freeze\(\{/u,
+  );
   assert.equal(
     section.match(/pricing\.periodLabel/gu).length,
     1,
