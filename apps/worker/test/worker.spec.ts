@@ -1450,6 +1450,11 @@ describe("synthetic usage monitor service", () => {
     return secret;
   }
 
+  // The initiating client holds this verifier; the delivered handoff carries
+  // SHA-256(verifier) as its binding, and enrollment must re-present the raw
+  // verifier to consume the proof.
+  const HOSTED_IDENTITY_TEST_VERIFIER = "z".repeat(64);
+
   async function deliveredHostedProof(
     runtimeEnv: Env,
     provider: "apple" | "google",
@@ -1457,16 +1462,18 @@ describe("synthetic usage monitor service", () => {
   ): Promise<string> {
     const state = encodeBase64Url(crypto.getRandomValues(new Uint8Array(48)));
     const proof = encodeBase64Url(crypto.getRandomValues(new Uint8Array(48)));
+    const bindingHash = await sha256Hex(HOSTED_IDENTITY_TEST_VERIFIER);
     const now = new Date();
     const expiresAt = new Date(now.getTime() + 5 * 60 * 1_000).toISOString();
     if (provider === "apple") {
       await runtimeEnv.USAGE_MONITOR_DB.prepare(
         `INSERT INTO apple_signin_handoffs
-           (state, nonce_hash, identity_link_key, proof, created_at, expires_at, delivered_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+           (state, nonce_hash, binding_hash, identity_link_key, proof, created_at, expires_at, delivered_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(
         state,
         "a".repeat(64),
+        bindingHash,
         linkKeyHex,
         proof,
         now.toISOString(),
@@ -1476,9 +1483,17 @@ describe("synthetic usage monitor service", () => {
     } else {
       await runtimeEnv.USAGE_MONITOR_DB.prepare(
         `INSERT INTO google_signin_handoffs
-           (state, code_verifier, identity_link_key, proof, created_at, expires_at, delivered_at)
-         VALUES (?, NULL, ?, ?, ?, ?, ?)`,
-      ).bind(state, linkKeyHex, proof, now.toISOString(), expiresAt, now.toISOString()).run();
+           (state, code_verifier, binding_hash, identity_link_key, proof, created_at, expires_at, delivered_at)
+         VALUES (?, NULL, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        state,
+        bindingHash,
+        linkKeyHex,
+        proof,
+        now.toISOString(),
+        expiresAt,
+        now.toISOString(),
+      ).run();
     }
     return proof;
   }
@@ -1502,6 +1517,7 @@ describe("synthetic usage monitor service", () => {
             provider as "apple" | "google",
             linkKeyHex,
           ),
+          verifier: HOSTED_IDENTITY_TEST_VERIFIER,
         },
       }),
     }, effectiveEnv);
@@ -1557,6 +1573,7 @@ describe("synthetic usage monitor service", () => {
             "google",
             await sha256Hex("test-open-mode-primary"),
           ),
+          verifier: HOSTED_IDENTITY_TEST_VERIFIER,
         },
       }),
     }, env);
@@ -1590,6 +1607,7 @@ describe("synthetic usage monitor service", () => {
             "google",
             await sha256Hex("test-open-mode-synthetic"),
           ),
+          verifier: HOSTED_IDENTITY_TEST_VERIFIER,
         },
       }),
     }, env);
@@ -5310,6 +5328,70 @@ describe("synthetic usage monitor service", () => {
           error: { code: "IDENTITY_TOKEN_INVALID" },
         });
       }
+    });
+
+    // csf_b814237b / csf_42bcd8fd: the delivered proof is a bearer credential.
+    // Enrollment must carry the initiator binding through to the reattachment
+    // sink so a leaked proof alone — or one presented with the wrong verifier —
+    // cannot reattach an existing participant.
+    it("binds hosted-proof enrollment to the initiating client's verifier", async () => {
+      const runtimeEnv = identityBindings();
+      const linkKey = await sha256Hex("test-hosted-identity-binding-subject");
+      const proof = await deliveredHostedProof(runtimeEnv, "google", linkKey);
+
+      // The proof alone (no verifier) and the proof with a wrong verifier are
+      // both refused, and neither failed attempt consumes the one-use proof.
+      for (const identity of [
+        { provider: "google", proof },
+        { provider: "google", proof, verifier: "y".repeat(64) },
+      ]) {
+        const rejected = await api("/api/v1/enroll", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            consentVersion: "privacy-safe-telemetry-v0.1",
+            syntheticOnly: false,
+            identity,
+          }),
+        }, runtimeEnv);
+        expect(rejected.status).toBe(401);
+        expect(await rejected.json()).toMatchObject({
+          error: { code: "IDENTITY_TOKEN_INVALID" },
+        });
+      }
+
+      // Re-presenting the initiator's verifier reattaches exactly once: the
+      // failed attempts left the proof collectable.
+      const accepted = await api("/api/v1/enroll", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          consentVersion: "privacy-safe-telemetry-v0.1",
+          syntheticOnly: false,
+          identity: {
+            provider: "google",
+            proof,
+            verifier: HOSTED_IDENTITY_TEST_VERIFIER,
+          },
+        }),
+      }, runtimeEnv);
+      expect(accepted.status).toBe(201);
+
+      // Single use: the same proof and verifier cannot be spent again.
+      const replay = await api("/api/v1/enroll", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          consentVersion: "privacy-safe-telemetry-v0.1",
+          syntheticOnly: false,
+          identity: {
+            provider: "google",
+            proof,
+            verifier: HOSTED_IDENTITY_TEST_VERIFIER,
+          },
+        }),
+      }, runtimeEnv);
+      expect(replay.status).toBe(401);
     });
 
     it("reattaches an existing identity under disabled mode and refuses a new one", async () => {

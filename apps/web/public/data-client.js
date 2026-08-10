@@ -85,6 +85,7 @@ export const LOCAL_CONTRIBUTION_PREPARATION_RESULT_VERSION =
 export const LOCAL_CONTRIBUTION_DEVICE_PAIRING_VERSION =
   "local-contribution-device-pairing-v0.1";
 export const LOCAL_ONBOARDING_SCHEMA_VERSION = "local-onboarding-v0.2";
+export const LOCAL_COMPANION_SCHEMA_VERSION = "local-companion-v0.1";
 const MAXIMUM_ONBOARDING_ROLLOUT_FILES = 100;
 
 const PARTICIPANT_COMPARISON_METRIC_UNITS = Object.freeze({
@@ -155,6 +156,32 @@ const HOSTED_IDENTITY_ERROR_CODES = new Set([
   "IDENTITY_RESULT_PENDING"
 ]);
 const HOSTED_SIGNIN_STATE = /^[A-Za-z0-9_-]{43,128}$/u;
+// The initiating client generates this verifier, keeps it, and sends only its
+// SHA-256 digest to the start route. It re-presents the raw verifier to collect
+// the result and again when enrollment consumes the proof, so the unguessable
+// state alone — which transits the provider, the browser, and any log — is no
+// longer sufficient to redeem a completed sign-in.
+const HOSTED_SIGNIN_VERIFIER = /^[A-Za-z0-9_-]{43,128}$/u;
+
+function randomHostedSignInVerifier() {
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(48));
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary)
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/u, "");
+}
+
+async function hostedSignInBinding(verifier) {
+  const digest = new Uint8Array(await globalThis.crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(verifier)
+  ));
+  let hex = "";
+  for (const byte of digest) hex += byte.toString(16).padStart(2, "0");
+  return hex;
+}
 // The only two URLs this page will ever hand to window.open for sign-in. The
 // service builds them; this is the check that it built the one it claimed to.
 const APPLE_AUTHORIZE_URL_PREFIX =
@@ -321,10 +348,12 @@ function hasExactKeys(value, expectedKeys) {
 }
 
 function validHostedIdentity(identity) {
-  return hasExactKeys(identity, ["provider", "proof"])
+  return hasExactKeys(identity, ["provider", "proof", "verifier"])
     && HOSTED_IDENTITY_PROVIDERS.has(identity.provider)
     && typeof identity.proof === "string"
-    && /^[A-Za-z0-9_-]{64}$/u.test(identity.proof);
+    && /^[A-Za-z0-9_-]{64}$/u.test(identity.proof)
+    && typeof identity.verifier === "string"
+    && HOSTED_SIGNIN_VERIFIER.test(identity.verifier);
 }
 
 /**
@@ -382,11 +411,14 @@ function hostedIdentityRequestError(response, payload) {
 async function startHostedSignIn(fetchImpl, provider) {
   const { path, schemaVersion, authorizePrefix } =
     HOSTED_IDENTITY_START_ROUTES[provider];
+  // The verifier stays on this client; only its digest is sent to the service.
+  const verifier = randomHostedSignInVerifier();
+  const binding = await hostedSignInBinding(verifier);
   const response = await fetchImpl(`${CENTRAL_ROOT}${path}`, {
     method: "POST",
     credentials: "same-origin",
     headers: { Accept: "application/json", "Content-Type": "application/json" },
-    body: JSON.stringify({})
+    body: JSON.stringify({ binding })
   });
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
@@ -403,7 +435,8 @@ async function startHostedSignIn(fetchImpl, provider) {
   }
   return Object.freeze({
     state: payload.state,
-    authorizeUrl: payload.authorizeUrl
+    authorizeUrl: payload.authorizeUrl,
+    verifier
   });
 }
 
@@ -412,18 +445,23 @@ async function startHostedSignIn(fetchImpl, provider) {
  * IDENTITY_RESULT_PENDING so the caller can keep polling without treating it
  * as a failure.
  */
-async function readHostedSignInResult(fetchImpl, provider, state) {
+async function readHostedSignInResult(fetchImpl, provider, state, verifier) {
   const { path, schemaVersion } = HOSTED_IDENTITY_RESULT_ROUTES[provider];
   if (typeof state !== "string" || !HOSTED_SIGNIN_STATE.test(state)) {
     throw new TypeError(
       `${HOSTED_IDENTITY_LABELS[provider]} sign-in state is invalid.`
     );
   }
+  if (typeof verifier !== "string" || !HOSTED_SIGNIN_VERIFIER.test(verifier)) {
+    throw new TypeError(
+      `${HOSTED_IDENTITY_LABELS[provider]} sign-in verifier is invalid.`
+    );
+  }
   const response = await fetchImpl(`${CENTRAL_ROOT}${path}`, {
     method: "POST",
     credentials: "same-origin",
     headers: { Accept: "application/json", "Content-Type": "application/json" },
-    body: JSON.stringify({ state })
+    body: JSON.stringify({ state, verifier })
   });
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
@@ -436,7 +474,9 @@ async function readHostedSignInResult(fetchImpl, provider, state) {
       `The service did not return a usable ${HOSTED_IDENTITY_LABELS[provider]} sign-in proof.`
     );
   }
-  return Object.freeze({ provider, proof: payload.proof });
+  // The verifier is echoed back with the proof so enrollment can carry the
+  // initiator binding through to proof consumption.
+  return Object.freeze({ provider, proof: payload.proof, verifier });
 }
 
 
@@ -1147,6 +1187,87 @@ export function normalizeLocalContributionPreparation(payload) {
       provenanceRetained: true
     },
     prepared: { batchCount, bytes }
+  };
+}
+
+export const LOCAL_WINDOW_BREAKDOWN_SCHEMA_VERSION = "local-window-breakdown-v0.1";
+
+function windowBreakdownSpeedRow(value) {
+  return {
+    costUsd: nonNegative(value?.costUsd, 0),
+    tokens: count(value?.tokens, 0),
+    events: count(value?.events, 0),
+    unpricedEvents: count(value?.unpricedEvents, 0),
+    unpricedShare: nonNegative(value?.unpricedShare, 0),
+  };
+}
+
+/**
+ * The per-model / per-speed cost mix for one bounded window, sanitized to
+ * content-free numbers. A missing or unavailable breakdown reads back as an
+ * explicit unavailable status rather than an empty-but-priced mix, so the panel
+ * can tell "nothing here" apart from "we could not read it".
+ */
+export function normalizeWindowBreakdown(payload) {
+  const unavailable = {
+    status: "unavailable",
+    from: null,
+    to: null,
+    events: 0,
+    unpricedShare: 0,
+    costUsd: 0,
+    tokens: 0,
+    fastCostUsd: 0,
+    fastEvents: 0,
+    byModel: [],
+    bySpeed: {},
+    spark: { events: 0, costUsd: 0 },
+  };
+  const breakdown = payload?.breakdown;
+  if (payload?.schemaVersion !== LOCAL_COMPANION_SCHEMA_VERSION
+      || breakdown === null
+      || typeof breakdown !== "object"
+      || Array.isArray(breakdown)) {
+    return unavailable;
+  }
+  if (breakdown.status !== "available") {
+    return { ...unavailable, status: text(breakdown.status, "unavailable") };
+  }
+  const byModel = (Array.isArray(breakdown.byModel) ? breakdown.byModel : [])
+    .filter((row) => typeof row?.model === "string" && row.model.length > 0)
+    .map((row) => ({
+      model: row.model,
+      costUsd: nonNegative(row.costUsd, 0),
+      tokens: count(row.tokens, 0),
+      events: count(row.events, 0),
+      unpricedEvents: count(row.unpricedEvents, 0),
+      unpricedShare: nonNegative(row.unpricedShare, 0),
+      fastModeMultiplier: finite(row.fastModeMultiplier, null),
+    }));
+  const bySpeed = {};
+  const rawSpeed = breakdown.bySpeed;
+  if (rawSpeed && typeof rawSpeed === "object" && !Array.isArray(rawSpeed)) {
+    for (const [speed, value] of Object.entries(rawSpeed)) {
+      if (typeof speed !== "string" || speed.length === 0) continue;
+      bySpeed[speed] = windowBreakdownSpeedRow(value);
+    }
+  }
+  return {
+    status: "available",
+    from: count(breakdown.from, null),
+    to: count(breakdown.to, null),
+    events: count(breakdown.events, 0),
+    unpricedShare: nonNegative(breakdown.unpricedShare, 0),
+    costUsd: nonNegative(breakdown.costUsd, 0),
+    tokens: count(breakdown.tokens, 0),
+    fastCostUsd: nonNegative(breakdown.fastCostUsd, 0),
+    fastEvents: count(breakdown.fastEvents, 0),
+    byModel,
+    bySpeed,
+    spark: {
+      events: count(breakdown.spark?.events, 0),
+      costUsd: nonNegative(breakdown.spark?.costUsd, 0),
+    },
   };
 }
 
@@ -2976,6 +3097,31 @@ export class LocalCompanionClient {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh`);
   }
 
+  /**
+   * The per-model / per-speed cost mix for one bounded [fromMs, toMs] window,
+   * repriced from the unified local index by the companion. Used to explain a
+   * detected divergence period with its own contributor mix. A companion that
+   * predates the route (404/405) reads back as an unavailable breakdown rather
+   * than throwing, so the panel degrades to its range-level context.
+   */
+  async windowBreakdown(fromMs, toMs) {
+    if (!Number.isSafeInteger(fromMs) || !Number.isSafeInteger(toMs)) {
+      return normalizeWindowBreakdown(null);
+    }
+    const query = new URLSearchParams({ from: String(fromMs), to: String(toMs) });
+    try {
+      return normalizeWindowBreakdown(await fetchJson(
+        this.fetchImpl,
+        `${LOCAL_ROOT}/timeline/window-breakdown?${query}`,
+      ));
+    } catch (error) {
+      if ([400, 404, 405].includes(error?.status)) {
+        return normalizeWindowBreakdown(null);
+      }
+      throw error;
+    }
+  }
+
   async cancelRefresh() {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh/cancel`, {
       method: "POST",
@@ -3414,7 +3560,8 @@ export class CommunityClient {
     if (identity !== null) {
       body.identity = {
         provider: identity.provider,
-        proof: identity.proof
+        proof: identity.proof,
+        verifier: identity.verifier
       };
     }
     if (typeof inviteCode === "string" && inviteCode.length > 0) body.inviteCode = inviteCode;
@@ -3435,8 +3582,8 @@ export class CommunityClient {
     return startHostedSignIn(this.fetchImpl, "google");
   }
 
-  async identityGoogleResult(state) {
-    return readHostedSignInResult(this.fetchImpl, "google", state);
+  async identityGoogleResult(state, verifier) {
+    return readHostedSignInResult(this.fetchImpl, "google", state, verifier);
   }
 
   /**
@@ -3448,8 +3595,8 @@ export class CommunityClient {
     return startHostedSignIn(this.fetchImpl, "apple");
   }
 
-  async identityAppleResult(state) {
-    return readHostedSignInResult(this.fetchImpl, "apple", state);
+  async identityAppleResult(state, verifier) {
+    return readHostedSignInResult(this.fetchImpl, "apple", state, verifier);
   }
 
   async recover(recoveryCode) {

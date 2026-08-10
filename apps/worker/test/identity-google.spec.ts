@@ -3,7 +3,21 @@ import { applyD1Migrations, reset } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
+
+// The initiating client generates an unguessable verifier and sends only its
+// SHA-256 digest to the start route; it re-presents the raw verifier to collect
+// and to consume the result.
+function newSignInVerifier(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(48));
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary)
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/u, "");
+}
 
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -87,10 +101,15 @@ async function callback(
   );
 }
 
-async function startSignIn(): Promise<{ state: string; authorizeUrl: string }> {
-  const response = await json("/api/v1/identity/google/start", {});
+async function startSignIn(): Promise<
+  { state: string; authorizeUrl: string; verifier: string }
+> {
+  const verifier = newSignInVerifier();
+  const binding = await sha256Hex(verifier);
+  const response = await json("/api/v1/identity/google/start", { binding });
   expect(response.status).toBe(200);
-  return response.json<{ state: string; authorizeUrl: string }>();
+  const payload = await response.json<{ state: string; authorizeUrl: string }>();
+  return { ...payload, verifier };
 }
 
 function storedVerifier(state: string): Promise<{ verifier: string } | null> {
@@ -175,6 +194,7 @@ describe("hosted Google sign-in", () => {
 
     const pending = await json("/api/v1/identity/google/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     expect(pending.status).toBe(404);
     expect(await pending.json()).toMatchObject({
@@ -225,6 +245,7 @@ describe("hosted Google sign-in", () => {
 
     const result = await json("/api/v1/identity/google/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     expect(result.status).toBe(200);
     const payload = await result.json();
@@ -247,6 +268,7 @@ describe("hosted Google sign-in", () => {
     // indistinguishable from an expired handoff.
     const replay = await json("/api/v1/identity/google/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     expect(replay.status).toBe(401);
     expect(await replay.json()).toMatchObject({
@@ -288,6 +310,7 @@ describe("hosted Google sign-in", () => {
 
     const result = await json("/api/v1/identity/google/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     expect(result.status).toBe(401);
     expect(await result.json()).toMatchObject({
@@ -317,6 +340,7 @@ describe("hosted Google sign-in", () => {
 
     const result = await json("/api/v1/identity/google/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     // A completed-but-stale handoff must read as invalid, not as still
     // pending — a client must never be told to keep polling for a result that
@@ -365,6 +389,7 @@ describe("hosted Google sign-in", () => {
     await new Promise((resolve) => setTimeout(resolve, 3_500));
     const result = await json("/api/v1/identity/google/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     expect(result.status).toBe(200);
     expect(await result.json()).toMatchObject({
@@ -397,6 +422,7 @@ describe("hosted Google sign-in", () => {
     expect(tokenCalls).toHaveLength(0);
     const result = await json("/api/v1/identity/google/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     expect(result.status).toBe(401);
     expect(await result.json()).toMatchObject({
@@ -439,6 +465,7 @@ describe("hosted Google sign-in", () => {
 
     const result = await json("/api/v1/identity/google/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     expect(result.status).toBe(200);
     expect(await result.json()).toMatchObject({
@@ -500,6 +527,7 @@ describe("hosted Google sign-in", () => {
 
     const cancelledResult = await json("/api/v1/identity/google/result", {
       state: cancelled.state,
+      verifier: cancelled.verifier,
     });
     expect(cancelledResult.status).toBe(401);
     expect(await cancelledResult.json()).toMatchObject({
@@ -511,6 +539,7 @@ describe("hosted Google sign-in", () => {
     expect(cancelledRow).toBeNull();
     const pendingResult = await json("/api/v1/identity/google/result", {
       state: stillPending.state,
+      verifier: stillPending.verifier,
     });
     expect(pendingResult.status).toBe(404);
     expect(await pendingResult.json()).toMatchObject({
@@ -531,6 +560,7 @@ describe("hosted Google sign-in", () => {
 
     const result = await json("/api/v1/identity/google/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     expect(result.status).toBe(401);
     expect(await result.json()).toMatchObject({
@@ -554,6 +584,7 @@ describe("hosted Google sign-in", () => {
     expect(tokenCalls).toHaveLength(2);
     const retryResult = await json("/api/v1/identity/google/result", {
       state: retry.state,
+      verifier: retry.verifier,
     });
     expect(retryResult.status).toBe(401);
     expect(await retryResult.json()).toMatchObject({
@@ -642,7 +673,7 @@ describe("hosted Google sign-in", () => {
     // collection-control incident brake refuses the ceremony itself.
     const disabled = await json(
       "/api/v1/identity/google/start",
-      {},
+      { binding: "a".repeat(64) },
       bindings({ ENROLLMENT_MODE: "disabled" }),
     );
     expect(disabled.status).toBe(200);
@@ -689,5 +720,73 @@ describe("hosted Google sign-in", () => {
     );
     expect(removed.status).toBe(404);
     expect(tokenCalls).toHaveLength(0);
+  });
+
+  // csf_42bcd8fd: server-held PKCE authenticates the Worker's own token
+  // exchange, not the result recipient, so the only capability the result route
+  // required was the state disclosed to whoever started the flow. These cases
+  // pin the independent client binding that now gates delivery and consumption.
+  it("binds Google sign-in delivery to the initiating client's verifier", async () => {
+    const verifier = newSignInVerifier();
+    const binding = await sha256Hex(verifier);
+    const start = await json("/api/v1/identity/google/start", { binding });
+    expect(start.status).toBe(200);
+    const startedPayload = await start.json<Record<string, unknown>>();
+    const state = startedPayload.state as string;
+    // The binding is independent of the server-held PKCE verifier and is never
+    // returned in JSON.
+    expect(Object.keys(startedPayload).sort())
+      .toEqual(["authorizeUrl", "schemaVersion", "state"]);
+    const serializedStart = JSON.stringify(startedPayload);
+    expect(serializedStart.includes(verifier)).toBe(false);
+    expect(serializedStart.includes(binding)).toBe(false);
+    const pkce = await storedVerifier(state);
+    expect(pkce?.verifier).not.toBe(verifier);
+
+    // A caller holding the state but not the verifier cannot even learn that the
+    // sign-in is pending.
+    const wrongVerifier = newSignInVerifier();
+    const probedPending = await json("/api/v1/identity/google/result", {
+      state,
+      verifier: wrongVerifier,
+    });
+    expect(probedPending.status).toBe(401);
+
+    // Google's redirect fills the row as a victim completing the attacker's
+    // authorize URL would; the completing browser carries no verifier.
+    const landed = await callback(new URLSearchParams({
+      code: "google-one-time-code",
+      state,
+    }).toString());
+    expect(landed.status).toBe(200);
+    expect(await landed.text()).toContain("Signed in");
+
+    // The attacker browser — holding the state but a different verifier — cannot
+    // retrieve the proof, and the failed attempt must not consume it.
+    const stolen = await json("/api/v1/identity/google/result", {
+      state,
+      verifier: wrongVerifier,
+    });
+    expect(stolen.status).toBe(401);
+    expect(await stolen.json()).toMatchObject({
+      error: { code: "IDENTITY_TOKEN_INVALID" },
+    });
+    // A missing verifier is a malformed body, never a delivery.
+    const missingVerifier = await json("/api/v1/identity/google/result", {
+      state,
+    });
+    expect(missingVerifier.status).toBe(400);
+
+    // The initiator, holding the verifier, still collects the one proof exactly
+    // once.
+    const collected = await json("/api/v1/identity/google/result", {
+      state,
+      verifier,
+    });
+    expect(collected.status).toBe(200);
+    expect(await collected.json()).toMatchObject({
+      schemaVersion: "identity-google-result-v0.1",
+      proof: expect.stringMatching(/^[A-Za-z0-9_-]{64}$/u),
+    });
   });
 });

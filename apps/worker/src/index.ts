@@ -617,6 +617,13 @@ const MAX_APPLE_CALLBACK_BYTES = 16 * 1024;
 // URL so an oversized redirect is refused before anything is looked up.
 const MAX_GOOGLE_CALLBACK_URL_LENGTH = 8 * 1024;
 const SIGNIN_HANDOFF_PROOF_PATTERN = /^[A-Za-z0-9_-]{64}$/u;
+// The initiating client generates an unguessable verifier, keeps it, and sends
+// only SHA-256(verifier) as `binding` when it starts the flow. It re-presents
+// the raw verifier to collect the result and again when enrollment consumes the
+// proof. The verifier follows RFC 7636's 43-128 character range; the binding is
+// its lowercase-hex digest.
+const SIGNIN_HANDOFF_VERIFIER_PATTERN = /^[A-Za-z0-9_-]{43,128}$/u;
+const SIGNIN_HANDOFF_BINDING_PATTERN = /^[0-9a-f]{64}$/u;
 const SIGNIN_COMPLETED_MESSAGE = "Signed in — return to TiboTattle.";
 const SIGNIN_NOT_COMPLETED_MESSAGE =
   "Sign-in was not completed. Return to TiboTattle and start the sign-in again.";
@@ -686,38 +693,48 @@ function signInCallbackUrl(
 function hostedIdentityProof(value: unknown): {
   provider: "apple" | "google";
   proof: string;
+  verifier: string;
 } {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
   }
   const provider = Reflect.get(value, "provider");
   const proof = Reflect.get(value, "proof");
-  if (Object.keys(value).sort().join("\0") !== ["proof", "provider"].join("\0")
+  const verifier = Reflect.get(value, "verifier");
+  if (Object.keys(value).sort().join("\0")
+        !== ["proof", "provider", "verifier"].join("\0")
       || (provider !== "apple" && provider !== "google")
       || typeof proof !== "string"
-      || !SIGNIN_HANDOFF_PROOF_PATTERN.test(proof)) {
+      || !SIGNIN_HANDOFF_PROOF_PATTERN.test(proof)
+      || typeof verifier !== "string"
+      || !SIGNIN_HANDOFF_VERIFIER_PATTERN.test(verifier)) {
     throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
   }
-  return { provider, proof };
+  return { provider, proof, verifier };
 }
 
 async function consumeHostedIdentityProof(
   db: D1Database,
   identity: unknown,
 ): Promise<{ provider: "apple" | "google"; linkKeyHex: string }> {
-  const { provider, proof } = hostedIdentityProof(identity);
+  const { provider, proof, verifier } = hostedIdentityProof(identity);
   const table = provider === "apple"
     ? "apple_signin_handoffs"
     : "google_signin_handoffs";
   const nowIso = new Date().toISOString();
+  // Consumption carries the initiator binding through to the sink: the delivered
+  // proof is a bearer credential, so a leaked proof alone cannot reattach a
+  // participant — the same verifier that collected it must be re-presented here.
+  const bindingHash = await sha256Hex(verifier);
   const claimed = await db.prepare(
     `DELETE FROM ${table}
       WHERE proof = ?
+        AND binding_hash = ?
         AND identity_link_key IS NOT NULL
         AND delivered_at IS NOT NULL
         AND expires_at > ?
       RETURNING identity_link_key AS linkKeyHex`,
-  ).bind(proof, nowIso).first<{ linkKeyHex: string }>();
+  ).bind(proof, bindingHash, nowIso).first<{ linkKeyHex: string }>();
   if (!claimed || !/^[0-9a-f]{64}$/u.test(claimed.linkKeyHex)) {
     throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
   }
@@ -988,10 +1005,16 @@ async function handleIdentityAppleStart(
   const redirectUri = signInCallbackUrl(request, env, "apple");
   const body = await readBoundedJson(request);
   const value = body.value;
+  // The initiating client supplies `binding` = SHA-256(verifier). The raw
+  // verifier stays on the client and is required again to collect the result
+  // and to consume the proof, so the state alone is never a bearer capability.
+  const binding = Reflect.get(value ?? {}, "binding");
   if (typeof value !== "object"
       || value === null
       || Array.isArray(value)
-      || Object.keys(value).length !== 0) {
+      || Object.keys(value).length !== 1
+      || typeof binding !== "string"
+      || !SIGNIN_HANDOFF_BINDING_PATTERN.test(binding)) {
     throw new ApiError(400, "BODY_INVALID");
   }
   await assertSignInStartAdmission(env.USAGE_MONITOR_DB, env);
@@ -1005,6 +1028,7 @@ async function handleIdentityAppleStart(
   await insertAppleSignInHandoff(env.USAGE_MONITOR_DB, {
     state,
     nonceHash,
+    bindingHash: binding,
     createdAt: nowIso,
     expiresAt: new Date(
       nowMs + SIGNIN_HANDOFF_AUTHORIZATION_TTL_MILLISECONDS,
@@ -1119,17 +1143,22 @@ async function handleIdentityAppleResult(
     throw new ApiError(400, "BODY_INVALID");
   }
   const state = Reflect.get(value, "state");
-  if (Object.keys(value).length !== 1
+  const verifier = Reflect.get(value, "verifier");
+  if (Object.keys(value).length !== 2
       || typeof state !== "string"
-      || !APPLE_SIGNIN_STATE_PATTERN.test(state)) {
+      || !APPLE_SIGNIN_STATE_PATTERN.test(state)
+      || typeof verifier !== "string"
+      || !SIGNIN_HANDOFF_VERIFIER_PATTERN.test(verifier)) {
     throw new ApiError(400, "BODY_INVALID");
   }
+  const bindingHash = await sha256Hex(verifier);
   const nowIso = new Date().toISOString();
   await deleteExpiredAppleHandoffs(env.USAGE_MONITOR_DB, nowIso);
   const delivered = await deliverAppleSignInHandoff(
     env.USAGE_MONITOR_DB,
     state,
     nowIso,
+    bindingHash,
   );
   if (delivered) {
     return jsonResponse({
@@ -1141,6 +1170,7 @@ async function handleIdentityAppleResult(
     env.USAGE_MONITOR_DB,
     state,
     nowIso,
+    bindingHash,
   );
   if (pending) throw new ApiError(404, "IDENTITY_RESULT_PENDING");
   throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
@@ -1172,10 +1202,17 @@ async function handleIdentityGoogleStart(
   const redirectUri = signInCallbackUrl(request, env, "google");
   const body = await readBoundedJson(request);
   const value = body.value;
+  // `binding` = SHA-256(client verifier). It is server-held PKCE-independent:
+  // the `code_verifier` below authenticates the Worker's own token exchange,
+  // whereas this binding authenticates the client that may collect and consume
+  // the result. The two are never conflated.
+  const binding = Reflect.get(value ?? {}, "binding");
   if (typeof value !== "object"
       || value === null
       || Array.isArray(value)
-      || Object.keys(value).length !== 0) {
+      || Object.keys(value).length !== 1
+      || typeof binding !== "string"
+      || !SIGNIN_HANDOFF_BINDING_PATTERN.test(binding)) {
     throw new ApiError(400, "BODY_INVALID");
   }
   await assertSignInStartAdmission(env.USAGE_MONITOR_DB, env);
@@ -1188,11 +1225,12 @@ async function handleIdentityGoogleStart(
   const codeVerifier = randomSecret(48);
   await env.USAGE_MONITOR_DB.prepare(
     `INSERT INTO google_signin_handoffs
-       (state, code_verifier, identity_link_key, proof, created_at, expires_at, delivered_at)
-       VALUES (?, ?, NULL, NULL, ?, ?, NULL)`,
+       (state, code_verifier, binding_hash, identity_link_key, proof, created_at, expires_at, delivered_at)
+       VALUES (?, ?, ?, NULL, NULL, ?, ?, NULL)`,
   ).bind(
     state,
     codeVerifier,
+    binding,
     nowIso,
     new Date(
       nowMs + SIGNIN_HANDOFF_AUTHORIZATION_TTL_MILLISECONDS,
@@ -1323,37 +1361,48 @@ async function handleIdentityGoogleResult(
     throw new ApiError(400, "BODY_INVALID");
   }
   const state = Reflect.get(value, "state");
-  if (Object.keys(value).length !== 1
+  const verifier = Reflect.get(value, "verifier");
+  if (Object.keys(value).length !== 2
       || typeof state !== "string"
-      || !GOOGLE_SIGNIN_STATE_PATTERN.test(state)) {
+      || !GOOGLE_SIGNIN_STATE_PATTERN.test(state)
+      || typeof verifier !== "string"
+      || !SIGNIN_HANDOFF_VERIFIER_PATTERN.test(verifier)) {
     throw new ApiError(400, "BODY_INVALID");
   }
+  const bindingHash = await sha256Hex(verifier);
   const nowIso = new Date().toISOString();
   await deleteExpiredGoogleHandoffs(env.USAGE_MONITOR_DB, nowIso);
+  // The proof is released only to a caller re-presenting the initiator's
+  // verifier: a mismatched or absent binding updates zero rows, so the proof is
+  // neither delivered nor consumed and stays collectable by the initiator.
   const delivered = await env.USAGE_MONITOR_DB.prepare(
     `UPDATE google_signin_handoffs
         SET delivered_at = ?
       WHERE state = ?
+        AND binding_hash = ?
         AND identity_link_key IS NOT NULL
         AND proof IS NOT NULL
         AND delivered_at IS NULL
         AND expires_at > ?
       RETURNING proof`,
-  ).bind(nowIso, state, nowIso).first<{ proof: string }>();
+  ).bind(nowIso, state, bindingHash, nowIso).first<{ proof: string }>();
   if (delivered) {
     return jsonResponse({
       schemaVersion: "identity-google-result-v0.1",
       proof: delivered.proof,
     });
   }
+  // A caller holding the state but not the verifier cannot even learn that a
+  // sign-in is pending: the binding is required here too.
   const pending = await env.USAGE_MONITOR_DB.prepare(
     `SELECT state FROM google_signin_handoffs
       WHERE state = ?
+        AND binding_hash = ?
         AND identity_link_key IS NULL
         AND proof IS NULL
         AND delivered_at IS NULL
         AND expires_at > ?`,
-  ).bind(state, nowIso).first<{ state: string }>();
+  ).bind(state, bindingHash, nowIso).first<{ state: string }>();
   if (pending) throw new ApiError(404, "IDENTITY_RESULT_PENDING");
   throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
 }

@@ -63,6 +63,7 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     "0029_sparkle_appcast_guard_nonces.sql",
     "0030_deletion_cascade_child_indexes.sql",
     "0031_incremental_contribution_v1.sql",
+    "0032_signin_handoff_client_binding.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",

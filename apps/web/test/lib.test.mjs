@@ -73,6 +73,7 @@ import {
   normalizeLocalContributionDeviceDisconnect,
   normalizeLocalContributionDeviceReset,
   normalizeLocalDiagnosticNote,
+  normalizeWindowBreakdown,
   PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION,
   PARTICIPANT_PROFILE_SCHEMA_VERSION,
   PARTICIPANT_STATS_SCHEMA_VERSION,
@@ -3083,9 +3084,15 @@ test("hosted Google sign-in starts, polls, and refuses anything but Google's aut
   assert.equal(calls[0].url, "/api/v1/identity/google/start");
   assert.equal(calls[0].options.method, "POST");
   assert.equal(calls[0].options.credentials, "same-origin");
-  // The start request carries nothing at all: no client id, no redirect, no
-  // PKCE verifier. The service owns every one of them.
-  assert.deepEqual(JSON.parse(calls[0].options.body), {});
+  // The start request carries only SHA-256(verifier): the client keeps the raw
+  // verifier and the service still owns the client id, redirect, and PKCE. The
+  // start also never returns the verifier or its digest to the page.
+  const googleStartBody = JSON.parse(calls[0].options.body);
+  assert.deepEqual(Object.keys(googleStartBody), ["binding"]);
+  assert.match(googleStartBody.binding, /^[0-9a-f]{64}$/u);
+  assert.match(started.verifier, /^[A-Za-z0-9_-]{43,128}$/u);
+  assert.equal(started.authorizeUrl.includes(started.verifier), false);
+  assert.equal(started.authorizeUrl.includes(googleStartBody.binding), false);
 
   // A tampered authorize URL is never handed to window.open.
   for (const authorizeUrl of [
@@ -3129,24 +3136,37 @@ test("hosted Google sign-in starts, polls, and refuses anything but Google's aut
     schemaVersion: "identity-google-result-v0.1",
     proof: "P".repeat(64)
   });
-  const identity = await client.identityGoogleResult(state);
+  const identity = await client.identityGoogleResult(state, started.verifier);
   assert.deepEqual(identity, {
     provider: "google",
-    proof: "P".repeat(64)
+    proof: "P".repeat(64),
+    verifier: started.verifier
   });
   const resultCall = calls.at(-1);
   assert.equal(resultCall.url, "/api/v1/identity/google/result");
   assert.equal(resultCall.options.credentials, "same-origin");
-  assert.deepEqual(JSON.parse(resultCall.options.body), { state });
+  assert.deepEqual(JSON.parse(resultCall.options.body), {
+    state,
+    verifier: started.verifier
+  });
 
-  await assert.rejects(client.identityGoogleResult("short"), TypeError);
-  await assert.rejects(client.identityGoogleResult(null), TypeError);
+  await assert.rejects(
+    client.identityGoogleResult("short", started.verifier),
+    TypeError
+  );
+  await assert.rejects(
+    client.identityGoogleResult(null, started.verifier),
+    TypeError
+  );
+  // A missing or malformed verifier is refused before any request is made.
+  await assert.rejects(client.identityGoogleResult(state, "short"), TypeError);
+  await assert.rejects(client.identityGoogleResult(state), TypeError);
 
   // A pending sign-in is a signal to keep polling, not a failure.
   responseStatus = 404;
   responsePayload = () => ({ error: { code: "IDENTITY_RESULT_PENDING" } });
   await assert.rejects(
-    client.identityGoogleResult(state),
+    client.identityGoogleResult(state, started.verifier),
     (error) => error.status === 404
       && error.code === "IDENTITY_RESULT_PENDING"
   );
@@ -3154,7 +3174,7 @@ test("hosted Google sign-in starts, polls, and refuses anything but Google's aut
   responseStatus = 401;
   responsePayload = () => ({ error: { code: "IDENTITY_TOKEN_INVALID" } });
   await assert.rejects(
-    client.identityGoogleResult(state),
+    client.identityGoogleResult(state, started.verifier),
     (error) => error.status === 401 && error.code === "IDENTITY_TOKEN_INVALID"
   );
   responseStatus = 503;
@@ -3167,7 +3187,7 @@ test("hosted Google sign-in starts, polls, and refuses anything but Google's aut
   responseStatus = 401;
   responsePayload = () => ({ error: { code: "PRIVATE_DETAIL_MUST_NOT_PASS" } });
   await assert.rejects(
-    client.identityGoogleResult(state),
+    client.identityGoogleResult(state, started.verifier),
     (error) => error.status === 401 && error.code === undefined
   );
   responseStatus = 200;
@@ -3176,7 +3196,7 @@ test("hosted Google sign-in starts, polls, and refuses anything but Google's aut
     proof: ""
   });
   await assert.rejects(
-    client.identityGoogleResult(state),
+    client.identityGoogleResult(state, started.verifier),
     /usable Google sign-in proof/u
   );
 });
@@ -3227,6 +3247,7 @@ test("no client-side Google authorization path survives in the shipped modules",
 test("a hosted identity enrolls same-origin with fixed error codes", async () => {
   const calls = [];
   const state = "G".repeat(64);
+  const verifier = "V".repeat(64);
   let responseStatus = 200;
   let responsePayload = () => ({
     schemaVersion: "identity-google-result-v0.1",
@@ -3241,31 +3262,36 @@ test("a hosted identity enrolls same-origin with fixed error codes", async () =>
       });
     }
   });
-  const identity = await client.identityGoogleResult(state);
+  const identity = await client.identityGoogleResult(state, verifier);
   assert.deepEqual(identity, {
     provider: "google",
-    proof: "P".repeat(64)
+    proof: "P".repeat(64),
+    verifier
   });
   assert.equal(calls[0].url, "/api/v1/identity/google/result");
   assert.equal(calls[0].options.method, "POST");
   assert.equal(calls[0].options.credentials, "same-origin");
-  assert.deepEqual(JSON.parse(calls[0].options.body), { state });
+  assert.deepEqual(JSON.parse(calls[0].options.body), { state, verifier });
 
   await client.enroll(null, "telemetry-contribution-v0.1", {
     deviceBootstrap: true,
     identity
   });
   assert.equal(calls[1].url, "/api/v1/enroll");
+  // The verifier is carried through to enrollment so proof consumption is bound
+  // to the client that initiated the sign-in.
   assert.deepEqual(JSON.parse(calls[1].options.body).identity, {
     provider: "google",
-    proof: "P".repeat(64)
+    proof: "P".repeat(64),
+    verifier
   });
   await client.enroll(null, "telemetry-contribution-v0.1", {
-    identity: { provider: "apple", proof: "A".repeat(64) }
+    identity: { provider: "apple", proof: "A".repeat(64), verifier }
   });
   assert.deepEqual(JSON.parse(calls[2].options.body).identity, {
     provider: "apple",
-    proof: "A".repeat(64)
+    proof: "A".repeat(64),
+    verifier
   });
   assert.equal(
     Object.hasOwn(JSON.parse(calls[2].options.body), "deviceBootstrap"),
@@ -3273,13 +3299,20 @@ test("a hosted identity enrolls same-origin with fixed error codes", async () =>
   );
   await assert.rejects(
     client.enroll(null, "telemetry-contribution-v0.1", {
-      identity: { provider: "github", proof: "A".repeat(64) }
+      identity: { provider: "github", proof: "A".repeat(64), verifier }
     }),
     TypeError
   );
   await assert.rejects(
     client.enroll(null, "telemetry-contribution-v0.1", {
       identity: { provider: "google", proof: "A".repeat(64), extra: true }
+    }),
+    TypeError
+  );
+  // A hosted identity missing its verifier is refused before any request.
+  await assert.rejects(
+    client.enroll(null, "telemetry-contribution-v0.1", {
+      identity: { provider: "google", proof: "A".repeat(64) }
     }),
     TypeError
   );
@@ -3303,7 +3336,7 @@ test("a hosted identity enrolls same-origin with fixed error codes", async () =>
   });
   await assert.rejects(
     client.enroll(null, "telemetry-contribution-v0.1", {
-      identity: { provider: "google", proof: "P".repeat(64) }
+      identity: { provider: "google", proof: "P".repeat(64), verifier }
     }),
     (error) => error.status === 503
       && error.code === "BACKEND_STORAGE_UNAVAILABLE"
@@ -3340,7 +3373,14 @@ test("hosted Apple sign-in starts, polls, and refuses anything but Apple's autho
   assert.equal(calls[0].url, "/api/v1/identity/apple/start");
   assert.equal(calls[0].options.method, "POST");
   assert.equal(calls[0].options.credentials, "same-origin");
-  assert.deepEqual(JSON.parse(calls[0].options.body), {});
+  // The start carries only SHA-256(verifier); the raw verifier stays on the
+  // client and is never returned to the page.
+  const appleStartBody = JSON.parse(calls[0].options.body);
+  assert.deepEqual(Object.keys(appleStartBody), ["binding"]);
+  assert.match(appleStartBody.binding, /^[0-9a-f]{64}$/u);
+  assert.match(started.verifier, /^[A-Za-z0-9_-]{43,128}$/u);
+  assert.equal(started.authorizeUrl.includes(started.verifier), false);
+  assert.equal(started.authorizeUrl.includes(appleStartBody.binding), false);
 
   // A tampered authorize URL is never handed to window.open.
   for (const authorizeUrl of [
@@ -3373,30 +3413,42 @@ test("hosted Apple sign-in starts, polls, and refuses anything but Apple's autho
     schemaVersion: "identity-apple-result-v0.1",
     proof: "A".repeat(64)
   });
-  const identity = await client.identityAppleResult(state);
+  const identity = await client.identityAppleResult(state, started.verifier);
   assert.deepEqual(identity, {
     provider: "apple",
-    proof: "A".repeat(64)
+    proof: "A".repeat(64),
+    verifier: started.verifier
   });
   const resultCall = calls.at(-1);
   assert.equal(resultCall.url, "/api/v1/identity/apple/result");
   assert.equal(resultCall.options.credentials, "same-origin");
-  assert.deepEqual(JSON.parse(resultCall.options.body), { state });
+  assert.deepEqual(JSON.parse(resultCall.options.body), {
+    state,
+    verifier: started.verifier
+  });
 
-  await assert.rejects(client.identityAppleResult("short"), TypeError);
-  await assert.rejects(client.identityAppleResult(null), TypeError);
+  await assert.rejects(
+    client.identityAppleResult("short", started.verifier),
+    TypeError
+  );
+  await assert.rejects(
+    client.identityAppleResult(null, started.verifier),
+    TypeError
+  );
+  await assert.rejects(client.identityAppleResult(state, "short"), TypeError);
+  await assert.rejects(client.identityAppleResult(state), TypeError);
 
   responseStatus = 404;
   responsePayload = () => ({ error: { code: "IDENTITY_RESULT_PENDING" } });
   await assert.rejects(
-    client.identityAppleResult(state),
+    client.identityAppleResult(state, started.verifier),
     (error) => error.status === 404
       && error.code === "IDENTITY_RESULT_PENDING"
   );
   responseStatus = 401;
   responsePayload = () => ({ error: { code: "IDENTITY_TOKEN_INVALID" } });
   await assert.rejects(
-    client.identityAppleResult(state),
+    client.identityAppleResult(state, started.verifier),
     (error) => error.status === 401 && error.code === "IDENTITY_TOKEN_INVALID"
   );
   responseStatus = 503;
@@ -3412,7 +3464,7 @@ test("hosted Apple sign-in starts, polls, and refuses anything but Apple's autho
     proof: ""
   });
   await assert.rejects(
-    client.identityAppleResult(state),
+    client.identityAppleResult(state, started.verifier),
     /usable Apple sign-in proof/u
   );
 });
@@ -5718,8 +5770,10 @@ test("post-results contribution CTA is explicit while technical and deletion con
  * app.js with the pending sign-in handoff store cut out (owner-reported
  * orphaned proof, 2026-08-08). Web storage remains forbidden everywhere else:
  * the ONLY thing this page may persist is the five-minute single-use
- * read-back handle {provider, state, startedAt} — never a proof, a session,
- * or anything upload-related — and these three helpers are its only home.
+ * read-back handle {provider, state, verifier, startedAt} — never a proof, a
+ * session, or anything upload-related — and these three helpers are its only
+ * home. The verifier is the initiator binding, not a bearer credential: it is
+ * useless without the matching state the same record holds.
  */
 function appSourceOutsidePendingHandoffStore(appSource) {
   const start = appSource.indexOf(
@@ -5731,7 +5785,7 @@ function appSourceOutsidePendingHandoffStore(appSource) {
   // The persisted record carries exactly the read-back handle and nothing else.
   assert.match(
     store,
-    /JSON\.stringify\(\{ provider: providerId, state, startedAt: Date\.now\(\) \}\)/u,
+    /JSON\.stringify\(\{\s*provider: providerId,\s*state,\s*verifier,\s*startedAt: Date\.now\(\),?\s*\}\)/u,
   );
   const storeCode = store.replace(/^\s*\/\/[^\n]*$/gmu, "");
   assert.doesNotMatch(storeCode, /proof|csrf|token(?!s)|localStorage/iu);
@@ -8201,8 +8255,9 @@ async function settleCeremony(scope, harness, { untilFetchCount }) {
 
 test("the post-sign-in resume enrolls with the proof first, then mints and claims the v1.0 pairing", async () => {
   const proof = "a".repeat(64);
+  const verifier = "v".repeat(64);
   const harness = {
-    identity: { provider: "google", proof },
+    identity: { provider: "google", proof, verifier },
     // The stored session is exactly the credential the service just refused.
     // It must never reach the wire while the proof is in hand.
     session: { csrfToken: "stale-csrf", participantId: "old", consentVersion: null },
@@ -8234,7 +8289,10 @@ test("the post-sign-in resume enrolls with the proof first, then mints and claim
       ["/api/v1/me/device-pairings", "POST", "fresh-csrf"],
     ],
   );
-  assert.deepEqual(harness.fetchCalls[0].body.identity, { provider: "google", proof });
+  assert.deepEqual(
+    harness.fetchCalls[0].body.identity,
+    { provider: "google", proof, verifier },
+  );
   assert.equal(harness.fetchCalls[0].body.consentVersion, "privacy-safe-telemetry-v0.1");
   assert.equal(harness.fetchCalls[0].body.deviceBootstrap, undefined);
   assert.deepEqual(harness.fetchCalls[1].body, {
@@ -8415,8 +8473,10 @@ return {
     () => null,
     () => { harness.resumedCeremony += 1; },
     {
-      identityGoogleResult: (state) => harness.result(state),
-      identityAppleResult: (state) => harness.result(state),
+      identityGoogleResult: (state, verifier) =>
+        harness.result(state, verifier),
+      identityAppleResult: (state, verifier) =>
+        harness.result(state, verifier),
     },
   );
 }
@@ -8431,14 +8491,18 @@ test("a reload between sign-in start and callback still claims the proof", async
     JSON.stringify({
       provider: "google",
       state: "s".repeat(64),
+      verifier: "v".repeat(64),
       startedAt: Date.now() - 30_000,
     }),
   );
   const harness = {
     storage,
-    result: async (state) => {
+    result: async (state, verifier) => {
       assert.equal(state, "s".repeat(64));
-      return { provider: "google", proof: "b".repeat(64) };
+      // The initiator binding survives the reload and is re-presented so the
+      // resumed poll can collect the proof.
+      assert.equal(verifier, "v".repeat(64));
+      return { provider: "google", proof: "b".repeat(64), verifier };
     },
   };
   const scope = await loadHostedSignInResume(harness);
@@ -8447,6 +8511,7 @@ test("a reload between sign-in start and callback still claims the proof", async
   assert.deepEqual(scope.state().hostedIdentity, {
     provider: "google",
     proof: "b".repeat(64),
+    verifier: "v".repeat(64),
   });
   assert.equal(
     storage.getItem("tibotattle.pending-hosted-sign-in.v1"),
@@ -8466,6 +8531,7 @@ test("an expired handoff shows the expiry copy and logs a diagnostic note", asyn
     JSON.stringify({
       provider: "google",
       state: "s".repeat(64),
+      verifier: "v".repeat(64),
       startedAt: Date.now() - scopeProbe.HOSTED_SIGNIN_HANDOFF_VALIDITY_MS - 1_000,
     }),
   );
@@ -8494,6 +8560,7 @@ test("a definite service verdict clears the handoff and logs; an unreachable ser
   const record = JSON.stringify({
     provider: "apple",
     state: "s".repeat(64),
+    verifier: "v".repeat(64),
     startedAt: Date.now() - 5_000,
   });
 
@@ -8533,10 +8600,11 @@ test("the handoff persists the moment the browser opens and every activation ret
     appSource,
     /const PENDING_HOSTED_SIGNIN_STORAGE_KEY = "tibotattle\.pending-hosted-sign-in\.v1";/u,
   );
-  // Persisted BEFORE the authorize URL leaves for the browser.
+  // Persisted BEFORE the authorize URL leaves for the browser, carrying the
+  // initiator verifier alongside the state.
   assert.match(
     appSource,
-    /persistPendingHostedSignIn\(providerId, request\.state\);[\s\S]{0,240}?openHostedSignInInBrowser\(request\.authorizeUrl\);/u,
+    /persistPendingHostedSignIn\(providerId, request\.state, request\.verifier\);[\s\S]{0,240}?openHostedSignInInBrowser\(request\.authorizeUrl\);/u,
   );
   // Collected on load and on every reactivation surface.
   assert.match(
@@ -8572,4 +8640,108 @@ test("the handoff persists the moment the browser opens and every activation ret
     appSource,
     /const HOSTED_SIGNIN_HANDOFF_VALIDITY_MS =\s*\n\s*HOSTED_SIGNIN_POLL_ATTEMPTS \* HOSTED_SIGNIN_POLL_INTERVAL_MS;/u,
   );
+});
+
+test("divergence window-breakdown normalizer sanitizes to content-free numbers", () => {
+  const payload = {
+    schemaVersion: "local-companion-v0.1",
+    breakdown: {
+      status: "available",
+      from: 1_000,
+      to: 2_000,
+      events: 30,
+      unpricedShare: 0.1,
+      costUsd: 12.5,
+      tokens: 4_000,
+      fastCostUsd: 3,
+      fastEvents: 4,
+      byModel: [
+        {
+          model: "gpt-5.6-sol",
+          costUsd: 9,
+          tokens: 3_000,
+          events: 20,
+          unpricedEvents: 0,
+          unpricedShare: 0,
+          fastModeMultiplier: 2.5,
+        },
+        // A row with no model name is not evidence and must be dropped.
+        { costUsd: 1, events: 1 },
+      ],
+      bySpeed: {
+        standard: { costUsd: 8, tokens: 2_000, events: 15, unpricedEvents: 0, unpricedShare: 0 },
+        fast: { costUsd: 3, tokens: 900, events: 4, unpricedEvents: 0, unpricedShare: 0 },
+      },
+      spark: { events: 2, costUsd: 0.4 },
+    },
+  };
+  const normalized = normalizeWindowBreakdown(payload);
+  assert.equal(normalized.status, "available");
+  assert.equal(normalized.from, 1_000);
+  assert.equal(normalized.to, 2_000);
+  assert.equal(normalized.costUsd, 12.5);
+  assert.equal(normalized.byModel.length, 1);
+  assert.equal(normalized.byModel[0].model, "gpt-5.6-sol");
+  assert.equal(normalized.byModel[0].fastModeMultiplier, 2.5);
+  assert.equal(normalized.bySpeed.fast.costUsd, 3);
+  assert.equal(normalized.spark.events, 2);
+
+  // Wrong schema, unavailable status, and a null payload all read back as
+  // an explicit unavailable breakdown, never an empty-but-priced mix.
+  assert.equal(normalizeWindowBreakdown(null).status, "unavailable");
+  assert.equal(
+    normalizeWindowBreakdown({ schemaVersion: "wrong", breakdown: { status: "available" } }).status,
+    "unavailable",
+  );
+  const degraded = normalizeWindowBreakdown({
+    schemaVersion: "local-companion-v0.1",
+    breakdown: { status: "unavailable" },
+  });
+  assert.equal(degraded.status, "unavailable");
+  assert.deepEqual(degraded.byModel, []);
+});
+
+test("divergence window-breakdown client sends bounded integers and degrades on 404", async () => {
+  const calls = [];
+  const client = new LocalCompanionClient({
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return new Response(JSON.stringify({
+        schemaVersion: "local-companion-v0.1",
+        breakdown: {
+          status: "available",
+          from: 100,
+          to: 200,
+          events: 1,
+          unpricedShare: 0,
+          costUsd: 1,
+          tokens: 1,
+          fastCostUsd: 0,
+          fastEvents: 0,
+          byModel: [{ model: "gpt-5.6-sol", costUsd: 1, tokens: 1, events: 1, unpricedEvents: 0, unpricedShare: 0 }],
+          bySpeed: { standard: { costUsd: 1, tokens: 1, events: 1, unpricedEvents: 0, unpricedShare: 0 } },
+          spark: { events: 0, costUsd: 0 },
+        },
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    },
+  });
+  const result = await client.windowBreakdown(100, 200);
+  assert.equal(result.status, "available");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0], "/api/local/timeline/window-breakdown?from=100&to=200");
+
+  // A non-integer bound never leaves the page.
+  const noCall = [];
+  const guardClient = new LocalCompanionClient({
+    fetchImpl: async (url) => { noCall.push(url); return new Response("{}", { status: 200 }); },
+  });
+  assert.equal((await guardClient.windowBreakdown(1.5, 2)).status, "unavailable");
+  assert.equal(noCall.length, 0);
+
+  // A companion predating the route answers 404; the panel degrades rather
+  // than throwing.
+  const oldClient = new LocalCompanionClient({
+    fetchImpl: async () => new Response("", { status: 404 }),
+  });
+  assert.equal((await oldClient.windowBreakdown(100, 200)).status, "unavailable");
 });

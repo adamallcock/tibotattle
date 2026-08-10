@@ -4107,6 +4107,10 @@ function renderResidualInspectionTable() {
  * exact cost/token/unpriced mix from its buckets; this line adds the range's
  * dominant priced model and observed speed as clearly-marked context.
  */
+// One id per rendered divergence period, so each period's expandable breakdown
+// panel has a stable target for its toggle's `aria-controls`.
+let nextDivergenceBreakdownId = 0;
+
 function divergenceRangeContext(data) {
   const accounting = accountingPeriod(data);
   if (!accounting) return null;
@@ -4206,16 +4210,153 @@ function divergencePeriodItem(period, rangeContext) {
     ));
   }
 
-  if (rangeContext !== null) {
-    item.append(localizedNode(
+  // The per-period model and speed mix is not in the timeline payload, so it is
+  // fetched on demand: expanding the period asks the companion to reprice just
+  // this window from the unified index. This replaces the old whole-selected-
+  // range context line with the window's OWN contributor mix; the range context
+  // survives only as the fallback when a companion predating the route cannot
+  // answer.
+  const breakdownId = `divergence-breakdown-${nextDivergenceBreakdownId++}`;
+  const toggle = node("button", "divergence-period-toggle");
+  toggle.type = "button";
+  toggle.setAttribute("aria-expanded", "false");
+  toggle.setAttribute("aria-controls", breakdownId);
+  setLocalizedText(toggle, "divergence.breakdown.show");
+  const panel = node("div", "divergence-period-breakdown");
+  panel.id = breakdownId;
+  panel.hidden = true;
+
+  let loadState = "idle";
+  const loadBreakdown = async () => {
+    if (loadState === "loaded" || loadState === "loading") return;
+    loadState = "loading";
+    clear(panel);
+    panel.append(localizedNode(
       "p",
-      "divergence-period-context",
-      "divergence.rangeMix",
-      { model: rangeContext.model, speed: rangeContext.speed },
+      "divergence-breakdown-status",
+      "divergence.breakdown.loading",
     ));
+    let breakdown = null;
+    try {
+      breakdown = await localClient.windowBreakdown(period.startMs, period.endMs);
+    } catch {
+      breakdown = null;
+    }
+    loadState = "loaded";
+    renderDivergenceBreakdown(panel, breakdown, rangeContext);
+  };
+  toggle.addEventListener("click", () => {
+    const open = toggle.getAttribute("aria-expanded") === "true";
+    toggle.setAttribute("aria-expanded", open ? "false" : "true");
+    setLocalizedText(
+      toggle,
+      open ? "divergence.breakdown.show" : "divergence.breakdown.hide",
+    );
+    panel.hidden = open;
+    if (!open) loadBreakdown();
+  });
+
+  item.append(toggle, panel);
+  return item;
+}
+
+// The window's own repriced contributor mix, or a clearly-marked fallback. The
+// per-model and per-speed rows are the true per-period evidence the endpoint
+// exists to supply; an unavailable breakdown falls back to the range-level
+// context rather than pretending this window had none.
+function divergenceModelLabel(model) {
+  if (model === "unknown") return t("accounting.model.unrecognized");
+  return formatModelName(model) || model;
+}
+
+function renderDivergenceBreakdown(panel, breakdown, rangeContext) {
+  clear(panel);
+  if (!breakdown || breakdown.status !== "available") {
+    panel.append(rangeContext !== null
+      ? localizedNode(
+        "p",
+        "divergence-breakdown-status",
+        "divergence.breakdown.unavailable",
+        { model: rangeContext.model, speed: rangeContext.speed },
+      )
+      : localizedNode(
+        "p",
+        "divergence-breakdown-status",
+        "divergence.breakdown.unavailablePlain",
+      ));
+    return;
+  }
+  if (!breakdown.byModel.length) {
+    panel.append(localizedNode(
+      "p",
+      "divergence-breakdown-status",
+      "divergence.breakdown.empty",
+    ));
+    return;
   }
 
-  return item;
+  panel.append(localizedNode(
+    "p",
+    "divergence-breakdown-heading",
+    "divergence.breakdown.modelHeading",
+  ));
+  const modelList = node("ul", "divergence-breakdown-list");
+  for (const row of breakdown.byModel) {
+    const share = breakdown.costUsd > 0 ? row.costUsd / breakdown.costUsd : 0;
+    modelList.append(localizedNode(
+      "li",
+      "divergence-breakdown-row",
+      "divergence.breakdown.modelRow",
+      {
+        model: divergenceModelLabel(row.model),
+        cost: formatApiMoney(row.costUsd),
+        share: formatPercent(share * 100, 1),
+      },
+    ));
+  }
+  panel.append(modelList);
+
+  const speedEntries = Object.values(breakdown.bySpeed)
+    .filter((row) => row.events > 0)
+    .sort((left, right) => right.costUsd - left.costUsd);
+  if (speedEntries.length) {
+    panel.append(localizedNode(
+      "p",
+      "divergence-breakdown-heading",
+      "divergence.breakdown.speedHeading",
+    ));
+    const speedList = node("ul", "divergence-breakdown-list");
+    for (const row of speedEntries) {
+      speedList.append(localizedNode(
+        "li",
+        "divergence-breakdown-row",
+        "divergence.breakdown.speedRow",
+        {
+          speed: divergenceSpeedLabel(row.speed),
+          cost: formatApiMoney(row.costUsd),
+          events: compact(row.events),
+        },
+      ));
+    }
+    panel.append(speedList);
+  }
+
+  if (breakdown.fastCostUsd > 0) {
+    panel.append(localizedNode(
+      "p",
+      "divergence-breakdown-fast",
+      "divergence.breakdown.fastCost",
+      { cost: formatApiMoney(breakdown.fastCostUsd) },
+    ));
+  }
+  if (breakdown.unpricedShare > 0) {
+    panel.append(localizedNode(
+      "p",
+      "divergence-breakdown-unpriced",
+      "divergence.breakdown.unpriced",
+      { share: formatPercent(breakdown.unpricedShare * 100, 1) },
+    ));
+  }
 }
 
 /**
@@ -7805,7 +7946,8 @@ const HOSTED_SIGNIN_FLOWS = {
   google: {
     label: "Google",
     start: () => communityClient.identityGoogleStart(),
-    result: (state) => communityClient.identityGoogleResult(state),
+    result: (state, verifier) =>
+      communityClient.identityGoogleResult(state, verifier),
     waiting:
       "Finish signing in with Google in your browser. TiboTattle returns to the front when it is ready. You can cancel this sign-in here at any time; nothing is uploaded until you review it.",
     signedIn:
@@ -7821,7 +7963,8 @@ const HOSTED_SIGNIN_FLOWS = {
   apple: {
     label: "Apple",
     start: () => communityClient.identityAppleStart(),
-    result: (state) => communityClient.identityAppleResult(state),
+    result: (state, verifier) =>
+      communityClient.identityAppleResult(state, verifier),
     waiting:
       "Finish signing in with Apple in your browser. TiboTattle returns to the front when it is ready. You can cancel this sign-in here at any time; nothing is uploaded until you review it.",
     signedIn:
@@ -7847,11 +7990,16 @@ const HOSTED_SIGNIN_FLOWS = {
 // contract test cuts this block out and holds the rest of the file to zero.
 const PENDING_HOSTED_SIGNIN_STORAGE_KEY = "tibotattle.pending-hosted-sign-in.v1";
 
-function persistPendingHostedSignIn(providerId, state) {
+function persistPendingHostedSignIn(providerId, state, verifier) {
   try {
     window.sessionStorage?.setItem(
       PENDING_HOSTED_SIGNIN_STORAGE_KEY,
-      JSON.stringify({ provider: providerId, state, startedAt: Date.now() }),
+      JSON.stringify({
+        provider: providerId,
+        state,
+        verifier,
+        startedAt: Date.now(),
+      }),
     );
   } catch {
     // Storage being unavailable only removes the reload resilience; the live
@@ -7872,12 +8020,16 @@ function readPendingHostedSignIn() {
     const raw = window.sessionStorage?.getItem(PENDING_HOSTED_SIGNIN_STORAGE_KEY);
     if (typeof raw !== "string" || raw === "") return null;
     const value = JSON.parse(raw);
-    // The state token keeps the exact shape the service mints (the same
-    // bound the client's own read-back enforces), so a corrupt record is
-    // discarded here instead of failing the read-back forever.
+    // The state token and the client verifier keep the exact shape the service
+    // mints and requires (the same bounds the client's own read-back enforces),
+    // so a corrupt record is discarded here instead of failing the read-back
+    // forever. The verifier is the initiator binding: without it a resumed poll
+    // can no longer collect the proof, so a record missing it is unusable.
     if (!Object.hasOwn(HOSTED_SIGNIN_FLOWS, value?.provider ?? "")
         || typeof value?.state !== "string"
         || !/^[A-Za-z0-9_-]{43,128}$/u.test(value.state)
+        || typeof value?.verifier !== "string"
+        || !/^[A-Za-z0-9_-]{43,128}$/u.test(value.verifier)
         || !Number.isFinite(value?.startedAt)) {
       clearPendingHostedSignIn();
       return null;
@@ -7935,7 +8087,7 @@ async function resumePendingHostedSignIn({ retries = 2 } = {}) {
     for (let attemptIndex = 0; attemptIndex <= retries; attemptIndex += 1) {
       let identity = null;
       try {
-        identity = await flow.result(pending.state);
+        identity = await flow.result(pending.state, pending.verifier);
       } catch (error) {
         if (error?.code === "IDENTITY_RESULT_PENDING") {
           // The provider has not returned yet; retry shortly, then leave the
@@ -8004,17 +8156,17 @@ async function beginHostedSignIn(providerId) {
   try {
     const request = await flow.start();
     // Persisted BEFORE the browser opens: from this moment a completed
-    // sign-in exists server-side that only this state token can collect, so
-    // the token must survive a dashboard reload (owner-reported orphaned
-    // proof, 2026-08-08).
-    persistPendingHostedSignIn(providerId, request.state);
+    // sign-in exists server-side that only this state token AND the client
+    // verifier can collect, so both must survive a dashboard reload
+    // (owner-reported orphaned proof, 2026-08-08).
+    persistPendingHostedSignIn(providerId, request.state, request.verifier);
     openHostedSignInInBrowser(request.authorizeUrl);
     status.textContent = flow.waiting;
     for (let poll = 0; poll < HOSTED_SIGNIN_POLL_ATTEMPTS; poll += 1) {
       if (attempt.cancelled || activeHostedSignIn !== attempt) return;
       let identity = null;
       try {
-        identity = await flow.result(request.state);
+        identity = await flow.result(request.state, request.verifier);
       } catch (error) {
         if (error?.code !== "IDENTITY_RESULT_PENDING") throw error;
         // The fixed callback page wakes the native dashboard only after the
