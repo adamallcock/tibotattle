@@ -1423,8 +1423,13 @@ function createRemoteAppcastAtomicGuard({ channel, endpoint, token, fetchGuard }
       }
       if (response.status === 409) return readAtomicGuardResponse(response);
       if (!response.ok) {
+        // Surface the guard's status and error body: the guard's error codes
+        // (401 auth, 422 candidate shape, 503 storage) name the exact reason
+        // and carry no secrets, and a masked message has repeatedly cost
+        // publish-debugging round trips.
+        const responseBody = await response.text().catch(() => "");
         fail(
-          "The appcast atomic guard rejected the publication request",
+          `The appcast atomic guard rejected the publication request (status ${response.status}): ${responseBody.slice(0, 512)}`,
           "SPARKLE_UPDATE_ATOMIC_GUARD_REMOTE_FAILED",
         );
       }
