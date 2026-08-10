@@ -596,10 +596,14 @@ export function renderSparkleAppcast({
   const shortVersionElement = shortVersion === null
     ? ""
     : `<sparkle:shortVersionString>${shortVersion}</sparkle:shortVersionString>\n`;
+  // Delta enclosures carry sparkle:version (the candidate bundle version, as
+  // in official Sparkle appcasts): the publisher's shape validation requires
+  // every enclosure's version to match its immutable object path, and the
+  // minimal item has no <sparkle:version> element to inherit it from.
   const deltasBlock = deltas.length === 0
     ? ""
     : `<sparkle:deltas>\n${deltas.map((delta) =>
-      `<enclosure url="${delta.url}" sparkle:deltaFrom="${delta.deltaFrom}" length="${delta.size}" type="${DELTA_ENCLOSURE_CONTENT_TYPE}" sparkle:edSignature="${delta.signature}" />`).join("\n")}\n</sparkle:deltas>\n`;
+      `<enclosure url="${delta.url}" sparkle:version="${bundleVersion}" sparkle:deltaFrom="${delta.deltaFrom}" length="${delta.size}" type="${DELTA_ENCLOSURE_CONTENT_TYPE}" sparkle:edSignature="${delta.signature}" />`).join("\n")}\n</sparkle:deltas>\n`;
   // NON-STABLE / TEST SHAPE ONLY. This hand-built minimal document is NOT
   // feed-signed, and every production build ships SURequireSignedFeed=true:
   // Sparkle refuses any feed without the generate_appcast signature trailer
