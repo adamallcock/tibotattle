@@ -38,13 +38,29 @@ artifact.
 - **A menu bar item** — where the allowance stands without opening the app,
   including a Check for Updates entry in builds that ship the updater.
 
+## Install
+
+Most people should install the prebuilt app: download it from
+[tibotattle.com](https://tibotattle.com), or pick a version from the
+[tibotattle-client releases page](https://github.com/adamallcock/tibotattle-client/releases).
+This repository is the source of truth; `tibotattle-client` is the filtered
+public release mirror it exports. To build from source instead, follow the
+quick start below.
+
 ## Quick start (macOS, Apple Silicon)
 
-Requirements: macOS on arm64, Node.js ≥ 22.13, [pnpm](https://pnpm.io) 11, and
-the Xcode command-line tools for the app build.
+Requirements: macOS on arm64, Node.js ≥ 22.13 for the repository tooling,
+[pnpm](https://pnpm.io) 11, and the Xcode command-line tools. The app-bundle
+build itself requires exactly Node v26.2.0 on macOS arm64: it fails on any
+other runtime rather than producing an unverifiable bundle.
+
+The root workspace uses pnpm; the worker and Cloud Run apps keep their own
+npm lockfiles (only needed for the hosted-service checks and the full gates):
 
 ```bash
 pnpm install
+npm --prefix apps/worker ci
+npm --prefix apps/cloud-run ci
 ```
 
 Build and open the self-contained desktop app:
@@ -125,6 +141,16 @@ compatibility fallback until they are explicitly migrated.
 | `docs/` | Reference, decisions, plans, receipts, and historical goal documents |
 | `local-review/` | Reproducible standalone review artifact tooling |
 
+Despite the name, `local-review/` is committed developer tooling that builds a
+reproducible standalone review artifact — no local user data is tracked there.
+
+The hosted community-aggregate service at
+[tibotattle.com](https://tibotattle.com) is operated by the maintainer, and
+the deploy scripts in this repository target the owner's Cloudflare account.
+Forks that want their own hosted service must provision their own resources
+per `apps/worker/wrangler.jsonc`; the local app never requires the hosted
+service.
+
 ## Development
 
 ```bash
@@ -169,9 +195,13 @@ include the retained release gate).
 command catalog, privacy boundary documentation, and operational detail live in
 the [full product reference](docs/reference/product-reference.md).
 
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the
+workflow and gates, and [SECURITY.md](SECURITY.md) for how to report
+vulnerabilities privately.
+
 ## Status
 
-This is an early, personal-pilot release (v0.1.0). It is not a
+This is an early, personal-pilot release (v0.1.1). It is not a
 provider-authoritative billing dashboard: quota estimates carry explicit
 uncertainty, and unknown models or tiers stay explicit unknowns rather than
 silently defaulted. See
