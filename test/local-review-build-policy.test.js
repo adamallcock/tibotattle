@@ -152,8 +152,20 @@ test("local-review graph closes over every live compatibility input", async () =
     "schemas/telemetry-v0.1/quota-snapshot.schema.json",
     "schemas/telemetry-v0.1/usage-event.schema.json",
   ]);
+  // The closure grew by two workspace packages when the collector projection
+  // and the replay-safe cache stopped reaching into src/export/registries.js
+  // and started entering the export owner through its reviewed facade, as
+  // `source_owner_public_api` requires. Importing a facade pulls that facade's
+  // whole graph, not the single module that was wanted, so quota-analysis and
+  // telemetry-contract came with it. Both are pure computation packages, and
+  // the property this artifact actually exists to guarantee - that nothing in
+  // it can reach the network - is enforced separately and unconditionally by
+  // the FORBIDDEN_BUILTINS check in scripts/build-local-review-artifact.js.
+  // This list stays exact so any further growth still has to be argued for.
   assert.deepEqual(graph.external, [
     "@app-usagemonitor/identity-core",
+    "@app-usagemonitor/quota-analysis",
+    "@app-usagemonitor/telemetry-contract",
     "@github/keytar",
     "ajv",
   ]);

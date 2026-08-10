@@ -7,10 +7,12 @@ import * as policy from "../src/contribution/recurrence-policy.js";
 import {
   AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS,
   AUTOMATIC_CONTRIBUTION_LOOKBACK_HOURS,
+  AUTOMATIC_CONTRIBUTION_MAXIMUM_SCHEDULE_DITHER_MILLISECONDS,
   AUTOMATIC_CONTRIBUTION_REPLAY_OVERLAP_HOURS,
   AUTOMATIC_CONTRIBUTION_SETTINGS_SCHEMA_VERSION,
   AutomaticContributionError,
   automaticContributionRequiredConsent,
+  applyAutomaticContributionScheduleDither,
   claimAutomaticContributionRun,
   completeAutomaticContributionRun,
   createInitialAutomaticContributionState,
@@ -105,12 +107,14 @@ test("the contribution facade adds only the recurrence policy identities", () =>
   const recurrenceExports = [
     "AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS",
     "AUTOMATIC_CONTRIBUTION_LOOKBACK_HOURS",
+    "AUTOMATIC_CONTRIBUTION_MAXIMUM_SCHEDULE_DITHER_MILLISECONDS",
     "AUTOMATIC_CONTRIBUTION_PRIVACY_CONTRACT_VERSION",
     "AUTOMATIC_CONTRIBUTION_REPLAY_OVERLAP_HOURS",
     "AUTOMATIC_CONTRIBUTION_SETTINGS_SCHEMA_VERSION",
     "AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION",
     "AutomaticContributionError",
     "automaticContributionRequiredConsent",
+    "applyAutomaticContributionScheduleDither",
     "claimAutomaticContributionRun",
     "completeAutomaticContributionRun",
     "createInitialAutomaticContributionState",
@@ -179,7 +183,15 @@ test("parser migrates all supported schemas without mutation and rejects non-dat
     schemaVersion: "automatic-contribution-settings-v0.2",
   };
   delete v02.preparationClaim;
-  for (const source of [initial, v01, v02]) {
+  delete v02.nextAttemptAt;
+  delete v02.scheduleDitherMilliseconds;
+  const v03 = {
+    ...initial,
+    schemaVersion: "automatic-contribution-settings-v0.3",
+  };
+  delete v03.nextAttemptAt;
+  delete v03.scheduleDitherMilliseconds;
+  for (const source of [initial, v01, v02, v03]) {
     const before = structuredClone(source);
     const parsed = parseAutomaticContributionState(source);
     assert.equal(parsed.schemaVersion, AUTOMATIC_CONTRIBUTION_SETTINGS_SCHEMA_VERSION);
@@ -201,6 +213,8 @@ test("v0.2 migration preserves its reviewed checkpoint and drops only its absent
   const rich = preparedAutomaticState();
   const v02 = { ...rich, schemaVersion: "automatic-contribution-settings-v0.2" };
   delete v02.preparationClaim;
+  delete v02.nextAttemptAt;
+  delete v02.scheduleDitherMilliseconds;
   const before = structuredClone(v02);
   const migrated = parseAutomaticContributionState(v02);
   assert.deepEqual(v02, before);
@@ -211,6 +225,26 @@ test("v0.2 migration preserves its reviewed checkpoint and drops only its absent
   assert.equal(migrated.preparationClaim, null);
   assert.deepEqual(migrated.consent, rich.consent);
   assert.equal(migrated.lastAttemptAt, rich.lastAttemptAt);
+});
+
+test("disabled v0.3 state with a previous attempt migrates without inventing a schedule", () => {
+  const active = enabledState();
+  const legacy = {
+    ...active,
+    schemaVersion: "automatic-contribution-settings-v0.3",
+    enabled: false,
+    paused: false,
+    consent: null,
+    lastAttemptAt: ATTEMPTED_AT,
+    lastSuccessAt: ATTEMPTED_AT,
+  };
+  delete legacy.nextAttemptAt;
+  delete legacy.scheduleDitherMilliseconds;
+
+  const migrated = parseAutomaticContributionState(legacy);
+  assert.equal(migrated.enabled, false);
+  assert.equal(migrated.nextAttemptAt, null);
+  assert.equal(migrated.scheduleDitherMilliseconds, null);
 });
 
 test("status precedence keeps destination drift readable without exposing state identifiers", () => {
@@ -246,6 +280,7 @@ test("status handles unavailable malformed state and every valid precedence bran
   const consentRequiredState = {
     ...reviewedState(),
     enabled: true,
+    nextAttemptAt: ATTEMPTED_AT,
     consent: {
       ...automaticContributionRequiredConsent({ destinationOrigin: OTHER_ORIGIN }),
       consentedAt: REVIEWED_AT,
@@ -282,6 +317,89 @@ test("status handles unavailable malformed state and every valid precedence bran
   });
   assert.equal(failed.status, "failed");
   assert.deepEqual(failed.lastOutcome, validDiagnostics.lastOutcome);
+});
+
+test("schedule dither survives parsing, delays legacy catch-up, and preserves Retry-After", () => {
+  const dither = 30 * 60 * 1_000;
+  const enabled = enableAutomaticContribution(reviewedState(), {
+    destinationOrigin: ORIGIN,
+    intervalHours: AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS,
+    consent: automaticContributionRequiredConsent({ destinationOrigin: ORIGIN }),
+    consentedAt: REVIEWED_AT,
+    scheduleDitherMilliseconds: dither,
+  });
+  assert.equal(
+    projectAutomaticContributionStatus(enabled, { destinationOrigin: ORIGIN }).nextAttemptAt,
+    "2026-07-29T18:30:00.000Z",
+  );
+  assert.equal(enabled.scheduleDitherMilliseconds, dither);
+
+  const legacy = { ...enabled, schemaVersion: "automatic-contribution-settings-v0.3" };
+  delete legacy.nextAttemptAt;
+  delete legacy.scheduleDitherMilliseconds;
+  const staggeredLegacy = applyAutomaticContributionScheduleDither(legacy, {
+    destinationOrigin: ORIGIN,
+    now: "2026-07-29T18:15:00.000Z",
+    scheduleDitherMilliseconds: dither,
+  });
+  assert.equal(staggeredLegacy.scheduleDitherMilliseconds, dither);
+  assert.equal(staggeredLegacy.nextAttemptAt, "2026-07-29T18:30:00.000Z");
+
+  const claimed = claimAutomaticContributionRun(enabled, {
+    destinationOrigin: ORIGIN,
+    attemptedAt: ATTEMPTED_AT,
+    preparationId: PREPARATION_ID,
+  });
+  const prepared = recordPreparedAutomaticContribution(claimed.state, {
+    destinationOrigin: ORIGIN,
+    preparedAt: ATTEMPTED_AT,
+    preparationId: PREPARATION_ID,
+    preparedSetId: NEXT_SET_ID,
+    coveredAt: NEXT_COVERAGE,
+  });
+  const retryAt = "2026-07-29T18:02:30.000Z";
+  const retried = completeAutomaticContributionRun(prepared, {
+    destinationOrigin: ORIGIN,
+    completedAt: ATTEMPTED_AT,
+    event: {
+      code: "retry_scheduled",
+      pause: false,
+      preparedSet: null,
+      retryNotBeforeAt: retryAt,
+    },
+  });
+  assert.equal(retried.nextAttemptAt, retryAt);
+  assert.throws(() => completeAutomaticContributionRun(prepared, {
+    destinationOrigin: ORIGIN,
+    completedAt: ATTEMPTED_AT,
+    event: {
+      code: "accepted",
+      pause: false,
+      preparedSet: preparedSet({ preparedSetId: NEXT_SET_ID, coveredAt: NEXT_COVERAGE }),
+      retryNotBeforeAt: retryAt,
+    },
+  }), fixedError("configuration_invalid"));
+  assert.equal(
+    AUTOMATIC_CONTRIBUTION_MAXIMUM_SCHEDULE_DITHER_MILLISECONDS,
+    60 * 60 * 1_000,
+  );
+});
+
+test("a late foreground firing advances from the persisted phase, not wake time", () => {
+  const enabled = enableAutomaticContribution(reviewedState(), {
+    destinationOrigin: ORIGIN,
+    intervalHours: AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS,
+    consent: automaticContributionRequiredConsent({ destinationOrigin: ORIGIN }),
+    consentedAt: REVIEWED_AT,
+    scheduleDitherMilliseconds: 30 * 60 * 1_000,
+  });
+  assert.equal(enabled.nextAttemptAt, "2026-07-29T18:30:00.000Z");
+  const lateClaim = claimAutomaticContributionRun(enabled, {
+    destinationOrigin: ORIGIN,
+    attemptedAt: "2026-07-29T19:00:00.000Z",
+    preparationId: PREPARATION_ID,
+  });
+  assert.equal(lateClaim.state.nextAttemptAt, "2026-07-30T00:30:00.000Z");
 });
 
 test("public status is a frozen, privacy-safe projection with frozen nested records", () => {

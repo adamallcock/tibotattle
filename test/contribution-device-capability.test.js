@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   chmod,
+  mkdir,
   mkdtemp,
   readFile,
   rm,
@@ -10,11 +11,12 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   ContributionDeviceCapabilityError,
   createProductionContributionDeviceBackend,
   ensureContributionDeviceCapability,
+  migrateLegacyContributionDeviceCapability,
   readContributionDeviceCapability,
   removeContributionDeviceCapability,
   withContributionDeviceSecret,
@@ -142,6 +144,171 @@ test("normal reads expose only a stable domain-separated hash and public binding
       readContributionDeviceCapability({ backend, stateFile, expectedOrigin: "https://other.example" }),
       fixedError("origin_conflict"),
     );
+  });
+});
+
+test("legacy contribution binding metadata migrates without replacing or exposing the Keychain secret", async () => {
+  await fixture(async ({ root, stateFile }) => {
+    const legacyStateFile = join(root, "legacy", "device.json");
+    const backend = memoryBackend();
+    const created = await ensureContributionDeviceCapability({
+      backend,
+      origin: ORIGIN,
+      stateFile: legacyStateFile,
+      generateDeviceId: () => DEVICE_ID,
+      generateSecret: () => Buffer.alloc(32, 31),
+      clock: () => Date.parse("2026-08-01T12:00:00.000Z"),
+    });
+    const callsBeforeMigration = backend.calls.length;
+
+    const migrated = await migrateLegacyContributionDeviceCapability({
+      backend,
+      legacyStateFile,
+      stateFile,
+      expectedOrigin: `${ORIGIN}/`,
+    });
+
+    assert.deepEqual(migrated, { ...created, status: "migrated" });
+    assert.equal(Object.hasOwn(migrated, "secret"), false);
+    assert.equal(backend.calls.length, callsBeforeMigration + 1);
+    assert.equal(backend.calls.at(-1)[0], "read");
+    assert.deepEqual(backend.current(), Buffer.alloc(32, 31));
+    assert.equal((await stat(stateFile)).mode & 0o777, 0o600);
+    await assert.rejects(readFile(legacyStateFile), { code: "ENOENT" });
+
+    const read = await readContributionDeviceCapability({
+      backend,
+      stateFile,
+      expectedOrigin: ORIGIN,
+    });
+    assert.equal(read.deviceSecretHash, created.deviceSecretHash);
+  });
+});
+
+test("legacy migration is lazy when no old binding exists", async () => {
+  await fixture(async ({ root, stateFile }) => {
+    const backend = memoryBackend(Buffer.alloc(32, 32));
+    assert.deepEqual(await migrateLegacyContributionDeviceCapability({
+      backend,
+      legacyStateFile: join(root, "legacy", "device.json"),
+      stateFile,
+      expectedOrigin: ORIGIN,
+    }), { status: "missing" });
+    assert.equal(backend.calls.length, 0, "an absent legacy file must not touch Keychain");
+  });
+});
+
+test("legacy migration finishes exact crash recovery without another Keychain read", async () => {
+  await fixture(async ({ root, stateFile }) => {
+    const legacyStateFile = join(root, "legacy", "device.json");
+    const backend = memoryBackend();
+    await ensureContributionDeviceCapability({
+      backend,
+      origin: ORIGIN,
+      stateFile: legacyStateFile,
+      generateDeviceId: () => DEVICE_ID,
+      generateSecret: () => Buffer.alloc(32, 33),
+      clock: () => Date.parse("2026-08-01T13:00:00.000Z"),
+    });
+    await mkdir(dirname(stateFile), { recursive: true, mode: 0o700 });
+    await writeFile(stateFile, await readFile(legacyStateFile), { mode: 0o600 });
+    const callsBeforeMigration = backend.calls.length;
+
+    const result = await migrateLegacyContributionDeviceCapability({
+      backend,
+      legacyStateFile,
+      stateFile,
+      expectedOrigin: ORIGIN,
+    });
+
+    assert.equal(result.status, "already_migrated");
+    assert.equal(result.deviceId, DEVICE_ID);
+    assert.equal(backend.calls.length, callsBeforeMigration);
+    await assert.rejects(readFile(legacyStateFile), { code: "ENOENT" });
+    assert.equal((await stat(stateFile)).mode & 0o777, 0o600);
+  });
+});
+
+test("legacy migration preserves conflicting, unsafe, and wrong-origin state", async () => {
+  await fixture(async ({ root, stateFile }) => {
+    const legacyStateFile = join(root, "legacy", "device.json");
+    const backend = memoryBackend();
+    await ensureContributionDeviceCapability({
+      backend,
+      origin: ORIGIN,
+      stateFile: legacyStateFile,
+      generateDeviceId: () => DEVICE_ID,
+      generateSecret: () => Buffer.alloc(32, 34),
+    });
+    await ensureContributionDeviceCapability({
+      backend: memoryBackend(),
+      origin: ORIGIN,
+      stateFile,
+      generateDeviceId: () => "22222222-2222-4222-8222-222222222222",
+      generateSecret: () => Buffer.alloc(32, 35),
+    });
+    const callsBeforeMigration = backend.calls.length;
+    await assert.rejects(
+      migrateLegacyContributionDeviceCapability({
+        backend,
+        legacyStateFile,
+        stateFile,
+        expectedOrigin: ORIGIN,
+      }),
+      fixedError("credential_conflict"),
+    );
+    assert.equal(backend.calls.length, callsBeforeMigration);
+    assert.equal((await stat(legacyStateFile)).mode & 0o777, 0o600);
+    assert.equal((await stat(stateFile)).mode & 0o777, 0o600);
+  });
+
+  await fixture(async ({ root, stateFile }) => {
+    const legacyStateFile = join(root, "legacy", "device.json");
+    const backend = memoryBackend();
+    await ensureContributionDeviceCapability({
+      backend,
+      origin: ORIGIN,
+      stateFile: legacyStateFile,
+      generateDeviceId: () => DEVICE_ID,
+      generateSecret: () => Buffer.alloc(32, 36),
+    });
+    await chmod(legacyStateFile, 0o644);
+    const callsBeforeMigration = backend.calls.length;
+    await assert.rejects(
+      migrateLegacyContributionDeviceCapability({
+        backend,
+        legacyStateFile,
+        stateFile,
+        expectedOrigin: ORIGIN,
+      }),
+      fixedError("state_invalid"),
+    );
+    assert.equal(backend.calls.length, callsBeforeMigration);
+    assert.equal((await stat(legacyStateFile)).mode & 0o777, 0o644);
+  });
+
+  await fixture(async ({ root, stateFile }) => {
+    const legacyStateFile = join(root, "legacy", "device.json");
+    const backend = memoryBackend();
+    await ensureContributionDeviceCapability({
+      backend,
+      origin: ORIGIN,
+      stateFile: legacyStateFile,
+      generateDeviceId: () => DEVICE_ID,
+      generateSecret: () => Buffer.alloc(32, 37),
+    });
+    const callsBeforeMigration = backend.calls.length;
+    await assert.rejects(
+      migrateLegacyContributionDeviceCapability({
+        backend,
+        legacyStateFile,
+        stateFile,
+        expectedOrigin: "https://other.example",
+      }),
+      fixedError("origin_conflict"),
+    );
+    assert.equal(backend.calls.length, callsBeforeMigration);
+    assert.equal((await stat(legacyStateFile)).mode & 0o777, 0o600);
   });
 });
 

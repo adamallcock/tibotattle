@@ -163,7 +163,9 @@
         "priceBasis": {
           "enum": [
             "current_api_prices",
-            "unpriced"
+            "historical_api_prices",
+            "unpriced",
+            "mixed_api_prices"
           ]
         }
       }

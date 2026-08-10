@@ -19,6 +19,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,12 +29,32 @@ import {
   validateStateDirectoryName,
 } from "../config/product-brand.js";
 import {
+  RELEASE_MANIFEST,
+  RELEASE_VERSION,
+} from "../config/release-manifest.js";
+import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
+import {
+  INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+  INTERNAL_DOGFOOD_SERVICE_ORIGIN_MODE,
+  RELEASE_CHANNELS_SCHEMA_VERSION,
+  STABLE_RELEASE_CHANNEL,
+  assertReleaseChannelConfiguration,
+  createReleaseChannelProvenance,
+  getReleaseChannel,
+} from "../config/release-channels.js";
+import {
   MACOS_RUNTIME_STATIC_ASSETS,
   MACOS_ACCOUNTING_RUNTIME_FILES,
+  MACOS_BUILD_PROFILES,
   MACOS_IDENTITY_CORE_RUNTIME_FILES,
+  MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+  MACOS_QUOTA_ANALYSIS_RUNTIME_FILES,
   MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES,
   MACOS_WEB_MODULE_ENTRYPOINTS,
   buildMacOSApp,
+  buildMacOSAppForRelease,
+  buildMacOSReleaseCandidate,
+  collectMacOSLocalizationResources,
   collectMacOSRuntimeGraph,
   collectMacOSSwiftSources,
   collectMacOSWebModuleGraph,
@@ -42,10 +63,18 @@ import {
   calculateMacOSSourceInputDigest,
   assertMacOSWebModuleInventory,
   assertMacOSWorkspaceRuntimePackageInventory,
+  assertMacOSExternalBuildOutputIsFresh,
   normalizeMacOSBundleVersion,
+  normalizeMacOSBuildProfile,
   normalizeMacOSCentralOrigin,
+  parseMacOSBuildArguments,
+  pinnedPackage,
+  pinnedPackageTreeDigest,
   stageMacOSWebModules,
   stageMacOSWorkspaceRuntimePackages,
+  installMacOSExternalBuildOutput,
+  validateMacOSPreviewApp,
+  validateMacOSPreviewOutputPath,
   validateMacOSDistributionConfiguration,
 } from "../scripts/build-macos-app.js";
 import {
@@ -54,19 +83,27 @@ import {
 import {
   compareMacOSBundleVersions,
   createMacOSSignedReplacementContract,
+  assertStableSparkleKeyContinuity,
   developerIDSignMacOSApp,
+  developerIDSignMacOSDMG,
   inspectMacOSApp,
   packageMacOSDMG,
+  prepareMacOSReleaseCandidate,
   readMacOSReleaseSourceProvenance,
   readMacOSReleaseBuildConfiguration,
   readMacOSReleaseCredentials,
+  readStableReleaseManifest,
   submitToAppleNotary,
   validateNodeRuntimeEntitlements,
   validateMacOSSignedReplacementArtifacts,
   validateMacOSSignedReplacementPair,
   validateMacOSApplicationsLink,
   validateMacOSDMG,
+  validateMacOSLoginItemReleaseRehearsal,
 } from "../scripts/macos-release-core.js";
+import {
+  parseArguments as parseMacOSDMGArguments,
+} from "../scripts/package-macos-dmg.js";
 import {
   SPARKLE_FRAMEWORK_LINKS,
   SPARKLE_FRAMEWORK_SHA256,
@@ -102,6 +139,20 @@ const MENU_BAR_STATUS_SOURCE = join(
   "Sources",
   "MenuBarStatus.swift",
 );
+const QUOTA_NOTIFICATIONS_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "QuotaNotifications.swift",
+);
+const LOCALIZATION_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "Localization.swift",
+);
 const BUILD_SCRIPT = join(
   REPOSITORY_ROOT,
   "scripts",
@@ -116,6 +167,53 @@ const BUILD_SUPPORTED =
   process.platform === "darwin"
   && process.arch === "arm64"
   && process.version === "v26.2.0";
+const MACOS_TEST_LANES_ACTIVE = process.env.USAGE_MONITOR_TEST_LANES === "1";
+const MACOS_TEST_SCOPE = MACOS_TEST_LANES_ACTIVE
+  ? process.env.USAGE_MONITOR_MACOS_TEST_SCOPE ?? "all"
+  : "all";
+if (MACOS_TEST_LANES_ACTIVE
+    && !new Set(["all", "source", "artifact"]).has(MACOS_TEST_SCOPE)) {
+  throw new Error(
+    "USAGE_MONITOR_MACOS_TEST_SCOPE must be one of all, source, or artifact",
+  );
+}
+
+const SYNTHETIC_DOGFOOD_PUBLIC_KEY = Buffer.alloc(32, 7).toString("base64");
+const SYNTHETIC_DOGFOOD_PUBLIC_KEY_SHA256 = createHash("sha256")
+  .update(Buffer.from(SYNTHETIC_DOGFOOD_PUBLIC_KEY, "base64"))
+  .digest("hex");
+
+function syntheticDogfoodReleaseChannel() {
+  return {
+    schemaVersion: RELEASE_CHANNELS_SCHEMA_VERSION,
+    name: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+    configured: true,
+    buildManifestChannel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+    serviceOriginMode: INTERNAL_DOGFOOD_SERVICE_ORIGIN_MODE,
+    serviceOrigin: "https://dogfood.tibotattle.example",
+    publicWebsiteOrigin: "https://dogfood.tibotattle.example",
+    sparkle: {
+      origin: "https://updates.dogfood.tibotattle.example",
+      appcastURL:
+        "https://updates.dogfood.tibotattle.example/internal-dogfood/appcast.xml",
+      appcastObjectKey: "internal-dogfood/appcast.xml",
+      r2Bucket: "tibotattle-dogfood-updates",
+      objectPrefix: "internal-dogfood/releases",
+      atomicGuardURL:
+        "https://release.dogfood.tibotattle.example/api/v1/internal/release/appcast",
+      publicEdKeySha256: SYNTHETIC_DOGFOOD_PUBLIC_KEY_SHA256,
+    },
+  };
+}
+
+function macOSArtifactTest(name, options, body) {
+  return test(name, {
+    ...options,
+    skip: MACOS_TEST_SCOPE === "source"
+      ? "excluded by the macOS source-only lane"
+      : options.skip,
+  }, body);
+}
 
 test("reviewed product brand owns the native bundle and semantic-open identity", () => {
   assert.equal(Object.isFrozen(PRODUCT_BRAND), true);
@@ -412,9 +510,10 @@ function runCaptured(command, arguments_, options = {}, timeoutMs = 30_000) {
     });
     let stdout = "";
     let stderr = "";
+    let timedOut = false;
     const timeout = setTimeout(() => {
+      timedOut = true;
       child.kill("SIGKILL");
-      rejectRun(new Error(`child timed out: ${stderr || stdout}`));
     }, timeoutMs);
     child.stdout.on("data", (chunk) => {
       stdout = `${stdout}${chunk}`.slice(-16_384);
@@ -426,19 +525,68 @@ function runCaptured(command, arguments_, options = {}, timeoutMs = 30_000) {
       clearTimeout(timeout);
       rejectRun(error);
     });
-    child.once("exit", (code, signal) => {
+    child.once("close", (code, signal) => {
       clearTimeout(timeout);
+      if (timedOut) {
+        rejectRun(new Error(`child timed out: ${stderr || stdout}`));
+        return;
+      }
       resolveRun({ code, signal, stdout, stderr });
     });
   });
 }
 
+function buildOutputValue(output, label) {
+  const line = output.split("\n").find((candidate) =>
+    candidate.startsWith(`${label}: `));
+  assert.notEqual(line, undefined, `missing ${label} from macOS build output`);
+  return line.slice(`${label}: `.length);
+}
+
+async function buildMacOSAppInIndependentProcess(output) {
+  const result = await runCaptured(
+    process.execPath,
+    [BUILD_SCRIPT, "--output", output],
+    { cwd: REPOSITORY_ROOT },
+    120_000,
+  );
+  assert.equal(result.code, 0, result.stderr || result.stdout);
+  assert.equal(result.signal, null, result.stderr || result.stdout);
+  const totalBytes = Number(buildOutputValue(result.stdout, "Payload bytes"));
+  assert.equal(Number.isSafeInteger(totalBytes), true);
+  return Object.freeze({
+    buildProfile: buildOutputValue(result.stdout, "Compiler profile"),
+    output: buildOutputValue(result.stdout, "Output"),
+    payloadSha256: buildOutputValue(result.stdout, "Payload SHA-256"),
+    sourceSha256: buildOutputValue(result.stdout, "Source SHA-256"),
+    totalBytes,
+  });
+}
+
 test("native launcher keeps the requested foreground-only lifecycle", async () => {
-  const [source, semanticOpenTargetSource, menuBarStatusSource] = await Promise.all([
+  const [
+    source,
+    semanticOpenTargetSource,
+    menuBarStatusSource,
+    loginItemSource,
+    localizationSource,
+  ] = await Promise.all([
     readFile(SWIFT_SOURCE, "utf8"),
     readFile(SEMANTIC_OPEN_TARGET_SOURCE, "utf8"),
     readFile(MENU_BAR_STATUS_SOURCE, "utf8"),
+    readFile(
+      join(REPOSITORY_ROOT, "apps", "macos", "Sources", "LoginItemManager.swift"),
+      "utf8",
+    ),
+    readFile(
+      join(REPOSITORY_ROOT, "apps", "macos", "Sources", "Localization.swift"),
+      "utf8",
+    ),
   ]);
+  const firstRunDisclosureSource = source.slice(
+    source.indexOf("private func showFirstRunDisclosure"),
+    source.indexOf("private func startCompanion"),
+  );
   assert.match(source, /import AppKit/u);
   assert.match(source, /"USAGE_MONITOR_PORT": "0"/u);
   assert.match(source, /"USAGE_MONITOR_RESOURCE_ROOT"/u);
@@ -446,6 +594,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /"CODEX_HOME": codexHome\.path/u);
   assert.match(source, /"USAGE_MONITOR_CENTRAL_ORIGIN"/u);
   assert.match(source, /UsageMonitorCentralOriginMode/u);
+  assert.match(source, /BundledProduct\.publicWebsiteOrigin/u);
   assert.match(
     source,
     /"USAGE_MONITOR_PARENT_PID": String\(getpid\(\)\)/u,
@@ -456,12 +605,24 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(source, /O_DIRECTORY \| O_NOFOLLOW/u);
   assert.match(source, /fchmod\(descriptor, 0o700\)/u);
-  assert.match(source, /title: "Open Dashboard"/u);
-  assert.match(source, /title: "Retry"/u);
-  assert.match(source, /title: "Settings…"/u);
-  assert.match(source, /title: "Data & Diagnostics…"/u);
-  assert.match(source, /title: "Codex Folder…"/u);
-  assert.match(source, /title: "Version & Updates…"/u);
+  assert.match(
+    source,
+    /title: TiboTattleLocalization\.string\(\.settingsOpenDashboard\)/u,
+  );
+  assert.match(source, /title: TiboTattleLocalization\.string\(\.launcherRetry\)/u);
+  assert.match(source, /title: TiboTattleLocalization\.string\(\.menuSettings\)/u);
+  assert.match(
+    source,
+    /title: TiboTattleLocalization\.string\(\.launcherDataDiagnostics\)/u,
+  );
+  assert.match(
+    source,
+    /title: TiboTattleLocalization\.string\(\.settingsChooseCodexFolder\)/u,
+  );
+  assert.match(
+    source,
+    /title: TiboTattleLocalization\.format\([\s\S]*?\.menuAboutProduct[\s\S]*?BundledProduct\.displayName/u,
+  );
   assert.doesNotMatch(
     source,
     /title: "Open \\\(BundledProduct\.monitoredAppDisplayName\)"/u,
@@ -470,14 +631,20 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     source,
     /withBundleIdentifier: BundledProduct\.monitoredAppBundleIdentifier/u,
   );
-  assert.match(source, /Copy Diagnostics/u);
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.dialogCopyDiagnostics\)/u,
+  );
   assert.match(source, /usage-monitor-macos-diagnostics-v1/u);
   assert.match(source, /UM_MACOS_COMPANION_START_TIMEOUT/u);
   assert.match(source, /companionStartupTimeoutSeconds/u);
   assert.match(source, /NSOpenPanel/u);
   assert.match(source, /launcher-settings-v1\.json/u);
-  assert.match(source, /Default location \(~\/\.codex\)/u);
-  assert.match(source, /title: "About TiboTattle"/u);
+  assert.match(source, /settingsCodexFolderDefaultLocation/u);
+  assert.match(
+    source,
+    /title: TiboTattleLocalization\.format\([\s\S]*?\.settingsAboutProduct[\s\S]*?BundledProduct\.displayName/u,
+  );
   assert.match(source, /case companionAlreadyRunning/u);
   assert.match(source, /UM_MACOS_COMPANION_ALREADY_RUNNING/u);
   assert.match(source, /automatic_contribution_instance_active/u);
@@ -485,13 +652,31 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     source,
     /anotherInstanceIsActive\s*\? LauncherError\.companionAlreadyRunning/u,
   );
-  assert.match(source, /--confirm-local-keychain-reset/u);
-  assert.match(source, /Reset exactly two local Keychain capabilities now/iu);
-  assert.match(source, /Hosted service: no registered device is revoked/iu);
-  assert.match(source, /Secure erasure is not claimed/iu);
-  assert.match(source, /Move Data to Trash/u);
+  assert.match(source, /private var automaticCompanionRecoveryUsed = false/u);
   assert.match(
     source,
+    /private func companionExited\([\s\S]*?!automaticCompanionRecoveryUsed[\s\S]*?automaticCompanionRecoveryUsed = true[\s\S]*?startCompanion\(\)[\s\S]*?return[\s\S]*?showFailure/u,
+  );
+  assert.match(
+    source,
+    /@objc private func retryCompanion\(\) \{[\s\S]*?automaticCompanionRecoveryUsed = false/u,
+  );
+  assert.match(source, /--confirm-local-keychain-reset/u);
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\s*\.dialogResetCapabilities\s*\)/u,
+  );
+  assert.match(
+    localizationSource,
+    /Hosted service: no registered device is revoked/iu,
+  );
+  assert.match(localizationSource, /Secure erasure is not claimed/iu);
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.dialogMoveDataToTrash\)/u,
+  );
+  assert.match(
+    localizationSource,
     /App state: local indexes[\s\S]*Keychain: pseudonymous identity[\s\S]*Hosted service: sent community data/iu,
   );
   assert.match(source, /requiredString\("UsageMonitorAppOpenScheme"\)/u);
@@ -511,7 +696,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(
     source,
-    /init\(semanticOpenTarget: SemanticOpenTarget\)[\s\S]*self\.semanticOpenTarget = semanticOpenTarget/u,
+    /init\([\s\S]*semanticOpenTarget: SemanticOpenTarget[\s\S]*self\.semanticOpenTarget = semanticOpenTarget/u,
   );
   assert.match(
     source,
@@ -541,19 +726,27 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /--app-link-smoke-test/u);
   assert.match(
     source,
-    /updates local \\\(BundledProduct\.monitoredAppDisplayName\) metadata while the app is open/iu,
+    /TiboTattleLocalization\.format\([\s\S]*?\.launcherWelcome[\s\S]*?BundledProduct\.displayName/u,
   );
   assert.match(
     source,
-    /Welcome to \\\(BundledProduct\.displayName\)/u,
+    /addButton\(\s*withTitle:\s*TiboTattleLocalization\.string\(\s*\.launcherGetStarted\s*\)\s*\)/u,
   );
-  assert.match(source, /addButton\(withTitle: "Get Started"\)/u);
+  assert.match(
+    firstRunDisclosureSource,
+    /checkboxWithTitle:[\s\S]*\.settingsStartAtLogin/u,
+  );
+  assert.match(firstRunDisclosureSource, /startAtLogin\.state = \.on/u);
+  assert.match(
+    firstRunDisclosureSource,
+    /guard alert\.runModal\(\) == \.alertFirstButtonReturn[\s\S]*?registerLoginItemForFirstRun/u,
+  );
   assert.match(source, /first-run-v1\.json/u);
   assert.match(source, /usage-monitor-first-run-v1/u);
-  assert.match(source, /Community contribution is optional/iu);
-  assert.match(source, /Community contribution is optional/iu);
+  assert.match(localizationSource, /Community contribution is optional/iu);
+  assert.match(localizationSource, /Community contribution is optional/iu);
   assert.doesNotMatch(source, /six-hour while-open contribution schedule/iu);
-  assert.match(source, /Keep the app open while analysis runs/iu);
+  assert.match(localizationSource, /Keep the app open while analysis runs/iu);
   assert.match(
     source,
     /guard !quitting, retryAllowed, firstRunAcknowledged,[\s\S]*let codexHomeConfiguration/u,
@@ -567,26 +760,341 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     /retryButton\.isEnabled = retryAllowed && firstRunAcknowledged/u,
   );
   assert.match(source, /SPUStandardUpdaterController/u);
+  assert.match(source, /startingUpdater:\s*false/u);
+  assert.doesNotMatch(source, /startingUpdater:\s*true/u);
+  assert.match(source, /private enum AppUpdaterState: Equatable/u);
+  assert.match(
+    source,
+    /case unavailable[\s\S]*case unverified[\s\S]*case ready[\s\S]*case checking[\s\S]*case updateAvailable[\s\S]*case verifiedNoUpdate[\s\S]*case failed/u,
+  );
+  assert.match(source, /feedIsReachable = false/u);
+  assert.match(source, /hasError: error != nil/u);
+  assert.match(source, /hasBody: data\?\.isEmpty == false/u);
+  assert.match(source, /request\.httpMethod = "GET"/u);
+  assert.doesNotMatch(source, /request\.httpMethod = "HEAD"/u);
+  assert.match(
+    source,
+    /static func feedResponseIsReachable\([\s\S]*200..<300/u,
+  );
+  assert.match(
+    source,
+    /guard Self\.feedResponseIsReachable\([\s\S]*showFeedFailureAlert/u,
+  );
+  assert.match(source, /alert\.addButton\(withTitle: TiboTattleLocalization\.string\(\.launcherRetry\)\)/u);
+  assert.match(source, /alert\.addButton\(withTitle: TiboTattleLocalization\.string\(\.commonCancel\)\)/u);
+  assert.match(source, /alert\.runModal\(\) == \.alertFirstButtonReturn[\s\S]*checkForUpdates\(nil\)/u);
+  const updaterSummary = source.match(
+    /var settingsSummary: String \{([\s\S]*?)\n    \}\n\n    private func setState/u,
+  )?.[1];
+  assert.ok(updaterSummary, "updater summary source should be present");
+  const readySummary = updaterSummary.match(
+    /case \.ready:([\s\S]*?)case \.checking:/u,
+  )?.[1];
+  assert.ok(readySummary, "ready updater summary source should be present");
+  assert.match(readySummary, /settingsAutomaticUpdatesReachable/u);
+  assert.doesNotMatch(
+    readySummary,
+    /settingsAutomaticUpdatesOn|settingsAutomaticUpdatesOff/u,
+  );
+  assert.match(source, /didFindValidUpdate[\s\S]*\.updateAvailable/u);
+  assert.match(
+    source,
+    /func updaterDidNotFindUpdate\(_ updater: SPUUpdater, error: Error\) \{[\s\S]*?setState\(\.verifiedNoUpdate\)\s*\}/u,
+  );
+  assert.match(
+    source,
+    /func updaterDidNotFindUpdate\(_ updater: SPUUpdater\) \{\s*setState\(\.verifiedNoUpdate\)\s*\}/u,
+  );
+  assert.match(
+    source,
+    /stateForUpdaterAbort\([\s\S]*SUSparkleErrorDomain[\s\S]*Int\(SUError\.noUpdateError\.rawValue\):[\s\S]*return \.verifiedNoUpdate[\s\S]*Int\(SUError\.installationCanceledError\.rawValue\):[\s\S]*return \.ready[\s\S]*default:[\s\S]*return \.failed/u,
+  );
+  assert.match(
+    source,
+    /didAbortWithError[\s\S]*stateForUpdaterAbort\([\s\S]*errorDomain: updaterError\.domain[\s\S]*errorCode: updaterError\.code/u,
+  );
+  assert.match(source, /controller\.checkForUpdates\(sender\)/u);
+  assert.match(source, /runtimeStateDescription/u);
+  assert.match(
+    source,
+    /firstRunAcknowledged = true[\s\S]*updater\.startAfterFirstRunDisclosure\(\)/u,
+  );
+  assert.match(
+    source,
+    /var firstRunUpdatesDisclosure: String[\s\S]*guard isAvailable else[\s\S]*settingsUpdateDisclosureDevelopment/u,
+  );
+  assert.match(
+    source,
+    /if Self\.isPreviewDistribution[\s\S]*settingsUpdateDisclosurePreview/u,
+  );
+  assert.match(
+    source,
+    /allowsAutomaticUpdateOptIn && automaticUpdatesEnabled[\s\S]*settingsUpdateDisclosureAutomaticOn/u,
+  );
+  assert.equal(
+    firstRunDisclosureSource.includes("updater.firstRunUpdatesDisclosure"),
+    true,
+  );
+  assert.doesNotMatch(
+    firstRunDisclosureSource,
+    /settingsUpdateDisclosureAutomaticOn/u,
+  );
   assert.match(source, /updater\.automaticallyDownloadsUpdates = enabled/u);
-  assert.match(source, /withTitle: "Automatic Updates…"/u);
-  assert.match(source, /Turn On Automatic Updates/u);
-  assert.match(source, /Turn Off Automatic Updates/u);
-  assert.match(source, /install them when you quit the app/iu);
-  assert.match(source, /This development build contains no updater framework/iu);
-  assert.match(source, /move \\\(BundledProduct\.bundleName\) to Trash/iu);
-  assert.match(source, /Updating local usage while the app is open/iu);
-  assert.match(source, /Large histories may need several passes/iu);
-  assert.match(source, /Nothing leaves this Mac/iu);
+  assert.match(source, /NSSwitch\(\)/u);
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.settingsAutomaticUpdates\)/u,
+  );
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.settingsLanguage\)/u,
+  );
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.settingsLanguageSystem\)/u,
+  );
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.settingsLanguageSummary\)/u,
+  );
+  assert.match(
+    source,
+    /settingsAboutAutomaticUpdatesDetailLabel\?\.stringValue\s*=\s*automaticUpdatesSettingsSummary\(\)/u,
+  );
+  assert.doesNotMatch(
+    source,
+    /settingsAutomaticUpdatesDetailLabel\?\.stringValue\s*=\s*updater\.automaticUpdatesPreferenceSummary/u,
+  );
+  assert.match(source, /private func settingsGroup\(/u);
+  assert.match(source, /let group = NSBox\(\)/u);
+  const settingsSource = source.slice(
+    source.indexOf("private func showSettings(selecting index: Int)"),
+    source.indexOf("    private func diagnosticText()"),
+  );
+  assert.ok(settingsSource, "settings construction source should be present");
+  const generalSettings = settingsSource.match(
+    /let general = settingsPage\([\s\S]*?\n        \)\n(?=        let notifications)/u,
+  )?.[0] ?? "";
+  assert.ok(generalSettings, "general settings page wiring should be present");
+  assert.match(
+    generalSettings,
+    /languageSection[\s\S]*sourceSection[\s\S]*refreshIntervalSection[\s\S]*startAtLoginSection/u,
+  );
+  assert.doesNotMatch(generalSettings, /quotaNotificationsSection/u);
+  assert.doesNotMatch(
+    generalSettings,
+    /automaticUpdatesHeader|aboutAutomaticUpdatesDetail|checkForUpdates|launcherUpToDate/u,
+  );
+  const notificationSettings = settingsSource.match(
+    /let notifications = settingsPage\([\s\S]*?views: \[quotaNotificationsSection\][\s\S]*?\n        \)/u,
+  )?.[0] ?? "";
+  assert.ok(
+    notificationSettings,
+    "notification settings should have a dedicated native page",
+  );
+  const aboutSettings = settingsSource.slice(
+    settingsSource.indexOf("let about = settingsPage("),
+  );
+  assert.match(
+    aboutSettings,
+    /aboutProductSection[\s\S]*aboutUpdatesSection[\s\S]*projectLinks/u,
+  );
+  const aboutUpdates = settingsSource.slice(
+    settingsSource.indexOf("let aboutUpdatesSection = settingsGroup("),
+    settingsSource.indexOf("let aboutProductSection = settingsGroup("),
+  );
+  assert.match(
+    aboutUpdates,
+    /automaticUpdatesHeader[\s\S]*aboutAutomaticUpdatesDetail[\s\S]*checkForUpdates/u,
+  );
+  assert.match(settingsSource, /symbolName: "globe"/u);
+  assert.match(settingsSource, /symbolName: "folder"/u);
+  assert.match(settingsSource, /symbolName: "clock"/u);
+  assert.match(source, /settingsOpenNotifications/u);
+  assert.match(source, /x-apple\.systempreferences:com\.apple\.Notifications-Settings\.extension/u);
+  assert.match(source, /case \.unverified:[\s\S]*?settingsCheckForUpdates/u);
+  assert.match(source, /nativeEvidenceState = \.readFailed/u);
+  assert.match(source, /nativeEvidenceState = \.lifecycleUnavailable/u);
+  assert.doesNotMatch(source, /settingsNotificationsReset\)/u);
+  assert.doesNotMatch(source, /toggleQuotaNotificationReset/u);
+  assert.match(
+    localizationSource,
+    /Local usage refreshes while TiboTattle is open\. Raw logs stay on this Mac\./iu,
+  );
+  assert.match(
+    localizationSource,
+    /Start TiboTattle when you sign in\. Manage this in System Settings → Login Items\./iu,
+  );
+  assert.match(source, /NSApp\.applicationIconImage/u);
+  assert.doesNotMatch(source, /showAutomaticUpdateOptions/u);
+  assert.doesNotMatch(source, /showLifecycleHelp/u);
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\s*\.launcherUpdatingLocalUsage\s*\)/u,
+  );
+  assert.match(localizationSource, /Updating local usage while the app is open/iu);
+  assert.match(localizationSource, /Large histories may need several passes/iu);
+  assert.match(localizationSource, /Nothing leaves this Mac/iu);
   assert.match(source, /private final class NativeDashboardChrome/u);
-  assert.match(source, /NSSplitView\(\)/u);
-  assert.match(source, /configureBadge\(modeButton, symbol: "lock\.fill"\)/u);
+  const destinationSource = source.match(
+    /private enum NativeDashboardDestination:[\s\S]*?\n\}\n\n\/\/\/ `NSSplitView`/u,
+  )?.[0] ?? "";
+  assert.ok(destinationSource, "native dashboard destination enum is present");
+  assert.doesNotMatch(destinationSource, /case data\b/u);
+  assert.doesNotMatch(source, /nativeDashboardDataPrivacy|nativeDashboard\.dataPrivacy/u);
+  assert.match(destinationSource, /case community\b/u);
+  assert.deepEqual(
+    [...destinationSource.matchAll(/^\s*case (\w+)$/gmu)].map((match) => match[1]),
+    ["overview", "weekly", "trends", "method", "community"],
+  );
+  assert.match(source, /private final class NativeDashboardReportPane/u);
+  // The chrome is an NSSplitViewController with a real sidebar item, so the
+  // split view is vended by AppKit rather than constructed here. That is what
+  // gives the sidebar its system vibrancy, rounding and full-height behaviour;
+  // the geometry it produces is asserted by the measured chrome smoke below.
+  assert.match(source, /class NativeDashboardChrome: NSSplitViewController/u);
+  assert.match(source, /NSSplitViewItem\(sidebarWithViewController:/u);
+  assert.match(
+    source,
+    /reportPane = NativeDashboardReportPane\(webView: webView\)/u,
+  );
+  // The web view must NOT carry an autoresizing mask: the pane runs full
+  // height so the sidebar can reach the title bar, and a mask fights the
+  // safe-area inset applied on resize. That the web view still tracks its
+  // pane is asserted by measurement in the chrome smoke rather than by the
+  // presence of a mask.
+  assert.match(source, /webView\.autoresizingMask = \[\]/u);
+  assert.doesNotMatch(source, /webView\.autoresizingMask = \[\.width/u);
+  assert.match(source, /override func layout\(\) \{[\s\S]*?fitWebViewToBounds\(\)/u);
+  assert.match(source, /webView\.frame = frame/u);
+  assert.match(source, /private func loadWhenViewportIsReady\(\)/u);
+  assert.match(source, /viewport\.width >= 120, viewport\.height >= 120/u);
+  assert.match(source, /nativeDashboardChrome\?\.prepareReportViewport\(\)/u);
+  assert.match(source, /document\.querySelector\('#main'\)\?\.innerText/u);
+  assert.match(source, /addSplitViewItem\(reportItem\)/u);
+  assert.doesNotMatch(source, /addSplitViewItem\(webView\)/u);
+  assert.doesNotMatch(source, /split\.addArrangedSubview\(webView\)/u);
+  assert.match(source, /newWindow\.toolbar = makeDashboardToolbar\(\)/u);
+  assert.match(source, /newWindow\.toolbarStyle = \.unified/u);
   assert.match(source, /refreshLocalUsage\(automatic: true\)/u);
-  assert.match(source, /nativeRefreshIntervalSeconds = 300/u);
+  assert.match(source, /static let defaultsKey = "tibotattle\.refresh-interval\.v1"/u);
+  assert.match(source, /static let allowedSeconds = \[60, 5 \* 60, 15 \* 60, 30 \* 60\]/u);
+  assert.match(source, /static func seconds\(in defaults: UserDefaults\) -> Int/u);
+  assert.match(source, /static func setSeconds\(\s*_ value: Int, in defaults: UserDefaults\)/u);
+  assert.match(source, /defaults\.set\(value, forKey: defaultsKey\)/u);
+  assert.match(source, /NativeRefreshIntervalPreference\.seconds/u);
+  assert.match(source, /private struct NativeForegroundRefreshSchedule/u);
+  assert.match(source, /NativeForegroundRefreshScheduler\.schedule/u);
+  assert.match(source, /enqueue\(now \+ \.seconds\(schedule\.intervalSeconds\), work\)/u);
+  assert.match(source, /DispatchQueue\.main\.asyncAfter\(deadline: deadline, execute: work\)/u);
+  assert.match(source, /setSeconds\(value, in: UserDefaults\.standard\)/u);
+  assert.match(source, /--native-refresh-settings-contract-smoke-test/u);
+  assert.doesNotMatch(source, /nativeRefreshIntervalSeconds/u);
   assert.match(source, /private func scheduleNativeRefresh\(\)/u);
+  const refreshIntervalSelectionSource = source.match(
+    /@objc private func selectRefreshInterval\(_ sender: NSPopUpButton\)[\s\S]*?(?=\n    @objc private func openNotificationSettings)/u,
+  )?.[0] ?? "";
+  assert.ok(
+    refreshIntervalSelectionSource,
+    "refresh interval picker action should be present",
+  );
+  assert.match(
+    refreshIntervalSelectionSource,
+    /NativeRefreshIntervalSelection\.apply\([\s\S]*?seconds: seconds[\s\S]*?dashboardAvailable: dashboardURL != nil[\s\S]*?refreshInFlight: nativeRefreshInFlight[\s\S]*?scheduleNativeRefresh\(\)/u,
+  );
+  assert.match(
+    source,
+    /private enum NativeRefreshIntervalSelection[\s\S]*?setSeconds\(seconds, in: defaults\)[\s\S]*?guard dashboardAvailable, !refreshInFlight else \{ return true \}[\s\S]*?reschedule\(\)/u,
+  );
+  assert.match(source, /stack\.centerXAnchor\.constraint\(equalTo: document\.centerXAnchor\)/u);
+  assert.match(source, /stack\.widthAnchor\.constraint\(lessThanOrEqualToConstant: 680\)/u);
+  assert.match(source, /contentStack\.alignment = \.leading/u);
+  assert.match(source, /view\.widthAnchor\.constraint\(equalTo: contentStack\.widthAnchor\)/u);
+  assert.match(source, /stack\.alignment = \.leading/u);
+  assert.match(source, /view\.widthAnchor\.constraint\(equalTo: stack\.widthAnchor\)/u);
+  assert.match(source, /newWindow\.setContentSize\(NSSize\(width: 760, height: 620\)\)/u);
+  assert.match(source, /nativeStatusRefreshButton\?\.contentTintColor/u);
+  assert.match(source, /nativeToolbarStatusColor\(isRefreshing:/u);
+  // Deliberately re-pinned 2026-08-08: the status pill dropped the system
+  // tints (.systemYellow/.systemGreen never reached a bezelled title anyway)
+  // for the web dashboard's state-pill palette — green #174f45 for fresh,
+  // amber #815718 for running/indexing, rust #97402a for a failed refresh —
+  // resolved per appearance and painted as a rounded fill behind a
+  // borderless, tint-aware button.
+  assert.match(source, /private struct NativeToolbarStatusColor/u);
+  assert.match(source, /light: \(red: 23, green: 79, blue: 69, alpha: 1\)/u);
+  assert.match(source, /light: \(red: 129, green: 87, blue: 24, alpha: 1\)/u);
+  assert.match(source, /light: \(red: 151, green: 64, blue: 42, alpha: 1\)/u);
+  // Deliberately re-pinned 2026-08-08: the pill dressing is an inert
+  // borderless NSButton, not a plain NSView. On macOS 26 the toolbar wraps a
+  // custom-view item in its own Liquid Glass platter (NSToolbarPlatterView
+  // hosting an NSGlassEffectView, 11pt taller than the pill), which rendered
+  // as the white halo the owner reported. AppKit only asks its own buttons
+  // whether they want glass — a borderless button declines the platter
+  // through public API; a plain NSView is misted over regardless. The pill
+  // button stays pure dressing: empty title, no action, no key focus, no
+  // accessibility element — the inner title button remains the control.
+  assert.match(source, /private final class NativeToolbarStatusPill: NSButton/u);
+  assert.match(
+    source,
+    /private final class NativeToolbarStatusPill: NSButton[\s\S]*?title = ""[\s\S]*?isBordered = false[\s\S]*?refusesFirstResponder = true[\s\S]*?setAccessibilityElement\(false\)[\s\S]*?wantsLayer = true/u,
+  );
+  assert.match(source, /button\.isBordered = false/u);
+  assert.doesNotMatch(source, /\.systemYellow|\.systemGreen/u);
+  // The colorway mirrors the title's own precedence: a running refresh,
+  // then a terminal failure, then an incomplete index, then evidence.
+  assert.match(
+    source,
+    /private func nativeToolbarStatusColor\([\s\S]*?if isRefreshing \{[\s\S]*?return \.busy[\s\S]*?if nativeRefreshFailure != nil \{[\s\S]*?return \.failed[\s\S]*?!coverage\.isComplete \{[\s\S]*?return \.busy[\s\S]*?case \.live:[\s\S]*?return \.fresh/u,
+  );
+  assert.match(source, /nativeStatusPill\?\.colorway = colorway/u);
+  assert.match(source, /nativeDashboardFresh/u);
+  assert.match(source, /nativeDashboardNeedsRefresh/u);
+  assert.match(
+    source,
+    /tibotattle:locale-override[\s\S]*?requestAnimationFrame[\s\S]*?new Event\('resize'\)/u,
+  );
   assert.match(source, /LocalCompanionEvidenceReader/u);
-  assert.match(source, /LaunchAgent, or daemon/iu);
-  assert.match(source, /title: "Quit"/u);
-  assert.match(source, /title: "Settings…"[\s\S]*keyEquivalent: ","/u);
+  assert.match(source, /firstRunLoginItemDisclosure/u);
+  assert.match(source, /registerLoginItemForFirstRun/u);
+  assert.match(source, /func applicationDidBecomeActive[\s\S]*?updateStartAtLoginSettingsControl\(\)/u);
+  assert.match(source, /title: TiboTattleLocalization\.string\([\s\S]*?\.settingsRefreshLoginItemStatus/u);
+  assert.match(source, /title: TiboTattleLocalization\.string\([\s\S]*?\.settingsRemovePendingLoginItem/u);
+  assert.match(source, /@objc private func removePendingLoginItem\(\)[\s\S]*?\.unregister/u);
+  assert.match(source, /loginItemOperationResult\([\s\S]*?showLoginItemOperationResult/u);
+  assert.match(source, /windowShouldClose\(_ sender: NSWindow\)/u);
+  assert.match(source, /sender\.orderOut\(nil\)[\s\S]*return false/u);
+  assert.match(
+    source,
+    /private func quitApplication\(\) \{\s*NSApp\.terminate\(nil\)/u,
+  );
+  assert.match(loginItemSource, /import ServiceManagement/u);
+  assert.match(loginItemSource, /SMAppService\.mainApp/u);
+  assert.match(loginItemSource, /SMAppService\.openSystemSettingsLoginItems\(\)/u);
+  assert.match(loginItemSource, /case \.notFound:/u);
+  assert.match(loginItemSource, /struct LoginItemSettingsPresentation/u);
+  assert.match(loginItemSource, /case \.requiresApproval:[\s\S]*?showsPendingRemoval: true/u);
+  assert.match(loginItemSource, /case notConfirmed/u);
+  assert.match(loginItemSource, /func reconciledLoginItemOperationResultAfterError/u);
+  for (const forbidden of [
+    "daemonService",
+    "agentService",
+    "SMLoginItemSetEnabled",
+    "LaunchAgents",
+    "LaunchDaemons",
+  ]) {
+    assert.equal(loginItemSource.includes(forbidden), false, forbidden);
+  }
+  assert.match(localizationSource, /LaunchAgent or daemon/iu);
+  assert.doesNotMatch(localizationSource, /installs no login item/iu);
+  assert.match(
+    source,
+    /title: TiboTattleLocalization\.format\([\s\S]*?\.menuQuitProduct[\s\S]*?BundledProduct\.displayName/u,
+  );
+  assert.match(
+    source,
+    /title: TiboTattleLocalization\.string\(\.menuSettings\)[\s\S]*keyEquivalent: ","/u,
+  );
   // The menu-bar item is additive: the Dock icon and the regular activation
   // policy stay, and the window remains the primary surface.
   assert.match(source, /application\.setActivationPolicy\(\.regular\)/u);
@@ -601,8 +1109,14 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(menuBarStatusSource, /private static let idlePollSeconds = 60/u);
   assert.match(menuBarStatusSource, /refreshStaleEvidenceIfNeeded\(\)/u);
-  assert.match(menuBarStatusSource, /systemSymbolName: "chart\.bar\.fill"/u);
-  assert.match(menuBarStatusSource, /image\?\.isTemplate = true/u);
+  assert.match(menuBarStatusSource, /private static func makeBrandBirdTemplate\(\)/u);
+  assert.match(menuBarStatusSource, /NSApp\.applicationIconImage/u);
+  assert.match(menuBarStatusSource, /template\.isTemplate = true/u);
+  assert.match(menuBarStatusSource, /systemSymbolName: "bird\.fill"/u);
+  assert.match(menuBarStatusSource, /let glyphSize = NSSize\(width: 16, height: 16\)/u);
+  assert.match(menuBarStatusSource, /private static func drawMeter\(/u);
+  assert.doesNotMatch(menuBarStatusSource, /NSApp\.applicationIconImage\.copy\(\)/u);
+  assert.doesNotMatch(menuBarStatusSource, /source\.size = NSSize\(width: 16, height: 16\)/u);
   // The menu bar has one primary app destination. It reuses the in-app
   // dashboard path and leaves the browser as the separate explicit control.
   assert.match(source, /openTiboTattle: \{ \[weak self\] in self\?\.openTiboTattle\(\) \}/u);
@@ -618,10 +1132,19 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     source,
     /func applicationWillTerminate[\s\S]*menuBarStatus\?\.shutDown\(\)/u,
   );
-  // The status item must never become the app's only surface.
+  // The shipped app must never become a menu-bar-only surface. Accessory
+  // activation is confined to the non-launching AppKit smoke modes.
+  assert.match(
+    source,
+    /private enum MenuBarContractSmokeTest \{[\s\S]*?application\.setActivationPolicy\(\.accessory\)/u,
+  );
+  assert.equal(
+    source.match(/setActivationPolicy\(\.accessory\)/gu)?.length,
+    3,
+    "only isolated AppKit smoke modes may use accessory activation",
+  );
   for (const forbidden of [
     "LSUIElement",
-    "setActivationPolicy(.accessory)",
     "setActivationPolicy(.prohibited)",
     "MenuBarExtra",
   ]) {
@@ -636,12 +1159,49 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   for (const forbidden of [
     "LaunchAgents",
     "LaunchDaemons",
-    "ServiceManagement",
-    "SMAppService",
     "SMLoginItemSetEnabled",
     "URLSessionConfiguration.background",
   ]) {
     assert.equal(source.includes(forbidden), false, forbidden);
+  }
+});
+
+test("native update disclosure routes settings to About in every catalog", async () => {
+  const expectations = [
+    {
+      about: "Settings → About",
+      general: "Settings → General",
+      locale: "en",
+    },
+    {
+      about: "Configuración → Acerca de",
+      general: "Configuración → General",
+      locale: "es",
+    },
+    {
+      about: "“设置”→“关于”",
+      general: "“设置”→“通用”",
+      locale: "zh-Hans",
+    },
+  ];
+  for (const { about, general, locale } of expectations) {
+    const catalog = await readFile(
+      join(
+        REPOSITORY_ROOT,
+        "apps",
+        "macos",
+        "Resources",
+        `${locale}.lproj`,
+        "Localizable.strings",
+      ),
+      "utf8",
+    );
+    const disclosureLines = catalog
+      .split(/\r?\n/u)
+      .filter((line) => line.includes('"settings.updateDisclosureAutomatic'));
+    assert.equal(disclosureLines.length, 2, locale);
+    assert.equal(disclosureLines.every((line) => line.includes(about)), true, locale);
+    assert.equal(disclosureLines.some((line) => line.includes(general)), false, locale);
   }
 });
 
@@ -654,6 +1214,10 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   // WebKit is a system framework: the bundle gains no new binary and the
   // packaged app declares no new transport exception for it.
   assert.match(buildSource, /"-framework",\s*\n\s*"WebKit",/u);
+  assert.match(
+    buildSource,
+    /"-framework",\s*\n\s*"ServiceManagement",/u,
+  );
   assert.equal(buildSource.includes("NSAllowsArbitraryLoads"), false);
   assert.equal(buildSource.includes("NSExceptionDomains"), false);
   assert.match(
@@ -672,6 +1236,18 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   assert.match(
     source,
     /func notifyHostedSignInReturn\(\) \{[\s\S]*?window\.dispatchEvent\(new Event\('tibotattle:hosted-sign-in-return'\)\)/u,
+  );
+  // The shell takes the foreground refresh cadence away from the page, so it
+  // owes the page a signal when a refresh finished. Without it the document
+  // keeps rendering the snapshot it loaded with while the toolbar reports the
+  // refresh complete, and the window asserts a freshness it does not have.
+  assert.match(
+    source,
+    /func notifyLocalEvidenceUpdated\(\) \{[\s\S]*?window\.dispatchEvent\(new Event\('tibotattle:local-evidence-updated'\)\)/u,
+  );
+  assert.match(
+    source,
+    /private func finishNativeRefresh\(title: String, refreshEnabled: Bool\) \{[\s\S]*?dashboardWebHost\?\.notifyLocalEvidenceUpdated\(\)/u,
   );
   assert.match(
     source,
@@ -746,7 +1322,10 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   assert.match(source, /actionRow\.isHidden = false/u);
   assert.match(source, /layout\.addArrangedSubview\(actionRow\)/u);
   // The browser remains an explicit, separate choice rather than the default.
-  assert.match(source, /title: "Open in Browser"/u);
+  assert.match(
+    source,
+    /title: TiboTattleLocalization\.string\(\.launcherOpenInBrowser\)/u,
+  );
   assert.match(
     source,
     /@objc private func openDashboard\(\) \{[\s\S]*?showDashboardWebView\(dashboardURL\)/u,
@@ -759,22 +1338,263 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   assert.match(source, /UM_MACOS_DASHBOARD_DOWNLOAD_FAILED/u);
 });
 
+test("unified toolbar preserves the rich loopback report and single authority", async () => {
+  const source = await readFile(SWIFT_SOURCE, "utf8");
+  assert.match(
+    source,
+    /private final class AppDelegate: NSObject, NSApplicationDelegate,\s*NSWindowDelegate, NSToolbarDelegate/u,
+  );
+  // The standard AppKit window (and its traffic lights) remains; the toolbar
+  // is a presentation layer on top of the existing embedded WebKit report.
+  // Pin the DASHBOARD window's own style mask. The previous literal regex
+  // also matched an unrelated window literal inside a smoke test, so it kept
+  // passing while no longer describing the dashboard at all.
+  // `.fullSizeContentView` is what lets the sidebar run behind the title bar.
+  assert.match(source, /dashboardWindowStyleMask: NSWindow\.StyleMask = \[/u);
+  assert.match(
+    source,
+    /dashboardWindowStyleMask: NSWindow\.StyleMask = \[[^\]]*\.fullSizeContentView/u,
+  );
+  assert.match(source, /styleMask: Self\.dashboardWindowStyleMask/u);
+  assert.match(
+    source,
+    /newWindow\.toolbar = makeDashboardToolbar\(\)\s*\n\s*newWindow\.toolbarStyle = \.unified/u,
+  );
+
+  const chrome = source.match(
+    /private final class NativeDashboardChrome: NSSplitViewController \{([\s\S]*?)\n\}\n\n@MainActor\nprivate final class AppDelegate/u,
+  )?.[1];
+  assert.ok(chrome, "native dashboard chrome should be present");
+  // Removing the old in-content header prevents a second refresh/status row;
+  // the existing sidebar and report stay in place beneath the toolbar.
+  // The split controller owns pane geometry now, so there is no hand-written
+  // top constraint. The genuine behaviour this block protects - no second
+  // in-content refresh/status row - is asserted below and is unchanged.
+  assert.match(chrome, /addSplitViewItem\(sidebarItem\)/u);
+  assert.doesNotMatch(chrome, /\bheader\b/u);
+  assert.doesNotMatch(chrome, /onRefresh/u);
+
+  const toolbar = source.match(
+    /private func makeDashboardToolbar\(\) -> NSToolbar \{([\s\S]*?)\n    \/\/\/ The dashboard runs inside a native AppKit shell/u,
+  )?.[1];
+  assert.ok(toolbar, "dashboard toolbar implementation should be present");
+  assert.match(toolbar, /toolbarStatusRefreshIdentifier/u);
+  assert.doesNotMatch(toolbar, /toolbarStatusIdentifier|toolbarRefreshIdentifier/u);
+  assert.match(toolbar, /let button = NSButton\(/u);
+  assert.match(toolbar, /action: #selector\(refreshDashboardFromToolbar\)/u);
+  assert.match(toolbar, /nativeToolbarEvidenceTitle/u);
+  assert.match(source, /nativeToolbarStatusColor\(isRefreshing:/u);
+  assert.match(source, /case \.live:[\s\S]*?nativeDashboardFresh/u);
+  assert.match(toolbar, /toolbarShareIdentifier/u);
+  assert.match(toolbar, /toolbarSettingsIdentifier/u);
+  assert.match(toolbar, /@objc private func refreshDashboardFromToolbar\(\) \{[\s\S]*?refreshLocalUsage\(automatic: false\)/u);
+  assert.match(
+    toolbar,
+    /@objc private func showShareCardFromToolbar\(\) \{[\s\S]*?document\.getElementById\('share-panel'\)\?\.scrollIntoView/u,
+  );
+  // Toolbar actions must reuse the report and the already-running companion;
+  // they may not become another parser, service, or native share process.
+  assert.doesNotMatch(
+    toolbar,
+    /\b(?:CompanionProcess|Process|URLSession|NSSharingService)\b/u,
+  );
+});
+
+test("toolbar pill narrates the real index build and terminal refresh failure", async () => {
+  const source = await readFile(SWIFT_SOURCE, "utf8");
+  // Deliberately re-pinned pill vocabulary: while the unified history index
+  // is incomplete the idle pill says "Indexing <n> of <m>", and a refresh the
+  // companion reports as failed says so. Both strings stay content-free -
+  // fixed words plus locale-formatted counts, or a step name from the
+  // companion's closed refresh-step vocabulary, never free-form text.
+  assert.match(source, /return "Indexing \\\(indexed\) of \\\(total\)"/u);
+  assert.match(source, /guard let step else \{ return "Refresh failed" \}/u);
+  assert.match(source, /return "Refresh failed: \\\(step\)"/u);
+  // Counts render with thousands separators and no abbreviation.
+  assert.match(
+    source,
+    /private enum NativeToolbarStatusText \{[\s\S]*?decimalNumberFormatter\(\s*maximumFractionDigits: 0\s*\)/u,
+  );
+  // Failure identity first, then real indexing progress, outrank the
+  // evidence prose; complete coverage plus a non-failed refresh restores
+  // the existing "Fresh"/"Stale"/"Status" vocabulary untouched.
+  assert.match(
+    source,
+    /private func nativeToolbarEvidenceTitle\(fallback: String\) -> String \{[\s\S]*?if let failure = nativeRefreshFailure \{[\s\S]*?if let coverage = nativeHistoryIndexingCoverage, !coverage\.isComplete \{[\s\S]*?switch nativeEvidenceState \{/u,
+  );
+  // The step vocabulary is closed on the client as well: an unrecognized
+  // step renders as plain "Refresh failed".
+  assert.match(
+    source,
+    /static let refreshFailureSteps: Set<String> = \[\s*"collector",\s*"accounting",\s*"archive_index",\s*"unified_index",\s*"assemble",\s*\]/u,
+  );
+  // Coverage is the companion's own overview payload: coverage.history
+  // first, the pricing historyCoverage mirror second, and demo/synthetic
+  // payloads never narrate indexing.
+  assert.match(
+    source,
+    /\(root\["coverage"\] as\? \[String: Any\]\)\?\["history"\][\s\S]*?\(root\["pricing"\] as\? \[String: Any\]\)\?\["historyCoverage"\]/u,
+  );
+  assert.match(source, /\["demo", "synthetic"\]\.contains\(mode\)/u);
+  // The failure receipt comes from /api/local/refresh, and only a "failed"
+  // status may claim a failure.
+  assert.match(
+    source,
+    /guard status == "failed" else \{ return \.notFailed \}/u,
+  );
+  // Both reads reuse the already-audited loopback reader rather than adding
+  // a second session or network route.
+  assert.match(source, /private extension LocalCompanionEvidenceReader \{/u);
+  // A refresh terminal re-reads both facts before the pill claims a state.
+  assert.match(
+    source,
+    /readNativeToolbarStatusFacts\(base: base\) \{ \[weak self\] in\s*\n\s*self\?\.finishNativeRefresh\(/u,
+  );
+  // While coverage is incomplete the idle pill re-reads it on a bounded
+  // 30-second foreground cadence; a refresh start, coverage completion,
+  // dashboard teardown, and quit all stop the poll, and it never becomes a
+  // timer, helper, daemon, or background polling path.
+  assert.match(source, /private static let indexingCoveragePollSeconds = 30/u);
+  assert.match(
+    source,
+    /private func scheduleNativeIndexingCoveragePoll\(\) \{[\s\S]*?let coverage = nativeHistoryIndexingCoverage,\s*\n\s*!coverage\.isComplete/u,
+  );
+  assert.match(
+    source,
+    /cancelNativeRefreshSchedule\(\)\s*\n\s*cancelNativeIndexingCoveragePoll\(\)\s*\n\s*nativeRefreshInFlight = true/u,
+  );
+  assert.match(
+    source,
+    /func applicationWillTerminate\(_ notification: Notification\) \{[\s\S]*?cancelNativeIndexingCoveragePoll\(\)/u,
+  );
+});
+
+test("dashboard sidebar resizes for real, wears the brand palette, and the titlebar carries the brand row", async () => {
+  const source = await readFile(SWIFT_SOURCE, "utf8");
+  // 1. The divider is a real control. AppKit applies a divider drag at
+  // priority 490 (dragThatCannotResizeWindow); the previous .defaultHigh
+  // (750) holding priority outranked the user's own drag, which is the
+  // seam-that-lies the owner reported: a resize cursor over a divider that
+  // refuses to move.
+  assert.match(source, /static let sidebarMinimumThickness: CGFloat = 180/u);
+  assert.match(source, /static let sidebarMaximumThickness: CGFloat = 320/u);
+  assert.match(source, /static let sidebarRestingThickness: CGFloat = 216/u);
+  assert.match(
+    source,
+    /private static let sidebarHoldingPriority = NSLayoutConstraint\.Priority\(260\)/u,
+  );
+  assert.match(
+    source,
+    /sidebarItem\.holdingPriority = Self\.sidebarHoldingPriority/u,
+  );
+  assert.doesNotMatch(source, /sidebarItem\.holdingPriority = \.defaultHigh/u);
+  // The chosen width survives relaunch through the split view's own
+  // autosave, and the designed 216pt opening width is seeded exactly once
+  // so later launches never fight the user's chosen width.
+  assert.match(source, /splitView\.autosaveName = Self\.splitAutosaveName/u);
+  assert.match(source, /"com\.usagemonitor\.local\.dashboard-split\.v1"/u);
+  assert.match(
+    source,
+    /override func viewDidAppear\(\) \{[\s\S]*?splitView\.setPosition\(Self\.sidebarRestingThickness, ofDividerAt: 0\)/u,
+  );
+  // The layout smoke asserts the same band the chrome enforces rather than
+  // a drifting literal.
+  assert.match(
+    source,
+    /NativeDashboardChrome\.sidebarMinimumThickness - 1/u,
+  );
+  // 2. The sidebar carries the web report's warm-paper palette over the
+  // system material, and the selected row uses the brand's deep green
+  // instead of the user's system accent. Both mirror the web tokens
+  // --paper #f5f1e8 and --green #174f45 and resolve per appearance.
+  assert.match(source, /private enum NativeBrandPalette/u);
+  assert.match(
+    source,
+    /srgbRed: 245 \/ 255,\s*\n\s*green: 241 \/ 255,\s*\n\s*blue: 232 \/ 255/u,
+  );
+  assert.match(
+    source,
+    /srgbRed: 23 \/ 255,\s*\n\s*green: 79 \/ 255,\s*\n\s*blue: 69 \/ 255/u,
+  );
+  assert.match(source, /private final class NativeSidebarBrandWash: NSView/u);
+  assert.match(source, /sidebar\.addSubview\(sidebarWash\)/u);
+  assert.match(
+    source,
+    /override func updateLayer\(\) \{\s*\n\s*layer\?\.backgroundColor = NativeBrandPalette\.sidebarWash\.cgColor/u,
+  );
+  assert.match(
+    source,
+    /button\.contentTintColor = selected\s*\n\s*\? NativeBrandPalette\.accent/u,
+  );
+  // 3. The titlebar shows the brand row - the bundle's own icon beside the
+  // wordmark in brand green - as a native accessory. The window keeps its
+  // title for Mission Control, the window menu, and accessibility; only
+  // the titlebar's text drawing is replaced, and nothing about the row is
+  // a web view.
+  assert.match(source, /newWindow\.titleVisibility = \.hidden/u);
+  assert.match(
+    source,
+    /newWindow\.addTitlebarAccessoryViewController\(\s*\n\s*Self\.makeTitlebarBrandAccessory\(\)/u,
+  );
+  const accessory = source.match(
+    /private static func makeTitlebarBrandAccessory\(\)[\s\S]*?\n    \}/u,
+  )?.[0] ?? "";
+  assert.ok(accessory, "titlebar brand accessory factory should be present");
+  assert.match(accessory, /NSImageView\(image: NSApp\.applicationIconImage\)/u);
+  assert.match(accessory, /wordmark\.textColor = NativeBrandPalette\.accent/u);
+  assert.match(accessory, /accessory\.layoutAttribute = \.left/u);
+  assert.doesNotMatch(accessory, /WKWebView|WebKit/u);
+  // Deliberately re-pinned 2026-08-08: AppKit stretches a left accessory to
+  // the full titlebar container (66pt on macOS 26) while the traffic lights
+  // and toolbar controls centre on the toolbar row at its top, which sat the
+  // brand a visible 7pt low. The row now rides in NativeTitlebarBrandRow,
+  // which centres it on the close button's own measured axis.
+  assert.match(
+    accessory,
+    /accessory\.view = NativeTitlebarBrandRow\(content: row\)/u,
+  );
+  const brandRow = source.match(
+    /private final class NativeTitlebarBrandRow: NSView \{[\s\S]*?\n\}/u,
+  )?.[0] ?? "";
+  assert.ok(brandRow, "titlebar brand row container should be present");
+  assert.match(
+    brandRow,
+    /window\?\.standardWindowButton\(\.closeButton\)/u,
+  );
+  assert.match(brandRow, /centerY = convert\(anchorInWindow, from: nil\)\.midY/u);
+  assert.match(
+    brandRow,
+    /y: \(centerY - size\.height \/ 2\)\.rounded\(\)/u,
+  );
+});
+
 test("menu-bar status item degrades honestly and never invents allowance evidence", async () => {
   const source = await readFile(MENU_BAR_STATUS_SOURCE, "utf8");
   assert.match(source, /import AppKit/u);
-  // Variable-length item with a legible, native template glyph. The full
-  // product icon remains for dashboard/share-card scale, not a 15px status bar.
+  // Variable-length item with the branded app mark, sized for the native
+  // status bar rather than a generic system chart glyph.
   assert.match(
     source,
     /NSStatusBar\.system\.statusItem\(\s*withLength: NSStatusItem\.variableLength\s*\)/u,
   );
-  assert.match(source, /systemSymbolName: "chart\.bar\.fill"/u);
-  assert.match(source, /image\?\.isTemplate = true/u);
+  assert.match(source, /private static func makeBrandBirdTemplate\(\)/u);
+  assert.match(source, /NSApp\.applicationIconImage/u);
+  assert.match(source, /template\.isTemplate = true/u);
+  assert.match(source, /systemSymbolName: "bird\.fill"/u);
+  assert.match(source, /let glyphSize = NSSize\(width: 16, height: 16\)/u);
+  assert.doesNotMatch(source, /NSApp\.applicationIconImage\.copy\(\)/u);
+  assert.doesNotMatch(source, /source\.size = NSSize\(width: 16, height: 16\)/u);
+  assert.match(source, /private static func statusGlyph\([\s\S]*?state: StatusGlyphState/u);
+  assert.match(source, /private static func glyphState\(/u);
+  assert.match(source, /private static func drawMeter\(/u);
+  assert.match(source, /case live\(remainingPercent: Double\)/u);
+  assert.match(source, /case \.stale|case \.analyzing|case \.unavailable/u);
+  assert.doesNotMatch(source, /systemSymbolName: "chart\.bar\.fill"/u);
   assert.doesNotMatch(source, /url\(forResource: "AppIcon", withExtension: "icns"\)/u);
   assert.match(source, /setAccessibilityLabel\(/u);
-  assert.match(source, /image\?\.accessibilityDescription = productName/u);
-  assert.match(source, /"Settings…"/u);
-  assert.match(source, /configure\(aboutItem,/u);
+  assert.match(source, /glyph\.accessibilityDescription = "\\\(productName\) status"/u);
+  assert.match(source, /TiboTattleLocalization\.string\(\.menuSettings\)/u);
+  assert.match(source, /configure\(\s*aboutItem,/u);
   assert.match(source, /#selector\(showAbout\)/u);
 
   // The compact title shows a number only for live evidence; stale, absent,
@@ -786,45 +1606,162 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.match(source, /if phase == \.analyzing \{ return analyzingPlaceholder \}/u);
   assert.match(source, /private let analyzingPlaceholder = "…"/u);
   assert.match(source, /private let unknownPlaceholder = "–"/u);
-  assert.match(source, /No verified quota lanes observed yet/u);
-  assert.match(source, /Allowance values and reset countdowns are hidden/u);
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.menuBarNoVerifiedAllowance\)/u,
+  );
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.menuBarLocalEvidenceStale\)/u,
+  );
   assert.match(source, /func resetCountdown\(_ date: Date\?, now: Date = Date\(\)\) -> String\?/u);
   assert.match(source, /guard companionReachable, evidence == \.live else/u);
 
-  // Every supported observed lane is projected with a fixed privacy-safe
-  // label; the weekly primary remains only the compact-title preference.
-  assert.match(source, /private let weeklyWindowDurationMinutes = 10_080/u);
-  assert.match(source, /let lanes = rows\.enumerated\(\)\.compactMap/u);
-  assert.match(source, /return "Five-hour allowance"/u);
-  assert.match(source, /return "Secondary observed allowance"/u);
-  assert.match(source, /Observed quota lane/u);
-  assert.match(source, /isPrimary: limitId == "codex"/u);
+  // Only the normal Codex allowance track is projected with fixed
+  // privacy-safe labels; a separate product can never become the title.
+  assert.match(
+    source,
+    /private let weeklyWindowDurationMinutes\s*=\s*\n\s*CodexQuotaWindowDuration\.sevenDayMinutes/u,
+  );
+  assert.match(source, /private let codexPrimaryLimitId = "codex"/u);
+  assert.match(
+    source,
+    /private let supportedCodexAllowanceWindowDurations\s*=\s*\n\s*1\.\.\.CodexQuotaWindowDuration\.maximumMinutes/u,
+  );
+  assert.match(source, /let candidates = rows\.compactMap/u);
+  assert.match(source, /guard Self\.isSupportedCodexAllowance\(/u);
+  assert.match(
+    source,
+    /return TiboTattleLocalization\.string\(\.menuBarFiveHourAllowance\)/u,
+  );
+  assert.match(
+    source,
+    /return TiboTattleLocalization\.string\(\.menuBarSevenDayAllowance\)/u,
+  );
+  assert.match(source, /left\.durationMinutes > right\.durationMinutes/u);
+  assert.match(source, /left\.isExplicitPrimary != right\.isExplicitPrimary/u);
+  assert.match(source, /return left\.stableKey < right\.stableKey/u);
+  assert.match(source, /isPrimary: index == 0/u);
+  assert.match(source, /TiboTattleLocalization\.quotaWindowLabel\(/u);
+  assert.match(source, /let observedAt = lanes\.compactMap\(\\\.observedAt\)\.max\(\)/u);
+  assert.doesNotMatch(source, /codex_bengalfox|Secondary observed allowance|Observed quota lane/u);
   assert.match(
     source,
     /guard overview\.freshnessStatus == "live" else \{ return \.stale \}/u,
   );
 
-  // Menu contract: native summary/lane views retain the disabled information
-  // semantics while making the compact status readable, followed by the
-  // existing actions and a separator before Quit.
+  // Menu contract: every information lane is a standard native text item.
+  // This deliberately forbids custom NSMenuItem views: a source-level
+  // assertion prevents the zero-frame regression from returning without a
+  // real AppKit harness.
   assert.match(source, /menu\.autoenablesItems = false/u);
-  assert.match(source, /allowanceItem\.view = summaryView/u);
-  assert.match(source, /summaryView\.render\(productName: productName, snapshot: snapshot\)/u);
   assert.match(source, /allowanceItem\.isEnabled = false/u);
   assert.match(source, /evidenceItem\.isEnabled = false/u);
-  assert.match(source, /"Open \\\(productName\)"/u);
+  assert.match(source, /allowanceItem\.title =/u);
+  assert.match(source, /evidenceItem\.title = snapshot\.evidenceSummary/u);
+  assert.doesNotMatch(source, /MenuBarSummaryView|MenuBarQuotaLaneView/u);
+  assert.doesNotMatch(source, /\.view\s*=(?!=)/u);
+  assert.doesNotMatch(source, /evidenceItem\.isHidden|allowanceItem\.isHidden/u);
+  assert.match(
+    source,
+    /TiboTattleLocalization\.format\(\.menuBarOpenProduct, productName\)/u,
+  );
   assert.match(source, /openTiboTattleItem\.isEnabled = true/u);
-  assert.match(source, /"Analyze Local Usage"/u);
-  assert.match(source, /"Update Local Usage"/u);
-  assert.match(source, /"Analyzing Local Usage…"/u);
-  assert.match(source, /"Quit \\\(productName\)"/u);
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.menuBarAnalyzeLocalUsage\)/u,
+  );
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.menuBarRetryLocalAnalysis\)/u,
+  );
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.menuBarUpdateLocalUsage\)/u,
+  );
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.menuBarAnalyzingLocalUsage\)/u,
+  );
+  assert.match(
+    source,
+    /TiboTattleLocalization\.format\(\.menuQuitProduct, productName\)/u,
+  );
   assert.match(source, /private var quotaLaneItems: \[NSMenuItem\] = \[\]/u);
   assert.match(source, /func renderQuotaLanes\(\)/u);
-  assert.match(source, /let view = MenuBarQuotaLaneView\(\)/u);
+  assert.match(
+    source,
+    /let item = NSMenuItem\(\s*title: snapshot\.laneSummary\(lane\),\s*action: nil,\s*keyEquivalent: ""\s*\)/u,
+  );
+  assert.match(source, /item\.isEnabled = false/u);
   assert.match(source, /menu\.insertItem\(item, at: insertionIndex \+ offset\)/u);
   assert.doesNotMatch(source, /showWindowItem/u);
   assert.doesNotMatch(source, /openDashboardItem/u);
-  assert.match(source, /analyzeItem\.isEnabled = snapshot\.phase == \.ready/u);
+  assert.match(
+    source,
+    /analyzeItem\.isEnabled = snapshot\.phase == \.ready\s*\n\s*\|\| \(snapshot\.phase == \.unavailable && dashboardURL != nil\)/u,
+  );
+
+  // Keep the standard NSStatusItem menu lifecycle intact. Escape and app
+  // deactivation both cancel native menu tracking, and every action clears
+  // tracking before it can open another app surface.
+  assert.match(source, /statusItem\.menu = menu/u);
+  assert.match(
+    source,
+    /NSEvent\.addLocalMonitorForEvents\(matching: \.keyDown\)[\s\S]*?event\.keyCode == 53[\s\S]*?self\.dismissMenu\(\)/u,
+  );
+  assert.match(
+    source,
+    /NSEvent\.addLocalMonitorForEvents\([\s\S]*?\.leftMouseDown[\s\S]*?event\.window[\s\S]*?NSApp\.windows\.contains[\s\S]*?self\.dismissMenu\(\)/u,
+  );
+  assert.match(
+    source,
+    /NSApplication\.didResignActiveNotification[\s\S]*?self\?\.dismissMenu\(\)/u,
+  );
+  assert.match(source, /private func dismissMenu\(\) \{\s*menu\.cancelTracking\(\)/u);
+  assert.match(
+    source,
+    /func shutDown\(\) \{[\s\S]*?dismissMenu\(\)[\s\S]*?removeInteractionMonitoring\(\)/u,
+  );
+  for (const action of [
+    "openTiboTattle",
+    "analyzeLocalUsage",
+    "quit",
+    "showSettings",
+    "showAbout",
+    "checkForUpdates",
+  ]) {
+    assert.match(
+      source,
+      new RegExp(`@objc private func ${action}\\(\\) \\{[\\s\\S]*?dismissMenu\\(\\)`, "u"),
+      action,
+    );
+  }
+
+  // Restart/failure/read errors clear numeric evidence before rendering. A
+  // callback from an older URL or start cannot cross the generation boundary.
+  assert.match(source, /private var companionGeneration: UInt64 = 0/u);
+  assert.match(source, /private func invalidateObservedEvidence\(\) \{[\s\S]*?snapshot\.lanes = \[\][\s\S]*?snapshot\.observedAt = nil[\s\S]*?snapshot\.evidence = \.none/u);
+  assert.match(source, /func companionStarting\(\) \{[\s\S]*?invalidateObservedEvidence\(\)/u);
+  assert.match(source, /func companionUnavailable\(summary: String\?\) \{[\s\S]*?invalidateObservedEvidence\(\)/u);
+  assert.match(source, /guard let overview else \{[\s\S]*?invalidateObservedEvidence\(\)[\s\S]*?snapshot\.phase = \.unavailable/u);
+  assert.match(source, /self\.companionGeneration == generation/u);
+  assert.match(source, /self\.dashboardURL == dashboardURL/u);
+
+  // Cached titles are reconciled before tracking starts. Async reads may only
+  // update existing rows while open; changed lane structure waits for close.
+  assert.match(
+    source,
+    /func menuWillOpen\(_ menu: NSMenu\) \{[\s\S]*?render\(\)\s*\n\s*isMenuTracking = true\s*\n\s*pollNow\(\)/u,
+  );
+  assert.match(
+    source,
+    /func menuDidClose\(_ menu: NSMenu\) \{[\s\S]*?structuralRebuildPending[\s\S]*?render\(\)/u,
+  );
+  assert.match(source, /if isMenuTracking && structureChanged/u);
+  assert.match(source, /structuralRebuildPending = true/u);
+  assert.match(source, /deferredLaneTitle/u);
+  assert.match(source, /private func expireCachedEvidenceIfNeeded\(\)/u);
 
   // The analyze item drives the companion's own refresh route with the exact
   // same-origin proof the dashboard button sends.
@@ -854,6 +1791,58 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   ]) {
     assert.equal(source.includes(forbidden), false, forbidden);
   }
+});
+
+test("native quota duration and reset scheduling stay bounded and provider-aware", async () => {
+  const [menuSource, notificationSource, localizationSource] = await Promise.all([
+    readFile(MENU_BAR_STATUS_SOURCE, "utf8"),
+    readFile(QUOTA_NOTIFICATIONS_SOURCE, "utf8"),
+    readFile(LOCALIZATION_SOURCE, "utf8"),
+  ]);
+  assert.match(
+    localizationSource,
+    /static let maximumMinutes = 525_600/u,
+  );
+  assert.match(
+    localizationSource,
+    /static func integer\(from value: Any\?\) -> Int\?/u,
+  );
+  assert.match(
+    localizationSource,
+    /return "Provider-reported .*englishUnit.*window"/u,
+  );
+  assert.match(
+    menuSource,
+    /CodexQuotaWindowDuration\.integer\(\s*\n\s*from: row\["durationMinutes"\]\s*\n\s*\)/u,
+  );
+  assert.match(
+    notificationSource,
+    /CodexQuotaWindowDuration\.integer\(\s*\n\s*from: rawWindow\["durationMinutes"\]\s*\n\s*\)/u,
+  );
+  assert.match(
+    notificationSource,
+    /CodexQuotaWindowDuration\.isValid\(window\.durationMinutes\)/u,
+  );
+  assert.match(
+    notificationSource,
+    /case "provider_reported_identity"[\s\S]*?validProviderResetIdentity/u,
+  );
+  assert.match(
+    notificationSource,
+    /let resetIsDue = observedAt >= previousResetAt/u,
+  );
+  assert.match(
+    notificationSource,
+    /Schedule-only fallback[\s\S]*?previous\.resetAt[\s\S]*?kind: \.reset/u,
+  );
+  assert.match(
+    notificationSource,
+    /A provider schedule change before the old due time is not a\n\s*\/\/ reset/u,
+  );
+  assert.doesNotMatch(
+    menuSource + "\n" + localizationSource,
+    /monthly\s+limit|plan\s+entitlement/iu,
+  );
 });
 
 test("targeted local Keychain reset removes only exact local capabilities and residue", async () => {
@@ -1016,6 +2005,360 @@ test("targeted local Keychain reset removes only exact local capabilities and re
   }
 });
 
+test("reviewed dogfood is configured with shared service and isolated updates", () => {
+  const dogfood = getReleaseChannel(INTERNAL_DOGFOOD_RELEASE_CHANNEL);
+  assert.equal(dogfood.configured, true);
+  assert.equal(dogfood.serviceOriginMode, INTERNAL_DOGFOOD_SERVICE_ORIGIN_MODE);
+  assert.equal(dogfood.serviceOrigin, DEPLOYMENT_ENDPOINTS.public.origin);
+  assert.equal(dogfood.publicWebsiteOrigin, DEPLOYMENT_ENDPOINTS.public.origin);
+  assert.equal(dogfood.sparkle.origin, "https://dogfood-updates.tibotattle.com");
+  assert.equal(
+    dogfood.sparkle.appcastURL,
+    "https://dogfood-updates.tibotattle.com/internal-dogfood/appcast.xml",
+  );
+  assert.equal(dogfood.sparkle.r2Bucket, "tibotattle-dogfood-updates");
+  assert.equal(dogfood.sparkle.objectPrefix, "internal-dogfood/releases");
+  assert.match(dogfood.sparkle.publicEdKeySha256, /^[a-f0-9]{64}$/u);
+  assert.equal(assertReleaseChannelConfiguration(dogfood), dogfood);
+});
+
+test("generic external builders reject env and CLI marker spoofing", async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-stable-build-gate-"),
+  );
+  const output = join(temporaryRoot, "TiboTattle.app");
+  try {
+    assert.throws(
+      () => parseMacOSBuildArguments([
+        "--output",
+        output,
+        "--external-distribution",
+        "--release-channel",
+        STABLE_RELEASE_CHANNEL,
+      ]),
+      { code: "MACOS_EXTERNAL_BUILD_RELEASE_CORE_REQUIRED" },
+    );
+    const directBuild = spawnSync(
+      process.execPath,
+      [
+        BUILD_SCRIPT,
+        "--output",
+        output,
+        "--external-distribution",
+        "--release-channel",
+        STABLE_RELEASE_CHANNEL,
+      ],
+      {
+        cwd: REPOSITORY_ROOT,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          USAGE_MONITOR_MACOS_RELEASE_GATE: "release-macos-app",
+        },
+      },
+    );
+    assert.equal(directBuild.status, 1, directBuild.stderr);
+    assert.match(
+      directBuild.stderr,
+      /only available through the validated release-macos-app programmatic path/u,
+    );
+    await assert.rejects(
+      buildMacOSApp({
+        output,
+        externalDistribution: true,
+        releaseChannel: STABLE_RELEASE_CHANNEL,
+      }),
+      { code: "MACOS_EXTERNAL_BUILD_RELEASE_CORE_REQUIRED" },
+    );
+    assert.throws(
+      () => parseMacOSBuildArguments([
+        "--output",
+        output,
+        "--external-distribution",
+        "--release-channel",
+        STABLE_RELEASE_CHANNEL,
+        "--release-gate",
+        "release-macos-app",
+      ]),
+      { code: "MACOS_APP_BUILD_FAILED" },
+    );
+    assert.equal(typeof buildMacOSAppForRelease, "function");
+    assert.equal(typeof buildMacOSReleaseCandidate, "function");
+    assert.equal(typeof prepareMacOSReleaseCandidate, "function");
+    await assert.rejects(
+      buildMacOSAppForRelease({
+        output,
+        externalDistribution: true,
+        releaseChannel: STABLE_RELEASE_CHANNEL,
+      }),
+      { code: "MACOS_EXTERNAL_BUILD_PREFLIGHT_REQUIRED" },
+    );
+    await assert.rejects(
+      buildMacOSReleaseCandidate({
+        output,
+        externalDistribution: true,
+        releaseChannel: STABLE_RELEASE_CHANNEL,
+      }),
+      { code: "MACOS_BUNDLE_VERSION_REQUIRED" },
+    );
+    await assert.rejects(lstat(output), { code: "ENOENT" });
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("external app output is fresh-only and rejects a TOCTOU target", async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-external-output-safety-"),
+  );
+  const stagedApp = join(temporaryRoot, "staged", "TiboTattle.app");
+  const output = join(temporaryRoot, "output", "TiboTattle.app");
+  const sentinel = join(output, "sentinel.txt");
+  try {
+    await mkdir(join(stagedApp, "Contents"), { recursive: true });
+    await writeFile(join(stagedApp, "Contents", "marker.txt"), "staged");
+    await assertMacOSExternalBuildOutputIsFresh(output);
+
+    // Model a target appearing after the initial absence check. The no-
+    // replace claim must fail without touching that target.
+    await mkdir(output, { recursive: true });
+    await writeFile(sentinel, "preserve", { mode: 0o600 });
+    await assert.rejects(
+      installMacOSExternalBuildOutput(stagedApp, output),
+      { code: "MACOS_EXTERNAL_OUTPUT_REPLACEMENT_FORBIDDEN" },
+    );
+    assert.equal(await readFile(sentinel, "utf8"), "preserve");
+
+    await rm(output, { recursive: true, force: false });
+    await installMacOSExternalBuildOutput(stagedApp, output);
+    assert.equal(
+      await readFile(join(output, "Contents", "marker.txt"), "utf8"),
+      "staged",
+    );
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("release authorization is programmatic and does not apply to development or preview", async () => {
+  const source = await readFile(RELEASE_CORE, "utf8");
+  assert.match(
+    source,
+    /assertStableSparkleKeyContinuity\(/u,
+  );
+  assert.match(source, /buildMacOSAppForRelease/u);
+  assert.doesNotMatch(source, /USAGE_MONITOR_MACOS_RELEASE_GATE/u);
+
+  const development = parseMacOSBuildArguments([
+    "--output",
+    ".release-build/macos/TiboTattle.app",
+  ]);
+  assert.equal(development.externalDistribution, false);
+
+  const preview = parseMacOSBuildArguments([
+    "--preview-distribution",
+  ], {
+    USAGE_MONITOR_PREVIEW_CENTRAL_ORIGIN: "https://preview.usage.example",
+    USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL:
+      "https://updates.usage.example/appcast.xml",
+    USAGE_MONITOR_PREVIEW_SPARKLE_PUBLIC_ED_KEY:
+      Buffer.alloc(32, 4).toString("base64"),
+  });
+  assert.equal(preview.externalDistribution, false);
+
+  assert.throws(
+    () => parseMacOSBuildArguments([
+      "--output",
+      ".release-build/macos-production/TiboTattle.app",
+      "--external-distribution",
+      "--release-channel",
+      STABLE_RELEASE_CHANNEL,
+    ], {
+      USAGE_MONITOR_MACOS_RELEASE_GATE: "release-macos-app",
+    }),
+    { code: "MACOS_EXTERNAL_BUILD_RELEASE_CORE_REQUIRED" },
+  );
+  assert.throws(
+    () => parseMacOSBuildArguments([
+      "--output",
+      ".release-build/macos-production/TiboTattle.app",
+      "--external-distribution",
+      "--release-channel",
+      STABLE_RELEASE_CHANNEL,
+      "--release-gate",
+      "release-macos-app",
+    ]),
+    { code: "MACOS_APP_BUILD_FAILED" },
+  );
+  assert.throws(() => parseMacOSBuildArguments([
+    "--output",
+    ".release-build/macos-production/TiboTattle.app",
+    "--external-distribution",
+    "--release-channel",
+    STABLE_RELEASE_CHANNEL,
+  ]), { code: "MACOS_EXTERNAL_BUILD_RELEASE_CORE_REQUIRED" });
+});
+
+test("generic DMG packaging requires an explicit visible non-release mode", () => {
+  assert.throws(
+    () => parseMacOSDMGArguments([
+      "--app",
+      ".release-build/macos/TiboTattle.app",
+    ]),
+    /one explicit non-release mode/u,
+  );
+  assert.deepEqual(
+    parseMacOSDMGArguments([
+      "--app",
+      ".release-build/macos/TiboTattle.app",
+      "--development",
+    ]),
+    {
+      appPath: resolve(".release-build/macos/TiboTattle.app"),
+      output: resolve(
+        `.release-build/macos/TiboTattle-${RELEASE_VERSION}`
+          + "-macOS-arm64-development.dmg",
+      ),
+      replace: false,
+      distribution: "development",
+    },
+  );
+  assert.deepEqual(
+    parseMacOSDMGArguments([
+      "--app",
+      ".release-build/macos-preview/current/TiboTattle.app",
+      "--preview",
+    ]).distribution,
+    "preview",
+  );
+  assert.throws(
+    () => parseMacOSDMGArguments([
+      "--app",
+      ".release-build/macos/TiboTattle.app",
+      "--development",
+      "--preview",
+    ]),
+    /Unknown or repeated argument: --preview/u,
+  );
+});
+
+test("direct DMG packaging cannot infer release semantics", async () => {
+  await assert.rejects(
+    packageMacOSDMG({
+      appPath: ".release-build/macos/TiboTattle.app",
+      output: ".release-build/macos/TiboTattle.dmg",
+    }),
+    { code: "MACOS_DMG_DISTRIBUTION_REQUIRED" },
+  );
+});
+
+test("stable external bundle inputs remain bound to the reviewed production policy", async () => {
+  const stable = normalizeMacOSCentralOrigin(DEPLOYMENT_ENDPOINTS.public.origin);
+  assert.deepEqual(
+    validateMacOSDistributionConfiguration({
+      centralService: stable,
+      externalDistribution: true,
+      releaseChannel: STABLE_RELEASE_CHANNEL,
+    }),
+    {
+      channel: "production",
+      externalDistribution: true,
+      previewDistribution: false,
+      productionOriginValidated: true,
+      previewOriginValidated: false,
+    },
+  );
+  assert.deepEqual(
+    readMacOSReleaseBuildConfiguration({
+      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+      USAGE_MONITOR_PRODUCTION_ORIGIN: DEPLOYMENT_ENDPOINTS.public.origin,
+      USAGE_MONITOR_SPARKLE_APPCAST_URL:
+        DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
+      USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
+      USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
+        Buffer.alloc(32, 1).toString("base64"),
+    }, STABLE_RELEASE_CHANNEL),
+    {
+      bundleVersion: "42.7",
+      productionOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
+      provisioningProfile: null,
+      sparkleAppcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
+      sparkleFramework: "/tmp/Sparkle.framework",
+      sparklePublicEdKey: Buffer.alloc(32, 1).toString("base64"),
+    },
+  );
+});
+
+test("a separately configured synthetic dogfood policy models its mode and endpoints without network access", async () => {
+  const dogfood = syntheticDogfoodReleaseChannel();
+  assert.equal(assertReleaseChannelConfiguration(dogfood), dogfood);
+  await assert.rejects(
+    buildMacOSApp({
+      output: join(tmpdir(), "usage-monitor-synthetic-dogfood.app"),
+      externalDistribution: true,
+      releaseChannel: dogfood,
+    }),
+    { code: "MACOS_RELEASE_CHANNEL_NAME_REQUIRED" },
+  );
+  assert.deepEqual(
+    validateMacOSDistributionConfiguration({
+      centralService: {
+        configured: true,
+        mode: INTERNAL_DOGFOOD_SERVICE_ORIGIN_MODE,
+        origin: dogfood.serviceOrigin,
+      },
+      externalDistribution: true,
+      releaseChannel: dogfood,
+    }),
+    {
+      channel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+      externalDistribution: true,
+      previewDistribution: false,
+      productionOriginValidated: true,
+      previewOriginValidated: false,
+    },
+  );
+  assert.deepEqual(
+    {
+      channelName: dogfood.name,
+      serviceOriginMode: dogfood.serviceOriginMode,
+      serviceOrigin: dogfood.serviceOrigin,
+      publicWebsiteOrigin: dogfood.publicWebsiteOrigin,
+      sparkleAppcastURL: dogfood.sparkle.appcastURL,
+      sparklePublicEdKeySha256: dogfood.sparkle.publicEdKeySha256,
+    },
+    {
+      channelName: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+      serviceOriginMode: INTERNAL_DOGFOOD_SERVICE_ORIGIN_MODE,
+      serviceOrigin: "https://dogfood.tibotattle.example",
+      publicWebsiteOrigin: "https://dogfood.tibotattle.example",
+      sparkleAppcastURL:
+        "https://updates.dogfood.tibotattle.example/internal-dogfood/appcast.xml",
+      sparklePublicEdKeySha256: SYNTHETIC_DOGFOOD_PUBLIC_KEY_SHA256,
+    },
+  );
+});
+
+test("native central service accepts development, stable, and dogfood HTTPS modes", async () => {
+  const source = await readFile(SWIFT_SOURCE, "utf8");
+  assert.match(source, /case developmentLoopback = "development_loopback"/u);
+  assert.match(source, /case productionHTTPS = "production_https"/u);
+  assert.match(source, /case internalDogfoodHTTPS = "internal_dogfood_https"/u);
+  assert.match(
+    source,
+    /case \.productionHTTPS, \.internalDogfoodHTTPS:/u,
+  );
+});
+
+test("development and preview builds treat the release-channel policy as optional", async () => {
+  const source = await readFile(BUILD_SCRIPT, "utf8");
+  assert.match(
+    source,
+    /const selectedPublicEdKeySha256 =\s+selectedReleaseChannel\?\.sparkle\.publicEdKeySha256 \?\? null/u,
+  );
+  assert.match(source, /if \(selectedPublicEdKeySha256 !== null/u);
+});
+
 test("macOS release metadata validates versions, production mode, and Keychain references", async () => {
   assert.equal(normalizeMacOSBundleVersion(), "1");
   for (const value of ["1", "1.2", "1.2.3", "0.0.0", "123456789"]) {
@@ -1028,15 +2371,31 @@ test("macOS release metadata validates versions, production mode, and Keychain r
       value,
     );
   }
-  const production = normalizeMacOSCentralOrigin("https://usage.example");
+  const production = normalizeMacOSCentralOrigin(DEPLOYMENT_ENDPOINTS.public.origin);
   assert.deepEqual(
     validateMacOSDistributionConfiguration({
       centralService: production,
       externalDistribution: true,
     }),
     {
+      channel: "production",
       externalDistribution: true,
+      previewDistribution: false,
       productionOriginValidated: true,
+      previewOriginValidated: false,
+    },
+  );
+  assert.deepEqual(
+    validateMacOSDistributionConfiguration({
+      centralService: production,
+      previewDistribution: true,
+    }),
+    {
+      channel: MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+      externalDistribution: false,
+      previewDistribution: true,
+      productionOriginValidated: false,
+      previewOriginValidated: true,
     },
   );
   assert.throws(
@@ -1046,6 +2405,55 @@ test("macOS release metadata validates versions, production mode, and Keychain r
     }),
     { code: "MACOS_PRODUCTION_ORIGIN_REQUIRED" },
   );
+  assert.throws(
+    () => validateMacOSDistributionConfiguration({
+      centralService: normalizeMacOSCentralOrigin(null),
+      previewDistribution: true,
+    }),
+    { code: "MACOS_PREVIEW_ORIGIN_REQUIRED" },
+  );
+  assert.throws(
+    () => validateMacOSDistributionConfiguration({
+      centralService: normalizeMacOSCentralOrigin("http://127.0.0.1:8792", {
+        allowLoopbackCentralOrigin: true,
+      }),
+      previewDistribution: true,
+    }),
+    { code: "MACOS_PREVIEW_ORIGIN_REQUIRED" },
+  );
+  assert.throws(
+    () => validateMacOSDistributionConfiguration({
+      centralService: production,
+      externalDistribution: true,
+      previewDistribution: true,
+    }),
+    { code: "MACOS_DISTRIBUTION_CHANNEL_CONFLICT" },
+  );
+  assert.equal(
+    validateMacOSPreviewOutputPath(".release-build/macos-preview/current/TiboTattle.app")
+      .endsWith("/.release-build/macos-preview/current/TiboTattle.app"),
+    true,
+  );
+  assert.throws(
+    () => validateMacOSPreviewOutputPath("/Applications/TiboTattle.app"),
+    { code: "MACOS_PREVIEW_OUTPUT_FORBIDDEN" },
+  );
+  assert.throws(
+    () => validateMacOSPreviewOutputPath(
+      ".release-build/macos-preview/other/TiboTattle.app",
+    ),
+    { code: "MACOS_PREVIEW_OUTPUT_FORBIDDEN" },
+  );
+  for (const origin of [
+    "https://10.0.0.1",
+    "https://[::ffff:7f00:1]",
+  ]) {
+    assert.throws(
+      () => normalizeMacOSCentralOrigin(origin),
+      { code: "MACOS_APP_BUILD_FAILED" },
+      origin,
+    );
+  }
   assert.deepEqual(
     readMacOSReleaseCredentials({
       USAGE_MONITOR_DEVELOPER_ID_APPLICATION:
@@ -1072,21 +2480,21 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   assert.deepEqual(
     readMacOSReleaseBuildConfiguration({
       USAGE_MONITOR_BUNDLE_VERSION: "42.7",
-      USAGE_MONITOR_PRODUCTION_ORIGIN: "https://usage.example",
+      USAGE_MONITOR_PRODUCTION_ORIGIN: DEPLOYMENT_ENDPOINTS.public.origin,
       USAGE_MONITOR_SPARKLE_APPCAST_URL:
-        "https://usage.example/appcast.xml",
+        DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
       USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
       USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
         Buffer.alloc(32, 1).toString("base64"),
     }),
     {
       bundleVersion: "42.7",
-      productionOrigin: "https://usage.example",
+      productionOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
       // Absent when no provisioning profile is supplied. Restricted
       // entitlements are the only reason to embed one, and Developer ID
       // distribution does not grant any.
       provisioningProfile: null,
-      sparkleAppcastURL: "https://usage.example/appcast.xml",
+      sparkleAppcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
       sparkleFramework: "/tmp/Sparkle.framework",
       sparklePublicEdKey: Buffer.alloc(32, 1).toString("base64"),
     },
@@ -1094,22 +2502,19 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   assert.deepEqual(
     readMacOSReleaseBuildConfiguration({
       USAGE_MONITOR_BUNDLE_VERSION: "42.7",
-      USAGE_MONITOR_PRODUCTION_ORIGIN: "https://usage.example",
       USAGE_MONITOR_PROVISIONING_PROFILE:
         "/tmp/embedded.provisionprofile",
-      USAGE_MONITOR_SPARKLE_APPCAST_URL:
-        "https://usage.example/appcast.xml",
       USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
       USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
         Buffer.alloc(32, 1).toString("base64"),
     }),
     {
       bundleVersion: "42.7",
-      productionOrigin: "https://usage.example",
+      productionOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
       // A supplied profile reaches the release as an exact path, because it
       // is copied into the bundle before signing so the signature seals it.
       provisioningProfile: "/tmp/embedded.provisionprofile",
-      sparkleAppcastURL: "https://usage.example/appcast.xml",
+      sparkleAppcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
       sparkleFramework: "/tmp/Sparkle.framework",
       sparklePublicEdKey: Buffer.alloc(32, 1).toString("base64"),
     },
@@ -1119,11 +2524,8 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   assert.equal(
     readMacOSReleaseBuildConfiguration({
       USAGE_MONITOR_BUNDLE_VERSION: "42.7",
-      USAGE_MONITOR_PRODUCTION_ORIGIN: "https://usage.example",
       USAGE_MONITOR_PROVISIONING_PROFILE:
         "release/embedded.provisionprofile",
-      USAGE_MONITOR_SPARKLE_APPCAST_URL:
-        "https://usage.example/appcast.xml",
       USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
       USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
         Buffer.alloc(32, 1).toString("base64"),
@@ -1136,10 +2538,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
     assert.throws(
       () => readMacOSReleaseBuildConfiguration({
         USAGE_MONITOR_BUNDLE_VERSION: "42.7",
-        USAGE_MONITOR_PRODUCTION_ORIGIN: "https://usage.example",
         USAGE_MONITOR_PROVISIONING_PROFILE: unusable,
-        USAGE_MONITOR_SPARKLE_APPCAST_URL:
-          "https://usage.example/appcast.xml",
         USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
         USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
           Buffer.alloc(32, 1).toString("base64"),
@@ -1151,8 +2550,6 @@ test("macOS release metadata validates versions, production mode, and Keychain r
     () => readMacOSReleaseBuildConfiguration({
       USAGE_MONITOR_BUNDLE_VERSION: "42.7",
       USAGE_MONITOR_PRODUCTION_ORIGIN: "http://usage.example",
-      USAGE_MONITOR_SPARKLE_APPCAST_URL:
-        "https://usage.example/appcast.xml",
       USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
       USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
         Buffer.alloc(32, 1).toString("base64"),
@@ -1162,18 +2559,36 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   assert.throws(
     () => readMacOSReleaseBuildConfiguration({
       USAGE_MONITOR_BUNDLE_VERSION: "candidate",
-      USAGE_MONITOR_PRODUCTION_ORIGIN: "https://usage.example",
-      USAGE_MONITOR_SPARKLE_APPCAST_URL:
-        "https://usage.example/appcast.xml",
       USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
       USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
         Buffer.alloc(32, 1).toString("base64"),
     }),
     { code: "MACOS_BUNDLE_VERSION_REQUIRED" },
   );
+  assert.throws(
+    () => readMacOSReleaseBuildConfiguration({
+      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+      USAGE_MONITOR_PRODUCTION_ORIGIN: "https://usage.example",
+      USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
+      USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
+        Buffer.alloc(32, 1).toString("base64"),
+    }),
+    { code: "MACOS_RELEASE_ENDPOINTS_MISMATCH" },
+  );
+  assert.throws(
+    () => readMacOSReleaseBuildConfiguration({
+      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+      USAGE_MONITOR_SPARKLE_APPCAST_URL:
+        "https://updates.example/appcast.xml",
+      USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
+      USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
+        Buffer.alloc(32, 1).toString("base64"),
+    }),
+    { code: "MACOS_RELEASE_ENDPOINTS_MISMATCH" },
+  );
   const releaseSource = await readFile(RELEASE_CORE, "utf8");
   const freshBuild = releaseSource.indexOf(
-    "runMacOSReleaseCommand(process.execPath",
+    "buildMacOSAppForRelease({",
   );
   const developerIDSigning = releaseSource.indexOf(
     "await developerIDSignMacOSApp(stagedApp",
@@ -1188,6 +2603,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
     releaseSource,
     /USAGE_MONITOR_PRODUCTION_ORIGIN/u,
   );
+  assert.match(releaseSource, /releaseChannel\.name/u);
   assert.match(
     releaseSource,
     /USAGE_MONITOR_BUNDLE_VERSION/u,
@@ -1198,6 +2614,9 @@ test("macOS release metadata validates versions, production mode, and Keychain r
     }),
     {
       appcastURL: null,
+      automaticChecks: false,
+      automaticUpdatesEnabledByDefault: false,
+      allowsAutomaticUpdateOptIn: false,
       enabled: false,
       framework: null,
       publicEdKey: null,
@@ -1210,6 +2629,272 @@ test("macOS release metadata validates versions, production mode, and Keychain r
       externalDistribution: false,
     }),
     { code: "MACOS_UPDATER_FORBIDDEN_IN_DEVELOPMENT" },
+  );
+});
+
+test("preview CLI inputs are opt-in and development parsing ignores preview environment", async () => {
+  const environment = {
+    USAGE_MONITOR_PREVIEW_CENTRAL_ORIGIN: "https://preview.usage.example",
+    USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL:
+      "https://updates.usage.example/appcast.xml",
+    USAGE_MONITOR_PREVIEW_SPARKLE_PUBLIC_ED_KEY:
+      Buffer.alloc(32, 4).toString("base64"),
+  };
+  const development = parseMacOSBuildArguments([
+    "--output",
+    ".release-build/macos/TiboTattle.app",
+  ], environment);
+  assert.equal(development.previewDistribution, false);
+  assert.equal(development.centralOrigin, null);
+  assert.equal(development.sparkleFramework, null);
+  assert.equal(development.sparkleAppcastURL, null);
+  assert.equal(development.sparklePublicEdKey, null);
+  assert.equal(development.buildProfile, MACOS_BUILD_PROFILES.release);
+
+  const testBuild = parseMacOSBuildArguments([
+    "--output",
+    ".release-build/macos-test/TiboTattle.app",
+    "--test-build",
+  ], environment);
+  assert.equal(testBuild.buildProfile, MACOS_BUILD_PROFILES.test);
+  assert.equal(normalizeMacOSBuildProfile("release"), "release");
+  assert.equal(normalizeMacOSBuildProfile("test"), "test");
+  assert.throws(
+    () => normalizeMacOSBuildProfile("profiling"),
+    { code: "MACOS_BUILD_PROFILE_INVALID" },
+  );
+
+  const preview = parseMacOSBuildArguments([
+    "--preview-distribution",
+  ], environment);
+  assert.equal(preview.previewDistribution, true);
+  assert.equal(preview.centralOrigin, environment.USAGE_MONITOR_PREVIEW_CENTRAL_ORIGIN);
+  assert.equal(
+    preview.sparkleAppcastURL,
+    environment.USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL,
+  );
+  assert.equal(
+    preview.sparklePublicEdKey,
+    environment.USAGE_MONITOR_PREVIEW_SPARKLE_PUBLIC_ED_KEY,
+  );
+  assert.equal(preview.sparkleFramework.endsWith(
+    "/.release-deps/Sparkle.framework",
+  ), true);
+  assert.equal(preview.output.endsWith(
+    "/.release-build/macos-preview/current/TiboTattle.app",
+  ), true);
+  assert.throws(
+    () => parseMacOSBuildArguments([
+      "--preview-distribution",
+      "--release-channel",
+      INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+    ], environment),
+    { code: "MACOS_RELEASE_CHANNEL_EXTERNAL_REQUIRED" },
+  );
+  const defaultPreview = parseMacOSBuildArguments([
+    "--preview-distribution",
+  ], {});
+  assert.equal(
+    defaultPreview.centralOrigin,
+    DEPLOYMENT_ENDPOINTS.public.origin,
+  );
+  assert.equal(
+    defaultPreview.sparkleAppcastURL,
+    DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
+  );
+  assert.equal(
+    defaultPreview.sparklePublicEdKey,
+    "jhgPwmvWLMr7TGURJUoi6sXias7YP1F+hejZawKVTGw=",
+  );
+  assert.deepEqual(
+    parseMacOSBuildArguments([
+      "--validate-preview",
+      "--app",
+      ".release-build/macos-preview/current/TiboTattle.app",
+    ], environment),
+    {
+      appPath: resolve(
+        ".release-build/macos-preview/current/TiboTattle.app",
+      ),
+      validatePreview: true,
+    },
+  );
+  assert.throws(
+    () => parseMacOSBuildArguments([
+      "--preview-distribution",
+    ], {
+      ...environment,
+      USAGE_MONITOR_PREVIEW_OUTPUT: ".release-build/other/TiboTattle.app",
+    }),
+    { code: "MACOS_PREVIEW_OUTPUT_FORBIDDEN" },
+  );
+  assert.throws(
+    () => parseMacOSBuildArguments([
+      "--preview-distribution",
+      "--output",
+      ".release-build/other/TiboTattle.app",
+    ], environment),
+    { code: "MACOS_PREVIEW_OUTPUT_FORBIDDEN" },
+  );
+  assert.throws(
+    () => parseMacOSBuildArguments([
+      "--replace-preview-output",
+      "--output",
+      ".release-build/macos/TiboTattle.app",
+    ], environment),
+    { code: "MACOS_APP_BUILD_FAILED" },
+  );
+  assert.throws(
+    () => parseMacOSBuildArguments([
+      "--output",
+      ".release-build/macos-production/TiboTattle.app",
+      "--external-distribution",
+      "--test-build",
+    ], environment),
+    { code: "MACOS_TEST_BUILD_DISTRIBUTION_FORBIDDEN" },
+  );
+  assert.throws(
+    () => parseMacOSBuildArguments([
+      "--preview-distribution",
+      "--test-build",
+    ], environment),
+    { code: "MACOS_TEST_BUILD_DISTRIBUTION_FORBIDDEN" },
+  );
+  assert.throws(
+    () => parseMacOSBuildArguments([
+      "--validate-preview",
+      "--app",
+      ".release-build/macos-preview/current/TiboTattle.app",
+      "--test-build",
+    ], environment),
+    { code: "MACOS_PREVIEW_VALIDATION_ARGUMENTS_INVALID" },
+  );
+  await assert.rejects(
+    buildMacOSApp({
+      output: join(tmpdir(), "usage-monitor-test-profile-preview.app"),
+      centralOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
+      previewDistribution: true,
+      buildProfile: MACOS_BUILD_PROFILES.test,
+    }),
+    { code: "MACOS_TEST_BUILD_DISTRIBUTION_FORBIDDEN" },
+  );
+});
+
+test("Login Item release rehearsal requires the installed signed-app lifecycle evidence", () => {
+  const checks = {
+    firstRunConsentIsVisibleAndAffirmative: true,
+    settingsReconcileAfterSystemSettingsChange: true,
+    enableDisableAndPendingRemoval: true,
+    automaticLoginLaunch: true,
+    upgradeRetainsSingleMainAppLoginItem: true,
+    moveAndReinstallLeavesNoStaleDuplicate: true,
+    uninstallAndReinstallLeavesNoStaleDuplicate: true,
+    duplicateLaunchExplainsExistingApp: true,
+    windowCloseKeepsMenuBarAndQuitStopsApp: true,
+    noAgentDaemonOrBackgroundUpload: true,
+  };
+  const rehearsal = {
+    schemaVersion: "usage-monitor-macos-login-item-release-rehearsal-v1",
+    recordedOn: "2026-08-04",
+    environment: {
+      cleanDisposableProfile: true,
+      installedInApplications: true,
+    },
+    application: {
+      bundleIdentifier: "com.usagemonitor.local",
+      bundleVersion: "17",
+      shortVersion: "0.1.0",
+    },
+    checks,
+  };
+  const validated = validateMacOSLoginItemReleaseRehearsal(rehearsal, {
+    bundleVersion: "17",
+    shortVersion: "0.1.0",
+  });
+  assert.equal(validated.bundleIdentifier, "com.usagemonitor.local");
+  assert.equal(validated.bundleVersion, "17");
+  assert.equal(validated.requiredChecks.length, 10);
+  assert.throws(
+    () => validateMacOSLoginItemReleaseRehearsal({
+      ...rehearsal,
+      checks: {
+        ...checks,
+        automaticLoginLaunch: false,
+      },
+    }, {
+      bundleVersion: "17",
+      shortVersion: "0.1.0",
+    }),
+    { code: "MACOS_LOGIN_ITEM_REHEARSAL_INVALID" },
+  );
+  assert.throws(
+    () => validateMacOSLoginItemReleaseRehearsal(rehearsal, {
+      bundleVersion: "18",
+      shortVersion: "0.1.0",
+    }),
+    { code: "MACOS_LOGIN_ITEM_REHEARSAL_INVALID" },
+  );
+  assert.throws(
+    () => validateMacOSLoginItemReleaseRehearsal({
+      ...rehearsal,
+      recordedOn: "2026-02-30",
+    }, {
+      bundleVersion: "17",
+      shortVersion: "0.1.0",
+    }),
+    { code: "MACOS_LOGIN_ITEM_REHEARSAL_INVALID" },
+  );
+});
+
+test("Login Item release tooling validates only the fake seam and an Applications receipt", async () => {
+  const [releaseSource, gateSource] = await Promise.all([
+    readFile(RELEASE_CORE, "utf8"),
+    readFile(
+      join(
+        REPOSITORY_ROOT,
+        "scripts",
+        "validate-macos-login-item-release.js",
+      ),
+      "utf8",
+    ),
+  ]);
+  assert.match(
+    releaseSource,
+    /validateMacOSLoginItemContract\(inspected\.executablePath\)/u,
+  );
+  assert.match(
+    releaseSource,
+    /--login-item-contract-smoke-test/u,
+  );
+  assert.match(releaseSource, /real Login Items; the executable/u);
+  assert.match(releaseSource, /fake ServiceManagement seam/u);
+  assert.match(
+    gateSource,
+    /const REQUIRED_APPLICATION_PATH\s*=\s*`\/Applications\/\$\{PRODUCT_BRAND\.bundleName\}`/u,
+  );
+  assert.match(gateSource, /validateInstalledMacOSApp\(appPath, \{ production: true \}\)/u);
+  assert.match(gateSource, /validateMacOSLoginItemReleaseRehearsal/u);
+  assert.equal(gateSource.includes("register()"), false);
+  assert.equal(gateSource.includes("unregister()"), false);
+  const refusedDevelopmentPath = spawnSync(process.execPath, [
+    join(
+      REPOSITORY_ROOT,
+      "scripts",
+      "validate-macos-login-item-release.js",
+    ),
+    "--app",
+    ".release-build/macos/TiboTattle.app",
+    "--rehearsal",
+    "/tmp/unused-login-item-rehearsal.json",
+  ], {
+    cwd: REPOSITORY_ROOT,
+    encoding: "utf8",
+    timeout: 5_000,
+  });
+  assert.equal(refusedDevelopmentPath.status, 1);
+  assert.match(
+    refusedDevelopmentPath.stderr,
+    /must use \/Applications\/TiboTattle\.app/u,
   );
 });
 
@@ -1229,13 +2914,13 @@ test("signed updater replacement contract validates upgrade and rollback artifac
     updateChecksPerformedByApp: true,
     manualUpdateCheckAvailable: true,
     automaticUpdateOptInAvailable: true,
-    automaticUpdatesEnabledByDefault: false,
+    automaticUpdatesEnabledByDefault: true,
     afterUserOptIn: {
       automaticDownload: true,
       installOnQuit: true,
     },
     installProcedure:
-      "sparkle_user_choice_or_opted_in_install_on_quit_or_manual_dmg_replacement",
+      "sparkle_automatic_install_on_quit_or_manual_dmg_replacement",
     downloadPolicy: "pinned_https_appcast_and_eddsa_signed_artifact",
     state: {
       root: "~/Library/Application Support/Usage Monitor",
@@ -1269,37 +2954,44 @@ test("signed updater replacement contract validates upgrade and rollback artifac
     dmgNotarizationAccepted: true,
     dmgTicketStapled: true,
   };
+  const sparklePublicKeySha256 = createHash("sha256")
+    .update(Buffer.alloc(32, 1))
+    .digest("hex");
+  const changedSparklePublicKeySha256 = createHash("sha256")
+    .update(Buffer.alloc(32, 2))
+    .digest("hex");
   const releaseManifest = (bundleVersion, fileName, bytes) => ({
     schemaVersion: "usage-monitor-macos-release-v0.2",
     application: {
       bundleIdentifier: "com.usagemonitor.local",
       bundleVersion,
-      shortVersion: "0.1.0",
+      shortVersion: RELEASE_VERSION,
     },
     artifact: {
       bytes: bytes.length,
       fileName,
       sha256: createHash("sha256").update(bytes).digest("hex"),
     },
+    channel: createReleaseChannelProvenance(STABLE_RELEASE_CHANNEL, {
+      publicEdKeySha256: sparklePublicKeySha256,
+    }),
     source: {
       commit: "a".repeat(40),
-      tag: "v0.1.0",
+      tag: RELEASE_MANIFEST.tag,
     },
     assurances: { ...assurances },
     updater: {
       appcastURL: "https://usage.example/appcast.xml",
       automaticChecks: true,
       automaticUpdateOptInAvailable: true,
-      automaticUpdatesEnabledByDefault: false,
+      automaticUpdatesEnabledByDefault: true,
       afterUserOptIn: {
         automaticDownload: true,
         installOnQuit: true,
       },
       enabled: true,
       frameworkVersion: SPARKLE_VERSION,
-      publicEdKeySha256: createHash("sha256")
-        .update(Buffer.alloc(32, 1))
-        .digest("hex"),
+      publicEdKeySha256: sparklePublicKeySha256,
       requiresSignedFeed: true,
     },
     replacement,
@@ -1322,7 +3014,72 @@ test("signed updater replacement contract validates upgrade and rollback artifac
     temporaryRoot,
     "UsageMonitor-candidate.dmg.release.json",
   );
+  const malformedPreviousManifestPath = join(
+    temporaryRoot,
+    "malformed-previous-stable.json",
+  );
   try {
+    assert.throws(
+      () => assertStableSparkleKeyContinuity({
+        candidateBundleVersion: candidateManifest.application.bundleVersion,
+        candidatePublicEdKeySha256: sparklePublicKeySha256,
+        channel: STABLE_RELEASE_CHANNEL,
+      }),
+      { code: "MACOS_STABLE_PREVIOUS_MANIFEST_REQUIRED" },
+    );
+    await assert.rejects(
+      readStableReleaseManifest(join(temporaryRoot, "missing-stable.json")),
+      { code: "MACOS_STABLE_PREVIOUS_MANIFEST_INVALID" },
+    );
+    await writeFile(malformedPreviousManifestPath, "not-json");
+    await assert.rejects(
+      readStableReleaseManifest(malformedPreviousManifestPath),
+      { code: "MACOS_STABLE_PREVIOUS_MANIFEST_INVALID" },
+    );
+    assert.throws(
+      () => assertStableSparkleKeyContinuity({
+        candidateBundleVersion: candidateManifest.application.bundleVersion,
+        candidatePublicEdKeySha256: changedSparklePublicKeySha256,
+        channel: STABLE_RELEASE_CHANNEL,
+        previousManifest,
+      }),
+      { code: "MACOS_STABLE_UPDATER_KEY_MISMATCH" },
+    );
+    assert.throws(
+      () => assertStableSparkleKeyContinuity({
+        candidateBundleVersion: previousManifest.application.bundleVersion,
+        candidatePublicEdKeySha256: sparklePublicKeySha256,
+        channel: STABLE_RELEASE_CHANNEL,
+        previousManifest,
+      }),
+      { code: "MACOS_STABLE_VERSION_NOT_NEWER" },
+    );
+    assert.deepEqual(
+      assertStableSparkleKeyContinuity({
+        candidateBundleVersion: candidateManifest.application.bundleVersion,
+        candidatePublicEdKeySha256: sparklePublicKeySha256,
+        channel: STABLE_RELEASE_CHANNEL,
+        previousManifest,
+      }),
+      {
+        mode: "previous_manifest",
+        policy: "previous_stable_manifest_required",
+        previousBundleVersion: "10",
+      },
+    );
+    assert.deepEqual(
+      assertStableSparkleKeyContinuity({
+        candidateBundleVersion: "1",
+        candidatePublicEdKeySha256: sparklePublicKeySha256,
+        channel: STABLE_RELEASE_CHANNEL,
+        stableBootstrap: true,
+      }),
+      {
+        bootstrap: "explicit_owner_only",
+        mode: "bootstrap",
+        policy: "previous_stable_manifest_required",
+      },
+    );
     await writeFile(
       join(temporaryRoot, previousManifest.artifact.fileName),
       previousBytes,
@@ -1353,6 +3110,16 @@ test("signed updater replacement contract validates upgrade and rollback artifac
         automaticUpdaterPresent: true,
         hostedDataChanged: false,
       },
+    );
+    assert.equal(previousManifest.channel.name, STABLE_RELEASE_CHANNEL);
+    assert.equal(candidateManifest.channel.name, STABLE_RELEASE_CHANNEL);
+    assert.equal(
+      previousManifest.channel.sparkle.publicEdKeySha256,
+      previousManifest.updater.publicEdKeySha256,
+    );
+    assert.equal(
+      candidateManifest.channel.sparkle.publicEdKeySha256,
+      candidateManifest.updater.publicEdKeySha256,
     );
     const validatedArtifacts = [];
     const artifacts = await validateMacOSSignedReplacementArtifacts({
@@ -1425,9 +3192,144 @@ test("signed updater replacement contract validates upgrade and rollback artifac
         previousManifest,
         candidateManifest: {
           ...candidateManifest,
+          channel: {
+            ...candidateManifest.channel,
+            sparkle: {
+              ...candidateManifest.channel.sparkle,
+              publicEdKeySha256: changedSparklePublicKeySha256,
+            },
+          },
+          updater: {
+            ...candidateManifest.updater,
+            publicEdKeySha256: changedSparklePublicKeySha256,
+          },
+        },
+      }),
+      { code: "MACOS_REPLACEMENT_UPDATER_KEY_MISMATCH" },
+      "a same-channel replacement with a changed Sparkle key must fail",
+    );
+    for (const [label, previous, candidate] of [
+      [
+        "previous",
+        {
+          ...previousManifest,
+          channel: {
+            ...previousManifest.channel,
+            sparkle: {
+              ...previousManifest.channel.sparkle,
+              publicEdKeySha256: "c".repeat(64),
+            },
+          },
+        },
+        candidateManifest,
+      ],
+      [
+        "candidate",
+        previousManifest,
+        {
+          ...candidateManifest,
+          channel: {
+            ...candidateManifest.channel,
+            sparkle: {
+              ...candidateManifest.channel.sparkle,
+              publicEdKeySha256: "c".repeat(64),
+            },
+          },
+        },
+      ],
+    ]) {
+      assert.throws(
+        () => validateMacOSSignedReplacementPair({
+          previousManifest: previous,
+          candidateManifest: candidate,
+        }),
+        { code: "MACOS_RELEASE_UPDATER_KEY_MISMATCH" },
+        `${label} mismatched channel fingerprint must fail closed`,
+      );
+    }
+    for (const [label, publicEdKeySha256] of [
+      ["absent", undefined],
+      ["malformed", "not-a-sha256"],
+    ]) {
+      assert.throws(
+        () => validateMacOSSignedReplacementPair({
+          previousManifest,
+          candidateManifest: {
+            ...candidateManifest,
+            channel: {
+              ...candidateManifest.channel,
+              sparkle: {
+                ...candidateManifest.channel.sparkle,
+                publicEdKeySha256,
+              },
+            },
+          },
+        }),
+        { code: "MACOS_RELEASE_CHANNEL_MISMATCH" },
+        `${label} channel fingerprint must fail closed`,
+      );
+    }
+    for (const [label, publicEdKeySha256] of [
+      ["absent", undefined],
+      ["malformed", "not-a-sha256"],
+    ]) {
+      assert.throws(
+        () => validateMacOSSignedReplacementPair({
+          previousManifest,
+          candidateManifest: {
+            ...candidateManifest,
+            updater: {
+              ...candidateManifest.updater,
+              publicEdKeySha256,
+            },
+          },
+        }),
+        { code: "MACOS_REPLACEMENT_MANIFEST_INVALID" },
+        `${label} updater fingerprint must fail closed`,
+      );
+    }
+    for (const [label, previous, candidate] of [
+      [
+        "previous",
+        { ...previousManifest, channel: undefined },
+        candidateManifest,
+      ],
+      [
+        "candidate",
+        previousManifest,
+        { ...candidateManifest, channel: undefined },
+      ],
+    ]) {
+      assert.throws(
+        () => validateMacOSSignedReplacementPair({
+          previousManifest: previous,
+          candidateManifest: candidate,
+        }),
+        { code: "MACOS_RELEASE_CHANNEL_PROVENANCE_REQUIRED" },
+        `${label} release channel provenance must be required`,
+      );
+    }
+    assert.throws(
+      () => validateMacOSSignedReplacementPair({
+        previousManifest,
+        candidateManifest: {
+          ...candidateManifest,
+          channel: {
+            ...candidateManifest.channel,
+            name: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+          },
+        },
+      }),
+      { code: "MACOS_RELEASE_CHANNEL_MISMATCH" },
+    );
+    assert.throws(
+      () => validateMacOSSignedReplacementPair({
+        previousManifest,
+        candidateManifest: {
+          ...candidateManifest,
           replacement: {
             ...replacement,
-            automaticUpdatesEnabledByDefault: true,
+            automaticUpdatesEnabledByDefault: false,
           },
         },
       }),
@@ -1468,14 +3370,14 @@ test("signed macOS releases require a clean, annotated source tag and minimal No
     execFileSync("/usr/bin/git", ["commit", "--quiet", "-m", "release input"], {
       cwd: temporaryRoot,
     });
-    execFileSync("/usr/bin/git", ["tag", "-a", "v0.1.0", "-m", "release"], {
+    execFileSync("/usr/bin/git", ["tag", "-a", RELEASE_MANIFEST.tag, "-m", "release"], {
       cwd: temporaryRoot,
     });
     const provenance = readMacOSReleaseSourceProvenance({
       repositoryRoot: temporaryRoot,
     });
     assert.match(provenance.commit, /^[0-9a-f]{40}$/u);
-    assert.equal(provenance.tag, "v0.1.0");
+    assert.equal(provenance.tag, RELEASE_MANIFEST.tag);
 
     await writeFile(join(temporaryRoot, "release-input.txt"), "dirty\n");
     assert.throws(
@@ -1588,8 +3490,10 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
           CFBundleURLName: "com.usagemonitor.local.open",
           CFBundleURLSchemes: ["usagemonitor"],
         }],
-        UsageMonitorCentralOrigin: "https://usage.example",
+        UsageMonitorCentralOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
         UsageMonitorCentralOriginMode: "production_https",
+        UsageMonitorPublicWebsiteOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
+        UsageMonitorReleaseChannel: STABLE_RELEASE_CHANNEL,
         UsageMonitorAppOpenHost: PRODUCT_BRAND.appOpenHost,
         UsageMonitorAppOpenScheme: PRODUCT_BRAND.appOpenScheme,
         UsageMonitorAppOpenURL: PRODUCT_BRAND.appOpenURL,
@@ -1602,9 +3506,9 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
         UsageMonitorUpdaterEnabled: true,
         UsageMonitorUpdaterFrameworkVersion: SPARKLE_VERSION,
         SUAllowsAutomaticUpdates: true,
-        SUAutomaticallyUpdate: false,
+        SUAutomaticallyUpdate: true,
         SUEnableAutomaticChecks: true,
-        SUFeedURL: "https://usage.example/appcast.xml",
+        SUFeedURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
         SUPublicEDKey: Buffer.alloc(32, 1).toString("base64"),
         SURequireSignedFeed: true,
         SUVerifyUpdateBeforeExtraction: true,
@@ -1622,6 +3526,8 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
           appOpenHost: "open",
           appOpenScheme: "usagemonitor",
           appOpenURL: "usagemonitor://open",
+          channel: "production",
+          channelName: STABLE_RELEASE_CHANNEL,
           externalDistributionRequested: true,
           iconIncluded: true,
           iconSha256: createHash("sha256")
@@ -1635,10 +3541,10 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
             .digest("hex"),
           requiresDeveloperIDAndNotarization: true,
           updater: {
-            appcastURL: "https://usage.example/appcast.xml",
+            appcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
             automaticChecks: true,
             automaticUpdateOptInAvailable: true,
-            automaticUpdatesEnabledByDefault: false,
+            automaticUpdatesEnabledByDefault: true,
             afterUserOptIn: {
               automaticDownload: true,
               installOnQuit: true,
@@ -1717,6 +3623,25 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
       && arguments_.includes("--verify"));
     assert.equal(verify.arguments_.includes("--deep"), true);
     assert.equal(verify.arguments_.includes("--strict"), true);
+
+    const dmg = join(temporaryRoot, "TiboTattle.dmg");
+    await writeFile(dmg, "signed-DMG-fixture");
+    const dmgCalls = [];
+    assert.deepEqual(
+      await developerIDSignMacOSDMG(dmg, {
+        identity,
+        commandRunner(command, arguments_, options) {
+          dmgCalls.push({ arguments_, command, options });
+          return { stderr: "", stdout: "" };
+        },
+      }),
+      { path: dmg },
+    );
+    assert.deepEqual(dmgCalls.map(({ arguments_ }) => arguments_), [
+      ["--force", "--timestamp", "--sign", identity, dmg],
+      ["--verify", "--strict", "--verbose=2", dmg],
+    ]);
+    assert.deepEqual(dmgCalls[0].options.secrets, [identity]);
 
     const acceptedCalls = [];
     assert.deepEqual(
@@ -1855,7 +3780,10 @@ test("macOS central origin policy is fixed, HTTPS-first, and explicit for loopba
 });
 
 test("macOS runtime graph is closed over exact source and dependency allowlists", async () => {
-  const [graph, webModules, swiftSources] = await Promise.all([
+  const [graph, concurrentGraph, webModules, swiftSources] = await Promise.all([
+    collectMacOSRuntimeGraph(),
+    // The reproducibility artifact test can build two independent bundles at
+    // once, so the graph scanner must not share mutable RegExp cursor state.
     collectMacOSRuntimeGraph(),
     collectMacOSWebModuleGraph(),
     collectMacOSSwiftSources(),
@@ -1868,11 +3796,13 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   assert.deepEqual(graph.externalSpecifiers, [
     "@app-usagemonitor/accounting",
     "@app-usagemonitor/identity-core",
+    "@app-usagemonitor/quota-analysis",
     "@app-usagemonitor/telemetry-contract",
     "@github/keytar",
     "ajv",
     "runcost/browser",
   ]);
+  assert.deepEqual(concurrentGraph, graph);
   assert.equal(graph.builtins.includes("node:http"), true);
   assert.equal(graph.builtins.includes("node:sqlite"), true);
   assert.equal(graph.relativeFiles.includes("src/local-installation-diagnostics.js"), true);
@@ -1904,10 +3834,11 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   // entry. The community entry itself is website-only and is not bundled.
   assert.deepEqual(webModules.relativeFiles, [
     "apps/web/public/app.js",
-    "apps/web/public/community-view.js",
+    "apps/web/public/community-data.js",
     "apps/web/public/data-client.js",
     "apps/web/public/install-cta.js",
     "apps/web/public/lib.js",
+    "apps/web/public/localization.js",
     "apps/web/public/navigation.js",
     "apps/web/public/telemetry-envelope.js",
     "apps/web/public/telemetry-shared.generated.js",
@@ -1918,18 +3849,29 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     false,
   );
   assert.deepEqual(swiftSources.relativeFiles, [
+    "apps/macos/Sources/Localization.swift",
+    "apps/macos/Sources/LoginItemManager.swift",
     "apps/macos/Sources/MenuBarStatus.swift",
+    "apps/macos/Sources/QuotaNotifications.swift",
     "apps/macos/Sources/SemanticOpenTarget.swift",
     "apps/macos/UsageMonitorApp.swift",
+  ]);
+  const localizationResources = await collectMacOSLocalizationResources();
+  assert.deepEqual(localizationResources.relativeFiles, [
+    "en.lproj/Localizable.strings",
+    "es.lproj/Localizable.strings",
+    "localization/manifest.json",
+    "zh-Hans.lproj/Localizable.strings",
   ]);
   assert.deepEqual(runtimeAssets, [
     "apps/macos/reset-local-keychain.js",
     "apps/web/public/app.js",
-    "apps/web/public/community-view.js",
+    "apps/web/public/community-data.js",
     "apps/web/public/data-client.js",
     "apps/web/public/index.html",
     "apps/web/public/install-cta.js",
     "apps/web/public/lib.js",
+    "apps/web/public/localization.js",
     "apps/web/public/navigation.js",
     "apps/web/public/styles.css",
     "apps/web/public/telemetry-envelope.js",
@@ -2190,21 +4132,28 @@ test("macOS workspace package capture binds staged bytes, inventory, and digest 
       name: "@app-usagemonitor/accounting",
       root: join(temporaryRoot, "packages", "accounting"),
       runtimeFiles: MACOS_ACCOUNTING_RUNTIME_FILES,
-      version: "0.1.0",
+      version: RELEASE_VERSION,
     },
     {
       inputDirectory: "packages/identity-core",
       name: "@app-usagemonitor/identity-core",
       root: join(temporaryRoot, "packages", "identity-core"),
       runtimeFiles: MACOS_IDENTITY_CORE_RUNTIME_FILES,
-      version: "0.1.0",
+      version: RELEASE_VERSION,
     },
     {
       inputDirectory: "packages/telemetry-contract",
       name: "@app-usagemonitor/telemetry-contract",
       root: join(temporaryRoot, "packages", "telemetry-contract"),
       runtimeFiles: MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES,
-      version: "0.1.0",
+      version: RELEASE_VERSION,
+    },
+    {
+      inputDirectory: "packages/quota-analysis",
+      name: "@app-usagemonitor/quota-analysis",
+      root: join(temporaryRoot, "packages", "quota-analysis"),
+      runtimeFiles: MACOS_QUOTA_ANALYSIS_RUNTIME_FILES,
+      version: RELEASE_VERSION,
     },
   ];
   try {
@@ -2235,11 +4184,12 @@ test("macOS workspace package capture binds staged bytes, inventory, and digest 
         return join(definition.root, "index.js");
       },
     });
-    assert.equal(captures.length, 3);
+    assert.equal(captures.length, 4);
     assert.equal(
       captures.reduce((total, capture) => total + capture.files.length, 0),
       MACOS_ACCOUNTING_RUNTIME_FILES.length
         + MACOS_IDENTITY_CORE_RUNTIME_FILES.length
+        + MACOS_QUOTA_ANALYSIS_RUNTIME_FILES.length
         + MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES.length,
     );
     assert.equal(Object.isFrozen(captures), true);
@@ -2291,6 +4241,7 @@ test("macOS workspace package capture binds staged bytes, inventory, and digest 
     const mutations = [
       ["@app-usagemonitor/accounting", "src/cost-ledger.js"],
       ["@app-usagemonitor/identity-core", "src/pseudonym.js"],
+      ["@app-usagemonitor/quota-analysis", "src/quota-windows.js"],
       ["@app-usagemonitor/telemetry-contract", "src/envelope.js"],
     ];
     for (const [name, relativeFile] of mutations) {
@@ -2312,7 +4263,10 @@ test("macOS workspace package capture binds staged bytes, inventory, and digest 
       stagedAppRoot,
       captures,
     );
-    assert.equal(stagedRows.length, 18);
+    assert.equal(
+      stagedRows.length,
+      captures.reduce((total, capture) => total + capture.files.length, 0),
+    );
     const stagedInventory = [];
     for (const capture of captures) {
       for (const file of capture.files) {
@@ -2408,7 +4362,7 @@ test("macOS identity-core capture rejects resolver mismatch and unsafe runtime f
       name: "@app-usagemonitor/identity-core",
       root,
       runtimeFiles: MACOS_IDENTITY_CORE_RUNTIME_FILES,
-      version: "0.1.0",
+      version: RELEASE_VERSION,
     };
   };
   try {
@@ -2620,9 +4574,13 @@ test("macOS Swift discovery rejects candidates in unknown top-level directories"
   }
 });
 
-test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdog smokes", {
+macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdog smokes", {
   skip: BUILD_SUPPORTED ? false : "requires pinned macOS arm64 Node v26.2.0 builder",
-  timeout: 60_000,
+  // This creates and deeply verifies two complete signed app bundles. On a
+  // loaded developer Mac, codesign and the framework inventory alone can take
+  // longer than a minute; retain every assertion and give the artifact check
+  // a realistic bounded budget instead of turning it into a flaky failure.
+  timeout: 180_000,
 }, async () => {
   const temporaryRoot = await mkdtemp(
     join(await realpath(tmpdir()), "usage-monitor-macos-test-"),
@@ -2631,8 +4589,26 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
   const outputB = join(temporaryRoot, "b", "TiboTattle.app");
   const smokeHome = join(temporaryRoot, "smoke-home");
   try {
-    const first = await buildMacOSApp({ output: outputA });
-    const second = await buildMacOSApp({ output: outputB });
+    // Each child has its own Node event loop, output parent, and compiler
+    // scratch tree. This makes Swift compilation and codesigning genuinely
+    // concurrent rather than serialising them behind this process's spawnSync
+    // calls. allSettled ensures cleanup waits for both children on failure.
+    const attempts = await Promise.allSettled([
+      buildMacOSAppInIndependentProcess(outputA),
+      buildMacOSAppInIndependentProcess(outputB),
+    ]);
+    const failures = attempts.filter((attempt) => attempt.status === "rejected");
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures.map(({ reason }) => reason),
+        "independent reproducibility builds failed",
+      );
+    }
+    const [first, second] = attempts.map(({ value }) => value);
+    assert.equal(first.buildProfile, MACOS_BUILD_PROFILES.release);
+    assert.equal(second.buildProfile, MACOS_BUILD_PROFILES.release);
+    assert.equal(first.output, outputA);
+    assert.equal(second.output, outputB);
     assert.equal(first.payloadSha256, second.payloadSha256);
     assert.equal(first.sourceSha256, second.sourceSha256);
     assert.equal(first.totalBytes, second.totalBytes);
@@ -2670,6 +4646,8 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
       appOpenHost: "open",
       appOpenScheme: "usagemonitor",
       appOpenURL: "usagemonitor://open",
+      channel: "development",
+      channelName: "development",
       externalDistributionRequested: false,
       iconIncluded: true,
       iconSha256: await sha256File(
@@ -2679,6 +4657,8 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
       provenanceSha256: await sha256File(
         join(REPOSITORY_ROOT, "apps", "macos", "Assets", "AppIcon.provenance.txt"),
       ),
+      previewDistributionRequested: false,
+      previewOriginValidated: false,
       requiresDeveloperIDAndNotarization: false,
       updater: {
         appcastURL: null,
@@ -2727,15 +4707,19 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
       [
         {
           name: "@app-usagemonitor/accounting",
-          version: "0.1.0",
+          version: RELEASE_VERSION,
         },
         {
           name: "@app-usagemonitor/identity-core",
-          version: "0.1.0",
+          version: RELEASE_VERSION,
+        },
+        {
+          name: "@app-usagemonitor/quota-analysis",
+          version: RELEASE_VERSION,
         },
         {
           name: "@app-usagemonitor/telemetry-contract",
-          version: "0.1.0",
+          version: RELEASE_VERSION,
         },
         { name: "@github/keytar", version: "7.10.6" },
         { name: "ajv", version: "8.20.0" },
@@ -2776,9 +4760,21 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
         .map((path) => path.slice(bundledIdentityCorePrefix.length)),
       MACOS_IDENTITY_CORE_RUNTIME_FILES,
     );
+    const bundledQuotaAnalysisPrefix =
+      "Contents/Resources/app/node_modules/"
+      + "@app-usagemonitor/quota-analysis/";
+    assert.deepEqual(
+      bundleFiles
+        .map(({ relativePath }) => relativePath)
+        .filter((path) => path.startsWith(bundledQuotaAnalysisPrefix))
+        .map((path) => path.slice(bundledQuotaAnalysisPrefix.length)),
+      MACOS_QUOTA_ANALYSIS_RUNTIME_FILES,
+    );
     const swiftSources = await collectMacOSSwiftSources();
+    const localizationResources = await collectMacOSLocalizationResources();
     const sourceInputPaths = new Set([
       ...manifest.inputs.firstPartyFiles,
+      ...manifest.inputs.localizationResources,
       ...manifest.inputs.staticAssets,
       ...MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES.map(
         (path) => `packages/telemetry-contract/${path}`,
@@ -2789,6 +4785,9 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
       ...MACOS_IDENTITY_CORE_RUNTIME_FILES.map(
         (path) => `packages/identity-core/${path}`,
       ),
+      ...MACOS_QUOTA_ANALYSIS_RUNTIME_FILES.map(
+        (path) => `packages/quota-analysis/${path}`,
+      ),
       "config/product-brand.js",
       "scripts/build-macos-app.js",
       "scripts/lib/captured-utf8-source.mjs",
@@ -2796,6 +4795,28 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
       "apps/macos/Assets/AppIcon.provenance.txt",
       ...swiftSources.relativeFiles,
     ]);
+    assert.deepEqual(
+      manifest.inputs.localizationResources,
+      localizationResources.relativeFiles.map((path) =>
+        `apps/macos/Resources/${path}`),
+    );
+    for (const relativePath of [
+      "Contents/Resources/en.lproj/Localizable.strings",
+      "Contents/Resources/es.lproj/Localizable.strings",
+      "Contents/Resources/localization/manifest.json",
+      "Contents/Resources/app/localization/en.lproj/Localizable.strings",
+      "Contents/Resources/app/localization/es.lproj/Localizable.strings",
+      "Contents/Resources/app/localization/manifest.json",
+      "Contents/Resources/zh-Hans.lproj/Localizable.strings",
+      "Contents/Resources/app/localization/zh-Hans.lproj/Localizable.strings",
+    ]) {
+      assert.equal(
+        bundleFiles.some(({ relativePath: bundledPath }) =>
+          bundledPath === relativePath),
+        true,
+        relativePath,
+      );
+    }
     const sourceInputHash = createHash("sha256");
     for (const path of [...sourceInputPaths].sort((left, right) =>
       left.localeCompare(right))) {
@@ -2887,6 +4908,15 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
     ], { encoding: "utf8" }));
     assert.equal(developmentPlist.UsageMonitorUpdaterEnabled, false);
     assert.equal(
+      developmentPlist.UsageMonitorBuildChannel,
+      "development",
+    );
+    assert.equal(
+      developmentPlist.UsageMonitorReleaseChannel,
+      "development",
+    );
+    assert.equal(developmentPlist.UsageMonitorPreviewDistribution, false);
+    assert.equal(
       bundleFiles.some(({ relativePath }) =>
         relativePath.startsWith("Contents/Frameworks/")),
       false,
@@ -2903,7 +4933,91 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
     );
     assert.match(
       updaterSmoke.stdout,
-      /runtime=development_disabled/u,
+      /runtime=development_disabled state=unavailable_in_build/u,
+    );
+    const failedFeedSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--updater-feed-contract-smoke-test", "404"],
+      { encoding: "utf8" },
+    );
+    assert.equal(
+      failedFeedSmoke.status,
+      0,
+      failedFeedSmoke.stderr || failedFeedSmoke.stdout,
+    );
+    assert.match(
+      failedFeedSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_UPDATER_FEED_CONTRACT status=404 result=failed sparkle_check=false$/mu,
+    );
+    const loginItemSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--login-item-contract-smoke-test"],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    assert.equal(
+      loginItemSmoke.status,
+      0,
+      loginItemSmoke.stderr || loginItemSmoke.stdout,
+    );
+    assert.match(
+      loginItemSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_LOGIN_ITEM_CONTRACT fake=true register=affirmative-only unregister=explicit status=enabled,not-registered,requires-approval,unavailable outcomes=confirmed,requires-approval,not-confirmed,unavailable,failed pending_removal=true real_service_calls=0 daemon=false$/mu,
+    );
+    const menuBarSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--menu-bar-contract-smoke-test"],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    assert.equal(
+      menuBarSmoke.status,
+      0,
+      menuBarSmoke.stderr || menuBarSmoke.stdout,
+    );
+    assert.match(
+      menuBarSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT native_rows=true titles=true states=starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q dismissal=native,escape,same-app,deactivation$/mu,
+    );
+    const quotaNotificationSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--quota-notification-contract-smoke-test"],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    assert.equal(
+      quotaNotificationSmoke.status,
+      0,
+      quotaNotificationSmoke.stderr || quotaNotificationSmoke.stdout,
+    );
+    assert.match(
+      quotaNotificationSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_QUOTA_NOTIFICATION_CONTRACT opt_in=true fresh_only=true first_sample=false threshold=true reset_schedule_fallback=true reset_identity_dedupe=true dedupe=true opt_out=true$/mu,
+    );
+    const refreshSettingsSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--native-refresh-settings-contract-smoke-test"],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    assert.equal(
+      refreshSettingsSmoke.status,
+      0,
+      refreshSettingsSmoke.stderr || refreshSettingsSmoke.stdout,
+    );
+    assert.match(
+      refreshSettingsSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_REFRESH_SETTINGS_CONTRACT default=300 persisted=900 reloaded=900 picker_action=true picker_persisted=true scheduler=300->900 invalid_ignored=true$/mu,
+    );
+    const nativeDashboardLayoutSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--native-dashboard-layout-smoke-test"],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(
+      nativeDashboardLayoutSmoke.status,
+      0,
+      nativeDashboardLayoutSmoke.stderr || nativeDashboardLayoutSmoke.stdout,
+    );
+    assert.match(
+      nativeDashboardLayoutSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_NATIVE_DASHBOARD_LAYOUT web_width=[6-9][0-9]{2,} web_height=[6-9][0-9]{2,}$/mu,
     );
     const generatedFiles = bundleFiles
       .map(({ relativePath }) => relativePath)
@@ -2993,7 +5107,7 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
     );
     assert.equal(
       accountingProbe.stdout,
-      "provider-neutral-api-price-equivalent-v0.1",
+      "provider-neutral-api-price-equivalent-v0.2",
     );
     const identityCoreProbe = spawnSync(node, [
       "--input-type=module",
@@ -3149,6 +5263,10 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
       plistJson.UsageMonitorMonitoredAppBundleIdentifier,
       PRODUCT_BRAND.monitoredAppBundleIdentifier,
     );
+    assert.equal(
+      plistJson.UsageMonitorPublicWebsiteOrigin,
+      DEPLOYMENT_ENDPOINTS.public.origin,
+    );
     assert.equal(plistJson.CFBundleIconFile, "AppIcon");
     assert.equal(Object.hasOwn(plistJson, "UsageMonitorCentralOrigin"), false);
     assert.equal(
@@ -3218,6 +5336,18 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
     assert.match(
       diagnostics.stdout,
       /^failure_code: UM_MACOS_COMPANION_START_TIMEOUT$/mu,
+    );
+    assert.match(
+      diagnostics.stdout,
+      /^login_item_status: requires_approval$/mu,
+    );
+    assert.match(
+      diagnostics.stdout,
+      /^login_item_last_operation: register_requires_approval$/mu,
+    );
+    assert.match(
+      diagnostics.stdout,
+      /^login_item_service: main_app_only$/mu,
     );
     assert.match(diagnostics.stdout, /^paths_included: false$/mu);
     assert.match(diagnostics.stdout, /^identifiers_included: false$/mu);
@@ -3451,13 +5581,15 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
     const dmg = join(
       temporaryRoot,
       "dmg",
-      "UsageMonitor-0.0.1-macOS-arm64.dmg",
+      `TiboTattle-${RELEASE_VERSION}-macOS-arm64-development.dmg`,
     );
     const packaged = await packageMacOSDMG({
       appPath: outputA,
       output: dmg,
+      distribution: "development",
     });
     assert.equal(packaged.output, dmg);
+    assert.equal(packaged.distribution, "development");
     assert.match(packaged.sha256, /^[a-f0-9]{64}$/u);
     assert.equal(packaged.bytes > 0, true);
     assert.deepEqual(
@@ -3465,8 +5597,15 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
       {
         bundleIdentifier: "com.usagemonitor.local",
         production: false,
-        shortVersion: "0.1.0",
+        shortVersion: RELEASE_VERSION,
       },
+    );
+    await assert.rejects(
+      validateMacOSDMG(dmg, {
+        expectedBundleVersion: "999",
+        production: false,
+      }),
+      { code: "MACOS_RELEASE_ARTIFACT_METADATA_MISMATCH" },
     );
 
     const watchdogHome = join(temporaryRoot, "watchdog-home");
@@ -3538,7 +5677,229 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
   }
 });
 
-test("signed app relays central readiness to an explicitly connected loopback lab", {
+macOSArtifactTest("preview distribution builds retain the normal identity and reject production validation", {
+  skip: BUILD_SUPPORTED ? false : "requires pinned macOS arm64 Node v26.2.0 builder",
+  timeout: 120_000,
+}, async (context) => {
+  const preparedFramework = join(
+    REPOSITORY_ROOT,
+    ".release-deps",
+    "Sparkle.framework",
+  );
+  try {
+    await lstat(preparedFramework);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      context.skip("pinned framework has not been prepared in this checkout");
+      return;
+    }
+    throw error;
+  }
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-macos-preview-test-"),
+  );
+  const output = join(temporaryRoot, "preview", "TiboTattle.app");
+  const publicEdKey = Buffer.alloc(32, 9).toString("base64");
+  try {
+    const build = await buildMacOSApp({
+      bundleVersion: "42",
+      centralOrigin: "https://preview.usage.example",
+      output,
+      previewDistribution: true,
+      previewStagingRoot: dirname(output),
+      sparkleAppcastURL: "https://updates.usage.example/appcast.xml",
+      sparkleFramework: preparedFramework,
+      sparklePublicEdKey: publicEdKey,
+    });
+    assert.deepEqual(
+      {
+        channel: build.channel,
+        centralServiceMode: build.centralServiceMode,
+        externalDistributionRequested: build.externalDistributionRequested,
+        updaterEnabled: build.updaterEnabled,
+      },
+      {
+        channel: MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+        centralServiceMode: "production_https",
+        externalDistributionRequested: false,
+        updaterEnabled: true,
+      },
+    );
+    const manifest = JSON.parse(await readFile(join(
+      output,
+      "Contents",
+      "Resources",
+      "build-manifest.json",
+    ), "utf8"));
+    assert.equal(manifest.application.bundleIdentifier, PRODUCT_BRAND.bundleIdentifier);
+    assert.equal(manifest.application.bundleVersion, "42");
+    assert.equal(manifest.release.channel, MACOS_PREVIEW_DISTRIBUTION_CHANNEL);
+    assert.equal(
+      manifest.release.channelName,
+      MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+    );
+    assert.equal(manifest.release.previewDistributionRequested, true);
+    assert.equal(manifest.release.externalDistributionRequested, false);
+    assert.equal(manifest.release.requiresDeveloperIDAndNotarization, false);
+    assert.deepEqual(await validateMacOSPreviewApp(output), {
+      appPath: resolve(output),
+      bundleIdentifier: PRODUCT_BRAND.bundleIdentifier,
+      bundleVersion: "42",
+      channel: MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+      updaterEnabled: true,
+    });
+    const previewDMG = join(
+      temporaryRoot,
+      "dmg",
+      `TiboTattle-${RELEASE_VERSION}-macOS-arm64-preview.dmg`,
+    );
+    const packagedPreview = await packageMacOSDMG({
+      appPath: output,
+      output: previewDMG,
+      distribution: "preview",
+    });
+    assert.equal(packagedPreview.distribution, "preview");
+    assert.equal(packagedPreview.output, previewDMG);
+    assert.equal(packagedPreview.bytes > 0, true);
+    await assert.rejects(
+      inspectMacOSApp(output, { requireExternalDistribution: true }),
+      { code: "MACOS_UPDATER_CONFIGURATION_INVALID" },
+    );
+    const plist = JSON.parse(execFileSync("/usr/bin/plutil", [
+      "-convert",
+      "json",
+      "-o",
+      "-",
+      join(output, "Contents", "Info.plist"),
+    ], { encoding: "utf8" }));
+    assert.equal(plist.CFBundleIdentifier, PRODUCT_BRAND.bundleIdentifier);
+    assert.equal(
+      plist.UsageMonitorPublicWebsiteOrigin,
+      DEPLOYMENT_ENDPOINTS.public.origin,
+    );
+    assert.equal(plist.UsageMonitorBuildChannel, MACOS_PREVIEW_DISTRIBUTION_CHANNEL);
+    assert.equal(
+      plist.UsageMonitorReleaseChannel,
+      MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+    );
+    assert.equal(plist.UsageMonitorPreviewDistribution, true);
+    assert.equal(plist.UsageMonitorCentralOriginMode, "production_https");
+    assert.equal(plist.UsageMonitorUpdaterEnabled, true);
+    assert.equal(plist.SUPublicEDKey, publicEdKey);
+    assert.equal(plist.SUEnableAutomaticChecks, false);
+    assert.equal(plist.SUAllowsAutomaticUpdates, false);
+    assert.equal(plist.SUAutomaticallyUpdate, false);
+    const updaterSmoke = spawnSync(
+      join(output, "Contents", "MacOS", "TiboTattle"),
+      ["--updater-contract-smoke-test"],
+      { encoding: "utf8" },
+    );
+    assert.equal(
+      updaterSmoke.status,
+      0,
+      updaterSmoke.stderr || updaterSmoke.stdout,
+    );
+    assert.match(
+      updaterSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_UPDATER_CONTRACT runtime=sparkle_2_9_3_enabled state=feed_unverified$/mu,
+    );
+    const failedFeedSmoke = spawnSync(
+      join(output, "Contents", "MacOS", "TiboTattle"),
+      ["--updater-feed-contract-smoke-test", "404"],
+      { encoding: "utf8" },
+    );
+    assert.equal(
+      failedFeedSmoke.status,
+      0,
+      failedFeedSmoke.stderr || failedFeedSmoke.stdout,
+    );
+    assert.match(
+      failedFeedSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_UPDATER_FEED_CONTRACT status=404 result=failed sparkle_check=false$/mu,
+    );
+    const reachableFeedSmoke = spawnSync(
+      join(output, "Contents", "MacOS", "TiboTattle"),
+      ["--updater-feed-contract-smoke-test", "200"],
+      { encoding: "utf8" },
+    );
+    assert.equal(
+      reachableFeedSmoke.status,
+      0,
+      reachableFeedSmoke.stderr || reachableFeedSmoke.stdout,
+    );
+    assert.match(
+      reachableFeedSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_UPDATER_FEED_CONTRACT status=200 result=reachable sparkle_check=true$/mu,
+    );
+    await assert.rejects(
+      buildMacOSApp({
+        bundleVersion: "42",
+        centralOrigin: "https://preview.usage.example",
+        output,
+        previewDistribution: true,
+        previewStagingRoot: dirname(output),
+        sparkleAppcastURL: "https://updates.usage.example/appcast.xml",
+        sparkleFramework: preparedFramework,
+        sparklePublicEdKey: publicEdKey,
+      }),
+      { code: "MACOS_PREVIEW_REPLACE_REQUIRED" },
+    );
+    const legacyManifestPath = join(
+      output,
+      "Contents",
+      "Resources",
+      "build-manifest.json",
+    );
+    await chmod(legacyManifestPath, 0o644);
+    const legacyManifest = JSON.parse(await readFile(legacyManifestPath, "utf8"));
+    delete legacyManifest.release.channelName;
+    await writeFile(legacyManifestPath, JSON.stringify(legacyManifest));
+    const legacyPlistPath = join(output, "Contents", "Info.plist");
+    await chmod(legacyPlistPath, 0o644);
+    const legacyPlist = await readFile(legacyPlistPath, "utf8");
+    await writeFile(
+      legacyPlistPath,
+      legacyPlist.replace(
+        /  <key>UsageMonitorReleaseChannel<\/key>\n  <string>preview_distribution<\/string>\n/u,
+        "",
+      ),
+    );
+    await buildMacOSApp({
+      bundleVersion: "42",
+      centralOrigin: "https://preview.usage.example",
+      output,
+      previewDistribution: true,
+      previewStagingRoot: dirname(output),
+      replacePreviewOutput: true,
+      sparkleAppcastURL: "https://updates.usage.example/appcast.xml",
+      sparkleFramework: preparedFramework,
+      sparklePublicEdKey: publicEdKey,
+    });
+    assert.deepEqual(await validateMacOSPreviewApp(output), {
+      appPath: resolve(output),
+      bundleIdentifier: PRODUCT_BRAND.bundleIdentifier,
+      bundleVersion: "42",
+      channel: MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+      updaterEnabled: true,
+    });
+    const retired = await readdir(join(dirname(output), "retired"));
+    assert.equal(retired.length, 1);
+    assert.match(retired[0], /^TiboTattle-legacy-preview-[a-f0-9]{16}\.app$/u);
+    const archivedManifest = JSON.parse(await readFile(join(
+      dirname(output),
+      "retired",
+      retired[0],
+      "Contents",
+      "Resources",
+      "build-manifest.json",
+    ), "utf8"));
+    assert.equal(archivedManifest.release.channelName, undefined);
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+macOSArtifactTest("signed app relays central readiness to an explicitly connected loopback lab", {
   skip: BUILD_SUPPORTED ? false : "requires pinned macOS arm64 Node v26.2.0 builder",
   timeout: 60_000,
 }, async () => {
@@ -3714,6 +6075,18 @@ test("build script itself does not admit private output trees", async () => {
   assert.match(source, /loginItemAdded: false/u);
   assert.match(source, /backgroundUploadAdded: false/u);
   assert.match(source, /externalDistributionRequested/u);
+  assert.match(source, /previewDistributionRequested/u);
+  assert.match(source, /MACOS_PREVIEW_DISTRIBUTION_CHANNEL/u);
+  assert.match(source, /UsageMonitorBuildChannel/u);
+  assert.match(source, /UsageMonitorReleaseChannel/u);
+  assert.match(source, /channelName/u);
+  assert.match(source, /MACOS_PREVIEW_OUTPUT_FORBIDDEN/u);
+  assert.match(source, /--preview-distribution/u);
+  assert.match(source, /--validate-preview/u);
+  assert.match(source, /COPYFILE_FICLONE/u);
+  assert.match(source, /MACOS_BUILD_PROFILE_TEST/u);
+  assert.match(source, /\["-Onone"\]/u);
+  assert.match(source, /\["-O", "-whole-module-optimization"\]/u);
   assert.match(source, /MACOS_ICON_ASSET_REQUIRED/u);
   assert.match(source, /CFBundleURLSchemes/u);
   assert.match(source, /PRODUCT_BRAND\.appOpenScheme/u);
@@ -3728,4 +6101,52 @@ test("build script itself does not admit private output trees", async () => {
   );
   assert.doesNotMatch(source, /cp\s+-R|copy.*REPOSITORY_ROOT.*resources/iu);
   assert.equal(await realpath(REPOSITORY_ROOT), REPOSITORY_ROOT);
+});
+
+// csf_efb42178: pinnedPackage() previously authenticated external packages only
+// by name and version, both attacker-retainable, then copied those installed
+// bytes into the signed app. It now also verifies a reviewed deterministic
+// file-tree digest of the installed package, rejecting tampered bytes before
+// any copy or signing.
+test("pinnedPackage authenticates external packages by reviewed file-tree digest, not just name and version", async (t) => {
+  const rootRequire = createRequire(join(REPOSITORY_ROOT, "package.json"));
+
+  // The real installed package passes and its digest is recorded for provenance.
+  const realPackageJson = rootRequire.resolve("ajv/package.json");
+  const accepted = await pinnedPackage("ajv", realPackageJson);
+  assert.equal(accepted.name, "ajv");
+  assert.equal(accepted.version, "8.20.0");
+  assert.match(accepted.treeDigest, /^[0-9a-f]{64}$/u);
+  // The recorded digest is exactly the reviewed pin and reproduces on a second
+  // read, so it is a stable provenance value.
+  assert.equal(
+    accepted.treeDigest,
+    await pinnedPackageTreeDigest(dirname(realPackageJson)),
+  );
+
+  // A tampered package that keeps the pinned name and version but changes its
+  // bytes is rejected before copying — the version-only check would have
+  // accepted it.
+  const tamperedRoot = await mkdtemp(
+    join(tmpdir(), "usage-monitor-pinned-package-"),
+  );
+  t.after(() => rm(tamperedRoot, { recursive: true, force: true }));
+  await writeFile(
+    join(tamperedRoot, "package.json"),
+    `${JSON.stringify({ name: "ajv", version: "8.20.0" }, null, 2)}\n`,
+  );
+  await writeFile(
+    join(tamperedRoot, "index.js"),
+    "module.exports = function () { /* poisoned */ return true; };\n",
+  );
+  await assert.rejects(
+    pinnedPackage("ajv", join(tamperedRoot, "package.json")),
+    /tree digest mismatch/u,
+  );
+
+  // The digest is sensitive to any content change under the tree.
+  const before = await pinnedPackageTreeDigest(tamperedRoot);
+  await writeFile(join(tamperedRoot, "index.js"), "module.exports = 1;\n");
+  const after = await pinnedPackageTreeDigest(tamperedRoot);
+  assert.notEqual(before, after);
 });

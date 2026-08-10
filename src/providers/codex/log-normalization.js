@@ -1,3 +1,6 @@
+import { normalizeProviderPlanType } from "./plan-normalization.js";
+import { normalizeProviderQuotaWindow } from "./quota-normalization.js";
+
 const COMPONENT_KEYS = [
   "input_tokens",
   "cached_input_tokens",
@@ -6,6 +9,13 @@ const COMPONENT_KEYS = [
   "reasoning_output_tokens",
   "total_tokens",
 ];
+
+export function validAbortSignal(signal) {
+  return signal === null
+    || (typeof signal === "object"
+      && typeof signal.aborted === "boolean"
+      && typeof signal.addEventListener === "function");
+}
 
 export const CODEX_LOG_RELEVANT_LINE_NEEDLES = Object.freeze([
   '"type":"session_meta"',
@@ -25,13 +35,6 @@ export const CODEX_LOG_RELEVANT_LINE_NEEDLES = Object.freeze([
   '"type":"apply_patch_call"',
   '"type":"local_shell_call"',
 ]);
-
-export function validAbortSignal(signal) {
-  return signal === null
-    || (typeof signal === "object"
-      && typeof signal.aborted === "boolean"
-      && typeof signal.addEventListener === "function");
-}
 
 export function throwIfAborted(signal) {
   if (!signal?.aborted) return;
@@ -120,25 +123,19 @@ function safeClassification(value) {
 export function canonicalRateLimitWindows(rateLimits) {
   if (!rateLimits || typeof rateLimits !== "object") return [];
   const limitId = safeClassification(rateLimits.limit_id);
-  const planType = safeClassification(rateLimits.plan_type);
+  const planType = normalizeProviderPlanType(rateLimits.plan_type);
   const windows = [];
   for (const slot of ["primary", "secondary"]) {
     const window = rateLimits[slot];
     if (!window || typeof window !== "object") continue;
-    const usedPercent = Number(window.used_percent);
-    const windowDurationMins = Number(window.window_minutes);
-    const resetsAt = Number(window.resets_at);
-    if (!Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100) continue;
-    if (!Number.isInteger(windowDurationMins) || windowDurationMins <= 0) continue;
-    if (!Number.isInteger(resetsAt) || resetsAt <= 0) continue;
+    const normalized = normalizeProviderQuotaWindow(window);
+    if (normalized === null) continue;
     windows.push({
       provider: "openai_codex",
       planType,
       limitId,
       slot,
-      usedPercent,
-      windowDurationMins,
-      resetsAt,
+      ...normalized,
     });
   }
   return windows;
@@ -157,7 +154,12 @@ export const CONTRADICTED_LEADING_SNAPSHOT_WINDOW_MS = 60_000;
 export const CONTRADICTED_LEADING_SNAPSHOT_PERCENT = 10;
 
 function rateLimitWindowIdentity(window) {
-  return `${window.provider}|${window.limitId}|${window.slot}`;
+  return [
+    window.provider,
+    window.limitId,
+    window.slot,
+    window.windowDurationMins ?? "unknown",
+  ].join("\u0000");
 }
 
 function contradicts(held, candidate) {

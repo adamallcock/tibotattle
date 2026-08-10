@@ -2,6 +2,7 @@ import Ajv from "ajv";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { safeValidationErrors } from "./safe-validation-errors.js";
 import { MAXIMUM_EXPORT_SET_CHUNKS } from "./set-schema.js";
 
 export const EXPORT_DELETION_PLAN_VERSION = "local-export-deletion-plan-v0.1";
@@ -51,14 +52,6 @@ const validatePreflightSchema = ajv.compile(preflightSchema);
 const validateJournalSchema = ajv.compile(journalSchema);
 const validateCommitMarkerSchema = ajv.compile(commitMarkerSchema);
 const validateReceiptSchema = ajv.compile(receiptSchema);
-
-function safeValidationErrors(errors = []) {
-  return errors.slice(0, 20).map((error) => ({
-    path: error.instancePath || "/",
-    keyword: error.keyword,
-    schemaPath: error.schemaPath,
-  }));
-}
 
 function invariant(path, name) {
   return { path, keyword: "invariant", schemaPath: `#/x-invariant/${name}` };
@@ -253,4 +246,3 @@ export {
   commitMarkerSchema as exportDeletionCommitMarkerSchema,
   receiptSchema as exportDeletionReceiptSchema,
 };
-

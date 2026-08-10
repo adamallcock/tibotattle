@@ -1,9 +1,17 @@
 # Hosted running costs at 100, 1,000, 10,000, and 100,000 users
 
-> Written 2026-08-02 against `main` at `d160b72`. Cloudflare rates were read
+> Written 2026-08-02 against `main` at `d160b72`. Amended 2026-08-04 for the
+> public-upload admission controls. Cloudflare rates were read
 > from `developers.cloudflare.com` on 2026-08-01 and are cited inline. This
 > document answers one question: **can the owner afford to open the hosted
 > side to the public, and what breaks first if he does?**
+
+> **Historical capacity study, not release status.** This analysis predates
+> the current named release-channel and disabled-staging controls. It must not
+> be used to infer that any hosted service, update feed, artifact, signing
+> setup, or public enrollment path is operational. Revalidate all cost inputs
+> against the channel selected in `config/release-channels.js` before making an
+> operational decision.
 
 Every input below is labelled **MEASURED** (read from this repository, with
 `file:line`, or produced by running its own code against its own data) or
@@ -133,7 +141,7 @@ will be far lower, which is where the first assumption enters.
 ### 2.1 What is bound
 
 **MEASURED** from `apps/worker/wrangler.jsonc` (production environment,
-lines 132-226):
+lines 240-380):
 
 - one Worker on custom domains `tibotattle.com` and `www.tibotattle.com`, plus
   the `workers.dev` origin;
@@ -142,10 +150,13 @@ lines 132-226):
 - static assets served from `apps/web/public` through the `ASSETS` binding;
 - one hourly cron trigger, `"0 * * * *"`;
 - observability enabled at `head_sampling_rate: 1`;
-- two rate-limit namespaces.
-
-There is no KV, no Durable Object, no Queue, no Hyperdrive, and no Logpush
-destination.
+- eight edge Rate Limit bindings: coarse and participant-keyed
+  upload-authorization guards plus coarse and client-keyed pre-body upload
+  ingress guards;
+- one named `UploadIngressBudget` Durable Object namespace, used as an
+  environment-wide upload start/in-flight budget; and
+- no Queue, KV, Hyperdrive, or Logpush destination. Queue ingress is
+  deliberately disabled pending an R2-pointer and idempotent-consumer design.
 
 **MEASURED.** The v0.2 account-scoped contract exists but is switched off:
 `TELEMETRY_V02_ENABLED = false` (`apps/worker/src/telemetry-v0.2.ts:16`) and
@@ -398,14 +409,21 @@ as `"sparkle_signed_appcast_with_manual_dmg_fallback"`
 (`scripts/macos-release-core.js:899`). **Every update is a full ~47 MB
 download.**
 
-**MEASURED distribution channel.** The appcast target is
-`https://github.com/adamallcock/app-usagemonitor/releases/latest/download/appcast.xml`
-(`docs/runbooks/2026-07-31-v0.1.0-release-resume.md:36`). The generated
-`Info.plist` sets `SUEnableAutomaticChecks`, `SUAllowsAutomaticUpdates`,
-`SURequireSignedFeed`, and `SUVerifyUpdateBeforeExtraction`, with
-`SUAutomaticallyUpdate` false (`scripts/build-macos-app.js:1331-1349`). It does
-**not** set `SUScheduledCheckInterval`, so Sparkle's default applies —
-one appcast check per day.
+**Historical distribution assumption; current channel unavailable.** The
+former GitHub Releases appcast cited in the original analysis is retired. The
+current stable policy derives its canonical URL from
+`config/deployment-endpoints.js`, but that declaration is not proof of a live
+feed or artifact. The publisher and rehearsal gates deliberately fail closed
+until an owner provisions the atomic appcast writer and completes a signed
+N-to-N+1 rehearsal. See
+[the current publication runbook](../runbooks/2026-08-02-r2-sparkle-update-publisher.md)
+and [owner execution runbook](../runbooks/2026-08-04-owner-release-execution.md).
+
+The full-DMG size above is a historical local measurement, useful only as a
+rough bandwidth input. No current claim is made about automatic downloads,
+install-on-quit, check cadence, CDN, or public release availability. Those
+values must be measured from a signed, owner-observed channel before this cost
+model informs a launch decision.
 
 **Bandwidth per release**, assuming every installed copy takes the update:
 
@@ -416,32 +434,23 @@ one appcast check per day.
 | 10,000 | 470 GB | 470 GB | 940 GB |
 | 100,000 | 4.7 TB | 4.7 TB | 9.4 TB |
 
-Appcast polling itself is negligible: a few KB × one check/day × user count —
-about 3 GB/month even at 100,000 users, and it is served by GitHub, not
-Cloudflare.
+Any future appcast-polling cost or cache behavior is intentionally left
+unmodelled here until the owner-provisioned update channel exists and has been
+measured.
 
-**The risk.** GitHub Releases bandwidth is currently free and unmetered, and
-GitHub publishes no quota for it. GitHub's Acceptable Use Policies prohibit
-using the service as a content delivery network or for excessive bandwidth,
-without defining either. That means:
+**Retired hosting comparison, not a rollout recommendation.** The original
+GitHub Releases scenario is retained only to explain why it was rejected. It
+has no bearing on an update channel today: the current policy uses a separate
+R2-oriented endpoint, but no appcast, artifact, or atomic writer has been
+proven live.
 
-- there is no number to plan against, and no warning threshold to monitor;
-- 4.7 TB/month from one repository at 100,000 users is squarely in the
-  territory where a manual review is plausible;
-- if GitHub throttles or disables the release assets, **the entire update
-  channel goes down at once**. Sparkle would simply stop finding updates, and
-  every installed copy would silently stop receiving security fixes. There is
-  no fallback host configured.
-
-**The fix is nearly free.** R2 egress is $0
-([R2 pricing](https://developers.cloudflare.com/r2/pricing/), footnote 1:
-"Egressing directly from R2 … does not incur data transfer (egress) charges and
-is free"). Hosting `appcast.xml` and the DMG in R2 would cost, at 100,000
-users and one release/month: ~50 MB of storage (free, inside the 10 GB-month
-allowance) + 100,000 Class B `GetObject` operations per release (free, inside
-the 10-million allowance) + 3M appcast GETs/month (free). **Total: $0.**
-Moving update hosting to R2 removes the single largest uncontrolled dependency
-in the product for no additional cost.
+**Candidate direction requires a fresh pricing and availability review.** R2
+remains the intended storage boundary once the owner-provisioned channel is
+ready, but the historical "$0" calculation must not be used for budgeting or
+as a claim that hosting is configured. Before any launch decision, re-read
+current provider pricing, measure the actual signed DMG and polling cadence,
+and record the observed limits, cache behavior, and fallback plan in the
+release evidence.
 
 ---
 
@@ -507,8 +516,12 @@ Two caveats carried forward from that reading:
   two rows written: one to the table itself, and one to the index."
 - **The rate-limiting binding has no published meter.** Cloudflare's docs are
   silent on whether `ratelimits` is billed separately. This model assumes it is
-  bundled into standard Workers pricing, which is **unverified**. Two
-  namespaces at 20 requests/60 s are unlikely to be material either way.
+  bundled into standard Workers pricing, which is **unverified**. The eight
+  current bindings are unlikely to be material either way.
+- **This pre-admission cost model now excludes Durable Object RPC/storage.**
+  One short-lived lease is acquired and released for each accepted upload. Do
+  not use the numeric totals here as a public capacity ceiling until that
+  addition has been measured against the deployed plan and traffic shape.
 
 ### Where each resource crosses from free into paid
 
@@ -899,9 +912,8 @@ silence for a value.
    The R2 pricing page names only the singular form as free. Since deletes
    appear in neither the Class A nor the Class B list, this is assumed free at
    any batch size; unverified.
-8. **GitHub's actual fair-use bandwidth threshold for Releases.** Undocumented
-   by GitHub. §4 states the risk rather than a number, because there is no
-   number to state.
+8. **Retired GitHub Releases fair-use threshold.** This input belongs only to
+   the superseded hosting scenario and is not a current release dependency.
 9. **The exact DMG size.** No `.dmg` exists in the working tree. The ~47 MB
    figure is derived from a measured 145 MB app bundle and a measured 43.9 MB
    gzip of its dominant component; DMG container overhead was not measured.

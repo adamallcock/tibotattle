@@ -19,8 +19,16 @@ import {
   rebuildPendingCommunityWeeklySnapshots,
 } from "../src/community-snapshots";
 import {
+  hasDeletionTombstone,
+  hasIdentityReenrollmentCooldown,
+  hasIdentityReenrollmentCooldownDigest,
+  identityReenrollmentCooldownDigest,
   participantDeletionDigest,
+  purgeExpiredDeletionTombstones,
+  purgeExpiredIdentityReenrollmentCooldowns,
+  purgeExpiredPrimaryIdentityReenrollmentCooldowns,
   recordDeletionTombstone,
+  recordPrimaryIdentityReenrollmentCooldown,
   runBackendLifecycle,
 } from "../src/retention";
 import {
@@ -39,6 +47,10 @@ interface OptionalAdminBinding {
   ADMIN_IDENTITY_LINK_KEY?: string;
 }
 
+interface OptionalDeploymentIdentityBinding {
+  DEPLOYMENT_SOURCE_COMMIT?: string;
+}
+
 interface EnrollmentResponse {
   participantId: string;
   recoveryCode: string;
@@ -54,12 +66,17 @@ function recoveryAttemptId(): string {
   return `um_recovery_attempt_${encodeBase64Url(crypto.getRandomValues(new Uint8Array(32)))}`;
 }
 
-function testBindings(overrides: Partial<Env & OptionalAdminBinding> = {}): Env {
+function testBindings(
+  overrides: Partial<
+    Env & OptionalAdminBinding & OptionalDeploymentIdentityBinding
+  > = {},
+): Env {
   const bindings = env as TestBindings;
   return {
     ASSETS: bindings.ASSETS,
     DELETION_LEDGER: bindings.DELETION_LEDGER,
     ENROLLMENT_MODE: bindings.ENROLLMENT_MODE,
+    SIGN_IN_START_MAX_PER_MINUTE: "1200",
     ENROLLMENT_RATE_LIMIT: bindings.ENROLLMENT_RATE_LIMIT,
     CLIENT_ATTEMPT_RATE_LIMIT: bindings.CLIENT_ATTEMPT_RATE_LIMIT,
     ENVELOPE_PRIVATE_JWK: privateJwkJson,
@@ -69,6 +86,21 @@ function testBindings(overrides: Partial<Env & OptionalAdminBinding> = {}): Env 
     QUARANTINE: bindings.QUARANTINE,
     PUBLIC_READ_RATE_LIMIT: bindings.PUBLIC_READ_RATE_LIMIT,
     RECOVERY_RATE_LIMIT: bindings.RECOVERY_RATE_LIMIT,
+    UPLOAD_AUTHORIZATION_RATE_LIMIT: bindings.UPLOAD_AUTHORIZATION_RATE_LIMIT,
+    UPLOAD_PRINCIPAL_RATE_LIMIT: bindings.UPLOAD_PRINCIPAL_RATE_LIMIT,
+    UPLOAD_INGRESS_REQUEST_RATE_LIMIT:
+      bindings.UPLOAD_INGRESS_REQUEST_RATE_LIMIT,
+    UPLOAD_INGRESS_CLIENT_RATE_LIMIT:
+      bindings.UPLOAD_INGRESS_CLIENT_RATE_LIMIT,
+    UPLOAD_INGRESS_BUDGET: bindings.UPLOAD_INGRESS_BUDGET,
+    UPLOAD_INGRESS_QUEUE_MODE: bindings.UPLOAD_INGRESS_QUEUE_MODE,
+    UPLOAD_INGRESS_MAX_CONCURRENT: bindings.UPLOAD_INGRESS_MAX_CONCURRENT,
+    UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE:
+      bindings.UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE,
+    UPLOAD_INGRESS_BURST: bindings.UPLOAD_INGRESS_BURST,
+    UPLOAD_INGRESS_LEASE_SECONDS: bindings.UPLOAD_INGRESS_LEASE_SECONDS,
+    UPLOAD_INGRESS_BODY_TOTAL_SECONDS: "60",
+    UPLOAD_INGRESS_BODY_IDLE_SECONDS: "15",
     USAGE_MONITOR_DB: bindings.USAGE_MONITOR_DB,
     ...overrides,
   } as Env;
@@ -311,6 +343,7 @@ async function encryptRaw(
 async function registerUpload(
   participant: EnrollmentResponse,
   rawEnvelope: string,
+  runtimeEnv = testBindings(),
 ): Promise<{ uploadAuthorization: string; expiresAt: string }> {
   const response = await api("/api/v1/me/upload-authorizations", {
     method: "POST",
@@ -323,7 +356,7 @@ async function registerUpload(
       contentLengthBytes: new TextEncoder().encode(rawEnvelope).byteLength,
       contentType: "application/json",
     }),
-  });
+  }, runtimeEnv);
   expect(response.status).toBe(201);
   return response.json<{ uploadAuthorization: string; expiresAt: string }>();
 }
@@ -579,7 +612,7 @@ async function seedSealedSuppressedSnapshot(): Promise<void> {
  */
 async function seedPublishedSnapshotWithNoCells(): Promise<void> {
   const payload = JSON.stringify({
-    schemaVersion: "community-weekly-snapshot-v0.2",
+    schemaVersion: "community-weekly-snapshot-v0.3",
     snapshotId: "community-weekly:2026-07-20",
     snapshotRevision: 1,
     releaseStatus: "published",
@@ -1406,9 +1439,21 @@ describe("synthetic usage monitor service", () => {
       GOOGLE_OIDC_CLIENT_ID: GOOGLE_CLIENT,
       APPLE_SERVICES_ID: APPLE_CLIENT,
       IDENTITY_LINK_SECRET: "identity-link-secret-for-tests-0123456789abcdef",
+      IDENTITY_LINK_SECRET_VERSION: "test-v1",
       ...overrides,
     } as unknown as Partial<Env>);
   }
+
+  function configuredIdentityLinkSecret(runtimeEnv: Env): string {
+    const secret = runtimeEnv.IDENTITY_LINK_SECRET;
+    if (typeof secret !== "string") throw new Error("identity test secret missing");
+    return secret;
+  }
+
+  // The initiating client holds this verifier; the delivered handoff carries
+  // SHA-256(verifier) as its binding, and enrollment must re-present the raw
+  // verifier to consume the proof.
+  const HOSTED_IDENTITY_TEST_VERIFIER = "z".repeat(64);
 
   async function deliveredHostedProof(
     runtimeEnv: Env,
@@ -1417,20 +1462,38 @@ describe("synthetic usage monitor service", () => {
   ): Promise<string> {
     const state = encodeBase64Url(crypto.getRandomValues(new Uint8Array(48)));
     const proof = encodeBase64Url(crypto.getRandomValues(new Uint8Array(48)));
+    const bindingHash = await sha256Hex(HOSTED_IDENTITY_TEST_VERIFIER);
     const now = new Date();
     const expiresAt = new Date(now.getTime() + 5 * 60 * 1_000).toISOString();
     if (provider === "apple") {
       await runtimeEnv.USAGE_MONITOR_DB.prepare(
         `INSERT INTO apple_signin_handoffs
-           (state, identity_link_key, proof, created_at, expires_at, delivered_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      ).bind(state, linkKeyHex, proof, now.toISOString(), expiresAt, now.toISOString()).run();
+           (state, nonce_hash, binding_hash, identity_link_key, proof, created_at, expires_at, delivered_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        state,
+        "a".repeat(64),
+        bindingHash,
+        linkKeyHex,
+        proof,
+        now.toISOString(),
+        expiresAt,
+        now.toISOString(),
+      ).run();
     } else {
       await runtimeEnv.USAGE_MONITOR_DB.prepare(
         `INSERT INTO google_signin_handoffs
-           (state, code_verifier, identity_link_key, proof, created_at, expires_at, delivered_at)
-         VALUES (?, NULL, ?, ?, ?, ?, ?)`,
-      ).bind(state, linkKeyHex, proof, now.toISOString(), expiresAt, now.toISOString()).run();
+           (state, code_verifier, binding_hash, identity_link_key, proof, created_at, expires_at, delivered_at)
+         VALUES (?, NULL, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        state,
+        bindingHash,
+        linkKeyHex,
+        proof,
+        now.toISOString(),
+        expiresAt,
+        now.toISOString(),
+      ).run();
     }
     return proof;
   }
@@ -1454,9 +1517,42 @@ describe("synthetic usage monitor service", () => {
             provider as "apple" | "google",
             linkKeyHex,
           ),
+          verifier: HOSTED_IDENTITY_TEST_VERIFIER,
         },
       }),
     }, effectiveEnv);
+  }
+
+  async function enrollMatureOpenCohortParticipant(
+    index: number,
+    runtimeEnv: Env,
+  ): Promise<EnrollmentResponse> {
+    const response = await identityEnroll(
+      await sha256Hex(`open-community-cohort-${index}`),
+      "google",
+      runtimeEnv,
+    );
+    expect(response.status).toBe(201);
+    const participant = await enrollmentFrom(response);
+    await runtimeEnv.USAGE_MONITOR_DB.prepare(
+      "UPDATE participants SET created_at = ? WHERE id = ?",
+    ).bind("2026-07-01T00:00:00.000Z", participant.participantId).run();
+    return participant;
+  }
+
+  async function uploadTelemetryAt(
+    participant: EnrollmentResponse,
+    telemetry: Record<string, unknown>,
+    createdAt: string,
+  ): Promise<{ contributionId: string }> {
+    Reflect.set(telemetry, "createdAt", createdAt);
+    const response = await uploadEnvelope(participant, await encrypt(telemetry, true));
+    expect(response.status).toBe(202);
+    const receipt = await response.json<{ contributionId: string }>();
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      "UPDATE telemetry_contributions SET created_at = ? WHERE id = ?",
+    ).bind(createdAt, receipt.contributionId).run();
+    return receipt;
   }
 
   it("enrolls open-mode production participants with grant-backed eligibility", async () => {
@@ -1477,6 +1573,7 @@ describe("synthetic usage monitor service", () => {
             "google",
             await sha256Hex("test-open-mode-primary"),
           ),
+          verifier: HOSTED_IDENTITY_TEST_VERIFIER,
         },
       }),
     }, env);
@@ -1510,6 +1607,7 @@ describe("synthetic usage monitor service", () => {
             "google",
             await sha256Hex("test-open-mode-synthetic"),
           ),
+          verifier: HOSTED_IDENTITY_TEST_VERIFIER,
         },
       }),
     }, env);
@@ -1682,6 +1780,18 @@ describe("synthetic usage monitor service", () => {
         CLIENT_ATTEMPT_RATE_LIMIT: allowedLimiter,
       }));
       expect(signInStart.status).toBe(503);
+      const deviceDisconnect = await api("/api/v1/device/disconnect", {
+        method: "POST",
+        headers: {
+          "cf-connecting-ip": "203.0.113.9",
+          authorization: "Device um_device_00000000-0000-4000-8000-000000000000.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        },
+      }, testBindings({
+        RECOVERY_RATE_LIMIT: allowedLimiter,
+        CLIENT_ATTEMPT_RATE_LIMIT: clientBlockedLimiter,
+        IDENTITY_LINK_SECRET: "rate-limit-secret-for-tests-0123456789abcdef",
+      }));
+      expect(deviceDisconnect.status).toBe(429);
       const malformedPath = await api(
         "/api/v1/contributions/PRIVATE_PATH_CANARY",
         { headers: { authorization: "Bearer PRIVATE_CAPABILITY_CANARY" } },
@@ -1696,14 +1806,15 @@ describe("synthetic usage monitor service", () => {
     );
     expect(limiterKeys).toContain("usage-monitor:recovery:global");
     expect(limiterKeys).toContain("usage-monitor:sign_in_start:global");
+    expect(limiterKeys).toContain("usage-monitor:device_disconnect:global");
     const clientKeys = limiterKeys.filter((key) => key.includes(":client:"));
-    expect(clientKeys).toHaveLength(3);
+    expect(clientKeys).toHaveLength(4);
     for (const key of clientKeys) {
       expect(key).toMatch(/:client:[0-9a-f]{64}$/u);
       expect(key).not.toContain("PRIVATE_IP_CANARY");
       expect(key).not.toContain("203.0.113.9");
     }
-    expect(new Set(clientKeys).size).toBe(3);
+    expect(new Set(clientKeys).size).toBe(4);
     expect(warnings.join("\n")).not.toContain("PRIVATE_PATH_CANARY");
     expect(warnings.join("\n")).not.toContain("PRIVATE_CAPABILITY_CANARY");
     const attemptsTable = await testBindings().USAGE_MONITOR_DB.prepare(
@@ -1711,6 +1822,225 @@ describe("synthetic usage monitor service", () => {
         WHERE type = 'table' AND name LIKE '%attempt%'`,
     ).first<{ total: number }>();
     expect(attemptsTable?.total).toBe(0);
+  });
+
+  it("limits upload authorization before parsing the body and never places a participant identifier in the rate key", async () => {
+    const participant = await enroll();
+    const limiterKeys: string[] = [];
+    const allowedLimiter = {
+      async limit(input: { key: string }): Promise<{ success: boolean }> {
+        limiterKeys.push(input.key);
+        return { success: true };
+      },
+    } satisfies RateLimit;
+    const blockedPrincipalLimiter = {
+      async limit(input: { key: string }): Promise<{ success: boolean }> {
+        limiterKeys.push(input.key);
+        return { success: false };
+      },
+    } satisfies RateLimit;
+
+    const response = await api("/api/v1/me/upload-authorizations", {
+      method: "POST",
+      headers: {
+        ...personalHeaders(participant, { csrf: true }),
+        "content-type": "application/json",
+      },
+      // A limiter rejection must win over this malformed request body.
+      body: "{",
+    }, testBindings({
+      UPLOAD_AUTHORIZATION_RATE_LIMIT: allowedLimiter,
+      UPLOAD_PRINCIPAL_RATE_LIMIT: blockedPrincipalLimiter,
+      IDENTITY_LINK_SECRET: "rate-limit-secret-for-tests-0123456789abcdef",
+    }));
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("60");
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "UPLOAD_ADMISSION_LIMIT_REACHED" },
+    });
+    expect(limiterKeys).toEqual([
+      "usage-monitor:upload_authorization:global",
+      expect.stringMatching(
+        /^usage-monitor:upload_authorization:participant:[0-9a-f]{64}$/u,
+      ),
+    ]);
+    expect(limiterKeys.join("\n")).not.toContain(participant.cookie);
+    expect(limiterKeys.join("\n")).not.toContain(participant.participantId);
+  });
+
+  it("returns the shared-ingress retry deadline without consuming a token that could not enter", async () => {
+    const participant = await enroll();
+    const rawEnvelope = JSON.stringify(await encrypt(syntheticFixture()));
+    const authorization = await registerUpload(participant, rawEnvelope);
+    const blockedBudget = {
+      getByName() {
+        return {
+          async acquire() {
+            return {
+              allowed: false,
+              leaseId: null,
+              retryAfterSeconds: 23,
+            };
+          },
+          async release() {},
+        };
+      },
+    } as unknown as Env["UPLOAD_INGRESS_BUDGET"];
+
+    const rejected = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${authorization.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: rawEnvelope,
+    }, testBindings({ UPLOAD_INGRESS_BUDGET: blockedBudget }));
+    expect(rejected.status).toBe(429);
+    expect(rejected.headers.get("retry-after")).toBe("23");
+    await expect(rejected.json()).resolves.toMatchObject({
+      error: { code: "UPLOAD_INGRESS_LIMIT_REACHED" },
+    });
+
+    const replay = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${authorization.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: rawEnvelope,
+    });
+    expect(replay.status).toBe(202);
+    await expect(replay.json()).resolves.toMatchObject({
+      status: "accepted_synthetic",
+    });
+  });
+
+  it("sheds a valid-looking public upload before its body is consumed or token claimed", async () => {
+    const participant = await enroll();
+    const rawEnvelope = JSON.stringify(await encrypt(syntheticFixture()));
+    const authorization = await registerUpload(participant, rawEnvelope);
+    const allowedLimiter = {
+      async limit(): Promise<{ success: boolean }> { return { success: true }; },
+    } satisfies RateLimit;
+    const blockedLimiter = {
+      async limit(): Promise<{ success: boolean }> { return { success: false }; },
+    } satisfies RateLimit;
+    const rawRequest = new Request("https://example.test/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${authorization.uploadAuthorization}`,
+        "content-type": "application/json",
+        "cf-connecting-ip": "203.0.113.7",
+      },
+      body: rawEnvelope,
+    });
+    let bodyReaderRequested = false;
+    const request = new Proxy(rawRequest, {
+      get(target, property) {
+        const value = Reflect.get(target, property, target);
+        if (property !== "body" || value === null) {
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+        return new Proxy(value as ReadableStream<Uint8Array>, {
+          get(stream, streamProperty) {
+            const streamValue = Reflect.get(stream, streamProperty, stream);
+            if (streamProperty === "getReader") {
+              return (...args: unknown[]) => {
+                bodyReaderRequested = true;
+                return Reflect.apply(
+                  streamValue as (...inner: unknown[]) => unknown,
+                  stream,
+                  args,
+                );
+              };
+            }
+            return typeof streamValue === "function"
+              ? streamValue.bind(stream) : streamValue;
+          },
+        });
+      },
+    }) as Request;
+    const rejected = await handleRequest(request, testBindings({
+      UPLOAD_INGRESS_REQUEST_RATE_LIMIT: allowedLimiter,
+      UPLOAD_INGRESS_CLIENT_RATE_LIMIT: blockedLimiter,
+      IDENTITY_LINK_SECRET: "rate-limit-secret-for-tests-0123456789abcdef",
+    }));
+    expect(rejected.status).toBe(429);
+    expect(rejected.headers.get("retry-after")).toBe("60");
+    expect(bodyReaderRequested).toBe(false);
+
+    const retry = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${authorization.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: rawEnvelope,
+    });
+    expect(retry.status).toBe(202);
+  });
+
+  it("does not issue upload tokens or report traffic ready when ingress is misconfigured", async () => {
+    const participant = await enroll();
+    const broken = testBindings({
+      UPLOAD_INGRESS_QUEUE_MODE: "queues" as unknown as Env["UPLOAD_INGRESS_QUEUE_MODE"],
+    });
+    const registration = await api("/api/v1/me/upload-authorizations", {
+      method: "POST",
+      headers: {
+        ...personalHeaders(participant, { csrf: true }),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        envelopeDigest: "a".repeat(64),
+        contentLengthBytes: 10,
+        contentType: "application/json",
+      }),
+    }, broken);
+    expect(registration.status).toBe(503);
+    await expect(registration.json()).resolves.toMatchObject({
+      error: { code: "ADMISSION_CONFIGURATION_INVALID" },
+    });
+    const ready = await api("/api/ready", {}, broken);
+    expect(ready.status).toBe(503);
+    await expect(ready.json()).resolves.toMatchObject({
+      error: { code: "ADMISSION_CONFIGURATION_INVALID" },
+    });
+  });
+
+  it("maps a failed upload admission binding to a retryable service response", async () => {
+    const participant = await enroll();
+    const unavailable = {
+      async limit(): Promise<{ success: boolean }> {
+        throw new Error("rate binding unavailable");
+      },
+    } satisfies RateLimit;
+    const response = await api("/api/v1/me/upload-authorizations", {
+      method: "POST",
+      headers: {
+        ...personalHeaders(participant, { csrf: true }),
+        "content-type": "application/json",
+      },
+      body: "{",
+    }, testBindings({
+      UPLOAD_AUTHORIZATION_RATE_LIMIT: unavailable,
+    }));
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("60");
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "UPLOAD_INGRESS_UNAVAILABLE" },
+    });
+  });
+
+  it("fails health closed if Queue ingress is enabled before its protocol is implemented", async () => {
+    const response = await api("/api/health", {}, testBindings({
+      UPLOAD_INGRESS_QUEUE_MODE: "queues" as unknown as Env["UPLOAD_INGRESS_QUEUE_MODE"],
+    }));
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "ADMISSION_CONFIGURATION_INVALID" },
+    });
   });
 
   it("publishes the configured public key and a non-sensitive health result", async () => {
@@ -1750,6 +2080,11 @@ describe("synthetic usage monitor service", () => {
           status: "implementation_disabled",
           externalParticipantsAuthorized: false,
         },
+        incrementalContribution: {
+          schemaVersion: "telemetry-contribution-v1.0",
+          status: "implementation_ready",
+          externalParticipantsAuthorized: false,
+        },
       },
       capabilities: {
         encryptedUpload: true,
@@ -1762,7 +2097,28 @@ describe("synthetic usage monitor service", () => {
         boundedQuarantineRetention: true,
         deletionSafeRestoreReplay: true,
         ongoingDeviceUploadRegistration: true,
+        coordinatedSignInAdmission: true,
       },
+    });
+  });
+
+  it("exposes the validated non-secret deployment source commit when configured", async () => {
+    const response = await api("/api/health", {}, testBindings({
+      DEPLOYMENT_SOURCE_COMMIT: "c26823c",
+    }));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      deployment: { sourceCommit: "c26823c" },
+    });
+  });
+
+  it("fails health closed for an invalid configured deployment source commit", async () => {
+    const response = await api("/api/health", {}, testBindings({
+      DEPLOYMENT_SOURCE_COMMIT: "not-a-commit",
+    }));
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "DEPLOYMENT_SOURCE_COMMIT_INVALID" },
     });
   });
 
@@ -1861,7 +2217,10 @@ describe("synthetic usage monitor service", () => {
       ownerEnv,
     );
     expect(overview.status).toBe(200);
-    await expect(overview.json()).resolves.toMatchObject({
+    const overviewBody = await overview.json<{
+      ingress: { lastDeniedAt: unknown } | null;
+    }>();
+    expect(overviewBody).toMatchObject({
       schemaVersion: "admin-overview-v0.1",
       collection: {
         state: "operational",
@@ -1871,13 +2230,51 @@ describe("synthetic usage monitor service", () => {
         publication: true,
       },
       counts: {
-        participants: { active: 1 },
+        participants: {
+          active: 1,
+          enrolledLast24Hours: 1,
+          enrolledLast7Days: 1,
+        },
         contributions: {
-          telemetry: { total: 0 },
+          telemetry: {
+            total: 0,
+            acceptedLast24Hours: 0,
+            acceptedLast7Days: 0,
+          },
           storedTelemetryRecords: 0,
         },
       },
+      // The shared Durable Object runtime may carry leases or denials from
+      // sibling tests; only the configured capacities are deterministic here.
+      ingress: {
+        maximumConcurrent: 64,
+        burst: 1200,
+        activeLeases: expect.any(Number),
+        availableStartTokens: expect.any(Number),
+        concurrencyDenials: expect.any(Number),
+        startRateDenials: expect.any(Number),
+      },
       errors: { sampled: true, capacity: 256 },
+    });
+    expect([null, expect.any(String)]).toContainEqual(
+      overviewBody.ingress?.lastDeniedAt,
+    );
+
+    // Losing the ingress budget binding must degrade the pressure section to
+    // null, never take the rest of the authenticated overview down.
+    const overviewWithoutBudget = await api(
+      "/api/v1/admin/overview",
+      { headers: personalHeaders(participant) },
+      testBindings({
+        ADMIN_IDENTITY_LINK_KEY: adminIdentityKey,
+        UPLOAD_INGRESS_BUDGET:
+          undefined as unknown as Env["UPLOAD_INGRESS_BUDGET"],
+      }),
+    );
+    expect(overviewWithoutBudget.status).toBe(200);
+    await expect(overviewWithoutBudget.json()).resolves.toMatchObject({
+      schemaVersion: "admin-overview-v0.1",
+      ingress: null,
     });
 
     const csrfRejected = await api(
@@ -1928,6 +2325,24 @@ describe("synthetic usage monitor service", () => {
       outcome: "success",
     });
     expect(audit?.details_json).toContain("maintenance");
+
+    // A damaged persisted audit payload must not take the owner dashboard
+    // down. The read path should return a bounded null detail instead.
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      `UPDATE admin_action_audit
+          SET details_json = ?
+        WHERE action = ? AND outcome = ?`,
+    ).bind("{malformed", "set_collection_controls", "success").run();
+    const overviewWithCorruptAudit = await api(
+      "/api/v1/admin/overview",
+      { headers: personalHeaders(participant) },
+      ownerEnv,
+    );
+    expect(overviewWithCorruptAudit.status).toBe(200);
+    const corruptAuditBody = await overviewWithCorruptAudit.json<{
+      audit: Array<{ details: unknown }>;
+    }>();
+    expect(corruptAuditBody.audit[0]?.details).toBeNull();
 
     const conflict = await api(
       "/api/v1/admin/action",
@@ -2322,7 +2737,9 @@ describe("synthetic usage monitor service", () => {
       },
       body: "{",
     });
-    expect(malformedJson.status).toBe(400);
+    // An unauthenticated header is rejected before a public request's JSON is
+    // parsed; malformed bodies cannot become an unlimited CPU work surface.
+    expect(malformedJson.status).toBe(401);
 
     const extraEnvelope = {
       ...(await encrypt(syntheticFixture())),
@@ -2655,7 +3072,8 @@ describe("synthetic usage monitor service", () => {
     const repriced = await testBindings().USAGE_MONITOR_DB.prepare(
       `SELECT server_cost_usd, server_cost_nanousd, server_pricing_status,
               server_pricing_method_version, server_price_registry_sha256,
-              server_price_card_ids, server_tier_basis, server_api_service_tier,
+              server_price_card_ids, server_price_basis, server_price_epoch_basis,
+              server_price_event_time, server_tier_basis, server_api_service_tier,
               speed_mode, api_service_tier
          FROM telemetry_records
         WHERE participant_id = ? AND record_kind = 'usage'`,
@@ -2666,6 +3084,9 @@ describe("synthetic usage monitor service", () => {
       server_pricing_method_version: string;
       server_price_registry_sha256: string;
       server_price_card_ids: string;
+      server_price_basis: string;
+      server_price_epoch_basis: string;
+      server_price_event_time: string;
       server_tier_basis: string;
       server_api_service_tier: string;
       speed_mode: string;
@@ -2675,15 +3096,19 @@ describe("synthetic usage monitor service", () => {
       server_cost_usd: "0.0032",
       server_cost_nanousd: 3_200_000,
       server_pricing_status: "fully_priced",
-      server_pricing_method_version: "server-api-price-equivalent-v0.1",
+      server_pricing_method_version: "server-api-price-equivalent-v0.2",
+      server_price_basis: "historical_api_prices",
+      server_price_epoch_basis: "event_time_when_registry_has_effective_evidence",
+      server_price_event_time: "2026-07-25T12:05:00.000Z",
       server_tier_basis: "subscription_standard_counterfactual",
       server_api_service_tier: "standard",
       speed_mode: "fast",
       api_service_tier: "priority",
     });
     expect(repriced?.server_price_registry_sha256).toMatch(/^[a-f0-9]{64}$/u);
-    expect(repriced?.server_price_card_ids).toContain(":standard:");
-    expect(repriced?.server_price_card_ids).not.toContain(":priority:");
+    expect(repriced?.server_price_card_ids).toBe(
+      '["openai:gpt-5.6-sol:standard:short:official-observed-2026-08-01"]',
+    );
 
     const replay = await uploadEnvelope(participant, firstEnvelope);
     expect(replay.headers.get("idempotency-replayed")).toBe("true");
@@ -2754,6 +3179,15 @@ describe("synthetic usage monitor service", () => {
             endAt: "2026-07-25T12:30:00.000Z",
           },
           clientPlatform: "macos",
+          serverAccounting: {
+            apiPriceEquivalentUsd: "0.0032",
+            priceBasis: "historical_api_prices",
+            priceEpochBasis: "event_time_when_registry_has_effective_evidence",
+            eventTimeRange: {
+              startAt: "2026-07-25T12:05:00.000Z",
+              endAt: "2026-07-25T12:05:00.000Z",
+            },
+          },
           recordCounts: { declared: 2, accepted: 2, deduplicated: 0 },
           quarantine: {
             state: "retained",
@@ -2773,7 +3207,9 @@ describe("synthetic usage monitor service", () => {
       `SELECT id, declared_record_count, accepted_record_count,
               server_priced_event_count,
               server_partially_priced_event_count,
-              server_unpriced_event_count
+              server_unpriced_event_count, server_price_basis,
+              server_price_epoch_basis, server_price_event_time_start,
+              server_price_event_time_end
          FROM telemetry_contributions
         WHERE participant_id = ?
         ORDER BY created_at, id`,
@@ -2784,6 +3220,10 @@ describe("synthetic usage monitor service", () => {
       server_priced_event_count: number;
       server_partially_priced_event_count: number;
       server_unpriced_event_count: number;
+      server_price_basis: string;
+      server_price_epoch_basis: string;
+      server_price_event_time_start: string;
+      server_price_event_time_end: string;
     }>();
     expect(contributionRows.results).toMatchObject([
       {
@@ -2791,6 +3231,11 @@ describe("synthetic usage monitor service", () => {
         declared_record_count: 2,
         accepted_record_count: 2,
         server_priced_event_count: 1,
+        server_unpriced_event_count: 0,
+        server_price_basis: "historical_api_prices",
+        server_price_epoch_basis: "event_time_when_registry_has_effective_evidence",
+        server_price_event_time_start: "2026-07-25T12:05:00.000Z",
+        server_price_event_time_end: "2026-07-25T12:05:00.000Z",
       },
       {
         id: secondAccepted.contributionId,
@@ -2846,7 +3291,7 @@ describe("synthetic usage monitor service", () => {
     for (const forbidden of [
       "r2_key", "plaintext_digest", "envelope_digest", "datasetId",
       "accountTrackId", "eligibilityUnitId", "recoveryCode", "csrfToken",
-      "\"accounting\"", "registrySha256", "priceBasis",
+      "\"accounting\"", "registrySha256",
     ]) {
       expect(profileText).not.toContain(forbidden);
     }
@@ -2908,7 +3353,7 @@ describe("synthetic usage monitor service", () => {
 
     const community = await api("/api/v1/community/insights");
     await expect(community.json()).resolves.toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.2",
+      schemaVersion: "community-weekly-snapshot-v0.3",
       releaseStatus: "not_yet_published",
       reason: "stable_snapshot_unavailable",
     });
@@ -2951,6 +3396,85 @@ describe("synthetic usage monitor service", () => {
     });
   });
 
+  it("persists January history as priced with pre-repricing window provenance", async () => {
+    const participant = await enrollTelemetry();
+    const january = telemetryFixture("e");
+    Reflect.set(january, "createdAt", "2026-01-15T12:30:00.000Z");
+    Reflect.set(january, "coveredAt", {
+      startAt: "2026-01-15T12:00:00.000Z",
+      endAt: "2026-01-15T12:30:00.000Z",
+    });
+    Reflect.set(january, "providerPolicyEpoch", "openai_pre_agentic_pool_2026_07_09");
+    const usage = Reflect.get(january, "usageEvents") as Array<Record<string, unknown>>;
+    usage[0]!.eventTime = "2026-01-15T12:05:00.000Z";
+    usage[0]!.accounting = {
+      estimatedApiCostUsd: null,
+      pricingCoveragePercent: 0,
+      unknownBillableUnits: 0,
+      priceBasis: "unpriced",
+    };
+    Reflect.set(january, "accounting", {
+      estimatedApiCostUsd: null,
+      pricedEventCoveragePercent: 0,
+      unknownModelEventCount: 0,
+      unknownBillableUnits: 0,
+      priceBasis: "unpriced",
+    });
+    const quota = Reflect.get(january, "quotaSnapshots") as Array<Record<string, unknown>>;
+    quota[0]!.observedTime = "2026-01-15T12:10:00.000Z";
+    quota[0]!.receivedTime = "2026-01-15T12:10:01.000Z";
+    quota[0]!.resetsAt = "2026-01-22T12:00:00.000Z";
+
+    const uploaded = await uploadEnvelope(
+      participant,
+      await encrypt(january, true),
+    );
+    expect(uploaded.status).toBe(202);
+    const row = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT server_cost_usd, server_pricing_status, server_price_basis,
+              server_price_epoch_basis, server_price_event_time,
+              server_price_card_ids
+         FROM telemetry_records
+        WHERE participant_id = ? AND record_kind = 'usage'`,
+    ).bind(participant.participantId).first<{
+      server_cost_usd: string;
+      server_pricing_status: string;
+      server_price_basis: string;
+      server_price_epoch_basis: string;
+      server_price_event_time: string;
+      server_price_card_ids: string;
+    }>();
+    // The reviewed GPT-5.6 Sol card carries no vendor-effective boundary, so a
+    // January instant is inside its validity window and is priced from it.
+    expect(row).toEqual({
+      server_cost_usd: "0.0032",
+      server_pricing_status: "fully_priced",
+      server_price_basis: "historical_api_prices",
+      server_price_epoch_basis: "event_time_when_registry_has_effective_evidence",
+      server_price_event_time: "2026-01-15T12:05:00.000Z",
+      server_price_card_ids:
+        '["openai:gpt-5.6-sol:standard:short:official-observed-2026-08-01"]',
+    });
+
+    const profile = await api("/api/v1/me", {
+      headers: personalHeaders(participant),
+    });
+    await expect(profile.json()).resolves.toMatchObject({
+      contributions: [{
+        serverAccounting: {
+          apiPriceEquivalentUsd: "0.0032",
+          priceBasis: "historical_api_prices",
+          priceEpochBasis: "event_time_when_registry_has_effective_evidence",
+          eventTimeRange: {
+            startAt: "2026-01-15T12:05:00.000Z",
+            endAt: "2026-01-15T12:05:00.000Z",
+          },
+          verification: "server_repriced",
+        },
+      }],
+    });
+  });
+
   it("refuses a rolling quota conversion when account continuity was not transmitted", async () => {
     const participant = await enrollTelemetry();
     const first = await uploadEnvelope(
@@ -2990,6 +3514,8 @@ describe("synthetic usage monitor service", () => {
         rows: unknown[];
       };
     }>();
+    // Both July events are priced from the reviewed registry; the rolling
+    // quota conversion is refused on account continuity, not on price cover.
     expect(stats.totals.apiPriceEquivalentUsd).toBe("0.0064");
     expect(stats.rollingQuotaMovement).toMatchObject({
       status: "not_testable",
@@ -3119,7 +3645,7 @@ describe("synthetic usage monitor service", () => {
     expect(response.status).toBe(200);
     const body = await response.json<Record<string, unknown>>();
     expect(body).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.2",
+      schemaVersion: "community-weekly-snapshot-v0.3",
       releaseStatus: "not_yet_published",
       reason: "stable_snapshot_unavailable",
     });
@@ -3252,30 +3778,36 @@ describe("synthetic usage monitor service", () => {
     let participantToDelete: EnrollmentResponse | null = null;
     let contributionToDelete = "";
     const cohort: EnrollmentResponse[] = [];
-    for (let index = 0; index < 20; index += 1) {
-      const grant = await issueTestGrant();
-      const enrolled = await enrollWithGrant(grant);
-      expect(enrolled.status).toBe(201);
-      const participant = await enrollmentFrom(enrolled);
-      cohort.push(participant);
-      participantToDelete ??= participant;
-      const contribution = await uploadEnvelope(
-        participant,
-        await encrypt(telemetryFixture("a"), true),
-      );
-      expect(contribution.status).toBe(202);
-      const contributionBody = await contribution.json<{ contributionId: string }>();
-      await testBindings().USAGE_MONITOR_DB.prepare(
-        "UPDATE telemetry_contributions SET created_at = ? WHERE id = ?",
-      ).bind(
-        "2026-07-28T23:59:59.000Z",
-        contributionBody.contributionId,
-      ).run();
-      if (index === 0) contributionToDelete = contributionBody.contributionId;
-    }
     const unmeteredLimiter = {
       limit: async () => ({ success: true }),
     } as unknown as RateLimit;
+    const openCohortEnv = identityBindings({
+      ENROLLMENT_MODE: "open" as Env["ENROLLMENT_MODE"],
+      ENROLLMENT_RATE_LIMIT: unmeteredLimiter,
+      CLIENT_ATTEMPT_RATE_LIMIT: unmeteredLimiter,
+    });
+    for (let index = 0; index < 20; index += 1) {
+      const participant = await enrollMatureOpenCohortParticipant(
+        index,
+        openCohortEnv,
+      );
+      cohort.push(participant);
+      participantToDelete ??= participant;
+      const contribution = await uploadTelemetryAt(
+        participant,
+        telemetryFixture("a"),
+        "2026-07-25T23:59:59.000Z",
+      );
+      // The second accepted day deliberately repeats the observed occurrence.
+      // It proves the participant's two-day contribution cadence without
+      // doubling the cell metric being exercised below.
+      await uploadTelemetryAt(
+        participant,
+        telemetryFixture("a"),
+        "2026-07-26T23:59:59.000Z",
+      );
+      if (index === 0) contributionToDelete = contribution.contributionId;
+    }
     for (let index = 0; index < 2; index += 1) {
       const grant = await issueTestGrant();
       const enrolled = await enrollWithGrant(grant, inviteOnlyBindings({
@@ -3342,7 +3874,7 @@ describe("synthetic usage monitor service", () => {
     const publishedText = await response.text();
     const published = JSON.parse(publishedText) as Record<string, unknown>;
     expect(published).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.2",
+      schemaVersion: "community-weekly-snapshot-v0.3",
       releaseStatus: "published",
       immutable: true,
       nonOverlapping: true,
@@ -3485,7 +4017,7 @@ describe("synthetic usage monitor service", () => {
     const withdrawn = await api("/api/v1/stats/aggregate");
     const withdrawnText = await withdrawn.text();
     expect(JSON.parse(withdrawnText)).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.2",
+      schemaVersion: "community-weekly-snapshot-v0.3",
       releaseStatus: "withdrawn",
       reason: "source_data_withdrawn",
       immutable: true,
@@ -3529,7 +4061,7 @@ describe("synthetic usage monitor service", () => {
     const rebuiltResponse = await api("/api/v1/stats/aggregate");
     const rebuiltText = await rebuiltResponse.text();
     expect(JSON.parse(rebuiltText)).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.2",
+      schemaVersion: "community-weekly-snapshot-v0.3",
       snapshotId: "community-weekly:2026-07-20:r2",
       snapshotRevision: 2,
       releaseStatus: "suppressed",
@@ -3581,48 +4113,52 @@ describe("synthetic usage monitor service", () => {
     // omitting plan from the grouping key, this would collapse into a single
     // 40-participant cell instead of two 20-participant cells.
     //
-    // Community eligibility requires a redeemed invite grant (see
-    // participant_community_eligibility's insert trigger), and 40
-    // enrollments would exceed the shared enrollment rate limit this late in
-    // the suite — so this reuses the exact grant-and-unmetered-limiter
-    // pattern the "seals, serves, protects, and withdraws" test above uses
-    // for its own bulk enrollment.
+    // v0.3 public aggregates require distinct open-enrollment provider
+    // accounts, a mature account age, and two accepted collection days. Keep
+    // the test's large cohort explicit about each of those requirements.
     const unmeteredLimiter = {
       limit: async () => ({ success: true }),
     } as unknown as RateLimit;
-    const bulkEnrollBindings = inviteOnlyBindings({
+    const bulkEnrollBindings = identityBindings({
+      ENROLLMENT_MODE: "open" as Env["ENROLLMENT_MODE"],
       ENROLLMENT_RATE_LIMIT: unmeteredLimiter,
+      CLIENT_ATTEMPT_RATE_LIMIT: unmeteredLimiter,
     });
+    let identityIndex = 10_000;
     async function enrollEligible(): Promise<EnrollmentResponse> {
-      const grant = await issueTestGrant();
-      const enrolled = await enrollWithGrant(grant, bulkEnrollBindings);
-      expect(enrolled.status).toBe(201);
-      return enrollmentFrom(enrolled);
+      const participant = await enrollMatureOpenCohortParticipant(
+        identityIndex,
+        bulkEnrollBindings,
+      );
+      identityIndex += 1;
+      return participant;
     }
 
     for (let index = 0; index < 20; index += 1) {
       const known = await enrollEligible();
-      const knownUpload = await uploadEnvelope(
+      await uploadTelemetryAt(
         known,
-        await encrypt(telemetryFixture("a"), true),
+        telemetryFixture("a"),
+        "2026-07-25T23:59:59.000Z",
       );
-      expect(knownUpload.status).toBe(202);
-      const knownBody = await knownUpload.json<{ contributionId: string }>();
-      await testBindings().USAGE_MONITOR_DB.prepare(
-        "UPDATE telemetry_contributions SET created_at = ? WHERE id = ?",
-      ).bind("2026-07-28T23:59:59.000Z", knownBody.contributionId).run();
+      await uploadTelemetryAt(
+        known,
+        telemetryFixture("a"),
+        "2026-07-26T23:59:59.000Z",
+      );
 
       const unknown = await enrollEligible();
-      const unknownUpload = await uploadEnvelope(
+      await uploadTelemetryAt(
         unknown,
-        await encrypt(telemetryFixture("a"), true),
+        telemetryFixture("a"),
+        "2026-07-25T23:59:59.000Z",
       );
-      expect(unknownUpload.status).toBe(202);
-      const unknownBody = await unknownUpload.json<{ contributionId: string }>();
+      await uploadTelemetryAt(
+        unknown,
+        telemetryFixture("a"),
+        "2026-07-26T23:59:59.000Z",
+      );
       await testBindings().USAGE_MONITOR_DB.batch([
-        testBindings().USAGE_MONITOR_DB.prepare(
-          "UPDATE telemetry_contributions SET created_at = ? WHERE id = ?",
-        ).bind("2026-07-28T23:59:59.000Z", unknownBody.contributionId),
         // No in-window quota evidence for this participant: their usage
         // event stays in-window, but their quota snapshot is pushed years
         // outside it, so participant_plans finds nothing to COALESCE from.
@@ -3778,7 +4314,7 @@ describe("synthetic usage monitor service", () => {
       inviteOnlyBindings(),
     );
     await expect(suppressed.json()).resolves.toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.2",
+      schemaVersion: "community-weekly-snapshot-v0.3",
       releaseStatus: "not_yet_published",
       reason: "stable_snapshot_unavailable",
     });
@@ -3803,7 +4339,7 @@ describe("synthetic usage monitor service", () => {
     );
     const communityText = await community.text();
     expect(JSON.parse(communityText)).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.2",
+      schemaVersion: "community-weekly-snapshot-v0.3",
       releaseStatus: "not_yet_published",
       reason: "stable_snapshot_unavailable",
     });
@@ -4452,6 +4988,43 @@ describe("synthetic usage monitor service", () => {
     expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
   });
 
+  it("does not let expired tombstones block auth and purges them one bounded page at a time", async () => {
+    const nowEpoch = Date.parse("2026-08-04T00:00:00.000Z");
+    const participantIds = Array.from(
+      { length: 101 },
+      () => `participant:${crypto.randomUUID()}`,
+    );
+    const ledger = testBindings().DELETION_LEDGER;
+    for (let offset = 0; offset < participantIds.length; offset += 50) {
+      const rows = participantIds.slice(offset, offset + 50);
+      await ledger.batch(await Promise.all(
+        rows.map(async (participantId) => ledger.prepare(
+          `INSERT INTO deletion_tombstones (
+            participant_digest, schema_version, deleted_at, retain_until
+          ) VALUES (?, 'participant-deletion-tombstone-v0.1', ?, ?)`,
+        ).bind(
+          await participantDeletionDigest(participantId),
+          "2026-01-01T00:00:00.000Z",
+          "2026-07-01T00:00:00.000Z",
+        )),
+      ));
+    }
+
+    await expect(hasDeletionTombstone(
+      ledger,
+      participantIds[0]!,
+      nowEpoch,
+    )).resolves.toBe(false);
+    const first = await purgeExpiredDeletionTombstones(ledger, nowEpoch);
+    expect(first).toEqual({ purged: 100, complete: false });
+    const second = await purgeExpiredDeletionTombstones(ledger, nowEpoch);
+    expect(second).toEqual({ purged: 1, complete: true });
+    const remaining = await ledger.prepare(
+      "SELECT COUNT(*) AS total FROM deletion_tombstones",
+    ).first<{ total: number }>();
+    expect(remaining?.total).toBe(0);
+  });
+
   it("suppresses a pre-deletion primary restore using only the independent digest", async () => {
     const participant = await enrollTelemetry();
     await uploadEnvelope(
@@ -4635,6 +5208,68 @@ describe("synthetic usage monitor service", () => {
       });
     });
 
+    it("pins the hosted identity key configuration and rejects an in-place rotation", async () => {
+      const production = identityBindings({
+        ENVIRONMENT: "production" as Env["ENVIRONMENT"],
+        ENROLLMENT_MODE: "open" as Env["ENROLLMENT_MODE"],
+        PUBLIC_ORIGIN: "https://tibotattle.com",
+      });
+      const first = await identityEnroll(
+        await sha256Hex("test-hosted-identity\\0configuration-pin-first"),
+        "google",
+        production,
+      );
+      expect(first.status).toBe(201);
+      const pinned = await production.USAGE_MONITOR_DB.prepare(
+        `SELECT key_version, secret_fingerprint
+           FROM identity_link_secret_configuration
+          WHERE singleton = 1`,
+      ).first<{ key_version: string; secret_fingerprint: string }>();
+      expect(pinned?.key_version).toBe("test-v1");
+      expect(pinned?.secret_fingerprint).toMatch(/^[0-9a-f]{64}$/u);
+      expect(JSON.stringify(pinned)).not.toContain(
+        configuredIdentityLinkSecret(production),
+      );
+
+      const changedSecret = identityBindings({
+        ENVIRONMENT: "production" as Env["ENVIRONMENT"],
+        ENROLLMENT_MODE: "open" as Env["ENROLLMENT_MODE"],
+        PUBLIC_ORIGIN: "https://tibotattle.com",
+        IDENTITY_LINK_SECRET: "rotated-identity-link-secret-for-tests-0123456789",
+      });
+      const secretRejected = await identityEnroll(
+        await sha256Hex("test-hosted-identity\\0configuration-pin-secret"),
+        "google",
+        changedSecret,
+      );
+      expect(secretRejected.status).toBe(503);
+      await expect(secretRejected.json()).resolves.toMatchObject({
+        error: { code: "IDENTITY_CONFIGURATION_INVALID" },
+      });
+
+      const changedVersion = identityBindings({
+        ENVIRONMENT: "production" as Env["ENVIRONMENT"],
+        ENROLLMENT_MODE: "open" as Env["ENROLLMENT_MODE"],
+        PUBLIC_ORIGIN: "https://tibotattle.com",
+        IDENTITY_LINK_SECRET_VERSION:
+          "test-v2" as unknown as Env["IDENTITY_LINK_SECRET_VERSION"],
+      } as unknown as Partial<Env>);
+      const versionRejected = await identityEnroll(
+        await sha256Hex("test-hosted-identity\\0configuration-pin-version"),
+        "google",
+        changedVersion,
+      );
+      expect(versionRejected.status).toBe(503);
+      await expect(versionRejected.json()).resolves.toMatchObject({
+        error: { code: "IDENTITY_CONFIGURATION_INVALID" },
+      });
+
+      const participants = await production.USAGE_MONITOR_DB.prepare(
+        "SELECT COUNT(*) AS total FROM participants",
+      ).first<{ total: number }>();
+      expect(participants?.total).toBe(1);
+    });
+
     it("enrolls, stores only the pairwise hash, and reattaches the same participant", async () => {
       const subject = "google-subject-alpha";
       const linkKey = await sha256Hex(`test-hosted-identity\0${subject}`);
@@ -4643,10 +5278,16 @@ describe("synthetic usage monitor service", () => {
       const firstBody = await first.json<{ participantId: string; recoveryCode: string }>();
 
       const row = await testBindings().USAGE_MONITOR_DB.prepare(
-        "SELECT identity_link_key FROM participants WHERE id = ?",
-      ).bind(firstBody.participantId).first<{ identity_link_key: string }>();
+        `SELECT identity_link_key, identity_cooldown_digest
+           FROM participants
+          WHERE id = ?`,
+      ).bind(firstBody.participantId).first<{
+        identity_link_key: string;
+        identity_cooldown_digest: string | null;
+      }>();
       expect(row?.identity_link_key).toMatch(/^[0-9a-f]{64}$/u);
       expect(row?.identity_link_key.includes(subject)).toBe(false);
+      expect(row?.identity_cooldown_digest).toBeNull();
 
       const second = await identityEnroll(linkKey);
       expect(second.status).toBe(201);
@@ -4689,6 +5330,103 @@ describe("synthetic usage monitor service", () => {
       }
     });
 
+    // csf_b814237b / csf_42bcd8fd: the delivered proof is a bearer credential.
+    // Enrollment must carry the initiator binding through to the reattachment
+    // sink so a leaked proof alone — or one presented with the wrong verifier —
+    // cannot reattach an existing participant.
+    it("binds hosted-proof enrollment to the initiating client's verifier", async () => {
+      const runtimeEnv = identityBindings();
+      const linkKey = await sha256Hex("test-hosted-identity-binding-subject");
+      const proof = await deliveredHostedProof(runtimeEnv, "google", linkKey);
+
+      // The proof alone (no verifier) and the proof with a wrong verifier are
+      // both refused, and neither failed attempt consumes the one-use proof.
+      for (const identity of [
+        { provider: "google", proof },
+        { provider: "google", proof, verifier: "y".repeat(64) },
+      ]) {
+        const rejected = await api("/api/v1/enroll", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            consentVersion: "privacy-safe-telemetry-v0.1",
+            syntheticOnly: false,
+            identity,
+          }),
+        }, runtimeEnv);
+        expect(rejected.status).toBe(401);
+        expect(await rejected.json()).toMatchObject({
+          error: { code: "IDENTITY_TOKEN_INVALID" },
+        });
+      }
+
+      // Re-presenting the initiator's verifier reattaches exactly once: the
+      // failed attempts left the proof collectable.
+      const accepted = await api("/api/v1/enroll", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          consentVersion: "privacy-safe-telemetry-v0.1",
+          syntheticOnly: false,
+          identity: {
+            provider: "google",
+            proof,
+            verifier: HOSTED_IDENTITY_TEST_VERIFIER,
+          },
+        }),
+      }, runtimeEnv);
+      expect(accepted.status).toBe(201);
+
+      // Single use: the same proof and verifier cannot be spent again.
+      const replay = await api("/api/v1/enroll", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          consentVersion: "privacy-safe-telemetry-v0.1",
+          syntheticOnly: false,
+          identity: {
+            provider: "google",
+            proof,
+            verifier: HOSTED_IDENTITY_TEST_VERIFIER,
+          },
+        }),
+      }, runtimeEnv);
+      expect(replay.status).toBe(401);
+    });
+
+    it("reattaches an existing identity under disabled mode and refuses a new one", async () => {
+      // Disabled mode pauses NEW participation only: an identity already
+      // linked to a participant signs back in and reattaches; an identity
+      // with no link is refused at the enrollment write.
+      const linkKey = await sha256Hex("test-hosted-identity\0disabled-reattach");
+      const first = await identityEnroll(linkKey);
+      expect(first.status).toBe(201);
+      const firstBody = await first.json<{ participantId: string }>();
+
+      const disabledEnv = identityBindings({
+        ENROLLMENT_MODE: "disabled",
+      } as unknown as Partial<Env>);
+      const reattached = await identityEnroll(linkKey, "google", disabledEnv);
+      expect(reattached.status).toBe(201);
+      const reattachedBody = await reattached.json<{ participantId: string }>();
+      expect(reattachedBody.participantId).toBe(firstBody.participantId);
+
+      const fresh = await identityEnroll(
+        await sha256Hex("test-hosted-identity\0disabled-new-identity"),
+        "google",
+        disabledEnv,
+      );
+      expect(fresh.status).toBe(503);
+      await expect(fresh.json()).resolves.toMatchObject({
+        error: { code: "ENROLLMENT_DISABLED" },
+      });
+
+      const count = await testBindings().USAGE_MONITOR_DB.prepare(
+        "SELECT COUNT(*) AS total FROM participants",
+      ).first<{ total: number }>();
+      expect(count?.total).toBe(1);
+    });
+
     it("refuses reattachment during deletion and unlinks after deletion", async () => {
       const subject = "google-subject-deleting";
       const linkKey = await sha256Hex(`test-hosted-identity\0${subject}`);
@@ -4700,6 +5438,9 @@ describe("synthetic usage monitor service", () => {
       ).bind(firstBody.participantId).run();
       const duringDeletion = await identityEnroll(linkKey);
       expect(duringDeletion.status).toBe(409);
+      await expect(duringDeletion.json()).resolves.toMatchObject({
+        error: { code: "PARTICIPANT_DELETING" },
+      });
 
       const { finishParticipantDeletion } = await import("../src/repository");
       await finishParticipantDeletion(
@@ -4710,6 +5451,199 @@ describe("synthetic usage monitor service", () => {
       expect(afterDeletion.status).toBe(201);
       const freshBody = await afterDeletion.json<{ participantId: string }>();
       expect(freshBody.participantId).not.toBe(firstBody.participantId);
+    });
+
+    it("suppresses immediate hosted re-enrollment and permits it after cooldown expiry", async () => {
+      const env = identityBindings();
+      const linkKey = await sha256Hex("test-hosted-identity\0cooldown-subject");
+      const first = await identityEnroll(linkKey, "google", env);
+      expect(first.status).toBe(201);
+      const participant = await enrollmentFrom(first);
+
+      const deleted = await api("/api/v1/me", {
+        method: "DELETE",
+        headers: personalHeaders(participant, { csrf: true }),
+      }, env);
+      expect(deleted.status).toBe(200);
+
+      const cooldown = await env.DELETION_LEDGER.prepare(
+        `SELECT identity_cooldown_digest, deleted_at, retain_until
+           FROM identity_reenrollment_cooldowns`,
+      ).first<{
+        identity_cooldown_digest: string;
+        deleted_at: string;
+        retain_until: string;
+      }>();
+      expect(cooldown?.identity_cooldown_digest).toMatch(/^[0-9a-f]{64}$/u);
+      expect(cooldown?.deleted_at).toMatch(/Z$/u);
+      expect(cooldown?.retain_until).toMatch(/Z$/u);
+      expect(JSON.stringify(cooldown)).not.toContain(linkKey);
+      const cooldownDigest = await identityReenrollmentCooldownDigest(
+        configuredIdentityLinkSecret(env),
+        linkKey,
+      );
+      expect(cooldown?.identity_cooldown_digest).toBe(cooldownDigest);
+      const primaryCooldown = await env.USAGE_MONITOR_DB.prepare(
+        `SELECT identity_cooldown_digest, deleted_at, retain_until
+           FROM identity_reenrollment_cooldowns`,
+      ).first<{
+        identity_cooldown_digest: string;
+        deleted_at: string;
+        retain_until: string;
+      }>();
+      expect(primaryCooldown?.identity_cooldown_digest).toBe(cooldownDigest);
+      expect(primaryCooldown?.deleted_at).toMatch(/Z$/u);
+      expect(primaryCooldown?.retain_until).toMatch(/Z$/u);
+      expect(JSON.stringify(primaryCooldown)).not.toContain(linkKey);
+      await expect(hasIdentityReenrollmentCooldown(
+        env.DELETION_LEDGER,
+        linkKey,
+        env.IDENTITY_LINK_SECRET,
+      )).resolves.toBe(true);
+      await expect(hasIdentityReenrollmentCooldownDigest(
+        env.USAGE_MONITOR_DB,
+        cooldownDigest,
+      )).resolves.toBe(true);
+
+      const immediate = await identityEnroll(linkKey, "google", env);
+      expect(immediate.status).toBe(409);
+      await expect(immediate.json()).resolves.toMatchObject({
+        error: { code: "IDENTITY_REENROLLMENT_COOLDOWN" },
+      });
+
+      await env.DELETION_LEDGER.prepare(
+        `UPDATE identity_reenrollment_cooldowns
+            SET deleted_at = ?, retain_until = ?`,
+      ).bind(
+        "2026-01-01T00:00:00.000Z",
+        "2026-07-01T00:00:00.000Z",
+      ).run();
+      await env.USAGE_MONITOR_DB.prepare(
+        `UPDATE identity_reenrollment_cooldowns
+            SET deleted_at = ?, retain_until = ?`,
+      ).bind(
+        "2026-01-01T00:00:00.000Z",
+        "2026-07-01T00:00:00.000Z",
+      ).run();
+      await expect(hasIdentityReenrollmentCooldown(
+        env.DELETION_LEDGER,
+        linkKey,
+        env.IDENTITY_LINK_SECRET,
+        Date.parse("2026-08-04T00:00:00.000Z"),
+      )).resolves.toBe(false);
+      await expect(purgeExpiredIdentityReenrollmentCooldowns(
+        env.DELETION_LEDGER,
+        Date.parse("2026-08-04T00:00:00.000Z"),
+      )).resolves.toEqual({ purged: 1, complete: true });
+      await expect(purgeExpiredPrimaryIdentityReenrollmentCooldowns(
+        env.USAGE_MONITOR_DB,
+        Date.parse("2026-08-04T00:00:00.000Z"),
+      )).resolves.toEqual({ purged: 1, complete: true });
+      const afterExpiry = await identityEnroll(linkKey, "google", env);
+      expect(afterExpiry.status).toBe(201);
+      const fresh = await afterExpiry.json<{ participantId: string }>();
+      expect(fresh.participantId).not.toBe(participant.participantId);
+    });
+
+    it("enforces the primary cooldown at the participant INSERT boundary", async () => {
+      const env = identityBindings();
+      const linkKey = await sha256Hex("test-hosted-identity\\0insert-boundary");
+      const first = await identityEnroll(linkKey, "google", env);
+      expect(first.status).toBe(201);
+      const participant = await enrollmentFrom(first);
+      const cooldownDigest = await identityReenrollmentCooldownDigest(
+        configuredIdentityLinkSecret(env),
+        linkKey,
+      );
+
+      // Model the vulnerable interleaving precisely: the request observed an
+      // active participant, deletion then persisted its primary marker and
+      // removed the unique link row before the request reached enroll(). No
+      // external-ledger marker is present in this test, so only primary D1 can
+      // reject it.
+      await env.USAGE_MONITOR_DB.prepare(
+        "UPDATE participants SET state = 'deleting' WHERE id = ?",
+      ).bind(participant.participantId).run();
+      await recordPrimaryIdentityReenrollmentCooldown(
+        env.USAGE_MONITOR_DB,
+        cooldownDigest,
+      );
+      const { enroll: enrollParticipant, finishParticipantDeletion } =
+        await import("../src/repository");
+      await finishParticipantDeletion(
+        env.USAGE_MONITOR_DB,
+        participant.participantId,
+      );
+
+      await expect(enrollParticipant(
+        env.USAGE_MONITOR_DB,
+        "privacy-safe-telemetry-v0.1",
+        null,
+        {
+          identityLinkKey: linkKey,
+          identityCooldownDigest: cooldownDigest,
+        },
+      )).rejects.toThrow("identity reenrollment cooldown active");
+      const afterDirectInsert = await env.USAGE_MONITOR_DB.prepare(
+        "SELECT COUNT(*) AS total FROM participants",
+      ).first<{ total: number }>();
+      expect(afterDirectInsert?.total).toBe(0);
+
+      const throughHandler = await identityEnroll(linkKey, "google", env);
+      expect(throughHandler.status).toBe(409);
+      await expect(throughHandler.json()).resolves.toMatchObject({
+        error: { code: "IDENTITY_REENROLLMENT_COOLDOWN" },
+      });
+    });
+
+    it("writes both cooldown copies before restore replay removes a hosted link", async () => {
+      const env = identityBindings();
+      const linkKey = await sha256Hex("test-hosted-identity\\0restore-replay");
+      const first = await identityEnroll(linkKey, "google", env);
+      expect(first.status).toBe(201);
+      const participant = await enrollmentFrom(first);
+      const now = Date.now();
+      await recordDeletionTombstone(
+        env.DELETION_LEDGER,
+        participant.participantId,
+        now,
+      );
+
+      const lifecycle = await runBackendLifecycle(
+        env.USAGE_MONITOR_DB,
+        env.DELETION_LEDGER,
+        env.QUARANTINE,
+        now,
+        undefined,
+        configuredIdentityLinkSecret(env),
+        false,
+      );
+      expect(lifecycle.restoredParticipantsSuppressed).toBe(1);
+      const cooldownDigest = await identityReenrollmentCooldownDigest(
+        configuredIdentityLinkSecret(env),
+        linkKey,
+      );
+      for (const database of [env.USAGE_MONITOR_DB, env.DELETION_LEDGER]) {
+        await expect(hasIdentityReenrollmentCooldownDigest(
+          database,
+          cooldownDigest,
+        )).resolves.toBe(true);
+      }
+    });
+
+    it("keeps the synthetic development identity path usable without the hosted secret", async () => {
+      const env = identityBindings({ IDENTITY_LINK_SECRET: undefined });
+      const linkKey = await sha256Hex("test-development-identity-without-secret");
+      const first = await identityEnroll(linkKey, "google", env);
+      expect(first.status).toBe(201);
+      const participant = await enrollmentFrom(first);
+      const deleted = await api("/api/v1/me", {
+        method: "DELETE",
+        headers: personalHeaders(participant, { csrf: true }),
+      }, env);
+      expect(deleted.status).toBe(200);
+      const second = await identityEnroll(linkKey, "google", env);
+      expect(second.status).toBe(201);
     });
   });
 });

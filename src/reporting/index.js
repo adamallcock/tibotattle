@@ -1,6 +1,7 @@
 export {
   analyzeMonitoringQuality,
   classifyMonitoringInterval,
+  createCollectorQualityAccumulator,
   renderMonitoringQualityReport,
 } from "./monitoring-quality.js";
 export {

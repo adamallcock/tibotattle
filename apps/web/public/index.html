@@ -25,9 +25,10 @@
       Not a release slot: this is the product version this dashboard build ships
       as, and it is filled in source so the packaged Mac app carries it too. A
       shared results card names it, so a posted figure can be tied back to the
-      build that produced it. A test keeps it equal to the package version.
+      build that produced it. The local companion and packaged app stamp it
+      from the release manifest.
     -->
-    <meta name="usage-monitor-app-version" content="0.1.0">
+    <meta name="usage-monitor-app-version" content="__USAGE_MONITOR_RELEASE_VERSION__">
     <!--
       The published home this build points at. A shared results card prints it
       so a reader can find the project; the release build's own canonical URL
@@ -68,19 +69,21 @@
     <link rel="stylesheet" href="./styles.css">
     <script type="module" src="./app.js"></script>
   </head>
-  <body class="first-run">
-    <a class="skip-link" href="#main">Skip to monitoring dashboard</a>
+  <body class="first-run" data-i18n-root>
+    <a class="skip-link" href="#main" data-i18n-legacy-root>Skip to monitoring dashboard</a>
 
-    <header class="topbar">
-      <a class="brand" href="#overview" aria-label="TiboTattle dashboard">
+    <header class="topbar" data-i18n-legacy-root>
+      <a class="brand" href="#overview" aria-label="TiboTattle dashboard" data-i18n-aria-label="aria.tibotattleDashboard">
         <img class="brand-icon" src="./tibotattle-icon.png" alt="">
         <span>TiboTattle</span>
       </a>
       <div class="top-actions">
-        <span class="state-pill state-connecting" id="central-state" data-requires-evidence hidden>
-          <span class="state-dot" aria-hidden="true"></span>
-          Community checking
-        </span>
+        <label class="language-picker">
+          <span class="sr-only" data-i18n="language.label">Language</span>
+          <select data-language-picker aria-label="Language"></select>
+        </label>
+        <p class="sr-only" data-language-announcement role="status" aria-live="polite" aria-atomic="true"></p>
+        <span class="history-index-badge" id="history-index-badge" hidden></span>
         <span class="state-pill state-connecting" id="global-state">
           <span class="state-dot" aria-hidden="true"></span>
           Connecting
@@ -94,15 +97,14 @@
       </div>
     </header>
 
-    <div class="dashboard-shell">
-      <aside class="dashboard-sidebar" aria-label="Dashboard navigation">
-        <nav class="primary-nav" aria-label="Dashboard sections">
+    <div class="dashboard-shell" data-i18n-legacy-root>
+      <aside class="dashboard-sidebar" aria-label="Dashboard navigation" data-i18n-aria-label="aria.dashboardNavigation">
+        <nav class="primary-nav" aria-label="Dashboard sections" data-i18n-aria-label="aria.dashboardSections">
           <a href="#overview" data-nav="overview" data-requires-evidence>Overview</a>
           <a href="#weekly" data-nav="weekly" data-requires-evidence>Allowance</a>
           <a href="#timeline" data-nav="trends" data-requires-evidence>Trends</a>
-          <a href="#accounting" data-nav="method" data-requires-evidence>How it works</a>
+          <a href="#accounting" data-nav="method" data-requires-evidence>Usage and costs</a>
           <a href="#community" data-nav="community" data-requires-evidence>Community</a>
-          <a href="#data" data-nav="data">Data &amp; privacy</a>
         </nav>
       </aside>
       <div class="dashboard-content">
@@ -159,7 +161,7 @@
               <span id="installer-size"></span>
               <span id="installer-sha256"></span>
             </div>
-            <nav class="installer-links" id="installer-links" aria-label="Release information" hidden>
+            <nav class="installer-links" id="installer-links" aria-label="Release information" data-i18n-aria-label="aria.releaseInformation" hidden>
               <a id="release-notes-link" href="" hidden>Release notes</a>
               <a id="privacy-link" href="" hidden>Privacy</a>
               <a id="security-link" href="" hidden>Security</a>
@@ -237,9 +239,6 @@
             <p class="eyebrow">01 · Overview</p>
             <h2 id="overview-title">Where your allowance stands</h2>
           </div>
-          <p id="overview-context">
-            Current quota observations and API-price-equivalent usage from your local evidence.
-          </p>
         </div>
 
         <div class="metric-grid quota-grid" id="quota-cards" aria-live="polite">
@@ -247,6 +246,14 @@
           <div class="skeleton-card"></div>
           <div class="skeleton-card"></div>
         </div>
+
+        <!--
+          Statements the local companion published about the evidence behind
+          these observations. They are its own finished sentences, rendered as
+          text and never reworded here. Each list stays out of the document
+          entirely when the companion published nothing for it.
+        -->
+        <ul class="evidence-warnings" id="evidence-warnings" hidden></ul>
 
         <div class="two-column overview-panels">
           <article class="panel">
@@ -267,6 +274,25 @@
               <strong id="cost-total">—</strong>
               <small id="cost-coverage">Awaiting local evidence</small>
             </div>
+            <!--
+              How much of the discovered history this figure is actually drawn
+              from. It stays out of the document once the index is complete,
+              and it never states a percentage it did not measure.
+            -->
+            <div class="index-progress" id="history-progress" hidden>
+              <p class="index-progress-headline" id="history-progress-headline"></p>
+              <div
+                class="index-progress-track"
+                id="history-progress-track"
+                role="progressbar"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-labelledby="history-progress-headline"
+              ><i id="history-progress-fill"></i></div>
+              <p class="index-progress-detail" id="history-progress-detail"></p>
+              <p class="index-progress-detail" id="history-progress-note"></p>
+            </div>
+            <ul class="evidence-warnings" id="cost-warnings" hidden></ul>
             <p class="annotation">
               This activity total can exceed the inferred weekly limit: it spans
               a calendar period, while the weekly estimate describes one observed
@@ -283,6 +309,9 @@
               </div>
               <span class="evidence-chip" id="fit-chip">No evidence</span>
             </div>
+            <p class="plain-result" id="comparison-result">
+              More observations are required before a useful comparison can be made.
+            </p>
             <div class="comparison-visual" id="comparison-visual">
               <div class="comparison-row">
                 <span>Observed quota movement</span>
@@ -295,9 +324,6 @@
                 <strong>—</strong>
               </div>
             </div>
-            <p class="plain-result" id="comparison-result">
-              More observations are required before a useful comparison can be made.
-            </p>
             <dl class="calibration-facts" id="calibration-facts">
               <div>
                 <dt>Central fitted rate</dt>
@@ -319,17 +345,89 @@
           </article>
         </div>
 
+      </section>
+
+      <section class="dashboard-section lead-section dashboard-page-inactive" id="weekly" aria-labelledby="weekly-title" data-dashboard-page="weekly" data-requires-evidence aria-hidden="true" inert>
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">02 · Weekly allowance</p>
+            <h2 id="weekly-title">Our best estimate of the seven-day limit</h2>
+          </div>
+        </div>
+
+        <div class="weekly-hero">
+          <div>
+            <span id="weekly-estimate-label" data-i18n="weekly.headline.label">All-data median estimate</span>
+            <strong id="weekly-estimate">—</strong>
+            <small id="weekly-range">No evidence interval available</small>
+          </div>
+          <p id="weekly-explanation">The estimate will appear when local usage can be matched to quota changes.</p>
+        </div>
+
+        <article class="panel weekly-history-panel lead-chart-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">History</p>
+              <h3>Allowance estimate history</h3>
+            </div>
+            <div class="weekly-chart-controls">
+              <div class="segmented-control" id="weekly-range-controls" aria-label="Weekly history date range" data-i18n-aria-label="aria.weeklyHistoryRange">
+                <button type="button" data-days="7">7d</button>
+                <button type="button" data-days="30" class="active" aria-pressed="true">30d</button>
+                <button type="button" data-days="36500">All</button>
+              </div>
+              <label class="weekly-span-control" for="weekly-span-control">
+                <span>Minimum observed quota span</span>
+                <input id="weekly-span-control" type="range" min="0" max="99" step="1" value="50">
+                <output id="weekly-span-value" for="weekly-span-control">50+ pp</output>
+              </label>
+            </div>
+          </div>
+          <div class="legend weekly-legend" aria-label="Weekly estimate chart legend" data-i18n-aria-label="aria.weeklyEstimateLegend">
+            <span><i class="legend-dot weekly-center"></i>All-data median</span>
+            <span><i class="legend-dot weekly-mature"></i><span id="weekly-span-legend">Observed across 50+ points</span></span>
+            <span id="weekly-partial-legend" hidden><i class="legend-dot weekly-partial"></i>Short observation</span>
+            <span><i class="legend-dot weekly-error-bar"></i>Slope-agreement range</span>
+          </div>
+          <div class="chart-empty small" id="weekly-empty">No weekly estimates loaded.</div>
+          <div class="chart-shell weekly-history-chart" id="weekly-chart" hidden></div>
+          <!--
+            Honest naming for the per-reset bars: they are the 10th-to-90th
+            percentile spread of slopes formed from different pairs of observed
+            quota boundaries WITHIN one reset — a disagreement diagnostic. The
+            calibration report states the same thing; calling it a measured or
+            confidence range here overclaimed.
+          -->
+          <p class="annotation">
+            Each reset estimate is drawn with its slope-agreement range: the
+            spread of slopes from different pairs of observed quota boundaries
+            within that reset. It is a within-reset disagreement diagnostic,
+            not a confidence interval.
+          </p>
+          <!-- The zone is named once per chart, from the reader's own system
+               zone, instead of being repeated on every tick and tooltip. -->
+          <p class="annotation" id="weekly-chart-timezone"></p>
+        </article>
+
+        <!--
+          Owner-directed 2026-08-08 (third round): the header above the card
+          is title plus ONE short caption. The earlier two-paragraph explainer
+          is gone; the surviving sentence keeps the two promises a reader must
+          have before posting — the card follows the chart's active filters,
+          and nothing private is on it. The reference still travels in the
+          saved file name only.
+        -->
         <article class="panel share-panel" id="share-panel">
           <div class="panel-heading">
             <div>
               <p class="panel-kicker">Share</p>
               <h3>A results card you can post</h3>
             </div>
-            <span class="evidence-chip" id="share-card-reference">Reference pending</span>
           </div>
           <p class="annotation">
-            A ready-to-post image of the three headline figures. It contains no
-            prompts, responses, paths, account details, or raw activity.
+            The card follows the chart’s active date range and span filter.
+            It contains no prompts, responses, paths, account details, or raw
+            activity.
           </p>
           <div class="share-preview">
             <canvas
@@ -338,6 +436,7 @@
               width="1200"
               height="800"
               aria-label="A results card is generated once local evidence is available."
+              data-i18n-aria-label="aria.shareCard"
             ></canvas>
           </div>
           <div class="share-actions">
@@ -348,66 +447,19 @@
               Copy image
             </button>
           </div>
+          <!--
+            Transient confirmation for a completed copy: it appears, holds a
+            few seconds, and leaves, instead of accumulating as permanent page
+            text under the card. A role="status" live region like the action
+            statuses elsewhere on this page, and it carries no focusable
+            content, so it cannot trap focus.
+          -->
+          <p class="share-toast" id="share-card-toast" role="status" hidden></p>
           <p class="participant-action-status" id="share-card-status" role="status" hidden></p>
-        </article>
-      </section>
-
-      <section class="dashboard-section lead-section" id="weekly" aria-labelledby="weekly-title" data-dashboard-page="weekly" data-requires-evidence>
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">02 · Weekly allowance</p>
-            <h2 id="weekly-title">Our best estimate of the seven-day limit</h2>
-          </div>
-          <p>One dot per distinct reset.</p>
-        </div>
-
-        <div class="weekly-hero">
-          <div>
-            <span>Historical median estimate</span>
-            <strong id="weekly-estimate">—</strong>
-            <small id="weekly-range">No evidence interval available</small>
-          </div>
-          <p id="weekly-explanation">The estimate will appear when local usage can be matched to quota changes.</p>
-        </div>
-
-        <aside class="weekly-pricing-receipt" id="weekly-pricing-receipt" aria-live="polite">
-          <div>
-            <p class="panel-kicker">Price basis used for every fit</p>
-            <h3 id="weekly-pricing-receipt-title">Price table not yet loaded</h3>
-          </div>
-          <p id="weekly-pricing-receipt-copy">
-            TiboTattle will state which reviewed price table was used once local evidence loads.
-          </p>
-        </aside>
-
-        <article class="panel weekly-history-panel lead-chart-panel">
-          <div class="panel-heading">
-            <div>
-              <p class="panel-kicker">History</p>
-              <h3>Allowance estimate history</h3>
-            </div>
-            <div class="weekly-chart-controls">
-              <div class="segmented-control" id="weekly-range-controls" aria-label="Weekly history date range">
-                <button type="button" data-days="7">7d</button>
-                <button type="button" data-days="31" class="active" aria-pressed="true">31d</button>
-                <button type="button" data-days="36500">All</button>
-              </div>
-            </div>
-          </div>
-          <div class="legend weekly-legend" aria-label="Weekly estimate chart legend">
-            <span><i class="legend-dot weekly-center"></i>Typical estimate</span>
-            <span><i class="legend-dot weekly-mature"></i>Observed across 50+ points</span>
-            <span id="weekly-partial-legend" hidden><i class="legend-dot weekly-partial"></i>Short observation</span>
-          </div>
-          <div class="chart-empty small" id="weekly-empty">No weekly estimates loaded.</div>
-          <div class="chart-shell weekly-history-chart" id="weekly-chart" hidden></div>
-          <p class="annotation">
-            Each dot is a separate reset estimate. Its vertical bar shows the range supported by that reset’s observations.
-          </p>
         </article>
 
         <details class="panel weekly-table-panel evidence-disclosure">
-          <summary>See individual measurements</summary>
+          <summary>See individual usage changes</summary>
           <div class="table-wrap">
             <table>
               <caption class="sr-only">Individual seven-day reset estimates</caption>
@@ -416,7 +468,7 @@
                   <th scope="col">Observed</th>
                   <th scope="col">Observed span</th>
                   <th scope="col">Estimate</th>
-                  <th scope="col">Measured range</th>
+                  <th scope="col">Slope-agreement range</th>
                   <th scope="col">Status</th>
                 </tr>
               </thead>
@@ -428,7 +480,7 @@
         </details>
       </section>
 
-      <section class="dashboard-section" id="timeline" aria-labelledby="timeline-title" data-dashboard-page="trends" data-requires-evidence>
+      <section class="dashboard-section dashboard-page-inactive" id="timeline" aria-labelledby="timeline-title" data-dashboard-page="trends" data-requires-evidence aria-hidden="true" inert>
         <div class="section-heading">
           <div>
             <p class="eyebrow">03 · Timeline</p>
@@ -436,71 +488,42 @@
           </div>
         </div>
 
-        <article class="panel chart-panel">
-          <div class="chart-heading">
-            <div>
-              <h3 id="usage-timeline-title">API-price-equivalent usage over time</h3>
-              <p id="usage-timeline-copy">Replay-safe local increments · browser-local time · current API prices</p>
-            </div>
-            <div class="chart-control-stack">
-              <div class="segmented-control" id="usage-group-controls" aria-label="Usage grouping">
-                <button type="button" data-group="hour" class="active" aria-pressed="true">Hour</button>
-                <button type="button" data-group="day">Day</button>
-                <button type="button" data-group="week">Week</button>
-              </div>
-              <div class="segmented-control" id="range-controls" aria-label="Usage chart date range">
-                <button type="button" data-days="1">24h</button>
-                <button type="button" data-days="7" class="active" aria-pressed="true">7d</button>
-                <button type="button" data-days="31">31d</button>
-              </div>
-              <div class="legend compact-legend" aria-label="Usage chart legend">
-                <span><i class="legend-dot cost"></i>API-cost estimate</span>
-                <span><i class="legend-dot allowance"></i>7-day allowance remaining</span>
-              </div>
-            </div>
-          </div>
-          <div class="chart-empty" id="usage-timeline-empty">
-            <strong>No real usage timeline loaded</strong>
-            <p>Analyze local usage to build recent content-free usage buckets.</p>
-          </div>
-          <div class="chart-shell" id="usage-timeline-chart" hidden></div>
-          <div class="chart-summary-grid" id="usage-timeline-summary"></div>
-        </article>
-
-        <details class="advanced-calibration">
+        <details class="advanced-calibration" open>
           <summary>Advanced calibration: measured quota change versus calculated change</summary>
         <article class="panel chart-panel">
           <div class="chart-heading">
             <div>
               <h3 id="timeline-chart-title">Observed quota change versus cost-implied change</h3>
-              <p id="timeline-chart-copy">Browser-local chart axis · exact local and UTC times are listed below</p>
+              <p id="timeline-chart-copy">Chart and table use this Mac’s reporting time zone.</p>
             </div>
             <div class="calibration-controls">
-              <span class="control-label">Calibration window</span>
-              <div class="segmented-control" id="window-controls" aria-label="Calibration rolling comparison window">
-                <button type="button" data-hours="0.25">15 min</button>
-                <button type="button" data-hours="1" class="active" aria-pressed="true">1 hour</button>
-                <button type="button" data-hours="3">3 hours</button>
-              </div>
-              <div class="segmented-control" id="calibration-range-controls" aria-label="Calibration date range">
+              <!--
+                Owner decision 2026-08-06: the rolling comparison window is
+                fixed at three hours. The 15-minute and 1-hour widths the old
+                segmented control offered proved inaccurate, and a control
+                with one honest option is clutter, so the width lives in
+                app.js as CALIBRATION_WINDOW_HOURS rather than here.
+              -->
+              <div class="segmented-control" id="calibration-range-controls" aria-label="Calibration date range" data-i18n-aria-label="aria.calibrationDateRange">
                 <button type="button" data-days="1">24h</button>
                 <button type="button" data-days="7" class="active" aria-pressed="true">7d</button>
-                <button type="button" data-days="31">31d</button>
+                <button type="button" data-days="30">30d</button>
+                <button type="button" data-days="36500">All</button>
               </div>
-              <div class="chart-navigation" aria-label="Calibration zoom and pan">
-                <button class="button button-quiet compact" id="timeline-pan-back" type="button" title="Pan calibration earlier">← Earlier</button>
-                <button class="button button-quiet compact" id="timeline-zoom-out" type="button" title="Zoom out">−</button>
-                <button class="button button-quiet compact" id="timeline-zoom-in" type="button" title="Zoom in">+</button>
+              <div class="chart-navigation" aria-label="Calibration zoom and pan" data-i18n-aria-label="aria.calibrationZoomPan">
+                <button class="button button-quiet compact" id="timeline-pan-back" type="button" title="Pan calibration earlier" data-i18n-title="title.panCalibrationEarlier">← Earlier</button>
+                <button class="button button-quiet compact" id="timeline-zoom-out" type="button" title="Zoom out" data-i18n-title="title.zoomOut">−</button>
+                <button class="button button-quiet compact" id="timeline-zoom-in" type="button" title="Zoom in" data-i18n-title="title.zoomIn">+</button>
                 <button class="button button-quiet compact" id="timeline-reset-zoom" type="button">Reset view</button>
-                <button class="button button-quiet compact" id="timeline-pan-forward" type="button" title="Pan calibration later">Later →</button>
+                <button class="button button-quiet compact" id="timeline-pan-forward" type="button" title="Pan calibration later" data-i18n-title="title.panCalibrationLater">Later →</button>
                 <span class="sr-only" id="timeline-zoom-status" aria-live="polite"></span>
               </div>
-              <div class="legend" aria-label="Calibration chart legend">
+              <div class="legend" aria-label="Calibration chart legend" data-i18n-aria-label="aria.calibrationLegend">
                 <span><i class="legend-dot observed"></i>Observed quota</span>
                 <span><i class="legend-dot expected"></i>Expected from API cost</span>
                 <span><i class="legend-dot chart-status-missing"></i>Missing quota bracket</span>
-                <span><i class="legend-dot chart-status-reset"></i>Reset or track change</span>
-                <span><i class="legend-dot chart-status-ambiguous"></i>Ambiguous movement</span>
+                <span><i class="legend-dot chart-status-reset"></i>Window boundary or track change</span>
+                <span><i class="legend-dot chart-status-ambiguous"></i>Movement needs context</span>
               </div>
             </div>
           </div>
@@ -509,6 +532,7 @@
             <p>Connect the local companion or choose the labeled demo.</p>
           </div>
           <div class="chart-shell" id="timeline-chart" hidden></div>
+          <p class="series-coverage" id="timeline-coverage" role="status" hidden></p>
           <div class="chart-summary-grid" id="timeline-summary"></div>
           <p class="timeline-confidence" id="timeline-confidence" role="status"></p>
         </article>
@@ -518,14 +542,24 @@
             <div class="panel-heading">
               <div>
                 <p class="panel-kicker">Residuals</p>
-                <h3>Where the estimate misses</h3>
+                <h3>Observed versus calculated movement</h3>
               </div>
             </div>
             <p class="annotation">
-              Residual = observed quota change minus cost-implied change. Positive
-              values mean the allowance fell faster than the token model predicted.
-              The axis covers the same date range as the calibration chart above;
-              windows that cannot be differenced are shaded gaps, never zeros.
+              The difference between provider-reported quota movement and the
+              movement implied by local usage changes. Quiet periods with no
+              activity and no quota change are neutral, not errors.
+            </p>
+            <!--
+              The designed cumulative view (owner-directed, 2026-08-08). The
+              sentence names the semantics honestly: a per-bucket
+              non-overlapping running sum, restarted at every reset boundary
+              or track change, drawn only where live reset annotations exist.
+            -->
+            <p class="annotation">
+              The second line is cumulative drift: the running sum of each
+              bucket’s observed-minus-expected movement, restarted at every
+              window boundary or track change.
             </p>
             <div class="chart-empty small" id="residual-empty">No residual evidence loaded.</div>
             <div class="chart-shell compact-chart" id="residual-chart" hidden></div>
@@ -543,7 +577,7 @@
                 <caption class="sr-only">Largest unexplained quota movement periods</caption>
                 <thead>
                   <tr>
-                  <th scope="col">Exact local / UTC time</th>
+                  <th scope="col" id="residual-time-heading">Local time</th>
                   <th scope="col">Observed</th>
                   <th scope="col">Expected</th>
                   <th scope="col">Difference</th>
@@ -555,123 +589,232 @@
                 </tbody>
               </table>
             </div>
+            <!--
+              Simple pagination (owner-directed, 2026-08-08): ten rows per
+              page over the full merged inspection list, with the shown range
+              stated as "N–M of T". The status span is written by the
+              renderer, so it starts empty rather than carrying placeholder
+              copy.
+            -->
+            <div class="table-pagination" id="residual-pagination" hidden>
+              <button class="button button-quiet compact" id="residual-page-prev" type="button" disabled>Previous</button>
+              <span class="table-pagination-status" id="residual-page-status" role="status"></span>
+              <button class="button button-quiet compact" id="residual-page-next" type="button" disabled>Next</button>
+            </div>
           </article>
         </div>
         </details>
+        <article class="panel divergence-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Divergence periods</p>
+              <h3>Where observed and priced usage diverge</h3>
+            </div>
+          </div>
+          <p class="annotation">
+            Sustained stretches where provider-reported quota movement and the
+            movement implied by priced usage persistently disagree. A single
+            spike that cancels out is not listed. Expand a period to reprice just
+            that window and see its cost mix by model and speed.
+          </p>
+          <p class="timeline-confidence" id="divergence-summary" role="status" hidden></p>
+          <p class="annotation" id="divergence-caveat" hidden></p>
+          <div class="chart-empty small" id="divergence-empty" hidden></div>
+          <ol class="divergence-list" id="divergence-list"></ol>
+        </article>
+        <article class="panel chart-panel">
+          <div class="chart-heading">
+            <div>
+              <h3 id="usage-timeline-title">API-price-equivalent usage over time</h3>
+              <p id="usage-timeline-copy">Local usage over time</p>
+            </div>
+            <div class="chart-control-stack">
+              <div class="segmented-control" id="usage-group-controls" aria-label="Usage grouping" data-i18n-aria-label="aria.usageGrouping">
+                <button type="button" data-group="hour" class="active" aria-pressed="true">Hour</button>
+                <button type="button" data-group="day">Day</button>
+                <button type="button" data-group="week">Week</button>
+              </div>
+              <div class="segmented-control" id="range-controls" aria-label="Usage chart date range" data-i18n-aria-label="aria.usageDateRange">
+                <button type="button" data-days="1">24h</button>
+                <button type="button" data-days="7" class="active" aria-pressed="true">7d</button>
+                <button type="button" data-days="30">30d</button>
+                <button type="button" data-days="36500">All</button>
+              </div>
+              <div class="chart-navigation" aria-label="Usage zoom and pan" data-i18n-aria-label="aria.usageZoomPan">
+                <button class="button button-quiet compact" id="usage-pan-back" type="button" title="Pan usage earlier" data-i18n-title="title.panUsageEarlier">← Earlier</button>
+                <button class="button button-quiet compact" id="usage-zoom-out" type="button" title="Zoom out" data-i18n-title="title.zoomOut">−</button>
+                <button class="button button-quiet compact" id="usage-zoom-in" type="button" title="Zoom in" data-i18n-title="title.zoomIn">+</button>
+                <button class="button button-quiet compact" id="usage-reset-zoom" type="button">Reset view</button>
+                <button class="button button-quiet compact" id="usage-pan-forward" type="button" title="Pan usage later" data-i18n-title="title.panUsageLater">Later →</button>
+                <span class="sr-only" id="usage-zoom-status" aria-live="polite"></span>
+              </div>
+              <div class="legend compact-legend" aria-label="Usage chart legend" data-i18n-aria-label="aria.usageLegend">
+                <span><i class="legend-dot cost"></i>API-price-equivalent usage</span>
+                <span><i class="legend-dot allowance"></i>Seven-day allowance remaining</span>
+              </div>
+            </div>
+          </div>
+          <div class="chart-empty" id="usage-timeline-empty">
+            <strong>No real usage timeline loaded</strong>
+            <p>Analyze local usage to build recent content-free usage buckets.</p>
+          </div>
+          <div class="chart-shell" id="usage-timeline-chart" hidden></div>
+          <p class="series-coverage" id="usage-timeline-coverage" role="status" hidden></p>
+          <div class="chart-summary-grid" id="usage-timeline-summary"></div>
+        </article>
+
       </section>
 
-      <section class="dashboard-section" id="accounting" aria-labelledby="accounting-title" data-dashboard-page="method" data-requires-evidence>
+      <section class="dashboard-section dashboard-page-inactive" id="accounting" aria-labelledby="accounting-title" data-dashboard-page="method" data-requires-evidence aria-hidden="true" inert>
         <div class="section-heading split">
           <div>
             <p class="eyebrow">04 · Cost accounting</p>
             <h2 id="accounting-title">How the estimate was calculated</h2>
           </div>
-          <div class="segmented-control" id="accounting-period-controls" aria-label="Accounting period">
+          <div class="segmented-control" id="accounting-period-controls" aria-label="Accounting period" data-i18n-aria-label="aria.accountingPeriod">
             <button type="button" data-period="24h">24h</button>
             <button type="button" data-period="7d" class="active" aria-pressed="true">7d</button>
             <button type="button" data-period="30d">30d</button>
-            <button type="button" data-period="all">All</button>
+            <button type="button" data-period="history" hidden>Indexed history</button>
           </div>
         </div>
         <div class="notice notice-info accounting-disclosure">
           <div>
             <strong>API pricing is a measuring stick, not your bill.</strong>
             <p>
-              Every local usage increment is repriced with the public Standard
-              API rate card, then multiplied by the published Fast credit rate
-              when its effective mode is Fast. The result is a quota-weighted
-              API-price equivalent, not an invoice.
+              Each local usage change uses the public API price that was in
+              effect when it occurred, with the published Fast multiplier when
+              applicable. It is an equivalent for comparison, not an invoice.
             </p>
           </div>
         </div>
+        <ul class="evidence-warnings" id="accounting-warnings" hidden></ul>
         <div class="metric-grid accounting-summary" id="accounting-summary"></div>
-        <div class="two-column">
+        <div class="two-column accounting-component-grid">
           <article class="panel">
             <div class="panel-heading">
               <div>
                 <p class="panel-kicker">Token components</p>
-                <h3>Non-overlapping token components</h3>
+                <h3>Token count</h3>
               </div>
             </div>
             <p class="annotation">
-              Output text excludes reasoning tokens. Combined output is used only
-              when a source does not provide that split, and is never added again.
+              Every token belongs to one non-overlapping component.
+              Output text excludes reasoning tokens; combined output is only used
+              when a source does not provide that split.
             </p>
-            <div class="accounting-bars" id="accounting-components"></div>
+            <div class="accounting-bars" id="accounting-component-counts"></div>
           </article>
           <article class="panel">
             <div class="panel-heading">
               <div>
-                <p class="panel-kicker">Models</p>
-                <h3>Recognized and unknown model usage</h3>
+                <p class="panel-kicker">Cost contribution</p>
+                <h3>API-equivalent cost</h3>
               </div>
             </div>
+            <p class="annotation">
+              Standard-rate API equivalent by component. Coverage and price
+              provenance stay visible without adding a guessed cost.
+            </p>
+            <div class="accounting-bars" id="accounting-component-costs"></div>
+          </article>
+        </div>
+        <article class="panel accounting-models-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Models</p>
+              <h3>Model usage</h3>
+            </div>
+          </div>
             <div class="table-wrap">
               <table>
-                <caption class="sr-only">Replay-safe usage grouped by recognized model</caption>
-                <thead><tr><th>Model</th><th>Usage increments</th><th>Tokens</th><th>API equivalent</th></tr></thead>
+                <caption class="sr-only">Replay-safe usage grouped by model, across every allowance</caption>
+                <thead><tr><th>Model</th><th>Usage changes</th><th>Tokens</th><th>API equivalent</th></tr></thead>
                 <tbody id="accounting-models"></tbody>
               </table>
             </div>
-            <p class="annotation">
-              Any unrecognized model is kept as an explicit overflow row. Its
-              tokens remain visible, but no price is invented.
+            <p class="annotation" id="accounting-price-coverage" hidden></p>
+            <!--
+              The expansion of the marker each separately metered row carries.
+              The asterisk itself is drawn by the stylesheet so this stays one
+              translated sentence rather than a sentence plus a glyph.
+            -->
+            <p class="annotation model-allowance-footnote">
+              A model on a separate allowance is listed on its own row and
+              carries no API equivalent, because that figure cannot be compared
+              with the main allowance. Nothing unavailable is replaced with an
+              invented cost.
             </p>
-          </article>
-        </div>
-      </section>
-
-      <section class="dashboard-section" id="coverage" aria-labelledby="coverage-title" data-dashboard-page="method" data-requires-evidence>
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">05 · Reading the estimate</p>
-            <h2 id="coverage-title">When to treat this as an estimate</h2>
-          </div>
-          <p>
-            TiboTattle shows only the few conditions that materially affect the
-            allowance estimate. Everything else stays in local diagnostics.
-          </p>
-        </div>
-
-        <article class="panel blind-spots">
-          <div class="panel-heading">
-            <div>
-              <p class="panel-kicker">Good to know</p>
-              <h3>What could change this estimate</h3>
-            </div>
-          </div>
-          <div id="blind-spot-list" class="issue-list">
-            <div class="empty-inline">No quality artifact loaded.</div>
-          </div>
         </article>
       </section>
 
       <section
-        class="contribution-cta"
-        id="contribution-cta"
+        class="contribution-cta dashboard-page-inactive"
+        id="community"
         aria-labelledby="contribution-cta-title"
         data-dashboard-page="community"
         data-requires-evidence
+        aria-hidden="true"
+        inert
       >
+        <!--
+          The guided journey, stated as stages with visible state. Every chip
+          and detail line is rendered from measured facts: companion health,
+          the counted index sources, the freshness of local evidence, and the
+          sign-in / connection state. Each detail line is one short sentence
+          (owner-directed 2026-08-08: the previous multi-clause copy wrapped
+          to eight lines at typical widths), and the whole journey states the
+          final flow: sign in → connect → approve once → syncs automatically.
+        -->
+        <ol class="journey-stages" id="community-journey" aria-label="Contribution journey stages" data-i18n-aria-label="aria.contributionJourney">
+          <li class="journey-stage" id="journey-stage-app">
+            <p class="journey-stage-head">
+              <span class="journey-stage-name">Mac app &amp; companion</span>
+              <span class="evidence-chip neutral journey-stage-state" id="journey-stage-app-state">—</span>
+            </p>
+            <p class="journey-stage-detail" id="journey-stage-app-detail"></p>
+          </li>
+          <li class="journey-stage" id="journey-stage-index">
+            <p class="journey-stage-head">
+              <span class="journey-stage-name">Local usage index</span>
+              <span class="evidence-chip neutral journey-stage-state" id="journey-stage-index-state">—</span>
+            </p>
+            <p class="journey-stage-detail" id="journey-stage-index-detail"></p>
+          </li>
+          <li class="journey-stage" id="journey-stage-evidence">
+            <p class="journey-stage-head">
+              <span class="journey-stage-name">Local evidence</span>
+              <span class="evidence-chip neutral journey-stage-state" id="journey-stage-evidence-state">—</span>
+            </p>
+            <p class="journey-stage-detail" id="journey-stage-evidence-detail"></p>
+          </li>
+          <li class="journey-stage" id="journey-stage-community">
+            <p class="journey-stage-head">
+              <span class="journey-stage-name">Sign in &amp; approve</span>
+              <span class="evidence-chip neutral journey-stage-state" id="journey-stage-community-state">—</span>
+            </p>
+            <p class="journey-stage-detail" id="journey-stage-community-detail"></p>
+          </li>
+        </ol>
         <div class="contribution-cta-copy">
           <p class="eyebrow">Optional</p>
-          <h2 id="contribution-cta-title">Share one anonymous summary</h2>
+          <h2 id="contribution-cta-title">Contribute anonymous usage data</h2>
           <p>
-            Improve community estimates with one reviewed, content-free result.
-            You see the exact prepared export before anything is sent.
+            Help improve community estimates: sign in, then approve once. You
+            see the covered data before anything is sent; after approval it
+            stays current automatically.
           </p>
           <details class="contribution-categories">
             <summary>What leaves this Mac — and what never does</summary>
             <div>
               <p>
-                May be shared: timestamps, token counts, safe model labels,
-                coarse tool and surface categories, and observed allowance
-                percentages.
+                Shared: times, token counts, model names, broad activity
+                categories, and how much of your allowance was left.
               </p>
               <p>
-                Never shared: prompts, responses, reasoning, files, paths,
-                URLs, commands, account names, email addresses, identifiers,
-                or credentials.
+                Never shared: anything you typed or a model wrote, file names,
+                folders, links, commands, your name, your email, or any account
+                or login details.
               </p>
             </div>
           </details>
@@ -679,14 +822,13 @@
         <div class="contribution-cta-action">
           <div class="identity-signin" id="identity-signin">
             <p class="control-label">
-              Sign in for hosted contribution
+              Sign in to contribute
               <span class="evidence-chip neutral" id="identity-signin-state">Not signed in</span>
             </p>
             <p class="annotation">
-              Hosted participation requires signing in with Google or Apple.
-              The service stores only an irreversible hash of that sign-in —
-              never your email or name — and this page keeps the sign-in token
-              in memory only. Local-only use needs no account.
+              Contributing uses your Google or Apple sign-in. We keep a
+              scrambled version of it that cannot be turned back into your email
+              or your name. Using TiboTattle on your own needs no account.
             </p>
             <!--
               Both vendor marks are drawn once here as inline SVG symbols and
@@ -725,10 +867,8 @@
               </span>
               <span class="identity-account-copy">
                 <strong id="identity-account-provider">Signed in with Google</strong>
-                <small>
-                  Signing out only forgets this sign-in on this page. It deletes
-                  nothing: metadata already contributed stays until you delete it
-                  in Hosted privacy controls.
+                <small id="identity-account-detail">
+                  Signing out ends this app's contribution session.
                 </small>
               </span>
               <!--
@@ -745,7 +885,7 @@
                 Check sign-in
               </button>
               <button class="button button-quiet" id="identity-signin-cancel" type="button">
-                Cancel
+                Cancel sign-in
               </button>
             </div>
             <p class="annotation" id="identity-google-unavailable" hidden>
@@ -756,503 +896,130 @@
             </p>
             <p class="participant-action-status" id="identity-signin-status" role="status" hidden></p>
           </div>
-          <label class="consent-row contribution-primary-consent">
-            <input id="community-connect-consent" type="checkbox">
-            <span>
-              <strong>I consent to review and submit this metadata.</strong>
-              <small>
-                The result is shown for review before anything is sent.
-              </small>
-            </span>
-          </label>
-          <div class="contribution-cta-buttons">
-            <button class="button button-primary" id="connect-community" type="button" disabled>
-              Review contribution
-            </button>
-            <button class="button button-quiet" id="contribution-not-now" type="button">
-              Not now
-            </button>
-          </div>
-          <p class="participant-action-status" id="community-connect-status" role="status" hidden></p>
-          <details class="automatic-contribution-status" id="automatic-contribution-status" aria-live="polite" hidden>
-            <summary>Automatic contribution (advanced)</summary>
-            <div>
-              <strong>Automatic contribution</strong>
-              <span class="evidence-chip neutral" id="automatic-contribution-state">Off</span>
-            </div>
-            <p id="automatic-contribution-description">
-              Off until you explicitly consent. No daemon or login item is installed;
-              checks run only while TiboTattle is open.
-            </p>
-            <!--
-              Deliberately not a "compact" button, for the same reason as sign
-              out above: this is the only in-page way to stop recurring
-              contribution, so it keeps the full 44px target rather than the
-              37px compact one, and stays clear of any rule that hides compact
-              controls at narrow widths.
-            -->
-            <button
-              class="button button-quiet"
-              id="automatic-contribution-toggle"
-              type="button"
-              hidden
-            >
-              Turn off automatic contribution
-            </button>
-          </details>
-        </div>
-      </section>
+          <!--
+            One surface (owner-directed 2026-08-08): the connect card and the
+            approve card are collapsed into this single ceremony, directly
+            under sign-in — no scrolling between two cards. A user does:
+            Sign in → Review and approve. Nothing else. The single button
+            mints the pairing WITH the v1.0 consent (the server session is
+            already held), has the companion claim it — the claim records the
+            server-side consent-once grant — then records the local
+            approve-once consent with the review token and starts the first
+            sync pass immediately.
 
-      <section class="dashboard-section" id="data" data-dashboard-page="data" data-nav-target aria-labelledby="data-title">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">06 · Data &amp; privacy</p>
-            <h2 id="data-title">Local by default. Contribute by choice.</h2>
-          </div>
-          <p>
-            Raw logs are read by the loopback companion, not the webpage. A contribution
-            must be a privacy-stripped export and is validated again by the server.
-            Hosted participation requires signing in with Google or Apple; the service
-            stores only an irreversible hash of that sign-in, never your email or name.
-            Local-only use needs no account.
-          </p>
-        </div>
-
-        <div class="boundary-diagram" role="img" aria-label="Raw logs remain local. The local companion extracts content-free metadata for the dashboard. Only a reviewed safe export can be sent to the contribution service.">
-          <div class="boundary-node private">
-            <span>On your computer</span>
-            <strong>Raw Codex logs</strong>
-            <small>Prompts, responses, paths never enter this page</small>
-          </div>
-          <span class="boundary-arrow" aria-hidden="true">→</span>
-          <div class="boundary-node local">
-            <span>Loopback only</span>
-            <strong>Local companion</strong>
-            <small>Reads logs, prices usage, builds safe summaries</small>
-          </div>
-          <span class="boundary-arrow optional" aria-hidden="true">⇢</span>
-          <div class="boundary-node community">
-            <span>Optional</span>
-            <strong>Validated contribution</strong>
-            <small>Content-free schema, bounded size, explicit consent</small>
-          </div>
-        </div>
-
-        <details class="panel schema-inspection">
-          <summary>
-            <span>
-              <span class="panel-kicker">Pre-upload inspection</span>
-              <strong>Exact metadata categories a contribution may contain</strong>
-            </span>
-            <span class="evidence-chip">Closed schema</span>
-          </summary>
-          <div class="schema-grid">
-            <div>
-              <h3>Permitted metadata</h3>
-              <ul>
-                <li>Observation, event and reset timestamps</li>
-                <li>Uncached input, cached input, cache write, text output, reasoning output and combined-output token counts</li>
-                <li>Recognized model declaration or safe opaque model fingerprint</li>
-                <li>Subscription speed and separately observed API service tier</li>
-                <li>Coarse surface, agent scope and child-rollout lineage classes</li>
-                <li>Coarse tool-class counts</li>
-                <li>Quota percentage, window duration, slot and reset timing</li>
-                <li>Domain-separated participant, account, session, event and snapshot pseudonyms where the selected contract permits them</li>
-                <li>Schema, pricing, parser and consent provenance plus fixed diagnostics</li>
-              </ul>
-            </div>
-            <div class="excluded">
-              <h3>Never collected or uploaded</h3>
-              <ul>
-                <li>Prompts, responses or reasoning text</li>
-                <li>Tool names, arguments, commands or command output</li>
-                <li>URLs, files, paths, repositories, branches or working directories</li>
-                <li>Email addresses, account names, hostnames or usernames</li>
-                <li>Raw participant, device, account, session or request identifiers</li>
-                <li>Credentials, cookies, API keys, tokens or authorization material</li>
-                <li>Arbitrary labels, unknown fields or free-form metadata</li>
-              </ul>
-            </div>
-          </div>
-          <p class="backend-contract-note">
-            Browser validation is a preflight. The Worker decrypts into bounded
-            memory, validates the same closed schema again, rejects content canaries,
-            and recalculates API-price-equivalent values before D1 ingestion.
-          </p>
-        </details>
-
-        <details class="journey-disclosure journey-progressive" id="community-contribution-disclosure">
-          <summary>
-            <span>
-              <span class="panel-kicker">Advanced details</span>
-              <strong>Contribution, service, and account controls</strong>
-            </span>
-            <span class="evidence-chip neutral">Closed until you choose it</span>
-          </summary>
-        <div class="two-column data-panels">
-          <article class="panel">
+            The surface stays out of the document until the local companion's
+            health payload advertises the v1.0 sync capability, because until
+            that transport exists it would describe an upload that cannot
+            happen. The review-bootstrap the approve gate requires (one
+            verified real instance of the covered data on screen) is produced
+            invisibly: the page prepares and verifies it by itself and
+            renders the facts below, so the reader meets one review and one
+            button, never preparation steps.
+          -->
+          <section class="panel incremental-consent" id="incremental-consent" aria-labelledby="incremental-consent-title" hidden>
             <div class="panel-heading">
               <div>
-                <p class="panel-kicker">Local collector</p>
-                <h3>Source and analysis status</h3>
+                <p class="panel-kicker">Approve once</p>
+                <h3 id="incremental-consent-title">Automatic full-history contribution</h3>
               </div>
-              <span class="evidence-chip" id="collector-state">Unknown</span>
-            </div>
-            <dl class="definition-grid" id="collector-details">
-              <div><dt>Last analysis</dt><dd>—</dd></div>
-              <div><dt>Safe records</dt><dd>—</dd></div>
-              <div><dt>Source bytes</dt><dd>Not exposed to browser</dd></div>
-              <div><dt>Identity</dt><dd>Pseudonymous</dd></div>
-            </dl>
-            <section class="index-progress" id="index-progress" aria-live="polite" hidden>
-              <div class="index-progress-heading">
-                <strong id="index-progress-title">Analyzing recent local history</strong>
-                <span class="evidence-chip neutral" id="index-progress-phase">Waiting</span>
-              </div>
-              <progress id="index-progress-bar" max="1" value="0"></progress>
-              <p id="index-progress-summary">
-                The local companion has not started a bounded local analysis.
-              </p>
-              <p class="annotation" id="index-progress-coverage">
-                Raw log contents and source paths never enter this page.
-              </p>
-              <p class="annotation safe-close-guidance" id="index-progress-close-guidance">
-                You may close this browser tab while analysis continues. Keep
-                the TiboTattle app open; closing it ends the local companion
-                and preserves the last durable checkpoint for a later resume.
-              </p>
-            </section>
-            <div class="privacy-lists">
-              <div>
-                <strong>Included</strong>
-                <ul><li>Timestamps and models</li><li>Token components and quota observations</li><li>Coarse tool and surface categories</li></ul>
-              </div>
-              <div class="excluded">
-                <strong>Excluded</strong>
-                <ul><li>Prompts and responses</li><li>Files, paths, commands and arguments</li><li>Email and account names</li></ul>
-              </div>
-            </div>
-          </article>
-
-          <article class="panel contribution-panel" id="contribution-review">
-            <div class="panel-heading">
-              <div>
-                <p class="panel-kicker">Review before the first send</p>
-                <h3>Review a content-free contribution</h3>
-              </div>
-              <span class="evidence-chip neutral" id="service-state">Checking service</span>
+              <span class="evidence-chip neutral" id="incremental-consent-state">Not approved</span>
             </div>
             <p class="annotation">
-              Preparation reads the latest bounded interval locally and performs no
-              upload. Inspect the concise summary, expand the exact JSON if wanted,
-              then confirm the first send.
+              Approval covers the kind of data, once — after it, your full
+              history uploads and stays current without per-batch review.
             </p>
-            <div class="local-preparation">
-              <p class="control-label">Prepare and review evidence</p>
-              <div class="preparation-readiness">
-                <strong>Preparation identity</strong>
-                <span class="evidence-chip neutral" id="preparation-identity">Checking</span>
-              </div>
-              <div class="preparation-window">
-                <span class="control-label">Evidence to prepare</span>
-                <div class="segmented-control" id="contribution-lookback-controls" aria-label="Contribution preparation lookback">
-                  <button type="button" data-lookback-hours="1">1 hour</button>
-                  <button type="button" data-lookback-hours="24" class="active" aria-pressed="true">24 hours</button>
-                  <button type="button" data-lookback-hours="168">7 days</button>
-                </div>
-              </div>
-              <p class="annotation" id="preparation-estimate">
-                Analyze local usage to estimate the number of privacy-safe
-                records and upload batches before preparation.
-              </p>
-              <button class="button button-secondary" id="prepare-contribution" type="button">
-                Prepare and review last 24 hours
-              </button>
-              <p class="participant-action-status" id="prepare-contribution-status" role="status">
-                Nothing is sent until you separately inspect and choose a send action.
-                A dense seven-day selection may exceed the single reviewed-set safety cap;
-                if so, choose 24 hours instead.
-              </p>
-            </div>
-            <details class="manual-contribution">
-              <summary>Advanced: use an existing TiboTattle export</summary>
-              <p class="annotation">
-                Choose a <code>.json</code> file created by TiboTattle. Do not
-                choose a <code>.jsonl</code> file, a sessions folder, or a raw Codex log.
-              </p>
-            <form id="contribution-form">
-              <label class="file-drop" for="contribution-file">
-                <input id="contribution-file" name="export" type="file" accept=".json,application/json" required>
-                <span aria-hidden="true">＋</span>
-                <strong>Choose a TiboTattle .json export</strong>
-                <small id="file-help">Not a Codex log or .jsonl file · 1.25 MB browser validation limit</small>
-              </label>
-              <section
-                class="selected-contribution-inspection"
-                id="selected-contribution-inspection"
-                aria-live="polite"
-                hidden
-              >
-                <div class="panel-heading compact-heading">
-                  <div>
-                    <p class="panel-kicker">Selected export inspection</p>
-                    <h4>Exact retained fields and values</h4>
-                  </div>
-                  <span class="evidence-chip neutral" id="selected-contribution-state">Not validated</span>
-                </div>
-                <p class="annotation" id="selected-contribution-message">
-                  Choose a TiboTattle export to validate it locally.
-                </p>
-                <dl class="backend-facts selected-contribution-facts">
-                  <div><dt>Schema</dt><dd id="selected-contribution-schema">—</dd></div>
-                  <div><dt>Exact bytes</dt><dd id="selected-contribution-bytes">—</dd></div>
-                  <div><dt>Usage rows</dt><dd id="selected-contribution-usage">—</dd></div>
-                  <div><dt>Quota rows</dt><dd id="selected-contribution-quota">—</dd></div>
-                </dl>
-                <details class="exact-json-inspection">
-                  <summary>Review every validated field and value</summary>
-                  <pre id="selected-contribution-json"></pre>
-                </details>
-                <p class="backend-contract-note">
-                  This is the complete plaintext contribution. These exact values
-                  are encrypted in your browser; raw logs and any field not shown
-                  here are not sent.
-                </p>
-              </section>
-              <label class="consent-row">
-                <input id="contribution-consent" type="checkbox" required>
-                <span>
-                  <strong id="contribution-consent-title">I reviewed this as a privacy-safe TiboTattle export.</strong>
-                  <small id="contribution-consent-detail">Uploading is optional and can be tested against a local backend.</small>
-                </span>
-              </label>
-              <button class="button button-primary" id="contribution-submit" type="submit" disabled>
-                Validate and contribute
-              </button>
-            </form>
-            </details>
-            <div class="upload-status" id="upload-status" role="status" hidden></div>
-          </article>
-        </div>
-
-        <details class="panel sync-status-panel" aria-labelledby="sync-status-title" hidden>
-          <summary class="sync-panel-summary">
-            <div>
-              <p class="panel-kicker">Contribution activity</p>
-              <h3 id="sync-status-title">Advanced queue and exact review</h3>
-            </div>
-            <span class="evidence-chip neutral" id="sync-state">Checking queue</span>
-          </summary>
-          <div class="sync-panel-body">
-          <p class="annotation" id="sync-description">
-            The local queue contains metadata about committed, privacy-verified
-            batches only. It never contains prompts, responses, source paths,
-            account names, browser sessions, or device secrets.
-          </p>
-          <dl class="backend-facts sync-facts">
-            <div><dt>Waiting</dt><dd id="sync-waiting">—</dd></div>
-            <div><dt>In flight</dt><dd id="sync-in-flight">—</dd></div>
-            <div><dt>Accepted</dt><dd id="sync-accepted">—</dd></div>
-            <div><dt>Needs attention</dt><dd id="sync-attention">—</dd></div>
-            <div><dt>Next attempt</dt><dd id="sync-next-attempt">—</dd></div>
-            <div><dt>Last accepted</dt><dd id="sync-last-accepted">—</dd></div>
-          </dl>
-          <div class="sync-next-card" id="sync-next-card">
-            <div class="panel-heading compact-heading">
+            <ul class="incremental-consent-facts">
+              <li>Your full usage history uploads first; new events then upload roughly every 6 hours.</li>
+              <li>Community estimates recompute when your data or corrections to it arrive, including for past months.</li>
+            </ul>
+            <details class="contribution-categories">
+              <summary>The exact kind of data covered</summary>
               <div>
-                <p class="panel-kicker">Next verified upload</p>
-                <h4 id="sync-next-title">Inspect before sending</h4>
-              </div>
-              <span class="evidence-chip neutral" id="sync-next-state">Not inspected</span>
-            </div>
-            <dl class="backend-facts sync-next-facts">
-              <div><dt>Covered period</dt><dd id="sync-next-coverage">—</dd></div>
-              <div><dt>Safe records</dt><dd id="sync-next-records">—</dd></div>
-              <div><dt>API-price estimate</dt><dd id="sync-next-cost">—</dd></div>
-              <div><dt>Upload reservation</dt><dd id="sync-next-bytes">—</dd></div>
-            </dl>
-            <div class="sync-actions" aria-label="Foreground contribution controls">
-              <button class="button button-secondary" id="sync-inspect" type="button">
-                Inspect next
-              </button>
-              <button class="button button-primary" id="sync-run-once" type="button">
-                Send reviewed upload
-              </button>
-              <button class="button button-secondary" id="sync-pause" type="button">
-                Pause
-              </button>
-              <button class="button button-secondary" id="sync-resume" type="button">
-                Resume
-              </button>
-            </div>
-            <p class="annotation">
-              Sending stays disabled until you open the exact local review for
-              the current queued contribution.
-            </p>
-            <p class="participant-action-status" id="sync-action-status" role="status" hidden></p>
-            <details class="sync-exact-review" id="sync-exact-review" hidden>
-              <summary>
-                <span>Review exact content-free metadata JSON</span>
-                <span class="evidence-chip" id="sync-exact-review-state">Verified</span>
-              </summary>
-              <p class="annotation">
-                This verified JSON is read from the owner-only prepared set over
-                loopback. It has not been sent to the contribution service.
-              </p>
-              <pre id="sync-exact-review-json" tabindex="0"></pre>
-            </details>
-            <p class="backend-contract-note">
-              Inspection uses loopback only: it performs no service request,
-              key fetch, authorization, or upload. The send action consumes a
-              ten-minute, single-use local authorization and can claim only the
-              exact reviewed queue job. The broader foreground CLI retains its
-              independent bounded multi-job and upload-byte limits.
-            </p>
-          </div>
-          <p class="backend-contract-note">
-            Automatic checks run at most every 6 hours while TiboTattle is
-            open and only after explicit consent. No login item, LaunchAgent,
-            daemon or silent background process is installed.
-          </p>
-          </div>
-        </details>
-
-        <article class="panel backend-panel" id="backend" data-nav-target aria-labelledby="backend-title">
-          <div class="panel-heading">
-            <div>
-              <p class="panel-kicker">Optional community service</p>
-              <h3 id="backend-title">Community backend readiness and data lifecycle</h3>
-            </div>
-            <span class="evidence-chip neutral" id="backend-state">Checking backend</span>
-          </div>
-          <p class="annotation" id="backend-description">
-            This optional service is separate from the local collector above.
-            Your local reporting works whether or not it is reachable, and
-            nothing leaves this Mac unless you choose to contribute.
-          </p>
-          <details class="journey-disclosure service-detail-disclosure" id="backend-service-detail">
-            <summary>
-              <span><strong>Service readiness and lifecycle detail</strong></span>
-            </summary>
-            <div class="service-detail-body">
-          <p class="annotation" id="backend-readiness-note">
-            Live readiness verifies database and encrypted-object access,
-            fresh retention and restore replay, object reconciliation, and
-            aggregate rebuild state. The repeatable backend suite covers the
-            complete ingestion, isolation, export, and deletion lifecycle.
-          </p>
-          <dl class="backend-facts" id="backend-facts">
-            <div><dt>Database</dt><dd id="backend-database">Checking</dd></div>
-            <div><dt>Deletion ledger</dt><dd id="backend-deletion-ledger">Checking</dd></div>
-            <div><dt>Encrypted quarantine</dt><dd id="backend-storage">Checking</dd></div>
-            <div><dt>Retention &amp; restore replay</dt><dd id="backend-lifecycle">Checking</dd></div>
-            <div><dt>Object reconciliation</dt><dd id="backend-reconciliation">Checking</dd></div>
-            <div><dt>Aggregate rebuild</dt><dd id="backend-aggregate-rebuild">Checking</dd></div>
-            <div><dt>Collection state</dt><dd id="backend-collection-state">Checking</dd></div>
-            <div><dt>Enrollment</dt><dd id="backend-enrollment">Checking</dd></div>
-            <div><dt>Upload registration</dt><dd id="backend-upload-registration">Checking</dd></div>
-            <div><dt>Ingestion processing</dt><dd id="backend-processing">Checking</dd></div>
-            <div><dt>Aggregate publication</dt><dd id="backend-publication">Checking</dd></div>
-            <div><dt>Participant rights</dt><dd id="backend-participant-rights">Checking</dd></div>
-            <div><dt>Accepted upload contract</dt><dd id="backend-contract">Checking</dd></div>
-          </dl>
-          <ol class="backend-flow" aria-label="Contribution backend lifecycle">
-            <li><strong>1</strong><span>Browser validation</span><small>Reject raw or oversized files before upload</small></li>
-            <li><strong>2</strong><span>Encrypted transport</span><small>One-use upload authorization and envelope encryption</small></li>
-            <li><strong>3</strong><span>Server validation</span><small>Closed schema, content-field rejection, and canonical repricing</small></li>
-            <li><strong>4</strong><span>Transactional ingest</span><small>Idempotent deduplication into participant-isolated records</small></li>
-            <li><strong>5</strong><span>Private analysis</span><small>Personal cost, quota movement, and calibration results</small></li>
-            <li><strong>6</strong><span>Delayed aggregate</span><small>Thresholded, clipped, rounded community snapshots</small></li>
-              <li><strong>7</strong><span>User control</span><small>Explicit hosted deletion remains available</small></li>
-            <li><strong>8</strong><span>Lifecycle enforcement</span><small>Seven-day quarantine cleanup and deletion-safe restore replay</small></li>
-          </ol>
-          <div class="backend-contract-note" id="backend-contract-note">
-            Account-scoped v0.2 ingest is disabled by default. A separately
-            configured loopback-only preview can exercise the complete HTTP path;
-            external participants remain unauthorized.
-          </div>
-            </div>
-          </details>
-        </article>
-
-        <div class="two-column result-panels">
-          <article class="panel personal-result-panel" id="history" data-nav-target>
-            <div class="panel-heading">
-              <div>
-                <p class="panel-kicker">Your contributed evidence</p>
-                <h3>Your contribution receipt</h3>
-              </div>
-            </div>
-            <p class="annotation">
-              Accepted intervals and private calculations appear here. Personal
-              reporting remains in this local app; contribution helps improve the
-              delayed community view.
-            </p>
-            <div class="result-summary" id="personal-result">
-              <p>No accepted contribution is associated with this browser yet.</p>
-            </div>
-            <details class="contribution-history-disclosure">
-              <summary>Contribution history</summary>
-              <section
-                class="participant-detail contribution-history"
-                id="contribution-history"
-                aria-label="Private contribution history"
-                hidden
-              ></section>
-            </details>
-            <div class="participant-controls" id="participant-controls" hidden>
-              <details class="privacy-controls">
-                <summary>Hosted privacy controls</summary>
                 <p>
-                  Permanently remove the content-free pseudonymous metadata
-                  associated with this hosted contribution session.
+                  Covered: token counts, model identifiers or keyed
+                  fingerprints, tier, surface and outcome categories,
+                  timestamps, quota percentages, tool-class counts per
+                  session, and stable pseudonymous session identifiers.
                 </p>
-                <button class="button button-danger" id="delete-participant" type="button">
-                  Delete all contributed metadata
-                </button>
-                <p class="participant-action-status" id="participant-action-status" role="status" hidden></p>
-              </details>
-            </div>
-          </article>
-          <article class="panel community-result-panel" id="community" data-nav-target>
-            <div class="panel-heading">
-              <div>
-                <p class="panel-kicker">Delayed community evidence</p>
-                <h3>Published weekly snapshot</h3>
-              </div>
-            </div>
-            <div class="result-summary" id="community-result">
-              <p>Checking for the latest delayed weekly snapshot…</p>
-            </div>
-            <details class="journey-disclosure service-detail-disclosure" id="community-snapshot-provenance">
-              <summary>
-                <span><strong>How this snapshot is produced</strong></span>
-              </summary>
-              <div class="service-detail-body">
-                <div id="community-snapshot-service-detail"></div>
-                <p class="annotation">
-                  Community values use a fixed delay, independent per-cell support,
-                  participant-level clipping, and coarse rounding. A sealed
-                  revision is never rewritten; privacy-affecting deletion withdraws
-                  it and schedules a replacement revision without the deleted
-                  source.
+                <p>
+                  Never covered: prompts, responses, file names, paths,
+                  commands, or any account identifier.
                 </p>
               </div>
             </details>
-          </article>
+            <!--
+              One verified real instance of the covered data, prepared and
+              verified on this Mac by the page itself. These facts are the
+              review the approve gate requires; they appear once the local
+              verification succeeds and are never a step the reader performs.
+            -->
+            <dl class="summary-facts incremental-review-facts" id="incremental-review-facts" hidden>
+              <div><dt>Time covered</dt><dd id="incremental-review-coverage">—</dd></div>
+              <div><dt>Items included</dt><dd id="incremental-review-records">—</dd></div>
+              <div><dt>Upload size</dt><dd id="incremental-review-bytes">—</dd></div>
+            </dl>
+            <div class="contribution-cta-buttons">
+              <button class="button button-primary" id="incremental-consent-approve" type="button" disabled>
+                Review and approve
+              </button>
+              <!--
+                Error recovery only: hidden until the invisible review
+                bootstrap fails, so the happy path stays a single button.
+              -->
+              <button class="button button-quiet" id="incremental-review-retry" type="button" hidden>
+                Check again
+              </button>
+            </div>
+            <p class="annotation" id="incremental-consent-gate"></p>
+            <p class="annotation">
+              Approval is asked once. Only a change to the kind of data or the
+              destination asks again.
+            </p>
+            <p class="participant-action-status" id="incremental-consent-status" role="status" hidden></p>
+            <!--
+              The modest status line for the running sync after approval:
+              live first-pass progress as day counts, the paused reason, and
+              the last error code, all from the companion's bounded
+              incremental-status projection. No path, no content, no
+              identifier.
+            -->
+            <p class="annotation" id="incremental-sync-status" role="status" hidden></p>
+            <!--
+              Deletion honesty (owner-directed 2026-08-08): the card used to
+              state "Deletion removes everything you contributed, always."
+              with no control behind it. The sentence is gone; in its place
+              is the working control — the service's participant deletion
+              (DELETE /api/v1/me) removes accepted chunks and stored uploads
+              and tombstones the account. The button appears only with a live
+              contribution session, because deletion requires one.
+            -->
+            <div class="contribution-cta-buttons incremental-delete-row">
+              <button class="button button-quiet" id="delete-contributions" type="button" hidden>
+                Delete my contributions
+              </button>
+            </div>
+          </section>
         </div>
-        </details>
+
+          <!--
+            What the community published lives on the website. It is a link,
+            not a second explanation of the same thing inside the app.
+          -->
+          <p class="community-public-evidence">
+            <a href="https://tibotattle.com/#community" target="_blank" rel="noopener">See what the community published</a>
+          </p>
       </section>
+
     </main>
 
-    <footer>
-      <p>TiboTattle · evidence, uncertainty, and privacy boundaries kept visible.</p>
-      <p class="footer-disclaimer">
-        Named with affection for the Codex community. Not affiliated with or
-        endorsed by OpenAI or Thibault Sottiaux — and we will happily rename if
-        asked. Your tokens tattle only to you.
-      </p>
-      <p id="schema-version">Dashboard contract: waiting</p>
+    <!--
+      Owner-directed 2026-08-08: the "Dashboard contract: …" line is gone from
+      the user-facing footer. The contract version stays discoverable to
+      machines through the payload itself (data.schemaVersion) and on the
+      share card's text transcript; it was never a fact a reader acts on.
+    -->
+    <footer data-i18n-legacy-root>
+      <p>TiboTattle · not affiliated with OpenAI or Thibault Sottiaux</p>
     </footer>
       </div>
     </div>

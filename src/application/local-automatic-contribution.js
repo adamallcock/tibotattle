@@ -1,11 +1,13 @@
 import {
   AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS,
   AUTOMATIC_CONTRIBUTION_LOOKBACK_HOURS,
+  AUTOMATIC_CONTRIBUTION_MAXIMUM_SCHEDULE_DITHER_MILLISECONDS,
   AUTOMATIC_CONTRIBUTION_PRIVACY_CONTRACT_VERSION,
   AUTOMATIC_CONTRIBUTION_REPLAY_OVERLAP_HOURS,
   AUTOMATIC_CONTRIBUTION_SETTINGS_SCHEMA_VERSION,
   AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION,
   AutomaticContributionError,
+  applyAutomaticContributionScheduleDither,
   automaticContributionRequiredConsent,
   claimAutomaticContributionRun,
   completeAutomaticContributionRun,
@@ -83,6 +85,17 @@ function nullableTimestamp(value) {
   if (!Number.isFinite(milliseconds)) return null;
   const normalized = new Date(milliseconds).toISOString();
   return normalized === value ? normalized : null;
+}
+
+function retryAfterAt(now, retryAfterMilliseconds) {
+  if (!Number.isSafeInteger(retryAfterMilliseconds)
+      || retryAfterMilliseconds <= 0) {
+    return null;
+  }
+  const nowMilliseconds = Date.parse(now);
+  const retryAt = nowMilliseconds + retryAfterMilliseconds;
+  if (!Number.isSafeInteger(retryAt)) return null;
+  return nullableTimestamp(new Date(retryAt).toISOString());
 }
 
 function validatedPreparedSetStatus(value, expectedPreparedSetId) {
@@ -206,6 +219,11 @@ function uploadOutcome(value, expectedPending) {
       code: "retry_scheduled",
       pause: false,
       preparedSet,
+      // The runner provides the selected prepared set's queue checkpoint
+      // after applying both the service's Retry-After floor and per-client
+      // retry jitter. The queue-wide status timestamp may belong to a
+      // different set and must never control this recurrence.
+      retryNotBeforeAt: nullableTimestamp(value.retryNotBeforeAt),
     };
   }
   return { code: "upload_failed", pause: true, preparedSet: null };
@@ -246,6 +264,7 @@ class AutomaticContributionControllerBase {
   #settingsFile;
   #storage;
   #randomUuid;
+  #ditherRandom;
   #resolvePath;
   #destinationOrigin;
   #requiredConsent;
@@ -274,6 +293,7 @@ class AutomaticContributionControllerBase {
     uploadRunner,
     maintenanceRunner = async () => {},
     now = () => new Date(),
+    ditherRandom = Math.random,
     setTimeoutImpl = setTimeout,
     clearTimeoutImpl = clearTimeout,
     runTimeoutMilliseconds = DEFAULT_RUN_TIMEOUT_MILLISECONDS,
@@ -287,6 +307,7 @@ class AutomaticContributionControllerBase {
         || typeof uploadRunner !== "function"
         || typeof maintenanceRunner !== "function"
         || typeof now !== "function"
+        || typeof ditherRandom !== "function"
         || typeof setTimeoutImpl !== "function"
         || typeof clearTimeoutImpl !== "function"
         || !Number.isSafeInteger(runTimeoutMilliseconds)
@@ -296,6 +317,7 @@ class AutomaticContributionControllerBase {
     }
     this.#storage = storage;
     this.#randomUuid = randomUuid;
+    this.#ditherRandom = ditherRandom;
     this.#resolvePath = resolvePath;
     this.#settingsFile = this.#resolvePath(settingsFile);
     this.#requiredConsent = automaticContributionRequiredConsent({
@@ -331,6 +353,15 @@ class AutomaticContributionControllerBase {
 
   #nextAttemptAt() {
     return this.#project().nextAttemptAt;
+  }
+
+  #scheduleDitherMilliseconds() {
+    const random = Number(this.#ditherRandom());
+    if (!Number.isFinite(random)) fail("configuration_invalid");
+    const bounded = Math.min(1, Math.max(0, random));
+    return Math.round(
+      bounded * AUTOMATIC_CONTRIBUTION_MAXIMUM_SCHEDULE_DITHER_MILLISECONDS,
+    );
   }
 
   #clearScheduledTimer() {
@@ -399,6 +430,15 @@ class AutomaticContributionControllerBase {
     await this.initialize();
     return this.#serialize(async () => {
       this.#started = true;
+      const staggered = applyAutomaticContributionScheduleDither(this.#settings, {
+        destinationOrigin: this.#destinationOrigin,
+        now: this.#nowIso(),
+        scheduleDitherMilliseconds: this.#scheduleDitherMilliseconds(),
+      });
+      if (JSON.stringify(staggered) !== JSON.stringify(this.#settings)) {
+        this.#settings = staggered;
+        await this.#persist();
+      }
       this.#schedule();
       return this.#project();
     });
@@ -427,6 +467,7 @@ class AutomaticContributionControllerBase {
         intervalHours,
         consent,
         consentedAt: this.#nowIso(),
+        scheduleDitherMilliseconds: this.#scheduleDitherMilliseconds(),
       });
       this.#generation += 1;
       this.#runAbortController?.abort();
@@ -681,9 +722,15 @@ class AutomaticContributionControllerBase {
               );
             }
           } catch (error) {
+            const retryable = !timedOut && error?.retryable === true;
             selectedOutcome = {
-              code: timedOut ? "run_timeout" : "upload_failed",
-              pause: timedOut || error?.retryable !== true,
+              code: timedOut
+                ? "run_timeout"
+                : retryable ? "retry_scheduled" : "upload_failed",
+              pause: !retryable,
+              retryNotBeforeAt: !retryable
+                ? null
+                : retryAfterAt(this.#nowIso(), error?.retryAfterMilliseconds),
             };
           }
         }
@@ -717,6 +764,7 @@ class AutomaticContributionControllerBase {
           preparedSet: selectedOutcome.code === "accepted"
             ? selectedOutcome.preparedSet ?? null
             : null,
+          retryNotBeforeAt: selectedOutcome.retryNotBeforeAt ?? null,
         },
       });
       await this.#persist();
@@ -738,6 +786,8 @@ const AUTOMATIC_CONTRIBUTION_LIMITS = Object.freeze({
   intervalHours: AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS,
   lookbackHours: AUTOMATIC_CONTRIBUTION_LOOKBACK_HOURS,
   replayOverlapHours: AUTOMATIC_CONTRIBUTION_REPLAY_OVERLAP_HOURS,
+  maximumScheduleDitherMilliseconds:
+    AUTOMATIC_CONTRIBUTION_MAXIMUM_SCHEDULE_DITHER_MILLISECONDS,
   runTimeoutMilliseconds: DEFAULT_RUN_TIMEOUT_MILLISECONDS,
   maximumSettingsBytes: MAXIMUM_SETTINGS_BYTES,
 });

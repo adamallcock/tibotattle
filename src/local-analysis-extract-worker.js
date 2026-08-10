@@ -117,9 +117,11 @@ function sameIdentity(stats, task) {
 }
 
 function assertSafeStats(stats, task) {
+  // nlink deliberately unchecked - see the source-boundary note in
+  // local-analysis-index.js; identity (dev/ino/birthtime) and ownership below
+  // are what actually anchor this read to the discovered file.
   if (!stats.isFile()
       || stats.isSymbolicLink()
-      || stats.nlink !== 1
       || (typeof process.getuid === "function" && stats.uid !== process.getuid())
       || !sameIdentity(stats, task)
       || stats.size < task.endByte) {

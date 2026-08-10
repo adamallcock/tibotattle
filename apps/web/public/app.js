@@ -1,24 +1,26 @@
 import {
   CommunityClient,
+  isPrimaryCodexQuotaWindow,
+  isPrimaryCodexWeeklyQuotaWindow,
   LocalCompanionClient,
+  CODEX_PRIMARY_LIMIT_ID,
+  CODEX_SPARK_LIMIT_ID,
+  CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
+  CODEX_WEEKLY_ALLOWANCE_MINUTES,
   demoDashboard,
-  normalizeCommunitySnapshot,
-  normalizeParticipantHistory,
-  normalizeParticipantStats
+  isValidQuotaWindowDuration,
+  selectPrimaryCodexQuotaWindow
 } from "./data-client.js";
 import {
   DIAGNOSTIC_REFERENCE_PATTERN,
-  contributionBatchAdmission,
   createDiagnosticReference,
   createQuotaTimelineLookup,
   createRefreshPollingBudget,
-  createTelemetryEnvelope,
+  detectDeviationPeriods,
   diagnosticErrorCode,
   diagnosticReferenceSentence,
   diagnosticSurface,
-  parseJsonWithUniqueObjectKeys,
   refreshNeedsContinuation,
-  safeApiError,
   serviceRequestId,
   validateContributionForUpload
 } from "./lib.js";
@@ -26,22 +28,39 @@ import {
   mountDashboardNavigation,
 } from "./navigation.js";
 import {
-  COMMUNITY_METRIC_LABELS,
-  renderCommunitySnapshot as renderSharedCommunitySnapshot,
-} from "./community-view.js";
-import {
-  configuredSemanticOpenTarget,
   renderInstallerJourney as renderSharedInstallerJourney,
 } from "./install-cta.js";
 import {
+  createBrowserLocalization,
+} from "./localization.js";
+import {
   compact,
+  adaptiveChartTickCount,
+  classifyTimelineEvidence,
   createDomHelpers,
   finite,
   formatAge,
+  formatChartTimestamp,
   formatLocal,
+  formatModelName,
+  formatNumber,
+  formatReportingTime,
+  formatTimeZoneLabel,
+  getFormattingLocale,
   localCalendarParts,
+  numberFormatter,
+  selectAvailableAccountingPeriod,
+  setFormattingLocale,
+  setMessageLocale,
+  REPORTING_TIME_ZONE,
   USER_TIME_ZONE,
 } from "./ui-format.js";
+
+const localization = createBrowserLocalization();
+setFormattingLocale(localization.formatLocale());
+setMessageLocale(localization.locale());
+const t = localization.t;
+const tPlural = localization.tPlural;
 
 const localClient = new LocalCompanionClient();
 let communitySession = null;
@@ -51,34 +70,99 @@ const communityClient = new CommunityClient({
 });
 
 let dashboard = null;
-let activeWindowHours = 1;
+// Owner decision 2026-08-06: the calibration rolling comparison window is
+// fixed at three hours. The 15-minute and 1-hour widths the old segmented
+// control offered proved inaccurate, so the chart, its summary tiles, the
+// sensitivity lookup, and the exact-windows inspection table all read this
+// one width instead of a selection.
+const CALIBRATION_WINDOW_HOURS = 3;
 let activeUsageRangeDays = 7;
 let activeCalibrationRangeDays = 7;
 let activeUsageGrouping = "hour";
 let activeAccountingPeriod = "7d";
-let activeWeeklyRangeDays = 31;
-// A full seven-day reset is rarely observed end-to-end. Fits based on at least
-// half of its percentage display are shown as the primary evidence; shorter
-// readings stay visible as outlined diagnostics rather than being filtered out.
-const WEEKLY_WELL_OBSERVED_SPAN_PP = 50;
+// Every date-range control on the dashboard now offers the same three bounded
+// windows before "All", and the cost-accounting period selector's own middle
+// window is a 30-day one published by the companion. A chart labelled 31d beside
+// an accounting total labelled 30d described two different periods with no
+// visible reason, which is the inconsistency this settles.
+let activeWeeklyRangeDays = 30;
+let activeWeeklyMinimumObservedSpanPp = 50;
 let timelineViewport = null;
+let usageTimelineViewport = null;
 let timelinePointerStart = null;
+let usagePointerStart = null;
+// The exact-windows inspection table pages through its full merged row set
+// (owner-directed 2026-08-08) instead of capping at eight rows: ten rows per
+// page, newest first, with the shown range stated as "N–M of T". The rows are
+// re-derived on every timeline render; the page index is clamped there and
+// returns to the first page whenever the underlying selection changes shape,
+// so Prev/Next can never show a stale slice of a different selection.
+const RESIDUAL_TABLE_PAGE_SIZE = 10;
+let residualTablePage = 0;
+let residualInspectionRows = [];
+let residualInspectionSignature = "";
 let localCompanionHealth = null;
+// This is an optional, short-lived rendering hint from the public health
+// endpoint. The Worker remains authoritative; a missing or stale health read
+// never blocks a legitimate sign-in, while an explicit paused state avoids
+// sending somebody into an OAuth ceremony that the service will refuse.
+let communityServiceHealth = null;
 let contributionSyncStatus = null;
 let contributionSyncPreview = null;
 let contributionSyncExactReview = null;
 let contributionSyncBusy = false;
-let automaticContributionStatus = null;
-let automaticContributionBusy = false;
+// The prepared set the page last verified by itself. The summary card is the
+// review — there is no separate reveal click — so when a ready prepared set
+// appears, the page runs the exact local verification once for that set. The
+// key prevents a failing verification from being retried in a render loop:
+// retrying is an explicit action again after a failure.
+let contributionSyncAutoReviewedKey = null;
+// Approval state for the approve-once incremental consent surface. It exists
+// only while the companion advertises the v1.0 sync capability. The page
+// itself holds nothing durable: the approved flag is re-read from the
+// companion's incremental-status projection, which also feeds the modest
+// days-synced/paused/last-error status line under the surface.
+let incrementalConsentApproved = false;
+let incrementalConsentBusy = false;
+let incrementalSyncStatus = null;
+// The invisible review bootstrap prepares one real instance of the covered
+// data at most once per queue state, so a failing preparation cannot loop;
+// trying again is the explicit "Check again" action.
+let incrementalReviewPrepareAttempted = false;
+// One silent authorization repair per page load (owner-directed 2026-08-08):
+// a Mac whose earlier pairing carried the v0.1 consent has no server-side
+// v1.0 grant, so its uploads pause with consent_rejected. When the page holds
+// the session, it re-runs the pairing ceremony with the v1.0 consent by
+// itself — once — instead of surfacing a failure the user cannot act on.
+let incrementalRepairAttempted = false;
+// One-time history-index build (and a parser-version reparse) advances one
+// bounded pass per foreground refresh. Left to the sparse auto-cadence, a
+// full build crawls across many timer ticks with the machine idle between
+// them, and — while a reparse deletes-then-re-derives — cost reads low until
+// it completes. So a successful refresh that leaves the history index
+// incomplete chains the next one promptly, bounded, until coverage catches
+// up. Reset on a manual refresh or when coverage completes.
+let reindexAutoContinuations = 0;
+const REINDEX_AUTO_CONTINUE_LIMIT = 40;
+const REINDEX_AUTO_CONTINUE_DELAY_MS = 1_500;
+let reindexAutoContinueTimer = null;
+// The short read-only polling loop behind the live first-pass status line.
+// setTimeout-chained (never an interval), bounded, and it only ever performs
+// the same GET the page performs on load.
+let incrementalSyncPollTimer = null;
+let incrementalSyncPollCount = 0;
 let fastModePreference = null;
 let fastModePreferenceBusy = false;
-let pendingAutomaticContributionConsent = null;
-let participantContributionAdmission = null;
 let localOnboarding = null;
-let selectedContributionValidated = false;
-let contributionSelectionRevision = 0;
-let contributionPreparationBusy = false;
 let communityConnectBusy = false;
+// True once this Mac has actually been paired as an upload-only device in
+// this session.
+let communityDevicePaired = false;
+// True once THIS session claimed a pairing that carried the v1.0 incremental
+// consent — the claim is what records the server-side consent-once grant. A
+// v0.1-era credential or a previously accepted upload is deliberately not
+// enough: the ceremony re-pairs unless this exact evidence exists.
+let communityDevicePairedV1 = false;
 // The opaque sign-in proof lives only in this module-scoped memory; it is
 // never persisted to storage and disappears with the tab.
 let hostedIdentity = null;
@@ -91,16 +175,106 @@ let activeHostedSignIn = null;
 // configured, so these stay false until a start attempt says otherwise.
 let appleSignInUnavailable = false;
 let googleSignInUnavailable = false;
-let activeContributionLookbackHours = 24;
 let localActionBusy = false;
 let localRefreshInProgress = false;
 let localRefreshCancelRequested = false;
+// Archive indexing progress is intentionally transient: the durable dashboard
+// continues to show only the last verified complete/partial coverage receipt.
+// While a refresh owns a new pass, make that distinction visible beside cost
+// rather than letting a previous complete receipt look current.
+let archiveHistoryScanActive = false;
 let returnRefreshScheduled = false;
 let returnRefreshDeferrals = 0;
-const LOCAL_CALENDAR_PARTS = localCalendarParts();
+let globalState = null;
+let visibleConnectionNotice = null;
+let dashboardUnavailableState = null;
 
 const $ = (selector) => document.querySelector(selector);
 const { clear, node } = createDomHelpers(document);
+
+// Product-owned legacy copy stays explicitly registered with the bounded
+// migration bridge. Values originating in a local report, provider response,
+// file, or user choice use the raw helpers instead, so localization can never
+// reinterpret them just because they happen to equal an English UI label.
+function setProductText(element, englishText) {
+  if (!element) return;
+  forgetLocalizedNode(element);
+  element.removeAttribute("data-i18n-skip");
+  localization.setLegacyText(element, englishText);
+}
+
+// Every node this page fills from a message key is remembered as it is
+// written: the element, the key, and the values it was rendered with. A
+// language change then re-runs the same translation over the same nodes.
+//
+// This deliberately replaces the previous hand-maintained list of renderers to
+// call again after a switch. Text produced by `t(...)` is already in the old
+// language, so the exact-text migration bridge cannot recover it — a status
+// line whose renderer was missing from that list stayed frozen in the previous
+// language forever. A registry cannot drift: a surface added later is covered
+// the moment it writes its first localized string.
+const localizedNodes = new Map();
+
+function forgetLocalizedNode(element) {
+  if (element) localizedNodes.delete(element);
+}
+
+function setRawText(element, value) {
+  if (!element) return;
+  forgetLocalizedNode(element);
+  element.setAttribute("data-i18n-skip", "");
+  element.textContent = value == null ? "" : String(value);
+}
+
+function setLocalizedText(element, key, values = {}) {
+  if (!element) return;
+  element.removeAttribute("data-i18n-skip");
+  localizedNodes.set(element, { key, values, plural: null });
+  element.textContent = t(key, values);
+}
+
+function setLocalizedPluralText(element, key, count, values = {}) {
+  if (!element) return;
+  element.removeAttribute("data-i18n-skip");
+  localizedNodes.set(element, { key, values, plural: count });
+  element.textContent = tPlural(key, count, values);
+}
+
+// A created element that carries localized copy, registered the same way.
+function localizedNode(tag, className, key, values = {}) {
+  const element = node(tag, className, "");
+  setLocalizedText(element, key, values);
+  return element;
+}
+
+function retranslateLocalizedNodes() {
+  for (const [element, entry] of localizedNodes) {
+    if (!element.isConnected) {
+      localizedNodes.delete(element);
+      continue;
+    }
+    const next = entry.plural === null
+      ? t(entry.key, entry.values)
+      : tPlural(entry.key, entry.plural, entry.values);
+    if (element.textContent !== next) element.textContent = next;
+  }
+}
+
+function rawNode(tag, className, value) {
+  const element = node(tag, className, value == null ? "" : String(value));
+  element.setAttribute("data-i18n-skip", "");
+  return element;
+}
+
+function configuredSemanticOpenTarget(documentRef) {
+  const target = documentRef
+    .querySelector('meta[name="usage-monitor-semantic-open-target"]')
+    ?.getAttribute("content")
+    ?.trim();
+  return target && /^[a-z][a-z0-9+.-]*:\/\/open$/iu.test(target)
+    ? target
+    : null;
+}
 
 const SEMANTIC_OPEN_TARGET = configuredSemanticOpenTarget(document);
 const installedAppLink = $("#open-installed-app");
@@ -110,6 +284,44 @@ if (SEMANTIC_OPEN_TARGET) {
   installedAppLink.removeAttribute("href");
   installedAppLink.setAttribute("aria-disabled", "true");
 }
+
+// A language change redraws browser-generated values using the same display
+// locale and leaves data, timestamps, and request ownership untouched. The
+// native host dispatches the same event after its Settings picker changes, so
+// the existing WebView is updated rather than reloaded.
+function rerenderLocalizedDashboard() {
+  // Register the current English-owned text before replacing any generated
+  // values, then run the bridge once more afterwards. This prevents a previous
+  // locale's nodes from surviving a switch back to English (or Spanish) in the
+  // same WebView.
+  localization.localizeTree();
+  renderSharedInstallerJourney(document, {
+    formatLocale: getFormattingLocale(),
+    translateMessage: t,
+  });
+  // Charts write formatted instants and numbers straight into an
+  // `data-i18n-skip` SVG text layer, so the evidence view is redrawn from the
+  // state it was built from. This is a single state-driven redraw, not a list
+  // of surfaces someone has to remember to extend.
+  if (dashboard) {
+    renderDashboard(dashboard);
+  } else if (dashboardUnavailableState) {
+    renderDashboardUnavailableState(dashboardUnavailableState);
+  } else if (globalState) {
+    renderGlobalState();
+  }
+  // Everything else — every status line, chip, and button label written from a
+  // message key anywhere on this page — re-translates from the registry those
+  // writes populate. Nothing has to be named here for it to be covered.
+  retranslateLocalizedNodes();
+  localization.localizeTree();
+}
+
+window.addEventListener("tibotattle:locale-change", (event) => {
+  setFormattingLocale(event.detail?.formatLocale ?? localization.formatLocale());
+  setMessageLocale(event.detail?.locale ?? localization.locale());
+  rerenderLocalizedDashboard();
+});
 
 // The release-slot marker for "this build is paired with a hosted contribution
 // service". It is read as a build signal only: the client id itself no longer
@@ -140,17 +352,23 @@ function openInstalledApp() {
   }, 2_000);
 }
 
+function isLoopbackDashboard() {
+  const host = String(window.location?.hostname ?? "").toLowerCase();
+  return host === "localhost" || host === "127.0.0.1" || host === "::1";
+}
+
 function setJourneyState(state) {
   const body = document.body;
   body.classList.remove("first-run", "needs-local-setup", "local-ready", "demo-mode");
   body.classList.add(state);
-  $("#companion-setup").hidden = state !== "first-run";
+  // The installation journey belongs to the hosted first-visit page. If the
+  // loopback dashboard loses its local service briefly, showing instructions
+  // for installing the app inside the already-installed app is actively
+  // misleading.
+  $("#companion-setup").hidden = state !== "first-run" || isLoopbackDashboard();
   const hasEvidence = state === "local-ready" || state === "demo-mode";
   for (const element of document.querySelectorAll("[data-requires-evidence]")) {
     element.hidden = !hasEvidence;
-  }
-  if (!hasEvidence) {
-    $("#community-contribution-disclosure").open = false;
   }
 }
 
@@ -197,46 +415,151 @@ function updateLocalActionButtons() {
 function setCommunitySession(value) {
   communitySession = value;
   if (!value) {
-    participantContributionAdmission = null;
-    renderContributionPreparationEstimate();
+    // Losing the session means the next primary action is a connection again,
+    // not a review of something this Mac can no longer send.
+    communityDevicePaired = false;
+    renderContributionActionState();
   }
-}
-
-async function sha256Hex(value) {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return [...new Uint8Array(digest)]
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
 }
 
 function formatMoney(value, digits = 0) {
   const number = finite(value);
   return number === null
     ? "—"
-    : new Intl.NumberFormat("en-US", {
-        style: "currency",
-        currency: "USD",
-        minimumFractionDigits: digits,
-        maximumFractionDigits: digits
-      }).format(number);
+    : formatNumber(number, {
+      style: "currency",
+      currency: "USD",
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    });
 }
 
 function formatApiMoney(value) {
   const number = finite(value);
   if (number === null) return "—";
-  if (number > 0 && number < .01) return "<$0.01";
-  return new Intl.NumberFormat("en-US", {
+  if (number > 0 && number < .01) {
+    return `<${formatNumber(.01, {
+      style: "currency",
+      currency: "USD",
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    })}`;
+  }
+  return formatNumber(number, {
     style: "currency",
     currency: "USD",
     minimumFractionDigits: 2,
-    maximumFractionDigits: 2
-  }).format(number);
+    maximumFractionDigits: 2,
+  });
 }
 
+/**
+ * A percentage near an end of the scale must not be printed as if it were at
+ * that end. `Intl` rounds 99.96 to "100%" and 0.04 to "0%", and on this
+ * dashboard both ends are load-bearing claims rather than cosmetics:
+ *
+ *   100% price coverage means every usage change carries a reviewed price,
+ *        which is why the rounded "100%" sat next to a note saying coverage
+ *        was partial - the note was right and the number was rounded.
+ *     0% remaining means the allowance is gone, which is a different fact
+ *        from "a sliver is left".
+ *
+ * So only an exact 0 or 100 may print as 0% or 100%. Anything strictly
+ * between prints as a bounded "<" or ">" reading, the same idiom
+ * `formatApiMoney` already uses for amounts under a cent.
+ */
 function formatPercent(value, digits = 0) {
   const number = finite(value);
   if (number === null) return "—";
-  return `${Number.isInteger(number) ? number.toFixed(0) : number.toFixed(digits)}%`;
+  const places = Number.isInteger(number) ? 0 : digits;
+  const percentFormatter = numberFormatter({
+    maximumFractionDigits: places,
+    minimumFractionDigits: 0,
+    style: "percent",
+  });
+  const format = (amount) => percentFormatter.format(amount / 100);
+  // The test is whether this value *renders* as an endpoint, not whether it
+  // is near one: at whole-number precision 99.2 renders as "99%", which is
+  // honest and needs no bound, while 99.5 renders as "100%", which is not.
+  // Comparing rendered strings also keeps this agreeing with whatever
+  // rounding mode the locale's formatter uses.
+  const step = 10 ** -places;
+  const rendered = format(number);
+  if (number > 0 && rendered === format(0)) return `<${format(step)}`;
+  if (number < 100 && rendered === format(100)) return `>${format(100 - step)}`;
+  return rendered;
+}
+
+/**
+ * One whole-number formatter for tabular counts.
+ *
+ * `compact` is right for a headline chip, where a single number stands alone.
+ * It is wrong for a column: it renders "154.9K" next to "74" and silently
+ * changes precision partway down the table, so nothing can be compared or
+ * added up by eye. Grouped exact integers stay comparable at every magnitude.
+ */
+function formatCount(value) {
+  const number = finite(value);
+  if (number === null || number < 0) return t("accounting.model.notReported");
+  return formatNumber(Math.trunc(number), { maximumFractionDigits: 0 });
+}
+
+function formatDecimal(value, digits = 0) {
+  const number = finite(value);
+  return number === null
+    ? "—"
+    : numberFormatter({
+      maximumFractionDigits: digits,
+      minimumFractionDigits: digits,
+    }).format(number);
+}
+
+let activeInformationPopover = null;
+let nextInformationPopoverId = 1;
+
+function positionInformationPopover(popover, button) {
+  const anchor = button.getBoundingClientRect();
+  const viewportPadding = 16;
+  const preferredTop = anchor.bottom + 8;
+  const width = popover.offsetWidth;
+  const height = popover.offsetHeight;
+  const left = Math.min(
+    Math.max(viewportPadding, anchor.left),
+    Math.max(viewportPadding, window.innerWidth - width - viewportPadding),
+  );
+  const top = preferredTop + height <= window.innerHeight - viewportPadding
+    ? preferredTop
+    : Math.max(viewportPadding, anchor.top - height - 8);
+  popover.style.left = `${Math.round(left)}px`;
+  popover.style.top = `${Math.round(top)}px`;
+}
+
+function closeInformationPopover({ restoreFocus = false } = {}) {
+  const current = activeInformationPopover;
+  if (!current) return;
+  current.popover.remove();
+  current.button.setAttribute("aria-expanded", "false");
+  current.button.removeAttribute("aria-describedby");
+  activeInformationPopover = null;
+  if (restoreFocus && current.button.isConnected) current.button.focus();
+}
+
+function openInformationPopover(button) {
+  if (activeInformationPopover?.button === button) {
+    closeInformationPopover({ restoreFocus: false });
+    return;
+  }
+  closeInformationPopover();
+  const popover = node("span", "info-popover");
+  const id = `information-popover-${nextInformationPopoverId++}`;
+  popover.id = id;
+  popover.setAttribute("role", "tooltip");
+  popover.textContent = button.dataset.informationExplanation ?? "";
+  document.body.append(popover);
+  button.setAttribute("aria-expanded", "true");
+  button.setAttribute("aria-describedby", id);
+  activeInformationPopover = { button, popover };
+  positionInformationPopover(popover, button);
 }
 
 function informationLabel(label, explanation) {
@@ -244,24 +567,20 @@ function informationLabel(label, explanation) {
   fragment.append(document.createTextNode(label));
   const button = node("button", "info-button", "i");
   button.type = "button";
-  button.tabIndex = 0;
-  button.title = explanation;
-  button.setAttribute("aria-label", `${label}: ${explanation}`);
+  button.dataset.informationExplanation = explanation;
+  button.setAttribute("aria-label", t("aria.moreInformation", { label }));
+  button.setAttribute("aria-expanded", "false");
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openInformationPopover(button);
+  });
   fragment.append(button);
   return fragment;
 }
 
 function formatPp(value, digits = 1) {
   const number = finite(value);
-  return number === null ? "—" : `${number.toFixed(digits)} pp`;
-}
-
-function formatUtc(value, { dateOnly = false } = {}) {
-  if (!value || !Number.isFinite(Date.parse(value))) return "Unknown";
-  return new Intl.DateTimeFormat("en-US", dateOnly
-    ? { timeZone: "UTC", month: "short", day: "numeric", year: "numeric" }
-    : { timeZone: "UTC", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }
-  ).format(new Date(value));
+  return number === null ? "—" : `${formatDecimal(number, digits)} pp`;
 }
 
 const COMPONENT_LABELS = Object.freeze({
@@ -279,59 +598,174 @@ function componentLabel(value) {
 
 function formatTimeRemaining(value) {
   const timestamp = Date.parse(value);
-  if (!Number.isFinite(timestamp)) return "Time remaining unavailable";
+  if (!Number.isFinite(timestamp)) return t("format.timeUnavailable");
   const remainingMs = timestamp - Date.now();
-  if (remainingMs <= 0) return "Reset due or recently passed";
+  if (remainingMs <= 0) return t("format.resetDue");
   const totalMinutes = Math.ceil(remainingMs / 60_000);
   const days = Math.floor(totalMinutes / 1_440);
   const hours = Math.floor((totalMinutes % 1_440) / 60);
   const minutes = totalMinutes % 60;
-  if (days > 0) return `${days}d ${hours}h remaining`;
-  if (hours > 0) return `${hours}h ${minutes}m remaining`;
-  return `${minutes}m remaining`;
+  if (days > 0) return t("format.remainingDays", { days, hours });
+  if (hours > 0) return t("format.remainingHours", { hours, minutes });
+  return t("format.remainingMinutes", { minutes });
 }
 
 function formatSpanLength(spanMs) {
   const minutes = Math.max(1, Math.round(spanMs / 60_000));
-  if (minutes < 90) return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  if (minutes < 90) return tPlural("format.durationMinute", minutes);
   const hours = minutes / 60;
-  if (hours < 48) return `${hours.toFixed(hours < 10 ? 1 : 0)} hours`;
-  return `${(hours / 24).toFixed(1)} days`;
+  if (hours < 48) {
+    const value = Number(hours.toFixed(hours < 10 ? 1 : 0));
+    return tPlural("format.durationHour", value, {
+      count: formatDecimal(value, hours < 10 ? 1 : 0),
+    });
+  }
+  const value = Number((hours / 24).toFixed(1));
+  return tPlural("format.durationDay", value, { count: formatDecimal(value, 1) });
 }
 
 function setGlobalState(state, { companionReachable = false } = {}) {
-  const labels = {
-    live: "Up to date",
-    updating: "Updating",
-    stale: "Needs refresh",
-    insufficient: "More data needed",
-    setup: "Set up this Mac",
-    offline: companionReachable ? "Ready to analyze" : "Open the Mac app",
-    demo: "Labeled demo data"
+  globalState = { companionReachable, state };
+  renderGlobalState();
+}
+
+// The state pill said "Fresh" while the history index was one-third built,
+// because quota observation freshness and index completeness are different
+// facts. This badge states the second fact until it stops being true.
+function renderHistoryIndexBadge(data) {
+  const badge = $("#history-index-badge");
+  if (!badge) return;
+  const history = data?.pricing?.historyCoverage
+    ?? data?.accounting?.historyCoverage
+    ?? null;
+  const indexed = finite(history?.indexedSourceCount, null);
+  const total = finite(history?.sourceCount, null);
+  const complete = history?.status === "complete"
+    || (indexed !== null && total !== null && total > 0 && indexed >= total);
+  if (data?.mode === "demo" || complete
+      || indexed === null || total === null || total <= 0) {
+    badge.hidden = true;
+    return;
+  }
+  badge.hidden = false;
+  setRawText(badge, t("status.indexingHistory", {
+    indexed: compact(indexed),
+    total: compact(total),
+  }));
+}
+
+function renderGlobalState() {
+  if (!globalState) return;
+  const keys = {
+    live: "status.fresh",
+    updating: "status.running",
+    stale: "status.needsRefresh",
+    insufficient: "status.moreDataNeeded",
+    setup: "status.setUpMac",
+    offline: globalState.companionReachable
+      ? "status.readyToAnalyze"
+      : "status.openMacApp",
+    demo: "status.labeledDemoData",
   };
   const pill = $("#global-state");
-  pill.className = `state-pill state-${state}`;
-  pill.replaceChildren(node("span", "state-dot"), document.createTextNode(labels[state] ?? "Unknown state"));
+  if (!pill) return;
+  pill.className = `state-pill state-${globalState.state}`;
+  pill.replaceChildren(
+    node("span", "state-dot"),
+    document.createTextNode(t(keys[globalState.state] ?? "status.unknown")),
+  );
 }
 
 function showConnectionNotice({
   title,
+  titleKey = null,
   copy,
+  copyKey = null,
   kind = "warning",
   showDemo = false,
   showCheck = false,
 }) {
+  visibleConnectionNotice = {
+    copy,
+    copyKey,
+    kind,
+    showCheck,
+    showDemo,
+    title,
+    titleKey,
+  };
+  renderConnectionNotice();
+}
+
+function renderConnectionNotice() {
+  if (!visibleConnectionNotice) return;
+  const {
+    copy,
+    copyKey,
+    kind,
+    showCheck,
+    showDemo,
+    title,
+    titleKey,
+  } = visibleConnectionNotice;
   const notice = $("#connection-notice");
   notice.className = `notice notice-${kind}`;
-  $("#connection-title").textContent = title;
-  $("#connection-copy").textContent = copy;
+  if (titleKey) {
+    setLocalizedText($("#connection-title"), titleKey);
+  } else {
+    setProductText($("#connection-title"), title);
+  }
+  if (copyKey) {
+    setLocalizedText($("#connection-copy"), copyKey);
+  } else {
+    setProductText($("#connection-copy"), copy);
+  }
   $("#connection-check").hidden = !showCheck;
   $("#demo-button").hidden = !showDemo;
   notice.hidden = false;
 }
 
 function hideConnectionNotice() {
+  visibleConnectionNotice = null;
   $("#connection-notice").hidden = true;
+}
+
+function renderDashboardUnavailableState(kind) {
+  const companionCopy = isLoopbackDashboard()
+    ? "dashboard.unavailable.companionInAppCopy"
+    : "dashboard.unavailable.companionCopy";
+  const variants = {
+    "backend-only": {
+      latestObservation: "dashboard.unavailable.backendOnlyOrigin",
+      title: "dashboard.unavailable.backendOnlyTitle",
+      copy: "dashboard.unavailable.backendOnlyCopy",
+    },
+    "dashboard-unavailable": {
+      latestObservation: "dashboard.unavailable.companionUnavailable",
+      title: "dashboard.unavailable.dashboardTitle",
+      copy: "dashboard.unavailable.dashboardCopy",
+    },
+    "companion-unavailable": {
+      latestObservation: "dashboard.unavailable.companionUnavailable",
+      title: "dashboard.unavailable.companionTitle",
+      copy: companionCopy,
+    },
+  };
+  const selected = variants[kind] ?? variants["companion-unavailable"];
+  dashboardUnavailableState = Object.hasOwn(variants, kind)
+    ? kind
+    : "companion-unavailable";
+  setGlobalState("offline");
+  setLocalizedText($("#latest-observation"), selected.latestObservation);
+  setLocalizedText($("#data-source"), "dashboard.unavailable.noRealUsage");
+  showConnectionNotice({
+    titleKey: selected.title,
+    copyKey: selected.copy,
+    kind: "error",
+    showDemo: true,
+    showCheck: true,
+  });
+  renderDashboardSkeleton();
 }
 
 function onboardingSourceGuidance(value) {
@@ -381,9 +815,31 @@ function onboardingSourceGuidance(value) {
 function renderLocalOnboarding(value) {
   localOnboarding = value;
   const card = $("#setup-card");
+  if (!card) return;
+  if (runsInsideNativeDashboard()) {
+    card.hidden = true;
+    card.setAttribute("aria-hidden", "true");
+    setJourneyState(
+      dashboard?.mode === "demo"
+        ? "demo-mode"
+        : dashboard
+          ? "local-ready"
+          : value && value.state !== "unavailable"
+            ? "needs-local-setup"
+            : "first-run",
+    );
+    updateLocalActionButtons();
+    return;
+  }
   if (!value || value.state === "unavailable") {
     card.hidden = true;
-    setJourneyState(dashboard?.mode === "demo" ? "demo-mode" : "first-run");
+    setJourneyState(
+      dashboard?.mode === "demo"
+        ? "demo-mode"
+        : dashboard
+          ? "local-ready"
+          : "first-run",
+    );
     updateLocalActionButtons();
     return;
   }
@@ -396,6 +852,7 @@ function renderLocalOnboarding(value) {
   const boundedPause = indexing?.status === "bounded_pause";
   const ready = localAnalysisAllowed(value);
   card.hidden = false;
+  card.removeAttribute("aria-hidden");
   card.classList.toggle("needs-attention", !ready);
   $("#setup-title").textContent = boundedPause
     ? "Continue your local analysis"
@@ -449,6 +906,7 @@ function renderLocalOnboarding(value) {
 }
 
 function renderDashboard(data) {
+  dashboardUnavailableState = null;
   dashboard = data;
   if (data.mode === "demo") {
     setJourneyState("demo-mode");
@@ -457,13 +915,16 @@ function renderDashboard(data) {
   setGlobalState(data.state, {
     companionReachable: data.mode !== "demo"
   });
+  renderHistoryIndexBadge(data);
   $("#latest-observation").textContent = data.freshness.latestObservedAt
     ? formatAge(data.freshness.ageSeconds ?? (Date.now() - Date.parse(data.freshness.latestObservedAt)) / 1000)
     : "No timestamp";
   $("#data-source").textContent = data.mode === "demo"
     ? "Illustrative fixture — not your usage"
     : `${formatLocal(data.freshness.latestObservedAt)} · local companion`;
-  $("#schema-version").textContent = `Dashboard contract: ${data.schemaVersion}`;
+  // The footer's "Dashboard contract" line is gone (owner-directed,
+  // 2026-08-08): the version stays machine-discoverable on data.schemaVersion
+  // and in the share card's text transcript, and was never a user fact.
 
   if (data.mode === "demo") {
     showConnectionNotice({
@@ -473,11 +934,27 @@ function renderDashboard(data) {
       showCheck: true
     });
   } else if (data.state === "stale") {
-    showConnectionNotice({
-      title: "The local evidence is stale",
-      copy: "The dashboard is showing real local artifacts, but the latest collector observation is older than its freshness threshold.",
-      kind: "warning"
-    });
+    // A stale cached accounting result makes the companion's single freshness
+    // verdict "stale" even when the newest observation is seconds old. Saying
+    // the observation is old in that case is simply untrue, and it is the
+    // reason a refresh appears to change nothing: the observation was never
+    // what was stale.
+    const observationIsCurrent = finite(data.freshness.ageSeconds) !== null
+      && finite(data.freshness.staleAfterSeconds) !== null
+      && data.freshness.ageSeconds <= data.freshness.staleAfterSeconds;
+    if (observationIsCurrent && data.freshness.accountingStatus === "stale") {
+      showConnectionNotice({
+        copyKey: "dashboard.stale.accountingCopy",
+        kind: "warning",
+        titleKey: "dashboard.stale.accountingTitle",
+      });
+    } else {
+      showConnectionNotice({
+        title: "The local evidence is stale",
+        copy: "The dashboard is showing real local artifacts, but the latest collector observation is older than its freshness threshold.",
+        kind: "warning"
+      });
+    }
   } else if (data.state === "insufficient") {
     showConnectionNotice({
       title: "The companion is connected, but evidence is incomplete",
@@ -490,102 +967,277 @@ function renderDashboard(data) {
   }
 
   renderQuotaCards(data);
+  renderEvidenceWarnings(data);
   renderPricing(data);
   renderComparison(data);
-  renderShareCard(data);
+  // The share card renders inside renderWeekly, from the same history model
+  // as the chart it summarizes (owner-verified regression, 2026-08-08).
   renderUsageTimeline(data);
   renderTimeline(data);
   renderWeekly(data);
   renderAccounting(data);
-  renderQuality(data);
-  renderCollector(data);
-  renderContributionPreparationEstimate();
+  renderCommunityJourney();
 }
 
 function renderQuotaCards(data) {
   const container = $("#quota-cards");
   clear(container);
-  const windows = data.quotaWindows;
+  const normalWindows = data.quotaWindows.filter(isPrimaryCodexQuotaWindow);
+  const sparkWindows = data.quotaWindows.filter((window) => (
+    window?.limitId === CODEX_SPARK_LIMIT_ID
+      && isValidQuotaWindowDuration(finite(window?.durationMinutes))
+  ));
+  const primaryWindow = selectPrimaryCodexQuotaWindow(normalWindows);
+  const normalOrderedWindows = primaryWindow === null
+    ? normalWindows
+    : [primaryWindow, ...normalWindows.filter((window) => window !== primaryWindow)];
+  // Spark is a separate provider limit. Keep it out of the normal allowance
+  // selection so it cannot be mistaken for the five-hour or seven-day track.
+  const windows = [...normalOrderedWindows, ...sparkWindows];
   if (!windows.length) {
     const card = node("article", "metric-card insufficient");
-    card.innerHTML = `
-      <div class="metric-card-header"><span class="metric-name">Quota observations</span><span class="evidence-chip">Insufficient</span></div>
-      <strong class="metric-value">—</strong>
-      <p>The local companion has not exposed a current allowance window.</p>
-    `;
+    const header = node("div", "metric-card-header");
+    const name = node("span", "metric-name");
+    setLocalizedText(name, "dashboard.quota.observations");
+    const chip = node("span", "evidence-chip");
+    setLocalizedText(chip, "dashboard.quota.insufficient");
+    const value = node("strong", "metric-value", "—");
+    const copy = node("p");
+    setLocalizedText(copy, "dashboard.quota.noCurrent");
+    header.append(name, chip);
+    card.append(header, value, copy);
     container.append(card);
     return;
   }
   for (const window of windows) {
     const remaining = finite(window.remainingPercent);
-    const card = node("article", `metric-card ${window.status === "stale" ? "stale" : ""}`);
+    const spark = window.limitId === CODEX_SPARK_LIMIT_ID;
+    const card = node("article", [
+      "metric-card",
+      window.status === "stale" ? "stale" : "",
+      spark ? "quota-card-spark" : "",
+    ].filter(Boolean).join(" "));
     const header = node("div", "metric-card-header");
+    const name = node("span", "metric-name", localizedQuotaWindowLabel(window));
+    const plan = node("span", "evidence-chip");
+    const reportedPlan = providerReportedPlanEvidence(window.planType);
+    if (spark) {
+      setLocalizedText(plan, "dashboard.quota.spark");
+    } else if (data.mode === "demo") {
+      setLocalizedText(plan, "dashboard.quota.demo");
+    } else if (reportedPlan) {
+      plan.textContent = reportedPlan;
+    } else {
+      setLocalizedText(plan, "dashboard.quota.observed");
+    }
     header.append(
-      node("span", "metric-name", window.label),
-      node("span", "evidence-chip", window.planType || (data.mode === "demo" ? "Demo" : "Observed"))
+      name,
+      plan,
     );
     const value = node("strong", "metric-value");
-    value.textContent = remaining === null ? "—" : `${remaining.toFixed(window.precision ?? 0)}%`;
-    value.append(node("small", "", " remaining"));
+    setLocalizedText(value, "dashboard.quota.remaining", {
+      value: remaining === null
+        ? "—"
+        : formatPercent(remaining, window.precision ?? 0),
+    });
     const progress = node("div", "mini-progress");
     const fill = node("i");
     fill.style.width = `${Math.max(0, Math.min(100, remaining ?? 0))}%`;
     progress.append(fill);
     const meta = node("div", "metric-meta");
     meta.append(
-      node("span", "", window.usedPercent === null ? "Used unknown" : `${formatPercent(window.usedPercent)} used`),
-      node("span", "", window.resetAt ? `Resets ${formatLocal(window.resetAt)}` : "Reset unknown")
+      node(
+        "span",
+        "",
+        window.usedPercent === null
+          ? t("dashboard.quota.usedUnknown")
+          : t("dashboard.quota.used", {
+            value: formatPercent(window.usedPercent),
+          }),
+      ),
+      node(
+        "span",
+        "",
+        window.resetAt
+          ? t("dashboard.quota.resets", { time: formatLocal(window.resetAt) })
+          : t("dashboard.quota.resetUnknown"),
+      ),
     );
     card.append(header, value, progress, meta);
     if (window.resetAt) card.append(node("p", "", formatTimeRemaining(window.resetAt)));
     if (window.observedAt) {
-      const attribution = window.accountAttribution === "attributed_pseudonymous"
-        ? "pseudonymous account attributed"
-        : "account unattributed";
-      card.append(node("p", "", `Observed ${formatLocal(window.observedAt)} · ${attribution}`));
+      card.append(node("p", "", t("dashboard.quota.observedAtPlain", {
+        time: formatLocal(window.observedAt),
+      })));
     }
     container.append(card);
   }
 }
 
+function providerReportedPlanEvidence(value) {
+  const candidate = typeof value === "string" ? value.trim() : "";
+  if (candidate === "" || candidate.toLowerCase() === "unknown") return "";
+  return t("dashboard.quota.providerPlan", { plan: candidate });
+}
+
+function localizedQuotaWindowDuration(durationMinutes) {
+  const duration = finite(durationMinutes, null);
+  if (!isValidQuotaWindowDuration(duration)) return "";
+  if (duration % (24 * 60) === 0) {
+    return tPlural("quota.durationDay", duration / (24 * 60));
+  }
+  if (duration % 60 === 0) {
+    return tPlural("quota.durationHour", duration / 60);
+  }
+  return tPlural("quota.durationMinute", duration);
+}
+
+function localizedQuotaWindowLabel(window) {
+  const duration = finite(window?.durationMinutes, null);
+  if (window?.limitId === CODEX_SPARK_LIMIT_ID) {
+    return t("dashboard.quota.windowSpark");
+  }
+  if (window?.limitId === CODEX_PRIMARY_LIMIT_ID
+      && duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) {
+    return t("dashboard.quota.windowFiveHour");
+  }
+  if (window?.limitId === CODEX_PRIMARY_LIMIT_ID
+      && duration === CODEX_WEEKLY_ALLOWANCE_MINUTES) {
+    return t("dashboard.quota.windowSevenDay");
+  }
+  if (window?.limitId === CODEX_PRIMARY_LIMIT_ID
+      && isValidQuotaWindowDuration(duration)) {
+    return t("dashboard.quota.windowProviderReported", {
+      duration: localizedQuotaWindowDuration(duration),
+    });
+  }
+  return t("dashboard.quota.windowOther");
+}
+
+function historyCoverageLabel(history) {
+  if (archiveHistoryScanActive) {
+    return t(history?.status === "complete"
+      ? "dashboard.pricing.historyScanningComplete"
+      : "dashboard.pricing.historyScanningPartial");
+  }
+  if (history?.status === "complete") {
+    return t("dashboard.pricing.historyComplete");
+  }
+  if (history?.errorCode === "archive_disk_space") {
+    return t("dashboard.pricing.historyDiskSpace");
+  }
+  if (history?.errorCode === "archive_storage_unavailable") {
+    return t("dashboard.pricing.historyStorageUnavailable");
+  }
+  if (history?.phase === "not_started") {
+    return t("dashboard.pricing.historyNotStarted");
+  }
+  const indexed = finite(history?.indexedSourceCount, 0);
+  const total = finite(history?.sourceCount, 0);
+  if (total > 0) {
+    return t("dashboard.pricing.historyProgress", {
+      indexed: compact(indexed),
+      total: compact(total),
+    });
+  }
+  return t("dashboard.pricing.historyResume");
+}
+
+function pricingMethodLabel(pricing) {
+  const replaySafe = finite(pricing?.replayExclusionDiagnostics?.filesScanned, 0) > 0
+    || String(pricing?.accountingSource ?? "").includes("replay");
+  if (!replaySafe) return t("dashboard.pricing.legacyProjection");
+  const key = pricing?.accountingCacheStatus === "stale"
+    ? "dashboard.pricing.staleReplaySafe"
+    : "dashboard.pricing.replaySafe";
+  return t(key);
+}
+
+function pricingRegistryProvenance(pricing) {
+  const version = typeof pricing?.registryVersion === "string"
+    && /^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/u.test(pricing.registryVersion)
+    ? pricing.registryVersion
+    : "";
+  if (!version) return "";
+  const observedAt = pricing.registryObservedAt
+    ? t("dashboard.pricing.registryObservedAt", {
+      time: formatLocal(pricing.registryObservedAt, { dateOnly: true }),
+    })
+    : "";
+  return t("dashboard.pricing.registryProvenance", { version, observedAt });
+}
+
 function renderPricing(data) {
   const pricing = data.pricing;
   const fastMode = pricing.fastMode;
-  $("#cost-period").textContent = pricing.periodLabel;
+  setRawText($("#cost-period"), pricing.periodLabel);
   // The headline is the quota-weighted figure whenever a weighting exists;
   // when nothing can be weighted legitimately the label falls back to the
   // Standard-rate name rather than presenting an unweighted number under a
   // weighted heading.
   const weighted = pricing.quotaWeightedTotalCostUsd;
   const useWeighted = weighted !== null && fastMode.weightingStatus !== "unknown";
-  $("#cost-metric-kicker").textContent = useWeighted
+  setRawText($("#cost-metric-kicker"), useWeighted
     ? fastMode.metricLabel
-    : fastMode.standardMetricLabel;
+    : fastMode.standardMetricLabel);
   $("#cost-metric-kicker").title = useWeighted
     ? fastMode.metricExplainer
-    : "No usage in this period could be weighted, so the Standard-rate total is shown unchanged.";
+    : t("dashboard.pricing.noWeightedTitle");
   $("#cost-total").textContent = formatMoney(
     useWeighted ? weighted : pricing.totalCostUsd,
     2
   );
-  const provenance = pricing.registryVersion
-    ? ` · price registry ${pricing.registryVersion}${pricing.registryObservedAt ? ` (${formatLocal(pricing.registryObservedAt)})` : ""}`
+  const eventCount = finite(pricing.eventCount, 0);
+  const coverage = pricing.coveragePercent;
+  // Drawn before the provenance line, and above the early return for a period
+  // with no priced components: a figure of nothing is exactly when a reader
+  // most needs to know how little of their history is indexed. Calling it from
+  // here rather than from `renderDashboard` also means the two points where an
+  // active archive pass flips `archiveHistoryScanActive` and re-runs this
+  // renderer move the progress statement with it.
+  const historyProgressShown = renderHistoryProgress(data);
+  // One panel states the index coverage once. When the block above is showing
+  // the counted sources, the terse provenance fragment would only repeat it.
+  const history = historyProgressShown
+    ? ""
+    : historyCoverageLabel(pricing.historyCoverage);
+  const method = pricingMethodLabel(pricing);
+  const provenance = pricingRegistryProvenance(pricing);
+  const coverageElement = $("#cost-coverage");
+  const coverageKey = coverage === null
+    ? history
+      ? "dashboard.pricing.noCoverageWithHistory"
+      : "dashboard.pricing.noCoverage"
+    : history
+      ? "dashboard.pricing.coverageWithHistory"
+      : "dashboard.pricing.coverage";
+  const coverageValues = coverage === null
+      ? { history }
+      : {
+        percent: formatPercent(coverage, 1),
+        method,
+        provenance,
+        history,
+      };
+  clear(coverageElement);
+  const coverageLine = node("span", "coverage-line");
+  setRawText(coverageLine, t(coverageKey, coverageValues));
+  coverageElement.append(coverageLine);
+  // No "reviewed historical prices began on …" caveat is printed here. Every
+  // retained usage change is priced at the rate in effect when it occurred,
+  // with no start boundary, so the sentence was false. It was also the live
+  // path that rendered "Jan 1, 1970" whenever the partial-history coverage
+  // record carried no start instant.
+  coverageElement.title = eventCount > 0
+    ? t("dashboard.pricing.coverageDenominator", { count: compact(eventCount) })
     : "";
-  const replay = pricing.replayExclusionDiagnostics?.forkReplayEventsExcluded ?? 0;
-  const accountingMethod = pricing.accountingSource
-    === "lineage_aware_cumulative_snapshot_replay_exclusion"
-    ? `${pricing.accountingCacheStatus === "stale" ? "stale replay-safe cache" : "replay-safe"} · ${compact(replay)} inherited child snapshots excluded`
-    : "legacy projection; replay exclusion has not been verified";
-  $("#cost-coverage").textContent = pricing.coveragePercent === null
-    ? "Price coverage is not available"
-    : `${formatPercent(pricing.coveragePercent, 1)} priced · ${accountingMethod}${provenance}`;
   const list = $("#cost-components");
   clear(list);
   const components = pricing.components.filter(
     (row) => finite(row.costUsd, 0) > 0 || finite(row.tokens, 0) > 0
   );
   if (!components.length) {
-    list.append(node("p", "empty-inline", "No token-component accounting was returned."));
+    list.append(node("p", "empty-inline", t("dashboard.pricing.noComponents")));
     return;
   }
   const max = Math.max(...components.map((row) => row.costUsd ?? 0), .01);
@@ -596,21 +1248,162 @@ function renderPricing(data) {
     const fill = node("i");
     fill.style.width = `${Math.max(component.costUsd > 0 ? 1 : 0, ((component.costUsd ?? 0) / max) * 100)}%`;
     track.append(fill);
-    const hasUnpricedTokens = finite(component.unpricedTokens, 0) > 0;
-    const hasPricedTokens = finite(component.pricedTokens, 0) > 0;
-    const costLabel = hasUnpricedTokens && !hasPricedTokens
-      ? "Unpriced"
-      : hasUnpricedTokens
-        ? `${formatApiMoney(component.costUsd)} + unpriced`
-        : formatApiMoney(component.costUsd);
     row.append(
       track,
-      node("strong", "", costLabel)
+      node("strong", "", formatApiMoney(component.costUsd))
     );
-    row.title = hasUnpricedTokens
-      ? `${compact(component.tokens)} tokens · ${compact(component.unpricedTokens)} unpriced`
-      : `${compact(component.tokens)} tokens`;
+    row.title = t("dashboard.pricing.tokens", { count: compact(component.tokens) });
     list.append(row);
+  }
+}
+
+// Decimal steps, so the unit named here is the unit the companion counted in.
+const BYTE_UNITS = Object.freeze([
+  "byte",
+  "kilobyte",
+  "megabyte",
+  "gigabyte",
+  "terabyte",
+]);
+
+function formatBytes(value) {
+  const number = finite(value);
+  if (number === null || number < 0) return "—";
+  let amount = number;
+  let index = 0;
+  while (amount >= 1_000 && index < BYTE_UNITS.length - 1) {
+    amount /= 1_000;
+    index += 1;
+  }
+  return formatNumber(amount, {
+    style: "unit",
+    unit: BYTE_UNITS[index],
+    unitDisplay: "short",
+    maximumFractionDigits: index === 0 ? 0 : 1,
+  });
+}
+
+/**
+ * How much of the discovered history the figures on this page are drawn from.
+ *
+ * Every number here is measured: the local companion publishes how many
+ * sources it discovered and how many it has indexed, and the share is that
+ * division. Nothing estimates a finish time, because none is known — a
+ * progress bar that implied one would be the same invention this product
+ * refuses everywhere else. The block is absent entirely once the index is
+ * complete, and absent when there is no denominator to divide by.
+ *
+ * It sits with the API-price-equivalent total because that total, and every
+ * figure derived from it, covers only the indexed share.
+ */
+function renderHistoryProgress(data) {
+  const container = $("#history-progress");
+  if (!container) return;
+  const history = data?.pricing?.historyCoverage
+    ?? data?.accounting?.historyCoverage
+    ?? null;
+  const total = finite(history?.sourceCount, 0);
+  const indexed = finite(history?.indexedSourceCount, 0);
+  if (history === null || history.status === "complete" || total <= 0) {
+    container.hidden = true;
+    return false;
+  }
+  container.hidden = false;
+  const percent = (indexed / total) * 100;
+  setLocalizedText(
+    $("#history-progress-headline"),
+    archiveHistoryScanActive
+      ? "dashboard.history.indexingActive"
+      : history.phase === "not_started"
+        ? "dashboard.history.indexingNotStarted"
+        : "dashboard.history.indexingPaused",
+    { percent: formatPercent(percent, 1) },
+  );
+  container.classList.toggle("active", archiveHistoryScanActive);
+  const track = $("#history-progress-track");
+  track.setAttribute("aria-valuenow", String(Math.round(percent)));
+  // The bar alone would announce a bare percentage. The counted sources are
+  // the fact worth hearing, so they are what it reports.
+  track.setAttribute("aria-valuetext", t("dashboard.history.indexingSources", {
+    bytesIndexed: formatBytes(history.indexedBytes),
+    bytesTotal: formatBytes(history.sourceBytes),
+    indexed: formatNumber(indexed),
+    total: formatNumber(total),
+  }));
+  // A started-but-tiny index must still be visibly non-empty, or 2.7% reads as
+  // "nothing has happened".
+  $("#history-progress-fill").style.width =
+    `${indexed > 0 ? Math.max(1.5, percent) : 0}%`;
+  setLocalizedText($("#history-progress-detail"), "dashboard.history.indexingSources", {
+    bytesIndexed: formatBytes(history.indexedBytes),
+    bytesTotal: formatBytes(history.sourceBytes),
+    indexed: formatNumber(indexed),
+    total: formatNumber(total),
+  });
+  setLocalizedText($("#history-progress-note"), "dashboard.history.indexingResumes");
+  return true;
+}
+
+/**
+ * Statements the local companion published about the evidence behind a figure.
+ *
+ * The companion writes each one as a finished English sentence and publishes no
+ * category alongside it. This page therefore decides only *where* a sentence
+ * appears, never what it says: each string is written with `setRawText`, so it
+ * reaches the document as text, unreworded and untruncated, and localization
+ * cannot reinterpret it.
+ *
+ * Placement is matched on the vocabulary the companion itself assembles these
+ * strings from. A sentence this build does not recognize is still shown — with
+ * the observations at the top of the overview — rather than dropped.
+ */
+const EVIDENCE_WARNING_ROUTES = Object.freeze([
+  // Anything about the history index qualifies the indexed-history totals,
+  // which are the figures the accounting period selector can show.
+  { pattern: /\bindex(?:ed|ing)\b/iu, selector: "#accounting-warnings" },
+  // Anything about prices, cost, or the accounting cache qualifies the
+  // API-price-equivalent figure the overview headlines.
+  {
+    pattern: /\b(?:accounting|cost|price|prices|priced|pricing|unpriced)\b/iu,
+    selector: "#cost-warnings",
+  },
+]);
+const EVIDENCE_WARNING_FALLBACK = "#evidence-warnings";
+// Coverage that is still growing is progress, not a failure. A caveat on a
+// figure that is already being shown is not progress, and must not be dressed
+// as it.
+const EVIDENCE_WARNING_PROGRESS =
+  /\b(?:advance|advances|advancing|expand|expands|still)\b/iu;
+
+function evidenceWarningTarget(message) {
+  return EVIDENCE_WARNING_ROUTES
+    .find((route) => route.pattern.test(message))
+    ?.selector ?? EVIDENCE_WARNING_FALLBACK;
+}
+
+function renderEvidenceWarnings(data) {
+  const grouped = new Map([
+    ...EVIDENCE_WARNING_ROUTES.map((route) => [route.selector, []]),
+    [EVIDENCE_WARNING_FALLBACK, []],
+  ]);
+  for (const message of Array.isArray(data?.warnings) ? data.warnings : []) {
+    if (typeof message !== "string" || message === "") continue;
+    grouped.get(evidenceWarningTarget(message)).push(message);
+  }
+  for (const [selector, messages] of grouped) {
+    const list = $(selector);
+    if (!list) continue;
+    clear(list);
+    // Nothing published means nothing rendered: no empty container and no
+    // "no warnings" state.
+    list.hidden = messages.length === 0;
+    for (const message of messages) {
+      const item = node("li", EVIDENCE_WARNING_PROGRESS.test(message)
+        ? "evidence-warning progress"
+        : "evidence-warning");
+      setRawText(item, message);
+      list.append(item);
+    }
   }
 }
 
@@ -624,7 +1417,7 @@ function humanize(value) {
 function latestRollingPair(data) {
   if (data.timeline?.usage?.length) {
     const live = liveTimelinePoints(data, {
-      windowHours: 1,
+      windowHours: CALIBRATION_WINDOW_HOURS,
       rangeDays: activeUsageRangeDays,
     })
       .filter((row) => row.observed !== null && row.expected !== null)
@@ -639,7 +1432,10 @@ function latestRollingPair(data) {
       residual: finite(row.residual_pp ?? row.residualPp)
     };
   }
-  const groups = groupRolling(data.gradient.rolling, 1);
+  // The canonical artifact rolling series is the three-hour smoothing; the
+  // hourly rows are diagnostic extras, and the owner fixed every comparison
+  // to the three-hour width (2026-08-06).
+  const groups = groupRolling(data.gradient.rolling, CALIBRATION_WINDOW_HOURS);
   const last = groups.at(-1);
   return last ? { observed: last.observed, expected: last.expected, residual: last.observed - last.expected } : null;
 }
@@ -647,16 +1443,42 @@ function latestRollingPair(data) {
 function renderComparison(data) {
   const pair = latestRollingPair(data);
   const summary = data.gradient.summary ?? {};
+  const weeklySummary = data.weekly.summary ?? {};
   const mae = finite(summary.mean_absolute_error_pp ?? summary.meanAbsoluteErrorPp);
   const within = finite(summary.points_within_80_band_fraction ?? summary.pointsWithin80BandFraction);
-  const capacity = finite(summary.capacity_usd ?? summary.capacityUsd);
-  const lower = finite(summary.lower_80_usd ?? summary.lower80Usd);
-  const upper = finite(summary.upper_80_usd ?? summary.upper80Usd);
+  // The weekly estimator is the canonical fitted-rate source. Older gradient
+  // artifacts used a separate summary shape, which is retained only as a
+  // compatibility fallback for old demo payloads.
+  const capacity = finite(
+    weeklySummary.median_weekly_value_usd
+      ?? weeklySummary.medianWeeklyValueUsd
+      ?? summary.capacity_usd
+      ?? summary.capacityUsd,
+  );
+  const lower = finite(
+    weeklySummary.lower_80_across_resets_usd
+      ?? weeklySummary.lower80Usd
+      ?? summary.lower_80_usd
+      ?? summary.lower80Usd,
+  );
+  const upper = finite(
+    weeklySummary.upper_80_across_resets_usd
+      ?? weeklySummary.upper80Usd
+      ?? summary.upper_80_usd
+      ?? summary.upper80Usd,
+  );
+  const qualifyingResets = finite(
+    weeklySummary.qualifying_resets ?? weeklySummary.qualifyingResets,
+    0,
+  );
   const chip = $("#fit-chip");
-  renderCalibrationRate({ capacity, lower, upper });
+  renderCalibrationRate({ capacity, lower, upper, qualifyingResets });
   if (!pair || pair.observed === null || pair.expected === null) {
-    chip.textContent = "Insufficient";
-    $("#comparison-result").textContent = "There is not yet a matched quota-and-cost window to compare.";
+    setProductText(chip, "Insufficient");
+    setProductText(
+      $("#comparison-result"),
+      "There is not yet a matched quota-and-cost window to compare.",
+    );
     return;
   }
   const max = Math.max(Math.abs(pair.observed), Math.abs(pair.expected), 1);
@@ -667,34 +1489,56 @@ function renderComparison(data) {
     row.querySelector("strong").textContent = formatPp(values[index]);
   });
   const residual = pair.residual ?? pair.observed - pair.expected;
-  chip.textContent = mae === null ? "Matched window" : `MAE ${mae.toFixed(1)} pp`;
-  $("#comparison-result").textContent = `${formatPp(Math.abs(residual))} separates the observed and cost-implied movement in the latest matched window.${within === null ? "" : ` Across the series, ${formatPercent(within * 100)} of points fall inside the modeled 80% band.`}`;
+  chip.textContent = mae === null
+    ? t("dashboard.comparison.matchedWindow")
+    : t("dashboard.comparison.mae", { value: formatDecimal(mae, 1) });
+  const latestMovement = t("dashboard.comparison.latestMovement", {
+    residual: formatPp(Math.abs(residual)),
+  });
+  const seriesBand = within === null
+    ? ""
+    : ` ${t("dashboard.comparison.seriesBand", {
+      percent: formatPercent(within * 100),
+    })}`;
+  $("#comparison-result").textContent = latestMovement + seriesBand;
 }
 
-function renderCalibrationRate({ capacity, lower, upper }) {
+function renderCalibrationRate({ capacity, lower, upper, qualifyingResets = 0 }) {
   const rate = $("#calibration-rate");
   const range = $("#calibration-range");
   const example = $("#calibration-example");
   const explanation = $("#calibration-explanation");
   if (capacity === null || capacity <= 0) {
-    rate.textContent = "Not estimable";
-    range.textContent = "Not estimable";
-    example.textContent = "Not estimable";
-    explanation.textContent =
-      "There is not yet enough matched cost and quota evidence for a positive fitted rate. API prices remain a measuring stick, not a subscription charge.";
+    setProductText(rate, "Not estimable");
+    setProductText(range, "Not estimable");
+    setProductText(example, "Not estimable");
+    setLocalizedText(explanation, "dashboard.calibration.noRate");
     return;
   }
   const perPoint = capacity / 100;
   const movementForHundred = 10_000 / capacity;
-  rate.textContent = `${formatMoney(perPoint, 2)} API equivalent per 1 percentage point`;
+  setLocalizedText(rate, "dashboard.calibration.perPoint", {
+    amount: formatMoney(perPoint, 2),
+  });
   range.textContent = lower !== null && lower > 0 && upper !== null && upper > 0
-    ? `${formatMoney(lower / 100, 2)}–${formatMoney(upper / 100, 2)} per point`
-    : "Range unavailable";
-  example.textContent =
-    `$100 of recorded API-price-equivalent usage corresponds to about ${movementForHundred.toFixed(1)} percentage points`;
+    ? t("dashboard.calibration.range", {
+      lower: formatMoney(lower / 100, 2),
+      upper: formatMoney(upper / 100, 2),
+    })
+    : t("dashboard.calibration.rangeUnavailable");
+  setLocalizedText(example, "dashboard.calibration.example", {
+    points: formatDecimal(movementForHundred, 1),
+  });
   explanation.textContent = lower !== null && lower > 0 && upper !== null && upper > 0
-    ? `The central fit implies a full 100-point allowance near ${formatMoney(capacity, 0)} API equivalent. The 80% range (${formatMoney(lower, 0)}–${formatMoney(upper, 0)}) describes variation across qualifying reset periods; it is not an 80% probability or a provider-published dollar cap.`
-    : `The central fit implies a full 100-point allowance near ${formatMoney(capacity, 0)} API equivalent, but there is not yet a usable across-reset range. This is not a provider-published dollar cap.`;
+    ? t("dashboard.calibration.withRange", {
+      count: Math.max(1, Math.round(qualifyingResets)),
+      amount: formatMoney(capacity, 0),
+      lower: formatMoney(lower, 0),
+      upper: formatMoney(upper, 0),
+    })
+    : t("dashboard.calibration.withoutRange", {
+      amount: formatMoney(capacity, 0),
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -722,51 +1566,51 @@ const SHARE_CARD_HEIGHT = 800;
 // Drawn at twice the posted size so the text stays clean after a feed
 // resamples it, and legible once a timeline scales it down.
 const SHARE_CARD_PIXEL_SCALE = 2;
-const SHARE_CARD_MAX_CAVEATS = 5;
-const SHARE_CARD_MAX_CAVEAT_LINES = 7;
+// A shared image is read at a glance. Keep only the two qualifications that
+// materially change how a reader should compare its headline figures.
+const SHARE_CARD_MAX_CAVEATS = 2;
+const SHARE_CARD_MAX_CAVEAT_LINES = 2;
 // One type size for all three figures, reduced until the longest of them fits
 // its column. A figure is never cut off: "Not estimable" and a seven-figure
 // total both overrun the column at the full size, and an ellipsis in the
 // largest type on the card is unreadable and easy to misread.
 const SHARE_CARD_VALUE_SIZE = 54;
 const SHARE_CARD_VALUE_MIN_SIZE = 34;
-// The plotted history. Fewer than three fits is a scatter, not a history, and
-// beyond two dozen the points crowd at the width a feed shows.
-const SHARE_CARD_TREND_MIN_POINTS = 3;
-const SHARE_CARD_TREND_MAX_POINTS = 26;
-const SHARE_CARD_TREND_MIN_HEIGHT = 88;
-const SHARE_CARD_TREND_MAX_HEIGHT = 210;
+// The plot has 94 px of fixed axis padding, so anything shorter cannot carry
+// an honest chart. This lower bound prevents a caveat from collapsing the
+// evidence region into a zero-height plot.
+const SHARE_CARD_TREND_MIN_HEIGHT = 168;
+// The chart is the evidence on the image, not decorative garnish. Reserve a
+// meaningful vertical lane for it instead of compressing it below three cards
+// and a verbose footer. Raised 420 → 472 (owner-directed, 2026-08-08): the
+// identifier footer and its rule are gone from the image, and every one of
+// those reclaimed pixels belongs to the plot.
+const SHARE_CARD_TREND_MAX_HEIGHT = 472;
 // Identifier-shaped only, exactly as a diagnostic code is: no space, no
 // slash, no separator that could carry a path or a folder name.
 const SHARE_CARD_REGISTRY_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/u;
 const SHARE_CARD_APP_VERSION_PATTERN = /^[0-9]+\.[0-9]+\.[0-9]+$/u;
 const SHARE_CARD_HOME_PATTERN =
   /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/u;
-// The exact period names this product emits, each paired with the phrase the
-// card prints mid-sentence. An unrecognized one is replaced rather than
-// printed, so a renamed or injected label can never reach a post.
-const SHARE_CARD_PERIOD_PHRASES = new Map([
-  ["All retained evidence", "all retained evidence"],
-  ["Last 24 hours", "the last 24 hours"],
-  ["Last 30 days", "the last 30 days"],
-  ["Last 7 days", "the last 7 days"],
-  ["Recorded period", "the recorded period"],
+// The exact period names this product emits, each mapped to an owned message
+// key. An unrecognized source value is replaced rather than printed, so a
+// renamed or injected label can never reach a shared card.
+const SHARE_CARD_PERIOD_KEYS = new Map([
+  ["All retained evidence", "share.period.allRetained"],
+  ["Cached 31-day window", "share.period.cachedThirtyOneDay"],
+  ["Cached 31-day collector window", "share.period.cachedThirtyOneDayCollector"],
+  ["Last 24 hours", "share.period.lastDay"],
+  ["Last 30 days", "share.period.lastThirtyDays"],
+  ["Last 7 days", "share.period.lastSevenDays"],
+  ["Recorded period", "share.period.recorded"],
 ]);
 // Fixed window names, keyed on the observed window duration rather than on the
 // companion's own label field.
-const SHARE_CARD_WINDOW_LABELS = Object.freeze({
-  five_hour: "five-hour allowance",
-  other: "observed allowance window",
-  seven_day: "seven-day allowance",
+const SHARE_CARD_WINDOW_KEYS = Object.freeze({
+  five_hour: "share.window.fiveHour",
+  other: "share.window.other",
+  seven_day: "share.window.sevenDay",
 });
-const SHARE_CARD_UNKNOWN_PERIOD = "the recorded period";
-const SHARE_CARD_DATE_FORMAT = new Intl.DateTimeFormat("en-US", {
-  ...(USER_TIME_ZONE === "local time" ? {} : { timeZone: USER_TIME_ZONE }),
-  month: "short",
-  day: "numeric",
-  year: "numeric",
-});
-
 let shareCard = null;
 let shareCardReference = "";
 let shareCardSignature = "";
@@ -823,32 +1667,44 @@ function shareCardHome() {
 }
 
 function shareCardWindowKind(window) {
+  if (!isPrimaryCodexQuotaWindow(window)) return "other";
   const minutes = finite(window?.durationMinutes);
-  if (minutes === 10_080) return "seven_day";
-  if (minutes === 300) return "five_hour";
+  if (minutes === CODEX_WEEKLY_ALLOWANCE_MINUTES) return "seven_day";
+  if (minutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) return "five_hour";
   return "other";
 }
 
 /**
  * Choose the one allowance window the card reports.
  *
- * The seven-day window is the headline the rest of the page leads with; when
- * it is absent the longest observed window stands in, so the card never has to
- * pick between two figures a reader could confuse.
+ * The selected normal Codex window is the card's allowance denominator. A
+ * provider-reported duration is never silently replaced with a shorter named
+ * window: seven-day reset history and its estimate stay absent unless the
+ * selected window is genuinely seven days.
  */
 function shareCardWindow(windows) {
   const observed = (Array.isArray(windows) ? windows : [])
-    .filter((window) => finite(window?.remainingPercent) !== null);
-  return observed.find((window) => shareCardWindowKind(window) === "seven_day")
-    ?? [...observed].sort(
-      (left, right) =>
-        finite(right?.durationMinutes, 0) - finite(left?.durationMinutes, 0),
-    )[0]
-    ?? null;
+    .filter((window) => (
+      isPrimaryCodexQuotaWindow(window)
+      && finite(window?.remainingPercent) !== null
+    ));
+  const selected = selectPrimaryCodexQuotaWindow(observed);
+  return selected;
 }
 
 function shareCardPeriodLabel(candidate) {
-  return SHARE_CARD_PERIOD_PHRASES.get(candidate) ?? SHARE_CARD_UNKNOWN_PERIOD;
+  return t(SHARE_CARD_PERIOD_KEYS.get(candidate) ?? "share.period.recorded");
+}
+
+function shareCardWindowLabel(window) {
+  const kind = shareCardWindowKind(window);
+  if (kind !== "other") {
+    return t(SHARE_CARD_WINDOW_KEYS[kind]);
+  }
+  const duration = localizedQuotaWindowDuration(window?.durationMinutes);
+  return duration === ""
+    ? t(SHARE_CARD_WINDOW_KEYS.other)
+    : t("share.window.providerReportedDuration", { duration });
 }
 
 /**
@@ -856,54 +1712,76 @@ function shareCardPeriodLabel(candidate) {
  * a time of day and any raw-log timestamp.
  */
 function shareCardDateLabel(timestamp) {
-  return Number.isFinite(timestamp) ? SHARE_CARD_DATE_FORMAT.format(timestamp) : "";
+  if (!Number.isFinite(timestamp)) return "";
+  return new Intl.DateTimeFormat(getFormattingLocale(), {
+    ...(USER_TIME_ZONE === "local time" ? {} : { timeZone: USER_TIME_ZONE }),
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  }).format(timestamp);
 }
 
 /**
- * The history the card plots: one point per qualifying reset-series fit, each
- * with the within-reset sensitivity bar the weekly panel draws.
- *
- * Only fits observed across at least the fixed primary-evidence span are
- * plotted. The horizontal
- * axis carries date-only labels for the derived estimate availability, never a
+ * The history the card plots: the exact allowance-history series the weekly
+ * panel uses, including shorter diagnostic observations. The horizontal axis
+ * carries date-only labels for the derived estimate availability, never a
  * raw-log timestamp or a time of day.
  */
-function shareCardTrend(rows) {
-  const points = (Array.isArray(rows) ? rows : [])
-    .map((row) => ({
-      at: Date.parse(row?.last_observed_at ?? row?.first_observed_at ?? ""),
-      value: finite(row?.value_usd ?? row?.value),
-      low: finite(row?.pairwise_p10_usd),
-      high: finite(row?.pairwise_p90_usd),
-      spanPp: finite(row?.displayed_span_pp),
-    }))
-    .filter((point) =>
-      Number.isFinite(point.at)
-      && point.value !== null
-      && point.value > 0
-      && point.spanPp !== null
-      && point.spanPp >= WEEKLY_WELL_OBSERVED_SPAN_PP)
-    .sort((left, right) => left.at - right.at)
-    .slice(-SHARE_CARD_TREND_MAX_POINTS)
-    .map((point) => Object.freeze({
-      at: point.at,
-      dateLabel: shareCardDateLabel(point.at),
-      value: point.value,
-      // A sensitivity bound that is missing or the wrong side of the fit
-      // collapses onto the fit rather than drawing a bar it cannot support.
-      low: point.low !== null && point.low > 0 && point.low < point.value
-        ? point.low
-        : point.value,
-      high: point.high !== null && point.high > point.value
-        ? point.high
-        : point.value,
-    }));
-  if (points.length < SHARE_CARD_TREND_MIN_POINTS) return null;
+function shareCardTrend(history) {
+  // The card is a compact rendering of the exact series on Allowance estimate
+  // history. It must not silently remove shorter fits, change the active
+  // period, or rescale the chart just because it is being shared.
+  const points = (Array.isArray(history?.points) ? history.points : [])
+    .map((point) => {
+      const value = finite(point?.value);
+      if (!Number.isFinite(point?.at) || value === null || value <= 0) return null;
+      const low = finite(point?.low);
+      const high = finite(point?.high);
+      return Object.freeze({
+        at: point.at,
+        dateLabel: point.dateLabel,
+        value,
+        low,
+        high,
+        historicalMedian: finite(point?.historicalMedian),
+        acrossResetLow: finite(point?.acrossResetLow),
+        acrossResetHigh: finite(point?.acrossResetHigh),
+        wellObserved: point.wellObserved === true,
+      });
+    })
+    .filter((point) => point !== null);
+  const axisLow = finite(history?.axis?.low);
+  const axisHigh = finite(history?.axis?.high);
+  if (!points.length || axisLow === null || axisHigh === null || axisHigh <= axisLow) {
+    return null;
+  }
+  const observedBounds = points.flatMap((point) => [
+    point.value,
+    point.low,
+    point.high,
+  ]).filter((value) => value !== null);
   return Object.freeze({
     points: Object.freeze(points),
-    low: Math.min(...points.map((point) => point.low)),
-    high: Math.max(...points.map((point) => point.high)),
+    low: Math.min(...observedBounds),
+    high: Math.max(...observedBounds),
+    axis: Object.freeze({
+      low: axisLow,
+      high: axisHigh,
+      ticks: Object.freeze([...(history?.axis?.ticks ?? [])]),
+    }),
+    xTicks: Object.freeze([...(history?.xTicks ?? [])]),
     count: points.length,
+    // The population the count sentence names. The page headline counts the
+    // whole corpus while the chart draws the filtered subset; the card used
+    // to print only the subset count, which read as a different dataset. The
+    // shared history model carries the corpus size and the filter it applied,
+    // so the card can state "{shown} of {total}" exactly like the hero.
+    totalCount: Math.max(
+      points.length,
+      finite(history?.totalCount, points.length),
+    ),
+    spanFloorPp: finite(history?.spanFloorPp, 0),
+    rangeDays: finite(history?.rangeDays),
     firstDateLabel: points[0].dateLabel,
     lastDateLabel: points[points.length - 1].dateLabel,
   });
@@ -923,6 +1801,7 @@ function buildShareCard(data, {
   registryVersion = "",
   home = "",
   contractVersion = "",
+  history = null,
 } = {}) {
   if (!DIAGNOSTIC_REFERENCE_PATTERN.test(reference ?? "")) {
     throw new TypeError("A results card requires a minted reference.");
@@ -930,13 +1809,15 @@ function buildShareCard(data, {
   const isDemo = data?.mode === "demo";
   const pricing = data?.pricing ?? {};
   const fastMode = pricing.fastMode ?? {};
-  const summary = data?.gradient?.summary ?? {};
+  // The share card's third figure is specifically the weekly reset fit. Do
+  // not substitute the older general-gradient summary here: both are API-price
+  // equivalents, but their evidence source and denominator are different.
+  const summary = data?.weekly?.summary ?? {};
 
   const allowanceWindow = shareCardWindow(data?.quotaWindows ?? []);
+  const isWeeklyWindow = shareCardWindowKind(allowanceWindow) === "seven_day";
   const remaining = finite(allowanceWindow?.remainingPercent);
-  const windowLabel =
-    SHARE_CARD_WINDOW_LABELS[shareCardWindowKind(allowanceWindow)]
-    ?? SHARE_CARD_WINDOW_LABELS.other;
+  const windowLabel = shareCardWindowLabel(allowanceWindow);
 
   const weighted = finite(pricing.quotaWeightedTotalCostUsd);
   const useWeighted = weighted !== null && fastMode.weightingStatus !== "unknown";
@@ -944,107 +1825,153 @@ function buildShareCard(data, {
   const excluded = finite(fastMode.unweightedUnknownApiPriceEquivalentUsd, 0);
   const period = shareCardPeriodLabel(pricing.periodLabel);
 
-  const capacity = finite(summary.capacity_usd ?? summary.capacityUsd);
-  const lower = finite(summary.lower_80_usd ?? summary.lower80Usd);
-  const upper = finite(summary.upper_80_usd ?? summary.upper80Usd);
+  const capacity = isWeeklyWindow ? finite(
+    summary.median_weekly_value_usd ?? summary.medianWeeklyValueUsd,
+  ) : null;
+  const lower = isWeeklyWindow ? finite(
+    summary.lower_80_across_resets_usd ?? summary.lower80Usd,
+  ) : null;
+  const upper = isWeeklyWindow ? finite(
+    summary.upper_80_across_resets_usd ?? summary.upper80Usd,
+  ) : null;
   const hasCapacity = capacity !== null && capacity > 0;
   const hasRange = hasCapacity
     && lower !== null && lower > 0
     && upper !== null && upper > 0;
 
+  // The allowance estimate leads: it is the card's headline claim, and the
+  // title promises it (owner-directed reorder, 2026-08-07).
   const stats = [
     {
-      label: "Allowance left",
-      value: remaining === null ? "Not observed" : formatPercent(remaining),
-      detail: remaining === null
-        ? "no current allowance window was observed"
-        : `of the ${windowLabel}`,
-    },
-    {
-      // The same two names the accounting panel uses, so a reader comparing a
-      // posted card against the dashboard sees one metric, not two.
-      label: useWeighted
-        ? "Quota-weighted API-price equivalent"
-        : "Standard-rate API-price equivalent",
-      value: spend === null ? "Not available" : formatMoney(spend, 2),
-      detail: spend === null
-        ? "no priced usage was recorded"
-        : `over ${period}`,
-    },
-    {
-      label: "A full allowance measures",
-      value: hasCapacity ? formatMoney(capacity, 0) : "Not estimable",
-      detail: hasRange
-        ? `80% range ${formatMoney(lower, 0)}–${formatMoney(upper, 0)}`
+      label: isWeeklyWindow
+        ? t("share.stat.estimatedAllowance")
+        : t("share.stat.estimatedAllowanceUnavailable"),
+      value: hasCapacity ? formatMoney(capacity, 0) : t("share.value.notEstimable"),
+      detail: !isWeeklyWindow
+        ? t("share.detail.notApplicableToWindow")
+        : hasRange
+        ? t("share.detail.resetRange", {
+          lower: formatMoney(lower, 0),
+          upper: formatMoney(upper, 0),
+        })
         : hasCapacity
-          ? "no across-reset range yet"
-          : "not enough matched windows yet",
+          ? t("share.detail.noAcrossResetRange")
+          : t("share.detail.notEnoughMatchedWindows"),
+    },
+    {
+      label: t("share.stat.allowanceLeft"),
+      value: remaining === null ? t("share.value.notObserved") : formatPercent(remaining),
+      detail: remaining === null
+        ? t("share.detail.noCurrentAllowance")
+        : t("share.detail.ofWindow", { window: windowLabel }),
+    },
+    {
+      // This is the complete rolling ledger selection, not a single weekly
+      // allowance. The label must make the different denominator clear on the
+      // image itself: an activity total can legitimately exceed one estimated
+      // allowance without being a billing error or an allowance overrun.
+      label: t("share.stat.recordedActivity"),
+      value: spend === null ? t("share.value.notAvailable") : formatMoney(spend, 0),
+      detail: spend === null
+        ? t("share.detail.noPricedUsage")
+        : t("share.detail.activityPeriod", { period }),
     },
   ];
 
   // Assembled from the same state the panels report, strongest qualification
-  // first, so a shortened card never drops the caveat that matters most.
+  // first. The old separate activity-versus-allowance sentence is gone
+  // (owner-directed, 2026-08-07): each stat's own detail line already names
+  // its denominator, and the reclaimed row belongs to the chart.
   const caveats = [];
   if (isDemo) {
-    caveats.push(
-      "Labeled demo data: an illustrative fixture, not measured usage.",
-    );
+    caveats.push(t("share.caveat.demo"));
   }
   if (excluded > 0) {
-    caveats.push(
-      `Not a complete total: ${formatMoney(excluded, 2)} of Standard-rate cost could not be speed-weighted and is excluded rather than counted at 1x.`,
-    );
+    caveats.push(t("share.caveat.unweighted", {
+      amount: formatMoney(excluded, 2),
+    }));
   }
   if (fastMode.weightingStatus === "unknown") {
-    caveats.push(
-      "No usage could be speed-weighted, so this is the unchanged Standard-rate total.",
-    );
+    caveats.push(t("share.caveat.noWeighted"));
   } else if (fastMode.weightingStatus !== "complete") {
-    caveats.push(
-      "Fast-mode attribution is partial: Codex records the speed mode only when it changes, never at session start.",
-    );
+    caveats.push(t("share.caveat.fastPartial"));
   }
   const coverage = finite(pricing.coveragePercent);
   if (coverage !== null && coverage < 100) {
-    caveats.push(
-      `${formatPercent(coverage, 1)} of recorded usage could be priced; the rest is left unpriced rather than estimated.`,
-    );
+    caveats.push(t("share.caveat.coverage", {
+      percent: formatPercent(coverage, 1),
+    }));
   }
-  caveats.push(
-    hasRange
-      ? "The range is variation across qualifying reset periods, not an 80% probability. API prices are a measuring stick for quota consumption, not a subscription charge or a published dollar cap."
-      : "API prices are a measuring stick for quota consumption, not a subscription charge or a published dollar cap.",
-  );
-
   const identifiers = [
-    reference,
-    appVersion === "" ? "unversioned build" : `TiboTattle ${appVersion}`,
-    registryVersion === "" ? "" : `prices ${registryVersion}`,
+    t("share.identifier.debug", { reference }),
+    appVersion === "" ? t("share.identifier.unversioned") : t("share.identifier.version", {
+      version: appVersion,
+    }),
   ].filter((part) => part !== "");
 
+  const trend = isWeeklyWindow ? shareCardTrend(history) : null;
   return Object.freeze({
     reference,
     isDemo,
-    title: "Where my Codex allowance stands",
+    title: t("share.title"),
     // The strongest claim on the card is the one a fixture must not borrow.
     // A demo card says so in the line under the title and in a mark beside the
     // wordmark, not only in the smallest copy on the image, because a reader
     // scrolling a timeline reads the title and the figures and nothing else.
     subtitle: isDemo
-      ? "Illustrative demo data. Not a measurement."
-      : "Measured on my own Mac. Nothing left it.",
-    badge: isDemo ? "DEMO DATA" : "",
+      ? t("share.subtitle.demo")
+      : t("share.subtitle.local"),
+    badge: isDemo ? t("share.badge.demo") : "",
     stats: Object.freeze(stats.map((stat) => Object.freeze({ ...stat }))),
-    trend: shareCardTrend(data?.weekly?.weeklyValues),
-    trendLabel: "Seven-day fits, each with its own sensitivity bar",
-    trendEmpty: "Not enough qualifying resets yet to plot a history.",
-    trendEmptyDetail:
-      "Each reset observed across most of the allowance adds one fit, with the sensitivity bar that fit carries.",
+    // Reset-fit history is an explicitly seven-day model. It is never drawn
+    // behind a five-hour or provider-reported generic allowance window.
+    trend,
+    trendLabel: t("share.trend.label"),
+    // The count sentence mirrors the Allowance hero's phrasing: shown of
+    // total, plus the range and span filter the shared model applied. A bare
+    // subset count beside the page's corpus count read as two different
+    // datasets (owner review, 2026-08-08).
+    trendCount: trend === null ? "" : shareCardTrendCountLabel(trend),
+    trendEmpty: isWeeklyWindow
+      ? t("share.trend.empty")
+      : t("share.trend.unavailableForWindow"),
+    trendEmptyDetail: isWeeklyWindow
+      ? t("share.trend.emptyDetail")
+      : t("share.trend.unavailableForWindowDetail"),
     caveats: Object.freeze(caveats),
     identifierLine: identifiers.join(" · "),
     contractVersion,
     home,
+    // Drawn at the image's top-right corner in place of the home host
+    // (owner-directed, 2026-08-08). Empty when the build is unversioned, so
+    // the corner is blank rather than carrying an invented number.
+    versionLabel: appVersion === ""
+      ? ""
+      : t("share.identifier.version", { version: appVersion }),
   });
+}
+
+/**
+ * The plotted history's population sentence: shown of total, with the fixed
+ * range vocabulary and the span floor the shared model applied. Only numbers
+ * and fixed copy can reach it.
+ */
+function shareCardTrendCountLabel(trend) {
+  const range = trend.rangeDays === null
+    || trend.rangeDays >= ALL_HISTORY_RANGE_DAYS
+    ? t("share.range.all")
+    : t("share.range.days", { days: formatNumber(trend.rangeDays) });
+  const values = {
+    range,
+    shown: formatNumber(trend.count),
+    total: formatNumber(trend.totalCount),
+  };
+  return trend.spanFloorPp > 0
+    ? t("share.trend.countWithFloor", {
+      ...values,
+      span: formatNumber(trend.spanFloorPp),
+    })
+    : t("share.trend.countAnySpan", values);
 }
 
 /**
@@ -1052,18 +1979,21 @@ function buildShareCard(data, {
  */
 function shareCardText(card) {
   const figures = card.stats
-    .map((stat) => `${stat.label}: ${stat.value} — ${stat.detail}.`)
+    .map((stat) => t("share.text.figure", stat))
     .join(" ");
   const trailer = card.contractVersion === ""
     ? card.identifierLine
-    : `${card.identifierLine} · contract ${card.contractVersion}`;
+    : t("share.text.contract", {
+      identifier: card.identifierLine,
+      version: card.contractVersion,
+    });
   return [
-    `TiboTattle — ${card.title}. ${card.subtitle}`,
+    t("share.text.header", { subtitle: card.subtitle, title: card.title }),
     figures,
     shareCardTrendText(card),
     card.caveats.join(" "),
-    `${trailer}.`,
-    card.home === "" ? "" : `More at ${card.home}`,
+    t("share.text.trailer", { trailer }),
+    card.home === "" ? "" : t("share.text.more", { home: card.home }),
   ].filter((line) => line !== "").join("\n");
 }
 
@@ -1073,8 +2003,21 @@ function shareCardText(card) {
  */
 function shareCardTrendText(card) {
   return card.trend === null
-    ? `${card.trendLabel}: ${card.trendEmpty} ${card.trendEmptyDetail}`
-    : `${card.trendLabel}: ${card.trend.count} fits observed from ${card.trend.firstDateLabel} to ${card.trend.lastDateLabel}. The vertical axis is API-price equivalent USD, spanning ${formatMoney(card.trend.low, 0)} to ${formatMoney(card.trend.high, 0)} including every sensitivity bar.`;
+    ? t("share.text.trendEmpty", {
+      detail: card.trendEmptyDetail,
+      empty: card.trendEmpty,
+      label: card.trendLabel,
+    })
+    : t("share.text.trendPopulated", {
+      end: card.trend.lastDateLabel,
+      // The same shown-of-total sentence the image prints, so the text
+      // transcript and the picture state one population.
+      fits: card.trendCount,
+      high: formatMoney(card.trend.high, 0),
+      label: card.trendLabel,
+      low: formatMoney(card.trend.low, 0),
+      start: card.trend.firstDateLabel,
+    });
 }
 
 function shareCardFont(weight, size, family = "sans") {
@@ -1092,8 +2035,17 @@ function shareCardFont(weight, size, family = "sans") {
 function shareCardWrap(context, value, maxWidth, maxLines) {
   const lines = [];
   let current = "";
-  for (const word of String(value).split(" ")) {
-    const candidate = current === "" ? word : `${current} ${word}`;
+  const source = String(value).trim();
+  const words = /\s/u.test(source)
+    ? source.split(/\s+/u)
+    : typeof Intl.Segmenter === "function"
+      ? [...new Intl.Segmenter(localization.locale(), {
+        granularity: "grapheme",
+      }).segment(source)].map(({ segment }) => segment)
+      : Array.from(source);
+  const separator = /\s/u.test(source) ? " " : "";
+  for (const word of words) {
+    const candidate = current === "" ? word : `${current}${separator}${word}`;
     if (current !== "" && context.measureText(candidate).width > maxWidth) {
       lines.push(current);
       current = word;
@@ -1108,12 +2060,12 @@ function shareCardWrap(context, value, maxWidth, maxLines) {
 
 function shareCardFit(context, value, maxWidth) {
   if (context.measureText(value).width <= maxWidth) return value;
-  let text = value;
-  while (text.length > 1
-    && context.measureText(`${text}…`).width > maxWidth) {
-    text = text.slice(0, -1);
+  const units = Array.from(String(value));
+  while (units.length > 1
+    && context.measureText(`${units.join("")}…`).width > maxWidth) {
+    units.pop();
   }
-  return `${text}…`;
+  return `${units.join("")}…`;
 }
 
 function drawShareCardBrand(context, x, y) {
@@ -1172,39 +2124,6 @@ function drawShareCardBadge(context, badge, x, y) {
   return width;
 }
 
-/**
- * Plot the reset-series fits and their sensitivity bars.
- *
- * Independent estimates, so they are drawn as points and never joined into a
- * line the model does not claim. Only numbers reach the canvas here: each
- * point's position comes from a parsed timestamp and a dollar figure, and the
- * axis is labelled with formatted money and date-only observation labels.
- */
-function shareCardTrendAxis(low, high) {
-  const observedRange = Math.max(
-    high - low,
-    Math.max(Math.abs(low), Math.abs(high), 1) * .1,
-  );
-  const paddedLow = Math.max(0, low - observedRange * .08);
-  const paddedHigh = high + observedRange * .08;
-  const desiredStep = Math.max((paddedHigh - paddedLow) / 4, Number.MIN_VALUE);
-  const magnitude = 10 ** Math.floor(Math.log10(desiredStep));
-  const normalized = desiredStep / magnitude;
-  const multiple = [1, 2, 2.5, 5, 10].find((candidate) => candidate >= normalized) ?? 10;
-  const step = multiple * magnitude;
-  const axisLow = Math.max(0, Math.floor(paddedLow / step) * step);
-  const axisHigh = Math.ceil(paddedHigh / step) * step;
-  const ticks = [];
-  for (let value = axisHigh; value >= axisLow - step / 1_000; value -= step) {
-    ticks.push(Number(value.toFixed(8)));
-  }
-  return Object.freeze({
-    low: axisLow,
-    high: axisHigh,
-    ticks: Object.freeze(ticks),
-  });
-}
-
 function drawShareCardTrend(context, card, x, y, width, height) {
   drawShareCardPanel(context, x, y, width, height);
   context.save();
@@ -1221,11 +2140,10 @@ function drawShareCardTrend(context, card, x, y, width, height) {
     context.restore();
     return;
   }
-  const { points, low, high } = card.trend;
-  const axis = shareCardTrendAxis(low, high);
-  const xAxisLabel = "Reset estimate availability (local date)";
-  const yAxisLabel = "API-price equivalent (USD)";
-  const padTop = 20;
+  const { points, axis, xTicks } = card.trend;
+  const xAxisLabel = t("share.axis.resetEstimateDate");
+  const yAxisLabel = t("share.axis.allowance");
+  const padTop = 40;
   const padBottom = 54;
   const padLeft = 92;
   const padRight = 20;
@@ -1235,11 +2153,13 @@ function drawShareCardTrend(context, card, x, y, width, height) {
   const plotRight = x + width - padRight;
   const plotTop = y + padTop;
   const plotBottom = y + height - padBottom;
-  const span = points[points.length - 1].at - points[0].at;
+  const domainStart = points[0].at;
+  const domainEnd = points.at(-1).at;
+  const span = domainEnd - domainStart;
   const range = axis.high - axis.low;
   const positionX = (point) => points.length === 1 || span <= 0
     ? (plotLeft + plotRight) / 2
-    : plotLeft + (point.at - points[0].at) / span * (plotRight - plotLeft);
+    : plotLeft + (point.at - domainStart) / span * (plotRight - plotLeft);
   const positionY = (value) => range <= 0
     ? (plotTop + plotBottom) / 2
     : plotBottom - (value - axis.low) / range * (plotBottom - plotTop);
@@ -1262,26 +2182,59 @@ function drawShareCardTrend(context, card, x, y, width, height) {
   context.lineTo(plotRight, plotBottom);
   context.stroke();
 
+  const bandLow = finite(points[0]?.acrossResetLow);
+  const bandHigh = finite(points[0]?.acrossResetHigh);
+  if (bandLow !== null && bandHigh !== null && bandHigh > bandLow) {
+    context.fillStyle = "rgba(49, 95, 132, .14)";
+    context.fillRect(
+      plotLeft,
+      positionY(bandHigh),
+      plotRight - plotLeft,
+      positionY(bandLow) - positionY(bandHigh),
+    );
+  }
+
   for (const point of points) {
     const pointX = Math.round(positionX(point)) + .5;
-    context.strokeStyle = "rgba(23, 79, 69, .38)";
-    context.lineWidth = 2;
-    context.beginPath();
-    context.moveTo(pointX, positionY(point.high));
-    context.lineTo(pointX, positionY(point.low));
-    context.stroke();
-    context.lineWidth = 1.5;
-    for (const bound of [point.high, point.low]) {
-      const capY = Math.round(positionY(bound)) + .5;
+    if (point.low !== null && point.high !== null) {
+      context.strokeStyle = "rgba(49, 95, 132, .78)";
+      context.lineWidth = 1.8;
       context.beginPath();
-      context.moveTo(pointX - 4, capY);
-      context.lineTo(pointX + 4, capY);
+      context.moveTo(pointX, positionY(point.high));
+      context.lineTo(pointX, positionY(point.low));
       context.stroke();
+      for (const bound of [point.high, point.low]) {
+        const capY = Math.round(positionY(bound)) + .5;
+        context.beginPath();
+        context.moveTo(pointX - 5, capY);
+        context.lineTo(pointX + 5, capY);
+        context.stroke();
+      }
     }
-    context.fillStyle = "#174f45";
+  }
+
+  const median = finite(points[0]?.historicalMedian);
+  if (median !== null) {
+    const medianY = Math.round(positionY(median)) + .5;
+    context.strokeStyle = "#174f45";
+    context.lineWidth = 3;
+    context.beginPath();
+    context.moveTo(plotLeft, medianY);
+    context.lineTo(plotRight, medianY);
+    context.stroke();
+  }
+
+  for (const point of points) {
+    const pointX = Math.round(positionX(point)) + .5;
+    context.fillStyle = point.wellObserved ? "#315f84" : "#fffef9";
     context.beginPath();
     context.arc(pointX, positionY(point.value), 4.5, 0, Math.PI * 2);
     context.fill();
+    if (!point.wellObserved) {
+      context.strokeStyle = "#a9492f";
+      context.lineWidth = 2.4;
+      context.stroke();
+    }
   }
 
   context.fillStyle = "#65706b";
@@ -1294,21 +2247,17 @@ function drawShareCardTrend(context, card, x, y, width, height) {
       positionY(value) + 5,
     );
   }
-  context.save();
-  context.translate(x + 20, (plotTop + plotBottom) / 2);
-  context.rotate(-Math.PI / 2);
-  context.textAlign = "center";
-  context.fillText(yAxisLabel, 0, 0);
-  context.restore();
+  context.textAlign = "left";
+  context.font = shareCardFont(700, 13);
+  context.fillText(yAxisLabel, plotLeft, y + 22);
 
-  const dateIndexes = points.length < 3
-    ? [0, points.length - 1]
-    : [0, Math.floor((points.length - 1) / 2), points.length - 1];
-  for (const index of [...new Set(dateIndexes)]) {
-    const point = points[index];
-    const alignment = index === 0 ? "left" : index === points.length - 1 ? "right" : "center";
-    context.textAlign = alignment;
-    context.fillText(point.dateLabel, positionX(point), plotBottom + 21);
+  for (const tick of xTicks) {
+    // SVG uses `middle`; Canvas uses the equivalent `center` value.
+    context.textAlign = tick.alignment === "middle" ? "center" : tick.alignment;
+    const tickX = points.length === 1 || span <= 0
+      ? (plotLeft + plotRight) / 2
+      : plotLeft + (tick.at - domainStart) / span * (plotRight - plotLeft);
+    context.fillText(tick.label, tickX, plotBottom + 21);
   }
   context.font = shareCardFont(600, 13);
   context.textAlign = "center";
@@ -1338,39 +2287,46 @@ function drawShareCard(canvas, card) {
   context.lineWidth = 2;
   context.strokeRect(1, 1, SHARE_CARD_WIDTH - 2, SHARE_CARD_HEIGHT - 2);
 
-  drawShareCardBrand(context, margin, 68);
+  // Header band (owner-directed tightening, 2026-08-07): brand, title and
+  // subtitle sit in 170px instead of the old 207px, and every reclaimed pixel
+  // below goes to the chart.
+  drawShareCardBrand(context, margin, 54);
   context.textBaseline = "alphabetic";
   context.fillStyle = "#17211e";
   context.font = shareCardFont(800, 25);
-  context.fillText("TiboTattle", margin + 52, 77);
+  context.fillText("TiboTattle", margin + 52, 63);
   if (card.badge !== "") {
     drawShareCardBadge(
       context,
       card.badge,
       margin + 68 + context.measureText("TiboTattle").width,
-      75,
+      61,
     );
   }
 
+  // The top-right corner names the build that produced these figures
+  // (owner-directed, 2026-08-08): the app version replaced the home host,
+  // which already reaches a reader through the text transcript's "More at"
+  // line. An unversioned build leaves the corner blank.
   context.textAlign = "right";
   context.font = shareCardFont(700, 20);
   context.fillStyle = "#65706b";
-  if (card.home !== "") {
-    context.fillText(card.home, SHARE_CARD_WIDTH - margin, 77);
+  if (card.versionLabel !== "") {
+    context.fillText(card.versionLabel, SHARE_CARD_WIDTH - margin, 63);
   }
   context.textAlign = "left";
 
   context.fillStyle = "#17211e";
-  context.font = shareCardFont(500, 52, "serif");
-  context.fillText(shareCardFit(context, card.title, inner), margin, 158);
-  context.font = shareCardFont(600, 21);
+  context.font = shareCardFont(500, 50, "serif");
+  context.fillText(shareCardFit(context, card.title, inner), margin, 126);
+  context.font = shareCardFont(600, 20);
   context.fillStyle = "#65706b";
-  context.fillText(shareCardFit(context, card.subtitle, inner), margin, 192);
+  context.fillText(shareCardFit(context, card.subtitle, inner), margin, 156);
 
   const gap = 22;
   const columnWidth = (inner - gap * 2) / 3;
-  const statTop = 222;
-  const statHeight = 178;
+  const statTop = 176;
+  const statHeight = 152;
   const padding = 20;
   const textWidth = columnWidth - padding * 2;
   const valueSize = shareCardValueSize(
@@ -1384,50 +2340,60 @@ function drawShareCard(canvas, card) {
     context.fillStyle = "#65706b";
     context.font = shareCardFont(750, 15);
     const labelLines = shareCardWrap(
-      context, stat.label.toUpperCase(), textWidth, 2,
+      context, stat.label.toLocaleUpperCase(localization.locale()), textWidth, 2,
     );
     labelLines.forEach((line, lineIndex) => {
-      context.fillText(line, x + padding, statTop + 34 + lineIndex * 19);
+      context.fillText(line, x + padding, statTop + 32 + lineIndex * 19);
     });
     context.fillStyle = "#174f45";
     context.font = shareCardFont(500, valueSize, "serif");
     context.fillText(
       shareCardFit(context, stat.value, textWidth),
       x + padding,
-      statTop + 110,
+      statTop + 98,
     );
     context.fillStyle = "#65706b";
-    context.font = shareCardFont(600, 17);
+    context.font = shareCardFont(600, 16);
     shareCardWrap(context, stat.detail, textWidth, 2).forEach((line, lineIndex) => {
-      context.fillText(line, x + padding, statTop + 140 + lineIndex * 21);
+      context.fillText(line, x + padding, statTop + 126 + lineIndex * 20);
     });
   });
 
-  // The qualifications are laid out from the bottom up, so a card with one
-  // caveat and a card with several both sit against the same rule instead of
-  // leaving the strongest qualification stranded in white space. The history
-  // above them then takes exactly the space they leave, so the card is never
-  // hollow in the middle and never crowds a qualification out.
+  // Qualifications are reserved only for incomplete data. A complete card
+  // gives the plot its natural visual weight instead of spending the lower
+  // third on generic methodology copy. The old activity-versus-allowance
+  // sentence row is gone with its field (owner-directed, 2026-08-07).
   context.font = shareCardFont(500, 17);
   const caveatLines = card.caveats
     .slice(0, SHARE_CARD_MAX_CAVEATS)
     .flatMap((caveat) => shareCardWrap(context, caveat, inner - 20, 2))
     .slice(0, SHARE_CARD_MAX_CAVEAT_LINES);
   const caveatStep = 23;
-  const ruleY = SHARE_CARD_HEIGHT - 82.5;
-  const caveatTop = ruleY - 22 - (caveatLines.length - 1) * caveatStep;
-  const trendTop = statTop + statHeight + 44;
+  // The identifier/debug footer and its rule are gone from the image
+  // (owner-directed, 2026-08-08). The reference still reaches a reader
+  // through the text transcript, the saved file's name, and the chip beside
+  // the card; on the picture, every reclaimed pixel belongs to the chart.
+  // Caveats, when present, now anchor directly above the card's bottom edge.
+  const caveatBaseY = SHARE_CARD_HEIGHT - 26;
+  const caveatTop = caveatLines.length === 0
+    ? caveatBaseY + 22
+    : caveatBaseY - (caveatLines.length - 1) * caveatStep;
+  const trendTop = statTop + statHeight + 34;
   const trendHeight = Math.min(
     SHARE_CARD_TREND_MAX_HEIGHT,
     Math.max(SHARE_CARD_TREND_MIN_HEIGHT, caveatTop - 30 - trendTop),
   );
   context.fillStyle = "#65706b";
   context.font = shareCardFont(750, 15);
-  context.fillText(card.trendLabel.toUpperCase(), margin, trendTop - 14);
-  if (card.trend !== null) {
+  context.fillText(
+    card.trendLabel.toLocaleUpperCase(localization.locale()),
+    margin,
+    trendTop - 14,
+  );
+  if (card.trendCount !== "") {
     context.textAlign = "right";
     context.fillText(
-      `${card.trend.count} qualifying resets`,
+      card.trendCount,
       SHARE_CARD_WIDTH - margin,
       trendTop - 14,
     );
@@ -1435,46 +2401,22 @@ function drawShareCard(canvas, card) {
   }
   drawShareCardTrend(context, card, margin, trendTop, inner, trendHeight);
 
-  context.font = shareCardFont(500, 17);
-  let caveatY = caveatTop;
-  context.fillStyle = "rgba(23, 79, 69, .3)";
-  context.fillRect(
-    margin,
-    caveatY - 16,
-    3,
-    (caveatLines.length - 1) * caveatStep + 22,
-  );
-  context.fillStyle = "#65706b";
-  for (const line of caveatLines) {
-    context.fillText(line, margin + 20, caveatY);
-    caveatY += caveatStep;
+  if (caveatLines.length > 0) {
+    context.font = shareCardFont(500, 17);
+    let caveatY = caveatTop;
+    context.fillStyle = "rgba(23, 79, 69, .3)";
+    context.fillRect(
+      margin,
+      caveatY - 16,
+      3,
+      (caveatLines.length - 1) * caveatStep + 22,
+    );
+    context.fillStyle = "#65706b";
+    for (const line of caveatLines) {
+      context.fillText(line, margin + 20, caveatY);
+      caveatY += caveatStep;
+    }
   }
-
-  context.strokeStyle = "rgba(23, 33, 30, .16)";
-  context.lineWidth = 1;
-  context.beginPath();
-  context.moveTo(margin, ruleY);
-  context.lineTo(SHARE_CARD_WIDTH - margin, ruleY);
-  context.stroke();
-
-  context.fillStyle = "#17211e";
-  context.font = shareCardFont(700, 18);
-  context.fillText(
-    shareCardFit(context, card.identifierLine, inner),
-    margin,
-    ruleY + 28.5,
-  );
-  context.fillStyle = "#65706b";
-  context.font = shareCardFont(500, 16);
-  context.fillText(
-    shareCardFit(
-      context,
-      "Local-first measurement. No prompts, files, folder names, or account details leave the Mac.",
-      inner,
-    ),
-    margin,
-    ruleY + 52.5,
-  );
   return true;
 }
 
@@ -1489,6 +2431,55 @@ function setShareCardStatus(text, { error = false } = {}) {
   status.className = `participant-action-status${error ? " error" : ""}`;
   status.textContent = text;
   status.hidden = text === "";
+}
+
+// Confirmation of a completed copy is transient: the owner reported the
+// previous static status line as broken, because every copy appended
+// permanent text under the card. The toast appears over the panel, holds
+// long enough to read the printed reference, and removes itself. It is a
+// role="status" live region — the same announcement pattern the other action
+// statuses on this page use — and contains no focusable content, so it
+// cannot trap focus. Its entrance and exit motion live in the stylesheet
+// behind prefers-reduced-motion.
+const SHARE_CARD_TOAST_HOLD_MS = 6_000;
+const SHARE_CARD_TOAST_LEAVE_MS = 300;
+let shareCardToastHoldTimer = null;
+let shareCardToastLeaveTimer = null;
+
+function dismissShareCardToast() {
+  const toast = $("#share-card-toast");
+  clearTimeout(shareCardToastHoldTimer);
+  clearTimeout(shareCardToastLeaveTimer);
+  shareCardToastHoldTimer = null;
+  shareCardToastLeaveTimer = null;
+  toast.classList.remove("share-toast-leaving");
+  toast.textContent = "";
+  toast.hidden = true;
+}
+
+function showShareCardToast(text, { actionLabel = "", onAction = null } = {}) {
+  const toast = $("#share-card-toast");
+  dismissShareCardToast();
+  toast.hidden = false;
+  toast.textContent = text;
+  // An optional single action, used by Save to reveal the file. The button is
+  // only ever offered when a caller verified the capability exists, so the
+  // toast never shows a control that cannot act.
+  if (actionLabel !== "" && typeof onAction === "function") {
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = "button button-quiet compact share-toast-action";
+    action.textContent = actionLabel;
+    action.addEventListener("click", onAction);
+    toast.append(action);
+  }
+  shareCardToastHoldTimer = setTimeout(() => {
+    toast.classList.add("share-toast-leaving");
+    shareCardToastLeaveTimer = setTimeout(
+      dismissShareCardToast,
+      SHARE_CARD_TOAST_LEAVE_MS,
+    );
+  }, SHARE_CARD_TOAST_HOLD_MS);
 }
 
 function updateShareCardActions() {
@@ -1506,23 +2497,37 @@ function updateShareCardActions() {
  *
  * A fresh reference is minted whenever the figures change, so one posted image
  * and one reference always describe the same numbers.
+ *
+ * Owner-verified regression fix (2026-08-08): the chart renderer hands its
+ * OWN history model in through `history`, so the card and the chart are two
+ * renderings of one model instance. A card that derived its own model relied
+ * on every caller re-rendering it after every filter change — the coupling
+ * that broke. Standalone calls (the brand-image late load) still derive the
+ * model themselves and read the same active-filter state.
  */
-function renderShareCard(data) {
+function renderShareCard(data, { history: sharedHistory = null } = {}) {
   const canvas = $("#share-card-canvas");
   const allowanceWindow = shareCardWindow(data?.quotaWindows ?? []);
+  const isWeeklyWindow = shareCardWindowKind(allowanceWindow) === "seven_day";
+  const history = isWeeklyWindow
+    ? sharedHistory ?? allowanceHistoryChartModel(data)
+    : null;
+  const trend = isWeeklyWindow ? shareCardTrend(history) : null;
   const signature = JSON.stringify([
     data?.mode,
     shareCardWindowKind(allowanceWindow),
+    finite(allowanceWindow?.durationMinutes),
     finite(allowanceWindow?.remainingPercent),
     finite(data?.pricing?.quotaWeightedTotalCostUsd),
     finite(data?.pricing?.totalCostUsd),
     finite(data?.pricing?.coveragePercent),
     data?.pricing?.fastMode?.weightingStatus ?? "",
     finite(data?.pricing?.fastMode?.unweightedUnknownApiPriceEquivalentUsd, 0),
-    finite(data?.gradient?.summary?.capacity_usd
-      ?? data?.gradient?.summary?.capacityUsd),
-    // The plotted history is on the image too, so a new fit is a new card.
-    shareCardTrend(data?.weekly?.weeklyValues)?.points ?? null,
+    finite(data?.weekly?.summary?.median_weekly_value_usd
+      ?? data?.weekly?.summary?.medianWeeklyValueUsd),
+    // The plotted history is on the image too, so any change to the canonical
+    // dashboard model becomes a new card.
+    trend,
   ]);
   if (signature !== shareCardSignature || shareCardReference === "") {
     shareCardSignature = signature;
@@ -1534,13 +2539,16 @@ function renderShareCard(data) {
     registryVersion: shareCardRegistryVersion(data?.pricing?.registryVersion),
     contractVersion: shareCardRegistryVersion(data?.schemaVersion),
     home: shareCardHome(),
+    history,
   });
-  $("#share-card-reference").textContent = shareCard.reference;
+  // The header's reference chip is gone (owner-directed, 2026-08-08): the
+  // reference still exists — the saved file name carries it — but the panel
+  // header no longer prints a code the reader cannot act on.
   canvas.setAttribute("aria-label", shareCardText(shareCard));
   if (!drawShareCard(canvas, shareCard)) {
     shareCard = null;
     setShareCardStatus(
-      "This browser did not provide a drawing surface, so no image could be produced. The card's figures are listed below it as text.",
+      "TiboTattle could not get a drawing surface, so no image could be produced. The card's figures are listed below it as text.",
       { error: true },
     );
   } else {
@@ -1572,7 +2580,7 @@ function downloadShareCard() {
     const blob = await shareCardBlob($("#share-card-canvas"));
     if (blob === null) {
       setShareCardStatus(
-        "This browser could not turn the card into a PNG. Nothing was saved; the figures remain listed below as text.",
+        "TiboTattle could not turn the card into a PNG. Nothing was saved; the figures remain listed below as text.",
         { error: true },
       );
       return;
@@ -1583,9 +2591,19 @@ function downloadShareCard() {
     link.download = shareCardFileName(card);
     link.click();
     URL.revokeObjectURL(url);
-    setShareCardStatus(
-      `Saved as ${shareCardFileName(card)}. Reference ${card.reference} is printed on the image.`,
-    );
+    // The image no longer prints the reference (owner-directed, 2026-08-08),
+    // so the claim moved with the fact: the file name carries it.
+    const saved = `Saved as ${shareCardFileName(card)}. The file name carries reference ${card.reference}.`;
+    // Reveal is native-only: the shell tracks where the download landed and
+    // shows it in Finder itself, so the page never learns a filesystem path.
+    // In a plain browser the button is absent rather than disabled.
+    const bridge = document.body.classList.contains("native-dashboard")
+      ? window.webkit?.messageHandlers?.tibotattleDownloads
+      : undefined;
+    showShareCardToast(saved, bridge ? {
+      actionLabel: t("shareCard.showInFinder"),
+      onAction: () => bridge.postMessage({ type: "reveal-latest-download" }),
+    } : {});
   });
 }
 
@@ -1594,7 +2612,7 @@ function copyShareCardImage() {
     if (typeof ClipboardItem !== "function"
       || typeof navigator.clipboard?.write !== "function") {
       setShareCardStatus(
-        "This browser cannot put an image on the clipboard. Use Save image instead, or Copy as text.",
+        "TiboTattle cannot put an image on the clipboard here. Use Save image instead, or Copy as text.",
         { error: true },
       );
       return;
@@ -1602,7 +2620,7 @@ function copyShareCardImage() {
     const blob = await shareCardBlob($("#share-card-canvas"));
     if (blob === null) {
       setShareCardStatus(
-        "This browser could not turn the card into a PNG. Nothing was copied.",
+        "TiboTattle could not turn the card into a PNG. Nothing was copied.",
         { error: true },
       );
       return;
@@ -1611,8 +2629,11 @@ function copyShareCardImage() {
       await navigator.clipboard.write([
         new ClipboardItem({ "image/png": blob }),
       ]);
-      setShareCardStatus(
-        `Copied. Paste it anywhere; reference ${card.reference} is printed on the image.`,
+      // A stale error from an earlier attempt would otherwise sit under the
+      // fresh confirmation.
+      setShareCardStatus("");
+      showShareCardToast(
+        `Copied. Paste it anywhere; reference ${card.reference} identifies these figures.`,
       );
     } catch {
       setShareCardStatus(
@@ -1627,7 +2648,7 @@ function copyShareCardText() {
   return runShareCardAction(async (card) => {
     if (typeof navigator.clipboard?.writeText !== "function") {
       setShareCardStatus(
-        "This browser cannot write to the clipboard. The card's text is listed below it and can be selected.",
+        "TiboTattle cannot write to the clipboard here. The card's text is listed below it and can be selected.",
         { error: true },
       );
       return;
@@ -1651,7 +2672,8 @@ function groupRolling(rows, hours) {
     if (rowHours !== hours) continue;
     const timestamp = row.timestamp ?? row.window_end_utc ?? row.observed_at;
     if (!timestamp || !Number.isFinite(Date.parse(timestamp))) continue;
-    const group = groups.get(timestamp) ?? { timestamp, observed: null, expected: null };
+    const group = groups.get(timestamp)
+      ?? { timestamp, timestampMs: Date.parse(timestamp), observed: null, expected: null };
     const series = String(row.series ?? "").toLowerCase();
     const value = finite(row.quota_change_pp ?? row.quotaChangePp);
     if (series.includes("observ")) group.observed = value;
@@ -1664,12 +2686,12 @@ function groupRolling(rows, hours) {
   }
   return [...groups.values()]
     .filter((row) => row.observed !== null || row.expected !== null)
-    .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+    .sort((a, b) => a.timestampMs - b.timestampMs);
 }
 
 function latestTimelineObservationMs(data) {
   const latest = data.timeline.usage.at(-1)?.endAt
-    ?? data.timeline.quota.at(-1)?.observedAt
+    ?? mainWeeklyQuotaTrack(data.timeline.quota).at(-1)?.observedAt
     ?? data.freshness.latestObservedAt;
   const latestMs = Date.parse(latest);
   return Number.isFinite(latestMs) ? latestMs : null;
@@ -1682,20 +2704,105 @@ function timelineCutoffMs(data, rangeDays) {
     : latestMs - rangeDays * 24 * 60 * 60 * 1_000;
 }
 
+// The "All" range button claims everything retained, so it is covered by
+// definition and is the one range that cannot fall short.
+const ALL_HISTORY_RANGE_DAYS = 36_500;
+// A retained series legitimately begins a bucket or so inside the requested
+// window, so only a real shortfall is reported rather than rounding.
+const SERIES_COVERAGE_TOLERANCE = 0.95;
+
+/**
+ * How much of the labelled range the retained series can actually cover.
+ *
+ * A range control labels the chart with a period; the series behind that label
+ * can reach back far less far, and a line chart cannot show the difference
+ * between "nothing happened then" and "that time is missing". Two different
+ * things produce it and neither is visible: the evidence may simply not go back
+ * that far, and a rejected accounting cache makes the companion fall back to a
+ * much smaller live collector projection. Rebuilding identical evidence with
+ * the cache withheld took the usage series from 1,716 points spanning 30.9 days
+ * to 589 spanning 16.7, and the quota series from 10,000 points spanning 30.9
+ * days to 940 spanning 10.1, while the only warning the dashboard offered was
+ * about prices.
+ *
+ * The comparison is against the extent of the retained series, not against the
+ * first drawn point. An idle night at the start of a selected week leaves the
+ * first bucket hours inside the window while the week itself is fully covered
+ * by evidence; that is an honest label, and reporting it would bury the case
+ * where the evidence really does stop short.
+ *
+ * Returns null when the label is honest.
+ */
+function seriesCoverageShortfall(data, rangeDays) {
+  if (!Number.isFinite(rangeDays) || rangeDays >= ALL_HISTORY_RANGE_DAYS) return null;
+  const usage = data?.timeline?.usage;
+  if (!Array.isArray(usage) || usage.length === 0) return null;
+  const latestMs = latestTimelineObservationMs(data);
+  // The series is ascending by time - the rolling-window walk in
+  // `liveTimelinePoints` and the `at(-1)` read above both depend on it - so the
+  // earliest retained observation is the head, not a scan on every pan frame.
+  const earliestMs = Date.parse(usage[0].startAt ?? usage[0].endAt);
+  if (latestMs === null || !Number.isFinite(earliestMs)) return null;
+  const claimedMs = rangeDays * 24 * 60 * 60 * 1_000;
+  const coveredMs = Math.max(0, latestMs - earliestMs);
+  if (coveredMs >= claimedMs * SERIES_COVERAGE_TOLERANCE) return null;
+  return { claimedMs, coveredMs };
+}
+
+/**
+ * State the shortfall next to the chart that is understating its own history.
+ *
+ * When the cause is known it is named: a withheld accounting cache is
+ * repairable by a local replay, and saying only that prices are withheld leaves
+ * the reader to interpret two thirds of their history vanishing as a quiet
+ * month.
+ */
+function renderSeriesCoverage(element, data, rangeDays) {
+  if (!element) return;
+  const shortfall = seriesCoverageShortfall(data, rangeDays);
+  if (shortfall === null) {
+    element.hidden = true;
+    setRawText(element, "");
+    return;
+  }
+  element.hidden = false;
+  setLocalizedText(
+    element,
+    data?.pricing?.accountingCacheStatus === "unavailable"
+      ? "dashboard.series.shortOfRangeWithheldCache"
+      : "dashboard.series.shortOfRange",
+    {
+      claimed: formatSpanLength(shortfall.claimedMs),
+      covered: formatSpanLength(shortfall.coveredMs),
+    },
+  );
+}
+
 function timelineBounds(points) {
-  const values = points
-    .map((point) => Date.parse(point.timestamp))
-    .filter(Number.isFinite);
-  if (values.length < 2) return null;
-  return { startMs: Math.min(...values), endMs: Math.max(...values) };
+  let startMs = Number.POSITIVE_INFINITY;
+  let endMs = Number.NEGATIVE_INFINITY;
+  let counted = 0;
+  // A single loop over stamped milliseconds, rather than map/filter/spread over
+  // re-parsed strings: this runs several times per redraw and once more for the
+  // residual chart, on every frame of a pan.
+  for (const point of points) {
+    const at = pointTimestampMs(point);
+    if (!Number.isFinite(at)) continue;
+    counted += 1;
+    if (at < startMs) startMs = at;
+    if (at > endMs) endMs = at;
+  }
+  if (counted < 2) return null;
+  return { startMs, endMs };
 }
 
 function normalizeTimelineViewport(points) {
   const bounds = timelineBounds(points);
   if (bounds === null) return null;
-  if (timelineViewport === null) return bounds;
-  const startMs = Math.max(bounds.startMs, Math.min(timelineViewport.startMs, bounds.endMs));
-  const endMs = Math.max(startMs + 1, Math.min(timelineViewport.endMs, bounds.endMs));
+  const stored = chartViewportTarget.read();
+  if (stored === null) return bounds;
+  const startMs = Math.max(bounds.startMs, Math.min(stored.startMs, bounds.endMs));
+  const endMs = Math.max(startMs + 1, Math.min(stored.endMs, bounds.endMs));
   if (endMs - startMs < 60_000) return bounds;
   return { startMs, endMs };
 }
@@ -1703,7 +2810,7 @@ function normalizeTimelineViewport(points) {
 function timelinePointsInViewport(points, viewport) {
   if (viewport === null) return points;
   return points.filter((point) => {
-    const timestamp = Date.parse(point.timestamp);
+    const timestamp = pointTimestampMs(point);
     return Number.isFinite(timestamp)
       && timestamp >= viewport.startMs
       && timestamp <= viewport.endMs;
@@ -1711,7 +2818,47 @@ function timelinePointsInViewport(points, viewport) {
 }
 
 function resetTimelineViewport() {
-  timelineViewport = null;
+  chartViewportTarget.write(null);
+}
+
+/**
+ * Which chart the shared zoom and pan policy is acting on.
+ *
+ * Every interactive chart on the dashboard zooms and pans by the same rules:
+ * the clamped per-event step, the minimum useful span, the rule that a fully
+ * zoomed-out chart stores no viewport at all, and the reset that returns to the
+ * selected date range. Those rules live once, in `zoomTimeline`, `panTimeline`,
+ * and `updateTimelineViewport` below, and are reviewed there.
+ *
+ * A chart is therefore not a copy of that policy — it is a place to keep a
+ * viewport and a way to redraw. `withChartViewport` names one for the duration
+ * of a single synchronous gesture call and restores the previous target on the
+ * way out, so a chart can never leak its identity into another chart's handler.
+ * The calibration chart is the default target because it is the chart every
+ * pre-existing caller was written against.
+ */
+const CALIBRATION_CHART_VIEWPORT = Object.freeze({
+  read: () => timelineViewport,
+  write: (value) => { timelineViewport = value; },
+  render: () => scheduleTimelineRender(),
+});
+
+const USAGE_CHART_VIEWPORT = Object.freeze({
+  read: () => usageTimelineViewport,
+  write: (value) => { usageTimelineViewport = value; },
+  render: () => scheduleUsageTimelineRender(),
+});
+
+let chartViewportTarget = CALIBRATION_CHART_VIEWPORT;
+
+function withChartViewport(chart, run) {
+  const previous = chartViewportTarget;
+  chartViewportTarget = chart;
+  try {
+    return run();
+  } finally {
+    chartViewportTarget = previous;
+  }
 }
 
 // Zoom is a ratio applied per step, so one step feels the same at every scale.
@@ -1741,10 +2888,36 @@ function updateTimelineViewport(points, update) {
   const minimumSpanMs = minimumTimelineSpanMs(bounds);
   const startMs = Math.max(bounds.startMs, Math.min(next.startMs, bounds.endMs - minimumSpanMs));
   const endMs = Math.min(bounds.endMs, Math.max(next.endMs, startMs + minimumSpanMs));
-  timelineViewport = endMs - startMs >= bounds.endMs - bounds.startMs - 1
+  chartViewportTarget.write(endMs - startMs >= bounds.endMs - bounds.startMs - 1
     ? null
-    : { startMs, endMs };
-  if (dashboard) renderTimeline(dashboard);
+    : { startMs, endMs });
+  chartViewportTarget.render();
+}
+
+/**
+ * One redraw per displayed frame, however many input events arrive.
+ *
+ * A mouse notch is one event, but a trackpad flick emits dozens of small wheel
+ * deltas and a drag emits a `pointermove` for every sampled position — the
+ * pointer sampling rate is well above the display rate on current hardware.
+ * Redrawing synchronously inside each handler meant the chart was rebuilt many
+ * times for a single painted frame, and the extra rebuilds were never shown to
+ * anyone. The viewport arithmetic still runs on every event, so the gesture
+ * stays exact; only the drawing is coalesced.
+ */
+let timelineRenderFrame = 0;
+
+function scheduleTimelineRender() {
+  if (!dashboard) return;
+  if (typeof requestAnimationFrame !== "function") {
+    renderTimeline(dashboard);
+    return;
+  }
+  if (timelineRenderFrame !== 0) return;
+  timelineRenderFrame = requestAnimationFrame(() => {
+    timelineRenderFrame = 0;
+    if (dashboard) renderTimeline(dashboard);
+  });
 }
 
 function wheelZoomFactor(event) {
@@ -1796,24 +2969,38 @@ function panTimeline(points, fraction) {
   });
 }
 
+// Evidence-state names reach both the SVG text layer (as shaded-interval
+// tooltips) and the residual table, so they resolve through the catalogue like
+// every other chart string rather than being stamped as English.
+const TIMELINE_STATUS_KEYS = Object.freeze({
+  matched: "chart.status.matched",
+  inactive: "chart.status.inactive",
+  unpriced_local_activity: "chart.status.unpricedLocalActivity",
+  unexplained_without_local_activity: "chart.status.unexplainedWithoutLocalActivity",
+  missing_quota_bracket: "chart.status.missingQuotaBracket",
+  reset_or_track_change: "chart.status.resetOrTrackChange",
+  backward_or_ambiguous: "chart.status.backwardOrAmbiguous",
+});
+
+function timelineStatusKey(status) {
+  return TIMELINE_STATUS_KEYS[status] ?? "chart.status.historical";
+}
+
 function timelineStatusLabel(status) {
-  return {
-    matched: "Matched quota bracket",
-    missing_quota_bracket: "Missing quota bracket",
-    reset_or_track_change: "Provider reset or quota-track change",
-    backward_or_ambiguous: "Ambiguous quota movement",
-  }[status] ?? "Historical calibration point";
+  return t(timelineStatusKey(status));
 }
 
 function timelineStatusIntervals(points, viewport) {
+  // Sorting through `Date.parse` in the comparator re-parsed each instant
+  // O(log n) times. The instants are read once, then sorted as numbers.
   const rows = points
-    .filter((point) => Number.isFinite(Date.parse(point.timestamp)))
-    .sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
-  return rows.flatMap((point, index) => {
-    if (!point.status || point.status === "matched") return [];
-    const current = Date.parse(point.timestamp);
-    const previous = index === 0 ? viewport.startMs : Date.parse(rows[index - 1].timestamp);
-    const next = index === rows.length - 1 ? viewport.endMs : Date.parse(rows[index + 1].timestamp);
+    .map((point) => ({ point, at: pointTimestampMs(point) }))
+    .filter(({ at }) => Number.isFinite(at))
+    .sort((left, right) => left.at - right.at);
+  return rows.flatMap(({ point, at: current }, index) => {
+    if (!point.status || point.status === "matched" || point.status === "inactive") return [];
+    const previous = index === 0 ? viewport.startMs : rows[index - 1].at;
+    const next = index === rows.length - 1 ? viewport.endMs : rows[index + 1].at;
     return [{
       status: point.status,
       startMs: Math.max(viewport.startMs, (previous + current) / 2),
@@ -1823,9 +3010,7 @@ function timelineStatusIntervals(points, viewport) {
 }
 
 function mainWeeklyQuotaTrack(rows) {
-  const weeklyCodex = rows.filter(
-    (row) => row.limitId === "codex" && row.durationMinutes === 10_080,
-  );
+  const weeklyCodex = rows.filter(isPrimaryCodexWeeklyQuotaWindow);
   if (!weeklyCodex.length) return [];
   const primary = weeklyCodex.filter((row) => row.slot === "primary");
   if (primary.length) return primary;
@@ -1843,10 +3028,34 @@ function mainWeeklyQuotaTrack(rows) {
     ))[0]?.[1] ?? [];
 }
 
+// The provider restates the same reset boundary with a slightly different
+// instant on each snapshot; the observed drift across this corpus is one to
+// twenty-two seconds. Comparing the two strings exactly therefore reported a
+// reset or track change for roughly one window in ten that had neither, and
+// discarded a usable observation each time.
+//
+// A genuine change moves the boundary by hours — the short window is five
+// hours and the long one is seven days — so two minutes is wide enough to
+// absorb every observed restatement and still far too narrow to merge two
+// distinct reset cycles.
+const RESET_BOUNDARY_TOLERANCE_MS = 2 * 60 * 1_000;
+
+function sameResetBoundary(before, after) {
+  if (!before || !after) return false;
+  const beforeMs = Date.parse(before);
+  const afterMs = Date.parse(after);
+  if (!Number.isFinite(beforeMs) || !Number.isFinite(afterMs)) {
+    // An unparseable boundary carries no tolerance to reason about, so fall
+    // back to demanding that the provider repeated itself verbatim.
+    return before === after;
+  }
+  return Math.abs(afterMs - beforeMs) <= RESET_BOUNDARY_TOLERANCE_MS;
+}
+
 function liveTimelinePoints(
   data,
   {
-    windowHours = activeWindowHours,
+    windowHours = CALIBRATION_WINDOW_HOURS,
     rangeDays = activeCalibrationRangeDays,
   } = {},
 ) {
@@ -1858,18 +3067,31 @@ function liveTimelinePoints(
   if (!usage.length) return [];
   const windowMs = windowHours * 60 * 60 * 1_000;
   const cutoff = timelineCutoffMs(data, rangeDays);
-  const weeklyQuota = mainWeeklyQuotaTrack(data.timeline.quota);
-  const quota = (weeklyQuota.length ? weeklyQuota : data.timeline.quota);
+  const quota = mainWeeklyQuotaTrack(data.timeline.quota);
   const quotaLookup = createQuotaTimelineLookup(quota);
   const points = [];
   let startIndex = 0;
   let rollingCost = 0;
   let rollingEvents = 0;
+  // Cumulative drift (owner-directed, 2026-08-08): the running sum of
+  // per-bucket observed-minus-expected movement since the last reset boundary
+  // or track change — the same signed observed-versus-expected accumulation
+  // the reporting module's signed AUC integrates (see buildRollingResidual in
+  // src/simple-quota-gradient.js), expressed over NON-OVERLAPPING usage
+  // buckets so the rolling windows above can never double-count an hour. The
+  // sum re-anchors at each boundary: within one reset it answers "how far
+  // ahead of the cost-implied line has observed quota movement run since this
+  // reset began". Honesty guards: no capacity or no quota row means no value,
+  // and a stale quota bracket suspends the line rather than letting a static
+  // observation read as growing negative drift.
+  let driftAnchor = null;
+  let driftCostUsd = 0;
   for (let index = 0; index < usage.length; index += 1) {
     const current = usage[index];
     const endMs = Date.parse(current.endAt);
     rollingCost += current.apiPriceEquivalentUsd;
     rollingEvents += current.usageEvents;
+    driftCostUsd += current.apiPriceEquivalentUsd;
     while (startIndex <= index
         && Date.parse(usage[startIndex].endAt) <= endMs - windowMs) {
       rollingCost -= usage[startIndex].apiPriceEquivalentUsd;
@@ -1886,24 +3108,56 @@ function liveTimelinePoints(
     const bracketed = before && after
       && startMs - beforeMatch.timestampMs <= maximumBracketGapMs
       && endMs - afterMatch.timestampMs <= maximumBracketGapMs;
-    const sameReset = bracketed && before.resetAt && before.resetAt === after.resetAt;
+    const sameReset = Boolean(bracketed)
+      && sameResetBoundary(before.resetAt, after.resetAt);
     const observed = sameReset && after.usedPercent >= before.usedPercent
       ? after.usedPercent - before.usedPercent
       : null;
     const expected = capacity !== null && capacity > 0
       ? rollingCost / capacity * 100
       : null;
-    points.push({
-      timestamp: current.endAt,
+    const evidence = classifyTimelineEvidence({
+      bracketed,
+      sameReset,
       observed,
       expected,
-      residual: observed === null || expected === null ? null : observed - expected,
+      usageEvents: rollingEvents,
+      apiCostUsd: rollingCost,
+    });
+    let cumulativeResidual = null;
+    // A re-anchor marks the first drift observation of a new reset or track:
+    // the deviation-period detector splits its runs here, so a sustained drift
+    // that crosses a boundary is never read as one continuous period across the
+    // reset. Stamped on the point so the flag survives viewport filtering.
+    let driftReanchor = false;
+    if (capacity !== null && capacity > 0
+        && after !== null
+        && Number.isFinite(finite(after.usedPercent))
+        && endMs - afterMatch.timestampMs <= maximumBracketGapMs) {
+      if (driftAnchor === null
+          || !sameResetBoundary(driftAnchor.resetAt, after.resetAt)) {
+        // A boundary or track change re-anchors the accumulation: drift is
+        // zero by definition at the first observation of a new reset.
+        driftAnchor = { resetAt: after.resetAt, usedPercent: after.usedPercent };
+        driftCostUsd = 0;
+        cumulativeResidual = 0;
+        driftReanchor = true;
+      } else {
+        cumulativeResidual = after.usedPercent - driftAnchor.usedPercent
+          - driftCostUsd / capacity * 100;
+      }
+    }
+    points.push({
+      timestamp: current.endAt,
+      timestampMs: endMs,
+      observed,
+      expected,
+      residual: evidence.residual,
+      cumulativeResidual,
+      driftReanchor,
       apiCostUsd: Math.max(0, rollingCost),
       usageEvents: Math.max(0, rollingEvents),
-      status: !bracketed ? "missing_quota_bracket"
-        : !sameReset ? "reset_or_track_change"
-          : observed === null ? "backward_or_ambiguous"
-            : "matched"
+      status: evidence.status,
     });
   }
   return points;
@@ -1923,7 +3177,7 @@ function groupedUsageTimeline(data) {
       key = `hour:${sortMs}`;
     } else {
       const parts = Object.fromEntries(
-        LOCAL_CALENDAR_PARTS.formatToParts(timestamp)
+        localCalendarParts().formatToParts(timestamp)
           .filter((part) => part.type !== "literal")
           .map((part) => [part.type, part.value])
       );
@@ -1959,6 +3213,7 @@ function groupedUsageTimeline(data) {
     .map(({ sortMs: _sortMs, periodStartMs, periodEndMs, ...row }) => ({
       ...row,
       timestamp: new Date(periodEndMs).toISOString(),
+      timestampMs: periodEndMs,
       periodStartAt: new Date(periodStartMs).toISOString(),
       periodEndAt: new Date(periodEndMs).toISOString(),
       apiCostUsd: Number(row.apiCostUsd.toFixed(6))
@@ -1966,11 +3221,7 @@ function groupedUsageTimeline(data) {
 }
 
 function usagePointsWithAllowance(data, points) {
-  const preferred = mainWeeklyQuotaTrack(data.timeline.quota);
-  const fallback = data.timeline.quota.filter(
-    (row) => row.durationMinutes === 10_080 || row.limitId === "codex"
-  );
-  const quota = preferred.length ? preferred : fallback;
+  const quota = mainWeeklyQuotaTrack(data.timeline.quota);
   const quotaLookup = createQuotaTimelineLookup(quota);
   const maximumObservationAgeMs = {
     hour: 6 * 60 * 60 * 1_000,
@@ -1992,66 +3243,175 @@ function usagePointsWithAllowance(data, points) {
   });
 }
 
-function renderUsageTimeline(data) {
+function usageGroupingsForRange(rangeDays = activeUsageRangeDays) {
+  if (rangeDays <= 1) return ["hour"];
+  if (rangeDays <= 7) return ["hour", "day"];
+  return ["hour", "day", "week"];
+}
+
+function syncUsageGroupingControls() {
+  const controls = $("#usage-group-controls");
+  if (!controls) return;
+  const allowed = new Set(usageGroupingsForRange());
+  if (!allowed.has(activeUsageGrouping)) activeUsageGrouping = "hour";
+  for (const control of controls.querySelectorAll("button[data-group]")) {
+    const visible = allowed.has(control.dataset.group);
+    const active = visible && control.dataset.group === activeUsageGrouping;
+    control.hidden = !visible;
+    control.disabled = !visible;
+    control.setAttribute("aria-hidden", String(!visible));
+    control.classList.toggle("active", active);
+    control.setAttribute("aria-pressed", String(active));
+  }
+}
+
+// The vertical axis has to state its unit and its aggregation together: the
+// same series is dollars per hour, per day, or per week depending on the
+// selected grouping, and "API equivalent" alone said neither.
+const USAGE_GROUPING_UNIT_KEYS = Object.freeze({
+  hour: "chart.unit.hour",
+  day: "chart.unit.day",
+  week: "chart.unit.week",
+});
+
+const USAGE_GROUPING_AXIS_KEYS = Object.freeze({
+  hour: "chart.axis.apiEquivalentPerHour",
+  day: "chart.axis.apiEquivalentPerDay",
+  week: "chart.axis.apiEquivalentPerWeek",
+});
+
+function usageGroupingUnitKey(grouping = activeUsageGrouping) {
+  return USAGE_GROUPING_UNIT_KEYS[grouping] ?? "chart.unit.interval";
+}
+
+function usageChartAxisLabels(grouping = activeUsageGrouping) {
+  return Object.freeze({
+    primary: {
+      key: USAGE_GROUPING_AXIS_KEYS[grouping] ?? "chart.axis.apiEquivalentPerInterval",
+    },
+    secondary: { key: "chart.axis.sevenDayAllowanceRemaining" },
+  });
+}
+
+// The usage chart's own derive/draw split, for the same reason the calibration
+// chart has one: grouping every usage bucket in the artifact and matching each
+// one against the quota track depends on the evidence and the two segmented
+// controls, never on the zoom viewport, so a pan must not pay for it.
+let usageSeriesMemo = null;
+
+function selectedUsagePoints(data) {
+  if (usageSeriesMemo !== null
+      && usageSeriesMemo.data === data
+      && usageSeriesMemo.grouping === activeUsageGrouping
+      && usageSeriesMemo.rangeDays === activeUsageRangeDays) {
+    return usageSeriesMemo.points;
+  }
   const points = usagePointsWithAllowance(data, groupedUsageTimeline(data));
+  usageSeriesMemo = {
+    data,
+    grouping: activeUsageGrouping,
+    rangeDays: activeUsageRangeDays,
+    points,
+  };
+  return points;
+}
+
+let usageRenderFrame = 0;
+
+function scheduleUsageTimelineRender() {
+  if (!dashboard) return;
+  if (typeof requestAnimationFrame !== "function") {
+    renderUsageTimeline(dashboard);
+    return;
+  }
+  if (usageRenderFrame !== 0) return;
+  usageRenderFrame = requestAnimationFrame(() => {
+    usageRenderFrame = 0;
+    if (dashboard) renderUsageTimeline(dashboard);
+  });
+}
+
+function resetUsageTimelineViewport() {
+  usageTimelineViewport = null;
+}
+
+function renderUsageTimeline(data) {
+  syncUsageGroupingControls();
+  const points = selectedUsagePoints(data);
+  const viewport = withChartViewport(
+    USAGE_CHART_VIEWPORT,
+    () => normalizeTimelineViewport(points),
+  );
+  const visiblePoints = timelinePointsInViewport(points, viewport);
   const shell = $("#usage-timeline-chart");
   const empty = $("#usage-timeline-empty");
-  const label = { hour: "hour", day: "day", week: "week" }[activeUsageGrouping];
-  $("#usage-timeline-title").textContent =
-    `API-price-equivalent usage by ${label} · latest ${activeUsageRangeDays} day${activeUsageRangeDays === 1 ? "" : "s"}`;
-  if (!points.length) {
+  const unit = t(usageGroupingUnitKey());
+  const axisLabels = usageChartAxisLabels();
+  setLocalizedText($("#usage-timeline-title"), "chart.usage.heading", {
+    unit,
+    range: tPlural("format.durationDay", activeUsageRangeDays, {
+      count: formatDecimal(activeUsageRangeDays, 0),
+    }),
+  });
+  if (!visiblePoints.length) {
     shell.hidden = true;
     empty.hidden = false;
   } else {
     shell.hidden = false;
     empty.hidden = true;
-    shell.replaceChildren(lineChart({
-      points,
+    drawChart(shell, lineChart({
+      points: visiblePoints,
       series: [{
         key: "apiCostUsd",
         className: "chart-line-value",
-        label: "API-price-equivalent usage"
+        label: { key: "chart.series.apiEquivalentUsage" },
+        // Dense per-interval samples: dots would merge into a solid band, so
+        // the line carries the shape and each sample stays hoverable. This is
+        // the opposite of the allowance history chart, on purpose.
+        pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+        format: (value) => formatApiMoney(value),
       }],
-      yLabel: "API-equivalent USD",
+      yLabel: axisLabels.primary,
       secondarySeries: [{
         key: "allowanceRemaining",
         className: "chart-line-allowance",
-        label: "Seven-day allowance remaining"
+        label: { key: "chart.series.sevenDayAllowanceRemaining" },
+        pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
       }],
-      secondaryYLabel: "Allowance remaining (%)",
-      title: "Real local API-price-equivalent usage over time",
-      description: `Replay-safe local usage cost with provider-observed seven-day allowance remaining in ${USER_TIME_ZONE}.`,
-      includeZero: true
+      secondaryYLabel: axisLabels.secondary,
+      yTickFormat: (value) => formatApiMoney(value),
+      title: { key: "chart.usage.title" },
+      description: {
+        key: "chart.usage.description",
+        values: { unit, timeZone: formatTimeZoneLabel() },
+      },
+      includeZero: true,
+      height: TIMELINE_CHART_HEIGHT,
+      xDomain: viewport,
     }));
+    bindUsageTimelineInteractions(shell, points, viewport);
   }
-  $("#usage-timeline-copy").textContent =
-    `Replay-safe local increments · ${USER_TIME_ZONE} · current Standard API prices`;
+  setLocalizedText($("#usage-timeline-copy"), "chart.timeZoneNote", {
+    timeZone: formatTimeZoneLabel(),
+  });
+  renderSeriesCoverage(
+    $("#usage-timeline-coverage"),
+    data,
+    activeUsageRangeDays,
+  );
   const summary = $("#usage-timeline-summary");
   clear(summary);
-  const total = points.reduce((sum, row) => sum + row.apiCostUsd, 0);
-  const events = points.reduce((sum, row) => sum + row.usageEvents, 0);
-  const replayExcluded = data.accounting.replayExclusionDiagnostics
-    ?.forkReplayEventsExcluded ?? 0;
+  const total = visiblePoints.reduce((sum, row) => sum + row.apiCostUsd, 0);
   for (const [name, explanation, value] of [
     [
-      "Time buckets",
-      "Time intervals with repeated history removed, so one piece of work is not counted twice.",
-      compact(points.length)
+      "Time intervals",
+      "The number of displayed hour, day, or week intervals.",
+      compact(visiblePoints.length)
     ],
     [
       "API-price equivalent",
       "A public API-price measuring stick for the local usage observed here, not a bill.",
       formatApiMoney(total)
-    ],
-    [
-      "Usage increments",
-      "Separate measured changes in usage, rather than messages or raw log rows.",
-      compact(events)
-    ],
-    [
-      "Repeated history removed",
-      "Inherited parent-rollout records excluded to avoid counting the same work twice.",
-      compact(replayExcluded)
     ]
   ]) {
     const item = node("div");
@@ -2062,18 +3422,137 @@ function renderUsageTimeline(data) {
   }
 }
 
+/**
+ * Wheel, drag, and keyboard zoom for the usage chart.
+ *
+ * This is deliberately the same gesture vocabulary as the calibration chart
+ * below it — wheel to zoom about the pointer, drag to pan, `+`/`-` and the
+ * arrow keys from the keyboard, `Home` to reset — and it reaches the same
+ * `zoomTimeline` and `panTimeline` policy, so both charts move by identical
+ * steps and clamp identically. It is a separate binder rather than a shared one
+ * because it targets a different element with its own pointer state and its own
+ * viewport; the behaviour that has to stay uniform lives in the functions both
+ * binders call, not in the wiring.
+ */
+function bindUsageTimelineInteractions(shell, points, viewport) {
+  if (viewport === null) return;
+  shell.classList.add("interactive-chart");
+  shell.tabIndex = 0;
+  shell.setAttribute("aria-label", t("chart.usage.aria", {
+    timeZone: USER_TIME_ZONE,
+  }));
+  setLocalizedText($("#usage-zoom-status"), "dashboard.timeline.status", {
+    start: formatLocal(new Date(viewport.startMs).toISOString()),
+    end: formatLocal(new Date(viewport.endMs).toISOString()),
+    span: formatSpanLength(viewport.endMs - viewport.startMs),
+  });
+  shell.onwheel = (event) => {
+    if (!event.deltaY) return;
+    event.preventDefault();
+    const bounds = shell.getBoundingClientRect();
+    const ratio = bounds.width > 0 ? (event.clientX - bounds.left) / bounds.width : .5;
+    zoomUsageTimeline(points, wheelZoomFactor(event), ratio);
+  };
+  shell.onpointerdown = (event) => {
+    if (event.button !== undefined && event.button !== 0) return;
+    usagePointerStart = { x: event.clientX, dragging: false };
+    shell.setPointerCapture?.(event.pointerId);
+    shell.classList.add("is-pointer-active");
+  };
+  shell.onpointermove = (event) => {
+    if (usagePointerStart === null) return;
+    const width = Math.max(1, shell.getBoundingClientRect().width);
+    const delta = event.clientX - usagePointerStart.x;
+    if (Math.abs(delta) < 8) return;
+    usagePointerStart.dragging = true;
+    usagePointerStart.x = event.clientX;
+    shell.classList.add("is-panning");
+    event.preventDefault();
+    panUsageTimeline(points, -delta / width);
+  };
+  const stopPanning = (event) => {
+    const wasDragging = usagePointerStart?.dragging === true;
+    usagePointerStart = null;
+    shell.releasePointerCapture?.(event.pointerId);
+    shell.classList.remove("is-pointer-active");
+    shell.classList.remove("is-panning");
+    if (wasDragging) event.preventDefault();
+  };
+  shell.onpointerup = stopPanning;
+  shell.onpointercancel = stopPanning;
+  shell.onselectstart = (event) => {
+    if (usagePointerStart !== null) event.preventDefault();
+  };
+  shell.onkeydown = (event) => {
+    if (["+", "="].includes(event.key)) {
+      event.preventDefault();
+      zoomUsageTimeline(points, 1 / TIMELINE_BUTTON_ZOOM_STEP);
+    } else if (["-", "_"].includes(event.key)) {
+      event.preventDefault();
+      zoomUsageTimeline(points, TIMELINE_BUTTON_ZOOM_STEP);
+    } else if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      panUsageTimeline(points, -.2);
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      panUsageTimeline(points, .2);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      resetUsageTimelineViewport();
+      scheduleUsageTimelineRender();
+    }
+  };
+}
+
+function zoomUsageTimeline(points, factor, anchorRatio = .5) {
+  withChartViewport(
+    USAGE_CHART_VIEWPORT,
+    () => zoomTimeline(points, factor, anchorRatio),
+  );
+}
+
+function panUsageTimeline(points, fraction) {
+  withChartViewport(USAGE_CHART_VIEWPORT, () => panTimeline(points, fraction));
+}
+
+/**
+ * Deriving the calibration series is the expensive half of this page: it walks
+ * every usage bucket in the artifact to rebuild the rolling window, builds a
+ * quota lookup, and classifies each window's evidence state. None of that
+ * depends on the zoom or pan viewport — only on the loaded evidence and the
+ * date-range control above the chart — yet it ran again for every wheel event,
+ * which is what made the chart feel heavy to drag.
+ *
+ * The result is remembered against exactly the inputs it is a function of. The
+ * dashboard payload is compared by identity, so a refresh that produces a new
+ * object invalidates the memo without any explicit clearing, and a payload that
+ * has not changed cannot serve a stale series.
+ */
+let timelineSeriesMemo = null;
+
 function selectedTimelinePoints(data) {
+  if (timelineSeriesMemo !== null
+      && timelineSeriesMemo.data === data
+      && timelineSeriesMemo.rangeDays === activeCalibrationRangeDays) {
+    return timelineSeriesMemo.selection;
+  }
   const livePoints = liveTimelinePoints(data);
   const cutoff = timelineCutoffMs(data, activeCalibrationRangeDays);
   const historicalPoints = groupRolling(
     [...data.gradient.rollingHistory, ...data.gradient.rolling],
-    activeWindowHours,
-  ).filter((row) => Date.parse(row.timestamp) >= cutoff);
+    CALIBRATION_WINDOW_HOURS,
+  ).filter((row) => pointTimestampMs(row) >= cutoff);
   const liveMatched = livePoints.filter(
     (row) => row.observed !== null && row.expected !== null,
   ).length;
   const usingLive = liveMatched > 0 || historicalPoints.length === 0;
-  return { points: usingLive ? livePoints : historicalPoints, usingLive };
+  const selection = { points: usingLive ? livePoints : historicalPoints, usingLive };
+  timelineSeriesMemo = {
+    data,
+    rangeDays: activeCalibrationRangeDays,
+    selection,
+  };
+  return selection;
 }
 
 function renderTimeline(data) {
@@ -2083,37 +3562,61 @@ function renderTimeline(data) {
   const matchedVisible = visiblePoints.filter(
     (point) => point.observed !== null && point.expected !== null,
   );
-  const windowLabel = activeWindowHours === 0.25
-    ? "15-minute"
-    : `${activeWindowHours}-hour`;
-  $("#timeline-chart-title").textContent = `${windowLabel} rolling quota change versus cost-implied change`;
+  const windowLabel = t("dashboard.timeWindow.hours", {
+    count: CALIBRATION_WINDOW_HOURS,
+  });
+  setLocalizedText($("#timeline-chart-title"), "dashboard.timeline.title", {
+    window: windowLabel,
+  });
   $("#timeline-chart-copy").textContent = usingLive
-    ? `Replay-safe local increments · ${USER_TIME_ZONE} chart axis · exact local and UTC times below`
-    : `Historical local calibration artifact from ${formatLocal(data.artifactStatus.gradient.generatedAt)} · recent quota snapshots are too sparse to bracket ${windowLabel} endpoints`;
+    ? t("dashboard.timeline.liveCopy", { timeZone: formatTimeZoneLabel() })
+    : t("dashboard.timeline.historicalCopy", {
+      generatedAt: formatLocal(data.artifactStatus.gradient.generatedAt),
+      window: windowLabel,
+    });
   const empty = $("#timeline-empty");
   const shell = $("#timeline-chart");
   if (!visiblePoints.length || (usingLive && matchedVisible.length === 0)) {
     shell.hidden = true;
     empty.hidden = false;
     empty.querySelector("strong").textContent = visiblePoints.length
-      ? "Not comparable yet"
-      : `No ${windowLabel} series loaded`;
+      ? t("dashboard.timeline.notComparableYet")
+      : tPlural("dashboard.timeline.series", 0, { window: windowLabel });
     empty.querySelector("p").textContent = visiblePoints.length
-      ? `Cost history exists, but quota observations do not bracket any ${windowLabel} window in this date range. The calculated line is hidden until there is measured evidence to compare it with.`
-      : "This is a missing-data state, not a zero-usage period.";
+      ? t("dashboard.timeline.noBracket", { window: windowLabel })
+      : t("dashboard.timeline.missingData");
   } else {
     empty.hidden = true;
     shell.hidden = false;
-    shell.replaceChildren(lineChart({
+    drawChart(shell, lineChart({
       points: visiblePoints,
       series: [
-        { key: "observed", className: "chart-line-observed", label: "Observed quota change" },
-        { key: "expected", className: "chart-line-expected", label: "Expected from API cost" }
+        {
+          key: "observed",
+          className: "chart-line-observed",
+          label: { key: "dashboard.timeline.observedQuota" },
+          pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+          format: formatPp,
+        },
+        {
+          key: "expected",
+          className: "chart-line-expected",
+          label: { key: "dashboard.timeline.expectedCost" },
+          pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+          format: formatPp,
+        }
       ],
-      yLabel: "Percentage points",
-      title: `${windowLabel} rolling quota movement`,
-      description: `Observed quota movement compared with movement implied by priced token usage. The horizontal axis is ${USER_TIME_ZONE}.`,
+      yLabel: { key: "dashboard.timeline.percentagePoints" },
+      title: {
+        key: "dashboard.timeline.movementTitle",
+        values: { window: windowLabel },
+      },
+      description: {
+        key: "dashboard.timeline.chartDescription",
+        values: { timeZone: formatTimeZoneLabel() },
+      },
       includeZero: true,
+      height: TIMELINE_CHART_HEIGHT,
       xDomain: viewport,
       statusIntervals: usingLive && viewport !== null
         ? timelineStatusIntervals(points, viewport)
@@ -2121,40 +3624,75 @@ function renderTimeline(data) {
     }));
     bindTimelineInteractions(shell, points, viewport);
   }
+  renderSeriesCoverage(
+    $("#timeline-coverage"),
+    data,
+    activeCalibrationRangeDays,
+  );
   renderTimelineSummary(data, visiblePoints);
   renderTimelineConfidence(points, visiblePoints, usingLive, viewport);
   renderResiduals(data, visiblePoints, viewport);
+  // The divergence panel reads the whole selected calibration range, not the
+  // zoomed viewport: it answers "across this range, where did observed and
+  // priced usage persistently disagree", so pan and zoom must not reshape it.
+  renderDivergencePeriods(data, points);
 }
 
 function renderTimelineConfidence(allPoints, visiblePoints, usingLive, viewport) {
   const element = $("#timeline-confidence");
-  const matched = visiblePoints.filter((point) => point.observed !== null && point.expected !== null).length;
-  const excluded = visiblePoints.length - matched;
+  const activePoints = visiblePoints.filter((point) => point.status !== "inactive");
+  const matched = activePoints.filter((point) => point.observed !== null && point.expected !== null).length;
+  const excluded = activePoints.length - matched;
   const full = timelineBounds(allPoints);
   const zoomed = viewport !== null && full !== null
     && (viewport.startMs !== full.startMs || viewport.endMs !== full.endMs);
   element.classList.toggle("low", matched < 3 || excluded > matched);
   if (!visiblePoints.length) {
-    element.textContent = "No points fall inside this zoomed interval. Reset the view to return to the available evidence.";
+    setProductText(
+      element,
+      "No points fall inside this zoomed interval. Reset the view to return to the available evidence.",
+    );
+  } else if (activePoints.length === 0) {
+    setProductText(
+      element,
+      "No local activity or provider-reported quota movement occurred in this interval.",
+    );
   } else if (!usingLive) {
-    element.textContent = "This historical calibration view has no per-window reset annotations. Treat it as diagnostic evidence, not a live allowance reading.";
+    setProductText(
+      element,
+      "This historical calibration view has no per-window reset annotations. Treat it as diagnostic evidence, not a live allowance reading.",
+    );
   } else if (matched < 3) {
-    element.textContent = `Low confidence: only ${matched} matched quota window${matched === 1 ? "" : "s"} is visible; ${excluded} window${excluded === 1 ? " is" : "s are"} excluded for missing or ambiguous quota evidence.`;
+    setLocalizedText(element, "dashboard.timeline.lowConfidence", {
+      visible: tPlural("dashboard.timeline.visibleWindow", matched),
+      excluded: tPlural("dashboard.timeline.excludedWindow", excluded),
+    });
   } else if (excluded > 0) {
-    element.textContent = `${matched} matched windows are shown. ${excluded} excluded window${excluded === 1 ? " is" : "s are"} shaded above; do not read them as zero usage.`;
+    setLocalizedText(element, "dashboard.timeline.excludedShown", {
+      shown: tPlural("dashboard.timeline.shownWindow", matched),
+      excluded: tPlural("dashboard.timeline.excludedWindow", excluded),
+    });
   } else {
-    element.textContent = `${matched} matched quota windows are visible. This compares observed percentage-point movement with a priced-token estimate; it is not a provider-published allowance.`;
+    setLocalizedText(element, "dashboard.timeline.allMatched", {
+      visible: tPlural("dashboard.timeline.visibleWindow", matched),
+    });
   }
-  if (zoomed) element.textContent += " Use Reset view to return to the selected date range.";
+  if (zoomed) element.textContent += ` ${t("dashboard.timeline.resetView")}`;
 }
 
 function bindTimelineInteractions(shell, points, viewport) {
   if (viewport === null) return;
   shell.classList.add("interactive-chart");
   shell.tabIndex = 0;
-  shell.setAttribute("aria-label", `Interactive quota timeline in ${USER_TIME_ZONE}. Use plus or minus to zoom, arrow keys to pan, Home to reset, or drag horizontally.`);
+  shell.setAttribute("aria-label", t("dashboard.timeline.aria", {
+    timeZone: USER_TIME_ZONE,
+  }));
   const status = $("#timeline-zoom-status");
-  status.textContent = `Timeline shows ${formatLocal(new Date(viewport.startMs).toISOString())} through ${formatLocal(new Date(viewport.endMs).toISOString())}, a span of ${formatSpanLength(viewport.endMs - viewport.startMs)}.`;
+  setLocalizedText(status, "dashboard.timeline.status", {
+    start: formatLocal(new Date(viewport.startMs).toISOString()),
+    end: formatLocal(new Date(viewport.endMs).toISOString()),
+    span: formatSpanLength(viewport.endMs - viewport.startMs),
+  });
   shell.onwheel = (event) => {
     if (!event.deltaY) return;
     event.preventDefault();
@@ -2163,26 +3701,35 @@ function bindTimelineInteractions(shell, points, viewport) {
     zoomTimeline(points, wheelZoomFactor(event), ratio);
   };
   shell.onpointerdown = (event) => {
-    timelinePointerStart = { x: event.clientX };
+    if (event.button !== undefined && event.button !== 0) return;
+    timelinePointerStart = { x: event.clientX, dragging: false };
     shell.setPointerCapture?.(event.pointerId);
-    shell.classList.add("is-panning");
+    shell.classList.add("is-pointer-active");
   };
   shell.onpointermove = (event) => {
     if (timelinePointerStart === null) return;
     const width = Math.max(1, shell.getBoundingClientRect().width);
     const delta = event.clientX - timelinePointerStart.x;
-    if (Math.abs(delta) < 3) return;
+    if (Math.abs(delta) < 8) return;
+    timelinePointerStart.dragging = true;
     timelinePointerStart.x = event.clientX;
+    shell.classList.add("is-panning");
     event.preventDefault();
     panTimeline(points, -delta / width);
   };
   const stopPanning = (event) => {
+    const wasDragging = timelinePointerStart?.dragging === true;
     timelinePointerStart = null;
     shell.releasePointerCapture?.(event.pointerId);
+    shell.classList.remove("is-pointer-active");
     shell.classList.remove("is-panning");
+    if (wasDragging) event.preventDefault();
   };
   shell.onpointerup = stopPanning;
   shell.onpointercancel = stopPanning;
+  shell.onselectstart = (event) => {
+    if (timelinePointerStart !== null) event.preventDefault();
+  };
   shell.onkeydown = (event) => {
     if (["+", "="].includes(event.key)) {
       event.preventDefault();
@@ -2204,10 +3751,53 @@ function bindTimelineInteractions(shell, points, viewport) {
   };
 }
 
+/**
+ * The signed observed-minus-expected area under a matched residual series, in
+ * percentage-point-hours. Trapezoidal over consecutive matched points, the
+ * same integration buildRollingResidual performs for the artifact summary in
+ * src/simple-quota-gradient.js: positive means observed quota movement ran
+ * ahead of what recorded cost implies across the covered span.
+ */
+function signedResidualAucPpHours(matched) {
+  if (!Array.isArray(matched) || matched.length < 2) return null;
+  let area = 0;
+  for (let index = 1; index < matched.length; index += 1) {
+    const prior = matched[index - 1];
+    const current = matched[index];
+    const elapsedHours =
+      (pointTimestampMs(current) - pointTimestampMs(prior)) / 3_600_000;
+    if (!Number.isFinite(elapsedHours) || elapsedHours <= 0) continue;
+    area += elapsedHours
+      * ((prior.observed - prior.expected) + (current.observed - current.expected))
+      / 2;
+  }
+  return area;
+}
+
+// A signed pp·hours figure keeps its sign visible: "+" is printed explicitly
+// because the sign IS the finding — which side of the cost-implied line the
+// observed movement accumulated on.
+function formatSignedPpHours(value) {
+  const number = finite(value);
+  if (number === null) return "—";
+  return t("format.ppHours", {
+    value: `${number < 0 ? "" : "+"}${formatDecimal(number, 1)}`,
+  });
+}
+
+// A signed percentage-point figure, same convention as the pp·hours reading:
+// the "+" or "−" is which side of the cost-implied line the drift sits on.
+function formatSignedPp(value) {
+  const number = finite(value);
+  if (number === null) return "—";
+  return `${number < 0 ? "" : "+"}${formatPp(number)}`;
+}
+
 function renderTimelineSummary(data, points) {
   const summary = data.gradient.summary ?? {};
-  const sensitivity = data.gradient.windowSensitivity.find((row) => finite(row.smoothing_hours ?? row.window_hours ?? row.hours) === activeWindowHours);
-  const matched = points.filter((row) => row.observed !== null && row.expected !== null);
+  const sensitivity = data.gradient.windowSensitivity.find((row) => finite(row.smoothing_hours ?? row.window_hours ?? row.hours) === CALIBRATION_WINDOW_HOURS);
+  const activePoints = points.filter((row) => row.status !== "inactive");
+  const matched = activePoints.filter((row) => row.observed !== null && row.expected !== null);
   const live = points.some((row) => Object.hasOwn(row, "status"));
   const liveMae = matched.length
     ? matched.reduce((sum, row) => sum + Math.abs(row.observed - row.expected), 0) / matched.length
@@ -2215,19 +3805,50 @@ function renderTimelineSummary(data, points) {
   const livePeak = matched.length
     ? Math.max(...matched.map((row) => Math.abs(row.observed - row.expected)))
     : null;
+  // Signed AUC over the visible matched residuals (owner-directed,
+  // 2026-08-08): the trapezoidal observed-minus-expected integral in
+  // pp·hours, exactly as buildRollingResidual computes it for the artifact
+  // summary in src/simple-quota-gradient.js. The historical view reports the
+  // artifact's own whole-history figure instead of re-deriving one.
+  const liveSignedAuc = signedResidualAucPpHours(matched);
   const values = [
-    ["Matched windows", compact(matched.length)],
-    ["Mean absolute error", formatPp(live ? liveMae : sensitivity?.mae_pp ?? sensitivity?.weighted_mae_pp ?? summary.mean_absolute_error_pp)],
-    ["Peak residual", formatPp(live ? livePeak : summary.rolling_peak_absolute_residual_pp)],
-    ["Usable quota coverage", points.length
-      ? formatPercent(matched.length / points.length * 100)
-      : "—"]
+    [
+      "Matched windows",
+      "Windows with both observed quota movement and a comparable cost-implied movement.",
+      compact(matched.length),
+    ],
+    [
+      "Mean absolute error",
+      "The average absolute difference between observed and cost-implied quota movement, in percentage points.",
+      formatPp(live ? liveMae : sensitivity?.mae_pp ?? sensitivity?.weighted_mae_pp ?? summary.mean_absolute_error_pp),
+    ],
+    [
+      "Peak residual",
+      "The largest absolute observed-versus-calculated difference in the selected calibration view.",
+      formatPp(live ? livePeak : summary.rolling_peak_absolute_residual_pp),
+    ],
+    [
+      t("dashboard.summary.cumulativeDrift"),
+      t("dashboard.summary.cumulativeDriftExplanation"),
+      formatSignedPpHours(
+        live ? liveSignedAuc : summary.rolling_signed_auc_pp_hours,
+      ),
+    ],
+    [
+      "Usable quota coverage",
+      "The share of active windows with enough quota evidence to make a comparison.",
+      activePoints.length
+        ? formatPercent(matched.length / activePoints.length * 100, 1)
+        : "—",
+    ],
   ];
   const container = $("#timeline-summary");
   clear(container);
-  for (const [label, value] of values) {
+  for (const [label, explanation, value] of values) {
     const item = node("div");
-    item.append(node("span", "", label), node("strong", "", value));
+    const labelElement = node("span");
+    labelElement.append(informationLabel(label, explanation));
+    item.append(labelElement, node("strong", "", value));
     container.append(item);
   }
 }
@@ -2242,15 +3863,19 @@ function residualRows(data, points) {
       : row.observed - row.expected,
   }));
   const artifactResiduals = !live && data.gradient.residual.length
-    ? data.gradient.residual.map((row) => ({
-        timestamp: row.timestamp ?? row.window_end_utc,
-        observed: finite(row.observed_quota_change_pp),
-        expected: finite(row.expected_quota_change_pp),
-        residual: finite(row.residual_pp)
-      }))
+    ? data.gradient.residual.map((row) => {
+        const timestamp = row.timestamp ?? row.window_end_utc;
+        return {
+          timestamp,
+          timestampMs: Date.parse(timestamp),
+          observed: finite(row.observed_quota_change_pp),
+          expected: finite(row.expected_quota_change_pp),
+          residual: finite(row.residual_pp)
+        };
+      })
     : [];
   const visibleArtifactResiduals = artifactResiduals.filter((row) => {
-    const timestamp = Date.parse(row.timestamp);
+    const timestamp = pointTimestampMs(row);
     return Number.isFinite(timestamp)
       && visibleBounds !== null
       && timestamp >= visibleBounds.startMs
@@ -2264,12 +3889,13 @@ function residualRows(data, points) {
   // instead of quietly starting at the first computable point.
   return source
     .filter((row) => {
-      const timestamp = Date.parse(row.timestamp);
-      return Number.isFinite(timestamp)
+      const timestamp = pointTimestampMs(row);
+      return row.status !== "inactive"
+        && Number.isFinite(timestamp)
         && (visibleBounds === null
           || (timestamp >= visibleBounds.startMs && timestamp <= visibleBounds.endMs));
     })
-    .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+    .sort((a, b) => pointTimestampMs(a) - pointTimestampMs(b));
 }
 
 function residualGapReasons(rows) {
@@ -2291,15 +3917,55 @@ function renderResidualCoverage(rows, computed) {
   const missing = rows.length - computed.length;
   element.classList.toggle("low", rows.length > 0 && missing > computed.length);
   if (!rows.length) {
-    element.textContent = "No windows fall inside this date range.";
+    setProductText(element, "No windows fall inside this date range.");
   } else if (missing === 0) {
-    element.textContent = `All ${rows.length} window${rows.length === 1 ? "" : "s"} in this range have a computable residual.`;
+    setLocalizedPluralText(element, "dashboard.residual.allComputable", rows.length);
   } else {
-    element.textContent = `${computed.length} of ${rows.length} windows in this range have a computable residual. The other ${missing} are shown as shaded gaps on the same axis, never as zero: ${residualGapReasons(rows).join(", ")}.`;
+    setLocalizedText(element, "dashboard.residual.partial", {
+      computed: computed.length,
+      total: rows.length,
+      missing,
+      reasons: residualGapReasons(rows).join(", "),
+    });
   }
 }
 
+/**
+ * Merge two already-ranked lists into one bounded inspection list without
+ * letting the longer list starve the shorter one.
+ *
+ * Each list is guaranteed its own half of `limit`; whatever a short list does
+ * not use is handed to the other. Rows are deduplicated by timestamp, keeping
+ * the first (higher-ranked) occurrence, and returned newest first.
+ */
+function balancedInspectionRows(first, second, limit) {
+  const firstShare = Math.min(first.length, Math.ceil(limit / 2));
+  const selected = [];
+  const seen = new Set();
+  const take = (rows, count) => {
+    for (const row of rows) {
+      if (selected.length >= limit || count <= 0) return;
+      if (seen.has(row.timestamp)) continue;
+      seen.add(row.timestamp);
+      selected.push(row);
+      count -= 1;
+    }
+  };
+  take(first, firstShare);
+  take(second, limit - selected.length);
+  // Backfill only after the second list has had its reserved share, so a long
+  // unmatched list can still fill the table when nothing is comparable.
+  take(first, limit - selected.length);
+  return selected.sort(
+    (left, right) => Date.parse(right.timestamp) - Date.parse(left.timestamp),
+  );
+}
+
 function renderResiduals(data, points, viewport = null) {
+  const timeHeading = $("#residual-time-heading");
+  if (timeHeading) {
+    setLocalizedText(timeHeading, "format.localTime");
+  }
   const residuals = residualRows(data, points);
   const computed = residuals.filter((row) => row.residual !== null);
   // The residual axis is pinned to the calibration chart's own domain so a
@@ -2313,13 +3979,36 @@ function renderResiduals(data, points, viewport = null) {
   } else {
     empty.hidden = true;
     shell.hidden = false;
-    shell.replaceChildren(lineChart({
+    drawChart(shell, lineChart({
       points: residuals,
-      series: [{ key: "residual", className: "chart-line-value", label: "Residual" }],
-      yLabel: "Percentage points",
-      title: "Quota movement residuals",
-      description: "Observed quota change minus the API-cost-implied change, over the same date range as the calibration chart. Windows with no computable residual are left as shaded gaps.",
+      series: [{
+        key: "residual",
+        className: "chart-line-value",
+        label: { key: "chart.residual.series" },
+        pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+        format: formatPp,
+      }, {
+        // The designed cumulative view (owner-directed, 2026-08-08): the
+        // running sum of per-bucket observed-minus-expected movement,
+        // re-anchored at each reset boundary or track change — computed in
+        // liveTimelinePoints beside the evidence it reads. Live points only:
+        // the historical artifact view carries no per-window reset
+        // annotations, so its rows have no such key and this series simply
+        // draws nothing there instead of inventing anchors.
+        key: "cumulativeResidual",
+        className: "chart-line-expected",
+        label: { key: "chart.residual.cumulativeSeries" },
+        pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+        format: formatPp,
+      }],
+      yLabel: { key: "dashboard.timeline.percentagePoints" },
+      title: { key: "chart.residual.title" },
+      description: {
+        key: "chart.residual.description",
+        values: { timeZone: formatTimeZoneLabel() },
+      },
       includeZero: true,
+      height: COMPACT_CHART_HEIGHT,
       xDomain: domain,
       statusIntervals: domain === null
         ? []
@@ -2327,38 +4016,623 @@ function renderResiduals(data, points, viewport = null) {
     }));
   }
   renderResidualCoverage(residuals, computed);
-  const table = $("#residual-table");
-  clear(table);
   const unmatched = points
-    .filter((point) => point.timestamp && point.status && point.status !== "matched")
+    .filter((point) => point.timestamp && point.status
+      && !["matched", "inactive"].includes(point.status))
     .sort((left, right) => Date.parse(right.timestamp) - Date.parse(left.timestamp));
   const largest = [...computed]
     .sort((a, b) => Math.abs(b.residual) - Math.abs(a.residual));
-  const inspection = [...unmatched, ...largest]
-    .filter((row, index, rows) => rows.findIndex((candidate) => candidate.timestamp === row.timestamp) === index)
-    .slice(0, 8);
-  if (!inspection.length) {
+  // Both halves of this table matter: the windows that could not be compared,
+  // and the comparable windows whose residual is largest. Pagination replaced
+  // the old eight-row cap (owner-directed, 2026-08-08): nothing is dropped
+  // any more — the merge keeps every row from both halves, deduplicated by
+  // timestamp and ordered newest first, and the reader pages through it ten
+  // rows at a time.
+  const inspection = balancedInspectionRows(
+    unmatched,
+    largest,
+    unmatched.length + largest.length,
+  );
+  // A changed selection restarts at the first page: the page index describes
+  // a position within ONE row set, and surviving a range change would show an
+  // arbitrary slice of a different one.
+  const signature = `${inspection.length}`
+    + `:${inspection[0]?.timestamp ?? ""}`
+    + `:${inspection.at(-1)?.timestamp ?? ""}`;
+  if (signature !== residualInspectionSignature) {
+    residualInspectionSignature = signature;
+    residualTablePage = 0;
+  }
+  residualInspectionRows = inspection;
+  renderResidualInspectionTable();
+}
+
+/**
+ * One page of the exact-windows inspection table, plus the pager beneath it.
+ * Rendered from the module-held row set so Prev/Next can redraw the table
+ * without re-deriving the timeline.
+ */
+function renderResidualInspectionTable() {
+  const table = $("#residual-table");
+  clear(table);
+  const rows = residualInspectionRows;
+  const pagination = $("#residual-pagination");
+  if (!rows.length) {
+    if (pagination) pagination.hidden = true;
     const row = node("tr");
-    const cell = node("td", "empty-cell", "No periods loaded.");
+    const cell = node("td", "empty-cell", t("residual.table.empty"));
     cell.colSpan = 5;
     row.append(cell);
     table.append(row);
     return;
   }
-  for (const item of inspection) {
+  const pageCount = Math.ceil(rows.length / RESIDUAL_TABLE_PAGE_SIZE);
+  residualTablePage = Math.min(Math.max(0, residualTablePage), pageCount - 1);
+  const start = residualTablePage * RESIDUAL_TABLE_PAGE_SIZE;
+  const pageRows = rows.slice(start, start + RESIDUAL_TABLE_PAGE_SIZE);
+  for (const item of pageRows) {
     const row = node("tr");
     const residual = item.observed === null || item.expected === null
       ? null
       : item.residual;
     row.append(
-      node("td", "", `${formatLocal(item.timestamp)} · ${formatUtc(item.timestamp)}`),
+      node("td", "", formatChartTimestamp(item.timestamp)),
       node("td", "", formatPp(item.observed)),
       node("td", "", formatPp(item.expected)),
-      node("td", residual === null ? "" : residual >= 0 ? "positive" : "negative", residual === null ? "Not comparable" : `${residual >= 0 ? "+" : ""}${formatPp(residual)}`),
+      node("td", residual === null ? "" : residual >= 0 ? "positive" : "negative", residual === null ? t("residual.table.notComparable") : `${residual >= 0 ? "+" : ""}${formatPp(residual)}`),
       node("td", "", timelineStatusLabel(item.status ?? "matched")),
     );
     table.append(row);
   }
+  if (!pagination) return;
+  pagination.hidden = false;
+  setLocalizedText($("#residual-page-status"), "residual.table.page", {
+    start: formatNumber(start + 1),
+    end: formatNumber(start + pageRows.length),
+    total: formatNumber(rows.length),
+  });
+  const previous = $("#residual-page-prev");
+  const next = $("#residual-page-next");
+  if (previous) previous.disabled = residualTablePage === 0;
+  if (next) next.disabled = residualTablePage >= pageCount - 1;
+}
+
+/**
+ * The range-level model and observed-speed context for the divergence panel.
+ *
+ * This is deliberately NOT period-specific: the timeline usage buckets carry
+ * cost, tokens, and price coverage but no per-bucket model or speed breakdown,
+ * so the only model/speed evidence client-side is the whole-selected-period
+ * `byModel`/`bySpeed` on the accounting payload. Each period surfaces its own
+ * exact cost/token/unpriced mix from its buckets; this line adds the range's
+ * dominant priced model and observed speed as clearly-marked context.
+ */
+// One id per rendered divergence period, so each period's expandable breakdown
+// panel has a stable target for its toggle's `aria-controls`.
+let nextDivergenceBreakdownId = 0;
+
+function divergenceRangeContext(data) {
+  const accounting = accountingPeriod(data);
+  if (!accounting) return null;
+  const models = modelUsageRows(accounting);
+  const topModel = models.find((row) => !modelRowIsSeparateAllowance(row))
+    ?? models[0]
+    ?? null;
+  const modelLabel = topModel === null ? null
+    : topModel.model === "unknown" || topModel.pricingStatus === "unrecognized"
+      ? t("accounting.model.unrecognized")
+      : formatModelName(topModel.model) || topModel.model;
+  const bySpeed = accounting.bySpeed ?? {};
+  const rankedSpeed = ["fast", "standard", "unknown"]
+    .map((key) => [key, finite(bySpeed?.[key]?.events, 0)])
+    .sort((left, right) => right[1] - left[1]);
+  const topSpeed = rankedSpeed[0]?.[1] > 0 ? rankedSpeed[0][0] : null;
+  if (modelLabel === null && topSpeed === null) return null;
+  return {
+    model: modelLabel ?? t("divergence.speed.unknown"),
+    speed: divergenceSpeedLabel(topSpeed ?? "unknown"),
+  };
+}
+
+// Static speed keys so the translated-inventory gate can verify every one. A
+// computed `t(\`divergence.speed.${key}\`)` would resolve at runtime but read
+// as no key to the source scanner.
+function divergenceSpeedLabel(key) {
+  if (key === "fast") return t("divergence.speed.fast");
+  if (key === "standard") return t("divergence.speed.standard");
+  return t("divergence.speed.unknown");
+}
+
+/**
+ * One detected divergence period, rendered to match the Trends card copy: a
+ * localized date range and duration, the finding in plain words, the signed
+ * magnitude, and the contributor mix (exact per-period totals plus range-level
+ * model/speed context).
+ */
+function divergencePeriodItem(period, rangeContext) {
+  const item = node(
+    "li",
+    `divergence-period ${period.direction === "under_costed"
+      ? "under-costed"
+      : "over-costed"}`,
+  );
+
+  const header = node("div", "divergence-period-header");
+  header.append(
+    rawNode(
+      "span",
+      "divergence-period-range",
+      t("divergence.dateRange", {
+        start: formatChartTimestamp(period.startAt),
+        end: formatChartTimestamp(period.endAt),
+      }),
+    ),
+    localizedNode("span", "divergence-period-duration", "divergence.duration", {
+      duration: formatSpanLength(period.durationMs),
+    }),
+  );
+
+  const finding = localizedNode(
+    "p",
+    "divergence-period-finding",
+    period.direction === "under_costed"
+      ? "divergence.underCosted"
+      : "divergence.overCosted",
+    { pp: formatPp(period.absPeakDriftPp) },
+  );
+
+  const magnitude = localizedNode(
+    "p",
+    "divergence-period-magnitude",
+    "divergence.magnitude",
+    {
+      peak: formatSignedPp(period.peakDriftPp),
+      auc: formatSignedPpHours(period.signedAucPpHours),
+    },
+  );
+
+  const contributors = period.contributors;
+  const mix = localizedNode("p", "divergence-period-mix", "divergence.mix", {
+    cost: formatApiMoney(contributors.costUsd),
+    tokens: compact(contributors.totalTokens),
+    events: compact(contributors.usageEvents),
+  });
+
+  item.append(header, finding, magnitude, mix);
+
+  if (contributors.unpricedEventShare !== null
+      && contributors.unpricedEvents > 0) {
+    item.append(localizedNode(
+      "p",
+      "divergence-period-unpriced",
+      "divergence.unpricedShare",
+      { share: formatPercent(contributors.unpricedEventShare * 100, 1) },
+    ));
+  }
+
+  // The per-period model and speed mix is not in the timeline payload, so it is
+  // fetched on demand: expanding the period asks the companion to reprice just
+  // this window from the unified index. This replaces the old whole-selected-
+  // range context line with the window's OWN contributor mix; the range context
+  // survives only as the fallback when a companion predating the route cannot
+  // answer.
+  const breakdownId = `divergence-breakdown-${nextDivergenceBreakdownId++}`;
+  const toggle = node("button", "divergence-period-toggle");
+  toggle.type = "button";
+  toggle.setAttribute("aria-expanded", "false");
+  toggle.setAttribute("aria-controls", breakdownId);
+  setLocalizedText(toggle, "divergence.breakdown.show");
+  const panel = node("div", "divergence-period-breakdown");
+  panel.id = breakdownId;
+  panel.hidden = true;
+
+  let loadState = "idle";
+  const loadBreakdown = async () => {
+    if (loadState === "loaded" || loadState === "loading") return;
+    loadState = "loading";
+    clear(panel);
+    panel.append(localizedNode(
+      "p",
+      "divergence-breakdown-status",
+      "divergence.breakdown.loading",
+    ));
+    let breakdown = null;
+    try {
+      breakdown = await localClient.windowBreakdown(period.startMs, period.endMs);
+    } catch {
+      breakdown = null;
+    }
+    loadState = "loaded";
+    renderDivergenceBreakdown(panel, breakdown, rangeContext);
+  };
+  toggle.addEventListener("click", () => {
+    const open = toggle.getAttribute("aria-expanded") === "true";
+    toggle.setAttribute("aria-expanded", open ? "false" : "true");
+    setLocalizedText(
+      toggle,
+      open ? "divergence.breakdown.show" : "divergence.breakdown.hide",
+    );
+    panel.hidden = open;
+    if (!open) loadBreakdown();
+  });
+
+  item.append(toggle, panel);
+  return item;
+}
+
+// The window's own repriced contributor mix, or a clearly-marked fallback. The
+// per-model and per-speed rows are the true per-period evidence the endpoint
+// exists to supply; an unavailable breakdown falls back to the range-level
+// context rather than pretending this window had none.
+function divergenceModelLabel(model) {
+  if (model === "unknown") return t("accounting.model.unrecognized");
+  return formatModelName(model) || model;
+}
+
+function renderDivergenceBreakdown(panel, breakdown, rangeContext) {
+  clear(panel);
+  if (!breakdown || breakdown.status !== "available") {
+    panel.append(rangeContext !== null
+      ? localizedNode(
+        "p",
+        "divergence-breakdown-status",
+        "divergence.breakdown.unavailable",
+        { model: rangeContext.model, speed: rangeContext.speed },
+      )
+      : localizedNode(
+        "p",
+        "divergence-breakdown-status",
+        "divergence.breakdown.unavailablePlain",
+      ));
+    return;
+  }
+  if (!breakdown.byModel.length) {
+    panel.append(localizedNode(
+      "p",
+      "divergence-breakdown-status",
+      "divergence.breakdown.empty",
+    ));
+    return;
+  }
+
+  panel.append(localizedNode(
+    "p",
+    "divergence-breakdown-heading",
+    "divergence.breakdown.modelHeading",
+  ));
+  const modelList = node("ul", "divergence-breakdown-list");
+  for (const row of breakdown.byModel) {
+    const share = breakdown.costUsd > 0 ? row.costUsd / breakdown.costUsd : 0;
+    modelList.append(localizedNode(
+      "li",
+      "divergence-breakdown-row",
+      "divergence.breakdown.modelRow",
+      {
+        model: divergenceModelLabel(row.model),
+        cost: formatApiMoney(row.costUsd),
+        share: formatPercent(share * 100, 1),
+      },
+    ));
+  }
+  panel.append(modelList);
+
+  const speedEntries = Object.values(breakdown.bySpeed)
+    .filter((row) => row.events > 0)
+    .sort((left, right) => right.costUsd - left.costUsd);
+  if (speedEntries.length) {
+    panel.append(localizedNode(
+      "p",
+      "divergence-breakdown-heading",
+      "divergence.breakdown.speedHeading",
+    ));
+    const speedList = node("ul", "divergence-breakdown-list");
+    for (const row of speedEntries) {
+      speedList.append(localizedNode(
+        "li",
+        "divergence-breakdown-row",
+        "divergence.breakdown.speedRow",
+        {
+          speed: divergenceSpeedLabel(row.speed),
+          cost: formatApiMoney(row.costUsd),
+          events: compact(row.events),
+        },
+      ));
+    }
+    panel.append(speedList);
+  }
+
+  if (breakdown.fastCostUsd > 0) {
+    panel.append(localizedNode(
+      "p",
+      "divergence-breakdown-fast",
+      "divergence.breakdown.fastCost",
+      { cost: formatApiMoney(breakdown.fastCostUsd) },
+    ));
+  }
+  if (breakdown.unpricedShare > 0) {
+    panel.append(localizedNode(
+      "p",
+      "divergence-breakdown-unpriced",
+      "divergence.breakdown.unpriced",
+      { share: formatPercent(breakdown.unpricedShare * 100, 1) },
+    ));
+  }
+}
+
+/**
+ * The "Where observed and priced usage diverge" panel. It runs the pure
+ * detector over the whole selected calibration range and lists each sustained
+ * period, or states plainly that nothing diverged in this range.
+ */
+function renderDivergencePeriods(data, points) {
+  const list = $("#divergence-list");
+  const empty = $("#divergence-empty");
+  const summary = $("#divergence-summary");
+  const caveat = $("#divergence-caveat");
+  if (!list || !empty || !summary) return;
+  clear(list);
+
+  const result = detectDeviationPeriods(points, {
+    usageBuckets: data?.timeline?.usage ?? [],
+  });
+
+  if (!result.periods.length) {
+    list.hidden = true;
+    summary.hidden = true;
+    if (caveat) caveat.hidden = true;
+    empty.hidden = false;
+    // "Nothing diverged" and "there is no drift series to judge" are different
+    // facts: the historical artifact view carries no per-window reset anchors,
+    // so it can never earn the clean-bill-of-health copy.
+    setLocalizedText(
+      empty,
+      result.hasDriftSeries ? "divergence.empty" : "divergence.emptyNoDrift",
+    );
+    return;
+  }
+
+  empty.hidden = true;
+  list.hidden = false;
+  summary.hidden = false;
+  // Honest-estimator label (2026-08-10): the constant-rate expected line
+  // reads model-mix shifts as divergence (established by the full-history
+  // deviation investigation — sol-heavy stretches imply ~$2,300/100pp and
+  // terra-heavy ~$1,100 against one blended constant). Until the per-model
+  // expected line ships, every listed period carries this caveat.
+  if (caveat) {
+    caveat.hidden = false;
+    setLocalizedText(caveat, "divergence.methodCaveat");
+  }
+  if (result.truncated) {
+    setLocalizedText(summary, "divergence.truncated", {
+      shown: formatNumber(result.periods.length),
+      total: formatNumber(result.totalFound),
+    });
+    // No silent truncation: the cap is a display bound, and the full count is
+    // both stated above and recorded here.
+    console.info(
+      `[divergence] ${result.totalFound} periods detected; showing the `
+        + `${result.periods.length} widest.`,
+    );
+  } else {
+    setLocalizedPluralText(summary, "divergence.count", result.totalFound, {
+      count: formatNumber(result.totalFound),
+    });
+  }
+
+  const rangeContext = divergenceRangeContext(data);
+  for (const period of result.periods) {
+    list.append(divergencePeriodItem(period, rangeContext));
+  }
+}
+
+// A tick label's resolution follows the span the axis actually covers, so
+// every tick on one axis has the same compact shape instead of each one
+// carrying a full date and time.
+const CHART_TICK_TIME_ONLY_SPAN_MS = 36 * 60 * 60 * 1_000;
+const CHART_TICK_MONTH_ONLY_SPAN_MS = 365 * 24 * 60 * 60 * 1_000;
+
+// The three tick shapes, hoisted so each one is a stable object rather than a
+// literal rebuilt per call, and one live formatter per (locale, shape).
+// `formatChartTimeLabel` runs once per tick and per rendered frame; building an
+// `Intl.DateTimeFormat` for each half of each label was a measurable share of
+// the pan and zoom cost, and nothing about the formatter depends on the instant
+// being formatted. Keying on the live formatting locale means a language change
+// needs no invalidation — it simply misses the cache once per shape.
+const CHART_TICK_SHAPES = Object.freeze({
+  day: Object.freeze({ month: "short", day: "numeric" }),
+  clock: Object.freeze({ hour: "numeric", minute: "2-digit" }),
+  month: Object.freeze({ month: "short", year: "numeric" }),
+});
+
+const chartTickFormatters = new Map();
+
+function chartTickFormatter(shape) {
+  const locale = getFormattingLocale();
+  const key = `${locale} ${shape}`;
+  const cached = chartTickFormatters.get(key);
+  if (cached !== undefined) return cached;
+  const formatter = new Intl.DateTimeFormat(locale, {
+    timeZone: USER_TIME_ZONE,
+    ...CHART_TICK_SHAPES[shape],
+  });
+  chartTickFormatters.set(key, formatter);
+  return formatter;
+}
+
+/**
+ * The one axis-tick label formatter.
+ *
+ * Two properties are deliberate and both were reported as defects:
+ *
+ * 1. No tick carries a time-zone name. A chart states its zone exactly once,
+ *    in its caption, through `formatTimeZoneLabel()` — which reads
+ *    `Intl.DateTimeFormat().resolvedOptions().timeZone`, so it is correct for
+ *    whatever zone the reader's Mac is in and is never assumed. Repeating a
+ *    short name ("EDT") on ticks while the caption said a long generic name
+ *    ("Eastern Time") stated the same fact two different ways.
+ *
+ * 2. The date and time halves are formatted independently and joined with a
+ *    separator chosen here. Asking one `Intl.DateTimeFormat` for both halves
+ *    delegates the join to ICU, and WebKit's ICU supplies a localized
+ *    connective — "Jan 5 at 3:04 PM" — that Node's ICU does not, so no Node
+ *    test can see it. Composing the halves removes that glue by construction
+ *    rather than by rewriting a string after the fact.
+ */
+function formatChartTimeLabel(value, { dateOnly = false, spanMs = null } = {}) {
+  const timestamp = value instanceof Date
+    ? value.valueOf()
+    : typeof value === "number"
+      ? value
+      : Date.parse(value);
+  if (!Number.isFinite(timestamp)) return t("format.unknown");
+  const span = finite(spanMs);
+  const resolution = dateOnly ? "date"
+    : span === null ? "dateAndTime"
+      : span <= CHART_TICK_TIME_ONLY_SPAN_MS ? "time"
+        : span <= CHART_TICK_MONTH_ONLY_SPAN_MS ? "date"
+          : "month";
+  try {
+    const instant = new Date(timestamp);
+    const part = (shape) => chartTickFormatter(shape).format(instant);
+    if (resolution === "time") return part("clock");
+    if (resolution === "month") return part("month");
+    if (resolution === "date") return part("day");
+    return `${part("day")} · ${part("clock")}`;
+  } catch {
+    return formatChartTimestamp(new Date(timestamp).toISOString(), { dateOnly });
+  }
+}
+
+/**
+ * Whether a series draws its data points. This is decided per chart, and there
+ * is deliberately no global switch, because the dashboard's two chart families
+ * want opposite answers and both answers are correct:
+ *
+ *  - EVIDENCE_DOTS — the allowance estimate history. Each dot is one observed
+ *    seven-day reset: sparse, individually meaningful evidence. The dots are
+ *    what that chart is for, and they must be visible.
+ *  - HOVER_ONLY — the dense usage, calibration, and residual timelines. Those
+ *    plot hundreds of adjacent samples, where dots smear into a band. The line
+ *    carries the shape while every sample keeps an invisible hit target, so
+ *    hover, keyboard focus, and assistive technology still reach each value.
+ *
+ * Every series must name one. There is no default to fall back to and no
+ * boolean to flip in one place, so "hide the dots" can only ever be said about
+ * a single chart. A previous change that flipped one shared flag silently
+ * erased the allowance chart's points; this makes that edit impossible to
+ * write by accident.
+ */
+const CHART_POINT_STYLE = Object.freeze({
+  EVIDENCE_DOTS: "evidence-dots",
+  HOVER_ONLY: "hover-only",
+});
+
+const CHART_POINT_STYLES = new Set(Object.values(CHART_POINT_STYLE));
+
+/**
+ * Drawing heights, in viewBox units, for the charts whose CSS lets them take
+ * their height from the shape of their drawing rather than from a fixed pixel
+ * value.
+ *
+ * The timeline charts were drawn into a 900x300 box inside a shell that is
+ * routinely 977px wide. An SVG scales its viewBox to fit, so the smaller ratio
+ * won: the plot was pinned to 300px tall and letterboxed with 77px of dead
+ * space across the width. These heights pair with `aspect-ratio` rules in
+ * `styles.css` so each chart fills its card in both directions, which roughly
+ * doubles the plot area the same evidence is drawn into.
+ *
+ * Each value must stay in step with the matching `aspect-ratio`; a height with
+ * no matching rule only reintroduces the letterbox.
+ */
+const TIMELINE_CHART_HEIGHT = 420;
+const COMPACT_CHART_HEIGHT = 340;
+
+/**
+ * The one place a plotted point's instant is turned into milliseconds.
+ *
+ * Every series carries its instant as an ISO string, because that is what the
+ * evidence artifacts and the local companion emit and what the tooltips print.
+ * Re-parsing that string is not free, and the viewport helpers, the status
+ * intervals, the residual filter, and the x-scale each parsed the same strings
+ * again on every redraw: a single wheel notch over a month of calibration
+ * evidence was measured at 18,177 `Date.parse` calls.
+ *
+ * Series builders now stamp `timestampMs` alongside `timestamp`, and this
+ * reader prefers it. The fallback keeps the helper honest for points that come
+ * straight from an artifact — a caller never has to know which kind it holds.
+ */
+function pointTimestampMs(point) {
+  const stamped = point?.timestampMs;
+  if (typeof stamped === "number" && Number.isFinite(stamped)) return stamped;
+  return Date.parse(point?.timestamp ?? point?.date);
+}
+
+/**
+ * Swap a chart into its shell, releasing what the outgoing chart still held.
+ *
+ * `lineChart` attaches a `ResizeObserver` so the axis can shed tick labels as
+ * the card narrows. A pan or zoom replaces the whole SVG on every frame, so
+ * without this the page kept one live observer per rendered frame, each still
+ * watching a detached tree and each waking on the next real resize.
+ */
+function drawChart(shell, chart) {
+  for (const previous of shell.children ?? []) {
+    previous.chartTickDensityObserver?.disconnect();
+  }
+  shell.replaceChildren(chart);
+}
+
+function chartSeriesDrawsPoints(item, field) {
+  const style = item?.pointStyle;
+  if (!CHART_POINT_STYLES.has(style)) {
+    throw new TypeError(
+      `lineChart ${field} needs an explicit pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS draws visible data points, CHART_POINT_STYLE.HOVER_ONLY keeps them reachable without drawing them.`,
+    );
+  }
+  return style === CHART_POINT_STYLE.EVIDENCE_DOTS;
+}
+
+/**
+ * The localization hook for everything the chart writes into the SVG text
+ * layer: axis labels, series names, the `<title>`/`<desc>` accessibility pair,
+ * and hover tooltips.
+ *
+ * SVG text nodes are stamped `data-i18n-skip` because they already contain
+ * formatted numbers and instants that exact-text translation must never touch.
+ * That left the text layer as the one surface the localization bridge could not
+ * see, and hardcoded English flowed straight through it. Resolving the strings
+ * here, at the single chart-rendering helper, closes that gap for every chart
+ * at once.
+ *
+ * Callers pass a descriptor rather than a string:
+ *   { key: "chart.residual.title" }               → t(key)
+ *   { key: "weekly.point.detail", values: {...} } → t(key, values)
+ *   { key: "share.resetFit", plural: count }      → tPlural(key, count, values)
+ *   { data: alreadyFormattedSourceValue }         → verbatim, never translated
+ *
+ * A bare string throws. That is the enforcement: a chart added later cannot
+ * reintroduce untranslated English without failing the moment it renders.
+ */
+function chartText(descriptor, field = "text") {
+  if (descriptor === null || descriptor === undefined) return "";
+  if (typeof descriptor === "object" && !Array.isArray(descriptor)) {
+    if (typeof descriptor.key === "string") {
+      return typeof descriptor.plural === "number"
+        ? tPlural(descriptor.key, descriptor.plural, descriptor.values ?? {})
+        : t(descriptor.key, descriptor.values ?? {});
+    }
+    if (Object.hasOwn(descriptor, "data")) {
+      return descriptor.data == null ? "" : String(descriptor.data);
+    }
+  }
+  throw new TypeError(
+    `lineChart ${field} must be a localization descriptor ({ key }) or explicit source data ({ data }). Hardcoded strings cannot reach the SVG text layer.`,
+  );
+}
+
+function chartSeriesCaption(label, value) {
+  return t("chart.seriesValue", { label, value });
 }
 
 function lineChart({
@@ -2371,26 +4645,67 @@ function lineChart({
   confidence = null,
   errorBars = null,
   xDomain = null,
+  xTicks = null,
+  yDomain = null,
+  yTickFormat = null,
   statusIntervals = [],
   secondarySeries = [],
   secondaryYLabel = null,
+  // The drawing height, in viewBox units. It pairs with an `aspect-ratio` in
+  // `styles.css`: the SVG is laid out at the card's full width and takes its
+  // height from this ratio, so the plot fills the box in both directions
+  // instead of being letterboxed by a fixed CSS height. A chart whose CSS
+  // pins an explicit height keeps the default, because raising this without
+  // raising that one only reintroduces the letterbox it is meant to remove.
+  height = 300,
 }) {
+  // Hover, keyboard focus, and the accessible name are unconditional. Only the
+  // visible dot is a per-chart decision, and every series has to state it.
+  const chartSeries = (Array.isArray(series) ? series : []).map((item) => ({
+    ...item,
+    label: chartText(item.label, "series label"),
+    markers: chartSeriesDrawsPoints(item, "series"),
+    focusable: item.focusable !== false,
+    tooltip: item.tooltip !== false,
+  }));
+  const chartSecondarySeries = (Array.isArray(secondarySeries) ? secondarySeries : []).map((item) => ({
+    ...item,
+    label: chartText(item.label, "secondary series label"),
+    markers: chartSeriesDrawsPoints(item, "secondary series"),
+    focusable: item.focusable !== false,
+    tooltip: item.tooltip !== false,
+  }));
   const width = 900;
-  const height = 330;
-  const hasSecondary = secondarySeries.length > 0;
-  const margin = { top: 24, right: hasSecondary ? 64 : 22, bottom: 50, left: 58 };
-  const values = points.flatMap((point) => series.map((item) => finite(point[item.key])).filter((value) => value !== null));
-  if (confidence) values.push(...points.flatMap((point) => [finite(point[confidence.low]), finite(point[confidence.high])].filter((value) => value !== null)));
-  if (errorBars) values.push(...points.flatMap((point) => [finite(point[errorBars.low]), finite(point[errorBars.high])].filter((value) => value !== null)));
-  if (includeZero) values.push(0);
-  let min = Math.min(...values);
-  let max = Math.max(...values);
-  if (!Number.isFinite(min) || !Number.isFinite(max)) { min = 0; max = 1; }
-  if (min === max) { min -= 1; max += 1; }
-  const pad = (max - min) * .1;
-  min = includeZero && min >= 0 ? 0 : min - pad;
-  max += pad;
-  const timestamps = points.map((point) => Date.parse(point.timestamp ?? point.date));
+  const hasSecondary = chartSecondarySeries.length > 0;
+  const margin = {
+    top: 12,
+    right: hasSecondary ? 96 : 24,
+    // Tick labels are horizontal. They used to be rotated -24° and given a
+    // 66px gutter because each one carried a full date and time; now that a
+    // tick reads "Jul 15" or "2:04 PM", rotation only made short text harder
+    // to read and cost the plot 22px of height. The gutter is sized to the one
+    // line of 10px text it holds — it was carrying 22px of slack beneath the
+    // baseline, which is plot area no chart was using.
+    bottom: 30,
+    left: 72,
+  };
+  const tickLabelBaseline = height - 11;
+  let min = finite(yDomain?.low);
+  let max = finite(yDomain?.high);
+  if (min === null || max === null || max <= min) {
+    const values = points.flatMap((point) => chartSeries.map((item) => finite(point[item.key])).filter((value) => value !== null));
+    if (confidence) values.push(...points.flatMap((point) => [finite(point[confidence.low]), finite(point[confidence.high])].filter((value) => value !== null)));
+    if (errorBars) values.push(...points.flatMap((point) => [finite(point[errorBars.low]), finite(point[errorBars.high])].filter((value) => value !== null)));
+    if (includeZero) values.push(0);
+    min = Math.min(...values);
+    max = Math.max(...values);
+    if (!Number.isFinite(min) || !Number.isFinite(max)) { min = 0; max = 1; }
+    if (min === max) { min -= 1; max += 1; }
+    const pad = (max - min) * .1;
+    min = includeZero && min >= 0 ? 0 : min - pad;
+    max += pad;
+  }
+  const timestamps = points.map(pointTimestampMs);
   const timed = timestamps.every(Number.isFinite);
   const dataStartMs = timed ? Math.min(...timestamps) : 0;
   const dataEndMs = timed ? Math.max(...timestamps) : Math.max(1, points.length - 1);
@@ -2403,37 +4718,224 @@ function lineChart({
   const safeDomainEndMs = domainEndMs > domainStartMs
     ? domainEndMs
     : domainStartMs + 1;
+  // `timestamps` was already computed above, once per point, so the x-scale
+  // reads that array instead of re-parsing the same ISO string on every call.
+  const plotWidth = width - margin.left - margin.right;
+  const lastIndex = Math.max(1, points.length - 1);
   const x = (index, point = points[index]) => {
+    const at = timed
+      ? (index >= 0 && timestamps[index] !== undefined
+        ? timestamps[index]
+        : pointTimestampMs(point))
+      : null;
     const coordinate = timed
-      ? (Date.parse(point.timestamp ?? point.date) - domainStartMs)
-        / (safeDomainEndMs - domainStartMs)
-      : index / Math.max(1, points.length - 1);
-    return margin.left + coordinate * (width - margin.left - margin.right);
+      ? (at - domainStartMs) / (safeDomainEndMs - domainStartMs)
+      : index / lastIndex;
+    return margin.left + coordinate * plotWidth;
   };
   const y = (value) => margin.top + (max - value) / (max - min) * (height - margin.top - margin.bottom);
   const ySecondary = (value) => margin.top
     + (100 - Math.max(0, Math.min(100, value))) / 100
       * (height - margin.top - margin.bottom);
 
+  // Six candidate divisions rather than five. Ticks are now kept inside the
+  // domain instead of rounding outwards past each end, which costs the axis
+  // roughly one tick; asking for one more division back restores the density a
+  // chart this tall needs to stay readable.
+  const chartTickStep = (low, high, target = 6) => {
+    const span = Math.abs(high - low);
+    if (!Number.isFinite(span) || span <= 0) return 1;
+    const raw = span / Math.max(1, target - 1);
+    const magnitude = 10 ** Math.floor(Math.log10(raw));
+    const normalized = raw / magnitude;
+    const factor = normalized <= 1 ? 1
+      : normalized <= 2 ? 2
+        : normalized <= 2.5 ? 2.5
+          : normalized <= 5 ? 5
+            : 10;
+    return factor * magnitude;
+  };
+  // The fewest decimals that write the step exactly. The old rule returned 0
+  // for any step of 1 or more, so a 2.5 step printed its own grid lines as
+  // "0, -3, -5, -8, -10" — two labels naming a value their line was not drawn
+  // at. It also under-reported fractional steps: 0.25 needs two places, not
+  // one.
+  const chartTickDigits = (step) => {
+    if (!Number.isFinite(step) || step <= 0) return 0;
+    for (let digits = 0; digits < 3; digits += 1) {
+      if (Math.abs(step - Number(step.toFixed(digits))) <= step * 1e-9) return digits;
+    }
+    return 3;
+  };
+  const yStep = chartTickStep(min, max);
+  const yDigits = chartTickDigits(yStep);
+  const yTicks = Array.isArray(yDomain?.ticks) && yDomain.ticks.length > 0
+    ? yDomain.ticks.filter((value) => Number.isFinite(value))
+    : (() => {
+      // Ticks sit on round multiples of the step, but only where the axis
+      // actually goes. Rounding outwards put a grid line and a label a whole
+      // step beyond each end of the domain: on the residual chart that drew
+      // two of five grid lines outside the SVG box entirely, and `overflow:
+      // visible` meant they were painted over the card below rather than
+      // clipped. Rounding inwards keeps every tick on the plot.
+      const first = Math.floor(max / yStep) * yStep;
+      const last = Math.ceil(min / yStep) * yStep;
+      const values = [];
+      for (let value = first; value >= last - yStep / 100; value -= yStep) {
+        values.push(Number(value.toFixed(Math.max(0, yDigits + 2))));
+        if (values.length >= 8) break;
+      }
+      return values.length >= 2 ? values : [max, min];
+    })();
+
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
   svg.setAttribute("role", "img");
-  const titleNode = document.createElementNS(svg.namespaceURI, "title");
-  titleNode.textContent = title;
-  const descNode = document.createElementNS(svg.namespaceURI, "desc");
-  descNode.textContent = description;
-  svg.append(titleNode, descNode);
+  // The chart's accessible name and description live on aria attributes
+  // rather than a root <title>/<desc> pair: a root <title> also acts as a
+  // delayed grey native tooltip over every hover target inside the SVG, which
+  // is the double-tooltip the owner removed (2026-08-08). Both strings still
+  // pass through chartText, so hardcoded English still cannot reach them.
+  svg.setAttribute("aria-label", chartText(title, "title"));
+  const chartDescription = chartText(description, "description");
+  if (chartDescription !== "") {
+    svg.setAttribute("aria-description", chartDescription);
+  }
 
-  for (let index = 0; index < 5; index += 1) {
-    const value = max - index / 4 * (max - min);
+  const tooltipWidth = 330;
+  const tooltipHeight = 48;
+  const tooltip = document.createElementNS(svg.namespaceURI, "g");
+  tooltip.setAttribute("class", "chart-hover-tooltip");
+  tooltip.setAttribute("visibility", "hidden");
+  tooltip.setAttribute("aria-hidden", "true");
+  const tooltipBackground = document.createElementNS(svg.namespaceURI, "rect");
+  tooltipBackground.setAttribute("width", String(tooltipWidth));
+  tooltipBackground.setAttribute("height", String(tooltipHeight));
+  tooltipBackground.setAttribute("rx", "6");
+  const tooltipHeading = svgText(10, 18, "", "chart-tooltip-heading");
+  const tooltipDetail = svgText(10, 36, "", "chart-tooltip-detail");
+  tooltip.append(tooltipBackground, tooltipHeading, tooltipDetail);
+  const showTooltip = (xPosition, yPosition, heading, detail = "") => {
+    const tooltipX = Math.max(
+      margin.left,
+      Math.min(width - margin.right - tooltipWidth, xPosition + 10),
+    );
+    const tooltipY = yPosition - tooltipHeight - 10 < margin.top
+      ? yPosition + 10
+      : yPosition - tooltipHeight - 10;
+    tooltip.setAttribute("transform", `translate(${tooltipX} ${tooltipY})`);
+    tooltipHeading.textContent = heading.slice(0, 72);
+    tooltipDetail.textContent = detail.slice(0, 86);
+    tooltip.setAttribute("visibility", "visible");
+    tooltip.setAttribute("aria-hidden", "false");
+  };
+  const hideTooltip = () => {
+    tooltip.setAttribute("visibility", "hidden");
+    tooltip.setAttribute("aria-hidden", "true");
+  };
+
+  const bindChartInteraction = ({
+    element,
+    heading,
+    detail = "",
+    xPosition,
+    yPosition,
+    pointer = true,
+    focus = true,
+    label = `${heading}${detail ? ` · ${detail}` : ""}`,
+  }) => {
+    if (focus) {
+      element.setAttribute("tabindex", "0");
+      element.setAttribute("role", "img");
+      element.setAttribute("aria-label", label);
+    }
+    if (typeof element.addEventListener !== "function") return;
+    if (pointer) {
+      element.addEventListener("pointerenter", () => showTooltip(
+        xPosition,
+        yPosition,
+        heading,
+        detail,
+      ));
+      element.addEventListener("pointerleave", hideTooltip);
+    }
+    if (focus) {
+      element.addEventListener("focus", () => showTooltip(
+        xPosition,
+        yPosition,
+        heading,
+        detail,
+      ));
+      element.addEventListener("blur", hideTooltip);
+    }
+  };
+
+  const installTickDensity = (tickLabels) => {
+    if (tickLabels.length === 0) return;
+    const update = (renderedWidth) => {
+      const widthForDensity = Number.isFinite(renderedWidth) && renderedWidth > 0
+        ? renderedWidth
+        : width;
+      const target = Math.min(
+        tickLabels.length,
+        adaptiveChartTickCount(widthForDensity, {
+          left: margin.left,
+          right: margin.right,
+        }),
+      );
+      const visible = new Set();
+      if (target === 1) {
+        visible.add(0);
+      } else {
+        for (let index = 0; index < target; index += 1) {
+          visible.add(Math.round(index * (tickLabels.length - 1) / (target - 1)));
+        }
+      }
+      tickLabels.forEach((label, index) => {
+        label.setAttribute("display", visible.has(index) ? "inline" : "none");
+        label.setAttribute("aria-hidden", visible.has(index) ? "false" : "true");
+      });
+    };
+    const renderedWidth = typeof svg.getBoundingClientRect === "function"
+      ? svg.getBoundingClientRect().width
+      : width;
+    update(renderedWidth);
+    if (typeof ResizeObserver === "function") {
+      const observer = new ResizeObserver((entries) => {
+        // A pan redraws the chart every frame, discarding the SVG this observer
+        // was created for. Once that SVG leaves the document the observer has
+        // nothing to report, so it releases itself rather than accumulating one
+        // live observer per rendered frame.
+        if (svg.isConnected === false) {
+          observer.disconnect();
+          return;
+        }
+        update(entries[0]?.contentRect?.width ?? renderedWidth);
+      });
+      observer.observe(svg);
+      svg.chartTickDensityObserver = observer;
+    }
+  };
+
+  for (const value of yTicks) {
     const yPosition = y(value);
     svg.append(svgLine(margin.left, yPosition, width - margin.right, yPosition, "chart-grid"));
-    svg.append(svgText(margin.left - 8, yPosition + 3, value.toFixed(Math.abs(max - min) < 10 ? 1 : 0), "chart-axis-label", "end"));
-    if (hasSecondary) {
+    const label = yTickFormat === null
+      ? formatDecimal(value, yDigits)
+      : yTickFormat(value, yDigits);
+    svg.append(svgText(margin.left - 8, yPosition + 3, label, "chart-axis-label", "end"));
+  }
+
+  if (hasSecondary) {
+    // The percentage axis is drawn on its own round quarters. It used to reuse
+    // the left axis's tick positions, so a four-tick dollar axis produced
+    // 100 / 67 / 33 / 0 % — arithmetically true and unreadable. The percentage
+    // scale is fixed at 0–100, so its ticks do not depend on the other axis.
+    for (const percent of [100, 75, 50, 25, 0]) {
       svg.append(svgText(
         width - margin.right + 8,
-        ySecondary(100 - index * 25) + 3,
-        `${100 - index * 25}%`,
+        ySecondary(percent) + 3,
+        formatPercent(percent, 0),
         "chart-axis-label",
         "start"
       ));
@@ -2445,34 +4947,72 @@ function lineChart({
   }
 
   if (timed) {
-    for (let index = 0; index < 4; index += 1) {
-      const timestamp = new Date(
-        domainStartMs + (safeDomainEndMs - domainStartMs) * index / 3,
-      ).toISOString();
-      svg.append(svgText(
-        margin.left + (width - margin.left - margin.right) * index / 3,
-        height - 22,
-        formatLocal(timestamp, { dateOnly: safeDomainEndMs - domainStartMs > 7 * 24 * 60 * 60 * 1_000 }),
+    // Render the widest useful candidate set once, then hide labels as the
+    // SVG's actual CSS width changes. The plotted geometry stays stable while
+    // narrow cards shed labels instead of acquiring a horizontal scrollbar.
+    const automaticTickCount = adaptiveChartTickCount(width, {
+      left: margin.left,
+      right: margin.right,
+    });
+    const domainSpanMs = safeDomainEndMs - domainStartMs;
+    const ticks = Array.isArray(xTicks) && xTicks.length > 0
+      ? xTicks
+      : Array.from({ length: automaticTickCount }, (_, index) => {
+        const at = domainStartMs + domainSpanMs * index / (automaticTickCount - 1);
+        return {
+          at,
+          label: formatChartTimeLabel(at, { spanMs: domainSpanMs }),
+          alignment: index === 0
+            ? "start"
+            : index === automaticTickCount - 1
+              ? "end"
+              : "middle",
+        };
+      });
+    const tickLabels = [];
+    for (const tick of ticks) {
+      const at = finite(tick?.at);
+      if (at === null) continue;
+      const position = margin.left + (at - domainStartMs)
+        / (safeDomainEndMs - domainStartMs) * (width - margin.left - margin.right);
+      const tickLabel = svgText(
+        position,
+        tickLabelBaseline,
+        typeof tick.label === "string"
+          ? tick.label
+          : formatChartTimeLabel(at, { spanMs: domainSpanMs }),
         "chart-axis-label",
-        index === 0 ? "start" : index === 3 ? "end" : "middle",
-      ));
+        tick.alignment ?? "middle",
+      );
+      svg.append(tickLabel);
+      tickLabels.push(tickLabel);
     }
-    svg.append(svgText(width / 2, height - 6, USER_TIME_ZONE, "chart-axis-label", "middle"));
+    installTickDensity(tickLabels);
   } else {
     const labelIndexes = [...new Set([0, Math.floor((points.length - 1) / 3), Math.floor((points.length - 1) * 2 / 3), points.length - 1])];
+    const tickLabels = [];
     for (const index of labelIndexes) {
       const timestamp = points[index]?.timestamp ?? points[index]?.date;
-      svg.append(svgText(x(index), height - 22, formatLocal(timestamp, { dateOnly: true }), "chart-axis-label", index === 0 ? "start" : index === points.length - 1 ? "end" : "middle"));
+      const tickLabel = svgText(x(index), tickLabelBaseline, formatChartTimeLabel(timestamp, { dateOnly: true }), "chart-axis-label", index === 0 ? "start" : index === points.length - 1 ? "end" : "middle");
+      svg.append(tickLabel);
+      tickLabels.push(tickLabel);
     }
+    installTickDensity(tickLabels);
   }
-  const yAxisLabel = svgText(15, height / 2, yLabel, "chart-axis-label", "middle");
+  const yAxisLabel = svgText(
+    15,
+    height / 2,
+    chartText(yLabel, "yLabel"),
+    "chart-axis-label",
+    "middle",
+  );
   yAxisLabel.setAttribute("transform", `rotate(-90 15 ${height / 2})`);
   svg.append(yAxisLabel);
   if (hasSecondary && secondaryYLabel) {
     const secondaryLabel = svgText(
       width - 8,
       height / 2,
-      secondaryYLabel,
+      chartText(secondaryYLabel, "secondaryYLabel"),
       "chart-axis-label",
       "middle"
     );
@@ -2502,6 +5042,27 @@ function lineChart({
       const polygon = document.createElementNS(svg.namespaceURI, "polygon");
       polygon.setAttribute("points", [...upper, ...lower].map(([a, b]) => `${a},${b}`).join(" "));
       polygon.setAttribute("class", "chart-area-confidence");
+      const bandLow = Math.min(...confidencePoints.map(({ low }) => low));
+      const bandHigh = Math.max(...confidencePoints.map(({ high }) => high));
+      const bandFormat = confidence.format ?? formatMoney;
+      const bandHeading = chartText(confidence.label, "confidence label");
+      const bandDetail = `${bandFormat(bandLow)}–${bandFormat(bandHigh)}`;
+      const bandCaption = chartSeriesCaption(bandHeading, bandDetail);
+      // No native <title> here: the styled hover tooltip already shows this
+      // caption immediately, and the browser's delayed grey tooltip repeated
+      // it (owner-reported double tooltip, 2026-08-08). The caption stays on
+      // aria-label for assistive technology.
+      const middlePoint = confidencePoints[Math.floor(confidencePoints.length / 2)];
+      bindChartInteraction({
+        element: polygon,
+        heading: bandHeading,
+        detail: bandDetail,
+        xPosition: x(middlePoint.index, middlePoint.point),
+        yPosition: y((bandLow + bandHigh) / 2),
+        pointer: confidence.tooltip !== false,
+        focus: confidence.focusable !== false,
+        label: bandCaption,
+      });
       svg.append(polygon);
     }
   }
@@ -2522,7 +5083,16 @@ function lineChart({
       );
       if (errorBars.tooltip !== false) {
         const barTitle = document.createElementNS(svg.namespaceURI, "title");
-        barTitle.textContent = `${errorBars.label}: ${format(low)}–${format(high)}${point.timestamp ? ` · ${formatLocal(point.timestamp)}` : ""}`;
+        const barCaption = chartSeriesCaption(
+          chartText(errorBars.label, "errorBars label"),
+          `${format(low)}–${format(high)}`,
+        );
+        setRawText(
+          barTitle,
+          point.timestamp
+            ? `${barCaption} · ${formatChartTimestamp(point.timestamp)}`
+            : barCaption,
+        );
         group.append(barTitle);
       }
       svg.append(group);
@@ -2543,12 +5113,15 @@ function lineChart({
     rect.setAttribute("height", String(height - margin.top - margin.bottom));
     rect.setAttribute("class", `chart-status-${interval.status === "reset_or_track_change" ? "reset" : interval.status === "missing_quota_bracket" ? "missing" : "ambiguous"}`);
     const intervalTitle = document.createElementNS(svg.namespaceURI, "title");
-    intervalTitle.textContent = timelineStatusLabel(interval.status);
+    setRawText(
+      intervalTitle,
+      chartText({ key: timelineStatusKey(interval.status) }, "status interval"),
+    );
     rect.append(intervalTitle);
     svg.append(rect);
   }
 
-  for (const item of series) {
+  for (const item of chartSeries) {
     const segments = [];
     let segment = [];
     points.forEach((point, index) => {
@@ -2556,62 +5129,106 @@ function lineChart({
       if (value === null) {
         if (segment.length) segments.push(segment);
         segment = [];
-      } else segment.push([x(index, point), y(value)]);
+      } else segment.push({
+        point,
+        index,
+        value,
+        x: x(index, point),
+        y: y(value),
+      });
     });
     if (segment.length) segments.push(segment);
     if (item.connect !== false) for (const pathPoints of segments) {
       const path = document.createElementNS(svg.namespaceURI, "polyline");
-      path.setAttribute("points", pathPoints.map(([a, b]) => `${a},${b}`).join(" "));
+      path.setAttribute("points", pathPoints.map(({ x: xPosition, y: yPosition }) => `${xPosition},${yPosition}`).join(" "));
       path.setAttribute("class", item.className);
+      if (item.lineFocusable === true) {
+        const format = item.format ?? formatMoney;
+        const representative = pathPoints[Math.floor(pathPoints.length / 2)];
+        const heading = chartSeriesCaption(item.label, format(representative.value));
+        const detail = typeof item.lineDetail === "function"
+          ? chartText(
+            item.lineDetail(pathPoints.map(({ point }) => point)),
+            "lineDetail",
+          )
+          : "";
+        const caption = [heading, detail].filter(Boolean).join(" · ");
+        // The styled hover is the one tooltip; a native <title> repeated it
+        // after a delay as the grey system tooltip. The caption survives on
+        // aria-label.
+        bindChartInteraction({
+          element: path,
+          heading,
+          detail,
+          xPosition: representative.x,
+          yPosition: representative.y,
+          pointer: item.lineTooltip !== false,
+          focus: item.focusable !== false,
+          label: caption,
+        });
+      }
       svg.append(path);
     }
-    if (item.markers === true) {
+    {
       const format = item.format ?? formatMoney;
       points.forEach((point, index) => {
         const value = finite(point[item.key]);
         if (value === null) return;
+        // Both coordinates are used three times each — the attribute, the
+        // tooltip anchor, and the focus anchor — so they are computed once.
+        const markerX = x(index, point);
+        const markerY = y(value);
         const marker = document.createElementNS(svg.namespaceURI, "circle");
-        marker.setAttribute("cx", String(x(index, point)));
-        marker.setAttribute("cy", String(y(value)));
-        const markerRadius = typeof item.markerRadius === "function"
+        marker.setAttribute("cx", String(markerX));
+        marker.setAttribute("cy", String(markerY));
+        const visualRadius = typeof item.markerRadius === "function"
           ? item.markerRadius(point)
           : item.markerRadius ?? 4;
+        const showMarker = item.markers
+          && Number.isFinite(visualRadius)
+          && visualRadius > 0;
         const markerOpacity = typeof item.markerOpacity === "function"
           ? item.markerOpacity(point)
           : item.markerOpacity;
-        marker.setAttribute("r", String(markerRadius));
-        if (Number.isFinite(markerOpacity)) {
+        marker.setAttribute("r", String(showMarker
+          ? visualRadius
+          : Math.max(7, finite(item.hitRadius, 8))));
+        if (showMarker && Number.isFinite(markerOpacity)) {
           marker.setAttribute(
             "opacity",
             String(Math.max(0, Math.min(1, markerOpacity))),
           );
         }
-        marker.setAttribute("class", `${item.className} chart-point`);
-        if (item.tooltip !== false || item.focusable === true) {
-          const timestamp = point.timestamp ?? point.date;
-          const caption = [
-            `${item.label}: ${format(value)}`,
-            item.detail?.(point),
-            timestamp ? formatLocal(timestamp) : null,
-          ].filter(Boolean).join(" · ");
-          if (item.tooltip !== false) {
-            const markerTitle = document.createElementNS(svg.namespaceURI, "title");
-            markerTitle.textContent = caption;
-            marker.append(markerTitle);
-          }
-          // A hover title alone is mouse-only, so focusable markers carry the
-          // identical sentence to the keyboard and to assistive technology.
-          if (item.focusable === true) {
-            marker.setAttribute("tabindex", "0");
-            marker.setAttribute("role", "img");
-            marker.setAttribute("aria-label", caption);
-          }
-        }
+        marker.setAttribute("class", showMarker
+          ? `${item.className} chart-point`
+          : `${item.className} chart-point chart-point-hit-target`);
+        const timestamp = point.timestamp ?? point.date;
+        const heading = chartSeriesCaption(item.label, format(value));
+        const detail = [
+          item.detail ? chartText(item.detail(point), "series detail") : null,
+          timestamp ? formatChartTimestamp(timestamp) : null,
+        ].filter(Boolean).join(" · ");
+        const caption = [heading, detail].filter(Boolean).join(" · ");
+        // Deliberately no native <title> on a point: the styled hover shows
+        // this caption immediately, and the browser's delayed grey tooltip
+        // then repeated it word for word (owner-reported double tooltip,
+        // 2026-08-08). Keyboard and assistive technology keep the identical
+        // sentence through the aria-label below.
+        bindChartInteraction({
+          element: marker,
+          heading,
+          detail,
+          xPosition: markerX,
+          yPosition: markerY,
+          pointer: item.tooltip !== false,
+          focus: item.focusable !== false,
+          label: caption,
+        });
         svg.append(marker);
       });
     }
   }
-  for (const item of secondarySeries) {
+  for (const item of chartSecondarySeries) {
     const segments = [];
     let segment = [];
     points.forEach((point, index) => {
@@ -2620,7 +5237,13 @@ function lineChart({
         if (segment.length) segments.push(segment);
         segment = [];
       } else {
-        segment.push([x(index, point), ySecondary(value)]);
+        segment.push({
+          point,
+          index,
+          value,
+          x: x(index, point),
+          y: ySecondary(value),
+        });
       }
     });
     if (segment.length) segments.push(segment);
@@ -2628,12 +5251,76 @@ function lineChart({
       const path = document.createElementNS(svg.namespaceURI, "polyline");
       path.setAttribute(
         "points",
-        pathPoints.map(([a, b]) => `${a},${b}`).join(" ")
+        pathPoints.map(({ x: xPosition, y: yPosition }) => `${xPosition},${yPosition}`).join(" ")
       );
       path.setAttribute("class", item.className);
+      if (item.lineFocusable === true) {
+        const format = item.format ?? ((value) => formatPercent(value, 1));
+        const representative = pathPoints[Math.floor(pathPoints.length / 2)];
+        const heading = chartSeriesCaption(item.label, format(representative.value));
+        const detail = typeof item.lineDetail === "function"
+          ? chartText(
+            item.lineDetail(pathPoints.map(({ point }) => point)),
+            "secondary lineDetail",
+          )
+          : "";
+        const caption = [heading, detail].filter(Boolean).join(" · ");
+        // Same rule as the primary series: the styled hover owns the
+        // tooltip, aria-label owns the accessible name, no native <title>.
+        bindChartInteraction({
+          element: path,
+          heading,
+          detail,
+          xPosition: representative.x,
+          yPosition: representative.y,
+          pointer: item.lineTooltip !== false,
+          focus: item.focusable !== false,
+          label: caption,
+        });
+      }
       svg.append(path);
     }
+    {
+      const format = item.format ?? ((value) => formatPercent(value, 1));
+      points.forEach((point, index) => {
+        const value = finite(point[item.key]);
+        if (value === null) return;
+        const markerX = x(index, point);
+        const markerY = ySecondary(value);
+        const marker = document.createElementNS(svg.namespaceURI, "circle");
+        marker.setAttribute("cx", String(markerX));
+        marker.setAttribute("cy", String(markerY));
+        const visualRadius = typeof item.markerRadius === "function"
+          ? item.markerRadius(point)
+          : item.markerRadius ?? 2.6;
+        const showMarker = item.markers
+          && Number.isFinite(visualRadius)
+          && visualRadius > 0;
+        marker.setAttribute("r", String(showMarker
+          ? visualRadius
+          : Math.max(7, finite(item.hitRadius, 8))));
+        marker.setAttribute("class", showMarker
+          ? `${item.className} chart-point`
+          : `${item.className} chart-point chart-point-hit-target`);
+        const heading = chartSeriesCaption(item.label, format(value));
+        const detail = point.timestamp ? formatChartTimestamp(point.timestamp) : "";
+        const caption = [heading, detail].filter(Boolean).join(" · ");
+        // No native <title>: the styled hover is the one tooltip on a point.
+        bindChartInteraction({
+          element: marker,
+          heading,
+          detail,
+          xPosition: markerX,
+          yPosition: markerY,
+          pointer: item.tooltip !== false,
+          focus: item.focusable !== false,
+          label: caption,
+        });
+        svg.append(marker);
+      });
+    }
   }
+  svg.append(tooltip);
   return svg;
 }
 
@@ -2653,6 +5340,12 @@ function svgText(x, y, value, className, anchor = "start") {
   element.setAttribute("y", y);
   element.setAttribute("class", className);
   element.setAttribute("text-anchor", anchor);
+  // SVG text stays out of the exact-text bridge: it mixes localized copy with
+  // formatted numbers and instants that must never be matched against an
+  // English phrase table. Its words are localized upstream instead, by
+  // `chartText` inside `lineChart`, which is why that helper refuses a bare
+  // string — this attribute is the reason a gap here would be invisible.
+  element.setAttribute("data-i18n-skip", "");
   element.textContent = value;
   return element;
 }
@@ -2660,134 +5353,650 @@ function svgText(x, y, value, className, anchor = "start") {
 function isWellObservedWeeklyFit(observedSpanPp) {
   // An unrecorded span cannot be promoted to primary evidence. It remains an
   // outlined diagnostic so a missing measurement is never silently discarded.
-  return observedSpanPp !== null && observedSpanPp >= WEEKLY_WELL_OBSERVED_SPAN_PP;
+  return observedSpanPp !== null && observedSpanPp >= activeWeeklyMinimumObservedSpanPp;
 }
 
-function renderWeeklyPricingReceipt(data) {
-  const pricing = data.pricing ?? {};
-  const registryVersion = pricing.registryVersion || "reviewed official price table";
-  const reviewedAt = pricing.registryObservedAt
-    ? `reviewed ${formatLocal(pricing.registryObservedAt, { dateOnly: true })}`
-    : "with no review date returned";
-  const rebuiltAt = data.artifactStatus?.weekly?.generatedAt
-    ? ` The fits were last rebuilt ${formatLocal(data.artifactStatus.weekly.generatedAt)}.`
-    : "";
-  const currentPriceSensitivity = pricing.priceEpochBasis
-    === "current_price_sensitivity_at_registry_observation";
-  const title = $("#weekly-pricing-receipt-title");
-  const copy = $("#weekly-pricing-receipt-copy");
+/**
+ * The one presentation model for the allowance history in the dashboard and
+ * on the share card. It deliberately contains only derived numerical evidence
+ * and date-only labels, so both surfaces inherit the same inclusion, range,
+ * point-classification, and axis decisions without exposing source rows.
+ */
+function allowanceHistoryChartModel(data, {
+  rangeDays = activeWeeklyRangeDays,
+} = {}) {
+  const summary = data?.weekly?.summary ?? {};
+  const estimate = finite(summary.median_weekly_value_usd ?? summary.medianWeeklyValueUsd);
+  const lower = finite(summary.lower_80_across_resets_usd ?? summary.lower80Usd);
+  const upper = finite(summary.upper_80_across_resets_usd ?? summary.upper80Usd);
+  const allPoints = (Array.isArray(data?.weekly?.weeklyValues) ? data.weekly.weeklyValues : [])
+    .map((row, index) => {
+      const at = Date.parse(row?.last_observed_at ?? row?.first_observed_at ?? "");
+      const value = finite(row?.value_usd ?? row?.value);
+      const observedSpanPp = finite(row?.displayed_span_pp);
+      if (!Number.isFinite(at) || value === null) return null;
+      return Object.freeze({
+        timestamp: row?.last_observed_at ?? row?.first_observed_at,
+        at,
+        dateLabel: shareCardDateLabel(at),
+        resetDueAt: row?.reset_due_at ?? row?.resetAt ?? null,
+        value,
+        low: finite(row?.pairwise_p10_usd ?? row?.lower),
+        high: finite(row?.pairwise_p90_usd ?? row?.upper),
+        observedSpanPp,
+        wellObserved: isWellObservedWeeklyFit(observedSpanPp),
+        historicalMedian: estimate,
+        acrossResetLow: lower,
+        acrossResetHigh: upper,
+        index,
+      });
+    })
+    .filter((point) => point !== null)
+    .sort((left, right) => left.at - right.at);
+  const latestObservedAt = allPoints.at(-1)?.at ?? null;
+  const validRangeDays = Number.isFinite(rangeDays) && rangeDays > 0 ? rangeDays : null;
+  const boundedRangeDays = validRangeDays !== null
+    && validRangeDays < ALL_HISTORY_RANGE_DAYS
+    ? validRangeDays
+    : null;
+  const cutoffAt = latestObservedAt === null || validRangeDays === null
+    ? Number.NEGATIVE_INFINITY
+    : latestObservedAt - validRangeDays * 24 * 60 * 60 * 1_000;
+  // A 7-day window over a roughly weekly per-reset series holds one or two
+  // fits at most, and the shared span slider then filtered those away almost
+  // every time, so the 7d button was near-guaranteed to show an empty chart
+  // (estimator audit, 2026-08-08). Short ranges therefore relax the span
+  // floor to zero: every fit in range draws, with short observations keeping
+  // their outlined diagnostic styling. The effective floor travels with the
+  // model so the hero sentence, the chart caption, and the share card all
+  // describe the filter that actually applied.
+  const spanFloorPp = boundedRangeDays !== null && boundedRangeDays <= 7
+    ? 0
+    : activeWeeklyMinimumObservedSpanPp;
+  const inRange = allPoints.filter((point) => point.at >= cutoffAt);
+  const points = inRange.filter((point) => (
+    spanFloorPp === 0
+      || (point.observedSpanPp !== null
+        && point.observedSpanPp >= spanFloorPp)
+  ));
+  const axis = allowanceHistoryAxis(points);
+  return Object.freeze({
+    allPoints: Object.freeze(allPoints),
+    points: Object.freeze(points),
+    axis,
+    xTicks: allowanceHistoryDateTicks(points),
+    // The population facts the sentences around this model state: the corpus
+    // size, how many fits fall in the selected range, the span floor that was
+    // actually applied, the bounded range (null for "All"), and the newest
+    // fit the range is anchored at.
+    totalCount: allPoints.length,
+    inRangeCount: inRange.length,
+    spanFloorPp,
+    rangeDays: boundedRangeDays,
+    anchorAt: latestObservedAt,
+  });
+}
 
-  if (!currentPriceSensitivity) {
-    title.textContent = "Price epoch was not verified";
-    copy.textContent = `This build returned ${registryVersion}, ${reviewedAt}, but not the price epoch used for the fits. The app will not claim that a recent price change was applied until that evidence is present.${rebuiltAt}`;
-    return;
+/**
+ * Keep both renderers on the same vertical scale. This is the dashboard's
+ * former chart-domain calculation expressed once: fitted values, across-reset
+ * range, and each measured sensitivity range all count toward the domain.
+ */
+function allowanceHistoryAxis(points) {
+  const values = (Array.isArray(points) ? points : [])
+    .flatMap((point) => [
+      finite(point?.value),
+      finite(point?.historicalMedian),
+      finite(point?.acrossResetLow),
+      finite(point?.acrossResetHigh),
+      finite(point?.low),
+      finite(point?.high),
+    ])
+    .filter((value) => value !== null);
+  let low = Math.min(...values);
+  let high = Math.max(...values);
+  if (!Number.isFinite(low) || !Number.isFinite(high)) {
+    low = 0;
+    high = 1;
+  }
+  if (low === high) {
+    low -= 1;
+    high += 1;
+  }
+  const padding = (high - low) * .1;
+  low -= padding;
+  high += padding;
+  // Tick values a person could have chosen: snap outward to a 1/2/2.5/5-step
+  // grid instead of slicing the raw data range into equal fourths, which
+  // printed amounts like $1,006 and $2,447 on a dollar axis.
+  const rawStep = (high - low) / 4;
+  const magnitude = 10 ** Math.floor(Math.log10(rawStep));
+  const step = [1, 2, 2.5, 5, 10]
+    .map((base) => base * magnitude)
+    .find((candidate) => candidate >= rawStep) ?? rawStep;
+  const firstTick = Math.max(0, Math.floor(low / step) * step);
+  const lastTick = Math.ceil(high / step) * step;
+  const ticks = [];
+  for (let value = lastTick; value >= firstTick - step / 2; value -= step) {
+    ticks.push(Math.round(value * 100) / 100);
+  }
+  return Object.freeze({
+    low: firstTick,
+    high: lastTick,
+    ticks: Object.freeze(ticks),
+  });
+}
+
+/**
+ * Four evenly spaced date labels are legible in both the interactive view and
+ * a posted image. They are based on the selected history domain rather than
+ * on the density of reset fits.
+ */
+function allowanceHistoryDateTicks(points, maximum = 4) {
+  const first = points?.[0]?.at;
+  const last = points?.at(-1)?.at;
+  if (!Number.isFinite(first) || !Number.isFinite(last)) return Object.freeze([]);
+  // Ticks take their resolution from the span they cover, so a month of resets
+  // reads "Jan 5" while a multi-year history reads "Jan 2026" instead of every
+  // tick repeating a full date.
+  const spanMs = Math.max(0, last - first);
+  if (last <= first) {
+    return Object.freeze([
+      Object.freeze({
+        at: first,
+        label: formatChartTimeLabel(first, { spanMs }),
+        alignment: "middle",
+      }),
+    ]);
+  }
+  return Object.freeze(Array.from({ length: maximum }, (_, index) => {
+    const at = first + spanMs * index / (maximum - 1);
+    return Object.freeze({
+      at,
+      label: formatChartTimeLabel(at, { spanMs }),
+      alignment: index === 0 ? "start" : index === maximum - 1 ? "end" : "middle",
+    });
+  }));
+}
+
+function weeklySpanLabel() {
+  return activeWeeklyMinimumObservedSpanPp === 0
+    ? t("weekly.span.all")
+    : t("weekly.span.minimum", {
+      span: formatDecimal(activeWeeklyMinimumObservedSpanPp, 0),
+    });
+}
+
+// Sentences describe the floor the model actually applied, not the slider
+// position: a short range relaxes the floor to zero, and a caption that kept
+// naming the slider's floor would describe points the chart is not drawing.
+function spanFloorSentenceLabel(spanFloorPp) {
+  return spanFloorPp === 0
+    ? t("weekly.span.none")
+    : t("weekly.span.minimum", {
+      span: formatDecimal(spanFloorPp, 0),
+    });
+}
+
+
+function weeklyObservedSeriesLabel() {
+  return activeWeeklyMinimumObservedSpanPp === 0
+    ? { key: "weekly.series.allSpans" }
+    : {
+      key: "weekly.series.wellObserved",
+      values: { span: formatDecimal(activeWeeklyMinimumObservedSpanPp, 0) },
+    };
+}
+
+function weeklyPointDetail(point) {
+  return {
+    key: "weekly.point.detail",
+    values: {
+      span: formatPp(point.observedSpanPp),
+      low: formatMoney(point.low),
+      high: formatMoney(point.high),
+    },
+  };
+}
+
+function renderAllowanceHistoryChart(history) {
+  return lineChart({
+    points: history.points,
+    series: [
+      {
+        key: "historicalMedian",
+        className: "chart-line-weekly-center",
+        label: { key: "weekly.series.allDataMedian" },
+        // A flat reference line: one value repeated at every x, so a dot per
+        // point would say nothing the line does not already say.
+        pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+        lineFocusable: true,
+        lineDetail: (points) => ({
+          key: "share.resetFit",
+          plural: points.length,
+        }),
+        format: (value) => formatMoney(value),
+      },
+      {
+        key: "value",
+        className: "chart-point-weekly-mature",
+        label: weeklyObservedSeriesLabel(),
+        connect: false,
+        // Each dot is one observed seven-day reset. These are the plotted
+        // points the chart exists to show; a shared "hide markers" flag once
+        // turned every one of them into an invisible hit target. `markerRadius`
+        // still splits well-observed from short observations across the two
+        // point series, so exactly one of the pair draws each estimate.
+        pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
+        format: (value) => formatMoney(value),
+        detail: weeklyPointDetail,
+        markerRadius: (point) => point.wellObserved ? 4 : 0,
+      },
+      {
+        key: "value",
+        className: "chart-point-weekly-partial",
+        label: { key: "weekly.series.shortObservation" },
+        connect: false,
+        pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
+        format: (value) => formatMoney(value),
+        detail: weeklyPointDetail,
+        markerRadius: (point) => point.wellObserved ? 0 : 4,
+      },
+    ],
+    confidence: {
+      low: "acrossResetLow",
+      high: "acrossResetHigh",
+      label: { key: "weekly.series.acrossResetRange" },
+      format: (value) => formatMoney(value),
+    },
+    errorBars: {
+      low: "low",
+      high: "high",
+      className: "chart-error-bar-weekly",
+      label: { key: "weekly.series.measuredRange" },
+      tooltip: false,
+    },
+    xDomain: {
+      startMs: history.points[0]?.at,
+      endMs: history.points.at(-1)?.at,
+    },
+    xTicks: history.xTicks,
+    yDomain: history.axis,
+    yTickFormat: (value, digits) => formatMoney(value, digits),
+    yLabel: { key: "chart.axis.apiEquivalentPerSevenDays" },
+    title: { key: "weekly.chart.title" },
+    description: {
+      key: "weekly.chart.description",
+      values: {
+        span: spanFloorSentenceLabel(history.spanFloorPp),
+        timeZone: formatTimeZoneLabel(),
+      },
+    },
+  });
+}
+
+// The local pace engine is deliberately optional. Older companions and
+// community/demo payloads do not carry this field, so the card is mounted
+// lazily and remains hidden unless the engine returns current, safe weekly
+// allowance evidence. One clean observation gets a quiet collecting state;
+// this presentation never calls the allowance "tokens" and does not turn a
+// pace estimate into a probability.
+function firstFiniteForecastNumber(...values) {
+  for (const value of values) {
+    const number = finite(value);
+    if (number !== null) return number;
+  }
+  return null;
+}
+
+function forecastTimestamp(...values) {
+  for (const value of values) {
+    if (value instanceof Date && Number.isFinite(value.valueOf())) {
+      return value.valueOf();
+    }
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && value.length > 0) {
+      const timestamp = Date.parse(value);
+      if (Number.isFinite(timestamp)) return timestamp;
+    }
+  }
+  return null;
+}
+
+function formatForecastDuration(hours) {
+  const value = finite(hours);
+  if (value === null || value <= 0) return null;
+  const totalMinutes = Math.max(1, Math.ceil(value * 60));
+  const days = Math.floor(totalMinutes / 1_440);
+  const remainingHours = Math.floor((totalMinutes % 1_440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days}d ${remainingHours}h`;
+  if (remainingHours > 0) return `${remainingHours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
+function ensureWeeklyPaceForecastCard() {
+  const hero = $(".weekly-hero");
+  if (!hero?.parentNode) return null;
+  let card = $("#weekly-pace-forecast");
+  if (!card) {
+    card = node("aside", "weekly-pace-forecast");
+    card.id = "weekly-pace-forecast";
+    card.setAttribute("aria-live", "polite");
+    card.setAttribute("aria-atomic", "true");
+    hero.parentNode.insertBefore(card, hero.nextSibling);
+  }
+  return card;
+}
+
+function weeklyPaceDirection(percentagePointsPerHour, baseline = null) {
+  const pace = finite(percentagePointsPerHour);
+  const steady = firstFiniteForecastNumber(
+    baseline,
+    // A seven-day allowance paced evenly across its full window is the only
+    // baseline this card can derive without inventing a user schedule.
+    100 / (CODEX_WEEKLY_ALLOWANCE_MINUTES / 60),
+  );
+  if (pace === null || steady === null || steady <= 0) return null;
+  if (pace > steady * 1.1) return "Recent pace is ahead of a steady weekly pace.";
+  if (pace < steady * .9) return "Recent pace is behind a steady weekly pace.";
+  return "Recent pace is close to a steady weekly pace.";
+}
+
+function renderWeeklyPaceForecast(data) {
+  const card = ensureWeeklyPaceForecastCard();
+  if (!card) return;
+  card.hidden = true;
+  card.className = "weekly-pace-forecast";
+  card.removeAttribute("aria-labelledby");
+  clear(card);
+
+  const forecast = data?.weekly?.paceForecast;
+  if (!forecast || typeof forecast !== "object" || Array.isArray(forecast)) return;
+  const pace = forecast.pace && typeof forecast.pace === "object"
+    ? forecast.pace
+    : {};
+  const rawStatus = String(forecast.status ?? forecast.state ?? "")
+    .trim()
+    .toLowerCase();
+  const status = rawStatus === "reset_before_exhaustion"
+    ? "will_reach_reset_first"
+    : rawStatus;
+  const resetAt = forecastTimestamp(
+    forecast.resetsAt,
+    forecast.resetAt,
+    forecast.reset_at,
+  );
+  const now = Date.now();
+  if (resetAt === null || resetAt <= now) return;
+
+  let remaining = firstFiniteForecastNumber(
+    forecast.remainingPercent,
+    forecast.remaining_percentage,
+    forecast.currentRemainingPercent,
+  );
+  const used = firstFiniteForecastNumber(
+    forecast.currentUsedPercent,
+    forecast.usedPercent,
+    forecast.current_used_percent,
+  );
+  if (remaining === null && used !== null) remaining = 100 - used;
+  if (remaining !== null && (remaining < 0 || remaining > 100)) remaining = null;
+
+  const percentagePointsPerHour = firstFiniteForecastNumber(
+    pace.percentagePointsPerHour,
+    pace.percentPerHour,
+    pace.pacePercentPerHour,
+    forecast.percentagePointsPerHour,
+    forecast.pacePercentPerHour,
+    forecast.pacePpPerHour,
+  );
+  const hoursToReset = firstFiniteForecastNumber(
+    (resetAt - now) / 3_600_000,
+    forecast.hoursToReset,
+    forecast.resetHours,
+  );
+  const suppliedHoursToExhaustion = firstFiniteForecastNumber(
+    forecast.hoursToExhaustion,
+    forecast.hoursToAllowance,
+    forecast.etaHours,
+  );
+  let etaAt = forecastTimestamp(
+    forecast.etaAt,
+    forecast.exhaustionAt,
+    forecast.allowanceAt,
+  );
+  if (etaAt === null && suppliedHoursToExhaustion !== null && suppliedHoursToExhaustion > 0) {
+    etaAt = now + suppliedHoursToExhaustion * 3_600_000;
+  }
+  const available = status === "available"
+    || (status === "" && etaAt !== null && percentagePointsPerHour !== null);
+  const reachesResetFirst = status === "will_reach_reset_first"
+    || status === "reset_before_exhaustion";
+  const paceIntervals = firstFiniteForecastNumber(pace.sampleCount);
+  const observations = firstFiniteForecastNumber(
+    forecast.observationCount,
+    forecast.observations,
+    forecast.sampleCount,
+    paceIntervals === null ? null : paceIntervals + 1,
+  );
+  const paceElapsedHours = firstFiniteForecastNumber(pace.elapsedHours);
+  // A single trusted snapshot cannot establish a rate, but it is useful to
+  // say why the forecast is not visible yet. Do not surface an unbounded or
+  // otherwise unusable engine result as a generic empty state.
+  const collectingEvidence = status === "insufficient_observations"
+    && observations === 1;
+  const earlyEstimate = available && (
+    (observations !== null && observations <= 2)
+    || (paceElapsedHours !== null && paceElapsedHours < 1)
+  );
+  // A contradiction between the status and dates is an integration error, not
+  // a reason to show a confident-looking card. Wait for the next refresh.
+  if (available && (etaAt === null || etaAt <= now || etaAt > resetAt)) return;
+  if (!available && !reachesResetFirst && !collectingEvidence) return;
+  if (collectingEvidence && remaining === null) return;
+  if (!collectingEvidence
+      && remaining === null
+      && percentagePointsPerHour === null
+      && !reachesResetFirst) return;
+
+  const title = node("h3", "weekly-pace-forecast-title");
+  const cardId = "weekly-pace-forecast-title";
+  title.id = cardId;
+  title.textContent = collectingEvidence
+    ? "Pace estimate ready after one more refresh"
+    : reachesResetFirst
+      ? "At the recent pace, the weekly allowance should last to reset"
+      : etaAt === null
+        ? "At this pace: weekly allowance exhaustion is approaching"
+        : `At this pace: reaches weekly allowance ${formatReportingTime(etaAt)}`;
+  card.setAttribute("aria-labelledby", cardId);
+
+  const heading = node("div", "weekly-pace-forecast-heading");
+  heading.append(
+    node(
+      "p",
+      "panel-kicker",
+      collectingEvidence ? "Collecting forecast evidence" : "Forecast from recent pace",
+    ),
+    node(
+      "span",
+      collectingEvidence
+        ? "evidence-chip weekly-pace-forecast-collecting-chip"
+        : earlyEstimate
+          ? "evidence-chip weekly-pace-forecast-early-chip"
+          : "evidence-chip",
+      collectingEvidence ? "One more refresh" : earlyEstimate ? "Early estimate" : "Observed pace",
+    ),
+  );
+
+  const direction = weeklyPaceDirection(
+    percentagePointsPerHour,
+    firstFiniteForecastNumber(
+      pace.steadyPercentagePointsPerHour,
+      forecast.steadyPercentagePointsPerHour,
+    ),
+  );
+  const copy = node("p", "weekly-pace-forecast-copy");
+  copy.textContent = collectingEvidence
+    ? "One clean weekly allowance observation is saved. The next fresh observation for this account and reset will establish its pace."
+    : earlyEstimate
+      ? "This is an early estimate from a small amount of recent evidence; it will settle as more observations arrive."
+      : direction ?? (reachesResetFirst
+        ? "Recent allowance movement is not fast enough to exhaust this window before its reset."
+        : "The estimate uses the latest clean allowance observations.");
+
+  const metrics = node("div", "weekly-pace-forecast-metrics");
+  if (remaining !== null) {
+    metrics.append(
+      node("div", "weekly-pace-forecast-metric", "Allowance left"),
+    );
+    const item = metrics.lastElementChild;
+    item.replaceChildren(
+      node("span", "", "Allowance left"),
+      node("strong", "", formatPercent(remaining)),
+    );
+  }
+  const resetDuration = formatForecastDuration(hoursToReset);
+  if (resetDuration) {
+    metrics.append(
+      node("div", "weekly-pace-forecast-metric"),
+    );
+    const item = metrics.lastElementChild;
+    item.append(
+      node("span", "", "Reset"),
+      node("strong", "", `in ${resetDuration}`),
+    );
+  }
+  if (collectingEvidence) {
+    metrics.append(
+      node("div", "weekly-pace-forecast-metric"),
+    );
+    const item = metrics.lastElementChild;
+    item.append(
+      node("span", "", "Evidence"),
+      node("strong", "", "1 saved"),
+    );
+  } else if (percentagePointsPerHour !== null && percentagePointsPerHour > 0) {
+    metrics.append(
+      node("div", "weekly-pace-forecast-metric"),
+    );
+    const item = metrics.lastElementChild;
+    item.append(
+      node("span", "", "Recent pace"),
+      node("strong", "", `${formatDecimal(percentagePointsPerHour, 1)} pp/hour`),
+    );
   }
 
-  title.textContent = "Current official prices are applied to every fit";
-  const julyThirtyRepricing = pricing.registryVersion === "app-official-api-prices-v0.2"
-    ? " It includes the lower GPT-5.6 Terra and Luna prices effective July 30."
-    : "";
-  copy.textContent = `Every visible fit, including the newest, uses ${registryVersion}, ${reviewedAt}; this is not a stale pre-change calculation.${julyThirtyRepricing}${rebuiltAt}`;
+  const observationDuration = formatForecastDuration(paceElapsedHours);
+  const evidence = observations !== null && observations >= 1
+    ? node(
+      "p",
+      "weekly-pace-forecast-evidence",
+      collectingEvidence
+        ? "One fresh allowance observation is saved for this weekly reset."
+        : `Based on ${Math.round(observations)} recent allowance observation${Math.round(observations) === 1 ? "" : "s"}${observationDuration ? ` over ${observationDuration}` : ""}.`,
+    )
+    : null;
+  card.className = [
+    "weekly-pace-forecast",
+    collectingEvidence
+      ? "is-insufficient"
+      : reachesResetFirst
+        ? "is-reset-first"
+        : "is-available",
+    earlyEstimate ? "is-early-estimate" : "",
+  ].filter(Boolean).join(" ");
+  card.append(heading, title, copy, metrics);
+  if (evidence) card.append(evidence);
+  card.hidden = false;
 }
 
 function renderWeekly(data) {
-  renderWeeklyPricingReceipt(data);
+  renderWeeklyPaceForecast(data);
   const summary = data.weekly.summary ?? {};
   const estimate = finite(summary.median_weekly_value_usd ?? summary.medianWeeklyValueUsd);
   const lower = finite(summary.lower_80_across_resets_usd ?? summary.lower80Usd);
   const upper = finite(summary.upper_80_across_resets_usd ?? summary.upper80Usd);
   const qualifying = finite(summary.qualifying_resets ?? summary.qualifyingResets, 0);
-  $("#weekly-estimate").textContent = estimate === null ? "Insufficient evidence" : `${formatMoney(estimate)} API equivalent`;
-  $("#weekly-range").textContent = lower === null || upper === null
-    ? "No evidence interval available"
-    : `80% across-reset range: ${formatMoney(lower)}–${formatMoney(upper)}`;
-  const accountAttributionIsUnavailable =
-    data.weekly.accountAttribution?.status === "historical_unattributed";
-  const evidenceExplanation = qualifying
-    ? `${qualifying} reset estimates. Filled dots have ${WEEKLY_WELL_OBSERVED_SPAN_PP}+ observed percentage points; outlined dots are shorter observations.`
-    : "The estimate will appear when enough quota transitions can be matched to priced usage.";
-  $("#weekly-explanation").textContent = accountAttributionIsUnavailable
-    ? `${evidenceExplanation} Account attribution is unavailable for these historical fits.`
-    : evidenceExplanation;
 
-  const values = data.weekly.weeklyValues.map((row, index) => {
-    const value = finite(row.value_usd ?? row.value);
-    const observedSpanPp = finite(row.displayed_span_pp);
-    return {
-    ...row,
-    timestamp: row.last_observed_at ?? row.first_observed_at,
-    resetDueAt: row.reset_due_at ?? row.resetAt ?? null,
-    value,
-    low: finite(row.pairwise_p10_usd ?? row.lower),
-    high: finite(row.pairwise_p90_usd ?? row.upper),
-    observedSpanPp,
-    historicalMedian: estimate,
-    acrossResetLow: lower,
-    acrossResetHigh: upper,
-    matureValue: isWellObservedWeeklyFit(observedSpanPp) ? value : null,
-    provisionalValue: isWellObservedWeeklyFit(observedSpanPp) ? null : value,
-    index
-    };
-  }).filter((row) => row.timestamp && row.value !== null)
-    .sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
-  const latestObservedMs = values.reduce(
-    (latest, row) => Math.max(latest, Date.parse(row.timestamp)),
-    Number.NEGATIVE_INFINITY,
-  );
-  const cutoffMs = Number.isFinite(latestObservedMs)
-    ? latestObservedMs - activeWeeklyRangeDays * 24 * 60 * 60 * 1_000
-    : Number.NEGATIVE_INFINITY;
-  const rangedValues = values.filter((row) => Date.parse(row.timestamp) >= cutoffMs);
-  const chartValues = rangedValues;
-  $("#weekly-partial-legend").hidden = !chartValues.some((row) => row.provisionalValue !== null);
+  const history = allowanceHistoryChartModel(data);
+  const values = history.allPoints;
+  const chartValues = history.points;
+
+  // The headline is a stable all-data median. The range buttons and the
+  // minimum-observed-span slider filter the chart and nothing else, so the two
+  // numbers could differ by hundreds of dollars with nothing on screen saying
+  // why. They now say so: the hero names its population, and the sentence
+  // underneath reports how much of that population the chart is drawing. The
+  // headline is deliberately not made to follow the filter — a figure people
+  // quote should not move when they adjust a chart control.
+  setLocalizedText($("#weekly-estimate-label"), "weekly.headline.label");
+  $("#weekly-estimate").textContent = estimate === null
+    ? t("weekly.headline.insufficient")
+    : t("weekly.headline.value", { amount: formatMoney(estimate) });
+  $("#weekly-range").textContent = lower === null || upper === null
+    ? t("weekly.headline.rangeUnavailable")
+    : t("weekly.headline.range", {
+      lower: formatMoney(lower),
+      upper: formatMoney(upper),
+    });
+  $("#weekly-explanation").textContent = qualifying
+    ? t("weekly.headline.relationship", {
+      qualifying: formatDecimal(qualifying, 0),
+      shown: formatDecimal(chartValues.length, 0),
+      total: formatDecimal(values.length, 0),
+      // The floor the model actually applied — a short range relaxes it —
+      // and the newest fit the range is anchored at, so "7d" reads as seven
+      // days back from that fit rather than from today (estimator audit,
+      // 2026-08-08).
+      span: spanFloorSentenceLabel(history.spanFloorPp),
+      anchor: history.anchorAt === null
+        ? "—"
+        : shareCardDateLabel(history.anchorAt),
+    })
+    : t("weekly.headline.pending");
+
+  setLocalizedText($("#weekly-chart-timezone"), "chart.timeZoneNote", {
+    timeZone: formatTimeZoneLabel(),
+  });
+  $("#weekly-span-value").textContent = weeklySpanLabel();
+  $("#weekly-span-legend").textContent = chartText(weeklyObservedSeriesLabel());
+  $("#weekly-partial-legend").hidden = !chartValues.some((row) => !row.wellObserved);
   const empty = $("#weekly-empty");
   const shell = $("#weekly-chart");
   if (!chartValues.length) {
     empty.hidden = false;
     shell.hidden = true;
-    empty.textContent = "No weekly estimates loaded.";
+    // An empty chart names its reason instead of the generic sentence: either
+    // no fits fall in the selected range at all, or fits are in range and the
+    // span floor filtered every one of them (estimator audit, 2026-08-08).
+    if (values.length === 0) {
+      setLocalizedText(empty, "weekly.chart.empty");
+    } else if (history.inRangeCount === 0) {
+      setLocalizedText(empty, "weekly.chart.emptyRange");
+    } else {
+      setLocalizedPluralText(
+        empty,
+        "weekly.chart.emptyBelowFloor",
+        history.inRangeCount,
+        { span: formatDecimal(history.spanFloorPp, 0) },
+      );
+    }
   } else {
     empty.hidden = true;
     shell.hidden = false;
-    shell.replaceChildren(lineChart({
-      points: chartValues,
-      series: [
-        {
-          key: "historicalMedian",
-          className: "chart-line-weekly-center",
-          label: "Historical median",
-        },
-        {
-          key: "matureValue",
-          className: "chart-point-weekly-mature",
-          label: `Observed across ${WEEKLY_WELL_OBSERVED_SPAN_PP}+ points`,
-          connect: false,
-          markers: true,
-          tooltip: false,
-        },
-        {
-          key: "provisionalValue",
-          className: "chart-point-weekly-partial",
-          label: "Short observation",
-          connect: false,
-          markers: true,
-          tooltip: false,
-        },
-      ],
-      confidence: { low: "acrossResetLow", high: "acrossResetHigh" },
-      errorBars: {
-        low: "low",
-        high: "high",
-        className: "chart-error-bar-weekly",
-        label: "Measured range",
-        tooltip: false,
-      },
-      yLabel: "API-equivalent USD",
-      title: "Seven-day allowance estimate history",
-      description: `One dot per distinct seven-day reset estimate, plotted when observed in ${USER_TIME_ZONE}. Filled dots use at least ${WEEKLY_WELL_OBSERVED_SPAN_PP} displayed percentage points; outlined dots are shorter observations. Each vertical bar is that reset's measured range.`
-    }));
+    shell.replaceChildren(renderAllowanceHistoryChart(history));
   }
   renderWeeklyTable(values);
+  // The chart renderer owns the card re-render (owner-verified regression,
+  // 2026-08-08). The old wiring re-rendered the card only where a caller
+  // remembered to, so a path that redrew the chart without the extra call
+  // left the card describing the previous filters. Every path that renders
+  // the allowance history — the range buttons, the span slider, a dashboard
+  // load, a locale change — now redraws the card from the SAME model
+  // instance, so the two surfaces cannot disagree.
+  renderShareCard(data, { history });
 }
 
 function renderWeeklyTable(values) {
@@ -2795,7 +6004,7 @@ function renderWeeklyTable(values) {
   clear(table);
   if (!values.length) {
     const row = node("tr");
-    const cell = node("td", "empty-cell", "No weekly evidence loaded.");
+    const cell = node("td", "empty-cell", t("weekly.table.empty"));
     cell.colSpan = 5;
     row.append(cell);
     table.append(row);
@@ -2804,8 +6013,10 @@ function renderWeeklyTable(values) {
   for (const row of values.slice(-14).reverse()) {
     const span = row.observedSpanPp ?? finite(row.displayed_span_pp);
     const status = isWellObservedWeeklyFit(span)
-      ? "Well observed"
-      : span === null ? "Span not recorded" : "Short observation";
+      ? t("weekly.table.wellObserved")
+      : span === null
+        ? t("weekly.table.spanNotRecorded")
+        : t("weekly.series.shortObservation");
     const evidenceDate = formatLocal(row.timestamp, { dateOnly: true });
     const tr = node("tr");
     tr.append(
@@ -2820,23 +6031,54 @@ function renderWeeklyTable(values) {
 }
 
 function accountingPeriod(data) {
-  const selected = data.accounting.periods.find(
-    (period) => period.periodId === activeAccountingPeriod
+  const periods = Array.isArray(data?.accounting?.periods)
+    ? data.accounting.periods
+    : [];
+  const selected = periods.find(
+    (period) => period?.periodId === activeAccountingPeriod,
   );
-  return selected
-    ? {
-      ...data.accounting,
-      ...selected,
-      replayExclusionDiagnostics: data.accounting.replayExclusionDiagnostics,
-      accountingSource: data.accounting.accountingSource
-    }
-    : data.accounting;
+  if (!selected) return null;
+  return {
+    ...data.accounting,
+    ...selected,
+    replayExclusionDiagnostics: data.accounting.replayExclusionDiagnostics,
+    accountingSource: data.accounting.accountingSource,
+  };
+}
+
+function syncAccountingPeriodControls(data) {
+  const controls = $("#accounting-period-controls");
+  if (!controls) return;
+  const periods = Array.isArray(data?.accounting?.periods)
+    ? data.accounting.periods
+    : [];
+  const available = new Set(
+    periods
+      .map((period) => period?.periodId)
+      .filter((periodId) => typeof periodId === "string" && periodId !== ""),
+  );
+  if (!available.has(activeAccountingPeriod)) {
+    activeAccountingPeriod = selectAvailableAccountingPeriod(periods, activeAccountingPeriod);
+  }
+  for (const control of controls.querySelectorAll("button")) {
+    const periodId = control.dataset.period;
+    const present = available.has(periodId);
+    // The indexed-history option is a capability, not a promise made by the
+    // static page. If the payload does not carry it, keep the control out of
+    // the UI rather than making the 31-day cache look like full history.
+    control.hidden = periodId === "history" && !present;
+    control.disabled = !present;
+    control.setAttribute("aria-disabled", String(!present));
+    const active = present && periodId === activeAccountingPeriod;
+    control.classList.toggle("active", active);
+    control.setAttribute("aria-pressed", String(active));
+  }
 }
 
 function renderAccountingDimension(containerSelector, dimension, {
   emptyMessage = "No observations in this period.",
   unknownLabel = "Not recorded",
-  eventNoun = "usage increments",
+  eventNoun = "usage changes",
   labels = {}
 } = {}) {
   const container = $(containerSelector);
@@ -2886,25 +6128,54 @@ function renderAccountingDimension(containerSelector, dimension, {
   }
 }
 
+function renderAccountingComponentBars(containerSelector, rows, {
+  emptyMessage,
+  valueFor,
+  displayValue,
+  titleFor = () => ""
+}) {
+  const container = $(containerSelector);
+  clear(container);
+  if (!rows.length) {
+    container.append(node("p", "empty-inline", emptyMessage));
+    return;
+  }
+  const maximum = Math.max(1, ...rows.map(valueFor));
+  for (const rowData of rows) {
+    const value = valueFor(rowData);
+    const row = node("div", "component-row");
+    const label = node("span", "", componentLabel(rowData.key));
+    const title = titleFor(rowData);
+    if (title) label.title = title;
+    const track = node("div", "component-track");
+    const fill = node("i");
+    fill.style.width = `${Math.max(value > 0 ? 1 : 0, value / maximum * 100)}%`;
+    track.append(fill);
+    row.append(label, track, node("strong", "", displayValue(rowData)));
+    container.append(row);
+  }
+}
+
 function renderAccounting(data) {
+  syncAccountingPeriodControls(data);
   const accounting = accountingPeriod(data);
+  if (accounting === null) {
+    clear($("#accounting-summary"));
+    clear($("#accounting-component-counts"));
+    clear($("#accounting-component-costs"));
+    clear($("#accounting-models"));
+    return;
+  }
   const summary = $("#accounting-summary");
   clear(summary);
-  const pricedEvents = finite(accounting.pricingCoverage?.fullyPricedEvents, 0)
-    + finite(accounting.pricingCoverage?.partiallyPricedEvents, 0);
-  const replayExcluded = finite(
-    accounting.replayExclusionDiagnostics?.forkReplayEventsExcluded,
-    0
-  );
+  // Price coverage used to sit here as a third headline metric. It now reads
+  // as a caption under the model table instead: with every retained usage
+  // change priced at the rate in effect when it occurred, coverage is a
+  // reassurance rather than a number worth a card, and when it is not complete
+  // the rows that lack a price are the useful thing to be standing next to.
   const fastMode = accounting.fastMode;
   const weighted = accounting.quotaWeightedApiPriceEquivalentUsd;
   for (const [label, explanation, value, note] of [
-    [
-      "Usage increments",
-      "Separate measured changes in usage. Repeated history is removed before this count is calculated.",
-      compact(accounting.events),
-      "Measured changes, not messages or log rows"
-    ],
     [
       fastMode.metricShortLabel,
       "A public API-price measuring stick for the usage observed locally. It is not a bill or a subscription limit.",
@@ -2914,22 +6185,10 @@ function renderAccounting(data) {
         : `${formatApiMoney(accounting.apiPriceEquivalentUsd)} at Standard rates before Fast weighting`
     ],
     [
-      "Tokens measured",
-      "The tokens attached to those measured changes during the selected time period.",
+      "Tokens",
+      "The tokens attached to those usage changes during the selected time period.",
       compact(accounting.totalTokens),
       accounting.periodLabel
-    ],
-    [
-      "Repeated history removed",
-      "Events inherited from a parent rollout that would otherwise count the same work twice.",
-      compact(replayExcluded),
-      "Excluded before totals are calculated"
-    ],
-    [
-      "Price coverage",
-      "The share of measured changes with a known public API price. Unknown prices are left out rather than guessed.",
-      formatPercent(pricedEvents / Math.max(1, accounting.events) * 100, 1),
-      "Measured changes with a mapped price"
     ]
   ]) {
     const card = node("article", "metric-card compact-metric");
@@ -2943,91 +6202,242 @@ function renderAccounting(data) {
     summary.append(card);
   }
 
-  const components = $("#accounting-components");
-  clear(components);
-  const componentRows = Object.entries(accounting.components ?? {})
-    .filter(([, value]) => value > 0)
-    .sort((left, right) => right[1] - left[1]);
-  const maximum = Math.max(1, ...componentRows.map(([, value]) => value));
-  for (const [key, value] of componentRows) {
-    const row = node("div", "component-row");
-    row.append(node("span", "", componentLabel(key)));
-    const track = node("div", "component-track");
-    const fill = node("i");
-    fill.style.width = `${Math.max(value > 0 ? 1 : 0, value / maximum * 100)}%`;
-    track.append(fill);
-    row.append(track, node("strong", "", compact(value)));
-    components.append(row);
-  }
+  const componentCountRows = Object.entries(accounting.components ?? {})
+    .filter(([, tokens]) => tokens > 0)
+    .map(([key, tokens]) => ({ key, tokens }))
+    .sort((left, right) => right.tokens - left.tokens);
+  renderAccountingComponentBars("#accounting-component-counts", componentCountRows, {
+    emptyMessage: "No token-component accounting in this period.",
+    valueFor: (row) => row.tokens,
+    displayValue: (row) => compact(row.tokens)
+  });
 
+  const componentCostRows = Object.entries(accounting.componentCosts ?? {})
+    .map(([key, value]) => ({
+      key,
+      tokens: finite(value?.tokens, 0),
+      costUsd: finite(value?.costUsd, 0)
+    }))
+    .filter((row) => row.tokens > 0 || row.costUsd > 0)
+    .sort((left, right) => right.costUsd - left.costUsd || right.tokens - left.tokens);
+  renderAccountingComponentBars("#accounting-component-costs", componentCostRows, {
+    emptyMessage: "No component costs were priced in this period.",
+    valueFor: (row) => row.costUsd,
+    displayValue: (row) => row.costUsd > 0
+      ? formatApiMoney(row.costUsd)
+      : "—",
+    titleFor: (row) => `${compact(row.tokens)} tokens`,
+  });
+
+  renderAccountingModels(accounting);
+}
+
+/**
+ * Every model identity observed in the period, across both allowance tracks.
+ *
+ * `byModel` describes the primary Codex pool only, because the separately
+ * metered Spark allowance is kept out of that pool's own totals. `modelUsage`
+ * is the combined list, each row carrying its own allowance track. Reading
+ * only `byModel` is what previously left Spark usage invisible, or collapsed
+ * into "Unrecognized model".
+ */
+function modelUsageRows(accounting) {
+  const combined = Array.isArray(accounting?.modelUsage)
+    ? accounting.modelUsage
+    : [
+      ...(accounting?.byModel ?? []),
+      ...(accounting?.spark?.byModel ?? []),
+    ];
+  return [...combined].sort((left, right) => (
+    // A separate allowance has no comparable money figure, so those rows
+    // cannot be ranked against the primary pool. They sort last.
+    Number(modelRowIsSeparateAllowance(left))
+      - Number(modelRowIsSeparateAllowance(right))
+    || finite(right.apiPriceEquivalentUsd, 0) - finite(left.apiPriceEquivalentUsd, 0)
+    || finite(right.totalTokens, 0) - finite(left.totalTokens, 0)
+    || String(left.model ?? "").localeCompare(String(right.model ?? ""))
+  ));
+}
+
+function modelRowIsSeparateAllowance(row) {
+  return row?.allowanceTrack === "spark"
+    || row?.apiPriceEquivalentApplicable === false;
+}
+
+/**
+ * The API-equivalent cell, which used to print one em dash for four different
+ * situations. They are not the same fact and a reader has to be able to tell
+ * them apart:
+ *
+ *   separate allowance - Spark is metered against its own pool, so an
+ *                        API-price equivalent is not a meaningful figure at
+ *                        all, as opposed to a missing one.
+ *   no published price - a recognised model OpenAI publishes no price card
+ *                        for. Deliberately not priced; not an error.
+ *   not priced         - an identifier this build has never reviewed. No
+ *                        price is invented for it, and it is not a zero.
+ *   not reported       - the row carried no usable number. Malformed input,
+ *                        never silently shown as zero.
+ *   a real amount      - including an honest, priced $0.00.
+ */
+function modelApiEquivalentCell(row) {
+  const cell = node("td", "model-api-equivalent");
+  if (modelRowIsSeparateAllowance(row)) {
+    setLocalizedText(cell, "accounting.model.separateAllowance");
+    cell.title = t("accounting.model.separateAllowanceTitle");
+    return cell;
+  }
+  if (row?.pricingStatus === "known_unpriced") {
+    setLocalizedText(cell, "accounting.model.noPublishedPrice");
+    cell.title = t("accounting.model.noPublishedPriceTitle");
+    return cell;
+  }
+  if (row?.pricingStatus === "unrecognized") {
+    // An identifier this build has never reviewed carries no price, and a
+    // guessed one would be worse than none. Printing "$0.00" here read as a
+    // priced zero, which is a different and untrue claim.
+    setLocalizedText(cell, "accounting.model.notPricedUnknown");
+    cell.title = t("accounting.model.notPricedUnknownTitle");
+    return cell;
+  }
+  const amount = finite(row?.apiPriceEquivalentUsd);
+  if (amount === null || amount < 0) {
+    setLocalizedText(cell, "accounting.model.notReported");
+    cell.title = t("accounting.model.notReportedTitle");
+    return cell;
+  }
+  setRawText(cell, formatApiMoney(amount));
+  if (amount === 0) cell.title = t("accounting.model.zeroTitle");
+  return cell;
+}
+
+/**
+ * Price coverage as a sentence beside the rows it describes, rather than a
+ * headline metric. `null` means the period holds no usage change at all, so
+ * there is no coverage claim to make and the caption stays off entirely.
+ */
+function pricingCoverageNote(accounting) {
+  const events = finite(accounting?.events, 0);
+  if (events <= 0) return null;
+  if (finite(accounting?.pricingCoverage?.unpricedEvents, 0) <= 0) {
+    return t("accounting.pricing.coverageReviewed");
+  }
+  const priced = finite(accounting?.pricingCoverage?.fullyPricedEvents, 0)
+    + finite(accounting?.pricingCoverage?.partiallyPricedEvents, 0);
+  return t("accounting.pricing.partialCoverage", {
+    percent: formatPercent(priced / events * 100, 1),
+  });
+}
+
+function renderAccountingModels(accounting) {
   const models = $("#accounting-models");
+  if (!models) return;
   clear(models);
-  const modelRows = [...(accounting.byModel ?? [])]
-    .sort((left, right) => right.apiPriceEquivalentUsd - left.apiPriceEquivalentUsd);
+  const coverage = $("#accounting-price-coverage");
+  if (coverage) {
+    const note = pricingCoverageNote(accounting);
+    setRawText(coverage, note ?? "");
+    coverage.hidden = note === null;
+  }
+  const modelRows = modelUsageRows(accounting);
   if (!modelRows.length) {
     const row = node("tr");
-    const cell = node("td", "empty-cell", "No model accounting in this period.");
+    const cell = localizedNode("td", "empty-cell", "accounting.model.noneInPeriod");
     cell.colSpan = 4;
     row.append(cell);
     models.append(row);
-  } else {
-    const visibleModelRows = modelRows.some((model) => model.model === "unknown")
-      ? modelRows
-      : [...modelRows, {
-        model: "unknown",
-        events: 0,
-        totalTokens: 0,
-        apiPriceEquivalentUsd: 0
-      }];
-    for (const model of visibleModelRows) {
-      const row = node("tr");
-      row.append(
-        node("td", "", model.model === "unknown" ? "Unrecognized / unpriced overflow" : model.model),
-        node("td", "", compact(model.events)),
-        node("td", "", compact(model.totalTokens)),
-        node(
-          "td",
-          "",
-          model.model === "unknown"
-            ? "—"
-            : formatApiMoney(model.apiPriceEquivalentUsd)
-        )
-      );
-      models.append(row);
-    }
+    return;
   }
-
+  for (const model of modelRows) {
+    const row = node("tr");
+    const identity = node("td", "model-identity");
+    // "Unrecognized model" now means exactly one thing: an identifier this
+    // build has never reviewed, so it is withheld rather than printed.
+    if (model.model === "unknown" || model.pricingStatus === "unrecognized") {
+      identity.append(localizedNode("span", "", "accounting.model.unrecognized"));
+    } else {
+      // The wire identifier is what the provider reported and what any
+      // support conversation will quote, so it stays reachable on hover even
+      // though the readable name is what gets printed.
+      const name = formatModelName(model.model);
+      const label = rawNode("span", "", name);
+      if (name !== model.model) label.title = model.model;
+      identity.append(label);
+    }
+    if (modelRowIsSeparateAllowance(model)) {
+      // A filled chip on every Spark row shouted the same fact once per row and
+      // crowded the identity column. One marker on the name, carrying the same
+      // sentence as its expansion and pointing at the standing footnote under
+      // the table, says it without competing with the figures.
+      const marker = rawNode("abbr", "model-allowance-marker", "*");
+      marker.title = t("accounting.model.separateAllowanceTitle");
+      identity.append(marker);
+    }
+    // One formatter for both count columns. Compact notation put "154.9K"
+    // beside "74" in the same column, which no reader can compare by eye.
+    row.append(
+      identity,
+      rawNode("td", "numeric-cell", formatCount(model.events)),
+      rawNode("td", "numeric-cell", formatCount(model.totalTokens)),
+      modelApiEquivalentCell(model),
+    );
+    models.append(row);
+  }
 }
 
 function fastModeCoverageSentence(fastMode) {
   const coverage = fastMode.coverage;
   if (coverage.totalEvents === 0) {
-    return "No usage increments in this period, so there is no speed-mode attribution to report.";
+    return t("accounting.fastMode.noUsage");
   }
   const parts = [
-    `${compact(coverage.observedEvents)} observed in the logs`,
-    `${compact(coverage.assumedFromPreferenceEvents)} attributed from your stated mode`,
-    `${compact(coverage.inferredEvents)} inferred from calibration residuals`,
-    `${compact(coverage.unknownEvents)} still unknown`
+    t("accounting.fastMode.observed", {
+      count: compact(coverage.observedEvents),
+    }),
+    t("accounting.fastMode.stated", {
+      count: compact(coverage.assumedFromPreferenceEvents),
+    }),
+    t("accounting.fastMode.inferred", {
+      count: compact(coverage.inferredEvents),
+    }),
+    t("accounting.fastMode.unknown", {
+      count: compact(coverage.unknownEvents),
+    })
   ];
   const share = coverage.unknownSharePercent === null
     ? ""
-    : ` (${formatPercent(coverage.unknownSharePercent, 1)} of increments).`;
+    : t("accounting.fastMode.unknownShare", {
+      percent: formatPercent(coverage.unknownSharePercent, 1),
+    });
   const unweighted = fastMode.unweightedUnknownApiPriceEquivalentUsd > 0
-    ? ` ${formatApiMoney(fastMode.unweightedUnknownApiPriceEquivalentUsd)} of Standard-rate cost could not be weighted and is excluded from the weighted total rather than counted at 1x.`
+    ? t("accounting.fastMode.unweighted", {
+      amount: formatApiMoney(fastMode.unweightedUnknownApiPriceEquivalentUsd),
+    })
     : "";
-  return `Of ${compact(coverage.totalEvents)} usage increments: ${parts.join(", ")}${share}${unweighted} Codex records the mode only when it is applied or changed, so turns before the first change in a session are never observed and a small structural error in the calibration cannot be engineered away.`;
+  return t("accounting.fastMode.coverage", {
+    total: compact(coverage.totalEvents),
+    parts: parts.join(", "),
+    share,
+    unweighted,
+  });
 }
 
 function fastModeInferenceSentence(fastMode) {
   const inference = fastMode.inference;
   if (inference.status !== "inferred") {
-    return "Residual inference has not run: there is not yet enough matched calibration evidence to compare a window against a Standard reference.";
+    return t("accounting.fastMode.inferenceNotRun");
   }
   if (inference.inferredFastWindows === 0) {
-    return `Residual inference compared ${compact(inference.scoredWindowCount)} calibration windows against ${compact(inference.referenceWindowCount)} Standard references and marked none as Fast.`;
+    return t("accounting.fastMode.inferenceNone", {
+      scored: compact(inference.scoredWindowCount),
+      reference: compact(inference.referenceWindowCount),
+    });
   }
-  return `Residual inference marked ${compact(inference.inferredFastWindows)} of ${compact(inference.scoredWindowCount)} calibration windows as inferred Fast, against ${compact(inference.referenceWindowCount)} Standard references. Inference labels windows, never individual increments, so it is reported here and never folded into the weighted total.`;
+  return t("accounting.fastMode.inferenceSome", {
+    fast: compact(inference.inferredFastWindows),
+    scored: compact(inference.scoredWindowCount),
+    reference: compact(inference.referenceWindowCount),
+  });
 }
 
 function renderFastModePreference() {
@@ -3045,10 +6455,13 @@ function renderFastModePreference() {
     control.disabled = fastModePreferenceBusy;
   }
   if (accounting === null) {
-    coverage.textContent = "Awaiting local evidence.";
+    setProductText(coverage, "Awaiting local evidence.");
     return;
   }
-  coverage.textContent = `${fastModeCoverageSentence(accounting.fastMode)} ${fastModeInferenceSentence(accounting.fastMode)}`;
+  coverage.textContent = [
+    fastModeCoverageSentence(accounting.fastMode),
+    fastModeInferenceSentence(accounting.fastMode),
+  ].join(" ");
 }
 
 async function selectFastModePreference(mode) {
@@ -3066,7 +6479,7 @@ async function selectFastModePreference(mode) {
       : `Saved. Increments with an observed tier keep it; the rest are now weighted as ${fastModePreference.mode === "fast" ? "Fast" : "Standard"}.`;
     await refreshDashboardAfterFastModeChange();
   } catch (error) {
-    showFailure(status, {
+    await showFailure(status, {
       surface: "fast_mode_preference",
       error,
       fallback:
@@ -3078,396 +6491,21 @@ async function selectFastModePreference(mode) {
   }
 }
 
-// Statuses that change how a reader should trust the headline number, most
-// material first. Anything else is a coverage note and stays in the inventory.
-const MATERIAL_GAP_STATUSES = Object.freeze([
-  "missing",
-  "not_observed",
-  "insufficient_evidence",
-  "mostly_unknown",
-  "unattributed",
-  "unsupported",
-  "unsupported_or_partial",
-  "unavailable",
-  "excluded",
-  "uncertain",
-  "partial"
-]);
-const MATERIAL_GAP_LIMIT = 2;
-
-function materialGapRank(item) {
-  const index = MATERIAL_GAP_STATUSES.indexOf(item.status ?? item.priority ?? "");
-  return index === -1 ? MATERIAL_GAP_STATUSES.length : index;
-}
-
-function gapExplanation(item) {
-  return item.explanation ?? item.evidence ?? item.description ?? item.action
-    ?? "Additional evidence is required.";
-}
-
-function briefGapExplanation(item) {
-  const source = String(gapExplanation(item)).trim();
-  const end = source.indexOf(". ");
-  return end === -1 ? source : source.slice(0, end + 1);
-}
-
-function gapTitle(item) {
-  return item.title ?? item.dimension ?? "Unresolved coverage gap";
-}
-
-function fastModeShortCoverage(fastMode) {
-  const coverage = fastMode.coverage;
-  if (coverage.totalEvents === 0) {
-    return "No usage increments in this period, so there is nothing to attribute.";
-  }
-  return `Of ${compact(coverage.totalEvents)} increments: ${compact(coverage.observedEvents)} observed, ${compact(coverage.assumedFromPreferenceEvents)} from your stated mode, ${compact(coverage.inferredEvents)} inferred, ${compact(coverage.unknownEvents)} unknown.`;
-}
-
-function renderQuality(data) {
-  const issues = [
-    ...data.monitoringGaps,
-    ...data.quality.opportunities,
-    ...data.quality.blindSpots
-  ];
-  const ranked = issues
-    .map((item, index) => ({ item, index }))
-    .filter(({ item }) => materialGapRank(item) < MATERIAL_GAP_STATUSES.length)
-    .sort((left, right) => (
-      materialGapRank(left.item) - materialGapRank(right.item)
-      || left.index - right.index
-    ))
-    .map(({ item }) => item);
-  const material = ranked.slice(0, MATERIAL_GAP_LIMIT);
-
-  const issueList = $("#blind-spot-list");
-  clear(issueList);
-  if (!issues.length) {
-    issueList.append(node("div", "empty-inline", "No blind-spot inventory was returned."));
-  } else if (!material.length) {
-    issueList.append(node(
-      "div",
-      "empty-inline",
-      "Nothing in the current inventory changes how the headline number should be read."
-    ));
-  } else {
-    for (const item of material) {
-      const issue = node("div", "issue");
-      issue.append(node("span", "issue-icon", "!"));
-      const copy = node("div");
-      copy.append(
-        node("strong", "", gapTitle(item)),
-        node("p", "", briefGapExplanation(item))
-      );
-      issue.append(copy, node("span", "issue-priority", humanize(item.status ?? item.priority ?? "Open")));
-      issueList.append(issue);
-    }
-  }
-}
-
-function renderReports(data) {
-  const container = $("#report-links");
-  clear(container);
-  if (!data.reports.length) {
-    container.append(node("span", "empty-inline", "No reports advertised by the local companion."));
-    return;
-  }
-  for (const report of data.reports) {
-    if (data.mode === "demo") {
-      container.append(node("span", "report-link", `${report.title} · demo only`));
-      continue;
-    }
-    const link = node("a", "report-link", report.title);
-    link.href = report.href;
-    link.target = "_blank";
-    link.rel = "noopener";
-    container.append(link);
-  }
-}
-
-function renderCollector(data) {
-  const collector = data.collector ?? {};
-  const state = $("#collector-state");
-  state.textContent = data.state === "live"
-    ? "Current"
-    : data.state === "offline" && data.mode !== "demo"
-      ? "Ready to analyze"
-      : humanize(data.state);
-  state.className = `evidence-chip ${data.state === "live" ? "" : "neutral"}`;
-  const rows = [
-    ["Last analysis", formatLocal(collector.lastScanAt ?? data.activity?.lastScanAt ?? data.freshness.latestObservedAt)],
-    ["Safe records", compact(collector.safeRecordCount ?? data.activity?.safeRecordCount ?? data.activity?.recordCount)],
-    ["Covered from", collector.coveredAt?.startAt ? formatLocal(collector.coveredAt.startAt) : "Unavailable"],
-    ["Covered through", collector.coveredAt?.endAt ? formatLocal(collector.coveredAt.endAt) : "Unavailable"],
-    ["Contribution through", collector.exportableCoveredAt?.endAt
-      ? formatLocal(collector.exportableCoveredAt.endAt)
-      : "No rollout usage available"],
-    ["Usage / quota rows", `${compact(collector.recordCounts?.usage)} / ${compact(collector.recordCounts?.quota)}`],
-    ["Analysis state", humanize(collector.indexingState || "Unavailable")],
-    ["Source bytes", "Not exposed to browser"],
-    ["Identity", collector.identityMode ?? "Pseudonymous"]
-  ];
-  const dl = $("#collector-details");
-  clear(dl);
-  for (const [term, value] of rows) {
-    const wrapper = node("div");
-    wrapper.append(node("dt", "", term), node("dd", "", value));
-    dl.append(wrapper);
-  }
-  renderIndexProgress(collector.indexing ?? null, {
-    status: collector.indexing?.status ?? collector.indexingState
-  });
-}
-
-function renderIndexProgress(progress, { status = "" } = {}) {
-  const container = $("#index-progress");
-  if (!container) return;
-  if (!progress || typeof progress !== "object") {
-    container.hidden = true;
-    return;
-  }
-  const allowedPhases = new Set([
-    "starting",
-    "discovering",
-    "rollout_index",
-    "quick_result",
-    "quota_refresh",
-    "reloading",
-    "complete",
-    "paused",
-    "prospective",
-    "failed"
-  ]);
-  const phase = allowedPhases.has(progress.phase) ? progress.phase : "rollout_index";
-  const filesSelected = Number.isSafeInteger(progress.filesSelected)
-    && progress.filesSelected >= 0 ? progress.filesSelected : null;
-  const filesProcessed = Number.isSafeInteger(progress.filesProcessed)
-    && progress.filesProcessed >= 0 ? progress.filesProcessed : 0;
-  const filesComplete = filesSelected !== null
-    && filesSelected > 0
-    && filesProcessed >= filesSelected;
-  const recordsWritten = Number.isSafeInteger(progress.recordsWritten)
-    && progress.recordsWritten >= 0 ? progress.recordsWritten : 0;
-  const startAt = Number.isFinite(Date.parse(progress.coveredAt?.startAt))
-    ? progress.coveredAt.startAt : "";
-  const endAt = Number.isFinite(Date.parse(progress.coveredAt?.endAt))
-    ? progress.coveredAt.endAt : "";
-  const bar = $("#index-progress-bar");
-  if (filesSelected !== null && filesSelected > 0) {
-    bar.max = filesSelected;
-    bar.value = Math.min(filesProcessed, filesSelected);
-  } else {
-    bar.max = 1;
-    bar.removeAttribute("value");
-  }
-  $("#index-progress-title").textContent =
-    status === "cancelled"
-      ? "Local analysis cancelled"
-      : status === "cancelling"
-        ? "Stopping at a safe checkpoint"
-      : phase === "quick_result"
-        ? "Headline results are ready"
-      : status === "recent_7d_complete"
-      ? "Recent local history indexed"
-      : status === "recent_7d_partial"
-        ? "Useful recent history indexed"
-      : status === "prospective_only"
-        ? "Collecting new activity prospectively"
-        : status === "bounded_pause"
-          ? "Recent history analysis paused"
-          : filesComplete && status === "running"
-            ? "Calculating usage and allowance"
-          : "Analyzing recent local history";
-  $("#index-progress-phase").textContent = humanize(
-    status === "cancelled"
-      ? "cancelled"
-      : status === "cancelling"
-        ? "cancelling"
-      : phase === "quick_result"
-        ? "deeper accounting"
-      : status === "recent_7d_complete"
-      ? "complete"
-      : filesComplete && status === "running"
-        ? "finalizing"
-        : phase
-  );
-  $("#index-progress-summary").textContent = status === "cancelled"
-    ? "The analysis stopped without replacing verified existing results. Run it again whenever convenient."
-    : status === "cancelling"
-      ? "TiboTattle is finishing its current atomic step and preserving a resumable checkpoint."
-    : phase === "quick_result"
-      ? "Your headline local result is available. Deeper replay-safe cost accounting and weekly calibration are still finishing."
-    : status === "prospective_only"
-    ? `${compact(recordsWritten)} safe records retained since local collection began. Older activity was not retroactively indexed for this existing checkpoint.`
-    : status === "recent_7d_partial"
-      ? `${compact(recordsWritten)} safe records retained from a bounded recent tail. The analysis completed safely, but cannot prove it reached the entire requested seven-day window.`
-      : filesSelected === null
-        ? `${compact(recordsWritten)} safe records retained; discovering bounded recent rollouts.`
-        : filesComplete && status === "running"
-          ? `${compact(filesProcessed)} bounded rollout files are indexed. Replaying safe token increments, quota transitions, and the seven-day calibration now.`
-          : `${compact(filesProcessed)} of ${compact(filesSelected)} bounded rollout files processed · ${compact(recordsWritten)} safe records retained.`;
-  $("#index-progress-coverage").textContent = startAt && endAt
-    ? `Content-free evidence currently covers ${formatLocal(startAt)} through ${formatLocal(endAt)}. Raw content and source paths never enter this page.`
-    : "Raw log contents and source paths never enter this page.";
-  container.hidden = false;
-}
-
-function renderAutomaticContributionStatus(status) {
-  const value = status ?? {
-    state: "unavailable",
-    enabled: false,
-    consentCurrent: false,
-    firstReviewComplete: false,
-    firstReviewedAcceptedAt: "",
-    requiredConsent: null,
-    lastAttemptAt: "",
-    lastSuccessAt: "",
-    nextAttemptAt: "",
-    lastOutcome: null
-  };
-  automaticContributionStatus = value;
-  const awaitingReviewedSend = Boolean(
-    pendingAutomaticContributionConsent && !value.enabled
-  );
-  const labels = {
-    unavailable: "Unavailable",
-    not_configured: "Not configured",
-    disabled: "Off",
-    first_review_required: "First review needed",
-    consent_required: "Consent needed",
-    scheduled: "On",
-    running: "Running now",
-    paused: "Paused",
-    failed: "Needs attention"
-  };
-  const chip = $("#automatic-contribution-state");
-  chip.textContent = awaitingReviewedSend
-    ? "Review first send"
-    : labels[value.state] ?? "Unavailable";
-  chip.className = ["scheduled", "running"].includes(value.state)
-    ? "evidence-chip"
-    : value.state === "failed"
-      ? "evidence-chip error"
-      : "evidence-chip neutral";
-
-  const next = value.nextAttemptAt
-    ? ` Next check ${formatLocal(value.nextAttemptAt)}.`
-    : "";
-  const last = value.lastSuccessAt
-    ? ` Last contribution ${formatLocal(value.lastSuccessAt)}.`
-    : "";
-  const outcome = value.lastOutcome?.status === "failed"
-    ? ` The last attempt needs attention (${value.lastOutcome.code.replaceAll("_", " ")}).`
-    : "";
-  const pausedDescriptions = {
-    queue_paused:
-      `Automatic contribution is stopped because the local queue is paused. No automatic retry is scheduled; inspect and resume the queue before continuing.${last}`,
-    run_timeout:
-      `Automatic contribution stopped after its five-minute abort deadline. No retry is scheduled; turn it off, inspect local status, and explicitly enable it again.${last}`,
-    identity_unavailable:
-      `Automatic contribution stopped because its local pseudonymous identity is unavailable. Nothing more is scheduled until the local identity is repaired and you explicitly enable it again.${last}`,
-    privacy_verification_failed:
-      `Automatic contribution stopped because the privacy verification failed. Nothing was inferred or retried; inspect the local result before explicitly enabling it again.${last}`,
-    delivery_rejected:
-      `Automatic contribution stopped because the service rejected part of the exact prepared set. No retry is scheduled; inspect the contribution status before explicitly enabling it again.${last}`,
-    preparation_failed:
-      `Automatic contribution stopped because local preparation or maintenance failed. No retry is scheduled; inspect local status before explicitly enabling it again.${last}`,
-    upload_failed:
-      `Automatic contribution stopped because delivery failed without a safe retry signal. No retry is scheduled; inspect local status before explicitly enabling it again.${last}`
-  };
-  const pausedDescription = pausedDescriptions[value.lastOutcome?.code]
-    ?? `Automatic contribution is stopped and no retry is scheduled. Inspect the bounded last outcome before explicitly enabling it again.${last}${outcome}`;
-  const descriptions = {
-    unavailable:
-      "Automatic contribution is unavailable in this app build. You can still prepare and send a reviewed contribution.",
-    not_configured:
-      "The contribution service is not configured in this app build. Nothing will be sent.",
-    disabled:
-      "Off until you explicitly consent. No daemon or login item is installed; checks run only while TiboTattle is open.",
-    first_review_required:
-      "Automatic contribution is off. Consent, inspect, and send one exact reviewed contribution before a recurring schedule can be enabled.",
-    consent_required:
-      "The metadata contract or destination changed. Review the current disclosure and consent again before anything is scheduled.",
-    scheduled:
-      `On. TiboTattle checks for new content-free pseudonymous metadata every 6 hours while the app is open.${last}${next}${outcome}`,
-    running:
-      `A bounded foreground contribution check is running now.${last}${next}`,
-    paused: pausedDescription,
-    failed:
-      `Automatic contribution has stopped because its local settings are unavailable. No retry is scheduled; repair the local app state, then review the current consent before turning it on again.${last}${outcome}`
-  };
-  $("#automatic-contribution-status").hidden = !value.enabled;
-  $("#automatic-contribution-description").textContent = awaitingReviewedSend
-    ? "Consent is held only in this open tab. Automatic contribution remains off until your exact reviewed first send is accepted."
-    : descriptions[value.state] ?? descriptions.unavailable;
-
-  const toggle = $("#automatic-contribution-toggle");
-  toggle.hidden = !value.enabled;
-  toggle.disabled = automaticContributionBusy;
-  toggle.textContent = automaticContributionBusy
-    ? "Turning off…"
-    : "Turn off automatic contribution";
-  $("#contribution-not-now").hidden = value.enabled;
-  updateCommunityConnectButton();
-}
-
-async function refreshAutomaticContributionStatus() {
-  const status = await localClient.automaticContributionStatus();
-  renderAutomaticContributionStatus(status);
-  return status;
-}
-
 function renderContributionSyncStatus(status) {
   const value = status ?? {
     state: "unavailable",
     paused: null,
-    counts: {
-      pending: 0,
-      inFlight: 0,
-      accepted: 0,
-      retryable: 0,
-      rejected: 0
-    },
-    nextAttemptAt: "",
-    lastAcceptedAt: ""
+    counts: {},
   };
-  const labels = {
-    unavailable: "Queue unavailable",
-    paused: "Queue paused",
-    attention: "Needs attention",
-    active: "Delivery active",
-    idle: "Up to date",
-    empty: "Nothing queued"
-  };
-  const chip = $("#sync-state");
-  chip.textContent = labels[value.state] ?? "Queue unavailable";
-  chip.className = ["active", "idle"].includes(value.state)
-    ? "evidence-chip"
-    : "evidence-chip neutral";
-  const counts = value.counts;
-  $("#sync-waiting").textContent = compact(counts.pending + counts.retryable);
-  $("#sync-in-flight").textContent = compact(counts.inFlight);
-  $("#sync-accepted").textContent = compact(counts.accepted);
-  $("#sync-attention").textContent = compact(counts.retryable + counts.rejected);
-  $("#sync-next-attempt").textContent = value.nextAttemptAt
-    ? formatLocal(value.nextAttemptAt)
-    : "None scheduled";
-  $("#sync-last-accepted").textContent = value.lastAcceptedAt
-    ? formatLocal(value.lastAcceptedAt)
-    : "No accepted batch yet";
-  const descriptions = {
-    unavailable: "No verified local queue state is available. Nothing about a file, path, identity, origin, or credential is inferred.",
-    paused: "Delivery is paused locally. Prepared batches remain content-free and will not be sent until you explicitly resume.",
-    attention: "At least one batch is waiting for a retry or was rejected. Use the local status command for bounded counts; it does not print paths or identifiers.",
-    active: "Committed privacy-safe batches are waiting, retrying, or currently leased to the foreground sender.",
-    idle: "Every discovered committed batch has been accepted or replayed, and no retry is due.",
-    empty: "No committed privacy-safe prepared set has entered this queue yet."
-  };
-  $("#sync-description").textContent = descriptions[value.state]
-    ?? descriptions.unavailable;
   contributionSyncStatus = value;
-  updateContributionSyncButtons();
+  renderContributionActionState();
 }
 
+// The legacy "Prepare and review a contribution" surface is gone
+// (owner-directed, 2026-08-08): the prepared-set queue no longer renders its
+// own card. The queue still matters — it is the review bootstrap behind the
+// approve-once surface and the evidence of a previously accepted upload — so
+// its state is stored and the consent surface re-renders from it.
 function renderContributionSyncPreview(preview) {
   const value = preview ?? {
     status: "unavailable",
@@ -3475,93 +6513,67 @@ function renderContributionSyncPreview(preview) {
     item: null
   };
   contributionSyncPreview = value;
-  const labels = {
-    ready: "Ready",
-    retry_wait: "Waiting to retry",
-    paused: "Paused",
-    empty: "Nothing queued",
-    not_configured: "Not configured",
-    unavailable: "Unavailable"
-  };
-  const chip = $("#sync-next-state");
-  const state = value.status === "available"
-    ? value.state
-    : value.status;
-  chip.textContent = labels[state] ?? "Unavailable";
-  chip.className = state === "ready"
-    ? "evidence-chip"
-    : "evidence-chip neutral";
-  if (!value.item) {
-    $("#sync-next-coverage").textContent = value.status === "not_configured"
-      ? "Set prepared directory at launch"
-      : "—";
-    $("#sync-next-records").textContent = "—";
-    $("#sync-next-cost").textContent = "—";
-    $("#sync-next-bytes").textContent = "—";
-    updateContributionSyncButtons();
-    return;
-  }
-  const item = value.item;
-  $("#sync-next-coverage").textContent =
-    `${formatLocal(item.coveredAt.startAt)} – ${formatLocal(item.coveredAt.endAt)}`;
-  $("#sync-next-records").textContent =
-    `${compact(item.recordCounts.total)} total · ${compact(item.recordCounts.usageEvents)} usage · ${compact(item.recordCounts.quotaSnapshots)} quota`;
-  $("#sync-next-cost").textContent =
-    `${item.accounting.estimatedApiCostUsd === null ? "Unpriced" : `$${item.accounting.estimatedApiCostUsd}`} · ${item.accounting.pricedEventCoveragePercent}% priced`;
-  $("#sync-next-bytes").textContent =
-    `${compact(item.reservedUploadBytes)} bytes reserved (${compact(item.preparedBytes)} prepared)`;
-  updateContributionSyncButtons();
+  renderContributionActionState();
+  maybeReviewPreparedSummary();
 }
 
-function updateContributionSyncButtons() {
-  const available = contributionSyncPreview?.status === "available";
-  const paused = contributionSyncStatus?.paused === true;
-  $("#sync-inspect").disabled = contributionSyncBusy;
-  $("#sync-run-once").disabled = contributionSyncBusy
-    || !available
-    || contributionSyncPreview?.deliveryConfigured !== true
-    || contributionSyncPreview?.state !== "ready"
-    || contributionSyncExactReview?.state !== "ready"
-    || paused;
-  $("#sync-pause").disabled = contributionSyncBusy
-    || !available
-    || contributionSyncStatus?.state === "unavailable"
-    || paused;
-  $("#sync-resume").disabled = contributionSyncBusy
-    || !available
-    || contributionSyncStatus?.state === "unavailable"
-    || !paused;
+// Whether this build is paired with a hosted contribution service at all. A
+// build without one has nothing to sign into or connect to, and — with the
+// approve-once surface as the only contribution flow — nothing to approve.
+function contributionServiceConfigured() {
+  return localCompanionHealth?.capabilities?.contributionDevicePairing === true;
 }
 
-function showContributionSyncAction(message, error = false) {
-  const status = $("#sync-action-status");
+/**
+ * Whether this page can honestly claim this Mac holds upload authority. Only
+ * two measured facts support that claim: the pairing ceremony completed in
+ * this session, or the local queue records a previously accepted upload —
+ * which only a paired device can produce. Anything less is a guess, and a
+ * guess here is exactly what produced "connecting fails anyway -> no send".
+ */
+function communityUploadAuthorityEvidence() {
+  return communityDevicePaired
+    || finite(contributionSyncStatus?.counts?.accepted, 0) > 0
+    || Boolean(contributionSyncStatus?.lastAcceptedAt);
+}
+
+// (communityAuthorizationSatisfied left with the two-card flow, owner-directed
+// 2026-08-08: the review bootstrap is purely local and no longer waits for
+// pairing, and the single ceremony performs the pairing itself.)
+
+// One re-render entry point for everything the contribution state feeds now
+// that the legacy send card is gone: the approve-once surface and the
+// journey strip. It also gives the silent authorization repair its chance —
+// the repair is guarded to run at most once per page load.
+function renderContributionActionState() {
+  renderIncrementalConsent();
+  renderCommunityJourney();
+  maybeRepairIncrementalAuthorization();
+}
+
+// The approve-once surface's own status line. It inherits the role the old
+// #sync-action-status played for the send card: verification progress, and
+// each failure with its quotable reference.
+function showIncrementalReviewStatus(message, error = false) {
+  const status = $("#incremental-consent-status");
+  if (!status) return;
   status.hidden = false;
+  // A direct write over a node the keyed variant may have registered.
+  forgetLocalizedNode(status);
   status.textContent = message;
   status.classList.toggle("error", error);
 }
 
-function contributionSyncPassResult(result) {
-  const needsAttention = result.status === "completed"
-    && result.accepted === 0
-    && result.retryable + result.rejected > 0;
-  const counts =
-    `${compact(result.accepted)} accepted, ${compact(result.retryable)} waiting to retry, ${compact(result.rejected)} rejected`;
-  const bandwidth =
-    `${compact(result.reservedUploadBytes)} upload bytes reserved${result.bandwidthLimited ? "; stopped at byte cap" : ""}`;
-  const guidance = needsAttention
-    ? " Nothing was accepted. Check device pairing before trying again; this Mac may need to be paired as an upload-only device. These bounded counters do not identify the exact server-side reason."
-    : "";
-  return {
-    message:
-      `Pass ${result.status}: ${compact(result.processed)} processed; ${counts}; ${bandwidth}.${guidance}`,
-    needsAttention
-  };
+function showIncrementalReviewStatusKey(key, values = {}) {
+  const status = $("#incremental-consent-status");
+  if (!status) return;
+  status.hidden = false;
+  status.classList.remove("error");
+  setLocalizedText(status, key, values);
 }
 
 function clearContributionSyncExactReview() {
   contributionSyncExactReview = null;
-  $("#sync-exact-review").hidden = true;
-  $("#sync-exact-review-json").textContent = "";
 }
 
 function renderContributionSyncExactReview(value) {
@@ -3586,10 +6598,6 @@ function renderContributionSyncExactReview(value) {
     payloadBytes: value.payloadBytes,
     reviewToken: value.reviewToken,
   };
-  $("#sync-exact-review-json").textContent = JSON.stringify(value.payload, null, 2);
-  $("#sync-exact-review-state").textContent =
-    `Verified · ${compact(value.payloadBytes)} bytes`;
-  $("#sync-exact-review").hidden = false;
 }
 
 async function refreshContributionSyncControls() {
@@ -3597,100 +6605,210 @@ async function refreshContributionSyncControls() {
   // Preview discovery commits newly prepared sets to the queue. Read queue
   // status afterwards so the two cards describe the same durable state.
   const preview = await localClient.contributionSyncPreview();
-  const [status, automatic] = await Promise.all([
-    localClient.contributionSyncStatus(),
-    localClient.automaticContributionStatus()
-  ]);
+  const status = await localClient.contributionSyncStatus();
   renderContributionSyncStatus(status);
   renderContributionSyncPreview(preview);
-  renderAutomaticContributionStatus(automatic);
 }
 
-async function runContributionSyncAction(action) {
+// The manual "Send summary" action is gone with the prepare-and-review
+// surface (owner-directed, 2026-08-08). After the approve-once consent, the
+// companion's incremental engine uploads by itself; the page only reflects
+// that engine's bounded status line.
+
+/**
+ * A stable identity for the currently prepared set, from its own printed
+ * facts. It exists so the page verifies each prepared set exactly once by
+ * itself; a verification that failed is retried only by an explicit action.
+ */
+function preparedSummaryIdentity() {
+  const item = contributionSyncPreview?.item;
+  if (!item) return null;
+  return [
+    item.coveredAt?.startAt,
+    item.coveredAt?.endAt,
+    item.preparedBytes,
+    item.recordCounts?.total,
+  ].join("|");
+}
+
+/**
+ * The invisible review bootstrap behind the approve-once surface.
+ *
+ * The approve gate keeps the review-bootstrap requirement — one verified
+ * real instance of the covered data on screen before approval can be given —
+ * but the owner removed every user-facing preparation step with the legacy
+ * prepare flow (2026-08-08). So the page produces that instance itself: a
+ * ready prepared set verifies itself exactly as before, and an empty queue
+ * triggers one silent local preparation whose result then verifies itself.
+ * The token gate is unchanged — Approve stays disabled until the exact local
+ * verification succeeds, and the approval carries the minted token.
+ */
+function maybeReviewPreparedSummary() {
+  if (contributionSyncBusy || incrementalConsentBusy) return;
+  // The token feeds only the approve-once consent now, so nothing prepares
+  // or verifies on a build without the capability or after approval.
+  if (!incrementalSyncCapabilityAdvertised() || incrementalConsentApproved) return;
+  // The bootstrap no longer waits for pairing (owner-directed 2026-08-08,
+  // one-step flow): pairing now happens INSIDE the single Review-and-approve
+  // interaction, so the facts must already be on screen when that interaction
+  // begins. The bootstrap is purely local — prepare and verify on this Mac,
+  // no network — and the minted token still only ever feeds the explicit
+  // approval.
+  if (contributionSyncPreview?.status !== "available") return;
+  if (contributionSyncPreview.state !== "ready"
+      || contributionSyncPreview.item == null) {
+    maybePrepareIncrementalReviewInstance();
+    return;
+  }
+  if (contributionSyncExactReview?.state === "ready") return;
+  const key = preparedSummaryIdentity();
+  if (key === null || key === contributionSyncAutoReviewedKey) return;
+  contributionSyncAutoReviewedKey = key;
+  void reviewPreparedSummary({ refreshFirst: false });
+}
+
+/**
+ * One silent preparation per queue state, and only when the queue is truly
+ * empty: retry-wait, paused, and not-configured states are real conditions
+ * that a fresh preparation would not change. A failed attempt never loops;
+ * "Check again" on the approve card is the explicit retry.
+ */
+function maybePrepareIncrementalReviewInstance() {
+  if (contributionSyncPreview?.state !== "empty") return;
+  if (incrementalReviewPrepareAttempted) return;
+  incrementalReviewPrepareAttempted = true;
+  void prepareIncrementalReviewInstance();
+}
+
+async function prepareIncrementalReviewInstance() {
   if (contributionSyncBusy) return;
   contributionSyncBusy = true;
-  let acceptedContribution = false;
-  updateContributionSyncButtons();
-  showContributionSyncAction(
-    action === "run"
-      ? "Running one bounded foreground pass…"
-      : action === "pause" ? "Pausing local delivery…" : "Resuming local delivery…"
-  );
+  const retry = $("#incremental-review-retry");
+  if (retry) retry.hidden = true;
+  renderContributionActionState();
+  showIncrementalReviewStatusKey("consent.preparingReview");
+  clearContributionSyncExactReview();
+  // A fresh preparation may reproduce byte-identical facts; it must still
+  // verify itself again, so the once-per-set marker is cleared with the token.
+  contributionSyncAutoReviewedKey = null;
+  let preparedCommitted = false;
   try {
-    if (action === "run") {
-      if (contributionSyncExactReview?.state !== "ready") {
-        throw new Error("exact review required");
-      }
-      const result = await localClient.runContributionSyncOnce(
-        contributionSyncExactReview.reviewToken
-      );
-      if (result.status === "unavailable") throw new Error("sync unavailable");
-      const outcome = contributionSyncPassResult(result);
-      acceptedContribution = result.status === "completed"
-        && Number.isSafeInteger(result.accepted)
-        && result.accepted > 0;
-      showContributionSyncAction(outcome.message, outcome.needsAttention);
-    } else {
-      const status = await localClient.setContributionSyncPaused(action === "pause");
-      if (status.state === "unavailable") throw new Error("control unavailable");
-      showContributionSyncAction(
-        action === "pause" ? "Local delivery is paused." : "Local delivery is resumed."
-      );
+    let prepared;
+    try {
+      prepared = await localClient.prepareContribution({ lookbackHours: 24 });
+    } catch (error) {
+      // A very active day can exceed the fixed reviewed-set safety bound at
+      // 24 hours. The lookback was only ever a size guard — never a consent
+      // decision — so the bootstrap narrows to the latest hour by itself
+      // instead of surfacing a window picker the owner removed.
+      if (error?.code !== "export_too_large") throw error;
+      prepared = await localClient.prepareContribution({ lookbackHours: 1 });
     }
+    if (prepared.status !== "prepared") {
+      const error = new Error("Preparation did not return a verified contribution.");
+      error.code = "preparation_failed";
+      throw error;
+    }
+    // The busy flag this preparation holds makes the refresh's automatic
+    // verification pass bail out, so the pass is re-run explicitly below
+    // once the flag is released.
     await refreshContributionSyncControls();
-    if (acceptedContribution) await loadCommunityResults();
+    preparedCommitted = true;
   } catch (error) {
-    // A leftover device credential stops delivery for a precisely known local
-    // reason with its own repair, so it is answered where the user can act on
-    // it rather than folded into the generic queue message.
-    if (contributionDeviceRecoveryIsRequired(error)) {
-      renderContributionDeviceRecovery($("#community-connect-status"), {
-        error
-      });
-      showContributionSyncAction(
-        "Delivery stopped because this Mac has a leftover device credential. Durable queue state was retained; the repair is offered above.",
-        true
-      );
-    } else {
-      showContributionSyncAction(describeFailure({
-        surface: "contribution_send",
-        error,
-        fallback:
-          "The local companion rejected or could not complete this action. Durable queue state was retained."
-      }).text, true);
-    }
+    if (retry) retry.hidden = false;
+    showIncrementalReviewStatus((await describeFailure({
+      surface: "contribution_prepare",
+      error,
+      messages: INCREMENTAL_PREPARATION_ERROR_COPY,
+      fallback:
+        "A privacy-verified instance of the covered data could not be prepared. No upload occurred and incomplete staging is ignored by the queue."
+    })).text, true);
   } finally {
     contributionSyncBusy = false;
-    updateContributionSyncButtons();
+    renderContributionActionState();
   }
+  if (preparedCommitted) maybeReviewPreparedSummary();
 }
 
-async function inspectNextContribution() {
+// Fixed sentences for the silent preparation's own failure codes. They speak
+// on the approve card, so each names the reader's actual next action there.
+const INCREMENTAL_PREPARATION_ERROR_COPY = {
+  identity_unavailable:
+    "The local Keychain identity is unavailable. Open Keychain Access, select the login Keychain, unlock it, then choose Check again. Do not reset, delete, rotate, or broaden access to the identity. No upload occurred.",
+  coverage_unavailable:
+    "No usable local coverage is available yet. Analyze local usage first, then choose Check again. No upload occurred.",
+  coverage_invalid:
+    "The available local coverage is not usable for a contribution yet. No upload occurred.",
+  no_safe_records:
+    "No privacy-safe records were found in the recent local evidence. Analyze local usage again later. No upload occurred.",
+  export_too_large:
+    "Even the latest hour exceeded a fixed reviewed-set safety bound. Nothing was truncated or uploaded.",
+  privacy_verification_failed:
+    "Privacy verification rejected the prepared data, so it was not queued or uploaded.",
+  preparation_in_progress:
+    "A local preparation is already running. Nothing has been uploaded.",
+  review_archive_invalid:
+    "TiboTattle could not save the copy you would review, so nothing was queued and nothing was uploaded.",
+  prepared_spool_invalid:
+    "The place TiboTattle keeps a prepared instance on this Mac is not usable, so nothing was queued and nothing was uploaded.",
+  preparation_failed:
+    "A privacy-verified instance of the covered data could not be prepared. No upload occurred and incomplete staging is ignored by the queue.",
+};
+
+async function reviewPreparedSummary({ refreshFirst = true } = {}) {
+  if (contributionSyncBusy) return;
   contributionSyncBusy = true;
-  $(".sync-status-panel").open = true;
-  updateContributionSyncButtons();
-  showContributionSyncAction(
-    "Inspecting content-free pseudonymous metadata through loopback; no service request or upload is performed."
-  );
+  const retry = $("#incremental-review-retry");
+  if (retry) retry.hidden = true;
+  renderContributionActionState();
+  showIncrementalReviewStatusKey("syncStatus.verifyingSummary");
   try {
-    await refreshContributionSyncControls();
+    // Preview discovery commits newly prepared sets to the queue, so an
+    // explicit re-check refreshes first; the automatic verification is
+    // itself triggered by a fresh render and skips the redundant read.
+    if (refreshFirst) await refreshContributionSyncControls();
     const review = await localClient.contributionSyncExactReview();
     renderContributionSyncExactReview(review);
-    $("#sync-exact-review").open = false;
-    showContributionSyncAction(
-      "Review the concise coverage and record totals above. Expand the exact JSON if wanted, then confirm the first send."
-    );
-  } catch {
-    showContributionSyncAction(
-      "The next contribution could not be inspected. Nothing was uploaded.",
-      true
-    );
+    contributionSyncAutoReviewedKey = preparedSummaryIdentity();
+    showIncrementalReviewStatusKey("syncStatus.summaryVerified");
+  } catch (error) {
+    // A bare `catch {}` discarded the only evidence of what actually failed
+    // and printed one sentence for every cause. Surface the real one, and
+    // offer the explicit re-check: automatic verification never retries a
+    // failure by itself.
+    if (retry) retry.hidden = false;
+    showIncrementalReviewStatus((await describeFailure({
+      surface: "contribution_prepare",
+      error,
+      fallback:
+        "The prepared instance could not be verified on this Mac. Nothing was uploaded."
+    })).text, true);
   } finally {
     contributionSyncBusy = false;
-    updateContributionSyncButtons();
+    renderContributionActionState();
   }
 }
 
+/**
+ * The explicit retry behind "Check again": clear the once-only markers, then
+ * re-read the queue. The render that follows re-runs the same automatic
+ * bootstrap — verify a ready set, or prepare one silently when the queue is
+ * empty — so recovery walks exactly the path the happy case walks.
+ */
+async function retryIncrementalReviewBootstrap() {
+  if (contributionSyncBusy) return;
+  incrementalReviewPrepareAttempted = false;
+  contributionSyncAutoReviewedKey = null;
+  const retry = $("#incremental-review-retry");
+  if (retry) retry.hidden = true;
+  await refreshContributionSyncControls();
+}
+
+/**
+ * Stop only this installation's background upload capability. The hosted
+ * contribution account/session remains intact: sign-out and metadata deletion
+ * are separate controls with their own explicit confirmation.
+ */
 async function loadLocalDashboard() {
   const previousBusy = localActionBusy;
   localActionBusy = true;
@@ -3699,19 +6817,30 @@ async function loadLocalDashboard() {
   updateLocalActionButtons();
   try {
     const syncState = (async () => {
-      const [preview, status, automatic] = await Promise.all([
-        localClient.contributionSyncPreview(),
-        localClient.contributionSyncStatus(),
-        localClient.automaticContributionStatus()
+      const [preview, status] = await Promise.all([
+        localClient.contributionSyncPreview().catch(() => null),
+        localClient.contributionSyncStatus().catch(() => null)
       ]);
-      return { preview, status, automatic };
+      return { preview, status };
     })();
+    const loadDashboardData = async () => {
+      try {
+        return await localClient.load();
+      } catch (firstError) {
+        await new Promise((resolve) => window.setTimeout(resolve, 250));
+        try {
+          return await localClient.load();
+        } catch {
+          throw firstError;
+        }
+      }
+    };
     const [data, sync, localHealth, onboarding, speedPreference] = await Promise.all([
-      localClient.load(),
+      loadDashboardData(),
       syncState,
       localClient.health().catch(() => null),
-      localClient.onboarding(),
-      localClient.fastModePreference()
+      localClient.onboarding().catch(() => null),
+      localClient.fastModePreference().catch(() => null)
     ]);
     localCompanionHealth = localHealth;
     fastModePreference = speedPreference;
@@ -3720,75 +6849,54 @@ async function loadLocalDashboard() {
     // on a capability it carries. Without this re-render they keep the
     // disabled state bootstrap gave them when the capability was still unknown.
     renderHostedIdentity();
-    renderPreparationIdentity(localHealth);
     renderContributionSyncStatus(sync.status);
+    // Consent state is read from the companion before the queue renders, so
+    // an already-approved Mac never re-prepares a review instance it no
+    // longer needs.
+    await loadIncrementalSyncStatus();
     renderContributionSyncPreview(sync.preview);
-    renderAutomaticContributionStatus(sync.automatic);
     renderLocalOnboarding(onboarding);
   } catch {
-    const [localHealth, backendHealth, onboarding] = await Promise.all([
+    const [localHealth, onboarding] = await Promise.all([
       localClient.health().catch(() => null),
-      communityClient.health().catch(() => null),
       localClient.onboarding().catch(() => null),
     ]);
     localCompanionHealth = localHealth;
-    renderHostedIdentity();
-    const backendOnly = localHealth === null
-      && backendHealth?.checks?.database === "ok";
     dashboard = null;
+    renderHostedIdentity();
     renderContributionSyncStatus(null);
+    await loadIncrementalSyncStatus();
     renderContributionSyncPreview(null);
-    renderAutomaticContributionStatus(null);
-    renderPreparationIdentity(null);
     renderLocalOnboarding(onboarding);
-    setGlobalState("offline");
-    $("#latest-observation").textContent = backendOnly
-      ? "Backend-only origin"
-      : "Companion unavailable";
-    $("#data-source").textContent = "No real usage is displayed";
-    showConnectionNotice({
-      title: backendOnly
-        ? "This address is the backend-only service"
-        : localHealth
-          ? "The companion could not load the local dashboard"
-          : "The local companion is not available",
-      copy: backendOnly
-        ? "This service accepts optional community requests but cannot read this Mac. Open TiboTattle from Applications and use its in-app window."
-        : localHealth
-          ? "The Mac app is running, but its in-app dashboard could not be loaded. Quit and reopen TiboTattle, then open the dashboard in its window and check again."
-          : "Open TiboTattle from Applications, wait for Ready, then open the dashboard in its window. If no installer is published below, this build is not yet available for a new installation.",
-      kind: "error",
-      showDemo: true,
-      showCheck: true,
-    });
-    renderDashboardSkeleton();
+    renderDashboardUnavailableState(
+      localHealth ? "dashboard-unavailable" : "companion-unavailable",
+    );
   } finally {
     localActionBusy = previousBusy;
     updateLocalActionButtons();
   }
 }
 
-function renderPreparationIdentity(health) {
-  const chip = $("#preparation-identity");
-  const mode = health?.capabilities?.contributionPreparationIdentityMode;
-  const labels = {
-    production_keychain: "Keychain checked on prepare",
-    development_file_override: "Development file ready",
-    development_environment_override: "Development environment override",
-  };
-  chip.textContent = labels[mode] ?? "Unavailable";
-  chip.className = mode === "development_file_override"
-    ? "evidence-chip"
-    : "evidence-chip neutral";
-}
+// The "preparation identity" Keychain notice left with the prepare surface it
+// annotated (owner-directed, 2026-08-08). The one case that still matters —
+// the login Keychain is unreachable, so the silent review bootstrap will
+// fail — speaks through that bootstrap's own identity_unavailable sentence
+// on the approve card.
 
 function renderDashboardSkeleton() {
   const container = $("#quota-cards");
   clear(container);
   const card = node("article", "metric-card insufficient");
   const header = node("div", "metric-card-header");
-  header.append(node("span", "metric-name", "No local evidence"), node("span", "evidence-chip", "Offline"));
-  card.append(header, node("strong", "metric-value", "—"), node("p", "", "This empty state is intentional. Demo values are never substituted automatically."));
+  header.append(
+    node("span", "metric-name", t("dashboard.unavailable.noLocalEvidence")),
+    node("span", "evidence-chip", t("dashboard.unavailable.offline")),
+  );
+  card.append(
+    header,
+    node("strong", "metric-value", "—"),
+    node("p", "", t("dashboard.unavailable.emptyState")),
+  );
   container.append(card);
 }
 
@@ -3811,8 +6919,55 @@ async function refreshDashboardAfterFastModeChange() {
   }
 }
 
-async function requestRefresh() {
+/**
+ * True when the local history index has discovered more sources than it has
+ * indexed — a one-time build or a parser-version reparse is still catching up.
+ * Reads the same coverage the top-bar badge uses; demo mode is never pending.
+ */
+function historyIndexIncomplete() {
+  if (!dashboard || dashboard.mode === "demo") return false;
+  const history = dashboard?.pricing?.historyCoverage
+    ?? dashboard?.accounting?.historyCoverage
+    ?? null;
+  const indexed = finite(history?.indexedSourceCount, null);
+  const total = finite(history?.sourceCount, null);
+  if (history?.status === "complete") return false;
+  return indexed !== null && total !== null && total > 0 && indexed < total;
+}
+
+/**
+ * After a successful refresh that left the history index incomplete, run the
+ * next pass promptly instead of waiting for the sparse auto-cadence, bounded
+ * by REINDEX_AUTO_CONTINUE_LIMIT. Stops the moment coverage completes, the
+ * user interacts, or the bound is reached (the ordinary cadence then carries
+ * the remainder). Never runs in demo mode or while another action is busy.
+ */
+function scheduleReindexAutoContinuation() {
+  if (reindexAutoContinueTimer !== null) {
+    clearTimeout(reindexAutoContinueTimer);
+    reindexAutoContinueTimer = null;
+  }
+  if (!historyIndexIncomplete()) {
+    reindexAutoContinuations = 0;
+    return;
+  }
+  if (reindexAutoContinuations >= REINDEX_AUTO_CONTINUE_LIMIT) return;
+  reindexAutoContinueTimer = setTimeout(() => {
+    reindexAutoContinueTimer = null;
+    if (localActionBusy || !historyIndexIncomplete()) {
+      reindexAutoContinuations = 0;
+      return;
+    }
+    reindexAutoContinuations += 1;
+    void requestRefresh({ autoContinue: true });
+  }, REINDEX_AUTO_CONTINUE_DELAY_MS);
+}
+
+async function requestRefresh({ autoContinue = false } = {}) {
   if (localActionBusy) return;
+  // A person pressing Refresh restarts the auto-continuation budget; a chained
+  // reindex pass keeps counting toward the bound set when it began.
+  if (!autoContinue) reindexAutoContinuations = 0;
   if (!localAnalysisAllowed()) {
     showConnectionNotice({
       title: "Finish the local check before analyzing",
@@ -3832,16 +6987,10 @@ async function requestRefresh() {
   localActionBusy = true;
   localRefreshInProgress = true;
   localRefreshCancelRequested = false;
+  archiveHistoryScanActive = false;
   button.textContent = "Starting local analysis…";
   updateLocalActionButtons();
   setGlobalState("updating");
-  renderIndexProgress({
-    phase: "starting",
-    filesSelected: null,
-    filesProcessed: 0,
-    recordsWritten: 0,
-    coveredAt: { startAt: "", endAt: "" }
-  }, { status: "running" });
   try {
     await localClient.refresh();
     refreshAccepted = true;
@@ -3850,6 +6999,8 @@ async function requestRefresh() {
     let consecutiveStatusFailures = 0;
     let outcome = "running";
     let finalErrorCode = null;
+    let finalFailedStep = null;
+    let finalFailureCode = null;
     let pollCount = 0;
     let timeoutSettlementNoted = false;
     while (pollingBudget.hasTime()
@@ -3869,8 +7020,14 @@ async function requestRefresh() {
       const refresh = status?.refresh ?? {};
       outcome = refresh.status ?? "failed";
       finalErrorCode = refresh.errorCode ?? null;
+      finalFailedStep = refresh.failedStep ?? finalFailedStep;
+      finalFailureCode = refresh.failureCode ?? finalFailureCode;
       const progress = refresh.progress ?? refresh.result?.indexing ?? null;
-      if (progress) renderIndexProgress(progress, { status: outcome });
+      const archiveScanning = progress?.kind === "archive_index";
+      if (archiveScanning && !archiveHistoryScanActive) {
+        archiveHistoryScanActive = true;
+        if (dashboard) renderPricing(dashboard);
+      }
       if (progress?.phase === "quick_result" && !quickResultLoaded) {
         try {
           await loadQuickResultDashboard();
@@ -3893,6 +7050,8 @@ async function requestRefresh() {
         ? progress.filesSelected : null;
       button.textContent = outcome === "cancelling"
         ? "Stopping safely…"
+        : archiveScanning
+          ? `Indexing archive history… ${elapsedLabel}`
         : progress?.phase === "quick_result"
           ? `Headline ready; finishing deeper accounting… ${elapsedLabel}`
         : processed !== null && selected !== null
@@ -3959,30 +7118,63 @@ async function requestRefresh() {
       });
       return;
     }
-    if (outcome !== "succeeded") throw new Error("The local refresh did not complete successfully.");
+    if (outcome !== "succeeded") {
+      // The companion stamps failures with a fixed step name and a bounded
+      // machine code; carrying them here is the difference between "it did
+      // not finish" and something a person can act on.
+      const failureDetail = [finalFailedStep, finalFailureCode]
+        .filter(Boolean).join(" · ");
+      const failure = new Error(failureDetail
+        ? `The local refresh failed at: ${failureDetail}.`
+        : "The local refresh did not complete successfully.");
+      if (finalFailureCode) failure.code = finalFailureCode;
+      failure.refreshFailureDetail = failureDetail || null;
+      throw failure;
+    }
+    archiveHistoryScanActive = false;
     button.textContent = "Loading updated evidence…";
     await loadLocalDashboard();
-  } catch {
+    scheduleReindexAutoContinuation();
+  } catch (error) {
     if (dashboard) {
       setGlobalState(dashboard.state, {
         companionReachable: dashboard.mode !== "demo",
       });
     }
+    // This was a bare `catch {}`: it printed one of three sentences for every
+    // possible cause and discarded the only evidence of which one occurred.
+    // That is the same defect this file already fixed for the contribution
+    // path, left in place on the product's most important path - so a refresh
+    // that failed for a specific, named reason was indistinguishable from one
+    // that merely did not finish, and there was nothing to quote when asking
+    // for help. `local_refresh` was already a reviewed diagnostic surface with
+    // no caller; this is that caller. The three sentences below remain as the
+    // fallback for a cause with no fixed copy of its own.
+    const described = await describeFailure({
+      surface: "local_refresh",
+      error,
+      fallback: continuationLimitReached
+        ? "TiboTattle stopped this one-click analysis rather than repeatedly reading a very large history. Your available headline and previously verified results remain usable; you can run the analysis again later from its durable checkpoint."
+        : refreshAccepted
+          ? (error?.refreshFailureDetail
+            ? `The analysis failed at: ${error.refreshFailureDetail}. Existing evidence is still available and no partial accounting result replaced it.`
+            : "The analysis was accepted, but it did not reach a verified completion state. Existing evidence is still available and no partial accounting result replaced it.")
+        : "The local companion may be offline, busy, or rejecting this request. Existing evidence has not been altered.",
+    });
     showConnectionNotice({
       title: continuationLimitReached
         ? "Deep analysis paused after two bounded continuations"
         : refreshAccepted
           ? "The local analysis did not finish"
         : "Local analysis could not be started",
-      copy: continuationLimitReached
-        ? "TiboTattle stopped this one-click analysis rather than repeatedly reading a very large history. Your available headline and previously verified results remain usable; you can run the analysis again later from its durable checkpoint."
-        : refreshAccepted
-          ? "The analysis was accepted, but it did not reach a verified completion state. Existing evidence is still available and no partial accounting result replaced it."
-        : "The local companion may be offline, busy, or rejecting this request. Existing evidence has not been altered.",
+      copy: described.text,
       kind: continuationLimitReached ? "warning" : "error",
       showDemo: !dashboard
     });
   } finally {
+    const wasArchiveScanning = archiveHistoryScanActive;
+    archiveHistoryScanActive = false;
+    if (wasArchiveScanning && dashboard) renderPricing(dashboard);
     localActionBusy = false;
     localRefreshInProgress = false;
     localRefreshCancelRequested = false;
@@ -4036,10 +7228,41 @@ async function checkLocalSetup() {
   }
 }
 
+let nativeEvidenceReloadInFlight = false;
+
+/**
+ * Re-read the companion's fragments after the native shell finished a refresh.
+ *
+ * In a browser, `requestRefresh` drives the refresh itself and re-renders when
+ * it completes. Inside the app that path stands down (see
+ * `scheduleReturningUserRefresh` below), so this is the only thing that moves
+ * the rendered numbers off the snapshot the page loaded with. Without it the
+ * dashboard keeps showing the pre-refresh figures while the toolbar reports
+ * the refresh finished - the UI asserting a freshness it does not have.
+ */
+async function reloadLocalEvidenceAfterNativeRefresh() {
+  // A refresh started from this page re-renders on its own completion, and a
+  // second overlapping read would only race it.
+  if (nativeEvidenceReloadInFlight || localRefreshInProgress || localActionBusy) {
+    return;
+  }
+  nativeEvidenceReloadInFlight = true;
+  try {
+    await loadQuickResultDashboard();
+  } catch {
+    // A failed re-read leaves the previous numbers on screen rather than
+    // blanking them. The next finished refresh signals again.
+  } finally {
+    nativeEvidenceReloadInFlight = false;
+  }
+}
+
 function scheduleReturningUserRefresh() {
   // The native macOS shell owns the foreground cadence. Running both the web
   // return-visit timer and the native timer races the same bounded companion
   // request, which can surface a harmless 409 as a confusing dashboard error.
+  // What the shell owes in return is a signal when its refresh finished, which
+  // `tibotattle:local-evidence-updated` carries.
   if (runsInsideNativeDashboard()) return;
   const priorEvidence = dashboard?.mode !== "demo"
     && Boolean(
@@ -4075,7 +7298,7 @@ const HOSTED_IDENTITY_ERROR_COPY = {
   IDENTITY_REQUIRED:
     "Hosted participation requires sign-in. Sign in with Google or Apple above, then try again. Nothing was uploaded.",
   IDENTITY_TOKEN_INVALID:
-    "The sign-in could not be verified by the contribution service. Sign in again, then retry. Nothing was uploaded.",
+    "The sign-in was cancelled or could not be completed. Nothing was uploaded. You can try again.",
   IDENTITY_CONFIGURATION_INVALID:
     "Hosted sign-in is not configured on the contribution service, so hosted actions are unavailable. Local reporting continues unchanged.",
   IDENTITY_PROVIDER_UNAVAILABLE:
@@ -4099,11 +7322,6 @@ function hostedIdentityErrorCopy(error) {
   return fixedCopy(HOSTED_IDENTITY_ERROR_COPY, error?.code);
 }
 
-// One precisely known local fault: this Mac still holds a contribution-device
-// secret in its Keychain, but the local record that pairs that secret with the
-// service is gone — typically a leftover from an earlier install. It cannot be
-// read or replaced in that state. Nothing about the invitation, the network,
-// or the service is wrong, so the copy must not send the user to look at them.
 const CONTRIBUTION_DEVICE_CONFLICT_COPY =
   "This Mac still holds a contribution-device credential from an earlier install, and the local record that paired it is gone, so it cannot be used or replaced. Nothing was uploaded and nothing was changed. Clear the leftover credential below, then connect again.";
 
@@ -4113,11 +7331,11 @@ const CONTRIBUTION_DEVICE_CONFLICT_COPY =
 const SERVICE_ERROR_COPY = {
   ...HOSTED_IDENTITY_ERROR_COPY,
   AUTH_REQUIRED:
-    "The contribution service did not recognize this browser session. Reload the local dashboard, then try again. Nothing was uploaded.",
+    "The contribution service did not recognize this app's contribution session. Reopen TiboTattle, then try again. Nothing was uploaded.",
   AUTH_INVALID:
-    "The contribution service rejected this browser session. Reload the local dashboard, then try again. Nothing was uploaded.",
+    "The contribution service rejected this app's contribution session. Reopen TiboTattle, then sign in again. Nothing was uploaded.",
   CSRF_INVALID:
-    "This browser session expired while the request was in flight. Reload the local dashboard, then try again. Nothing was uploaded.",
+    "This app's contribution session expired while the request was in flight. Reopen TiboTattle, then try again. Nothing was uploaded.",
   BODY_INVALID:
     "TiboTattle and the contribution service did not agree on this connection request. Nothing was uploaded; install the current signed build, then sign in again.",
   CONTENT_TYPE_INVALID:
@@ -4126,6 +7344,14 @@ const SERVICE_ERROR_COPY = {
     "This build points to a contribution-service route that is unavailable. Nothing was uploaded; install the current signed build before trying again.",
   ATTEMPT_LIMIT_REACHED:
     "Too many attempts were made in a short window. Wait a few minutes before trying again. Nothing was uploaded.",
+  ADMISSION_CONFIGURATION_INVALID:
+    "The contribution service is not ready to accept uploads. Nothing was uploaded; try again shortly.",
+  UPLOAD_ADMISSION_LIMIT_REACHED:
+    "Too many upload authorizations were requested in a short window. Wait a minute before trying again. Nothing was uploaded.",
+  UPLOAD_INGRESS_LIMIT_REACHED:
+    "The contribution service is temporarily busy. Wait for the stated retry time before trying again. Nothing was uploaded.",
+  UPLOAD_INGRESS_UNAVAILABLE:
+    "The contribution service cannot admit uploads right now. Nothing was uploaded; try again shortly.",
   BACKEND_STORAGE_UNAVAILABLE:
     "The contribution service could not reach its own storage. Nothing was uploaded; try again shortly.",
   COLLECTION_CONTROL_UNAVAILABLE:
@@ -4141,7 +7367,7 @@ const SERVICE_ERROR_COPY = {
   PARTICIPANT_DELETING:
     "A deletion is still running for this participant. Wait for it to finish, then try again. Nothing was uploaded.",
   DEVICE_AUTH_INVALID:
-    "The contribution service did not accept this Mac's upload device. Reset this Mac's device credential below, then connect again. Nothing was uploaded.",
+    "The contribution service did not accept this Mac's upload device. Nothing was uploaded; review the contribution again before retrying.",
   DEVICE_NOT_FOUND:
     "The contribution service has no record of this Mac as an upload device. Connect this Mac again. Nothing was uploaded.",
   PAIRING_AUTH_INVALID:
@@ -4169,7 +7395,53 @@ const SERVICE_ERROR_COPY = {
   BODY_TOO_LARGE:
     "The request exceeded the service's fixed size bound. Nothing was uploaded; choose a shorter interval.",
   INTERNAL_ERROR:
-    "The contribution service failed while handling this request. Nothing was uploaded; try again shortly."
+    "The contribution service failed while handling this request. Nothing was uploaded; try again shortly.",
+  // Codes the service can return that previously had no sentence here, so
+  // every one of them produced "the cause was not reported in a form this page
+  // can explain". Admin-only and updater-guard codes are deliberately absent:
+  // this page cannot reach those routes.
+  BODY_TIMEOUT:
+    "The request to the contribution service did not finish in time. Nothing was uploaded; check your connection and try again.",
+  METHOD_NOT_ALLOWED:
+    "This build asked the contribution service for something it does not offer on that route. Nothing was uploaded; install the current signed build.",
+  MAINTENANCE_IN_PROGRESS:
+    "The contribution service is in maintenance. Nothing was uploaded, and local reporting is unaffected. Try again later.",
+  MAINTENANCE_INCOMPLETE:
+    "The contribution service has not finished its maintenance pass. Nothing was uploaded; try again shortly.",
+  ADMISSION_RATE_LIMIT_UNAVAILABLE:
+    "The contribution service could not check its own upload rate limits, so it declined rather than guessing. Nothing was uploaded; try again shortly.",
+  DELETION_LEDGER_UNAVAILABLE:
+    "The contribution service could not reach the record of deletions, so it declined rather than acting without it. Nothing was changed or uploaded.",
+  IDENTITY_REQUIRED_FOR_UPLOAD:
+    "Hosted participation requires sign-in before an upload. Sign in with Google or Apple above, then try again. Nothing was uploaded.",
+  IDENTITY_REENROLLMENT_COOLDOWN:
+    "This sign-in enrolled recently and is inside a fixed cooldown before it can enroll again. Nothing was uploaded; wait and try again.",
+  IDENTITY_RESULT_PENDING:
+    "The sign-in has not finished in the browser window yet. Complete it there, then choose Check sign-in. Nothing was uploaded.",
+  SIGN_IN_START_LIMIT_REACHED:
+    "Too many sign-ins were started in a short window. Wait a few minutes before trying again. Nothing was uploaded.",
+  INVITE_GRANT_INVALID:
+    "The contribution service did not accept this build's enrollment request. Nothing was uploaded; install the current signed build, then sign in again.",
+  KEY_CONFIGURATION_INVALID:
+    "The contribution service has no usable upload key configured, so it cannot accept encrypted evidence. Nothing was uploaded; try again later.",
+  KEY_ID_INVALID:
+    "The upload key this build used is not one the contribution service recognizes. Nothing was uploaded; install the current signed build.",
+  LIFECYCLE_BOUNDS_EXCEEDED:
+    "The request went beyond a fixed safety bound in the contribution service. Nothing was uploaded; choose a shorter interval.",
+  LIFECYCLE_STATE_CONFLICT:
+    "The contribution service is in a different state than this page expected. Nothing was uploaded; reload TiboTattle and try again.",
+  TELEMETRY_REQUIRED:
+    "The contribution service expected privacy-safe evidence and did not receive any. Nothing was uploaded; prepare and review a contribution first.",
+  SYNTHETIC_REQUIRED:
+    "That route accepts only test evidence, and this is real evidence. Nothing was uploaded; this is a defect worth reporting.",
+  SYNTHETIC_RECORD_INVALID:
+    "The contribution service rejected a test record against its closed schema. Nothing was stored.",
+  ACCOUNT_SCOPED_LOCAL_ONLY:
+    "This build keeps account-scoped evidence on your Mac and does not send it. Nothing was uploaded, and local reporting is unaffected.",
+  ACCOUNT_SCOPED_INGEST_DISABLED:
+    "The contribution service is not accepting account-scoped evidence right now. Nothing was uploaded, and local reporting is unaffected.",
+  ACCOUNT_SCOPED_CONFIGURATION_INVALID:
+    "The contribution service is not configured to handle account-scoped evidence. Nothing was uploaded; try again later."
 };
 
 // Fixed local companion codes. These describe this Mac, not the service, so
@@ -4185,24 +7457,24 @@ const LOCAL_COMPANION_ERROR_COPY = {
     "The contribution service returned an unexpected response. Nothing was uploaded; try again shortly.",
   central_participant_response_too_large:
     "The contribution service returned more data than TiboTattle accepts for a connection. Nothing was uploaded; try again shortly.",
-  contribution_device_recovery_required: CONTRIBUTION_DEVICE_CONFLICT_COPY,
-  contribution_device_credential_conflict: CONTRIBUTION_DEVICE_CONFLICT_COPY,
+  contribution_device_pairing_not_authorized:
+    "The local companion refused this pairing request because it did not come from the local dashboard. Nothing was uploaded; reload TiboTattle and try again.",
+  contribution_device_pairing_response_invalid:
+    "The local companion returned an invalid pairing result. Nothing was uploaded; reload TiboTattle and try again.",
   contribution_device_pairing_not_configured:
     "This build is not configured to connect to a contribution service, so there is nothing to pair with. Local reporting is unaffected.",
   contribution_device_pairing_failed:
     "The contribution service did not complete device pairing. Nothing was uploaded; try again shortly.",
-  automatic_contribution_first_review_required:
-    "One contribution must be reviewed and accepted before automatic contribution can be armed. Nothing repeats until then.",
-  automatic_contribution_not_configured:
-    "This build has no contribution service configured, so automatic contribution cannot be armed.",
-  automatic_contribution_consent_binding_mismatch:
-    "The stored consent no longer matches the contract this build would send. Reload the local dashboard and consent again; nothing repeats until then.",
-  automatic_contribution_settings_unavailable:
-    "The local companion could not read or write the automatic-contribution setting. No setting was inferred.",
-  device_credential_reset_failed:
-    "The leftover device credential could not be cleared. Nothing was deleted on this Mac or in the service.",
-  device_credential_reset_not_authorized:
-    "The local companion refused this request because it did not arrive from the local dashboard. Nothing was deleted.",
+  contribution_device_recovery_required: CONTRIBUTION_DEVICE_CONFLICT_COPY,
+  contribution_device_credential_conflict: CONTRIBUTION_DEVICE_CONFLICT_COPY,
+  unsupported_media_type:
+    "The local companion rejected this request format. Nothing was uploaded; reload TiboTattle and try again.",
+  request_too_large:
+    "The local request exceeded the local safety bound. Nothing was uploaded; reload TiboTattle and try again.",
+  invalid_json:
+    "The local companion could not read this request. Nothing was uploaded; reload TiboTattle and try again.",
+  invalid_request:
+    "The local companion could not validate this request. Nothing was uploaded; reload TiboTattle and try again.",
   review_expired_or_changed:
     "The reviewed contribution changed or the review expired before sending. Nothing was uploaded; review it again.",
   sync_in_progress:
@@ -4218,40 +7490,173 @@ const LOCAL_COMPANION_ERROR_COPY = {
   fast_mode_preference_invalid:
     "That Codex speed mode is not one this build accepts. Nothing was stored.",
   fast_mode_preference_not_authorized:
-    "The local companion refused this request because it did not arrive from the local dashboard. Nothing was stored."
+    "The local companion refused this request because it did not arrive from the local dashboard. Nothing was stored.",
+  // Codes the local app can return that previously had no sentence here.
+  // Everything below describes this Mac, so none of it sends the reader
+  // looking at the network or at the contribution service.
+  enrollment_response_invalid:
+    "The contribution service replied in a shape TiboTattle does not accept, so no pseudonymous access was established. Nothing was uploaded; sign in again and retry.",
+  device_credential_reset_failed:
+    "The leftover device credential could not be cleared. Nothing was deleted on this Mac or in the service; try again, or reopen TiboTattle first.",
+  device_credential_reset_not_authorized:
+    "TiboTattle refused this reset because it did not come from the local dashboard. Nothing was deleted.",
+  review_required_before_send:
+    "The prepared summary has not been verified on this Mac yet, so sending is not offered. Wait for the summary card to finish checking, or choose Check summary again. Nothing was uploaded.",
+  sync_unavailable:
+    "TiboTattle could not run a delivery pass. Anything queued stays on this Mac and nothing was uploaded.",
+  sync_not_authorized:
+    "TiboTattle refused this send because it did not come from the local dashboard. Nothing was uploaded.",
+  sync_control_not_authorized:
+    "TiboTattle refused this change because it did not come from the local dashboard. Nothing was changed.",
+  sync_control_failed:
+    "TiboTattle could not change the delivery setting. The previous setting still applies and nothing was uploaded.",
+  sync_preview_not_authorized:
+    "TiboTattle refused to describe the queue because the request did not come from the local dashboard. Nothing was uploaded.",
+  exact_review_not_authorized:
+    "TiboTattle refused to open the exact local review because the request did not come from the local dashboard. Nothing was uploaded.",
+  preparation_not_authorized:
+    "TiboTattle refused to prepare a contribution because the request did not come from the local dashboard. Nothing was prepared or uploaded.",
+  refresh_not_authorized:
+    "TiboTattle refused to analyze local usage because the request did not come from the local dashboard. Nothing was changed.",
+  refresh_cancel_not_authorized:
+    "TiboTattle refused to cancel the analysis because the request did not come from the local dashboard. The analysis is still running.",
+  refresh_not_running:
+    "There is no local analysis running to cancel. Nothing was changed.",
+  diagnostic_note_not_authorized:
+    "TiboTattle refused to write a diagnostic note because the request did not come from the local dashboard. The reference above is still quotable.",
+  diagnostic_note_not_recorded:
+    "TiboTattle could not write the diagnostic note to its local log. The reference above is still quotable.",
+  contribution_device_disconnect_not_authorized:
+    "TiboTattle refused to disconnect this Mac because the request did not come from the local dashboard. This Mac is unchanged.",
+  contribution_device_disconnect_not_configured:
+    "This build has no contribution service configured, so there is no device to disconnect. Local reporting is unaffected.",
+  contribution_device_disconnect_failed:
+    "This Mac could not be disconnected. It may still be able to upload; try again, or reopen TiboTattle first.",
+  contribution_device_disconnect_cleanup_pending:
+    "This Mac stopped uploading, but clearing its local credential has not finished. Reopen TiboTattle and check again.",
+  automatic_contribution_not_authorized:
+    "TiboTattle refused this automatic contribution change because it did not come from the local dashboard. Nothing was changed.",
+  automatic_contribution_not_configured:
+    "This build has no automatic contribution to configure. Local reporting is unaffected.",
+  automatic_contribution_first_review_required:
+    "Automatic contribution cannot start until you have reviewed and sent one contribution by hand. Nothing was uploaded.",
+  automatic_contribution_consent_binding_mismatch:
+    "The stored automatic contribution consent no longer matches this build, so nothing runs automatically. Nothing was uploaded; consent again to resume.",
+  automatic_contribution_settings_unavailable:
+    "TiboTattle could not read the automatic contribution setting. Nothing runs automatically until it can, and nothing was uploaded.",
+  automatic_contribution_bootstrap_persist_failed:
+    "TiboTattle could not store the automatic contribution setting, so it stays off. Nothing was uploaded.",
+  automatic_contribution_lock_release_failed:
+    "A background contribution pass did not release its lock cleanly. Reopen TiboTattle before trying again; nothing was uploaded.",
+  loopback_required:
+    "This request has to come from the local dashboard on this Mac. Nothing was changed. Open TiboTattle and try again.",
+  host_not_allowed:
+    "TiboTattle only answers the local dashboard on this Mac and refused this request. Nothing was changed.",
+  method_not_allowed:
+    "TiboTattle does not offer that action on this route. Nothing was changed; install the current signed build.",
+  not_found:
+    "This build asked TiboTattle for something it does not provide. Nothing was changed; install the current signed build.",
+  internal_error:
+    "TiboTattle failed while handling this request on your Mac. Nothing was uploaded; reopen TiboTattle and try again.",
+  request_failed:
+    "TiboTattle could not complete this request. Nothing was uploaded; reopen TiboTattle and try again.",
+  // The local relay that forwards a request to the contribution service. A
+  // failure here means the request never left this Mac.
+  central_service_not_configured:
+    "This build is not configured to reach a contribution service, so the request never left this Mac. Local reporting is unaffected.",
+  central_service_unavailable:
+    "TiboTattle could not reach the contribution service. Nothing was uploaded; check your connection and try again.",
+  central_request_not_authorized:
+    "TiboTattle refused to forward this request because it did not come from the local dashboard. Nothing left this Mac.",
+  central_request_invalid:
+    "TiboTattle would not forward this request because it did not match what the relay accepts. Nothing left this Mac.",
+  central_request_too_large:
+    "The request exceeded the local relay's fixed size bound, so it was not forwarded. Nothing left this Mac.",
+  central_route_not_allowed:
+    "This build asked to reach a service route the local relay does not allow. Nothing left this Mac; install the current signed build.",
+  central_method_not_allowed:
+    "The local relay does not forward that action. Nothing left this Mac; install the current signed build.",
+  central_content_type_invalid:
+    "The local relay rejected this request's format before forwarding it. Nothing left this Mac.",
+  // The participant-scoped relay, which also carries the browser session.
+  central_participant_authorization_invalid:
+    "TiboTattle did not accept the authorization on this participant request. Nothing was uploaded; reload TiboTattle and sign in again.",
+  central_participant_cookie_invalid:
+    "The contribution session stored for this app is not usable. Nothing was uploaded; sign in again.",
+  central_participant_csrf_invalid:
+    "The contribution session expired while the request was in flight. Nothing was uploaded; reload TiboTattle and try again.",
+  central_participant_content_type_invalid:
+    "TiboTattle rejected this participant request's format before forwarding it. Nothing was uploaded.",
+  central_participant_request_invalid:
+    "TiboTattle would not forward this participant request because it did not match what the relay accepts. Nothing was uploaded.",
+  central_participant_request_too_large:
+    "The participant request exceeded the local relay's fixed size bound, so it was not forwarded. Nothing was uploaded.",
+  central_participant_route_not_allowed:
+    "This build asked to reach a participant route the local relay does not allow. Nothing was uploaded; install the current signed build.",
+  central_participant_method_not_allowed:
+    "The local relay does not forward that participant action. Nothing was uploaded; install the current signed build."
 };
 
 /**
  * Turn one failure into honest copy plus a quotable reference.
  *
  * The reference is fresh WebCrypto randomness, never derived from anything the
- * user typed or the service returned. It is filed in the local diagnostics log
- * alongside the fixed error code and, when the service supplied one, its own
- * request id — so a support conversation can join both sides. The sentence
- * itself always comes from a map written here or from the caller's fallback;
- * no server string is ever rendered.
+ * user typed or the service returned. The page waits for the local diagnostics
+ * POST and claims the write only after the companion confirms it; when that
+ * confirmation fails, the reference remains visible without the write claim,
+ * and a companion that answered yet refused the note is reported to the
+ * console rather than blending into an unreachable one.
+ * The sentence itself always comes from a map written here or from the caller's
+ * fallback; no server string is ever rendered.
  */
-function describeFailure({ surface, error, messages = {}, fallback }) {
+async function describeFailure({ surface, error, messages = {}, fallback }) {
   const reference = createDiagnosticReference();
   const code = diagnosticErrorCode(error?.code);
   const requestId = serviceRequestId(error?.requestId);
-  // Filed without blocking the message: the user must still be told what
-  // happened even when the companion cannot write its log.
-  void localClient.recordDiagnosticNote({
-    reference,
-    surface: diagnosticSurface(surface),
-    code,
-    requestId
-  }).catch(() => {});
+  let writtenToLocalLog = false;
+  // "recorded" | "refused" | "unreachable": a companion that answered without
+  // confirming this exact reference refused the note, which is a contract
+  // break between this build and the companion; only a request that never got
+  // an answer counts as unreachable.
+  let localNote = "unreachable";
+  try {
+    const recorded = await localClient.recordDiagnosticNote({
+      reference,
+      surface: diagnosticSurface(surface),
+      code,
+      requestId
+    });
+    writtenToLocalLog = recorded?.status === "recorded"
+      && recorded.reference === reference;
+    localNote = writtenToLocalLog ? "recorded" : "refused";
+  } catch (noteError) {
+    // The reference remains useful even when the local companion cannot write
+    // its diagnostics log. Do not claim a write that was not confirmed.
+    localNote = typeof noteError?.status === "number"
+      ? "refused"
+      : "unreachable";
+  }
+  if (localNote === "refused") {
+    // Never silent: a running companion that declines this page's own note
+    // means the reference shown below cannot be looked up later.
+    console.error(
+      `Diagnostic note ${reference} was refused by the local companion.`
+    );
+  }
   const explanation = fixedCopy(messages, code)
     ?? fixedCopy(SERVICE_ERROR_COPY, code)
     ?? fixedCopy(LOCAL_COMPANION_ERROR_COPY, code)
     ?? fallback;
-  const trailer = diagnosticReferenceSentence({ reference, requestId });
+  const trailer = diagnosticReferenceSentence({
+    reference,
+    requestId,
+    writtenToLocalLog,
+  });
   return Object.freeze({
     reference,
     requestId,
     code,
+    localNote,
     text: trailer === "" ? explanation : `${explanation} ${trailer}`
   });
 }
@@ -4259,8 +7664,8 @@ function describeFailure({ surface, error, messages = {}, fallback }) {
 /**
  * Report a failure into a status element, preserving the specific cause.
  */
-function showFailure(status, options) {
-  const described = describeFailure(options);
+async function showFailure(status, options) {
+  const described = await describeFailure(options);
   status.hidden = false;
   status.className = `${options.statusClass ?? "participant-action-status"} error`;
   status.textContent = described.text;
@@ -4273,8 +7678,35 @@ function showFailure(status, options) {
 // stays disabled with fixed copy, hosted Apple sign-in remains available
 // whenever the service is configured for it, and the server stays the
 // authority on whether identity is required.
+function hasCommunitySession() {
+  return typeof communitySession?.csrfToken === "string"
+    && communitySession.csrfToken.length > 0;
+}
+
+function hostedEnrollmentIsPaused() {
+  // Only the operator's collection-control incident brake closes the door
+  // for everyone. A routine "disabled" enrollment mode pauses NEW sign-ups
+  // at the service's enrollment write, while the sign-in ceremony stays open
+  // so an existing contributor can reattach - the service decides which one
+  // this identity is.
+  if (hasCommunitySession()) return false;
+  const controls = communityServiceHealth?.collectionControls;
+  return controls != null
+    && controls.state !== "operational"
+    && controls.enrollment === false;
+}
+
+function hostedNewEnrollmentIsPaused() {
+  // Informational, never a lockout: new sign-ups are paused, but signing in
+  // still reconnects an existing contributor.
+  return communityServiceHealth?.enrollmentMode === "disabled";
+}
+
 function hostedSignInRequired() {
-  return configuredGoogleClientId() !== null && hostedIdentity === null;
+  return configuredGoogleClientId() !== null
+    && hostedIdentity === null
+    && !hasCommunitySession()
+    && !hostedEnrollmentIsPaused();
 }
 
 // The provider is the only identity fact this page ever holds. No name, email,
@@ -4305,24 +7737,42 @@ function renderHostedIdentity() {
   // sign in at all, so the controls say so instead of failing after the click.
   const serviceConfigured =
     localCompanionHealth?.capabilities?.contributionDevicePairing === true;
-  const signedIn = hostedIdentity !== null;
-  const provider = HOSTED_IDENTITY_PROVIDERS[hostedIdentity?.provider]
-    ?? HOSTED_IDENTITY_PROVIDERS.google;
+  const hasServerSession = hasCommunitySession();
+  const signedIn = hostedIdentity !== null || hasServerSession;
+  const provider = HOSTED_IDENTITY_PROVIDERS[hostedIdentity?.provider] ?? null;
+  const enrollmentPaused = hostedEnrollmentIsPaused();
   const googleUnavailableNow = googleSignInUnavailable
     || configuredGoogleClientId() === null
-    || !serviceConfigured;
+    || !serviceConfigured
+    || enrollmentPaused;
   googleButton.disabled = hostedIdentityBusy
     || signedIn
     || googleUnavailableNow;
   googleUnavailable.hidden = !googleUnavailableNow || signedIn;
-  googleUnavailable.textContent = serviceConfigured
-    ? "Hosted sign-in is not configured for this build."
-    : "This build has no contribution service, so hosted sign-in is unavailable.";
-  const appleUnavailableNow = appleSignInUnavailable || !serviceConfigured;
-  appleUnavailable.hidden = !appleUnavailableNow || signedIn;
-  appleUnavailable.textContent = serviceConfigured
+  // Written through the registering helpers: a line produced by `t(...)` is
+  // already in the old language after a switch, so it has to be re-translated
+  // from its key rather than from its rendered text.
+  if (enrollmentPaused) {
+    setLocalizedText(googleUnavailable, "contribution.enrollmentPaused");
+  } else if (hostedNewEnrollmentIsPaused() && !signedIn && !googleUnavailableNow) {
+    // The buttons stay enabled: sign-in reconnects an existing contributor
+    // even while new sign-ups are paused.
+    googleUnavailable.hidden = false;
+    setLocalizedText(googleUnavailable, "contribution.newEnrollmentPausedSignInWorks");
+  } else {
+    setProductText(googleUnavailable, serviceConfigured
+      ? "Hosted sign-in is not configured for this build."
+      : "This build has no contribution service, so hosted sign-in is unavailable.");
+  }
+  const appleUnavailableNow = appleSignInUnavailable
+    || !serviceConfigured
+    || enrollmentPaused;
+  // When enrollment is paused, use one shared sentence instead of displaying
+  // the same global status below both provider buttons.
+  appleUnavailable.hidden = !appleUnavailableNow || signedIn || enrollmentPaused;
+  setProductText(appleUnavailable, serviceConfigured
     ? "Hosted Apple sign-in is not configured for this build."
-    : "This build has no contribution service, so hosted sign-in is unavailable.";
+    : "This build has no contribution service, so hosted sign-in is unavailable.");
   appleButton.disabled = hostedIdentityBusy
     || signedIn
     || appleUnavailableNow;
@@ -4334,33 +7784,65 @@ function renderHostedIdentity() {
   pendingActions.hidden = !hostedIdentityBusy || signedIn;
   checkButton.disabled = !hostedIdentityBusy || signedIn;
   cancelButton.disabled = !hostedIdentityBusy || signedIn;
-  $("#identity-account-provider").textContent = provider.label;
-  $("#identity-account-mark").setAttribute("href", provider.mark);
-  chip.textContent = signedIn
+  $("#identity-account-badge").hidden = provider === null;
+  setRawText($("#identity-account-provider"), provider?.label ?? t("contribution.identityGenericSession"));
+  if (provider !== null) {
+    $("#identity-account-mark").setAttribute("href", provider.mark);
+  }
+  setProductText(
+    $("#identity-account-detail"),
+    provider !== null
+      ? "Signing out ends this app's contribution session."
+      : "This app already has a contribution session. Signing out ends it.",
+  );
+  setProductText(chip, signedIn
     ? "Signed in"
-    : hostedIdentityBusy ? "Signing in…" : "Not signed in";
+    : hostedIdentityBusy ? "Signing in…" : "Not signed in");
   chip.className = signedIn
     ? "evidence-chip"
     : "evidence-chip neutral";
-  updateCommunityConnectButton();
+  // Sign-in state gates the single approve ceremony, so the merged surface
+  // and the journey strip re-render with it (owner-directed 2026-08-08: the
+  // separate connect button this used to refresh is gone).
+  renderContributionActionState();
 }
 
-// Signing out is entirely page-local. The sign-in token was never persisted,
-// so forgetting it needs no network call and destroys no hosted data; the
-// pseudonymous session is dropped alongside it so the next sign-in — with the
-// same account or a different one — enrolls under the identity just presented
-// rather than reusing the previous participant's session.
-function signOutHostedIdentity() {
-  if (hostedIdentityBusy || hostedIdentity === null) return;
-  hostedIdentity = null;
-  setCommunitySession(null);
-  $("#participant-controls").hidden = true;
+// A completed hosted handoff is memory-only, but enrollment also creates an
+// HttpOnly service session. When one exists, acknowledge its server-side
+// revocation before changing the UI: otherwise this page would say "signed
+// out" while the browser still held a usable session cookie. A proof that was
+// never enrolled has no session and can be forgotten locally.
+async function signOutHostedIdentity() {
+  if (hostedIdentityBusy || (hostedIdentity === null && !hasCommunitySession())) {
+    return;
+  }
   const status = $("#identity-signin-status");
+  const hadServerSession = Boolean(communitySession?.csrfToken);
+  hostedIdentityBusy = true;
+  renderHostedIdentity();
   status.hidden = false;
   status.className = "participant-action-status";
-  status.textContent =
-    "Signed out on this page only. The in-memory sign-in was discarded and nothing was deleted: metadata you already contributed is unchanged, and Hosted privacy controls still export or delete it. Sign in again with any Google or Apple account.";
-  renderHostedIdentity();
+  setLocalizedText(status, hadServerSession
+    ? "contribution.signOutStarting"
+    : "contribution.signOutForgetting");
+  try {
+    if (hadServerSession) await communityClient.logout();
+    hostedIdentity = null;
+    setCommunitySession(null);
+    $("#participant-controls")?.setAttribute("hidden", "");
+    setLocalizedText(status, hadServerSession
+      ? "contribution.signOutCompleted"
+      : "contribution.signOutUnfinished");
+  } catch (error) {
+    await showFailure(status, {
+      surface: "hosted_identity",
+      error,
+      fallback: t("contribution.signOutFailed")
+    });
+  } finally {
+    hostedIdentityBusy = false;
+    renderHostedIdentity();
+  }
 }
 
 // The service holds a completed sign-in for five minutes, so the poll stops
@@ -4369,6 +7851,11 @@ function signOutHostedIdentity() {
 // password and a second factor.
 const HOSTED_SIGNIN_POLL_ATTEMPTS = 150;
 const HOSTED_SIGNIN_POLL_INTERVAL_MS = 2_000;
+// The service-side hold, stated once: the poll budget IS the validity window,
+// and the persisted pending handoff below uses the same bound so this page
+// never claims a proof the service has already discarded.
+const HOSTED_SIGNIN_HANDOFF_VALIDITY_MS =
+  HOSTED_SIGNIN_POLL_ATTEMPTS * HOSTED_SIGNIN_POLL_INTERVAL_MS;
 
 // The packaged Mac app stamps this fixed marker before any dashboard script
 // runs. A normal browser keeps the dashboard page open in a second tab while
@@ -4441,11 +7928,16 @@ function cancelHostedSignIn() {
   attempt.cancelled = true;
   activeHostedSignIn = null;
   hostedIdentityBusy = false;
+  // An explicit cancel is a user decision: the persisted handoff must not
+  // resurrect this sign-in on the next reactivation.
+  clearPendingHostedSignIn();
   attempt.wake?.();
   const status = $("#identity-signin-status");
   status.hidden = false;
   status.className = "participant-action-status";
-  status.textContent = `${attempt.label} sign-in was cancelled. Nothing was uploaded.`;
+  setLocalizedText(status, "contribution.signInCancelled", {
+    provider: attempt.label,
+  });
   renderHostedIdentity();
 }
 
@@ -4465,9 +7957,10 @@ const HOSTED_SIGNIN_FLOWS = {
   google: {
     label: "Google",
     start: () => communityClient.identityGoogleStart(),
-    result: (state) => communityClient.identityGoogleResult(state),
+    result: (state, verifier) =>
+      communityClient.identityGoogleResult(state, verifier),
     waiting:
-      "Finish signing in with Google in your browser. TiboTattle collects the result itself and returns to the front when it is ready; you can close the callback tab. Only a stable account identifier is requested; no email or name is asked for. If no browser tab opened, try again.",
+      "Finish signing in with Google in your browser. TiboTattle returns to the front when it is ready. You can cancel this sign-in here at any time; nothing is uploaded until you review it.",
     signedIn:
       "Signed in with Google. This page holds only a short-lived opaque proof; the service keeps only an irreversible identity hash, never your email or name.",
     timedOut:
@@ -4481,9 +7974,10 @@ const HOSTED_SIGNIN_FLOWS = {
   apple: {
     label: "Apple",
     start: () => communityClient.identityAppleStart(),
-    result: (state) => communityClient.identityAppleResult(state),
+    result: (state, verifier) =>
+      communityClient.identityAppleResult(state, verifier),
     waiting:
-      "Finish signing in with Apple in your browser. TiboTattle collects the result itself and returns to the front when it is ready; you can close the callback tab. No name or email is requested. If no browser tab opened, try again.",
+      "Finish signing in with Apple in your browser. TiboTattle returns to the front when it is ready. You can cancel this sign-in here at any time; nothing is uploaded until you review it.",
     signedIn:
       "Signed in with Apple. This page holds only a short-lived opaque proof; the service keeps only an irreversible identity hash, never your email or name.",
     timedOut:
@@ -4496,9 +7990,162 @@ const HOSTED_SIGNIN_FLOWS = {
   },
 };
 
+// The pending sign-in handoff survives a dashboard reload (owner-reported
+// orphaned proof, 2026-08-08: a server-side COMPLETED Google sign-in expired
+// unread because the state token needed to collect it lived only in page
+// memory, and the native deep-link reactivation reloaded the page). The
+// moment the browser is opened, {provider, state, startedAt} is persisted to
+// sessionStorage — tab-scoped and gone when the tab closes, holding only the
+// single-use five-minute read-back handle, never a proof or a session. These
+// three helpers are the ONLY place this page touches web storage; the source
+// contract test cuts this block out and holds the rest of the file to zero.
+const PENDING_HOSTED_SIGNIN_STORAGE_KEY = "tibotattle.pending-hosted-sign-in.v1";
+
+function persistPendingHostedSignIn(providerId, state, verifier) {
+  try {
+    window.sessionStorage?.setItem(
+      PENDING_HOSTED_SIGNIN_STORAGE_KEY,
+      JSON.stringify({
+        provider: providerId,
+        state,
+        verifier,
+        startedAt: Date.now(),
+      }),
+    );
+  } catch {
+    // Storage being unavailable only removes the reload resilience; the live
+    // poll still collects the proof exactly as before.
+  }
+}
+
+function clearPendingHostedSignIn() {
+  try {
+    window.sessionStorage?.removeItem(PENDING_HOSTED_SIGNIN_STORAGE_KEY);
+  } catch {
+    // Nothing to clear when storage is unavailable.
+  }
+}
+
+function readPendingHostedSignIn() {
+  try {
+    const raw = window.sessionStorage?.getItem(PENDING_HOSTED_SIGNIN_STORAGE_KEY);
+    if (typeof raw !== "string" || raw === "") return null;
+    const value = JSON.parse(raw);
+    // The state token and the client verifier keep the exact shape the service
+    // mints and requires (the same bounds the client's own read-back enforces),
+    // so a corrupt record is discarded here instead of failing the read-back
+    // forever. The verifier is the initiator binding: without it a resumed poll
+    // can no longer collect the proof, so a record missing it is unusable.
+    if (!Object.hasOwn(HOSTED_SIGNIN_FLOWS, value?.provider ?? "")
+        || typeof value?.state !== "string"
+        || !/^[A-Za-z0-9_-]{43,128}$/u.test(value.state)
+        || typeof value?.verifier !== "string"
+        || !/^[A-Za-z0-9_-]{43,128}$/u.test(value.verifier)
+        || !Number.isFinite(value?.startedAt)) {
+      clearPendingHostedSignIn();
+      return null;
+    }
+    return value;
+  } catch {
+    clearPendingHostedSignIn();
+    return null;
+  }
+}
+
+// One resume at a time; re-entrant activations (load + focus + deep link in
+// the same second) must not race two read-backs of the one-time result.
+let pendingHostedSignInResumeInFlight = false;
+
+/**
+ * Collect a sign-in this page started but never read back (owner-reported
+ * orphaned proof, 2026-08-08). Runs on load and on every reactivation —
+ * deep-link return, visibilitychange to visible, window focus — and reads the
+ * persisted handoff's result with a couple of bounded retries inside the
+ * five-minute validity window. Success completes the identical journey the
+ * live poll would have: identity adopted, record cleared, and the pending
+ * repair ceremony resumed. A proof that expired unread, or a definite service
+ * verdict, is reported through describeFailure so a reference and request id
+ * reach the local diagnostics log; an unreachable service leaves the record
+ * for the next activation instead of logging a note per focus change.
+ */
+async function resumePendingHostedSignIn({ retries = 2 } = {}) {
+  if (pendingHostedSignInResumeInFlight) return;
+  if (hostedIdentityBusy || activeHostedSignIn !== null || hostedIdentity !== null) {
+    return;
+  }
+  const pending = readPendingHostedSignIn();
+  if (pending === null) return;
+  const flow = HOSTED_SIGNIN_FLOWS[pending.provider];
+  const status = $("#identity-signin-status");
+  if (Date.now() - pending.startedAt > HOSTED_SIGNIN_HANDOFF_VALIDITY_MS) {
+    clearPendingHostedSignIn();
+    const error = new Error("The completed sign-in expired before this Mac collected it.");
+    error.code = "HOSTED_SIGNIN_HANDOFF_EXPIRED";
+    await showFailure(status, {
+      surface: "hosted_identity",
+      error,
+      messages: {
+        HOSTED_SIGNIN_HANDOFF_EXPIRED:
+          `The completed ${flow.label} sign-in expired before this Mac could collect it. Nothing was uploaded; sign in again.`,
+      },
+      fallback: flow.failed,
+    });
+    renderHostedIdentity();
+    return;
+  }
+  pendingHostedSignInResumeInFlight = true;
+  try {
+    for (let attemptIndex = 0; attemptIndex <= retries; attemptIndex += 1) {
+      let identity = null;
+      try {
+        identity = await flow.result(pending.state, pending.verifier);
+      } catch (error) {
+        if (error?.code === "IDENTITY_RESULT_PENDING") {
+          // The provider has not returned yet; retry shortly, then leave the
+          // record for the next activation inside the validity window.
+          identity = null;
+        } else if (error?.code === undefined && error?.status === undefined) {
+          // Unreachable service: not a verdict on the proof. Keep the record
+          // and try again on the next activation rather than logging a note
+          // per focus change.
+          return;
+        } else {
+          clearPendingHostedSignIn();
+          await showFailure(status, {
+            surface: "hosted_identity",
+            error,
+            fallback: hostedIdentityErrorCopy(error) ?? flow.failed,
+          });
+          renderHostedIdentity();
+          return;
+        }
+      }
+      if (identity !== null) {
+        clearPendingHostedSignIn();
+        hostedIdentity = identity;
+        status.hidden = false;
+        status.className = "participant-action-status";
+        status.textContent = flow.signedIn;
+        renderHostedIdentity();
+        foregroundNativeDashboardAfterSignIn();
+        resumeContributionCeremonyAfterSignIn();
+        return;
+      }
+      if (attemptIndex < retries) {
+        await new Promise((resolveWait) => {
+          setTimeout(resolveWait, HOSTED_SIGNIN_POLL_INTERVAL_MS);
+        });
+      }
+    }
+  } finally {
+    pendingHostedSignInResumeInFlight = false;
+  }
+}
+
 async function beginHostedSignIn(providerId) {
   const flow = HOSTED_SIGNIN_FLOWS[providerId];
-  if (flow === undefined || hostedIdentityBusy || hostedIdentity !== null) {
+  if (flow === undefined || hostedIdentityBusy || hostedIdentity !== null
+      || pendingHostedSignInResumeInFlight) {
     return;
   }
   const status = $("#identity-signin-status");
@@ -4514,27 +8161,57 @@ async function beginHostedSignIn(providerId) {
   renderHostedIdentity();
   status.hidden = false;
   status.className = "participant-action-status";
-  status.textContent = `Starting ${flow.label} sign-in…`;
+  setLocalizedText(status, "contribution.signInStarting", {
+    provider: flow.label,
+  });
   try {
     const request = await flow.start();
+    // Persisted BEFORE the browser opens: from this moment a completed
+    // sign-in exists server-side that only this state token AND the client
+    // verifier can collect, so both must survive a dashboard reload
+    // (owner-reported orphaned proof, 2026-08-08).
+    persistPendingHostedSignIn(providerId, request.state, request.verifier);
     openHostedSignInInBrowser(request.authorizeUrl);
     status.textContent = flow.waiting;
     for (let poll = 0; poll < HOSTED_SIGNIN_POLL_ATTEMPTS; poll += 1) {
       if (attempt.cancelled || activeHostedSignIn !== attempt) return;
       let identity = null;
       try {
-        identity = await flow.result(request.state);
+        identity = await flow.result(request.state, request.verifier);
       } catch (error) {
         if (error?.code !== "IDENTITY_RESULT_PENDING") throw error;
+        // The fixed callback page wakes the native dashboard only after the
+        // provider has returned. A current service turns a cancelled callback
+        // into IDENTITY_TOKEN_INVALID; this branch preserves the same safe UI
+        // outcome while a previously deployed service still reports pending.
+        if (attempt.returnedToApp) {
+          // A completed callback whose result stays pending is a read-back
+          // failure the user acted on, so it is referenced and logged like
+          // one (owner-reported silent failure, 2026-08-08) instead of
+          // rendering copy with no diagnostic note behind it.
+          clearPendingHostedSignIn();
+          await showFailure(status, {
+            surface: "hosted_identity",
+            error,
+            messages: {
+              IDENTITY_RESULT_PENDING:
+                `${flow.label} sign-in did not complete. Nothing was uploaded. You can try again.`,
+            },
+            fallback: flow.failed,
+          });
+          return;
+        }
       }
       if (identity !== null) {
         if (attempt.cancelled || activeHostedSignIn !== attempt) return;
+        clearPendingHostedSignIn();
         hostedIdentity = identity;
         activeHostedSignIn = null;
         hostedIdentityBusy = false;
         status.textContent = flow.signedIn;
         renderHostedIdentity();
         foregroundNativeDashboardAfterSignIn();
+        resumeContributionCeremonyAfterSignIn();
         return;
       }
       if (poll + 1 < HOSTED_SIGNIN_POLL_ATTEMPTS) {
@@ -4542,25 +8219,34 @@ async function beginHostedSignIn(providerId) {
       }
     }
     // A bounded poll that ran out is still a failed action from the user's
-    // side, so it is referenced and logged like any other.
-    showFailure(status, {
+    // side, so it is referenced and logged like any other. The poll budget IS
+    // the handoff's validity window, so the persisted record is expired with
+    // it.
+    clearPendingHostedSignIn();
+    await showFailure(status, {
       surface: "hosted_identity",
       error: null,
       fallback: flow.timedOut,
     });
   } catch (error) {
     if (attempt.cancelled || activeHostedSignIn !== attempt) return;
+    // A definite verdict (a coded or HTTP-status failure) retires the
+    // persisted handoff; a transient unreachable-service throw keeps it, so
+    // the reactivation resume can still collect the proof inside its window.
+    if (error?.code !== undefined || error?.status !== undefined) {
+      clearPendingHostedSignIn();
+    }
     const unconfigured = error?.code === "IDENTITY_CONFIGURATION_INVALID";
     if (unconfigured) flow.markUnavailable();
-    showFailure(status, {
+    await showFailure(status, {
       surface: "hosted_identity",
       error,
       messages: unconfigured
         ? { IDENTITY_CONFIGURATION_INVALID: flow.unconfigured }
-        : error?.code === "IDENTITY_TOKEN_INVALID" && attempt.returnedToApp
+        : error?.code === "IDENTITY_TOKEN_INVALID"
           ? {
             IDENTITY_TOKEN_INVALID:
-              `${flow.label} did not confirm the sign-in. Nothing was uploaded; try again.`,
+              `${flow.label} sign-in was cancelled or did not complete. Nothing was uploaded. You can try again.`,
           }
           : {},
       fallback: hostedIdentityErrorCopy(error)
@@ -4577,24 +8263,615 @@ async function beginHostedSignIn(providerId) {
   }
 }
 
-function updateCommunityConnectButton() {
-  const button = $("#connect-community");
-  const consent = $("#community-connect-consent");
-  consent.disabled = false;
-  button.disabled = communityConnectBusy
-    || hostedSignInRequired()
-    || !consent.checked;
-  if (!communityConnectBusy) {
-    button.textContent = hostedSignInRequired()
-      ? "Sign in above to contribute"
-      : "Review contribution";
+// (communityContributionIsConnected and updateCommunityConnectButton left
+// with the separate connect card, owner-directed 2026-08-08: the one-step
+// ceremony pairs and approves in the same interaction, so there is no
+// standalone connect button to label or gate any more.)
+
+// The chip vocabulary of the journey strip. Four states, each an honest
+// summary of the detail line beside it: finished, measurably under way,
+// waiting on something else, or waiting on the reader.
+const JOURNEY_STATE_KEYS = Object.freeze({
+  action: "journey.state.actionNeeded",
+  done: "journey.state.done",
+  progress: "journey.state.inProgress",
+  waiting: "journey.state.waiting",
+});
+
+/**
+ * The guided journey as explicit stages with visible state: app/companion →
+ * index building → evidence → community. Every line is rendered from a
+ * measured fact — companion health, the counted index sources (the same
+ * numbers as the history progress surface), evidence freshness, and the
+ * sign-in/connection facts — and each stage says plainly whether it is done,
+ * in progress with real numbers, or blocked and by what.
+ */
+function renderCommunityJourney() {
+  if (!$("#community-journey")) return;
+  const stage = (name, state, detailKey, detailValues = {}) => {
+    const item = $(`#journey-stage-${name}`);
+    const chip = $(`#journey-stage-${name}-state`);
+    const detail = $(`#journey-stage-${name}-detail`);
+    if (!item || !chip || !detail) return;
+    setLocalizedText(chip, JOURNEY_STATE_KEYS[state]);
+    chip.className =
+      `evidence-chip journey-stage-state${state === "done" ? "" : " neutral"}`;
+    setLocalizedText(detail, detailKey, detailValues);
+    item.className = `journey-stage journey-stage-${state}`;
+  };
+
+  // 1 — the Mac app and its loopback companion.
+  if (localCompanionHealth !== null) {
+    stage("app", "done", "journey.app.connected");
+  } else {
+    stage("app", "action", "journey.app.missing");
+  }
+
+  // 2 — the local index, with the same measured counts the history progress
+  // surface reports. Nothing here estimates a finish time.
+  const history = dashboard?.pricing?.historyCoverage
+    ?? dashboard?.accounting?.historyCoverage
+    ?? null;
+  const totalSources = finite(history?.sourceCount, 0);
+  if (dashboard && dashboard.mode !== "demo" && history?.status === "complete") {
+    stage("index", "done", "journey.index.complete");
+  } else if (dashboard && dashboard.mode !== "demo" && totalSources > 0) {
+    // The same measured counts the history progress surface reports, stated
+    // as one short sentence: the two-sentence byte breakdown wrapped this
+    // card to eight lines (owner-directed tightening, 2026-08-08).
+    stage("index", "progress", "journey.index.progress", {
+      indexed: formatNumber(finite(history.indexedSourceCount, 0)),
+      total: formatNumber(totalSources),
+    });
+  } else {
+    stage("index", "waiting", "journey.index.waiting");
+  }
+
+  // 3 — local evidence.
+  if (dashboard && dashboard.mode !== "demo" && dashboard.freshness?.latestObservedAt) {
+    stage("evidence", "done", "journey.evidence.ready", {
+      time: formatLocal(dashboard.freshness.latestObservedAt),
+    });
+  } else if (dashboard?.mode === "demo") {
+    stage("evidence", "action", "journey.evidence.demo");
+  } else {
+    stage("evidence", "action", "journey.evidence.missing");
+  }
+
+  // 4 — sign in, then the single review-and-approve ceremony (owner-directed
+  // 2026-08-08: connecting is no longer a user-visible step — the ceremony
+  // pairs this Mac itself). Once approval stands the line states the flow's
+  // remaining truth: it syncs automatically.
+  if (localCompanionHealth === null) {
+    stage("community", "waiting", "journey.community.waitingCompanion");
+  } else if (!contributionServiceConfigured()) {
+    stage("community", "waiting", "journey.community.noService");
+  } else if (!incrementalSyncCapabilityAdvertised()) {
+    // A build whose companion does not advertise the v1.0 transport has no
+    // in-page ceremony; a Mac already holding upload authority still reads
+    // as connected rather than pending.
+    if (communityUploadAuthorityEvidence()) {
+      stage("community", "done", "journey.community.connected");
+    } else {
+      stage("community", "waiting", "journey.community.waitingIndex");
+    }
+  } else if (incrementalConsentApproved && incrementalGrantRejected()) {
+    // The transparent re-pair is pending, so this stage must not claim
+    // "done · syncing" while the approve card is asking for a sign-in
+    // (owner-reported contradictory state, 2026-08-08). One truth: a missing
+    // sign-in is the reader's action; otherwise the authorization refresh is
+    // simply in flight.
+    if (hostedSignInRequired()) {
+      stage("community", "action", "journey.community.signInAgain");
+    } else {
+      stage("community", "progress", "journey.community.refreshingAuthority");
+    }
+  } else if (incrementalConsentApproved) {
+    stage("community", "done", "journey.community.syncing");
+  } else if (hostedEnrollmentIsPaused()) {
+    stage("community", "waiting", "journey.community.paused");
+  } else if (hostedSignInRequired()) {
+    stage("community", "action", "journey.community.signInFirst");
+  } else {
+    stage("community", "action", "journey.community.approveNext");
   }
 }
 
-// The local capability layer raises contribution_device_credential_conflict;
-// the companion projects it onto contribution_device_recovery_required at its
-// HTTP boundary. Both name the same leftover credential, so both take the same
-// honest explanation and the same in-page repair.
+// The incremental full-history contribution contract this dashboard is ready
+// to collect consent for. The approve-once surface renders only when the
+// local companion's health payload advertises exactly this capability; until
+// that transport exists the surface stays out of the document entirely, so
+// the page never claims an automatic upload that cannot happen.
+const INCREMENTAL_SYNC_CONTRACT = "telemetry-contribution-v1.0";
+
+function incrementalSyncCapabilityAdvertised() {
+  return localCompanionHealth?.capabilities?.incrementalContributionSync
+    === INCREMENTAL_SYNC_CONTRACT;
+}
+
+/**
+ * Whether the service refused this Mac's uploads for want of the v1.0
+ * consent-once grant. The engine pauses with exactly this fixed reason when
+ * an upload comes back 403 TELEMETRY_CONSENT_INVALID — the mark of a pairing
+ * that was claimed carrying the v0.1 consent, so no grant was recorded.
+ */
+function incrementalGrantRejected() {
+  return incrementalSyncStatus?.status === "available"
+    && incrementalSyncStatus.pausedReason === "consent_rejected";
+}
+
+/**
+ * The one merged surface (owner-directed 2026-08-08). Approval covers the
+ * KIND of data, once, and the first approval keeps the review-bootstrap
+ * requirement — one verified real instance of the data is on screen before
+ * approval can be given. The single button also owns the pairing ceremony:
+ * sign-in is the only prerequisite it states.
+ */
+function renderIncrementalConsent() {
+  const surface = $("#incremental-consent");
+  if (!surface) return;
+  if (!incrementalSyncCapabilityAdvertised()) {
+    surface.hidden = true;
+    return;
+  }
+  surface.hidden = false;
+  const approve = $("#incremental-consent-approve");
+  const gate = $("#incremental-consent-gate");
+  const chip = $("#incremental-consent-state");
+  const reviewVerified = contributionSyncExactReview?.state === "ready";
+  const busy = incrementalConsentBusy || communityConnectBusy;
+  // A recorded approval whose claim carried the v0.1 consent re-opens the
+  // same single action (the transparent re-pair). The chip stays "Approved":
+  // the user's approval stands; only the transport authorization re-runs.
+  const repairNeeded = incrementalConsentApproved && incrementalGrantRejected();
+  setLocalizedText(chip, incrementalConsentApproved
+    ? "consent.stateApproved"
+    : "consent.stateNotApproved");
+  chip.className = incrementalConsentApproved
+    ? "evidence-chip"
+    : "evidence-chip neutral";
+  approve.disabled = busy
+    || (incrementalConsentApproved && !repairNeeded)
+    || (!incrementalConsentApproved && !reviewVerified)
+    || hostedSignInRequired();
+  const remove = $("#delete-contributions");
+  if (remove) {
+    remove.hidden = !hasCommunitySession();
+    remove.disabled = busy;
+  }
+  // The review the approve gate requires, on screen: the verified prepared
+  // instance's own facts. They come from the same queue item the one-use
+  // token was minted for, and they leave with approval — the card then
+  // describes the running sync instead.
+  const facts = $("#incremental-review-facts");
+  const item = contributionSyncPreview?.item;
+  if (facts) {
+    const show = !incrementalConsentApproved && reviewVerified && item != null;
+    facts.hidden = !show;
+    if (show) {
+      setRawText(
+        $("#incremental-review-coverage"),
+        `${formatLocal(item.coveredAt.startAt)} – ${formatLocal(item.coveredAt.endAt)}`,
+      );
+      setRawText(
+        $("#incremental-review-records"),
+        `${compact(item.recordCounts.total)} total · ${compact(item.recordCounts.usageEvents)} usage · ${compact(item.recordCounts.quotaSnapshots)} quota`,
+      );
+      setRawText(
+        $("#incremental-review-bytes"),
+        `${compact(item.preparedBytes)} bytes, verified on this Mac`,
+      );
+    }
+  }
+  if (incrementalConsentApproved && !(repairNeeded && hostedSignInRequired())) {
+    forgetLocalizedNode(gate);
+    gate.textContent = "";
+    gate.hidden = true;
+  } else {
+    gate.hidden = false;
+    // Why the button is off, stated where the button is, in gate order: the
+    // missing sign-in first, then the in-flight review. Connection is no
+    // longer a stated prerequisite — the ceremony performs it itself. A
+    // signed-out Mac that needs the transparent re-pair names the repair's
+    // own next step (owner-reported repair loop, 2026-08-08): sign in again,
+    // and connecting resumes by itself.
+    setLocalizedText(gate, hostedSignInRequired()
+      ? repairNeeded
+        ? "consent.signInAgainToFinish"
+        : "consent.signInFirst"
+      : reviewVerified
+        ? "consent.readyToApprove"
+        : "consent.reviewFirst");
+  }
+  renderIncrementalSyncStatusLine();
+}
+
+/**
+ * The status line for the approved sync, from the companion's bounded
+ * incremental-status projection: live first-pass progress as day counts, the
+ * paused reason code, and the last error code. Every value is a number or a
+ * fixed vocabulary code the projection validated; no path, content, or
+ * identifier can reach this line.
+ *
+ * Re-pinned 2026-08-08 (owner-directed): approval starts the first pass
+ * immediately and the page polls this projection while it runs, so the line
+ * shows "Uploading day 3 of 82…" instead of an indefinite "waiting".
+ */
+function renderIncrementalSyncStatusLine() {
+  const line = $("#incremental-sync-status");
+  if (!line) return;
+  if (!incrementalSyncCapabilityAdvertised()
+      || !incrementalConsentApproved
+      || incrementalSyncStatus?.status !== "available") {
+    forgetLocalizedNode(line);
+    line.textContent = "";
+    line.hidden = true;
+    return;
+  }
+  // The transparent re-pair state renders as the routine it is — an
+  // authorization refresh — never as a failure the user must interpret. When
+  // the page cannot run the refresh yet (signed out), the gate line asks for
+  // sign-in and this line stays quiet rather than claiming work in progress.
+  if (incrementalGrantRejected()) {
+    if (hostedSignInRequired()) {
+      forgetLocalizedNode(line);
+      line.textContent = "";
+      line.hidden = true;
+      return;
+    }
+    setRawText(line, t("consent.syncRefreshingAuthority"));
+    line.hidden = false;
+    return;
+  }
+  const progress = incrementalSyncStatus.progress;
+  const parts = [];
+  if (progress === null) {
+    parts.push(t("consent.syncStarting"));
+  } else if (progress.daysPending > 0 && !incrementalSyncStatus.paused) {
+    // Mid catch-up: the day currently being uploaded, from the settled pass
+    // counts the engine reports between its bounded passes.
+    parts.push(t("consent.syncUploading", {
+      current: formatNumber(Math.min(progress.daysSynced + 1, progress.daysTotal)),
+      total: formatNumber(progress.daysTotal),
+    }));
+  } else {
+    parts.push(t("consent.syncProgress", {
+      pending: formatNumber(progress.daysPending),
+      synced: formatNumber(progress.daysSynced),
+      total: formatNumber(progress.daysTotal),
+    }));
+  }
+  if (incrementalSyncStatus.paused) {
+    parts.push(t("consent.syncPaused", {
+      reason: incrementalSyncStatus.pausedReason ?? "unknown",
+    }));
+  }
+  const outcome = incrementalSyncStatus.lastOutcome;
+  // A bounded partial pass is progress, not an error; only a failed or
+  // paused outcome earns the "Last error" clause (2026-08-08).
+  if (outcome !== null && ["failed", "paused"].includes(outcome.status)) {
+    parts.push(t("consent.syncLastError", { code: outcome.code }));
+  }
+  // A composed multi-part sentence: raw write, like the other composed
+  // status lines, so a stale registry entry cannot resurrect over it.
+  setRawText(line, parts.join(" "));
+  line.hidden = false;
+}
+
+// The live-progress poll behind the first pass (owner-directed 2026-08-08).
+// A chained setTimeout — never an interval — that repeats the same bounded
+// GET the page performs on load, while there is measurable movement to show:
+// a running pass, a first pass that has not settled yet, or pending days
+// between bounded passes. It stops on pause, on completion, and at a fixed
+// budget, so an idle dashboard never polls forever.
+const INCREMENTAL_SYNC_POLL_INTERVAL_MS = 4_000;
+const INCREMENTAL_SYNC_POLL_LIMIT = 450;
+
+function incrementalSyncPollWorthwhile() {
+  if (!incrementalSyncCapabilityAdvertised() || !incrementalConsentApproved) {
+    return false;
+  }
+  const status = incrementalSyncStatus;
+  if (status?.status !== "available" || status.paused) return false;
+  if (status.running) return true;
+  if (status.progress === null) return true;
+  return status.progress.daysPending > 0;
+}
+
+function scheduleIncrementalSyncStatusPoll({ reset = false } = {}) {
+  if (reset) incrementalSyncPollCount = 0;
+  if (incrementalSyncPollTimer !== null) return;
+  if (!incrementalSyncPollWorthwhile()) return;
+  if (incrementalSyncPollCount >= INCREMENTAL_SYNC_POLL_LIMIT) return;
+  incrementalSyncPollTimer = window.setTimeout(() => {
+    incrementalSyncPollTimer = null;
+    incrementalSyncPollCount += 1;
+    void loadIncrementalSyncStatus().catch(() => {});
+  }, INCREMENTAL_SYNC_POLL_INTERVAL_MS);
+}
+
+/**
+ * Re-read the bounded incremental sync status. It carries the durable
+ * consent verdict — so an approved Mac renders as approved after a reload —
+ * and the progress facts the status line prints.
+ */
+async function loadIncrementalSyncStatus() {
+  if (!incrementalSyncCapabilityAdvertised()) {
+    incrementalSyncStatus = null;
+    incrementalConsentApproved = false;
+    renderContributionActionState();
+    return;
+  }
+  incrementalSyncStatus = await localClient.incrementalContributionSyncStatus();
+  // Only an available projection may change the consent verdict: a transient
+  // read failure normalizes to a fail-closed shape whose false consent must
+  // not un-approve a Mac the companion just recorded an approval for.
+  if (incrementalSyncStatus?.status === "available") {
+    incrementalConsentApproved =
+      incrementalSyncStatus.consent.approved === true
+      && incrementalSyncStatus.consent.current === true;
+  }
+  renderContributionActionState();
+  scheduleIncrementalSyncStatusPoll();
+}
+
+/**
+ * The one-step ceremony (owner-directed, 2026-08-08): a single "Review and
+ * approve" interaction does everything after sign-in. It mints the pairing
+ * WITH the v1.0 consent identifier (the server session is already held), has
+ * the companion claim it — the claim is what records the server-side
+ * consent-once grant every chunk upload is verified against — then records
+ * the local approve-once consent with the review token, and the companion
+ * starts the first sync pass immediately.
+ *
+ * The same ceremony is the transparent re-pair path: a Mac whose earlier
+ * claim carried the v0.1 consent has no grant, so its uploads pause with
+ * consent_rejected. Re-running the ceremony re-pairs with the v1.0 consent
+ * and skips the local approval it already holds — nothing is reported as a
+ * failure, because nothing the user did failed.
+ */
+async function approveIncrementalContribution() {
+  if (incrementalConsentBusy || communityConnectBusy
+      || !incrementalSyncCapabilityAdvertised()) {
+    return;
+  }
+  const status = $("#incremental-consent-status");
+  const needsLocalApproval = !incrementalConsentApproved;
+  if (needsLocalApproval && contributionSyncExactReview?.state !== "ready") {
+    status.hidden = false;
+    status.className = "participant-action-status error";
+    setLocalizedText(status, "consent.reviewFirst");
+    return;
+  }
+  if (hostedEnrollmentIsPaused()) {
+    status.hidden = false;
+    status.className = "participant-action-status error";
+    setLocalizedText(status, "contribution.enrollmentPausedNoUpload");
+    return;
+  }
+  if (hostedSignInRequired()) {
+    status.hidden = false;
+    status.className = "participant-action-status error";
+    setLocalizedText(status, "consent.signInFirst");
+    return;
+  }
+  incrementalConsentBusy = true;
+  // A hosted proof is intentionally one-use. If enrollment itself fails, the
+  // page must not claim the same proof can be retried: it is dropped and the
+  // next action is a fresh browser sign-in. Failures after a session is
+  // established can be retried without authenticating again.
+  let enrollmentAttemptedWithHostedIdentity = false;
+  let enrollmentEstablished = false;
+  renderContributionActionState();
+  try {
+    // --- Upload authority, inside the same interaction. -------------------
+    // Only a v1.0-consent claim made by THIS session proves the server-side
+    // grant exists; anything less re-pairs. The claim is idempotent for a
+    // valid credential and the companion resumes its engine on pairing, so
+    // re-pairing is safe even when a grant already existed.
+    if (!communityDevicePairedV1) {
+      await contributionConnectStep("service_check", status, () => {
+        if (localCompanionHealth?.capabilities?.contributionDevicePairing !== true) {
+          const error = new Error(
+            "The local app is not connected to a configured contribution service."
+          );
+          error.code = "contribution_device_pairing_not_configured";
+          throw error;
+        }
+      });
+      let pairing;
+      // A pending sign-in proof ALWAYS establishes its own fresh session
+      // first (owner-reported resume bug, 2026-08-08): after a
+      // session-rejected repair, any stored csrfToken is either gone or
+      // exactly the credential the service just refused, and minting the
+      // pairing with it burned the sign-in behind repeated AUTH_REQUIRED
+      // failures the user had already fixed by signing in. The stored
+      // session mints directly only when NO proof is in hand, so the
+      // post-sign-in order is fixed: enroll with the proof, adopt the
+      // session it returns, then mint and claim the v1.0 pairing.
+      if (hostedIdentity === null && communitySession?.csrfToken) {
+        pairing = await contributionConnectStep(
+          "hosted_enrollment",
+          status,
+          () => communityClient.createDevicePairing(false),
+        );
+      } else {
+        // This page never collects or sends an invitation code. The Worker
+        // is the authority on whether its current enrollment mode admits
+        // this hosted proof; a paused service fails before the browser
+        // OAuth start. The enrollment deliberately does NOT request the
+        // device bootstrap: the Worker's bootstrap pairing may only carry
+        // the v0.1 ongoing consent, so the pairing is minted separately
+        // with the session the enrollment just established — the one route
+        // that can carry the v1.0 consent (2026-08-08).
+        enrollmentAttemptedWithHostedIdentity = hostedIdentity !== null;
+        pairing = await contributionConnectStep("hosted_enrollment", status, async () => {
+          const enrollment = await communityClient.enroll(
+            null,
+            "telemetry-contribution-v0.1",
+            { deviceBootstrap: false, identity: hostedIdentity }
+          );
+          if (enrollment?.schemaVersion !== "participant-bootstrap-v0.1"
+              || typeof enrollment?.csrfToken !== "string") {
+            const error = new Error(
+              "The contribution service did not establish pseudonymous access."
+            );
+            error.code = "enrollment_response_invalid";
+            throw error;
+          }
+          setCommunitySession({
+            csrfToken: enrollment.csrfToken,
+            participantId: enrollment.participantId ?? null,
+            consentVersion: "privacy-safe-telemetry-v0.1"
+          });
+          enrollmentEstablished = true;
+          return communityClient.createDevicePairing(false);
+        });
+      }
+      await contributionConnectStep(
+        "device_pairing",
+        status,
+        () => finishCommunityDevicePairing(pairing, status),
+      );
+      pairing = null;
+      communityDevicePairedV1 = true;
+    }
+    // --- Local consent, and the first pass starts now. --------------------
+    if (needsLocalApproval) {
+      status.hidden = false;
+      status.className = "participant-action-status";
+      setLocalizedText(status, "consent.approving");
+      const result = await localClient.approveIncrementalContribution(
+        contributionSyncExactReview.reviewToken
+      );
+      if (result?.status !== "approved") {
+        const error = new Error("The local companion did not record the approval.");
+        error.code = "incremental_consent_failed";
+        throw error;
+      }
+      incrementalConsentApproved = true;
+      setLocalizedText(status, "consent.approved");
+    } else {
+      // The transparent re-pair: the local approval already stands, the
+      // fresh claim recorded the grant, and the companion's pairing route
+      // resumed and kicked the engine. Say what happened, not "failed".
+      status.hidden = false;
+      status.className = "participant-action-status";
+      setLocalizedText(status, "consent.authorityRefreshed");
+    }
+    // The companion starts the first pass immediately on approval; read the
+    // bounded status now and keep polling so the line shows live progress.
+    await loadIncrementalSyncStatus().catch(() => {});
+    scheduleIncrementalSyncStatusPoll({ reset: true });
+  } catch (error) {
+    if (contributionConnectStepOf(error) !== null
+        && contributionSessionWasRejected(error)) {
+      // The stored session was rejected mid-ceremony. This is the repair
+      // loop's root (owner-reported, 2026-08-08): failure copy here repeated
+      // on every load while the dead session survived. Render the sign-in
+      // gate instead — once signed in, the ceremony resumes automatically.
+      renderContributionSessionSignInGate(status);
+    } else if (contributionConnectStepOf(error) !== null
+        || contributionDeviceRecoveryIsRequired(error)) {
+      await reportContributionConnectFailure(status, error, {
+        enrollmentAttemptedWithHostedIdentity,
+        enrollmentEstablished,
+      });
+    } else {
+      await showFailure(status, {
+        surface: "automatic_contribution",
+        error,
+        fallback:
+          "The approval could not be recorded on this Mac, so nothing changed and nothing uploads automatically."
+      });
+    }
+  } finally {
+    incrementalConsentBusy = false;
+    renderContributionActionState();
+  }
+}
+
+/**
+ * The silent authorization repair (owner-directed, 2026-08-08): when the
+ * engine reports consent_rejected — the first upload came back 403
+ * TELEMETRY_CONSENT_INVALID because the earlier claim carried the v0.1
+ * consent — and this page holds the session, the ceremony re-runs by itself,
+ * once per page load. The user approved this exact kind of data already; the
+ * re-pair is transport repair, not a new decision, so it must not read as a
+ * failure or ask again.
+ */
+function maybeRepairIncrementalAuthorization() {
+  if (incrementalRepairAttempted) return;
+  if (incrementalConsentBusy || communityConnectBusy) return;
+  if (!incrementalSyncCapabilityAdvertised()) return;
+  if (!incrementalConsentApproved || !incrementalGrantRejected()) return;
+  if (!hasCommunitySession()) return;
+  incrementalRepairAttempted = true;
+  void approveIncrementalContribution();
+}
+
+/**
+ * After a completed hosted sign-in, finish what the sign-in was for
+ * (owner-reported repair loop, 2026-08-08): a Mac whose approval stands but
+ * whose upload authority was refused resumes the connect ceremony immediately
+ * with the fresh proof — the promised "sign in again to finish connecting
+ * this Mac" journey ends here without another click. Only the repair path
+ * resumes automatically; a Mac that never approved still gets its explicit
+ * Review-and-approve action.
+ */
+function resumeContributionCeremonyAfterSignIn() {
+  if (!incrementalSyncCapabilityAdvertised()) return;
+  if (!incrementalConsentApproved || !incrementalGrantRejected()) return;
+  if (incrementalConsentBusy || communityConnectBusy) return;
+  void approveIncrementalContribution();
+}
+
+// Deletion honesty (owner-directed, 2026-08-08): the card no longer states a
+// deletion promise without a control behind it. This is the control — the
+// service's participant deletion (DELETE /api/v1/me), which purges accepted
+// chunks and stored uploads and tombstones the account. It needs the live
+// session, asks for explicit confirmation, and touches nothing local.
+const CONTRIBUTION_DELETION_CONFIRMATION =
+  "Delete everything you contributed?\n\nThe service deletes your contributed usage data and this account's records, and this Mac's upload authority stops working. Local reporting on this Mac is unchanged. This cannot be undone.";
+
+async function deleteCommunityContributions() {
+  if (incrementalConsentBusy || communityConnectBusy) return;
+  if (!hasCommunitySession()) return;
+  if (!window.confirm(CONTRIBUTION_DELETION_CONFIRMATION)) return;
+  const status = $("#incremental-consent-status");
+  incrementalConsentBusy = true;
+  renderContributionActionState();
+  status.hidden = false;
+  status.className = "participant-action-status";
+  setProductText(status, "Deleting your contributed data from the service…");
+  try {
+    await communityClient.deleteParticipant();
+    // The account is tombstoned server-side: the session, the sign-in proof
+    // and this Mac's pairing evidence are all dead with it.
+    hostedIdentity = null;
+    setCommunitySession(null);
+    communityDevicePairedV1 = false;
+    status.hidden = false;
+    status.className = "participant-action-status";
+    setProductText(
+      status,
+      "Deleted. The service removed your contributed data and this account's records. Local reporting on this Mac is unchanged.",
+    );
+    renderHostedIdentity();
+    await loadIncrementalSyncStatus().catch(() => {});
+  } catch (error) {
+    await showFailure(status, {
+      surface: "participant_deletion",
+      error,
+      fallback:
+        "The service did not confirm the deletion, so nothing is assumed deleted. Try again."
+    });
+  } finally {
+    incrementalConsentBusy = false;
+    renderContributionActionState();
+  }
+}
+
 function contributionDeviceRecoveryIsRequired(error) {
   try {
     return error?.code === "contribution_device_recovery_required"
@@ -4604,15 +8881,66 @@ function contributionDeviceRecoveryIsRequired(error) {
   }
 }
 
+// The service's three session-rejection codes: the stored browser session or
+// its CSRF confirmation was not recognized — a session that predates the last
+// service deploy, or one that expired server-side. Nothing about the user's
+// approval or this Mac's queue is wrong when one of these comes back, so the
+// honest next step is a fresh sign-in, never a retry with the same dead
+// session (owner-reported repair loop, 2026-08-08).
+const CONTRIBUTION_SESSION_REJECTION_CODES = new Set([
+  "AUTH_REQUIRED",
+  "AUTH_INVALID",
+  "CSRF_INVALID",
+]);
+
+function contributionSessionWasRejected(error) {
+  try {
+    return CONTRIBUTION_SESSION_REJECTION_CODES.has(error?.code);
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Explain the leftover-credential fault and offer the one action that fixes it.
- *
- * This replaces a generic "check the service and Keychain" message with the
- * actual cause, and is the only place the reset control appears: it is shown
- * when, and only when, a credential conflict was actually detected.
+ * The one fallback for a rejected stored session (owner-reported repair loop,
+ * 2026-08-08). The silent repair used to treat a session-rejected pairing
+ * mint as a terminal step-2 failure, keep the dead session, and repeat the
+ * identical failure on every load. A rejected session is not a failure the
+ * user must interpret: clear the dead session and the stale identity proof,
+ * say the one action that fixes it, and render the sign-in gate. The user's
+ * approval still stands, and after the next sign-in the ceremony resumes by
+ * itself — see resumeContributionCeremonyAfterSignIn.
  */
-function renderContributionDeviceRecovery(status, { error } = {}) {
-  const described = describeFailure({
+function renderContributionSessionSignInGate(status) {
+  hostedIdentity = null;
+  communityDevicePairedV1 = false;
+  // Any auth rejection consumes this load's one automatic attempt: after the
+  // gate, only an explicit user action — completing a sign-in, or pressing
+  // Review and approve — may run the ceremony again (owner-reported repeated
+  // AUTH_REQUIRED burst, 2026-08-08).
+  incrementalRepairAttempted = true;
+  // Clearing the session re-renders the approve surface, whose gate line now
+  // asks for the sign-in; the guarded auto-repair cannot re-run without a
+  // session, so this cannot loop.
+  setCommunitySession(null);
+  status.hidden = false;
+  status.className = "participant-action-status";
+  setLocalizedText(status, "consent.signInAgainToFinish");
+  // One truth about being signed in (owner-reported contradictory state,
+  // 2026-08-08): the identity card's status line is rewritten too, so a
+  // stale "Signed in with Google" sentence cannot sit beside a "Not signed
+  // in" chip after the proof and session were cleared.
+  const identityStatus = $("#identity-signin-status");
+  if (identityStatus) {
+    identityStatus.hidden = false;
+    identityStatus.className = "participant-action-status";
+    setLocalizedText(identityStatus, "consent.signInAgainToFinish");
+  }
+  renderHostedIdentity();
+}
+
+async function renderContributionDeviceRecovery(status, { error } = {}) {
+  const described = await describeFailure({
     surface: "contribution_connect",
     error,
     fallback: CONTRIBUTION_DEVICE_CONFLICT_COPY
@@ -4627,11 +8955,7 @@ function renderContributionDeviceRecovery(status, { error } = {}) {
   reset.addEventListener("click", () => {
     void resetContributionDeviceCredential();
   });
-  const action = node(
-    "a",
-    "button button-secondary",
-    "Open TiboTattle"
-  );
+  const action = node("a", "button button-secondary", "Open TiboTattle");
   if (SEMANTIC_OPEN_TARGET) {
     action.href = SEMANTIC_OPEN_TARGET;
   } else {
@@ -4639,8 +8963,6 @@ function renderContributionDeviceRecovery(status, { error } = {}) {
   }
   const actions = node("div", "contribution-cta-buttons");
   actions.append(reset, action);
-  // Reachable from journeys that never revealed this element, so it un-hides
-  // itself rather than relying on the caller having done so.
   status.hidden = false;
   status.className = "participant-action-status error";
   status.replaceChildren(
@@ -4653,7 +8975,7 @@ function renderContributionDeviceRecovery(status, { error } = {}) {
     node(
       "p",
       "annotation",
-      "Resetting clears only that unusable local credential and its local record. Metadata you already contributed is untouched, no hosted device is revoked, and the TiboTattle app's Data & Diagnostics… menu offers the same repair natively."
+      "Resetting clears only that unusable credential and its local record. Then choose Review and approve again."
     ),
     actions
   );
@@ -4661,27 +8983,33 @@ function renderContributionDeviceRecovery(status, { error } = {}) {
 }
 
 const DEVICE_CREDENTIAL_RESET_CONFIRMATION =
-  "Clear this Mac's unusable contribution-device credential?\n\nThis deletes only the leftover credential in this Mac's Keychain and the local record that went with it. Metadata you already contributed is not deleted, no hosted device is revoked, and your local reporting is unchanged.";
+  "Clear this Mac's unusable contribution-device credential?\n\nThis clears only the leftover credential in this Mac's Keychain and its local record. Local reporting is unchanged.";
 
 async function resetContributionDeviceCredential() {
-  if (communityConnectBusy) return;
+  if (communityConnectBusy || incrementalConsentBusy) return;
   if (!window.confirm(DEVICE_CREDENTIAL_RESET_CONFIRMATION)) return;
-  const status = $("#community-connect-status");
+  // The recovery reports on the merged ceremony's own status line
+  // (owner-directed 2026-08-08: the separate connect card is gone).
+  const status = $("#incremental-consent-status");
   communityConnectBusy = true;
-  updateCommunityConnectButton();
+  renderContributionActionState();
   status.hidden = false;
   status.className = "participant-action-status";
   status.textContent = "Clearing the unusable local device credential…";
   try {
     const result = await localClient.resetContributionDeviceCredential();
     if (result.status === "unavailable") {
-      throw new Error("The local companion did not confirm the reset.");
+      // Carry a code: a codeless throw always fell through to the generic
+      // "the cause was not reported in a form this page can explain".
+      const error = new Error("The local companion did not confirm the reset.");
+      error.code = "device_credential_reset_failed";
+      throw error;
     }
     status.textContent = result.status === "already_absent"
-      ? "No leftover device credential was present on this Mac, so nothing was deleted. Choose Contribute and keep it current to connect."
-      : "The leftover device credential was cleared. Metadata you already contributed is untouched. Choose Contribute and keep it current to connect this Mac again.";
+      ? "No leftover device credential was present. Choose Review and approve to continue."
+      : "The leftover device credential was cleared. Choose Review and approve again.";
   } catch (error) {
-    showFailure(status, {
+    await showFailure(status, {
       surface: "device_credential_reset",
       error,
       fallback:
@@ -4689,1337 +9017,166 @@ async function resetContributionDeviceCredential() {
     });
   } finally {
     communityConnectBusy = false;
-    updateCommunityConnectButton();
+    renderContributionActionState();
   }
 }
 
 async function finishCommunityDevicePairing(pairing, status) {
   if (typeof pairing?.pairingCode !== "string") {
-    throw new Error("The service did not return a one-use pairing capability.");
+    const error = new Error("The service did not return a one-use pairing capability.");
+    error.code = "contribution_device_pairing_response_invalid";
+    throw error;
   }
   const paired = await localClient.pairContributionDevice(pairing.pairingCode);
   if (paired.status !== "paired") {
-    throw new Error("The local app did not accept the upload-only pairing.");
+    const error = new Error("The local app did not accept the upload-only pairing.");
+    error.code = "contribution_device_pairing_response_invalid";
+    throw error;
   }
+  communityDevicePaired = true;
   status.textContent =
     `This Mac is connected through ${formatLocal(paired.expiresAt)}. Nothing was uploaded.`;
   return paired;
 }
 
-function openContributionReview() {
-  const disclosure = $("#community-contribution-disclosure");
-  disclosure.open = true;
-  const queue = $(".sync-status-panel");
-  queue.hidden = false;
-  queue.open = true;
-}
-
-async function disableAutomaticContribution() {
-  if (automaticContributionBusy) return;
-  const status = $("#community-connect-status");
-  automaticContributionBusy = true;
-  status.hidden = false;
-  status.className = "participant-action-status";
-  status.textContent = "Turning off automatic contribution…";
-  renderAutomaticContributionStatus(automaticContributionStatus);
-  try {
-    const disabled = await localClient.disableAutomaticContribution();
-    if (disabled.state === "unavailable" || disabled.enabled) {
-      throw new Error("Automatic contribution did not turn off.");
-    }
-    pendingAutomaticContributionConsent = null;
-    renderAutomaticContributionStatus(disabled);
-    status.textContent =
-      "Automatic contribution is off. Already accepted metadata is unchanged; use Hosted privacy controls if you want it deleted.";
-  } catch (error) {
-    showFailure(status, {
-      surface: "automatic_contribution",
-      error,
-      fallback:
-        "Automatic contribution could not be turned off. No setting was inferred; check the local companion and try again."
-    });
-  } finally {
-    automaticContributionBusy = false;
-    renderAutomaticContributionStatus(automaticContributionStatus);
-  }
-}
-
-async function connectCommunityContribution() {
-  if (communityConnectBusy) return;
-  const status = $("#community-connect-status");
-  if (hostedSignInRequired()) {
-    status.hidden = false;
-    status.className = "participant-action-status error";
-    status.textContent =
-      "Sign in first: hosted participation requires Google or Apple sign-in above. Local-only use needs no account, and nothing was uploaded.";
-    return;
-  }
-  let pairing = null;
-  // A hosted proof is intentionally one-use. If enrollment itself fails, do
-  // not leave the page claiming that the same proof can safely be retried:
-  // drop it from this memory-only page and make the next action a fresh
-  // browser sign-in. Failures after a session is established are different —
-  // the user can retry those local pairing steps without authenticating again.
-  let enrollmentAttemptedWithHostedIdentity = false;
-  let enrollmentEstablished = false;
-  communityConnectBusy = true;
-  status.hidden = false;
-  status.className = "participant-action-status";
-  status.textContent =
-    "Creating pseudonymous contribution access and connecting this Mac…";
-  $("#connect-community").textContent = "Connecting contribution…";
-  updateCommunityConnectButton();
-  try {
-    if (localCompanionHealth?.capabilities?.contributionDevicePairing !== true) {
-      throw new Error(
-        "The local app is not connected to a configured contribution service."
-      );
-    }
-    if (communitySession?.csrfToken) {
-      pairing = await communityClient.createDevicePairing(false);
-      await finishCommunityDevicePairing(pairing, status);
-    } else {
-      // Production enrollment is open, so this page never collects or sends an
-      // invitation code. The client keeps the parameter because the service
-      // still supports an invite-only mode for private pilots.
-      enrollmentAttemptedWithHostedIdentity = hostedIdentity !== null;
-      const enrollment = await communityClient.enroll(
-        null,
-        "telemetry-contribution-v0.1",
-        { deviceBootstrap: true, identity: hostedIdentity }
-      );
-      if (enrollment?.schemaVersion !== "participant-bootstrap-v0.1"
-          || enrollment?.state !== "pairing_ready"
-          || typeof enrollment?.csrfToken !== "string"
-          || typeof enrollment?.pairing?.pairingCode !== "string") {
-        throw new Error(
-          "The contribution service did not establish paired pseudonymous access."
-        );
-      }
-      setCommunitySession({
-        csrfToken: enrollment.csrfToken,
-        participantId: enrollment.participantId ?? null,
-        consentVersion: "privacy-safe-telemetry-v0.1"
-      });
-      enrollmentEstablished = true;
-      // The ordinary contribution product has no recovery journey. The server
-      // still returns this legacy capability, but the browser intentionally
-      // neither displays nor persists it.
-      void enrollment.recoveryCode;
-      pairing = enrollment.pairing;
-      await finishCommunityDevicePairing(pairing, status);
-    }
-    pendingAutomaticContributionConsent = null;
-    $("#community-connect-consent").checked = false;
-    openContributionReview();
-    await Promise.all([
-      refreshContributionSyncControls(),
-      loadCommunityResults(),
-    ]);
-    status.textContent =
-      "Connected. Review the content-free result below before deciding whether to send it. Nothing will repeat automatically.";
-    await prepareLocalContribution();
-    if (contributionSyncPreview?.state === "ready") {
-      await inspectNextContribution();
-    }
-  } catch (error) {
-    if (contributionDeviceRecoveryIsRequired(error)) {
-      renderContributionDeviceRecovery(status, { error });
-    } else {
-      const retryNeedsFreshSignIn = enrollmentAttemptedWithHostedIdentity
-        && !enrollmentEstablished
-        && hostedIdentity !== null;
-      if (retryNeedsFreshSignIn) {
-        hostedIdentity = null;
-        renderHostedIdentity();
-      }
-      // The fallback is reached only when the cause is genuinely unknown, so
-      // it must not assert which of several unrelated things to go and check.
-      const described = showFailure(status, {
-        surface: "contribution_connect",
-        error,
-        fallback:
-          "This Mac could not be connected, and no evidence was uploaded. The cause was not reported in a form this page can explain; retrying is safe."
-      });
-      if (retryNeedsFreshSignIn) {
-        status.textContent = `${described.text} For safety, this page discarded the one-time sign-in; sign in again before retrying.`;
-      }
-    }
-  } finally {
-    pairing = null;
-    communityConnectBusy = false;
-    updateCommunityConnectButton();
-  }
-}
-
-function contributionPreparationEstimate(
-  data = dashboard,
-  lookbackHours = activeContributionLookbackHours,
-  admission = participantContributionAdmission,
-) {
-  if (!data || data.mode === "demo") return null;
-  const referenceMs = Date.parse(data.freshness?.latestObservedAt);
-  const endMs = Number.isFinite(referenceMs) ? referenceMs : Date.now();
-  const startMs = endMs - lookbackHours * 60 * 60 * 1_000;
-  const usageEvents = (data.timeline?.usage ?? []).reduce((total, row) => {
-    const rowEnd = Date.parse(row.endAt);
-    return Number.isFinite(rowEnd) && rowEnd >= startMs && rowEnd <= endMs
-      ? total + Math.max(0, Math.floor(finite(row.usageEvents, 0)))
-      : total;
-  }, 0);
-  const quotaSnapshots = (data.timeline?.quota ?? []).filter((row) => {
-    const observed = Date.parse(row.observedAt);
-    return Number.isFinite(observed) && observed >= startMs && observed <= endMs;
-  }).length;
-  const records = usageEvents + quotaSnapshots;
-  const batches = records > 0 ? Math.ceil(records / 200) : 0;
-  const batchAdmission = contributionBatchAdmission({
-    estimatedBatches: batches,
-    participantAdmission: admission,
-  });
-  return {
-    usageEvents,
-    quotaSnapshots,
-    records,
-    batches,
-    maximumSerializedBytes: batches * 1_310_720,
-    localReviewLimit: batchAdmission.localReviewLimit,
-    admissionKnown: batchAdmission.admissionKnown,
-    remainingBatches: batchAdmission.remainingBatches,
-    maximumBatches: batchAdmission.maximumBatches,
-    renewsAt: batchAdmission.renewsAt,
-    effectiveBatchLimit: batchAdmission.effectiveBatchLimit,
-    exceedsLocalReviewLimit: batchAdmission.exceedsLocalReviewLimit,
-    exceedsParticipantAdmission:
-      batchAdmission.exceedsParticipantAdmission,
-    tooLarge: batchAdmission.blocked,
-    partial: ![
-      "recent_7d_complete",
-      "recent_7d_partial",
-      "prospective_only",
-    ].includes(data.collector?.indexing?.status),
-  };
-}
-
-function renderContributionPreparationEstimate() {
-  const element = $("#preparation-estimate");
-  const button = $("#prepare-contribution");
-  const estimate = contributionPreparationEstimate();
-  if (!element || !button) return null;
-  if (!estimate) {
-    element.textContent =
-      "Analyze local usage to estimate privacy-safe records and upload batches before preparation.";
-    if (!contributionPreparationBusy) button.disabled = false;
-    return null;
-  }
-  if (estimate.records === 0) {
-    element.textContent =
-      "No privacy-safe records are visible in this indexed interval. Choose another window or update local usage first.";
-  } else {
-    const coverage = estimate.partial
-      ? " The local index is partial, so the exact count may be higher."
-      : "";
-    const renews = estimate.renewsAt
-      ? ` The participant allowance renews ${formatLocal(estimate.renewsAt)}.`
-      : "";
-    if (estimate.exceedsParticipantAdmission) {
-      element.textContent = estimate.remainingBatches === 0
-        ? `This participant has no community batch allowance remaining.${renews} Wait for renewal before preparing another reviewed set. No local preparation or upload has started.`
-        : `Preflight estimates ${compact(estimate.batches)} batches, above this participant’s ${compact(estimate.remainingBatches)} remaining community batch${estimate.remainingBatches === 1 ? "" : "es"}.${renews} Choose a shorter window or wait for renewal before preparing.${coverage}`;
-    } else if (estimate.exceedsLocalReviewLimit) {
-      element.textContent =
-        `Preflight estimates ${compact(estimate.records)} records across ${compact(estimate.batches)} batches, above the local ${compact(estimate.localReviewLimit)}-batch reviewed-set safety cap. Choose a shorter window before preparing.${coverage}`;
-    } else {
-      const admission = estimate.admissionKnown
-        ? ` This participant has ${compact(estimate.remainingBatches)} of ${compact(estimate.maximumBatches)} community batches remaining${estimate.renewsAt ? ` until ${formatLocal(estimate.renewsAt)}` : ""}.`
-        : " Community batch allowance is unknown until this Mac is connected; the service checks it again before accepting any upload.";
-      element.textContent =
-        `Preflight estimates ${compact(estimate.records)} records across about ${compact(estimate.batches)} batch${estimate.batches === 1 ? "" : "es"} (${compact(estimate.maximumSerializedBytes)} bytes worst-case). Exact counts and bytes are independently verified before queueing; no wall-clock ETA is inferred from record count.${admission}${coverage}`;
-    }
-  }
-  if (!contributionPreparationBusy) {
-    button.disabled = estimate.records === 0 || estimate.tooLarge;
-  }
-  return estimate;
-}
-
-async function prepareLocalContribution() {
-  if (contributionPreparationBusy) return;
-  const estimate = renderContributionPreparationEstimate();
-  if (estimate?.tooLarge) {
-    const status = $("#prepare-contribution-status");
-    status.classList.add("error");
-    status.textContent = estimate.exceedsParticipantAdmission
-      ? `This interval is estimated to exceed the participant’s remaining community allowance${estimate.renewsAt ? `, which renews ${formatLocal(estimate.renewsAt)}` : ""}. Choose a shorter window or wait for renewal. No preparation or upload started.`
-      : "This interval is estimated to exceed the local 100-batch reviewed-set safety cap. Choose a shorter window. No preparation or upload started.";
-    return;
-  }
-  contributionPreparationBusy = true;
-  const button = $("#prepare-contribution");
-  const status = $("#prepare-contribution-status");
-  button.disabled = true;
-  button.textContent = "Preparing locally…";
-  status.classList.remove("error");
-  const lookbackLabel = activeContributionLookbackHours === 1
-    ? "latest hour"
-    : activeContributionLookbackHours === 24
-      ? "last 24 hours"
-      : "last seven days";
-  status.textContent =
-    `Building and independently verifying content-free evidence from the ${lookbackLabel}. No network upload is performed.`;
-  clearContributionSyncExactReview();
-  try {
-    const result = await localClient.prepareContribution({
-      lookbackHours: activeContributionLookbackHours,
-    });
-    if (result.status !== "prepared") {
-      throw new Error("Preparation did not return a verified contribution.");
-    }
-    const records = result.recordCounts.usageEvents
-      + result.recordCounts.quotaSnapshots
-      + result.recordCounts.activityMarkers;
-    const coveredLabel = result.coveredAt?.startAt && result.coveredAt?.endAt
-      ? ` covering ${formatLocal(result.coveredAt.startAt)} through ${formatLocal(result.coveredAt.endAt)}`
-      : "";
-    status.textContent =
-      `Prepared ${compact(result.prepared.batchCount)} verified batch${result.prepared.batchCount === 1 ? "" : "es"} with ${compact(records)} safe records (${compact(result.prepared.bytes)} bytes)${coveredLabel}. Nothing was uploaded.`;
-    await refreshContributionSyncControls();
-  } catch (error) {
-    status.classList.add("error");
-    const preparationMessages = {
-      identity_unavailable:
-        "The local Keychain identity is unavailable. Open Keychain Access, select the login Keychain, unlock it, then retry. Do not reset, delete, rotate, or broaden access to the identity. No upload occurred.",
-      coverage_unavailable:
-        "No usable local coverage is available yet. Analyze local usage first. No upload occurred.",
-      coverage_invalid:
-        "The selected local coverage interval is not usable for a contribution. No upload occurred.",
-      no_safe_records:
-        "No privacy-safe records were found in the selected interval. No upload occurred.",
-      export_too_large:
-        activeContributionLookbackHours > 24
-          ? "Seven days exceeded the current single reviewed-set safety cap. Try 24 hours; on a very active history, use 1 hour. Nothing was truncated or uploaded."
-          : activeContributionLookbackHours === 24
-            ? "This high-activity 24-hour interval exceeded the current single reviewed-set safety cap. Choose 1 hour. Nothing was truncated or uploaded; longer dense intervals need the planned locally aggregated export format."
-            : "The latest hour exceeded a fixed reviewed-set safety bound. Nothing was truncated or uploaded.",
-      privacy_verification_failed:
-        "Privacy verification rejected the prepared data, so it was not queued or uploaded.",
-      preparation_in_progress:
-        "A local preparation is already running. Nothing has been uploaded.",
-      review_archive_invalid:
-        "The local review archive could not be written, so nothing was queued. No upload occurred.",
-      prepared_spool_invalid:
-        "The local prepared-contribution spool is not in a usable state, so nothing was queued. No upload occurred.",
-      preparation_failed:
-        "A privacy-verified contribution could not be prepared. No upload occurred and incomplete staging is ignored by the queue."
-    };
-    status.textContent = describeFailure({
-      surface: "contribution_prepare",
-      error,
-      messages: preparationMessages,
-      fallback:
-        "A privacy-verified contribution could not be prepared. No upload occurred and incomplete staging is ignored by the queue."
-    }).text;
-  } finally {
-    contributionPreparationBusy = false;
-    button.disabled = false;
-    button.textContent = activeContributionLookbackHours === 1
-      ? "Prepare and review latest hour"
-      : activeContributionLookbackHours === 24
-        ? "Prepare and review last 24 hours"
-        : "Prepare and review last 7 days";
-    renderContributionPreparationEstimate();
-  }
-}
-
-function parseSafeExport(file) {
-  if (!file || file.size > 1_310_720) throw new Error("Choose a JSON export no larger than 1.25 MB.");
-  if (!file.name.toLowerCase().endsWith(".json") && file.type !== "application/json") {
-    throw new Error("Choose the JSON export produced by TiboTattle.");
-  }
-  return file.text().then((content) => {
-    let payload;
-    try {
-      payload = parseJsonWithUniqueObjectKeys(content);
-    } catch (error) {
-      if (error?.code === "duplicate_json_object_key") {
-        throw new Error("The selected file contains duplicate JSON object keys.");
-      }
-      throw new Error("The selected file is not valid JSON.");
-    }
-    validateContributionForUpload(payload);
-    return payload;
-  });
-}
-
-function resetSelectedContributionInspection() {
-  selectedContributionValidated = false;
-  $("#selected-contribution-inspection").hidden = true;
-  $("#selected-contribution-state").textContent = "Not validated";
-  $("#selected-contribution-state").className = "evidence-chip neutral";
-  $("#selected-contribution-message").textContent =
-    "Choose a TiboTattle export to validate it locally.";
-  $("#selected-contribution-schema").textContent = "—";
-  $("#selected-contribution-bytes").textContent = "—";
-  $("#selected-contribution-usage").textContent = "—";
-  $("#selected-contribution-quota").textContent = "—";
-  $("#selected-contribution-json").textContent = "";
-}
-
-function renderSelectedContributionInspection(file, payload) {
-  const usageRows = Array.isArray(payload.usageEvents)
-    ? payload.usageEvents.length
-    : 0;
-  const quotaRows = Array.isArray(payload.quotaSnapshots)
-    ? payload.quotaSnapshots.length
-    : 0;
-  selectedContributionValidated = true;
-  $("#selected-contribution-inspection").hidden = false;
-  $("#selected-contribution-state").textContent = "Validated locally";
-  $("#selected-contribution-state").className = "evidence-chip";
-  $("#selected-contribution-message").textContent =
-    "The closed-schema browser preflight passed. Expand the review below before consenting.";
-  $("#selected-contribution-schema").textContent = payload.schemaVersion;
-  $("#selected-contribution-bytes").textContent =
-    `${new Intl.NumberFormat("en-US").format(file.size)} bytes`;
-  $("#selected-contribution-usage").textContent = compact(usageRows);
-  $("#selected-contribution-quota").textContent = compact(quotaRows);
-  $("#selected-contribution-json").textContent = JSON.stringify(payload, null, 2);
-}
-
-function renderSelectedContributionError(error) {
-  selectedContributionValidated = false;
-  $("#selected-contribution-inspection").hidden = false;
-  $("#selected-contribution-state").textContent = "Rejected locally";
-  $("#selected-contribution-state").className = "evidence-chip error";
-  $("#selected-contribution-message").textContent =
-    error instanceof Error
-      ? error.message
-      : "The selected file did not pass the closed-schema browser preflight.";
-  $("#selected-contribution-schema").textContent = "Not accepted";
-  $("#selected-contribution-bytes").textContent = "—";
-  $("#selected-contribution-usage").textContent = "—";
-  $("#selected-contribution-quota").textContent = "—";
-  $("#selected-contribution-json").textContent = "";
-}
-
-async function ensureCommunitySession(contributionSchemaVersion) {
-  const requiredConsent = contributionSchemaVersion === "telemetry-contribution-v0.2"
-    ? "privacy-safe-telemetry-v0.2"
-    : "privacy-safe-telemetry-v0.1";
-  if (communitySession?.csrfToken) {
-    if (communitySession.consentVersion !== requiredConsent) {
-      throw new Error(
-        `This browser session accepted ${communitySession.consentVersion || "an older consent contract"}. Reload the local dashboard before using a different contribution contract.`
-      );
-    }
-    return communitySession;
-  }
-  if (hostedSignInRequired()) {
-    throw new Error(
-      "Sign in first: hosted participation requires Google or Apple sign-in above. Local-only use needs no account."
-    );
-  }
-  let enrollment;
-  try {
-    // No invitation code is collected: production enrollment is open, and the
-    // service remains the authority on whether it accepts a new participant.
-    enrollment = await communityClient.enroll(
-      null,
-      contributionSchemaVersion,
-      { identity: hostedIdentity }
-    );
-  } catch (error) {
-    const identityCopy = hostedIdentityErrorCopy(error);
-    if (identityCopy !== null) throw new Error(identityCopy);
-    throw error;
-  }
-  if (typeof enrollment?.csrfToken !== "string") {
-    throw new Error("The contribution service did not establish a pseudonymous contribution session.");
-  }
-  setCommunitySession({
-    csrfToken: enrollment.csrfToken,
-    participantId: enrollment.participantId ?? null,
-    consentVersion: requiredConsent
-  });
-  // Recovery is intentionally absent from the ordinary product. Do not display
-  // or persist this legacy server capability.
-  void enrollment.recoveryCode;
-  return communitySession;
-}
-
-async function submitContribution(event) {
-  event.preventDefault();
-  const file = $("#contribution-file").files[0];
-  const status = $("#upload-status");
-  const button = $("#contribution-submit");
-  status.hidden = false;
-  status.className = "upload-status";
-  status.textContent = "Validating the privacy-safe export in this browser…";
-  button.disabled = true;
-  try {
-    const payload = await parseSafeExport(file);
-    await ensureCommunitySession(payload.schemaVersion);
-    status.textContent = "Encrypting the validated export in this browser…";
-    const key = await communityClient.envelopeKey();
-    if (key?.algorithm && key.algorithm !== "RSA-OAEP-256") throw new Error("The server offered an unsupported envelope algorithm.");
-    const envelope = await createTelemetryEnvelope({
-      payload,
-      publicJwk: key.publicJwk,
-      keyId: key.keyId
-    });
-    const serializedEnvelope = JSON.stringify(envelope);
-    const contentLengthBytes = new TextEncoder().encode(serializedEnvelope).byteLength;
-    const envelopeDigest = await sha256Hex(serializedEnvelope);
-    status.textContent = "Registering a one-use authorization for this exact encrypted envelope…";
-    const registration = await communityClient.registerUpload({
-      envelopeDigest,
-      contentLengthBytes,
-      contentType: "application/json"
-    });
-    if (typeof registration?.uploadAuthorization !== "string") {
-      throw new Error("The service did not return a one-use upload authorization.");
-    }
-    status.textContent = "Submitting encrypted telemetry for immediate server-side validation…";
-    const receipt = await communityClient.contributeSerialized(
-      serializedEnvelope,
-      registration.uploadAuthorization
-    );
-    setCommunitySession({ ...communitySession, contributionId: receipt.contributionId });
-    status.textContent = `Accepted as ${receipt.contributionId}. The server reported ${compact(receipt.recordCounts?.deduplicated ?? 0)} deduplicated records.`;
-    await loadCommunityResults();
-  } catch (error) {
-    showFailure(status, {
-      surface: "contribution_send",
-      error,
-      statusClass: "upload-status",
-      // A rejection this page raised itself carries copy written here; a
-      // transport rejection carries only a status line, which is not copy.
-      fallback: error instanceof Error && error.status === undefined
-        ? error.message
-        : safeApiError(error, "The contribution was rejected.")
-    });
-  } finally {
-    button.disabled = !(
-      selectedContributionValidated
-      && $("#contribution-consent").checked
-      && $("#contribution-file").files.length
-    );
-  }
-}
-
-function renderPersonalStats(container, payload) {
-  clear(container);
-  const stats = normalizeParticipantStats(payload);
-  if (stats.state === "service_unavailable") {
-    container.append(node("p", "", "No personal result is available."));
-    return;
-  }
-  if (stats.state === "unsupported_schema") {
-    container.append(node(
-      "p",
-      "result-state result-state-warning",
-      `The service returned ${stats.schemaVersion || "an unknown schema"}, not participant-stats-v0.2. No personal values were displayed.`
-    ));
-    return;
-  }
-
-  const source = stats.totals;
-  const grid = node("div", "result-metrics");
-  const metrics = [
-    ["Safe usage events", source.usageEvents, compact],
-    ["Server-repriced API equivalent", source.apiPriceEquivalentUsd, formatApiMoney],
-    ["Quota snapshots", source.quotaSnapshots, compact]
-  ];
-  for (const [label, value, formatter] of metrics) {
-    const card = node("div");
-    card.append(
-      node("span", "", label),
-      node("strong", "", value === null ? "Not available" : formatter(value))
-    );
-    grid.append(card);
-  }
-  container.append(grid);
-
-  const verification = node("p", "result-verification");
-  verification.append(
-    node("strong", "", "Server-repriced API equivalent. "),
-    document.createTextNode(
-      "This is a current public API price-card comparison calculated by the server, not a subscription charge or OpenAI’s internal quota unit."
-    )
-  );
-  container.append(verification);
-
-  const coverage = stats.pricingCoverage;
-  const coveragePanel = node("section", "participant-detail");
-  coveragePanel.append(node("h4", "", "Server pricing coverage"));
-  const coverageState = node("span", `coverage-state coverage-${coverage.state}`, coverage.state.replaceAll("_", " "));
-  const coverageHeading = node("div", "participant-detail-heading");
-  coverageHeading.append(
-    coverageState,
-    node(
-      "strong",
-      "",
-      coverage.percent === null ? "Coverage not testable" : `${formatPercent(coverage.percent, 1)} of events at least partly priced`
-    )
-  );
-  coveragePanel.append(coverageHeading);
-  const coverageGrid = node("div", "coverage-counts");
-  for (const [label, value] of [
-    ["Fully priced", coverage.fullyPricedEvents],
-    ["Partly priced", coverage.partiallyPricedEvents],
-    ["Unpriced", coverage.unpricedEvents],
-    ["Unclassified", coverage.unclassifiedEvents]
-  ]) {
-    const item = node("div");
-    item.append(node("span", "", label), node("strong", "", value === null ? "Unknown" : compact(value)));
-    coverageGrid.append(item);
-  }
-  coveragePanel.append(coverageGrid);
-  if (source.serverUnknownBillableUnits > 0) {
-    coveragePanel.append(node(
-      "p",
-      "result-state result-state-warning",
-      `${compact(source.serverUnknownBillableUnits)} observed billable units were not assigned a server price.`
-    ));
-  }
-  container.append(coveragePanel);
-
-  const pricingBasis = node("section", "participant-detail");
-  pricingBasis.append(node("h4", "", "Keep subscription speed separate from API pricing"));
-  const basisGrid = node("div", "pricing-basis-grid");
-  const standard = node("article", "basis-card");
-  standard.append(
-    node("span", "basis-label", "Standard API counterfactual"),
-    node(
-      "strong",
-      "",
-      stats.standardApiCounterfactual.apiPriceEquivalentUsd === null
-        ? "Not separately returned"
-        : formatApiMoney(stats.standardApiCounterfactual.apiPriceEquivalentUsd)
-    ),
-    node(
-      "p",
-      "",
-      stats.standardApiCounterfactual.apiPriceEquivalentUsd === null
-        ? "This response does not isolate a Standard-only subtotal. The total above remains the verified server-repriced API equivalent."
-        : `${stats.standardApiCounterfactual.events === null ? "Eligible subscription events" : compact(stats.standardApiCounterfactual.events) + " events"} repriced against the Standard API card.`
-    )
-  );
-  const fast = node("article", "basis-card basis-fast");
-  const fastValue = stats.codexFastObservations.eventShare === null
-    ? stats.codexFastObservations.eventCount === null
-      ? "Not testable"
-      : `${compact(stats.codexFastObservations.eventCount)} events`
-    : `${formatPercent(stats.codexFastObservations.eventShare * 100, 1)} of events`;
-  fast.append(
-    node("span", "basis-label", "Codex Fast observations"),
-    node("strong", "", fastValue),
-    node(
-      "p",
-      "",
-      "Fast is a subscription speed observation. It is not API Priority tier, and no invented Fast price multiplier is applied here."
-    )
-  );
-  basisGrid.append(standard, fast);
-  pricingBasis.append(basisGrid);
-  container.append(pricingBasis);
-
-  const accountScoped = renderAccountScopedQuotaAnalysis(
-    container,
-    stats.accountScopedQuotaAnalysis
-  );
-  if (!accountScoped) {
-    renderParticipantQuotaMovement(container, stats.rollingQuotaMovement);
-  }
-  renderPrivateCommunityComparison(container, stats.communityComparison);
-}
-
-const ACCOUNT_CALIBRATION_REASONS = Object.freeze({
-  account_scoped_dataset_unavailable: "No complete account-scoped dataset has been contributed yet.",
-  supported_quota_track_unavailable: "No five-hour or seven-day quota track is available in the contributed data.",
-  source_evidence_refused: "The source dataset is partial or otherwise ineligible for calibration.",
-  too_few_boundaries: "At least eight useful quota boundaries are required inside a reset window.",
-  insufficient_displayed_span: "The visible quota movement covers less than five percentage points.",
-  insufficient_training_boundaries: "There are too few earlier points to train this reset estimate.",
-  insufficient_holdout_boundaries: "There are too few later points to test the estimate out of sample.",
-  capacity_not_estimable: "Cost and quota movement do not yet form an estimable positive gradient.",
-  sensitivity_too_wide: "The plausible capacity range is still too wide to report as a useful estimate.",
-  prior_reset_forecast_unavailable: "At least two completed prior reset estimates are needed before a rolling comparison is honest.",
-  endpoint_brackets_unavailable: "Quota observations do not bracket the exact rolling-hour endpoints closely enough."
+/**
+ * The named steps of "connect this Mac", each with its own progress line and
+ * its own honest failure sentence.
+ *
+ * Six distinct operations used to share one try/catch and one fallback
+ * sentence, so every failure — a build with no service configured, a rejected
+ * hosted proof, a refused local pairing, an unreadable local queue — produced
+ * the same paragraph. That made the actual failing step unidentifiable, which
+ * is why "submitting still seems to not be working" could not be narrowed
+ * down. Each step now reports itself.
+ *
+ * `connects` marks the steps that must succeed before this Mac counts as
+ * connected. Anything after that point is a local follow-up: it must never
+ * claim the connection failed.
+ */
+const CONTRIBUTION_CONNECT_STEPS = Object.freeze({
+  service_check: Object.freeze({
+    connects: true,
+    progress: "Checking that this build has a contribution service…",
+    stopped: "Connecting stopped at step 1 of 3, checking the contribution service.",
+    failure:
+      "This build is not paired with a contribution service, so there is nothing to connect to. Nothing was uploaded and local reporting is unaffected.",
+  }),
+  hosted_enrollment: Object.freeze({
+    connects: true,
+    progress: "Creating pseudonymous contribution access…",
+    stopped: "Connecting stopped at step 2 of 3, creating pseudonymous contribution access.",
+    failure:
+      "The contribution service did not establish pseudonymous access. Nothing was uploaded; sign in again and retry.",
+  }),
+  device_pairing: Object.freeze({
+    connects: true,
+    progress: "Connecting this Mac as an upload-only device…",
+    stopped: "Connecting stopped at step 3 of 3, pairing this Mac as an upload-only device.",
+    failure:
+      "The pairing was not completed, so this Mac is not connected. Nothing was uploaded; retrying is safe.",
+  }),
+  // The queue_refresh follow-up step left with the separate connect flow
+  // (owner-directed, 2026-08-08): the merged ceremony's review bootstrap owns
+  // the queue and reports its own failures on the same surface.
 });
-
-function renderAccountScopedQuotaAnalysis(container, analysis) {
-  if (analysis?.status !== "ready" || !analysis.tracks?.length) return false;
-  const section = node("section", "participant-detail quota-movement");
-  const heading = node("div", "participant-detail-heading");
-  const title = node("div");
-  title.append(
-    node("h4", "", "Account-scoped quota calibration"),
-    node(
-      "p",
-      "",
-      "Usage and quota evidence are partitioned by a participant-scoped pseudonym. These results are private and are never copied into community output."
-    )
-  );
-  heading.append(title, node("span", "private-chip", "Private result"));
-  section.append(heading);
-
-  const grid = node("div", "pricing-basis-grid");
-  for (const track of analysis.tracks) {
-    const card = node("article", "basis-card");
-    const windowLabel = track.windowDurationMinutes === 10_080
-      ? "Seven-day allowance"
-      : "Five-hour allowance";
-    const estimate = track.latestCapacityUsd === null
-      ? "Collecting evidence"
-      : formatApiMoney(track.latestCapacityUsd);
-    card.append(
-      node(
-        "span",
-        "basis-label",
-        `${windowLabel} · ${track.planVariant || track.planType}`
-      ),
-      node("strong", "", estimate)
-    );
-    if (track.latestCapacityUsd !== null) {
-      const range = track.sensitivityLowerUsd !== null
-        && track.sensitivityUpperUsd !== null
-        ? ` Plausible sensitivity range: ${formatApiMoney(track.sensitivityLowerUsd)}–${formatApiMoney(track.sensitivityUpperUsd)}.`
-        : "";
-      card.append(node(
-        "p",
-        "",
-        `API-price-equivalent capacity from ${compact(track.estimatedResets)} qualified reset${track.estimatedResets === 1 ? "" : "s"}.${range}`
-      ));
-    } else {
-      card.append(node(
-        "p",
-        "",
-        `${compact(track.totalResets)} reset window${track.totalResets === 1 ? "" : "s"} observed; none yet passes every calibration gate.`
-      ));
-    }
-    const rolling = track.rollingStatus === "conditional_comparison"
-      ? `${compact(track.rollingComparisonCount)} honest 1–3 hour rolling comparisons available.`
-      : "Rolling observed-versus-expected comparison is not testable yet.";
-    card.append(node("p", "", rolling));
-    const reasons = [...new Set([
-      ...track.refusalCodes,
-      ...track.rollingRefusalCodes
-    ])].slice(0, 3);
-    if (reasons.length) {
-      const list = node("ul", "calibration-reasons");
-      for (const reason of reasons) {
-        list.append(node(
-          "li",
-          "",
-          fixedCopy(ACCOUNT_CALIBRATION_REASONS, reason)
-            // An unrecognized refusal code is still a fixed code, but it is
-            // not copy: only identifier-shaped values are ever humanized.
-            ?? (/^[a-z][a-z0-9_]{1,63}$/u.test(reason)
-              ? reason.replaceAll("_", " ")
-              : "A fixed refusal code was reported that this page cannot explain.")
-        ));
-      }
-      card.append(list);
-    }
-    grid.append(card);
-  }
-  section.append(grid);
-  container.append(section);
-  return true;
-}
-
-const QUOTA_MOVEMENT_REASONS = Object.freeze({
-  account_continuity_not_transmitted: "Account continuity is deliberately absent from this privacy-safe contribution, so the server will not calculate an account-specific quota conversion.",
-  insufficient_quota_observations: "There are not yet two usable quota observations in one reset window.",
-  analysis_record_limit_exceeded: "The private analysis exceeded its bounded record limit.",
-  stale_quota_observation: "At least one provider quota observation arrived too late to support this comparison.",
-  backward_quota_observation: "The quota percentage moved backwards inside one reset window, so this track was rejected as ambiguous.",
-  incomplete_server_pricing_in_interval: "At least one overlapping usage event was not fully priced by the server.",
-  no_observed_quota_movement: "The recorded quota percentage did not move in this window.",
-  no_server_priced_usage_in_interval: "No server-priced usage overlaps this quota interval.",
-  no_usage_in_interval: "No usage events overlap this quota interval.",
-  no_valid_rolling_rows: "The response contained no valid 1-, 2-, or 3-hour comparison rows."
-});
-
-function renderParticipantQuotaMovement(container, movement) {
-  const section = node("section", "participant-detail quota-movement");
-  const heading = node("div", "participant-detail-heading");
-  const title = node("div");
-  title.append(
-    node("h4", "", "Private rolling quota movement"),
-    node("p", "", "Observed quota decrease versus movement implied by server-repriced API equivalent, bucketed in UTC.")
-  );
-  heading.append(title, node("span", "private-chip", "Private result"));
-  section.append(heading);
-
-  if (movement.accountContinuity === "not_transmitted") {
-    section.append(node(
-      "p",
-      "result-state result-state-warning",
-      "Account continuity was not transmitted. Participant-wide usage may span accounts, so this comparison must not be treated as an account-specific quota conversion."
-    ));
-  }
-
-  if (movement.status !== "conditional_estimate") {
-    const copy = fixedCopy(QUOTA_MOVEMENT_REASONS, movement.reason)
-      ?? "The available private evidence cannot support this comparison yet.";
-    const state = node("div", "not-testable-state");
-    state.append(
-      node("strong", "", "Not testable"),
-      node("p", "", copy)
-    );
-    section.append(state);
-  } else {
-    const metadata = node("div", "movement-metadata");
-    const resetLabel = movement.resetsAt ? `Reset ${formatLocal(movement.resetsAt)}` : "Reset time unavailable";
-    const capacityLabel = movement.apiPriceEquivalentCapacityUsd === null
-      ? "Capacity estimate unavailable"
-      : `${formatApiMoney(movement.apiPriceEquivalentCapacityUsd)} per 100 percentage points`;
-    metadata.append(
-      node("span", "", [movement.planType, movement.planVariant, movement.limitId, movement.slot].filter(Boolean).join(" · ") || "Quota track"),
-      node("span", "", resetLabel),
-      node("span", "", capacityLabel)
-    );
-    section.append(metadata);
-    section.append(node(
-      "p",
-      "snapshot-disclosure",
-      "The capacity figure is a conditional API-price-equivalent gradient, not a provider-reported allowance. Tables show the latest 12 valid points for each smoothing window."
-    ));
-
-    for (const smoothingHours of [1, 2, 3]) {
-      const rows = movement.rows
-        .filter((row) => row.smoothingHours === smoothingHours)
-        .sort((left, right) => Date.parse(left.windowEndUtc) - Date.parse(right.windowEndUtc))
-        .slice(-12);
-      const group = node("section", "movement-window");
-      const groupHeading = node("div", "movement-window-heading");
-      groupHeading.append(
-        node("h5", "", `${smoothingHours}-hour rolling window`),
-        node("span", "", rows.length ? `${rows.length} latest points` : "Not testable")
-      );
-      group.append(groupHeading);
-      if (!rows.length) {
-        group.append(node(
-          "p",
-          "empty-inline",
-          `Not testable: the response does not yet contain a valid ${smoothingHours}-hour rolling point.`
-        ));
-        section.append(group);
-        continue;
-      }
-      const wrap = node("div", "table-wrap movement-table");
-      const table = document.createElement("table");
-      const caption = node(
-        "caption",
-        "sr-only",
-        `${smoothingHours}-hour private rolling quota movement in UTC`
-      );
-      const thead = document.createElement("thead");
-      const header = document.createElement("tr");
-      for (const label of ["Window ending (UTC)", "Observed", "Expected", "Difference", "API equivalent", "Events"]) {
-        const th = document.createElement("th");
-        th.scope = "col";
-        th.textContent = label;
-        header.append(th);
-      }
-      thead.append(header);
-      const tbody = document.createElement("tbody");
-      for (const row of rows) {
-        const tr = document.createElement("tr");
-        const difference = row.observedQuotaChangePp - row.expectedQuotaChangePp;
-        for (const value of [
-          formatLocal(row.windowEndUtc),
-          formatPp(row.observedQuotaChangePp, 2),
-          formatPp(row.expectedQuotaChangePp, 2),
-          formatPp(difference, 2),
-          formatApiMoney(row.apiPriceEquivalentUsd),
-          compact(row.usageEvents)
-        ]) {
-          tr.append(node("td", "", value));
-        }
-        tbody.append(tr);
-      }
-      table.append(caption, thead, tbody);
-      wrap.append(table);
-      group.append(wrap);
-      section.append(group);
-    }
-  }
-  container.append(section);
-}
-
-const COMMUNITY_COMPARISON_REASONS = Object.freeze({
-  stable_snapshot_unavailable: "No stable released community week is available yet.",
-  community_snapshot_not_released: "The latest community week is withdrawn or privacy-suppressed, so no personal comparison is shown.",
-  community_snapshot_contract_invalid: "The released community week could not be compared safely.",
-  participant_comparison_too_large: "The comparison exceeded its fixed safe size.",
-  participant_comparison_contract_invalid: "The participant comparison could not be constructed safely.",
-  comparison_contract_invalid: "The comparison response did not pass browser validation."
-});
-
-function renderPrivateCommunityComparison(container, comparison) {
-  const section = node("section", "participant-detail community-comparison");
-  const heading = node("div", "participant-detail-heading");
-  const title = node("div");
-  title.append(
-    node("h4", "", "Your contribution in the released week"),
-    node(
-      "p",
-      "",
-      "Your value uses the publication clipping cap. The community value is the already-public total rounded down."
-    )
-  );
-  heading.append(title, node("span", "private-chip", "Private comparison"));
-  section.append(heading);
-
-  if (comparison?.status !== "ready") {
-    const state = node("div", "not-testable-state");
-    state.append(
-      node("strong", "", "Not testable"),
-      node(
-        "p",
-        "",
-        fixedCopy(COMMUNITY_COMPARISON_REASONS, comparison?.reason)
-          ?? "A disclosure-safe released week is required before this comparison can be shown."
-      )
-    );
-    section.append(state);
-    container.append(section);
-    return;
-  }
-
-  section.append(node(
-    "p",
-    "snapshot-disclosure",
-    `${formatLocal(comparison.period.startAt, { dateOnly: true })}–${formatLocal(comparison.period.endAt, { dateOnly: true })} · revision ${compact(comparison.snapshotRevision)}. This is not an average, percentile, bill, or provider allowance. A rounded-down public total can be lower than your own clipped value.`
-  ));
-  const activeCells = comparison.cells.filter((cell) => cell.participantHasActivity);
-  if (!activeCells.length) {
-    const state = node("div", "not-testable-state");
-    state.append(
-      node("strong", "", "No matched released cell"),
-      node(
-        "p",
-        "",
-        "Your accepted activity did not contribute to a provider/model cell released for this fixed week."
-      )
-    );
-    section.append(state);
-    container.append(section);
-    return;
-  }
-
-  const wrap = node("div", "table-wrap comparison-table");
-  const table = document.createElement("table");
-  const caption = node(
-    "caption",
-    "sr-only",
-    "Private clipped contribution compared with public rounded community total"
-  );
-  const thead = document.createElement("thead");
-  const header = document.createElement("tr");
-  for (const label of [
-    "Provider / model",
-    "Metric",
-    "Your clipped contribution",
-    "Public rounded total",
-    "Interpretation"
-  ]) {
-    const th = document.createElement("th");
-    th.scope = "col";
-    th.textContent = label;
-    header.append(th);
-  }
-  thead.append(header);
-  const tbody = document.createElement("tbody");
-  for (const cell of activeCells) {
-    for (const [metricName, label] of Object.entries(COMMUNITY_METRIC_LABELS)) {
-      const metric = cell.metrics[metricName];
-      const row = document.createElement("tr");
-      const identity = document.createElement("th");
-      identity.scope = "row";
-      identity.textContent = `${cell.provider} · ${cell.planType === "unknown" ? "plan unknown" : cell.planType + (cell.planVariant !== "unknown" ? " " + cell.planVariant : "")} · ${cell.modelId}`;
-      row.append(identity, node("td", "", label));
-      if (metric.status === "community_not_released") {
-        row.append(
-          node("td", "suppressed-value", "Not shown"),
-          node("td", "suppressed-value", "Not released"),
-          node("td", "", "Community support did not pass the fixed release rule.")
-        );
-      } else if (metric.status === "participant_component_unavailable") {
-        row.append(
-          node("td", "suppressed-value", "Not observed"),
-          node("td", "", compact(metric.communityRoundedValue)),
-          node("td", "", "Your source did not report this component.")
-        );
-      } else {
-        row.append(
-          node("td", "", compact(metric.participantClippedValue)),
-          node("td", "", compact(metric.communityRoundedValue)),
-          node(
-            "td",
-            "",
-            metric.participantClippedValue > metric.communityRoundedValue
-              ? "Public rounding makes a share calculation invalid."
-              : "Same fixed week; no average or percentile is inferred."
-          )
-        );
-      }
-      tbody.append(row);
-    }
-  }
-  table.append(caption, thead, tbody);
-  wrap.append(table);
-  section.append(wrap);
-  container.append(section);
-}
-
-const CONTRIBUTION_STATUS_LABELS = Object.freeze({
-  accepted: "Accepted",
-  accepted_synthetic: "Accepted fixture",
-  deleting: "Deletion in progress"
-});
-
-function renderContributionHistory(container, payload) {
-  clear(container);
-  const history = normalizeParticipantHistory(payload);
-  if (!communitySession?.csrfToken) {
-    container.hidden = true;
-    return;
-  }
-  container.hidden = false;
-  const heading = node("div", "participant-detail-heading");
-  const title = node("div");
-  title.append(
-    node("h4", "", "Accepted contribution history"),
-    node(
-      "p",
-      "",
-      "Each row is private to this participant and comes from canonical backend state."
-    )
-  );
-  heading.append(title, node("span", "private-chip", "Private history"));
-  container.append(heading);
-
-  if (history.state !== "ready") {
-    const unavailable = node("div", "not-testable-state");
-    unavailable.append(
-      node("strong", "", "History unavailable"),
-      node(
-        "p",
-        "",
-        history.reason === "unsupported_schema"
-          ? "The service returned an unsupported participant-history contract."
-          : history.reason === "invalid_contract"
-            ? "The service response did not pass the browser's closed history contract."
-            : "The participant-history service could not be reached."
-      )
-    );
-    container.append(unavailable);
-    return;
-  }
-
-  const disclosure = node("p", "history-disclosure");
-  disclosure.textContent = history.items.length === 0
-    ? "No accepted contribution batches remain."
-    : `${compact(history.contributionCount)} accepted or deleting batch${history.contributionCount === 1 ? "" : "es"}. The current transport does not carry a reviewed client software version.`;
-  container.append(disclosure);
-  if (history.items.length === 0) return;
-
-  const list = node("div", "history-list");
-  history.items.forEach((item, index) => {
-    const card = node("article", "history-card");
-    const cardHeading = node("div", "history-card-heading");
-    const label = node("div");
-    label.append(
-      node("strong", "", `Contribution ${history.items.length - index}`),
-      node("small", "", `Received ${formatLocal(item.createdAt)}`)
-    );
-    cardHeading.append(
-      label,
-      node(
-        "span",
-        item.status === "deleting"
-          ? "history-state history-state-deleting"
-          : "history-state",
-        fixedCopy(CONTRIBUTION_STATUS_LABELS, item.status)
-          ?? "Status unavailable"
-      )
-    );
-    card.append(cardHeading);
-
-    const details = node("dl", "history-facts");
-    const recordSummary = item.recordCounts === null
-      ? "Fixture contract"
-      : `${compact(item.recordCounts.accepted)} accepted · ${compact(item.recordCounts.deduplicated)} duplicate`;
-    const pricingSummary = item.serverAccounting.verification === "server_repriced"
-      ? `${formatApiMoney(item.serverAccounting.apiPriceEquivalentUsd)} API-price equivalent`
-      : "Server repricing unavailable";
-    const quarantineSummary = item.quarantine.state === "deleted"
-      ? `Encrypted object deleted ${formatLocal(item.quarantine.deletedAt)}`
-      : `Encrypted object scheduled for deletion after ${formatLocal(item.quarantine.scheduledDeletionAt)}`;
-    for (const [term, description] of [
-      ["Covered period", `${formatLocal(item.coveredAt.startAt)}–${formatLocal(item.coveredAt.endAt)}`],
-      ["Records", recordSummary],
-      ["Contract", `${item.transportSchemaVersion} · ${item.clientPlatform}`],
-      ["Pricing", pricingSummary],
-      ["Quarantine", quarantineSummary]
-    ]) {
-      const fact = node("div");
-      fact.append(node("dt", "", term), node("dd", "", description));
-      details.append(fact);
-    }
-    card.append(details);
-    card.append(node(
-      "p",
-      "history-retention-note",
-      "Deleting the encrypted quarantine object does not delete the canonical metadata used for your private results. Use the button below to delete this contribution from canonical results."
-    ));
-    if (item.status !== "deleting") {
-      const remove = node("button", "button button-danger history-delete", "Delete this contribution");
-      remove.type = "button";
-      remove.dataset.contributionId = item.contributionId;
-      card.append(remove);
-    }
-    list.append(card);
-  });
-  container.append(list);
-}
 
 /**
- * Render one delayed weekly snapshot.
+ * Run one named step, tagging any failure with the step it came from.
  *
- * The default view carries the result and the one caveat needed to read it
- * honestly. Everything that only describes how the service produces the number
- * — contract version, ingestion cutoff, release timing, per-cell support
- * mechanics, sealed-revision policy, and what the current contract cannot yet
- * publish — is relocated into the collapsed provenance disclosure beside it.
+ * The tag is what lets the single reporting site name the failing step and
+ * choose that step's own fallback sentence, instead of collapsing six
+ * different situations into one generic paragraph.
  */
-function renderCommunitySnapshot(container, payload) {
-  return renderSharedCommunitySnapshot({
-    documentRef: document,
-    container,
-    detail: $("#community-snapshot-service-detail"),
-    payload,
-  });
+async function contributionConnectStep(stepId, status, run) {
+  const step = CONTRIBUTION_CONNECT_STEPS[stepId];
+  status.hidden = false;
+  status.className = "participant-action-status";
+  setProductText(status, step.progress);
+  try {
+    return await run();
+  } catch (error) {
+    const tagged = error instanceof Error ? error : new Error("Step failed.");
+    tagged.contributionStep = stepId;
+    throw tagged;
+  }
 }
 
+function contributionConnectStepOf(error) {
+  const stepId = error?.contributionStep;
+  return typeof stepId === "string"
+    && Object.hasOwn(CONTRIBUTION_CONNECT_STEPS, stepId)
+    ? CONTRIBUTION_CONNECT_STEPS[stepId]
+    : null;
+}
+
+// (connectCommunityContribution and its openIncrementalConsent routing left
+// with the two-card flow, owner-directed 2026-08-08: the merged ceremony in
+// approveIncrementalContribution owns enrollment, the v1.0-consent pairing,
+// and the local approval in one interaction.)
+
+/**
+ * Report one connect failure, naming the step it came from.
+ *
+ * The step's own sentence is the fallback, so an error code this page has
+ * never seen still produces "step 3 of 3, connecting this Mac as an
+ * upload-only device: …" rather than "the cause was not reported in a form
+ * this page can explain".
+ */
+async function reportContributionConnectFailure(status, error, {
+  enrollmentAttemptedWithHostedIdentity,
+  enrollmentEstablished,
+}) {
+  if (contributionDeviceRecoveryIsRequired(error)) {
+    await renderContributionDeviceRecovery(status, { error });
+    return;
+  }
+  const step = contributionConnectStepOf(error);
+  const retryNeedsFreshSignIn = enrollmentAttemptedWithHostedIdentity
+    && !enrollmentEstablished
+    && hostedIdentity !== null;
+  if (retryNeedsFreshSignIn) {
+    hostedIdentity = null;
+    renderHostedIdentity();
+  }
+  const described = await describeFailure({
+    surface: "contribution_connect",
+    error,
+    fallback: step?.failure
+      ?? "This Mac could not be connected, and no evidence was uploaded. Retrying is safe."
+  });
+  // The step is stated even when the code itself is explainable. Knowing that
+  // pairing failed rather than enrolling is the part that was missing.
+  const stepLine = step === null ? "" : `${step.stopped} `;
+  status.hidden = false;
+  status.className = "participant-action-status error";
+  status.textContent = `${stepLine}${described.text}`;
+  if (retryNeedsFreshSignIn) {
+    setLocalizedText(status, "contribution.signInDiscarded", {
+      message: `${stepLine}${described.text}`,
+    });
+  }
+}
+
+// The preparation preflight estimate and its lookback picker left with the
+// prepare surface (owner-directed, 2026-08-08). Size limits are enforced by
+// the companion itself during the silent review bootstrap, which narrows the
+// window on export_too_large instead of asking the reader to.
+
 async function loadCommunityResults() {
-  const service = $("#service-state");
-  const personal = $("#personal-result");
-  const community = $("#community-result");
-  const participantControls = $("#participant-controls");
   const centralConfigured = localCompanionHealth === null
     || localCompanionHealth?.capabilities?.centralServiceProxy === true;
   if (!centralConfigured) {
-    participantContributionAdmission = null;
-    renderBackendHealth(null, null, { configured: false });
-    service.textContent = "Local preparation available; community service not connected";
-    service.className = "evidence-chip neutral";
-    participantControls.hidden = true;
-    renderPersonalStats(personal, null);
-    renderContributionHistory($("#contribution-history"), null);
-    renderCommunitySnapshot(community, null);
-    renderContributionPreparationEstimate();
+    communityServiceHealth = null;
+    renderHostedIdentity();
     return;
   }
   try {
-    const [
-      healthResult,
-      readinessResult,
-      personalResult,
-      communityResult,
-      profileResult
-    ] = await Promise.allSettled([
-      communityClient.health(),
-      communityClient.readiness(),
-      communitySession?.csrfToken ? communityClient.personalStats() : Promise.resolve(null),
-      communityClient.communityStats(),
-      communitySession?.csrfToken ? communityClient.participantProfile() : Promise.resolve(null)
-    ]);
-    const serviceReachable = healthResult.status === "fulfilled"
-      || communityResult.status === "fulfilled"
-      || (Boolean(communitySession?.csrfToken) && personalResult.status === "fulfilled");
-    renderBackendHealth(
-      healthResult.status === "fulfilled" ? healthResult.value : null,
-      readinessResult.status === "fulfilled" ? readinessResult.value : null,
-      { configured: true },
-    );
-    service.textContent = serviceReachable
-      ? "Community service reachable"
-      : "Community service unavailable";
-    service.className = serviceReachable ? "evidence-chip" : "evidence-chip neutral";
-    const normalizedProfile = normalizeParticipantHistory(
-      profileResult.status === "fulfilled" ? profileResult.value : null,
-    );
-    participantContributionAdmission = normalizedProfile.state === "ready"
-      ? normalizedProfile.contributionAdmission
-      : null;
-    renderPersonalStats(personal, personalResult.status === "fulfilled" ? personalResult.value : null);
-    renderContributionHistory(
-      $("#contribution-history"),
-      profileResult.status === "fulfilled" ? profileResult.value : null
-    );
-    renderCommunitySnapshot(community, communityResult.status === "fulfilled" ? communityResult.value : null);
-    renderContributionPreparationEstimate();
-    participantControls.hidden = !(communitySession?.csrfToken && personalResult.status === "fulfilled");
-    // The advertised enrollment mode is reported by the backend facts panel;
-    // this page collects no invitation code for any of those modes.
+    communityServiceHealth = await communityClient.health();
   } catch {
-    participantContributionAdmission = null;
-    renderBackendHealth(null, null, { configured: true });
-    service.textContent = "Community service unavailable";
-    service.className = "evidence-chip neutral";
-    participantControls.hidden = true;
-    renderContributionHistory($("#contribution-history"), null);
-    renderContributionPreparationEstimate();
+    communityServiceHealth = null;
   }
-}
-
-function renderBackendHealth(health, readiness, { configured = true } = {}) {
-  if (!configured) {
-    const state = $("#backend-state");
-    state.textContent = "Not connected";
-    state.className = "evidence-chip neutral";
-    const centralState = $("#central-state");
-    centralState.replaceChildren(
-      node("span", "state-dot"),
-      document.createTextNode("Local-only mode"),
-    );
-    centralState.className = "state-pill state-local";
-    $("#backend-facts").hidden = true;
-    $("#backend-description").textContent =
-      "Your local usage, allowance estimates, and privacy review are working without a remote service. Community upload and aggregate comparisons appear only in a build with an explicit community-service origin.";
-    $("#backend-readiness-note").textContent =
-      "This build has no community-service origin sealed into it, so there is no readiness to report.";
-    $("#backend-contract-note").textContent =
-      "No community origin is sealed into this app. Nothing is failing and no upload is attempted.";
-    return;
-  }
-  $("#backend-facts").hidden = false;
-  $("#backend-description").textContent =
-    "This optional service is separate from the local collector above. Your local reporting works whether or not it is reachable, and nothing leaves this Mac unless you choose to contribute.";
-  // Engineering detail about how readiness is established lives inside the
-  // collapsed service-detail disclosure, not in the panel's default view.
-  $("#backend-readiness-note").textContent =
-    "Live readiness verifies database and encrypted-object access, fresh retention and restore replay, object reconciliation, and aggregate rebuild state.";
-  const reachable = health?.status === "ok";
-  const servingReady = readiness?.state === "ready";
-  const readinessKnown = servingReady || readiness?.state === "not_ready";
-  const controls = health?.collectionControls;
-  const collectionState = reachable
-    && ["operational", "degraded", "contained"].includes(controls?.state)
-    ? controls.state
-    : null;
-  const state = $("#backend-state");
-  const stateLabels = {
-    operational: "Community backend ready",
-    degraded: "Collection partially paused",
-    contained: "Collection contained"
-  };
-  const stateLabel = !reachable
-    ? "Community service unavailable"
-    : !readinessKnown
-      ? "Readiness unavailable"
-      : !servingReady
-        ? "Community recovery pending"
-        : stateLabels[collectionState] ?? "Community status incomplete";
-  state.textContent = stateLabel;
-  state.className = servingReady && collectionState === "operational"
-    ? "evidence-chip"
-    : "evidence-chip neutral";
-  const centralState = $("#central-state");
-  centralState.replaceChildren(
-    node("span", "state-dot"),
-    document.createTextNode(stateLabel)
-  );
-  centralState.className = servingReady && collectionState === "operational"
-    ? "state-pill"
-    : reachable
-      ? "state-pill state-insufficient"
-      : "state-pill state-offline";
-  $("#backend-database").textContent = health?.checks?.database === "ok"
-    ? "Connected"
-    : "Unavailable";
-  $("#backend-deletion-ledger").textContent = health?.checks?.deletionLedger === "ok"
-    ? "Independent digest-only store reachable"
-    : "Unavailable";
-  $("#backend-storage").textContent = health?.checks?.encryptedObjectStore === "reachable"
-    ? "Reachable"
-    : "Unavailable";
-  const lifecycleLabels = {
-    never_run: "Awaiting first scheduled pass",
-    running: "Lifecycle pass running",
-    completed: health?.checks?.quarantineRetentionComplete === true
-      && health?.checks?.restoreReplayComplete === true
-      ? "Retention and restore replay current"
-      : "Catching up; publication held",
-    failed: "Lifecycle pass failed; operator review required",
-    stale: "Lifecycle evidence stale; publication held",
-    incomplete: "Catching up; publication held",
-    ready: "Retention and restore replay current"
-  };
-  $("#backend-lifecycle").textContent = lifecycleLabels[
-    readinessKnown ? readiness.lifecycle : health?.checks?.lifecycle
-  ]
-    ?? "Unavailable";
-  const reconciliationLabels = {
-    never_run: "Awaiting first reconciliation pass",
-    running: "Reconciliation running",
-    completed: readiness?.quarantineReconciliationComplete === true
-      ? "Tracked objects and metadata reconciled"
-      : "Reconciliation incomplete",
-    failed: "Reconciliation failed; operator review required"
-  };
-  $("#backend-reconciliation").textContent = readinessKnown
-    ? reconciliationLabels[readiness.quarantineReconciliation] ?? "Unavailable"
-    : "Unavailable";
-  $("#backend-aggregate-rebuild").textContent = readinessKnown
-    ? readiness.aggregateRebuildComplete
-      ? "Complete"
-      : "Pending; publication held"
-    : "Unavailable";
-  $("#backend-collection-state").textContent = {
-    operational: "Operational",
-    degraded: "One or more intake stages paused",
-    contained: "All collection and publication paused"
-  }[collectionState] ?? "Unavailable";
-  const enrollmentLabels = {
-    local_open: "Open for local testing",
-    invite_only: "Private invite pilot",
-    disabled: "New enrollment paused"
-  };
-  $("#backend-enrollment").textContent = controls?.enrollment === false
-    ? "Paused"
-    : enrollmentLabels[health?.enrollmentMode] ?? "Unavailable";
-  const controlLabel = (value) => value === true
-    ? "Enabled"
-    : value === false
-      ? "Paused"
-      : "Unavailable";
-  $("#backend-upload-registration").textContent = controlLabel(
-    controls?.uploadRegistration
-  );
-  $("#backend-processing").textContent = controlLabel(controls?.processing);
-  $("#backend-publication").textContent = controlLabel(controls?.publication);
-  $("#backend-participant-rights").textContent = reachable
-    && health?.capabilities?.participantStats === true
-    && health?.capabilities?.participantExport === true
-    && health?.capabilities?.participantDeletion === true
-    ? "View, export, and delete remain available"
-    : "Unavailable";
-  $("#backend-contract").textContent = health?.contracts?.acceptedContribution
-    ?? "Unavailable";
-
-  const accountContract = health?.contracts?.accountScopedContribution;
-  $("#backend-contract-note").textContent =
-    accountContract?.status === "local_preview_loopback_only"
-      ? `${accountContract.schemaVersion} account-scoped ingest is active only on this loopback development server. It remains unauthorized for external participants.`
-      : accountContract?.status === "implementation_disabled"
-        ? `${accountContract.schemaVersion} account-scoped ingest is implemented and testable, but disabled on this HTTP route.`
-        : "No account-scoped experimental contract was advertised by this backend.";
+  renderHostedIdentity();
 }
 
 async function restoreCommunitySession() {
@@ -6033,69 +9190,12 @@ async function restoreCommunitySession() {
     });
   } catch {
     setCommunitySession(null);
-  }
-}
-
-async function deleteParticipantData() {
-  if (!window.confirm("Permanently delete every hosted contribution and private statistic associated with this pseudonymous contribution session? This cannot be undone.")) return;
-  const status = $("#participant-action-status");
-  status.hidden = false;
-  status.className = "participant-action-status";
-  status.textContent = "Turning off automatic contribution, then deleting hosted metadata…";
-  try {
-    pendingAutomaticContributionConsent = null;
-    if (automaticContributionStatus?.enabled) {
-      const disabled = await localClient.disableAutomaticContribution();
-      if (disabled.state === "unavailable" || disabled.enabled) {
-        throw new Error("Automatic contribution could not be disabled.");
-      }
-      renderAutomaticContributionStatus(disabled);
-    }
-    const receipt = await communityClient.deleteParticipant();
-    setCommunitySession(null);
-    $("#contribution-file").value = "";
-    $("#contribution-consent").checked = false;
-    $("#contribution-submit").disabled = true;
-    $(".file-drop").classList.remove("selected");
-    $("#file-help").textContent = "Privacy-safe JSON export · 1.25 MB browser validation limit";
-    const uploadStatus = $("#upload-status");
-    uploadStatus.hidden = false;
-    uploadStatus.className = "upload-status";
-    uploadStatus.textContent = `Deleted ${compact(receipt?.contributionsDeleted ?? 0)} contribution batches and the pseudonymous hosted session.`;
-    status.textContent = "Your hosted content-free pseudonymous metadata was deleted.";
-    $("#participant-controls").hidden = true;
-    renderPersonalStats($("#personal-result"), null);
-    renderContributionHistory($("#contribution-history"), null);
-    await loadCommunityResults();
-  } catch (error) {
-    showFailure(status, {
-      surface: "hosted_privacy",
-      error,
-      fallback:
-        "The contributed data could not be deleted. Nothing was removed; your deletion right is unchanged and you can try again."
-    });
-  }
-}
-
-async function deleteSingleContribution(contributionId) {
-  if (!window.confirm(
-    "Delete this contribution from canonical private results and any current project-controlled aggregate? Other accepted contributions remain."
-  )) return;
-  const status = $("#participant-action-status");
-  status.hidden = false;
-  status.className = "participant-action-status";
-  status.textContent = "Deleting this contribution and refreshing derived results…";
-  try {
-    await communityClient.deleteContribution(contributionId);
-    status.textContent = "Contribution deleted. Private and community results have been refreshed.";
-    await loadCommunityResults();
-  } catch (error) {
-    showFailure(status, {
-      surface: "hosted_privacy",
-      error,
-      fallback:
-        "The contribution could not be deleted. Nothing was removed; you can try again."
-    });
+  } finally {
+    // A restored host-only session is already sufficient for protected
+    // browser actions and device pairing. Reflect it as a generic signed-in
+    // state instead of falsely showing a Google/Apple choice or asking for a
+    // redundant browser ceremony after every reload.
+    renderHostedIdentity();
   }
 }
 
@@ -6106,72 +9206,51 @@ $("#open-installed-app").addEventListener("click", openInstalledApp);
 $("#connection-check").addEventListener("click", checkLocalSetup);
 $("#companion-check").addEventListener("click", checkLocalSetup);
 $("#setup-check-again").addEventListener("click", checkLocalSetup);
-$("#contribution-lookback-controls").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-lookback-hours]");
-  if (!button || contributionPreparationBusy) return;
-  activeContributionLookbackHours = Number(button.dataset.lookbackHours);
-  for (const control of $("#contribution-lookback-controls").querySelectorAll("button")) {
-    const active = control === button;
-    control.classList.toggle("active", active);
-    control.setAttribute("aria-pressed", String(active));
-  }
-  $("#prepare-contribution").textContent = activeContributionLookbackHours === 1
-    ? "Prepare and review latest hour"
-    : activeContributionLookbackHours === 24
-      ? "Prepare and review last 24 hours"
-      : "Prepare and review last 7 days";
-  renderContributionPreparationEstimate();
-});
 $("#identity-google-signin").addEventListener("click", () => {
   void beginHostedSignIn("google");
 });
 $("#identity-apple-signin").addEventListener("click", () => {
   void beginHostedSignIn("apple");
 });
-$("#identity-signout").addEventListener("click", signOutHostedIdentity);
+$("#identity-signout").addEventListener("click", () => {
+  void signOutHostedIdentity();
+});
 $("#identity-signin-check").addEventListener("click", checkHostedSignInNow);
 $("#identity-signin-cancel").addEventListener("click", cancelHostedSignIn);
 window.addEventListener("tibotattle:hosted-sign-in-return", checkHostedSignInNow);
-$("#community-connect-consent").addEventListener(
-  "change",
-  updateCommunityConnectButton
-);
-$("#connect-community").addEventListener(
-  "click",
-  connectCommunityContribution
-);
-$("#contribution-not-now").addEventListener("click", () => {
-  pendingAutomaticContributionConsent = null;
-  $("#community-connect-consent").checked = false;
-  renderAutomaticContributionStatus(automaticContributionStatus);
-  updateCommunityConnectButton();
-  const status = $("#community-connect-status");
-  status.hidden = false;
-  status.className = "participant-action-status";
-  status.textContent =
-    "Nothing will be contributed. Your local reporting continues unchanged.";
+// Reactivation hooks for the persisted handoff (owner-reported orphaned
+// proof, 2026-08-08): the deep-link return, the page becoming visible again,
+// and the window regaining focus each try to collect a pending sign-in this
+// page (or its pre-reload incarnation) started. The resume self-guards, so
+// overlapping activations cannot race the one-time read-back.
+window.addEventListener("tibotattle:hosted-sign-in-return", () => {
+  void resumePendingHostedSignIn();
 });
-$("#automatic-contribution-toggle").addEventListener(
-  "click",
-  disableAutomaticContribution
-);
-$("#prepare-contribution").addEventListener("click", prepareLocalContribution);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") void resumePendingHostedSignIn();
+});
+window.addEventListener("focus", () => {
+  void resumePendingHostedSignIn();
+});
+window.addEventListener("tibotattle:local-evidence-updated", () => {
+  void reloadLocalEvidenceAfterNativeRefresh();
+});
+// The connect-consent checkbox, the connect button and "Not now" left with
+// the two-card flow (owner-directed, 2026-08-08): after sign-in, the single
+// Review-and-approve button below is the one contribution action, and its
+// explicit approval is the consent.
 $("#demo-button").addEventListener("click", () => renderDashboard(demoDashboard()));
-$("#sync-inspect").addEventListener("click", inspectNextContribution);
-$("#sync-run-once").addEventListener("click", () => runContributionSyncAction("run"));
-$("#sync-pause").addEventListener("click", () => runContributionSyncAction("pause"));
-$("#sync-resume").addEventListener("click", () => runContributionSyncAction("resume"));
-$("#window-controls").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-hours]");
-  if (!button || !dashboard) return;
-  activeWindowHours = Number(button.dataset.hours);
-  for (const control of $("#window-controls").querySelectorAll("button")) {
-    const active = control === button;
-    control.classList.toggle("active", active);
-    control.setAttribute("aria-pressed", String(active));
-  }
-  resetTimelineViewport();
-  renderTimeline(dashboard);
+// The prepare, lookback, and send controls left with the legacy prepare flow
+// (owner-directed, 2026-08-08). The approve card's only companion control is
+// the error-recovery re-check for its invisible review bootstrap.
+$("#incremental-review-retry").addEventListener("click", () => {
+  void retryIncrementalReviewBootstrap();
+});
+$("#incremental-consent-approve").addEventListener("click", () => {
+  void approveIncrementalContribution();
+});
+$("#delete-contributions").addEventListener("click", () => {
+  void deleteCommunityContributions();
 });
 $("#range-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-days]");
@@ -6182,8 +9261,32 @@ $("#range-controls").addEventListener("click", (event) => {
     control.classList.toggle("active", active);
     control.setAttribute("aria-pressed", String(active));
   }
+  // Choosing a date range restates what the chart should cover, so a zoom left
+  // over from the previous range cannot survive it. This is the same rule the
+  // calibration range control follows.
+  resetUsageTimelineViewport();
   renderUsageTimeline(dashboard);
   renderComparison(dashboard);
+});
+$("#usage-zoom-in").addEventListener("click", () => {
+  if (!dashboard) return;
+  zoomUsageTimeline(selectedUsagePoints(dashboard), 1 / TIMELINE_BUTTON_ZOOM_STEP);
+});
+$("#usage-zoom-out").addEventListener("click", () => {
+  if (!dashboard) return;
+  zoomUsageTimeline(selectedUsagePoints(dashboard), TIMELINE_BUTTON_ZOOM_STEP);
+});
+$("#usage-pan-back").addEventListener("click", () => {
+  if (!dashboard) return;
+  panUsageTimeline(selectedUsagePoints(dashboard), -.2);
+});
+$("#usage-pan-forward").addEventListener("click", () => {
+  if (!dashboard) return;
+  panUsageTimeline(selectedUsagePoints(dashboard), .2);
+});
+$("#usage-reset-zoom").addEventListener("click", () => {
+  resetUsageTimelineViewport();
+  if (dashboard) renderUsageTimeline(dashboard);
 });
 $("#calibration-range-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-days]");
@@ -6217,15 +9320,27 @@ $("#timeline-reset-zoom").addEventListener("click", () => {
   resetTimelineViewport();
   if (dashboard) renderTimeline(dashboard);
 });
+// The exact-windows pager (owner-directed, 2026-08-08). The page index is
+// clamped inside the renderer, so a click at either end can never leave the
+// row set.
+$("#residual-page-prev").addEventListener("click", () => {
+  residualTablePage -= 1;
+  renderResidualInspectionTable();
+});
+$("#residual-page-next").addEventListener("click", () => {
+  residualTablePage += 1;
+  renderResidualInspectionTable();
+});
 $("#usage-group-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-group]");
-  if (!button || !dashboard) return;
+  if (!button || !dashboard || !usageGroupingsForRange().includes(button.dataset.group)) return;
   activeUsageGrouping = button.dataset.group;
   for (const control of $("#usage-group-controls").querySelectorAll("button")) {
     const active = control === button;
     control.classList.toggle("active", active);
     control.setAttribute("aria-pressed", String(active));
   }
+  resetUsageTimelineViewport();
   renderUsageTimeline(dashboard);
 });
 $("#weekly-range-controls").addEventListener("click", (event) => {
@@ -6237,73 +9352,51 @@ $("#weekly-range-controls").addEventListener("click", (event) => {
     control.classList.toggle("active", active);
     control.setAttribute("aria-pressed", String(active));
   }
+  // renderWeekly itself re-renders the share card from the same model
+  // (owner-verified regression, 2026-08-08), so a control cannot redraw the
+  // chart while leaving the card on the previous filters.
+  renderWeekly(dashboard);
+});
+$("#weekly-span-control").addEventListener("input", (event) => {
+  if (!dashboard) return;
+  activeWeeklyMinimumObservedSpanPp = Math.min(99, Math.max(0, Number(event.target.value)));
   renderWeekly(dashboard);
 });
 $("#accounting-period-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-period]");
   if (!button || !dashboard) return;
-  activeAccountingPeriod = button.dataset.period;
-  for (const control of $("#accounting-period-controls").querySelectorAll("button")) {
-    const active = control === button;
-    control.classList.toggle("active", active);
-    control.setAttribute("aria-pressed", String(active));
-  }
-  renderAccounting(dashboard);
-});
-$("#contribution-file").addEventListener("change", async () => {
-  contributionSelectionRevision += 1;
-  const selectionRevision = contributionSelectionRevision;
-  const file = $("#contribution-file").files[0];
-  const drop = $(".file-drop");
-  drop.classList.toggle("selected", Boolean(file));
-  $("#file-help").textContent = file ? `${file.name} · ${compact(file.size)} bytes` : "Privacy-safe JSON export · 1.25 MB browser validation limit";
-  resetSelectedContributionInspection();
-  $("#contribution-consent").checked = false;
-  $("#contribution-consent-title").textContent =
-    "I reviewed this as a privacy-safe TiboTattle export.";
-  $("#contribution-consent-detail").textContent =
-    "Uploading is optional and can be tested against a local backend.";
-  if (file) {
-    try {
-      const payload = await parseSafeExport(file);
-      if (
-        selectionRevision !== contributionSelectionRevision
-        || $("#contribution-file").files[0] !== file
-      ) return;
-      renderSelectedContributionInspection(file, payload);
-      if (payload?.schemaVersion === "telemetry-contribution-v0.2") {
-        $("#contribution-consent-title").textContent =
-          "I consent to upload participant-scoped pseudonymous account tracks.";
-        $("#contribution-consent-detail").textContent =
-          "They link usage and quota rows only within this pseudonymous contribution session for private calibration; they are never published in community output and are deleted with the hosted session.";
-      }
-    } catch (error) {
-      if (
-        selectionRevision !== contributionSelectionRevision
-        || $("#contribution-file").files[0] !== file
-      ) return;
-      renderSelectedContributionError(error);
-    }
-  }
-  $("#contribution-submit").disabled = true;
-});
-$("#contribution-consent").addEventListener("change", () => {
-  $("#contribution-submit").disabled = !(
-    selectedContributionValidated
-    && $("#contribution-consent").checked
-    && $("#contribution-file").files.length
+  const available = new Set(
+    (Array.isArray(dashboard.accounting?.periods) ? dashboard.accounting.periods : [])
+      .map((period) => period?.periodId),
   );
+  if (!available.has(button.dataset.period) || button.disabled) {
+    syncAccountingPeriodControls(dashboard);
+    return;
+  }
+  activeAccountingPeriod = button.dataset.period;
+  renderAccounting(dashboard);
 });
 $("#share-card-download").addEventListener("click", downloadShareCard);
 $("#share-card-copy").addEventListener("click", copyShareCardImage);
-$("#contribution-form").addEventListener("submit", submitContribution);
-$("#delete-participant").addEventListener("click", deleteParticipantData);
-$("#contribution-history").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-contribution-id]");
-  if (button?.dataset.contributionId) {
-    deleteSingleContribution(button.dataset.contributionId);
-  }
+document.addEventListener("click", (event) => {
+  const current = activeInformationPopover;
+  if (!current) return;
+  if (current.button.contains(event.target) || current.popover.contains(event.target)) return;
+  closeInformationPopover();
 });
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !activeInformationPopover) return;
+  event.preventDefault();
+  closeInformationPopover({ restoreFocus: true });
+});
+window.addEventListener("resize", () => {
+  const current = activeInformationPopover;
+  if (current) positionInformationPopover(current.popover, current.button);
+});
+document.addEventListener("scroll", () => {
+  const current = activeInformationPopover;
+  if (current) positionInformationPopover(current.popover, current.button);
+}, true);
 
 mountDashboardNavigation({
   documentRef: document,
@@ -6311,7 +9404,10 @@ mountDashboardNavigation({
 });
 
 async function bootstrapDashboard() {
-  renderSharedInstallerJourney(document);
+  renderSharedInstallerJourney(document, {
+    formatLocale: getFormattingLocale(),
+    translateMessage: t,
+  });
   renderHostedIdentity();
   updateLocalActionButtons();
   await loadLocalDashboard();
@@ -6322,6 +9418,10 @@ async function bootstrapDashboard() {
     await restoreCommunitySession();
   }
   await loadCommunityResults();
+  // A sign-in the pre-reload page started but never read back is collected
+  // now, while its five-minute handoff is still valid (owner-reported
+  // orphaned proof, 2026-08-08).
+  void resumePendingHostedSignIn();
   scheduleReturningUserRefresh();
 }
 

@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "usage-monitor-worker-sparkle-release-contract-v1",
+  "channel": "internal-dogfood",
+  "serviceOrigin": "https://tibotattle.com",
+  "guardOrigin": "https://dogfood-release.tibotattle.com",
+  "updateOrigin": "https://dogfood-updates.tibotattle.com",
+  "appcastURL": "https://dogfood-updates.tibotattle.com/internal-dogfood/appcast.xml",
+  "appcastObjectKey": "internal-dogfood/appcast.xml",
+  "r2Bucket": "tibotattle-dogfood-updates",
+  "objectPrefix": "internal-dogfood/releases",
+  "guardSchema": "usage-monitor-sparkle-appcast-atomic-guard-v1",
+  "guardRoute": "/api/v1/internal/release/appcast",
+  "appcastContentType": "application/xml; charset=utf-8",
+  "appcastCacheControl": "public, max-age=300, must-revalidate",
+  "artifactContentType": "application/x-apple-diskimage",
+  "artifactCacheControl": "public, max-age=31536000, immutable"
+}

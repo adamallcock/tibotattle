@@ -8,6 +8,8 @@ import {
   APP_PRICE_REGISTRY_SHA256,
   NORMALIZED_PRICE_EVIDENCE_ROWS,
   OPENAI_OFFICIAL_PRICE_CARDS,
+  OPENAI_PRICE_EVIDENCE_START_DATE,
+  PROVIDER_TOOL_PRICE_CARDS,
   addOfficialPriceRegistry,
   validateOfficialPriceRegistry,
 } from "../packages/accounting/index.js";
@@ -51,7 +53,8 @@ test("registry validates and preserves exact decimal strings and provenance", ()
   assert.equal(APP_PRICE_REGISTRY_MANIFEST.sha256, APP_PRICE_REGISTRY_SHA256);
   assert.equal(APP_PRICE_REGISTRY_MANIFEST.sources.length, 2);
   assert.equal(batch54.metadata.provenance.vendor_effective_from, null);
-  assert.equal(batch54.effective.from, "2026-07-26");
+  assert.equal(OPENAI_PRICE_EVIDENCE_START_DATE, "2026-07-26");
+  assert.equal(batch54.effective.from, undefined);
   assert.equal(
     batch54.metadata.provenance.evidence_urls.some((url) => url.endsWith("/models/gpt-5.4")),
     true,
@@ -284,7 +287,7 @@ test("GPT-5.6 Terra and Luna pricing changes at the official July 30 boundary", 
       && card.effective.to === "2026-07-29" && card.metadata.total_input_context_band === "short"
   ));
   assert.equal(closed.metadata.provenance.vendor_effective_to, "2026-07-29");
-  assert.equal(closed.effective.from, "2026-07-26");
+  assert.equal(closed.effective.from, undefined);
 });
 
 test("OpenAI service_tier fast is priced only as an explicitly labeled Priority fallback", () => {
@@ -400,33 +403,86 @@ test("Anthropic cache categories, Batch modifiers, and first-party API Fast are 
 });
 
 test("Claude Sonnet 5 pricing changes at the official September 1 boundary", () => {
-  const august = price({
-    provider: "anthropic",
-    model: "claude-sonnet-5",
-    pricedAt: "2026-08-31",
-    components: { input_uncached_tokens: 1_000_000, output_text_tokens: 1_000_000 },
-  });
-  const september = price({
-    provider: "anthropic",
-    model: "claude-sonnet-5",
-    pricedAt: "2026-09-01",
-    components: { input_uncached_tokens: 1_000_000, output_text_tokens: 1_000_000 },
-  });
-  assert.equal(august.total, "12");
-  assert.equal(september.total, "18");
+  const components = { input_uncached_tokens: 1_000_000, output_text_tokens: 1_000_000 };
+  // The introductory window is open backwards but still closes at the published
+  // vendor change, so old history prices at the introductory rate and events on
+  // or after 2026-09-01 select the distinct successor card.
+  const totals = { "2026-01-15": "12", "2026-08-31": "12", "2026-09-01": "18", "2026-09-02": "18" };
+  const selected = {};
+  for (const [pricedAt, total] of Object.entries(totals)) {
+    const result = price({ provider: "anthropic", model: "claude-sonnet-5", pricedAt, components });
+    assert.equal(result.total, total, pricedAt);
+    assert.equal(result.warnings.length, 0, pricedAt);
+    selected[pricedAt] = [...new Set(result.components.map((item) => item.price_card_id))].sort().join(",");
+    assert.match(selected[pricedAt], /^anthropic:claude-sonnet-5:standard:/, pricedAt);
+  }
+  assert.equal(selected["2026-01-15"], selected["2026-08-31"]);
+  assert.equal(selected["2026-09-01"], selected["2026-09-02"]);
+  assert.notEqual(selected["2026-08-31"], selected["2026-09-01"]);
+
+  const introductory = ANTHROPIC_OFFICIAL_PRICE_CARDS.find((card) => card.model === "claude-sonnet-5" && card.service_tier === "standard" && card.effective.to === "2026-08-31");
+  assert.equal(introductory.effective.from, undefined);
+  assert.equal(introductory.metadata.provenance.vendor_effective_to, "2026-08-31");
   const future = ANTHROPIC_OFFICIAL_PRICE_CARDS.find((card) => card.model === "claude-sonnet-5" && card.service_tier === "standard" && card.effective.from === "2026-09-01");
   assert.equal(future.metadata.provenance.vendor_effective_from, "2026-09-01");
 });
 
-test("undated price evidence refuses pre-observation historical pricing", () => {
-  const result = price({
-    provider: "anthropic",
-    model: "claude-sonnet-4-6",
-    pricedAt: "2026-07-24",
-    components: { input_uncached_tokens: 1_000_000 },
-  });
-  assert.equal(result.total, "0");
-  assert.ok(result.warnings.some((warning) => warning.code === "historical_price_missing"));
+test("undated Anthropic price evidence prices history as far back as it goes", () => {
+  // The Anthropic review date is provenance, not a validity lower bound: an
+  // undated reviewed rate must price a recognized event of any age. Only rows
+  // with a published vendor-effective boundary may refuse a date.
+  for (const pricedAt of ["2025-06-01", "2026-01-15", "2026-07-24", "2026-07-25"]) {
+    const result = price({
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+      pricedAt,
+      components: { input_uncached_tokens: 1_000_000 },
+    });
+    assert.equal(result.total, "3", pricedAt);
+    assert.equal(result.warnings.length, 0, pricedAt);
+  }
+  for (const card of ANTHROPIC_OFFICIAL_PRICE_CARDS) {
+    if (card.metadata.provenance.vendor_effective_from) continue;
+    assert.equal(card.effective.from, undefined, card.id);
+  }
+});
+
+test("provider tool unit cards price billable units from before the review date", () => {
+  const toolUnits = {
+    openai: [
+      { name: "web_search_units", quantity: "1000", unit: "search" },
+      { name: "file_search_units", quantity: "1000", unit: "call" },
+    ],
+    anthropic: [{ name: "web_search_units", quantity: "1000", unit: "search" }],
+  };
+  const expected = { openai: "12.5", anthropic: "10" };
+  for (const [provider, components] of Object.entries(toolUnits)) {
+    for (const pricedAt of ["2025-06-01", "2026-01-15", "2026-07-24", "2026-08-01"]) {
+      const result = calculateCost({
+        usageLedger: {
+          schema_version: "0.1",
+          provider,
+          surface: provider === "openai" ? "openai.responses" : "anthropic.messages",
+          model: { requested: `${provider}-provider-tools` },
+          context: { service_tier: "standard", region: "global", priced_at: pricedAt },
+          components,
+        },
+        priceCards: compilePriceCatalog(APP_OFFICIAL_PRICE_CARDS),
+        mode: "compatibility",
+      });
+      assert.equal(result.total, expected[provider], `${provider}/${pricedAt}`);
+      assert.equal(result.warnings.length, 0, `${provider}/${pricedAt}`);
+    }
+  }
+  for (const card of PROVIDER_TOOL_PRICE_CARDS) {
+    assert.deepEqual(card.effective, {}, card.id);
+    assert.equal(card.metadata.provenance.vendor_effective_from, null, card.id);
+    assert.equal(
+      card.metadata.provenance.historical_validity,
+      "reviewed_rate_without_vendor_effective_date",
+      card.id,
+    );
+  }
 });
 
 test("validation rejects unsupported tiers, absent provenance, overlaps, and destructive aliases", () => {

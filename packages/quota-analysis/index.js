@@ -16,3 +16,20 @@ export {
   QUOTA_ROLLING_POLICY,
   buildRollingQuotaComparisons,
 } from "./src/quota-rolling.js";
+
+export {
+  QUOTA_PACE_POLICY,
+  analyzeQuotaPace,
+} from "./src/quota-pace-forecast.js";
+
+export {
+  FIVE_HOUR_WINDOW_MINUTES,
+  formatQuotaWindowDuration,
+  MAX_QUOTA_WINDOW_DURATION_MINUTES,
+  quotaWindowLabel,
+  selectPrimaryQuotaWindow,
+  SEVEN_DAY_WINDOW_MINUTES,
+  SUPPORTED_QUOTA_WINDOW_DURATIONS,
+  isValidQuotaWindowDuration,
+  isSupportedQuotaWindowDuration,
+} from "./src/quota-windows.js";

@@ -1,6 +1,32 @@
 export type IsoInstant = string;
 export type OpaqueId = string;
-export type QuotaWindowDurationMinutes = 300 | 10080;
+// Runtime validation is required; this type intentionally does not encode the
+// provider-reported duration bounds.
+export type QuotaWindowDurationMinutes = number;
+export type SupportedQuotaWindowDurationMinutes = QuotaWindowDurationMinutes;
+
+export const FIVE_HOUR_WINDOW_MINUTES: 300;
+export const SEVEN_DAY_WINDOW_MINUTES: 10080;
+export const MAX_QUOTA_WINDOW_DURATION_MINUTES: 525600;
+export const SUPPORTED_QUOTA_WINDOW_DURATIONS: readonly [300, 10080];
+export function isValidQuotaWindowDuration(value: number): boolean;
+export function isSupportedQuotaWindowDuration(
+  value: number,
+): value is SupportedQuotaWindowDurationMinutes;
+
+export interface QuotaWindowSelectionInput {
+  limitId?: string;
+  slot?: string;
+  windowDurationMinutes?: number;
+  durationMinutes?: number;
+  windowDurationMins?: number;
+}
+export function selectPrimaryQuotaWindow<T extends QuotaWindowSelectionInput>(
+  windows: readonly T[] | null | undefined,
+): T | null;
+export function formatQuotaWindowDuration(value: number): string | null;
+export function quotaWindowLabel(limitId: string, durationMinutes: number): string;
+
 export type QuotaSlot =
   | "primary"
   | "secondary"
@@ -279,3 +305,79 @@ export function buildRollingQuotaComparisons(input: {
   resetEvidence: QuotaResetEvidence;
   capacityForecast: PriorCapacityForecast;
 }): QuotaRollingComparisons;
+
+export type QuotaPaceStatus =
+  | "unavailable"
+  | "insufficient_observations"
+  | "available"
+  | "will_reach_reset_first";
+
+export type QuotaPaceRefusalCode =
+  | "reset_elapsed"
+  | "stale_observation"
+  | "future_observation"
+  | "incompatible_observation"
+  | "ambiguous_observation"
+  | "backward_observation"
+  | "insufficient_observations"
+  | "non_positive_pace"
+  | "implausible_pace";
+
+export interface QuotaPaceSnapshotInput {
+  accountTrackId: string;
+  provider: string;
+  planType: string;
+  planVariant: string;
+  limitId: string;
+  slot: string;
+  windowDurationMinutes: QuotaWindowDurationMinutes;
+  resetsAt: IsoInstant;
+  observedAt: IsoInstant;
+  receivedAt: IsoInstant;
+  usedPercent: number;
+  policyEpoch: string;
+}
+
+export interface QuotaPaceEstimate {
+  method: "median_adjacent_quota_slope";
+  sampleCount: number;
+  elapsedHours: number | null;
+  movementPp: number | null;
+  percentagePointsPerHour: number | null;
+}
+
+export interface QuotaPaceForecast {
+  schemaVersion: "quota-pace-forecast-v0.1";
+  status: QuotaPaceStatus;
+  refusalCodes: QuotaPaceRefusalCode[];
+  accountTrackId: string;
+  provider: string;
+  planType: string;
+  planVariant: string;
+  limitId: string;
+  slot: string;
+  windowDurationMinutes: QuotaWindowDurationMinutes;
+  policyEpoch: string;
+  resetsAt: IsoInstant;
+  currentObservedAt: IsoInstant;
+  currentUsedPercent: number;
+  remainingPercent: number;
+  pace: QuotaPaceEstimate;
+  etaAt: IsoInstant | null;
+  hoursToExhaustion: number | null;
+  hoursToReset: number | null;
+}
+
+export const QUOTA_PACE_POLICY: Readonly<{
+  schemaVersion: "quota-pace-forecast-v0.1";
+  method: "median_adjacent_quota_slope";
+  windowDurationMinutes: 10080;
+  maximumReceiptLagMs: number;
+  maximumPacePpPerHour: number;
+  minimumObservations: 2;
+}>;
+
+export function analyzeQuotaPace(input: {
+  currentSnapshot: QuotaPaceSnapshotInput;
+  observations: readonly QuotaPaceSnapshotInput[];
+}): QuotaPaceForecast;

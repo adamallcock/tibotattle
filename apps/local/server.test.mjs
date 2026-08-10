@@ -29,6 +29,15 @@ import {
   claimContributionDevicePairing,
 } from "../../src/contribution-device-client.js";
 import {
+  LocalCompanionClient,
+} from "../web/public/data-client.js";
+import {
+  createDiagnosticReference,
+  diagnosticErrorCode,
+  diagnosticSurface,
+  serviceRequestId,
+} from "../web/public/lib.js";
+import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
 } from "../../src/platform/export-identity-keychain.js";
 import {
@@ -164,6 +173,10 @@ async function fixture() {
   await writeFile(join(staticRoot, "data-client.js"), "export const client = true;");
   await writeFile(join(staticRoot, "lib.js"), "export const lib = true;");
   await writeFile(
+    join(staticRoot, "localization.js"),
+    "export const localization = true;",
+  );
+  await writeFile(
     join(staticRoot, "telemetry-shared.generated.js"),
     "export const telemetry = true;",
   );
@@ -295,8 +308,10 @@ test("loopback server exposes only fixed API, static, and report routes", async 
       contributionSyncStatus: true,
       contributionSyncNext: true,
       contributionDevicePairing: false,
+      contributionDeviceDisconnect: false,
       contributionSyncExactReview: true,
       contributionSyncActions: false,
+      incrementalContributionSync: false,
       centralServiceProxy: false,
       centralParticipantRelay: false,
       arbitraryPathAccess: false,
@@ -350,6 +365,7 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     );
     assert.doesNotMatch(pageBody, new RegExp(SEMANTIC_OPEN_TARGET_PLACEHOLDER, "u"));
     assert.equal((await fetch(`${base}/data-client.js`)).status, 200);
+    assert.equal((await fetch(`${base}/localization.js`)).status, 200);
     assert.equal(
       (await fetch(`${base}/telemetry-shared.generated.js`)).status,
       200,
@@ -367,6 +383,20 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     const report = await fetch(`${base}/reports/gradient`);
     assert.equal(report.status, 200);
     assert.match(await report.text(), /Gradient detail/);
+    const privateReportDirectory = join(
+      files.resourceRoot,
+      ".usage-monitor",
+      "legacy-reports",
+    );
+    await mkdir(privateReportDirectory, { recursive: true });
+    await writeFile(
+      join(privateReportDirectory, "2026-07-24-simple-quota-gradient-report.html"),
+      "<!doctype html><title>Canonical gradient detail</title>",
+      { mode: 0o600 },
+    );
+    const canonicalReport = await fetch(`${base}/reports/gradient`);
+    assert.equal(canonicalReport.status, 200);
+    assert.match(await canonicalReport.text(), /Canonical gradient detail/);
 
     assert.equal((await fetch(`${base}/reports/not-allowed`)).status, 404);
     assert.equal((await fetch(`${base}/api/local/not-allowed`)).status, 404);
@@ -383,6 +413,85 @@ test("loopback server exposes only fixed API, static, and report routes", async 
       `<meta content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}"><meta content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}">`,
     );
     assert.equal((await fetch(`${base}/index.html`)).status, 404);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("window-breakdown route bounds its range and returns a per-model/speed shape", async () => {
+  const files = await fixture();
+  const requests = [];
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    // Injected so the route's validation and shaping are exercised without a
+    // real unified index on disk. A caller asking for an inverted range is
+    // rejected by the reader with a typed code the route maps to 400.
+    windowBreakdownProvider: async ({ fromMs, toMs }) => {
+      requests.push({ fromMs, toMs });
+      if (toMs <= fromMs) {
+        const error = new Error("window range is invalid");
+        error.code = "window_range_invalid";
+        throw error;
+      }
+      return {
+        status: "available",
+        errorCode: null,
+        schemaVersion: "local-window-breakdown-v0.1",
+        from: fromMs,
+        to: toMs,
+        events: 12,
+        unpricedEvents: 0,
+        unpricedShare: 0,
+        costUsd: 34.5,
+        tokens: 6_000,
+        fastCostUsd: 0,
+        fastEvents: 0,
+        byModel: [
+          { model: "gpt-5.6-sol", costUsd: 34.5, tokens: 6_000, events: 12, unpricedEvents: 0, unpricedShare: 0, fastModeFamily: "gpt-5.6", fastModeMultiplier: 2.5 },
+        ],
+        bySpeed: { standard: { speed: "standard", costUsd: 34.5, tokens: 6_000, events: 12, unpricedEvents: 0, unpricedShare: 0 } },
+        spark: { events: 0, costUsd: 0 },
+      };
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const route = `${base}/api/local/timeline/window-breakdown`;
+
+    // A well-formed bounded window returns the breakdown, and the exact integer
+    // parameters reach the provider.
+    const ok = await fetch(`${route}?from=1000&to=2000`);
+    assert.equal(ok.status, 200);
+    const payload = await ok.json();
+    assert.equal(payload.schemaVersion, LOCAL_COMPANION_SCHEMA_VERSION);
+    assert.equal(payload.breakdown.status, "available");
+    assert.equal(payload.breakdown.byModel[0].model, "gpt-5.6-sol");
+    assert.deepEqual(requests.at(-1), { fromMs: 1000, toMs: 2000 });
+
+    // Missing, non-integer, and float parameters never reach the provider.
+    const before = requests.length;
+    assert.equal((await fetch(route)).status, 400);
+    assert.equal((await fetch(`${route}?from=1000`)).status, 400);
+    assert.equal((await fetch(`${route}?from=1.5&to=2000`)).status, 400);
+    assert.equal((await fetch(`${route}?from=abc&to=2000`)).status, 400);
+    // An unexpected extra parameter is refused rather than ignored.
+    assert.equal((await fetch(`${route}?from=1000&to=2000&path=/x`)).status, 400);
+    assert.equal(requests.length, before);
+
+    // A provider that rejects an inverted range maps to a 400 with its code.
+    const bad = await fetch(`${route}?from=2000&to=1000`);
+    assert.equal(bad.status, 400);
+    assert.equal((await bad.json()).error.code, "window_range_invalid");
+
+    // The route is GET-only.
+    assert.equal((await fetch(route, { method: "POST" })).status, 405);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
@@ -576,6 +685,7 @@ test("automatic contribution endpoints require exact consent and remain foregrou
     },
     automaticContributionOptions: {
       now: () => new Date(now),
+      ditherRandom: () => 0,
       setTimeoutImpl(callback, delay) {
         const id = nextTimer;
         nextTimer += 1;
@@ -868,6 +978,7 @@ test("shutdown retains the automatic-contribution lock until an aborted run fini
     }),
     automaticContributionOptions: {
       now: () => new Date(now),
+      ditherRandom: () => 0,
     },
     port: 0,
   };
@@ -967,6 +1078,7 @@ test("initialization failure retains the lock until idempotent automatic shutdow
   const initializationError = new Error("simulated initialization failure");
   let stopCalls = 0;
   let restarted;
+  let failedStart;
   let observedFailure;
   const automaticContributionController = {
     async start() {
@@ -999,21 +1111,41 @@ test("initialization failure retains the lock until idempotent automatic shutdow
     port: 0,
   };
   try {
-    observedFailure = assert.rejects(
-      startLocalCompanionServer({
-        ...baseOptions,
-        dataStore: {
-          ...fakeStore(),
-          async initialize() {
-            throw initializationError;
-          },
+    // The snapshot build now runs behind an already-open port, so a build that
+    // fails is surfaced on `snapshotReady` instead of on the start call. Every
+    // consequence of that failure is unchanged: automatic contribution stops
+    // exactly once, the instance lock is held until that cleanup finishes, and
+    // no second instance may start in the meantime.
+    failedStart = await startLocalCompanionServer({
+      ...baseOptions,
+      dataStore: {
+        ...fakeStore(),
+        async initialize() {
+          throw initializationError;
         },
-        automaticContributionController,
-      }),
+      },
+      automaticContributionController,
+    });
+    observedFailure = assert.rejects(
+      failedStart.snapshotReady,
       (error) => error === initializationError,
     );
     await stopStarted.promise;
     assert.equal(stopCalls, 1);
+
+    // The port is open, so the failure has to be readable rather than silent:
+    // readiness names it, and every route that would have to project the
+    // missing snapshot refuses instead of answering with an empty one.
+    const failedHealth = await fetch(
+      `http://127.0.0.1:${failedStart.port}/api/local/health`,
+    ).then((response) => response.json());
+    assert.equal(failedHealth.status, "ready");
+    assert.equal(failedHealth.snapshot.status, "failed");
+    const failedOverview = await fetch(
+      `http://127.0.0.1:${failedStart.port}/api/local/overview`,
+    );
+    assert.equal(failedOverview.status, 503);
+    assert.equal((await failedOverview.json()).error.code, "snapshot_unavailable");
 
     await assert.rejects(
       startLocalCompanionServer({
@@ -1028,6 +1160,8 @@ test("initialization failure retains the lock until idempotent automatic shutdow
     await observedFailure;
     observedFailure = null;
     assert.equal(stopCalls, 1);
+    await failedStart.close();
+    failedStart = null;
     await assert.rejects(
       lstat(join(
         files.stateRoot,
@@ -1051,8 +1185,76 @@ test("initialization failure retains the lock until idempotent automatic shutdow
     cleanupBarrier.resolve();
     await Promise.allSettled([
       observedFailure,
+      failedStart?.close(),
       restarted?.close(),
     ].filter(Boolean));
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("the port and readiness answer before the first snapshot is built", async () => {
+  const files = await fixture();
+  const buildStarted = deferred();
+  const buildBarrier = deferred();
+  const store = fakeStore();
+  let app;
+  try {
+    const startedAt = Date.now();
+    app = await startLocalCompanionServer({
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: {
+        ...store,
+        async initialize() {
+          buildStarted.resolve();
+          await buildBarrier.promise;
+        },
+      },
+      refreshRunner: async () => ({}),
+      port: 0,
+    });
+    const base = `http://127.0.0.1:${app.port}`;
+    await buildStarted.promise;
+
+    // Listening, and honest about what is not ready yet. Before the port moved
+    // ahead of the build this request could not even be sent: a real install
+    // spends seconds here, and a rejected accounting cache spends long enough
+    // to exceed the launcher's own startup budget and have the companion
+    // killed before it could finish.
+    const health = await fetch(`${base}/api/local/health`)
+      .then((response) => response.json());
+    assert.equal(health.status, "ready");
+    assert.deepEqual(health.snapshot, { status: "building", errorCode: null });
+    assert.ok(
+      Date.now() - startedAt < 5_000,
+      "readiness must answer without waiting for the snapshot build",
+    );
+    assert.equal((await fetch(`${base}/`)).status, 200);
+
+    // A route that reads the snapshot waits for the build rather than
+    // projecting a half-built one.
+    let overviewSettled = false;
+    const overview = fetch(`${base}/api/local/overview`)
+      .then((response) => {
+        overviewSettled = true;
+        return response;
+      });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(overviewSettled, false);
+
+    buildBarrier.resolve();
+    assert.equal((await overview).status, 200);
+    await app.snapshotReady;
+    assert.deepEqual(
+      (await fetch(`${base}/api/local/health`)
+        .then((response) => response.json())).snapshot,
+      { status: "ready", errorCode: null },
+    );
+  } finally {
+    buildBarrier.resolve();
+    await app?.close();
     await rm(files.root, { recursive: true });
   }
 });
@@ -1470,7 +1672,12 @@ test("server rejects forged hosts and requires same-origin refresh authorization
       body: JSON.stringify({ reason: "user_request" }),
     });
     assert.equal(started.status, 202);
-    assert.equal((await started.json()).refresh.status, "running");
+    const startedPayload = await started.json();
+    assert.equal(startedPayload.refresh.status, "running");
+    assert.match(
+      startedPayload.refresh.refreshId,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    );
 
     const duplicate = await fetch(`${base}/api/local/refresh`, {
       method: "POST",
@@ -1478,12 +1685,18 @@ test("server rejects forged hosts and requires same-origin refresh authorization
       body: "{}",
     });
     assert.equal(duplicate.status, 409);
+    const duplicatePayload = await duplicate.json();
+    assert.equal(
+      duplicatePayload.refresh.refreshId,
+      startedPayload.refresh.refreshId,
+    );
     resolveRefresh();
     await waitFor(async () => {
       const status = await fetch(`${base}/api/local/refresh`).then((response) => response.json());
       return status.refresh.status === "succeeded";
     });
     const completed = await fetch(`${base}/api/local/refresh`).then((response) => response.json());
+    assert.equal(completed.refresh.refreshId, startedPayload.refresh.refreshId);
     assert.deepEqual(completed.refresh.result, {
       rolloutRecordsWritten: 2,
       filesDiscovered: 3,
@@ -2440,6 +2653,10 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
     assert.equal(previewCalls, 0);
     const pairingCode =
       "um_pair_00000000-0000-4000-8000-000000000000.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    // Pause the queue the way a device_unavailable sync outcome would. A
+    // refused pairing must leave it paused; a successful pairing is the cure
+    // and must resume it without a separate dashboard action.
+    pausedState = true;
     const unauthorizedPairing = await fetch(
       `${base}/api/local/contribution/device-pair`,
       {
@@ -2450,6 +2667,7 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
     );
     assert.equal(unauthorizedPairing.status, 403);
     assert.equal(pairedCode, null);
+    assert.equal(pausedState, true);
     const paired = await fetch(
       `${base}/api/local/contribution/device-pair`,
       {
@@ -2459,6 +2677,7 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
       },
     ).then((response) => response.json());
     assert.equal(pairedCode, pairingCode);
+    assert.equal(pausedState, false);
     assert.deepEqual(paired, {
       schemaVersion: "local-contribution-device-pairing-v0.1",
       status: "paired",
@@ -2613,25 +2832,78 @@ test("stale contribution-device credentials return fixed recovery guidance witho
     };
     const pairingCode =
       "um_pair_00000000-0000-4000-8000-000000000000.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const response = await fetch(
-        `${base}/api/local/contribution/device-pair`,
-        {
-          method: "POST",
-          headers,
-          body: JSON.stringify({ pairingCode }),
+    const client = new LocalCompanionClient({
+      fetchImpl: (url, options = {}) => fetch(`${base}${url}`, {
+        ...options,
+        headers: {
+          ...options.headers,
+          Origin: base,
         },
-      );
-      assert.equal(response.status, 409);
-      const payload = await response.json();
-      assert.deepEqual(payload, {
-        schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
-        error: {
-          code: "contribution_device_recovery_required",
-        },
-      });
-      assert.equal(JSON.stringify(payload).includes(privateCanary), false);
-    }
+      }),
+    });
+    await assert.rejects(
+      client.pairContributionDevice(pairingCode),
+      (error) => error?.status === 409
+        && error?.code === "contribution_device_recovery_required",
+    );
+
+    // The browser client preserves only the fixed recovery code. The raw
+    // route still carries the same minimal payload, with no credential value
+    // or provider failure detail.
+    const response = await fetch(
+      `${base}/api/local/contribution/device-pair`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ pairingCode }),
+      },
+    );
+    assert.equal(response.status, 409);
+    const payload = await response.json();
+    assert.deepEqual(payload, {
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      error: {
+        code: "contribution_device_recovery_required",
+      },
+    });
+    assert.equal(JSON.stringify(payload).includes(privateCanary), false);
+
+    // Integrated rendered-state contract: this exact client error reaches the
+    // narrow recovery renderer, which offers reset and never generic fallback.
+    const appSource = await readFile(
+      new URL("../web/public/app.js", import.meta.url),
+      "utf8",
+    );
+    const htmlSource = await readFile(
+      new URL("../web/public/index.html", import.meta.url),
+      "utf8",
+    );
+    // Re-pinned 2026-08-08 (owner-directed one-step flow): the pairing steps
+    // live inside the merged Review-and-approve ceremony now, and they report
+    // on the merged surface's own status line — the separate connect card and
+    // its #community-connect-status are gone.
+    const connectSource = appSource.match(
+      /async function approveIncrementalContribution\(\) \{([\s\S]*?)\n\}\n/u,
+    )?.[1] ?? "";
+    // Failure handling was centralized: every connect failure routes through
+    // reportContributionConnectFailure, and the recovery contract lives there.
+    const reportFailureSource = appSource.match(
+      /async function reportContributionConnectFailure\([\s\S]*?\) \{([\s\S]*?)\n\}\n/u,
+    )?.[1] ?? "";
+    const recoverySource = appSource.match(
+      /async function renderContributionDeviceRecovery\(status, \{ error \} = \{\}\) \{([\s\S]*?)\n\}\n\nconst DEVICE_CREDENTIAL_RESET_CONFIRMATION/u,
+    )?.[1] ?? "";
+    assert.doesNotMatch(htmlSource, /id="community-connect-status"/u);
+    assert.match(htmlSource, /id="incremental-consent-status"/u);
+    assert.match(htmlSource, /id="community"[^>]*data-dashboard-page="community"/u);
+    assert.doesNotMatch(htmlSource, /id="data"[^>]*data-dashboard-page/u);
+    assert.doesNotMatch(htmlSource, /data-nav="data"/u);
+    assert.match(connectSource, /reportContributionConnectFailure\(status, error/u);
+    assert.match(reportFailureSource, /if \(contributionDeviceRecoveryIsRequired\(error\)\) \{\s*\n\s*await renderContributionDeviceRecovery\(status, \{ error \}\);/u);
+    assert.match(recoverySource, /id = "reset-device-credential"/u);
+    assert.match(recoverySource, /leftover contribution-device credential/u);
+    assert.doesNotMatch(recoverySource, /showFailure\(/u);
+    assert.doesNotMatch(appSource, /DO-NOT-LEAK-stale-device-credential-conflict/u);
     assert.equal(reads, 2);
     assert.equal(creates, 0);
     assert.equal(deletes, 0);
@@ -3196,6 +3468,150 @@ test("diagnostic notes are bounded, fixed-vocabulary, and land in a local log", 
   }
 });
 
+test("the dashboard's own sign-in failure note lands in the diagnostics log", async () => {
+  const files = await fixture();
+  const diagnosticsLogFile = join(files.stateRoot, "diagnostics-v0.1.log");
+  let now = Date.parse("2026-08-07T10:00:00.000Z");
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    diagnosticsLogFile,
+    clock: () => now,
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    // Browser-faithful fetch: receiver-sensitive exactly like Window.fetch
+    // (Blink throws "Illegal invocation", WebKit "Can only call Window.fetch
+    // on instances of Window" when it is invoked as a property of anything),
+    // resolving the dashboard's relative route against this server and
+    // stamping the Origin header a browser adds to every same-origin POST.
+    // A client that regresses to calling its stored fetch as a method fails
+    // here before any request is made — exactly as it would on a real page.
+    function browserFetch(url, options = {}) {
+      if (this !== undefined && this !== globalThis) {
+        throw new TypeError("Illegal invocation");
+      }
+      return fetch(`${base}${url}`, {
+        ...options,
+        headers: {
+          ...options.headers,
+          Origin: base,
+        },
+      });
+    }
+    const client = new LocalCompanionClient({ fetchImpl: browserFetch });
+
+    // The exact note describeFailure files for a failed hosted sign-in whose
+    // error never got a service answer: a page-minted reference, the fixed
+    // hosted_identity surface, and empty validated code and request id (the
+    // client replaces the empty code with its fixed "unknown").
+    const offlineReference = createDiagnosticReference();
+    const offline = await client.recordDiagnosticNote({
+      reference: offlineReference,
+      surface: diagnosticSurface("hosted_identity"),
+      code: diagnosticErrorCode(undefined),
+      requestId: serviceRequestId(undefined),
+    });
+    assert.deepEqual(offline, {
+      status: "recorded",
+      reference: offlineReference,
+    });
+
+    // The same journey when the service answered with its fixed error shape:
+    // the code and request id travel exactly as validated from that answer.
+    now = Date.parse("2026-08-07T10:01:00.000Z");
+    const answeredReference = createDiagnosticReference();
+    const answered = await client.recordDiagnosticNote({
+      reference: answeredReference,
+      surface: diagnosticSurface("hosted_identity"),
+      code: diagnosticErrorCode("INTERNAL_ERROR"),
+      requestId: serviceRequestId("0f2c7a11-4b93-4bb2-9a7c-1c0d2e3f4a5b"),
+    });
+    assert.deepEqual(answered, {
+      status: "recorded",
+      reference: answeredReference,
+    });
+
+    const lines = (await readFile(diagnosticsLogFile, "utf8"))
+      .trimEnd()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(lines, [
+      {
+        schemaVersion: "local-diagnostic-note-v0.1",
+        recordedAt: "2026-08-07T10:00:00.000Z",
+        reference: offlineReference,
+        surface: "hosted_identity",
+        code: "unknown",
+        requestId: "",
+      },
+      {
+        schemaVersion: "local-diagnostic-note-v0.1",
+        recordedAt: "2026-08-07T10:01:00.000Z",
+        reference: answeredReference,
+        surface: "hosted_identity",
+        code: "INTERNAL_ERROR",
+        requestId: "0f2c7a11-4b93-4bb2-9a7c-1c0d2e3f4a5b",
+      },
+    ]);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("failed diagnostic note writes return a fixed error without leaking recorder details", async () => {
+  const files = await fixture();
+  let calls = 0;
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    diagnosticsLogFile: join(files.stateRoot, "diagnostics-v0.1.log"),
+    diagnosticNoteRecorder: async () => {
+      calls += 1;
+      throw new Error("private diagnostic recorder detail");
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const response = await fetch(`${base}/api/local/diagnostics/note`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1",
+        Origin: base,
+      },
+      body: JSON.stringify({
+        reference: "TT-7QF3K2",
+        surface: "contribution_connect",
+        code: "contribution_device_recovery_required",
+        requestId: "",
+      }),
+    });
+    assert.equal(response.status, 500);
+    const payload = await response.json();
+    assert.deepEqual(payload, {
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      error: { code: "diagnostic_note_not_recorded" },
+    });
+    assert.equal(JSON.stringify(payload).includes("private diagnostic recorder detail"), false);
+    assert.equal(calls, 1);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
 test("the diagnostics log is bounded and keeps one previous generation", async () => {
   const files = await fixture();
   const diagnosticsLogFile = join(files.stateRoot, "diagnostics-v0.1.log");
@@ -3409,6 +3825,186 @@ test("a failed device credential reset reports one fixed code and deletes nothin
     assert.equal(payload.includes("/Users/private"), false);
     assert.equal(payload.includes("adamallcock"), false);
   } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("disconnecting this Mac requires a local confirmation and returns no device identifier", async () => {
+  const files = await fixture();
+  let calls = 0;
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    contributionDeviceDisconnectRunner: async () => {
+      calls += 1;
+      return {
+        status: "disconnected",
+        deliveryPaused: true,
+        localCredential: "deleted",
+        localBinding: "removed",
+      };
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const path = "/api/local/contribution/device-disconnect";
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const health = await fetch(`${base}/api/local/health`).then((response) => response.json());
+    assert.equal(health.capabilities.contributionDeviceDisconnect, true);
+
+    const unauthorized = await fetch(`${base}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: "disconnect_this_mac" }),
+    });
+    assert.equal(unauthorized.status, 403);
+    assert.equal((await unauthorized.json()).error.code, "contribution_device_disconnect_not_authorized");
+
+    for (const body of ["{}", JSON.stringify({ confirm: "yes" })]) {
+      const rejected = await fetch(`${base}${path}`, {
+        method: "POST",
+        headers,
+        body,
+      });
+      assert.equal(rejected.status, 400);
+      assert.equal((await rejected.json()).error.code, "invalid_request");
+    }
+    assert.equal(calls, 0);
+
+    const disconnected = await fetch(`${base}${path}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ confirm: "disconnect_this_mac" }),
+    });
+    assert.equal(disconnected.status, 200);
+    const body = await disconnected.text();
+    assert.deepEqual(JSON.parse(body), {
+      schemaVersion: "local-contribution-device-disconnect-v0.1",
+      status: "disconnected",
+      deliveryPaused: true,
+      localCredential: "deleted",
+      localBinding: "removed",
+      includesIdentifiers: false,
+      includesCredentials: false,
+      hostedDataDeleted: false,
+    });
+    assert.equal(calls, 1);
+    assert.equal(body.includes("00000000-0000"), false);
+    assert.equal((await fetch(`${base}${path}`)).status, 405);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("disconnect serializes delivery-affecting mutations before remote revocation completes", async () => {
+  const files = await fixture();
+  const disconnectStarted = deferred();
+  const releaseDisconnect = deferred();
+  let disconnectCalls = 0;
+  let syncCalls = 0;
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    contributionDeviceDisconnectRunner: async () => {
+      disconnectCalls += 1;
+      disconnectStarted.resolve();
+      await releaseDisconnect.promise;
+      return {
+        status: "disconnected",
+        deliveryPaused: true,
+        localCredential: "deleted",
+        localBinding: "removed",
+      };
+    },
+    contributionSyncExactReviewProvider: async () => ({
+      schemaVersion: "contribution-sync-exact-review-v0.1",
+      state: "ready",
+      networkActivity: false,
+      discoveredSets: 1,
+      enqueued: 0,
+      payloadBytes: 16,
+      payload: exactReviewContribution(),
+      reviewBinding: {
+        jobId: REVIEW_JOB_ID,
+        contributionSha256: REVIEW_SHA256,
+      },
+    }),
+    contributionSyncOnceRunner: async () => {
+      syncCalls += 1;
+      throw new Error("sync must not start while disconnect is pending");
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const review = await fetch(
+      `${base}/api/local/contribution/sync-inspect-exact`,
+      { method: "POST", headers, body: "{}" },
+    ).then((response) => response.json());
+    const disconnect = fetch(
+      `${base}/api/local/contribution/device-disconnect`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ confirm: "disconnect_this_mac" }),
+      },
+    );
+    await disconnectStarted.promise;
+
+    const blockedSync = await fetch(
+      `${base}/api/local/contribution/sync-once`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ reviewToken: review.reviewToken }),
+      },
+    );
+    assert.equal(blockedSync.status, 409);
+    assert.deepEqual(await blockedSync.json(), {
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      error: { code: "sync_in_progress" },
+    });
+    assert.equal(syncCalls, 0);
+
+    const duplicate = await fetch(
+      `${base}/api/local/contribution/device-disconnect`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ confirm: "disconnect_this_mac" }),
+      },
+    );
+    assert.equal(duplicate.status, 409);
+    assert.deepEqual(await duplicate.json(), {
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      error: { code: "sync_in_progress" },
+    });
+    assert.equal(disconnectCalls, 1);
+
+    releaseDisconnect.resolve();
+    assert.equal((await disconnect).status, 200);
+  } finally {
+    releaseDisconnect.resolve();
     await app.close();
     await rm(files.root, { recursive: true });
   }

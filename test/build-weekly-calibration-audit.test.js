@@ -16,8 +16,12 @@ import { fileURLToPath } from "node:url";
 const SCRIPT = fileURLToPath(
   new URL("../src/build-weekly-calibration-audit.js", import.meta.url),
 );
-const START_AT = "2020-01-01T11:00:00.000Z";
-const END_AT = "2020-01-01T13:00:00.000Z";
+// The historical price ledger now intentionally fails closed before an
+// official effective-price window exists. Keep this fixture inside the
+// reviewed GPT-5.6 price window because this test exercises successful local
+// audit pricing rather than the separate unknown-history path.
+const START_AT = "2026-07-31T11:00:00.000Z";
+const END_AT = "2026-07-31T13:00:00.000Z";
 const MODEL = "gpt-5.6-sol";
 const EXPECTED_TOTAL_TOKENS = 1_100;
 const EXPECTED_API_PRICE_EQUIVALENT_USD = 0.008;
@@ -86,12 +90,12 @@ async function createFixture() {
 
   const rolloutPath = join(
     archivedSessions,
-    "rollout-2020-01-01T12-00-00-weekly-audit.jsonl",
+    "rollout-2026-07-31T12-00-00-weekly-audit.jsonl",
   );
   const tokenUsage = usage();
   const records = [
     {
-      timestamp: "2020-01-01T12:00:00.000Z",
+      timestamp: "2026-07-31T12:00:00.000Z",
       type: "session_meta",
       payload: {
         id: SESSION_CANARY,
@@ -101,7 +105,7 @@ async function createFixture() {
       },
     },
     {
-      timestamp: "2020-01-01T12:00:00.001Z",
+      timestamp: "2026-07-31T12:00:00.001Z",
       type: "turn_context",
       payload: {
         model: MODEL,
@@ -110,7 +114,7 @@ async function createFixture() {
       },
     },
     {
-      timestamp: "2020-01-01T12:01:00.000Z",
+      timestamp: "2026-07-31T12:01:00.000Z",
       type: "event_msg",
       payload: {
         type: "token_count",

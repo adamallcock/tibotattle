@@ -1,0 +1,44 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "tibotattle-dogfood-release-guard",
+  "main": "src/dogfood-update-guard.ts",
+  "compatibility_date": "2026-08-05",
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "routes": [
+    {
+      "pattern": "dogfood-release.tibotattle.com",
+      "custom_domain": true
+    }
+  ],
+  "vars": {
+    "SPARKLE_APPCAST_GUARD_MODE": "enabled",
+    "SPARKLE_APPCAST_GUARD_CHANNEL": "internal-dogfood",
+    "SPARKLE_APPCAST_GUARD_BUCKET": "tibotattle-dogfood-updates",
+    "SPARKLE_APPCAST_GUARD_APPCAST_KEY": "internal-dogfood/appcast.xml",
+    "SPARKLE_APPCAST_GUARD_ENDPOINT_PATH": "/api/v1/internal/release/appcast",
+    "SPARKLE_APPCAST_GUARD_CONTENT_TYPE": "application/xml; charset=utf-8",
+    "SPARKLE_APPCAST_GUARD_CACHE_CONTROL": "public, max-age=300, must-revalidate",
+    "SPARKLE_APPCAST_GUARD_MAX_XML_BYTES": "1048576",
+    "SPARKLE_APPCAST_GUARD_PUBLIC_ED_KEY": "ITd8MScUmLiMB0ulDrDdAn4ofHp0e6UxTkXbpK8DSvQ=",
+    "SPARKLE_APPCAST_GUARD_PUBLIC_ED_KEY_SHA256": "77d5717947da768e7e96a1b1e6225d2cae4748a556f109f2a30444a5f41ff3d2"
+  },
+  "r2_buckets": [
+    {
+      "binding": "SPARKLE_RELEASES",
+      "bucket_name": "tibotattle-dogfood-updates"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "USAGE_MONITOR_DB",
+      "database_name": "tibotattle-dogfood-release-guard",
+      "database_id": "1d89651e-b8e9-4335-98bc-68872eadb8bf",
+      "migrations_dir": "dogfood-update-guard-migrations"
+    }
+  ]
+}

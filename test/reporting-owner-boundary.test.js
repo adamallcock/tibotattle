@@ -11,9 +11,24 @@ const REPOSITORY_ROOT = resolve(
   dirname(fileURLToPath(import.meta.url)),
   "..",
 );
-const REPORTING_IMPLEMENTATIONS = Object.freeze([
-  "src/reporting/monitoring-quality.js",
-  "src/reporting/weekly-calibration.js",
+// Every reporting implementation module, pinned to the exact import
+// specifiers it is reviewed to carry. An empty list means the module is a
+// pure leaf. A non-empty list may only name a workspace package the
+// architecture checker already grants the reporting owner
+// (OWNER_ALLOWED_PACKAGES in scripts/check-architecture-boundaries.mjs);
+// runtime builtins and relative reaches into another owner stay forbidden.
+const REPORTING_IMPLEMENTATIONS = Object.freeze({
+  "src/reporting/monitoring-quality.js": Object.freeze([]),
+  // The seven-day window length is the quota owner's constant. Reporting
+  // reads it from that package's public entrypoint instead of restating
+  // 10_080 and letting the two definitions drift apart.
+  "src/reporting/weekly-calibration.js": Object.freeze([
+    "@app-usagemonitor/quota-analysis",
+  ]),
+});
+const REPORTING_ALLOWED_PACKAGES = Object.freeze([
+  "@app-usagemonitor/accounting",
+  "@app-usagemonitor/quota-analysis",
 ]);
 const REPORTING_PUBLIC_EXPORTS = Object.freeze([
   "BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT",
@@ -21,6 +36,7 @@ const REPORTING_PUBLIC_EXPORTS = Object.freeze([
   "analyzeMonitoringQuality",
   "analyzeWeeklyCalibration",
   "classifyMonitoringInterval",
+  "createCollectorQualityAccumulator",
   "projectBoundedWeeklyCalibrationSummary",
   "renderMonitoringQualityReport",
   "renderWeeklyCalibrationReport",
@@ -43,11 +59,24 @@ test("reporting publishes only the reviewed monitoring and weekly calibration AP
 });
 
 test("reporting implementations are runtime-neutral and index-only outside the owner", async () => {
-  for (const implementation of REPORTING_IMPLEMENTATIONS) {
+  for (
+    const [implementation, reviewed] of Object.entries(REPORTING_IMPLEMENTATIONS)
+  ) {
     const imports = await extractEsmImports(await source(implementation), {
       sourceName: implementation,
     });
-    assert.deepEqual(imports, [], `${implementation} must not import a runtime or another owner`);
+    assert.deepEqual(
+      imports.map(({ specifier }) => specifier).sort(),
+      [...reviewed].sort(),
+      `${implementation} must not import a runtime or another owner`,
+    );
+    for (const specifier of reviewed) {
+      assert.equal(
+        REPORTING_ALLOWED_PACKAGES.includes(specifier),
+        true,
+        `${implementation} may only reach a package the reporting owner is granted: ${specifier}`,
+      );
+    }
   }
 
   const indexImports = await extractEsmImports(

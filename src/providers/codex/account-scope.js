@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import { sanitizeProviderPlanLabel } from "./plan-normalization.js";
 
 /**
  * A versioned, privacy-preserving account partition.  It is deliberately not
@@ -9,7 +10,6 @@ export const OPENAI_ACCOUNT_SCOPE_VERSION = "openai-account-v1";
 export const OPENAI_ACCOUNT_SCOPE_PREFIX = "openai-account:v1:";
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/u;
-const PLAN_TYPE_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 const SCOPE_ID_PATTERN = /^openai-account:v1:[A-Za-z0-9_-]{43}$/u;
 const HMAC_DOMAIN = "app-usagemonitor/openai-account-scope/v1\u0000";
 
@@ -70,9 +70,7 @@ function usableSecret(secret) {
  * local observation. Invalid values are omitted rather than echoed.
  */
 export function sanitizePlanType(planType) {
-  if (typeof planType !== "string") return null;
-  const normalized = planType.trim().toLowerCase();
-  return PLAN_TYPE_PATTERN.test(normalized) ? normalized : null;
+  return sanitizeProviderPlanLabel(planType);
 }
 
 /**

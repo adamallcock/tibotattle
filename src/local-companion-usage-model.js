@@ -1,0 +1,575 @@
+import {
+  addUsdStrings,
+  emptySpeedWeightingCrossing,
+  FAST_MODE_MODEL_FAMILY_KEYS,
+  fastModeModelFamilyKey,
+  OBSERVED_SPEED_MODE_KEYS,
+  priceCodexUsageEvent,
+} from "@app-usagemonitor/accounting";
+import {
+  isValidQuotaWindowDuration,
+} from "@app-usagemonitor/quota-analysis";
+import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
+import {
+  codexModelAllowanceTrack,
+  codexModelApiPriceEquivalentApplicable,
+  codexModelPricingStatus,
+  OPENAI_CODEX_SPARK_MODEL_ID,
+  recognizedCodexModelId,
+} from "./export/index.js";
+
+// The companion's usage-accounting projection model, shared verbatim between
+// its two evidence sources: the bounded recent collector state and the unified
+// local index. One definition of a period, a timeline bucket and a projected
+// usage event is what keeps the two sources comparable figure-for-figure —
+// any parity diff between them is then a difference in evidence, never a
+// difference in arithmetic.
+
+export const COMPONENT_KEYS = Object.freeze([
+  "input_uncached_tokens",
+  "input_cache_read_tokens",
+  "input_cache_write_tokens",
+  "output_text_tokens",
+  "output_reasoning_tokens",
+  "output_combined_tokens",
+]);
+
+// Model identity is owned by the reviewed export registry so that the live
+// collector projection, the replay-safe cache and the indexed archive cannot
+// drift apart and disagree about what counts as recognised.
+const SPARK_MODEL = OPENAI_CODEX_SPARK_MODEL_ID;
+
+export const KNOWN_SPEEDS = new Set(["standard", "fast", "flex", "batch", "unknown"]);
+export const KNOWN_API_TIERS = new Set(["standard", "priority", "flex", "batch", "unknown"]);
+export const KNOWN_SURFACES = new Set([
+  "extension_or_ide",
+  "scheduled_task",
+  "subagent",
+  "cli_exec",
+  "work",
+  "workspace_agent",
+  "excel",
+  "voice_task",
+  "unknown",
+]);
+export const KNOWN_AGENT_SCOPES = new Set(["root", "subagent", "automation", "unknown"]);
+export const KNOWN_LINEAGE = new Set(["standalone", "forked", "parent_linked", "unknown"]);
+export const KNOWN_TOOL_CLASSES = new Set(["apply_patch", "local_shell", "other", "subagent", "tool_gateway"]);
+export const KNOWN_LIMITS = new Set(["codex", "codex_bengalfox", "codex-spark"]);
+export const KNOWN_PLANS = new Set(TELEMETRY_PLAN_TYPES);
+export const KNOWN_SLOTS = new Set(["primary", "secondary"]);
+export const TIMELINE_BUCKET_MS = 15 * 60 * 1_000;
+export const MAX_QUOTA_TIMELINE_POINTS = 10_000;
+const MAX_DATASET_ROWS = 2_500;
+
+export function finiteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+export function quotaResetIsoInstant(value) {
+  if (!Number.isSafeInteger(value) || value <= 0) return null;
+  try {
+    return new Date(value * 1_000).toISOString();
+  } catch {
+    return null;
+  }
+}
+
+export function deterministicSample(rows, maximum = MAX_DATASET_ROWS) {
+  if (rows.length <= maximum) return rows;
+  const sampled = [];
+  const last = rows.length - 1;
+  for (let index = 0; index < maximum; index += 1) {
+    sampled.push(rows[Math.round((index * last) / (maximum - 1))]);
+  }
+  return sampled;
+}
+
+export function emptyComponents() {
+  return Object.fromEntries(COMPONENT_KEYS.map((key) => [key, 0]));
+}
+
+export function addComponents(target, components) {
+  if (!components || typeof components !== "object" || Array.isArray(components)) return;
+  for (const key of COMPONENT_KEYS) {
+    const value = components[key];
+    if (Number.isSafeInteger(value) && value >= 0) target[key] += value;
+  }
+}
+
+export function safeModel(model) {
+  return recognizedCodexModelId(model) ?? "unknown";
+}
+
+function modelPricingStatus(model) {
+  return codexModelPricingStatus(model);
+}
+
+export function safeSpeed(speed) {
+  return KNOWN_SPEEDS.has(speed) ? speed : "unknown";
+}
+
+export function safeEnum(value, allowed) {
+  return allowed.has(value) ? value : "unknown";
+}
+
+export function emptyDimension(keys) {
+  return Object.fromEntries([...keys].map((key) => [
+    key,
+    { events: 0, totalTokens: 0, apiPriceEquivalentUsd: 0 },
+  ]));
+}
+
+export function usageProjection(record, declaredSpeed = "unknown", pricer = null) {
+  const components = emptyComponents();
+  addComponents(components, record.components);
+  if (components.output_combined_tokens > 0
+      && components.output_text_tokens + components.output_reasoning_tokens > 0) {
+    components.output_combined_tokens = 0;
+  }
+  const totalTokens = components.input_uncached_tokens
+    + components.input_cache_read_tokens
+    + components.input_cache_write_tokens
+    + (components.output_combined_tokens > 0
+      ? components.output_combined_tokens
+      : components.output_text_tokens + components.output_reasoning_tokens);
+  if (totalTokens === 0) return null;
+  const model = safeModel(record.model);
+  let priced;
+  try {
+    // A caller iterating a large store passes a memoized pricer (the same one
+    // the replay-safe cache accounts with); it falls back to the full pricer
+    // whenever its per-(model, band, date) plan cannot be proven exact, so
+    // the figures are identical either way — only the wall time differs.
+    priced = pricer !== null
+      ? pricer({ timestamp: record.observedAt, model }, components)
+      : priceCodexUsageEvent({
+        timestamp: record.observedAt,
+        model,
+        components,
+      }, {
+        // Subscription speed and the API billing tier are separate concepts.
+        // Standard is the explicit counterfactual until an API tier is
+        // observed.
+        apiServiceTier: "standard",
+        priceEpochBasis: "event_time",
+      });
+  } catch {
+    priced = { totalUsd: "0", coverageStatus: "unpriced" };
+  }
+  const rawCost = Number(priced.totalUsd);
+  const priceCardIds = Array.isArray(priced.selectedPriceCardIds)
+    ? [...new Set(priced.selectedPriceCardIds.filter((id) => (
+      typeof id === "string" && id.length > 0 && id.length <= 128
+    )))].sort()
+    : [];
+  const priceCardBreakdown = Array.isArray(priced.priceCardBreakdown)
+    ? priced.priceCardBreakdown.filter((item) => (
+      item
+      && typeof item === "object"
+      && typeof item.priceCardId === "string"
+      && item.priceCardId.length > 0
+      && item.priceCardId.length <= 128
+      && Number.isSafeInteger(item.events)
+      && item.events >= 0
+      && typeof item.costUsd === "string"
+      && /^\d+(?:\.\d+)?$/u.test(item.costUsd)
+    ))
+    : [];
+  return {
+    model,
+    modelPricingStatus: modelPricingStatus(record.model),
+    modelAllowanceTrack: codexModelAllowanceTrack(record.model),
+    modelApiPriceEquivalentApplicable:
+      codexModelApiPriceEquivalentApplicable(record.model),
+    isSpark: model === SPARK_MODEL,
+    components,
+    totalTokens,
+    apiPriceEquivalentUsd: Number.isFinite(rawCost) ? rawCost : 0,
+    apiPriceEquivalentUsdExact: ["fully_priced", "partially_priced"].includes(
+      priced.coverageStatus,
+    ) && typeof priced.totalUsd === "string"
+        && /^\d+(?:\.\d+)?$/u.test(priced.totalUsd)
+      ? priced.totalUsd
+      : null,
+    priceCardIds,
+    priceCardBreakdown,
+    pricingCoverageStatus: ["fully_priced", "partially_priced"].includes(priced.coverageStatus)
+      ? priced.coverageStatus
+      : "unpriced",
+    speed: safeSpeed(record.tierSemantics?.codexSpeedMode),
+    declaredSpeed,
+    apiServiceTier: safeEnum(record.tierSemantics?.apiServiceTier, KNOWN_API_TIERS),
+    surface: safeEnum(record.surfaceClassification?.surface, KNOWN_SURFACES),
+    agentScope: safeEnum(record.surfaceClassification?.agentScope, KNOWN_AGENT_SCOPES),
+    lineage: safeEnum(record.surfaceClassification?.lineageDisposition, KNOWN_LINEAGE),
+    reasoningEffort: "unknown",
+    accountAttribution: record.accountScope?.status === "available"
+      ? "attributed_pseudonymous"
+      : "unattributed",
+  };
+}
+
+export function newUsagePeriod(id, label, { includeSpark = true } = {}) {
+  const period = {
+    id,
+    label,
+    events: 0,
+    totalTokens: 0,
+    components: emptyComponents(),
+    apiPriceEquivalentUsd: 0,
+    apiPriceEquivalentUsdExact: null,
+    priceCardIds: [],
+    priceCardBreakdown: {},
+    pricingCoverage: {
+      fullyPricedEvents: 0,
+      partiallyPricedEvents: 0,
+      unpricedEvents: 0,
+    },
+    byModel: {},
+    bySpeed: emptyDimension(KNOWN_SPEEDS),
+    byApiServiceTier: emptyDimension(KNOWN_API_TIERS),
+    bySurface: emptyDimension(KNOWN_SURFACES),
+    byAgentScope: emptyDimension(KNOWN_AGENT_SCOPES),
+    byLineage: emptyDimension(KNOWN_LINEAGE),
+    byReasoningEffort: {
+      unknown: { events: 0, totalTokens: 0, apiPriceEquivalentUsd: 0 },
+    },
+    // Observed speed mode crossed with the model's published Fast credit rate
+    // family, so the owner's Fast-mode preference can be applied at read time.
+    speedWeighting: emptySpeedWeightingCrossing(),
+    // The same crossing, holding only the events the log left UNOBSERVED that
+    // a timestamped Codex `service_tier` reading actually covers.
+    declaredSpeedWeighting: emptySpeedWeightingCrossing(),
+    accountAttribution: {
+      attributedPseudonymousEvents: 0,
+      unattributedEvents: 0,
+    },
+  };
+  if (includeSpark) {
+    period.spark = newUsagePeriod("spark", "Spark allowance", {
+      includeSpark: false,
+    });
+  }
+  return period;
+}
+
+function addSpeedWeighting(crossing, projection) {
+  const speed = crossing[projection.speed] ? projection.speed : "unknown";
+  const cell = crossing[speed][fastModeModelFamilyKey(projection.model)];
+  cell.events += 1;
+  cell.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
+}
+
+function addDeclaredSpeedWeighting(crossing, projection) {
+  // Only a declaration that resolved to a real mode is recorded, and only for
+  // events the log left unobserved; everything else is left unattributed.
+  if (projection.declaredSpeed !== "standard"
+      && projection.declaredSpeed !== "fast") return;
+  const cell =
+    crossing[projection.declaredSpeed][fastModeModelFamilyKey(projection.model)];
+  cell.events += 1;
+  cell.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
+}
+
+function finalizeSpeedWeighting(crossing) {
+  return Object.fromEntries(Object.entries(crossing).map(([speed, families]) => [
+    speed,
+    Object.fromEntries(Object.entries(families).map(([family, cell]) => [
+      family,
+      {
+        ...cell,
+        apiPriceEquivalentUsd: Number(cell.apiPriceEquivalentUsd.toFixed(6)),
+      },
+    ])),
+  ]));
+}
+
+export function safeSpeedWeighting(value) {
+  const crossing = emptySpeedWeightingCrossing();
+  for (const speed of OBSERVED_SPEED_MODE_KEYS) {
+    for (const family of FAST_MODE_MODEL_FAMILY_KEYS) {
+      const cell = value?.[speed]?.[family];
+      crossing[speed][family] = {
+        events: Number.isSafeInteger(cell?.events) && cell.events >= 0
+          ? cell.events
+          : 0,
+        apiPriceEquivalentUsd:
+          finiteNumber(cell?.apiPriceEquivalentUsd) !== null
+            && cell.apiPriceEquivalentUsd >= 0
+            ? cell.apiPriceEquivalentUsd
+            : 0,
+      };
+    }
+  }
+  return crossing;
+}
+
+function addDimension(dimension, key, projection) {
+  const row = dimension[key] ?? dimension.unknown;
+  row.events += 1;
+  row.totalTokens += projection.totalTokens;
+  row.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
+}
+
+export function addUsageToPeriod(period, projection) {
+  if (projection === null) return;
+  if (projection.isSpark) {
+    addUsageToPeriod(period.spark, { ...projection, isSpark: false });
+    return;
+  }
+  period.events += 1;
+  period.totalTokens += projection.totalTokens;
+  addComponents(period.components, projection.components);
+  const modelSummary = period.byModel[projection.model] ??= {
+    model: projection.model,
+    pricingStatus: projection.modelPricingStatus,
+    allowanceTrack: projection.modelAllowanceTrack,
+    apiPriceEquivalentApplicable: projection.modelApiPriceEquivalentApplicable,
+    events: 0,
+    totalTokens: 0,
+    apiPriceEquivalentUsd: 0,
+  };
+  modelSummary.events += 1;
+  modelSummary.totalTokens += projection.totalTokens;
+  modelSummary.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
+  period.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
+  if (projection.apiPriceEquivalentUsdExact !== null) {
+    period.apiPriceEquivalentUsdExact = period.apiPriceEquivalentUsdExact === null
+      ? projection.apiPriceEquivalentUsdExact
+      : addUsdStrings(
+        period.apiPriceEquivalentUsdExact,
+        projection.apiPriceEquivalentUsdExact,
+      );
+  }
+  for (const id of projection.priceCardIds) {
+    if (!period.priceCardIds.includes(id)) period.priceCardIds.push(id);
+  }
+  for (const item of projection.priceCardBreakdown) {
+    const row = period.priceCardBreakdown[item.priceCardId] ?? {
+      priceCardId: item.priceCardId,
+      events: 0,
+      costUsd: "0",
+    };
+    row.events += item.events;
+    row.costUsd = addUsdStrings(row.costUsd, item.costUsd);
+    period.priceCardBreakdown[item.priceCardId] = row;
+  }
+  addDimension(period.bySpeed, projection.speed, projection);
+  addSpeedWeighting(period.speedWeighting, projection);
+  addDeclaredSpeedWeighting(period.declaredSpeedWeighting, projection);
+  addDimension(period.byApiServiceTier, projection.apiServiceTier, projection);
+  addDimension(period.bySurface, projection.surface, projection);
+  addDimension(period.byAgentScope, projection.agentScope, projection);
+  addDimension(period.byLineage, projection.lineage, projection);
+  addDimension(period.byReasoningEffort, projection.reasoningEffort, projection);
+  if (projection.accountAttribution === "attributed_pseudonymous") {
+    period.accountAttribution.attributedPseudonymousEvents += 1;
+  } else {
+    period.accountAttribution.unattributedEvents += 1;
+  }
+  if (projection.pricingCoverageStatus === "fully_priced") {
+    period.pricingCoverage.fullyPricedEvents += 1;
+  } else if (projection.pricingCoverageStatus === "partially_priced") {
+    period.pricingCoverage.partiallyPricedEvents += 1;
+  }
+  else period.pricingCoverage.unpricedEvents += 1;
+}
+
+function finalizeDimension(dimension) {
+  return Object.fromEntries(Object.entries(dimension).map(([key, row]) => [
+    key,
+    {
+      ...row,
+      apiPriceEquivalentUsd: Number(row.apiPriceEquivalentUsd.toFixed(6)),
+    },
+  ]));
+}
+
+export function finalizeUsagePeriod(period) {
+  const priced = period.pricingCoverage.fullyPricedEvents + period.pricingCoverage.partiallyPricedEvents;
+  const finalized = {
+    ...period,
+    apiPriceEquivalentUsd: Number(period.apiPriceEquivalentUsd.toFixed(6)),
+    priceCardIds: [...period.priceCardIds].sort(),
+    priceCardBreakdown: Object.values(period.priceCardBreakdown).sort(
+      (left, right) => left.priceCardId.localeCompare(right.priceCardId),
+    ),
+    pricedEventFraction: period.events === 0 ? null : Number((priced / period.events).toFixed(6)),
+    byModel: Object.values(period.byModel)
+      .map((row) => ({ ...row, apiPriceEquivalentUsd: Number(row.apiPriceEquivalentUsd.toFixed(6)) }))
+      .sort((left, right) => right.apiPriceEquivalentUsd - left.apiPriceEquivalentUsd || left.model.localeCompare(right.model)),
+    bySpeed: finalizeDimension(period.bySpeed),
+    byApiServiceTier: finalizeDimension(period.byApiServiceTier),
+    bySurface: finalizeDimension(period.bySurface),
+    byAgentScope: finalizeDimension(period.byAgentScope),
+    byLineage: finalizeDimension(period.byLineage),
+    byReasoningEffort: finalizeDimension(period.byReasoningEffort),
+    speedWeighting: finalizeSpeedWeighting(period.speedWeighting),
+    declaredSpeedWeighting: finalizeSpeedWeighting(
+      period.declaredSpeedWeighting,
+    ),
+  };
+  if (period.spark) finalized.spark = finalizeUsagePeriod(period.spark);
+  // One list covering every allowance track. `byModel` stays aligned with the
+  // period's own totals, which exclude the separately metered Spark track.
+  finalized.modelUsage = [
+    ...finalized.byModel,
+    ...(finalized.spark?.byModel ?? []),
+  ].sort((left, right) => (
+    right.apiPriceEquivalentUsd - left.apiPriceEquivalentUsd
+    || right.totalTokens - left.totalTokens
+    || left.model.localeCompare(right.model)
+  ));
+  return finalized;
+}
+
+export function validObservedAt(record) {
+  const timestamp = Date.parse(record?.observedAt);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function newTimelineBucket(startMs) {
+  return {
+    startMs,
+    endMs: startMs + TIMELINE_BUCKET_MS,
+    usageEvents: 0,
+    totalTokens: 0,
+    components: emptyComponents(),
+    apiPriceEquivalentUsd: 0,
+    fullyPricedEvents: 0,
+    partiallyPricedEvents: 0,
+    unpricedEvents: 0,
+  };
+}
+
+export function addTimelineUsage(buckets, observedMs, projection) {
+  if (projection === null) return;
+  const startMs = Math.floor(observedMs / TIMELINE_BUCKET_MS) * TIMELINE_BUCKET_MS;
+  const bucket = buckets.get(startMs) ?? newTimelineBucket(startMs);
+  bucket.usageEvents += 1;
+  bucket.totalTokens += projection.totalTokens;
+  bucket.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
+  addComponents(bucket.components, projection.components);
+  if (projection.pricingCoverageStatus === "fully_priced") bucket.fullyPricedEvents += 1;
+  else if (projection.pricingCoverageStatus === "partially_priced") bucket.partiallyPricedEvents += 1;
+  else bucket.unpricedEvents += 1;
+  buckets.set(startMs, bucket);
+}
+
+export function finalizeTimelineBuckets(buckets) {
+  return [...buckets.values()]
+    .sort((left, right) => left.startMs - right.startMs)
+    .map((bucket) => ({
+      startAt: new Date(bucket.startMs).toISOString(),
+      endAt: new Date(bucket.endMs).toISOString(),
+      usageEvents: bucket.usageEvents,
+      totalTokens: bucket.totalTokens,
+      components: bucket.components,
+      apiPriceEquivalentUsd: Number(bucket.apiPriceEquivalentUsd.toFixed(6)),
+      pricingCoverage: {
+        fullyPricedEvents: bucket.fullyPricedEvents,
+        partiallyPricedEvents: bucket.partiallyPricedEvents,
+        unpricedEvents: bucket.unpricedEvents,
+      },
+    }));
+}
+
+export function quotaWindowProjection(window) {
+  if (!window || typeof window !== "object") return null;
+  const usedPercent = finiteNumber(window.usedPercent);
+  if (usedPercent === null || usedPercent < 0 || usedPercent > 100) return null;
+  const durationMinutes = isValidQuotaWindowDuration(
+    window.windowDurationMins,
+  )
+    ? window.windowDurationMins
+    : null;
+  if (durationMinutes === null) return null;
+  const resetAt = quotaResetIsoInstant(window.resetsAt);
+  if (resetAt === null) return null;
+  return {
+    limitId: KNOWN_LIMITS.has(window.limitId) ? window.limitId : "unknown",
+    slot: KNOWN_SLOTS.has(window.slot) ? window.slot : "unknown",
+    planType: KNOWN_PLANS.has(window.planType) ? window.planType : "unknown",
+    usedPercent,
+    remainingPercent: Number((100 - usedPercent).toFixed(3)),
+    durationMinutes,
+    resetAt,
+  };
+}
+
+function primaryCodexWindowIndex(windows) {
+  let selected = -1;
+  for (let index = 0; index < windows.length; index += 1) {
+    const candidate = windows[index];
+    if (candidate.limitId !== "codex") continue;
+    if (selected === -1) {
+      selected = index;
+      continue;
+    }
+    const prior = windows[selected];
+    if (candidate.durationMinutes > prior.durationMinutes
+        || (candidate.durationMinutes === prior.durationMinutes
+          && candidate.slot === "primary"
+          && prior.slot !== "primary")) {
+      selected = index;
+    }
+  }
+  return selected;
+}
+
+// Keep every observed window, but put the selected normal Codex window first.
+// The scan is stable for equal duration/slot candidates, so provider ordering
+// remains the final deterministic tie-breaker and planType stays attached only
+// to the window where it was observed.
+export function orderQuotaWindows(windows) {
+  const selected = primaryCodexWindowIndex(windows);
+  if (selected <= 0) return windows;
+  return [
+    windows[selected],
+    ...windows.slice(0, selected),
+    ...windows.slice(selected + 1),
+  ];
+}
+
+function quotaTimelineRowTieBreak(row) {
+  return [
+    row.planType,
+    row.usedPercent.toFixed(3),
+    row.resetAt,
+    row.accountAttribution,
+  ].join("\0");
+}
+
+export function finalizeQuotaTimeline(rows) {
+  rows.sort((left, right) => (
+    Date.parse(left.observedAt) - Date.parse(right.observedAt)
+    || left.limitId.localeCompare(right.limitId)
+    || left.slot.localeCompare(right.slot)
+    || left.durationMinutes - right.durationMinutes
+    || left.planType.localeCompare(right.planType)
+    || left.usedPercent - right.usedPercent
+  ));
+  const points = new Map();
+  for (const row of rows) {
+    const track = `${row.limitId}:${row.slot}:${row.durationMinutes ?? "unknown"}`;
+    const observedMs = Date.parse(row.observedAt);
+    const key = `${track}:${observedMs}`;
+    const prior = points.get(key);
+    if (prior === undefined
+        || quotaTimelineRowTieBreak(row) < quotaTimelineRowTieBreak(prior)) {
+      points.set(key, row);
+    }
+  }
+  return deterministicSample(
+    [...points.values()].sort((left, right) => (
+      Date.parse(left.observedAt) - Date.parse(right.observedAt)
+      || left.limitId.localeCompare(right.limitId)
+      || left.slot.localeCompare(right.slot)
+      || left.durationMinutes - right.durationMinutes
+      || left.planType.localeCompare(right.planType)
+      || left.usedPercent - right.usedPercent
+    )),
+    MAX_QUOTA_TIMELINE_POINTS,
+  );
+}

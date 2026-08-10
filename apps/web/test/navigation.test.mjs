@@ -41,14 +41,34 @@ function fakeLink(nav) {
   };
 }
 
-function fakePage(name) {
-  return { dataset: { dashboardPage: name }, hidden: false };
+function fakePage(name, { hidden = false } = {}) {
+  const headingAttributes = new Map();
+  const heading = {
+    attributes: headingAttributes,
+    focusOptions: null,
+    setAttribute(name, value) { headingAttributes.set(name, value); },
+    focus(options) { this.focusOptions = options; },
+  };
+  return {
+    attributes: new Map(),
+    classList: new FakeClassList(),
+    dataset: { dashboardPage: name },
+    hidden,
+    inert: false,
+    heading,
+    setAttribute(name, value) { this.attributes.set(name, value); },
+    removeAttribute(name) { this.attributes.delete(name); },
+    querySelector(selector) {
+      assert.equal(selector, "h1, h2");
+      return heading;
+    },
+  };
 }
 
 function fakeBrowser({ hash = "" } = {}) {
-  const links = ["overview", "weekly", "trends", "method", "community", "data"]
+  const links = ["overview", "weekly", "trends", "method", "community"]
     .map(fakeLink);
-  const pages = ["overview", "weekly", "trends", "method", "community", "data"]
+  const pages = ["overview", "weekly", "trends", "method", "community"]
     .map(fakePage);
   const disclosure = { open: false };
   const listeners = new Map();
@@ -79,13 +99,24 @@ function fakeBrowser({ hash = "" } = {}) {
 
 function assertActivePage(browser, expected) {
   for (const page of browser.pages) {
-    assert.equal(page.hidden, page.dataset.dashboardPage !== expected, page.dataset.dashboardPage);
+    const inactive = page.dataset.dashboardPage !== expected;
+    assert.equal(page.classList.contains("dashboard-page-inactive"), inactive, page.dataset.dashboardPage);
+    assert.equal(page.inert, inactive, page.dataset.dashboardPage);
+    assert.equal(page.attributes.get("aria-hidden"), inactive ? "true" : undefined, page.dataset.dashboardPage);
   }
   for (const link of browser.links) {
     const active = link.dataset.nav === expected;
     assert.equal(link.classList.contains("active"), active, link.dataset.nav);
     assert.equal(link.attributes.get("aria-current"), active ? "page" : undefined, link.dataset.nav);
   }
+}
+
+function assertExactlyOneVisiblePage(browser, expected) {
+  assertActivePage(browser, expected);
+  assert.equal(
+    browser.pages.filter((page) => !page.classList.contains("dashboard-page-inactive")).length,
+    1,
+  );
 }
 
 test("hashes preserve deep links while selecting their owning top-level page", () => {
@@ -101,7 +132,39 @@ test("hashes preserve deep links while selecting their owning top-level page", (
   browser.windowRef.location.hash = "#backend";
   browser.listeners.get("popstate")();
   assert.equal(browser.disclosure.open, true);
-  assertActivePage(browser, "data");
+  assertActivePage(browser, "community");
+});
+
+test("retired section hashes do not masquerade as live destinations", () => {
+  const browser = fakeBrowser({ hash: "#coverage" });
+  mountDashboardNavigation(browser);
+  assertActivePage(browser, "overview");
+
+  browser.windowRef.location.hash = "#trends";
+  browser.listeners.get("hashchange")();
+  assertActivePage(browser, "trends");
+
+  browser.windowRef.location.hash = "#coverage";
+  browser.listeners.get("hashchange")();
+  assertActivePage(browser, "trends");
+});
+
+test("retained deep-link aliases select their current owning page", () => {
+  const cases = [
+    ["accounting", "method"],
+    ["timeline", "trends"],
+    ["trends", "trends"],
+    ["history", "community"],
+    ["backend", "community"],
+    ["data", "community"],
+    ["coverage", "overview"],
+  ];
+
+  for (const [target, expected] of cases) {
+    const browser = fakeBrowser({ hash: `#${target}` });
+    mountDashboardNavigation(browser);
+    assertExactlyOneVisiblePage(browser, expected);
+  }
 });
 
 test("page links prevent long-document anchor scrolling and retain normal history", () => {
@@ -114,6 +177,77 @@ test("page links prevent long-document anchor scrolling and retain normal histor
   assert.deepEqual(browser.pushed, ["#trends"]);
   assert.deepEqual(browser.scrolls, [{ top: 0, behavior: "instant" }]);
   assertActivePage(browser, "trends");
+  const trendsPage = browser.pages.find((page) => page.dataset.dashboardPage === "trends");
+  assert.equal(trendsPage.heading.attributes.get("tabindex"), "-1");
+  assert.deepEqual(trendsPage.heading.focusOptions, { preventScroll: true });
+});
+
+test("native trends hash selects the trends page", () => {
+  const browser = fakeBrowser({ hash: "#trends" });
+  mountDashboardNavigation(browser);
+  assertActivePage(browser, "trends");
+  const trendsPage = browser.pages.find((page) => page.dataset.dashboardPage === "trends");
+  assert.equal(trendsPage.heading.focusOptions, null, "initial mount does not steal focus");
+
+  browser.windowRef.location.hash = "#overview";
+  browser.listeners.get("hashchange")();
+  browser.windowRef.location.hash = "#trends";
+  browser.listeners.get("hashchange")();
+  assert.deepEqual(trendsPage.heading.focusOptions, { preventScroll: true });
+});
+
+test("repeated overview and trends transitions keep exactly one page active", () => {
+  const browser = fakeBrowser({ hash: "#overview" });
+  mountDashboardNavigation(browser);
+
+  for (let index = 0; index < 50; index += 1) {
+    const nav = index % 2 === 0 ? "trends" : "overview";
+    browser.links.find((link) => link.dataset.nav === nav).click();
+    assertExactlyOneVisiblePage(browser, nav);
+  }
+});
+
+test("repeated transitions and a navigation remount keep exactly one page visible", () => {
+  const browser = fakeBrowser({ hash: "#overview" });
+  let teardown = mountDashboardNavigation(browser);
+
+  for (const nav of ["trends", "overview", "community", "weekly", "method", "trends"]) {
+    browser.links.find((link) => link.dataset.nav === nav).click();
+    assertExactlyOneVisiblePage(browser, nav);
+  }
+
+  teardown();
+  browser.windowRef.location.hash = "#timeline";
+  teardown = mountDashboardNavigation(browser);
+  assertExactlyOneVisiblePage(browser, "trends");
+
+  for (const [hash, expected] of [
+    ["#community", "community"],
+    ["#weekly", "weekly"],
+    ["#overview", "overview"],
+    ["#trends", "trends"],
+  ]) {
+    browser.windowRef.location.hash = hash;
+    browser.listeners.get("hashchange")();
+    assertExactlyOneVisiblePage(browser, expected);
+  }
+
+  teardown();
+});
+
+test("navigation never overrides component-owned hidden state", () => {
+  const browser = fakeBrowser({ hash: "#overview" });
+  const hiddenOverviewComponent = browser.pages.find(
+    (page) => page.dataset.dashboardPage === "overview",
+  );
+  hiddenOverviewComponent.hidden = true;
+  mountDashboardNavigation(browser);
+
+  browser.links.find((link) => link.dataset.nav === "trends").click();
+  browser.links.find((link) => link.dataset.nav === "overview").click();
+
+  assert.equal(hiddenOverviewComponent.hidden, true);
+  assertActivePage(browser, "overview");
 });
 
 test("teardown removes page and history listeners", () => {

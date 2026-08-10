@@ -2,6 +2,7 @@ import Ajv from "ajv";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { safeValidationErrors } from "./safe-validation-errors.js";
 
 export const PROVIDER_ACCOUNTING_SNAPSHOT_VERSION = "provider-accounting-snapshot-v0.1";
 export const PROVIDER_ACCOUNTING_EXTRACTION_VERSION = "provider-accounting-extractor-v0.1";
@@ -48,14 +49,6 @@ const METRIC_UNITS = Object.freeze({
   spend_usd: "usd",
   connected_voice_minutes_used: "minutes",
 });
-
-function safeValidationErrors(errors = []) {
-  return errors.slice(0, 20).map((error) => ({
-    path: error.instancePath || "/",
-    keyword: error.keyword,
-    schemaPath: error.schemaPath,
-  }));
-}
 
 function invariant(path, name) {
   return { path, keyword: "invariant", schemaPath: `#/x-invariant/${name}` };

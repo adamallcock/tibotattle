@@ -40,6 +40,21 @@ assert.match(
 );
 assert.match(dockerfile, /^USER node$/mu);
 assert.match(dockerfile, /npm ci --omit=dev/u);
+// Every base-image stage must be pinned to an immutable registry digest, not a
+// mutable version tag, so a moved or compromised upstream tag cannot substitute
+// base-image bytes into an authorized rebuild.
+const fromLines = dockerfile.match(/^FROM .*/gmu) ?? [];
+assert.ok(
+  fromLines.length >= 2,
+  "Dockerfile must declare both build stages",
+);
+for (const line of fromLines) {
+  assert.match(
+    line,
+    /@sha256:[0-9a-f]{64}(?: AS \S+)?$/u,
+    `base image must be digest-pinned: ${line}`,
+  );
+}
 assert.match(dockerignore, /^\.env\.\*$/mu);
 assert.match(dockerignore, /^\.git$/mu);
 assert.match(dockerignore, /^\.npmrc$/mu);

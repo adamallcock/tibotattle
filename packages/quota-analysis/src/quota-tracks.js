@@ -1,4 +1,8 @@
-const SUPPORTED_DURATIONS = new Set([300, 10_080]);
+import {
+  isValidQuotaWindowDuration,
+  SUPPORTED_QUOTA_WINDOW_DURATIONS,
+} from "./quota-windows.js";
+
 const SLOT_VALUES = new Set([
   "primary",
   "secondary",
@@ -97,7 +101,7 @@ function validateQuota(row) {
       || !validToken(row.planVariant)
       || !validToken(row.limitId)
       || !SLOT_VALUES.has(row.slot)
-      || !SUPPORTED_DURATIONS.has(row.windowDurationMinutes)
+      || !isValidQuotaWindowDuration(row.windowDurationMinutes)
       || !validInstant(row.resetsAt)
       || !validInstant(row.observedAt)
       || !validInstant(row.receivedAt)
@@ -366,6 +370,6 @@ export function buildResetEvidence(input) {
 }
 
 export const QUOTA_TRACK_POLICY = Object.freeze({
-  supportedDurationsMinutes: Object.freeze([300, 10_080]),
+  supportedDurationsMinutes: SUPPORTED_QUOTA_WINDOW_DURATIONS,
   maximumReceiptLagMs: MAX_RECEIPT_LAG_MS,
 });

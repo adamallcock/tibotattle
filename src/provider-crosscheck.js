@@ -98,62 +98,119 @@ function accountPlanBoundaryDates(planTimeline, scopeId) {
   return dates;
 }
 
-function summarizeProspectiveAccountScoped({ records, accountScope, officialByDate, planTimeline, providerPlanType, startAt, endAt }) {
-  const matching = (records ?? []).filter((record) => record?.kind === "codex_rollout_usage_snapshot"
-    && record.accountScope?.status === "available"
-    && record.accountScope.scopeId === accountScope.scopeId
-    && Number.isFinite(Date.parse(record.observedAt))
-    && record.observedAt >= startAt
-    && record.observedAt <= endAt);
+export function createProspectiveAccountScopedAccumulator({
+  accountScope,
+  planTimeline,
+  providerPlanType,
+  startAt,
+  endAt,
+} = {}) {
+  const sanitizedAccountScope = sanitizeAccountScope(accountScope);
+  if (!Number.isFinite(Date.parse(startAt)) || !Number.isFinite(Date.parse(endAt))) {
+    throw new TypeError("Prospective account accumulator requires bounded timestamps");
+  }
   const daily = new Map();
   const byPlanVariant = {};
-  for (const record of matching) {
-    const context = resolvePlanContext({
-      timeline: planTimeline,
-      scopeId: accountScope.scopeId,
-      at: record.observedAt,
-      providerPlanType,
-    });
-    const plan = context.planVariant ?? "unknown";
-    const date = record.observedAt.slice(0, 10);
-    const tokens = componentTotal(record.components);
-    const dailyKey = `${date}|${plan}`;
-    const row = daily.get(dailyKey) ?? { date, planVariant: plan, eventCount: 0, localTokens: 0 };
-    row.eventCount += 1;
-    row.localTokens += tokens;
-    daily.set(dailyKey, row);
-    const planRow = byPlanVariant[plan] ??= { eventCount: 0, localTokens: 0 };
-    planRow.eventCount += 1;
-    planRow.localTokens += tokens;
-  }
-  const planCountByDate = {};
-  for (const row of daily.values()) planCountByDate[row.date] = (planCountByDate[row.date] ?? 0) + 1;
-  const knownBoundaryDates = accountPlanBoundaryDates(planTimeline, accountScope.scopeId);
-  const rows = [...daily.values()].sort((left, right) => left.date.localeCompare(right.date) || left.planVariant.localeCompare(right.planVariant)).map((row) => {
-    const officialTokens = Number.isFinite(officialByDate.get(row.date)) ? officialByDate.get(row.date) : null;
-    const observedMixedPlanDay = planCountByDate[row.date] > 1;
-    const knownBoundaryDay = knownBoundaryDates.has(row.date);
-    const providerBucketIsUnallocatable = observedMixedPlanDay || knownBoundaryDay;
-    return {
-      ...row,
-      officialAccountTokens: providerBucketIsUnallocatable ? null : officialTokens,
-      partialLocalToOfficialRatio: !providerBucketIsUnallocatable && officialTokens > 0 ? round(row.localTokens / officialTokens) : null,
-      coverage: observedMixedPlanDay
-        ? "mixed_plan_day_provider_bucket_not_allocatable"
-        : (knownBoundaryDay ? "known_plan_boundary_day_provider_bucket_not_allocatable" : "partial_prospective_marker_window_not_full_day"),
-    };
-  });
+  let eventCount = 0;
+  let totalTokens = 0;
+  let firstObservedAt = null;
+  let lastObservedAt = null;
   return {
-    status: matching.length > 0 ? "available_partial" : "not_yet_observed",
-    accountScope,
-    eventCount: matching.length,
-    totalTokens: matching.reduce((sum, record) => sum + componentTotal(record.components), 0),
-    firstObservedAt: matching.length > 0 ? matching[0].observedAt : null,
-    lastObservedAt: matching.length > 0 ? matching.at(-1).observedAt : null,
-    byPlanVariant,
-    daily: rows,
-    interpretation: "These records are account-matched prospectively, but their marker window may cover only part of a provider UTC day and is never treated as full account coverage.",
+    add(record) {
+      if (record?.kind !== "codex_rollout_usage_snapshot"
+          || record.accountScope?.status !== "available"
+          || record.accountScope.scopeId !== sanitizedAccountScope.scopeId
+          || typeof record.observedAt !== "string"
+          || !Number.isFinite(Date.parse(record.observedAt))
+          || record.observedAt < startAt
+          || record.observedAt > endAt) return;
+      const context = resolvePlanContext({
+        timeline: planTimeline,
+        scopeId: sanitizedAccountScope.scopeId,
+        at: record.observedAt,
+        providerPlanType,
+      });
+      const plan = context.planVariant ?? "unknown";
+      const date = record.observedAt.slice(0, 10);
+      const tokens = componentTotal(record.components);
+      const dailyKey = `${date}|${plan}`;
+      const row = daily.get(dailyKey) ?? { date, planVariant: plan, eventCount: 0, localTokens: 0 };
+      row.eventCount += 1;
+      row.localTokens += tokens;
+      daily.set(dailyKey, row);
+      const planRow = byPlanVariant[plan] ??= { eventCount: 0, localTokens: 0 };
+      planRow.eventCount += 1;
+      planRow.localTokens += tokens;
+      eventCount += 1;
+      totalTokens += tokens;
+      if (firstObservedAt === null) firstObservedAt = record.observedAt;
+      lastObservedAt = record.observedAt;
+    },
+    finalize({ officialByDate = new Map() } = {}) {
+      const planCountByDate = {};
+      for (const row of daily.values()) {
+        planCountByDate[row.date] = (planCountByDate[row.date] ?? 0) + 1;
+      }
+      const knownBoundaryDates = accountPlanBoundaryDates(
+        planTimeline,
+        sanitizedAccountScope.scopeId,
+      );
+      const rows = [...daily.values()]
+        .sort((left, right) => left.date.localeCompare(right.date)
+          || left.planVariant.localeCompare(right.planVariant))
+        .map((row) => {
+          const officialTokens = Number.isFinite(officialByDate.get(row.date))
+            ? officialByDate.get(row.date)
+            : null;
+          const observedMixedPlanDay = planCountByDate[row.date] > 1;
+          const knownBoundaryDay = knownBoundaryDates.has(row.date);
+          const providerBucketIsUnallocatable = observedMixedPlanDay || knownBoundaryDay;
+          return {
+            ...row,
+            officialAccountTokens: providerBucketIsUnallocatable ? null : officialTokens,
+            partialLocalToOfficialRatio: !providerBucketIsUnallocatable && officialTokens > 0
+              ? round(row.localTokens / officialTokens)
+              : null,
+            coverage: observedMixedPlanDay
+              ? "mixed_plan_day_provider_bucket_not_allocatable"
+              : (knownBoundaryDay
+                ? "known_plan_boundary_day_provider_bucket_not_allocatable"
+                : "partial_prospective_marker_window_not_full_day"),
+          };
+        });
+      return {
+        status: eventCount > 0 ? "available_partial" : "not_yet_observed",
+        accountScope: sanitizedAccountScope,
+        eventCount,
+        totalTokens,
+        firstObservedAt,
+        lastObservedAt,
+        byPlanVariant,
+        daily: rows,
+        interpretation: "These records are account-matched prospectively, but their marker window may cover only part of a provider UTC day and is never treated as full account coverage.",
+      };
+    },
   };
+}
+
+function summarizeProspectiveAccountScoped({
+  records,
+  accountScope,
+  officialByDate,
+  planTimeline,
+  providerPlanType,
+  startAt,
+  endAt,
+}) {
+  const accumulator = createProspectiveAccountScopedAccumulator({
+    accountScope,
+    planTimeline,
+    providerPlanType,
+    startAt,
+    endAt,
+  });
+  for (const record of records ?? []) accumulator.add(record);
+  return accumulator.finalize({ officialByDate });
 }
 
 function summarizeEpochs(daily) {
@@ -217,6 +274,7 @@ export function analyzeProviderCrosscheck({
   planTimeline = null,
   providerUiObservations = [],
   prospectiveCollectorRecords = [],
+  prospectiveCollectorAccumulator = null,
   cacheValidation = { status: "unspecified" },
 }) {
   if (!localScan || !Number.isFinite(Date.parse(localScan.startAt)) || !Number.isFinite(Date.parse(localScan.endAt))) {
@@ -288,15 +346,17 @@ export function analyzeProviderCrosscheck({
   const accountCompatibility = localToProviderLifetimeRatio !== null && localToProviderLifetimeRatio > 1.05
     ? "incompatible_current_account_cannot_cover_all_local_tokens"
     : "not_disproven_by_lifetime_total";
-  const prospectiveAccountScoped = summarizeProspectiveAccountScoped({
-    records: prospectiveCollectorRecords,
-    accountScope,
-    officialByDate,
-    planTimeline,
-    providerPlanType,
-    startAt: localScan.startAt,
-    endAt: localScan.endAt,
-  });
+  const prospectiveAccountScoped = typeof prospectiveCollectorAccumulator?.finalize === "function"
+    ? prospectiveCollectorAccumulator.finalize({ officialByDate })
+    : summarizeProspectiveAccountScoped({
+      records: prospectiveCollectorRecords,
+      accountScope,
+      officialByDate,
+      planTimeline,
+      providerPlanType,
+      startAt: localScan.startAt,
+      endAt: localScan.endAt,
+    });
   return {
     schemaVersion: SCHEMA_VERSION,
     kind: "provider_local_account_crosscheck",

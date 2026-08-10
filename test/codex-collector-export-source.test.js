@@ -162,6 +162,39 @@ test("freezes a complete-line prefix and emits only provider-neutral quota candi
   }
 });
 
+test("retains the provider-reported prolite plan in quota candidates", async () => {
+  const value = await fixture([quotaRecord({
+    windows: [window({ planType: "prolite" })],
+    account: { ...accountScope(), planType: "prolite" },
+  })]);
+  try {
+    const result = await scanCodexCollectorExportSource(await planFor(value));
+    assert.equal(result.candidates.length, 1);
+    assert.equal(result.candidates[0].planType, "prolite");
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("retains go and edu provider-reported plans in quota candidates", async () => {
+  const value = await fixture([quotaRecord({
+    windows: [
+      window({ planType: "go" }),
+      window({ planType: "edu", slot: "secondary" }),
+    ],
+    account: { ...accountScope(), planType: null },
+  })]);
+  try {
+    const result = await scanCodexCollectorExportSource(await planFor(value));
+    assert.deepEqual(
+      result.candidates.map((candidate) => candidate.planType),
+      ["go", "edu"],
+    );
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
 test("resumes at exact byte, line, and window positions with batch-size equivalence", async () => {
   const value = await fixture([
     quotaRecord({

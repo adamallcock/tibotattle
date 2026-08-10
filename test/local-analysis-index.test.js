@@ -14,15 +14,22 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { scanCodexLogEvents } from "../src/codex-log-scan.js";
+import { recognizedExportModelId } from "../src/export/index.js";
 import {
+  configureDatabase,
   createIndexedCodexLogScan,
   inspectLocalAnalysisIndex,
+  LOCAL_ANALYSIS_INDEX_PARSER_VERSION,
+  markLocalAnalysisIndexCoveragePartial,
   refreshLocalAnalysisIndex,
 } from "../src/local-analysis-index.js";
 import {
   readReplaySafeAccountingCache,
   refreshReplaySafeAccountingCache,
 } from "../src/replay-safe-accounting-cache.js";
+import {
+  writeLocalCollectorAccountingCache,
+} from "../src/local-collector-state.js";
 
 const START_AT = "2026-07-24T11:55:00.000Z";
 const END_AT = "2026-07-24T12:10:00.000Z";
@@ -46,31 +53,45 @@ function usage(input, output = 0) {
   };
 }
 
-function token(timestamp, total, last, usedPercent) {
+function token(
+  timestamp,
+  total,
+  last,
+  usedPercent,
+  {
+    primaryDuration = 300,
+    secondaryDuration = 10080,
+    primaryResetAt = 1784912400,
+    secondaryResetAt = 1785430800,
+    model,
+  } = {},
+) {
+  const payload = {
+    type: "token_count",
+    info: {
+      total_token_usage: total,
+      last_token_usage: last,
+    },
+    rate_limits: {
+      limit_id: "codex",
+      plan_type: "pro",
+      primary: {
+        used_percent: usedPercent,
+        window_minutes: primaryDuration,
+        resets_at: primaryResetAt,
+      },
+      secondary: {
+        used_percent: usedPercent / 2,
+        window_minutes: secondaryDuration,
+        resets_at: secondaryResetAt,
+      },
+    },
+  };
+  if (model !== undefined) payload.model = model;
   return JSON.stringify({
     timestamp,
     type: "event_msg",
-    payload: {
-      type: "token_count",
-      info: {
-        total_token_usage: total,
-        last_token_usage: last,
-      },
-      rate_limits: {
-        limit_id: "codex",
-        plan_type: "pro",
-        primary: {
-          used_percent: usedPercent,
-          window_minutes: 300,
-          resets_at: 1784912400,
-        },
-        secondary: {
-          used_percent: usedPercent / 2,
-          window_minutes: 10080,
-          resets_at: 1785430800,
-        },
-      },
-    },
+    payload,
   });
 }
 
@@ -391,6 +412,329 @@ test("persistent local index preserves replay-safe accounting and appends only n
   );
 });
 
+test("local index keeps quota durations distinct and relays a valid generic window", async () => {
+  const { root, codexHome, parentPath } = await fixture();
+  await appendFile(parentPath, `${[
+    token(
+      "2026-07-24T12:06:00.000Z",
+      usage(240, 50),
+      usage(20, 10),
+      18,
+      {
+        primaryDuration: 43_200,
+        primaryResetAt: 1784912400,
+      },
+    ),
+    token(
+      "2026-07-24T12:07:00.000Z",
+      usage(260, 60),
+      usage(20, 10),
+      30,
+      {
+        primaryDuration: 43_200,
+        primaryResetAt: 1784912400,
+      },
+    ),
+  ].join("\n")}\n`);
+  const indexFile = join(root, "local-analysis-index-generic.sqlite");
+  const secretFile = join(root, "local-analysis-index-generic-secret");
+  const indexedScan = createIndexedCodexLogScan({
+    indexFile,
+    secretFile,
+    workerCount: 2,
+    chunkBytes: CHUNK_BYTES,
+  });
+
+  const result = await receipt(indexedScan, codexHome);
+  const genericRows = result.quotaRows.filter(
+    (row) => row.window.windowDurationMins === 43_200,
+  );
+  assert.deepEqual(
+    genericRows.map((row) => [row.timestamp, row.window.usedPercent]),
+    [["2026-07-24T12:07:00.000Z", 30]],
+  );
+  assert.equal(
+    result.quotaRows.some(
+      (row) => row.window.windowDurationMins === 300,
+    ),
+    true,
+  );
+  assert.equal(
+    result.quotaRows.some(
+      (row) => row.window.windowDurationMins === 10_080,
+    ),
+    true,
+  );
+  assert.equal(
+    (await inspectLocalAnalysisIndex({ indexFile })).schemaVersion,
+    "local-analysis-index-v5",
+  );
+});
+
+test("local index refuses an out-of-range provider duration without losing source data", async () => {
+  const { root, codexHome, parentPath } = await fixture();
+  await appendFile(parentPath, `${token(
+    "2026-07-24T12:06:00.000Z",
+    usage(240, 50),
+    usage(20, 10),
+    18,
+    { primaryDuration: 525_601 },
+  )}\n`);
+  const indexFile = join(root, "local-analysis-index-invalid-duration.sqlite");
+  const secretFile = join(root, "local-analysis-index-invalid-duration-secret");
+  const result = await receipt(createIndexedCodexLogScan({
+    indexFile,
+    secretFile,
+    workerCount: 1,
+    chunkBytes: CHUNK_BYTES,
+  }), codexHome);
+
+  assert.equal(
+    result.quotaRows.some(
+      (row) => row.window.windowDurationMins === 525_601,
+    ),
+    false,
+  );
+  assert.equal((await stat(parentPath)).size > 0, true);
+  assert.equal(
+    (await inspectLocalAnalysisIndex({ indexFile })).quotaFacts > 0,
+    true,
+  );
+});
+
+test("recognized Spark survives worker extraction and rebuilds a pre-Spark index", async () => {
+  assert.equal(
+    recognizedExportModelId("GPT-5.3-Codex-Spark"),
+    "gpt-5.3-codex-spark",
+  );
+  const { root, codexHome, parentPath } = await fixture();
+  await appendFile(parentPath, `${[
+    JSON.stringify({
+      timestamp: "2026-07-24T12:05:00.010Z",
+      type: "turn_context",
+      payload: { model: "gpt-5.3-codex-spark" },
+    }),
+    token(
+      "2026-07-24T12:06:00.000Z",
+      usage(240, 50),
+      usage(20, 10),
+      18,
+      { model: "gpt-5.3-codex-spark" },
+    ),
+  ].join("\n")}\n`);
+  const indexFile = join(root, "local-analysis-index-spark.sqlite");
+  const secretFile = join(root, "local-analysis-index-spark-secret");
+  const indexedScan = createIndexedCodexLogScan({
+    indexFile,
+    secretFile,
+    workerCount: 1,
+    chunkBytes: CHUNK_BYTES,
+  });
+
+  const initial = await receipt(indexedScan, codexHome);
+  assert.equal(
+    initial.usageRows.some((row) => row.model === "gpt-5.3-codex-spark"),
+    true,
+  );
+  const database = new DatabaseSync(indexFile);
+  try {
+    assert.deepEqual(
+      [...database.prepare("SELECT DISTINCT model FROM usage_facts").iterate()]
+        .map((row) => row.model)
+        .sort(),
+      ["gpt-5.3-codex-spark", "gpt-5.6-sol"].sort(),
+    );
+    database.prepare(
+      "UPDATE meta SET value = ? WHERE key = 'parser_version'",
+    ).run("parallel-jsonl-accounting-v5");
+    database.prepare("UPDATE usage_facts SET model = 'unknown'").run();
+    database.prepare(
+      "UPDATE sources SET current_model = 'unknown', current_model_seen = 1",
+    ).run();
+  } finally {
+    database.close();
+  }
+
+  const rebuilt = await receipt(indexedScan, codexHome);
+  assert.equal(
+    rebuilt.usageRows.some((row) => row.model === "gpt-5.3-codex-spark"),
+    true,
+  );
+  assert.equal(rebuilt.usageRows.some((row) => row.model === "unknown"), false);
+  const inspected = await inspectLocalAnalysisIndex({ indexFile });
+  assert.equal(inspected.parserVersion, LOCAL_ANALYSIS_INDEX_PARSER_VERSION);
+  assert.equal(inspected.parserVersion, "parallel-jsonl-accounting-v6");
+});
+
+test("local index rebuilds a prior semantic generation from source logs", async () => {
+  const { root, codexHome, parentPath } = await fixture();
+  await appendFile(parentPath, `${token(
+    "2026-07-24T12:06:00.000Z",
+    usage(240, 50),
+    usage(20, 10),
+    18,
+    { primaryDuration: 43_200 },
+  )}\n`);
+  const indexFile = join(root, "local-analysis-index-rebuild.sqlite");
+  const secretFile = join(root, "local-analysis-index-rebuild-secret");
+  await refreshLocalAnalysisIndex({
+    indexFile,
+    secretFile,
+    codexHome,
+    startAt: START_AT,
+    endAt: END_AT,
+    workerCount: 1,
+    chunkBytes: CHUNK_BYTES,
+  });
+  const sourceBytesBefore = (await stat(parentPath)).size;
+  const database = new DatabaseSync(indexFile);
+  try {
+    database.exec("PRAGMA user_version=4");
+    database.prepare(
+      "UPDATE meta SET value = ? WHERE key = ?",
+    ).run("local-analysis-index-v4", "schema_version");
+    database.prepare(
+      "UPDATE meta SET value = ? WHERE key = ?",
+    ).run("parallel-jsonl-accounting-v4", "parser_version");
+  } finally {
+    database.close();
+  }
+
+  const rebuilt = await refreshLocalAnalysisIndex({
+    indexFile,
+    secretFile,
+    codexHome,
+    startAt: START_AT,
+    endAt: END_AT,
+    workerCount: 1,
+    chunkBytes: CHUNK_BYTES,
+  });
+  assert.equal(rebuilt.status, "built");
+  assert.equal(rebuilt.scanBytes > 0, true);
+  assert.equal(rebuilt.sourceProjectionReusedCount, 0);
+  assert.equal((await stat(parentPath)).size, sourceBytesBefore);
+  assert.equal(
+    (await inspectLocalAnalysisIndex({ indexFile })).schemaVersion,
+    "local-analysis-index-v5",
+  );
+});
+
+test("partial index batches retain durable cursors and resume to the exact receipt", async () => {
+  const { root, codexHome, parentPath, childPath } = await chunkedFixture({
+    includeSecondSource: true,
+  });
+  const indexFile = join(root, "local-analysis-index-v4.sqlite");
+  const secretFile = join(root, "local-analysis-index-secret-v4");
+  const legacy = await receipt(scanCodexLogEvents, codexHome);
+
+  let refreshed = null;
+  let partialPasses = 0;
+  for (let pass = 0; pass < 8; pass += 1) {
+    refreshed = await refreshLocalAnalysisIndex({
+      indexFile,
+      secretFile,
+      codexHome,
+      startAt: START_AT,
+      endAt: END_AT,
+      workerCount: 2,
+      chunkBytes: CHUNK_BYTES,
+      maximumSourcesPerRefresh: 1,
+      maximumScanBytesPerRefresh: CHUNK_BYTES,
+    });
+    const inspection = await inspectLocalAnalysisIndex({ indexFile });
+    assert.deepEqual(inspection.coverage, refreshed.coverage);
+    assert.equal(inspection.coverage.sourceCount, 2);
+    assert.equal(
+      inspection.coverage.indexedSourceCount
+        + inspection.coverage.pendingSourceCount,
+      2,
+    );
+    assert.equal(refreshed.scanBytes <= CHUNK_BYTES, true);
+    if (refreshed.coverage.status === "complete") break;
+    partialPasses += 1;
+    assert.equal(inspection.coverage.status, "partial");
+    assert.equal(inspection.coverage.pendingSourceCount > 0, true);
+    assert.equal(
+      inspection.coverage.indexedBytes < inspection.coverage.sourceBytes,
+      true,
+    );
+  }
+
+  assert.ok(refreshed);
+  assert.equal(partialPasses >= 2, true);
+  assert.deepEqual(refreshed.coverage, {
+    status: "complete",
+    sourceCount: 2,
+    indexedSourceCount: 2,
+    pendingSourceCount: 0,
+    sourceBytes: refreshed.sourceBytes,
+    indexedBytes: refreshed.sourceBytes,
+  });
+  assert.deepEqual(
+    await receipt(createIndexedCodexLogScan({
+      indexFile,
+      secretFile,
+      workerCount: 2,
+      chunkBytes: CHUNK_BYTES,
+    }), codexHome),
+    legacy,
+  );
+
+  const bytes = await readFile(indexFile);
+  for (const canary of ["PRIVATE_PARENT", "PRIVATE_CHILD", parentPath, childPath]) {
+    assert.equal(bytes.includes(Buffer.from(canary)), false);
+  }
+});
+
+test("coverage marker withholds a nominally complete archive until a fresh check clears it", async () => {
+  const { root, codexHome } = await fixture();
+  const indexFile = join(root, "local-analysis-index-coverage.sqlite");
+  const secretFile = join(root, "local-analysis-index-coverage-secret");
+  await refreshLocalAnalysisIndex({
+    indexFile,
+    secretFile,
+    codexHome,
+    startAt: START_AT,
+    endAt: END_AT,
+    workerCount: 1,
+    chunkBytes: CHUNK_BYTES,
+  });
+
+  await markLocalAnalysisIndexCoveragePartial({
+    indexFile,
+    reason: "timeout",
+    observedAt: END_AT,
+  });
+  const blocked = (await inspectLocalAnalysisIndex({ indexFile })).coverage;
+  assert.deepEqual(blocked, {
+    status: "partial",
+    sourceCount: 2,
+    indexedSourceCount: 2,
+    pendingSourceCount: 0,
+    sourceBytes: blocked.sourceBytes,
+    indexedBytes: blocked.indexedBytes,
+    blockReason: "timeout",
+  });
+
+  const refreshed = await refreshLocalAnalysisIndex({
+    indexFile,
+    secretFile,
+    codexHome,
+    startAt: START_AT,
+    endAt: END_AT,
+    workerCount: 1,
+    chunkBytes: CHUNK_BYTES,
+  });
+  assert.equal(refreshed.coverage.status, "complete");
+  assert.equal(
+    Object.hasOwn(
+      (await inspectLocalAnalysisIndex({ indexFile })).coverage,
+      "blockReason",
+    ),
+    false,
+  );
+});
+
 test("same-size prefix rewrites invalidate a cached index even when millisecond metadata collides", async () => {
   const { root, codexHome, parentPath } = await fixture();
   // Keep the terminal 4 KiB unchanged: a tail-only boundary HMAC cannot see
@@ -453,9 +797,9 @@ test("same-size prefix rewrites invalidate a cached index even when millisecond 
   assert.notDeepEqual(refreshed, initial);
 });
 
-test("committed index projection recovers a malformed compatibility cache", async () => {
+test("the canonical SQLite accounting state never falls back to an index projection", async () => {
   const { root, codexHome } = await fixture();
-  const cacheFile = join(root, "accounting.json");
+  const stateFile = join(root, "local-collector-state-v1.sqlite");
   const indexFile = join(root, "local-analysis-index-v2.sqlite");
   const indexSecretFile = join(
     root,
@@ -463,21 +807,142 @@ test("committed index projection recovers a malformed compatibility cache", asyn
   );
   const nowMs = Date.parse(END_AT);
   const written = await refreshReplaySafeAccountingCache({
-    cacheFile,
+    stateFile,
     indexFile,
     indexSecretFile,
     codexHome,
     now: () => nowMs,
-    windowDays: 1,
+    // Re-pinned 1 -> 365 (2026-08-08): the standing owner rule forbids
+    // convenience-sized history windows, so 365 is the smallest accepted.
+    // The fixture corpus is tiny either way.
+    windowDays: 365,
     indexWorkerCount: 2,
     indexChunkBytes: 4 * 1024 * 1024,
   });
-  await writeFile(cacheFile, "{malformed compatibility cache");
+  const invalid = structuredClone(written);
+  delete invalid.quotaTimeline;
+  await writeLocalCollectorAccountingCache({ stateFile, cache: invalid });
   const recovered = await readReplaySafeAccountingCache({
-    cacheFile,
-    indexFile,
+    stateFile,
     now: () => nowMs,
   });
-  assert.equal(recovered.status, "available");
-  assert.deepEqual(recovered.cache, written);
+  assert.deepEqual(recovered, {
+    status: "unavailable",
+    errorCode: "cache_invalid",
+    cache: null,
+  });
+});
+
+// PRAGMA journal_mode returns a result row, so issuing it through exec()
+// prepares the statement without stepping it and the requested change is
+// silently discarded. These tests assert the mode SQLite actually granted,
+// read back after configuration -- not that a write was attempted.
+test("configureDatabase grants a MEMORY journal in staging and DELETE+FULL durably, verified by readback", async () => {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-journal-mode-"));
+  try {
+    const stagingDatabase = new DatabaseSync(join(root, "staging.sqlite"));
+    try {
+      configureDatabase(stagingDatabase, { staging: true });
+      assert.equal(
+        stagingDatabase.prepare("PRAGMA journal_mode").get().journal_mode,
+        "memory",
+      );
+      assert.equal(
+        Number(stagingDatabase.prepare("PRAGMA synchronous").get().synchronous),
+        0,
+      );
+      assert.equal(
+        stagingDatabase.prepare("PRAGMA locking_mode").get().locking_mode,
+        "exclusive",
+      );
+    } finally {
+      stagingDatabase.close();
+    }
+
+    // Start the durable connection in WAL so the DELETE readback proves the
+    // pragma took effect rather than observing the fresh-database default.
+    const durableDatabase = new DatabaseSync(join(root, "durable.sqlite"));
+    try {
+      assert.equal(
+        durableDatabase.prepare("PRAGMA journal_mode = WAL").get().journal_mode,
+        "wal",
+      );
+      configureDatabase(durableDatabase, { staging: false });
+      assert.equal(
+        durableDatabase.prepare("PRAGMA journal_mode").get().journal_mode,
+        "delete",
+      );
+      assert.equal(
+        Number(durableDatabase.prepare("PRAGMA synchronous").get().synchronous),
+        2,
+      );
+    } finally {
+      durableDatabase.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// A fork child whose tail is entirely replayed parent rows leaves the
+// interleaved quota statement mid-step: every row `continue`s past the drain,
+// the statement keeps a read transaction on the extracted shard schema, and
+// the DETACH after the derivation commit fails with "database extract_N is
+// locked" unless the iterator is explicitly closed. Observed on the real
+// corpus; whether it surfaced depended on garbage-collection timing.
+test("a fork child that only replays parent rows still lets the shard detach", async () => {
+  const { root, codexHome, childPath } = await fixture();
+  await writeFile(childPath, `${[
+    JSON.stringify({
+      timestamp: "2026-07-24T12:03:00.000Z",
+      type: "session_meta",
+      payload: {
+        id: "PRIVATE_CHILD",
+        forked_from_id: "PRIVATE_PARENT",
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-24T12:03:00.010Z",
+      type: "turn_context",
+      payload: { model: "gpt-5.6-sol" },
+    }),
+    // Replays of the parent's cumulative snapshots, and nothing after them.
+    token(
+      "2026-07-24T12:03:01.000Z",
+      usage(100, 20),
+      usage(100, 20),
+      10,
+    ),
+    token(
+      "2026-07-24T12:03:02.000Z",
+      usage(160, 35),
+      usage(60, 15),
+      12,
+    ),
+  ].join("\n")}\n`);
+  const refreshed = await refreshLocalAnalysisIndex({
+    indexFile: join(root, "local-analysis-index-replay-tail.sqlite"),
+    secretFile: join(root, "local-analysis-index-replay-tail-secret"),
+    codexHome,
+    startAt: START_AT,
+    endAt: END_AT,
+    workerCount: 1,
+    chunkBytes: CHUNK_BYTES,
+  });
+  assert.equal(refreshed.status, "built");
+  assert.equal(refreshed.coverage.status, "complete");
+});
+
+test("configureDatabase throws when the runtime refuses the requested journal mode", () => {
+  // Models a runtime that answers every journal_mode request with "delete",
+  // exactly how the bundled SQLite refuses journal_mode=OFF. A silently
+  // degraded journal is the defect this guard exists to catch.
+  const refusingDatabase = {
+    prepare: () => ({ get: () => ({ journal_mode: "delete" }) }),
+    exec: () => {},
+  };
+  assert.throws(
+    () => configureDatabase(refusingDatabase, { staging: true }),
+    { code: "local_analysis_index_journal_mode_refused" },
+  );
 });

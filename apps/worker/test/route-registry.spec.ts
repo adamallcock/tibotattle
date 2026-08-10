@@ -13,6 +13,7 @@ const EXACT_ROUTES = [
   ["/api/health", "health"],
   ["/api/ready", "ready"],
   ["/api/v1/enroll", "enroll"],
+  ["/api/v1/internal/release/appcast", "sparkle_appcast_guard"],
   ["/api/v1/identity/google/start", "identity_google_start"],
   ["/api/v1/identity/google/callback", "identity_google_callback"],
   ["/api/v1/identity/google/result", "identity_google_result"],
@@ -29,6 +30,9 @@ const EXACT_ROUTES = [
   ["/api/v1/me/device-pairings", "device_pairing"],
   ["/api/v1/device-pairings/claim", "device_pairing_claim"],
   ["/api/v1/device/upload-authorizations", "device_upload_authorization"],
+  ["/api/v1/device/disconnect", "device_disconnect"],
+  ["/api/v1/device/sync/state", "device_sync_state"],
+  ["/api/v1/device/sync/manifest", "device_sync_manifest"],
   ["/api/v1/me/devices", "participant_devices"],
   ["/api/v1/me/devices/revoke", "participant_device_revocation"],
   ["/api/v1/envelope-key", "envelope_key"],
@@ -40,12 +44,13 @@ const EXACT_ROUTES = [
   ["/api/v1/me/insights", "participant_stats"],
   ["/api/v1/stats/aggregate", "community_stats"],
   ["/api/v1/community/insights", "community_stats"],
+  ["/api/v1/community/daily", "community_daily"],
   ["/api/v1/me", "participant"],
 ] as const;
 
 describe("Worker route registry", () => {
   it("recognizes every exact route and preserves stable log classifications", () => {
-    expect(EXACT_ROUTES).toHaveLength(32);
+    expect(EXACT_ROUTES).toHaveLength(37);
     expect(WORKER_ROUTE_POLICY).toEqual(
       EXACT_ROUTES.map(([pathname, id]) => ({ pathname, id })),
     );

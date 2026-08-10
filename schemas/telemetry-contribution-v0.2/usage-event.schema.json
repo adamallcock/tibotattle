@@ -361,6 +361,7 @@
         "priceBasis": {
           "enum": [
             "current_api_prices",
+            "historical_api_prices",
             "unpriced"
           ]
         }

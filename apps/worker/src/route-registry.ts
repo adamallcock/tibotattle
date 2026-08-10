@@ -14,6 +14,10 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
   { pathname: "/api/health", id: "health" },
   { pathname: "/api/ready", id: "ready" },
   { pathname: "/api/v1/enroll", id: "enroll" },
+  {
+    pathname: "/api/v1/internal/release/appcast",
+    id: "sparkle_appcast_guard",
+  },
   // Both hosted providers use the same three-route handoff: the dashboard
   // starts a sign-in, the provider redirects to this service's own callback,
   // and the dashboard reads the one-time result back keyed by an unguessable
@@ -54,6 +58,18 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
   {
     pathname: "/api/v1/device/upload-authorizations",
     id: "device_upload_authorization",
+  },
+  {
+    pathname: "/api/v1/device/disconnect",
+    id: "device_disconnect",
+  },
+  {
+    pathname: "/api/v1/device/sync/state",
+    id: "device_sync_state",
+  },
+  {
+    pathname: "/api/v1/device/sync/manifest",
+    id: "device_sync_manifest",
   },
   {
     pathname: "/api/v1/me/devices",
@@ -98,6 +114,10 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
   {
     pathname: "/api/v1/community/insights",
     id: "community_stats",
+  },
+  {
+    pathname: "/api/v1/community/daily",
+    id: "community_daily",
   },
   {
     pathname: "/api/v1/me",

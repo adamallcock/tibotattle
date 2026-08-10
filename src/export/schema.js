@@ -1,4 +1,5 @@
 import Ajv from "ajv";
+import { safeValidationErrors } from "./safe-validation-errors.js";
 
 import activityMarkerSchema from "../../schemas/telemetry-v0.1/activity-marker.schema.json" with { type: "json" };
 import bundleSchema from "../../schemas/telemetry-v0.1/bundle.schema.json" with { type: "json" };
@@ -55,14 +56,6 @@ const validators = Object.freeze(Object.fromEntries(
     ajv.getSchema(schema.$id),
   ]),
 ));
-
-function safeValidationErrors(errors = []) {
-  return errors.slice(0, 20).map((error) => ({
-    path: error.instancePath || "/",
-    keyword: error.keyword,
-    schemaPath: error.schemaPath,
-  }));
-}
 
 export function validateExportRecord(name, value) {
   const validate = validators[name];

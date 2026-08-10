@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "usage-monitor-worker-sparkle-release-contract-v1",
+  "channel": "stable",
+  "serviceOrigin": "https://tibotattle.com",
+  "updateOrigin": "https://updates.tibotattle.com",
+  "appcastURL": "https://updates.tibotattle.com/appcast.xml",
+  "appcastObjectKey": "appcast.xml",
+  "r2Bucket": "tibotattle-updates",
+  "objectPrefix": "releases",
+  "guardSchema": "usage-monitor-sparkle-appcast-atomic-guard-v1",
+  "guardRoute": "/api/v1/internal/release/appcast",
+  "appcastContentType": "application/xml; charset=utf-8",
+  "appcastCacheControl": "public, max-age=300, must-revalidate",
+  "artifactContentType": "application/x-apple-diskimage",
+  "artifactCacheControl": "public, max-age=31536000, immutable"
+}

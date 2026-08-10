@@ -3,6 +3,7 @@ import {
   summarizeSupplementalSourcePlan,
   stableJson,
 } from "../../export/index.js";
+import { validSha256 } from "./source-validation.js";
 
 export function createSourcePlanBundleContext(configuration) {
 const {
@@ -70,10 +71,6 @@ function exactKeys(value, keys) {
   return value && typeof value === "object" && !Array.isArray(value)
     && Object.keys(value).length === keys.length
     && keys.every((key) => Object.hasOwn(value, key));
-}
-
-function validSha256(value) {
-  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 }
 
 function bundleDigest(value) {

@@ -4,10 +4,10 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light">
-    <meta name="theme-color" content="#f5f1e8">
+    <meta name="theme-color" content="#082f2a">
     <!--
-      This is the public website surface. It shows exactly two things: how to
-      install the Mac app, and the published community snapshot. Everything
+      This is the public website surface. It introduces the Mac app, offers
+      its verified installer, and shows the published community snapshot. Everything
       that needs the local companion — the personal dashboard, contribution
       preparation and upload, and hosted sign-in — lives in the app itself, so
       no control here can render dead.
@@ -27,181 +27,310 @@
     <meta name="usage-monitor-privacy-url" content="">
     <meta name="usage-monitor-security-url" content="">
     <meta name="usage-monitor-support-url" content="">
-    <meta name="usage-monitor-semantic-open-target" content="__USAGE_MONITOR_SEMANTIC_OPEN_TARGET__">
     <link rel="canonical" href="">
     <meta property="og:type" content="website">
     <meta property="og:title" content="TiboTattle">
     <meta
       property="og:description"
-      content="Private, local-first monitoring for AI usage. Install the Mac app, or read the published community snapshot."
+      content="TiboTattle is a private Mac app that estimates your seven-day Codex allowance locally and shows delayed, aggregate activity from contributors when published."
     >
     <meta property="og:url" content="">
     <meta property="og:image" content="">
     <meta property="og:image:width" content="1200">
     <meta property="og:image:height" content="630">
-    <meta property="og:image:alt" content="TiboTattle local-first allowance dashboard">
+    <meta property="og:image:alt" content="TiboTattle local dashboard with a personal seven-day allowance history">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="TiboTattle">
     <meta
       name="twitter:description"
-      content="Private, local-first monitoring for AI usage. Install the Mac app, or read the published community snapshot."
+      content="TiboTattle is a private Mac app that estimates your seven-day Codex allowance locally and shows delayed, aggregate activity from contributors when published."
     >
     <meta name="twitter:image" content="">
     <meta
       name="description"
-      content="TiboTattle measures your Codex allowance locally on your Mac. Install the app, or read the privacy-safe weekly community snapshot."
+      content="See where your Codex allowance stands with a private Mac app that calculates your personal dashboard locally."
     >
     <title>TiboTattle</title>
+    <link rel="icon" type="image/png" href="./tibotattle-icon.png">
+    <link rel="apple-touch-icon" href="./tibotattle-icon.png">
     <link rel="stylesheet" href="./styles.css">
     <script type="module" src="./community.js"></script>
   </head>
-  <body class="community-site">
-    <a class="skip-link" href="#main">Skip to install and community</a>
+  <body class="community-site" data-i18n-root data-i18n-legacy-root>
+    <a class="skip-link" href="#main">Skip to TiboTattle</a>
 
-    <header class="topbar">
-      <a class="brand" href="#install" aria-label="TiboTattle home">
-        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+    <header class="topbar" data-i18n-legacy-root>
+      <a
+        class="brand"
+        href="#install"
+        aria-label="TiboTattle home"
+        data-i18n-aria-label="aria.tibotattleHome"
+      >
+        <img class="brand-icon" src="./tibotattle-icon.png" alt="" width="42" height="42">
         <span>TiboTattle</span>
       </a>
-      <nav class="primary-nav" aria-label="Site sections">
-        <a href="#install">Install</a>
+      <nav
+        class="primary-nav"
+        aria-label="Site sections"
+        data-i18n-aria-label="aria.siteSections"
+      >
+        <a href="#how-it-works">How it works</a>
         <a href="#community">Community</a>
+        <a href="./docs.html">Docs</a>
       </nav>
+      <label class="language-picker">
+        <span class="sr-only" data-i18n="language.label">Language</span>
+        <select data-language-picker aria-label="Language"></select>
+      </label>
+      <p
+        class="sr-only"
+        data-language-announcement
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      ></p>
+      <a class="header-download" href="#download">
+        <img src="./apple.svg" alt="" width="14" height="14">
+        <span id="header-download-label">Get the Mac app</span>
+      </a>
     </header>
 
-    <main id="main">
-      <div class="page-heading">
-        <div>
-          <p class="eyebrow">Local-first allowance monitoring</p>
-          <h1>Your Codex allowance, measured on your own Mac.</h1>
-          <p class="lede">
-            TiboTattle reads content-free Codex metadata locally and shows what
-            your allowance is actually doing. The dashboard lives inside the Mac
-            app, because only the app can read your local files. This site has
-            two jobs: hand you the app, and publish what the community has
-            chosen to share.
+    <main id="main" tabindex="-1" data-i18n-legacy-root>
+      <section class="product-hero" id="install" aria-labelledby="install-title">
+        <div class="hero-copy">
+          <h1 id="install-title">See where your Codex allowance stands.</h1>
+          <p class="hero-lede">
+            TiboTattle is a private Mac app that estimates how much of your
+            seven-day Codex allowance remains and shows how your usage changes
+            over time. Your personal dashboard is calculated on your Mac.
           </p>
-        </div>
-      </div>
 
-      <section class="companion-setup" id="install" aria-labelledby="install-title">
-        <div class="companion-setup-copy">
-          <p class="eyebrow">Get the app</p>
-          <h2 id="install-title">Install TiboTattle for Mac</h2>
-          <p>
-            A website cannot read Codex files, and TiboTattle does not ask it
-            to. The Mac app runs a private loopback companion, reads metadata
-            locally, and shows the full dashboard inside its own window. Nothing
-            is uploaded unless you explicitly choose to contribute.
-          </p>
-        </div>
-        <ol class="companion-steps">
-          <li>
-            <strong>Download the signed Mac app</strong>
-            <a class="button button-primary" id="installer-link" href="" hidden>
-              Download TiboTattle for Mac
-            </a>
+          <div
+            class="install-cluster"
+            id="download"
+            aria-label="Get TiboTattle for Mac"
+            data-i18n-aria-label="aria.getTiboTattleForMac"
+          >
+            <div class="install-actions">
+              <a
+                class="button mac-download-button"
+                id="installer-link"
+                hidden
+              >
+                <img class="download-platform-icon" src="./apple.svg" alt="" width="22" height="22">
+                Download for macOS
+              </a>
+              <button
+                class="button mac-download-button"
+                id="installer-unavailable-action"
+                type="button"
+                aria-describedby="installer-unavailable"
+                disabled
+              >
+                <img class="download-platform-icon" src="./apple.svg" alt="" width="22" height="22">
+                Download for macOS
+              </button>
+              <span class="installer-unavailable" id="installer-unavailable">
+                Public download coming soon.
+              </span>
+            </div>
             <div class="installer-details" id="installer-details" hidden>
               <span id="installer-version"></span>
               <span id="installer-compatibility"></span>
               <span id="installer-size"></span>
               <span id="installer-sha256"></span>
             </div>
-            <nav class="installer-links" id="installer-links" aria-label="Release information" hidden>
+            <nav class="installer-links" id="installer-links" aria-label="Release information" data-i18n-aria-label="aria.releaseInformation" hidden>
               <a id="release-notes-link" href="" hidden>Release notes</a>
               <a id="privacy-link" href="" hidden>Privacy</a>
               <a id="security-link" href="" hidden>Security</a>
               <a id="support-link" href="" hidden>Support</a>
             </nav>
-            <span class="installer-unavailable" id="installer-unavailable">
-              A public installer is not configured for this build. If you
-              already received the app, open it from Applications.
-            </span>
-          </li>
-          <li>
-            <strong>Open it from Applications</strong>
-            <a class="button button-secondary" id="open-installed-app" href="">
-              Open installed app
-            </a>
-            <span>
-              Already installed? This link asks macOS to bring TiboTattle
-              forward.
-            </span>
-          </li>
-          <li>
-            <strong>Everything else happens in the app</strong>
-            <span>
-              Your usage, weekly limit estimate, calibration, and the optional
-              contribution controls are all inside the app window. They are
-              deliberately absent from this site, because no website can produce
-              them honestly.
-            </span>
-          </li>
-        </ol>
-        <div class="companion-setup-actions">
-          <p id="open-installed-app-status" role="status" hidden></p>
+            <p class="installer-availability-note">
+              We will make the signed Mac installer available here when it is
+              ready.
+            </p>
+          </div>
+
+          <a class="community-inline" href="#community">
+            <span class="community-dot" id="community-snapshot-dot" aria-hidden="true"></span>
+            <span>Latest community evidence</span>
+            <strong id="community-snapshot-hero">Checking snapshot</strong>
+          </a>
         </div>
+
+        <figure class="product-window" aria-labelledby="product-preview-title">
+          <div class="product-window-bar">
+            <span class="preview-brand">
+              <img src="./tibotattle-icon.png" alt="" width="32" height="32">
+              <strong>TiboTattle</strong>
+            </span>
+            <span class="preview-demo">Demo data</span>
+          </div>
+          <div class="product-window-content">
+            <p class="preview-label" id="product-preview-title">Seven-day allowance estimate</p>
+            <div class="preview-value">
+              <strong>$1,879</strong>
+              <span>API equivalent<br>per 7 days</span>
+            </div>
+            <p class="preview-qualification">Example only — not your usage or a bill.</p>
+            <dl class="preview-stats">
+              <div>
+                <dt>Observed resets</dt>
+                <dd>14</dd>
+              </div>
+              <div>
+                <dt>Allowance remaining</dt>
+                <dd>61%</dd>
+              </div>
+            </dl>
+            <img
+              class="preview-chart"
+              src="./tibotattle-weekly-preview.jpg"
+              width="914"
+              height="430"
+              alt="Sample seven-day allowance history with reset-level uncertainty ranges"
+              data-i18n-alt="alt.previewWeeklyHistory"
+            >
+          </div>
+          <figcaption>Your dashboard is calculated privately on your Mac.</figcaption>
+        </figure>
       </section>
 
-      <section class="dashboard-section" id="community" aria-labelledby="community-title">
-        <div class="section-heading">
+      <section
+        class="feature-strip"
+        id="how-it-works"
+        aria-label="What TiboTattle provides"
+        data-i18n-aria-label="aria.tibotattleFeatures"
+      >
+        <article>
+          <span class="feature-step" aria-hidden="true">1</span>
+          <h2>Install the Mac app</h2>
+          <p>Open TiboTattle and let it calculate your Codex usage locally.</p>
+        </article>
+        <article>
+          <span class="feature-step" aria-hidden="true">2</span>
+          <h2>See your week</h2>
+          <p>View your allowance estimate and history in the app.</p>
+        </article>
+        <article>
+          <span class="feature-step" aria-hidden="true">3</span>
+          <h2>Share only if you choose</h2>
+          <p>Review a content-free summary before any optional community contribution.</p>
+        </article>
+      </section>
+
+      <section
+        class="community-proof"
+        id="community"
+        data-community-state="checking"
+        aria-labelledby="community-title"
+      >
+        <div class="community-proof-heading">
           <div>
-            <p class="eyebrow">Delayed community evidence</p>
-            <h2 id="community-title">What the community has published</h2>
+            <h2 id="community-title">Community activity snapshot</h2>
+            <p>When available, this is a delayed, anonymous activity summary from people who chose to contribute.</p>
+            <p class="annotation">
+              Personal dashboards and contributions stay in the Mac app.
+            </p>
+          </div>
+          <div class="community-estimate-summary">
+            <span class="evidence-chip neutral" id="community-snapshot-panel-state">
+              Checking snapshot
+            </span>
+            <div id="community-snapshot-status" role="status">
+              <p>Checking for the latest delayed aggregate snapshot…</p>
+            </div>
           </div>
         </div>
-        <p class="lede">
-          These are privacy-safe activity totals from people who chose to
-          contribute from the app. They are delayed, support-gated, clipped per
-          participant, and rounded down. They are not an average, not a cost,
-          and not a limit estimate.
-        </p>
-        <article class="panel community-result-panel">
-          <div class="panel-heading">
-            <div>
-              <p class="panel-kicker">Delayed community evidence</p>
-              <h3>Published weekly snapshot</h3>
+
+        <details class="community-method">
+          <summary>See community activity details</summary>
+          <div class="community-method-body">
+            <div class="activity-heading">
+              <div>
+                <h3>Published activity</h3>
+                <p>Delayed, rounded totals for the published reporting period.</p>
+              </div>
+              <span class="evidence-chip neutral" id="community-service-state">
+                Checking service
+              </span>
             </div>
-            <span class="evidence-chip neutral" id="community-service-state" role="status">
-              Checking service
-            </span>
-          </div>
-          <div class="result-summary" id="community-result">
-            <p>Checking for the latest delayed weekly snapshot…</p>
-          </div>
-          <details class="journey-disclosure service-detail-disclosure" id="community-snapshot-provenance">
-            <summary>
-              <span><strong>How this snapshot is produced</strong></span>
-            </summary>
-            <div class="service-detail-body">
-              <div id="community-snapshot-service-detail"></div>
-              <p class="annotation">
-                Community values use a fixed delay, independent per-cell support,
-                participant-level clipping, and coarse rounding. A sealed
-                revision is never rewritten; privacy-affecting deletion withdraws
-                it and schedules a replacement revision without the deleted
-                source.
-              </p>
+            <div class="result-summary" id="community-result">
+              <p>Checking for the latest delayed aggregate snapshot…</p>
             </div>
-          </details>
-        </article>
+            <details class="journey-disclosure service-detail-disclosure" id="community-snapshot-provenance">
+              <summary><strong>Snapshot and source details</strong></summary>
+              <div class="service-detail-body">
+                <div id="community-snapshot-service-detail"></div>
+                <p class="annotation">
+                  Values are delayed, rounded activity totals supplied by
+                  contributors. This page does not turn them into a personal
+                  reading or a statement about everyone.
+                </p>
+              </div>
+            </details>
+
+            <div class="activity-heading">
+              <div>
+                <h3>Daily activity series</h3>
+                <p>Delayed daily totals for the past year. Each day shows its latest published revision.</p>
+              </div>
+              <span class="evidence-chip neutral" id="community-daily-state">
+                Checking daily series
+              </span>
+            </div>
+            <div class="result-summary" id="community-daily-result">
+              <p>Checking for published daily activity…</p>
+            </div>
+          </div>
+        </details>
       </section>
     </main>
 
-    <footer>
-      <p>TiboTattle · evidence, uncertainty, and privacy boundaries kept visible.</p>
-      <p class="footer-disclaimer">
-        Named with affection for the Codex community. Not affiliated with or
-        endorsed by OpenAI or Thibault Sottiaux — and we will happily rename if
-        asked. Your tokens tattle only to you.
-      </p>
+    <footer data-i18n-legacy-root>
+      <div class="footer-copy">
+        <span class="footer-brand">
+          <img src="./tibotattle-icon.png" alt="" width="28" height="28">
+          <strong>TiboTattle</strong>
+        </span>
+        <p>Local-first and independent. Not affiliated with OpenAI.</p>
+      </div>
+      <nav
+        class="footer-links"
+        aria-label="Find TiboTattle online"
+        data-i18n-aria-label="aria.findTiboTattleOnline"
+      >
+        <a class="footer-resource" href="./docs.html">Docs</a>
+        <a class="footer-resource" href="./privacy.html">Privacy</a>
+        <a
+          class="footer-social"
+          href="https://github.com/adamallcock"
+          target="_blank"
+          rel="noreferrer"
+          aria-label="GitHub (opens in a new tab)"
+          data-i18n-aria-label="aria.githubExternal"
+        >
+          <img src="./github.svg" alt="" width="16" height="16">
+          <span class="footer-social-label">GitHub</span>
+        </a>
+        <a
+          class="footer-social"
+          href="https://x.com/adamallcock"
+          target="_blank"
+          rel="noreferrer"
+          aria-label="X (opens in a new tab)"
+          data-i18n-aria-label="aria.xExternal"
+        >
+          <img src="./x.svg" alt="" width="15" height="15">
+          <span class="footer-social-label">X</span>
+        </a>
+      </nav>
     </footer>
 
     <noscript>
       <div class="noscript">
-        JavaScript is required to show the verified download details and the
-        published community snapshot. Nothing on this page is hidden from you
-        deliberately: both are only shown after their fixed shape is checked.
+        Turn on JavaScript to check download availability and the public community snapshot.
       </div>
     </noscript>
   </body>

@@ -2,13 +2,13 @@ const PAGE_BY_TARGET = new Map([
   ["overview", "overview"],
   ["weekly", "weekly"],
   ["accounting", "method"],
-  ["coverage", "method"],
   ["method", "method"],
   ["timeline", "trends"],
+  ["trends", "trends"],
   ["community", "community"],
-  ["history", "data"],
-  ["backend", "data"],
-  ["data", "data"],
+  ["history", "community"],
+  ["backend", "community"],
+  ["data", "community"],
 ]);
 
 function targetFromHash(windowRef) {
@@ -25,13 +25,26 @@ export function mountDashboardNavigation({ documentRef, windowRef }) {
   const pages = [...documentRef.querySelectorAll("[data-dashboard-page]")];
   let activePage = null;
 
-  function setPage(page) {
+  function focusPageHeading(page) {
+    const heading = pages
+      .find((element) => element.dataset.dashboardPage === page)
+      ?.querySelector?.("h1, h2");
+    if (!heading) return;
+    heading.setAttribute?.("tabindex", "-1");
+    heading.focus?.({ preventScroll: true });
+  }
+
+  function setPage(page, { focusHeading = false } = {}) {
     if (!pages.some((element) => element.dataset.dashboardPage === page)) {
       return false;
     }
     activePage = page;
     for (const element of pages) {
-      element.hidden = element.dataset.dashboardPage !== page;
+      const inactive = element.dataset.dashboardPage !== page;
+      element.classList.toggle("dashboard-page-inactive", inactive);
+      element.inert = inactive;
+      if (inactive) element.setAttribute("aria-hidden", "true");
+      else element.removeAttribute("aria-hidden");
     }
     for (const link of links) {
       const active = link.dataset.nav === page;
@@ -39,6 +52,7 @@ export function mountDashboardNavigation({ documentRef, windowRef }) {
       if (active) link.setAttribute("aria-current", "page");
       else link.removeAttribute("aria-current");
     }
+    if (focusHeading) focusPageHeading(page);
     return true;
   }
 
@@ -50,13 +64,17 @@ export function mountDashboardNavigation({ documentRef, windowRef }) {
       );
       if (disclosure) disclosure.open = true;
     }
-    setPage(PAGE_BY_TARGET.get(target) ?? activePage ?? "overview");
+    const hadActivePage = activePage !== null;
+    const page = PAGE_BY_TARGET.get(target) ?? activePage ?? "overview";
+    if (setPage(page, { focusHeading: hadActivePage }) && hadActivePage) {
+      windowRef.scrollTo?.({ top: 0, behavior: "instant" });
+    }
   }
 
   function navigate(event) {
     const link = event.currentTarget;
     const page = link.dataset.nav;
-    if (!setPage(page)) return;
+    if (!setPage(page, { focusHeading: true })) return;
     event.preventDefault();
     const hash = link.getAttribute("href") ?? `#${page}`;
     if (windowRef.location.hash !== hash) {

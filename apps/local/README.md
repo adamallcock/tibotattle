@@ -112,7 +112,7 @@ On first use:
 6. optionally choose **Contribute and keep it current**, review the exact first
    prepared contribution, and send it explicitly.
 
-Every slice is deliberately bounded. A separate 64 MiB checkpointed headline
+Every slice is deliberately bounded. A separate 128 MiB checkpointed headline
 pass publishes current quota and recent content-free usage before the full
 seven-day index and deeper replay-safe accounting complete. The refresh status
 exposes `quickResultAt` and the `quick_result` phase. Internal
@@ -135,7 +135,7 @@ while it computes API-price-equivalent usage. It atomically writes only an
 owner-readable, versioned, content-free accounting cache. The weekly view uses
 that live cache and labels older observations as account-unattributed and
 potentially spanning multiple accounts. It does not read the replay-heavy
-collector ledger as a substitute or perform a second raw-log pass.
+collector record store as a substitute or perform a second raw-log pass.
 
 A quota-only refresh now reuses a current accounting cache while preserving
 the newly observed quota card. If any genuinely new rollout usage was written,
@@ -145,14 +145,42 @@ directory entries, elapsed time, line size, and RSS, including a 1.5 GiB
 accounting RSS ceiling. A violation becomes fixed
 `refresh_resource_limited`; the browser retains the useful headline or prior
 result and explains that deep analysis stopped at its safety limit. This is
-safe for the pilot. A persistent incremental index remains the intended
-performance optimization for fast complete scans of very large histories.
+safe for the pilot.
 
-Passive recursive discovery is abort-aware and capped at 20,000 directory
-entries and 5,000 rollout files per pass. Its byte ceiling also covers later
-files, appends, truncations, and reseeding. Reaching a bound preserves durable
-cursors and emits fixed content-free pause evidence; the foreground collector
-uses the same limits.
+A separate archive-accounting SQLite index now makes all-history coverage
+explicit. Its first scheduled source parse is 128 MiB; later resumptions may
+schedule up to 1.5 GiB, examine 500,000 directory entries and 125,000 rollout
+files, and run for five minutes. It publishes owner-only, durable 128 MiB-or-smaller
+checkpoints while it works. The dashboard reports **scanning**, **partial**, or
+**complete** archive coverage, while its current cost controls remain
+explicitly labelled as a cached 31-day window. This first archive step is a
+coverage gate, not an all-time aggregate; it does not turn an incomplete
+archive prefix into an all-time cost total.
+
+Before it stages a new archive generation, the companion reserves free disk
+space for the existing index, the selected pass budget, and a 128 MiB safety
+margin. If that check cannot pass, the dashboard receives the fixed partial
+state `archive_disk_space`; it never starts an unsafe stage or calls coverage
+complete.
+
+The source-parse budget does not claim to meter every operating-system read:
+small source-identity and lineage preflight reads remain protected by the same
+source caps and five-minute deadline. A normal finalized JSONL source needs
+only a one-byte terminal-newline check before its already indexed prefix can
+be reused.
+
+Passive recursive discovery is abort-aware and capped at 500,000 directory
+entries and 125,000 rollout files per pass, so the foreground collector cannot
+block a qualifying archive scan merely because the older discovery guard was
+too small. Its byte ceiling also covers later files, appends, truncations, and
+reseeding. Reaching a bound preserves durable cursors and emits fixed
+content-free pause evidence. Its responsive recent-window byte, record-batch,
+and line-size boundaries remain, while records, cursors, dedupe, quota
+observations, accounting cache, and lock live together in one owner-only SQLite
+state database; these larger discovery caps are not an unbounded scan.
+Legacy JSON/JSONL retirement is serialized by an owner-only migration lease,
+requires strict valid bounded records, and does not report complete until every
+managed legacy artifact has been removed after a durable parity receipt.
 
 Repository-generated weekly artifacts are not a native production fallback.
 Developers who specifically need the frozen historical fixture may opt in while

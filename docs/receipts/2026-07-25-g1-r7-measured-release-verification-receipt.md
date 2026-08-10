@@ -19,11 +19,11 @@ This receipt supersedes the earlier [synthetic smoke verification receipt](./202
 
 | Profile | Node 24 semantic receipt SHA-256 | Node 26 semantic receipt SHA-256 | Result |
 |---|---|---|---|
-| [Synthetic semantics](./generated/r7-release-synthetic-semantics-node24.14.0-v0.1.json) | `f3fb2deb59cef1448530b0b9507428ecb5dc2cd98ab24b83f2bd17dabe78ccb5` | `0fc7d3bf0f4be9c0381483c6ef26db73e06875521bc91b1630ed3a947aff8279` | Partial profile; two-pass determinism passed |
-| [Synthetic pressure](./generated/r7-release-synthetic-pressure-node24.14.0-v0.1.json) | `c281312672052f9e02c0a8937e60d70c639ee7b23f7df84df14acabd650b9b16` | `b06f8a933188aabb2e427a79e6521b2e2a435874fde45fe113ab4bfb94f6519d` | Partial profile; two-pass determinism passed |
-| [Materialized boundaries](./generated/r7-release-materialized-boundaries-node24.14.0-v0.1.json) | `1fc38a56ae672bac2e58b7336ad0abc74d6279d323affe08c5a594e57cb98892` | `8566a396307158169b6defc6e65858ce555651616e80275e306fadcd8c99d1a8` | Partial profile; material cases passed, candidate boundaries unidentified |
-| [Real local history](./generated/r7-release-real-local-history-node24.14.0-v0.1.json) | `eb7441c8493c695be4c80e690f20333d3ef6174936df79fe101212ff20caad3a` | `ce643bd0bc94cdd5321284098170fe89165731d59eb6fc11656136bc35d0eff7` | Partial profile; two-pass determinism passed |
-| [Decision](./generated/r7-release-decision-node24.14.0-v0.1.json) | `43b967ecd1965aa5a996d1e029f6cce046a1ba178e5d49e2cd6b54f98e0f523b` | `9959bd29f622a65a1295a345f715037f26d77856462ef5cbe0917d52e93fd30f` | `release_open`; all 19 dimensions unresolved |
+| [Synthetic semantics](../../generated/r7-release-synthetic-semantics-node24.14.0-v0.1.json) | `f3fb2deb59cef1448530b0b9507428ecb5dc2cd98ab24b83f2bd17dabe78ccb5` | `0fc7d3bf0f4be9c0381483c6ef26db73e06875521bc91b1630ed3a947aff8279` | Partial profile; two-pass determinism passed |
+| [Synthetic pressure](../../generated/r7-release-synthetic-pressure-node24.14.0-v0.1.json) | `c281312672052f9e02c0a8937e60d70c639ee7b23f7df84df14acabd650b9b16` | `b06f8a933188aabb2e427a79e6521b2e2a435874fde45fe113ab4bfb94f6519d` | Partial profile; two-pass determinism passed |
+| [Materialized boundaries](../../generated/r7-release-materialized-boundaries-node24.14.0-v0.1.json) | `1fc38a56ae672bac2e58b7336ad0abc74d6279d323affe08c5a594e57cb98892` | `8566a396307158169b6defc6e65858ce555651616e80275e306fadcd8c99d1a8` | Partial profile; material cases passed, candidate boundaries unidentified |
+| [Real local history](../../generated/r7-release-real-local-history-node24.14.0-v0.1.json) | `eb7441c8493c695be4c80e690f20333d3ef6174936df79fe101212ff20caad3a` | `ce643bd0bc94cdd5321284098170fe89165731d59eb6fc11656136bc35d0eff7` | Partial profile; two-pass determinism passed |
+| [Decision](../../generated/r7-release-decision-node24.14.0-v0.1.json) | `43b967ecd1965aa5a996d1e029f6cce046a1ba178e5d49e2cd6b54f98e0f523b` | `9959bd29f622a65a1295a345f715037f26d77856462ef5cbe0917d52e93fd30f` | `release_open`; all 19 dimensions unresolved |
 
 The Node 26 files use the same profile basename with `node26.2.0-v0.1.json`. `test/r7-generated-release-evidence.test.js` requires exactly these ten release files, revalidates each against the current source-bound contract, and exactly rebuilds the decision receipt from the eight non-decision inputs on each qualified runtime.
 

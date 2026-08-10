@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  createPublicKey,
+  randomBytes,
+  verify,
+} from "node:crypto";
 import {
   lstat,
   mkdtemp,
@@ -12,7 +18,20 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PRODUCT_BRAND } from "../config/product-brand.js";
-import { validateMacOSDMG } from "./macos-release-core.js";
+import { CANONICAL_STABLE_APPCAST_POLICY } from "../config/sparkle-appcast-policy.js";
+import {
+  assertDeploymentEndpoints,
+  DEPLOYMENT_ENDPOINTS,
+} from "../config/deployment-endpoints.js";
+import {
+  assertReleaseChannelPublication,
+  resolveReleaseChannel,
+} from "../config/release-channels.js";
+import {
+  assertStableSparkleKeyContinuity,
+  readStableReleaseManifest,
+  validateMacOSDMG,
+} from "./macos-release-core.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
@@ -25,13 +44,23 @@ const WRANGLER_PATH = join(
   "wrangler",
 );
 
-export const APPROVED_R2_BUCKET = "tibotattle-updates";
-export const CANONICAL_UPDATE_ORIGIN = "https://updates.tibotattle.com";
-export const CANONICAL_APPCAST_URL =
-  `${CANONICAL_UPDATE_ORIGIN}/appcast.xml`;
+assertDeploymentEndpoints();
+export const APPROVED_R2_BUCKET = DEPLOYMENT_ENDPOINTS.sparkle.r2Bucket;
+export const CANONICAL_UPDATE_ORIGIN = DEPLOYMENT_ENDPOINTS.sparkle.origin;
+export const CANONICAL_APPCAST_URL = DEPLOYMENT_ENDPOINTS.sparkle.appcastURL;
 export const RELEASE_MANIFEST_SCHEMA = "usage-monitor-macos-release-v0.2";
 export const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 export const APPCAST_CACHE_CONTROL = "public, max-age=300, must-revalidate";
+export const APPCAST_ATOMIC_GUARD_SCHEMA =
+  "usage-monitor-sparkle-appcast-atomic-guard-v1";
+export const APPCAST_ATOMIC_GUARD_ROUTE =
+  "/api/v1/internal/release/appcast";
+export const APPCAST_ATOMIC_GUARD_TOKEN_ENV =
+  "SPARKLE_APPCAST_GUARD_TOKEN";
+export const DELTA_CONTENT_TYPE = "application/octet-stream";
+const PUBLICATION_STATUS_VALIDATED = "validated";
+const PUBLICATION_STATUS_PUBLISHED = "published";
+const PUBLICATION_STATUS_RESUMED_VERIFIED = "resumed_verified";
 
 const REQUIRED_RELEASE_ASSURANCES = Object.freeze([
   "appNotarizationAccepted",
@@ -46,12 +75,20 @@ const REQUIRED_RELEASE_ASSURANCES = Object.freeze([
 const MAX_APPCAST_BYTES = 1024 * 1024;
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_DMG_BYTES = 10 * 1024 * 1024 * 1024;
+const PUBLIC_READBACK_TIMEOUT_MS = 30_000;
 const BUNDLE_VERSION_PATTERN =
   /^(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){0,2}$/u;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
+const ED25519_PUBLIC_KEY_PATTERN = /^[A-Za-z0-9+/]{43}=$/u;
 const ED25519_SIGNATURE_PATTERN = /^[A-Za-z0-9+/]{86}==$/u;
 const SAFE_DMG_FILE_NAME_PATTERN =
   /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.dmg$/u;
+const ED25519_SPKI_PREFIX = Buffer.from(
+  "302a300506032b6570032100",
+  "hex",
+);
+const SAFE_RELEASE_OBJECT_FILE_NAME_PATTERN =
+  /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(?:dmg|delta)$/u;
 
 function fail(message, code = "SPARKLE_UPDATE_PUBLICATION_INVALID") {
   const error = new Error(message);
@@ -59,11 +96,84 @@ function fail(message, code = "SPARKLE_UPDATE_PUBLICATION_INVALID") {
   throw error;
 }
 
+function defaultPublicFetch(...arguments_) {
+  if (typeof globalThis.fetch !== "function") {
+    fail(
+      "Public update read-back requires the Node fetch implementation",
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  return globalThis.fetch(...arguments_);
+}
+
 function requiredOption(value, label) {
   if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
     fail(`${label} is required`);
   }
   return value;
+}
+
+function normalizeAppcastAtomicGuardEndpoint(value, channel) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string" || value.includes("\0")) {
+    fail(
+      "--atomic-appcast-guard-endpoint must be supplied as a canonical HTTPS URL",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_ENDPOINT_INVALID",
+    );
+  }
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    fail(
+      "--atomic-appcast-guard-endpoint must be supplied as a canonical HTTPS URL",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_ENDPOINT_INVALID",
+    );
+  }
+  if (parsed.protocol !== "https:"
+      || parsed.username
+      || parsed.password
+      || parsed.search
+      || parsed.hash
+      || parsed.href !== value
+      || parsed.href !== channel.sparkle.atomicGuardURL) {
+    fail(
+      `--atomic-appcast-guard-endpoint must equal the reviewed ${channel.name} guard URL`,
+      "SPARKLE_UPDATE_ATOMIC_GUARD_ENDPOINT_INVALID",
+    );
+  }
+  return parsed.href;
+}
+
+function normalizeAppcastAtomicGuardTokenEnv(value) {
+  if (value === null || value === undefined) return null;
+  if (value !== APPCAST_ATOMIC_GUARD_TOKEN_ENV) {
+    fail(
+      `--atomic-appcast-guard-token-env must name ${APPCAST_ATOMIC_GUARD_TOKEN_ENV}`,
+      "SPARKLE_UPDATE_ATOMIC_GUARD_TOKEN_ENV_INVALID",
+    );
+  }
+  return value;
+}
+
+function normalizeAppcastAtomicGuardToken(value) {
+  if (typeof value !== "string"
+      || !/^[^\u0000-\u001f\u007f]{32,256}$/u.test(value)) {
+    fail(
+      `The ${APPCAST_ATOMIC_GUARD_TOKEN_ENV} environment variable must contain a non-logged owner secret`,
+      "SPARKLE_UPDATE_ATOMIC_GUARD_TOKEN_REQUIRED",
+    );
+  }
+  return value;
+}
+
+function readAppcastAtomicGuardToken(envName) {
+  const value = process.env[envName];
+  // Do not let Wrangler children inherit the owner secret. The environment
+  // variable name is allowlisted above; the value is never included in an
+  // option object, receipt, request body, or diagnostic.
+  delete process.env[envName];
+  return normalizeAppcastAtomicGuardToken(value);
 }
 
 async function readRegularInput(path, { label, maximumBytes }) {
@@ -82,8 +192,47 @@ async function readRegularInput(path, { label, maximumBytes }) {
   return Object.freeze({ path: selected, size: metadata.size });
 }
 
-async function sha256File(path) {
-  return createHash("sha256").update(await readFile(path)).digest("hex");
+async function readFileWithSha256(path) {
+  const bytes = await readFile(path);
+  return Object.freeze({
+    bytes,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  });
+}
+
+function normalizeSparklePublicKey(value) {
+  if (typeof value !== "string"
+      || !ED25519_PUBLIC_KEY_PATTERN.test(value)) {
+    fail(
+      "--sparkle-public-ed-key must be canonical base64 for 32 public-key bytes",
+      "SPARKLE_UPDATE_PUBLIC_KEY_INVALID",
+    );
+  }
+  const raw = Buffer.from(value, "base64");
+  if (raw.length !== 32 || raw.toString("base64") !== value) {
+    fail(
+      "--sparkle-public-ed-key must be canonical base64 for 32 public-key bytes",
+      "SPARKLE_UPDATE_PUBLIC_KEY_INVALID",
+    );
+  }
+  let key;
+  try {
+    key = createPublicKey({
+      key: Buffer.concat([ED25519_SPKI_PREFIX, raw]),
+      format: "der",
+      type: "spki",
+    });
+  } catch {
+    fail(
+      "--sparkle-public-ed-key could not be imported as an Ed25519 public key",
+      "SPARKLE_UPDATE_PUBLIC_KEY_INVALID",
+    );
+  }
+  return Object.freeze({
+    encoded: value,
+    key,
+    sha256: createHash("sha256").update(raw).digest("hex"),
+  });
 }
 
 function readManifest(text) {
@@ -99,11 +248,18 @@ function readManifest(text) {
   }
 }
 
-function validateReleaseManifest(manifest, dmg) {
+function validateReleaseManifest(
+  manifest,
+  dmg,
+  sparklePublicKey,
+  channel,
+) {
   if (manifest.schemaVersion !== RELEASE_MANIFEST_SCHEMA
       || manifest.application?.bundleIdentifier !== PRODUCT_BRAND.bundleIdentifier
       || typeof manifest.application?.bundleVersion !== "string"
       || !BUNDLE_VERSION_PATTERN.test(manifest.application.bundleVersion)
+      || typeof manifest.application?.shortVersion !== "string"
+      || manifest.application.shortVersion.length === 0
       || typeof manifest.artifact?.fileName !== "string"
       || !SAFE_DMG_FILE_NAME_PATTERN.test(manifest.artifact.fileName)
       || manifest.artifact.fileName.includes("..")
@@ -115,11 +271,31 @@ function validateReleaseManifest(manifest, dmg) {
       || !SHA256_PATTERN.test(manifest.artifact.sha256)
       || manifest.updater?.enabled !== true
       || manifest.updater?.requiresSignedFeed !== true
-      || manifest.updater?.appcastURL !== CANONICAL_APPCAST_URL
+      || manifest.updater?.appcastURL !== channel.sparkle.appcastURL
       || REQUIRED_RELEASE_ASSURANCES.some(
         (key) => manifest.assurances?.[key] !== true,
       )) {
     fail("Release manifest is not a complete canonical signed-DMG release");
+  }
+  try {
+    assertReleaseChannelPublication(channel.name, manifest.channel);
+  } catch {
+    fail(
+      `Release manifest channel provenance does not match ${channel.name}`,
+      "SPARKLE_UPDATE_CHANNEL_MISMATCH",
+    );
+  }
+  if (!SHA256_PATTERN.test(manifest.updater?.publicEdKeySha256 ?? "")) {
+    fail(
+      "Release manifest is missing the public Ed25519 key fingerprint",
+      "SPARKLE_UPDATE_PUBLIC_KEY_MISMATCH",
+    );
+  }
+  if (manifest.updater.publicEdKeySha256 !== sparklePublicKey.sha256) {
+    fail(
+      "Release manifest public Ed25519 key fingerprint does not match the supplied public key",
+      "SPARKLE_UPDATE_PUBLIC_KEY_MISMATCH",
+    );
   }
   return Object.freeze({
     artifactSha256: manifest.artifact.sha256,
@@ -155,7 +331,27 @@ function validateAppcastSignature(value) {
   }
 }
 
-function validatePublishedDownloadURL(value) {
+function verifyEnclosureSignature({ bytes, enclosure, sparklePublicKey }) {
+  let signatureVerified = false;
+  try {
+    signatureVerified = verify(
+      null,
+      bytes,
+      sparklePublicKey.key,
+      Buffer.from(enclosure.signature, "base64"),
+    );
+  } catch {
+    signatureVerified = false;
+  }
+  if (!signatureVerified) {
+    fail(
+      "Appcast enclosure signature does not verify against its artifact and the supplied public key",
+      "SPARKLE_UPDATE_SIGNATURE_INVALID",
+    );
+  }
+}
+
+function validatePublishedDownloadURL(value, channel) {
   if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
     fail("Appcast enclosure URL is invalid");
   }
@@ -165,67 +361,703 @@ function validatePublishedDownloadURL(value) {
   } catch {
     fail("Appcast enclosure URL is invalid");
   }
-  if (selected.origin !== CANONICAL_UPDATE_ORIGIN
+  const objectPrefix = `${channel.sparkle.objectPrefix}/`;
+  if (selected.origin !== channel.sparkle.origin
       || selected.protocol !== "https:"
       || selected.username || selected.password
       || selected.search || selected.hash
-      || !selected.pathname.startsWith("/releases/")
+      || !selected.pathname.startsWith(`/${objectPrefix}`)
       || selected.href !== value) {
-    fail("Appcast enclosure URL must be an exact immutable URL on the approved feed origin");
+    fail(`Appcast enclosure URL must be an exact immutable URL on the ${channel.name} feed origin`);
   }
   return selected.href;
 }
 
-function appcastEnclosures(text) {
+function parsePublishedObjectKey(value, channel) {
+  let selected;
+  try {
+    selected = new URL(value);
+  } catch {
+    fail("Appcast enclosure URL is invalid");
+  }
+  const prefixSegments = channel.sparkle.objectPrefix.split("/");
+  const segments = selected.pathname.slice(1).split("/");
+  const versionIndex = prefixSegments.length;
+  if (selected.origin !== channel.sparkle.origin
+      || segments.length !== versionIndex + 3
+      || segments.slice(0, versionIndex).join("/")
+        !== channel.sparkle.objectPrefix
+      || !BUNDLE_VERSION_PATTERN.test(segments[versionIndex] ?? "")
+      || !SHA256_PATTERN.test(segments[versionIndex + 1] ?? "")
+      || !SAFE_RELEASE_OBJECT_FILE_NAME_PATTERN.test(
+        segments[versionIndex + 2] ?? "",
+      )) {
+    fail(
+      "Appcast enclosure URL must name a content-addressed DMG or delta object",
+      "SPARKLE_UPDATE_APPCAST_OBJECT_PATH_INVALID",
+    );
+  }
+  return Object.freeze({
+    bundleVersion: segments[versionIndex],
+    fileName: segments[versionIndex + 2],
+    key: segments.join("/"),
+    sha256: segments[versionIndex + 1],
+  });
+}
+
+function compareBundleVersions(left, right) {
+  const leftParts = left.split(".").map(Number).concat([0, 0]).slice(0, 3);
+  const rightParts = right.split(".").map(Number).concat([0, 0]).slice(0, 3);
+  for (let index = 0; index < 3; index += 1) {
+    if (leftParts[index] < rightParts[index]) return -1;
+    if (leftParts[index] > rightParts[index]) return 1;
+  }
+  return 0;
+}
+
+function appcastEnclosures(text, channel) {
   if (text.includes("<!DOCTYPE") || text.includes("<!ENTITY")) {
     fail("Appcast must not contain a document type or entity declaration");
   }
-  const matches = [...text.matchAll(/<enclosure\b([^>]*)\/>/gu)];
-  if (matches.length === 0) fail("Appcast must contain a self-closing enclosure");
+  const enclosureOpenings = [...text.matchAll(/<enclosure\b/gu)].length;
+  const itemBodies = [...text.matchAll(
+    /<item\b[^>]*>([\s\S]*?)<\/item\s*>/gu,
+  )];
+  const matches = itemBodies.flatMap((item) => {
+    const body = item[1];
+    const versions = [...body.matchAll(
+      /<sparkle:version\b[^>]*>\s*([^<]+?)\s*<\/sparkle:version\s*>/gu,
+    )].map((match) => match[1]);
+    if (versions.length > 1) {
+      fail("Appcast item has ambiguous Sparkle versions");
+    }
+    return [...body.matchAll(
+      /<enclosure\b([^>]*?)(?:\/>|>\s*<\/enclosure\s*>)/gu,
+    )].map((match) => ({
+      attributes: match[1],
+      itemVersion: versions[0],
+    }));
+  });
+  if (matches.length === 0) {
+    fail("Appcast must contain an empty enclosure");
+  }
+  if (matches.length !== enclosureOpenings) {
+    fail("Every appcast enclosure must be empty and belong to one item");
+  }
   return matches.map((match) => {
-    const attributes = parseEnclosureAttributes(match[1]);
-    const url = validatePublishedDownloadURL(attributes.get("url"));
+    const attributes = parseEnclosureAttributes(match.attributes);
+    const url = validatePublishedDownloadURL(attributes.get("url"), channel);
+    const object = parsePublishedObjectKey(url, channel);
     const length = attributes.get("length");
-    if (!/^(?:0|[1-9][0-9]*)$/u.test(length ?? "")) {
+    const lengthNumber = Number(length);
+    if (!/^(?:0|[1-9][0-9]*)$/u.test(length ?? "")
+        || !Number.isSafeInteger(lengthNumber)
+        || lengthNumber < 1
+        || lengthNumber > MAX_DMG_BYTES) {
       fail("Appcast enclosure length is invalid");
     }
     validateAppcastSignature(attributes.get("sparkle:edSignature"));
+    const attributeVersion = attributes.get("sparkle:version");
+    if (attributeVersion !== undefined && match.itemVersion !== undefined
+        && attributeVersion !== match.itemVersion) {
+      fail("Appcast enclosure and item Sparkle versions disagree");
+    }
+    const version = attributeVersion ?? match.itemVersion;
+    if (typeof version !== "string"
+        || !BUNDLE_VERSION_PATTERN.test(version)
+        || object.bundleVersion !== version) {
+      fail(
+        "Appcast enclosure version must match its immutable object path",
+        "SPARKLE_UPDATE_APPCAST_VERSION_MISMATCH",
+      );
+    }
+    const deltaFrom = attributes.get("sparkle:deltaFrom");
+    if (deltaFrom !== undefined
+        && (!BUNDLE_VERSION_PATTERN.test(deltaFrom)
+          || compareBundleVersions(deltaFrom, version) >= 0)) {
+      fail(
+        "Appcast delta source must be an older bundle version",
+        "SPARKLE_UPDATE_APPCAST_DELTA_INVALID",
+      );
+    }
     return Object.freeze({
-      length: Number(length),
+      deltaFrom,
+      length: lengthNumber,
+      objectKey: object.key,
+      objectSha256: object.sha256,
       signature: attributes.get("sparkle:edSignature"),
       url,
-      version: attributes.get("sparkle:version"),
+      version,
     });
   });
 }
 
-function immutableObjectKeys({ bundleVersion, fileName, sha256 }) {
-  const prefix = `releases/${bundleVersion}/${sha256}`;
+function countDeltaContainerEnclosures(text) {
+  const blocks = [...text.matchAll(
+    /<sparkle:deltas\b[^>]*>([\s\S]*?)<\/sparkle:deltas\s*>/gu,
+  )];
+  const openings = [...text.matchAll(/<sparkle:deltas\b/gu)].length;
+  if (openings !== blocks.length
+      || blocks.some((block) => block[1].includes("<item")
+        || block[1].includes("<sparkle:deltas"))) {
+    fail(
+      "Appcast sparkle:deltas containers must be well formed",
+      "SPARKLE_UPDATE_APPCAST_DELTA_INVALID",
+    );
+  }
+  return blocks.reduce(
+    (count, block) => count + [...block[1].matchAll(/<enclosure\b/gu)].length,
+    0,
+  );
+}
+
+/**
+ * Sparkle clients treat only enclosures inside an item's <sparkle:deltas>
+ * container as delta candidates; the item's own enclosure remains the full
+ * download a client falls back to when it cannot apply a delta. Enforcing
+ * this placement is what keeps automatic full-DMG fallback working, so a
+ * delta enclosure outside the container (or a full enclosure inside one) is
+ * rejected rather than published.
+ */
+function assertCanonicalStableAppcast(text, channel, enclosures, appcastPolicy) {
+  if (channel.name !== "stable") return;
+  const policy = appcastPolicy ?? CANONICAL_STABLE_APPCAST_POLICY;
+
+  const itemOpenings = [...text.matchAll(/<item\b[^>]*>/gu)]
+    .filter((match) => !match[0].endsWith("/>")).length;
+  const itemClosings = [...text.matchAll(/<\/item\s*>/gu)].length;
+  const itemBodies = [...text.matchAll(
+    /<item\b[^>]*>([\s\S]*?)<\/item\s*>/gu,
+  )];
+  if (itemOpenings !== policy.channelItemCount
+      || itemClosings !== policy.channelItemCount
+      || itemBodies.length !== policy.channelItemCount) {
+    fail(
+      "Stable appcast must contain exactly one RSS channel item; history is not retained",
+      "SPARKLE_UPDATE_APPCAST_HISTORY_UNSUPPORTED",
+    );
+  }
+  const fullEnclosures = enclosures.filter(
+    (enclosure) => enclosure.deltaFrom === undefined,
+  );
+  const deltaEnclosures = enclosures.filter(
+    (enclosure) => enclosure.deltaFrom !== undefined,
+  );
+  if (deltaEnclosures.length > 0 && policy.allowDeltaFrom !== true) {
+    fail(
+      "The stable publisher only accepts one signed full candidate DMG; Sparkle delta publication is unsupported",
+      "SPARKLE_UPDATE_DELTA_UNSUPPORTED",
+    );
+  }
+  if (fullEnclosures.length !== policy.enclosureCount
+      || [...(itemBodies[0]?.[1] ?? "").matchAll(/<enclosure\b/gu)].length
+        !== enclosures.length) {
+    fail(
+      "Stable appcast must contain exactly one full enclosure inside its sole item",
+      "SPARKLE_UPDATE_APPCAST_NON_CANONICAL",
+    );
+  }
+  if (policy.fullDmgOnly
+      && fullEnclosures.some(
+        (enclosure) => !enclosure.objectKey.endsWith(".dmg"),
+      )) {
+    fail(
+      "Stable appcast must contain exactly one signed full DMG enclosure",
+      "SPARKLE_UPDATE_APPCAST_NON_CANONICAL",
+    );
+  }
+  if (deltaEnclosures.length > 0) {
+    const maximumDeltaEnclosures = policy.maxDeltaEnclosures ?? 3;
+    if (deltaEnclosures.length > maximumDeltaEnclosures) {
+      fail(
+        "Stable appcast delta enclosures must be a bounded set of .delta objects",
+        "SPARKLE_UPDATE_APPCAST_DELTA_INVALID",
+      );
+    }
+  }
+}
+
+function assertDeltaEnclosurePlacement(text, enclosures) {
+  const deltaEnclosures = enclosures.filter(
+    (enclosure) => enclosure.deltaFrom !== undefined,
+  );
+  const containedEnclosures = countDeltaContainerEnclosures(text);
+  if (deltaEnclosures.some(
+    (enclosure) => !enclosure.objectKey.endsWith(".delta"),
+  )
+      || deltaEnclosures.some(
+        (enclosure) => enclosure.objectKey.endsWith(".dmg"),
+      )
+      || containedEnclosures !== deltaEnclosures.length) {
+    fail(
+      "Appcast delta enclosures must be .delta objects inside the item's sparkle:deltas container so clients can fall back to the full download",
+      "SPARKLE_UPDATE_APPCAST_DELTA_INVALID",
+    );
+  }
+}
+
+/**
+ * Validate a locally generated candidate appcast against the reviewed
+ * channel and (for stable) the canonical appcast policy, without touching
+ * any artifact. Used by the appcast/delta generator as a self-check and by
+ * specs; the publisher itself performs the same checks plus artifact
+ * validation.
+ */
+export function validateCandidateAppcastShape(text, channelName, {
+  appcastPolicy = CANONICAL_STABLE_APPCAST_POLICY,
+} = {}) {
+  const channel = resolveReleaseChannel(channelName);
+  const enclosures = appcastEnclosures(text, channel);
+  assertCanonicalStableAppcast(text, channel, enclosures, appcastPolicy);
+  assertDeltaEnclosurePlacement(text, enclosures);
+  return enclosures;
+}
+
+function immutableObjectKeys({ bundleVersion, fileName, sha256, channel }) {
+  const prefix = `${channel.sparkle.objectPrefix}/${bundleVersion}/${sha256}`;
   return Object.freeze({
     artifact: `${prefix}/${fileName}`,
     manifest: `${prefix}/release-manifest.json`,
   });
 }
 
-function validateAppcast(text, { manifest, dmg, objectKeys }) {
+function validateAppcast(text, {
+  appcastPolicy,
+  channel,
+  dmg,
+  dmgBytes,
+  manifest,
+  objectKeys,
+  sparklePublicKey,
+}) {
+  const enclosures = appcastEnclosures(text, channel);
+  assertCanonicalStableAppcast(text, channel, enclosures, appcastPolicy);
+  assertDeltaEnclosurePlacement(text, enclosures);
   const artifactURL = new URL(
     objectKeys.artifact,
-    `${CANONICAL_UPDATE_ORIGIN}/`,
+    `${channel.sparkle.origin}/`,
   ).href;
-  const matching = appcastEnclosures(text).filter(
+  const matching = enclosures.filter(
     (enclosure) => enclosure.url === artifactURL,
   );
   if (matching.length !== 1
       || matching[0].length !== dmg.size
-      || matching[0].version !== manifest.bundleVersion) {
+      || matching[0].version !== manifest.bundleVersion
+      || matching[0].deltaFrom !== undefined) {
+    if (matching.length === 1 && matching[0].deltaFrom !== undefined) {
+      fail(
+        "The publisher only accepts a full candidate DMG; new Sparkle delta publication is unsupported",
+        "SPARKLE_UPDATE_DELTA_UNSUPPORTED",
+      );
+    }
     fail("Appcast must contain exactly one signed enclosure for this manifest and DMG");
   }
-  return Object.freeze({ artifactURL, enclosure: matching[0] });
+  verifyEnclosureSignature({
+    bytes: dmgBytes,
+    enclosure: matching[0],
+    sparklePublicKey,
+  });
+  return Object.freeze({
+    artifactURL,
+    enclosure: matching[0],
+    enclosures: Object.freeze(enclosures),
+  });
 }
 
-function normalizeBucket(bucket) {
-  if (bucket !== APPROVED_R2_BUCKET) {
-    fail(`--bucket must explicitly name the approved bucket ${APPROVED_R2_BUCKET}`);
+function sameAppcastEnclosure(left, right) {
+  return left.deltaFrom === right.deltaFrom
+    && left.length === right.length
+    && left.objectKey === right.objectKey
+    && left.objectSha256 === right.objectSha256
+    && left.signature === right.signature
+    && left.url === right.url
+    && left.version === right.version;
+}
+
+function assertExactCandidateAppcast({
+  appcastBytes,
+  appcastPolicy,
+  appcastUpdate,
+  currentAppcast,
+  channel,
+  dmg,
+  dmgBytes,
+  manifest,
+  objectKeys,
+  sparklePublicKey,
+}) {
+  if (currentAppcast === null
+      || currentAppcast.bytes !== appcastBytes.length
+      || currentAppcast.sha256 !== createHash("sha256")
+        .update(appcastBytes)
+        .digest("hex")
+      || !currentAppcast.content.equals(appcastBytes)) {
+    return false;
+  }
+
+  const observed = validateAppcast(currentAppcast.content.toString("utf8"), {
+    appcastPolicy,
+    channel,
+    dmg,
+    dmgBytes,
+    manifest,
+    objectKeys,
+    sparklePublicKey,
+  });
+  const candidateVersionEnclosures = appcastUpdate.enclosures.filter(
+    (enclosure) => enclosure.version === manifest.bundleVersion
+      && enclosure.deltaFrom === undefined,
+  );
+  const observedVersionEnclosures = observed.enclosures.filter(
+    (enclosure) => enclosure.version === manifest.bundleVersion
+      && enclosure.deltaFrom === undefined,
+  );
+  if (candidateVersionEnclosures.length !== 1
+      || observedVersionEnclosures.length !== 1
+      || !sameAppcastEnclosure(
+        candidateVersionEnclosures[0],
+        appcastUpdate.enclosure,
+      )
+      || !sameAppcastEnclosure(
+        observedVersionEnclosures[0],
+        observed.enclosure,
+      )
+      || observed.artifactURL !== appcastUpdate.artifactURL
+      || observed.enclosures.length !== appcastUpdate.enclosures.length
+      || observed.enclosures.some(
+        (enclosure, index) => !sameAppcastEnclosure(
+          enclosure,
+          appcastUpdate.enclosures[index],
+        ),
+      )) {
+    fail(
+      "Live appcast has an ambiguous or non-canonical candidate publication state",
+      "SPARKLE_UPDATE_APPCAST_RECOVERY_MISMATCH",
+    );
+  }
+  return true;
+}
+
+function responseHeader(response, name) {
+  const value = response?.headers?.get?.(name);
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function declaredResponseLength(response, label, { required = false } = {}) {
+  const value = responseHeader(response, "content-length");
+  if (value === "") {
+    if (required) {
+      fail(
+        `${label} response is missing Content-Length`,
+        "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+      );
+    }
+    return null;
+  }
+  if (!/^(?:0|[1-9][0-9]*)$/u.test(value)) {
+    fail(
+      `${label} response has an invalid Content-Length: ${value}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  const selected = Number(value);
+  if (!Number.isSafeInteger(selected) || selected > MAX_DMG_BYTES) {
+    fail(
+      `${label} response has an unsafe Content-Length: ${value}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  return selected;
+}
+
+function validatePublicResponse(response, {
+  cacheControl = null,
+  contentType = null,
+  label,
+} = {}) {
+  const status = response?.status;
+  if (status !== 200) {
+    fail(
+      `${label} returned HTTP ${String(status)}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  if (contentType !== null) {
+    const observed = responseHeader(response, "content-type")
+      .split(";", 1)[0]
+      .trim()
+      .toLowerCase();
+    if (observed !== contentType) {
+      fail(
+        `${label} returned Content-Type ${observed || "<missing>"}; expected ${contentType}`,
+        "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+      );
+    }
+  }
+  if (cacheControl !== null
+      && responseHeader(response, "cache-control") !== cacheControl) {
+    fail(
+      `${label} returned Cache-Control ${responseHeader(response, "cache-control") || "<missing>"}; expected ${cacheControl}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+}
+
+async function fetchPublicResponse(fetchPublic, url, {
+  label,
+  method = "GET",
+} = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    PUBLIC_READBACK_TIMEOUT_MS,
+  );
+  try {
+    const response = await fetchPublic(url, {
+      cache: "no-store",
+      headers: {
+        "Cache-Control": "no-cache",
+        Pragma: "no-cache",
+      },
+      method,
+      redirect: "error",
+      signal: controller.signal,
+    });
+    if (response?.url && response.url !== url) {
+      fail(
+        `${label} redirected away from the canonical URL`,
+        "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+      );
+    }
+    return response;
+  } catch (error) {
+    if (error?.code === "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED") throw error;
+    if (error?.name === "AbortError") {
+      fail(
+        `${label} timed out after ${PUBLIC_READBACK_TIMEOUT_MS} ms`,
+        "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+      );
+    }
+    fail(
+      `${label} request failed: ${error?.message || String(error)}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function readResponseBytes(response, {
+  expectedBytes = null,
+  label,
+  maximumBytes,
+} = {}) {
+  const declared = declaredResponseLength(response, label, { required: false });
+  if (declared !== null && declared > maximumBytes) {
+    fail(
+      `${label} response exceeds the safe size limit`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  let bytes;
+  try {
+    bytes = Buffer.from(await response.arrayBuffer());
+  } catch (error) {
+    fail(
+      `${label} body read failed: ${error?.message || String(error)}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  if (bytes.length < 1 || bytes.length > maximumBytes) {
+    fail(
+      `${label} response has an unsafe body size: ${bytes.length}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  if (declared !== null && declared !== bytes.length) {
+    fail(
+      `${label} Content-Length ${declared} does not match body bytes ${bytes.length}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  if (expectedBytes !== null && expectedBytes !== bytes.length) {
+    fail(
+      `${label} body bytes ${bytes.length} do not match expected ${expectedBytes}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  return bytes;
+}
+
+async function readResponseDigest(response, {
+  expectedBytes,
+  expectedSha256,
+  label,
+} = {}) {
+  const declared = declaredResponseLength(response, label, { required: false });
+  if (declared !== null && declared !== expectedBytes) {
+    fail(
+      `${label} Content-Length ${declared} does not match expected ${expectedBytes}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  const hash = createHash("sha256");
+  let bytes = 0;
+  try {
+    if (response.body?.getReader) {
+      const reader = response.body.getReader();
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        const value = Buffer.from(chunk.value);
+        bytes += value.length;
+        if (bytes > MAX_DMG_BYTES) {
+          fail(
+            `${label} response exceeds the safe size limit`,
+            "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+          );
+        }
+        hash.update(value);
+      }
+    } else {
+      const value = Buffer.from(await response.arrayBuffer());
+      bytes = value.length;
+      if (bytes > MAX_DMG_BYTES) {
+        fail(
+          `${label} response exceeds the safe size limit`,
+          "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+        );
+      }
+      hash.update(value);
+    }
+  } catch (error) {
+    if (error?.code === "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED") throw error;
+    fail(
+      `${label} body read failed: ${error?.message || String(error)}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  if (bytes !== expectedBytes) {
+    fail(
+      `${label} body bytes ${bytes} do not match expected ${expectedBytes}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  const observedSha256 = hash.digest("hex");
+  if (observedSha256 !== expectedSha256) {
+    fail(
+      `${label} SHA-256 ${observedSha256} does not match expected ${expectedSha256}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  return observedSha256;
+}
+
+async function verifyPublicPublication({
+  appcastBytes,
+  appcastPolicy,
+  appcastUpdate,
+  channel,
+  dmg,
+  dmgBytes,
+  fetchPublic,
+  manifest,
+  objectKeys,
+  publication,
+  sparklePublicKey,
+}) {
+  const publicAppcastResponse = await fetchPublicResponse(
+    fetchPublic,
+    publication.appcast.url,
+    { label: "Public Sparkle appcast" },
+  );
+  validatePublicResponse(publicAppcastResponse, {
+    cacheControl: APPCAST_CACHE_CONTROL,
+    contentType: "application/xml",
+    label: "Public Sparkle appcast",
+  });
+  const publicAppcastBytes = await readResponseBytes(publicAppcastResponse, {
+    expectedBytes: appcastBytes.length,
+    label: "Public Sparkle appcast",
+    maximumBytes: MAX_APPCAST_BYTES,
+  });
+  const localAppcastSha256 = createHash("sha256")
+    .update(appcastBytes)
+    .digest("hex");
+  const publicAppcastSha256 = createHash("sha256")
+    .update(publicAppcastBytes)
+    .digest("hex");
+  if (publicAppcastSha256 !== localAppcastSha256) {
+    fail(
+      `Public Sparkle appcast SHA-256 ${publicAppcastSha256} does not match the uploaded ${localAppcastSha256}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  const publicAppcastText = publicAppcastBytes.toString("utf8");
+  const publicUpdate = validateAppcast(publicAppcastText, {
+    appcastPolicy,
+    channel,
+    dmg,
+    dmgBytes,
+    manifest,
+    objectKeys,
+    sparklePublicKey,
+  });
+  if (publicUpdate.artifactURL !== appcastUpdate.artifactURL
+      || publicUpdate.enclosure.length !== appcastUpdate.enclosure.length
+      || publicUpdate.enclosure.version !== appcastUpdate.enclosure.version
+      || publicUpdate.enclosure.signature !== appcastUpdate.enclosure.signature) {
+    fail(
+      "Public Sparkle appcast does not retain the validated update enclosure",
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+
+  const enclosures = appcastEnclosures(publicAppcastText, channel);
+  for (const enclosure of enclosures) {
+    if (enclosure.url === publication.artifact.url) continue;
+    const response = await fetchPublicResponse(fetchPublic, enclosure.url, {
+      label: `Public Sparkle enclosure ${enclosure.url}`,
+      method: "HEAD",
+    });
+    validatePublicResponse(response, {
+      cacheControl: IMMUTABLE_CACHE_CONTROL,
+      label: `Public Sparkle enclosure ${enclosure.url}`,
+    });
+    const declared = declaredResponseLength(response, "Public Sparkle enclosure", {
+      required: true,
+    });
+    if (declared !== enclosure.length) {
+      fail(
+        `Public Sparkle enclosure ${enclosure.url} Content-Length ${declared} does not match appcast ${enclosure.length}`,
+        "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+      );
+    }
+  }
+
+  const publicArtifactResponse = await fetchPublicResponse(
+    fetchPublic,
+    publication.artifact.url,
+    { label: "Public Sparkle DMG" },
+  );
+  validatePublicResponse(publicArtifactResponse, {
+    cacheControl: IMMUTABLE_CACHE_CONTROL,
+    contentType: "application/x-apple-diskimage",
+    label: "Public Sparkle DMG",
+  });
+  await readResponseDigest(publicArtifactResponse, {
+    expectedBytes: dmg.size,
+    expectedSha256: publication.artifact.sha256,
+    label: "Public Sparkle DMG",
+  });
+}
+
+function normalizeBucket(bucket, channel) {
+  if (bucket !== channel.sparkle.r2Bucket) {
+    fail(
+      `--bucket must explicitly name the approved bucket ${channel.sparkle.r2Bucket} for channel ${channel.name}`,
+      "SPARKLE_UPDATE_BUCKET_MISMATCH",
+    );
   }
   return bucket;
 }
@@ -257,11 +1089,18 @@ function defaultRunWrangler(arguments_) {
   });
 }
 
-async function remoteObjectExists({ bucket, key, runWrangler, temporaryRoot }) {
+async function readRemoteObject({
+  bucket,
+  key,
+  maximumBytes = MAX_DMG_BYTES,
+  runWrangler,
+  temporaryRoot,
+}) {
   const destination = join(
     temporaryRoot,
-    createHash("sha256").update(key).digest("hex"),
+    createHash("sha256").update(`read:${key}`).digest("hex"),
   );
+  await rm(destination, { force: true });
   const result = await runWrangler([
     "r2",
     "object",
@@ -271,9 +1110,166 @@ async function remoteObjectExists({ bucket, key, runWrangler, temporaryRoot }) {
     destination,
     "--remote",
   ]);
-  if (result?.status === 0) return true;
-  if (resultWasNotFound(result ?? {})) return false;
-  fail("Unable to establish the current R2 object state", "SPARKLE_UPDATE_WRANGLER_FAILED");
+  if (result?.status !== 0) {
+    if (resultWasNotFound(result ?? {})) return null;
+    fail(
+      `Unable to read R2 object ${key}`,
+      "SPARKLE_UPDATE_WRANGLER_FAILED",
+    );
+  }
+  let metadata;
+  try {
+    metadata = await lstat(destination);
+  } catch (error) {
+    fail(
+      `R2 object ${key} could not be read: ${error.message}`,
+      "SPARKLE_UPDATE_R2_OBJECT_INVALID",
+    );
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()
+      || metadata.size < 1 || metadata.size > maximumBytes) {
+    fail(
+      `R2 object ${key} was not returned as a safe regular file`,
+      "SPARKLE_UPDATE_R2_OBJECT_INVALID",
+    );
+  }
+  let resolvedDestination;
+  try {
+    resolvedDestination = await realpath(destination);
+  } catch (error) {
+    fail(
+      `R2 object ${key} could not be resolved: ${error.message}`,
+      "SPARKLE_UPDATE_R2_OBJECT_INVALID",
+    );
+  }
+  if (resolvedDestination !== destination) {
+    fail(
+      `R2 object ${key} was returned outside the probe directory`,
+      "SPARKLE_UPDATE_R2_OBJECT_INVALID",
+    );
+  }
+  let contents;
+  try {
+    contents = await readFileWithSha256(destination);
+  } catch (error) {
+    fail(
+      `R2 object ${key} could not be read: ${error.message}`,
+      "SPARKLE_UPDATE_R2_OBJECT_INVALID",
+    );
+  }
+  if (contents.bytes.length !== metadata.size) {
+    fail(
+      `R2 object ${key} changed while it was being read`,
+      "SPARKLE_UPDATE_R2_OBJECT_INVALID",
+    );
+  }
+  return Object.freeze({
+    bytes: metadata.size,
+    content: contents.bytes,
+    path: destination,
+    sha256: contents.sha256,
+  });
+}
+
+function verifyRetainedImmutableObject({
+  candidate,
+  object,
+  remote,
+}) {
+  if (remote.bytes !== candidate.bytes.length
+      || remote.sha256 !== candidate.sha256
+      || !remote.content.equals(candidate.bytes)) {
+    fail(
+      `Existing immutable R2 object ${object.key} does not match the validated candidate bytes, SHA-256, and size`,
+      "SPARKLE_UPDATE_IMMUTABLE_OBJECT_MISMATCH",
+    );
+  }
+  return remote;
+}
+
+function assertAppcastStateUnchanged(expected, observed, key) {
+  const unchanged = expected === null
+    ? observed === null
+    : observed !== null
+      && observed.bytes === expected.bytes
+      && observed.sha256 === expected.sha256
+      && observed.content.equals(expected.content);
+  if (!unchanged) {
+    fail(
+      `R2 appcast ${key} changed during publication preflight`,
+      "SPARKLE_UPDATE_APPCAST_STATE_CHANGED",
+    );
+  }
+}
+
+function highestAppcastVersion(text, channel) {
+  const enclosures = appcastEnclosures(text, channel);
+  return enclosures.reduce(
+    (highest, enclosure) => highest === null
+      || compareBundleVersions(enclosure.version, highest) > 0
+      ? enclosure.version
+      : highest,
+    null,
+  );
+}
+
+async function validatePublishedEnclosureObjects({
+  appcastUpdate,
+  bucket,
+  dmg,
+  publishedObjectKeys = new Set(),
+  runWrangler,
+  sparklePublicKey,
+  temporaryRoot,
+}) {
+  const remoteObjects = new Map();
+  for (const enclosure of appcastUpdate.enclosures) {
+    if (enclosure.url === appcastUpdate.artifactURL
+        || publishedObjectKeys.has(enclosure.objectKey)) {
+      continue;
+    }
+    if (!remoteObjects.has(enclosure.objectKey)) {
+      remoteObjects.set(
+        enclosure.objectKey,
+        await readRemoteObject({
+          bucket,
+          key: enclosure.objectKey,
+          runWrangler,
+          temporaryRoot,
+        }),
+      );
+    }
+    const remote = remoteObjects.get(enclosure.objectKey);
+    if (!remote) {
+      fail(
+        `Appcast enclosure object is unavailable: ${enclosure.url}`,
+        "SPARKLE_UPDATE_APPCAST_OBJECT_MISSING",
+      );
+    }
+    if (remote.bytes !== enclosure.length) {
+      fail(
+        `Appcast enclosure byte length does not match R2 object: ${enclosure.url} (advertised ${enclosure.length}, received ${remote.bytes})`,
+        "SPARKLE_UPDATE_APPCAST_OBJECT_LENGTH_MISMATCH",
+      );
+    }
+    if (remote.sha256 !== enclosure.objectSha256) {
+      fail(
+        `Appcast enclosure SHA-256 does not match R2 object: ${enclosure.url} (expected ${enclosure.objectSha256}, received ${remote.sha256})`,
+        "SPARKLE_UPDATE_APPCAST_OBJECT_CHECKSUM_MISMATCH",
+      );
+    }
+    verifyEnclosureSignature({
+      bytes: remote.content,
+      enclosure,
+      sparklePublicKey,
+    });
+  }
+  if (appcastUpdate.enclosure.length !== dmg.size) {
+    fail(
+      "Current appcast enclosure length does not match the candidate DMG",
+      "SPARKLE_UPDATE_APPCAST_LENGTH_MISMATCH",
+    );
+  }
 }
 
 async function putObject({ bucket, key, path, contentType, cacheControl, runWrangler }) {
@@ -296,26 +1292,351 @@ async function putObject({ bucket, key, path, contentType, cacheControl, runWran
 }
 
 /**
+ * The installed Wrangler R2 CLI only exposes an unconditional PUT. The
+ * publisher therefore accepts a guard only through this owner-only seam or
+ * the explicit owner-provisioned HTTPS endpoint below; the owner
+ * implementation must perform the final mutation with a real remote
+ * conditional primitive. A read followed by an ordinary PUT does not satisfy
+ * this contract.
+ */
+function normalizeAppcastAtomicGuard(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "object"
+      || value.schemaVersion !== APPCAST_ATOMIC_GUARD_SCHEMA
+      || value.ownerOnly !== true
+      || typeof value.compareAndSwap !== "function") {
+    fail(
+      "The owner-provisioned appcast atomic guard is invalid",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_INVALID",
+    );
+  }
+  return value;
+}
+
+function appcastAtomicExpectation(currentAppcast) {
+  if (currentAppcast === null) return null;
+  return {
+    bytes: currentAppcast.bytes,
+    content: Buffer.from(currentAppcast.content),
+    sha256: currentAppcast.sha256,
+  };
+}
+
+function remoteAppcastAtomicExpectation(currentAppcast) {
+  if (currentAppcast === null) {
+    return { state: "empty", bytes: 0, sha256: null, etag: null };
+  }
+  return {
+    state: "present",
+    bytes: currentAppcast.bytes,
+    sha256: currentAppcast.sha256,
+    // Wrangler's object-get command intentionally exposes bytes only. The
+    // guard re-reads this state and obtains the R2 etag immediately before its
+    // conditional put; a non-null value is supported when an owner seam has
+    // one, but the R2 CAS remains the authoritative race check.
+    etag: currentAppcast.etag ?? null,
+  };
+}
+
+function canonicalRemoteGuardRequest(timestamp, nonce, bodySha256) {
+  return `${APPCAST_ATOMIC_GUARD_SCHEMA}\0POST\0${APPCAST_ATOMIC_GUARD_ROUTE}`
+    + `\0${timestamp}\0${nonce}\0${bodySha256}`;
+}
+
+async function readAtomicGuardResponse(response) {
+  let body;
+  try {
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (bytes.length > 16 * 1024) {
+      fail(
+        "The appcast atomic guard returned an oversized response",
+        "SPARKLE_UPDATE_ATOMIC_GUARD_REMOTE_FAILED",
+      );
+    }
+    body = JSON.parse(bytes.toString("utf8"));
+  } catch (error) {
+    if (error?.code === "SPARKLE_UPDATE_ATOMIC_GUARD_REMOTE_FAILED") throw error;
+    fail(
+      "The appcast atomic guard returned an invalid response",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_REMOTE_FAILED",
+    );
+  }
+  if (body?.status === "conflict") return { status: "conflict" };
+  if (body?.status === "committed") return { status: "committed" };
+  fail(
+    "The appcast atomic guard did not return a commit result",
+    "SPARKLE_UPDATE_ATOMIC_GUARD_REMOTE_FAILED",
+  );
+}
+
+function createRemoteAppcastAtomicGuard({ channel, endpoint, token, fetchGuard }) {
+  return {
+    schemaVersion: APPCAST_ATOMIC_GUARD_SCHEMA,
+    ownerOnly: true,
+    compareAndSwap: async ({
+      bucket,
+      cacheControl,
+      content,
+      contentType,
+      expectedCurrent,
+      key,
+    }) => {
+      const candidateBytes = Buffer.from(content);
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      const nonce = randomBytes(24).toString("base64url");
+      const body = JSON.stringify({
+        schemaVersion: APPCAST_ATOMIC_GUARD_SCHEMA,
+        channel: channel.name,
+        bucket,
+        key,
+        contentType,
+        cacheControl,
+        expectedCurrent: remoteAppcastAtomicExpectation(expectedCurrent),
+        candidate: {
+          bytes: candidateBytes.length,
+          sha256: createHash("sha256").update(candidateBytes).digest("hex"),
+          base64: candidateBytes.toString("base64url"),
+        },
+      });
+      const bodySha256 = createHash("sha256").update(body).digest("hex");
+      const signature = createHmac("sha256", token)
+        .update(canonicalRemoteGuardRequest(timestamp, nonce, bodySha256))
+        .digest("base64url");
+      let response;
+      try {
+        response = await fetchGuard(endpoint, {
+          method: "POST",
+          redirect: "error",
+          headers: {
+            "content-type": "application/json",
+            "x-usage-monitor-release-timestamp": timestamp,
+            "x-usage-monitor-release-nonce": nonce,
+            "x-usage-monitor-release-signature": signature,
+          },
+          body,
+        });
+      } catch {
+        fail(
+          "The appcast atomic guard request failed",
+          "SPARKLE_UPDATE_ATOMIC_GUARD_REMOTE_FAILED",
+        );
+      }
+      if (response.status === 409) return readAtomicGuardResponse(response);
+      if (!response.ok) {
+        fail(
+          "The appcast atomic guard rejected the publication request",
+          "SPARKLE_UPDATE_ATOMIC_GUARD_REMOTE_FAILED",
+        );
+      }
+      return readAtomicGuardResponse(response);
+    },
+  };
+}
+
+async function putAppcastWithAtomicGuard({
+  atomicAppcastGuard,
+  bucket,
+  content,
+  expectedCurrent,
+  key,
+  path,
+  contentType,
+  cacheControl,
+}) {
+  let result;
+  try {
+    result = await atomicAppcastGuard.compareAndSwap({
+      bucket,
+      cacheControl,
+      contentType,
+      content: Buffer.from(content),
+      expectedCurrent: appcastAtomicExpectation(expectedCurrent),
+      key,
+      path,
+      schemaVersion: APPCAST_ATOMIC_GUARD_SCHEMA,
+    });
+  } catch (error) {
+    if (error?.code === "SPARKLE_UPDATE_WRANGLER_FAILED"
+        || error?.code === "SPARKLE_UPDATE_ATOMIC_GUARD_REMOTE_FAILED") {
+      throw error;
+    }
+    fail(
+      "The owner-provisioned appcast atomic guard failed",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_FAILED",
+    );
+  }
+  if (result?.status === "conflict") {
+    fail(
+      "The live appcast changed before the owner-provisioned atomic mutation",
+      "SPARKLE_UPDATE_APPCAST_ATOMIC_CONFLICT",
+    );
+  }
+  if (result?.status !== "committed") {
+    fail(
+      "The owner-provisioned appcast atomic guard did not commit",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_FAILED",
+    );
+  }
+}
+
+/**
+ * Every delta enclosure the candidate appcast advertises for the candidate
+ * bundle version must exist locally beside the DMG (the generator writes
+ * them there), match the advertised content-addressed SHA-256 and length,
+ * and carry a Sparkle Ed25519 signature that verifies with the same public
+ * key as the full DMG. Delta objects for other versions are historical feed
+ * entries and are validated against R2 instead.
+ */
+async function readCandidateDeltaArtifacts({
+  appcastUpdate,
+  channel,
+  dmgPath,
+  manifest,
+  sparklePublicKey,
+}) {
+  const candidateDeltas = appcastUpdate.enclosures.filter(
+    (enclosure) => enclosure.deltaFrom !== undefined
+      && enclosure.version === manifest.bundleVersion,
+  );
+  if (candidateDeltas.length === 0) return Object.freeze([]);
+  const seenSources = new Set();
+  const seenKeys = new Set();
+  const artifacts = [];
+  for (const enclosure of candidateDeltas) {
+    if (seenSources.has(enclosure.deltaFrom)
+        || seenKeys.has(enclosure.objectKey)) {
+      fail(
+        "Appcast candidate delta enclosures must have distinct source versions and object keys",
+        "SPARKLE_UPDATE_APPCAST_DELTA_INVALID",
+      );
+    }
+    seenSources.add(enclosure.deltaFrom);
+    seenKeys.add(enclosure.objectKey);
+    const parsed = parsePublishedObjectKey(enclosure.url, channel);
+    const localPath = join(dirname(resolve(dmgPath)), parsed.fileName);
+    const exists = await lstat(localPath).catch(() => null);
+    if (exists === null) {
+      fail(
+        `Appcast advertises delta ${parsed.fileName} for version ${manifest.bundleVersion}, but the file is not beside the DMG; regenerate the appcast (or a full-only appcast) before publishing`,
+        "SPARKLE_UPDATE_DELTA_ARTIFACT_MISSING",
+      );
+    }
+    const delta = await readRegularInput(localPath, {
+      label: `Delta artifact ${parsed.fileName}`,
+      maximumBytes: MAX_DMG_BYTES,
+    });
+    const deltaWithSha256 = await readFileWithSha256(delta.path);
+    if (deltaWithSha256.bytes.length !== delta.size) {
+      fail(`Delta artifact ${parsed.fileName} changed while it was being read`);
+    }
+    if (delta.size !== enclosure.length
+        || deltaWithSha256.sha256 !== enclosure.objectSha256) {
+      fail(
+        `Delta artifact ${parsed.fileName} does not match its appcast enclosure length and content-addressed SHA-256`,
+        "SPARKLE_UPDATE_DELTA_ARTIFACT_INVALID",
+      );
+    }
+    verifyEnclosureSignature({
+      bytes: deltaWithSha256.bytes,
+      enclosure,
+      sparklePublicKey,
+    });
+    artifacts.push(Object.freeze({
+      bytes: delta.size,
+      cacheControl: IMMUTABLE_CACHE_CONTROL,
+      contentType: DELTA_CONTENT_TYPE,
+      contents: deltaWithSha256,
+      deltaFrom: enclosure.deltaFrom,
+      key: enclosure.objectKey,
+      path: delta.path,
+      sha256: deltaWithSha256.sha256,
+      url: enclosure.url,
+    }));
+  }
+  return Object.freeze(artifacts);
+}
+
+/**
  * Validate and, only when publish is explicitly true, publish one complete
- * Sparkle update. The publisher deliberately accepts neither Sparkle signing
- * keys nor Cloudflare credentials; the operator performs signing separately
- * and Wrangler uses its own existing local authentication.
+ * Sparkle update. The publisher deliberately accepts no Sparkle private signing
+ * key nor Cloudflare credentials; the operator performs signing separately and
+ * supplies only the public verification key. Wrangler uses its own existing
+ * local authentication.
  */
 export async function publishSparkleUpdate({
+  atomicAppcastGuard = null,
+  atomicAppcastGuardEndpoint = null,
+  atomicAppcastGuardTokenEnv = null,
   appcastPath,
+  // The reviewed canonical policy is the only production value; this seam is
+  // injectable (like runWrangler and validateDMG) so specs can exercise the
+  // delta-enabled appcast shape ahead of the reviewed config/guard change.
+  // It is deliberately not reachable from the CLI argument parser.
+  appcastPolicy = CANONICAL_STABLE_APPCAST_POLICY,
   bucket,
+  channel,
   dmgPath,
   publish = false,
   releaseManifestPath,
+  previousStableManifestPath = null,
   replaceAppcast = false,
+  sparklePublicEdKey,
+  stableBootstrap = false,
   runWrangler = defaultRunWrangler,
+  fetchPublic = defaultPublicFetch,
+  fetchGuard = defaultPublicFetch,
   validateDMG = validateMacOSDMG,
 } = {}) {
   if (typeof publish !== "boolean" || typeof replaceAppcast !== "boolean"
-      || typeof runWrangler !== "function" || typeof validateDMG !== "function") {
+      || typeof stableBootstrap !== "boolean"
+      || (previousStableManifestPath !== null
+        && typeof previousStableManifestPath !== "string")
+      || typeof runWrangler !== "function"
+      || typeof fetchPublic !== "function"
+      || typeof fetchGuard !== "function"
+      || typeof validateDMG !== "function"
+      || !appcastPolicy || typeof appcastPolicy !== "object"
+      || appcastPolicy.schemaVersion
+        !== CANONICAL_STABLE_APPCAST_POLICY.schemaVersion) {
     fail("Publisher options are invalid");
   }
-  normalizeBucket(bucket);
+  const releaseChannel = resolveReleaseChannel(channel);
+  normalizeBucket(bucket, releaseChannel);
+  const normalizedAppcastAtomicGuardEndpoint =
+    normalizeAppcastAtomicGuardEndpoint(
+      atomicAppcastGuardEndpoint,
+      releaseChannel,
+    );
+  const normalizedAppcastAtomicGuardTokenEnv =
+    normalizeAppcastAtomicGuardTokenEnv(
+      atomicAppcastGuardTokenEnv,
+  );
+  const injectedAppcastAtomicGuard = normalizeAppcastAtomicGuard(
+    atomicAppcastGuard,
+  );
+  if (injectedAppcastAtomicGuard !== null
+      && (normalizedAppcastAtomicGuardEndpoint !== null
+        || normalizedAppcastAtomicGuardTokenEnv !== null)) {
+    fail(
+      "An injected appcast atomic guard cannot be combined with remote guard options",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_OPTIONS_CONFLICT",
+    );
+  }
+  if ((normalizedAppcastAtomicGuardEndpoint === null)
+      !== (normalizedAppcastAtomicGuardTokenEnv === null)) {
+    fail(
+      "--atomic-appcast-guard-endpoint and --atomic-appcast-guard-token-env are required together",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_OPTIONS_REQUIRED",
+    );
+  }
+  const normalizedAppcastAtomicGuardToken = publish
+    && injectedAppcastAtomicGuard === null
+    && normalizedAppcastAtomicGuardEndpoint !== null
+    ? readAppcastAtomicGuardToken(normalizedAppcastAtomicGuardTokenEnv)
+    : null;
+  const normalizedSparklePublicKey = normalizeSparklePublicKey(
+    sparklePublicEdKey,
+  );
   const [dmg, appcast, releaseManifest] = await Promise.all([
     readRegularInput(dmgPath, { label: "--dmg", maximumBytes: MAX_DMG_BYTES }),
     readRegularInput(appcastPath, {
@@ -327,33 +1648,81 @@ export async function publishSparkleUpdate({
       maximumBytes: MAX_MANIFEST_BYTES,
     }),
   ]);
+  const releaseManifestWithSha256 = await readFileWithSha256(releaseManifest.path);
+  if (releaseManifestWithSha256.bytes.length !== releaseManifest.size) {
+    fail("Release manifest changed while it was being read");
+  }
   const manifest = validateReleaseManifest(
-    readManifest(await readFile(releaseManifest.path, "utf8")),
+    readManifest(releaseManifestWithSha256.bytes.toString("utf8")),
     dmg,
+    normalizedSparklePublicKey,
+    releaseChannel,
   );
-  await validateDMG(dmg.path, { production: true });
-  const observedDMGSha256 = await sha256File(dmg.path);
+  await validateDMG(dmg.path, {
+    expectedBundleIdentifier: manifest.manifest.application.bundleIdentifier,
+    expectedBundleVersion: manifest.bundleVersion,
+    expectedShortVersion: manifest.manifest.application.shortVersion,
+    channel: releaseChannel.name,
+    production: true,
+  });
+  const dmgWithSha256 = await readFileWithSha256(dmg.path);
+  if (dmgWithSha256.bytes.length !== dmg.size) {
+    fail("DMG changed while it was being validated");
+  }
+  const observedDMGSha256 = dmgWithSha256.sha256;
   if (observedDMGSha256 !== manifest.artifactSha256) {
     fail("DMG does not match the release manifest SHA-256");
   }
   const objectKeys = immutableObjectKeys({
     bundleVersion: manifest.bundleVersion,
+    channel: releaseChannel,
     fileName: basename(dmg.path),
     sha256: observedDMGSha256,
   });
+  const appcastBytes = await readFile(appcast.path);
+  if (appcastBytes.length !== appcast.size) {
+    fail("Appcast changed while it was being read");
+  }
   const appcastUpdate = validateAppcast(
-    await readFile(appcast.path, "utf8"),
-    { dmg, manifest, objectKeys },
+    appcastBytes.toString("utf8"),
+    {
+      appcastPolicy,
+      channel: releaseChannel,
+      dmg,
+      dmgBytes: dmgWithSha256.bytes,
+      manifest,
+      objectKeys,
+      sparklePublicKey: normalizedSparklePublicKey,
+    },
   );
+  const candidateDeltaArtifacts = await readCandidateDeltaArtifacts({
+    appcastUpdate,
+    channel: releaseChannel,
+    dmgPath: dmg.path,
+    manifest,
+    sparklePublicKey: normalizedSparklePublicKey,
+  });
+  const previousStableManifest = previousStableManifestPath === null
+    ? null
+    : await readStableReleaseManifest(previousStableManifestPath);
+  assertStableSparkleKeyContinuity({
+    candidateBundleVersion: manifest.bundleVersion,
+    candidatePublicEdKeySha256: normalizedSparklePublicKey.sha256,
+    channel: releaseChannel.name,
+    previousManifest: previousStableManifest,
+    stableBootstrap,
+  });
   const publication = Object.freeze({
     appcast: Object.freeze({
       cacheControl: APPCAST_CACHE_CONTROL,
       contentType: "application/xml; charset=utf-8",
-      key: "appcast.xml",
+      key: releaseChannel.sparkle.appcastObjectKey,
       path: appcast.path,
-      url: CANONICAL_APPCAST_URL,
+      url: releaseChannel.sparkle.appcastURL,
     }),
+    channel: releaseChannel.name,
     artifact: Object.freeze({
+      bytes: dmg.size,
       cacheControl: IMMUTABLE_CACHE_CONTROL,
       contentType: "application/x-apple-diskimage",
       key: objectKeys.artifact,
@@ -362,69 +1731,247 @@ export async function publishSparkleUpdate({
       url: appcastUpdate.artifactURL,
     }),
     bucket,
+    deltas: Object.freeze(candidateDeltaArtifacts.map(
+      (delta) => Object.freeze({
+        bytes: delta.bytes,
+        cacheControl: delta.cacheControl,
+        contentType: delta.contentType,
+        deltaFrom: delta.deltaFrom,
+        key: delta.key,
+        path: delta.path,
+        sha256: delta.sha256,
+        url: delta.url,
+      }),
+    )),
     manifest: Object.freeze({
+      bytes: releaseManifestWithSha256.bytes.length,
       cacheControl: IMMUTABLE_CACHE_CONTROL,
       contentType: "application/json; charset=utf-8",
       key: objectKeys.manifest,
       path: releaseManifest.path,
+      sha256: releaseManifestWithSha256.sha256,
     }),
     published: publish,
+    resumed: false,
+    status: publish ? "pending" : PUBLICATION_STATUS_VALIDATED,
+    verified: false,
   });
   if (!publish) return publication;
+  const normalizedAppcastAtomicGuard = injectedAppcastAtomicGuard
+    ?? (normalizedAppcastAtomicGuardEndpoint === null
+      ? null
+      : createRemoteAppcastAtomicGuard({
+        channel: releaseChannel,
+        endpoint: normalizedAppcastAtomicGuardEndpoint,
+        fetchGuard,
+        token: normalizedAppcastAtomicGuardToken,
+      }));
+  if (normalizedAppcastAtomicGuard === null) {
+    fail(
+      "Publishing requires an owner-provisioned atomic appcast guard; Wrangler's ordinary R2 PUT is not concurrency safe",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_REQUIRED",
+    );
+  }
 
+  let resumedPublication = false;
   const temporaryRoot = await mkdtemp(
     join(await realpath(tmpdir()), "tibotattle-r2-update-probe-"),
   );
   try {
-    for (const object of [publication.artifact, publication.manifest]) {
-      if (await remoteObjectExists({
+    const immutableObjects = [
+      {
+        candidate: dmgWithSha256,
+        maximumBytes: MAX_DMG_BYTES,
+        object: publication.artifact,
+      },
+      {
+        candidate: releaseManifestWithSha256,
+        maximumBytes: MAX_MANIFEST_BYTES,
+        object: publication.manifest,
+      },
+      ...candidateDeltaArtifacts.map((delta, index) => ({
+        candidate: delta.contents,
+        maximumBytes: MAX_DMG_BYTES,
+        object: publication.deltas[index],
+      })),
+    ];
+    for (const immutableObject of immutableObjects) {
+      const remote = await readRemoteObject({
         bucket,
-        key: object.key,
+        key: immutableObject.object.key,
+        maximumBytes: immutableObject.maximumBytes,
         runWrangler,
         temporaryRoot,
-      })) {
-        fail("Refusing to overwrite an immutable R2 update object", "SPARKLE_UPDATE_OBJECT_EXISTS");
+      });
+      if (remote !== null) {
+        verifyRetainedImmutableObject({
+          candidate: immutableObject.candidate,
+          object: immutableObject.object,
+          remote,
+        });
       }
+      immutableObject.remote = remote;
     }
-    const appcastExists = await remoteObjectExists({
+    const currentAppcast = await readRemoteObject({
       bucket,
       key: publication.appcast.key,
+      maximumBytes: MAX_APPCAST_BYTES,
       runWrangler,
       temporaryRoot,
     });
-    if (appcastExists && !replaceAppcast) {
+    resumedPublication = assertExactCandidateAppcast({
+      appcastBytes,
+      appcastPolicy,
+      appcastUpdate,
+      currentAppcast,
+      channel: releaseChannel,
+      dmg,
+      dmgBytes: dmgWithSha256.bytes,
+      manifest,
+      objectKeys,
+      sparklePublicKey: normalizedSparklePublicKey,
+    });
+    if (resumedPublication
+        && immutableObjects.some(({ remote }) => remote === null)) {
+      fail(
+        "Cannot resume a publication while an immutable candidate object is missing",
+        "SPARKLE_UPDATE_IMMUTABLE_OBJECT_MISSING",
+      );
+    }
+    if (currentAppcast !== null && !resumedPublication && !replaceAppcast) {
       fail("Refusing to replace appcast.xml without --replace-appcast", "SPARKLE_UPDATE_APPCAST_REPLACE_REQUIRED");
     }
-    for (const object of [publication.artifact, publication.manifest, publication.appcast]) {
-      await putObject({
+    if (currentAppcast !== null && !resumedPublication) {
+      const currentEnclosures = appcastEnclosures(
+        currentAppcast.content.toString("utf8"),
+        releaseChannel,
+      );
+      const currentVersion = highestAppcastVersion(
+        currentAppcast.content.toString("utf8"),
+        releaseChannel,
+      );
+      if (currentVersion === null
+          || compareBundleVersions(manifest.bundleVersion, currentVersion) <= 0) {
+        if (currentVersion !== null
+            && compareBundleVersions(manifest.bundleVersion, currentVersion) === 0
+            && currentEnclosures.filter(
+              (enclosure) => enclosure.version === manifest.bundleVersion
+                && enclosure.deltaFrom === undefined,
+            ).length !== 1) {
+          fail(
+            "Live appcast has an ambiguous candidate-version publication state",
+            "SPARKLE_UPDATE_APPCAST_AMBIGUOUS",
+          );
+        }
+        fail(
+          `Candidate bundle version ${manifest.bundleVersion} is not newer than the live appcast version ${currentVersion ?? "unknown"}`,
+          "SPARKLE_UPDATE_VERSION_NOT_NEWER",
+        );
+      }
+    }
+    if (stableBootstrap && currentAppcast !== null) {
+      fail(
+        "Stable bootstrap requires an empty live appcast; retain the prior stable manifest for every later release",
+        "SPARKLE_UPDATE_STABLE_BOOTSTRAP_NOT_FIRST_RELEASE",
+      );
+    }
+    await validatePublishedEnclosureObjects({
+      appcastUpdate,
+      bucket,
+      dmg,
+      publishedObjectKeys: new Set(
+        publication.deltas.map((delta) => delta.key),
+      ),
+      runWrangler,
+      sparklePublicKey: normalizedSparklePublicKey,
+      temporaryRoot,
+    });
+    if (!resumedPublication) {
+      for (const immutableObject of immutableObjects) {
+        if (immutableObject.remote !== null) continue;
+        await putObject({
+          bucket,
+          key: immutableObject.object.key,
+          path: immutableObject.object.path,
+          contentType: immutableObject.object.contentType,
+          cacheControl: immutableObject.object.cacheControl,
+          runWrangler,
+        });
+      }
+      const appcastBeforeWrite = await readRemoteObject({
         bucket,
-        key: object.key,
-        path: object.path,
-        contentType: object.contentType,
-        cacheControl: object.cacheControl,
+        key: publication.appcast.key,
+        maximumBytes: MAX_APPCAST_BYTES,
         runWrangler,
+        temporaryRoot,
+      });
+      assertAppcastStateUnchanged(
+        currentAppcast,
+        appcastBeforeWrite,
+        publication.appcast.key,
+      );
+      await putAppcastWithAtomicGuard({
+        atomicAppcastGuard: normalizedAppcastAtomicGuard,
+        bucket,
+        cacheControl: publication.appcast.cacheControl,
+        contentType: publication.appcast.contentType,
+        content: appcastBytes,
+        expectedCurrent: currentAppcast,
+        key: publication.appcast.key,
+        path: publication.appcast.path,
       });
     }
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
-  return publication;
+  await verifyPublicPublication({
+    appcastBytes,
+    appcastPolicy,
+    appcastUpdate,
+    channel: releaseChannel,
+    dmg,
+    dmgBytes: dmgWithSha256.bytes,
+    fetchPublic,
+    manifest,
+    objectKeys,
+    publication,
+    sparklePublicKey: normalizedSparklePublicKey,
+  });
+  return Object.freeze({
+    ...publication,
+    resumed: resumedPublication,
+    status: resumedPublication
+      ? PUBLICATION_STATUS_RESUMED_VERIFIED
+      : PUBLICATION_STATUS_PUBLISHED,
+    verified: true,
+  });
 }
 
 export function parseSparkleUpdatePublisherArguments(argv) {
   const options = {
     appcastPath: null,
+    atomicAppcastGuardEndpoint: null,
+    atomicAppcastGuardTokenEnv: null,
     bucket: null,
+    channel: null,
     dmgPath: null,
     publish: false,
     releaseManifestPath: null,
+    previousStableManifestPath: null,
     replaceAppcast: false,
+    sparklePublicEdKey: null,
+    stableBootstrap: false,
   };
   const flags = new Map([
     ["--appcast", "appcastPath"],
+    ["--atomic-appcast-guard-endpoint", "atomicAppcastGuardEndpoint"],
+    ["--atomic-appcast-guard-token-env", "atomicAppcastGuardTokenEnv"],
     ["--bucket", "bucket"],
+    ["--channel", "channel"],
     ["--dmg", "dmgPath"],
     ["--release-manifest", "releaseManifestPath"],
+    ["--previous-stable-manifest", "previousStableManifestPath"],
+    ["--sparkle-public-ed-key", "sparklePublicEdKey"],
   ]);
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -438,11 +1985,47 @@ export function parseSparkleUpdatePublisherArguments(argv) {
       options.publish = true;
     } else if (argument === "--replace-appcast" && !options.replaceAppcast) {
       options.replaceAppcast = true;
+    } else if (argument === "--stable-bootstrap" && !options.stableBootstrap) {
+      options.stableBootstrap = true;
     } else {
       fail(`Unknown or repeated argument: ${argument}`);
     }
   }
-  for (const [flag, key] of flags) requiredOption(options[key], flag);
+  for (const [flag, key] of [
+    ["--appcast", "appcastPath"],
+    ["--bucket", "bucket"],
+    ["--channel", "channel"],
+    ["--dmg", "dmgPath"],
+    ["--release-manifest", "releaseManifestPath"],
+    ["--sparkle-public-ed-key", "sparklePublicEdKey"],
+  ]) requiredOption(options[key], flag);
+  const releaseChannel = resolveReleaseChannel(options.channel);
+  normalizeAppcastAtomicGuardEndpoint(
+    options.atomicAppcastGuardEndpoint,
+    releaseChannel,
+  );
+  normalizeAppcastAtomicGuardTokenEnv(options.atomicAppcastGuardTokenEnv);
+  if ((options.atomicAppcastGuardEndpoint === null)
+      !== (options.atomicAppcastGuardTokenEnv === null)) {
+    fail(
+      "--atomic-appcast-guard-endpoint and --atomic-appcast-guard-token-env are required together",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_OPTIONS_REQUIRED",
+    );
+  }
+  if (options.channel !== "stable"
+      && (options.previousStableManifestPath !== null
+        || options.stableBootstrap)) {
+    fail(
+      "Stable continuity options are only valid for the stable channel",
+      "MACOS_STABLE_CONTINUITY_CHANNEL_INVALID",
+    );
+  }
+  if (options.previousStableManifestPath !== null && options.stableBootstrap) {
+    fail(
+      "--stable-bootstrap cannot be combined with --previous-stable-manifest",
+      "MACOS_STABLE_BOOTSTRAP_INVALID",
+    );
+  }
   if (options.replaceAppcast && !options.publish) {
     fail("--replace-appcast requires --publish");
   }
@@ -456,9 +2039,16 @@ export async function main(argv) {
   console.log(`Validated signed DMG SHA-256: ${publication.artifact.sha256}`);
   console.log(`R2 artifact: ${publication.bucket}/${publication.artifact.key}`);
   console.log(`R2 manifest: ${publication.bucket}/${publication.manifest.key}`);
+  for (const delta of publication.deltas) {
+    console.log(
+      `R2 delta (from ${delta.deltaFrom}): ${publication.bucket}/${delta.key}`,
+    );
+  }
   console.log(`R2 appcast: ${publication.appcast.url}`);
   if (!publication.published) {
     console.log("Validation only; re-run with --publish to invoke Wrangler.");
+  } else {
+    console.log("Public read-back: canonical appcast and DMG verified.");
   }
 }
 

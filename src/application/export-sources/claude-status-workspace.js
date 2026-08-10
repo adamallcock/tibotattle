@@ -4,6 +4,7 @@ import {
   normalizeSupplementalSourcePlan,
   stableJson,
 } from "../../export/index.js";
+import { safeCount, validSha256 } from "./source-validation.js";
 
 export function createClaudeStatusWorkspaceContext(configuration) {
 const {
@@ -28,7 +29,6 @@ const CLAUDE_STATUS_WORKSPACE_SOURCE_VERSION = "claude-status-workspace-source-v
 const CLAUDE_STATUS_WORKSPACE_CURSOR_VERSION = "claude-status-workspace-cursor-v0.1";
 const DEFAULT_CLAUDE_STATUS_RECORDS_PER_BATCH = 500;
 
-const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 const MAXIMUM_BATCH_INPUT_RECORDS = 500;
 const SAFE_CODES = new Set(["configuration", "source_integrity"]);
 
@@ -49,14 +49,6 @@ function exactKeys(value, keys) {
   return value && typeof value === "object" && !Array.isArray(value)
     && Object.keys(value).length === keys.length
     && keys.every((key) => Object.hasOwn(value, key));
-}
-
-function validSha256(value) {
-  return typeof value === "string" && SHA256_PATTERN.test(value);
-}
-
-function safeCount(value) {
-  return Number.isSafeInteger(value) && value >= 0;
 }
 
 function claudeStatusWorkspaceSourceKey(ledgerSourceKey) {

@@ -2,9 +2,26 @@ import {
   assertAdmissionBindings,
   assertAttemptAllowed,
   assertPublicAggregateReadAllowed,
+  assertUploadAuthorizationBindings,
+  assertUploadAuthorizationAllowed,
+  assertUploadIngressRateLimitBindings,
+  assertUploadIngressRequestAllowed,
   configuredEnrollmentMode,
   parseInviteGrant,
 } from "./admission";
+import {
+  acquireUploadIngressLease,
+  assertUploadIngressConfiguration,
+  probeUploadIngressBudget,
+  readUploadIngressStatus,
+  releaseUploadIngressLease,
+  startUploadIngressLeaseHeartbeat,
+  uploadIngressBodyReadPolicy,
+} from "./upload-ingress-admission";
+import {
+  readBoundedRequestBody,
+  type BoundedBodyReadPolicy,
+} from "./bounded-body";
 import {
   assertAccountScopedLocalPreview,
   configuredAccountScopedIngestMode,
@@ -16,6 +33,7 @@ import {
   MAX_PARTICIPANT_PROFILE_HISTORY_ITEMS,
   MAX_REQUEST_BYTES,
   MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT,
+  ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION,
   ONGOING_TELEMETRY_CONSENT_VERSION,
   ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
   QUARANTINE_RETENTION_MILLISECONDS,
@@ -34,6 +52,12 @@ import {
   type AdminAction,
   type CollectionControlReason,
 } from "./admin-operations";
+import { verifyAdminAccessAssertion } from "./admin-access";
+import {
+  adminHostname,
+  adminUiResponse,
+  isAdminSurfacePath,
+} from "./admin-ui";
 import {
   buildCommunityWeeklySnapshot,
   readLatestCommunityWeeklySnapshot,
@@ -50,6 +74,7 @@ import {
   randomSecret,
   sha256Hex,
 } from "./crypto";
+import { parseStoredRecordJson } from "./stored-record";
 import {
   abandonDeviceUploadAuthorization,
   authenticateDevice,
@@ -57,9 +82,12 @@ import {
   claimDeviceUploadAuthorization,
   createDevicePairing,
   createDeviceUploadAuthorization,
+  disconnectAuthenticatedDevice,
   listParticipantDevices,
+  purgeStaleDeviceLifecycleRows,
   recordDeviceUploadReceipt,
   revokeParticipantDevice,
+  type DeviceTransportConsentVersion,
 } from "./device-auth";
 import {
   ApiError,
@@ -78,6 +106,8 @@ import {
   insertContribution,
   listContributions,
   markParticipantDeleting,
+  participantIdentityLinkKeyForDeletion,
+  participantIdentityLinkState,
   reattachParticipantByLinkKey,
   recoverAccess,
   revokeSession,
@@ -88,6 +118,8 @@ import {
   appleAuthorizeUrl,
   appleSignInConfiguration,
   exchangeAppleAuthorizationCode,
+  generateAppleSignInNonce,
+  hashAppleSignInNonce,
 } from "./identity-apple";
 import {
   GOOGLE_SIGNIN_STATE_PATTERN,
@@ -96,7 +128,18 @@ import {
   googleCodeChallenge,
   googleSignInConfiguration,
 } from "./identity-google";
+import { assertPinnedIdentityLinkSecretConfiguration } from "./identity-link-configuration";
 import { identityRequired, verifyHostedIdentity } from "./identity-oidc";
+import {
+  claimPendingAppleSignInHandoff,
+  completeAppleSignInHandoff,
+  deleteExpiredAppleSignInHandoffs,
+  deliverAppleSignInHandoff,
+  discardClaimedAppleSignInHandoff,
+  discardPendingAppleSignInHandoff,
+  insertAppleSignInHandoff,
+  readPendingAppleSignInHandoff,
+} from "./identity-handoff-repository";
 import {
   clearPendingQuarantineObject,
   putTrackedQuarantineObject,
@@ -104,14 +147,27 @@ import {
   reconcilePendingQuarantineObjects,
 } from "./quarantine-reconciliation";
 import {
+  hasIdentityReenrollmentCooldownDigest,
   hasDeletionTombstone,
+  identityReenrollmentCooldownDigest,
+  purgeExpiredDeletionTombstones,
+  purgeExpiredIdentityReenrollmentCooldowns,
+  purgeExpiredPrimaryIdentityReenrollmentCooldowns,
+  recordIdentityReenrollmentCooldownFromDigest,
   recordDeletionTombstone,
+  recordPrimaryIdentityReenrollmentCooldown,
   runBackendLifecycle,
 } from "./retention";
+import {
+  assertSignInStartAdmission,
+  assertSignInStartAdmissionConfiguration,
+  purgeExpiredSignInStartAdmissions,
+} from "./signin-admission";
 import {
   matchWorkerRoute,
   type ApiWorkerRouteId,
 } from "./route-registry";
+import { handleSparkleAppcastGuard } from "./sparkle-appcast-guard";
 import {
   assertCsrf,
   assertSameOrigin,
@@ -146,6 +202,24 @@ import {
   telemetryRecordsForContribution,
 } from "./telemetry-repository";
 
+// Wrangler discovers Durable Object classes through the Worker module's named
+// exports. The class itself owns only opaque short-lived admission leases.
+export { UploadIngressBudget } from "./ingress-budget";
+
+const DEPLOYMENT_SOURCE_COMMIT_PATTERN = /^[a-f0-9]{7,64}$/u;
+
+function configuredDeploymentSourceCommit(env: Env): string | null {
+  const configured = (env as Env & {
+    DEPLOYMENT_SOURCE_COMMIT?: unknown;
+  }).DEPLOYMENT_SOURCE_COMMIT;
+  if (configured === undefined) return null;
+  if (typeof configured !== "string"
+      || !DEPLOYMENT_SOURCE_COMMIT_PATTERN.test(configured)) {
+    throw new ApiError(503, "DEPLOYMENT_SOURCE_COMMIT_INVALID");
+  }
+  return configured;
+}
+
 function telemetryContributionLimitError(
   admission: TelemetryContributionAdmission,
   nowEpoch = Date.now(),
@@ -165,6 +239,35 @@ function telemetryContributionLimitError(
   });
 }
 import {
+  MAX_TELEMETRY_V1_CHUNK_CANONICAL_BYTES,
+  TELEMETRY_V1_ENVELOPE_SCHEMA_VERSION,
+  assertTelemetryV1ConsentCurrent,
+  parseTelemetryV1Chunk,
+  validateTelemetryV1Envelope,
+} from "./telemetry-v1";
+import {
+  MAX_SYNC_MANIFEST_RANGE_DAYS,
+  currentTelemetryV1Chunk,
+  existingTelemetryV1ChunkByEnvelopeDigest,
+  insertTelemetryV1Chunk,
+  telemetryV1AcknowledgedThroughDay,
+  telemetryV1ChunkAdmission,
+  telemetryV1ChunkAdmissionError,
+  telemetryV1ChunkCount,
+  telemetryV1ChunkId,
+  telemetryV1ChunkR2KeyPage,
+  telemetryV1DeviceConsentCurrent,
+  telemetryV1DeviceForUploadAuthorization,
+  telemetryV1SyncManifest,
+  telemetryV1SyncState,
+  type TelemetryV1ChunkRow,
+} from "./telemetry-v1-repository";
+import {
+  readPublishedCommunityDailyAggregates,
+  rebuildPendingCommunityDailyAggregates,
+} from "./community-daily-aggregates";
+import { canonicalJson } from "./canonical-json";
+import {
   insertTelemetryContributionV02,
 } from "./telemetry-v0.2-repository";
 import {
@@ -179,7 +282,15 @@ import {
   validateSyntheticContribution,
 } from "./validation";
 
-async function readBoundedJson(request: Request): Promise<{
+const CONTROL_BODY_READ_POLICY = Object.freeze({
+  maximumTotalMilliseconds: 15_000,
+  maximumIdleMilliseconds: 5_000,
+} satisfies BoundedBodyReadPolicy);
+
+async function readBoundedJson(
+  request: Request,
+  policy: BoundedBodyReadPolicy = CONTROL_BODY_READ_POLICY,
+): Promise<{
   bytes: Uint8Array;
   raw: string;
   value: unknown;
@@ -192,32 +303,7 @@ async function readBoundedJson(request: Request): Promise<{
     if (!Number.isSafeInteger(length) || length < 0) throw new ApiError(400, "BODY_INVALID");
     if (length > MAX_REQUEST_BYTES) throw new ApiError(413, "BODY_TOO_LARGE");
   }
-  if (!request.body) throw new ApiError(400, "BODY_INVALID");
-
-  const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const result = await reader.read();
-      if (result.done) break;
-      total += result.value.byteLength;
-      if (total > MAX_REQUEST_BYTES) {
-        await reader.cancel();
-        throw new ApiError(413, "BODY_TOO_LARGE");
-      }
-      chunks.push(result.value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-
-  const combined = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    combined.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
+  const combined = await readBoundedRequestBody(request, MAX_REQUEST_BYTES, policy);
   let raw: string;
   try {
     raw = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(combined);
@@ -225,6 +311,39 @@ async function readBoundedJson(request: Request): Promise<{
   } catch {
     throw new ApiError(400, "BODY_INVALID");
   }
+}
+
+const UPLOAD_AUTHORIZATION_HEADER =
+  /^Upload um_(?:device_)?upload_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/u;
+
+/**
+ * Reject requests that cannot possibly be a contribution before spending a
+ * Rate Limit key or shared ingress slot. The bound reader rechecks these
+ * fields before consuming the body; this is a cheap pre-body fence only.
+ */
+function contributionRequestPreflight(request: Request): string {
+  if (hasSessionCookie(request.headers.get("cookie"))) {
+    throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+  }
+  const authorization = request.headers.get("authorization");
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
+  if (contentType !== "application/json") {
+    throw new ApiError(415, "CONTENT_TYPE_INVALID");
+  }
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw new ApiError(400, "BODY_INVALID");
+    }
+    if (length > MAX_REQUEST_BYTES) throw new ApiError(413, "BODY_TOO_LARGE");
+  }
+  if (!request.body) throw new ApiError(400, "BODY_INVALID");
+  if (typeof authorization !== "string"
+      || !UPLOAD_AUTHORIZATION_HEADER.test(authorization)) {
+    throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+  }
+  return authorization;
 }
 
 /**
@@ -250,30 +369,11 @@ async function readBoundedForm(
     }
     if (length > maximumBytes) throw new ApiError(413, "BODY_TOO_LARGE");
   }
-  if (!request.body) throw new ApiError(400, "BODY_INVALID");
-  const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const result = await reader.read();
-      if (result.done) break;
-      total += result.value.byteLength;
-      if (total > maximumBytes) {
-        await reader.cancel();
-        throw new ApiError(413, "BODY_TOO_LARGE");
-      }
-      chunks.push(result.value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const combined = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    combined.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
+  const combined = await readBoundedRequestBody(
+    request,
+    maximumBytes,
+    CONTROL_BODY_READ_POLICY,
+  );
   try {
     return new URLSearchParams(
       new TextDecoder("utf-8", { fatal: true, ignoreBOM: false })
@@ -319,7 +419,9 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
   assertSameOrigin(request);
   const mode = configuredEnrollmentMode(env);
   assertAdmissionBindings(env);
-  if (mode === "disabled") throw new ApiError(503, "ENROLLMENT_DISABLED");
+  // "disabled" pauses NEW participation only. An identity that already links
+  // to a participant reattaches below without creating anything, so the
+  // refusal moves to the fresh-enrollment fall-through instead of the door.
   await assertCollectionControl(env.USAGE_MONITOR_DB, "enrollment");
   await assertAttemptAllowed(
     env.ENROLLMENT_RATE_LIMIT,
@@ -386,8 +488,21 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
   if (identityRequired(env) && !identityProvided) {
     throw new ApiError(401, "IDENTITY_REQUIRED");
   }
+  if (identityRequired(env)) {
+    await assertPinnedIdentityLinkSecretConfiguration(
+      env.USAGE_MONITOR_DB,
+      Reflect.get(env, "IDENTITY_LINK_SECRET"),
+      Reflect.get(env, "IDENTITY_LINK_SECRET_VERSION"),
+    );
+  }
   const verifiedIdentity = identityProvided
     ? await consumeHostedIdentityProof(env.USAGE_MONITOR_DB, identityValue)
+    : null;
+  const identityCooldownDigest = verifiedIdentity !== null
+    ? await assertIdentityReenrollmentAllowed(
+      env,
+      verifiedIdentity.linkKeyHex,
+    )
     : null;
   if (deviceBootstrapRequested) {
     await assertCollectionControl(
@@ -396,6 +511,7 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
     );
   }
   const consentVersion = Reflect.get(body.value, "consentVersion") as string;
+  const syntheticOnly = Reflect.get(body.value, "syntheticOnly");
   const reattached = verifiedIdentity
     ? await reattachParticipantByLinkKey(
       env.USAGE_MONITOR_DB,
@@ -404,20 +520,40 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
       { deviceBootstrap: deviceBootstrapRequested },
     )
     : null;
+  if (reattached === null && mode === "disabled") {
+    throw new ApiError(503, "ENROLLMENT_DISABLED");
+  }
   const inviteGrant = reattached === null && mode === "invite_only"
     ? await parseInviteGrant(Reflect.get(body.value, "inviteCode"))
     : null;
-  const enrollment = reattached ?? await enroll(
-    env.USAGE_MONITOR_DB,
-    consentVersion,
-    inviteGrant,
-    {
-      deviceBootstrap: deviceBootstrapRequested,
-      openCommunityEligibility: mode === "open"
-        && Reflect.get(body.value, "syntheticOnly") === false,
-      identityLinkKey: verifiedIdentity?.linkKeyHex ?? null,
-    },
-  );
+  const enrollment = reattached ?? await (async () => {
+    try {
+      return await enroll(
+        env.USAGE_MONITOR_DB,
+        consentVersion,
+        inviteGrant,
+        {
+          deviceBootstrap: deviceBootstrapRequested,
+          openCommunityEligibility: mode === "open"
+            && syntheticOnly === false,
+          identityLinkKey: verifiedIdentity?.linkKeyHex ?? null,
+          identityCooldownDigest,
+        },
+      );
+    } catch (error) {
+      // The primary trigger is the linearization point for the active →
+      // deleting → removed race. Map its expected rejection without exposing
+      // a database error; any unrecognised write failure remains fail-closed.
+      if (identityCooldownDigest !== null
+          && await hasIdentityReenrollmentCooldownDigest(
+            env.USAGE_MONITOR_DB,
+            identityCooldownDigest,
+          )) {
+        throw new ApiError(409, "IDENTITY_REENROLLMENT_COOLDOWN");
+      }
+      throw error;
+    }
+  })();
   return jsonResponse({
     schemaVersion: "participant-bootstrap-v0.1",
     state: enrollment.pairing ? "pairing_ready" : "enrolled",
@@ -448,13 +584,54 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
   }, 201, { "set-cookie": sessionCookie(enrollment.session) });
 }
 
-const SIGNIN_HANDOFF_TTL_MILLISECONDS = 5 * 60 * 1000;
+// A handoff row has two phases, and each phase is bounded by its own clock.
+// `expires_at` always holds the deadline of the phase the row is currently in,
+// so exactly one deadline is ever live for a row and the purge query, its
+// index, and the "expired reads as invalid, never as pending" rule are all
+// unchanged.
+//
+// Phase 1 — authorization, from the start route until the provider callback
+// fills the row. The row holds no credential here: an unguessable 384-bit
+// state and a nonce digest, nothing that can be replayed against anything.
+// Its deadline is measured from the instant the state was minted, which is
+// correct, because that is what the deadline bounds: an unused state. What it
+// has to cover, though, is an entire human round trip — a cold-starting
+// browser, an account chooser, a password, a second factor, and Apple's
+// Hide-My-Email decision. Five minutes sits below that; ten is the
+// conventional authorization-request lifetime and matches the provider's own
+// authorization-code lifetime, so a careful reader is no longer refused at the
+// callback for a delay that is not a security event.
+const SIGNIN_HANDOFF_AUTHORIZATION_TTL_MILLISECONDS = 10 * 60 * 1000;
+// Phase 2 — delivery, from the moment the callback mints the opaque proof
+// until the dashboard collects it. The proof IS a bearer credential, so this
+// deadline is measured from the instant it was minted rather than from
+// whatever happened to be left of phase 1. Under the previous single deadline
+// the collectable window was `TTL minus round-trip duration`, which tends to
+// zero in exactly the case a careful user produces: a proof minted at 4:57
+// lived three seconds and expired before the dashboard's next poll. Measuring
+// from the mint gives every proof the same guaranteed window. The ceiling on
+// how long a proof can exist is unchanged at five minutes — only the floor
+// moves, from zero to five minutes.
+const SIGNIN_HANDOFF_DELIVERY_TTL_MILLISECONDS = 5 * 60 * 1000;
+// A callback holds its processing claim for this long before another callback
+// may re-claim the row. It must comfortably exceed the provider request timeout
+// (10s, capped at 60s) plus verification so a legitimately slow exchange is
+// never preempted, while still freeing a crashed claimant well inside the
+// 10-minute authorization window for one bounded retry.
+const SIGNIN_HANDOFF_PROCESSING_LEASE_MILLISECONDS = 60 * 1000;
 const MAX_APPLE_CALLBACK_BYTES = 16 * 1024;
 // Google returns its authorization code in the redirect's query string. The
 // code itself is bounded by the exchange, and this bounds the whole callback
 // URL so an oversized redirect is refused before anything is looked up.
 const MAX_GOOGLE_CALLBACK_URL_LENGTH = 8 * 1024;
 const SIGNIN_HANDOFF_PROOF_PATTERN = /^[A-Za-z0-9_-]{64}$/u;
+// The initiating client generates an unguessable verifier, keeps it, and sends
+// only SHA-256(verifier) as `binding` when it starts the flow. It re-presents
+// the raw verifier to collect the result and again when enrollment consumes the
+// proof. The verifier follows RFC 7636's 43-128 character range; the binding is
+// its lowercase-hex digest.
+const SIGNIN_HANDOFF_VERIFIER_PATTERN = /^[A-Za-z0-9_-]{43,128}$/u;
+const SIGNIN_HANDOFF_BINDING_PATTERN = /^[0-9a-f]{64}$/u;
 const SIGNIN_COMPLETED_MESSAGE = "Signed in — return to TiboTattle.";
 const SIGNIN_NOT_COMPLETED_MESSAGE =
   "Sign-in was not completed. Return to TiboTattle and start the sign-in again.";
@@ -463,6 +640,27 @@ const SIGNIN_NOT_COMPLETED_MESSAGE =
 // provider payload, so returning to the app reveals nothing from the OAuth
 // exchange.
 const SIGNIN_CALLBACK_APP_OPEN_URL = "usagemonitor://open";
+
+/**
+ * A disabled enrollment mode pauses NEW participation only; an existing
+ * participant's identity reattaches through this same OAuth ceremony, so the
+ * ceremony must stay open while the mode is disabled. The fresh-enrollment
+ * refusal happens at the enrollment write, after the reattach check.
+ */
+async function assertHostedSignInStartAllowed(env: Env): Promise<void> {
+  configuredEnrollmentMode(env);
+  // The collection control is the other operator containment switch. Check it
+  // before an edge budget, coordinated admission slot, or provider redirect so
+  // a temporarily paused service cannot create stranded OAuth handoffs.
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "enrollment");
+  if (identityRequired(env)) {
+    await assertPinnedIdentityLinkSecretConfiguration(
+      env.USAGE_MONITOR_DB,
+      Reflect.get(env, "IDENTITY_LINK_SECRET"),
+      Reflect.get(env, "IDENTITY_LINK_SECRET_VERSION"),
+    );
+  }
+}
 
 /**
  * Production sign-in is deliberately pinned to one configured HTTPS origin.
@@ -503,42 +701,106 @@ function signInCallbackUrl(
 function hostedIdentityProof(value: unknown): {
   provider: "apple" | "google";
   proof: string;
+  verifier: string;
 } {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
   }
   const provider = Reflect.get(value, "provider");
   const proof = Reflect.get(value, "proof");
-  if (Object.keys(value).sort().join("\0") !== ["proof", "provider"].join("\0")
+  const verifier = Reflect.get(value, "verifier");
+  if (Object.keys(value).sort().join("\0")
+        !== ["proof", "provider", "verifier"].join("\0")
       || (provider !== "apple" && provider !== "google")
       || typeof proof !== "string"
-      || !SIGNIN_HANDOFF_PROOF_PATTERN.test(proof)) {
+      || !SIGNIN_HANDOFF_PROOF_PATTERN.test(proof)
+      || typeof verifier !== "string"
+      || !SIGNIN_HANDOFF_VERIFIER_PATTERN.test(verifier)) {
     throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
   }
-  return { provider, proof };
+  return { provider, proof, verifier };
 }
 
 async function consumeHostedIdentityProof(
   db: D1Database,
   identity: unknown,
 ): Promise<{ provider: "apple" | "google"; linkKeyHex: string }> {
-  const { provider, proof } = hostedIdentityProof(identity);
+  const { provider, proof, verifier } = hostedIdentityProof(identity);
   const table = provider === "apple"
     ? "apple_signin_handoffs"
     : "google_signin_handoffs";
   const nowIso = new Date().toISOString();
+  // Consumption carries the initiator binding through to the sink: the delivered
+  // proof is a bearer credential, so a leaked proof alone cannot reattach a
+  // participant — the same verifier that collected it must be re-presented here.
+  const bindingHash = await sha256Hex(verifier);
   const claimed = await db.prepare(
     `DELETE FROM ${table}
       WHERE proof = ?
+        AND binding_hash = ?
         AND identity_link_key IS NOT NULL
         AND delivered_at IS NOT NULL
         AND expires_at > ?
       RETURNING identity_link_key AS linkKeyHex`,
-  ).bind(proof, nowIso).first<{ linkKeyHex: string }>();
+  ).bind(proof, bindingHash, nowIso).first<{ linkKeyHex: string }>();
   if (!claimed || !/^[0-9a-f]{64}$/u.test(claimed.linkKeyHex)) {
     throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
   }
   return { provider, linkKeyHex: claimed.linkKeyHex };
+}
+
+/**
+ * A proof is consumed before this check, so a caller cannot replay one hosted
+ * handoff while probing the cooldown. Existing active participants are
+ * deliberately exempt: sign-in remains a reattachment operation, not a new
+ * account generation. Deleted or deleting links are compared only through a
+ * short-lived, purpose-separated digest. The primary-D1 copy is checked here
+ * for a clear user-facing result and enforced again by an INSERT trigger.
+ */
+async function assertIdentityReenrollmentAllowed(
+  env: Env,
+  identityLinkKey: string,
+): Promise<string | null> {
+  const state = await participantIdentityLinkState(
+    env.USAGE_MONITOR_DB,
+    identityLinkKey,
+  );
+  // Do not fall through to a fresh enrollment when the deletion still owns
+  // the link. The caller must start a new verified handoff after deletion
+  // reaches a stable outcome.
+  if (state?.state === "deleting") {
+    throw new ApiError(409, "PARTICIPANT_DELETING");
+  }
+  const rawIdentityLinkSecret = Reflect.get(env, "IDENTITY_LINK_SECRET");
+  if (typeof rawIdentityLinkSecret !== "string"
+      || rawIdentityLinkSecret.length < 32) {
+    if (identityRequired(env)) {
+      throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
+    }
+    return null;
+  }
+  // Derive even for an active row. A deletion may complete after this state
+  // read and before reattachment; the value then reaches the atomic INSERT
+  // guard if a fresh enrollment is attempted.
+  const cooldownDigest = await identityReenrollmentCooldownDigest(
+    rawIdentityLinkSecret,
+    identityLinkKey,
+  );
+  if (state?.state === "active") return cooldownDigest;
+  const [primaryCoolingDown, ledgerCoolingDown] = await Promise.all([
+    hasIdentityReenrollmentCooldownDigest(
+      env.USAGE_MONITOR_DB,
+      cooldownDigest,
+    ),
+    hasIdentityReenrollmentCooldownDigest(
+      env.DELETION_LEDGER,
+      cooldownDigest,
+    ),
+  ]);
+  if (primaryCoolingDown || ledgerCoolingDown) {
+    throw new ApiError(409, "IDENTITY_REENROLLMENT_COOLDOWN");
+  }
+  return cooldownDigest;
 }
 
 /**
@@ -553,9 +815,10 @@ async function verifiedHostedCallbackIdentity(
   env: Env,
   provider: "apple" | "google",
   idToken: string,
+  options: { expectedNonceHash?: string } = {},
 ): Promise<{ provider: "apple" | "google"; linkKeyHex: string }> {
   if (identityRequired(env)) {
-    return verifyHostedIdentity(env, { provider, idToken });
+    return verifyHostedIdentity(env, { provider, idToken }, options);
   }
   return {
     provider,
@@ -577,16 +840,7 @@ async function deleteExpiredAppleHandoffs(
   nowIso: string,
   maximumRows = MAX_EXPIRED_SIGNIN_HANDOFFS_PER_PROVIDER,
 ): Promise<number> {
-  const result = await db.prepare(
-    `DELETE FROM apple_signin_handoffs
-      WHERE state IN (
-        SELECT state FROM apple_signin_handoffs
-         WHERE expires_at <= ?
-         ORDER BY expires_at, state
-         LIMIT ?
-      )`,
-  ).bind(nowIso, maximumRows).run();
-  return result.meta.changes;
+  return deleteExpiredAppleSignInHandoffs(db, nowIso, maximumRows);
 }
 
 async function deleteExpiredGoogleHandoffs(
@@ -604,6 +858,66 @@ async function deleteExpiredGoogleHandoffs(
       )`,
   ).bind(nowIso, maximumRows).run();
   return result.meta.changes;
+}
+
+/**
+ * A provider can return a valid state with an explicit cancellation (or an
+ * exchange can fail after that state has been claimed). That handoff cannot
+ * subsequently succeed: authorization codes are one-time and the person has
+ * already chosen a different outcome. Delete only an empty, live row so a
+ * late cancellation can never undo a completed or delivered sign-in.
+ */
+async function discardPendingAppleHandoff(
+  db: D1Database,
+  state: string,
+  nowIso: string,
+): Promise<void> {
+  await discardPendingAppleSignInHandoff(db, state, nowIso);
+}
+
+/**
+ * Discards an unclaimed Google handoff after a provider cancellation that
+ * arrives before any callback has claimed the row. The `claim_id IS NULL` fence
+ * keeps a cancellation callback from deleting a row another callback is already
+ * processing; that claimant discards its own row through
+ * `discardClaimedGoogleHandoff`.
+ */
+async function discardPendingGoogleHandoff(
+  db: D1Database,
+  state: string,
+  nowIso: string,
+): Promise<void> {
+  await db.prepare(
+    `DELETE FROM google_signin_handoffs
+      WHERE state = ?
+        AND claim_id IS NULL
+        AND identity_link_key IS NULL
+        AND proof IS NULL
+        AND delivered_at IS NULL
+        AND expires_at > ?`,
+  ).bind(state, nowIso).run();
+}
+
+/**
+ * Discards a Google handoff the caller holds the claim on, after its own
+ * provider exchange failed. Fenced to `claimId`, so a callback that lost its
+ * claim to a lease-expiry re-claim deletes nothing.
+ */
+async function discardClaimedGoogleHandoff(
+  db: D1Database,
+  state: string,
+  claimId: string,
+  nowIso: string,
+): Promise<void> {
+  await db.prepare(
+    `DELETE FROM google_signin_handoffs
+      WHERE state = ?
+        AND claim_id = ?
+        AND identity_link_key IS NULL
+        AND proof IS NULL
+        AND delivered_at IS NULL
+        AND expires_at > ?`,
+  ).bind(state, claimId, nowIso).run();
 }
 
 async function hasExpiredAppleHandoffs(db: D1Database, nowIso: string): Promise<boolean> {
@@ -716,6 +1030,7 @@ async function handleIdentityAppleStart(
 ): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
   assertSameOrigin(request);
+  await assertHostedSignInStartAllowed(env);
   assertAdmissionBindings(env);
   await assertAttemptAllowed(
     env.ENROLLMENT_RATE_LIMIT,
@@ -728,30 +1043,39 @@ async function handleIdentityAppleStart(
   const redirectUri = signInCallbackUrl(request, env, "apple");
   const body = await readBoundedJson(request);
   const value = body.value;
+  // The initiating client supplies `binding` = SHA-256(verifier). The raw
+  // verifier stays on the client and is required again to collect the result
+  // and to consume the proof, so the state alone is never a bearer capability.
+  const binding = Reflect.get(value ?? {}, "binding");
   if (typeof value !== "object"
       || value === null
       || Array.isArray(value)
-      || Object.keys(value).length !== 0) {
+      || Object.keys(value).length !== 1
+      || typeof binding !== "string"
+      || !SIGNIN_HANDOFF_BINDING_PATTERN.test(binding)) {
     throw new ApiError(400, "BODY_INVALID");
   }
+  await assertSignInStartAdmission(env.USAGE_MONITOR_DB, env);
   const nowMs = Date.now();
   const nowIso = new Date(nowMs).toISOString();
   await deleteExpiredAppleHandoffs(env.USAGE_MONITOR_DB, nowIso);
   // 48 random bytes render as 64 base64url characters.
   const state = randomSecret(48);
-  await env.USAGE_MONITOR_DB.prepare(
-    `INSERT INTO apple_signin_handoffs
-       (state, identity_link_key, proof, created_at, expires_at, delivered_at)
-       VALUES (?, NULL, NULL, ?, ?, NULL)`,
-  ).bind(
+  const nonce = generateAppleSignInNonce();
+  const nonceHash = await hashAppleSignInNonce(nonce);
+  await insertAppleSignInHandoff(env.USAGE_MONITOR_DB, {
     state,
-    nowIso,
-    new Date(nowMs + SIGNIN_HANDOFF_TTL_MILLISECONDS).toISOString(),
-  ).run();
+    nonceHash,
+    bindingHash: binding,
+    createdAt: nowIso,
+    expiresAt: new Date(
+      nowMs + SIGNIN_HANDOFF_AUTHORIZATION_TTL_MILLISECONDS,
+    ).toISOString(),
+  });
   return jsonResponse({
     schemaVersion: "identity-apple-start-v0.1",
     state,
-    authorizeUrl: appleAuthorizeUrl(configuration, redirectUri, state),
+    authorizeUrl: appleAuthorizeUrl(configuration, redirectUri, state, nonce),
   });
 }
 
@@ -775,41 +1099,77 @@ async function handleIdentityAppleCallback(
   const code = form.get("code");
   const failure = signInCallbackPage(SIGNIN_NOT_COMPLETED_MESSAGE);
   if (typeof state !== "string"
-      || !APPLE_SIGNIN_STATE_PATTERN.test(state)
-      || form.get("error") !== null
-      || typeof code !== "string"
-      || code.length === 0) {
+      || !APPLE_SIGNIN_STATE_PATTERN.test(state)) {
     return failure;
   }
   const nowIso = new Date().toISOString();
-  const pending = await env.USAGE_MONITOR_DB.prepare(
-    `SELECT state FROM apple_signin_handoffs
-      WHERE state = ?
-        AND identity_link_key IS NULL
-        AND proof IS NULL
-        AND delivered_at IS NULL
-        AND expires_at > ?`,
-  ).bind(state, nowIso).first<{ state: string }>();
+  if (form.get("error") !== null) {
+    await discardPendingAppleHandoff(env.USAGE_MONITOR_DB, state, nowIso);
+    return failure;
+  }
+  if (typeof code !== "string" || code.length === 0) return failure;
+  // Atomically reserve the row before any client-secret signing or provider I/O.
+  // Of many callbacks carrying this one valid state, exactly one wins the claim;
+  // the rest see no change here and stop, so provider work cannot fan out.
+  const claimId = randomSecret(48);
+  const pending = await claimPendingAppleSignInHandoff(
+    env.USAGE_MONITOR_DB,
+    state,
+    claimId,
+    nowIso,
+    new Date(
+      Date.now() - SIGNIN_HANDOFF_PROCESSING_LEASE_MILLISECONDS,
+    ).toISOString(),
+  );
   if (!pending) return failure;
   let verified: { provider: "apple" | "google"; linkKeyHex: string };
   try {
+    if (identityRequired(env)) {
+      await assertPinnedIdentityLinkSecretConfiguration(
+        env.USAGE_MONITOR_DB,
+        Reflect.get(env, "IDENTITY_LINK_SECRET"),
+        Reflect.get(env, "IDENTITY_LINK_SECRET_VERSION"),
+      );
+    }
     const idToken = await exchangeAppleAuthorizationCode(env, code, redirectUri);
-    verified = await verifiedHostedCallbackIdentity(env, "apple", idToken);
+    verified = await verifiedHostedCallbackIdentity(env, "apple", idToken, {
+      // The offline harness intentionally has no signed Apple token. Hosted
+      // deployments always bind the signed nonce claim to this state row.
+      expectedNonceHash: identityRequired(env) ? pending.nonceHash : undefined,
+    });
   } catch {
+    // A provider code can be spent only once. Leaving this handoff pending
+    // would make the desktop app poll a state that cannot ever complete. The
+    // discard is fenced to this callback's own claim, so a callback whose claim
+    // was preempted by a lease-expiry re-claim can never delete the new
+    // claimant's row.
+    await discardClaimedAppleSignInHandoff(
+      env.USAGE_MONITOR_DB,
+      state,
+      claimId,
+      new Date().toISOString(),
+    );
     return failure;
   }
-  // Re-checked against the time the exchange finished, not the time it
-  // started, so a handoff that expired mid-exchange is never filled.
-  const stored = await env.USAGE_MONITOR_DB.prepare(
-    `UPDATE apple_signin_handoffs
-        SET identity_link_key = ?, proof = ?
-      WHERE state = ?
-        AND identity_link_key IS NULL
-        AND proof IS NULL
-        AND delivered_at IS NULL
-        AND expires_at > ?`,
-  ).bind(verified.linkKeyHex, randomSecret(48), state, new Date().toISOString()).run();
-  if (stored.meta.changes !== 1) return failure;
+  // The authorization deadline is re-checked against the time the exchange
+  // finished, not the time it started, so a handoff that expired mid-exchange
+  // is never filled. The same write moves the row into its delivery phase: the
+  // proof being minted here gets its own full window, measured from now, so it
+  // cannot expire between being minted and being collectable however long the
+  // round trip took.
+  const filledAtMs = Date.now();
+  const stored = await completeAppleSignInHandoff(
+    env.USAGE_MONITOR_DB,
+    state,
+    claimId,
+    verified.linkKeyHex,
+    randomSecret(48),
+    new Date(filledAtMs).toISOString(),
+    new Date(
+      filledAtMs + SIGNIN_HANDOFF_DELIVERY_TTL_MILLISECONDS,
+    ).toISOString(),
+  );
+  if (!stored) return failure;
   return signInCallbackPage(SIGNIN_COMPLETED_MESSAGE, { completed: true });
 }
 
@@ -834,37 +1194,35 @@ async function handleIdentityAppleResult(
     throw new ApiError(400, "BODY_INVALID");
   }
   const state = Reflect.get(value, "state");
-  if (Object.keys(value).length !== 1
+  const verifier = Reflect.get(value, "verifier");
+  if (Object.keys(value).length !== 2
       || typeof state !== "string"
-      || !APPLE_SIGNIN_STATE_PATTERN.test(state)) {
+      || !APPLE_SIGNIN_STATE_PATTERN.test(state)
+      || typeof verifier !== "string"
+      || !SIGNIN_HANDOFF_VERIFIER_PATTERN.test(verifier)) {
     throw new ApiError(400, "BODY_INVALID");
   }
+  const bindingHash = await sha256Hex(verifier);
   const nowIso = new Date().toISOString();
   await deleteExpiredAppleHandoffs(env.USAGE_MONITOR_DB, nowIso);
-  const delivered = await env.USAGE_MONITOR_DB.prepare(
-    `UPDATE apple_signin_handoffs
-        SET delivered_at = ?
-      WHERE state = ?
-        AND identity_link_key IS NOT NULL
-        AND proof IS NOT NULL
-        AND delivered_at IS NULL
-        AND expires_at > ?
-      RETURNING proof`,
-  ).bind(nowIso, state, nowIso).first<{ proof: string }>();
+  const delivered = await deliverAppleSignInHandoff(
+    env.USAGE_MONITOR_DB,
+    state,
+    nowIso,
+    bindingHash,
+  );
   if (delivered) {
     return jsonResponse({
       schemaVersion: "identity-apple-result-v0.1",
       proof: delivered.proof,
     });
   }
-  const pending = await env.USAGE_MONITOR_DB.prepare(
-    `SELECT state FROM apple_signin_handoffs
-      WHERE state = ?
-        AND identity_link_key IS NULL
-        AND proof IS NULL
-        AND delivered_at IS NULL
-        AND expires_at > ?`,
-  ).bind(state, nowIso).first<{ state: string }>();
+  const pending = await readPendingAppleSignInHandoff(
+    env.USAGE_MONITOR_DB,
+    state,
+    nowIso,
+    bindingHash,
+  );
   if (pending) throw new ApiError(404, "IDENTITY_RESULT_PENDING");
   throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
 }
@@ -882,6 +1240,7 @@ async function handleIdentityGoogleStart(
 ): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
   assertSameOrigin(request);
+  await assertHostedSignInStartAllowed(env);
   assertAdmissionBindings(env);
   await assertAttemptAllowed(
     env.ENROLLMENT_RATE_LIMIT,
@@ -894,12 +1253,20 @@ async function handleIdentityGoogleStart(
   const redirectUri = signInCallbackUrl(request, env, "google");
   const body = await readBoundedJson(request);
   const value = body.value;
+  // `binding` = SHA-256(client verifier). It is server-held PKCE-independent:
+  // the `code_verifier` below authenticates the Worker's own token exchange,
+  // whereas this binding authenticates the client that may collect and consume
+  // the result. The two are never conflated.
+  const binding = Reflect.get(value ?? {}, "binding");
   if (typeof value !== "object"
       || value === null
       || Array.isArray(value)
-      || Object.keys(value).length !== 0) {
+      || Object.keys(value).length !== 1
+      || typeof binding !== "string"
+      || !SIGNIN_HANDOFF_BINDING_PATTERN.test(binding)) {
     throw new ApiError(400, "BODY_INVALID");
   }
+  await assertSignInStartAdmission(env.USAGE_MONITOR_DB, env);
   const nowMs = Date.now();
   const nowIso = new Date(nowMs).toISOString();
   await deleteExpiredGoogleHandoffs(env.USAGE_MONITOR_DB, nowIso);
@@ -909,13 +1276,16 @@ async function handleIdentityGoogleStart(
   const codeVerifier = randomSecret(48);
   await env.USAGE_MONITOR_DB.prepare(
     `INSERT INTO google_signin_handoffs
-       (state, code_verifier, identity_link_key, proof, created_at, expires_at, delivered_at)
-       VALUES (?, ?, NULL, NULL, ?, ?, NULL)`,
+       (state, code_verifier, binding_hash, identity_link_key, proof, created_at, expires_at, delivered_at)
+       VALUES (?, ?, ?, NULL, NULL, ?, ?, NULL)`,
   ).bind(
     state,
     codeVerifier,
+    binding,
     nowIso,
-    new Date(nowMs + SIGNIN_HANDOFF_TTL_MILLISECONDS).toISOString(),
+    new Date(
+      nowMs + SIGNIN_HANDOFF_AUTHORIZATION_TTL_MILLISECONDS,
+    ).toISOString(),
   ).run();
   return jsonResponse({
     schemaVersion: "identity-google-start-v0.1",
@@ -951,24 +1321,46 @@ async function handleIdentityGoogleCallback(
   const state = parameters.get("state");
   const code = parameters.get("code");
   if (typeof state !== "string"
-      || !GOOGLE_SIGNIN_STATE_PATTERN.test(state)
-      || parameters.get("error") !== null
-      || typeof code !== "string"
-      || code.length === 0) {
+      || !GOOGLE_SIGNIN_STATE_PATTERN.test(state)) {
     return failure;
   }
   const nowIso = new Date().toISOString();
+  if (parameters.get("error") !== null) {
+    await discardPendingGoogleHandoff(env.USAGE_MONITOR_DB, state, nowIso);
+    return failure;
+  }
+  if (typeof code !== "string" || code.length === 0) return failure;
+  // Atomically reserve the row before spending the PKCE verifier on a provider
+  // token request. The same conditional UPDATE that claims the row returns the
+  // verifier, so exactly one of many racing callbacks reaches the exchange; the
+  // rest change no row and stop. `claimed_at <= staleBefore` permits one bounded
+  // retry after a crashed claimant's lease expires.
+  const claimId = randomSecret(48);
+  const staleClaimBeforeIso = new Date(
+    Date.now() - SIGNIN_HANDOFF_PROCESSING_LEASE_MILLISECONDS,
+  ).toISOString();
   const pending = await env.USAGE_MONITOR_DB.prepare(
-    `SELECT code_verifier AS codeVerifier FROM google_signin_handoffs
+    `UPDATE google_signin_handoffs
+        SET claim_id = ?, claimed_at = ?
       WHERE state = ?
         AND identity_link_key IS NULL
         AND proof IS NULL
         AND delivered_at IS NULL
-        AND expires_at > ?`,
-  ).bind(state, nowIso).first<{ codeVerifier: string }>();
+        AND expires_at > ?
+        AND (claim_id IS NULL OR claimed_at <= ?)
+      RETURNING code_verifier AS codeVerifier`,
+  ).bind(claimId, nowIso, state, nowIso, staleClaimBeforeIso)
+    .first<{ codeVerifier: string }>();
   if (!pending) return failure;
   let verified: { provider: "apple" | "google"; linkKeyHex: string };
   try {
+    if (identityRequired(env)) {
+      await assertPinnedIdentityLinkSecretConfiguration(
+        env.USAGE_MONITOR_DB,
+        Reflect.get(env, "IDENTITY_LINK_SECRET"),
+        Reflect.get(env, "IDENTITY_LINK_SECRET_VERSION"),
+      );
+    }
     const idToken = await exchangeGoogleAuthorizationCode(
       env,
       code,
@@ -977,19 +1369,45 @@ async function handleIdentityGoogleCallback(
     );
     verified = await verifiedHostedCallbackIdentity(env, "google", idToken);
   } catch {
+    // A provider code can be spent only once. Leaving this handoff pending
+    // would make the desktop app poll a state that cannot ever complete. The
+    // discard is fenced to this callback's own claim, so a preempted callback
+    // can never delete the row the new claimant is processing.
+    await discardClaimedGoogleHandoff(
+      env.USAGE_MONITOR_DB,
+      state,
+      claimId,
+      new Date().toISOString(),
+    );
     return failure;
   }
-  // Re-checked against the time the exchange finished, not the time it
-  // started, so a handoff that expired mid-exchange is never filled.
+  // The authorization deadline is re-checked against the time the exchange
+  // finished, not the time it started, so a handoff that expired mid-exchange
+  // is never filled. The same write moves the row into its delivery phase on
+  // Apple's terms: `expires_at` becomes the proof's own window, measured from
+  // the instant the proof is minted. SQLite evaluates the WHERE clause against
+  // the pre-update row, so the authorization deadline is still the one being
+  // enforced here.
+  const filledAtMs = Date.now();
+  // Completion is fenced to this claim: a callback whose claim was preempted by
+  // a lease-expiry re-claim writes zero rows and reports failure.
   const stored = await env.USAGE_MONITOR_DB.prepare(
     `UPDATE google_signin_handoffs
-        SET code_verifier = NULL, identity_link_key = ?, proof = ?
+        SET code_verifier = NULL, identity_link_key = ?, proof = ?, expires_at = ?
       WHERE state = ?
+        AND claim_id = ?
         AND identity_link_key IS NULL
         AND proof IS NULL
         AND delivered_at IS NULL
         AND expires_at > ?`,
-  ).bind(verified.linkKeyHex, randomSecret(48), state, new Date().toISOString()).run();
+  ).bind(
+    verified.linkKeyHex,
+    randomSecret(48),
+    new Date(filledAtMs + SIGNIN_HANDOFF_DELIVERY_TTL_MILLISECONDS).toISOString(),
+    state,
+    claimId,
+    new Date(filledAtMs).toISOString(),
+  ).run();
   if (stored.meta.changes !== 1) return failure;
   return signInCallbackPage(SIGNIN_COMPLETED_MESSAGE, { completed: true });
 }
@@ -1014,37 +1432,48 @@ async function handleIdentityGoogleResult(
     throw new ApiError(400, "BODY_INVALID");
   }
   const state = Reflect.get(value, "state");
-  if (Object.keys(value).length !== 1
+  const verifier = Reflect.get(value, "verifier");
+  if (Object.keys(value).length !== 2
       || typeof state !== "string"
-      || !GOOGLE_SIGNIN_STATE_PATTERN.test(state)) {
+      || !GOOGLE_SIGNIN_STATE_PATTERN.test(state)
+      || typeof verifier !== "string"
+      || !SIGNIN_HANDOFF_VERIFIER_PATTERN.test(verifier)) {
     throw new ApiError(400, "BODY_INVALID");
   }
+  const bindingHash = await sha256Hex(verifier);
   const nowIso = new Date().toISOString();
   await deleteExpiredGoogleHandoffs(env.USAGE_MONITOR_DB, nowIso);
+  // The proof is released only to a caller re-presenting the initiator's
+  // verifier: a mismatched or absent binding updates zero rows, so the proof is
+  // neither delivered nor consumed and stays collectable by the initiator.
   const delivered = await env.USAGE_MONITOR_DB.prepare(
     `UPDATE google_signin_handoffs
         SET delivered_at = ?
       WHERE state = ?
+        AND binding_hash = ?
         AND identity_link_key IS NOT NULL
         AND proof IS NOT NULL
         AND delivered_at IS NULL
         AND expires_at > ?
       RETURNING proof`,
-  ).bind(nowIso, state, nowIso).first<{ proof: string }>();
+  ).bind(nowIso, state, bindingHash, nowIso).first<{ proof: string }>();
   if (delivered) {
     return jsonResponse({
       schemaVersion: "identity-google-result-v0.1",
       proof: delivered.proof,
     });
   }
+  // A caller holding the state but not the verifier cannot even learn that a
+  // sign-in is pending: the binding is required here too.
   const pending = await env.USAGE_MONITOR_DB.prepare(
     `SELECT state FROM google_signin_handoffs
       WHERE state = ?
+        AND binding_hash = ?
         AND identity_link_key IS NULL
         AND proof IS NULL
         AND delivered_at IS NULL
         AND expires_at > ?`,
-  ).bind(state, nowIso).first<{ state: string }>();
+  ).bind(state, bindingHash, nowIso).first<{ state: string }>();
   if (pending) throw new ApiError(404, "IDENTITY_RESULT_PENDING");
   throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
 }
@@ -1170,12 +1599,22 @@ async function handleSecurityReset(request: Request, env: Env): Promise<Response
 
 async function handleUploadAuthorization(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
+  assertAdmissionBindings(env);
+  assertUploadAuthorizationBindings(env);
+  assertUploadIngressConfiguration(env);
   await assertCollectionControl(
     env.USAGE_MONITOR_DB,
     "uploadRegistration",
   );
   const session = await personalSession(request, env);
   assertCsrf(request, session);
+  await assertUploadAuthorizationAllowed(
+    env.UPLOAD_AUTHORIZATION_RATE_LIMIT,
+    env.UPLOAD_PRINCIPAL_RATE_LIMIT,
+    session.participantId,
+    env,
+  );
+  await probeUploadIngressBudget(env);
   const body = await readBoundedJson(request);
   if (typeof body.value !== "object"
       || body.value === null
@@ -1218,15 +1657,23 @@ async function handleDevicePairing(request: Request, env: Env): Promise<Response
     throw new ApiError(400, "TELEMETRY_REQUIRED");
   }
   const body = await readBoundedJson(request);
+  const requestedConsentVersion = Reflect.get(body.value ?? {}, "consentVersion");
+  // A telemetry participant may request either the deployed v0.1 ongoing
+  // consent or the v1.0 incremental-contribution consent; the account-scoped
+  // preview keeps its own single identifier. The pairing records the choice
+  // server-side, which is what the v1.0 chunk path later verifies against.
+  const allowedConsentVersions = accountScoped
+    ? [ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION]
+    : [
+      ONGOING_TELEMETRY_CONSENT_VERSION,
+      ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION,
+    ];
   if (typeof body.value !== "object"
       || body.value === null
       || Array.isArray(body.value)
       || Object.keys(body.value).length !== 2
-      || Reflect.get(body.value, "consentVersion") !== (
-        accountScoped
-          ? ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION
-          : ONGOING_TELEMETRY_CONSENT_VERSION
-      )
+      || typeof requestedConsentVersion !== "string"
+      || !allowedConsentVersions.includes(requestedConsentVersion)
       || Reflect.get(body.value, "ongoingUpload") !== true) {
     throw new ApiError(400, "BODY_INVALID");
   }
@@ -1236,6 +1683,9 @@ async function handleDevicePairing(request: Request, env: Env): Promise<Response
       session.participantId,
       session.sessionId,
       session.consentVersion,
+      undefined,
+      undefined,
+      requestedConsentVersion as DeviceTransportConsentVersion,
     ),
     201,
     { vary: "Cookie" },
@@ -1271,6 +1721,9 @@ async function handleDeviceUploadAuthorization(
   env: Env,
 ): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
+  assertAdmissionBindings(env);
+  assertUploadAuthorizationBindings(env);
+  assertUploadIngressConfiguration(env);
   await assertCollectionControl(
     env.USAGE_MONITOR_DB,
     "uploadRegistration",
@@ -1283,6 +1736,13 @@ async function handleDeviceUploadAuthorization(
   if (await hasDeletionTombstone(env.DELETION_LEDGER, device.participantId)) {
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
+  await assertUploadAuthorizationAllowed(
+    env.UPLOAD_AUTHORIZATION_RATE_LIMIT,
+    env.UPLOAD_PRINCIPAL_RATE_LIMIT,
+    device.participantId,
+    env,
+  );
+  await probeUploadIngressBudget(env);
   const body = await readBoundedJson(request);
   if (typeof body.value !== "object"
       || body.value === null
@@ -1302,6 +1762,47 @@ async function handleDeviceUploadAuthorization(
     Reflect.get(body.value, "envelopeDigest") as string,
     Reflect.get(body.value, "contentLengthBytes") as number,
   ), 201);
+}
+
+/**
+ * Let the Mac that holds an upload-only bearer stop itself even while public
+ * collection is contained. This deliberately does not use a browser cookie,
+ * CSRF token, or the upload-registration control: the presented device secret
+ * is the sole authority and a stopped client must always be able to revoke
+ * it. It is idempotent for a valid credential and revokes pending uploads too.
+ */
+async function handleDeviceDisconnect(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  // This endpoint intentionally accepts a device bearer without a browser
+  // session so a Mac can stop itself during a collection incident. Apply the
+  // existing coarse/per-client admission before the credential hash and D1
+  // lookup, so arbitrary plausible bearers cannot turn revocation into an
+  // unbounded public work amplifier.
+  assertAdmissionBindings(env);
+  await assertAttemptAllowed(
+    env.RECOVERY_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "device_disconnect",
+  );
+  if (request.headers.has("cookie")) throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  if (request.headers.get("content-length") !== null
+      && request.headers.get("content-length") !== "0") {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const disconnected = await disconnectAuthenticatedDevice(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("authorization"),
+  );
+  return jsonResponse({
+    schemaVersion: "device-disconnect-v0.1",
+    disconnected: true,
+    deviceId: disconnected.deviceId,
+  });
 }
 
 async function handleDevices(request: Request, env: Env): Promise<Response> {
@@ -1634,30 +2135,361 @@ async function handleTelemetryContribution(
   }
 }
 
-async function handleContribution(request: Request, env: Env): Promise<Response> {
-  if (request.method !== "POST") methodNotAllowed(["POST"]);
-  await assertCollectionControl(env.USAGE_MONITOR_DB, "processing");
-  if (hasSessionCookie(request.headers.get("cookie"))) {
+async function telemetryV1ChunkReceipt(
+  env: Env,
+  row: TelemetryV1ChunkRow,
+  deviceId: string,
+): Promise<Response> {
+  const acknowledgedThroughDay = await telemetryV1AcknowledgedThroughDay(
+    env.USAGE_MONITOR_DB,
+    row.participant_id,
+    deviceId,
+  );
+  return jsonResponse(
+    {
+      schemaVersion: "telemetry-chunk-receipt-v1.0",
+      contributionId: row.id,
+      chunkId: telemetryV1ChunkId(row),
+      chunkRevision: row.revision,
+      status: row.superseded_at === null ? "accepted" : "superseded",
+      replayed: true,
+      recordCounts: {
+        declared: row.record_count,
+        accepted: row.accepted_record_count,
+      },
+      acknowledgedThroughDay,
+    },
+    202,
+    { "idempotency-replayed": "true" },
+  );
+}
+
+/**
+ * telemetry-contribution-v1.0 incremental chunk ingest. Additive alongside
+ * the deployed v0.1 prepared-sample path: v1.0 envelopes carry their own
+ * schema version, so the v0.1 branch is untouched. Chunks are
+ * device-authenticated only — the cursor is keyed (participant, device) and
+ * a browser session has no device identity.
+ */
+async function handleTelemetryV1Contribution(
+  body: { raw: string; value: unknown },
+  participant: { id: string; consentVersion: string },
+  uploadAuthorization: {
+    authorizationId: string;
+    authorizationKind: "session" | "device";
+  },
+  env: Env,
+): Promise<Response> {
+  if (uploadAuthorization.authorizationKind !== "device") {
     throw new ApiError(401, "UPLOAD_AUTH_INVALID");
   }
-  const body = await readBoundedJson(request);
-  const contentType = request.headers.get("content-type")?.trim() ?? "";
-  const bodyBytes = body.bytes.byteLength;
-  const scopeDigest = await sha256Hex(body.bytes);
-  const authorizationHeader = request.headers.get("authorization");
-  const claimed = authorizationHeader?.startsWith("Upload um_device_upload_")
-    ? await claimDeviceUploadAuthorization(
-      env.USAGE_MONITOR_DB,
-      authorizationHeader,
-      { envelopeDigest: scopeDigest, bodyBytes, contentType },
-    )
-    : await claimUploadAuthorization(
-      env.USAGE_MONITOR_DB,
-      authorizationHeader,
-      { envelopeDigest: scopeDigest, bodyBytes, contentType },
-    );
-  let completed = false;
+  if (participant.consentVersion !== TELEMETRY_CONSENT_VERSION) {
+    throw new ApiError(400, "TELEMETRY_REQUIRED");
+  }
+  const envelope = validateTelemetryV1Envelope(body.value);
+  const envelopeDigestValue = await telemetryEnvelopeDigest(envelope);
+  const deviceId = await telemetryV1DeviceForUploadAuthorization(
+    env.USAGE_MONITOR_DB,
+    uploadAuthorization.authorizationId,
+  );
+  if (deviceId === null) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+  const envelopeReplay = await existingTelemetryV1ChunkByEnvelopeDigest(
+    env.USAGE_MONITOR_DB,
+    participant.id,
+    envelopeDigestValue,
+  );
+  if (envelopeReplay) {
+    return telemetryV1ChunkReceipt(env, envelopeReplay, deviceId);
+  }
+
+  const plaintext = await decryptSyntheticEnvelope(
+    envelope,
+    env.ENVELOPE_PUBLIC_JWK,
+    env.ENVELOPE_PRIVATE_JWK,
+  );
+  const chunk = parseTelemetryV1Chunk(plaintext);
+  // Consent once, granted server-side: the chunk's declared consent must
+  // equal the currently required identifiers AND the grant this device's
+  // pairing claim recorded. An upload can never create or repair the grant.
+  assertTelemetryV1ConsentCurrent(chunk.consent);
+  if (!await telemetryV1DeviceConsentCurrent(
+    env.USAGE_MONITOR_DB,
+    participant.id,
+    deviceId,
+  )) {
+    throw new ApiError(403, "TELEMETRY_CONSENT_INVALID");
+  }
+  // The digest identity is the canonical minified JSON array of the chunk's
+  // records — the same serialization the client computes — so replay and
+  // supersession compare content, not envelope bytes.
+  const canonicalRecords = canonicalJson(chunk.records);
+  if (new TextEncoder().encode(canonicalRecords).byteLength
+      > MAX_TELEMETRY_V1_CHUNK_CANONICAL_BYTES) {
+    throw new ApiError(400, "CHUNK_INVALID");
+  }
+  if (await sha256Hex(canonicalRecords) !== chunk.chunkDigest) {
+    throw new ApiError(400, "CHUNK_DIGEST_MISMATCH");
+  }
+  const current = await currentTelemetryV1Chunk(
+    env.USAGE_MONITOR_DB,
+    participant.id,
+    deviceId,
+    chunk.stream,
+    chunk.chunkDay,
+    chunk.chunkSeq,
+  );
+  // Content replay is scoped to the FULL chunk identity: only this exact
+  // (device, stream, day, seq) chunk with an equal digest is a replay. An
+  // equal digest anywhere else is a coincidence and proceeds as an insert.
+  if (current && current.chunk_digest === chunk.chunkDigest) {
+    return telemetryV1ChunkReceipt(env, current, deviceId);
+  }
+  // Same-digest replay answered above, so a declared revision must extend
+  // the current one by exactly one; anything else means the client's cursor
+  // disagrees with the journal and must re-fetch the manifest.
+  if (current
+    ? chunk.chunkRevision !== current.revision + 1
+    : chunk.chunkRevision !== 1) {
+    throw new ApiError(409, "CHUNK_REVISION_CONFLICT");
+  }
+  const admission = await telemetryV1ChunkAdmission(
+    env.USAGE_MONITOR_DB,
+    participant.id,
+    deviceId,
+  );
+  if (admission.state === "exhausted") {
+    throw telemetryV1ChunkAdmissionError(admission);
+  }
+
+  const chunkRowId = `chunk:${crypto.randomUUID()}`;
+  const r2Key = `telemetry/v1-${crypto.randomUUID()}`;
+  const createdAt = new Date().toISOString();
+  await putTrackedQuarantineObject(
+    env.USAGE_MONITOR_DB,
+    env.QUARANTINE,
+    {
+      contributionId: chunkRowId,
+      objectKind: "telemetry",
+      r2Key,
+      registeredAt: createdAt,
+    },
+    JSON.stringify(envelope),
+    {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: {
+        contributionId: chunkRowId,
+        schemaVersion: TELEMETRY_V1_ENVELOPE_SCHEMA_VERSION,
+        plaintextSchemaVersion: chunk.schemaVersion,
+        synthetic: "false",
+      },
+    },
+  );
   try {
+    const result = await insertTelemetryV1Chunk(env.USAGE_MONITOR_DB, {
+      participantId: participant.id,
+      deviceId,
+      deviceUploadAuthorizationId: uploadAuthorization.authorizationId,
+      chunkRowId,
+      r2Key,
+      envelopeDigest: envelopeDigestValue,
+      chunk,
+      supersedes: current,
+      createdAt,
+    });
+    const [acknowledgedThroughDay, settledAdmission] = await Promise.all([
+      telemetryV1AcknowledgedThroughDay(
+        env.USAGE_MONITOR_DB,
+        participant.id,
+        deviceId,
+      ),
+      telemetryV1ChunkAdmission(env.USAGE_MONITOR_DB, participant.id, deviceId),
+    ]);
+    return jsonResponse({
+      schemaVersion: "telemetry-chunk-receipt-v1.0",
+      contributionId: chunkRowId,
+      chunkId: chunk.chunkId,
+      chunkRevision: chunk.chunkRevision,
+      status: "accepted",
+      supersededRevision: current?.revision ?? null,
+      recordCounts: {
+        declared: chunk.records.length,
+        accepted: result.acceptedRecords,
+      },
+      acknowledgedThroughDay,
+      admission: settledAdmission,
+    }, 202);
+  } catch (error) {
+    // The journal batch can have committed before this response was built.
+    // A found current row with this exact identity and digest makes this an
+    // indeterminate, committed outcome; only a proven-absent row permits
+    // removing the orphaned quarantine object.
+    const replay = await currentTelemetryV1Chunk(
+      env.USAGE_MONITOR_DB,
+      participant.id,
+      deviceId,
+      chunk.stream,
+      chunk.chunkDay,
+      chunk.chunkSeq,
+    );
+    if (replay && replay.chunk_digest === chunk.chunkDigest) {
+      return telemetryV1ChunkReceipt(env, replay, deviceId);
+    }
+    try {
+      await env.QUARANTINE.delete(r2Key);
+      await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, {
+        contributionId: chunkRowId,
+        r2Key,
+      });
+    } catch {
+      // The reconciliation registration remains durable by design.
+    }
+    // Trigger aborts and constraint races already carry their typed codes
+    // from the repository mapping; only untyped failures fall through to
+    // the admission recheck that distinguishes a raced budget exhaustion
+    // from a genuine internal error.
+    if (error instanceof ApiError) throw error;
+    const retryAdmission = await telemetryV1ChunkAdmission(
+      env.USAGE_MONITOR_DB,
+      participant.id,
+      deviceId,
+    );
+    if (retryAdmission.state === "exhausted") {
+      throw telemetryV1ChunkAdmissionError(retryAdmission);
+    }
+    throw error;
+  }
+}
+
+const SYNC_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
+const DAY_MILLISECONDS = 24 * 60 * 60 * 1000;
+
+/**
+ * Shared admission and authentication for the v1.0 cursor read endpoints.
+ * The device bearer is the sole authority, exactly as for upload
+ * registration; a browser cookie on these endpoints is always a mistake.
+ */
+async function deviceSyncPrincipal(
+  request: Request,
+  env: Env,
+): Promise<{ participantId: string; deviceId: string }> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  assertAdmissionBindings(env);
+  await assertAttemptAllowed(
+    env.RECOVERY_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "device_sync",
+  );
+  if (request.headers.has("cookie")) {
+    throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  }
+  const device = await authenticateDevice(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("authorization"),
+  );
+  if (await hasDeletionTombstone(env.DELETION_LEDGER, device.participantId)) {
+    throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  }
+  return { participantId: device.participantId, deviceId: device.deviceId };
+}
+
+async function handleDeviceSyncState(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const device = await deviceSyncPrincipal(request, env);
+  const [state, admission] = await Promise.all([
+    telemetryV1SyncState(
+      env.USAGE_MONITOR_DB,
+      device.participantId,
+      device.deviceId,
+    ),
+    telemetryV1ChunkAdmission(
+      env.USAGE_MONITOR_DB,
+      device.participantId,
+      device.deviceId,
+    ),
+  ]);
+  return jsonResponse({ ...state, admission });
+}
+
+async function handleDeviceSyncManifest(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const device = await deviceSyncPrincipal(request, env);
+  const url = new URL(request.url);
+  const fromDay = url.searchParams.get("fromDay");
+  const toDay = url.searchParams.get("toDay");
+  if (fromDay === null || toDay === null
+      || !SYNC_DAY_PATTERN.test(fromDay) || !SYNC_DAY_PATTERN.test(toDay)) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const fromEpoch = Date.parse(`${fromDay}T00:00:00.000Z`);
+  const toEpoch = Date.parse(`${toDay}T00:00:00.000Z`);
+  if (!Number.isFinite(fromEpoch) || !Number.isFinite(toEpoch)
+      || fromEpoch > toEpoch) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  if ((toEpoch - fromEpoch) / DAY_MILLISECONDS + 1
+      > MAX_SYNC_MANIFEST_RANGE_DAYS) {
+    throw new ApiError(400, "SYNC_RANGE_TOO_LARGE");
+  }
+  return jsonResponse(await telemetryV1SyncManifest(
+    env.USAGE_MONITOR_DB,
+    device.participantId,
+    device.deviceId,
+    fromDay,
+    toDay,
+  ));
+}
+
+async function handleContribution(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  assertUploadIngressConfiguration(env);
+  assertUploadIngressRateLimitBindings(env);
+  const bodyReadPolicy = uploadIngressBodyReadPolicy(env);
+  const authorizationHeader = contributionRequestPreflight(request);
+  await assertUploadIngressRequestAllowed(
+    env.UPLOAD_INGRESS_REQUEST_RATE_LIMIT,
+    env.UPLOAD_INGRESS_CLIENT_RATE_LIMIT,
+    request,
+    env,
+  );
+  // This lease intentionally begins before body consumption. A public request
+  // with a syntactically valid bearer header can otherwise force 2 MiB reads,
+  // JSON parsing, hashing, or a D1 token lookup without entering the shared
+  // budget. Rejections do not consume the one-use authorization, so a client
+  // can honor Retry-After and retry the exact prepared envelope.
+  const ingressLease = await acquireUploadIngressLease(env);
+  const heartbeat = startUploadIngressLeaseHeartbeat(env, ingressLease);
+  let completed = false;
+  let claimed: {
+    authorizationId: string;
+    participantId: string;
+    authorizationKind: "session" | "device";
+  } | null = null;
+  try {
+    const body = await readBoundedJson(request, bodyReadPolicy);
+    await heartbeat.assertActive();
+    const contentType = request.headers.get("content-type")?.trim() ?? "";
+    const bodyBytes = body.bytes.byteLength;
+    const scopeDigest = await sha256Hex(body.bytes);
+    await heartbeat.assertActive();
+    await assertCollectionControl(env.USAGE_MONITOR_DB, "processing");
+    claimed = authorizationHeader.startsWith("Upload um_device_upload_")
+      ? await claimDeviceUploadAuthorization(
+        env.USAGE_MONITOR_DB,
+        authorizationHeader,
+        { envelopeDigest: scopeDigest, bodyBytes, contentType },
+      )
+      : await claimUploadAuthorization(
+        env.USAGE_MONITOR_DB,
+        authorizationHeader,
+        { envelopeDigest: scopeDigest, bodyBytes, contentType },
+      );
+    await heartbeat.assertActive();
     if (!hasExactEnvelopeKeyOccurrences(body.raw)) {
       throw new ApiError(400, "ENVELOPE_INVALID");
     }
@@ -1672,9 +2504,14 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
     if (await hasDeletionTombstone(env.DELETION_LEDGER, participant.id)) {
       throw new ApiError(401, "UPLOAD_AUTH_INVALID");
     }
-    const response = Reflect.get(body.value, "schemaVersion") === "telemetry-envelope-v0.1"
+    await heartbeat.assertActive();
+    const declaredEnvelopeVersion = Reflect.get(body.value, "schemaVersion");
+    const response = declaredEnvelopeVersion === "telemetry-envelope-v0.1"
       ? await handleTelemetryContribution(request, body, participant, claimed, env)
-      : await handleSyntheticContribution(body, participant, claimed, env);
+      : declaredEnvelopeVersion === TELEMETRY_V1_ENVELOPE_SCHEMA_VERSION
+        ? await handleTelemetryV1Contribution(body, participant, claimed, env)
+        : await handleSyntheticContribution(body, participant, claimed, env);
+    await heartbeat.assertActive();
     const receipt = await response.clone().json<{ contributionId?: unknown }>();
     if (typeof receipt.contributionId !== "string") {
       throw new ApiError(500, "INTERNAL_ERROR");
@@ -1695,17 +2532,32 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
     completed = true;
     return response;
   } finally {
-    if (!completed) {
-      if (claimed.authorizationKind === "device") {
-        await abandonDeviceUploadAuthorization(
-          env.USAGE_MONITOR_DB,
-          claimed.authorizationId,
-        );
-      } else {
-        await abandonUploadAuthorization(
-          env.USAGE_MONITOR_DB,
-          claimed.authorizationId,
-        );
+    try {
+      if (!completed && claimed !== null) {
+        if (claimed.authorizationKind === "device") {
+          await abandonDeviceUploadAuthorization(env.USAGE_MONITOR_DB, claimed.authorizationId);
+        } else {
+          await abandonUploadAuthorization(env.USAGE_MONITOR_DB, claimed.authorizationId);
+        }
+      }
+    } catch {
+      // Preserve the original client-visible status and leave a redacted
+      // operational signal if the best-effort token revocation itself fails.
+      console.error(JSON.stringify({
+        level: "error",
+        event: "upload_authorization_abandon_failed",
+      }));
+    } finally {
+      await heartbeat.stop();
+      try {
+        await releaseUploadIngressLease(env, ingressLease);
+      } catch {
+        // The renewals leave a finite availability backstop. Do not turn an
+        // already committed contribution into a client failure.
+        console.warn(JSON.stringify({
+          level: "warn",
+          event: "upload_ingress_lease_release_failed",
+        }));
       }
     }
   }
@@ -1802,10 +2654,10 @@ async function handleExport(request: Request, env: Env): Promise<Response> {
       for (const item of page.rows) {
         yield serializeContribution({
           ...telemetryContributionMetadata(item.contribution),
-          records: item.records.map((record) => ({
-            kind: record.record_kind,
-            value: JSON.parse(record.record_json) as unknown,
-          })),
+          records: item.records.flatMap((record) => {
+            const value = parseStoredRecordJson(record.record_json);
+            return value ? [{ kind: record.record_kind, value }] : [];
+          }),
         });
       }
       cursor = page.nextCursor;
@@ -1846,6 +2698,13 @@ async function handleDelete(request: Request, env: Env): Promise<Response> {
   if (request.method !== "DELETE") methodNotAllowed(["DELETE"]);
   const session = await personalSession(request, env, true, true);
   assertCsrf(request, session);
+  if (identityRequired(env)) {
+    await assertPinnedIdentityLinkSecretConfiguration(
+      env.USAGE_MONITOR_DB,
+      Reflect.get(env, "IDENTITY_LINK_SECRET"),
+      Reflect.get(env, "IDENTITY_LINK_SECRET_VERSION"),
+    );
+  }
   if (session.participantState === "active") {
     await markParticipantDeleting(
       env.USAGE_MONITOR_DB,
@@ -1862,11 +2721,45 @@ async function handleDelete(request: Request, env: Env): Promise<Response> {
     env.DELETION_LEDGER,
     session.participantId,
   );
+  const identityLinkKey = await participantIdentityLinkKeyForDeletion(
+    env.USAGE_MONITOR_DB,
+    session.participantId,
+    session.sessionId,
+  );
+  if (identityLinkKey !== null) {
+    const rawIdentityLinkSecret = Reflect.get(env, "IDENTITY_LINK_SECRET");
+    if (typeof rawIdentityLinkSecret !== "string"
+        || rawIdentityLinkSecret.length < 32) {
+      if (identityRequired(env)) {
+        throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
+      }
+    } else {
+      const cooldownDigest = await identityReenrollmentCooldownDigest(
+        rawIdentityLinkSecret,
+        identityLinkKey,
+      );
+      // Persist the primary marker before dropping the old unique link key.
+      // The external ledger remains the independent restoration safeguard;
+      // this primary marker is what makes fresh INSERT admission atomic.
+      await recordPrimaryIdentityReenrollmentCooldown(
+        env.USAGE_MONITOR_DB,
+        cooldownDigest,
+      );
+      await recordIdentityReenrollmentCooldownFromDigest(
+        env.DELETION_LEDGER,
+        cooldownDigest,
+      );
+    }
+  }
   const contributions = await listContributions(env.USAGE_MONITOR_DB, session.participantId);
   if (contributions.length > MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT) {
     throw new ApiError(500, "INTERNAL_ERROR");
   }
   const telemetryTotal = await telemetryContributionCount(
+    env.USAGE_MONITOR_DB,
+    session.participantId,
+  );
+  const telemetryV1Total = await telemetryV1ChunkCount(
     env.USAGE_MONITOR_DB,
     session.participantId,
   );
@@ -1886,18 +2779,36 @@ async function handleDelete(request: Request, env: Env): Promise<Response> {
     }
     cursor = page.nextCursor;
   } while (cursor);
+  let chunkCursor: { createdAt: string; chunkRowId: string } | null = null;
+  do {
+    const page = await telemetryV1ChunkR2KeyPage(
+      env.USAGE_MONITOR_DB,
+      session.participantId,
+      chunkCursor,
+    );
+    if (page.rows.length > 0) {
+      await env.QUARANTINE.delete(page.rows.map((row) => row.r2Key));
+    }
+    chunkCursor = page.nextCursor;
+  } while (chunkCursor);
   const currentTelemetryTotal = await telemetryContributionCount(
     env.USAGE_MONITOR_DB,
     session.participantId,
   );
-  if (currentTelemetryTotal !== telemetryTotal) {
+  const currentTelemetryV1Total = await telemetryV1ChunkCount(
+    env.USAGE_MONITOR_DB,
+    session.participantId,
+  );
+  if (currentTelemetryTotal !== telemetryTotal
+      || currentTelemetryV1Total !== telemetryV1Total) {
     throw new ApiError(409, "UPLOAD_IN_PROGRESS");
   }
   await finishParticipantDeletion(env.USAGE_MONITOR_DB, session.participantId);
   return jsonResponse({
     deleted: true,
     participantId: session.participantId,
-    contributionsDeleted: contributions.length + telemetryTotal,
+    contributionsDeleted: contributions.length + telemetryTotal
+      + telemetryV1Total,
   }, 200, { "set-cookie": clearedSessionCookie(), vary: "Cookie" });
 }
 
@@ -1963,6 +2874,7 @@ async function handleAdminOverview(request: Request, env: Env): Promise<Response
       enrollmentMode: env.ENROLLMENT_MODE,
       accountScopedIngestMode: env.ACCOUNT_SCOPED_INGEST_MODE,
       diagnosticReference: reference ?? undefined,
+      ingress: await readUploadIngressStatus(env),
     }),
     200,
     { "cache-control": "no-store", vary: "Cookie" },
@@ -2007,6 +2919,16 @@ async function handleAdminAction(request: Request, env: Env): Promise<Response> 
           quarantineReconciliationComplete: result.quarantineReconciliationComplete,
           expiredIdentityHandoffsPurged: result.expiredIdentityHandoffsPurged,
           expiredIdentityHandoffPurgeComplete: result.expiredIdentityHandoffPurgeComplete,
+          expiredDeletionTombstonesPurged: result.expiredDeletionTombstonesPurged,
+          deletionTombstonePurgeComplete: result.deletionTombstonePurgeComplete,
+          expiredPrimaryIdentityReenrollmentCooldownsPurged:
+            result.expiredPrimaryIdentityReenrollmentCooldownsPurged,
+          primaryIdentityReenrollmentCooldownPurgeComplete:
+            result.primaryIdentityReenrollmentCooldownPurgeComplete,
+          expiredIdentityReenrollmentCooldownsPurged:
+            result.expiredIdentityReenrollmentCooldownsPurged,
+          identityReenrollmentCooldownPurgeComplete:
+            result.identityReenrollmentCooldownPurgeComplete,
           aggregateRebuildComplete: result.aggregateRebuildComplete,
           publicationEnabled: result.publicationEnabled,
         },
@@ -2095,6 +3017,82 @@ async function handleCommunityStats(request: Request, env: Env): Promise<Respons
   return new Response(snapshot.payloadJson, { headers });
 }
 
+const COMMUNITY_DAILY_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
+const COMMUNITY_DAILY_MAX_RANGE_DAYS = 366;
+const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
+
+function communityDailyRangeDay(value: string | null): string {
+  if (value === null || !COMMUNITY_DAILY_DAY_PATTERN.test(value)) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const epoch = Date.parse(`${value}T00:00:00.000Z`);
+  // The round-trip comparison rejects calendar-impossible dates such as
+  // 2026-02-31 that Date.parse silently normalizes.
+  if (!Number.isFinite(epoch)
+      || new Date(epoch).toISOString().slice(0, 10) !== value) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  return value;
+}
+
+async function handleCommunityDaily(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "publication");
+  await assertPublicAggregateReadAllowed(env.PUBLIC_READ_RATE_LIMIT, request, env);
+  const parameters = new URL(request.url).searchParams;
+  for (const name of parameters.keys()) {
+    if (name !== "from" && name !== "to") {
+      throw new ApiError(400, "BODY_INVALID");
+    }
+  }
+  const from = communityDailyRangeDay(parameters.get("from"));
+  const to = communityDailyRangeDay(parameters.get("to"));
+  const rangeDays = 1 + Math.round(
+    (Date.parse(`${to}T00:00:00.000Z`) - Date.parse(`${from}T00:00:00.000Z`))
+      / MILLISECONDS_PER_DAY,
+  );
+  if (rangeDays < 1 || rangeDays > COMMUNITY_DAILY_MAX_RANGE_DAYS) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const rows = await readPublishedCommunityDailyAggregates(
+    env.USAGE_MONITOR_DB,
+    from,
+    to,
+  );
+  const days = rows.map((row) => {
+    let payload: unknown;
+    try {
+      payload = JSON.parse(row.payload_json);
+    } catch {
+      // Published rows are hash-stamped and immutable; an unparseable payload
+      // is storage corruption, not a client problem.
+      throw new ApiError(500, "INTERNAL_ERROR");
+    }
+    return {
+      day: row.day,
+      revision: row.revision,
+      releasedAt: row.released_at,
+      payload,
+    };
+  });
+  return jsonResponse(
+    {
+      schemaVersion: "community-daily-read-v1.0",
+      from,
+      to,
+      days,
+    },
+    200,
+    // Every returned revision is immutable, but the latest-revision selection
+    // is not: withdrawal and late-data recomputation both move it. A modest
+    // shared lifetime keeps the read cheap without pinning a stale revision.
+    { "cache-control": "public, max-age=300" },
+  );
+}
+
 const CONTRIBUTION_ID_PATTERN =
   /^contribution:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
@@ -2132,10 +3130,10 @@ async function handleContributionResource(
     );
     return jsonResponse({
       ...telemetryContributionMetadata(row),
-      records: records.map((record) => ({
-        kind: record.record_kind,
-        value: JSON.parse(record.record_json) as unknown,
-      })),
+      records: records.flatMap((record) => {
+        const value = parseStoredRecordJson(record.record_json);
+        return value ? [{ kind: record.record_kind, value }] : [];
+      }),
     }, 200, { vary: "Cookie" });
   }
   if (!await markTelemetryContributionDeleting(
@@ -2172,8 +3170,9 @@ interface RetentionReadinessRow {
 
 async function aggregateRebuildComplete(db: D1Database): Promise<boolean> {
   const row = await db.prepare(
-    `SELECT EXISTS (
-      SELECT 1 FROM community_weekly_snapshot_rebuilds
+    `SELECT (
+      EXISTS (SELECT 1 FROM community_weekly_snapshot_rebuilds)
+      OR EXISTS (SELECT 1 FROM community_daily_aggregate_rebuilds)
     ) AS pending`,
   ).first<{ pending: number }>();
   if (row?.pending !== 0 && row?.pending !== 1) {
@@ -2212,6 +3211,12 @@ async function handleReady(
   nowEpoch = Date.now(),
 ): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
+  assertAdmissionBindings(env);
+  assertUploadAuthorizationBindings(env);
+  assertUploadIngressRateLimitBindings(env);
+  assertUploadIngressConfiguration(env);
+  assertSignInStartAdmissionConfiguration(env);
+  await probeUploadIngressBudget(env);
   const retention = await env.USAGE_MONITOR_DB.prepare(
     `SELECT state, last_completed_at, maintenance_run_at,
             quarantine_retention_complete, restore_replay_complete
@@ -2271,6 +3276,8 @@ async function routeApi(
       return handleRetiredAppleDomainAssociation();
     case "enroll":
       return handleEnroll(request, env);
+    case "sparkle_appcast_guard":
+      return handleSparkleAppcastGuard(request, env);
     case "identity_google_start":
       return handleIdentityGoogleStart(request, env);
     case "identity_google_callback":
@@ -2303,6 +3310,12 @@ async function routeApi(
       return handleDevicePairingClaim(request, env);
     case "device_upload_authorization":
       return handleDeviceUploadAuthorization(request, env);
+    case "device_disconnect":
+      return handleDeviceDisconnect(request, env);
+    case "device_sync_state":
+      return handleDeviceSyncState(request, env);
+    case "device_sync_manifest":
+      return handleDeviceSyncManifest(request, env);
     case "participant_devices":
       return handleDevices(request, env);
     case "participant_device_revocation":
@@ -2321,6 +3334,8 @@ async function routeApi(
       return handleStats(request, env);
     case "community_stats":
       return handleCommunityStats(request, env);
+    case "community_daily":
+      return handleCommunityDaily(request, env);
     case "participant":
       if (request.method === "DELETE") return handleDelete(request, env);
       return handleMe(request, env);
@@ -2333,6 +3348,24 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   const url = new URL(request.url);
   const route = matchWorkerRoute(url.pathname);
   try {
+    // Hostname split for the owner-only admin surface. When PUBLIC_ORIGIN is
+    // pinned, the admin UI and /api/v1/admin/* exist solely on
+    // admin.<public host> behind Cloudflare Access; every request there must
+    // carry a verifiable Cf-Access-Jwt-Assertion (defense in depth beneath
+    // the edge policy), and the public origin keeps its deliberate 404s.
+    // Development environments pin no PUBLIC_ORIGIN and are unchanged.
+    const configuredAdminHostname = adminHostname(env);
+    if (configuredAdminHostname !== null) {
+      if (url.hostname === configuredAdminHostname) {
+        await verifyAdminAccessAssertion(request, env);
+        const adminUi = adminUiResponse(request.method, url.pathname);
+        if (adminUi !== null) return adminUi;
+      } else if (isAdminSurfacePath(url.pathname)
+        || (route.kind === "exact"
+          && (route.id === "admin_overview" || route.id === "admin_action"))) {
+        throw new ApiError(404, "NOT_FOUND");
+      }
+    }
     if (route.id === "ready") {
       return noStore(await handleReady(request, env));
     }
@@ -2340,6 +3373,11 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (request.method !== "GET") methodNotAllowed(["GET"]);
       const enrollmentMode = configuredEnrollmentMode(env);
       assertAdmissionBindings(env);
+      assertUploadAuthorizationBindings(env);
+      assertUploadIngressRateLimitBindings(env);
+      assertUploadIngressConfiguration(env);
+      assertSignInStartAdmissionConfiguration(env);
+      await probeUploadIngressBudget(env);
       const collectionControls = await readCollectionControls(
         env.USAGE_MONITOR_DB,
       );
@@ -2363,10 +3401,14 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         "SELECT schema_version FROM deletion_tombstones LIMIT 1",
       ).first();
       await env.QUARANTINE.head("__usage_monitor_health_probe__");
+      const deploymentSourceCommit = configuredDeploymentSourceCommit(env);
       return noStore(jsonResponse({
         status: "ok",
         mode: "synthetic-and-private-telemetry",
         enrollmentMode,
+        ...(deploymentSourceCommit === null
+          ? {}
+          : { deployment: { sourceCommit: deploymentSourceCommit } }),
         collectionControls: {
           state: collectionControls.state,
           enrollment: collectionControls.enrollment
@@ -2393,6 +3435,11 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
               : "implementation_disabled",
             externalParticipantsAuthorized: false,
           },
+          incrementalContribution: {
+            schemaVersion: "telemetry-contribution-v1.0",
+            status: "implementation_ready",
+            externalParticipantsAuthorized: false,
+          },
         },
         capabilities: {
           encryptedUpload: collectionControls.processing,
@@ -2406,13 +3453,16 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           deletionSafeRestoreReplay: true,
           ongoingDeviceUploadRegistration:
             collectionControls.uploadRegistration,
+          coordinatedSignInAdmission: true,
         },
       }));
     }
     if (route.id === "unknown_api") throw new ApiError(404, "NOT_FOUND");
     if (route.id !== "asset") {
       const response = await routeApi(request, env, route.id);
-      return route.id === "community_stats" ? response : noStore(response);
+      return route.id === "community_stats" || route.id === "community_daily"
+        ? response
+        : noStore(response);
     }
     const asset = await env.ASSETS.fetch(request);
     const headers = new Headers(asset.headers);
@@ -2472,6 +3522,19 @@ interface ScheduledMaintenanceLog {
   quarantineReconciliationComplete: boolean;
   expiredIdentityHandoffsPurged: number;
   expiredIdentityHandoffPurgeComplete: boolean;
+  expiredDeletionTombstonesPurged: number;
+  deletionTombstonePurgeComplete: boolean;
+  expiredPrimaryIdentityReenrollmentCooldownsPurged: number;
+  primaryIdentityReenrollmentCooldownPurgeComplete: boolean;
+  expiredIdentityReenrollmentCooldownsPurged: number;
+  identityReenrollmentCooldownPurgeComplete: boolean;
+  expiredSignInAdmissionsPurged: number;
+  signInAdmissionPurgeComplete: boolean;
+  staleDevicePairingsRevoked: number;
+  staleDeviceCredentialsRevoked: number;
+  staleDeviceUploadAuthorizationsRevoked: number;
+  expiredDeviceCredentialRotationsPurged: number;
+  expiredDevicePairingEventsPurged: number;
   aggregateRebuildComplete: boolean;
   publicationEnabled: boolean | null;
 }
@@ -2542,6 +3605,19 @@ export async function runScheduledMaintenance(
   let quarantineReconciliationComplete = false;
   let expiredIdentityHandoffsPurged = 0;
   let expiredIdentityHandoffPurgeComplete = false;
+  let expiredDeletionTombstonesPurged = 0;
+  let deletionTombstonePurgeComplete = false;
+  let expiredPrimaryIdentityReenrollmentCooldownsPurged = 0;
+  let primaryIdentityReenrollmentCooldownPurgeComplete = false;
+  let expiredIdentityReenrollmentCooldownsPurged = 0;
+  let identityReenrollmentCooldownPurgeComplete = false;
+  let expiredSignInAdmissionsPurged = 0;
+  let signInAdmissionPurgeComplete = false;
+  let staleDevicePairingsRevoked = 0;
+  let staleDeviceCredentialsRevoked = 0;
+  let staleDeviceUploadAuthorizationsRevoked = 0;
+  let expiredDeviceCredentialRotationsPurged = 0;
+  let expiredDevicePairingEventsPurged = 0;
   let rebuildComplete = false;
   let publicationEnabled: boolean | null = null;
   let maintenanceLease: string | null = null;
@@ -2559,6 +3635,19 @@ export async function runScheduledMaintenance(
         quarantineReconciliationComplete,
         expiredIdentityHandoffsPurged,
         expiredIdentityHandoffPurgeComplete,
+        expiredDeletionTombstonesPurged,
+        deletionTombstonePurgeComplete,
+        expiredPrimaryIdentityReenrollmentCooldownsPurged,
+        primaryIdentityReenrollmentCooldownPurgeComplete,
+        expiredIdentityReenrollmentCooldownsPurged,
+        identityReenrollmentCooldownPurgeComplete,
+        expiredSignInAdmissionsPurged,
+        signInAdmissionPurgeComplete,
+        staleDevicePairingsRevoked,
+        staleDeviceCredentialsRevoked,
+        staleDeviceUploadAuthorizationsRevoked,
+        expiredDeviceCredentialRotationsPurged,
+        expiredDevicePairingEventsPurged,
         aggregateRebuildComplete: rebuildComplete,
         publicationEnabled,
       };
@@ -2579,6 +3668,40 @@ export async function runScheduledMaintenance(
     );
     expiredIdentityHandoffsPurged = handoffPurge.purged;
     expiredIdentityHandoffPurgeComplete = handoffPurge.complete;
+    const deletionTombstonePurge = await purgeExpiredDeletionTombstones(
+      env.DELETION_LEDGER,
+    );
+    expiredDeletionTombstonesPurged = deletionTombstonePurge.purged;
+    deletionTombstonePurgeComplete = deletionTombstonePurge.complete;
+    const primaryIdentityReenrollmentCooldownPurge =
+      await purgeExpiredPrimaryIdentityReenrollmentCooldowns(
+        env.USAGE_MONITOR_DB,
+      );
+    expiredPrimaryIdentityReenrollmentCooldownsPurged =
+      primaryIdentityReenrollmentCooldownPurge.purged;
+    primaryIdentityReenrollmentCooldownPurgeComplete =
+      primaryIdentityReenrollmentCooldownPurge.complete;
+    const identityReenrollmentCooldownPurge =
+      await purgeExpiredIdentityReenrollmentCooldowns(
+        env.DELETION_LEDGER,
+      );
+    expiredIdentityReenrollmentCooldownsPurged =
+      identityReenrollmentCooldownPurge.purged;
+    identityReenrollmentCooldownPurgeComplete =
+      identityReenrollmentCooldownPurge.complete;
+    const signInAdmissionPurge = await purgeExpiredSignInStartAdmissions(
+      env.USAGE_MONITOR_DB,
+    );
+    expiredSignInAdmissionsPurged = signInAdmissionPurge.purged;
+    signInAdmissionPurgeComplete = signInAdmissionPurge.complete;
+    const deviceLifecycle = await purgeStaleDeviceLifecycleRows(
+      env.USAGE_MONITOR_DB,
+    );
+    staleDevicePairingsRevoked = deviceLifecycle.pairingsRevoked;
+    staleDeviceCredentialsRevoked = deviceLifecycle.devicesRevoked;
+    staleDeviceUploadAuthorizationsRevoked = deviceLifecycle.uploadsRevoked;
+    expiredDeviceCredentialRotationsPurged = deviceLifecycle.rotationsPurged;
+    expiredDevicePairingEventsPurged = deviceLifecycle.pairingEventsPurged;
     await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
     const lifecycle = await runBackendLifecycle(
       env.USAGE_MONITOR_DB,
@@ -2589,6 +3712,8 @@ export async function runScheduledMaintenance(
         env.USAGE_MONITOR_DB,
         ownedMaintenanceLease,
       ),
+      Reflect.get(env, "IDENTITY_LINK_SECRET"),
+      !identityRequired(env),
     );
     quarantineRetentionComplete =
       lifecycle.quarantineRetentionComplete;
@@ -2620,7 +3745,12 @@ export async function runScheduledMaintenance(
         env.USAGE_MONITOR_DB,
         scheduledTime,
       );
-      rebuildComplete = !rebuild.remaining;
+      await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
+      const dailyRebuild = await rebuildPendingCommunityDailyAggregates(
+        env.USAGE_MONITOR_DB,
+        scheduledTime,
+      );
+      rebuildComplete = !rebuild.remaining && !dailyRebuild.remaining;
     } else {
       rebuildComplete = await aggregateRebuildComplete(
         env.USAGE_MONITOR_DB,
@@ -2630,6 +3760,10 @@ export async function runScheduledMaintenance(
     const complete = lifecycleComplete
       && quarantineReconciliationComplete
       && expiredIdentityHandoffPurgeComplete
+      && deletionTombstonePurgeComplete
+      && primaryIdentityReenrollmentCooldownPurgeComplete
+      && identityReenrollmentCooldownPurgeComplete
+      && signInAdmissionPurgeComplete
       && rebuildComplete;
     const log: ScheduledMaintenanceLog = {
       level: "info",
@@ -2642,6 +3776,19 @@ export async function runScheduledMaintenance(
       quarantineReconciliationComplete,
       expiredIdentityHandoffsPurged,
       expiredIdentityHandoffPurgeComplete,
+      expiredDeletionTombstonesPurged,
+      deletionTombstonePurgeComplete,
+      expiredPrimaryIdentityReenrollmentCooldownsPurged,
+      primaryIdentityReenrollmentCooldownPurgeComplete,
+      expiredIdentityReenrollmentCooldownsPurged,
+      identityReenrollmentCooldownPurgeComplete,
+      expiredSignInAdmissionsPurged,
+      signInAdmissionPurgeComplete,
+      staleDevicePairingsRevoked,
+      staleDeviceCredentialsRevoked,
+      staleDeviceUploadAuthorizationsRevoked,
+      expiredDeviceCredentialRotationsPurged,
+      expiredDevicePairingEventsPurged,
       aggregateRebuildComplete: rebuildComplete,
       publicationEnabled,
     };
@@ -2659,6 +3806,19 @@ export async function runScheduledMaintenance(
       quarantineReconciliationComplete,
       expiredIdentityHandoffsPurged,
       expiredIdentityHandoffPurgeComplete,
+      expiredDeletionTombstonesPurged,
+      deletionTombstonePurgeComplete,
+      expiredPrimaryIdentityReenrollmentCooldownsPurged,
+      primaryIdentityReenrollmentCooldownPurgeComplete,
+      expiredIdentityReenrollmentCooldownsPurged,
+      identityReenrollmentCooldownPurgeComplete,
+      expiredSignInAdmissionsPurged,
+      signInAdmissionPurgeComplete,
+      staleDevicePairingsRevoked,
+      staleDeviceCredentialsRevoked,
+      staleDeviceUploadAuthorizationsRevoked,
+      expiredDeviceCredentialRotationsPurged,
+      expiredDevicePairingEventsPurged,
       aggregateRebuildComplete: rebuildComplete,
       publicationEnabled,
     };

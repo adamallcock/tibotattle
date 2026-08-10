@@ -9,7 +9,7 @@ status: complete
 
 ## Purpose
 
-This is the supporting chart and metric map for the portable report `2026-07-24-simple-quota-gradient-report.html`. The report intentionally treats the simplest observable relationship as primary: Standard OpenAI API-priced local usage versus observed quota percentage consumption inside one reset identity.
+This is the supporting chart and metric map for the owner-only portable report `.usage-monitor/legacy-reports/2026-07-24-simple-quota-gradient-report.html`. The report intentionally treats the simplest observable relationship as primary: Standard OpenAI API-priced local usage versus observed quota percentage consumption inside one reset identity.
 
 ## Source map
 
@@ -115,6 +115,6 @@ The gradient is a descriptive conversion between two observed series. It is not 
 npm run build:rolling-history
 npm run build:simple-report-data
 node $HOME/.codex/plugins/cache/openai-curated-remote/data-analytics/0.2.8-13ceeea1f599/skills/build-report/scripts/deliver_portable_artifact.mjs \
-  --input 2026-07-24-simple-quota-gradient-artifact.json \
-  --output 2026-07-24-simple-quota-gradient-report.html
+  --input .usage-monitor/legacy-reports/2026-07-24-simple-quota-gradient-artifact.json \
+  --output .usage-monitor/legacy-reports/2026-07-24-simple-quota-gradient-report.html
 ```

@@ -2,6 +2,7 @@ import Ajv from "ajv";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { safeValidationErrors } from "./safe-validation-errors.js";
 
 export const EXPORT_WORKSPACE_DISCARD_PLAN_VERSION = "local-export-workspace-discard-plan-v0.1";
 export const EXPORT_WORKSPACE_DISCARD_PREFLIGHT_VERSION = "usage-export-workspace-discard-preflight-v0.1";
@@ -48,20 +49,12 @@ const validators = {
   receipt: ajv.compile(exportWorkspaceDiscardReceiptSchema),
 };
 
-function safeErrors(errors = []) {
-  return errors.slice(0, 20).map((error) => ({
-    path: error.instancePath || "/",
-    keyword: error.keyword,
-    schemaPath: error.schemaPath,
-  }));
-}
-
 function invariant(path, name) {
   return { path, keyword: "invariant", schemaPath: `#/x-invariant/${name}` };
 }
 
 function validate(name, value, semantic = () => []) {
-  if (!validators[name](value)) return { valid: false, errors: safeErrors(validators[name].errors) };
+  if (!validators[name](value)) return { valid: false, errors: safeValidationErrors(validators[name].errors) };
   const errors = semantic(value).slice(0, 20);
   return { valid: errors.length === 0, errors };
 }

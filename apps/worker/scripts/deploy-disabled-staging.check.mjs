@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  COMPATIBLE_DEPLOY_CONFIRMATION,
   DEPLOY_CONFIRMATION,
   runDisabledStagingDeployment,
 } from "./deploy-disabled-staging.mjs";
@@ -85,6 +86,10 @@ function runDeployment(options) {
       packageCount: 2,
       packages: [],
     }),
+    stageAssets: async () => ({
+      directory: "fixture-generated-worker-assets",
+      files: 4,
+    }),
     ...options,
   });
 }
@@ -105,6 +110,126 @@ test("deployment requires an exact confirmation before any command", async () =>
   });
   assert.deepEqual(result, { ok: false, code: "CONFIRMATION_REQUIRED" });
   assert.deepEqual(calls, []);
+});
+
+test("pre-migration compatibility phase deploys the disabled Worker without claiming live proof", async (t) => {
+  const config = provisionedConfig();
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-staging-identity-"));
+  const identityReceiptFile = join(root, "deployment-identity.json");
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const calls = [];
+  let liveProbeCalled = false;
+  const result = await runDeployment({
+    config,
+    origin: stagingOrigin,
+    phase: "pre_migration_compatibility",
+    confirmation: COMPATIBLE_DEPLOY_CONFIRMATION,
+    identityReceiptFile,
+    expectedSourceCommit: "c26823c",
+    spawn: (_command, args) => {
+      calls.push(args);
+      if (args[0] === "deploy") {
+        return { status: 0, stdout: `Deployed ${stagingOrigin}`, stderr: "" };
+      }
+      liveProbeCalled = true;
+      return { status: 0, stdout: "", stderr: "" };
+    },
+    fetchImpl: async () => {
+      liveProbeCalled = true;
+      return containedFetch();
+    },
+  });
+  const { deploymentIdentity, ...resultSummary } = result;
+  assert.deepEqual(resultSummary, {
+    ok: true,
+    code: "COMPATIBLE_DISABLED_STAGING_DEPLOYED",
+    collectionAuthorized: false,
+    receiptRequired: true,
+    liveContainmentObserved: false,
+    runtimeConfiguration: "disabled_contained",
+  });
+  const identity = JSON.parse(await readFile(identityReceiptFile, "utf8"));
+  assert.equal(identity.deployment.origin, stagingOrigin);
+  assert.equal(identity.deployment.sourceCommit, "c26823c");
+  assert.equal(identity.deployment.revisionObserved, false);
+  assert.deepEqual(deploymentIdentity, identity);
+  assert.deepEqual(calls, [[
+    "deploy", "--env", "staging", "--strict",
+    "--var", "DEPLOYMENT_SOURCE_COMMIT:c26823c",
+  ]]);
+  assert.equal(liveProbeCalled, false);
+});
+
+test("pre-migration compatibility requires a durable identity receipt before checks or Wrangler", async () => {
+  const calls = [];
+  const result = await runDeployment({
+    config: provisionedConfig(),
+    origin: stagingOrigin,
+    phase: "pre_migration_compatibility",
+    confirmation: COMPATIBLE_DEPLOY_CONFIRMATION,
+    checkWorkspacePackages: async () => calls.push("workspace"),
+    stageAssets: async () => calls.push("assets"),
+    spawn: () => calls.push("deploy"),
+  });
+  assert.deepEqual(result, {
+    ok: false,
+    code: "STAGING_DEPLOYMENT_IDENTITY_RECEIPT_REQUIRED",
+  });
+  assert.deepEqual(calls, []);
+});
+
+test("pre-migration compatibility refuses an open or unexpected staged runtime configuration", async (t) => {
+  for (const scenario of [
+    {
+      name: "enrollment enabled",
+      mutate: (config) => {
+        config.env.staging.vars.ENROLLMENT_MODE = "open";
+      },
+      blocker: "CONFIG_ENROLLMENT_DISABLED",
+    },
+    {
+      name: "account-scoped ingest enabled",
+      mutate: (config) => {
+        config.env.staging.vars.ACCOUNT_SCOPED_INGEST_MODE = "open";
+      },
+      blocker: "CONFIG_ACCOUNT_SCOPED_INGEST_DISABLED",
+    },
+    {
+      name: "upload ingress queue enabled",
+      mutate: (config) => {
+        config.env.staging.vars.UPLOAD_INGRESS_QUEUE_MODE = "enabled";
+      },
+      blocker: "CONFIG_NO_UNEXPECTED_VARIABLES",
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      let workspaceChecked = false;
+      let assetsChecked = false;
+      let spawned = false;
+      const result = await runDeployment({
+        config: scenario.mutate(provisionedConfig()),
+        origin: stagingOrigin,
+        phase: "pre_migration_compatibility",
+        confirmation: COMPATIBLE_DEPLOY_CONFIRMATION,
+        checkWorkspacePackages: async () => {
+          workspaceChecked = true;
+        },
+        stageAssets: async () => {
+          assetsChecked = true;
+        },
+        spawn: () => {
+          spawned = true;
+          return { status: 0, stdout: `Deployed ${stagingOrigin}` };
+        },
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.code, "STAGING_COMPATIBLE_RUNTIME_CONFIGURATION_BLOCKED");
+      assert.equal(result.blockers.includes(scenario.blocker), true);
+      assert.equal(workspaceChecked, false);
+      assert.equal(assetsChecked, false);
+      assert.equal(spawned, false);
+    });
+  }
 });
 
 test("deployment accepts only a bare HTTPS staging origin", async () => {
@@ -178,6 +303,29 @@ test("deployment fails closed on an unexpected package-check failure", async () 
   assert.equal(wranglerCalled, false);
 });
 
+test("deployment refuses unverified generated public assets before Wrangler", async () => {
+  let wranglerCalled = false;
+  const result = await runDeployment({
+    config: provisionedConfig(),
+    origin: stagingOrigin,
+    confirmation: DEPLOY_CONFIRMATION,
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    stageAssets: async () => {
+      throw new Error("generated public asset manifest is invalid");
+    },
+    spawn: () => {
+      wranglerCalled = true;
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.deepEqual(result, {
+    ok: false,
+    code: "STAGING_PUBLIC_ASSETS_INVALID",
+  });
+  assert.equal(wranglerCalled, false);
+});
+
 test("deployment runs only after live readiness and verifies contained health", async () => {
   const config = provisionedConfig();
   const calls = [];
@@ -212,6 +360,15 @@ test("deployment runs only after live readiness and verifies contained health", 
   assert.equal(result.receipt.operation, "disabled_staging_deployed");
   assert.equal(result.receipt.activationState, "not_authorized");
   assert.equal(result.receipt.evidence.pilotSchemaCurrent, true);
+  assert.equal(result.receipt.evidence.remoteReadOnlyProof, true);
+  assert.equal(result.receipt.evidence.migrationInventoryCurrent, true);
+  assert.equal(result.receipt.evidence.primaryReenrollmentSchemaCurrent, true);
+  assert.equal(result.receipt.evidence.deletionLedgerSchemaCurrent, true);
+  assert.equal(result.receipt.evidence.identityProtectionSchemaCurrent, true);
+  assert.equal(
+    result.receipt.evidence.identityProtectionSchema.status,
+    "verified",
+  );
   assert.equal(result.receipt.evidence.healthContained, true);
   assert.equal(result.receipt.evidence.lifecycleReadiness, "not_ready");
   assert.deepEqual(calls.at(-1), [
@@ -221,6 +378,44 @@ test("deployment runs only after live readiness and verifies contained health", 
   assert.equal(requested[0].options.redirect, "error");
   assert.equal(requested[1].url, `${stagingOrigin}/api/ready`);
   assert.equal(requested[1].options.redirect, "error");
+});
+
+test("deployment refuses missing identity protection before Wrangler deploy", async (t) => {
+  for (const scenario of [
+    {
+      name: "primary re-enrollment protection",
+      options: { missingPrimarySchema: true },
+      blocker: "REMOTE_IDENTITY_REENROLLMENT_SCHEMA_INCOMPLETE",
+    },
+    {
+      name: "deletion-ledger cooldown protection",
+      options: { missingDeletionLedgerSchema: true },
+      blocker: "REMOTE_DELETION_LEDGER_SCHEMA_INCOMPLETE",
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const config = provisionedConfig();
+      const calls = [];
+      let fetchCalled = false;
+      const result = await runDeployment({
+        config,
+        origin: stagingOrigin,
+        confirmation: DEPLOY_CONFIRMATION,
+        wrangler: "/fake/wrangler",
+        workerDirectory,
+        spawn: successSpawn(config, calls, scenario.options),
+        fetchImpl: async () => {
+          fetchCalled = true;
+          return containedFetch();
+        },
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.code, "STAGING_READINESS_BLOCKED");
+      assert.equal(result.blockers.includes(scenario.blocker), true);
+      assert.equal(calls.some((args) => args[0] === "deploy"), false);
+      assert.equal(fetchCalled, false);
+    });
+  }
 });
 
 test("deployment refuses a health response with any collection path enabled", async () => {

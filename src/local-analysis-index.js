@@ -20,6 +20,9 @@ import { dirname, join, resolve } from "node:path";
 import { Worker } from "node:worker_threads";
 import { DatabaseSync } from "node:sqlite";
 import {
+  isValidQuotaWindowDuration,
+} from "@app-usagemonitor/quota-analysis";
+import {
   canonicalComponents,
   createLeadingRateLimitGate,
   deltaComponentPresence,
@@ -28,18 +31,23 @@ import {
   subtractUsage,
 } from "./codex-log-scan.js";
 import { stableJson } from "./export/index.js";
+import { validAbortSignal } from "./valid-abort-signal.js";
 
 export const LOCAL_ANALYSIS_INDEX_SCHEMA_VERSION =
-  "local-analysis-index-v3";
-// Bumped when extraction changes what the index can hold. v3 gated quota
-// admission; v4 stops the chunk reader from rebuilding a record out of a reused
-// buffer, so every index built before it is missing whichever records happened
-// to straddle a read boundary and must be rebuilt rather than reused.
+  "local-analysis-index-v5";
+// Bumped when extraction or index semantics change. v3 gated quota admission;
+// v4 stops the chunk reader from rebuilding a record out of a reused buffer, so
+// every index built before it is missing whichever records happened to straddle
+// a read boundary; v5 keeps provider-reported quota duration in the leading
+// window identity and refuses out-of-range cached quota facts; v6 preserves the
+// reviewed Spark and Codex auto-review model identities instead of collapsing
+// them into "unknown" (every index built before it stored those events under
+// the unrecognised label, so it has to be rebuilt, not migrated).
 export const LOCAL_ANALYSIS_INDEX_PARSER_VERSION =
-  "parallel-jsonl-accounting-v4";
+  "parallel-jsonl-accounting-v6";
 
 const INDEX_APPLICATION_ID = 0x554d4149;
-const INDEX_USER_VERSION = 3;
+const INDEX_USER_VERSION = 5;
 const DEFAULT_CHUNK_BYTES = 64 * 1024 * 1024;
 const MAXIMUM_WORKERS = 10;
 const BOUNDARY_BYTES = 4 * 1024;
@@ -83,18 +91,28 @@ const DIAGNOSTIC_DEFAULTS = Object.freeze({
   rolloutsByAgentScope: {},
 });
 const COMPACT_SEQUENCE_VERSION = 1;
+const SOURCE_INDEX_STATES = new Set(["pending", "complete"]);
+const COVERAGE_BLOCK_REASONS = new Set([
+  "directory_entries",
+  "rollout_files",
+  "interrupted",
+  "timeout",
+  "disk_space",
+  "storage_unavailable",
+]);
+
+function canonicalInstant(value) {
+  if (typeof value !== "string") return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value
+    ? value
+    : null;
+}
 
 function fixedError(code) {
   const error = new Error(code);
   error.code = code;
   return error;
-}
-
-function validAbortSignal(signal) {
-  return signal === null
-    || (typeof signal === "object"
-      && typeof signal.aborted === "boolean"
-      && typeof signal.addEventListener === "function");
 }
 
 function throwIfAborted(signal) {
@@ -404,14 +422,42 @@ async function completeLinePrefix(path, size) {
       constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
     );
     const metadata = await handle.stat();
+    // `nlink !== 1` used to be part of this guard and is deliberately not.
+    //
+    // The guard exists to catch a source changing underneath a resumable pass,
+    // and a hard-link count does not detect that: a second directory entry
+    // pointing at the same inode cannot alter the bytes being read through a
+    // handle already opened with O_NOFOLLOW, stat-ed on that handle, and
+    // ownership-checked below. What it did do was abort the entire archive
+    // pass. Fourteen of this machine's 3,709 rollout files carry nlink 2 or 3
+    // - all from a single day, the shape left by an archive move that links
+    // into `archived_sessions/` before unlinking from `sessions/` - and those
+    // fourteen were enough to fail every refresh with
+    // `local_analysis_source_changed` and freeze the archive index at 1,224 of
+    // 3,709 sources, while the dashboard reported that indexing was "still
+    // advancing".
+    //
+    // The protections that actually bound this read are retained: O_NOFOLLOW
+    // refuses a symlink, `isFile` refuses anything else, the size check
+    // refuses a truncation, and the uid check refuses a file this user does
+    // not own.
     if (!metadata.isFile()
         || metadata.isSymbolicLink()
-        || metadata.nlink !== 1
         || metadata.size < size
         || (typeof process.getuid === "function"
           && metadata.uid !== process.getuid())) {
       throw fixedError("local_analysis_source_changed");
     }
+    // Codex rollout files normally finish with a newline. Checking that one
+    // byte first avoids a 256 KiB tail read for every already-well-formed
+    // source during a resumable archive pass. The backward search below is
+    // retained only for an actively written or otherwise unterminated file.
+    const terminalByte = Buffer.allocUnsafe(1);
+    const terminalRead = await handle.read(terminalByte, 0, 1, size - 1);
+    if (terminalRead.bytesRead !== 1) {
+      throw fixedError("local_analysis_source_changed");
+    }
+    if (terminalByte[0] === 0x0a) return size;
     const maximum = Math.min(size, 16 * 1024 * 1024);
     let end = size;
     while (end > size - maximum) {
@@ -451,9 +497,19 @@ async function sourceBoundary(secret, path, prefixBytes) {
     );
     const metadata = await handle.stat({ bigint: true });
     const fileSize = Number(metadata.size);
+    // `nlink` is deliberately not checked here. An additional directory entry
+    // cannot alter bytes read through this already-opened O_NOFOLLOW handle
+    // whose type, size, ctime and ownership are verified, and the check's
+    // failure mode - failing the source and stalling history - is out of all
+    // proportion to what it detects. Honest provenance note: the hardlinks
+    // that originally tripped this family of guards turned out to be our own
+    // benchmark fixtures, not Codex archive behaviour as first claimed; the
+    // guard fired correctly on them, and it is removed because the response
+    // was wrong, not the detection. The secret-file guard keeps its link
+    // check: for a file this product creates itself, an extra link really is
+    // unexpected.
     if (!metadata.isFile()
         || metadata.isSymbolicLink()
-        || Number(metadata.nlink) !== 1
         || !Number.isSafeInteger(fileSize)
         || fileSize < prefixBytes
         || (typeof process.getuid === "function"
@@ -515,7 +571,6 @@ async function reuseUnchangedSourceProjection(info, prior) {
     const fileSize = Number(metadata.size);
     if (!metadata.isFile()
         || metadata.isSymbolicLink()
-        || Number(metadata.nlink) !== 1
         || !Number.isSafeInteger(fileSize)
         || fileSize !== Number(info.size)
         || !sameIdentity(prior, identityMetadata)
@@ -635,21 +690,42 @@ async function projectSources(
   return { sources, reusedCount };
 }
 
-function configureDatabase(
+// PRAGMA journal_mode returns a result row, so issuing it through exec()
+// prepares the statement without ever stepping it: SQLite discards the
+// requested change and the connection silently keeps its previous journal.
+// (synchronous and locking_mode return no row and do take effect through
+// exec().) The journal mode must be stepped via prepare().get() and the
+// granted mode verified -- a runtime that refuses the request would otherwise
+// leave staging paying for the on-disk rollback journal it asked not to have.
+function setJournalMode(database, mode) {
+  const granted = database
+    .prepare(`PRAGMA journal_mode = ${mode}`)
+    .get()?.journal_mode;
+  if (granted !== mode.toLowerCase()) {
+    throw fixedError("local_analysis_index_journal_mode_refused");
+  }
+}
+
+export function configureDatabase(
   database,
   { readOnly = false, staging = false } = {},
 ) {
   if (!readOnly) {
-    database.exec(staging
-      ? `
-        PRAGMA journal_mode=OFF;
+    if (staging) {
+      // journal_mode=OFF is refused by the bundled SQLite (readback stays
+      // "delete"). MEMORY is granted, and bounds the rollback journal to one
+      // in-memory commit batch instead of a journal file written to disk.
+      setJournalMode(database, "MEMORY");
+      database.exec(`
         PRAGMA synchronous=OFF;
         PRAGMA locking_mode=EXCLUSIVE;
-      `
-      : `
-        PRAGMA journal_mode=DELETE;
-        PRAGMA synchronous=FULL;
       `);
+    } else {
+      // DELETE+FULL measured faster than WAL on this workload; keep it, but
+      // step the journal mode with readback for the same silent-no-op reason.
+      setJournalMode(database, "DELETE");
+      database.exec("PRAGMA synchronous=FULL;");
+    }
   }
   database.exec(`
     PRAGMA foreign_keys=ON;
@@ -681,6 +757,20 @@ async function syncDirectory(path) {
     }
   } finally {
     await handle?.close().catch(() => {});
+  }
+}
+
+async function publishStagedIndex(stageFile, indexFile) {
+  const publishedFile = `${indexFile}.publish-${process.pid}-${randomBytes(6).toString("hex")}`;
+  try {
+    await copyFile(stageFile, publishedFile);
+    await chmod(publishedFile, 0o600);
+    await syncPath(publishedFile);
+    await rename(publishedFile, indexFile);
+    await syncDirectory(dirname(indexFile));
+    await chmod(indexFile, 0o600);
+  } finally {
+    await rm(publishedFile, { force: true }).catch(() => {});
   }
 }
 
@@ -717,7 +807,10 @@ function initializeSchema(database) {
       current_model_seen INTEGER NOT NULL DEFAULT 0
         CHECK(current_model_seen IN (0, 1)),
       previous_totals_json TEXT,
-      previous_presence_json TEXT
+      previous_presence_json TEXT,
+      scan_offset INTEGER NOT NULL DEFAULT 0 CHECK(scan_offset >= 0),
+      index_state TEXT NOT NULL DEFAULT 'pending'
+        CHECK(index_state IN ('pending', 'complete'))
     ) STRICT;
     CREATE INDEX sources_lineage ON sources(parent_source_key);
     CREATE TABLE source_snapshot_sets (
@@ -790,7 +883,7 @@ function initializeSchema(database) {
   `);
 }
 
-function validateDatabase(database) {
+function validateDatabase(database, { requireComplete = true } = {}) {
   const applicationId = Number(
     database.prepare("PRAGMA application_id").get().application_id,
   );
@@ -807,7 +900,8 @@ function validateDatabase(database) {
   );
   if (meta.schema_version !== LOCAL_ANALYSIS_INDEX_SCHEMA_VERSION
       || meta.parser_version !== LOCAL_ANALYSIS_INDEX_PARSER_VERSION
-      || meta.status !== "complete") {
+      || !["partial", "complete"].includes(meta.status)
+      || (requireComplete && meta.status !== "complete")) {
     throw fixedError("local_analysis_index_schema_invalid");
   }
   return meta;
@@ -815,7 +909,7 @@ function validateDatabase(database) {
 
 function openExistingIndex(
   indexFile,
-  { readOnly = true, staging = false } = {},
+  { readOnly = true, staging = false, requireComplete = true } = {},
 ) {
   let database;
   try {
@@ -824,7 +918,7 @@ function openExistingIndex(
       timeout: 5_000,
     });
     configureDatabase(database, { readOnly, staging });
-    const meta = validateDatabase(database);
+    const meta = validateDatabase(database, { requireComplete });
     return { database, meta };
   } catch (error) {
     if (database?.isOpen) database.close();
@@ -850,7 +944,8 @@ function readStoredSources(database) {
            device, inode, birthtime_ms, file_size, prefix_bytes, mtime_ms,
            ctime_ms, ctime_ns, boundary_start, boundary_hmac, surface, thread_source,
            agent_scope, lineage_disposition, current_model,
-           current_model_seen, previous_totals_json, previous_presence_json
+           current_model_seen, previous_totals_json, previous_presence_json,
+           scan_offset, index_state
     FROM sources
   `).iterate()].map((row) => [row.source_key, {
     sourceKey: row.source_key,
@@ -880,6 +975,10 @@ function readStoredSources(database) {
     previousPresence: row.previous_presence_json === null
       ? null
       : JSON.parse(row.previous_presence_json),
+    scanOffset: Number(row.scan_offset),
+    indexState: SOURCE_INDEX_STATES.has(row.index_state)
+      ? row.index_state
+      : "pending",
   }]));
 }
 
@@ -900,9 +999,20 @@ function descendantsOf(keys, sources) {
   return invalid;
 }
 
-function createChunks(source, startByte, chunkBytes) {
+function createChunks(
+  source,
+  startByte,
+  chunkBytes,
+  maximumBytes = Number.POSITIVE_INFINITY,
+) {
   const chunks = [];
+  let scheduledBytes = 0;
   for (let start = startByte; start < source.prefixBytes;) {
+    const length = Math.min(chunkBytes, source.prefixBytes - start);
+    // A source must advance at least one bounded chunk or it would be unable
+    // to make progress when its first readable chunk is larger than the
+    // selected pass budget. Later chunks respect the budget exactly.
+    if (scheduledBytes > 0 && scheduledBytes + length > maximumBytes) break;
     const end = Math.min(source.prefixBytes, start + chunkBytes);
     chunks.push({
       path: source.info.path,
@@ -913,9 +1023,159 @@ function createChunks(source, startByte, chunkBytes) {
       startByte: start,
       endByte: end,
     });
+    scheduledBytes += end - start;
     start = end;
   }
   return chunks;
+}
+
+function taskSlices(tasks, maximumCommitBytes) {
+  if (maximumCommitBytes === null || tasks.length === 0) {
+    return [tasks];
+  }
+  const slices = [];
+  let current = [];
+  let currentBytes = 0;
+  for (const task of tasks) {
+    const bytes = task.endByte - task.startByte;
+    if (current.length > 0 && currentBytes + bytes > maximumCommitBytes) {
+      slices.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+    current.push(task);
+    currentBytes += bytes;
+  }
+  if (current.length > 0) slices.push(current);
+  return slices;
+}
+
+function sourceEndOffsetsForTasks(tasks) {
+  const offsets = new Map();
+  for (const task of tasks) {
+    offsets.set(
+      task.sourceKey,
+      Math.max(offsets.get(task.sourceKey) ?? 0, task.endByte),
+    );
+  }
+  return offsets;
+}
+
+function validOptionalPositiveSafeInteger(value) {
+  return value === null
+    || (Number.isSafeInteger(value) && value >= 1);
+}
+
+// The shared leading-reading gate predates generic provider durations and uses
+// provider/limit/slot as its opaque identity. Keep the duration in the local
+// gate key until every caller has the duration-aware contract; the original
+// entry remains the payload returned to the index projection.
+function quotaGateIdentity(window) {
+  return {
+    ...window,
+    slot: `${window.slot}\u0000${window.windowDurationMins}`,
+  };
+}
+
+function createDurationAwareQuotaGate(settledWindows) {
+  const gate = createLeadingRateLimitGate(
+    settledWindows.map(quotaGateIdentity),
+  );
+  return {
+    offer(window, timestampMs, entry) {
+      return gate.offer(quotaGateIdentity(window), timestampMs, entry);
+    },
+    flush() {
+      return gate.flush();
+    },
+  };
+}
+
+function validOptionalDiscoveryLimits(value) {
+  return value === null
+    || (value
+      && typeof value === "object"
+      && !Array.isArray(value)
+      && Object.keys(value).length === 2
+      && Object.hasOwn(value, "maximumDirectoryEntries")
+      && Object.hasOwn(value, "maximumRolloutFiles")
+      && Number.isSafeInteger(value.maximumDirectoryEntries)
+      && value.maximumDirectoryEntries >= 1
+      && Number.isSafeInteger(value.maximumRolloutFiles)
+      && value.maximumRolloutFiles >= 1);
+}
+
+function planIndexBatch({
+  sources,
+  existingByKey,
+  resetKeys,
+  appendKeys,
+  maximumSourcesPerRefresh,
+  maximumScanBytesPerRefresh,
+  chunkBytes,
+}) {
+  const sourceLimit = maximumSourcesPerRefresh ?? Number.MAX_SAFE_INTEGER;
+  const byteLimit = maximumScanBytesPerRefresh ?? Number.POSITIVE_INFINITY;
+  const completeKeys = new Set();
+  const needsScan = new Set();
+  for (const source of sources) {
+    const prior = existingByKey.get(source.sourceKey);
+    const fullyIndexed = prior?.indexState === "complete"
+      && prior.scanOffset >= source.prefixBytes;
+    if (resetKeys.has(source.sourceKey)
+        || appendKeys.has(source.sourceKey)
+        || !fullyIndexed) {
+      needsScan.add(source.sourceKey);
+    } else {
+      completeKeys.add(source.sourceKey);
+    }
+  }
+  const tasks = [];
+  const sourceEndOffsets = new Map();
+  let scheduledSources = 0;
+  let scheduledBytes = 0;
+  for (const source of sources) {
+    if (!needsScan.has(source.sourceKey)) continue;
+    if (source.parentSourceKey !== null
+        && !completeKeys.has(source.parentSourceKey)) {
+      // A fork cannot be replay-safe until its parent snapshot set is fully
+      // durable. Leave it pending rather than approximating its inherited
+      // prefix from an incomplete parent.
+      continue;
+    }
+    const prior = existingByKey.get(source.sourceKey);
+    const startByte = resetKeys.has(source.sourceKey)
+      ? 0
+      : Math.min(prior?.scanOffset ?? 0, source.prefixBytes);
+    if (startByte >= source.prefixBytes) {
+      sourceEndOffsets.set(source.sourceKey, source.prefixBytes);
+      completeKeys.add(source.sourceKey);
+      continue;
+    }
+    if (scheduledSources >= sourceLimit) continue;
+    const remaining = byteLimit - scheduledBytes;
+    if (remaining <= 0 && tasks.length > 0) continue;
+    const sourceTasks = createChunks(
+      source,
+      startByte,
+      chunkBytes,
+      Number.isFinite(remaining)
+        ? Math.max(chunkBytes, remaining)
+        : Number.POSITIVE_INFINITY,
+    );
+    if (sourceTasks.length === 0) continue;
+    tasks.push(...sourceTasks);
+    scheduledSources += 1;
+    const endByte = sourceTasks.at(-1).endByte;
+    sourceEndOffsets.set(source.sourceKey, endByte);
+    scheduledBytes += endByte - startByte;
+    if (endByte >= source.prefixBytes) completeKeys.add(source.sourceKey);
+  }
+  return {
+    tasks,
+    sourceEndOffsets,
+    selectedKeys: new Set(sourceEndOffsets.keys()),
+  };
 }
 
 function balancedAssignments(tasks, workerCount) {
@@ -1138,7 +1398,8 @@ function resetSources(database, keys) {
   );
   const resetState = database.prepare(`
     UPDATE sources SET current_model='unknown', current_model_seen=0,
-      previous_totals_json=NULL, previous_presence_json=NULL
+      previous_totals_json=NULL, previous_presence_json=NULL,
+      scan_offset=0, index_state='pending'
     WHERE source_key=?
   `);
   for (const key of keys) {
@@ -1150,6 +1411,108 @@ function resetSources(database, keys) {
     deleteDiagnosticEvents.run(key);
     resetState.run(key);
   }
+}
+
+function markSourcesPending(database, keys) {
+  const markPending = database.prepare(`
+    UPDATE sources SET index_state='pending'
+    WHERE source_key=?
+  `);
+  for (const key of keys) markPending.run(key);
+}
+
+function markSourcesIndexed(database, completedOffsets) {
+  const update = database.prepare(`
+    UPDATE sources
+    SET scan_offset = ?,
+        index_state = CASE
+          WHEN ? >= prefix_bytes THEN 'complete'
+          ELSE 'pending'
+        END
+    WHERE source_key = ?
+  `);
+  for (const [sourceKeyValue, offset] of completedOffsets) {
+    update.run(offset, offset, sourceKeyValue);
+  }
+}
+
+function indexCoverage(database, sources) {
+  const rows = Object.fromEntries(
+    [...database.prepare(`
+      SELECT index_state, COUNT(*) AS source_count,
+             COALESCE(SUM(prefix_bytes), 0) AS source_bytes,
+             COALESCE(SUM(scan_offset), 0) AS indexed_bytes
+      FROM sources
+      GROUP BY index_state
+    `).iterate()].map((row) => [row.index_state, {
+      sourceCount: Number(row.source_count),
+      sourceBytes: Number(row.source_bytes),
+      indexedBytes: Number(row.indexed_bytes),
+    }]),
+  );
+  const complete = rows.complete ?? {
+    sourceCount: 0,
+    sourceBytes: 0,
+    indexedBytes: 0,
+  };
+  const pending = rows.pending ?? {
+    sourceCount: 0,
+    sourceBytes: 0,
+    indexedBytes: 0,
+  };
+  const sourceCount = sources.length;
+  const sourceBytes = sources.reduce(
+    (sum, source) => sum + source.prefixBytes,
+    0,
+  );
+  const indexedBytes = complete.sourceBytes + pending.indexedBytes;
+  return {
+    status: pending.sourceCount === 0 ? "complete" : "partial",
+    sourceCount,
+    indexedSourceCount: complete.sourceCount,
+    pendingSourceCount: pending.sourceCount,
+    sourceBytes,
+    indexedBytes: Math.min(sourceBytes, indexedBytes),
+  };
+}
+
+function coverageFromMeta(meta, sourceCount, sourceBytes) {
+  const value = (name) => Number(meta[name]);
+  const indexedSourceCount = value("indexed_source_count");
+  const pendingSourceCount = value("pending_source_count");
+  const indexedBytes = value("indexed_bytes");
+  const validCount = (count) => (
+    Number.isSafeInteger(count) && count >= 0 && count <= sourceCount
+  );
+  const validBytes = Number.isSafeInteger(indexedBytes)
+    && indexedBytes >= 0
+    && indexedBytes <= sourceBytes;
+  if (!validCount(indexedSourceCount)
+      || !validCount(pendingSourceCount)
+      || indexedSourceCount + pendingSourceCount !== sourceCount
+      || !validBytes) {
+    throw fixedError("local_analysis_index_schema_invalid");
+  }
+  const blockReason = meta.coverage_blocked_reason ?? "none";
+  if (blockReason !== "none" && !COVERAGE_BLOCK_REASONS.has(blockReason)) {
+    throw fixedError("local_analysis_index_schema_invalid");
+  }
+  const status = meta.status === "complete" && blockReason === "none"
+    ? "complete"
+    : "partial";
+  if (blockReason === "none"
+      && (status === "complete") !== (pendingSourceCount === 0)) {
+    throw fixedError("local_analysis_index_schema_invalid");
+  }
+  return {
+    status,
+    sourceCount,
+    indexedSourceCount,
+    pendingSourceCount,
+    sourceBytes,
+    indexedBytes,
+    ...(blockReason === "none" ? {} : { blockReason }),
+  };
 }
 
 function presenceFromMask(mask) {
@@ -1252,8 +1615,11 @@ async function deriveChangedSources({
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const settledQuotaWindows = database.prepare(`
-    SELECT DISTINCT provider, limit_id, slot
-    FROM quota_facts WHERE source_key = ?
+    SELECT DISTINCT provider, limit_id, slot, window_duration_mins
+    FROM quota_facts
+    WHERE source_key = ?
+      AND window_duration_mins BETWEEN 1 AND 525600
+      AND window_duration_mins = CAST(window_duration_mins AS INTEGER)
   `);
   const updateState = database.prepare(`
     UPDATE sources SET current_model=?, current_model_seen=?,
@@ -1347,6 +1713,8 @@ async function deriveChangedSources({
                window_duration_mins, resets_at, source_offset
         FROM ${schema}.quota_records
         WHERE source_key = ?
+          AND window_duration_mins BETWEEN 1 AND 525600
+          AND window_duration_mins = CAST(window_duration_mins AS INTEGER)
         ORDER BY source_offset, slot_order
       `),
     };
@@ -1433,11 +1801,12 @@ async function deriveChangedSources({
     let nextQuota = quotaIterator.next();
     // An appended source already committed its leading reading in an earlier
     // pass, so only a window this source has never recorded is still leading.
-    const leadingQuotaGate = createLeadingRateLimitGate(
+    const leadingQuotaGate = createDurationAwareQuotaGate(
       [...settledQuotaWindows.iterate(source.sourceKey)].map((row) => ({
         provider: row.provider,
         limitId: row.limit_id,
         slot: row.slot,
+        windowDurationMins: Number(row.window_duration_mins),
       })),
     );
     const commitQuota = async (entry) => {
@@ -1559,6 +1928,11 @@ async function deriveChangedSources({
             && Number(nextQuota.value.source_offset)
               === Number(row.source_offset)) {
           const quota = nextQuota.value;
+          const windowDurationMins = Number(quota.window_duration_mins);
+          if (!isValidQuotaWindowDuration(windowDurationMins)) {
+            nextQuota = quotaIterator.next();
+            continue;
+          }
           const entry = {
             sourceOffset: Number(row.source_offset),
             slotOrder: Number(quota.slot_order),
@@ -1569,7 +1943,7 @@ async function deriveChangedSources({
             limitId: quota.limit_id,
             slot: quota.slot,
             usedPercent: Number(quota.used_percent),
-            windowDurationMins: Number(quota.window_duration_mins),
+            windowDurationMins,
             resetsAt: Number(quota.resets_at),
           };
           const gated = leadingQuotaGate.offer(
@@ -1685,6 +2059,13 @@ async function deriveChangedSources({
         });
       }
     }
+    // The quota iterator advances only while token rows still trail it, so
+    // quota rows past the final drained offset leave the statement mid-step.
+    // An un-reset statement holds a read transaction on the extracted shard
+    // schema, and the later DETACH then fails with "database extract_N is
+    // locked" -- observed on the real corpus, dependent on row order and on
+    // whether garbage collection happened to finalize the abandoned iterator.
+    quotaIterator.return();
     for (const released of leadingQuotaGate.flush()) {
       await commitQuota(released);
     }
@@ -1737,6 +2118,7 @@ function updateMeta(database, {
   startAt,
   endAt,
   generatedAt,
+  coverage,
   sourceCount,
   sourceBytes,
   scanWallMs,
@@ -1751,12 +2133,16 @@ function updateMeta(database, {
   for (const [key, value] of Object.entries({
     schema_version: LOCAL_ANALYSIS_INDEX_SCHEMA_VERSION,
     parser_version: LOCAL_ANALYSIS_INDEX_PARSER_VERSION,
-    status: "complete",
+    status: coverage.status,
     generated_at: generatedAt,
     covered_start_at: startAt,
     covered_end_at: endAt,
     source_count: String(sourceCount),
     source_bytes: String(sourceBytes),
+    indexed_source_count: String(coverage.indexedSourceCount),
+    pending_source_count: String(coverage.pendingSourceCount),
+    indexed_bytes: String(coverage.indexedBytes),
+    coverage_blocked_reason: "none",
     last_scan_wall_ms: String(scanWallMs),
     last_scan_bytes: String(scanBytes),
     last_worker_count: String(workerCount),
@@ -1974,11 +2360,15 @@ function readIndexScan(database, {
              window_duration_mins, resets_at
       FROM quota_facts
       WHERE timestamp_ms >= ? AND timestamp_ms <= ?
+        AND window_duration_mins BETWEEN 1 AND 525600
+        AND window_duration_mins = CAST(window_duration_mins AS INTEGER)
       ORDER BY timestamp_ms, source_key, source_offset, slot_order
     `).iterate(startMs, endMs)) {
       throwIfAborted(signal);
       const source = sourceMap.get(row.source_key);
       if (!source) continue;
+      const windowDurationMins = Number(row.window_duration_mins);
+      if (!isValidQuotaWindowDuration(windowDurationMins)) continue;
       const quotaResult = onRateLimitSnapshot?.({
         timestamp: row.observed_at,
         timestampMs: Number(row.timestamp_ms),
@@ -1989,7 +2379,7 @@ function readIndexScan(database, {
           limitId: row.limit_id,
           slot: row.slot,
           usedPercent: Number(row.used_percent),
-          windowDurationMins: Number(row.window_duration_mins),
+          windowDurationMins,
           resetsAt: Number(row.resets_at),
         },
         surfaceClassification: {
@@ -2050,8 +2440,16 @@ export async function refreshLocalAnalysisIndex({
     Math.max(1, availableParallelism() - 2),
   ),
   chunkBytes = DEFAULT_CHUNK_BYTES,
+  // Optional per-refresh limits let a first full-history index make durable
+  // progress in bounded slices. They are deliberately opt-in: the existing
+  // fixed-window caller keeps its one-generation atomic behavior.
+  maximumSourcesPerRefresh = null,
+  maximumScanBytesPerRefresh = null,
+  maximumCommitBytes = null,
+  discoveryLimits = null,
   onUsage = null,
   onRateLimitSnapshot = null,
+  beforeStage = null,
 } = {}) {
   if (typeof indexFile !== "string"
       || typeof secretFile !== "string"
@@ -2066,9 +2464,14 @@ export async function refreshLocalAnalysisIndex({
       || !Number.isSafeInteger(chunkBytes)
       || chunkBytes < 4 * 1024 * 1024
       || chunkBytes > 256 * 1024 * 1024
+      || !validOptionalPositiveSafeInteger(maximumSourcesPerRefresh)
+      || !validOptionalPositiveSafeInteger(maximumScanBytesPerRefresh)
+      || !validOptionalPositiveSafeInteger(maximumCommitBytes)
+      || !validOptionalDiscoveryLimits(discoveryLimits)
       || (onUsage !== null && typeof onUsage !== "function")
       || (onRateLimitSnapshot !== null
-        && typeof onRateLimitSnapshot !== "function")) {
+        && typeof onRateLimitSnapshot !== "function")
+      || (beforeStage !== null && typeof beforeStage !== "function")) {
     throw new TypeError("Local analysis index options are invalid");
   }
   throwIfAborted(signal);
@@ -2082,10 +2485,11 @@ export async function refreshLocalAnalysisIndex({
     startAt,
     endAt,
     signal,
+    discoveryLimits,
   });
   let existing = null;
   try {
-    existing = openExistingIndex(indexFile);
+    existing = openExistingIndex(indexFile, { requireComplete: false });
   } catch (error) {
     if (![
       "local_analysis_index_unavailable",
@@ -2150,16 +2554,34 @@ export async function refreshLocalAnalysisIndex({
   // sources, copying a potentially large SQLite file just to record a
   // zero-byte refresh provides no new durable fact. Leave the complete,
   // verified generation in place and return the same indexed result.
-  if (existing !== null && changedKeys.size === 0 && removed.size === 0) {
+  const allSourcesAlreadyComplete = sources.every((source) => {
+    const prior = existingByKey.get(source.sourceKey);
+    return prior?.indexState === "complete"
+      && prior.scanOffset >= source.prefixBytes;
+  });
+  if (existing !== null
+      && existing.meta.status === "complete"
+      && changedKeys.size === 0
+      && removed.size === 0
+      && allSourcesAlreadyComplete) {
+    const sourceBytes = sources.reduce(
+      (sum, source) => sum + source.prefixBytes,
+      0,
+    );
     return {
       status: "reused",
       indexFile,
       sources,
       sourceCount: sources.length,
-      sourceBytes: sources.reduce(
-        (sum, source) => sum + source.prefixBytes,
-        0,
-      ),
+      sourceBytes,
+      coverage: {
+        status: "complete",
+        sourceCount: sources.length,
+        indexedSourceCount: sources.length,
+        pendingSourceCount: 0,
+        sourceBytes,
+        indexedBytes: sourceBytes,
+      },
       scanBytes: 0,
       workerCount,
       sourceProjectionReusedCount,
@@ -2168,6 +2590,11 @@ export async function refreshLocalAnalysisIndex({
       streamedScanResult: null,
     };
   }
+  // Staging duplicates the current index. Let the archive orchestrator make a
+  // conservative disk-headroom decision only after this no-op reuse path is
+  // known to be inapplicable, so a complete unchanged archive is never
+  // downgraded merely because a future deep budget would not currently fit.
+  if (beforeStage !== null) await beforeStage();
   const stageFile = `${indexFile}.building-${process.pid}-${randomBytes(6).toString("hex")}`;
   let database;
   let scanBytes = 0;
@@ -2184,6 +2611,7 @@ export async function refreshLocalAnalysisIndex({
       database = openExistingIndex(stageFile, {
         readOnly: false,
         staging: true,
+        requireComplete: false,
       }).database;
     }
     database.exec("BEGIN IMMEDIATE");
@@ -2197,138 +2625,175 @@ export async function refreshLocalAnalysisIndex({
         database,
         [...resetKeys].filter((key) => currentByKey.has(key)),
       );
+      markSourcesPending(database, append);
       database.exec("COMMIT");
     } catch (error) {
       if (database.isTransaction) database.exec("ROLLBACK");
       throw error;
     }
 
-    const tasks = [];
-    for (const source of sources) {
-      if (resetKeys.has(source.sourceKey)) {
-        tasks.push(...createChunks(source, 0, chunkBytes));
-      } else if (append.has(source.sourceKey)) {
-        tasks.push(...createChunks(
-          source,
-          existingByKey.get(source.sourceKey).prefixBytes,
-          chunkBytes,
-        ));
-      }
-    }
-    scanBytes = tasks.reduce(
-      (sum, task) => sum + task.endByte - task.startByte,
+    const batch = planIndexBatch({
+      sources,
+      existingByKey,
+      resetKeys,
+      appendKeys: append,
+      maximumSourcesPerRefresh,
+      maximumScanBytesPerRefresh,
+      chunkBytes,
+    });
+    const { tasks } = batch;
+    const sourceBytes = sources.reduce(
+      (sum, source) => sum + source.prefixBytes,
       0,
     );
-    if (tasks.length > 0) {
-      const extracted = await extractTasks({
-        tasks,
-        workerCount,
-        signal,
-        tempParent: dirname(indexFile),
-      });
-      workerResults = extracted.results;
-      shardDirectory = extracted.shardDirectory;
-      phaseWallMs.extraction = extracted.extractWallMs;
-      phaseWallMs.shardMerge = extracted.mergeWallMs;
-      attachedSchemas = attachExtractedShards(
-        database,
-        extracted.shardFiles,
-      );
-      const extractedSchemaBySource = new Map(
-        [...extracted.sourceShardIndexes].map(
-          ([sourceKeyValue, index]) => [
-            sourceKeyValue,
-            attachedSchemas[index],
-          ],
-        ),
-      );
-      const derivationStartedAt = performance.now();
-      database.exec("BEGIN IMMEDIATE");
-      try {
-        await deriveChangedSources({
-          database,
-          sources,
-          changedKeys,
-          resetKeys,
-          extractedSchemaBySource,
-          workerResults,
-          onUsage: existing === null ? onUsage : null,
-          onRateLimitSnapshot:
-            existing === null ? onRateLimitSnapshot : null,
-          projectionStartMs: Date.parse(startAt),
-          projectionEndMs: Date.parse(endAt),
-          signal,
-        });
-        database.exec("COMMIT");
-      } catch (error) {
-        if (database.isTransaction) database.exec("ROLLBACK");
-        throw error;
+    const resetPending = new Set(resetKeys);
+    const taskSourceKeys = new Set(tasks.map((task) => task.sourceKey));
+    const noTaskOffsets = new Map(
+      [...batch.sourceEndOffsets].filter(([key]) => !taskSourceKeys.has(key)),
+    );
+    const slices = taskSlices(tasks, maximumCommitBytes);
+    let coverage = null;
+    for (let sliceIndex = 0; sliceIndex < slices.length; sliceIndex += 1) {
+      const slice = slices[sliceIndex];
+      const completedOffsets = sourceEndOffsetsForTasks(slice);
+      if (sliceIndex === 0) {
+        for (const [key, offset] of noTaskOffsets) {
+          completedOffsets.set(key, offset);
+        }
       }
-      phaseWallMs.derivation =
-        performance.now() - derivationStartedAt;
-      detachExtractedShards(database, attachedSchemas);
-      attachedSchemas = [];
-      await rm(shardDirectory, { recursive: true, force: true });
-      shardDirectory = null;
-      const factIndexStartedAt = performance.now();
-      database.exec(`
-        CREATE INDEX IF NOT EXISTS usage_facts_time
-          ON usage_facts(timestamp_ms, source_key, source_offset);
-        CREATE INDEX IF NOT EXISTS quota_facts_time
-          ON quota_facts(
-            timestamp_ms, source_key, source_offset, slot_order
-          );
-      `);
-      phaseWallMs.factIndexes =
-        performance.now() - factIndexStartedAt;
-      if (existing === null) {
-        streamedScanResult = {
-          parserVersion: LOCAL_ANALYSIS_INDEX_PARSER_VERSION,
-          diagnostics: buildDiagnostics(
+      const selectedKeys = new Set(completedOffsets.keys());
+      scanBytes += slice.reduce(
+        (sum, task) => sum + task.endByte - task.startByte,
+        0,
+      );
+      if (slice.length > 0) {
+        const extracted = await extractTasks({
+          tasks: slice,
+          workerCount,
+          signal,
+          tempParent: dirname(indexFile),
+        });
+        workerResults = extracted.results;
+        shardDirectory = extracted.shardDirectory;
+        phaseWallMs.extraction = (phaseWallMs.extraction ?? 0)
+          + extracted.extractWallMs;
+        phaseWallMs.shardMerge = (phaseWallMs.shardMerge ?? 0)
+          + extracted.mergeWallMs;
+        attachedSchemas = attachExtractedShards(
+          database,
+          extracted.shardFiles,
+        );
+        const extractedSchemaBySource = new Map(
+          [...extracted.sourceShardIndexes].map(
+            ([sourceKeyValue, index]) => [
+              sourceKeyValue,
+              attachedSchemas[index],
+            ],
+          ),
+        );
+        const resetForSlice = new Set(
+          [...resetPending].filter((key) => selectedKeys.has(key)),
+        );
+        const derivationStartedAt = performance.now();
+        database.exec("BEGIN IMMEDIATE");
+        try {
+          await deriveChangedSources({
             database,
             sources,
-            Date.parse(startAt),
-            Date.parse(endAt),
-          ),
-          toolCallsByClass: {},
-          toolObservationsBySource: {},
-          serverBillableUnits: {},
-        };
+            changedKeys: selectedKeys,
+            resetKeys: resetForSlice,
+            extractedSchemaBySource,
+            workerResults,
+            onUsage: existing === null ? onUsage : null,
+            onRateLimitSnapshot:
+              existing === null ? onRateLimitSnapshot : null,
+            projectionStartMs: Date.parse(startAt),
+            projectionEndMs: Date.parse(endAt),
+            signal,
+          });
+          markSourcesIndexed(database, completedOffsets);
+          database.exec("COMMIT");
+        } catch (error) {
+          if (database.isTransaction) database.exec("ROLLBACK");
+          throw error;
+        }
+        for (const key of resetForSlice) resetPending.delete(key);
+        phaseWallMs.derivation = (phaseWallMs.derivation ?? 0)
+          + performance.now() - derivationStartedAt;
+        detachExtractedShards(database, attachedSchemas);
+        attachedSchemas = [];
+        await rm(shardDirectory, { recursive: true, force: true });
+        shardDirectory = null;
+        const factIndexStartedAt = performance.now();
+        database.exec(`
+          CREATE INDEX IF NOT EXISTS usage_facts_time
+            ON usage_facts(timestamp_ms, source_key, source_offset);
+          CREATE INDEX IF NOT EXISTS quota_facts_time
+            ON quota_facts(
+              timestamp_ms, source_key, source_offset, slot_order
+            );
+        `);
+        phaseWallMs.factIndexes = (phaseWallMs.factIndexes ?? 0)
+          + performance.now() - factIndexStartedAt;
+      } else if (completedOffsets.size > 0) {
+        database.exec("BEGIN IMMEDIATE");
+        try {
+          markSourcesIndexed(database, completedOffsets);
+          database.exec("COMMIT");
+        } catch (error) {
+          if (database.isTransaction) database.exec("ROLLBACK");
+          throw error;
+        }
       }
+      coverage = indexCoverage(database, sources);
+      updateMeta(database, {
+        startAt: new Date(startAt).toISOString(),
+        endAt: new Date(endAt).toISOString(),
+        generatedAt: new Date().toISOString(),
+        coverage,
+        sourceCount: sources.length,
+        sourceBytes,
+        scanWallMs: Math.round(performance.now() - startedAt),
+        scanBytes,
+        workerCount,
+        phaseWallMs,
+      });
+      const finalizeStartedAt = performance.now();
+      database.exec("PRAGMA optimize");
+      const integrity = database.prepare("PRAGMA quick_check").get();
+      if (integrity?.quick_check !== "ok") {
+        throw fixedError("local_analysis_index_integrity_failed");
+      }
+      await syncPath(stageFile);
+      await publishStagedIndex(stageFile, indexFile);
+      phaseWallMs.finalize = (phaseWallMs.finalize ?? 0)
+        + performance.now() - finalizeStartedAt;
     }
-    const generatedAt = new Date().toISOString();
-    updateMeta(database, {
-      startAt: new Date(startAt).toISOString(),
-      endAt: new Date(endAt).toISOString(),
-      generatedAt,
-      sourceCount: sources.length,
-      sourceBytes: sources.reduce(
-        (sum, source) => sum + source.prefixBytes,
-        0,
-      ),
-      scanWallMs: Math.round(performance.now() - startedAt),
-      scanBytes,
-      workerCount,
-      phaseWallMs,
-    });
-    const finalizeStartedAt = performance.now();
-    database.exec("PRAGMA optimize");
-    const integrity = database.prepare("PRAGMA quick_check").get();
-    if (integrity?.quick_check !== "ok") {
-      throw fixedError("local_analysis_index_integrity_failed");
+    if (coverage === null) {
+      throw fixedError("local_analysis_index_coverage_unavailable");
+    }
+    if (existing === null && coverage.status === "complete") {
+      streamedScanResult = {
+        parserVersion: LOCAL_ANALYSIS_INDEX_PARSER_VERSION,
+        diagnostics: buildDiagnostics(
+          database,
+          sources,
+          Date.parse(startAt),
+          Date.parse(endAt),
+        ),
+        toolCallsByClass: {},
+        toolObservationsBySource: {},
+        serverBillableUnits: {},
+      };
     }
     database.close();
     database = null;
-    await chmod(stageFile, 0o600);
-    await syncPath(stageFile);
-    await rename(stageFile, indexFile);
-    await syncDirectory(dirname(indexFile));
-    await chmod(indexFile, 0o600);
-    phaseWallMs.finalize = performance.now() - finalizeStartedAt;
     return {
       status: existing === null
         ? "built"
-        : changedKeys.size === 0 && removed.size === 0
+        : changedKeys.size === 0
+            && removed.size === 0
+            && batch.selectedKeys.size === 0
           ? "reused"
           : "updated",
       indexFile,
@@ -2338,6 +2803,7 @@ export async function refreshLocalAnalysisIndex({
         (sum, source) => sum + source.prefixBytes,
         0,
       ),
+      coverage,
       scanBytes,
       workerCount,
       sourceProjectionReusedCount,
@@ -2365,6 +2831,112 @@ export async function refreshLocalAnalysisIndex({
     }
     await rm(stageFile, { force: true }).catch(() => {});
   }
+}
+
+// Archive orchestration records only a fixed reason when discovery or a
+// deadline prevents a fresh completeness check. This deliberately does not
+// store a path, source name, exception message, or any raw source detail.
+// The next successful refresh clears the marker through updateMeta().
+export async function markLocalAnalysisIndexCoveragePartial({
+  indexFile = defaultLocalAnalysisIndexPath(),
+  reason,
+  observedAt = new Date().toISOString(),
+} = {}) {
+  const observedAtMs = typeof observedAt === "string"
+    ? Date.parse(observedAt)
+    : Number.NaN;
+  if (typeof indexFile !== "string"
+      || indexFile.length < 1
+      || !COVERAGE_BLOCK_REASONS.has(reason)
+      || typeof observedAt !== "string"
+      || !Number.isFinite(observedAtMs)
+      || new Date(observedAtMs).toISOString() !== observedAt) {
+    throw new TypeError("Local analysis coverage marker is invalid");
+  }
+  let database;
+  let initialMarkerFile = null;
+  let missing = false;
+  try {
+    await lstat(indexFile);
+  } catch (metadataError) {
+    if (metadataError?.code === "ENOENT") missing = true;
+    else throw metadataError;
+  }
+  try {
+    if (!missing) {
+      ({ database } = openExistingIndex(indexFile, {
+        readOnly: false,
+        requireComplete: false,
+      }));
+    } else {
+      // A first discovery can reach a safety cap before there is enough source
+      // metadata to build an ordinary index. Persist a zero-source partial
+      // marker in that precise case, so the UI can distinguish it from no
+      // attempted archive indexing. Do not replace a present unreadable or
+      // incompatible index: it remains a separate fail-closed condition.
+      await mkdir(dirname(indexFile), { recursive: true, mode: 0o700 });
+      initialMarkerFile = `${indexFile}.coverage-${process.pid}-${randomBytes(6).toString("hex")}`;
+      database = createFreshIndex(initialMarkerFile);
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        updateMeta(database, {
+          startAt: observedAt,
+          endAt: observedAt,
+          generatedAt: observedAt,
+          coverage: {
+            status: "partial",
+            sourceCount: 0,
+            indexedSourceCount: 0,
+            pendingSourceCount: 0,
+            sourceBytes: 0,
+            indexedBytes: 0,
+          },
+          sourceCount: 0,
+          sourceBytes: 0,
+          scanWallMs: 0,
+          scanBytes: 0,
+          workerCount: 0,
+          phaseWallMs: {},
+        });
+        database.exec("COMMIT");
+      } catch (initialError) {
+        if (database.isTransaction) database.exec("ROLLBACK");
+        throw initialError;
+      }
+    }
+    const set = database.prepare(`
+      INSERT INTO meta(key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value
+    `);
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      set.run("status", "partial");
+      set.run("coverage_blocked_reason", reason);
+      set.run("coverage_blocked_at", observedAt);
+      database.exec("COMMIT");
+    } catch (error) {
+      if (database.isTransaction) database.exec("ROLLBACK");
+      throw error;
+    }
+  } catch (error) {
+    if (initialMarkerFile !== null) {
+      await rm(initialMarkerFile, { force: true }).catch(() => {});
+    }
+    throw error;
+  } finally {
+    if (database?.isOpen) database.close();
+  }
+  if (initialMarkerFile === null) {
+    await syncPath(indexFile);
+  } else {
+    try {
+      await syncPath(initialMarkerFile);
+      await publishStagedIndex(initialMarkerFile, indexFile);
+    } finally {
+      await rm(initialMarkerFile, { force: true }).catch(() => {});
+    }
+  }
+  return { status: "partial", blockReason: reason };
 }
 
 export function createIndexedCodexLogScan({
@@ -2412,23 +2984,79 @@ export function createIndexedCodexLogScan({
   };
 }
 
+// Read an already-published index generation without rediscovering or parsing
+// raw rollout files. Archive accounting uses this to derive a bounded,
+// content-free aggregate from the durable index after each foreground pass.
+// `requireComplete=false` is deliberate: a partial archive may expose only
+// the events it has durably indexed, provided the caller labels that coverage
+// honestly and binds any saved projection to the same index generation.
+export function createLocalAnalysisIndexReadScan({
+  indexFile = defaultLocalAnalysisIndexPath(),
+  requireComplete = true,
+} = {}) {
+  if (typeof indexFile !== "string"
+      || indexFile.length < 1
+      || typeof requireComplete !== "boolean") {
+    throw new TypeError("Local analysis index read scan options are invalid");
+  }
+  return async function scanPublishedLocalAnalysisIndex({
+    startAt,
+    endAt,
+    onUsage,
+    onRateLimitSnapshot,
+    signal = null,
+  } = {}) {
+    if (typeof startAt !== "string"
+        || typeof endAt !== "string"
+        || canonicalInstant(startAt) !== startAt
+        || canonicalInstant(endAt) !== endAt
+        || Date.parse(startAt) > Date.parse(endAt)
+        || !validAbortSignal(signal)
+        || (onUsage !== undefined && typeof onUsage !== "function")
+        || (onRateLimitSnapshot !== undefined
+          && typeof onRateLimitSnapshot !== "function")) {
+      throw new TypeError("Local analysis index read scan request is invalid");
+    }
+    const { database } = openExistingIndex(indexFile, {
+      requireComplete,
+    });
+    try {
+      return await readIndexScan(database, {
+        sources: [...readStoredSources(database).values()],
+        startAt,
+        endAt,
+        onUsage,
+        onRateLimitSnapshot,
+        signal,
+      });
+    } finally {
+      database.close();
+    }
+  };
+}
+
 export async function writeLocalAnalysisIndexProjection({
   indexFile = defaultLocalAnalysisIndexPath(),
   kind = "replay_safe_accounting",
   schemaVersion,
   generatedAt,
   value,
+  requireCompleteIndex = true,
 } = {}) {
   if (typeof kind !== "string"
       || !/^[a-z][a-z0-9_]{0,63}$/u.test(kind)
       || typeof schemaVersion !== "string"
       || typeof generatedAt !== "string"
       || new Date(generatedAt).toISOString() !== generatedAt
+      || typeof requireCompleteIndex !== "boolean"
       || !value
       || typeof value !== "object") {
     throw new TypeError("Local analysis projection is invalid");
   }
-  const { database } = openExistingIndex(indexFile, { readOnly: false });
+  const { database } = openExistingIndex(indexFile, {
+    readOnly: false,
+    requireComplete: requireCompleteIndex,
+  });
   try {
     database.prepare(`
       INSERT INTO projections(
@@ -2453,13 +3081,18 @@ export async function readLocalAnalysisIndexProjection({
   indexFile = defaultLocalAnalysisIndexPath(),
   kind = "replay_safe_accounting",
   schemaVersion,
+  requireCompleteIndex = true,
 } = {}) {
-  if (typeof kind !== "string" || typeof schemaVersion !== "string") {
+  if (typeof kind !== "string"
+      || typeof schemaVersion !== "string"
+      || typeof requireCompleteIndex !== "boolean") {
     throw new TypeError("Local analysis projection request is invalid");
   }
   let opened;
   try {
-    opened = openExistingIndex(indexFile);
+    opened = openExistingIndex(indexFile, {
+      requireComplete: requireCompleteIndex,
+    });
     const row = opened.database.prepare(`
       SELECT schema_version, generated_at, value_json
       FROM projections WHERE kind = ?
@@ -2482,7 +3115,9 @@ export async function readLocalAnalysisIndexProjection({
 export async function inspectLocalAnalysisIndex({
   indexFile = defaultLocalAnalysisIndexPath(),
 } = {}) {
-  const { database, meta } = openExistingIndex(indexFile);
+  const { database, meta } = openExistingIndex(indexFile, {
+    requireComplete: false,
+  });
   try {
     const sourceCount = Number(
       database.prepare("SELECT COUNT(*) AS count FROM sources").get().count,
@@ -2516,6 +3151,10 @@ export async function inspectLocalAnalysisIndex({
       FROM source_diagnostics WHERE code = 'reassembledLineMismatches'
     `).get().count);
     const metadata = await stat(indexFile);
+    const sourceBytes = Number(database.prepare(
+      "SELECT COALESCE(SUM(prefix_bytes), 0) AS bytes FROM sources",
+    ).get().bytes);
+    const coverage = coverageFromMeta(meta, sourceCount, sourceBytes);
     return {
       schemaVersion: meta.schema_version,
       parserVersion: meta.parser_version,
@@ -2524,6 +3163,7 @@ export async function inspectLocalAnalysisIndex({
         startAt: meta.covered_start_at,
         endAt: meta.covered_end_at,
       },
+      coverage,
       sourceCount,
       usageFacts,
       quotaFacts,

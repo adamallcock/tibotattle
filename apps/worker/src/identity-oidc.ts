@@ -1,5 +1,6 @@
 import * as oauth from "oauth4webapi";
 
+import { sha256Hex } from "./crypto";
 import { ApiError, type ErrorCode } from "./errors";
 import { isDevelopmentEnvironment } from "./admission";
 
@@ -27,6 +28,12 @@ const APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys";
 const MAXIMUM_TOKEN_BYTES = 16 * 1024;
 const MAXIMUM_JWKS_BYTES = 64 * 1024;
 const CLOCK_SKEW_SECONDS = 300;
+const MAXIMUM_NONCE_LENGTH = 256;
+const NONCE_HASH_PATTERN = /^[0-9a-f]{64}$/u;
+// A provider key fetch is part of the browser callback's critical path. Keep
+// an unavailable provider from leaving the short-lived handoff in limbo.
+export const OIDC_PROVIDER_REQUEST_TIMEOUT_MILLISECONDS = 10_000;
+const MAXIMUM_PROVIDER_REQUEST_TIMEOUT_MILLISECONDS = 60_000;
 
 export interface VerifiedIdentity {
   provider: "google" | "apple";
@@ -116,44 +123,51 @@ function environmentJwksFetcher(env: Env): JwksFetcher | undefined {
 async function providerJwksFetcher(
   url: string,
   request: oauth.CustomFetchOptions<"GET">,
+  timeoutMilliseconds: number,
 ): Promise<Response> {
-  let response: Response;
   try {
-    response = await fetch(url, {
-      method: request.method,
-      headers: request.headers,
-      redirect: request.redirect,
-      signal: request.signal,
-    });
+    return await withOidcProviderTimeout(async (signal) => {
+      let response: Response;
+      try {
+        response = await fetch(url, {
+          method: request.method,
+          headers: request.headers,
+          redirect: request.redirect,
+          signal,
+        });
+      } catch {
+        throw new ProviderUnavailableError();
+      }
+      if (!response.ok) throw new ProviderUnavailableError();
+
+      let text: string;
+      try {
+        text = await response.text();
+      } catch {
+        throw new ProviderUnavailableError();
+      }
+      if (text.length > MAXIMUM_JWKS_BYTES) throw new ProviderUnavailableError();
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        throw new ProviderUnavailableError();
+      }
+      if (!isJsonWebKeySet(parsed)) throw new ProviderUnavailableError();
+
+      // oauth4webapi owns every security-sensitive JWKS operation after this
+      // bounded transport read: key filtering, key import, algorithm binding,
+      // cache lifetime, and JWS verification.
+      return new Response(text, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      });
+    }, timeoutMilliseconds, request.signal);
   } catch {
     throw new ProviderUnavailableError();
   }
-  if (!response.ok) throw new ProviderUnavailableError();
-
-  let text: string;
-  try {
-    text = await response.text();
-  } catch {
-    throw new ProviderUnavailableError();
-  }
-  if (text.length > MAXIMUM_JWKS_BYTES) throw new ProviderUnavailableError();
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw new ProviderUnavailableError();
-  }
-  if (!isJsonWebKeySet(parsed)) throw new ProviderUnavailableError();
-
-  // oauth4webapi owns every security-sensitive JWKS operation after this
-  // bounded transport read: key filtering, key import, algorithm binding,
-  // cache lifetime, and JWS verification.
-  return new Response(text, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-  });
 }
 
 function oidcClient(expectedAudience: string, nowMs: number): oauth.Client {
@@ -185,6 +199,8 @@ async function validateWithOauth4WebApi(
   idToken: string,
   nowMs: number,
   jwksFetcher: JwksFetcher | undefined,
+  expectedNonce: string | undefined,
+  timeoutMilliseconds: number,
 ): Promise<Record<string, unknown>> {
   const response = idTokenResponse(idToken);
   const tokenResponse = await oauth.processAuthorizationCodeResponse(
@@ -192,9 +208,10 @@ async function validateWithOauth4WebApi(
     oidcClient(expectedAudience, nowMs),
     response,
     {
-      // Neither hosted authorization request sends a nonce. Requiring its
-      // absence rejects a token replayed from a different OIDC transaction.
-      expectedNonce: oauth.expectNoNonce,
+      // Google keeps the historical no-nonce contract. Apple transactions
+      // opt into an exact expected nonce below; requiring that claim rejects
+      // a token replayed from a different OIDC transaction.
+      expectedNonce: expectedNonce ?? oauth.expectNoNonce,
       requireIdToken: true,
     },
   );
@@ -203,9 +220,12 @@ async function validateWithOauth4WebApi(
     [oauth.customFetch]: async (url, request) => {
       if (url !== server.jwksUrl) throw new ProviderUnavailableError();
       if (jwksFetcher !== undefined) {
-        return Response.json(await jwksFetcher(url));
+        return Response.json(await withOidcProviderTimeout(
+          () => jwksFetcher(url),
+          timeoutMilliseconds,
+        ));
       }
-      return providerJwksFetcher(url, request);
+      return providerJwksFetcher(url, request, timeoutMilliseconds);
     },
   };
   await oauth.validateApplicationLevelSignature(
@@ -216,6 +236,42 @@ async function validateWithOauth4WebApi(
   return oauth.getValidatedIdTokenClaims(tokenResponse) as Record<string, unknown>;
 }
 
+/**
+ * Reads only the unverified nonce claim needed to configure oauth4webapi's
+ * claim comparison.  Signature verification still happens immediately after
+ * processAuthorizationCodeResponse; this preliminary parse never authorizes
+ * an identity and is bound to the persisted digest below.  Keeping this
+ * helper local also prevents raw token/nonce material from entering logs.
+ */
+function unverifiedNonce(idToken: string): string {
+  const segments = idToken.split(".");
+  if (segments.length !== 3 || segments[1] === undefined) {
+    identityError("IDENTITY_TOKEN_INVALID");
+  }
+  const encoded = segments[1]!.replaceAll("-", "+").replaceAll("_", "/");
+  if (encoded.length === 0 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(encoded)) {
+    identityError("IDENTITY_TOKEN_INVALID");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(atob(encoded.padEnd(Math.ceil(encoded.length / 4) * 4, "=")));
+  } catch {
+    identityError("IDENTITY_TOKEN_INVALID");
+  }
+  if (typeof parsed !== "object"
+      || parsed === null
+      || Array.isArray(parsed)) {
+    identityError("IDENTITY_TOKEN_INVALID");
+  }
+  const nonce = Reflect.get(parsed, "nonce");
+  if (typeof nonce !== "string"
+      || nonce.length === 0
+      || nonce.length > MAXIMUM_NONCE_LENGTH) {
+    identityError("IDENTITY_TOKEN_INVALID");
+  }
+  return nonce;
+}
+
 export function identityRequired(env: Env): boolean {
   return !isDevelopmentEnvironment(env);
 }
@@ -223,7 +279,19 @@ export function identityRequired(env: Env): boolean {
 export async function verifyHostedIdentity(
   env: Env,
   identity: unknown,
-  options: { jwksFetcher?: JwksFetcher; nowMs?: number } = {},
+  options: {
+    jwksFetcher?: JwksFetcher;
+    nowMs?: number;
+    /** Raw request-scoped nonce, when a caller deliberately keeps it in memory. */
+    expectedNonce?: string;
+    /**
+     * SHA-256 hex digest of the nonce minted for this Apple transaction. The
+     * raw nonce is intentionally not persisted by the handoff repository.
+     */
+    expectedNonceHash?: string;
+    /** Internal test seam; production callers use the bounded default. */
+    timeoutMilliseconds?: number;
+  } = {},
 ): Promise<VerifiedIdentity> {
   if (typeof identity !== "object" || identity === null || Array.isArray(identity)) {
     identityError("IDENTITY_REQUIRED");
@@ -250,8 +318,39 @@ export async function verifyHostedIdentity(
     throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
   }
 
+  const expectedNonceHash = options.expectedNonceHash;
+  const suppliedExpectedNonce = options.expectedNonce;
+  if (suppliedExpectedNonce !== undefined
+      && (typeof suppliedExpectedNonce !== "string"
+        || suppliedExpectedNonce.length === 0
+        || suppliedExpectedNonce.length > MAXIMUM_NONCE_LENGTH)) {
+    identityError("IDENTITY_TOKEN_INVALID");
+  }
+  if (expectedNonceHash !== undefined
+      && (provider !== "apple" || !NONCE_HASH_PATTERN.test(expectedNonceHash))) {
+    identityError("IDENTITY_TOKEN_INVALID");
+  }
+  if (suppliedExpectedNonce !== undefined && expectedNonceHash !== undefined) {
+    const suppliedNonceHash = await sha256Hex(suppliedExpectedNonce);
+    if (suppliedNonceHash !== expectedNonceHash) {
+      identityError("IDENTITY_TOKEN_INVALID");
+    }
+  }
+  // The only production flow that sends a nonce is Apple.  A missing digest
+  // retains the old no-nonce contract for direct callers and Google; the
+  // Apple callback integration always supplies the state-row digest.
+  const expectedNonce = suppliedExpectedNonce
+    ?? (expectedNonceHash === undefined ? undefined : unverifiedNonce(idToken));
+
   const testJwksFetcher = environmentJwksFetcher(env);
   const jwksFetcher = testJwksFetcher ?? options.jwksFetcher;
+  const timeoutMilliseconds = options.timeoutMilliseconds
+    ?? OIDC_PROVIDER_REQUEST_TIMEOUT_MILLISECONDS;
+  if (!Number.isSafeInteger(timeoutMilliseconds)
+      || timeoutMilliseconds < 1
+      || timeoutMilliseconds > MAXIMUM_PROVIDER_REQUEST_TIMEOUT_MILLISECONDS) {
+    throw new ApiError(500, "INTERNAL_ERROR");
+  }
   const nowMs = options.nowMs ?? Date.now();
   const servers = provider === "google" ? oidcServers.google : oidcServers.apple;
   let claims: Record<string, unknown> | undefined;
@@ -264,6 +363,8 @@ export async function verifyHostedIdentity(
           idToken,
           nowMs,
           jwksFetcher,
+          expectedNonce,
+          timeoutMilliseconds,
         );
         break;
       } catch (error) {
@@ -277,6 +378,26 @@ export async function verifyHostedIdentity(
     identityError("IDENTITY_TOKEN_INVALID");
   }
   if (claims === undefined) identityError("IDENTITY_TOKEN_INVALID");
+
+  if (expectedNonceHash !== undefined || suppliedExpectedNonce !== undefined) {
+    const nonce = claims.nonce;
+    if (typeof nonce !== "string"
+        || nonce.length === 0
+        || nonce.length > MAXIMUM_NONCE_LENGTH
+        || nonce !== expectedNonce) {
+      identityError("IDENTITY_TOKEN_INVALID");
+    }
+    // A raw nonce is already compared exactly above. Hash comparison is only
+    // meaningful for the persisted-digest path used by Apple's callback; do
+    // not reject an otherwise valid direct caller merely because it supplied
+    // the raw expected nonce rather than a storage digest.
+    if (expectedNonceHash !== undefined) {
+      const actualNonceHash = await sha256Hex(nonce);
+      if (actualNonceHash !== expectedNonceHash) {
+        identityError("IDENTITY_TOKEN_INVALID");
+      }
+    }
+  }
 
   const subject = claims.sub;
   if (typeof subject !== "string" || subject.length === 0 || subject.length > 256) {
@@ -309,4 +430,36 @@ export async function verifyHostedIdentity(
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
   return { provider, linkKeyHex };
+}
+
+/**
+ * Bounds both the real fetch and injected test fetchers. The parent signal is
+ * retained so oauth4webapi can cancel its own request, while the local timer
+ * guarantees a provider outage becomes a finite, opaque failure.
+ */
+async function withOidcProviderTimeout<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeoutMilliseconds: number,
+  parentSignal?: AbortSignal,
+): Promise<T> {
+  const controller = new AbortController();
+  const abortFromParent = () => controller.abort();
+  if (parentSignal?.aborted) {
+    controller.abort();
+  } else {
+    parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new ProviderUnavailableError());
+    }, timeoutMilliseconds);
+  });
+  try {
+    return await Promise.race([operation(controller.signal), timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    parentSignal?.removeEventListener("abort", abortFromParent);
+  }
 }

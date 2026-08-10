@@ -139,10 +139,17 @@ The checked-in `staging` environment is intentionally safe but incomplete:
 - two D1 bindings, one private R2 binding, two independent rate limiters,
   static assets, hourly lifecycle work, and Worker observability are explicit
   environment configuration; and
+- root, staging, and production `ASSETS` bindings all consume the
+  manifest-verified `.release-build/worker-assets` tree. The staging step
+  allows only the generated community landing assets and rejects dashboard,
+  admin, sign-in, contribution, and app-open routes; the native app's
+  loopback server continues to use `apps/web/public` separately; and
 - D1 resource IDs are schema-valid sentinels that the strict readiness command
   rejects.
 
-Run the non-mutating configuration and dry-deployment gate:
+Run the non-mutating configuration and dry-deployment gate. It first verifies
+and atomically stages the generated public release tree, so a missing,
+tampered, or unsafe release output blocks before Wrangler is invoked:
 
 ```sh
 npm run staging:check
@@ -185,11 +192,35 @@ npm run keys:staging
 This creates ignored mode-0600 `.dev.vars.staging`, refuses overwrite, and
 never prints a key. It must not reuse `.dev.vars`.
 
-Prepare remote D1 only after `staging:ready` proves that the configured
-resources exist:
+After the owner has observed the exact staging target and configured resources,
+deploy the compatible disabled Worker before any migration:
 
 ```sh
-npm run staging:prepare -- --confirm PREPARE_DISABLED_STAGING
+npm run staging:deploy -- \
+  --origin https://EXACT-STAGING-HOST \
+  --phase pre_migration_compatibility \
+  --identity-receipt-file /owner-only/staging-deployment-identity.json \
+  --confirm DEPLOY_COMPATIBLE_DISABLED_STAGING
+```
+
+The compatible deploy binds the checked-out source commit into the non-secret
+`DEPLOYMENT_SOURCE_COMMIT` Worker variable through Wrangler's `--var` path and
+emits a local non-secret identity receipt. That receipt is an owner-local
+attestation, not self-authenticating live proof; its revision field explicitly
+remains owner-observation required. Preparation independently fetches the
+exact origin's `/api/health` and requires its validated runtime source commit
+to match both the identity receipt and the expected checkout before any
+remote D1/resource inspection or mutation. The owner must still observe the active opaque revision
+and disabled/contained health, then retain a proof referencing that identity
+receipt outside Git. Only after those checks may preparation reach remote D1
+mutation:
+
+```sh
+npm run staging:prepare -- \
+  --origin https://EXACT-STAGING-HOST \
+  --receipt-file /owner-only/staging-disabled-worker-proof.json \
+  --identity-receipt-file /owner-only/staging-deployment-identity.json \
+  --confirm PREPARE_DISABLED_STAGING
 ```
 
 This applies both migration streams and immediately forces enrollment, upload
@@ -278,6 +309,9 @@ hours and quarantine retention, deletion-ledger restore replay, pending
 aggregate rebuilds, and quarantine reconciliation are all complete. Retention
 and reconciliation must also record the same maintenance-cycle timestamp, so a
 termination between the two passes cannot reuse an older successful status.
+It also validates the upload ingress bindings and performs a non-consuming
+`UploadIngressBudget` Durable Object probe, so readiness cannot remain `200`
+when public upload admission is unavailable.
 
 `DELETION_LEDGER` has its own migration directory and must be backed up and
 restored independently from `USAGE_MONITOR_DB`. Participant deletion first

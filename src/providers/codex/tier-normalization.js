@@ -6,6 +6,12 @@ const TIER_SOURCES = new Set([
   "turn_override",
   "app_log",
   "rollout_thread_settings",
+  // Seeded from the most-recent observed tier of the session's own resume
+  // segments or fork/parent ancestor chain — never from concurrent unrelated
+  // threads (service_tier is per-thread). Provenance, not observation: a turn
+  // keeps "rollout_thread_settings" only when the declaration is in its own
+  // file or resume cursor.
+  "lineage_inherited",
   "config",
   "experiment_manifest",
   "unobserved",

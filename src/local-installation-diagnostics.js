@@ -142,16 +142,25 @@ export function defaultLocalCompanionStateRoot({
 export function localCompanionStatePaths(stateRoot) {
   const selected = normalizedAbsolutePath(stateRoot);
   return Object.freeze({
-    collectorFile: join(selected, "collector-events.jsonl"),
-    checkpointFile: join(selected, "collector-checkpoint-v0.3.json"),
-    collectorLockFile: join(selected, "collector.lock"),
-    collectorJournalFile: join(
+    // One SQLite database owns collector records, cursors, dedupe state,
+    // quota observations, the instance lock and replay-safe accounting. The
+    // legacy JSON/JSONL files are discovered privately by the migration code
+    // and removed only after its parity receipt is durable.
+    collectorStateFile: join(selected, "local-collector-state-v1.sqlite"),
+    archiveAccountingIndexFile: join(
       selected,
-      "collector-checkpoint-v0.3.json.batch-journal",
+      "local-archive-accounting-index-v1.sqlite",
     ),
-    accountingCacheFile: join(
+    archiveAccountingIndexSecretFile: join(
       selected,
-      "local-replay-safe-accounting-v0.1.json",
+      "local-archive-accounting-index-v1-secret",
+    ),
+    // The unified local index: the one store the dashboard's full-history
+    // periods and timelines read, advanced incrementally on refresh.
+    unifiedIndexFile: join(selected, "local-unified-index-v1.sqlite"),
+    unifiedIndexSecretFile: join(
+      selected,
+      "local-unified-index-device-salt-v1",
     ),
     accountObservationLockFile: join(
       selected,
@@ -172,6 +181,11 @@ export function localCompanionStatePaths(stateRoot) {
       selected,
       "private",
       "automatic-contribution-v0.1.lock",
+    ),
+    incrementalContributionSyncSettingsFile: join(
+      selected,
+      "private",
+      "incremental-contribution-sync-v1.json",
     ),
     fastModePreferenceFile: join(
       selected,

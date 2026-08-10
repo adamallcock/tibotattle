@@ -3,7 +3,21 @@ import { applyD1Migrations, reset } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
+
+// The initiating client generates an unguessable verifier and sends only its
+// SHA-256 digest to the start route; it re-presents the raw verifier to collect
+// and to consume the result.
+function newSignInVerifier(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(48));
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary)
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/u, "");
+}
 
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -38,6 +52,7 @@ function bindings(overrides: Record<string, unknown> = {}): Env {
     ASSETS: runtime.ASSETS,
     DELETION_LEDGER: runtime.DELETION_LEDGER,
     ENROLLMENT_MODE: runtime.ENROLLMENT_MODE,
+    SIGN_IN_START_MAX_PER_MINUTE: "1200",
     ENROLLMENT_RATE_LIMIT: runtime.ENROLLMENT_RATE_LIMIT,
     CLIENT_ATTEMPT_RATE_LIMIT: runtime.CLIENT_ATTEMPT_RATE_LIMIT,
     ENVELOPE_PRIVATE_JWK: "",
@@ -86,10 +101,15 @@ async function callback(
   );
 }
 
-async function startSignIn(): Promise<{ state: string; authorizeUrl: string }> {
-  const response = await json("/api/v1/identity/google/start", {});
+async function startSignIn(): Promise<
+  { state: string; authorizeUrl: string; verifier: string }
+> {
+  const verifier = newSignInVerifier();
+  const binding = await sha256Hex(verifier);
+  const response = await json("/api/v1/identity/google/start", { binding });
   expect(response.status).toBe(200);
-  return response.json<{ state: string; authorizeUrl: string }>();
+  const payload = await response.json<{ state: string; authorizeUrl: string }>();
+  return { ...payload, verifier };
 }
 
 function storedVerifier(state: string): Promise<{ verifier: string } | null> {
@@ -174,6 +194,7 @@ describe("hosted Google sign-in", () => {
 
     const pending = await json("/api/v1/identity/google/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     expect(pending.status).toBe(404);
     expect(await pending.json()).toMatchObject({
@@ -224,6 +245,7 @@ describe("hosted Google sign-in", () => {
 
     const result = await json("/api/v1/identity/google/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     expect(result.status).toBe(200);
     const payload = await result.json();
@@ -246,6 +268,7 @@ describe("hosted Google sign-in", () => {
     // indistinguishable from an expired handoff.
     const replay = await json("/api/v1/identity/google/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     expect(replay.status).toBe(401);
     expect(await replay.json()).toMatchObject({
@@ -287,6 +310,7 @@ describe("hosted Google sign-in", () => {
 
     const result = await json("/api/v1/identity/google/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     expect(result.status).toBe(401);
     expect(await result.json()).toMatchObject({
@@ -316,10 +340,90 @@ describe("hosted Google sign-in", () => {
 
     const result = await json("/api/v1/identity/google/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     // A completed-but-stale handoff must read as invalid, not as still
     // pending — a client must never be told to keep polling for a result that
     // can no longer be delivered.
+    expect(result.status).toBe(401);
+    expect(await result.json()).toMatchObject({
+      error: { code: "IDENTITY_TOKEN_INVALID" },
+    });
+  });
+
+  it("gives a proof minted at the end of a slow round trip its own collectable window", async () => {
+    const db = bindings().USAGE_MONITOR_DB;
+    const started = await startSignIn();
+    // Model an OAuth round trip that consumed all but three seconds of the
+    // authorization window: a cold-starting browser plus somebody who actually
+    // reads Google's consent screen. Ageing the row is exactly equivalent to
+    // advancing the clock from every handler's point of view.
+    const startedAtMs = Date.now() - 297_000;
+    await db.prepare(
+      "UPDATE google_signin_handoffs SET created_at = ?, expires_at = ? WHERE state = ?",
+    ).bind(
+      new Date(startedAtMs).toISOString(),
+      new Date(startedAtMs + 300_000).toISOString(),
+      started.state,
+    ).run();
+
+    const filledAtMs = Date.now();
+    const landed = await callback(new URLSearchParams({
+      code: "google-one-time-code",
+      state: started.state,
+    }).toString());
+    expect(landed.status).toBe(200);
+    expect(await landed.text()).toContain("Signed in");
+
+    // The proof's deadline is measured from the mint, not from what was left
+    // of the authorization window. Before this was fixed the row still carried
+    // the start-based deadline and the measured window here was 3s.
+    const row = await db.prepare(
+      "SELECT expires_at AS expiresAt FROM google_signin_handoffs WHERE state = ?",
+    ).bind(started.state).first<{ expiresAt: string }>();
+    expect(Date.parse(row!.expiresAt) - filledAtMs).toBeGreaterThan(270_000);
+
+    // Not merely a stored number: a dashboard poll landing after the old
+    // start-based deadline had passed still collects the proof. This slept
+    // interval is what turned an entirely correct sign-in into a 401.
+    await new Promise((resolve) => setTimeout(resolve, 3_500));
+    const result = await json("/api/v1/identity/google/result", {
+      state: started.state,
+      verifier: started.verifier,
+    });
+    expect(result.status).toBe(200);
+    expect(await result.json()).toMatchObject({
+      schemaVersion: "identity-google-result-v0.1",
+      proof: expect.stringMatching(/^[A-Za-z0-9_-]{64}$/u),
+    });
+  }, 30_000);
+
+  it("still refuses a callback that arrives after the authorization window", async () => {
+    const db = bindings().USAGE_MONITOR_DB;
+    const started = await startSignIn();
+    // The authorization window is longer than it was, but it is still a window,
+    // and it is still measured from the instant the state was minted.
+    const startedAtMs = Date.now() - 601_000;
+    await db.prepare(
+      "UPDATE google_signin_handoffs SET created_at = ?, expires_at = ? WHERE state = ?",
+    ).bind(
+      new Date(startedAtMs).toISOString(),
+      new Date(startedAtMs + 600_000).toISOString(),
+      started.state,
+    ).run();
+
+    const late = await callback(new URLSearchParams({
+      code: "google-one-time-code",
+      state: started.state,
+    }).toString());
+    expect(await late.text()).toContain("Sign-in was not completed.");
+    // No exchange was attempted, so the PKCE verifier was never spent and no
+    // proof exists to be delivered.
+    expect(tokenCalls).toHaveLength(0);
+    const result = await json("/api/v1/identity/google/result", {
+      state: started.state,
+      verifier: started.verifier,
+    });
     expect(result.status).toBe(401);
     expect(await result.json()).toMatchObject({
       error: { code: "IDENTITY_TOKEN_INVALID" },
@@ -361,6 +465,7 @@ describe("hosted Google sign-in", () => {
 
     const result = await json("/api/v1/identity/google/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     expect(result.status).toBe(200);
     expect(await result.json()).toMatchObject({
@@ -369,7 +474,7 @@ describe("hosted Google sign-in", () => {
     });
   });
 
-  it("ignores an unknown, malformed, errored, or oversized callback", async () => {
+  it("ignores an unknown, malformed, or oversized callback", async () => {
     const started = await startSignIn();
 
     for (const query of [
@@ -378,15 +483,6 @@ describe("hosted Google sign-in", () => {
       new URLSearchParams({ code: "c", state: `bad state ${"x".repeat(60)}` })
         .toString(),
       new URLSearchParams({ state: started.state }).toString(),
-      new URLSearchParams({
-        state: started.state,
-        error: "access_denied",
-      }).toString(),
-      new URLSearchParams({
-        code: "c",
-        state: started.state,
-        error: "access_denied",
-      }).toString(),
       `code=${"a".repeat(9_000)}&state=${started.state}`,
       "",
     ]) {
@@ -417,7 +513,41 @@ describe("hosted Google sign-in", () => {
     expect(row?.deliveredAt ?? null).toBeNull();
   });
 
-  it("keeps a failed Google exchange from filling the handoff", async () => {
+  it("ends only the cancelled Google handoff instead of leaving the app polling", async () => {
+    const cancelled = await startSignIn();
+    const stillPending = await startSignIn();
+
+    const landed = await callback(new URLSearchParams({
+      state: cancelled.state,
+      error: "access_denied",
+    }).toString());
+    expect(landed.status).toBe(200);
+    expect(await landed.text()).toContain("Sign-in was not completed.");
+    expect(tokenCalls).toHaveLength(0);
+
+    const cancelledResult = await json("/api/v1/identity/google/result", {
+      state: cancelled.state,
+      verifier: cancelled.verifier,
+    });
+    expect(cancelledResult.status).toBe(401);
+    expect(await cancelledResult.json()).toMatchObject({
+      error: { code: "IDENTITY_TOKEN_INVALID" },
+    });
+    const cancelledRow = await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state FROM google_signin_handoffs WHERE state = ?",
+    ).bind(cancelled.state).first<{ state: string }>();
+    expect(cancelledRow).toBeNull();
+    const pendingResult = await json("/api/v1/identity/google/result", {
+      state: stillPending.state,
+      verifier: stillPending.verifier,
+    });
+    expect(pendingResult.status).toBe(404);
+    expect(await pendingResult.json()).toMatchObject({
+      error: { code: "IDENTITY_RESULT_PENDING" },
+    });
+  });
+
+  it("ends an unusable Google handoff after its exchange fails", async () => {
     const started = await startSignIn();
     tokenResponder = () => new Response("invalid_grant", { status: 400 });
     const failed = await callback(new URLSearchParams({
@@ -430,21 +560,40 @@ describe("hosted Google sign-in", () => {
 
     const result = await json("/api/v1/identity/google/result", {
       state: started.state,
+      verifier: started.verifier,
     });
-    expect(result.status).toBe(404);
+    expect(result.status).toBe(401);
     expect(await result.json()).toMatchObject({
-      error: { code: "IDENTITY_RESULT_PENDING" },
+      error: { code: "IDENTITY_TOKEN_INVALID" },
     });
+    const failedRow = await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state FROM google_signin_handoffs WHERE state = ?",
+    ).bind(started.state).first<{ state: string }>();
+    expect(failedRow).toBeNull();
 
-    // A Google response with no id_token is an invalid token, not a fill.
+    // A fresh handoff also stops after a response with no id_token: its code
+    // is spent and therefore cannot be retried under the old state.
+    const retry = await startSignIn();
     tokenResponder = () => Response.json({ access_token: "no-id-token" });
     const missingIdToken = await callback(new URLSearchParams({
       code: "google-one-time-code",
-      state: started.state,
+      state: retry.state,
     }).toString());
     expect(missingIdToken.status).toBe(200);
     expect(await missingIdToken.text()).toContain("Sign-in was not completed.");
     expect(tokenCalls).toHaveLength(2);
+    const retryResult = await json("/api/v1/identity/google/result", {
+      state: retry.state,
+      verifier: retry.verifier,
+    });
+    expect(retryResult.status).toBe(401);
+    expect(await retryResult.json()).toMatchObject({
+      error: { code: "IDENTITY_TOKEN_INVALID" },
+    });
+    const missingIdTokenRow = await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state FROM google_signin_handoffs WHERE state = ?",
+    ).bind(retry.state).first<{ state: string }>();
+    expect(missingIdTokenRow).toBeNull();
   });
 
   it("requires same-origin starts, reads, and a well-formed result body", async () => {
@@ -518,6 +667,41 @@ describe("hosted Google sign-in", () => {
     expect(tokenCalls).toHaveLength(0);
   });
 
+  it("keeps the Google ceremony open under disabled mode but not the incident brake", async () => {
+    // Disabled enrollment MODE pauses new sign-ups only; the ceremony stays
+    // open because an existing participant reattaches through it. Only the
+    // collection-control incident brake refuses the ceremony itself.
+    const disabled = await json(
+      "/api/v1/identity/google/start",
+      { binding: "a".repeat(64) },
+      bindings({ ENROLLMENT_MODE: "disabled" }),
+    );
+    expect(disabled.status).toBe(200);
+    const allocated = await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM google_signin_handoffs",
+    ).first<{ total: number }>();
+    expect(allocated?.total).toBe(1);
+
+    await bindings().USAGE_MONITOR_DB.prepare(
+      `UPDATE collection_controls
+          SET enrollment_enabled = 0,
+              control_state = 'degraded',
+              revision = revision + 1
+        WHERE singleton = 1`,
+    ).run();
+    const paused = await json("/api/v1/identity/google/start", {});
+    expect(paused.status).toBe(503);
+    expect(await paused.json()).toMatchObject({
+      error: { code: "COLLECTION_ENROLLMENT_DISABLED" },
+    });
+
+    const rows = await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM google_signin_handoffs",
+    ).first<{ total: number }>();
+    expect(rows?.total).toBe(1);
+    expect(tokenCalls).toHaveLength(0);
+  });
+
   it("no longer exposes the client-side authorization-code exchange", async () => {
     // The old route completed a sign-in from a code the caller supplied. It is
     // gone rather than deprecated: with the service owning the redirect there
@@ -536,5 +720,105 @@ describe("hosted Google sign-in", () => {
     );
     expect(removed.status).toBe(404);
     expect(tokenCalls).toHaveLength(0);
+  });
+
+  // csf_42bcd8fd: server-held PKCE authenticates the Worker's own token
+  // exchange, not the result recipient, so the only capability the result route
+  // required was the state disclosed to whoever started the flow. These cases
+  // pin the independent client binding that now gates delivery and consumption.
+  it("binds Google sign-in delivery to the initiating client's verifier", async () => {
+    const verifier = newSignInVerifier();
+    const binding = await sha256Hex(verifier);
+    const start = await json("/api/v1/identity/google/start", { binding });
+    expect(start.status).toBe(200);
+    const startedPayload = await start.json<Record<string, unknown>>();
+    const state = startedPayload.state as string;
+    // The binding is independent of the server-held PKCE verifier and is never
+    // returned in JSON.
+    expect(Object.keys(startedPayload).sort())
+      .toEqual(["authorizeUrl", "schemaVersion", "state"]);
+    const serializedStart = JSON.stringify(startedPayload);
+    expect(serializedStart.includes(verifier)).toBe(false);
+    expect(serializedStart.includes(binding)).toBe(false);
+    const pkce = await storedVerifier(state);
+    expect(pkce?.verifier).not.toBe(verifier);
+
+    // A caller holding the state but not the verifier cannot even learn that the
+    // sign-in is pending.
+    const wrongVerifier = newSignInVerifier();
+    const probedPending = await json("/api/v1/identity/google/result", {
+      state,
+      verifier: wrongVerifier,
+    });
+    expect(probedPending.status).toBe(401);
+
+    // Google's redirect fills the row as a victim completing the attacker's
+    // authorize URL would; the completing browser carries no verifier.
+    const landed = await callback(new URLSearchParams({
+      code: "google-one-time-code",
+      state,
+    }).toString());
+    expect(landed.status).toBe(200);
+    expect(await landed.text()).toContain("Signed in");
+
+    // The attacker browser — holding the state but a different verifier — cannot
+    // retrieve the proof, and the failed attempt must not consume it.
+    const stolen = await json("/api/v1/identity/google/result", {
+      state,
+      verifier: wrongVerifier,
+    });
+    expect(stolen.status).toBe(401);
+    expect(await stolen.json()).toMatchObject({
+      error: { code: "IDENTITY_TOKEN_INVALID" },
+    });
+    // A missing verifier is a malformed body, never a delivery.
+    const missingVerifier = await json("/api/v1/identity/google/result", {
+      state,
+    });
+    expect(missingVerifier.status).toBe(400);
+
+    // The initiator, holding the verifier, still collects the one proof exactly
+    // once.
+    const collected = await json("/api/v1/identity/google/result", {
+      state,
+      verifier,
+    });
+    expect(collected.status).toBe(200);
+    expect(await collected.json()).toMatchObject({
+      schemaVersion: "identity-google-result-v0.1",
+      proof: expect.stringMatching(/^[A-Za-z0-9_-]{64}$/u),
+    });
+  });
+
+  // csf_efe7a64e: the pending read did not reserve the row, so many callbacks
+  // carrying one valid state each spent the PKCE verifier on a Google token
+  // request. The atomic claim now admits exactly one to provider I/O and fences
+  // completion, so the shared row is filled once.
+  it("admits exactly one of many concurrent Google callbacks to the provider exchange", async () => {
+    const started = await startSignIn();
+    const attempts = 6;
+    const responses = await Promise.all(
+      Array.from({ length: attempts }, () => callback(new URLSearchParams({
+        code: "google-one-time-code",
+        state: started.state,
+      }).toString())),
+    );
+    const pages = await Promise.all(responses.map((response) => response.text()));
+    const completed = pages.filter((page) => page.includes("Signed in")).length;
+    const refused = pages.filter(
+      (page) => page.includes("Sign-in was not completed"),
+    ).length;
+    // Exactly one callback exchanged the code at Google's token endpoint.
+    expect(tokenCalls).toHaveLength(1);
+    expect(completed).toBe(1);
+    expect(refused).toBe(attempts - 1);
+    // The shared row was filled exactly once, and the winning claim also cleared
+    // the single-use PKCE verifier.
+    const stored = await bindings().USAGE_MONITOR_DB.prepare(
+      `SELECT COUNT(*) AS total, COUNT(proof) AS proofs,
+              COUNT(identity_link_key) AS links, COUNT(code_verifier) AS verifiers
+         FROM google_signin_handoffs`,
+    ).first<{ total: number; proofs: number; links: number; verifiers: number }>();
+    expect(stored).toEqual({ total: 1, proofs: 1, links: 1, verifiers: 0 });
   });
 });

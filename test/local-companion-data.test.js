@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import {
   mkdir,
   mkdtemp,
-  readFile,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -17,6 +17,13 @@ import {
 import {
   refreshReplaySafeAccountingCache,
 } from "../src/replay-safe-accounting-cache.js";
+import {
+  refreshLocalArchiveAccountingIndex,
+} from "../src/local-archive-accounting-index.js";
+import {
+  readLocalCollectorAccountingCache,
+  writeLocalCollectorAccountingCache,
+} from "../src/local-collector-state.js";
 
 const ARTIFACT_FILES = {
   gradient: "2026-07-24-simple-quota-gradient-artifact.json",
@@ -26,9 +33,10 @@ const ARTIFACT_FILES = {
 
 async function fixtureRoot() {
   const root = await mkdtemp(join(tmpdir(), "local-companion-data-"));
-  await mkdir(join(root, ".usage-monitor"));
+  const reportDirectory = join(root, ".usage-monitor", "legacy-reports");
+  await mkdir(reportDirectory, { recursive: true });
   for (const [kind, file] of Object.entries(ARTIFACT_FILES)) {
-    await writeFile(join(root, file), JSON.stringify({
+    await writeFile(join(reportDirectory, file), JSON.stringify({
       privateTopLevel: "/Users/private/source",
       snapshot: {
         status: "complete",
@@ -66,9 +74,48 @@ async function fixtureRoot() {
     "2026-07-24-monitoring-quality-report.html",
     "2026-07-24-codex-work-account-usage-report.html",
   ]) {
-    await writeFile(join(root, file), "<!doctype html><title>report</title>");
+    await writeFile(join(reportDirectory, file), "<!doctype html><title>report</title>");
   }
   return root;
+}
+
+function rolloutUsage(input, output = 0) {
+  return {
+    input_tokens: input,
+    cached_input_tokens: 0,
+    cache_write_input_tokens: 0,
+    output_tokens: output,
+    reasoning_output_tokens: 0,
+    total_tokens: input + output,
+  };
+}
+
+function rolloutToken(timestamp, total, last, usedPercent) {
+  return JSON.stringify({
+    timestamp,
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: {
+        total_token_usage: total,
+        last_token_usage: last,
+      },
+      rate_limits: {
+        limit_id: "codex",
+        plan_type: "pro",
+        primary: {
+          used_percent: usedPercent,
+          window_minutes: 300,
+          resets_at: 1_785_433_600,
+        },
+        secondary: {
+          used_percent: usedPercent,
+          window_minutes: 10_080,
+          resets_at: 1_785_433_600,
+        },
+      },
+    },
+  });
 }
 
 test("local companion builds a closed real-data projection without identifiers or paths", async () => {
@@ -138,7 +185,8 @@ test("local companion builds a closed real-data projection without identifiers o
     ];
     await writeFile(
       join(root, ".usage-monitor", "collector-events.jsonl"),
-      `${ledger.map((row) => JSON.stringify(row)).join("\n")}\nmalformed\n`,
+      `${ledger.map((row) => JSON.stringify(row)).join("\n")}\n`,
+      { mode: 0o600 },
     );
     await writeFile(
       join(root, ".usage-monitor", "collector-checkpoint-v0.3.json"),
@@ -183,7 +231,7 @@ test("local companion builds a closed real-data projection without identifiers o
     assert.deepEqual(snapshot.overview.usage[0].byModel.map((row) => row.model), ["gpt-5.6-sol", "unknown"]);
     assert.equal(snapshot.overview.tools.counts.subagent, 1);
     assert.equal(snapshot.overview.tools.counts.other, 1);
-    assert.equal(snapshot.overview.collector.malformedLines, 1);
+    assert.equal(snapshot.overview.collector.malformedLines, 0);
     assert.deepEqual(snapshot.overview.collector.coveredAt, {
       startAt: "2026-07-25T11:00:00.000Z",
       endAt: "2026-07-25T11:47:00.000Z",
@@ -224,6 +272,18 @@ test("local companion builds a closed real-data projection without identifiers o
     assert.equal(snapshot.overview.accounting.byLineage.forked.events, 1);
     assert.equal(snapshot.overview.accounting.reasoningEffortAvailable, false);
     assert.equal(snapshot.overview.accounting.apiPriceCounterfactualTier, "standard");
+    assert.deepEqual(snapshot.overview.pricing.historyCoverage, {
+      status: "partial",
+      phase: "not_started",
+      errorCode: "archive_index_unavailable",
+      generatedAt: null,
+      coveredAt: { startAt: null, endAt: null },
+      sourceCount: 0,
+      indexedSourceCount: 0,
+      pendingSourceCount: 0,
+      sourceBytes: 0,
+      indexedBytes: 0,
+    });
     assert.equal(
       snapshot.overview.monitoringGaps.find((row) => row.id === "ordinary_chat")?.status,
       "excluded",
@@ -277,8 +337,13 @@ test("local companion builds a closed real-data projection without identifiers o
     );
     assert.equal(
       snapshot.overview.pricing.priceEpochBasis,
-      "current_price_sensitivity_at_registry_observation",
+      "event_time_when_registry_has_effective_evidence",
     );
+    assert.equal(
+      snapshot.overview.pricing.eventTimeHistoricalTotalUsdExact,
+      snapshot.overview.accounting.apiPriceEquivalentUsdExact ?? null,
+    );
+    assert.equal(snapshot.overview.pricing.currentPriceSensitivityTotalUsdExact, null);
     assert.equal(fastMode.inference.appliedToWeighting, false);
     assert.equal(fastMode.inference.status, "insufficient_signal");
     assert.equal(snapshot.gradient.datasets.summary[0].private_field, undefined);
@@ -299,6 +364,280 @@ test("local companion builds a closed real-data projection without identifiers o
     ]) {
       assert.equal(serialized.includes(privateValue), false, `response leaked ${privateValue}`);
     }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("raw rollout history reaches the companion through the archive projection with event-time prices", async () => {
+  const root = await fixtureRoot();
+  const codexHome = join(root, ".codex");
+  const sessions = join(codexHome, "sessions");
+  const archiveIndexFile = join(
+    root,
+    ".usage-monitor",
+    "local-archive-accounting-index-v1.sqlite",
+  );
+  const archiveSecretFile = join(
+    root,
+    ".usage-monitor",
+    "local-archive-accounting-index-v1-secret",
+  );
+  const oldTerraCard =
+    "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01";
+  const newTerraCard =
+    "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-01";
+  try {
+    await mkdir(sessions, { recursive: true });
+    await writeFile(
+      join(sessions, "rollout-2026-07-25T12-00-00-history.jsonl"),
+      `${[
+        JSON.stringify({
+          timestamp: "2026-07-25T12:00:00.000Z",
+          type: "session_meta",
+          payload: { id: "PRIVATE_ARCHIVE_SESSION" },
+        }),
+        JSON.stringify({
+          timestamp: "2026-07-25T12:00:00.010Z",
+          type: "turn_context",
+          payload: { model: "gpt-5.6-terra" },
+        }),
+        // Recognized historical Terra events remain priceable before the
+        // review date. July 29 uses the old card and July 30 the lower new
+        // card.
+        rolloutToken(
+          "2026-07-25T12:01:00.000Z",
+          rolloutUsage(1_000_000),
+          rolloutUsage(1_000_000),
+          1,
+        ),
+        rolloutToken(
+          "2026-07-29T23:59:59.000Z",
+          rolloutUsage(2_000_000),
+          rolloutUsage(1_000_000),
+          2,
+        ),
+        rolloutToken(
+          "2026-07-30T00:00:00.000Z",
+          rolloutUsage(3_000_000),
+          rolloutUsage(1_000_000),
+          3,
+        ),
+      ].join("\n")}\n`,
+      { mode: 0o600 },
+    );
+
+    const refreshed = await refreshLocalArchiveAccountingIndex({
+      indexFile: archiveIndexFile,
+      secretFile: archiveSecretFile,
+      codexHome,
+      now: () => Date.parse("2026-08-01T12:00:00.000Z"),
+      workerCount: 1,
+    });
+    assert.equal(refreshed.status, "complete");
+    assert.equal(refreshed.projectionStatus, "available");
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      archiveIndexFile,
+      allowDevelopmentArtifactFallback: true,
+      now: () => Date.parse("2026-08-01T12:00:00.000Z"),
+    });
+    const history = snapshot.overview.accounting.periods
+      .find((period) => period.periodId === "history");
+    assert.ok(history);
+    assert.equal(history.periodLabel, "Indexed history");
+    assert.equal(history.events, 3);
+    assert.equal(history.totalTokens, 3_000_000);
+    assert.equal(history.apiPriceEquivalentUsd, 7);
+    assert.deepEqual(history.pricingCoverage, {
+      fullyPricedEvents: 3,
+      partiallyPricedEvents: 0,
+      unpricedEvents: 0,
+    });
+    assert.deepEqual(history.priceCardIds, [newTerraCard, oldTerraCard]);
+    assert.deepEqual(history.priceCardBreakdown, [
+      { priceCardId: newTerraCard, events: 1, costUsd: "2" },
+      { priceCardId: oldTerraCard, events: 2, costUsd: "5" },
+    ]);
+    assert.equal(history.evidenceStartDate, "2026-07-26");
+    assert.equal(snapshot.overview.accounting.evidenceStartDate, "2026-07-26");
+    assert.equal(snapshot.overview.pricing.evidenceStartDate, "2026-07-26");
+    assert.equal(snapshot.overview.accounting.historyPeriodStatus, "available");
+    assert.equal(snapshot.overview.accounting.historyCoverage.status, "complete");
+    assert.equal(
+      snapshot.overview.pricing.priceEpochBasis,
+      "event_time_when_registry_has_effective_evidence",
+    );
+    assert.equal(
+      JSON.stringify(snapshot).includes("PRIVATE_ARCHIVE_SESSION"),
+      false,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("local companion relays bounded durations and selects a deterministic primary window", async () => {
+  const root = await mkdtemp(join(tmpdir(), "local-companion-generic-quota-"));
+  try {
+    await mkdir(join(root, ".usage-monitor"));
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      `${JSON.stringify({
+        kind: "codex_quota_snapshot",
+        observedAt: "2026-07-25T11:45:00.000Z",
+        windows: [
+          {
+            limitId: "codex",
+            slot: "secondary",
+            planType: "go",
+            usedPercent: 20,
+            windowDurationMins: 43_200,
+            resetsAt: 1_784_980_800,
+          },
+          {
+            limitId: "codex",
+            slot: "primary",
+            planType: "arbitrary-plan-name",
+            usedPercent: 30,
+            windowDurationMins: 43_200,
+            resetsAt: 1_784_980_800,
+          },
+          {
+            limitId: "codex",
+            slot: "primary",
+            planType: "prolite",
+            usedPercent: 40,
+            windowDurationMins: 300,
+            resetsAt: 1_784_916_000,
+          },
+          {
+            limitId: "codex",
+            slot: "secondary",
+            planType: "pro",
+            usedPercent: 50,
+            windowDurationMins: 10_080,
+            resetsAt: 1_785_376_800,
+          },
+          {
+            limitId: "codex_bengalfox",
+            slot: "primary",
+            planType: "edu",
+            usedPercent: 60,
+            windowDurationMins: 43_200,
+            resetsAt: 1_784_980_800,
+          },
+          {
+            limitId: "codex",
+            slot: "primary",
+            planType: "pro",
+            usedPercent: 70,
+            windowDurationMins: 0,
+            resetsAt: 1_784_980_800,
+          },
+          {
+            limitId: "codex",
+            slot: "primary",
+            planType: "pro",
+            usedPercent: 80,
+            windowDurationMins: 525_601,
+            resetsAt: 1_784_980_800,
+          },
+        ],
+      })}\n`,
+      { mode: 0o600 },
+    );
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    const windows = snapshot.overview.quota.windows;
+    assert.deepEqual(
+      windows.map((window) => [
+        window.limitId,
+        window.slot,
+        window.durationMinutes,
+        window.planType,
+      ]),
+      [
+        ["codex", "primary", 43_200, "unknown"],
+        ["codex", "secondary", 43_200, "go"],
+        ["codex", "primary", 300, "prolite"],
+        ["codex", "secondary", 10_080, "pro"],
+        ["codex_bengalfox", "primary", 43_200, "edu"],
+      ],
+    );
+    assert.equal(snapshot.overview.quotaWindows[0].durationMinutes, 43_200);
+    assert.equal(
+      JSON.stringify(snapshot).includes("monthly"),
+      false,
+    );
+    assert.equal(
+      Object.hasOwn(snapshot.overview.quota.windows[0], "planType"),
+      true,
+    );
+    assert.equal(snapshot.overview.quota.windows[0].planType, "unknown");
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("local companion excludes invalid quota windows before presentation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "local-companion-invalid-quota-"));
+  try {
+    await mkdir(join(root, ".usage-monitor"));
+    const validWindow = {
+      limitId: "codex",
+      slot: "primary",
+      planType: "go",
+      usedPercent: 20,
+      windowDurationMins: 300,
+      resetsAt: 1_784_916_000,
+    };
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      `${JSON.stringify({
+        kind: "codex_quota_snapshot",
+        observedAt: "2026-07-25T11:45:00.000Z",
+        windows: [
+          validWindow,
+          { ...validWindow, resetsAt: 0 },
+          { ...validWindow, resetsAt: Number.MAX_SAFE_INTEGER },
+          { ...validWindow, resetsAt: "not-a-date" },
+          { ...validWindow, windowDurationMins: -1 },
+          { ...validWindow, windowDurationMins: 525_601 },
+          { ...validWindow, usedPercent: -1 },
+          { ...validWindow, usedPercent: 101 },
+        ],
+      })}\n${JSON.stringify({
+        kind: "codex_quota_snapshot",
+        observedAt: "not-a-date",
+        windows: [validWindow],
+      })}\n`,
+      { mode: 0o600 },
+    );
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+
+    assert.deepEqual(
+      snapshot.overview.quota.windows.map((window) => [
+        window.planType,
+        window.usedPercent,
+        window.durationMinutes,
+        window.resetAt,
+      ]),
+      [[
+        "go",
+        20,
+        300,
+        new Date(1_784_916_000 * 1_000).toISOString(),
+      ]],
+    );
   } finally {
     await rm(root, { recursive: true });
   }
@@ -326,15 +665,16 @@ test("the stated speed mode attributes unrecorded evidence and never overrides a
       join(root, ".usage-monitor", "collector-events.jsonl"),
       [
         // Observed Standard on a family with a published Fast rate.
-        usage("2026-07-25T11:00:00.000Z", "gpt-5.4", "standard"),
+        usage("2026-07-26T11:00:00.000Z", "gpt-5.4", "standard"),
         // No recorded mode: only the stated preference can attribute this.
-        usage("2026-07-25T11:10:00.000Z", "gpt-5.4", "unknown"),
+        usage("2026-07-26T11:10:00.000Z", "gpt-5.4", "unknown"),
       ].map((line) => `${line}\n`).join(""),
+      { mode: 0o600 },
     );
     const build = (fastModePreference) => buildLocalCompanionSnapshot({
       root,
       fastModePreference,
-      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+      now: () => Date.parse("2026-07-26T12:00:00.000Z"),
     });
 
     // Each event prices to $5 of Standard-rate API equivalent. Stating
@@ -402,6 +742,105 @@ test("the stated speed mode attributes unrecorded evidence and never overrides a
   }
 });
 
+test("collector fallback keeps mixed event-time price provenance while an old replay cache is withheld", async () => {
+  const root = await fixtureRoot();
+  const stateFile = join(root, ".usage-monitor", "local-collector-state-v1.sqlite");
+  const olderTerraCard =
+    "openai:gpt-5.6-terra:standard:long-through-2026-07-29:official-observed-2026-08-01";
+  const lowerTerraCard =
+    "openai:gpt-5.6-terra:standard:long-from-2026-07-30:official-observed-2026-08-01";
+  try {
+    const usage = (observedAt) => JSON.stringify({
+      schemaVersion: "0.3",
+      kind: "codex_rollout_usage_snapshot",
+      observedAt,
+      model: "gpt-5.6-terra",
+      components: { input_uncached_tokens: 1_000_000 },
+    });
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      [
+        usage("2026-07-29T23:59:59.000Z"),
+        usage("2026-07-30T00:00:00.000Z"),
+      ].map((line) => `${line}\n`).join(""),
+      { mode: 0o600 },
+    );
+    // This is deliberately a former cache shape: it must be withheld rather
+    // than supplying legacy price provenance during the rebuild interval.
+    await writeLocalCollectorAccountingCache({ stateFile, cache: {
+      schemaVersion: "local-replay-safe-accounting-v0.1",
+      priceEpochBasis: "current_price_sensitivity_at_registry_observation",
+    } });
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      collectorStateFile: stateFile,
+      allowDevelopmentArtifactFallback: true,
+      now: () => Date.parse("2026-07-30T01:00:00.000Z"),
+    });
+
+    assert.equal(
+      snapshot.overview.pricing.accountingCacheStatus,
+      "unavailable",
+    );
+    assert.equal(
+      snapshot.overview.pricing.accountingSource,
+      "collector_projection_unverified",
+    );
+    assert.equal(snapshot.overview.pricing.totalCostUsd, 9);
+    assert.equal(snapshot.overview.pricing.eventTimeHistoricalTotalUsdExact, "9");
+    assert.deepEqual(snapshot.overview.pricing.priceCardIds, [
+      lowerTerraCard,
+      olderTerraCard,
+    ]);
+    assert.deepEqual(snapshot.overview.pricing.priceCardBreakdown, [
+      { priceCardId: lowerTerraCard, events: 1, costUsd: "4" },
+      { priceCardId: olderTerraCard, events: 1, costUsd: "5" },
+    ]);
+    assert.equal(snapshot.overview.pricing.mixedPriceCardWindows, true);
+    assert.deepEqual(
+      snapshot.overview.accounting.periods.find((period) => period.periodId === "7d")
+        ?.priceCardBreakdown,
+      snapshot.overview.pricing.priceCardBreakdown,
+    );
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("collector fallback never presents its retained ledger as all local history", async () => {
+  const root = await fixtureRoot();
+  try {
+    const usage = (observedAt) => JSON.stringify({
+      schemaVersion: "0.3",
+      kind: "codex_rollout_usage_snapshot",
+      observedAt,
+      model: "gpt-5.6-sol",
+      components: { input_uncached_tokens: 100 },
+    });
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      [
+        usage("2026-06-01T12:00:00.000Z"),
+        usage("2026-07-25T11:00:00.000Z"),
+      ].map((line) => `${line}\n`).join(""),
+      { mode: 0o600 },
+    );
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    const broadest = snapshot.overview.accounting.periods
+      .find((period) => period.periodId === "all");
+    assert.equal(broadest?.periodLabel, "Cached 31-day collector window");
+    assert.equal(broadest?.events, 1);
+    assert.equal(snapshot.overview.pricing.historyCoverage.status, "partial");
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("a declared Codex baseline fills only the turns it actually covers", async () => {
   const root = await mkdtemp(join(tmpdir(), "local-companion-declared-"));
   try {
@@ -425,16 +864,17 @@ test("a declared Codex baseline fills only the turns it actually covers", async 
       [
         // Before the configuration was ever read: the declaration must not
         // reach back to it, however close.
-        usage("2026-07-25T09:00:00.000Z", "unknown"),
+        usage("2026-07-26T09:00:00.000Z", "unknown"),
         // Inside the covered interval, but observed Standard in the log, so
         // the declaration must not touch it either.
-        usage("2026-07-25T10:30:00.000Z", "standard"),
+        usage("2026-07-26T10:30:00.000Z", "standard"),
         // Inside the covered interval and unobserved: the only turn the
         // declaration is allowed to attribute.
-        usage("2026-07-25T10:45:00.000Z", "unknown"),
+        usage("2026-07-26T10:45:00.000Z", "unknown"),
         // After the newest reading: uncovered again until the next reading.
-        usage("2026-07-25T11:30:00.000Z", "unknown"),
+        usage("2026-07-26T11:30:00.000Z", "unknown"),
       ].map((line) => `${line}\n`).join(""),
+      { mode: 0o600 },
     );
 
     const snapshot = await buildLocalCompanionSnapshot({
@@ -444,10 +884,10 @@ test("a declared Codex baseline fills only the turns it actually covers", async 
       fastModePreference: "mixed_unknown",
       codexSpeedBaselines: [{
         mode: "fast",
-        firstSeenAt: "2026-07-25T10:00:00.000Z",
-        lastSeenAt: "2026-07-25T11:00:00.000Z",
+        firstSeenAt: "2026-07-26T10:00:00.000Z",
+        lastSeenAt: "2026-07-26T11:00:00.000Z",
       }],
-      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+      now: () => Date.parse("2026-07-26T12:00:00.000Z"),
     });
 
     const fastMode = snapshot.overview.accounting.fastMode;
@@ -476,7 +916,7 @@ test("a declared Codex baseline fills only the turns it actually covers", async 
     const undeclared = await buildLocalCompanionSnapshot({
       root,
       fastModePreference: "mixed_unknown",
-      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+      now: () => Date.parse("2026-07-26T12:00:00.000Z"),
     });
     assert.equal(
       undeclared.overview.accounting.fastMode.coverage.declaredFromConfigEvents,
@@ -511,6 +951,7 @@ test("a completed bounded tail is projected as useful partial recent coverage", 
           total_tokens: 11,
         },
       })}\n`,
+      { mode: 0o600 },
     );
     await writeFile(
       join(root, ".usage-monitor", "collector-checkpoint-v0.3.json"),
@@ -554,7 +995,7 @@ test("missing and malformed artifacts fail closed while collector evidence remai
   const root = await mkdtemp(join(tmpdir(), "local-companion-missing-"));
   try {
     await mkdir(join(root, ".usage-monitor"));
-    await writeFile(join(root, ".usage-monitor", "collector-events.jsonl"), "");
+    await writeFile(join(root, ".usage-monitor", "collector-events.jsonl"), "", { mode: 0o600 });
     await writeFile(
       join(root, ".usage-monitor", "collector-checkpoint-v0.3.json"),
       JSON.stringify({
@@ -574,8 +1015,13 @@ test("missing and malformed artifacts fail closed while collector evidence remai
           },
         },
       }),
+      { mode: 0o600 },
     );
-    await writeFile(join(root, ARTIFACT_FILES.gradient), "{malformed");
+    await mkdir(join(root, ".usage-monitor", "legacy-reports"), { recursive: true });
+    await writeFile(
+      join(root, ".usage-monitor", "legacy-reports", ARTIFACT_FILES.gradient),
+      "{malformed",
+    );
     const snapshot = await buildLocalCompanionSnapshot({
       root,
       allowDevelopmentArtifactFallback: true,
@@ -593,7 +1039,7 @@ test("missing and malformed artifacts fail closed while collector evidence remai
 
 test("live weekly cache replaces the repo artifact and labels historical account ambiguity", async () => {
   const root = await fixtureRoot();
-  const cacheFile = join(root, ".usage-monitor", "accounting.json");
+  const stateFile = join(root, ".usage-monitor", "local-collector-state-v1.sqlite");
   try {
     const collectorFile = join(
       root,
@@ -605,11 +1051,13 @@ test("live weekly cache replaces the repo artifact and labels historical account
       observedAt: "2026-07-25T11:30:00.000Z",
       toolClass: "subagent",
       eventKey: "PRIVATE_COLLECTOR_EVENT_KEY",
-    })}\n`);
+    })}\n`, { mode: 0o600 });
     await refreshReplaySafeAccountingCache({
-      cacheFile,
+      stateFile,
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
-      windowDays: 31,
+      // Re-pinned 31 -> 365 (2026-08-08): the standing owner rule forbids
+      // convenience-sized history windows, so 365 is the smallest accepted.
+      windowDays: 365,
       scan: async ({ onUsage, onRateLimitSnapshot }) => {
         onUsage({
           timestamp: "2026-07-25T10:00:00.000Z",
@@ -639,7 +1087,7 @@ test("live weekly cache replaces the repo artifact and labels historical account
     });
     const snapshot = await buildLocalCompanionSnapshot({
       root,
-      accountingCacheFile: cacheFile,
+      collectorStateFile: stateFile,
       allowDevelopmentArtifactFallback: true,
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
     });
@@ -677,18 +1125,17 @@ test("live weekly cache replaces the repo artifact and labels historical account
       ],
     );
     assert.equal(snapshot.overview.tools.total, 1);
-    const projectionBytes = await readFile(
-      `${collectorFile}.projection-v1.json`,
+    await assert.rejects(
+      stat(`${collectorFile}.projection-v1.json`),
+      { code: "ENOENT" },
     );
-    assert.equal(
-      projectionBytes.includes(
-        Buffer.from("PRIVATE_COLLECTOR_EVENT_KEY"),
-      ),
-      false,
+    await assert.rejects(
+      stat(`${collectorFile}.projection-v2.json`),
+      { code: "ENOENT" },
     );
     const cachedSnapshot = await buildLocalCompanionSnapshot({
       root,
-      accountingCacheFile: cacheFile,
+      collectorStateFile: stateFile,
       allowDevelopmentArtifactFallback: true,
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
     });
@@ -701,22 +1148,28 @@ test("live weekly cache replaces the repo artifact and labels historical account
 
 test("malformed live weekly reset rows fail closed without crashing the dashboard", async () => {
   const root = await fixtureRoot();
-  const cacheFile = join(root, ".usage-monitor", "accounting.json");
+  const stateFile = join(root, ".usage-monitor", "local-collector-state-v1.sqlite");
   try {
-    await writeFile(join(root, ".usage-monitor", "collector-events.jsonl"), "");
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      "",
+      { mode: 0o600 },
+    );
     await refreshReplaySafeAccountingCache({
-      cacheFile,
+      stateFile,
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
-      windowDays: 31,
+      // Re-pinned 31 -> 365 (2026-08-08): the standing owner rule forbids
+      // convenience-sized history windows, so 365 is the smallest accepted.
+      windowDays: 365,
       scan: async () => ({ diagnostics: {} }),
     });
-    const cache = JSON.parse(await readFile(cacheFile, "utf8"));
+    const cache = (await readLocalCollectorAccountingCache({ stateFile })).cache;
     cache.weeklyCalibration.recentResets = [null];
-    await writeFile(cacheFile, JSON.stringify(cache));
+    await writeLocalCollectorAccountingCache({ stateFile, cache });
 
     const snapshot = await buildLocalCompanionSnapshot({
       root,
-      accountingCacheFile: cacheFile,
+      collectorStateFile: stateFile,
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
     });
     assert.equal(snapshot.weekly.status, "unavailable");
@@ -749,4 +1202,150 @@ test("data store retains its last good snapshot when a reload fails", async () =
   await store.initialize();
   await assert.rejects(() => store.reload(), /private internal failure/);
   assert.equal(store.getOverview().marker, "last-good");
+});
+
+test("the unified index removes the 31-day ceiling and keeps fork replay out of the headline", async () => {
+  const root = await fixtureRoot();
+  try {
+    // A corpus whose real history reaches far beyond any 31-day window, plus
+    // a forked child that replays its parent — the replay must not surface
+    // anywhere in the snapshot.
+    const sessions = join(root, "sessions", "2026", "06", "01");
+    await mkdir(sessions, { recursive: true });
+    const line = (value) => JSON.stringify(value);
+    const meta = (id, parent = null) => line({
+      timestamp: "2026-06-01T12:00:00.000Z",
+      type: "session_meta",
+      payload: {
+        id,
+        session_id: id,
+        ...(parent === null ? { thread_source: "user" } : {
+          forked_from_id: parent,
+          parent_thread_id: parent,
+          thread_source: "subagent",
+        }),
+        originator: "codex_cli_rs",
+        cwd: "/Users/private/project",
+      },
+    });
+    const turn = (timestamp) => line({
+      timestamp,
+      type: "turn_context",
+      payload: { model: "gpt-5.6-sol", effort: "high" },
+    });
+    const usageTotals = (input, output) => ({
+      input_tokens: input,
+      cached_input_tokens: 0,
+      cache_write_input_tokens: 0,
+      output_tokens: output,
+      reasoning_output_tokens: 0,
+      total_tokens: input + output,
+    });
+    const count = (timestamp, totals, last) => line({
+      timestamp,
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: { total_token_usage: totals, last_token_usage: last },
+      },
+    });
+    await writeFile(join(sessions, "rollout-2026-06-01T12-00-00-parent.jsonl"), `${[
+      meta("session-deep-parent"),
+      turn("2026-06-01T12:00:00.000Z"),
+      count("2026-06-01T12:00:01.000Z", usageTotals(100, 10), usageTotals(100, 10)),
+      count("2026-07-25T11:00:00.000Z", usageTotals(300, 30), usageTotals(200, 20)),
+    ].join("\n")}\n`);
+    await writeFile(join(sessions, "rollout-2026-07-25T11-30-00-child.jsonl"), `${[
+      meta("session-deep-child", "session-deep-parent"),
+      count("2026-07-25T11:30:00.000Z", usageTotals(100, 10), usageTotals(100, 10)),
+      count("2026-07-25T11:30:01.000Z", usageTotals(300, 30), usageTotals(200, 20)),
+      turn("2026-07-25T11:30:02.000Z"),
+      count("2026-07-25T11:30:03.000Z", usageTotals(400, 50), usageTotals(100, 20)),
+    ].join("\n")}\n`);
+    const { rebuildLocalUnifiedIndex } = await import("../src/local-unified-index-build.js");
+    const built = await rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile: join(root, ".usage-monitor", "local-unified-index-v1.sqlite"),
+      secretFile: join(root, ".usage-monitor", "local-unified-index-device-salt-v1"),
+      contractVersion: "companion-test-v1",
+    });
+    assert.equal(built.usageEvents, 3);
+    assert.equal(built.forkReplayEventsSkipped, 2);
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      allowDevelopmentArtifactFallback: false,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+
+    // The broadest period covers the whole indexed history — the June event
+    // sits 54 days back, far beyond the old 31-day ceiling — and counts the
+    // three genuine turns, never the two replayed ones.
+    const broadest = snapshot.overview.usage.find((period) => period.id === "all");
+    assert.equal(broadest.label, "All indexed local history");
+    assert.equal(broadest.events, 3);
+    assert.equal(broadest.totalTokens, 110 + 220 + 120);
+    // The timeline reaches the June evidence too.
+    assert.equal(snapshot.overview.timeline.source, "unified_local_index");
+    assert.equal(
+      snapshot.overview.timeline.usage[0].startAt,
+      "2026-06-01T12:00:00.000Z",
+    );
+    assert.equal(snapshot.overview.timeline.history.status, "complete");
+    assert.equal(
+      snapshot.overview.timeline.history.coveredAt.startAt,
+      "2026-06-01T12:00:01.000Z",
+    );
+    // The headline accounting names the replay-suppressed source and the
+    // collector-projection warning does not fire.
+    assert.equal(
+      snapshot.overview.accounting.accountingSource,
+      "unified_local_index_replay_suppressed",
+    );
+    assert.ok(!snapshot.overview.warnings.some((warning) => (
+      warning.includes("live collector projection")
+    )));
+    assert.ok(!snapshot.overview.warnings.some((warning) => (
+      warning.includes("unified local index")
+    )));
+    // Content never leaks into the payload.
+    const serialized = JSON.stringify(snapshot);
+    assert.ok(!serialized.includes("session-deep-parent"));
+    assert.ok(!serialized.includes("/Users/private"));
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a missing unified index keeps the bounded window and says so in the payload", async () => {
+  const root = await fixtureRoot();
+  try {
+    const usage = (observedAt) => JSON.stringify({
+      schemaVersion: "0.3",
+      kind: "codex_rollout_usage_snapshot",
+      observedAt,
+      model: "gpt-5.6-sol",
+      components: { input_uncached_tokens: 100 },
+    });
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      `${usage("2026-07-25T11:00:00.000Z")}\n`,
+      { mode: 0o600 },
+    );
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(snapshot.overview.timeline.source, "recent_collector_window");
+    assert.equal(snapshot.overview.timeline.history.status, "unavailable");
+    assert.equal(snapshot.overview.timeline.history.reason, "unified_index_missing");
+    assert.equal(snapshot.overview.timeline.history.boundedDays, 31);
+    assert.ok(snapshot.overview.warnings.some((warning) => (
+      warning.includes("unified local index has not been built yet")
+    )));
+    const broadest = snapshot.overview.usage.find((period) => period.id === "all");
+    assert.equal(broadest.label, "Cached 31-day collector window");
+  } finally {
+    await rm(root, { recursive: true });
+  }
 });

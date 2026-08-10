@@ -131,6 +131,15 @@ async function runtimeSourceUrls(relativeDirectory) {
       if (metadata.isSymbolicLink()) {
         throw new TypeError("R7 benchmark runtime source contains a symlink");
       }
+      // Operating-system metadata is not runtime source and must not be
+      // attested as such, but neither should its presence fail the smoke
+      // gate: `.DS_Store` reappears whenever anyone opens the folder in
+      // Finder. No runtime module in these trees is a dotfile, and OS
+      // metadata always is, so skipping dotfiles excludes the noise without
+      // widening what the digest is allowed to cover. This mirrors
+      // collectR7ReleaseEvidenceRuntimeSourcePaths in
+      // src/r7-release-evidence-schema.js.
+      if (name.startsWith(".")) continue;
       if (metadata.isDirectory()) {
         await visit(new URL(`${name}/`, directory));
       } else if (metadata.isFile()
@@ -150,7 +159,13 @@ async function runtimeSourceUrls(relativeDirectory) {
 export async function collectR7BenchmarkImplementationUrls() {
   return [
     ...await runtimeSourceUrls("src"),
-    ...await runtimeSourceUrls("shared"),
+    // `shared/` was dissolved when ownership boundaries landed; its quota
+    // calibration, rolling, and track modules moved to packages/quota-analysis.
+    // Dropping the old path without adding the new one would have made this
+    // scan pass while silently excluding the calibration code it exists to
+    // attest, so the smoke provenance follows the code rather than the
+    // directory name.
+    ...await runtimeSourceUrls("packages/quota-analysis/src"),
     ...await runtimeSourceUrls("packages/accounting/src"),
     new URL("packages/accounting/index.js", REPOSITORY_ROOT),
     new URL("packages/accounting/package.json", REPOSITORY_ROOT),

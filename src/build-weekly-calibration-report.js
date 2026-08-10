@@ -1,14 +1,18 @@
 #!/usr/bin/env node
 
-import { chmod, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import {
+  localLegacyReportPath,
+  writeLocalLegacyReport,
+} from "./local-legacy-report-storage.js";
 
 const root = process.cwd();
 const inputPath = resolve(root, ".usage-monitor/weekly-calibration-v0.2.json");
 const providerCrosscheckPath = resolve(root, ".usage-monitor/provider-crosscheck-v0.1.json");
 const experimentPath = resolve(root, ".usage-monitor/experiment-results.jsonl");
 const highErrorAuditPath = resolve(root, ".usage-monitor/weekly-calibration-high-error-audit-v0.1.json");
-const outputPath = resolve(root, "2026-07-24-weekly-7-day-calibration-artifact.json");
+const outputPath = localLegacyReportPath(root, "2026-07-24-weekly-7-day-calibration-artifact.json");
 const calibration = JSON.parse(await readFile(inputPath, "utf8"));
 const providerCrosscheck = JSON.parse(await readFile(providerCrosscheckPath, "utf8"));
 const experimentResults = (await readFile(experimentPath, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
@@ -706,6 +710,5 @@ const artifact = {
   ],
 };
 
-await writeFile(outputPath, `${JSON.stringify(artifact, null, 2)}\n`, "utf8");
-await chmod(outputPath, 0o600);
+await writeLocalLegacyReport(root, "2026-07-24-weekly-7-day-calibration-artifact.json", `${JSON.stringify(artifact, null, 2)}\n`);
 process.stdout.write(`${JSON.stringify({ outputPath, generatedAt, charts: artifact.manifest.charts.length, tables: artifact.manifest.tables.length }, null, 2)}\n`);

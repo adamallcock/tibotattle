@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   analyzeMonitoringQuality,
   classifyMonitoringInterval,
+  createCollectorQualityAccumulator,
   renderMonitoringQualityReport,
 } from "../src/reporting/index.js";
 
@@ -107,4 +108,32 @@ test("keeps continuity as a P0 when a refresh follows a long app-server gap", ()
   assert.equal(report.collector.status, "fresh");
   assert.equal(report.collector.latestAppServerGapMs, 7_195_000);
   assert.ok(report.opportunities.some((row) => row.id === "collector_continuity" && /fresh after/.test(row.evidence)));
+});
+
+test("streamed collector summaries preserve the array report semantics", () => {
+  const records = [
+    { kind: "codex_rollout_usage_snapshot", source: "rollout", observedAt: "2026-07-24T10:01:00.000Z", stalenessMs: 10, accountScope: { status: "available", scopeId: "scope-v1:test" }, tierSemantics: { codexSpeedMode: "standard" } },
+    { kind: "codex_quota_snapshot", source: "app_server_read", observedAt: "2026-07-24T10:00:00.000Z" },
+    { kind: "codex_rollout_usage_snapshot", source: "rollout", observedAt: "2026-07-24T10:03:00.000Z", stalenessMs: 30, accountScope: { status: "available", scopeId: "scope-v1:test" }, tierSemantics: { codexSpeedMode: "fast" } },
+    { kind: "codex_quota_snapshot", source: "app_server_notification", observedAt: "2026-07-24T10:02:00.000Z" },
+  ];
+  const now = "2026-07-24T10:04:00.000Z";
+  const accumulator = createCollectorQualityAccumulator({ nowMs: Date.parse(now) });
+  for (const record of [...records].sort((left, right) => left.observedAt.localeCompare(right.observedAt))) {
+    accumulator.add(record);
+  }
+  const arrayReport = analyzeMonitoringQuality({
+    transitions: fixture(),
+    collectorRecords: records,
+    now,
+  });
+  const streamedReport = analyzeMonitoringQuality({
+    transitions: fixture(),
+    collectorSummary: accumulator.finalize({
+      rolloutReceiptStalenessMsP50: 20,
+      rolloutReceiptStalenessMsP90: 28,
+    }),
+    now,
+  });
+  assert.deepEqual(streamedReport.collector, arrayReport.collector);
 });

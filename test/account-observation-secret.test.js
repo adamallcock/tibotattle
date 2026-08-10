@@ -475,15 +475,14 @@ test("doctor, register, capture, and collector CLI paths share the injected prod
     assert.equal(capturedScope.status, "available");
 
     let collectorLoader;
-    await run(["collect-once", "--data-file", join(root, "collector.jsonl")], {
+    await run(["collect-once", "--state-file", join(root, "collector.sqlite")], {
       ...dependencies,
       async runCollectorOnceCommand(options) {
         collectorLoader = options.loadAccountObservationSecret;
         return {
           rolloutRecordsWritten: 0,
           refresh: { attempted: false, errorCode: null, recordWritten: false },
-          dataFile: join(root, "collector.jsonl"),
-          checkpointFile: join(root, "checkpoint.json"),
+          stateFile: join(root, "collector.sqlite"),
         };
       },
     });

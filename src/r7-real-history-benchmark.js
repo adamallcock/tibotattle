@@ -15,7 +15,6 @@ import {
   createExportResourceGuard,
   DEFAULT_EXPORT_RESOURCE_LIMITS,
 } from "./export-resource-policy.js";
-import { defaultCollectorDataFile } from "./passive-collector.js";
 import { runR7FilesystemHighWaterSampler } from "./r7-filesystem-high-water.js";
 import {
   assertValidR7ReleaseEvidenceReceipt,
@@ -443,7 +442,10 @@ export async function runR7RealHistoryEvidence({
   temporaryRoot = tmpdir(),
   timeoutMs = R7_WORKER_MAXIMUM_TIMEOUT_MS,
   codexHome = join(homedir(), ".codex"),
-  collectorPath = defaultCollectorDataFile(),
+  // The current local collector is SQLite. This historical benchmark accepts
+  // an explicitly supplied JSONL supplemental source when requested, but it
+  // must not silently depend on the retired managed ledger path.
+  collectorPath = null,
   claudeStateDirectory = defaultClaudeStatusStateDirectory(),
   claudeProjectsDirectory = defaultClaudeProjectsDirectory(),
   afterSourcePlanFreeze = async () => {},
@@ -453,7 +455,8 @@ export async function runR7RealHistoryEvidence({
   normalizeTimeout(timeoutMs);
   if (typeof temporaryRoot !== "string" || !isAbsolute(temporaryRoot)
       || typeof codexHome !== "string" || !isAbsolute(codexHome)
-      || typeof collectorPath !== "string" || !isAbsolute(collectorPath)
+      || (collectorPath !== null
+        && (typeof collectorPath !== "string" || !isAbsolute(collectorPath)))
       || typeof claudeStateDirectory !== "string" || !isAbsolute(claudeStateDirectory)
       || typeof claudeProjectsDirectory !== "string" || !isAbsolute(claudeProjectsDirectory)
       || typeof afterSourcePlanFreeze !== "function") {

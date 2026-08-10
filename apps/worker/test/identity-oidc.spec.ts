@@ -1,6 +1,6 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { encodeBase64Url } from "../src/crypto";
+import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { ApiError } from "../src/errors";
 import {
   clearIdentityJwksCacheForTests,
@@ -300,6 +300,94 @@ describe("pairwise pseudonymous identifier derivation", () => {
 });
 
 describe("adversarial claim validation", () => {
+  it("requires Apple's ID Token nonce to match the state-row digest", async () => {
+    const nonce = "apple-transaction-nonce-000000000000000000000000";
+    const token = await rs256Token(
+      header(),
+      applePayload({ nonce }),
+      primary.privateKey,
+    );
+    const verified = await verifyHostedIdentity(
+      bindings(),
+      { provider: "apple", idToken: token },
+      {
+        expectedNonceHash: await sha256Hex(nonce),
+        jwksFetcher: jwksFetcherFor([primary.jwk]),
+        nowMs: NOW_MS,
+      },
+    );
+    expect(verified.provider).toBe("apple");
+  });
+
+  it("also accepts an exact request-scoped Apple nonce without persisting it", async () => {
+    const nonce = "apple-request-scoped-nonce-000000000000000000000000";
+    const token = await rs256Token(
+      header(),
+      applePayload({ nonce }),
+      primary.privateKey,
+    );
+    await expect(verifyHostedIdentity(
+      bindings(),
+      { provider: "apple", idToken: token },
+      {
+        expectedNonce: nonce,
+        jwksFetcher: jwksFetcherFor([primary.jwk]),
+        nowMs: NOW_MS,
+      },
+    )).resolves.toMatchObject({ provider: "apple" });
+  });
+
+  it("rejects an Apple nonce that is missing or bound to another transaction", async () => {
+    const nonce = "apple-transaction-nonce-000000000000000000000000";
+    const token = await rs256Token(
+      header(),
+      applePayload({ nonce }),
+      primary.privateKey,
+    );
+    await expect(verifyHostedIdentity(
+      bindings(),
+      { provider: "apple", idToken: token },
+      {
+        expectedNonceHash: await sha256Hex("a-different-transaction-nonce-000000000000000000"),
+        jwksFetcher: jwksFetcherFor([primary.jwk]),
+        nowMs: NOW_MS,
+      },
+    )).rejects.toMatchObject({ status: 401, code: "IDENTITY_TOKEN_INVALID" });
+
+    const noNonce = await rs256Token(
+      header(),
+      applePayload(),
+      primary.privateKey,
+    );
+    await expect(verifyHostedIdentity(
+      bindings(),
+      { provider: "apple", idToken: noNonce },
+      {
+        expectedNonceHash: await sha256Hex(nonce),
+        jwksFetcher: poisonFetcher,
+        nowMs: NOW_MS,
+      },
+    )).rejects.toMatchObject({ status: 401, code: "IDENTITY_TOKEN_INVALID" });
+  });
+
+  it("does not accept nonce binding on a non-Apple provider", async () => {
+    const nonce = "google-transaction-nonce-000000000000000000000000";
+    const token = await rs256Token(
+      header(),
+      googlePayload({ nonce }),
+      primary.privateKey,
+    );
+    await expect(verifyHostedIdentity(
+      bindings(),
+      { provider: "google", idToken: token },
+      {
+        expectedNonceHash: await sha256Hex(nonce),
+        jwksFetcher: poisonFetcher,
+        nowMs: NOW_MS,
+      },
+    )).rejects.toMatchObject({ status: 401, code: "IDENTITY_TOKEN_INVALID" });
+  });
+
   it("rejects a wrong, downgraded, suffix-tricked, or cross-provider issuer", async () => {
     for (const badIssuer of [
       "https://not-google.example",
@@ -884,6 +972,30 @@ describe("default JWKS fetcher", () => {
         { nowMs: NOW_MS },
       )).rejects.toMatchObject({ status: 401, code: "IDENTITY_PROVIDER_UNAVAILABLE" });
     }
+  });
+
+  it("fails closed and aborts when the JWKS provider does not answer", async () => {
+    let aborted = false;
+    globalThis.fetch = (async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      init?.signal?.addEventListener("abort", () => {
+        aborted = true;
+      }, { once: true });
+      return new Promise<Response>(() => {});
+    }) as typeof fetch;
+
+    const token = await rs256Token(header(), googlePayload(), primary.privateKey);
+    await expect(verifyHostedIdentity(
+      bindings(),
+      { provider: "google", idToken: token },
+      { nowMs: NOW_MS, timeoutMilliseconds: 1 },
+    )).rejects.toMatchObject({
+      status: 401,
+      code: "IDENTITY_PROVIDER_UNAVAILABLE",
+    });
+    expect(aborted).toBe(true);
   });
 
   it("verifies a real token through the default fetcher against the documented JWKS URLs", async () => {

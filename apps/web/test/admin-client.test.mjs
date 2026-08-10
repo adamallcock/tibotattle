@@ -28,9 +28,21 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
       publication: true,
     },
     counts: {
-      participants: { active: 5, total: 6, bounded: false },
+      participants: {
+        active: 5,
+        total: 6,
+        bounded: false,
+        enrolledLast24Hours: 1,
+        enrolledLast7Days: 3,
+      },
       contributions: {
-        telemetry: { accepted: 9, total: 10, bounded: false },
+        telemetry: {
+          accepted: 9,
+          total: 10,
+          bounded: false,
+          acceptedLast24Hours: 2,
+          acceptedLast7Days: 6,
+        },
         storedTelemetryRecords: 22,
         storedTelemetryRecordsBounded: false,
       },
@@ -45,6 +57,15 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
       failureCode: null,
     },
     reconciliation: { state: "completed", reconciliationComplete: true },
+    ingress: {
+      activeLeases: 3,
+      maximumConcurrent: 16,
+      availableStartTokens: 240,
+      burst: 300,
+      concurrencyDenials: 4,
+      startRateDenials: 2,
+      lastDeniedAt: "2026-08-02T09:15:00.000Z",
+    },
     snapshots: [{
       snapshotId: "community-weekly:2026-07-26",
       weekStart: "2026-07-26T00:00:00.000Z",
@@ -61,6 +82,13 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
         ratePerDay: 0.29,
         latestAt: "2026-08-02T10:00:00.000Z",
       }],
+      recentDiagnostics: [{
+        requestId: "019fc0b7-6c19-7b40-bda0-a1a1d7202100",
+        routeClass: "admin_overview",
+        errorCode: "BACKEND_STORAGE_UNAVAILABLE",
+        status: 503,
+        occurredAt: "2026-08-02T10:00:00.000Z",
+      }],
       lookup: null,
     },
     audit: [{
@@ -72,6 +100,36 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
   });
   assert.equal(Object.isFrozen(overview), true);
   assert.equal(Object.isFrozen(overview.collection), true);
+});
+
+test("an unavailable ingress budget projects to null instead of failing the view", async () => {
+  const payload = await fixture("admin-overview-valid.json");
+  payload.ingress = null;
+  assert.equal(projectAdminOverview(payload).ingress, null);
+  delete payload.ingress;
+  assert.equal(projectAdminOverview(payload).ingress, null);
+});
+
+test("admin overview projector rejects malformed ingress pressure values", async () => {
+  for (const ingress of [
+    { activeLeases: -1 },
+    { ...{
+      activeLeases: 0,
+      maximumConcurrent: 16,
+      availableStartTokens: 0,
+      burst: 300,
+      concurrencyDenials: 0,
+      startRateDenials: 0,
+    }, lastDeniedAt: 12345 },
+    "unavailable",
+  ]) {
+    const payload = await fixture("admin-overview-valid.json");
+    payload.ingress = ingress;
+    assert.throws(
+      () => projectAdminOverview(payload),
+      /ADMIN_OVERVIEW_INVALID/u,
+    );
+  }
 });
 
 test("admin overview projector rejects missing and malformed render values", async () => {

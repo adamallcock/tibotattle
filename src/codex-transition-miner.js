@@ -1,4 +1,5 @@
 import { scanCodexLogEvents } from "./codex-log-scan.js";
+import { validAbortSignal } from "./valid-abort-signal.js";
 import {
   fastQuotaMultiplier,
   subscriptionSpeedSensitivity,
@@ -13,7 +14,7 @@ import {
 
 const SCHEMA_VERSION = "0.3";
 export const PARSER_VERSION = "0.3.2";
-const ESTIMATOR_VERSION = "provider-neutral-api-price-equivalent-v0.1";
+const ESTIMATOR_VERSION = "provider-neutral-api-price-equivalent-v0.2";
 const COMPONENT_NAMES = [
   "input_uncached_tokens",
   "input_cache_read_tokens",
@@ -42,13 +43,6 @@ function fixedError(code) {
   const error = new Error(code);
   error.code = code;
   return error;
-}
-
-function validAbortSignal(signal) {
-  return signal === null
-    || (typeof signal === "object"
-      && typeof signal.aborted === "boolean"
-      && typeof signal.addEventListener === "function");
 }
 
 function throwIfDerivationAborted(signal) {
@@ -109,6 +103,7 @@ function priceUsageEvent(event, priceCards) {
     warningCodes: costWarningCodes(ledger),
     coverageWarningCodes: ledger.warnings.coverage.map((warning) => warning.code).sort(),
     priceCardIds: ledger.selectedPriceCardIds,
+    priceCardBreakdown: ledger.priceCardBreakdown,
   };
 }
 
@@ -135,6 +130,7 @@ function aggregateUsage(
   const models = {};
   const pricingWarnings = new Set();
   const priceCardIds = new Set();
+  const priceCardBreakdown = new Map();
   const tierUsageEventCounts = {};
   let costUsd = 0;
   for (let index = startIndex; index < endIndex; index += 1) {
@@ -144,6 +140,16 @@ function aggregateUsage(
     costUsd += event.costUsd;
     for (const warning of event.coverageWarningCodes) pricingWarnings.add(warning);
     for (const id of event.priceCardIds) priceCardIds.add(id);
+    for (const item of event.priceCardBreakdown ?? []) {
+      const row = priceCardBreakdown.get(item.priceCardId) ?? {
+        priceCardId: item.priceCardId,
+        events: 0,
+        costUsd: "0",
+      };
+      row.events += item.events ?? 0;
+      row.costUsd = addUsdStrings(row.costUsd, item.costUsd ?? "0");
+      priceCardBreakdown.set(item.priceCardId, row);
+    }
     const speedMode = event.tierSemantics?.codexSpeedMode ?? "unknown";
     tierUsageEventCounts[speedMode] = (tierUsageEventCounts[speedMode] ?? 0) + 1;
     const model = models[event.model] ??= { events: 0, costUsd: 0, components: emptyComponents() };
@@ -159,6 +165,9 @@ function aggregateUsage(
     models,
     pricingWarnings: [...pricingWarnings].sort(),
     priceCardIds: [...priceCardIds].sort(),
+    priceCardBreakdown: [...priceCardBreakdown.values()].sort(
+      (left, right) => left.priceCardId.localeCompare(right.priceCardId),
+    ),
     tierUsageEventCounts,
   };
 }
@@ -320,6 +329,7 @@ function makeTransition({
     aggregateToolClassMix: toolMix,
     controlledState: "unknown",
     priceCardIds: marginal.priceCardIds,
+    priceCardBreakdown: marginal.priceCardBreakdown,
     snapshot: {
       source: "rollout_token_count",
       providerSnapshotAgeMs: null,
@@ -406,6 +416,7 @@ function makeSnapshotInterval({
     ),
     controlledState: "unknown",
     priceCardIds: marginal.priceCardIds,
+    priceCardBreakdown: marginal.priceCardBreakdown,
     snapshot: {
       source: "rollout_token_count",
       providerSnapshotAgeMs: null,
@@ -529,10 +540,11 @@ function decodeCompactAccountingUsage(value) {
 
 function decodePrepricedCompactAccountingUsage(value) {
   if (!Array.isArray(value)
-      || value.length !== 19
+      || ![19, 20].includes(value.length)
       || !Array.isArray(value[16])
       || !Array.isArray(value[17])
       || !Array.isArray(value[18])) return null;
+  if (value.length === 20 && !Array.isArray(value[19])) return null;
   const base = decodeCompactAccountingUsage(value.slice(0, 10));
   if (base === null) return null;
   return {
@@ -546,6 +558,7 @@ function decodePrepricedCompactAccountingUsage(value) {
     warningCodes: value[16],
     coverageWarningCodes: value[17],
     priceCardIds: value[18],
+    priceCardBreakdown: value[19] ?? [],
     prepricedAccountingInput: true,
   };
 }
@@ -587,7 +600,7 @@ async function normalizeTransitionInputsCooperatively({
     if (consumeInputs) rawUsageEvents[index] = null;
     const event = inputEncoding === "accounting_compact_v1"
       ? decodeCompactAccountingUsage(source)
-      : inputEncoding === "accounting_prepriced_compact_v1"
+      : ["accounting_prepriced_compact_v1", "accounting_prepriced_compact_v2"].includes(inputEncoding)
         ? decodePrepricedCompactAccountingUsage(source)
         : source;
     if (!event || typeof event !== "object" || Array.isArray(event)) continue;
@@ -622,6 +635,7 @@ async function normalizeTransitionInputsCooperatively({
     const snapshot = [
       "accounting_compact_v1",
       "accounting_prepriced_compact_v1",
+      "accounting_prepriced_compact_v2",
     ].includes(inputEncoding)
       ? decodeCompactAccountingSnapshot(source)
       : source;
@@ -919,6 +933,7 @@ export async function deriveCodexTransitionSeriesCooperatively({
         "object",
         "accounting_compact_v1",
         "accounting_prepriced_compact_v1",
+        "accounting_prepriced_compact_v2",
       ].includes(inputEncoding)) {
     throw new TypeError("Cooperative transition series inputs are invalid");
   }
@@ -1216,8 +1231,12 @@ export async function mineCodexTransitions({
         thresholdTokens: 272000,
       },
       estimatorVersion: ESTIMATOR_VERSION,
-      priceEpochBasis: "current_price_sensitivity_at_registry_observation",
-      currentPriceSensitivityTotalUsdExact: cumulativeScanCostUsdExact,
+      priceEpochBasis: "event_time_when_registry_has_effective_evidence",
+      eventTimeHistoricalTotalUsdExact: cumulativeScanCostUsdExact,
+      // This field is reserved for a registry-observation/current-card
+      // sensitivity total. The miner above is explicitly historical, so a
+      // historical cumulative total must never be exposed under this name.
+      currentPriceSensitivityTotalUsdExact: null,
       selectedSource: priceResolution.selectedSource,
       registry: priceResolution.registry,
       sources: priceResolution.registry.sources.map((source) => ({

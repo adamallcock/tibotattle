@@ -10,12 +10,13 @@ const DEVICE_ID = "11111111-1111-4111-8111-111111111111";
 const AUTH_ID = "22222222-2222-4222-8222-222222222222";
 const CONTRIBUTION_ID = "33333333-3333-4333-8333-333333333333";
 
-function response(value, status = 200) {
+function response(value, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(value), {
     status,
     headers: {
       "Cache-Control": "no-store",
       "Content-Type": "application/json",
+      ...extraHeaders,
     },
   });
 }
@@ -150,11 +151,12 @@ test("only transient HTTP failures are marked retryable", async () => {
       }),
       fetchImpl: async () => response({
         error: { code: "BACKEND_STORAGE_UNAVAILABLE", requestId: "fixed" },
-      }, 429),
+      }, 429, { "Retry-After": "60" }),
     }),
     (error) => error.code === "contribution_device_sync_service_unavailable"
       && error.retryable === true
-      && error.deviceUnavailable === false,
+      && error.deviceUnavailable === false
+      && error.retryAfterMilliseconds === 60_000,
   );
 
   await assert.rejects(
@@ -191,5 +193,48 @@ test("only transient HTTP failures are marked retryable", async () => {
     (error) => error.code === "contribution_device_sync_device_unavailable"
       && error.retryable === false
       && error.deviceUnavailable === true,
+  );
+});
+
+test("Retry-After accepts IMF-fixdate and never silently shortens an over-horizon floor", async (t) => {
+  const entry = {
+    basename: "telemetry-contribution-000001.json",
+    sha256: "a".repeat(64),
+    bytes: 123,
+    recordCounts: { usageEvents: 1, quotaSnapshots: 0, activityMarkers: 0 },
+  };
+  const fixedNow = Date.parse("2026-07-26T12:00:00.000Z");
+  t.mock.method(Date, "now", () => fixedNow);
+  const transient = (header) => syncPreparedContributionEntryOnce({
+    directory: "/private/prepared",
+    entry,
+    origin: "https://usage.example",
+    backend: {},
+    loadContribution: async () => ({
+      schemaVersion: "telemetry-contribution-v0.1",
+      synthetic: false,
+    }),
+    fetchImpl: async () => response({ error: { code: "busy" } }, 429, {
+      "Retry-After": header,
+    }),
+  });
+
+  await assert.rejects(
+    transient("Sun, 26 Jul 2026 12:01:00 GMT"),
+    (error) => error.retryable === true
+      && error.retryAfterMilliseconds === 60_000
+      && error.retryAfterExceedsMaximum === false,
+  );
+  await assert.rejects(
+    transient("08/05/2026"),
+    (error) => error.retryable === true
+      && error.retryAfterMilliseconds === null
+      && error.retryAfterExceedsMaximum === false,
+  );
+  await assert.rejects(
+    transient("604801"),
+    (error) => error.retryable === true
+      && error.retryAfterMilliseconds === null
+      && error.retryAfterExceedsMaximum === true,
   );
 });

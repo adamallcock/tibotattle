@@ -113,6 +113,15 @@ const V02_CONTRIBUTION_DIAGNOSTIC_KEYS = Object.freeze([
   "unknownBillableUnits",
   "priceBasis",
 ]);
+const V02_EVENT_PRICE_BASES = Object.freeze([
+  "current_api_prices",
+  "historical_api_prices",
+  "unpriced",
+]);
+const V02_BATCH_PRICE_BASES = Object.freeze([
+  ...V02_EVENT_PRICE_BASES,
+  "mixed_api_prices",
+]);
 
 function accountTrackId(value) {
   return typeof value === "string" && ACCOUNT_TRACK_PATTERN.test(value);
@@ -125,7 +134,7 @@ function validUsageDiagnostic(value) {
     && isTelemetryMoney(value.estimatedApiCostUsd)
     && isTelemetryBounded(value.pricingCoveragePercent, 0, 100)
     && isTelemetryInteger(value.unknownBillableUnits, 1_000_000_000)
-    && ["current_api_prices", "unpriced"].includes(value.priceBasis);
+    && V02_EVENT_PRICE_BASES.includes(value.priceBasis);
 }
 
 function validContributionDiagnostic(value) {
@@ -139,7 +148,7 @@ function validContributionDiagnostic(value) {
     && isTelemetryBounded(value.pricedEventCoveragePercent, 0, 100)
     && isTelemetryInteger(value.unknownModelEventCount, 200)
     && isTelemetryInteger(value.unknownBillableUnits, 1_000_000_000)
-    && ["current_api_prices", "unpriced"].includes(value.priceBasis);
+    && V02_BATCH_PRICE_BASES.includes(value.priceBasis);
 }
 
 function stripV02Usage(row) {

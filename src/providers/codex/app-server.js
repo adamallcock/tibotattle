@@ -3,6 +3,9 @@ import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createInterface } from "node:readline";
 import { deriveOpenAIAccountScope, sanitizeAccountScope } from "./account-scope.js";
+import { normalizeProviderPlanType } from "./plan-normalization.js";
+import { normalizeProviderQuotaWindow } from "./quota-normalization.js";
+import { RELEASE_VERSION } from "../../../config/release-manifest.js";
 
 const DEFAULT_TIMEOUT_MS = 20_000;
 const ACCOUNT_HMAC_ENV = "APP_USAGEMONITOR_ACCOUNT_HMAC_KEY";
@@ -90,7 +93,7 @@ export class CodexAppServerClient extends EventEmitter {
       clientInfo: {
         name: "app_usagemonitor",
         title: "TiboTattle",
-        version: "0.1.0",
+        version: RELEASE_VERSION,
       },
       capabilities: {
         optOutNotificationMethods: ["remoteControl/status/changed"],
@@ -198,19 +201,7 @@ export async function readCodexAccountSnapshot({ timeoutMs = DEFAULT_TIMEOUT_MS 
 
 function sanitizeLimitWindow(window) {
   if (!window) return null;
-  if (
-    !Number.isFinite(window.usedPercent)
-    || window.usedPercent < 0
-    || window.usedPercent > 100
-    || !Number.isFinite(window.windowDurationMins)
-    || window.windowDurationMins <= 0
-    || !Number.isFinite(window.resetsAt)
-  ) return null;
-  return {
-    usedPercent: window.usedPercent,
-    windowDurationMins: window.windowDurationMins,
-    resetsAt: window.resetsAt,
-  };
+  return normalizeProviderQuotaWindow(window);
 }
 
 export function sanitizeRateLimit(limit) {
@@ -220,7 +211,7 @@ export function sanitizeRateLimit(limit) {
     limitName: limit.limitName ?? null,
     primary: sanitizeLimitWindow(limit.primary),
     secondary: sanitizeLimitWindow(limit.secondary),
-    planType: limit.planType ?? null,
+    planType: normalizeProviderPlanType(limit.planType),
     rateLimitReachedType: limit.rateLimitReachedType ?? null,
     spendControlReached: limit.spendControlReached ?? null,
     credits: limit.credits
@@ -262,7 +253,9 @@ export function sanitizeCodexAccountSnapshot(snapshot, capturedAt, {
         .filter((bucket) => typeof bucket?.startDate === "string" && Number.isFinite(bucket?.tokens))
         .map((bucket) => ({ date: bucket.startDate, tokens: bucket.tokens }))
     : [];
-  const providerPlanType = snapshot.account?.account?.planType ?? canonical.planType ?? null;
+  const providerPlanType = normalizeProviderPlanType(
+    snapshot.account?.account?.planType ?? canonical.planType,
+  );
   const accountScope = sanitizeAccountScope(deriveOpenAIAccountScope(snapshot.account, {
     secret: accountHmacKey,
     planType: providerPlanType,

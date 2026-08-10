@@ -329,4 +329,151 @@ describe("disabled v0.2 backend shadow lane", () => {
     }>();
     expect(counts).toEqual({ contributions: 3, records: 57 });
   });
+
+  // csf_efc6acb1: a near-maximal corpus with one distinct continuity track per
+  // row previously drove per-track full-array rescans into quadratic work. The
+  // distinct-track ceiling now rejects the adversarial corpus before any
+  // per-track analysis begins.
+  it("rejects an adversarial high-cardinality corpus before any per-track analysis", async () => {
+    const bindings = env as TestBindings;
+    const participant = await enroll(
+      bindings.USAGE_MONITOR_DB,
+      "privacy-safe-telemetry-v0.2",
+    );
+
+    // 300 distinct account tracks (> the 256 continuity-track ceiling) spread
+    // across two datasets, each within the 200-record-per-contribution and
+    // 100-dataset limits. Every quota snapshot is on its own track, so each is a
+    // distinct continuity seed. A handful of usage events keeps the contribution
+    // contract-valid; usage rows do not create seeds.
+    const MIN_MS = 60_000;
+    const perContribution = 150;
+    for (let datasetIndex = 0; datasetIndex < 2; datasetIndex += 1) {
+      const datasetId = opaque("dataset", 9_000 + datasetIndex);
+      const firstObserved = Date.UTC(2026, 0, 8) + datasetIndex * DAY_MS;
+      const span = (perContribution - 1) * MIN_MS;
+      const resetsAt = new Date(firstObserved + 30 * DAY_MS).toISOString();
+      const quotaSnapshots = Array.from(
+        { length: perContribution },
+        (_, snapshotIndex) => {
+          const ordinal = datasetIndex * perContribution + snapshotIndex;
+          const observed = new Date(firstObserved + snapshotIndex * MIN_MS)
+            .toISOString();
+          return {
+            schemaVersion: "quota-snapshot-v0.2",
+            accountTrackId:
+              `account-track:v1:${ordinal.toString(16).padStart(64, "0")}`,
+            observedTime: observed,
+            receivedTime: observed,
+            provider: "openai_codex",
+            planType: "pro",
+            planVariant: "pro-20x",
+            limitId: "codex",
+            slot: snapshotIndex % 2 === 0 ? "primary" : "secondary",
+            usedPercent: 0,
+            displayPrecision: 0,
+            windowDurationMinutes: 10_080,
+            resetsAt,
+            snapshotSource: "rollout",
+            providerSurface: "account_shared_unallocated",
+            snapshotId: opaque("snapshot", 900_000 + ordinal),
+          };
+        },
+      );
+      const usageEvents = Array.from({ length: 5 }, (_, eventIndex) => ({
+        schemaVersion: "usage-event-v0.2",
+        accountTrackId:
+          `account-track:v1:${(700_000 + datasetIndex * 10 + eventIndex)
+            .toString(16).padStart(64, "0")}`,
+        eventTime: new Date(firstObserved + eventIndex * MIN_MS).toISOString(),
+        provider: "openai_codex",
+        modelId: "gpt-5.6-sol",
+        modelRecognition: "recognized",
+        modelFingerprint: null,
+        billingSurface: "chatgpt_subscription",
+        speedMode: "standard",
+        apiServiceTier: "standard",
+        reasoningEffort: "xhigh",
+        components: {
+          inputUncachedTokens: 100_000,
+          inputCacheReadTokens: 900_000,
+          inputCacheWriteTokens: 0,
+          inputCacheWrite5mTokens: null,
+          inputCacheWrite1hTokens: null,
+          outputTextTokens: 20_000,
+          outputReasoningTokens: 10_000,
+          outputCombinedTokens: null,
+        },
+        totalInputContextTokens: 1_000_000,
+        surface: "local_interactive_unclassified",
+        agentScope: "root",
+        lineageDisposition: "standalone",
+        toolClassCounts: toolCounts(),
+        outcome: "completed",
+        eventId: opaque("event", 800_000 + datasetIndex * 10 + eventIndex),
+        accountingDiagnostic: {
+          status: "untrusted_diagnostic",
+          sourceSchemaVersion: "telemetry-contribution-v0.1",
+          estimatedApiCostUsd: "1.000000",
+          pricingCoveragePercent: 100,
+          unknownBillableUnits: 0,
+          priceBasis: "current_api_prices",
+        },
+      }));
+      const contributionRecord = {
+        schemaVersion: "telemetry-contribution-v0.2",
+        consentVersion: "privacy-safe-telemetry-v0.2",
+        status: "implementation_disabled",
+        synthetic: false,
+        datasetId,
+        partIndex: 1,
+        partCount: 1,
+        completeness: "complete",
+        createdAt: new Date(firstObserved + span + MIN_MS).toISOString(),
+        coveredAt: {
+          startAt: new Date(firstObserved).toISOString(),
+          endAt: new Date(firstObserved + span).toISOString(),
+        },
+        clientPlatform: "macos",
+        providerPolicyEpoch: "unknown",
+        usageEvents,
+        quotaSnapshots,
+        activityMarkers: [],
+        accountingDiagnostic: {
+          status: "untrusted_diagnostic",
+          sourceSchemaVersion: "telemetry-contribution-v0.1",
+          estimatedApiCostUsd: "5.000000",
+          pricedEventCoveragePercent: 100,
+          unknownModelEventCount: 0,
+          unknownBillableUnits: 0,
+          priceBasis: "current_api_prices",
+        },
+      };
+      await insert(
+        bindings.USAGE_MONITOR_DB,
+        participant,
+        contributionRecord,
+        9_000 + datasetIndex,
+      );
+    }
+
+    const distinctTracks = await bindings.USAGE_MONITOR_DB.prepare(
+      `SELECT COUNT(DISTINCT account_track_id) AS total
+         FROM telemetry_contribution_occurrences
+        WHERE participant_id = ? AND record_kind = 'quota'`,
+    ).bind(participant.participantId).first<{ total: number }>();
+    expect(distinctTracks?.total).toBe(300);
+
+    const analysis = await accountScopedQuotaAnalysis(
+      bindings.USAGE_MONITOR_DB,
+      participant.participantId,
+    ) as { status: string; reason?: string; tracks: unknown[] };
+    // The ceiling is enforced before any per-track flatMap or downstream
+    // analysis: no track results are produced.
+    expect(analysis).toMatchObject({
+      status: "not_testable",
+      reason: "continuity_track_limit_exceeded",
+      tracks: [],
+    });
+  }, 60_000);
 });

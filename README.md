@@ -8,7 +8,8 @@ work would have cost at API prices, and how well token cost explains your quota
 consumption.
 
 Everything runs locally. Raw logs never leave your machine, and no prompt,
-response, file path, or account identifier ever enters any derived artifact.
+response, file path, or raw account identifier ever enters any derived
+artifact.
 
 
 > **The name:** TiboTattle is named with affection for the Codex community and
@@ -64,10 +65,34 @@ then open <http://localhost:8787>. A useful headline usually appears within
 seconds; the first deep pass over a large history is bounded, cancellable, and
 resumable.
 
+## Languages
+
+TiboTattle ships English, Simplified Chinese, and Spanish for its native shell,
+local dashboard, and public community/install surface. New users follow a safe
+system-language match with English fallback; General settings and the web
+header both provide a persisted override. Language choice does not change
+regional number/date formatting, event times, or quota/pricing semantics. See
+[the localization decision record](docs/decisions/2026-08-03-localization-system.md)
+for the provenance and future-locale policy.
+
 ## Privacy model
 
-- Local analysis works fully offline; the app installs no daemon, Login Item,
-  or background service.
+- Local analysis works fully offline. On a new macOS install, the first-run
+  disclosure visibly preselects **Start TiboTattle at login**, but TiboTattle
+  registers the native Login Item only after the person confirms **Get
+  Started**. Settings re-reads the real macOS state after a request or return
+  from System Settings, and can remove an approval-pending request as well as
+  an enabled item. This starts the normal app at login; it does not install a
+  daemon, LaunchAgent, privileged helper, or separate background worker.
+- Optional macOS allowance notifications are **off by default** and local-only.
+  If enabled in **Settings → General**, they are evaluated only after the
+  existing foreground refresh receives fresh direct provider quota evidence.
+  Stale, inferred, mixed-source, unknown, unobserved, forecast, and
+  log-derived state never notifies; turning the same switch off immediately
+  stops future alerts and clears only their local pending/dedupe state.
+  The current provider receipt supplies a reset schedule but no reset identity,
+  so reset alerts are visibly unavailable rather than inferred from time or a
+  percentage change.
 - The dashboard binds to loopback only. The packaged app's network behavior is
   audited at build time (zero JavaScript and zero native network attempts in
   offline mode).
@@ -79,6 +104,15 @@ resumable.
   never your name or email, and local-only use needs no account at all.
 - Derived artifacts (reports, exports, telemetry) are schema-validated to
   exclude prompts, responses, commands, paths, URLs, and raw identifiers.
+
+### Private local report artifacts
+
+Historical technical-report artifacts are kept only in
+`.usage-monitor/legacy-reports/`, which is ignored by Git and never used as a
+public web asset. `npm run migrate:legacy-reports` previews a one-time,
+no-overwrite move from the former repository-root layout; add `-- --apply` only
+after reviewing its SHA-256 manifest. Existing root files remain a read-only
+compatibility fallback until they are explicitly migrated.
 
 ## Repository layout
 
@@ -100,6 +134,36 @@ npm test
 ```bash
 npm run product:check
 ```
+
+For native iteration, start with a deterministic preflight and the source-only
+macOS lane:
+
+```bash
+npm run test:fast
+npm run test:macos:smoke
+```
+
+`test:macos:smoke` builds one development-only app with the test compiler
+profile; that profile cannot create preview or external-distribution output.
+Use `npm run test:changed -- --base <revision>` to select known changed paths,
+which includes `<revision>...HEAD` plus staged, unstaged, and untracked local
+paths. It narrows only reviewed native app/build and i18n paths: native source
+changes include the test-profile smoke, and `--full` adds the expensive
+bundle-artifact lane. Web, local-server, shared configuration, runner, and
+unfamiliar paths conservatively run the complete `npm run check` gate. The
+smoke lane requires macOS arm64 with the pinned Node v26.2.0 builder; it fails
+rather than falsely reporting a smoke result on another platform. The retained
+release-quality macOS gate is always:
+
+```bash
+npm run product:macos:test
+```
+
+`npm test` and lane execution remain serial by design. The artifact lane itself
+uses two isolated OS-level builder processes for its reproducibility check;
+each build has a separate output and compiler scratch directory. Measure the
+local lanes with `npm run test:benchmark` (or `test:benchmark:release` to
+include the retained release gate).
 
 `npm run architecture:check` enforces the ownership boundaries. The complete
 command catalog, privacy boundary documentation, and operational detail live in

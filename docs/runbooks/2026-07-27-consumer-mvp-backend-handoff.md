@@ -175,13 +175,13 @@ directly.
 
 ## Rendered browser evidence
 
-- [Consumer overview](./docs/qa/2026-07-27-consumer-overview.png)
-- [Real local usage timeline](./docs/qa/2026-07-27-consumer-timeline.png)
-- [Interactive UTC quota timeline](./docs/qa/2026-07-27-interactive-quota-timeline.jpg)
-- [Mobile timeline controls](./docs/qa/2026-07-27-mobile-timeline-controls.jpg)
-- [Exact pre-upload inspection](./docs/qa/2026-07-27-exact-pre-upload-inspection.jpg)
-- [Private server-calculated results](./docs/qa/2026-07-27-unified-private-results.png)
-- [Backend status](./docs/qa/2026-07-27-unified-backend-status.png)
+- [Consumer overview](../qa/2026-07-27-consumer-overview.png)
+- [Real local usage timeline](../qa/2026-07-27-consumer-timeline.png)
+- [Interactive UTC quota timeline](../qa/2026-07-27-interactive-quota-timeline.jpg)
+- [Mobile timeline controls](../qa/2026-07-27-mobile-timeline-controls.jpg)
+- [Exact pre-upload inspection](../qa/2026-07-27-exact-pre-upload-inspection.jpg)
+- [Private server-calculated results](../qa/2026-07-27-unified-private-results.png)
+- [Backend status](../qa/2026-07-27-unified-backend-status.png)
 
 The real inspected contribution contained 99 usage rows and 101 quota rows and
 was exactly 213,315 bytes. The UI showed the schema and counts before consent, with an

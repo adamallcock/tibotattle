@@ -1,0 +1,85 @@
+{
+  "schemaVersion": "provider-quota-windows-v1",
+  "containsSensitiveData": false,
+  "rateLimits": [
+    {
+      "limit_id": "codex",
+      "plan_type": " Pro ",
+      "primary": {
+        "used_percent": 12,
+        "window_minutes": 300,
+        "resets_at": 1785456360
+      },
+      "secondary": {
+        "used_percent": 21,
+        "window_minutes": 10080,
+        "resets_at": 1786061160
+      }
+    },
+    {
+      "limit_id": "codex",
+      "plan_type": "pro-20x",
+      "primary": {
+        "used_percent": 31,
+        "window_minutes": 43200,
+        "resets_at": 1788048360
+      }
+    },
+    {
+      "limit_id": "codex_bengalfox",
+      "plan_type": "provider-private-plan",
+      "primary": {
+        "used_percent": 40,
+        "window_minutes": 525600,
+        "resets_at": 1817001960
+      }
+    }
+  ],
+  "invalidRateLimits": [
+    {
+      "limit_id": "codex",
+      "plan_type": "pro",
+      "primary": {
+        "used_percent": 10,
+        "window_minutes": 0,
+        "resets_at": 1785456360
+      }
+    },
+    {
+      "limit_id": "codex",
+      "plan_type": "pro",
+      "primary": {
+        "used_percent": 10,
+        "window_minutes": 43200.5,
+        "resets_at": 1785456360
+      }
+    },
+    {
+      "limit_id": "codex",
+      "plan_type": "pro",
+      "primary": {
+        "used_percent": 10,
+        "window_minutes": 525601,
+        "resets_at": 1785456360
+      }
+    },
+    {
+      "limit_id": "codex",
+      "plan_type": "pro",
+      "primary": {
+        "used_percent": 10,
+        "window_minutes": 300,
+        "resets_at": 9007199254740991
+      }
+    },
+    {
+      "limit_id": "codex",
+      "plan_type": "pro",
+      "primary": {
+        "used_percent": "10",
+        "window_minutes": 43200,
+        "resets_at": 1785456360
+      }
+    }
+  ]
+}

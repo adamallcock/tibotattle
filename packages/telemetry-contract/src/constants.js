@@ -11,6 +11,19 @@ export const ACCOUNT_SCOPED_TELEMETRY_ENVELOPE_SCHEMA_VERSION =
   "telemetry-envelope-v0.2";
 export const MAX_TELEMETRY_BROWSER_BYTES = 1_310_720;
 
+export const TELEMETRY_PLAN_TYPES = Object.freeze([
+  "free",
+  "go",
+  "plus",
+  "pro",
+  "prolite",
+  "business",
+  "enterprise",
+  "edu",
+  "team",
+  "unknown",
+]);
+
 export const TELEMETRY_TOOL_CLASSES = Object.freeze([
   "webSearch",
   "fileSearch",

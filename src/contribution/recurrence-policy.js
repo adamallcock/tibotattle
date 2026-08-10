@@ -6,7 +6,7 @@ import {
 } from "../export/index.js";
 
 export const AUTOMATIC_CONTRIBUTION_SETTINGS_SCHEMA_VERSION =
-  "automatic-contribution-settings-v0.3";
+  "automatic-contribution-settings-v0.4";
 export const AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION =
   "automatic-contribution-status-v0.1";
 export const AUTOMATIC_CONTRIBUTION_PRIVACY_CONTRACT_VERSION =
@@ -14,10 +14,22 @@ export const AUTOMATIC_CONTRIBUTION_PRIVACY_CONTRACT_VERSION =
 export const AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS = 6;
 export const AUTOMATIC_CONTRIBUTION_LOOKBACK_HOURS = 24;
 export const AUTOMATIC_CONTRIBUTION_REPLAY_OVERLAP_HOURS = 1;
+// A bounded, persisted phase prevents a large cohort that opts in together
+// from reappearing at every six-hour boundary. The local controller supplies
+// this value from its runtime RNG; policy-only callers retain a deterministic
+// zero phase unless they opt in explicitly.
+export const AUTOMATIC_CONTRIBUTION_MAXIMUM_SCHEDULE_DITHER_MILLISECONDS =
+  60 * 60 * 1_000;
 
 const INTERVAL_MILLISECONDS =
   AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS * 60 * 60 * 1_000;
 const SETTINGS_KEYS = Object.freeze([
+  "acceptedThrough", "consent", "enabled", "intervalHours", "lastAttemptAt",
+  "lastOutcome", "lastSuccessAt", "nextAttemptAt", "paused",
+  "pendingContribution", "preparationClaim", "reviewBootstrap",
+  "scheduleDitherMilliseconds", "schemaVersion",
+]);
+const VERSION_THREE_SETTINGS_KEYS = Object.freeze([
   "acceptedThrough", "consent", "enabled", "intervalHours", "lastAttemptAt",
   "lastOutcome", "lastSuccessAt", "paused", "pendingContribution",
   "preparationClaim", "reviewBootstrap", "schemaVersion",
@@ -63,7 +75,10 @@ const PREPARED_SET_STATUS_KEYS = Object.freeze([
 ]);
 const COVERED_AT_KEYS = Object.freeze(["endAt", "startAt"]);
 const OUTCOME_KEYS = Object.freeze(["at", "code", "status"]);
-const TERMINAL_EVENT_KEYS = Object.freeze(["code", "pause", "preparedSet"]);
+const TERMINAL_EVENT_KEYS = Object.freeze([
+  "code", "pause", "preparedSet", "retryNotBeforeAt",
+]);
+const LEGACY_TERMINAL_EVENT_KEYS = Object.freeze(["code", "pause", "preparedSet"]);
 const SHA256 = /^[a-f0-9]{64}$/u;
 const UUID_V4 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -290,6 +305,37 @@ function validOutcome(value) {
     && nullableTimestamp(value.at) !== null);
 }
 
+function validScheduleDitherMilliseconds(value) {
+  return value === null || (Number.isSafeInteger(value)
+    && value >= 0
+    && value <= AUTOMATIC_CONTRIBUTION_MAXIMUM_SCHEDULE_DITHER_MILLISECONDS);
+}
+
+function scheduleAfter(at, ditherMilliseconds = 0) {
+  const milliseconds = Date.parse(at);
+  if (!Number.isFinite(milliseconds)) return null;
+  return new Date(milliseconds + INTERVAL_MILLISECONDS + ditherMilliseconds)
+    .toISOString();
+}
+
+function nextCadenceAfter(scheduledAt, attemptedAt) {
+  const scheduledMilliseconds = Date.parse(scheduledAt);
+  const attemptedMilliseconds = Date.parse(attemptedAt);
+  if (!Number.isFinite(scheduledMilliseconds)
+      || !Number.isFinite(attemptedMilliseconds)) {
+    return null;
+  }
+  let next = scheduledMilliseconds + INTERVAL_MILLISECONDS;
+  while (next <= attemptedMilliseconds) next += INTERVAL_MILLISECONDS;
+  return new Date(next).toISOString();
+}
+
+function legacyNextAttemptAt(value) {
+  if (value.enabled !== true) return null;
+  const anchor = value.lastAttemptAt ?? value.consent?.consentedAt;
+  return typeof anchor === "string" ? scheduleAfter(anchor) : null;
+}
+
 function emptySettings() {
   return {
     schemaVersion: AUTOMATIC_CONTRIBUTION_SETTINGS_SCHEMA_VERSION,
@@ -303,6 +349,8 @@ function emptySettings() {
     reviewBootstrap: null,
     lastAttemptAt: null,
     lastSuccessAt: null,
+    nextAttemptAt: null,
+    scheduleDitherMilliseconds: null,
     lastOutcome: null,
   };
 }
@@ -329,6 +377,17 @@ function validatedSettings(value) {
       ...value,
       schemaVersion: AUTOMATIC_CONTRIBUTION_SETTINGS_SCHEMA_VERSION,
       preparationClaim: null,
+      nextAttemptAt: legacyNextAttemptAt(value),
+      scheduleDitherMilliseconds: null,
+    });
+  }
+  if (exactKeys(value, VERSION_THREE_SETTINGS_KEYS)
+      && value.schemaVersion === "automatic-contribution-settings-v0.3") {
+    return validatedSettings({
+      ...value,
+      schemaVersion: AUTOMATIC_CONTRIBUTION_SETTINGS_SCHEMA_VERSION,
+      nextAttemptAt: legacyNextAttemptAt(value),
+      scheduleDitherMilliseconds: null,
     });
   }
   if (!exactKeys(value, SETTINGS_KEYS)
@@ -338,7 +397,12 @@ function validatedSettings(value) {
       || value.intervalHours !== AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS
       || nullableTimestamp(value.lastAttemptAt) !== value.lastAttemptAt
       || nullableTimestamp(value.lastSuccessAt) !== value.lastSuccessAt
+      || nullableTimestamp(value.nextAttemptAt) !== value.nextAttemptAt
+      || !validScheduleDitherMilliseconds(value.scheduleDitherMilliseconds)
       || !validOutcome(value.lastOutcome)
+      || (!value.enabled && (value.nextAttemptAt !== null
+        || value.scheduleDitherMilliseconds !== null))
+      || (value.enabled && value.nextAttemptAt === null)
       || (value.acceptedThrough !== null
         && (!exactKeys(value.acceptedThrough, ACCEPTED_THROUGH_KEYS)
           || nullableTimestamp(value.acceptedThrough.acceptedAt) === null
@@ -422,6 +486,8 @@ function validatedSettings(value) {
     reviewBootstrap: value.reviewBootstrap === null ? null : { ...value.reviewBootstrap },
     lastAttemptAt: value.lastAttemptAt,
     lastSuccessAt: value.lastSuccessAt,
+    nextAttemptAt: value.nextAttemptAt,
+    scheduleDitherMilliseconds: value.scheduleDitherMilliseconds,
     lastOutcome: value.lastOutcome === null ? null : { ...value.lastOutcome },
   };
 }
@@ -459,10 +525,9 @@ function outcome(code, at) {
 
 function nextAttemptAt(state, context) {
   if (!context.consentCurrent || state.paused) return null;
+  if (state.nextAttemptAt !== null) return state.nextAttemptAt;
   const anchor = state.lastAttemptAt ?? state.consent?.consentedAt;
-  const milliseconds = Date.parse(anchor);
-  return Number.isFinite(milliseconds)
-    ? new Date(milliseconds + INTERVAL_MILLISECONDS).toISOString() : null;
+  return typeof anchor === "string" ? scheduleAfter(anchor) : null;
 }
 
 export function projectAutomaticContributionStatus(state, {
@@ -560,6 +625,7 @@ export function enableAutomaticContribution(state, {
   intervalHours,
   consent,
   consentedAt,
+  scheduleDitherMilliseconds = 0,
 } = {}) {
   const parsed = parseAutomaticContributionState(state);
   const context = currentContext(parsed, destinationOrigin);
@@ -569,18 +635,34 @@ export function enableAutomaticContribution(state, {
       || !sameRequiredConsent(snapshot(consent, "consent_binding_mismatch"), context.required)) {
     fail("consent_binding_mismatch");
   }
+  if (!Number.isSafeInteger(scheduleDitherMilliseconds)
+      || scheduleDitherMilliseconds < 0
+      || scheduleDitherMilliseconds
+        > AUTOMATIC_CONTRIBUTION_MAXIMUM_SCHEDULE_DITHER_MILLISECONDS) {
+    fail("configuration_invalid");
+  }
+  const at = timestamp(consentedAt);
   return {
     ...parsed,
     enabled: true,
     paused: false,
     intervalHours: AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS,
-    consent: { ...context.required, consentedAt: timestamp(consentedAt) },
+    consent: { ...context.required, consentedAt: at },
+    nextAttemptAt: scheduleAfter(at, scheduleDitherMilliseconds),
+    scheduleDitherMilliseconds,
   };
 }
 
 export function disableAutomaticContribution(state) {
   const parsed = parseAutomaticContributionState(state);
-  return { ...parsed, enabled: false, paused: false, consent: null };
+  return {
+    ...parsed,
+    enabled: false,
+    paused: false,
+    consent: null,
+    nextAttemptAt: null,
+    scheduleDitherMilliseconds: null,
+  };
 }
 
 export function claimAutomaticContributionRun(state, {
@@ -616,7 +698,17 @@ export function claimAutomaticContributionRun(state, {
       };
     }
   }
-  const next = { ...parsed, lastAttemptAt: at, preparationClaim };
+  const nextAttemptAt = nextCadenceAfter(parsed.nextAttemptAt, at);
+  if (nextAttemptAt === null) fail("configuration_invalid");
+  const next = {
+    ...parsed,
+    lastAttemptAt: at,
+    // Advance from the persisted due time rather than the wall-clock firing
+    // time. A laptop waking late therefore keeps its chosen phase instead of
+    // slowly reforming a cohort at arbitrary wake times.
+    nextAttemptAt,
+    preparationClaim,
+  };
   return Object.freeze({
     state: next,
     claim: Object.freeze({
@@ -692,7 +784,10 @@ export function completeAutomaticContributionRun(state, {
 } = {}) {
   const parsed = parseAutomaticContributionState(state);
   const context = currentContext(parsed, destinationOrigin);
-  const terminal = snapshot(event, "configuration_invalid");
+  const suppliedTerminal = snapshot(event, "configuration_invalid");
+  const terminal = exactKeys(suppliedTerminal, LEGACY_TERMINAL_EVENT_KEYS)
+    ? { ...suppliedTerminal, retryNotBeforeAt: null }
+    : suppliedTerminal;
   if (!exactKeys(terminal, TERMINAL_EVENT_KEYS)
       || !TERMINAL_EVENT_CODES.has(terminal.code)
       || typeof terminal.pause !== "boolean"
@@ -701,7 +796,11 @@ export function completeAutomaticContributionRun(state, {
       || (terminal.code !== "accepted" && terminal.preparedSet !== null)
       || (terminal.code === "accepted"
         && (terminal.preparedSet === null
-          || typeof terminal.preparedSet !== "object"))) {
+          || typeof terminal.preparedSet !== "object"))
+      || nullableTimestamp(terminal.retryNotBeforeAt)
+        !== terminal.retryNotBeforeAt
+      || (terminal.code !== "retry_scheduled"
+        && terminal.retryNotBeforeAt !== null)) {
     fail("configuration_invalid");
   }
   const at = timestamp(completedAt);
@@ -726,10 +825,57 @@ export function completeAutomaticContributionRun(state, {
     lastOutcome: outcome(successful ? "accepted" : terminal.code, at),
     pendingContribution: successful || clearPending ? null : parsed.pendingContribution,
     preparationClaim: successful ? null : parsed.preparationClaim,
+    nextAttemptAt: terminal.code === "retry_scheduled"
+      && terminal.retryNotBeforeAt !== null
+      ? terminal.retryNotBeforeAt
+      : parsed.nextAttemptAt,
     acceptedThrough: successful ? {
       ...context.required,
       acceptedAt: at,
       coveredThroughAt: accepted.coveredAt.endAt,
     } : parsed.acceptedThrough,
+  };
+}
+
+/**
+ * Migrate a previously phase-locked schedule, or spread an overdue relaunch,
+ * without changing consent or the contribution payload. The caller supplies
+ * one random phase and persists the returned state before scheduling work.
+ */
+export function applyAutomaticContributionScheduleDither(state, {
+  destinationOrigin = null,
+  now,
+  scheduleDitherMilliseconds,
+} = {}) {
+  const parsed = parseAutomaticContributionState(state);
+  const context = currentContext(parsed, destinationOrigin);
+  if (!context.firstReviewComplete || !context.consentCurrent || parsed.paused) {
+    return parsed;
+  }
+  if (!Number.isSafeInteger(scheduleDitherMilliseconds)
+      || scheduleDitherMilliseconds < 0
+      || scheduleDitherMilliseconds
+        > AUTOMATIC_CONTRIBUTION_MAXIMUM_SCHEDULE_DITHER_MILLISECONDS) {
+    fail("configuration_invalid");
+  }
+  const nowAt = Date.parse(timestamp(now));
+  const existingNextAttemptAt = nextAttemptAt(parsed, context);
+  if (existingNextAttemptAt === null) fail("configuration_invalid");
+  const selectedDither = parsed.scheduleDitherMilliseconds
+    ?? scheduleDitherMilliseconds;
+  let scheduledAt = Date.parse(existingNextAttemptAt);
+  if (parsed.scheduleDitherMilliseconds === null) {
+    scheduledAt += selectedDither;
+  }
+  if (scheduledAt < nowAt) scheduledAt = nowAt + selectedDither;
+  const next = new Date(scheduledAt).toISOString();
+  if (parsed.scheduleDitherMilliseconds === selectedDither
+      && parsed.nextAttemptAt === next) {
+    return parsed;
+  }
+  return {
+    ...parsed,
+    scheduleDitherMilliseconds: selectedDither,
+    nextAttemptAt: next,
   };
 }

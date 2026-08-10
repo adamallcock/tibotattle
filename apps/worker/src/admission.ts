@@ -34,7 +34,16 @@ export function configuredEnrollmentMode(env: Env): EnrollmentMode {
   return mode as EnrollmentMode;
 }
 
-type AttemptPurpose = "enrollment" | "sign_in_start" | "recovery";
+type AttemptPurpose =
+  | "enrollment"
+  | "sign_in_start"
+  | "recovery"
+  | "device_disconnect"
+  | "device_sync";
+type RateLimitPurpose = AttemptPurpose
+  | "public_aggregate_read"
+  | "upload_authorization"
+  | "upload_ingress";
 
 const RATE_LIMIT_KEY_PREFIX = "app-usagemonitor/rate-limit/v1";
 const CLIENT_ADDRESS_PATTERN = /^[0-9a-f:.]{3,45}$/iu;
@@ -55,12 +64,12 @@ function clientAddressForRateLimit(request: Request): string {
   return address.toLowerCase();
 }
 
-async function clientRateLimitKey(
-  request: Request,
+async function rateLimitSubjectKey(
   env: Env,
-  purpose: AttemptPurpose | "public_aggregate_read",
+  purpose: RateLimitPurpose,
+  subject: string,
 ): Promise<string> {
-  const material = `${RATE_LIMIT_KEY_PREFIX}\0${purpose}\0${clientAddressForRateLimit(request)}`;
+  const material = `${RATE_LIMIT_KEY_PREFIX}\0${purpose}\0${subject}`;
   const secret = Reflect.get(env, "IDENTITY_LINK_SECRET");
   if (typeof secret === "string" && secret.length >= 32) {
     const key = await crypto.subtle.importKey(
@@ -86,6 +95,49 @@ async function clientRateLimitKey(
   throw new ApiError(503, "ADMISSION_CONFIGURATION_INVALID");
 }
 
+function clientRateLimitKey(
+  request: Request,
+  env: Env,
+  purpose: RateLimitPurpose,
+): Promise<string> {
+  return rateLimitSubjectKey(
+    env,
+    purpose,
+    clientAddressForRateLimit(request),
+  );
+}
+
+function uploadIngressUnavailable(): ApiError {
+  return new ApiError(503, "UPLOAD_INGRESS_UNAVAILABLE", {
+    responseHeaders: { "retry-after": "60" },
+  });
+}
+
+function admissionRateLimitUnavailable(): ApiError {
+  return new ApiError(503, "ADMISSION_RATE_LIMIT_UNAVAILABLE", {
+    responseHeaders: { "retry-after": "60" },
+  });
+}
+
+async function applyUploadRateLimit(
+  limiter: RateLimit,
+  key: string,
+): Promise<void> {
+  let result: { success: boolean };
+  try {
+    result = await limiter.limit({ key });
+  } catch {
+    throw uploadIngressUnavailable();
+  }
+  if (!result.success) {
+    throw new ApiError(429, "UPLOAD_INGRESS_LIMIT_REACHED", {
+      // Rate Limit does not expose a reset time; all upload bindings use a
+      // one-minute window, so clients receive a conservative fixed floor.
+      responseHeaders: { "retry-after": "60" },
+    });
+  }
+}
+
 export async function assertAttemptAllowed(
   coarseLimiter: RateLimit | undefined,
   clientLimiter: RateLimit | undefined,
@@ -95,14 +147,23 @@ export async function assertAttemptAllowed(
 ): Promise<void> {
   assertLimiterConfigured(coarseLimiter);
   assertLimiterConfigured(clientLimiter);
-  const coarse = await coarseLimiter.limit({
-    key: `usage-monitor:${purpose}:global`,
-  });
-  if (!coarse.success) throw new ApiError(429, "ATTEMPT_LIMIT_REACHED");
-  const client = await clientLimiter.limit({
-    key: `usage-monitor:${purpose}:client:${await clientRateLimitKey(request, env, purpose)}`,
-  });
-  if (!client.success) throw new ApiError(429, "ATTEMPT_LIMIT_REACHED");
+  try {
+    const coarse = await coarseLimiter.limit({
+      key: `usage-monitor:${purpose}:global`,
+    });
+    if (!coarse.success) throw new ApiError(429, "ATTEMPT_LIMIT_REACHED", {
+      responseHeaders: { "retry-after": "60" },
+    });
+    const client = await clientLimiter.limit({
+      key: `usage-monitor:${purpose}:client:${await clientRateLimitKey(request, env, purpose)}`,
+    });
+    if (!client.success) throw new ApiError(429, "ATTEMPT_LIMIT_REACHED", {
+      responseHeaders: { "retry-after": "60" },
+    });
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw admissionRateLimitUnavailable();
+  }
 }
 
 export async function assertPublicAggregateReadAllowed(
@@ -111,14 +172,107 @@ export async function assertPublicAggregateReadAllowed(
   env: Env,
 ): Promise<void> {
   assertLimiterConfigured(limiter);
-  const result = await limiter.limit({
-    key: `usage-monitor:public_aggregate_read:client:${await clientRateLimitKey(
+  try {
+    const result = await limiter.limit({
+      key: `usage-monitor:public_aggregate_read:client:${await clientRateLimitKey(
+        request,
+        env,
+        "public_aggregate_read",
+      )}`,
+    });
+    if (!result.success) throw new ApiError(429, "ATTEMPT_LIMIT_REACHED", {
+      responseHeaders: { "retry-after": "60" },
+    });
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw admissionRateLimitUnavailable();
+  }
+}
+
+/**
+ * Upload registration is authenticated, so participant-keyed limiting avoids
+ * punishing a NAT while a person cannot evade the limit by minting more device
+ * credentials. Both keys are HMACed before leaving Worker memory.
+ */
+export async function assertUploadAuthorizationAllowed(
+  coarseLimiter: RateLimit | undefined,
+  principalLimiter: RateLimit | undefined,
+  principalId: string,
+  env: Env,
+): Promise<void> {
+  assertLimiterConfigured(coarseLimiter);
+  assertLimiterConfigured(principalLimiter);
+  try {
+    const coarse = await coarseLimiter.limit({
+      key: "usage-monitor:upload_authorization:global",
+    });
+    if (!coarse.success) {
+      throw new ApiError(429, "UPLOAD_ADMISSION_LIMIT_REACHED", {
+        // Cloudflare's binding outcome deliberately does not expose a reset
+        // timestamp. This matches the configured one-minute window.
+        responseHeaders: { "retry-after": "60" },
+      });
+    }
+    const principal = await principalLimiter.limit({
+      key: `usage-monitor:upload_authorization:participant:${await rateLimitSubjectKey(
+        env,
+        "upload_authorization",
+        `participant\0${principalId}`,
+      )}`,
+    });
+    if (principal.success) return;
+    throw new ApiError(429, "UPLOAD_ADMISSION_LIMIT_REACHED", {
+      responseHeaders: { "retry-after": "60" },
+    });
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw uploadIngressUnavailable();
+  }
+}
+
+/**
+ * This runs before a contribution body is read. The client key limits one
+ * address, while the separately named coarse binding sheds obvious floods
+ * before they reach the environment-wide Durable Object.
+ */
+export async function assertUploadIngressRequestAllowed(
+  coarseLimiter: RateLimit | undefined,
+  clientLimiter: RateLimit | undefined,
+  request: Request,
+  env: Env,
+): Promise<void> {
+  assertLimiterConfigured(coarseLimiter);
+  assertLimiterConfigured(clientLimiter);
+  await applyUploadRateLimit(
+    coarseLimiter,
+    "usage-monitor:upload_ingress:global",
+  );
+  await applyUploadRateLimit(
+    clientLimiter,
+    `usage-monitor:upload_ingress:client:${await clientRateLimitKey(
       request,
       env,
-      "public_aggregate_read",
+      "upload_ingress",
     )}`,
-  });
-  if (!result.success) throw new ApiError(429, "ATTEMPT_LIMIT_REACHED");
+  );
+}
+
+export function assertUploadAuthorizationBindings(env: Env): void {
+  for (const name of [
+    "UPLOAD_AUTHORIZATION_RATE_LIMIT",
+    "UPLOAD_PRINCIPAL_RATE_LIMIT",
+  ] as const) {
+    assertLimiterConfigured(Reflect.get(env, name) as RateLimit | undefined);
+  }
+}
+
+export function assertUploadIngressRateLimitBindings(env: Env): void {
+  for (const name of [
+    "UPLOAD_INGRESS_REQUEST_RATE_LIMIT",
+    "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
+  ] as const) {
+    assertLimiterConfigured(Reflect.get(env, name) as RateLimit | undefined);
+  }
 }
 
 export function assertAdmissionBindings(env: Env): void {

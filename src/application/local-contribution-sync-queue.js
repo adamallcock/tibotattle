@@ -21,6 +21,14 @@ const DEFAULT_MAXIMUM_ATTEMPTS = 8;
 const DEFAULT_LEASE_MILLISECONDS = 10 * 60 * 1000;
 const DEFAULT_MAXIMUM_JOBS_PER_PASS = 25;
 const MAXIMUM_JOBS_PER_PASS = 100;
+const RETRY_BACKOFF_POLICY = Object.freeze({
+  initialDelayMilliseconds: 5_000,
+  maximumDelayMilliseconds: 3_600_000,
+  minimumDelayMilliseconds: 1_000,
+  jitterMinimumMultiplier: 0.75,
+  jitterMaximumMultiplier: 1.25,
+});
+const MAXIMUM_SERVER_RETRY_DITHER_MILLISECONDS = 60_000;
 const MINIMUM_RESERVED_UPLOAD_BYTES_PER_PASS = 16 * 1024;
 const DEFAULT_MAXIMUM_RESERVED_UPLOAD_BYTES_PER_PASS = 16 * 1024 * 1024;
 const MAXIMUM_RESERVED_UPLOAD_BYTES_PER_PASS = 256 * 1024 * 1024;
@@ -423,10 +431,39 @@ function boundedErrorCode(error, fallback) {
   return fallback;
 }
 
-function retryDelayMilliseconds(attemptCount, random) {
-  const base = Math.min(3_600_000, 5000 * (2 ** Math.max(0, attemptCount - 1)));
-  const jitter = 0.75 + (Math.min(1, Math.max(0, random())) * 0.5);
-  return Math.max(1000, Math.round(base * jitter));
+function retryDelayMilliseconds(
+  attemptCount,
+  random,
+  retryAfterMilliseconds = null,
+) {
+  const base = Math.min(
+    RETRY_BACKOFF_POLICY.maximumDelayMilliseconds,
+    RETRY_BACKOFF_POLICY.initialDelayMilliseconds
+      * (2 ** Math.max(0, attemptCount - 1)),
+  );
+  const boundedRandom = Math.min(1, Math.max(0, random()));
+  const jitter = RETRY_BACKOFF_POLICY.jitterMinimumMultiplier
+    + (boundedRandom * (
+      RETRY_BACKOFF_POLICY.jitterMaximumMultiplier
+      - RETRY_BACKOFF_POLICY.jitterMinimumMultiplier
+    ));
+  const localDelay = Math.max(
+    RETRY_BACKOFF_POLICY.minimumDelayMilliseconds,
+    Math.round(base * jitter),
+  );
+  if (!Number.isSafeInteger(retryAfterMilliseconds)
+      || retryAfterMilliseconds <= 0) {
+    return localDelay;
+  }
+  // RFC Retry-After is a lower bound. Add only a small positive per-client
+  // spread so a shared server deadline cannot become a second herd boundary.
+  const serverDither = Math.round(
+    Math.min(
+      MAXIMUM_SERVER_RETRY_DITHER_MILLISECONDS,
+      retryAfterMilliseconds * 0.25,
+    ) * boundedRandom,
+  );
+  return Math.max(localDelay, retryAfterMilliseconds + serverDither);
 }
 
 function entryForJob(set, job) {
@@ -497,6 +534,7 @@ function safeContributionProjection(payload) {
         "current_api_prices",
         "historical_api_prices",
         "unpriced",
+        "mixed_api_prices",
       ].includes(priceBasis)) {
     fail("queue_invalid");
   }
@@ -856,6 +894,7 @@ async function runContributionSyncQueueOnce({
         const failureAt = queueTimestamp(failureAtMs);
         const interrupted = signal?.aborted === true;
         const deviceUnavailable = error?.deviceUnavailable === true;
+        const retryAfterExceedsMaximum = error?.retryAfterExceedsMaximum === true;
         const mayRetry = interrupted || deviceUnavailable
           || error?.retryable === true;
         const exhausted = job.attempt_count >= maximumAttempts;
@@ -865,11 +904,21 @@ async function runContributionSyncQueueOnce({
           : exhausted && mayRetry
             ? "retry_exhausted"
             : boundedErrorCode(error, "local_failure");
+        const retryAfterMilliseconds = error?.retryAfterMilliseconds;
+        // Cancellation must not turn a response that already supplied
+        // Retry-After into an immediate retry. A plain interruption remains
+        // eligible for immediate recovery; a service floor always wins.
         const nextAttemptAt = state === "retryable"
           ? queueTimestamp(
             interrupted
+              && (!Number.isSafeInteger(retryAfterMilliseconds)
+                || retryAfterMilliseconds <= 0)
               ? failureAtMs
-              : failureAtMs + retryDelayMilliseconds(job.attempt_count, random),
+              : failureAtMs + retryDelayMilliseconds(
+                job.attempt_count,
+                random,
+                retryAfterMilliseconds,
+              ),
           )
           : null;
         repository.finishFailed(job, {
@@ -877,15 +926,20 @@ async function runContributionSyncQueueOnce({
           errorCode,
           nextAttemptAt,
           timestamp: failureAt,
-          pause: deviceUnavailable,
+          // An over-horizon Retry-After is safer as an explicit pause than a
+          // truncated deadline that would violate the server's retry floor.
+          pause: deviceUnavailable || retryAfterExceedsMaximum,
         });
         if (state === "retryable") result.retryable += 1;
         else result.rejected += 1;
-        if (deviceUnavailable || interrupted) break;
+        if (deviceUnavailable || retryAfterExceedsMaximum || interrupted) break;
       }
     }
     const completedAt = iso(now());
     const queue = repository.status(completedAt);
+    const retryNotBeforeAt = selectedPreparedSetId === null
+      ? null
+      : repository.preparedSetNextAttemptAt(selectedPreparedSetId);
     return Object.freeze({
       status: queue.paused
         ? "paused"
@@ -896,6 +950,7 @@ async function runContributionSyncQueueOnce({
       enqueued: enqueued.inserted,
       ...result,
       queue,
+      retryNotBeforeAt,
       preparedSet: selectedPreparedSetId === null
         ? null
         : repository.preparedSetStatus(selectedPreparedSetId),
@@ -994,6 +1049,7 @@ const CONTRIBUTION_SYNC_QUEUE_LIMITS = Object.freeze({
   leaseMilliseconds: DEFAULT_LEASE_MILLISECONDS,
   maximumJobsPerPass: DEFAULT_MAXIMUM_JOBS_PER_PASS,
   maximumJobsPerPassAllowed: MAXIMUM_JOBS_PER_PASS,
+  retryBackoffPolicy: RETRY_BACKOFF_POLICY,
   minimumReservedUploadBytesPerPass:
     MINIMUM_RESERVED_UPLOAD_BYTES_PER_PASS,
   maximumReservedUploadBytesPerPass:
@@ -1044,6 +1100,7 @@ export function createLocalContributionSyncQueueContext({
     CONTRIBUTION_SYNC_QUEUE_LIMITS,
     CONTRIBUTION_SYNC_QUEUE_SCHEMA,
     CONTRIBUTION_SYNC_STATUS_SCHEMA,
+    RETRY_BACKOFF_POLICY,
     ContributionSyncQueueError,
     conservativeUploadReservationBytes,
     defaultContributionSyncQueueFile: () =>

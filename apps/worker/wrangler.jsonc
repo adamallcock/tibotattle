@@ -20,7 +20,22 @@
   "vars": {
     "ENVIRONMENT": "synthetic-development",
     "ENROLLMENT_MODE": "local_open",
-    "ACCOUNT_SCOPED_INGEST_MODE": "disabled"
+    "ACCOUNT_SCOPED_INGEST_MODE": "disabled",
+    // Queue ingestion is deliberately deferred: a 2 MiB envelope requires an
+    // R2-pointer/consumer-receipt protocol rather than a direct Queue body.
+    "UPLOAD_INGRESS_QUEUE_MODE": "disabled",
+    // Synthetic tests are sequentially isolated at the database layer but
+    // intentionally share the Durable Object runtime. Keep this above the
+    // full suite's fixture count; targeted budget tests pass their own policy.
+    "UPLOAD_INGRESS_MAX_CONCURRENT": "64",
+    "UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE": "1200",
+    "UPLOAD_INGRESS_BURST": "1200",
+    "UPLOAD_INGRESS_LEASE_SECONDS": "90",
+    "UPLOAD_INGRESS_BODY_TOTAL_SECONDS": "60",
+    "UPLOAD_INGRESS_BODY_IDLE_SECONDS": "15",
+    // Authoritative, D1-backed global sign-in-start budget. The synthetic
+    // harness needs headroom; hosted environments use materially lower caps.
+    "SIGN_IN_START_MAX_PER_MINUTE": "1200"
   },
   "secrets": {
     "required": [
@@ -50,6 +65,40 @@
       "name": "PUBLIC_READ_RATE_LIMIT",
       "namespace_id": "1004",
       "simple": { "limit": 1000, "period": 60 }
+    },
+    {
+      "name": "UPLOAD_AUTHORIZATION_RATE_LIMIT",
+      "namespace_id": "1005",
+      "simple": { "limit": 1000, "period": 60 }
+    },
+    {
+      "name": "UPLOAD_PRINCIPAL_RATE_LIMIT",
+      "namespace_id": "1006",
+      "simple": { "limit": 1000, "period": 60 }
+    },
+    {
+      "name": "UPLOAD_INGRESS_REQUEST_RATE_LIMIT",
+      "namespace_id": "1007",
+      "simple": { "limit": 1000, "period": 60 }
+    },
+    {
+      "name": "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
+      "namespace_id": "1008",
+      "simple": { "limit": 1000, "period": 60 }
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "UPLOAD_INGRESS_BUDGET",
+        "class_name": "UploadIngressBudget"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "upload-ingress-budget-v1",
+      "new_sqlite_classes": ["UploadIngressBudget"]
     }
   ],
   "d1_databases": [
@@ -74,7 +123,7 @@
   ],
   "assets": {
     "binding": "ASSETS",
-    "directory": "../web/public",
+    "directory": "../../.release-build/worker-assets",
     "not_found_handling": "single-page-application",
     // Keep the retired Apple association filename out of the SPA fallback.
     // Sign in with Apple web registration is configured in Apple's portal and
@@ -103,7 +152,16 @@
       "vars": {
         "ENVIRONMENT": "staging",
         "ENROLLMENT_MODE": "disabled",
-        "ACCOUNT_SCOPED_INGEST_MODE": "disabled"
+        "ACCOUNT_SCOPED_INGEST_MODE": "disabled",
+        "UPLOAD_INGRESS_QUEUE_MODE": "disabled",
+        "UPLOAD_INGRESS_MAX_CONCURRENT": "8",
+        "UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE": "120",
+        "UPLOAD_INGRESS_BURST": "16",
+        "UPLOAD_INGRESS_LEASE_SECONDS": "90",
+        "UPLOAD_INGRESS_BODY_TOTAL_SECONDS": "60",
+        "UPLOAD_INGRESS_BODY_IDLE_SECONDS": "15",
+        "SIGN_IN_START_MAX_PER_MINUTE": "5",
+        "IDENTITY_LINK_SECRET_VERSION": "staging-v1"
       },
       "secrets": {
         "required": [
@@ -131,8 +189,36 @@
           "name": "PUBLIC_READ_RATE_LIMIT",
           "namespace_id": "2004",
           "simple": { "limit": 120, "period": 60 }
+        },
+        {
+          "name": "UPLOAD_AUTHORIZATION_RATE_LIMIT",
+          "namespace_id": "2005",
+          "simple": { "limit": 300, "period": 60 }
+        },
+        {
+          "name": "UPLOAD_PRINCIPAL_RATE_LIMIT",
+          "namespace_id": "2006",
+          "simple": { "limit": 6, "period": 60 }
+        },
+        {
+          "name": "UPLOAD_INGRESS_REQUEST_RATE_LIMIT",
+          "namespace_id": "2007",
+          "simple": { "limit": 240, "period": 60 }
+        },
+        {
+          "name": "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
+          "namespace_id": "2008",
+          "simple": { "limit": 20, "period": 60 }
         }
       ],
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "UPLOAD_INGRESS_BUDGET",
+            "class_name": "UploadIngressBudget"
+          }
+        ]
+      },
       "d1_databases": [
         {
           "binding": "USAGE_MONITOR_DB",
@@ -155,7 +241,7 @@
       ],
       "assets": {
         "binding": "ASSETS",
-        "directory": "../web/public",
+        "directory": "../../.release-build/worker-assets",
         "not_found_handling": "single-page-application",
         "run_worker_first": ["/api/*"]
       }
@@ -169,7 +255,12 @@
       // the TLS certificates for both hostnames on deploy.
       "routes": [
         { "pattern": "tibotattle.com", "custom_domain": true },
-        { "pattern": "www.tibotattle.com", "custom_domain": true }
+        { "pattern": "www.tibotattle.com", "custom_domain": true },
+        // Owner-only operations hostname. The Worker serves the admin UI and
+        // /api/v1/admin/* exclusively here, behind the Cloudflare Access
+        // application for admin.tibotattle.com (Google login, allow-policy
+        // pinned to the owner). The public hostnames keep their 404s.
+        { "pattern": "admin.tibotattle.com", "custom_domain": true }
       ],
       "preview_urls": false,
       "cache": {
@@ -186,15 +277,36 @@
       "vars": {
         "ENVIRONMENT": "production",
         "PUBLIC_ORIGIN": "https://tibotattle.com",
+        // Owner decision 2026-08-07: community enrollment is OPEN. The
+        // containment-era "disabled" default was never a product choice, and
+        // the operator collection-control row remains the incident brake.
         "ENROLLMENT_MODE": "open",
         "ACCOUNT_SCOPED_INGEST_MODE": "disabled",
+        "UPLOAD_INGRESS_QUEUE_MODE": "disabled",
+        "UPLOAD_INGRESS_MAX_CONCURRENT": "8",
+        "UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE": "120",
+        "UPLOAD_INGRESS_BURST": "16",
+        "UPLOAD_INGRESS_LEASE_SECONDS": "90",
+        "UPLOAD_INGRESS_BODY_TOTAL_SECONDS": "60",
+        "UPLOAD_INGRESS_BODY_IDLE_SECONDS": "15",
+        "SIGN_IN_START_MAX_PER_MINUTE": "20",
+        // A non-secret immutable label paired with the keyed fingerprint in
+        // D1. Changing either it or IDENTITY_LINK_SECRET fails closed until a
+        // separately reviewed dual-key identity migration exists.
+        "IDENTITY_LINK_SECRET_VERSION": "production-v1",
         "GOOGLE_OIDC_CLIENT_ID": "806510610397-f6k0uje651hpurbmfr7vub9iqj04428j.apps.googleusercontent.com",
         // Web Sign in with Apple. APPLE_SERVICES_ID is the Apple Services ID:
         // it is the OAuth client_id, the subject of the ES256 client secret,
         // and the audience the returned id_token is verified against.
         "APPLE_SERVICES_ID": "com.usagemonitor.web",
         "APPLE_KEY_ID": "L58X7J2J7A",
-        "APPLE_TEAM_ID": "43RTH622SB"
+        "APPLE_TEAM_ID": "43RTH622SB",
+        // Cloudflare Access binding for admin.tibotattle.com. The team domain
+        // and the Access application AUD tag pin admin-host requests to the
+        // "TiboTattle admin" self-hosted Access app (Google-only IdP, policy
+        // restricted to the owner email). Neither value is a secret.
+        "ACCESS_TEAM_DOMAIN": "tibotattle.cloudflareaccess.com",
+        "ACCESS_AUD": "3ffbc68d303a9da74f462a685b788c57935c65024df4e9b144e1c872598bb61c"
       },
       "secrets": {
         // The owner-specific ADMIN_IDENTITY_LINK_KEY is intentionally not a
@@ -234,8 +346,36 @@
           "name": "PUBLIC_READ_RATE_LIMIT",
           "namespace_id": "3004",
           "simple": { "limit": 120, "period": 60 }
+        },
+        {
+          "name": "UPLOAD_AUTHORIZATION_RATE_LIMIT",
+          "namespace_id": "3005",
+          "simple": { "limit": 300, "period": 60 }
+        },
+        {
+          "name": "UPLOAD_PRINCIPAL_RATE_LIMIT",
+          "namespace_id": "3006",
+          "simple": { "limit": 6, "period": 60 }
+        },
+        {
+          "name": "UPLOAD_INGRESS_REQUEST_RATE_LIMIT",
+          "namespace_id": "3007",
+          "simple": { "limit": 240, "period": 60 }
+        },
+        {
+          "name": "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
+          "namespace_id": "3008",
+          "simple": { "limit": 20, "period": 60 }
         }
       ],
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "UPLOAD_INGRESS_BUDGET",
+            "class_name": "UploadIngressBudget"
+          }
+        ]
+      },
       "d1_databases": [
         {
           "binding": "USAGE_MONITOR_DB",
@@ -258,15 +398,29 @@
       ],
       "assets": {
         "binding": "ASSETS",
-        // `production:stage-assets` accepts only tracked files from a clean
-        // release checkout. Do not point production at the mutable working
-        // tree: every file in that directory would otherwise be deployable.
-        "directory": "../../.release-build/worker-assets",
-        "not_found_handling": "single-page-application",
+        // Production serves the manifest-verified public release output
+        // directly. A raw Wrangler deploy therefore fails when that output is
+        // absent instead of reusing a stale staged dashboard or admin tree.
+        "directory": "../../.release-build/public-release-site",
+        // Missing dashboard/admin paths must remain real 404s rather than
+        // falling through to the public landing page.
+        "not_found_handling": "404-page",
         // Prevent the legacy association filename from receiving the SPA
         // fallback. It is deliberately a 404, not an Apple release gate.
+        //
+        // The admin surface MUST be worker-first: the worker gates on the
+        // admin hostname (404 on the public origin), verifies the Cloudflare
+        // Access JWT, and serves the embedded admin UI. Without these paths
+        // the asset layer answers /admin before the worker runs, so the
+        // Access-authenticated operator saw the public landing page.
         "run_worker_first": [
           "/api/*",
+          "/admin",
+          "/admin/*",
+          "/admin.html",
+          "/admin.js",
+          "/admin-client.js",
+          "/admin.css",
           "/.well-known/apple-developer-domain-association.txt"
         ]
       }

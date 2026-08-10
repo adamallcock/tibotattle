@@ -34,6 +34,7 @@ function bindings(overrides: Partial<Env> = {}): Env {
     ASSETS: runtime.ASSETS,
     DELETION_LEDGER: runtime.DELETION_LEDGER,
     ENROLLMENT_MODE: runtime.ENROLLMENT_MODE,
+    SIGN_IN_START_MAX_PER_MINUTE: "1200",
     ENROLLMENT_RATE_LIMIT: runtime.ENROLLMENT_RATE_LIMIT,
     CLIENT_ATTEMPT_RATE_LIMIT: runtime.CLIENT_ATTEMPT_RATE_LIMIT,
     ENVELOPE_PRIVATE_JWK: "",
@@ -43,6 +44,20 @@ function bindings(overrides: Partial<Env> = {}): Env {
     QUARANTINE: runtime.QUARANTINE,
     PUBLIC_READ_RATE_LIMIT: runtime.PUBLIC_READ_RATE_LIMIT,
     RECOVERY_RATE_LIMIT: runtime.RECOVERY_RATE_LIMIT,
+    UPLOAD_AUTHORIZATION_RATE_LIMIT: runtime.UPLOAD_AUTHORIZATION_RATE_LIMIT,
+    UPLOAD_PRINCIPAL_RATE_LIMIT: runtime.UPLOAD_PRINCIPAL_RATE_LIMIT,
+    UPLOAD_INGRESS_REQUEST_RATE_LIMIT:
+      runtime.UPLOAD_INGRESS_REQUEST_RATE_LIMIT,
+    UPLOAD_INGRESS_CLIENT_RATE_LIMIT: runtime.UPLOAD_INGRESS_CLIENT_RATE_LIMIT,
+    UPLOAD_INGRESS_BUDGET: runtime.UPLOAD_INGRESS_BUDGET,
+    UPLOAD_INGRESS_QUEUE_MODE: runtime.UPLOAD_INGRESS_QUEUE_MODE,
+    UPLOAD_INGRESS_MAX_CONCURRENT: runtime.UPLOAD_INGRESS_MAX_CONCURRENT,
+    UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE:
+      runtime.UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE,
+    UPLOAD_INGRESS_BURST: runtime.UPLOAD_INGRESS_BURST,
+    UPLOAD_INGRESS_LEASE_SECONDS: runtime.UPLOAD_INGRESS_LEASE_SECONDS,
+    UPLOAD_INGRESS_BODY_TOTAL_SECONDS: "60",
+    UPLOAD_INGRESS_BODY_IDLE_SECONDS: "15",
     USAGE_MONITOR_DB: runtime.USAGE_MONITOR_DB,
     ...overrides,
   } as Env;
@@ -419,13 +434,15 @@ describe("quarantine crash reconciliation", () => {
     const activeAt = new Date(now + 60_000).toISOString();
     const db = bindings().USAGE_MONITOR_DB;
     const identityLinkKey = "a".repeat(64);
+    const nonceHash = "b".repeat(64);
     for (let index = 0; index < 101; index += 1) {
       await db.prepare(
         `INSERT INTO apple_signin_handoffs
-           (state, identity_link_key, proof, created_at, expires_at, delivered_at)
-         VALUES (?, ?, NULL, ?, ?, NULL)`,
+           (state, nonce_hash, identity_link_key, proof, created_at, expires_at, delivered_at)
+         VALUES (?, ?, ?, NULL, ?, ?, NULL)`,
       ).bind(
         `apple-expired-${index}`,
+        nonceHash,
         identityLinkKey,
         expiredAt,
         expiredAt,
@@ -433,9 +450,9 @@ describe("quarantine crash reconciliation", () => {
     }
     await db.prepare(
       `INSERT INTO apple_signin_handoffs
-         (state, identity_link_key, proof, created_at, expires_at, delivered_at)
-       VALUES ('apple-active', ?, NULL, ?, ?, NULL)`,
-    ).bind(identityLinkKey, new Date(now).toISOString(), activeAt).run();
+         (state, nonce_hash, identity_link_key, proof, created_at, expires_at, delivered_at)
+       VALUES ('apple-active', ?, ?, NULL, ?, ?, NULL)`,
+    ).bind(nonceHash, identityLinkKey, new Date(now).toISOString(), activeAt).run();
     await db.prepare(
       `INSERT INTO google_signin_handoffs
          (state, code_verifier, identity_link_key, proof, created_at, expires_at, delivered_at)
@@ -472,6 +489,42 @@ describe("quarantine crash reconciliation", () => {
       `SELECT COUNT(*) AS total FROM apple_signin_handoffs WHERE state = 'apple-active'`,
     ).first<{ total: number }>();
     expect(activeRows?.total).toBe(1);
+  });
+
+  it("purges expired primary and ledger identity cooldown markers independently", async () => {
+    const now = Date.now();
+    const deletedAt = new Date(now - 2 * 60 * 60 * 1_000).toISOString();
+    const retainUntil = new Date(now - 60 * 60 * 1_000).toISOString();
+    const digest = "c".repeat(64);
+    const insert = `INSERT INTO identity_reenrollment_cooldowns (
+      identity_cooldown_digest, schema_version, deleted_at, retain_until
+    ) VALUES (?, 'identity-reenrollment-cooldown-v0.1', ?, ?)`;
+    await bindings().USAGE_MONITOR_DB.prepare(insert).bind(
+      digest,
+      deletedAt,
+      retainUntil,
+    ).run();
+    await bindings().DELETION_LEDGER.prepare(insert).bind(
+      digest,
+      deletedAt,
+      retainUntil,
+    ).run();
+
+    const result = await runScheduledMaintenance(bindings(), now);
+    expect(result).toMatchObject({
+      expiredPrimaryIdentityReenrollmentCooldownsPurged: 1,
+      primaryIdentityReenrollmentCooldownPurgeComplete: true,
+      expiredIdentityReenrollmentCooldownsPurged: 1,
+      identityReenrollmentCooldownPurgeComplete: true,
+    });
+    const primary = await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM identity_reenrollment_cooldowns",
+    ).first<{ total: number }>();
+    const ledger = await bindings().DELETION_LEDGER.prepare(
+      "SELECT COUNT(*) AS total FROM identity_reenrollment_cooldowns",
+    ).first<{ total: number }>();
+    expect(primary?.total).toBe(0);
+    expect(ledger?.total).toBe(0);
   });
 
   it.each<QuarantineObjectKind>(["synthetic", "telemetry"])(
@@ -1127,6 +1180,19 @@ describe("backend readiness and scheduled observability", () => {
       quarantineReconciliationComplete: true,
       expiredIdentityHandoffsPurged: 0,
       expiredIdentityHandoffPurgeComplete: true,
+      expiredDeletionTombstonesPurged: 0,
+      deletionTombstonePurgeComplete: true,
+      expiredPrimaryIdentityReenrollmentCooldownsPurged: 0,
+      primaryIdentityReenrollmentCooldownPurgeComplete: true,
+      expiredIdentityReenrollmentCooldownsPurged: 0,
+      identityReenrollmentCooldownPurgeComplete: true,
+      expiredSignInAdmissionsPurged: 0,
+      signInAdmissionPurgeComplete: true,
+      staleDevicePairingsRevoked: 0,
+      staleDeviceCredentialsRevoked: 0,
+      staleDeviceUploadAuthorizationsRevoked: 0,
+      expiredDeviceCredentialRotationsPurged: 0,
+      expiredDevicePairingEventsPurged: 0,
       aggregateRebuildComplete: true,
       publicationEnabled: true,
     });
@@ -1171,6 +1237,19 @@ describe("backend readiness and scheduled observability", () => {
       quarantineReconciliationComplete: false,
       expiredIdentityHandoffsPurged: 0,
       expiredIdentityHandoffPurgeComplete: true,
+      expiredDeletionTombstonesPurged: 0,
+      deletionTombstonePurgeComplete: true,
+      expiredPrimaryIdentityReenrollmentCooldownsPurged: 0,
+      primaryIdentityReenrollmentCooldownPurgeComplete: true,
+      expiredIdentityReenrollmentCooldownsPurged: 0,
+      identityReenrollmentCooldownPurgeComplete: true,
+      expiredSignInAdmissionsPurged: 0,
+      signInAdmissionPurgeComplete: true,
+      staleDevicePairingsRevoked: 0,
+      staleDeviceCredentialsRevoked: 0,
+      staleDeviceUploadAuthorizationsRevoked: 0,
+      expiredDeviceCredentialRotationsPurged: 0,
+      expiredDevicePairingEventsPurged: 0,
       aggregateRebuildComplete: false,
       publicationEnabled: null,
     });

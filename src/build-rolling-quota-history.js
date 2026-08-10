@@ -2,6 +2,7 @@
 
 import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { SEVEN_DAY_WINDOW_MINUTES } from "@app-usagemonitor/quota-analysis";
 import { mineCodexTransitions } from "./codex-transition-miner.js";
 import { buildRollingHours } from "./simple-quota-gradient.js";
 
@@ -10,7 +11,7 @@ const historyPath = resolve(root, ".usage-monitor/weekly-limit-simple-history-20
 const outputPath = resolve(root, ".usage-monitor/rolling-quota-history-2026-06-11-to-2026-07-24-v0.1.json");
 const startAt = "2026-06-11T00:00:00.000Z";
 const endAt = "2026-07-24T13:51:29.000Z";
-const weeklyWindowMins = 10_080;
+const weeklyWindowMins = SEVEN_DAY_WINDOW_MINUTES;
 const july13Reset = 1_784_487_650;
 
 function seriesKey(row) {

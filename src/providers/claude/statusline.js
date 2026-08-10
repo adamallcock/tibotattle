@@ -1,5 +1,9 @@
 import { createHmac } from "node:crypto";
 import { Buffer } from "node:buffer";
+import {
+  FIVE_HOUR_WINDOW_MINUTES,
+  SEVEN_DAY_WINDOW_MINUTES,
+} from "@app-usagemonitor/quota-analysis";
 
 export const CLAUDE_STATUSLINE_SCHEMA_VERSION = "0.2";
 export const DEFAULT_MAX_CLAUDE_STATUS_INPUT_BYTES = 64 * 1024;
@@ -143,7 +147,10 @@ export function validateClaudeStatusSnapshot(snapshot) {
   if (!isPlainRecord(limits)) fail("snapshot_limits");
   requireExactKeys(limits, ["fiveHour", "sevenDay"], "snapshot_limits");
   const normalizedLimits = {};
-  for (const [key, duration] of [["fiveHour", 300], ["sevenDay", 10_080]]) {
+  for (const [key, duration] of [
+    ["fiveHour", FIVE_HOUR_WINDOW_MINUTES],
+    ["sevenDay", SEVEN_DAY_WINDOW_MINUTES],
+  ]) {
     const window = ownData(limits, key, true);
     if (window === null) {
       normalizedLimits[key] = null;
@@ -205,8 +212,14 @@ export function sanitizeClaudeStatusline(input, capturedAt = new Date().toISOStr
     fastMode: fastMode === true,
     sessionPseudonym: normalizeSessionPseudonym(ownData(input, "session_id"), ownData(options, "sessionSecret")),
     limits: {
-      fiveHour: normalizeWindow(rateLimits ? ownData(rateLimits, "five_hour") : undefined, 300),
-      sevenDay: normalizeWindow(rateLimits ? ownData(rateLimits, "seven_day") : undefined, 10_080),
+      fiveHour: normalizeWindow(
+        rateLimits ? ownData(rateLimits, "five_hour") : undefined,
+        FIVE_HOUR_WINDOW_MINUTES,
+      ),
+      sevenDay: normalizeWindow(
+        rateLimits ? ownData(rateLimits, "seven_day") : undefined,
+        SEVEN_DAY_WINDOW_MINUTES,
+      ),
     },
     privacy: {
       rawSessionIdentifierStored: false,

@@ -75,6 +75,10 @@ test("continuity and reset identities exclude slot and retain duration", () => {
     continuityKey(row),
     continuityKey({ ...row, windowDurationMinutes: 10_080 }),
   );
+  assert.notEqual(
+    resetKey(row),
+    resetKey({ ...row, windowDurationMinutes: 43_200 }),
+  );
 });
 
 test("five-hour and seven-day tracks use the same evidence semantics", () => {
@@ -87,6 +91,24 @@ test("five-hour and seven-day tracks use the same evidence semantics", () => {
   assert.deepEqual(sevenDay.boundaries, fiveHour.boundaries);
   assert.equal(sevenDay.totalCostNanousd, fiveHour.totalCostNanousd);
   assert.equal(sevenDay.windowDurationMinutes, 10_080);
+});
+
+test("a 43,200-minute provider-reported window is admitted without changing track accounting", () => {
+  const result = buildResetEvidence(fixture({ duration: 43_200 })).resets[0];
+  assert.equal(result.status, "eligible");
+  assert.deepEqual(result.boundaries, buildResetEvidence(fixture()).resets[0].boundaries);
+  assert.equal(result.totalCostNanousd, 42_000_000_000);
+  assert.equal(result.windowDurationMinutes, 43_200);
+});
+
+test("invalid provider-reported durations are rejected at track admission", () => {
+  for (const duration of [0, 1.5, Number.MAX_SAFE_INTEGER + 1, 525_601]) {
+    assert.throws(
+      () => buildResetEvidence(fixture({ duration })),
+      /quota_tracks_invalid_input/u,
+      String(duration),
+    );
+  }
 });
 
 test("foreign accounts and track fields are isolated from an existing reset", () => {

@@ -387,6 +387,24 @@ export function createLocalContributionSyncQueueStorageContext({
       });
     }
 
+    // The automatic controller must only inherit a retry deadline for the
+    // prepared set it selected. `status().nextAttemptAt` is intentionally
+    // queue-wide for the local UI, so using it for recurrence could make a
+    // different set's earlier job trigger a tight automatic retry loop.
+    function preparedSetNextAttemptAt(preparedSetId) {
+      if (!SHA256.test(preparedSetId ?? "")) failures.fail("queue_invalid");
+      const row = database.prepare(`
+        SELECT MIN(next_attempt_at) AS value
+          FROM contribution_jobs
+         WHERE prepared_set_id = ?
+           AND state IN ('pending', 'retryable')
+      `).get(preparedSetId);
+      if (row.value === null || row.value === undefined) return null;
+      const normalized = iso(row.value, failures);
+      if (normalized !== row.value) failures.fail("queue_invalid");
+      return normalized;
+    }
+
     function setPaused(paused, timestamp) {
       database.prepare(`
         UPDATE queue_meta
@@ -561,6 +579,7 @@ export function createLocalContributionSyncQueueStorageContext({
       finishAccepted,
       finishFailed,
       nextQueuedJob,
+      preparedSetNextAttemptAt,
       preparedSetStatus,
       readyJobs,
       recoverExpiredLeases,

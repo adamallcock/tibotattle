@@ -24,23 +24,25 @@
  * responses, but never silently turn a failure into real-looking data.
  */
 
+import { TELEMETRY_PLAN_TYPES } from "./telemetry-shared.generated.js";
+
+export {
+  COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
+  SUPPORTED_COMMUNITY_SNAPSHOT_SCHEMA_VERSIONS,
+  normalizeCommunitySnapshot,
+} from "./community-data.js";
+
 const LOCAL_ROOT = "/api/local";
 const CENTRAL_ROOT = "/api/v1";
-export const COMMUNITY_SNAPSHOT_SCHEMA_VERSION = "community-weekly-snapshot-v0.2";
-// A sealed snapshot is immutable by design: the database refuses to rewrite a
-// released revision, so a week published under an earlier contract keeps being
-// served forever. A reader that accepted only the newest contract would turn
-// every version bump into "unsupported contract" for already-published weeks,
-// so both released contracts are accepted here. The only difference is the
-// plan-cohort fields, which v0.1 cells simply do not carry; every other check
-// stays exactly as strict for both.
-export const SUPPORTED_COMMUNITY_SNAPSHOT_SCHEMA_VERSIONS = Object.freeze([
-  "community-weekly-snapshot-v0.1",
-  COMMUNITY_SNAPSHOT_SCHEMA_VERSION
-]);
-const COMMUNITY_SNAPSHOT_PLAN_COHORT_VERSIONS = new Set([
-  COMMUNITY_SNAPSHOT_SCHEMA_VERSION
-]);
+// Provider quota identifiers are protocol values, not display copy. Keep the
+// normal Codex allowance selection bound to the exact technical identifier so
+// a translated UI label (or another product's weekly-looking window) can never
+// be mistaken for it.
+export const CODEX_PRIMARY_LIMIT_ID = "codex";
+export const CODEX_SPARK_LIMIT_ID = "codex_bengalfox";
+export const CODEX_FIVE_HOUR_ALLOWANCE_MINUTES = 300;
+export const CODEX_WEEKLY_ALLOWANCE_MINUTES = 10_080;
+export const MAX_QUOTA_WINDOW_DURATION_MINUTES = 525_600;
 const BACKEND_LIFECYCLE_STATES = new Set([
   "never_run",
   "running",
@@ -61,7 +63,7 @@ export const PARTICIPANT_PROFILE_SCHEMA_VERSION = "participant-profile-v0.2";
 export const PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION =
   "participant-community-comparison-v0.2";
 // The comparison is derived from a sealed snapshot, so it inherits the same
-// immutability and the same two live contracts.
+// immutability and every released aggregate contract it can interpret.
 export const SUPPORTED_PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSIONS =
   Object.freeze([
     "participant-community-comparison-v0.1",
@@ -83,18 +85,9 @@ export const LOCAL_CONTRIBUTION_PREPARATION_RESULT_VERSION =
 export const LOCAL_CONTRIBUTION_DEVICE_PAIRING_VERSION =
   "local-contribution-device-pairing-v0.1";
 export const LOCAL_ONBOARDING_SCHEMA_VERSION = "local-onboarding-v0.2";
+export const LOCAL_COMPANION_SCHEMA_VERSION = "local-companion-v0.1";
 const MAXIMUM_ONBOARDING_ROLLOUT_FILES = 100;
 
-const COMMUNITY_METRIC_UNITS = Object.freeze({
-  usageEvents: "events_rounded_down",
-  inputUncachedTokens: "tokens_rounded_down",
-  inputCacheReadTokens: "tokens_rounded_down",
-  inputCacheWriteTokens: "tokens_rounded_down",
-  outputTextTokens: "tokens_rounded_down",
-  outputReasoningTokens: "tokens_rounded_down",
-  outputCombinedTokens: "tokens_rounded_down",
-  toolUnits: "tool_units_rounded_down"
-});
 const PARTICIPANT_COMPARISON_METRIC_UNITS = Object.freeze({
   usageEvents: "events",
   inputUncachedTokens: "tokens",
@@ -118,6 +111,8 @@ export const LOCAL_DIAGNOSTIC_NOTE_SCHEMA_VERSION =
   "local-diagnostic-note-v0.1";
 export const LOCAL_CONTRIBUTION_DEVICE_RESET_VERSION =
   "local-contribution-device-reset-v0.1";
+export const LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION =
+  "local-contribution-device-disconnect-v0.1";
 const DIAGNOSTIC_REFERENCE_PATTERN = /^TT-[0-9A-HJKMNP-TV-Z]{6}$/u;
 // Both boundaries answer with fixed identifier-shaped codes: the Worker uses
 // SCREAMING_SNAKE, the local companion uses lower_snake. Neither shape can
@@ -161,6 +156,32 @@ const HOSTED_IDENTITY_ERROR_CODES = new Set([
   "IDENTITY_RESULT_PENDING"
 ]);
 const HOSTED_SIGNIN_STATE = /^[A-Za-z0-9_-]{43,128}$/u;
+// The initiating client generates this verifier, keeps it, and sends only its
+// SHA-256 digest to the start route. It re-presents the raw verifier to collect
+// the result and again when enrollment consumes the proof, so the unguessable
+// state alone — which transits the provider, the browser, and any log — is no
+// longer sufficient to redeem a completed sign-in.
+const HOSTED_SIGNIN_VERIFIER = /^[A-Za-z0-9_-]{43,128}$/u;
+
+function randomHostedSignInVerifier() {
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(48));
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary)
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/u, "");
+}
+
+async function hostedSignInBinding(verifier) {
+  const digest = new Uint8Array(await globalThis.crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(verifier)
+  ));
+  let hex = "";
+  for (const byte of digest) hex += byte.toString(16).padStart(2, "0");
+  return hex;
+}
 // The only two URLs this page will ever hand to window.open for sign-in. The
 // service builds them; this is the check that it built the one it claimed to.
 const APPLE_AUTHORIZE_URL_PREFIX =
@@ -222,6 +243,92 @@ function text(value, fallback = "") {
   return typeof value === "string" && value.length <= 500 ? value : fallback;
 }
 
+function normalizePlanType(value) {
+  const candidate = text(value, "unknown");
+  return TELEMETRY_PLAN_TYPES.includes(candidate) ? candidate : "unknown";
+}
+
+function canonicalInstant(value) {
+  if (typeof value !== "string" || value.length > 32) return null;
+  const epoch = Date.parse(value);
+  return Number.isFinite(epoch) && new Date(epoch).toISOString() === value
+    ? value
+    : null;
+}
+
+function normalizeQuotaLimitId(value) {
+  const candidate = text(value, "");
+  return candidate === CODEX_PRIMARY_LIMIT_ID || candidate === CODEX_SPARK_LIMIT_ID
+    ? candidate
+    : "unknown";
+}
+
+/**
+ * True only for the provider's normal Codex allowance track. `primary` here
+ * names the limit identifier, not its UI slot: either provider slot can carry
+ * a valid normal Codex window. This deliberately does not inspect labels.
+ */
+export function isPrimaryCodexQuotaWindow(window) {
+  return window?.limitId === CODEX_PRIMARY_LIMIT_ID
+    && isValidQuotaWindowDuration(finite(window?.durationMinutes));
+}
+
+export function isPrimaryCodexWeeklyQuotaWindow(window) {
+  return window?.limitId === CODEX_PRIMARY_LIMIT_ID
+    && finite(window?.durationMinutes) === CODEX_WEEKLY_ALLOWANCE_MINUTES;
+}
+
+export function isValidQuotaWindowDuration(value) {
+  return Number.isSafeInteger(value)
+    && value >= 1
+    && value <= MAX_QUOTA_WINDOW_DURATION_MINUTES;
+}
+
+export function selectPrimaryCodexQuotaWindow(windows) {
+  let selected = null;
+  for (const window of Array.isArray(windows) ? windows : []) {
+    if (!isPrimaryCodexQuotaWindow(window)) continue;
+    if (selected === null) {
+      selected = window;
+      continue;
+    }
+    const durationMinutes = finite(window.durationMinutes);
+    const selectedDurationMinutes = finite(selected.durationMinutes);
+    if (durationMinutes > selectedDurationMinutes
+        || (durationMinutes === selectedDurationMinutes
+          && window.slot === "primary"
+          && selected.slot !== "primary")) {
+      selected = window;
+    }
+  }
+  return selected;
+}
+
+export function formatQuotaWindowDuration(durationMinutes) {
+  const duration = finite(durationMinutes, null);
+  if (!isValidQuotaWindowDuration(duration)) return "";
+  if (duration % (24 * 60) === 0) return `${duration / (24 * 60)}-day`;
+  if (duration % 60 === 0) return `${duration / 60}-hour`;
+  return `${duration}-minute`;
+}
+
+export function quotaWindowLabel(limitId, durationMinutes) {
+  const duration = finite(durationMinutes, null);
+  if (limitId === CODEX_PRIMARY_LIMIT_ID
+      && duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) {
+    return "Five-hour allowance";
+  }
+  if (limitId === CODEX_PRIMARY_LIMIT_ID
+      && duration === CODEX_WEEKLY_ALLOWANCE_MINUTES) {
+    return "Seven-day allowance";
+  }
+  if (limitId === CODEX_PRIMARY_LIMIT_ID
+      && isValidQuotaWindowDuration(duration)) {
+    return `Provider-reported ${formatQuotaWindowDuration(duration)} window`;
+  }
+  return "Other observed allowance";
+}
+
 function count(value, fallback = null) {
   const number = finite(value, fallback);
   return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
@@ -241,10 +348,12 @@ function hasExactKeys(value, expectedKeys) {
 }
 
 function validHostedIdentity(identity) {
-  return hasExactKeys(identity, ["provider", "proof"])
+  return hasExactKeys(identity, ["provider", "proof", "verifier"])
     && HOSTED_IDENTITY_PROVIDERS.has(identity.provider)
     && typeof identity.proof === "string"
-    && /^[A-Za-z0-9_-]{64}$/u.test(identity.proof);
+    && /^[A-Za-z0-9_-]{64}$/u.test(identity.proof)
+    && typeof identity.verifier === "string"
+    && HOSTED_SIGNIN_VERIFIER.test(identity.verifier);
 }
 
 /**
@@ -302,11 +411,14 @@ function hostedIdentityRequestError(response, payload) {
 async function startHostedSignIn(fetchImpl, provider) {
   const { path, schemaVersion, authorizePrefix } =
     HOSTED_IDENTITY_START_ROUTES[provider];
+  // The verifier stays on this client; only its digest is sent to the service.
+  const verifier = randomHostedSignInVerifier();
+  const binding = await hostedSignInBinding(verifier);
   const response = await fetchImpl(`${CENTRAL_ROOT}${path}`, {
     method: "POST",
     credentials: "same-origin",
     headers: { Accept: "application/json", "Content-Type": "application/json" },
-    body: JSON.stringify({})
+    body: JSON.stringify({ binding })
   });
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
@@ -323,7 +435,8 @@ async function startHostedSignIn(fetchImpl, provider) {
   }
   return Object.freeze({
     state: payload.state,
-    authorizeUrl: payload.authorizeUrl
+    authorizeUrl: payload.authorizeUrl,
+    verifier
   });
 }
 
@@ -332,18 +445,23 @@ async function startHostedSignIn(fetchImpl, provider) {
  * IDENTITY_RESULT_PENDING so the caller can keep polling without treating it
  * as a failure.
  */
-async function readHostedSignInResult(fetchImpl, provider, state) {
+async function readHostedSignInResult(fetchImpl, provider, state, verifier) {
   const { path, schemaVersion } = HOSTED_IDENTITY_RESULT_ROUTES[provider];
   if (typeof state !== "string" || !HOSTED_SIGNIN_STATE.test(state)) {
     throw new TypeError(
       `${HOSTED_IDENTITY_LABELS[provider]} sign-in state is invalid.`
     );
   }
+  if (typeof verifier !== "string" || !HOSTED_SIGNIN_VERIFIER.test(verifier)) {
+    throw new TypeError(
+      `${HOSTED_IDENTITY_LABELS[provider]} sign-in verifier is invalid.`
+    );
+  }
   const response = await fetchImpl(`${CENTRAL_ROOT}${path}`, {
     method: "POST",
     credentials: "same-origin",
     headers: { Accept: "application/json", "Content-Type": "application/json" },
-    body: JSON.stringify({ state })
+    body: JSON.stringify({ state, verifier })
   });
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
@@ -356,7 +474,9 @@ async function readHostedSignInResult(fetchImpl, provider, state) {
       `The service did not return a usable ${HOSTED_IDENTITY_LABELS[provider]} sign-in proof.`
     );
   }
-  return Object.freeze({ provider, proof: payload.proof });
+  // The verifier is echoed back with the proof so enrollment can carry the
+  // initiator binding through to proof consumption.
+  return Object.freeze({ provider, proof: payload.proof, verifier });
 }
 
 
@@ -541,6 +661,102 @@ export function normalizeContributionSyncStatus(payload) {
   };
 }
 
+// The bounded incremental-status projection the approve-once surface reads:
+// consent verdict, day-count progress, pause reason and last outcome as
+// fixed-vocabulary codes. Anything else in the payload fails the read closed.
+const INCREMENTAL_SYNC_STATUS_SCHEMA_VERSION =
+  "local-incremental-contribution-sync-v1.0";
+const INCREMENTAL_SYNC_CODE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/u;
+const INCREMENTAL_SYNC_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
+
+export function normalizeIncrementalContributionSyncStatus(payload) {
+  const unavailable = Object.freeze({
+    status: "unavailable",
+    consent: Object.freeze({ approved: false, current: false, consentedAt: "" }),
+    paused: false,
+    pausedReason: null,
+    running: false,
+    progress: null,
+    lastAttemptAt: "",
+    nextAttemptAt: "",
+    lastOutcome: null
+  });
+  if (payload?.schemaVersion !== INCREMENTAL_SYNC_STATUS_SCHEMA_VERSION
+      || payload?.status !== "available"
+      || typeof payload?.paused !== "boolean"
+      || typeof payload?.running !== "boolean"
+      || typeof payload?.consent?.approved !== "boolean"
+      || typeof payload?.consent?.current !== "boolean"
+      || payload?.includesContent !== false
+      || payload?.includesPaths !== false
+      || payload?.includesIdentifiers !== false
+      || payload?.includesCredentials !== false) {
+    return unavailable;
+  }
+  const consentedAt = text(payload.consent.consentedAt, "");
+  const lastAttemptAt = text(payload.lastAttemptAt, "");
+  const nextAttemptAt = text(payload.nextAttemptAt, "");
+  if ((consentedAt && !Number.isFinite(Date.parse(consentedAt)))
+      || (lastAttemptAt && !Number.isFinite(Date.parse(lastAttemptAt)))
+      || (nextAttemptAt && !Number.isFinite(Date.parse(nextAttemptAt)))) {
+    return unavailable;
+  }
+  const rawProgress = payload.progress;
+  let progress = null;
+  if (rawProgress !== null && rawProgress !== undefined) {
+    const daysTotal = count(rawProgress.daysTotal, null);
+    const daysSynced = count(rawProgress.daysSynced, null);
+    const daysPending = count(rawProgress.daysPending, null);
+    const chunksUploaded = count(rawProgress.chunksUploaded, null);
+    const acknowledgedThroughDay = rawProgress.acknowledgedThroughDay ?? null;
+    if (daysTotal === null || daysSynced === null || daysPending === null
+        || chunksUploaded === null
+        || (acknowledgedThroughDay !== null
+          && !INCREMENTAL_SYNC_DAY_PATTERN.test(acknowledgedThroughDay))) {
+      return unavailable;
+    }
+    progress = Object.freeze({
+      daysTotal,
+      daysSynced,
+      daysPending,
+      chunksUploaded,
+      acknowledgedThroughDay
+    });
+  }
+  const rawOutcome = payload.lastOutcome;
+  let lastOutcome = null;
+  if (rawOutcome !== null && rawOutcome !== undefined) {
+    if (!Number.isFinite(Date.parse(rawOutcome.at ?? ""))
+        || !INCREMENTAL_SYNC_CODE_PATTERN.test(rawOutcome.code ?? "")
+        || !["succeeded", "partial", "failed", "paused"].includes(rawOutcome.status)) {
+      return unavailable;
+    }
+    lastOutcome = Object.freeze({
+      at: rawOutcome.at,
+      code: rawOutcome.code,
+      status: rawOutcome.status
+    });
+  }
+  return Object.freeze({
+    status: "available",
+    consent: Object.freeze({
+      approved: payload.consent.approved,
+      current: payload.consent.current,
+      consentedAt
+    }),
+    paused: payload.paused,
+    pausedReason: payload.paused
+      && INCREMENTAL_SYNC_CODE_PATTERN.test(payload.pausedReason ?? "")
+      ? payload.pausedReason
+      : null,
+    running: payload.running,
+    progress,
+    lastAttemptAt,
+    nextAttemptAt,
+    lastOutcome
+  });
+}
+
 export function normalizeAutomaticContributionStatus(payload) {
   const unavailable = Object.freeze({
     state: "unavailable",
@@ -641,7 +857,7 @@ export function normalizeAutomaticContributionStatus(payload) {
   if (!hasExactKeys(requiredConsent, requiredConsentKeys)
       || requiredConsent.telemetrySchemaVersion !== "telemetry-contribution-v0.1"
       || requiredConsent.fieldDictionaryVersion
-        !== "telemetry-v0.1-registry-2026-07-25.3"
+        !== "telemetry-v0.1-registry-2026-08-06.1"
       || requiredConsent.privacyContractVersion
         !== "ongoing-privacy-safe-telemetry-v0.1"
       || !validDestination
@@ -834,7 +1050,7 @@ export function normalizeContributionSyncPreview(payload) {
         && /^(?:0|[1-9]\d*)\.\d{6}$/.test(estimatedCost)))
     && coverage !== null && coverage >= 0 && coverage <= 100
     && unknownModels !== null && unknownUnits !== null
-    && ["current_api_prices", "historical_api_prices", "unpriced"]
+    && ["current_api_prices", "historical_api_prices", "unpriced", "mixed_api_prices"]
       .includes(item?.accounting?.priceBasis)
     && item?.accounting?.verification === "client_declared_unverified"
     && preparedBytes !== null && reservedUploadBytes !== null
@@ -974,6 +1190,87 @@ export function normalizeLocalContributionPreparation(payload) {
   };
 }
 
+export const LOCAL_WINDOW_BREAKDOWN_SCHEMA_VERSION = "local-window-breakdown-v0.1";
+
+function windowBreakdownSpeedRow(value) {
+  return {
+    costUsd: nonNegative(value?.costUsd, 0),
+    tokens: count(value?.tokens, 0),
+    events: count(value?.events, 0),
+    unpricedEvents: count(value?.unpricedEvents, 0),
+    unpricedShare: nonNegative(value?.unpricedShare, 0),
+  };
+}
+
+/**
+ * The per-model / per-speed cost mix for one bounded window, sanitized to
+ * content-free numbers. A missing or unavailable breakdown reads back as an
+ * explicit unavailable status rather than an empty-but-priced mix, so the panel
+ * can tell "nothing here" apart from "we could not read it".
+ */
+export function normalizeWindowBreakdown(payload) {
+  const unavailable = {
+    status: "unavailable",
+    from: null,
+    to: null,
+    events: 0,
+    unpricedShare: 0,
+    costUsd: 0,
+    tokens: 0,
+    fastCostUsd: 0,
+    fastEvents: 0,
+    byModel: [],
+    bySpeed: {},
+    spark: { events: 0, costUsd: 0 },
+  };
+  const breakdown = payload?.breakdown;
+  if (payload?.schemaVersion !== LOCAL_COMPANION_SCHEMA_VERSION
+      || breakdown === null
+      || typeof breakdown !== "object"
+      || Array.isArray(breakdown)) {
+    return unavailable;
+  }
+  if (breakdown.status !== "available") {
+    return { ...unavailable, status: text(breakdown.status, "unavailable") };
+  }
+  const byModel = (Array.isArray(breakdown.byModel) ? breakdown.byModel : [])
+    .filter((row) => typeof row?.model === "string" && row.model.length > 0)
+    .map((row) => ({
+      model: row.model,
+      costUsd: nonNegative(row.costUsd, 0),
+      tokens: count(row.tokens, 0),
+      events: count(row.events, 0),
+      unpricedEvents: count(row.unpricedEvents, 0),
+      unpricedShare: nonNegative(row.unpricedShare, 0),
+      fastModeMultiplier: finite(row.fastModeMultiplier, null),
+    }));
+  const bySpeed = {};
+  const rawSpeed = breakdown.bySpeed;
+  if (rawSpeed && typeof rawSpeed === "object" && !Array.isArray(rawSpeed)) {
+    for (const [speed, value] of Object.entries(rawSpeed)) {
+      if (typeof speed !== "string" || speed.length === 0) continue;
+      bySpeed[speed] = windowBreakdownSpeedRow(value);
+    }
+  }
+  return {
+    status: "available",
+    from: count(breakdown.from, null),
+    to: count(breakdown.to, null),
+    events: count(breakdown.events, 0),
+    unpricedShare: nonNegative(breakdown.unpricedShare, 0),
+    costUsd: nonNegative(breakdown.costUsd, 0),
+    tokens: count(breakdown.tokens, 0),
+    fastCostUsd: nonNegative(breakdown.fastCostUsd, 0),
+    fastEvents: count(breakdown.fastEvents, 0),
+    byModel,
+    bySpeed,
+    spark: {
+      events: count(breakdown.spark?.events, 0),
+      costUsd: nonNegative(breakdown.spark?.costUsd, 0),
+    },
+  };
+}
+
 export function normalizeLocalContributionDevicePairing(payload) {
   const unavailable = {
     status: "unavailable",
@@ -1030,111 +1327,34 @@ export function normalizeLocalContributionDeviceReset(payload) {
   };
 }
 
-function snapshotMetric(value, expectedUnit) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return null;
-  }
-  if (value.status === "suppressed") {
-    return { status: "suppressed", value: null, unit: expectedUnit };
-  }
-  const numeric = finite(value.value, null);
-  if (value.status !== "released"
-      || value.unit !== expectedUnit
-      || numeric === null
-      || !Number.isSafeInteger(numeric)
-      || numeric < 0) {
-    return null;
-  }
-  return { status: "released", value: numeric, unit: expectedUnit };
-}
-
-export function normalizeCommunitySnapshot(payload) {
-  if (!payload) return { state: "service_unavailable", cells: [] };
-  if (payload.publicationStatus === "development_diagnostic_not_publication_safe") {
-    return { state: "development_unsafe", cells: [] };
-  }
-  if (!SUPPORTED_COMMUNITY_SNAPSHOT_SCHEMA_VERSIONS.includes(
-    payload.schemaVersion
-  )
-      || payload.immutable !== true
-      || payload.nonOverlapping !== true) {
-    return { state: "unsupported_schema", cells: [] };
-  }
-  const carriesPlanCohort = COMMUNITY_SNAPSHOT_PLAN_COHORT_VERSIONS.has(
-    payload.schemaVersion
-  );
-
-  const base = {
-    schemaVersion: payload.schemaVersion,
-    snapshotId: text(payload.snapshotId, ""),
-    period: {
-      startAt: text(payload.period?.startAt, ""),
-      endAt: text(payload.period?.endAt, "")
-    },
-    ingestionCutoffAt: text(payload.ingestionCutoffAt, ""),
-    releasedAt: text(payload.releasedAt, ""),
-    policyVersion: text(payload.privacyPolicy?.version, ""),
-    minimumIndependentParticipants: finite(
-      payload.privacyPolicy?.minimumIndependentParticipants,
-      null
-    ),
-    cells: []
+/**
+ * Accept only the deliberately non-identifying result of stopping this Mac's
+ * upload authority. The local companion performs the authenticated remote
+ * revocation and clears its Keychain/state binding; the browser must never
+ * receive the device id or the bearer secret that made that possible.
+ */
+export function normalizeLocalContributionDeviceDisconnect(payload) {
+  const unavailable = {
+    status: "unavailable",
+    deliveryPaused: false,
+    localCredential: "unknown",
+    localBinding: "unknown",
   };
-
-  if (payload.releaseStatus === "not_yet_published") {
-    return { ...base, state: "not_yet_published" };
-  }
-  if (payload.releaseStatus === "withdrawn") {
-    return { ...base, state: "withdrawn" };
-  }
-  if (payload.releaseStatus === "suppressed") {
-    return { ...base, state: "suppressed" };
-  }
-  if (payload.releaseStatus !== "published"
-      || !base.snapshotId
-      || !base.period.startAt
-      || !base.period.endAt
-      || !base.ingestionCutoffAt
-      || !base.releasedAt
-      || !base.policyVersion
-      || !Number.isSafeInteger(base.minimumIndependentParticipants)
-      || base.minimumIndependentParticipants < 3
-      || !Array.isArray(payload.cells)
-      || payload.cells.length > 100) {
-    return { ...base, state: "unsupported_schema" };
-  }
-
-  const cells = [];
-  let partial = false;
-  for (const candidate of payload.cells) {
-    const provider = text(candidate?.provider, "");
-    const modelId = text(candidate?.modelId, "");
-    if (!provider || !modelId || !candidate.metrics
-        || typeof candidate.metrics !== "object"
-        || Array.isArray(candidate.metrics)) {
-      return { ...base, state: "unsupported_schema" };
-    }
-    // Plan cohorts arrived with v0.2. A v0.1 cell has no cohort to report, so
-    // it is described as unknown rather than guessed at or rejected.
-    const planType = carriesPlanCohort
-      ? text(candidate?.planType, "unknown")
-      : "unknown";
-    const planVariant = carriesPlanCohort
-      ? text(candidate?.planVariant, "unknown")
-      : "unknown";
-    const metrics = {};
-    for (const [metricName, expectedUnit] of Object.entries(COMMUNITY_METRIC_UNITS)) {
-      const metric = snapshotMetric(candidate.metrics[metricName], expectedUnit);
-      if (!metric) return { ...base, state: "unsupported_schema" };
-      metrics[metricName] = metric;
-      partial ||= metric.status === "suppressed";
-    }
-    cells.push({ provider, planType, planVariant, modelId, metrics });
+  if (payload?.schemaVersion !== LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION
+      || payload?.status !== "disconnected"
+      || payload?.deliveryPaused !== true
+      || !["deleted", "already_missing"].includes(payload?.localCredential)
+      || payload?.localBinding !== "removed"
+      || payload?.hostedDataDeleted !== false
+      || payload?.includesIdentifiers !== false
+      || payload?.includesCredentials !== false) {
+    return unavailable;
   }
   return {
-    ...base,
-    state: partial ? "published_partial" : "published",
-    cells
+    status: "disconnected",
+    deliveryPaused: true,
+    localCredential: payload.localCredential,
+    localBinding: "removed",
   };
 }
 
@@ -1147,7 +1367,7 @@ function normalizeQuotaMovement(payload) {
     interpretation: text(payload?.interpretation, ""),
     accountContinuity: text(payload?.accountContinuity, "not_transmitted"),
     provider: text(payload?.provider, ""),
-    planType: text(payload?.planType, ""),
+    planType: normalizePlanType(payload?.planType),
     planVariant: text(payload?.planVariant, ""),
     limitId: text(payload?.limitId, ""),
     slot: text(payload?.slot, ""),
@@ -1213,7 +1433,7 @@ function normalizeAccountScopedQuotaAnalysis(payload) {
     const windowDurationMinutes = count(continuity.windowDurationMinutes, null);
     if (
       !["openai_codex", "anthropic_claude_code"].includes(continuity.provider)
-      || ![300, 10_080].includes(windowDurationMinutes)
+      || !isValidQuotaWindowDuration(windowDurationMinutes)
     ) {
       return [];
     }
@@ -1231,7 +1451,7 @@ function normalizeAccountScopedQuotaAnalysis(payload) {
     return [{
       index: index + 1,
       provider: text(continuity.provider, ""),
-      planType: text(continuity.planType, "unknown"),
+      planType: normalizePlanType(continuity.planType),
       planVariant: text(continuity.planVariant, "unknown"),
       limitId: text(continuity.limitId, "unknown"),
       windowDurationMinutes,
@@ -1496,10 +1716,35 @@ export function normalizeParticipantHistory(payload) {
     const serverPrice = priceVerification === "server_repriced"
       ? nonNegative(candidate?.serverAccounting?.apiPriceEquivalentUsd, null)
       : null;
+    const serverPriceBasis = candidate?.serverAccounting?.priceBasis === undefined
+      ? null
+      : text(candidate?.serverAccounting?.priceBasis, "");
+    const serverPriceEpochBasis = candidate?.serverAccounting?.priceEpochBasis === undefined
+      ? null
+      : text(candidate?.serverAccounting?.priceEpochBasis, "");
+    const serverEventTimeRange = candidate?.serverAccounting?.eventTimeRange;
+    const serverEventTimeStart = serverEventTimeRange === null
+      || serverEventTimeRange === undefined
+      ? null
+      : canonicalInstant(serverEventTimeRange?.startAt);
+    const serverEventTimeEnd = serverEventTimeRange === null
+      || serverEventTimeRange === undefined
+      ? null
+      : canonicalInstant(serverEventTimeRange?.endAt);
     if (!["server_repriced", "server_repricing_unavailable"].includes(priceVerification)
         || (priceVerification === "server_repriced" && serverPrice === null)
         || (priceVerification === "server_repricing_unavailable"
           && candidate?.serverAccounting?.apiPriceEquivalentUsd !== null)) {
+      return unavailable("invalid_contract");
+    }
+    if ((serverPriceBasis !== null
+      && !["historical_api_prices", "unpriced", "mixed_api_prices"].includes(serverPriceBasis))
+        || (serverPriceEpochBasis !== null
+          && serverPriceEpochBasis !== "event_time_when_registry_has_effective_evidence")
+        || (serverEventTimeRange !== null && serverEventTimeRange !== undefined
+          && (serverEventTimeStart === null
+            || serverEventTimeEnd === null
+            || Date.parse(serverEventTimeEnd) < Date.parse(serverEventTimeStart)))) {
       return unavailable("invalid_contract");
     }
 
@@ -1516,6 +1761,12 @@ export function normalizeParticipantHistory(payload) {
       recordCounts,
       serverAccounting: {
         apiPriceEquivalentUsd: serverPrice,
+        priceBasis: serverPriceBasis,
+        priceEpochBasis: serverPriceEpochBasis,
+        eventTimeRange: serverEventTimeRange === null
+          || serverEventTimeRange === undefined
+          ? null
+          : { startAt: serverEventTimeStart, endAt: serverEventTimeEnd },
         verification: priceVerification
       },
       quarantine: {
@@ -1737,12 +1988,25 @@ const LOCAL_MODELS = new Set([
   "gpt-5.6-terra",
   "gpt-5.6-luna",
   "gpt-5.5",
+  "gpt-5.5-codex",
   "gpt-5.4",
   "gpt-5.4-mini",
   "gpt-5",
   "gpt-4.1",
+  // Recognised identities that carry no published API price card. They were
+  // missing here, so the local report's rows for them were discarded at this
+  // boundary and their usage silently reappeared as "unknown".
+  "codex-auto-review",
+  // Metered against its own subscription allowance, never the primary pool.
+  "gpt-5.3-codex-spark",
   "unknown"
 ]);
+const LOCAL_MODEL_PRICING_STATUSES = new Set([
+  "priced",
+  "known_unpriced",
+  "unrecognized"
+]);
+const LOCAL_MODEL_ALLOWANCE_TRACKS = new Set(["primary", "spark"]);
 const MONITORING_GAP_COPY = Object.freeze({
   quota_snapshots: ["Quota snapshots", "Current provider quota windows and their freshness."],
   account_attribution: ["Account attribution", "Whether quota and usage can be tied safely to one pseudonymous local account scope."],
@@ -1770,8 +2034,6 @@ function normalizeLocalComponentCosts(value) {
     const row = value?.[key] ?? {};
     return [key, {
       tokens: count(row.tokens, 0),
-      pricedTokens: count(row.pricedTokens, 0),
-      unpricedTokens: count(row.unpricedTokens, 0),
       costUsd: nonNegative(row.costUsd, 0)
     }];
   }));
@@ -1930,7 +2192,10 @@ function normalizeLocalTimeline(value = {}) {
     const observedAt = text(row?.observedAt, "");
     const usedPercent = finite(row?.usedPercent, null);
     const remainingPercent = finite(row?.remainingPercent, null);
-    const durationMinutes = count(row?.durationMinutes, null);
+    const durationCandidate = count(row?.durationMinutes, null);
+    const durationMinutes = isValidQuotaWindowDuration(durationCandidate)
+      ? durationCandidate
+      : null;
     const resetAt = row?.resetAt === null ? "" : text(row?.resetAt, "");
     if (!Number.isFinite(Date.parse(observedAt))
         || usedPercent === null || usedPercent < 0 || usedPercent > 100
@@ -1942,14 +2207,11 @@ function normalizeLocalTimeline(value = {}) {
       remainingPercent,
       durationMinutes,
       resetAt,
-      limitId: ["codex", "codex_bengalfox", "unknown"].includes(row?.limitId)
-        ? row.limitId
-        : "unknown",
+      limitId: normalizeQuotaLimitId(row?.limitId),
       slot: ["primary", "secondary", "unknown"].includes(row?.slot)
         ? row.slot
         : "unknown",
-      planType: ["free", "plus", "pro", "team", "business", "enterprise", "unknown"]
-        .includes(row?.planType) ? row.planType : "unknown",
+      planType: normalizePlanType(row?.planType),
       accountAttribution: row?.accountAttribution === "attributed_pseudonymous"
         ? "attributed_pseudonymous"
         : "unattributed"
@@ -1966,24 +2228,68 @@ function normalizeLocalTimeline(value = {}) {
   };
 }
 
-function normalizeLocalAccounting(value = {}) {
-  const models = array(value.byModel).slice(0, 32).flatMap((row) => {
+/**
+ * One model-usage row set, with the three facts a display surface needs to
+ * tell four different situations apart.
+ *
+ * `apiPriceEquivalentUsd` deliberately falls back to `null`, not `0`: a row
+ * that reported no usable figure is missing, and rendering it as a priced zero
+ * is a different and untrue claim.
+ */
+function normalizeLocalModelUsage(rows) {
+  return array(rows).slice(0, 32).flatMap((row) => {
     if (!LOCAL_MODELS.has(row?.model)) return [];
+    const allowanceTrack = LOCAL_MODEL_ALLOWANCE_TRACKS.has(row.allowanceTrack)
+      ? row.allowanceTrack
+      : "primary";
     return [{
       model: row.model,
       events: count(row.events, 0),
       totalTokens: count(row.totalTokens, 0),
-      apiPriceEquivalentUsd: nonNegative(row.apiPriceEquivalentUsd, 0)
+      apiPriceEquivalentUsd: nonNegative(row.apiPriceEquivalentUsd, null),
+      pricingStatus: LOCAL_MODEL_PRICING_STATUSES.has(row.pricingStatus)
+        ? row.pricingStatus
+        : (row.model === "unknown" ? "unrecognized" : "priced"),
+      allowanceTrack,
+      // A separate allowance is not substitutable for the primary pool, so no
+      // dollar comparison against it is honest. Only an explicit `false` or a
+      // Spark row withholds the figure.
+      apiPriceEquivalentApplicable:
+        row.apiPriceEquivalentApplicable !== false && allowanceTrack !== "spark"
     }];
   });
+}
+
+function normalizeLocalAccounting(value = {}) {
+  const models = normalizeLocalModelUsage(value.byModel);
+  // Both allowance tracks in one list, each row stating which track it belongs
+  // to. The local report already publishes this; dropping it here is what left
+  // the separately metered Spark allowance invisible on the model table.
+  const modelUsage = Array.isArray(value.modelUsage)
+    ? normalizeLocalModelUsage(value.modelUsage)
+    : [...models, ...normalizeLocalModelUsage(value?.spark?.byModel)];
   const normalized = {
-    periodId: ["24h", "7d", "30d", "all"].includes(value.periodId)
+    periodId: ["24h", "7d", "30d", "all", "history"].includes(value.periodId)
       ? value.periodId
       : "all",
     periodLabel: text(value.periodLabel, "Recorded period"),
     events: count(value.events, 0),
     totalTokens: count(value.totalTokens, 0),
     apiPriceEquivalentUsd: nonNegative(value.apiPriceEquivalentUsd, 0),
+    priceCardIds: array(value.priceCardIds)
+      .filter((id) => typeof id === "string" && id.length > 0)
+      .slice(0, 32),
+    priceCardBreakdown: array(value.priceCardBreakdown)
+      .flatMap((item) => (
+        typeof item?.priceCardId === "string"
+          && Number.isSafeInteger(item.events)
+          && item.events >= 0
+          && typeof item.costUsd === "string"
+          && /^\d+(?:\.\d+)?$/u.test(item.costUsd)
+          ? [{ priceCardId: item.priceCardId, events: item.events, costUsd: item.costUsd }]
+          : []
+      ))
+      .slice(0, 32),
     quotaWeightedApiPriceEquivalentUsd: nonNegative(
       value.quotaWeightedApiPriceEquivalentUsd,
       null
@@ -1998,6 +2304,7 @@ function normalizeLocalAccounting(value = {}) {
     components: normalizeLocalComponents(value.components),
     componentCosts: normalizeLocalComponentCosts(value.componentCosts),
     byModel: models,
+    modelUsage,
     bySpeed: normalizeAccountingDimension(
       value.bySpeed,
       new Set(["standard", "fast", "flex", "batch", "unknown"])
@@ -2043,6 +2350,7 @@ function normalizeLocalAccounting(value = {}) {
     reasoningEffortAvailable: value.reasoningEffortAvailable === true,
     accountingSource: text(value.accountingSource, "unknown"),
     accountingCacheStatus: text(value.accountingCacheStatus, "unknown"),
+    historyCoverage: normalizeHistoryCoverage(value.historyCoverage),
     replayExclusionDiagnostics: {
       filesScanned: count(value?.replayExclusionDiagnostics?.filesScanned, 0),
       forkReplayEventsExcluded: count(
@@ -2062,6 +2370,10 @@ function normalizeLocalAccounting(value = {}) {
         0
       )
     },
+    evidenceStartDate: typeof value.evidenceStartDate === "string"
+      && /^\d{4}-\d{2}-\d{2}$/u.test(value.evidenceStartDate)
+      ? value.evidenceStartDate
+      : null,
     generatedAt: text(value.generatedAt, ""),
     coveredAt: {
       startAt: text(value?.coveredAt?.startAt, ""),
@@ -2070,7 +2382,7 @@ function normalizeLocalAccounting(value = {}) {
     unknownModelEvents: count(value.unknownModelEvents, 0),
     periods: []
   };
-  normalized.periods = array(value.periods).slice(0, 4).map((period) => (
+  normalized.periods = array(value.periods).slice(0, 5).map((period) => (
     normalizeLocalAccounting({ ...period, periods: [] })
   ));
   return normalized;
@@ -2112,36 +2424,105 @@ function safeState(value, fallback = "insufficient") {
 function normalizeQuota(window, index) {
   const used = finite(window?.usedPercent ?? window?.used_percent ?? window?.used, null);
   const remaining = finite(window?.remainingPercent ?? window?.remaining_percent, used === null ? null : 100 - used);
-  const durationMinutes = finite(window?.durationMinutes ?? window?.duration_minutes ?? window?.windowMinutes, null);
-  const limitId = text(window?.limitId, "unknown");
-  const defaultLabel = durationMinutes === 300
-    ? "Five-hour allowance"
-    : limitId === "codex"
-      ? "Seven-day allowance"
-      : limitId === "codex_bengalfox"
-        ? "Secondary observed allowance"
-        : durationMinutes === 10080
-          ? "Provider-reported seven-day window"
-          : "Quota window";
+  const durationCandidate = finite(window?.durationMinutes ?? window?.duration_minutes ?? window?.windowMinutes, null);
+  const durationMinutes = isValidQuotaWindowDuration(durationCandidate)
+    ? durationCandidate
+    : null;
+  const limitId = normalizeQuotaLimitId(window?.limitId);
   return {
     id: text(window?.id ?? limitId, `quota-${index}`),
     limitId,
     slot: text(window?.slot, "unknown"),
-    label: text(window?.label, defaultLabel),
+    // Labels are fixed product copy. The raw label can be localized or
+    // provider-controlled, so it is never used to name or select a window.
+    label: quotaWindowLabel(limitId, durationMinutes),
     durationMinutes,
     usedPercent: used,
     remainingPercent: remaining,
     resetAt: text(window?.resetAt ?? window?.reset_at, ""),
     observedAt: text(window?.observedAt ?? window?.observed_at, ""),
     precision: finite(window?.precision ?? window?.displayPrecision, null),
-    planType: text(window?.planType ?? window?.plan_type, ""),
+    planType: normalizePlanType(window?.planType ?? window?.plan_type),
     accountAttribution: text(window?.accountAttribution, ""),
     status: safeState(window?.status, "live")
   };
 }
 
+function normalizeHistoryCoverage(value = {}) {
+  const phase = [
+    "complete",
+    "idle",
+    "awaiting_resume",
+    "not_started",
+    "invalid",
+  ].includes(value?.phase)
+    ? value.phase
+    : "not_started";
+  const sourceCount = count(value?.sourceCount, null);
+  const indexedSourceCount = count(value?.indexedSourceCount, null);
+  const pendingSourceCount = count(value?.pendingSourceCount, null);
+  const sourceBytes = count(value?.sourceBytes, null);
+  const indexedBytes = count(value?.indexedBytes, null);
+  const generatedAt = canonicalInstant(value?.generatedAt);
+  const coveredStartAt = canonicalInstant(value?.coveredAt?.startAt);
+  const coveredEndAt = canonicalInstant(value?.coveredAt?.endAt);
+  const errorCode = [
+    "archive_directory_entries",
+    "archive_rollout_files",
+    "archive_timeout",
+    "archive_interrupted",
+    "archive_disk_space",
+    "archive_storage_unavailable",
+    "archive_index_unavailable",
+  ].includes(value?.errorCode)
+    ? value.errorCode
+    : null;
+  const coherent = sourceCount !== null
+    && indexedSourceCount !== null
+    && pendingSourceCount !== null
+    && indexedSourceCount + pendingSourceCount === sourceCount
+    && sourceBytes !== null
+    && indexedBytes !== null
+    && indexedBytes <= sourceBytes;
+  // “Complete” is a claim about the whole archive, so a malformed or
+  // internally inconsistent browser payload must fail closed to partial.
+  const complete = value?.status === "complete"
+    && ["complete", "idle"].includes(phase)
+    && errorCode === null
+    && coherent
+    && indexedSourceCount === sourceCount
+    && pendingSourceCount === 0
+    && indexedBytes === sourceBytes
+    && generatedAt !== null
+    && coveredStartAt !== null
+    && coveredEndAt !== null
+    && Date.parse(coveredEndAt) >= Date.parse(coveredStartAt);
+  return {
+    status: complete ? "complete" : "partial",
+    phase,
+    sourceCount: sourceCount ?? 0,
+    indexedSourceCount: sourceCount === null || indexedSourceCount === null
+      ? 0
+      : Math.min(indexedSourceCount, sourceCount),
+    pendingSourceCount: sourceCount === null || pendingSourceCount === null
+      ? 0
+      : Math.min(pendingSourceCount, sourceCount),
+    sourceBytes: sourceBytes ?? 0,
+    indexedBytes: sourceBytes === null || indexedBytes === null
+      ? 0
+      : Math.min(indexedBytes, sourceBytes),
+    generatedAt: generatedAt ?? "",
+    errorCode,
+    coveredAt: {
+      startAt: coveredStartAt ?? "",
+      endAt: coveredEndAt ?? "",
+    },
+  };
+}
+
 function normalizePricing(pricing = {}) {
   const source = pricing?.components ?? pricing?.componentTotals ?? {};
+  const priceEpochBasis = text(pricing?.priceEpochBasis, "");
   const componentRows = Array.isArray(source)
     ? source
     : Object.entries(source).map(([name, value]) => ({
@@ -2162,16 +2543,44 @@ function normalizePricing(pricing = {}) {
     subscriptionSpeedIsSeparate: pricing?.subscriptionSpeedIsSeparate === true,
     registryVersion: text(pricing?.registryVersion, ""),
     registryObservedAt: text(pricing?.registryObservedAt, ""),
-    priceEpochBasis: text(pricing?.priceEpochBasis, ""),
+    evidenceStartDate: typeof pricing?.evidenceStartDate === "string"
+      && /^\d{4}-\d{2}-\d{2}$/u.test(pricing.evidenceStartDate)
+      ? pricing.evidenceStartDate
+      : null,
+    priceEpochBasis,
+    eventTimeHistoricalTotalUsdExact: typeof pricing?.eventTimeHistoricalTotalUsdExact === "string"
+      && /^\d+(?:\.\d+)?$/u.test(pricing.eventTimeHistoricalTotalUsdExact)
+      ? pricing.eventTimeHistoricalTotalUsdExact
+      : null,
+    currentPriceSensitivityTotalUsdExact: priceEpochBasis === "event_time_when_registry_has_effective_evidence"
+      ? null
+      : typeof pricing?.currentPriceSensitivityTotalUsdExact === "string"
+      && /^\d+(?:\.\d+)?$/u.test(pricing.currentPriceSensitivityTotalUsdExact)
+      ? pricing.currentPriceSensitivityTotalUsdExact
+      : null,
+    priceCardIds: array(pricing?.priceCardIds)
+      .filter((id) => typeof id === "string" && id.length > 0)
+      .slice(0, 32),
+    priceCardBreakdown: array(pricing?.priceCardBreakdown)
+      .flatMap((item) => (
+        typeof item?.priceCardId === "string"
+          && Number.isSafeInteger(item.events)
+          && item.events >= 0
+          && typeof item.costUsd === "string"
+          && /^\d+(?:\.\d+)?$/u.test(item.costUsd)
+          ? [{ priceCardId: item.priceCardId, events: item.events, costUsd: item.costUsd }]
+          : []
+      ))
+      .slice(0, 32),
+    mixedPriceCardWindows: pricing?.mixedPriceCardWindows === true,
     components: componentRows.slice(0, 12).map((row) => ({
       name: text(row?.name ?? row?.component, "Unknown"),
       tokens: finite(row?.tokens ?? row?.value, 0),
-      pricedTokens: finite(row?.pricedTokens, 0),
-      unpricedTokens: finite(row?.unpricedTokens, 0),
       costUsd: finite(row?.costUsd, null)
     })),
     accountingSource: text(pricing?.accountingSource, "unknown"),
     accountingCacheStatus: text(pricing?.accountingCacheStatus, "unknown"),
+    historyCoverage: normalizeHistoryCoverage(pricing?.historyCoverage),
     replayExclusionDiagnostics: {
       filesScanned: count(pricing?.replayExclusionDiagnostics?.filesScanned, 0),
       forkReplayEventsExcluded: count(
@@ -2209,17 +2618,153 @@ function normalizeGradient(payload = {}) {
   };
 }
 
+const WEEKLY_PACE_FORECAST_SCHEMA_VERSION = "local-weekly-pace-forecast-v0.1";
+const WEEKLY_PACE_FORECAST_STATUSES = new Set([
+  "unavailable",
+  "insufficient_observations",
+  "available",
+  "will_reach_reset_first"
+]);
+const WEEKLY_PACE_FORECAST_METHOD = "median_adjacent_quota_slope";
+
+function weeklyPaceNumber(value, {
+  minimum = Number.NEGATIVE_INFINITY,
+  maximum = Number.POSITIVE_INFINITY
+} = {}) {
+  if (value === null) return null;
+  return typeof value === "number"
+      && Number.isFinite(value)
+      && value >= minimum
+      && value <= maximum
+    ? value
+    : undefined;
+}
+
+function normalizeWeeklyPaceForecast(value) {
+  const expectedKeys = [
+    "schemaVersion",
+    "status",
+    "currentUsedPercent",
+    "remainingPercent",
+    "resetsAt",
+    "pace",
+    "observationCount",
+    "etaAt",
+    "hoursToExhaustion",
+    "hoursToReset"
+  ];
+  if (!hasExactKeys(value, expectedKeys)
+      || value.schemaVersion !== WEEKLY_PACE_FORECAST_SCHEMA_VERSION
+      || !WEEKLY_PACE_FORECAST_STATUSES.has(value.status)
+      || !hasExactKeys(value.pace, [
+        "method",
+        "sampleCount",
+        "elapsedHours",
+        "movementPp",
+        "percentagePointsPerHour"
+      ])) return null;
+  const currentUsedPercent = weeklyPaceNumber(value.currentUsedPercent, {
+    minimum: 0,
+    maximum: 100
+  });
+  const remainingPercent = weeklyPaceNumber(value.remainingPercent, {
+    minimum: 0,
+    maximum: 100
+  });
+  const elapsedHours = weeklyPaceNumber(value.pace.elapsedHours, { minimum: 0 });
+  const movementPp = weeklyPaceNumber(value.pace.movementPp, { minimum: 0 });
+  const percentagePointsPerHour = weeklyPaceNumber(
+    value.pace.percentagePointsPerHour,
+    { minimum: 0, maximum: 100 }
+  );
+  const hoursToExhaustion = weeklyPaceNumber(value.hoursToExhaustion, {
+    minimum: 0
+  });
+  const hoursToReset = weeklyPaceNumber(value.hoursToReset, { minimum: 0 });
+  const resetsAt = value.resetsAt === null ? null : canonicalInstant(value.resetsAt);
+  const etaAt = value.etaAt === null ? null : canonicalInstant(value.etaAt);
+  if (currentUsedPercent === undefined
+      || remainingPercent === undefined
+      || elapsedHours === undefined
+      || movementPp === undefined
+      || percentagePointsPerHour === undefined
+      || hoursToExhaustion === undefined
+      || hoursToReset === undefined
+      || (value.resetsAt !== null && resetsAt === null)
+      || (value.etaAt !== null && etaAt === null)
+      || (value.pace.method !== null
+        && value.pace.method !== WEEKLY_PACE_FORECAST_METHOD)
+      || !Number.isSafeInteger(value.pace.sampleCount)
+      || value.pace.sampleCount < 0
+      || value.pace.sampleCount >= 8_192
+      || !Number.isSafeInteger(value.observationCount)
+      || value.observationCount < 0
+      || value.observationCount > 8_192) return null;
+  if (value.status === "available") {
+    if (currentUsedPercent === null
+        || remainingPercent === null
+        || resetsAt === null
+        || etaAt === null
+        || percentagePointsPerHour === null
+        || percentagePointsPerHour <= 0
+        || hoursToExhaustion === null
+        || hoursToReset === null
+        || Date.parse(etaAt) >= Date.parse(resetsAt)) return null;
+  } else if (etaAt !== null || hoursToExhaustion !== null) {
+    return null;
+  }
+  return {
+    schemaVersion: WEEKLY_PACE_FORECAST_SCHEMA_VERSION,
+    status: value.status,
+    currentUsedPercent,
+    remainingPercent,
+    resetsAt,
+    pace: {
+      method: value.pace.method,
+      sampleCount: value.pace.sampleCount,
+      elapsedHours,
+      movementPp,
+      percentagePointsPerHour
+    },
+    observationCount: value.observationCount,
+    etaAt,
+    hoursToExhaustion,
+    hoursToReset
+  };
+}
+
 function normalizeWeekly(payload = {}) {
   const envelope = payload?.weekly ?? payload;
   const source = artifactData(envelope);
+  const weeklyValues = array(source.weeklyValues ?? source.weekly_values)
+    .map((row) => ({
+      ...row,
+      priceCardIds: array(row?.priceCardIds ?? row?.price_card_ids)
+        .filter((id) => typeof id === "string" && id.length > 0)
+        .slice(0, 32),
+      priceCardBreakdown: array(row?.priceCardBreakdown ?? row?.price_card_breakdown)
+        .flatMap((item) => {
+          if (typeof item?.priceCardId !== "string"
+              || !/^\d+(?:\.\d+)?$/u.test(item?.costUsd ?? "")
+              || !Number.isSafeInteger(item?.events)
+              || item.events < 0) return [];
+          return [{
+            priceCardId: item.priceCardId,
+            events: item.events,
+            costUsd: item.costUsd,
+          }];
+        })
+        .slice(0, 32),
+    }));
   return {
     summary: array(source.summary)[0] ?? source.summary ?? {},
-    weeklyValues: array(source.weeklyValues ?? source.weekly_values),
+    weeklyValues,
     valueSeries: array(source.valueSeries ?? source.value_series),
     holdoutSeries: array(source.holdoutSeries ?? source.holdout_series),
     errorConcentration: array(source.errorConcentration ?? source.error_concentration),
     providerEpochs: array(source.providerEpochs ?? source.provider_epochs),
     dataClass: text(envelope?.dataClass, ""),
+    paceForecast: normalizeWeeklyPaceForecast(envelope?.paceForecast),
     accountAttribution: {
       status: text(envelope?.accountAttribution?.status, ""),
       maySpanMultipleAccounts:
@@ -2270,7 +2815,14 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
       status: state,
       latestObservedAt: text(freshness?.latestObservedAt ?? overview?.latestObservedAt ?? overview?.latestEvidenceAt, ""),
       ageSeconds: finite(freshness?.ageSeconds ?? freshness?.age_seconds, null),
-      staleAfterSeconds: finite(freshness?.staleAfterSeconds, null)
+      staleAfterSeconds: finite(freshness?.staleAfterSeconds, null),
+      // The companion reports one overall freshness verdict, and a stale
+      // cached accounting result makes that verdict "stale" even while the
+      // newest collector observation is seconds old. Both parts are published;
+      // keeping this one lets the page name what is actually stale instead of
+      // telling a reader their observation is old when it is not.
+      accountingStatus: text(freshness?.accountingStatus, ""),
+      accountingAgeSeconds: finite(freshness?.accountingAgeSeconds, null)
     },
     quotaWindows,
     activity: {
@@ -2278,8 +2830,8 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
       usageEvents: overview?.activity?.usageEvents ?? selectedUsage?.events,
       totalTokens: overview?.activity?.totalTokens ?? selectedUsage?.totalTokens
     },
-    usagePeriods: usagePeriods.slice(0, 4).map((period) => ({
-      id: ["24h", "7d", "30d", "all"].includes(period?.id) ? period.id : "all",
+    usagePeriods: usagePeriods.slice(0, 5).map((period) => ({
+      id: ["24h", "7d", "30d", "all", "history"].includes(period?.id) ? period.id : "all",
       label: text(period?.label, "Recorded period"),
       events: count(period?.events, 0),
       totalTokens: count(period?.totalTokens, 0),
@@ -2473,18 +3025,37 @@ export function normalizeBackendReadiness(payload) {
 
 export class LocalCompanionClient {
   constructor({ fetchImpl = globalThis.fetch } = {}) {
-    this.fetchImpl = fetchImpl;
+    // Browser-native fetch is receiver-sensitive: invoked as a property of
+    // this client it throws "Illegal invocation" (WebKit: "Can only call
+    // Window.fetch on instances of Window") before any request leaves the
+    // page. Hold a detached wrapper so every method may call
+    // this.fetchImpl(...) directly.
+    this.fetchImpl = (...args) => fetchImpl(...args);
+    // Set once the companion has answered 404/405 for the consolidated
+    // endpoint, so the negotiation is not repeated on every later load.
+    this.consolidatedUnavailable = false;
   }
 
   async load() {
-    try {
-      const [status, dashboard] = await Promise.all([
-        fetchJson(this.fetchImpl, `${LOCAL_ROOT}/v1/status`).catch(() => null),
-        fetchJson(this.fetchImpl, `${LOCAL_ROOT}/v1/dashboard`)
-      ]);
-      return normalizeDashboardPayload({ ...dashboard, status: dashboard?.status ?? status?.status });
-    } catch (error) {
-      if (![404, 405].includes(error.status)) throw error;
+    // The consolidated endpoint is a supported companion capability, not dead
+    // code, so the probe stays. What does not need to stay is re-asking on
+    // every single load: a companion that serves only the split fragments
+    // answered 404 the first time and will answer 404 every time, and each
+    // repeat cost two round-trips and put two errors in the console where they
+    // masked real ones. The answer is remembered for the life of this client,
+    // which is a page load - a companion that gains the endpoint is picked up
+    // on the next one.
+    if (!this.consolidatedUnavailable) {
+      try {
+        const [status, dashboard] = await Promise.all([
+          fetchJson(this.fetchImpl, `${LOCAL_ROOT}/v1/status`).catch(() => null),
+          fetchJson(this.fetchImpl, `${LOCAL_ROOT}/v1/dashboard`)
+        ]);
+        return normalizeDashboardPayload({ ...dashboard, status: dashboard?.status ?? status?.status });
+      } catch (error) {
+        if (![404, 405].includes(error.status)) throw error;
+        this.consolidatedUnavailable = true;
+      }
     }
 
     const paths = ["overview", "gradient", "weekly", "quality", "reports"];
@@ -2524,6 +3095,31 @@ export class LocalCompanionClient {
 
   refreshStatus() {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh`);
+  }
+
+  /**
+   * The per-model / per-speed cost mix for one bounded [fromMs, toMs] window,
+   * repriced from the unified local index by the companion. Used to explain a
+   * detected divergence period with its own contributor mix. A companion that
+   * predates the route (404/405) reads back as an unavailable breakdown rather
+   * than throwing, so the panel degrades to its range-level context.
+   */
+  async windowBreakdown(fromMs, toMs) {
+    if (!Number.isSafeInteger(fromMs) || !Number.isSafeInteger(toMs)) {
+      return normalizeWindowBreakdown(null);
+    }
+    const query = new URLSearchParams({ from: String(fromMs), to: String(toMs) });
+    try {
+      return normalizeWindowBreakdown(await fetchJson(
+        this.fetchImpl,
+        `${LOCAL_ROOT}/timeline/window-breakdown?${query}`,
+      ));
+    } catch (error) {
+      if ([400, 404, 405].includes(error?.status)) {
+        return normalizeWindowBreakdown(null);
+      }
+      throw error;
+    }
   }
 
   async cancelRefresh() {
@@ -2671,6 +3267,25 @@ export class LocalCompanionClient {
     }
   }
 
+  /**
+   * The bounded status of the approved incremental full-history sync: the
+   * durable consent verdict, day-count progress, the paused reason and the
+   * last outcome, every code from a fixed vocabulary. A GET with no side
+   * effects; a failed read normalizes to the fail-closed unavailable shape.
+   */
+  async incrementalContributionSyncStatus() {
+    try {
+      return normalizeIncrementalContributionSyncStatus(
+        await fetchJson(
+          this.fetchImpl,
+          `${LOCAL_ROOT}/contribution/incremental-status`
+        )
+      );
+    } catch {
+      return normalizeIncrementalContributionSyncStatus(null);
+    }
+  }
+
   async pairContributionDevice(pairingCode) {
     const response = await this.fetchImpl(
       `${LOCAL_ROOT}/contribution/device-pair`,
@@ -2753,8 +3368,51 @@ export class LocalCompanionClient {
     return normalizeLocalContributionDeviceReset(payload);
   }
 
+  /**
+   * Stop this Mac's upload-only authority. Unlike the local repair above,
+   * this is a two-sided transaction: the companion first revokes the remote
+   * device bearer using the Keychain secret it alone can read, then pauses
+   * local delivery and clears that exact local binding. It does not delete
+   * already accepted hosted metadata or the browser's hosted session.
+   */
+  async disconnectContributionDevice() {
+    const response = await this.fetchImpl(
+      `${LOCAL_ROOT}/contribution/device-disconnect`,
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1"
+        },
+        body: JSON.stringify({ confirm: "disconnect_this_mac" })
+      }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) throw localCompanionRequestError(response, payload);
+    return normalizeLocalContributionDeviceDisconnect(payload);
+  }
+
   contributionSyncExactReview() {
     return this.localContributionMutation("sync-inspect-exact");
+  }
+
+  /**
+   * Record the approve-once consent for the incremental full-history
+   * contribution model (telemetry-contribution-v1.0). The route is fixed and
+   * only ever called when the companion's health payload advertises the v1.0
+   * sync capability; the review token proves one verified real instance of
+   * the covered data was on screen, which is the first-run review-bootstrap
+   * requirement carried into the approve-once model.
+   */
+  async approveIncrementalContribution(reviewToken) {
+    if (typeof reviewToken !== "string"
+        || !/^[A-Za-z0-9_-]{43}$/u.test(reviewToken)) {
+      throw new TypeError("Incremental consent requires a valid review token.");
+    }
+    return this.localContributionMutation("incremental-approve", {
+      reviewToken,
+    });
   }
 
   localContributionMutation(path, body = {}) {
@@ -2827,7 +3485,9 @@ export class CommunityClient {
     getCsrfToken = () => null,
     getParticipantId = () => null
   } = {}) {
-    this.fetchImpl = fetchImpl;
+    // Detached for the same reason as LocalCompanionClient: browser-native
+    // fetch throws when invoked with this client as its receiver.
+    this.fetchImpl = (...args) => fetchImpl(...args);
     this.getCsrfToken = getCsrfToken;
     this.getParticipantId = getParticipantId;
     this.pendingRecovery = null;
@@ -2856,10 +3516,7 @@ export class CommunityClient {
   }
 
   async readiness() {
-    // Browser-native fetch is receiver-sensitive. Calling it as a property of
-    // this client can throw "Illegal invocation" before any request is made.
-    const fetchImpl = this.fetchImpl;
-    const response = await fetchImpl("/api/ready", {
+    const response = await this.fetchImpl("/api/ready", {
       headers: { Accept: "application/json" }
     });
     if (![200, 503].includes(response.status)) {
@@ -2903,7 +3560,8 @@ export class CommunityClient {
     if (identity !== null) {
       body.identity = {
         provider: identity.provider,
-        proof: identity.proof
+        proof: identity.proof,
+        verifier: identity.verifier
       };
     }
     if (typeof inviteCode === "string" && inviteCode.length > 0) body.inviteCode = inviteCode;
@@ -2924,8 +3582,8 @@ export class CommunityClient {
     return startHostedSignIn(this.fetchImpl, "google");
   }
 
-  async identityGoogleResult(state) {
-    return readHostedSignInResult(this.fetchImpl, "google", state);
+  async identityGoogleResult(state, verifier) {
+    return readHostedSignInResult(this.fetchImpl, "google", state, verifier);
   }
 
   /**
@@ -2937,8 +3595,8 @@ export class CommunityClient {
     return startHostedSignIn(this.fetchImpl, "apple");
   }
 
-  async identityAppleResult(state) {
-    return readHostedSignInResult(this.fetchImpl, "apple", state);
+  async identityAppleResult(state, verifier) {
+    return readHostedSignInResult(this.fetchImpl, "apple", state, verifier);
   }
 
   async recover(recoveryCode) {
@@ -3076,9 +3734,17 @@ export class CommunityClient {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        // Re-pinned 2026-08-08 (v1.0 wiring): a telemetry participant's
+        // pairing requests the v1.0 incremental consent identifier. The
+        // Worker pins it on the pairing, and the companion's CLAIM of that
+        // pairing is what records the server-side consent-once grant that
+        // every v1.0 chunk upload is verified against — a pairing still
+        // carrying "ongoing-privacy-safe-telemetry-v0.1" leaves every upload
+        // refused 403 TELEMETRY_CONSENT_INVALID. The account-scoped preview
+        // keeps its own single identifier.
         consentVersion: accountScoped
           ? "ongoing-privacy-safe-telemetry-v0.2"
-          : "ongoing-privacy-safe-telemetry-v0.1",
+          : "ongoing-privacy-safe-telemetry-v1.0",
         ongoingUpload: true
       })
     }));
@@ -3225,7 +3891,7 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
       observedAt: iso(observedMs),
       usedPercent: Number((100 - remainingPercent).toFixed(1)),
       remainingPercent,
-      durationMinutes: 10_080,
+      durationMinutes: CODEX_WEEKLY_ALLOWANCE_MINUTES,
       resetAt: iso(sinceResetMs >= 0 ? lastResetMs + 7 * DAY : lastResetMs),
       limitId: "codex",
       slot: "primary",
@@ -3260,8 +3926,6 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
       components: componentTokens,
       componentCosts: Object.fromEntries(Object.entries(componentTokens).map(([key, count]) => [key, {
         tokens: count,
-        pricedTokens: Math.round(count * .97),
-        unpricedTokens: count - Math.round(count * .97),
         costUsd: Number((cost * ({
           input_uncached_tokens: .458,
           input_cache_read_tokens: .1535,
@@ -3271,12 +3935,24 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
           output_combined_tokens: 0
         })[key]).toFixed(2))
       }])),
+      // The labeled demo carries every model-row state the real payload can
+      // produce, so the model table can be reviewed without waiting for a
+      // matching day of real usage.
       byModel: [
-        { model: "gpt-5.6-sol", events: Math.round(events * .62), totalTokens: Math.round(tokens * .64), apiPriceEquivalentUsd: Number((cost * .66).toFixed(2)) },
-        { model: "gpt-5.6-terra", events: Math.round(events * .18), totalTokens: Math.round(tokens * .19), apiPriceEquivalentUsd: Number((cost * .21).toFixed(2)) },
-        { model: "gpt-5.4-mini", events: Math.round(events * .15), totalTokens: Math.round(tokens * .13), apiPriceEquivalentUsd: Number((cost * .09).toFixed(2)) },
-        { model: "unknown", events: Math.round(events * .05), totalTokens: Math.round(tokens * .04), apiPriceEquivalentUsd: 0 }
+        { model: "gpt-5.6-sol", events: Math.round(events * .62), totalTokens: Math.round(tokens * .64), apiPriceEquivalentUsd: Number((cost * .66).toFixed(2)), pricingStatus: "priced", allowanceTrack: "primary", apiPriceEquivalentApplicable: true },
+        { model: "gpt-5.6-terra", events: Math.round(events * .18), totalTokens: Math.round(tokens * .19), apiPriceEquivalentUsd: Number((cost * .21).toFixed(2)), pricingStatus: "priced", allowanceTrack: "primary", apiPriceEquivalentApplicable: true },
+        { model: "gpt-5.4-mini", events: Math.round(events * .15), totalTokens: Math.round(tokens * .13), apiPriceEquivalentUsd: Number((cost * .09).toFixed(2)), pricingStatus: "priced", allowanceTrack: "primary", apiPriceEquivalentApplicable: true },
+        // Recognised, and deliberately carries no published price card.
+        { model: "codex-auto-review", events: Math.round(events * .04), totalTokens: Math.round(tokens * .02), apiPriceEquivalentUsd: 0, pricingStatus: "known_unpriced", allowanceTrack: "primary", apiPriceEquivalentApplicable: true },
+        { model: "unknown", events: Math.round(events * .05), totalTokens: Math.round(tokens * .04), apiPriceEquivalentUsd: 0, pricingStatus: "unrecognized", allowanceTrack: "primary", apiPriceEquivalentApplicable: true }
       ],
+      // Metered against its own subscription allowance, so it is kept out of
+      // the primary pool's totals and quotes no API-price equivalent.
+      spark: {
+        byModel: [
+          { model: "gpt-5.3-codex-spark", events: Math.round(events * .21), totalTokens: Math.round(tokens * .07), apiPriceEquivalentUsd: 0, pricingStatus: "known_unpriced", allowanceTrack: "spark", apiPriceEquivalentApplicable: false }
+        ]
+      },
       bySpeed: accountingDimension(total, { standard: .78, fast: .13, unknown: .09 }),
       byApiServiceTier: accountingDimension(total, { standard: .97, unknown: .03 }),
       bySurface: accountingDimension(total, {
@@ -3323,7 +3999,7 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
       demoAccountingPeriod("24h", "Last 24 hours", .131),
       demoAccountingPeriod("7d", "Last 7 days", 1),
       demoAccountingPeriod("30d", "Last 30 days", 2.15),
-      demoAccountingPeriod("all", "All retained evidence", 2.62)
+      demoAccountingPeriod("all", "Cached 31-day window", 2.62)
     ]
   };
   return normalizeDashboardPayload({
@@ -3333,8 +4009,8 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
     generatedAt: nowIso,
     freshness: { status: "demo", latestObservedAt: nowIso, ageSeconds: 0 },
     quotaWindows: [
-      { id: "weekly", label: "Seven-day allowance", durationMinutes: 10080, usedPercent: 39, remainingPercent: 61, resetAt: iso(lastResetMs + 7 * DAY), observedAt: nowIso, planType: "pro", status: "demo" },
-      { id: "primary", label: "Five-hour allowance", durationMinutes: 300, usedPercent: 18, remainingPercent: 82, resetAt: iso(nowMs + 2 * HOUR + 11 * 60_000), observedAt: nowIso, planType: "pro", status: "demo" }
+      { id: "weekly", limitId: CODEX_PRIMARY_LIMIT_ID, durationMinutes: CODEX_WEEKLY_ALLOWANCE_MINUTES, usedPercent: 39, remainingPercent: 61, resetAt: iso(lastResetMs + 7 * DAY), observedAt: nowIso, planType: "pro", status: "demo" },
+      { id: "primary", limitId: CODEX_PRIMARY_LIMIT_ID, durationMinutes: CODEX_FIVE_HOUR_ALLOWANCE_MINUTES, usedPercent: 18, remainingPercent: 82, resetAt: iso(nowMs + 2 * HOUR + 11 * 60_000), observedAt: nowIso, planType: "pro", status: "demo" }
     ],
     activity: { eventCount: 8120, safeRecordCount: 11432, lastScanAt: nowIso },
     timeline: {
@@ -3379,7 +4055,7 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
         { dimension: "Account scope known", coverage_fraction: .12 }
       ],
       opportunities: [
-        { priority: "P0", title: "Unknown model tokens", evidence: "Some historical events cannot be matched to a current API price card." },
+        { priority: "P0", title: "Unknown model tokens", evidence: "Some historical events cannot be matched to an official API price card." },
         { priority: "P0", title: "Integer quota display", evidence: "Quota observations are rounded to whole percentage points." },
         { priority: "P1", title: "Shared agentic surfaces", evidence: "Work, Workspace Agents, and Voice task work may draw from the same pool." },
         { priority: "P1", title: "Fast-mode attribution", evidence: "Historical records do not always identify the subscription speed tier." }

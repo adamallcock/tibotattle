@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "tibotattle-localization-v2",
+  "table": "Localizable",
+  "fallbackLocale": "en-US",
+  "defaultLocale": "en-US",
+  "supportedLocales": [
+    "en-US",
+    "zh-Hans",
+    "es"
+  ],
+  "preference": "system-or-user-override",
+  "webResourceRoot": "./localization"
+}

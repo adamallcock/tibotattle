@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 
-import { chmod, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
   analyzeFastDiagnostic,
   analyzeSimpleQuotaGradient,
   summarizeSlotSemantics,
 } from "./simple-quota-gradient.js";
+import {
+  localLegacyReportPath,
+  writeLocalLegacyReport,
+} from "./local-legacy-report-storage.js";
 
 const root = process.cwd();
 const recentPath = resolve(root, ".usage-monitor/transitions-simple-current-2026-07-24-v0.3.2.json");
@@ -14,7 +18,7 @@ const historyPath = resolve(root, ".usage-monitor/weekly-limit-simple-history-20
 const historyTransitionsPath = resolve(root, ".usage-monitor/transitions-simple-history-2026-06-11-to-2026-07-24-v0.3.2.json");
 const fastDiagnosticPath = resolve(root, ".usage-monitor/transitions-fast-diagnostic-2026-07-13-v0.3.2.json");
 const rollingHistoryPath = resolve(root, ".usage-monitor/rolling-quota-history-2026-06-11-to-2026-07-24-v0.1.json");
-const outputPath = resolve(root, "2026-07-24-simple-quota-gradient-artifact.json");
+const outputPath = localLegacyReportPath(root, "2026-07-24-simple-quota-gradient-artifact.json");
 
 const recent = JSON.parse(await readFile(recentPath, "utf8"));
 const history = JSON.parse(await readFile(historyPath, "utf8"));
@@ -785,6 +789,5 @@ const artifact = {
   ],
 };
 
-await writeFile(outputPath, `${JSON.stringify(artifact, null, 2)}\n`, "utf8");
-await chmod(outputPath, 0o600);
+await writeLocalLegacyReport(root, "2026-07-24-simple-quota-gradient-artifact.json", `${JSON.stringify(artifact, null, 2)}\n`);
 process.stdout.write(`${JSON.stringify({ outputPath, generatedAt, selectedReset: selected, gradient, history: historySummary }, null, 2)}\n`);

@@ -3,8 +3,34 @@ import { applyD1Migrations, reset } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import { appleClientSecret } from "../src/identity-apple";
+import {
+  APPLE_SIGNIN_NONCE_PATTERN,
+  appleClientSecret,
+  exchangeAppleAuthorizationCode,
+  hashAppleSignInNonce,
+} from "../src/identity-apple";
+import {
+  claimPendingAppleSignInHandoff,
+  completeAppleSignInHandoff,
+  deliverAppleSignInHandoff,
+  insertAppleSignInHandoff,
+  readPendingAppleSignInHandoff,
+} from "../src/identity-handoff-repository";
+import { sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
+
+// The initiating client generates an unguessable verifier and sends only its
+// SHA-256 digest to the start route; it re-presents the raw verifier to collect
+// and to consume the result. These helpers model that client.
+function newSignInVerifier(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(48));
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary)
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/u, "");
+}
 
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -50,6 +76,7 @@ function bindings(overrides: Record<string, unknown> = {}): Env {
     QUARANTINE: runtime.QUARANTINE,
     PUBLIC_READ_RATE_LIMIT: runtime.PUBLIC_READ_RATE_LIMIT,
     RECOVERY_RATE_LIMIT: runtime.RECOVERY_RATE_LIMIT,
+    SIGN_IN_START_MAX_PER_MINUTE: "1200",
     USAGE_MONITOR_DB: runtime.USAGE_MONITOR_DB,
     APPLE_SERVICES_ID: SERVICES_ID,
     APPLE_TEAM_ID: TEAM_ID,
@@ -103,10 +130,15 @@ async function callback(
   );
 }
 
-async function startSignIn(): Promise<{ state: string; authorizeUrl: string }> {
-  const response = await json("/api/v1/identity/apple/start", {});
+async function startSignIn(): Promise<
+  { state: string; authorizeUrl: string; verifier: string }
+> {
+  const verifier = newSignInVerifier();
+  const binding = await sha256Hex(verifier);
+  const response = await json("/api/v1/identity/apple/start", { binding });
   expect(response.status).toBe(200);
-  return response.json<{ state: string; authorizeUrl: string }>();
+  const payload = await response.json<{ state: string; authorizeUrl: string }>();
+  return { ...payload, verifier };
 }
 
 beforeAll(async () => {
@@ -164,6 +196,130 @@ afterEach(() => {
 });
 
 describe("web Sign in with Apple", () => {
+  it("keeps handoff storage digest-only and enforces callback/result one-use predicates", async () => {
+    const db = bindings().USAGE_MONITOR_DB;
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const state = "repository-test-state";
+    const nonceHash = "a".repeat(64);
+    const linkKey = "b".repeat(64);
+    const proof = "c".repeat(64);
+    const bindingHash = "e".repeat(64);
+    await insertAppleSignInHandoff(db, {
+      state,
+      nonceHash,
+      bindingHash,
+      createdAt: nowIso,
+      expiresAt: new Date(nowMs + 60_000).toISOString(),
+    });
+    expect(await readPendingAppleSignInHandoff(db, state, nowIso)).toEqual({
+      state,
+      nonceHash,
+    });
+    // The binding gates the pending read: a wrong verifier digest cannot even
+    // learn that a sign-in is pending.
+    expect(
+      await readPendingAppleSignInHandoff(db, state, nowIso, "f".repeat(64)),
+    ).toBeNull();
+    expect(
+      await readPendingAppleSignInHandoff(db, state, nowIso, bindingHash),
+    ).toEqual({ state, nonceHash });
+    // The callback atomically claims the pending row before any provider work.
+    const claimId = "1".repeat(64);
+    const staleClaimBefore = new Date(nowMs - 60_000).toISOString();
+    expect(await claimPendingAppleSignInHandoff(
+      db,
+      state,
+      claimId,
+      nowIso,
+      staleClaimBefore,
+    )).toEqual({ state, nonceHash });
+    // A concurrent callback cannot re-claim the row while the lease is live.
+    expect(await claimPendingAppleSignInHandoff(
+      db,
+      state,
+      "2".repeat(64),
+      nowIso,
+      staleClaimBefore,
+    )).toBeNull();
+    // The row was inserted with a 60s authorization window that is nearly
+    // spent; filling it hands the freshly minted proof its own window.
+    const deliveryExpiresAt = new Date(nowMs + 300_000).toISOString();
+    // Completion is fenced to the claim: a wrong claim id writes nothing.
+    expect(await completeAppleSignInHandoff(
+      db,
+      state,
+      "2".repeat(64),
+      linkKey,
+      proof,
+      nowIso,
+      deliveryExpiresAt,
+    )).toBe(false);
+    expect(await completeAppleSignInHandoff(
+      db,
+      state,
+      claimId,
+      linkKey,
+      proof,
+      nowIso,
+      deliveryExpiresAt,
+    )).toBe(true);
+    expect(await db.prepare(
+      "SELECT expires_at AS expiresAt FROM apple_signin_handoffs WHERE state = ?",
+    ).bind(state).first<{ expiresAt: string }>()).toEqual({
+      expiresAt: deliveryExpiresAt,
+    });
+    expect(await completeAppleSignInHandoff(
+      db,
+      state,
+      claimId,
+      linkKey,
+      "d".repeat(64),
+      nowIso,
+      deliveryExpiresAt,
+    )).toBe(false);
+    // A deadline that is not strictly after the mint would let a proof exist
+    // that was never collectable, so the storage boundary refuses it outright.
+    await expect(completeAppleSignInHandoff(
+      db,
+      `${state}-backdated`,
+      claimId,
+      linkKey,
+      "f".repeat(64),
+      nowIso,
+      nowIso,
+    )).rejects.toThrow();
+    // A wrong verifier digest neither delivers the proof nor marks the row
+    // consumed, so the correct binding can still collect it exactly once.
+    expect(
+      await deliverAppleSignInHandoff(db, state, nowIso, "f".repeat(64)),
+    ).toBeNull();
+    expect(await deliverAppleSignInHandoff(db, state, nowIso, bindingHash))
+      .toEqual({ proof });
+    expect(await deliverAppleSignInHandoff(db, state, nowIso, bindingHash))
+      .toBeNull();
+
+    const stored = await db.prepare(
+      "SELECT nonce_hash AS nonceHash, identity_link_key AS linkKey, proof FROM apple_signin_handoffs WHERE state = ?",
+    ).bind(state).first<{ nonceHash: string; linkKey: string; proof: string }>();
+    expect(stored).toEqual({ nonceHash, linkKey, proof });
+    expect(JSON.stringify(stored)).not.toContain("repository-test-raw-nonce");
+
+    // A pre-nonce handoff shape cannot be reintroduced after migration: rows
+    // without the digest fail at the storage boundary and must be restarted.
+    await expect(db.prepare(
+      `INSERT INTO apple_signin_handoffs
+         (state, identity_link_key, proof, created_at, expires_at, delivered_at)
+       VALUES (?, ?, ?, ?, ?, NULL)`,
+    ).bind(
+      "legacy-shape",
+      linkKey,
+      "e".repeat(64),
+      nowIso,
+      new Date(nowMs + 60_000).toISOString(),
+    ).run()).rejects.toThrow();
+  });
+
   it("mints an ES256 client secret with Apple's required claims and leaks no key", async () => {
     const secret = await appleClientSecret(bindings(), 1_800_000_000_000);
     const [headerSegment, claimSegment, signatureSegment] = secret.split(".");
@@ -187,12 +343,40 @@ describe("web Sign in with Apple", () => {
     expect(secret.includes("PRIVATE KEY")).toBe(false);
   });
 
+  it("fails closed and aborts a token exchange that outlives the callback budget", async () => {
+    let aborted = false;
+    globalThis.fetch = (async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      init?.signal?.addEventListener("abort", () => {
+        aborted = true;
+      }, { once: true });
+      return new Promise<Response>(() => {});
+    }) as typeof fetch;
+
+    await expect(exchangeAppleAuthorizationCode(
+      bindings(),
+      "apple-hung-provider-code",
+      CALLBACK_URL,
+      Date.now(),
+      { timeoutMilliseconds: 1 },
+    )).rejects.toMatchObject({
+      status: 401,
+      code: "IDENTITY_TOKEN_INVALID",
+    });
+    expect(aborted).toBe(true);
+  });
+
   it("carries a start, an Apple callback, and a single-use result end to end", async () => {
     const started = await startSignIn();
     expect(started.state).toMatch(/^[A-Za-z0-9_-]{64}$/u);
     const authorize = new URL(started.authorizeUrl);
     expect(authorize.origin + authorize.pathname)
       .toBe("https://appleid.apple.com/auth/authorize");
+    const nonce = authorize.searchParams.get("nonce");
+    expect(nonce).toMatch(APPLE_SIGNIN_NONCE_PATTERN);
+    expect(nonce).toHaveLength(43);
     expect(Object.fromEntries(authorize.searchParams)).toEqual({
       client_id: SERVICES_ID,
       redirect_uri: CALLBACK_URL,
@@ -200,10 +384,12 @@ describe("web Sign in with Apple", () => {
       scope: "",
       response_mode: "form_post",
       state: started.state,
+      nonce,
     });
 
     const pending = await json("/api/v1/identity/apple/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     expect(pending.status).toBe(404);
     expect(await pending.json()).toMatchObject({
@@ -233,6 +419,7 @@ describe("web Sign in with Apple", () => {
       "apple-one-time-code",
       APPLE_ID_TOKEN,
       started.state,
+      nonce!,
       "Real",
       "Name",
     ]) {
@@ -250,6 +437,7 @@ describe("web Sign in with Apple", () => {
 
     const result = await json("/api/v1/identity/apple/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     expect(result.status).toBe(200);
     const resultPayload = await result.json();
@@ -263,30 +451,36 @@ describe("web Sign in with Apple", () => {
     // indistinguishable from an expired handoff.
     const replay = await json("/api/v1/identity/apple/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     expect(replay.status).toBe(401);
     expect(await replay.json()).toMatchObject({
       error: { code: "IDENTITY_TOKEN_INVALID" },
     });
 
-    // Neither Apple's optional user payload nor the raw provider credential is
-    // persisted anywhere. The short-lived row contains an opaque proof only.
+    // Neither Apple's optional user payload, raw provider credential, nor raw
+    // nonce is persisted anywhere. The short-lived row contains only the
+    // nonce digest, verified link key, and opaque proof needed for handoff.
     const stored = await bindings().USAGE_MONITOR_DB.prepare(
-      `SELECT state, identity_link_key AS linkKey, proof, delivered_at AS deliveredAt
+      `SELECT state, nonce_hash AS nonceHash, identity_link_key AS linkKey, proof, delivered_at AS deliveredAt
          FROM apple_signin_handoffs`,
     ).all<{
       state: string;
+      nonceHash: string;
       linkKey: string;
       proof: string;
       deliveredAt: string | null;
     }>();
     expect(stored.results).toHaveLength(1);
+    expect(stored.results[0]?.nonceHash).toBe(await hashAppleSignInNonce(nonce!));
+    expect(stored.results[0]?.nonceHash).not.toContain(nonce!);
     expect(stored.results[0]?.linkKey).toMatch(/^[0-9a-f]{64}$/u);
     expect(stored.results[0]?.proof).toMatch(/^[A-Za-z0-9_-]{64}$/u);
     expect(stored.results[0]?.deliveredAt).not.toBeNull();
     const serializedStored = JSON.stringify(stored.results);
     expect(serializedStored).not.toContain("Real");
     expect(serializedStored).not.toContain(APPLE_ID_TOKEN);
+    expect(serializedStored).not.toContain(nonce!);
   });
 
   it("expires an unread handoff and refuses the expired state", async () => {
@@ -308,6 +502,7 @@ describe("web Sign in with Apple", () => {
 
     const result = await json("/api/v1/identity/apple/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     expect(result.status).toBe(401);
     expect(await result.json()).toMatchObject({
@@ -337,10 +532,89 @@ describe("web Sign in with Apple", () => {
 
     const result = await json("/api/v1/identity/apple/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     // A completed-but-stale handoff must read as invalid, not as still
     // pending — a client must never be told to keep polling for a result
     // that can no longer be delivered.
+    expect(result.status).toBe(401);
+    expect(await result.json()).toMatchObject({
+      error: { code: "IDENTITY_TOKEN_INVALID" },
+    });
+  });
+
+  it("gives a proof minted at the end of a slow round trip its own collectable window", async () => {
+    const db = bindings().USAGE_MONITOR_DB;
+    const started = await startSignIn();
+    // Model an OAuth round trip that consumed all but three seconds of the
+    // authorization window: a cold-starting browser plus somebody who actually
+    // reads Apple's consent screen. Ageing the row is exactly equivalent to
+    // advancing the clock from every handler's point of view.
+    const startedAtMs = Date.now() - 297_000;
+    await db.prepare(
+      "UPDATE apple_signin_handoffs SET created_at = ?, expires_at = ? WHERE state = ?",
+    ).bind(
+      new Date(startedAtMs).toISOString(),
+      new Date(startedAtMs + 300_000).toISOString(),
+      started.state,
+    ).run();
+
+    const filledAtMs = Date.now();
+    const landed = await callback(new URLSearchParams({
+      code: "apple-one-time-code",
+      state: started.state,
+    }).toString());
+    expect(landed.status).toBe(200);
+    expect(await landed.text()).toContain("Signed in");
+
+    // The proof's deadline is measured from the mint, not from what was left
+    // of the authorization window. Before this was fixed the row still carried
+    // the start-based deadline and the measured window here was 3s.
+    const row = await db.prepare(
+      "SELECT expires_at AS expiresAt FROM apple_signin_handoffs WHERE state = ?",
+    ).bind(started.state).first<{ expiresAt: string }>();
+    expect(Date.parse(row!.expiresAt) - filledAtMs).toBeGreaterThan(270_000);
+
+    // Not merely a stored number: a dashboard poll landing after the old
+    // start-based deadline had passed still collects the proof. This slept
+    // interval is what turned an entirely correct sign-in into a 401.
+    await new Promise((resolve) => setTimeout(resolve, 3_500));
+    const result = await json("/api/v1/identity/apple/result", {
+      state: started.state,
+      verifier: started.verifier,
+    });
+    expect(result.status).toBe(200);
+    expect(await result.json()).toMatchObject({
+      schemaVersion: "identity-apple-result-v0.1",
+      proof: expect.stringMatching(/^[A-Za-z0-9_-]{64}$/u),
+    });
+  }, 30_000);
+
+  it("still refuses a callback that arrives after the authorization window", async () => {
+    const db = bindings().USAGE_MONITOR_DB;
+    const started = await startSignIn();
+    // The authorization window is longer than it was, but it is still a window,
+    // and it is still measured from the instant the state was minted.
+    const startedAtMs = Date.now() - 601_000;
+    await db.prepare(
+      "UPDATE apple_signin_handoffs SET created_at = ?, expires_at = ? WHERE state = ?",
+    ).bind(
+      new Date(startedAtMs).toISOString(),
+      new Date(startedAtMs + 600_000).toISOString(),
+      started.state,
+    ).run();
+
+    const late = await callback(new URLSearchParams({
+      code: "apple-one-time-code",
+      state: started.state,
+    }).toString());
+    expect(await late.text()).toContain("Sign-in was not completed.");
+    // No exchange was attempted, so no proof exists to be delivered.
+    expect(tokenCalls).toHaveLength(0);
+    const result = await json("/api/v1/identity/apple/result", {
+      state: started.state,
+      verifier: started.verifier,
+    });
     expect(result.status).toBe(401);
     expect(await result.json()).toMatchObject({
       error: { code: "IDENTITY_TOKEN_INVALID" },
@@ -382,6 +656,7 @@ describe("web Sign in with Apple", () => {
 
     const result = await json("/api/v1/identity/apple/result", {
       state: started.state,
+      verifier: started.verifier,
     });
     expect(result.status).toBe(200);
     expect(await result.json()).toMatchObject({
@@ -390,7 +665,7 @@ describe("web Sign in with Apple", () => {
     });
   });
 
-  it("ignores an unknown, malformed, errored, or replayed callback", async () => {
+  it("ignores an unknown, malformed, or replayed callback", async () => {
     const started = await startSignIn();
 
     for (const body of [
@@ -399,10 +674,6 @@ describe("web Sign in with Apple", () => {
       new URLSearchParams({ code: "c", state: `bad state ${"x".repeat(60)}` })
         .toString(),
       new URLSearchParams({ state: started.state }).toString(),
-      new URLSearchParams({
-        state: started.state,
-        error: "user_cancelled_authorize",
-      }).toString(),
       "",
     ]) {
       const ignored = await callback(body);
@@ -448,7 +719,55 @@ describe("web Sign in with Apple", () => {
     expect(row?.deliveredAt ?? null).toBeNull();
   });
 
-  it("keeps a failed Apple exchange from filling the handoff", async () => {
+  it("ends only the cancelled Apple handoff instead of leaving the app polling", async () => {
+    const cancelled = await startSignIn();
+    const stillPending = await startSignIn();
+
+    const landed = await callback(new URLSearchParams({
+      state: cancelled.state,
+      error: "user_cancelled_authorize",
+    }).toString());
+    expect(landed.status).toBe(200);
+    expect(await landed.text()).toContain("Sign-in was not completed.");
+    expect(tokenCalls).toHaveLength(0);
+
+    const cancelledResult = await json("/api/v1/identity/apple/result", {
+      state: cancelled.state,
+      verifier: cancelled.verifier,
+    });
+    expect(cancelledResult.status).toBe(401);
+    expect(await cancelledResult.json()).toMatchObject({
+      error: { code: "IDENTITY_TOKEN_INVALID" },
+    });
+    const cancelledRow = await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state FROM apple_signin_handoffs WHERE state = ?",
+    ).bind(cancelled.state).first<{ state: string }>();
+    expect(cancelledRow).toBeNull();
+
+    // Cancellation is terminal only for that state. A fresh start must be
+    // usable immediately rather than inheriting a stale "signing in" marker.
+    const reentered = await startSignIn();
+    expect(reentered.state).not.toBe(cancelled.state);
+    const reenteredResult = await json("/api/v1/identity/apple/result", {
+      state: reentered.state,
+      verifier: reentered.verifier,
+    });
+    expect(reenteredResult.status).toBe(404);
+    expect(await reenteredResult.json()).toMatchObject({
+      error: { code: "IDENTITY_RESULT_PENDING" },
+    });
+
+    const pendingResult = await json("/api/v1/identity/apple/result", {
+      state: stillPending.state,
+      verifier: stillPending.verifier,
+    });
+    expect(pendingResult.status).toBe(404);
+    expect(await pendingResult.json()).toMatchObject({
+      error: { code: "IDENTITY_RESULT_PENDING" },
+    });
+  });
+
+  it("ends an unusable Apple handoff after its exchange fails", async () => {
     const started = await startSignIn();
     tokenResponder = () => new Response("invalid_client", { status: 400 });
     const failed = await callback(new URLSearchParams({
@@ -461,11 +780,16 @@ describe("web Sign in with Apple", () => {
 
     const result = await json("/api/v1/identity/apple/result", {
       state: started.state,
+      verifier: started.verifier,
     });
-    expect(result.status).toBe(404);
+    expect(result.status).toBe(401);
     expect(await result.json()).toMatchObject({
-      error: { code: "IDENTITY_RESULT_PENDING" },
+      error: { code: "IDENTITY_TOKEN_INVALID" },
     });
+    const failedRow = await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state FROM apple_signin_handoffs WHERE state = ?",
+    ).bind(started.state).first<{ state: string }>();
+    expect(failedRow).toBeNull();
   });
 
   it("requires same-origin starts, reads, and a well-formed result body", async () => {
@@ -528,6 +852,22 @@ describe("web Sign in with Apple", () => {
     expect(rows?.total).toBe(0);
   });
 
+  it("keeps the Apple ceremony open while enrollment mode is disabled", async () => {
+    // Disabled mode pauses new sign-ups at the enrollment write; the ceremony
+    // stays open because an existing participant reattaches through it.
+    const response = await json(
+      "/api/v1/identity/apple/start",
+      { binding: "a".repeat(64) },
+      bindings({ ENROLLMENT_MODE: "disabled" }),
+    );
+    expect(response.status).toBe(200);
+    const rows = await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM apple_signin_handoffs",
+    ).first<{ total: number }>();
+    expect(rows?.total).toBe(1);
+    expect(tokenCalls).toHaveLength(0);
+  });
+
   it("keeps the retired Apple association filename out of the SPA fallback", async () => {
     const path = "/.well-known/apple-developer-domain-association.txt";
     for (const method of ["GET", "POST"]) {
@@ -548,5 +888,165 @@ describe("web Sign in with Apple", () => {
     });
     const secret = await appleClientSecret(flattened, 1_800_000_000_000);
     expect(secret.split(".")).toHaveLength(3);
+  });
+
+  // csf_b814237b: the proof was delivered to whoever held the state. The state
+  // necessarily transits the provider round-trip, the victim's browser, the
+  // referrer, and any log, so it is not a possession secret. These cases pin the
+  // independent client binding that now gates delivery and consumption.
+  it("binds Apple sign-in delivery to the initiating client's verifier", async () => {
+    const verifier = newSignInVerifier();
+    const binding = await sha256Hex(verifier);
+    const start = await json("/api/v1/identity/apple/start", { binding });
+    expect(start.status).toBe(200);
+    const startedPayload = await start.json<Record<string, unknown>>();
+    const state = startedPayload.state as string;
+    // The client binding is never returned in JSON: neither the raw verifier nor
+    // its digest appears, and the response shape is unchanged.
+    expect(Object.keys(startedPayload).sort())
+      .toEqual(["authorizeUrl", "schemaVersion", "state"]);
+    const serializedStart = JSON.stringify(startedPayload);
+    expect(serializedStart.includes(verifier)).toBe(false);
+    expect(serializedStart.includes(binding)).toBe(false);
+
+    // A caller holding the state but not the verifier cannot even learn that the
+    // sign-in is pending.
+    const wrongVerifier = newSignInVerifier();
+    const probedPending = await json("/api/v1/identity/apple/result", {
+      state,
+      verifier: wrongVerifier,
+    });
+    expect(probedPending.status).toBe(401);
+
+    // Apple's callback fills the row exactly as a victim completing the attacker's
+    // authorize URL would: the completing browser carries no verifier.
+    const landed = await callback(new URLSearchParams({
+      code: "apple-one-time-code",
+      state,
+    }).toString());
+    expect(landed.status).toBe(200);
+    expect(await landed.text()).toContain("Signed in");
+
+    // The attacker browser — holding the state but a different verifier — cannot
+    // retrieve the proof, and the failed attempt must not consume it.
+    const stolen = await json("/api/v1/identity/apple/result", {
+      state,
+      verifier: wrongVerifier,
+    });
+    expect(stolen.status).toBe(401);
+    expect(await stolen.json()).toMatchObject({
+      error: { code: "IDENTITY_TOKEN_INVALID" },
+    });
+    // A missing verifier is a malformed body, never a delivery.
+    const missingVerifier = await json("/api/v1/identity/apple/result", { state });
+    expect(missingVerifier.status).toBe(400);
+
+    // The initiator, holding the verifier, still collects the one proof exactly
+    // once — the attacker's probes neither stole nor spoiled it.
+    const collected = await json("/api/v1/identity/apple/result", {
+      state,
+      verifier,
+    });
+    expect(collected.status).toBe(200);
+    expect(await collected.json()).toMatchObject({
+      schemaVersion: "identity-apple-result-v0.1",
+      proof: expect.stringMatching(/^[A-Za-z0-9_-]{64}$/u),
+    });
+  });
+
+  // csf_94325b7787: the pending read did not reserve the row, so many callbacks
+  // carrying one valid state each reached client-secret signing and Apple's
+  // token endpoint. The atomic claim now admits exactly one to provider I/O.
+  it("admits exactly one of many concurrent Apple callbacks to the provider exchange", async () => {
+    const started = await startSignIn();
+    const attempts = 6;
+    const responses = await Promise.all(
+      Array.from({ length: attempts }, () => callback(new URLSearchParams({
+        code: "apple-one-time-code",
+        state: started.state,
+      }).toString())),
+    );
+    const pages = await Promise.all(responses.map((response) => response.text()));
+    const completed = pages.filter((page) => page.includes("Signed in")).length;
+    const refused = pages.filter(
+      (page) => page.includes("Sign-in was not completed"),
+    ).length;
+    // Exactly one callback signed a client secret and hit Apple's token endpoint;
+    // every other callback stopped at the claim, so provider work did not fan out.
+    expect(tokenCalls).toHaveLength(1);
+    // Exactly one callback completed; the rest are the indistinguishable failure.
+    expect(completed).toBe(1);
+    expect(refused).toBe(attempts - 1);
+    // The shared row was filled exactly once: a single identity and proof.
+    const stored = await bindings().USAGE_MONITOR_DB.prepare(
+      `SELECT COUNT(*) AS total, COUNT(proof) AS proofs,
+              COUNT(identity_link_key) AS links
+         FROM apple_signin_handoffs`,
+    ).first<{ total: number; proofs: number; links: number }>();
+    expect(stored).toEqual({ total: 1, proofs: 1, links: 1 });
+  });
+
+  // csf_94325b7787: the claim carries a lease so a crashed claimant frees the
+  // row for one bounded retry, and completion/discard are fenced to the claimant.
+  it("re-claims an Apple handoff only after its processing lease expires", async () => {
+    const db = bindings().USAGE_MONITOR_DB;
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const nonceHash = "a".repeat(64);
+    const state = "lease-test-state";
+    await insertAppleSignInHandoff(db, {
+      state,
+      nonceHash,
+      bindingHash: "b".repeat(64),
+      createdAt: nowIso,
+      expiresAt: new Date(nowMs + 600_000).toISOString(),
+    });
+    const first = "1".repeat(64);
+    // A callback claims the row (and then, model a crash: it never completes).
+    expect(await claimPendingAppleSignInHandoff(
+      db,
+      state,
+      first,
+      nowIso,
+      new Date(nowMs - 60_000).toISOString(),
+    )).toEqual({ state, nonceHash });
+    // While the lease is live, a concurrent callback cannot re-claim it.
+    expect(await claimPendingAppleSignInHandoff(
+      db,
+      state,
+      "2".repeat(64),
+      nowIso,
+      new Date(nowMs - 60_000).toISOString(),
+    )).toBeNull();
+    // Once the lease has expired, a single bounded retry re-claims the row.
+    const later = new Date(nowMs + 120_000).toISOString();
+    const second = "2".repeat(64);
+    expect(await claimPendingAppleSignInHandoff(
+      db,
+      state,
+      second,
+      later,
+      new Date(nowMs + 60_000).toISOString(),
+    )).toEqual({ state, nonceHash });
+    // The preempted original claimant can no longer complete or discard the row.
+    expect(await completeAppleSignInHandoff(
+      db,
+      state,
+      first,
+      "c".repeat(64),
+      "d".repeat(64),
+      later,
+      new Date(nowMs + 400_000).toISOString(),
+    )).toBe(false);
+    // The new claimant completes it exactly once.
+    expect(await completeAppleSignInHandoff(
+      db,
+      state,
+      second,
+      "c".repeat(64),
+      "d".repeat(64),
+      later,
+      new Date(nowMs + 400_000).toISOString(),
+    )).toBe(true);
   });
 });

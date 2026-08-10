@@ -12,6 +12,20 @@ export const ACCOUNT_SCOPED_TELEMETRY_ENVELOPE_SCHEMA_VERSION:
   "telemetry-envelope-v0.2";
 export const MAX_TELEMETRY_BROWSER_BYTES: 1310720;
 
+export const TELEMETRY_PLAN_TYPES: readonly [
+  "free",
+  "go",
+  "plus",
+  "pro",
+  "prolite",
+  "business",
+  "enterprise",
+  "edu",
+  "team",
+  "unknown",
+];
+export type TelemetryPlanType = typeof TELEMETRY_PLAN_TYPES[number];
+
 export const TELEMETRY_TOOL_CLASSES: readonly [
   "webSearch",
   "fileSearch",
@@ -96,6 +110,10 @@ export interface UsageAccounting {
     | "unpriced";
 }
 
+export type TelemetryBatchPriceBasis =
+  | UsageAccounting["priceBasis"]
+  | "mixed_api_prices";
+
 export interface TelemetryUsageEvent {
   schemaVersion: "usage-event-v0.1";
   eventTime: string;
@@ -163,16 +181,7 @@ export interface TelemetryQuotaSnapshot {
   observedTime: string;
   receivedTime: string;
   provider: "openai_codex" | "anthropic_claude_code";
-  planType:
-    | "free"
-    | "go"
-    | "plus"
-    | "pro"
-    | "business"
-    | "enterprise"
-    | "edu"
-    | "team"
-    | "unknown";
+  planType: TelemetryPlanType;
   planVariant:
     | "pro-20x"
     | "pro-10x-promo"
@@ -212,7 +221,7 @@ export interface TelemetryActivityMarker {
   surface: string;
   state: "start" | "end" | "pulse";
   agenticPoolCoupling: string;
-  planType: TelemetryQuotaSnapshot["planType"];
+  planType: TelemetryPlanType;
   planVariant: TelemetryQuotaSnapshot["planVariant"];
   markerId: string;
 }
@@ -239,7 +248,7 @@ export interface TelemetryContribution {
     pricedEventCoveragePercent: number;
     unknownModelEventCount: number;
     unknownBillableUnits: number;
-    priceBasis: UsageAccounting["priceBasis"];
+    priceBasis: TelemetryBatchPriceBasis;
   };
 }
 
@@ -251,7 +260,7 @@ export type UsageAccountingDiagnosticV02 =
   Omit<UsageAccounting, "priceBasis"> & {
     status: "untrusted_diagnostic";
     sourceSchemaVersion: "telemetry-contribution-v0.1";
-    priceBasis: "current_api_prices" | "unpriced";
+    priceBasis: UsageAccounting["priceBasis"];
   };
 
 export type TelemetryUsageEventV02 =
@@ -300,7 +309,7 @@ export interface TelemetryContributionV02
     pricedEventCoveragePercent: number;
     unknownModelEventCount: number;
     unknownBillableUnits: number;
-    priceBasis: "current_api_prices" | "unpriced";
+    priceBasis: TelemetryBatchPriceBasis;
   };
 }
 

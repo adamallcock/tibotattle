@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { constants, lstatSync } from "node:fs";
 import { lstat, open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   LOCAL_COMPANION_REPORT_FILES,
@@ -12,13 +12,33 @@ import {
   buildLocalCompanionSnapshot,
 } from "../../src/local-companion-data.js";
 import {
+  resolveLocalLegacyReportReadPath,
+} from "../../src/local-legacy-report-storage.js";
+import {
   refreshReplaySafeAccountingCache,
 } from "../../src/replay-safe-accounting-cache.js";
+import {
+  refreshLocalArchiveAccountingIndex,
+} from "../../src/local-archive-accounting-index.js";
+import {
+  ingestLocalUnifiedIndexIncrement,
+} from "../../src/local-unified-index-ingest.js";
+import {
+  readLocalUnifiedWindowBreakdown,
+} from "../../src/local-unified-window-breakdown.js";
+import { TELEMETRY_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
 import {
   AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS,
   acquireAutomaticContributionInstanceLock,
   createAutomaticContributionController,
 } from "../../src/automatic-contribution.js";
+import {
+  TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+  createIncrementalContributionSyncController,
+} from "../../src/incremental-contribution.js";
+import {
+  runIncrementalContributionSyncOnce,
+} from "../../src/contribution-incremental-sync.js";
 import {
   createFastModePreferenceController,
 } from "../../src/fast-mode-preference.js";
@@ -40,12 +60,15 @@ import {
 } from "../../src/contribution-sync-queue.js";
 import {
   createProductionContributionDeviceBackend,
+  migrateLegacyContributionDeviceCapability,
+  removeContributionDeviceCapability,
 } from "../../src/contribution-device-capability.js";
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
 } from "../../src/platform/export-identity-keychain.js";
 import {
   claimContributionDevicePairing,
+  disconnectContributionDevice as disconnectContributionDeviceRemotely,
 } from "../../src/contribution-device-client.js";
 import {
   LOCAL_CONTRIBUTION_PREPARATION_ALLOWED_LOOKBACK_HOURS,
@@ -72,6 +95,10 @@ import {
   PRODUCT_BRAND,
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../config/product-brand.js";
+import {
+  RELEASE_VERSION,
+  RELEASE_VERSION_PLACEHOLDER,
+} from "../../config/release-manifest.js";
 import {
   FAST_MODE_PREFERENCE_VALUES,
 } from "@app-usagemonitor/accounting";
@@ -130,6 +157,8 @@ export const LOCAL_DIAGNOSTIC_NOTE_SCHEMA_VERSION =
   "local-diagnostic-note-v0.1";
 export const LOCAL_CONTRIBUTION_DEVICE_RESET_VERSION =
   "local-contribution-device-reset-v0.1";
+export const LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION =
+  "local-contribution-device-disconnect-v0.1";
 const MAX_DIAGNOSTICS_LOG_BYTES = 256 * 1024;
 const DIAGNOSTIC_REFERENCE = /^TT-[0-9A-HJKMNP-TV-Z]{6}$/u;
 // Fixed journey names. Anything else is refused, so no free-form label can
@@ -145,6 +174,9 @@ const DIAGNOSTIC_SURFACES = new Set([
   "hosted_identity",
   "hosted_privacy",
   "local_refresh",
+  // 2026-08-08 (deletion honesty): the dashboard's "Delete my contributions"
+  // action files its failures like every other journey.
+  "participant_deletion",
 ]);
 // Identifier-shaped fixed codes only: SCREAMING_SNAKE from the contribution
 // service, lower_snake from this companion. Neither shape can carry a
@@ -232,6 +264,7 @@ const API_ROUTES = new Set([
   "/api/local/weekly",
   "/api/local/quality",
   "/api/local/reports",
+  "/api/local/timeline/window-breakdown",
   "/api/local/refresh",
   "/api/local/refresh/cancel",
   "/api/local/contribution/preview",
@@ -239,6 +272,7 @@ const API_ROUTES = new Set([
   "/api/local/contribution/sync-status",
   "/api/local/contribution/sync-next",
   "/api/local/contribution/device-pair",
+  "/api/local/contribution/device-disconnect",
   "/api/local/contribution/device-credential-reset",
   "/api/local/contribution/sync-inspect-exact",
   "/api/local/contribution/sync-once",
@@ -247,12 +281,32 @@ const API_ROUTES = new Set([
   "/api/local/contribution/automatic-settings",
   "/api/local/contribution/automatic-enable",
   "/api/local/contribution/automatic-disable",
+  "/api/local/contribution/incremental-status",
+  "/api/local/contribution/incremental-approve",
   "/api/local/accounting/fast-mode-preference",
+]);
+
+// The two routes that must answer while the first snapshot is still being
+// built: readiness, and the channel used to report that a start went wrong.
+// Everything else in API_ROUTES reads the snapshot and waits for it.
+const SNAPSHOT_INDEPENDENT_API_ROUTES = new Set([
+  "/api/local/health",
+  "/api/local/diagnostics/note",
 ]);
 
 
 function jsonBody(value) {
   return Buffer.from(JSON.stringify(value));
+}
+
+// A query-string parameter that must be a plain base-ten safe integer. Anything
+// else — a float, a sign, whitespace, scientific notation, an empty value — is
+// rejected rather than coerced, so the two bounded window parameters can never
+// carry a surprising value into the reader.
+function integerParameter(value) {
+  if (typeof value !== "string" || !/^-?\d{1,16}$/u.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
 function securityHeaders({ report = false } = {}) {
@@ -859,6 +913,30 @@ async function authorizeContributionDeviceCredentialReset(request, response) {
   return true;
 }
 
+async function authorizeContributionDeviceDisconnect(request, response) {
+  if (!sameOrigin(request)
+      || request.headers["x-usage-monitor-local"] !== "1") {
+    sendError(response, 403, "contribution_device_disconnect_not_authorized");
+    return false;
+  }
+  let value;
+  try {
+    value = await readBoundedJsonObject(request);
+  } catch (error) {
+    sendError(response, boundedRequestStatus(error), error.code ?? "invalid_request");
+    return false;
+  }
+  // This revokes a live remote bearer and then clears its exact local
+  // Keychain binding. It needs a distinct explicit confirmation from the
+  // local-only leftover-credential repair.
+  if (Object.keys(value).join("\0") !== "confirm"
+      || value.confirm !== "disconnect_this_mac") {
+    sendError(response, 400, "invalid_request");
+    return false;
+  }
+  return true;
+}
+
 async function authorizeContributionDevicePairing(request, response) {
   if (!sameOrigin(request)
       || request.headers["x-usage-monitor-local"] !== "1") {
@@ -1112,16 +1190,23 @@ async function authorizeReviewedContributionMutation(
 }
 
 async function readFixedFile(root, file, maximumBytes) {
-  const path = resolve(root, file);
+  const resolvedRoot = resolve(root);
+  const path = resolve(resolvedRoot, file);
+  const rootPrefix = resolvedRoot.endsWith(sep) ? resolvedRoot : `${resolvedRoot}${sep}`;
+  if (!path.startsWith(rootPrefix)) {
+    const error = new Error("not_found");
+    error.code = "not_found";
+    throw error;
+  }
   let metadata;
   try {
-    metadata = await stat(path);
+    metadata = await lstat(path);
   } catch {
     const error = new Error("not_found");
     error.code = "not_found";
     throw error;
   }
-  if (!metadata.isFile() || metadata.size > maximumBytes) {
+  if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.size > maximumBytes) {
     const error = new Error("not_found");
     error.code = "not_found";
     throw error;
@@ -1147,6 +1232,25 @@ function stampSemanticOpenTarget(body) {
       PRODUCT_BRAND.appOpenURL,
     ),
   );
+}
+
+function stampReleaseVersion(body) {
+  const source = body.toString("utf8");
+  const first = source.indexOf(RELEASE_VERSION_PLACEHOLDER);
+  if (first < 0) return Buffer.from(source);
+  if (source.indexOf(
+    RELEASE_VERSION_PLACEHOLDER,
+    first + RELEASE_VERSION_PLACEHOLDER.length,
+  ) >= 0) {
+    const error = new Error("not_found");
+    error.code = "not_found";
+    throw error;
+  }
+  return Buffer.from(source.replace(RELEASE_VERSION_PLACEHOLDER, RELEASE_VERSION));
+}
+
+function stampLocalDashboard(body) {
+  return stampReleaseVersion(stampSemanticOpenTarget(body));
 }
 
 function finiteNonNegativeInteger(value) {
@@ -1414,6 +1518,88 @@ function syncRunProjection(value) {
   };
 }
 
+const INCREMENTAL_SYNC_OUTCOME_CODE = /^[a-z][a-z0-9_]{0,63}$/u;
+const INCREMENTAL_SYNC_DAY = /^\d{4}-\d{2}-\d{2}$/u;
+
+/**
+ * The bounded status the dashboard's incremental surface reads: consent
+ * state, cursor progress as day counts and the acknowledged watermark day,
+ * pause reason as a fixed code. No path, no content, no identifier.
+ */
+function incrementalSyncStatusProjection(value, { configured = false } = {}) {
+  const consent = value?.consent;
+  const valid = value?.schemaVersion
+      === "incremental-contribution-sync-status-v1.0"
+    && typeof value?.paused === "boolean"
+    && typeof value?.running === "boolean"
+    && consent && typeof consent === "object"
+    && typeof consent.approved === "boolean"
+    && typeof consent.current === "boolean";
+  const projected = {
+    schemaVersion: "local-incremental-contribution-sync-v1.0",
+    status: valid
+      ? "available"
+      : configured ? "unavailable" : "not_configured",
+    contractVersion: TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+    consent: { approved: false, current: false, consentedAt: null },
+    paused: false,
+    pausedReason: null,
+    running: false,
+    progress: null,
+    lastAttemptAt: null,
+    nextAttemptAt: null,
+    lastOutcome: null,
+    includesContent: false,
+    includesPaths: false,
+    includesIdentifiers: false,
+    includesCredentials: false,
+  };
+  if (!valid) return projected;
+  const progress = value.progress;
+  const progressValid = progress !== null
+    && typeof progress === "object"
+    && [progress.daysTotal, progress.daysSynced, progress.daysPending,
+      progress.chunksUploaded].every(isNonNegativeInteger)
+    && (progress.acknowledgedThroughDay === null
+      || (typeof progress.acknowledgedThroughDay === "string"
+        && INCREMENTAL_SYNC_DAY.test(progress.acknowledgedThroughDay)));
+  const outcome = value.lastOutcome;
+  const outcomeValid = outcome !== null
+    && typeof outcome === "object"
+    && nullableInstant(outcome.at) !== null
+    && INCREMENTAL_SYNC_OUTCOME_CODE.test(outcome.code ?? "")
+    && ["succeeded", "partial", "failed", "paused"].includes(outcome.status);
+  return {
+    ...projected,
+    status: "available",
+    consent: {
+      approved: consent.approved,
+      current: consent.current,
+      consentedAt: nullableInstant(consent.consentedAt),
+    },
+    paused: value.paused,
+    pausedReason: value.paused
+      && INCREMENTAL_SYNC_OUTCOME_CODE.test(value.pausedReason ?? "")
+      ? value.pausedReason
+      : null,
+    running: value.running,
+    progress: progressValid
+      ? {
+        daysTotal: progress.daysTotal,
+        daysSynced: progress.daysSynced,
+        daysPending: progress.daysPending,
+        chunksUploaded: progress.chunksUploaded,
+        acknowledgedThroughDay: progress.acknowledgedThroughDay,
+      }
+      : null,
+    lastAttemptAt: nullableInstant(value.lastAttemptAt),
+    nextAttemptAt: nullableInstant(value.nextAttemptAt),
+    lastOutcome: outcomeValid
+      ? { at: nullableInstant(outcome.at), code: outcome.code, status: outcome.status }
+      : null,
+  };
+}
+
 const PREPARATION_ERROR_CODES = new Set([
   "coverage_unavailable",
   "coverage_invalid",
@@ -1671,6 +1857,25 @@ export function createLocalCompanionServer(options = {}) {
     options.diagnosticsLogFile
       ?? join(installation.stateRoot, DIAGNOSTICS_LOG_FILE_NAME),
   );
+  const legacyContributionDeviceStateCandidate = Object.hasOwn(
+    options,
+    "legacyContributionDeviceStateFile",
+  )
+    ? options.legacyContributionDeviceStateFile
+    : process.platform === "darwin"
+        && !Object.hasOwn(options, "contributionDeviceBackendFactory")
+      ? join(
+        homeDirectory,
+        "Library",
+        "Application Support",
+        "app-usagemonitor",
+        "contribution-device-binding-v1.json",
+      )
+      : null;
+  const legacyContributionDeviceStateFile =
+    legacyContributionDeviceStateCandidate === null
+      ? null
+      : assertLocalAbsolutePath(legacyContributionDeviceStateCandidate);
   const preparedCandidate = Object.hasOwn(
     options,
     "preparedContributionDirectory",
@@ -1712,6 +1917,7 @@ export function createLocalCompanionServer(options = {}) {
     codexHome,
     contributionQueueFile,
     diagnosticsLogFile,
+    legacyContributionDeviceStateFile,
     preparedContributionDirectory,
     contributionPreparationOptions: selectedPreparationOptions,
     parentWatchdogPid,
@@ -1742,9 +1948,9 @@ function createPreparedLocalCompanionServer({
   dataStore = new LocalCompanionDataStore({
     builder: async () => buildLocalCompanionSnapshot({
       root: resourceRoot,
-      collectorFile: statePaths.collectorFile,
-      checkpointFile: statePaths.checkpointFile,
-      accountingCacheFile: statePaths.accountingCacheFile,
+      collectorStateFile: statePaths.collectorStateFile,
+      archiveIndexFile: statePaths.archiveAccountingIndexFile,
+      unifiedIndexFile: statePaths.unifiedIndexFile,
       allowDevelopmentArtifactFallback:
         environment.USAGE_MONITOR_DEVELOPMENT_ARTIFACT_FALLBACK === "1",
       // The owner's stated Codex speed mode. It attributes only the turns that
@@ -1758,16 +1964,33 @@ function createPreparedLocalCompanionServer({
       codexSpeedBaselines: await codexSpeedBaseline.readWindows(),
     }),
   }),
+  // Reprice the usage events inside a bounded [from, to] window from the
+  // unified local index, grouped by model and observed speed. Injected so a
+  // test can drive the route's range validation and response shape without a
+  // real index on disk; in production it reads the same index the snapshot
+  // draws from, strictly read-only.
+  windowBreakdownProvider = ({ fromMs, toMs }) => readLocalUnifiedWindowBreakdown({
+    indexFile: statePaths.unifiedIndexFile,
+    fromMs,
+    toMs,
+  }),
   refreshRunner = createLocalCollectorRefreshRunner({
     codexHome,
-    dataFile: statePaths.collectorFile,
-    checkpointFile: statePaths.checkpointFile,
-    lockFile: statePaths.collectorLockFile,
-    journalFile: statePaths.collectorJournalFile,
+    stateFile: statePaths.collectorStateFile,
     accountObservationOperationLockFile:
       statePaths.accountObservationLockFile,
     refreshAccounting: refreshReplaySafeAccountingCache,
-    accountingCacheFile: statePaths.accountingCacheFile,
+    refreshArchiveIndex: refreshLocalArchiveAccountingIndex,
+    archiveIndexFile: statePaths.archiveAccountingIndexFile,
+    archiveIndexSecretFile: statePaths.archiveAccountingIndexSecretFile,
+    // Advance the unified index by its cursors on every foreground refresh:
+    // an ordinary pass reads only the bytes the rollout corpus grew.
+    refreshUnifiedIndex: (options) => ingestLocalUnifiedIndexIncrement({
+      ...options,
+      contractVersion: TELEMETRY_SCHEMA_VERSION,
+    }),
+    unifiedIndexFile: statePaths.unifiedIndexFile,
+    unifiedIndexSecretFile: statePaths.unifiedIndexSecretFile,
     recordCodexSpeedBaseline: async () => (
       (await codexSpeedBaseline.record()).windows
     ),
@@ -1792,6 +2015,7 @@ function createPreparedLocalCompanionServer({
   developmentIdentityOptIn =
     environment[DEVELOPMENT_IDENTITY_OPT_IN_ENV] ?? null,
   contributionQueueFile,
+  legacyContributionDeviceStateFile = null,
   contributionSyncStatusProvider = () => inspectContributionSyncQueue({
     queueFile: contributionQueueFile,
   }),
@@ -1801,6 +2025,7 @@ function createPreparedLocalCompanionServer({
     createProductionContributionDeviceBackend,
   contributionDevicePairingProvider = null,
   contributionDeviceCredentialResetRunner = null,
+  contributionDeviceDisconnectRunner = null,
   diagnosticNoteRecorder = null,
   clock = () => Date.now(),
   contributionSyncNextProvider = null,
@@ -1811,6 +2036,7 @@ function createPreparedLocalCompanionServer({
   contributionSyncTimeoutMs = 60_000,
   automaticContributionController = null,
   automaticContributionOptions = {},
+  incrementalContributionController = null,
   onError = () => {},
 } = {}) {
   if (!environment || typeof environment !== "object"
@@ -1881,6 +2107,13 @@ function createPreparedLocalCompanionServer({
       && typeof contributionServiceOrigin !== "string") {
     throw new TypeError("contributionServiceOrigin must be a string or null");
   }
+  if (legacyContributionDeviceStateFile !== null
+      && (typeof legacyContributionDeviceStateFile !== "string"
+        || !isAbsolute(legacyContributionDeviceStateFile))) {
+    throw new TypeError(
+      "legacyContributionDeviceStateFile must be an absolute path or null",
+    );
+  }
   if (typeof diagnosticsLogFile !== "string"
       || diagnosticsLogFile.length < 1
       || typeof clock !== "function"
@@ -1893,6 +2126,8 @@ function createPreparedLocalCompanionServer({
         && typeof contributionDevicePairingProvider !== "function")
       || (contributionDeviceCredentialResetRunner !== null
         && typeof contributionDeviceCredentialResetRunner !== "function")
+      || (contributionDeviceDisconnectRunner !== null
+        && typeof contributionDeviceDisconnectRunner !== "function")
       || (contributionSyncNextProvider !== null
         && typeof contributionSyncNextProvider !== "function")
       || (contributionSyncExactReviewProvider !== null
@@ -1915,26 +2150,102 @@ function createPreparedLocalCompanionServer({
         directory: preparedContributionDirectory,
         queueFile: contributionQueueFile,
       }));
+  const createContributionDeviceBackend = async () => {
+    const backend = contributionDeviceBackendFactory();
+    if (legacyContributionDeviceStateFile !== null) {
+      await migrateLegacyContributionDeviceCapability({
+        backend,
+        legacyStateFile: legacyContributionDeviceStateFile,
+        stateFile: statePaths.contributionDeviceStateFile,
+        expectedOrigin: contributionServiceOrigin,
+      });
+    }
+    return backend;
+  };
   const pairContributionDevice = contributionDevicePairingProvider
     ?? (contributionServiceOrigin === null
       ? null
-      : ({ pairingCode }) => claimContributionDevicePairing({
-        origin: contributionServiceOrigin,
-        pairingCode,
-        capabilityOptions: {
-          backend: contributionDeviceBackendFactory(),
-          stateFile: statePaths.contributionDeviceStateFile,
-        },
-      }));
+      : async ({ pairingCode }) => {
+        const backend = await createContributionDeviceBackend();
+        return claimContributionDevicePairing({
+          origin: contributionServiceOrigin,
+          pairingCode,
+          capabilityOptions: {
+            backend,
+            stateFile: statePaths.contributionDeviceStateFile,
+          },
+        });
+      });
   // Purely local repair: it needs the Keychain backend and the binding state
   // file, never a contribution service origin, so it stays available even when
   // no service is configured.
   const resetContributionDeviceCredential =
     contributionDeviceCredentialResetRunner
-    ?? (() => resetContributionDeviceCredentialLocally({
-      backend: contributionDeviceBackendFactory(),
-      stateFile: statePaths.contributionDeviceStateFile,
-    }));
+    ?? (async () => {
+      const backend = await createContributionDeviceBackend();
+      return resetContributionDeviceCredentialLocally({
+        backend,
+        stateFile: statePaths.contributionDeviceStateFile,
+      });
+    });
+  // Disconnect revokes the remote bearer before removing its local binding.
+  // Serialize every delivery-affecting local mutation with that transition so
+  // a foreground or automatic sync cannot begin in the await between the
+  // initial idle check and remote revocation.
+  let contributionDeviceDisconnectInProgress = false;
+  const disconnectContributionDevice = contributionDeviceDisconnectRunner
+    ?? (contributionServiceOrigin === null
+      ? null
+      : async () => {
+        const backend = await createContributionDeviceBackend();
+        let remoteConfirmed = false;
+        try {
+          const remote = await disconnectContributionDeviceRemotely({
+            origin: contributionServiceOrigin,
+            capabilityOptions: {
+              backend,
+              stateFile: statePaths.contributionDeviceStateFile,
+            },
+          });
+          if (remote?.status !== "disconnected"
+              || typeof remote.deviceId !== "string") {
+            throw new Error("remote contribution-device disconnect invalid");
+          }
+          remoteConfirmed = true;
+          // Once the remote bearer is gone, stop the local queue before
+          // erasing the exact credential. A pause persistence failure leaves
+          // the harmless stale local binding in place for a retry; it never
+          // leaves a live remote upload authority behind.
+          const queue = await setContributionPaused({ paused: true });
+          if (queue?.paused !== true) {
+            throw new Error("contribution delivery was not paused");
+          }
+          const removed = await removeContributionDeviceCapability({
+            backend,
+            stateFile: statePaths.contributionDeviceStateFile,
+            expectedOrigin: contributionServiceOrigin,
+            confirmDeviceId: remote.deviceId,
+            remoteRevocationConfirmed: true,
+          });
+          if (removed?.status !== "removed"
+              || removed.deviceId !== remote.deviceId) {
+            throw new Error("local contribution-device removal invalid");
+          }
+          return Object.freeze({
+            status: "disconnected",
+            deliveryPaused: true,
+            localCredential: removed.credential,
+            localBinding: "removed",
+          });
+        } catch (error) {
+          if (remoteConfirmed) {
+            const cleanupPending = new Error("local disconnect cleanup pending");
+            cleanupPending.code = "contribution_device_disconnect_cleanup_pending";
+            throw cleanupPending;
+          }
+          throw error;
+        }
+      });
   const recordDiagnosticNote = diagnosticNoteRecorder
     ?? ((note) => appendDiagnosticNote({
       file: diagnosticsLogFile,
@@ -1952,25 +2263,28 @@ function createPreparedLocalCompanionServer({
     ?? (preparedContributionDirectory === null
         || contributionServiceOrigin === null
       ? async () => null
-      : ({
+      : async ({
         signal,
         reviewedJob,
         preparedSetId,
         maximumJobs = LOCAL_SYNC_MAXIMUM_JOBS,
         maximumReservedUploadBytes =
           LOCAL_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES,
-      }) => runContributionSyncQueueOnce({
-        directory: preparedContributionDirectory,
-        origin: contributionServiceOrigin,
-        backend: contributionDeviceBackendFactory(),
-        queueFile: contributionQueueFile,
-        stateFile: statePaths.contributionDeviceStateFile,
-        maximumJobs,
-        maximumReservedUploadBytes,
-        reviewedJob,
-        preparedSetId,
-        signal,
-      }));
+      }) => {
+        const backend = await createContributionDeviceBackend();
+        return runContributionSyncQueueOnce({
+          directory: preparedContributionDirectory,
+          origin: contributionServiceOrigin,
+          backend,
+          queueFile: contributionQueueFile,
+          stateFile: statePaths.contributionDeviceStateFile,
+          maximumJobs,
+          maximumReservedUploadBytes,
+          reviewedJob,
+          preparedSetId,
+          signal,
+        });
+      });
   const setContributionPaused = contributionSyncPauseSetter
     ?? (({ paused }) => setContributionSyncPaused({
       paused,
@@ -1980,6 +2294,8 @@ function createPreparedLocalCompanionServer({
     || contributionSyncNextProvider !== null;
   const contributionDevicePairingConfigured =
     pairContributionDevice !== null;
+  const contributionDeviceDisconnectConfigured =
+    disconnectContributionDevice !== null;
   const syncExactReviewConfigured = preparedContributionDirectory !== null
     || contributionSyncExactReviewProvider !== null;
   const syncDeliveryConfigured =
@@ -2009,7 +2325,7 @@ function createPreparedLocalCompanionServer({
             }),
         })
       ),
-    });
+  });
   let contributionPreparationInProgress = false;
   let contributionSyncInProgress = false;
   const runAutomaticContributionRetirement =
@@ -2047,7 +2363,7 @@ function createPreparedLocalCompanionServer({
     signal,
     preparedSetId,
   }) => {
-    if (contributionSyncInProgress) {
+    if (contributionSyncInProgress || contributionDeviceDisconnectInProgress) {
       const error = new Error("sync_in_progress");
       error.code = "sync_in_progress";
       error.retryable = true;
@@ -2077,10 +2393,68 @@ function createPreparedLocalCompanionServer({
       uploadRunner: runAutomaticContributionUpload,
       maintenanceRunner: runAutomaticContributionRetirement,
     });
+  if (incrementalContributionController !== null
+      && (!incrementalContributionController
+        || typeof incrementalContributionController !== "object"
+        || typeof incrementalContributionController.start !== "function"
+        || typeof incrementalContributionController.stop !== "function"
+        || typeof incrementalContributionController.inspect !== "function"
+        || typeof incrementalContributionController.approve !== "function"
+        || typeof incrementalContributionController.resume !== "function")) {
+    throw new TypeError("incrementalContributionController is invalid");
+  }
+  // The telemetry-contribution-v1.0 incremental sync, additive beside the
+  // v0.1 prepared-set path. Configured only when a contribution service
+  // origin exists; the health capability additionally requires the unified
+  // index file to be present, because the index is the upload source.
+  const incrementalContribution = incrementalContributionController
+    ?? (contributionServiceOrigin === null
+      ? null
+      : createIncrementalContributionSyncController({
+        settingsFile: statePaths.incrementalContributionSyncSettingsFile,
+        destinationOrigin: contributionServiceOrigin,
+        runner: async ({ signal }) => {
+          if (contributionSyncInProgress
+              || contributionDeviceDisconnectInProgress) {
+            const error = new Error("sync_in_progress");
+            error.code = "sync_in_progress";
+            error.retryable = true;
+            throw error;
+          }
+          contributionSyncInProgress = true;
+          try {
+            const backend = await createContributionDeviceBackend();
+            return await runIncrementalContributionSyncOnce({
+              indexFile: statePaths.unifiedIndexFile,
+              origin: contributionServiceOrigin,
+              backend,
+              stateFile: statePaths.contributionDeviceStateFile,
+              signal,
+            });
+          } finally {
+            contributionSyncInProgress = false;
+          }
+        },
+      }));
+  const unifiedIndexPresent = async () => {
+    try {
+      const metadata = await lstat(statePaths.unifiedIndexFile);
+      return metadata.isFile() && !metadata.isSymbolicLink();
+    } catch {
+      return false;
+    }
+  };
   let automaticContributionInstanceLock = null;
   let automaticContributionInstanceLockRelease = null;
   let automaticContributionShutdown = null;
-  let initializationPromise = null;
+  let instanceLockPromise = null;
+  let snapshotPromise = null;
+  // Building the first snapshot reads the whole retained collector state, which
+  // is seconds of work on a large install. The port is opened before that work
+  // starts, so this is the only record of whether the in-memory snapshot the
+  // read routes project from actually exists yet. It is reported verbatim by
+  // /api/local/health rather than being smoothed into "ready".
+  let snapshotState = { status: "building", errorCode: null };
   const releaseAutomaticContributionInstanceLock = () => {
     if (automaticContributionInstanceLockRelease !== null) {
       return automaticContributionInstanceLockRelease;
@@ -2096,10 +2470,77 @@ function createPreparedLocalCompanionServer({
     if (automaticContributionShutdown === null) {
       automaticContributionShutdown = (async () => {
         await automaticContribution.stop();
+        try {
+          await incrementalContribution?.stop();
+        } catch {
+          onError("incremental_contribution_stop_failed");
+        }
         await releaseAutomaticContributionInstanceLock();
       })();
     }
     return automaticContributionShutdown;
+  };
+  // Single-instance exclusion is cheap (one lock file) and must still be
+  // decided before this process is allowed to accept requests, so it stays on
+  // the pre-listen path. Only the snapshot build moves behind the port.
+  const acquireInstanceLock = () => {
+    if (instanceLockPromise === null) {
+      instanceLockPromise = (async () => {
+        automaticContributionInstanceLock =
+          await acquireAutomaticContributionInstanceLock({
+            lockFile: statePaths.automaticContributionLockFile,
+          });
+      })();
+    }
+    return instanceLockPromise;
+  };
+  // Resolved the moment the outcome of the first build is known. A failing
+  // build still finishes stopping automatic contribution before it rethrows -
+  // the instance lock must outlive that cleanup - but a request waiting to read
+  // the snapshot is answered as soon as the answer exists, not held behind
+  // someone else's teardown.
+  let announceSnapshotOutcome = null;
+  const snapshotOutcome = new Promise((resolveOutcome) => {
+    announceSnapshotOutcome = resolveOutcome;
+  });
+  const buildSnapshot = () => {
+    if (snapshotPromise === null) {
+      snapshotPromise = (async () => {
+        try {
+          await dataStore.initialize();
+          await automaticContribution.start();
+          // v1.0 incremental sync starts beside the v0.1 scheduler; a
+          // failure here must never take the v0.1 path or the snapshot down.
+          try {
+            await incrementalContribution?.start();
+          } catch {
+            onError("incremental_contribution_start_failed");
+          }
+          snapshotState = { status: "ready", errorCode: null };
+          announceSnapshotOutcome();
+        } catch (error) {
+          snapshotState = {
+            status: "failed",
+            errorCode: typeof error?.code === "string"
+              && /^[a-z0-9_]{1,64}$/u.test(error.code)
+              ? error.code
+              : "snapshot_unavailable",
+          };
+          announceSnapshotOutcome();
+          await shutdownAutomaticContribution().catch(() => {});
+          throw error;
+        }
+      })();
+    }
+    return snapshotPromise;
+  };
+  // Read routes wait for the first build instead of projecting an empty or
+  // half-built snapshot. A build that failed is reported as a failure rather
+  // than waited on forever.
+  const whenSnapshotSettled = async () => {
+    buildSnapshot().catch(() => {});
+    await snapshotOutcome;
+    return snapshotState;
   };
   const refresh = new LocalCompanionRefreshController({
     runner: refreshRunner,
@@ -2134,12 +2575,15 @@ function createPreparedLocalCompanionServer({
         return;
       }
       const path = url.pathname;
-      // No route here accepts a query string. Hosted sign-in used to redirect
-      // back to a loopback callback on this companion, which was the one
+      // Only the window-breakdown route accepts a query string, and only its
+      // two bounded integer parameters. Hosted sign-in used to redirect back to
+      // a loopback callback on this companion, which was the previous
       // exception; both providers now redirect to the contribution service's
       // own callback and the dashboard collects the result over the relay, so
-      // nothing on this origin ever receives a provider's ?code again.
-      if (url.search !== "" || url.hash !== "") {
+      // nothing on this origin ever receives a provider's ?code again. Every
+      // other route stays query-free by construction.
+      const acceptsQueryString = path === "/api/local/timeline/window-breakdown";
+      if (url.hash !== "" || (url.search !== "" && !acceptsQueryString)) {
         sendError(response, 400, "invalid_request");
         return;
       }
@@ -2202,15 +2646,42 @@ function createPreparedLocalCompanionServer({
         sendError(response, 404, "not_found");
         return;
       }
+      // The listening port no longer proves the snapshot exists: it is opened
+      // first so the window, its static assets, and readiness answer at once.
+      // Every route that reads the snapshot therefore waits for the first build
+      // here, and a build that failed is refused rather than answered with an
+      // empty projection. Health and the diagnostic note stay outside the gate
+      // precisely so a slow or failed build can still be observed.
+      if (path.startsWith("/api/") && !SNAPSHOT_INDEPENDENT_API_ROUTES.has(path)) {
+        if ((await whenSnapshotSettled()).status !== "ready") {
+          sendError(response, 503, "snapshot_unavailable");
+          return;
+        }
+      }
 
       if (path === "/api/local/health") {
         if (request.method !== "GET") {
           sendError(response, 405, "method_not_allowed");
           return;
         }
+        // The dashboard's approve-once surface lights up only when this
+        // advertises exactly the v1.0 contract: a configured contribution
+        // service origin AND an existing unified index (the upload source).
+        const incrementalSyncCapability = incrementalContribution !== null
+          && await unifiedIndexPresent()
+          ? TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION
+          : false;
         send(response, 200, {
           schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
           status: "ready",
+          // `status` above states that this loopback surface is answering, which
+          // it now does from the first millisecond. Whether the evidence
+          // snapshot behind the read routes exists yet is a separate fact, and
+          // it is stated separately rather than being folded into that word.
+          snapshot: {
+            status: snapshotState.status,
+            errorCode: snapshotState.errorCode,
+          },
           mode: "loopback_real_local_evidence",
           remoteUploadEnabled: false,
           capabilities: {
@@ -2224,8 +2695,11 @@ function createPreparedLocalCompanionServer({
             contributionSyncNext: syncPreviewConfigured,
             contributionDevicePairing:
               contributionDevicePairingConfigured,
+            contributionDeviceDisconnect:
+              contributionDeviceDisconnectConfigured,
             contributionSyncExactReview: syncExactReviewConfigured,
             contributionSyncActions: syncDeliveryConfigured,
+            incrementalContributionSync: incrementalSyncCapability,
             centralServiceProxy: centralProxy.enabled,
             centralParticipantRelay: participantRelay.enabled,
             arbitraryPathAccess: false,
@@ -2316,6 +2790,47 @@ function createPreparedLocalCompanionServer({
           return;
         }
         send(response, 200, dataStore.getReports());
+        return;
+      }
+      if (path === "/api/local/timeline/window-breakdown") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        // The two bounded integer parameters, and only those. Anything else in
+        // the query string is refused rather than ignored, so the one route
+        // that reads a query string cannot be turned into a general parameter
+        // channel. The window itself is bounded and validated by the reader.
+        const allowed = new Set(["from", "to"]);
+        for (const key of url.searchParams.keys()) {
+          if (!allowed.has(key)) {
+            sendError(response, 400, "invalid_request");
+            return;
+          }
+        }
+        const fromMs = integerParameter(url.searchParams.get("from"));
+        const toMs = integerParameter(url.searchParams.get("to"));
+        if (fromMs === null || toMs === null) {
+          sendError(response, 400, "invalid_request");
+          return;
+        }
+        let breakdown;
+        try {
+          breakdown = await windowBreakdownProvider({ fromMs, toMs });
+        } catch (error) {
+          sendError(
+            response,
+            error?.code === "window_range_invalid" ? 400 : 500,
+            error?.code === "window_range_invalid"
+              ? "window_range_invalid"
+              : "window_breakdown_unavailable",
+          );
+          return;
+        }
+        send(response, 200, {
+          schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+          breakdown,
+        });
         return;
       }
       if (path === "/api/local/contribution/preview") {
@@ -2463,6 +2978,91 @@ function createPreparedLocalCompanionServer({
         }
         return;
       }
+      if (path === "/api/local/contribution/incremental-status") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        if (incrementalContribution === null) {
+          send(response, 200, incrementalSyncStatusProjection(null, {
+            configured: false,
+          }));
+          return;
+        }
+        let status;
+        try {
+          status = await incrementalContribution.inspect();
+        } catch {
+          status = null;
+        }
+        send(response, 200, incrementalSyncStatusProjection(status, {
+          configured: true,
+        }));
+        return;
+      }
+      if (path === "/api/local/contribution/incremental-approve") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        // Approve-once consent for the v1.0 incremental model. The review
+        // token proves one verified real instance of the covered data was on
+        // screen (the review-bootstrap requirement carried into the
+        // approve-once flow); it is single-use, exactly like sync-once.
+        const reviewToken = await authorizeReviewedContributionMutation(
+          request,
+          response,
+          "incremental_consent_not_authorized",
+        );
+        if (reviewToken === null) return;
+        if (incrementalContribution === null) {
+          sendError(response, 409, "incremental_sync_not_configured");
+          return;
+        }
+        const authorization = reviewedContributionAuthorization;
+        reviewedContributionAuthorization = null;
+        if (authorization === null
+            || authorization.expiresAt < Date.now()
+            || authorization.reviewToken !== reviewToken) {
+          sendError(response, 409, "review_expired_or_changed");
+          return;
+        }
+        let approved;
+        try {
+          approved = await incrementalContribution.approve();
+        } catch {
+          sendError(response, 500, "incremental_consent_failed");
+          return;
+        }
+        if (approved?.consent?.approved !== true
+            || approved?.consent?.current !== true
+            || nullableInstant(approved.consent.consentedAt) === null) {
+          sendError(response, 500, "incremental_consent_failed");
+          return;
+        }
+        send(response, 200, {
+          schemaVersion: "local-incremental-contribution-consent-v1.0",
+          status: "approved",
+          contractVersion: TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+          consentedAt: nullableInstant(approved.consent.consentedAt),
+          includesIdentifiers: false,
+          includesCredentials: false,
+        });
+        // 2026-08-08 (owner-directed immediate first pass): approval must
+        // become a running sync pass now, not a pending timer the user cannot
+        // see — production showed "waiting for the first pass" indefinitely.
+        // The controller's approve() already schedules an immediate attempt;
+        // this explicit due-run starts it in this tick while respecting the
+        // controller's own serialization and the shared v0.1 sync lock (a
+        // concurrent pass fails that run closed and the bounded retry ladder
+        // re-runs it). Best-effort by design: the scheduled attempt survives.
+        try {
+          void incrementalContribution.runDue?.()?.catch?.(() => {});
+        } catch {
+          // deliberately ignored
+        }
+        return;
+      }
       if (path === "/api/local/accounting/fast-mode-preference") {
         if (request.method === "GET") {
           try {
@@ -2556,6 +3156,10 @@ function createPreparedLocalCompanionServer({
           );
           return;
         }
+        if (contributionDeviceDisconnectInProgress) {
+          sendError(response, 409, "sync_in_progress");
+          return;
+        }
         try {
           const paired = await pairContributionDevice({ pairingCode });
           const expiresAt = nullableInstant(paired?.expiresAt);
@@ -2563,6 +3167,33 @@ function createPreparedLocalCompanionServer({
               || paired?.scope !== "upload_registration"
               || expiresAt === null) {
             throw new Error("pairing response invalid");
+          }
+          // The sync queue auto-pauses when the service reports the device
+          // credential invalid (device_unavailable); a successful pairing is
+          // the cure, so it resumes here. Best-effort: the pairing itself
+          // succeeded, and the sync status surface still reports a paused
+          // queue if this resume fails.
+          try {
+            await setContributionPaused({ paused: false });
+          } catch {
+            // deliberately ignored
+          }
+          // The v1.0 incremental sync pauses on the same trigger and is
+          // cured by the same pairing, equally best-effort.
+          try {
+            await incrementalContribution?.resume();
+          } catch {
+            // deliberately ignored
+          }
+          // 2026-08-08 (owner-directed): a fresh pairing translates into a
+          // prompt sync attempt too — the re-pair path (a v0.1-consent claim
+          // being replaced by a v1.0 one) must not leave its first pass
+          // waiting on a timer the user cannot see. Same serialization
+          // guarantees as the approval kick above.
+          try {
+            void incrementalContribution?.runDue?.()?.catch?.(() => {});
+          } catch {
+            // deliberately ignored
           }
           send(response, 200, {
             schemaVersion: "local-contribution-device-pairing-v0.1",
@@ -2585,6 +3216,59 @@ function createPreparedLocalCompanionServer({
         }
         return;
       }
+      if (path === "/api/local/contribution/device-disconnect") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        if (!await authorizeContributionDeviceDisconnect(request, response)) return;
+        if (!contributionDeviceDisconnectConfigured) {
+          sendError(response, 409, "contribution_device_disconnect_not_configured");
+          return;
+        }
+        if (contributionSyncInProgress || contributionDeviceDisconnectInProgress) {
+          sendError(response, 409, "sync_in_progress");
+          return;
+        }
+        contributionDeviceDisconnectInProgress = true;
+        let disconnected;
+        try {
+          disconnected = await disconnectContributionDevice();
+        } catch (error) {
+          const cleanupPending = error?.code
+            === "contribution_device_disconnect_cleanup_pending";
+          sendError(
+            response,
+            cleanupPending ? 409 : 502,
+            cleanupPending
+              ? "contribution_device_disconnect_cleanup_pending"
+              : "contribution_device_disconnect_failed",
+          );
+          return;
+        } finally {
+          contributionDeviceDisconnectInProgress = false;
+        }
+        if (disconnected?.status !== "disconnected"
+            || disconnected.deliveryPaused !== true
+            || !["deleted", "already_missing"].includes(
+              disconnected.localCredential,
+            )
+            || disconnected.localBinding !== "removed") {
+          sendError(response, 500, "contribution_device_disconnect_failed");
+          return;
+        }
+        send(response, 200, {
+          schemaVersion: LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION,
+          status: "disconnected",
+          deliveryPaused: true,
+          localCredential: disconnected.localCredential,
+          localBinding: "removed",
+          includesIdentifiers: false,
+          includesCredentials: false,
+          hostedDataDeleted: false,
+        });
+        return;
+      }
       if (path === "/api/local/contribution/device-credential-reset") {
         if (request.method !== "POST") {
           sendError(response, 405, "method_not_allowed");
@@ -2594,6 +3278,10 @@ function createPreparedLocalCompanionServer({
           request,
           response,
         )) return;
+        if (contributionDeviceDisconnectInProgress) {
+          sendError(response, 409, "sync_in_progress");
+          return;
+        }
         let reset;
         try {
           reset = await resetContributionDeviceCredential();
@@ -2675,7 +3363,7 @@ function createPreparedLocalCompanionServer({
           sendError(response, 409, "review_expired_or_changed");
           return;
         }
-        if (contributionSyncInProgress) {
+        if (contributionSyncInProgress || contributionDeviceDisconnectInProgress) {
           sendError(response, 409, "sync_in_progress");
           return;
         }
@@ -2742,7 +3430,7 @@ function createPreparedLocalCompanionServer({
           response,
           "sync_control_not_authorized",
         )) return;
-        if (contributionSyncInProgress) {
+        if (contributionSyncInProgress || contributionDeviceDisconnectInProgress) {
           sendError(response, 409, "sync_in_progress");
           return;
         }
@@ -2776,7 +3464,15 @@ function createPreparedLocalCompanionServer({
           "refresh_not_authorized",
         )) return;
         if (!refresh.start()) {
-          sendError(response, 409, "refresh_in_progress");
+          // Keep the terminal receipt's opaque run identifier available to a
+          // first-party native caller that joined an already-running explicit
+          // refresh. It contains no account or evidence data and lets the
+          // caller reject a later, unrelated terminal receipt.
+          send(response, 409, {
+            schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+            error: { code: "refresh_in_progress" },
+            refresh: refresh.getStatus(),
+          });
           return;
         }
         send(response, 202, {
@@ -2813,9 +3509,13 @@ function createPreparedLocalCompanionServer({
           return;
         }
         try {
-          const body = await readFixedFile(
+          const reportPath = await resolveLocalLegacyReportReadPath(
             resourceRoot,
             report.file,
+          );
+          const body = await readFixedFile(
+            resourceRoot,
+            reportPath,
             MAX_REPORT_BYTES,
           );
           send(response, 200, body, report.type, { report: true });
@@ -2838,7 +3538,7 @@ function createPreparedLocalCompanionServer({
             MAX_STATIC_BYTES,
           );
           const body = staticFile.file === "index.html"
-            ? stampSemanticOpenTarget(source)
+            ? stampLocalDashboard(source)
             : source;
           send(response, 200, body, staticFile.type);
         } catch {
@@ -2866,23 +3566,12 @@ function createPreparedLocalCompanionServer({
     automaticContribution,
     [PARENT_WATCHDOG_PID]: parentWatchdogPid,
     async initialize() {
-      if (initializationPromise === null) {
-        initializationPromise = (async () => {
-          automaticContributionInstanceLock =
-            await acquireAutomaticContributionInstanceLock({
-              lockFile: statePaths.automaticContributionLockFile,
-            });
-          try {
-            await dataStore.initialize();
-            await automaticContribution.start();
-          } catch (error) {
-            await shutdownAutomaticContribution().catch(() => {});
-            throw error;
-          }
-        })();
-      }
-      return initializationPromise;
+      await acquireInstanceLock();
+      await buildSnapshot();
     },
+    acquireInstanceLock,
+    buildSnapshot,
+    snapshotStatus: () => ({ ...snapshotState }),
     shutdownAutomaticContribution,
   };
 }
@@ -2909,7 +3598,14 @@ export async function startLocalCompanionServer({
     terminateProcess: terminateProcessOnParentDeath,
   });
   try {
-    await app.initialize();
+    // Single-instance exclusion still decides whether this process may serve at
+    // all, so it stays ahead of listen(). The snapshot build does not: it used
+    // to hold the port shut for the 3-7 s it takes to read the retained
+    // collector state on a real install, and for far longer when a rejected
+    // accounting cache forces a full re-price - long enough to exceed the
+    // launcher's own startup budget and have the companion killed before it
+    // could finish repairing itself.
+    await app.acquireInstanceLock();
     if (!declaredParentIsCurrent(expectedParentPid)) {
       throw parentWatchdogConfigurationError();
     }
@@ -2929,10 +3625,16 @@ export async function startLocalCompanionServer({
     await app.shutdownAutomaticContribution().catch(() => {});
     throw error;
   }
+  // Started behind the open port. The read routes await this same promise, and
+  // a failure is surfaced through `snapshotReady` rather than being swallowed:
+  // it still stops automatic contribution and releases the instance lock.
+  const snapshotReady = app.buildSnapshot();
+  snapshotReady.catch(() => {});
   return {
     ...app,
     host,
     port: actualPort(app.server),
+    snapshotReady,
     close: async () => {
       parentWatchdog.stop();
       await closeHttpServer(app.server);
@@ -2959,6 +3661,19 @@ if (process.argv[1]
       () => process.exit(1),
     );
   };
+  // A snapshot that cannot be built leaves nothing for the read routes to
+  // project, so the process still exits and the host still sees a failed
+  // companion - the same outcome as before the port moved ahead of the build,
+  // reported once the port is open rather than in place of opening it.
+  app.snapshotReady.catch(() => {
+    if (closing) return;
+    closing = true;
+    app.server.closeAllConnections?.();
+    void app.close().then(
+      () => process.exit(1),
+      () => process.exit(1),
+    );
+  });
   process.once("SIGINT", close);
   process.once("SIGTERM", close);
 }

@@ -20,6 +20,7 @@ import {
   inspectExactNextContributionSyncUpload,
   inspectContributionSyncQueue,
   inspectNextContributionSyncUpload,
+  RETRY_BACKOFF_POLICY,
   retireAcceptedContributionArtifacts,
   runContributionSyncQueueOnce,
   runContributionSyncQueueWatch,
@@ -51,6 +52,17 @@ import {
 const ORIGIN = "https://usage.example";
 const ACCEPTED_ID =
   "contribution:11111111-1111-4111-8111-111111111111";
+
+test("retry backoff policy is a named immutable contract", () => {
+  assert.equal(Object.isFrozen(RETRY_BACKOFF_POLICY), true);
+  assert.deepEqual(RETRY_BACKOFF_POLICY, {
+    initialDelayMilliseconds: 5_000,
+    maximumDelayMilliseconds: 3_600_000,
+    minimumDelayMilliseconds: 1_000,
+    jitterMinimumMultiplier: 0.75,
+    jitterMaximumMultiplier: 1.25,
+  });
+});
 
 function usage(index = 1) {
   return {
@@ -417,6 +429,50 @@ test("prepared-set-bound automatic send cannot process older queued sets", async
   assert.equal(calls[0].entry.sha256, newer.manifest.files[0].sha256);
 });
 
+test("prepared-set-bound automatic retry returns only its selected checkpoint", async () => {
+  const value = await fixture({ spool: true });
+  const selected = await createPreparedSet(value.preparedRoot, {
+    setName: `prepared-set-${randomUUID()}`,
+    index: 2,
+  });
+  const olderId = preparedContributionSetId(value.prepared.manifest);
+  const selectedId = preparedContributionSetId(selected.manifest);
+  const older = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    preparedSetId: olderId,
+    now: () => new Date("2026-07-26T12:00:00.000Z"),
+    random: () => 0,
+    syncEntry: async () => {
+      throw new ContributionDeviceSyncError("service_unavailable", {
+        retryable: true,
+        retryAfterMilliseconds: 60_000,
+      });
+    },
+  });
+  assert.equal(older.retryNotBeforeAt, "2026-07-26T12:01:00.000Z");
+
+  const selectedResult = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    preparedSetId: selectedId,
+    now: () => new Date("2026-07-26T12:00:00.000Z"),
+    random: () => 0,
+    syncEntry: async () => {
+      throw new ContributionDeviceSyncError("service_unavailable", {
+        retryable: true,
+        retryAfterMilliseconds: 120_000,
+      });
+    },
+  });
+  assert.equal(selectedResult.queue.nextAttemptAt, "2026-07-26T12:01:00.000Z");
+  assert.equal(selectedResult.retryNotBeforeAt, "2026-07-26T12:02:00.000Z");
+});
+
 test("inspect-next rejects arbitrary text in projected classification fields", async () => {
   const value = await fixture();
   await assert.rejects(
@@ -605,6 +661,73 @@ test("retryable failures use bounded backoff and later produce one accepted row"
     attempt_count: 2,
     contribution_id: ACCEPTED_ID,
   });
+});
+
+test("retryable failures honor Retry-After before adding bounded client spread", async () => {
+  const value = await fixture();
+  const clock = Date.parse("2026-07-26T12:00:00.000Z");
+  const result = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    now: () => new Date(clock),
+    random: () => 0.5,
+    syncEntry: async () => {
+      throw new ContributionDeviceSyncError("service_unavailable", {
+        retryable: true,
+        retryAfterMilliseconds: 60_000,
+      });
+    },
+  });
+  assert.equal(result.retryable, 1);
+  // 60 seconds is the service floor; the half-random client adds 7.5 seconds
+  // (half of the bounded 15-second, 25% spread).
+  assert.equal(result.queue.nextAttemptAt, "2026-07-26T12:01:07.500Z");
+});
+
+test("an interruption cannot undercut a Retry-After floor", async () => {
+  const value = await fixture();
+  const abort = new AbortController();
+  const result = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    now: () => new Date("2026-07-26T12:00:00.000Z"),
+    random: () => 0.5,
+    signal: abort.signal,
+    syncEntry: async () => {
+      abort.abort();
+      throw new ContributionDeviceSyncError("service_unavailable", {
+        retryable: true,
+        retryAfterMilliseconds: 60_000,
+      });
+    },
+  });
+  assert.equal(result.status, "interrupted");
+  assert.equal(result.retryable, 1);
+  assert.equal(result.queue.nextAttemptAt, "2026-07-26T12:01:07.500Z");
+});
+
+test("an over-horizon Retry-After pauses instead of scheduling an earlier retry", async () => {
+  const value = await fixture();
+  const result = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    now: () => new Date("2026-07-26T12:00:00.000Z"),
+    syncEntry: async () => {
+      throw new ContributionDeviceSyncError("service_unavailable", {
+        retryable: true,
+        retryAfterExceedsMaximum: true,
+      });
+    },
+  });
+  assert.equal(result.status, "paused");
+  assert.equal(result.retryable, 1);
+  assert.equal(result.queue.paused, true);
 });
 
 test("terminal validation failures are rejected without automatic replay", async () => {

@@ -8,7 +8,9 @@ import {
   validateTelemetryContributionV02,
   type TelemetryContributionV02,
 } from "./telemetry-v0.2";
+import { canonicalJson } from "./canonical-json";
 import { ApiError } from "./errors";
+import { parseStoredRecordJson } from "./stored-record";
 
 export interface TelemetryV02Insert {
   participantId: string;
@@ -55,16 +57,6 @@ function transportMetadata(record: TelemetryContributionV02): TelemetryTransport
   };
 }
 
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  if (value && typeof value === "object") {
-    return `{${Object.keys(value as Record<string, unknown>).sort()
-      .map((key) => `${JSON.stringify(key)}:${canonicalJson(Reflect.get(value, key))}`)
-      .join(",")}}`;
-  }
-  return JSON.stringify(value);
-}
-
 async function assertOccurrenceCompatibility(
   db: D1Database,
   participantId: string,
@@ -105,12 +97,11 @@ async function assertOccurrenceCompatibility(
       record_json?: unknown;
     } | undefined;
     if (!found) continue;
-    let storedCanonical = "";
-    try {
-      storedCanonical = canonicalJson(JSON.parse(String(found.record_json)));
-    } catch {
+    const storedRecord = parseStoredRecordJson(found.record_json);
+    if (!storedRecord) {
       throw new ApiError(409, "TELEMETRY_OCCURRENCE_CONFLICT");
     }
+    const storedCanonical = canonicalJson(storedRecord);
     const expected = incoming[index]!;
     if (found.account_track_id !== expected.accountTrackId
         || found.policy_epoch !== expected.policyEpoch

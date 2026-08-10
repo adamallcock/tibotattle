@@ -39,6 +39,8 @@ export const CONTRIBUTION_SYNC_QUEUE_SCHEMA =
   contributionSyncQueue.CONTRIBUTION_SYNC_QUEUE_SCHEMA;
 export const CONTRIBUTION_SYNC_STATUS_SCHEMA =
   contributionSyncQueue.CONTRIBUTION_SYNC_STATUS_SCHEMA;
+export const RETRY_BACKOFF_POLICY =
+  contributionSyncQueue.RETRY_BACKOFF_POLICY;
 export const ContributionSyncQueueError =
   contributionSyncQueue.ContributionSyncQueueError;
 export const conservativeUploadReservationBytes =

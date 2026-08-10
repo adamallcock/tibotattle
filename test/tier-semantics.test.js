@@ -35,6 +35,25 @@ test("clear, omission, and future values remain explicit unknown or other values
   assert.equal(future.providerTierRaw, "ultra");
 });
 
+test("lineage_inherited is a valid provenance and normalizes speed like any observation", () => {
+  // Session-lineage speed carry-forward: a fork descendant seeded from its
+  // ancestor chain records the tier under lineage_inherited — same speed
+  // semantics, distinct provenance. It must validate end to end.
+  const inherited = normalizeProviderTier("priority", {
+    billingSurface: "chatgpt_subscription",
+    tierSource: "lineage_inherited",
+    tierObservedAt: "2026-07-25T00:00:00.000Z",
+  });
+  assert.equal(inherited.codexSpeedMode, "fast");
+  assert.equal(inherited.tierSource, "lineage_inherited");
+  assert.deepEqual(validateTierDeclaration(inherited), inherited);
+  // The vocabulary is closed: an unknown provenance still throws.
+  assert.throws(() => normalizeProviderTier("priority", {
+    billingSurface: "chatgpt_subscription",
+    tierSource: "global_carry_forward",
+  }), /tierSource is invalid/);
+});
+
 test("tier declaration rejects cross-surface conflation", () => {
   assert.throws(() => validateTierDeclaration({
     billingSurface: "chatgpt_subscription",

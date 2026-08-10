@@ -80,7 +80,7 @@ The two line charts answer different questions—temporal value stability versus
 - Provider coupling policy: `https://learn.chatgpt.com/docs/pricing` (checked July 24, 2026)
 - Reviewed public API: `src/reporting/index.js`
 - Tests: `test/weekly-calibration.test.js`
-- Canonical report artifact: `2026-07-24-weekly-7-day-calibration-artifact.json`
-- Portable report: `2026-07-24-weekly-7-day-calibration-report.html`
+- Canonical report artifact: `.usage-monitor/legacy-reports/2026-07-24-weekly-7-day-calibration-artifact.json`
+- Portable report: `.usage-monitor/legacy-reports/2026-07-24-weekly-7-day-calibration-report.html`
 
 Final QA: 173 repository tests passed; 467 independent calibration checks passed; portable report source interaction and responsive checks passed at 1440 px and 390 px.

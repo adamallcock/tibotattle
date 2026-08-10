@@ -6,6 +6,7 @@ import {
   readdir,
   realpath,
 } from "node:fs/promises";
+import { isIP } from "node:net";
 import {
   basename,
   dirname,
@@ -26,6 +27,28 @@ export const SPARKLE_LICENSE_SHA256 =
   "816be66341dd11b22806862dffd8392b240babaced1cdf24da2ff413ef00c3fd";
 export const SPARKLE_UPSTREAM_LICENSE_SHA256 =
   "389a4e4e9a32f059775b13a06e25a591445ba229d2838d26dd3e7c0c45127cfe";
+export const SPARKLE_TOOLS_DIRECTORY_NAME = "SparkleTools";
+
+// These are the public release tools needed to sign an update, generate an
+// appcast, and optionally create a BinaryDelta. `generate_keys` is deliberately
+// not staged: key generation and private-key custody remain outside this tree.
+export const SPARKLE_TOOL_FILES = Object.freeze({
+  BinaryDelta: Object.freeze({
+    archivePath: "./bin/BinaryDelta",
+    mode: "755",
+    sha256: "6f4e7b70aa04d53808c5679b58a839aef2e413b48b06f4427b3fa32898ef9162",
+  }),
+  generate_appcast: Object.freeze({
+    archivePath: "./bin/generate_appcast",
+    mode: "755",
+    sha256: "d70b1872fb6a859695f8abc0a403301d151d1c6c83cf427f4a2716c37a48983d",
+  }),
+  sign_update: Object.freeze({
+    archivePath: "./bin/sign_update",
+    mode: "755",
+    sha256: "bfb52400c3da18bb4c251ac4818c2c2e1e31c2e649a45b31c11109b6e57b34ad",
+  }),
+});
 
 export const SPARKLE_FRAMEWORK_LINKS = Object.freeze({
   Autoupdate: "Versions/Current/Autoupdate",
@@ -165,6 +188,60 @@ export async function inspectPinnedSparkleFramework(path) {
   });
 }
 
+export async function inspectPinnedSparkleTools(path) {
+  if (typeof path !== "string" || path.length === 0 || path.includes("\0")) {
+    fail("A reviewed Sparkle tools path is required");
+  }
+  const selected = resolve(path);
+  if (basename(selected) !== SPARKLE_TOOLS_DIRECTORY_NAME) {
+    fail(`Updater tools directory must be named ${SPARKLE_TOOLS_DIRECTORY_NAME}`);
+  }
+  const metadata = await lstat(selected).catch(() => {
+    fail("The reviewed Sparkle tools input is unavailable");
+  });
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    fail("The reviewed Sparkle tools input must be a real directory");
+  }
+  if (await realpath(selected) !== selected) {
+    fail("The reviewed Sparkle tools path must not traverse a link");
+  }
+
+  const expectedNames = Object.keys(SPARKLE_TOOL_FILES).sort();
+  const observedEntries = (await readdir(selected, {
+    withFileTypes: true,
+  })).map((entry) => entry.name).sort();
+  if (JSON.stringify(observedEntries) !== JSON.stringify(expectedNames)) {
+    fail("Sparkle tools directory contains an unexpected file set");
+  }
+
+  const tools = [];
+  for (const name of expectedNames) {
+    const toolPath = join(selected, name);
+    const toolMetadata = await lstat(toolPath);
+    if (!toolMetadata.isFile() || toolMetadata.isSymbolicLink()
+        || await realpath(toolPath) !== toolPath) {
+      fail(`Sparkle tool must be a regular non-linked file: ${name}`);
+    }
+    const mode = (toolMetadata.mode & 0o777).toString(8).padStart(3, "0");
+    const expected = SPARKLE_TOOL_FILES[name];
+    if (mode !== expected.mode) {
+      fail(`Sparkle tool has an unexpected mode: ${name}`);
+    }
+    const sha256 = createHash("sha256")
+      .update(await readFile(toolPath))
+      .digest("hex");
+    if (sha256 !== expected.sha256) {
+      fail(`Sparkle tool does not match the pinned release: ${name}`);
+    }
+    tools.push(Object.freeze({ mode, name, path: toolPath, sha256 }));
+  }
+  return Object.freeze({
+    path: selected,
+    tools: Object.freeze(tools),
+    version: SPARKLE_VERSION,
+  });
+}
+
 function normalizeAppcastURL(value) {
   if (typeof value !== "string" || value.length === 0
       || value.includes("\0")) {
@@ -176,13 +253,17 @@ function normalizeAppcastURL(value) {
   } catch {
     fail("Updater appcast URL must be an absolute HTTPS URL");
   }
+  const hostname = selected.hostname.startsWith("[")
+    ? selected.hostname.slice(1, -1)
+    : selected.hostname;
   if (selected.protocol !== "https:"
       || selected.username || selected.password
       || selected.search || selected.hash
       || ["localhost", "127.0.0.1", "[::1]"].includes(selected.hostname)
+      || isIP(hostname) !== 0
       || selected.pathname === "/"
       || selected.href !== value) {
-    fail("Updater appcast URL must be an exact non-loopback HTTPS URL");
+    fail("Updater appcast URL must be an exact HTTPS DNS URL");
   }
   return selected.href;
 }
@@ -197,18 +278,47 @@ function normalizePublicEdKey(value) {
   return value;
 }
 
+export function normalizeMacOSUpdaterMetadata({
+  appcastURL = null,
+  publicEdKey = null,
+} = {}) {
+  if (appcastURL === null || appcastURL === undefined || appcastURL === ""
+      || publicEdKey === null || publicEdKey === undefined
+      || publicEdKey === "") {
+    fail(
+      "Updater appcast URL and public Ed25519 key are required",
+      "MACOS_UPDATER_REQUIRED_FOR_DISTRIBUTION",
+    );
+  }
+  return Object.freeze({
+    appcastURL: normalizeAppcastURL(appcastURL),
+    publicEdKey: normalizePublicEdKey(publicEdKey),
+  });
+}
+
 export async function normalizeMacOSUpdaterConfiguration({
   appcastURL = null,
   externalDistribution = false,
+  previewDistribution = false,
   frameworkPath = null,
   publicEdKey = null,
 } = {}) {
   if (typeof externalDistribution !== "boolean") {
     fail("externalDistribution must be a boolean");
   }
+  if (typeof previewDistribution !== "boolean") {
+    fail("previewDistribution must be a boolean");
+  }
+  if (externalDistribution && previewDistribution) {
+    fail(
+      "Production and preview updater channels are mutually exclusive",
+      "MACOS_UPDATER_CHANNEL_CONFLICT",
+    );
+  }
+  const distributionEnabled = externalDistribution || previewDistribution;
   const provided = [appcastURL, frameworkPath, publicEdKey]
     .some((value) => value !== null && value !== undefined && value !== "");
-  if (!externalDistribution) {
+  if (!distributionEnabled) {
     if (provided) {
       fail(
         "Updater inputs are forbidden in development and ad-hoc builds",
@@ -217,6 +327,9 @@ export async function normalizeMacOSUpdaterConfiguration({
     }
     return Object.freeze({
       appcastURL: null,
+      automaticChecks: false,
+      automaticUpdatesEnabledByDefault: false,
+      allowsAutomaticUpdateOptIn: false,
       enabled: false,
       framework: null,
       publicEdKey: null,
@@ -232,11 +345,21 @@ export async function normalizeMacOSUpdaterConfiguration({
     );
   }
   const framework = await inspectPinnedSparkleFramework(frameworkPath);
+  const metadata = normalizeMacOSUpdaterMetadata({
+    appcastURL,
+    publicEdKey,
+  });
   return Object.freeze({
-    appcastURL: normalizeAppcastURL(appcastURL),
+    appcastURL: metadata.appcastURL,
+    // A preview client shares the normal bundle identifier so it can exercise
+    // the same OAuth callback registration. It must never silently consume a
+    // production-signed update merely because it was opened for testing.
+    automaticChecks: externalDistribution,
+    automaticUpdatesEnabledByDefault: externalDistribution,
+    allowsAutomaticUpdateOptIn: externalDistribution,
     enabled: true,
     framework,
-    publicEdKey: normalizePublicEdKey(publicEdKey),
+    publicEdKey: metadata.publicEdKey,
     version: SPARKLE_VERSION,
   });
 }

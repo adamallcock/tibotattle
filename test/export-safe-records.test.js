@@ -4,8 +4,10 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  normalizeActivityMarker,
   normalizeClaudeStatusQuotaSnapshots,
   normalizeCodexCollectorQuotaCandidate,
+  normalizeCodexQuotaSnapshot,
   scanCodexSafeRecords,
   summarizeActivityMarkerPlan,
 } from "../src/export-safe-records.js";
@@ -158,7 +160,7 @@ function claudeStatus(overrides = {}) {
   };
 }
 
-test("safe-record adapter emits validated metadata-only envelopes matching the legacy bundle bytes", async () => {
+test("safe-record adapter preserves scanner-release order while its canonical bundle matches legacy bytes", async () => {
   const home = await safeRecordFixture();
   try {
     const envelopes = [];
@@ -187,7 +189,10 @@ test("safe-record adapter emits validated metadata-only envelopes matching the l
     });
 
     assert.deepEqual(envelopes.map(({ recordType }) => recordType), [
-      "quotaSnapshot", "quotaSnapshot", "usageEvent", "activityMarker",
+      // Leading quota snapshots are deliberately held until the parser has
+      // accepted a real usage record; this is the scanner's streaming order,
+      // while the bundle comparison below remains canonicalized.
+      "usageEvent", "quotaSnapshot", "quotaSnapshot", "activityMarker",
     ]);
     assert.equal(guard.snapshot().counters.outputRecords, envelopes.length);
     assert.equal(
@@ -263,6 +268,37 @@ test("collector candidates normalize deterministically without exporting source 
     observationIdentityMaterial: "f".repeat(64),
   }));
   assert.equal(notification.snapshotSource, "notification");
+});
+
+test("safe plan normalization retains canonical labels and fails closed for arbitrary identifiers", () => {
+  const quotaEvent = (planType) => normalizeCodexQuotaSnapshot(SECRET, {
+    timestamp: "2026-07-24T12:02:00.000Z",
+    sourceScopeId: `session:v1:${"a".repeat(64)}`,
+    window: {
+      limitId: "codex",
+      planType,
+      slot: "secondary",
+      usedPercent: 12.3,
+      windowDurationMins: 10_080,
+      resetsAt: 1_785_430_800,
+    },
+  });
+  const bounds = {
+    startMs: Date.parse(START_AT),
+    endMs: Date.parse(END_AT),
+  };
+  for (const [planType, expected] of [
+    ["go", "go"],
+    ["edu", "edu"],
+    ["prolite", "prolite"],
+    ["arbitrary-plan-name", "unknown"],
+  ]) {
+    assert.equal(quotaEvent(planType).planType, expected);
+    assert.equal(
+      normalizeActivityMarker(SECRET, { ...marker(), planType }, bounds).planType,
+      expected,
+    );
+  }
 });
 
 test("sessionless unattributed collector states cannot collapse across distinct observations", () => {

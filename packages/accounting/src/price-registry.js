@@ -1,11 +1,16 @@
 // Reviewed provider price evidence shared by local and edge accounting adapters.
 export const APP_PRICE_REGISTRY_OBSERVED_AT = "2026-08-01T13:47:00Z";
-// First official-page review; undated OpenAI rows assert no validity before it.
+// First official-page review. This is the review boundary, not a lower bound
+// on the reviewed model rates: recognized OpenAI/Codex events before this date
+// remain priceable unless a card has an explicit vendor-effective boundary.
 const OPENAI_FIRST_OBSERVED_DATE = "2026-07-26";
+export const OPENAI_PRICE_EVIDENCE_START_DATE = OPENAI_FIRST_OBSERVED_DATE;
+// Same review-boundary semantics as OpenAI above: this timestamp records when
+// the Anthropic pricing page was reviewed. It is provenance only and never a
+// lower bound on the reviewed model rates.
 const ANTHROPIC_OBSERVED_AT = "2026-07-25T14:18:33Z";
-const ANTHROPIC_OBSERVED_DATE = ANTHROPIC_OBSERVED_AT.slice(0, 10);
 const PER_MILLION = "1000000";
-export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.2";
+export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.4";
 
 export const OFFICIAL_PRICE_SOURCE_URLS = Object.freeze({
   openai: "https://developers.openai.com/api/docs/pricing",
@@ -48,7 +53,9 @@ const OPENAI_ROWS = Object.freeze([
   // 272K boundary is inclusive on the long side to preserve the monitor's
   // established threshold contract. GPT-5.6 Terra and Luna were officially
   // repriced effective 2026-07-30; Sol was not changed. The pre-change rows
-  // stay behind a closed validity window so historical pricing is preserved.
+  // retain the explicit vendor validity window so historical pricing is
+  // preserved. Undated rows remain open to reviewed historical events; the
+  // review date is provenance, not an invented model-rate start date.
   ["gpt-5.6-sol", "standard", "5", "0.5", "6.25", "30", "short"],
   ["gpt-5.6-sol", "standard", "10", "1", "12.5", "45", "long"],
   ["gpt-5.6-sol", "batch", "2.5", "0.25", "3.125", "15", "short"],
@@ -118,7 +125,12 @@ const OPENAI_ROWS = Object.freeze([
 ]);
 
 const ANTHROPIC_ROWS = Object.freeze([
-  // Values are base input, 5m write, 1h write, cache read, and output USD/MTok.
+  // Values are base input, 5m write, 1h write, cache read, and output USD/MTok,
+  // plus an optional dated validity period. Only Claude Sonnet 5 carries a
+  // published vendor boundary: the introductory rate runs through 2026-08-31 and
+  // the standard rate takes effect 2026-09-01. Every other row is undated and
+  // stays open-ended in both directions; the review date is provenance, not an
+  // invented model-rate start date.
   ["claude-fable-5", "standard", "10", "12.5", "20", "1", "50"],
   ["claude-fable-5", "batch", "5", "6.25", "10", "0.5", "25"],
   ["claude-haiku-4-5-20251001", "standard", "1", "1.25", "2", "0.1", "5"],
@@ -185,9 +197,9 @@ function provenance(provider, { vendorEffectiveFrom = null, vendorEffectiveTo = 
     evidence_urls: source.evidenceUrls,
     vendor_effective_from: vendorEffectiveFrom,
     vendor_effective_to: vendorEffectiveTo,
-    historical_validity: vendorEffectiveFrom
+    historical_validity: vendorEffectiveFrom || vendorEffectiveTo
       ? "official_vendor_window"
-      : "not_asserted_before_first_observation",
+      : "reviewed_rate_without_vendor_effective_date",
   };
 }
 
@@ -212,17 +224,14 @@ function cardId(provider, model, tier, suffix = "current") {
   return `${provider}:${model}:${tier}:${suffix}:official-observed-${observedDate}`;
 }
 
-// Undated rows begin at each provider's first review so pre-repricing history
-// stays priceable; new observations must not silently shift those windows.
-const FIRST_OBSERVED_DATES = Object.freeze({
-  openai: OPENAI_FIRST_OBSERVED_DATE,
-  anthropic: ANTHROPIC_OBSERVED_DATE,
-});
+// Effective-window helpers. The review dates remain provenance metadata for
+// every provider; only an explicit vendor-effective date constrains selection,
+// so all reviewed history stays priceable as far back as events go.
 
 function openAiEffective(period) {
   if (period === "through-2026-07-29") {
     return {
-      effective: { from: OPENAI_FIRST_OBSERVED_DATE, to: "2026-07-29" },
+      effective: { to: "2026-07-29" },
       vendorEffectiveFrom: null,
       vendorEffectiveTo: "2026-07-29",
       suffix: "through-2026-07-29",
@@ -237,12 +246,37 @@ function openAiEffective(period) {
     };
   }
   return {
-    effective: { from: OPENAI_FIRST_OBSERVED_DATE },
+    // No vendor-effective date was published for this row. An open effective
+    // range is deliberate: the reviewed card may price recognized historical
+    // events before the review date, while dated repricing rows below remain
+    // bounded by their explicit vendor boundary.
+    effective: {},
     vendorEffectiveFrom: null,
     vendorEffectiveTo: null,
     suffix: "current",
   };
 }
+
+// Routing aliases OpenAI exposes in the model picker that resolve to a model
+// already priced here. They are not separate products and are not listed
+// separately on the pricing page, so they share the target's rates rather than
+// falling through to "unrecognized" and losing their cost entirely. Each alias
+// must carry a stated assumption, because sharing a rate is a claim about
+// billing that the registry is asserting on the vendor's behalf.
+const OPENAI_MODEL_ALIASES = Object.freeze({
+  "gpt-5.4": ["codex-auto-review"],
+  "gpt-5.5": ["gpt-5.5-codex"],
+  "gpt-5.6-sol": ["gpt-5.6-sol-wm"],
+});
+
+const OPENAI_ALIAS_ASSUMPTIONS = Object.freeze({
+  "codex-auto-review":
+    "Owner-directed: priced at gpt-5.4 rates. codex-auto-review is an OpenAI-managed routing alias and the underlying model is not publicly disclosed, so this is an assumption rather than a published mapping. It rests on gpt-5.4 having been the documented Auto-review model until 2026-04-16 and remaining the explicit Bedrock Codex reviewer. It is known to be wrong for API-key Codex from 2026-08-05, where Auto-review moved to gpt-5.6-luna; ChatGPT-auth Codex still sends this alias.",
+  "gpt-5.5-codex":
+    "Assumed to share gpt-5.5 API rates; not listed separately on the official pricing page.",
+  "gpt-5.6-sol-wm":
+    "Work Mode routing alias for gpt-5.6-sol; the picker describes it as a routing alias, so it is billed at the gpt-5.6-sol rates and is not listed separately on the official pricing page.",
+});
 
 function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextBand = null, period = null]) {
   const contextConditions = contextBand === "short"
@@ -250,7 +284,7 @@ function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextB
     : contextBand === "long"
       ? { min_total_input_tokens: "272000" }
       : null;
-  const aliases = model === "gpt-5.5" ? ["gpt-5.5-codex"] : undefined;
+  const aliases = OPENAI_MODEL_ALIASES[model];
   const validity = openAiEffective(period);
   const bandSuffix = contextBand ?? "current";
   return {
@@ -278,9 +312,9 @@ function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextB
       total_input_context_band: contextBand,
       provenance: provenance("openai", validity),
       ...(aliases ? {
-        alias_assumptions: {
-          "gpt-5.5-codex": "Assumed to share gpt-5.5 API rates; not listed separately on the official pricing page.",
-        },
+        alias_assumptions: Object.fromEntries(
+          aliases.map((alias) => [alias, OPENAI_ALIAS_ASSUMPTIONS[alias]]),
+        ),
       } : {}),
       ...(contextBand ? {
         coverage_note: contextBand === "short"
@@ -293,8 +327,11 @@ function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextB
 
 function anthropicEffective(period) {
   if (period === "introductory") {
+    // Closed only at the published vendor change on 2026-09-01, exactly like the
+    // OpenAI through-2026-07-29 rows. The window stays open backwards so events
+    // of any age select the introductory rate that was in force at the time.
     return {
-      effective: { from: ANTHROPIC_OBSERVED_DATE, to: "2026-08-31" },
+      effective: { to: "2026-08-31" },
       vendorEffectiveFrom: null,
       vendorEffectiveTo: "2026-08-31",
       suffix: "through-2026-08-31",
@@ -309,7 +346,10 @@ function anthropicEffective(period) {
     };
   }
   return {
-    effective: { from: ANTHROPIC_OBSERVED_DATE },
+    // No vendor-effective date was published for this row, so the effective
+    // range is open in both directions. The review date is provenance and must
+    // never act as a lower bound that unprices earlier recognized history.
+    effective: {},
     vendorEffectiveFrom: null,
     vendorEffectiveTo: null,
     suffix: "current",
@@ -355,7 +395,9 @@ function providerToolCard(provider, model, rows) {
     model,
     service_tier: "standard",
     region: "global",
-    effective: { from: FIRST_OBSERVED_DATES[provider] },
+    // Provider tool unit prices carry no published vendor-effective date, so the
+    // window is open in both directions and historical tool units stay priced.
+    effective: {},
     components: rows.map(([name, amount, unit, per]) => (
       providerUnitComponent(name, amount, unit, per)
     )),
@@ -383,14 +425,15 @@ export const APP_OFFICIAL_PRICE_CARDS = deepFreeze([
   ...PROVIDER_TOOL_PRICE_CARDS,
 ]);
 
-export const APP_PRICE_REGISTRY_SHA256 = "29f217770ecd220dc9bd8cce86e6b2a3a96251c2aa3dbae8d1019910626c7fe8";
+export const APP_PRICE_REGISTRY_SHA256 =
+  "6a99c2fb93c6999c6b7ee9b841403855672df7c556e22c636291366828da2c09";
 
 export const APP_PRICE_REGISTRY_MANIFEST = deepFreeze({
   version: APP_PRICE_REGISTRY_VERSION,
   sha256: APP_PRICE_REGISTRY_SHA256,
   observedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
   priceBasis: "official_api_price_not_subscription_allowance",
-  historicalDefault: "current_price_sensitivity_unless_vendor_effective_window_is_proven",
+  historicalDefault: "event_time_when_official_effective_window_matches",
   sources: Object.values(SOURCE_DEFINITIONS).map((definition) => ({
     provider: definition.provider,
     url: definition.url,

@@ -4,6 +4,7 @@ import {
   FIXTURE_ID,
 } from "./constants";
 import { ApiError } from "./errors";
+import { SEVEN_DAY_WINDOW_MINUTES } from "@app-usagemonitor/quota-analysis";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -61,7 +62,7 @@ export function syntheticFixture(): SyntheticContribution {
       end: "2026-07-21T00:00:00.000Z",
     },
     quota: {
-      windowMinutes: 10_080,
+      windowMinutes: SEVEN_DAY_WINDOW_MINUTES,
       usedPercentBefore: 26,
       usedPercentAfter: 31,
       displayPrecision: 0,

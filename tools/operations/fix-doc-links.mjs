@@ -9,6 +9,7 @@ const skipDirs = new Set([
   ".release-deps",
   ".release-repro",
   ".wrangler",
+  ".build",
   "build",
   "coverage",
   "dist",

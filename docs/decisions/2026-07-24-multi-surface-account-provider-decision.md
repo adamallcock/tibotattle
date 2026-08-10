@@ -50,7 +50,9 @@ The retained collector ledger currently has zero rollout events with the newly r
 
 ## Plan result
 
-The provider exposes `planType: pro`, not a 5x/20x product variant. The owner-only plan timeline therefore records:
+The provider exposes raw `plan_type: pro`, not a 5x/20x product variant. This
+is a provider-reported label, not evidence of the exact plan variant or its
+multiplier. The owner-only plan timeline therefore records:
 
 - current pseudonymous profile default: `pro-20x`, confidence `user_reported_normal_state`, effective only from the July 24 account capture; and
 - unresolved episode: `pro-5x`, with account and dates left null.
@@ -64,8 +66,16 @@ The clearest verified plan change near the study window is April 9, 2026: OpenAI
 The app-server read-only methods provide more useful provider evidence than local rollouts alone:
 
 - `account/read`: current email and generic plan type, transformed immediately into a pseudonymous scope;
-- `account/rateLimits/read`: integer percentage, reset, window duration, and plan-level quota state; and
+- `account/rateLimits/read`: `plan_type`, `window_minutes`, `resets_at`, integer percentage, and plan-level quota state; and
 - `account/usage/read`: 60 daily token buckets plus nonfinancial summary/lifetime token counts.
+
+Current parser clarification (2026-08-05): `plan_type` is the provider plan
+label, `window_minutes` is the provider-reported quota duration, and `resets_at`
+is the provider-reported reset schedule. A value of 43,200 minutes is a
+**30-day provider-reported window**, not a calendar-month billing limit. Unknown
+or unsupported labels normalize to `unknown` and fail closed for exact plan or
+absolute-allowance claims; valid limit and duration evidence remains
+independently usable.
 
 Credit balance and raw account fields are dropped. The provider totals remain account-level and cannot allocate Work, Cloud, Desktop, subagent, scheduled-task, or code-review usage.
 
@@ -146,7 +156,7 @@ The earlier Standard-only first-three versus last-three decline of 12.04% remain
 
 - 152 Node tests pass, including account/plan inference partitioning, cross-partition headline suppression, raw-identity rejection, task-surface classification, matched-day epoch ratios, prospective same-scope, mixed-plan-day, and one-sided known-boundary handling, fresh-marker scoping, suffix-aware cache freshness and advancement, bounded streamed collector batching, exactly-once rollout and provider-snapshot checkpoint-failure replay, journal-preparation and committed-journal cleanup recovery, bounded dedupe compaction, idle-checkpoint suppression, UI sanitization, and report-width packaging.
 - A privacy scan found neither declared email address nor Gmail address patterns in project source, documentation, the canonical artifact, or new owner-only crosscheck artifacts.
-- The portable report contains 31 rendered blocks, 8 metric cards, 4 charts, and 3 tables. Its embedded artifact equals `artifact.json`; the enhanced reader passes 1440-pixel and 390-pixel viewport checks and keyboard-accessible source-dialog verification with no external requests or browser errors.
+- The portable report contains 31 rendered blocks, 8 metric cards, 4 charts, and 3 tables. Its embedded artifact equals `.usage-monitor/legacy-reports/artifact.json`; the enhanced reader passes 1440-pixel and 390-pixel viewport checks and keyboard-accessible source-dialog verification with no external requests or browser errors.
 
 ## Next evidence to collect
 

@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  addUsdStrings,
+  aggregateLocalApiPriceResults,
   apiPriceResolutionSummary,
   codexProviderBillableToolUnits,
   priceClaudeUsageRecord,
@@ -9,7 +11,7 @@ import {
   summarizeClaudeApiPriceRecords,
 } from "../packages/accounting/index.js";
 
-test("Codex current-price sensitivity prices current cards without backdating the event", () => {
+test("Codex defaults to event-time history while retaining explicit current sensitivity", () => {
   const event = {
     timestamp: "2026-07-13T12:00:00.000Z",
     model: "gpt-5.6-luna",
@@ -31,19 +33,23 @@ test("Codex current-price sensitivity prices current cards without backdating th
       output_reasoning_tokens: true,
     },
   };
-  const current = priceCodexUsageEvent(event);
-  const historical = priceCodexUsageEvent(event, { priceEpochBasis: "event_time" });
+  const historical = priceCodexUsageEvent(event);
+  const current = priceCodexUsageEvent(event, { priceEpochBasis: "current_price_sensitivity" });
 
   assert.equal(current.totalUsd, "1.4");
   assert.equal(current.pricingContext.priceEpochBasis, "current_price_sensitivity_at_registry_observation");
-  assert.equal(historical.totalUsd, "0");
-  assert.equal(historical.coverageStatus, "unpriced");
-  assert.ok(historical.warnings.coverage.some((warning) => warning.code === "historical_price_missing"));
+  assert.equal(historical.pricingContext.priceEpochBasis, "event_time_when_registry_has_effective_evidence");
+  assert.equal(historical.totalUsd, "7");
+  assert.equal(historical.coverageStatus, "fully_priced");
+  assert.equal(
+    historical.warnings.coverage.some((warning) => warning.code === "historical_price_missing"),
+    false,
+  );
 });
 
 test("Codex component availability reaches the ledger and never becomes observed zero", () => {
   const result = priceCodexUsageEvent({
-    timestamp: "2026-07-25T15:00:00.000Z",
+    timestamp: "2026-07-26T15:00:00.000Z",
     model: "gpt-5.6-sol",
     raw: { input_tokens: 10 },
     components: {
@@ -90,8 +96,8 @@ test("Codex pricing prefers canonical totalInputContextTokens for the exact long
   };
   const result = priceCodexUsageEvent(event);
   assert.equal(result.coverageStatus, "fully_priced");
-  assert.equal(result.totalUsd, "2.2");
-  assert.match(result.selectedPriceCardId, /:long(?:-from-2026-07-30)?:/);
+  assert.equal(result.totalUsd, "11");
+  assert.match(result.selectedPriceCardId, /:long-(?:through-2026-07-29|from-2026-07-30):/);
 });
 
 test("Claude canonical records retain cache TTL and combined-output semantics", () => {
@@ -129,7 +135,7 @@ test("typed provider tool units price separately from client tool classes", () =
     responses_web_search_call: 2,
     responses_file_search_call: 3,
     client_wrapper: 999,
-  });
+  }, { eventTime: "2026-08-01T00:00:00.000Z" });
   assert.equal(result.coverageStatus, "partially_priced");
   assert.equal(result.totalUsd, "0.0275");
   const unknown = result.components.find((component) => (
@@ -137,6 +143,96 @@ test("typed provider tool units price separately from client tool classes", () =
   ));
   assert.equal(unknown.pricingStatus, "unpriced");
   assert.equal(unknown.reasonCode, "unknown_tool_component");
+});
+
+test("event-time boundary selects distinct Terra and Luna official cards and aggregates provenance exactly", () => {
+  for (const model of ["gpt-5.6-terra", "gpt-5.6-luna"]) {
+    const before = priceCodexUsageEvent({
+      timestamp: "2026-07-29T23:59:59.999Z",
+      model,
+      components: { input_uncached_tokens: 1_000_000 },
+    });
+    const after = priceCodexUsageEvent({
+      timestamp: "2026-07-30T00:00:00.000Z",
+      model,
+      components: { input_uncached_tokens: 1_000_000 },
+    });
+    const mixed = aggregateLocalApiPriceResults([before, after]);
+
+    assert.notEqual(before.selectedPriceCardId, after.selectedPriceCardId, model);
+    assert.equal(mixed.selectedPriceCardIds.length, 2, model);
+    assert.equal(mixed.priceCardBreakdown.length, 2, model);
+    assert.equal(mixed.priceCardBreakdown[0].events, 1, model);
+    assert.equal(mixed.priceCardBreakdown[1].events, 1, model);
+    assert.equal(mixed.totalUsd, addUsdStrings(before.totalUsd, after.totalUsd), model);
+  }
+});
+
+test("recognized historical events price before the review date while missing time fails closed", () => {
+  const preReview = priceCodexUsageEvent({
+    timestamp: "2026-07-24T23:59:59.999Z",
+    model: "gpt-5.6-terra",
+    raw: { input_tokens: 1_000 },
+    components: { input_uncached_tokens: 1_000_000 },
+  });
+  assert.equal(preReview.totalUsd, "2.5");
+  assert.equal(preReview.coverageStatus, "fully_priced");
+  assert.equal(
+    preReview.warnings.coverage.some((warning) => (
+      warning.code === "historical_price_missing"
+    )),
+    false,
+  );
+
+  const result = priceCodexUsageEvent({
+    model: "gpt-5.6-terra",
+    components: { input_uncached_tokens: 1_000_000 },
+  });
+  assert.equal(result.totalUsd, "0");
+  assert.equal(result.coverageStatus, "unpriced");
+  assert.ok(result.warnings.coverage.some((warning) => (
+    warning.code === "historical_price_timestamp_missing"
+  )));
+  assert.equal(result.pricingContext.historicalPriceReasonCode, "historical_price_timestamp_missing");
+  assert.equal(result.components[0].reasonCode, "historical_price_timestamp_missing");
+});
+
+test("the reviewed GPT-5.5 Codex alias remains priceable in historical events", () => {
+  const result = priceCodexUsageEvent({
+    timestamp: "2026-07-24T12:00:00.000Z",
+    model: "gpt-5.5-codex",
+    raw: { input_tokens: 1_000 },
+    components: {
+      input_uncached_tokens: 1_000_000,
+      output_text_tokens: 1_000_000,
+    },
+  });
+  assert.equal(result.coverageStatus, "fully_priced");
+  assert.equal(result.totalUsd, "35");
+  assert.match(result.selectedPriceCardIds[0], /openai:gpt-5\.5:standard:short:/u);
+});
+
+test("noncanonical historical event times fail closed instead of selecting a card", () => {
+  for (const timestamp of [
+    "2026-07-30",
+    "2026-07-30T00:00:00Z",
+    "2026-07-30T00:00:00.000-00:00",
+    "2026-07-30T00:00:00.000+00:00",
+  ]) {
+    const result = priceCodexUsageEvent({
+      timestamp,
+      model: "gpt-5.6-terra",
+      components: { input_uncached_tokens: 1_000_000 },
+    });
+    assert.equal(result.totalUsd, "0", timestamp);
+    assert.equal(result.coverageStatus, "unpriced", timestamp);
+    assert.deepEqual(result.selectedPriceCardIds, [], timestamp);
+    assert.equal(
+      result.components[0].reasonCode,
+      "historical_price_timestamp_missing",
+      timestamp,
+    );
+  }
 });
 
 test("Claude record summaries expose exact per-model coverage", () => {

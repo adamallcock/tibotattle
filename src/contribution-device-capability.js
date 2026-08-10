@@ -12,7 +12,7 @@ import {
   realpath,
   unlink,
 } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { defaultExportStateDirectory } from "./export-identity.js";
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
@@ -365,6 +365,12 @@ function publicResult(status, state, secret) {
   });
 }
 
+function sameState(left, right) {
+  return left?.origin === right?.origin
+    && left?.deviceId === right?.deviceId
+    && left?.createdAt === right?.createdAt;
+}
+
 export function defaultContributionDeviceStateFile(options) {
   return join(defaultExportStateDirectory(options), "contribution-device-binding-v1.json");
 }
@@ -382,6 +388,87 @@ export function createProductionContributionDeviceBackend({
   } catch (error) {
     if (error instanceof ContributionDeviceCapabilityError) throw error;
     translateBackendFailure(error);
+  }
+}
+
+// The macOS product state root was renamed after the contribution credential
+// shipped. Keep the Keychain secret in place and move only its public binding
+// metadata, lazily, when a contribution operation actually needs it. This
+// avoids a launch-time Keychain prompt and preserves a fail-closed boundary if
+// either file was replaced, made world-readable, or points at another service.
+export async function migrateLegacyContributionDeviceCapability({
+  backend,
+  legacyStateFile,
+  stateFile = defaultContributionDeviceStateFile(),
+  expectedOrigin = null,
+} = {}) {
+  const selected = assertBackend(backend);
+  if (typeof legacyStateFile !== "string" || legacyStateFile.length < 1
+      || legacyStateFile.length > 4096
+      || typeof stateFile !== "string" || stateFile.length < 1
+      || stateFile.length > 4096
+      || resolve(legacyStateFile) === resolve(stateFile)) {
+    fail("invalid_configuration");
+  }
+  const normalizedExpectedOrigin = expectedOrigin === null
+    ? null
+    : normalizeOrigin(expectedOrigin);
+  const currentInspection = await inspectState(stateFile);
+  const legacyInspection = await inspectState(legacyStateFile);
+
+  if (legacyInspection === null) {
+    if (currentInspection !== null && normalizedExpectedOrigin !== null
+        && currentInspection.state.origin !== normalizedExpectedOrigin) {
+      fail("origin_conflict");
+    }
+    return Object.freeze({
+      status: currentInspection === null ? "missing" : "not_needed",
+    });
+  }
+  const legacyState = legacyInspection.state;
+  if (normalizedExpectedOrigin !== null
+      && legacyState.origin !== normalizedExpectedOrigin) {
+    fail("origin_conflict");
+  }
+
+  // A previous attempt may have durably published the new file and then been
+  // interrupted before deleting the old one. Exact public metadata equality
+  // is enough to finish that cleanup without touching Keychain again.
+  if (currentInspection !== null) {
+    if (normalizedExpectedOrigin !== null
+        && currentInspection.state.origin !== normalizedExpectedOrigin) {
+      fail("origin_conflict");
+    }
+    if (!sameState(currentInspection.state, legacyState)) {
+      fail("credential_conflict");
+    }
+    await removeInspectedState(legacyInspection);
+    return Object.freeze({
+      status: "already_migrated",
+      origin: currentInspection.state.origin,
+      deviceId: currentInspection.state.deviceId,
+      createdAt: currentInspection.state.createdAt,
+    });
+  }
+
+  let stored = null;
+  try {
+    stored = await invokeBackend(selected, "read");
+    if (stored === null) fail("credential_missing");
+    // Validate the secret before publishing the state file. publicResult also
+    // returns only the stable domain-separated hash, never the secret itself.
+    const result = publicResult("migrated", legacyState, stored);
+    await writeNewState(stateFile, canonicalState(legacyState));
+    const published = await inspectState(stateFile);
+    if (published === null || !sameState(published.state, legacyState)) {
+      fail("state_invalid");
+    }
+    // If this unlink is interrupted, the exact-state branch above completes
+    // cleanup on the next contribution operation.
+    await removeInspectedState(legacyInspection);
+    return result;
+  } finally {
+    if (Buffer.isBuffer(stored)) stored.fill(0);
   }
 }
 

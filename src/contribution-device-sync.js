@@ -14,6 +14,8 @@ import {
 } from "./telemetry-contribution-builder.js";
 
 const MAXIMUM_RESPONSE_BYTES = 32_768;
+const MAXIMUM_RETRY_AFTER_MILLISECONDS = 7 * 24 * 60 * 60 * 1_000;
+const IMF_FIXDATE = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/u;
 const CONTRIBUTION_ID =
   /^contribution:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const DEVICE_UPLOAD =
@@ -32,6 +34,8 @@ export class ContributionDeviceSyncError extends Error {
   constructor(code, {
     retryable = false,
     deviceUnavailable = false,
+    retryAfterMilliseconds = null,
+    retryAfterExceedsMaximum = false,
   } = {}) {
     if (!ERROR_CODES.has(code)) {
       throw new TypeError("Unknown contribution device sync error code");
@@ -41,11 +45,56 @@ export class ContributionDeviceSyncError extends Error {
     this.code = `contribution_device_sync_${code}`;
     this.retryable = retryable;
     this.deviceUnavailable = deviceUnavailable;
+    if (retryAfterMilliseconds !== null
+        && (!Number.isSafeInteger(retryAfterMilliseconds)
+          || retryAfterMilliseconds < 0
+          || retryAfterMilliseconds > MAXIMUM_RETRY_AFTER_MILLISECONDS)) {
+      throw new TypeError("Invalid contribution device retry delay");
+    }
+    this.retryAfterMilliseconds = retryAfterMilliseconds;
+    if (typeof retryAfterExceedsMaximum !== "boolean") {
+      throw new TypeError("Invalid contribution device retry horizon");
+    }
+    this.retryAfterExceedsMaximum = retryAfterExceedsMaximum;
   }
 }
 
 function fail(code, options = {}) {
   throw new ContributionDeviceSyncError(code, options);
+}
+
+function retryAfter(response, now = Date.now()) {
+  const value = response.headers.get("retry-after")?.trim() ?? "";
+  if (value.length === 0 || value.length > 128) {
+    return { milliseconds: null, exceedsMaximum: false };
+  }
+  let milliseconds;
+  if (/^\d+$/u.test(value)) {
+    const seconds = Number(value);
+    if (!Number.isSafeInteger(seconds)) {
+      return { milliseconds: null, exceedsMaximum: true };
+    }
+    milliseconds = seconds * 1_000;
+  } else {
+    // Do not hand arbitrary strings to Date.parse: browser-specific formats
+    // such as "08/05/2026" are not HTTP Retry-After dates and could create a
+    // surprising future deadline. HTTP-date is IMF-fixdate on the wire.
+    if (!IMF_FIXDATE.test(value)) {
+      return { milliseconds: null, exceedsMaximum: false };
+    }
+    const retryAt = Date.parse(value);
+    if (!Number.isFinite(retryAt)) {
+      return { milliseconds: null, exceedsMaximum: false };
+    }
+    milliseconds = Math.max(0, retryAt - now);
+  }
+  if (!Number.isSafeInteger(milliseconds)
+      || milliseconds > MAXIMUM_RETRY_AFTER_MILLISECONDS) {
+    // Do not silently shorten an advertised floor. The queue will pause and
+    // require an explicit operator decision rather than retrying early.
+    return { milliseconds: null, exceedsMaximum: true };
+  }
+  return { milliseconds, exceedsMaximum: false };
 }
 
 async function readJson(response, rejectionCode, {
@@ -75,7 +124,12 @@ async function readJson(response, rejectionCode, {
   if (!response.ok) {
     if (response.status === 408 || response.status === 429
         || response.status >= 500) {
-      fail("service_unavailable", { retryable: true });
+      const retry = retryAfter(response);
+      fail("service_unavailable", {
+        retryable: true,
+        retryAfterMilliseconds: retry.milliseconds,
+        retryAfterExceedsMaximum: retry.exceedsMaximum,
+      });
     }
     const backendCode = payload?.error?.code;
     if (deviceAuthorization
@@ -223,6 +277,7 @@ export async function syncPreparedContributionEntryOnce({
           code: error.code.replace("contribution_device_sync_", ""),
           retryable: error.retryable,
           deviceUnavailable: error.deviceUnavailable,
+          retryAfterMilliseconds: error.retryAfterMilliseconds,
         });
       }
     },
@@ -232,6 +287,7 @@ export async function syncPreparedContributionEntryOnce({
     fail(registrationOutcome.code, {
       retryable: registrationOutcome.retryable === true,
       deviceUnavailable: registrationOutcome.deviceUnavailable === true,
+      retryAfterMilliseconds: registrationOutcome.retryAfterMilliseconds ?? null,
     });
   }
   const uploadAuthorization = registrationOutcome.uploadAuthorization;

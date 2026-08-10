@@ -13,7 +13,7 @@
     "transportReady": false
   },
   "fieldContract": {
-    "sha256": "1f0d44394f2866a345f4c3ef6b5382726813601cf46749896edf31f82cccddb8",
+    "sha256": "edfe33395bf820140a200fda623062a40be1bdf61987148ad5faf28f5d7b8b98",
     "version": "telemetry-field-dictionary-v0.1"
   },
   "implementation": {
@@ -72,15 +72,15 @@
     }
   },
   "registry": {
-    "sha256": "79a20167ed2671bc2773358f966560a870f228f41827b4286036fb9574e63f35",
-    "version": "telemetry-v0.1-registry-2026-07-25.3"
+    "sha256": "c662fa382b9e673d0be40410fcb6a3520005b303cdad80fe9f648bedd9e90359",
+    "version": "telemetry-v0.1-registry-2026-08-06.1"
   },
   "schemas": {
     "members": [
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/activity-marker.schema.json",
         "name": "activity-marker.schema.json",
-        "sha256": "1588f843cad732fa28a65e18be2b2bdd3a050f91b086a7fbebb3ded7bd58364c"
+        "sha256": "bb17769dff7074ffa67b6122e2cdd0cbe59487dd3355bd18badf15d4cacb629e"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/bundle.schema.json",
@@ -90,7 +90,7 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
         "name": "compatibility.schema.json",
-        "sha256": "5478de5c44ea1fc7300a387d475793b94e2fb971609b17eacb4d4b194385fb57"
+        "sha256": "818706faa89ca917c8954992d55f8a58ac87bbd0b33eba5ec39d6c4a58af7da7"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/privacy-receipt.schema.json",
@@ -100,15 +100,15 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/quota-snapshot.schema.json",
         "name": "quota-snapshot.schema.json",
-        "sha256": "e0827a8cd11eed121ac6bbed325271dd8edd61dfde2b9fe500c617a15cba8c83"
+        "sha256": "a3b3f351b2f1d74232fc851d999ab1f32e6bb7fdc7bcbf0887e3c03b583c3b51"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/usage-event.schema.json",
         "name": "usage-event.schema.json",
-        "sha256": "9b0d572464fe922049cf4a83b9f0e6b0bdc176271a61971ec6b0706ae8aa4edd"
+        "sha256": "0f3203f4949104f7bca19ef2aa926560390965a3dfe564544192641d5ef48fb2"
       }
     ],
-    "setSha256": "913863a9b6d889683aa5b327f58614bbfe332519c9b069e70450431d2470a538"
+    "setSha256": "50bb5089f177cfe494743a4f95cd6ff711ef9db370fe39c4e927b729034da525"
   },
   "tupleVersion": "usage-export-compatibility-v0.1"
 }
