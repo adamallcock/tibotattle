@@ -146,10 +146,22 @@ async function fetchAccessJwks(jwksUrl: string): Promise<JsonWebKeySet> {
       redirect: "error",
       signal: AbortSignal.timeout(JWKS_REQUEST_TIMEOUT_MILLISECONDS),
     });
-  } catch {
+  } catch (error) {
+    // Coarse deny-site observability (2026-08-10, remove with the attempt
+    // log): step name and error class only, never token or key material.
+    console.warn("admin-access-step", JSON.stringify({
+      step: "jwks_fetch_throw",
+      errorName: error instanceof Error ? error.name : typeof error,
+    }));
     accessDenied();
   }
-  if (!response.ok) accessDenied();
+  if (!response.ok) {
+    console.warn("admin-access-step", JSON.stringify({
+      step: "jwks_fetch_status",
+      status: response.status,
+    }));
+    accessDenied();
+  }
   let text: string;
   try {
     text = await response.text();
@@ -229,7 +241,13 @@ async function verificationKey(
     keys,
   };
   const key = keys.get(kid);
-  if (!key) accessDenied();
+  if (!key) {
+    console.warn("admin-access-step", JSON.stringify({
+      step: "kid_unknown",
+      publishedKeys: keys.size,
+    }));
+    accessDenied();
+  }
   return key;
 }
 
@@ -337,10 +355,19 @@ export async function verifyAdminAccessAssertion(
       decodeBase64UrlSegment(segments[2]) as unknown as ArrayBuffer,
       signedInput as unknown as ArrayBuffer,
     );
-  } catch {
+  } catch (error) {
+    console.warn("admin-access-step", JSON.stringify({
+      step: "signature_throw",
+      errorName: error instanceof Error ? error.name : typeof error,
+    }));
     accessDenied();
   }
-  if (!signatureValid) accessDenied();
+  if (!signatureValid) {
+    console.warn("admin-access-step", JSON.stringify({
+      step: "signature_invalid",
+    }));
+    accessDenied();
+  }
 
   const claims = decodeJsonSegment(segments[1]);
   const nowSeconds = Math.floor(nowMs / 1000);
