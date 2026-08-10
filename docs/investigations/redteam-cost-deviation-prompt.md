@@ -24,7 +24,7 @@ cost diverges from the constant-capacity expectation by more than a threshold.
 
 ## Where everything lives
 
-- Repo root: `/Users/adamallcock/Documents/Coding/app-usagemonitor`
+- Repo root: `<repo-root>`
 - Live unified index (read-only; ~190 MB SQLite, `node:sqlite`/`sqlite3` compatible):
   `~/Library/Application Support/Usage Monitor/local-unified-index-v1.sqlite`
   Open it **read-only** (`file:...?mode=ro`). Never write to it.
