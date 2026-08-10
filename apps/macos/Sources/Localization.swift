@@ -559,7 +559,7 @@ enum TiboTattleLocalization {
             case .nativeDashboardFresh:
                 "Fresh"
             case .nativeDashboardHowItWorks:
-                "How it works"
+                "Usage and costs"
             case .nativeDashboardNeedsRefresh:
                 "Stale"
             case .nativeDashboardLocalOnly:

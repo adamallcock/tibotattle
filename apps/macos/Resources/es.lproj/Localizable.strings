@@ -12,7 +12,7 @@
 "nativeDashboard.community" = "Comunidad";
 "nativeDashboard.dataPrivacy" = "Datos y privacidad";
 "nativeDashboard.fresh" = "Actualizado";
-"nativeDashboard.howItWorks" = "Cómo funciona";
+"nativeDashboard.howItWorks" = "Uso y costes";
 "nativeDashboard.needsRefresh" = "Desactualizado";
 "nativeDashboard.localOnly" = "Solo local";
 "nativeDashboard.localOnlyTooltip" = "El análisis y los resultados en caché permanecen en este Mac. La contribución a la comunidad es opcional.";

@@ -12,7 +12,7 @@
 "nativeDashboard.community" = "社区";
 "nativeDashboard.dataPrivacy" = "数据与隐私";
 "nativeDashboard.fresh" = "最新";
-"nativeDashboard.howItWorks" = "工作原理";
+"nativeDashboard.howItWorks" = "用量与成本";
 "nativeDashboard.needsRefresh" = "已过期";
 "nativeDashboard.localOnly" = "仅限本机";
 "nativeDashboard.localOnlyTooltip" = "分析结果和缓存结果保留在这台 Mac 上。是否贡献给社区由你自行选择。";
