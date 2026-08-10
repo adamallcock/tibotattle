@@ -3514,8 +3514,7 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
         SUVerifyUpdateBeforeExtraction: true,
       }),
     );
-    const payload = await testPayloadInventory(app, temporaryRoot);
-    await writeFile(
+    const writeBuildManifest = async () => await writeFile(
       join(resources, "build-manifest.json"),
       JSON.stringify({
         schemaVersion: "usage-monitor-macos-app-build-v0.1",
@@ -3559,9 +3558,53 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
             verifyBeforeExtraction: true,
           },
         },
-        payload,
+        payload: await testPayloadInventory(app, temporaryRoot),
       }),
     );
+    await writeBuildManifest();
+
+    // The synthetic keytar.node staged above is not the audited npm
+    // artifact, and Developer ID signing must refuse to sign it: the
+    // runtime loader trusts a signed binding through its designated
+    // requirement, so the byte audit has to happen here, before signing.
+    await assert.rejects(
+      developerIDSignMacOSApp(app, {
+        commandRunner: (command) => {
+          if (command === "/usr/bin/security") {
+            return { stderr: "", stdout: `1) HASH "${identity}"\n` };
+          }
+          return { stderr: "", stdout: "" };
+        },
+        identity,
+      }),
+      { code: "MACOS_KEYTAR_BINDING_UNAUDITED" },
+    );
+
+    // With the audited bytes staged, signing proceeds — and additionally
+    // proves the signed binding against the exact designated requirement
+    // the runtime loader tests.
+    const rootRequire = createRequire(join(REPOSITORY_ROOT, "package.json"));
+    const keytarBindingPath = join(
+      app,
+      "Contents",
+      "Resources",
+      "app",
+      "node_modules",
+      "@github",
+      "keytar",
+      "prebuilds",
+      "darwin-arm64",
+      "keytar.node",
+    );
+    await chmod(keytarBindingPath, 0o700);
+    await copyFile(
+      rootRequire.resolve(
+        "@github/keytar/prebuilds/darwin-arm64/keytar.node",
+      ),
+      keytarBindingPath,
+    );
+    await chmod(keytarBindingPath, 0o555);
+    await writeBuildManifest();
 
     const calls = [];
     const runner = (command, arguments_, options = {}) => {
@@ -3623,6 +3666,22 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
       && arguments_.includes("--verify"));
     assert.equal(verify.arguments_.includes("--deep"), true);
     assert.equal(verify.arguments_.includes("--strict"), true);
+    // The freshly signed binding is proven against the exact requirement
+    // the runtime loader will test on every launch: same team, same
+    // identifier, nothing build-specific.
+    const requirementVerify = calls.find(({ command, arguments_ }) =>
+      command === "/usr/bin/codesign"
+      && arguments_.some((argument) =>
+        typeof argument === "string" && argument.startsWith("-R=")));
+    assert.deepEqual(requirementVerify.arguments_, [
+      "--verify",
+      "--strict",
+      "-R=anchor apple generic"
+        + ' and certificate leaf[subject.OU] = "43RTH622SB"'
+        + ' and identifier "keytar"',
+      "--",
+      keytarBindingPath,
+    ]);
 
     const dmg = join(temporaryRoot, "TiboTattle.dmg");
     await writeFile(dmg, "signed-DMG-fixture");

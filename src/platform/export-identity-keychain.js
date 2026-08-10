@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -8,7 +9,24 @@ const SECRET_BYTES = 32;
 const STORED_SECRET_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const NATIVE_BINDING_SPECIFIER = "@github/keytar/prebuilds/darwin-arm64/keytar.node";
 
+// The audited artifact exactly as published: this is the hash of the npm
+// prebuild BEFORE any code signing. The Developer ID release pipeline
+// re-signs keytar.node in place (hardened-runtime library validation demands
+// a same-team signature), which rewrites the Mach-O, so a production install
+// can never match these bytes. Signed derivatives are accepted through the
+// designated-requirement verification below instead.
 export const KEYTAR_DARWIN_ARM64_SHA256 = "855c21e1e702967230bd87f600d04c311b77f29150f3372d547e72882c58de6a";
+// The two facts a signed derivative must prove, and nothing build-specific:
+// the Apple Developer ID team that signs this product's releases, and the
+// code identifier codesign derives for the keytar prebuild. Together they are
+// the binding's designated requirement — stable across every properly signed
+// build, unlike a CDHash or a byte digest of a signed binary.
+export const KEYTAR_SIGNING_TEAM_IDENTIFIER = "43RTH622SB";
+export const KEYTAR_SIGNING_CODE_IDENTIFIER = "keytar";
+const CODESIGN_PATH = "/usr/bin/codesign";
+const SECURITY_PATH = "/usr/bin/security";
+// errSecItemNotFound surfaces from the security CLI as exit status 44.
+const SECURITY_ITEM_NOT_FOUND_STATUS = 44;
 
 export const EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES = Object.freeze({
   exportIdentity: Object.freeze({
@@ -72,8 +90,50 @@ function validateBinding(binding) {
 }
 
 /**
- * Load only the audited macOS arm64 prebuild. The package JavaScript loader is
- * deliberately bypassed so it cannot select a build artifact at runtime.
+ * The exact requirement string a signed keytar binding must satisfy: Apple's
+ * generic anchor, this product's Developer ID team, and the binding's own
+ * code identifier. Deliberately nothing else — no version, no CDHash, no
+ * certificate serial — so a Sparkle update signed by the same team keeps
+ * passing while any other origin fails.
+ */
+export function keytarSignedBindingRequirement() {
+  return "anchor apple generic"
+    + ` and certificate leaf[subject.OU] = "${KEYTAR_SIGNING_TEAM_IDENTIFIER}"`
+    + ` and identifier "${KEYTAR_SIGNING_CODE_IDENTIFIER}"`;
+}
+
+/**
+ * The constructed codesign invocation, exported so a test can pin the exact
+ * arguments without a signed binary: --verify validates the embedded
+ * signature's page hashes, --strict keeps the validation modern, and
+ * -R= makes codesign additionally test the designated requirement above.
+ */
+export function keytarSignedBindingVerificationArguments(bindingPath) {
+  return Object.freeze([
+    "--verify",
+    "--strict",
+    `-R=${keytarSignedBindingRequirement()}`,
+    "--",
+    bindingPath,
+  ]);
+}
+
+function defaultRunVerificationCommand(command, commandArguments) {
+  const outcome = spawnSync(command, commandArguments, {
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  return { status: outcome.status };
+}
+
+/**
+ * Load only trusted bytes at the audited prebuild path: either the exact
+ * audited npm artifact (development installs, byte-pinned), or a signed
+ * derivative of it that macOS proves was signed by this product's Developer
+ * ID team with the binding's own identifier. The Developer ID release
+ * pipeline verifies the audited bytes immediately before signing, so the
+ * signed acceptance chains back to the same audit. The package JavaScript
+ * loader is deliberately bypassed so it cannot select a build artifact at
+ * runtime.
  */
 export function loadExportIdentityKeychainBinding(options = {}) {
   if (!options || typeof options !== "object" || Array.isArray(options)) fail("invalid_configuration");
@@ -83,11 +143,13 @@ export function loadExportIdentityKeychainBinding(options = {}) {
     resolveBinding = (specifier) => require.resolve(specifier),
     readBinding = (path) => readFileSync(path),
     requireBinding = (path) => require(path),
+    runVerificationCommand = defaultRunVerificationCommand,
   } = options;
   if (platform !== "darwin") fail("unsupported_platform");
   if (architecture !== "arm64") fail("unsupported_architecture");
   if (typeof resolveBinding !== "function" || typeof readBinding !== "function"
-      || typeof requireBinding !== "function") fail("invalid_configuration");
+      || typeof requireBinding !== "function"
+      || typeof runVerificationCommand !== "function") fail("invalid_configuration");
 
   let bindingPath;
   let bindingBytes;
@@ -106,7 +168,26 @@ export function loadExportIdentityKeychainBinding(options = {}) {
     fail("invalid_configuration");
   }
   const digest = createHash("sha256").update(bindingBytes).digest("hex");
-  if (digest !== KEYTAR_DARWIN_ARM64_SHA256) fail("binding_integrity");
+  if (digest !== KEYTAR_DARWIN_ARM64_SHA256) {
+    // Not the audited bytes. Signing rewrites the Mach-O, so this is the
+    // expected state of every Developer ID build (observed live 2026-08-10:
+    // the byte pin alone turned the first signed Sparkle update into a total
+    // Keychain outage). Accept the file only if macOS proves it carries a
+    // valid signature satisfying the designated requirement; anything else
+    // stays failed closed.
+    let verified = false;
+    try {
+      const outcome = runVerificationCommand(
+        CODESIGN_PATH,
+        keytarSignedBindingVerificationArguments(bindingPath),
+      );
+      verified = outcome !== null && typeof outcome === "object"
+        && outcome.status === 0;
+    } catch {
+      // Verification failures are content-free: fall through to fail closed.
+    }
+    if (!verified) fail("binding_integrity");
+  }
 
   try {
     return validateBinding(requireBinding(bindingPath));
@@ -311,4 +392,68 @@ export function createExportIdentityKeychainBackend(options = {}) {
   }
 
   return Object.freeze({ read, createIfMissing, replaceExact, deleteExact, describe });
+}
+
+/**
+ * The constructed security invocation for an attribute-addressed delete,
+ * exported so a test can pin the exact arguments. Deleting by service and
+ * account never decrypts the item, so it needs neither the native binding
+ * nor the item's access control list — it works in exactly the states where
+ * a read cannot (verified live 2026-08-10 against a credential the updated
+ * app could no longer read).
+ */
+export function exportIdentityKeychainAttributeDeleteArguments(capability) {
+  const pair = capabilityPair(capability);
+  return Object.freeze([
+    "delete-generic-password",
+    "-s",
+    pair.service,
+    "-a",
+    pair.account,
+  ]);
+}
+
+function defaultRunAttributeDeleteCommand(command, commandArguments) {
+  // The security CLI prints the deleted item's attributes on success; they
+  // are discarded unread so nothing about the item can enter an error, a
+  // log, or a caller.
+  const outcome = spawnSync(command, commandArguments, {
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  return { status: outcome.status };
+}
+
+/**
+ * Delete a capability's Keychain item by its fixed attributes, without ever
+ * reading the secret. This is the repair path for a credential the ordinary
+ * backend cannot read — a broken access control list, or a native binding
+ * that cannot even load — and must therefore depend on neither.
+ */
+export function deleteExportIdentityKeychainItemByAttributes(
+  capability,
+  options = {},
+) {
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    fail("invalid_configuration");
+  }
+  const {
+    platform = process.platform,
+    runCommand = defaultRunAttributeDeleteCommand,
+  } = options;
+  const commandArguments =
+    exportIdentityKeychainAttributeDeleteArguments(capability);
+  if (platform !== "darwin") fail("unsupported_platform");
+  if (typeof runCommand !== "function") fail("invalid_configuration");
+  let outcome;
+  try {
+    outcome = runCommand(SECURITY_PATH, commandArguments);
+  } catch {
+    fail("operation_failed");
+  }
+  const status = outcome !== null && typeof outcome === "object"
+    ? outcome.status
+    : undefined;
+  if (status === 0) return "deleted";
+  if (status === SECURITY_ITEM_NOT_FOUND_STATUS) return "missing";
+  fail("operation_failed");
 }
