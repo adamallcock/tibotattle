@@ -432,6 +432,60 @@ export const WEB_MESSAGES = Object.freeze({
     "El área con signo bajo la serie de residuos visible: puntos porcentuales observados menos esperados integrados en horas. Un valor positivo significa que el movimiento de cuota observado superó lo que implica el coste registrado.",
   ],
   "format.ppHours": ["{value} pp·h", "{value} 个百分点·小时", "{value} pp·h"],
+  // The deviation-period detector's Trends panel: sustained stretches where
+  // observed quota movement and priced (cost-implied) usage persistently
+  // disagree. Copy stays honest — a period is a finding to review, never proof
+  // of a billing error.
+  "divergence.dateRange": ["{start} → {end}", "{start} → {end}", "{start} → {end}"],
+  "divergence.duration": ["over {duration}", "持续 {duration}", "durante {duration}"],
+  "divergence.underCosted": [
+    "Observed quota fell about {pp} more than priced usage explains — likely under-counted here.",
+    "观测到的额度下降比按价格计算的用量所能解释的多出约 {pp}——这里很可能被少计。",
+    "La cuota observada bajó unos {pp} más de lo que explica el uso con precio: probablemente se subestimó aquí.",
+  ],
+  "divergence.overCosted": [
+    "Observed quota fell about {pp} short of what priced usage predicted — likely over-counted or credited here.",
+    "观测到的额度下降比按价格计算的用量所预测的少约 {pp}——这里很可能被多计或有额度返还。",
+    "La cuota observada bajó unos {pp} menos de lo que predijo el uso con precio: probablemente se sobrestimó o se acreditó aquí.",
+  ],
+  "divergence.magnitude": [
+    "Peak drift {peak} · signed area {auc}",
+    "峰值漂移 {peak} · 带符号面积 {auc}",
+    "Deriva máxima {peak} · área con signo {auc}",
+  ],
+  "divergence.mix": [
+    "This window: {cost} priced usage across {tokens} tokens in {events} usage changes.",
+    "此窗口：{cost} 的计价用量，涵盖 {tokens} 个令牌、{events} 次用量变化。",
+    "Esta ventana: {cost} de uso con precio en {tokens} tokens y {events} cambios de uso.",
+  ],
+  "divergence.unpricedShare": [
+    "{share} of usage changes in this window carry no published price.",
+    "此窗口中有 {share} 的用量变化没有已公布的价格。",
+    "El {share} de los cambios de uso de esta ventana no tienen un precio publicado.",
+  ],
+  "divergence.rangeMix": [
+    "Range mix (whole selected period, not just this window): mostly {model}, {speed} speed.",
+    "范围构成（整个所选时段，而非仅此窗口）：以 {model} 为主，{speed} 速度。",
+    "Mezcla del intervalo (todo el período seleccionado, no solo esta ventana): sobre todo {model}, velocidad {speed}.",
+  ],
+  "divergence.empty": [
+    "No sustained divergence in this range — observed and priced usage track within the noise band.",
+    "此范围内没有持续的背离——观测用量与计价用量在噪声带内保持一致。",
+    "Sin divergencia sostenida en este intervalo: el uso observado y el uso con precio coinciden dentro del margen de ruido.",
+  ],
+  "divergence.emptyNoDrift": [
+    "No cumulative-drift series is available for this range yet — open it with the local companion connected to detect divergence periods.",
+    "此范围尚无累计漂移序列——请在已连接本地伴随程序的情况下打开，以检测背离时段。",
+    "Aún no hay una serie de deriva acumulada para este intervalo: ábrelo con el acompañante local conectado para detectar períodos de divergencia.",
+  ],
+  "divergence.truncated": [
+    "Showing the {shown} widest of {total} detected periods.",
+    "在检测到的 {total} 个时段中显示最显著的 {shown} 个。",
+    "Mostrando los {shown} más amplios de {total} períodos detectados.",
+  ],
+  "divergence.speed.fast": ["fast", "快速", "rápida"],
+  "divergence.speed.standard": ["standard", "标准", "estándar"],
+  "divergence.speed.unknown": ["unknown", "未知", "desconocida"],
   "contribution.signInCancelled": ["{provider} sign-in was cancelled. Nothing was uploaded.", "已取消 {provider} 登录。未上传任何内容。", "Se canceló el inicio de sesión con {provider}. No se cargó nada."],
   "contribution.signInStarting": ["Starting {provider} sign-in…", "正在开始 {provider} 登录…", "Iniciando sesión con {provider}…"],
   "contribution.signInIncomplete": ["{provider} sign-in did not complete. Nothing was uploaded. You can try again.", "{provider} 登录未完成。未上传任何内容。你可以重试。", "El inicio de sesión con {provider} no se completó. No se cargó nada. Puedes intentarlo de nuevo."],
@@ -907,6 +961,10 @@ export const WEB_PLURAL_MESSAGES = Object.freeze({
     one: ["The {count} window in this range has a computable residual.", "此范围内的 {count} 个窗口有可计算的残差。", "La {count} ventana de este intervalo tiene un residual calculable."],
     other: ["All {count} windows in this range have a computable residual.", "此范围内的全部 {count} 个窗口都有可计算的残差。", "Todas las {count} ventanas de este intervalo tienen un residual calculable."],
   }),
+  "divergence.count": Object.freeze({
+    one: ["{count} sustained divergence period in this range.", "此范围内有 {count} 个持续背离时段。", "{count} período de divergencia sostenida en este intervalo."],
+    other: ["{count} sustained divergence periods in this range.", "此范围内有 {count} 个持续背离时段。", "{count} períodos de divergencia sostenida en este intervalo."],
+  }),
   "contribution.deduplicatedRecord": Object.freeze({
     one: ["{count} deduplicated record", "{count} 条去重记录", "{count} registro deduplicado"],
     other: ["{count} deduplicated records", "{count} 条去重记录", "{count} registros deduplicados"],
@@ -1055,6 +1113,10 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Overview": ["概览", "Resumen"],
   "Allowance": ["额度", "Límite"],
   "Trends": ["趋势", "Tendencias"],
+  // Dashboard nav label for the #accounting page (renamed from "How it works",
+  // 2026-08-09). The "How it works" entry below stays for the community site's
+  // product walkthrough, which is a different section that keeps that name.
+  "Usage and costs": ["用量与成本", "Uso y costes"],
   "How it works": ["工作原理", "Cómo funciona"],
   "Community": ["社区", "Comunidad"],
   "Local evidence dashboard": ["本地证据仪表板", "Panel de evidencia local"],
@@ -1349,6 +1411,11 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "No residual evidence loaded.": ["未加载残差证据。", "No se cargó evidencia de residuales."],
   "Inspect exact periods": ["检查精确期间", "Inspeccionar períodos exactos"],
   "Exact windows and evidence state": ["精确窗口和证据状态", "Ventanas exactas y estado de evidencia"],
+  // Deviation-period detector panel headings (static copy; the period rows and
+  // empty state are localized from WEB_MESSAGES).
+  "Divergence periods": ["背离时段", "Períodos de divergencia"],
+  "Where observed and priced usage diverge": ["观测用量与计价用量的背离之处", "Dónde divergen el uso observado y el uso con precio"],
+  "Sustained stretches where provider-reported quota movement and the movement implied by priced usage persistently disagree. A single spike that cancels out is not listed.": ["提供方报告的额度变化与计价用量所推算的变化持续不一致的连续时段。单个会相互抵消的尖峰不会被列出。", "Tramos sostenidos en los que el movimiento de cuota informado por el proveedor y el implícito en el uso con precio discrepan de forma persistente. Un pico aislado que se cancela no se incluye."],
   "Largest unexplained quota movement periods": ["最大的未解释额度变化期间", "Períodos con mayor movimiento de cuota sin explicación"],
   "Evidence state": ["证据状态", "Estado de evidencia"],
   "No periods loaded.": ["未加载期间。", "No se cargaron períodos."],

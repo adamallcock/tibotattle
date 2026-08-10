@@ -16,6 +16,7 @@ import {
   createDiagnosticReference,
   createQuotaTimelineLookup,
   createRefreshPollingBudget,
+  detectDeviationPeriods,
   diagnosticErrorCode,
   diagnosticReferenceSentence,
   diagnosticSurface,
@@ -3124,6 +3125,11 @@ function liveTimelinePoints(
       apiCostUsd: rollingCost,
     });
     let cumulativeResidual = null;
+    // A re-anchor marks the first drift observation of a new reset or track:
+    // the deviation-period detector splits its runs here, so a sustained drift
+    // that crosses a boundary is never read as one continuous period across the
+    // reset. Stamped on the point so the flag survives viewport filtering.
+    let driftReanchor = false;
     if (capacity !== null && capacity > 0
         && after !== null
         && Number.isFinite(finite(after.usedPercent))
@@ -3135,6 +3141,7 @@ function liveTimelinePoints(
         driftAnchor = { resetAt: after.resetAt, usedPercent: after.usedPercent };
         driftCostUsd = 0;
         cumulativeResidual = 0;
+        driftReanchor = true;
       } else {
         cumulativeResidual = after.usedPercent - driftAnchor.usedPercent
           - driftCostUsd / capacity * 100;
@@ -3147,6 +3154,7 @@ function liveTimelinePoints(
       expected,
       residual: evidence.residual,
       cumulativeResidual,
+      driftReanchor,
       apiCostUsd: Math.max(0, rollingCost),
       usageEvents: Math.max(0, rollingEvents),
       status: evidence.status,
@@ -3624,6 +3632,10 @@ function renderTimeline(data) {
   renderTimelineSummary(data, visiblePoints);
   renderTimelineConfidence(points, visiblePoints, usingLive, viewport);
   renderResiduals(data, visiblePoints, viewport);
+  // The divergence panel reads the whole selected calibration range, not the
+  // zoomed viewport: it answers "across this range, where did observed and
+  // priced usage persistently disagree", so pan and zoom must not reshape it.
+  renderDivergencePeriods(data, points);
 }
 
 function renderTimelineConfidence(allPoints, visiblePoints, usingLive, viewport) {
@@ -3771,6 +3783,14 @@ function formatSignedPpHours(value) {
   return t("format.ppHours", {
     value: `${number < 0 ? "" : "+"}${formatDecimal(number, 1)}`,
   });
+}
+
+// A signed percentage-point figure, same convention as the pp·hours reading:
+// the "+" or "−" is which side of the cost-implied line the drift sits on.
+function formatSignedPp(value) {
+  const number = finite(value);
+  if (number === null) return "—";
+  return `${number < 0 ? "" : "+"}${formatPp(number)}`;
 }
 
 function renderTimelineSummary(data, points) {
@@ -4075,6 +4095,183 @@ function renderResidualInspectionTable() {
   const next = $("#residual-page-next");
   if (previous) previous.disabled = residualTablePage === 0;
   if (next) next.disabled = residualTablePage >= pageCount - 1;
+}
+
+/**
+ * The range-level model and observed-speed context for the divergence panel.
+ *
+ * This is deliberately NOT period-specific: the timeline usage buckets carry
+ * cost, tokens, and price coverage but no per-bucket model or speed breakdown,
+ * so the only model/speed evidence client-side is the whole-selected-period
+ * `byModel`/`bySpeed` on the accounting payload. Each period surfaces its own
+ * exact cost/token/unpriced mix from its buckets; this line adds the range's
+ * dominant priced model and observed speed as clearly-marked context.
+ */
+function divergenceRangeContext(data) {
+  const accounting = accountingPeriod(data);
+  if (!accounting) return null;
+  const models = modelUsageRows(accounting);
+  const topModel = models.find((row) => !modelRowIsSeparateAllowance(row))
+    ?? models[0]
+    ?? null;
+  const modelLabel = topModel === null ? null
+    : topModel.model === "unknown" || topModel.pricingStatus === "unrecognized"
+      ? t("accounting.model.unrecognized")
+      : formatModelName(topModel.model) || topModel.model;
+  const bySpeed = accounting.bySpeed ?? {};
+  const rankedSpeed = ["fast", "standard", "unknown"]
+    .map((key) => [key, finite(bySpeed?.[key]?.events, 0)])
+    .sort((left, right) => right[1] - left[1]);
+  const topSpeed = rankedSpeed[0]?.[1] > 0 ? rankedSpeed[0][0] : null;
+  if (modelLabel === null && topSpeed === null) return null;
+  return {
+    model: modelLabel ?? t("divergence.speed.unknown"),
+    speed: divergenceSpeedLabel(topSpeed ?? "unknown"),
+  };
+}
+
+// Static speed keys so the translated-inventory gate can verify every one. A
+// computed `t(\`divergence.speed.${key}\`)` would resolve at runtime but read
+// as no key to the source scanner.
+function divergenceSpeedLabel(key) {
+  if (key === "fast") return t("divergence.speed.fast");
+  if (key === "standard") return t("divergence.speed.standard");
+  return t("divergence.speed.unknown");
+}
+
+/**
+ * One detected divergence period, rendered to match the Trends card copy: a
+ * localized date range and duration, the finding in plain words, the signed
+ * magnitude, and the contributor mix (exact per-period totals plus range-level
+ * model/speed context).
+ */
+function divergencePeriodItem(period, rangeContext) {
+  const item = node(
+    "li",
+    `divergence-period ${period.direction === "under_costed"
+      ? "under-costed"
+      : "over-costed"}`,
+  );
+
+  const header = node("div", "divergence-period-header");
+  header.append(
+    rawNode(
+      "span",
+      "divergence-period-range",
+      t("divergence.dateRange", {
+        start: formatChartTimestamp(period.startAt),
+        end: formatChartTimestamp(period.endAt),
+      }),
+    ),
+    localizedNode("span", "divergence-period-duration", "divergence.duration", {
+      duration: formatSpanLength(period.durationMs),
+    }),
+  );
+
+  const finding = localizedNode(
+    "p",
+    "divergence-period-finding",
+    period.direction === "under_costed"
+      ? "divergence.underCosted"
+      : "divergence.overCosted",
+    { pp: formatPp(period.absPeakDriftPp) },
+  );
+
+  const magnitude = localizedNode(
+    "p",
+    "divergence-period-magnitude",
+    "divergence.magnitude",
+    {
+      peak: formatSignedPp(period.peakDriftPp),
+      auc: formatSignedPpHours(period.signedAucPpHours),
+    },
+  );
+
+  const contributors = period.contributors;
+  const mix = localizedNode("p", "divergence-period-mix", "divergence.mix", {
+    cost: formatApiMoney(contributors.costUsd),
+    tokens: compact(contributors.totalTokens),
+    events: compact(contributors.usageEvents),
+  });
+
+  item.append(header, finding, magnitude, mix);
+
+  if (contributors.unpricedEventShare !== null
+      && contributors.unpricedEvents > 0) {
+    item.append(localizedNode(
+      "p",
+      "divergence-period-unpriced",
+      "divergence.unpricedShare",
+      { share: formatPercent(contributors.unpricedEventShare * 100, 1) },
+    ));
+  }
+
+  if (rangeContext !== null) {
+    item.append(localizedNode(
+      "p",
+      "divergence-period-context",
+      "divergence.rangeMix",
+      { model: rangeContext.model, speed: rangeContext.speed },
+    ));
+  }
+
+  return item;
+}
+
+/**
+ * The "Where observed and priced usage diverge" panel. It runs the pure
+ * detector over the whole selected calibration range and lists each sustained
+ * period, or states plainly that nothing diverged in this range.
+ */
+function renderDivergencePeriods(data, points) {
+  const list = $("#divergence-list");
+  const empty = $("#divergence-empty");
+  const summary = $("#divergence-summary");
+  if (!list || !empty || !summary) return;
+  clear(list);
+
+  const result = detectDeviationPeriods(points, {
+    usageBuckets: data?.timeline?.usage ?? [],
+  });
+
+  if (!result.periods.length) {
+    list.hidden = true;
+    summary.hidden = true;
+    empty.hidden = false;
+    // "Nothing diverged" and "there is no drift series to judge" are different
+    // facts: the historical artifact view carries no per-window reset anchors,
+    // so it can never earn the clean-bill-of-health copy.
+    setLocalizedText(
+      empty,
+      result.hasDriftSeries ? "divergence.empty" : "divergence.emptyNoDrift",
+    );
+    return;
+  }
+
+  empty.hidden = true;
+  list.hidden = false;
+  summary.hidden = false;
+  if (result.truncated) {
+    setLocalizedText(summary, "divergence.truncated", {
+      shown: formatNumber(result.periods.length),
+      total: formatNumber(result.totalFound),
+    });
+    // No silent truncation: the cap is a display bound, and the full count is
+    // both stated above and recorded here.
+    console.info(
+      `[divergence] ${result.totalFound} periods detected; showing the `
+        + `${result.periods.length} widest.`,
+    );
+  } else {
+    setLocalizedPluralText(summary, "divergence.count", result.totalFound, {
+      count: formatNumber(result.totalFound),
+    });
+  }
+
+  const rangeContext = divergenceRangeContext(data);
+  for (const period of result.periods) {
+    list.append(divergencePeriodItem(period, rangeContext));
+  }
 }
 
 // A tick label's resolution follows the span the axis actually covers, so

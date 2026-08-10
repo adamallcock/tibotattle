@@ -1473,6 +1473,31 @@ h2 {
    confidence note rather than a neutral caption: the reader is looking at a
    picture that understates its subject. */
 .series-coverage { margin: var(--space-4) 0 0; padding: var(--space-3) var(--pad-tile); color: #784d25; border-inline-start: 3px solid var(--rust); background: var(--rust-soft); font-size: .75rem; }
+/* Deviation-period detector panel. Each period is a bordered card whose
+   inline-start accent names the direction: blue where observed quota outran
+   priced usage (under-counted), amber where priced usage outran observed
+   (over-counted or credited). */
+.divergence-panel .annotation { margin-top: 6px; }
+.divergence-panel .timeline-confidence { margin-bottom: var(--space-4); }
+.divergence-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-3); }
+.divergence-list[hidden] { display: none; }
+.divergence-period {
+  padding: var(--space-4) var(--pad-tile);
+  border: 1px solid var(--line);
+  border-inline-start: 4px solid var(--muted);
+  border-radius: var(--radius-sm);
+  background: var(--surface-quiet);
+}
+.divergence-period.under-costed { border-inline-start-color: var(--blue); background: var(--blue-soft); }
+.divergence-period.over-costed { border-inline-start-color: var(--amber); background: var(--amber-soft); }
+.divergence-period-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; }
+.divergence-period-range { font-weight: 600; font-size: .84rem; font-variant-numeric: tabular-nums; }
+.divergence-period-duration { color: var(--muted); font-size: .72rem; letter-spacing: .03em; text-transform: uppercase; }
+.divergence-period-finding { margin: 8px 0 0; font-size: .82rem; }
+.divergence-period-magnitude { margin: 6px 0 0; color: var(--muted); font-size: .74rem; font-variant-numeric: tabular-nums; }
+.divergence-period-mix { margin: 6px 0 0; font-size: .76rem; font-variant-numeric: tabular-nums; }
+.divergence-period-unpriced { margin: 4px 0 0; color: var(--rust); font-size: .74rem; }
+.divergence-period-context { margin: 6px 0 0; color: var(--muted); font-size: .72rem; }
 .lower-charts { grid-template-columns: 1fr; margin-top: 18px; }
 .table-wrap { width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius-sm); }
 table { width: 100%; border-collapse: collapse; font-size: .73rem; }
@@ -1675,9 +1700,15 @@ tbody tr:last-child td { border-bottom: 0; }
 .compact-metric { min-height: 150px; }
 .compact-metric .metric-value { margin: 16px 0 8px; font-size: 2rem; }
 .accounting-component-grid { margin-bottom: 18px; }
-/* The model name owns the slack; numeric columns hug the right edge with
-   tabular digits. Fixed layout starved the name column into wrapping while
-   opening a void before the numbers (owner-reported, 2026-08-07). */
+/* The model name owns the slack and stays on one line; the numeric columns
+   size to their digits and hug the right edge. A stale second rule block
+   (width: 42%; white-space: normal) used to sit below this one and, at equal
+   specificity, win — which re-broke readable names onto a second line
+   ("GPT-5.3 Codex Spark") and reopened a void before the numbers
+   (owner-reported 2026-08-07, again 2026-08-09). One coherent block now.
+   An unrecognized raw identifier is a single long unbreakable token; on a
+   narrow table it overflows into the .table-wrap horizontal scroll rather than
+   forcing a spaced name to wrap. */
 .accounting-models-panel table { table-layout: auto; }
 .accounting-models-panel th:first-child,
 .accounting-models-panel td:first-child { width: 100%; white-space: nowrap; }
@@ -1686,19 +1717,6 @@ tbody tr:last-child td { border-bottom: 0; }
   text-align: end;
   font-variant-numeric: tabular-nums;
 }
-.accounting-models-panel th:first-child,
-.accounting-models-panel td:first-child {
-  width: 42%;
-  white-space: normal;
-  /* `anywhere` lets the browser compute a min-content width of one character,
-     so in a fixed-layout table it broke readable names apart - "GPT-5.6 Sol"
-     became two lines. `break-word` still rescues an unrecognized raw
-     identifier, which is one long unbreakable token, but only when it cannot
-     otherwise fit. */
-  overflow-wrap: break-word;
-}
-.accounting-models-panel th:not(:first-child),
-.accounting-models-panel td:not(:first-child) { text-align: end; }
 /* Ordinary inline flow, not a flex row. The row used to hold a name and a
    filled chip side by side; it now holds a name and a reference mark, and a
    flex item cannot sit against the last word of a name that wrapped — the

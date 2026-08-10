@@ -103,7 +103,7 @@
           <a href="#overview" data-nav="overview" data-requires-evidence>Overview</a>
           <a href="#weekly" data-nav="weekly" data-requires-evidence>Allowance</a>
           <a href="#timeline" data-nav="trends" data-requires-evidence>Trends</a>
-          <a href="#accounting" data-nav="method" data-requires-evidence>How it works</a>
+          <a href="#accounting" data-nav="method" data-requires-evidence>Usage and costs</a>
           <a href="#community" data-nav="community" data-requires-evidence>Community</a>
         </nav>
       </aside>
@@ -604,6 +604,22 @@
           </article>
         </div>
         </details>
+        <article class="panel divergence-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Divergence periods</p>
+              <h3>Where observed and priced usage diverge</h3>
+            </div>
+          </div>
+          <p class="annotation">
+            Sustained stretches where provider-reported quota movement and the
+            movement implied by priced usage persistently disagree. A single
+            spike that cancels out is not listed.
+          </p>
+          <p class="timeline-confidence" id="divergence-summary" role="status" hidden></p>
+          <div class="chart-empty small" id="divergence-empty" hidden></div>
+          <ol class="divergence-list" id="divergence-list"></ol>
+        </article>
         <article class="panel chart-panel">
           <div class="chart-heading">
             <div>

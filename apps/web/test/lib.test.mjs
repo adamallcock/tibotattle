@@ -21,6 +21,11 @@ import {
   createRefreshPollingBudget,
   createSyntheticEnvelope,
   createTelemetryEnvelope,
+  detectDeviationPeriods,
+  DEVIATION_DRIFT_THRESHOLD_PP,
+  DEVIATION_MIN_DURATION_MS,
+  DEVIATION_MERGE_GAP_MS,
+  DEVIATION_MAX_PERIODS,
   parseJsonWithUniqueObjectKeys,
   refreshNeedsContinuation,
   runReviewedContributionGate,
@@ -563,6 +568,197 @@ test("chart and accounting shared helpers fail closed on unavailable evidence", 
   );
   assert.equal(selectAvailableAccountingPeriod([{ periodId: "all" }], "history"), null);
   assert.equal(selectAvailableAccountingPeriod([], "history"), null);
+});
+
+// --- Deviation-period detector (added 2026-08-09) --------------------------
+// The detector reads the same live cumulative-drift series the residual chart
+// draws and reports only SUSTAINED runs. These fixtures pin the five behaviours
+// the Trends panel depends on: a sustained positive run, a sustained negative
+// run, a spike that cancels (must not flag), reset-boundary splitting, and the
+// empty/no-drift cases.
+const DEVIATION_STEP_MS = 15 * 60 * 1_000;
+const DEVIATION_BASE_MS = Date.parse("2026-08-01T00:00:00.000Z");
+
+// Build a 15-minute-spaced drift series. Each entry is a number (the drift, in
+// pp) or `{ drift, residual, reanchor }`. `residual` defaults to the drift so
+// the signed AUC carries the same sign as the run.
+function driftSeries(entries, { startMs = DEVIATION_BASE_MS } = {}) {
+  return entries.map((entry, index) => {
+    const drift = typeof entry === "number" ? entry : entry.drift;
+    const residual = typeof entry === "object" && "residual" in entry
+      ? entry.residual
+      : drift;
+    const reanchor = typeof entry === "object" && entry.reanchor === true;
+    const timestampMs = startMs + index * DEVIATION_STEP_MS;
+    return {
+      timestampMs,
+      timestamp: new Date(timestampMs).toISOString(),
+      cumulativeResidual: drift,
+      residual,
+      driftReanchor: reanchor,
+    };
+  });
+}
+
+test("deviation detector flags a sustained positive run as under-counted", () => {
+  // Below-threshold lead-in, then 3 hours above +5 pp, then a return to zero.
+  const series = driftSeries([
+    0, 1, 2, 3, 4,
+    8, 8, 9, 10, 9, 8, 8, 8, 9, 8, 8, 8, 9,
+    3, 1, 0,
+  ]);
+  const result = detectDeviationPeriods(series);
+  assert.equal(result.periods.length, 1);
+  assert.equal(result.hasDriftSeries, true);
+  const [period] = result.periods;
+  assert.equal(period.direction, "under_costed");
+  assert.equal(period.directionSign, 1);
+  assert.ok(period.durationMs >= DEVIATION_MIN_DURATION_MS);
+  assert.equal(period.absPeakDriftPp, 10);
+  assert.ok(period.peakDriftPp > 0);
+  assert.ok(period.signedAucPpHours > 0, "positive run accumulates positive area");
+});
+
+test("deviation detector flags a sustained negative run as over-counted", () => {
+  const series = driftSeries([
+    0, -1, -2, -3,
+    -8, -9, -8, -8, -9, -8, -8, -9, -8, -8, -9, -8, -8,
+    -2, 0,
+  ]);
+  const result = detectDeviationPeriods(series);
+  assert.equal(result.periods.length, 1);
+  const [period] = result.periods;
+  assert.equal(period.direction, "over_costed");
+  assert.equal(period.directionSign, -1);
+  assert.equal(period.absPeakDriftPp, 9);
+  assert.ok(period.peakDriftPp < 0);
+  assert.ok(period.signedAucPpHours < 0, "negative run accumulates negative area");
+});
+
+test("deviation detector ignores a spike that cancels itself out", () => {
+  // A tall but brief +excursion followed by an equally brief -excursion: net
+  // ~zero, and neither side lasts the two-hour minimum. Nothing is a period.
+  const series = driftSeries([
+    0, 8, 12, 8, 0, -8, -12, -8, 0,
+  ]);
+  const result = detectDeviationPeriods(series);
+  assert.equal(result.periods.length, 0);
+  assert.equal(result.totalFound, 0);
+  assert.equal(result.hasDriftSeries, true, "a spike is still real drift evidence");
+});
+
+test("deviation detector splits a run at a reset-boundary re-anchor", () => {
+  // Twelve consecutive above-threshold buckets are one 165-minute period on
+  // their own. A re-anchor at the midpoint (a reset boundary or track change)
+  // splits them into two 75-minute halves, and neither half clears the floor.
+  const values = Array.from({ length: 12 }, () => 8);
+  const withoutReset = detectDeviationPeriods(driftSeries(values));
+  assert.equal(withoutReset.periods.length, 1, "unbroken run is one period");
+
+  const withReset = detectDeviationPeriods(driftSeries(
+    values.map((drift, index) => (index === 6 ? { drift, reanchor: true } : drift)),
+  ));
+  assert.equal(withReset.periods.length, 0, "the reset ends the period at the boundary");
+});
+
+test("deviation detector treats a data gap as a hard boundary", () => {
+  // A null drift is a missing bucket, not a zero: it ends the run in progress
+  // exactly like a reset, so a run straddling the gap cannot be sustained.
+  const series = driftSeries([
+    8, 8, 8, 8, 8,
+    { drift: null },
+    8, 8, 8, 8, 8,
+  ]);
+  const result = detectDeviationPeriods(series);
+  assert.equal(result.periods.length, 0);
+});
+
+test("deviation detector returns an explicit empty result with no drift series", () => {
+  const empty = detectDeviationPeriods([]);
+  assert.deepEqual(empty.periods, []);
+  assert.equal(empty.totalFound, 0);
+  assert.equal(empty.truncated, false);
+  assert.equal(empty.hasDriftSeries, false);
+
+  // Present-but-unusable: every point suspends the drift line. This must read
+  // as "no series to judge", not "nothing diverged".
+  const suspended = detectDeviationPeriods(
+    driftSeries([{ drift: null }, { drift: null }, { drift: null }]),
+  );
+  assert.equal(suspended.periods.length, 0);
+  assert.equal(suspended.hasDriftSeries, false);
+});
+
+test("deviation detector attaches exact per-period contributor totals from buckets", () => {
+  const series = driftSeries([
+    0, 0,
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    0,
+  ]);
+  const [period] = detectDeviationPeriods(series).periods;
+  // One bucket inside the run, one outside it, plus a bucket the run spans that
+  // carries unpriced changes.
+  const usageBuckets = [
+    {
+      startAt: "2026-07-31T23:00:00.000Z",
+      endAt: "2026-08-01T00:00:00.000Z",
+      apiPriceEquivalentUsd: 99,
+      totalTokens: 9_999,
+      usageEvents: 40,
+      pricingCoverage: { unpricedEvents: 0 },
+    },
+    {
+      startAt: new Date(period.startMs).toISOString(),
+      endAt: new Date(period.startMs).toISOString(),
+      apiPriceEquivalentUsd: 4,
+      totalTokens: 2_000,
+      usageEvents: 10,
+      pricingCoverage: { unpricedEvents: 4 },
+    },
+    {
+      startAt: new Date(period.endMs).toISOString(),
+      endAt: new Date(period.endMs).toISOString(),
+      apiPriceEquivalentUsd: 6,
+      totalTokens: 3_000,
+      usageEvents: 6,
+      pricingCoverage: { unpricedEvents: 0 },
+    },
+  ];
+  const [priced] = detectDeviationPeriods(series, { usageBuckets }).periods;
+  assert.equal(priced.contributors.costUsd, 10);
+  assert.equal(priced.contributors.totalTokens, 5_000);
+  assert.equal(priced.contributors.usageEvents, 16);
+  assert.equal(priced.contributors.unpricedEvents, 4);
+  assert.equal(priced.contributors.pricedEvents, 12);
+  assert.ok(Math.abs(priced.contributors.unpricedEventShare - 4 / 16) < 1e-9);
+  assert.equal(priced.contributors.bucketCount, 2);
+});
+
+test("deviation detector caps the list and reports the full count", () => {
+  const constants = {
+    thresholdPp: DEVIATION_DRIFT_THRESHOLD_PP,
+    minDurationMs: DEVIATION_MIN_DURATION_MS,
+    mergeGapMs: DEVIATION_MERGE_GAP_MS,
+    maxPeriods: DEVIATION_MAX_PERIODS,
+  };
+  assert.equal(constants.thresholdPp, 5);
+  assert.equal(constants.minDurationMs, 2 * 60 * 60 * 1_000);
+  assert.equal(constants.maxPeriods, 20);
+
+  // Two well-separated sustained runs; capping to one keeps the widest and
+  // still reports both were found, so nothing is silently dropped.
+  const run = [8, 8, 8, 8, 8, 8, 8, 8, 8, 8];
+  const tallerRun = [12, 12, 12, 12, 12, 12, 12, 12, 12, 12];
+  const series = driftSeries([
+    ...run,
+    ...Array.from({ length: 12 }, () => 0),
+    ...tallerRun,
+  ]);
+  const result = detectDeviationPeriods(series, { maxPeriods: 1 });
+  assert.equal(result.totalFound, 2);
+  assert.equal(result.periods.length, 1);
+  assert.equal(result.truncated, true);
+  assert.equal(result.periods[0].absPeakDriftPp, 12, "the widest period is kept");
 });
 
 test("browser JSON preflight rejects duplicate object keys before parsing", () => {
@@ -4111,7 +4307,7 @@ test("participant results fail closed for unverifiable prices and honest not-tes
 test("public interface is dashboard-first and never substitutes demo data automatically", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  for (const label of ["Overview", "Allowance", "Trends", "Community", "How it works"]) {
+  for (const label of ["Overview", "Allowance", "Trends", "Community", "Usage and costs"]) {
     assert.match(html, new RegExp(label));
   }
   assert.doesNotMatch(html, /data-nav="data"|Data &amp; privacy|05 · READING THE ESTIMATE|PRICE BASIS FOR THE VISIBLE FITS/iu);

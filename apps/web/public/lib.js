@@ -496,3 +496,248 @@ export function diagnosticReferenceSentence({
     ? `Reference ${reference}, also written to the local diagnostics log.`
     : `Reference ${reference} · service request ${service}. Both are written to the local diagnostics log.`;
 }
+
+// --- Deviation-period detector ---------------------------------------------
+//
+// A deviation period is a SUSTAINED stretch where the re-anchored cumulative
+// drift — the running sum of each non-overlapping bucket's observed-minus-priced
+// quota movement, restarted at every reset boundary or track change, exactly
+// the `cumulativeResidual` series `liveTimelinePoints` draws and the signed AUC
+// in src/simple-quota-gradient.js integrates — moves materially away from zero
+// and stays there. It is deliberately NOT a single spike: a short excursion
+// that returns to zero, or a +spike immediately cancelled by a -spike, must not
+// be reported. The detector reads the same live timeline points the residual
+// chart uses (each carries `cumulativeResidual` and, at a fresh anchor, a
+// `driftReanchor` flag) and returns an ordered list of periods.
+
+// |cumulative drift| must exceed this, in percentage points, for a bucket to
+// count as diverging. Pinned to the 5 pp minimum displayed span the weekly
+// calibration contract already treats as the smallest movement worth reading
+// (WEEKLY_CALIBRATION_MINIMUM_DISPLAYED_SPAN_PP in localization.js): a drift
+// smaller than the smallest span we will draw is not a finding.
+export const DEVIATION_DRIFT_THRESHOLD_PP = 5;
+// A run must persist at least this long before it is a "period" rather than a
+// transient. The residual series is a 3-hour rolling window, so a genuine
+// sustained disagreement outlives a large share of that window; two hours is
+// long enough that a single window's settling cannot manufacture a period, and
+// short enough to catch a real half-window run.
+export const DEVIATION_MIN_DURATION_MS = 2 * 60 * 60 * 1_000;
+// Same-sign runs separated only by a brief sub-threshold dip (no reset, no data
+// gap between them) are one period, not two. 45 minutes is three 15-minute
+// buckets — long enough to bridge a shallow wobble, short enough that a real
+// return to zero still ends the period.
+export const DEVIATION_MERGE_GAP_MS = 45 * 60 * 1_000;
+// The list is capped so the panel stays readable. Anything beyond the cap is
+// counted and reported (see `totalFound`/`truncated`), never silently dropped.
+export const DEVIATION_MAX_PERIODS = 20;
+
+function deviationNumberOrNull(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function deviationNonNegative(value) {
+  const number = deviationNumberOrNull(value);
+  return number === null || number < 0 ? 0 : number;
+}
+
+function deviationPointMs(point) {
+  const stamped = point?.timestampMs;
+  if (typeof stamped === "number" && Number.isFinite(stamped)) return stamped;
+  return Date.parse(point?.timestamp ?? "");
+}
+
+// The signed observed-minus-priced area, in pp·hours, over the period's points.
+// Trapezoidal over the per-window residual, matching buildRollingResidual's
+// signed AUC in src/simple-quota-gradient.js so the two statistics agree.
+function deviationSignedAuc(points) {
+  let area = 0;
+  for (let index = 1; index < points.length; index += 1) {
+    const prior = points[index - 1];
+    const current = points[index];
+    if (prior.residual === null || current.residual === null) continue;
+    const elapsedHours = (current.timestampMs - prior.timestampMs) / 3_600_000;
+    if (!Number.isFinite(elapsedHours) || elapsedHours <= 0) continue;
+    area += elapsedHours * (prior.residual + current.residual) / 2;
+  }
+  return area;
+}
+
+// Within one drift segment (no reset, no gap), the maximal same-sign runs whose
+// |drift| exceeds the threshold, merging two same-sign runs separated only by a
+// brief sub-threshold dip. A sign flip between two runs is never bridged, so a
+// spike that cancels can never merge into its own rebound.
+function deviationSegmentExcursions(segment, { thresholdPp, mergeGapMs }) {
+  const runs = [];
+  let run = null;
+  for (const point of segment) {
+    const sign = point.drift > thresholdPp ? 1
+      : point.drift < -thresholdPp ? -1
+        : 0;
+    if (sign === 0) {
+      run = null;
+      continue;
+    }
+    if (run && run.sign === sign) {
+      run.points.push(point);
+    } else {
+      run = { sign, points: [point] };
+      runs.push(run);
+    }
+  }
+  const merged = [];
+  for (const candidate of runs) {
+    const last = merged.at(-1);
+    if (last
+        && last.sign === candidate.sign
+        && candidate.points[0].timestampMs
+          - last.points.at(-1).timestampMs <= mergeGapMs) {
+      last.points.push(...candidate.points);
+    } else {
+      merged.push({ sign: candidate.sign, points: [...candidate.points] });
+    }
+  }
+  return merged;
+}
+
+// Aggregate the exact usage buckets whose end falls inside the period. This is
+// the only per-period contributor evidence available client-side: cost, token
+// volume, usage-change count, and the unpriced-change share. The per-period
+// model and speed MIX is not in the timeline payload — those breakdowns exist
+// only at the whole-selected-period grain (byModel/bySpeed) — so the renderer
+// layers the range-level dominant model/speed on top, clearly marked as
+// range context rather than a period-specific claim.
+function deviationBucketContributors(buckets, startMs, endMs) {
+  let costUsd = 0;
+  let totalTokens = 0;
+  let usageEvents = 0;
+  let unpricedEvents = 0;
+  let bucketCount = 0;
+  for (const bucket of buckets) {
+    if (bucket.endMs < startMs || bucket.endMs > endMs) continue;
+    costUsd += bucket.cost;
+    totalTokens += bucket.tokens;
+    usageEvents += bucket.events;
+    unpricedEvents += bucket.unpriced;
+    bucketCount += 1;
+  }
+  return {
+    costUsd,
+    totalTokens,
+    usageEvents,
+    unpricedEvents,
+    pricedEvents: Math.max(0, usageEvents - unpricedEvents),
+    unpricedEventShare: usageEvents > 0 ? unpricedEvents / usageEvents : null,
+    bucketCount,
+  };
+}
+
+/**
+ * Find the sustained periods where observed quota movement persistently
+ * disagrees with priced (cost-implied) usage.
+ *
+ * @param {Array} points  Live timeline points, each `{ timestampMs, timestamp,
+ *   cumulativeResidual, residual, driftReanchor }`. A null/absent
+ *   `cumulativeResidual` is a data gap that ends any run; a `driftReanchor`
+ *   point starts a fresh segment (a reset boundary or track change), which ends
+ *   the preceding period by construction.
+ * @param {Object} [options]
+ * @param {Array}  [options.usageBuckets]  Raw `data.timeline.usage` buckets,
+ *   used only to attach the exact per-period contributor totals.
+ * @returns {{ periods: Array, totalFound: number, truncated: boolean,
+ *   thresholdPp: number, minDurationMs: number, hasDriftSeries: boolean }}
+ */
+export function detectDeviationPeriods(points, {
+  usageBuckets = [],
+  thresholdPp = DEVIATION_DRIFT_THRESHOLD_PP,
+  minDurationMs = DEVIATION_MIN_DURATION_MS,
+  mergeGapMs = DEVIATION_MERGE_GAP_MS,
+  maxPeriods = DEVIATION_MAX_PERIODS,
+} = {}) {
+  const series = (Array.isArray(points) ? points : [])
+    .map((point) => ({
+      timestampMs: deviationPointMs(point),
+      timestamp: typeof point?.timestamp === "string" ? point.timestamp : null,
+      drift: deviationNumberOrNull(point?.cumulativeResidual),
+      residual: deviationNumberOrNull(point?.residual),
+      reanchor: point?.driftReanchor === true,
+    }))
+    .filter((point) => Number.isFinite(point.timestampMs))
+    .sort((left, right) => left.timestampMs - right.timestampMs);
+  // Whether any drift evidence exists at all separates "nothing diverged" from
+  // "this view carries no cumulative-drift series to judge" — the historical
+  // artifact view has no per-window reset anchors, so it can only ever report
+  // the latter, and the panel must not read it as a clean bill of health.
+  const hasDriftSeries = series.some((point) => point.drift !== null);
+
+  // Split into segments at data gaps (null drift) and reset re-anchors.
+  const segments = [];
+  let segment = [];
+  for (const point of series) {
+    if (point.drift === null) {
+      if (segment.length) segments.push(segment);
+      segment = [];
+      continue;
+    }
+    if (point.reanchor && segment.length) {
+      segments.push(segment);
+      segment = [];
+    }
+    segment.push(point);
+  }
+  if (segment.length) segments.push(segment);
+
+  const buckets = (Array.isArray(usageBuckets) ? usageBuckets : [])
+    .map((bucket) => ({
+      endMs: Date.parse(bucket?.endAt ?? ""),
+      cost: deviationNonNegative(bucket?.apiPriceEquivalentUsd),
+      tokens: deviationNonNegative(bucket?.totalTokens),
+      events: deviationNonNegative(bucket?.usageEvents),
+      unpriced: deviationNonNegative(bucket?.pricingCoverage?.unpricedEvents),
+    }))
+    .filter((bucket) => Number.isFinite(bucket.endMs));
+
+  const found = [];
+  for (const currentSegment of segments) {
+    for (const run of deviationSegmentExcursions(currentSegment, {
+      thresholdPp,
+      mergeGapMs,
+    })) {
+      const runPoints = run.points;
+      const startMs = runPoints[0].timestampMs;
+      const endMs = runPoints.at(-1).timestampMs;
+      const durationMs = endMs - startMs;
+      if (durationMs < minDurationMs) continue;
+      let peakDriftPp = 0;
+      for (const point of runPoints) {
+        if (Math.abs(point.drift) > Math.abs(peakDriftPp)) {
+          peakDriftPp = point.drift;
+        }
+      }
+      found.push({
+        startAt: runPoints[0].timestamp,
+        endAt: runPoints.at(-1).timestamp,
+        startMs,
+        endMs,
+        durationMs,
+        directionSign: run.sign,
+        direction: run.sign > 0 ? "under_costed" : "over_costed",
+        peakDriftPp,
+        absPeakDriftPp: Math.abs(peakDriftPp),
+        netDriftPp: runPoints.at(-1).drift - runPoints[0].drift,
+        signedAucPpHours: deviationSignedAuc(runPoints),
+        pointCount: runPoints.length,
+        contributors: deviationBucketContributors(buckets, startMs, endMs),
+      });
+    }
+  }
+
+  found.sort((left, right) => right.absPeakDriftPp - left.absPeakDriftPp);
+  return {
+    periods: found.slice(0, maxPeriods),
+    totalFound: found.length,
+    truncated: found.length > maxPeriods,
+    thresholdPp,
+    minDurationMs,
+    hasDriftSeries,
+  };
+}
