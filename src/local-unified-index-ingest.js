@@ -4,6 +4,8 @@ import { discoverCodexRolloutInfos } from "./codex-log-scan.js";
 import {
   createLineageSnapshots,
   extractRolloutUsage,
+  inheritedTierSeed,
+  ownObservedTier,
 } from "./local-unified-index-extract.js";
 import {
   createEventSink,
@@ -295,6 +297,45 @@ export async function ingestLocalUnifiedIndexIncrement({
       };
     }
 
+    // Lineage speed carry-forward (design: composition-aware-expected-line
+    // §4). Walk the fork/parent ancestor chain nearest-first and seed the
+    // child's initial tier from the first ancestor whose final tier is known —
+    // this pass's freshest derived state when the ancestor was scanned here,
+    // its persisted cursor otherwise. Strictly lineage-scoped: only the chain
+    // named by `lineage.parentId` is ever consulted, never concurrent
+    // unrelated threads — Codex `service_tier` is per-thread, and a global
+    // "most recent switch anywhere" carry would mislabel the majority of Fast
+    // sessions. No reachable declaration anywhere up the chain leaves the
+    // seed null and the child's turns unobserved.
+    function lineageSeedTier(info) {
+      const seen = new Set();
+      let parentId = info.lineage?.parentId ?? null;
+      while (parentId && !seen.has(parentId)) {
+        seen.add(parentId);
+        const scanned = finalBySessionId.get(parentId);
+        if (scanned !== undefined) {
+          // Freshly scanned this pass: its final tier already folds in ITS
+          // own seed, so a non-null value is the nearest observed
+          // declaration. A null keeps walking — harmlessly redundant, since
+          // the ancestor's own derivation covered the same chain.
+          if (scanned.tier !== null && scanned.tier !== undefined) {
+            return inheritedTierSeed(scanned.tier);
+          }
+        } else {
+          const parent = bySessionId.get(parentId);
+          const cursor = parent === undefined
+            ? undefined
+            : cursors.get(
+              sourceLocal(deviceSalt, parent.rolloutKey).toString("hex"),
+            );
+          const carried = cursor === undefined ? null : carriedTier(cursor);
+          if (carried !== null) return inheritedTierSeed(carried);
+        }
+        parentId = bySessionId.get(parentId)?.lineage?.parentId ?? null;
+      }
+      return null;
+    }
+
     function ancestorSessionLocalsFor(info) {
       const chain = [];
       const seen = new Set();
@@ -427,7 +468,15 @@ export async function ingestLocalUnifiedIndexIncrement({
             ),
             seedModel: seed.seedModel,
             seedEffort: seed.seedEffort,
-            seedTier: resuming ? carriedTier(cursor) : null,
+            // A resumed segment carries its own cursor tier (own-file
+            // declarations, still `rollout_thread_settings`). When the cursor
+            // carries none — the file never declared, or only ever inherited —
+            // the ancestor chain is consulted, exactly as a whole-file rescan
+            // would, so provenance survives resume instead of degrading to
+            // unobserved.
+            seedTier: resuming
+              ? carriedTier(cursor) ?? lineageSeedTier(info)
+              : lineageSeedTier(info),
             seedTotals: resuming ? carriedTotals(cursor) : null,
             seedTurnContextSeen: resuming
               && Number(cursor.turn_context_seen) === 1,
@@ -439,14 +488,19 @@ export async function ingestLocalUnifiedIndexIncrement({
             finalBySessionId.set(info.lineage.sessionId, {
               model: outcome.finalModel,
               effort: outcome.finalEffort,
+              tier: outcome.finalTier,
             });
           }
           writeCursorForOutcome(writer, deviceSalt, info, state, {
             nextOffset: outcome.read.nextOffset,
             finalModel: outcome.finalModel,
             finalEffort: outcome.finalEffort,
-            finalTierRaw: outcome.finalTier?.providerTierRaw ?? null,
-            finalTierObservedAtMs: outcome.finalTier?.observedAtMs ?? null,
+            // Only this file's own declarations are carried in the cursor. An
+            // inherited seed is re-derived from the ancestor chain on the
+            // next pass, so `lineage_inherited` provenance is never laundered
+            // into an own observation by a resume.
+            finalTierRaw: ownObservedTier(outcome.finalTier)?.providerTierRaw ?? null,
+            finalTierObservedAtMs: ownObservedTier(outcome.finalTier)?.observedAtMs ?? null,
             finalTotals: outcome.finalTotals,
             turnContextSeen: outcome.finalTurnContextSeen,
             // A whole-file scan makes the collected set durable; a resumed

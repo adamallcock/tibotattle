@@ -3,6 +3,8 @@ import { parentPort, workerData } from "node:worker_threads";
 import {
   createLineageSnapshots,
   extractRolloutUsage,
+  inheritedTierSeed,
+  ownObservedTier,
 } from "./local-unified-index-extract.js";
 
 // One lane of a parallel rebuild.
@@ -89,6 +91,9 @@ async function run() {
           },
           seedModel: seed?.model ?? null,
           seedEffort: seed?.effort ?? null,
+          // Lineage speed carry-forward: the parent's final tier already folds
+          // in its own seed, so a direct-parent lookup spans the whole chain.
+          seedTier: inheritedTierSeed(seed?.tier ?? null),
           ...(maximumLineBytes === undefined ? {} : { maximumLineBytes }),
           onEvent: (event) => {
             events.push(event);
@@ -99,6 +104,7 @@ async function run() {
           finalBySessionId.set(source.sessionId, {
             model: outcome.finalModel,
             effort: outcome.finalEffort,
+            tier: outcome.finalTier,
           });
         }
         flush(source.rolloutKey, true, {
@@ -116,8 +122,10 @@ async function run() {
           nextOffset: outcome.read.nextOffset,
           finalModel: outcome.finalModel,
           finalEffort: outcome.finalEffort,
-          finalTierRaw: outcome.finalTier?.providerTierRaw ?? null,
-          finalTierObservedAtMs: outcome.finalTier?.observedAtMs ?? null,
+          // Own-file declarations only: an inherited seed is re-derived from
+          // the ancestor chain on the next pass, keeping its provenance.
+          finalTierRaw: ownObservedTier(outcome.finalTier)?.providerTierRaw ?? null,
+          finalTierObservedAtMs: ownObservedTier(outcome.finalTier)?.observedAtMs ?? null,
           finalTotals: outcome.finalTotals,
           turnContextSeen: outcome.finalTurnContextSeen,
           snapshotsPersisted: collector !== null,

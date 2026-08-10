@@ -7,6 +7,8 @@ import { recognizedExportModelId } from "./export/index.js";
 import {
   createLineageSnapshots,
   extractRolloutUsage,
+  inheritedTierSeed,
+  ownObservedTier,
 } from "./local-unified-index-extract.js";
 import {
   createUnifiedIndexWriter,
@@ -84,7 +86,13 @@ function tierRow(tier) {
     apiServiceTier: "unknown",
     billingSurface: CODEX_BILLING_SURFACE,
     codexSpeedMode,
-    tierSource: "rollout_thread_settings",
+    // Provenance, not observation strength: a tier seeded from the fork/parent
+    // ancestor chain must not masquerade as a declaration read from this
+    // file. Pricing keys off `codexSpeedMode` alone, so an inherited Fast
+    // still prices Fast — the label only records where the value came from.
+    tierSource: tier.inherited === true
+      ? "lineage_inherited"
+      : "rollout_thread_settings",
     providerTierRaw: raw ?? null,
   };
 }
@@ -453,6 +461,7 @@ export async function rebuildLocalUnifiedIndex({
         surface: surfaceRow(info.lineage?.surfaceClassification),
         finalModel: null,
         finalEffort: null,
+        finalTier: null,
       };
       // The raw session UUID travels in v1.0 contribution records (owner
       // decision). The writer refuses anything that is not UUID-shaped, so a
@@ -468,15 +477,21 @@ export async function rebuildLocalUnifiedIndex({
     if (info.lineage?.sessionId) bySessionId.set(info.lineage.sessionId, info);
   }
   function seedFor(info) {
+    const none = { seedModel: null, seedEffort: null, seedTier: null };
     const parentId = info.lineage?.parentId;
-    if (!parentId) return { seedModel: null, seedEffort: null };
+    if (!parentId) return none;
     const parent = bySessionId.get(parentId);
-    if (!parent) return { seedModel: null, seedEffort: null };
+    if (!parent) return none;
     const parentState = sourceState.get(parent.rolloutKey);
-    if (parentState === undefined) return { seedModel: null, seedEffort: null };
+    if (parentState === undefined) return none;
     return {
       seedModel: parentState.finalModel,
       seedEffort: parentState.finalEffort,
+      // Lineage speed carry-forward. The direct parent's final tier already
+      // folds in ITS seed (components run parent-first), so this one lookup
+      // carries the nearest observed declaration down an arbitrarily deep
+      // chain — and stays strictly lineage-scoped by construction.
+      seedTier: inheritedTierSeed(parentState.finalTier),
     };
   }
 
@@ -506,18 +521,23 @@ export async function rebuildLocalUnifiedIndex({
               ),
               seedModel: seed.seedModel,
               seedEffort: seed.seedEffort,
+              seedTier: seed.seedTier,
               maximumLineBytes,
               signal,
               onEvent: (event) => sink.write(state, event),
             });
             state.finalModel = outcome.finalModel;
             state.finalEffort = outcome.finalEffort;
+            state.finalTier = outcome.finalTier;
             writeCursorForOutcome(writer, deviceSalt, info, state, {
               nextOffset: outcome.read.nextOffset,
               finalModel: outcome.finalModel,
               finalEffort: outcome.finalEffort,
-              finalTierRaw: outcome.finalTier?.providerTierRaw ?? null,
-              finalTierObservedAtMs: outcome.finalTier?.observedAtMs ?? null,
+              // Only this file's own declarations are carried. An inherited
+              // seed is re-derived from the ancestor chain on the next pass,
+              // so its lineage_inherited provenance survives a resume.
+              finalTierRaw: ownObservedTier(outcome.finalTier)?.providerTierRaw ?? null,
+              finalTierObservedAtMs: ownObservedTier(outcome.finalTier)?.observedAtMs ?? null,
               finalTotals: outcome.finalTotals,
               turnContextSeen: outcome.finalTurnContextSeen,
               snapshotsPersisted: collector !== null,

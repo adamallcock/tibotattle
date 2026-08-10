@@ -30,6 +30,7 @@ import {
   reasoningEffortOrdinal,
   sessionLocal,
 } from "../src/local-unified-index.js";
+import { readLocalUnifiedWindowBreakdown } from "../src/local-unified-window-breakdown.js";
 
 const CONTRACT = "usage-event-v0.2";
 
@@ -859,6 +860,10 @@ test("classifySource forces a whole-file rescan for cursors stamped by an older 
     { size_bytes: 100, mtime_ms: 5, parser_version: "unified-rollout-typed-v1" },
     { size_bytes: 100, mtime_ms: 4, parser_version: "unified-rollout-typed-v1" },
     { size_bytes: 60, mtime_ms: 5, parser_version: "unified-rollout-typed-v1" },
+    // v2 rows label lineage descendants' pre-declaration turns "unobserved"
+    // even when an ancestor declaration is reachable; the v3 bump (lineage
+    // speed carry-forward) must flag them for re-derivation.
+    { size_bytes: 100, mtime_ms: 5, parser_version: "unified-rollout-typed-v2" },
     // A cursor whose run row is missing reads as unknown, the safe direction.
     { size_bytes: 100, mtime_ms: 5, parser_version: null },
   ]) {
@@ -929,6 +934,326 @@ test("a parser-version bump re-derives poisoned sources and replaces their rows"
     assert.equal(settled.sourcesReparsedForParserVersion, 0);
     assert.equal(settled.sourcesSkipped, 1);
     assert.equal(settled.insertedUsageEvents, 0);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+// --- Lineage speed carry-forward --------------------------------------------
+
+function tierRows(database) {
+  return database.prepare(`
+    SELECT u.observed_at_ms AS ms, m.model_id AS model,
+           t.codex_speed_mode AS speed, t.tier_source AS source,
+           t.provider_tier_raw AS raw
+    FROM usage_event u
+    JOIN model m ON m.id = u.model_id
+    JOIN tier_semantics t ON t.id = u.tier_id
+    ORDER BY u.observed_at_ms`).all().map((row) => ({
+      model: row.model,
+      speed: row.speed,
+      source: row.source,
+      raw: row.raw,
+    }));
+}
+
+test("a fork descendant inherits its ancestor's declared speed as lineage_inherited", async () => {
+  // Root declares Fast; the child forks with no thread_settings_applied of its
+  // own; the grandchild forks from the child, which itself only inherited.
+  // The nearest reachable declaration wins for both descendants, and the
+  // provenance says so: inherited tier never masquerades as an own-file
+  // declaration.
+  const files = {
+    "rollout-2026-07-25T00-00-00-root.jsonl": [
+      sessionMeta("session-root"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      threadSettings("2026-07-25T00:00:00.500Z", "priority"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+    "rollout-2026-07-25T01-00-00-mid.jsonl": [
+      sessionMeta("session-mid", { parentId: "session-root", threadSource: "subagent" }),
+      // Replayed parent history, then the child's own turn. No declaration.
+      tokenCount("2026-07-25T01:00:00.000Z", usage(100, 10), usage(100, 10)),
+      turnContext("2026-07-25T01:00:01.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T01:00:02.000Z", usage(200, 20), usage(100, 10)),
+    ],
+    "rollout-2026-07-25T02-00-00-leaf.jsonl": [
+      sessionMeta("session-leaf", { parentId: "session-mid", threadSource: "subagent" }),
+      tokenCount("2026-07-25T02:00:00.000Z", usage(100, 10), usage(100, 10)),
+      tokenCount("2026-07-25T02:00:01.000Z", usage(200, 20), usage(100, 10)),
+      turnContext("2026-07-25T02:00:02.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T02:00:03.000Z", usage(300, 30), usage(100, 10)),
+    ],
+  };
+  const { root } = await corpus(files);
+  const expected = [
+    { model: "gpt-5.6-sol", speed: "fast", source: "rollout_thread_settings", raw: "priority" },
+    { model: "gpt-5.6-sol", speed: "fast", source: "lineage_inherited", raw: "priority" },
+    { model: "gpt-5.6-sol", speed: "fast", source: "lineage_inherited", raw: "priority" },
+  ];
+  try {
+    // The single-threaded rebuild and the worker rebuild must attribute
+    // identically — the seed travels with the lineage component either way.
+    for (const workerCount of [1, 3]) {
+      await build(root, { workerCount });
+      const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+      try {
+        assert.deepEqual(tierRows(database), expected, `workerCount ${workerCount}`);
+        // The cursor carries only own-file declarations: the descendants'
+        // inherited tier is re-derived from the chain next pass, never
+        // laundered into an own observation.
+        const carries = database.prepare(
+          "SELECT carry_tier_raw AS raw FROM source_cursor ORDER BY raw",
+        ).all().map((row) => row.raw);
+        assert.deepEqual(carries, [null, null, "priority"]);
+      } finally {
+        database.close();
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("concurrent unrelated sessions never cross-contaminate speed", async () => {
+  // Three overlapping standalone threads: one Fast, one Standard, one silent.
+  // service_tier is per-thread; only a session's own lineage may seed it, so
+  // the silent thread stays unobserved even though two contemporaneous
+  // declarations exist elsewhere.
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-fastt.jsonl": [
+      sessionMeta("session-fast"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      threadSettings("2026-07-25T00:00:01.000Z", "priority"),
+      tokenCount("2026-07-25T00:00:02.000Z", usage(100, 10), usage(100, 10)),
+    ],
+    "rollout-2026-07-25T00-00-00-stand.jsonl": [
+      sessionMeta("session-standard"),
+      turnContext("2026-07-25T00:00:00.500Z", "gpt-5.5"),
+      threadSettings("2026-07-25T00:00:01.500Z", "default"),
+      tokenCount("2026-07-25T00:00:02.500Z", usage(100, 10), usage(100, 10)),
+    ],
+    "rollout-2026-07-25T00-00-00-quiet.jsonl": [
+      sessionMeta("session-quiet"),
+      turnContext("2026-07-25T00:00:01.000Z", "gpt-5.4-mini"),
+      tokenCount("2026-07-25T00:00:03.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  try {
+    await build(root);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      assert.deepEqual(tierRows(database), [
+        { model: "gpt-5.6-sol", speed: "fast", source: "rollout_thread_settings", raw: "priority" },
+        { model: "gpt-5.5", speed: "standard", source: "rollout_thread_settings", raw: "default" },
+        { model: "gpt-5.4-mini", speed: "unknown", source: "unobserved", raw: null },
+      ]);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a fork child whose ancestor chain never declared stays unobserved", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-parent.jsonl": [
+      sessionMeta("session-parent"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-terra"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+    "rollout-2026-07-25T01-00-00-child.jsonl": [
+      sessionMeta("session-child", { parentId: "session-parent", threadSource: "subagent" }),
+      tokenCount("2026-07-25T01:00:00.000Z", usage(100, 10), usage(100, 10)),
+      turnContext("2026-07-25T01:00:01.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T01:00:02.000Z", usage(200, 20), usage(100, 10)),
+    ],
+  });
+  try {
+    await build(root);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      assert.deepEqual(tierRows(database), [
+        { model: "gpt-5.6-terra", speed: "unknown", source: "unobserved", raw: null },
+        { model: "gpt-5.6-sol", speed: "unknown", source: "unobserved", raw: null },
+      ]);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a child's own declaration supersedes the inherited seed from that turn on", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-parent.jsonl": [
+      sessionMeta("session-parent"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      threadSettings("2026-07-25T00:00:00.500Z", "priority"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+    "rollout-2026-07-25T01-00-00-child.jsonl": [
+      sessionMeta("session-child", { parentId: "session-parent", threadSource: "subagent" }),
+      tokenCount("2026-07-25T01:00:00.000Z", usage(100, 10), usage(100, 10)),
+      turnContext("2026-07-25T01:00:01.000Z", "gpt-5.6-sol"),
+      // Pre-declaration: inherits the ancestor's Fast.
+      tokenCount("2026-07-25T01:00:02.000Z", usage(200, 20), usage(100, 10)),
+      // The child then declares its own tier.
+      threadSettings("2026-07-25T01:00:03.000Z", "default"),
+      tokenCount("2026-07-25T01:00:04.000Z", usage(300, 30), usage(100, 10)),
+    ],
+  });
+  try {
+    await build(root);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      assert.deepEqual(tierRows(database), [
+        { model: "gpt-5.6-sol", speed: "fast", source: "rollout_thread_settings", raw: "priority" },
+        { model: "gpt-5.6-sol", speed: "fast", source: "lineage_inherited", raw: "priority" },
+        { model: "gpt-5.6-sol", speed: "standard", source: "rollout_thread_settings", raw: "default" },
+      ]);
+      // The child's cursor now carries its OWN declaration.
+      const carries = database.prepare(
+        "SELECT carry_tier_raw AS raw FROM source_cursor ORDER BY raw",
+      ).all().map((row) => row.raw);
+      assert.deepEqual(carries, ["default", "priority"]);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a fork indexed in a later pass inherits from the parent's cursor and keeps provenance across resume", async () => {
+  const { root, sessions } = await corpus({
+    "rollout-2026-07-25T00-00-00-parent.jsonl": [
+      sessionMeta("session-parent"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      threadSettings("2026-07-25T00:00:00.500Z", "priority"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const ingest = () => ingestLocalUnifiedIndexIncrement({
+    codexHome: root,
+    indexFile: join(root, "index.sqlite"),
+    secretFile: join(root, "salt"),
+    contractVersion: CONTRACT,
+  });
+  const readTiers = () => {
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      return {
+        rows: tierRows(database),
+        carries: database.prepare(
+          "SELECT carry_tier_raw AS raw FROM source_cursor ORDER BY raw",
+        ).all().map((row) => row.raw),
+      };
+    } finally {
+      database.close();
+    }
+  };
+  const forkFile = (name, sessionId) => [
+    sessionMeta(sessionId, { parentId: "session-parent", threadSource: "subagent" }),
+    turnContext(`${name}`, "gpt-5.6-sol"),
+    tokenCount(`${name.replace(".000Z", ".100Z")}`, usage(100, 10), usage(100, 10)),
+    tokenCount(`${name.replace(".000Z", ".200Z")}`, usage(200, 20), usage(100, 10)),
+  ];
+  try {
+    const first = await ingest();
+    assert.equal(first.insertedUsageEvents, 1);
+
+    // Pass 2: the first fork appears. The parent is re-scanned once for its
+    // durable snapshot set, so the seed comes from THIS pass's derived state.
+    await writeFile(
+      join(sessions, "rollout-2026-07-25T01-00-00-child.jsonl"),
+      `${forkFile("2026-07-25T01:00:00.000Z", "session-child").join("\n")}\n`,
+    );
+    const second = await ingest();
+    assert.equal(second.sourcesRescanned, 2);
+    assert.equal(second.insertedUsageEvents, 1);
+    assert.deepEqual(readTiers().rows, [
+      { model: "gpt-5.6-sol", speed: "fast", source: "rollout_thread_settings", raw: "priority" },
+      { model: "gpt-5.6-sol", speed: "fast", source: "lineage_inherited", raw: "priority" },
+    ]);
+
+    // Pass 3: a second fork, with the parent's set durable — the parent is
+    // NOT re-scanned, so the seed can only come from its persisted cursor.
+    await writeFile(
+      join(sessions, "rollout-2026-07-25T02-00-00-second.jsonl"),
+      `${forkFile("2026-07-25T02:00:00.000Z", "session-second").join("\n")}\n`,
+    );
+    const third = await ingest();
+    assert.equal(third.sourcesRescanned, 1, "only the new fork is scanned");
+    assert.equal(third.insertedUsageEvents, 1);
+    const afterThird = readTiers();
+    assert.deepEqual(afterThird.rows[2], {
+      model: "gpt-5.6-sol",
+      speed: "fast",
+      source: "lineage_inherited",
+      raw: "priority",
+    });
+    // Provenance is never persisted as an own observation: only the parent's
+    // cursor carries a tier.
+    assert.deepEqual(afterThird.carries, [null, null, "priority"]);
+
+    // Pass 4: the first fork's file grows. Its cursor carries no tier — it
+    // never declared — so the resumed segment re-derives the lineage seed and
+    // the appended turn keeps lineage_inherited, exactly as a whole-file
+    // rescan would label it.
+    await appendFile(
+      join(sessions, "rollout-2026-07-25T01-00-00-child.jsonl"),
+      `${tokenCountTotalOnly("2026-07-25T01:00:05.000Z", usage(300, 30))}\n`,
+    );
+    const fourth = await ingest();
+    assert.equal(fourth.sourcesResumed, 1);
+    assert.equal(fourth.insertedUsageEvents, 1);
+    const afterFourth = readTiers();
+    assert.deepEqual(afterFourth.rows[3], {
+      model: "gpt-5.6-sol",
+      speed: "fast",
+      source: "lineage_inherited",
+      raw: "priority",
+    });
+    assert.deepEqual(afterFourth.carries, [null, null, "priority"]);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("an inherited Fast turn reaches Fast pricing through the speed crossing", async () => {
+  // Pricing keys off codex_speed_mode alone; lineage_inherited is provenance.
+  // The child's inherited-Fast turn must land in the fast speed bucket of the
+  // windowed repricing with a real nonzero priced cost.
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-parent.jsonl": [
+      sessionMeta("session-parent"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      threadSettings("2026-07-25T00:00:00.500Z", "priority"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(1_000_000, 100_000), usage(1_000_000, 100_000)),
+    ],
+    "rollout-2026-07-25T01-00-00-child.jsonl": [
+      sessionMeta("session-child", { parentId: "session-parent", threadSource: "subagent" }),
+      tokenCount("2026-07-25T01:00:00.000Z", usage(1_000_000, 100_000), usage(1_000_000, 100_000)),
+      turnContext("2026-07-25T01:00:01.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T01:00:02.000Z", usage(2_000_000, 200_000), usage(1_000_000, 100_000)),
+    ],
+  });
+  try {
+    await build(root);
+    const breakdown = await readLocalUnifiedWindowBreakdown({
+      indexFile: join(root, "index.sqlite"),
+      fromMs: Date.parse("2026-07-25T00:00:00.000Z"),
+      toMs: Date.parse("2026-07-25T02:00:00.000Z"),
+    });
+    assert.equal(breakdown.status, "available");
+    // The parent's own-declared Fast turn and the child's inherited one.
+    assert.equal(breakdown.fastEvents, 2);
+    assert.equal(breakdown.bySpeed.fast.events, 2);
+    assert.ok(breakdown.bySpeed.fast.costUsd > 0, "inherited Fast is priced, not unknown");
+    assert.equal(breakdown.bySpeed.unknown, undefined, "no turn fell back to unknown speed");
   } finally {
     await rm(root, { recursive: true });
   }

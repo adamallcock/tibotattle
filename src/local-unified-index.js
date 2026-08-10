@@ -38,7 +38,17 @@ export const LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v1";
 // spend (measured: 13.02B phantom tokens in one session), so the incremental
 // ingest forces a whole-file rescan of any source whose cursor was stamped by
 // an older parser version.
-export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v2";
+//
+// v3 (2026-08-10): session-lineage speed carry-forward. A fork/lineage
+// descendant with no `thread_settings_applied` of its own now seeds its
+// initial tier from the most-recent observed tier of its ancestor chain,
+// recorded under the new `lineage_inherited` tier_source (never masquerading
+// as `rollout_thread_settings`). Strictly lineage-scoped — a session's own
+// resume segments plus its fork/parent chain, never concurrent unrelated
+// threads. Rows derived under v2 label such turns `unobserved` (priced
+// Standard even when the reachable ancestor declaration was Fast), so the
+// incremental ingest forces a whole-file rescan of v2-stamped sources.
+export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v3";
 
 // A row salvaged from a line that exceeded the bounded-line cap carries this
 // parser version instead. The agreed schema has no "partial" column and the
@@ -47,7 +57,7 @@ export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v2";
 // degraded row is recorded. Kept in lockstep with the main constant: salvaged
 // rows run the same delta derivation.
 export const LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v2-partial";
+  "unified-rollout-typed-v3-partial";
 
 const INDEX_APPLICATION_ID = 0x554d5549;
 // Version 2 (2026-08-07) widens version 1 with the two incremental-ingest

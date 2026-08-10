@@ -181,6 +181,38 @@ export function salvagePartialTokenCount(text) {
 }
 
 /**
+ * True only for a tier state that this file itself declared (or that its own
+ * resume cursor carried, which is the same declaration seen earlier). An
+ * inherited seed is provenance-distinct: it must never be persisted into the
+ * cursor's carry as if it were an own observation — the next pass re-derives
+ * it from the ancestor chain instead, so the `lineage_inherited` label
+ * survives a resume rather than being laundered into
+ * `rollout_thread_settings`.
+ */
+export function ownObservedTier(tierState) {
+  return tierState !== null
+    && tierState !== undefined
+    && tierState.inherited !== true
+    ? tierState
+    : null;
+}
+
+/**
+ * Shape an ancestor's final tier state as a fork child's seed. The child's
+ * turns carry it with `lineage_inherited` provenance; the ancestor's own
+ * `inherited` flag (it may itself have seeded from further up) is irrelevant —
+ * from the child's perspective the value always arrives through lineage.
+ */
+export function inheritedTierSeed(finalTier) {
+  if (finalTier === null || finalTier === undefined) return null;
+  return {
+    providerTierRaw: finalTier.providerTierRaw ?? null,
+    observedAtMs: finalTier.observedAtMs,
+    inherited: true,
+  };
+}
+
+/**
  * Scan one rollout file and emit typed usage facts in file order.
  *
  * `seedModel` / `seedEffort` carry the lineage parent's last observed values
@@ -193,6 +225,15 @@ export function salvagePartialTokenCount(text) {
  * `lineageDisposition: "forked"` — while `token_count` itself never carries a
  * model of its own (0 of 26,884 sampled records had `payload.model` or
  * `payload.info.model`).
+ *
+ * `seedTier` carries tier state the same way, with provenance: a resume passes
+ * the cursor's own-file carry (still `rollout_thread_settings`), while a fork
+ * child passes its ancestor lineage's last observed tier marked
+ * `inherited: true` (surfaced as `lineage_inherited`). Inheritance flows ONLY
+ * along a session's own resume segments and its fork/parent ancestor chain —
+ * never across concurrent unrelated threads, whose per-thread `service_tier`
+ * a global carry would mislabel. No reachable declaration leaves the seed
+ * null and the turns unobserved.
  */
 export async function extractRolloutUsage(path, {
   size,
@@ -257,9 +298,11 @@ export async function extractRolloutUsage(path, {
     cumulativeCounterRegressions: 0,
     tierEvents: 0,
     modelSeededFromLineage: 0,
+    tierSeededFromLineage: 0,
     modelMissing: 0,
   };
   if (seedModel !== null) diagnostics.modelSeededFromLineage = 1;
+  if (seedTier?.inherited === true) diagnostics.tierSeededFromLineage = 1;
 
   const read = await forEachRolloutLine(path, {
     start: startOffset,
@@ -358,7 +401,13 @@ export async function extractRolloutUsage(path, {
         const raw = settings.service_tier;
         if (raw !== null && typeof raw !== "string") return;
         diagnostics.tierEvents += 1;
-        const priorMs = tierState?.observedAtMs ?? Number.NEGATIVE_INFINITY;
+        // An own-file declaration always supersedes an inherited seed — the
+        // ancestor's declaration is upstream of everything in this file, so
+        // its timestamp must not outvote a genuine local observation. Among
+        // own declarations the latest-at-or-before rule stands.
+        const priorMs = tierState === null || tierState.inherited === true
+          ? Number.NEGATIVE_INFINITY
+          : tierState.observedAtMs;
         if (observedAtMs >= priorMs) {
           tierState = {
             providerTierRaw: safeClassification(raw),
@@ -464,7 +513,13 @@ export async function extractRolloutUsage(path, {
         sourceOffset: lineEndOffset,
         model: currentModel,
         reasoningEffort: currentEffort ?? settingsEffort,
-        tier: tierState !== null && tierState.observedAtMs <= observedAtMs
+        // The at-or-before gate applies to own-file declarations. An
+        // inherited seed is by construction upstream of every turn in this
+        // file (lineage order, not wall-clock order), so it applies from the
+        // first event regardless of the ancestor clock's skew.
+        tier: tierState !== null
+          && (tierState.inherited === true
+            || tierState.observedAtMs <= observedAtMs)
           ? tierState
           : null,
         components: usage ? canonicalComponents(usage) : null,
