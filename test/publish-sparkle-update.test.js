@@ -50,11 +50,28 @@ async function publishSparkleUpdate(options) {
   });
 }
 
+/**
+ * Append the generate_appcast feed-signature trailer over a document prefix,
+ * exactly as the pinned official tool does (SURequireSignedFeed clients and
+ * the stable publisher preflight both refuse a stable feed without it).
+ */
+function signOfficialFeedPrefix(prefix) {
+  const prefixBytes = Buffer.from(prefix, "utf8");
+  const envelopeSignature = sign(null, prefixBytes, TEST_KEY_PAIR.privateKey)
+    .toString("base64");
+  return `${prefix}<!-- sparkle-signatures:
+edSignature: ${envelopeSignature}
+length: ${prefixBytes.length}
+-->
+`;
+}
+
 async function createReleaseFixture({
   appcastURL = CANONICAL_APPCAST_URL,
   bundleVersion = "1",
   dmgbBytes = Buffer.from("signed-notarized-dmg-fixture"),
   mutateAppcast = (value) => value,
+  mutateSignedAppcast = (value) => value,
   mutateManifest = (value) => value,
 } = {}) {
   const root = await mkdtemp(
@@ -123,11 +140,29 @@ async function createReleaseFixture({
       requiresSignedFeed: true,
     },
   });
-  const appcast = mutateAppcast(`<?xml version="1.0" encoding="utf-8"?>
-<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><item>
-<enclosure url="${artifactURL}" length="${dmgbBytes.length}" sparkle:version="${bundleVersion}" sparkle:edSignature="${signature}" />
-</item></channel></rss>
-`);
+  // The stable fixture mirrors the pinned official generate_appcast output
+  // (SURequireSignedFeed): the exact document shape the Worker guard accepts
+  // plus the signed sparkle-signatures trailer. mutateAppcast edits the
+  // document BEFORE signing (the envelope stays valid over the mutated
+  // document so each test hits its intended structural failure);
+  // mutateSignedAppcast edits the final signed bytes for trailer tampering.
+  const documentPrefix = mutateAppcast(`<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:
+IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
+--><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>TiboTattle</title>
+        <item>
+            <title>${RELEASE_VERSION}</title>
+            <pubDate>Wed, 05 Aug 2026 14:55:05 -0400</pubDate>
+            <sparkle:version>${bundleVersion}</sparkle:version>
+            <sparkle:shortVersionString>${RELEASE_VERSION}</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="${artifactURL}" length="${dmgbBytes.length}" type="application/octet-stream" sparkle:edSignature="${signature}"></enclosure>
+        </item>
+    </channel>
+</rss>`);
+  const appcast = mutateSignedAppcast(signOfficialFeedPrefix(documentPrefix));
   await Promise.all([
     writeFile(dmgPath, dmgbBytes),
     writeFile(appcastPath, appcast),
@@ -527,13 +562,42 @@ test("validates an explicitly supplied canonical signed update without invoking 
   }
 });
 
-test("accepts the empty paired enclosure emitted by the reviewed Sparkle generator", async () => {
+test("refuses an unsigned stable candidate outright, naming SURequireSignedFeed", async () => {
+  // The 2026-08-10 incident: a stable feed without the generate_appcast
+  // sparkle-signatures trailer bricks every installed updater, because the
+  // whole fleet ships SURequireSignedFeed=true. The publisher must refuse it
+  // before any validation side effect or network call.
   const fixture = await createReleaseFixture({
-    mutateAppcast: (value) => value
-      .replace(' sparkle:version="1"', "")
-      .replace("<enclosure ", "<sparkle:version>1</sparkle:version>\n<enclosure ")
-      .replace(" />", "></enclosure>"),
+    mutateSignedAppcast: (value) => value.replace(
+      /<!-- sparkle-signatures:[\s\S]*$/u,
+      "",
+    ),
   });
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: async () => assert.fail("unsigned stable feed must not call Wrangler"),
+        validateDMG: async () => {},
+      }),
+      (error) => {
+        assert.equal(error.code, "SPARKLE_UPDATE_STABLE_FEED_UNSIGNED");
+        assert.match(error.message, /SURequireSignedFeed/u);
+        return true;
+      },
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("accepts the official generate_appcast signed shape as the stable candidate", async () => {
+  const fixture = await createReleaseFixture();
   try {
     const publication = await publishSparkleUpdate({
       appcastPath: fixture.appcastPath,
@@ -546,6 +610,35 @@ test("accepts the empty paired enclosure emitted by the reviewed Sparkle generat
     });
     assert.equal(publication.status, "validated");
     assert.equal(publication.artifact.url, fixture.artifactURL);
+    assert.match(fixture.appcast, /<!-- sparkle-signatures:\n/u);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("refuses a stable candidate whose feed envelope was tampered after signing", async () => {
+  const fixture = await createReleaseFixture({
+    // Same-length tamper: the declared trailer length still matches, so the
+    // failure is specifically the Ed25519 envelope verification.
+    mutateSignedAppcast: (value) => value.replace(
+      "<title>TiboTattle</title>",
+      "<title>TiboTattlX</title>",
+    ),
+  });
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: async () => assert.fail("tampered stable feed must not call Wrangler"),
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_SIGNED_FEED_ENVELOPE_SIGNATURE_INVALID" },
+    );
   } finally {
     await fixture.cleanup();
   }
@@ -1293,7 +1386,10 @@ test("rejects stable appcast history before any remote mutation", async () => {
         },
         validateDMG: async () => {},
       }),
-      { code: "SPARKLE_UPDATE_APPCAST_HISTORY_UNSUPPORTED" },
+      // The signed-feed preflight rejects the retained-history shape before
+      // the canonical-policy check can even run: the official
+      // generate_appcast document carries exactly one item.
+      { code: "SPARKLE_SIGNED_FEED_SHAPE_INVALID" },
     );
     assert.deepEqual(calls, []);
   } finally {
@@ -1304,8 +1400,8 @@ test("rejects stable appcast history before any remote mutation", async () => {
 test("rejects a stable Sparkle delta before any remote mutation", async () => {
   const fixture = await createReleaseFixture({
     mutateAppcast: (value) => value.replace(
-      'sparkle:version="1"',
-      'sparkle:version="1" sparkle:deltaFrom="0"',
+      'type="application/octet-stream"',
+      'type="application/octet-stream" sparkle:deltaFrom="0"',
     ),
   });
   const calls = [];
@@ -1325,7 +1421,9 @@ test("rejects a stable Sparkle delta before any remote mutation", async () => {
         },
         validateDMG: async () => {},
       }),
-      { code: "SPARKLE_UPDATE_DELTA_UNSUPPORTED" },
+      // The signed-feed preflight pins the exact official enclosure
+      // attribute set, so the extra sparkle:deltaFrom fails there first.
+      { code: "SPARKLE_SIGNED_FEED_ENCLOSURE_INVALID" },
     );
     assert.deepEqual(calls, []);
   } finally {
@@ -1516,8 +1614,8 @@ test("fails closed when the appcast signature, URL, or manifest checksum is inva
 test("does not introduce a new Sparkle delta enclosure", async () => {
   const fixture = await createReleaseFixture({
     mutateAppcast: (value) => value.replace(
-      'sparkle:version="1"',
-      'sparkle:version="1" sparkle:deltaFrom="0"',
+      'type="application/octet-stream"',
+      'type="application/octet-stream" sparkle:deltaFrom="0"',
     ),
   });
   try {
@@ -1532,7 +1630,7 @@ test("does not introduce a new Sparkle delta enclosure", async () => {
         runWrangler: async () => assert.fail("unsupported delta must not call Wrangler"),
         validateDMG: async () => {},
       }),
-      { code: "SPARKLE_UPDATE_DELTA_UNSUPPORTED" },
+      { code: "SPARKLE_SIGNED_FEED_ENCLOSURE_INVALID" },
     );
   } finally {
     await fixture.cleanup();
@@ -1816,7 +1914,7 @@ test("rejects a delta enclosure outside the sparkle:deltas fallback container", 
   }
 });
 
-test("stable delta publication turns on with the reviewed policy flip and no publisher change", async () => {
+test("stable delta policy flip fails closed until the signed-feed validator understands deltas", async () => {
   const deltaBytes = Buffer.from("stable-binary-delta-0-to-1");
   const deltaDigest = sha256(deltaBytes);
   const deltaFileName = `${RELEASE_MANIFEST.macOS.arm64DmgFileName.slice(0, -".dmg".length)}-from-0.delta`;
@@ -1841,27 +1939,64 @@ test("stable delta publication turns on with the reviewed policy flip and no pub
     runWrangler: async () => assert.fail("validation-only must not call Wrangler"),
     validateDMG: async () => {},
   };
+  const deltaEnabledPolicy = {
+    ...CANONICAL_STABLE_APPCAST_POLICY,
+    allowDeltaFrom: true,
+  };
   try {
-    // Identical inputs: today's reviewed policy refuses the delta appcast...
+    // Under today's reviewed policy the signed-feed preflight refuses the
+    // delta-carrying document (the official generate_appcast full-only shape
+    // has no sparkle:deltas container)...
     await assert.rejects(
       publishSparkleUpdate(options),
-      { code: "SPARKLE_UPDATE_DELTA_UNSUPPORTED" },
+      { code: "SPARKLE_SIGNED_FEED_SHAPE_INVALID" },
     );
-    // ...and the flipped policy accepts it with the delta fully validated,
-    // so the config/guard change is the only remaining stable gate.
-    const publication = await publishSparkleUpdate({
-      ...options,
-      appcastPolicy: {
-        ...CANONICAL_STABLE_APPCAST_POLICY,
-        allowDeltaFrom: true,
-      },
-    });
-    assert.equal(publication.status, "validated");
-    assert.equal(publication.deltas.length, 1);
-    assert.equal(publication.deltas[0].deltaFrom, "0");
-    assert.equal(
-      publication.deltas[0].key,
-      `releases/1/${deltaDigest}/${deltaFileName}`,
+    // ...and a delta-enabled policy does NOT silently disable the 2026-08-10
+    // incident preflight: it fails closed with a named error until
+    // sparkle-signed-feed-validation.js (and the Worker guard's official
+    // parser) are extended for a delta-carrying signed feed. Flipping
+    // config/sparkle-appcast-policy.js alone must never turn stable
+    // publication into a preflight-free path.
+    await assert.rejects(
+      publishSparkleUpdate({
+        ...options,
+        appcastPolicy: deltaEnabledPolicy,
+      }),
+      { code: "SPARKLE_UPDATE_STABLE_DELTA_FEED_VALIDATION_UNSUPPORTED" },
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("stable trailer requirement is unconditional: a delta-enabled policy still refuses an unsigned candidate", async () => {
+  // SURequireSignedFeed is a property of the installed fleet, not of the
+  // delta policy: even with allowDeltaFrom flipped, an unsigned stable
+  // candidate (no sparkle-signatures trailer) must be refused before any
+  // network call, with the incident's named error.
+  const fixture = await createReleaseFixture({
+    mutateSignedAppcast: (value) => value.replace(
+      /<!-- sparkle-signatures:[\s\S]*$/u,
+      "",
+    ),
+  });
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        appcastPolicy: {
+          ...CANONICAL_STABLE_APPCAST_POLICY,
+          allowDeltaFrom: true,
+        },
+        runWrangler: async () => assert.fail("unsigned stable must not call Wrangler"),
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_STABLE_FEED_UNSIGNED" },
     );
   } finally {
     await fixture.cleanup();
@@ -2095,7 +2230,16 @@ test("appcast generator fails open to full-only, then produces a signed validate
     // mismatch), and both versions are now retained for the next release.
     await lstat(join(archiveRoot, "internal-dogfood", "2", "TiboTattle.app"));
 
-    // The stable channel stays policy-gated: same inputs, full-only appcast.
+    // The stable channel never falls back to the hand-built shape
+    // (SURequireSignedFeed, 2026-08-10 incident): it must drive the pinned
+    // official generate_appcast, which cannot process this synthetic
+    // non-mountable DMG — so the run fails closed instead of silently
+    // emitting an unsigned feed, and the previously written appcast is left
+    // untouched.
+    const beforeStable = await readFile(
+      join(releases[1].releaseRoot, "appcast.xml"),
+      "utf8",
+    );
     const stable = runAppcastGenerator([
       "--channel", "stable",
       "--app", releases[1].appPath,
@@ -2107,14 +2251,14 @@ test("appcast generator fails open to full-only, then produces a signed validate
       "--sparkle-public-ed-key", key.publicEdKey,
       "--replace",
     ]);
-    assert.equal(stable.status, 0, stable.stderr || stable.stdout);
-    assert.match(stable.stderr, /disabled for the stable channel/u);
-    const stableAppcast = await readFile(
+    assert.notEqual(stable.status, 0);
+    assert.match(stable.stderr, /generate_appcast/u);
+    const afterStable = await readFile(
       join(releases[1].releaseRoot, "appcast.xml"),
       "utf8",
     );
-    assert.equal(stableAppcast.includes("sparkle:deltas"), false);
-    validateCandidateAppcastShape(stableAppcast, "stable");
+    assert.equal(afterStable, beforeStable);
+    assert.equal(afterStable.includes("sparkle-signatures"), false);
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
