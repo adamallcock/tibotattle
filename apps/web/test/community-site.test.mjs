@@ -9,11 +9,11 @@ import {
   PublicCommunityClient,
   communityDailyWindow,
   normalizeCommunityDailySeries,
+  normalizeCommunitySnapshot,
 } from "../public/community-data.js";
 import {
-  COMMUNITY_METRIC_LABELS,
+  buildCommunityDailyChartModel,
   renderCommunityDailySeries,
-  renderCommunitySnapshot,
 } from "../public/community-view.js";
 import {
   configuredInstallerRelease,
@@ -76,6 +76,9 @@ function fakeDocument(metaContent = {}) {
   return {
     documentElement: { lang: "en-US" },
     createElement(tag) {
+      return new FakeElement(tag);
+    },
+    createElementNS(namespace, tag) {
       return new FakeElement(tag);
     },
     querySelector(selector) {
@@ -160,11 +163,29 @@ test("the public site presents only the install call to action and the community
   assert.match(html, /id="installer-details"/u);
   assert.match(html, /id="installer-unavailable"/u);
   assert.doesNotMatch(html, /open-installed-app|usage-monitor-semantic-open-target|usagemonitor:\/\//u);
-  assert.match(html, /id="community-result"/u);
-  assert.match(html, /id="community-snapshot-service-detail"/u);
-  assert.match(html, /id="community-service-state"/u);
-  assert.match(html, /id="community-snapshot-status"/u);
-  assert.match(html, /id="community-snapshot-panel-state"/u);
+  assert.match(html, /id="community-daily-result"/u);
+  assert.match(html, /id="community-daily-state"/u);
+  assert.match(html, /id="community-daily-status"/u);
+  assert.match(html, /id="community-daily-panel-state"/u);
+  assert.match(html, /id="community-daily-hero"/u);
+
+  // The legacy sealed-snapshot presentation is retired: the page carries no
+  // snapshot banner, no provenance expander, and no snapshot copy at all.
+  for (
+    const retiredSnapshotSurface of [
+      'id="community-result"',
+      'id="community-service-state"',
+      'id="community-snapshot-status"',
+      'id="community-snapshot-panel-state"',
+      'id="community-snapshot-provenance"',
+      'id="community-snapshot-service-detail"',
+      "Published activity",
+      "Snapshot and source details",
+    ]
+  ) {
+    assert.equal(html.includes(retiredSnapshotSurface), false, retiredSnapshotSurface);
+  }
+  assert.doesNotMatch(html, /snapshot/iu);
 
   // Every control that cannot work without the local companion is absent from
   // the website. These are the dead controls the split exists to remove.
@@ -249,28 +270,13 @@ test("the public site presents only the install call to action and the community
   }
 });
 
-test("the public community client exposes only read-only aggregate requests", async () => {
+test("the public community client exposes only the read-only daily request", async () => {
+  // The legacy weekly snapshot request left with the snapshot presentation:
+  // the public site reads the day-partitioned series and nothing else.
   assert.deepEqual(
     Object.getOwnPropertyNames(PublicCommunityClient.prototype).sort(),
-    ["communityDaily", "communityStats", "constructor"],
+    ["communityDaily", "constructor"],
   );
-  const calls = [];
-  const payload = { releaseStatus: "not_yet_published" };
-  const client = new PublicCommunityClient({
-    fetchImpl: async (...args) => {
-      calls.push(args);
-      return {
-        ok: true,
-        status: 200,
-        json: async () => payload,
-      };
-    },
-  });
-  assert.equal(await client.communityStats(), payload);
-  assert.deepEqual(calls, [[
-    "/api/v1/stats/aggregate",
-    { headers: { Accept: "application/json" } },
-  ]]);
 
   const requestId = "12345678-1234-4123-8123-123456789abc";
   const failing = new PublicCommunityClient({
@@ -287,7 +293,7 @@ test("the public community client exposes only read-only aggregate requests", as
     }),
   });
   await assert.rejects(
-    failing.communityStats(),
+    failing.communityDaily(),
     (error) => {
       assert.equal(error.message, "Request failed (503).");
       assert.equal(error.code, "AGGREGATE_UNAVAILABLE");
@@ -298,14 +304,14 @@ test("the public community client exposes only read-only aggregate requests", as
   );
 });
 
-test("the first visit leads with the product, Mac download action, and snapshot-only community view", async () => {
+test("the first visit leads with the product, Mac download action, and daily community view", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   assert.match(html, /<h1 id="install-title">See where your Codex allowance stands\.<\/h1>/u);
   assert.match(html, /private Mac app that estimates how much of your\s+seven-day Codex allowance remains/u);
   assert.match(html, /Your personal dashboard is calculated on your Mac\./u);
   assert.match(html, /Download for macOS/u);
   assert.match(html, /Latest community evidence/u);
-  assert.match(html, /Community activity snapshot/u);
+  assert.match(html, /Community daily activity/u);
   assert.match(html, /Install the Mac app/u);
   assert.match(html, /See your week/u);
   assert.match(html, /Share only if you choose/u);
@@ -381,10 +387,10 @@ test("unavailable community activity uses the compact public state", async () =>
   const source = await readFile(SITE_SOURCE, "utf8");
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
   assert.match(html, /data-community-state="checking"/u);
-  assert.match(html, /<h2 id="community-title">Community activity snapshot<\/h2>/u);
+  assert.match(html, /<h2 id="community-title">Community daily activity<\/h2>/u);
   assert.match(
     html,
-    /When available, this is a delayed, anonymous activity summary from people who chose to contribute\./u,
+    /When available, this is a delayed, anonymous daily activity series from people who chose to contribute\./u,
   );
   assert.doesNotMatch(
     html,
@@ -396,7 +402,9 @@ test("unavailable community activity uses the compact public state", async () =>
   );
   assert.match(source, /\.dataset\.communityState = state;/u);
   assert.match(styles, /\[data-community-state="service_unavailable"\]/u);
-  assert.match(styles, /\[data-community-state="not_yet_published"\]/u);
+  assert.match(styles, /\[data-community-state="none_published"\]/u);
+  assert.doesNotMatch(styles, /\[data-community-state="not_yet_published"\]/u);
+  assert.doesNotMatch(styles, /\[data-community-state="withdrawn"\]/u);
   assert.match(
     styles,
     /@media \(max-width: 1120px\) \{[\s\S]*?\.community-site \.community-proof\[data-community-state\] \.community-proof-heading \{\s*grid-template-columns: 1fr;/u,
@@ -465,10 +473,14 @@ test("the dashboard keeps contribution review local while the public site owns d
   assert.match(appHtml, /id="incremental-consent-approve"/u);
 });
 
-test("the community view degrades honestly without a service or a published week", () => {
+test("the retained weekly snapshot normalizer still guards the app's closed contract", () => {
+  // The public site no longer renders the sealed weekly snapshot, but the Mac
+  // app's data-client.js still imports this normalizer, so its state machine
+  // keeps behavioural cover here beside the contract fixture.
   for (
     const [payload, expectedState] of [
       [null, "service_unavailable"],
+      [publishedSnapshot(), "published"],
       [publishedSnapshot({ releaseStatus: "not_yet_published" }), "not_yet_published"],
       [publishedSnapshot({ releaseStatus: "withdrawn" }), "withdrawn"],
       [publishedSnapshot({ releaseStatus: "suppressed" }), "suppressed"],
@@ -479,25 +491,13 @@ test("the community view degrades honestly without a service or a published week
       ],
     ]
   ) {
-    const documentRef = fakeDocument();
-    const container = documentRef.createElement("div");
-    const detail = documentRef.createElement("div");
-    const state = renderCommunitySnapshot({
-      documentRef,
-      container,
-      detail,
-      payload,
-    });
-    assert.equal(state, expectedState);
-    assert.match(container.text, /[A-Za-z]{3}/u, expectedState);
-    // No empty panel and no invented figure in any degraded state.
-    assert.equal(container.children.length > 0, true, expectedState);
-    assert.equal(
-      container.descendants().some(({ tag }) => tag === "table"),
-      false,
-      expectedState,
-    );
+    assert.equal(normalizeCommunitySnapshot(payload).state, expectedState);
   }
+  const published = normalizeCommunitySnapshot(publishedSnapshot());
+  assert.equal(published.participantCohort, "provider_account");
+  assert.equal(published.minimumParticipants, 20);
+  assert.equal(published.cells.length, 1);
+  assert.equal(published.cells[0].metrics.usageEvents.value, 30);
 });
 
 test("the public source contains no community allowance, estimate, capacity, or privacy-review claim", async () => {
@@ -512,63 +512,18 @@ test("the public source contains no community allowance, estimate, capacity, or 
   assert.doesNotMatch(publicCopy, /id="community-estimate|renderCommunityEstimate/u);
 });
 
-test("the generated community state follows the active UI language", () => {
+test("the generated daily community state follows the active UI language", () => {
   const documentRef = fakeDocument();
   documentRef.documentElement.lang = "zh-Hans";
   const container = documentRef.createElement("div");
-  const detail = documentRef.createElement("div");
+  const stateNode = documentRef.createElement("span");
 
   assert.equal(
-    renderCommunitySnapshot({ documentRef, container, detail, payload: null }),
+    renderCommunityDailySeries({ documentRef, container, stateNode, payload: null }),
     "service_unavailable",
   );
-  assert.match(container.text, /中心服务不可用/u);
-  assert.match(detail.text, /不在当前契约/u);
-});
-
-test("a published community week renders its support gate, provenance, and cells", () => {
-  const documentRef = fakeDocument();
-  const container = documentRef.createElement("div");
-  const detail = documentRef.createElement("div");
-  const state = renderCommunitySnapshot({
-    documentRef,
-    container,
-    detail,
-    payload: publishedSnapshot(),
-    now: Date.parse("2026-07-22T01:00:00.000Z"),
-  });
-  assert.equal(state, "published");
-  assert.match(
-    container.text,
-    /at least 20 distinct eligible social-provider accounts/u,
-  );
-  assert.match(
-    container.text,
-    /not everyone's usage, an average, a cost, or a personal reading/u,
-  );
-  const table = container.descendants().find(({ tag }) => tag === "table");
-  assert.ok(table, "a released week renders its cell table");
-  const headerLabels = table
-    .descendants()
-    .filter(({ tag }) => tag === "th")
-    .map(({ textContent }) => textContent);
-  for (const label of Object.values(COMMUNITY_METRIC_LABELS)) {
-    assert.equal(headerLabels.includes(label), true, label);
-  }
-  assert.match(detail.text, /community-weekly/u);
-  assert.match(detail.text, /capped per eligible provider account/u);
-
-  // The site can render the headline without the provenance container, and it
-  // must not invent one.
-  const bare = documentRef.createElement("div");
-  assert.equal(
-    renderCommunitySnapshot({ documentRef, container: bare, payload: publishedSnapshot() }),
-    "published",
-  );
-  assert.equal(
-    bare.descendants().some(({ tag }) => tag === "table"),
-    true,
-  );
+  assert.match(container.text, /每日社区活动暂时不可用/u);
+  assert.equal(stateNode.textContent, "每日序列不可用");
 });
 
 function publishedDailyDay(day, revision, overrides = {}) {
@@ -746,6 +701,29 @@ test("a published daily series renders revision freshness, latest-first", () => 
   assert.match(container.text, /Revision age/u);
   assert.match(container.text, /Published days in window/u);
   assert.match(container.text, /never edit history/u);
+
+  // The chart precedes the table: bars for usage events, a line series for
+  // combined output, and — while the series is one or two days long — dots
+  // plus the still-filling note.
+  const svg = container.descendants().find(({ tag }) => tag === "svg");
+  assert.ok(svg, "a published daily series renders its inline SVG chart");
+  const chartIndex = container.children.findIndex((child) =>
+    child.descendants().some(({ tag }) => tag === "svg")
+    || child.tag === "svg");
+  const tableIndex = container.children.findIndex((child) =>
+    child.descendants().some(({ tag }) => tag === "table"));
+  assert.ok(chartIndex >= 0 && chartIndex < tableIndex, "the chart renders above the table");
+  assert.equal(svg.attributes.get("role"), "img");
+  assert.equal(svg.attributes.get("aria-label"), "Daily community activity chart");
+  const bars = svg.descendants().filter(({ tag }) => tag === "rect")
+    .filter((element) => element.attributes.get("class") === "daily-events-bar");
+  assert.equal(bars.length, 2);
+  const dots = svg.descendants().filter(({ tag }) => tag === "circle");
+  assert.equal(dots.length, 2, "a sparse series marks every output point with a dot");
+  assert.match(container.text, /still filling/u);
+  assert.match(container.text, /Usage events/u);
+  assert.match(container.text, /Combined output/u);
+
   const table = container.descendants().find(({ tag }) => tag === "table");
   assert.ok(table, "a published daily series renders its table");
   const columnLabels = table
@@ -792,11 +770,13 @@ test("the daily series degrades honestly without a service or published days", (
     assert.equal(stateNode.textContent, "Daily series unavailable");
     assert.equal(stateNode.className, "evidence-chip neutral");
     assert.match(container.text, marker, expectedState);
-    assert.equal(
-      container.descendants().some(({ tag }) => tag === "table"),
-      false,
-      expectedState,
-    );
+    for (const absent of ["table", "svg"]) {
+      assert.equal(
+        container.descendants().some(({ tag }) => tag === absent),
+        false,
+        `${expectedState}: ${absent}`,
+      );
+    }
   }
 });
 
@@ -809,6 +789,129 @@ test("the public site hosts the daily series containers", async () => {
   const source = await readFile(SITE_SOURCE, "utf8");
   assert.match(source, /renderCommunityDailySeries/u);
   assert.match(source, /communityDaily\(\)/u);
+  assert.doesNotMatch(source, /communityStats|renderCommunitySnapshot/u);
+});
+
+test("the daily chart model maps published days honestly", () => {
+  // Non-published states produce no chart at all.
+  for (const payload of [
+    null,
+    { schemaVersion: "wrong" },
+    publishedDailySeries({ days: [] }),
+  ]) {
+    assert.equal(
+      buildCommunityDailyChartModel(normalizeCommunityDailySeries(payload)),
+      null,
+    );
+  }
+
+  // A two-day series is sparse: both days chart, and the line stays one
+  // connected segment because the days are calendar-adjacent.
+  const sparse = buildCommunityDailyChartModel(
+    normalizeCommunityDailySeries(publishedDailySeries()),
+  );
+  assert.equal(sparse.sparse, true);
+  assert.deepEqual(sparse.bars.map(({ day }) => day), ["2026-08-06", "2026-08-07"]);
+  assert.equal(sparse.outputSegments.length, 1);
+  assert.equal(sparse.outputSegments[0].length, 2);
+  assert.deepEqual(sparse.dayTicks.map(({ day }) => day), ["2026-08-06", "2026-08-07"]);
+  assert.equal(sparse.tickLabelStyle, "day");
+  assert.ok(sparse.bars[0].x < sparse.bars[1].x, "bars advance with the calendar");
+
+  // Events scale from zero on the left axis; output tokens scale on the right.
+  assert.equal(sparse.eventsTicks[0].value, 0);
+  assert.equal(sparse.eventsTicks[0].y, sparse.plot.bottom);
+  assert.ok(
+    sparse.eventsTicks[sparse.eventsTicks.length - 1].value >= 120,
+    "the events axis covers the maximum usage-event total",
+  );
+  assert.ok(
+    sparse.outputTicks[sparse.outputTicks.length - 1].value >= 500,
+    "the output axis covers the maximum combined-output total",
+  );
+});
+
+test("the daily chart model renders unpublished days as gaps, not zeros", () => {
+  const series = normalizeCommunityDailySeries(publishedDailySeries({
+    days: [
+      publishedDailyDay("2026-08-01", 1),
+      publishedDailyDay("2026-08-02", 1),
+      publishedDailyDay("2026-08-05", 2),
+    ],
+  }));
+  const model = buildCommunityDailyChartModel(series);
+  assert.equal(model.sparse, false);
+  assert.equal(model.bars.length, 3, "only published days draw a bar");
+  // The output line breaks at the two-day publication gap: one connected
+  // segment for the adjacent days, then an isolated single-point segment.
+  assert.deepEqual(
+    model.outputSegments.map((segment) => segment.map(({ day }) => day)),
+    [["2026-08-01", "2026-08-02"], ["2026-08-05"]],
+  );
+  const positions = model.bars.map(({ x }) => x);
+  assert.ok(positions[0] < positions[1] && positions[1] < positions[2]);
+  // The gap is proportional on the date axis: three days of silence spread
+  // the last bar further from the second than the second from the first.
+  assert.ok(
+    positions[2] - positions[1] > (positions[1] - positions[0]) * 2,
+    "missing days occupy axis space instead of collapsing",
+  );
+});
+
+test("the daily chart model thins ticks and bars for a year of days", () => {
+  const days = [];
+  const start = Date.parse("2025-08-10T00:00:00.000Z");
+  for (let offset = 0; offset < 366; offset += 3) {
+    const day = new Date(start + offset * 86_400_000).toISOString().slice(0, 10);
+    days.push(publishedDailyDay(day, 1));
+  }
+  const series = normalizeCommunityDailySeries(publishedDailySeries({
+    from: "2025-08-10",
+    to: "2026-08-10",
+    days,
+  }));
+  assert.equal(series.state, "published");
+  const model = buildCommunityDailyChartModel(series);
+  assert.equal(model.sparse, false);
+  assert.equal(model.bars.length, days.length);
+  assert.ok(model.dayTicks.length <= 6, "a year keeps a handful of date ticks");
+  assert.equal(model.tickLabelStyle, "month", "long spans label ticks by month");
+  assert.ok(model.barWidth >= 1, "bars stay visible");
+  const slotWidth = (model.plot.right - model.plot.left) / model.spanDays;
+  assert.ok(model.barWidth <= slotWidth, "bars never overlap their neighbours");
+  for (const tick of model.dayTicks) {
+    assert.match(tick.day, /^\d{4}-\d{2}-\d{2}$/u);
+    assert.ok(tick.x >= model.plot.left && tick.x <= model.plot.right);
+  }
+});
+
+test("the daily chart keeps an all-zero output series on the baseline", () => {
+  // Combined-output totals were zero before the server-side fix; a series of
+  // zeros must chart as a flat baseline, never as an invented scale.
+  const series = normalizeCommunityDailySeries(publishedDailySeries({
+    days: [
+      publishedDailyDay("2026-08-06", 1, {
+        payload: {
+          totals: {
+            ...publishedDailyDay("2026-08-06", 1).payload.totals,
+            outputCombinedTokens: 0,
+          },
+        },
+      }),
+      publishedDailyDay("2026-08-07", 1, {
+        payload: {
+          totals: {
+            ...publishedDailyDay("2026-08-07", 1).payload.totals,
+            outputCombinedTokens: 0,
+          },
+        },
+      }),
+    ],
+  }));
+  const model = buildCommunityDailyChartModel(series);
+  for (const point of model.outputPoints) {
+    assert.equal(point.y, model.plot.bottom);
+  }
 });
 
 test("the install card refuses a partially injected release", () => {

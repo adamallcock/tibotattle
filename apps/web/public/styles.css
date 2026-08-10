@@ -700,32 +700,6 @@ h1 {
   font-weight: var(--weight-display);
 }
 /*
- * In-panel variant of the same disclosure. It holds the service plumbing a
- * result panel used to print by default: contract versions, publication
- * policy, readiness internals and lifecycle stages. The result and its
- * plain-language caveat stay above it, in the open.
- */
-.service-detail-disclosure {
-  margin-top: var(--space-4);
-  border-radius: var(--radius-sm);
-  background: var(--surface-quiet);
-}
-.service-detail-disclosure > summary { padding: var(--space-3) var(--pad-tile); }
-.service-detail-disclosure > summary::after { font-size: .66rem; }
-.service-detail-disclosure > summary strong {
-  margin-top: 0;
-  color: var(--green);
-  font-family: inherit;
-  font-size: .74rem;
-  font-weight: var(--weight-bold);
-}
-.service-detail-disclosure > .service-detail-body {
-  display: grid;
-  gap: 12px;
-  padding: 0 15px 15px;
-}
-
-/*
  * (14g) This card is a two-column pitch: copy on the left, the sign-in and
  * consent controls on the right. Two later children — the "see what the
  * community published" link and the whole prepare-and-review disclosure — were
@@ -1946,10 +1920,7 @@ h2 { font-size: clamp(2rem, 3.8vw, 3.25rem); }
 .summary-facts dd { margin: 4px 0 0; overflow-wrap: anywhere; font-size: .76rem; font-weight: var(--weight-semibold); }
 .calibration-reasons { margin: 10px 0 0; padding-inline-start: 18px; color: var(--muted); font-size: .7rem; line-height: 1.45; }
 .calibration-reasons li + li { margin-top: 4px; }
-.snapshot-heading { display: grid; gap: 4px; margin-bottom: 12px; }
-.snapshot-heading strong { font-family: var(--serif); font-size: 1rem; font-weight: var(--weight-display); }
-.snapshot-heading span, .snapshot-disclosure, .snapshot-partial { color: var(--muted); font-size: .68rem; }
-.snapshot-partial { color: var(--rust); }
+.snapshot-disclosure { color: var(--muted); font-size: .68rem; }
 .snapshot-quality-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr));
@@ -1976,7 +1947,6 @@ h2 { font-size: clamp(2rem, 3.8vw, 3.25rem); }
 .snapshot-table { margin-top: 14px; }
 .snapshot-table table { min-width: 920px; }
 .snapshot-table th, .snapshot-table td { white-space: nowrap; }
-.snapshot-table .suppressed-value { color: var(--muted); font-style: italic; }
 .participant-action-status.error { color: var(--rust); }
 
 /* Public landing hierarchy. Keep the community surface intentionally small;
@@ -2003,7 +1973,6 @@ h2 { font-size: clamp(2rem, 3.8vw, 3.25rem); }
   max-width: 850px;
   margin-bottom: 24px;
 }
-.community-site .community-result-panel { background: var(--surface-raised); }
 .community-site .community-download { margin-top: 18px; }
 .community-site .community-trust-grid {
   display: grid;
@@ -2672,22 +2641,16 @@ footer p { margin: 0; }
 .community-site .community-proof:is(
   [data-community-state="checking"],
   [data-community-state="service_unavailable"],
-  [data-community-state="development_unsafe"],
   [data-community-state="unsupported_schema"],
-  [data-community-state="not_yet_published"],
-  [data-community-state="withdrawn"],
-  [data-community-state="suppressed"]
+  [data-community-state="none_published"]
 ) {
   padding: clamp(44px, 6vw, 68px) 0;
 }
 .community-site .community-proof:is(
   [data-community-state="checking"],
   [data-community-state="service_unavailable"],
-  [data-community-state="development_unsafe"],
   [data-community-state="unsupported_schema"],
-  [data-community-state="not_yet_published"],
-  [data-community-state="withdrawn"],
-  [data-community-state="suppressed"]
+  [data-community-state="none_published"]
 ) .community-proof-heading {
   grid-template-columns: minmax(0, 1.1fr) minmax(320px, .9fr);
   gap: 36px;
@@ -2695,11 +2658,8 @@ footer p { margin: 0; }
 .community-site .community-proof:is(
   [data-community-state="checking"],
   [data-community-state="service_unavailable"],
-  [data-community-state="development_unsafe"],
   [data-community-state="unsupported_schema"],
-  [data-community-state="not_yet_published"],
-  [data-community-state="withdrawn"],
-  [data-community-state="suppressed"]
+  [data-community-state="none_published"]
 ) h2 {
   max-width: 620px;
   font-size: clamp(2.35rem, 3.7vw, 3.6rem);
@@ -2707,11 +2667,8 @@ footer p { margin: 0; }
 .community-site .community-proof:is(
   [data-community-state="checking"],
   [data-community-state="service_unavailable"],
-  [data-community-state="development_unsafe"],
   [data-community-state="unsupported_schema"],
-  [data-community-state="not_yet_published"],
-  [data-community-state="withdrawn"],
-  [data-community-state="suppressed"]
+  [data-community-state="none_published"]
 ) .community-estimate-summary {
   gap: 10px;
   padding: 18px;
@@ -2719,11 +2676,8 @@ footer p { margin: 0; }
 .community-site .community-proof:is(
   [data-community-state="checking"],
   [data-community-state="service_unavailable"],
-  [data-community-state="development_unsafe"],
   [data-community-state="unsupported_schema"],
-  [data-community-state="not_yet_published"],
-  [data-community-state="withdrawn"],
-  [data-community-state="suppressed"]
+  [data-community-state="none_published"]
 ) .community-method {
   margin-top: 18px;
 }
@@ -2751,11 +2705,7 @@ footer p { margin: 0; }
 .community-site .result-summary > p {
   font-size: .74rem;
 }
-.community-site .snapshot-heading {
-  margin-bottom: 8px;
-}
-.community-site .snapshot-disclosure,
-.community-site .snapshot-partial {
+.community-site .snapshot-disclosure {
   color: var(--muted);
   font-size: .72rem;
 }
@@ -2765,9 +2715,62 @@ footer p { margin: 0; }
 .community-site .table-wrap {
   margin-top: 16px;
 }
-.community-site .service-detail-disclosure {
-  margin-top: 15px;
+/*
+ * The public daily-series chart. Inline SVG only — the site is CSP-strict and
+ * dependency-free. Usage-event bars read on the left axis in the chart
+ * accent; the combined-output line reads on the right axis in blue, matching
+ * the dashboard's cost/value series colour.
+ */
+.community-site .community-daily-chart {
+  margin-top: 16px;
+  padding: 14px 14px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-quiet);
 }
+.community-site .community-daily-chart svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.community-site .community-daily-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: .66rem;
+}
+.community-site .community-daily-legend > span {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+.community-site .daily-legend-swatch {
+  width: 14px;
+  height: 9px;
+  border-radius: 2px;
+  background: var(--chart-accent);
+}
+.community-site .daily-legend-swatch.output {
+  height: 3px;
+  border-radius: 999px;
+  background: var(--blue);
+}
+.community-site .community-daily-chart .annotation {
+  margin-top: 6px;
+}
+.daily-events-bar { fill: var(--chart-accent); opacity: .82; }
+.daily-output-line {
+  fill: none;
+  stroke: var(--blue);
+  stroke-width: 2.2;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+.daily-output-dot { fill: var(--blue); }
+.daily-axis-events { fill: var(--green-text); }
+.daily-axis-output { fill: var(--blue); }
 .community-site .resource-main {
   width: min(960px, calc(100% - 48px));
   margin: 0 auto;
@@ -3014,33 +3017,24 @@ footer p { margin: 0; }
   .community-site .community-proof:is(
     [data-community-state="checking"],
     [data-community-state="service_unavailable"],
-    [data-community-state="development_unsafe"],
     [data-community-state="unsupported_schema"],
-    [data-community-state="not_yet_published"],
-    [data-community-state="withdrawn"],
-    [data-community-state="suppressed"]
+    [data-community-state="none_published"]
   ) {
     padding: 38px 0;
   }
   .community-site .community-proof:is(
     [data-community-state="checking"],
     [data-community-state="service_unavailable"],
-    [data-community-state="development_unsafe"],
     [data-community-state="unsupported_schema"],
-    [data-community-state="not_yet_published"],
-    [data-community-state="withdrawn"],
-    [data-community-state="suppressed"]
+    [data-community-state="none_published"]
   ) .community-proof-heading {
     gap: 18px;
   }
   .community-site .community-proof:is(
     [data-community-state="checking"],
     [data-community-state="service_unavailable"],
-    [data-community-state="development_unsafe"],
     [data-community-state="unsupported_schema"],
-    [data-community-state="not_yet_published"],
-    [data-community-state="withdrawn"],
-    [data-community-state="suppressed"]
+    [data-community-state="none_published"]
   ) h2 {
     margin-bottom: 10px;
     font-size: clamp(2.15rem, 10vw, 3rem);
@@ -3048,22 +3042,16 @@ footer p { margin: 0; }
   .community-site .community-proof:is(
     [data-community-state="checking"],
     [data-community-state="service_unavailable"],
-    [data-community-state="development_unsafe"],
     [data-community-state="unsupported_schema"],
-    [data-community-state="not_yet_published"],
-    [data-community-state="withdrawn"],
-    [data-community-state="suppressed"]
+    [data-community-state="none_published"]
   ) .community-estimate-summary {
     padding: 16px;
   }
   .community-site .community-proof:is(
     [data-community-state="checking"],
     [data-community-state="service_unavailable"],
-    [data-community-state="development_unsafe"],
     [data-community-state="unsupported_schema"],
-    [data-community-state="not_yet_published"],
-    [data-community-state="withdrawn"],
-    [data-community-state="suppressed"]
+    [data-community-state="none_published"]
   ) .community-method {
     margin-top: 14px;
   }

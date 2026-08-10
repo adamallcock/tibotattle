@@ -1,72 +1,22 @@
 // The community aggregate view. It needs no local companion, so the public
-// website can show it honestly. The local app and public site render it from
-// this single module.
+// website can show it honestly. The public site renders the day-partitioned
+// daily series only: the legacy sealed weekly snapshot presentation was
+// retired in favour of daily revisions, so no snapshot render path lives here
+// any more.
 
-import {
-  normalizeCommunityDailySeries,
-  normalizeCommunitySnapshot,
-} from "./community-data.js";
+import { normalizeCommunityDailySeries } from "./community-data.js";
 import {
   compact,
   createDomHelpers,
+  dateTimeFormatter,
   formatAge,
   formatLocal,
 } from "./ui-format.js";
 import { translate } from "./localization.js";
 
-export const COMMUNITY_METRIC_LABELS = Object.freeze({
-  usageEvents: "Usage events",
-  inputUncachedTokens: "Input uncached",
-  inputCacheReadTokens: "Cache read",
-  inputCacheWriteTokens: "Cache write",
-  outputTextTokens: "Output text",
-  outputReasoningTokens: "Reasoning output",
-  outputCombinedTokens: "Combined output",
-  toolUnits: "Tool units",
-});
-
 /**
- * Fixed, non-speculative copy for every state the community contract can be
- * in. A state that carries no released figures must say so plainly rather than
- * leaving an empty panel that reads like a loading spinner that never ends.
- */
-export const COMMUNITY_SNAPSHOT_STATE_COPY = Object.freeze({
-  service_unavailable:
-    "Community activity is temporarily unavailable. This does not tell us whether a weekly snapshot exists.",
-  development_unsafe:
-    "Live cumulative totals have not passed privacy review, so they are not displayed.",
-  unsupported_schema:
-    "This community snapshot cannot be displayed safely with this version of TiboTattle.",
-  not_yet_published: "No stable weekly snapshot is available yet.",
-  withdrawn:
-    "This weekly revision was withdrawn for privacy or quality reasons. A replacement revision may be pending.",
-  suppressed:
-    "This week did not pass the privacy checks required for publication. We do not disclose why or how close the cohort was.",
-});
-
-const COMMUNITY_SNAPSHOT_STATE_KEYS = Object.freeze({
-  service_unavailable: "community.state.serviceUnavailable",
-  development_unsafe: "community.state.developmentUnsafe",
-  unsupported_schema: "community.state.unsupportedSchema",
-  not_yet_published: "community.state.notYetPublished",
-  withdrawn: "community.state.withdrawn",
-  suppressed: "community.state.suppressed",
-});
-
-const COMMUNITY_METRIC_MESSAGE_KEYS = Object.freeze({
-  usageEvents: "community.metric.usageEvents",
-  inputUncachedTokens: "community.metric.inputUncached",
-  inputCacheReadTokens: "community.metric.cacheRead",
-  inputCacheWriteTokens: "community.metric.cacheWrite",
-  outputTextTokens: "community.metric.outputText",
-  outputReasoningTokens: "community.metric.reasoningOutput",
-  outputCombinedTokens: "community.metric.combinedOutput",
-  toolUnits: "community.metric.toolUnits",
-});
-
-/**
- * Fixed copy for the day-partitioned series states. Same policy as the
- * weekly snapshot copy above: no degraded state may leave an empty panel.
+ * Fixed copy for the day-partitioned series states. No degraded state may
+ * leave an empty panel that reads like a loading spinner that never ends.
  */
 export const COMMUNITY_DAILY_STATE_COPY = Object.freeze({
   service_unavailable:
@@ -92,6 +42,311 @@ const COMMUNITY_DAILY_COLUMN_KEYS = Object.freeze([
   "community.daily.revision",
   "community.released",
 ]);
+
+const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
+const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
+
+export const COMMUNITY_DAILY_CHART_WIDTH = 900;
+export const COMMUNITY_DAILY_CHART_HEIGHT = 300;
+// Beyond this span, per-day tick labels would repeat month names ambiguously,
+// so ticks switch to month-plus-year labels.
+const MONTH_TICK_SPAN_DAYS = 150;
+
+function communityDayStartMs(day) {
+  return Date.parse(`${day}T00:00:00.000Z`);
+}
+
+/**
+ * A round tick step (1/2/2.5/5 × 10^n) that covers the value range with the
+ * requested number of divisions. Same shape as the dashboard's chart axes so
+ * public and in-app charts agree on what a readable axis is.
+ */
+function chartTickStep(span, target = 4) {
+  if (!Number.isFinite(span) || span <= 0) return 1;
+  const raw = span / Math.max(1, target);
+  const magnitude = 10 ** Math.floor(Math.log10(raw));
+  const normalized = raw / magnitude;
+  const factor = normalized <= 1 ? 1
+    : normalized <= 2 ? 2
+      : normalized <= 2.5 ? 2.5
+        : normalized <= 5 ? 5
+          : 10;
+  return factor * magnitude;
+}
+
+function valueAxis(maximum, plotTop, plotBottom) {
+  const top = Math.max(1, maximum);
+  const step = chartTickStep(top);
+  const axisTop = Math.ceil(top / step) * step;
+  const y = (value) => plotBottom
+    - (value / axisTop) * (plotBottom - plotTop);
+  const ticks = [];
+  for (let value = 0; value <= axisTop + step / 100; value += step) {
+    ticks.push({ value, y: y(value) });
+  }
+  return { axisTop, y, ticks };
+}
+
+/**
+ * Pure geometry for the public daily-series chart: usage events as bars on
+ * the left axis and combined output tokens as a line on the right axis.
+ *
+ * The mapping is honest about the series' shape:
+ * - the x scale covers the published days only, positioned by real date, so a
+ *   day that was never published is a gap, not a zero;
+ * - the output line breaks at any gap wider than one day instead of bridging
+ *   days that do not exist;
+ * - one or two published days mark the series as `sparse`, which the renderer
+ *   turns into visible dots plus a still-filling note;
+ * - a year of days thins the date ticks to a handful of month labels instead
+ *   of stacking hundreds of unreadable ones.
+ *
+ * Returns null for every non-published state. The model carries no formatted
+ * strings: days stay ISO day strings and values stay numbers, so locale
+ * changes never invalidate it.
+ */
+export function buildCommunityDailyChartModel(series, {
+  width = COMMUNITY_DAILY_CHART_WIDTH,
+  height = COMMUNITY_DAILY_CHART_HEIGHT,
+  maximumDayTicks = 6,
+} = {}) {
+  if (!series || series.state !== "published" || series.days.length === 0) {
+    return null;
+  }
+  const margin = { top: 16, right: 64, bottom: 32, left: 56 };
+  const plotTop = margin.top;
+  const plotBottom = height - margin.bottom;
+  const days = series.days.map((day) => ({
+    day: day.day,
+    atMs: communityDayStartMs(day.day),
+    usageEvents: day.totals.usageEvents,
+    outputCombinedTokens: day.totals.outputCombinedTokens,
+  }));
+  const startMs = days[0].atMs;
+  const endMs = days[days.length - 1].atMs;
+  const spanDays = Math.round((endMs - startMs) / MILLISECONDS_PER_DAY) + 1;
+  const plotWidth = width - margin.left - margin.right;
+  const slotWidth = plotWidth / spanDays;
+  const barWidth = Math.max(1.5, Math.min(22, slotWidth * 0.62));
+  const usableWidth = Math.max(1, plotWidth - barWidth);
+  const x = (atMs) => (spanDays === 1
+    ? margin.left + plotWidth / 2
+    : margin.left + barWidth / 2 + ((atMs - startMs) / (endMs - startMs)) * usableWidth);
+
+  const events = valueAxis(
+    Math.max(...days.map((day) => day.usageEvents)),
+    plotTop,
+    plotBottom,
+  );
+  const output = valueAxis(
+    Math.max(...days.map((day) => day.outputCombinedTokens)),
+    plotTop,
+    plotBottom,
+  );
+
+  const bars = days.map((day) => {
+    const center = x(day.atMs);
+    const top = events.y(day.usageEvents);
+    return {
+      day: day.day,
+      usageEvents: day.usageEvents,
+      x: center - barWidth / 2,
+      y: top,
+      width: barWidth,
+      height: plotBottom - top,
+    };
+  });
+
+  const outputPoints = days.map((day) => ({
+    day: day.day,
+    outputCombinedTokens: day.outputCombinedTokens,
+    x: x(day.atMs),
+    y: output.y(day.outputCombinedTokens),
+  }));
+  // Split the line at unpublished days: consecutive points stay connected only
+  // when their days are adjacent on the calendar.
+  const outputSegments = [];
+  let segment = [outputPoints[0]];
+  for (let index = 1; index < days.length; index += 1) {
+    const gapDays = Math.round(
+      (days[index].atMs - days[index - 1].atMs) / MILLISECONDS_PER_DAY,
+    );
+    if (gapDays > 1) {
+      outputSegments.push(segment);
+      segment = [];
+    }
+    segment.push(outputPoints[index]);
+  }
+  outputSegments.push(segment);
+
+  // Date ticks: every published day while they fit, then evenly spaced
+  // calendar positions across the span, labelled by month once the span makes
+  // repeated day labels ambiguous.
+  const tickLabelStyle = spanDays > MONTH_TICK_SPAN_DAYS ? "month" : "day";
+  let dayTicks;
+  if (days.length <= maximumDayTicks) {
+    dayTicks = days.map((day) => ({ day: day.day, x: x(day.atMs) }));
+  } else {
+    const count = Math.max(2, maximumDayTicks);
+    dayTicks = [];
+    for (let index = 0; index < count; index += 1) {
+      const atMs = startMs
+        + Math.round(((endMs - startMs) * index) / (count - 1) / MILLISECONDS_PER_DAY)
+          * MILLISECONDS_PER_DAY;
+      const day = new Date(atMs).toISOString().slice(0, 10);
+      if (dayTicks.length === 0 || dayTicks[dayTicks.length - 1].day !== day) {
+        dayTicks.push({ day, x: x(atMs) });
+      }
+    }
+  }
+
+  return {
+    width,
+    height,
+    margin,
+    plot: {
+      top: plotTop,
+      bottom: plotBottom,
+      left: margin.left,
+      right: width - margin.right,
+    },
+    spanDays,
+    barWidth,
+    sparse: days.length <= 2,
+    bars,
+    outputPoints,
+    outputSegments,
+    eventsTicks: events.ticks,
+    outputTicks: output.ticks,
+    dayTicks,
+    tickLabelStyle,
+  };
+}
+
+function svgNode(documentRef, tag, className = "", attributes = {}) {
+  const element = documentRef.createElementNS(SVG_NAMESPACE, tag);
+  // SVG elements take their class through setAttribute: assigning
+  // `.className` writes to an SVGAnimatedString and is silently ignored.
+  if (className) element.setAttribute("class", className);
+  for (const [name, value] of Object.entries(attributes)) {
+    element.setAttribute(name, String(value));
+  }
+  return element;
+}
+
+function tickLabelFormatter(style) {
+  // Published days are UTC calendar days. Formatting them in the viewer's
+  // zone would shift "2026-08-07" to Aug 6 west of Greenwich, so the labels
+  // pin UTC while still following the selected formatting locale.
+  return dateTimeFormatter(style === "month"
+    ? { timeZone: "UTC", month: "short", year: "numeric" }
+    : { timeZone: "UTC", month: "short", day: "numeric" });
+}
+
+/**
+ * Renders the inline SVG daily chart. The site is CSP-strict and
+ * dependency-free, so this is plain SVG construction: bars for usage events
+ * on the left axis, a line for combined output tokens on the right axis, and
+ * dots plus a note while the series is still one or two days long.
+ */
+function appendCommunityDailyChart({ documentRef, container, series, t }) {
+  const model = buildCommunityDailyChartModel(series);
+  if (model === null) return;
+  const { node } = createDomHelpers(documentRef);
+
+  const figure = node("div", "community-daily-chart");
+  const legend = node("p", "community-daily-legend");
+  for (const [swatchClass, labelKey] of [
+    ["daily-legend-swatch events", "community.metric.usageEvents"],
+    ["daily-legend-swatch output", "community.metric.combinedOutput"],
+  ]) {
+    const item = node("span");
+    const swatch = node("span", swatchClass);
+    swatch.setAttribute("aria-hidden", "true");
+    item.append(swatch, node("span", "", t(labelKey)));
+    legend.append(item);
+  }
+  figure.append(legend);
+
+  const svg = svgNode(documentRef, "svg", "", {
+    viewBox: `0 0 ${model.width} ${model.height}`,
+    role: "img",
+    "aria-label": t("community.daily.chartLabel"),
+    "aria-description": t("community.daily.chartDescription"),
+  });
+  svg.setAttribute("data-i18n-skip", "");
+
+  for (const tick of model.eventsTicks) {
+    svg.append(svgNode(documentRef, "line", "chart-grid", {
+      x1: model.plot.left,
+      x2: model.plot.right,
+      y1: tick.y,
+      y2: tick.y,
+    }));
+    const label = svgNode(documentRef, "text", "chart-axis-label daily-axis-events", {
+      x: model.plot.left - 8,
+      y: tick.y + 3,
+      "text-anchor": "end",
+    });
+    label.textContent = compact(tick.value);
+    svg.append(label);
+  }
+  for (const tick of model.outputTicks) {
+    const label = svgNode(documentRef, "text", "chart-axis-label daily-axis-output", {
+      x: model.plot.right + 8,
+      y: tick.y + 3,
+      "text-anchor": "start",
+    });
+    label.textContent = compact(tick.value);
+    svg.append(label);
+  }
+  const formatTick = tickLabelFormatter(model.tickLabelStyle);
+  for (const tick of model.dayTicks) {
+    const label = svgNode(documentRef, "text", "chart-axis-label", {
+      x: tick.x,
+      y: model.height - 10,
+      "text-anchor": "middle",
+    });
+    label.textContent = formatTick.format(new Date(communityDayStartMs(tick.day)));
+    svg.append(label);
+  }
+
+  for (const bar of model.bars) {
+    svg.append(svgNode(documentRef, "rect", "daily-events-bar", {
+      x: bar.x,
+      y: bar.y,
+      width: bar.width,
+      height: Math.max(0, bar.height),
+    }));
+  }
+
+  for (const segment of model.outputSegments) {
+    if (segment.length >= 2) {
+      svg.append(svgNode(documentRef, "polyline", "daily-output-line", {
+        points: segment
+          .map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`)
+          .join(" "),
+      }));
+    }
+    // An isolated day has no line to sit on, and a one-or-two-day series is
+    // easier to read as marked points; both get explicit dots.
+    if (segment.length === 1 || model.sparse) {
+      for (const point of segment) {
+        svg.append(svgNode(documentRef, "circle", "daily-output-dot", {
+          cx: point.x,
+          cy: point.y,
+          r: 3.4,
+        }));
+      }
+    }
+  }
+
+  figure.append(svg);
+  if (model.sparse) {
+    figure.append(node("p", "annotation", t("community.daily.seriesFilling")));
+  }
+  container.append(figure);
+}
 
 /**
  * Renders the day-partitioned community series: the latest published
@@ -148,6 +403,8 @@ export function renderCommunityDailySeries({
     t("community.daily.recomputeNote"),
   ));
 
+  appendCommunityDailyChart({ documentRef, container, series, t });
+
   const breakdown = node("details", "journey-disclosure snapshot-breakdown");
   const summary = node("summary");
   summary.append(node(
@@ -196,348 +453,4 @@ export function renderCommunityDailySeries({
   breakdown.append(wrap);
   container.append(breakdown);
   return series.state;
-}
-
-/**
- * The current weekly contract publishes activity cells, not allowance
- * evidence. Keep that distinction as a separate rendered state so a future
- * contract cannot accidentally turn a token total into a quota claim.
- */
-export const COMMUNITY_ESTIMATE_STATE_COPY = Object.freeze({
-  service_unavailable: Object.freeze({
-    label: "Unavailable",
-    hero: "Unavailable right now",
-    body: "The community service is temporarily unavailable, so there’s no estimate to show.",
-  }),
-  development_unsafe: Object.freeze({
-    label: "Unavailable",
-    hero: "No public estimate",
-    body: "There’s no privacy-reviewed community estimate to show right now.",
-  }),
-  unsupported_schema: Object.freeze({
-    label: "Unavailable",
-    hero: "Estimate update required",
-    body: "This estimate needs an update before it can be shown safely.",
-  }),
-  not_yet_published: Object.freeze({
-    label: "Collecting evidence",
-    hero: "Collecting matched evidence",
-    body: "The community estimate isn’t ready yet. Matched quota coverage and uncertainty are still being collected.",
-  }),
-  withdrawn: Object.freeze({
-    label: "Not published",
-    hero: "This week was withdrawn",
-    body: "This week’s estimate was withdrawn after privacy or quality review.",
-  }),
-  suppressed: Object.freeze({
-    label: "Not published",
-    hero: "Not published this week",
-    body: "This week’s estimate is not published because the evidence did not pass the required privacy checks.",
-  }),
-  activity_only: Object.freeze({
-    label: "Activity only",
-    hero: "Activity released; estimate pending",
-    body: "This week’s community activity is available, but it does not support an allowance estimate yet.",
-  }),
-});
-
-// Preserve the exported English copy above as a stable, non-localized
-// contract for callers and tests. Rendering always goes through these keys so
-// that the public first-visit estimate state changes language with the rest of
-// the page instead of leaving a misleading English-only status behind.
-const COMMUNITY_ESTIMATE_STATE_KEYS = Object.freeze({
-  service_unavailable: Object.freeze({
-    label: "community.estimate.serviceUnavailable.label",
-    hero: "community.estimate.serviceUnavailable.hero",
-    body: "community.estimate.serviceUnavailable.body",
-  }),
-  development_unsafe: Object.freeze({
-    label: "community.estimate.developmentUnsafe.label",
-    hero: "community.estimate.developmentUnsafe.hero",
-    body: "community.estimate.developmentUnsafe.body",
-  }),
-  unsupported_schema: Object.freeze({
-    label: "community.estimate.unsupportedSchema.label",
-    hero: "community.estimate.unsupportedSchema.hero",
-    body: "community.estimate.unsupportedSchema.body",
-  }),
-  not_yet_published: Object.freeze({
-    label: "community.estimate.notYetPublished.label",
-    hero: "community.estimate.notYetPublished.hero",
-    body: "community.estimate.notYetPublished.body",
-  }),
-  withdrawn: Object.freeze({
-    label: "community.estimate.withdrawn.label",
-    hero: "community.estimate.withdrawn.hero",
-    body: "community.estimate.withdrawn.body",
-  }),
-  suppressed: Object.freeze({
-    label: "community.estimate.suppressed.label",
-    hero: "community.estimate.suppressed.hero",
-    body: "community.estimate.suppressed.body",
-  }),
-  activity_only: Object.freeze({
-    label: "community.estimate.activityOnly.label",
-    hero: "community.estimate.activityOnly.hero",
-    body: "community.estimate.activityOnly.body",
-  }),
-});
-
-function estimateState(snapshot) {
-  return Object.hasOwn(COMMUNITY_ESTIMATE_STATE_COPY, snapshot.state)
-    ? snapshot.state
-    : "activity_only";
-}
-
-/**
- * Render the named public estimate gate without deriving a number from the
- * current activity-only contract. The optional nodes are public-site-only;
- * the in-app dashboard keeps its existing activity snapshot surface.
- */
-export function renderCommunityEstimate({
-  documentRef,
-  container = null,
-  hero = null,
-  stateNode = null,
-  stateNodes = [],
-  snapshot,
-}) {
-  const { clear, node } = createDomHelpers(documentRef);
-  const state = estimateState(snapshot);
-  const copy = COMMUNITY_ESTIMATE_STATE_COPY[state];
-  const localizedKeys = COMMUNITY_ESTIMATE_STATE_KEYS[state];
-  const locale = documentRef?.documentElement?.lang ?? "en-US";
-  const t = (key) => translate(key, {}, locale);
-  if (container) {
-    clear(container);
-    container.append(node(
-      "p",
-      "estimate-status-copy",
-      localizedKeys ? t(localizedKeys.body) : copy.body,
-    ));
-  }
-  if (hero) hero.textContent = localizedKeys ? t(localizedKeys.hero) : copy.hero;
-  for (const item of [stateNode, ...stateNodes]) {
-    if (!item) continue;
-    item.textContent = localizedKeys ? t(localizedKeys.label) : copy.label;
-    item.className = "evidence-chip neutral";
-  }
-  return state;
-}
-
-/**
- * Renders one community snapshot payload.
- *
- * `detail` is optional: the public site shows the same provenance disclosure
- * the dashboard does, but a caller without that container still gets the
- * headline table and the honest empty states.
- */
-export function renderCommunitySnapshot({
-  documentRef,
-  container,
-  detail = null,
-  estimateContainer = null,
-  estimateHero = null,
-  estimateState = null,
-  estimateStates = [],
-  payload,
-  now = Date.now(),
-}) {
-  const { clear, node } = createDomHelpers(documentRef);
-  const locale = documentRef?.documentElement?.lang ?? "en-US";
-  const t = (key, values = {}) => translate(key, values, locale);
-  clear(container);
-  if (detail) clear(detail);
-  const snapshot = normalizeCommunitySnapshot(payload);
-  renderCommunityEstimate({
-    documentRef,
-    container: estimateContainer,
-    hero: estimateHero,
-    stateNode: estimateState,
-    stateNodes: estimateStates,
-    snapshot,
-  });
-
-  if (snapshot.state === "service_unavailable") {
-    container.append(
-      node("p", "", t("community.state.serviceUnavailable")),
-    );
-    if (!detail) return snapshot.state;
-    const quality = node("dl", "snapshot-quality-grid");
-    for (const [term, value] of [
-      [t("community.pending.releasedSnapshot"), t("community.pending.notLoaded")],
-      [t("community.pending.cohortLimit"), t("community.pending.notInContract")],
-      [t("community.pending.matchedQuota"), t("community.pending.notInContract")],
-      [t("community.pending.changeConfidence"), t("community.pending.notInContract")],
-    ]) {
-      const item = node("div");
-      item.append(node("dt", "", term), node("dd", "", value));
-      quality.append(item);
-    }
-    detail.append(quality);
-    detail.append(node(
-      "p",
-      "snapshot-disclosure",
-      t("community.noCapacityClaim"),
-    ));
-    return snapshot.state;
-  }
-
-  if (Object.hasOwn(COMMUNITY_SNAPSHOT_STATE_COPY, snapshot.state)) {
-    container.append(
-      node("p", "", t(COMMUNITY_SNAPSHOT_STATE_KEYS[snapshot.state])),
-    );
-    return snapshot.state;
-  }
-
-  const heading = node("div", "snapshot-heading");
-  heading.append(node(
-    "strong",
-    "",
-    `${formatLocal(snapshot.period.startAt, { dateOnly: true })} – ${
-      formatLocal(snapshot.period.endAt, { dateOnly: true })
-    }`,
-  ));
-  container.append(heading);
-  const providerAccountCohort = snapshot.participantCohort === "provider_account";
-  const weeklyActivityKey = providerAccountCohort
-    ? "community.providerAccountWeeklyActivity"
-    : "community.weeklyActivity";
-  const partialMetricsKey = providerAccountCohort
-    ? "community.providerAccountPartialMetrics"
-    : "community.partialMetrics";
-  const supportKey = providerAccountCohort
-    ? "community.providerAccountsPerCell"
-    : "community.participantsPerCell";
-  const releaseMechanicsKey = providerAccountCohort
-    ? "community.providerAccountReleaseMechanics"
-    : "community.releaseMechanics";
-  // The one sentence a reader needs to know what these numbers are and are
-  // not. The mechanism that produces them lives in the disclosure below.
-  container.append(node(
-    "p",
-    "snapshot-disclosure",
-    t(weeklyActivityKey, {
-      count: compact(snapshot.minimumParticipants),
-    }),
-  ));
-  if (snapshot.state === "published_partial") {
-    container.append(node(
-      "p",
-      "snapshot-partial",
-      t(partialMetricsKey),
-    ));
-  }
-
-  if (detail) {
-    const quality = node("dl", "snapshot-quality-grid");
-    for (
-      const [term, value] of [
-        [t("community.contract"), snapshot.schemaVersion],
-        [t("community.releasedModelCells"), compact(snapshot.cells.length)],
-        [
-          t("community.minimumSupport"),
-          t(supportKey, {
-            count: compact(snapshot.minimumParticipants),
-          }),
-        ],
-        [t("community.ingestionCutoff"), formatLocal(snapshot.ingestionCutoffAt)],
-        [t("community.released"), formatLocal(snapshot.releasedAt)],
-        [
-          t("community.snapshotAge"),
-          formatAge(Math.max(0, (now - Date.parse(snapshot.releasedAt)) / 1_000)),
-        ],
-        [
-          t("community.coverageState"),
-          snapshot.state === "published_partial"
-            ? t("community.partiallyReleased")
-            : t("community.allContractedCells"),
-        ],
-      ]
-    ) {
-      const item = node("div");
-      item.append(node("dt", "", term), node("dd", "", value));
-      quality.append(item);
-    }
-    detail.append(quality);
-    detail.append(node(
-      "p",
-      "snapshot-disclosure",
-      t(releaseMechanicsKey, {
-        count: compact(snapshot.minimumParticipants),
-      }),
-    ));
-    detail.append(node(
-      "p",
-      "snapshot-disclosure",
-      t("community.currentReleaseScope"),
-    ));
-  }
-
-  // A release can contain many provider/model cells. The public landing view
-  // stays a readable weekly snapshot; the complete activity breakdown remains
-  // available on demand without masquerading as a personal dashboard.
-  const breakdown = node("details", "journey-disclosure snapshot-breakdown");
-  const summary = node("summary");
-  summary.append(node(
-    "span",
-    "",
-    t("community.detailedActivity", { count: compact(snapshot.cells.length) }),
-  ));
-  breakdown.append(summary);
-  const wrap = node("div", "table-wrap snapshot-table");
-  const table = documentRef.createElement("table");
-  const caption = node(
-    "caption",
-    "sr-only",
-    t("community.metricsCaption"),
-  );
-  const thead = documentRef.createElement("thead");
-  const header = documentRef.createElement("tr");
-  for (
-    const label of [
-      t("community.providerModel"),
-      ...Object.keys(COMMUNITY_METRIC_LABELS).map((metricName) =>
-        t(COMMUNITY_METRIC_MESSAGE_KEYS[metricName])),
-    ]
-  ) {
-    const th = documentRef.createElement("th");
-    th.scope = "col";
-    th.textContent = label;
-    header.append(th);
-  }
-  thead.append(header);
-  const tbody = documentRef.createElement("tbody");
-  for (const cell of snapshot.cells) {
-    const row = documentRef.createElement("tr");
-    const identity = documentRef.createElement("th");
-    identity.scope = "row";
-    // Provider/model identifiers are source data, not product copy. Keep
-    // them outside the exact-text localization bridge even if a future value
-    // happens to equal a translated UI label.
-    identity.setAttribute("data-i18n-skip", "");
-    identity.textContent = [
-      cell.provider,
-      cell.planType === "unknown"
-        ? t("community.planUnknown")
-        : cell.planType + (cell.planVariant !== "unknown" ? " " + cell.planVariant : ""),
-      cell.modelId,
-    ].join(" · ");
-    row.append(identity);
-    for (const metricName of Object.keys(COMMUNITY_METRIC_LABELS)) {
-      const td = documentRef.createElement("td");
-      const metric = cell.metrics[metricName];
-      td.textContent = metric.status === "released"
-        ? compact(metric.value)
-        : t("community.notReleased");
-      if (metric.status !== "released") td.className = "suppressed-value";
-      row.append(td);
-    }
-    tbody.append(row);
-  }
-  table.append(caption, thead, tbody);
-  wrap.append(table);
-  breakdown.append(wrap);
-  container.append(breakdown);
-  return snapshot.state;
 }
