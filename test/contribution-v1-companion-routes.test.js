@@ -129,7 +129,15 @@ function fakeIncrementalController() {
     lastAttemptAt: null,
     nextAttemptAt: approved ? "2026-08-03T00:00:00.000Z" : null,
     lastOutcome: approved
-      ? { at: "2026-08-03T00:00:00.000Z", code: "partial_progress", status: "partial" }
+      ? {
+        at: "2026-08-03T00:00:00.000Z",
+        code: "partial_progress",
+        status: "partial",
+        // The 0.1.2 recorded cause: the code must survive the projection so
+        // the dashboard can name it, and the message must never leave the
+        // companion — it is the canary the body assertions check for.
+        detail: { code: "device_credential_unavailable", message: PRIVATE_CANARY },
+      }
       : null,
     privatePath: PRIVATE_CANARY,
   });
@@ -240,7 +248,11 @@ test("the capability advertises the v1.0 contract only when configured with an e
       "telemetry-contribution-v1.0",
     );
     // The same injected controller served both configured servers, and each
-    // started it beside the v0.1 scheduler.
+    // started it beside the v0.1 scheduler. The start rides the lazy snapshot
+    // build a health read kicks off without being awaited by the response, so
+    // give the event loop the same settling turns the kick counters get —
+    // asserting immediately raced it and failed roughly one run in four.
+    await settleKicks();
     assert.equal(controller.calls.start, 2);
   } finally {
     await app.close();
@@ -296,6 +308,7 @@ test("the status route reports bounded progress and never a path", async () => {
         at: "2026-08-03T00:00:00.000Z",
         code: "partial_progress",
         status: "partial",
+        detail: { code: "device_credential_unavailable" },
       },
       includesContent: false,
       includesPaths: false,

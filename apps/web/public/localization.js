@@ -214,26 +214,12 @@ export const WEB_MESSAGES = Object.freeze({
   "dashboard.quota.attributionPseudonymous": ["pseudonymous account attributed", "已归因于假名化帐户", "cuenta seudónima atribuida"],
   "dashboard.quota.attributionUnavailable": ["account unattributed", "未归因帐户", "cuenta sin atribución"],
   "dashboard.pricing.noWeightedTitle": ["No usage in this period could be weighted, so the Standard-rate total is shown unchanged.", "此期间没有可加权的使用量，因此显示未变动的 Standard 费率总额。", "No se pudo ponderar ningún uso en este período, por lo que se muestra sin cambios el total a tarifa Standard."],
-  "dashboard.pricing.noCoverage": ["Price coverage is not available", "价格覆盖率不可用", "La cobertura de precios no está disponible"],
-  "dashboard.pricing.coverageDenominator": ["Based on {count} usage changes in the displayed period.", "基于所显示期间的 {count} 个使用变化。", "Basado en {count} cambios de uso durante el período mostrado."],
-  "dashboard.pricing.coverage": ["{percent} coverage · {method}{provenance}", "覆盖率 {percent} · {method}{provenance}", "{percent} de cobertura · {method}{provenance}"],
-  "dashboard.pricing.noCoverageWithHistory": ["Price coverage is not available · {history}", "价格覆盖率不可用 · {history}", "La cobertura de precios no está disponible · {history}"],
-  "dashboard.pricing.coverageWithHistory": ["{percent} coverage · {method}{provenance} · {history}", "覆盖率 {percent} · {method}{provenance} · {history}", "{percent} de cobertura · {method}{provenance} · {history}"],
-  "dashboard.pricing.registryProvenance": [" · price registry {version}{observedAt}", " · 价格登记表 {version}{observedAt}", " · registro de precios {version}{observedAt}"],
-  "dashboard.pricing.registryObservedAt": [" ({time})", "（{time}）", " ({time})"],
-  "dashboard.pricing.replaySafe": ["replay-safe", "可安全重放", "seguro para reproducción"],
-  "dashboard.pricing.staleReplaySafe": ["stale replay-safe cache", "陈旧的可安全重放缓存", "caché seguro para reproducción desactualizado"],
-  "dashboard.pricing.legacyProjection": ["legacy projection", "旧版投影", "proyección heredada"],
+  // The overview card's coverage/method/provenance metadata line was removed
+  // (owner-directed, 2026-08-10), and its keys with it. Coverage honesty
+  // remains in the history-progress keys below, the accounting.pricing.*
+  // sentences, and the routed evidence warnings.
   "dashboard.pricing.noComponents": ["No token-component accounting was returned.", "未返回令牌组件核算。", "No se devolvió contabilidad por componente de token."],
   "dashboard.pricing.tokens": ["{count} tokens", "{count} 个令牌", "{count} tokens"],
-  "dashboard.pricing.historyScanningComplete": ["Scanning for older history", "正在扫描更早的历史记录", "Buscando historial anterior"],
-  "dashboard.pricing.historyScanningPartial": ["Scanning for older history", "正在扫描更早的历史记录", "Buscando historial anterior"],
-  "dashboard.pricing.historyComplete": ["History index complete", "历史索引完成", "Índice histórico completo"],
-  "dashboard.pricing.historyDiskSpace": ["History scan paused: free space needed", "历史扫描已暂停：需要可用空间", "Análisis histórico en pausa: se necesita espacio libre"],
-  "dashboard.pricing.historyStorageUnavailable": ["History scan paused: storage check unavailable", "历史扫描已暂停：无法检查存储空间", "Análisis histórico en pausa: no se puede comprobar el almacenamiento"],
-  "dashboard.pricing.historyNotStarted": ["Older history has not been scanned", "尚未扫描更早的历史记录", "Aún no se ha analizado el historial anterior"],
-  "dashboard.pricing.historyProgress": ["History scan: {indexed} of {total} files", "历史扫描：{indexed}/{total} 个文件", "Análisis histórico: {indexed} de {total} archivos"],
-  "dashboard.pricing.historyResume": ["History scan paused", "历史扫描已暂停", "Análisis histórico en pausa"],
   // How much of the discovered history the figures above are drawn from. Every
   // number here is measured — indexed and discovered source counts published by
   // the local companion — so the share is a real proportion of a real
@@ -307,10 +293,13 @@ export const WEB_MESSAGES = Object.freeze({
   "accounting.fastMode.inferenceNotRun": ["Residual inference has not run: there is not yet enough matched calibration evidence to compare a window against a Standard reference.", "残差推断尚未运行：还没有足够的匹配校准证据将某个窗口与 Standard 参考进行比较。", "La inferencia de residuos no se ha ejecutado: todavía no hay suficiente evidencia de calibración coincidente para comparar una ventana con una referencia Standard."],
   "accounting.fastMode.inferenceNone": ["Residual inference compared {scored} calibration windows against {reference} Standard references and marked none as Fast.", "残差推断将 {scored} 个校准窗口与 {reference} 个 Standard 参考进行了比较，没有标记任何一个为 Fast。", "La inferencia de residuos comparó {scored} ventanas de calibración con {reference} referencias Standard y no marcó ninguna como Fast."],
   "accounting.fastMode.inferenceSome": ["Residual inference marked {fast} of {scored} calibration windows as inferred Fast, against {reference} Standard references. Inference labels windows, never individual increments, so it is reported here and never folded into the weighted total.", "残差推断在与 {reference} 个 Standard 参考比较后，将 {scored} 个校准窗口中的 {fast} 个标记为推断的 Fast。推断标记的是窗口而非单个增量，因此只在此报告，绝不会并入加权总额。", "La inferencia de residuos marcó {fast} de {scored} ventanas de calibración como Fast inferido, frente a {reference} referencias Standard. La inferencia etiqueta ventanas, nunca incrementos individuales, por lo que se informa aquí y nunca se incorpora al total ponderado."],
-  "dashboard.calibration.perPoint": ["{amount} API equivalent per 1 percentage point", "每 1 个百分点相当于 {amount} 的 API 价值", "{amount} de equivalente de API por cada punto porcentual"],
-  "dashboard.calibration.range": ["{lower}–{upper} per point", "每点 {lower}–{upper}", "{lower}–{upper} por punto"],
+  // The stat tiles carry bare figures; their per-point unit lives in the
+  // static labels beneath them, so the old sentence-length "perPoint" and
+  // "range" values left with the table presentation (owner-directed,
+  // 2026-08-10). The example translation is a full sentence rendered as prose
+  // under the stat row.
   "dashboard.calibration.rangeUnavailable": ["Range unavailable", "区间不可用", "Intervalo no disponible"],
-  "dashboard.calibration.example": ["$100 of recorded API-price-equivalent usage corresponds to about {points} percentage points", "记录的 API 价格等价值使用量每 100 美元约对应 {points} 个百分点", "100 USD de uso registrado equivalente al precio de API corresponden a unos {points} puntos porcentuales"],
+  "dashboard.calibration.example": ["$100 of recorded API-price-equivalent usage corresponds to about {points} percentage points.", "记录的 API 价格等价值使用量每 100 美元约对应 {points} 个百分点。", "100 USD de uso registrado equivalente al precio de API corresponden a unos {points} puntos porcentuales."],
   "dashboard.calibration.noRate": [`The weekly calibration contract requires at least ${WEEKLY_CALIBRATION_MINIMUM_QUOTA_BOUNDARIES} unique quota-boundary observations spanning at least ${WEEKLY_CALIBRATION_MINIMUM_DISPLAYED_SPAN_PP} displayed percentage points, plus a valid positive fit, before TiboTattle can estimate this rate and range. API prices remain a measuring stick, not a subscription charge.`, `每周校准契约要求至少 ${WEEKLY_CALIBRATION_MINIMUM_QUOTA_BOUNDARIES} 个唯一额度边界观测值，跨度至少为 ${WEEKLY_CALIBRATION_MINIMUM_DISPLAYED_SPAN_PP} 个显示百分点，并且拟合必须有效且为正，TiboTattle 才能估算此费率和区间。API 价格仍只是衡量尺，而不是订阅费用。`, `El contrato de calibración semanal exige al menos ${WEEKLY_CALIBRATION_MINIMUM_QUOTA_BOUNDARIES} observaciones únicas de límites de cuota que abarquen al menos ${WEEKLY_CALIBRATION_MINIMUM_DISPLAYED_SPAN_PP} puntos porcentuales mostrados, además de un ajuste positivo válido, antes de que TiboTattle pueda estimar esta tasa y su intervalo. Los precios de API siguen siendo una referencia, no un cargo de suscripción.`],
   "dashboard.calibration.withRange": ["Across {count} qualifying resets, the fitted seven-day allowance is {amount}; the middle 80% of those estimates spans {lower}–{upper}. Observed movement comes from the provider. Cost-implied movement translates local activity using the price in effect when each event occurred.", "在 {count} 次合格重置中，拟合的七天额度为 {amount}；这些估计的中间 80% 范围为 {lower}–{upper}。观测变化来自提供商。成本推算变化使用每个事件发生时有效的价格换算本地活动。", "En {count} reinicios válidos, el límite ajustado de siete días es {amount}; el 80 % central de esas estimaciones abarca {lower}–{upper}. El movimiento observado procede del proveedor. El movimiento implícito por coste traduce la actividad local con el precio vigente cuando ocurrió cada evento."],
   "dashboard.calibration.withoutRange": ["The central fit implies a full 100-point allowance near {amount} API equivalent, but there is not yet a usable across-reset range. This is not a provider-published dollar cap.", "中心拟合表明完整的 100 点额度约为 {amount} 的 API 等价值，但尚无可用的跨重置区间。这不是提供商公布的美元上限。", "El ajuste central implica una asignación completa de 100 puntos cercana a {amount} de equivalente de API, pero todavía no hay un intervalo utilizable entre restablecimientos. No es un límite monetario publicado por el proveedor."],
@@ -423,6 +412,7 @@ export const WEB_MESSAGES = Object.freeze({
   // The exact-windows pager (owner-directed, 2026-08-08): the shown range of
   // the full merged inspection list.
   "residual.table.page": ["{start}–{end} of {total}", "第 {start}–{end} 项，共 {total} 项", "{start}–{end} de {total}"],
+  "weekly.table.page": ["{start}–{end} of {total}", "第 {start}–{end} 项，共 {total} 项", "{start}–{end} de {total}"],
   // The signed-AUC drift figure beside MAE and peak (owner-directed,
   // 2026-08-08). The unit is percentage-point-hours.
   "dashboard.summary.cumulativeDrift": ["Cumulative drift", "累计漂移", "Deriva acumulada"],
@@ -565,13 +555,18 @@ export const WEB_MESSAGES = Object.freeze({
   "contribution.signOutCompleted": ["Signed out. Sign in again with Google or Apple when you want to contribute.", "已退出登录。想继续贡献时，请使用 Google 或 Apple 再次登录。", "Sesión cerrada. Inicia sesión de nuevo con Google o Apple cuando quieras contribuir."],
   "contribution.signOutUnfinished": ["This unfinished sign-in was forgotten. No server session or metadata was created. Sign in again with Google or Apple when you want to contribute.", "这次未完成的登录已被忘记。没有创建服务器会话或元数据。想继续贡献时，请使用 Google 或 Apple 再次登录。", "Este inicio de sesión incompleto se olvidó. No se creó ninguna sesión de servidor ni metadatos. Inicia sesión de nuevo con Google o Apple cuando quieras contribuir."],
   "contribution.signOutFailed": ["The service could not confirm sign-out, so you are still signed in. Nothing was changed; check your connection and try again.", "服务无法确认退出登录，因此你仍处于登录状态。没有任何更改；请检查连接后重试。", "El servicio no pudo confirmar el cierre de sesión, por lo que sigues con la sesión iniciada. No se cambió nada; comprueba tu conexión e inténtalo de nuevo."],
-  "share.period.allRetained": ["all retained evidence", "全部保留证据", "toda la evidencia conservada"],
-  "share.period.cachedThirtyOneDay": ["the cached 31-day window", "缓存的 31 天窗口", "la ventana en caché de 31 días"],
-  "share.period.cachedThirtyOneDayCollector": ["the cached 31-day collector window", "缓存的 31 天收集器窗口", "la ventana del recopilador en caché de 31 días"],
-  "share.period.lastDay": ["the last 24 hours", "过去 24 小时", "las últimas 24 horas"],
-  "share.period.lastThirtyDays": ["the last 30 days", "过去 30 天", "los últimos 30 días"],
-  "share.period.lastSevenDays": ["the last 7 days", "过去 7 天", "los últimos 7 días"],
-  "share.period.recorded": ["the recorded period", "记录的期间", "el período registrado"],
+  // Standalone capitalized forms (owner-directed, 2026-08-10): the period is
+  // now the whole detail line under Recorded activity — the "event-time API
+  // equivalent" caption is gone — so the mid-sentence "the …" phrasing left
+  // with it. allRecorded is the range-selected "All" label.
+  "share.period.allRecorded": ["All recorded history", "所有记录的历史", "Todo el historial registrado"],
+  "share.period.allRetained": ["All retained evidence", "全部保留证据", "Toda la evidencia conservada"],
+  "share.period.cachedThirtyOneDay": ["Cached 31-day window", "缓存的 31 天窗口", "Ventana en caché de 31 días"],
+  "share.period.cachedThirtyOneDayCollector": ["Cached 31-day collector window", "缓存的 31 天收集器窗口", "Ventana del recopilador en caché de 31 días"],
+  "share.period.lastDay": ["Last 24 hours", "过去 24 小时", "Últimas 24 horas"],
+  "share.period.lastThirtyDays": ["Last 30 days", "过去 30 天", "Últimos 30 días"],
+  "share.period.lastSevenDays": ["Last 7 days", "过去 7 天", "Últimos 7 días"],
+  "share.period.recorded": ["Recorded period", "记录的期间", "Período registrado"],
   "share.window.fiveHour": ["five-hour allowance", "五小时额度", "asignación de cinco horas"],
   "share.window.other": ["observed allowance window", "观测到的额度窗口", "ventana de asignación observada"],
   "share.window.providerReportedDuration": ["provider-reported {duration} window", "提供方报告的 {duration} 窗口", "ventana de {duration} informada por el proveedor"],
@@ -587,7 +582,6 @@ export const WEB_MESSAGES = Object.freeze({
   "share.detail.ofWindow": ["of the {window}", "属于{window}", "de la {window}"],
   "share.detail.notApplicableToWindow": ["not calculated for this allowance window", "不针对该额度窗口计算", "no se calcula para esta ventana de asignación"],
   "share.detail.noPricedUsage": ["no priced usage was recorded", "未记录到已定价的使用量", "no se registró uso con precio"],
-  "share.detail.activityPeriod": ["{period} · event-time API equivalent", "{period} · 按事件时间计算的 API 等价值", "{period} · equivalente de API en el momento del evento"],
   "share.detail.resetRange": ["Observed reset range {lower}–{upper}", "观测到的重置范围 {lower}–{upper}", "Rango de restablecimiento observado: {lower}–{upper}"],
   "share.detail.noAcrossResetRange": ["no across-reset range yet", "尚无跨重置范围", "aún no hay intervalo entre restablecimientos"],
   "share.detail.notEnoughMatchedWindows": ["not enough matched windows yet", "尚无足够的匹配窗口", "aún no hay suficientes ventanas coincidentes"],
@@ -668,45 +662,34 @@ export const WEB_MESSAGES = Object.freeze({
   "journey.state.inProgress": ["In progress", "进行中", "En curso"],
   "journey.state.actionNeeded": ["Action needed", "需要操作", "Acción necesaria"],
   "journey.state.waiting": ["Waiting", "等待中", "En espera"],
-  "journey.app.connected": [
-    "The Mac app's companion is answering.",
-    "Mac 应用的伴随程序正在响应。",
-    "El acompañante de la app está respondiendo.",
-  ],
-  "journey.app.missing": [
-    "Open TiboTattle from Applications.",
-    "请从“应用程序”打开 TiboTattle。",
-    "Abre TiboTattle desde Aplicaciones.",
-  ],
+  // The journey strip is two boxes (owner-directed, 2026-08-10): the
+  // "Mac app & companion" stage was self-referential and its keys left with
+  // it, and the "Local evidence" observation time now rides as the index
+  // line's second clause via the …WithEvidence variants below.
   "journey.index.progress": [
     "Indexing {indexed} of {total} sources.",
     "正在索引 {total} 个来源中的第 {indexed} 个。",
     "Indexando {indexed} de {total} fuentes.",
+  ],
+  "journey.index.progressWithEvidence": [
+    "Indexing {indexed} of {total} sources · latest observation {time}.",
+    "正在索引 {total} 个来源中的第 {indexed} 个 · 最新观测 {time}。",
+    "Indexando {indexed} de {total} fuentes · última observación {time}.",
   ],
   "journey.index.complete": [
     "The discovered history is fully indexed.",
     "已发现的历史记录已全部编入索引。",
     "El historial descubierto está completamente indexado.",
   ],
+  "journey.index.completeWithEvidence": [
+    "History indexed · latest observation {time}.",
+    "历史已索引 · 最新观测 {time}。",
+    "Historial indexado · última observación {time}.",
+  ],
   "journey.index.waiting": [
     "Waiting for the first local analysis.",
     "正在等待第一次本地分析。",
     "A la espera del primer análisis local.",
-  ],
-  "journey.evidence.ready": [
-    "Latest observation {time}.",
-    "最新观测：{time}。",
-    "Última observación: {time}.",
-  ],
-  "journey.evidence.demo": [
-    "Labeled demo figures, not your usage.",
-    "这是带标注的演示数据，不是你的使用情况。",
-    "Cifras de demostración etiquetadas, no tu uso.",
-  ],
-  "journey.evidence.missing": [
-    "Analyze local usage to build evidence.",
-    "请分析本地使用情况以建立证据。",
-    "Analiza el uso local para generar evidencia.",
   ],
   "journey.community.waitingCompanion": [
     "Waiting for the Mac app first.",
@@ -835,6 +818,11 @@ export const WEB_MESSAGES = Object.freeze({
     "Last error: {code}.",
     "最近错误：{code}。",
     "Último error: {code}.",
+  ],
+  "consent.syncRetryFailed": [
+    "The retry request failed: {code}.",
+    "重试请求失败：{code}。",
+    "La solicitud de reintento falló: {code}.",
   ],
   "consent.approving": [
     "Recording your approval on this Mac…",
@@ -1083,9 +1071,7 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   ],
   // The community guided journey: stage names, the collapsed review card, and
   // the approve-once incremental consent surface.
-  "Mac app & companion": ["Mac 应用与伴随程序", "App para Mac y acompañante"],
   "Local usage index": ["本地使用索引", "Índice de uso local"],
-  "Local evidence": ["本地证据", "Evidencia local"],
   "Sign in & approve": ["登录并核准", "Iniciar sesión y aprobar"],
   "This summary is the review": ["这份摘要就是审阅", "Este resumen es la revisión"],
   "Check summary again": ["再次检查摘要", "Volver a comprobar el resumen"],
@@ -1103,6 +1089,7 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Covered: token counts, model identifiers or keyed fingerprints, tier, surface and outcome categories, timestamps, quota percentages, tool-class counts per session, and stable pseudonymous session identifiers.": ["涵盖：令牌数量、模型标识符或密钥指纹、层级、界面与结果类别、时间戳、额度百分比、每个会话的工具类别计数，以及稳定的化名会话标识符。", "Cubierto: recuentos de tokens, identificadores de modelo o huellas con clave, categorías de nivel, superficie y resultado, marcas de tiempo, porcentajes de cuota, recuentos de clases de herramientas por sesión e identificadores de sesión seudónimos estables."],
   "Never covered: prompts, responses, file names, paths, commands, or any account identifier.": ["绝不涵盖：提示词、回复、文件名、路径、命令或任何帐户标识符。", "Nunca cubierto: indicaciones, respuestas, nombres de archivo, rutas, comandos ni ningún identificador de cuenta."],
   "Review and approve": ["审阅并核准", "Revisar y aprobar"],
+  "Retry now": ["立即重试", "Reintentar ahora"],
   "Approval is asked once. Only a change to the kind of data or the destination asks again.": ["核准只询问一次。只有数据类型或目的地发生变化时才会再次询问。", "La aprobación se pide una sola vez. Solo un cambio en el tipo de datos o el destino vuelve a preguntar."],
   "Minimum observed quota span": ["最低观测额度跨度", "Intervalo mínimo de cuota observado"],
   "50+ pp": ["50+ 个百分点", "50+ pp"],
@@ -1337,7 +1324,6 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Replay-safe usage cost": ["可重放安全的使用成本", "Coste de uso seguro para reproducción"],
   "Standard-rate API prices applied to non-overlapping local token increments, then multiplied by the published Fast credit rate for increments whose effective mode is Fast. It tracks relative quota consumption; it is not a subscription charge or a published dollar limit.": ["将标准费率 API 价格应用于不重叠的本地令牌增量，再对有效模式为 Fast 的增量乘以公开的 Fast 抵扣费率。它跟踪相对额度消耗；不是订阅费用或公开的美元限额。", "Precios de API de tarifa estándar aplicados a incrementos locales de tokens no superpuestos y luego multiplicados por la tasa publicada de crédito Fast para incrementos cuyo modo efectivo es Fast. Registra el consumo relativo de cuota; no es un cargo de suscripción ni un límite en dólares publicado."],
   "Recorded period": ["记录期间", "Periodo registrado"],
-  "Awaiting local evidence": ["等待本地证据", "En espera de evidencia local"],
   "This activity total can exceed the inferred weekly limit: it spans a calendar period, while the weekly estimate describes one observed reset track and may cross resets, credits, or account changes.": ["此活动总量可能超过推断的每周限额：它跨越一个日历期间，而每周估计描述的是一个观测到的重置轨迹，并且可能跨越重置、抵扣或帐户变化。", "Este total de actividad puede superar el límite semanal inferido: abarca un período de calendario, mientras que la estimación semanal describe una trayectoria de reinicio observada y puede cruzar reinicios, créditos o cambios de cuenta."],
   "Measured versus calculated": ["实测与计算", "Medido frente a calculado"],
   "Does token cost explain the quota change?": ["令牌成本能解释额度变化吗？", "¿El coste de tokens explica el cambio de cuota?"],
@@ -1345,10 +1331,9 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Observed quota movement": ["观测到的额度变化", "Movimiento de cuota observado"],
   "Cost-implied movement": ["成本推算的变化", "Movimiento implícito por el coste"],
   "More observations are required before a useful comparison can be made.": ["需要更多观测结果才能进行有意义的比较。", "Se requieren más observaciones antes de poder realizar una comparación útil."],
-  "Central fitted rate": ["中心拟合比率", "Tasa central ajustada"],
+  "Central fitted rate · per point": ["中心拟合比率 · 每点", "Tasa central ajustada · por punto"],
   "Not estimable": ["无法估计", "No estimable"],
-  "Plausible 80% range": ["可信的 80% 范围", "Rango plausible del 80 %"],
-  "Example translation": ["示例换算", "Conversión de ejemplo"],
+  "Plausible 80% range · per point": ["可信的 80% 范围 · 每点", "Rango plausible del 80 % · por punto"],
   "This fit uses API prices as a measuring stick. It is not a provider-published dollar allowance.": ["此拟合将 API 价格用作衡量标尺。它不是提供商发布的美元额度。", "Este ajuste usa precios de API como regla de medida. No es un límite en dólares publicado por el proveedor."],
   "A results card you can post": ["可发布的结果卡片", "Una tarjeta de resultados que puedes publicar"],
   "Reference pending": ["参考待定", "Referencia pendiente"],

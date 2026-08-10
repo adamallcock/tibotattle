@@ -9,6 +9,7 @@ import {
   CODEX_WEEKLY_ALLOWANCE_MINUTES,
   demoDashboard,
   isValidQuotaWindowDuration,
+  normalizeIncrementalContributionSyncStatus,
   selectPrimaryCodexQuotaWindow
 } from "./data-client.js";
 import {
@@ -125,6 +126,15 @@ let contributionSyncAutoReviewedKey = null;
 let incrementalConsentApproved = false;
 let incrementalConsentBusy = false;
 let incrementalSyncStatus = null;
+// The optional lastOutcome.detail.code the 0.1.2 companion records beside the
+// bare outcome code, so "Last error: device credential unavailable" can be
+// stated instead of an anonymous "run_failed". The bounded normalizer keeps
+// its fixed three-field outcome, so the page reads the raw projection once
+// and holds only this one fixed-vocabulary code beside it.
+let incrementalSyncLastOutcomeDetailCode = null;
+// The manual "Retry now" lever against an inherited retry backoff
+// (owner-directed 2026-08-10): POST incremental-run, render its projection.
+let incrementalSyncRetryBusy = false;
 // The invisible review bootstrap prepares one real instance of the covered
 // data at most once per queue state, so a failing preparation cannot loop;
 // trying again is the explicit "Check again" action.
@@ -1114,59 +1124,6 @@ function localizedQuotaWindowLabel(window) {
   return t("dashboard.quota.windowOther");
 }
 
-function historyCoverageLabel(history) {
-  if (archiveHistoryScanActive) {
-    return t(history?.status === "complete"
-      ? "dashboard.pricing.historyScanningComplete"
-      : "dashboard.pricing.historyScanningPartial");
-  }
-  if (history?.status === "complete") {
-    return t("dashboard.pricing.historyComplete");
-  }
-  if (history?.errorCode === "archive_disk_space") {
-    return t("dashboard.pricing.historyDiskSpace");
-  }
-  if (history?.errorCode === "archive_storage_unavailable") {
-    return t("dashboard.pricing.historyStorageUnavailable");
-  }
-  if (history?.phase === "not_started") {
-    return t("dashboard.pricing.historyNotStarted");
-  }
-  const indexed = finite(history?.indexedSourceCount, 0);
-  const total = finite(history?.sourceCount, 0);
-  if (total > 0) {
-    return t("dashboard.pricing.historyProgress", {
-      indexed: compact(indexed),
-      total: compact(total),
-    });
-  }
-  return t("dashboard.pricing.historyResume");
-}
-
-function pricingMethodLabel(pricing) {
-  const replaySafe = finite(pricing?.replayExclusionDiagnostics?.filesScanned, 0) > 0
-    || String(pricing?.accountingSource ?? "").includes("replay");
-  if (!replaySafe) return t("dashboard.pricing.legacyProjection");
-  const key = pricing?.accountingCacheStatus === "stale"
-    ? "dashboard.pricing.staleReplaySafe"
-    : "dashboard.pricing.replaySafe";
-  return t(key);
-}
-
-function pricingRegistryProvenance(pricing) {
-  const version = typeof pricing?.registryVersion === "string"
-    && /^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/u.test(pricing.registryVersion)
-    ? pricing.registryVersion
-    : "";
-  if (!version) return "";
-  const observedAt = pricing.registryObservedAt
-    ? t("dashboard.pricing.registryObservedAt", {
-      time: formatLocal(pricing.registryObservedAt, { dateOnly: true }),
-    })
-    : "";
-  return t("dashboard.pricing.registryProvenance", { version, observedAt });
-}
-
 function renderPricing(data) {
   const pricing = data.pricing;
   const fastMode = pricing.fastMode;
@@ -1187,50 +1144,23 @@ function renderPricing(data) {
     useWeighted ? weighted : pricing.totalCostUsd,
     2
   );
-  const eventCount = finite(pricing.eventCount, 0);
-  const coverage = pricing.coveragePercent;
-  // Drawn before the provenance line, and above the early return for a period
-  // with no priced components: a figure of nothing is exactly when a reader
-  // most needs to know how little of their history is indexed. Calling it from
-  // here rather than from `renderDashboard` also means the two points where an
-  // active archive pass flips `archiveHistoryScanActive` and re-runs this
-  // renderer move the progress statement with it.
-  const historyProgressShown = renderHistoryProgress(data);
-  // One panel states the index coverage once. When the block above is showing
-  // the counted sources, the terse provenance fragment would only repeat it.
-  const history = historyProgressShown
-    ? ""
-    : historyCoverageLabel(pricing.historyCoverage);
-  const method = pricingMethodLabel(pricing);
-  const provenance = pricingRegistryProvenance(pricing);
-  const coverageElement = $("#cost-coverage");
-  const coverageKey = coverage === null
-    ? history
-      ? "dashboard.pricing.noCoverageWithHistory"
-      : "dashboard.pricing.noCoverage"
-    : history
-      ? "dashboard.pricing.coverageWithHistory"
-      : "dashboard.pricing.coverage";
-  const coverageValues = coverage === null
-      ? { history }
-      : {
-        percent: formatPercent(coverage, 1),
-        method,
-        provenance,
-        history,
-      };
-  clear(coverageElement);
-  const coverageLine = node("span", "coverage-line");
-  setRawText(coverageLine, t(coverageKey, coverageValues));
-  coverageElement.append(coverageLine);
-  // No "reviewed historical prices began on …" caveat is printed here. Every
-  // retained usage change is priced at the rate in effect when it occurred,
-  // with no start boundary, so the sentence was false. It was also the live
-  // path that rendered "Jan 1, 1970" whenever the partial-history coverage
-  // record carried no start instant.
-  coverageElement.title = eventCount > 0
-    ? t("dashboard.pricing.coverageDenominator", { count: compact(eventCount) })
-    : "";
+  // Drawn above the early return for a period with no priced components: a
+  // figure of nothing is exactly when a reader most needs to know how little
+  // of their history is indexed. Calling it from here rather than from
+  // `renderDashboard` also means the two points where an active archive pass
+  // flips `archiveHistoryScanActive` and re-runs this renderer move the
+  // progress statement with it.
+  renderHistoryProgress(data);
+  // The metadata line under the total ("100% coverage · stale replay-safe
+  // cache · price registry … · History index complete") is gone
+  // (owner-directed, 2026-08-10). Trace of its "stale replay-safe cache"
+  // fragment: the companion called the cache stale from wall-clock age since
+  // the last rebuild, while the refresh loop deliberately reuses the cache on
+  // passes that add no rollout usage — so the label condemned totals that
+  // covered every known usage record. The companion now derives staleness
+  // against the newest exportable evidence (src/local-companion-data.js), and
+  // the surviving honesty surfaces here are the history-progress block above,
+  // the routed evidence warnings, and the share card's registry provenance.
   const list = $("#cost-components");
   clear(list);
   const components = pricing.components.filter(
@@ -1503,6 +1433,10 @@ function renderComparison(data) {
   $("#comparison-result").textContent = latestMovement + seriesBand;
 }
 
+// Owner-directed restyle (2026-08-10): the fitted-rate facts render as a
+// compact stat row. Each tile holds the bare figure; its unit lives in the
+// fixed label beneath it, and the sentence-length "example translation" moved
+// into the prose below the stats — it is a sentence, not a datum.
 function renderCalibrationRate({ capacity, lower, upper, qualifyingResets = 0 }) {
   const rate = $("#calibration-rate");
   const range = $("#calibration-range");
@@ -1511,34 +1445,38 @@ function renderCalibrationRate({ capacity, lower, upper, qualifyingResets = 0 })
   if (capacity === null || capacity <= 0) {
     setProductText(rate, "Not estimable");
     setProductText(range, "Not estimable");
-    setProductText(example, "Not estimable");
+    if (example) example.hidden = true;
     setLocalizedText(explanation, "dashboard.calibration.noRate");
     return;
   }
   const perPoint = capacity / 100;
   const movementForHundred = 10_000 / capacity;
-  setLocalizedText(rate, "dashboard.calibration.perPoint", {
-    amount: formatMoney(perPoint, 2),
-  });
-  range.textContent = lower !== null && lower > 0 && upper !== null && upper > 0
-    ? t("dashboard.calibration.range", {
-      lower: formatMoney(lower / 100, 2),
-      upper: formatMoney(upper / 100, 2),
-    })
-    : t("dashboard.calibration.rangeUnavailable");
+  const hasRange = lower !== null && lower > 0 && upper !== null && upper > 0;
+  setRawText(rate, formatMoney(perPoint, 2));
+  if (hasRange) {
+    setRawText(
+      range,
+      `${formatMoney(lower / 100, 2)}–${formatMoney(upper / 100, 2)}`,
+    );
+  } else {
+    setLocalizedText(range, "dashboard.calibration.rangeUnavailable");
+  }
+  if (example) example.hidden = false;
   setLocalizedText(example, "dashboard.calibration.example", {
     points: formatDecimal(movementForHundred, 1),
   });
-  explanation.textContent = lower !== null && lower > 0 && upper !== null && upper > 0
-    ? t("dashboard.calibration.withRange", {
+  if (hasRange) {
+    setLocalizedText(explanation, "dashboard.calibration.withRange", {
       count: Math.max(1, Math.round(qualifyingResets)),
       amount: formatMoney(capacity, 0),
       lower: formatMoney(lower, 0),
       upper: formatMoney(upper, 0),
-    })
-    : t("dashboard.calibration.withoutRange", {
+    });
+  } else {
+    setLocalizedText(explanation, "dashboard.calibration.withoutRange", {
       amount: formatMoney(capacity, 0),
     });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1802,13 +1740,18 @@ function buildShareCard(data, {
   home = "",
   contractVersion = "",
   history = null,
+  activity = null,
 } = {}) {
   if (!DIAGNOSTIC_REFERENCE_PATTERN.test(reference ?? "")) {
     throw new TypeError("A results card requires a minted reference.");
   }
   const isDemo = data?.mode === "demo";
   const pricing = data?.pricing ?? {};
-  const fastMode = pricing.fastMode ?? {};
+  // The activity figure follows the usage chart's selected date range
+  // (owner-directed, 2026-08-10) whenever the accounting periods carry that
+  // range; the pricing fallback preserves the old 7-day-selected behavior
+  // for payloads without per-period accounting (the demo fixture among them).
+  const fastMode = activity?.fastMode ?? pricing.fastMode ?? {};
   // The share card's third figure is specifically the weekly reset fit. Do
   // not substitute the older general-gradient summary here: both are API-price
   // equivalents, but their evidence source and denominator are different.
@@ -1819,11 +1762,19 @@ function buildShareCard(data, {
   const remaining = finite(allowanceWindow?.remainingPercent);
   const windowLabel = shareCardWindowLabel(allowanceWindow);
 
-  const weighted = finite(pricing.quotaWeightedTotalCostUsd);
+  const weighted = activity !== null
+    ? activity.quotaWeightedTotalCostUsd
+    : finite(pricing.quotaWeightedTotalCostUsd);
   const useWeighted = weighted !== null && fastMode.weightingStatus !== "unknown";
-  const spend = useWeighted ? weighted : finite(pricing.totalCostUsd);
+  const spend = useWeighted
+    ? weighted
+    : activity !== null
+      ? activity.totalCostUsd
+      : finite(pricing.totalCostUsd);
   const excluded = finite(fastMode.unweightedUnknownApiPriceEquivalentUsd, 0);
-  const period = shareCardPeriodLabel(pricing.periodLabel);
+  const period = activity !== null
+    ? t(activity.labelKey)
+    : shareCardPeriodLabel(pricing.periodLabel);
 
   const capacity = isWeeklyWindow ? finite(
     summary.median_weekly_value_usd ?? summary.medianWeeklyValueUsd,
@@ -1872,9 +1823,10 @@ function buildShareCard(data, {
       // allowance without being a billing error or an allowance overrun.
       label: t("share.stat.recordedActivity"),
       value: spend === null ? t("share.value.notAvailable") : formatMoney(spend, 0),
-      detail: spend === null
-        ? t("share.detail.noPricedUsage")
-        : t("share.detail.activityPeriod", { period }),
+      // The "event-time API equivalent" caption is gone (owner-directed,
+      // 2026-08-10): the detail line states the selected range and nothing
+      // else.
+      detail: spend === null ? t("share.detail.noPricedUsage") : period,
     },
   ];
 
@@ -1896,7 +1848,11 @@ function buildShareCard(data, {
   } else if (fastMode.weightingStatus !== "complete") {
     caveats.push(t("share.caveat.fastPartial"));
   }
-  const coverage = finite(pricing.coveragePercent);
+  // The caveat qualifies the figure actually printed, so it reads the same
+  // selected range the activity stat does.
+  const coverage = activity !== null
+    ? activity.coveragePercent
+    : finite(pricing.coveragePercent);
   if (coverage !== null && coverage < 100) {
     caveats.push(t("share.caveat.coverage", {
       percent: formatPercent(coverage, 1),
@@ -2505,6 +2461,39 @@ function updateShareCardActions() {
  * that broke. Standalone calls (the brand-image late load) still derive the
  * model themselves and read the same active-filter state.
  */
+// The share card's activity figure follows the usage chart's selected date
+// range (owner-directed, 2026-08-10). The selection is structural — period
+// ids and fixed message keys — so no free-form label can reach the image,
+// and "All" states the honest denominator: everything recorded, not one
+// bounded window.
+const SHARE_CARD_RANGE_PERIODS = Object.freeze({
+  1: Object.freeze({ id: "24h", labelKey: "share.period.lastDay" }),
+  7: Object.freeze({ id: "7d", labelKey: "share.period.lastSevenDays" }),
+  30: Object.freeze({ id: "30d", labelKey: "share.period.lastThirtyDays" }),
+});
+
+function shareCardActivitySelection(data, rangeDays) {
+  const selected = SHARE_CARD_RANGE_PERIODS[rangeDays]
+    ?? { id: "all", labelKey: "share.period.allRecorded" };
+  const period = (Array.isArray(data?.accounting?.periods)
+    ? data.accounting.periods
+    : []).find((row) => row?.periodId === selected.id) ?? null;
+  if (period === null) return null;
+  const events = finite(period.events, 0);
+  const priced = finite(period.pricingCoverage?.fullyPricedEvents, 0)
+    + finite(period.pricingCoverage?.partiallyPricedEvents, 0);
+  return {
+    labelKey: selected.labelKey,
+    totalCostUsd: finite(period.apiPriceEquivalentUsd),
+    quotaWeightedTotalCostUsd:
+      finite(period.quotaWeightedApiPriceEquivalentUsd),
+    fastMode: period.fastMode ?? {},
+    coveragePercent: events > 0
+      ? Number(((priced / events) * 100).toFixed(6))
+      : null,
+  };
+}
+
 function renderShareCard(data, { history: sharedHistory = null } = {}) {
   const canvas = $("#share-card-canvas");
   const allowanceWindow = shareCardWindow(data?.quotaWindows ?? []);
@@ -2513,6 +2502,7 @@ function renderShareCard(data, { history: sharedHistory = null } = {}) {
     ? sharedHistory ?? allowanceHistoryChartModel(data)
     : null;
   const trend = isWeeklyWindow ? shareCardTrend(history) : null;
+  const activity = shareCardActivitySelection(data, activeUsageRangeDays);
   const signature = JSON.stringify([
     data?.mode,
     shareCardWindowKind(allowanceWindow),
@@ -2523,6 +2513,10 @@ function renderShareCard(data, { history: sharedHistory = null } = {}) {
     finite(data?.pricing?.coveragePercent),
     data?.pricing?.fastMode?.weightingStatus ?? "",
     finite(data?.pricing?.fastMode?.unweightedUnknownApiPriceEquivalentUsd, 0),
+    // A changed range selection is a different card: the activity figure,
+    // its label, and its coverage caveat all follow it.
+    activeUsageRangeDays,
+    activity,
     finite(data?.weekly?.summary?.median_weekly_value_usd
       ?? data?.weekly?.summary?.medianWeeklyValueUsd),
     // The plotted history is on the image too, so any change to the canonical
@@ -2540,6 +2534,7 @@ function renderShareCard(data, { history: sharedHistory = null } = {}) {
     contractVersion: shareCardRegistryVersion(data?.schemaVersion),
     home: shareCardHome(),
     history,
+    activity,
   });
   // The header's reference chip is gone (owner-directed, 2026-08-08): the
   // reference still exists — the saved file name carries it — but the panel
@@ -5999,10 +5994,41 @@ function renderWeekly(data) {
   renderShareCard(data, { history });
 }
 
+// The Allowance page's reset-estimate table pages through its full row set
+// (owner-directed 2026-08-10) instead of truncating to the newest fourteen:
+// twenty rows per page, newest first, same pager idiom as the exact-windows
+// inspection table. The state lives beside its renderers so the render
+// harness that extracts this section gets the whole mechanism.
+const WEEKLY_TABLE_PAGE_SIZE = 20;
+let weeklyTablePage = 0;
+let weeklyTableRows = [];
+let weeklyTableSignature = "";
+
 function renderWeeklyTable(values) {
+  // Newest first over the FULL set: the old `.slice(-14)` silently dropped
+  // every earlier reset estimate. A changed row set restarts at the first
+  // page, exactly like the exact-windows inspection table: a page index only
+  // describes a position within one row set.
+  const rows = [...values].reverse();
+  const signature = `${rows.length}`
+    + `:${rows[0]?.timestamp ?? ""}`
+    + `:${rows.at(-1)?.timestamp ?? ""}`;
+  if (signature !== weeklyTableSignature) {
+    weeklyTableSignature = signature;
+    weeklyTablePage = 0;
+  }
+  weeklyTableRows = rows;
+  renderWeeklyTablePage();
+}
+
+function renderWeeklyTablePage() {
   const table = $("#weekly-table");
+  if (!table) return;
   clear(table);
-  if (!values.length) {
+  const rows = weeklyTableRows;
+  const pagination = $("#weekly-table-pagination");
+  if (!rows.length) {
+    if (pagination) pagination.hidden = true;
     const row = node("tr");
     const cell = node("td", "empty-cell", t("weekly.table.empty"));
     cell.colSpan = 5;
@@ -6010,7 +6036,11 @@ function renderWeeklyTable(values) {
     table.append(row);
     return;
   }
-  for (const row of values.slice(-14).reverse()) {
+  const pageCount = Math.ceil(rows.length / WEEKLY_TABLE_PAGE_SIZE);
+  weeklyTablePage = Math.min(Math.max(0, weeklyTablePage), pageCount - 1);
+  const start = weeklyTablePage * WEEKLY_TABLE_PAGE_SIZE;
+  const pageRows = rows.slice(start, start + WEEKLY_TABLE_PAGE_SIZE);
+  for (const row of pageRows) {
     const span = row.observedSpanPp ?? finite(row.displayed_span_pp);
     const status = isWellObservedWeeklyFit(span)
       ? t("weekly.table.wellObserved")
@@ -6028,6 +6058,19 @@ function renderWeeklyTable(values) {
     );
     table.append(tr);
   }
+  if (!pagination) return;
+  // The pager renders only when there is something to page through; a set
+  // that fits one page keeps the plain table.
+  pagination.hidden = pageCount <= 1;
+  setLocalizedText($("#weekly-table-status"), "weekly.table.page", {
+    start: formatNumber(start + 1),
+    end: formatNumber(start + pageRows.length),
+    total: formatNumber(rows.length),
+  });
+  const previous = $("#weekly-table-prev");
+  const next = $("#weekly-table-next");
+  if (previous) previous.disabled = weeklyTablePage === 0;
+  if (next) next.disabled = weeklyTablePage >= pageCount - 1;
 }
 
 function accountingPeriod(data) {
@@ -8279,12 +8322,14 @@ const JOURNEY_STATE_KEYS = Object.freeze({
 });
 
 /**
- * The guided journey as explicit stages with visible state: app/companion →
- * index building → evidence → community. Every line is rendered from a
- * measured fact — companion health, the counted index sources (the same
- * numbers as the history progress surface), evidence freshness, and the
- * sign-in/connection facts — and each stage says plainly whether it is done,
- * in progress with real numbers, or blocked and by what.
+ * The guided journey as explicit stages with visible state: index building →
+ * community. Every line is rendered from a measured fact — the counted index
+ * sources (the same numbers as the history progress surface), evidence
+ * freshness, and the sign-in/connection facts. Trimmed from four boxes to
+ * two (owner-directed, 2026-08-10): the "Mac app & companion" box was
+ * self-referential — this dashboard rendering at all proves the companion
+ * answers — and the "Local evidence" observation time is a fact, not a
+ * stage, so it rides as the index box's second clause.
  */
 function renderCommunityJourney() {
   if (!$("#community-journey")) return;
@@ -8300,45 +8345,46 @@ function renderCommunityJourney() {
     item.className = `journey-stage journey-stage-${state}`;
   };
 
-  // 1 — the Mac app and its loopback companion.
-  if (localCompanionHealth !== null) {
-    stage("app", "done", "journey.app.connected");
-  } else {
-    stage("app", "action", "journey.app.missing");
-  }
-
-  // 2 — the local index, with the same measured counts the history progress
-  // surface reports. Nothing here estimates a finish time.
+  // 1 — the local index, with the same measured counts the history progress
+  // surface reports, plus the newest local observation as the same line's
+  // second fact. Nothing here estimates a finish time.
   const history = dashboard?.pricing?.historyCoverage
     ?? dashboard?.accounting?.historyCoverage
     ?? null;
   const totalSources = finite(history?.sourceCount, 0);
+  const observedAt = dashboard && dashboard.mode !== "demo"
+    && dashboard.freshness?.latestObservedAt
+    ? formatLocal(dashboard.freshness.latestObservedAt)
+    : null;
   if (dashboard && dashboard.mode !== "demo" && history?.status === "complete") {
-    stage("index", "done", "journey.index.complete");
+    if (observedAt === null) {
+      stage("index", "done", "journey.index.complete");
+    } else {
+      stage("index", "done", "journey.index.completeWithEvidence", {
+        time: observedAt,
+      });
+    }
   } else if (dashboard && dashboard.mode !== "demo" && totalSources > 0) {
     // The same measured counts the history progress surface reports, stated
     // as one short sentence: the two-sentence byte breakdown wrapped this
     // card to eight lines (owner-directed tightening, 2026-08-08).
-    stage("index", "progress", "journey.index.progress", {
+    const counts = {
       indexed: formatNumber(finite(history.indexedSourceCount, 0)),
       total: formatNumber(totalSources),
-    });
+    };
+    if (observedAt === null) {
+      stage("index", "progress", "journey.index.progress", counts);
+    } else {
+      stage("index", "progress", "journey.index.progressWithEvidence", {
+        ...counts,
+        time: observedAt,
+      });
+    }
   } else {
     stage("index", "waiting", "journey.index.waiting");
   }
 
-  // 3 — local evidence.
-  if (dashboard && dashboard.mode !== "demo" && dashboard.freshness?.latestObservedAt) {
-    stage("evidence", "done", "journey.evidence.ready", {
-      time: formatLocal(dashboard.freshness.latestObservedAt),
-    });
-  } else if (dashboard?.mode === "demo") {
-    stage("evidence", "action", "journey.evidence.demo");
-  } else {
-    stage("evidence", "action", "journey.evidence.missing");
-  }
-
-  // 4 — sign in, then the single review-and-approve ceremony (owner-directed
+  // 2 — sign in, then the single review-and-approve ceremony (owner-directed
   // 2026-08-08: connecting is no longer a user-visible step — the ceremony
   // pairs this Mac itself). Once approval stands the line states the flow's
   // remaining truth: it syncs automatically.
@@ -8484,6 +8530,7 @@ function renderIncrementalConsent() {
         : "consent.reviewFirst");
   }
   renderIncrementalSyncStatusLine();
+  renderIncrementalSyncRetry();
 }
 
 /**
@@ -8548,14 +8595,99 @@ function renderIncrementalSyncStatusLine() {
   }
   const outcome = incrementalSyncStatus.lastOutcome;
   // A bounded partial pass is progress, not an error; only a failed or
-  // paused outcome earns the "Last error" clause (2026-08-08).
+  // paused outcome earns the "Last error" clause (2026-08-08). When the
+  // companion recorded a specific cause beside the bare outcome code
+  // (0.1.2's lastOutcome.detail), that cause is what the reader sees:
+  // "device credential unavailable" says what to fix, "run_failed" does not.
   if (outcome !== null && ["failed", "paused"].includes(outcome.status)) {
-    parts.push(t("consent.syncLastError", { code: outcome.code }));
+    const code = incrementalSyncLastOutcomeDetailCode ?? outcome.code;
+    parts.push(t("consent.syncLastError", {
+      code: code.replaceAll("_", " "),
+    }));
   }
   // A composed multi-part sentence: raw write, like the other composed
   // status lines, so a stale registry entry cannot resurrect over it.
   setRawText(line, parts.join(" "));
   line.hidden = false;
+}
+
+// The fixed-vocabulary shape every incremental outcome code already obeys;
+// anything else stays off the page.
+const INCREMENTAL_OUTCOME_CODE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/u;
+
+function boundedOutcomeDetailCode(payload) {
+  const code = payload?.lastOutcome?.detail?.code;
+  return typeof code === "string" && INCREMENTAL_OUTCOME_CODE_PATTERN.test(code)
+    ? code
+    : null;
+}
+
+/**
+ * The manual sync lever (owner-directed 2026-08-10): visible whenever the
+ * approved engine is neither mid-pass nor paused awaiting the consent
+ * repair, because those are the states where "wait out the backoff" was the
+ * user's only option. Disabled while a pass runs or the request is in
+ * flight; the POST's own response is the same bounded projection the status
+ * line reads, so the outcome renders honestly either way.
+ */
+function renderIncrementalSyncRetry() {
+  const button = $("#incremental-sync-retry");
+  if (!button) return;
+  const status = incrementalSyncStatus;
+  const visible = incrementalSyncCapabilityAdvertised()
+    && incrementalConsentApproved
+    && status?.status === "available"
+    && !incrementalGrantRejected();
+  button.hidden = !visible;
+  if (!visible) {
+    hideIncrementalSyncRetryNote();
+    return;
+  }
+  button.disabled = status.running === true || incrementalSyncRetryBusy;
+}
+
+function hideIncrementalSyncRetryNote() {
+  const note = $("#incremental-sync-retry-note");
+  if (!note) return;
+  forgetLocalizedNode(note);
+  note.textContent = "";
+  note.hidden = true;
+}
+
+async function runIncrementalSyncNow() {
+  if (incrementalSyncRetryBusy) return;
+  incrementalSyncRetryBusy = true;
+  hideIncrementalSyncRetryNote();
+  renderIncrementalSyncRetry();
+  try {
+    // The route resets the retry ladder and starts the due pass, then
+    // returns the bounded incremental-status projection of what it did.
+    const payload =
+      await localClient.localContributionMutation("incremental-run");
+    incrementalSyncStatus =
+      normalizeIncrementalContributionSyncStatus(payload);
+    incrementalSyncLastOutcomeDetailCode = boundedOutcomeDetailCode(payload);
+    if (incrementalSyncStatus?.status === "available") {
+      incrementalConsentApproved =
+        incrementalSyncStatus.consent.approved === true
+        && incrementalSyncStatus.consent.current === true;
+    }
+    renderContributionActionState();
+    scheduleIncrementalSyncStatusPoll({ reset: true });
+  } catch (error) {
+    const note = $("#incremental-sync-retry-note");
+    if (note) {
+      const code = typeof error?.code === "string"
+        && INCREMENTAL_OUTCOME_CODE_PATTERN.test(error.code)
+        ? error.code.replaceAll("_", " ")
+        : "request_failed".replaceAll("_", " ");
+      setLocalizedText(note, "consent.syncRetryFailed", { code });
+      note.hidden = false;
+    }
+  } finally {
+    incrementalSyncRetryBusy = false;
+    renderIncrementalSyncRetry();
+  }
 }
 
 // The live-progress poll behind the first pass (owner-directed 2026-08-08).
@@ -8602,7 +8734,22 @@ async function loadIncrementalSyncStatus() {
     renderContributionActionState();
     return;
   }
-  incrementalSyncStatus = await localClient.incrementalContributionSyncStatus();
+  // The same bounded GET the client performs, read raw once so the optional
+  // lastOutcome.detail.code survives beside the normalized projection — the
+  // deliberately fixed three-field outcome shape cannot carry it. The exact
+  // exported normalizer still owns every other fact.
+  let payload = null;
+  try {
+    const response = await fetch(
+      "/api/local/contribution/incremental-status",
+      { headers: { Accept: "application/json" } },
+    );
+    payload = response.ok ? await response.json() : null;
+  } catch {
+    payload = null;
+  }
+  incrementalSyncStatus = normalizeIncrementalContributionSyncStatus(payload);
+  incrementalSyncLastOutcomeDetailCode = boundedOutcomeDetailCode(payload);
   // Only an available projection may change the consent verdict: a transient
   // read failure normalizes to a fail-closed shape whose false consent must
   // not un-approve a Mac the companion just recorded an approval for.
@@ -9249,6 +9396,9 @@ $("#incremental-review-retry").addEventListener("click", () => {
 $("#incremental-consent-approve").addEventListener("click", () => {
   void approveIncrementalContribution();
 });
+$("#incremental-sync-retry").addEventListener("click", () => {
+  void runIncrementalSyncNow();
+});
 $("#delete-contributions").addEventListener("click", () => {
   void deleteCommunityContributions();
 });
@@ -9267,6 +9417,12 @@ $("#range-controls").addEventListener("click", (event) => {
   resetUsageTimelineViewport();
   renderUsageTimeline(dashboard);
   renderComparison(dashboard);
+  // The share card's activity figure follows this same selection
+  // (owner-directed, 2026-08-10). The chart renderer owns the card
+  // re-render, so this goes through renderWeekly — the same rule the weekly
+  // range and span handlers follow — rather than a direct card call a new
+  // path could forget.
+  renderWeekly(dashboard);
 });
 $("#usage-zoom-in").addEventListener("click", () => {
   if (!dashboard) return;
@@ -9330,6 +9486,15 @@ $("#residual-page-prev").addEventListener("click", () => {
 $("#residual-page-next").addEventListener("click", () => {
   residualTablePage += 1;
   renderResidualInspectionTable();
+});
+// Same clamped-in-renderer rule for the Allowance page's reset-estimate table.
+$("#weekly-table-prev").addEventListener("click", () => {
+  weeklyTablePage -= 1;
+  renderWeeklyTablePage();
+});
+$("#weekly-table-next").addEventListener("click", () => {
+  weeklyTablePage += 1;
+  renderWeeklyTablePage();
 });
 $("#usage-group-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-group]");

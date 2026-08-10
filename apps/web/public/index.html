@@ -269,10 +269,14 @@
               increments whose effective mode is Fast. It tracks relative quota
               consumption; it is not a subscription charge or a published dollar limit.
             </p>
+            <!--
+              The coverage/provenance metadata line that sat under the total
+              was removed (owner-directed, 2026-08-10); coverage honesty now
+              lives in the history-progress block and the routed warnings.
+            -->
             <div class="cost-total">
               <span id="cost-period">Recorded period</span>
               <strong id="cost-total">—</strong>
-              <small id="cost-coverage">Awaiting local evidence</small>
             </div>
             <!--
               How much of the discovered history this figure is actually drawn
@@ -324,20 +328,24 @@
                 <strong>—</strong>
               </div>
             </div>
-            <dl class="calibration-facts" id="calibration-facts">
+            <!--
+              Owner-directed restyle (2026-08-10): the three-column table of
+              sentence-length cells is now a two-tile stat row — value
+              prominent, short label beneath — and the "example translation"
+              sentence reads as prose below the stats, because it is a
+              sentence, not a datum.
+            -->
+            <div class="calibration-stats" id="calibration-facts">
               <div>
-                <dt>Central fitted rate</dt>
-                <dd id="calibration-rate">Not estimable</dd>
+                <strong id="calibration-rate">Not estimable</strong>
+                <span>Central fitted rate · per point</span>
               </div>
               <div>
-                <dt>Plausible 80% range</dt>
-                <dd id="calibration-range">Not estimable</dd>
+                <strong id="calibration-range">Not estimable</strong>
+                <span>Plausible 80% range · per point</span>
               </div>
-              <div>
-                <dt>Example translation</dt>
-                <dd id="calibration-example">Not estimable</dd>
-              </div>
-            </dl>
+            </div>
+            <p class="annotation calibration-example" id="calibration-example" hidden></p>
             <p class="annotation calibration-explanation" id="calibration-explanation">
               This fit uses API prices as a measuring stick. It is not a
               provider-published dollar allowance.
@@ -476,6 +484,17 @@
                 <tr><td colspan="5" class="empty-cell">No weekly evidence loaded.</td></tr>
               </tbody>
             </table>
+          </div>
+          <!--
+            Pagination over the full reset-estimate row set (owner-directed,
+            2026-08-10): twenty rows per page, newest first, replacing the old
+            newest-fourteen truncation. Same pager idiom as the exact-windows
+            inspection table; the status span is written by the renderer.
+          -->
+          <div class="table-pagination" id="weekly-table-pagination" hidden>
+            <button class="button button-quiet compact" id="weekly-table-prev" type="button" disabled>Previous</button>
+            <span class="table-pagination-status" id="weekly-table-status" role="status"></span>
+            <button class="button button-quiet compact" id="weekly-table-next" type="button" disabled>Next</button>
           </div>
         </details>
       </section>
@@ -758,35 +777,20 @@
         inert
       >
         <!--
-          The guided journey, stated as stages with visible state. Every chip
-          and detail line is rendered from measured facts: companion health,
-          the counted index sources, the freshness of local evidence, and the
-          sign-in / connection state. Each detail line is one short sentence
-          (owner-directed 2026-08-08: the previous multi-clause copy wrapped
-          to eight lines at typical widths), and the whole journey states the
-          final flow: sign in → connect → approve once → syncs automatically.
+          The guided journey, stated as stages with visible state, rendered
+          from measured facts. Trimmed to two boxes (owner-directed,
+          2026-08-10): the "Mac app & companion" box was self-referential —
+          this dashboard rendering at all already proves the companion
+          answers — and the "Local evidence" observation time is a fact, not
+          a stage, so it now rides as the index box's second clause.
         -->
         <ol class="journey-stages" id="community-journey" aria-label="Contribution journey stages" data-i18n-aria-label="aria.contributionJourney">
-          <li class="journey-stage" id="journey-stage-app">
-            <p class="journey-stage-head">
-              <span class="journey-stage-name">Mac app &amp; companion</span>
-              <span class="evidence-chip neutral journey-stage-state" id="journey-stage-app-state">—</span>
-            </p>
-            <p class="journey-stage-detail" id="journey-stage-app-detail"></p>
-          </li>
           <li class="journey-stage" id="journey-stage-index">
             <p class="journey-stage-head">
               <span class="journey-stage-name">Local usage index</span>
               <span class="evidence-chip neutral journey-stage-state" id="journey-stage-index-state">—</span>
             </p>
             <p class="journey-stage-detail" id="journey-stage-index-detail"></p>
-          </li>
-          <li class="journey-stage" id="journey-stage-evidence">
-            <p class="journey-stage-head">
-              <span class="journey-stage-name">Local evidence</span>
-              <span class="evidence-chip neutral journey-stage-state" id="journey-stage-evidence-state">—</span>
-            </p>
-            <p class="journey-stage-detail" id="journey-stage-evidence-detail"></p>
           </li>
           <li class="journey-stage" id="journey-stage-community">
             <p class="journey-stage-head">
@@ -984,6 +988,19 @@
               identifier.
             -->
             <p class="annotation" id="incremental-sync-status" role="status" hidden></p>
+            <!--
+              Manual retry (owner-directed 2026-08-10): the one lever against
+              an inherited retry backoff. POSTs the 0.1.2 incremental-run
+              route, which resets the ladder and starts the due pass; the
+              response is the same bounded status projection and re-renders
+              the line above honestly.
+            -->
+            <div class="contribution-cta-buttons incremental-sync-retry-row">
+              <button class="button button-quiet" id="incremental-sync-retry" type="button" hidden>
+                Retry now
+              </button>
+            </div>
+            <p class="annotation" id="incremental-sync-retry-note" role="status" hidden></p>
             <!--
               Deletion honesty (owner-directed 2026-08-08): the card used to
               state "Deletion removes everything you contributed, always."

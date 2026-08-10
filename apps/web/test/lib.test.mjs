@@ -347,7 +347,8 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
     "formatPp", "formatChartTimeLabel", "formatTimeZoneLabel", "timelineStatusKey",
     "setRawText", "setLocalizedText", "setLocalizedPluralText", "t", "tPlural",
     "shareCardDateLabel", "ALL_HISTORY_RANGE_DAYS",
-    "$", "clear", "node", "formatLocal", "renderWeeklyPaceForecast",
+    "$", "clear", "node", "formatLocal", "formatNumber",
+    "renderWeeklyPaceForecast",
     // renderWeekly owns the share-card re-render (owner-verified regression,
     // 2026-08-08), so the hero harness stubs it like the other renderers.
     "renderShareCard",
@@ -379,6 +380,7 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
     () => {},
     () => ({ append() {}, textContent: "" }),
     (value) => new Date(value).toISOString().slice(0, 10),
+    (value) => String(value),
     () => {},
     () => {},
     rangeDays,
@@ -1489,22 +1491,40 @@ test("history coverage only becomes complete from coherent archive evidence", ()
   );
 });
 
-test("cost coverage visibly surfaces historical coverage and concise provenance", async () => {
+test("the cost card drops its metadata line while coverage honesty stays elsewhere", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const localizationSource = await readFile(
     new URL("../public/localization.js", import.meta.url),
     "utf8",
   );
-  assert.match(appSource, /historyCoverageLabel\(pricing\.historyCoverage\)/u);
+  // The "{percent} coverage · {method}{provenance} · {history}" line under
+  // the total is gone (owner-directed, 2026-08-10), together with its "stale
+  // replay-safe cache" fragment: the companion had derived that label from
+  // wall-clock cache age even though the refresh loop deliberately reuses the
+  // cache on passes with no new rollout usage, so it condemned totals that
+  // still covered every known usage record.
+  assert.doesNotMatch(html, /id="cost-coverage"/u);
+  assert.doesNotMatch(
+    appSource,
+    /cost-coverage|pricingMethodLabel|historyCoverageLabel|pricingRegistryProvenance/u,
+  );
+  assert.doesNotMatch(
+    localizationSource,
+    /dashboard\.pricing\.(?:coverage|noCoverage|replaySafe|staleReplaySafe|legacyProjection|registryProvenance|registryObservedAt|history)/u,
+  );
+  // The surviving coverage honesty surfaces: the history-progress block, the
+  // accounting page's coverage sentences, and the routed evidence warnings.
+  assert.match(appSource, /renderHistoryProgress\(data\)/u);
+  assert.match(localizationSource, /"accounting\.pricing\.partialCoverage":/u);
+  assert.match(localizationSource, /"accounting\.pricing\.coverageReviewed":/u);
+  assert.match(localizationSource, /"accounting\.pricing\.coverageShort":/u);
   // Every retained usage change is priced at the rate in effect when it
   // occurred, so no surface claims a date before which history was unpriced.
   assert.doesNotMatch(appSource, /thirtyDayCoverageWarning|coverage-warning/u);
   assert.doesNotMatch(localizationSource, /thirtyDayCoverageWarning/u);
-  assert.match(localizationSource, /"accounting\.pricing\.partialCoverage":/u);
- assert.match(localizationSource, /"accounting\.pricing\.coverageReviewed":/u);
-  assert.match(localizationSource, /"accounting\.pricing\.coverageShort":/u);
- assert.doesNotMatch(appSource, /cost-history-coverage/u);
- assert.doesNotMatch(appSource, /coverage-unpriced|unpricedTokens/u);
+  assert.doesNotMatch(appSource, /cost-history-coverage/u);
+  assert.doesNotMatch(appSource, /coverage-unpriced|unpricedTokens/u);
   assert.doesNotMatch(appSource, /pricedEventCoveragePercent[^\n]*priced/u);
 });
 
@@ -4607,8 +4627,10 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.match(appSource, /timelineStatusLabel/);
   // The `recent_7d_partial` pin lived in the preparation preflight estimate,
   // which left with the prepare flow (owner-directed, 2026-08-08); partial
-  // index handling stays pinned through the coverage labels below.
-  assert.match(appSource, /historyCoverageLabel|thirtyDayCoverageWarning/u);
+  // index handling stays pinned through the measured history-progress block
+  // (the terse coverage labels left with the cost card's metadata line,
+  // owner-directed 2026-08-10).
+  assert.match(appSource, /renderHistoryProgress\(data\)/u);
   assert.match(appSource, /chart\.status\.resetOrTrackChange/u);
   assert.match(appSource, /chart\.status\.backwardOrAmbiguous/u);
   assert.match(appSource, /Calculating usage and allowance/);
@@ -4657,9 +4679,10 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.match(styles, /\.primary-nav \{[\s\S]*overflow-x: auto;/);
 });
 
-test("default calibration view explains the fitted rate and uncertainty plainly", async () => {
+test("default calibration view renders a stat row and keeps the example as prose", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
   for (const id of [
     "calibration-rate",
     "calibration-range",
@@ -4668,10 +4691,21 @@ test("default calibration view explains the fitted rate and uncertainty plainly"
   ]) {
     assert.match(html, new RegExp(`id="${id}"`));
   }
+  // Owner-directed restyle (2026-08-10): the three-column definition list of
+  // sentence-length cells is a two-tile stat row — figure prominent, short
+  // label beneath — and the "example translation" sentence reads as prose
+  // under the stats rather than as a third squeezed column.
+  assert.match(html, /class="calibration-stats" id="calibration-facts"/u);
+  assert.doesNotMatch(html, /<dl class="calibration-facts"|<dt>Central fitted rate<\/dt>|Example translation/u);
+  assert.match(html, /<span>Central fitted rate · per point<\/span>/u);
+  assert.match(html, /<span>Plausible 80% range · per point<\/span>/u);
+  assert.match(styles, /\.calibration-stats strong \{[^\n}]*font-family: var\(--serif\)/u);
   assert.match(appSource, /function renderCalibrationRate/);
-  assert.match(appSource, /"dashboard\.calibration\.perPoint"/u);
-  assert.match(appSource, /t\("dashboard\.calibration\.withRange"/u);
-  assert.match(appSource, /t\("dashboard\.calibration\.withoutRange"/u);
+  assert.doesNotMatch(appSource, /dashboard\.calibration\.perPoint|dashboard\.calibration\.range"/u);
+  assert.match(appSource, /setLocalizedText\(example, "dashboard\.calibration\.example"/u);
+  assert.match(appSource, /"dashboard\.calibration\.rangeUnavailable"/u);
+  assert.match(appSource, /"dashboard\.calibration\.withRange"/u);
+  assert.match(appSource, /"dashboard\.calibration\.withoutRange"/u);
 });
 
 test("weekly view keeps the default surface to the estimate and its reset history", async () => {
@@ -4692,7 +4726,10 @@ test("weekly view keeps pricing provenance with accounting and removes the obsol
   assert.doesNotMatch(html, /id="weekly-pricing-receipt"|Price basis for the visible fits/iu);
   assert.doesNotMatch(appSource, /function renderWeeklyPricingReceipt|renderWeeklyPricingReceipt\(/u);
   assert.doesNotMatch(styles, /\.weekly-pricing-receipt/u);
-  assert.match(appSource, /pricingRegistryProvenance\(pricing\)/u);
+  // The overview's registry-provenance fragment left with the cost card's
+  // metadata line (owner-directed, 2026-08-10); the share card remains the
+  // surface that publishes the price-registry version.
+  assert.match(appSource, /shareCardRegistryVersion\(data\?\.pricing\?\.registryVersion\)/u);
 });
 
 test("weekly keeps every fit visible and marks short observations separately", async () => {
@@ -5501,8 +5538,10 @@ test("the weekly allowance chart leads the dashboard", async () => {
 test("weekly details keep reset evidence concise and do not present speed coverage as known", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  // Both halves of the paginated presentation (owner-directed 2026-08-10):
+  // the row-set holder and the page renderer beneath it.
   const tableMatch = appSource.match(
-    /function renderWeeklyTable\(values\) \{([\s\S]*?)\n\}/u,
+    /function renderWeeklyTable\(values\) \{([\s\S]*?)\nfunction accountingPeriod\(data\)/u,
   );
   assert.ok(tableMatch, "renderWeeklyTable source is available for contract review");
   const tableSource = tableMatch[1];
@@ -5814,8 +5853,16 @@ test("the page never schedules uploads itself; recurrence is the approved compan
     /sessionStorage|localStorage/u,
   );
   assert.doesNotMatch(appSource, /automaticContributionStatus|enableAutomaticContribution|disableAutomaticContribution/u);
-  // The status line is read-only: a GET the client normalizes fail-closed.
-  assert.match(appSource, /localClient\.incrementalContributionSyncStatus\(\)/u);
+  // The status line is read-only: the same bounded GET the client performs,
+  // read raw once so 0.1.2's lastOutcome.detail.code survives, then passed
+  // through the client's own exported fail-closed normalizer
+  // (owner-directed, 2026-08-10).
+  assert.match(appSource, /"\/api\/local\/contribution\/incremental-status"/u);
+  assert.match(
+    appSource,
+    /normalizeIncrementalContributionSyncStatus\(payload\)/u,
+  );
+  assert.match(appSource, /boundedOutcomeDetailCode\(payload\)/u);
   assert.doesNotMatch(appSource, /setInterval\(/u);
 });
 
@@ -5894,9 +5941,12 @@ test("the community journey states its stages and gates effort behind sign-in an
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
-  // The four stages, in journey order, at the top of the community section:
-  // app/companion → index building → evidence → sign in & approve.
-  const stagePositions = ["app", "index", "evidence", "community"].map((name) => {
+  // Two stages, in journey order, at the top of the community section
+  // (owner-directed 2026-08-10): index building → sign in & approve. The
+  // "Mac app & companion" box was self-referential — the dashboard rendering
+  // at all proves the companion answers — and the "Local evidence"
+  // observation time rides as the index box's second clause.
+  const stagePositions = ["index", "community"].map((name) => {
     const id = `id="journey-stage-${name}"`;
     assert.match(html, new RegExp(id, "u"));
     assert.match(html, new RegExp(`id="journey-stage-${name}-state"`, "u"));
@@ -5904,6 +5954,12 @@ test("the community journey states its stages and gates effort behind sign-in an
     return html.indexOf(id);
   });
   assert.deepEqual(stagePositions, [...stagePositions].sort((a, b) => a - b));
+  assert.doesNotMatch(html, /journey-stage-app|journey-stage-evidence/u);
+  assert.doesNotMatch(appSource, /journey\.app\.|journey\.evidence\./u);
+  assert.match(
+    appSource,
+    /stage\("index", "done", "journey\.index\.completeWithEvidence", \{/u,
+  );
   // Authorization state is visible before the action buttons: the strip
   // precedes the sign-in block, which precedes the approve-once surface
   // (re-pinned 2026-08-08: the prepare/review disclosure is removed).
@@ -5918,7 +5974,7 @@ test("the community journey states its stages and gates effort behind sign-in an
   // two-sentence byte breakdown that wrapped the card to eight lines.
   assert.match(
     appSource,
-    /stage\("index", "progress", "journey\.index\.progress", \{/u,
+    /stage\("index", "progress", "journey\.index\.progress", counts\);/u,
   );
   // Re-pinned 2026-08-08 (one-step flow): journey.community.connectNext left
   // with the connect step; the signed-in state points straight at the single
@@ -5926,9 +5982,9 @@ test("the community journey states its stages and gates effort behind sign-in an
   // not advertised the v1.0 transport yet.
   for (const locale of SUPPORTED_LOCALES) {
     for (const key of [
-      "journey.app.connected",
-      "journey.app.missing",
       "journey.index.complete",
+      "journey.index.completeWithEvidence",
+      "journey.index.progressWithEvidence",
       "journey.index.waiting",
       "journey.community.signInFirst",
       "journey.community.waitingIndex",
@@ -7188,11 +7244,17 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   // The whole of the dashboard the card is allowed to see. Everything here is
   // a number, a fixed enumeration, or a version identifier; no field carries
   // user text, and a card that started reading one would fail this list.
+  // data.accounting.periods joined 2026-08-10 (owner-directed): the activity
+  // figure follows the usage chart's selected range, and the selection reads
+  // only per-period numbers, the fastMode enum, and pricing-coverage counts,
+  // then labels the range through fixed message keys — never a payload label.
   assert.deepEqual(
     [...new Set(
       [...section.matchAll(/data\??\.[A-Za-z]+(?:\?\.[A-Za-z]+)*/gu)].map((match) => match[0]),
     )].sort(),
     [
+      "data.accounting",
+      "data?.accounting?.periods",
       "data?.mode",
       "data?.pricing",
       "data?.pricing?.coveragePercent",
@@ -7348,7 +7410,17 @@ test("a posted results card can carry only fixed copy and formatted figures", as
       "Recorded period",
     ],
   );
-  assert.match(section, /const period = shareCardPeriodLabel\(pricing\.periodLabel\);/u);
+  // The range-selected label comes from the fixed SHARE_CARD_RANGE_PERIODS
+  // key map (owner-directed, 2026-08-10); the payload's own period label
+  // remains the fallback and still passes through the fixed vocabulary.
+  assert.match(
+    section,
+    /const period = activity !== null\s*\n\s*\? t\(activity\.labelKey\)\s*\n\s*: shareCardPeriodLabel\(pricing\.periodLabel\);/u,
+  );
+  assert.match(
+    section,
+    /const SHARE_CARD_RANGE_PERIODS = Object\.freeze\(\{/u,
+  );
   assert.equal(
     section.match(/pricing\.periodLabel/gu).length,
     1,
