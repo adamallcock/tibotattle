@@ -9,6 +9,7 @@ import {
   CODEX_WEEKLY_ALLOWANCE_MINUTES,
   demoDashboard,
   isValidQuotaWindowDuration,
+  normalizeIncrementalContributionSyncStatus,
   selectPrimaryCodexQuotaWindow
 } from "./data-client.js";
 import {
@@ -125,6 +126,15 @@ let contributionSyncAutoReviewedKey = null;
 let incrementalConsentApproved = false;
 let incrementalConsentBusy = false;
 let incrementalSyncStatus = null;
+// The optional lastOutcome.detail.code the 0.1.2 companion records beside the
+// bare outcome code, so "Last error: device credential unavailable" can be
+// stated instead of an anonymous "run_failed". The bounded normalizer keeps
+// its fixed three-field outcome, so the page reads the raw projection once
+// and holds only this one fixed-vocabulary code beside it.
+let incrementalSyncLastOutcomeDetailCode = null;
+// The manual "Retry now" lever against an inherited retry backoff
+// (owner-directed 2026-08-10): POST incremental-run, render its projection.
+let incrementalSyncRetryBusy = false;
 // The invisible review bootstrap prepares one real instance of the covered
 // data at most once per queue state, so a failing preparation cannot loop;
 // trying again is the explicit "Check again" action.
@@ -8415,6 +8425,7 @@ function renderIncrementalConsent() {
         : "consent.reviewFirst");
   }
   renderIncrementalSyncStatusLine();
+  renderIncrementalSyncRetry();
 }
 
 /**
@@ -8479,14 +8490,99 @@ function renderIncrementalSyncStatusLine() {
   }
   const outcome = incrementalSyncStatus.lastOutcome;
   // A bounded partial pass is progress, not an error; only a failed or
-  // paused outcome earns the "Last error" clause (2026-08-08).
+  // paused outcome earns the "Last error" clause (2026-08-08). When the
+  // companion recorded a specific cause beside the bare outcome code
+  // (0.1.2's lastOutcome.detail), that cause is what the reader sees:
+  // "device credential unavailable" says what to fix, "run_failed" does not.
   if (outcome !== null && ["failed", "paused"].includes(outcome.status)) {
-    parts.push(t("consent.syncLastError", { code: outcome.code }));
+    const code = incrementalSyncLastOutcomeDetailCode ?? outcome.code;
+    parts.push(t("consent.syncLastError", {
+      code: code.replaceAll("_", " "),
+    }));
   }
   // A composed multi-part sentence: raw write, like the other composed
   // status lines, so a stale registry entry cannot resurrect over it.
   setRawText(line, parts.join(" "));
   line.hidden = false;
+}
+
+// The fixed-vocabulary shape every incremental outcome code already obeys;
+// anything else stays off the page.
+const INCREMENTAL_OUTCOME_CODE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/u;
+
+function boundedOutcomeDetailCode(payload) {
+  const code = payload?.lastOutcome?.detail?.code;
+  return typeof code === "string" && INCREMENTAL_OUTCOME_CODE_PATTERN.test(code)
+    ? code
+    : null;
+}
+
+/**
+ * The manual sync lever (owner-directed 2026-08-10): visible whenever the
+ * approved engine is neither mid-pass nor paused awaiting the consent
+ * repair, because those are the states where "wait out the backoff" was the
+ * user's only option. Disabled while a pass runs or the request is in
+ * flight; the POST's own response is the same bounded projection the status
+ * line reads, so the outcome renders honestly either way.
+ */
+function renderIncrementalSyncRetry() {
+  const button = $("#incremental-sync-retry");
+  if (!button) return;
+  const status = incrementalSyncStatus;
+  const visible = incrementalSyncCapabilityAdvertised()
+    && incrementalConsentApproved
+    && status?.status === "available"
+    && !incrementalGrantRejected();
+  button.hidden = !visible;
+  if (!visible) {
+    hideIncrementalSyncRetryNote();
+    return;
+  }
+  button.disabled = status.running === true || incrementalSyncRetryBusy;
+}
+
+function hideIncrementalSyncRetryNote() {
+  const note = $("#incremental-sync-retry-note");
+  if (!note) return;
+  forgetLocalizedNode(note);
+  note.textContent = "";
+  note.hidden = true;
+}
+
+async function runIncrementalSyncNow() {
+  if (incrementalSyncRetryBusy) return;
+  incrementalSyncRetryBusy = true;
+  hideIncrementalSyncRetryNote();
+  renderIncrementalSyncRetry();
+  try {
+    // The route resets the retry ladder and starts the due pass, then
+    // returns the bounded incremental-status projection of what it did.
+    const payload =
+      await localClient.localContributionMutation("incremental-run");
+    incrementalSyncStatus =
+      normalizeIncrementalContributionSyncStatus(payload);
+    incrementalSyncLastOutcomeDetailCode = boundedOutcomeDetailCode(payload);
+    if (incrementalSyncStatus?.status === "available") {
+      incrementalConsentApproved =
+        incrementalSyncStatus.consent.approved === true
+        && incrementalSyncStatus.consent.current === true;
+    }
+    renderContributionActionState();
+    scheduleIncrementalSyncStatusPoll({ reset: true });
+  } catch (error) {
+    const note = $("#incremental-sync-retry-note");
+    if (note) {
+      const code = typeof error?.code === "string"
+        && INCREMENTAL_OUTCOME_CODE_PATTERN.test(error.code)
+        ? error.code.replaceAll("_", " ")
+        : "request_failed".replaceAll("_", " ");
+      setLocalizedText(note, "consent.syncRetryFailed", { code });
+      note.hidden = false;
+    }
+  } finally {
+    incrementalSyncRetryBusy = false;
+    renderIncrementalSyncRetry();
+  }
 }
 
 // The live-progress poll behind the first pass (owner-directed 2026-08-08).
@@ -8533,7 +8629,22 @@ async function loadIncrementalSyncStatus() {
     renderContributionActionState();
     return;
   }
-  incrementalSyncStatus = await localClient.incrementalContributionSyncStatus();
+  // The same bounded GET the client performs, read raw once so the optional
+  // lastOutcome.detail.code survives beside the normalized projection — the
+  // deliberately fixed three-field outcome shape cannot carry it. The exact
+  // exported normalizer still owns every other fact.
+  let payload = null;
+  try {
+    const response = await fetch(
+      "/api/local/contribution/incremental-status",
+      { headers: { Accept: "application/json" } },
+    );
+    payload = response.ok ? await response.json() : null;
+  } catch {
+    payload = null;
+  }
+  incrementalSyncStatus = normalizeIncrementalContributionSyncStatus(payload);
+  incrementalSyncLastOutcomeDetailCode = boundedOutcomeDetailCode(payload);
   // Only an available projection may change the consent verdict: a transient
   // read failure normalizes to a fail-closed shape whose false consent must
   // not un-approve a Mac the companion just recorded an approval for.
@@ -9179,6 +9290,9 @@ $("#incremental-review-retry").addEventListener("click", () => {
 });
 $("#incremental-consent-approve").addEventListener("click", () => {
   void approveIncrementalContribution();
+});
+$("#incremental-sync-retry").addEventListener("click", () => {
+  void runIncrementalSyncNow();
 });
 $("#delete-contributions").addEventListener("click", () => {
   void deleteCommunityContributions();

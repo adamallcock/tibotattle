@@ -814,6 +814,11 @@ export const WEB_MESSAGES = Object.freeze({
     "最近错误：{code}。",
     "Último error: {code}.",
   ],
+  "consent.syncRetryFailed": [
+    "The retry request failed: {code}.",
+    "重试请求失败：{code}。",
+    "La solicitud de reintento falló: {code}.",
+  ],
   "consent.approving": [
     "Recording your approval on this Mac…",
     "正在这台 Mac 上记录你的核准…",
@@ -1079,6 +1084,7 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Covered: token counts, model identifiers or keyed fingerprints, tier, surface and outcome categories, timestamps, quota percentages, tool-class counts per session, and stable pseudonymous session identifiers.": ["涵盖：令牌数量、模型标识符或密钥指纹、层级、界面与结果类别、时间戳、额度百分比、每个会话的工具类别计数，以及稳定的化名会话标识符。", "Cubierto: recuentos de tokens, identificadores de modelo o huellas con clave, categorías de nivel, superficie y resultado, marcas de tiempo, porcentajes de cuota, recuentos de clases de herramientas por sesión e identificadores de sesión seudónimos estables."],
   "Never covered: prompts, responses, file names, paths, commands, or any account identifier.": ["绝不涵盖：提示词、回复、文件名、路径、命令或任何帐户标识符。", "Nunca cubierto: indicaciones, respuestas, nombres de archivo, rutas, comandos ni ningún identificador de cuenta."],
   "Review and approve": ["审阅并核准", "Revisar y aprobar"],
+  "Retry now": ["立即重试", "Reintentar ahora"],
   "Approval is asked once. Only a change to the kind of data or the destination asks again.": ["核准只询问一次。只有数据类型或目的地发生变化时才会再次询问。", "La aprobación se pide una sola vez. Solo un cambio en el tipo de datos o el destino vuelve a preguntar."],
   "Minimum observed quota span": ["最低观测额度跨度", "Intervalo mínimo de cuota observado"],
   "50+ pp": ["50+ 个百分点", "50+ pp"],

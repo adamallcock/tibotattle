@@ -978,6 +978,19 @@
             -->
             <p class="annotation" id="incremental-sync-status" role="status" hidden></p>
             <!--
+              Manual retry (owner-directed 2026-08-10): the one lever against
+              an inherited retry backoff. POSTs the 0.1.2 incremental-run
+              route, which resets the ladder and starts the due pass; the
+              response is the same bounded status projection and re-renders
+              the line above honestly.
+            -->
+            <div class="contribution-cta-buttons incremental-sync-retry-row">
+              <button class="button button-quiet" id="incremental-sync-retry" type="button" hidden>
+                Retry now
+              </button>
+            </div>
+            <p class="annotation" id="incremental-sync-retry-note" role="status" hidden></p>
+            <!--
               Deletion honesty (owner-directed 2026-08-08): the card used to
               state "Deletion removes everything you contributed, always."
               with no control behind it. The sentence is gone; in its place

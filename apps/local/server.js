@@ -1613,7 +1613,18 @@ function incrementalSyncStatusProjection(value, { configured = false } = {}) {
     lastAttemptAt: nullableInstant(value.lastAttemptAt),
     nextAttemptAt: nullableInstant(value.nextAttemptAt),
     lastOutcome: outcomeValid
-      ? { at: nullableInstant(outcome.at), code: outcome.code, status: outcome.status }
+      ? {
+        at: nullableInstant(outcome.at),
+        code: outcome.code,
+        status: outcome.status,
+        // The engine's recorded cause beside the bare outcome code (0.1.2),
+        // code only — the scrubbed message stays out of the projection. This
+        // is what lets the dashboard say "device credential unavailable"
+        // instead of an anonymous "run_failed".
+        ...(INCREMENTAL_SYNC_OUTCOME_CODE.test(outcome.detail?.code ?? "")
+          ? { detail: { code: outcome.detail.code } }
+          : {}),
+      }
       : null,
   };
 }

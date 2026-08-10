@@ -129,7 +129,15 @@ function fakeIncrementalController() {
     lastAttemptAt: null,
     nextAttemptAt: approved ? "2026-08-03T00:00:00.000Z" : null,
     lastOutcome: approved
-      ? { at: "2026-08-03T00:00:00.000Z", code: "partial_progress", status: "partial" }
+      ? {
+        at: "2026-08-03T00:00:00.000Z",
+        code: "partial_progress",
+        status: "partial",
+        // The 0.1.2 recorded cause: the code must survive the projection so
+        // the dashboard can name it, and the message must never leave the
+        // companion — it is the canary the body assertions check for.
+        detail: { code: "device_credential_unavailable", message: PRIVATE_CANARY },
+      }
       : null,
     privatePath: PRIVATE_CANARY,
   });
@@ -296,6 +304,7 @@ test("the status route reports bounded progress and never a path", async () => {
         at: "2026-08-03T00:00:00.000Z",
         code: "partial_progress",
         status: "partial",
+        detail: { code: "device_credential_unavailable" },
       },
       includesContent: false,
       includesPaths: false,

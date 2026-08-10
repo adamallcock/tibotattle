@@ -5849,8 +5849,16 @@ test("the page never schedules uploads itself; recurrence is the approved compan
     /sessionStorage|localStorage/u,
   );
   assert.doesNotMatch(appSource, /automaticContributionStatus|enableAutomaticContribution|disableAutomaticContribution/u);
-  // The status line is read-only: a GET the client normalizes fail-closed.
-  assert.match(appSource, /localClient\.incrementalContributionSyncStatus\(\)/u);
+  // The status line is read-only: the same bounded GET the client performs,
+  // read raw once so 0.1.2's lastOutcome.detail.code survives, then passed
+  // through the client's own exported fail-closed normalizer
+  // (owner-directed, 2026-08-10).
+  assert.match(appSource, /"\/api\/local\/contribution\/incremental-status"/u);
+  assert.match(
+    appSource,
+    /normalizeIncrementalContributionSyncStatus\(payload\)/u,
+  );
+  assert.match(appSource, /boundedOutcomeDetailCode\(payload\)/u);
   assert.doesNotMatch(appSource, /setInterval\(/u);
 });
 
