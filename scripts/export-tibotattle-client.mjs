@@ -175,6 +175,10 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/local-companion-usage-model.js",
   "src/local-legacy-report-storage.js",
   "src/local-unified-companion-source.js",
+  // Reviewed 2026-08-10: pure windowed repricing over the local index for
+  // the divergence panel's per-period cost mix — no content, paths, or
+  // identifiers beyond what the companion already exports.
+  "src/local-unified-window-breakdown.js",
   "src/local-unified-index-build.js",
   "src/local-unified-index-extract.js",
   "src/local-unified-index-ingest.js",
