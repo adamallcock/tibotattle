@@ -85,7 +85,10 @@ async function buildCommunityDailyAggregate(
         COALESCE(SUM(r.output_text_tokens), 0) AS output_text_tokens,
         COALESCE(SUM(r.output_reasoning_tokens), 0)
           AS output_reasoning_tokens,
-        COALESCE(SUM(r.output_combined_tokens), 0) AS output_combined_tokens
+        COALESCE(SUM(COALESCE(r.output_combined_tokens,
+          COALESCE(r.output_text_tokens, 0)
+            + COALESCE(r.output_reasoning_tokens, 0))), 0)
+          AS output_combined_tokens
        FROM telemetry_v1_records r
        JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
        WHERE r.observed_day = ?`,
@@ -101,7 +104,10 @@ async function buildCommunityDailyAggregate(
         COALESCE(SUM(r.output_text_tokens), 0) AS output_text_tokens,
         COALESCE(SUM(r.output_reasoning_tokens), 0)
           AS output_reasoning_tokens,
-        COALESCE(SUM(r.output_combined_tokens), 0) AS output_combined_tokens
+        COALESCE(SUM(COALESCE(r.output_combined_tokens,
+          COALESCE(r.output_text_tokens, 0)
+            + COALESCE(r.output_reasoning_tokens, 0))), 0)
+          AS output_combined_tokens
        FROM telemetry_v1_records r
        JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
        WHERE r.observed_day = ? AND r.stream = 'usage'
