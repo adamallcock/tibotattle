@@ -280,21 +280,62 @@ export function createTelemetryV1IndexReader(database, {
     FROM quota_observation
     WHERE observed_at_ms >= ? AND observed_at_ms < ?
     ORDER BY observed_at_ms, limit_id, slot`);
-  const sessionStatement = database.prepare(`
+  // One corpus-wide GROUP BY, cached across days. The previous per-day
+  // statement re-grouped every usage_event row (a string-keyed scan) for
+  // every derived day, which made a first full-history pass quadratic in
+  // corpus size and pinned the companion's event loop for its whole
+  // duration (observed live 2026-08-10: sqlite3BlobCompare dominating a
+  // 99%-CPU spin). The global ordering (first_ms, session_local) restricted
+  // to a day's range is exactly the order the per-day statement produced,
+  // so derived chunk digests are unchanged.
+  const allSessionsStatement = database.prepare(`
     SELECT u.session_local AS session_local,
            MIN(u.observed_at_ms) AS first_ms,
            ${identityColumn} AS session_uuid
     FROM usage_event u
     ${identityJoin}
     GROUP BY u.session_local
-    HAVING MIN(u.observed_at_ms) >= ? AND MIN(u.observed_at_ms) < ?
     ORDER BY first_ms, u.session_local`);
-  const toolClassStatement = toolClassAvailable
+  let sessionFirstsCache = null;
+  function sessionFirsts() {
+    sessionFirstsCache ??= allSessionsStatement.all();
+    return sessionFirstsCache;
+  }
+  // Same treatment for tool-class counts: one ordered scan into a map
+  // instead of one indexed-by-nothing lookup per session per day. Rows are
+  // pre-ordered by tool_class within each session, matching the order the
+  // per-session statement produced.
+  const allToolClassStatement = toolClassAvailable
     ? database.prepare(`
-      SELECT tool_class, count FROM tool_class_count
-      WHERE session_local = ?
-      ORDER BY tool_class`)
+      SELECT session_local, tool_class, count FROM tool_class_count
+      ORDER BY session_local, tool_class`)
     : null;
+  // session_local is stored as a BLOB, which node:sqlite surfaces as a fresh
+  // Uint8Array per row — a Map keyed on the raw value would compare by
+  // reference and never hit. Key on a canonical string encoding instead.
+  function sessionKey(value) {
+    return typeof value === "string"
+      ? `s:${value}`
+      : `b:${Buffer.from(value).toString("hex")}`;
+  }
+  let toolClassCache = null;
+  function toolClassBySession() {
+    if (toolClassCache === null) {
+      toolClassCache = new Map();
+      if (allToolClassStatement !== null) {
+        for (const row of allToolClassStatement.all()) {
+          const key = sessionKey(row.session_local);
+          const rows = toolClassCache.get(key);
+          if (rows === undefined) {
+            toolClassCache.set(key, [row]);
+          } else {
+            rows.push(row);
+          }
+        }
+      }
+    }
+    return toolClassCache;
+  }
   const daysStatement = database.prepare(`
     SELECT DISTINCT day FROM (
       SELECT date(observed_at_ms / 1000, 'unixepoch') AS day FROM usage_event
@@ -430,7 +471,8 @@ export function createTelemetryV1IndexReader(database, {
     const { startMs, endMs } = dayBounds(day);
     const records = [];
     let excluded = 0;
-    for (const row of sessionStatement.all(startMs, endMs)) {
+    for (const row of sessionFirsts()) {
+      if (row.first_ms < startMs || row.first_ms >= endMs) continue;
       const sessionUuid = sessionUuidFor(row);
       if (sessionUuid === null) {
         excluded += 1;
@@ -439,8 +481,8 @@ export function createTelemetryV1IndexReader(database, {
       const toolClassCounts = {};
       let entries = 0;
       let invalid = false;
-      if (toolClassStatement !== null) {
-        for (const tool of toolClassStatement.all(row.session_local)) {
+      if (allToolClassStatement !== null) {
+        for (const tool of toolClassBySession().get(sessionKey(row.session_local)) ?? []) {
           const count = Number(tool.count);
           if (typeof tool.tool_class !== "string"
               || !TOOL_CLASS_KEY.test(tool.tool_class)

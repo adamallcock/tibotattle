@@ -260,10 +260,12 @@ function addDays(day, count) {
  * second derivation exact — a digest that no longer matches means the index
  * advanced mid-pass, which ends the pass rather than shipping mixed content.
  */
-function deriveLocalDays(reader) {
-  return reader.days().map((day) => {
+async function deriveLocalDays(reader) {
+  const days = reader.days();
+  const derivedDays = [];
+  for (const day of days) {
     const derived = reader.deriveDay(day);
-    return {
+    derivedDays.push({
       day: derived.day,
       dayDigest: derived.dayDigest,
       chunks: derived.chunks.map((chunk) => ({
@@ -273,8 +275,14 @@ function deriveLocalDays(reader) {
         chunkDigest: chunk.chunkDigest,
         recordCount: chunk.recordCount,
       })),
-    };
-  });
+    });
+    // One breath per derived day: a first full-history pass runs across the
+    // whole corpus, and without this yield it starves the companion's event
+    // loop for the entire derivation — dashboard, menu bar, and diagnostics
+    // all read as dead while the pass runs (observed live 2026-08-10).
+    await new Promise((resolveDay) => setImmediate(resolveDay));
+  }
+  return derivedDays;
 }
 
 function tailPlan(localDays, acknowledgedThroughDay) {
@@ -402,7 +410,7 @@ export async function runIncrementalContributionSyncOnce({
       reasoningEffortName,
       fallbackParserVersion: LOCAL_UNIFIED_INDEX_PARSER_VERSION,
     });
-    const localDays = deriveLocalDays(reader);
+    const localDays = await deriveLocalDays(reader);
     daysTotal = localDays.length;
 
     const deviceHeaders = (secret, binding) => ({
