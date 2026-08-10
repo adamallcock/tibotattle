@@ -628,12 +628,18 @@ export function validateCandidateAppcastShape(text, channelName, {
  * the exact official document shape the Worker guard accepts, and enclosure
  * consistency with the release DMG bytes) with named failure reasons.
  *
- * Scoped to the reviewed full-only stable policy: the injectable
- * delta-enabled policy seam (specs only) bypasses this preflight because
- * scripts/sparkle-signed-feed-validation.js must be extended for a
- * delta-carrying signed feed before that policy flip can ever land.
+ * This preflight runs UNCONDITIONALLY for the stable channel — the trailer
+ * requirement is a property of the installed fleet (SURequireSignedFeed),
+ * not of the delta policy, so no policy value may disable it. Because
+ * scripts/sparkle-signed-feed-validation.js only understands the pinned
+ * full-only official generate_appcast shape today, a delta-enabled stable
+ * policy (allowDeltaFrom: true) FAILS CLOSED here with a named error instead
+ * of silently skipping validation: extend the validator (and the Worker
+ * guard's official parser) for delta-carrying signed feeds before flipping
+ * config/sparkle-appcast-policy.js.
  */
 function assertStableCandidateFeedSigned({
+  appcastPolicy,
   appcastText,
   channel,
   dmgBytes,
@@ -646,6 +652,12 @@ function assertStableCandidateFeedSigned({
     fail(
       "Stable appcast candidate is not feed-signed: installed clients set SURequireSignedFeed and would refuse it. Generate the stable appcast with scripts/generate-sparkle-appcast.js --channel stable, which drives the pinned official generate_appcast and embeds the signed sparkle-signatures trailer.",
       "SPARKLE_UPDATE_STABLE_FEED_UNSIGNED",
+    );
+  }
+  if (appcastPolicy.allowDeltaFrom === true) {
+    fail(
+      "Stable delta publication is enabled by the appcast policy, but the signed-feed preflight only validates the full-only official generate_appcast shape. Extend scripts/sparkle-signed-feed-validation.js (and the Worker guard's official parser) for delta-carrying signed feeds before enabling allowDeltaFrom for the stable channel.",
+      "SPARKLE_UPDATE_STABLE_DELTA_FEED_VALIDATION_UNSUPPORTED",
     );
   }
   const validated = validateSignedSparkleFeed({
@@ -1738,9 +1750,9 @@ export async function publishSparkleUpdate({
   if (appcastBytes.length !== appcast.size) {
     fail("Appcast changed while it was being read");
   }
-  if (releaseChannel.name === "stable"
-      && appcastPolicy.allowDeltaFrom !== true) {
+  if (releaseChannel.name === "stable") {
     assertStableCandidateFeedSigned({
+      appcastPolicy,
       appcastText: appcastBytes.toString("utf8"),
       channel: releaseChannel,
       dmgBytes: dmgWithSha256.bytes,

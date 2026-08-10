@@ -312,7 +312,14 @@ document is acceptable to the installed fleet.
   the DMG bytes and SHA-256.
 - `scripts/publish-sparkle-update.js` runs the same validation as a
   preflight before any network call, and **refuses an unsigned stable
-  candidate outright** (`SPARKLE_UPDATE_STABLE_FEED_UNSIGNED`).
+  candidate outright** (`SPARKLE_UPDATE_STABLE_FEED_UNSIGNED`). The
+  preflight is unconditional for the stable channel: flipping
+  `allowDeltaFrom` in `config/sparkle-appcast-policy.js` does not skip it —
+  the publisher then fails closed with
+  `SPARKLE_UPDATE_STABLE_DELTA_FEED_VALIDATION_UNSUPPORTED` until
+  `sparkle-signed-feed-validation.js` (and the Worker guard's official
+  parser) are extended for delta-carrying signed feeds. No policy value can
+  turn stable publication into a preflight-free path.
 
 ### End-to-end publication recipe (stable)
 

@@ -1901,7 +1901,7 @@ test("rejects a delta enclosure outside the sparkle:deltas fallback container", 
   }
 });
 
-test("stable delta publication turns on with the reviewed policy flip and no publisher change", async () => {
+test("stable delta policy flip fails closed until the signed-feed validator understands deltas", async () => {
   const deltaBytes = Buffer.from("stable-binary-delta-0-to-1");
   const deltaDigest = sha256(deltaBytes);
   const deltaFileName = `${RELEASE_MANIFEST.macOS.arm64DmgFileName.slice(0, -".dmg".length)}-from-0.delta`;
@@ -1926,32 +1926,64 @@ test("stable delta publication turns on with the reviewed policy flip and no pub
     runWrangler: async () => assert.fail("validation-only must not call Wrangler"),
     validateDMG: async () => {},
   };
+  const deltaEnabledPolicy = {
+    ...CANONICAL_STABLE_APPCAST_POLICY,
+    allowDeltaFrom: true,
+  };
   try {
-    // Identical inputs: under today's reviewed policy the signed-feed
-    // preflight refuses the delta-carrying document (the official
-    // generate_appcast full-only shape has no sparkle:deltas container)...
+    // Under today's reviewed policy the signed-feed preflight refuses the
+    // delta-carrying document (the official generate_appcast full-only shape
+    // has no sparkle:deltas container)...
     await assert.rejects(
       publishSparkleUpdate(options),
       { code: "SPARKLE_SIGNED_FEED_SHAPE_INVALID" },
     );
-    // ...and the flipped policy accepts it with the delta fully validated.
-    // NOTE: the injectable delta-enabled policy also bypasses the stable
-    // signed-feed preflight, because sparkle-signed-feed-validation.js (and
-    // the Worker guard's official parser) must be extended for a
-    // delta-carrying signed feed before the reviewed flip can land.
-    const publication = await publishSparkleUpdate({
-      ...options,
-      appcastPolicy: {
-        ...CANONICAL_STABLE_APPCAST_POLICY,
-        allowDeltaFrom: true,
-      },
-    });
-    assert.equal(publication.status, "validated");
-    assert.equal(publication.deltas.length, 1);
-    assert.equal(publication.deltas[0].deltaFrom, "0");
-    assert.equal(
-      publication.deltas[0].key,
-      `releases/1/${deltaDigest}/${deltaFileName}`,
+    // ...and a delta-enabled policy does NOT silently disable the 2026-08-10
+    // incident preflight: it fails closed with a named error until
+    // sparkle-signed-feed-validation.js (and the Worker guard's official
+    // parser) are extended for a delta-carrying signed feed. Flipping
+    // config/sparkle-appcast-policy.js alone must never turn stable
+    // publication into a preflight-free path.
+    await assert.rejects(
+      publishSparkleUpdate({
+        ...options,
+        appcastPolicy: deltaEnabledPolicy,
+      }),
+      { code: "SPARKLE_UPDATE_STABLE_DELTA_FEED_VALIDATION_UNSUPPORTED" },
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("stable trailer requirement is unconditional: a delta-enabled policy still refuses an unsigned candidate", async () => {
+  // SURequireSignedFeed is a property of the installed fleet, not of the
+  // delta policy: even with allowDeltaFrom flipped, an unsigned stable
+  // candidate (no sparkle-signatures trailer) must be refused before any
+  // network call, with the incident's named error.
+  const fixture = await createReleaseFixture({
+    mutateSignedAppcast: (value) => value.replace(
+      /<!-- sparkle-signatures:[\s\S]*$/u,
+      "",
+    ),
+  });
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        appcastPolicy: {
+          ...CANONICAL_STABLE_APPCAST_POLICY,
+          allowDeltaFrom: true,
+        },
+        runWrangler: async () => assert.fail("unsigned stable must not call Wrangler"),
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_STABLE_FEED_UNSIGNED" },
     );
   } finally {
     await fixture.cleanup();
