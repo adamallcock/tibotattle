@@ -33,7 +33,13 @@ import {
 // beyond what the wire contract itself carries.
 
 const RUN_SCHEMA_VERSION = "incremental-contribution-sync-run-v1.0";
-const DEFAULT_MAXIMUM_CHUNKS_PER_PASS = 60;
+// 2026-08-10 (owner-directed): the first full-history backfill is the pass
+// that matters — at 60 chunks/pass an 84-day corpus took most of a day of
+// pass overhead and retry ladders. 500 per pass lets a typical backfill
+// finish in one or two passes while staying far inside the service's
+// admission budgets (20k chunks/device/day launch week, 2k steady) and the
+// absolute per-pass bound below.
+const DEFAULT_MAXIMUM_CHUNKS_PER_PASS = 500;
 const MAXIMUM_CHUNKS_PER_PASS = 2_000;
 const MAX_RESPONSE_BYTES = 32_768;
 const MAX_MANIFEST_RESPONSE_BYTES = 4 * 1024 * 1024;
