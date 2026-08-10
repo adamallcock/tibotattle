@@ -407,8 +407,20 @@
         "not_found_handling": "404-page",
         // Prevent the legacy association filename from receiving the SPA
         // fallback. It is deliberately a 404, not an Apple release gate.
+        //
+        // The admin surface MUST be worker-first: the worker gates on the
+        // admin hostname (404 on the public origin), verifies the Cloudflare
+        // Access JWT, and serves the embedded admin UI. Without these paths
+        // the asset layer answers /admin before the worker runs, so the
+        // Access-authenticated operator saw the public landing page.
         "run_worker_first": [
           "/api/*",
+          "/admin",
+          "/admin/*",
+          "/admin.html",
+          "/admin.js",
+          "/admin-client.js",
+          "/admin.css",
           "/.well-known/apple-developer-domain-association.txt"
         ]
       }
