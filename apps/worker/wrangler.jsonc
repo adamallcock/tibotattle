@@ -301,13 +301,12 @@
         "APPLE_SERVICES_ID": "com.usagemonitor.web",
         "APPLE_KEY_ID": "L58X7J2J7A",
         "APPLE_TEAM_ID": "43RTH622SB",
-        // Cloudflare Access binding for admin.tibotattle.com. Both values are
-        // deliberately empty placeholders: until the owner fills the Zero
-        // Trust team domain (for example "yourteam.cloudflareaccess.com") and
-        // the Access application AUD tag, every admin-host request fails
-        // closed with ADMIN_NOT_CONFIGURED. Neither value is a secret.
-        "ACCESS_TEAM_DOMAIN": "",
-        "ACCESS_AUD": ""
+        // Cloudflare Access binding for admin.tibotattle.com. The team domain
+        // and the Access application AUD tag pin admin-host requests to the
+        // "TiboTattle admin" self-hosted Access app (Google-only IdP, policy
+        // restricted to the owner email). Neither value is a secret.
+        "ACCESS_TEAM_DOMAIN": "tibotattle.cloudflareaccess.com",
+        "ACCESS_AUD": "3ffbc68d303a9da74f462a685b788c57935c65024df4e9b144e1c872598bb61c"
       },
       "secrets": {
         // The owner-specific ADMIN_IDENTITY_LINK_KEY is intentionally not a
