@@ -228,8 +228,8 @@
       >
         <div class="community-proof-heading">
           <div>
-            <h2 id="community-title">Community daily activity</h2>
-            <p>When available, this is a delayed, anonymous daily activity series from people who chose to contribute. A late contribution never edits history: it publishes a replacement revision for its day.</p>
+            <h2 id="community-title">What the Codex allowance is really worth</h2>
+            <p>When available, this leads with the fitted seven-day Codex allowance in API-price-equivalent dollars across every contributing account, from delayed, anonymous contributions. The daily activity series sits below. A late contribution never edits history: it publishes a replacement revision for its day.</p>
             <p class="annotation">
               Personal dashboards and contributions stay in the Mac app.
             </p>
@@ -241,6 +241,34 @@
             <div id="community-daily-status" role="status">
               <p>Checking for published daily activity…</p>
             </div>
+          </div>
+        </div>
+
+        <div class="community-allowance" id="community-allowance-figure">
+          <div class="activity-heading">
+            <div>
+              <h3>Fitted seven-day allowance</h3>
+              <p>Central fit, plausible range, and per-day estimates across all contributing accounts, valued at API prices.</p>
+            </div>
+            <div class="allowance-controls">
+              <span class="evidence-chip neutral" id="community-allowance-state">
+                Checking allowance estimates
+              </span>
+              <div
+                class="segmented-control"
+                id="community-allowance-range-controls"
+                role="group"
+                aria-label="Allowance estimate date range"
+                data-i18n-aria-label="aria.allowanceRange"
+              >
+                <button type="button" data-range-days="30" aria-pressed="false">30d</button>
+                <button type="button" data-range-days="90" aria-pressed="false">90d</button>
+                <button type="button" data-range-days="" class="active" aria-pressed="true">All</button>
+              </div>
+            </div>
+          </div>
+          <div class="result-summary" id="community-allowance-result">
+            <p>Checking for published allowance estimates…</p>
           </div>
         </div>
 

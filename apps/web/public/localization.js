@@ -653,6 +653,7 @@ export const WEB_MESSAGES = Object.freeze({
   "alt.previewWeeklyHistory": ["Sample seven-day allowance history with reset-level uncertainty ranges", "带有重置级别不确定性范围的七天额度历史示例", "Ejemplo de historial de asignación de siete días con intervalos de incertidumbre por restablecimiento"],
   "aria.shareCard": ["A results card is generated once local evidence is available.", "本地证据可用后会生成结果卡片。", "Se genera una tarjeta de resultados cuando hay evidencia local disponible."],
   "aria.weeklyHistoryRange": ["Weekly history date range", "每周历史日期范围", "Intervalo de fechas del historial semanal"],
+  "aria.allowanceRange": ["Allowance estimate date range", "额度估计日期范围", "Intervalo de fechas de la estimación de asignación"],
   "aria.weeklyEstimateLegend": ["Weekly estimate chart legend", "每周估计图例", "Leyenda del gráfico de estimación semanal"],
   "aria.usageGrouping": ["Usage grouping", "使用情况分组", "Agrupación de uso"],
   "aria.usageDateRange": ["Usage chart date range", "使用图日期范围", "Intervalo de fechas del gráfico de uso"],
@@ -888,6 +889,31 @@ export const WEB_MESSAGES = Object.freeze({
   "community.daily.day": ["Day", "日期", "Día"],
   "community.daily.quotaObservations": ["Quota observations", "额度观测", "Observaciones de cuota"],
   "community.daily.contributingDevices": ["Contributing devices", "贡献设备", "Dispositivos contribuyentes"],
+  // The community allowance series. Aggregate dollar-equivalent estimates and
+  // participant counts are owner-approved for publication; the participant
+  // count is part of the claim and always rendered as visible copy.
+  "community.title": ["What the Codex allowance is really worth", "Codex 额度到底值多少", "Cuánto vale realmente la asignación de Codex"],
+  "community.allowance.state.serviceUnavailable": ["The community allowance series is temporarily unavailable. This does not tell us whether any estimate has been published.", "社区额度序列暂时不可用。这并不能说明是否已发布任何估计。", "La serie comunitaria de asignación no está disponible temporalmente. Esto no indica si se ha publicado alguna estimación."],
+  "community.allowance.state.unsupportedSchema": ["The community allowance series cannot be displayed safely with this version of TiboTattle.", "此版本的 TiboTattle 无法安全显示社区额度序列。", "La serie comunitaria de asignación no se puede mostrar de forma segura con esta versión de TiboTattle."],
+  "community.allowance.state.nonePublished": ["No community days have been published for the year window yet.", "此一年窗口内尚未发布任何社区日期。", "Todavía no se ha publicado ningún día comunitario para la ventana anual."],
+  "community.allowance.available": ["Allowance estimates available", "额度估计可用", "Estimaciones de asignación disponibles"],
+  "community.allowance.unavailable": ["Allowance estimates unavailable", "额度估计不可用", "Estimaciones de asignación no disponibles"],
+  "community.allowance.accumulating": ["Estimates still accumulating", "估计仍在累积中", "Las estimaciones aún se están acumulando"],
+  "community.allowance.stillAccumulating": ["Allowance estimates are still accumulating. Published days exist, but no reset fit has qualified yet — the daily activity below shows contributions arriving.", "额度估计仍在累积中。已有发布的日期，但尚无合格的重置拟合——下方的每日活动显示贡献正在到达。", "Las estimaciones de asignación aún se están acumulando. Existen días publicados, pero ningún ajuste de restablecimiento ha calificado todavía; la actividad diaria más abajo muestra que las contribuciones están llegando."],
+  "community.allowance.noneInRange": ["No allowance estimates fall inside this range. Select All to see every published estimate.", "此范围内没有额度估计。选择“全部”以查看所有已发布的估计。", "Ninguna estimación de asignación cae dentro de este intervalo. Selecciona Todo para ver todas las estimaciones publicadas."],
+  "community.allowance.perWindow": ["per 7 days, API-price equivalent", "每 7 天，API 价格等价值", "por 7 días, equivalente al precio de API"],
+  "community.allowance.bandSentence": ["Plausible range {lower}–{upper} (middle 80% of reset fits).", "合理范围 {lower}–{upper}（重置拟合的中间 80%）。", "Rango plausible {lower}–{upper} (80 % central de los ajustes de restablecimiento)."],
+  "community.allowance.latestLabel": ["Latest published estimate ({day}):", "最新发布的估计（{day}）：", "Última estimación publicada ({day}):"],
+  // Composition template so each locale keeps its own punctuation between the
+  // latest-label, account-count, and fit-count fragments.
+  "community.allowance.caveatSentence": ["{latest} {accounts}, {fits}.", "{latest}{accounts}，{fits}。", "{latest} {accounts}, {fits}."],
+  "community.allowance.legendCentral": ["Central estimate (median of reset fits)", "中心估计（重置拟合的中位数）", "Estimación central (mediana de los ajustes de restablecimiento)"],
+  "community.allowance.legendBand": ["Plausible range (middle 80%)", "合理范围（中间 80%）", "Rango plausible (80 % central)"],
+  "community.allowance.legendDots": ["Dot size = reset fits behind the day", "圆点大小 = 该日背后的重置拟合数", "Tamaño del punto = ajustes de restablecimiento detrás del día"],
+  "community.allowance.chartLabel": ["Community allowance estimate chart", "社区额度估计图表", "Gráfico de estimación de asignación comunitaria"],
+  "community.allowance.chartDescription": ["Fitted seven-day allowance value in API-equivalent dollars per published day: a central line, a shaded middle-80% range where published, and dots sized by the number of qualifying reset fits. Days without estimates appear as gaps.", "每个已发布日期的拟合七天额度价值（API 等价美元）：一条中心线、发布时的中间 80% 阴影范围，以及按合格重置拟合数量确定大小的圆点。没有估计的日期显示为空缺。", "Valor ajustado de la asignación de siete días en dólares equivalentes de API por día publicado: una línea central, un rango sombreado del 80 % central donde se publicó, y puntos cuyo tamaño refleja el número de ajustes de restablecimiento que califican. Los días sin estimaciones aparecen como huecos."],
+  "community.allowance.sparseNote": ["The allowance series is still filling in. Dots mark the few published estimates so far.", "额度序列仍在补充中。圆点标记目前已发布的少量估计。", "La serie de asignación todavía se está completando. Los puntos marcan las pocas estimaciones publicadas hasta ahora."],
+  "community.allowance.methodNote": ["Each point is the median fitted seven-day Codex allowance across every qualifying reset fit observed in the trailing 30 days, across all contributing accounts, valued at API prices. Fits qualify by the shared calibration gates (boundaries, span, holdout, sensitivity) with no display-side span floor. Like every day here, estimates recompute as late data arrives.", "每个点都是过去 30 天内观测到的所有合格重置拟合在全部贡献账户上的拟合七天 Codex 额度中位数，按 API 价格计值。拟合按共享校准门槛（边界、跨度、留出验证、敏感度）合格，不含显示侧跨度下限。与此处的每一天一样，估计会随迟到数据的到达而重新计算。", "Cada punto es la mediana de la asignación de Codex de siete días ajustada sobre todos los ajustes de restablecimiento que califican observados en los últimos 30 días, en todas las cuentas contribuyentes, valorada a precios de API. Los ajustes califican según las puertas de calibración compartidas (límites, amplitud, validación, sensibilidad) sin umbral de amplitud del lado de la presentación. Como cada día aquí, las estimaciones se recalculan cuando llegan datos tardíos."],
 });
 
 function catalogIndex(locale) {
@@ -1000,6 +1026,16 @@ export const WEB_PLURAL_MESSAGES = Object.freeze({
   "share.resetFit": Object.freeze({
     one: ["{count} reset fit", "{count} 个重置拟合", "{count} ajuste de restablecimiento"],
     other: ["{count} reset fits", "{count} 个重置拟合", "{count} ajustes de restablecimiento"],
+  }),
+  // The community allowance caveat: the participant count backing every point
+  // is visible copy, so "from 1 contributing account" reads plainly.
+  "community.allowance.accountCount": Object.freeze({
+    one: ["from {count} contributing account", "来自 {count} 个贡献账户", "de {count} cuenta contribuyente"],
+    other: ["from {count} contributing accounts", "来自 {count} 个贡献账户", "de {count} cuentas contribuyentes"],
+  }),
+  "community.allowance.fitCount": Object.freeze({
+    one: ["{count} qualifying reset fit in the trailing 30 days", "过去 30 天内 {count} 个合格重置拟合", "{count} ajuste de restablecimiento que califica en los últimos 30 días"],
+    other: ["{count} qualifying reset fits in the trailing 30 days", "过去 30 天内 {count} 个合格重置拟合", "{count} ajustes de restablecimiento que califican en los últimos 30 días"],
   }),
   // The Allowance history chart's honest empty reason: fits exist in the
   // selected range, and the span floor filtered every one of them.
@@ -1245,7 +1281,12 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "View your allowance estimate and history in the app.": ["在应用中查看额度估计和历史记录。", "Consulta en la app la estimación de tu límite y su historial."],
   "Share only if you choose": ["仅在你选择时分享", "Comparte solo si quieres"],
   "Review a content-free summary before any optional community contribution.": ["在选择向社区贡献之前，先查看不含内容的摘要。", "Revisa un resumen sin contenido antes de cualquier contribución opcional a la comunidad."],
-  "When available, this is a delayed, anonymous daily activity series from people who chose to contribute. A late contribution never edits history: it publishes a replacement revision for its day.": ["如有可用数据，这里会显示选择贡献者的延迟匿名每日活动序列。迟到的贡献绝不会改写历史：它会为该日发布替代修订。", "Cuando esté disponible, aquí se mostrará una serie diaria de actividad anónima y diferida de quienes decidieron contribuir. Una contribución tardía nunca edita la historia: publica una revisión de reemplazo para su día."],
+  "When available, this leads with the fitted seven-day Codex allowance in API-price-equivalent dollars across every contributing account, from delayed, anonymous contributions. The daily activity series sits below. A late contribution never edits history: it publishes a replacement revision for its day.": ["如有可用数据，这里会首先展示按 API 价格等价美元计算的、覆盖所有贡献账户的拟合七天 Codex 额度，数据来自延迟的匿名贡献。每日活动序列位于下方。迟到的贡献绝不会改写历史：它会为该日发布替代修订。", "Cuando esté disponible, aquí se muestra primero la asignación de Codex de siete días ajustada, en dólares equivalentes al precio de API, sobre todas las cuentas contribuyentes, a partir de contribuciones anónimas y diferidas. La serie de actividad diaria está debajo. Una contribución tardía nunca edita la historia: publica una revisión de reemplazo para su día."],
+  "What the Codex allowance is really worth": ["Codex 额度到底值多少", "Cuánto vale realmente la asignación de Codex"],
+  "Fitted seven-day allowance": ["拟合的七天额度", "Asignación de siete días ajustada"],
+  "Central fit, plausible range, and per-day estimates across all contributing accounts, valued at API prices.": ["中心拟合、合理范围以及所有贡献账户的每日估计，按 API 价格计值。", "Ajuste central, rango plausible y estimaciones por día sobre todas las cuentas contribuyentes, valoradas a precios de API."],
+  "Checking allowance estimates": ["正在检查额度估计", "Comprobando las estimaciones de asignación"],
+  "Checking for published allowance estimates…": ["正在检查已发布的额度估计…", "Comprobando las estimaciones de asignación publicadas…"],
   "Checking daily activity": ["正在检查每日活动", "Comprobando la actividad diaria"],
   "Personal dashboards and contributions stay in the Mac app.": ["个人仪表板和贡献功能保留在 Mac 应用中。", "Los paneles personales y las contribuciones permanecen en la app para Mac."],
   "See community activity details": ["查看社区活动详情", "Ver detalles de la actividad comunitaria"],
