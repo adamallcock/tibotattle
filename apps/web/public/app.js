@@ -1114,59 +1114,6 @@ function localizedQuotaWindowLabel(window) {
   return t("dashboard.quota.windowOther");
 }
 
-function historyCoverageLabel(history) {
-  if (archiveHistoryScanActive) {
-    return t(history?.status === "complete"
-      ? "dashboard.pricing.historyScanningComplete"
-      : "dashboard.pricing.historyScanningPartial");
-  }
-  if (history?.status === "complete") {
-    return t("dashboard.pricing.historyComplete");
-  }
-  if (history?.errorCode === "archive_disk_space") {
-    return t("dashboard.pricing.historyDiskSpace");
-  }
-  if (history?.errorCode === "archive_storage_unavailable") {
-    return t("dashboard.pricing.historyStorageUnavailable");
-  }
-  if (history?.phase === "not_started") {
-    return t("dashboard.pricing.historyNotStarted");
-  }
-  const indexed = finite(history?.indexedSourceCount, 0);
-  const total = finite(history?.sourceCount, 0);
-  if (total > 0) {
-    return t("dashboard.pricing.historyProgress", {
-      indexed: compact(indexed),
-      total: compact(total),
-    });
-  }
-  return t("dashboard.pricing.historyResume");
-}
-
-function pricingMethodLabel(pricing) {
-  const replaySafe = finite(pricing?.replayExclusionDiagnostics?.filesScanned, 0) > 0
-    || String(pricing?.accountingSource ?? "").includes("replay");
-  if (!replaySafe) return t("dashboard.pricing.legacyProjection");
-  const key = pricing?.accountingCacheStatus === "stale"
-    ? "dashboard.pricing.staleReplaySafe"
-    : "dashboard.pricing.replaySafe";
-  return t(key);
-}
-
-function pricingRegistryProvenance(pricing) {
-  const version = typeof pricing?.registryVersion === "string"
-    && /^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/u.test(pricing.registryVersion)
-    ? pricing.registryVersion
-    : "";
-  if (!version) return "";
-  const observedAt = pricing.registryObservedAt
-    ? t("dashboard.pricing.registryObservedAt", {
-      time: formatLocal(pricing.registryObservedAt, { dateOnly: true }),
-    })
-    : "";
-  return t("dashboard.pricing.registryProvenance", { version, observedAt });
-}
-
 function renderPricing(data) {
   const pricing = data.pricing;
   const fastMode = pricing.fastMode;
@@ -1187,50 +1134,23 @@ function renderPricing(data) {
     useWeighted ? weighted : pricing.totalCostUsd,
     2
   );
-  const eventCount = finite(pricing.eventCount, 0);
-  const coverage = pricing.coveragePercent;
-  // Drawn before the provenance line, and above the early return for a period
-  // with no priced components: a figure of nothing is exactly when a reader
-  // most needs to know how little of their history is indexed. Calling it from
-  // here rather than from `renderDashboard` also means the two points where an
-  // active archive pass flips `archiveHistoryScanActive` and re-runs this
-  // renderer move the progress statement with it.
-  const historyProgressShown = renderHistoryProgress(data);
-  // One panel states the index coverage once. When the block above is showing
-  // the counted sources, the terse provenance fragment would only repeat it.
-  const history = historyProgressShown
-    ? ""
-    : historyCoverageLabel(pricing.historyCoverage);
-  const method = pricingMethodLabel(pricing);
-  const provenance = pricingRegistryProvenance(pricing);
-  const coverageElement = $("#cost-coverage");
-  const coverageKey = coverage === null
-    ? history
-      ? "dashboard.pricing.noCoverageWithHistory"
-      : "dashboard.pricing.noCoverage"
-    : history
-      ? "dashboard.pricing.coverageWithHistory"
-      : "dashboard.pricing.coverage";
-  const coverageValues = coverage === null
-      ? { history }
-      : {
-        percent: formatPercent(coverage, 1),
-        method,
-        provenance,
-        history,
-      };
-  clear(coverageElement);
-  const coverageLine = node("span", "coverage-line");
-  setRawText(coverageLine, t(coverageKey, coverageValues));
-  coverageElement.append(coverageLine);
-  // No "reviewed historical prices began on …" caveat is printed here. Every
-  // retained usage change is priced at the rate in effect when it occurred,
-  // with no start boundary, so the sentence was false. It was also the live
-  // path that rendered "Jan 1, 1970" whenever the partial-history coverage
-  // record carried no start instant.
-  coverageElement.title = eventCount > 0
-    ? t("dashboard.pricing.coverageDenominator", { count: compact(eventCount) })
-    : "";
+  // Drawn above the early return for a period with no priced components: a
+  // figure of nothing is exactly when a reader most needs to know how little
+  // of their history is indexed. Calling it from here rather than from
+  // `renderDashboard` also means the two points where an active archive pass
+  // flips `archiveHistoryScanActive` and re-runs this renderer move the
+  // progress statement with it.
+  renderHistoryProgress(data);
+  // The metadata line under the total ("100% coverage · stale replay-safe
+  // cache · price registry … · History index complete") is gone
+  // (owner-directed, 2026-08-10). Trace of its "stale replay-safe cache"
+  // fragment: the companion called the cache stale from wall-clock age since
+  // the last rebuild, while the refresh loop deliberately reuses the cache on
+  // passes that add no rollout usage — so the label condemned totals that
+  // covered every known usage record. The companion now derives staleness
+  // against the newest exportable evidence (src/local-companion-data.js), and
+  // the surviving honesty surfaces here are the history-progress block above,
+  // the routed evidence warnings, and the share card's registry provenance.
   const list = $("#cost-components");
   clear(list);
   const components = pricing.components.filter(
@@ -1503,6 +1423,10 @@ function renderComparison(data) {
   $("#comparison-result").textContent = latestMovement + seriesBand;
 }
 
+// Owner-directed restyle (2026-08-10): the fitted-rate facts render as a
+// compact stat row. Each tile holds the bare figure; its unit lives in the
+// fixed label beneath it, and the sentence-length "example translation" moved
+// into the prose below the stats — it is a sentence, not a datum.
 function renderCalibrationRate({ capacity, lower, upper, qualifyingResets = 0 }) {
   const rate = $("#calibration-rate");
   const range = $("#calibration-range");
@@ -1511,34 +1435,38 @@ function renderCalibrationRate({ capacity, lower, upper, qualifyingResets = 0 })
   if (capacity === null || capacity <= 0) {
     setProductText(rate, "Not estimable");
     setProductText(range, "Not estimable");
-    setProductText(example, "Not estimable");
+    if (example) example.hidden = true;
     setLocalizedText(explanation, "dashboard.calibration.noRate");
     return;
   }
   const perPoint = capacity / 100;
   const movementForHundred = 10_000 / capacity;
-  setLocalizedText(rate, "dashboard.calibration.perPoint", {
-    amount: formatMoney(perPoint, 2),
-  });
-  range.textContent = lower !== null && lower > 0 && upper !== null && upper > 0
-    ? t("dashboard.calibration.range", {
-      lower: formatMoney(lower / 100, 2),
-      upper: formatMoney(upper / 100, 2),
-    })
-    : t("dashboard.calibration.rangeUnavailable");
+  const hasRange = lower !== null && lower > 0 && upper !== null && upper > 0;
+  setRawText(rate, formatMoney(perPoint, 2));
+  if (hasRange) {
+    setRawText(
+      range,
+      `${formatMoney(lower / 100, 2)}–${formatMoney(upper / 100, 2)}`,
+    );
+  } else {
+    setLocalizedText(range, "dashboard.calibration.rangeUnavailable");
+  }
+  if (example) example.hidden = false;
   setLocalizedText(example, "dashboard.calibration.example", {
     points: formatDecimal(movementForHundred, 1),
   });
-  explanation.textContent = lower !== null && lower > 0 && upper !== null && upper > 0
-    ? t("dashboard.calibration.withRange", {
+  if (hasRange) {
+    setLocalizedText(explanation, "dashboard.calibration.withRange", {
       count: Math.max(1, Math.round(qualifyingResets)),
       amount: formatMoney(capacity, 0),
       lower: formatMoney(lower, 0),
       upper: formatMoney(upper, 0),
-    })
-    : t("dashboard.calibration.withoutRange", {
+    });
+  } else {
+    setLocalizedText(explanation, "dashboard.calibration.withoutRange", {
       amount: formatMoney(capacity, 0),
     });
+  }
 }
 
 // ---------------------------------------------------------------------------

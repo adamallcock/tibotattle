@@ -1087,8 +1087,6 @@ h2 {
 .cost-total { display: grid; grid-template-columns: 1fr auto; align-items: baseline; padding: 20px 0; border-top: 1px solid var(--line); }
 .cost-total span { color: var(--muted); font-size: .75rem; }
 .cost-total strong { font-family: var(--serif); font-size: 2.8rem; font-weight: var(--weight-display); }
-.cost-total small { grid-column: 1 / -1; color: var(--muted); font-size: .7rem; line-height: 1.45; }
-.coverage-line { display: block; }
 
 /*
  * How much of the discovered history a figure is drawn from, and the local
@@ -1160,18 +1158,25 @@ h2 {
 .bar-track i { display: block; height: 100%; border-radius: inherit; background: var(--green); }
 .comparison-row.calculated .bar-track i { background: var(--rust); }
 .plain-result { margin: 0; padding: var(--pad-tile); color: #31536d; background: var(--blue-soft); border-radius: var(--radius-sm); font-size: .8rem; }
-.calibration-facts {
+/*
+ * Fitted-rate facts as a compact stat row (owner-directed, 2026-08-10): the
+ * figure leads in the display serif the other stat tiles use, and the short
+ * uppercase label sits beneath it. The former three-column definition list
+ * squeezed sentence-length cells into narrow columns.
+ */
+.calibration-stats {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   margin: 18px 0 0;
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
   background: var(--surface-raised);
 }
-.calibration-facts div { min-width: 0; padding: var(--pad-tile); border-inline-end: 1px solid var(--line); }
-.calibration-facts div:last-child { border-inline-end: 0; }
-.calibration-facts dt { color: var(--muted); font-size: .62rem; font-weight: var(--weight-semibold); letter-spacing: .04em; text-transform: uppercase; }
-.calibration-facts dd { margin: 7px 0 0; font-size: .78rem; font-weight: var(--weight-semibold); overflow-wrap: anywhere; }
+.calibration-stats div { min-width: 0; padding: var(--pad-tile); border-inline-end: 1px solid var(--line); }
+.calibration-stats div:last-child { border-inline-end: 0; }
+.calibration-stats strong { display: block; font-family: var(--serif); font-size: 1.55rem; font-weight: var(--weight-display); line-height: 1.05; overflow-wrap: anywhere; }
+.calibration-stats span { display: block; margin-top: 7px; color: var(--muted); font-size: .62rem; font-weight: var(--weight-semibold); letter-spacing: .04em; text-transform: uppercase; }
+.calibration-example { margin: 12px 0 0; }
 .calibration-explanation { margin: 12px 0 0; }
 
 .share-panel { margin-top: 22px; }
@@ -2094,9 +2099,9 @@ footer p { margin: 0; }
   .weekly-pace-forecast-metrics { grid-column: 1; grid-row: auto; }
   .weekly-span-control { grid-template-columns: 1fr auto; }
   .weekly-span-control input { grid-column: 1 / -1; grid-row: 2; }
-  .calibration-facts { grid-template-columns: 1fr; }
-  .calibration-facts div { border-inline-end: 0; border-bottom: 1px solid var(--line); }
-  .calibration-facts div:last-child { border-bottom: 0; }
+  .calibration-stats { grid-template-columns: 1fr; }
+  .calibration-stats div { border-inline-end: 0; border-bottom: 1px solid var(--line); }
+  .calibration-stats div:last-child { border-bottom: 0; }
   .share-card-readout { grid-template-columns: 1fr; }
   .share-card-readout > div { border-inline-end: 0; }
   .share-card-readout > div:nth-child(2) { border-top: 1px solid var(--line); }

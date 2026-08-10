@@ -269,10 +269,14 @@
               increments whose effective mode is Fast. It tracks relative quota
               consumption; it is not a subscription charge or a published dollar limit.
             </p>
+            <!--
+              The coverage/provenance metadata line that sat under the total
+              was removed (owner-directed, 2026-08-10); coverage honesty now
+              lives in the history-progress block and the routed warnings.
+            -->
             <div class="cost-total">
               <span id="cost-period">Recorded period</span>
               <strong id="cost-total">—</strong>
-              <small id="cost-coverage">Awaiting local evidence</small>
             </div>
             <!--
               How much of the discovered history this figure is actually drawn
@@ -324,20 +328,24 @@
                 <strong>—</strong>
               </div>
             </div>
-            <dl class="calibration-facts" id="calibration-facts">
+            <!--
+              Owner-directed restyle (2026-08-10): the three-column table of
+              sentence-length cells is now a two-tile stat row — value
+              prominent, short label beneath — and the "example translation"
+              sentence reads as prose below the stats, because it is a
+              sentence, not a datum.
+            -->
+            <div class="calibration-stats" id="calibration-facts">
               <div>
-                <dt>Central fitted rate</dt>
-                <dd id="calibration-rate">Not estimable</dd>
+                <strong id="calibration-rate">Not estimable</strong>
+                <span>Central fitted rate · per point</span>
               </div>
               <div>
-                <dt>Plausible 80% range</dt>
-                <dd id="calibration-range">Not estimable</dd>
+                <strong id="calibration-range">Not estimable</strong>
+                <span>Plausible 80% range · per point</span>
               </div>
-              <div>
-                <dt>Example translation</dt>
-                <dd id="calibration-example">Not estimable</dd>
-              </div>
-            </dl>
+            </div>
+            <p class="annotation calibration-example" id="calibration-example" hidden></p>
             <p class="annotation calibration-explanation" id="calibration-explanation">
               This fit uses API prices as a measuring stick. It is not a
               provider-published dollar allowance.

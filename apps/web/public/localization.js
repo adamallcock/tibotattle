@@ -214,26 +214,12 @@ export const WEB_MESSAGES = Object.freeze({
   "dashboard.quota.attributionPseudonymous": ["pseudonymous account attributed", "已归因于假名化帐户", "cuenta seudónima atribuida"],
   "dashboard.quota.attributionUnavailable": ["account unattributed", "未归因帐户", "cuenta sin atribución"],
   "dashboard.pricing.noWeightedTitle": ["No usage in this period could be weighted, so the Standard-rate total is shown unchanged.", "此期间没有可加权的使用量，因此显示未变动的 Standard 费率总额。", "No se pudo ponderar ningún uso en este período, por lo que se muestra sin cambios el total a tarifa Standard."],
-  "dashboard.pricing.noCoverage": ["Price coverage is not available", "价格覆盖率不可用", "La cobertura de precios no está disponible"],
-  "dashboard.pricing.coverageDenominator": ["Based on {count} usage changes in the displayed period.", "基于所显示期间的 {count} 个使用变化。", "Basado en {count} cambios de uso durante el período mostrado."],
-  "dashboard.pricing.coverage": ["{percent} coverage · {method}{provenance}", "覆盖率 {percent} · {method}{provenance}", "{percent} de cobertura · {method}{provenance}"],
-  "dashboard.pricing.noCoverageWithHistory": ["Price coverage is not available · {history}", "价格覆盖率不可用 · {history}", "La cobertura de precios no está disponible · {history}"],
-  "dashboard.pricing.coverageWithHistory": ["{percent} coverage · {method}{provenance} · {history}", "覆盖率 {percent} · {method}{provenance} · {history}", "{percent} de cobertura · {method}{provenance} · {history}"],
-  "dashboard.pricing.registryProvenance": [" · price registry {version}{observedAt}", " · 价格登记表 {version}{observedAt}", " · registro de precios {version}{observedAt}"],
-  "dashboard.pricing.registryObservedAt": [" ({time})", "（{time}）", " ({time})"],
-  "dashboard.pricing.replaySafe": ["replay-safe", "可安全重放", "seguro para reproducción"],
-  "dashboard.pricing.staleReplaySafe": ["stale replay-safe cache", "陈旧的可安全重放缓存", "caché seguro para reproducción desactualizado"],
-  "dashboard.pricing.legacyProjection": ["legacy projection", "旧版投影", "proyección heredada"],
+  // The overview card's coverage/method/provenance metadata line was removed
+  // (owner-directed, 2026-08-10), and its keys with it. Coverage honesty
+  // remains in the history-progress keys below, the accounting.pricing.*
+  // sentences, and the routed evidence warnings.
   "dashboard.pricing.noComponents": ["No token-component accounting was returned.", "未返回令牌组件核算。", "No se devolvió contabilidad por componente de token."],
   "dashboard.pricing.tokens": ["{count} tokens", "{count} 个令牌", "{count} tokens"],
-  "dashboard.pricing.historyScanningComplete": ["Scanning for older history", "正在扫描更早的历史记录", "Buscando historial anterior"],
-  "dashboard.pricing.historyScanningPartial": ["Scanning for older history", "正在扫描更早的历史记录", "Buscando historial anterior"],
-  "dashboard.pricing.historyComplete": ["History index complete", "历史索引完成", "Índice histórico completo"],
-  "dashboard.pricing.historyDiskSpace": ["History scan paused: free space needed", "历史扫描已暂停：需要可用空间", "Análisis histórico en pausa: se necesita espacio libre"],
-  "dashboard.pricing.historyStorageUnavailable": ["History scan paused: storage check unavailable", "历史扫描已暂停：无法检查存储空间", "Análisis histórico en pausa: no se puede comprobar el almacenamiento"],
-  "dashboard.pricing.historyNotStarted": ["Older history has not been scanned", "尚未扫描更早的历史记录", "Aún no se ha analizado el historial anterior"],
-  "dashboard.pricing.historyProgress": ["History scan: {indexed} of {total} files", "历史扫描：{indexed}/{total} 个文件", "Análisis histórico: {indexed} de {total} archivos"],
-  "dashboard.pricing.historyResume": ["History scan paused", "历史扫描已暂停", "Análisis histórico en pausa"],
   // How much of the discovered history the figures above are drawn from. Every
   // number here is measured — indexed and discovered source counts published by
   // the local companion — so the share is a real proportion of a real
@@ -307,10 +293,13 @@ export const WEB_MESSAGES = Object.freeze({
   "accounting.fastMode.inferenceNotRun": ["Residual inference has not run: there is not yet enough matched calibration evidence to compare a window against a Standard reference.", "残差推断尚未运行：还没有足够的匹配校准证据将某个窗口与 Standard 参考进行比较。", "La inferencia de residuos no se ha ejecutado: todavía no hay suficiente evidencia de calibración coincidente para comparar una ventana con una referencia Standard."],
   "accounting.fastMode.inferenceNone": ["Residual inference compared {scored} calibration windows against {reference} Standard references and marked none as Fast.", "残差推断将 {scored} 个校准窗口与 {reference} 个 Standard 参考进行了比较，没有标记任何一个为 Fast。", "La inferencia de residuos comparó {scored} ventanas de calibración con {reference} referencias Standard y no marcó ninguna como Fast."],
   "accounting.fastMode.inferenceSome": ["Residual inference marked {fast} of {scored} calibration windows as inferred Fast, against {reference} Standard references. Inference labels windows, never individual increments, so it is reported here and never folded into the weighted total.", "残差推断在与 {reference} 个 Standard 参考比较后，将 {scored} 个校准窗口中的 {fast} 个标记为推断的 Fast。推断标记的是窗口而非单个增量，因此只在此报告，绝不会并入加权总额。", "La inferencia de residuos marcó {fast} de {scored} ventanas de calibración como Fast inferido, frente a {reference} referencias Standard. La inferencia etiqueta ventanas, nunca incrementos individuales, por lo que se informa aquí y nunca se incorpora al total ponderado."],
-  "dashboard.calibration.perPoint": ["{amount} API equivalent per 1 percentage point", "每 1 个百分点相当于 {amount} 的 API 价值", "{amount} de equivalente de API por cada punto porcentual"],
-  "dashboard.calibration.range": ["{lower}–{upper} per point", "每点 {lower}–{upper}", "{lower}–{upper} por punto"],
+  // The stat tiles carry bare figures; their per-point unit lives in the
+  // static labels beneath them, so the old sentence-length "perPoint" and
+  // "range" values left with the table presentation (owner-directed,
+  // 2026-08-10). The example translation is a full sentence rendered as prose
+  // under the stat row.
   "dashboard.calibration.rangeUnavailable": ["Range unavailable", "区间不可用", "Intervalo no disponible"],
-  "dashboard.calibration.example": ["$100 of recorded API-price-equivalent usage corresponds to about {points} percentage points", "记录的 API 价格等价值使用量每 100 美元约对应 {points} 个百分点", "100 USD de uso registrado equivalente al precio de API corresponden a unos {points} puntos porcentuales"],
+  "dashboard.calibration.example": ["$100 of recorded API-price-equivalent usage corresponds to about {points} percentage points.", "记录的 API 价格等价值使用量每 100 美元约对应 {points} 个百分点。", "100 USD de uso registrado equivalente al precio de API corresponden a unos {points} puntos porcentuales."],
   "dashboard.calibration.noRate": [`The weekly calibration contract requires at least ${WEEKLY_CALIBRATION_MINIMUM_QUOTA_BOUNDARIES} unique quota-boundary observations spanning at least ${WEEKLY_CALIBRATION_MINIMUM_DISPLAYED_SPAN_PP} displayed percentage points, plus a valid positive fit, before TiboTattle can estimate this rate and range. API prices remain a measuring stick, not a subscription charge.`, `每周校准契约要求至少 ${WEEKLY_CALIBRATION_MINIMUM_QUOTA_BOUNDARIES} 个唯一额度边界观测值，跨度至少为 ${WEEKLY_CALIBRATION_MINIMUM_DISPLAYED_SPAN_PP} 个显示百分点，并且拟合必须有效且为正，TiboTattle 才能估算此费率和区间。API 价格仍只是衡量尺，而不是订阅费用。`, `El contrato de calibración semanal exige al menos ${WEEKLY_CALIBRATION_MINIMUM_QUOTA_BOUNDARIES} observaciones únicas de límites de cuota que abarquen al menos ${WEEKLY_CALIBRATION_MINIMUM_DISPLAYED_SPAN_PP} puntos porcentuales mostrados, además de un ajuste positivo válido, antes de que TiboTattle pueda estimar esta tasa y su intervalo. Los precios de API siguen siendo una referencia, no un cargo de suscripción.`],
   "dashboard.calibration.withRange": ["Across {count} qualifying resets, the fitted seven-day allowance is {amount}; the middle 80% of those estimates spans {lower}–{upper}. Observed movement comes from the provider. Cost-implied movement translates local activity using the price in effect when each event occurred.", "在 {count} 次合格重置中，拟合的七天额度为 {amount}；这些估计的中间 80% 范围为 {lower}–{upper}。观测变化来自提供商。成本推算变化使用每个事件发生时有效的价格换算本地活动。", "En {count} reinicios válidos, el límite ajustado de siete días es {amount}; el 80 % central de esas estimaciones abarca {lower}–{upper}. El movimiento observado procede del proveedor. El movimiento implícito por coste traduce la actividad local con el precio vigente cuando ocurrió cada evento."],
   "dashboard.calibration.withoutRange": ["The central fit implies a full 100-point allowance near {amount} API equivalent, but there is not yet a usable across-reset range. This is not a provider-published dollar cap.", "中心拟合表明完整的 100 点额度约为 {amount} 的 API 等价值，但尚无可用的跨重置区间。这不是提供商公布的美元上限。", "El ajuste central implica una asignación completa de 100 puntos cercana a {amount} de equivalente de API, pero todavía no hay un intervalo utilizable entre restablecimientos. No es un límite monetario publicado por el proveedor."],
@@ -1338,7 +1327,6 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Replay-safe usage cost": ["可重放安全的使用成本", "Coste de uso seguro para reproducción"],
   "Standard-rate API prices applied to non-overlapping local token increments, then multiplied by the published Fast credit rate for increments whose effective mode is Fast. It tracks relative quota consumption; it is not a subscription charge or a published dollar limit.": ["将标准费率 API 价格应用于不重叠的本地令牌增量，再对有效模式为 Fast 的增量乘以公开的 Fast 抵扣费率。它跟踪相对额度消耗；不是订阅费用或公开的美元限额。", "Precios de API de tarifa estándar aplicados a incrementos locales de tokens no superpuestos y luego multiplicados por la tasa publicada de crédito Fast para incrementos cuyo modo efectivo es Fast. Registra el consumo relativo de cuota; no es un cargo de suscripción ni un límite en dólares publicado."],
   "Recorded period": ["记录期间", "Periodo registrado"],
-  "Awaiting local evidence": ["等待本地证据", "En espera de evidencia local"],
   "This activity total can exceed the inferred weekly limit: it spans a calendar period, while the weekly estimate describes one observed reset track and may cross resets, credits, or account changes.": ["此活动总量可能超过推断的每周限额：它跨越一个日历期间，而每周估计描述的是一个观测到的重置轨迹，并且可能跨越重置、抵扣或帐户变化。", "Este total de actividad puede superar el límite semanal inferido: abarca un período de calendario, mientras que la estimación semanal describe una trayectoria de reinicio observada y puede cruzar reinicios, créditos o cambios de cuenta."],
   "Measured versus calculated": ["实测与计算", "Medido frente a calculado"],
   "Does token cost explain the quota change?": ["令牌成本能解释额度变化吗？", "¿El coste de tokens explica el cambio de cuota?"],
@@ -1346,10 +1334,9 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Observed quota movement": ["观测到的额度变化", "Movimiento de cuota observado"],
   "Cost-implied movement": ["成本推算的变化", "Movimiento implícito por el coste"],
   "More observations are required before a useful comparison can be made.": ["需要更多观测结果才能进行有意义的比较。", "Se requieren más observaciones antes de poder realizar una comparación útil."],
-  "Central fitted rate": ["中心拟合比率", "Tasa central ajustada"],
+  "Central fitted rate · per point": ["中心拟合比率 · 每点", "Tasa central ajustada · por punto"],
   "Not estimable": ["无法估计", "No estimable"],
-  "Plausible 80% range": ["可信的 80% 范围", "Rango plausible del 80 %"],
-  "Example translation": ["示例换算", "Conversión de ejemplo"],
+  "Plausible 80% range · per point": ["可信的 80% 范围 · 每点", "Rango plausible del 80 % · por punto"],
   "This fit uses API prices as a measuring stick. It is not a provider-published dollar allowance.": ["此拟合将 API 价格用作衡量标尺。它不是提供商发布的美元额度。", "Este ajuste usa precios de API como regla de medida. No es un límite en dólares publicado por el proveedor."],
   "A results card you can post": ["可发布的结果卡片", "Una tarjeta de resultados que puedes publicar"],
   "Reference pending": ["参考待定", "Referencia pendiente"],

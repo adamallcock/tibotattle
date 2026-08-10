@@ -1489,22 +1489,40 @@ test("history coverage only becomes complete from coherent archive evidence", ()
   );
 });
 
-test("cost coverage visibly surfaces historical coverage and concise provenance", async () => {
+test("the cost card drops its metadata line while coverage honesty stays elsewhere", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const localizationSource = await readFile(
     new URL("../public/localization.js", import.meta.url),
     "utf8",
   );
-  assert.match(appSource, /historyCoverageLabel\(pricing\.historyCoverage\)/u);
+  // The "{percent} coverage · {method}{provenance} · {history}" line under
+  // the total is gone (owner-directed, 2026-08-10), together with its "stale
+  // replay-safe cache" fragment: the companion had derived that label from
+  // wall-clock cache age even though the refresh loop deliberately reuses the
+  // cache on passes with no new rollout usage, so it condemned totals that
+  // still covered every known usage record.
+  assert.doesNotMatch(html, /id="cost-coverage"/u);
+  assert.doesNotMatch(
+    appSource,
+    /cost-coverage|pricingMethodLabel|historyCoverageLabel|pricingRegistryProvenance/u,
+  );
+  assert.doesNotMatch(
+    localizationSource,
+    /dashboard\.pricing\.(?:coverage|noCoverage|replaySafe|staleReplaySafe|legacyProjection|registryProvenance|registryObservedAt|history)/u,
+  );
+  // The surviving coverage honesty surfaces: the history-progress block, the
+  // accounting page's coverage sentences, and the routed evidence warnings.
+  assert.match(appSource, /renderHistoryProgress\(data\)/u);
+  assert.match(localizationSource, /"accounting\.pricing\.partialCoverage":/u);
+  assert.match(localizationSource, /"accounting\.pricing\.coverageReviewed":/u);
+  assert.match(localizationSource, /"accounting\.pricing\.coverageShort":/u);
   // Every retained usage change is priced at the rate in effect when it
   // occurred, so no surface claims a date before which history was unpriced.
   assert.doesNotMatch(appSource, /thirtyDayCoverageWarning|coverage-warning/u);
   assert.doesNotMatch(localizationSource, /thirtyDayCoverageWarning/u);
-  assert.match(localizationSource, /"accounting\.pricing\.partialCoverage":/u);
- assert.match(localizationSource, /"accounting\.pricing\.coverageReviewed":/u);
-  assert.match(localizationSource, /"accounting\.pricing\.coverageShort":/u);
- assert.doesNotMatch(appSource, /cost-history-coverage/u);
- assert.doesNotMatch(appSource, /coverage-unpriced|unpricedTokens/u);
+  assert.doesNotMatch(appSource, /cost-history-coverage/u);
+  assert.doesNotMatch(appSource, /coverage-unpriced|unpricedTokens/u);
   assert.doesNotMatch(appSource, /pricedEventCoveragePercent[^\n]*priced/u);
 });
 
@@ -4607,8 +4625,10 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.match(appSource, /timelineStatusLabel/);
   // The `recent_7d_partial` pin lived in the preparation preflight estimate,
   // which left with the prepare flow (owner-directed, 2026-08-08); partial
-  // index handling stays pinned through the coverage labels below.
-  assert.match(appSource, /historyCoverageLabel|thirtyDayCoverageWarning/u);
+  // index handling stays pinned through the measured history-progress block
+  // (the terse coverage labels left with the cost card's metadata line,
+  // owner-directed 2026-08-10).
+  assert.match(appSource, /renderHistoryProgress\(data\)/u);
   assert.match(appSource, /chart\.status\.resetOrTrackChange/u);
   assert.match(appSource, /chart\.status\.backwardOrAmbiguous/u);
   assert.match(appSource, /Calculating usage and allowance/);
@@ -4657,9 +4677,10 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.match(styles, /\.primary-nav \{[\s\S]*overflow-x: auto;/);
 });
 
-test("default calibration view explains the fitted rate and uncertainty plainly", async () => {
+test("default calibration view renders a stat row and keeps the example as prose", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
   for (const id of [
     "calibration-rate",
     "calibration-range",
@@ -4668,10 +4689,21 @@ test("default calibration view explains the fitted rate and uncertainty plainly"
   ]) {
     assert.match(html, new RegExp(`id="${id}"`));
   }
+  // Owner-directed restyle (2026-08-10): the three-column definition list of
+  // sentence-length cells is a two-tile stat row — figure prominent, short
+  // label beneath — and the "example translation" sentence reads as prose
+  // under the stats rather than as a third squeezed column.
+  assert.match(html, /class="calibration-stats" id="calibration-facts"/u);
+  assert.doesNotMatch(html, /<dl class="calibration-facts"|<dt>Central fitted rate<\/dt>|Example translation/u);
+  assert.match(html, /<span>Central fitted rate · per point<\/span>/u);
+  assert.match(html, /<span>Plausible 80% range · per point<\/span>/u);
+  assert.match(styles, /\.calibration-stats strong \{[^\n}]*font-family: var\(--serif\)/u);
   assert.match(appSource, /function renderCalibrationRate/);
-  assert.match(appSource, /"dashboard\.calibration\.perPoint"/u);
-  assert.match(appSource, /t\("dashboard\.calibration\.withRange"/u);
-  assert.match(appSource, /t\("dashboard\.calibration\.withoutRange"/u);
+  assert.doesNotMatch(appSource, /dashboard\.calibration\.perPoint|dashboard\.calibration\.range"/u);
+  assert.match(appSource, /setLocalizedText\(example, "dashboard\.calibration\.example"/u);
+  assert.match(appSource, /"dashboard\.calibration\.rangeUnavailable"/u);
+  assert.match(appSource, /"dashboard\.calibration\.withRange"/u);
+  assert.match(appSource, /"dashboard\.calibration\.withoutRange"/u);
 });
 
 test("weekly view keeps the default surface to the estimate and its reset history", async () => {
@@ -4692,7 +4724,10 @@ test("weekly view keeps pricing provenance with accounting and removes the obsol
   assert.doesNotMatch(html, /id="weekly-pricing-receipt"|Price basis for the visible fits/iu);
   assert.doesNotMatch(appSource, /function renderWeeklyPricingReceipt|renderWeeklyPricingReceipt\(/u);
   assert.doesNotMatch(styles, /\.weekly-pricing-receipt/u);
-  assert.match(appSource, /pricingRegistryProvenance\(pricing\)/u);
+  // The overview's registry-provenance fragment left with the cost card's
+  // metadata line (owner-directed, 2026-08-10); the share card remains the
+  // surface that publishes the price-registry version.
+  assert.match(appSource, /shareCardRegistryVersion\(data\?\.pricing\?\.registryVersion\)/u);
 });
 
 test("weekly keeps every fit visible and marks short observations separately", async () => {
