@@ -55,7 +55,21 @@ const PROGRESS_KEYS = Object.freeze([
   "daysTotal",
 ]);
 const OUTCOME_KEYS = Object.freeze(["at", "code", "status"]);
+// Additive since 2026-08-10: a thrown runner error is recorded as a bounded
+// `detail` on the outcome, so a `run_failed` is never anonymous again. An
+// outcome without the key (an older settings file, or a shaped run outcome)
+// still parses; an outcome carrying it round-trips.
+const OUTCOME_KEYS_WITH_DETAIL = Object.freeze([...OUTCOME_KEYS, "detail"]);
+const OUTCOME_DETAIL_KEYS = Object.freeze(["code", "message"]);
+const MAXIMUM_OUTCOME_DETAIL_MESSAGE_CHARS = 200;
 const OUTCOME_STATUSES = new Set(["succeeded", "partial", "failed", "paused"]);
+// Thrown runner errors that mean "another local writer holds the resource
+// right now" — the legacy v0.1 pipeline holding the shared sync mutex, or the
+// foreground indexer writing the unified index. These are expected local
+// coordination, not service pressure: they retry within the pending minute
+// and must never escalate the exponential ladder (observed live 2026-08-10:
+// one anonymous collision inflated the gap toward an hour).
+const COORDINATION_RETRY_CODES = new Set(["sync_in_progress", "index_busy"]);
 const PAUSED_REASONS = new Set([
   "device_unavailable",
   "consent_rejected",
@@ -164,6 +178,30 @@ function initialSettings() {
   };
 }
 
+// Bounded, path-free evidence of a thrown runner error: the error's own code
+// when it already fits the outcome-code vocabulary, and a truncated message
+// with any slash-joined run elided whole so a filesystem path (or anything
+// shaped like one) can never persist.
+function boundedErrorDetail(error) {
+  const code = typeof error?.code === "string" && OUTCOME_CODE.test(error.code)
+    ? error.code
+    : null;
+  const message = (typeof error?.message === "string" ? error.message : "")
+    .replaceAll(/\s+/gu, " ")
+    .replaceAll(/\S*[/\\]\S*/gu, "[path]")
+    .slice(0, MAXIMUM_OUTCOME_DETAIL_MESSAGE_CHARS)
+    .trim();
+  return Object.freeze({ code, message });
+}
+
+function validOutcomeDetail(value) {
+  return value === undefined
+    || (exactKeys(value, OUTCOME_DETAIL_KEYS)
+      && (value.code === null || OUTCOME_CODE.test(value.code))
+      && typeof value.message === "string"
+      && value.message.length <= MAXIMUM_OUTCOME_DETAIL_MESSAGE_CHARS);
+}
+
 function validProgress(value) {
   return value === null
     || (exactKeys(value, PROGRESS_KEYS)
@@ -198,10 +236,12 @@ function parseSettings(value) {
             .every((entry) => typeof entry === "string" && entry.length > 0
               && entry.length <= 2_048)))
       || (value.lastOutcome !== null
-        && !(exactKeys(value.lastOutcome, OUTCOME_KEYS)
+        && !((exactKeys(value.lastOutcome, OUTCOME_KEYS)
+            || exactKeys(value.lastOutcome, OUTCOME_KEYS_WITH_DETAIL))
           && nullableTimestamp(value.lastOutcome.at) !== null
           && OUTCOME_CODE.test(value.lastOutcome.code ?? "")
-          && OUTCOME_STATUSES.has(value.lastOutcome.status)))
+          && OUTCOME_STATUSES.has(value.lastOutcome.status)
+          && validOutcomeDetail(value.lastOutcome.detail)))
       || !validProgress(value.progress)) {
     fail("settings_unavailable");
   }
@@ -242,6 +282,9 @@ class IncrementalContributionSyncController {
   #runTimeoutMilliseconds;
   #settings = initialSettings();
   #initialized = false;
+  // The backlog clamp fires at most once, on the first start() after load: a
+  // later start() call must never defeat a ladder a live process is walking.
+  #startupClampConsidered = false;
   #settingsAvailable = true;
   #started = false;
   #timer = null;
@@ -432,7 +475,34 @@ class IncrementalContributionSyncController {
             + this.#dither(MAXIMUM_PENDING_DITHER_MILLISECONDS),
         ).toISOString();
         await this.#persist();
+      } else if (this.#consentCurrent()
+          && !this.#settings.paused
+          && this.#settingsAvailable
+          && !this.#startupClampConsidered
+          && this.#settings.nextAttemptAt !== null
+          && ((this.#settings.progress?.daysPending ?? 0) > 0
+            || this.#settings.lastOutcome?.status !== "succeeded")
+          && Date.parse(this.#settings.nextAttemptAt)
+              - Date.parse(this.#nowIso())
+            > PENDING_RETRY_MILLISECONDS) {
+        // Startup clamp (2026-08-10, observed live): the exponential ladder
+        // protects a live process from hammering a struggling service, but a
+        // persisted next-attempt inherited across a restart — often an app
+        // update, itself a natural re-probe point — left an 86-day backfill
+        // idle for most of an hour after the service had recovered. With
+        // backlog evidence (pending days, or a last outcome that is not
+        // "succeeded"), a fresh process re-probes within the pending minute
+        // and the ladder starts over. Steady state (succeeded, nothing
+        // pending) keeps its six-hour schedule untouched.
+        this.#settings.retryCount = 0;
+        this.#settings.nextAttemptAt = new Date(
+          Date.parse(this.#nowIso())
+            + PENDING_RETRY_MILLISECONDS
+            + this.#dither(MAXIMUM_PENDING_DITHER_MILLISECONDS),
+        ).toISOString();
+        await this.#persist();
       }
+      this.#startupClampConsidered = true;
       this.#schedule();
       return this.#project();
     });
@@ -563,10 +633,12 @@ class IncrementalContributionSyncController {
     timeout?.unref?.();
     let runOutcome = null;
     let runFailed = false;
+    let runError = null;
     try {
       runOutcome = await this.#runner({ signal: abortController.signal });
-    } catch {
+    } catch (error) {
       runFailed = true;
+      runError = error;
     } finally {
       this.#clearTimeout(timeout);
       if (this.#runAbortController === abortController) {
@@ -586,8 +658,11 @@ class IncrementalContributionSyncController {
         pause = false,
         pausedReason = null,
         resetRetries = true,
+        detail = null,
       } = {}) => {
-        this.#settings.lastOutcome = { at: completedAt, code, status };
+        this.#settings.lastOutcome = detail === null
+          ? { at: completedAt, code, status }
+          : { at: completedAt, code, status, detail };
         this.#settings.paused = pause;
         this.#settings.pausedReason = pause ? pausedReason : null;
         if (resetRetries) this.#settings.retryCount = 0;
@@ -596,15 +671,38 @@ class IncrementalContributionSyncController {
           : new Date(completedMs + nextDelay).toISOString();
       };
       if (runFailed || !validRunOutcome(runOutcome)) {
-        // The runner itself failed shapelessly. Never spin: pause after the
-        // bounded retry ladder tops out, exactly one honest state.
-        this.#settings.retryCount += 1;
-        settle(
-          timedOut ? "run_timeout" : "run_failed",
-          "failed",
-          this.#retryDelayMilliseconds(null),
-          { resetRetries: false },
-        );
+        const detail = runError === null ? null : boundedErrorDetail(runError);
+        const coordinationCode = !timedOut
+          && runError?.retryable === true
+          && typeof runError?.code === "string"
+          && COORDINATION_RETRY_CODES.has(runError.code)
+          ? runError.code
+          : null;
+        if (coordinationCode !== null) {
+          // A known local coordination collision — another writer holds the
+          // shared mutex or the unified index for a moment. Retry within the
+          // pending minute; the exponential ladder is for service pressure
+          // and must stay exactly where it is (neither escalated nor reset).
+          settle(
+            coordinationCode,
+            "failed",
+            PENDING_RETRY_MILLISECONDS
+              + this.#dither(MAXIMUM_PENDING_DITHER_MILLISECONDS),
+            { resetRetries: false, detail },
+          );
+        } else {
+          // The runner itself failed shapelessly. Never spin: pause after the
+          // bounded retry ladder tops out, exactly one honest state — and
+          // since 2026-08-10 the thrown error's code and bounded message are
+          // recorded, so the failure is never anonymous.
+          this.#settings.retryCount += 1;
+          settle(
+            timedOut ? "run_timeout" : "run_failed",
+            "failed",
+            this.#retryDelayMilliseconds(null),
+            { resetRetries: false, detail },
+          );
+        }
       } else if (runOutcome.failure !== null) {
         const failure = runOutcome.failure;
         if (failure.deviceUnavailable === true) {

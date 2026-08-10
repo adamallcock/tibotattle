@@ -358,3 +358,220 @@ test("approval without a configured destination fails closed", async () => {
     (error) => error.code === "incremental_contribution_not_configured",
   );
 });
+
+function coordinationError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  error.retryable = true;
+  return error;
+}
+
+test("a known coordination collision retries within the pending minute without touching the ladder (2026-08-10)", async () => {
+  // The two expected local collisions: the legacy v0.1 pipeline holding the
+  // shared sync mutex, and the foreground indexer writing the unified index.
+  // Neither is service pressure, so neither may escalate the exponential
+  // backoff that stretched the live 86-day backfill to ~48-minute gaps.
+  const { controller, storage, runs, advance } = harness({
+    outcomes: [
+      coordinationError(
+        "sync_in_progress",
+        "legacy v0.1 sync holds the shared mutex",
+      ),
+      coordinationError(
+        "index_busy",
+        "unified index momentarily held by another local writer",
+      ),
+      runOutcome(),
+    ],
+  });
+  await controller.start();
+  await controller.approve();
+
+  const collided = await controller.runDue();
+  assert.equal(collided.paused, false);
+  assert.equal(collided.lastOutcome.status, "failed");
+  assert.equal(collided.lastOutcome.code, "sync_in_progress");
+  assert.deepEqual(collided.lastOutcome.detail, {
+    code: "sync_in_progress",
+    message: "legacy v0.1 sync holds the shared mutex",
+  });
+  assert.equal(
+    Date.parse(collided.nextAttemptAt) - Date.parse(collided.lastAttemptAt),
+    60_000,
+  );
+  let persisted = JSON.parse(storage.files.get(SETTINGS_FILE));
+  assert.equal(persisted.retryCount, 0);
+  assert.equal(persisted.lastOutcome.detail.code, "sync_in_progress");
+
+  // A second collision stays at the pending minute: no ladder, no doubling.
+  advance(60_000);
+  const busy = await controller.runDue();
+  assert.equal(busy.lastOutcome.code, "index_busy");
+  assert.deepEqual(busy.lastOutcome.detail, {
+    code: "index_busy",
+    message: "unified index momentarily held by another local writer",
+  });
+  assert.equal(
+    Date.parse(busy.nextAttemptAt) - Date.parse(busy.lastAttemptAt),
+    60_000,
+  );
+  persisted = JSON.parse(storage.files.get(SETTINGS_FILE));
+  assert.equal(persisted.retryCount, 0);
+
+  advance(60_000);
+  const recovered = await controller.runDue();
+  assert.equal(recovered.lastOutcome.code, "synced");
+  assert.equal(runs.length, 3);
+});
+
+test("an unknown thrown runner error keeps today's ladder and records a bounded, path-free detail (2026-08-10)", async () => {
+  const anonymous = new Error(
+    "ENOENT: no such file, open '/Users/owner/Library/state.sqlite3'",
+  );
+  const coded = new Error("wire exploded");
+  coded.code = "wire_exploded";
+  // A coordination-shaped code WITHOUT retryable === true is not a
+  // coordination collision: it keeps the ladder like any other throw.
+  const notRetryable = new Error("looks coordinated but is not");
+  notRetryable.code = "sync_in_progress";
+  const storage = fakeStorage();
+  const { controller, advance } = harness({
+    storage,
+    outcomes: [anonymous, coded, notRetryable],
+  });
+  await controller.start();
+  await controller.approve();
+
+  const first = await controller.runDue();
+  assert.equal(first.lastOutcome.code, "run_failed");
+  assert.equal(first.lastOutcome.status, "failed");
+  assert.equal(first.lastOutcome.detail.code, null);
+  assert.equal(first.lastOutcome.detail.message.includes("/Users"), false);
+  assert.equal(first.lastOutcome.detail.message.includes("[path]"), true);
+  // First rung, exactly as today: 5 s at the deterministic 0.75 jitter floor.
+  assert.equal(
+    Date.parse(first.nextAttemptAt) - Date.parse(first.lastAttemptAt),
+    3_750,
+  );
+  assert.equal(JSON.parse(storage.files.get(SETTINGS_FILE)).retryCount, 1);
+
+  advance(3_750);
+  const second = await controller.runDue();
+  assert.equal(second.lastOutcome.detail.code, "wire_exploded");
+  assert.equal(second.lastOutcome.detail.message, "wire exploded");
+  // Second rung doubles, exactly as today.
+  assert.equal(
+    Date.parse(second.nextAttemptAt) - Date.parse(second.lastAttemptAt),
+    7_500,
+  );
+  assert.equal(JSON.parse(storage.files.get(SETTINGS_FILE)).retryCount, 2);
+
+  advance(7_500);
+  const third = await controller.runDue();
+  assert.equal(third.lastOutcome.code, "run_failed");
+  assert.equal(third.lastOutcome.detail.code, "sync_in_progress");
+  assert.equal(
+    Date.parse(third.nextAttemptAt) - Date.parse(third.lastAttemptAt),
+    15_000,
+  );
+  assert.equal(JSON.parse(storage.files.get(SETTINGS_FILE)).retryCount, 3);
+  await controller.stop();
+
+  // The widened outcome shape round-trips: a restart loads the detail back.
+  const revived = harness({ storage });
+  await revived.controller.start();
+  const status = await revived.controller.inspect();
+  assert.deepEqual(status.lastOutcome.detail, {
+    code: "sync_in_progress",
+    message: "looks coordinated but is not",
+  });
+});
+
+function persistedSettings(overrides = {}) {
+  return {
+    schemaVersion: "incremental-contribution-sync-settings-v1.0",
+    consent: {
+      consentedAt: "2026-08-01T00:00:00.000Z",
+      destinationOrigin: ORIGIN,
+      telemetrySchemaVersion: "telemetry-contribution-v1.0",
+      fieldDictionaryVersion: "telemetry-v1.0-registry-2026-08-07.1",
+      privacyContractVersion: "ongoing-privacy-safe-telemetry-v1.0",
+    },
+    paused: false,
+    pausedReason: null,
+    retryCount: 0,
+    lastAttemptAt: "2026-08-02T23:59:00.000Z",
+    lastOutcome: null,
+    nextAttemptAt: null,
+    progress: null,
+    ...overrides,
+  };
+}
+
+test("a restart with backlog clamps an inherited backoff to the pending minute and resets the ladder (2026-08-10)", async () => {
+  // The live incident: eleven service_unavailable passes stretched the gap
+  // to ~48 minutes, the file kept it, and the relaunched app sat idle for
+  // most of an hour after the service had recovered. A fresh process is a
+  // natural re-probe point; with backlog pending it must not inherit that.
+  // The lastOutcome here is the pre-detail shape: an old file still loads.
+  const settings = persistedSettings({
+    retryCount: 11,
+    lastOutcome: {
+      at: "2026-08-02T23:59:03.000Z",
+      code: "service_unavailable",
+      status: "failed",
+    },
+    nextAttemptAt: "2026-08-03T00:48:00.000Z",
+    progress: {
+      daysTotal: 86,
+      daysSynced: 7,
+      daysPending: 79,
+      chunksUploaded: 420,
+      acknowledgedThroughDay: "2026-05-13",
+    },
+  });
+  const storage = fakeStorage(
+    new Map([[SETTINGS_FILE, `${JSON.stringify(settings)}\n`]]),
+  );
+  const { controller, storage: sameStorage, runs, advance } =
+    harness({ storage });
+  const started = await controller.start();
+  // Clamped to now + PENDING_RETRY_MILLISECONDS (zero dither here), well
+  // inside the ~2 minutes the operator can reasonably call "soon".
+  assert.equal(started.nextAttemptAt, "2026-08-03T00:01:00.000Z");
+  const persisted = JSON.parse(sameStorage.files.get(SETTINGS_FILE));
+  assert.equal(persisted.retryCount, 0);
+  assert.equal(persisted.nextAttemptAt, "2026-08-03T00:01:00.000Z");
+  // The pre-detail outcome survived the load and the rewrite verbatim.
+  assert.deepEqual(persisted.lastOutcome, settings.lastOutcome);
+  // And the clamped schedule actually drains: the pass runs a minute in.
+  await controller.runDue();
+  assert.equal(runs.length, 0);
+  advance(60_000);
+  await controller.runDue();
+  assert.equal(runs.length, 1);
+});
+
+test("steady state keeps its six-hour schedule across a restart (2026-08-10)", async () => {
+  const text = `${JSON.stringify(persistedSettings({
+    lastOutcome: {
+      at: "2026-08-02T23:59:03.000Z",
+      code: "synced",
+      status: "succeeded",
+    },
+    nextAttemptAt: "2026-08-03T06:00:00.000Z",
+    progress: {
+      daysTotal: 86,
+      daysSynced: 86,
+      daysPending: 0,
+      chunksUploaded: 499,
+      acknowledgedThroughDay: "2026-08-02",
+    },
+  }))}\n`;
+  const storage = fakeStorage(new Map([[SETTINGS_FILE, text]]));
+  const { controller } = harness({ storage });
+  const started = await controller.start();
+  assert.equal(started.nextAttemptAt, "2026-08-03T06:00:00.000Z");
+  // Nothing pending, last pass succeeded: the file is not even rewritten.
+  assert.equal(storage.files.get(SETTINGS_FILE), text);
+});
