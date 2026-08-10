@@ -467,10 +467,21 @@ export function renderSparkleAppcast({
     ? ""
     : `<sparkle:deltas>\n${deltas.map((delta) =>
       `<enclosure url="${delta.url}" sparkle:deltaFrom="${delta.deltaFrom}" length="${delta.size}" type="${DELTA_ENCLOSURE_CONTENT_TYPE}" sparkle:edSignature="${delta.signature}" />`).join("\n")}\n</sparkle:deltas>\n`;
+  // The Worker's atomic appcast guard (sparkle-appcast-guard.ts) accepts
+  // ONLY the elements rss > channel > item > enclosure — no version/title
+  // child elements, no text content — and the enclosure must carry exactly
+  // url, length, sparkle:version, sparkle:edSignature (no type attribute).
+  // Sparkle reads the version from the enclosure attribute, so the one
+  // reviewed minimal shape serves both the updater and the guard. Discovered
+  // on the first real stable publication (2026-08-10): the previous
+  // element-style emission was refused 422 CANDIDATE_INVALID. NOTE: the
+  // delta block below still emits a <sparkle:deltas> wrapper the guard would
+  // refuse; stable-channel deltas are disabled by the reviewed policy, and
+  // enabling them requires extending the guard's parser first.
+  void shortVersionElement;
   return `<?xml version="1.0" encoding="utf-8"?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0"><channel><item>
-<sparkle:version>${bundleVersion}</sparkle:version>
-${shortVersionElement}<enclosure url="${full.url}" length="${full.size}" type="${FULL_ENCLOSURE_CONTENT_TYPE}" sparkle:edSignature="${full.signature}" />
+<enclosure url="${full.url}" length="${full.size}" sparkle:version="${bundleVersion}" sparkle:edSignature="${full.signature}" />
 ${deltasBlock}</item></channel></rss>
 `;
 }
