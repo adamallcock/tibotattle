@@ -291,14 +291,18 @@ async function serveReleaseOutput(output) {
 }
 
 function assertPublicEntryClaimBoundary(html, label = "public entry") {
-  assert.match(html, /Community daily activity/u, label);
+  // Re-pinned 2026-08-10 (owner-directed): the community section leads with
+  // the fitted allowance estimate, honestly labeled with its participant
+  // count, above the daily activity series.
+  assert.match(html, /What the Codex allowance is really worth/u, label);
+  assert.match(html, /id="community-allowance-figure"/u, label);
   assert.match(html, /delayed, aggregate activity/u, label);
   // The retired sealed-snapshot presentation must not resurface on the
   // published site: daily revisions are the only public activity surface.
   assert.doesNotMatch(html, /snapshot/iu, label);
   assert.doesNotMatch(
     html,
-    /Community seven-day estimate|community allowance|community estimate|community capacity|best guess|privacy[- ]reviewed|privacy and quality checks|privacy-safe community/u,
+    /best guess|privacy[- ]reviewed|privacy and quality checks|privacy-safe community/u,
     label,
   );
   for (const forbidden of [
@@ -730,7 +734,10 @@ test("checked-in public source satisfies the complete release contract", async (
   assert.match(html, /id="installer-link"/u);
   assert.match(html, /id="community-daily-result"/u);
   assert.match(html, /src="\.\/community\.js"/u);
-  assert.match(html, /id="community-title">Community daily activity<\/h2>/u);
+  assert.match(
+    html,
+    /id="community-title">What the Codex allowance is really worth<\/h2>/u,
+  );
   const publishedHtml = [html, docsHtml, privacyHtml].join("\n");
   for (
     const dashboardOnly of [

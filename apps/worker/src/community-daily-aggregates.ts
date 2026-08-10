@@ -1,4 +1,9 @@
 import { canonicalJson } from "./canonical-json";
+import {
+  collectCommunityAllowanceFits,
+  summarizeCommunityAllowanceDay,
+} from "./community-allowance";
+import type { CommunityAllowanceFit } from "./community-allowance";
 import { sha256Hex } from "./crypto";
 
 /**
@@ -48,10 +53,100 @@ interface DailyCellRow {
   output_combined_tokens: number;
 }
 
+/**
+ * Provider for the cross-participant allowance fits, keyed by the mutation
+ * epoch the requesting build read its sources under. The collection walks
+ * every active participant's v0.2 corpus, so a cron pass computes it once and
+ * shares it across the ≤24 day builds of that pass; a mid-pass epoch bump
+ * (participant deletion) invalidates the cache and the next build recollects
+ * against the surviving corpus.
+ */
+type AllowanceFitsForEpoch = (epoch: number) => Promise<CommunityAllowanceFit[]>;
+
+function memoizedAllowanceFits(db: D1Database): AllowanceFitsForEpoch {
+  let cached: { epoch: number; fits: CommunityAllowanceFit[] } | null = null;
+  return async (epoch: number) => {
+    if (cached === null || cached.epoch !== epoch) {
+      cached = { epoch, fits: await collectCommunityAllowanceFits(db) };
+    }
+    return cached.fits;
+  };
+}
+
+/**
+ * Fit-corpus drift reconciliation: the honesty backstop behind the payload's
+ * `recomputesOnLateData: true` claim for the allowance block.
+ *
+ * The rebuild queue is fed by v1 chunk arrivals (0031 trigger) and participant
+ * deletion, but the fit corpus is the v0.2 contribution path, which enqueues
+ * nothing — a late v0.2 contribution whose fits fall inside already-published
+ * trailing windows would otherwise leave those days' published fitCount and
+ * centralUsd silently wrong forever. So every rebuild pass recomputes the
+ * expected allowance block for each currently published day from the current
+ * fit corpus and enqueues exactly the days whose published block disagrees
+ * (including pre-allowance revisions, and any basis/cohort definition change
+ * shipped in code). Convergent: once a day republishes with the matching
+ * block, it stops drifting; days whose revisions are all withdrawn are the
+ * deletion machinery's job and are never touched here.
+ */
+async function enqueueCommunityAllowanceDriftRebuilds(
+  db: D1Database,
+  allowanceFitsForEpoch: AllowanceFitsForEpoch,
+): Promise<void> {
+  const epochRow = await db.prepare(
+    `SELECT mutation_epoch FROM community_snapshot_mutation_control
+      WHERE singleton_id = 1`,
+  ).first<{ mutation_epoch: number }>();
+  const reconcileEpoch = Number(epochRow?.mutation_epoch);
+  if (!Number.isSafeInteger(reconcileEpoch) || reconcileEpoch < 0) {
+    throw new Error("community daily aggregate mutation control unavailable");
+  }
+  const fits = await allowanceFitsForEpoch(reconcileEpoch);
+  const published = await db.prepare(
+    `SELECT a.day, a.payload_json
+       FROM community_daily_aggregates a
+       JOIN (
+         SELECT day, MAX(revision) AS revision
+           FROM community_daily_aggregates
+          WHERE release_state = 'published'
+          GROUP BY day
+       ) latest ON latest.day = a.day AND latest.revision = a.revision
+      WHERE a.release_state = 'published'
+      ORDER BY a.day ASC`,
+  ).all<{ day: string; payload_json: string }>();
+  const drifted: string[] = [];
+  for (const row of published.results) {
+    const expected = canonicalJson(
+      summarizeCommunityAllowanceDay(fits, row.day),
+    );
+    let current: string | null = null;
+    try {
+      const payload = JSON.parse(row.payload_json) as { allowance?: unknown };
+      if (payload.allowance !== undefined) {
+        current = canonicalJson(payload.allowance);
+      }
+    } catch {
+      current = null;
+    }
+    if (current !== expected) drifted.push(row.day);
+  }
+  for (const day of drifted) {
+    await db.prepare(
+      `INSERT INTO community_daily_aggregate_rebuilds (
+        day, requested_epoch, requested_at
+      ) VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      ON CONFLICT(day) DO UPDATE SET
+        requested_epoch = excluded.requested_epoch,
+        requested_at = excluded.requested_at`,
+    ).bind(day, reconcileEpoch).run();
+  }
+}
+
 async function buildCommunityDailyAggregate(
   db: D1Database,
   rebuild: DailyRebuildRow,
   scheduledTime: number,
+  allowanceFitsForEpoch: AllowanceFitsForEpoch,
 ): Promise<{ state: "built" | "conflicted"; aggregateId: string }> {
   const { day } = rebuild;
   // Bind the build to the mutation epoch it read its sources under, exactly
@@ -124,6 +219,13 @@ async function buildCommunityDailyAggregate(
   if (!Number.isSafeInteger(revision) || revision < 1) {
     throw new Error("invalid community daily aggregate revision");
   }
+  // The allowance block is additive on schema v1.0: the site normalizer
+  // treats a missing or invalid block as per-day-absent, so older published
+  // revisions without it stay renderable and old clients ignore it entirely.
+  const allowance = summarizeCommunityAllowanceDay(
+    await allowanceFitsForEpoch(buildEpoch),
+    day,
+  );
   const aggregateId = `community-daily:${day}:r${revision}`;
   const releasedAt = new Date(scheduledTime).toISOString();
   const cellRows = cells.results.slice(0, MAX_DAILY_AGGREGATE_CELLS);
@@ -139,6 +241,10 @@ async function buildCommunityDailyAggregate(
     recomputesOnLateData: true,
     policyVersion: COMMUNITY_DAILY_POLICY_VERSION,
     suppression: "none_daily_grain_by_owner_decision",
+    // Aggregate dollar-equivalent estimates and participant counts are
+    // explicitly owner-approved for publication; no per-account identifier
+    // exists anywhere in this block.
+    allowance,
     totals: {
       contributingParticipants: Number(totals?.contributing_participants ?? 0),
       contributingDevices: Number(totals?.contributing_devices ?? 0),
@@ -236,6 +342,10 @@ export async function rebuildPendingCommunityDailyAggregates(
       || maximumRebuilds > 48) {
     throw new Error("invalid community daily aggregate rebuild request");
   }
+  const allowanceFitsForEpoch = memoizedAllowanceFits(db);
+  // Reconcile before draining, so days a late v0.2 contribution drifted are
+  // enqueued in time for this same pass to rebuild them.
+  await enqueueCommunityAllowanceDriftRebuilds(db, allowanceFitsForEpoch);
   const rows = await db.prepare(
     `SELECT day, requested_epoch, requested_at
        FROM community_daily_aggregate_rebuilds
@@ -245,7 +355,12 @@ export async function rebuildPendingCommunityDailyAggregates(
   const aggregateIds: string[] = [];
   let processed = 0;
   for (const row of rows.results.slice(0, maximumRebuilds)) {
-    const result = await buildCommunityDailyAggregate(db, row, scheduledTime);
+    const result = await buildCommunityDailyAggregate(
+      db,
+      row,
+      scheduledTime,
+      allowanceFitsForEpoch,
+    );
     processed += 1;
     aggregateIds.push(result.aggregateId);
   }

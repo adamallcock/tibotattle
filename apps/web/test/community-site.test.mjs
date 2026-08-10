@@ -12,8 +12,10 @@ import {
   normalizeCommunitySnapshot,
 } from "../public/community-data.js";
 import {
+  buildCommunityAllowanceChartModel,
   buildCommunityDailyChartModel,
   communityDailyColumnFormatter,
+  renderCommunityAllowanceSection,
   renderCommunityDailySeries,
 } from "../public/community-view.js";
 import {
@@ -312,7 +314,7 @@ test("the first visit leads with the product, Mac download action, and daily com
   assert.match(html, /Your personal dashboard is calculated on your Mac\./u);
   assert.match(html, /Download for macOS/u);
   assert.match(html, /Latest community evidence/u);
-  assert.match(html, /Community daily activity/u);
+  assert.match(html, /What the Codex allowance is really worth/u);
   assert.match(html, /Install the Mac app/u);
   assert.match(html, /See your week/u);
   assert.match(html, /Share only if you choose/u);
@@ -345,9 +347,13 @@ test("the first visit leads with the product, Mac download action, and daily com
     html,
     /After download|companion-steps|install-explainer|Illustrative demo|Illustrative fixture|Example local dashboard/u,
   );
+  // Re-pinned 2026-08-10 (owner-directed): the community section now leads
+  // with the fitted allowance estimate, so the old "no community estimate
+  // surface" guard narrows to the copy that stays banned — hedge words and
+  // unearned privacy claims.
   assert.doesNotMatch(
     html,
-    /Community seven-day estimate|community allowance|community estimate|community capacity|best guess|privacy[- ]reviewed|privacy and quality checks/u,
+    /best guess|privacy[- ]reviewed|privacy and quality checks/u,
   );
 });
 
@@ -388,14 +394,17 @@ test("unavailable community activity uses the compact public state", async () =>
   const source = await readFile(SITE_SOURCE, "utf8");
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
   assert.match(html, /data-community-state="checking"/u);
-  assert.match(html, /<h2 id="community-title">Community daily activity<\/h2>/u);
   assert.match(
     html,
-    /When available, this is a delayed, anonymous daily activity series from people who chose to contribute\./u,
+    /<h2 id="community-title">What the Codex allowance is really worth<\/h2>/u,
+  );
+  assert.match(
+    html,
+    /When available, this leads with the fitted seven-day Codex allowance in API-price-equivalent dollars across every contributing account on the Codex Pro \(20x\) plan, from delayed, anonymous contributions\. Other plan cohorts are never mixed into this series\./u,
   );
   assert.doesNotMatch(
     html,
-    /privacy[- ]reviewed|privacy and quality checks|community seven-day estimate|community allowance|community estimate|community capacity|best guess/u,
+    /privacy[- ]reviewed|privacy and quality checks|best guess/u,
   );
   assert.doesNotMatch(
     source,
@@ -501,14 +510,46 @@ test("the retained weekly snapshot normalizer still guards the app's closed cont
   assert.equal(published.cells[0].metrics.usageEvents.value, 30);
 });
 
-test("the public source contains no community allowance, estimate, capacity, or privacy-review claim", async () => {
+// Re-pinned 2026-08-10 (owner-directed): the community section now leads with
+// THE product insight — the fitted seven-day allowance across all
+// contributing accounts. The earlier "no community estimate surface" guard is
+// replaced by honest-labeling guards: the surface must exist, sit above the
+// daily activity block, carry real time controls, and keep hedge copy out.
+test("the community allowance surface leads the section with honest labeling", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   const source = await readFile(SITE_SOURCE, "utf8");
+
+  assert.match(html, /id="community-allowance-figure"/u);
+  assert.match(html, /id="community-allowance-result"/u);
+  assert.match(html, /id="community-allowance-state"/u);
+  assert.match(html, /id="community-allowance-range-controls"/u);
+  // The allowance figure is the first block inside the community section,
+  // above the daily-activity disclosure.
+  const communityIndex = html.indexOf('id="community"');
+  const allowanceIndex = html.indexOf('id="community-allowance-figure"');
+  const dailyIndex = html.indexOf('class="community-method"');
+  assert.ok(communityIndex >= 0 && allowanceIndex > communityIndex);
+  assert.ok(
+    allowanceIndex < dailyIndex,
+    "the allowance figure renders above the daily activity block",
+  );
+  // Segmented time controls follow the app's established range pattern.
+  for (const control of [
+    'data-range-days="30"',
+    'data-range-days="90"',
+    'data-range-days=""',
+  ]) {
+    assert.match(html, new RegExp(control, "u"), control);
+  }
+
+  assert.match(source, /renderCommunityAllowanceSection/u);
+  assert.match(source, /community-allowance-range-controls/u);
+
   const publicCopy = `${html}\n${source}`;
-  assert.match(publicCopy, /delayed, aggregate/u);
+  assert.match(publicCopy, /delayed, anonymous contributions/u);
   assert.doesNotMatch(
     publicCopy,
-    /Community seven-day estimate|community allowance|community estimate|community capacity|best guess|privacy[- ]reviewed|privacy and quality checks/u,
+    /best guess|privacy[- ]reviewed|privacy and quality checks/u,
   );
   assert.doesNotMatch(publicCopy, /id="community-estimate|renderCommunityEstimate/u);
 });
@@ -935,6 +976,321 @@ test("the daily chart keeps an all-zero output series on the baseline", () => {
   for (const point of model.outputPoints) {
     assert.equal(point.y, model.plot.bottom);
   }
+});
+
+function allowanceBlock(overrides = {}) {
+  return {
+    basis: "seven_day_codex_pro20x_trailing_30d",
+    limitId: "codex",
+    planType: "pro",
+    planVariant: "pro-20x",
+    windowDurationMinutes: 10_080,
+    trailingDays: 30,
+    qualification: "shared_reset_fit_gates_no_span_floor",
+    spanFloorPp: 0,
+    fitCount: 5,
+    participantCount: 1,
+    centralUsd: 1879,
+    band80Usd: { lowerUsd: 1500, upperUsd: 2300 },
+    ...overrides,
+  };
+}
+
+function allowanceDay(day, allowance, revision = 1) {
+  return publishedDailyDay(day, revision, { payload: { allowance } });
+}
+
+test("the daily normalizer treats the allowance block as additive and per-day", () => {
+  // Old revisions without the block stay renderable: allowance is null, the
+  // day itself survives.
+  const withoutBlock = normalizeCommunityDailySeries(publishedDailySeries());
+  assert.equal(withoutBlock.state, "published");
+  assert.equal(withoutBlock.days[0].allowance, null);
+
+  const published = normalizeCommunityDailySeries(publishedDailySeries({
+    days: [allowanceDay("2026-08-06", allowanceBlock())],
+  }));
+  assert.equal(published.state, "published");
+  assert.deepEqual(published.days[0].allowance, {
+    fitCount: 5,
+    participantCount: 1,
+    centralUsd: 1879,
+    band80Usd: { lowerUsd: 1500, upperUsd: 2300 },
+  });
+
+  // The honest zero-estimate day: block present, no claim.
+  const empty = normalizeCommunityDailySeries(publishedDailySeries({
+    days: [allowanceDay("2026-08-06", allowanceBlock({
+      fitCount: 0,
+      participantCount: 0,
+      centralUsd: null,
+      band80Usd: null,
+    }))],
+  }));
+  assert.deepEqual(empty.days[0].allowance, {
+    fitCount: 0,
+    participantCount: 0,
+    centralUsd: null,
+    band80Usd: null,
+  });
+
+  // Invalid blocks collapse to per-day-absent, never to unsupported_schema:
+  // the activity series must keep rendering even if the allowance claim is
+  // malformed.
+  for (const [label, hostile] of [
+    ["unknown basis", allowanceBlock({ basis: "five_hour_trailing_7d" })],
+    // A different plan cohort is a different product's allowance; the page's
+    // copy names the Pro (20x) cohort, so the block must not render under it.
+    ["different plan cohort", allowanceBlock({ planVariant: "pro-5x" })],
+    ["cohort-less pooled block", allowanceBlock({
+      planType: undefined,
+      planVariant: undefined,
+    })],
+    ["negative fit count", allowanceBlock({ fitCount: -1 })],
+    ["missing central with fits", allowanceBlock({ centralUsd: null })],
+    ["zero-dollar central", allowanceBlock({ centralUsd: 0 })],
+    ["inverted band", allowanceBlock({ band80Usd: { lowerUsd: 9, upperUsd: 3 } })],
+    ["participants without fits", allowanceBlock({ participantCount: 0 })],
+    [
+      "estimate on a zero-fit day",
+      allowanceBlock({ fitCount: 0, participantCount: 0, band80Usd: null }),
+    ],
+  ]) {
+    const series = normalizeCommunityDailySeries(publishedDailySeries({
+      days: [allowanceDay("2026-08-06", hostile)],
+    }));
+    assert.equal(series.state, "published", label);
+    assert.equal(series.days[0].allowance, null, label);
+  }
+
+  // A missing band is legitimate below the fit minimum.
+  const bandless = normalizeCommunityDailySeries(publishedDailySeries({
+    days: [allowanceDay("2026-08-06", allowanceBlock({
+      fitCount: 2,
+      band80Usd: null,
+    }))],
+  }));
+  assert.deepEqual(bandless.days[0].allowance, {
+    fitCount: 2,
+    participantCount: 1,
+    centralUsd: 1879,
+    band80Usd: null,
+  });
+});
+
+test("the allowance chart model maps estimates honestly and slices ranges", () => {
+  // No allowance-bearing day anywhere: no model.
+  assert.equal(
+    buildCommunityAllowanceChartModel(
+      normalizeCommunityDailySeries(publishedDailySeries()),
+    ),
+    null,
+  );
+
+  const series = normalizeCommunityDailySeries(publishedDailySeries({
+    from: "2025-08-10",
+    to: "2026-08-10",
+    days: [
+      allowanceDay("2026-04-01", allowanceBlock({
+        fitCount: 1,
+        band80Usd: null,
+        centralUsd: 900,
+      })),
+      allowanceDay("2026-08-01", allowanceBlock({ centralUsd: 1700 })),
+      allowanceDay("2026-08-02", allowanceBlock({ centralUsd: 1800 })),
+      // A published day whose estimate has not accrued: a gap, not a zero.
+      allowanceDay("2026-08-03", allowanceBlock({
+        fitCount: 0,
+        participantCount: 0,
+        centralUsd: null,
+        band80Usd: null,
+      })),
+      allowanceDay("2026-08-05", allowanceBlock({
+        fitCount: 12,
+        centralUsd: 1879,
+      })),
+    ],
+  }));
+  assert.equal(series.state, "published");
+
+  const all = buildCommunityAllowanceChartModel(series);
+  assert.equal(all.dots.length, 4, "only estimate-bearing days become points");
+  // The central line breaks at the April-to-August gap, at the estimate-free
+  // Aug 3, and around the isolated Aug 5 point.
+  assert.deepEqual(
+    all.centralSegments.map((segment) => segment.map(({ day }) => day)),
+    [["2026-04-01"], ["2026-08-01", "2026-08-02"], ["2026-08-05"]],
+  );
+  // The band renders only where days published one: April's one-fit day has
+  // no band, so band segments cover the banded August days only.
+  assert.deepEqual(
+    all.bandSegments.map((segment) => segment.map(({ day }) => day)),
+    [["2026-08-01", "2026-08-02"], ["2026-08-05"]],
+  );
+  // Dot radius grows with fit count: the 12-fit day out-weighs the 1-fit day.
+  const radiusByDay = new Map(all.dots.map(({ day, radius }) => [day, radius]));
+  assert.ok(radiusByDay.get("2026-08-05") > radiusByDay.get("2026-04-01"));
+  // The dollar axis covers the largest published claim (the band top).
+  assert.ok(all.dollarTicks[all.dollarTicks.length - 1].value >= 2300);
+  assert.equal(all.dollarTicks[0].value, 0);
+  // The latest point carries the honest counts the headline renders.
+  assert.equal(all.latest.day, "2026-08-05");
+  assert.equal(all.latest.fitCount, 12);
+  assert.equal(all.latest.participantCount, 1);
+  assert.equal(all.sparse, false);
+
+  // Range slicing anchors at the latest published day (2026-08-05): a 30-day
+  // range keeps the August points and drops April.
+  const thirty = buildCommunityAllowanceChartModel(series, { rangeDays: 30 });
+  assert.deepEqual(thirty.dots.map(({ day }) => day), [
+    "2026-08-01",
+    "2026-08-02",
+    "2026-08-05",
+  ]);
+
+  // A range with estimates outside it produces no model — the renderer's
+  // "none in this range" state, distinct from "still accumulating".
+  const twoDays = buildCommunityAllowanceChartModel(series, { rangeDays: 1 });
+  assert.equal(twoDays.dots.length, 1);
+  assert.equal(twoDays.sparse, true);
+});
+
+test("the allowance section renders the estimate with its visible caveat", () => {
+  const documentRef = fakeDocument();
+  const container = documentRef.createElement("div");
+  const stateNode = documentRef.createElement("span");
+  const state = renderCommunityAllowanceSection({
+    documentRef,
+    container,
+    stateNode,
+    payload: publishedDailySeries({
+      days: [
+        allowanceDay("2026-08-06", allowanceBlock({
+          fitCount: 4,
+          centralUsd: 1700,
+        })),
+        allowanceDay("2026-08-07", allowanceBlock({
+          fitCount: 5,
+          centralUsd: 1879,
+        })),
+      ],
+    }),
+  });
+  assert.equal(state, "published");
+  assert.equal(stateNode.textContent, "Allowance estimates available");
+  assert.equal(stateNode.className, "evidence-chip");
+  // The headline claim, in dollars, with the per-window qualification.
+  assert.match(container.text, /\$1,879/u);
+  assert.match(container.text, /per 7 days, API-price equivalent/u);
+  // The plausible range is spelled out beside the central number.
+  assert.match(container.text, /\$1,500/u);
+  assert.match(container.text, /\$2,300/u);
+  // The participant count is visible copy, not a tooltip: with one account
+  // contributing, the page says so plainly.
+  assert.match(container.text, /from 1 contributing account\b/u);
+  assert.match(container.text, /5 qualifying reset fits in the trailing 30 days/u);
+  // The methodology note names the shared gates and the absent span floor.
+  assert.match(container.text, /no display-side span floor/u);
+  // Chart present with band, line, and fit dots; sparse two-point series
+  // carries the still-filling note.
+  const svg = container.descendants().find(({ tag }) => tag === "svg");
+  assert.ok(svg, "the allowance section renders its inline SVG chart");
+  assert.ok(svg.descendants().some((element) => (
+    element.attributes.get("class") === "allowance-central-line"
+  )));
+  assert.ok(svg.descendants().some((element) => (
+    element.attributes.get("class") === "allowance-band-area"
+  )));
+  assert.equal(
+    svg.descendants().filter((element) => (
+      element.attributes.get("class") === "allowance-fit-dot"
+    )).length,
+    2,
+  );
+  assert.match(container.text, /still filling/u);
+});
+
+test("the allowance section degrades honestly through every state", () => {
+  // Not published at all: fixed state copy, neutral chip.
+  for (const [payload, expectedState, marker] of [
+    [null, "service_unavailable", /temporarily unavailable/u],
+    [{ schemaVersion: "wrong" }, "unsupported_schema", /cannot be displayed safely/u],
+    [publishedDailySeries({ days: [] }), "none_published", /No community days/u],
+  ]) {
+    const documentRef = fakeDocument();
+    const container = documentRef.createElement("div");
+    const stateNode = documentRef.createElement("span");
+    const state = renderCommunityAllowanceSection({
+      documentRef,
+      container,
+      stateNode,
+      payload,
+    });
+    assert.equal(state, expectedState);
+    assert.equal(stateNode.textContent, "Allowance estimates unavailable");
+    assert.equal(stateNode.className, "evidence-chip neutral");
+    assert.match(container.text, marker, expectedState);
+  }
+
+  // Published days exist but no estimate has accrued anywhere.
+  {
+    const documentRef = fakeDocument();
+    const container = documentRef.createElement("div");
+    const stateNode = documentRef.createElement("span");
+    const state = renderCommunityAllowanceSection({
+      documentRef,
+      container,
+      stateNode,
+      payload: publishedDailySeries(),
+    });
+    assert.equal(state, "estimates_accumulating");
+    assert.equal(stateNode.textContent, "Estimates still accumulating");
+    assert.match(container.text, /still accumulating/u);
+    assert.equal(
+      container.descendants().some(({ tag }) => tag === "svg"),
+      false,
+    );
+  }
+
+  // Estimates exist, but the selected range excludes all of them.
+  {
+    const documentRef = fakeDocument();
+    const container = documentRef.createElement("div");
+    const stateNode = documentRef.createElement("span");
+    const state = renderCommunityAllowanceSection({
+      documentRef,
+      container,
+      stateNode,
+      payload: publishedDailySeries({
+        from: "2025-08-10",
+        to: "2026-08-10",
+        days: [
+          allowanceDay("2026-04-01", allowanceBlock()),
+          publishedDailyDay("2026-08-07", 1),
+        ],
+      }),
+      rangeDays: 30,
+    });
+    assert.equal(state, "no_estimates_in_range");
+    assert.match(container.text, /No allowance estimates fall inside this range/u);
+  }
+});
+
+test("the allowance section follows the active UI language", () => {
+  const documentRef = fakeDocument();
+  documentRef.documentElement.lang = "zh-Hans";
+  const container = documentRef.createElement("div");
+  const stateNode = documentRef.createElement("span");
+  renderCommunityAllowanceSection({
+    documentRef,
+    container,
+    stateNode,
+    payload: publishedDailySeries({
+      days: [allowanceDay("2026-08-07", allowanceBlock())],
+    }),
+  });
+  assert.equal(stateNode.textContent, "额度估计可用");
+  assert.match(container.text, /来自 1 个贡献账户/u);
 });
 
 test("the install card refuses a partially injected release", () => {

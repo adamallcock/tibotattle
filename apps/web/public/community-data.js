@@ -275,6 +275,61 @@ export function communityDailyWindow(nowMs = Date.now()) {
   return { from, to };
 }
 
+// The allowance block is additive on community-daily-aggregate-v1.0: older
+// published revisions never carried it, so a missing or invalid block is
+// per-day-absent (`allowance: null`), never `unsupported_schema`. Only the
+// exact published basis is interpreted; a different basis is a different
+// claim this client does not understand and therefore does not render.
+// The basis is pinned to one declared plan cohort — the page's copy names
+// the Codex Pro (20x) plan, so a block claiming any other cohort (or a
+// pooled, cohort-less basis) must not render under that copy.
+export const COMMUNITY_ALLOWANCE_BASIS = "seven_day_codex_pro20x_trailing_30d";
+export const COMMUNITY_ALLOWANCE_PLAN_TYPE = "pro";
+export const COMMUNITY_ALLOWANCE_PLAN_VARIANT = "pro-20x";
+
+function normalizedDailyAllowance(candidate) {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return null;
+  }
+  if (candidate.basis !== COMMUNITY_ALLOWANCE_BASIS
+      || candidate.planType !== COMMUNITY_ALLOWANCE_PLAN_TYPE
+      || candidate.planVariant !== COMMUNITY_ALLOWANCE_PLAN_VARIANT) {
+    return null;
+  }
+  const fitCount = finite(candidate.fitCount, null);
+  const participantCount = finite(candidate.participantCount, null);
+  if (!Number.isSafeInteger(fitCount)
+      || fitCount < 0
+      || !Number.isSafeInteger(participantCount)
+      || participantCount < 0
+      || (fitCount === 0) !== (participantCount === 0)) {
+    return null;
+  }
+  if (fitCount === 0) {
+    if (candidate.centralUsd !== null || candidate.band80Usd !== null) {
+      return null;
+    }
+    return { fitCount: 0, participantCount: 0, centralUsd: null, band80Usd: null };
+  }
+  const centralUsd = finite(candidate.centralUsd, null);
+  if (centralUsd === null || centralUsd <= 0) return null;
+  let band80Usd = null;
+  if (candidate.band80Usd !== null && candidate.band80Usd !== undefined) {
+    const raw = candidate.band80Usd;
+    if (typeof raw !== "object" || Array.isArray(raw)) return null;
+    const lowerUsd = finite(raw.lowerUsd, null);
+    const upperUsd = finite(raw.upperUsd, null);
+    if (lowerUsd === null
+        || upperUsd === null
+        || lowerUsd <= 0
+        || upperUsd < lowerUsd) {
+      return null;
+    }
+    band80Usd = { lowerUsd, upperUsd };
+  }
+  return { fitCount, participantCount, centralUsd, band80Usd };
+}
+
 function normalizedDailyTotals(candidate) {
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
     return null;
@@ -319,7 +374,13 @@ function normalizedDailyDay(candidate) {
   }
   const totals = normalizedDailyTotals(payload.totals);
   if (totals === null) return null;
-  return { day, revision, releasedAt, totals };
+  return {
+    day,
+    revision,
+    releasedAt,
+    totals,
+    allowance: normalizedDailyAllowance(payload.allowance),
+  };
 }
 
 /**

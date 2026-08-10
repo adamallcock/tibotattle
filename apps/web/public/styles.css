@@ -2831,6 +2831,86 @@ footer p { margin: 0; }
 .daily-output-dot { fill: var(--blue); }
 .daily-axis-events { fill: var(--green-text); }
 .daily-axis-output { fill: var(--blue); }
+/*
+ * The community allowance figure: the section's centerpiece. Central fit and
+ * band read in the brand green so the hero estimate is visually distinct from
+ * the blue activity series below it.
+ */
+.community-site .community-allowance {
+  margin-top: 28px;
+}
+.community-site .allowance-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: flex-end;
+  flex-shrink: 0;
+}
+.community-site .allowance-controls .evidence-chip {
+  margin: 0;
+}
+.community-site .allowance-headline {
+  margin-top: 15px;
+}
+.community-site .allowance-headline-value {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  margin: 0;
+}
+.community-site .allowance-headline-value strong {
+  font-family: var(--serif);
+  font-size: clamp(2rem, 3.4vw, 2.9rem);
+  font-weight: var(--weight-regular);
+  letter-spacing: -.03em;
+  line-height: 1;
+}
+.community-site .allowance-headline-value span {
+  max-width: 22ch;
+  color: var(--muted);
+  font-size: .72rem;
+  line-height: 1.35;
+}
+.community-site .allowance-headline-band,
+.community-site .allowance-headline-caveat {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: .74rem;
+}
+.community-site .daily-legend-swatch.allowance-central {
+  height: 3px;
+  border-radius: 999px;
+  background: var(--green);
+}
+.community-site .daily-legend-swatch.allowance-band {
+  background: var(--green);
+  opacity: .18;
+}
+.community-site .daily-legend-swatch.allowance-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: var(--green);
+}
+.allowance-band-area {
+  fill: var(--green);
+  opacity: .14;
+  stroke: none;
+}
+.allowance-band-mark {
+  stroke: var(--green);
+  opacity: .3;
+  stroke-width: 6;
+  stroke-linecap: round;
+}
+.allowance-central-line {
+  fill: none;
+  stroke: var(--green);
+  stroke-width: 2.2;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+.allowance-fit-dot { fill: var(--green); }
 .community-site .resource-main {
   width: min(960px, calc(100% - 48px));
   margin: 0 auto;
@@ -3117,6 +3197,9 @@ footer p { margin: 0; }
   }
   .community-site .activity-heading {
     display: grid;
+  }
+  .community-site .allowance-controls {
+    align-items: flex-start;
   }
   .community-site .resource-main {
     width: min(100% - 36px, 960px);

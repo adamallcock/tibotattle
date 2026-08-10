@@ -11,7 +11,10 @@
 // the community view are the same modules the in-app dashboard entry uses.
 
 import { PublicCommunityClient } from "./community-data.js";
-import { renderCommunityDailySeries } from "./community-view.js";
+import {
+  renderCommunityAllowanceSection,
+  renderCommunityDailySeries,
+} from "./community-view.js";
 import {
   renderInstallerJourney,
 } from "./install-cta.js";
@@ -45,6 +48,10 @@ const publicRequestIdPattern =
 let lastCommunityDailyPayload = null;
 let lastCommunityDailyFailure = null;
 let communityDailySettled = false;
+// The allowance range selection: 30/90 calendar days or null for the whole
+// published series. Re-rendering is purely client-side — the year window is
+// already fetched — so a range change never issues a request.
+let allowanceRangeDays = null;
 const communityClient = new PublicCommunityClient();
 
 function publicErrorCode(candidate) {
@@ -70,7 +77,7 @@ export function setPublicDailyPresentation(documentRef, state, {
   const hero = documentRef.querySelector("#community-daily-hero");
   const panelState = documentRef.querySelector("#community-daily-panel-state");
   const panelStatus = documentRef.querySelector("#community-daily-status");
-  if (title) title.textContent = t("community.daily.title");
+  if (title) title.textContent = t("community.title");
   const presentation = failed || state === "service_unavailable"
     ? [t("community.daily.seriesUnavailable"), false]
     : {
@@ -107,7 +114,39 @@ function renderPublicInstallerJourney() {
   return release;
 }
 
+function renderCommunityAllowanceResult(payload) {
+  const container = $("#community-allowance-result");
+  if (!container) return;
+  renderCommunityAllowanceSection({
+    documentRef: document,
+    container,
+    stateNode: $("#community-allowance-state"),
+    payload,
+    rangeDays: allowanceRangeDays,
+  });
+}
+
+function wireAllowanceRangeControls() {
+  const controls = $("#community-allowance-range-controls");
+  if (!controls) return;
+  controls.addEventListener("click", (event) => {
+    const button = event.target?.closest?.("button[data-range-days]");
+    if (!button) return;
+    allowanceRangeDays = button.dataset.rangeDays === ""
+      ? null
+      : Number(button.dataset.rangeDays);
+    for (const candidate of controls.querySelectorAll("button[data-range-days]")) {
+      candidate.classList.toggle("active", candidate === button);
+      candidate.setAttribute("aria-pressed", String(candidate === button));
+    }
+    if (communityDailySettled) {
+      renderCommunityAllowanceResult(lastCommunityDailyPayload);
+    }
+  });
+}
+
 function renderCommunityDailyResult({ payload, failure = null }) {
+  renderCommunityAllowanceResult(payload);
   const container = $("#community-daily-result");
   const state = renderCommunityDailySeries({
     documentRef: document,
@@ -154,6 +193,7 @@ async function loadCommunityDailySeries() {
 
 if (typeof document !== "undefined") {
   renderPublicInstallerJourney();
+  wireAllowanceRangeControls();
   void loadCommunityDailySeries();
   window.addEventListener("tibotattle:locale-change", (event) => {
     setFormattingLocale(event.detail?.formatLocale ?? localization.formatLocale());
