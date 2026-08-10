@@ -229,6 +229,28 @@ const PINNED_PACKAGES = Object.freeze({
   runcost: "0.2.1",
 });
 
+// A name/version match only authenticates attacker-retainable metadata: a
+// poisoned package that keeps its package.json name and version passes. Each
+// external third-party package's installed tree is therefore additionally
+// pinned to a reviewed, deterministic file-tree digest (content + structure,
+// nested node_modules excluded). pinnedPackage() recomputes the digest and
+// fails the build before any of those bytes are copied into the signed app.
+// Bump a value here only through a reviewed dependency update, alongside the
+// version above.
+const PINNED_PACKAGE_TREE_DIGESTS = Object.freeze({
+  "@github/keytar":
+    "0a09b62fbf597c176747009631e671c0625530132a471b6a1aa47153edf131be",
+  ajv: "7fecaf9a9ff3f41dabc7f7d762c7fecb8384c38a3c0dd4e6da0f3b3ef04569ca",
+  "fast-deep-equal":
+    "6c98665ed0585630ce02fbf064e6ed854f8e6546cb1e534158dbfbc18e05aa85",
+  "fast-uri": "5d5e9a9ba8b7f156f13720ade07460da26fa0c5407dbb179b9b622f09896d6c9",
+  "json-schema-traverse":
+    "71ac31baf5e8476eb746605c96d1961a1e7474d4491828506602cbf17b5c5af6",
+  "require-from-string":
+    "9e1890ada44ec4673a9170d2b2d1210c80e57e225c3ac07011fafbe5a9694da7",
+  runcost: "873e747570e3dfeced68ada15d5144734356a8fc084d2618cb4f73565bd6929b",
+});
+
 const TELEMETRY_CONTRACT_PACKAGE_NAME =
   "@app-usagemonitor/telemetry-contract";
 const TELEMETRY_CONTRACT_PACKAGE_ROOT = join(
@@ -1234,15 +1256,69 @@ function readPackage(path) {
   return readFile(path, "utf8").then((text) => JSON.parse(text));
 }
 
-async function pinnedPackage(name, packagePath) {
+/**
+ * A deterministic content-and-structure digest of an installed package tree,
+ * used to authenticate third-party bytes beyond their retainable name/version
+ * metadata. The root is realpath-resolved; entries are visited in a fixed
+ * sorted order; file content, sizes, and symlink targets all contribute; and a
+ * nested `node_modules` is excluded so a package's own reviewed content is
+ * pinned independently of however its dependencies happen to be laid out.
+ */
+export async function pinnedPackageTreeDigest(packageRoot) {
+  const resolvedRoot = await realpath(packageRoot);
+  const hash = createHash("sha256");
+  async function walk(absolute, relativePath) {
+    const entries = await readdir(absolute, { withFileTypes: true });
+    entries.sort((left, right) => (
+      left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+    ));
+    for (const entry of entries) {
+      if (entry.name === "node_modules") continue;
+      const childAbsolute = join(absolute, entry.name);
+      const childRelative = relativePath === ""
+        ? entry.name
+        : `${relativePath}/${entry.name}`;
+      const info = await lstat(childAbsolute);
+      if (info.isSymbolicLink()) {
+        hash.update(`L\0${childRelative}\0${await readlink(childAbsolute)}\0`);
+      } else if (info.isDirectory()) {
+        hash.update(`D\0${childRelative}\0`);
+        await walk(childAbsolute, childRelative);
+      } else if (info.isFile()) {
+        const fileHash = createHash("sha256")
+          .update(await readFile(childAbsolute))
+          .digest("hex");
+        hash.update(`F\0${childRelative}\0${info.size}\0${fileHash}\0`);
+      } else {
+        hash.update(`O\0${childRelative}\0`);
+      }
+    }
+  }
+  await walk(resolvedRoot, "");
+  return hash.digest("hex");
+}
+
+export async function pinnedPackage(name, packagePath) {
   const manifest = await readPackage(packagePath);
   if (manifest.name !== name || manifest.version !== PINNED_PACKAGES[name]) {
     fail(`Pinned package mismatch for ${name}`);
+  }
+  // Authenticate the installed bytes, not just name/version: recompute the tree
+  // digest and reject any tampered package before it is copied into the signed
+  // app. A package without a reviewed digest pin is refused outright.
+  const expectedDigest = PINNED_PACKAGE_TREE_DIGESTS[name];
+  if (typeof expectedDigest !== "string") {
+    fail(`Missing reviewed tree digest for pinned package ${name}`);
+  }
+  const treeDigest = await pinnedPackageTreeDigest(dirname(packagePath));
+  if (treeDigest !== expectedDigest) {
+    fail(`Pinned package tree digest mismatch for ${name}`);
   }
   return {
     name,
     version: manifest.version,
     license: manifest.license ?? null,
+    treeDigest,
   };
 }
 

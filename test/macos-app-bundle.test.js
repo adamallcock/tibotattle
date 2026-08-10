@@ -19,6 +19,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -67,6 +68,8 @@ import {
   normalizeMacOSBuildProfile,
   normalizeMacOSCentralOrigin,
   parseMacOSBuildArguments,
+  pinnedPackage,
+  pinnedPackageTreeDigest,
   stageMacOSWebModules,
   stageMacOSWorkspaceRuntimePackages,
   installMacOSExternalBuildOutput,
@@ -6098,4 +6101,52 @@ test("build script itself does not admit private output trees", async () => {
   );
   assert.doesNotMatch(source, /cp\s+-R|copy.*REPOSITORY_ROOT.*resources/iu);
   assert.equal(await realpath(REPOSITORY_ROOT), REPOSITORY_ROOT);
+});
+
+// csf_efb42178: pinnedPackage() previously authenticated external packages only
+// by name and version, both attacker-retainable, then copied those installed
+// bytes into the signed app. It now also verifies a reviewed deterministic
+// file-tree digest of the installed package, rejecting tampered bytes before
+// any copy or signing.
+test("pinnedPackage authenticates external packages by reviewed file-tree digest, not just name and version", async (t) => {
+  const rootRequire = createRequire(join(REPOSITORY_ROOT, "package.json"));
+
+  // The real installed package passes and its digest is recorded for provenance.
+  const realPackageJson = rootRequire.resolve("ajv/package.json");
+  const accepted = await pinnedPackage("ajv", realPackageJson);
+  assert.equal(accepted.name, "ajv");
+  assert.equal(accepted.version, "8.20.0");
+  assert.match(accepted.treeDigest, /^[0-9a-f]{64}$/u);
+  // The recorded digest is exactly the reviewed pin and reproduces on a second
+  // read, so it is a stable provenance value.
+  assert.equal(
+    accepted.treeDigest,
+    await pinnedPackageTreeDigest(dirname(realPackageJson)),
+  );
+
+  // A tampered package that keeps the pinned name and version but changes its
+  // bytes is rejected before copying — the version-only check would have
+  // accepted it.
+  const tamperedRoot = await mkdtemp(
+    join(tmpdir(), "usage-monitor-pinned-package-"),
+  );
+  t.after(() => rm(tamperedRoot, { recursive: true, force: true }));
+  await writeFile(
+    join(tamperedRoot, "package.json"),
+    `${JSON.stringify({ name: "ajv", version: "8.20.0" }, null, 2)}\n`,
+  );
+  await writeFile(
+    join(tamperedRoot, "index.js"),
+    "module.exports = function () { /* poisoned */ return true; };\n",
+  );
+  await assert.rejects(
+    pinnedPackage("ajv", join(tamperedRoot, "package.json")),
+    /tree digest mismatch/u,
+  );
+
+  // The digest is sensitive to any content change under the tree.
+  const before = await pinnedPackageTreeDigest(tamperedRoot);
+  await writeFile(join(tamperedRoot, "index.js"), "module.exports = 1;\n");
+  const after = await pinnedPackageTreeDigest(tamperedRoot);
+  assert.notEqual(before, after);
 });
