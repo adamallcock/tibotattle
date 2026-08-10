@@ -581,3 +581,255 @@ test("the local kick route resumes the schedule now and starts a due pass (2026-
     await rm(files.root, { recursive: true });
   }
 });
+
+const SERVICE_ORIGIN = "http://127.0.0.1:9";
+
+function persistedConsentSettings() {
+  return {
+    schemaVersion: "incremental-contribution-sync-settings-v1.0",
+    consent: {
+      consentedAt: "2026-08-08T17:31:13.735Z",
+      destinationOrigin: SERVICE_ORIGIN,
+      telemetrySchemaVersion: "telemetry-contribution-v1.0",
+      fieldDictionaryVersion: "telemetry-v1.0-registry-2026-08-07.1",
+      privacyContractVersion: "ongoing-privacy-safe-telemetry-v1.0",
+    },
+    paused: false,
+    pausedReason: null,
+    retryCount: 0,
+    lastAttemptAt: null,
+    lastOutcome: null,
+    nextAttemptAt: null,
+    progress: {
+      daysTotal: 86,
+      daysSynced: 7,
+      daysPending: 79,
+      chunksUploaded: 80,
+      acknowledgedThroughDay: "2026-05-24",
+    },
+  };
+}
+
+async function seedConsentedIncrementalSettings(files) {
+  const privateDirectory = join(files.stateRoot, "private");
+  await mkdir(privateDirectory, { recursive: true, mode: 0o700 });
+  await writeFile(
+    join(privateDirectory, "incremental-contribution-sync-v1.json"),
+    `${JSON.stringify(persistedConsentSettings())}\n`,
+    { mode: 0o600 },
+  );
+}
+
+async function statusUntil(base, predicate) {
+  let status = null;
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    status = await fetch(
+      `${base}/api/local/contribution/incremental-status`,
+    ).then((response) => response.json());
+    if (predicate(status)) return status;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return status;
+}
+
+test("a thrown capability failure pauses as device_unavailable instead of an anonymous run_failed loop (2026-08-10)", async () => {
+  // Observed live: a Sparkle update invalidated the audited Keychain
+  // binding, so the wiring's backend factory threw before the sync engine
+  // could shape the failure — and the controller walked an anonymous
+  // run_failed retry ladder forever while the dashboard showed no repair
+  // path. The wiring now hands the engine's own device_unavailable shape to
+  // the controller, which pauses with the reason the re-approve surface
+  // keys on, and the last honest progress survives.
+  const files = await fixture();
+  await seedConsentedIncrementalSettings(files);
+  const app = await startApp(files, {
+    contributionServiceOrigin: SERVICE_ORIGIN,
+    contributionDeviceBackendFactory: () => {
+      const error = new Error(
+        "Contribution device capability operation failed",
+      );
+      error.code = "contribution_device_credential_unavailable";
+      throw error;
+    },
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const kicked = await fetch(
+      `${base}/api/local/contribution/incremental-run`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1",
+          Origin: base,
+        },
+        body: "{}",
+      },
+    );
+    assert.equal(kicked.status, 200);
+    const status = await statusUntil(base, (value) => value.paused === true);
+    assert.equal(status.status, "available");
+    assert.equal(status.paused, true);
+    assert.equal(status.pausedReason, "device_unavailable");
+    assert.equal(status.lastOutcome.code, "device_unavailable");
+    assert.equal(status.lastOutcome.status, "paused");
+    // The no-run outcome measured nothing: the progress a real pass
+    // recorded is still shown beside the pause.
+    assert.deepEqual(status.progress, {
+      daysTotal: 86,
+      daysSynced: 7,
+      daysPending: 79,
+      chunksUploaded: 80,
+      acknowledgedThroughDay: "2026-05-24",
+    });
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("the credential reset succeeds by attribute delete when the backend cannot even be constructed (2026-08-10)", async () => {
+  // Observed live: the in-app cure 500ed in exactly the state it exists to
+  // cure, because building the Keychain backend itself threw. The reset now
+  // treats the backend as best-effort and falls back to an
+  // attribute-addressed delete that needs neither the native binding nor
+  // the item's access control list.
+  const files = await fixture();
+  const attributeDeletes = [];
+  const app = await startApp(files, {
+    contributionDeviceBackendFactory: () => {
+      const error = new Error(
+        "Contribution device capability operation failed",
+      );
+      error.code = "contribution_device_credential_unavailable";
+      throw error;
+    },
+    contributionDeviceCredentialAttributeDelete: async () => {
+      attributeDeletes.push("deleted");
+      return "deleted";
+    },
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const response = await fetch(
+      `${base}/api/local/contribution/device-credential-reset`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1",
+          Origin: base,
+        },
+        body: JSON.stringify({ confirm: "reset_device_credential" }),
+      },
+    );
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      schemaVersion: "local-contribution-device-reset-v0.1",
+      status: "reset",
+      credential: "deleted",
+      binding: "already_missing",
+      hostedDataDeleted: false,
+      includesIdentifiers: false,
+    });
+    assert.equal(attributeDeletes.length, 1);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("the credential reset falls back to attribute delete when the read is broken, and never when it works", async () => {
+  const files = await fixture();
+
+  // A backend whose read throws — the broken access-control state — still
+  // resets, by attributes.
+  const brokenDeletes = [];
+  const broken = await startApp(files, {
+    contributionDeviceBackendFactory: () => ({
+      async read() {
+        const error = new Error("macOS Keychain backend failed");
+        error.code = "export_identity_keychain_denied";
+        throw error;
+      },
+      async createIfMissing() {
+        throw new Error("unexpected createIfMissing");
+      },
+      async deleteExact() {
+        throw new Error("unexpected deleteExact");
+      },
+    }),
+    contributionDeviceCredentialAttributeDelete: async () => {
+      brokenDeletes.push("deleted");
+      return "deleted";
+    },
+  });
+  try {
+    const base = `http://127.0.0.1:${broken.port}`;
+    const response = await fetch(
+      `${base}/api/local/contribution/device-credential-reset`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1",
+          Origin: base,
+        },
+        body: JSON.stringify({ confirm: "reset_device_credential" }),
+      },
+    );
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.status, "reset");
+    assert.equal(body.credential, "deleted");
+    assert.equal(brokenDeletes.length, 1);
+  } finally {
+    await broken.close();
+  }
+
+  // A backend that reads cleanly keeps today's exact-value behavior: a
+  // missing credential reports already_absent and the attribute delete is
+  // never consulted.
+  const healthyDeletes = [];
+  const healthy = await startApp(files, {
+    contributionDeviceBackendFactory: () => ({
+      async read() {
+        return null;
+      },
+      async createIfMissing() {
+        throw new Error("unexpected createIfMissing");
+      },
+      async deleteExact() {
+        throw new Error("unexpected deleteExact");
+      },
+    }),
+    contributionDeviceCredentialAttributeDelete: async () => {
+      healthyDeletes.push("deleted");
+      return "deleted";
+    },
+  });
+  try {
+    const base = `http://127.0.0.1:${healthy.port}`;
+    const response = await fetch(
+      `${base}/api/local/contribution/device-credential-reset`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1",
+          Origin: base,
+        },
+        body: JSON.stringify({ confirm: "reset_device_credential" }),
+      },
+    );
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.status, "already_absent");
+    assert.equal(body.credential, "already_missing");
+    assert.equal(body.binding, "already_missing");
+    assert.equal(healthyDeletes.length, 0);
+  } finally {
+    await healthy.close();
+    await rm(files.root, { recursive: true });
+  }
+});

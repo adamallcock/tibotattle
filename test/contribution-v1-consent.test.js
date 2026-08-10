@@ -208,6 +208,62 @@ test("device_unavailable auto-pauses exactly like the v0.1 queue, until resumed"
   assert.equal(runs.length, 2);
 });
 
+test("a no-run device_unavailable outcome pauses without clobbering the last honest progress (2026-08-10)", async () => {
+  // The wiring shapes a pre-engine capability failure (Keychain credential
+  // unreadable after a Sparkle update) into the engine's own
+  // device_unavailable form, with networkActivity false and zeroed counts
+  // because no pass ever ran. The pause and its reason must land; the zeros
+  // must not overwrite progress a real pass measured.
+  const { controller, runs, advance } = harness({
+    outcomes: [
+      runOutcome(),
+      runOutcome({
+        status: "failed",
+        daysTotal: 0,
+        daysSynced: 0,
+        daysPending: 0,
+        chunksUploaded: 0,
+        chunksSkipped: 0,
+        recordsUploaded: 0,
+        acknowledgedThroughDay: null,
+        failure: {
+          code: "device_unavailable",
+          retryable: false,
+          deviceUnavailable: true,
+          retryAfterMilliseconds: null,
+        },
+        networkActivity: false,
+      }),
+      runOutcome(),
+    ],
+  });
+  await controller.start();
+  await controller.approve();
+  const synced = await controller.runDue();
+  assert.equal(synced.lastOutcome.code, "synced");
+
+  advance(6 * 60 * 60 * 1_000);
+  const paused = await controller.runDue();
+  assert.equal(paused.paused, true);
+  assert.equal(paused.pausedReason, "device_unavailable");
+  assert.equal(paused.lastOutcome.code, "device_unavailable");
+  assert.equal(paused.nextAttemptAt, null);
+  // The last measured truth survives the pause verbatim.
+  assert.deepEqual(paused.progress, {
+    daysTotal: 2,
+    daysSynced: 2,
+    daysPending: 0,
+    chunksUploaded: 2,
+    acknowledgedThroughDay: "2026-08-02",
+  });
+
+  // The same cure as every device_unavailable: re-pairing resumes it.
+  const resumed = await controller.resume();
+  assert.equal(resumed.paused, false);
+  await controller.runDue();
+  assert.equal(runs.length, 3);
+});
+
 test("retryable failures back off exponentially and reset on success", async () => {
   const { controller, advance } = harness({
     outcomes: [
