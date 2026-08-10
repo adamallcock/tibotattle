@@ -46,7 +46,11 @@ const ED25519_PUBLIC_KEY_PATTERN = /^[A-Za-z0-9+/]{43}=$/u;
 const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 const XML_ATTRIBUTE_PATTERN =
   /\s+([A-Za-z_:][A-Za-z0-9:._-]*)\s*=\s*("[^"]*"|'[^']*')/gu;
-const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024 * 1024;
+// Mirror of SPARKLE_APPCAST_GUARD_MAX_ARTIFACT_BYTES in
+// apps/worker/src/sparkle-appcast-guard.ts: a candidate this module accepts
+// must never be one the deployed guard 422s, so the caps must agree — a DMG
+// past this size has to fail fast locally, before any artifact upload.
+const MAX_ARTIFACT_BYTES = 512 * 1024 * 1024;
 
 function fail(message, code) {
   const error = new Error(message);
