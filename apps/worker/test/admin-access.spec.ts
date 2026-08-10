@@ -322,6 +322,28 @@ describe("admin surface hostname gating", () => {
     expect(response.status).toBe(200);
   });
 
+  it("accepts the token from the CF_Authorization cookie when the header is absent", async () => {
+    // A Worker on a Custom Domain does not always receive the
+    // Cf-Access-Jwt-Assertion header; Access always sets CF_Authorization.
+    // The same JWT must verify from the cookie (owner-reported 2026-08-09).
+    const token = await signedAccessJwt();
+    const response = await handleRequest(
+      new Request(`${ADMIN_ORIGIN}/admin.html`, {
+        headers: { cookie: `CF_Authorization=${token}; other=1` },
+      }),
+      adminSurfaceBindings(),
+    );
+    expect(response.status).toBe(200);
+    // A cookie without the token is still refused.
+    const refused = await handleRequest(
+      new Request(`${ADMIN_ORIGIN}/admin.html`, {
+        headers: { cookie: "other=1" },
+      }),
+      adminSurfaceBindings(),
+    );
+    expect(refused.status).toBe(403);
+  });
+
   it("keeps the existing admin auth layer beneath a valid assertion", async () => {
     // A verified Access identity reaches the same fail-closed admin API the
     // public origin used to expose: without ADMIN_IDENTITY_LINK_KEY it is

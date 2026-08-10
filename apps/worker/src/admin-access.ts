@@ -15,6 +15,29 @@ import { ApiError } from "./errors";
  */
 
 export const ACCESS_JWT_HEADER = "cf-access-jwt-assertion";
+// Cloudflare Access delivers the application token two ways: the
+// Cf-Access-Jwt-Assertion request header AND the CF_Authorization cookie.
+// A Worker on a Custom Domain does not always receive the header, so the
+// documented-robust pattern reads the cookie as a fallback. The same JWT is
+// cryptographically verified either way.
+const ACCESS_JWT_COOKIE = "CF_Authorization";
+
+function accessTokenFromRequest(request: Request): string | null {
+  const header = request.headers.get(ACCESS_JWT_HEADER);
+  if (typeof header === "string" && header.length > 0) return header;
+  const cookieHeader = request.headers.get("cookie");
+  if (typeof cookieHeader !== "string" || cookieHeader.length === 0) {
+    return null;
+  }
+  for (const pair of cookieHeader.split(";")) {
+    const index = pair.indexOf("=");
+    if (index < 0) continue;
+    if (pair.slice(0, index).trim() !== ACCESS_JWT_COOKIE) continue;
+    const value = pair.slice(index + 1).trim();
+    return value.length > 0 ? value : null;
+  }
+  return null;
+}
 
 // An Access team domain is always `<team>.cloudflareaccess.com`. Anything
 // else — including an empty placeholder — is unconfigured, never a fetch.
@@ -267,14 +290,18 @@ export async function verifyAdminAccessAssertion(
   const jwksFetcher = environmentJwksFetcher(env);
   const nowMs = options.nowMs ?? Date.now();
 
-  const token = request.headers.get(ACCESS_JWT_HEADER);
+  const token = accessTokenFromRequest(request);
   // Coarse, non-sensitive observability (2026-08-09): the response never says
   // which check refused, which left an authenticated operator's rejection
   // undiagnosable. This logs only presence/shape and the claim mismatch
   // category to the Worker's own observability stream — never token bytes,
   // signatures, or identity. Remove once admin sign-in is confirmed working.
   console.warn("admin-access-attempt", JSON.stringify({
-    hasHeader: token !== null,
+    hasHeader: request.headers.get(ACCESS_JWT_HEADER) !== null,
+    hasCookie: /(?:^|;\s*)CF_Authorization=/u.test(
+      request.headers.get("cookie") ?? "",
+    ),
+    hasToken: token !== null,
     segments: typeof token === "string" ? token.split(".").length : 0,
     teamDomain: configuration.teamDomain,
     audiencePrefix: configuration.audience.slice(0, 8),
