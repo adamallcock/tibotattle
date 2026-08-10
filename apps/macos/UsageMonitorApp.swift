@@ -5670,7 +5670,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             ),
             externalLinkButton(
                 title: TiboTattleLocalization.string(.settingsGitHub),
-                address: "https://github.com/adamallcock"
+                address: "https://github.com/adamallcock/tibotattle"
             ),
             externalLinkButton(
                 title: TiboTattleLocalization.string(.settingsX),
