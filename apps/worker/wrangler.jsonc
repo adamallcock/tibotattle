@@ -289,7 +289,12 @@
         "UPLOAD_INGRESS_LEASE_SECONDS": "90",
         "UPLOAD_INGRESS_BODY_TOTAL_SECONDS": "60",
         "UPLOAD_INGRESS_BODY_IDLE_SECONDS": "15",
-        "SIGN_IN_START_MAX_PER_MINUTE": "20",
+        // Global backstop only — per-client abuse is bounded by the rate-limit
+        // bindings. 20/min was exhaustible by a handful of IPs and throttled a
+        // legitimate launch spike; 300/min (~5 starts/s of cheap D1 writes)
+        // keeps the ceiling meaningful without gating real sign-ins.
+        // Owner-raised 2026-08-10 for public launch.
+        "SIGN_IN_START_MAX_PER_MINUTE": "300",
         // A non-secret immutable label paired with the keyed fingerprint in
         // D1. Changing either it or IDENTITY_LINK_SECRET fails closed until a
         // separately reviewed dual-key identity migration exists.
