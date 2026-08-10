@@ -1850,14 +1850,34 @@ export async function publishSparkleUpdate({
         currentAppcast.content.toString("utf8"),
         releaseChannel,
       );
-      if (currentVersion === null
-          || compareBundleVersions(manifest.bundleVersion, currentVersion) <= 0) {
-        if (currentVersion !== null
-            && compareBundleVersions(manifest.bundleVersion, currentVersion) === 0
-            && currentEnclosures.filter(
-              (enclosure) => enclosure.version === manifest.bundleVersion
-                && enclosure.deltaFrom === undefined,
-            ).length !== 1) {
+      // A same-version --replace-appcast is permitted only as a document-only
+      // re-publication (for example re-signing the feed for Sparkle's signed
+      // appcast validation): the live full enclosure must be retained
+      // byte-for-byte so the immutable artifact state cannot drift under a
+      // version that installed clients have already observed.
+      const sameVersion = currentVersion !== null
+        && compareBundleVersions(manifest.bundleVersion, currentVersion) === 0;
+      const fullEnclosureFor = (enclosures) => enclosures.filter(
+        (enclosure) => enclosure.version === manifest.bundleVersion
+          && enclosure.deltaFrom === undefined,
+      );
+      const liveFullEnclosures = fullEnclosureFor(currentEnclosures);
+      const candidateFullEnclosures = fullEnclosureFor(appcastEnclosures(
+        appcastBytes.toString("utf8"),
+        releaseChannel,
+      ));
+      const documentOnlyReplacement = replaceAppcast
+        && sameVersion
+        && liveFullEnclosures.length === 1
+        && candidateFullEnclosures.length === 1
+        && liveFullEnclosures[0].url === candidateFullEnclosures[0].url
+        && liveFullEnclosures[0].length === candidateFullEnclosures[0].length
+        && liveFullEnclosures[0].signature
+          === candidateFullEnclosures[0].signature;
+      if (!documentOnlyReplacement
+          && (currentVersion === null
+            || compareBundleVersions(manifest.bundleVersion, currentVersion) <= 0)) {
+        if (sameVersion && liveFullEnclosures.length !== 1) {
           fail(
             "Live appcast has an ambiguous candidate-version publication state",
             "SPARKLE_UPDATE_APPCAST_AMBIGUOUS",
