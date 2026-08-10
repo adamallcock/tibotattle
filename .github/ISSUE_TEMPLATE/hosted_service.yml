@@ -1,0 +1,41 @@
+name: Hosted service issue
+description: Report a problem with the hosted community-aggregate service at tibotattle.com.
+labels: ["hosted-service"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The hosted service is operated by the maintainer. For security
+        problems (including anything touching contributor pseudonymity or
+        the upload/deletion endpoints), use a private GitHub Security
+        Advisory, not a public issue (see SECURITY.md).
+  - type: input
+    id: page
+    attributes:
+      label: Affected page or endpoint
+      placeholder: https://tibotattle.com/...
+    validations:
+      required: true
+  - type: input
+    id: when
+    attributes:
+      label: When it happened
+      description: Approximate date/time with timezone.
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: |
+        What you saw versus what you expected. Include error messages shown
+        by the site, but redact anything account-specific.
+    validations:
+      required: true
+  - type: checkboxes
+    id: no-session-content
+    attributes:
+      label: Content check
+      options:
+        - label: This report contains no prompts, model responses, or real file paths from coding-agent sessions.
+          required: true

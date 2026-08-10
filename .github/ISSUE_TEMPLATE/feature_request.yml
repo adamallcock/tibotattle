@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest an improvement to TiboTattle.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that TiboTattle does not support today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What you would like to happen. Sketches and examples welcome.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried, or other approaches that could solve the same problem.
+    validations:
+      required: false
+  - type: checkboxes
+    id: no-session-content
+    attributes:
+      label: Content check
+      options:
+        - label: This request contains no prompts, model responses, or real file paths from coding-agent sessions.
+          required: true
