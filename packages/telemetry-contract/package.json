@@ -1,6 +1,6 @@
 {
   "name": "@app-usagemonitor/telemetry-contract",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Runtime-neutral closed telemetry schemas, normalization, and validation.",
