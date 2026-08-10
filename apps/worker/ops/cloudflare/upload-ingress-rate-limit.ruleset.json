@@ -1,0 +1,27 @@
+{
+  "name": "tibotattle-upload-ingress-rate-limit",
+  "description": "Version-controlled pre-Worker abuse shed for public contribution uploads.",
+  "kind": "zone",
+  "phase": "http_ratelimit",
+  "rules": [
+    {
+      "ref": "tibotattle-upload-ingress-per-ip-v1",
+      "description": "Return a retryable JSON response before a per-IP upload flood reaches the Worker.",
+      "expression": "http.request.method eq \"POST\" and http.request.uri.path eq \"/api/v1/contributions\"",
+      "action": "block",
+      "action_parameters": {
+        "response": {
+          "status_code": 429,
+          "content_type": "application/json",
+          "content": "{\"error\":{\"code\":\"UPLOAD_INGRESS_EDGE_LIMIT_REACHED\"}}"
+        }
+      },
+      "ratelimit": {
+        "characteristics": ["ip.src"],
+        "period": 60,
+        "requests_per_period": 30,
+        "mitigation_timeout": 60
+      }
+    }
+  ]
+}
