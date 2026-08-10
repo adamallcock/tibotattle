@@ -18,6 +18,21 @@ import { parseStoredRecordJson } from "./stored-record";
 
 const MAX_DATASETS = 100;
 const MAX_ANALYSIS_RECORDS = 10_000;
+// The row ceiling bounds materialized input but not algorithmic complexity: a
+// near-maximal corpus with one distinct continuity tuple per row would drive
+// per-track work quadratic. A legitimate participant has a handful of tracks
+// (a few providers x plans x limits x windows across a bounded set of policy
+// epochs), so this ceiling sits far above real cardinality yet far below the
+// row ceiling, and it is enforced before any per-track analysis begins.
+const MAX_CONTINUITY_TRACKS = 256;
+
+// Usage events are matched to a track by the subset the per-track usage filter
+// uses: account track, provider, and policy epoch. The plan/limit fields on a
+// usage event are stamped from the seed, not the row.
+type UsageEventPartial = Omit<
+  QuotaUsageEventInput,
+  "planType" | "planVariant" | "limitId"
+>;
 
 interface DatasetRow {
   dataset_id: string;
@@ -80,6 +95,14 @@ function seedKey(row: TrackSeed): string {
     row.windowDurationMinutes,
     row.policyEpoch,
   ]);
+}
+
+function usageTrackEpochKey(
+  accountTrackId: string,
+  provider: string,
+  policyEpoch: string,
+): string {
+  return JSON.stringify([accountTrackId, provider, policyEpoch]);
 }
 
 function quotaTransport(row: AnalysisRecordRow): QuotaTransportRecord | null {
@@ -215,63 +238,98 @@ export async function accountScopedQuotaAnalysis(
     seeds.set(seedKey(seed), seed);
   }
   if (seeds.size === 0) return notTestable("supported_quota_track_unavailable");
+  // Reject an adversarial high-cardinality corpus before any per-track work,
+  // rather than letting distinct-seed count multiply the per-seed cost.
+  if (seeds.size > MAX_CONTINUITY_TRACKS) {
+    return notTestable("continuity_track_limit_exceeded");
+  }
+
+  // Group quota snapshots and usage events into keyed buckets in a single linear
+  // pass each, so each track reads only its own records instead of rescanning
+  // the full arrays. Total grouping work is O(rows); with the track ceiling
+  // above, total per-track work is bounded rather than quadratic in the corpus.
+  const quotaSnapshotsBySeed = new Map<string, QuotaSnapshotInput[]>();
+  for (const row of quota) {
+    if (!row.plan_type || !row.plan_variant || !row.limit_id
+        || !row.window_duration_minutes
+        || !row.slot || row.used_percent === null || !row.resets_at) continue;
+    const transport = quotaTransport(row);
+    if (typeof transport?.receivedTime !== "string"
+        || !Number.isSafeInteger(transport.displayPrecision)) continue;
+    const key = seedKey({
+      accountTrackId: row.account_track_id,
+      provider: row.provider,
+      planType: row.plan_type,
+      planVariant: row.plan_variant,
+      limitId: row.limit_id,
+      windowDurationMinutes: row.window_duration_minutes,
+      policyEpoch: row.policy_epoch,
+    });
+    const snapshot: QuotaSnapshotInput = {
+      snapshotId: row.occurrence_id,
+      datasetId: row.dataset_id,
+      accountTrackId: row.account_track_id,
+      provider: row.provider,
+      planType: row.plan_type,
+      planVariant: row.plan_variant,
+      limitId: row.limit_id,
+      slot: row.slot as QuotaSlot,
+      windowDurationMinutes:
+        row.window_duration_minutes as QuotaWindowDurationMinutes,
+      resetsAt: row.resets_at,
+      observedAt: row.observed_at,
+      receivedAt: transport.receivedTime,
+      usedPercent: row.used_percent,
+      displayPrecision: transport.displayPrecision as number,
+      policyEpoch: row.policy_epoch,
+    };
+    const bucket = quotaSnapshotsBySeed.get(key);
+    if (bucket) bucket.push(snapshot);
+    else quotaSnapshotsBySeed.set(key, [snapshot]);
+  }
+
+  const usageEventsByTrackEpoch = new Map<string, UsageEventPartial[]>();
+  for (const row of usage) {
+    if (row.server_cost_nanousd === null || row.server_pricing_status === null) {
+      continue;
+    }
+    const key = usageTrackEpochKey(
+      row.account_track_id,
+      row.provider,
+      row.policy_epoch,
+    );
+    const partial: UsageEventPartial = {
+      eventId: row.occurrence_id,
+      datasetId: row.dataset_id,
+      accountTrackId: row.account_track_id,
+      provider: row.provider,
+      observedAt: row.observed_at,
+      costNanousd: row.server_cost_nanousd,
+      pricingStatus: row.server_pricing_status as PricingStatus,
+      policyEpoch: row.policy_epoch,
+    };
+    const bucket = usageEventsByTrackEpoch.get(key);
+    if (bucket) bucket.push(partial);
+    else usageEventsByTrackEpoch.set(key, [partial]);
+  }
 
   const tracks = [];
   for (const seed of [...seeds.values()].sort((left, right) => (
     seedKey(left).localeCompare(seedKey(right))
   ))) {
-    const quotaSnapshots: QuotaSnapshotInput[] = quota.flatMap((row) => {
-      if (row.account_track_id !== seed.accountTrackId
-          || row.provider !== seed.provider
-          || row.plan_type !== seed.planType
-          || row.plan_variant !== seed.planVariant
-          || row.limit_id !== seed.limitId
-          || row.window_duration_minutes !== seed.windowDurationMinutes
-          || row.policy_epoch !== seed.policyEpoch
-          || !row.slot || row.used_percent === null || !row.resets_at) return [];
-      const transport = quotaTransport(row);
-      if (typeof transport?.receivedTime !== "string"
-          || !Number.isSafeInteger(transport.displayPrecision)) return [];
-      return [{
-        snapshotId: row.occurrence_id,
-        datasetId: row.dataset_id,
-        accountTrackId: row.account_track_id,
-        provider: row.provider,
-        planType: row.plan_type,
-        planVariant: row.plan_variant,
-        limitId: row.limit_id,
-        slot: row.slot as QuotaSlot,
-        windowDurationMinutes:
-          row.window_duration_minutes as QuotaWindowDurationMinutes,
-        resetsAt: row.resets_at,
-        observedAt: row.observed_at,
-        receivedAt: transport.receivedTime,
-        usedPercent: row.used_percent,
-        displayPrecision: transport.displayPrecision as number,
-        policyEpoch: row.policy_epoch,
-      }];
-    });
-    const usageEvents: QuotaUsageEventInput[] = usage.flatMap((row) => (
-      row.account_track_id === seed.accountTrackId
-        && row.provider === seed.provider
-        && row.policy_epoch === seed.policyEpoch
-        && row.server_cost_nanousd !== null
-        && row.server_pricing_status !== null
-        ? [{
-          eventId: row.occurrence_id,
-          datasetId: row.dataset_id,
-          accountTrackId: row.account_track_id,
-          provider: row.provider,
-          planType: seed.planType,
-          planVariant: seed.planVariant,
-          limitId: seed.limitId,
-          observedAt: row.observed_at,
-          costNanousd: row.server_cost_nanousd,
-          pricingStatus: row.server_pricing_status as PricingStatus,
-          policyEpoch: row.policy_epoch,
-        }]
-        : []
-    ));
+    const quotaSnapshots = quotaSnapshotsBySeed.get(seedKey(seed)) ?? [];
+    const usageEvents: QuotaUsageEventInput[] = (
+      usageEventsByTrackEpoch.get(usageTrackEpochKey(
+        seed.accountTrackId,
+        seed.provider,
+        seed.policyEpoch,
+      )) ?? []
+    ).map((partial) => ({
+      ...partial,
+      planType: seed.planType,
+      planVariant: seed.planVariant,
+      limitId: seed.limitId,
+    }));
     const evidence = buildResetEvidence({ datasets, quotaSnapshots, usageEvents });
     const calibration = analyzeQuotaCalibration(evidence);
     tracks.push({
