@@ -1285,6 +1285,30 @@ export async function buildLocalCompanionSnapshot({
   // list names the withheld pricing - so conflating them buys nothing and
   // costs the reader a true statement.
   const freshnessStatus = collectorFreshnessStatus;
+  // The cache reader's "stale" verdict is wall-clock age alone:
+  // now - coveredAt.endAt > MAX_REPLAY_SAFE_CACHE_AGE_MS. But coveredAt.endAt
+  // is stamped only when the cache is REBUILT, and the foreground refresh
+  // deliberately reuses the cache untouched whenever a pass writes no new
+  // rollout usage records (local-companion-refresh.js). An idle stretch —
+  // quota observations arriving, no token usage — therefore ages the cache
+  // past the threshold while the newest observation stays seconds-fresh, and
+  // the "stale" verdict indicts totals that in fact cover every known usage
+  // record. Wall clock is the wrong comparator. The honest question is
+  // whether exportable evidence exists beyond the cache's coverage end, the
+  // same comparison the unified-index lag warning below already makes, so the
+  // verdict is re-derived against that clock here and "stale" survives only
+  // when newer evidence genuinely outruns the coverage end.
+  const accountingCoverageEndMs = replaySafeCache === null
+    ? Number.NaN
+    : Date.parse(replaySafeCache.coveredAt.endAt);
+  const accountingCoversKnownEvidence = Number.isFinite(accountingCoverageEndMs)
+    && (collector.latestExportableRecordAt === null
+      || collector.latestExportableRecordAt - accountingCoverageEndMs
+        <= MAX_REPLAY_SAFE_CACHE_AGE_MS);
+  const accountingStatus =
+    replaySafeAccounting.status === "stale" && accountingCoversKnownEvidence
+      ? "available"
+      : replaySafeAccounting.status;
   // Recent periods prefer the freshly refreshed replay-safe cache, then the
   // unified index (also replay-suppressed), and fall back to the raw collector
   // projection — which counts fork replay — only when neither exists.
@@ -1375,11 +1399,15 @@ export async function buildLocalCompanionSnapshot({
   if (collectorFreshnessStatus === "stale") {
     warnings.push("The newest retained collector evidence is stale.");
   }
-  if (replaySafeAccounting.status === "stale") {
-    warnings.push(
-      `Replay-safe cost accounting is ${Math.round((replaySafeAccounting.ageSeconds ?? 0) / 60)} minutes old and is shown as stale until refreshed.`,
-    );
-  }
+  // The "Replay-safe cost accounting is N minutes old and is shown as stale
+  // until refreshed" banner is gone (owner-directed, 2026-08-10). Trace: it
+  // fired on wall-clock cache age, but coveredAt.endAt only advances on a
+  // rebuild and the refresh loop intentionally reuses the cache when a pass
+  // adds no rollout usage — so the banner condemned figures that still
+  // covered every known usage record while the dashboard's own observation
+  // read seconds-fresh. The verdict is now derived against the newest
+  // exportable evidence (`accountingStatus` above) and stays published as
+  // machine-readable status fields; no sentence returns here.
   if (replaySafeAccounting.errorCode === "cache_price_registry_outdated") {
     warnings.push(
       "Official API prices changed. Cached price estimates are withheld until the next local replay rebuilds them with the current registry.",
@@ -1466,7 +1494,7 @@ export async function buildLocalCompanionSnapshot({
           latestObservedAt: latestEvidenceAt,
           ageSeconds: evidenceAgeSeconds,
           staleAfterSeconds: MAX_COLLECTOR_LIVE_AGE_MS / 1_000,
-          accountingStatus: replaySafeAccounting.status,
+          accountingStatus,
           accountingAgeSeconds: replaySafeAccounting.ageSeconds ?? null,
         },
       collector: {
@@ -1563,7 +1591,7 @@ export async function buildLocalCompanionSnapshot({
           : unifiedAvailable
             ? "unified_local_index_replay_suppressed"
             : "collector_projection_unverified",
-        accountingCacheStatus: replaySafeAccounting.status,
+        accountingCacheStatus: accountingStatus,
         replayExclusionDiagnostics: replaySafeCache?.diagnostics ?? null,
         evidenceStartDate: OPENAI_PRICE_EVIDENCE_START_DATE,
         historyCoverage: archiveCoverage,
@@ -1666,7 +1694,7 @@ export async function buildLocalCompanionSnapshot({
           : unifiedAvailable
             ? "unified_local_index_replay_suppressed"
             : "collector_projection_unverified",
-        accountingCacheStatus: replaySafeAccounting.status,
+        accountingCacheStatus: accountingStatus,
         replayExclusionDiagnostics: replaySafeCache?.diagnostics ?? null,
         historyCoverage: archiveCoverage,
         historyPeriodStatus: archiveAccounting.status,

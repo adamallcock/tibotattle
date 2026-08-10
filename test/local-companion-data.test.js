@@ -742,6 +742,122 @@ test("the stated speed mode attributes unrecorded evidence and never overrides a
   }
 });
 
+test("an idle-period cache older than the wall clock threshold stays available with no stale banner", async () => {
+  // Reproduces the owner's screenshot conflict: the newest observation is a
+  // quota snapshot from one minute ago, while the replay-safe cache was last
+  // rebuilt 54 minutes ago because the refresh loop reuses it on passes with
+  // no new rollout usage. No usage evidence exists beyond the cache's
+  // coverage end, so the accounting is complete, not stale.
+  const root = await fixtureRoot();
+  const stateFile = join(root, ".usage-monitor", "local-collector-state-v1.sqlite");
+  try {
+    const usage = (observedAt) => JSON.stringify({
+      schemaVersion: "0.3",
+      kind: "codex_rollout_usage_snapshot",
+      observedAt,
+      model: "gpt-5.6-sol",
+      components: { input_uncached_tokens: 100 },
+    });
+    const quota = (observedAt) => JSON.stringify({
+      kind: "codex_quota_snapshot",
+      observedAt,
+      windows: [],
+    });
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      [
+        usage("2026-07-25T11:00:00.000Z"),
+        quota("2026-07-25T12:53:00.000Z"),
+      ].map((line) => `${line}\n`).join(""),
+      { mode: 0o600 },
+    );
+    await refreshReplaySafeAccountingCache({
+      stateFile,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+      windowDays: 365,
+      scan: async ({ onUsage }) => {
+        onUsage({
+          timestamp: "2026-07-25T11:00:00.000Z",
+          model: "gpt-5.6-sol",
+          components: { input_uncached_tokens: 100 },
+        });
+        return { diagnostics: {} };
+      },
+    });
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      collectorStateFile: stateFile,
+      allowDevelopmentArtifactFallback: true,
+      now: () => Date.parse("2026-07-25T12:54:00.000Z"),
+    });
+    assert.equal(snapshot.overview.freshness.status, "live");
+    assert.equal(snapshot.overview.freshness.accountingStatus, "available");
+    assert.equal(snapshot.overview.pricing.accountingCacheStatus, "available");
+    assert.equal(snapshot.overview.accounting.accountingCacheStatus, "available");
+    // The raw rebuild age remains published for a reader that wants it.
+    assert.equal(snapshot.overview.freshness.accountingAgeSeconds, 54 * 60);
+    assert.ok(!snapshot.overview.warnings.some((warning) => (
+      warning.includes("shown as stale")
+    )));
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a cache genuinely outrun by newer usage evidence still reports stale", async () => {
+  const root = await fixtureRoot();
+  const stateFile = join(root, ".usage-monitor", "local-collector-state-v1.sqlite");
+  try {
+    const usage = (observedAt) => JSON.stringify({
+      schemaVersion: "0.3",
+      kind: "codex_rollout_usage_snapshot",
+      observedAt,
+      model: "gpt-5.6-sol",
+      components: { input_uncached_tokens: 100 },
+    });
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      [
+        usage("2026-07-25T11:00:00.000Z"),
+        // Usage evidence 40 minutes past the cache's coverage end: the
+        // cached totals genuinely miss it, so the honest verdict is stale.
+        usage("2026-07-25T12:40:00.000Z"),
+      ].map((line) => `${line}\n`).join(""),
+      { mode: 0o600 },
+    );
+    await refreshReplaySafeAccountingCache({
+      stateFile,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+      windowDays: 365,
+      scan: async ({ onUsage }) => {
+        onUsage({
+          timestamp: "2026-07-25T11:00:00.000Z",
+          model: "gpt-5.6-sol",
+          components: { input_uncached_tokens: 100 },
+        });
+        return { diagnostics: {} };
+      },
+    });
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      collectorStateFile: stateFile,
+      allowDevelopmentArtifactFallback: true,
+      now: () => Date.parse("2026-07-25T12:54:00.000Z"),
+    });
+    assert.equal(snapshot.overview.freshness.accountingStatus, "stale");
+    assert.equal(snapshot.overview.pricing.accountingCacheStatus, "stale");
+    // The red banner sentence stays retired even when stale is honest; the
+    // machine-readable status carries the fact.
+    assert.ok(!snapshot.overview.warnings.some((warning) => (
+      warning.includes("shown as stale")
+    )));
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("collector fallback keeps mixed event-time price provenance while an old replay cache is withheld", async () => {
   const root = await fixtureRoot();
   const stateFile = join(root, ".usage-monitor", "local-collector-state-v1.sqlite");
