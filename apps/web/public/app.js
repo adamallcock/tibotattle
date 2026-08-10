@@ -134,6 +134,17 @@ let incrementalReviewPrepareAttempted = false;
 // the session, it re-runs the pairing ceremony with the v1.0 consent by
 // itself — once — instead of surfacing a failure the user cannot act on.
 let incrementalRepairAttempted = false;
+// One-time history-index build (and a parser-version reparse) advances one
+// bounded pass per foreground refresh. Left to the sparse auto-cadence, a
+// full build crawls across many timer ticks with the machine idle between
+// them, and — while a reparse deletes-then-re-derives — cost reads low until
+// it completes. So a successful refresh that leaves the history index
+// incomplete chains the next one promptly, bounded, until coverage catches
+// up. Reset on a manual refresh or when coverage completes.
+let reindexAutoContinuations = 0;
+const REINDEX_AUTO_CONTINUE_LIMIT = 40;
+const REINDEX_AUTO_CONTINUE_DELAY_MS = 1_500;
+let reindexAutoContinueTimer = null;
 // The short read-only polling loop behind the live first-pass status line.
 // setTimeout-chained (never an interval), bounded, and it only ever performs
 // the same GET the page performs on load.
@@ -6559,8 +6570,55 @@ async function refreshDashboardAfterFastModeChange() {
   }
 }
 
-async function requestRefresh() {
+/**
+ * True when the local history index has discovered more sources than it has
+ * indexed — a one-time build or a parser-version reparse is still catching up.
+ * Reads the same coverage the top-bar badge uses; demo mode is never pending.
+ */
+function historyIndexIncomplete() {
+  if (!dashboard || dashboard.mode === "demo") return false;
+  const history = dashboard?.pricing?.historyCoverage
+    ?? dashboard?.accounting?.historyCoverage
+    ?? null;
+  const indexed = finite(history?.indexedSourceCount, null);
+  const total = finite(history?.sourceCount, null);
+  if (history?.status === "complete") return false;
+  return indexed !== null && total !== null && total > 0 && indexed < total;
+}
+
+/**
+ * After a successful refresh that left the history index incomplete, run the
+ * next pass promptly instead of waiting for the sparse auto-cadence, bounded
+ * by REINDEX_AUTO_CONTINUE_LIMIT. Stops the moment coverage completes, the
+ * user interacts, or the bound is reached (the ordinary cadence then carries
+ * the remainder). Never runs in demo mode or while another action is busy.
+ */
+function scheduleReindexAutoContinuation() {
+  if (reindexAutoContinueTimer !== null) {
+    clearTimeout(reindexAutoContinueTimer);
+    reindexAutoContinueTimer = null;
+  }
+  if (!historyIndexIncomplete()) {
+    reindexAutoContinuations = 0;
+    return;
+  }
+  if (reindexAutoContinuations >= REINDEX_AUTO_CONTINUE_LIMIT) return;
+  reindexAutoContinueTimer = setTimeout(() => {
+    reindexAutoContinueTimer = null;
+    if (localActionBusy || !historyIndexIncomplete()) {
+      reindexAutoContinuations = 0;
+      return;
+    }
+    reindexAutoContinuations += 1;
+    void requestRefresh({ autoContinue: true });
+  }, REINDEX_AUTO_CONTINUE_DELAY_MS);
+}
+
+async function requestRefresh({ autoContinue = false } = {}) {
   if (localActionBusy) return;
+  // A person pressing Refresh restarts the auto-continuation budget; a chained
+  // reindex pass keeps counting toward the bound set when it began.
+  if (!autoContinue) reindexAutoContinuations = 0;
   if (!localAnalysisAllowed()) {
     showConnectionNotice({
       title: "Finish the local check before analyzing",
@@ -6727,6 +6785,7 @@ async function requestRefresh() {
     archiveHistoryScanActive = false;
     button.textContent = "Loading updated evidence…";
     await loadLocalDashboard();
+    scheduleReindexAutoContinuation();
   } catch (error) {
     if (dashboard) {
       setGlobalState(dashboard.state, {
