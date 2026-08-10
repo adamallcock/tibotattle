@@ -1498,6 +1498,33 @@ h2 {
 .divergence-period-mix { margin: 6px 0 0; font-size: .76rem; font-variant-numeric: tabular-nums; }
 .divergence-period-unpriced { margin: 4px 0 0; color: var(--rust); font-size: .74rem; }
 .divergence-period-context { margin: 6px 0 0; color: var(--muted); font-size: .72rem; }
+.divergence-period-toggle {
+  margin-top: 8px;
+  padding: 3px 10px;
+  font: inherit;
+  font-size: .72rem;
+  color: var(--blue);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.divergence-period-toggle:hover { background: var(--surface-quiet); }
+.divergence-period-breakdown { margin-top: 8px; }
+.divergence-period-breakdown[hidden] { display: none; }
+.divergence-breakdown-status { margin: 4px 0 0; color: var(--muted); font-size: .74rem; }
+.divergence-breakdown-heading {
+  margin: 8px 0 2px;
+  font-size: .7rem;
+  font-weight: 600;
+  letter-spacing: .03em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.divergence-breakdown-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.divergence-breakdown-row { font-size: .76rem; font-variant-numeric: tabular-nums; }
+.divergence-breakdown-fast { margin: 6px 0 0; font-size: .74rem; color: var(--muted); }
+.divergence-breakdown-unpriced { margin: 4px 0 0; font-size: .74rem; color: var(--rust); }
 .lower-charts { grid-template-columns: 1fr; margin-top: 18px; }
 .table-wrap { width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius-sm); }
 table { width: 100%; border-collapse: collapse; font-size: .73rem; }

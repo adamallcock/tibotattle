@@ -419,6 +419,85 @@ test("loopback server exposes only fixed API, static, and report routes", async 
   }
 });
 
+test("window-breakdown route bounds its range and returns a per-model/speed shape", async () => {
+  const files = await fixture();
+  const requests = [];
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    // Injected so the route's validation and shaping are exercised without a
+    // real unified index on disk. A caller asking for an inverted range is
+    // rejected by the reader with a typed code the route maps to 400.
+    windowBreakdownProvider: async ({ fromMs, toMs }) => {
+      requests.push({ fromMs, toMs });
+      if (toMs <= fromMs) {
+        const error = new Error("window range is invalid");
+        error.code = "window_range_invalid";
+        throw error;
+      }
+      return {
+        status: "available",
+        errorCode: null,
+        schemaVersion: "local-window-breakdown-v0.1",
+        from: fromMs,
+        to: toMs,
+        events: 12,
+        unpricedEvents: 0,
+        unpricedShare: 0,
+        costUsd: 34.5,
+        tokens: 6_000,
+        fastCostUsd: 0,
+        fastEvents: 0,
+        byModel: [
+          { model: "gpt-5.6-sol", costUsd: 34.5, tokens: 6_000, events: 12, unpricedEvents: 0, unpricedShare: 0, fastModeFamily: "gpt-5.6", fastModeMultiplier: 2.5 },
+        ],
+        bySpeed: { standard: { speed: "standard", costUsd: 34.5, tokens: 6_000, events: 12, unpricedEvents: 0, unpricedShare: 0 } },
+        spark: { events: 0, costUsd: 0 },
+      };
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const route = `${base}/api/local/timeline/window-breakdown`;
+
+    // A well-formed bounded window returns the breakdown, and the exact integer
+    // parameters reach the provider.
+    const ok = await fetch(`${route}?from=1000&to=2000`);
+    assert.equal(ok.status, 200);
+    const payload = await ok.json();
+    assert.equal(payload.schemaVersion, LOCAL_COMPANION_SCHEMA_VERSION);
+    assert.equal(payload.breakdown.status, "available");
+    assert.equal(payload.breakdown.byModel[0].model, "gpt-5.6-sol");
+    assert.deepEqual(requests.at(-1), { fromMs: 1000, toMs: 2000 });
+
+    // Missing, non-integer, and float parameters never reach the provider.
+    const before = requests.length;
+    assert.equal((await fetch(route)).status, 400);
+    assert.equal((await fetch(`${route}?from=1000`)).status, 400);
+    assert.equal((await fetch(`${route}?from=1.5&to=2000`)).status, 400);
+    assert.equal((await fetch(`${route}?from=abc&to=2000`)).status, 400);
+    // An unexpected extra parameter is refused rather than ignored.
+    assert.equal((await fetch(`${route}?from=1000&to=2000&path=/x`)).status, 400);
+    assert.equal(requests.length, before);
+
+    // A provider that rejects an inverted range maps to a 400 with its code.
+    const bad = await fetch(`${route}?from=2000&to=1000`);
+    assert.equal(bad.status, 400);
+    assert.equal((await bad.json()).error.code, "window_range_invalid");
+
+    // The route is GET-only.
+    assert.equal((await fetch(route, { method: "POST" })).status, 405);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
 test("local companion remains usable before Codex is installed", async () => {
   const files = await fixture();
   const app = await startLocalCompanionServer({

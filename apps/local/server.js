@@ -23,6 +23,9 @@ import {
 import {
   ingestLocalUnifiedIndexIncrement,
 } from "../../src/local-unified-index-ingest.js";
+import {
+  readLocalUnifiedWindowBreakdown,
+} from "../../src/local-unified-window-breakdown.js";
 import { TELEMETRY_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
 import {
   AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS,
@@ -261,6 +264,7 @@ const API_ROUTES = new Set([
   "/api/local/weekly",
   "/api/local/quality",
   "/api/local/reports",
+  "/api/local/timeline/window-breakdown",
   "/api/local/refresh",
   "/api/local/refresh/cancel",
   "/api/local/contribution/preview",
@@ -293,6 +297,16 @@ const SNAPSHOT_INDEPENDENT_API_ROUTES = new Set([
 
 function jsonBody(value) {
   return Buffer.from(JSON.stringify(value));
+}
+
+// A query-string parameter that must be a plain base-ten safe integer. Anything
+// else — a float, a sign, whitespace, scientific notation, an empty value — is
+// rejected rather than coerced, so the two bounded window parameters can never
+// carry a surprising value into the reader.
+function integerParameter(value) {
+  if (typeof value !== "string" || !/^-?\d{1,16}$/u.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
 function securityHeaders({ report = false } = {}) {
@@ -1950,6 +1964,16 @@ function createPreparedLocalCompanionServer({
       codexSpeedBaselines: await codexSpeedBaseline.readWindows(),
     }),
   }),
+  // Reprice the usage events inside a bounded [from, to] window from the
+  // unified local index, grouped by model and observed speed. Injected so a
+  // test can drive the route's range validation and response shape without a
+  // real index on disk; in production it reads the same index the snapshot
+  // draws from, strictly read-only.
+  windowBreakdownProvider = ({ fromMs, toMs }) => readLocalUnifiedWindowBreakdown({
+    indexFile: statePaths.unifiedIndexFile,
+    fromMs,
+    toMs,
+  }),
   refreshRunner = createLocalCollectorRefreshRunner({
     codexHome,
     stateFile: statePaths.collectorStateFile,
@@ -2551,12 +2575,15 @@ function createPreparedLocalCompanionServer({
         return;
       }
       const path = url.pathname;
-      // No route here accepts a query string. Hosted sign-in used to redirect
-      // back to a loopback callback on this companion, which was the one
+      // Only the window-breakdown route accepts a query string, and only its
+      // two bounded integer parameters. Hosted sign-in used to redirect back to
+      // a loopback callback on this companion, which was the previous
       // exception; both providers now redirect to the contribution service's
       // own callback and the dashboard collects the result over the relay, so
-      // nothing on this origin ever receives a provider's ?code again.
-      if (url.search !== "" || url.hash !== "") {
+      // nothing on this origin ever receives a provider's ?code again. Every
+      // other route stays query-free by construction.
+      const acceptsQueryString = path === "/api/local/timeline/window-breakdown";
+      if (url.hash !== "" || (url.search !== "" && !acceptsQueryString)) {
         sendError(response, 400, "invalid_request");
         return;
       }
@@ -2763,6 +2790,47 @@ function createPreparedLocalCompanionServer({
           return;
         }
         send(response, 200, dataStore.getReports());
+        return;
+      }
+      if (path === "/api/local/timeline/window-breakdown") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        // The two bounded integer parameters, and only those. Anything else in
+        // the query string is refused rather than ignored, so the one route
+        // that reads a query string cannot be turned into a general parameter
+        // channel. The window itself is bounded and validated by the reader.
+        const allowed = new Set(["from", "to"]);
+        for (const key of url.searchParams.keys()) {
+          if (!allowed.has(key)) {
+            sendError(response, 400, "invalid_request");
+            return;
+          }
+        }
+        const fromMs = integerParameter(url.searchParams.get("from"));
+        const toMs = integerParameter(url.searchParams.get("to"));
+        if (fromMs === null || toMs === null) {
+          sendError(response, 400, "invalid_request");
+          return;
+        }
+        let breakdown;
+        try {
+          breakdown = await windowBreakdownProvider({ fromMs, toMs });
+        } catch (error) {
+          sendError(
+            response,
+            error?.code === "window_range_invalid" ? 400 : 500,
+            error?.code === "window_range_invalid"
+              ? "window_range_invalid"
+              : "window_breakdown_unavailable",
+          );
+          return;
+        }
+        send(response, 200, {
+          schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+          breakdown,
+        });
         return;
       }
       if (path === "/api/local/contribution/preview") {

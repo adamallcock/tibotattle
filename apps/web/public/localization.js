@@ -468,6 +468,66 @@ export const WEB_MESSAGES = Object.freeze({
     "范围构成（整个所选时段，而非仅此窗口）：以 {model} 为主，{speed} 速度。",
     "Mezcla del intervalo (todo el período seleccionado, no solo esta ventana): sobre todo {model}, velocidad {speed}.",
   ],
+  "divergence.breakdown.show": [
+    "Show this window's cost mix",
+    "显示此窗口的成本构成",
+    "Mostrar la mezcla de costes de esta ventana",
+  ],
+  "divergence.breakdown.hide": [
+    "Hide this window's cost mix",
+    "隐藏此窗口的成本构成",
+    "Ocultar la mezcla de costes de esta ventana",
+  ],
+  "divergence.breakdown.loading": [
+    "Repricing this window…",
+    "正在重新计价此窗口……",
+    "Recalculando el precio de esta ventana…",
+  ],
+  "divergence.breakdown.modelHeading": [
+    "By model (this window)",
+    "按模型（此窗口）",
+    "Por modelo (esta ventana)",
+  ],
+  "divergence.breakdown.speedHeading": [
+    "By speed (this window)",
+    "按速度（此窗口）",
+    "Por velocidad (esta ventana)",
+  ],
+  "divergence.breakdown.modelRow": [
+    "{model}: {cost} ({share} of window cost)",
+    "{model}：{cost}（占窗口成本的 {share}）",
+    "{model}: {cost} ({share} del coste de la ventana)",
+  ],
+  "divergence.breakdown.speedRow": [
+    "{speed}: {cost} across {events} usage changes",
+    "{speed}：{cost}，涵盖 {events} 次用量变化",
+    "{speed}: {cost} en {events} cambios de uso",
+  ],
+  "divergence.breakdown.fastCost": [
+    "Fast-speed usage: {cost} of this window's priced cost.",
+    "快速用量：占此窗口计价成本的 {cost}。",
+    "Uso en velocidad rápida: {cost} del coste con precio de esta ventana.",
+  ],
+  "divergence.breakdown.unpriced": [
+    "{share} of this window's usage changes carry no published price.",
+    "此窗口中有 {share} 的用量变化没有已公布的价格。",
+    "El {share} de los cambios de uso de esta ventana no tienen un precio publicado.",
+  ],
+  "divergence.breakdown.empty": [
+    "No priced usage events in this window.",
+    "此窗口中没有已计价的用量事件。",
+    "No hay eventos de uso con precio en esta ventana.",
+  ],
+  "divergence.breakdown.unavailable": [
+    "Per-window cost mix is unavailable from this companion — range mix instead: mostly {model}, {speed} speed.",
+    "此伴随程序无法提供逐窗口成本构成——改用范围构成：以 {model} 为主，{speed} 速度。",
+    "La mezcla de costes por ventana no está disponible en este acompañante; en su lugar, la mezcla del intervalo: sobre todo {model}, velocidad {speed}.",
+  ],
+  "divergence.breakdown.unavailablePlain": [
+    "Per-window cost mix is unavailable from this companion.",
+    "此伴随程序无法提供逐窗口成本构成。",
+    "La mezcla de costes por ventana no está disponible en este acompañante.",
+  ],
   "divergence.empty": [
     "No sustained divergence in this range — observed and priced usage track within the noise band.",
     "此范围内没有持续的背离——观测用量与计价用量在噪声带内保持一致。",
@@ -1415,7 +1475,7 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   // empty state are localized from WEB_MESSAGES).
   "Divergence periods": ["背离时段", "Períodos de divergencia"],
   "Where observed and priced usage diverge": ["观测用量与计价用量的背离之处", "Dónde divergen el uso observado y el uso con precio"],
-  "Sustained stretches where provider-reported quota movement and the movement implied by priced usage persistently disagree. A single spike that cancels out is not listed.": ["提供方报告的额度变化与计价用量所推算的变化持续不一致的连续时段。单个会相互抵消的尖峰不会被列出。", "Tramos sostenidos en los que el movimiento de cuota informado por el proveedor y el implícito en el uso con precio discrepan de forma persistente. Un pico aislado que se cancela no se incluye."],
+  "Sustained stretches where provider-reported quota movement and the movement implied by priced usage persistently disagree. A single spike that cancels out is not listed. Expand a period to reprice just that window and see its cost mix by model and speed.": ["提供方报告的额度变化与计价用量所推算的变化持续不一致的连续时段。单个会相互抵消的尖峰不会被列出。展开某个时段可仅对该窗口重新计价，并按模型和速度查看其成本构成。", "Tramos sostenidos en los que el movimiento de cuota informado por el proveedor y el implícito en el uso con precio discrepan de forma persistente. Un pico aislado que se cancela no se incluye. Despliega un período para recalcular el precio de esa ventana y ver su mezcla de costes por modelo y velocidad."],
   "Largest unexplained quota movement periods": ["最大的未解释额度变化期间", "Períodos con mayor movimiento de cuota sin explicación"],
   "Evidence state": ["证据状态", "Estado de evidencia"],
   "No periods loaded.": ["未加载期间。", "No se cargaron períodos."],
