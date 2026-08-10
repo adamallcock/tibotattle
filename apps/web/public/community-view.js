@@ -775,12 +775,23 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
       r: dot.radius,
     });
     const title = svgNode(documentRef, "title");
+    // Every dot names its own backing: the participant count can change
+    // mid-series, so the latest-day caveat alone would misdescribe older
+    // points.
+    const tooltipLanguage = documentRef?.documentElement?.lang ?? "en-US";
     title.textContent = `${dot.day}: ${dollars.format(dot.centralUsd)} — ${
       translatePlural(
         "community.allowance.fitCount",
         dot.fitCount,
         {},
-        documentRef?.documentElement?.lang ?? "en-US",
+        tooltipLanguage,
+      )
+    } · ${
+      translatePlural(
+        "community.allowance.accountCount",
+        dot.participantCount,
+        {},
+        tooltipLanguage,
       )
     }`;
     circle.append(title);

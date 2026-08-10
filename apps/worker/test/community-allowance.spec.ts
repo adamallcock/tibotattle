@@ -406,7 +406,7 @@ describe("summarizeCommunityAllowanceDay", () => {
     expect(summary.trailingDays).toBe(30);
     expect(summary.windowDurationMinutes).toBe(10_080);
     expect(summary.limitId).toBe("codex");
-    expect(summary.spanFloorPp).toBe(0);
+    expect(summary.spanFloorPp).toBe(40);
   });
 
   it("publishes the honest empty summary for a day with no qualifying fits", () => {
@@ -493,8 +493,8 @@ describe("community allowance in the daily aggregate", () => {
       basis: "seven_day_codex_pro20x_trailing_30d",
       planType: "pro",
       planVariant: "pro-20x",
-      qualification: "shared_reset_fit_gates_no_span_floor",
-      spanFloorPp: 0,
+      qualification: "shared_reset_fit_gates_40pp_span_floor",
+      spanFloorPp: 40,
       fitCount: 1,
       participantCount: 1,
       band80Usd: null,

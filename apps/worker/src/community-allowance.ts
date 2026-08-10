@@ -16,9 +16,10 @@ import { accountScopedQuotaAnalysis } from "./quota-analysis";
  * `summarizeTrack` (median across reset fits, q10–q90 band).
  *
  * Honesty note carried into the published payload: qualification is the
- * shared package's fit gates with no display-side span floor (the app's
- * allowance page applies an additional 50pp floor at render time; this series
- * publishes `spanFloorPp: 0` so the two counts are never conflated).
+ * shared package's fit gates plus a 40pp observed-span floor — the same
+ * floor the app's public share card names ("40pp span") — so the published
+ * community figure and the numbers people screenshot from their own app are
+ * the same methodology. `spanFloorPp` carries the floor explicitly.
  *
  * Plan-cohort discipline, matching the weekly snapshots' cohort keying: an
  * allowance is a property of one plan, so mixing plan cohorts would publish
@@ -34,7 +35,12 @@ export const COMMUNITY_ALLOWANCE_PLAN_TYPE = "pro";
 export const COMMUNITY_ALLOWANCE_PLAN_VARIANT = "pro-20x";
 export const COMMUNITY_ALLOWANCE_TRAILING_DAYS = 30;
 export const COMMUNITY_ALLOWANCE_QUALIFICATION =
-  "shared_reset_fit_gates_no_span_floor";
+  "shared_reset_fit_gates_40pp_span_floor";
+// The same observed-span floor the app's public share card names ("40pp
+// span"): short-span fits extrapolate a whole week from a sliver of quota
+// movement and are the noisiest inputs to the published median, and the
+// community figure must be the same methodology a reader's own app shows.
+export const COMMUNITY_ALLOWANCE_SPAN_FLOOR_PP = 40;
 // Mirrors MINIMUM_RESETS_FOR_UNCERTAINTY in the shared calibration package:
 // below three fits a q10–q90 band is an artifact of interpolation, not a
 // spread, so the band is withheld and only the central estimate publishes.
@@ -56,7 +62,7 @@ export interface CommunityDailyAllowance {
   windowDurationMinutes: number;
   trailingDays: number;
   qualification: typeof COMMUNITY_ALLOWANCE_QUALIFICATION;
-  spanFloorPp: 0;
+  spanFloorPp: typeof COMMUNITY_ALLOWANCE_SPAN_FLOOR_PP;
   fitCount: number;
   participantCount: number;
   centralUsd: number | null;
@@ -68,6 +74,7 @@ interface AnalysisResetFit {
   limitId?: unknown;
   windowDurationMinutes?: unknown;
   capacityNanousd?: unknown;
+  displayedSpanPp?: unknown;
   lastObservedAt?: unknown;
 }
 
@@ -150,6 +157,9 @@ export async function collectCommunityAllowanceFits(
               || typeof reset.capacityNanousd !== "number"
               || !Number.isFinite(reset.capacityNanousd)
               || reset.capacityNanousd <= 0
+              || typeof reset.displayedSpanPp !== "number"
+              || !Number.isFinite(reset.displayedSpanPp)
+              || reset.displayedSpanPp < COMMUNITY_ALLOWANCE_SPAN_FLOOR_PP
               || typeof reset.lastObservedAt !== "string"
               || !Number.isFinite(Date.parse(reset.lastObservedAt))) {
             continue;
@@ -207,7 +217,7 @@ export function summarizeCommunityAllowanceDay(
     windowDurationMinutes: SEVEN_DAY_WINDOW_MINUTES,
     trailingDays: COMMUNITY_ALLOWANCE_TRAILING_DAYS,
     qualification: COMMUNITY_ALLOWANCE_QUALIFICATION,
-    spanFloorPp: 0,
+    spanFloorPp: COMMUNITY_ALLOWANCE_SPAN_FLOOR_PP,
     fitCount: qualifying.length,
     participantCount: new Set(qualifying.map((fit) => fit.participantId)).size,
     centralUsd: central === null ? null : usd(central),
