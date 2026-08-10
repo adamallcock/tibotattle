@@ -55,12 +55,30 @@ increase in inferable activity shape. The owner accepts this for the
 community-estimate accuracy it buys. Record that trade in the privacy
 contract review; do not describe the delta as null.
 
-## Verification gate before coding
+## Verification gate before coding — PASSED (2026-08-10, read-only audit)
 
-Confirm `observed_at_ms` for an already-uploaded observation cannot shift
-across re-scans of the same source data (else the link breaks silently and a
-different anchor is needed). Read the extraction provenance in the unified
-index pipeline and check the live local index for id-stability evidence.
+Verdict: **STABLE — adopt the anchor.** All three id components are pure
+functions of per-record source bytes (observed_at_ms from the rollout line's
+own ISO timestamp, extract.js:376/507/131; limitId from the record,
+extract.js:119; slot a loop constant, extract.js:122). The upsert key
+columns are structurally excluded from the conflict-update SET list and the
+arrival-order hazard was already fixed with a total ordering. Empirically:
+705,098 rows, zero key collisions; a second independently built index
+(local-analysis-index-v2) agrees on 705,053 of 705,053 shared keys.
+
+Caveats to honor in implementation:
+- **Presence, not value**: fork-replay suppression can make a rebuild add or
+  drop rows (never rename one). A dropped row is a visible absence — the
+  server must tolerate anchors it stops seeing re-derived, never re-point.
+- **Use the string, never the sqlite rowid** (insertion-ordered, not
+  rebuild-stable).
+- **Spark limitId reality check**: the live corpus contains limit_ids
+  `codex` and `codex_bengalfox` — no `codex-spark` row exists on the
+  reference machine. Confirm which token the Spark track actually emits
+  before writing the separation test, or it passes vacuously
+  (src/local-companion-usage-model.js:58 hedges with all three).
+- Latent: a missing limit_id maps to "unknown" — zero such rows today; add a
+  diagnostic counter, not a fix.
 
 ## Sequencing note
 
