@@ -1028,10 +1028,29 @@ export async function handleSparkleAppcastGuardForContract(
         contract,
       );
     }
-    if (compareBundleVersions(
+    // A signed live feed must never be replaced by an unsigned one: installed
+    // apps require signed feeds, and the guard refuses the downgrade even for
+    // a caller holding the release token.
+    if (currentAppcast.signedEnvelope !== null
+        && candidateAppcast.signedEnvelope === null) {
+      invalidCandidate();
+    }
+    const versionComparison = compareBundleVersions(
       candidateAppcast.latest.version,
       currentAppcast.latest.version,
-    ) <= 0) {
+    );
+    // A same-version candidate is allowed only as a document-only
+    // re-publication (for example re-signing the feed for Sparkle's signed
+    // appcast validation): the live full enclosure must be retained
+    // byte-for-byte so the immutable artifact state cannot drift under a
+    // version installed clients have already observed.
+    const documentOnlyReplacement = versionComparison === 0
+      && candidateAppcast.latest.deltaFrom === undefined
+      && currentAppcast.latest.deltaFrom === undefined
+      && candidateAppcast.latest.url === currentAppcast.latest.url
+      && candidateAppcast.latest.length === currentAppcast.latest.length
+      && candidateAppcast.latest.signature === currentAppcast.latest.signature;
+    if (versionComparison <= 0 && !documentOnlyReplacement) {
       invalidCandidate();
     }
   }

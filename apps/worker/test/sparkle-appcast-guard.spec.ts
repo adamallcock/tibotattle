@@ -342,8 +342,12 @@ async function installArtifact(
   return key;
 }
 
-async function seedAppcast(bucket: FakeR2Bucket, version: string): Promise<Uint8Array> {
-  const current = await appcastBytes(version);
+async function seedAppcast(
+  bucket: FakeR2Bucket,
+  version: string,
+  content?: Uint8Array,
+): Promise<Uint8Array> {
+  const current = content ?? await appcastBytes(version);
   bucket.object = {
     bytes: current,
     etag: `${version}-appcast-etag`,
@@ -707,16 +711,96 @@ describe("Sparkle appcast atomic guard", () => {
     expect(bucket.putCalls).toBe(0);
   });
 
-  it("rejects equal and lower active versions", async () => {
-    for (const [version, nonce] of [["2", "equal-version-nonce-01"], ["1", "lower-version-nonce-01"]] as const) {
+  it("rejects a lower version and a same-version enclosure change", async () => {
+    const alteredArtifact = encoder.encode("signed-dmg-artifact-altered");
+    const cases = [
+      {
+        nonce: "lower-version-nonce-01",
+        candidateVersion: "1",
+        candidateArtifact: ARTIFACT_BYTES,
+      },
+      {
+        // Same version, different artifact: a document-only re-publication
+        // must retain the live full enclosure byte-for-byte, so an artifact
+        // swap under an already-published version stays refused.
+        nonce: "equal-version-swap-nonce-01",
+        candidateVersion: "2",
+        candidateArtifact: alteredArtifact,
+      },
+    ] as const;
+    for (const { nonce, candidateVersion, candidateArtifact } of cases) {
       const bucket = new FakeR2Bucket();
       const current = await seedAppcast(bucket, "2");
       await installArtifact(bucket, "2");
-      await installArtifact(bucket, version);
+      await installArtifact(bucket, candidateVersion, candidateArtifact);
       const response = await invoke(
         await signedRequest(
           await payload({
-            candidate: await appcastBytes(version),
+            candidate: await appcastBytes(candidateVersion, candidateArtifact),
+            expectedCurrent: {
+              state: "present",
+              bytes: current.byteLength,
+              sha256: await sha256Hex(current),
+              etag: null,
+            },
+          }),
+          TOKEN,
+          Math.floor(NOW / 1000),
+          nonce,
+        ),
+        bindings(bucket),
+        NOW,
+      );
+      expect(response.status).toBe(422);
+      expect(bucket.putCalls).toBe(0);
+    }
+  });
+
+  it("accepts a same-version document-only re-publication that signs the feed", async () => {
+    const bucket = new FakeR2Bucket();
+    const current = await seedAppcast(bucket, "2");
+    await installArtifact(bucket, "2");
+    const candidate = await officialSignedAppcastBytes("2");
+    const response = await invoke(
+      await signedRequest(
+        await payload({
+          candidate,
+          expectedCurrent: {
+            state: "present",
+            bytes: current.byteLength,
+            sha256: await sha256Hex(current),
+            etag: null,
+          },
+        }),
+        TOKEN,
+        Math.floor(NOW / 1000),
+        "document-only-resign-nonce-01",
+      ),
+      bindings(bucket),
+      NOW,
+    );
+    expect(response.status).toBe(200);
+    expect(bucket.putCalls).toBe(1);
+    expect(bucket.object?.bytes).toEqual(candidate);
+  });
+
+  it("never replaces a signed live feed with an unsigned candidate", async () => {
+    for (const [candidateVersion, nonce] of [
+      ["2", "signed-downgrade-equal-nonce-01"],
+      ["3", "signed-downgrade-higher-nonce-01"],
+    ] as const) {
+      const bucket = new FakeR2Bucket();
+      const current = await seedAppcast(
+        bucket,
+        "2",
+        await officialSignedAppcastBytes("2"),
+      );
+      await installArtifact(bucket, "2");
+      await installArtifact(bucket, candidateVersion);
+      const response = await invoke(
+        await signedRequest(
+          await payload({
+            candidate: await appcastBytes(candidateVersion),
             expectedCurrent: {
               state: "present",
               bytes: current.byteLength,
