@@ -322,7 +322,7 @@ test("the first visit leads with the product, Mac download action, and daily com
   assert.match(html, /Demo data/u);
   assert.match(html, /Example only — not your usage or a bill\./u);
   assert.match(html, /Your dashboard is calculated privately on your Mac\./u);
-  assert.match(html, /href="https:\/\/github\.com\/adamallcock"/u);
+  assert.match(html, /href="https:\/\/github\.com\/adamallcock\/tibotattle"/u);
   assert.match(html, /href="https:\/\/x\.com\/adamallcock"/u);
   assert.match(html, /footer-social-label">X<\/span>/u);
   assert.match(html, /href="\.\/docs\.html">Docs<\/a>/u);
