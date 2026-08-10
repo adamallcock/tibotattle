@@ -148,10 +148,13 @@ async function fetchAccessJwks(jwksUrl: string): Promise<JsonWebKeySet> {
     });
   } catch (error) {
     // Coarse deny-site observability (2026-08-10, remove with the attempt
-    // log): step name and error class only, never token or key material.
+    // log): step name and error text only, never token or key material.
     console.warn("admin-access-step", JSON.stringify({
       step: "jwks_fetch_throw",
       errorName: error instanceof Error ? error.name : typeof error,
+      errorMessage: error instanceof Error
+        ? error.message.slice(0, 200)
+        : String(error).slice(0, 200),
     }));
     accessDenied();
   }
