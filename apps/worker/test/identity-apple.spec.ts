@@ -10,6 +10,7 @@ import {
   hashAppleSignInNonce,
 } from "../src/identity-apple";
 import {
+  claimPendingAppleSignInHandoff,
   completeAppleSignInHandoff,
   deliverAppleSignInHandoff,
   insertAppleSignInHandoff,
@@ -223,12 +224,41 @@ describe("web Sign in with Apple", () => {
     expect(
       await readPendingAppleSignInHandoff(db, state, nowIso, bindingHash),
     ).toEqual({ state, nonceHash });
+    // The callback atomically claims the pending row before any provider work.
+    const claimId = "1".repeat(64);
+    const staleClaimBefore = new Date(nowMs - 60_000).toISOString();
+    expect(await claimPendingAppleSignInHandoff(
+      db,
+      state,
+      claimId,
+      nowIso,
+      staleClaimBefore,
+    )).toEqual({ state, nonceHash });
+    // A concurrent callback cannot re-claim the row while the lease is live.
+    expect(await claimPendingAppleSignInHandoff(
+      db,
+      state,
+      "2".repeat(64),
+      nowIso,
+      staleClaimBefore,
+    )).toBeNull();
     // The row was inserted with a 60s authorization window that is nearly
     // spent; filling it hands the freshly minted proof its own window.
     const deliveryExpiresAt = new Date(nowMs + 300_000).toISOString();
+    // Completion is fenced to the claim: a wrong claim id writes nothing.
     expect(await completeAppleSignInHandoff(
       db,
       state,
+      "2".repeat(64),
+      linkKey,
+      proof,
+      nowIso,
+      deliveryExpiresAt,
+    )).toBe(false);
+    expect(await completeAppleSignInHandoff(
+      db,
+      state,
+      claimId,
       linkKey,
       proof,
       nowIso,
@@ -242,6 +272,7 @@ describe("web Sign in with Apple", () => {
     expect(await completeAppleSignInHandoff(
       db,
       state,
+      claimId,
       linkKey,
       "d".repeat(64),
       nowIso,
@@ -252,6 +283,7 @@ describe("web Sign in with Apple", () => {
     await expect(completeAppleSignInHandoff(
       db,
       `${state}-backdated`,
+      claimId,
       linkKey,
       "f".repeat(64),
       nowIso,
@@ -920,5 +952,101 @@ describe("web Sign in with Apple", () => {
       schemaVersion: "identity-apple-result-v0.1",
       proof: expect.stringMatching(/^[A-Za-z0-9_-]{64}$/u),
     });
+  });
+
+  // csf_94325b7787: the pending read did not reserve the row, so many callbacks
+  // carrying one valid state each reached client-secret signing and Apple's
+  // token endpoint. The atomic claim now admits exactly one to provider I/O.
+  it("admits exactly one of many concurrent Apple callbacks to the provider exchange", async () => {
+    const started = await startSignIn();
+    const attempts = 6;
+    const responses = await Promise.all(
+      Array.from({ length: attempts }, () => callback(new URLSearchParams({
+        code: "apple-one-time-code",
+        state: started.state,
+      }).toString())),
+    );
+    const pages = await Promise.all(responses.map((response) => response.text()));
+    const completed = pages.filter((page) => page.includes("Signed in")).length;
+    const refused = pages.filter(
+      (page) => page.includes("Sign-in was not completed"),
+    ).length;
+    // Exactly one callback signed a client secret and hit Apple's token endpoint;
+    // every other callback stopped at the claim, so provider work did not fan out.
+    expect(tokenCalls).toHaveLength(1);
+    // Exactly one callback completed; the rest are the indistinguishable failure.
+    expect(completed).toBe(1);
+    expect(refused).toBe(attempts - 1);
+    // The shared row was filled exactly once: a single identity and proof.
+    const stored = await bindings().USAGE_MONITOR_DB.prepare(
+      `SELECT COUNT(*) AS total, COUNT(proof) AS proofs,
+              COUNT(identity_link_key) AS links
+         FROM apple_signin_handoffs`,
+    ).first<{ total: number; proofs: number; links: number }>();
+    expect(stored).toEqual({ total: 1, proofs: 1, links: 1 });
+  });
+
+  // csf_94325b7787: the claim carries a lease so a crashed claimant frees the
+  // row for one bounded retry, and completion/discard are fenced to the claimant.
+  it("re-claims an Apple handoff only after its processing lease expires", async () => {
+    const db = bindings().USAGE_MONITOR_DB;
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const nonceHash = "a".repeat(64);
+    const state = "lease-test-state";
+    await insertAppleSignInHandoff(db, {
+      state,
+      nonceHash,
+      bindingHash: "b".repeat(64),
+      createdAt: nowIso,
+      expiresAt: new Date(nowMs + 600_000).toISOString(),
+    });
+    const first = "1".repeat(64);
+    // A callback claims the row (and then, model a crash: it never completes).
+    expect(await claimPendingAppleSignInHandoff(
+      db,
+      state,
+      first,
+      nowIso,
+      new Date(nowMs - 60_000).toISOString(),
+    )).toEqual({ state, nonceHash });
+    // While the lease is live, a concurrent callback cannot re-claim it.
+    expect(await claimPendingAppleSignInHandoff(
+      db,
+      state,
+      "2".repeat(64),
+      nowIso,
+      new Date(nowMs - 60_000).toISOString(),
+    )).toBeNull();
+    // Once the lease has expired, a single bounded retry re-claims the row.
+    const later = new Date(nowMs + 120_000).toISOString();
+    const second = "2".repeat(64);
+    expect(await claimPendingAppleSignInHandoff(
+      db,
+      state,
+      second,
+      later,
+      new Date(nowMs + 60_000).toISOString(),
+    )).toEqual({ state, nonceHash });
+    // The preempted original claimant can no longer complete or discard the row.
+    expect(await completeAppleSignInHandoff(
+      db,
+      state,
+      first,
+      "c".repeat(64),
+      "d".repeat(64),
+      later,
+      new Date(nowMs + 400_000).toISOString(),
+    )).toBe(false);
+    // The new claimant completes it exactly once.
+    expect(await completeAppleSignInHandoff(
+      db,
+      state,
+      second,
+      "c".repeat(64),
+      "d".repeat(64),
+      later,
+      new Date(nowMs + 400_000).toISOString(),
+    )).toBe(true);
   });
 });

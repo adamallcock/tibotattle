@@ -131,9 +131,11 @@ import {
 import { assertPinnedIdentityLinkSecretConfiguration } from "./identity-link-configuration";
 import { identityRequired, verifyHostedIdentity } from "./identity-oidc";
 import {
+  claimPendingAppleSignInHandoff,
   completeAppleSignInHandoff,
   deleteExpiredAppleSignInHandoffs,
   deliverAppleSignInHandoff,
+  discardClaimedAppleSignInHandoff,
   discardPendingAppleSignInHandoff,
   insertAppleSignInHandoff,
   readPendingAppleSignInHandoff,
@@ -611,6 +613,12 @@ const SIGNIN_HANDOFF_AUTHORIZATION_TTL_MILLISECONDS = 10 * 60 * 1000;
 // how long a proof can exist is unchanged at five minutes — only the floor
 // moves, from zero to five minutes.
 const SIGNIN_HANDOFF_DELIVERY_TTL_MILLISECONDS = 5 * 60 * 1000;
+// A callback holds its processing claim for this long before another callback
+// may re-claim the row. It must comfortably exceed the provider request timeout
+// (10s, capped at 60s) plus verification so a legitimately slow exchange is
+// never preempted, while still freeing a crashed claimant well inside the
+// 10-minute authorization window for one bounded retry.
+const SIGNIN_HANDOFF_PROCESSING_LEASE_MILLISECONDS = 60 * 1000;
 const MAX_APPLE_CALLBACK_BYTES = 16 * 1024;
 // Google returns its authorization code in the redirect's query string. The
 // code itself is bounded by the exchange, and this bounds the whole callback
@@ -867,6 +875,13 @@ async function discardPendingAppleHandoff(
   await discardPendingAppleSignInHandoff(db, state, nowIso);
 }
 
+/**
+ * Discards an unclaimed Google handoff after a provider cancellation that
+ * arrives before any callback has claimed the row. The `claim_id IS NULL` fence
+ * keeps a cancellation callback from deleting a row another callback is already
+ * processing; that claimant discards its own row through
+ * `discardClaimedGoogleHandoff`.
+ */
 async function discardPendingGoogleHandoff(
   db: D1Database,
   state: string,
@@ -875,11 +890,34 @@ async function discardPendingGoogleHandoff(
   await db.prepare(
     `DELETE FROM google_signin_handoffs
       WHERE state = ?
+        AND claim_id IS NULL
         AND identity_link_key IS NULL
         AND proof IS NULL
         AND delivered_at IS NULL
         AND expires_at > ?`,
   ).bind(state, nowIso).run();
+}
+
+/**
+ * Discards a Google handoff the caller holds the claim on, after its own
+ * provider exchange failed. Fenced to `claimId`, so a callback that lost its
+ * claim to a lease-expiry re-claim deletes nothing.
+ */
+async function discardClaimedGoogleHandoff(
+  db: D1Database,
+  state: string,
+  claimId: string,
+  nowIso: string,
+): Promise<void> {
+  await db.prepare(
+    `DELETE FROM google_signin_handoffs
+      WHERE state = ?
+        AND claim_id = ?
+        AND identity_link_key IS NULL
+        AND proof IS NULL
+        AND delivered_at IS NULL
+        AND expires_at > ?`,
+  ).bind(state, claimId, nowIso).run();
 }
 
 async function hasExpiredAppleHandoffs(db: D1Database, nowIso: string): Promise<boolean> {
@@ -1070,10 +1108,18 @@ async function handleIdentityAppleCallback(
     return failure;
   }
   if (typeof code !== "string" || code.length === 0) return failure;
-  const pending = await readPendingAppleSignInHandoff(
+  // Atomically reserve the row before any client-secret signing or provider I/O.
+  // Of many callbacks carrying this one valid state, exactly one wins the claim;
+  // the rest see no change here and stop, so provider work cannot fan out.
+  const claimId = randomSecret(48);
+  const pending = await claimPendingAppleSignInHandoff(
     env.USAGE_MONITOR_DB,
     state,
+    claimId,
     nowIso,
+    new Date(
+      Date.now() - SIGNIN_HANDOFF_PROCESSING_LEASE_MILLISECONDS,
+    ).toISOString(),
   );
   if (!pending) return failure;
   let verified: { provider: "apple" | "google"; linkKeyHex: string };
@@ -1093,10 +1139,14 @@ async function handleIdentityAppleCallback(
     });
   } catch {
     // A provider code can be spent only once. Leaving this handoff pending
-    // would make the desktop app poll a state that cannot ever complete.
-    await discardPendingAppleHandoff(
+    // would make the desktop app poll a state that cannot ever complete. The
+    // discard is fenced to this callback's own claim, so a callback whose claim
+    // was preempted by a lease-expiry re-claim can never delete the new
+    // claimant's row.
+    await discardClaimedAppleSignInHandoff(
       env.USAGE_MONITOR_DB,
       state,
+      claimId,
       new Date().toISOString(),
     );
     return failure;
@@ -1111,6 +1161,7 @@ async function handleIdentityAppleCallback(
   const stored = await completeAppleSignInHandoff(
     env.USAGE_MONITOR_DB,
     state,
+    claimId,
     verified.linkKeyHex,
     randomSecret(48),
     new Date(filledAtMs).toISOString(),
@@ -1279,14 +1330,27 @@ async function handleIdentityGoogleCallback(
     return failure;
   }
   if (typeof code !== "string" || code.length === 0) return failure;
+  // Atomically reserve the row before spending the PKCE verifier on a provider
+  // token request. The same conditional UPDATE that claims the row returns the
+  // verifier, so exactly one of many racing callbacks reaches the exchange; the
+  // rest change no row and stop. `claimed_at <= staleBefore` permits one bounded
+  // retry after a crashed claimant's lease expires.
+  const claimId = randomSecret(48);
+  const staleClaimBeforeIso = new Date(
+    Date.now() - SIGNIN_HANDOFF_PROCESSING_LEASE_MILLISECONDS,
+  ).toISOString();
   const pending = await env.USAGE_MONITOR_DB.prepare(
-    `SELECT code_verifier AS codeVerifier FROM google_signin_handoffs
+    `UPDATE google_signin_handoffs
+        SET claim_id = ?, claimed_at = ?
       WHERE state = ?
         AND identity_link_key IS NULL
         AND proof IS NULL
         AND delivered_at IS NULL
-        AND expires_at > ?`,
-  ).bind(state, nowIso).first<{ codeVerifier: string }>();
+        AND expires_at > ?
+        AND (claim_id IS NULL OR claimed_at <= ?)
+      RETURNING code_verifier AS codeVerifier`,
+  ).bind(claimId, nowIso, state, nowIso, staleClaimBeforeIso)
+    .first<{ codeVerifier: string }>();
   if (!pending) return failure;
   let verified: { provider: "apple" | "google"; linkKeyHex: string };
   try {
@@ -1306,10 +1370,13 @@ async function handleIdentityGoogleCallback(
     verified = await verifiedHostedCallbackIdentity(env, "google", idToken);
   } catch {
     // A provider code can be spent only once. Leaving this handoff pending
-    // would make the desktop app poll a state that cannot ever complete.
-    await discardPendingGoogleHandoff(
+    // would make the desktop app poll a state that cannot ever complete. The
+    // discard is fenced to this callback's own claim, so a preempted callback
+    // can never delete the row the new claimant is processing.
+    await discardClaimedGoogleHandoff(
       env.USAGE_MONITOR_DB,
       state,
+      claimId,
       new Date().toISOString(),
     );
     return failure;
@@ -1322,10 +1389,13 @@ async function handleIdentityGoogleCallback(
   // the pre-update row, so the authorization deadline is still the one being
   // enforced here.
   const filledAtMs = Date.now();
+  // Completion is fenced to this claim: a callback whose claim was preempted by
+  // a lease-expiry re-claim writes zero rows and reports failure.
   const stored = await env.USAGE_MONITOR_DB.prepare(
     `UPDATE google_signin_handoffs
         SET code_verifier = NULL, identity_link_key = ?, proof = ?, expires_at = ?
       WHERE state = ?
+        AND claim_id = ?
         AND identity_link_key IS NULL
         AND proof IS NULL
         AND delivered_at IS NULL
@@ -1335,6 +1405,7 @@ async function handleIdentityGoogleCallback(
     randomSecret(48),
     new Date(filledAtMs + SIGNIN_HANDOFF_DELIVERY_TTL_MILLISECONDS).toISOString(),
     state,
+    claimId,
     new Date(filledAtMs).toISOString(),
   ).run();
   if (stored.meta.changes !== 1) return failure;

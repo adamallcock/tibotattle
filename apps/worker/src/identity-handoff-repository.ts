@@ -125,9 +125,48 @@ export async function readPendingAppleSignInHandoff(
 }
 
 /**
+ * Atomically reserves a pending handoff before any provider I/O. Exactly one of
+ * many racing callbacks wins this conditional UPDATE and receives the nonce
+ * digest; every other callback sees zero changes and must stop before signing a
+ * client secret or contacting the provider. `claimed_at` is a lease: a claim
+ * older than `staleClaimBeforeIso` is re-claimable, so a crashed claimant frees
+ * the row for one bounded retry rather than stranding the sign-in for its whole
+ * authorization window. The returned `claimId` fences completion and discard.
+ */
+export async function claimPendingAppleSignInHandoff(
+  db: D1Database,
+  state: string,
+  claimId: string,
+  nowIso: string,
+  staleClaimBeforeIso: string,
+): Promise<ApplePendingSignInHandoff | null> {
+  assertProof(claimId);
+  assertInstant(nowIso);
+  assertInstant(staleClaimBeforeIso);
+  const row = await db.prepare(
+    `UPDATE apple_signin_handoffs
+        SET claim_id = ?, claimed_at = ?
+      WHERE state = ?
+        AND identity_link_key IS NULL
+        AND proof IS NULL
+        AND delivered_at IS NULL
+        AND expires_at > ?
+        AND (claim_id IS NULL OR claimed_at <= ?)
+      RETURNING state, nonce_hash AS nonceHash`,
+  ).bind(claimId, nowIso, state, nowIso, staleClaimBeforeIso)
+    .first<ApplePendingSignInHandoff>();
+  if (!row || typeof row.state !== "string" || typeof row.nonceHash !== "string") {
+    return null;
+  }
+  if (!NONCE_HASH_PATTERN.test(row.nonceHash)) return null;
+  return { state: row.state, nonceHash: row.nonceHash };
+}
+
+/**
  * Atomically fills a pending handoff with the already verified pairwise link
  * key and a fresh opaque proof.  A false result means it expired, was filled,
- * or was delivered while provider verification was in flight.
+ * was delivered, or was re-claimed by another callback while provider
+ * verification was in flight.
  *
  * The same statement moves the row from its authorization phase into its
  * delivery phase: the WHERE clause still enforces the authorization deadline
@@ -139,11 +178,13 @@ export async function readPendingAppleSignInHandoff(
 export async function completeAppleSignInHandoff(
   db: D1Database,
   state: string,
+  claimId: string,
   identityLinkKey: string,
   proof: string,
   nowIso: string,
   deliveryExpiresAtIso: string,
 ): Promise<boolean> {
+  assertProof(claimId);
   assertIdentityLinkKey(identityLinkKey);
   assertProof(proof);
   // Both instants are canonical `toISOString()` output, so the ordering
@@ -152,10 +193,13 @@ export async function completeAppleSignInHandoff(
   assertInstant(nowIso);
   assertInstant(deliveryExpiresAtIso);
   if (!(deliveryExpiresAtIso > nowIso)) internalError();
+  // Completion is fenced to the claimant: a callback whose claim was preempted
+  // by a lease-expiry re-claim writes zero rows here and reports failure.
   const result = await db.prepare(
     `UPDATE apple_signin_handoffs
         SET identity_link_key = ?, proof = ?, expires_at = ?
       WHERE state = ?
+        AND claim_id = ?
         AND identity_link_key IS NULL
         AND proof IS NULL
         AND delivered_at IS NULL
@@ -165,6 +209,7 @@ export async function completeAppleSignInHandoff(
     proof,
     deliveryExpiresAtIso,
     state,
+    claimId,
     nowIso,
   ).run();
   return result.meta.changes === 1;
@@ -203,7 +248,13 @@ export async function deliverAppleSignInHandoff(
   return { proof: row.proof };
 }
 
-/** Deletes a live, still-empty handoff after provider cancellation/exchange failure. */
+/**
+ * Deletes a live, still-empty, UNCLAIMED handoff after a provider cancellation
+ * that arrives before any callback has claimed the row. The `claim_id IS NULL`
+ * predicate is the fence: a cancellation callback can never delete a row another
+ * callback is already processing — that claimant discards its own row on failure
+ * through `discardClaimedAppleSignInHandoff`.
+ */
 export async function discardPendingAppleSignInHandoff(
   db: D1Database,
   state: string,
@@ -212,11 +263,36 @@ export async function discardPendingAppleSignInHandoff(
   await db.prepare(
     `DELETE FROM apple_signin_handoffs
       WHERE state = ?
+        AND claim_id IS NULL
         AND identity_link_key IS NULL
         AND proof IS NULL
         AND delivered_at IS NULL
         AND expires_at > ?`,
   ).bind(state, nowIso).run();
+}
+
+/**
+ * Discards a handoff the caller currently holds the claim on, after its own
+ * provider exchange failed. Fenced to `claimId`: a callback that lost its claim
+ * to a lease-expiry re-claim deletes nothing, so it can never remove the row the
+ * new claimant is processing.
+ */
+export async function discardClaimedAppleSignInHandoff(
+  db: D1Database,
+  state: string,
+  claimId: string,
+  nowIso: string,
+): Promise<void> {
+  assertProof(claimId);
+  await db.prepare(
+    `DELETE FROM apple_signin_handoffs
+      WHERE state = ?
+        AND claim_id = ?
+        AND identity_link_key IS NULL
+        AND proof IS NULL
+        AND delivered_at IS NULL
+        AND expires_at > ?`,
+  ).bind(state, claimId, nowIso).run();
 }
 
 /** Purges expired rows in a bounded batch for scheduled/opportunistic cleanup. */

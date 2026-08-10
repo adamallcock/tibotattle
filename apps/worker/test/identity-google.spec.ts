@@ -789,4 +789,36 @@ describe("hosted Google sign-in", () => {
       proof: expect.stringMatching(/^[A-Za-z0-9_-]{64}$/u),
     });
   });
+
+  // csf_efe7a64e: the pending read did not reserve the row, so many callbacks
+  // carrying one valid state each spent the PKCE verifier on a Google token
+  // request. The atomic claim now admits exactly one to provider I/O and fences
+  // completion, so the shared row is filled once.
+  it("admits exactly one of many concurrent Google callbacks to the provider exchange", async () => {
+    const started = await startSignIn();
+    const attempts = 6;
+    const responses = await Promise.all(
+      Array.from({ length: attempts }, () => callback(new URLSearchParams({
+        code: "google-one-time-code",
+        state: started.state,
+      }).toString())),
+    );
+    const pages = await Promise.all(responses.map((response) => response.text()));
+    const completed = pages.filter((page) => page.includes("Signed in")).length;
+    const refused = pages.filter(
+      (page) => page.includes("Sign-in was not completed"),
+    ).length;
+    // Exactly one callback exchanged the code at Google's token endpoint.
+    expect(tokenCalls).toHaveLength(1);
+    expect(completed).toBe(1);
+    expect(refused).toBe(attempts - 1);
+    // The shared row was filled exactly once, and the winning claim also cleared
+    // the single-use PKCE verifier.
+    const stored = await bindings().USAGE_MONITOR_DB.prepare(
+      `SELECT COUNT(*) AS total, COUNT(proof) AS proofs,
+              COUNT(identity_link_key) AS links, COUNT(code_verifier) AS verifiers
+         FROM google_signin_handoffs`,
+    ).first<{ total: number; proofs: number; links: number; verifiers: number }>();
+    expect(stored).toEqual({ total: 1, proofs: 1, links: 1, verifiers: 0 });
+  });
 });
