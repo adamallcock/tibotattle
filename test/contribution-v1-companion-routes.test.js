@@ -248,7 +248,11 @@ test("the capability advertises the v1.0 contract only when configured with an e
       "telemetry-contribution-v1.0",
     );
     // The same injected controller served both configured servers, and each
-    // started it beside the v0.1 scheduler.
+    // started it beside the v0.1 scheduler. The start rides the lazy snapshot
+    // build a health read kicks off without being awaited by the response, so
+    // give the event loop the same settling turns the kick counters get —
+    // asserting immediately raced it and failed roughly one run in four.
+    await settleKicks();
     assert.equal(controller.calls.start, 2);
   } finally {
     await app.close();
