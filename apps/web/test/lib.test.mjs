@@ -9231,6 +9231,72 @@ test("divergence window-breakdown client sends bounded integers and degrades on 
   assert.equal((await oldClient.windowBreakdown(100, 200)).status, "unavailable");
 });
 
+// The hourly usage chart was reported clipped at the bottom (x-axis and the
+// foot of the lines hidden by the shell). At this revision it is not clipped:
+// the SVG takes its height from the drawing's own ratio and the shell grows to
+// fit, so nothing is letterboxed or clipped. A future edit that pins a fixed
+// pixel height, or lets the CSS ratio drift from the viewBox height lineChart
+// draws at, would bring the clip back — this pins the contract instead.
+test("Trends usage chart sizes from its aspect ratio, never a fixed pixel height", async () => {
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+
+  const svgBlock = styles.match(/\.chart-shell svg \{([\s\S]*?)\}/u)?.[1] ?? "";
+  assert.match(svgBlock, /height: auto;/u, "the shell SVG height is derived, not pinned");
+  assert.doesNotMatch(svgBlock, /height: \d+px/u, "a fixed pixel height reinstates the letterbox/clip");
+  const timelineRatio = svgBlock.match(/aspect-ratio: 900 \/ (\d+)/u)?.[1];
+  assert.ok(timelineRatio, "the timeline chart shell declares an aspect ratio");
+  const compactRatio = styles
+    .match(/\.chart-shell\.compact-chart svg \{[^}]*aspect-ratio: 900 \/ (\d+)/u)?.[1];
+  assert.ok(compactRatio, "the compact chart shell declares an aspect ratio");
+
+  // The CSS ratio has to stay in step with the viewBox height each chart is
+  // drawn at, or the SVG is scaled to a box of the wrong shape and clips.
+  const timelineHeight = appSource.match(/const TIMELINE_CHART_HEIGHT = (\d+);/u)?.[1];
+  const compactHeight = appSource.match(/const COMPACT_CHART_HEIGHT = (\d+);/u)?.[1];
+  assert.equal(timelineRatio, timelineHeight, "timeline aspect-ratio matches TIMELINE_CHART_HEIGHT");
+  assert.equal(compactRatio, compactHeight, "compact aspect-ratio matches COMPACT_CHART_HEIGHT");
+});
+
+// The "Show this window's cost mix" button was reported inert. The button
+// expands the period, reprices just that window through the companion, and —
+// when the companion cannot answer (an older route, or the accounting cache
+// still rebuilding) — states that honestly rather than doing nothing. This
+// pins the whole chain so a refactor cannot quietly return it to a dead click.
+test("Trends cost-mix toggle expands and degrades honestly when repricing is unavailable", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const localization = await readFile(new URL("../public/localization.js", import.meta.url), "utf8");
+
+  // The click handler toggles the panel and, only on expand, loads the mix.
+  assert.match(appSource, /toggle\.addEventListener\("click", \(\) => \{/u);
+  assert.match(appSource, /panel\.hidden = open;/u);
+  assert.match(appSource, /if \(!open\) loadBreakdown\(\);/u);
+  // Loading reprices the exact window; any failure is caught, not swallowed
+  // into a no-op.
+  assert.match(
+    appSource,
+    /breakdown = await localClient\.windowBreakdown\(period\.startMs, period\.endMs\);/u,
+  );
+  assert.match(appSource, /\} catch \{\s*breakdown = null;\s*\}/u);
+  // A null or non-available breakdown renders an explicit unavailable state,
+  // never an empty panel.
+  assert.match(appSource, /if \(!breakdown \|\| breakdown\.status !== "available"\)/u);
+  assert.match(appSource, /"divergence\.breakdown\.unavailable"/u);
+  assert.match(appSource, /"divergence\.breakdown\.unavailablePlain"/u);
+  // The honest-state copy exists in every locale.
+  for (const key of ["divergence.breakdown.unavailable", "divergence.breakdown.unavailablePlain"]) {
+    const row = localization.match(
+      new RegExp(`"${key.replace(/\./gu, "\\.")}": \\[([\\s\\S]*?)\\]`, "u"),
+    )?.[1];
+    assert.ok(row, `${key} is defined`);
+    assert.equal(
+      (row.match(/"/gu) ?? []).length,
+      6,
+      `${key} carries all three languages`,
+    );
+  }
+});
+
 // Owner polish (2026-08-11): the calibration legend used to stack three rows
 // high inside the right-aligned control column, and its seven entries all drew
 // the same line swatch, so the two plotted lines were not distinguishable from
