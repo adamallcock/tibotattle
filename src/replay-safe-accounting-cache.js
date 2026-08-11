@@ -111,6 +111,17 @@ const ACCOUNT_SCOPE_ID_PATTERN = /^openai-account:v1:[A-Za-z0-9_-]{43}$/u;
 const ACCOUNT_TRACK_ID_PATTERN = /^account-track:v1:[a-f0-9]{64}$/u;
 const MAX_RETAINED_TRANSITION_BYTES = 320 * 1024 * 1024;
 const MAX_ACCOUNTING_RSS_BYTES = Math.floor(1.5 * 1024 * 1024 * 1024);
+// What one accounting rebuild may itself ADD to process RSS. The absolute
+// ceiling above is compared against whole-process RSS, and inside a companion
+// that idles near ~800 MB that left the pass an accidental ~700 MB budget
+// that shrank with every unrelated allocation — the live five-hour incident
+// ran exactly that arithmetic. The pass's own metered climb measured ~330 MB
+// on the real corpus, and the composition fit has since moved to an O(bins)
+// streaming pass, so 512 MiB is the measured climb plus ~55% headroom for
+// corpus growth: a principled bound on what the pass does, enforced relative
+// to the RSS captured at build start, while MAX_ACCOUNTING_RSS_BYTES stays
+// the absolute hard backstop against a baseline that is itself leaking.
+const ACCOUNTING_RSS_DELTA_BUDGET_BYTES = 512 * 1024 * 1024;
 const ACCOUNTING_RSS_CHECK_INTERVAL = 2_048;
 const COMPACT_USAGE_RETAINED_BYTES = 256;
 const COMPACT_SNAPSHOT_RETAINED_BYTES = 192;
@@ -2225,18 +2236,32 @@ export async function buildReplaySafeAccountingCache({
   const baselines = Array.isArray(declaredSpeedBaselines)
     ? declaredSpeedBaselines
     : [];
+  // Budget-relative guard: the pass is charged for its OWN growth over the
+  // RSS captured here at build start, so a large companion baseline no longer
+  // silently spends the budget before the pass begins — and a small baseline
+  // no longer grants the pass an accidental gigabyte. The absolute ceiling is
+  // retained as the hard backstop, so the effective limit is whichever of
+  // (baseline + delta budget, absolute ceiling) is LOWER.
+  const baselineRss = rss();
+  if (!Number.isSafeInteger(baselineRss) || baselineRss < 0) {
+    throw fixedError("accounting_transition_rss_measurement_invalid");
+  }
+  const effectiveMaximumRssBytes = Math.min(
+    maximumRssBytes,
+    baselineRss + ACCOUNTING_RSS_DELTA_BUDGET_BYTES,
+  );
   const checkRuntimeMemory = () => {
     const currentRss = rss();
     if (!Number.isSafeInteger(currentRss) || currentRss < 0) {
       throw fixedError("accounting_transition_rss_measurement_invalid");
     }
-    if (currentRss > maximumRssBytes) {
+    if (currentRss > effectiveMaximumRssBytes) {
       throw fixedError("accounting_transition_rss_limit_exceeded");
     }
   };
   checkRuntimeMemory();
   const scanResourceGuard = createExportResourceGuard({
-    limits: { maximumRssBytes },
+    limits: { maximumRssBytes: effectiveMaximumRssBytes },
     clock: now,
     rss,
   });

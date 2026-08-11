@@ -2127,7 +2127,10 @@ test("measured RSS ceiling fails closed during accounting and preserves the last
     scan: scanner([]),
   });
   const before = await readTestCache(cacheFile);
-  const samples = [50, 101];
+  // Baseline capture, then a clean start check, then the post-scan check
+  // crosses the absolute ceiling: the injected 100-byte ceiling is far below
+  // baseline + delta budget, so this exercises the hard backstop arm.
+  const samples = [50, 50, 101];
 
   await assert.rejects(
     refreshReplaySafeAccountingCache({
@@ -2147,6 +2150,87 @@ test("measured RSS ceiling fails closed during accounting and preserves the last
 
   assert.deepEqual(await readTestCache(cacheFile), before);
   assert.equal((await stat(cacheFile)).mode & 0o777, 0o600);
+});
+
+test("the RSS guard is budget-relative: a pass climbing past the delta budget fails closed below the absolute ceiling", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rss-delta-"));
+  const cacheFile = join(directory, "accounting.json");
+  await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
+    scan: scanner([]),
+  });
+  const before = await readTestCache(cacheFile);
+  const baseline = 900 * 1024 * 1024;
+  // Baseline capture and the start check see the companion's resting RSS;
+  // the post-scan check sees the pass one byte past its own 512 MiB delta
+  // budget while still ~100 MiB UNDER the absolute 1.5 GiB ceiling — the
+  // exact reading the old absolute-only guard waved through.
+  const samples = [baseline, baseline, baseline + 512 * 1024 * 1024 + 1];
+
+  await assert.rejects(
+    refreshReplaySafeAccountingCache({
+      cacheFile,
+      now: () => NOW + 1_000,
+      rss: () => samples.shift() ?? baseline + 512 * 1024 * 1024 + 1,
+      scan: scanner([]),
+    }),
+    (error) => error?.code === "accounting_transition_rss_limit_exceeded",
+  );
+
+  assert.deepEqual(await readTestCache(cacheFile), before);
+});
+
+test("a large companion baseline is not charged against the pass budget", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rss-baseline-"));
+  const cacheFile = join(directory, "accounting.json");
+  const baseline = 1_200 * 1024 * 1024;
+  // The companion idles at ~1.2 GiB and the pass climbs a modest 50 MiB:
+  // well within its delta budget and under the absolute ceiling, so the
+  // rebuild must complete — a high resting baseline alone is never a
+  // refusal.
+  let calls = 0;
+  const cache = await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
+    rss: () => {
+      calls += 1;
+      return calls <= 2 ? baseline : baseline + 50 * 1024 * 1024;
+    },
+    scan: scanner([
+      usageEvent({
+        timestamp: "2026-07-27T11:55:00.000Z",
+        components: { input_uncached_tokens: 1 },
+      }),
+    ]),
+  });
+
+  assert.equal(cache.schemaVersion, REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION);
+  assert.equal(period(cache, "7d").events, 1);
+});
+
+test("the scan resource guard inherits the budget-relative RSS ceiling", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rss-guard-limit-"));
+  const cacheFile = join(directory, "accounting.json");
+  const baseline = 100 * 1024 * 1024;
+  let observedGuard = null;
+  await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
+    rss: () => baseline,
+    scan: async ({ resourceGuard }) => {
+      observedGuard = resourceGuard;
+      return { diagnostics: {} };
+    },
+  });
+
+  // The deep-scan guard polices the same pass, so it must carry the same
+  // effective ceiling (baseline + delta budget here, since that is below the
+  // absolute constant) rather than the absolute constant alone.
+  assert.equal(
+    observedGuard?.limits.maximumRssBytes,
+    baseline + 512 * 1024 * 1024,
+  );
 });
 
 test("deep log scanning receives hard resource bounds and preserves the last cache when they trip", async () => {
