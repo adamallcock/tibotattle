@@ -280,6 +280,49 @@ test("a used_percent reset starts a fresh segment; no window ever spans the boun
   assert.ok(lastObserved.quota_change_pp <= 7);
 });
 
+test("a single stale dip that recovers never starts a segment or fabricates movement", () => {
+  // Live-corpus shape (266 raw-grain occurrences): one interleaved reading
+  // from a stale source drops far below the envelope and the next reading
+  // recovers. Splitting on the single dip would anchor a fresh segment at
+  // the stale value and book the recovery (~55pp here) as observed movement
+  // against pennies of cost.
+  const intervals = [
+    compositionInterval({ hour: 0, priorUsedPercent: 60, nextUsedPercent: 61, costsByModel: { "gpt-5.6-sol": 25 } }),
+    compositionInterval({ hour: 1, priorUsedPercent: 61, nextUsedPercent: 6, costsByModel: { "gpt-5.6-sol": 1 } }),
+    compositionInterval({ hour: 2, priorUsedPercent: 6, nextUsedPercent: 61, costsByModel: { "gpt-5.6-sol": 1 } }),
+    compositionInterval({ hour: 3, priorUsedPercent: 61, nextUsedPercent: 62, costsByModel: { "gpt-5.6-sol": 25 } }),
+  ];
+  const rolling = buildRollingHours(intervals, COMPOSITION, 1);
+  const observed = rolling.filter((row) => row.series === "Observed quota change");
+  // One segment, monotone envelope: total observed movement is 60 -> 62,
+  // never a +55 phantom.
+  for (const row of observed) {
+    assert.ok(row.quota_change_pp === null || row.quota_change_pp <= 2);
+  }
+  const total = observed.reduce((sum, row) => sum + (row.quota_change_pp ?? 0), 0);
+  assert.ok(Math.abs(total - 2) < 1e-9);
+});
+
+test("two consecutive confirming readings still split a genuine reset into a fresh segment", () => {
+  const intervals = [
+    compositionInterval({ hour: 0, priorUsedPercent: 60, nextUsedPercent: 61, costsByModel: { "gpt-5.6-sol": 25 } }),
+    // Banked reset: the display drops and STAYS down across two readings.
+    compositionInterval({ hour: 1, priorUsedPercent: 61, nextUsedPercent: 6, costsByModel: { "gpt-5.6-sol": 1 } }),
+    compositionInterval({ hour: 2, priorUsedPercent: 6, nextUsedPercent: 7, costsByModel: { "gpt-5.6-sol": 10 } }),
+    compositionInterval({ hour: 3, priorUsedPercent: 7, nextUsedPercent: 9, costsByModel: { "gpt-5.6-sol": 20 } }),
+  ];
+  const rolling = buildRollingHours(intervals, COMPOSITION, 1);
+  const observed = rolling.filter((row) => row.series === "Observed quota change");
+  // The confirmed drop starts a fresh segment: no window mixes 61 with the
+  // post-reset climb, and post-reset movement is measured from the low base.
+  for (const row of observed) {
+    assert.ok(row.quota_change_pp === null
+      || (row.quota_change_pp >= 0 && row.quota_change_pp <= 3));
+  }
+  const lastObserved = observed.at(-1);
+  assert.equal(lastObserved.quota_change_pp, 2);
+});
+
 test("buildRollingResidual counts the saturated windows its AUC excluded", () => {
   const intervals = [
     compositionInterval({ hour: 0, priorUsedPercent: 98, nextUsedPercent: 100, costsByModel: { "gpt-5.6-sol": 50 } }),

@@ -272,14 +272,32 @@ export function buildRollingHours(intervals, capacity, smoothingHours = 3) {
 
   // One bucket per (segment, hour). A reset inside an hour starts a new
   // bucket in a new segment rather than folding pre- and post-reset movement
-  // into one envelope.
+  // into one envelope. A reset needs TWO consecutive sub-envelope readings
+  // (the composition kernel's rule): a single reading that immediately
+  // recovers is a stale interleaved source, and splitting on it would start
+  // a segment at the stale value and book the recovery as a huge phantom
+  // observed movement the monotone envelope previously absorbed.
   const buckets = new Map();
   let segment = 0;
   let monotonicUsed = ordered[0].priorUsedPercent;
+  let pendingDropPercent = null;
   for (const row of ordered) {
     if (row.nextUsedPercent < monotonicUsed - RESET_DECREASE_THRESHOLD_PP) {
-      segment += 1;
-      monotonicUsed = Math.min(row.priorUsedPercent, row.nextUsedPercent);
+      if (pendingDropPercent !== null
+          && row.nextUsedPercent
+            <= pendingDropPercent + RESET_DECREASE_THRESHOLD_PP) {
+        // Confirmed persistent drop: a genuine (banked/automatic) reset.
+        segment += 1;
+        monotonicUsed = Math.min(row.priorUsedPercent, row.nextUsedPercent);
+        pendingDropPercent = null;
+      } else {
+        // First (or non-confirming) sub-envelope reading: hold judgement.
+        // The envelope below absorbs the dip, so a stale reading that
+        // recovers contributes no movement anywhere.
+        pendingDropPercent = row.nextUsedPercent;
+      }
+    } else {
+      pendingDropPercent = null;
     }
     const key = `${segment}|${hourStart(row.eventTime)}`;
     const canonicalPrior = monotonicUsed;
@@ -343,16 +361,32 @@ export function buildRollingHours(intervals, capacity, smoothingHours = 3) {
       const observedChange = saturated
         ? null
         : hour.endUsedPercent - window[0].startUsedPercent;
-      const expectedChange = saturated
-        ? null
-        : capacityUsdByModel !== null
-          ? compositionExpectedPp(windowCostByModel, {
+      let expectedChange = null;
+      if (!saturated) {
+        if (capacityUsdByModel !== null) {
+          const attributedPp = compositionExpectedPp(windowCostByModel, {
             capacityUsdByModel,
             fallbackCapacityUsd,
-          })
-          : (fallbackCapacityUsd !== null
-            ? cost * 100 / fallbackCapacityUsd
-            : null);
+          });
+          // Cost that carries no modelMix attribution (older artifacts,
+          // partial mixes) still consumed quota: price it at the blended
+          // fallback so the composition line integrates EVERY dollar the
+          // blended line would, never silently dropping unattributed cost.
+          const attributedCost = Object.values(windowCostByModel)
+            .reduce((sum, value) => sum + value, 0);
+          const unattributedCost = Math.max(0, cost - attributedCost);
+          if (attributedPp !== null) {
+            if (unattributedCost <= 1e-9) {
+              expectedChange = attributedPp;
+            } else if (fallbackCapacityUsd !== null) {
+              expectedChange = attributedPp
+                + unattributedCost * 100 / fallbackCapacityUsd;
+            }
+          }
+        } else if (fallbackCapacityUsd !== null) {
+          expectedChange = cost * 100 / fallbackCapacityUsd;
+        }
+      }
       const windowEnd = new Date(Date.parse(hour.timestamp) + 3_600_000).toISOString();
       const shared = {
         timestamp: windowEnd,
