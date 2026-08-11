@@ -5,8 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
+  assertReplaySafeAccountingCache,
   buildReplaySafeAccountingCache,
   buildReplaySafeAccountingPeriod,
+  fitCompositionFromCompactCorpus,
   readReplaySafeAccountingCache as readReplaySafeAccountingCacheImpl,
   refreshReplaySafeAccountingCache as refreshReplaySafeAccountingCacheImpl,
 } from "../src/replay-safe-accounting-cache.js";
@@ -18,7 +20,12 @@ import {
   createUnifiedIndexWriter,
   openLocalUnifiedIndex,
 } from "../src/local-unified-index.js";
-import { buildRollingQuotaComparisons } from "@app-usagemonitor/quota-analysis";
+import {
+  blendedCompositionCapacityUsd,
+  buildCompositionObservations,
+  buildRollingQuotaComparisons,
+  calibrateCompositionCapacities,
+} from "@app-usagemonitor/quota-analysis";
 
 // The previous JSON paths are test-fixture names only. The wrappers prove the
 // same cache contracts against SQLite without allowing production callers to
@@ -827,6 +834,357 @@ test("a mix-varied corpus yields a fitted per-model composition that survives th
   });
   assert.equal(read.status, "available");
   assert.deepEqual(read.cache.weeklyCalibration.composition, composition);
+});
+
+// Compact rows exactly as transitionUsageProjection / weeklyRateLimitProjection
+// lay them out, restricted to the indices the composition fit reads: usage
+// [0]=ISO timestamp, [1]=model, [10]=costUsd; snapshot [1]=timestampMs,
+// [3]=planType, [7]=resetsAt seconds, [8]=usedPercent.
+function compactUsageRow(timestampMs, model, costUsd) {
+  const row = new Array(16).fill(null);
+  row[0] = new Date(timestampMs).toISOString();
+  row[1] = model;
+  row[10] = costUsd;
+  return row;
+}
+
+function compactSnapshotRow(
+  timestampMs,
+  usedPercent,
+  resetsAtSeconds,
+  planType = "pro",
+) {
+  const row = new Array(9).fill(null);
+  row[0] = new Date(timestampMs).toISOString();
+  row[1] = timestampMs;
+  row[3] = planType;
+  row[7] = resetsAtSeconds;
+  row[8] = usedPercent;
+  return row;
+}
+
+// The pre-streaming per-event reference: materialize {observedAtMs, model,
+// costUsd} objects for the whole corpus and hand them to the kernel — the
+// exact code the streaming pass replaced. The fit must stay bit-identical to
+// this path; only the peak memory may differ.
+function referencePerEventComposition({
+  rawUsageEvents,
+  weeklyRateLimitSnapshots,
+  endMs,
+}) {
+  const usageRows = [];
+  for (const row of rawUsageEvents) {
+    if (!Array.isArray(row)) continue;
+    const observedAtMs = Date.parse(row[0]);
+    const costUsd = Number(row[10]);
+    if (!Number.isFinite(observedAtMs)
+        || typeof row[1] !== "string"
+        || !Number.isFinite(costUsd)
+        || costUsd < 0) continue;
+    usageRows.push({ observedAtMs, model: row[1], costUsd });
+  }
+  const quotaRows = [];
+  for (const row of weeklyRateLimitSnapshots) {
+    if (!Array.isArray(row)) continue;
+    const observedAtMs = Number(row[1]);
+    const resetsAtSeconds = Number(row[7]);
+    const usedPercent = Number(row[8]);
+    if (!Number.isFinite(observedAtMs)
+        || !Number.isFinite(resetsAtSeconds)
+        || !Number.isFinite(usedPercent)) continue;
+    quotaRows.push({
+      observedAtMs,
+      planType: typeof row[3] === "string" ? row[3] : "unknown",
+      resetsAtMs: resetsAtSeconds * 1_000,
+      usedPercent,
+    });
+  }
+  const { observations, voidedBinCount, poolCount } =
+    buildCompositionObservations({ usageRows, quotaRows });
+  const fit = calibrateCompositionCapacities(observations);
+  const recentStartMs = endMs - 14 * 24 * 60 * 60 * 1_000;
+  const recentMix = {};
+  for (const row of usageRows) {
+    if (row.observedAtMs < recentStartMs) continue;
+    recentMix[row.model] = (recentMix[row.model] ?? 0) + row.costUsd;
+  }
+  const blendedRecentMixUsd = fit.status === "fitted"
+    ? blendedCompositionCapacityUsd(recentMix, {
+      capacityUsdByModel: fit.capacityUsdByModel,
+      fallbackCapacityUsd: fit.singleConstantUsd,
+    })
+    : null;
+  return {
+    usageRows,
+    quotaRows,
+    observations,
+    voidedBinCount,
+    poolCount,
+    fit,
+    blendedRecentMixUsd,
+  };
+}
+
+test("the streaming composition binning matches the per-event kernel path exactly", async () => {
+  const grainMs = 2 * 60 * 60 * 1_000;
+  const resetStartMs = Date.parse("2026-08-10T00:00:00.000Z");
+  const resetsAtSeconds = Math.floor(
+    (resetStartMs + 7 * 24 * 60 * 60 * 1_000) / 1_000,
+  );
+  const endMs = resetStartMs + 60 * 60 * 60 * 1_000;
+  const rawUsageEvents = [];
+  const weeklyRateLimitSnapshots = [
+    compactSnapshotRow(resetStartMs, 0, resetsAtSeconds),
+  ];
+  // The mix-varied fixture shape: alternating pure-model 2h bins whose
+  // displayed movement differs 4x on comparable spend — but with SEVERAL
+  // fractional-cost events per bin, so the streaming accumulation has real
+  // floating-point summation order to preserve, plus a sliver model that
+  // folds into "other" and an out-of-recent-window event that must reach the
+  // bins yet stay out of the recent mix.
+  let usedPercent = 0;
+  for (let bin = 0; bin < 25; bin += 1) {
+    const binStartMs = resetStartMs + bin * grainMs;
+    const model = bin % 2 === 0 ? "gpt-5.6-sol" : "gpt-5.6-terra";
+    for (let event = 0; event < 7; event += 1) {
+      rawUsageEvents.push(compactUsageRow(
+        binStartMs + (event + 1) * 60_000,
+        model,
+        0.7 + event * 0.037,
+      ));
+    }
+    rawUsageEvents.push(
+      compactUsageRow(binStartMs + 8 * 60_000, "gpt-5.6-luna", 0.003),
+    );
+    usedPercent += bin % 2 === 0 ? 1 : 4;
+    weeklyRateLimitSnapshots.push(
+      compactSnapshotRow(binStartMs + 90 * 60_000, usedPercent, resetsAtSeconds),
+    );
+  }
+  rawUsageEvents.push(compactUsageRow(
+    resetStartMs - 30 * 24 * 60 * 60 * 1_000,
+    "gpt-5.6-sol",
+    5,
+  ));
+  // Malformed rows both paths must skip identically.
+  rawUsageEvents.push(null);
+  rawUsageEvents.push(compactUsageRow(resetStartMs, "gpt-5.6-sol", -1));
+  const negativeCost = compactUsageRow(resetStartMs, "gpt-5.6-sol", 1);
+  negativeCost[0] = "not-a-timestamp";
+  rawUsageEvents.push(negativeCost);
+  weeklyRateLimitSnapshots.push(null);
+  const malformedSnapshot = compactSnapshotRow(resetStartMs, 50, resetsAtSeconds);
+  malformedSnapshot[1] = Number.NaN;
+  weeklyRateLimitSnapshots.push(malformedSnapshot);
+
+  const reference = referencePerEventComposition({
+    rawUsageEvents,
+    weeklyRateLimitSnapshots,
+    endMs,
+  });
+  // The fixture must exercise the strongest path: a genuinely fitted vector.
+  assert.equal(reference.fit.status, "fitted");
+
+  const streamed = await fitCompositionFromCompactCorpus({
+    rawUsageEvents,
+    weeklyRateLimitSnapshots,
+    endMs,
+  });
+  assert.deepEqual(streamed, {
+    status: reference.fit.status,
+    grainHours: 2,
+    observationCount: reference.fit.observationCount,
+    voidedBinCount: reference.voidedBinCount,
+    poolCount: reference.poolCount,
+    capacityUsdByModel: reference.fit.capacityUsdByModel,
+    modelCostShares: reference.fit.modelCostShares,
+    r2: reference.fit.r2,
+    singleConstantUsd: reference.fit.singleConstantUsd,
+    singleConstantR2: reference.fit.singleConstantR2,
+    blendedRecentMixUsd: Number(reference.blendedRecentMixUsd.toFixed(2)),
+    recentMixDays: 14,
+  });
+
+  // The grains themselves are identical, not merely the fit summary:
+  // aggregating per (grain bin, model) in encounter order and re-running the
+  // kernel yields byte-for-byte the observations the per-event rows produce.
+  const binCosts = new Map();
+  for (const row of reference.usageRows) {
+    if (row.model.length === 0) continue;
+    const binStartMs = Math.floor(row.observedAtMs / grainMs) * grainMs;
+    let costs = binCosts.get(binStartMs);
+    if (costs === undefined) {
+      costs = new Map();
+      binCosts.set(binStartMs, costs);
+    }
+    costs.set(row.model, (costs.get(row.model) ?? 0) + row.costUsd);
+  }
+  const aggregatedRows = [];
+  for (const [binStartMs, costs] of binCosts) {
+    for (const [model, costUsd] of costs) {
+      aggregatedRows.push({ observedAtMs: binStartMs, model, costUsd });
+    }
+  }
+  assert.deepEqual(
+    buildCompositionObservations({
+      usageRows: aggregatedRows,
+      quotaRows: reference.quotaRows,
+    }),
+    {
+      observations: reference.observations,
+      voidedBinCount: reference.voidedBinCount,
+      poolCount: reference.poolCount,
+    },
+  );
+});
+
+test("the composition fit meters memory and abort on the shared cadence", async () => {
+  const startMs = Date.parse("2026-08-10T00:00:00.000Z");
+  const resetsAtSeconds = Math.floor(
+    (startMs + 7 * 24 * 60 * 60 * 1_000) / 1_000,
+  );
+  const rawUsageEvents = [];
+  for (let index = 0; index < 5_000; index += 1) {
+    rawUsageEvents.push(
+      compactUsageRow(startMs + index * 1_000, "gpt-5.6-sol", 0.01),
+    );
+  }
+  const weeklyRateLimitSnapshots = [];
+  for (let index = 0; index < 1_200; index += 1) {
+    weeklyRateLimitSnapshots.push(compactSnapshotRow(
+      startMs + index * 60_000,
+      Math.min(100, Math.floor(index / 60)),
+      resetsAtSeconds,
+    ));
+  }
+  const endMs = startMs + 24 * 60 * 60 * 1_000;
+
+  // 5,000 usage rows + 1,200 snapshot rows share one row counter, so the
+  // 2,048-row cadence fires at 2,048 and 4,096 (usage pass) and 6,144
+  // (quota pass): exactly three memory checks.
+  let checks = 0;
+  await fitCompositionFromCompactCorpus({
+    rawUsageEvents,
+    weeklyRateLimitSnapshots,
+    endMs,
+    checkRuntimeMemory: () => {
+      checks += 1;
+    },
+  });
+  assert.equal(checks, 3);
+
+  // A memory guard that trips mid-corpus propagates out of the fit itself.
+  const guardError = new Error("accounting_transition_rss_limit_exceeded");
+  guardError.code = "accounting_transition_rss_limit_exceeded";
+  await assert.rejects(
+    fitCompositionFromCompactCorpus({
+      rawUsageEvents,
+      weeklyRateLimitSnapshots,
+      endMs,
+      checkRuntimeMemory: () => {
+        throw guardError;
+      },
+    }),
+    (error) => error?.code === "accounting_transition_rss_limit_exceeded",
+  );
+
+  // An aborted signal interrupts on the same cadence.
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    fitCompositionFromCompactCorpus({
+      rawUsageEvents,
+      weeklyRateLimitSnapshots,
+      endMs,
+      signal: controller.signal,
+    }),
+    (error) => error?.name === "AbortError",
+  );
+});
+
+test("a composition fit that trips the RSS ceiling mid-way fails soft into a completed v0.7 cache", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-fit-fail-soft-"));
+  const stateFile = join(directory, "collector-state-v1.sqlite");
+  let fitSpikeArmed = false;
+  let checksSinceArmed = 0;
+  const cache = await buildReplaySafeAccountingCache({
+    now: () => NOW,
+    maximumRssBytes: 1_000,
+    // Under the ceiling everywhere except the SECOND check after the scan
+    // returns: the first is the build's post-scan phase boundary, the second
+    // is the fit's first in-loop cadence check — so the throw provably
+    // starts inside the fit, and the ceiling is back under for every later
+    // phase.
+    rss: () => {
+      if (!fitSpikeArmed) return 10;
+      checksSinceArmed += 1;
+      return checksSinceArmed === 2 ? 1_001 : 10;
+    },
+    scan: async ({ onUsage }) => {
+      for (let index = 0; index < 2_100; index += 1) {
+        onUsage(usageEvent({
+          timestamp: new Date(NOW - 100_000_000 + index * 1_000).toISOString(),
+          components: { input_uncached_tokens: 1 },
+        }));
+      }
+      fitSpikeArmed = true;
+      return { diagnostics: {} };
+    },
+  });
+
+  // The build completed: every event aggregated, the calibration block
+  // exists, and only the optional composition enrichment is gone.
+  assert.equal(cache.schemaVersion, REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION);
+  assert.equal(period(cache, "all").events, 2_100);
+  assert.equal(cache.weeklyCalibration.composition, null);
+  assert.deepEqual(cache.weeklyCalibration.compositionStatus, {
+    status: "fit_failed",
+    reason: "accounting_transition_rss_limit_exceeded",
+  });
+
+  // The completed cache is valid, survives the SQLite round trip, and the
+  // honest failure record survives with it.
+  await writeTestCache(stateFile, cache);
+  const read = await readReplaySafeAccountingCache({
+    cacheFile: stateFile,
+    now: () => NOW,
+  });
+  assert.equal(read.status, "available");
+  assert.equal(read.cache.weeklyCalibration.composition, null);
+  assert.deepEqual(read.cache.weeklyCalibration.compositionStatus, {
+    status: "fit_failed",
+    reason: "accounting_transition_rss_limit_exceeded",
+  });
+
+  // The failure record is validated, not merely tolerated: an unbounded
+  // reason or a record claiming failure NEXT TO a composition block both
+  // fail the cache validator.
+  const unboundedReason = structuredClone(cache);
+  unboundedReason.weeklyCalibration.compositionStatus = {
+    status: "fit_failed",
+    reason: "free text with spaces / and paths",
+  };
+  assert.throws(
+    () => assertReplaySafeAccountingCache(unboundedReason),
+    (error) => error?.code === "cache_invalid",
+  );
+  const contradictory = structuredClone(cache);
+  contradictory.weeklyCalibration.composition = {
+    status: "insufficient_observations",
+    grainHours: 2,
+    observationCount: 0,
+    capacityUsdByModel: null,
+    modelCostShares: {},
+    r2: null,
+    singleConstantUsd: null,
+    singleConstantR2: null,
+    blendedRecentMixUsd: null,
+    recentMixDays: 14,
+  };
+  assert.throws(
+    () => assertReplaySafeAccountingCache(contradictory),
+    (error) => error?.code === "cache_invalid",
+  );
 });
 
 // Fixture unified index for the full-history calibration tests: the same
