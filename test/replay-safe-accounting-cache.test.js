@@ -1326,6 +1326,140 @@ test("a missing or empty unified index degrades honestly to the windowed corpus"
   assert.equal(empty.weeklyCalibrationInput.source, "windowed_scan");
 });
 
+// Free-form fixture for the retained-byte budget tests: exact usage
+// timestamps and exact quota readings, unlike the reset-shaped calibration
+// fixture above.
+async function writeUnifiedCorpusFixture(indexFile, { usageEvents, quotaRows }) {
+  const database = openLocalUnifiedIndex(indexFile, { create: true });
+  const writer = createUnifiedIndexWriter(database, {
+    contractVersion: "unified-calibration-test-v1",
+  });
+  const modelId = writer.internModel("gpt-5.6-terra", "recognized");
+  const tierId = writer.internTier({
+    apiServiceTier: "unknown",
+    billingSurface: "unknown",
+    codexSpeedMode: "unknown",
+    tierSource: "unknown",
+    providerTierRaw: null,
+  });
+  const surfaceId = writer.internSurface({
+    agentScope: "unknown",
+    surface: "unknown",
+    threadSource: "unknown",
+    lineageDisposition: "unknown",
+  });
+  const accountScopeId = writer.internAccountScope({
+    status: "unavailable",
+    reason: null,
+    planType: null,
+    scopeLocal: null,
+  });
+  const sessionLocal = Buffer.alloc(32, 9);
+  for (const [index, observedAtMs] of usageEvents.entries()) {
+    writer.writeUsageEvent({
+      eventKey: Buffer.from(`unified-budget-event-${index}`),
+      observedAtMs,
+      sessionLocal,
+      accountScopeId,
+      modelId,
+      tierId,
+      surfaceId,
+      reasoningEffort: 8,
+      outcome: 5,
+      tokensInUncached: 1_000,
+    });
+  }
+  for (const row of quotaRows) {
+    writer.internQuota({
+      observedAtMs: row.observedAtMs,
+      limitId: "codex",
+      slot: "secondary",
+      planType: "pro",
+      usedPercent: row.usedPercent,
+      resetsAtMs: row.resetsAtMs,
+      durationMins: 10_080,
+    });
+  }
+  await writer.close({ integrityCheck: true, fsyncPath: indexFile });
+}
+
+test("the unified usage read refuses incrementally when resident rows project past the byte budget", async () => {
+  const directory = await mkdtemp(
+    join(tmpdir(), "usage-monitor-unified-usage-budget-"),
+  );
+  const indexFile = join(directory, "local-unified-index-v2.sqlite");
+  const tieMs = NOW - 24 * 60 * 60 * 1_000;
+  await writeUnifiedCorpusFixture(indexFile, {
+    usageEvents: Array.from({ length: 40 }, () => tieMs),
+    quotaRows: [0, 1, 2].map((step) => ({
+      observedAtMs: tieMs + step * 60_000,
+      usedPercent: step,
+      resetsAtMs: NOW + 60 * 60 * 1_000,
+    })),
+  });
+
+  // Retention keeps the newest 5 usage rows, but every row shares one
+  // timestamp, so the batched read walks all 40 before trimming. The
+  // post-trim corpus (5 usage rows + 3 collapsed snapshots = 1,856 projected
+  // bytes) FITS the injected 2,560-byte budget, so this refusal can only
+  // come from the incremental accounting inside the batch loop noticing the
+  // resident working set (40 rows = 10,240 projected bytes) — the residency
+  // the after-the-fact gate never saw.
+  await assert.rejects(
+    buildReplaySafeAccountingCache({
+      now: () => NOW,
+      unifiedIndexFile: indexFile,
+      transitionResourceLimits: { usageEvents: 5, retainedBytes: 2_560 },
+      scan: scanner([]),
+    }),
+    (error) => error?.code === "accounting_calibration_corpus_unavailable",
+  );
+});
+
+test("the snapshot run-collapse loop stops reading once the retained byte budget is exhausted", async () => {
+  const directory = await mkdtemp(
+    join(tmpdir(), "usage-monitor-unified-snapshot-budget-"),
+  );
+  const indexFile = join(directory, "local-unified-index-v2.sqlite");
+  const baseMs = NOW - 30 * 24 * 60 * 60 * 1_000;
+  const snapshotRows = 60_000;
+  await writeUnifiedCorpusFixture(indexFile, {
+    usageEvents: Array.from(
+      { length: 10 },
+      (_, index) => baseMs + index * 60_000,
+    ),
+    quotaRows: Array.from({ length: snapshotRows }, (_, index) => ({
+      observedAtMs: baseMs + index * 1_000,
+      // Consecutive readings always differ, so the run collapse retains every
+      // row and only the byte budget can stop the read.
+      usedPercent: (index % 200) / 2,
+      resetsAtMs: NOW + 60 * 60 * 1_000,
+    })),
+  });
+
+  let rssCalls = 0;
+  await assert.rejects(
+    buildReplaySafeAccountingCache({
+      now: () => NOW,
+      unifiedIndexFile: indexFile,
+      // The 10 usage rows (2,560 projected bytes) fit; the budget dies at the
+      // 51st retained snapshot, ~59,950 stream rows before the end.
+      transitionResourceLimits: { retainedBytes: 12_288 },
+      rss: () => {
+        rssCalls += 1;
+        return 1_000;
+      },
+      scan: scanner([]),
+    }),
+    (error) => error?.code === "accounting_calibration_corpus_unavailable",
+  );
+  // A read that stops at the refusal never reaches the periodic in-loop
+  // memory checks a full 60k-row materialization performs (~29 checks at the
+  // 2,048-row cadence). The handful recorded here are the build's fixed
+  // phase-boundary checks.
+  assert.ok(rssCalls < 15, `expected an early stop, saw ${rssCalls} RSS checks`);
+});
+
 // Standing owner rule (2026-08-08): NEVER convenience-sized history windows.
 // 31 and 93 — the two values that were actually shipped — must now be
 // unrepresentable, not merely unused.
@@ -1993,7 +2127,10 @@ test("measured RSS ceiling fails closed during accounting and preserves the last
     scan: scanner([]),
   });
   const before = await readTestCache(cacheFile);
-  const samples = [50, 101];
+  // Baseline capture, then a clean start check, then the post-scan check
+  // crosses the absolute ceiling: the injected 100-byte ceiling is far below
+  // baseline + delta budget, so this exercises the hard backstop arm.
+  const samples = [50, 50, 101];
 
   await assert.rejects(
     refreshReplaySafeAccountingCache({
@@ -2013,6 +2150,87 @@ test("measured RSS ceiling fails closed during accounting and preserves the last
 
   assert.deepEqual(await readTestCache(cacheFile), before);
   assert.equal((await stat(cacheFile)).mode & 0o777, 0o600);
+});
+
+test("the RSS guard is budget-relative: a pass climbing past the delta budget fails closed below the absolute ceiling", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rss-delta-"));
+  const cacheFile = join(directory, "accounting.json");
+  await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
+    scan: scanner([]),
+  });
+  const before = await readTestCache(cacheFile);
+  const baseline = 900 * 1024 * 1024;
+  // Baseline capture and the start check see the companion's resting RSS;
+  // the post-scan check sees the pass one byte past its own 512 MiB delta
+  // budget while still ~100 MiB UNDER the absolute 1.5 GiB ceiling — the
+  // exact reading the old absolute-only guard waved through.
+  const samples = [baseline, baseline, baseline + 512 * 1024 * 1024 + 1];
+
+  await assert.rejects(
+    refreshReplaySafeAccountingCache({
+      cacheFile,
+      now: () => NOW + 1_000,
+      rss: () => samples.shift() ?? baseline + 512 * 1024 * 1024 + 1,
+      scan: scanner([]),
+    }),
+    (error) => error?.code === "accounting_transition_rss_limit_exceeded",
+  );
+
+  assert.deepEqual(await readTestCache(cacheFile), before);
+});
+
+test("a large companion baseline is not charged against the pass budget", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rss-baseline-"));
+  const cacheFile = join(directory, "accounting.json");
+  const baseline = 1_200 * 1024 * 1024;
+  // The companion idles at ~1.2 GiB and the pass climbs a modest 50 MiB:
+  // well within its delta budget and under the absolute ceiling, so the
+  // rebuild must complete — a high resting baseline alone is never a
+  // refusal.
+  let calls = 0;
+  const cache = await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
+    rss: () => {
+      calls += 1;
+      return calls <= 2 ? baseline : baseline + 50 * 1024 * 1024;
+    },
+    scan: scanner([
+      usageEvent({
+        timestamp: "2026-07-27T11:55:00.000Z",
+        components: { input_uncached_tokens: 1 },
+      }),
+    ]),
+  });
+
+  assert.equal(cache.schemaVersion, REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION);
+  assert.equal(period(cache, "7d").events, 1);
+});
+
+test("the scan resource guard inherits the budget-relative RSS ceiling", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rss-guard-limit-"));
+  const cacheFile = join(directory, "accounting.json");
+  const baseline = 100 * 1024 * 1024;
+  let observedGuard = null;
+  await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
+    rss: () => baseline,
+    scan: async ({ resourceGuard }) => {
+      observedGuard = resourceGuard;
+      return { diagnostics: {} };
+    },
+  });
+
+  // The deep-scan guard polices the same pass, so it must carry the same
+  // effective ceiling (baseline + delta budget here, since that is below the
+  // absolute constant) rather than the absolute constant alone.
+  assert.equal(
+    observedGuard?.limits.maximumRssBytes,
+    baseline + 512 * 1024 * 1024,
+  );
 });
 
 test("deep log scanning receives hard resource bounds and preserves the last cache when they trip", async () => {
