@@ -2028,6 +2028,16 @@ async function readUnifiedIndexCalibrationCorpus({
           observedMs,
           transitionUsageProjection(rawEvent, event),
         ]);
+        // Projected-bytes accounting per retained row, mirroring the windowed
+        // path's reserveTransitionInput: the byte budget bounds what is
+        // RESIDENT, so the moment the materialized working set projects past
+        // it the read refuses — it never finishes materializing a corpus the
+        // final gate was always going to reject. (The retention cutoff bounds
+        // the row COUNT up to timestamp ties; only this check bounds bytes.)
+        if (stampedUsage.length * COMPACT_USAGE_RETAINED_BYTES
+            > limits.retainedBytes) {
+          return null;
+        }
       }
       afterRowId = Number(batch.at(-1).row_id);
       if (batch.length < UNIFIED_CALIBRATION_READ_BATCH_ROWS) break;
@@ -2054,7 +2064,31 @@ async function readUnifiedIndexCalibrationCorpus({
     const weeklyRateLimitSnapshots = [];
     let firstSnapshotMs = null;
     const groupRuns = new Map();
+    // Incremental reservation for every snapshot row the collapse decides to
+    // retain, mirroring reserveTransitionInput on the windowed path: bytes,
+    // snapshot count, and combined count are all checked BEFORE the row is
+    // materialized, so the retained corpus can never sit fully resident past
+    // `limits` with the refusal still ahead of it. Once tripped, the read
+    // stops consuming the snapshot stream entirely and reports the corpus
+    // unusable (null -> the caller's typed
+    // accounting_calibration_corpus_unavailable).
+    const retainedUsageBytes =
+      rawUsageEvents.length * COMPACT_USAGE_RETAINED_BYTES;
+    let retainedInputBudgetExceeded = false;
+    const reserveSnapshotRetention = () => {
+      const retainedSnapshots = weeklyRateLimitSnapshots.length + 1;
+      if (retainedSnapshots > limits.weeklySnapshots
+          || rawUsageEvents.length + retainedSnapshots > limits.combinedInputs
+          || retainedUsageBytes
+            + retainedSnapshots * COMPACT_SNAPSHOT_RETAINED_BYTES
+            > limits.retainedBytes) {
+        retainedInputBudgetExceeded = true;
+        return false;
+      }
+      return true;
+    };
     const emit = (pending) => {
+      if (!reserveSnapshotRetention()) return;
       weeklyRateLimitSnapshots.push(weeklyRateLimitProjection({
         timestamp: new Date(pending.observedMs).toISOString(),
         timestampMs: pending.observedMs,
@@ -2074,6 +2108,10 @@ async function readUnifiedIndexCalibrationCorpus({
       snapshotLowerMs,
       endMs,
     )) {
+      // Stop reading the stream the moment retention refused a row: every
+      // later row would either be refused too or misrepresent a corpus that
+      // is already over budget as complete.
+      if (retainedInputBudgetExceeded) return null;
       processed += 1;
       if (processed % ACCOUNTING_RSS_CHECK_INTERVAL === 0) {
         throwIfAborted(signal);
@@ -2116,6 +2154,7 @@ async function readUnifiedIndexCalibrationCorpus({
     for (const run of groupRuns.values()) {
       if (run.pending) emit(run.pending);
     }
+    if (retainedInputBudgetExceeded) return null;
     if (weeklyRateLimitSnapshots.length === 0) return null;
     if (weeklyRateLimitSnapshots.length > limits.weeklySnapshots
         || rawUsageEvents.length + weeklyRateLimitSnapshots.length
