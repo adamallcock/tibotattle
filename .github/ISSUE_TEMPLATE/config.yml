@@ -1,0 +1,4 @@
+contact_links:
+  - name: Security report (private)
+    url: https://github.com/adamallcock/app-usagemonitor/security/advisories/new
+    about: Report vulnerabilities privately via GitHub Security Advisories. Never file a security problem as a public issue.

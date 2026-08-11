@@ -1,0 +1,62 @@
+name: Bug report
+description: Report a problem with the local TiboTattle app or dashboard.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. For problems with the hosted service at
+        tibotattle.com, use the "Hosted service issue" template instead.
+        For security problems, use a private GitHub Security Advisory,
+        not a public issue (see SECURITY.md).
+  - type: input
+    id: app-version
+    attributes:
+      label: App version
+      description: From the About panel or menu bar item (for example, v0.1.1).
+      placeholder: v0.1.1
+    validations:
+      required: true
+  - type: dropdown
+    id: install-channel
+    attributes:
+      label: Install channel
+      options:
+        - Release download (tibotattle.com / tibotattle-client releases)
+        - Built from source
+        - Preview / development build
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps. Use redacted or synthetic examples only.
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: |
+        What happened instead. If relevant, include output from the built-in
+        diagnostics: `npm run diagnose:dashboard` (review it for anything
+        personal before pasting).
+    validations:
+      required: true
+  - type: checkboxes
+    id: no-session-content
+    attributes:
+      label: Content check
+      options:
+        - label: This report contains no prompts, model responses, or real file paths from coding-agent sessions.
+          required: true

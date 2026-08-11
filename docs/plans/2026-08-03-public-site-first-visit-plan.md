@@ -121,7 +121,7 @@ The revised first visit uses:
   and repository Markdown is not a published documentation surface.
 
 The visual targets are the generated desktop and mobile concepts under
-`/Users/adamallcock/.codex/generated_images/019fca39-224d-7f91-ab58-c0c20aa1247f/`.
+`~/.codex/generated_images/019fca39-224d-7f91-ab58-c0c20aa1247f/`.
 They are design references only; the production page keeps text, actions,
 status, and app-preview framing in HTML and uses a privacy-safe screenshot of
 the labeled demo chart as its only new product image.
