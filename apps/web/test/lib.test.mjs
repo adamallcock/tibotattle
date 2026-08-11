@@ -8973,6 +8973,94 @@ test("the sign-in gate fires only for a dead stored session and always records a
   );
 });
 
+test("the merged identity status renders the right label and one next action per state", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("const IDENTITY_STATE_CHIP_KEYS = Object.freeze({");
+  const end = appSource.indexOf("\n// A completed hosted handoff is memory-only");
+  assert.ok(start >= 0 && end > start, "the identity status model is available");
+  const model = Function(
+    `${appSource.slice(start, end)}
+return {
+  IDENTITY_STATE_CHIP_KEYS,
+  hostedIdentityStatusState,
+  hostedIdentityNextActionKey,
+};`,
+  )();
+
+  // Every underlying fact combination maps to exactly one honest state.
+  const state = (facts) => model.hostedIdentityStatusState(facts);
+  // New: nothing at all.
+  assert.equal(
+    state({ signingIn: false, signedIn: false, hasServerSession: false, repairPending: false }),
+    "new",
+  );
+  // Signing in wins over everything, including a stale session still present.
+  assert.equal(
+    state({ signingIn: true, signedIn: true, hasServerSession: true, repairPending: false }),
+    "signingIn",
+  );
+  // A completed round trip that left only an in-page proof is Reconnecting,
+  // never a flat Connected and never New.
+  assert.equal(
+    state({ signingIn: false, signedIn: true, hasServerSession: false, repairPending: false }),
+    "reconnecting",
+  );
+  // An approved Mac whose upload authority is being re-paired is Reconnecting.
+  assert.equal(
+    state({ signingIn: false, signedIn: true, hasServerSession: true, repairPending: true }),
+    "reconnecting",
+  );
+  // A real server session with nothing pending is Connected.
+  assert.equal(
+    state({ signingIn: false, signedIn: true, hasServerSession: true, repairPending: false }),
+    "connected",
+  );
+
+  // The chip label and the ONE next action per state — and the reconnect that
+  // lost its session names its own sign-in step.
+  assert.deepEqual(model.IDENTITY_STATE_CHIP_KEYS, {
+    new: "identity.state.new",
+    signingIn: "identity.state.signingIn",
+    reconnecting: "identity.state.reconnecting",
+    connected: "identity.state.connected",
+  });
+  assert.equal(model.hostedIdentityNextActionKey("new", false), "identity.next.new");
+  assert.equal(model.hostedIdentityNextActionKey("signingIn", false), "identity.next.signingIn");
+  assert.equal(model.hostedIdentityNextActionKey("connected", false), "identity.next.connected");
+  assert.equal(
+    model.hostedIdentityNextActionKey("reconnecting", false),
+    "identity.next.reconnecting",
+    "a reconnect that still holds its session reconnects silently",
+  );
+  assert.equal(
+    model.hostedIdentityNextActionKey("reconnecting", true),
+    "identity.next.reconnectSignIn",
+    "a reconnect that lost its session asks for a fresh sign-in",
+  );
+
+  // Every state and action line is present, short, and coherent in all three
+  // languages.
+  const keys = [
+    ...Object.values(model.IDENTITY_STATE_CHIP_KEYS),
+    "identity.next.new",
+    "identity.next.signingIn",
+    "identity.next.reconnecting",
+    "identity.next.reconnectSignIn",
+    "identity.next.connected",
+  ];
+  for (const locale of SUPPORTED_LOCALES) {
+    for (const key of keys) {
+      const copy = translate(key, {}, locale);
+      assert.ok(copy.length > 0 && copy.length <= 90, `${locale} ${key} stays short`);
+    }
+  }
+
+  // The chip element and its one-next-action sibling both exist in the page.
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(html, /id="identity-signin-state"/u);
+  assert.match(html, /id="identity-signin-next"/u);
+});
+
 test("the journey's community stage cannot claim done while the re-pair is pending", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   // The repair branch renders BEFORE the approved-done branch, splitting on

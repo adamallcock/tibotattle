@@ -7702,7 +7702,7 @@ const SERVICE_ERROR_COPY = {
   KEY_ID_INVALID:
     "The upload key this build used is not one the contribution service recognizes. Nothing was uploaded; install the current signed build.",
   LIFECYCLE_BOUNDS_EXCEEDED:
-    "The request went beyond a fixed safety bound in the contribution service. Nothing was uploaded; choose a shorter interval.",
+    "This account already has its maximum of connected Macs, so this Mac was not connected. Sign out a Mac you no longer use from its own TiboTattle, then connect this one again. Nothing was uploaded.",
   LIFECYCLE_STATE_CONFLICT:
     "The contribution service is in a different state than this page expected. Nothing was uploaded; reload TiboTattle and try again.",
   TELEMETRY_REQUIRED:
@@ -8070,16 +8070,75 @@ function renderHostedIdentity() {
       ? "Signing out ends this app's contribution session."
       : "This app already has a contribution session. Signing out ends it.",
   );
-  setProductText(chip, signedIn
-    ? "Signed in"
-    : hostedIdentityBusy ? "Signing in…" : "Not signed in");
-  chip.className = signedIn
+  // One honest, four-state identity status (owner-reported contradictions,
+  // 2026-08-08/10). A single flat "Signed in"/"Not signed in" chip could not
+  // tell never-tried from signing-in from reconnecting from connected, so it
+  // showed a live in-page proof as "Signed in", a completed Google round trip
+  // as "Not signed in", and an APPROVED Mac beside a dead action. The merged
+  // model resolves all three, and the ONE next action is stated beside it so
+  // the chip and the action can never disagree.
+  const identityState = hostedIdentityStatusState({
+    signingIn: hostedIdentityBusy
+      || activeHostedSignIn !== null
+      || pendingHostedSignInResumeInFlight,
+    signedIn,
+    hasServerSession,
+    repairPending: incrementalConsentApproved && incrementalUploadAuthorityLost(),
+  });
+  setLocalizedText(chip, IDENTITY_STATE_CHIP_KEYS[identityState]);
+  chip.className = identityState === "connected"
     ? "evidence-chip"
     : "evidence-chip neutral";
+  const nextAction = $("#identity-signin-next");
+  if (nextAction) {
+    setLocalizedText(
+      nextAction,
+      hostedIdentityNextActionKey(identityState, hostedSignInRequired()),
+    );
+  }
   // Sign-in state gates the single approve ceremony, so the merged surface
   // and the journey strip re-render with it (owner-directed 2026-08-08: the
   // separate connect button this used to refresh is gone).
   renderContributionActionState();
+}
+
+// The four merged identity states and their one-next-action lines. Kept beside
+// renderHostedIdentity so the chip vocabulary and the action vocabulary are
+// read from the same place.
+const IDENTITY_STATE_CHIP_KEYS = Object.freeze({
+  new: "identity.state.new",
+  signingIn: "identity.state.signingIn",
+  reconnecting: "identity.state.reconnecting",
+  connected: "identity.state.connected",
+});
+const IDENTITY_STATE_NEXT_KEYS = Object.freeze({
+  new: "identity.next.new",
+  signingIn: "identity.next.signingIn",
+  reconnecting: "identity.next.reconnecting",
+  connected: "identity.next.connected",
+});
+
+/**
+ * The one honest identity status, from the underlying facts. Signing-in wins
+ * over everything: an in-flight ceremony is the truest current state. Otherwise
+ * a Mac that holds only an in-page proof, or whose upload authority is being
+ * re-paired, is Reconnecting rather than a flat "Connected"; a real server
+ * session with nothing pending is Connected; and nothing at all is New — never
+ * "Not signed in" right after a completed round trip left a live proof.
+ */
+function hostedIdentityStatusState({ signingIn, signedIn, hasServerSession, repairPending }) {
+  if (signingIn) return "signingIn";
+  if (repairPending || (signedIn && !hasServerSession)) return "reconnecting";
+  if (signedIn) return "connected";
+  return "new";
+}
+
+// A reconnect that has lost its session names its own next step — sign in
+// again — rather than implying nothing is asked of the reader.
+function hostedIdentityNextActionKey(identityState, signInRequired) {
+  return identityState === "reconnecting" && signInRequired
+    ? "identity.next.reconnectSignIn"
+    : IDENTITY_STATE_NEXT_KEYS[identityState];
 }
 
 // A completed hosted handoff is memory-only, but enrollment also creates an
