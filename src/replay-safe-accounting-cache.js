@@ -60,8 +60,12 @@ import { fastQuotaMultiplier } from "./application/index.js";
 // and `.coveredAt`. A v0.4 cache's calibration was silently bounded by its
 // scan window, so it is withheld and rebuilt rather than shown as full
 // history.
+// v0.6: quota-track identity became slot-agnostic (keyed on limitId +
+// duration). A v0.5 cache derived its weekly calibration with pre-Jul-12
+// history filtered out by slot, so it is withheld and rebuilt rather than
+// blended with the restored corpus.
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
-  "local-replay-safe-accounting-v0.5";
+  "local-replay-safe-accounting-v0.6";
 
 const HISTORICAL_PRICE_EPOCH_BASIS =
   "event_time_when_registry_has_effective_evidence";
