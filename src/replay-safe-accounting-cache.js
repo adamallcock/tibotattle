@@ -43,6 +43,7 @@ import {
   SEVEN_DAY_WINDOW_MINUTES,
 } from "@app-usagemonitor/quota-analysis";
 import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
+import { SPARK_QUOTA_LIMIT_IDS } from "./local-companion-usage-model.js";
 import {
   defaultLocalCollectorStatePath,
   prepareLocalCollectorState,
@@ -74,8 +75,14 @@ import { fastQuotaMultiplier } from "./application/index.js";
 // cache carries no composition block and its expected line silently misreads
 // model mix as deviation, so it is withheld and rebuilt rather than served
 // alongside surfaces that now assume the fit can exist.
+// v0.8 (2026-08-11): the scan retains Spark quota snapshots under every id in
+// SPARK_QUOTA_LIMIT_IDS. A v0.7 cache matched the reserved marketing token
+// ("codex-spark") only, while real captures report "codex_bengalfox", so its
+// `sparkQuotaTimeline` is empty against every capture to date; it is withheld
+// and rebuilt rather than served as evidence that no Spark quota history
+// exists.
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
-  "local-replay-safe-accounting-v0.7";
+  "local-replay-safe-accounting-v0.8";
 
 const HISTORICAL_PRICE_EPOCH_BASIS =
   "event_time_when_registry_has_effective_evidence";
@@ -624,9 +631,10 @@ function quotaTimelineProjection(
 ) {
   const observedAt = canonicalInstant(snapshot?.timestamp);
   const window = snapshot?.window;
-  // Keep only the fixed main Codex weekly family used by the UI calibration.
-  // The high-churn codex_bengalfox family is a different track, not a
-  // substitute for missing observations on this allowance.
+  // Keep only the limit family the caller asked for. The high-churn
+  // codex_bengalfox family never folds into the main "codex" weekly track
+  // used by the UI calibration — it is the Spark allowance's real limit id
+  // and is retained on the Spark series instead.
   if (observedAt === null
       || !window
       || typeof window !== "object"
@@ -709,18 +717,32 @@ function quotaTimelineRowTieBreak(row) {
   ].join("\0");
 }
 
+// Retained order must satisfy validQuotaTimeline's code-unit sortKey check on
+// read. localeCompare gives punctuation variable collation weight — it orders
+// "codex_bengalfox" before "codex-spark" while the code-unit check orders
+// them the other way — so quota-timeline ordering always compares code units,
+// never collation order.
+function codeUnitCompare(left, right) {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
 function quotaTimelineRowSort(left, right) {
-  return left.observedAt.localeCompare(right.observedAt)
-    || left.limitId.localeCompare(right.limitId)
-    || left.slot.localeCompare(right.slot)
-    || left.resetAt.localeCompare(right.resetAt)
-    || left.planType.localeCompare(right.planType)
+  return codeUnitCompare(left.observedAt, right.observedAt)
+    || codeUnitCompare(left.limitId, right.limitId)
+    || codeUnitCompare(left.slot, right.slot)
+    || codeUnitCompare(left.resetAt, right.resetAt)
+    || codeUnitCompare(left.planType, right.planType)
     || left.usedPercent - right.usedPercent;
 }
 
 function quotaTimelineDeterministicRowSort(left, right) {
   return quotaTimelineRowSort(left, right)
-    || String(left.durationMinutes).localeCompare(String(right.durationMinutes));
+    || codeUnitCompare(
+      String(left.durationMinutes),
+      String(right.durationMinutes),
+    );
 }
 
 function retainQuotaTimeline(buckets, snapshot, options) {
@@ -864,7 +886,7 @@ function selectTrackBalancedQuotaTimelineRows(rows, maximum, rangeRows) {
   }
   const trackBudget = Math.ceil(maximum / byTrack.size);
   let tracks = [...byTrack.entries()]
-    .sort(([left], [right]) => left.localeCompare(right))
+    .sort(([left], [right]) => codeUnitCompare(left, right))
     .map(([, group]) => ({
       rows: selectTimeStratifiedQuotaTimelineRows(
         group.sort(quotaTimelineDeterministicRowSort),
@@ -917,14 +939,7 @@ function retainBoundedQuotaTimelineRows(groups, maximum, rangeRows) {
 }
 
 function finalizeWeeklyQuotaTimeline(buckets) {
-  const rows = [...buckets.values()].sort((left, right) => (
-    left.observedAt.localeCompare(right.observedAt)
-    || left.limitId.localeCompare(right.limitId)
-    || left.slot.localeCompare(right.slot)
-    || left.resetAt.localeCompare(right.resetAt)
-    || left.planType.localeCompare(right.planType)
-    || left.usedPercent - right.usedPercent
-  ));
+  const rows = [...buckets.values()].sort(quotaTimelineRowSort);
   // Keep the historical path byte-for-byte/order-for-order for ordinary
   // caches. Retention only changes when the old newest-only cap would have
   // discarded the earlier covered window.
@@ -2313,7 +2328,10 @@ export async function buildReplaySafeAccountingCache({
         if (!Number.isFinite(observedMs)
             || observedMs < startMs
             || observedMs > endMs) return;
-        if (window?.limitId === "codex-spark"
+        // Rows keep the observed limit id: consumers filter the series with
+        // SPARK_QUOTA_LIMIT_IDS.includes(row.limitId), same as the unified
+        // and collector paths.
+        if (SPARK_QUOTA_LIMIT_IDS.includes(window?.limitId)
             && window.provider === "openai_codex"
             && isValidQuotaWindowDuration(window.windowDurationMins)) {
           if (retainWindowedCalibrationInputs) {
@@ -2325,7 +2343,7 @@ export async function buildReplaySafeAccountingCache({
           retainQuotaTimeline(
             sparkQuotaTimelineBuckets,
             snapshot,
-            { limitId: "codex-spark", durationMinutes: null },
+            { limitId: window.limitId, durationMinutes: null },
           );
           return;
         }
@@ -2471,9 +2489,12 @@ export async function buildReplaySafeAccountingCache({
   }, { composition });
   if (compositionFitFailure !== null) {
     // Additive v0.7 field, present only when the fit itself threw: a blank
-    // composition must be distinguishable from "the corpus never supported a
-    // fit" — five hours of silent refresh loops is what an unrecorded
-    // failure cost the last time.
+    // composition caused by a failure must be distinguishable against a
+    // corpus that simply never supported a fit — five hours of silent
+    // refresh loops is what an unrecorded failure cost the last time.
+    // (Comment deliberately avoids a quoted phrase after the keyword-like
+    // word f-r-o-m: the release gate's ESM lexer reads that shape in
+    // comments as an import specifier.)
     weeklyCalibration.compositionStatus = compositionFitFailure;
   }
   const paceForecast = projectWeeklyPaceForecast(weeklyPaceSnapshots, endMs);
@@ -2617,7 +2638,7 @@ function validWeeklyCalibrationInput(value) {
 function validQuotaTimeline(
   value,
   coveredAt,
-  { limitId = "codex", durationMinutes = WEEKLY_WINDOW_MINUTES } = {},
+  { limitIds = ["codex"], durationMinutes = WEEKLY_WINDOW_MINUTES } = {},
 ) {
   if (!Array.isArray(value) || value.length > MAX_QUOTA_TIMELINE_ROWS) {
     return false;
@@ -2642,7 +2663,7 @@ function validQuotaTimeline(
         || Object.keys(row).sort().join("\0") !== expectedKeys
         || canonicalInstant(row.observedAt) === null
         || canonicalInstant(row.resetAt) === null
-        || row.limitId !== limitId
+        || !limitIds.includes(row.limitId)
         || !QUOTA_SLOTS.has(row.slot)
         || !(QUOTA_PLANS.has(row.planType) || row.planType === "unknown")
         || typeof row.usedPercent !== "number"
@@ -2667,13 +2688,15 @@ function validQuotaTimeline(
     const bucketKey = quotaTimelineTrackBucketKey(row);
     if (seenBuckets.has(bucketKey)) return false;
     seenBuckets.add(bucketKey);
+    // Percent is zero-padded so the string compare is numeric, matching the
+    // writer's ascending numeric sort ("9.000" must not sort after "19.000").
     const sortKey = [
       row.observedAt,
       row.limitId,
       row.slot,
       row.resetAt,
       row.planType,
-      row.usedPercent.toFixed(3),
+      row.usedPercent.toFixed(3).padStart(7, "0"),
     ].join("\0");
     if (priorSortKey !== null && sortKey < priorSortKey) return false;
     priorSortKey = sortKey;
@@ -2839,7 +2862,8 @@ function validWeeklyCalibrationComposition(value) {
 // Additive v0.7 field, present only when the composition fit itself threw
 // (resource ceiling, abort, numerical failure): the build completed with
 // `composition: null` and this bounded record says why, so a blank
-// composition is distinguishable from "the corpus never supported a fit".
+// composition caused by a failure stays distinguishable against a corpus that
+// simply never supported a fit.
 // Absent on caches whose fit ran to completion.
 function validWeeklyCalibrationCompositionStatus(value, composition) {
   if (value === undefined) return true;
@@ -2874,7 +2898,7 @@ function validCache(value) {
       || !validQuotaTimeline(
         value.sparkQuotaTimeline,
         value.coveredAt,
-        { limitId: "codex-spark", durationMinutes: null },
+        { limitIds: SPARK_QUOTA_LIMIT_IDS, durationMinutes: null },
       )
       || (value.weekly !== undefined && !validWeeklyPaceContainer(value.weekly))
       || !validWeeklyCalibrationInput(value.weeklyCalibrationInput)
