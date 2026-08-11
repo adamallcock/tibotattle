@@ -5,6 +5,7 @@ import {
   claimContributionDevicePairing,
   ContributionDeviceClientError,
   disconnectContributionDevice,
+  renewContributionDeviceCredential,
 } from "../src/contribution-device-client.js";
 
 const DEVICE_ID = "11111111-1111-4111-8111-111111111111";
@@ -172,5 +173,87 @@ test("device disconnect rejects a malformed or rejected revocation response", as
     }),
     (error) => error instanceof ContributionDeviceClientError
       && error.code === "contribution_device_client_response_invalid",
+  );
+});
+
+const ATTEMPT_ID = "33333333-3333-4333-8333-333333333333";
+
+test("renewal posts a device-authenticated rotation and returns the new expiry", async () => {
+  const calls = [];
+  const currentSecret = Buffer.alloc(32, 7);
+  const nextHash = "a".repeat(64);
+  const result = await renewContributionDeviceCredential({
+    origin: "https://usage.example",
+    generateRotationAttemptId: () => ATTEMPT_ID,
+    fetchImpl: async (url, options) => {
+      calls.push({ url: String(url), options });
+      return jsonResponse({
+        schemaVersion: "device-credential-renewal-v1.0",
+        deviceId: DEVICE_ID,
+        state: "active",
+        scope: "upload_registration",
+        expiresAt: "2026-09-10T00:00:00.000Z",
+        credentialGeneration: 2,
+        commit: true,
+      });
+    },
+    rotate: async ({ expectedOrigin, performRemoteRotation }) => {
+      assert.equal(expectedOrigin, "https://usage.example");
+      const remote = await performRemoteRotation({
+        origin: expectedOrigin,
+        deviceId: DEVICE_ID,
+        currentSecret,
+        nextDeviceSecretHash: nextHash,
+      });
+      assert.deepEqual(remote, {
+        committed: true,
+        expiresAt: "2026-09-10T00:00:00.000Z",
+      });
+      return {
+        status: "renewed",
+        origin: expectedOrigin,
+        deviceId: DEVICE_ID,
+        expiresAt: remote.expiresAt,
+      };
+    },
+  });
+  assert.deepEqual(result, {
+    status: "renewed",
+    origin: "https://usage.example",
+    deviceId: DEVICE_ID,
+    expiresAt: "2026-09-10T00:00:00.000Z",
+  });
+  assert.equal(calls[0].url, "https://usage.example/api/v1/device/credential/renew");
+  assert.equal(calls[0].options.method, "POST");
+  assert.equal(calls[0].options.credentials, "omit");
+  assert.equal(
+    calls[0].options.headers.Authorization,
+    `Device um_device_${DEVICE_ID}.${currentSecret.toString("base64url")}`,
+  );
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    nextDeviceSecretHash: nextHash,
+    rotationAttemptId: ATTEMPT_ID,
+  });
+});
+
+test("renewal surfaces a rejected rotation without touching the local credential", async () => {
+  await assert.rejects(
+    renewContributionDeviceCredential({
+      origin: "https://usage.example",
+      generateRotationAttemptId: () => ATTEMPT_ID,
+      fetchImpl: async () => jsonResponse(
+        { error: { code: "DEVICE_AUTH_INVALID" } },
+        401,
+      ),
+      rotate: async ({ expectedOrigin, performRemoteRotation }) =>
+        performRemoteRotation({
+          origin: expectedOrigin,
+          deviceId: DEVICE_ID,
+          currentSecret: Buffer.alloc(32, 7),
+          nextDeviceSecretHash: "a".repeat(64),
+        }),
+    }),
+    (error) => error instanceof ContributionDeviceClientError
+      && error.code === "contribution_device_client_renewal_rejected",
   );
 });

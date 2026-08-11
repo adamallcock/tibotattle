@@ -39,6 +39,7 @@ type AttemptPurpose =
   | "sign_in_start"
   | "recovery"
   | "device_disconnect"
+  | "device_credential_renew"
   | "device_sync";
 type RateLimitPurpose = AttemptPurpose
   | "public_aggregate_read"

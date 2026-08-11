@@ -19,11 +19,16 @@ export {
   createLocalContributionSyncQueueStorageContext,
 } from "./local-contribution-sync-queue-storage.js";
 export {
+  CONTRIBUTION_DEVICE_READER_CODE_IDENTIFIER,
+  CONTRIBUTION_DEVICE_READER_TEAM_IDENTIFIER,
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
   ExportIdentityKeychainError,
   KEYTAR_DARWIN_ARM64_SHA256,
   KEYTAR_SIGNING_CODE_IDENTIFIER,
   KEYTAR_SIGNING_TEAM_IDENTIFIER,
+  contributionDeviceDurableAddArguments,
+  contributionDeviceReaderRequirement,
+  contributionDeviceReaderRequirementVerificationArguments,
   createExportIdentityKeychainBackend,
   deleteExportIdentityKeychainItemByAttributes,
   exportIdentityKeychainAttributeDeleteArguments,

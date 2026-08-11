@@ -1700,10 +1700,15 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         self.onNavigation = onNavigation
         self.onLanguagePreferenceChange = onLanguagePreferenceChange
         let configuration = WKWebViewConfiguration()
-        // Nothing this surface stores survives the app. The hosted sign-in
-        // token is already memory-only by design; a non-persistent store keeps
-        // loopback cookies and local storage off disk as well.
-        configuration.websiteDataStore = .nonPersistent()
+        // Persistent by owner decision (sign-in-once durability, part 3): a
+        // still-valid 30-minute web session and an in-flight sign-in handoff
+        // now survive an app relaunch, so quitting mid-flow resumes instead of
+        // restarting from zero. The earlier non-persistent store kept loopback
+        // cookies and local storage off disk for privacy; the owner accepted
+        // that trade-off because the durable upload authority is the 30-day
+        // Keychain device credential regardless — the web session it persists
+        // is short-lived and only ever mints that credential, never uploads.
+        configuration.websiteDataStore = .default()
         // The language preference can change while this host remains alive.
         // Install the first document-start scripts now, then refresh them
         // before every later local navigation. That gives a reloaded document
@@ -4438,12 +4443,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func hideDashboardWebView() {
         // Refuse to tear the web view down while a hosted sign-in is in flight
-        // (owner-reported, 2026-08-10). stop() below wipes the live page and,
-        // with it, the pending sign-in handoff held in the non-persistent web
-        // store — discarding a sign-in the service may still be holding. The
-        // page clears this flag the moment the sign-in settles, cancels, or
-        // times out, and a fresh navigation clears it too, so this can only
-        // defer teardown for the brief window it protects.
+        // (owner-reported, 2026-08-10). stop() below wipes the live page; the
+        // web store is now persistent (sign-in-once durability, part 3), so a
+        // pending handoff and a valid session survive a relaunch, but tearing
+        // the live page down mid-flow would still discard the in-memory
+        // continuation the page is driving. The page clears this flag the
+        // moment the sign-in settles, cancels, or times out, and a fresh
+        // navigation clears it too, so this can only defer teardown for the
+        // brief window it protects.
         if dashboardWebHost?.hostedSignInInFlight == true {
             return
         }

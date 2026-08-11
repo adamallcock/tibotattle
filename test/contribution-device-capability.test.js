@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
 import {
   ContributionDeviceCapabilityError,
   createProductionContributionDeviceBackend,
@@ -19,6 +20,7 @@ import {
   migrateLegacyContributionDeviceCapability,
   readContributionDeviceCapability,
   removeContributionDeviceCapability,
+  rotateContributionDeviceCredential,
   withContributionDeviceSecret,
 } from "../src/contribution-device-capability.js";
 import { EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES } from "../src/export-identity-keychain.js";
@@ -604,4 +606,129 @@ test("production selection never falls back from the audited macOS arm64 Keychai
     architecture: "arm64",
     createBackend: () => backend,
   }), backend);
+});
+
+function rotatableBackend(initial = null) {
+  let value = initial && Buffer.from(initial);
+  const calls = [];
+  const exact = (capability) => assert.equal(capability, CAPABILITY);
+  return {
+    calls,
+    current: () => value && Buffer.from(value),
+    async read(capability) {
+      exact(capability);
+      calls.push(["read"]);
+      return value && Buffer.from(value);
+    },
+    async createIfMissing(capability, secret) {
+      exact(capability);
+      calls.push(["create"]);
+      if (value) return "existing";
+      value = Buffer.from(secret);
+      return "created";
+    },
+    async replaceExact(capability, expected, replacement) {
+      exact(capability);
+      calls.push(["replace", Buffer.from(expected), Buffer.from(replacement)]);
+      if (!value) return "missing";
+      if (!value.equals(expected)) return "conflict";
+      value = Buffer.from(replacement);
+      return "replaced";
+    },
+    async deleteExact(capability, expected) {
+      exact(capability);
+      calls.push(["delete"]);
+      if (!value) return "missing";
+      if (!value.equals(expected)) return "conflict";
+      value = null;
+      return "deleted";
+    },
+  };
+}
+
+function expectedDeviceHash(deviceId, secret) {
+  return createHash("sha256")
+    .update("app-usagemonitor/device/v1\u0000")
+    .update(deviceId)
+    .update("\u0000")
+    .update(secret)
+    .digest("hex");
+}
+
+test("rotate renews the stored secret only after the service confirms the commit", async () => {
+  await fixture(async ({ stateFile }) => {
+    const backend = rotatableBackend();
+    const oldSecret = Buffer.alloc(32, 7);
+    await ensureContributionDeviceCapability({
+      backend,
+      origin: ORIGIN,
+      stateFile,
+      generateDeviceId: () => DEVICE_ID,
+      generateSecret: () => Buffer.from(oldSecret),
+      clock: () => Date.parse("2026-08-11T00:00:00.000Z"),
+    });
+
+    const newSecret = Buffer.alloc(32, 200);
+    let observed = null;
+    const result = await rotateContributionDeviceCredential({
+      backend,
+      stateFile,
+      expectedOrigin: ORIGIN,
+      generateSecret: () => Buffer.from(newSecret),
+      performRemoteRotation: async (input) => {
+        observed = {
+          origin: input.origin,
+          deviceId: input.deviceId,
+          currentSecret: Buffer.from(input.currentSecret),
+          nextDeviceSecretHash: input.nextDeviceSecretHash,
+        };
+        return { committed: true, expiresAt: "2026-09-10T00:00:00.000Z" };
+      },
+    });
+
+    assert.equal(observed.origin, ORIGIN);
+    assert.equal(observed.deviceId, DEVICE_ID);
+    assert.deepEqual(observed.currentSecret, oldSecret,
+      "the remote rotation is authenticated with the current secret");
+    assert.equal(observed.nextDeviceSecretHash,
+      expectedDeviceHash(DEVICE_ID, newSecret));
+    assert.deepEqual(result, {
+      status: "renewed",
+      origin: ORIGIN,
+      deviceId: DEVICE_ID,
+      expiresAt: "2026-09-10T00:00:00.000Z",
+    });
+    assert.equal(Object.isFrozen(result), true);
+    assert.deepEqual(backend.current(), newSecret,
+      "the Keychain now holds the rotated secret");
+  });
+});
+
+test("rotate leaves the valid secret untouched when the service does not commit", async () => {
+  await fixture(async ({ stateFile }) => {
+    const backend = rotatableBackend();
+    const oldSecret = Buffer.alloc(32, 11);
+    await ensureContributionDeviceCapability({
+      backend,
+      origin: ORIGIN,
+      stateFile,
+      generateDeviceId: () => DEVICE_ID,
+      generateSecret: () => Buffer.from(oldSecret),
+      clock: () => Date.parse("2026-08-11T00:00:00.000Z"),
+    });
+
+    await assert.rejects(
+      rotateContributionDeviceCredential({
+        backend,
+        stateFile,
+        expectedOrigin: ORIGIN,
+        generateSecret: () => Buffer.alloc(32, 222),
+        performRemoteRotation: async () => ({ committed: false }),
+      }),
+      fixedError("operation_failed"),
+    );
+    assert.deepEqual(backend.current(), oldSecret,
+      "a non-committed rotation never replaces the local secret");
+    assert.equal(backend.calls.some(([method]) => method === "replace"), false);
+  });
 });

@@ -87,6 +87,7 @@ import {
   purgeStaleDeviceLifecycleRows,
   recordDeviceUploadReceipt,
   revokeParticipantDevice,
+  rotateDeviceCredential,
   type DeviceTransportConsentVersion,
 } from "./device-auth";
 import {
@@ -1805,6 +1806,62 @@ async function handleDeviceDisconnect(
   });
 }
 
+/**
+ * Silent auto-renewal. A valid, unexpired device bearer rotates its own secret
+ * in place: the client presents the current device credential (device auth, no
+ * browser session) plus the hash of a freshly generated replacement secret and
+ * an idempotent attempt id. The service atomically supersedes the old secret
+ * for the SAME device — never a new slot, so it stays compatible with the
+ * active-device cap and its self-heal — and returns the new expiry. This keeps
+ * the 30-day credential from ever lapsing under normal use with zero user
+ * interaction. `rotateDeviceCredential` enforces the same idle window and the
+ * hard social-recheck horizon that a sliding auth does, so renewal can extend
+ * the bearer but never past the deadline that legitimately requires a re-login.
+ */
+async function handleDeviceCredentialRenew(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  assertAdmissionBindings(env);
+  await assertAttemptAllowed(
+    env.RECOVERY_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "device_credential_renew",
+  );
+  await assertCollectionControl(
+    env.USAGE_MONITOR_DB,
+    "uploadRegistration",
+  );
+  if (request.headers.has("cookie")) throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  const body = await readBoundedJson(request);
+  if (typeof body.value !== "object"
+      || body.value === null
+      || Array.isArray(body.value)
+      || Object.keys(body.value).length !== 2
+      || typeof Reflect.get(body.value, "nextDeviceSecretHash") !== "string"
+      || typeof Reflect.get(body.value, "rotationAttemptId") !== "string") {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const rotated = await rotateDeviceCredential(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("authorization"),
+    Reflect.get(body.value, "nextDeviceSecretHash") as string,
+    Reflect.get(body.value, "rotationAttemptId") as string,
+  );
+  return jsonResponse({
+    schemaVersion: "device-credential-renewal-v1.0",
+    deviceId: rotated.deviceId,
+    state: rotated.state,
+    scope: rotated.scope,
+    expiresAt: rotated.expiresAt,
+    credentialGeneration: rotated.credentialGeneration,
+    commit: rotated.commit,
+  });
+}
+
 async function handleDevices(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
   const session = await personalSession(request, env);
@@ -3312,6 +3369,8 @@ async function routeApi(
       return handleDeviceUploadAuthorization(request, env);
     case "device_disconnect":
       return handleDeviceDisconnect(request, env);
+    case "device_credential_renew":
+      return handleDeviceCredentialRenew(request, env);
     case "device_sync_state":
       return handleDeviceSyncState(request, env);
     case "device_sync_manifest":

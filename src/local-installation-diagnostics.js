@@ -213,6 +213,10 @@ export function localCompanionStatePaths(stateRoot) {
       selected,
       "contribution-device-binding-v1.json",
     ),
+    contributionDeviceRenewalStateFile: join(
+      selected,
+      "contribution-device-renewal-v1.json",
+    ),
   });
 }
 

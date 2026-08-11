@@ -23,6 +23,22 @@ export const KEYTAR_DARWIN_ARM64_SHA256 = "855c21e1e702967230bd87f600d04c311b77f
 // build, unlike a CDHash or a byte digest of a signed binary.
 export const KEYTAR_SIGNING_TEAM_IDENTIFIER = "43RTH622SB";
 export const KEYTAR_SIGNING_CODE_IDENTIFIER = "keytar";
+
+// The reader of the contribution-device credential is the packaged Node
+// runtime — the companion process that calls keytar. A credential item minted
+// with keytar's default `SecItemAdd` access control is trusted to exactly the
+// creating code's snapshot (its partition / code-directory hash), NOT to a
+// stable designated requirement, so the next Developer ID build — a Sparkle
+// update re-signs `runtime/bin/node` — presents a different code object and the
+// default ACL denies it; a headless read then fails errSecInteractionNotAllowed
+// / errSecAuthFailed and the credential reads as unavailable. keytar exposes no
+// way to pass a `SecAccessRef` / `kSecAttrAccess` / `kSecAttrAccessGroup`, so it
+// cannot express a designated-requirement ACL. These two facts are the team and
+// the codesign-derived identifier of that reader; together they are the
+// designated requirement the durable ACL binds to — stable across every
+// same-team, same-identifier signed build.
+export const CONTRIBUTION_DEVICE_READER_TEAM_IDENTIFIER = "43RTH622SB";
+export const CONTRIBUTION_DEVICE_READER_CODE_IDENTIFIER = "node";
 const CODESIGN_PATH = "/usr/bin/codesign";
 const SECURITY_PATH = "/usr/bin/security";
 // errSecItemNotFound surfaces from the security CLI as exit status 44.
@@ -119,6 +135,96 @@ export function keytarSignedBindingVerificationArguments(bindingPath) {
 }
 
 function defaultRunVerificationCommand(command, commandArguments) {
+  const outcome = spawnSync(command, commandArguments, {
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  return { status: outcome.status };
+}
+
+/**
+ * The designated requirement the contribution-device credential's ACL binds
+ * to: Apple's generic anchor, this product's Developer ID team, and the code
+ * identifier codesign derives for the packaged Node runtime. Deliberately
+ * nothing build-specific — no version, no CDHash — so any properly signed
+ * same-team, same-identifier build (a Sparkle update) keeps read access while
+ * any other origin fails. This is the reader-side analogue of
+ * keytarSignedBindingRequirement().
+ */
+export function contributionDeviceReaderRequirement() {
+  return "anchor apple generic"
+    + ` and certificate leaf[subject.OU] = "${CONTRIBUTION_DEVICE_READER_TEAM_IDENTIFIER}"`
+    + ` and identifier "${CONTRIBUTION_DEVICE_READER_CODE_IDENTIFIER}"`;
+}
+
+/**
+ * The codesign invocation that proves a reader binary satisfies the designated
+ * requirement the durable ACL binds to. A signed update cycle is the only
+ * definitive proof that the ACL survives; this pins the exact `-R=` semantics
+ * a release check (or the owner, by hand) runs against the installed
+ * `runtime/bin/node` to confirm the next build still matches the requirement.
+ */
+export function contributionDeviceReaderRequirementVerificationArguments(readerPath) {
+  return Object.freeze([
+    "--verify",
+    "--strict",
+    `-R=${contributionDeviceReaderRequirement()}`,
+    "--",
+    readerPath,
+  ]);
+}
+
+/**
+ * The exact `security add-generic-password` invocation that mints the
+ * contribution-device credential with a designated-requirement ACL.
+ *
+ * `-T <readerPath>` records the reader's SecTrustedApplication, whose match is
+ * performed against its designated requirement (the reader's team + identifier)
+ * rather than a build-specific snapshot, so a re-signed update is still trusted
+ * without a prompt. `-U` makes the create idempotent. `-w <secret>` supplies
+ * the base64url secret exactly as keytar would store it, so a later keytar
+ * getPassword reads the identical stored string back.
+ *
+ * TRADE-OFF (documented, owner-directed): the secret is passed as a process
+ * argument, briefly visible to same-user/root process inspection. The
+ * 2026-07-24 Keychain decision record rejects the `security` write path for the
+ * *installation identity* for exactly this reason. This credential is a
+ * different, lower-value bearer — a revocable, rate-limited, auto-renewing
+ * device-upload token — and the sign-in-once design doc
+ * (docs/design/2026-08-11-sign-in-once-durability.md) explicitly re-weighs the
+ * trade-off for it, sanctioning "the `security`-CLI equivalent the codebase can
+ * invoke" so a signed update never invalidates read access. The mint falls back
+ * to keytar's default ACL if this invocation fails, so availability never
+ * regresses below today's behaviour.
+ */
+export function contributionDeviceDurableAddArguments({
+  service,
+  account,
+  secret,
+  readerPath,
+} = {}) {
+  if (typeof service !== "string" || service.length < 1
+      || typeof account !== "string" || account.length < 1
+      || typeof secret !== "string" || !STORED_SECRET_PATTERN.test(secret)
+      || typeof readerPath !== "string" || !isAbsolute(readerPath)) {
+    fail("invalid_configuration");
+  }
+  return Object.freeze([
+    "add-generic-password",
+    "-U",
+    "-s",
+    service,
+    "-a",
+    account,
+    "-T",
+    readerPath,
+    "-w",
+    secret,
+  ]);
+}
+
+function defaultRunDurableAddCommand(command, commandArguments) {
+  // The secret is on the argv; keep every stdio stream discarded so it can
+  // never enter a log, an error, or a caller.
   const outcome = spawnSync(command, commandArguments, {
     stdio: ["ignore", "ignore", "ignore"],
   });
@@ -273,6 +379,28 @@ function nativeFailureCode(error) {
   return "operation_failed";
 }
 
+function normalizeDurableAccess(durableAccess) {
+  if (durableAccess === null || durableAccess === undefined) return null;
+  if (typeof durableAccess !== "object" || Array.isArray(durableAccess)) {
+    fail("invalid_configuration");
+  }
+  const {
+    platform = process.platform,
+    readerPath,
+    runCommand = defaultRunDurableAddCommand,
+  } = durableAccess;
+  // A designated-requirement ACL is a macOS-only construct; on any other
+  // platform durable access is silently inert and keytar's default path is
+  // used, exactly as before.
+  if (platform !== "darwin") return null;
+  if (typeof readerPath !== "string" || readerPath.length < 1
+      || !isAbsolute(readerPath)
+      || typeof runCommand !== "function") {
+    fail("invalid_configuration");
+  }
+  return Object.freeze({ readerPath, runCommand });
+}
+
 /**
  * This adapter intentionally does not claim compare-and-swap semantics.
  * Callers must hold the app's installation/export-identity lease around every
@@ -283,8 +411,15 @@ export function createExportIdentityKeychainBackend(options = {}) {
   const {
     binding = undefined,
     loadBinding = loadExportIdentityKeychainBinding,
+    // Optional durable-ACL mint for the contribution-device credential only.
+    // When present, a fresh mint of that one capability is written through the
+    // `security` CLI with a designated-requirement ACL so a signed update keeps
+    // read access; every other capability, and the readback of this one, still
+    // go through keytar unchanged.
+    durableAccess = null,
   } = options;
   if (typeof loadBinding !== "function") fail("invalid_configuration");
+  const durableMint = normalizeDurableAccess(durableAccess);
   let selectedBinding = binding;
   if (selectedBinding === undefined) {
     try {
@@ -302,6 +437,39 @@ export function createExportIdentityKeychainBackend(options = {}) {
     } catch (error) {
       fail(nativeFailureCode(error));
     }
+  }
+
+  // Write a fresh secret for a capability. The contribution-device credential
+  // is minted with a designated-requirement ACL through the `security` CLI when
+  // durable access is configured; if that invocation is unavailable or fails,
+  // it falls back to keytar's default ACL so availability never regresses below
+  // today's behaviour. Every other capability always uses keytar.
+  async function writeSecret(pair, secretString) {
+    if (durableMint !== null
+        && pair === EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice) {
+      let status;
+      try {
+        const outcome = durableMint.runCommand(
+          SECURITY_PATH,
+          contributionDeviceDurableAddArguments({
+            service: pair.service,
+            account: pair.account,
+            secret: secretString,
+            readerPath: durableMint.readerPath,
+          }),
+        );
+        status = outcome !== null && typeof outcome === "object"
+          ? outcome.status
+          : undefined;
+      } catch {
+        status = undefined;
+      }
+      if (status === 0) return;
+      // The durable mint did not take. Fall through to keytar so the credential
+      // is still created (with the update-fragile default ACL that Part 2's
+      // renewal and the attribute-reset repair path both already handle).
+    }
+    await invoke("setPassword", pair.service, pair.account, secretString);
   }
 
   async function describe(capability) {
@@ -335,7 +503,7 @@ export function createExportIdentityKeychainBackend(options = {}) {
       generated = copySecret(generatedSecret);
       existing = await readInternal(capability);
       if (existing !== null) return "existing";
-      await invoke("setPassword", pair.service, pair.account, generated.toString("base64url"));
+      await writeSecret(pair, generated.toString("base64url"));
       readback = await readInternal(capability, "readback_mismatch");
       if (readback === null || !sameSecret(readback, generated)) fail("readback_mismatch");
       return "created";
