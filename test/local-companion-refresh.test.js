@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import {
   createLocalCollectorRefreshRunner,
+  createTerminalRefreshFailureRecorder,
   LocalCompanionRefreshController,
 } from "../src/local-companion-refresh.js";
 import {
@@ -1800,4 +1801,226 @@ test("a timed-out refresh cannot be reclassified as user-cancelled while settlin
   }
   assert.equal(controller.getStatus().status, "failed");
   assert.equal(controller.getStatus().errorCode, "refresh_timed_out");
+});
+
+test("terminal refresh failures invoke the failure observer with bounded identity only", async () => {
+  const observed = [];
+  const failing = new LocalCompanionRefreshController({
+    runner: async () => {
+      const error = new Error("private failure detail /Users/private");
+      error.code = "accounting_transition_rss_limit_exceeded";
+      error.refreshStep = "accounting";
+      throw error;
+    },
+    dataStore: {
+      async reload() {},
+    },
+    clock: () => Date.parse("2026-07-23T12:00:00.000Z"),
+    onTerminalFailure: (failure) => {
+      observed.push(failure);
+    },
+  });
+
+  assert.equal(failing.start(), true);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (failing.getStatus().status === "failed") break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(observed, [{
+    errorCode: "refresh_resource_limited",
+    failedStep: "accounting",
+    failureCode: "accounting_transition_rss_limit_exceeded",
+  }]);
+  assert.equal(
+    JSON.stringify(observed).includes("private failure detail"),
+    false,
+  );
+
+  // Success never reaches the observer.
+  const succeeded = [];
+  const succeeding = new LocalCompanionRefreshController({
+    runner: async () => ({}),
+    dataStore: {
+      async reload() {},
+    },
+    onTerminalFailure: (failure) => {
+      succeeded.push(failure);
+    },
+  });
+  assert.equal(succeeding.start(), true);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (!succeeding.isRunning()) break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(succeeding.getStatus().status, "succeeded");
+  assert.deepEqual(succeeded, []);
+
+  // Cancellation is a user action, not a failure: no entry.
+  const cancelled = [];
+  const cancelling = new LocalCompanionRefreshController({
+    runner: ({ signal }) => new Promise((resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        const error = new Error("aborted");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+    }),
+    dataStore: {
+      async reload() {},
+    },
+    onTerminalFailure: (failure) => {
+      cancelled.push(failure);
+    },
+  });
+  assert.equal(cancelling.start(), true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(cancelling.cancel(), true);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (!cancelling.isRunning()) break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(cancelling.getStatus().status, "cancelled");
+  assert.deepEqual(cancelled, []);
+});
+
+test("a timed-out refresh files exactly one terminal failure entry, even after settling", async () => {
+  const observed = [];
+  const controller = new LocalCompanionRefreshController({
+    runner: ({ signal }) => new Promise((resolve) => {
+      signal.addEventListener("abort", () => {
+        resolve({ indexing: PAUSED_INDEX });
+      }, { once: true });
+    }),
+    dataStore: {
+      async reload() {},
+    },
+    timeoutMs: 1_000,
+    onTerminalFailure: (failure) => {
+      observed.push(failure);
+    },
+  });
+
+  assert.equal(controller.start(), true);
+  await new Promise((resolve) => setTimeout(resolve, 1_050));
+  assert.equal(controller.getStatus().status, "failed");
+  assert.equal(controller.getStatus().errorCode, "refresh_timed_out");
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (!controller.isRunning()) break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  // The timer filed the entry the moment the failure became terminal; the
+  // later settlement of the same run must not file a second one.
+  assert.deepEqual(observed, [{ errorCode: "refresh_timed_out" }]);
+});
+
+test("terminal refresh failure notes are bounded, step-stamped, and rate-limited per signature", async () => {
+  const notes = [];
+  let nowMs = Date.parse("2026-08-11T09:00:00.000Z");
+  let nextSymbol = 0;
+  const record = createTerminalRefreshFailureRecorder({
+    recordNote: (note) => {
+      notes.push(note);
+    },
+    clock: () => nowMs,
+    randomIndex: (bound) => {
+      nextSymbol = (nextSymbol + 7) % bound;
+      return nextSymbol;
+    },
+  });
+
+  const resourceLimited = {
+    errorCode: "refresh_resource_limited",
+    failedStep: "accounting",
+    failureCode: "accounting_transition_rss_limit_exceeded",
+  };
+  assert.equal(await record(resourceLimited), true);
+  assert.equal(notes.length, 1);
+  assert.match(notes[0].reference, /^TT-[0-9A-HJKMNP-TV-Z]{6}$/u);
+  assert.deepEqual({ ...notes[0], reference: null }, {
+    reference: null,
+    surface: "local_refresh",
+    code: "refresh_resource_limited",
+    requestId: "",
+    step: "accounting",
+    detail: "accounting_transition_rss_limit_exceeded",
+  });
+
+  // The incident cadence: the identical signature every five minutes must
+  // collapse to the one existing line for a full hour.
+  for (let minutes = 5; minutes < 60; minutes += 5) {
+    nowMs += 5 * 60_000;
+    assert.equal(await record(resourceLimited), false);
+  }
+  assert.equal(notes.length, 1);
+
+  // A genuinely different signature is never suppressed.
+  nowMs += 60_000;
+  assert.equal(await record({
+    errorCode: "refresh_failed",
+    failedStep: "unified_index",
+    failureCode: "local_unified_index_refresh_failed",
+  }), true);
+  assert.equal(notes.length, 2);
+  assert.deepEqual({ ...notes[1], reference: null }, {
+    reference: null,
+    surface: "local_refresh",
+    code: "refresh_failed",
+    requestId: "",
+    step: "unified_index",
+    detail: "local_unified_index_refresh_failed",
+  });
+
+  // After the hour the original signature files again.
+  nowMs += 60 * 60_000;
+  assert.equal(await record(resourceLimited), true);
+  assert.equal(notes.length, 3);
+
+  // A timeout carries no step or underlying code: nothing invented.
+  assert.equal(await record({ errorCode: "refresh_timed_out" }), true);
+  assert.deepEqual({ ...notes[3], reference: null }, {
+    reference: null,
+    surface: "local_refresh",
+    code: "refresh_timed_out",
+    requestId: "",
+  });
+
+  // Malformed identity collapses to bounded fixed codes, never free text.
+  assert.equal(await record({
+    errorCode: "Failed reading /Users/private/state.json",
+    failedStep: "not_a_step",
+    failureCode: "free text with spaces",
+  }), true);
+  assert.deepEqual({ ...notes[4], reference: null }, {
+    reference: null,
+    surface: "local_refresh",
+    code: "refresh_failed",
+    requestId: "",
+  });
+  assert.equal(JSON.stringify(notes).includes("/Users/private"), false);
+});
+
+test("a failing diagnostics writer is contained and cannot become a write storm", async () => {
+  let attempts = 0;
+  let nowMs = Date.parse("2026-08-11T09:00:00.000Z");
+  const record = createTerminalRefreshFailureRecorder({
+    recordNote: () => {
+      attempts += 1;
+      throw new Error("disk full");
+    },
+    clock: () => nowMs,
+  });
+
+  const failure = {
+    errorCode: "refresh_resource_limited",
+    failedStep: "accounting",
+    failureCode: "accounting_transition_rss_limit_exceeded",
+  };
+  assert.equal(await record(failure), false);
+  assert.equal(attempts, 1);
+  // The rate-limit stamp survives the failed write: a broken log costs this
+  // hour's line rather than one write attempt per failure-loop tick.
+  nowMs += 5 * 60_000;
+  assert.equal(await record(failure), false);
+  assert.equal(attempts, 1);
 });

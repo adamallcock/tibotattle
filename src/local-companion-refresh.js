@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -83,6 +83,98 @@ const QUOTA_NOTIFICATION_EVIDENCE_SCHEMA =
 const QUOTA_NOTIFICATION_LANES = new Set(["primary", "secondary"]);
 const QUOTA_NOTIFICATION_CONTINUITY_KEY = /^[A-Za-z0-9_-]{43}$/u;
 const MAX_NOTIFICATION_EVIDENCE_AGE_MS = 5 * 60 * 1_000;
+
+// A five-hour refresh_resource_limited loop once wrote NOTHING to
+// diagnostics-v0.1.log: the terminal classification lived only in the
+// in-memory refresh state, so once the dashboard moved on there was zero
+// local trail. Every terminal refresh failure now files one bounded note —
+// codes and a step name only, matching the log's privacy posture.
+//
+// Rate limit: a scheduler retry loop repeats an identical failure signature
+// every few minutes (the incident looped for five hours), so one note per
+// distinct (code, step, detail) signature per hour bounds that loop to 24
+// lines/day (~4 KB against the log's 256 KiB cap) while a genuinely NEW
+// signature — a different terminal code, failing step, or underlying typed
+// error — is never suppressed and lands immediately.
+const REFRESH_FAILURE_NOTE_INTERVAL_MS = 60 * 60 * 1_000;
+// The signature map cannot grow with a pathological churn of codes: bounded
+// vocabulary in practice, hard-capped here regardless.
+const REFRESH_FAILURE_NOTE_SIGNATURE_LIMIT = 64;
+const REFRESH_FAILURE_NOTE_SURFACE = "local_refresh";
+// Same alphabet the dashboard mints references from (Crockford-style base32,
+// no I/L/O/U), so a server-minted note is quotable to support exactly like a
+// dashboard-minted one.
+const DIAGNOSTIC_REFERENCE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/**
+ * The onTerminalFailure sink for LocalCompanionRefreshController: shapes a
+ * terminal refresh failure into one bounded diagnostics note and rate-limits
+ * it. Everything written is either chosen from a fixed set (surface, step),
+ * identifier-shaped and pattern-checked (codes), or minted here (the
+ * reference). No message text, path, or payload can pass through.
+ */
+export function createTerminalRefreshFailureRecorder({
+  recordNote,
+  clock = () => Date.now(),
+  randomIndex = (bound) => randomInt(bound),
+} = {}) {
+  if (typeof recordNote !== "function") {
+    throw new TypeError("recordNote must be a function");
+  }
+  if (typeof clock !== "function" || typeof randomIndex !== "function") {
+    throw new TypeError("terminal refresh failure recorder controls are invalid");
+  }
+  const lastNoteAtBySignature = new Map();
+  return async function recordTerminalRefreshFailure(failure) {
+    const code = typeof failure?.errorCode === "string"
+        && REFRESH_FAILURE_CODE_PATTERN.test(failure.errorCode)
+      ? failure.errorCode
+      : "refresh_failed";
+    const step = REFRESH_FAILURE_STEPS.has(failure?.failedStep)
+      ? failure.failedStep
+      : null;
+    const detail = typeof failure?.failureCode === "string"
+        && REFRESH_FAILURE_CODE_PATTERN.test(failure.failureCode)
+        && failure.failureCode !== code
+      ? failure.failureCode
+      : null;
+    const signature = `${code}\0${step ?? ""}\0${detail ?? ""}`;
+    const now = clock();
+    const lastAt = lastNoteAtBySignature.get(signature);
+    if (Number.isFinite(lastAt)
+        && now - lastAt < REFRESH_FAILURE_NOTE_INTERVAL_MS) {
+      return false;
+    }
+    // Re-inserting keeps the map in recency order, so the hard cap evicts the
+    // stalest signature. The stamp lands BEFORE the write: a broken log can
+    // cost this hour's line, never turn the failure loop into a write storm.
+    lastNoteAtBySignature.delete(signature);
+    lastNoteAtBySignature.set(signature, now);
+    if (lastNoteAtBySignature.size > REFRESH_FAILURE_NOTE_SIGNATURE_LIMIT) {
+      lastNoteAtBySignature.delete(
+        lastNoteAtBySignature.keys().next().value,
+      );
+    }
+    let reference = "TT-";
+    for (let symbol = 0; symbol < 6; symbol += 1) {
+      reference += DIAGNOSTIC_REFERENCE_ALPHABET[randomIndex(32)];
+    }
+    try {
+      await recordNote({
+        reference,
+        surface: REFRESH_FAILURE_NOTE_SURFACE,
+        code,
+        requestId: "",
+        ...(step === null ? {} : { step }),
+        ...(detail === null ? {} : { detail }),
+      });
+    } catch {
+      // The diagnostics trail must never affect the refresh outcome.
+      return false;
+    }
+    return true;
+  };
+}
 
 function isResourceLimitedRefreshError(error) {
   const code = error?.code;
@@ -750,7 +842,9 @@ export class LocalCompanionRefreshController {
   #clock;
   #createRefreshId;
   #dataStore;
+  #failureNotified = false;
   #inFlight = null;
+  #onTerminalFailure;
   #runner;
   #state;
   #timeoutMs;
@@ -761,6 +855,12 @@ export class LocalCompanionRefreshController {
     timeoutMs = 5 * 60_000,
     clock = () => Date.now(),
     createRefreshId = randomUUID,
+    // Observer for terminal refresh failures. Receives only the bounded
+    // identity the failed state itself carries — errorCode, and failedStep /
+    // failureCode when known — so a sink can file a content-free diagnostics
+    // note. Never invoked for success, cancellation, or non-terminal states,
+    // and at most once per run; its own failures are swallowed.
+    onTerminalFailure = null,
   }) {
     if (typeof runner !== "function") throw new TypeError("runner must be a function");
     if (!dataStore || typeof dataStore.reload !== "function") {
@@ -772,11 +872,15 @@ export class LocalCompanionRefreshController {
     if (typeof createRefreshId !== "function") {
       throw new TypeError("createRefreshId must be a function");
     }
+    if (onTerminalFailure !== null && typeof onTerminalFailure !== "function") {
+      throw new TypeError("onTerminalFailure must be a function or null");
+    }
     this.#runner = runner;
     this.#dataStore = dataStore;
     this.#timeoutMs = timeoutMs;
     this.#clock = clock;
     this.#createRefreshId = createRefreshId;
+    this.#onTerminalFailure = onTerminalFailure;
     this.#state = {
       status: "idle",
       refreshId: null,
@@ -811,6 +915,26 @@ export class LocalCompanionRefreshController {
     return true;
   }
 
+  // Fire-and-forget: the diagnostics trail must never affect refresh state
+  // handling, and a run that fails twice over (the timeout marks it failed,
+  // then the settling promise rejects) still files exactly one entry.
+  #notifyTerminalFailure() {
+    if (this.#onTerminalFailure === null
+        || this.#failureNotified
+        || this.#state.status !== "failed") return;
+    this.#failureNotified = true;
+    const { errorCode, failedStep, failureCode } = this.#state;
+    try {
+      Promise.resolve(this.#onTerminalFailure({
+        errorCode,
+        ...(failedStep === undefined ? {} : { failedStep }),
+        ...(failureCode === undefined ? {} : { failureCode }),
+      })).catch(() => {});
+    } catch {
+      // A throwing sink is treated exactly like a rejecting one.
+    }
+  }
+
   start() {
     if (this.#inFlight !== null) return false;
     const startedAt = this.#clock();
@@ -820,6 +944,7 @@ export class LocalCompanionRefreshController {
       throw new TypeError("createRefreshId must return a UUID");
     }
     this.#cancelRequested = false;
+    this.#failureNotified = false;
     this.#state = {
       status: "running",
       refreshId,
@@ -905,6 +1030,7 @@ export class LocalCompanionRefreshController {
             quickResultAt: this.#state.quickResultAt,
             errorCode: "refresh_timed_out",
           };
+          this.#notifyTerminalFailure();
           return;
         }
         await this.#dataStore.reload();
@@ -971,6 +1097,7 @@ export class LocalCompanionRefreshController {
             ? { failureCode: error.code }
             : {}),
         };
+        this.#notifyTerminalFailure();
       })
       .finally(() => {
         clearTimeout(timeout);
@@ -991,6 +1118,9 @@ export class LocalCompanionRefreshController {
         quickResultAt: this.#state.quickResultAt,
         errorCode: "refresh_timed_out",
       };
+      // The timeout IS the terminal failure the user sees, and a hung runner
+      // may never settle — file the trail entry now, not at settlement.
+      this.#notifyTerminalFailure();
     }, this.#timeoutMs);
     timeout.unref?.();
     this.#inFlight = work;

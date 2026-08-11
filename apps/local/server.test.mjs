@@ -3468,6 +3468,96 @@ test("diagnostic notes are bounded, fixed-vocabulary, and land in a local log", 
   }
 });
 
+test("a terminal refresh failure files one bounded, rate-limited diagnostics note", async () => {
+  const files = await fixture();
+  const diagnosticsLogFile = join(files.stateRoot, "diagnostics-v0.1.log");
+  const now = Date.parse("2026-08-11T09:00:00.000Z");
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => {
+      // The incident shape: a typed accounting resource stop escaping the
+      // accounting step with content in its message that must never land in
+      // the log.
+      const error = new Error("private failure detail /Users/private");
+      error.code = "accounting_transition_rss_limit_exceeded";
+      error.refreshStep = "accounting";
+      throw error;
+    },
+    diagnosticsLogFile,
+    clock: () => now,
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const runOnce = async () => {
+      const started = await fetch(`${base}/api/local/refresh`, {
+        method: "POST",
+        headers,
+        body: "{}",
+      });
+      assert.equal(started.status, 202);
+      const { refresh } = await started.json();
+      await waitFor(async () => {
+        const status = await fetch(`${base}/api/local/refresh`)
+          .then((response) => response.json());
+        return status.refresh.refreshId === refresh.refreshId
+          && status.refresh.status === "failed";
+      });
+    };
+
+    await runOnce();
+    await waitFor(async () => {
+      try {
+        return (await readFile(diagnosticsLogFile, "utf8")).includes("\n");
+      } catch {
+        return false;
+      }
+    });
+    const status = await fetch(`${base}/api/local/refresh`)
+      .then((response) => response.json());
+    assert.equal(status.refresh.errorCode, "refresh_resource_limited");
+
+    const lines = (await readFile(diagnosticsLogFile, "utf8"))
+      .trimEnd()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(lines.length, 1);
+    assert.match(lines[0].reference, /^TT-[0-9A-HJKMNP-TV-Z]{6}$/u);
+    assert.deepEqual({ ...lines[0], reference: null }, {
+      schemaVersion: "local-diagnostic-note-v0.1",
+      recordedAt: "2026-08-11T09:00:00.000Z",
+      reference: null,
+      surface: "local_refresh",
+      code: "refresh_resource_limited",
+      requestId: "",
+      step: "accounting",
+      detail: "accounting_transition_rss_limit_exceeded",
+    });
+
+    // The identical failure again inside the hour: the terminal state is
+    // fully reported, but the log gains no second line — a failure loop can
+    // never grow it unboundedly.
+    await runOnce();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const repeated = await readFile(diagnosticsLogFile, "utf8");
+    assert.equal(repeated.trimEnd().split("\n").length, 1);
+    assert.equal(repeated.includes("private failure detail"), false);
+    assert.equal(repeated.includes("/Users/private"), false);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
 test("the dashboard's own sign-in failure note lands in the diagnostics log", async () => {
   const files = await fixture();
   const diagnosticsLogFile = join(files.stateRoot, "diagnostics-v0.1.log");

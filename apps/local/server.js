@@ -49,6 +49,7 @@ import { createLocalCentralProxy } from "../../src/local-companion-central-proxy
 import {
   LocalCompanionRefreshController,
   createLocalCollectorRefreshRunner,
+  createTerminalRefreshFailureRecorder,
 } from "../../src/local-companion-refresh.js";
 import {
   inspectExactNextContributionSyncUpload,
@@ -354,11 +355,15 @@ function contributionDeviceRecoveryRequired(error) {
  * Append one bounded diagnostics line the user can quote to support.
  *
  * Every field was validated before this point and is either minted by the
- * dashboard (the reference), chosen from a fixed set (the surface), fixed and
- * identifier-shaped (the code), or the service's own request id. No message,
- * payload, path, or participant value is written. The file is capped: once it
- * would exceed the bound, the current file becomes the single previous
- * generation and a fresh one starts, so the log can never grow without limit.
+ * dashboard or this companion (the reference), chosen from a fixed set (the
+ * surface, and for server-minted refresh-failure notes the step), fixed and
+ * identifier-shaped (the code and the optional detail code), or the service's
+ * own request id. No message, payload, path, or participant value is written.
+ * The optional step/detail members exist only on server-minted terminal
+ * refresh-failure notes; the POST route's exact-key validation keeps them
+ * unreachable to callers. The file is capped: once it would exceed the bound,
+ * the current file becomes the single previous generation and a fresh one
+ * starts, so the log can never grow without limit.
  */
 async function appendDiagnosticNote({
   file,
@@ -372,6 +377,8 @@ async function appendDiagnosticNote({
     surface: note.surface,
     code: note.code,
     requestId: note.requestId,
+    ...(note.step === undefined ? {} : { step: note.step }),
+    ...(note.detail === undefined ? {} : { detail: note.detail }),
   })}\n`;
   const bytes = Buffer.byteLength(line, "utf8");
   let current = null;
@@ -2701,6 +2708,14 @@ function createPreparedLocalCompanionServer({
     runner: refreshRunner,
     dataStore,
     timeoutMs: refreshTimeoutMs,
+    // Five hours of refresh_resource_limited loops once left zero local
+    // trail: the terminal classification lived only in this controller's
+    // in-memory state. Every terminal refresh failure now files one bounded,
+    // rate-limited diagnostics note — codes, step, and timestamp only.
+    onTerminalFailure: createTerminalRefreshFailureRecorder({
+      recordNote: recordDiagnosticNote,
+      clock,
+    }),
   });
   const centralProxy = createLocalCentralProxy({
     centralOrigin,
