@@ -246,6 +246,7 @@
       "stableAliasReason": null,
       "additionalAliases": [],
       "callers": [
+        "test/generate-sparkle-appcast-stable-feed.test.js",
         "test/publish-sparkle-update.test.js"
       ],
       "decision": "retain_as_internal_release_support",
@@ -552,9 +553,11 @@
         "docs/runbooks/2026-08-02-r2-sparkle-update-publisher.md",
         "package.json#scripts.product:macos:publish-update",
         "scripts/generate-sparkle-appcast.js",
+        "test/generate-sparkle-appcast-stable-feed.test.js",
         "test/macos-updater.test.js",
         "test/publish-sparkle-update.test.js",
-        "test/release-channel-policy.test.js"
+        "test/release-channel-policy.test.js",
+        "test/sparkle-signed-feed-validation.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": "docs/runbooks/2026-08-02-r2-sparkle-update-publisher.md",
@@ -674,6 +677,24 @@
       "decision": "retain_and_relocate_after_inventory",
       "provenance": "docs/governance/2026-07-25-g0-control-traceability-matrix.md",
       "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "repository_architecture",
+      "canonicalPath": "scripts/sparkle-signed-feed-validation.js",
+      "stableAlias": null,
+      "stableAliasReason": "Library module consumed by the generator and publisher, not invoked directly.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/generate-sparkle-appcast.js",
+        "scripts/publish-sparkle-update.js",
+        "test/generate-sparkle-appcast-stable-feed.test.js",
+        "test/sparkle-signed-feed-validation.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": null,
+      "provenanceReason": "Guard-identical local validation of signed Sparkle feeds (SURequireSignedFeed); mirrors the Worker appcast guard so candidates fail fast before any upload.",
       "legacyPaths": []
     },
     {
