@@ -13,7 +13,7 @@
     "transportReady": false
   },
   "fieldContract": {
-    "sha256": "57a41e0c9bdab41a64e2a30d238898341b3d6e54a9d19b4a2ff2c19bf0366a7d",
+    "sha256": "5d3159cd186a362c6e81f88c45bdaf6c66213b063b13b7864b5753900286a3e1",
     "version": "telemetry-field-dictionary-v0.1"
   },
   "implementation": {
@@ -21,7 +21,7 @@
     "checkpointScanVersion": "codex-export-checkpoint-scan-v0.2",
     "exporterVersion": "0.3.0-draft.3",
     "packageName": "app-usagemonitor",
-    "packageVersion": "0.1.3",
+    "packageVersion": "0.1.4",
     "resourcePolicyVersion": "g1-r3-candidate-0.5"
   },
   "providerAdapters": {
@@ -90,7 +90,7 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
         "name": "compatibility.schema.json",
-        "sha256": "8f8613654268de6e2ce20b006579e01dc7543884e8148f8b41319747d9f8e30c"
+        "sha256": "f764fe6cc57ea3f639245f9cf57bf45a735e60a1d665504339d82fb89abff15a"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/privacy-receipt.schema.json",
@@ -108,7 +108,7 @@
         "sha256": "0f3203f4949104f7bca19ef2aa926560390965a3dfe564544192641d5ef48fb2"
       }
     ],
-    "setSha256": "4b55a72c7bc2c5912add675015739db4db7ecd870cef834db4e49a5d0f72a7da"
+    "setSha256": "cf5c9910391f3f414d428782a0d43becc7e33a8efeb9ad4942880cd849bee5bb"
   },
   "tupleVersion": "usage-export-compatibility-v0.1"
 }
