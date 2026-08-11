@@ -9,6 +9,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import {
+  createDeferredAccountingRebuildRecorder,
   createLocalCollectorRefreshRunner,
   createTerminalRefreshFailureRecorder,
   LocalCompanionRefreshController,
@@ -687,6 +688,211 @@ test("a quota-only refresh reuses current accounting while retaining fresh quota
     attempted: true,
     recordWritten: true,
     errorCode: null,
+  });
+});
+
+test("a memory-budget rebuild miss serves the retained cache, reports deferred, and backs off", async () => {
+  let nowMs = Date.parse("2026-07-23T12:00:00.000Z");
+  const clock = () => nowMs;
+  let rebuildAttempts = 0;
+  let deferForNextRebuild = true;
+  const runner = createLocalCollectorRefreshRunner({
+    stateFile: "/private/state.sqlite",
+    clock,
+    selectAccountObservationSecret: () => ({ loadAccountObservationSecret: null }),
+    runCollector: async () => ({
+      // New rollout usage: token accounting genuinely warrants a rebuild.
+      rolloutRecordsWritten: 5,
+      filesDiscovered: 3,
+      refresh: { attempted: true, recordWritten: false, errorCode: null },
+    }),
+    readAccountingCache: async () => ({
+      status: "available",
+      errorCode: null,
+      cache: REUSABLE_ACCOUNTING_CACHE,
+    }),
+    refreshAccounting: async () => {
+      rebuildAttempts += 1;
+      if (deferForNextRebuild) {
+        return {
+          status: "accounting_rebuild_deferred",
+          reason: "accounting_transition_rss_limit_exceeded",
+          retained: true,
+          generatedAt: REUSABLE_ACCOUNTING_CACHE.generatedAt,
+          coveredAt: REUSABLE_ACCOUNTING_CACHE.coveredAt,
+        };
+      }
+      return {
+        generatedAt: "2026-07-23T12:00:00.000Z",
+        periods: [{ id: "7d", events: 41 }],
+        diagnostics: { forkReplayEventsExcluded: 3 },
+      };
+    },
+  });
+
+  // First pass: the rebuild is attempted, misses budget, and the retained
+  // cache is served as a labelled "deferred" estimate — the refresh does NOT
+  // fail.
+  const first = await runner();
+  assert.equal(rebuildAttempts, 1);
+  assert.deepEqual(first.accounting, {
+    status: "replay_safe",
+    refreshStatus: "deferred",
+    generatedAt: "2026-07-23T10:00:00.000Z",
+    events: 17,
+    forkReplayEventsExcluded: 29,
+  });
+  assert.deepEqual(first.accountingRebuildDeferred, {
+    reason: "accounting_transition_rss_limit_exceeded",
+    retained: true,
+  });
+
+  // Second pass a minute later, still within the backoff window: the doomed
+  // full rebuild is skipped entirely and the retained cache is served again.
+  nowMs += 60_000;
+  const second = await runner();
+  assert.equal(rebuildAttempts, 1);
+  assert.equal(second.accounting.refreshStatus, "deferred");
+
+  // Once the backoff elapses the full rebuild is re-attempted; now it fits and
+  // succeeds, and the backoff is cleared so later passes rebuild immediately.
+  nowMs += 31 * 60_000;
+  deferForNextRebuild = false;
+  const third = await runner();
+  assert.equal(rebuildAttempts, 2);
+  assert.equal(third.accounting.refreshStatus, "rebuilt");
+  assert.equal(third.accounting.events, 41);
+  assert.equal(third.accountingRebuildDeferred, undefined);
+
+  const fourth = await runner();
+  assert.equal(rebuildAttempts, 3);
+  assert.equal(fourth.accounting.refreshStatus, "rebuilt");
+});
+
+test("a budget miss with no retained cache defers without fabricating an accounting block", async () => {
+  const runner = createLocalCollectorRefreshRunner({
+    stateFile: "/private/state.sqlite",
+    selectAccountObservationSecret: () => ({ loadAccountObservationSecret: null }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 5,
+      filesDiscovered: 3,
+      refresh: { attempted: true, recordWritten: false, errorCode: null },
+    }),
+    readAccountingCache: async () => ({
+      status: "unavailable",
+      errorCode: "cache_missing",
+      cache: null,
+    }),
+    refreshAccounting: async () => ({
+      status: "accounting_rebuild_deferred",
+      reason: "accounting_transition_rss_limit_exceeded",
+      retained: false,
+      generatedAt: null,
+      coveredAt: null,
+    }),
+  });
+
+  const result = await runner();
+  // No cache to serve -> no accounting block is invented, but the run still
+  // succeeds and reports the deferred outcome honestly.
+  assert.equal(result.accounting, undefined);
+  assert.deepEqual(result.accountingRebuildDeferred, {
+    reason: "accounting_transition_rss_limit_exceeded",
+    retained: false,
+  });
+});
+
+test("the deferred accounting rebuild recorder files one bounded, rate-limited note", async () => {
+  const notes = [];
+  let nowMs = 1_000;
+  const record = createDeferredAccountingRebuildRecorder({
+    recordNote: async (note) => { notes.push(note); },
+    clock: () => nowMs,
+    randomIndex: () => 0,
+  });
+
+  assert.equal(
+    await record({
+      reason: "accounting_transition_rss_limit_exceeded",
+      retained: true,
+    }),
+    true,
+  );
+  assert.deepEqual(notes, [{
+    reference: "TT-000000",
+    surface: "local_refresh",
+    code: "accounting_rebuild_deferred",
+    requestId: "",
+    step: "accounting",
+    detail: "accounting_transition_rss_limit_exceeded",
+  }]);
+
+  // The same signature within the hour is suppressed so a backed-off scheduler
+  // loop cannot become a write storm.
+  assert.equal(
+    await record({
+      reason: "accounting_transition_rss_limit_exceeded",
+      retained: true,
+    }),
+    false,
+  );
+  assert.equal(notes.length, 1);
+
+  // An hour later the same signature lands again.
+  nowMs += 60 * 60 * 1_000;
+  assert.equal(
+    await record({
+      reason: "accounting_transition_rss_limit_exceeded",
+      retained: true,
+    }),
+    true,
+  );
+  assert.equal(notes.length, 2);
+
+  // A free-text reason is dropped rather than written; the note stays bounded.
+  nowMs += 60 * 60 * 1_000;
+  await record({ reason: "free text / with spaces", retained: true });
+  assert.equal(notes.at(-1).detail, undefined);
+});
+
+test("the controller files a degraded note, not a terminal one, for a soft budget miss", async () => {
+  let reloads = 0;
+  let terminalCalls = 0;
+  const degraded = [];
+  const controller = new LocalCompanionRefreshController({
+    runner: async () => ({
+      rolloutRecordsWritten: 0,
+      accountingRebuildDeferred: {
+        reason: "accounting_transition_rss_limit_exceeded",
+        retained: true,
+      },
+    }),
+    dataStore: { async reload() { reloads += 1; } },
+    onTerminalFailure: () => { terminalCalls += 1; },
+    onDegradedOutcome: (outcome) => { degraded.push(outcome); },
+  });
+
+  assert.equal(controller.start(), true);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (controller.getStatus().status === "succeeded") break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  const status = controller.getStatus();
+  // A budget miss is a SOFT success: the dashboard was reloaded (retained cache
+  // served), no terminal failure was filed, and the degraded note fired once.
+  assert.equal(status.status, "succeeded");
+  assert.equal(status.errorCode, null);
+  assert.equal(reloads, 1);
+  assert.equal(terminalCalls, 0);
+  assert.deepEqual(degraded, [{
+    reason: "accounting_transition_rss_limit_exceeded",
+    retained: true,
+  }]);
+  assert.deepEqual(status.result.accountingRebuildDeferred, {
+    status: "deferred",
+    reason: "accounting_transition_rss_limit_exceeded",
+    retained: true,
   });
 });
 

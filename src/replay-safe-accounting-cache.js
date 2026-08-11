@@ -22,6 +22,7 @@ import {
   recognizedCodexModelId,
 } from "./export/index.js";
 import {
+  DEFAULT_EXPORT_RESOURCE_LIMITS,
   createExportResourceGuard,
   ExportResourceLimitError,
 } from "./export-resource-policy.js";
@@ -110,18 +111,44 @@ const PACE_STATUSES = new Set([
 const ACCOUNT_SCOPE_ID_PATTERN = /^openai-account:v1:[A-Za-z0-9_-]{43}$/u;
 const ACCOUNT_TRACK_ID_PATTERN = /^account-track:v1:[a-f0-9]{64}$/u;
 const MAX_RETAINED_TRANSITION_BYTES = 320 * 1024 * 1024;
-const MAX_ACCOUNTING_RSS_BYTES = Math.floor(1.5 * 1024 * 1024 * 1024);
-// What one accounting rebuild may itself ADD to process RSS. The absolute
-// ceiling above is compared against whole-process RSS, and inside a companion
-// that idles near ~800 MB that left the pass an accidental ~700 MB budget
-// that shrank with every unrelated allocation — the live five-hour incident
-// ran exactly that arithmetic. The pass's own metered climb measured ~330 MB
-// on the real corpus, and the composition fit has since moved to an O(bins)
-// streaming pass, so 512 MiB is the measured climb plus ~55% headroom for
-// corpus growth: a principled bound on what the pass does, enforced relative
-// to the RSS captured at build start, while MAX_ACCOUNTING_RSS_BYTES stays
-// the absolute hard backstop against a baseline that is itself leaking.
-const ACCOUNTING_RSS_DELTA_BUDGET_BYTES = 512 * 1024 * 1024;
+// Absolute whole-process RSS TARGET for one accounting rebuild. Raised
+// 1.5 -> 2 GiB on owner directive (2026-08-11) after a live 0.1.6 incident:
+// the transition-mining pass tripped at ~1.6 GB whole-process RSS on a
+// companion whose baseline idles near ~800 MB, and the throw hard-failed the
+// entire refresh — blanking the dashboard and flip-flopping every 5 minutes
+// as the scheduler re-ran the doomed pass. This ceiling is now a TARGET, not a
+// hard blocker: a miss degrades to a retained-cache soft-fail rather than
+// failing the refresh (see refreshReplaySafeAccountingCache and
+// ACCOUNTING_BUDGET_MISS_CODES). It remains the backstop that stops the pass
+// before it can OOM the process.
+const MAX_ACCOUNTING_RSS_BYTES = Math.floor(2 * 1024 * 1024 * 1024);
+// What one accounting rebuild may itself ADD to process RSS over the baseline
+// captured at build start. The effective ceiling is
+// min(MAX_ACCOUNTING_RSS_BYTES, baselineRss + this delta), so the delta must
+// be large enough that a NORMAL baseline reaches the 2 GiB absolute target
+// rather than capping the pass below it. The old 512 MiB delta is exactly what
+// made the incident inevitable: with the ~800 MB live baseline it capped the
+// build at ~1.3 GB — BELOW the 1.6 GB the pass actually needed — so the miss
+// was structural, not a real leak. Raised to 1.25 GiB so a typical baseline
+// lands on the absolute target (min(2 GiB, 800 MB + 1.25 GiB = 2.05 GiB) =
+// 2 GiB): the pass's own metered climb measured ~330 MB on the real corpus and
+// the composition fit is an O(bins) streaming pass, so 1.25 GiB is that
+// measured climb with generous corpus-growth headroom, while
+// MAX_ACCOUNTING_RSS_BYTES stays the absolute backstop against a leaking
+// baseline.
+const ACCOUNTING_RSS_DELTA_BUDGET_BYTES = Math.floor(1.25 * 1024 * 1024 * 1024);
+// A memory-budget miss — whole-process RSS over the effective ceiling, the
+// scan guard's own RSS trip, or the per-row retained-byte meter over budget —
+// is a soft TARGET miss, not a hard failure. refreshReplaySafeAccountingCache
+// catches exactly these codes, retains the last good on-disk cache untouched,
+// and reports a degraded/deferred outcome instead of throwing and blanking the
+// dashboard. Every OTHER accounting_* stop (input-count ceilings, source-size
+// safety stops, aborts, measurement-invalid) stays hard by design.
+const ACCOUNTING_BUDGET_MISS_CODES = new Set([
+  "accounting_transition_rss_limit_exceeded",
+  "accounting_transition_memory_budget_exceeded",
+  "accounting_scan_rss_limit_exceeded",
+]);
 const ACCOUNTING_RSS_CHECK_INTERVAL = 2_048;
 const COMPACT_USAGE_RETAINED_BYTES = 256;
 const COMPACT_SNAPSHOT_RETAINED_BYTES = 192;
@@ -162,6 +189,15 @@ function fixedError(code) {
   const error = new Error(code);
   error.code = code;
   return error;
+}
+
+// True for the RSS/byte memory-budget misses that the refresh wrapper treats
+// as a soft, recoverable TARGET miss (retain the prior cache, defer the
+// rebuild) rather than a hard refresh failure. Keyed on the fixed code alone,
+// so it recognizes a miss no matter which of the build's guard sites raised it.
+function isAccountingBudgetMiss(error) {
+  return typeof error?.code === "string"
+    && ACCOUNTING_BUDGET_MISS_CODES.has(error.code);
 }
 
 function accountingScanResourceError(error) {
@@ -2260,8 +2296,21 @@ export async function buildReplaySafeAccountingCache({
     }
   };
   checkRuntimeMemory();
+  // The deep-scan guard reuses the shared, frozen export resource policy, whose
+  // compatibility-bound candidate ceiling caps maximumRssBytes at 1.5 GiB. The
+  // accounting build's authoritative ceiling is the 2 GiB effective target
+  // above (checkRuntimeMemory), so pass the guard the LOWER of the two: it can
+  // only tighten the transition-path target, never contradict it. In practice
+  // the heavy growth is the post-scan transition mining that checkRuntimeMemory
+  // polices at the full 2 GiB, while the scan phase stays within the export
+  // policy's own bound. A scan-phase RSS trip is likewise a soft budget miss
+  // (accounting_scan_rss_limit_exceeded), not a hard refresh failure.
+  const scanResourceGuardMaximumRssBytes = Math.min(
+    effectiveMaximumRssBytes,
+    DEFAULT_EXPORT_RESOURCE_LIMITS.maximumRssBytes,
+  );
   const scanResourceGuard = createExportResourceGuard({
-    limits: { maximumRssBytes: effectiveMaximumRssBytes },
+    limits: { maximumRssBytes: scanResourceGuardMaximumRssBytes },
     clock: now,
     rss,
   });
@@ -2621,10 +2670,22 @@ export async function refreshReplaySafeAccountingCache({
   scan = null,
   indexWorkerCount,
   indexChunkBytes,
+  // Optional, layer-local hook fired when a rebuild misses its memory budget
+  // and is DEFERRED rather than failed. Receives only a bounded descriptor
+  // ({ reason, retained }); its own errors never affect the refresh. The
+  // deferred outcome is ALSO reported in the return value, and production wires
+  // the diagnostics note off that (runner -> controller.onDegradedOutcome), so
+  // this hook is a convenience for a caller that wants the signal inline
+  // without inspecting the return shape.
+  onAccountingRebuildDeferred = null,
   ...options
 } = {}) {
   if (cacheFile !== undefined) {
     throw new TypeError("cacheFile was retired; use stateFile");
+  }
+  if (onAccountingRebuildDeferred !== null
+      && typeof onAccountingRebuildDeferred !== "function") {
+    throw new TypeError("onAccountingRebuildDeferred must be a function or null");
   }
   const selectedStateFile = stateFile ?? defaultReplaySafeAccountingCachePath();
   const selectedIndexFile = indexFile ?? resolve(
@@ -2654,10 +2715,53 @@ export async function refreshReplaySafeAccountingCache({
   // scan. A live old JSON collector or an unverified parity mismatch must
   // fail before we derive a cache that cannot be committed safely.
   await prepareLocalCollectorState({ stateFile: selectedStateFile });
-  const cache = await buildReplaySafeAccountingCache({
-    ...options,
-    scan: effectiveScan,
-  });
+  let cache;
+  try {
+    cache = await buildReplaySafeAccountingCache({
+      ...options,
+      scan: effectiveScan,
+    });
+  } catch (error) {
+    if (!isAccountingBudgetMiss(error)) throw error;
+    // The rebuild missed its memory budget. Per owner directive the budget is
+    // a TARGET, never a hard dashboard-blanker: the whole refresh must NOT
+    // fail and the last good on-disk cache must survive untouched. Control
+    // never reaches the write below, so the prior cache is retained verbatim;
+    // the fuller rebuild is DEFERRED and the recent collector pass + quota
+    // card that already ran stay authoritative. This mirrors the
+    // composition-fit fail-soft (composition:null -> median fallback), widened
+    // from one sub-artifact to the whole accounting artifact.
+    let retainedCache = null;
+    try {
+      const stored = await readReplaySafeAccountingCache({
+        stateFile: selectedStateFile,
+      });
+      if (stored.status === "available") retainedCache = stored.cache;
+    } catch {
+      // A prior cache that cannot be read is treated as absent: the surface
+      // then shows honest insufficient-evidence rather than a stale estimate,
+      // and this read failure never turns the soft-fail back into a hard one.
+      retainedCache = null;
+    }
+    const deferred = Object.freeze({
+      status: "accounting_rebuild_deferred",
+      reason: error.code,
+      retained: retainedCache !== null,
+      generatedAt: retainedCache?.generatedAt ?? null,
+      coveredAt: retainedCache?.coveredAt ?? null,
+    });
+    if (onAccountingRebuildDeferred !== null) {
+      try {
+        await onAccountingRebuildDeferred({
+          reason: deferred.reason,
+          retained: deferred.retained,
+        });
+      } catch {
+        // The degraded-event trail must never affect the refresh outcome.
+      }
+    }
+    return deferred;
+  }
   if (Buffer.byteLength(stableJson(cache)) > MAX_CACHE_BYTES) {
     throw fixedError("cache_invalid_size");
   }
