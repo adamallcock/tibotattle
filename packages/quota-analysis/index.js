@@ -23,6 +23,15 @@ export {
 } from "./src/quota-pace-forecast.js";
 
 export {
+  MODEL_COMPOSITION_POLICY,
+  blendedCompositionCapacityUsd,
+  buildCompositionObservations,
+  calibrateCompositionCapacities,
+  compositionExpectedPp,
+  solveNonNegativeLeastSquares,
+} from "./src/model-composition.js";
+
+export {
   FIVE_HOUR_WINDOW_MINUTES,
   formatQuotaWindowDuration,
   MAX_QUOTA_WINDOW_DURATION_MINUTES,
