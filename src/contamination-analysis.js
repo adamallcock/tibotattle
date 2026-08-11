@@ -16,12 +16,14 @@ function mean(values) {
   return values.length === 0 ? null : values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
+// Series identity is (provider, plan, limit, duration). Slot is carried on
+// the classification as display provenance only: it is a server-assigned UI
+// role and the weekly window flipped secondary -> primary around 2026-07-06.
 function seriesKey(classification) {
   return [
     classification.provider,
     classification.planType,
     classification.limitId,
-    classification.slot,
     classification.windowDurationMins,
   ].join("|");
 }
@@ -108,11 +110,11 @@ function normalizeTransition(transition) {
 function normalizeExperiment(result) {
   if (!result || !["completed", "completed_with_stop"].includes(result.status) || !result.measuredLocal) return [];
   const beforeByKey = new Map((result.before?.windows ?? []).map((window) => [
-    [window.limitId, window.slot, window.windowDurationMins, window.resetsAt].join("|"),
+    [window.limitId, window.windowDurationMins, window.resetsAt].join("|"),
     window,
   ]));
   return (result.quotaChanges ?? []).flatMap((change) => {
-    const key = [change.limitId, change.slot, change.windowDurationMins, change.resetsAt].join("|");
+    const key = [change.limitId, change.windowDurationMins, change.resetsAt].join("|");
     const before = beforeByKey.get(key);
     const beforeUsedPercent = Number.isFinite(change.beforeUsedPercent)
       ? change.beforeUsedPercent
@@ -340,8 +342,10 @@ function structuralChanges(rows) {
   for (let index = 1; index < ordered.length; index += 1) {
     const prior = ordered[index - 1];
     const next = ordered[index];
-    const basePrior = [prior.classification.provider, prior.classification.planType, prior.classification.limitId, prior.classification.slot, prior.classification.windowDurationMins].join("|");
-    const baseNext = [next.classification.provider, next.classification.planType, next.classification.limitId, next.classification.slot, next.classification.windowDurationMins].join("|");
+    // Slot excluded on purpose: a server-side slot flip is not a plan, limit,
+    // or window change and must not emit a structural boundary.
+    const basePrior = [prior.classification.provider, prior.classification.planType, prior.classification.limitId, prior.classification.windowDurationMins].join("|");
+    const baseNext = [next.classification.provider, next.classification.planType, next.classification.limitId, next.classification.windowDurationMins].join("|");
     if (basePrior !== baseNext) {
       changes.push({ intervalIndex: next.intervalIndex, eventTime: next.eventTime, type: "plan_limit_or_window_change" });
     }

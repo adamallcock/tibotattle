@@ -217,11 +217,14 @@ test("the capability advertises the v1.0 contract only when configured with an e
     await app.close();
   }
   // Configured, but the unified index (the upload source) does not exist yet.
+  // The controller starts inside the snapshot build, which runs behind the
+  // already-open port; wait for it so the start is counted before close.
   const controller = fakeIncrementalController();
   app = await startApp(files, {
     incrementalContributionController: controller,
   });
   try {
+    await app.snapshotReady;
     const health = await fetch(
       `http://127.0.0.1:${app.port}/api/local/health`,
     ).then((response) => response.json());
@@ -240,6 +243,7 @@ test("the capability advertises the v1.0 contract only when configured with an e
     incrementalContributionController: controller,
   });
   try {
+    await app.snapshotReady;
     const health = await fetch(
       `http://127.0.0.1:${app.port}/api/local/health`,
     ).then((response) => response.json());

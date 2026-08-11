@@ -5572,8 +5572,11 @@ test("live timeline uses the primary Codex weekly track and live weekly median f
     /rows\.filter\(isPrimaryCodexWeeklyQuotaWindow\)/u,
   );
   assert.doesNotMatch(trackSource, /row\.limitId|row\.durationMinutes/u);
-  assert.match(trackSource, /row\.slot === "primary"/u);
-  assert.match(trackSource, /if \(primary\.length\) return primary;/u);
+  // Track identity is (limitId, duration): the provider's primary/secondary
+  // slot is a server-assigned UI role that flipped for the weekly window
+  // around 2026-07-06, so the track must never be selected or grouped by
+  // slot — that filter cut the entire pre-flip era out of the series.
+  assert.doesNotMatch(trackSource, /row\.slot|bySlot/u);
 
   const liveMatch = appSource.match(
     /function liveTimelinePoints\([\s\S]*?\) \{([\s\S]*?)\n\}\n\nfunction groupedUsageTimeline/u,

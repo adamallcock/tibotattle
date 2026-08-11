@@ -27,12 +27,16 @@ function sum(rows, selector) {
   return rows.reduce((total, row) => total + (Number(selector(row)) || 0), 0);
 }
 
+// Slot never keys a series or family: it is a server-assigned UI role (the
+// weekly window flipped secondary -> primary around 2026-07-06). Interval
+// rows carry the slot of their originating snapshot as provenance, so a
+// slot-keyed filter would drop post-flip rows from a merged dominant series.
 function seriesKey(row) {
-  return [row.provider, row.planType, row.limitId, row.slot, row.windowDurationMins, row.resetsAt].join("|");
+  return [row.provider, row.planType, row.limitId, row.windowDurationMins, row.resetsAt].join("|");
 }
 
 function familyKey(row) {
-  return [row.provider, row.planType, row.limitId, row.slot, row.windowDurationMins].join("|");
+  return [row.provider, row.planType, row.limitId, row.windowDurationMins].join("|");
 }
 
 function isKnownAccount(value) {
@@ -351,7 +355,6 @@ export function analyzeMonitoringQuality({
     ? collectorSummary
     : summarizeCollector(collectorRecords, nowMs);
   const dominantFamily = resetFamilies.find((row) => row.limitId === dominantGroup?.limitId
-    && row.slot === dominantGroup?.slot
     && row.windowDurationMins === dominantGroup?.windowDurationMins
     && row.provider === dominantGroup?.provider
     && row.planType === dominantGroup?.planType) ?? null;

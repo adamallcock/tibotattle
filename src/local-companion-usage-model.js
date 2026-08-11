@@ -533,26 +533,38 @@ export function orderQuotaWindows(windows) {
 }
 
 function quotaTimelineRowTieBreak(row) {
+  // Percent is zero-padded so the string compare is numeric: between two
+  // same-instant readings of one track the lower displayed percentage wins.
+  // Slot is deliberately LAST: it is display provenance, not identity, and
+  // only breaks the tie when the state is otherwise identical so dedupe
+  // stays order-independent.
   return [
     row.planType,
-    row.usedPercent.toFixed(3),
+    row.usedPercent.toFixed(3).padStart(7, "0"),
     row.resetAt,
     row.accountAttribution,
+    row.slot,
   ].join("\0");
 }
 
 export function finalizeQuotaTimeline(rows) {
+  // Quota track identity is (limitId, duration). The provider's
+  // primary/secondary slots are server-assigned UI roles — the weekly
+  // 10080-minute window flipped from `secondary` to `primary` around
+  // 2026-07-06 — so slot never participates in track identity or sorts ahead
+  // of the duration; it stays on the row as display provenance and acts only
+  // as a trailing deterministic tie-break.
   rows.sort((left, right) => (
     Date.parse(left.observedAt) - Date.parse(right.observedAt)
     || left.limitId.localeCompare(right.limitId)
-    || left.slot.localeCompare(right.slot)
     || left.durationMinutes - right.durationMinutes
+    || left.slot.localeCompare(right.slot)
     || left.planType.localeCompare(right.planType)
     || left.usedPercent - right.usedPercent
   ));
   const points = new Map();
   for (const row of rows) {
-    const track = `${row.limitId}:${row.slot}:${row.durationMinutes ?? "unknown"}`;
+    const track = `${row.limitId}:${row.durationMinutes ?? "unknown"}`;
     const observedMs = Date.parse(row.observedAt);
     const key = `${track}:${observedMs}`;
     const prior = points.get(key);
@@ -565,8 +577,8 @@ export function finalizeQuotaTimeline(rows) {
     [...points.values()].sort((left, right) => (
       Date.parse(left.observedAt) - Date.parse(right.observedAt)
       || left.limitId.localeCompare(right.limitId)
-      || left.slot.localeCompare(right.slot)
       || left.durationMinutes - right.durationMinutes
+      || left.slot.localeCompare(right.slot)
       || left.planType.localeCompare(right.planType)
       || left.usedPercent - right.usedPercent
     )),

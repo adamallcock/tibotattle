@@ -3004,23 +3004,15 @@ function timelineStatusIntervals(points, viewport) {
   });
 }
 
+// The weekly track is identified by (limitId, duration) alone. The provider's
+// primary/secondary slots are server-assigned UI roles — the weekly window
+// flipped from `secondary` to `primary` around 2026-07-06 — so filtering by
+// slot here cut the entire pre-flip era out of the series. Distinct concurrent
+// instances stay separated downstream by their reset boundaries
+// (sameResetBoundary), and the local pipeline already emits at most one row
+// per (limitId, duration, instant).
 function mainWeeklyQuotaTrack(rows) {
-  const weeklyCodex = rows.filter(isPrimaryCodexWeeklyQuotaWindow);
-  if (!weeklyCodex.length) return [];
-  const primary = weeklyCodex.filter((row) => row.slot === "primary");
-  if (primary.length) return primary;
-  const bySlot = new Map();
-  for (const row of weeklyCodex) {
-    const slot = row.slot ?? "unknown";
-    const group = bySlot.get(slot) ?? [];
-    group.push(row);
-    bySlot.set(slot, group);
-  }
-  return [...bySlot.entries()]
-    .sort((left, right) => (
-      right[1].length - left[1].length
-      || left[0].localeCompare(right[0])
-    ))[0]?.[1] ?? [];
+  return rows.filter(isPrimaryCodexWeeklyQuotaWindow);
 }
 
 // The provider restates the same reset boundary with a slightly different

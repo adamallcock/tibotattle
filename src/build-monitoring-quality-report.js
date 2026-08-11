@@ -119,7 +119,7 @@ const artifact = {
         id: "scope_definitions",
         type: "markdown",
         sourceId: "monitoring_quality",
-        body: `## Scope, data, and metric definitions\n\nThe profile covers retained local activity from **${quality.scope.startAt} through ${quality.scope.endAt}**. The comparison grain is one adjacent quota snapshot inside the largest exact provider/plan/limit/slot/duration/reset series. A fit-eligible interval must show a one-point increase, contain retained local usage, have complete elapsed-time coverage, and carry no pricing or attribution warning.\n\nCoverage fractions describe whether a required dimension is actually observed. They do not impute a value from the current login or plan. Collector freshness is measured from the newest privacy-minimized ledger timestamp to the diagnostic run time.`,
+        body: `## Scope, data, and metric definitions\n\nThe profile covers retained local activity from **${quality.scope.startAt} through ${quality.scope.endAt}**. The comparison grain is one adjacent quota snapshot inside the largest exact provider/plan/limit/duration/reset series; the provider's primary/secondary slot is display metadata, not series identity. A fit-eligible interval must show a one-point increase, contain retained local usage, have complete elapsed-time coverage, and carry no pricing or attribution warning.\n\nCoverage fractions describe whether a required dimension is actually observed. They do not impute a value from the current login or plan. Collector freshness is measured from the newest privacy-minimized ledger timestamp to the diagnostic run time.`,
       },
       {
         id: "method",

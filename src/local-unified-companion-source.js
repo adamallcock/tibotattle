@@ -145,20 +145,29 @@ function recordShape(row) {
 }
 
 function quotaRowCompare(left, right) {
+  // Track identity is (limitId, duration); slot is a server-assigned UI role
+  // and may only serve as a trailing deterministic tie-break, never ahead of
+  // the duration.
   return left.observedMs - right.observedMs
     || left.limitId.localeCompare(right.limitId)
-    || left.slot.localeCompare(right.slot)
     || left.durationMinutes - right.durationMinutes
+    || left.slot.localeCompare(right.slot)
     || left.planType.localeCompare(right.planType)
     || left.usedPercent - right.usedPercent;
 }
 
 function quotaRowTieBreak(row) {
+  // Percent is zero-padded so the string compare is numeric: between two
+  // same-instant readings of one track the lower displayed percentage wins.
+  // Slot is deliberately LAST: it is display provenance, not identity, and
+  // only breaks the tie when the state is otherwise identical so dedupe
+  // stays order-independent.
   return [
     row.planType,
-    row.usedPercent.toFixed(3),
+    row.usedPercent.toFixed(3).padStart(7, "0"),
     row.resetAt,
     row.accountAttribution,
+    row.slot,
   ].join("\0");
 }
 
@@ -216,7 +225,11 @@ function quotaTimelineFor(database, limitId, nowMs) {
       accountAttribution: "unattributed",
       observedMs,
     };
-    const track = `${candidate.slot}:${candidate.durationMinutes}`;
+    // Quota track identity is (limitId, duration). The provider's
+    // primary/secondary slots are UI roles that flipped server-side around
+    // 2026-07-06; keying on them fragments one continuous window into two
+    // tracks. Slot stays on the row as display provenance only.
+    const track = `${candidate.limitId}:${candidate.durationMinutes}`;
     const prior = group.get(track);
     if (prior === undefined
         || quotaRowTieBreak(candidate) < quotaRowTieBreak(prior)) {

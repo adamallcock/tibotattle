@@ -1079,17 +1079,11 @@ test("retains exact deterministic quota points for comparison brackets", async (
       resetAt: "2026-08-03T12:00:00.000Z",
       accountAttribution: "historical_unattributed",
     },
-    {
-      observedAt: "2026-07-27T12:00:00.000Z",
-      limitId: "codex",
-      slot: "primary",
-      planType: "pro",
-      usedPercent: 21,
-      remainingPercent: 79,
-      durationMinutes: 10_080,
-      resetAt: "2026-08-03T12:00:00.000Z",
-      accountAttribution: "historical_unattributed",
-    },
+    // Track identity is (limitId, duration): the provider's primary and
+    // secondary slots are UI roles, so the two same-instant 12:00 readings
+    // are one track point and the deterministic tie-break keeps exactly one
+    // ("edu" sorts before "pro"). The surviving row's slot is provenance of
+    // the winning reading, not a second series.
     {
       observedAt: "2026-07-27T12:00:00.000Z",
       limitId: "codex",
@@ -1114,22 +1108,23 @@ test("retains exact deterministic quota points for comparison brackets", async (
   }
 });
 
+// The provider reports the weekly window under the `secondary` slot for the
+// first half of the range and under `primary` afterwards — the observed
+// server-side slot flip of ~2026-07-06. Identity is (limitId, duration), so
+// this is ONE continuous duplicate-rich series spanning the flip, not two
+// slot-keyed fragments.
 test("retains duplicate-rich quota history across 31 days under the cap", async () => {
   const startMs = Date.parse("2026-07-01T00:00:00.000Z");
   const minutes = 31 * 24 * 60;
+  const flipMinute = Math.floor(minutes / 2);
   const snapshots = [];
   for (let minute = 0; minute < minutes; minute += 1) {
     const timestamp = new Date(startMs + minute * 60_000).toISOString();
     const day = Math.floor(minute / (24 * 60));
     snapshots.push(weeklySnapshot({
       timestamp,
-      slot: "primary",
+      slot: minute < flipMinute ? "secondary" : "primary",
       usedPercent: day,
-    }));
-    snapshots.push(weeklySnapshot({
-      timestamp,
-      slot: "secondary",
-      usedPercent: day + 0.5,
     }));
   }
   assert.ok(snapshots.length > 10_000);
@@ -1150,7 +1145,16 @@ test("retains duplicate-rich quota history across 31 days under the cap", async 
   const reversed = await build([...snapshots].reverse());
 
   assert.deepEqual(cache.quotaTimeline, reversed.quotaTimeline);
-  assert.equal(cache.quotaTimeline.length, 10_000);
+  // One merged (limitId, duration) track spans the flip; retention stays
+  // under the cap and reaches both ends of the covered window.
+  assert.ok(cache.quotaTimeline.length > 0);
+  assert.ok(cache.quotaTimeline.length <= 10_000);
+  assert.equal(
+    new Set(
+      cache.quotaTimeline.map((row) => `${row.limitId}:${row.durationMinutes}`),
+    ).size,
+    1,
+  );
   assert.equal(
     cache.quotaTimeline[0].observedAt,
     "2026-07-01T00:00:00.000Z",
@@ -1163,16 +1167,24 @@ test("retains duplicate-rich quota history across 31 days under the cap", async 
     new Set(cache.quotaTimeline.map((row) => row.observedAt.slice(0, 10))).size,
     31,
   );
-  for (const [slot, offset] of [["primary", 0], ["secondary", 0.5]]) {
-    const values = new Set(
-      cache.quotaTimeline
-        .filter((row) => row.slot === slot)
-        .map((row) => row.usedPercent),
-    );
-    for (let day = 0; day < 31; day += 1) {
-      assert.equal(values.has(day + offset), true, `${slot} day ${day}`);
-    }
+  const values = new Set(cache.quotaTimeline.map((row) => row.usedPercent));
+  for (let day = 0; day < 31; day += 1) {
+    assert.equal(values.has(day), true, `day ${day}`);
   }
+  // Slot survives on the rows as provenance of each era of the one track:
+  // pre-flip rows carry `secondary`, post-flip rows carry `primary`, and the
+  // series is continuous across the boundary.
+  const flipMs = Date.parse("2026-07-01T00:00:00.000Z")
+    + Math.floor((31 * 24 * 60) / 2) * 60_000;
+  for (const row of cache.quotaTimeline) {
+    assert.equal(
+      row.slot,
+      Date.parse(row.observedAt) < flipMs ? "secondary" : "primary",
+      `slot provenance at ${row.observedAt}`,
+    );
+  }
+  assert.ok(cache.quotaTimeline.some((row) => row.slot === "secondary"));
+  assert.ok(cache.quotaTimeline.some((row) => row.slot === "primary"));
 });
 
 // The duplicate-rich case above repeats one value per day, so it never has
@@ -1235,29 +1247,37 @@ test("churn-rich quota history stays inside the cap and still spans the range", 
     new Set(timeline.map((row) => row.observedAt.slice(0, 10))).size,
     31,
   );
-  // Every calendar day carries observations on both slots, so a comparison
-  // window anywhere in the range can find a bracket rather than being
-  // excluded for missing quota evidence.
-  for (const slot of ["primary", "secondary"]) {
-    const days = new Set(
-      timeline
-        .filter((row) => row.slot === slot)
-        .map((row) => row.observedAt.slice(0, 10)),
+  // Track identity is (limitId, duration): the primary and secondary
+  // readings are ONE merged track, each instant keeping the deterministic
+  // tie-break winner (the lower displayed percentage), never a phantom
+  // second series keyed by UI slot.
+  assert.equal(
+    new Set(timeline.map((row) => `${row.limitId}:${row.durationMinutes}`)).size,
+    1,
+  );
+  for (const row of timeline) {
+    const minute = Math.round(
+      (Date.parse(row.observedAt) - Date.parse("2026-07-01T00:00:00.000Z"))
+        / 60_000,
     );
-    assert.equal(days.size, 31, `${slot} day coverage`);
+    const primaryPercent = Number(((minute % 9_901) / 100).toFixed(2));
+    const secondaryPercent = Number((primaryPercent / 2).toFixed(3));
+    assert.equal(
+      row.usedPercent,
+      Math.min(primaryPercent, secondaryPercent),
+      `merged winner at ${row.observedAt}`,
+    );
   }
   // No retained neighbour gap may exceed the widest bracket tolerance the
   // dashboard allows for its narrowest comparison window.
-  const primary = timeline
-    .filter((row) => row.slot === "primary")
-    .map((row) => Date.parse(row.observedAt));
+  const merged = timeline.map((row) => Date.parse(row.observedAt));
   let widestGapMs = 0;
-  for (let index = 1; index < primary.length; index += 1) {
-    widestGapMs = Math.max(widestGapMs, primary[index] - primary[index - 1]);
+  for (let index = 1; index < merged.length; index += 1) {
+    widestGapMs = Math.max(widestGapMs, merged[index] - merged[index - 1]);
   }
   assert.ok(
     widestGapMs <= 60 * 60 * 1_000,
-    `widest retained primary gap ${widestGapMs}ms`,
+    `widest retained gap ${widestGapMs}ms`,
   );
 });
 

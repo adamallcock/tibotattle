@@ -51,6 +51,9 @@ function makeRng(seed) {
   };
 }
 
+// Slot is excluded from both keys: it is a server-assigned UI role (the
+// weekly window flipped secondary -> primary around 2026-07-06), so identity
+// is (limit, duration), with resetsAt separating series instances.
 function resetGroupKey(transition) {
   return [
     transition.accountScopeId ?? "unattributed",
@@ -58,7 +61,6 @@ function resetGroupKey(transition) {
     transition.provider,
     transition.planType,
     transition.limitId,
-    transition.slot,
     transition.windowDurationMins,
     transition.resetsAt,
   ].join("|");
@@ -71,7 +73,6 @@ function seriesKey(transition) {
     transition.provider,
     transition.planType,
     transition.limitId,
-    transition.slot,
     transition.windowDurationMins,
   ].join("|");
 }

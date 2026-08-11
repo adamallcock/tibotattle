@@ -24,13 +24,17 @@ const SNAPSHOT_KEYS = [
   "policyEpoch",
 ];
 
+// Track compatibility is judged by (limit, duration) plus account/plan/reset
+// facets. `slot` stays in the snapshot shape as visible metadata but is NOT a
+// track key: it is a server-assigned UI role, and the provider flipped the
+// weekly window from `secondary` to `primary` around 2026-07-06 without the
+// window itself changing.
 const TRACK_KEYS = [
   "accountTrackId",
   "provider",
   "planType",
   "planVariant",
   "limitId",
-  "slot",
   "windowDurationMinutes",
   "resetsAt",
   "policyEpoch",
