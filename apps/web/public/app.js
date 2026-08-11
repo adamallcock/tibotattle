@@ -8120,11 +8120,16 @@ async function signOutHostedIdentity() {
   }
 }
 
-// The service holds a completed sign-in for five minutes, so the poll stops
-// exactly when the handoff can no longer be delivered rather than earlier: the
-// user is authenticating in a separate browser window and may be typing a
-// password and a second factor.
-const HOSTED_SIGNIN_POLL_ATTEMPTS = 150;
+// The poll must cover the service's authorization window, not undershoot it
+// (owner-reported, 2026-08-10). The Worker holds an unused sign-in
+// authorization for ten minutes (SIGNIN_HANDOFF_AUTHORIZATION_TTL_MILLISECONDS)
+// — a full human round trip: a cold-starting browser, an account chooser, a
+// password, a second factor. The old five-minute client budget gave up while
+// the service still held the authorization, so a careful user's completed
+// sign-in expired unread and the exhaustion logged error:null → "unknown".
+// Ten minutes matches the service, so the poll stops exactly when the
+// authorization can no longer be redeemed rather than minutes earlier.
+const HOSTED_SIGNIN_POLL_ATTEMPTS = 300;
 const HOSTED_SIGNIN_POLL_INTERVAL_MS = 2_000;
 // The service-side hold, stated once: the poll budget IS the validity window,
 // and the persisted pending handoff below uses the same bound so this page

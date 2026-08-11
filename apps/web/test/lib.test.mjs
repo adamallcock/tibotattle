@@ -3721,10 +3721,10 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   assert.match(appSource, /IDENTITY_CONFIGURATION_INVALID/u);
   assert.match(appSource, /let hostedIdentity = null;/u);
 
-  // One poll loop serves both providers, and it stops exactly when the
-  // service's five-minute handoff expires rather than earlier: the user is
-  // authenticating in a separate browser window, which inside the macOS app is
-  // the only place a provider host can be loaded at all.
+  // One poll loop serves both providers, and it covers the service's full
+  // ten-minute sign-in authorization window rather than undershooting it: the
+  // user is authenticating in a separate browser window, which inside the
+  // macOS app is the only place a provider host can be loaded at all.
   const pollBody =
     appSource.match(/async function beginHostedSignIn\([\s\S]*?\n\}/u)?.[0] ?? "";
   assert.match(pollBody, /HOSTED_SIGNIN_POLL_ATTEMPTS/u);
@@ -3762,7 +3762,9 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
     appSource.match(/const HOSTED_SIGNIN_POLL_INTERVAL_MS = ([\d_]+);/u)?.[1]
       ?.replace(/_/gu, "")
   );
-  assert.equal(attempts * interval, 5 * 60 * 1_000);
+  // The client budget must be at least the Worker's ten-minute sign-in
+  // authorization TTL, never the old five minutes that gave up early (A6).
+  assert.ok(attempts * interval >= 10 * 60 * 1_000);
 
   // A browser handoff remains recoverable: the callback can wake the bounded
   // poll immediately, and the person can check or cancel without waiting for
@@ -9023,7 +9025,7 @@ function fakeSessionStorage(seed = {}) {
 
 async function loadHostedSignInResume(harness) {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  const start = appSource.indexOf("// The service holds a completed sign-in for five minutes");
+  const start = appSource.indexOf("// The poll must cover the service's authorization window");
   const end = appSource.indexOf("async function beginHostedSignIn(providerId) {");
   assert.ok(start >= 0 && end > start, "the sign-in resume section is available");
   const section = appSource.slice(start, end);
