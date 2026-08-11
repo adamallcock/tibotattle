@@ -410,7 +410,35 @@ function sendError(response, statusCode, code) {
 
 function contributionDeviceRecoveryRequired(error) {
   try {
-    return error?.code === "contribution_device_credential_conflict";
+    // Every one of these means this Mac's own device credential is present-but-
+    // unusable (or its binding is half-there): the LOCAL half is broken and the
+    // cure is the local reset ceremony — an attribute delete plus binding-file
+    // removal that never needs to read the secret — followed by a fresh mint on
+    // the next approval. Mapping them all to the recovery code routes the user
+    // into renderContributionDeviceRecovery (the reset button) instead of a
+    // generic 502 pairing/sync failure that offers no path and re-hits the same
+    // unreadable item on every retry (a silent forever-loop).
+    //   credential_conflict     keychain secret and binding file disagree, or a
+    //                           secret exists with no binding (or vice-versa).
+    //   credential_locked /     a signed update re-signed the app and the old
+    //   credential_denied       item's ACL no longer grants the companion read
+    //                           access (observed live 2026-08-10). The v0.1.9+
+    //                           durable-requirement ACL prevents this for items
+    //                           minted from now on; this is the recovery net for
+    //                           any item minted by an earlier build, or if the
+    //                           durable ACL ever fails to hold across a re-sign.
+    //   credential_unavailable  the secret is unreadable/corrupt or a fresh
+    //                           mint's read-back did not match — reset+remint.
+    //   credential_missing      a binding file with no backing secret (a
+    //                           half-completed prior reset or an out-of-band
+    //                           Keychain deletion) — clearing the binding lets
+    //                           the next approval mint cleanly.
+    const code = error?.code;
+    return code === "contribution_device_credential_conflict"
+      || code === "contribution_device_credential_locked"
+      || code === "contribution_device_credential_denied"
+      || code === "contribution_device_credential_unavailable"
+      || code === "contribution_device_credential_missing";
   } catch {
     return false;
   }

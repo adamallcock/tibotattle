@@ -2917,6 +2917,107 @@ test("stale contribution-device credentials return fixed recovery guidance witho
   }
 });
 
+// Regression: a device credential that a signed update left unreadable (its
+// Keychain ACL no longer grants the re-signed companion read access, observed
+// live 2026-08-10) surfaces as credential_locked/denied — and a corrupt or
+// read-back-mismatched secret as credential_unavailable. Before the recovery
+// classifier learned these codes, the pairing mint's up-front capability read
+// (claimContributionDevicePairing -> ensureContributionDeviceCapability ->
+// readContributionDeviceCapability) threw one of them, the route mapped it to a
+// generic 502 pairing_failed with no reset surface, and every retry re-hit the
+// same unreadable item — a silent forever-loop. Each must now reach the 409
+// recovery code that renders the local reset ceremony.
+for (const { label, thrown } of [
+  { label: "locked (re-sign broke the ACL)", thrown: { code: "export_identity_keychain_locked" } },
+  { label: "denied", thrown: { code: "export_identity_keychain_denied" } },
+  { label: "unavailable (unreadable/corrupt secret)", thrown: { code: "export_identity_keychain_wedged" } },
+]) {
+  test(`an unreadable device credential (${label}) routes pairing to local recovery, not a dead-end 502`, async () => {
+    const files = await fixture();
+    const privateCanary = "DO-NOT-LEAK-unreadable-device-credential";
+    const stateFile = join(files.stateRoot, "missing-device-binding-v1.json");
+    let reads = 0;
+    let creates = 0;
+    let deletes = 0;
+    let networkRequests = 0;
+    const backend = {
+      async read() {
+        reads += 1;
+        const error = new Error(privateCanary);
+        error.code = thrown.code;
+        throw error;
+      },
+      async createIfMissing() {
+        creates += 1;
+        return "created";
+      },
+      async deleteExact() {
+        deletes += 1;
+        return "deleted";
+      },
+    };
+    const app = await startLocalCompanionServer({
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: fakeStore(),
+      refreshRunner: async () => ({}),
+      contributionDevicePairingProvider: ({ pairingCode }) =>
+        claimContributionDevicePairing({
+          origin: "https://central.example",
+          pairingCode,
+          capabilityOptions: { backend, stateFile },
+          fetchImpl: async () => {
+            networkRequests += 1;
+            throw new Error(privateCanary);
+          },
+        }),
+      port: 0,
+    });
+    try {
+      const base = `http://127.0.0.1:${app.port}`;
+      const headers = {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1",
+        Origin: base,
+      };
+      const pairingCode =
+        "um_pair_00000000-0000-4000-8000-000000000000.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+      const client = new LocalCompanionClient({
+        fetchImpl: (url, options = {}) => fetch(`${base}${url}`, {
+          ...options,
+          headers: { ...options.headers, Origin: base },
+        }),
+      });
+      await assert.rejects(
+        client.pairContributionDevice(pairingCode),
+        (error) => error?.status === 409
+          && error?.code === "contribution_device_recovery_required",
+      );
+      const response = await fetch(
+        `${base}/api/local/contribution/device-pair`,
+        { method: "POST", headers, body: JSON.stringify({ pairingCode }) },
+      );
+      assert.equal(response.status, 409);
+      const payload = await response.json();
+      assert.deepEqual(payload, {
+        schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+        error: { code: "contribution_device_recovery_required" },
+      });
+      // The broken secret is never read out, minted over, or leaked: recovery is
+      // the sole outcome and it discloses nothing about the failed credential.
+      assert.equal(JSON.stringify(payload).includes(privateCanary), false);
+      assert.equal(creates, 0);
+      assert.equal(deletes, 0);
+      assert.equal(networkRequests, 0);
+    } finally {
+      await app.close();
+      await rm(files.root, { recursive: true });
+    }
+  });
+}
+
 test("optional HTTPS central proxy exposes public reads without leaking authority headers", async () => {
   const files = await fixture();
   const forwarded = [];
