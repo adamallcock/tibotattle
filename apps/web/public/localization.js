@@ -1199,6 +1199,7 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Movement needs context": ["变化需要上下文", "El movimiento necesita contexto"],
   "Allowance exhausted": ["额度已用尽", "Asignación agotada"],
   "Per-model rates": ["各模型费率", "Tasas por modelo"],
+  "Each model consumes the weekly allowance at its own rate, so the headline blends these over your recent mix.": ["每个模型以各自的速率消耗每周额度，因此标题按你近期的模型组合对这些费率加权混合。", "Cada modelo consume la asignación semanal a su propia tasa, así que el titular las combina según tu mezcla reciente."],
   "Indexed history": ["已索引历史", "Historial indexado"],
   "Model usage": ["模型使用情况", "Uso por modelo"],
   "A model on a separate allowance is listed on its own row and carries no API equivalent, because that figure cannot be compared with the main allowance. Nothing unavailable is replaced with an invented cost.": ["使用独立额度的模型会单独列为一行，并且不显示 API 等价值，因为该数值无法与主额度比较。任何不可用的数据都不会被虚构成本替代。", "Un modelo con una cuota independiente aparece en su propia fila y no lleva equivalente de API, porque esa cifra no se puede comparar con la cuota principal. Nada que no esté disponible se sustituye por un coste inventado."],
