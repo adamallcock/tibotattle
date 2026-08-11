@@ -1425,43 +1425,58 @@ h2 {
 .legend-dot.allowance { color: var(--green); }
 .compact-legend { justify-content: flex-end; margin-top: var(--space-2); }
 .chart-area-confidence { fill: rgba(49, 95, 132, .14); }
+/* Four exclusion bands, four distinct hues, so a shaded region on the chart
+   maps to exactly one legend entry. "Missing bracket" and "movement needs
+   context" both drew in the same grey and were indistinguishable; the latter
+   is violet now. Each legend swatch carries its band's hue at a higher alpha
+   so a 12px square reads where the faint plot-width wash would not. */
 .chart-status-missing { fill: rgba(101, 112, 107, .08); }
 .chart-status-reset { fill: rgba(49, 95, 132, .08); }
-.chart-status-ambiguous { fill: rgba(101, 112, 107, .06); }
+.chart-status-ambiguous { fill: rgba(124, 92, 173, .1); }
 /* "Allowance exhausted": the pool is pegged at 100%, so no residual is
    measurable across the span. Warmer than the neutral exclusions so a
    deliberate suspension never reads as a data gap. */
 .chart-status-saturated { fill: rgba(176, 101, 43, .1); }
 .legend-dot.chart-status-missing { background: rgba(101, 112, 107, .54); }
 .legend-dot.chart-status-reset { background: rgba(49, 95, 132, .54); }
-.legend-dot.chart-status-ambiguous { background: rgba(101, 112, 107, .54); }
+.legend-dot.chart-status-ambiguous { background: rgba(124, 92, 173, .54); }
 .legend-dot.chart-status-saturated { background: rgba(176, 101, 43, .54); }
+/* Two line series (a short stroke swatch) and four shaded-window categories
+   share one key. The area swatches are filled squares — the shape the bands
+   take on the chart — and a hairline separator sets the two groups apart, so
+   a reader tells a line from a band at a glance without a per-locale sublabel. */
+.legend-dot.area { width: 12px; height: 12px; border-radius: 3px; }
+.legend-group-sep { width: 1px; height: 15px; align-self: center; background: var(--line); }
+/* The calibration legend is a full-width horizontal row beneath the chart
+   heading. A slightly tighter column gap keeps all seven entries on one line
+   on a full-width English card; longer labels and narrower cards wrap it, but
+   never back into the three-high stack it made inside the control column. */
+.calibration-legend { width: 100%; margin-top: var(--space-4); justify-content: flex-start; column-gap: 14px; }
 .chart-zero { stroke: var(--muted); stroke-dasharray: 5 5; }
 .chart-point-observed { fill: var(--green); }
 .chart-point-expected { fill: var(--rust); }
 .chart-point-value { fill: var(--blue); }
 /*
- * (4-visual) This strip is populated at runtime and often holds two tiles, not
- * four. A fixed `repeat(4, 1fr)` therefore left two empty tracks, and because
- * the container was filled with the border colour and separated by 1px gaps,
- * those empty tracks rendered as a wide grey slab beside the numbers.
+ * (4-visual) This strip is populated at runtime: two tiles under the hourly
+ * usage chart, five under the calibration chart. A fixed `repeat(4, 1fr)` once
+ * left empty tracks that rendered as a grey slab; the flex fallback that
+ * replaced it capped each tile at 320px, so five 200px tiles could not share
+ * one row and wrapped four-across with a single orphan beneath.
  *
- * It is a wrapping row of tiles now, not a fixed four-track grid: each tile
- * asks for 200px and is allowed to grow to 320px, so two tiles occupy the
- * space two tiles need and the rest of the row is paper rather than panelling.
- * Four tiles still fill the width. The hairline-grid trick is gone with it —
- * each tile is a real rounded surface on cream, matching the metric cards.
+ * An `auto-fit` track list settles both cases: empty tracks collapse (no slab)
+ * and the tiles that exist distribute evenly by width — five across on a wide
+ * card, three-plus-two as it narrows, two side by side under the hourly chart —
+ * never four-plus-one. Each tile is a real rounded surface on cream, matching
+ * the metric cards.
  */
 .chart-summary-grid {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: var(--space-2);
   margin-top: var(--space-5);
 }
 .chart-summary-grid > div {
-  flex: 1 1 200px;
   min-width: 0;
-  max-width: 320px;
   padding: var(--space-3) var(--pad-tile);
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);

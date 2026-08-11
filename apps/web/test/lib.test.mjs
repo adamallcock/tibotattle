@@ -9230,3 +9230,186 @@ test("divergence window-breakdown client sends bounded integers and degrades on 
   });
   assert.equal((await oldClient.windowBreakdown(100, 200)).status, "unavailable");
 });
+
+// The hourly usage chart was reported clipped at the bottom (x-axis and the
+// foot of the lines hidden by the shell). At this revision it is not clipped:
+// the SVG takes its height from the drawing's own ratio and the shell grows to
+// fit, so nothing is letterboxed or clipped. A future edit that pins a fixed
+// pixel height, or lets the CSS ratio drift from the viewBox height lineChart
+// draws at, would bring the clip back — this pins the contract instead.
+test("Trends usage chart sizes from its aspect ratio, never a fixed pixel height", async () => {
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+
+  const svgBlock = styles.match(/\.chart-shell svg \{([\s\S]*?)\}/u)?.[1] ?? "";
+  assert.match(svgBlock, /height: auto;/u, "the shell SVG height is derived, not pinned");
+  assert.doesNotMatch(svgBlock, /height: \d+px/u, "a fixed pixel height reinstates the letterbox/clip");
+  const timelineRatio = svgBlock.match(/aspect-ratio: 900 \/ (\d+)/u)?.[1];
+  assert.ok(timelineRatio, "the timeline chart shell declares an aspect ratio");
+  const compactRatio = styles
+    .match(/\.chart-shell\.compact-chart svg \{[^}]*aspect-ratio: 900 \/ (\d+)/u)?.[1];
+  assert.ok(compactRatio, "the compact chart shell declares an aspect ratio");
+
+  // The CSS ratio has to stay in step with the viewBox height each chart is
+  // drawn at, or the SVG is scaled to a box of the wrong shape and clips.
+  const timelineHeight = appSource.match(/const TIMELINE_CHART_HEIGHT = (\d+);/u)?.[1];
+  const compactHeight = appSource.match(/const COMPACT_CHART_HEIGHT = (\d+);/u)?.[1];
+  assert.equal(timelineRatio, timelineHeight, "timeline aspect-ratio matches TIMELINE_CHART_HEIGHT");
+  assert.equal(compactRatio, compactHeight, "compact aspect-ratio matches COMPACT_CHART_HEIGHT");
+});
+
+// The "Show this window's cost mix" button was reported inert. The button
+// expands the period, reprices just that window through the companion, and —
+// when the companion cannot answer (an older route, or the accounting cache
+// still rebuilding) — states that honestly rather than doing nothing. This
+// pins the whole chain so a refactor cannot quietly return it to a dead click.
+test("Trends cost-mix toggle expands and degrades honestly when repricing is unavailable", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const localization = await readFile(new URL("../public/localization.js", import.meta.url), "utf8");
+
+  // The click handler toggles the panel and, only on expand, loads the mix.
+  assert.match(appSource, /toggle\.addEventListener\("click", \(\) => \{/u);
+  assert.match(appSource, /panel\.hidden = open;/u);
+  assert.match(appSource, /if \(!open\) loadBreakdown\(\);/u);
+  // Loading reprices the exact window; any failure is caught, not swallowed
+  // into a no-op.
+  assert.match(
+    appSource,
+    /breakdown = await localClient\.windowBreakdown\(period\.startMs, period\.endMs\);/u,
+  );
+  assert.match(appSource, /\} catch \{\s*breakdown = null;\s*\}/u);
+  // A null or non-available breakdown renders an explicit unavailable state,
+  // never an empty panel.
+  assert.match(appSource, /if \(!breakdown \|\| breakdown\.status !== "available"\)/u);
+  assert.match(appSource, /"divergence\.breakdown\.unavailable"/u);
+  assert.match(appSource, /"divergence\.breakdown\.unavailablePlain"/u);
+  // The honest-state copy exists in every locale.
+  for (const key of ["divergence.breakdown.unavailable", "divergence.breakdown.unavailablePlain"]) {
+    const row = localization.match(
+      new RegExp(`"${key.replace(/\./gu, "\\.")}": \\[([\\s\\S]*?)\\]`, "u"),
+    )?.[1];
+    assert.ok(row, `${key} is defined`);
+    assert.equal(
+      (row.match(/"/gu) ?? []).length,
+      6,
+      `${key} carries all three languages`,
+    );
+  }
+});
+
+// Owner polish (2026-08-11): the calibration legend used to stack three rows
+// high inside the right-aligned control column, and its seven entries all drew
+// the same line swatch, so the two plotted lines were not distinguishable from
+// the four shaded-window categories. It is a full-width row now, with square
+// swatches (the shape the bands take) for the area categories.
+test("Trends calibration legend is a full-width row with distinct line and area swatches", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+
+  assert.match(html, /class="legend calibration-legend"/u);
+  // The legend now sits below the heading controls, not inside them.
+  assert.ok(
+    html.indexOf("calibration-legend") > html.indexOf('id="timeline-reset-zoom"'),
+    "the legend follows the chart controls rather than nesting in them",
+  );
+  assert.ok(
+    html.indexOf("calibration-legend") < html.indexOf('id="timeline-empty"'),
+    "the legend precedes the chart body",
+  );
+  // The two line series keep a stroke swatch; the four exclusion categories
+  // carry the `area` class that renders a filled square.
+  assert.match(html, /<i class="legend-dot observed">/u);
+  assert.match(html, /<i class="legend-dot expected">/u);
+  assert.doesNotMatch(html, /legend-dot area (?:observed|expected)/u);
+  for (const status of ["missing", "reset", "ambiguous", "saturated"]) {
+    assert.match(
+      html,
+      new RegExp(`<i class="legend-dot area chart-status-${status}">`, "u"),
+      `${status} swatch is an area square`,
+    );
+  }
+  assert.match(styles, /\.legend-dot\.area \{[^}]*width: 12px;[^}]*height: 12px;/u);
+  assert.match(styles, /\.calibration-legend \{[^}]*width: 100%;/u);
+  assert.match(styles, /\.legend-group-sep \{/u);
+});
+
+// Owner polish (2026-08-11): "Missing quota bracket" and "Movement needs
+// context" shared one grey, so a shaded region could not be mapped back to its
+// exclusion. Each of the four exclusion categories now owns a distinct hue, and
+// the legend swatch carries the same hue as the band it keys.
+test("Trends exclusion bands and legend swatches use four distinct, matching hues", async () => {
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  const names = ["missing", "reset", "ambiguous", "saturated"];
+  const bandHue = (name) =>
+    styles.match(new RegExp(`\\.chart-status-${name} \\{ fill: rgba\\((\\d+, \\d+, \\d+)`, "u"))?.[1];
+  const swatchHue = (name) =>
+    styles.match(new RegExp(`\\.legend-dot\\.chart-status-${name} \\{ background: rgba\\((\\d+, \\d+, \\d+)`, "u"))?.[1];
+
+  const bands = names.map(bandHue);
+  const swatches = names.map(swatchHue);
+  assert.ok(bands.every(Boolean), "every exclusion band declares an rgb fill");
+  assert.ok(swatches.every(Boolean), "every legend swatch declares an rgb background");
+  assert.equal(new Set(bands).size, 4, "the four exclusion bands use four distinct hues");
+  assert.equal(new Set(swatches).size, 4, "the four legend swatches use four distinct hues");
+  for (let index = 0; index < names.length; index += 1) {
+    assert.equal(
+      swatches[index],
+      bands[index],
+      `the ${names[index]} legend swatch matches its on-chart band hue`,
+    );
+  }
+});
+
+// Owner polish (2026-08-11): verify the allowance-exhausted band is wired, not
+// silently broken — the owner never pegged their pool, so they see no such
+// band, and this proves it renders (with the saturated class the CSS colours
+// rust) the moment a pool_saturated window is present.
+test("timeline status bands render one shaded rect per exclusion, including allowance-exhausted", async () => {
+  const documentRef = new FakeSvgDocument(900);
+  const { lineChart, CHART_POINT_STYLE } = await loadLineChartRenderer(documentRef);
+  const base = Date.UTC(2026, 0, 1);
+  const hour = 3_600_000;
+  const at = (index) => base + index * hour;
+  const points = [0, 1, 2, 3, 4].map((index) => ({
+    timestamp: new Date(at(index)).toISOString(),
+    value: index,
+  }));
+  const svg = lineChart({
+    points,
+    series: [{
+      key: "value",
+      className: "chart-line-observed",
+      label: { key: "series.observed" },
+      pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+    }],
+    title: { key: "chart.title" },
+    description: { key: "chart.description" },
+    yLabel: { key: "chart.yLabel" },
+    statusIntervals: [
+      { status: "missing_quota_bracket", startMs: at(0), endMs: at(1) },
+      { status: "reset_or_track_change", startMs: at(1), endMs: at(2) },
+      { status: "backward_or_ambiguous", startMs: at(2), endMs: at(3) },
+      { status: "pool_saturated", startMs: at(3), endMs: at(4) },
+    ],
+  });
+  assert.equal(svg.querySelectorAll("rect.chart-status-missing").length, 1);
+  assert.equal(svg.querySelectorAll("rect.chart-status-reset").length, 1);
+  assert.equal(svg.querySelectorAll("rect.chart-status-ambiguous").length, 1);
+  assert.equal(
+    svg.querySelectorAll("rect.chart-status-saturated").length,
+    1,
+    "a pool_saturated window draws the allowance-exhausted band",
+  );
+});
+
+// Owner polish (2026-08-11): the five calibration summary tiles laid out
+// four-across with a lone orphan beneath. An auto-fit grid distributes them
+// evenly (five across, or three-plus-two when narrower) and the two tiles under
+// the hourly chart still sit side by side.
+test("Trends calibration summary tiles wrap evenly with an auto-fit grid", async () => {
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  const block = styles.match(/\.chart-summary-grid \{([\s\S]*?)\}/u)?.[1] ?? "";
+  assert.match(block, /display: grid;/u);
+  assert.match(block, /grid-template-columns: repeat\(auto-fit, minmax\(180px, 1fr\)\);/u);
+  assert.doesNotMatch(block, /flex: 1 1 200px/u, "the four-plus-one flex fallback is gone");
+});
