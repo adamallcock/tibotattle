@@ -11,17 +11,25 @@ on:
   workflow_dispatch:
 
 # The scanner reports in the job log and fails on vulnerabilities. SARIF
-# upload is intentionally disabled, so no security-events:write permission is
-# needed (which also keeps this usable in private repositories).
+# upload stays disabled via the upload-sarif input, but the called reusable
+# workflow DECLARES actions:read + security-events:write at its top level,
+# and GitHub refuses at startup ("No jobs were run") when a caller grants
+# less than the callee declares — every run since this file landed failed
+# that way. The grants below match the declaration; with upload-sarif false
+# nothing is ever written to security-events.
 permissions:
+  actions: read
   contents: read
+  security-events: write
 
 jobs:
   osv:
     name: Scan committed dependency locks
     uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
     permissions:
+      actions: read
       contents: read
+      security-events: write
     with:
       upload-sarif: false
       fail-on-vuln: true
