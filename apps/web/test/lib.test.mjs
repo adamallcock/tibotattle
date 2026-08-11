@@ -7188,14 +7188,21 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
     assert.match(appSource, new RegExp(`${code}:`, "u"));
   }
   // Reporting a connect failure is its own function now, so the one-use
-  // hosted proof handling is asserted where it lives.
+  // hosted proof handling is asserted where it lives. The proof is consumed by
+  // the ceremony the instant enroll is attempted (consume-once), so the fresh-
+  // sign-in verdict keys on the attempt-without-establishment alone and no
+  // longer on the proof still being present — after the drop it always is null.
   const connectFailure = appSource.match(
     /async function reportContributionConnectFailure\([\s\S]*?\n\}\n/u,
   )?.[0];
   assert.ok(connectFailure, "the connect failure reporter is available");
   assert.match(
     connectFailure,
-    /const retryNeedsFreshSignIn = enrollmentAttemptedWithHostedIdentity\s*\n\s*&& !enrollmentEstablished\s*\n\s*&& hostedIdentity !== null;/u,
+    /const retryNeedsFreshSignIn = enrollmentAttemptedWithHostedIdentity\s*\n\s*&& !enrollmentEstablished;/u,
+  );
+  assert.doesNotMatch(
+    connectFailure,
+    /retryNeedsFreshSignIn = enrollmentAttemptedWithHostedIdentity[\s\S]*?hostedIdentity !== null;/u,
   );
   assert.match(
     connectFailure,
@@ -8916,10 +8923,14 @@ test("a pairing mint that 401s inside the cookie-commit window retries and keeps
   );
   const state = scope.state();
   assert.equal(state.communitySession?.csrfToken, "fresh-csrf", "the fresh session is kept");
-  assert.deepEqual(
+  // The one-use proof is dropped the instant enroll is attempted (consume-once,
+  // 2026-08-11), and the cookie-commit mint retry rides the SESSION, never the
+  // proof. So the race is survived by the fresh session, not by a lingering
+  // proof — and a lingering proof is exactly what a re-entry would have re-sent.
+  assert.equal(
     state.hostedIdentity,
-    { provider: "google", proof, verifier },
-    "the identity proof survives the race",
+    null,
+    "the one-use proof is consumed and dropped, so nothing can re-enroll it",
   );
   assert.equal(state.communityDevicePairedV1, true, "the retried mint completes the pairing");
   assert.equal(state.incrementalConsentApproved, true, "approval is untouched");
@@ -8971,6 +8982,230 @@ test("the sign-in gate fires only for a dead stored session and always records a
     harness.elements("#incremental-consent-status").localizedKeys
       .includes("consent.signInAgainToFinish"),
   );
+});
+
+test("a cookie-race resume spends the load's one automatic ceremony, so an auto-repair cannot re-enroll the consumed proof", async () => {
+  // The exact owner-reported two-note failure (2026-08-11): a post-sign-in
+  // resume enrolls (consuming the one-use proof) and then the cookie-commit
+  // mint keeps coming back AUTH_REQUIRED until the bounded retry gives up —
+  // that is note one, an honest AUTH_REQUIRED. Its finally re-render used to let
+  // the guarded auto-repair start a SECOND ceremony ~69ms later that re-enrolled
+  // the now-dead proof and drew IDENTITY_TOKEN_INVALID — note two. The resume now
+  // spends the single-attempt budget the repair guards, so the second ceremony
+  // never starts.
+  const proof = "a".repeat(64);
+  const verifier = "v".repeat(64);
+  const harness = {
+    identity: { provider: "google", proof, verifier },
+    session: { csrfToken: "stale-csrf", participantId: "old", consentVersion: null },
+    approved: true,
+    grantRejected: true,
+    responses: [
+      {
+        status: 200,
+        payload: {
+          schemaVersion: "participant-bootstrap-v0.1",
+          csrfToken: "fresh-csrf",
+          participantId: "participant-1",
+        },
+      },
+      // The cookie never commits inside the window: every bounded mint attempt
+      // is rejected, so the ceremony gives up at the mint with an honest note.
+      { status: 401, payload: { error: { code: "AUTH_REQUIRED" } } },
+      { status: 401, payload: { error: { code: "AUTH_REQUIRED" } } },
+      { status: 401, payload: { error: { code: "AUTH_REQUIRED" } } },
+      { status: 401, payload: { error: { code: "AUTH_REQUIRED" } } },
+    ],
+  };
+  const scope = await loadContributionCeremony(harness);
+  scope.resumeContributionCeremonyAfterSignIn();
+  await settleCeremony(scope, harness, { untilFetchCount: 5 });
+
+  // The single automatic attempt was spent by the resume itself.
+  assert.equal(scope.state().incrementalRepairAttempted, true);
+  // Simulate the finally-render's auto-repair plus a couple of spurious
+  // reactivations: every one is a no-op now.
+  scope.maybeRepairIncrementalAuthorization();
+  scope.maybeRepairIncrementalAuthorization();
+  await new Promise((resolveWait) => setTimeout(resolveWait, 60));
+
+  // Exactly one enroll, ever — the one-use proof reached the wire once.
+  assert.equal(
+    harness.fetchCalls.filter((call) => call.url === "/api/v1/enroll").length,
+    1,
+    "the one-use proof is enrolled exactly once",
+  );
+  // The wire is enroll + the bounded mint retries, all under the FRESH session,
+  // and never a second enroll.
+  assert.deepEqual(
+    harness.fetchCalls.map((call) => [call.url, call.csrf]),
+    [
+      ["/api/v1/enroll", null],
+      ["/api/v1/me/device-pairings", "fresh-csrf"],
+      ["/api/v1/me/device-pairings", "fresh-csrf"],
+      ["/api/v1/me/device-pairings", "fresh-csrf"],
+      ["/api/v1/me/device-pairings", "fresh-csrf"],
+    ],
+  );
+  // One honest AUTH_REQUIRED note, and NO IDENTITY_TOKEN_INVALID note — the
+  // second-enroll failure that used to fire is gone.
+  const connectNotes = (harness.describeFailures ?? []).filter(
+    (entry) => entry.surface === "contribution_connect",
+  );
+  assert.equal(connectNotes.length, 1, "exactly one connect note");
+  assert.equal(connectNotes[0].code, "AUTH_REQUIRED");
+  assert.ok(
+    !connectNotes.some((entry) => entry.code === "IDENTITY_TOKEN_INVALID"),
+    "no dead-proof re-enroll note ever fires",
+  );
+  // The proof is dropped; the fresh session is kept for the next explicit try.
+  const state = scope.state();
+  assert.equal(state.hostedIdentity, null, "the consumed proof is dropped");
+  assert.equal(state.communitySession?.csrfToken, "fresh-csrf");
+  assert.equal(state.communityDevicePairedV1, false);
+});
+
+test("consume-once: a second ceremony after a consumed proof mints with the session and never re-enrolls", async () => {
+  // Even if a second ceremony DOES run after the proof was consumed (here the
+  // explicit Review-and-approve button, which is deliberately never gated by
+  // the auto-attempt budget), it must take the session-only mint path — the
+  // dropped proof can never be re-sent.
+  const proof = "a".repeat(64);
+  const verifier = "v".repeat(64);
+  const harness = {
+    identity: { provider: "google", proof, verifier },
+    session: { csrfToken: "stale-csrf", participantId: "old", consentVersion: null },
+    approved: true,
+    grantRejected: true,
+    responses: [
+      {
+        status: 200,
+        payload: {
+          schemaVersion: "participant-bootstrap-v0.1",
+          csrfToken: "fresh-csrf",
+          participantId: "participant-1",
+        },
+      },
+      // The first ceremony's mint never gets its cookie and gives up.
+      { status: 401, payload: { error: { code: "AUTH_REQUIRED" } } },
+      { status: 401, payload: { error: { code: "AUTH_REQUIRED" } } },
+      { status: 401, payload: { error: { code: "AUTH_REQUIRED" } } },
+      { status: 401, payload: { error: { code: "AUTH_REQUIRED" } } },
+      // The second ceremony's mint, once the cookie has landed, succeeds — and
+      // it is a mint, not an enroll.
+      { status: 201, payload: { pairingCode: "pc-1" } },
+    ],
+  };
+  const scope = await loadContributionCeremony(harness);
+  scope.resumeContributionCeremonyAfterSignIn();
+  await settleCeremony(scope, harness, { untilFetchCount: 5 });
+
+  // The proof was consumed by the first (failed) ceremony.
+  assert.equal(scope.state().hostedIdentity, null, "proof dropped after the first enroll");
+  assert.equal(scope.state().communityDevicePairedV1, false);
+
+  // The explicit button starts a second ceremony; with no proof in hand it
+  // mints under the established session.
+  scope.approveIncrementalContribution();
+  await settleCeremony(scope, harness, { untilFetchCount: 6 });
+
+  assert.equal(
+    harness.fetchCalls.filter((call) => call.url === "/api/v1/enroll").length,
+    1,
+    "still exactly one enroll — the second ceremony did not re-enroll",
+  );
+  const last = harness.fetchCalls[harness.fetchCalls.length - 1];
+  assert.equal(last.url, "/api/v1/me/device-pairings", "the second ceremony minted");
+  assert.equal(last.csrf, "fresh-csrf", "it minted under the established session, not the proof");
+  assert.equal(scope.state().communityDevicePairedV1, true, "the session-only mint pairs the Mac");
+  assert.deepEqual(harness.localCalls, [{ pairContributionDevice: "pc-1" }]);
+});
+
+test("a genuinely dead proof surfaces sign-in-again once and never retries the dead proof", async () => {
+  const proof = "a".repeat(64);
+  const verifier = "v".repeat(64);
+  const requestId = "33333333-3333-4333-8333-333333333333";
+  const harness = {
+    identity: { provider: "google", proof, verifier },
+    session: { csrfToken: "stale-csrf", participantId: "old", consentVersion: null },
+    approved: true,
+    grantRejected: true,
+    responses: [
+      // The very first use of the proof is refused: the auth code was already
+      // spent or invalid. This is a verdict on the proof, not the session.
+      { status: 401, payload: { error: { code: "IDENTITY_TOKEN_INVALID", requestId } } },
+    ],
+  };
+  const scope = await loadContributionCeremony(harness);
+  scope.resumeContributionCeremonyAfterSignIn();
+  await settleCeremony(scope, harness, { untilFetchCount: 1 });
+
+  // The proof reached the wire exactly once, and nothing minted after it.
+  assert.deepEqual(
+    harness.fetchCalls.map((call) => call.url),
+    ["/api/v1/enroll"],
+    "the dead proof is enrolled once and never a mint or a second enroll",
+  );
+  // The proof is dropped and the honest note is filed with the real code.
+  assert.equal(scope.state().hostedIdentity, null, "the dead proof is dropped");
+  const note = (harness.describeFailures ?? []).find(
+    (entry) => entry.surface === "contribution_connect",
+  );
+  assert.ok(note, "the dead proof is referenced in a diagnostics note");
+  assert.equal(note.code, "IDENTITY_TOKEN_INVALID");
+  assert.equal(note.requestId, requestId);
+  // The one honest next step is a fresh sign-in — not a silent retry.
+  assert.ok(
+    harness.elements("#incremental-consent-status").localizedKeys
+      .includes("contribution.signInDiscarded"),
+    "the next step is a fresh sign-in",
+  );
+
+  // No retry loop: the resume spent the load's automatic attempt, so a repair
+  // (or a reactivation) cannot re-send the dead proof.
+  assert.equal(scope.state().incrementalRepairAttempted, true);
+  scope.maybeRepairIncrementalAuthorization();
+  await new Promise((resolveWait) => setTimeout(resolveWait, 60));
+  assert.equal(harness.fetchCalls.length, 1, "the dead proof is never retried");
+});
+
+test("two concurrent ceremony invocations run exactly once", async () => {
+  // The single-flight guard is the synchronous incrementalConsentBusy flag, set
+  // before the first await. Two invocations in the same tick therefore
+  // serialize: the second sees the flag and is a no-op.
+  const proof = "a".repeat(64);
+  const verifier = "v".repeat(64);
+  const harness = {
+    identity: { provider: "google", proof, verifier },
+    session: { csrfToken: "stale-csrf", participantId: "old", consentVersion: null },
+    approved: true,
+    grantRejected: true,
+    responses: [
+      {
+        status: 200,
+        payload: {
+          schemaVersion: "participant-bootstrap-v0.1",
+          csrfToken: "fresh-csrf",
+          participantId: "participant-1",
+        },
+      },
+      { status: 201, payload: { pairingCode: "pc-1" } },
+    ],
+  };
+  const scope = await loadContributionCeremony(harness);
+  // Fire twice in the same tick — the second must be a no-op.
+  scope.approveIncrementalContribution();
+  scope.approveIncrementalContribution();
+  await settleCeremony(scope, harness, { untilFetchCount: 2 });
+  await new Promise((resolveWait) => setTimeout(resolveWait, 40));
+
+  assert.deepEqual(
+    harness.fetchCalls.map((call) => call.url),
+    ["/api/v1/enroll", "/api/v1/me/device-pairings"],
+    "exactly one enroll and one mint — the second invocation did nothing",
+  );
+  assert.equal(scope.state().communityDevicePairedV1, true);
+  assert.equal(scope.state().hostedIdentity, null);
 });
 
 test("the merged identity status renders the right label and one next action per state", async () => {

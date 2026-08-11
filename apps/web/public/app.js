@@ -9213,11 +9213,26 @@ async function approveIncrementalContribution() {
         // that can carry the v1.0 consent (2026-08-08).
         enrollmentAttemptedWithHostedIdentity = hostedIdentity !== null;
         pairing = await contributionConnectStep("hosted_enrollment", status, async () => {
-          const enrollment = await communityClient.enroll(
-            null,
-            "telemetry-contribution-v0.1",
-            { deviceBootstrap: false, identity: hostedIdentity }
-          );
+          let enrollment;
+          try {
+            enrollment = await communityClient.enroll(
+              null,
+              "telemetry-contribution-v0.1",
+              { deviceBootstrap: false, identity: hostedIdentity }
+            );
+          } finally {
+            // Consume the one-use proof the instant enroll has been ATTEMPTED
+            // with it — success or failure. A hosted proof is a single-use
+            // provider authorization code; the moment it reaches the wire it is
+            // dead, so it is dropped here and can never be re-sent by a
+            // re-entry, an auto-resume, or an auto-repair. Everything after this
+            // point that still needs authority uses the SESSION the enroll
+            // established (the cookie-commit mint retry below), never the proof.
+            // This is what stops a second ceremony execution from re-enrolling a
+            // consumed proof and drawing IDENTITY_TOKEN_INVALID (owner-reported
+            // two-note failure, 2026-08-11).
+            hostedIdentity = null;
+          }
           if (enrollment?.schemaVersion !== "participant-bootstrap-v0.1"
               || typeof enrollment?.csrfToken !== "string") {
             const error = new Error(
@@ -9386,6 +9401,17 @@ function resumeContributionCeremonyAfterSignIn() {
   if (!incrementalSyncCapabilityAdvertised()) return;
   if (!incrementalConsentApproved || !incrementalUploadAuthorityLost()) return;
   if (incrementalConsentBusy || communityConnectBusy) return;
+  // A post-sign-in resume IS this load's one automatic ceremony, so it spends
+  // the same single-attempt budget maybeRepairIncrementalAuthorization guards.
+  // Without this, a resume that consumed its one-use proof and then hit the
+  // cookie-commit mint race would re-render in its finally, and the guarded
+  // auto-repair — seeing an approved Mac whose authority is still lost and a
+  // held session — would start a SECOND ceremony 69ms later that re-enrolled
+  // the now-dead proof and drew IDENTITY_TOKEN_INVALID (owner-reported two-note
+  // failure, 2026-08-11). One automatic ceremony per load, whichever entry
+  // point starts it; the explicit Review-and-approve button is never gated by
+  // this budget.
+  incrementalRepairAttempted = true;
   void approveIncrementalContribution();
 }
 
@@ -9706,9 +9732,15 @@ async function reportContributionConnectFailure(status, error, {
     return;
   }
   const step = contributionConnectStepOf(error);
+  // The one-use proof is already dropped by the ceremony the instant enroll is
+  // attempted (consume-once), so this no longer keys off hostedIdentity still
+  // being present — after the drop that is always false. "Enroll was attempted
+  // with a proof and never established a session" is exactly a dead proof: the
+  // one honest next step is a fresh sign-in, never a retry with the consumed
+  // one. The redundant clear + re-render below keeps the identity card's state
+  // truthful even if a caller reached here by another path.
   const retryNeedsFreshSignIn = enrollmentAttemptedWithHostedIdentity
-    && !enrollmentEstablished
-    && hostedIdentity !== null;
+    && !enrollmentEstablished;
   if (retryNeedsFreshSignIn) {
     hostedIdentity = null;
     renderHostedIdentity();
