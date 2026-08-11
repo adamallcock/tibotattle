@@ -56,6 +56,15 @@ export const KNOWN_AGENT_SCOPES = new Set(["root", "subagent", "automation", "un
 export const KNOWN_LINEAGE = new Set(["standalone", "forked", "parent_linked", "unknown"]);
 export const KNOWN_TOOL_CLASSES = new Set(["apply_patch", "local_shell", "other", "subagent", "tool_gateway"]);
 export const KNOWN_LIMITS = new Set(["codex", "codex_bengalfox", "codex-spark"]);
+// The Spark allowance's provider limit id as it actually occurs in rollout
+// logs and the unified index ("codex_bengalfox", first because it is the only
+// one observed to date), plus the marketing token ("codex-spark") the export
+// registry reserves in case the provider stabilizes on it later. Querying
+// only the marketing token left the sparkQuota series permanently empty.
+export const SPARK_QUOTA_LIMIT_IDS = Object.freeze([
+  "codex_bengalfox",
+  "codex-spark",
+]);
 export const KNOWN_PLANS = new Set(TELEMETRY_PLAN_TYPES);
 export const KNOWN_SLOTS = new Set(["primary", "secondary"]);
 export const TIMELINE_BUCKET_MS = 15 * 60 * 1_000;
@@ -77,12 +86,68 @@ export function quotaResetIsoInstant(value) {
 
 export function deterministicSample(rows, maximum = MAX_DATASET_ROWS) {
   if (rows.length <= maximum) return rows;
+  if (maximum <= 0) return [];
+  if (maximum === 1) return [rows[0]];
   const sampled = [];
   const last = rows.length - 1;
   for (let index = 0; index < maximum; index += 1) {
     sampled.push(rows[Math.round((index * last) / (maximum - 1))]);
   }
   return sampled;
+}
+
+function quotaTimelineTrackKey(row) {
+  return `${row.limitId}:${row.durationMinutes ?? "unknown"}`;
+}
+
+function quotaTimelineOrderCompare(left, right) {
+  return left.observedEpochMs - right.observedEpochMs
+    || left.row.limitId.localeCompare(right.row.limitId)
+    || left.row.durationMinutes - right.row.durationMinutes
+    || left.row.slot.localeCompare(right.row.slot)
+    || left.row.planType.localeCompare(right.row.planType)
+    || left.row.usedPercent - right.row.usedPercent;
+}
+
+/**
+ * Thin a quota series to the payload ceiling without letting one dense track
+ * starve another. Sampling the combined series by row index looked uniform
+ * but was not: a consumer that then filters to one track (weekly versus
+ * five-hour) inherits whatever uneven residue of that track survived the
+ * combined thinning — measured as whole recent days losing every usable
+ * calibration window. Each track is therefore thinned independently under a
+ * fair share of the same total ceiling: tracks that fit keep every row and
+ * their surplus flows to the dense tracks, so the overall payload bound (and
+ * the size rationale behind it) is preserved exactly.
+ */
+export function sampleQuotaTimelineByTrack(rows, maximum = MAX_QUOTA_TIMELINE_POINTS) {
+  if (rows.length <= maximum) return rows;
+  const tracks = new Map();
+  for (const row of rows) {
+    const key = quotaTimelineTrackKey(row);
+    const group = tracks.get(key) ?? [];
+    group.push(row);
+    tracks.set(key, group);
+  }
+  const groups = [...tracks.entries()]
+    .sort((left, right) => (
+      left[1].length - right[1].length || left[0].localeCompare(right[0])
+    ))
+    .map(([, group]) => group);
+  let remaining = maximum;
+  let tracksLeft = groups.length;
+  const sampled = [];
+  for (const group of groups) {
+    const budget = Math.max(1, Math.floor(remaining / tracksLeft));
+    const take = Math.min(group.length, budget);
+    sampled.push(...deterministicSample(group, take));
+    remaining -= take;
+    tracksLeft -= 1;
+  }
+  return sampled
+    .map((row) => ({ row, observedEpochMs: Date.parse(row.observedAt) }))
+    .sort(quotaTimelineOrderCompare)
+    .map(({ row }) => row);
 }
 
 export function emptyComponents() {
@@ -533,26 +598,38 @@ export function orderQuotaWindows(windows) {
 }
 
 function quotaTimelineRowTieBreak(row) {
+  // Percent is zero-padded so the string compare is numeric: between two
+  // same-instant readings of one track the lower displayed percentage wins.
+  // Slot is deliberately LAST: it is display provenance, not identity, and
+  // only breaks the tie when the state is otherwise identical so dedupe
+  // stays order-independent.
   return [
     row.planType,
-    row.usedPercent.toFixed(3),
+    row.usedPercent.toFixed(3).padStart(7, "0"),
     row.resetAt,
     row.accountAttribution,
+    row.slot,
   ].join("\0");
 }
 
 export function finalizeQuotaTimeline(rows) {
+  // Quota track identity is (limitId, duration). The provider's
+  // primary/secondary slots are server-assigned UI roles — the weekly
+  // 10080-minute window flipped from `secondary` to `primary` around
+  // 2026-07-06 — so slot never participates in track identity or sorts ahead
+  // of the duration; it stays on the row as display provenance and acts only
+  // as a trailing deterministic tie-break.
   rows.sort((left, right) => (
     Date.parse(left.observedAt) - Date.parse(right.observedAt)
     || left.limitId.localeCompare(right.limitId)
-    || left.slot.localeCompare(right.slot)
     || left.durationMinutes - right.durationMinutes
+    || left.slot.localeCompare(right.slot)
     || left.planType.localeCompare(right.planType)
     || left.usedPercent - right.usedPercent
   ));
   const points = new Map();
   for (const row of rows) {
-    const track = `${row.limitId}:${row.slot}:${row.durationMinutes ?? "unknown"}`;
+    const track = `${row.limitId}:${row.durationMinutes ?? "unknown"}`;
     const observedMs = Date.parse(row.observedAt);
     const key = `${track}:${observedMs}`;
     const prior = points.get(key);
@@ -561,12 +638,15 @@ export function finalizeQuotaTimeline(rows) {
       points.set(key, row);
     }
   }
-  return deterministicSample(
+  // Thinning is per track under the shared ceiling: an index-uniform sample
+  // of the combined series silently starves whichever track a consumer
+  // filters down to (see sampleQuotaTimelineByTrack).
+  return sampleQuotaTimelineByTrack(
     [...points.values()].sort((left, right) => (
       Date.parse(left.observedAt) - Date.parse(right.observedAt)
       || left.limitId.localeCompare(right.limitId)
-      || left.slot.localeCompare(right.slot)
       || left.durationMinutes - right.durationMinutes
+      || left.slot.localeCompare(right.slot)
       || left.planType.localeCompare(right.planType)
       || left.usedPercent - right.usedPercent
     )),

@@ -35,6 +35,7 @@ import {
   quotaWindowProjection,
   safeSpeed,
   safeSpeedWeighting,
+  SPARK_QUOTA_LIMIT_IDS,
   TIMELINE_BUCKET_MS,
   usageProjection,
   validObservedAt,
@@ -843,7 +844,10 @@ async function readCollectorProjection(
         quotaTimeline.filter((row) => row.limitId === "codex"),
       ),
       sparkQuota: finalizeQuotaTimeline(
-        quotaTimeline.filter((row) => row.limitId === "codex-spark"),
+        // The Spark limit is reported as `codex_bengalfox` in practice;
+        // `codex-spark` is the reserved marketing token. Match both so the
+        // series cannot be permanently empty against real captures.
+        quotaTimeline.filter((row) => SPARK_QUOTA_LIMIT_IDS.includes(row.limitId)),
       ),
     },
     recordCounts,

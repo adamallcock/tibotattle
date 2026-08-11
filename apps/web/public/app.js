@@ -3004,23 +3004,15 @@ function timelineStatusIntervals(points, viewport) {
   });
 }
 
+// The weekly track is identified by (limitId, duration) alone. The provider's
+// primary/secondary slots are server-assigned UI roles — the weekly window
+// flipped from `secondary` to `primary` around 2026-07-06 — so filtering by
+// slot here cut the entire pre-flip era out of the series. Distinct concurrent
+// instances stay separated downstream by their reset boundaries
+// (sameResetBoundary), and the local pipeline already emits at most one row
+// per (limitId, duration, instant).
 function mainWeeklyQuotaTrack(rows) {
-  const weeklyCodex = rows.filter(isPrimaryCodexWeeklyQuotaWindow);
-  if (!weeklyCodex.length) return [];
-  const primary = weeklyCodex.filter((row) => row.slot === "primary");
-  if (primary.length) return primary;
-  const bySlot = new Map();
-  for (const row of weeklyCodex) {
-    const slot = row.slot ?? "unknown";
-    const group = bySlot.get(slot) ?? [];
-    group.push(row);
-    bySlot.set(slot, group);
-  }
-  return [...bySlot.entries()]
-    .sort((left, right) => (
-      right[1].length - left[1].length
-      || left[0].localeCompare(right[0])
-    ))[0]?.[1] ?? [];
+  return rows.filter(isPrimaryCodexWeeklyQuotaWindow);
 }
 
 // The provider restates the same reset boundary with a slightly different
@@ -3064,6 +3056,16 @@ function liveTimelinePoints(
   const cutoff = timelineCutoffMs(data, rangeDays);
   const quota = mainWeeklyQuotaTrack(data.timeline.quota);
   const quotaLookup = createQuotaTimelineLookup(quota);
+  // Prefix sums over the usage buckets so a shrunken window (see the
+  // forward-recovery branch below) can integrate cost and events over exactly
+  // the span it actually measured, instead of scaling the full-window sums.
+  const usageEndsMs = usage.map((row) => Date.parse(row.endAt));
+  const costPrefix = new Float64Array(usage.length + 1);
+  const eventsPrefix = new Float64Array(usage.length + 1);
+  for (let index = 0; index < usage.length; index += 1) {
+    costPrefix[index + 1] = costPrefix[index] + usage[index].apiPriceEquivalentUsd;
+    eventsPrefix[index + 1] = eventsPrefix[index] + usage[index].usageEvents;
+  }
   const points = [];
   let startIndex = 0;
   let rollingCost = 0;
@@ -3095,29 +3097,89 @@ function liveTimelinePoints(
     }
     if (endMs < cutoff) continue;
     const startMs = endMs - windowMs;
-    const beforeMatch = quotaLookup.atOrBefore(startMs);
     const afterMatch = quotaLookup.atOrBefore(endMs);
-    const before = beforeMatch?.row ?? null;
-    const after = afterMatch?.row ?? null;
     const maximumBracketGapMs = Math.max(30 * 60 * 1_000, windowMs);
+    // The start edge prefers a backward observation, like the end edge. But
+    // backward-only matching poisons every window whose start edge falls in a
+    // collection silence (sleep or idle): the first ~windowMs of the next
+    // work session would reach back into the silence and be excluded even
+    // though observations exist just inside the window. When no backward
+    // match lands within the gap, anchor on the earliest observation inside
+    // the window instead and shrink the measured span to what the two
+    // observations actually cover; the cost-implied side below integrates
+    // the same shrunken span, so observed and expected stay commensurable.
+    // A recovered span needs TWO distinct observations: with a single one,
+    // the end anchor resolves to the same row as the start anchor, observed
+    // is zero by construction over a zero-length span, and any cost in the
+    // window would fabricate a negative residual nobody measured — so that
+    // window stays honestly unbracketed.
+    let startMatch = quotaLookup.atOrBefore(startMs);
+    let spanStartMs = startMs;
+    let spanEndMs = endMs;
+    let shrunkenSpan = false;
+    if (!(startMatch && startMs - startMatch.timestampMs <= maximumBracketGapMs)) {
+      const forwardMatch = quotaLookup.atOrAfter(startMs);
+      if (forwardMatch && forwardMatch.timestampMs < endMs
+          && afterMatch && afterMatch.timestampMs > forwardMatch.timestampMs) {
+        startMatch = forwardMatch;
+        spanStartMs = forwardMatch.timestampMs;
+        // Observed movement ends at the end-edge observation, not at the
+        // bucket boundary: integrate the expected side to the same instant.
+        spanEndMs = afterMatch.timestampMs;
+        shrunkenSpan = true;
+      } else {
+        startMatch = null;
+      }
+    }
+    const before = startMatch?.row ?? null;
+    const after = afterMatch?.row ?? null;
     const bracketed = before && after
-      && startMs - beforeMatch.timestampMs <= maximumBracketGapMs
+      && spanStartMs - startMatch.timestampMs <= maximumBracketGapMs
       && endMs - afterMatch.timestampMs <= maximumBracketGapMs;
     const sameReset = Boolean(bracketed)
       && sameResetBoundary(before.resetAt, after.resetAt);
     const observed = sameReset && after.usedPercent >= before.usedPercent
       ? after.usedPercent - before.usedPercent
       : null;
+    let windowCostUsd = Math.max(0, rollingCost);
+    let windowEvents = Math.max(0, rollingEvents);
+    if (shrunkenSpan) {
+      // Only the usage buckets ending inside the measured span count, so the
+      // expected line integrates the interval the observed delta covers —
+      // (spanStartMs, spanEndMs], both edges pinned to real observations.
+      let lower = startIndex;
+      let upper = index + 1;
+      while (lower < upper) {
+        const middle = lower + Math.floor((upper - lower) / 2);
+        if (usageEndsMs[middle] <= spanStartMs) {
+          lower = middle + 1;
+        } else {
+          upper = middle;
+        }
+      }
+      let top = lower;
+      let topUpper = index + 1;
+      while (top < topUpper) {
+        const middle = top + Math.floor((topUpper - top) / 2);
+        if (usageEndsMs[middle] <= spanEndMs) {
+          top = middle + 1;
+        } else {
+          topUpper = middle;
+        }
+      }
+      windowCostUsd = Math.max(0, costPrefix[top] - costPrefix[lower]);
+      windowEvents = Math.max(0, eventsPrefix[top] - eventsPrefix[lower]);
+    }
     const expected = capacity !== null && capacity > 0
-      ? rollingCost / capacity * 100
+      ? windowCostUsd / capacity * 100
       : null;
     const evidence = classifyTimelineEvidence({
       bracketed,
       sameReset,
       observed,
       expected,
-      usageEvents: rollingEvents,
-      apiCostUsd: rollingCost,
+      usageEvents: windowEvents,
+      apiCostUsd: windowCostUsd,
     });
     let cumulativeResidual = null;
     // A re-anchor marks the first drift observation of a new reset or track:
@@ -3150,8 +3212,12 @@ function liveTimelinePoints(
       residual: evidence.residual,
       cumulativeResidual,
       driftReanchor,
-      apiCostUsd: Math.max(0, rollingCost),
-      usageEvents: Math.max(0, rollingEvents),
+      apiCostUsd: windowCostUsd,
+      usageEvents: windowEvents,
+      // The span both lines actually integrate: the nominal window unless the
+      // start edge was recovered forward past a collection silence, in which
+      // case both edges sit on real observations.
+      measuredSpanMs: spanEndMs - spanStartMs,
       status: evidence.status,
     });
   }
@@ -3633,6 +3699,28 @@ function renderTimeline(data) {
   renderDivergencePeriods(data, points);
 }
 
+// The copy names each exclusion mechanism that actually fired, in classifier
+// order. A mechanism with zero windows is never mentioned, so the sentence
+// cannot claim ambiguity (or anything else) that did not occur.
+const TIMELINE_EXCLUSION_MESSAGE_KEYS = Object.freeze([
+  ["missing_quota_bracket", "dashboard.timeline.excludedMissingBracket"],
+  ["reset_or_track_change", "dashboard.timeline.excludedResetOrTrackChange"],
+  ["backward_or_ambiguous", "dashboard.timeline.excludedAmbiguousMovement"],
+]);
+
+function describeTimelineExclusions(activePoints) {
+  const counts = new Map();
+  for (const point of activePoints) {
+    if (point.observed !== null && point.expected !== null) continue;
+    counts.set(point.status, (counts.get(point.status) ?? 0) + 1);
+  }
+  const described = TIMELINE_EXCLUSION_MESSAGE_KEYS
+    .filter(([status]) => (counts.get(status) ?? 0) > 0)
+    .map(([status, key]) => tPlural(key, counts.get(status)))
+    .join(t("dashboard.timeline.exclusionJoin"));
+  return described === "" ? t("dashboard.timeline.noExclusions") : described;
+}
+
 function renderTimelineConfidence(allPoints, visiblePoints, usingLive, viewport) {
   const element = $("#timeline-confidence");
   const activePoints = visiblePoints.filter((point) => point.status !== "inactive");
@@ -3660,12 +3748,12 @@ function renderTimelineConfidence(allPoints, visiblePoints, usingLive, viewport)
   } else if (matched < 3) {
     setLocalizedText(element, "dashboard.timeline.lowConfidence", {
       visible: tPlural("dashboard.timeline.visibleWindow", matched),
-      excluded: tPlural("dashboard.timeline.excludedWindow", excluded),
+      excluded: describeTimelineExclusions(activePoints),
     });
   } else if (excluded > 0) {
     setLocalizedText(element, "dashboard.timeline.excludedShown", {
       shown: tPlural("dashboard.timeline.shownWindow", matched),
-      excluded: tPlural("dashboard.timeline.excludedWindow", excluded),
+      excluded: describeTimelineExclusions(activePoints),
     });
   } else {
     setLocalizedText(element, "dashboard.timeline.allMatched", {

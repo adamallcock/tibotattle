@@ -62,6 +62,10 @@ export class R7RealHistoryEligibilityError extends Error {
 
 const execFileAsync = promisify(execFile);
 const FIXED_CHILD_ENVIRONMENT = Object.freeze({ LANG: "C", LC_ALL: "C", TZ: "UTC" });
+// The measured export lifecycle holds its destination lock as a symlink; a
+// pass that dies while holding it leaves that one symlink behind, so the
+// failure-path cleanup must tolerate exactly this name to remove the tree.
+const TRANSIENT_EXPORT_LOCK_NAMES = Object.freeze([".app-usagemonitor-export.lock"]);
 const RUNTIME_QUERY = "JSON.stringify({version:process.versions.node,platform:process.platform,architecture:process.arch})";
 const EXECUTED_OPERATIONS = Object.freeze([
   "source_scan",
@@ -262,24 +266,36 @@ async function runMeasuredWorker(root, config, {
   sourceScan = false,
 }) {
   let operation = null;
+  let operationError = null;
   if (sourceScan && sourceScanInputBytes(config) > R7_WORKER_MAXIMUM_STDIN_BYTES) {
     throw new RangeError("R7 real-history private source-plan input exceeds 32 MiB");
   }
   const filesystem = await runR7FilesystemHighWaterSampler({
     root,
     maximumElapsedMs: timeoutMs,
-    allowedTransientSymlinkNames: [".app-usagemonitor-export.lock"],
+    allowedTransientSymlinkNames: TRANSIENT_EXPORT_LOCK_NAMES,
     allowTransientOwnedHardlinks: true,
     async operation() {
-      operation = await runR7BenchmarkWorker(config, {
-        timeoutMs,
-        runtimeExecutable,
-        ...(sourceScan ? { maximumStdinBytes: R7_WORKER_MAXIMUM_STDIN_BYTES } : {}),
-      });
+      // The sampler records only that the operation failed; keep the worker's
+      // own error here so the surfaced failure names the operation and cause
+      // instead of collapsing every worker death into "operation_failed".
+      try {
+        operation = await runR7BenchmarkWorker(config, {
+          timeoutMs,
+          runtimeExecutable,
+          ...(sourceScan ? { maximumStdinBytes: R7_WORKER_MAXIMUM_STDIN_BYTES } : {}),
+        });
+      } catch (error) {
+        operationError = error;
+        throw error;
+      }
     },
   });
   if (filesystem.outcome !== "completed") {
-    throw new Error(`R7 real-history filesystem sampling stopped: ${filesystem.outcome}`);
+    throw new Error(
+      `R7 real-history ${config.operation} filesystem sampling stopped: ${filesystem.outcome}`
+        + (operationError === null ? "" : `: ${operationError.message}`),
+    );
   }
   return aggregateMeasuredOperation(requireCompleted(operation), filesystem);
 }
@@ -468,6 +484,7 @@ export async function runR7RealHistoryEvidence({
   let root = null;
   let rootIdentity = null;
   let evidence;
+  let operativeError = null;
   try {
     const planningGuard = createExportResourceGuard({ scope: "export_set" });
     const sourcePlanBundle = await createExportSourcePlanBundle({
@@ -538,13 +555,30 @@ export async function runR7RealHistoryEvidence({
       rawDurableCopyCreated: false,
     };
     assertContentFree(evidence, secretHex);
+  } catch (error) {
+    operativeError = error;
   } finally {
     secret.fill(0);
     if (root !== null && rootIdentity !== null) {
-      const inventory = await inventoryR7OwnedTree(root);
-      await cleanupR7OwnedTree(root, inventory, rootIdentity);
+      try {
+        const inventory = await inventoryR7OwnedTree(root, {
+          allowedTransientSymlinkNames: TRANSIENT_EXPORT_LOCK_NAMES,
+        });
+        await cleanupR7OwnedTree(root, inventory, rootIdentity, {
+          allowedTransientSymlinkNames: TRANSIENT_EXPORT_LOCK_NAMES,
+        });
+      } catch (cleanupError) {
+        // A cleanup failure must never replace the benchmark's own error:
+        // that masking is how a failed pass used to surface only as
+        // "temporary inventory contained a symlink".
+        operativeError = operativeError === null ? cleanupError : new AggregateError(
+          [operativeError, cleanupError],
+          "R7 real-history cleanup failed after a benchmark error",
+        );
+      }
     }
   }
+  if (operativeError !== null) throw operativeError;
   assertContentFree(evidence, secretHex);
   return evidence;
 }

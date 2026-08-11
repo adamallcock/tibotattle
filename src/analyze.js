@@ -139,7 +139,17 @@ export function analyzeObservations(observations) {
       : "unattributed";
     const planVariant = typeof observation.planVariant === "string" ? observation.planVariant : "unknown";
     for (const window of observation.windows ?? []) {
-      const partitionKey = [accountScopeId, planVariant, window.identity].join("|");
+      // Recompute the partition from the window's own fields instead of the
+      // stored identity string: older captures embedded the provider's UI
+      // slot in `identity`, and the weekly window flipped secondary ->
+      // primary around 2026-07-06. Identity is (limit, duration, resetsAt).
+      const partitionKey = [
+        accountScopeId,
+        planVariant,
+        window.limitId,
+        window.windowDurationMins,
+        window.resetsAt,
+      ].join("|");
       const group = groups.get(partitionKey) ?? {
         identity: window.identity,
         accountScopeId,

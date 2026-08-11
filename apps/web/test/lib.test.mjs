@@ -873,6 +873,49 @@ test("quota timeline lookup preserves latest-at-or-before boundary semantics", (
   );
 });
 
+test("quota timeline lookup answers earliest-at-or-after boundary semantics", () => {
+  const rows = [
+    { id: "late", observedAt: "2026-07-29T03:00:00.000Z" },
+    { id: "first-at-duplicate", observedAt: "2026-07-29T02:00:00.000Z" },
+    { id: "early", observedAt: "2026-07-29T01:00:00.000Z" },
+    { id: "last-at-duplicate", observedAt: "2026-07-29T02:00:00.000Z" },
+  ];
+  const sorted = [...rows].sort(
+    (left, right) => Date.parse(left.observedAt) - Date.parse(right.observedAt),
+  );
+  const reference = (timestampMs) => {
+    for (const row of sorted) {
+      if (Date.parse(row.observedAt) >= timestampMs) return row;
+    }
+    return null;
+  };
+  const lookup = createQuotaTimelineLookup(rows);
+
+  for (const timestampMs of [
+    Number.NEGATIVE_INFINITY,
+    Date.parse("2026-07-29T00:59:59.999Z"),
+    Date.parse("2026-07-29T01:00:00.000Z"),
+    Date.parse("2026-07-29T01:59:59.999Z"),
+    Date.parse("2026-07-29T02:00:00.000Z"),
+    Date.parse("2026-07-29T02:59:59.999Z"),
+    Date.parse("2026-07-29T03:00:00.000Z"),
+    Number.POSITIVE_INFINITY,
+  ]) {
+    assert.strictEqual(
+      lookup.atOrAfter(timestampMs)?.row ?? null,
+      reference(timestampMs),
+    );
+  }
+  assert.strictEqual(
+    lookup.atOrAfter(Date.parse("2026-07-29T02:00:00.000Z"))?.row,
+    rows[1],
+    "the earliest source row wins when observations share a timestamp",
+  );
+  assert.equal(lookup.atOrAfter(Date.parse("2026-07-29T03:00:00.001Z")), null);
+  assert.equal(lookup.atOrAfter(Number.NaN), null);
+  assert.equal(createQuotaTimelineLookup([]).atOrAfter(0), null);
+});
+
 test("quota timeline lookup parses supported dashboard bounds only once", () => {
   const quotaRowCount = 10_000;
   const usagePointCount = 3_000;
@@ -5572,8 +5615,11 @@ test("live timeline uses the primary Codex weekly track and live weekly median f
     /rows\.filter\(isPrimaryCodexWeeklyQuotaWindow\)/u,
   );
   assert.doesNotMatch(trackSource, /row\.limitId|row\.durationMinutes/u);
-  assert.match(trackSource, /row\.slot === "primary"/u);
-  assert.match(trackSource, /if \(primary\.length\) return primary;/u);
+  // Track identity is (limitId, duration): the provider's primary/secondary
+  // slot is a server-assigned UI role that flipped for the weekly window
+  // around 2026-07-06, so the track must never be selected or grouped by
+  // slot — that filter cut the entire pre-flip era out of the series.
+  assert.doesNotMatch(trackSource, /row\.slot|bySlot/u);
 
   const liveMatch = appSource.match(
     /function liveTimelinePoints\([\s\S]*?\) \{([\s\S]*?)\n\}\n\nfunction groupedUsageTimeline/u,
@@ -8101,6 +8147,215 @@ test("cumulative drift sums non-overlapping buckets and re-anchors at each reset
     points.map((point) => point.cumulativeResidual),
     [0, 7, 4, 0, -4, -9, -14, -19, null],
   );
+});
+
+test("a window starting inside a collection silence anchors forward and shrinks to the measured span", async () => {
+  const liveTimelinePoints = await loadLiveTimelinePoints();
+  const hour = (index) => new Date(Date.UTC(2026, 7, 5, index)).toISOString();
+  const resetAt = "2026-08-10T00:00:00.000Z";
+  const quotaRow = (index, usedPercent) => ({
+    observedAt: hour(index),
+    limitId: "codex",
+    durationMinutes: 10_080,
+    slot: "primary",
+    usedPercent,
+    remainingPercent: 100 - usedPercent,
+    resetAt,
+  });
+  const data = {
+    weekly: { summary: { median_weekly_value_usd: 1_000 } },
+    gradient: { summary: {} },
+    timeline: {
+      usage: Array.from({ length: 9 }, (_, index) => ({
+        startAt: hour(index),
+        endAt: hour(index + 1),
+        apiPriceEquivalentUsd: 50,
+        usageEvents: 5,
+      })),
+      // Collection was silent until hour 5 (sleep/idle): the first
+      // observations of the work session sit INSIDE the early windows.
+      quota: [
+        quotaRow(5, 50),
+        quotaRow(6, 55),
+        quotaRow(7, 61),
+        quotaRow(8, 68),
+        quotaRow(9, 76),
+      ],
+    },
+  };
+  const points = liveTimelinePoints(data);
+  assert.equal(points.length, 9);
+  // Windows ending before any observation exists stay honestly excluded —
+  // recovery requires an observation strictly inside the window.
+  assert.deepEqual(
+    points.slice(0, 5).map((point) => point.status),
+    Array.from({ length: 5 }, () => "missing_quota_bracket"),
+  );
+  // Hour 6 (window hours 3..6): backward-only matching excluded this window;
+  // the forward anchor at hour 5 shrinks the span to one hour, and the
+  // expected side integrates that same hour — $50 of $1,000 is 5 pp against
+  // the observed 55−50 = 5 pp.
+  const recoveredOne = points[5];
+  assert.equal(recoveredOne.status, "matched");
+  assert.equal(recoveredOne.observed, 5);
+  assert.equal(recoveredOne.expected, 5);
+  assert.equal(recoveredOne.measuredSpanMs, 3_600_000);
+  assert.equal(recoveredOne.apiCostUsd, 50);
+  assert.equal(recoveredOne.usageEvents, 5);
+  // Hour 7 (window hours 4..7): the span is two hours, so expected is 10 pp,
+  // never the full-window 15 pp — the two lines integrate the same interval.
+  const recoveredTwo = points[6];
+  assert.equal(recoveredTwo.status, "matched");
+  assert.equal(recoveredTwo.observed, 11);
+  assert.equal(recoveredTwo.expected, 10);
+  assert.equal(recoveredTwo.measuredSpanMs, 7_200_000);
+  assert.equal(recoveredTwo.apiCostUsd, 100);
+  // Hour 8 onward the backward match exists again: the nominal window is
+  // measured in full.
+  const nominal = points[7];
+  assert.equal(nominal.status, "matched");
+  assert.equal(nominal.observed, 18);
+  assert.equal(nominal.expected, 15);
+  assert.equal(nominal.measuredSpanMs, 10_800_000);
+});
+
+test("forward recovery requires a second observation and never integrates cost past it", async () => {
+  const liveTimelinePoints = await loadLiveTimelinePoints();
+  const hour = (index) => new Date(Date.UTC(2026, 7, 5, index)).toISOString();
+  const atMinutes = (minutes) => new Date(Date.UTC(2026, 7, 5, 0, minutes)).toISOString();
+  const resetAt = "2026-08-10T00:00:00.000Z";
+  const quotaRow = (observedAt, usedPercent) => ({
+    observedAt,
+    limitId: "codex",
+    durationMinutes: 10_080,
+    slot: "primary",
+    usedPercent,
+    remainingPercent: 100 - usedPercent,
+    resetAt,
+  });
+  const usage = Array.from({ length: 9 }, (_, index) => ({
+    startAt: hour(index),
+    endAt: hour(index + 1),
+    apiPriceEquivalentUsd: 50,
+    usageEvents: 5,
+  }));
+  const capacity = { weekly: { summary: { median_weekly_value_usd: 1_000 } }, gradient: { summary: {} } };
+
+  // A single observation inside the window: atOrAfter(start) and
+  // atOrBefore(end) resolve to the SAME row, so observed would be zero over a
+  // zero-length span while the window carries real cost. That window must stay
+  // missing_quota_bracket — a matched point here would fabricate a negative
+  // residual that renderDivergencePeriods reads as an unmeasured under-cost
+  // period.
+  const single = liveTimelinePoints({
+    ...capacity,
+    timeline: {
+      usage,
+      // One observation at 04:30, then silence until hour 8 restores real
+      // backward brackets for the tail windows.
+      quota: [quotaRow(atMinutes(4 * 60 + 30), 50), quotaRow(hour(8), 61), quotaRow(hour(9), 68)],
+    },
+  });
+  assert.equal(single.length, 9);
+  // Windows ending at hours 5..7 see only the 04:30 observation: no second
+  // observation, no bracket, no fabricated residual.
+  for (const point of single.slice(4, 7)) {
+    assert.equal(point.status, "missing_quota_bracket");
+    assert.equal(point.observed, null);
+    assert.equal(point.residual, null);
+  }
+
+  // Two observations, but the end-edge one lags the bucket boundary: the
+  // expected side must integrate only to the observation, never to the bucket
+  // end, and the measured span must be the observation-to-observation span.
+  const lagged = liveTimelinePoints({
+    ...capacity,
+    timeline: {
+      usage,
+      // Observations at 04:30 and 06:00; the window ending 07:00 anchors
+      // forward on 04:30 and its end edge falls back to 06:00.
+      quota: [quotaRow(atMinutes(4 * 60 + 30), 50), quotaRow(hour(6), 55)],
+    },
+  });
+  assert.equal(lagged.length, 9);
+  const recovered = lagged[6];
+  assert.equal(recovered.status, "matched");
+  assert.equal(recovered.observed, 5);
+  // Only the buckets ending in (04:30, 06:00] count: hours 5 and 6, $100 of
+  // $1,000 capacity = 10 pp. Integrating to the 07:00 bucket end would have
+  // claimed 15 pp against 5 pp observed — movement nobody measured.
+  assert.equal(recovered.expected, 10);
+  assert.equal(recovered.apiCostUsd, 100);
+  assert.equal(recovered.usageEvents, 10);
+  assert.equal(recovered.measuredSpanMs, 90 * 60 * 1_000);
+});
+
+test("timeline exclusion copy names only the mechanisms that actually fired", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("const TIMELINE_EXCLUSION_MESSAGE_KEYS");
+  const end = appSource.indexOf("\nfunction renderTimelineConfidence(");
+  assert.ok(start >= 0 && end > start, "describeTimelineExclusions is available");
+  const describeTimelineExclusions = Function(
+    "t",
+    "tPlural",
+    `${appSource.slice(start, end)}\nreturn describeTimelineExclusions;`,
+  )(
+    (key) => (key === "dashboard.timeline.exclusionJoin" ? "; " : `<${key}>`),
+    (key, count) => `${count} ${key.split(".").at(-1)}`,
+  );
+  const point = (status, matched = false) => ({
+    status,
+    observed: matched ? 1 : null,
+    expected: matched ? 1 : null,
+  });
+
+  // Only the firing mechanisms are named, in classifier order.
+  assert.equal(
+    describeTimelineExclusions([
+      point("missing_quota_bracket"),
+      point("missing_quota_bracket"),
+      point("reset_or_track_change"),
+      point("matched", true),
+    ]),
+    "2 excludedMissingBracket; 1 excludedResetOrTrackChange",
+  );
+  // Zero ambiguous windows means the copy never claims ambiguity.
+  assert.doesNotMatch(
+    describeTimelineExclusions([point("missing_quota_bracket")]),
+    /Ambiguous/iu,
+  );
+  assert.equal(
+    describeTimelineExclusions([point("backward_or_ambiguous")]),
+    "1 excludedAmbiguousMovement",
+  );
+  // Matched-family points are never counted as exclusions.
+  assert.equal(
+    describeTimelineExclusions([point("matched", true)]),
+    "<dashboard.timeline.noExclusions>",
+  );
+
+  // Every mechanism's copy exists in all three locales, and the retired
+  // conflated key is gone.
+  for (const key of [
+    "dashboard.timeline.excludedMissingBracket",
+    "dashboard.timeline.excludedResetOrTrackChange",
+    "dashboard.timeline.excludedAmbiguousMovement",
+  ]) {
+    const entry = WEB_PLURAL_MESSAGES[key];
+    assert.ok(entry, `${key} is catalogued`);
+    for (const form of ["one", "other"]) {
+      assert.equal(entry[form].length, SUPPORTED_LOCALES.length);
+      for (const message of entry[form]) {
+        assert.ok(message.includes("{count}"), `${key} ${form} counts windows`);
+      }
+    }
+  }
+  assert.equal(WEB_PLURAL_MESSAGES["dashboard.timeline.excludedWindow"], undefined);
+  assert.doesNotMatch(appSource, /dashboard\.timeline\.excludedWindow/u);
+  for (const locale of SUPPORTED_LOCALES) {
+    assert.ok(translate("dashboard.timeline.noExclusions", {}, locale).trim().length > 0);
+    assert.ok(translate("dashboard.timeline.exclusionJoin", {}, locale).length > 0);
+  }
 });
 
 test("the residual panel draws the cumulative line and states the signed-AUC drift", async () => {

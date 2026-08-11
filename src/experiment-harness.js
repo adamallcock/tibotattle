@@ -187,9 +187,11 @@ async function probeRecentCodexActivity({ endAtMs, lookbackMs, controllerSession
 }
 
 function quotaChanges(before, after) {
-  const byIdentity = new Map(before.map((window) => [[window.limitId, window.slot, window.windowDurationMins, window.resetsAt].join("|"), window]));
+  // Identity is (limit, duration, resetsAt); slot is a server-assigned UI
+  // role that can flip between captures without the window itself changing.
+  const byIdentity = new Map(before.map((window) => [[window.limitId, window.windowDurationMins, window.resetsAt].join("|"), window]));
   return after.map((window) => {
-    const key = [window.limitId, window.slot, window.windowDurationMins, window.resetsAt].join("|");
+    const key = [window.limitId, window.windowDurationMins, window.resetsAt].join("|");
     const prior = byIdentity.get(key);
     return {
       limitId: window.limitId,

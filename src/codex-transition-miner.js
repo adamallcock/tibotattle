@@ -231,12 +231,16 @@ function displayLagEnvelopes(events, windowStartMs, scanStartMs, snapshotMs, cum
   return { byEventCount, byElapsedTime };
 }
 
+// Quota window identity is (provider, plan, limit, duration, resetsAt). The
+// provider's primary/secondary slots are server-assigned UI roles — the
+// weekly 10080-minute window flipped secondary -> primary around 2026-07-06 —
+// so slot is carried on rows as display provenance but never keys a group:
+// keying on it split one continuous weekly series at the flip.
 function windowKey(window) {
   return [
     window.provider,
     window.planType,
     window.limitId,
-    window.slot,
     window.windowDurationMins,
     window.resetsAt,
   ].join("|");
@@ -503,11 +507,15 @@ function collapseTransitions({ snapshots, usageEvents, toolEvents, scanStartMs, 
   }
   transitions.sort((left, right) => left.eventTime.localeCompare(right.eventTime)
     || left.resetIdentity.localeCompare(right.resetIdentity)
+    || left.windowDurationMins - right.windowDurationMins
     || left.slot.localeCompare(right.slot));
   snapshotIntervals.sort((left, right) => left.eventTime.localeCompare(right.eventTime)
     || left.resetIdentity.localeCompare(right.resetIdentity)
+    || left.windowDurationMins - right.windowDurationMins
     || left.slot.localeCompare(right.slot));
-  groupSummaries.sort((left, right) => left.resetsAt - right.resetsAt || left.slot.localeCompare(right.slot));
+  groupSummaries.sort((left, right) => left.resetsAt - right.resetsAt
+    || left.windowDurationMins - right.windowDurationMins
+    || left.slot.localeCompare(right.slot));
   return {
     transitions,
     snapshotIntervals,
@@ -883,11 +891,14 @@ async function collapseTransitionsCooperatively({
   });
   transitions.sort((left, right) => left.eventTime.localeCompare(right.eventTime)
     || left.resetIdentity.localeCompare(right.resetIdentity)
+    || left.windowDurationMins - right.windowDurationMins
     || left.slot.localeCompare(right.slot));
   snapshotIntervals.sort((left, right) => left.eventTime.localeCompare(right.eventTime)
     || left.resetIdentity.localeCompare(right.resetIdentity)
+    || left.windowDurationMins - right.windowDurationMins
     || left.slot.localeCompare(right.slot));
   groupSummaries.sort((left, right) => left.resetsAt - right.resetsAt
+    || left.windowDurationMins - right.windowDurationMins
     || left.slot.localeCompare(right.slot));
   throwIfDerivationAborted(signal);
   return {

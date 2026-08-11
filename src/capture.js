@@ -24,7 +24,9 @@ function canonicalWindows(limit) {
       const window = limit[slot];
       const startEpochSeconds = window.resetsAt - window.windowDurationMins * 60;
       return {
-        identity: [limit.limitId, slot, window.windowDurationMins, window.resetsAt].join(":"),
+        // Identity is (limit, duration, resetsAt); the provider's
+        // primary/secondary slot is a UI role recorded separately below.
+        identity: [limit.limitId, window.windowDurationMins, window.resetsAt].join(":"),
         limitId: limit.limitId,
         slot,
         usedPercent: window.usedPercent,

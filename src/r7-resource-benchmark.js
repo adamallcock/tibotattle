@@ -179,7 +179,10 @@ export async function collectR7BenchmarkImplementationUrls() {
   ];
 }
 
-export async function inventoryR7OwnedTree(root) {
+export async function inventoryR7OwnedTree(root, {
+  allowedTransientSymlinkNames = [],
+} = {}) {
+  const allowedSymlinkNames = new Set(allowedTransientSymlinkNames);
   const rows = [];
   let entryCount = 0;
   async function walk(directory, prefix) {
@@ -195,8 +198,17 @@ export async function inventoryR7OwnedTree(root) {
       const relativeName = prefix ? `${prefix}/${name}` : name;
       const path = join(directory, name);
       const stat = await lstat(path);
-      if (stat.isSymbolicLink()) throw new Error("R7 temporary inventory contained a symlink");
-      if (stat.isDirectory()) {
+      if (stat.isSymbolicLink()) {
+        // The export destination lock is the one symlink the measured
+        // lifecycle legitimately creates, and a pass that failed while
+        // holding it leaves it behind. Failure-path cleanup opts into
+        // tolerating exactly that name; every other symlink stays refused,
+        // and the link target is never followed either way.
+        if (!allowedSymlinkNames.has(name)) {
+          throw new Error("R7 temporary inventory contained a symlink");
+        }
+        rows.push({ kind: "transient_symlink", relativeName });
+      } else if (stat.isDirectory()) {
         await walk(path, relativeName);
         rows.push({ kind: "directory", relativeName });
       } else if (stat.isFile() && stat.nlink === 1) {
@@ -248,9 +260,11 @@ async function assertSameOwnedRoot(root, expectedIdentity) {
   }
 }
 
-export async function cleanupR7OwnedTree(root, expected, expectedRootIdentity) {
+export async function cleanupR7OwnedTree(root, expected, expectedRootIdentity, {
+  allowedTransientSymlinkNames = [],
+} = {}) {
   await assertSameOwnedRoot(root, expectedRootIdentity);
-  const current = await inventoryR7OwnedTree(root);
+  const current = await inventoryR7OwnedTree(root, { allowedTransientSymlinkNames });
   if (current.inventorySha256 !== expected.inventorySha256
       || current.entryCount !== expected.entryCount
       || current.fileCount !== expected.fileCount) {
@@ -265,6 +279,12 @@ export async function cleanupR7OwnedTree(root, expected, expectedRootIdentity) {
           || stat.dev !== row.dev || stat.ino !== row.ino
           || await sha256OwnedFile(path, stat) !== row.sha256) {
         throw new Error("R7 temporary file changed before cleanup");
+      }
+      await unlink(path);
+    } else if (row.kind === "transient_symlink") {
+      const stat = await lstat(path);
+      if (!stat.isSymbolicLink()) {
+        throw new Error("R7 temporary transient symlink changed before cleanup");
       }
       await unlink(path);
     } else {
