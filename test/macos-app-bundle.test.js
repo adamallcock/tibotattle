@@ -1243,7 +1243,10 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
     source,
     /private func isCompanionURL\(_ url: URL\) -> Bool \{[\s\S]*?url\.scheme\?\.lowercased\(\) == "http"[\s\S]*?url\.host == loopbackHost[\s\S]*?url\.port == allowedPort[\s\S]*?url\.user == nil[\s\S]*?url\.password == nil/u,
   );
-  assert.match(source, /configuration\.websiteDataStore = \.nonPersistent\(\)/u);
+  // Persistent by owner decision (sign-in-once durability, part 3): a valid
+  // web session and an in-flight sign-in handoff survive an app relaunch. The
+  // durable upload authority is the Keychain device credential regardless.
+  assert.match(source, /configuration\.websiteDataStore = \.default\(\)/u);
   assert.match(source, /WKUserScript\([\s\S]*injectionTime: \.atDocumentStart/u);
   assert.match(source, /document\.documentElement\.classList\.add\('native-dashboard'\)/u);
   assert.match(
@@ -1283,7 +1286,6 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   assert.doesNotMatch(source, /Finish signing in in your browser/u);
   assert.match(source, /webView\.allowsBackForwardNavigationGestures = false/u);
   for (const forbidden of [
-    "WKWebsiteDataStore.default()",
     "allowsLinkPreview = true",
     "javaScriptCanOpenWindowsAutomatically",
     "setValue(true, forKey: \"allowUniversalAccessFromFileURLs\"",

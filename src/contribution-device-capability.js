@@ -379,12 +379,20 @@ export function createProductionContributionDeviceBackend({
   platform = process.platform,
   architecture = process.arch,
   createBackend = createExportIdentityKeychainBackend,
+  // The reader whose designated requirement the durable ACL binds to is this
+  // very companion process — the packaged Node runtime that calls keytar.
+  // process.execPath is its absolute on-disk path, and its codesign-derived
+  // identifier + team are stable across signed updates, so a mint bound to it
+  // survives a Sparkle re-sign that the default ACL would deny.
+  readerPath = process.execPath,
 } = {}) {
   if (platform !== "darwin" || architecture !== "arm64" || typeof createBackend !== "function") {
     fail("invalid_configuration");
   }
   try {
-    return assertBackend(createBackend());
+    return assertBackend(createBackend({
+      durableAccess: { platform, readerPath },
+    }));
   } catch (error) {
     if (error instanceof ContributionDeviceCapabilityError) throw error;
     translateBackendFailure(error);
@@ -615,6 +623,113 @@ export async function withContributionDeviceSecret({
   } finally {
     temporary?.fill(0);
     if (Buffer.isBuffer(stored)) stored.fill(0);
+  }
+}
+
+/**
+ * Silently rotate this Mac's device-upload secret in place — the local half of
+ * the sign-in-once auto-renewal (docs/design/2026-08-11-sign-in-once-durability
+ * section 2). A fresh 32-byte secret is generated locally, its
+ * domain-separated hash is handed to `performRemoteRotation` (the caller's
+ * network call to the renew route), and only after the service confirms the
+ * rotation committed is the Keychain value replaced compare-and-swap. No user
+ * sign-in is involved: the existing secret authenticates the renewal.
+ *
+ * Ordering guarantees the credential is never left invalid by a benign failure:
+ * if the remote rotation does not commit, the service still holds the old
+ * secret and the untouched Keychain value stays valid; the next pass retries.
+ * The one residual hazard is a failure strictly between the service commit and
+ * the local swap (a wedged Keychain, or a crash in that window) — the service
+ * would then hold the new secret while the Keychain holds the old, and the next
+ * device auth is revoked, degrading to exactly today's re-pair. That window is a
+ * single keytar update wide and only reachable ~monthly, so it is accepted
+ * rather than guarded by persisting the new secret to disk.
+ */
+export async function rotateContributionDeviceCredential({
+  backend,
+  stateFile = defaultContributionDeviceStateFile(),
+  expectedOrigin = null,
+  performRemoteRotation,
+  generateSecret = () => randomBytes(SECRET_BYTES),
+} = {}) {
+  const selected = assertBackend(backend);
+  if (typeof performRemoteRotation !== "function"
+      || typeof generateSecret !== "function") {
+    fail("invalid_configuration");
+  }
+  const state = await readState(stateFile);
+  let oldStored = null;
+  let oldSecret = null;
+  let newValue = null;
+  let newSecret = null;
+  let readback = null;
+  try {
+    oldStored = await invokeBackend(selected, "read");
+    if (state === null && oldStored === null) fail("credential_missing");
+    if (state === null) fail("credential_conflict");
+    if (oldStored === null) fail("credential_missing");
+    if (expectedOrigin !== null
+        && state.origin !== normalizeOrigin(expectedOrigin)) {
+      fail("origin_conflict");
+    }
+    oldSecret = copySecret(oldStored);
+    try {
+      newValue = generateSecret();
+    } catch {
+      fail("credential_unavailable");
+    }
+    newSecret = copySecret(newValue);
+    // A rotation to the same secret is rejected by the service and would be a
+    // no-op locally; a working generator makes this astronomically unlikely.
+    if (timingSafeEqual(oldSecret, newSecret)) fail("credential_conflict");
+    const nextDeviceSecretHash = hashSecret(state.deviceId, newSecret);
+    let remote;
+    try {
+      remote = await performRemoteRotation(Object.freeze({
+        origin: state.origin,
+        deviceId: state.deviceId,
+        currentSecret: oldSecret,
+        nextDeviceSecretHash,
+      }));
+    } catch (error) {
+      if (error instanceof ContributionDeviceCapabilityError) throw error;
+      fail("operation_failed");
+    }
+    if (!remote || typeof remote !== "object" || Array.isArray(remote)
+        || remote.committed !== true
+        || typeof remote.expiresAt !== "string"
+        || !Number.isFinite(Date.parse(remote.expiresAt))) {
+      // Not committed: the service still holds the old secret. Leave the
+      // Keychain value untouched and valid; the caller retries next pass.
+      fail("operation_failed");
+    }
+    const outcome = await invokeBackend(
+      selected,
+      "replaceExact",
+      oldSecret,
+      newSecret,
+    );
+    if (outcome === "conflict") fail("credential_conflict");
+    if (outcome === "missing") fail("credential_missing");
+    if (outcome !== "replaced") fail("credential_unavailable");
+    readback = await invokeBackend(selected, "read");
+    if (readback === null || !Buffer.isBuffer(readback)
+        || readback.byteLength !== SECRET_BYTES
+        || !timingSafeEqual(readback, newSecret)) {
+      fail("credential_unavailable");
+    }
+    return Object.freeze({
+      status: "renewed",
+      origin: state.origin,
+      deviceId: state.deviceId,
+      expiresAt: new Date(remote.expiresAt).toISOString(),
+    });
+  } finally {
+    if (Buffer.isBuffer(oldStored)) oldStored.fill(0);
+    oldSecret?.fill(0);
+    if (Buffer.isBuffer(newValue)) newValue.fill(0);
+    newSecret?.fill(0);
+    if (Buffer.isBuffer(readback)) readback.fill(0);
   }
 }
 

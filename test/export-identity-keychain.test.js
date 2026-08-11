@@ -2,11 +2,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import {
+  CONTRIBUTION_DEVICE_READER_CODE_IDENTIFIER,
+  CONTRIBUTION_DEVICE_READER_TEAM_IDENTIFIER,
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
   ExportIdentityKeychainError,
   KEYTAR_DARWIN_ARM64_SHA256,
   KEYTAR_SIGNING_CODE_IDENTIFIER,
   KEYTAR_SIGNING_TEAM_IDENTIFIER,
+  contributionDeviceDurableAddArguments,
+  contributionDeviceReaderRequirement,
+  contributionDeviceReaderRequirementVerificationArguments,
   createExportIdentityKeychainBackend,
   deleteExportIdentityKeychainItemByAttributes,
   exportIdentityKeychainAttributeDeleteArguments,
@@ -610,4 +615,148 @@ test("attribute delete reports an absent item honestly and fails closed on anyth
     }),
     assertKeychainError("unsupported_platform"),
   );
+});
+
+const READER_PATH =
+  "/Applications/TiboTattle.app/Contents/Resources/runtime/bin/node";
+
+test("the contribution-device reader requirement pins only the durable team and identifier", () => {
+  assert.equal(CONTRIBUTION_DEVICE_READER_TEAM_IDENTIFIER, "43RTH622SB");
+  assert.equal(CONTRIBUTION_DEVICE_READER_CODE_IDENTIFIER, "node");
+  assert.equal(
+    contributionDeviceReaderRequirement(),
+    "anchor apple generic"
+      + ' and certificate leaf[subject.OU] = "43RTH622SB"'
+      + ' and identifier "node"',
+  );
+  assert.deepEqual(
+    [...contributionDeviceReaderRequirementVerificationArguments(READER_PATH)],
+    [
+      "--verify",
+      "--strict",
+      `-R=${contributionDeviceReaderRequirement()}`,
+      "--",
+      READER_PATH,
+    ],
+  );
+});
+
+test("the durable add invocation binds the ACL to the reader path and rejects bad input", () => {
+  const secret = Buffer.alloc(32, 5).toString("base64url");
+  assert.deepEqual(
+    [...contributionDeviceDurableAddArguments({
+      service: "app-usagemonitor.contribution-device.v1",
+      account: "installation",
+      secret,
+      readerPath: READER_PATH,
+    })],
+    [
+      "add-generic-password",
+      "-U",
+      "-s",
+      "app-usagemonitor.contribution-device.v1",
+      "-a",
+      "installation",
+      "-T",
+      READER_PATH,
+      "-w",
+      secret,
+    ],
+  );
+  for (const bad of [
+    { service: "", account: "installation", secret, readerPath: READER_PATH },
+    { service: "svc", account: "installation", secret: "too-short", readerPath: READER_PATH },
+    { service: "svc", account: "installation", secret, readerPath: "relative/node" },
+    undefined,
+  ]) {
+    assert.throws(
+      () => contributionDeviceDurableAddArguments(bad),
+      assertKeychainError("invalid_configuration"),
+    );
+  }
+});
+
+test("a fresh contribution-device mint is written through the designated-requirement ACL", async () => {
+  const binding = memoryBinding();
+  const invocations = [];
+  const runCommand = (command, commandArguments) => {
+    const argv = [...commandArguments];
+    invocations.push([command, argv]);
+    // Simulate the security CLI writing the item that keytar then reads back.
+    const service = argv[argv.indexOf("-s") + 1];
+    const account = argv[argv.indexOf("-a") + 1];
+    const secret = argv[argv.indexOf("-w") + 1];
+    binding.values.set(credentialKey(service, account), secret);
+    return { status: 0 };
+  };
+  const backend = createExportIdentityKeychainBackend({
+    binding,
+    durableAccess: { platform: "darwin", readerPath: READER_PATH, runCommand },
+  });
+  const outcome = await backend.createIfMissing(DEVICE_CAPABILITY, Buffer.alloc(32, 5));
+  assert.equal(outcome, "created");
+  assert.equal(invocations.length, 1);
+  assert.equal(invocations[0][0], "/usr/bin/security");
+  assert.deepEqual(invocations[0][1], [
+    "add-generic-password",
+    "-U",
+    "-s",
+    "app-usagemonitor.contribution-device.v1",
+    "-a",
+    "installation",
+    "-T",
+    READER_PATH,
+    "-w",
+    Buffer.alloc(32, 5).toString("base64url"),
+  ]);
+  // keytar never wrote the value; the durable CLI mint did.
+  assert.equal(binding.calls.some(([method]) => method === "setPassword"), false);
+  assert.deepEqual(await backend.read(DEVICE_CAPABILITY), Buffer.alloc(32, 5));
+});
+
+test("a failed durable mint falls back to keytar so availability never regresses", async () => {
+  const binding = memoryBinding();
+  const backend = createExportIdentityKeychainBackend({
+    binding,
+    durableAccess: {
+      platform: "darwin",
+      readerPath: READER_PATH,
+      runCommand: () => ({ status: 1 }),
+    },
+  });
+  const outcome = await backend.createIfMissing(DEVICE_CAPABILITY, Buffer.alloc(32, 9));
+  assert.equal(outcome, "created");
+  // The CLI mint reported failure, so keytar's default path created the item.
+  assert.equal(binding.calls.some(([method]) => method === "setPassword"), true);
+  assert.deepEqual(await backend.read(DEVICE_CAPABILITY), Buffer.alloc(32, 9));
+});
+
+test("durable access applies to the contribution-device capability only, and only on darwin", async () => {
+  // Other capabilities keep using keytar even when durable access is configured.
+  const bindingA = memoryBinding();
+  let ran = 0;
+  const backendA = createExportIdentityKeychainBackend({
+    binding: bindingA,
+    durableAccess: {
+      platform: "darwin",
+      readerPath: READER_PATH,
+      runCommand: () => { ran += 1; return { status: 0 }; },
+    },
+  });
+  assert.equal(await backendA.createIfMissing(EXPORT_CAPABILITY, Buffer.alloc(32, 3)), "created");
+  assert.equal(ran, 0, "the security CLI is never used for the export identity");
+  assert.equal(bindingA.calls.some(([method]) => method === "setPassword"), true);
+
+  // A non-darwin platform makes durable access inert; keytar is used.
+  const bindingB = memoryBinding();
+  const backendB = createExportIdentityKeychainBackend({
+    binding: bindingB,
+    durableAccess: {
+      platform: "linux",
+      readerPath: READER_PATH,
+      runCommand: () => { throw new Error("must not run off darwin"); },
+    },
+  });
+  assert.equal(await backendB.createIfMissing(DEVICE_CAPABILITY, Buffer.alloc(32, 4)), "created");
+  assert.equal(bindingB.calls.some(([method]) => method === "setPassword"), true);
 });

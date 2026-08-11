@@ -74,6 +74,10 @@ import {
   disconnectContributionDevice as disconnectContributionDeviceRemotely,
 } from "../../src/contribution-device-client.js";
 import {
+  renewContributionDeviceCredentialIfDue,
+  writeContributionDeviceRenewalState,
+} from "../../src/contribution-device-renewal.js";
+import {
   LOCAL_CONTRIBUTION_PREPARATION_ALLOWED_LOOKBACK_HOURS,
   LOCAL_CONTRIBUTION_PREPARATION_DEFAULT_LOOKBACK_HOURS,
   LOCAL_CONTRIBUTION_PREPARATION_ERROR_VERSION,
@@ -2347,7 +2351,7 @@ function createPreparedLocalCompanionServer({
       ? null
       : async ({ pairingCode }) => {
         const backend = await createContributionDeviceBackend();
-        return claimContributionDevicePairing({
+        const paired = await claimContributionDevicePairing({
           origin: contributionServiceOrigin,
           pairingCode,
           capabilityOptions: {
@@ -2355,6 +2359,24 @@ function createPreparedLocalCompanionServer({
             stateFile: statePaths.contributionDeviceStateFile,
           },
         });
+        // Seed the auto-renewal due-tracker with the freshly issued expiry so a
+        // later normal sync pass can rotate the credential ~5 days before it
+        // lapses without any further user sign-in. Best-effort: the credential
+        // is fully paired regardless of whether this hint persists.
+        if (paired?.status === "paired"
+            && typeof paired.deviceId === "string"
+            && typeof paired.expiresAt === "string") {
+          try {
+            await writeContributionDeviceRenewalState(
+              statePaths.contributionDeviceRenewalStateFile,
+              { deviceId: paired.deviceId, expiresAt: paired.expiresAt },
+            );
+          } catch {
+            // A missing due-tracker only defers the first silent renewal until
+            // the next pairing; it never affects delivery.
+          }
+        }
+        return paired;
       });
   // Purely local repair: it needs at most the Keychain backend and the
   // binding state files, never a contribution service origin, so it stays
@@ -2617,6 +2639,24 @@ function createPreparedLocalCompanionServer({
           contributionSyncInProgress = true;
           try {
             const backend = await createContributionDeviceBackend();
+            // Silent auto-renewal (sign-in-once durability, part 2). Before the
+            // upload pass, rotate the 30-day credential in place if it is inside
+            // its renewal window, authenticated by the existing credential. This
+            // is strictly best-effort: it never throws into the pass, and a
+            // failure just leaves the still-valid credential for the next try.
+            try {
+              await renewContributionDeviceCredentialIfDue({
+                origin: contributionServiceOrigin,
+                renewalStateFile: statePaths.contributionDeviceRenewalStateFile,
+                capabilityOptions: {
+                  backend,
+                  stateFile: statePaths.contributionDeviceStateFile,
+                },
+              });
+            } catch {
+              // A renewal misconfiguration must never stall delivery; the pass
+              // proceeds on the credential that is still valid.
+            }
             return await runIncrementalContributionSyncOnce({
               indexFile: statePaths.unifiedIndexFile,
               origin: contributionServiceOrigin,
