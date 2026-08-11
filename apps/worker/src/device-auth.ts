@@ -440,6 +440,129 @@ function parseDeviceUploadAuthorization(header: string | null): {
   return { id: match[1], secret: match[2] };
 }
 
+/**
+ * Classify why a pairing mint could not be admitted. The device count and the
+ * issuance count are read with exactly the cutoffs `devicePairingInsert` gates
+ * on, so a `true` here means the same subquery the insert failed on is still
+ * failing. An inactive/absent participant leaves both `false` (the caller then
+ * returns the neutral auth failure), matching the pre-existing behaviour.
+ */
+async function pairingBoundsExceeded(
+  db: D1Database,
+  participantId: string,
+  nowEpoch: number,
+  policy: DeviceLifecyclePolicy,
+): Promise<{ deviceCapExceeded: boolean; issueRateExceeded: boolean }> {
+  const limit = await db.prepare(
+    `SELECT
+       (SELECT COUNT(*) FROM device_credentials
+         WHERE participant_id = ? AND state = 'active' AND expires_at > ?
+           AND last_used_at > ?) AS devices,
+       (SELECT COUNT(*) FROM device_pairings
+         WHERE participant_id = ? AND issued_at > ?) AS issued,
+       (SELECT state FROM participants WHERE id = ?) AS participant_state`,
+  ).bind(
+    participantId,
+    epochIso(nowEpoch),
+    new Date(nowEpoch - policy.idleMilliseconds).toISOString(),
+    participantId,
+    new Date(nowEpoch - policy.pairingIssueWindowMilliseconds).toISOString(),
+    participantId,
+  ).first<{ devices: number; issued: number; participant_state: string | null }>();
+  const participantActive = limit?.participant_state === "active";
+  return {
+    deviceCapExceeded: participantActive
+      && (limit!.devices ?? 0) >= policy.activeDeviceLimit,
+    issueRateExceeded: participantActive
+      && (limit!.issued ?? 0) >= policy.pairingIssueLimit,
+  };
+}
+
+/**
+ * W1 self-healing re-pair: free exactly one active-device slot for a
+ * session-authenticated mint that is only blocked by the active-device cap.
+ *
+ * The selection is deliberately conservative. It joins the presented session
+ * so a mint with no live, personal, unexpired `web_session` for this
+ * participant can never trigger a revoke (the auth-context check: a token or
+ * other non-session mint finds no target). The chosen credential must still be
+ * counted toward the cap (active, unexpired, non-idle — the same predicates
+ * `devicePairingInsert` counts on) and must not have been used since before
+ * this login (`last_used_at` — or `issued_at` when null — strictly precedes the
+ * session's `issued_at`). That is the "superseded by re-pair" signal: a
+ * credential a fresh browser login has effectively replaced. The oldest such
+ * credential is revoked with the same state transition every other revoke path
+ * in this file records (state -> 'revoked', `revoked_at` stamped, its pending
+ * upload authorizations revoked). The revoking UPDATE re-checks the
+ * session-issued_at bound so a device used concurrently between selection and
+ * revocation is never revoked, and the caller retries the mint at most once.
+ *
+ * @returns whether a credential was revoked (a slot was freed).
+ */
+async function revokeSupersededDeviceCredential(
+  db: D1Database,
+  participantId: string,
+  sessionId: string,
+  nowEpoch: number,
+  policy: DeviceLifecyclePolicy,
+): Promise<boolean> {
+  const now = epochIso(nowEpoch);
+  const idleCutoff = new Date(nowEpoch - policy.idleMilliseconds).toISOString();
+  const target = await db.prepare(
+    `SELECT device.id AS device_id
+       FROM device_credentials device
+       JOIN web_sessions session
+         ON session.id = ?
+        AND session.participant_id = device.participant_id
+        AND session.scope = 'personal'
+        AND session.state = 'active'
+        AND session.expires_at > ?
+      WHERE device.participant_id = ?
+        AND device.state = 'active'
+        AND device.expires_at > ?
+        AND device.last_used_at > ?
+        AND COALESCE(device.last_used_at, device.issued_at) < session.issued_at
+      ORDER BY COALESCE(device.last_used_at, device.issued_at) ASC, device.id ASC
+      LIMIT 1`,
+  ).bind(
+    sessionId,
+    now,
+    participantId,
+    now,
+    idleCutoff,
+  ).first<{ device_id: string }>();
+  if (!target) return false;
+  const results = await db.batch([
+    db.prepare(
+      `UPDATE device_credentials
+          SET state = 'revoked', revoked_at = COALESCE(revoked_at, ?)
+        WHERE id = ?
+          AND participant_id = ?
+          AND state = 'active'
+          AND COALESCE(last_used_at, issued_at) < (
+            SELECT issued_at FROM web_sessions
+             WHERE id = ?
+               AND participant_id = ?
+               AND scope = 'personal'
+               AND state = 'active'
+          )`,
+    ).bind(now, target.device_id, participantId, sessionId, participantId),
+    db.prepare(
+      `UPDATE device_upload_authorizations
+          SET state = 'revoked', revoked_at = COALESCE(revoked_at, ?),
+              consume_lease_expires_at = NULL
+        WHERE issued_by_device_id = ?
+          AND participant_id = ?
+          AND state IN ('unused', 'consuming')
+          AND EXISTS (
+            SELECT 1 FROM device_credentials
+             WHERE id = ? AND participant_id = ? AND state = 'revoked'
+          )`,
+    ).bind(now, target.device_id, participantId, target.device_id, participantId),
+  ]);
+  return results[0]?.meta.changes === 1;
+}
+
 export async function createDevicePairing(
   db: D1Database,
   participantId: string,
@@ -457,32 +580,42 @@ export async function createDevicePairing(
     nowEpoch,
     requestedTransportConsentVersion,
   );
-  const result = await devicePairingInsert(
+  const mint = (): Promise<D1Result<unknown>> => devicePairingInsert(
     db,
     material,
     participantConsentVersion,
     policy,
   ).run();
+  const result = await mint();
   if (result.meta.changes !== 1) {
-    const limit = await db.prepare(
-      `SELECT
-         (SELECT COUNT(*) FROM device_credentials
-           WHERE participant_id = ? AND state = 'active' AND expires_at > ?
-             AND last_used_at > ?) AS devices,
-         (SELECT COUNT(*) FROM device_pairings
-           WHERE participant_id = ? AND issued_at > ?) AS issued,
-         (SELECT state FROM participants WHERE id = ?) AS participant_state`,
-    ).bind(
+    const bounds = await pairingBoundsExceeded(
+      db,
       participantId,
-      epochIso(nowEpoch),
-      new Date(nowEpoch - policy.idleMilliseconds).toISOString(),
-      participantId,
-      new Date(nowEpoch - policy.pairingIssueWindowMilliseconds).toISOString(),
-      participantId,
-    ).first<{ devices: number; issued: number; participant_state: string | null }>();
-    if (limit?.participant_state === "active"
-        && ((limit.devices ?? 0) >= policy.activeDeviceLimit
-          || (limit.issued ?? 0) >= policy.pairingIssueLimit)) {
+      nowEpoch,
+      policy,
+    );
+    // Only self-heal when the active-device cap is the sole binding
+    // constraint: if issuance velocity is also exhausted, revoking a slot
+    // cannot admit this mint, so a credential must never be destroyed for it.
+    // A single revoke of a superseded credential, then one retry — no loop.
+    if (bounds.deviceCapExceeded
+        && !bounds.issueRateExceeded
+        && await revokeSupersededDeviceCredential(
+          db,
+          participantId,
+          sessionId,
+          nowEpoch,
+          policy,
+        )) {
+      const retry = await mint();
+      if (retry.meta.changes === 1) {
+        return {
+          pairingCode: material.pairingCode,
+          expiresAt: material.expiresAt,
+        };
+      }
+    }
+    if (bounds.deviceCapExceeded || bounds.issueRateExceeded) {
       throw new ApiError(429, "LIFECYCLE_BOUNDS_EXCEEDED");
     }
     throw new ApiError(401, "AUTH_INVALID");
