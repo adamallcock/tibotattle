@@ -329,7 +329,9 @@ export const WEB_MESSAGES = Object.freeze({
   "dashboard.timeline.movementTitle": ["{window} rolling quota movement", "{window} 滚动额度变化", "Movimiento móvil de cuota de {window}"],
   "dashboard.timeline.chartDescription": ["Observed quota movement compared with movement implied by priced token usage, with times shown in {timeZone}.", "将观测到的额度变化与按定价令牌使用量推断的变化进行比较，时间显示为 {timeZone}。", "Movimiento de cuota observado comparado con el movimiento implícito por el uso de tokens con precio; las horas se muestran en {timeZone}."],
   "dashboard.timeline.lowConfidence": ["Low confidence: only {visible}; {excluded}.", "置信度较低：仅显示 {visible}；{excluded}。", "Confianza baja: solo {visible}; {excluded}."],
-  "dashboard.timeline.excludedShown": ["{shown}. {excluded} and are shaded above; do not read them as zero usage.", "{shown}。{excluded}，并在上方显示为阴影；不要将它们理解为零使用。", "{shown}. {excluded}, se muestran sombreadas arriba; no las interpretes como uso cero."],
+  "dashboard.timeline.excludedShown": ["{shown}. {excluded}. Excluded windows are shaded above; do not read them as zero usage.", "{shown}。{excluded}。被排除的窗口在上方以阴影显示；不要将它们理解为零使用。", "{shown}. {excluded}. Las ventanas excluidas se muestran sombreadas arriba; no las interpretes como uso cero."],
+  "dashboard.timeline.exclusionJoin": ["; ", "；", "; "],
+  "dashboard.timeline.noExclusions": ["no windows are excluded", "没有窗口被排除", "ninguna ventana está excluida"],
   "dashboard.timeline.allMatched": ["{visible}. This compares observed percentage-point movement with a priced-token estimate; it is not a provider-published allowance.", "{visible}。这会将观测到的百分点变化与按定价令牌估算值进行比较；它不是提供商公布的额度。", "{visible}. Esto compara el movimiento observado en puntos porcentuales con una estimación de tokens con precio; no es una asignación publicada por el proveedor."],
   "dashboard.timeline.resetView": ["Use Reset view to return to the selected date range.", "使用“重置视图”返回所选日期范围。", "Usa Restablecer vista para volver al intervalo de fechas seleccionado."],
   "dashboard.timeline.aria": ["Interactive quota timeline in {timeZone}. Use plus or minus to zoom, arrow keys to pan, Home to reset, or drag horizontally.", "{timeZone} 的交互式额度时间线。使用加号或减号缩放，方向键平移，Home 重置，或水平拖动。", "Cronología interactiva de cuota en {timeZone}. Usa más o menos para ampliar, las flechas para desplazar, Inicio para restablecer o arrastra horizontalmente."],
@@ -959,9 +961,20 @@ export const WEB_PLURAL_MESSAGES = Object.freeze({
     one: ["{count} matched quota window is shown", "显示了 {count} 个匹配额度窗口", "se muestra {count} ventana de cuota coincidente"],
     other: ["{count} matched quota windows are shown", "显示了 {count} 个匹配额度窗口", "se muestran {count} ventanas de cuota coincidentes"],
   }),
-  "dashboard.timeline.excludedWindow": Object.freeze({
-    one: ["{count} window is excluded for missing or ambiguous quota evidence", "有 {count} 个窗口因缺少或不明确的额度证据而被排除", "{count} ventana está excluida por evidencia de cuota ausente o ambigua"],
-    other: ["{count} windows are excluded for missing or ambiguous quota evidence", "有 {count} 个窗口因缺少或不明确的额度证据而被排除", "{count} ventanas están excluidas por evidencia de cuota ausente o ambigua"],
+  // One entry per exclusion mechanism the evidence classifier can actually
+  // report, so the copy names the condition that fired instead of blaming
+  // every excluded window on "missing or ambiguous" evidence at once.
+  "dashboard.timeline.excludedMissingBracket": Object.freeze({
+    one: ["{count} window is excluded because no quota reading covers its edges (collection gap)", "有 {count} 个窗口因边缘缺少额度读数（采集中断）而被排除", "{count} ventana está excluida porque ninguna lectura de cuota cubre sus bordes (pausa de recolección)"],
+    other: ["{count} windows are excluded because no quota reading covers their edges (collection gap)", "有 {count} 个窗口因边缘缺少额度读数（采集中断）而被排除", "{count} ventanas están excluidas porque ninguna lectura de cuota cubre sus bordes (pausa de recolección)"],
+  }),
+  "dashboard.timeline.excludedResetOrTrackChange": Object.freeze({
+    one: ["{count} window is excluded because it spans a quota reset or track change", "有 {count} 个窗口因跨越额度重置或轨道变化而被排除", "{count} ventana está excluida porque abarca un reinicio de cuota o cambio de pista"],
+    other: ["{count} windows are excluded because they span a quota reset or track change", "有 {count} 个窗口因跨越额度重置或轨道变化而被排除", "{count} ventanas están excluidas porque abarcan un reinicio de cuota o cambio de pista"],
+  }),
+  "dashboard.timeline.excludedAmbiguousMovement": Object.freeze({
+    one: ["{count} window is excluded because its quota movement is ambiguous", "有 {count} 个窗口因额度变化不明确而被排除", "{count} ventana está excluida porque su movimiento de cuota es ambiguo"],
+    other: ["{count} windows are excluded because their quota movement is ambiguous", "有 {count} 个窗口因额度变化不明确而被排除", "{count} ventanas están excluidas porque su movimiento de cuota es ambiguo"],
   }),
   "dashboard.timeline.series": Object.freeze({
     one: ["No {window} series loaded", "未加载 {window} 序列", "No se cargó ninguna serie de {window}"],

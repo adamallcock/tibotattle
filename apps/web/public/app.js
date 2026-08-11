@@ -3677,6 +3677,28 @@ function renderTimeline(data) {
   renderDivergencePeriods(data, points);
 }
 
+// The copy names each exclusion mechanism that actually fired, in classifier
+// order. A mechanism with zero windows is never mentioned, so the sentence
+// cannot claim ambiguity (or anything else) that did not occur.
+const TIMELINE_EXCLUSION_MESSAGE_KEYS = Object.freeze([
+  ["missing_quota_bracket", "dashboard.timeline.excludedMissingBracket"],
+  ["reset_or_track_change", "dashboard.timeline.excludedResetOrTrackChange"],
+  ["backward_or_ambiguous", "dashboard.timeline.excludedAmbiguousMovement"],
+]);
+
+function describeTimelineExclusions(activePoints) {
+  const counts = new Map();
+  for (const point of activePoints) {
+    if (point.observed !== null && point.expected !== null) continue;
+    counts.set(point.status, (counts.get(point.status) ?? 0) + 1);
+  }
+  const described = TIMELINE_EXCLUSION_MESSAGE_KEYS
+    .filter(([status]) => (counts.get(status) ?? 0) > 0)
+    .map(([status, key]) => tPlural(key, counts.get(status)))
+    .join(t("dashboard.timeline.exclusionJoin"));
+  return described === "" ? t("dashboard.timeline.noExclusions") : described;
+}
+
 function renderTimelineConfidence(allPoints, visiblePoints, usingLive, viewport) {
   const element = $("#timeline-confidence");
   const activePoints = visiblePoints.filter((point) => point.status !== "inactive");
@@ -3704,12 +3726,12 @@ function renderTimelineConfidence(allPoints, visiblePoints, usingLive, viewport)
   } else if (matched < 3) {
     setLocalizedText(element, "dashboard.timeline.lowConfidence", {
       visible: tPlural("dashboard.timeline.visibleWindow", matched),
-      excluded: tPlural("dashboard.timeline.excludedWindow", excluded),
+      excluded: describeTimelineExclusions(activePoints),
     });
   } else if (excluded > 0) {
     setLocalizedText(element, "dashboard.timeline.excludedShown", {
       shown: tPlural("dashboard.timeline.shownWindow", matched),
-      excluded: tPlural("dashboard.timeline.excludedWindow", excluded),
+      excluded: describeTimelineExclusions(activePoints),
     });
   } else {
     setLocalizedText(element, "dashboard.timeline.allMatched", {

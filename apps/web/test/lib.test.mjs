@@ -8219,6 +8219,74 @@ test("a window starting inside a collection silence anchors forward and shrinks 
   assert.equal(nominal.measuredSpanMs, 10_800_000);
 });
 
+test("timeline exclusion copy names only the mechanisms that actually fired", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("const TIMELINE_EXCLUSION_MESSAGE_KEYS");
+  const end = appSource.indexOf("\nfunction renderTimelineConfidence(");
+  assert.ok(start >= 0 && end > start, "describeTimelineExclusions is available");
+  const describeTimelineExclusions = Function(
+    "t",
+    "tPlural",
+    `${appSource.slice(start, end)}\nreturn describeTimelineExclusions;`,
+  )(
+    (key) => (key === "dashboard.timeline.exclusionJoin" ? "; " : `<${key}>`),
+    (key, count) => `${count} ${key.split(".").at(-1)}`,
+  );
+  const point = (status, matched = false) => ({
+    status,
+    observed: matched ? 1 : null,
+    expected: matched ? 1 : null,
+  });
+
+  // Only the firing mechanisms are named, in classifier order.
+  assert.equal(
+    describeTimelineExclusions([
+      point("missing_quota_bracket"),
+      point("missing_quota_bracket"),
+      point("reset_or_track_change"),
+      point("matched", true),
+    ]),
+    "2 excludedMissingBracket; 1 excludedResetOrTrackChange",
+  );
+  // Zero ambiguous windows means the copy never claims ambiguity.
+  assert.doesNotMatch(
+    describeTimelineExclusions([point("missing_quota_bracket")]),
+    /Ambiguous/iu,
+  );
+  assert.equal(
+    describeTimelineExclusions([point("backward_or_ambiguous")]),
+    "1 excludedAmbiguousMovement",
+  );
+  // Matched-family points are never counted as exclusions.
+  assert.equal(
+    describeTimelineExclusions([point("matched", true)]),
+    "<dashboard.timeline.noExclusions>",
+  );
+
+  // Every mechanism's copy exists in all three locales, and the retired
+  // conflated key is gone.
+  for (const key of [
+    "dashboard.timeline.excludedMissingBracket",
+    "dashboard.timeline.excludedResetOrTrackChange",
+    "dashboard.timeline.excludedAmbiguousMovement",
+  ]) {
+    const entry = WEB_PLURAL_MESSAGES[key];
+    assert.ok(entry, `${key} is catalogued`);
+    for (const form of ["one", "other"]) {
+      assert.equal(entry[form].length, SUPPORTED_LOCALES.length);
+      for (const message of entry[form]) {
+        assert.ok(message.includes("{count}"), `${key} ${form} counts windows`);
+      }
+    }
+  }
+  assert.equal(WEB_PLURAL_MESSAGES["dashboard.timeline.excludedWindow"], undefined);
+  assert.doesNotMatch(appSource, /dashboard\.timeline\.excludedWindow/u);
+  for (const locale of SUPPORTED_LOCALES) {
+    assert.ok(translate("dashboard.timeline.noExclusions", {}, locale).trim().length > 0);
+    assert.ok(translate("dashboard.timeline.exclusionJoin", {}, locale).length > 0);
+  }
+});
+
 test("the residual panel draws the cumulative line and states the signed-AUC drift", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
