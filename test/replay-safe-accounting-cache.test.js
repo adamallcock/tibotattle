@@ -2118,41 +2118,71 @@ test("compact transition input ceilings fail closed without truncating or replac
   assert.equal((await stat(cacheFile)).mode & 0o777, 0o600);
 });
 
-test("measured RSS ceiling fails closed during accounting and preserves the last good cache", async () => {
+// Effective-ceiling arithmetic mirrored from the module: absolute 2 GiB target,
+// 1.25 GiB self-growth delta, effective = min(absolute, baseline + delta).
+const ACCOUNTING_RSS_ABSOLUTE = 2 * 1024 * 1024 * 1024;
+const ACCOUNTING_RSS_DELTA = Math.floor(1.25 * 1024 * 1024 * 1024);
+
+test("an RSS ceiling miss during accounting is a soft target: the prior cache is retained and served", async () => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rss-bound-"));
   const cacheFile = join(directory, "accounting.json");
   await refreshReplaySafeAccountingCache({
     cacheFile,
     now: () => NOW,
-    scan: scanner([]),
+    scan: scanner([
+      usageEvent({
+        timestamp: "2026-07-27T11:55:00.000Z",
+        components: { input_uncached_tokens: 1 },
+      }),
+    ]),
   });
   const before = await readTestCache(cacheFile);
-  // Baseline capture, then a clean start check, then the post-scan check
-  // crosses the absolute ceiling: the injected 100-byte ceiling is far below
-  // baseline + delta budget, so this exercises the hard backstop arm.
+  assert.notEqual(before, null);
+  // Baseline capture, a clean start check, then the post-scan check crosses the
+  // absolute ceiling: the injected 100-byte ceiling is far below baseline +
+  // delta budget, so this exercises the hard-backstop arm — which is now a soft
+  // TARGET, never a hard refresh failure that blanks the dashboard.
   const samples = [50, 50, 101];
+  const deferredEvents = [];
 
-  await assert.rejects(
-    refreshReplaySafeAccountingCache({
-      cacheFile,
-      now: () => NOW + 1_000,
-      maximumRssBytes: 100,
-      rss: () => samples.shift() ?? 101,
-      scan: scanner([
-        usageEvent({
-          timestamp: "2026-07-27T11:55:00.000Z",
-          components: { input_uncached_tokens: 1 },
-        }),
-      ]),
-    }),
-    (error) => error?.code === "accounting_transition_rss_limit_exceeded",
-  );
+  const outcome = await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW + 1_000,
+    maximumRssBytes: 100,
+    rss: () => samples.shift() ?? 101,
+    onAccountingRebuildDeferred: (event) => { deferredEvents.push(event); },
+    scan: scanner([
+      usageEvent({
+        timestamp: "2026-07-27T11:56:00.000Z",
+        components: { input_uncached_tokens: 1 },
+      }),
+    ]),
+  });
 
+  // No throw escaped to fail the refresh; a degraded/deferred outcome is
+  // reported instead, naming the budget it missed.
+  assert.equal(outcome.status, "accounting_rebuild_deferred");
+  assert.equal(outcome.reason, "accounting_transition_rss_limit_exceeded");
+  assert.equal(outcome.retained, true);
+  assert.equal(outcome.generatedAt, before.generatedAt);
+  // The honest degraded note was produced — content-free reason + retained.
+  assert.deepEqual(deferredEvents, [{
+    reason: "accounting_transition_rss_limit_exceeded",
+    retained: true,
+  }]);
+  // The last good cache survives on disk untouched, at its owner-only mode...
   assert.deepEqual(await readTestCache(cacheFile), before);
   assert.equal((await stat(cacheFile)).mode & 0o777, 0o600);
+  // ...and is still SERVED: the surface is available, not blanked.
+  const served = await readReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW + 1_000,
+  });
+  assert.equal(served.status, "available");
+  assert.deepEqual(served.cache, before);
 });
 
-test("the RSS guard is budget-relative: a pass climbing past the delta budget fails closed below the absolute ceiling", async () => {
+test("the RSS guard is budget-relative: a pass past the delta budget soft-fails below the absolute ceiling", async () => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rss-delta-"));
   const cacheFile = join(directory, "accounting.json");
   await refreshReplaySafeAccountingCache({
@@ -2161,23 +2191,162 @@ test("the RSS guard is budget-relative: a pass climbing past the delta budget fa
     scan: scanner([]),
   });
   const before = await readTestCache(cacheFile);
-  const baseline = 900 * 1024 * 1024;
-  // Baseline capture and the start check see the companion's resting RSS;
-  // the post-scan check sees the pass one byte past its own 512 MiB delta
-  // budget while still ~100 MiB UNDER the absolute 1.5 GiB ceiling — the
-  // exact reading the old absolute-only guard waved through.
-  const samples = [baseline, baseline, baseline + 512 * 1024 * 1024 + 1];
+  const baseline = 200 * 1024 * 1024;
+  // Baseline capture and the start check see the companion's resting RSS; the
+  // post-scan check sees the pass one byte past its 1.25 GiB delta budget while
+  // still far UNDER the 2 GiB absolute ceiling — the delta arm binds, and it is
+  // a soft target: the prior cache is retained, the refresh does not fail.
+  const samples = [baseline, baseline, baseline + ACCOUNTING_RSS_DELTA + 1];
 
-  await assert.rejects(
-    refreshReplaySafeAccountingCache({
-      cacheFile,
-      now: () => NOW + 1_000,
-      rss: () => samples.shift() ?? baseline + 512 * 1024 * 1024 + 1,
-      scan: scanner([]),
-    }),
-    (error) => error?.code === "accounting_transition_rss_limit_exceeded",
-  );
+  const outcome = await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW + 1_000,
+    rss: () => samples.shift() ?? baseline + ACCOUNTING_RSS_DELTA + 1,
+    scan: scanner([]),
+  });
 
+  assert.equal(outcome.status, "accounting_rebuild_deferred");
+  assert.equal(outcome.reason, "accounting_transition_rss_limit_exceeded");
+  assert.equal(outcome.retained, true);
+  assert.deepEqual(await readTestCache(cacheFile), before);
+});
+
+test("a retained-byte budget miss is a soft target that retains the prior cache", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-bytes-soft-"));
+  const cacheFile = join(directory, "accounting.json");
+  await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
+    scan: scanner([
+      usageEvent({
+        timestamp: "2026-07-27T11:55:00.000Z",
+        components: { input_uncached_tokens: 1_000_000 },
+      }),
+    ]),
+  });
+  const before = await readTestCache(cacheFile);
+  const deferredEvents = [];
+
+  // The per-row retained-byte meter is likewise advisory: over budget it
+  // retains the last good cache rather than failing the refresh.
+  const outcome = await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW + 1_000,
+    transitionResourceLimits: { retainedBytes: 1 },
+    onAccountingRebuildDeferred: (event) => { deferredEvents.push(event); },
+    scan: scanner([
+      usageEvent({
+        timestamp: "2026-07-27T11:56:00.000Z",
+        components: { input_uncached_tokens: 1 },
+      }),
+    ]),
+  });
+
+  assert.equal(outcome.status, "accounting_rebuild_deferred");
+  assert.equal(outcome.reason, "accounting_transition_memory_budget_exceeded");
+  assert.equal(outcome.retained, true);
+  assert.deepEqual(deferredEvents, [{
+    reason: "accounting_transition_memory_budget_exceeded",
+    retained: true,
+  }]);
+  assert.deepEqual(await readTestCache(cacheFile), before);
+});
+
+test("a memory-budget miss with no prior cache degrades honestly without throwing", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rss-nocache-"));
+  const cacheFile = join(directory, "accounting.json");
+  // No prior refresh: nothing valid is on disk to retain.
+  const samples = [50, 50, 101];
+  const deferredEvents = [];
+
+  const outcome = await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
+    maximumRssBytes: 100,
+    rss: () => samples.shift() ?? 101,
+    onAccountingRebuildDeferred: (event) => { deferredEvents.push(event); },
+    scan: scanner([
+      usageEvent({
+        timestamp: "2026-07-27T11:55:00.000Z",
+        components: { input_uncached_tokens: 1 },
+      }),
+    ]),
+  });
+
+  // Still no unhandled throw, but nothing is fabricated: retained is false and
+  // the surface honestly reports insufficient evidence.
+  assert.equal(outcome.status, "accounting_rebuild_deferred");
+  assert.equal(outcome.retained, false);
+  assert.equal(outcome.generatedAt, null);
+  assert.deepEqual(deferredEvents, [{
+    reason: "accounting_transition_rss_limit_exceeded",
+    retained: false,
+  }]);
+  assert.equal(await readTestCache(cacheFile), null);
+  const served = await readReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
+  });
+  assert.equal(served.status, "unavailable");
+  assert.equal(served.cache, null);
+});
+
+test("a rebuild within the raised 2 GiB budget completes normally", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rss-in-budget-"));
+  const cacheFile = join(directory, "accounting.json");
+  const baseline = 800 * 1024 * 1024;
+  // The live-failure reading: ~800 MB baseline, the pass climbs to ~1.6 GB.
+  // Under the old 1.5 GiB ceiling / 512 MiB delta that hard-failed; under the
+  // raised 2 GiB target it is comfortably in budget and the cache builds.
+  const climbed = 1_600 * 1024 * 1024;
+  let calls = 0;
+  const cache = await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
+    rss: () => {
+      calls += 1;
+      return calls <= 2 ? baseline : climbed;
+    },
+    scan: scanner([
+      usageEvent({
+        timestamp: "2026-07-27T11:55:00.000Z",
+        components: { input_uncached_tokens: 1 },
+      }),
+    ]),
+  });
+
+  assert.equal(cache.schemaVersion, REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION);
+  assert.equal(period(cache, "7d").events, 1);
+});
+
+test("the effective transition ceiling is the 2 GiB target for a realistic ~800 MB baseline", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rss-2gib-"));
+  const cacheFile = join(directory, "accounting.json");
+  await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
+    scan: scanner([]),
+  });
+  const before = await readTestCache(cacheFile);
+  const baseline = 800 * 1024 * 1024;
+  // Baseline capture + start check see the ~800 MB resting RSS; the post-scan
+  // transition-path check sees the pass one byte past the 2 GiB absolute
+  // target. min(2 GiB, 800 MB + 1.25 GiB = 2.05 GiB) = 2 GiB, so this is the
+  // exact boundary: paired with the "1.6 GB completes" test above it brackets
+  // the effective ceiling at ~2 GiB (the 1.6 GB the incident tripped at is now
+  // comfortably under budget), and crossing it is a soft target miss.
+  const samples = [baseline, baseline, ACCOUNTING_RSS_ABSOLUTE + 1];
+
+  const outcome = await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW + 1_000,
+    rss: () => samples.shift() ?? ACCOUNTING_RSS_ABSOLUTE + 1,
+    scan: scanner([]),
+  });
+
+  assert.equal(outcome.status, "accounting_rebuild_deferred");
+  assert.equal(outcome.reason, "accounting_transition_rss_limit_exceeded");
+  assert.equal(outcome.retained, true);
   assert.deepEqual(await readTestCache(cacheFile), before);
 });
 
@@ -2229,7 +2398,7 @@ test("the scan resource guard inherits the budget-relative RSS ceiling", async (
   // absolute constant) rather than the absolute constant alone.
   assert.equal(
     observedGuard?.limits.maximumRssBytes,
-    baseline + 512 * 1024 * 1024,
+    baseline + ACCOUNTING_RSS_DELTA,
   );
 });
 

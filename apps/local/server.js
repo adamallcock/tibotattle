@@ -48,6 +48,7 @@ import {
 import { createLocalCentralProxy } from "../../src/local-companion-central-proxy.js";
 import {
   LocalCompanionRefreshController,
+  createDeferredAccountingRebuildRecorder,
   createLocalCollectorRefreshRunner,
   createTerminalRefreshFailureRecorder,
 } from "../../src/local-companion-refresh.js";
@@ -2713,6 +2714,14 @@ function createPreparedLocalCompanionServer({
     // in-memory state. Every terminal refresh failure now files one bounded,
     // rate-limited diagnostics note — codes, step, and timestamp only.
     onTerminalFailure: createTerminalRefreshFailureRecorder({
+      recordNote: recordDiagnosticNote,
+      clock,
+    }),
+    // A memory-budget miss is now a SOFT outcome (the refresh succeeds serving
+    // the retained cache), so the terminal recorder above never files it. This
+    // sibling recorder keeps that one bounded, rate-limited diagnostics note —
+    // the trail the five-hour incident was found by — for the degraded event.
+    onDegradedOutcome: createDeferredAccountingRebuildRecorder({
       recordNote: recordDiagnosticNote,
       clock,
     }),

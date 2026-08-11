@@ -27,6 +27,15 @@ const EARLY_HEADLINE_RECENT_TAIL_BYTES = 4 * 1024 * 1024;
 const EARLY_HEADLINE_RECENT_PRELUDE_BYTES = 512 * 1024;
 const EARLY_HEADLINE_BUFFERED_LINE_BYTES = 1024 * 1024;
 const MAX_REUSABLE_ACCOUNTING_CACHE_AGE_MS = 30 * 60 * 1_000;
+// After an accounting rebuild misses its memory budget the FULL rebuild is
+// backed off for this long. The refresh endpoint is driven by an external
+// ~5-minute scheduler, and without a backoff every tick re-ran the same doomed
+// pass — the live incident looped that way for five hours, blanking the
+// dashboard on each miss. During the backoff the cheap recent collector pass
+// and quota refresh still run and the retained accounting cache is served, so
+// the surface stays populated instead of flip-flopping; a successful rebuild
+// clears the backoff immediately.
+const ACCOUNTING_REBUILD_BUDGET_BACKOFF_MS = 30 * 60 * 1_000;
 // Standing owner rule (2026-08-08, after five rounds of cap-shuffling): NEVER
 // introduce or retain small data-window caps — a history limit is either
 // absent or extreme (365+ days), never convenience-sized. 31 and 93 were both
@@ -51,7 +60,7 @@ const INDEXING_PHASES = new Set([
   "paused",
   "prospective",
 ]);
-const ACCOUNTING_REFRESH_STATUSES = new Set(["reused", "rebuilt"]);
+const ACCOUNTING_REFRESH_STATUSES = new Set(["reused", "rebuilt", "deferred"]);
 const ARCHIVE_INDEX_STATUSES = new Set(["complete", "partial"]);
 const ARCHIVE_INDEX_PHASES = new Set(["complete", "awaiting_resume"]);
 const ARCHIVE_INDEX_ERROR_CODES = new Set([
@@ -166,6 +175,68 @@ export function createTerminalRefreshFailureRecorder({
         code,
         requestId: "",
         ...(step === null ? {} : { step }),
+        ...(detail === null ? {} : { detail }),
+      });
+    } catch {
+      // The diagnostics trail must never affect the refresh outcome.
+      return false;
+    }
+    return true;
+  };
+}
+
+/**
+ * The onDegradedOutcome sink for LocalCompanionRefreshController: a rebuild
+ * that missed its memory budget is now a SOFT outcome (the refresh succeeds
+ * serving the retained cache), so the terminal-failure recorder never sees it.
+ * This files the one bounded, rate-limited diagnostics note that keeps the
+ * trail the incident was found by — a fixed surface/code/step plus the budget
+ * reason code, no message text, path, or payload. Rate-limited on the same
+ * (code, step, detail) signature cadence as the terminal recorder so a backed
+ * off scheduler loop cannot turn it into a write storm.
+ */
+export function createDeferredAccountingRebuildRecorder({
+  recordNote,
+  clock = () => Date.now(),
+  randomIndex = (bound) => randomInt(bound),
+} = {}) {
+  if (typeof recordNote !== "function") {
+    throw new TypeError("recordNote must be a function");
+  }
+  if (typeof clock !== "function" || typeof randomIndex !== "function") {
+    throw new TypeError("deferred accounting rebuild recorder controls are invalid");
+  }
+  const lastNoteAtBySignature = new Map();
+  return async function recordDeferredAccountingRebuild(outcome) {
+    const detail = typeof outcome?.reason === "string"
+        && REFRESH_FAILURE_CODE_PATTERN.test(outcome.reason)
+      ? outcome.reason
+      : null;
+    const signature = `accounting_rebuild_deferred\0accounting\0${detail ?? ""}`;
+    const now = clock();
+    const lastAt = lastNoteAtBySignature.get(signature);
+    if (Number.isFinite(lastAt)
+        && now - lastAt < REFRESH_FAILURE_NOTE_INTERVAL_MS) {
+      return false;
+    }
+    lastNoteAtBySignature.delete(signature);
+    lastNoteAtBySignature.set(signature, now);
+    if (lastNoteAtBySignature.size > REFRESH_FAILURE_NOTE_SIGNATURE_LIMIT) {
+      lastNoteAtBySignature.delete(
+        lastNoteAtBySignature.keys().next().value,
+      );
+    }
+    let reference = "TT-";
+    for (let symbol = 0; symbol < 6; symbol += 1) {
+      reference += DIAGNOSTIC_REFERENCE_ALPHABET[randomIndex(32)];
+    }
+    try {
+      await recordNote({
+        reference,
+        surface: REFRESH_FAILURE_NOTE_SURFACE,
+        code: "accounting_rebuild_deferred",
+        requestId: "",
+        step: "accounting",
         ...(detail === null ? {} : { detail }),
       });
     } catch {
@@ -501,6 +572,11 @@ export function createLocalCollectorRefreshRunner({
       || recentIndexWindowMs > 31 * 24 * 60 * 60 * 1_000) {
     throw new TypeError("recent index window is invalid");
   }
+  // Cross-invocation backoff for a memory-budget miss. Held in the runner
+  // closure so it survives between the external scheduler's ticks: once a
+  // rebuild defers, the FULL rebuild is skipped (the retained cache is served)
+  // until this instant passes. A successful rebuild resets it to 0.
+  let accountingRebuildDeferUntilMs = 0;
   return async function refreshLocalCollector({
     signal = null,
     onProgress = null,
@@ -645,6 +721,7 @@ export function createLocalCollectorRefreshRunner({
     }
     let accounting = null;
     let accountingRefreshStatus = null;
+    let accountingRebuildDeferred = null;
     refreshStep = "accounting";
     if (refreshAccounting !== null && accountingMayRun) {
       // A provider quota observation does not alter replay-safe token
@@ -653,26 +730,43 @@ export function createLocalCollectorRefreshRunner({
       // card independently.
       const collectorWroteNoRolloutUsage =
         result?.rolloutRecordsWritten === 0;
-      if (collectorWroteNoRolloutUsage && signal?.aborted !== true) {
+      // A recent rebuild that missed its memory budget backs the FULL rebuild
+      // off: within this window we serve the retained cache rather than re-run
+      // the doomed pass on every scheduler tick and blank the surface again.
+      const withinRebuildBackoff = clock() < accountingRebuildDeferUntilMs;
+      if ((collectorWroteNoRolloutUsage || withinRebuildBackoff)
+          && signal?.aborted !== true) {
         try {
           const existing = await readAccountingCache({
             ...(stateFile === null ? {} : { stateFile }),
             now: clock,
-            maximumAgeMs: MAX_REUSABLE_ACCOUNTING_CACHE_AGE_MS,
+            // During backoff a labelled estimate beats a blank surface, so the
+            // ordinary reuse-age gate is lifted (a valid cache then reads
+            // "available" regardless of age). Outside backoff the gate stays,
+            // so a cache older than the reuse age is not silently reused.
+            ...(withinRebuildBackoff
+              ? {}
+              : { maximumAgeMs: MAX_REUSABLE_ACCOUNTING_CACHE_AGE_MS }),
           });
           if (signal?.aborted !== true
               && existing?.status === "available"
               && existing.cache?.schemaVersion
                 === REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION) {
             accounting = existing.cache;
-            accountingRefreshStatus = "reused";
+            // No new usage -> the reused cache still covers every event, so it
+            // is exact ("reused"). Otherwise it is served only because the
+            // rebuild is backed off, so it is a deferred (possibly stale)
+            // estimate the surface labels as pending.
+            accountingRefreshStatus = collectorWroteNoRolloutUsage
+              ? "reused"
+              : "deferred";
           }
         } catch {
           // A failed cache read is never authoritative. Rebuild below.
         }
       }
-      if (accounting === null) {
-        accounting = await refreshAccounting({
+      if (accounting === null && !withinRebuildBackoff) {
+        const rebuilt = await refreshAccounting({
           codexHome,
           ...(stateFile === null ? {} : { stateFile }),
           now: clock,
@@ -687,7 +781,43 @@ export function createLocalCollectorRefreshRunner({
           declaredSpeedBaselines,
           signal,
         });
-        accountingRefreshStatus = "rebuilt";
+        if (rebuilt?.status === "accounting_rebuild_deferred") {
+          // Memory-budget miss soft-failed inside the rebuild: the prior
+          // on-disk cache was retained untouched. Do NOT fail the refresh —
+          // back off the full rebuild and serve whatever valid cache is on
+          // disk so the dashboard keeps its last honest estimate instead of
+          // blanking.
+          accountingRebuildDeferUntilMs = clock()
+            + ACCOUNTING_REBUILD_BUDGET_BACKOFF_MS;
+          accountingRebuildDeferred = {
+            reason: REFRESH_FAILURE_CODE_PATTERN.test(rebuilt.reason ?? "")
+              ? rebuilt.reason
+              : "accounting_rebuild_deferred",
+            retained: rebuilt.retained === true,
+          };
+          if (rebuilt.retained === true && signal?.aborted !== true) {
+            try {
+              const existing = await readAccountingCache({
+                ...(stateFile === null ? {} : { stateFile }),
+                now: clock,
+              });
+              if (existing?.status === "available"
+                  && existing.cache?.schemaVersion
+                    === REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION) {
+                accounting = existing.cache;
+                accountingRefreshStatus = "deferred";
+              }
+            } catch {
+              // Retained-cache read failed; the surface shows honest
+              // insufficient-evidence rather than a fabricated total.
+            }
+          }
+        } else {
+          accounting = rebuilt;
+          accountingRefreshStatus = "rebuilt";
+          // A successful rebuild clears any prior budget-miss backoff.
+          accountingRebuildDeferUntilMs = 0;
+        }
       }
     }
     const notificationEvidence = publicNotificationEvidence(
@@ -749,6 +879,9 @@ export function createLocalCollectorRefreshRunner({
       ...(publicArchiveIndexResult(archiveIndex) === null
         ? {}
         : { archiveIndex: publicArchiveIndexResult(archiveIndex) }),
+      ...(accountingRebuildDeferred === null
+        ? {}
+        : { accountingRebuildDeferred }),
       ...(unifiedIndex === null ? {} : { unifiedIndex }),
       ...(publicIndexingResult(result?.indexing) === null
         ? {}
@@ -833,6 +966,22 @@ function publicRefreshResult(result, now = Date.now()) {
   }
   const archiveIndex = publicArchiveIndexResult(result?.archiveIndex);
   if (archiveIndex !== null) projected.archiveIndex = archiveIndex;
+  const deferred = result?.accountingRebuildDeferred;
+  if (deferred && typeof deferred === "object" && !Array.isArray(deferred)) {
+    // A memory-budget miss is a soft, non-terminal outcome: the refresh
+    // succeeded serving the retained cache. Surface it so a first-party caller
+    // can show "using the estimate from <time>; a fuller rebuild is pending"
+    // instead of treating the run as breakage. Content-free: a fixed status
+    // plus the bounded budget reason code.
+    projected.accountingRebuildDeferred = {
+      status: "deferred",
+      reason: typeof deferred.reason === "string"
+          && REFRESH_FAILURE_CODE_PATTERN.test(deferred.reason)
+        ? deferred.reason
+        : "accounting_rebuild_deferred",
+      retained: deferred.retained === true,
+    };
+  }
   return projected;
 }
 
@@ -842,8 +991,10 @@ export class LocalCompanionRefreshController {
   #clock;
   #createRefreshId;
   #dataStore;
+  #degradedNotified = false;
   #failureNotified = false;
   #inFlight = null;
+  #onDegradedOutcome;
   #onTerminalFailure;
   #runner;
   #state;
@@ -861,6 +1012,12 @@ export class LocalCompanionRefreshController {
     // note. Never invoked for success, cancellation, or non-terminal states,
     // and at most once per run; its own failures are swallowed.
     onTerminalFailure = null,
+    // Observer for a SOFT degraded outcome: a refresh that SUCCEEDED but whose
+    // accounting rebuild missed its memory budget and was deferred (the
+    // retained cache is served). Receives only { reason, retained }, so a sink
+    // can file a content-free note keeping the trail the terminal recorder no
+    // longer sees. At most once per run; its own failures are swallowed.
+    onDegradedOutcome = null,
   }) {
     if (typeof runner !== "function") throw new TypeError("runner must be a function");
     if (!dataStore || typeof dataStore.reload !== "function") {
@@ -875,12 +1032,16 @@ export class LocalCompanionRefreshController {
     if (onTerminalFailure !== null && typeof onTerminalFailure !== "function") {
       throw new TypeError("onTerminalFailure must be a function or null");
     }
+    if (onDegradedOutcome !== null && typeof onDegradedOutcome !== "function") {
+      throw new TypeError("onDegradedOutcome must be a function or null");
+    }
     this.#runner = runner;
     this.#dataStore = dataStore;
     this.#timeoutMs = timeoutMs;
     this.#clock = clock;
     this.#createRefreshId = createRefreshId;
     this.#onTerminalFailure = onTerminalFailure;
+    this.#onDegradedOutcome = onDegradedOutcome;
     this.#state = {
       status: "idle",
       refreshId: null,
@@ -935,6 +1096,27 @@ export class LocalCompanionRefreshController {
     }
   }
 
+  // Fire-and-forget, mirroring #notifyTerminalFailure but for a SOFT degraded
+  // outcome: a succeeded run whose accounting rebuild was deferred over budget.
+  // Only the bounded { reason, retained } identity is passed; at most once per
+  // run, and the sink's own failures never touch refresh state.
+  #notifyDegradedOutcome(result) {
+    if (this.#onDegradedOutcome === null || this.#degradedNotified) return;
+    const deferred = result?.accountingRebuildDeferred;
+    if (!deferred || typeof deferred !== "object" || Array.isArray(deferred)) {
+      return;
+    }
+    this.#degradedNotified = true;
+    try {
+      Promise.resolve(this.#onDegradedOutcome({
+        reason: typeof deferred.reason === "string" ? deferred.reason : null,
+        retained: deferred.retained === true,
+      })).catch(() => {});
+    } catch {
+      // A throwing sink is treated exactly like a rejecting one.
+    }
+  }
+
   start() {
     if (this.#inFlight !== null) return false;
     const startedAt = this.#clock();
@@ -945,6 +1127,7 @@ export class LocalCompanionRefreshController {
     }
     this.#cancelRequested = false;
     this.#failureNotified = false;
+    this.#degradedNotified = false;
     this.#state = {
       status: "running",
       refreshId,
@@ -1048,6 +1231,10 @@ export class LocalCompanionRefreshController {
           quickResultAt: this.#state.quickResultAt,
           errorCode: null,
         };
+        // A budget miss is a SOFT outcome: the run succeeded serving the
+        // retained cache. File the degraded-event note (kept from the incident)
+        // now that the terminal-failure path no longer sees it.
+        this.#notifyDegradedOutcome(result);
       })
       .catch(async (error) => {
         if (this.#cancelRequested) {
