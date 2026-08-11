@@ -1368,34 +1368,37 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         return .live(remainingPercent: lane.remainingPercent)
     }
 
-    /// Use a bold system bird first: SF Symbols supplies the crisp 16pt
-    /// geometry that a menu bar needs. If a restricted launch context cannot
-    /// resolve that symbol, derive the same mark from the approved app icon.
+    /// The status item carries the TiboTattle bird, so the mark derived from
+    /// the approved app icon comes first. The SF Symbols bird is a generic
+    /// system bird, not the product's mark; it exists only as the emergency
+    /// fallback for a launch context that cannot read the bundled icon.
     private static func makeBrandBirdTemplate() -> NSImage? {
-        if let native = nativeBirdTemplate() { return native }
-        return makeAssetBirdTemplate()
+        if let asset = makeAssetBirdTemplate() { return asset }
+        return nativeBirdTemplate()
     }
 
-    /// Extract only the bright bird from the approved app icon as a fallback.
-    /// The source artwork uses a deep-green plate behind a cream/amber mark;
-    /// turning that plate into transparency avoids ever shrinking the full
-    /// application icon into the status item.
+    /// Extract only the bright bird from the approved app icon. The source
+    /// artwork uses a deep-green plate behind a cream/amber mark; turning
+    /// that plate into transparency avoids ever shrinking the full
+    /// application icon into the status item. Returns nil when no usable
+    /// icon is available so the caller can fall back honestly.
     private static func makeAssetBirdTemplate() -> NSImage? {
-        guard let source = NSApp.applicationIconImage,
+        guard let application = NSApp,
+              let source = application.applicationIconImage,
               let sourceCGImage = source.cgImage(
                   forProposedRect: nil,
                   context: nil,
                   hints: nil
               )
         else {
-            return nativeBirdTemplate()
+            return nil
         }
 
         let sourceRep = NSBitmapImageRep(cgImage: sourceCGImage)
         let sourceWidth = sourceRep.pixelsWide
         let sourceHeight = sourceRep.pixelsHigh
         guard sourceWidth > 0, sourceHeight > 0 else {
-            return nativeBirdTemplate()
+            return nil
         }
 
         // NSApp's icon is a square. This crop follows the bird's visible
@@ -1420,7 +1423,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             bytesPerRow: 0,
             bitsPerPixel: 0
         ) else {
-            return nativeBirdTemplate()
+            return nil
         }
         targetRep.size = NSSize(width: pixelSize, height: pixelSize)
 
@@ -1450,9 +1453,15 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
                 let color = sourceRep.colorAt(x: sourceX, y: sourceY)?
                     .usingColorSpace(.deviceRGB)
                 let red = color?.redComponent ?? 0
-                // The approved plate is substantially darker in red than
-                // the bird. Keep a soft edge instead of a binary cutout.
-                let alpha = min(1, max(0, (red - 0.16) / 0.26))
+                // Transparent squircle corners can report a bright colour,
+                // and the plate's drop shadow is translucent; gate on the
+                // source pixel's own alpha so only the bird itself survives.
+                let sourceAlpha = color?.alphaComponent ?? 0
+                // Measured from the approved icns: the plate's red channel
+                // stays below 0.25 and the cream/amber bird above 0.90, so a
+                // ramp across the gap keeps a soft anti-aliased edge without
+                // letting plate grain mist the mark.
+                let alpha = min(1, max(0, (red - 0.35) / 0.40)) * sourceAlpha
                 if alpha > 0.05 { retainedPixels += 1 }
                 var pixel = [255, 255, 255, Int((alpha * 255).rounded())]
                 pixel.withUnsafeMutableBufferPointer {
@@ -1460,7 +1469,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
                 }
             }
         }
-        guard retainedPixels > 0 else { return nativeBirdTemplate() }
+        guard retainedPixels > 0 else { return nil }
 
         let template = NSImage(size: NSSize(width: pixelSize, height: pixelSize))
         template.addRepresentation(targetRep)
@@ -1468,8 +1477,9 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         return template
     }
 
-    /// SF Symbols is a system-owned mark that matches TiboTattle's bird
-    /// branding without introducing another bundled artwork file.
+    /// Emergency fallback only: a system-owned generic bird for the launch
+    /// contexts where the approved app icon cannot be read at all. The brand
+    /// mark from `makeAssetBirdTemplate()` is always preferred.
     private static func nativeBirdTemplate() -> NSImage? {
         let symbol = NSImage(
             systemSymbolName: "bird.fill",

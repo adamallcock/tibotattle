@@ -1110,7 +1110,20 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(menuBarStatusSource, /private static let idlePollSeconds = 60/u);
   assert.match(menuBarStatusSource, /refreshStaleEvidenceIfNeeded\(\)/u);
   assert.match(menuBarStatusSource, /private static func makeBrandBirdTemplate\(\)/u);
-  assert.match(menuBarStatusSource, /NSApp\.applicationIconImage/u);
+  // The status item must render the TiboTattle mark derived from the
+  // approved app icon. The SF Symbols bird is a GENERIC system bird and may
+  // exist only as the emergency fallback — never as the preferred mark.
+  assert.match(
+    menuBarStatusSource,
+    /private static func makeBrandBirdTemplate\(\) -> NSImage\? \{\s*if let asset = makeAssetBirdTemplate\(\) \{ return asset \}\s*return nativeBirdTemplate\(\)\s*\}/u,
+    "brand bird template must prefer the app-icon mark over the SF Symbols bird",
+  );
+  assert.doesNotMatch(
+    menuBarStatusSource,
+    /if let native = nativeBirdTemplate\(\) \{ return native \}/u,
+    "the generic SF Symbols bird must never be preferred over the brand mark",
+  );
+  assert.match(menuBarStatusSource, /NSApp\.applicationIconImage|application\.applicationIconImage/u);
   assert.match(menuBarStatusSource, /template\.isTemplate = true/u);
   assert.match(menuBarStatusSource, /systemSymbolName: "bird\.fill"/u);
   assert.match(menuBarStatusSource, /let glyphSize = NSSize\(width: 16, height: 16\)/u);
@@ -1578,7 +1591,35 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
     /NSStatusBar\.system\.statusItem\(\s*withLength: NSStatusItem\.variableLength\s*\)/u,
   );
   assert.match(source, /private static func makeBrandBirdTemplate\(\)/u);
-  assert.match(source, /NSApp\.applicationIconImage/u);
+  // Regression guard (v0.1.4 shipped the generic SF Symbols bird): the brand
+  // mark extracted from the approved app icon must be the preferred glyph,
+  // and the extractor must fail to nil — the single fallback decision lives
+  // in makeBrandBirdTemplate, never hidden inside the extractor.
+  assert.match(
+    source,
+    /private static func makeBrandBirdTemplate\(\) -> NSImage\? \{\s*if let asset = makeAssetBirdTemplate\(\) \{ return asset \}\s*return nativeBirdTemplate\(\)\s*\}/u,
+    "brand bird template must prefer the app-icon mark over the SF Symbols bird",
+  );
+  assert.doesNotMatch(
+    source,
+    /if let native = nativeBirdTemplate\(\) \{ return native \}/u,
+    "the generic SF Symbols bird must never be preferred over the brand mark",
+  );
+  const assetExtractor = source.match(
+    /private static func makeAssetBirdTemplate\(\)[\s\S]*?\n    \}/u,
+  )?.[0] ?? "";
+  assert.ok(assetExtractor, "asset bird extractor should be present");
+  assert.doesNotMatch(
+    assetExtractor,
+    /nativeBirdTemplate\(\)/u,
+    "extractor failure paths must return nil, not silently substitute the generic bird",
+  );
+  assert.match(
+    assetExtractor,
+    /alphaComponent/u,
+    "extractor must gate on source alpha so shadow and corner pixels never speckle the mark",
+  );
+  assert.match(source, /NSApp\.applicationIconImage|application\.applicationIconImage/u);
   assert.match(source, /template\.isTemplate = true/u);
   assert.match(source, /systemSymbolName: "bird\.fill"/u);
   assert.match(source, /let glyphSize = NSSize\(width: 16, height: 16\)/u);
