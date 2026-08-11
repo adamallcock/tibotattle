@@ -548,15 +548,16 @@
                 <button class="button button-quiet compact" id="timeline-pan-forward" type="button" title="Pan calibration later" data-i18n-title="title.panCalibrationLater">Later →</button>
                 <span class="sr-only" id="timeline-zoom-status" aria-live="polite"></span>
               </div>
-              <div class="legend" aria-label="Calibration chart legend" data-i18n-aria-label="aria.calibrationLegend">
-                <span><i class="legend-dot observed"></i>Observed quota</span>
-                <span><i class="legend-dot expected"></i>Expected from API cost</span>
-                <span><i class="legend-dot chart-status-missing"></i>Missing quota bracket</span>
-                <span><i class="legend-dot chart-status-reset"></i>Window boundary or track change</span>
-                <span><i class="legend-dot chart-status-ambiguous"></i>Movement needs context</span>
-                <span><i class="legend-dot chart-status-saturated"></i>Allowance exhausted</span>
-              </div>
             </div>
+          </div>
+          <div class="legend calibration-legend" aria-label="Calibration chart legend" data-i18n-aria-label="aria.calibrationLegend">
+            <span><i class="legend-dot observed"></i>Observed quota</span>
+            <span><i class="legend-dot expected"></i>Expected from API cost</span>
+            <span class="legend-group-sep" aria-hidden="true"></span>
+            <span><i class="legend-dot area chart-status-missing"></i>Missing quota bracket</span>
+            <span><i class="legend-dot area chart-status-reset"></i>Window boundary or track change</span>
+            <span><i class="legend-dot area chart-status-ambiguous"></i>Movement needs context</span>
+            <span><i class="legend-dot area chart-status-saturated"></i>Allowance exhausted</span>
           </div>
           <div class="chart-empty" id="timeline-empty">
             <strong>No timeline loaded</strong>
