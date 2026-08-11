@@ -140,6 +140,62 @@ const MAX_PARTICIPANT_RELAY_REQUEST_BYTES = 2 * 1024 * 1024;
 const MAX_PARTICIPANT_RELAY_RESPONSE_BYTES = 4 * 1024 * 1024;
 const MAX_PARTICIPANT_EXPORT_RESPONSE_BYTES = 192 * 1024 * 1024;
 const PARTICIPANT_RELAY_TIMEOUT_MS = 15_000;
+// Outbound pre-warm to the contribution service (owner-reported 15.23s cold
+// call, 2026-08-10). This is the outbound twin of v0.1.6's inbound keep-alive
+// fix, which only tuned the WKWebView->companion socket. Node's global fetch
+// dispatcher pays the full cold DNS+TCP+TLS handshake on the first outbound
+// call — a measured 15.23s, right at the relay's 15s abort budget above, so the
+// first participant action after startup can time out. A best-effort pre-warm
+// ping at startup pays that handshake off the hot path and seeds the outbound
+// connection pool before the user's first action.
+//
+// NOTE: the deeper "hold the warm connection for minutes between actions" half
+// of this fix wants a persistent dispatcher with a minutes-long
+// keepAliveTimeout, which on Node means an undici Agent. undici is deliberately
+// NOT added here: the macOS runtime is closed over an exact dependency
+// allowlist (test/macos-app-bundle.test.js) that undici is not part of, and
+// smuggling it in — statically or by a computed import — would break that
+// supply-chain closure. Extending the idle window is therefore left to an owner
+// decision (approve undici into the runtime allowlist) or to the Worker
+// emitting a long `Keep-Alive: timeout=` response header; the pre-warm below is
+// the dependency-free half that removes the measured cold handshake.
+const CENTRAL_PREWARM_TIMEOUT_MS = 10_000;
+
+/**
+ * Wrap the outbound central fetch with a startup pre-warm, engaged only for the
+ * real production HTTPS service and only when the process is using Node's own
+ * fetch (tests inject their own fetchImpl and are never wrapped or pre-warmed).
+ * The fetch itself is unchanged — only the startup handshake is paid early.
+ */
+export function createCentralOutboundFetch({ baseFetch, centralOrigin, enabled }) {
+  const origin = participantCentralOrigin(centralOrigin);
+  const eligible = enabled === true
+    && origin !== null
+    && origin.startsWith("https://");
+  return Object.freeze({
+    fetch: baseFetch,
+    async warmUp() {
+      if (!eligible) return;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), CENTRAL_PREWARM_TIMEOUT_MS);
+      timeout.unref?.();
+      try {
+        await baseFetch(`${origin}/api/health`, {
+          method: "GET",
+          headers: { Accept: "application/json" },
+          redirect: "error",
+          signal: controller.signal,
+        });
+      } catch {
+        // Best effort: even a rejected request has already completed the
+        // DNS+TCP+TLS handshake and seeded the connection pool, which is the
+        // whole point of warming it.
+      } finally {
+        clearTimeout(timeout);
+      }
+    },
+  });
+}
 const DEVELOPMENT_IDENTITY_FILE_ENV =
   "USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE";
 const DEVELOPMENT_IDENTITY_OPT_IN_ENV =
@@ -2726,13 +2782,22 @@ function createPreparedLocalCompanionServer({
       clock,
     }),
   });
+  // One keep-alive-tuned outbound fetch feeds both the proxy and the relay, so
+  // the pre-warmed connection is reused by every central request. Only the real
+  // production default fetch is wrapped; an injected fetchImpl passes through
+  // untouched.
+  const centralOutbound = createCentralOutboundFetch({
+    baseFetch: centralFetch,
+    centralOrigin,
+    enabled: centralFetch === globalThis.fetch,
+  });
   const centralProxy = createLocalCentralProxy({
     centralOrigin,
-    fetchImpl: centralFetch,
+    fetchImpl: centralOutbound.fetch,
   });
   const participantRelay = createParticipantRelay({
     centralOrigin,
-    fetchImpl: centralFetch,
+    fetchImpl: centralOutbound.fetch,
   });
   let reviewedContributionAuthorization = null;
 
@@ -3793,6 +3858,7 @@ function createPreparedLocalCompanionServer({
     dataStore,
     refresh,
     automaticContribution,
+    centralOutbound,
     [PARENT_WATCHDOG_PID]: parentWatchdogPid,
     async initialize() {
       await acquireInstanceLock();
@@ -3859,6 +3925,11 @@ export async function startLocalCompanionServer({
   // it still stops automatic contribution and releases the instance lock.
   const snapshotReady = app.buildSnapshot();
   snapshotReady.catch(() => {});
+  // Warm the outbound connection to the contribution service off the hot path
+  // with a best-effort pre-warm ping. A no-op unless this process is talking to
+  // the real production service with Node's own fetch, and it never blocks
+  // readiness.
+  void app.centralOutbound?.warmUp().catch(() => {});
   return {
     ...app,
     host,

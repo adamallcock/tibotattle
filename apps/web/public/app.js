@@ -173,6 +173,14 @@ let communityDevicePaired = false;
 // v0.1-era credential or a previously accepted upload is deliberately not
 // enough: the ceremony re-pairs unless this exact evidence exists.
 let communityDevicePairedV1 = false;
+// When THIS page last minted a fresh community session (the enrollment adopts
+// one in the same ceremony). A session-rejection on a pairing mint fired
+// milliseconds after this is the WKWebView cookie-commit race, not a dead
+// stored session, so the sign-in gate must not discard the session this
+// ceremony just established (owner-reported "the sign-in that just worked was
+// thrown away", 2026-08-10). Restored or stored sessions leave this null: only
+// a mint records a timestamp, so an old session is never mistaken for fresh.
+let communitySessionMintedAt = null;
 // The opaque sign-in proof lives only in this module-scoped memory; it is
 // never persisted to storage and disappears with the tab.
 let hostedIdentity = null;
@@ -428,6 +436,9 @@ function setCommunitySession(value) {
     // Losing the session means the next primary action is a connection again,
     // not a review of something this Mac can no longer send.
     communityDevicePaired = false;
+    // A cleared session is no longer freshly minted, so a later rejection is a
+    // genuine dead-session gate rather than the mint race.
+    communitySessionMintedAt = null;
     renderContributionActionState();
   }
 }
@@ -7691,7 +7702,7 @@ const SERVICE_ERROR_COPY = {
   KEY_ID_INVALID:
     "The upload key this build used is not one the contribution service recognizes. Nothing was uploaded; install the current signed build.",
   LIFECYCLE_BOUNDS_EXCEEDED:
-    "The request went beyond a fixed safety bound in the contribution service. Nothing was uploaded; choose a shorter interval.",
+    "This account already has its maximum of connected Macs, so this Mac was not connected. Sign out a Mac you no longer use from its own TiboTattle, then connect this one again. Nothing was uploaded.",
   LIFECYCLE_STATE_CONFLICT:
     "The contribution service is in a different state than this page expected. Nothing was uploaded; reload TiboTattle and try again.",
   TELEMETRY_REQUIRED:
@@ -8059,16 +8070,75 @@ function renderHostedIdentity() {
       ? "Signing out ends this app's contribution session."
       : "This app already has a contribution session. Signing out ends it.",
   );
-  setProductText(chip, signedIn
-    ? "Signed in"
-    : hostedIdentityBusy ? "Signing in…" : "Not signed in");
-  chip.className = signedIn
+  // One honest, four-state identity status (owner-reported contradictions,
+  // 2026-08-08/10). A single flat "Signed in"/"Not signed in" chip could not
+  // tell never-tried from signing-in from reconnecting from connected, so it
+  // showed a live in-page proof as "Signed in", a completed Google round trip
+  // as "Not signed in", and an APPROVED Mac beside a dead action. The merged
+  // model resolves all three, and the ONE next action is stated beside it so
+  // the chip and the action can never disagree.
+  const identityState = hostedIdentityStatusState({
+    signingIn: hostedIdentityBusy
+      || activeHostedSignIn !== null
+      || pendingHostedSignInResumeInFlight,
+    signedIn,
+    hasServerSession,
+    repairPending: incrementalConsentApproved && incrementalUploadAuthorityLost(),
+  });
+  setLocalizedText(chip, IDENTITY_STATE_CHIP_KEYS[identityState]);
+  chip.className = identityState === "connected"
     ? "evidence-chip"
     : "evidence-chip neutral";
+  const nextAction = $("#identity-signin-next");
+  if (nextAction) {
+    setLocalizedText(
+      nextAction,
+      hostedIdentityNextActionKey(identityState, hostedSignInRequired()),
+    );
+  }
   // Sign-in state gates the single approve ceremony, so the merged surface
   // and the journey strip re-render with it (owner-directed 2026-08-08: the
   // separate connect button this used to refresh is gone).
   renderContributionActionState();
+}
+
+// The four merged identity states and their one-next-action lines. Kept beside
+// renderHostedIdentity so the chip vocabulary and the action vocabulary are
+// read from the same place.
+const IDENTITY_STATE_CHIP_KEYS = Object.freeze({
+  new: "identity.state.new",
+  signingIn: "identity.state.signingIn",
+  reconnecting: "identity.state.reconnecting",
+  connected: "identity.state.connected",
+});
+const IDENTITY_STATE_NEXT_KEYS = Object.freeze({
+  new: "identity.next.new",
+  signingIn: "identity.next.signingIn",
+  reconnecting: "identity.next.reconnecting",
+  connected: "identity.next.connected",
+});
+
+/**
+ * The one honest identity status, from the underlying facts. Signing-in wins
+ * over everything: an in-flight ceremony is the truest current state. Otherwise
+ * a Mac that holds only an in-page proof, or whose upload authority is being
+ * re-paired, is Reconnecting rather than a flat "Connected"; a real server
+ * session with nothing pending is Connected; and nothing at all is New — never
+ * "Not signed in" right after a completed round trip left a live proof.
+ */
+function hostedIdentityStatusState({ signingIn, signedIn, hasServerSession, repairPending }) {
+  if (signingIn) return "signingIn";
+  if (repairPending || (signedIn && !hasServerSession)) return "reconnecting";
+  if (signedIn) return "connected";
+  return "new";
+}
+
+// A reconnect that has lost its session names its own next step — sign in
+// again — rather than implying nothing is asked of the reader.
+function hostedIdentityNextActionKey(identityState, signInRequired) {
+  return identityState === "reconnecting" && signInRequired
+    ? "identity.next.reconnectSignIn"
+    : IDENTITY_STATE_NEXT_KEYS[identityState];
 }
 
 // A completed hosted handoff is memory-only, but enrollment also creates an
@@ -8109,17 +8179,33 @@ async function signOutHostedIdentity() {
   }
 }
 
-// The service holds a completed sign-in for five minutes, so the poll stops
-// exactly when the handoff can no longer be delivered rather than earlier: the
-// user is authenticating in a separate browser window and may be typing a
-// password and a second factor.
-const HOSTED_SIGNIN_POLL_ATTEMPTS = 150;
+// The poll must cover the service's authorization window, not undershoot it
+// (owner-reported, 2026-08-10). The Worker holds an unused sign-in
+// authorization for ten minutes (SIGNIN_HANDOFF_AUTHORIZATION_TTL_MILLISECONDS)
+// — a full human round trip: a cold-starting browser, an account chooser, a
+// password, a second factor. The old five-minute client budget gave up while
+// the service still held the authorization, so a careful user's completed
+// sign-in expired unread and the exhaustion logged error:null → "unknown".
+// Ten minutes matches the service, so the poll stops exactly when the
+// authorization can no longer be redeemed rather than minutes earlier.
+const HOSTED_SIGNIN_POLL_ATTEMPTS = 300;
 const HOSTED_SIGNIN_POLL_INTERVAL_MS = 2_000;
 // The service-side hold, stated once: the poll budget IS the validity window,
 // and the persisted pending handoff below uses the same bound so this page
 // never claims a proof the service has already discarded.
 const HOSTED_SIGNIN_HANDOFF_VALIDITY_MS =
   HOSTED_SIGNIN_POLL_ATTEMPTS * HOSTED_SIGNIN_POLL_INTERVAL_MS;
+
+// A failure at the local relay to the contribution service — not a verdict
+// from the Worker — surfaces as one of the companion's fixed
+// central_participant_* codes. It means the read-back never reached the
+// service, so it is transient by nature: retry it within the bounded sign-in
+// budget exactly like a still-pending result, and never let it destroy the
+// pending handoff (owner-reported relay identity loss, 2026-08-10).
+function isTransientSignInRelayError(error) {
+  return typeof error?.code === "string"
+    && error.code.startsWith("central_participant_");
+}
 
 // The packaged Mac app stamps this fixed marker before any dashboard script
 // runs. A normal browser keeps the dashboard page open in a second tab while
@@ -8358,20 +8444,28 @@ async function resumePendingHostedSignIn({ retries = 2 } = {}) {
     return;
   }
   pendingHostedSignInResumeInFlight = true;
+  // A reactivation is collecting a completed sign-in: hold off any teardown
+  // until it settles, exactly like a live sign-in.
+  signalHostedSignInInFlight(true);
   try {
     for (let attemptIndex = 0; attemptIndex <= retries; attemptIndex += 1) {
       let identity = null;
       try {
         identity = await flow.result(pending.state, pending.verifier);
       } catch (error) {
-        if (error?.code === "IDENTITY_RESULT_PENDING") {
-          // The provider has not returned yet; retry shortly, then leave the
-          // record for the next activation inside the validity window.
+        if (error?.code === "IDENTITY_RESULT_PENDING"
+            || isTransientSignInRelayError(error)) {
+          // Not a verdict on the proof: the provider has not returned yet, or
+          // the local relay to the service failed transiently
+          // (central_participant_*). Retry within the bounded window and leave
+          // the record intact for the next activation either way — a transient
+          // relay failure must never destroy the pending handoff
+          // (owner-reported, 2026-08-10).
           identity = null;
         } else if (error?.code === undefined && error?.status === undefined) {
-          // Unreachable service: not a verdict on the proof. Keep the record
-          // and try again on the next activation rather than logging a note
-          // per focus change.
+          // Unreachable service with no code at all: not a verdict on the
+          // proof. Keep the record and try again on the next activation rather
+          // than logging a note per focus change.
           return;
         } else {
           clearPendingHostedSignIn();
@@ -8403,6 +8497,22 @@ async function resumePendingHostedSignIn({ retries = 2 } = {}) {
     }
   } finally {
     pendingHostedSignInResumeInFlight = false;
+    signalHostedSignInInFlight(false);
+  }
+}
+
+// Tell the native shell whether a hosted sign-in is in flight, so it refuses to
+// tear the web view — and the pending handoff — down mid-sign-in (S1). A no-op
+// in a normal browser, where window.webkit is undefined; it carries a single
+// boolean and never a proof, provider, or account value.
+function signalHostedSignInInFlight(inFlight) {
+  try {
+    window.webkit?.messageHandlers?.tibotattleHostedSignIn?.postMessage({
+      inFlight: Boolean(inFlight),
+    });
+  } catch {
+    // The bridge is optional; its absence only removes the native shell's
+    // mid-sign-in teardown guard, never anything the sign-in itself needs.
   }
 }
 
@@ -8422,6 +8532,9 @@ async function beginHostedSignIn(providerId) {
   };
   activeHostedSignIn = attempt;
   hostedIdentityBusy = true;
+  // The browser is about to open: from here until this settles, the shell must
+  // not tear the page down and lose the handoff.
+  signalHostedSignInInFlight(true);
   renderHostedIdentity();
   status.hidden = false;
   status.className = "participant-action-status";
@@ -8443,12 +8556,17 @@ async function beginHostedSignIn(providerId) {
       try {
         identity = await flow.result(request.state, request.verifier);
       } catch (error) {
-        if (error?.code !== "IDENTITY_RESULT_PENDING") throw error;
+        // A transient relay failure (central_participant_*) is retried within
+        // this bounded loop exactly like a pending result rather than aborting
+        // the whole poll with zero retry (owner-reported, 2026-08-10). A
+        // definite verdict still throws and is handled below.
+        const pendingResult = error?.code === "IDENTITY_RESULT_PENDING";
+        if (!pendingResult && !isTransientSignInRelayError(error)) throw error;
         // The fixed callback page wakes the native dashboard only after the
         // provider has returned. A current service turns a cancelled callback
         // into IDENTITY_TOKEN_INVALID; this branch preserves the same safe UI
         // outcome while a previously deployed service still reports pending.
-        if (attempt.returnedToApp) {
+        if (pendingResult && attempt.returnedToApp) {
           // A completed callback whose result stays pending is a read-back
           // failure the user acted on, so it is referenced and logged like
           // one (owner-reported silent failure, 2026-08-08) instead of
@@ -8519,6 +8637,9 @@ async function beginHostedSignIn(providerId) {
           : flow.failed),
     });
   } finally {
+    // Whatever the outcome, this attempt is no longer in flight — the shell may
+    // tear the web view down again.
+    signalHostedSignInInFlight(false);
     if (activeHostedSignIn === attempt) {
       activeHostedSignIn = null;
       hostedIdentityBusy = false;
@@ -9111,7 +9232,14 @@ async function approveIncrementalContribution() {
             consentVersion: "privacy-safe-telemetry-v0.1"
           });
           enrollmentEstablished = true;
-          return communityClient.createDevicePairing(false);
+          // Stamp the mint instant BEFORE the pairing goes out: the __Host-
+          // session cookie the enroll response just set may not have committed
+          // to this WKWebView's out-of-process cookie jar yet, so the mint can
+          // race ahead of it. The retry below closes that millisecond window,
+          // and the timestamp keeps the catch from mistaking this fresh
+          // session for a dead stored one.
+          communitySessionMintedAt = Date.now();
+          return mintDevicePairingWithCookieCommitRetry();
         });
       }
       await contributionConnectStep(
@@ -9151,12 +9279,17 @@ async function approveIncrementalContribution() {
     scheduleIncrementalSyncStatusPoll({ reset: true });
   } catch (error) {
     if (contributionConnectStepOf(error) !== null
-        && contributionSessionWasRejected(error)) {
+        && contributionSessionWasRejected(error)
+        && !contributionSessionMintedWithinRaceWindow()) {
       // The stored session was rejected mid-ceremony. This is the repair
       // loop's root (owner-reported, 2026-08-08): failure copy here repeated
       // on every load while the dead session survived. Render the sign-in
       // gate instead — once signed in, the ceremony resumes automatically.
-      renderContributionSessionSignInGate(status);
+      // A session THIS ceremony minted seconds ago is deliberately excluded:
+      // that is the cookie-commit race, not a dead session, so it falls
+      // through to the retryable failure below and keeps the fresh session
+      // rather than being silently discarded (owner-reported, 2026-08-10).
+      await renderContributionSessionSignInGate(status, error);
     } else if (contributionConnectStepOf(error) !== null
         || contributionDeviceRecoveryIsRequired(error)) {
       await reportContributionConnectFailure(status, error, {
@@ -9174,6 +9307,50 @@ async function approveIncrementalContribution() {
   } finally {
     incrementalConsentBusy = false;
     renderContributionActionState();
+  }
+}
+
+// The cookie-commit race window (owner-reported, 2026-08-10). v0.1.6 restructured
+// the ceremony to enroll first and then mint the device pairing, and it fires the
+// mint in the same microtask as the enroll response. The just-issued __Host-
+// session cookie has not necessarily committed to the WKWebView's out-of-process,
+// non-persistent cookie jar by then, so the mint can go out cookie-less and the
+// Worker answers with a session-rejection class code — even though the session it
+// just minted is perfectly valid. The commit window is milliseconds; these three
+// backoffs cover it comfortably without ever masking a genuinely refused
+// credential, since a truly dead session keeps rejecting through every retry and
+// then fails honestly.
+const CONTRIBUTION_MINT_COOKIE_COMMIT_BACKOFFS_MS = Object.freeze([250, 500, 1_000]);
+// How long after a fresh mint a session-rejection still reads as the race rather
+// than a dead session. It sits well above the summed backoffs plus round trips,
+// while a restored or stored session (mint time null) is never treated as fresh.
+const CONTRIBUTION_FRESH_SESSION_RACE_WINDOW_MS = 10_000;
+
+function contributionSessionMintedWithinRaceWindow() {
+  return communitySessionMintedAt !== null
+    && Date.now() - communitySessionMintedAt < CONTRIBUTION_FRESH_SESSION_RACE_WINDOW_MS;
+}
+
+/**
+ * Mint the v1.0 device pairing, retrying only the session-rejection class
+ * that the cookie-commit race produces. The first mint runs immediately; a
+ * rejection inside the race window is retried on a short bounded backoff
+ * before the ceremony is allowed to conclude failure, so the sign-in the user
+ * just completed is not thrown away by a cookie that had not committed yet.
+ */
+async function mintDevicePairingWithCookieCommitRetry() {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await communityClient.createDevicePairing(false);
+    } catch (error) {
+      if (attempt >= CONTRIBUTION_MINT_COOKIE_COMMIT_BACKOFFS_MS.length
+          || !contributionSessionWasRejected(error)) {
+        throw error;
+      }
+      await new Promise((resolveBackoff) => {
+        setTimeout(resolveBackoff, CONTRIBUTION_MINT_COOKIE_COMMIT_BACKOFFS_MS[attempt]);
+      });
+    }
   }
 }
 
@@ -9297,7 +9474,18 @@ function contributionSessionWasRejected(error) {
  * approval still stands, and after the next sign-in the ceremony resumes by
  * itself — see resumeContributionCeremonyAfterSignIn.
  */
-function renderContributionSessionSignInGate(status) {
+async function renderContributionSessionSignInGate(status, error) {
+  // No more silent discards (owner-reported, 2026-08-10): this was the ONE
+  // ceremony failure path that cleared the session and identity without ever
+  // recording a diagnostics note, so a sign-in that reached the service and
+  // then hit a dead stored session left nothing to look up. Record the real
+  // code and request id first — the calm gate copy below is unchanged, but the
+  // failure is now referenced like every other one.
+  await describeFailure({
+    surface: "contribution_connect",
+    error,
+    fallback: "The stored contribution session was rejected, so this Mac asks for a fresh sign-in.",
+  });
   hostedIdentity = null;
   communityDevicePairedV1 = false;
   // Any auth rejection consumes this load's one automatic attempt: after the

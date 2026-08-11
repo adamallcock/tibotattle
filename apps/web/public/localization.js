@@ -847,6 +847,38 @@ export const WEB_MESSAGES = Object.freeze({
   ],
   "consent.stateApproved": ["Approved", "已核准", "Aprobado"],
   "consent.stateNotApproved": ["Not approved", "未核准", "No aprobado"],
+  // The merged four-state identity status shown at the sign-in chip, and the
+  // one next action beside it (owner-reported contradictory states,
+  // 2026-08-08/10). New / Signing in… / Reconnecting / Connected.
+  "identity.state.new": ["New", "新", "Nuevo"],
+  "identity.state.signingIn": ["Signing in…", "正在登录…", "Iniciando sesión…"],
+  "identity.state.reconnecting": ["Reconnecting", "正在重新连接", "Reconectando"],
+  "identity.state.connected": ["Connected", "已连接", "Conectado"],
+  "identity.next.new": [
+    "Sign in with Google or Apple to contribute.",
+    "使用 Google 或 Apple 登录即可贡献。",
+    "Inicia sesión con Google o Apple para contribuir.",
+  ],
+  "identity.next.signingIn": [
+    "Finish in your browser; TiboTattle returns when it's ready.",
+    "请在浏览器中完成；准备就绪后 TiboTattle 会自动返回。",
+    "Termina en tu navegador; TiboTattle vuelve cuando esté listo.",
+  ],
+  "identity.next.reconnecting": [
+    "Reconnecting this Mac automatically. Nothing was uploaded.",
+    "正在自动重新连接这台 Mac。未上传任何内容。",
+    "Reconectando este Mac automáticamente. No se cargó nada.",
+  ],
+  "identity.next.reconnectSignIn": [
+    "Sign in again to finish connecting this Mac.",
+    "请重新登录以完成这台 Mac 的连接。",
+    "Inicia sesión de nuevo para terminar de conectar este Mac.",
+  ],
+  "identity.next.connected": [
+    "This Mac is contributing.",
+    "这台 Mac 正在贡献。",
+    "Este Mac está contribuyendo.",
+  ],
   "title.panCalibrationEarlier": ["Pan calibration earlier", "向前平移校准", "Desplazar la calibración hacia antes"],
   "title.zoomOut": ["Zoom out", "缩小", "Alejar"],
   "title.zoomIn": ["Zoom in", "放大", "Acercar"],
@@ -1486,6 +1518,9 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Share one anonymous summary": ["分享一份匿名摘要", "Comparte un resumen anónimo"],
   "What leaves this Mac — and what never does": ["什么会离开这台 Mac，以及什么永远不会", "Qué sale de este Mac y qué no sale nunca"],
   "Not signed in": ["未登录", "Sin sesión iniciada"],
+  // The pre-JS default of the identity next-action line; renderHostedIdentity
+  // rewrites it per state, but the static copy still legacy-translates on load.
+  "Sign in with Google or Apple to contribute.": ["使用 Google 或 Apple 登录即可贡献。", "Inicia sesión con Google o Apple para contribuir."],
   "Sign in with Google": ["使用 Google 登录", "Iniciar sesión con Google"],
   "Sign in with Apple": ["使用 Apple 登录", "Iniciar sesión con Apple"],
   "Signed in with Google": ["已使用 Google 登录", "Sesión iniciada con Google"],

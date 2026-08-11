@@ -393,11 +393,24 @@ function localCompanionRequestError(response, payload) {
   return error;
 }
 
+// The local relay to the contribution service answers with its own fixed
+// central_participant_* codes when the relay itself — not the Worker — fails
+// (an unreachable service, a bounded-body overflow, a misconfigured origin).
+// They are a closed, content-free, lower_snake vocabulary the companion mints,
+// so a sign-in result read that fails at the relay can be retried and
+// referenced by its real cause instead of being stripped to an empty
+// "unknown" that aborts the poll with no diagnostic (owner-reported relay
+// identity loss, 2026-08-10). Any other server string is still dropped.
+const RELAY_TRANSPORT_ERROR_CODE_PATTERN = /^central_participant_[a-z0-9_]{1,48}$/u;
+
 function hostedIdentityRequestError(response, payload) {
   const error = new Error(`Request failed (${response.status}).`);
   error.status = response.status;
-  if (HOSTED_IDENTITY_ERROR_CODES.has(payload?.error?.code)) {
-    error.code = payload.error.code;
+  const code = payload?.error?.code;
+  if (typeof code === "string"
+      && (HOSTED_IDENTITY_ERROR_CODES.has(code)
+        || RELAY_TRANSPORT_ERROR_CODE_PATTERN.test(code))) {
+    error.code = code;
   }
   return attachServiceRequestId(error, payload);
 }

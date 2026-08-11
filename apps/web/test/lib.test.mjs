@@ -3721,21 +3721,24 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   assert.match(appSource, /IDENTITY_CONFIGURATION_INVALID/u);
   assert.match(appSource, /let hostedIdentity = null;/u);
 
-  // One poll loop serves both providers, and it stops exactly when the
-  // service's five-minute handoff expires rather than earlier: the user is
-  // authenticating in a separate browser window, which inside the macOS app is
-  // the only place a provider host can be loaded at all.
+  // One poll loop serves both providers, and it covers the service's full
+  // ten-minute sign-in authorization window rather than undershooting it: the
+  // user is authenticating in a separate browser window, which inside the
+  // macOS app is the only place a provider host can be loaded at all.
   const pollBody =
     appSource.match(/async function beginHostedSignIn\([\s\S]*?\n\}/u)?.[0] ?? "";
   assert.match(pollBody, /HOSTED_SIGNIN_POLL_ATTEMPTS/u);
-  assert.match(pollBody, /error\?\.code !== "IDENTITY_RESULT_PENDING"/u);
-  assert.match(pollBody, /if \(attempt\.returnedToApp\)/u);
+  // A still-pending result OR a transient relay failure keeps polling; only a
+  // definite verdict throws out of the loop (A2, 2026-08-10).
+  assert.match(pollBody, /error\?\.code === "IDENTITY_RESULT_PENDING"/u);
+  assert.match(pollBody, /if \(!pendingResult && !isTransientSignInRelayError\(error\)\) throw error;/u);
+  assert.match(pollBody, /if \(pendingResult && attempt\.returnedToApp\)/u);
   // Re-pinned 2026-08-08 (owner-reported silent failure): a returned-to-app
   // callback whose result stays pending is referenced and logged through
   // showFailure instead of rendering copy with no diagnostic note behind it.
   assert.match(
     pollBody,
-    /if \(attempt\.returnedToApp\) \{[\s\S]{0,640}?await showFailure\(status, \{[\s\S]{0,240}?IDENTITY_RESULT_PENDING:/u,
+    /if \(pendingResult && attempt\.returnedToApp\) \{[\s\S]{0,640}?await showFailure\(status, \{[\s\S]{0,240}?IDENTITY_RESULT_PENDING:/u,
   );
   assert.match(pollBody, /openHostedSignInInBrowser\(request\.authorizeUrl\)/u);
   assert.match(pollBody, /waitForHostedSignInPoll\(attempt\)/u);
@@ -3759,7 +3762,9 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
     appSource.match(/const HOSTED_SIGNIN_POLL_INTERVAL_MS = ([\d_]+);/u)?.[1]
       ?.replace(/_/gu, "")
   );
-  assert.equal(attempts * interval, 5 * 60 * 1_000);
+  // The client budget must be at least the Worker's ten-minute sign-in
+  // authorization TTL, never the old five minutes that gave up early (A6).
+  assert.ok(attempts * interval >= 10 * 60 * 1_000);
 
   // A browser handoff remains recoverable: the callback can wake the bounded
   // poll immediately, and the person can check or cancel without waiting for
@@ -5763,7 +5768,14 @@ test("new enrollment pairs immediately and intentionally discards recovery capab
   )?.[1] ?? "";
   assert.doesNotMatch(enrollmentBody, /recoveryCode/u);
   assert.match(enrollmentBody, /\{ deviceBootstrap: false, identity: hostedIdentity \}/u);
-  assert.match(enrollmentBody, /return communityClient\.createDevicePairing\(false\);/u);
+  // The mint goes through the cookie-commit retry now (owner-reported,
+  // 2026-08-10), which itself calls createDevicePairing(false) — the pairing
+  // is still minted separately with the fresh session.
+  assert.match(enrollmentBody, /return mintDevicePairingWithCookieCommitRetry\(\);/u);
+  const mintRetryBody = appSource.match(
+    /async function mintDevicePairingWithCookieCommitRetry\(\) \{([\s\S]*?)\n\}/u,
+  )?.[1] ?? "";
+  assert.match(mintRetryBody, /return await communityClient\.createDevicePairing\(false\);/u);
   assert.match(enrollmentBody, /finishCommunityDevicePairing\(pairing, status\)/u);
   assert.doesNotMatch(appSource, /pendingCommunityPairing/u);
   assert.doesNotMatch(appSource, /acknowledgeRecoveryAndConnect/u);
@@ -7897,19 +7909,24 @@ test("a session-rejected repair clears the dead session and renders one sign-in 
   );
 
   // The ceremony's catch routes a session rejection to the gate BEFORE the
-  // step reporter, so the step-2 failure paragraph cannot render for it.
+  // step reporter, so the step-2 failure paragraph cannot render for it — but
+  // only for a session that is NOT the one this ceremony just minted, so the
+  // cookie-commit race falls through to a retryable failure instead of a
+  // silent discard (owner-reported, 2026-08-10).
   assert.match(
     appSource,
-    /if \(contributionConnectStepOf\(error\) !== null\s*\n\s*&& contributionSessionWasRejected\(error\)\) \{[\s\S]{0,420}?renderContributionSessionSignInGate\(status\);\s*\n\s*\} else if \(contributionConnectStepOf\(error\) !== null\s*\n\s*\|\| contributionDeviceRecoveryIsRequired\(error\)\) \{/u,
+    /if \(contributionConnectStepOf\(error\) !== null\s*\n\s*&& contributionSessionWasRejected\(error\)\s*\n\s*&& !contributionSessionMintedWithinRaceWindow\(\)\) \{[\s\S]{0,900}?await renderContributionSessionSignInGate\(status, error\);\s*\n\s*\} else if \(contributionConnectStepOf\(error\) !== null\s*\n\s*\|\| contributionDeviceRecoveryIsRequired\(error\)\) \{/u,
   );
 
   // The gate clears every piece of the dead authority — the identity proof,
   // the session, and this session's pairing claim — and speaks in the calm
-  // register, never the error class.
+  // register, never the error class. It also records a diagnostics note first
+  // so the discard is never silent (owner-reported, 2026-08-10).
   const gate = appSource.match(
-    /function renderContributionSessionSignInGate\(status\) \{([\s\S]*?)\n\}/u,
+    /async function renderContributionSessionSignInGate\(status, error\) \{([\s\S]*?)\n\}/u,
   )?.[1];
   assert.ok(gate, "the sign-in gate renderer is available");
+  assert.match(gate, /await describeFailure\(\{/u);
   assert.match(gate, /hostedIdentity = null;/u);
   assert.match(gate, /communityDevicePairedV1 = false;/u);
   assert.match(gate, /setCommunitySession\(null\);/u);
@@ -8644,6 +8661,7 @@ let communityDevicePairedV1 = false;
 let incrementalRepairAttempted = false;
 let hostedIdentity = harness.identity;
 let communitySession = harness.session;
+let communitySessionMintedAt = harness.mintedAt ?? null;
 let incrementalConsentApproved = harness.approved;
 let contributionSyncExactReview = null;
 function hasCommunitySession() {
@@ -8656,6 +8674,7 @@ function setCommunitySession(value) {
   harness.sessions.push(value ? { ...value } : null);
   if (!value) {
     communityDevicePaired = false;
+    communitySessionMintedAt = null;
     renderContributionActionState();
   }
 }
@@ -8674,6 +8693,7 @@ return {
   state: () => ({
     hostedIdentity,
     communitySession,
+    communitySessionMintedAt,
     communityDevicePairedV1,
     incrementalConsentApproved,
     incrementalRepairAttempted,
@@ -8696,7 +8716,15 @@ return {
     async () => {},
     () => {},
     async () => {},
-    async () => ({ text: "described" }),
+    async ({ surface, error } = {}) => {
+      harness.describeFailures = harness.describeFailures ?? [];
+      harness.describeFailures.push({
+        surface,
+        code: error?.code ?? null,
+        requestId: error?.requestId ?? null,
+      });
+      return { text: "described", code: error?.code ?? null };
+    },
     (value) => String(value),
     (key) => `[${key}]`,
     () => ({ append() {}, textContent: "" }),
@@ -8704,8 +8732,10 @@ return {
 }
 
 async function settleCeremony(scope, harness, { untilFetchCount }) {
-  for (let tick = 0; tick < 40; tick += 1) {
-    await new Promise((resolveTick) => setTimeout(resolveTick, 0));
+  // A tick with real wall-clock time so the ceremony's bounded cookie-commit
+  // backoffs (hundreds of ms) can actually elapse before the check.
+  for (let tick = 0; tick < 300; tick += 1) {
+    await new Promise((resolveTick) => setTimeout(resolveTick, 15));
     if (harness.fetchCalls.length >= untilFetchCount
         && scope.state().incrementalConsentBusy === false) {
       return;
@@ -8843,6 +8873,194 @@ test("a session-rejected mint gates once and cannot repeat within the load", asy
   assert.equal(harness.fetchCalls.length, 1, "exactly one rejected mint, ever");
 });
 
+test("a pairing mint that 401s inside the cookie-commit window retries and keeps the fresh sign-in", async () => {
+  // THE root-cause fix (owner-reported, 2026-08-10): after the enroll adopts a
+  // fresh __Host- session, the first pairing mint can overtake the cookie's
+  // commit and come back AUTH_REQUIRED. That is the race, not a dead session,
+  // so the mint retries on a short backoff and the sign-in that just worked is
+  // never discarded.
+  const proof = "a".repeat(64);
+  const verifier = "v".repeat(64);
+  const harness = {
+    identity: { provider: "google", proof, verifier },
+    session: { csrfToken: "stale-csrf", participantId: "old", consentVersion: null },
+    approved: true,
+    grantRejected: true,
+    responses: [
+      {
+        status: 200,
+        payload: {
+          schemaVersion: "participant-bootstrap-v0.1",
+          csrfToken: "fresh-csrf",
+          participantId: "participant-1",
+        },
+      },
+      // The cookie has not committed yet, so the first mint is rejected.
+      { status: 401, payload: { error: { code: "AUTH_REQUIRED" } } },
+      // The retry, once the cookie lands, mints under the same fresh session.
+      { status: 201, payload: { pairingCode: "pc-1" } },
+    ],
+  };
+  const scope = await loadContributionCeremony(harness);
+  scope.resumeContributionCeremonyAfterSignIn();
+  await settleCeremony(scope, harness, { untilFetchCount: 3 });
+
+  assert.deepEqual(
+    harness.fetchCalls.map((call) => [call.url, call.method, call.csrf]),
+    [
+      ["/api/v1/enroll", "POST", null],
+      ["/api/v1/me/device-pairings", "POST", "fresh-csrf"],
+      ["/api/v1/me/device-pairings", "POST", "fresh-csrf"],
+    ],
+    "the mint is retried under the SAME fresh session, never the stale csrf",
+  );
+  const state = scope.state();
+  assert.equal(state.communitySession?.csrfToken, "fresh-csrf", "the fresh session is kept");
+  assert.deepEqual(
+    state.hostedIdentity,
+    { provider: "google", proof, verifier },
+    "the identity proof survives the race",
+  );
+  assert.equal(state.communityDevicePairedV1, true, "the retried mint completes the pairing");
+  assert.equal(state.incrementalConsentApproved, true, "approval is untouched");
+  assert.deepEqual(harness.localCalls, [{ pairContributionDevice: "pc-1" }]);
+  const surface = harness.elements("#incremental-consent-status");
+  assert.ok(
+    surface.localizedKeys.includes("consent.authorityRefreshed"),
+    "the settled state reports the calm refresh, not a failure",
+  );
+  assert.ok(
+    !surface.localizedKeys.includes("consent.signInAgainToFinish"),
+    "the sign-in gate never fired for the race",
+  );
+});
+
+test("the sign-in gate fires only for a dead stored session and always records a note", async () => {
+  // The other half of the fix: a session this ceremony did NOT mint (the mint
+  // timestamp stays null) that is rejected is a genuinely dead stored session.
+  // The gate still fires and clears it — but it now records a diagnostics note
+  // with the real code and request id first, so the discard is never silent.
+  const requestId = "22222222-2222-4222-8222-222222222222";
+  const harness = {
+    identity: null,
+    session: { csrfToken: "stale-csrf", participantId: "old", consentVersion: null },
+    approved: true,
+    grantRejected: true,
+    responses: [
+      { status: 401, payload: { error: { code: "AUTH_REQUIRED", requestId } } },
+    ],
+  };
+  const scope = await loadContributionCeremony(harness);
+  scope.maybeRepairIncrementalAuthorization();
+  await settleCeremony(scope, harness, { untilFetchCount: 1 });
+
+  // A dead stored session mints exactly once — no cookie-race retry, because
+  // this session carries no mint timestamp.
+  assert.deepEqual(
+    harness.fetchCalls.map((call) => [call.url, call.csrf]),
+    [["/api/v1/me/device-pairings", "stale-csrf"]],
+  );
+  assert.equal(scope.state().communitySession, null, "the dead session is cleared");
+  const note = (harness.describeFailures ?? []).find(
+    (entry) => entry.surface === "contribution_connect",
+  );
+  assert.ok(note, "the gate recorded a diagnostics note before discarding");
+  assert.equal(note.code, "AUTH_REQUIRED", "the note carries the real code");
+  assert.equal(note.requestId, requestId, "the note carries the real request id");
+  assert.ok(
+    harness.elements("#incremental-consent-status").localizedKeys
+      .includes("consent.signInAgainToFinish"),
+  );
+});
+
+test("the merged identity status renders the right label and one next action per state", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("const IDENTITY_STATE_CHIP_KEYS = Object.freeze({");
+  const end = appSource.indexOf("\n// A completed hosted handoff is memory-only");
+  assert.ok(start >= 0 && end > start, "the identity status model is available");
+  const model = Function(
+    `${appSource.slice(start, end)}
+return {
+  IDENTITY_STATE_CHIP_KEYS,
+  hostedIdentityStatusState,
+  hostedIdentityNextActionKey,
+};`,
+  )();
+
+  // Every underlying fact combination maps to exactly one honest state.
+  const state = (facts) => model.hostedIdentityStatusState(facts);
+  // New: nothing at all.
+  assert.equal(
+    state({ signingIn: false, signedIn: false, hasServerSession: false, repairPending: false }),
+    "new",
+  );
+  // Signing in wins over everything, including a stale session still present.
+  assert.equal(
+    state({ signingIn: true, signedIn: true, hasServerSession: true, repairPending: false }),
+    "signingIn",
+  );
+  // A completed round trip that left only an in-page proof is Reconnecting,
+  // never a flat Connected and never New.
+  assert.equal(
+    state({ signingIn: false, signedIn: true, hasServerSession: false, repairPending: false }),
+    "reconnecting",
+  );
+  // An approved Mac whose upload authority is being re-paired is Reconnecting.
+  assert.equal(
+    state({ signingIn: false, signedIn: true, hasServerSession: true, repairPending: true }),
+    "reconnecting",
+  );
+  // A real server session with nothing pending is Connected.
+  assert.equal(
+    state({ signingIn: false, signedIn: true, hasServerSession: true, repairPending: false }),
+    "connected",
+  );
+
+  // The chip label and the ONE next action per state — and the reconnect that
+  // lost its session names its own sign-in step.
+  assert.deepEqual(model.IDENTITY_STATE_CHIP_KEYS, {
+    new: "identity.state.new",
+    signingIn: "identity.state.signingIn",
+    reconnecting: "identity.state.reconnecting",
+    connected: "identity.state.connected",
+  });
+  assert.equal(model.hostedIdentityNextActionKey("new", false), "identity.next.new");
+  assert.equal(model.hostedIdentityNextActionKey("signingIn", false), "identity.next.signingIn");
+  assert.equal(model.hostedIdentityNextActionKey("connected", false), "identity.next.connected");
+  assert.equal(
+    model.hostedIdentityNextActionKey("reconnecting", false),
+    "identity.next.reconnecting",
+    "a reconnect that still holds its session reconnects silently",
+  );
+  assert.equal(
+    model.hostedIdentityNextActionKey("reconnecting", true),
+    "identity.next.reconnectSignIn",
+    "a reconnect that lost its session asks for a fresh sign-in",
+  );
+
+  // Every state and action line is present, short, and coherent in all three
+  // languages.
+  const keys = [
+    ...Object.values(model.IDENTITY_STATE_CHIP_KEYS),
+    "identity.next.new",
+    "identity.next.signingIn",
+    "identity.next.reconnecting",
+    "identity.next.reconnectSignIn",
+    "identity.next.connected",
+  ];
+  for (const locale of SUPPORTED_LOCALES) {
+    for (const key of keys) {
+      const copy = translate(key, {}, locale);
+      assert.ok(copy.length > 0 && copy.length <= 90, `${locale} ${key} stays short`);
+    }
+  }
+
+  // The chip element and its one-next-action sibling both exist in the page.
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(html, /id="identity-signin-state"/u);
+  assert.match(html, /id="identity-signin-next"/u);
+});
+
 test("the journey's community stage cannot claim done while the re-pair is pending", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   // The repair branch renders BEFORE the approved-done branch, splitting on
@@ -8860,7 +9078,7 @@ test("the journey's community stage cannot claim done while the re-pair is pendi
   // The gate reconciles the identity card's status line too.
   assert.match(
     appSource,
-    /function renderContributionSessionSignInGate\(status\) \{[\s\S]*?\$\("#identity-signin-status"\)/u,
+    /async function renderContributionSessionSignInGate\(status, error\) \{[\s\S]*?\$\("#identity-signin-status"\)/u,
   );
   for (const locale of SUPPORTED_LOCALES) {
     for (const key of [
@@ -8895,7 +9113,7 @@ function fakeSessionStorage(seed = {}) {
 
 async function loadHostedSignInResume(harness) {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  const start = appSource.indexOf("// The service holds a completed sign-in for five minutes");
+  const start = appSource.indexOf("// The poll must cover the service's authorization window");
   const end = appSource.indexOf("async function beginHostedSignIn(providerId) {");
   assert.ok(start >= 0 && end > start, "the sign-in resume section is available");
   const section = appSource.slice(start, end);
@@ -9078,6 +9296,108 @@ test("a definite service verdict clears the handoff and logs; an unreachable ser
   assert.equal(verdict.failures[0].code, "IDENTITY_TOKEN_INVALID");
 });
 
+test("a relay central_participant_* failure preserves its code and never destroys the handoff", async () => {
+  // Data-client: the identity result read threads a relay-level code and its
+  // request id through instead of stripping either to an empty "unknown" — the
+  // relay failed, not the Worker, so the page can retry and reference it (A2).
+  const requestId = "33333333-3333-4333-8333-333333333333";
+  const client = new CommunityClient({
+    fetchImpl: async () => new Response(
+      JSON.stringify({
+        error: { code: "central_participant_service_unavailable", requestId },
+      }),
+      { status: 502, headers: { "Content-Type": "application/json" } },
+    ),
+  });
+  await assert.rejects(
+    client.identityGoogleResult("s".repeat(64), "v".repeat(64)),
+    (error) => error.status === 502
+      && error.code === "central_participant_service_unavailable"
+      && error.requestId === requestId,
+  );
+  // An arbitrary server code is still dropped — only the fixed identity and
+  // relay vocabularies pass.
+  const leaky = new CommunityClient({
+    fetchImpl: async () => new Response(
+      JSON.stringify({ error: { code: "PRIVATE_DETAIL_MUST_NOT_PASS" } }),
+      { status: 502, headers: { "Content-Type": "application/json" } },
+    ),
+  });
+  await assert.rejects(
+    leaky.identityGoogleResult("s".repeat(64), "v".repeat(64)),
+    (error) => error.status === 502 && error.code === undefined,
+  );
+
+  // Resume: a transient relay failure on the first read is retried inside the
+  // bounded window and the handoff is kept; the eventual success collects it.
+  const storage = fakeSessionStorage();
+  const record = JSON.stringify({
+    provider: "google",
+    state: "s".repeat(64),
+    verifier: "v".repeat(64),
+    startedAt: Date.now() - 5_000,
+  });
+  storage.setItem("tibotattle.pending-hosted-sign-in.v1", record);
+  let attempts = 0;
+  const recovering = {
+    storage,
+    result: async (state, verifier) => {
+      attempts += 1;
+      if (attempts === 1) {
+        const error = new Error("Request failed (502).");
+        error.status = 502;
+        error.code = "central_participant_service_unavailable";
+        throw error;
+      }
+      return { provider: "google", proof: "b".repeat(64), verifier };
+    },
+  };
+  const recoveringScope = await loadHostedSignInResume(recovering);
+  await recoveringScope.resumePendingHostedSignIn({ retries: 1 });
+  assert.ok(attempts >= 2, "the transient relay failure was retried, not aborted");
+  assert.equal(
+    storage.getItem("tibotattle.pending-hosted-sign-in.v1"),
+    null,
+    "a collected handoff is cleared on success",
+  );
+  assert.deepEqual(recoveringScope.state().hostedIdentity, {
+    provider: "google",
+    proof: "b".repeat(64),
+    verifier: "v".repeat(64),
+  });
+  assert.equal(
+    recovering.failures.length,
+    0,
+    "no failure is logged for a transient relay error that recovered",
+  );
+
+  // Resume: a persistent relay failure through every bounded attempt keeps the
+  // handoff for the next activation and never logs a destroying verdict.
+  storage.setItem("tibotattle.pending-hosted-sign-in.v1", record);
+  const persistent = {
+    storage,
+    result: async () => {
+      const error = new Error("Request failed (502).");
+      error.status = 502;
+      error.code = "central_participant_service_unavailable";
+      throw error;
+    },
+  };
+  const persistentScope = await loadHostedSignInResume(persistent);
+  await persistentScope.resumePendingHostedSignIn({ retries: 1 });
+  assert.equal(
+    storage.getItem("tibotattle.pending-hosted-sign-in.v1"),
+    record,
+    "a persistent relay failure keeps the handoff rather than destroying it",
+  );
+  assert.equal(
+    persistent.failures.length,
+    0,
+    "a relay failure is never logged as a definite verdict",
+  );
+  assert.equal(persistentScope.state().hostedIdentity, null);
+});
+
 test("the handoff persists the moment the browser opens and every activation retries it", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   // The exact persistence key, versioned like the other product storage keys.
@@ -9125,6 +9445,27 @@ test("the handoff persists the moment the browser opens and every activation ret
     appSource,
     /const HOSTED_SIGNIN_HANDOFF_VALIDITY_MS =\s*\n\s*HOSTED_SIGNIN_POLL_ATTEMPTS \* HOSTED_SIGNIN_POLL_INTERVAL_MS;/u,
   );
+});
+
+test("the page tells the native shell when a hosted sign-in is in flight so it is not torn down", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  // A single content-free boolean crosses the bridge, guarded so it is a no-op
+  // in a normal browser where window.webkit is undefined (S1).
+  assert.match(
+    appSource,
+    /window\.webkit\?\.messageHandlers\?\.tibotattleHostedSignIn\?\.postMessage\(\{\s*\n\s*inFlight: Boolean\(inFlight\),/u,
+  );
+  // The live sign-in marks in-flight before the browser opens and clears it
+  // whatever the outcome.
+  const beginBody =
+    appSource.match(/async function beginHostedSignIn\([\s\S]*?\n\}/u)?.[0] ?? "";
+  assert.match(beginBody, /signalHostedSignInInFlight\(true\);/u);
+  assert.match(beginBody, /\} finally \{[\s\S]*?signalHostedSignInInFlight\(false\);/u);
+  // The reactivation resume does the same while it collects a completed proof.
+  const resumeBody =
+    appSource.match(/async function resumePendingHostedSignIn\([\s\S]*?\n\}\n/u)?.[0] ?? "";
+  assert.match(resumeBody, /pendingHostedSignInResumeInFlight = true;\s*\n(?:\s*\/\/[^\n]*\n)*\s*signalHostedSignInInFlight\(true\);/u);
+  assert.match(resumeBody, /pendingHostedSignInResumeInFlight = false;\s*\n\s*signalHostedSignInInFlight\(false\);/u);
 });
 
 test("divergence window-breakdown normalizer sanitizes to content-free numbers", () => {
