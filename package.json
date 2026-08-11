@@ -1,6 +1,6 @@
 {
   "name": "app-usagemonitor",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "private": true,
   "type": "module",
   "description": "Local-only quota and standard API-price usage triangulation experiment.",
