@@ -97,3 +97,30 @@ Deleting the Keychain item is logical credential deletion, not a secure-media-er
 - Keychain deletion does not guarantee physical erasure from backups or storage media.
 
 The decision becomes accepted only after the package/native audit, live throwaway-service smoke, backend tests, packaging/SBOM integration, and clean-machine validation all pass.
+
+## Addendum (2026-08-11): durable ACL for the contribution-device credential
+
+This record rejected the `security(1)` write path for the **installation
+identity**. The contribution-device credential is a different, weaker bearer:
+revocable, rate-limited, auto-renewing (~25-day rotation), and scoped only to
+uploading privacy-safe aggregate telemetry — not an identity or password.
+
+Its keytar-minted item was lost on every signed app update: the default
+`SecItemAdd` ACL trusts the creating binary by code-identity snapshot, so a
+Sparkle re-sign of `runtime/bin/node` was denied read access
+(`device_unavailable`), forcing the user to re-authenticate every few days —
+defeating the "sign in once" design. keytar exposes no `SecAccessRef` /
+`kSecAttrAccessGroup`, so a designated-requirement ACL is not expressible
+through it; the alternatives (access-group entitlement; partition-list) need
+native code or the interactive login password.
+
+**Owner decision (explicit, 2026-08-11):** for THIS credential only, mint via
+`security add-generic-password -T <node reader>` so read access is bound to the
+reader's **designated requirement** (`anchor apple generic and
+certificate leaf[subject.OU]="43RTH622SB" and identifier "node"`), which is
+stable across every same-team signed build. The accepted cost is a brief
+argv exposure of the secret during the one-time mint (visible to same-user /
+root process inspection for milliseconds). This is weighed acceptable because
+the credential is revocable, auto-renewing, and low-value, and because a CLI
+failure falls back to keytar's default ACL so availability never regresses.
+The installation identity's rejection of this path stands unchanged.
