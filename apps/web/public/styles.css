@@ -1977,7 +1977,7 @@ h2 { font-size: clamp(2rem, 3.8vw, 3.25rem); }
 .snapshot-table table { min-width: 920px; }
 .snapshot-table th, .snapshot-table td { white-space: nowrap; }
 .snapshot-table th.numeric, .snapshot-table td.numeric {
-  text-align: right;
+  text-align: end;
   font-variant-numeric: tabular-nums;
 }
 /* Narrow layouts: each day becomes a labelled card instead of forcing a
@@ -2011,7 +2011,7 @@ h2 { font-size: clamp(2rem, 3.8vw, 3.25rem); }
     opacity: .7;
     font-size: .8rem;
   }
-  .snapshot-table td.numeric { text-align: right; }
+  .snapshot-table td.numeric { text-align: end; }
 }
 .participant-action-status.error { color: var(--rust); }
 
