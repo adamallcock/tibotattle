@@ -47,7 +47,10 @@ import {
   PRODUCT_BRAND,
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../config/product-brand.js";
-import { startLocalCompanionServer } from "./server.js";
+import {
+  createCentralOutboundFetch,
+  startLocalCompanionServer,
+} from "./server.js";
 
 const DEVELOPMENT_COVERAGE = Object.freeze({
   startAt: "2026-07-24T21:00:00.000Z",
@@ -4279,4 +4282,54 @@ test("the Fast-mode preference is owner-only, fixed-valued, and rebuilds the acc
     await app.close();
     await rm(files.root, { recursive: true });
   }
+});
+
+test("central outbound fetch pre-warms only the real production service", async () => {
+  // The outbound twin of v0.1.6's keep-alive fix (owner-reported 15.23s cold
+  // call, 2026-08-10): a startup pre-warm engaged only for the real HTTPS
+  // service when the process uses Node's own fetch.
+
+  // Eligible: production HTTPS + the process default fetch. The pre-warm issues
+  // exactly one GET to /api/health on the central origin.
+  const productionCalls = [];
+  const production = createCentralOutboundFetch({
+    baseFetch: async (url, options = {}) => {
+      productionCalls.push({ url, method: options.method ?? "GET" });
+      return new Response("{}", { status: 200 });
+    },
+    centralOrigin: "https://usage-monitor.example",
+    enabled: true,
+  });
+  await production.warmUp();
+  assert.deepEqual(productionCalls, [
+    { url: "https://usage-monitor.example/api/health", method: "GET" },
+  ]);
+
+  // An injected (non-default) fetch is never pre-warmed, so tests and any
+  // custom transport are undisturbed.
+  const injectedCalls = [];
+  const injected = createCentralOutboundFetch({
+    baseFetch: async (url) => {
+      injectedCalls.push(url);
+      return new Response("{}", { status: 200 });
+    },
+    centralOrigin: "https://usage-monitor.example",
+    enabled: false,
+  });
+  await injected.warmUp();
+  assert.equal(injectedCalls.length, 0, "an injected fetch is never pre-warmed");
+
+  // A development loopback origin is not the cold-TLS case, so it is left alone
+  // even with the default fetch.
+  const loopbackCalls = [];
+  const loopback = createCentralOutboundFetch({
+    baseFetch: async (url) => {
+      loopbackCalls.push(url);
+      return new Response("{}", { status: 200 });
+    },
+    centralOrigin: "http://127.0.0.1:8792",
+    enabled: true,
+  });
+  await loopback.warmUp();
+  assert.equal(loopbackCalls.length, 0, "a loopback origin is never pre-warmed");
 });
