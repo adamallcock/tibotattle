@@ -3108,14 +3108,24 @@ function liveTimelinePoints(
     // the window instead and shrink the measured span to what the two
     // observations actually cover; the cost-implied side below integrates
     // the same shrunken span, so observed and expected stay commensurable.
+    // A recovered span needs TWO distinct observations: with a single one,
+    // the end anchor resolves to the same row as the start anchor, observed
+    // is zero by construction over a zero-length span, and any cost in the
+    // window would fabricate a negative residual nobody measured — so that
+    // window stays honestly unbracketed.
     let startMatch = quotaLookup.atOrBefore(startMs);
     let spanStartMs = startMs;
+    let spanEndMs = endMs;
     let shrunkenSpan = false;
     if (!(startMatch && startMs - startMatch.timestampMs <= maximumBracketGapMs)) {
       const forwardMatch = quotaLookup.atOrAfter(startMs);
-      if (forwardMatch && forwardMatch.timestampMs < endMs) {
+      if (forwardMatch && forwardMatch.timestampMs < endMs
+          && afterMatch && afterMatch.timestampMs > forwardMatch.timestampMs) {
         startMatch = forwardMatch;
         spanStartMs = forwardMatch.timestampMs;
+        // Observed movement ends at the end-edge observation, not at the
+        // bucket boundary: integrate the expected side to the same instant.
+        spanEndMs = afterMatch.timestampMs;
         shrunkenSpan = true;
       } else {
         startMatch = null;
@@ -3135,7 +3145,8 @@ function liveTimelinePoints(
     let windowEvents = Math.max(0, rollingEvents);
     if (shrunkenSpan) {
       // Only the usage buckets ending inside the measured span count, so the
-      // expected line integrates the interval the observed delta covers.
+      // expected line integrates the interval the observed delta covers —
+      // (spanStartMs, spanEndMs], both edges pinned to real observations.
       let lower = startIndex;
       let upper = index + 1;
       while (lower < upper) {
@@ -3146,8 +3157,18 @@ function liveTimelinePoints(
           upper = middle;
         }
       }
-      windowCostUsd = Math.max(0, costPrefix[index + 1] - costPrefix[lower]);
-      windowEvents = Math.max(0, eventsPrefix[index + 1] - eventsPrefix[lower]);
+      let top = lower;
+      let topUpper = index + 1;
+      while (top < topUpper) {
+        const middle = top + Math.floor((topUpper - top) / 2);
+        if (usageEndsMs[middle] <= spanEndMs) {
+          top = middle + 1;
+        } else {
+          topUpper = middle;
+        }
+      }
+      windowCostUsd = Math.max(0, costPrefix[top] - costPrefix[lower]);
+      windowEvents = Math.max(0, eventsPrefix[top] - eventsPrefix[lower]);
     }
     const expected = capacity !== null && capacity > 0
       ? windowCostUsd / capacity * 100
@@ -3194,8 +3215,9 @@ function liveTimelinePoints(
       apiCostUsd: windowCostUsd,
       usageEvents: windowEvents,
       // The span both lines actually integrate: the nominal window unless the
-      // start edge was recovered forward past a collection silence.
-      measuredSpanMs: endMs - spanStartMs,
+      // start edge was recovered forward past a collection silence, in which
+      // case both edges sit on real observations.
+      measuredSpanMs: spanEndMs - spanStartMs,
       status: evidence.status,
     });
   }

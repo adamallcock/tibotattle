@@ -8219,6 +8219,77 @@ test("a window starting inside a collection silence anchors forward and shrinks 
   assert.equal(nominal.measuredSpanMs, 10_800_000);
 });
 
+test("forward recovery requires a second observation and never integrates cost past it", async () => {
+  const liveTimelinePoints = await loadLiveTimelinePoints();
+  const hour = (index) => new Date(Date.UTC(2026, 7, 5, index)).toISOString();
+  const atMinutes = (minutes) => new Date(Date.UTC(2026, 7, 5, 0, minutes)).toISOString();
+  const resetAt = "2026-08-10T00:00:00.000Z";
+  const quotaRow = (observedAt, usedPercent) => ({
+    observedAt,
+    limitId: "codex",
+    durationMinutes: 10_080,
+    slot: "primary",
+    usedPercent,
+    remainingPercent: 100 - usedPercent,
+    resetAt,
+  });
+  const usage = Array.from({ length: 9 }, (_, index) => ({
+    startAt: hour(index),
+    endAt: hour(index + 1),
+    apiPriceEquivalentUsd: 50,
+    usageEvents: 5,
+  }));
+  const capacity = { weekly: { summary: { median_weekly_value_usd: 1_000 } }, gradient: { summary: {} } };
+
+  // A single observation inside the window: atOrAfter(start) and
+  // atOrBefore(end) resolve to the SAME row, so observed would be zero over a
+  // zero-length span while the window carries real cost. That window must stay
+  // missing_quota_bracket — a matched point here would fabricate a negative
+  // residual that renderDivergencePeriods reads as an unmeasured under-cost
+  // period.
+  const single = liveTimelinePoints({
+    ...capacity,
+    timeline: {
+      usage,
+      // One observation at 04:30, then silence until hour 8 restores real
+      // backward brackets for the tail windows.
+      quota: [quotaRow(atMinutes(4 * 60 + 30), 50), quotaRow(hour(8), 61), quotaRow(hour(9), 68)],
+    },
+  });
+  assert.equal(single.length, 9);
+  // Windows ending at hours 5..7 see only the 04:30 observation: no second
+  // observation, no bracket, no fabricated residual.
+  for (const point of single.slice(4, 7)) {
+    assert.equal(point.status, "missing_quota_bracket");
+    assert.equal(point.observed, null);
+    assert.equal(point.residual, null);
+  }
+
+  // Two observations, but the end-edge one lags the bucket boundary: the
+  // expected side must integrate only to the observation, never to the bucket
+  // end, and the measured span must be the observation-to-observation span.
+  const lagged = liveTimelinePoints({
+    ...capacity,
+    timeline: {
+      usage,
+      // Observations at 04:30 and 06:00; the window ending 07:00 anchors
+      // forward on 04:30 and its end edge falls back to 06:00.
+      quota: [quotaRow(atMinutes(4 * 60 + 30), 50), quotaRow(hour(6), 55)],
+    },
+  });
+  assert.equal(lagged.length, 9);
+  const recovered = lagged[6];
+  assert.equal(recovered.status, "matched");
+  assert.equal(recovered.observed, 5);
+  // Only the buckets ending in (04:30, 06:00] count: hours 5 and 6, $100 of
+  // $1,000 capacity = 10 pp. Integrating to the 07:00 bucket end would have
+  // claimed 15 pp against 5 pp observed — movement nobody measured.
+  assert.equal(recovered.expected, 10);
+  assert.equal(recovered.apiCostUsd, 100);
+  assert.equal(recovered.usageEvents, 10);
+  assert.equal(recovered.measuredSpanMs, 90 * 60 * 1_000);
+});
+
 test("timeline exclusion copy names only the mechanisms that actually fired", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const start = appSource.indexOf("const TIMELINE_EXCLUSION_MESSAGE_KEYS");
