@@ -6,19 +6,19 @@
     "toUtc": "2026-07-30T16:30:00.000Z"
   },
   "provenance": {
-    "source": "live unified index, read-only derivation 2026-08-11",
+    "source": "live unified index, read-only derivation 2026-08-11 (refit under the corrected kernel: multi-observation bins voided)",
     "grainHours": 2,
     "note": "Envelope movement per 2h bin with that bin's per-model Standard-API-priced cost; absolute percent level anchored so the window ends where the live pool did. Bins with cost but no envelope movement (idle or post-peg) carry zero movement."
   },
-  "constantCapacityUsd": 2060.65,
+  "constantCapacityUsd": 2129.12,
   "composition": {
     "capacityUsdByModel": {
-      "gpt-5.5": 2175.14,
-      "gpt-5.6-sol": 2539.01,
-      "gpt-5.6-terra": 899.26,
-      "other": null
+      "gpt-5.5": 2191.34,
+      "gpt-5.6-sol": 2437.11,
+      "gpt-5.6-terra": 1085.29,
+      "other": 1691.94
     },
-    "blendedCapacityUsd": 2007.24
+    "blendedCapacityUsd": 2059.58
   },
   "intervals": [
     {
@@ -216,8 +216,8 @@
   "expectations": {
     "spanPp": 69,
     "allCostUsd": 2056.44,
-    "residualBeforePp": -30.8,
-    "residualAfterPp": -15.71,
+    "residualBeforePp": -27.59,
+    "residualAfterPp": -14.59,
     "saturatedCostUsd": 264.06,
     "saturatedBins": 3
   }

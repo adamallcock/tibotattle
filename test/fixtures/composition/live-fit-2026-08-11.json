@@ -2,29 +2,35 @@
   "schemaVersion": "composition-live-fit-v1",
   "fittedAt": "2026-08-11",
   "corpus": {
-    "source": "live unified index (read-only), envelope x 2h-bin cost corpus, 2026-06-01 onward",
-    "observationCount": 500
+    "source": "live unified index (read-only), envelope x 2h-bin cost corpus, 2026-06-01 onward; multi-observation bins voided (corrected kernel)",
+    "observationCount": 489
   },
   "fit": {
     "status": "fitted",
     "capacityUsdByModel": {
-      "gpt-5.5": 2175.14,
-      "gpt-5.6-sol": 2539.01,
-      "gpt-5.6-terra": 899.26,
-      "other": null
+      "gpt-5.5": 2191.34,
+      "gpt-5.6-sol": 2437.11,
+      "gpt-5.6-terra": 1085.29,
+      "other": 1691.94
     },
     "modelCostShares": {
-      "gpt-5.6-sol": 0.455278,
-      "gpt-5.5": 0.429472,
-      "gpt-5.6-terra": 0.110711,
-      "gpt-5.6-luna": 0.002295,
-      "gpt-5.4-mini": 0.001999,
-      "gpt-5.4": 0.000225,
-      "codex-auto-review": 0.000021
+      "gpt-5.6-sol": 0.453309,
+      "gpt-5.5": 0.445083,
+      "gpt-5.6-terra": 0.096893,
+      "gpt-5.6-luna": 0.002384,
+      "gpt-5.4-mini": 0.002076,
+      "gpt-5.4": 0.000233,
+      "codex-auto-review": 0.000022
     },
-    "r2": 0.759206,
-    "singleConstantUsd": 2060.65,
-    "singleConstantR2": 0.664023
+    "r2": 0.780102,
+    "singleConstantUsd": 2129.12,
+    "singleConstantR2": 0.734752,
+    "identification": {
+      "adjustedR2": 0.778288,
+      "singleConstantAdjustedR2": 0.734208,
+      "splitHalfIdentified": true,
+      "splitHalfMaxCapacityDriftFraction": 0.0184
+    }
   },
-  "recentMixBlendedCapacityUsd": 2007.24
+  "recentMixBlendedCapacityUsd": 2059.58
 }
