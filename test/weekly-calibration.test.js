@@ -27,6 +27,52 @@ test("bounded weekly summary rejects malformed datasets", () => {
   );
 });
 
+test("bounded weekly summary embeds a defensive composition projection", () => {
+  const empty = projectBoundedWeeklyCalibrationSummary({ transitions: [] });
+  assert.equal(empty.composition, null);
+
+  const fitted = projectBoundedWeeklyCalibrationSummary({ transitions: [] }, {
+    composition: {
+      status: "fitted",
+      grainHours: 2,
+      observationCount: 500,
+      capacityUsdByModel: { "gpt-5.6-sol": 2_539.01, "gpt-5.6-terra": 899.26, other: null },
+      modelCostShares: { "gpt-5.6-sol": 0.46, "gpt-5.6-terra": 0.11 },
+      r2: 0.7592,
+      singleConstantUsd: 2_060.65,
+      singleConstantR2: 0.664,
+      blendedRecentMixUsd: 2_007.24,
+      recentMixDays: 14,
+    },
+  });
+  assert.equal(fitted.composition.status, "fitted");
+  assert.equal(fitted.composition.capacityUsdByModel["gpt-5.6-sol"], 2_539.01);
+  assert.equal(fitted.composition.capacityUsdByModel.other, null);
+  assert.equal(fitted.composition.blendedRecentMixUsd, 2_007.24);
+
+  // A non-fitted status never carries a vector, and a malformed block
+  // degrades to null instead of poisoning the summary.
+  const fallback = projectBoundedWeeklyCalibrationSummary({ transitions: [] }, {
+    composition: {
+      status: "fallback_blended",
+      observationCount: 40,
+      capacityUsdByModel: null,
+      singleConstantUsd: 1_800,
+      r2: 0.4,
+      singleConstantR2: 0.41,
+      blendedRecentMixUsd: null,
+    },
+  });
+  assert.equal(fallback.composition.status, "fallback_blended");
+  assert.equal(fallback.composition.capacityUsdByModel, null);
+  assert.equal(fallback.composition.singleConstantUsd, 1_800);
+
+  const malformed = projectBoundedWeeklyCalibrationSummary({ transitions: [] }, {
+    composition: { status: "surprise" },
+  });
+  assert.equal(malformed.composition, null);
+});
+
 test("bounded weekly summary retains up to 64 reset series from a 31-day window", () => {
   const firstReset = Math.floor(
     Date.parse("2026-07-01T12:00:00.000Z") / 1_000,

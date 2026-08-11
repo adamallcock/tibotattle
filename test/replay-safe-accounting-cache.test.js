@@ -761,6 +761,72 @@ test("the same lineage-aware scan produces a bounded weekly calibration summary"
   ]) {
     assert.equal(serialized.includes(forbidden), false);
   }
+  // The composition block always exists on a v0.7 cache, and a corpus this
+  // thin reports its own insufficiency instead of a fake vector.
+  assert.equal(
+    cache.weeklyCalibration.composition.status,
+    "insufficient_observations",
+  );
+  assert.equal(cache.weeklyCalibration.composition.capacityUsdByModel, null);
+});
+
+test("a mix-varied corpus yields a fitted per-model composition that survives the cache round trip", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "composition-cache-"));
+  const stateFile = join(directory, "collector-state-v1.sqlite");
+  const resetStart = Date.parse("2026-08-10T00:00:00.000Z");
+  const resetsAt = (resetStart + 7 * 24 * 60 * 60 * 1_000) / 1_000;
+  const nowMs = resetStart + 60 * 60 * 60 * 1_000;
+  const cache = await buildReplaySafeAccountingCache({
+    now: () => nowMs,
+    windowDays: 365,
+    scan: async ({ onUsage, onRateLimitSnapshot }) => {
+      let usedPercent = 0;
+      onRateLimitSnapshot(weeklySnapshot({
+        timestamp: new Date(resetStart).toISOString(),
+        usedPercent,
+        resetsAt,
+      }));
+      // 25 alternating pure-model 2h bins: sol bins move 1pp on a large
+      // token spend, terra bins move 4pp on the same spend — enough rank for
+      // the NNLS to separate the two rates, with zero collinearity.
+      for (let bin = 0; bin < 25; bin += 1) {
+        const binStart = resetStart + bin * 2 * 60 * 60 * 1_000;
+        const model = bin % 2 === 0 ? "gpt-5.6-sol" : "gpt-5.6-terra";
+        onUsage(usageEvent({
+          timestamp: new Date(binStart + 30 * 60_000).toISOString(),
+          model,
+          components: { input_uncached_tokens: 2_000_000 },
+        }));
+        usedPercent += bin % 2 === 0 ? 1 : 4;
+        onRateLimitSnapshot(weeklySnapshot({
+          timestamp: new Date(binStart + 90 * 60_000).toISOString(),
+          usedPercent,
+          resetsAt,
+        }));
+      }
+      return { diagnostics: {} };
+    },
+  });
+  const composition = cache.weeklyCalibration.composition;
+  assert.equal(composition.status, "fitted");
+  const sol = composition.capacityUsdByModel["gpt-5.6-sol"];
+  const terra = composition.capacityUsdByModel["gpt-5.6-terra"];
+  assert.ok(Number.isFinite(sol) && sol > 0);
+  assert.ok(Number.isFinite(terra) && terra > 0);
+  // Same spend, 4x the displayed movement: terra's $/100pp is materially
+  // lower than sol's.
+  assert.ok(sol > terra * 2);
+  assert.ok(composition.r2 > composition.singleConstantR2);
+  assert.ok(Number.isFinite(composition.blendedRecentMixUsd));
+  assert.equal(composition.grainHours, 2);
+  // The block survives the SQLite round trip and the read-path validator.
+  await writeTestCache(stateFile, cache);
+  const read = await readReplaySafeAccountingCache({
+    cacheFile: stateFile,
+    now: () => nowMs,
+  });
+  assert.equal(read.status, "available");
+  assert.deepEqual(read.cache.weeklyCalibration.composition, composition);
 });
 
 // Fixture unified index for the full-history calibration tests: the same

@@ -35,7 +35,11 @@ import {
 } from "@app-usagemonitor/accounting";
 import {
   analyzeQuotaPace,
+  blendedCompositionCapacityUsd,
+  buildCompositionObservations,
+  calibrateCompositionCapacities,
   isValidQuotaWindowDuration,
+  MODEL_COMPOSITION_POLICY,
   SEVEN_DAY_WINDOW_MINUTES,
 } from "@app-usagemonitor/quota-analysis";
 import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
@@ -64,8 +68,14 @@ import { fastQuotaMultiplier } from "./application/index.js";
 // duration). A v0.5 cache derived its weekly calibration with pre-Jul-12
 // history filtered out by slot, so it is withheld and rebuilt rather than
 // blended with the restored corpus.
+// v0.7 (2026-08-11): the weekly calibration gained the composition-aware
+// per-model $/pp vector (`weeklyCalibration.composition`, NNLS over the same
+// corpus — design: docs/design/composition-aware-expected-line.md). A v0.6
+// cache carries no composition block and its expected line silently misreads
+// model mix as deviation, so it is withheld and rebuilt rather than served
+// alongside surfaces that now assume the fit can exist.
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
-  "local-replay-safe-accounting-v0.6";
+  "local-replay-safe-accounting-v0.7";
 
 const HISTORICAL_PRICE_EPOCH_BASIS =
   "event_time_when_registry_has_effective_evidence";
@@ -1684,6 +1694,87 @@ async function deriveBoundedWeeklyCalibrationSeries({
 }
 
 const UNIFIED_CALIBRATION_READ_BATCH_ROWS = 20_000;
+const COMPOSITION_RECENT_MIX_DAYS = 14;
+
+/**
+ * Fit the composition-aware per-model $/pp vector from the SAME compact
+ * corpus the weekly calibration derivation is about to consume. Runs BEFORE
+ * `deriveBoundedWeeklyCalibrationSeries` because that call destroys its input
+ * arrays; this one only reads them.
+ *
+ * Compact encodings (see transitionUsageProjection /
+ * weeklyRateLimitProjection): usage [0]=ISO timestamp, [1]=model,
+ * [10]=costUsd; snapshot [1]=timestampMs, [3]=planType,
+ * [7]=resetsAt seconds, [8]=usedPercent.
+ *
+ * Never throws for corpus reasons: a thin or collinear corpus degrades to a
+ * typed non-fitted status inside the kernel, and the caller stores whatever
+ * status came back.
+ */
+function fitCompositionFromCompactCorpus({
+  rawUsageEvents,
+  weeklyRateLimitSnapshots,
+  endMs,
+}) {
+  const usageRows = [];
+  for (const row of rawUsageEvents) {
+    if (!Array.isArray(row)) continue;
+    const observedAtMs = Date.parse(row[0]);
+    const costUsd = Number(row[10]);
+    if (!Number.isFinite(observedAtMs)
+        || typeof row[1] !== "string"
+        || !Number.isFinite(costUsd)
+        || costUsd < 0) continue;
+    usageRows.push({ observedAtMs, model: row[1], costUsd });
+  }
+  const quotaRows = [];
+  for (const row of weeklyRateLimitSnapshots) {
+    if (!Array.isArray(row)) continue;
+    const observedAtMs = Number(row[1]);
+    const resetsAtSeconds = Number(row[7]);
+    const usedPercent = Number(row[8]);
+    if (!Number.isFinite(observedAtMs)
+        || !Number.isFinite(resetsAtSeconds)
+        || !Number.isFinite(usedPercent)) continue;
+    quotaRows.push({
+      observedAtMs,
+      planType: typeof row[3] === "string" ? row[3] : "unknown",
+      resetsAtMs: resetsAtSeconds * 1_000,
+      usedPercent,
+    });
+  }
+  const { observations, voidedBinCount, poolCount } =
+    buildCompositionObservations({ usageRows, quotaRows });
+  const fit = calibrateCompositionCapacities(observations);
+  const recentStartMs = endMs - COMPOSITION_RECENT_MIX_DAYS * 24 * 60 * 60 * 1_000;
+  const recentMix = {};
+  for (const row of usageRows) {
+    if (row.observedAtMs < recentStartMs) continue;
+    recentMix[row.model] = (recentMix[row.model] ?? 0) + row.costUsd;
+  }
+  const blendedRecentMixUsd = fit.status === "fitted"
+    ? blendedCompositionCapacityUsd(recentMix, {
+      capacityUsdByModel: fit.capacityUsdByModel,
+      fallbackCapacityUsd: fit.singleConstantUsd,
+    })
+    : null;
+  return {
+    status: fit.status,
+    grainHours: MODEL_COMPOSITION_POLICY.grainMs / 3_600_000,
+    observationCount: fit.observationCount,
+    voidedBinCount,
+    poolCount,
+    capacityUsdByModel: fit.capacityUsdByModel,
+    modelCostShares: fit.modelCostShares,
+    r2: fit.r2,
+    singleConstantUsd: fit.singleConstantUsd,
+    singleConstantR2: fit.singleConstantR2,
+    blendedRecentMixUsd: Number.isFinite(blendedRecentMixUsd)
+      ? Number(blendedRecentMixUsd.toFixed(2))
+      : null,
+    recentMixDays: COMPOSITION_RECENT_MIX_DAYS,
+  };
+}
 
 /**
  * Cheap usability probe for the unified calibration corpus, run BEFORE the
@@ -2229,6 +2320,19 @@ export async function buildReplaySafeAccountingCache({
       : unifiedCalibration.coveredAt.startAt,
     endAt: new Date(endMs).toISOString(),
   };
+  // The composition fit reads the same compact corpus the derivation below
+  // will consume, so it must run first.
+  const composition = fitCompositionFromCompactCorpus({
+    rawUsageEvents: retainWindowedCalibrationInputs
+      ? rawUsageEvents
+      : unifiedCalibration.rawUsageEvents,
+    weeklyRateLimitSnapshots: retainWindowedCalibrationInputs
+      ? weeklyRateLimitSnapshots
+      : unifiedCalibration.weeklyRateLimitSnapshots,
+    endMs,
+  });
+  throwIfAborted(signal);
+  checkRuntimeMemory();
   let transitionSeries;
   try {
     transitionSeries = await deriveBoundedWeeklyCalibrationSeries({
@@ -2280,7 +2384,7 @@ export async function buildReplaySafeAccountingCache({
         transitionSeries.deduplicatedSnapshotCount,
     },
     transitions: transitionSeries.transitions,
-  });
+  }, { composition });
   const paceForecast = projectWeeklyPaceForecast(weeklyPaceSnapshots, endMs);
   throwIfAborted(signal);
   return {
@@ -2596,6 +2700,51 @@ function validPriceCardProvenance(row) {
       === Number(exactNumber.toFixed(6));
 }
 
+const COMPOSITION_CACHE_STATUSES = new Set([
+  "fitted",
+  "fallback_blended",
+  "insufficient_observations",
+]);
+
+// The composition block a v0.7 cache carries on weeklyCalibration. `null` is
+// a valid value (the reporting projection stores null for a malformed or
+// absent input); a present block must be internally coherent — in particular
+// a vector may exist only under the "fitted" status.
+function validWeeklyCalibrationComposition(value) {
+  if (value === null || value === undefined) return true;
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || !COMPOSITION_CACHE_STATUSES.has(value.status)) return false;
+  const finiteOrNull = (candidate, minimum = Number.NEGATIVE_INFINITY) => (
+    candidate === null
+    || (typeof candidate === "number"
+      && Number.isFinite(candidate)
+      && candidate >= minimum)
+  );
+  if (!finiteOrNull(value.r2)
+      || !finiteOrNull(value.singleConstantR2)
+      || !finiteOrNull(value.singleConstantUsd, 0)
+      || !finiteOrNull(value.blendedRecentMixUsd, 0)
+      || !finiteOrNull(value.grainHours, 0)
+      || !finiteOrNull(value.recentMixDays, 0)
+      || !Number.isSafeInteger(value.observationCount)
+      || value.observationCount < 0) return false;
+  const vector = value.capacityUsdByModel;
+  if (vector === null) return true;
+  if (value.status !== "fitted"
+      || !vector || typeof vector !== "object" || Array.isArray(vector)) {
+    return false;
+  }
+  return Object.entries(vector).every(([model, capacity]) => (
+    typeof model === "string"
+    && model.length > 0
+    && model.length <= 64
+    && (capacity === null
+      || (typeof capacity === "number"
+        && Number.isFinite(capacity)
+        && capacity > 0))
+  ));
+}
+
 function validCache(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)
       || value.schemaVersion !== REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION
@@ -2633,6 +2782,9 @@ function validCache(value) {
       || !Array.isArray(value.weeklyCalibration.recentResets)
       || value.weeklyCalibration.recentResets.length
         > BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT
+      || !validWeeklyCalibrationComposition(
+        value.weeklyCalibration.composition,
+      )
       || value.periods.length !== 4
       || !Number.isSafeInteger(value.bucketMinutes)
       || value.bucketMinutes !== 15) return false;

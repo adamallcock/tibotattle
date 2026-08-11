@@ -1305,13 +1305,83 @@ function safeSpeedEventCount(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
+function finiteOrNull(value, { minimum = Number.NEGATIVE_INFINITY } = {}) {
+  return typeof value === "number" && Number.isFinite(value) && value >= minimum
+    ? value
+    : null;
+}
+
+const COMPOSITION_STATUSES = new Set([
+  "fitted",
+  "fallback_blended",
+  "insufficient_observations",
+]);
+const MAX_COMPOSITION_MODELS = 24;
+
+// The composition-aware calibration (design:
+// docs/design/composition-aware-expected-line.md): a per-model $/100pp
+// vector fitted by NNLS in the quota-analysis kernel, carried on the summary
+// so the expected line and the calibration card can price a cost mix per
+// model instead of through one blended constant. The projection is defensive:
+// a malformed block degrades to null rather than poisoning the summary, and
+// a non-"fitted" status never carries a vector.
+function projectComposition(composition) {
+  if (!composition || typeof composition !== "object"
+      || Array.isArray(composition)
+      || !COMPOSITION_STATUSES.has(composition.status)) {
+    return null;
+  }
+  const vectorEntries = Object.entries(composition.capacityUsdByModel ?? {})
+    .slice(0, MAX_COMPOSITION_MODELS)
+    .filter(([model]) => typeof model === "string" && model.length > 0
+      && model.length <= 64)
+    .map(([model, value]) => [
+      model,
+      value === null ? null : finiteOrNull(value, { minimum: 0 }),
+    ]);
+  const capacityUsdByModel = composition.status === "fitted"
+      && vectorEntries.some(([, value]) => value !== null && value > 0)
+    ? Object.fromEntries(vectorEntries)
+    : null;
+  return {
+    status: capacityUsdByModel === null && composition.status === "fitted"
+      ? "fallback_blended"
+      : composition.status,
+    grainHours: finiteOrNull(composition.grainHours, { minimum: 0 }),
+    observationCount: Number.isSafeInteger(composition.observationCount)
+      && composition.observationCount >= 0
+      ? composition.observationCount
+      : 0,
+    capacityUsdByModel,
+    modelCostShares: Object.fromEntries(
+      Object.entries(composition.modelCostShares ?? {})
+        .slice(0, MAX_COMPOSITION_MODELS)
+        .filter(([model]) => typeof model === "string" && model.length > 0
+          && model.length <= 64)
+        .map(([model, value]) => [model, finiteOrNull(value, { minimum: 0 })]),
+    ),
+    r2: finiteOrNull(composition.r2),
+    singleConstantUsd: finiteOrNull(
+      composition.singleConstantUsd,
+      { minimum: 0 },
+    ),
+    singleConstantR2: finiteOrNull(composition.singleConstantR2),
+    blendedRecentMixUsd: finiteOrNull(
+      composition.blendedRecentMixUsd,
+      { minimum: 0 },
+    ),
+    recentMixDays: finiteOrNull(composition.recentMixDays, { minimum: 0 }),
+  };
+}
+
 export function projectBoundedWeeklyCalibrationSummary(dataset, options = {}) {
   if (!dataset || typeof dataset !== "object" || Array.isArray(dataset)
       || (dataset.transitions !== undefined
         && !Array.isArray(dataset.transitions))) {
     throw new TypeError("Weekly calibration dataset is invalid");
   }
-  const report = analyzeWeeklyCalibration(dataset, options);
+  const { composition = null, ...analysisOptions } = options;
+  const report = analyzeWeeklyCalibration(dataset, analysisOptions);
   const value = report.weeklyValueSummary;
   const resets = report.resetValues
     .slice(-BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT)
@@ -1392,6 +1462,9 @@ export function projectBoundedWeeklyCalibrationSummary(dataset, options = {}) {
         .length,
       qualifyingResetValues: report.quality.qualifyingResetValues,
     },
+    // Optional composition-aware per-model calibration; null when the caller
+    // supplied none (older caches simply omit the field).
+    composition: projectComposition(composition),
     recentResets: resets,
     limitations: [
       "Provider percentages are whole-number observations, not an exact debit ledger.",

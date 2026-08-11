@@ -487,6 +487,40 @@ function validSpeedEventCounts(value) {
     ));
 }
 
+// The composition-aware per-model calibration a v0.7 cache carries. Absent
+// (older cache) and null (no usable fit) both read as "no composition";
+// a present block must be coherent, and a vector may exist only under the
+// "fitted" status.
+function validWeeklyComposition(value) {
+  if (value === null || value === undefined) return true;
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || !["fitted", "fallback_blended", "insufficient_observations"]
+        .includes(value.status)) return false;
+  const numberOrNull = (candidate, minimum = Number.NEGATIVE_INFINITY) => (
+    candidate === null
+    || (typeof candidate === "number"
+      && Number.isFinite(candidate)
+      && candidate >= minimum)
+  );
+  if (!numberOrNull(value.r2)
+      || !numberOrNull(value.singleConstantR2)
+      || !numberOrNull(value.singleConstantUsd, 0)
+      || !numberOrNull(value.blendedRecentMixUsd, 0)) return false;
+  const vector = value.capacityUsdByModel;
+  if (vector === null || vector === undefined) return value.status !== "fitted";
+  if (value.status !== "fitted"
+      || typeof vector !== "object" || Array.isArray(vector)) return false;
+  return Object.entries(vector).every(([model, capacity]) => (
+    typeof model === "string"
+    && model.length > 0
+    && model.length <= 64
+    && (capacity === null
+      || (typeof capacity === "number"
+        && Number.isFinite(capacity)
+        && capacity > 0))
+  ));
+}
+
 function validLiveWeeklyCalibration(weekly) {
   if (!weekly || typeof weekly !== "object" || Array.isArray(weekly)
       || weekly.schemaVersion !== "weekly-calibration-summary-v0.1"
@@ -513,6 +547,7 @@ function validLiveWeeklyCalibration(weekly) {
       || weekly.recentResets.length
         > BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT
       || !weekly.recentResets.every(validWeeklyReset)
+      || !validWeeklyComposition(weekly.composition)
       || !weekly.validation
       || typeof weekly.validation !== "object"
       || Array.isArray(weekly.validation)) {
@@ -597,6 +632,21 @@ function projectLiveWeeklyCalibration(cache, cacheReadErrorCode = null) {
           estimate?.plausibleRangeUsd?.lower ?? null,
         upper_80_across_resets_usd:
           estimate?.plausibleRangeUsd?.upper ?? null,
+        // Composition-aware per-model calibration (v0.7 cache). The blended
+        // figure is the cost-weighted rate over the recent mix — the honest
+        // headline for "$ per point" copy — and the vector powers per-model
+        // detail plus the composition-aware expected line. All null on an
+        // older cache or a corpus that could not support the fit.
+        composition_status: weekly.composition?.status ?? null,
+        blended_capacity_usd:
+          weekly.composition?.blendedRecentMixUsd ?? null,
+        capacity_by_model:
+          weekly.composition?.capacityUsdByModel ?? null,
+        composition_r2: weekly.composition?.r2 ?? null,
+        composition_single_constant_r2:
+          weekly.composition?.singleConstantR2 ?? null,
+        composition_observations:
+          weekly.composition?.observationCount ?? null,
         qualifying_resets: estimate?.qualifyingResets ?? 0,
         selected_holdout_mae_pp:
           weekly.validation
