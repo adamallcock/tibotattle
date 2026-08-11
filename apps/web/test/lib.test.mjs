@@ -3728,14 +3728,17 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   const pollBody =
     appSource.match(/async function beginHostedSignIn\([\s\S]*?\n\}/u)?.[0] ?? "";
   assert.match(pollBody, /HOSTED_SIGNIN_POLL_ATTEMPTS/u);
-  assert.match(pollBody, /error\?\.code !== "IDENTITY_RESULT_PENDING"/u);
-  assert.match(pollBody, /if \(attempt\.returnedToApp\)/u);
+  // A still-pending result OR a transient relay failure keeps polling; only a
+  // definite verdict throws out of the loop (A2, 2026-08-10).
+  assert.match(pollBody, /error\?\.code === "IDENTITY_RESULT_PENDING"/u);
+  assert.match(pollBody, /if \(!pendingResult && !isTransientSignInRelayError\(error\)\) throw error;/u);
+  assert.match(pollBody, /if \(pendingResult && attempt\.returnedToApp\)/u);
   // Re-pinned 2026-08-08 (owner-reported silent failure): a returned-to-app
   // callback whose result stays pending is referenced and logged through
   // showFailure instead of rendering copy with no diagnostic note behind it.
   assert.match(
     pollBody,
-    /if \(attempt\.returnedToApp\) \{[\s\S]{0,640}?await showFailure\(status, \{[\s\S]{0,240}?IDENTITY_RESULT_PENDING:/u,
+    /if \(pendingResult && attempt\.returnedToApp\) \{[\s\S]{0,640}?await showFailure\(status, \{[\s\S]{0,240}?IDENTITY_RESULT_PENDING:/u,
   );
   assert.match(pollBody, /openHostedSignInInBrowser\(request\.authorizeUrl\)/u);
   assert.match(pollBody, /waitForHostedSignInPoll\(attempt\)/u);
@@ -9201,6 +9204,108 @@ test("a definite service verdict clears the handoff and logs; an unreachable ser
   assert.equal(verdict.failures.length, 1);
   assert.equal(verdict.failures[0].surface, "hosted_identity");
   assert.equal(verdict.failures[0].code, "IDENTITY_TOKEN_INVALID");
+});
+
+test("a relay central_participant_* failure preserves its code and never destroys the handoff", async () => {
+  // Data-client: the identity result read threads a relay-level code and its
+  // request id through instead of stripping either to an empty "unknown" — the
+  // relay failed, not the Worker, so the page can retry and reference it (A2).
+  const requestId = "33333333-3333-4333-8333-333333333333";
+  const client = new CommunityClient({
+    fetchImpl: async () => new Response(
+      JSON.stringify({
+        error: { code: "central_participant_service_unavailable", requestId },
+      }),
+      { status: 502, headers: { "Content-Type": "application/json" } },
+    ),
+  });
+  await assert.rejects(
+    client.identityGoogleResult("s".repeat(64), "v".repeat(64)),
+    (error) => error.status === 502
+      && error.code === "central_participant_service_unavailable"
+      && error.requestId === requestId,
+  );
+  // An arbitrary server code is still dropped — only the fixed identity and
+  // relay vocabularies pass.
+  const leaky = new CommunityClient({
+    fetchImpl: async () => new Response(
+      JSON.stringify({ error: { code: "PRIVATE_DETAIL_MUST_NOT_PASS" } }),
+      { status: 502, headers: { "Content-Type": "application/json" } },
+    ),
+  });
+  await assert.rejects(
+    leaky.identityGoogleResult("s".repeat(64), "v".repeat(64)),
+    (error) => error.status === 502 && error.code === undefined,
+  );
+
+  // Resume: a transient relay failure on the first read is retried inside the
+  // bounded window and the handoff is kept; the eventual success collects it.
+  const storage = fakeSessionStorage();
+  const record = JSON.stringify({
+    provider: "google",
+    state: "s".repeat(64),
+    verifier: "v".repeat(64),
+    startedAt: Date.now() - 5_000,
+  });
+  storage.setItem("tibotattle.pending-hosted-sign-in.v1", record);
+  let attempts = 0;
+  const recovering = {
+    storage,
+    result: async (state, verifier) => {
+      attempts += 1;
+      if (attempts === 1) {
+        const error = new Error("Request failed (502).");
+        error.status = 502;
+        error.code = "central_participant_service_unavailable";
+        throw error;
+      }
+      return { provider: "google", proof: "b".repeat(64), verifier };
+    },
+  };
+  const recoveringScope = await loadHostedSignInResume(recovering);
+  await recoveringScope.resumePendingHostedSignIn({ retries: 1 });
+  assert.ok(attempts >= 2, "the transient relay failure was retried, not aborted");
+  assert.equal(
+    storage.getItem("tibotattle.pending-hosted-sign-in.v1"),
+    null,
+    "a collected handoff is cleared on success",
+  );
+  assert.deepEqual(recoveringScope.state().hostedIdentity, {
+    provider: "google",
+    proof: "b".repeat(64),
+    verifier: "v".repeat(64),
+  });
+  assert.equal(
+    recovering.failures.length,
+    0,
+    "no failure is logged for a transient relay error that recovered",
+  );
+
+  // Resume: a persistent relay failure through every bounded attempt keeps the
+  // handoff for the next activation and never logs a destroying verdict.
+  storage.setItem("tibotattle.pending-hosted-sign-in.v1", record);
+  const persistent = {
+    storage,
+    result: async () => {
+      const error = new Error("Request failed (502).");
+      error.status = 502;
+      error.code = "central_participant_service_unavailable";
+      throw error;
+    },
+  };
+  const persistentScope = await loadHostedSignInResume(persistent);
+  await persistentScope.resumePendingHostedSignIn({ retries: 1 });
+  assert.equal(
+    storage.getItem("tibotattle.pending-hosted-sign-in.v1"),
+    record,
+    "a persistent relay failure keeps the handoff rather than destroying it",
+  );
+  assert.equal(
+    persistent.failures.length,
+    0,
+    "a relay failure is never logged as a definite verdict",
+  );
+  assert.equal(persistentScope.state().hostedIdentity, null);
 });
 
 test("the handoff persists the moment the browser opens and every activation retries it", async () => {

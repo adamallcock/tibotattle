@@ -8132,6 +8132,17 @@ const HOSTED_SIGNIN_POLL_INTERVAL_MS = 2_000;
 const HOSTED_SIGNIN_HANDOFF_VALIDITY_MS =
   HOSTED_SIGNIN_POLL_ATTEMPTS * HOSTED_SIGNIN_POLL_INTERVAL_MS;
 
+// A failure at the local relay to the contribution service — not a verdict
+// from the Worker — surfaces as one of the companion's fixed
+// central_participant_* codes. It means the read-back never reached the
+// service, so it is transient by nature: retry it within the bounded sign-in
+// budget exactly like a still-pending result, and never let it destroy the
+// pending handoff (owner-reported relay identity loss, 2026-08-10).
+function isTransientSignInRelayError(error) {
+  return typeof error?.code === "string"
+    && error.code.startsWith("central_participant_");
+}
+
 // The packaged Mac app stamps this fixed marker before any dashboard script
 // runs. A normal browser keeps the dashboard page open in a second tab while
 // it polls for the result; the packaged app instead makes a main-frame
@@ -8375,14 +8386,19 @@ async function resumePendingHostedSignIn({ retries = 2 } = {}) {
       try {
         identity = await flow.result(pending.state, pending.verifier);
       } catch (error) {
-        if (error?.code === "IDENTITY_RESULT_PENDING") {
-          // The provider has not returned yet; retry shortly, then leave the
-          // record for the next activation inside the validity window.
+        if (error?.code === "IDENTITY_RESULT_PENDING"
+            || isTransientSignInRelayError(error)) {
+          // Not a verdict on the proof: the provider has not returned yet, or
+          // the local relay to the service failed transiently
+          // (central_participant_*). Retry within the bounded window and leave
+          // the record intact for the next activation either way — a transient
+          // relay failure must never destroy the pending handoff
+          // (owner-reported, 2026-08-10).
           identity = null;
         } else if (error?.code === undefined && error?.status === undefined) {
-          // Unreachable service: not a verdict on the proof. Keep the record
-          // and try again on the next activation rather than logging a note
-          // per focus change.
+          // Unreachable service with no code at all: not a verdict on the
+          // proof. Keep the record and try again on the next activation rather
+          // than logging a note per focus change.
           return;
         } else {
           clearPendingHostedSignIn();
@@ -8454,12 +8470,17 @@ async function beginHostedSignIn(providerId) {
       try {
         identity = await flow.result(request.state, request.verifier);
       } catch (error) {
-        if (error?.code !== "IDENTITY_RESULT_PENDING") throw error;
+        // A transient relay failure (central_participant_*) is retried within
+        // this bounded loop exactly like a pending result rather than aborting
+        // the whole poll with zero retry (owner-reported, 2026-08-10). A
+        // definite verdict still throws and is handled below.
+        const pendingResult = error?.code === "IDENTITY_RESULT_PENDING";
+        if (!pendingResult && !isTransientSignInRelayError(error)) throw error;
         // The fixed callback page wakes the native dashboard only after the
         // provider has returned. A current service turns a cancelled callback
         // into IDENTITY_TOKEN_INVALID; this branch preserves the same safe UI
         // outcome while a previously deployed service still reports pending.
-        if (attempt.returnedToApp) {
+        if (pendingResult && attempt.returnedToApp) {
           // A completed callback whose result stays pending is a read-back
           // failure the user acted on, so it is referenced and logged like
           // one (owner-reported silent failure, 2026-08-08) instead of
