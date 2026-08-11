@@ -369,24 +369,42 @@ export async function runIncrementalContributionSyncOnce({
   let remainingUploads = [];
   let orphanChunkIds = [];
   let acknowledgedThroughDay = null;
+  // Both flags exist so a failed pass can never fabricate progress. A pass
+  // that died before its first processed server response must not claim
+  // network activity (the controller preserves the last honest progress on
+  // networkActivity false), and a pass that died before an upload plan
+  // exists must not read its empty pending set as "everything synced" —
+  // that exact fabrication once overwrote a real 7/86 watermark with a
+  // false 87/87 while the server had received nothing.
+  let networkContacted = false;
+  let uploadPlanEstablished = false;
+  // Any resolved fetch — success or server rejection — is real network
+  // activity; only a request that never resolved leaves the pass silent.
+  const suppliedFetch = fetchImpl;
+  fetchImpl = async (...requestArguments) => {
+    const response = await suppliedFetch(...requestArguments);
+    networkContacted = true;
+    return response;
+  };
 
   const outcome = (failure) => {
     const pendingDays = new Set(remainingUploads.map((upload) => upload.day));
+    const dayCountsKnown = uploadPlanEstablished || failure === null;
     return Object.freeze({
       schemaVersion: RUN_SCHEMA_VERSION,
       status: failure !== null
         ? "failed"
         : remainingUploads.length > 0 ? "partial" : "complete",
       daysTotal,
-      daysSynced: Math.max(0, daysTotal - pendingDays.size),
-      daysPending: pendingDays.size,
+      daysSynced: dayCountsKnown ? Math.max(0, daysTotal - pendingDays.size) : 0,
+      daysPending: dayCountsKnown ? pendingDays.size : daysTotal,
       chunksUploaded: counters.chunksUploaded,
       chunksSkipped: counters.chunksSkipped,
       recordsUploaded: counters.recordsUploaded,
       acknowledgedThroughDay,
       orphanChunkIds: Object.freeze([...orphanChunkIds]),
       failure,
-      networkActivity: true,
+      networkActivity: networkContacted,
     });
   };
   const failureOutcome = (error) => outcome(Object.freeze({
@@ -554,6 +572,7 @@ export async function runIncrementalContributionSyncOnce({
     counters.chunksSkipped = plan.skippedChunks;
     orphanChunkIds = [...plan.orphanChunkIds];
     remainingUploads = [...plan.uploads];
+    uploadPlanEstablished = true;
     if (remainingUploads.length === 0) return outcome(null);
 
     let envelopeKey = null;

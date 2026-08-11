@@ -487,3 +487,48 @@ test("the engine refuses drifted consent identifiers before any network activity
     assert.equal(service.calls.length, 0);
   });
 });
+
+test("a credential failure inside the pass cannot fabricate synced progress", async () => {
+  await withIndex(async (file) => {
+    const service = createFakeService();
+    const outcome = await runIncrementalContributionSyncOnce(engineOptions(
+      file,
+      service,
+      {
+        withDeviceSecret: async () => {
+          const error = new Error("Contribution device capability operation failed");
+          error.code = "contribution_device_credential_missing";
+          throw error;
+        },
+      },
+    ));
+    assert.equal(outcome.status, "failed");
+    assert.equal(outcome.failure.code, "device_unavailable");
+    // The pass never reached the network and never planned an upload, so it
+    // must not claim activity or synced days: a fabricated "all synced"
+    // here once overwrote a real backlog watermark.
+    assert.equal(outcome.networkActivity, false);
+    assert.equal(outcome.daysSynced, 0);
+    assert.equal(outcome.daysPending, outcome.daysTotal);
+    assert.equal(service.calls.length, 0);
+  });
+});
+
+test("a server-refused device still reports its real network activity", async () => {
+  await withIndex(async (file) => {
+    const service = createFakeService({
+      stateStatus: () => response({
+        error: { code: "DEVICE_AUTH_INVALID" },
+      }, 401),
+    });
+    const outcome = await runIncrementalContributionSyncOnce(
+      engineOptions(file, service),
+    );
+    assert.equal(outcome.failure.code, "device_unavailable");
+    // The server answered, so the controller may trust these counts; the
+    // pending total stays honest because no upload plan was established.
+    assert.equal(outcome.networkActivity, true);
+    assert.equal(outcome.daysPending, outcome.daysTotal);
+    assert.equal(outcome.daysSynced, 0);
+  });
+});
