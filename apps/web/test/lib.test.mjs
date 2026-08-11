@@ -7936,7 +7936,7 @@ test("a session-rejected repair clears the dead session and renders one sign-in 
     /function resumeContributionCeremonyAfterSignIn\(\) \{([\s\S]*?)\n\}/u,
   )?.[1];
   assert.ok(resume, "the post-sign-in resume hook is available");
-  assert.match(resume, /if \(!incrementalConsentApproved \|\| !incrementalGrantRejected\(\)\) return;/u);
+  assert.match(resume, /if \(!incrementalConsentApproved \|\| !incrementalUploadAuthorityLost\(\)\) return;/u);
   assert.match(resume, /void approveIncrementalContribution\(\);/u);
 
   // The gate copy exists in every supported locale and names the one action.
@@ -8661,6 +8661,9 @@ function setCommunitySession(value) {
 }
 function incrementalSyncCapabilityAdvertised() { return true; }
 function incrementalGrantRejected() { return harness.grantRejected; }
+function incrementalUploadAuthorityLost() {
+  return harness.grantRejected || harness.deviceUnavailable === true;
+}
 function hostedEnrollmentIsPaused() { return false; }
 function hostedSignInRequired() { return false; }
 ${section}
@@ -8775,6 +8778,31 @@ test("the post-sign-in resume enrolls with the proof first, then mints and claim
   );
 });
 
+test("a lost device credential re-opens the ceremony exactly like a rejected grant", async () => {
+  // The deadlock this pins: with no device credential every pass pauses as
+  // device_unavailable BEFORE any upload can be refused, so a repair gated on
+  // consent_rejected alone was unreachable from the one state that needed it.
+  const harness = {
+    identity: null,
+    session: { csrfToken: "live-csrf", participantId: "p1", consentVersion: null },
+    approved: true,
+    grantRejected: false,
+    deviceUnavailable: true,
+    responses: [
+      { status: 401, payload: { error: { code: "AUTH_REQUIRED" } } },
+    ],
+  };
+  const scope = await loadContributionCeremony(harness);
+  scope.maybeRepairIncrementalAuthorization();
+  await settleCeremony(scope, harness, { untilFetchCount: 1 });
+  assert.equal(
+    harness.fetchCalls[0]?.url,
+    "/api/v1/me/device-pairings",
+    "device_unavailable opens the same transparent re-pair path",
+  );
+  assert.equal(scope.state().incrementalRepairAttempted, true);
+});
+
 test("a session-rejected mint gates once and cannot repeat within the load", async () => {
   const harness = {
     identity: null,
@@ -8821,7 +8849,7 @@ test("the journey's community stage cannot claim done while the re-pair is pendi
   // the same sign-in question the approve card's gate asks.
   assert.match(
     appSource,
-    /\} else if \(incrementalConsentApproved && incrementalGrantRejected\(\)\) \{[\s\S]{0,640}?stage\("community", "action", "journey\.community\.signInAgain"\);[\s\S]{0,240}?stage\("community", "progress", "journey\.community\.refreshingAuthority"\);[\s\S]{0,240}?\} else if \(incrementalConsentApproved\) \{\s*\n\s*stage\("community", "done", "journey\.community\.syncing"\);/u,
+    /\} else if \(incrementalConsentApproved && incrementalUploadAuthorityLost\(\)\) \{[\s\S]{0,640}?stage\("community", "action", "journey\.community\.signInAgain"\);[\s\S]{0,240}?stage\("community", "progress", "journey\.community\.refreshingAuthority"\);[\s\S]{0,240}?\} else if \(incrementalConsentApproved\) \{\s*\n\s*stage\("community", "done", "journey\.community\.syncing"\);/u,
   );
   // A pending sign-in proof always re-enrolls; the stored csrfToken mints
   // directly only when no proof is in hand.

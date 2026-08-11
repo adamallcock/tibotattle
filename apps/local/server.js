@@ -3763,6 +3763,16 @@ function createPreparedLocalCompanionServer({
       else response.destroy();
     }
   });
+  // Node's 5-second keep-alive default races CFNetwork's connection pooling:
+  // the WKWebView holds loopback sockets far longer, discovers the server's
+  // FIN only on the next write, and a click-driven POST written onto the
+  // torn-down socket dies with zero response bytes ("Load failed", no
+  // request id) — CFNetwork silently retries idempotent GETs but never
+  // POSTs, so exactly the user-initiated actions surfaced it. Ninety
+  // seconds comfortably outlasts the pool's reuse horizon; headersTimeout
+  // must stay above keepAliveTimeout or Node kills sockets mid-headers.
+  server.keepAliveTimeout = 90_000;
+  server.headersTimeout = 95_000;
   server.once("close", () => {
     void shutdownAutomaticContribution().catch(() => {
       onError("automatic_contribution_lock_release_failed");

@@ -8622,7 +8622,7 @@ function renderCommunityJourney() {
     } else {
       stage("community", "waiting", "journey.community.waitingIndex");
     }
-  } else if (incrementalConsentApproved && incrementalGrantRejected()) {
+  } else if (incrementalConsentApproved && incrementalUploadAuthorityLost()) {
     // The transparent re-pair is pending, so this stage must not claim
     // "done · syncing" while the approve card is asking for a sign-in
     // (owner-reported contradictory state, 2026-08-08). One truth: a missing
@@ -8668,6 +8668,22 @@ function incrementalGrantRejected() {
 }
 
 /**
+ * Whether this Mac's upload authority is lost and only the connect ceremony
+ * can restore it. Two paused reasons qualify: consent_rejected (the service
+ * refused the grant) and device_unavailable (no readable device credential —
+ * after a credential reset or a broken Keychain binding). Gating repair on
+ * consent_rejected alone was a designed-in deadlock: with no credential,
+ * every pass dies at device_unavailable before any upload can be refused,
+ * so the only state that re-opened the ceremony was unreachable from the
+ * state that needed it.
+ */
+function incrementalUploadAuthorityLost() {
+  return incrementalGrantRejected()
+    || (incrementalSyncStatus?.status === "available"
+      && incrementalSyncStatus.pausedReason === "device_unavailable");
+}
+
+/**
  * The one merged surface (owner-directed 2026-08-08). Approval covers the
  * KIND of data, once, and the first approval keeps the review-bootstrap
  * requirement — one verified real instance of the data is on screen before
@@ -8687,10 +8703,12 @@ function renderIncrementalConsent() {
   const chip = $("#incremental-consent-state");
   const reviewVerified = contributionSyncExactReview?.state === "ready";
   const busy = incrementalConsentBusy || communityConnectBusy;
-  // A recorded approval whose claim carried the v0.1 consent re-opens the
+  // A recorded approval whose upload authority is lost — a claim that
+  // carried the v0.1 consent, or a missing device credential — re-opens the
   // same single action (the transparent re-pair). The chip stays "Approved":
   // the user's approval stands; only the transport authorization re-runs.
-  const repairNeeded = incrementalConsentApproved && incrementalGrantRejected();
+  const repairNeeded = incrementalConsentApproved
+    && incrementalUploadAuthorityLost();
   setLocalizedText(chip, incrementalConsentApproved
     ? "consent.stateApproved"
     : "consent.stateNotApproved");
@@ -8780,7 +8798,7 @@ function renderIncrementalSyncStatusLine() {
   // authorization refresh — never as a failure the user must interpret. When
   // the page cannot run the refresh yet (signed out), the gate line asks for
   // sign-in and this line stays quiet rather than claiming work in progress.
-  if (incrementalGrantRejected()) {
+  if (incrementalUploadAuthorityLost()) {
     if (hostedSignInRequired()) {
       forgetLocalizedNode(line);
       line.textContent = "";
@@ -9172,7 +9190,7 @@ function maybeRepairIncrementalAuthorization() {
   if (incrementalRepairAttempted) return;
   if (incrementalConsentBusy || communityConnectBusy) return;
   if (!incrementalSyncCapabilityAdvertised()) return;
-  if (!incrementalConsentApproved || !incrementalGrantRejected()) return;
+  if (!incrementalConsentApproved || !incrementalUploadAuthorityLost()) return;
   if (!hasCommunitySession()) return;
   incrementalRepairAttempted = true;
   void approveIncrementalContribution();
@@ -9189,7 +9207,7 @@ function maybeRepairIncrementalAuthorization() {
  */
 function resumeContributionCeremonyAfterSignIn() {
   if (!incrementalSyncCapabilityAdvertised()) return;
-  if (!incrementalConsentApproved || !incrementalGrantRejected()) return;
+  if (!incrementalConsentApproved || !incrementalUploadAuthorityLost()) return;
   if (incrementalConsentBusy || communityConnectBusy) return;
   void approveIncrementalContribution();
 }
