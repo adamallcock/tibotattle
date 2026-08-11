@@ -25,6 +25,14 @@ const PACE_EXPORTS = Object.freeze([
   "QUOTA_PACE_POLICY",
   "analyzeQuotaPace",
 ]);
+const COMPOSITION_EXPORTS = Object.freeze([
+  "MODEL_COMPOSITION_POLICY",
+  "blendedCompositionCapacityUsd",
+  "buildCompositionObservations",
+  "calibrateCompositionCapacities",
+  "compositionExpectedPp",
+  "solveNonNegativeLeastSquares",
+]);
 const WINDOW_EXPORTS = Object.freeze([
   "FIVE_HOUR_WINDOW_MINUTES",
   "formatQuotaWindowDuration",
@@ -51,6 +59,16 @@ const SOURCE_HASHES = Object.freeze({
   // around 2026-07-06 without the window itself changing.
   "quota-pace-forecast.js":
     "7cb7e1fd014a214fd922a7f285ef976dc52189ed24a575c85be6919aa4c6156a",
+  // Not a pre-extraction kernel: authored 2026-08-11 for the
+  // composition-aware expected line (per-model NNLS calibration, design:
+  // docs/design/composition-aware-expected-line.md). Pinned the same way so
+  // an unreviewed edit to the fit is as loud as one to the older kernels.
+  // Re-pinned 2026-08-11 for the reviewed corrections: mid-bin-reset bins
+  // are voided (one bin's cost was attributed to every same-pool segment
+  // moving in it) and the fallback gate became df-adjusted plus split-half
+  // stability (raw nested R² could never reject a near-collinear fit).
+  "model-composition.js":
+    "e7a56f8d66e60227cc509fa3d8166b94c7544af867f081e6a6953e5e984abbd5",
 });
 
 test("quota analysis exposes one exact runtime-neutral package root", async () => {
@@ -77,6 +95,7 @@ test("quota analysis exposes one exact runtime-neutral package root", async () =
       ...CALIBRATION_EXPORTS,
       ...ROLLING_EXPORTS,
       ...PACE_EXPORTS,
+      ...COMPOSITION_EXPORTS,
       ...WINDOW_EXPORTS,
     ].sort(),
   );

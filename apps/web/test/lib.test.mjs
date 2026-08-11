@@ -676,6 +676,26 @@ test("deviation detector treats a data gap as a hard boundary", () => {
   assert.equal(result.periods.length, 0);
 });
 
+test("a pool-saturated span never becomes or extends a deviation period", () => {
+  // While the weekly pool is pegged at 100%, liveTimelinePoints suspends both
+  // the residual and the cumulative drift (nulls, status "pool_saturated") —
+  // the same shape as a data gap — so the detector can neither read the
+  // post-peg interregnum as an over-cost period nor bridge a run across it,
+  // and the excluded spans contribute nothing to any period's signed AUC.
+  const series = driftSeries([
+    -8, -8, -8, -8, -8, -8,
+    { drift: null, residual: null },
+    { drift: null, residual: null },
+    { drift: null, residual: null },
+    { drift: -8, reanchor: true }, -8, -8, -8, -8, -8,
+  ]);
+  const result = detectDeviationPeriods(series);
+  // Each side is 75 minutes: below the two-hour sustain floor once the
+  // saturated span refuses to connect them.
+  assert.equal(result.periods.length, 0);
+  assert.equal(result.hasDriftSeries, true);
+});
+
 test("deviation detector returns an explicit empty result with no drift series", () => {
   const empty = detectDeviationPeriods([]);
   assert.deepEqual(empty.periods, []);
@@ -8147,6 +8167,116 @@ test("cumulative drift sums non-overlapping buckets and re-anchors at each reset
     points.map((point) => point.cumulativeResidual),
     [0, 7, 4, 0, -4, -9, -14, -19, null],
   );
+});
+
+test("a single stale quota dip suspends one drift point instead of re-anchoring", async () => {
+  const liveTimelinePoints = await loadLiveTimelinePoints();
+  const hour = (index) => new Date(Date.UTC(2026, 7, 5, index)).toISOString();
+  const resetAt = "2026-08-10T00:00:00.000Z";
+  const quotaRow = (index, usedPercent) => ({
+    observedAt: hour(index),
+    limitId: "codex",
+    durationMinutes: 10_080,
+    slot: "primary",
+    usedPercent,
+    remainingPercent: 100 - usedPercent,
+    resetAt,
+  });
+  // Live-corpus shape (2026-05-26: 59 -> 6 -> 61): one interleaved reading
+  // from a stale source, immediately recovered, same resetAt. Re-anchoring on
+  // it would poison the baseline so the recovery books ~+55pp of fabricated
+  // sustained drift; the two-consecutive-readings rule holds it to a single
+  // suspended point.
+  const data = {
+    weekly: { summary: { median_weekly_value_usd: 2_000 } },
+    gradient: { summary: {} },
+    timeline: {
+      usage: Array.from({ length: 12 }, (_, index) => ({
+        startAt: hour(index),
+        endAt: hour(index + 1),
+        apiPriceEquivalentUsd: 10,
+        usageEvents: 5,
+      })),
+      quota: [
+        quotaRow(1, 55),
+        quotaRow(2, 56),
+        quotaRow(3, 57),
+        quotaRow(4, 58),
+        quotaRow(5, 6), // stale interleaved reading
+        quotaRow(6, 58),
+        quotaRow(7, 59),
+        quotaRow(8, 59),
+        quotaRow(9, 60),
+        quotaRow(10, 60),
+        quotaRow(11, 61),
+      ],
+    },
+  };
+  const points = liveTimelinePoints(data);
+  // Exactly one re-anchor: the series start. The dip itself suspends.
+  assert.deepEqual(
+    points.flatMap((point, index) => (point.driftReanchor ? [index] : [])),
+    [0],
+  );
+  assert.equal(points[4].cumulativeResidual, null);
+  // Drift resumes from the SAME anchor after the recovery — never a jump of
+  // the dip's magnitude.
+  for (const point of points) {
+    assert.ok(point.cumulativeResidual === null
+      || Math.abs(point.cumulativeResidual) < 10);
+  }
+  const detection = detectDeviationPeriods(points, {
+    usageBuckets: data.timeline.usage,
+  });
+  assert.equal(detection.periods.length, 0);
+});
+
+test("two consecutive confirming readings re-anchor the drift at a banked reset", async () => {
+  const liveTimelinePoints = await loadLiveTimelinePoints();
+  const hour = (index) => new Date(Date.UTC(2026, 7, 5, index)).toISOString();
+  const resetAt = "2026-08-10T00:00:00.000Z";
+  const quotaRow = (index, usedPercent) => ({
+    observedAt: hour(index),
+    limitId: "codex",
+    durationMinutes: 10_080,
+    slot: "primary",
+    usedPercent,
+    remainingPercent: 100 - usedPercent,
+    resetAt,
+  });
+  const data = {
+    weekly: { summary: { median_weekly_value_usd: 2_000 } },
+    gradient: { summary: {} },
+    timeline: {
+      usage: Array.from({ length: 8 }, (_, index) => ({
+        startAt: hour(index),
+        endAt: hour(index + 1),
+        apiPriceEquivalentUsd: 10,
+        usageEvents: 5,
+      })),
+      quota: [
+        quotaRow(1, 55),
+        quotaRow(2, 56),
+        quotaRow(3, 57),
+        // Banked reset keeps resets_at but the display drops and STAYS down.
+        quotaRow(4, 6),
+        quotaRow(5, 7),
+        quotaRow(6, 8),
+        quotaRow(7, 9),
+      ],
+    },
+  };
+  const points = liveTimelinePoints(data);
+  // The first low reading suspends; the second confirms and re-anchors to 0.
+  assert.equal(points[3].cumulativeResidual, null);
+  assert.equal(points[3].driftReanchor, false);
+  assert.equal(points[4].cumulativeResidual, 0);
+  assert.equal(points[4].driftReanchor, true);
+  // Post-reset drift measures from the new anchor, not the pre-reset level.
+  for (const point of points.slice(5)) {
+    assert.ok(point.cumulativeResidual === null
+      || Math.abs(point.cumulativeResidual) < 10);
+  }
 });
 
 test("a window starting inside a collection silence anchors forward and shrinks to the measured span", async () => {

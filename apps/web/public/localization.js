@@ -299,6 +299,11 @@ export const WEB_MESSAGES = Object.freeze({
   // 2026-08-10). The example translation is a full sentence rendered as prose
   // under the stat row.
   "dashboard.calibration.rangeUnavailable": ["Range unavailable", "区间不可用", "Intervalo no disponible"],
+  // Composition-aware per-model detail behind the blended headline (owner
+  // decision 2026-08-10: blended "$X per point" leads; per-model on expand).
+  "dashboard.calibration.perModelSummary": ["Per-model rates", "各模型费率", "Tasas por modelo"],
+  "dashboard.calibration.perModelExplainer": ["Each model consumes the weekly allowance at its own rate, so the headline blends these over your recent mix.", "每个模型以各自的速率消耗每周额度，因此标题按你近期的模型组合对这些费率加权混合。", "Cada modelo consume la asignación semanal a su propia tasa, así que el titular las combina según tu mezcla reciente."],
+  "dashboard.calibration.perModelRate": ["{amount} per point", "每点 {amount}", "{amount} por punto"],
   "dashboard.calibration.example": ["$100 of recorded API-price-equivalent usage corresponds to about {points} percentage points.", "记录的 API 价格等价值使用量每 100 美元约对应 {points} 个百分点。", "100 USD de uso registrado equivalente al precio de API corresponden a unos {points} puntos porcentuales."],
   "dashboard.calibration.noRate": [`The weekly calibration contract requires at least ${WEEKLY_CALIBRATION_MINIMUM_QUOTA_BOUNDARIES} unique quota-boundary observations spanning at least ${WEEKLY_CALIBRATION_MINIMUM_DISPLAYED_SPAN_PP} displayed percentage points, plus a valid positive fit, before TiboTattle can estimate this rate and range. API prices remain a measuring stick, not a subscription charge.`, `每周校准契约要求至少 ${WEEKLY_CALIBRATION_MINIMUM_QUOTA_BOUNDARIES} 个唯一额度边界观测值，跨度至少为 ${WEEKLY_CALIBRATION_MINIMUM_DISPLAYED_SPAN_PP} 个显示百分点，并且拟合必须有效且为正，TiboTattle 才能估算此费率和区间。API 价格仍只是衡量尺，而不是订阅费用。`, `El contrato de calibración semanal exige al menos ${WEEKLY_CALIBRATION_MINIMUM_QUOTA_BOUNDARIES} observaciones únicas de límites de cuota que abarquen al menos ${WEEKLY_CALIBRATION_MINIMUM_DISPLAYED_SPAN_PP} puntos porcentuales mostrados, además de un ajuste positivo válido, antes de que TiboTattle pueda estimar esta tasa y su intervalo. Los precios de API siguen siendo una referencia, no un cargo de suscripción.`],
   "dashboard.calibration.withRange": ["Across {count} qualifying resets, the fitted seven-day allowance is {amount}; the middle 80% of those estimates spans {lower}–{upper}. Observed movement comes from the provider. Cost-implied movement translates local activity using the price in effect when each event occurred.", "在 {count} 次合格重置中，拟合的七天额度为 {amount}；这些估计的中间 80% 范围为 {lower}–{upper}。观测变化来自提供商。成本推算变化使用每个事件发生时有效的价格换算本地活动。", "En {count} reinicios válidos, el límite ajustado de siete días es {amount}; el 80 % central de esas estimaciones abarca {lower}–{upper}. El movimiento observado procede del proveedor. El movimiento implícito por coste traduce la actividad local con el precio vigente cuando ocurrió cada evento."],
@@ -375,6 +380,9 @@ export const WEB_MESSAGES = Object.freeze({
   "chart.status.missingQuotaBracket": ["Quota bracket not recorded", "未记录额度区间", "Intervalo de cuota no registrado"],
   "chart.status.resetOrTrackChange": ["Window boundary or track change", "窗口边界或额度轨道变化", "Límite de ventana o cambio de seguimiento"],
   "chart.status.backwardOrAmbiguous": ["Movement needs context", "变化需要上下文", "El movimiento necesita contexto"],
+  // The pool is pegged at 100%: the display cannot move while cost accrues,
+  // so the span is a deliberate suspension, never an over-cost reading.
+  "chart.status.poolSaturated": ["Allowance exhausted", "额度已用尽", "Asignación agotada"],
   "chart.status.historical": ["Historical calibration point", "历史校准点", "Punto de calibración histórico"],
 
   // Weekly allowance history. The headline deliberately never follows the
@@ -975,6 +983,10 @@ export const WEB_PLURAL_MESSAGES = Object.freeze({
   "dashboard.timeline.excludedAmbiguousMovement": Object.freeze({
     one: ["{count} window is excluded because its quota movement is ambiguous", "有 {count} 个窗口因额度变化不明确而被排除", "{count} ventana está excluida porque su movimiento de cuota es ambiguo"],
     other: ["{count} windows are excluded because their quota movement is ambiguous", "有 {count} 个窗口因额度变化不明确而被排除", "{count} ventanas están excluidas porque su movimiento de cuota es ambiguo"],
+  }),
+  "dashboard.timeline.excludedPoolSaturated": Object.freeze({
+    one: ["{count} window is suspended because the allowance was exhausted (display pegged at 100%)", "有 {count} 个窗口因额度已用尽（显示固定在 100%）而暂停", "{count} ventana está suspendida porque la asignación estaba agotada (indicador fijado en 100 %)"],
+    other: ["{count} windows are suspended because the allowance was exhausted (display pegged at 100%)", "有 {count} 个窗口因额度已用尽（显示固定在 100%）而暂停", "{count} ventanas están suspendidas porque la asignación estaba agotada (indicador fijado en 100 %)"],
   }),
   "dashboard.timeline.series": Object.freeze({
     one: ["No {window} series loaded", "未加载 {window} 序列", "No se cargó ninguna serie de {window}"],

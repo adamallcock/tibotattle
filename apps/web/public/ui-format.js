@@ -265,6 +265,7 @@ export function classifyTimelineEvidence({
   expected = null,
   usageEvents = 0,
   apiCostUsd = 0,
+  poolSaturated = false,
 } = {}) {
   const observedValue = finite(observed);
   const expectedValue = finite(expected);
@@ -273,15 +274,19 @@ export function classifyTimelineEvidence({
   const residual = observedValue === null || expectedValue === null
     ? null
     : observedValue - expectedValue;
+  // A pegged pool is its own evidence state, not an ambiguity: the window is
+  // fully bracketed inside one reset, but a display at its ceiling cannot
+  // move, so no residual is measurable there ("allowance exhausted").
   const status = !bracketed ? "missing_quota_bracket"
     : !sameReset ? "reset_or_track_change"
-      : observedValue === null ? "backward_or_ambiguous"
-        : observedValue === 0 && events === 0 && cost === 0 ? "inactive"
-          : observedValue > 0 && events === 0
-            ? "unexplained_without_local_activity"
-            : events > 0 && cost === 0
-              ? "unpriced_local_activity"
-              : "matched";
+      : poolSaturated === true ? "pool_saturated"
+        : observedValue === null ? "backward_or_ambiguous"
+          : observedValue === 0 && events === 0 && cost === 0 ? "inactive"
+            : observedValue > 0 && events === 0
+              ? "unexplained_without_local_activity"
+              : events > 0 && cost === 0
+                ? "unpriced_local_activity"
+                : "matched";
   return Object.freeze({ status, residual });
 }
 
