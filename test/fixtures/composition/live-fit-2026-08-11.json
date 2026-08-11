@@ -1,0 +1,30 @@
+{
+  "schemaVersion": "composition-live-fit-v1",
+  "fittedAt": "2026-08-11",
+  "corpus": {
+    "source": "live unified index (read-only), envelope x 2h-bin cost corpus, 2026-06-01 onward",
+    "observationCount": 500
+  },
+  "fit": {
+    "status": "fitted",
+    "capacityUsdByModel": {
+      "gpt-5.5": 2175.14,
+      "gpt-5.6-sol": 2539.01,
+      "gpt-5.6-terra": 899.26,
+      "other": null
+    },
+    "modelCostShares": {
+      "gpt-5.6-sol": 0.455278,
+      "gpt-5.5": 0.429472,
+      "gpt-5.6-terra": 0.110711,
+      "gpt-5.6-luna": 0.002295,
+      "gpt-5.4-mini": 0.001999,
+      "gpt-5.4": 0.000225,
+      "codex-auto-review": 0.000021
+    },
+    "r2": 0.759206,
+    "singleConstantUsd": 2060.65,
+    "singleConstantR2": 0.664023
+  },
+  "recentMixBlendedCapacityUsd": 2007.24
+}

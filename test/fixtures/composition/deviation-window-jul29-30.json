@@ -1,0 +1,224 @@
+{
+  "schemaVersion": "composition-golden-window-v1",
+  "label": "Jul29-30-over",
+  "window": {
+    "fromUtc": "2026-07-29T18:45:00.000Z",
+    "toUtc": "2026-07-30T16:30:00.000Z"
+  },
+  "provenance": {
+    "source": "live unified index, read-only derivation 2026-08-11",
+    "grainHours": 2,
+    "note": "Envelope movement per 2h bin with that bin's per-model Standard-API-priced cost; absolute percent level anchored so the window ends where the live pool did. Bins with cost but no envelope movement (idle or post-peg) carry zero movement."
+  },
+  "constantCapacityUsd": 2060.65,
+  "composition": {
+    "capacityUsdByModel": {
+      "gpt-5.5": 2175.14,
+      "gpt-5.6-sol": 2539.01,
+      "gpt-5.6-terra": 899.26,
+      "other": null
+    },
+    "blendedCapacityUsd": 2007.24
+  },
+  "intervals": [
+    {
+      "eventTime": "2026-07-29T21:59:59.999Z",
+      "priorUsedPercent": 31,
+      "nextUsedPercent": 50,
+      "marginalApiPricedUsd": 376.14,
+      "marginalUsageEventCount": 1,
+      "modelMix": {
+        "gpt-5.6-sol": {
+          "costUsd": 291.71,
+          "events": 1
+        },
+        "gpt-5.6-terra": {
+          "costUsd": 84.44,
+          "events": 1
+        }
+      }
+    },
+    {
+      "eventTime": "2026-07-29T23:59:59.999Z",
+      "priorUsedPercent": 50,
+      "nextUsedPercent": 60,
+      "marginalApiPricedUsd": 240.03,
+      "marginalUsageEventCount": 1,
+      "modelMix": {
+        "gpt-5.6-sol": {
+          "costUsd": 193.53,
+          "events": 1
+        },
+        "gpt-5.6-terra": {
+          "costUsd": 46.49,
+          "events": 1
+        }
+      }
+    },
+    {
+      "eventTime": "2026-07-30T01:59:59.999Z",
+      "priorUsedPercent": 60,
+      "nextUsedPercent": 71,
+      "marginalApiPricedUsd": 262.99,
+      "marginalUsageEventCount": 1,
+      "modelMix": {
+        "gpt-5.6-sol": {
+          "costUsd": 241.13,
+          "events": 1
+        },
+        "gpt-5.6-terra": {
+          "costUsd": 21.86,
+          "events": 1
+        }
+      }
+    },
+    {
+      "eventTime": "2026-07-30T03:59:59.999Z",
+      "priorUsedPercent": 71,
+      "nextUsedPercent": 78,
+      "marginalApiPricedUsd": 166.73,
+      "marginalUsageEventCount": 1,
+      "modelMix": {
+        "gpt-5.6-sol": {
+          "costUsd": 154.88,
+          "events": 1
+        },
+        "gpt-5.6-terra": {
+          "costUsd": 11.85,
+          "events": 1
+        }
+      }
+    },
+    {
+      "eventTime": "2026-07-30T05:59:59.999Z",
+      "priorUsedPercent": 78,
+      "nextUsedPercent": 81,
+      "marginalApiPricedUsd": 65.81,
+      "marginalUsageEventCount": 1,
+      "modelMix": {
+        "gpt-5.6-sol": {
+          "costUsd": 64.19,
+          "events": 1
+        },
+        "gpt-5.6-terra": {
+          "costUsd": 1.63,
+          "events": 1
+        }
+      }
+    },
+    {
+      "eventTime": "2026-07-30T07:59:59.999Z",
+      "priorUsedPercent": 81,
+      "nextUsedPercent": 85,
+      "marginalApiPricedUsd": 107.1,
+      "marginalUsageEventCount": 1,
+      "modelMix": {
+        "gpt-5.6-sol": {
+          "costUsd": 99.74,
+          "events": 1
+        },
+        "gpt-5.6-terra": {
+          "costUsd": 7.36,
+          "events": 1
+        }
+      }
+    },
+    {
+      "eventTime": "2026-07-30T09:59:59.999Z",
+      "priorUsedPercent": 85,
+      "nextUsedPercent": 97,
+      "marginalApiPricedUsd": 275.4,
+      "marginalUsageEventCount": 1,
+      "modelMix": {
+        "gpt-5.6-sol": {
+          "costUsd": 262.68,
+          "events": 1
+        },
+        "gpt-5.6-terra": {
+          "costUsd": 12.73,
+          "events": 1
+        }
+      }
+    },
+    {
+      "eventTime": "2026-07-30T11:59:59.999Z",
+      "priorUsedPercent": 97,
+      "nextUsedPercent": 100,
+      "marginalApiPricedUsd": 298.18,
+      "marginalUsageEventCount": 1,
+      "modelMix": {
+        "gpt-5.6-sol": {
+          "costUsd": 288,
+          "events": 1
+        },
+        "gpt-5.6-terra": {
+          "costUsd": 10.18,
+          "events": 1
+        }
+      }
+    },
+    {
+      "eventTime": "2026-07-30T13:59:59.999Z",
+      "priorUsedPercent": 100,
+      "nextUsedPercent": 100,
+      "marginalApiPricedUsd": 50.51,
+      "marginalUsageEventCount": 1,
+      "modelMix": {
+        "gpt-5.6-sol": {
+          "costUsd": 48.93,
+          "events": 1
+        },
+        "gpt-5.6-terra": {
+          "costUsd": 1.37,
+          "events": 1
+        },
+        "gpt-5.6-luna": {
+          "costUsd": 0.2,
+          "events": 1
+        }
+      }
+    },
+    {
+      "eventTime": "2026-07-30T15:59:59.999Z",
+      "priorUsedPercent": 100,
+      "nextUsedPercent": 100,
+      "marginalApiPricedUsd": 116.04,
+      "marginalUsageEventCount": 1,
+      "modelMix": {
+        "gpt-5.6-sol": {
+          "costUsd": 102.83,
+          "events": 1
+        },
+        "gpt-5.6-terra": {
+          "costUsd": 13.21,
+          "events": 1
+        }
+      }
+    },
+    {
+      "eventTime": "2026-07-30T17:59:59.999Z",
+      "priorUsedPercent": 100,
+      "nextUsedPercent": 100,
+      "marginalApiPricedUsd": 97.51,
+      "marginalUsageEventCount": 1,
+      "modelMix": {
+        "gpt-5.6-sol": {
+          "costUsd": 94.6,
+          "events": 1
+        },
+        "gpt-5.6-terra": {
+          "costUsd": 2.9,
+          "events": 1
+        }
+      }
+    }
+  ],
+  "expectations": {
+    "spanPp": 69,
+    "allCostUsd": 2056.44,
+    "residualBeforePp": -30.8,
+    "residualAfterPp": -15.71,
+    "saturatedCostUsd": 264.06,
+    "saturatedBins": 3
+  }
+}

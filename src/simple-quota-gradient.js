@@ -1,6 +1,26 @@
-import { SEVEN_DAY_WINDOW_MINUTES } from "@app-usagemonitor/quota-analysis";
+import {
+  MODEL_COMPOSITION_POLICY,
+  SEVEN_DAY_WINDOW_MINUTES,
+  compositionExpectedPp,
+} from "@app-usagemonitor/quota-analysis";
 
 const WEEKLY_WINDOW_MINS = SEVEN_DAY_WINDOW_MINUTES;
+// The provider restates one pool's resets_at with seconds-level jitter (one
+// to twenty-two seconds observed), so the selected reset is a CLUSTER of
+// resets_at values within the same two-minute tolerance the dashboard's
+// boundary matcher uses — wide enough to absorb every observed restatement,
+// far too narrow to merge two distinct pools (a fresh pool's resets_at lands
+// hours-to-days away, and the composition kernel's coarser corpus pooling is
+// its own, separately-guarded concern).
+const POOL_RESETS_AT_JITTER_TOLERANCE_SECONDS = 120;
+// A displayed used_percent decrease larger than this is a genuine reset
+// boundary (banked or automatic); smaller wobbles are display jitter the
+// monotone envelope absorbs. Matches the composition kernel's corpus rule.
+const RESET_DECREASE_THRESHOLD_PP = MODEL_COMPOSITION_POLICY.resetDropPp;
+// The weekly pool's displayed ceiling. A rolling window that STARTS here is
+// measuring a pegged pool: observed cannot rise while cost keeps accruing, so
+// the expected side is suspended rather than booked as drift.
+const POOL_SATURATION_CEILING_PP = 100;
 
 function round(value, places = 6) {
   if (!Number.isFinite(value)) return null;
@@ -44,37 +64,79 @@ function rollingTimeLabels(start, end) {
   };
 }
 
-function mainWeeklyReset(intervals) {
-  const counts = new Map();
-  for (const interval of intervals) {
-    if (interval.windowDurationMins !== WEEKLY_WINDOW_MINS || !Number.isFinite(interval.resetsAt)) continue;
-    // Slot is a server-assigned UI role, not identity: the weekly window
-    // flipped secondary -> primary around 2026-07-06 and must remain one
-    // series. Identity is (limit, duration) with resetsAt as instance facet.
-    const key = [
-      interval.accountScopeId ?? "unattributed",
-      interval.planVariant ?? "unknown",
-      interval.provider,
-      interval.planType,
-      interval.limitId,
-      interval.windowDurationMins,
-      interval.resetsAt,
-    ].join("|");
-    const current = counts.get(key) ?? { count: 0, interval };
-    current.count += 1;
-    counts.set(key, current);
-  }
-  return [...counts.values()].sort((left, right) => right.count - left.count)[0] ?? null;
+function resetPartitionKey(interval) {
+  // Slot is a server-assigned UI role, not identity: the weekly window
+  // flipped secondary -> primary around 2026-07-06 and must remain one
+  // series. Identity is (limit, duration) with resetsAt as instance facet.
+  return [
+    interval.accountScopeId ?? "unattributed",
+    interval.planVariant ?? "unknown",
+    interval.provider,
+    interval.planType,
+    interval.limitId,
+    interval.windowDurationMins,
+  ].join("|");
 }
 
-function sameReset(row, selected) {
+function mainWeeklyReset(intervals) {
+  // One pool restates its resets_at with seconds-level jitter, so the
+  // instance facet is a CLUSTER of resets_at values within the pool
+  // tolerance, never one exact timestamp — exact matching split single pools
+  // into phantom near-empty tracks.
+  const partitions = new Map();
+  for (const interval of intervals) {
+    if (interval.windowDurationMins !== WEEKLY_WINDOW_MINS || !Number.isFinite(interval.resetsAt)) continue;
+    const key = resetPartitionKey(interval);
+    const rows = partitions.get(key) ?? [];
+    rows.push(interval);
+    partitions.set(key, rows);
+  }
+  const clusters = [];
+  for (const rows of partitions.values()) {
+    const byReset = new Map();
+    for (const interval of rows) {
+      const entry = byReset.get(interval.resetsAt) ?? { resetsAt: interval.resetsAt, count: 0, interval };
+      entry.count += 1;
+      byReset.set(interval.resetsAt, entry);
+    }
+    const ordered = [...byReset.values()].sort((left, right) => left.resetsAt - right.resetsAt);
+    let cluster = null;
+    for (const entry of ordered) {
+      if (cluster === null
+          || entry.resetsAt - cluster.maxResetsAt
+            > POOL_RESETS_AT_JITTER_TOLERANCE_SECONDS) {
+        cluster = {
+          interval: entry.interval,
+          count: 0,
+          resetsAtValues: new Set(),
+          maxResetsAt: entry.resetsAt,
+        };
+        clusters.push(cluster);
+      }
+      cluster.count += entry.count;
+      cluster.resetsAtValues.add(entry.resetsAt);
+      cluster.maxResetsAt = entry.resetsAt;
+      // The cluster is represented by its most-observed member so downstream
+      // labels name the timestamp the provider actually repeated.
+      if (entry.count > (cluster.representativeCount ?? 0)) {
+        cluster.interval = entry.interval;
+        cluster.representativeCount = entry.count;
+      }
+    }
+  }
+  return clusters.sort((left, right) => right.count - left.count)[0] ?? null;
+}
+
+function sameReset(row, selected, resetsAtValues = null) {
   return (row.accountScopeId ?? "unattributed") === (selected.accountScopeId ?? "unattributed")
     && (row.planVariant ?? "unknown") === (selected.planVariant ?? "unknown")
     && row.provider === selected.provider
     && row.planType === selected.planType
     && row.limitId === selected.limitId
     && row.windowDurationMins === selected.windowDurationMins
-    && row.resetsAt === selected.resetsAt;
+    && (resetsAtValues === null
+      ? row.resetsAt === selected.resetsAt
+      : resetsAtValues.has(row.resetsAt));
 }
 
 function isEligibleTransition(row) {
@@ -154,7 +216,53 @@ function buildCurve(transitions, diagnostic) {
   };
 }
 
-export function buildRollingHours(intervals, capacityUsd, smoothingHours = 3) {
+function normalizeRollingCapacity(capacity) {
+  if (Number.isFinite(capacity) && capacity > 0) {
+    return { capacityUsdByModel: null, fallbackCapacityUsd: capacity };
+  }
+  if (capacity && typeof capacity === "object") {
+    const fallback = capacity.blendedCapacityUsd;
+    return {
+      capacityUsdByModel: capacity.capacityUsdByModel ?? null,
+      fallbackCapacityUsd: Number.isFinite(fallback) && fallback > 0
+        ? fallback
+        : null,
+    };
+  }
+  throw new TypeError(
+    "capacity must be a positive number or {capacityUsdByModel, blendedCapacityUsd}",
+  );
+}
+
+function addModelCosts(target, modelMix) {
+  for (const [model, values] of Object.entries(modelMix ?? {})) {
+    const cost = values?.costUsd;
+    if (!Number.isFinite(cost) || cost <= 0) continue;
+    target[model] = (target[model] ?? 0) + cost;
+  }
+}
+
+/**
+ * Trailing rolling windows of observed versus cost-implied quota movement.
+ *
+ * `capacity` is either the legacy blended constant or a composition object
+ * `{capacityUsdByModel, blendedCapacityUsd}`; with the vector present each
+ * window's expected movement is Σ_model cost_model · 100 / capacity_model
+ * (per-interval `modelMix`), with unfitted models priced at the blended
+ * fallback.
+ *
+ * Two honesty guards from the pool-lifecycle addendum:
+ * - a used_percent DECREASE beyond display jitter is a hard segment boundary
+ *   (banked/automatic reset): no window ever spans it, so the monotone
+ *   envelope cannot smear a reset into a permanent ceiling;
+ * - a window that STARTS at the 100% ceiling is a pegged pool
+ *   ("pool saturated"): observed cannot move while cost accrues, so both
+ *   series emit null with `pool_saturated: true` instead of booking the
+ *   accrued cost as negative drift.
+ */
+export function buildRollingHours(intervals, capacity, smoothingHours = 3) {
+  const { capacityUsdByModel, fallbackCapacityUsd } =
+    normalizeRollingCapacity(capacity);
   const ordered = [...intervals]
     .filter((row) => Number.isFinite(row.marginalApiPricedUsd)
       && Number.isFinite(row.priorUsedPercent)
@@ -162,71 +270,122 @@ export function buildRollingHours(intervals, capacityUsd, smoothingHours = 3) {
     .sort((left, right) => left.eventTime.localeCompare(right.eventTime));
   if (ordered.length === 0) return [];
 
+  // One bucket per (segment, hour). A reset inside an hour starts a new
+  // bucket in a new segment rather than folding pre- and post-reset movement
+  // into one envelope.
   const buckets = new Map();
+  let segment = 0;
   let monotonicUsed = ordered[0].priorUsedPercent;
   for (const row of ordered) {
-    const key = hourStart(row.eventTime);
+    if (row.nextUsedPercent < monotonicUsed - RESET_DECREASE_THRESHOLD_PP) {
+      segment += 1;
+      monotonicUsed = Math.min(row.priorUsedPercent, row.nextUsedPercent);
+    }
+    const key = `${segment}|${hourStart(row.eventTime)}`;
     const canonicalPrior = monotonicUsed;
     monotonicUsed = Math.max(monotonicUsed, row.nextUsedPercent);
     const bucket = buckets.get(key) ?? {
-      timestamp: key,
+      timestamp: hourStart(row.eventTime),
+      segment,
       apiCostUsd: 0,
+      costByModel: {},
       eventCount: 0,
       startUsedPercent: canonicalPrior,
       endUsedPercent: monotonicUsed,
     };
     bucket.apiCostUsd += row.marginalApiPricedUsd;
+    addModelCosts(bucket.costByModel, row.modelMix);
     bucket.eventCount += row.marginalUsageEventCount ?? 0;
     bucket.endUsedPercent = monotonicUsed;
     buckets.set(key, bucket);
   }
-
-  const firstHour = Date.parse(hourStart(ordered[0].eventTime));
-  const lastHour = Date.parse(hourStart(ordered.at(-1).eventTime));
-  const hours = [];
-  let carry = ordered[0].priorUsedPercent;
-  for (let timestamp = firstHour; timestamp <= lastHour; timestamp += 3_600_000) {
-    const key = new Date(timestamp).toISOString();
-    const observed = buckets.get(key);
-    const row = observed ?? {
-      timestamp: key,
-      apiCostUsd: 0,
-      eventCount: 0,
-      startUsedPercent: carry,
-      endUsedPercent: carry,
-    };
-    carry = row.endUsedPercent;
-    hours.push(row);
+  const bySegment = new Map();
+  for (const bucket of buckets.values()) {
+    const rows = bySegment.get(bucket.segment) ?? [];
+    rows.push(bucket);
+    bySegment.set(bucket.segment, rows);
   }
 
-  return hours.slice(smoothingHours - 1).flatMap((hour, index) => {
-    const window = hours.slice(index, index + smoothingHours);
-    const cost = window.reduce((sum, item) => sum + item.apiCostUsd, 0);
-    const observedChange = hour.endUsedPercent - window[0].startUsedPercent;
-    const expectedChange = cost * 100 / capacityUsd;
-    const windowEnd = new Date(Date.parse(hour.timestamp) + 3_600_000).toISOString();
-    const shared = {
-      timestamp: windowEnd,
-      ...rollingTimeLabels(window[0].timestamp, windowEnd),
-      rolling_api_cost_usd: round(cost),
-      rolling_event_count: window.reduce((sum, item) => sum + item.eventCount, 0),
-      smoothing_hours: smoothingHours,
-    };
-    return [
-      { ...shared, series: "Observed quota change", quota_change_pp: round(observedChange) },
-      { ...shared, series: "Expected from API cost", quota_change_pp: round(expectedChange) },
-    ];
-  });
+  const output = [];
+  for (const segmentBuckets of [...bySegment.values()]) {
+    segmentBuckets.sort((left, right) => left.timestamp.localeCompare(right.timestamp));
+    const firstHour = Date.parse(segmentBuckets[0].timestamp);
+    const lastHour = Date.parse(segmentBuckets.at(-1).timestamp);
+    const byHour = new Map(segmentBuckets.map((bucket) => [bucket.timestamp, bucket]));
+    const hours = [];
+    let carry = segmentBuckets[0].startUsedPercent;
+    for (let timestamp = firstHour; timestamp <= lastHour; timestamp += 3_600_000) {
+      const key = new Date(timestamp).toISOString();
+      const observed = byHour.get(key);
+      const row = observed ?? {
+        timestamp: key,
+        apiCostUsd: 0,
+        costByModel: {},
+        eventCount: 0,
+        startUsedPercent: carry,
+        endUsedPercent: carry,
+      };
+      carry = row.endUsedPercent;
+      hours.push(row);
+    }
+    // Windows never span a segment boundary: each segment rolls on its own.
+    output.push(...hours.slice(smoothingHours - 1).flatMap((hour, index) => {
+      const window = hours.slice(index, index + smoothingHours);
+      const cost = window.reduce((sum, item) => sum + item.apiCostUsd, 0);
+      const windowCostByModel = {};
+      for (const item of window) {
+        for (const [model, value] of Object.entries(item.costByModel)) {
+          windowCostByModel[model] = (windowCostByModel[model] ?? 0) + value;
+        }
+      }
+      const saturated =
+        window[0].startUsedPercent >= POOL_SATURATION_CEILING_PP;
+      const observedChange = saturated
+        ? null
+        : hour.endUsedPercent - window[0].startUsedPercent;
+      const expectedChange = saturated
+        ? null
+        : capacityUsdByModel !== null
+          ? compositionExpectedPp(windowCostByModel, {
+            capacityUsdByModel,
+            fallbackCapacityUsd,
+          })
+          : (fallbackCapacityUsd !== null
+            ? cost * 100 / fallbackCapacityUsd
+            : null);
+      const windowEnd = new Date(Date.parse(hour.timestamp) + 3_600_000).toISOString();
+      const shared = {
+        timestamp: windowEnd,
+        ...rollingTimeLabels(window[0].timestamp, windowEnd),
+        rolling_api_cost_usd: round(cost),
+        rolling_event_count: window.reduce((sum, item) => sum + item.eventCount, 0),
+        smoothing_hours: smoothingHours,
+        pool_saturated: saturated,
+      };
+      return [
+        { ...shared, series: "Observed quota change", quota_change_pp: round(observedChange) },
+        { ...shared, series: "Expected from API cost", quota_change_pp: round(expectedChange) },
+      ];
+    }));
+  }
+  return output.sort((left, right) => left.timestamp.localeCompare(right.timestamp)
+    || left.series.localeCompare(right.series));
 }
 
 function buildRollingResidual(rolling) {
   const paired = new Map();
+  let saturatedWindows = 0;
   for (const row of rolling) {
     const item = paired.get(row.timestamp) ?? { timestamp: row.timestamp };
-    if (row.series === "Observed quota change") item.observed = row.quota_change_pp;
+    if (row.series === "Observed quota change") {
+      item.observed = row.quota_change_pp;
+      if (row.pool_saturated === true) saturatedWindows += 1;
+    }
     if (row.series === "Expected from API cost") item.expected = row.quota_change_pp;
     paired.set(row.timestamp, item);
   }
+  // Saturated windows carry null on both series, so this filter is what
+  // keeps the signed and absolute AUC from ever integrating post-peg cost.
   const rows = [...paired.values()]
     .filter((row) => Number.isFinite(row.observed) && Number.isFinite(row.expected))
     .sort((left, right) => left.timestamp.localeCompare(right.timestamp))
@@ -253,6 +412,7 @@ function buildRollingResidual(rolling) {
     rows,
     signedAucPpHours: round(signedAuc),
     absoluteAucPpHours: round(absoluteAuc),
+    saturatedWindowsExcluded: saturatedWindows,
     meanResidualPp: rows.length > 0
       ? round(rows.reduce((sum, row) => sum + row.residual_pp, 0) / rows.length)
       : null,
@@ -323,7 +483,7 @@ export function analyzeFastDiagnostic(diagnostic, {
   if (!selection) throw new Error("Fast diagnostic has no weekly snapshot intervals");
   const selected = selection.interval;
   const intervals = diagnostic.snapshotIntervals
-    .filter((row) => sameReset(row, selected))
+    .filter((row) => sameReset(row, selected, selection.resetsAtValues))
     .sort((left, right) => left.eventTime.localeCompare(right.eventTime));
   const fastRows = intervals.filter((row) => row.eventTime >= fastStart && row.eventTime < fastEnd);
   const referenceRows = intervals.filter((row) => row.eventTime >= referenceStart && row.eventTime < referenceEnd);
@@ -549,19 +709,36 @@ function buildResetTrend(diagnostics) {
   return { rows, table, usable };
 }
 
-export function analyzeSimpleQuotaGradient(recent, history, { smoothingHours = 3 } = {}) {
+export function analyzeSimpleQuotaGradient(recent, history, {
+  smoothingHours = 3,
+  // Optional composition-aware calibration: {capacityUsdByModel,
+  // blendedCapacityUsd}. When present the rolling expected line prices each
+  // window's per-model cost at its own fitted capacity; absent, the blended
+  // reset-diagnostic constant carries the line exactly as before.
+  composition = null,
+} = {}) {
   const selection = mainWeeklyReset(recent.snapshotIntervals ?? []);
   if (!selection) throw new Error("No weekly quota snapshot intervals were found");
   const selected = selection.interval;
-  const intervals = recent.snapshotIntervals.filter((row) => sameReset(row, selected));
-  const transitions = recent.transitions.filter((row) => sameReset(row, selected));
-  const diagnostic = history.resetDiagnostics.find((row) => sameReset(row, selected));
+  const intervals = recent.snapshotIntervals.filter((row) => sameReset(row, selected, selection.resetsAtValues));
+  const transitions = recent.transitions.filter((row) => sameReset(row, selected, selection.resetsAtValues));
+  const diagnostic = history.resetDiagnostics.find((row) => sameReset(row, selected, selection.resetsAtValues));
   if (!diagnostic?.usableDiagnostic || !Number.isFinite(diagnostic.descriptiveCapacityUsd)) {
     throw new Error(`No usable reset diagnostic matches ${selected.resetsAt}`);
   }
 
+  const compositionVector = composition?.capacityUsdByModel ?? null;
+  const rollingCapacity = compositionVector !== null
+    ? {
+      capacityUsdByModel: compositionVector,
+      blendedCapacityUsd: Number.isFinite(composition?.blendedCapacityUsd)
+        && composition.blendedCapacityUsd > 0
+        ? composition.blendedCapacityUsd
+        : diagnostic.descriptiveCapacityUsd,
+    }
+    : diagnostic.descriptiveCapacityUsd;
   const curve = buildCurve(transitions, diagnostic);
-  const rolling = buildRollingHours(intervals, diagnostic.descriptiveCapacityUsd, smoothingHours);
+  const rolling = buildRollingHours(intervals, rollingCapacity, smoothingHours);
   const residual = buildRollingResidual(rolling);
   const trend = buildResetTrend(history.resetDiagnostics);
   const recentThree = trend.usable.slice(-3).map((row) => row.descriptiveCapacityUsd);
@@ -592,6 +769,11 @@ export function analyzeSimpleQuotaGradient(recent, history, { smoothingHours = 3
       rollingAbsoluteAucPpHours: residual.absoluteAucPpHours,
       rollingMeanResidualPp: residual.meanResidualPp,
       rollingPeakAbsoluteResidualPp: residual.peakAbsoluteResidualPp,
+      rollingSaturatedWindowsExcluded: residual.saturatedWindowsExcluded,
+      rollingExpectedBasis: compositionVector !== null
+        ? "composition_per_model"
+        : "blended_constant",
+      compositionCapacityUsdByModel: compositionVector,
     },
     history: {
       usableResetCount: trend.usable.length,
