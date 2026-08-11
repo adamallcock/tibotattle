@@ -10,6 +10,7 @@ import {
   quotaWindowProjection,
   safeSpeed,
   sampleQuotaTimelineByTrack,
+  SPARK_QUOTA_LIMIT_IDS,
   TIMELINE_BUCKET_MS,
   usageProjection,
 } from "./local-companion-usage-model.js";
@@ -173,6 +174,10 @@ function quotaRowTieBreak(row) {
 
 /**
  * The quota series for one limit, streamed off the index in timestamp order.
+ * `limitIds` lists every provider spelling of that limit's id (the Spark
+ * allowance is stored as `codex_bengalfox`, with `codex-spark` reserved in
+ * case the marketing name stabilizes); querying only a spelling that never
+ * occurs left the series permanently empty.
  *
  * Semantically identical to the collector path's finalizeQuotaTimeline —
  * dedupe per (track, millisecond) by the same tie-break, per-track sample
@@ -181,12 +186,13 @@ function quotaRowTieBreak(row) {
  * Date.parse inside the comparator measured as seconds of the snapshot
  * build; this is why the shared finalizer is not reused here.
  */
-function quotaTimelineFor(database, limitId, nowMs) {
+function quotaTimelineFor(database, limitIds, nowMs) {
   const statement = database.prepare(`
-    SELECT observed_at_ms, slot, plan_type, used_percent,
+    SELECT observed_at_ms, limit_id, slot, plan_type, used_percent,
            resets_at_ms, duration_mins
     FROM quota_observation
-    WHERE limit_id = ? AND observed_at_ms <= ?
+    WHERE limit_id IN (${limitIds.map(() => "?").join(", ")})
+      AND observed_at_ms <= ?
     ORDER BY observed_at_ms`);
   const rows = [];
   let groupMs = null;
@@ -200,10 +206,10 @@ function quotaTimelineFor(database, limitId, nowMs) {
     }
     group = new Map();
   };
-  for (const row of statement.iterate(limitId, nowMs + 5 * 60_000)) {
+  for (const row of statement.iterate(...limitIds, nowMs + 5 * 60_000)) {
     const observedMs = Number(row.observed_at_ms);
     const projected = quotaWindowProjection({
-      limitId,
+      limitId: row.limit_id,
       slot: row.slot,
       planType: row.plan_type,
       usedPercent: row.used_percent,
@@ -335,8 +341,12 @@ export async function readLocalUnifiedCompanionProjection({
         projection,
       );
     }
-    const quotaSeries = quotaTimelineFor(database, "codex", nowMs);
-    const sparkQuotaSeries = quotaTimelineFor(database, "codex-spark", nowMs);
+    const quotaSeries = quotaTimelineFor(database, ["codex"], nowMs);
+    const sparkQuotaSeries = quotaTimelineFor(
+      database,
+      SPARK_QUOTA_LIMIT_IDS,
+      nowMs,
+    );
     const quotaObservations = Number(database.prepare(
       "SELECT COUNT(*) AS c FROM quota_observation",
     ).get()?.c ?? 0);

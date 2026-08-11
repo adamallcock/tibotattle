@@ -397,6 +397,13 @@ test("the unified companion projection reads one continuous weekly quota series 
         plan_type: "pro",
         primary: weeklyWindow(13),
       }),
+      // The Spark allowance reports under its real provider id
+      // `codex_bengalfox` — not the reserved marketing token `codex-spark`.
+      record("2026-07-25T00:04:30.000Z", {
+        limit_id: "codex_bengalfox",
+        plan_type: "pro",
+        primary: weeklyWindow(7),
+      }),
     ];
     await writeFile(
       join(sessions, "rollout-2026-07-25T00-00-00-fixture.jsonl"),
@@ -442,6 +449,16 @@ test("the unified companion projection reads one continuous weekly quota series 
         ["2026-07-25T00:02:00.000Z", 41],
       ],
     );
+    // The Spark series reads the id the index actually stores; querying only
+    // the marketing token left this series permanently empty.
+    assert.deepEqual(
+      projection.timeline.sparkQuota.map(
+        (row) => [row.observedAt, row.limitId, row.usedPercent],
+      ),
+      [["2026-07-25T00:04:30.000Z", "codex_bengalfox", 7]],
+    );
+    // And the Spark rows never leak into the primary codex series.
+    assert.ok(projection.timeline.quota.every((row) => row.limitId === "codex"));
   } finally {
     await rm(root, { recursive: true, force: true });
   }

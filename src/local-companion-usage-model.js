@@ -56,6 +56,15 @@ export const KNOWN_AGENT_SCOPES = new Set(["root", "subagent", "automation", "un
 export const KNOWN_LINEAGE = new Set(["standalone", "forked", "parent_linked", "unknown"]);
 export const KNOWN_TOOL_CLASSES = new Set(["apply_patch", "local_shell", "other", "subagent", "tool_gateway"]);
 export const KNOWN_LIMITS = new Set(["codex", "codex_bengalfox", "codex-spark"]);
+// The Spark allowance's provider limit id as it actually occurs in rollout
+// logs and the unified index ("codex_bengalfox", first because it is the only
+// one observed to date), plus the marketing token ("codex-spark") the export
+// registry reserves in case the provider stabilizes on it later. Querying
+// only the marketing token left the sparkQuota series permanently empty.
+export const SPARK_QUOTA_LIMIT_IDS = Object.freeze([
+  "codex_bengalfox",
+  "codex-spark",
+]);
 export const KNOWN_PLANS = new Set(TELEMETRY_PLAN_TYPES);
 export const KNOWN_SLOTS = new Set(["primary", "secondary"]);
 export const TIMELINE_BUCKET_MS = 15 * 60 * 1_000;
