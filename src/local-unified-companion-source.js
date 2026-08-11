@@ -3,13 +3,13 @@ import { declaredSpeedModeAt } from "./codex-speed-baseline.js";
 import {
   addTimelineUsage,
   addUsageToPeriod,
-  deterministicSample,
   finalizeTimelineBuckets,
   finalizeUsagePeriod,
   MAX_QUOTA_TIMELINE_POINTS,
   newUsagePeriod,
   quotaWindowProjection,
   safeSpeed,
+  sampleQuotaTimelineByTrack,
   TIMELINE_BUCKET_MS,
   usageProjection,
 } from "./local-companion-usage-model.js";
@@ -175,11 +175,11 @@ function quotaRowTieBreak(row) {
  * The quota series for one limit, streamed off the index in timestamp order.
  *
  * Semantically identical to the collector path's finalizeQuotaTimeline —
- * dedupe per (track, millisecond) by the same tie-break, deterministic sample
- * to the same ceiling — but computed in one streaming pass over the already
- * sorted SQL result. Re-sorting 645k materialized rows with Date.parse inside
- * the comparator measured as seconds of the snapshot build; this is why the
- * shared finalizer is not reused here.
+ * dedupe per (track, millisecond) by the same tie-break, per-track sample
+ * under the same ceiling — but computed in one streaming pass over the
+ * already sorted SQL result. Re-sorting 645k materialized rows with
+ * Date.parse inside the comparator measured as seconds of the snapshot
+ * build; this is why the shared finalizer is not reused here.
  */
 function quotaTimelineFor(database, limitId, nowMs) {
   const statement = database.prepare(`
@@ -237,7 +237,7 @@ function quotaTimelineFor(database, limitId, nowMs) {
     }
   }
   flushGroup();
-  return deterministicSample(rows, MAX_QUOTA_TIMELINE_POINTS);
+  return sampleQuotaTimelineByTrack(rows, MAX_QUOTA_TIMELINE_POINTS);
 }
 
 /**

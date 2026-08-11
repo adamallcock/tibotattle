@@ -9,6 +9,7 @@ import {
   finalizeQuotaTimeline,
   orderQuotaWindows,
   quotaWindowProjection,
+  sampleQuotaTimelineByTrack,
 } from "../src/local-companion-usage-model.js";
 import { rebuildLocalUnifiedIndex } from "../src/local-unified-index-build.js";
 import { readLocalUnifiedCompanionProjection } from "../src/local-unified-companion-source.js";
@@ -158,6 +159,81 @@ test("orderQuotaWindows keeps a deterministic slot tie-break only among equal du
     orderQuotaWindows([fiveHourPrimary, weeklySecondary, weeklyPrimary]),
     [weeklyPrimary, fiveHourPrimary, weeklySecondary],
   );
+});
+
+// Thinning must happen per track, not across the combined series: an
+// index-uniform sample of a mixed weekly + five-hour series hands each track
+// an uneven residue of survivors, and a consumer that filters to one track
+// can lose whole days (measured: every usable window of a recent day).
+test("sampleQuotaTimelineByTrack thins each track independently under the shared ceiling", () => {
+  const start = Date.parse("2026-07-01T00:00:00.000Z");
+  const rows = [];
+  // A dense weekly track: one observation a minute for 200 hours.
+  for (let index = 0; index < 12_000; index += 1) {
+    rows.push(timelineRow({
+      observedAt: new Date(start + index * 60_000).toISOString(),
+      slot: index < 6_000 ? "secondary" : "primary",
+      usedPercent: Math.min(100, index / 200),
+    }));
+  }
+  // A sparse five-hour track: one observation an hour over the same span.
+  for (let index = 0; index < 200; index += 1) {
+    rows.push(timelineRow({
+      observedAt: new Date(start + index * 3_600_000).toISOString(),
+      slot: "primary",
+      usedPercent: Math.min(100, index / 4),
+      durationMinutes: FIVE_HOUR_MINUTES,
+      resetsAt: FIVE_HOUR_RESETS_AT,
+    }));
+  }
+  const sampled = sampleQuotaTimelineByTrack(rows, 1_000);
+  assert.equal(sampled.length, 1_000);
+  const weekly = sampled.filter((row) => row.durationMinutes === WEEKLY_MINUTES);
+  const fiveHour = sampled.filter((row) => row.durationMinutes === FIVE_HOUR_MINUTES);
+  // The sparse track fits inside its fair share and keeps every row; the
+  // dense track absorbs the surplus.
+  assert.equal(fiveHour.length, 200);
+  assert.equal(weekly.length, 800);
+  // Each surviving track still spans its whole era — first and last rows kept.
+  assert.equal(weekly[0].observedAt, "2026-07-01T00:00:00.000Z");
+  assert.equal(weekly.at(-1).observedAt, new Date(start + 11_999 * 60_000).toISOString());
+  assert.equal(fiveHour[0].observedAt, "2026-07-01T00:00:00.000Z");
+  assert.equal(fiveHour.at(-1).observedAt, new Date(start + 199 * 3_600_000).toISOString());
+  // The merged output stays chronological.
+  const instants = sampled.map((row) => Date.parse(row.observedAt));
+  assert.ok(instants.every((value, index) => index === 0 || value >= instants[index - 1]));
+  // Below the ceiling nothing is touched.
+  assert.equal(sampleQuotaTimelineByTrack(rows, rows.length), rows);
+});
+
+test("finalizeQuotaTimeline over the ceiling keeps recent rows of every track", () => {
+  const start = Date.parse("2026-07-01T00:00:00.000Z");
+  const rows = [];
+  for (let index = 0; index < 11_000; index += 1) {
+    rows.push(timelineRow({
+      observedAt: new Date(start + index * 60_000).toISOString(),
+      slot: "primary",
+      usedPercent: Math.min(100, index / 200),
+    }));
+  }
+  for (let index = 0; index < 400; index += 1) {
+    rows.push(timelineRow({
+      observedAt: new Date(start + index * 1_800_000).toISOString(),
+      slot: "primary",
+      usedPercent: Math.min(100, index / 4),
+      durationMinutes: FIVE_HOUR_MINUTES,
+      resetsAt: FIVE_HOUR_RESETS_AT,
+    }));
+  }
+  const finalized = finalizeQuotaTimeline(rows);
+  assert.ok(finalized.length <= 10_000);
+  const weekly = finalized.filter((row) => row.durationMinutes === WEEKLY_MINUTES);
+  const fiveHour = finalized.filter((row) => row.durationMinutes === FIVE_HOUR_MINUTES);
+  // The five-hour track fits under its fair share and survives whole; the
+  // weekly track keeps its own first and last observations.
+  assert.equal(fiveHour.length, 400);
+  assert.equal(weekly[0].observedAt, "2026-07-01T00:00:00.000Z");
+  assert.equal(weekly.at(-1).observedAt, new Date(start + 10_999 * 60_000).toISOString());
 });
 
 function minerSnapshot({ timestamp, slot, usedPercent, durationMinutes = WEEKLY_MINUTES, resetsAt = WEEKLY_RESETS_AT }) {

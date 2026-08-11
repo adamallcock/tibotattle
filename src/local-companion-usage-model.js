@@ -77,12 +77,68 @@ export function quotaResetIsoInstant(value) {
 
 export function deterministicSample(rows, maximum = MAX_DATASET_ROWS) {
   if (rows.length <= maximum) return rows;
+  if (maximum <= 0) return [];
+  if (maximum === 1) return [rows[0]];
   const sampled = [];
   const last = rows.length - 1;
   for (let index = 0; index < maximum; index += 1) {
     sampled.push(rows[Math.round((index * last) / (maximum - 1))]);
   }
   return sampled;
+}
+
+function quotaTimelineTrackKey(row) {
+  return `${row.limitId}:${row.durationMinutes ?? "unknown"}`;
+}
+
+function quotaTimelineOrderCompare(left, right) {
+  return left.observedEpochMs - right.observedEpochMs
+    || left.row.limitId.localeCompare(right.row.limitId)
+    || left.row.durationMinutes - right.row.durationMinutes
+    || left.row.slot.localeCompare(right.row.slot)
+    || left.row.planType.localeCompare(right.row.planType)
+    || left.row.usedPercent - right.row.usedPercent;
+}
+
+/**
+ * Thin a quota series to the payload ceiling without letting one dense track
+ * starve another. Sampling the combined series by row index looked uniform
+ * but was not: a consumer that then filters to one track (weekly versus
+ * five-hour) inherits whatever uneven residue of that track survived the
+ * combined thinning — measured as whole recent days losing every usable
+ * calibration window. Each track is therefore thinned independently under a
+ * fair share of the same total ceiling: tracks that fit keep every row and
+ * their surplus flows to the dense tracks, so the overall payload bound (and
+ * the size rationale behind it) is preserved exactly.
+ */
+export function sampleQuotaTimelineByTrack(rows, maximum = MAX_QUOTA_TIMELINE_POINTS) {
+  if (rows.length <= maximum) return rows;
+  const tracks = new Map();
+  for (const row of rows) {
+    const key = quotaTimelineTrackKey(row);
+    const group = tracks.get(key) ?? [];
+    group.push(row);
+    tracks.set(key, group);
+  }
+  const groups = [...tracks.entries()]
+    .sort((left, right) => (
+      left[1].length - right[1].length || left[0].localeCompare(right[0])
+    ))
+    .map(([, group]) => group);
+  let remaining = maximum;
+  let tracksLeft = groups.length;
+  const sampled = [];
+  for (const group of groups) {
+    const budget = Math.max(1, Math.floor(remaining / tracksLeft));
+    const take = Math.min(group.length, budget);
+    sampled.push(...deterministicSample(group, take));
+    remaining -= take;
+    tracksLeft -= 1;
+  }
+  return sampled
+    .map((row) => ({ row, observedEpochMs: Date.parse(row.observedAt) }))
+    .sort(quotaTimelineOrderCompare)
+    .map(({ row }) => row);
 }
 
 export function emptyComponents() {
@@ -573,7 +629,10 @@ export function finalizeQuotaTimeline(rows) {
       points.set(key, row);
     }
   }
-  return deterministicSample(
+  // Thinning is per track under the shared ceiling: an index-uniform sample
+  // of the combined series silently starves whichever track a consumer
+  // filters down to (see sampleQuotaTimelineByTrack).
+  return sampleQuotaTimelineByTrack(
     [...points.values()].sort((left, right) => (
       Date.parse(left.observedAt) - Date.parse(right.observedAt)
       || left.limitId.localeCompare(right.limitId)
