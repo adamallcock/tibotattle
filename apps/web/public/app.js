@@ -8444,6 +8444,9 @@ async function resumePendingHostedSignIn({ retries = 2 } = {}) {
     return;
   }
   pendingHostedSignInResumeInFlight = true;
+  // A reactivation is collecting a completed sign-in: hold off any teardown
+  // until it settles, exactly like a live sign-in.
+  signalHostedSignInInFlight(true);
   try {
     for (let attemptIndex = 0; attemptIndex <= retries; attemptIndex += 1) {
       let identity = null;
@@ -8494,6 +8497,22 @@ async function resumePendingHostedSignIn({ retries = 2 } = {}) {
     }
   } finally {
     pendingHostedSignInResumeInFlight = false;
+    signalHostedSignInInFlight(false);
+  }
+}
+
+// Tell the native shell whether a hosted sign-in is in flight, so it refuses to
+// tear the web view — and the pending handoff — down mid-sign-in (S1). A no-op
+// in a normal browser, where window.webkit is undefined; it carries a single
+// boolean and never a proof, provider, or account value.
+function signalHostedSignInInFlight(inFlight) {
+  try {
+    window.webkit?.messageHandlers?.tibotattleHostedSignIn?.postMessage({
+      inFlight: Boolean(inFlight),
+    });
+  } catch {
+    // The bridge is optional; its absence only removes the native shell's
+    // mid-sign-in teardown guard, never anything the sign-in itself needs.
   }
 }
 
@@ -8513,6 +8532,9 @@ async function beginHostedSignIn(providerId) {
   };
   activeHostedSignIn = attempt;
   hostedIdentityBusy = true;
+  // The browser is about to open: from here until this settles, the shell must
+  // not tear the page down and lose the handoff.
+  signalHostedSignInInFlight(true);
   renderHostedIdentity();
   status.hidden = false;
   status.className = "participant-action-status";
@@ -8615,6 +8637,9 @@ async function beginHostedSignIn(providerId) {
           : flow.failed),
     });
   } finally {
+    // Whatever the outcome, this attempt is no longer in flight — the shell may
+    // tear the web view down again.
+    signalHostedSignInInFlight(false);
     if (activeHostedSignIn === attempt) {
       activeHostedSignIn = null;
       hostedIdentityBusy = false;

@@ -9447,6 +9447,27 @@ test("the handoff persists the moment the browser opens and every activation ret
   );
 });
 
+test("the page tells the native shell when a hosted sign-in is in flight so it is not torn down", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  // A single content-free boolean crosses the bridge, guarded so it is a no-op
+  // in a normal browser where window.webkit is undefined (S1).
+  assert.match(
+    appSource,
+    /window\.webkit\?\.messageHandlers\?\.tibotattleHostedSignIn\?\.postMessage\(\{\s*\n\s*inFlight: Boolean\(inFlight\),/u,
+  );
+  // The live sign-in marks in-flight before the browser opens and clears it
+  // whatever the outcome.
+  const beginBody =
+    appSource.match(/async function beginHostedSignIn\([\s\S]*?\n\}/u)?.[0] ?? "";
+  assert.match(beginBody, /signalHostedSignInInFlight\(true\);/u);
+  assert.match(beginBody, /\} finally \{[\s\S]*?signalHostedSignInInFlight\(false\);/u);
+  // The reactivation resume does the same while it collects a completed proof.
+  const resumeBody =
+    appSource.match(/async function resumePendingHostedSignIn\([\s\S]*?\n\}\n/u)?.[0] ?? "";
+  assert.match(resumeBody, /pendingHostedSignInResumeInFlight = true;\s*\n(?:\s*\/\/[^\n]*\n)*\s*signalHostedSignInInFlight\(true\);/u);
+  assert.match(resumeBody, /pendingHostedSignInResumeInFlight = false;\s*\n\s*signalHostedSignInInFlight\(false\);/u);
+});
+
 test("divergence window-breakdown normalizer sanitizes to content-free numbers", () => {
   const payload = {
     schemaVersion: "local-companion-v0.1",

@@ -1673,6 +1673,14 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     /// False while the view holds no dashboard, so the blank page loaded on
     /// teardown can never be reported as a dashboard that opened.
     private var hasDashboardTarget = false
+    /// True while the embedded page reports a hosted sign-in is in flight
+    /// (the browser is open and a completed proof may still be collected). The
+    /// shell refuses to tear the web view down in this window, because doing so
+    /// wipes the live page AND the pending handoff mid-flight — the sign-in the
+    /// service may still hold would be silently discarded (owner-reported,
+    /// 2026-08-10). The page sets it true the moment it opens the browser and
+    /// false as soon as the sign-in settles, cancels, or times out.
+    private(set) var hostedSignInInFlight = false
     let webView: WKWebView
 
     init(
@@ -1713,6 +1721,10 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         configuration.userContentController.add(
             self,
             name: "tibotattleDownloads"
+        )
+        configuration.userContentController.add(
+            self,
+            name: "tibotattleHostedSignIn"
         )
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -1844,6 +1856,10 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     func stop() {
         allowedPort = nil
         hasDashboardTarget = false
+        // The page this flag described is being discarded, so the flag it set
+        // no longer applies. (hideDashboardWebView refuses to reach stop() while
+        // a sign-in is in flight; this clears any residue on the paths that do.)
+        hostedSignInInFlight = false
         pendingDashboardURL = nil
         viewportPreparationAttempts = 0
         webView.stopLoading()
@@ -1918,6 +1934,16 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
             // bridge in either direction.
             if payload["type"] as? String == "reveal-latest-download" {
                 revealLatestDownload()
+            }
+            return
+        }
+        if message.name == "tibotattleHostedSignIn" {
+            // A single boolean, nothing else: whether a hosted sign-in is in
+            // flight. It carries no proof, provider, or account value — only
+            // the fact that tearing the web view down now would discard a
+            // sign-in still being collected.
+            if let inFlight = payload["inFlight"] as? Bool {
+                hostedSignInInFlight = inFlight
             }
             return
         }
@@ -1997,6 +2023,10 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard hasDashboardTarget else { return }
+        // A freshly loaded document has no sign-in in flight until it says so,
+        // so a stale flag from a prior page never blocks teardown after a
+        // reload.
+        hostedSignInInFlight = false
         // The local page keeps its public-web navigation when opened in a
         // browser. In the app, AppKit owns navigation and status so the
         // document can concentrate on the current page. This is presentation
@@ -4407,6 +4437,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func hideDashboardWebView() {
+        // Refuse to tear the web view down while a hosted sign-in is in flight
+        // (owner-reported, 2026-08-10). stop() below wipes the live page and,
+        // with it, the pending sign-in handoff held in the non-persistent web
+        // store — discarding a sign-in the service may still be holding. The
+        // page clears this flag the moment the sign-in settles, cancels, or
+        // times out, and a fresh navigation clears it too, so this can only
+        // defer teardown for the brief window it protects.
+        if dashboardWebHost?.hostedSignInInFlight == true {
+            return
+        }
         cancelNativeRefreshSchedule()
         dashboardWebViewShowing = false
         dashboardContainer.isHidden = true
