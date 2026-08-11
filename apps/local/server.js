@@ -119,6 +119,10 @@ import {
 import {
   matchParticipantRelayRoute,
 } from "./transport/participant-relay-routes.js";
+import {
+  createParticipantSessionCookieBridge,
+  participantRelayPathUsesSessionCookie,
+} from "./transport/participant-session-cookie-bridge.js";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const LOCAL_COMPANION_MODULE_FILE = fileURLToPath(import.meta.url);
@@ -723,6 +727,11 @@ function createParticipantRelay({
   timeoutMs = PARTICIPANT_RELAY_TIMEOUT_MS,
 }) {
   const origin = participantCentralOrigin(centralOrigin);
+  // One session-cookie bridge for the life of the relay: it holds the freshest
+  // session the upstream has issued so the enroll -> mint sequence carries that
+  // session even before the WKWebView jar commits its Set-Cookie (owner-reported
+  // first-sign-in AUTH_REQUIRED, 2026-08-11).
+  const sessionCookieBridge = createParticipantSessionCookieBridge();
   return Object.freeze({
     enabled: origin !== null,
     handles(path) {
@@ -743,7 +752,14 @@ function createParticipantRelay({
         Origin: origin,
       };
       if (body !== null) headers["Content-Type"] = "application/json";
-      const cookie = participantSessionCookie(request.headers.cookie);
+      const jarCookie = participantSessionCookie(request.headers.cookie);
+      // Session-authenticated routes (session, logout, /me/* including the
+      // device-pairing mint) take the bridge's freshest captured session so the
+      // enroll -> mint sequence never races the WKWebView jar commit. The
+      // proof/recovery/Upload routes keep exactly the jar's own cookie.
+      const cookie = participantRelayPathUsesSessionCookie(path)
+        ? sessionCookieBridge.cookieForRequest(jarCookie)
+        : jarCookie;
       if (cookie !== null) headers.Cookie = cookie;
       const csrf = request.headers["x-usage-monitor-csrf"];
       if (csrf !== undefined) {
@@ -801,6 +817,10 @@ function createParticipantRelay({
           throw fixedRelayError("central_participant_response_invalid");
         }
         responseHeaders["Set-Cookie"] = setCookie;
+        // Capture the session the worker just issued so the very next relay
+        // request (the ceremony's device-pairing mint) presents it regardless
+        // of whether the WKWebView jar has committed this Set-Cookie yet.
+        sessionCookieBridge.observeUpstreamSetCookie(setCookie);
       }
       if (upstream.headers.get("idempotency-replayed") === "true") {
         responseHeaders["Idempotency-Replayed"] = "true";

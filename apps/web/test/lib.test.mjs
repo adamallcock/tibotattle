@@ -9989,3 +9989,338 @@ test("Trends calibration summary tiles wrap evenly with an auto-fit grid", async
   assert.match(block, /grid-template-columns: repeat\(auto-fit, minmax\(180px, 1fr\)\);/u);
   assert.doesNotMatch(block, /flex: 1 1 200px/u, "the four-plus-one flex fallback is gone");
 });
+
+// ===========================================================================
+// First-sign-in device-pairing mint: the cookie-commit race, reproduced and
+// then closed by the relay's session-cookie bridge (owner-reported
+// AUTH_REQUIRED on v0.1.8, 2026-08-11).
+//
+// This harness drives the SHIPPED app.js mint ceremony
+// (mintDevicePairingWithCookieCommitRetry, sliced and executed exactly like the
+// renderer harnesses above) through a faithful model of the three moving parts:
+//   * a WKWebView cookie jar whose fresh Set-Cookie commits after a chosen
+//     latency — instant enough to model the ephemeral store, or beyond the retry
+//     budget to model the persistent (disk-backed) store,
+//   * the companion relay's cookie forwarding — either the stateless HEAD
+//     behaviour (forward only the jar's cookie) or the REAL fix (the imported
+//     createParticipantSessionCookieBridge), and
+//   * the worker's real session verdict taxonomy: a request with no session
+//     cookie is AUTH_REQUIRED (session.ts sessionCookieValue), a request bearing
+//     a wrong/stale token is AUTH_INVALID (session.ts authenticateSession).
+//
+// The taxonomy is the proof: the owner's machine reported AUTH_REQUIRED, which
+// can only mean the mint went out cookie-less (the commit-latency race) — a
+// stale cookie being sent would be AUTH_INVALID. Both cases are asserted.
+// ===========================================================================
+test("first-sign-in mint reproduces AUTH_REQUIRED and the relay bridge closes it", async () => {
+  const { createParticipantSessionCookieBridge, participantRelayPathUsesSessionCookie } =
+    await import("../../local/transport/participant-session-cookie-bridge.js");
+
+  const SESSION = "__Host-usage_monitor_session";
+  const FRESH_TOKEN =
+    "um_session_00000000-0000-4000-8000-000000000abc.fresh_secret_value_0000000000000000000000";
+  const STALE_TOKEN =
+    "um_session_00000000-0000-4000-8000-000000000def.stale_secret_value_0000000000000000000000";
+  const FRESH_MEMBER = `${SESSION}=${FRESH_TOKEN}`;
+  const STALE_MEMBER = `${SESSION}=${STALE_TOKEN}`;
+  const FRESH_SET_COOKIE =
+    `${FRESH_MEMBER}; Path=/; Max-Age=1800; Secure; HttpOnly; SameSite=Strict`;
+  const FRESH_CSRF = "um_csrf_fresh_csrf_token_value_00000000000000";
+
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const mintStart = appSource.indexOf(
+    "const CONTRIBUTION_MINT_COOKIE_COMMIT_BACKOFFS_MS",
+  );
+  const mintEnd = appSource.indexOf("/**\n * The silent authorization repair");
+  const codesStart = appSource.indexOf(
+    "const CONTRIBUTION_SESSION_REJECTION_CODES",
+  );
+  const codesEnd = appSource.indexOf(
+    "/**\n * The one fallback for a rejected stored session",
+  );
+  assert.ok(mintStart >= 0 && mintEnd > mintStart, "mint retry loop is available");
+  assert.ok(
+    codesStart >= 0 && codesEnd > codesStart,
+    "session-rejection classifier is available",
+  );
+  const mintSection =
+    `${appSource.slice(codesStart, codesEnd)}\n${appSource.slice(mintStart, mintEnd)}`;
+
+  function loadMintCeremony(communityClient, fakeSetTimeout) {
+    return Function(
+      "communityClient",
+      "setTimeout",
+      `${mintSection}\nreturn { mintDevicePairingWithCookieCommitRetry };`,
+    )(communityClient, fakeSetTimeout);
+  }
+
+  // The world: a jar with a scheduled commit, the (optional) real bridge, a
+  // worker enforcing the real session taxonomy, and a log of exactly what cookie
+  // each upstream request carried.
+  function makeWorld({ initialJarCookie = null, commitLatency, useBridge }) {
+    let logicalNow = 0;
+    // A deterministic clock: each mint backoff advances logical time by its ms
+    // and resumes on a microtask, so the jar's commit deadline is compared
+    // against elapsed backoff time without any real waiting.
+    const fakeSetTimeout = (callback, delay) => {
+      logicalNow += Math.max(0, Number(delay) || 0);
+      queueMicrotask(callback);
+      return 0;
+    };
+    const jar = {
+      committed: initialJarCookie,
+      pending: null,
+      current() {
+        if (this.pending !== null && logicalNow >= this.pending.at) {
+          this.committed = this.pending.member;
+          this.pending = null;
+        }
+        return this.committed;
+      },
+      receiveSetCookie(member) {
+        this.pending = { member, at: logicalNow + commitLatency };
+      },
+    };
+    const bridge = createParticipantSessionCookieBridge();
+    const forwarded = [];
+    const state = { csrf: "" };
+
+    // The worker's session verdict, mirrored from session.ts: a missing session
+    // cookie is AUTH_REQUIRED; a present-but-wrong token is AUTH_INVALID.
+    function workerSessionVerdict(cookieHeader) {
+      if (typeof cookieHeader !== "string" || cookieHeader.length === 0) {
+        return { ok: false, code: "AUTH_REQUIRED" };
+      }
+      const members = cookieHeader.split(";").map((part) => part.trim())
+        .filter((part) => part.startsWith(`${SESSION}=`));
+      if (members.length === 0) return { ok: false, code: "AUTH_REQUIRED" };
+      if (members.length !== 1) return { ok: false, code: "AUTH_INVALID" };
+      const token = members[0].slice(SESSION.length + 1);
+      if (token !== FRESH_TOKEN) return { ok: false, code: "AUTH_INVALID" };
+      return { ok: true };
+    }
+
+    const fetchImpl = async (url, options = {}) => {
+      void options;
+      const path = new URL(url, "http://127.0.0.1").pathname;
+      // The browser attaches the jar's currently-committed cookie; the relay
+      // then chooses what to forward upstream.
+      const jarCookie = jar.current();
+      const forwardedCookie = (useBridge && participantRelayPathUsesSessionCookie(path))
+        ? bridge.cookieForRequest(jarCookie)
+        : jarCookie;
+      forwarded.push(forwardedCookie);
+
+      let status;
+      let body;
+      let setCookie = null;
+      if (path === "/api/v1/enroll") {
+        // Enrollment authenticates with the one-use identity proof, not the
+        // session, so it always succeeds and issues the fresh session cookie.
+        status = 200;
+        body = {
+          schemaVersion: "participant-bootstrap-v0.1",
+          csrfToken: FRESH_CSRF,
+          participantId: "um_participant_0000",
+        };
+        setCookie = FRESH_SET_COOKIE;
+      } else if (path === "/api/v1/session") {
+        const verdict = workerSessionVerdict(forwardedCookie);
+        if (verdict.ok) {
+          status = 200;
+          body = {
+            schemaVersion: "participant-session-v0.1",
+            csrfToken: FRESH_CSRF,
+            participantId: "um_participant_0000",
+            consentVersion: "privacy-safe-telemetry-v0.1",
+          };
+        } else {
+          status = 401;
+          body = { error: { code: verdict.code } };
+        }
+      } else if (path === "/api/v1/me/device-pairings") {
+        const verdict = workerSessionVerdict(forwardedCookie);
+        if (verdict.ok) {
+          status = 201;
+          body = {
+            schemaVersion: "participant-device-pairing-v0.1",
+            pairingId: "um_pairing_0000",
+          };
+        } else {
+          status = 401;
+          body = { error: { code: verdict.code } };
+        }
+      } else {
+        status = 404;
+        body = { error: { code: "NOT_FOUND" } };
+      }
+
+      if (setCookie !== null) {
+        if (useBridge) bridge.observeUpstreamSetCookie(setCookie);
+        const member = setCookie.slice(0, setCookie.indexOf(";"));
+        jar.receiveSetCookie(member);
+      }
+      return new Response(JSON.stringify(body), {
+        status,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+
+    const communityClient = new CommunityClient({
+      fetchImpl,
+      getCsrfToken: () => state.csrf,
+      getParticipantId: () => null,
+    });
+    return { communityClient, fakeSetTimeout, jar, bridge, forwarded, state };
+  }
+
+  // The real post-sign-in order: enroll with the proof (adopting the session it
+  // returns), then fire the mint in the immediately following turn.
+  async function runFirstSignIn(world) {
+    const enrollment = await world.communityClient.enroll(
+      null,
+      "telemetry-contribution-v0.1",
+      {
+        deviceBootstrap: false,
+        identity: {
+          provider: "google",
+          proof: "P".repeat(64),
+          verifier: "V".repeat(64),
+        },
+      },
+    );
+    world.state.csrf = enrollment.csrfToken;
+    const { mintDevicePairingWithCookieCommitRetry } = loadMintCeremony(
+      world.communityClient,
+      world.fakeSetTimeout,
+    );
+    return mintDevicePairingWithCookieCommitRetry();
+  }
+
+  // --- 1. HEAD, persistent store, first sign-in: the reproduction. ----------
+  // The enroll cookie never commits to the jar inside the retry budget, and the
+  // stateless relay forwards only the jar (empty). Every mint attempt is
+  // cookie-less, so every attempt is AUTH_REQUIRED — the exact observed code.
+  {
+    const world = makeWorld({
+      initialJarCookie: null,
+      commitLatency: 100_000,
+      useBridge: false,
+    });
+    await assert.rejects(
+      runFirstSignIn(world),
+      (error) => error.code === "AUTH_REQUIRED",
+      "a cookie-less mint fails AUTH_REQUIRED",
+    );
+    const mintForwards = world.forwarded.slice(1);
+    assert.equal(mintForwards.length, 4, "one initial mint plus three retries");
+    assert.ok(
+      mintForwards.every((cookie) => cookie === null),
+      "every attempt went out with no session cookie",
+    );
+  }
+
+  // --- 2. The stale-cookie discriminator (still HEAD). ----------------------
+  // A stale persisted cookie is NOT the observed failure: the stateless relay
+  // forwards it and the worker answers AUTH_INVALID, never AUTH_REQUIRED. This
+  // is the code-level proof that the observed AUTH_REQUIRED is the commit race,
+  // not a stale cookie being presented.
+  {
+    const world = makeWorld({
+      initialJarCookie: STALE_MEMBER,
+      commitLatency: 100_000,
+      useBridge: false,
+    });
+    await assert.rejects(
+      runFirstSignIn(world),
+      (error) => error.code === "AUTH_INVALID",
+      "a stale cookie is rejected as INVALID, not REQUIRED",
+    );
+    const mintForwards = world.forwarded.slice(1);
+    assert.ok(
+      mintForwards.every((cookie) => cookie === STALE_MEMBER),
+      "the stale cookie is what a stateless relay keeps sending",
+    );
+  }
+
+  // --- 3. The fix: bridge on, jar NEVER commits within the test. ------------
+  // The relay captured the enroll's fresh session the instant it was issued, so
+  // the very first mint carries it and succeeds with no dependency on the jar.
+  {
+    const world = makeWorld({
+      initialJarCookie: null,
+      commitLatency: 100_000,
+      useBridge: true,
+    });
+    const pairing = await runFirstSignIn(world);
+    assert.equal(pairing.schemaVersion, "participant-device-pairing-v0.1");
+    const mintForwards = world.forwarded.slice(1);
+    assert.equal(mintForwards.length, 1, "the mint succeeds on the first attempt");
+    assert.equal(mintForwards[0], FRESH_MEMBER, "it carried the fresh session");
+    assert.equal(
+      world.bridge.capturedSessionMember(),
+      FRESH_MEMBER,
+      "the bridge holds only the fresh session",
+    );
+  }
+
+  // --- 4. The fix beats a stale persisted cookie. ---------------------------
+  // Even with a stale cookie sitting in the jar and the fresh one never
+  // committing, the mint carries the fresh session — no stale cookie survives an
+  // enroll on the mint path.
+  {
+    const world = makeWorld({
+      initialJarCookie: STALE_MEMBER,
+      commitLatency: 100_000,
+      useBridge: true,
+    });
+    const pairing = await runFirstSignIn(world);
+    assert.equal(pairing.schemaVersion, "participant-device-pairing-v0.1");
+    const mintForwards = world.forwarded.slice(1);
+    assert.equal(mintForwards[0], FRESH_MEMBER, "the stale cookie was never sent on the mint");
+    assert.notEqual(world.bridge.capturedSessionMember(), STALE_MEMBER);
+  }
+
+  // --- 5. The bounded retry still converges (ephemeral store, HEAD). --------
+  // When the jar commits inside the budget — the in-memory ephemeral store that
+  // paired successfully three times — the first attempt is cookie-less
+  // (AUTH_REQUIRED) and the retry after the 250ms backoff carries the freshly
+  // committed session. The client retry is preserved as defence in depth.
+  {
+    const world = makeWorld({
+      initialJarCookie: null,
+      commitLatency: 200,
+      useBridge: false,
+    });
+    const pairing = await runFirstSignIn(world);
+    assert.equal(pairing.schemaVersion, "participant-device-pairing-v0.1");
+    const mintForwards = world.forwarded.slice(1);
+    assert.equal(mintForwards.length, 2, "one cookie-less attempt, then one retry");
+    assert.equal(mintForwards[0], null, "attempt zero raced ahead of the commit");
+    assert.equal(mintForwards[1], FRESH_MEMBER, "the retry carried the committed session");
+  }
+
+  // --- 6. Resume across relaunch is preserved. ------------------------------
+  // A freshly launched companion has captured nothing; the persistent jar still
+  // holds a valid session. The bridge forwards the jar's own cookie, so a
+  // session read-back after relaunch still authenticates.
+  {
+    const world = makeWorld({
+      initialJarCookie: FRESH_MEMBER,
+      commitLatency: 0,
+      useBridge: true,
+    });
+    const session = await world.communityClient.session();
+    assert.equal(session.csrfToken, FRESH_CSRF, "the persisted session still authenticates");
+    assert.equal(
+      world.forwarded[0],
+      FRESH_MEMBER,
+      "the jar's own cookie was forwarded when the bridge had captured nothing",
+    );
+    assert.equal(
+      world.bridge.capturedSessionMember(),
+      null,
+      "a fresh process starts with no captured session",
+    );
+  }
+});
