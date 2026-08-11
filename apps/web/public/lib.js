@@ -238,6 +238,27 @@ export function createQuotaTimelineLookup(rows) {
         }
       }
       return lower === 0 ? null : entries[lower - 1];
+    },
+    // The forward complement of atOrBefore: the earliest observation at or
+    // after the instant. A rolling window whose start edge falls inside a
+    // collection silence has no backward observation to anchor on, but often
+    // has one just inside the window; the caller can anchor there and shrink
+    // the window to the actually-measured span instead of discarding it.
+    atOrAfter(timestampMs) {
+      if (typeof timestampMs !== "number" || Number.isNaN(timestampMs)) {
+        return null;
+      }
+      let lower = 0;
+      let upper = entries.length;
+      while (lower < upper) {
+        const middle = lower + Math.floor((upper - lower) / 2);
+        if (entries[middle].timestampMs < timestampMs) {
+          lower = middle + 1;
+        } else {
+          upper = middle;
+        }
+      }
+      return lower === entries.length ? null : entries[lower];
     }
   });
 }

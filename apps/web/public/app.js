@@ -3056,6 +3056,16 @@ function liveTimelinePoints(
   const cutoff = timelineCutoffMs(data, rangeDays);
   const quota = mainWeeklyQuotaTrack(data.timeline.quota);
   const quotaLookup = createQuotaTimelineLookup(quota);
+  // Prefix sums over the usage buckets so a shrunken window (see the
+  // forward-recovery branch below) can integrate cost and events over exactly
+  // the span it actually measured, instead of scaling the full-window sums.
+  const usageEndsMs = usage.map((row) => Date.parse(row.endAt));
+  const costPrefix = new Float64Array(usage.length + 1);
+  const eventsPrefix = new Float64Array(usage.length + 1);
+  for (let index = 0; index < usage.length; index += 1) {
+    costPrefix[index + 1] = costPrefix[index] + usage[index].apiPriceEquivalentUsd;
+    eventsPrefix[index + 1] = eventsPrefix[index] + usage[index].usageEvents;
+  }
   const points = [];
   let startIndex = 0;
   let rollingCost = 0;
@@ -3087,29 +3097,68 @@ function liveTimelinePoints(
     }
     if (endMs < cutoff) continue;
     const startMs = endMs - windowMs;
-    const beforeMatch = quotaLookup.atOrBefore(startMs);
     const afterMatch = quotaLookup.atOrBefore(endMs);
-    const before = beforeMatch?.row ?? null;
-    const after = afterMatch?.row ?? null;
     const maximumBracketGapMs = Math.max(30 * 60 * 1_000, windowMs);
+    // The start edge prefers a backward observation, like the end edge. But
+    // backward-only matching poisons every window whose start edge falls in a
+    // collection silence (sleep or idle): the first ~windowMs of the next
+    // work session would reach back into the silence and be excluded even
+    // though observations exist just inside the window. When no backward
+    // match lands within the gap, anchor on the earliest observation inside
+    // the window instead and shrink the measured span to what the two
+    // observations actually cover; the cost-implied side below integrates
+    // the same shrunken span, so observed and expected stay commensurable.
+    let startMatch = quotaLookup.atOrBefore(startMs);
+    let spanStartMs = startMs;
+    let shrunkenSpan = false;
+    if (!(startMatch && startMs - startMatch.timestampMs <= maximumBracketGapMs)) {
+      const forwardMatch = quotaLookup.atOrAfter(startMs);
+      if (forwardMatch && forwardMatch.timestampMs < endMs) {
+        startMatch = forwardMatch;
+        spanStartMs = forwardMatch.timestampMs;
+        shrunkenSpan = true;
+      } else {
+        startMatch = null;
+      }
+    }
+    const before = startMatch?.row ?? null;
+    const after = afterMatch?.row ?? null;
     const bracketed = before && after
-      && startMs - beforeMatch.timestampMs <= maximumBracketGapMs
+      && spanStartMs - startMatch.timestampMs <= maximumBracketGapMs
       && endMs - afterMatch.timestampMs <= maximumBracketGapMs;
     const sameReset = Boolean(bracketed)
       && sameResetBoundary(before.resetAt, after.resetAt);
     const observed = sameReset && after.usedPercent >= before.usedPercent
       ? after.usedPercent - before.usedPercent
       : null;
+    let windowCostUsd = Math.max(0, rollingCost);
+    let windowEvents = Math.max(0, rollingEvents);
+    if (shrunkenSpan) {
+      // Only the usage buckets ending inside the measured span count, so the
+      // expected line integrates the interval the observed delta covers.
+      let lower = startIndex;
+      let upper = index + 1;
+      while (lower < upper) {
+        const middle = lower + Math.floor((upper - lower) / 2);
+        if (usageEndsMs[middle] <= spanStartMs) {
+          lower = middle + 1;
+        } else {
+          upper = middle;
+        }
+      }
+      windowCostUsd = Math.max(0, costPrefix[index + 1] - costPrefix[lower]);
+      windowEvents = Math.max(0, eventsPrefix[index + 1] - eventsPrefix[lower]);
+    }
     const expected = capacity !== null && capacity > 0
-      ? rollingCost / capacity * 100
+      ? windowCostUsd / capacity * 100
       : null;
     const evidence = classifyTimelineEvidence({
       bracketed,
       sameReset,
       observed,
       expected,
-      usageEvents: rollingEvents,
-      apiCostUsd: rollingCost,
+      usageEvents: windowEvents,
+      apiCostUsd: windowCostUsd,
     });
     let cumulativeResidual = null;
     // A re-anchor marks the first drift observation of a new reset or track:
@@ -3142,8 +3191,11 @@ function liveTimelinePoints(
       residual: evidence.residual,
       cumulativeResidual,
       driftReanchor,
-      apiCostUsd: Math.max(0, rollingCost),
-      usageEvents: Math.max(0, rollingEvents),
+      apiCostUsd: windowCostUsd,
+      usageEvents: windowEvents,
+      // The span both lines actually integrate: the nominal window unless the
+      // start edge was recovered forward past a collection silence.
+      measuredSpanMs: endMs - spanStartMs,
       status: evidence.status,
     });
   }

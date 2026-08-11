@@ -873,6 +873,49 @@ test("quota timeline lookup preserves latest-at-or-before boundary semantics", (
   );
 });
 
+test("quota timeline lookup answers earliest-at-or-after boundary semantics", () => {
+  const rows = [
+    { id: "late", observedAt: "2026-07-29T03:00:00.000Z" },
+    { id: "first-at-duplicate", observedAt: "2026-07-29T02:00:00.000Z" },
+    { id: "early", observedAt: "2026-07-29T01:00:00.000Z" },
+    { id: "last-at-duplicate", observedAt: "2026-07-29T02:00:00.000Z" },
+  ];
+  const sorted = [...rows].sort(
+    (left, right) => Date.parse(left.observedAt) - Date.parse(right.observedAt),
+  );
+  const reference = (timestampMs) => {
+    for (const row of sorted) {
+      if (Date.parse(row.observedAt) >= timestampMs) return row;
+    }
+    return null;
+  };
+  const lookup = createQuotaTimelineLookup(rows);
+
+  for (const timestampMs of [
+    Number.NEGATIVE_INFINITY,
+    Date.parse("2026-07-29T00:59:59.999Z"),
+    Date.parse("2026-07-29T01:00:00.000Z"),
+    Date.parse("2026-07-29T01:59:59.999Z"),
+    Date.parse("2026-07-29T02:00:00.000Z"),
+    Date.parse("2026-07-29T02:59:59.999Z"),
+    Date.parse("2026-07-29T03:00:00.000Z"),
+    Number.POSITIVE_INFINITY,
+  ]) {
+    assert.strictEqual(
+      lookup.atOrAfter(timestampMs)?.row ?? null,
+      reference(timestampMs),
+    );
+  }
+  assert.strictEqual(
+    lookup.atOrAfter(Date.parse("2026-07-29T02:00:00.000Z"))?.row,
+    rows[1],
+    "the earliest source row wins when observations share a timestamp",
+  );
+  assert.equal(lookup.atOrAfter(Date.parse("2026-07-29T03:00:00.001Z")), null);
+  assert.equal(lookup.atOrAfter(Number.NaN), null);
+  assert.equal(createQuotaTimelineLookup([]).atOrAfter(0), null);
+});
+
 test("quota timeline lookup parses supported dashboard bounds only once", () => {
   const quotaRowCount = 10_000;
   const usagePointCount = 3_000;
@@ -8104,6 +8147,76 @@ test("cumulative drift sums non-overlapping buckets and re-anchors at each reset
     points.map((point) => point.cumulativeResidual),
     [0, 7, 4, 0, -4, -9, -14, -19, null],
   );
+});
+
+test("a window starting inside a collection silence anchors forward and shrinks to the measured span", async () => {
+  const liveTimelinePoints = await loadLiveTimelinePoints();
+  const hour = (index) => new Date(Date.UTC(2026, 7, 5, index)).toISOString();
+  const resetAt = "2026-08-10T00:00:00.000Z";
+  const quotaRow = (index, usedPercent) => ({
+    observedAt: hour(index),
+    limitId: "codex",
+    durationMinutes: 10_080,
+    slot: "primary",
+    usedPercent,
+    remainingPercent: 100 - usedPercent,
+    resetAt,
+  });
+  const data = {
+    weekly: { summary: { median_weekly_value_usd: 1_000 } },
+    gradient: { summary: {} },
+    timeline: {
+      usage: Array.from({ length: 9 }, (_, index) => ({
+        startAt: hour(index),
+        endAt: hour(index + 1),
+        apiPriceEquivalentUsd: 50,
+        usageEvents: 5,
+      })),
+      // Collection was silent until hour 5 (sleep/idle): the first
+      // observations of the work session sit INSIDE the early windows.
+      quota: [
+        quotaRow(5, 50),
+        quotaRow(6, 55),
+        quotaRow(7, 61),
+        quotaRow(8, 68),
+        quotaRow(9, 76),
+      ],
+    },
+  };
+  const points = liveTimelinePoints(data);
+  assert.equal(points.length, 9);
+  // Windows ending before any observation exists stay honestly excluded —
+  // recovery requires an observation strictly inside the window.
+  assert.deepEqual(
+    points.slice(0, 5).map((point) => point.status),
+    Array.from({ length: 5 }, () => "missing_quota_bracket"),
+  );
+  // Hour 6 (window hours 3..6): backward-only matching excluded this window;
+  // the forward anchor at hour 5 shrinks the span to one hour, and the
+  // expected side integrates that same hour — $50 of $1,000 is 5 pp against
+  // the observed 55−50 = 5 pp.
+  const recoveredOne = points[5];
+  assert.equal(recoveredOne.status, "matched");
+  assert.equal(recoveredOne.observed, 5);
+  assert.equal(recoveredOne.expected, 5);
+  assert.equal(recoveredOne.measuredSpanMs, 3_600_000);
+  assert.equal(recoveredOne.apiCostUsd, 50);
+  assert.equal(recoveredOne.usageEvents, 5);
+  // Hour 7 (window hours 4..7): the span is two hours, so expected is 10 pp,
+  // never the full-window 15 pp — the two lines integrate the same interval.
+  const recoveredTwo = points[6];
+  assert.equal(recoveredTwo.status, "matched");
+  assert.equal(recoveredTwo.observed, 11);
+  assert.equal(recoveredTwo.expected, 10);
+  assert.equal(recoveredTwo.measuredSpanMs, 7_200_000);
+  assert.equal(recoveredTwo.apiCostUsd, 100);
+  // Hour 8 onward the backward match exists again: the nominal window is
+  // measured in full.
+  const nominal = points[7];
+  assert.equal(nominal.status, "matched");
+  assert.equal(nominal.observed, 18);
+  assert.equal(nominal.expected, 15);
+  assert.equal(nominal.measuredSpanMs, 10_800_000);
 });
 
 test("the residual panel draws the cumulative line and states the signed-AUC drift", async () => {
