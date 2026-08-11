@@ -293,6 +293,7 @@ const QUOTA_ANALYSIS_PACKAGE_ROOT = join(
 export const MACOS_QUOTA_ANALYSIS_RUNTIME_FILES = Object.freeze([
   "index.js",
   "package.json",
+  "src/model-composition.js",
   "src/quota-calibration.js",
   "src/quota-pace-forecast.js",
   "src/quota-rolling.js",
