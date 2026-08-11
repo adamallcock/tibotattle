@@ -45,8 +45,12 @@ const SOURCE_HASHES = Object.freeze({
     "85118466c257497a72c07c05cda6224c8d0a7e6a7b85aa69b4d950bf823d2170",
   "quota-windows.js":
     "fbf4bdcfb8417efcc2cdf3d7e3e92f1302048e523d6722b06eb9c47b44861366",
+  // Re-pinned with the slot-identity change: `slot` left TRACK_KEYS because
+  // track compatibility is judged by (limit, duration) — the provider's
+  // primary/secondary slots are UI roles that flipped for the weekly window
+  // around 2026-07-06 without the window itself changing.
   "quota-pace-forecast.js":
-    "89bff15bf12f4b94c578c04a6c7b05f3c7656eda3ae9b935a0ed9683ef08e8b6",
+    "7cb7e1fd014a214fd922a7f285ef976dc52189ed24a575c85be6919aa4c6156a",
 });
 
 test("quota analysis exposes one exact runtime-neutral package root", async () => {
