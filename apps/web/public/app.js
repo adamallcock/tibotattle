@@ -3265,25 +3265,55 @@ function liveTimelinePoints(
         && after !== null
         && Number.isFinite(finite(after.usedPercent))
         && endMs - afterMatch.timestampMs <= maximumBracketGapMs) {
-      if (driftAnchor === null
-          || !sameResetBoundary(driftAnchor.resetAt, after.resetAt)
-          // A used_percent DECREASE beyond display jitter is a genuine reset
-          // even when the provider restated the same boundary instant
-          // (banked/automatic resets keep resets_at): re-anchor rather than
-          // reading the drop — and everything after it — as drift.
-          || after.usedPercent
-            < driftAnchor.maxUsedPercent - RESET_DECREASE_THRESHOLD_PP) {
+      // A used_percent DECREASE beyond display jitter inside one boundary is
+      // a genuine reset (banked/automatic resets keep resets_at) — but ONLY
+      // when a SECOND, distinct observation confirms it. A single sub-envelope
+      // reading that immediately recovers is a stale interleaved source (the
+      // composition kernel's rule; live-corpus precedent 59 -> 6 -> 61), and
+      // re-anchoring on it would poison the baseline so the recovery reads as
+      // a fabricated +50pp drift period.
+      const boundaryChanged = driftAnchor === null
+        || !sameResetBoundary(driftAnchor.resetAt, after.resetAt);
+      const subEnvelope = !boundaryChanged
+        && after.usedPercent
+          < driftAnchor.maxUsedPercent - RESET_DECREASE_THRESHOLD_PP;
+      const confirmedReset = subEnvelope
+        && driftAnchor.pendingDrop !== null
+        && afterMatch.timestampMs !== driftAnchor.pendingDrop.timestampMs
+        && after.usedPercent
+          <= driftAnchor.pendingDrop.usedPercent + RESET_DECREASE_THRESHOLD_PP;
+      if (boundaryChanged || confirmedReset) {
         // A boundary or track change re-anchors the accumulation: drift is
         // zero by definition at the first observation of a new reset.
         driftAnchor = {
           resetAt: after.resetAt,
           usedPercent: after.usedPercent,
           maxUsedPercent: after.usedPercent,
+          pendingDrop: null,
         };
         driftCostUsd = 0;
         cumulativeResidual = 0;
         driftReanchor = true;
+      } else if (subEnvelope) {
+        // First (or non-confirming) sub-envelope observation: either a stale
+        // source or the first sight of a reset — unmeasurable against this
+        // anchor either way, so the accumulation suspends for this point
+        // (null splits detector runs) instead of booking the dip as drift.
+        if (driftAnchor.pendingDrop === null
+            || afterMatch.timestampMs !== driftAnchor.pendingDrop.timestampMs) {
+          driftAnchor.pendingDrop = {
+            usedPercent: after.usedPercent,
+            timestampMs: afterMatch.timestampMs,
+          };
+        }
+        if (driftAnchor.maxUsedPercent >= POOL_SATURATION_CEILING_PP) {
+          // Still inside a pegged span: keep post-peg cost out of the
+          // accumulation exactly as the saturated branch below does.
+          driftCostUsd -= current.apiPriceEquivalentUsd;
+        }
+        cumulativeResidual = null;
       } else if (driftAnchor.maxUsedPercent >= POOL_SATURATION_CEILING_PP) {
+        driftAnchor.pendingDrop = null;
         // The pool pegged earlier in this reset: post-peg cost cannot be
         // measured against a display that can no longer move. Suspend the
         // accumulation (null splits detector runs) and keep the accrued cost
@@ -3291,6 +3321,8 @@ function liveTimelinePoints(
         driftCostUsd -= current.apiPriceEquivalentUsd;
         cumulativeResidual = null;
       } else {
+        // Recovery or normal movement clears any unconfirmed drop candidate.
+        driftAnchor.pendingDrop = null;
         driftAnchor.maxUsedPercent = Math.max(
           driftAnchor.maxUsedPercent,
           after.usedPercent,
