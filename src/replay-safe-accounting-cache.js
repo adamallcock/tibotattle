@@ -1695,6 +1695,21 @@ async function deriveBoundedWeeklyCalibrationSeries({
 
 const UNIFIED_CALIBRATION_READ_BATCH_ROWS = 20_000;
 const COMPOSITION_RECENT_MIX_DAYS = 14;
+const COMPOSITION_FIT_FAILURE_REASON_PATTERN = /^[A-Za-z0-9_.-]{1,64}$/u;
+
+// A bounded, machine-safe reason for a failed composition fit: the typed
+// error code when one exists, the error name otherwise. Never free-form
+// message text — messages can carry paths.
+function compositionFitFailureReason(error) {
+  const candidate = typeof error?.code === "string" && error.code.length > 0
+    ? error.code
+    : typeof error?.name === "string" && error.name.length > 0
+      ? error.name
+      : "unknown";
+  return COMPOSITION_FIT_FAILURE_REASON_PATTERN.test(candidate)
+    ? candidate
+    : "unknown";
+}
 
 /**
  * Fit the composition-aware per-model $/pp vector from the SAME compact
@@ -2373,18 +2388,33 @@ export async function buildReplaySafeAccountingCache({
     endAt: new Date(endMs).toISOString(),
   };
   // The composition fit reads the same compact corpus the derivation below
-  // will consume, so it must run first.
-  const composition = await fitCompositionFromCompactCorpus({
-    rawUsageEvents: retainWindowedCalibrationInputs
-      ? rawUsageEvents
-      : unifiedCalibration.rawUsageEvents,
-    weeklyRateLimitSnapshots: retainWindowedCalibrationInputs
-      ? weeklyRateLimitSnapshots
-      : unifiedCalibration.weeklyRateLimitSnapshots,
-    endMs,
-    signal,
-    checkRuntimeMemory,
-  });
+  // will consume, so it must run first. It is strictly optional enrichment:
+  // any throw out of it (resource ceiling, abort, numerical surprise) must
+  // not cost the whole build. The cache completes with `composition: null` —
+  // the dashboard then falls back to the across-reset median headline — and
+  // the failure is recorded on the calibration block, because a refresh that
+  // dies here re-runs the same doomed pass on every scheduler tick while the
+  // on-disk cache stays a rejected older artifact.
+  let composition = null;
+  let compositionFitFailure = null;
+  try {
+    composition = await fitCompositionFromCompactCorpus({
+      rawUsageEvents: retainWindowedCalibrationInputs
+        ? rawUsageEvents
+        : unifiedCalibration.rawUsageEvents,
+      weeklyRateLimitSnapshots: retainWindowedCalibrationInputs
+        ? weeklyRateLimitSnapshots
+        : unifiedCalibration.weeklyRateLimitSnapshots,
+      endMs,
+      signal,
+      checkRuntimeMemory,
+    });
+  } catch (error) {
+    compositionFitFailure = {
+      status: "fit_failed",
+      reason: compositionFitFailureReason(error),
+    };
+  }
   throwIfAborted(signal);
   checkRuntimeMemory();
   let transitionSeries;
@@ -2439,6 +2469,13 @@ export async function buildReplaySafeAccountingCache({
     },
     transitions: transitionSeries.transitions,
   }, { composition });
+  if (compositionFitFailure !== null) {
+    // Additive v0.7 field, present only when the fit itself threw: a blank
+    // composition must be distinguishable from "the corpus never supported a
+    // fit" — five hours of silent refresh loops is what an unrecorded
+    // failure cost the last time.
+    weeklyCalibration.compositionStatus = compositionFitFailure;
+  }
   const paceForecast = projectWeeklyPaceForecast(weeklyPaceSnapshots, endMs);
   throwIfAborted(signal);
   return {
@@ -2799,6 +2836,24 @@ function validWeeklyCalibrationComposition(value) {
   ));
 }
 
+// Additive v0.7 field, present only when the composition fit itself threw
+// (resource ceiling, abort, numerical failure): the build completed with
+// `composition: null` and this bounded record says why, so a blank
+// composition is distinguishable from "the corpus never supported a fit".
+// Absent on caches whose fit ran to completion.
+function validWeeklyCalibrationCompositionStatus(value, composition) {
+  if (value === undefined) return true;
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.keys(value).sort().join("\0") === "reason\0status"
+    && value.status === "fit_failed"
+    && typeof value.reason === "string"
+    && COMPOSITION_FIT_FAILURE_REASON_PATTERN.test(value.reason)
+    // A failed fit can never have produced a composition block.
+    && (composition === null || composition === undefined);
+}
+
 function validCache(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)
       || value.schemaVersion !== REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION
@@ -2837,6 +2892,10 @@ function validCache(value) {
       || value.weeklyCalibration.recentResets.length
         > BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT
       || !validWeeklyCalibrationComposition(
+        value.weeklyCalibration.composition,
+      )
+      || !validWeeklyCalibrationCompositionStatus(
+        value.weeklyCalibration.compositionStatus,
         value.weeklyCalibration.composition,
       )
       || value.periods.length !== 4

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
+  assertReplaySafeAccountingCache,
   buildReplaySafeAccountingCache,
   buildReplaySafeAccountingPeriod,
   fitCompositionFromCompactCorpus,
@@ -1098,6 +1099,91 @@ test("the composition fit meters memory and abort on the shared cadence", async 
       signal: controller.signal,
     }),
     (error) => error?.name === "AbortError",
+  );
+});
+
+test("a composition fit that trips the RSS ceiling mid-way fails soft into a completed v0.7 cache", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-fit-fail-soft-"));
+  const stateFile = join(directory, "collector-state-v1.sqlite");
+  let fitSpikeArmed = false;
+  let checksSinceArmed = 0;
+  const cache = await buildReplaySafeAccountingCache({
+    now: () => NOW,
+    maximumRssBytes: 1_000,
+    // Under the ceiling everywhere except the SECOND check after the scan
+    // returns: the first is the build's post-scan phase boundary, the second
+    // is the fit's first in-loop cadence check — so the throw provably
+    // starts inside the fit, and the ceiling is back under for every later
+    // phase.
+    rss: () => {
+      if (!fitSpikeArmed) return 10;
+      checksSinceArmed += 1;
+      return checksSinceArmed === 2 ? 1_001 : 10;
+    },
+    scan: async ({ onUsage }) => {
+      for (let index = 0; index < 2_100; index += 1) {
+        onUsage(usageEvent({
+          timestamp: new Date(NOW - 100_000_000 + index * 1_000).toISOString(),
+          components: { input_uncached_tokens: 1 },
+        }));
+      }
+      fitSpikeArmed = true;
+      return { diagnostics: {} };
+    },
+  });
+
+  // The build completed: every event aggregated, the calibration block
+  // exists, and only the optional composition enrichment is gone.
+  assert.equal(cache.schemaVersion, REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION);
+  assert.equal(period(cache, "all").events, 2_100);
+  assert.equal(cache.weeklyCalibration.composition, null);
+  assert.deepEqual(cache.weeklyCalibration.compositionStatus, {
+    status: "fit_failed",
+    reason: "accounting_transition_rss_limit_exceeded",
+  });
+
+  // The completed cache is valid, survives the SQLite round trip, and the
+  // honest failure record survives with it.
+  await writeTestCache(stateFile, cache);
+  const read = await readReplaySafeAccountingCache({
+    cacheFile: stateFile,
+    now: () => NOW,
+  });
+  assert.equal(read.status, "available");
+  assert.equal(read.cache.weeklyCalibration.composition, null);
+  assert.deepEqual(read.cache.weeklyCalibration.compositionStatus, {
+    status: "fit_failed",
+    reason: "accounting_transition_rss_limit_exceeded",
+  });
+
+  // The failure record is validated, not merely tolerated: an unbounded
+  // reason or a record claiming failure NEXT TO a composition block both
+  // fail the cache validator.
+  const unboundedReason = structuredClone(cache);
+  unboundedReason.weeklyCalibration.compositionStatus = {
+    status: "fit_failed",
+    reason: "free text with spaces / and paths",
+  };
+  assert.throws(
+    () => assertReplaySafeAccountingCache(unboundedReason),
+    (error) => error?.code === "cache_invalid",
+  );
+  const contradictory = structuredClone(cache);
+  contradictory.weeklyCalibration.composition = {
+    status: "insufficient_observations",
+    grainHours: 2,
+    observationCount: 0,
+    capacityUsdByModel: null,
+    modelCostShares: {},
+    r2: null,
+    singleConstantUsd: null,
+    singleConstantR2: null,
+    blendedRecentMixUsd: null,
+    recentMixDays: 14,
+  };
+  assert.throws(
+    () => assertReplaySafeAccountingCache(contradictory),
+    (error) => error?.code === "cache_invalid",
   );
 });
 
