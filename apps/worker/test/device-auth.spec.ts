@@ -11,6 +11,7 @@ import {
   DEFAULT_DEVICE_LIFECYCLE_POLICY,
   devicePairingInsert,
   disconnectAuthenticatedDevice,
+  listParticipantDevices,
   purgeStaleDeviceLifecycleRows,
   revokeParticipantDevice,
   rotateDeviceCredential,
@@ -141,6 +142,42 @@ async function issueAndClaim(
     nowEpoch,
     policy,
   );
+}
+
+async function seedActiveDevice(
+  fixture: Awaited<ReturnType<typeof participantFixture>>,
+  nowEpoch: number,
+  policy: Parameters<typeof createDevicePairing>[5],
+): Promise<string> {
+  const pairing = await createDevicePairing(
+    fixture.db,
+    fixture.participantId,
+    fixture.sessionId,
+    CONSENT,
+    nowEpoch,
+    policy,
+  );
+  const deviceId = crypto.randomUUID();
+  const rawSecret = crypto.getRandomValues(new Uint8Array(32));
+  await claimDevicePairing(
+    fixture.db,
+    `Pairing ${pairing.pairingCode}`,
+    deviceId,
+    await deviceSecretHash(deviceId, rawSecret),
+    nowEpoch,
+    policy,
+  );
+  return deviceId;
+}
+
+async function freshLoginSession(
+  db: D1Database,
+  participantId: string,
+  nowEpoch: number,
+): Promise<string> {
+  const session = await createSessionMaterial(participantId, nowEpoch);
+  await sessionInsert(db, session).run();
+  return session.id;
 }
 
 describe("device lifecycle primitives", () => {
@@ -496,5 +533,206 @@ describe("device lifecycle primitives", () => {
       CONSENT,
     ).run();
     expect(result.meta.changes).toBe(1);
+  });
+
+  it("self-heals a capped re-pair by revoking the credential the login superseded", async () => {
+    const t0 = Date.now();
+    const base = await participantFixture(t0);
+    const policy = {
+      ...DEFAULT_DEVICE_LIFECYCLE_POLICY,
+      activeDeviceLimit: 3,
+      pairingIssueLimit: 10,
+      pairingClaimLimit: 10,
+    };
+    const oldest = await seedActiveDevice(base, t0, policy);
+    const middle = await seedActiveDevice(base, t0 + 1, policy);
+    const newest = await seedActiveDevice(base, t0 + 2, policy);
+
+    // The person lost their local secret and signs in afresh to re-pair; the
+    // new login post-dates every existing credential's last use.
+    const loginEpoch = t0 + 10_000;
+    const sessionId = await freshLoginSession(base.db, base.participantId, loginEpoch);
+    const pairing = await createDevicePairing(
+      base.db,
+      base.participantId,
+      sessionId,
+      CONSENT,
+      loginEpoch,
+      policy,
+    );
+    expect(pairing.pairingCode).toMatch(/^um_pair_/u);
+
+    const afterHeal = await base.db.prepare(
+      `SELECT id, state FROM device_credentials
+        WHERE participant_id = ? ORDER BY issued_at ASC`,
+    ).bind(base.participantId).all<{ id: string; state: string }>();
+    expect(afterHeal.results
+      .filter((row) => row.state === "active").map((row) => row.id))
+      .toEqual([middle, newest]);
+    expect(afterHeal.results
+      .filter((row) => row.state === "revoked").map((row) => row.id))
+      .toEqual([oldest]);
+
+    // Claiming the freshly minted pairing returns the account to exactly the
+    // cap: three active credentials, never cap + 1.
+    const reDeviceId = crypto.randomUUID();
+    const reSecret = crypto.getRandomValues(new Uint8Array(32));
+    await claimDevicePairing(
+      base.db,
+      `Pairing ${pairing.pairingCode}`,
+      reDeviceId,
+      await deviceSecretHash(reDeviceId, reSecret),
+      loginEpoch,
+      policy,
+    );
+    const counts = await base.db.prepare(
+      `SELECT
+         SUM(CASE WHEN state = 'active' THEN 1 ELSE 0 END) AS active,
+         SUM(CASE WHEN state = 'revoked' THEN 1 ELSE 0 END) AS revoked
+       FROM device_credentials WHERE participant_id = ?`,
+    ).bind(base.participantId).first<{ active: number; revoked: number }>();
+    expect(counts).toEqual({ active: 3, revoked: 1 });
+  });
+
+  it("returns the honest cap error when no credential predates the login", async () => {
+    const t0 = Date.now();
+    const base = await participantFixture(t0);
+    const policy = {
+      ...DEFAULT_DEVICE_LIFECYCLE_POLICY,
+      activeDeviceLimit: 3,
+      pairingIssueLimit: 10,
+      pairingClaimLimit: 10,
+    };
+    const loginEpoch = t0;
+    const sessionId = await freshLoginSession(base.db, base.participantId, loginEpoch);
+    // Three genuinely concurrent Macs, each used after this login began.
+    const usedEpoch = loginEpoch + 5_000;
+    await seedActiveDevice(base, usedEpoch, policy);
+    await seedActiveDevice(base, usedEpoch + 1, policy);
+    await seedActiveDevice(base, usedEpoch + 2, policy);
+
+    await expect(createDevicePairing(
+      base.db,
+      base.participantId,
+      sessionId,
+      CONSENT,
+      usedEpoch + 10,
+      policy,
+    )).rejects.toMatchObject({ code: "LIFECYCLE_BOUNDS_EXCEEDED" });
+
+    const revoked = await base.db.prepare(
+      `SELECT COUNT(*) AS n FROM device_credentials
+        WHERE participant_id = ? AND state = 'revoked'`,
+    ).bind(base.participantId).first<{ n: number }>();
+    expect(revoked?.n).toBe(0);
+  });
+
+  it("keeps same-device re-pair idempotent without consuming a slot or revoking", async () => {
+    const t0 = Date.now();
+    const base = await participantFixture(t0);
+    const policy = {
+      ...DEFAULT_DEVICE_LIFECYCLE_POLICY,
+      activeDeviceLimit: 3,
+      pairingIssueLimit: 10,
+      pairingClaimLimit: 10,
+    };
+    const pairing = await createDevicePairing(
+      base.db,
+      base.participantId,
+      base.sessionId,
+      CONSENT,
+      t0,
+      policy,
+    );
+    const deviceId = crypto.randomUUID();
+    const rawSecret = crypto.getRandomValues(new Uint8Array(32));
+    const hash = await deviceSecretHash(deviceId, rawSecret);
+    const firstClaim = await claimDevicePairing(
+      base.db,
+      `Pairing ${pairing.pairingCode}`,
+      deviceId,
+      hash,
+      t0,
+      policy,
+    );
+    // Re-claiming the same pairing with the same device id must dedupe via the
+    // (pairing_id, claimed_device_id) replay path, not consume a second slot.
+    const replayClaim = await claimDevicePairing(
+      base.db,
+      `Pairing ${pairing.pairingCode}`,
+      deviceId,
+      hash,
+      t0 + 1,
+      policy,
+    );
+    expect(replayClaim).toEqual(firstClaim);
+
+    const counts = await base.db.prepare(
+      `SELECT
+         COUNT(*) AS total,
+         SUM(CASE WHEN state = 'active' THEN 1 ELSE 0 END) AS active,
+         SUM(CASE WHEN state = 'revoked' THEN 1 ELSE 0 END) AS revoked
+       FROM device_credentials WHERE participant_id = ?`,
+    ).bind(base.participantId).first<{
+      total: number;
+      active: number;
+      revoked: number;
+    }>();
+    expect(counts).toEqual({ total: 1, active: 1, revoked: 0 });
+  });
+
+  it("records the self-heal revocation in the device list and revokes its uploads", async () => {
+    const t0 = Date.now();
+    const base = await participantFixture(t0);
+    const policy = {
+      ...DEFAULT_DEVICE_LIFECYCLE_POLICY,
+      activeDeviceLimit: 3,
+      pairingIssueLimit: 10,
+      pairingClaimLimit: 10,
+    };
+    const oldest = await seedActiveDevice(base, t0, policy);
+    await seedActiveDevice(base, t0 + 1, policy);
+    await seedActiveDevice(base, t0 + 2, policy);
+
+    // A pending upload authorization on the superseded device must be revoked
+    // with it, exactly as every other credential-revoke path in this file does.
+    const upload = await createDeviceUploadAuthorization(
+      base.db,
+      {
+        deviceId: oldest,
+        participantId: base.participantId,
+        participantConsentVersion: CONSENT,
+        expiresAt: new Date(t0).toISOString(),
+        credentialGeneration: 1,
+        socialVerifiedAt: new Date(t0).toISOString(),
+      },
+      "a".repeat(64),
+      1,
+      t0 + 3,
+    );
+    const uploadId = upload.uploadAuthorization
+      .slice("um_device_upload_".length).split(".", 1)[0]!;
+
+    const loginEpoch = t0 + 10_000;
+    const sessionId = await freshLoginSession(base.db, base.participantId, loginEpoch);
+    await createDevicePairing(
+      base.db,
+      base.participantId,
+      sessionId,
+      CONSENT,
+      loginEpoch,
+      policy,
+    );
+
+    const devices = await listParticipantDevices(base.db, base.participantId);
+    const revokedEntry = devices.find((device) => device.deviceId === oldest);
+    expect(revokedEntry?.state).toBe("revoked");
+    expect(revokedEntry?.revokedAt).toBe(new Date(loginEpoch).toISOString());
+    expect(devices.filter((device) => device.state === "active")).toHaveLength(2);
+
+    const uploadState = await base.db.prepare(
+      "SELECT state FROM device_upload_authorizations WHERE id = ?",
+    ).bind(uploadId).first<{ state: string }>();
+    expect(uploadState?.state).toBe("revoked");
   });
 });
