@@ -1707,17 +1707,47 @@ const COMPOSITION_RECENT_MIX_DAYS = 14;
  * [10]=costUsd; snapshot [1]=timestampMs, [3]=planType,
  * [7]=resetsAt seconds, [8]=usedPercent.
  *
+ * Memory: the usage corpus is folded straight into per-(grain-bin, model)
+ * cost sums in ONE streaming pass — the recent-mix accumulation shares that
+ * pass — so peak extra memory is O(bins), never a second O(events) corpus
+ * copy (a full-history corpus of ~487k compact rows previously materialized
+ * ~487k intermediate objects here and pushed the process over the accounting
+ * RSS ceiling). The kernel consumes one aggregated row per (bin, model);
+ * bin starts are grain-aligned, so the kernel's own `Math.floor` binning is
+ * idempotent on them and its design matrix is exactly what the per-event
+ * corpus produced.
+ *
  * Never throws for corpus reasons: a thin or collinear corpus degrades to a
  * typed non-fitted status inside the kernel, and the caller stores whatever
- * status came back.
+ * status came back. Resource pressure and aborts DO throw — the streaming
+ * loops check the signal and the RSS guard on the same
+ * ACCOUNTING_RSS_CHECK_INTERVAL cadence as every other build phase.
+ *
+ * Exported for tests only (streaming-vs-per-event equivalence and metering
+ * cadence); production callers stay on buildReplaySafeAccountingCache.
  */
-function fitCompositionFromCompactCorpus({
+export async function fitCompositionFromCompactCorpus({
   rawUsageEvents,
   weeklyRateLimitSnapshots,
   endMs,
+  signal = null,
+  checkRuntimeMemory = () => {},
 }) {
-  const usageRows = [];
+  const grainMs = MODEL_COMPOSITION_POLICY.grainMs;
+  const recentStartMs = endMs - COMPOSITION_RECENT_MIX_DAYS * 24 * 60 * 60 * 1_000;
+  // binStartMs -> Map(model -> summed costUsd), Maps kept in first-encounter
+  // order so the kernel accumulates in the same order the per-event path did
+  // and the fit stays bit-identical.
+  const binCosts = new Map();
+  const recentMix = {};
+  let processed = 0;
   for (const row of rawUsageEvents) {
+    processed += 1;
+    if (processed % ACCOUNTING_RSS_CHECK_INTERVAL === 0) {
+      throwIfAborted(signal);
+      checkRuntimeMemory();
+      await cooperativeYield();
+    }
     if (!Array.isArray(row)) continue;
     const observedAtMs = Date.parse(row[0]);
     const costUsd = Number(row[10]);
@@ -1725,10 +1755,30 @@ function fitCompositionFromCompactCorpus({
         || typeof row[1] !== "string"
         || !Number.isFinite(costUsd)
         || costUsd < 0) continue;
-    usageRows.push({ observedAtMs, model: row[1], costUsd });
+    const model = row[1];
+    // The kernel's own binning refuses empty model names; the recent mix
+    // mirrors the historical per-event behavior and keeps them.
+    if (model.length > 0) {
+      const binStartMs = Math.floor(observedAtMs / grainMs) * grainMs;
+      let costs = binCosts.get(binStartMs);
+      if (costs === undefined) {
+        costs = new Map();
+        binCosts.set(binStartMs, costs);
+      }
+      costs.set(model, (costs.get(model) ?? 0) + costUsd);
+    }
+    if (observedAtMs >= recentStartMs) {
+      recentMix[model] = (recentMix[model] ?? 0) + costUsd;
+    }
   }
   const quotaRows = [];
   for (const row of weeklyRateLimitSnapshots) {
+    processed += 1;
+    if (processed % ACCOUNTING_RSS_CHECK_INTERVAL === 0) {
+      throwIfAborted(signal);
+      checkRuntimeMemory();
+      await cooperativeYield();
+    }
     if (!Array.isArray(row)) continue;
     const observedAtMs = Number(row[1]);
     const resetsAtSeconds = Number(row[7]);
@@ -1743,15 +1793,17 @@ function fitCompositionFromCompactCorpus({
       usedPercent,
     });
   }
+  // One aggregated row per (bin, model): O(bins x models), not O(events).
+  const usageRows = [];
+  for (const [binStartMs, costs] of binCosts) {
+    for (const [model, costUsd] of costs) {
+      usageRows.push({ observedAtMs: binStartMs, model, costUsd });
+    }
+  }
+  binCosts.clear();
   const { observations, voidedBinCount, poolCount } =
     buildCompositionObservations({ usageRows, quotaRows });
   const fit = calibrateCompositionCapacities(observations);
-  const recentStartMs = endMs - COMPOSITION_RECENT_MIX_DAYS * 24 * 60 * 60 * 1_000;
-  const recentMix = {};
-  for (const row of usageRows) {
-    if (row.observedAtMs < recentStartMs) continue;
-    recentMix[row.model] = (recentMix[row.model] ?? 0) + row.costUsd;
-  }
   const blendedRecentMixUsd = fit.status === "fitted"
     ? blendedCompositionCapacityUsd(recentMix, {
       capacityUsdByModel: fit.capacityUsdByModel,
@@ -2322,7 +2374,7 @@ export async function buildReplaySafeAccountingCache({
   };
   // The composition fit reads the same compact corpus the derivation below
   // will consume, so it must run first.
-  const composition = fitCompositionFromCompactCorpus({
+  const composition = await fitCompositionFromCompactCorpus({
     rawUsageEvents: retainWindowedCalibrationInputs
       ? rawUsageEvents
       : unifiedCalibration.rawUsageEvents,
@@ -2330,6 +2382,8 @@ export async function buildReplaySafeAccountingCache({
       ? weeklyRateLimitSnapshots
       : unifiedCalibration.weeklyRateLimitSnapshots,
     endMs,
+    signal,
+    checkRuntimeMemory,
   });
   throwIfAborted(signal);
   checkRuntimeMemory();
