@@ -142,6 +142,54 @@ async function enqueueCommunityAllowanceDriftRebuilds(
   }
 }
 
+/**
+ * Cross-device dedupe: for one participant and one day, count that day's
+ * records exactly once.
+ *
+ * Sync state and chunk supersession are per-(participant, device), so a
+ * participant whose device credential is irrecoverably lost re-pairs a fresh
+ * device that reads an empty per-device cursor and re-uploads its entire
+ * history — while the lost device's chunks stay current forever. Devices are
+ * an upload transport, not a data partition: two devices of one participant
+ * observe the SAME underlying local index, so summing records across devices
+ * would double-count every overlapping day. The honest general rule applied
+ * here: per (participant, day), aggregate only the records of the winning
+ * device — the device whose current chunks holding records for that day have
+ * the newest created_at (freshest evidence wins, across all streams), with a
+ * deterministic tiebreak on the larger device_id. Records only ever belong
+ * to current chunks (supersession deletes the superseded revision's records
+ * in the same transaction), so joining records to their owning chunk is the
+ * exact current-evidence set. The rule is self-healing and direction-free: a
+ * newer upload by ANY device of the participant flips the winner at the next
+ * rebuild, and a single-device participant is always its own winner, leaving
+ * single-device aggregation unchanged.
+ */
+const WINNING_DEVICE_CTE = `
+  WITH day_device_evidence AS (
+    SELECT r.participant_id AS participant_id,
+           r.device_id AS device_id,
+           MAX(c.created_at) AS newest_chunk_created_at
+      FROM telemetry_v1_records r
+      JOIN telemetry_v1_chunks c ON c.id = r.chunk_row_id
+     WHERE r.observed_day = ?
+     GROUP BY r.participant_id, r.device_id
+  ),
+  winning_devices AS (
+    SELECT participant_id, device_id
+      FROM day_device_evidence winner
+     WHERE NOT EXISTS (
+       SELECT 1 FROM day_device_evidence rival
+        WHERE rival.participant_id = winner.participant_id
+          AND (
+            rival.newest_chunk_created_at > winner.newest_chunk_created_at
+            OR (
+              rival.newest_chunk_created_at = winner.newest_chunk_created_at
+              AND rival.device_id > winner.device_id
+            )
+          )
+     )
+  )`;
+
 async function buildCommunityDailyAggregate(
   db: D1Database,
   rebuild: DailyRebuildRow,
@@ -162,8 +210,13 @@ async function buildCommunityDailyAggregate(
     throw new Error("community daily aggregate mutation control unavailable");
   }
   const [totals, cells, revisionRow] = await Promise.all([
+    // contributing_devices deliberately counts only winning devices — the
+    // devices whose records the published numbers actually include (one per
+    // participant per day). A losing transport duplicate is not a
+    // contribution.
     db.prepare(
-      `SELECT
+      `${WINNING_DEVICE_CTE}
+      SELECT
         COUNT(DISTINCT r.participant_id) AS contributing_participants,
         COUNT(DISTINCT r.participant_id || ':' || r.device_id)
           AS contributing_devices,
@@ -185,11 +238,15 @@ async function buildCommunityDailyAggregate(
             + COALESCE(r.output_reasoning_tokens, 0))), 0)
           AS output_combined_tokens
        FROM telemetry_v1_records r
+       JOIN winning_devices w
+         ON w.participant_id = r.participant_id
+        AND w.device_id = r.device_id
        JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
        WHERE r.observed_day = ?`,
-    ).bind(day).first<DailyTotalsRow>(),
+    ).bind(day, day).first<DailyTotalsRow>(),
     db.prepare(
-      `SELECT r.provider, r.model_id,
+      `${WINNING_DEVICE_CTE}
+      SELECT r.provider, r.model_id,
         COUNT(*) AS usage_events,
         COALESCE(SUM(r.input_uncached_tokens), 0) AS input_uncached_tokens,
         COALESCE(SUM(r.input_cache_read_tokens), 0)
@@ -204,12 +261,15 @@ async function buildCommunityDailyAggregate(
             + COALESCE(r.output_reasoning_tokens, 0))), 0)
           AS output_combined_tokens
        FROM telemetry_v1_records r
+       JOIN winning_devices w
+         ON w.participant_id = r.participant_id
+        AND w.device_id = r.device_id
        JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
        WHERE r.observed_day = ? AND r.stream = 'usage'
        GROUP BY r.provider, r.model_id
        ORDER BY r.provider, r.model_id
        LIMIT ?`,
-    ).bind(day, MAX_DAILY_AGGREGATE_CELLS + 1).all<DailyCellRow>(),
+    ).bind(day, day, MAX_DAILY_AGGREGATE_CELLS + 1).all<DailyCellRow>(),
     db.prepare(
       `SELECT COALESCE(MAX(revision), 0) + 1 AS revision
          FROM community_daily_aggregates WHERE day = ?`,
