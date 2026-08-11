@@ -173,6 +173,14 @@ let communityDevicePaired = false;
 // v0.1-era credential or a previously accepted upload is deliberately not
 // enough: the ceremony re-pairs unless this exact evidence exists.
 let communityDevicePairedV1 = false;
+// When THIS page last minted a fresh community session (the enrollment adopts
+// one in the same ceremony). A session-rejection on a pairing mint fired
+// milliseconds after this is the WKWebView cookie-commit race, not a dead
+// stored session, so the sign-in gate must not discard the session this
+// ceremony just established (owner-reported "the sign-in that just worked was
+// thrown away", 2026-08-10). Restored or stored sessions leave this null: only
+// a mint records a timestamp, so an old session is never mistaken for fresh.
+let communitySessionMintedAt = null;
 // The opaque sign-in proof lives only in this module-scoped memory; it is
 // never persisted to storage and disappears with the tab.
 let hostedIdentity = null;
@@ -428,6 +436,9 @@ function setCommunitySession(value) {
     // Losing the session means the next primary action is a connection again,
     // not a review of something this Mac can no longer send.
     communityDevicePaired = false;
+    // A cleared session is no longer freshly minted, so a later rejection is a
+    // genuine dead-session gate rather than the mint race.
+    communitySessionMintedAt = null;
     renderContributionActionState();
   }
 }
@@ -9111,7 +9122,14 @@ async function approveIncrementalContribution() {
             consentVersion: "privacy-safe-telemetry-v0.1"
           });
           enrollmentEstablished = true;
-          return communityClient.createDevicePairing(false);
+          // Stamp the mint instant BEFORE the pairing goes out: the __Host-
+          // session cookie the enroll response just set may not have committed
+          // to this WKWebView's out-of-process cookie jar yet, so the mint can
+          // race ahead of it. The retry below closes that millisecond window,
+          // and the timestamp keeps the catch from mistaking this fresh
+          // session for a dead stored one.
+          communitySessionMintedAt = Date.now();
+          return mintDevicePairingWithCookieCommitRetry();
         });
       }
       await contributionConnectStep(
@@ -9151,12 +9169,17 @@ async function approveIncrementalContribution() {
     scheduleIncrementalSyncStatusPoll({ reset: true });
   } catch (error) {
     if (contributionConnectStepOf(error) !== null
-        && contributionSessionWasRejected(error)) {
+        && contributionSessionWasRejected(error)
+        && !contributionSessionMintedWithinRaceWindow()) {
       // The stored session was rejected mid-ceremony. This is the repair
       // loop's root (owner-reported, 2026-08-08): failure copy here repeated
       // on every load while the dead session survived. Render the sign-in
       // gate instead — once signed in, the ceremony resumes automatically.
-      renderContributionSessionSignInGate(status);
+      // A session THIS ceremony minted seconds ago is deliberately excluded:
+      // that is the cookie-commit race, not a dead session, so it falls
+      // through to the retryable failure below and keeps the fresh session
+      // rather than being silently discarded (owner-reported, 2026-08-10).
+      await renderContributionSessionSignInGate(status, error);
     } else if (contributionConnectStepOf(error) !== null
         || contributionDeviceRecoveryIsRequired(error)) {
       await reportContributionConnectFailure(status, error, {
@@ -9174,6 +9197,50 @@ async function approveIncrementalContribution() {
   } finally {
     incrementalConsentBusy = false;
     renderContributionActionState();
+  }
+}
+
+// The cookie-commit race window (owner-reported, 2026-08-10). v0.1.6 restructured
+// the ceremony to enroll first and then mint the device pairing, and it fires the
+// mint in the same microtask as the enroll response. The just-issued __Host-
+// session cookie has not necessarily committed to the WKWebView's out-of-process,
+// non-persistent cookie jar by then, so the mint can go out cookie-less and the
+// Worker answers with a session-rejection class code — even though the session it
+// just minted is perfectly valid. The commit window is milliseconds; these three
+// backoffs cover it comfortably without ever masking a genuinely refused
+// credential, since a truly dead session keeps rejecting through every retry and
+// then fails honestly.
+const CONTRIBUTION_MINT_COOKIE_COMMIT_BACKOFFS_MS = Object.freeze([250, 500, 1_000]);
+// How long after a fresh mint a session-rejection still reads as the race rather
+// than a dead session. It sits well above the summed backoffs plus round trips,
+// while a restored or stored session (mint time null) is never treated as fresh.
+const CONTRIBUTION_FRESH_SESSION_RACE_WINDOW_MS = 10_000;
+
+function contributionSessionMintedWithinRaceWindow() {
+  return communitySessionMintedAt !== null
+    && Date.now() - communitySessionMintedAt < CONTRIBUTION_FRESH_SESSION_RACE_WINDOW_MS;
+}
+
+/**
+ * Mint the v1.0 device pairing, retrying only the session-rejection class
+ * that the cookie-commit race produces. The first mint runs immediately; a
+ * rejection inside the race window is retried on a short bounded backoff
+ * before the ceremony is allowed to conclude failure, so the sign-in the user
+ * just completed is not thrown away by a cookie that had not committed yet.
+ */
+async function mintDevicePairingWithCookieCommitRetry() {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await communityClient.createDevicePairing(false);
+    } catch (error) {
+      if (attempt >= CONTRIBUTION_MINT_COOKIE_COMMIT_BACKOFFS_MS.length
+          || !contributionSessionWasRejected(error)) {
+        throw error;
+      }
+      await new Promise((resolveBackoff) => {
+        setTimeout(resolveBackoff, CONTRIBUTION_MINT_COOKIE_COMMIT_BACKOFFS_MS[attempt]);
+      });
+    }
   }
 }
 
@@ -9297,7 +9364,18 @@ function contributionSessionWasRejected(error) {
  * approval still stands, and after the next sign-in the ceremony resumes by
  * itself — see resumeContributionCeremonyAfterSignIn.
  */
-function renderContributionSessionSignInGate(status) {
+async function renderContributionSessionSignInGate(status, error) {
+  // No more silent discards (owner-reported, 2026-08-10): this was the ONE
+  // ceremony failure path that cleared the session and identity without ever
+  // recording a diagnostics note, so a sign-in that reached the service and
+  // then hit a dead stored session left nothing to look up. Record the real
+  // code and request id first — the calm gate copy below is unchanged, but the
+  // failure is now referenced like every other one.
+  await describeFailure({
+    surface: "contribution_connect",
+    error,
+    fallback: "The stored contribution session was rejected, so this Mac asks for a fresh sign-in.",
+  });
   hostedIdentity = null;
   communityDevicePairedV1 = false;
   // Any auth rejection consumes this load's one automatic attempt: after the

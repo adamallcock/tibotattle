@@ -5763,7 +5763,14 @@ test("new enrollment pairs immediately and intentionally discards recovery capab
   )?.[1] ?? "";
   assert.doesNotMatch(enrollmentBody, /recoveryCode/u);
   assert.match(enrollmentBody, /\{ deviceBootstrap: false, identity: hostedIdentity \}/u);
-  assert.match(enrollmentBody, /return communityClient\.createDevicePairing\(false\);/u);
+  // The mint goes through the cookie-commit retry now (owner-reported,
+  // 2026-08-10), which itself calls createDevicePairing(false) — the pairing
+  // is still minted separately with the fresh session.
+  assert.match(enrollmentBody, /return mintDevicePairingWithCookieCommitRetry\(\);/u);
+  const mintRetryBody = appSource.match(
+    /async function mintDevicePairingWithCookieCommitRetry\(\) \{([\s\S]*?)\n\}/u,
+  )?.[1] ?? "";
+  assert.match(mintRetryBody, /return await communityClient\.createDevicePairing\(false\);/u);
   assert.match(enrollmentBody, /finishCommunityDevicePairing\(pairing, status\)/u);
   assert.doesNotMatch(appSource, /pendingCommunityPairing/u);
   assert.doesNotMatch(appSource, /acknowledgeRecoveryAndConnect/u);
@@ -7897,19 +7904,24 @@ test("a session-rejected repair clears the dead session and renders one sign-in 
   );
 
   // The ceremony's catch routes a session rejection to the gate BEFORE the
-  // step reporter, so the step-2 failure paragraph cannot render for it.
+  // step reporter, so the step-2 failure paragraph cannot render for it — but
+  // only for a session that is NOT the one this ceremony just minted, so the
+  // cookie-commit race falls through to a retryable failure instead of a
+  // silent discard (owner-reported, 2026-08-10).
   assert.match(
     appSource,
-    /if \(contributionConnectStepOf\(error\) !== null\s*\n\s*&& contributionSessionWasRejected\(error\)\) \{[\s\S]{0,420}?renderContributionSessionSignInGate\(status\);\s*\n\s*\} else if \(contributionConnectStepOf\(error\) !== null\s*\n\s*\|\| contributionDeviceRecoveryIsRequired\(error\)\) \{/u,
+    /if \(contributionConnectStepOf\(error\) !== null\s*\n\s*&& contributionSessionWasRejected\(error\)\s*\n\s*&& !contributionSessionMintedWithinRaceWindow\(\)\) \{[\s\S]{0,900}?await renderContributionSessionSignInGate\(status, error\);\s*\n\s*\} else if \(contributionConnectStepOf\(error\) !== null\s*\n\s*\|\| contributionDeviceRecoveryIsRequired\(error\)\) \{/u,
   );
 
   // The gate clears every piece of the dead authority — the identity proof,
   // the session, and this session's pairing claim — and speaks in the calm
-  // register, never the error class.
+  // register, never the error class. It also records a diagnostics note first
+  // so the discard is never silent (owner-reported, 2026-08-10).
   const gate = appSource.match(
-    /function renderContributionSessionSignInGate\(status\) \{([\s\S]*?)\n\}/u,
+    /async function renderContributionSessionSignInGate\(status, error\) \{([\s\S]*?)\n\}/u,
   )?.[1];
   assert.ok(gate, "the sign-in gate renderer is available");
+  assert.match(gate, /await describeFailure\(\{/u);
   assert.match(gate, /hostedIdentity = null;/u);
   assert.match(gate, /communityDevicePairedV1 = false;/u);
   assert.match(gate, /setCommunitySession\(null\);/u);
@@ -8644,6 +8656,7 @@ let communityDevicePairedV1 = false;
 let incrementalRepairAttempted = false;
 let hostedIdentity = harness.identity;
 let communitySession = harness.session;
+let communitySessionMintedAt = harness.mintedAt ?? null;
 let incrementalConsentApproved = harness.approved;
 let contributionSyncExactReview = null;
 function hasCommunitySession() {
@@ -8656,6 +8669,7 @@ function setCommunitySession(value) {
   harness.sessions.push(value ? { ...value } : null);
   if (!value) {
     communityDevicePaired = false;
+    communitySessionMintedAt = null;
     renderContributionActionState();
   }
 }
@@ -8674,6 +8688,7 @@ return {
   state: () => ({
     hostedIdentity,
     communitySession,
+    communitySessionMintedAt,
     communityDevicePairedV1,
     incrementalConsentApproved,
     incrementalRepairAttempted,
@@ -8696,7 +8711,15 @@ return {
     async () => {},
     () => {},
     async () => {},
-    async () => ({ text: "described" }),
+    async ({ surface, error } = {}) => {
+      harness.describeFailures = harness.describeFailures ?? [];
+      harness.describeFailures.push({
+        surface,
+        code: error?.code ?? null,
+        requestId: error?.requestId ?? null,
+      });
+      return { text: "described", code: error?.code ?? null };
+    },
     (value) => String(value),
     (key) => `[${key}]`,
     () => ({ append() {}, textContent: "" }),
@@ -8704,8 +8727,10 @@ return {
 }
 
 async function settleCeremony(scope, harness, { untilFetchCount }) {
-  for (let tick = 0; tick < 40; tick += 1) {
-    await new Promise((resolveTick) => setTimeout(resolveTick, 0));
+  // A tick with real wall-clock time so the ceremony's bounded cookie-commit
+  // backoffs (hundreds of ms) can actually elapse before the check.
+  for (let tick = 0; tick < 300; tick += 1) {
+    await new Promise((resolveTick) => setTimeout(resolveTick, 15));
     if (harness.fetchCalls.length >= untilFetchCount
         && scope.state().incrementalConsentBusy === false) {
       return;
@@ -8843,6 +8868,106 @@ test("a session-rejected mint gates once and cannot repeat within the load", asy
   assert.equal(harness.fetchCalls.length, 1, "exactly one rejected mint, ever");
 });
 
+test("a pairing mint that 401s inside the cookie-commit window retries and keeps the fresh sign-in", async () => {
+  // THE root-cause fix (owner-reported, 2026-08-10): after the enroll adopts a
+  // fresh __Host- session, the first pairing mint can overtake the cookie's
+  // commit and come back AUTH_REQUIRED. That is the race, not a dead session,
+  // so the mint retries on a short backoff and the sign-in that just worked is
+  // never discarded.
+  const proof = "a".repeat(64);
+  const verifier = "v".repeat(64);
+  const harness = {
+    identity: { provider: "google", proof, verifier },
+    session: { csrfToken: "stale-csrf", participantId: "old", consentVersion: null },
+    approved: true,
+    grantRejected: true,
+    responses: [
+      {
+        status: 200,
+        payload: {
+          schemaVersion: "participant-bootstrap-v0.1",
+          csrfToken: "fresh-csrf",
+          participantId: "participant-1",
+        },
+      },
+      // The cookie has not committed yet, so the first mint is rejected.
+      { status: 401, payload: { error: { code: "AUTH_REQUIRED" } } },
+      // The retry, once the cookie lands, mints under the same fresh session.
+      { status: 201, payload: { pairingCode: "pc-1" } },
+    ],
+  };
+  const scope = await loadContributionCeremony(harness);
+  scope.resumeContributionCeremonyAfterSignIn();
+  await settleCeremony(scope, harness, { untilFetchCount: 3 });
+
+  assert.deepEqual(
+    harness.fetchCalls.map((call) => [call.url, call.method, call.csrf]),
+    [
+      ["/api/v1/enroll", "POST", null],
+      ["/api/v1/me/device-pairings", "POST", "fresh-csrf"],
+      ["/api/v1/me/device-pairings", "POST", "fresh-csrf"],
+    ],
+    "the mint is retried under the SAME fresh session, never the stale csrf",
+  );
+  const state = scope.state();
+  assert.equal(state.communitySession?.csrfToken, "fresh-csrf", "the fresh session is kept");
+  assert.deepEqual(
+    state.hostedIdentity,
+    { provider: "google", proof, verifier },
+    "the identity proof survives the race",
+  );
+  assert.equal(state.communityDevicePairedV1, true, "the retried mint completes the pairing");
+  assert.equal(state.incrementalConsentApproved, true, "approval is untouched");
+  assert.deepEqual(harness.localCalls, [{ pairContributionDevice: "pc-1" }]);
+  const surface = harness.elements("#incremental-consent-status");
+  assert.ok(
+    surface.localizedKeys.includes("consent.authorityRefreshed"),
+    "the settled state reports the calm refresh, not a failure",
+  );
+  assert.ok(
+    !surface.localizedKeys.includes("consent.signInAgainToFinish"),
+    "the sign-in gate never fired for the race",
+  );
+});
+
+test("the sign-in gate fires only for a dead stored session and always records a note", async () => {
+  // The other half of the fix: a session this ceremony did NOT mint (the mint
+  // timestamp stays null) that is rejected is a genuinely dead stored session.
+  // The gate still fires and clears it — but it now records a diagnostics note
+  // with the real code and request id first, so the discard is never silent.
+  const requestId = "22222222-2222-4222-8222-222222222222";
+  const harness = {
+    identity: null,
+    session: { csrfToken: "stale-csrf", participantId: "old", consentVersion: null },
+    approved: true,
+    grantRejected: true,
+    responses: [
+      { status: 401, payload: { error: { code: "AUTH_REQUIRED", requestId } } },
+    ],
+  };
+  const scope = await loadContributionCeremony(harness);
+  scope.maybeRepairIncrementalAuthorization();
+  await settleCeremony(scope, harness, { untilFetchCount: 1 });
+
+  // A dead stored session mints exactly once — no cookie-race retry, because
+  // this session carries no mint timestamp.
+  assert.deepEqual(
+    harness.fetchCalls.map((call) => [call.url, call.csrf]),
+    [["/api/v1/me/device-pairings", "stale-csrf"]],
+  );
+  assert.equal(scope.state().communitySession, null, "the dead session is cleared");
+  const note = (harness.describeFailures ?? []).find(
+    (entry) => entry.surface === "contribution_connect",
+  );
+  assert.ok(note, "the gate recorded a diagnostics note before discarding");
+  assert.equal(note.code, "AUTH_REQUIRED", "the note carries the real code");
+  assert.equal(note.requestId, requestId, "the note carries the real request id");
+  assert.ok(
+    harness.elements("#incremental-consent-status").localizedKeys
+      .includes("consent.signInAgainToFinish"),
+  );
+});
+
 test("the journey's community stage cannot claim done while the re-pair is pending", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   // The repair branch renders BEFORE the approved-done branch, splitting on
@@ -8860,7 +8985,7 @@ test("the journey's community stage cannot claim done while the re-pair is pendi
   // The gate reconciles the identity card's status line too.
   assert.match(
     appSource,
-    /function renderContributionSessionSignInGate\(status\) \{[\s\S]*?\$\("#identity-signin-status"\)/u,
+    /async function renderContributionSessionSignInGate\(status, error\) \{[\s\S]*?\$\("#identity-signin-status"\)/u,
   );
   for (const locale of SUPPORTED_LOCALES) {
     for (const key of [
