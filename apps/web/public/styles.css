@@ -1177,6 +1177,25 @@ h2 {
 .calibration-stats strong { display: block; font-family: var(--serif); font-size: 1.55rem; font-weight: var(--weight-display); line-height: 1.05; overflow-wrap: anywhere; }
 .calibration-stats span { display: block; margin-top: 7px; color: var(--muted); font-size: .62rem; font-weight: var(--weight-semibold); letter-spacing: .04em; text-transform: uppercase; }
 .calibration-example { margin: 12px 0 0; }
+/*
+ * Per-model rates behind a disclosure (owner decision 2026-08-10): the
+ * blended figure stays the headline; the fitted per-model detail is one
+ * click away and lists each model's own "$ per point".
+ */
+.calibration-models { margin: 12px 0 0; font-size: .8rem; }
+.calibration-models > summary { cursor: pointer; color: var(--muted); font-weight: var(--weight-semibold); }
+.calibration-models .annotation { margin: 8px 0 0; }
+.calibration-model-list { margin: 8px 0 0; padding: 0; list-style: none; }
+.calibration-model-list li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+}
+.calibration-model-list li:last-child { border-bottom: 0; }
+.calibration-model-list strong { font-variant-numeric: tabular-nums; }
 .calibration-explanation { margin: 12px 0 0; }
 
 .share-panel { margin-top: 22px; }
@@ -1409,9 +1428,14 @@ h2 {
 .chart-status-missing { fill: rgba(101, 112, 107, .08); }
 .chart-status-reset { fill: rgba(49, 95, 132, .08); }
 .chart-status-ambiguous { fill: rgba(101, 112, 107, .06); }
+/* "Allowance exhausted": the pool is pegged at 100%, so no residual is
+   measurable across the span. Warmer than the neutral exclusions so a
+   deliberate suspension never reads as a data gap. */
+.chart-status-saturated { fill: rgba(176, 101, 43, .1); }
 .legend-dot.chart-status-missing { background: rgba(101, 112, 107, .54); }
 .legend-dot.chart-status-reset { background: rgba(49, 95, 132, .54); }
 .legend-dot.chart-status-ambiguous { background: rgba(101, 112, 107, .54); }
+.legend-dot.chart-status-saturated { background: rgba(176, 101, 43, .54); }
 .chart-zero { stroke: var(--muted); stroke-dasharray: 5 5; }
 .chart-point-observed { fill: var(--green); }
 .chart-point-expected { fill: var(--rust); }

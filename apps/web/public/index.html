@@ -346,6 +346,17 @@
               </div>
             </div>
             <p class="annotation calibration-example" id="calibration-example" hidden></p>
+            <!--
+              Composition-aware calibration (owner decision 2026-08-10): the
+              headline stays one blended "$ per point" figure for the recent
+              mix; the per-model rates the NNLS fit actually resolved are one
+              disclosure away, never the default read.
+            -->
+            <details class="calibration-models" id="calibration-models" hidden>
+              <summary data-i18n="dashboard.calibration.perModelSummary">Per-model rates</summary>
+              <p class="annotation" data-i18n="dashboard.calibration.perModelExplainer">Each model consumes the weekly allowance at its own rate, so the headline blends these over your recent mix.</p>
+              <ul class="calibration-model-list" id="calibration-model-list"></ul>
+            </details>
             <p class="annotation calibration-explanation" id="calibration-explanation">
               This fit uses API prices as a measuring stick. It is not a
               provider-published dollar allowance.

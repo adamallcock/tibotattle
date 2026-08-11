@@ -1376,15 +1376,23 @@ function renderComparison(data) {
   const weeklySummary = data.weekly.summary ?? {};
   const mae = finite(summary.mean_absolute_error_pp ?? summary.meanAbsoluteErrorPp);
   const within = finite(summary.points_within_80_band_fraction ?? summary.pointsWithin80BandFraction);
-  // The weekly estimator is the canonical fitted-rate source. Older gradient
-  // artifacts used a separate summary shape, which is retained only as a
-  // compatibility fallback for old demo payloads.
+  // The weekly estimator is the canonical fitted-rate source. The
+  // composition-aware blended rate (cost-weighted over the recent model mix)
+  // is preferred when the v0.7 cache fitted one; the across-reset median is
+  // the fallback, and older gradient artifacts remain a compatibility
+  // fallback for old demo payloads.
   const capacity = finite(
-    weeklySummary.median_weekly_value_usd
+    weeklySummary.blended_capacity_usd
+      ?? weeklySummary.median_weekly_value_usd
       ?? weeklySummary.medianWeeklyValueUsd
       ?? summary.capacity_usd
       ?? summary.capacityUsd,
   );
+  const capacityByModel = weeklySummary.capacity_by_model
+      && typeof weeklySummary.capacity_by_model === "object"
+      && !Array.isArray(weeklySummary.capacity_by_model)
+    ? weeklySummary.capacity_by_model
+    : null;
   const lower = finite(
     weeklySummary.lower_80_across_resets_usd
       ?? weeklySummary.lower80Usd
@@ -1402,7 +1410,7 @@ function renderComparison(data) {
     0,
   );
   const chip = $("#fit-chip");
-  renderCalibrationRate({ capacity, lower, upper, qualifyingResets });
+  renderCalibrationRate({ capacity, lower, upper, qualifyingResets, capacityByModel });
   if (!pair || pair.observed === null || pair.expected === null) {
     setProductText(chip, "Insufficient");
     setProductText(
@@ -1437,11 +1445,18 @@ function renderComparison(data) {
 // compact stat row. Each tile holds the bare figure; its unit lives in the
 // fixed label beneath it, and the sentence-length "example translation" moved
 // into the prose below the stats — it is a sentence, not a datum.
-function renderCalibrationRate({ capacity, lower, upper, qualifyingResets = 0 }) {
+function renderCalibrationRate({
+  capacity,
+  lower,
+  upper,
+  qualifyingResets = 0,
+  capacityByModel = null,
+}) {
   const rate = $("#calibration-rate");
   const range = $("#calibration-range");
   const example = $("#calibration-example");
   const explanation = $("#calibration-explanation");
+  renderCalibrationModelRates(capacityByModel);
   if (capacity === null || capacity <= 0) {
     setProductText(rate, "Not estimable");
     setProductText(range, "Not estimable");
@@ -1477,6 +1492,43 @@ function renderCalibrationRate({ capacity, lower, upper, qualifyingResets = 0 })
       amount: formatMoney(capacity, 0),
     });
   }
+}
+
+// The per-model disclosure under the blended headline (owner decision
+// 2026-08-10: blended "$X per point" stays the headline; per-model detail on
+// expand). Only rates the NNLS fit actually resolved are listed — a model the
+// fit could not identify is omitted rather than shown at the blend, and with
+// no resolved rates the whole disclosure stays hidden.
+function renderCalibrationModelRates(capacityByModel) {
+  const details = $("#calibration-models");
+  const list = $("#calibration-model-list");
+  if (!details || !list) return;
+  const rows = Object.entries(capacityByModel ?? {})
+    .filter(([model, value]) => model !== "other"
+      && typeof model === "string"
+      && Number.isFinite(value)
+      && value > 0)
+    .sort(([, left], [, right]) => right - left);
+  list.textContent = "";
+  if (rows.length === 0) {
+    details.hidden = true;
+    details.open = false;
+    return;
+  }
+  for (const [model, value] of rows) {
+    const item = document.createElement("li");
+    const name = document.createElement("span");
+    // Model identifiers arrive from the local companion payload; the
+    // formatter maps only reviewed fragments and never echoes free text.
+    setRawText(name, formatModelName(model));
+    const perPoint = document.createElement("strong");
+    setRawText(perPoint, t("dashboard.calibration.perModelRate", {
+      amount: formatMoney(value / 100, 2),
+    }));
+    item.append(name, perPoint);
+    list.append(item);
+  }
+  details.hidden = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -2975,6 +3027,7 @@ const TIMELINE_STATUS_KEYS = Object.freeze({
   missing_quota_bracket: "chart.status.missingQuotaBracket",
   reset_or_track_change: "chart.status.resetOrTrackChange",
   backward_or_ambiguous: "chart.status.backwardOrAmbiguous",
+  pool_saturated: "chart.status.poolSaturated",
 });
 
 function timelineStatusKey(status) {
@@ -3026,6 +3079,16 @@ function mainWeeklyQuotaTrack(rows) {
 // absorb every observed restatement and still far too narrow to merge two
 // distinct reset cycles.
 const RESET_BOUNDARY_TOLERANCE_MS = 2 * 60 * 1_000;
+// The weekly pool's displayed ceiling. A window whose start edge already
+// reads 100 is measuring a pegged pool: observed cannot rise while cost
+// keeps accruing, so the residual machinery suspends there instead of
+// booking the interregnum as negative drift (pool-lifecycle addendum,
+// docs/design/composition-aware-expected-line.md).
+const POOL_SATURATION_CEILING_PP = 100;
+// A displayed used_percent DECREASE beyond display jitter inside one reset
+// boundary is a genuine reset (banked or automatic): the drift accumulation
+// re-anchors rather than reading the drop as movement.
+const RESET_DECREASE_THRESHOLD_PP = 5;
 
 function sameResetBoundary(before, after) {
   if (!before || !after) return false;
@@ -3047,8 +3110,11 @@ function liveTimelinePoints(
   } = {},
 ) {
   const usage = data.timeline.usage;
+  // Prefer the composition-aware blended rate over the recent mix; the
+  // across-reset median stays as the fallback for older caches.
   const capacity = finite(
-    data.weekly.summary?.median_weekly_value_usd
+    data.weekly.summary?.blended_capacity_usd
+      ?? data.weekly.summary?.median_weekly_value_usd
       ?? data.gradient.summary?.capacity_usd
   );
   if (!usage.length) return [];
@@ -3138,7 +3204,14 @@ function liveTimelinePoints(
       && endMs - afterMatch.timestampMs <= maximumBracketGapMs;
     const sameReset = Boolean(bracketed)
       && sameResetBoundary(before.resetAt, after.resetAt);
-    const observed = sameReset && after.usedPercent >= before.usedPercent
+    // Pool saturated: the window STARTS at the ceiling, so the display
+    // cannot move no matter what the workload costs. Both series suspend —
+    // a zero observed against a live expected here is not a measurement.
+    const poolSaturated = sameReset
+      && before.usedPercent >= POOL_SATURATION_CEILING_PP;
+    const observed = !poolSaturated
+        && sameReset
+        && after.usedPercent >= before.usedPercent
       ? after.usedPercent - before.usedPercent
       : null;
     let windowCostUsd = Math.max(0, rollingCost);
@@ -3170,7 +3243,7 @@ function liveTimelinePoints(
       windowCostUsd = Math.max(0, costPrefix[top] - costPrefix[lower]);
       windowEvents = Math.max(0, eventsPrefix[top] - eventsPrefix[lower]);
     }
-    const expected = capacity !== null && capacity > 0
+    const expected = !poolSaturated && capacity !== null && capacity > 0
       ? windowCostUsd / capacity * 100
       : null;
     const evidence = classifyTimelineEvidence({
@@ -3180,6 +3253,7 @@ function liveTimelinePoints(
       expected,
       usageEvents: windowEvents,
       apiCostUsd: windowCostUsd,
+      poolSaturated,
     });
     let cumulativeResidual = null;
     // A re-anchor marks the first drift observation of a new reset or track:
@@ -3192,14 +3266,35 @@ function liveTimelinePoints(
         && Number.isFinite(finite(after.usedPercent))
         && endMs - afterMatch.timestampMs <= maximumBracketGapMs) {
       if (driftAnchor === null
-          || !sameResetBoundary(driftAnchor.resetAt, after.resetAt)) {
+          || !sameResetBoundary(driftAnchor.resetAt, after.resetAt)
+          // A used_percent DECREASE beyond display jitter is a genuine reset
+          // even when the provider restated the same boundary instant
+          // (banked/automatic resets keep resets_at): re-anchor rather than
+          // reading the drop — and everything after it — as drift.
+          || after.usedPercent
+            < driftAnchor.maxUsedPercent - RESET_DECREASE_THRESHOLD_PP) {
         // A boundary or track change re-anchors the accumulation: drift is
         // zero by definition at the first observation of a new reset.
-        driftAnchor = { resetAt: after.resetAt, usedPercent: after.usedPercent };
+        driftAnchor = {
+          resetAt: after.resetAt,
+          usedPercent: after.usedPercent,
+          maxUsedPercent: after.usedPercent,
+        };
         driftCostUsd = 0;
         cumulativeResidual = 0;
         driftReanchor = true;
+      } else if (driftAnchor.maxUsedPercent >= POOL_SATURATION_CEILING_PP) {
+        // The pool pegged earlier in this reset: post-peg cost cannot be
+        // measured against a display that can no longer move. Suspend the
+        // accumulation (null splits detector runs) and keep the accrued cost
+        // out of it, so a later re-anchor starts clean.
+        driftCostUsd -= current.apiPriceEquivalentUsd;
+        cumulativeResidual = null;
       } else {
+        driftAnchor.maxUsedPercent = Math.max(
+          driftAnchor.maxUsedPercent,
+          after.usedPercent,
+        );
         cumulativeResidual = after.usedPercent - driftAnchor.usedPercent
           - driftCostUsd / capacity * 100;
       }
@@ -3706,6 +3801,7 @@ const TIMELINE_EXCLUSION_MESSAGE_KEYS = Object.freeze([
   ["missing_quota_bracket", "dashboard.timeline.excludedMissingBracket"],
   ["reset_or_track_change", "dashboard.timeline.excludedResetOrTrackChange"],
   ["backward_or_ambiguous", "dashboard.timeline.excludedAmbiguousMovement"],
+  ["pool_saturated", "dashboard.timeline.excludedPoolSaturated"],
 ]);
 
 function describeTimelineExclusions(activePoints) {
@@ -5194,7 +5290,12 @@ function lineChart({
     rect.setAttribute("y", String(margin.top));
     rect.setAttribute("width", String(Math.max(1, Math.min(width - margin.right, end) - Math.max(margin.left, start))));
     rect.setAttribute("height", String(height - margin.top - margin.bottom));
-    rect.setAttribute("class", `chart-status-${interval.status === "reset_or_track_change" ? "reset" : interval.status === "missing_quota_bracket" ? "missing" : "ambiguous"}`);
+    rect.setAttribute("class", `chart-status-${
+      interval.status === "reset_or_track_change" ? "reset"
+        : interval.status === "missing_quota_bracket" ? "missing"
+          : interval.status === "pool_saturated" ? "saturated"
+            : "ambiguous"
+    }`);
     const intervalTitle = document.createElementNS(svg.namespaceURI, "title");
     setRawText(
       intervalTitle,

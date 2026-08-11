@@ -676,6 +676,26 @@ test("deviation detector treats a data gap as a hard boundary", () => {
   assert.equal(result.periods.length, 0);
 });
 
+test("a pool-saturated span never becomes or extends a deviation period", () => {
+  // While the weekly pool is pegged at 100%, liveTimelinePoints suspends both
+  // the residual and the cumulative drift (nulls, status "pool_saturated") —
+  // the same shape as a data gap — so the detector can neither read the
+  // post-peg interregnum as an over-cost period nor bridge a run across it,
+  // and the excluded spans contribute nothing to any period's signed AUC.
+  const series = driftSeries([
+    -8, -8, -8, -8, -8, -8,
+    { drift: null, residual: null },
+    { drift: null, residual: null },
+    { drift: null, residual: null },
+    { drift: -8, reanchor: true }, -8, -8, -8, -8, -8,
+  ]);
+  const result = detectDeviationPeriods(series);
+  // Each side is 75 minutes: below the two-hour sustain floor once the
+  // saturated span refuses to connect them.
+  assert.equal(result.periods.length, 0);
+  assert.equal(result.hasDriftSeries, true);
+});
+
 test("deviation detector returns an explicit empty result with no drift series", () => {
   const empty = detectDeviationPeriods([]);
   assert.deepEqual(empty.periods, []);
