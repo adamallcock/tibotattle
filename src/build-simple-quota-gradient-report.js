@@ -3,6 +3,11 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
+  blendedCompositionCapacityUsd,
+  buildCompositionObservations,
+  calibrateCompositionCapacities,
+} from "@app-usagemonitor/quota-analysis";
+import {
   analyzeFastDiagnostic,
   analyzeSimpleQuotaGradient,
   summarizeSlotSemantics,
@@ -25,7 +30,61 @@ const history = JSON.parse(await readFile(historyPath, "utf8"));
 const historyTransitions = JSON.parse(await readFile(historyTransitionsPath, "utf8"));
 const fastDiagnostic = JSON.parse(await readFile(fastDiagnosticPath, "utf8"));
 const rollingHistory = JSON.parse(await readFile(rollingHistoryPath, "utf8"));
-const analysis = analyzeSimpleQuotaGradient(recent, history, { smoothingHours: 3 });
+// Composition-aware calibration from the report's OWN weekly intervals (the
+// design's per-model expected line must run in the production caller, not
+// only in tests). Weekly rows only: a usage event also appears in the 5-hour
+// stream's modelMix, and mixing both would double-count its dollars. The
+// kernel degrades honestly — anything but a stable "fitted" status keeps the
+// blended constant exactly as before.
+function fitReportComposition(snapshotIntervals) {
+  const usageRows = [];
+  const quotaRows = [];
+  for (const row of snapshotIntervals ?? []) {
+    if (row.windowDurationMins !== 10_080) continue;
+    const observedAtMs = Date.parse(row.eventTime);
+    if (!Number.isFinite(observedAtMs)) continue;
+    if (Number.isFinite(row.nextUsedPercent) && Number.isFinite(row.resetsAt)) {
+      quotaRows.push({
+        observedAtMs,
+        planType: typeof row.planType === "string" ? row.planType : "unknown",
+        resetsAtMs: row.resetsAt * 1_000,
+        usedPercent: row.nextUsedPercent,
+      });
+    }
+    for (const [model, values] of Object.entries(row.modelMix ?? {})) {
+      const costUsd = values?.costUsd;
+      if (Number.isFinite(costUsd) && costUsd > 0) {
+        usageRows.push({ observedAtMs, model, costUsd });
+      }
+    }
+  }
+  const { observations } = buildCompositionObservations({ usageRows, quotaRows });
+  const fit = calibrateCompositionCapacities(observations);
+  if (fit.status !== "fitted") return { composition: null, fit };
+  const endMs = usageRows.reduce(
+    (max, row) => Math.max(max, row.observedAtMs),
+    Number.NEGATIVE_INFINITY,
+  );
+  const recentMix = {};
+  for (const row of usageRows) {
+    if (row.observedAtMs < endMs - 14 * 24 * 60 * 60 * 1_000) continue;
+    recentMix[row.model] = (recentMix[row.model] ?? 0) + row.costUsd;
+  }
+  const blendedCapacityUsd = blendedCompositionCapacityUsd(recentMix, {
+    capacityUsdByModel: fit.capacityUsdByModel,
+    fallbackCapacityUsd: fit.singleConstantUsd,
+  });
+  return {
+    composition: {
+      capacityUsdByModel: fit.capacityUsdByModel,
+      blendedCapacityUsd,
+    },
+    fit,
+  };
+}
+
+const { composition, fit: compositionFit } = fitReportComposition(recent.snapshotIntervals);
+const analysis = analyzeSimpleQuotaGradient(recent, history, { smoothingHours: 3, composition });
 const slotSemantics = summarizeSlotSemantics(historyTransitions);
 const fastAnalysis = analyzeFastDiagnostic(fastDiagnostic);
 const oneHourDiagnostic = fastAnalysis.windowDiagnostics.find((row) => row.window_hours === 1);
@@ -171,6 +230,24 @@ const summary = [{
 
 const artifact = {
   surface: "report",
+  // The basis the rolling expected line actually used, recorded so the
+  // artifact is honest about whether the per-model vector or the blended
+  // constant priced each window (composition_per_model versus
+  // blended_constant), with the fit's own identification diagnostics. The
+  // corpus constants below are the COMPOSITION CORPUS's own least-squares
+  // diagnostics (2h envelope-x-cost bins from this artifact's interval
+  // stream), not the reset gradient the report's headline uses — when the
+  // status is not "fitted" the expected line never touched any of them.
+  composition: {
+    status: compositionFit.status,
+    rollingExpectedBasis: analysis.gradient.rollingExpectedBasis,
+    capacityUsdByModel: compositionFit.capacityUsdByModel ?? null,
+    blendedRecentMixUsd: composition?.blendedCapacityUsd ?? null,
+    corpusSingleConstantUsd: compositionFit.singleConstantUsd ?? null,
+    corpusR2: compositionFit.r2 ?? null,
+    corpusSingleConstantR2: compositionFit.singleConstantR2 ?? null,
+    identification: compositionFit.identification ?? null,
+  },
   manifest: {
     version: 1,
     surface: "report",
