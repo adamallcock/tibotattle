@@ -133,6 +133,38 @@ test("a perfectly collinear corpus degrades to the blended constant, never NaN",
   assert.equal(Number.isNaN(fit.r2 ?? 0), false);
 });
 
+test("a NEAR-collinear corpus falls back instead of shipping a confident noise split", () => {
+  // One true constant, split into two pseudo-models at a random 50-70%
+  // fraction per bin: the models are identical by construction, so any
+  // per-model divergence the solver finds is noise. Raw R² still ties or
+  // marginally beats the constant (the constant is nested in the NNLS
+  // feasible set), which is exactly why the gate must be df-adjusted and
+  // stability-checked rather than a raw nested-R² comparison.
+  let seed = 999;
+  const rand = () => {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    return seed / 2147483648;
+  };
+  const observations = Array.from({ length: 120 }, (_, index) => {
+    const cost = 60 + 45 * Math.abs(noise(index * 5 + 2));
+    const fraction = 0.5 + 0.2 * rand();
+    return {
+      binStartMs: index * GRAIN_MS,
+      // True capacity $2,000/100pp with mild noise on the movement.
+      ppDelta: cost * 100 / 2_000 + 0.35 * noise(index * 11 + 3),
+      costByModel: {
+        "pseudo-a": cost * fraction,
+        "pseudo-b": cost * (1 - fraction),
+      },
+    };
+  });
+  const fit = calibrateCompositionCapacities(observations);
+  assert.equal(fit.status, "fallback_blended");
+  assert.equal(fit.capacityUsdByModel, null);
+  assert.ok(Math.abs(fit.singleConstantUsd - 2_000) < 40);
+  assert.ok(fit.identification !== undefined);
+});
+
 test("a thin corpus reports insufficient observations with the constant intact", () => {
   const observations = syntheticObservations({
     capacities: { "gpt-5.6-sol": 2_500 },
@@ -289,19 +321,43 @@ test("a persistent drop is a reset boundary that starts a fresh segment", () => 
       // A banked reset drops the display and STAYS down.
       quotaReading(1.2, 3),
       quotaReading(1.4, 3),
-      quotaReading(1.8, 6),
+      quotaReading(2.5, 6),
     ],
     usageRows: [
       usageRow(0.5, "gpt-5.6-sol", 25),
-      usageRow(1.6, "gpt-5.6-sol", 30),
+      usageRow(2.2, "gpt-5.6-sol", 30),
     ],
   });
-  // Segment one: 80->82 (2pp). Segment two: 3->6 (3pp) in the same bin —
-  // never 82->6 smeared into a phantom.
+  // Segment one: 80->82 (2pp) against its own bin's $25. Segment two: 3->6
+  // (3pp) in the next bin against that bin's $30 — never 82->6 smeared into
+  // a phantom, and never one bin's dollars attributed twice.
   const deltas = observations.map((observation) => observation.ppDelta).sort();
   assert.deepEqual(deltas, [2, 3]);
   const segments = new Set(observations.map((observation) => observation.segmentIndex));
   assert.equal(segments.size, 2);
+  assert.deepEqual(
+    observations.map((observation) => observation.costByModel),
+    [{ "gpt-5.6-sol": 25 }, { "gpt-5.6-sol": 30 }],
+  );
+});
+
+test("a mid-bin reset voids the bin: one bin's cost is never attributed to two segments", () => {
+  const { observations } = buildCompositionObservations({
+    quotaRows: [
+      quotaReading(0.1, 80),
+      quotaReading(0.6, 84),
+      // Banked reset INSIDE the same 2h bin, confirmed by a second reading,
+      // then movement resumes before the bin ends.
+      quotaReading(1.0, 3),
+      quotaReading(1.2, 3),
+      quotaReading(1.8, 9),
+    ],
+    usageRows: [usageRow(0.5, "gpt-5.6-sol", 100)],
+  });
+  // Both segments moved in ONE bin holding $100. Emitting both observations
+  // would attribute $200 for $100 spent (each copies the bin's full cost),
+  // so the bin is voided — honest refusal over double-counted training data.
+  assert.equal(observations.length, 0);
 });
 
 test("a pegged pool yields no observations, so post-peg cost cannot train the fit", () => {

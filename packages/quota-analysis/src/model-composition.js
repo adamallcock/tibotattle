@@ -14,9 +14,9 @@
 // Everything here is runtime-neutral and dependency-free: plain rows in,
 // plain fit out. The corpus builder mirrors, at observation grain, the same
 // refusals the calibration reporting makes at reset grain — monotone
-// envelopes per pool, stale interleaved readings ignored, ambiguous
-// multi-pool bins voided — so the fit never trains on double-attributed
-// evidence.
+// envelopes per pool, stale interleaved readings ignored, ambiguous bins
+// (multiple pools or multiple reset-separated segments moving in one bin)
+// voided — so the fit never trains on double-attributed evidence.
 
 export const MODEL_COMPOSITION_POLICY = Object.freeze({
   // Observation grain. Two hours is the finest grain at which the displayed
@@ -43,6 +43,14 @@ export const MODEL_COMPOSITION_POLICY = Object.freeze({
   minimumObservations: 24,
   // The label the folded remainder fits under.
   otherModelKey: "other",
+  // Identification guard for near-collinear corpora: the single-constant
+  // model is NESTED in the NNLS feasible set (a uniform vector is feasible),
+  // so raw training R² can only tie or beat the constant's — it can never
+  // reject a fit. Each named model's capacity must therefore also be STABLE:
+  // refitting on interleaved half-corpora may move no identified capacity by
+  // more than this fraction of its full-fit value, or the whole fit degrades
+  // to the blended constant instead of shipping a confident noise split.
+  maxSplitHalfCapacityDriftFraction: 0.35,
 });
 
 function finitePositive(value) {
@@ -218,20 +226,21 @@ export function buildCompositionObservations({
       }
     }
   }
-  const poolsPerBin = new Map();
+  const entriesPerBin = new Map();
   for (const entry of entries.values()) {
-    let set = poolsPerBin.get(entry.binStartMs);
-    if (set === undefined) {
-      set = new Set();
-      poolsPerBin.set(entry.binStartMs, set);
-    }
-    set.add(entry.poolKey);
+    entriesPerBin.set(
+      entry.binStartMs,
+      (entriesPerBin.get(entry.binStartMs) ?? 0) + 1,
+    );
   }
-  for (const [bin, set] of poolsPerBin) {
-    // Concurrent pools moving in the same bin make that bin's cost
-    // unattributable between them — the same refusal the reset-grain
-    // calibration makes for overlapping observation windows.
-    if (set.size > 1) voidedBins.add(bin);
+  for (const [bin, count] of entriesPerBin) {
+    // More than one observation in a bin — concurrent pools moving, or two
+    // segments of ONE pool bracketing a mid-bin reset — makes that bin's
+    // cost unattributable between them: each observation would otherwise
+    // copy the bin's FULL cost and the corpus would train on double-counted
+    // dollars. Void the bin — the same refusal the reset-grain calibration
+    // makes for overlapping observation windows.
+    if (count > 1) voidedBins.add(bin);
   }
   const observations = [...entries.values()]
     .filter((entry) => !voidedBins.has(entry.binStartMs) && entry.ppDelta > 0)
@@ -401,9 +410,14 @@ function round(value, places = 6) {
  * Degenerate corpora degrade explicitly, never to NaN:
  * - fewer than `minimumObservations` usable rows → status
  *   `"insufficient_observations"`, capacities null;
- * - a fit that fails to beat the single constant (collinear mixes carry no
- *   composition signal) → status `"fallback_blended"`, capacities null;
- * - both fall back to `singleConstantUsd`, which is always emitted when any
+ * - a fit that fails to beat the single constant on the DF-ADJUSTED
+ *   comparison (the constant is nested in the NNLS feasible set, so raw
+ *   training R² can only tie or beat it — the adjustment charges each free
+ *   per-model parameter) → status `"fallback_blended"`, capacities null;
+ * - a fit whose named-model capacities are UNSTABLE across interleaved
+ *   half-corpus refits (near-collinear mixes produce arbitrary splits with a
+ *   vanishing R² edge) → status `"fallback_blended"`, capacities null;
+ * - all fall back to `singleConstantUsd`, which is always emitted when any
  *   usable observation exists.
  *
  * A model NNLS zeroes out keeps `null` capacity (its cost showed no quota
@@ -414,6 +428,8 @@ export function calibrateCompositionCapacities(observations, {
   minimumModelCostShare = MODEL_COMPOSITION_POLICY.minimumModelCostShare,
   minimumObservations = MODEL_COMPOSITION_POLICY.minimumObservations,
   otherModelKey = MODEL_COMPOSITION_POLICY.otherModelKey,
+  maxSplitHalfCapacityDriftFraction =
+    MODEL_COMPOSITION_POLICY.maxSplitHalfCapacityDriftFraction,
 } = {}) {
   const usable = (Array.isArray(observations) ? observations : [])
     .filter((observation) => observation
@@ -489,9 +505,73 @@ export function calibrateCompositionCapacities(observations, {
     model,
     solution[index] > 1e-9 ? round(100 / solution[index], 2) : null,
   ]));
+  // Degrees-of-freedom-adjusted comparison for through-origin models: the
+  // single constant is nested inside the NNLS feasible set, so raw training
+  // R² for the multi-model fit can NEVER fall below the constant's — only an
+  // adjustment that charges the extra parameters can reject the fit.
+  const adjustedOf = (value, parameters) => (
+    Number.isFinite(value) && usable.length > parameters
+      ? 1 - (1 - value) * usable.length / (usable.length - parameters)
+      : null
+  );
+  const adjustedR2 = adjustedOf(r2, columns.length);
+  const singleConstantAdjustedR2 = adjustedOf(singleConstantR2, 1);
+  // Split-half stability: refit on interleaved halves of the time-ordered
+  // corpus. A genuinely identified capacity reappears near its full-fit
+  // value in every half that actually CARRIES the model's cost; a
+  // near-collinear noise split lands wherever each half's noise points. A
+  // half holding less than the share floor of a model's cost is absence of
+  // evidence, not instability, and is skipped for that model (a corpus of
+  // alternating pure-model bins must not fail on its own alternation). Only
+  // NAMED fitted models are held to this — the folded "other" sliver never
+  // carries enough cost for its drift to matter.
+  const ordered = [...usable].sort((left, right) => (
+    (Number.isFinite(left.binStartMs) ? left.binStartMs : 0)
+      - (Number.isFinite(right.binStartMs) ? right.binStartMs : 0)
+  ));
+  let splitHalfMaxDriftFraction = 0;
+  let splitHalfIdentified = true;
+  for (const parity of [0, 1]) {
+    const half = ordered.filter((_, index) => index % 2 === parity);
+    const halfDesign = designFor(half, fittedModels, otherModelKey);
+    const halfFit = solveNonNegativeLeastSquares(
+      halfDesign.rows,
+      half.map((observation) => observation.ppDelta),
+    );
+    const halfColumnCosts = columns.map((_, column) => halfDesign.rows
+      .reduce((sum, row) => sum + row[column], 0));
+    const halfTotalCost = halfColumnCosts
+      .reduce((sum, value) => sum + value, 0);
+    for (const [index, model] of columns.entries()) {
+      if (!fittedModels.includes(model)) continue;
+      if (!(solution[index] > 1e-9)) continue;
+      if (!(halfTotalCost > 0)
+          || halfColumnCosts[index]
+            < minimumModelCostShare * halfTotalCost) continue;
+      if (!halfFit.converged || !(halfFit.solution[index] > 1e-9)) {
+        splitHalfIdentified = false;
+        continue;
+      }
+      const fullCapacity = 100 / solution[index];
+      const halfCapacity = 100 / halfFit.solution[index];
+      splitHalfMaxDriftFraction = Math.max(
+        splitHalfMaxDriftFraction,
+        Math.abs(halfCapacity - fullCapacity) / fullCapacity,
+      );
+    }
+  }
+  const identification = {
+    adjustedR2: round(adjustedR2),
+    singleConstantAdjustedR2: round(singleConstantAdjustedR2),
+    splitHalfIdentified,
+    splitHalfMaxCapacityDriftFraction: round(splitHalfMaxDriftFraction, 4),
+  };
   const improved = converged
     && Number.isFinite(r2)
-    && (singleConstantR2 === null || r2 > singleConstantR2)
+    && (singleConstantAdjustedR2 === null
+      || (adjustedR2 !== null && adjustedR2 > singleConstantAdjustedR2))
+    && splitHalfIdentified
+    && splitHalfMaxDriftFraction <= maxSplitHalfCapacityDriftFraction
     && Object.values(capacityUsdByModel).some((value) => value !== null);
   if (!improved) {
     return {
@@ -502,6 +582,7 @@ export function calibrateCompositionCapacities(observations, {
       r2: round(r2),
       singleConstantR2: round(singleConstantR2),
       solverConverged: converged,
+      identification,
     };
   }
   return {
@@ -512,6 +593,7 @@ export function calibrateCompositionCapacities(observations, {
     r2: round(r2),
     singleConstantR2: round(singleConstantR2),
     solverConverged: converged,
+    identification,
   };
 }
 

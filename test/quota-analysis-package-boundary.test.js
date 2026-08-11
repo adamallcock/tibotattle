@@ -63,8 +63,12 @@ const SOURCE_HASHES = Object.freeze({
   // composition-aware expected line (per-model NNLS calibration, design:
   // docs/design/composition-aware-expected-line.md). Pinned the same way so
   // an unreviewed edit to the fit is as loud as one to the older kernels.
+  // Re-pinned 2026-08-11 for the reviewed corrections: mid-bin-reset bins
+  // are voided (one bin's cost was attributed to every same-pool segment
+  // moving in it) and the fallback gate became df-adjusted plus split-half
+  // stability (raw nested R² could never reject a near-collinear fit).
   "model-composition.js":
-    "a8fa6b179f523107f0fc965c7bbcffc6a9157480c961643f710f8dae8491f65c",
+    "e7a56f8d66e60227cc509fa3d8166b94c7544af867f081e6a6953e5e984abbd5",
 });
 
 test("quota analysis exposes one exact runtime-neutral package root", async () => {
