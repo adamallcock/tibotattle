@@ -15,7 +15,7 @@
     "head_sampling_rate": 1
   },
   "triggers": {
-    "crons": ["0 * * * *"]
+    "crons": ["* * * * *"]
   },
   "vars": {
     "ENVIRONMENT": "synthetic-development",
@@ -147,7 +147,7 @@
         "head_sampling_rate": 1
       },
       "triggers": {
-        "crons": ["0 * * * *"]
+        "crons": ["* * * * *"]
       },
       "vars": {
         "ENVIRONMENT": "staging",
@@ -272,7 +272,7 @@
         "head_sampling_rate": 1
       },
       "triggers": {
-        "crons": ["0 * * * *"]
+        "crons": ["* * * * *"]
       },
       "vars": {
         "ENVIRONMENT": "production",

@@ -3832,8 +3832,16 @@ export async function runScheduledMaintenance(
 
     const controls = await readCollectionControls(env.USAGE_MONITOR_DB);
     publicationEnabled = controls.publication;
+    // Community aggregates are computed from already-promoted telemetry rows.
+    // Quarantine reconciliation (above) is orthogonal R2 orphan housekeeping and
+    // drains a bounded batch per pass, so a bulk-upload backlog (e.g. a large
+    // backfill) can leave it incomplete for many passes. Publication must not be
+    // held hostage to that housekeeping: the daily aggregates are mutable and
+    // drift-reconciled, so republishing a day later as more data settles is the
+    // designed behavior. Gate only on lifecycle retention + the publication
+    // control; `quarantineReconciliationComplete` still flows into the overall
+    // `complete`/`code` below so maintenance honestly reports housekeeping lag.
     if (lifecycleComplete
-        && quarantineReconciliationComplete
         && publicationEnabled === true) {
       await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
       await buildCommunityWeeklySnapshot(

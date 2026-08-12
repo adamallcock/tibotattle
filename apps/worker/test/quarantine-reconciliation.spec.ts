@@ -1198,6 +1198,47 @@ describe("backend readiness and scheduled observability", () => {
     });
   });
 
+  it("rebuilds community aggregates while a bulk quarantine backlog is still reconciling", async () => {
+    // Community aggregates are computed from already-promoted telemetry; quarantine
+    // reconciliation is orthogonal R2 orphan housekeeping that drains a bounded
+    // 100/pass and can stay incomplete for many passes after a bulk backfill.
+    // Publication must not be gated on that housekeeping (a stalled band was the
+    // symptom). A drifted day is queued for rebuild...
+    const db = bindings().USAGE_MONITOR_DB;
+    await db.prepare(
+      `INSERT INTO community_daily_aggregate_rebuilds (
+        day, requested_epoch, requested_at
+      ) VALUES (?, 1, ?)`,
+    ).bind("2026-07-25", OLD_REGISTERED_AT).run();
+    // ...behind more than one reconciliation batch (>100) of due orphan
+    // registrations, so a single maintenance pass cannot finish reconciliation.
+    for (let index = 0; index < 101; index += 1) {
+      await putTrackedQuarantineObject(
+        db,
+        bindings().QUARANTINE,
+        registration(`bulk-orphan-${index}`),
+        "{}",
+      );
+    }
+
+    const result = await runScheduledMaintenance(bindings(), RECONCILIATION_NOW);
+
+    // Housekeeping is deliberately still incomplete after this pass...
+    expect(result).toMatchObject({ quarantineReconciliationComplete: false });
+    expect(await pendingCount()).toBe(1);
+    // ...yet the band's rebuild ran anyway: the queued day drained and published.
+    // Under the old gate (which required quarantineReconciliationComplete) the
+    // row would have stayed queued and no aggregate would exist.
+    const queued = await db.prepare(
+      "SELECT COUNT(*) AS total FROM community_daily_aggregate_rebuilds",
+    ).first<{ total: number }>();
+    expect(queued?.total).toBe(0);
+    const published = await db.prepare(
+      "SELECT COUNT(*) AS total FROM community_daily_aggregates WHERE day = ?",
+    ).bind("2026-07-25").first<{ total: number }>();
+    expect(published?.total).toBeGreaterThan(0);
+  });
+
   it("emits a fixed-field failure log without object details", async () => {
     const object = registration("PRIVATE_OBJECT_KEY_CANARY");
     const baseBucket = bindings().QUARANTINE;
