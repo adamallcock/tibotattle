@@ -1,9 +1,13 @@
 import { createHash } from "node:crypto";
 
 import {
-  TELEMETRY_MODEL_IDS,
   TELEMETRY_PLAN_TYPES,
 } from "@app-usagemonitor/telemetry-contract";
+
+import {
+  exportLimitProvider,
+  exportModelProvider,
+} from "../export/index.js";
 
 // telemetry-contribution-v1.0 chunk derivation over the local unified index
 // (docs/design/2026-08-07-incremental-contribution-model.md).
@@ -35,7 +39,6 @@ export const MAX_TELEMETRY_V1_CHUNK_CANONICAL_BYTES = 1_250_000;
 
 export const TELEMETRY_V1_STREAMS = Object.freeze(["quota", "session", "usage"]);
 
-const PROVIDER_OPENAI_CODEX = "openai_codex";
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
 const BOUNDED_TOKEN = /^[A-Za-z0-9._:-]{1,64}$/u;
@@ -52,7 +55,6 @@ const MAX_TOOL_CLASS_ENTRIES = 32;
 const MAX_WINDOW_DURATION_MINUTES = 527_040;
 const MAX_CHUNK_REVISION = 1_000_000;
 const MAX_ORPHAN_CHUNK_IDS = 64;
-const MODEL_IDS = new Set(TELEMETRY_MODEL_IDS);
 const PLAN_TYPES = new Set(TELEMETRY_PLAN_TYPES);
 // Transport canary, re-pinned from the v0.1 projection for v1.0: raw scope
 // identifiers never leave the device. `sessionUuid` is the one deliberate
@@ -310,6 +312,33 @@ export function createTelemetryV1IndexReader(database, {
       SELECT session_local, tool_class, count FROM tool_class_count
       ORDER BY session_local, tool_class`)
     : null;
+  // A session dimension record carries no model, so its provider is the one
+  // its own events agree on. A session spanning two vendors has no single
+  // honest answer, so it reports "unknown" rather than picking a winner.
+  // One ordered corpus-wide scan, same shape as the tool-class map below.
+  const allSessionProviderStatement = database.prepare(`
+    SELECT u.session_local AS session_local, m.model_id AS model_id
+    FROM usage_event u
+    JOIN model m ON m.id = u.model_id
+    GROUP BY u.session_local, m.model_id
+    ORDER BY u.session_local, m.model_id`);
+  let sessionProviderCache = null;
+  function providerBySession() {
+    if (sessionProviderCache === null) {
+      sessionProviderCache = new Map();
+      for (const row of allSessionProviderStatement.all()) {
+        const key = sessionKey(row.session_local);
+        const providers = sessionProviderCache.get(key);
+        const provider = exportModelProvider(boundedToken(row.model_id));
+        if (providers === undefined) {
+          sessionProviderCache.set(key, new Set([provider]));
+        } else {
+          providers.add(provider);
+        }
+      }
+    }
+    return sessionProviderCache;
+  }
   // session_local is stored as a BLOB, which node:sqlite surfaces as a fresh
   // Uint8Array per row — a Map keyed on the raw value would compare by
   // reference and never hit. Key on a canonical string encoding instead.
@@ -363,10 +392,14 @@ export function createTelemetryV1IndexReader(database, {
     let excluded = 0;
     for (const row of usageStatement.iterate(startMs, endMs)) {
       const sessionUuid = sessionUuidFor(row);
-      const modelId = typeof row.model_id === "string"
-        && MODEL_IDS.has(row.model_id)
-        ? row.model_id
-        : null;
+      // Model identities are carried as bounded tokens, not against a closed
+      // list. A transport allowlist here was a second copy of the reviewed
+      // registry in src/export/registries.js and had already drifted behind
+      // it, silently withholding whole models from every community estimate.
+      // Shape is still enforced; membership is the registry's job, and an
+      // unreviewed identity ships labelled provider "unknown" rather than
+      // being dropped or attributed by guess.
+      const modelId = boundedToken(row.model_id);
       const eventId = Buffer.from(row.event_key).toString("hex");
       const components = {
         inputUncachedTokens: tokenComponent(row.tokens_in_uncached),
@@ -398,7 +431,7 @@ export function createTelemetryV1IndexReader(database, {
         eventId,
         eventTime: instant(row.observed_at_ms),
         sessionUuid,
-        provider: PROVIDER_OPENAI_CODEX,
+        provider: exportModelProvider(modelId),
         modelId,
         speedMode: bounded.speedMode,
         apiServiceTier: bounded.apiServiceTier,
@@ -451,7 +484,9 @@ export function createTelemetryV1IndexReader(database, {
         schemaVersion: "quota-observation-v1.0",
         observationId,
         observedTime: instant(row.observed_at_ms),
-        provider: PROVIDER_OPENAI_CODEX,
+        // A quota reading carries no model, so its provider comes from the
+        // reviewed limit-identity registry instead.
+        provider: exportLimitProvider(limitId),
         planType: typeof row.plan_type === "string"
           && PLAN_TYPES.has(row.plan_type)
           ? row.plan_type
@@ -503,11 +538,16 @@ export function createTelemetryV1IndexReader(database, {
         if (invalid) excluded += 1;
         continue;
       }
+      const sessionProviders = providerBySession().get(
+        sessionKey(row.session_local),
+      );
       records.push({
         schemaVersion: "session-dimension-v1.0",
         sessionUuid,
         firstEventTime: instant(row.first_ms),
-        provider: PROVIDER_OPENAI_CODEX,
+        provider: sessionProviders?.size === 1
+          ? [...sessionProviders][0]
+          : "unknown",
         toolClassCounts,
       });
     }

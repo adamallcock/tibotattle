@@ -1039,9 +1039,10 @@ test("the daily normalizer treats the allowance block as additive and per-day", 
   // malformed.
   for (const [label, hostile] of [
     ["unknown basis", allowanceBlock({ basis: "five_hour_trailing_7d" })],
-    // A different plan cohort is a different product's allowance; the page's
-    // copy names the Pro (20x) cohort, so the block must not render under it.
-    ["different plan cohort", allowanceBlock({ planVariant: "pro-5x" })],
+    // A different plan_type is a different product's allowance (ProLite is the
+    // 5x plan); the page's copy names the Pro (20x) cohort, so the block must
+    // not render under it. Cohorting is by plan_type, not the frozen variant tag.
+    ["different plan cohort", allowanceBlock({ planType: "prolite" })],
     ["cohort-less pooled block", allowanceBlock({
       planType: undefined,
       planVariant: undefined,

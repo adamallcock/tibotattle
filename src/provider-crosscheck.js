@@ -1,6 +1,5 @@
 import { sanitizeAccountScope } from "./providers/codex/account.js";
 import { policyEpochAt, policyEpochsInRange } from "./policy-epochs.js";
-import { resolvePlanContext } from "./plan-timeline.js";
 
 const SCHEMA_VERSION = "0.1";
 const UI_SURFACES = new Set(["desktop_app", "cloud", "web", "mobile", "exec", "desktop", "cli", "extension", "code_review"]);
@@ -46,20 +45,13 @@ function sanitizeUiObservation(observation) {
   };
 }
 
-function dailyPlanContext(planTimeline, scopeId, date, providerPlanType) {
-  const providerContext = resolvePlanContext({
-    timeline: planTimeline,
-    scopeId,
-    at: `${date}T12:00:00.000Z`,
-    providerPlanType,
-  });
+function dailyPlanContext(providerPlanType) {
+  // The provider plan_type names the plan; there is no separate invented
+  // variant layer. Historical local rollouts stay account-unattributed.
   return {
     providerPlanType,
-    planVariant: "unknown",
     localAlias: null,
     source: "historical_local_account_unattributed",
-    ambiguity: providerContext.ambiguity,
-    providerAccountContext: providerContext,
   };
 }
 
@@ -78,29 +70,8 @@ function componentTotal(components) {
   return Object.values(components ?? {}).reduce((sum, value) => sum + (Number.isFinite(value) ? value : 0), 0);
 }
 
-function accountPlanBoundaryDates(planTimeline, scopeId) {
-  const dates = new Set();
-  const profile = planTimeline?.profiles?.find((candidate) => candidate.scopeId === scopeId);
-  if (!profile) return dates;
-  const timestamps = [
-    profile.defaultEffectiveAt,
-    ...(profile.periods ?? []).flatMap((period) => [period.startAt, period.endAt]),
-  ];
-  for (const timestamp of timestamps) {
-    const parsed = new Date(timestamp);
-    if (!Number.isFinite(parsed.valueOf())) continue;
-    const splitsUtcDay = parsed.getUTCHours() !== 0
-      || parsed.getUTCMinutes() !== 0
-      || parsed.getUTCSeconds() !== 0
-      || parsed.getUTCMilliseconds() !== 0;
-    if (splitsUtcDay) dates.add(parsed.toISOString().slice(0, 10));
-  }
-  return dates;
-}
-
 export function createProspectiveAccountScopedAccumulator({
   accountScope,
-  planTimeline,
   providerPlanType,
   startAt,
   endAt,
@@ -109,8 +80,8 @@ export function createProspectiveAccountScopedAccumulator({
   if (!Number.isFinite(Date.parse(startAt)) || !Number.isFinite(Date.parse(endAt))) {
     throw new TypeError("Prospective account accumulator requires bounded timestamps");
   }
+  const plan = providerPlanType ?? "unknown";
   const daily = new Map();
-  const byPlanVariant = {};
   let eventCount = 0;
   let totalTokens = 0;
   let firstObservedAt = null;
@@ -124,68 +95,41 @@ export function createProspectiveAccountScopedAccumulator({
           || !Number.isFinite(Date.parse(record.observedAt))
           || record.observedAt < startAt
           || record.observedAt > endAt) return;
-      const context = resolvePlanContext({
-        timeline: planTimeline,
-        scopeId: sanitizedAccountScope.scopeId,
-        at: record.observedAt,
-        providerPlanType,
-      });
-      const plan = context.planVariant ?? "unknown";
       const date = record.observedAt.slice(0, 10);
       const tokens = componentTotal(record.components);
-      const dailyKey = `${date}|${plan}`;
-      const row = daily.get(dailyKey) ?? { date, planVariant: plan, eventCount: 0, localTokens: 0 };
+      const row = daily.get(date) ?? { date, providerPlanType: plan, eventCount: 0, localTokens: 0 };
       row.eventCount += 1;
       row.localTokens += tokens;
-      daily.set(dailyKey, row);
-      const planRow = byPlanVariant[plan] ??= { eventCount: 0, localTokens: 0 };
-      planRow.eventCount += 1;
-      planRow.localTokens += tokens;
+      daily.set(date, row);
       eventCount += 1;
       totalTokens += tokens;
       if (firstObservedAt === null) firstObservedAt = record.observedAt;
       lastObservedAt = record.observedAt;
     },
     finalize({ officialByDate = new Map() } = {}) {
-      const planCountByDate = {};
-      for (const row of daily.values()) {
-        planCountByDate[row.date] = (planCountByDate[row.date] ?? 0) + 1;
-      }
-      const knownBoundaryDates = accountPlanBoundaryDates(
-        planTimeline,
-        sanitizedAccountScope.scopeId,
-      );
       const rows = [...daily.values()]
-        .sort((left, right) => left.date.localeCompare(right.date)
-          || left.planVariant.localeCompare(right.planVariant))
+        .sort((left, right) => left.date.localeCompare(right.date))
         .map((row) => {
           const officialTokens = Number.isFinite(officialByDate.get(row.date))
             ? officialByDate.get(row.date)
             : null;
-          const observedMixedPlanDay = planCountByDate[row.date] > 1;
-          const knownBoundaryDay = knownBoundaryDates.has(row.date);
-          const providerBucketIsUnallocatable = observedMixedPlanDay || knownBoundaryDay;
           return {
             ...row,
-            officialAccountTokens: providerBucketIsUnallocatable ? null : officialTokens,
-            partialLocalToOfficialRatio: !providerBucketIsUnallocatable && officialTokens > 0
+            officialAccountTokens: officialTokens,
+            partialLocalToOfficialRatio: officialTokens > 0
               ? round(row.localTokens / officialTokens)
               : null,
-            coverage: observedMixedPlanDay
-              ? "mixed_plan_day_provider_bucket_not_allocatable"
-              : (knownBoundaryDay
-                ? "known_plan_boundary_day_provider_bucket_not_allocatable"
-                : "partial_prospective_marker_window_not_full_day"),
+            coverage: "partial_prospective_marker_window_not_full_day",
           };
         });
       return {
         status: eventCount > 0 ? "available_partial" : "not_yet_observed",
         accountScope: sanitizedAccountScope,
+        providerPlanType: plan,
         eventCount,
         totalTokens,
         firstObservedAt,
         lastObservedAt,
-        byPlanVariant,
         daily: rows,
         interpretation: "These records are account-matched prospectively, but their marker window may cover only part of a provider UTC day and is never treated as full account coverage.",
       };
@@ -197,14 +141,12 @@ function summarizeProspectiveAccountScoped({
   records,
   accountScope,
   officialByDate,
-  planTimeline,
   providerPlanType,
   startAt,
   endAt,
 }) {
   const accumulator = createProspectiveAccountScopedAccumulator({
     accountScope,
-    planTimeline,
     providerPlanType,
     startAt,
     endAt,
@@ -271,7 +213,6 @@ function summarizeEpochs(daily) {
 export function analyzeProviderCrosscheck({
   localScan,
   accountSnapshot,
-  planTimeline = null,
   providerUiObservations = [],
   prospectiveCollectorRecords = [],
   prospectiveCollectorAccumulator = null,
@@ -291,7 +232,7 @@ export function analyzeProviderCrosscheck({
     const local = localByDate.get(date);
     const localTokens = local?.totalTokens ?? 0;
     const officialTokens = Number.isFinite(officialByDate.get(date)) ? officialByDate.get(date) : null;
-    const plan = dailyPlanContext(planTimeline, accountScope.scopeId, date, providerPlanType);
+    const plan = dailyPlanContext(providerPlanType);
     return {
       date,
       localTokens,
@@ -352,7 +293,6 @@ export function analyzeProviderCrosscheck({
       records: prospectiveCollectorRecords,
       accountScope,
       officialByDate,
-      planTimeline,
       providerPlanType,
       startAt: localScan.startAt,
       endAt: localScan.endAt,
@@ -417,7 +357,6 @@ export function analyzeProviderCrosscheck({
       localCollectionStart: localScan.startAt,
       localCollectionEnd: localScan.endAt,
       providerAccountCapturedAt: accountSnapshot?.capturedAt ?? null,
-      unresolvedPlanEpisodes: planTimeline?.unresolvedEpisodes?.length ?? 0,
       policyEvents: policyEpochsInRange(localScan.startAt, localScan.endAt),
       officialBucketGapDates: daily.filter((row) => row.officialTokens === null).map((row) => row.date),
     },
@@ -426,7 +365,7 @@ export function analyzeProviderCrosscheck({
       "Official daily token buckets are account-level and do not allocate ChatGPT Work, Codex cloud, desktop, automation, or subagent activity.",
       "Historical local rollouts do not carry a provider account subject, so account switching cannot be reconstructed retroactively.",
       "Provider UI turn totals and local request-like token events use different denominators and are not compared as equal units.",
-      "The unresolved $100 plan episode is retained as ambiguity until its dates and account are known.",
+      "The provider-reported plan_type names the plan; no separate plan variant is inferred.",
       ...(cacheValidation?.status === "stale_override"
         ? ["The local-history cache failed source-freshness validation and was included only because an explicit stale override was requested."]
         : []),

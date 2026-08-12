@@ -27,7 +27,6 @@ function median(values) {
 function exactGroupKey(transition) {
   return [
     transition.accountScopeId ?? "unattributed",
-    transition.planVariant ?? "unknown",
     transition.provider,
     transition.planType,
     transition.limitId,
@@ -121,7 +120,6 @@ function summarizeExactGroup(transitions) {
   const relativePairWidth = central80 && median(pairs.standard) > 0 ? (central80.upper - central80.lower) / median(pairs.standard) : null;
   return {
     accountScopeId: first.accountScopeId ?? "unattributed",
-    planVariant: first.planVariant ?? "unknown",
     provider: first.provider,
     planType: first.planType,
     limitId: first.limitId,
@@ -154,7 +152,7 @@ function summarizeExactGroup(transitions) {
 function selectDuplicateResetGroups(groups) {
   const classifications = new Map();
   for (const group of groups) {
-    const key = [group.accountScopeId, group.planVariant, group.provider, group.planType, group.limitId, group.windowDurationMins].join("|");
+    const key = [group.accountScopeId, group.provider, group.planType, group.limitId, group.windowDurationMins].join("|");
     const list = classifications.get(key) ?? [];
     list.push(group);
     classifications.set(key, list);
@@ -200,7 +198,7 @@ export function analyzeWeeklyLimitHistory(dataset) {
     .sort((left, right) => left.firstObservedAt.localeCompare(right.firstObservedAt) || left.resetsAt - right.resetsAt);
   const usablePartitions = new Map();
   for (const group of allUsable) {
-    const key = [group.accountScopeId, group.planVariant, group.provider, group.planType, group.limitId, group.windowDurationMins].join("|");
+    const key = [group.accountScopeId, group.provider, group.planType, group.limitId, group.windowDurationMins].join("|");
     const values = usablePartitions.get(key) ?? [];
     values.push(group);
     usablePartitions.set(key, values);
@@ -209,7 +207,6 @@ export function analyzeWeeklyLimitHistory(dataset) {
   const usable = crossPartitionHeadlineSuppressed ? [] : allUsable;
   const partitionSummaries = [...usablePartitions.values()].map((groups) => ({
     accountScopeId: groups[0].accountScopeId,
-    planVariant: groups[0].planVariant,
     provider: groups[0].provider,
     planType: groups[0].planType,
     limitId: groups[0].limitId,

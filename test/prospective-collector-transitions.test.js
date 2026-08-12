@@ -195,7 +195,6 @@ test("builds deterministic account-local adjacent transitions with marginal usag
   assert.equal(Object.hasOwn(first.transitions[0], "localOnly"), false);
   assert.equal(Object.hasOwn(first.transitions[0], "schemaVersion"), false);
   assert.equal(first.transitions[0].accountScopeId, ACCOUNT_A);
-  assert.equal(first.transitions[0].planVariant, "unknown");
   assert.equal(first.transitions[0].slot, "duration_led");
   assert.equal(first.transitions[0].marginalUsageEventCount, 1);
   assert.equal(first.transitions[0].marginalComponents.input_uncached_tokens, 20);

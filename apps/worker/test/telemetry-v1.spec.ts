@@ -606,6 +606,41 @@ describe("telemetry-contribution-v1.0 incremental chunks", () => {
     expect(journal?.total).toBe(0);
   });
 
+  it("admits unreviewed model and provider identities but still enforces token shape", async () => {
+    const participant = await enrollTelemetry();
+    const device = await pairDevice(participant);
+
+    // Neither identity is in any server-side registry. A closed enum here was
+    // a stale copy of the client's registry that silently withheld real usage,
+    // so admission depends on shape alone; pricing decides recognition later.
+    const widened = await usageChunk("2026-08-01", 0, 1, [
+      usageEvent("2026-08-01", "e", {
+        modelId: "nova-9-preview",
+        provider: "unknown",
+      }),
+    ]);
+    const accepted = await uploadChunk(device, widened);
+    expect(accepted.status).toBe(202);
+    const stored = await db().prepare(
+      `SELECT provider, model_id FROM telemetry_v1_records
+        WHERE stream = 'usage'`,
+    ).first<{ provider: string; model_id: string }>();
+    expect(stored).toEqual({
+      provider: "unknown",
+      model_id: "nova-9-preview",
+    });
+
+    // Shape is still the wire contract: an over-long identity is refused.
+    const malformed = await usageChunk("2026-08-02", 0, 1, [
+      usageEvent("2026-08-02", "f", { modelId: "n".repeat(65) }),
+    ]);
+    const refused = await uploadChunk(device, malformed);
+    expect(refused.status).toBe(400);
+    await expect(refused.json()).resolves.toMatchObject({
+      error: { code: "CHUNK_INVALID" },
+    });
+  });
+
   it("refuses chunks whose declared consent drifts from the server-recorded grant", async () => {
     const participant = await enrollTelemetry();
     const device = await pairDevice(participant);

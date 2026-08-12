@@ -22,6 +22,11 @@ export const TELEMETRY_PLAN_TYPES: readonly [
   "enterprise",
   "edu",
   "team",
+  "self_serve_business_prolite",
+  "self_serve_business_usage_based",
+  "ent26",
+  "enterprise_cbp_automation",
+  "enterprise_cbp_usage_based",
   "unknown",
 ];
 export type TelemetryPlanType = typeof TELEMETRY_PLAN_TYPES[number];

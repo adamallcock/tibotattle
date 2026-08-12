@@ -43,10 +43,6 @@ function isKnownAccount(value) {
   return typeof value === "string" && value.length > 0 && value !== "unattributed" && value !== "unknown";
 }
 
-function isKnownPlan(value) {
-  return typeof value === "string" && value.length > 0 && value !== "unknown";
-}
-
 function resetClusters(groups, toleranceSeconds = RESET_JITTER_TOLERANCE_SECONDS) {
   const clusters = [];
   for (const group of [...groups].sort((left, right) => right.snapshotCount - left.snapshotCount || left.resetsAt - right.resetsAt)) {
@@ -143,7 +139,6 @@ export function classifyMonitoringInterval(row, {
     cadence,
     speedCoverage,
     accountScope: isKnownAccount(row.accountScopeId) ? "known" : "unknown",
-    planVariant: isKnownPlan(row.planVariant) ? "known" : "unknown",
     localCoverage: coverageFraction === 1 ? "full_elapsed_window" : coverageFraction === null ? "unknown" : "partial",
     pricing: pricingWarnings.length === 0 ? "complete" : "warning",
     attribution: attributionWarnings.length === 0 ? "complete" : "warning",
@@ -360,7 +355,6 @@ export function analyzeMonitoringQuality({
     && row.planType === dominantGroup?.planType) ?? null;
   const metadata = {
     accountKnownIntervalFraction: ratio(intervals.filter((row) => isKnownAccount(row.accountScopeId)).length, intervalCount),
-    planKnownIntervalFraction: ratio(intervals.filter((row) => isKnownPlan(row.planVariant)).length, intervalCount),
     knownSpeedEventFraction: ratio(knownSpeedEvents, knownSpeedEvents + unknownSpeedEvents),
     providerSnapshotAgeKnownIntervalFraction: ratio(intervals.filter((row) => Number.isFinite(row.snapshot?.providerSnapshotAgeMs)).length, intervalCount),
     controlledIntervalFraction: ratio(intervals.filter((row) => row.controlledState === "controlled").length, intervalCount),
@@ -414,12 +408,12 @@ export function analyzeMonitoringQuality({
       "Use a tolerance-bounded canonical reset identity only for families classified fixed-with-jitter; never chain-merge moving reset timestamps.",
     ));
   }
-  if ((metadata.accountKnownIntervalFraction ?? 0) < 0.95 || (metadata.planKnownIntervalFraction ?? 0) < 0.95) {
+  if ((metadata.accountKnownIntervalFraction ?? 0) < 0.95) {
     opportunities.push(opportunity(
       "P0",
-      "prospective_account_plan_join",
-      "Make account and plan scope a hard prospective coverage gate",
-      `${round((metadata.accountKnownIntervalFraction ?? 0) * 100, 1)}% of dominant historical intervals know the account and ${round((metadata.planKnownIntervalFraction ?? 0) * 100, 1)}% know the specific plan variant.`,
+      "prospective_account_join",
+      "Make account scope a hard prospective coverage gate",
+      `${round((metadata.accountKnownIntervalFraction ?? 0) * 100, 1)}% of dominant historical intervals know the account.`,
       "Refresh the account marker on collector start and after switches; report unscoped time as a coverage gap rather than pooling it.",
     ));
   }
@@ -540,7 +534,7 @@ export function renderMonitoringQualityReport(report) {
     "",
     "## Observability findings",
     "",
-    `- Account-known intervals: ${percent(report.metadata.accountKnownIntervalFraction)}; specific-plan-known intervals: ${percent(report.metadata.planKnownIntervalFraction)}.`,
+    `- Account-known intervals: ${percent(report.metadata.accountKnownIntervalFraction)}.`,
     `- Known Standard/Fast usage events: ${percent(report.metadata.knownSpeedEventFraction)}.`,
     `- Intervals with known provider snapshot age: ${percent(report.metadata.providerSnapshotAgeKnownIntervalFraction)}.`,
     `- Flat integer-display intervals: ${percent(report.quantization.flatIntervalFraction)}; regressions: ${report.quantization.regressionIntervals}; skipped values: ${report.quantization.skippedValueIntervals}.`,

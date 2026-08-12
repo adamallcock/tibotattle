@@ -454,15 +454,6 @@ test("doctor, register, capture, and collector CLI paths share the injected prod
     assert.equal(lines.join("\n").includes(secret.toString("base64url")), false);
 
     lines.length = 0;
-    const timeline = join(root, "timeline.json");
-    await run([
-      "register-account", "--alias", "primary", "--default-plan", "pro-20x", "--plan-timeline", timeline,
-    ], dependencies);
-    const timelineText = await readFile(timeline, "utf8");
-    assert.equal(timelineText.includes("private.owner"), false);
-    assert.equal(timelineText.includes(secret.toString("base64url")), false);
-
-    lines.length = 0;
     let capturedScope;
     await run(["capture", "--data-file", join(root, "capture.jsonl")], {
       ...dependencies,
@@ -487,8 +478,8 @@ test("doctor, register, capture, and collector CLI paths share the injected prod
       },
     });
     assert.deepEqual(await collectorLoader(), secret);
-    assert.equal(selections, 4);
-    assert.ok(credentialLoads >= 4);
+    assert.equal(selections, 3);
+    assert.ok(credentialLoads >= 3);
   } finally {
     console.log = originalLog;
     await rm(root, { recursive: true, force: true });

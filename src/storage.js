@@ -89,10 +89,6 @@ export function defaultWeeklyHistoryReportFile(endAt) {
   return resolve(process.cwd(), ".usage-monitor", `${date}-weekly-limit-history-v0.1.md`);
 }
 
-export function defaultPlanTimelineFile() {
-  return resolve(process.cwd(), ".usage-monitor", "account-plan-timeline-v0.1.json");
-}
-
 export function defaultProviderUiObservationFile() {
   return resolve(process.cwd(), ".usage-monitor", "provider-ui-observations-v0.1.jsonl");
 }

@@ -4,7 +4,7 @@ import {
   ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION,
 } from "./constants";
 import { ApiError } from "./errors";
-import { TELEMETRY_MODEL_IDS, TELEMETRY_PLAN_TYPES } from "./telemetry-validation";
+import { TELEMETRY_PLAN_TYPES } from "./telemetry-validation";
 import type { TelemetryEnvelope } from "./telemetry-validation";
 
 /**
@@ -111,8 +111,13 @@ const OCCURRENCE_ID = /^[A-Za-z0-9._:-]{8,128}$/u;
 const SESSION_UUID = /^[A-Za-z0-9._:-]{8,128}$/u;
 const TOOL_CLASS_KEY = /^[a-zA-Z][A-Za-z0-9]{0,31}$/u;
 const MAX_TOKEN_COMPONENT = 1_000_000_000_000;
-const PROVIDERS = new Set(["openai_codex", "anthropic_claude_code"]);
-const MODEL_IDS = new Set<string>(TELEMETRY_MODEL_IDS);
+// `provider` and `modelId` are bounded tokens rather than closed sets, like
+// the seven sibling enums already are on this record. Holding a copy of the
+// client's model registry here made the wire contract a second source of
+// truth that drifted behind it and rejected real usage; vendors also ship new
+// identities faster than a coordinated Worker deploy can admit them. Shape,
+// length and character class are still enforced — an unrecognized identity is
+// stored and left unpriced by server-pricing, never invented.
 const PLAN_TYPES = new Set<string>(TELEMETRY_PLAN_TYPES);
 
 function chunkInvalid(): never {
@@ -211,8 +216,8 @@ function parseUsageEvent(value: unknown): TelemetryV1UsageEvent {
       || !isCanonicalInstant(record.eventTime)
       || typeof record.sessionUuid !== "string"
       || !SESSION_UUID.test(record.sessionUuid)
-      || !PROVIDERS.has(record.provider)
-      || !MODEL_IDS.has(record.modelId)
+      || !isBoundedToken(record.provider)
+      || !isBoundedToken(record.modelId)
       || !isBoundedToken(record.speedMode)
       || !isBoundedToken(record.apiServiceTier)
       || !isBoundedToken(record.surface)
@@ -243,7 +248,7 @@ function parseQuotaObservation(value: unknown): TelemetryV1QuotaObservation {
       || typeof record.observationId !== "string"
       || !OCCURRENCE_ID.test(record.observationId)
       || !isCanonicalInstant(record.observedTime)
-      || !PROVIDERS.has(record.provider)
+      || !isBoundedToken(record.provider)
       || !PLAN_TYPES.has(record.planType)
       || !isBoundedToken(record.planVariant)
       || !isBoundedToken(record.limitId)
@@ -271,7 +276,7 @@ function parseSessionDimension(value: unknown): TelemetryV1SessionDimension {
       || typeof record.sessionUuid !== "string"
       || !SESSION_UUID.test(record.sessionUuid)
       || !isCanonicalInstant(record.firstEventTime)
-      || !PROVIDERS.has(record.provider)
+      || !isBoundedToken(record.provider)
       || typeof record.toolClassCounts !== "object"
       || record.toolClassCounts === null
       || Array.isArray(record.toolClassCounts)) {

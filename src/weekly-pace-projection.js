@@ -75,9 +75,10 @@ function normalizedSnapshot(record, window) {
     accountTrackId,
     provider: PROVIDER,
     planType: safePlanType(window.planType),
-    // This forecast is confined to one current reset. It does not infer a
-    // plan tier or policy regime across earlier resets that the ledger cannot
-    // prove.
+    // The shared quota-analysis pace contract requires a non-empty planVariant
+    // track field (validateSnapshot / plainExact), so it stays on the wire even
+    // though the local plan cohort is now carried by planType. This forecast is
+    // confined to one current reset and never infers a plan tier across resets.
     planVariant: "current_reset_unobserved",
     limitId: LIMIT_ID,
     slot: window.slot,

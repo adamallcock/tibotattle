@@ -32,7 +32,6 @@ import {
   renderMonitoringQualityReport,
   renderWeeklyCalibrationReport,
 } from "./reporting/index.js";
-import { upsertPlanProfile, validatePlanTimeline } from "./plan-timeline.js";
 import { createActivityMarker } from "./activity-markers.js";
 import {
   inspectParticipantSecret,
@@ -133,7 +132,6 @@ import {
   defaultToolMechanismReportFile,
   defaultWeeklyHistoryFile,
   defaultWeeklyHistoryReportFile,
-  defaultPlanTimelineFile,
   defaultProviderUiObservationFile,
   defaultProviderCrosscheckFile,
   defaultProviderCrosscheckReportFile,
@@ -183,13 +181,12 @@ const {
 function usage() {
   console.log(`Usage:
   usage-monitor doctor
-  usage-monitor register-account --alias LOCAL_ALIAS --default-plan PLAN_VARIANT [--plan-timeline PATH]
-  usage-monitor capture [--label TEXT] [--controlled] [--offline] [--plan-timeline PATH] [--data-file PATH]
+  usage-monitor capture [--label TEXT] [--controlled] [--offline] [--data-file PATH]
   usage-monitor report [--json] [--data-file PATH] [--corrections PATH]
   usage-monitor transitions --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--offline] [--compact] [--window-minutes N] [--output PATH] [--audit-file PATH]
   usage-monitor infer [--input PATH] [--output PATH] [--report-file PATH]
   usage-monitor history [--input PATH] [--output PATH] [--report-file PATH]
-  usage-monitor crosscheck --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--input LOCAL_HISTORY_PATH] [--allow-stale-cache] [--offline] [--plan-timeline PATH] [--provider-ui PATH] [--output PATH] [--report-file PATH]
+  usage-monitor crosscheck --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--input LOCAL_HISTORY_PATH] [--allow-stale-cache] [--offline] [--provider-ui PATH] [--output PATH] [--report-file PATH]
   usage-monitor quality [--input TRANSITIONS_PATH] [--collector-file PATH] [--output PATH] [--report-file PATH]
   usage-monitor calibrate-weekly [--input TRANSITIONS_PATH] [--output PATH] [--report-file PATH]
   usage-monitor mark-activity --surface SURFACE --state start|end|pulse [--experiment-id ID] [--activity-file PATH]
@@ -273,10 +270,7 @@ export function parseArgs(argv) {
     executeLive: false,
     compact: false,
     windowDurationMins: null,
-    planTimelineFile: null,
     providerUiFile: null,
-    accountAlias: null,
-    defaultPlanVariant: null,
     allowStaleCache: false,
     collectorFile: null,
     claudeStatus: false,
@@ -348,7 +342,6 @@ export function parseArgs(argv) {
     else if (arg === "--experiments") result.experimentsFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--observations") result.observationsFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--corrections") result.correctionsFile = resolve(readOptionValue(argv, index++, arg));
-    else if (arg === "--plan-timeline") result.planTimelineFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--provider-ui") result.providerUiFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--collector-file") result.collectorFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--claude-state-dir") result.claudeStateDirectory = resolve(readOptionValue(argv, index++, arg));
@@ -371,8 +364,6 @@ export function parseArgs(argv) {
     else if (arg === "--interval-seconds") result.intervalSeconds = readNonNegativeNumber(argv, index++, arg);
     else if (arg === "--max-uploads-per-pass") result.maximumUploadsPerPass = readNonNegativeNumber(argv, index++, arg);
     else if (arg === "--max-upload-bytes-per-pass") result.maximumUploadBytesPerPass = readNonNegativeNumber(argv, index++, arg);
-    else if (arg === "--alias") result.accountAlias = readOptionValue(argv, index++, arg);
-    else if (arg === "--default-plan") result.defaultPlanVariant = readOptionValue(argv, index++, arg);
     else throw new Error(`Unknown argument: ${arg}`);
   }
   if (result.claudeStatus && result.claudeStateDirectory !== null) {
@@ -1137,40 +1128,10 @@ export async function run(
     console.log("RunCost: installed");
     return;
   }
-  if (args.command === "register-account") {
-    if (!args.accountAlias || !args.defaultPlanVariant) {
-      throw new Error("register-account requires --alias and --default-plan");
-    }
-    const capturedAt = new Date().toISOString();
-    const snapshot = await readSanitizedAccountSnapshot(capturedAt);
-    if (snapshot.accountScope.status !== "available") {
-      throw new Error(`Cannot register account scope: ${snapshot.accountScope.reason}`);
-    }
-    const timelineFile = args.planTimelineFile ?? defaultPlanTimelineFile();
-    const existingTimeline = await readJsonIfExists(timelineFile, {
-      schemaVersion: "0.1",
-      profiles: [],
-      unresolvedEpisodes: [],
-    });
-    validatePlanTimeline(existingTimeline);
-    const updatedTimeline = upsertPlanProfile({
-      timeline: existingTimeline,
-      scopeId: snapshot.accountScope.scopeId,
-      alias: args.accountAlias,
-      defaultPlanVariant: args.defaultPlanVariant,
-      effectiveAt: capturedAt,
-    });
-    await writeJsonOwnerOnlyAtomic(timelineFile, updatedTimeline);
-    console.log(`Registered current pseudonymous account as ${args.accountAlias} from ${capturedAt}.`);
-    console.log(`Plan timeline: ${timelineFile}`);
-    return;
-  }
   if (args.command === "capture") {
-    const planTimeline = await readJsonIfExists(args.planTimelineFile ?? defaultPlanTimelineFile(), null);
     const selection = selectedAccountObservation();
     const observation = await captureObservation({
       ...args,
-      planTimeline,
       sanitizeSnapshot: (snapshot, capturedAt) => sanitizeAccountSnapshot(snapshot, capturedAt, {
         loadAccountObservationSecret: selection.loadAccountObservationSecret,
       }),
@@ -1311,10 +1272,9 @@ export async function run(
         })
       : scanAndPriceCodexLogs({ startAt: args.startAt, endAt: args.endAt, offline: args.offline })
           .then((localScan) => ({ localScan, cacheValidation: { status: "fresh_scan" } }));
-    const [localScanResult, accountSnapshot, planTimeline, providerUiObservations] = await Promise.all([
+    const [localScanResult, accountSnapshot, providerUiObservations] = await Promise.all([
       localScanPromise,
       readSanitizedAccountSnapshot(capturedAt),
-      readJsonIfExists(args.planTimelineFile ?? defaultPlanTimelineFile(), null),
       readObservations(args.providerUiFile ?? defaultProviderUiObservationFile()),
     ]);
     const { localScan, cacheValidation } = localScanResult;
@@ -1323,7 +1283,6 @@ export async function run(
     }
     const prospectiveCollectorAccumulator = createProspectiveAccountScopedAccumulator({
       accountScope: accountSnapshot?.accountScope,
-      planTimeline,
       providerPlanType: accountSnapshot?.canonical?.planType
         ?? accountSnapshot?.accountScope?.planType
         ?? "unknown",
@@ -1339,7 +1298,6 @@ export async function run(
     const report = analyzeProviderCrosscheck({
       localScan,
       accountSnapshot,
-      planTimeline,
       providerUiObservations,
       prospectiveCollectorAccumulator,
       cacheValidation,

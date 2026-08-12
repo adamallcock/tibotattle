@@ -57,7 +57,6 @@ function makeRng(seed) {
 function resetGroupKey(transition) {
   return [
     transition.accountScopeId ?? "unattributed",
-    transition.planVariant ?? "unknown",
     transition.provider,
     transition.planType,
     transition.limitId,
@@ -69,7 +68,6 @@ function resetGroupKey(transition) {
 function seriesKey(transition) {
   return [
     transition.accountScopeId ?? "unattributed",
-    transition.planVariant ?? "unknown",
     transition.provider,
     transition.planType,
     transition.limitId,
@@ -448,7 +446,6 @@ function inferSeries(transitions) {
   return {
     classification: {
       accountScopeId: first.accountScopeId ?? "unattributed",
-      planVariant: first.planVariant ?? "unknown",
       provider: first.provider,
       planType: first.planType,
       limitId: first.limitId,

@@ -15,7 +15,7 @@ const SAFE_TRANSITION_KEYS = new Set([
   "lastPriorCumulativeApiPricedUsd", "lastPriorCumulativeQuotaWeightedLowerUsd",
   "lastPriorCumulativeQuotaWeightedUpperUsd", "lastPriorObservedAt", "limitId",
   "marginalApiPricedUsd", "marginalComponents", "marginalUsageEventCount", "modelMix",
-  "modelFingerprint", "nextUsedPercent", "parserVersion", "planType", "planVariant", "priceCardIds",
+  "modelFingerprint", "nextUsedPercent", "parserVersion", "planType", "priceCardIds",
   "priorUsedPercent", "provider", "providerSummary", "quality", "resetIdentity", "resetsAt", "sessionPseudonym",
   "slot", "snapshot", "tierUsageEventCounts", "windowDurationMins",
 ]);
@@ -146,7 +146,6 @@ function valueKey(value) {
 
 function knownScope(row) {
   return Boolean(row.accountScopeId && row.accountScopeId !== "unattributed")
-    && Boolean(row.planVariant && row.planVariant !== "unknown")
     && Boolean(row.planType && row.planType !== "unknown");
 }
 
@@ -156,7 +155,7 @@ function knownScope(row) {
 // resetsAt as the instance facet.
 function resetPartition(row) {
   return [
-    row.accountScopeId ?? "unattributed", row.planVariant ?? "unknown", row.provider ?? "unknown",
+    row.accountScopeId ?? "unattributed", row.provider ?? "unknown",
     row.planType ?? "unknown", row.limitId ?? "unknown",
     row.windowDurationMins ?? "unknown", row.resetsAt ?? "unknown",
   ].join("\u001f");
@@ -164,7 +163,7 @@ function resetPartition(row) {
 
 function basePartition(row) {
   return [
-    row.accountScopeId ?? "unattributed", row.planVariant ?? "unknown", row.provider ?? "unknown",
+    row.accountScopeId ?? "unattributed", row.provider ?? "unknown",
     row.planType ?? "unknown", row.limitId ?? "unknown",
     row.windowDurationMins ?? "unknown",
   ].join("\u001f");

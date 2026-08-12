@@ -137,7 +137,7 @@ export function analyzeObservations(observations) {
     const accountScopeId = observation.accountScope?.status === "available" && typeof observation.accountScope.scopeId === "string"
       ? observation.accountScope.scopeId
       : "unattributed";
-    const planVariant = typeof observation.planVariant === "string" ? observation.planVariant : "unknown";
+    const planType = typeof observation.planType === "string" ? observation.planType : "unknown";
     for (const window of observation.windows ?? []) {
       // Recompute the partition from the window's own fields instead of the
       // stored identity string: older captures embedded the provider's UI
@@ -145,7 +145,7 @@ export function analyzeObservations(observations) {
       // primary around 2026-07-06. Identity is (limit, duration, resetsAt).
       const partitionKey = [
         accountScopeId,
-        planVariant,
+        planType,
         window.limitId,
         window.windowDurationMins,
         window.resetsAt,
@@ -153,7 +153,7 @@ export function analyzeObservations(observations) {
       const group = groups.get(partitionKey) ?? {
         identity: window.identity,
         accountScopeId,
-        planVariant,
+        planType,
         limitId: window.limitId,
         slot: window.slot,
         windowDurationMins: window.windowDurationMins,
@@ -189,7 +189,7 @@ export function analyzeObservations(observations) {
     return {
       identity: group.identity,
       accountScopeId: group.accountScopeId,
-      planVariant: group.planVariant,
+      planType: group.planType,
       limitId: group.limitId,
       slot: group.slot,
       windowDurationMins: group.windowDurationMins,

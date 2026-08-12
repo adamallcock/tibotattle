@@ -7,6 +7,7 @@ import { handleRequest } from "../src/index";
 import {
   collectCommunityAllowanceFits,
   summarizeCommunityAllowanceDay,
+  summarizeCommunityCapacityByPlanType,
 } from "../src/community-allowance";
 import type { CommunityAllowanceFit } from "../src/community-allowance";
 import { accountScopedQuotaAnalysisV1 } from "../src/quota-analysis-v1";
@@ -157,6 +158,7 @@ function quotaSnapshot(
   observedTime: string,
   usedPercent: number,
   planVariant = "pro-20x",
+  planType = "pro",
 ): Record<string, unknown> {
   return {
     schemaVersion: "quota-snapshot-v0.2",
@@ -164,7 +166,7 @@ function quotaSnapshot(
     observedTime,
     receivedTime: new Date(Date.parse(observedTime) + 1_000).toISOString(),
     provider: "openai_codex",
-    planType: "pro",
+    planType,
     planVariant,
     limitId: "codex",
     slot: "seven_day",
@@ -184,7 +186,10 @@ function quotaSnapshot(
  * snapshots (nine boundaries, 40pp displayed span) with a fully priced usage
  * event between each pair, all within one reset and one complete dataset.
  */
-function calibratableContribution(planVariant = "pro-20x"): Record<string, unknown> {
+function calibratableContribution(
+  planVariant = "pro-20x",
+  planType = "pro",
+): Record<string, unknown> {
   const startMs = Date.parse("2026-07-25T12:00:00.000Z");
   const quotaSnapshots = [];
   const usageEvents = [];
@@ -194,6 +199,7 @@ function calibratableContribution(planVariant = "pro-20x"): Record<string, unkno
       new Date(startMs + index * 5 * 60_000).toISOString(),
       10 + index * 5,
       planVariant,
+      planType,
     ));
     if (index < 8) {
       usageEvents.push(usageEvent(
@@ -351,6 +357,7 @@ function fit(
 ): CommunityAllowanceFit {
   return {
     participantId: "participant-a",
+    planType: "pro",
     capacityNanousd: 100_000_000_000,
     lastObservedAt: "2026-07-25T12:40:00.000Z",
     ...overrides,
@@ -519,15 +526,50 @@ describe("community allowance in the daily aggregate", () => {
 
   it("excludes fits from other plan cohorts: the series is one plan, not a pool", async () => {
     const participant = await enrolledParticipant();
-    // The identical calibratable series, but observed on a pro-5x track: the
-    // fit gates pass, yet the published Pro (20x) series must not absorb a
-    // smaller plan's allowance into its median.
+    // The identical calibratable series, but observed on a ProLite (5x) plan:
+    // the fit gates pass, yet the published Pro (20x) series must not absorb a
+    // smaller plan's allowance into its median. The cohort is pinned by
+    // plan_type, so plan_type "prolite" is excluded regardless of the variant
+    // tag (which real uploads always carry as "unknown").
     const accepted = await upload(
       participant,
-      calibratableContribution("pro-5x"),
+      calibratableContribution("unknown", "prolite"),
     );
     expect(accepted.status, await accepted.clone().text()).toBe(202);
-    expect(await collectCommunityAllowanceFits(db())).toHaveLength(0);
+    // The collector gathers all plan_types (for the capacity monitor), but the
+    // published Pro (20x) band filters to plan_type "pro" in the summarizer, so
+    // a ProLite (5x) series contributes zero fits to the band.
+    const fits = await collectCommunityAllowanceFits(db());
+    expect(summarizeCommunityAllowanceDay(fits, "2026-07-27").fitCount).toBe(0);
+  });
+
+  it("summarizes median capacity per plan_type for the multiplier-ratio monitor", async () => {
+    // Two participants on different plans; the collector gathers both, and the
+    // additive capacity monitor buckets by plan_type so pro:prolite:plus ratios
+    // can be watched against the stated multipliers. The published band still
+    // sees only the pro cohort.
+    const proParticipant = await enrolledParticipant();
+    expect((await upload(
+      proParticipant,
+      calibratableContribution("unknown", "pro"),
+    )).status).toBe(202);
+    const proliteParticipant = await enrolledParticipant();
+    expect((await upload(
+      proliteParticipant,
+      calibratableContribution("unknown", "prolite"),
+    )).status).toBe(202);
+
+    const fits = await collectCommunityAllowanceFits(db());
+    const capacity = summarizeCommunityCapacityByPlanType(fits, "2026-07-27");
+    expect(Object.keys(capacity).sort()).toEqual(["pro", "prolite"]);
+    expect(capacity.pro!.fitCount).toBeGreaterThan(0);
+    expect(capacity.pro!.medianCapacityNanousd).toBeGreaterThan(0);
+    expect(capacity.prolite!.fitCount).toBeGreaterThan(0);
+    expect(capacity.prolite!.medianCapacityNanousd).toBeGreaterThan(0);
+    // The published band excludes the ProLite cohort.
+    const band = summarizeCommunityAllowanceDay(fits, "2026-07-27");
+    expect(band.planType).toBe("pro");
+    expect(band.fitCount).toBe(1);
   });
 
   it("re-enqueues published days whose allowance drifts when late v0.2 fits arrive", async () => {
@@ -838,7 +880,9 @@ async function seedV1CalibratableReset(options: {
       observed_at: new Date(startMs + index * 5 * 60_000).toISOString(),
       provider: "openai_codex",
       plan_type: "pro",
-      plan_variant: "pro-20x",
+      // Real v1 uploads always carry the variant as "unknown" (the client
+      // strips it); the band must draw from this shape, cohorting by plan_type.
+      plan_variant: "unknown",
       limit_id: "codex",
       slot: "seven_day",
       used_percent: 10 + index * options.stepPp,

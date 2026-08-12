@@ -70,7 +70,6 @@ function resetPartitionKey(interval) {
   // series. Identity is (limit, duration) with resetsAt as instance facet.
   return [
     interval.accountScopeId ?? "unattributed",
-    interval.planVariant ?? "unknown",
     interval.provider,
     interval.planType,
     interval.limitId,
@@ -129,7 +128,6 @@ function mainWeeklyReset(intervals) {
 
 function sameReset(row, selected, resetsAtValues = null) {
   return (row.accountScopeId ?? "unattributed") === (selected.accountScopeId ?? "unattributed")
-    && (row.planVariant ?? "unknown") === (selected.planVariant ?? "unknown")
     && row.provider === selected.provider
     && row.planType === selected.planType
     && row.limitId === selected.limitId

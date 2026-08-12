@@ -2,6 +2,7 @@ import { canonicalJson } from "./canonical-json";
 import {
   collectCommunityAllowanceFits,
   summarizeCommunityAllowanceDay,
+  summarizeCommunityCapacityByPlanType,
 } from "./community-allowance";
 import type { CommunityAllowanceFit } from "./community-allowance";
 import { sha256Hex } from "./crypto";
@@ -282,10 +283,13 @@ async function buildCommunityDailyAggregate(
   // The allowance block is additive on schema v1.0: the site normalizer
   // treats a missing or invalid block as per-day-absent, so older published
   // revisions without it stay renderable and old clients ignore it entirely.
-  const allowance = summarizeCommunityAllowanceDay(
-    await allowanceFitsForEpoch(buildEpoch),
-    day,
-  );
+  const fits = await allowanceFitsForEpoch(buildEpoch);
+  const allowance = summarizeCommunityAllowanceDay(fits, day);
+  // Additive per-plan_type capacity monitor: median observed capacity per plan
+  // over the same window, so the pro:prolite:plus ratios can be watched against
+  // the stated multipliers (pro = 20x, prolite = 5x). Rides the same fits and
+  // the same drift rebuild; read-side observability only, never gates the band.
+  const capacityByPlanType = summarizeCommunityCapacityByPlanType(fits, day);
   const aggregateId = `community-daily:${day}:r${revision}`;
   const releasedAt = new Date(scheduledTime).toISOString();
   const cellRows = cells.results.slice(0, MAX_DAILY_AGGREGATE_CELLS);
@@ -305,6 +309,7 @@ async function buildCommunityDailyAggregate(
     // explicitly owner-approved for publication; no per-account identifier
     // exists anywhere in this block.
     allowance,
+    capacityByPlanType,
     totals: {
       contributingParticipants: Number(totals?.contributing_participants ?? 0),
       contributingDevices: Number(totals?.contributing_devices ?? 0),

@@ -21,7 +21,6 @@ const july13Reset = 1_784_487_650;
 function seriesKey(row) {
   return [
     row.accountScopeId ?? "unattributed",
-    row.planVariant ?? "unknown",
     row.provider,
     row.planType,
     row.limitId,

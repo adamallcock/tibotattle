@@ -5,7 +5,6 @@ import {
 } from "./providers/codex/account.js";
 import { runCcusageCodexDaily, summarizeCcusage } from "./ccusage.js";
 import { scanAndPriceCodexLogs } from "./codex-local-usage-analysis.js";
-import { resolvePlanContext } from "./plan-timeline.js";
 
 function isoDate(epochMs) {
   return new Date(epochMs).toISOString().slice(0, 10);
@@ -71,18 +70,11 @@ export async function captureCodexObservation({
   runCcusage = runCcusageCodexDaily,
   summarizeCcusageReport = summarizeCcusage,
   scanLocal = scanAndPriceCodexLogs,
-  planTimeline = null,
 } = {}) {
   const startedAtMs = clock();
   const capturedAt = new Date(startedAtMs).toISOString();
   const rawSnapshot = await readSnapshot();
   const account = await sanitizeSnapshot(rawSnapshot, capturedAt);
-  const planContext = resolvePlanContext({
-    timeline: planTimeline,
-    scopeId: account.accountScope?.scopeId ?? null,
-    at: capturedAt,
-    providerPlanType: account.canonical.planType,
-  });
   const windows = [];
 
   for (const window of canonicalWindows(account.canonical)) {
@@ -142,8 +134,6 @@ export async function captureCodexObservation({
     offlinePricing: offline,
     accountScope: account.accountScope,
     planType: account.canonical.planType,
-    planVariant: planContext.planVariant,
-    planContextSource: planContext.source,
     canonicalLimitId: account.canonical.limitId,
     availableLimits: account.byLimitId,
     officialUsageSummary: account.officialUsageSummary,

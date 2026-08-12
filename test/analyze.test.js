@@ -66,13 +66,13 @@ test("observations sharing a reset are partitioned by account scope and plan var
     }],
   };
   const result = analyzeObservations([
-    { ...base, accountScope: { status: "available", scopeId: "scope-a" }, planVariant: "pro-20x" },
-    { ...base, accountScope: { status: "available", scopeId: "scope-b" }, planVariant: "pro-5x" },
+    { ...base, accountScope: { status: "available", scopeId: "scope-a" }, planType: "pro" },
+    { ...base, accountScope: { status: "available", scopeId: "scope-b" }, planType: "prolite" },
   ]);
   assert.equal(result.length, 2);
-  assert.deepEqual(result.map((group) => [group.accountScopeId, group.planVariant]), [
-    ["scope-a", "pro-20x"],
-    ["scope-b", "pro-5x"],
+  assert.deepEqual(result.map((group) => [group.accountScopeId, group.planType]), [
+    ["scope-a", "pro"],
+    ["scope-b", "prolite"],
   ]);
 });
 

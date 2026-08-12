@@ -551,7 +551,6 @@ export function buildProspectiveCollectorTransitions(records, { priceUsage } = {
       }
       transitions.push({
         accountScopeId: prior.accountScopeId,
-        planVariant: "unknown",
         provider: prior.window.provider,
         planType: prior.window.planType,
         limitId: prior.window.limitId,

@@ -306,7 +306,6 @@ function makeTransition({
   return {
     parserVersion: PARSER_VERSION,
     accountScopeId: "unattributed",
-    planVariant: "unknown",
     provider: prior.window.provider,
     planType: prior.window.planType,
     limitId: prior.window.limitId,
@@ -391,7 +390,6 @@ function makeSnapshotInterval({
     parserVersion: PARSER_VERSION,
     intervalKind: "adjacent_snapshot_interval",
     accountScopeId: "unattributed",
-    planVariant: "unknown",
     provider: prior.window.provider,
     planType: prior.window.planType,
     limitId: prior.window.limitId,
@@ -492,7 +490,6 @@ function collapseTransitions({ snapshots, usageEvents, toolEvents, scanStartMs, 
     }
     groupSummaries.push({
       accountScopeId: "unattributed",
-      planVariant: "unknown",
       provider: group[0].window.provider,
       planType: group[0].window.planType,
       limitId: group[0].window.limitId,
@@ -872,7 +869,6 @@ async function collapseTransitionsCooperatively({
     }
     groupSummaries.push({
       accountScopeId: "unattributed",
-      planVariant: "unknown",
       provider: group[0].window.provider,
       planType: group[0].window.planType,
       limitId: group[0].window.limitId,

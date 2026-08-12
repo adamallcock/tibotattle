@@ -26,10 +26,13 @@ import { accountScopedQuotaAnalysisV1 } from "./quota-analysis-v1";
  * Plan-cohort discipline, matching the weekly snapshots' cohort keying: an
  * allowance is a property of one plan, so mixing plan cohorts would publish
  * a median of two different products the moment a second cohort contributes.
- * The series is therefore pinned to a single declared cohort — the basis
- * string names it, the block carries `planType`/`planVariant`, and fits from
- * any other cohort never enter the corpus. Widening beyond one cohort means
- * publishing per-cohort blocks under new basis strings, never pooling.
+ * The series is therefore pinned to a single cohort by `plan_type` ALONE —
+ * the plan Codex reports IS the plan (pro = 20x, prolite = 5x); we never
+ * invent a multiplier "variant". `COMMUNITY_ALLOWANCE_BASIS` and the block's
+ * emitted `planVariant` are now FROZEN OPAQUE wire tags, retained byte-for-byte
+ * only for the website's exact-match render gate, NOT cohort selectors.
+ * Widening beyond one cohort means publishing per-cohort blocks under new
+ * basis strings, never pooling.
  */
 
 export const COMMUNITY_ALLOWANCE_BASIS = "seven_day_codex_pro20x_trailing_30d";
@@ -49,12 +52,19 @@ export const COMMUNITY_ALLOWANCE_SPAN_FLOOR_PP = 40;
 const MINIMUM_FITS_FOR_BAND = 3;
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
 const NANOUSD_PER_USD = 1_000_000_000;
-// Bump when the v1 fit-adapter's synthesis or pricing basis changes, so a
-// stale fit cache (keyed partly on this) invalidates without a chunk change.
-const FIT_ADAPTER_VERSION = "v1-fit-1";
+// Bump when the v1 fit-adapter's synthesis, pricing basis, or cohort
+// definition changes, so a stale fit cache (keyed partly on this) invalidates
+// without a chunk change. v1-fit-2: cohort by plan_type alone (dropped the
+// synthesized pro-20x variant pin).
+const FIT_ADAPTER_VERSION = "v1-fit-2";
 
 export interface CommunityAllowanceFit {
   participantId: string;
+  // The Codex plan_type this fit was observed on (pro, prolite, plus, ...).
+  // The published band filters to "pro"; the full set feeds the per-plan_type
+  // capacity monitor. The plan itself is the multiplier (pro = 20x, prolite =
+  // 5x), so no separate variant is needed.
+  planType: string;
   capacityNanousd: number;
   lastObservedAt: string;
 }
@@ -201,10 +211,16 @@ export async function collectCommunityAllowanceFits(
         : await accountScopedQuotaAnalysis(db, row.participant_id)) as AnalysisResult;
       if (analysis.status === "ready" && Array.isArray(analysis.tracks)) {
         for (const track of analysis.tracks) {
-          // Plan-cohort pin: fits from any other cohort are a different
-          // product's allowance and must never enter this corpus (module doc).
-          if (track.continuity?.planType !== COMMUNITY_ALLOWANCE_PLAN_TYPE
-              || track.continuity?.planVariant !== COMMUNITY_ALLOWANCE_PLAN_VARIANT) {
+          // The collector gathers qualifying fits for EVERY plan_type, each
+          // tagged with its plan (the Codex plan IS the plan + multiplier:
+          // pro = 20x, prolite = 5x; the "variant" is not a real distinction —
+          // real v1 uploads carry planVariant "unknown"). The published
+          // allowance band filters to plan_type "pro" in
+          // summarizeCommunityAllowanceDay; the full set also feeds the
+          // per-plan_type capacity monitor. A missing/blank plan_type can seed
+          // no cohort, so it is skipped.
+          const trackPlanType = track.continuity?.planType;
+          if (typeof trackPlanType !== "string" || trackPlanType.length === 0) {
             continue;
           }
           const calibrationTracks = track.calibration?.tracks;
@@ -227,6 +243,7 @@ export async function collectCommunityAllowanceFits(
               }
               participantFits.push({
                 participantId: row.participant_id,
+                planType: trackPlanType,
                 capacityNanousd: reset.capacityNanousd,
                 lastObservedAt: reset.lastObservedAt,
               });
@@ -290,6 +307,8 @@ export function summarizeCommunityAllowanceDay(
   const windowStartMs = windowEndMs
     - COMMUNITY_ALLOWANCE_TRAILING_DAYS * MILLISECONDS_PER_DAY;
   const qualifying = fits.filter((fit) => {
+    // The published band is a single plan cohort — plan_type "pro" (20x).
+    if (fit.planType !== COMMUNITY_ALLOWANCE_PLAN_TYPE) return false;
     const observedMs = Date.parse(fit.lastObservedAt);
     return observedMs > windowStartMs && observedMs <= windowEndMs;
   });
@@ -314,4 +333,57 @@ export function summarizeCommunityAllowanceDay(
       ? { lowerUsd: usd(lower), upperUsd: usd(upper) }
       : null,
   };
+}
+
+export interface CommunityPlanCapacity {
+  medianCapacityNanousd: number;
+  participantCount: number;
+  fitCount: number;
+}
+
+// Keyed by Codex plan_type (pro, prolite, plus, ...). Additive observability
+// block; never gates the published allowance band.
+export type CommunityCapacityByPlanType = Record<string, CommunityPlanCapacity>;
+
+/**
+ * Additive observability: the median observed seven-day capacity per plan_type
+ * over the SAME trailing-30d window and fit gates as the published band. It lets
+ * the pro:prolite:plus capacity ratios be watched at READ time against the
+ * plans' stated multipliers (pro = 20x, prolite = 5x, so pro:prolite ~= 4x).
+ * A sustained divergence flags plan_type mislabeling at the source or an OpenAI
+ * multiplier change — the signal the retired plan-timeline guesswork used to
+ * (badly) approximate. Ratios are never stored (only per-plan medians), so no
+ * multiplier belief is baked into the wire. Keys are sorted so identical inputs
+ * canonicalize identically.
+ */
+export function summarizeCommunityCapacityByPlanType(
+  fits: readonly CommunityAllowanceFit[],
+  day: string,
+): CommunityCapacityByPlanType {
+  const dayStartMs = Date.parse(`${day}T00:00:00.000Z`);
+  if (!Number.isFinite(dayStartMs)) {
+    throw new Error("invalid community allowance day");
+  }
+  const windowEndMs = dayStartMs + MILLISECONDS_PER_DAY;
+  const windowStartMs = windowEndMs
+    - COMMUNITY_ALLOWANCE_TRAILING_DAYS * MILLISECONDS_PER_DAY;
+  const byPlanType = new Map<string, CommunityAllowanceFit[]>();
+  for (const fit of fits) {
+    const observedMs = Date.parse(fit.lastObservedAt);
+    if (!(observedMs > windowStartMs && observedMs <= windowEndMs)) continue;
+    const bucket = byPlanType.get(fit.planType);
+    if (bucket) bucket.push(fit);
+    else byPlanType.set(fit.planType, [fit]);
+  }
+  const result: CommunityCapacityByPlanType = {};
+  for (const planType of [...byPlanType.keys()].sort()) {
+    const bucket = byPlanType.get(planType) ?? [];
+    const median = quantile(bucket.map((fit) => fit.capacityNanousd), 0.5);
+    result[planType] = {
+      medianCapacityNanousd: median === null ? 0 : Math.round(median),
+      participantCount: new Set(bucket.map((fit) => fit.participantId)).size,
+      fitCount: bucket.length,
+    };
+  }
+  return result;
 }

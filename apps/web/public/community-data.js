@@ -280,20 +280,21 @@ export function communityDailyWindow(nowMs = Date.now()) {
 // per-day-absent (`allowance: null`), never `unsupported_schema`. Only the
 // exact published basis is interpreted; a different basis is a different
 // claim this client does not understand and therefore does not render.
-// The basis is pinned to one declared plan cohort — the page's copy names
-// the Codex Pro (20x) plan, so a block claiming any other cohort (or a
-// pooled, cohort-less basis) must not render under that copy.
+// The basis is pinned to one plan cohort by plan_type — the page's copy names
+// the Codex Pro (20x) plan (plan_type "pro", which IS the 20x tier), so a block
+// on any other plan_type (or a pooled, cohort-less basis) must not render under
+// that copy. planVariant is not a cohort key (the plan itself is the multiplier;
+// pro = 20x, prolite = 5x); the basis keeps its legacy "pro20x" spelling as an
+// opaque, exact-matched tag.
 export const COMMUNITY_ALLOWANCE_BASIS = "seven_day_codex_pro20x_trailing_30d";
 export const COMMUNITY_ALLOWANCE_PLAN_TYPE = "pro";
-export const COMMUNITY_ALLOWANCE_PLAN_VARIANT = "pro-20x";
 
 function normalizedDailyAllowance(candidate) {
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
     return null;
   }
   if (candidate.basis !== COMMUNITY_ALLOWANCE_BASIS
-      || candidate.planType !== COMMUNITY_ALLOWANCE_PLAN_TYPE
-      || candidate.planVariant !== COMMUNITY_ALLOWANCE_PLAN_VARIANT) {
+      || candidate.planType !== COMMUNITY_ALLOWANCE_PLAN_TYPE) {
     return null;
   }
   const fitCount = finite(candidate.fitCount, null);

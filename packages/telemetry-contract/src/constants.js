@@ -11,6 +11,11 @@ export const ACCOUNT_SCOPED_TELEMETRY_ENVELOPE_SCHEMA_VERSION =
   "telemetry-envelope-v0.2";
 export const MAX_TELEMETRY_BROWSER_BYTES = 1_310_720;
 
+// Plan identifiers mirror Codex's KnownPlan enum verbatim (serde lowercase /
+// rename names) so we never invent our own plan labels. Source of truth:
+// openai/codex codex-rs/protocol/src/auth.rs (KnownPlan). "unknown" is our
+// sentinel for a plan Codex has not (yet) named. The usage multiplier is the
+// plan itself (e.g. pro = 20x, prolite = 5x) and is NOT a separate field.
 export const TELEMETRY_PLAN_TYPES = Object.freeze([
   "free",
   "go",
@@ -21,6 +26,11 @@ export const TELEMETRY_PLAN_TYPES = Object.freeze([
   "enterprise",
   "edu",
   "team",
+  "self_serve_business_prolite",
+  "self_serve_business_usage_based",
+  "ent26",
+  "enterprise_cbp_automation",
+  "enterprise_cbp_usage_based",
   "unknown",
 ]);
 

@@ -11,11 +11,9 @@ import {
 const root = process.cwd();
 const outputPath = localLegacyReportPath(root, "artifact.json");
 const crosscheckPath = resolve(root, ".usage-monitor/provider-crosscheck-v0.1.json");
-const planPath = resolve(root, ".usage-monitor/account-plan-timeline-v0.1.json");
 
 const artifact = JSON.parse(await readLocalLegacyReport(root, "artifact.json"));
 const crosscheck = JSON.parse(await readFile(crosscheckPath, "utf8"));
-const planTimeline = JSON.parse(await readFile(planPath, "utf8"));
 
 const extensionIds = new Set([
   "account_surface_metrics",
@@ -61,7 +59,6 @@ const round = (value, places = 6) => {
   return Math.round((value + Number.EPSILON) * scale) / scale;
 };
 
-const currentProfile = planTimeline.profiles.find((profile) => profile.scopeId === crosscheck.scope.accountScope.scopeId) ?? null;
 const currentUi = crosscheck.provider.uiObservations.at(-1) ?? null;
 const uiData = currentUi ?? {
   capturedAt: null,
@@ -92,10 +89,8 @@ const retainedDayCount = crosscheck.comparisons.daily.length;
 
 const accountSummary = [{
   current_scope_status: crosscheck.scope.accountScope.status,
-  current_scope_alias: currentProfile?.alias ?? "unassigned",
+  current_scope_alias: "unassigned",
   provider_plan_type: crosscheck.scope.providerPlanType,
-  assumed_plan_variant: currentProfile?.defaultPlanVariant ?? "unknown",
-  unresolved_plan_episodes: planTimeline.unresolvedEpisodes.length,
   historical_account_attribution: "unavailable",
   local_tokens: local.totalTokens,
   current_account_provider_lifetime_tokens: crosscheck.provider.officialUsageSummary?.lifetimeTokens ?? null,
@@ -141,7 +136,6 @@ const dailyProviderCoverage = crosscheck.comparisons.daily
       local_to_official_ratio: row.localToOfficialRatio,
       local_api_priced_usd: row.localApiPricedUsd,
       classification: row.classification,
-      plan_variant: row.plan?.planVariant ?? "unknown",
       policy_epoch: row.policyEpoch?.id ?? "unknown",
     },
     {
@@ -151,7 +145,6 @@ const dailyProviderCoverage = crosscheck.comparisons.daily
       local_to_official_ratio: row.localToOfficialRatio,
       local_api_priced_usd: row.localApiPricedUsd,
       classification: row.classification,
-      plan_variant: row.plan?.planVariant ?? "unknown",
       policy_epoch: row.policyEpoch?.id ?? "unknown",
     },
   ]);
@@ -265,12 +258,6 @@ const uiSource = {
     },
   },
 };
-const planSource = {
-  id: "account_plan_timeline",
-  label: "Owner-only pseudonymous plan timeline",
-  path: ".usage-monitor/account-plan-timeline-v0.1.json",
-  description: "User-reported normal 20x state and unresolved brief 5x episode. The provider's generic Pro label cannot distinguish the $100 and $200 variants.",
-};
 const officialSources = [
   {
     id: "openai_work_codex",
@@ -291,7 +278,7 @@ const officialSources = [
     description: "Official Codex plan and shared usage guidance.",
   },
 ];
-const newSources = [providerSource, uiSource, planSource, ...officialSources];
+const newSources = [providerSource, uiSource, ...officialSources];
 artifact.manifest.sources.push(...newSources);
 artifact.sources.push(...newSources);
 
@@ -346,7 +333,6 @@ artifact.manifest.charts.push(
         { field: "local_to_official_ratio", type: "quantitative", label: "Local / official", format: "number" },
         { field: "classification", type: "nominal", label: "Coverage classification" },
         { field: "policy_epoch", type: "nominal", label: "Policy epoch" },
-        { field: "plan_variant", type: "nominal", label: "Plan assumption" },
       ],
     },
   },
@@ -495,14 +481,14 @@ artifact.manifest.blocks.push(
   {
     id: "plan_account_context",
     type: "markdown",
-    sourceId: "account_plan_timeline",
-    body: `### Two accounts and the brief $100 plan\n\nThe current account is stored only as a Keychain-HMAC pseudonym${currentProfile?.alias ? ` with local alias \`${currentProfile.alias}\`` : " and has no registered local alias"}; raw email and provider account identifiers are never written. The provider reports only \`planType: ${crosscheck.scope.providerPlanType}\`, which does not distinguish the $100 5x and $200 20x variants. The timeline applies the registered ${currentProfile?.defaultPlanVariant ?? "unknown"} default only from ${currentProfile?.defaultEffectiveAt ?? "an unavailable effective date"} onward and leaves ${number(planTimeline.unresolvedEpisodes.length, 0)} brief-plan episode(s) unresolved, with no invented dates or account. Historical rollouts remain account-unattributed unless a fresh local marker existed at collection time.\n\nProspective account-scoped collector evidence is currently **${crosscheck.comparisons.prospectiveAccountScoped?.status ?? "unavailable"}** with ${number(crosscheck.comparisons.prospectiveAccountScoped?.eventCount ?? 0, 0)} matched rollout event(s). When available it is partitioned by pseudonymous scope and dated plan variant, but remains partial-marker coverage rather than a full-day reconciliation. Report and inference group keys now include both fields so two accounts or plan eras cannot be pooled.`,
+    sourceId: "provider_crosscheck",
+    body: `### Account scope and plan\n\nThe current account is stored only as a Keychain-HMAC pseudonym; raw email and provider account identifiers are never written. The provider-reported \`planType: ${crosscheck.scope.providerPlanType}\` names the plan directly (pro is the 20x tier, prolite the 5x tier); no separate plan-variant layer is inferred. Historical rollouts remain account-unattributed unless a fresh local marker existed at collection time.\n\nProspective account-scoped collector evidence is currently **${crosscheck.comparisons.prospectiveAccountScoped?.status ?? "unavailable"}** with ${number(crosscheck.comparisons.prospectiveAccountScoped?.eventCount ?? 0, 0)} matched rollout event(s). When available it is partitioned by pseudonymous scope, but remains partial-marker coverage rather than a full-day reconciliation. Report and inference group keys include the account scope and provider plan_type so two accounts cannot be pooled.`,
   },
   {
     id: "learning_loop",
     type: "markdown",
     sourceId: "provider_crosscheck",
-    body: `## Updated learning loop\n\n1. On each account, run \`register-account --alias … --default-plan …\`, then \`collect-once --stale-after-ms 0\` immediately after switching. Registration dates the plan profile; collection creates a fresh prospective marker. Neither command retroactively assigns old rollouts.\n2. Keep the passive collector running at normal boundaries so quota percentage, reset, official daily buckets, account scope, plan label, and new rollout receipts are time-aligned.\n3. Record the approximate dates and account alias for the brief 5x period when known; every plan/account boundary becomes a structural break.\n4. Capture the visible Analytics page near an app-server poll occasionally. The UI adds Work/shared-pool and provider-surface context; the app-server provides machine-readable quota and daily tokens.\n5. Continue the controlled Standard/Fast panels from the original report. The allowance remains non-identifiable until several clean within-reset panels cover one account, one plan, and all shared-pool activity.\n\nThe provenance-checked local-history cache avoids repricing the fixed ${number(retainedDayCount, 0)}-day interval when relevant sources are unchanged, or when every newly appended complete JSONL record is proven to fall after the fixed end timestamp. Rewrites, replacements, newly relevant files, and in-range suffix records are rejected unless a stale override is explicit. This build's cache status is **${crosscheck.local.cacheValidation?.status ?? "unspecified"}**.`,
+    body: `## Updated learning loop\n\n1. On each account, run \`collect-once --stale-after-ms 0\` immediately after switching. Collection creates a fresh prospective marker; it never retroactively assigns old rollouts.\n2. Keep the passive collector running at normal boundaries so quota percentage, reset, official daily buckets, account scope, plan label, and new rollout receipts are time-aligned.\n3. The provider plan_type names the plan directly, so no plan-variant registration is needed; every account boundary becomes a structural break.\n4. Capture the visible Analytics page near an app-server poll occasionally. The UI adds Work/shared-pool and provider-surface context; the app-server provides machine-readable quota and daily tokens.\n5. Continue the controlled Standard/Fast panels from the original report. The allowance remains non-identifiable until several clean within-reset panels cover one account, one plan, and all shared-pool activity.\n\nThe provenance-checked local-history cache avoids repricing the fixed ${number(retainedDayCount, 0)}-day interval when relevant sources are unchanged, or when every newly appended complete JSONL record is proven to fall after the fixed end timestamp. Rewrites, replacements, newly relevant files, and in-range suffix records are rejected unless a stale override is explicit. This build's cache status is **${crosscheck.local.cacheValidation?.status ?? "unspecified"}**.`,
   },
 );
 

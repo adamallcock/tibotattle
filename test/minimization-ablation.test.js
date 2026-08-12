@@ -26,7 +26,6 @@ function syntheticTransitions({ includeRestrictedFamilies = true, collideResetTi
     const eventMs = (resetsAt * 1_000) - ((12 - pointIndex) * 30 * 60 * 1_000);
     const common = {
       accountScopeId: "safe-account-partition",
-      planVariant: "pro-20x",
       provider: collideResetTimes ? "openai_codex" : resetIndex % 2 === 0 ? "openai_codex" : "anthropic_claude",
       planType: "pro",
       limitId: "codex",

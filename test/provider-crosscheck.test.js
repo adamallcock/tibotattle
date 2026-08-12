@@ -4,7 +4,6 @@ import {
   analyzeProviderCrosscheck,
   createProspectiveAccountScopedAccumulator,
 } from "../src/provider-crosscheck.js";
-import { createInitialPlanTimeline } from "../src/plan-timeline.js";
 
 const SCOPE = "openai-account:v1:0123456789abcdef0123456789abcdef0123456789a";
 
@@ -41,7 +40,6 @@ test("crosscheck keeps provider activity unallocated and partitions by pseudonym
   const report = analyzeProviderCrosscheck({
     localScan: localScan(),
     accountSnapshot: accountSnapshot(),
-    planTimeline: createInitialPlanTimeline({ scopeId: SCOPE, effectiveAt: "2026-07-23T00:00:00Z" }),
     providerUiObservations: [{
       kind: "provider_ui_usage_snapshot",
       capturedAt: "2026-07-24T00:01:00.000Z",
@@ -60,7 +58,7 @@ test("crosscheck keeps provider activity unallocated and partitions by pseudonym
   assert.equal(report.comparisons.aggregateLocalExcessTokens, 0);
   assert.equal(report.comparisons.accountCompatibility.verdict, "not_disproven_by_lifetime_total");
   assert.equal(report.comparisons.accountPartitioning.comparisonEligibility, "coverage_diagnostic_only_not_account_matched");
-  assert.equal(report.comparisons.daily[0].plan.planVariant, "unknown");
+  assert.equal(report.comparisons.daily[0].plan.providerPlanType, "pro");
   assert.equal(report.comparisons.daily[0].plan.source, "historical_local_account_unattributed");
   assert.equal(report.comparisons.daily[0].classification, "material_provider_activity_unallocated");
   assert.equal(report.comparisons.uiVsAppServer[0].percentagePointDifference, 0);
@@ -160,12 +158,10 @@ test("stale cache override remains visible in durable crosscheck output", () => 
   assert.ok(report.limitations.some((value) => value.includes("explicit stale override")));
 });
 
-test("prospective collector comparison filters by account and dates plan variants", () => {
-  const timeline = createInitialPlanTimeline({ scopeId: SCOPE, effectiveAt: "2026-07-23T00:00:00Z" });
+test("prospective collector comparison filters by account scope", () => {
   const report = analyzeProviderCrosscheck({
     localScan: localScan(),
     accountSnapshot: accountSnapshot(),
-    planTimeline: timeline,
     prospectiveCollectorRecords: [
       {
         kind: "codex_rollout_usage_snapshot",
@@ -185,13 +181,12 @@ test("prospective collector comparison filters by account and dates plan variant
   assert.equal(scoped.status, "available_partial");
   assert.equal(scoped.eventCount, 1);
   assert.equal(scoped.totalTokens, 30);
-  assert.equal(scoped.byPlanVariant["pro-20x"].eventCount, 1);
+  assert.equal(scoped.providerPlanType, "pro");
   assert.equal(scoped.daily[0].officialAccountTokens, 300);
   assert.equal(scoped.daily[0].partialLocalToOfficialRatio, 0.1);
 });
 
 test("streaming prospective aggregation is parity-equivalent to the array compatibility path", () => {
-  const timeline = createInitialPlanTimeline({ scopeId: SCOPE, effectiveAt: "2026-07-23T00:00:00Z" });
   const records = [
     {
       kind: "codex_rollout_usage_snapshot",
@@ -208,7 +203,6 @@ test("streaming prospective aggregation is parity-equivalent to the array compat
   ];
   const accumulator = createProspectiveAccountScopedAccumulator({
     accountScope: accountSnapshot().accountScope,
-    planTimeline: timeline,
     providerPlanType: "pro",
     startAt: localScan().startAt,
     endAt: localScan().endAt,
@@ -217,13 +211,11 @@ test("streaming prospective aggregation is parity-equivalent to the array compat
   const arrayReport = analyzeProviderCrosscheck({
     localScan: localScan(),
     accountSnapshot: accountSnapshot(),
-    planTimeline: timeline,
     prospectiveCollectorRecords: records,
   });
   const streamingReport = analyzeProviderCrosscheck({
     localScan: localScan(),
     accountSnapshot: accountSnapshot(),
-    planTimeline: timeline,
     prospectiveCollectorAccumulator: accumulator,
   });
   assert.deepEqual(
@@ -232,57 +224,28 @@ test("streaming prospective aggregation is parity-equivalent to the array compat
   );
 });
 
-test("prospective comparison never assigns one provider day across mixed plan variants", () => {
-  const timeline = createInitialPlanTimeline({ scopeId: SCOPE, effectiveAt: "2026-07-23T00:00:00Z" });
-  timeline.profiles[0].periods.push({
-    planVariant: "pro-5x",
-    startAt: "2026-07-23T12:00:00.000Z",
-    endAt: "2026-07-23T13:00:00.000Z",
-  });
-  const scopedRecord = (observedAt) => ({
-    kind: "codex_rollout_usage_snapshot",
-    observedAt,
-    accountScope: accountSnapshot().accountScope,
-    components: { input_uncached_tokens: 10 },
-  });
+test("prospective days carry the provider plan_type without a variant layer", () => {
   const report = analyzeProviderCrosscheck({
     localScan: localScan(),
     accountSnapshot: accountSnapshot(),
-    planTimeline: timeline,
     prospectiveCollectorRecords: [
-      scopedRecord("2026-07-23T11:00:00.000Z"),
-      scopedRecord("2026-07-23T12:30:00.000Z"),
+      {
+        kind: "codex_rollout_usage_snapshot",
+        observedAt: "2026-07-23T11:00:00.000Z",
+        accountScope: accountSnapshot().accountScope,
+        components: { input_uncached_tokens: 10 },
+      },
+      {
+        kind: "codex_rollout_usage_snapshot",
+        observedAt: "2026-07-23T12:30:00.000Z",
+        accountScope: accountSnapshot().accountScope,
+        components: { input_uncached_tokens: 10 },
+      },
     ],
   });
   const rows = report.comparisons.prospectiveAccountScoped.daily;
-  assert.equal(rows.length, 2);
-  assert.deepEqual(rows.map((row) => row.planVariant), ["pro-20x", "pro-5x"]);
-  assert.ok(rows.every((row) => row.officialAccountTokens === null));
-  assert.ok(rows.every((row) => row.partialLocalToOfficialRatio === null));
-  assert.ok(rows.every((row) => row.coverage === "mixed_plan_day_provider_bucket_not_allocatable"));
-});
-
-test("a known intraday plan boundary suppresses the provider day even when only one side is observed", () => {
-  const timeline = createInitialPlanTimeline({ scopeId: SCOPE, effectiveAt: "2026-07-23T00:00:00Z" });
-  timeline.profiles[0].periods.push({
-    planVariant: "pro-5x",
-    startAt: "2026-07-23T12:00:00.000Z",
-    endAt: "2026-07-23T13:00:00.000Z",
-  });
-  const report = analyzeProviderCrosscheck({
-    localScan: localScan(),
-    accountSnapshot: accountSnapshot(),
-    planTimeline: timeline,
-    prospectiveCollectorRecords: [{
-      kind: "codex_rollout_usage_snapshot",
-      observedAt: "2026-07-23T11:00:00.000Z",
-      accountScope: accountSnapshot().accountScope,
-      components: { input_uncached_tokens: 10 },
-    }],
-  });
-  const [row] = report.comparisons.prospectiveAccountScoped.daily;
-  assert.equal(row.planVariant, "pro-20x");
-  assert.equal(row.officialAccountTokens, null);
-  assert.equal(row.partialLocalToOfficialRatio, null);
-  assert.equal(row.coverage, "known_plan_boundary_day_provider_bucket_not_allocatable");
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].providerPlanType, "pro");
+  assert.equal(Object.hasOwn(rows[0], "planVariant"), false);
+  assert.equal(rows[0].coverage, "partial_prospective_marker_window_not_full_day");
 });

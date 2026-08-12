@@ -128,7 +128,6 @@ function mean(values) {
 function partitionKey(row, { includeSlot = true } = {}) {
   return [
     row.accountScopeId ?? "unattributed",
-    row.planVariant ?? "unknown",
     row.provider,
     row.planType,
     row.limitId,
@@ -380,7 +379,6 @@ function summarizeEvidence(rows) {
     coverage: {
       eligibleTransitions: eligible.length,
       accountKnownFraction: eligible.length > 0 ? round(eligible.filter((row) => row.accountScopeId && row.accountScopeId !== "unattributed").length / eligible.length) : null,
-      planVariantKnownFraction: eligible.length > 0 ? round(eligible.filter((row) => row.planVariant && row.planVariant !== "unknown").length / eligible.length) : null,
       speedKnownEventFraction: totalTierEvents > 0 ? round(knownTierEvents / totalTierEvents) : null,
       providerSnapshotAgeKnownFraction: eligible.length > 0 ? round(snapshotAges.length / eligible.length) : null,
       controlledStateKnownFraction: eligible.length > 0 ? round(eligible.filter((row) => row.controlledState && row.controlledState !== "unknown").length / eligible.length) : null,
@@ -399,7 +397,6 @@ function aggregateCoverage(rows) {
   return {
     eligibleTransitions: total,
     accountKnownFraction: weighted("accountKnownFraction"),
-    planVariantKnownFraction: weighted("planVariantKnownFraction"),
     speedKnownEventFraction: weighted("speedKnownEventFraction"),
     providerSnapshotAgeKnownFraction: weighted("providerSnapshotAgeKnownFraction"),
     controlledStateKnownFraction: weighted("controlledStateKnownFraction"),
@@ -987,7 +984,6 @@ export function analyzeWeeklyCalibration(dataset, { priorWindow = 3 } = {}) {
     const lagFits = Object.fromEntries(LAG_CANDIDATES.map((candidate) => [candidate.id, fitReset(group.rows, candidate)]));
     return {
       accountScopeId: first.accountScopeId ?? "unattributed",
-      planVariant: first.planVariant ?? "unknown",
       provider: first.provider,
       planType: first.planType,
       limitId: first.limitId,
@@ -1228,7 +1224,6 @@ export function analyzeWeeklyCalibration(dataset, { priorWindow = 3 } = {}) {
     },
     resetValues: rows.map((row) => ({
       accountScopeId: row.accountScopeId,
-      planVariant: row.planVariant,
       provider: row.provider,
       planType: row.planType,
       limitId: row.limitId,
@@ -1541,7 +1536,6 @@ export function renderWeeklyCalibrationReport(report) {
     "| Field | Historical coverage | Study target |",
     "| --- | ---: | ---: |",
     `| Account scope | ${(100 * (coverage.accountKnownFraction ?? 0)).toFixed(1)}% | 90% |`,
-    `| Specific plan variant | ${(100 * (coverage.planVariantKnownFraction ?? 0)).toFixed(1)}% | 90% |`,
     `| Standard/Fast state | ${(100 * (coverage.speedKnownEventFraction ?? 0)).toFixed(1)}% | 90% |`,
     `| Provider snapshot age | ${(100 * (coverage.providerSnapshotAgeKnownFraction ?? 0)).toFixed(1)}% | 90% |`,
     "",

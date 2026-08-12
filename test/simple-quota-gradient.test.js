@@ -91,7 +91,7 @@ test("never mixes two accounts or plan variants sharing the same reset timestamp
   }));
   const foreignPlan = value.recent.snapshotIntervals.slice(0, 2).map((row, index) => ({
     ...row,
-    planVariant: "pro-5x",
+    planType: "prolite",
     marginalApiPricedUsd: 999,
     eventTime: new Date(Date.UTC(2026, 6, 1, 14 + index)).toISOString(),
   }));

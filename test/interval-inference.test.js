@@ -80,18 +80,16 @@ test("inference never pools the same quota series across account or plan partiti
   const first = Array.from({ length: 8 }, (_, index) => ({
     ...syntheticTransition({ q: index + 1, capacity: 100 }),
     accountScopeId: "scope-a",
-    planVariant: "pro-20x",
   }));
   const second = Array.from({ length: 8 }, (_, index) => ({
     ...syntheticTransition({ q: index + 1, capacity: 200 }),
     accountScopeId: "scope-b",
-    planVariant: "pro-5x",
   }));
   const result = inferCapacityFromTransitions(dataset([...first, ...second]));
   assert.equal(result.series.length, 2);
-  assert.deepEqual(result.series.map((series) => [series.classification.accountScopeId, series.classification.planVariant]), [
-    ["scope-a", "pro-20x"],
-    ["scope-b", "pro-5x"],
+  assert.deepEqual(result.series.map((series) => series.classification.accountScopeId), [
+    "scope-a",
+    "scope-b",
   ]);
 });
 

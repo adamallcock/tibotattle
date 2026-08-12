@@ -1,7 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { captureCodexObservation, summarizeTierCoverage } from "../src/capture.js";
-import { createInitialPlanTimeline } from "../src/plan-timeline.js";
 
 const SCOPE = "openai-account:v1:0123456789abcdef0123456789abcdef0123456789a";
 
@@ -57,7 +56,6 @@ test("capture retains an aggregate subscription speed attribution without claimi
     runCcusage: async () => ({ private: "not persisted" }),
     summarizeCcusageReport: () => ({ daily: [] }),
     scanLocal: async () => localUsage({ standard: 3 }),
-    planTimeline: createInitialPlanTimeline({ scopeId: SCOPE, effectiveAt: "2026-07-23T00:00:00.000Z" }),
   });
 
   const tier = observation.windows[0].local.apiPricing.tierSemantics;
@@ -71,8 +69,7 @@ test("capture retains an aggregate subscription speed attribution without claimi
   });
   assert.equal(JSON.stringify(observation).includes("not persisted"), false);
   assert.equal(observation.accountScope.status, "available");
-  assert.equal(observation.planVariant, "pro-20x");
-  assert.equal(observation.planContextSource, "dated_user_reported_default");
+  assert.equal(observation.planType, "pro");
   assert.equal(observation.privacy.rawAccountIdentifiersStored, false);
 });
 

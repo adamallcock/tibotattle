@@ -91,18 +91,16 @@ test("weekly reset deduplication never crosses account or plan partitions", () =
   const first = Array.from({ length: 10 }, (_, index) => ({
     ...transition(index, { reset, capacityUsd: 600 }),
     accountScopeId: "scope-a",
-    planVariant: "pro-20x",
   }));
   const second = Array.from({ length: 10 }, (_, index) => ({
     ...transition(index, { reset, capacityUsd: 300 }),
     accountScopeId: "scope-b",
-    planVariant: "pro-5x",
   }));
   const report = analyzeWeeklyLimitHistory({ ...dataset(), transitions: [...first, ...second] });
   assert.equal(report.resetDiagnostics.length, 2);
-  assert.deepEqual(report.resetDiagnostics.map((group) => [group.accountScopeId, group.planVariant]), [
-    ["scope-a", "pro-20x"],
-    ["scope-b", "pro-5x"],
+  assert.deepEqual(report.resetDiagnostics.map((group) => group.accountScopeId), [
+    "scope-a",
+    "scope-b",
   ]);
   assert.equal(report.crossPartitionHeadlineSuppressed, true);
   assert.equal(report.descriptiveStandardApiEquivalent, null);
