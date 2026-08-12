@@ -185,8 +185,21 @@ async function readJson(response, {
         .includes(backendCode)) {
     interrupt("device_unavailable", { deviceUnavailable: true });
   }
+  // Both admission limits mean the same thing to the client: the service is
+  // deliberately pacing a burst (a full-history backfill requests one upload
+  // authorization and posts one chunk per window, so either the per-minute
+  // authorization budget on /upload-authorizations — UPLOAD_ADMISSION_LIMIT_
+  // REACHED — or the chunk budget on /contributions — CHUNK_ADMISSION_LIMIT_
+  // REACHED — trips first). Both must resume at the advertised Retry-After
+  // window, NOT climb the exponential service-pressure ladder: admission_
+  // exhausted settles "partial" and reschedules at the retry-after floor
+  // without incrementing retryCount, whereas the generic 429/5xx bucket below
+  // settles "failed" and escalates the backoff every pass — which would report
+  // an ordinary rate-limit as a service failure and progressively stall the
+  // backfill instead of draining it at a steady cadence.
   if (response.status === 429
-      && backendCode === "CHUNK_ADMISSION_LIMIT_REACHED") {
+      && (backendCode === "CHUNK_ADMISSION_LIMIT_REACHED"
+        || backendCode === "UPLOAD_ADMISSION_LIMIT_REACHED")) {
     interrupt("admission_exhausted", {
       retryable: true,
       retryAfterMilliseconds: retryAfter(response),

@@ -106,6 +106,7 @@ function createFakeService({
   admissionLimit = Number.POSITIVE_INFINITY,
   conflictOnce = false,
   stateStatus = null,
+  uploadAuthorizationRetryAfterSeconds = null,
 } = {}) {
   const journal = new Map();
   const calls = [];
@@ -193,6 +194,11 @@ function createFakeService({
     }
     if (parsed.pathname === "/api/v1/device/upload-authorizations") {
       assert.match(options.headers.Authorization, /^Device um_device_/u);
+      if (uploadAuthorizationRetryAfterSeconds !== null) {
+        return response({
+          error: { code: "UPLOAD_ADMISSION_LIMIT_REACHED" },
+        }, 429, { "Retry-After": String(uploadAuthorizationRetryAfterSeconds) });
+      }
       return response({
         uploadAuthorization: `um_device_upload_${AUTH_ID}.${"B".repeat(43)}`,
         expiresAt: "2026-08-02T00:00:00.000Z",
@@ -421,6 +427,29 @@ test("an exhausted admission budget stops the pass with the service's retry floo
     assert.equal(outcome.failure.deviceUnavailable, false);
     // The service's next admission window (its retryAt) is the floor.
     assert.equal(outcome.failure.retryAfterMilliseconds, 12 * 60 * 60 * 1_000);
+  });
+});
+
+test("an exhausted upload-authorization budget is admission_exhausted, not a service failure", async () => {
+  await withIndex(async (file) => {
+    // The per-minute authorization rate limit on /upload-authorizations is the
+    // service pacing a full-history backfill burst, not an outage. It must
+    // classify exactly like the chunk admission limit — admission_exhausted,
+    // resume at the advertised Retry-After — rather than the generic
+    // service_unavailable bucket, which would settle "failed" and climb the
+    // exponential service-pressure backoff ladder every pass, progressively
+    // stalling the drain and mislabelling an ordinary rate limit as an outage.
+    const service = createFakeService({ uploadAuthorizationRetryAfterSeconds: 60 });
+    const outcome = await runIncrementalContributionSyncOnce(
+      engineOptions(file, service, {
+        now: () => Date.parse("2026-08-01T12:00:00.000Z"),
+      }),
+    );
+    assert.equal(outcome.failure.code, "admission_exhausted");
+    assert.equal(outcome.failure.retryable, true);
+    assert.equal(outcome.failure.deviceUnavailable, false);
+    assert.equal(outcome.failure.retryAfterMilliseconds, 60 * 1_000);
+    assert.equal(outcome.chunksUploaded, 0);
   });
 });
 
