@@ -52,7 +52,7 @@ import {
   type AdminAction,
   type CollectionControlReason,
 } from "./admin-operations";
-import { verifyAdminAccessAssertion } from "./admin-access";
+import { authorizeAdminEmail, verifyAdminAccessAssertion } from "./admin-access";
 import {
   adminHostname,
   adminUiResponse,
@@ -170,6 +170,7 @@ import {
 } from "./route-registry";
 import { handleSparkleAppcastGuard } from "./sparkle-appcast-guard";
 import {
+  assertAdminCsrf,
   assertCsrf,
   assertSameOrigin,
   abandonUploadAuthorization,
@@ -2915,12 +2916,22 @@ async function adminSession(
   return { session, identityKey };
 }
 
-async function handleAdminOverview(request: Request, env: Env): Promise<Response> {
+async function handleAdminOverview(
+  request: Request,
+  env: Env,
+  access?: { readonly identityKey: string },
+): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
-  if (!adminIdentityKeyConfigured(Reflect.get(env, "ADMIN_IDENTITY_LINK_KEY"))) {
-    throw new ApiError(503, "ADMIN_NOT_CONFIGURED");
+  // access-mode (admin hostname): the router already verified Cloudflare Access
+  // and pinned the owner email, and overview is read-only, so proceed directly.
+  // dev-mode (single origin): keep the 503-before-auth ordering and the app
+  // session + ADMIN_IDENTITY_LINK_KEY gate.
+  if (access === undefined) {
+    if (!adminIdentityKeyConfigured(Reflect.get(env, "ADMIN_IDENTITY_LINK_KEY"))) {
+      throw new ApiError(503, "ADMIN_NOT_CONFIGURED");
+    }
+    await adminSession(request, env);
   }
-  await adminSession(request, env);
   const reference = new URL(request.url).searchParams.get("diagnosticReference");
   if (reference !== null && !validDiagnosticReference(reference)) {
     throw new ApiError(400, "BODY_INVALID");
@@ -2938,10 +2949,23 @@ async function handleAdminOverview(request: Request, env: Env): Promise<Response
   );
 }
 
-async function handleAdminAction(request: Request, env: Env): Promise<Response> {
+async function handleAdminAction(
+  request: Request,
+  env: Env,
+  access?: { readonly identityKey: string },
+): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
-  const { session, identityKey } = await adminSession(request, env);
-  assertCsrf(request, session);
+  let identityKey: string;
+  if (access !== undefined) {
+    // access-mode (admin hostname): identity is the owner-pinned Access email;
+    // CSRF is session-independent (exact-origin + mandatory custom header).
+    assertAdminCsrf(request);
+    identityKey = access.identityKey;
+  } else {
+    const { session, identityKey: devIdentityKey } = await adminSession(request, env);
+    assertCsrf(request, session);
+    identityKey = devIdentityKey;
+  }
   const body = await readBoundedJson(request);
   if (typeof body.value !== "object"
       || body.value === null
@@ -3416,9 +3440,26 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     const configuredAdminHostname = adminHostname(env);
     if (configuredAdminHostname !== null) {
       if (url.hostname === configuredAdminHostname) {
-        await verifyAdminAccessAssertion(request, env);
+        // Authenticate + owner-pin ONCE, at the chokepoint, before the UI or
+        // any route: Cloudflare Access already verified the Google identity;
+        // authorizeAdminEmail confirms it is the configured owner (a valid but
+        // non-owner Access identity is 403 here, an unset ACCESS_ADMIN_EMAIL is
+        // 503) so the static UI and every present/future admin route are
+        // owner-only, and the admin API handlers receive the identity directly
+        // rather than re-deriving an impossible __Host- session on this host.
+        const identity = await verifyAdminAccessAssertion(request, env);
+        const identityKey = authorizeAdminEmail(
+          identity,
+          Reflect.get(env, "ACCESS_ADMIN_EMAIL"),
+        );
         const adminUi = adminUiResponse(request.method, url.pathname);
         if (adminUi !== null) return adminUi;
+        if (route.kind === "exact" && route.id === "admin_overview") {
+          return noStore(await handleAdminOverview(request, env, { identityKey }));
+        }
+        if (route.kind === "exact" && route.id === "admin_action") {
+          return noStore(await handleAdminAction(request, env, { identityKey }));
+        }
       } else if (isAdminSurfacePath(url.pathname)
         || (route.kind === "exact"
           && (route.id === "admin_overview" || route.id === "admin_action"))) {

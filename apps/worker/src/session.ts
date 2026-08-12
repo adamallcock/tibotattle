@@ -280,6 +280,23 @@ export function assertCsrf(request: Request, session: SessionPrincipal): void {
   }
 }
 
+/**
+ * Session-independent CSRF defense for the admin hostname, where authentication
+ * is the Cloudflare Access JWT rather than the app __Host- session (so there is
+ * no session-bound double-submit token). Exact-origin is the load-bearing,
+ * browser-enforced, unforgeable control — it refuses both a cookie-borne
+ * cross-site POST (even under a pessimistic SameSite=None assumption) and an
+ * absent Origin. The mandatory non-CORS-safelisted header additionally forces a
+ * preflight the admin host never answers, so a cross-origin request never even
+ * reaches this check.
+ */
+export function assertAdminCsrf(request: Request): void {
+  assertSameOrigin(request);
+  if (request.headers.get("x-usage-monitor-admin") !== "1") {
+    throw new ApiError(403, "CSRF_INVALID");
+  }
+}
+
 export async function createUploadAuthorizationMaterial(
   participantId: string,
   issuedBySessionId: string,

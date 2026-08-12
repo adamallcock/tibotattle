@@ -283,9 +283,9 @@
         "ENROLLMENT_MODE": "open",
         "ACCOUNT_SCOPED_INGEST_MODE": "disabled",
         "UPLOAD_INGRESS_QUEUE_MODE": "disabled",
-        "UPLOAD_INGRESS_MAX_CONCURRENT": "8",
-        "UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE": "120",
-        "UPLOAD_INGRESS_BURST": "16",
+        "UPLOAD_INGRESS_MAX_CONCURRENT": "64",
+        "UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE": "1200",
+        "UPLOAD_INGRESS_BURST": "1200",
         "UPLOAD_INGRESS_LEASE_SECONDS": "90",
         "UPLOAD_INGRESS_BODY_TOTAL_SECONDS": "60",
         "UPLOAD_INGRESS_BODY_IDLE_SECONDS": "15",
@@ -312,6 +312,12 @@
         // restricted to the owner email). Neither value is a secret.
         "ACCESS_TEAM_DOMAIN": "tibotattle.cloudflareaccess.com",
         "ACCESS_AUD": "3ffbc68d303a9da74f462a685b788c57935c65024df4e9b144e1c872598bb61c",
+        // Worker-side owner pin for admin.tibotattle.com, enforced at the
+        // admin-host routing chokepoint (index.ts). Must equal the Google
+        // account the Access allow-policy admits; a valid Access JWT whose email
+        // != this is refused 403 ADMIN_REQUIRED, and an unset value fails the
+        // admin host closed with 503 ADMIN_NOT_CONFIGURED. Not a secret.
+        "ACCESS_ADMIN_EMAIL": "adamallcock@gmail.com",
         // Sparkle atomic appcast guard (sparkle-appcast-guard.ts): every
         // value below must equal the reviewed release contract
         // (sparkle-release-contract.json) or the guard fails closed as
@@ -372,22 +378,22 @@
         {
           "name": "UPLOAD_AUTHORIZATION_RATE_LIMIT",
           "namespace_id": "3005",
-          "simple": { "limit": 300, "period": 60 }
+          "simple": { "limit": 3000, "period": 60 }
         },
         {
           "name": "UPLOAD_PRINCIPAL_RATE_LIMIT",
           "namespace_id": "3006",
-          "simple": { "limit": 6, "period": 60 }
+          "simple": { "limit": 3000, "period": 60 }
         },
         {
           "name": "UPLOAD_INGRESS_REQUEST_RATE_LIMIT",
           "namespace_id": "3007",
-          "simple": { "limit": 240, "period": 60 }
+          "simple": { "limit": 3000, "period": 60 }
         },
         {
           "name": "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
           "namespace_id": "3008",
-          "simple": { "limit": 20, "period": 60 }
+          "simple": { "limit": 3000, "period": 60 }
         }
       ],
       "durable_objects": {

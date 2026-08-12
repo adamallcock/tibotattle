@@ -105,6 +105,10 @@ function adminSurfaceBindings(overrides: Record<string, unknown> = {}): Env {
     PUBLIC_ORIGIN,
     ACCESS_TEAM_DOMAIN,
     ACCESS_AUD,
+    // The owner pin the admin host authenticates against; the default signed
+    // JWT (signedAccessJwt) carries this same email. Tests that exercise the
+    // unset/wrong-owner branches override it.
+    ACCESS_ADMIN_EMAIL: "adamallcock@gmail.com",
     ACCESS_TEST_JWKS_JSON: accessJwksJson,
     ...overrides,
   });
@@ -344,19 +348,117 @@ describe("admin surface hostname gating", () => {
     expect(refused.status).toBe(403);
   });
 
-  it("keeps the existing admin auth layer beneath a valid assertion", async () => {
-    // A verified Access identity reaches the same fail-closed admin API the
-    // public origin used to expose: without ADMIN_IDENTITY_LINK_KEY it is
-    // ADMIN_NOT_CONFIGURED, and the session/CSRF second factor is untouched.
+  it("authenticates the owner from the Access identity and serves the overview", async () => {
+    // The first-ever green admin API path: a verified Access JWT whose email is
+    // the configured owner reaches the overview with no app __Host- session.
     const response = await handleRequest(
       new Request(`${ADMIN_ORIGIN}/api/v1/admin/overview`, {
         headers: { "cf-access-jwt-assertion": await signedAccessJwt() },
       }),
       adminSurfaceBindings(),
     );
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      schemaVersion: "admin-overview-v0.1",
+    });
+  });
+
+  it("refuses a verified Access identity that is not the configured owner", async () => {
+    // Defense in depth beneath the Access allow-policy: a valid JWT for a
+    // different email is refused at the router, for the UI and the API alike.
+    const token = await signedAccessJwt({ email: "attacker@example.test" });
+    const overview = await handleRequest(
+      new Request(`${ADMIN_ORIGIN}/api/v1/admin/overview`, {
+        headers: { "cf-access-jwt-assertion": token },
+      }),
+      adminSurfaceBindings(),
+    );
+    expect(overview.status).toBe(403);
+    await expect(overview.json()).resolves.toMatchObject({
+      error: { code: "ADMIN_REQUIRED" },
+    });
+    const ui = await handleRequest(
+      new Request(`${ADMIN_ORIGIN}/admin.html`, {
+        headers: { "cf-access-jwt-assertion": token },
+      }),
+      adminSurfaceBindings(),
+    );
+    expect(ui.status).toBe(403);
+  });
+
+  it("fails closed on the admin host when ACCESS_ADMIN_EMAIL is unset", async () => {
+    const response = await handleRequest(
+      new Request(`${ADMIN_ORIGIN}/api/v1/admin/overview`, {
+        headers: { "cf-access-jwt-assertion": await signedAccessJwt() },
+      }),
+      adminSurfaceBindings({ ACCESS_ADMIN_EMAIL: undefined }),
+    );
     expect(response.status).toBe(503);
     await expect(response.json()).resolves.toMatchObject({
       error: { code: "ADMIN_NOT_CONFIGURED" },
+    });
+  });
+
+  it("guards admin actions with a session-independent CSRF check", async () => {
+    const token = await signedAccessJwt();
+    const body = JSON.stringify({
+      action: "set_collection_controls",
+      expectedRevision: 1,
+      enrollment: true,
+      uploadRegistration: true,
+      processing: true,
+      publication: false,
+      reasonCode: "maintenance",
+    });
+    // Missing the mandatory custom header -> 403 CSRF_INVALID (before any action).
+    const noHeader = await handleRequest(
+      new Request(`${ADMIN_ORIGIN}/api/v1/admin/action`, {
+        method: "POST",
+        headers: {
+          "cf-access-jwt-assertion": token,
+          "content-type": "application/json",
+          origin: ADMIN_ORIGIN,
+        },
+        body,
+      }),
+      adminSurfaceBindings(),
+    );
+    expect(noHeader.status).toBe(403);
+    await expect(noHeader.json()).resolves.toMatchObject({
+      error: { code: "CSRF_INVALID" },
+    });
+    // A cross-site Origin is refused even with the header (cookie-borne CSRF).
+    const crossOrigin = await handleRequest(
+      new Request(`${ADMIN_ORIGIN}/api/v1/admin/action`, {
+        method: "POST",
+        headers: {
+          "cf-access-jwt-assertion": token,
+          "content-type": "application/json",
+          origin: "https://evil.test",
+          "x-usage-monitor-admin": "1",
+        },
+        body,
+      }),
+      adminSurfaceBindings(),
+    );
+    expect(crossOrigin.status).toBe(403);
+    // Same-origin + the custom header from the real admin page -> succeeds.
+    const ok = await handleRequest(
+      new Request(`${ADMIN_ORIGIN}/api/v1/admin/action`, {
+        method: "POST",
+        headers: {
+          "cf-access-jwt-assertion": token,
+          "content-type": "application/json",
+          origin: ADMIN_ORIGIN,
+          "x-usage-monitor-admin": "1",
+        },
+        body,
+      }),
+      adminSurfaceBindings(),
+    );
+    expect(ok.status).toBe(200);
+    await expect(ok.json()).resolves.toMatchObject({
+      action: "set_collection_controls",
     });
   });
 

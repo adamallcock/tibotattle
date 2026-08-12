@@ -61,6 +61,18 @@ export interface AdminAccessConfiguration {
   readonly audience: string;
 }
 
+/**
+ * The verified identity a valid Cloudflare Access application token carries.
+ * `sub` is always present on a genuine Access user token; `email` is the Google
+ * identity the allow-policy pins and is the owner gate + audit seed.
+ */
+export interface VerifiedAdminIdentity {
+  readonly sub: string;
+  readonly email: string | null;
+}
+
+const ADMIN_EMAIL_MAX_LENGTH = 254;
+
 interface JsonWebKeySet {
   keys: object[];
 }
@@ -85,6 +97,40 @@ function accessDenied(): never {
 
 function notConfigured(): never {
   throw new ApiError(503, "ADMIN_NOT_CONFIGURED");
+}
+
+/**
+ * The single normalization used by BOTH the owner-email comparison and the
+ * audit actor seed — keep them identical (any drift silently changes the
+ * audit digest). Treat like a keyed domain constant.
+ */
+export function normalizeAdminEmail(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+/**
+ * Worker-side owner pin, defense in depth beneath the Cloudflare Access
+ * allow-policy: even if the Access policy is later widened, only the configured
+ * owner email is admitted to the admin surface. An absent/malformed
+ * `ACCESS_ADMIN_EMAIL` fails the admin host closed (503); an Access-authenticated
+ * identity whose email is absent or is not the owner is refused (403). Returns
+ * the normalized owner email, used as the admin_action_audit actor seed.
+ */
+export function authorizeAdminEmail(
+  identity: VerifiedAdminIdentity,
+  configuredEmail: unknown,
+): string {
+  if (typeof configuredEmail !== "string"
+      || configuredEmail.length === 0
+      || configuredEmail.length > ADMIN_EMAIL_MAX_LENGTH
+      || !configuredEmail.includes("@")) {
+    notConfigured();
+  }
+  const expected = normalizeAdminEmail(configuredEmail);
+  if (identity.email === null || normalizeAdminEmail(identity.email) !== expected) {
+    throw new ApiError(403, "ADMIN_REQUIRED");
+  }
+  return expected;
 }
 
 /**
@@ -151,23 +197,10 @@ async function fetchAccessJwks(jwksUrl: string): Promise<JsonWebKeySet> {
       redirect: "manual",
       signal: AbortSignal.timeout(JWKS_REQUEST_TIMEOUT_MILLISECONDS),
     });
-  } catch (error) {
-    // Coarse deny-site observability (2026-08-10, remove with the attempt
-    // log): step name and error text only, never token or key material.
-    console.warn("admin-access-step", JSON.stringify({
-      step: "jwks_fetch_throw",
-      errorName: error instanceof Error ? error.name : typeof error,
-      errorMessage: error instanceof Error
-        ? error.message.slice(0, 200)
-        : String(error).slice(0, 200),
-    }));
+  } catch {
     accessDenied();
   }
   if (!response.ok) {
-    console.warn("admin-access-step", JSON.stringify({
-      step: "jwks_fetch_status",
-      status: response.status,
-    }));
     accessDenied();
   }
   let text: string;
@@ -250,10 +283,6 @@ async function verificationKey(
   };
   const key = keys.get(kid);
   if (!key) {
-    console.warn("admin-access-step", JSON.stringify({
-      step: "kid_unknown",
-      publishedKeys: keys.size,
-    }));
     accessDenied();
   }
   return key;
@@ -310,28 +339,13 @@ export async function verifyAdminAccessAssertion(
   request: Request,
   env: Env,
   options: { nowMs?: number } = {},
-): Promise<void> {
+): Promise<VerifiedAdminIdentity> {
   const configuration = adminAccessConfiguration(env);
   if (configuration === null) notConfigured();
   const jwksFetcher = environmentJwksFetcher(env);
   const nowMs = options.nowMs ?? Date.now();
 
   const token = accessTokenFromRequest(request);
-  // Coarse, non-sensitive observability (2026-08-09): the response never says
-  // which check refused, which left an authenticated operator's rejection
-  // undiagnosable. This logs only presence/shape and the claim mismatch
-  // category to the Worker's own observability stream — never token bytes,
-  // signatures, or identity. Remove once admin sign-in is confirmed working.
-  console.warn("admin-access-attempt", JSON.stringify({
-    hasHeader: request.headers.get(ACCESS_JWT_HEADER) !== null,
-    hasCookie: /(?:^|;\s*)CF_Authorization=/u.test(
-      request.headers.get("cookie") ?? "",
-    ),
-    hasToken: token !== null,
-    segments: typeof token === "string" ? token.split(".").length : 0,
-    teamDomain: configuration.teamDomain,
-    audiencePrefix: configuration.audience.slice(0, 8),
-  }));
   if (token === null
       || token.length === 0
       || token.length > MAXIMUM_TOKEN_BYTES) {
@@ -363,17 +377,10 @@ export async function verifyAdminAccessAssertion(
       decodeBase64UrlSegment(segments[2]) as unknown as ArrayBuffer,
       signedInput as unknown as ArrayBuffer,
     );
-  } catch (error) {
-    console.warn("admin-access-step", JSON.stringify({
-      step: "signature_throw",
-      errorName: error instanceof Error ? error.name : typeof error,
-    }));
+  } catch {
     accessDenied();
   }
   if (!signatureValid) {
-    console.warn("admin-access-step", JSON.stringify({
-      step: "signature_invalid",
-    }));
     accessDenied();
   }
 
@@ -386,15 +393,6 @@ export async function verifyAdminAccessAssertion(
     && Number.isFinite(expiry)
     && nowSeconds <= expiry + CLOCK_SKEW_SECONDS;
   if (!issuerOk || !audienceOk || !expiryOk) {
-    // Signature already verified; only claim shape is wrong. Log the category
-    // (not the values) so a misconfigured issuer/audience is diagnosable.
-    console.warn("admin-access-claims", JSON.stringify({
-      issuerOk,
-      audienceOk,
-      expiryOk,
-      issuerType: typeof claims.iss,
-      audType: Array.isArray(claims.aud) ? "array" : typeof claims.aud,
-    }));
     accessDenied();
   }
   const notBefore = claims.nbf;
@@ -411,4 +409,19 @@ export async function verifyAdminAccessAssertion(
         || nowSeconds < issuedAt - CLOCK_SKEW_SECONDS)) {
     accessDenied();
   }
+
+  // Return the verified identity. `sub` is a hard floor — a genuine Access user
+  // token always carries it, so a signature-valid non-user token can never
+  // become an anonymous admin. `email` is the owner gate and audit seed.
+  const sub = claims.sub;
+  if (typeof sub !== "string" || sub.length === 0 || sub.length > 256) {
+    accessDenied();
+  }
+  const rawEmail = claims.email;
+  const email = typeof rawEmail === "string"
+      && rawEmail.length > 0
+      && rawEmail.length <= ADMIN_EMAIL_MAX_LENGTH
+    ? normalizeAdminEmail(rawEmail)
+    : null;
+  return Object.freeze({ sub, email });
 }

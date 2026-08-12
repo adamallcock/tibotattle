@@ -44,7 +44,10 @@ async function request(path, init = {}) {
     ...init,
     headers: {
       ...(init.headers || {}),
-      ...(state.csrfToken ? { "x-usage-monitor-csrf": state.csrfToken } : {}),
+      // Session-independent admin CSRF: this custom header forces a CORS
+      // preflight the admin host never answers, so a cross-origin caller cannot
+      // reach the API. Always sent on the same-origin admin page (no preflight).
+      "x-usage-monitor-admin": "1",
     },
   });
   const body = await response.json().catch(() => null);
@@ -189,14 +192,16 @@ function render(overview) {
 async function load() {
   $("#refresh").disabled = true;
   try {
-    const session = await request("/api/v1/session");
-    state.csrfToken = session.csrfToken;
+    // No app session on the admin host: authentication is Cloudflare Access and
+    // the owner-email pin, and CSRF is the always-sent x-usage-monitor-admin
+    // header. The old /api/v1/session pre-fetch 401'd here and was the dead
+    // console symptom.
     const reference = $("#diagnostic-reference").value.trim();
     const query = reference ? `?diagnosticReference=${encodeURIComponent(reference)}` : "";
     render(projectAdminOverview(await request(`/api/v1/admin/overview${query}`)));
     $("#notice").hidden = true;
   } catch (error) {
-    showNotice(`Operations view unavailable: ${error.message}. Sign in on the dashboard first if needed.`);
+    showNotice(`Operations view unavailable: ${error.message}.`);
   } finally {
     $("#refresh").disabled = false;
   }
