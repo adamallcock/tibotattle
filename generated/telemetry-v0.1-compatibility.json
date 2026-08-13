@@ -13,7 +13,7 @@
     "transportReady": false
   },
   "fieldContract": {
-    "sha256": "f7dfca471370309cbc60b642360ed9879240c1d92bf8bf9aa90877fc2fab8706",
+    "sha256": "87913a139348123a67291dcf47f7da04edb8b86e8a65b917dbb1653413d2307f",
     "version": "telemetry-field-dictionary-v0.1"
   },
   "implementation": {
@@ -90,7 +90,7 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
         "name": "compatibility.schema.json",
-        "sha256": "7876f0fe85ac52adb902ea81b9243f5d1e39e09dd9833cde72264015e7e266c5"
+        "sha256": "f766140f83cb30b4a38bb05cc459253bd84c6b686d1116bdb1c99efacbc534d1"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/privacy-receipt.schema.json",
@@ -108,7 +108,7 @@
         "sha256": "0f3203f4949104f7bca19ef2aa926560390965a3dfe564544192641d5ef48fb2"
       }
     ],
-    "setSha256": "478ac4c748aac2aebde02fb0b74c268f7c05bb558aafef27deebf3adfcd5adb5"
+    "setSha256": "6cf448bfec226653b075e55c01528a45ef2bcf28a62c78c72b0aad5bcc85b56c"
   },
   "tupleVersion": "usage-export-compatibility-v0.1"
 }
