@@ -890,11 +890,16 @@ async function seedV1CalibratableReset(options: {
   stepPp: number;
   tag: string;
   unpriceable?: boolean;
+  // Override the nine 10+index*stepPp levels with an explicit used_percent
+  // sequence — e.g. one carrying a small backward "noise" dip.
+  usedPercents?: number[];
 }): Promise<void> {
   const startMs = Date.parse(options.startTime);
   const quotaRecords: V1SeedRecord[] = [];
   const usageRecords: V1SeedRecord[] = [];
-  for (let index = 0; index < 9; index += 1) {
+  const levels = options.usedPercents
+    ?? Array.from({ length: 9 }, (_unused, i) => 10 + i * options.stepPp);
+  for (let index = 0; index < levels.length; index += 1) {
     quotaRecords.push({
       occurrence_id: `q-${options.tag}-${index}`,
       observed_at: new Date(startMs + index * 5 * 60_000).toISOString(),
@@ -905,11 +910,11 @@ async function seedV1CalibratableReset(options: {
       plan_variant: "unknown",
       limit_id: "codex",
       slot: "seven_day",
-      used_percent: 10 + index * options.stepPp,
+      used_percent: levels[index]!,
       window_duration_minutes: 10_080,
       resets_at: options.resetsAt,
     });
-    if (index < 8) {
+    if (index < levels.length - 1) {
       usageRecords.push({
         occurrence_id: `u-${options.tag}-${index}`,
         observed_at: new Date(startMs + index * 5 * 60_000 + 150_000)
@@ -983,6 +988,37 @@ describe("community allowance from the v1.0 chunk corpus", () => {
     expect(summary.centralUsd).not.toBeNull();
     expect(summary.centralUsd!).toBeGreaterThan(0);
     expect(summary.band80Usd).not.toBeNull();
+  });
+
+  it("fits v1 resets carrying small used_percent noise dips (Fix B)", async () => {
+    const participantId = await seedV1Participant("noisy");
+    await seedV1Session(participantId, "v1-session-noisy");
+    await seedV1Device(participantId, "v1-device-noisy", "v1-session-noisy");
+    // A clean 5->68% climb with a 2pp backward jitter at index 5 (33 -> 31),
+    // below MAX_BACKWARD_NOISE_PP. The old strict gate refused the whole reset
+    // for that single dip; Fix B tolerates it and the running-max boundary
+    // builder keeps the boundaries monotonic, so the reset still calibrates.
+    const noisy = [5, 12, 19, 26, 33, 31, 40, 47, 54, 61, 68];
+    const days = ["2026-07-25", "2026-07-26", "2026-07-27"];
+    for (let index = 0; index < days.length; index += 1) {
+      await seedV1CalibratableReset({
+        participantId,
+        deviceId: "v1-device-noisy",
+        day: days[index]!,
+        startTime: `${days[index]!}T12:00:00.000Z`,
+        resetsAt: `2026-08-0${index + 1}T12:00:00.000Z`,
+        stepPp: 0,
+        tag: `noisy-${index}`,
+        usedPercents: noisy,
+      });
+    }
+
+    const fits = await collectCommunityAllowanceFits(db());
+    expect(fits.length).toBeGreaterThanOrEqual(3);
+    for (const one of fits) expect(one.capacityNanousd).toBeGreaterThan(0);
+    const summary = summarizeCommunityAllowanceDay(fits, "2026-07-27");
+    expect(summary.fitCount).toBeGreaterThanOrEqual(3);
+    expect(summary.centralUsd!).toBeGreaterThan(0);
   });
 
   it("returns no fits when v1 resets fall below the 40pp span floor", async () => {
