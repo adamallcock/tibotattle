@@ -393,6 +393,61 @@ const WINNING_DEVICE_CTE = `
      )
   )`;
 
+interface WinningDeviceRow {
+  observed_day: string;
+  device_id: string;
+}
+
+/**
+ * Resolve the winning (observed_day, device_id) set ONCE per analysis.
+ *
+ * The reads below inject this as a literal VALUES table instead of recomputing
+ * WINNING_DEVICE_CTE inline. The old inline form re-scanned the participant's
+ * whole record partition on the quota downsample AND on every usage page
+ * (~1 page per 5k events), so at the owner's ~1.22M-record scale one analysis
+ * read hundreds of millions of rows and never finished inside the per-minute
+ * cron. Resolving it once (a single corpus scan) and threading a ~tens-of-rows
+ * VALUES table keeps every downstream `JOIN winning_devices` byte-identical
+ * while the per-read queries become indexed range scans.
+ */
+async function loadWinningDevices(
+  db: D1Database,
+  participantId: string,
+): Promise<WinningDeviceRow[]> {
+  const result = await db.prepare(
+    `${WINNING_DEVICE_CTE}
+     SELECT observed_day, device_id FROM winning_devices`,
+  ).bind(participantId).all<WinningDeviceRow>();
+  return result.results;
+}
+
+/**
+ * A `(?, ?), (?, ?), …` VALUES list of `count` (observed_day, device_id) pairs,
+ * for a row-value `(r.observed_day, r.device_id) IN (VALUES …)` winner filter.
+ *
+ * The filter is a row-value IN rather than a JOIN on purpose: measured against
+ * the owner's real corpus, `JOIN winning_devices(VALUES …)` was a 453k×N nested
+ * loop (SQLite does not auto-index a small VALUES table here), whereas the IN
+ * form evaluates once per scanned row after the observed_at index range scan.
+ * Byte-identical to the JOIN because the winner pairs are distinct (one device
+ * per day), so neither form multiplies rows.
+ */
+function winnerPairValuesList(count: number): string {
+  return Array.from({ length: count }, () => "(?, ?)").join(", ");
+}
+
+/**
+ * The positional (observed_day, device_id, …) binds the IN VALUES list consumes,
+ * in row order. Bound FIRST, since the winner filter leads each query's WHERE.
+ */
+function winningDeviceBinds(winners: WinningDeviceRow[]): string[] {
+  const binds: string[] = [];
+  for (const winner of winners) {
+    binds.push(winner.observed_day, winner.device_id);
+  }
+  return binds;
+}
+
 /**
  * Windowed run-endpoint quota downsample.
  *
@@ -408,8 +463,14 @@ const WINNING_DEVICE_CTE = `
  * INCLUDES slot (an eligible multi-slot reset has time-disjoint slots); the
  * fitable GROUP BY EXCLUDES slot (= the shared resetKey).
  */
-const QUOTA_DOWNSAMPLE_SQL = `${WINNING_DEVICE_CTE},
-  scoped AS (
+// Binds (in order): the winner (observed_day, device_id) pairs, then
+// participantId, observedAt cutoff, resetsAt cutoff, window minutes, minimum
+// boundaries, minimum span, row limit. Anonymous `?` because the leading winner
+// IN list holds a variable number of binds, so fixed numbering is not possible.
+// `scoped` is MATERIALIZED so its winner-filtered index scan runs once rather
+// than being re-evaluated by both `fitable` and `survivors`.
+function buildQuotaDownsampleSql(winnerCount: number): string {
+  return `WITH scoped AS MATERIALIZED (
     SELECT r.occurrence_id AS occurrence_id,
            r.observed_at AS observed_at,
            r.provider AS provider,
@@ -422,15 +483,14 @@ const QUOTA_DOWNSAMPLE_SQL = `${WINNING_DEVICE_CTE},
            r.resets_at AS resets_at,
            r.id AS id
       FROM telemetry_v1_records r
-      JOIN winning_devices wd
-        ON wd.observed_day = r.observed_day AND wd.device_id = r.device_id
       JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
-     WHERE r.participant_id = ?1
+     WHERE (r.observed_day, r.device_id) IN (VALUES ${winnerPairValuesList(winnerCount)})
+       AND r.participant_id = ?
        AND r.stream = 'quota'
-       AND r.observed_at >= ?2
-       AND r.resets_at >= ?3
+       AND r.observed_at >= ?
+       AND r.resets_at >= ?
        AND r.limit_id = 'codex'
-       AND r.window_duration_minutes = ?4
+       AND r.window_duration_minutes = ?
        AND r.resets_at IS NOT NULL
        AND r.slot IS NOT NULL
        AND r.used_percent IS NOT NULL
@@ -443,8 +503,8 @@ const QUOTA_DOWNSAMPLE_SQL = `${WINNING_DEVICE_CTE},
       FROM scoped
      GROUP BY provider, plan_type, plan_variant, limit_id,
               window_duration_minutes, resets_at
-    HAVING COUNT(DISTINCT used_percent) >= ?5
-       AND (MAX(used_percent) - MIN(used_percent)) >= ?6
+    HAVING COUNT(DISTINCT used_percent) >= ?
+       AND (MAX(used_percent) - MIN(used_percent)) >= ?
   ),
   survivors AS (
     SELECT s.*
@@ -476,21 +536,26 @@ const QUOTA_DOWNSAMPLE_SQL = `${WINNING_DEVICE_CTE},
       OR used_percent <> prev_up
       OR used_percent <> next_up
    ORDER BY observed_at, id
-   LIMIT ?7`;
+   LIMIT ?`;
+}
 
-const USAGE_PAGE_SQL = `${WINNING_DEVICE_CTE}
+// Binds (in order): the winner (observed_day, device_id) pairs, then
+// participantId, observedAt cutoff, keyset cursor observed_at (twice — the `>`
+// and `=` legs), keyset cursor id, page size.
+function buildUsagePageSql(winnerCount: number): string {
+  return `
   SELECT r.id AS id, r.observed_at AS observed_at, r.provider AS provider,
          r.record_json AS record_json
     FROM telemetry_v1_records r
-    JOIN winning_devices wd
-      ON wd.observed_day = r.observed_day AND wd.device_id = r.device_id
     JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
-   WHERE r.participant_id = ?1
+   WHERE (r.observed_day, r.device_id) IN (VALUES ${winnerPairValuesList(winnerCount)})
+     AND r.participant_id = ?
      AND r.stream = 'usage'
-     AND r.observed_at >= ?2
-     AND (r.observed_at > ?3 OR (r.observed_at = ?3 AND r.id > ?4))
+     AND r.observed_at >= ?
+     AND (r.observed_at > ? OR (r.observed_at = ? AND r.id > ?))
    ORDER BY r.observed_at, r.id
-   LIMIT ?5`;
+   LIMIT ?`;
+}
 
 interface ProviderGrid {
   sortedMs: number[];
@@ -556,7 +621,10 @@ async function readAndBucketUsage(
   accountTrackByProvider: Map<string, string>,
   gridByProvider: Map<string, ProviderGrid>,
   maxWindowedUsageRows: number,
+  winners: WinningDeviceRow[],
 ): Promise<UsageEventPartial[] | "limit_exceeded"> {
+  const winnerBinds = winningDeviceBinds(winners);
+  const usagePageSql = buildUsagePageSql(winners.length);
   // Per provider: strictly-interior events keyed by their ceiling grid instant,
   // and grid-exact events kept as their own singleton at that instant (the
   // matchedUsage lower bound is inclusive, so a grid-exact event that equals a
@@ -569,8 +637,16 @@ async function readAndBucketUsage(
   let cursorObs = observedAtCutoff;
   let cursorId = 0;
   for (;;) {
-    const page = await db.prepare(USAGE_PAGE_SQL)
-      .bind(participantId, observedAtCutoff, cursorObs, cursorId, USAGE_PAGE_SIZE)
+    const page = await db.prepare(usagePageSql)
+      .bind(
+        ...winnerBinds,
+        participantId,
+        observedAtCutoff,
+        cursorObs,
+        cursorObs,
+        cursorId,
+        USAGE_PAGE_SIZE,
+      )
       .all<WindowedUsageRow>();
     const rows = page.results;
     if (rows.length === 0) break;
@@ -789,7 +865,19 @@ export async function accountScopedQuotaAnalysisV1(
   // a cycle only when its entire series is at or after the observed_at cutoff.
   const resetsAtCutoff = new Date(cutoffMs + SEVEN_DAY_WINDOW_MS).toISOString();
 
-  const quotaResult = await db.prepare(QUOTA_DOWNSAMPLE_SQL).bind(
+  // Resolve the winner set once; every downstream read reuses it as an inline
+  // (observed_day, device_id) IN (VALUES …) filter (see loadWinningDevices).
+  // No winners means no analyzable records.
+  const winners = await loadWinningDevices(db, participantId);
+  if (winners.length === 0) {
+    return notTestable("supported_quota_track_unavailable");
+  }
+  const winnerBinds = winningDeviceBinds(winners);
+
+  const quotaResult = await db.prepare(
+    buildQuotaDownsampleSql(winners.length),
+  ).bind(
+    ...winnerBinds,
     participantId,
     observedAtCutoff,
     resetsAtCutoff,
@@ -832,6 +920,7 @@ export async function accountScopedQuotaAnalysisV1(
     accountTrackByProvider,
     gridByProvider,
     maxWindowedUsageRows,
+    winners,
   );
   if (usageEvents === "limit_exceeded") {
     return notTestable("windowed_usage_limit_exceeded");
@@ -854,7 +943,12 @@ export async function downsampleQuotaForTest(
   const cutoffMs = nowMs - V1_ANALYSIS_WINDOW_MS;
   const observedAtCutoff = new Date(cutoffMs).toISOString();
   const resetsAtCutoff = new Date(cutoffMs + SEVEN_DAY_WINDOW_MS).toISOString();
-  const result = await db.prepare(QUOTA_DOWNSAMPLE_SQL).bind(
+  const winners = await loadWinningDevices(db, participantId);
+  if (winners.length === 0) return [];
+  const result = await db.prepare(
+    buildQuotaDownsampleSql(winners.length),
+  ).bind(
+    ...winningDeviceBinds(winners),
     participantId,
     observedAtCutoff,
     resetsAtCutoff,
