@@ -836,7 +836,12 @@ function v1PriceableUsageJson(): string {
     apiServiceTier: "priority",
     speedMode: "fast",
     reasoningEffort: "xhigh",
-    totalInputContextTokens: 1000,
+    // Real v1 usage records carry totalInputContextTokens null; the analyzer
+    // derives it from the input components (100 + 900 + 0 = 1000, the same
+    // value), so this fixture stays faithful AND regression-tests that
+    // derivation — without it, the OpenAI context-sensitive pricer fails closed
+    // (total_input_context_missing) and refuses every reset.
+    totalInputContextTokens: null,
     components: {
       inputUncachedTokens: 100,
       inputCacheReadTokens: 900,

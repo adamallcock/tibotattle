@@ -55,8 +55,10 @@ const NANOUSD_PER_USD = 1_000_000_000;
 // Bump when the v1 fit-adapter's synthesis, pricing basis, or cohort
 // definition changes, so a stale fit cache (keyed partly on this) invalidates
 // without a chunk change. v1-fit-2: cohort by plan_type alone (dropped the
-// synthesized pro-20x variant pin).
-const FIT_ADAPTER_VERSION = "v1-fit-2";
+// synthesized pro-20x variant pin). v1-fit-3: derive totalInputContextTokens
+// for v1 usage (records carry it null) + drop no-observation records, so the
+// OpenAI context-sensitive pricer no longer refuses every reset.
+const FIT_ADAPTER_VERSION = "v1-fit-3";
 
 export interface CommunityAllowanceFit {
   participantId: string;

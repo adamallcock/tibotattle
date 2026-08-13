@@ -251,6 +251,37 @@ function buildPricingEvent(
     return null;
   }
   const c = components as Record<string, unknown>;
+  const inputUncachedTokens = c.inputUncachedTokens ?? null;
+  const inputCacheReadTokens = c.inputCacheReadTokens ?? null;
+  const inputCacheWriteTokens = c.inputCacheWriteTokens ?? null;
+  const outputTextTokens = c.outputTextTokens ?? null;
+  const outputReasoningTokens = c.outputReasoningTokens ?? null;
+  const outputCombinedTokens = c.outputCombinedTokens ?? null;
+  // A record with no token observations at all carries no measurable usage.
+  // Drop it (DROP semantics) rather than emit a shapeable-but-unpriceable event:
+  // that event would price as component_observation_unavailable and refuse the
+  // whole reset (quota-tracks incomplete_server_pricing) for zero cost lost.
+  if (inputUncachedTokens === null && inputCacheReadTokens === null
+      && inputCacheWriteTokens === null && outputTextTokens === null
+      && outputReasoningTokens === null && outputCombinedTokens === null) {
+    return null;
+  }
+  // v1 records do not carry totalInputContextTokens, but the OpenAI
+  // context-sensitive price tiers require it — server-pricing fails closed with
+  // total_input_context_missing (unpriced) otherwise, which refused EVERY reset
+  // of a v1-only participant. Derive it from the input token components: the
+  // total input context is the uncached + cache-read + cache-write input the
+  // request billed.
+  const tokenNumber = (value: unknown): number =>
+    typeof value === "number" && Number.isFinite(value) ? value : 0;
+  const derivedInputContext = tokenNumber(inputUncachedTokens)
+    + tokenNumber(inputCacheReadTokens)
+    + tokenNumber(inputCacheWriteTokens);
+  const suppliedContext = rec.totalInputContextTokens;
+  const totalInputContextTokens =
+    typeof suppliedContext === "number" && Number.isFinite(suppliedContext)
+      ? suppliedContext
+      : derivedInputContext;
   const event = {
     schemaVersion: "usage-event-v0.1",
     eventTime: observedAt,
@@ -263,16 +294,16 @@ function buildPricingEvent(
     apiServiceTier: rec.apiServiceTier,
     reasoningEffort: rec.reasoningEffort,
     components: {
-      inputUncachedTokens: c.inputUncachedTokens ?? null,
-      inputCacheReadTokens: c.inputCacheReadTokens ?? null,
-      inputCacheWriteTokens: c.inputCacheWriteTokens ?? null,
+      inputUncachedTokens,
+      inputCacheReadTokens,
+      inputCacheWriteTokens,
       inputCacheWrite5mTokens: null,
       inputCacheWrite1hTokens: null,
-      outputTextTokens: c.outputTextTokens ?? null,
-      outputReasoningTokens: c.outputReasoningTokens ?? null,
-      outputCombinedTokens: c.outputCombinedTokens ?? null,
+      outputTextTokens,
+      outputReasoningTokens,
+      outputCombinedTokens,
     },
-    totalInputContextTokens: rec.totalInputContextTokens ?? null,
+    totalInputContextTokens,
   };
   return event as unknown as TelemetryUsageEvent;
 }
