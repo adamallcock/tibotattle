@@ -58,7 +58,7 @@ const NANOUSD_PER_USD = 1_000_000_000;
 // synthesized pro-20x variant pin). v1-fit-3: derive totalInputContextTokens
 // for v1 usage (records carry it null) + drop no-observation records, so the
 // OpenAI context-sensitive pricer no longer refuses every reset.
-const FIT_ADAPTER_VERSION = "v1-fit-3";
+const FIT_ADAPTER_VERSION = "v1-fit-4";
 
 export interface CommunityAllowanceFit {
   participantId: string;

@@ -16,6 +16,14 @@ const SAFE_TOKEN = /^[a-z0-9][a-z0-9_.:-]{0,127}$/u;
 const OPAQUE_ID = /^[a-z][a-z0-9_-]{0,31}:v[0-9]+:[a-f0-9]{64}$/u;
 const MAX_RECEIPT_LAG_MS = 5 * 60_000;
 const MAX_COST_NANOUSD = 90_000_000_000_000;
+// Integer used_percent readings jitter by a point or two between observations
+// (measured: 21 of 25 refused resets in real dense data had a max backward step
+// of only 1-2pp, all under 5). That is measurement noise, not a mid-window quota
+// reset — a genuine reset drops the reading ~100pp toward zero. Tolerate
+// sub-threshold dips so a clean 0->100% climb is not discarded over a 1pp
+// wobble; a single drop larger than this still refuses, so a window that spans
+// an actual reset boundary is never fit as one cycle.
+const MAX_BACKWARD_NOISE_PP = 5;
 
 const DATASET_KEYS = ["datasetId", "complete"];
 const QUOTA_KEYS = [
@@ -266,7 +274,8 @@ function buildOneReset(rows, allUsage, datasetStatus) {
     return lag < 0 || lag > MAX_RECEIPT_LAG_MS;
   })) refusals.push("stale_quota_observation");
   if (ordered.some((row, index) => (
-    index > 0 && row.usedPercent < ordered[index - 1].usedPercent
+    index > 0
+    && ordered[index - 1].usedPercent - row.usedPercent > MAX_BACKWARD_NOISE_PP
   ))) refusals.push("backward_quota_observation");
   if (matchedUsage.some((row) => row.pricingStatus !== "fully_priced")) {
     refusals.push("incomplete_server_pricing");
@@ -372,4 +381,5 @@ export function buildResetEvidence(input) {
 export const QUOTA_TRACK_POLICY = Object.freeze({
   supportedDurationsMinutes: SUPPORTED_QUOTA_WINDOW_DURATIONS,
   maximumReceiptLagMs: MAX_RECEIPT_LAG_MS,
+  maximumBackwardNoisePp: MAX_BACKWARD_NOISE_PP,
 });
