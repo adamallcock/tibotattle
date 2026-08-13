@@ -71,3 +71,6 @@ apps/macos/.build/
 # Per-machine Claude Code state: local permission settings and agent worktrees.
 .claude/settings.local.json
 .claude/worktrees/
+
+# Local-only companion docs (secret maps, machine-specific notes) — never commit
+*.local.md
