@@ -32,6 +32,7 @@ import {
   renderInstallerJourney as renderSharedInstallerJourney,
 } from "./install-cta.js";
 import {
+  COMPOSITION_MINIMUM_MODEL_COST_SHARE_PERCENT,
   createBrowserLocalization,
 } from "./localization.js";
 import {
@@ -1404,6 +1405,13 @@ function renderComparison(data) {
       && !Array.isArray(weeklySummary.capacity_by_model)
     ? weeklySummary.capacity_by_model
     : null;
+  // The fitted mix behind that vector, so the disclosure can name the models
+  // that consumed the allowance without earning a column of their own.
+  const modelCostShares = weeklySummary.model_cost_shares
+      && typeof weeklySummary.model_cost_shares === "object"
+      && !Array.isArray(weeklySummary.model_cost_shares)
+    ? weeklySummary.model_cost_shares
+    : null;
   const lower = finite(
     weeklySummary.lower_80_across_resets_usd
       ?? weeklySummary.lower80Usd
@@ -1421,7 +1429,14 @@ function renderComparison(data) {
     0,
   );
   const chip = $("#fit-chip");
-  renderCalibrationRate({ capacity, lower, upper, qualifyingResets, capacityByModel });
+  renderCalibrationRate({
+    capacity,
+    lower,
+    upper,
+    qualifyingResets,
+    capacityByModel,
+    modelCostShares,
+  });
   if (!pair || pair.observed === null || pair.expected === null) {
     setProductText(chip, "Insufficient");
     setProductText(
@@ -1462,12 +1477,13 @@ function renderCalibrationRate({
   upper,
   qualifyingResets = 0,
   capacityByModel = null,
+  modelCostShares = null,
 }) {
   const rate = $("#calibration-rate");
   const range = $("#calibration-range");
   const example = $("#calibration-example");
   const explanation = $("#calibration-explanation");
-  renderCalibrationModelRates(capacityByModel);
+  renderCalibrationModelRates(capacityByModel, modelCostShares);
   if (capacity === null || capacity <= 0) {
     setProductText(rate, "Not estimable");
     setProductText(range, "Not estimable");
@@ -1505,39 +1521,109 @@ function renderCalibrationRate({
   }
 }
 
+// Mirrors `MODEL_COMPOSITION_POLICY.otherModelKey` in the composition kernel:
+// the column every model under the share floor is folded into. It is a rate,
+// not a model, so it is never listed as one.
+const COMPOSITION_OTHER_MODEL_KEY = "other";
+
+// One row of the per-model disclosure: the model's display name, an optional
+// qualifier explaining why it has no fitted rate of its own, and the rate the
+// fit charges it.
+function calibrationModelRow(model, perPointUsd, qualifier) {
+  const item = node("li", "");
+  const label = node("span", "calibration-model-label");
+  const name = node("span", "");
+  // Model identifiers arrive from the local companion payload; the formatter
+  // maps only reviewed fragments and never echoes free text.
+  setRawText(name, formatModelName(model));
+  label.append(name);
+  if (qualifier) {
+    label.append(localizedNode("small", "", qualifier.key, qualifier.values));
+  }
+  const perPoint = node("strong", "");
+  if (perPointUsd === null) {
+    setLocalizedText(perPoint, "dashboard.calibration.perModelRateUnavailable");
+  } else {
+    setLocalizedText(perPoint, "dashboard.calibration.perModelRate", {
+      amount: formatMoney(perPointUsd, 2),
+    });
+  }
+  item.append(label, perPoint);
+  return item;
+}
+
 // The per-model disclosure under the blended headline (owner decision
 // 2026-08-10: blended "$X per point" stays the headline; per-model detail on
-// expand). Only rates the NNLS fit actually resolved are listed — a model the
-// fit could not identify is omitted rather than shown at the blend, and with
-// no resolved rates the whole disclosure stays hidden.
-function renderCalibrationModelRates(capacityByModel) {
+// expand).
+//
+// The rates the NNLS fit resolved lead the list. Under them come the models
+// the fit saw but could not price on their own — anything below the kernel's
+// share floor is folded into the pooled remainder column, which is exactly
+// how their cost is priced downstream. Listing only the resolved rates read as
+// if the missing models had never been used at all, which is the one thing
+// this card must not imply about real usage. With no resolved rate the whole
+// disclosure still stays hidden: there is no per-model detail to disclose.
+function renderCalibrationModelRates(capacityByModel, modelCostShares) {
   const details = $("#calibration-models");
   const list = $("#calibration-model-list");
+  const sharedNote = $("#calibration-model-shared");
   if (!details || !list) return;
-  const rows = Object.entries(capacityByModel ?? {})
-    .filter(([model, value]) => model !== "other"
-      && typeof model === "string"
-      && Number.isFinite(value)
-      && value > 0)
+  const vector = capacityByModel && typeof capacityByModel === "object"
+      && !Array.isArray(capacityByModel)
+    ? capacityByModel
+    : {};
+  const fittedRate = (model) => (
+    model !== COMPOSITION_OTHER_MODEL_KEY
+      && Number.isFinite(vector[model])
+      && vector[model] > 0
+      ? vector[model]
+      : null
+  );
+  const rows = Object.keys(vector)
+    .filter((model) => typeof model === "string" && fittedRate(model) !== null)
+    .sort((left, right) => fittedRate(right) - fittedRate(left));
+  const pooled = Number.isFinite(vector[COMPOSITION_OTHER_MODEL_KEY])
+      && vector[COMPOSITION_OTHER_MODEL_KEY] > 0
+    ? vector[COMPOSITION_OTHER_MODEL_KEY]
+    : null;
+  const shares = modelCostShares && typeof modelCostShares === "object"
+      && !Array.isArray(modelCostShares)
+    ? modelCostShares
+    : {};
+  const shared = Object.entries(shares)
+    .filter(([model, share]) => typeof model === "string"
+      && model !== COMPOSITION_OTHER_MODEL_KEY
+      && fittedRate(model) === null
+      && Number.isFinite(share)
+      && share > 0)
     .sort(([, left], [, right]) => right - left);
   list.textContent = "";
+  if (sharedNote) sharedNote.hidden = true;
   if (rows.length === 0) {
     details.hidden = true;
     details.open = false;
     return;
   }
-  for (const [model, value] of rows) {
-    const item = document.createElement("li");
-    const name = document.createElement("span");
-    // Model identifiers arrive from the local companion payload; the
-    // formatter maps only reviewed fragments and never echoes free text.
-    setRawText(name, formatModelName(model));
-    const perPoint = document.createElement("strong");
-    setRawText(perPoint, t("dashboard.calibration.perModelRate", {
-      amount: formatMoney(value / 100, 2),
-    }));
-    item.append(name, perPoint);
-    list.append(item);
+  for (const model of rows) {
+    list.append(calibrationModelRow(model, fittedRate(model) / 100, null));
+  }
+  for (const [model, share] of shared) {
+    list.append(calibrationModelRow(
+      model,
+      pooled === null ? null : pooled / 100,
+      {
+        key: pooled === null
+          ? "dashboard.calibration.perModelNoRate"
+          : "dashboard.calibration.perModelShared",
+        values: { share: formatPercent(share * 100, 1) },
+      },
+    ));
+  }
+  if (sharedNote && shared.length > 0) {
+    setLocalizedText(sharedNote, "dashboard.calibration.perModelSharedExplainer", {
+      threshold: formatPercent(COMPOSITION_MINIMUM_MODEL_COST_SHARE_PERCENT),
+    });
+    sharedNote.hidden = false;
   }
   details.hidden = false;
 }

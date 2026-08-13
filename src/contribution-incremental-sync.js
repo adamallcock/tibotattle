@@ -47,6 +47,17 @@ const MAX_MANIFEST_WINDOWS_PER_PASS = 120;
 const MANIFEST_WINDOW_DAYS = 31;
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
 const MAXIMUM_RETRY_AFTER_MILLISECONDS = 7 * 24 * 60 * 60 * 1_000;
+// A single request must never outlive the pass. A connection that stalls
+// mid-flight — a service redeploy that accepts the socket and sends headers,
+// then never finishes the body (observed live 2026-08-12: a backfill froze at
+// 56/88 with running:true for nine minutes after a transient 5xx) — would
+// otherwise pin the pass on a fetch that never settles, with only the
+// controller's minutes-long pass deadline as a backstop. Each request carries
+// its own bounded deadline, composed with any caller abort, so a stall
+// surfaces as a retryable service_unavailable within seconds rather than
+// hanging the pass behind an in-flight read.
+const DEFAULT_REQUEST_TIMEOUT_MILLISECONDS = 60_000;
+const MAXIMUM_REQUEST_TIMEOUT_MILLISECONDS = 5 * 60 * 1_000;
 const IMF_FIXDATE =
   /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/u;
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
@@ -344,6 +355,7 @@ export async function runIncrementalContributionSyncOnce({
   createEnvelope = createTelemetryV1Envelope,
   openIndex = openLocalUnifiedIndex,
   maximumChunks = DEFAULT_MAXIMUM_CHUNKS_PER_PASS,
+  requestTimeoutMilliseconds = DEFAULT_REQUEST_TIMEOUT_MILLISECONDS,
   now = Date.now,
 } = {}) {
   if (typeof indexFile !== "string" || indexFile.length < 1
@@ -356,6 +368,9 @@ export async function runIncrementalContributionSyncOnce({
       || !Number.isSafeInteger(maximumChunks)
       || maximumChunks < 1
       || maximumChunks > MAXIMUM_CHUNKS_PER_PASS
+      || !Number.isSafeInteger(requestTimeoutMilliseconds)
+      || requestTimeoutMilliseconds < 1_000
+      || requestTimeoutMilliseconds > MAXIMUM_REQUEST_TIMEOUT_MILLISECONDS
       || (signal !== undefined && !(signal instanceof AbortSignal))) {
     fail("invalid_configuration");
   }
@@ -394,8 +409,18 @@ export async function runIncrementalContributionSyncOnce({
   // Any resolved fetch — success or server rejection — is real network
   // activity; only a request that never resolved leaves the pass silent.
   const suppliedFetch = fetchImpl;
-  fetchImpl = async (...requestArguments) => {
-    const response = await suppliedFetch(...requestArguments);
+  fetchImpl = async (url, options = {}) => {
+    // Compose the caller's abort (the controller's pass deadline) with a
+    // fresh per-request deadline: whichever fires first aborts this fetch and
+    // any in-flight body read, and requestJson maps the rejection to a
+    // retryable service_unavailable. Without the per-request deadline a
+    // stalled read never settles and the entire pass hangs behind it.
+    const { signal: callerSignal, ...rest } = options;
+    const deadlineSignal = AbortSignal.timeout(requestTimeoutMilliseconds);
+    const requestSignal = callerSignal === undefined
+      ? deadlineSignal
+      : AbortSignal.any([callerSignal, deadlineSignal]);
+    const response = await suppliedFetch(url, { ...rest, signal: requestSignal });
     networkContacted = true;
     return response;
   };

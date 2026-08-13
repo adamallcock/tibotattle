@@ -128,10 +128,11 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     errors: { ...overview.errors, groups: [], recentDiagnostics: [] },
     audit: [],
   };
+  // The admin host authenticates from the Cloudflare Access JWT and sends the
+  // x-usage-monitor-admin CSRF header, so load() no longer pre-fetches a session
+  // token — each load is a single /api/v1/admin/overview request.
   const responses = [
-    { csrfToken: "csrf-token" },
     overview,
-    { csrfToken: "csrf-token" },
     emptyOverview,
   ];
   let fetchCount = 0;
@@ -206,7 +207,7 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     assert.equal(documentRef.byId.get("recent-diagnostic-empty").hidden, true);
 
     await documentRef.byId.get("refresh").listeners.get("click")();
-    assert.equal(fetchCount, 4);
+    assert.equal(fetchCount, 2);
     assert.deepEqual(tableTexts(documentRef, "error-groups"), []);
     assert.deepEqual(tableTexts(documentRef, "snapshot-rows"), []);
     assert.deepEqual(tableTexts(documentRef, "audit-rows"), []);

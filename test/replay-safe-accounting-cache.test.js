@@ -1871,6 +1871,117 @@ test("Spark quota observations stay outside the normal weekly quota timeline", a
   }]);
 });
 
+// Real captures report the Spark allowance as `codex_bengalfox`;
+// `codex-spark` is the reserved marketing token that has never been observed.
+// The scan must retain both, each row keeping its observed limit id — the
+// consumers filter with SPARK_QUOTA_LIMIT_IDS — or the cached spark series is
+// permanently empty against every real capture.
+test("Spark quota snapshots are retained under every real Spark limit id and round-trip", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-spark-ids-"));
+  const cacheFile = join(directory, "accounting.json");
+  const cache = await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
+    scan: async ({ onRateLimitSnapshot }) => {
+      onRateLimitSnapshot(weeklySnapshot({
+        timestamp: "2026-07-27T11:58:00.000Z",
+        usedPercent: 12,
+      }));
+      onRateLimitSnapshot(weeklySnapshot({
+        timestamp: "2026-07-27T11:59:00.000Z",
+        usedPercent: 33,
+        limitId: "codex_bengalfox",
+        durationMinutes: 300,
+      }));
+      onRateLimitSnapshot(weeklySnapshot({
+        timestamp: "2026-07-27T11:59:30.000Z",
+        usedPercent: 4,
+        limitId: "codex-spark",
+        durationMinutes: 300,
+      }));
+      return { diagnostics: {} };
+    },
+  });
+
+  assert.deepEqual(cache.quotaTimeline.map((row) => row.limitId), ["codex"]);
+  assert.deepEqual(
+    cache.sparkQuotaTimeline.map((row) => [row.limitId, row.usedPercent]),
+    [["codex_bengalfox", 33], ["codex-spark", 4]],
+  );
+  // The mixed-id series survives its own read validation: validQuotaTimeline
+  // accepts every id in SPARK_QUOTA_LIMIT_IDS on the spark timeline.
+  const read = await readReplaySafeAccountingCache({ cacheFile });
+  assert.equal(read.status, "available");
+  assert.equal(read.errorCode, null);
+  assert.deepEqual(read.cache, cache);
+});
+
+// At one instant the two Spark ids are two tracks whose retained order must
+// be the order the read-side sortKey check expects. localeCompare's variable
+// punctuation weighting puts "codex_bengalfox" before "codex-spark" while the
+// code-unit check puts them the other way around; a cache emitted in
+// collation order would be rejected by its own read validation.
+test("same-instant readings under both Spark ids stay deterministic and readable", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-spark-tie-"));
+  const cacheFile = join(directory, "accounting.json");
+  const snapshots = [
+    weeklySnapshot({
+      timestamp: "2026-07-27T11:59:00.000Z",
+      usedPercent: 33,
+      limitId: "codex_bengalfox",
+      durationMinutes: 300,
+    }),
+    weeklySnapshot({
+      timestamp: "2026-07-27T11:59:00.000Z",
+      usedPercent: 4,
+      limitId: "codex-spark",
+      durationMinutes: 300,
+    }),
+  ];
+  const build = async (orderedSnapshots) => refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
+    scan: async ({ onRateLimitSnapshot }) => {
+      for (const snapshot of orderedSnapshots) onRateLimitSnapshot(snapshot);
+      return { diagnostics: {} };
+    },
+  });
+  const cache = await build(snapshots);
+  const reversed = await build([...snapshots].reverse());
+
+  assert.deepEqual(cache.sparkQuotaTimeline, reversed.sparkQuotaTimeline);
+  assert.deepEqual(
+    cache.sparkQuotaTimeline.map((row) => row.limitId),
+    ["codex-spark", "codex_bengalfox"],
+  );
+  const read = await readReplaySafeAccountingCache({ cacheFile });
+  assert.equal(read.status, "available");
+  assert.equal(read.errorCode, null);
+});
+
+// Every v0.7 cache was built matching "codex-spark" only, so its spark series
+// is empty against real captures. The schema bump withholds those caches for
+// rebuild instead of serving them as evidence that no Spark history exists.
+test("a v0.7 cache with the permanently empty spark series is withheld for rebuild", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-spark-stale-"));
+  const cacheFile = join(directory, "accounting.json");
+  const cache = await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
+    scan: scanner([]),
+  });
+  await writeTestCache(cacheFile, {
+    ...cache,
+    schemaVersion: "local-replay-safe-accounting-v0.7",
+  });
+
+  assert.deepEqual(await readReplaySafeAccountingCache({ cacheFile }), {
+    status: "unavailable",
+    errorCode: "cache_accounting_semantics_outdated",
+    cache: null,
+  });
+});
+
 test("exact retained quota points make an eligible comparison window testable", async () => {
   const cache = await buildReplaySafeAccountingCache({
     now: () => Date.parse("2026-07-27T17:00:00.000Z"),

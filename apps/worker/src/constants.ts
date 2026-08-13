@@ -26,7 +26,12 @@ export const DEVICE_PAIRING_TTL_MILLISECONDS = 10 * 60 * 1000;
 export const DEVICE_CREDENTIAL_TTL_MILLISECONDS = 30 * 24 * 60 * 60 * 1000;
 export const RECOVERY_RETRY_TTL_MILLISECONDS = 5 * 60 * 1000;
 export const RECOVERY_RETRY_LIMIT = 2;
-export const QUARANTINE_RETENTION_MILLISECONDS = 7 * 24 * 60 * 60 * 1000;
+// Owner decision 2026-08-10: raw upload envelopes are retained indefinitely.
+// `null` means "no age-based deletion is scheduled", never "delete now"; every
+// consumer must surface the absence rather than substitute a date. Orphan
+// reconciliation still removes R2 objects that no D1 row references, which is
+// crash-safety cleanup rather than a retention window.
+export const QUARANTINE_RETENTION_MILLISECONDS: number | null = null;
 export const QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS =
   60 * 60 * 1000;
 export const BACKEND_LIFECYCLE_STALE_MILLISECONDS = 2 * 60 * 60 * 1000;

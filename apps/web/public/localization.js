@@ -32,6 +32,13 @@ export const LANGUAGE_OPTIONS = Object.freeze([
 export const WEEKLY_CALIBRATION_MINIMUM_QUOTA_BOUNDARIES = 8;
 export const WEEKLY_CALIBRATION_MINIMUM_DISPLAYED_SPAN_PP = 5;
 
+// Mirrors `MODEL_COMPOSITION_POLICY.minimumModelCostShare` in the composition
+// kernel: a model under this share of the fitted mix is never given a free
+// parameter of its own and is priced at the pooled remainder rate instead.
+// Same provenance rule as the two gates above - guarded by a source contract
+// test, because the per-model card states this threshold to the reader.
+export const COMPOSITION_MINIMUM_MODEL_COST_SHARE_PERCENT = 2;
+
 const RTL_LANGUAGES = new Set([
   "ar",
   "arc",
@@ -304,6 +311,14 @@ export const WEB_MESSAGES = Object.freeze({
   "dashboard.calibration.perModelSummary": ["Per-model rates", "各模型费率", "Tasas por modelo"],
   "dashboard.calibration.perModelExplainer": ["Each model consumes the weekly allowance at its own rate, so the headline blends these over your recent mix.", "每个模型以各自的速率消耗每周额度，因此标题按你近期的模型组合对这些费率加权混合。", "Cada modelo consume la asignación semanal a su propia tasa, así que el titular las combina según tu mezcla reciente."],
   "dashboard.calibration.perModelRate": ["{amount} per point", "每点 {amount}", "{amount} por punto"],
+  // A model too small for its own fitted column still consumed the allowance,
+  // and dropping it from this list made the card read as if it had not been
+  // seen at all. It is named here against the rate the fit actually charges
+  // it: the pooled remainder column, or nothing when that column is empty too.
+  "dashboard.calibration.perModelShared": ["Shared rate · {share} of the fitted mix", "共享费率 · 占拟合组合的 {share}", "Tasa compartida · {share} de la mezcla ajustada"],
+  "dashboard.calibration.perModelNoRate": ["No fitted rate · {share} of the fitted mix", "无拟合费率 · 占拟合组合的 {share}", "Sin tasa ajustada · {share} de la mezcla ajustada"],
+  "dashboard.calibration.perModelRateUnavailable": ["Not separately estimable", "无法单独估算", "No estimable por separado"],
+  "dashboard.calibration.perModelSharedExplainer": ["A model holding less than {threshold} of the fitted mix is too small to carry a rate of its own, so its usage is priced at one rate fitted for the remainder.", "占拟合组合不足 {threshold} 的模型太小，无法单独承载自己的费率，因此其使用量按为其余部分拟合的统一费率计价。", "Un modelo con menos del {threshold} de la mezcla ajustada es demasiado pequeño para tener una tasa propia, así que su uso se valora con una única tasa ajustada para el resto."],
   "dashboard.calibration.example": ["$100 of recorded API-price-equivalent usage corresponds to about {points} percentage points.", "记录的 API 价格等价值使用量每 100 美元约对应 {points} 个百分点。", "100 USD de uso registrado equivalente al precio de API corresponden a unos {points} puntos porcentuales."],
   "dashboard.calibration.noRate": [`The weekly calibration contract requires at least ${WEEKLY_CALIBRATION_MINIMUM_QUOTA_BOUNDARIES} unique quota-boundary observations spanning at least ${WEEKLY_CALIBRATION_MINIMUM_DISPLAYED_SPAN_PP} displayed percentage points, plus a valid positive fit, before TiboTattle can estimate this rate and range. API prices remain a measuring stick, not a subscription charge.`, `每周校准契约要求至少 ${WEEKLY_CALIBRATION_MINIMUM_QUOTA_BOUNDARIES} 个唯一额度边界观测值，跨度至少为 ${WEEKLY_CALIBRATION_MINIMUM_DISPLAYED_SPAN_PP} 个显示百分点，并且拟合必须有效且为正，TiboTattle 才能估算此费率和区间。API 价格仍只是衡量尺，而不是订阅费用。`, `El contrato de calibración semanal exige al menos ${WEEKLY_CALIBRATION_MINIMUM_QUOTA_BOUNDARIES} observaciones únicas de límites de cuota que abarquen al menos ${WEEKLY_CALIBRATION_MINIMUM_DISPLAYED_SPAN_PP} puntos porcentuales mostrados, además de un ajuste positivo válido, antes de que TiboTattle pueda estimar esta tasa y su intervalo. Los precios de API siguen siendo una referencia, no un cargo de suscripción.`],
   "dashboard.calibration.withRange": ["Across {count} qualifying resets, the fitted seven-day allowance is {amount}; the middle 80% of those estimates spans {lower}–{upper}. Observed movement comes from the provider. Cost-implied movement translates local activity using the price in effect when each event occurred.", "在 {count} 次合格重置中，拟合的七天额度为 {amount}；这些估计的中间 80% 范围为 {lower}–{upper}。观测变化来自提供商。成本推算变化使用每个事件发生时有效的价格换算本地活动。", "En {count} reinicios válidos, el límite ajustado de siete días es {amount}; el 80 % central de esas estimaciones abarca {lower}–{upper}. El movimiento observado procede del proveedor. El movimiento implícito por coste traduce la actividad local con el precio vigente cuando ocurrió cada evento."],
@@ -943,6 +958,11 @@ export const WEB_MESSAGES = Object.freeze({
   "community.allowance.chartLabel": ["Community allowance estimate chart", "社区额度估计图表", "Gráfico de estimación de asignación comunitaria"],
   "community.allowance.chartDescription": ["Fitted seven-day allowance value in API-equivalent dollars per published day: a central line, a shaded middle-80% range where published, and dots sized by the number of qualifying reset fits. Days without estimates appear as gaps.", "每个已发布日期的拟合七天额度价值（API 等价美元）：一条中心线、发布时的中间 80% 阴影范围，以及按合格重置拟合数量确定大小的圆点。没有估计的日期显示为空缺。", "Valor ajustado de la asignación de siete días en dólares equivalentes de API por día publicado: una línea central, un rango sombreado del 80 % central donde se publicó, y puntos cuyo tamaño refleja el número de ajustes de restablecimiento que califican. Los días sin estimaciones aparecen como huecos."],
   "community.allowance.sparseNote": ["The allowance series is still filling in. Dots mark the few published estimates so far.", "额度序列仍在补充中。圆点标记目前已发布的少量估计。", "La serie de asignación todavía se está completando. Los puntos marcan las pocas estimaciones publicadas hasta ahora."],
+  // Compact strings for the on-chart hover tooltip: a small caption under the
+  // central dollar value, and a single-line plausible-range row (the legend and
+  // headline carry the full-sentence forms).
+  "community.allowance.tooltipCentralCaption": ["central estimate", "中心估计", "estimación central"],
+  "community.allowance.tooltipRange": ["Plausible range {lower}–{upper}", "合理范围 {lower}–{upper}", "Rango plausible {lower}–{upper}"],
   "community.allowance.methodNote": ["Each point is the median fitted seven-day Codex allowance across every qualifying reset fit observed in the trailing 30 days, across contributing accounts on the Codex Pro (20x) plan, valued at API prices. Fits from other plan cohorts are never mixed into this series. Fits qualify by the shared calibration gates (boundaries, span, holdout, sensitivity) with no display-side span floor. Like every day here, estimates recompute as late data arrives.", "每个点都是过去 30 天内观测到的所有合格重置拟合在 Codex Pro（20x）方案贡献账户上的拟合七天 Codex 额度中位数，按 API 价格计值。其他方案群组的拟合绝不会混入此序列。拟合按共享校准门槛（边界、跨度、留出验证、敏感度）合格，不含显示侧跨度下限。与此处的每一天一样，估计会随迟到数据的到达而重新计算。", "Cada punto es la mediana de la asignación de Codex de siete días ajustada sobre todos los ajustes de restablecimiento que califican observados en los últimos 30 días, en las cuentas contribuyentes del plan Codex Pro (20x), valorada a precios de API. Los ajustes de otras cohortes de plan nunca se mezclan en esta serie. Los ajustes califican según las puertas de calibración compartidas (límites, amplitud, validación, sensibilidad) sin umbral de amplitud del lado de la presentación. Como cada día aquí, las estimaciones se recalculan cuando llegan datos tardíos."],
 });
 

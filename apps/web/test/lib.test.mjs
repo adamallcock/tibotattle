@@ -4351,6 +4351,36 @@ test("participant history keeps lifecycle and provenance bounded and private", a
     "2026-08-02T12:00:00.000Z";
   assert.equal(normalizeParticipantHistory(badRetention).reason, "invalid_contract");
 
+  // Retention disabled: the service publishes a null window, and every
+  // contribution must then carry a null schedule rather than a stale date.
+  const retentionDisabled = structuredClone(profile);
+  retentionDisabled.historyPolicy.quarantineRetentionMilliseconds = null;
+  retentionDisabled.contributions[0].quarantine.scheduledDeletionAt = null;
+  const disabledHistory = normalizeParticipantHistory(retentionDisabled);
+  assert.equal(disabledHistory.state, "ready");
+  assert.equal(disabledHistory.items[0].quarantine.scheduledDeletionAt, null);
+  assert.equal(disabledHistory.items[0].quarantine.state, "retained");
+
+  const disabledWithSchedule = structuredClone(retentionDisabled);
+  disabledWithSchedule.contributions[0].quarantine.scheduledDeletionAt =
+    "2026-08-01T12:00:00.000Z";
+  assert.equal(
+    normalizeParticipantHistory(disabledWithSchedule).reason,
+    "invalid_contract",
+  );
+
+  const enabledWithoutSchedule = structuredClone(profile);
+  enabledWithoutSchedule.contributions[0].quarantine.scheduledDeletionAt = null;
+  assert.equal(
+    normalizeParticipantHistory(enabledWithoutSchedule).reason,
+    "invalid_contract",
+  );
+
+  // A zero window is a malformed contract, never "delete immediately".
+  const zeroRetention = structuredClone(profile);
+  zeroRetention.historyPolicy.quarantineRetentionMilliseconds = 0;
+  assert.equal(normalizeParticipantHistory(zeroRetention).reason, "invalid_contract");
+
   const badCounts = structuredClone(profile);
   badCounts.contributions[0].recordCounts.accepted = 3;
   assert.equal(normalizeParticipantHistory(badCounts).reason, "invalid_contract");

@@ -76,7 +76,17 @@ async function buildIndex(file, { events, quotas = [], toolCounts = [] }) {
     planType: null,
     scopeLocal: null,
   });
-  const modelId = writer.internModel("gpt-5.6-sol", "recognized");
+  const defaultModelRowId = writer.internModel("gpt-5.6-sol", "recognized");
+  const modelRowIds = new Map([["gpt-5.6-sol", defaultModelRowId]]);
+  function modelRowId(name) {
+    if (name === undefined) return defaultModelRowId;
+    let id = modelRowIds.get(name);
+    if (id === undefined) {
+      id = writer.internModel(name, "recognized");
+      modelRowIds.set(name, id);
+    }
+    return id;
+  }
   const tierId = writer.internTier({
     apiServiceTier: "unknown",
     billingSurface: "chatgpt_subscription",
@@ -106,7 +116,7 @@ async function buildIndex(file, { events, quotas = [], toolCounts = [] }) {
       observedAtMs: event.observedAtMs,
       sessionLocal: event.sessionLocal,
       accountScopeId,
-      modelId,
+      modelId: modelRowId(event.model),
       tierId,
       surfaceId,
       quotaObservationId: null,
@@ -193,6 +203,60 @@ async function withFixtureIndex(run, { mutate = null, reversed = false } = {}) {
     await rm(root, { recursive: true });
   }
 }
+
+test("every model identity ships, with the provider derived from the reviewed registry", async () => {
+  const root = await mkdtemp(join(tmpdir(), "telemetry-v1-models-"));
+  const file = join(root, "index.sqlite");
+  try {
+    await buildIndex(file, {
+      events: [
+        // Reviewed, and previously carried by the transport allowlist.
+        { eventKey: eventKey(1), observedAtMs: dayMs(DAY_ONE, 1_000), sessionLocal: SESSION_A_LOCAL, model: "gpt-5.6-sol" },
+        // Reviewed by src/export/registries.js, but the stale transport
+        // allowlist dropped it: exactly the class of loss this widening ends.
+        { eventKey: eventKey(2), observedAtMs: dayMs(DAY_ONE, 2_000), sessionLocal: SESSION_A_LOCAL, model: "codex-auto-review" },
+        // Metered against its own allowance, so it must reach the service to
+        // be excluded from primary-pool comparisons rather than vanish.
+        { eventKey: eventKey(3), observedAtMs: dayMs(DAY_ONE, 3_000), sessionLocal: SESSION_A_LOCAL, model: "gpt-5.3-codex-spark" },
+        // A Claude identity derives the Anthropic provider, not the majority.
+        { eventKey: eventKey(4), observedAtMs: dayMs(DAY_ONE, 4_000), sessionLocal: SESSION_A_LOCAL, model: "claude-sonnet-5" },
+        // Never reviewed: it ships, labelled honestly rather than guessed.
+        { eventKey: eventKey(5), observedAtMs: dayMs(DAY_ONE, 5_000), sessionLocal: SESSION_A_LOCAL, model: "nova-9-preview" },
+      ],
+      // A session record exists only where tool-class counts do.
+      toolCounts: [
+        { sessionLocal: SESSION_A_LOCAL, toolClass: "mcp", count: 2 },
+      ],
+    });
+    const database = openLocalUnifiedIndex(file, { readOnly: true });
+    try {
+      const derived = indexReader(database).deriveDay(DAY_ONE);
+      assert.equal(derived.excluded.usage, 0);
+      const usage = derived.chunks
+        .filter((chunk) => chunk.stream === "usage")
+        .flatMap((chunk) => chunk.records);
+      assert.deepEqual(
+        usage.map((record) => [record.modelId, record.provider]),
+        [
+          ["gpt-5.6-sol", "openai_codex"],
+          ["codex-auto-review", "openai_codex"],
+          ["gpt-5.3-codex-spark", "openai_codex"],
+          ["claude-sonnet-5", "anthropic_claude_code"],
+          ["nova-9-preview", "unknown"],
+        ],
+      );
+      // A session spanning two vendors has no single honest provider.
+      const sessions = derived.chunks
+        .filter((chunk) => chunk.stream === "session")
+        .flatMap((chunk) => chunk.records);
+      assert.deepEqual(sessions.map((record) => record.provider), ["unknown"]);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
 
 test("the same index slice derives byte-identical digests regardless of insertion order", async () => {
   const forward = await withFixtureIndex((reader) => (

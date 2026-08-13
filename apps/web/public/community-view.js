@@ -768,6 +768,12 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
     }
   }
 
+  const locale = documentRef?.documentElement?.lang ?? "en-US";
+  const plural = (key, count) => translatePlural(key, count, {}, locale);
+
+  // Data dots. Each keeps a native <title> so the accessibility tree and any
+  // no-JS fallback still name the point; the richer visual tooltip below layers
+  // on top for pointer and keyboard users.
   for (const dot of model.dots) {
     const circle = svgNode(documentRef, "circle", "allowance-fit-dot", {
       cx: dot.x,
@@ -775,34 +781,205 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
       r: dot.radius,
     });
     const title = svgNode(documentRef, "title");
-    // Every dot names its own backing: the participant count can change
-    // mid-series, so the latest-day caveat alone would misdescribe older
-    // points.
-    const tooltipLanguage = documentRef?.documentElement?.lang ?? "en-US";
     title.textContent = `${dot.day}: ${dollars.format(dot.centralUsd)} — ${
-      translatePlural(
-        "community.allowance.fitCount",
-        dot.fitCount,
-        {},
-        tooltipLanguage,
-      )
-    } · ${
-      translatePlural(
-        "community.allowance.accountCount",
-        dot.participantCount,
-        {},
-        tooltipLanguage,
-      )
-    }`;
+      plural("community.allowance.fitCount", dot.fitCount)
+    } · ${plural("community.allowance.accountCount", dot.participantCount)}`;
     circle.append(title);
     svg.append(circle);
   }
 
+  // Hover furniture, painted above the dots but under a transparent capture
+  // rect: a vertical crosshair and a ring marking the active day. Both start
+  // hidden (CSS keys off data-visible) and only move once a pointer or focus
+  // event fires — neither happens in the server-side fake DOM.
+  const crosshair = svgNode(documentRef, "line", "allowance-crosshair", {
+    x1: 0, x2: 0, y1: model.plot.top, y2: model.plot.bottom,
+    "data-visible": "false",
+  });
+  const highlight = svgNode(documentRef, "circle", "allowance-hover-dot", {
+    cx: 0, cy: 0, r: 0, "data-visible": "false",
+  });
+  const capture = svgNode(documentRef, "rect", "allowance-hover-capture", {
+    x: model.plot.left,
+    y: model.plot.top,
+    width: Math.max(0, model.plot.right - model.plot.left),
+    height: Math.max(0, model.plot.bottom - model.plot.top),
+    fill: "transparent",
+    "pointer-events": "all",
+  });
+  svg.append(crosshair, highlight, capture);
+
   figure.append(svg);
+
+  // The visual tooltip is an HTML element positioned over the figure and filled
+  // on demand. It stays empty at build time so the server-rendered text carries
+  // no stray tooltip copy.
+  const tooltip = node("div", "allowance-tooltip");
+  tooltip.setAttribute("data-visible", "false");
+  tooltip.setAttribute("role", "status");
+  tooltip.setAttribute("aria-live", "polite");
+  figure.append(tooltip);
+
   if (model.sparse) {
     figure.append(node("p", "annotation", t("community.allowance.sparseNote")));
   }
   container.append(figure);
+
+  // Interactivity is browser-only: the fake DOM the render tests use has no
+  // addEventListener/getBoundingClientRect, so guard every runtime API and fall
+  // back to the static chart (dots + <title>) when they are absent.
+  const interactive = typeof svg.addEventListener === "function"
+    && typeof svg.getBoundingClientRect === "function"
+    && model.dots.length > 0;
+  if (!interactive) return;
+
+  const formatTipDate = dateTimeFormatter({
+    timeZone: "UTC", year: "numeric", month: "short", day: "numeric",
+  });
+
+  const fillTooltip = (dot) => {
+    tooltip.replaceChildren();
+    tooltip.append(node(
+      "div",
+      "allowance-tooltip-date",
+      formatTipDate.format(new Date(communityDayStartMs(dot.day))),
+    ));
+    const valueRow = node("div", "allowance-tooltip-value");
+    valueRow.append(
+      node("strong", "", dollars.format(dot.centralUsd)),
+      node(
+        "span",
+        "allowance-tooltip-caption",
+        t("community.allowance.tooltipCentralCaption"),
+      ),
+    );
+    tooltip.append(valueRow);
+    if (dot.band80Usd !== null) {
+      tooltip.append(node(
+        "div",
+        "allowance-tooltip-range",
+        t("community.allowance.tooltipRange", {
+          lower: dollars.format(dot.band80Usd.lowerUsd),
+          upper: dollars.format(dot.band80Usd.upperUsd),
+        }),
+      ));
+    }
+    tooltip.append(node(
+      "div",
+      "allowance-tooltip-meta",
+      `${plural("community.allowance.fitCount", dot.fitCount)} · ${
+        plural("community.allowance.accountCount", dot.participantCount)
+      }`,
+    ));
+  };
+
+  const positionTooltip = (dot) => {
+    const svgRect = svg.getBoundingClientRect();
+    const figRect = figure.getBoundingClientRect();
+    if (!svgRect || !figRect || svgRect.width === 0 || svgRect.height === 0) {
+      return;
+    }
+    const scaleX = svgRect.width / model.width;
+    const scaleY = svgRect.height / model.height;
+    const anchorX = (svgRect.left - figRect.left) + dot.x * scaleX;
+    const anchorY = (svgRect.top - figRect.top) + dot.y * scaleY;
+    // Clamp horizontally so the box never spills past the figure edges.
+    const halfWidth = (tooltip.offsetWidth || 0) / 2;
+    const clampedX = Math.min(
+      Math.max(anchorX, halfWidth + 6),
+      Math.max(halfWidth + 6, figRect.width - halfWidth - 6),
+    );
+    // Flip below the point when there is not enough headroom above it.
+    const below = anchorY - (tooltip.offsetHeight || 0) - 16 < 0;
+    tooltip.style.left = `${clampedX}px`;
+    tooltip.style.top = `${anchorY}px`;
+    tooltip.setAttribute("data-placement", below ? "below" : "above");
+    // Keep the caret pointing at the dot even after the box is clamped to an
+    // edge, but never let it slide off the tooltip's own rounded corners.
+    const caretShift = Math.max(
+      -(halfWidth - 10),
+      Math.min(halfWidth - 10, anchorX - clampedX),
+    );
+    tooltip.style.setProperty("--caret-left", `calc(50% + ${caretShift}px)`);
+  };
+
+  const showDot = (dot) => {
+    crosshair.setAttribute("x1", dot.x);
+    crosshair.setAttribute("x2", dot.x);
+    crosshair.setAttribute("data-visible", "true");
+    highlight.setAttribute("cx", dot.x);
+    highlight.setAttribute("cy", dot.y);
+    highlight.setAttribute("r", (dot.radius + 3).toFixed(1));
+    highlight.setAttribute("data-visible", "true");
+    fillTooltip(dot);
+    tooltip.setAttribute("data-visible", "true");
+    positionTooltip(dot);
+  };
+
+  const hide = () => {
+    crosshair.setAttribute("data-visible", "false");
+    highlight.setAttribute("data-visible", "false");
+    tooltip.setAttribute("data-visible", "false");
+  };
+
+  const nearestDot = (clientX) => {
+    const rect = svg.getBoundingClientRect();
+    if (!rect || rect.width === 0) return model.dots[0];
+    const viewX = ((clientX - rect.left) / rect.width) * model.width;
+    let best = model.dots[0];
+    let bestDistance = Infinity;
+    for (const dot of model.dots) {
+      const distance = Math.abs(dot.x - viewX);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = dot;
+      }
+    }
+    return best;
+  };
+
+  capture.addEventListener("pointermove", (event) => showDot(nearestDot(event.clientX)));
+  capture.addEventListener("pointerdown", (event) => showDot(nearestDot(event.clientX)));
+  // A touch tap fires pointerleave the instant the finger lifts, which would
+  // hide the tooltip before it could be read; keep it up for touch (the next
+  // tap moves it) and only auto-dismiss for a mouse leaving the plot.
+  capture.addEventListener("pointerleave", (event) => {
+    if (event.pointerType === "touch") return;
+    hide();
+  });
+
+  // Keyboard access: the chart is a single focus stop, so arrows walk the days,
+  // Home/End jump to the ends, and Escape dismisses. This is driven by keydown
+  // (reliably delivered to the focused element) rather than per-dot focus
+  // events, which SVG graphics elements dispatch inconsistently across engines.
+  // The tooltip is an aria-live region, so each step is announced.
+  svg.setAttribute("tabindex", "0");
+  let selected = model.dots.length - 1;
+  svg.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      hide();
+      return;
+    }
+    let moved = true;
+    if (event.key === "ArrowRight") {
+      selected = Math.min(model.dots.length - 1, selected + 1);
+    } else if (event.key === "ArrowLeft") {
+      selected = Math.max(0, selected - 1);
+    } else if (event.key === "Home") {
+      selected = 0;
+    } else if (event.key === "End") {
+      selected = model.dots.length - 1;
+    } else {
+      moved = false;
+    }
+    if (!moved) return;
+    event.preventDefault();
+    showDot(model.dots[selected]);
+  });
+  // Best effort: some engines do fire focus/blur on the SVG root even when they
+  // skip its graphics children. When they do, the chart shows/hides on tab.
+  svg.addEventListener("focus", () => showDot(model.dots[selected]));
+  svg.addEventListener("blur", hide);
 }
 
 /**

@@ -49,7 +49,8 @@ const QUARANTINE_SOURCE_TABLES: Record<
 };
 
 export interface LifecyclePassResult {
-  quarantineCutoffAt: string;
+  /** `null` while quarantine retention is disabled: no pass has a cutoff. */
+  quarantineCutoffAt: string | null;
   quarantineObjectsDeleted: number;
   quarantineRetentionComplete: boolean;
   restoredParticipantsSuppressed: number;
@@ -555,7 +556,13 @@ async function dueQuarantineObjects(
   return result.results;
 }
 
-async function deleteDueQuarantineObjects(
+/**
+ * Age-based quarantine removal. Retention is disabled in every shipped
+ * configuration, so `runBackendLifecycle` never calls this; it stays exported
+ * and directly tested so re-enabling retention is a constant change against
+ * machinery that is still known to work.
+ */
+export async function deleteDueQuarantineObjects(
   db: D1Database,
   quarantine: R2Bucket,
   cutoffAt: string,
@@ -600,9 +607,9 @@ export async function runBackendLifecycle(
     throw new ApiError(503, "LIFECYCLE_STATE_CONFLICT");
   };
   const startedAt = canonicalInstant(nowEpoch);
-  const quarantineCutoffAt = canonicalInstant(
-    nowEpoch - QUARANTINE_RETENTION_MILLISECONDS,
-  );
+  const quarantineCutoffAt = QUARANTINE_RETENTION_MILLISECONDS === null
+    ? null
+    : canonicalInstant(nowEpoch - QUARANTINE_RETENTION_MILLISECONDS);
   await assertOwnership();
   await db.prepare(
     `UPDATE retention_state
@@ -623,13 +630,13 @@ export async function runBackendLifecycle(
       allowMissingIdentityLinkSecret,
     );
     // R2 quarantine removal is a distinct destructive phase. An owner that
-    // lost its outer maintenance lease must not enter it.
+    // lost its outer maintenance lease must not enter it. With retention
+    // disabled the phase is skipped outright: nothing is due, so the pass
+    // reports a complete retention phase that deleted nothing.
     await assertOwnership();
-    const quarantineRetention = await deleteDueQuarantineObjects(
-      db,
-      quarantine,
-      quarantineCutoffAt,
-    );
+    const quarantineRetention = quarantineCutoffAt === null
+      ? { deleted: 0, complete: true }
+      : await deleteDueQuarantineObjects(db, quarantine, quarantineCutoffAt);
     const completedAt = new Date().toISOString();
     await assertOwnership();
     await db.prepare(

@@ -1072,6 +1072,9 @@ function weeklyPaceSnapshotProjection(snapshot) {
     accountTrackId,
     provider: "openai_codex",
     planType: paceToken(window.planType, "unknown"),
+    // The shared quota-analysis pace contract requires a non-empty planVariant
+    // track field (validateSnapshot / plainExact), so it stays on the wire even
+    // though the local plan cohort is now carried by planType.
     planVariant: paceToken(
       snapshot?.planVariant ?? window.planVariant,
       "current-window",
@@ -3010,6 +3013,23 @@ function validWeeklyCalibrationComposition(value) {
       || !finiteOrNull(value.recentMixDays, 0)
       || !Number.isSafeInteger(value.observationCount)
       || value.observationCount < 0) return false;
+  // The fitted mix, held to the same shape rule as the capacity vector: it is
+  // the only record of a model that consumed the allowance without earning a
+  // column of its own, and the dashboard names those models from it.
+  const shares = value.modelCostShares;
+  if (shares !== null && shares !== undefined) {
+    if (typeof shares !== "object" || Array.isArray(shares)) return false;
+    if (!Object.entries(shares).every(([model, share]) => (
+      typeof model === "string"
+      && model.length > 0
+      && model.length <= 64
+      && (share === null
+        || (typeof share === "number"
+          && Number.isFinite(share)
+          && share >= 0
+          && share <= 1))
+    ))) return false;
+  }
   const vector = value.capacityUsdByModel;
   if (vector === null) return true;
   if (value.status !== "fitted"

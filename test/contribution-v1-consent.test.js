@@ -36,28 +36,60 @@ function runOutcome(overrides = {}) {
   };
 }
 
+// A controllable timer table: timers only fire when a test calls fireFirst,
+// so a run-timeout can be driven deterministically while a runner hangs.
+function fakeTimers() {
+  let nextId = 1;
+  const scheduled = new Map();
+  return {
+    setTimeoutImpl(callback, delay) {
+      const id = nextId;
+      nextId += 1;
+      scheduled.set(id, { callback, delay });
+      return id;
+    },
+    clearTimeoutImpl(id) {
+      scheduled.delete(id);
+    },
+    fireFirst(delay) {
+      const entry = [...scheduled.entries()]
+        .find(([, timer]) => timer.delay === delay);
+      assert.ok(entry, `expected a ${delay} ms timer`);
+      scheduled.delete(entry[0]);
+      entry[1].callback();
+    },
+  };
+}
+
 function harness({
   destinationOrigin = ORIGIN,
   storage = fakeStorage(),
   outcomes = [],
+  runner = undefined,
+  timers = undefined,
+  runTimeoutMilliseconds = undefined,
 } = {}) {
   let clock = Date.parse("2026-08-03T00:00:00.000Z");
   const runs = [];
   const context = createLocalIncrementalContributionSyncContext({ storage });
+  const defaultRunner = async ({ signal }) => {
+    assert.equal(signal instanceof AbortSignal, true);
+    runs.push(clock);
+    const next = outcomes.shift();
+    if (next instanceof Error) throw next;
+    return next ?? runOutcome();
+  };
   const controller = context.createIncrementalContributionSyncController({
     settingsFile: SETTINGS_FILE,
     destinationOrigin,
-    runner: async ({ signal }) => {
-      assert.equal(signal instanceof AbortSignal, true);
-      runs.push(clock);
-      const next = outcomes.shift();
-      if (next instanceof Error) throw next;
-      return next ?? runOutcome();
-    },
+    runner: runner ?? defaultRunner,
     now: () => new Date(clock),
     ditherRandom: () => 0,
-    setTimeoutImpl: () => ({ unref() {} }),
-    clearTimeoutImpl: () => {},
+    setTimeoutImpl: timers?.setTimeoutImpl ?? (() => ({ unref() {} })),
+    clearTimeoutImpl: timers?.clearTimeoutImpl ?? (() => {}),
+    ...(runTimeoutMilliseconds === undefined
+      ? {}
+      : { runTimeoutMilliseconds }),
   });
   return {
     controller,
@@ -630,4 +662,72 @@ test("steady state keeps its six-hour schedule across a restart (2026-08-10)", a
   assert.equal(started.nextAttemptAt, "2026-08-03T06:00:00.000Z");
   // Nothing pending, last pass succeeded: the file is not even rewritten.
   assert.equal(storage.files.get(SETTINGS_FILE), text);
+});
+
+test("a pass that hangs past the deadline clears running and self-recovers (2026-08-12)", async () => {
+  const RUN_TIMEOUT_MILLISECONDS = 2 * 60 * 1_000;
+  const timers = fakeTimers();
+  let runnerCalls = 0;
+  let enterFirstRunner;
+  const firstRunnerEntered = new Promise((resolve) => {
+    enterFirstRunner = resolve;
+  });
+  const { controller, advance } = harness({
+    timers,
+    runTimeoutMilliseconds: RUN_TIMEOUT_MILLISECONDS,
+    runner: async ({ signal }) => {
+      assert.equal(signal instanceof AbortSignal, true);
+      runnerCalls += 1;
+      if (runnerCalls === 1) {
+        // A wedged pass: never settles, and — unlike a cooperative runner —
+        // never observes the abort either. Only the deadline can end it.
+        enterFirstRunner();
+        return new Promise(() => {});
+      }
+      return runOutcome();
+    },
+  });
+  await controller.start();
+  await controller.approve();
+
+  const running = controller.runDue();
+  await firstRunnerEntered;
+  // While the runner hangs, the controller honestly reports running:true.
+  const midRun = await controller.inspect();
+  assert.equal(midRun.running, true);
+
+  // The pass deadline fires; the wedged runner is abandoned and the pass
+  // settles without waiting on it.
+  timers.fireFirst(RUN_TIMEOUT_MILLISECONDS);
+  const timedOut = await running;
+  assert.equal(timedOut.running, false);
+  assert.equal(timedOut.lastOutcome.code, "run_timeout");
+  assert.equal(timedOut.lastOutcome.status, "failed");
+  assert.notEqual(timedOut.nextAttemptAt, null);
+
+  // Self-recovery: the retry ladder re-fires on schedule and the next pass
+  // runs to completion — no manual kick, no permanent wedge.
+  advance(
+    Date.parse(timedOut.nextAttemptAt) - Date.parse(timedOut.lastAttemptAt),
+  );
+  const recovered = await controller.runDue();
+  assert.equal(runnerCalls, 2);
+  assert.equal(recovered.running, false);
+  assert.equal(recovered.lastOutcome.code, "synced");
+  assert.equal(recovered.lastOutcome.status, "succeeded");
+});
+
+test("a pass that throws mid-flight clears running and reschedules", async () => {
+  const thrown = new Error("runner exploded mid-flight");
+  thrown.code = "runner_exploded";
+  const { controller } = harness({ outcomes: [thrown] });
+  await controller.start();
+  await controller.approve();
+  const status = await controller.runDue();
+  assert.equal(status.running, false);
+  assert.equal(status.lastOutcome.code, "run_failed");
+  assert.equal(status.lastOutcome.status, "failed");
+  // The bounded error detail is recorded so the failure is never anonymous.
+  assert.equal(status.lastOutcome.detail.code, "runner_exploded");
+  assert.notEqual(status.nextAttemptAt, null);
 });

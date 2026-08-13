@@ -28,6 +28,10 @@ const MAXIMUM_SCHEDULE_DITHER_MILLISECONDS = 60 * 60 * 1_000;
 const MAXIMUM_PENDING_DITHER_MILLISECONDS = 30_000;
 const MAXIMUM_ADMISSION_DITHER_MILLISECONDS = 5 * 60_000;
 const DEFAULT_RUN_TIMEOUT_MILLISECONDS = 10 * 60 * 1_000;
+// The pass deadline is a hard watchdog, not merely a cooperative abort: the
+// timer resolves this sentinel so the runner can be raced against it and a
+// runner that never settles can never pin #running true.
+const RUN_DEADLINE_REACHED = Symbol("incremental-contribution-run-deadline");
 const MAXIMUM_SETTINGS_BYTES = 16 * 1_024;
 const MAXIMUM_RETRY_AFTER_MILLISECONDS = 7 * 24 * 60 * 60 * 1_000;
 // The v0.1 queue's retry idiom, kept value-for-value: exponential from five
@@ -626,24 +630,56 @@ class IncrementalContributionSyncController {
     const abortController = new AbortController();
     this.#runAbortController = abortController;
     let timedOut = false;
-    const timeout = this.#setTimeout(() => {
-      timedOut = true;
-      abortController.abort();
-    }, this.#runTimeoutMilliseconds);
-    timeout?.unref?.();
+    let timeout = null;
+    // The pass deadline is a hard watchdog, not merely a cooperative abort. A
+    // runner that never settles — a fetch wedged mid-body during a service
+    // redeploy, or a hang the abort signal never reaches — must not pin
+    // #running true and starve the retry ladder (observed live 2026-08-12: a
+    // backfill froze at 56/88 with running:true for nine minutes after a
+    // transient service_unavailable, and only a manual kick cleared it). So
+    // the runner is raced against the deadline: whichever settles first
+    // decides the outcome, and a deadline win abandons the still-pending
+    // runner — its abort is already signalled, and its own finally releases
+    // the index handle and the shared sync mutex whenever it eventually
+    // settles. The next pass then re-plans from the durable watermark.
+    const deadlineReached = new Promise((resolve) => {
+      timeout = this.#setTimeout(() => {
+        timedOut = true;
+        abortController.abort();
+        resolve(RUN_DEADLINE_REACHED);
+      }, this.#runTimeoutMilliseconds);
+      timeout?.unref?.();
+    });
+    // The inner try/catch guarantees this promise settles (never rejects), so
+    // an abandoned runner leaves no unhandled rejection behind.
+    const runnerSettled = (async () => {
+      try {
+        return {
+          kind: "outcome",
+          value: await this.#runner({ signal: abortController.signal }),
+        };
+      } catch (error) {
+        return { kind: "error", value: error };
+      }
+    })();
     let runOutcome = null;
     let runFailed = false;
     let runError = null;
-    try {
-      runOutcome = await this.#runner({ signal: abortController.signal });
-    } catch (error) {
+    const raced = await Promise.race([runnerSettled, deadlineReached]);
+    this.#clearTimeout(timeout);
+    if (this.#runAbortController === abortController) {
+      this.#runAbortController = null;
+    }
+    if (raced === RUN_DEADLINE_REACHED) {
+      // The deadline won: the runner is still pending and is now abandoned.
+      // Settle as run_timeout (timedOut is already set by the timer) and let
+      // the runner unwind unobserved.
       runFailed = true;
-      runError = error;
-    } finally {
-      this.#clearTimeout(timeout);
-      if (this.#runAbortController === abortController) {
-        this.#runAbortController = null;
-      }
+    } else if (raced.kind === "error") {
+      runFailed = true;
+      runError = raced.value;
+    } else {
+      runOutcome = raced.value;
     }
 
     return this.#serialize(async () => {

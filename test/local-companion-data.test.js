@@ -1262,6 +1262,116 @@ test("live weekly cache replaces the repo artifact and labels historical account
   }
 });
 
+// A model under the composition kernel's share floor holds no fitted column of
+// its own, so the capacity vector is silent about it and the calibration card
+// used to omit it entirely — a model the owner had actually used read as one
+// they never had. The fitted mix travels beside the vector so the card can name
+// it against the pooled remainder rate instead.
+test("the fitted mix reaches the card for models with no column of their own", async () => {
+  const root = await fixtureRoot();
+  const stateFile = join(root, ".usage-monitor", "local-collector-state-v1.sqlite");
+  try {
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      "",
+      { mode: 0o600 },
+    );
+    await refreshReplaySafeAccountingCache({
+      stateFile,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+      windowDays: 365,
+      scan: async () => ({ diagnostics: {} }),
+    });
+    const composition = {
+      status: "fitted",
+      grainHours: 2,
+      observationCount: 120,
+      capacityUsdByModel: {
+        "gpt-5.6-sol": 2_500,
+        "gpt-5.6-terra": 900,
+        other: 1_900,
+      },
+      // Luna is a tenth of the floor: fitted, folded, and priced at "other".
+      modelCostShares: {
+        "gpt-5.6-sol": 0.5,
+        "gpt-5.5": 0.4,
+        "gpt-5.6-terra": 0.0977,
+        "gpt-5.6-luna": 0.002,
+        "gpt-5.4-mini": 0.0003,
+      },
+      r2: 0.8,
+      singleConstantUsd: 2_000,
+      singleConstantR2: 0.7,
+      blendedRecentMixUsd: 2_050,
+      recentMixDays: 14,
+    };
+    const cache = (await readLocalCollectorAccountingCache({ stateFile })).cache;
+    cache.weeklyCalibration.composition = composition;
+    await writeLocalCollectorAccountingCache({ stateFile, cache });
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      collectorStateFile: stateFile,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    const summary = snapshot.weekly.datasets.summary[0];
+    assert.equal(snapshot.weekly.dataClass, "live_replay_safe_cache");
+    assert.deepEqual(summary.capacity_by_model, composition.capacityUsdByModel);
+    assert.deepEqual(summary.model_cost_shares, composition.modelCostShares);
+    // The vector alone cannot distinguish "never used" from "too small to fit".
+    assert.equal(
+      Object.hasOwn(summary.capacity_by_model, "gpt-5.6-luna"),
+      false,
+    );
+    assert.equal(summary.model_cost_shares["gpt-5.6-luna"], 0.002);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("an out-of-range fitted-mix share fails closed like any other cache defect", async () => {
+  const root = await fixtureRoot();
+  const stateFile = join(root, ".usage-monitor", "local-collector-state-v1.sqlite");
+  try {
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      "",
+      { mode: 0o600 },
+    );
+    await refreshReplaySafeAccountingCache({
+      stateFile,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+      windowDays: 365,
+      scan: async () => ({ diagnostics: {} }),
+    });
+    const cache = (await readLocalCollectorAccountingCache({ stateFile })).cache;
+    cache.weeklyCalibration.composition = {
+      status: "fitted",
+      grainHours: 2,
+      observationCount: 120,
+      capacityUsdByModel: { "gpt-5.6-sol": 2_500 },
+      modelCostShares: { "gpt-5.6-luna": 2 },
+      r2: 0.8,
+      singleConstantUsd: 2_000,
+      singleConstantR2: 0.7,
+      blendedRecentMixUsd: 2_050,
+      recentMixDays: 14,
+    };
+    await writeLocalCollectorAccountingCache({ stateFile, cache });
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      collectorStateFile: stateFile,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(snapshot.weekly.status, "unavailable");
+    assert.equal(snapshot.weekly.errorCode, "live_cache_invalid");
+    assert.deepEqual(snapshot.weekly.datasets, {});
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("malformed live weekly reset rows fail closed without crashing the dashboard", async () => {
   const root = await fixtureRoot();
   const stateFile = join(root, ".usage-monitor", "local-collector-state-v1.sqlite");

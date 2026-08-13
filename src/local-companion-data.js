@@ -506,6 +506,23 @@ function validWeeklyComposition(value) {
       || !numberOrNull(value.singleConstantR2)
       || !numberOrNull(value.singleConstantUsd, 0)
       || !numberOrNull(value.blendedRecentMixUsd, 0)) return false;
+  // Every model the fit saw, with its share of the fitted corpus cost. A model
+  // below the kernel's share floor never gets a column of its own, so this
+  // vector is the only record that it was in the mix at all.
+  const shares = value.modelCostShares;
+  if (shares !== null && shares !== undefined) {
+    if (typeof shares !== "object" || Array.isArray(shares)) return false;
+    if (!Object.entries(shares).every(([model, share]) => (
+      typeof model === "string"
+      && model.length > 0
+      && model.length <= 64
+      && (share === null
+        || (typeof share === "number"
+          && Number.isFinite(share)
+          && share >= 0
+          && share <= 1))
+    ))) return false;
+  }
   const vector = value.capacityUsdByModel;
   if (vector === null || vector === undefined) return value.status !== "fitted";
   if (value.status !== "fitted"
@@ -642,6 +659,12 @@ function projectLiveWeeklyCalibration(cache, cacheReadErrorCode = null) {
           weekly.composition?.blendedRecentMixUsd ?? null,
         capacity_by_model:
           weekly.composition?.capacityUsdByModel ?? null,
+        // The fitted mix itself. A model whose share sits under the kernel's
+        // floor holds no column of its own and used to vanish from the card
+        // entirely; the card now names it against the pooled remainder rate
+        // instead, which needs this vector to know it existed.
+        model_cost_shares:
+          weekly.composition?.modelCostShares ?? null,
         composition_r2: weekly.composition?.r2 ?? null,
         composition_single_constant_r2:
           weekly.composition?.singleConstantR2 ?? null,

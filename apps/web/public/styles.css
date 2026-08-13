@@ -1195,7 +1195,14 @@ h2 {
   border-bottom: 1px solid var(--line);
 }
 .calibration-model-list li:last-child { border-bottom: 0; }
-.calibration-model-list strong { font-variant-numeric: tabular-nums; }
+.calibration-model-list strong { font-variant-numeric: tabular-nums; text-align: end; }
+/*
+ * A model under the fit's share floor carries a second line saying why it has
+ * no rate of its own. It sits under the model name rather than beside the
+ * figure, so the "$ per point" column stays one scannable list of numbers.
+ */
+.calibration-model-label { display: flex; flex-direction: column; gap: 2px; }
+.calibration-model-label small { color: var(--muted); font-size: .92em; }
 .calibration-explanation { margin: 12px 0 0; }
 
 .share-panel { margin-top: 22px; }
@@ -2950,6 +2957,120 @@ footer p { margin: 0; }
   vector-effect: non-scaling-stroke;
 }
 .allowance-fit-dot { fill: var(--green); }
+/*
+ * Hover affordances for the allowance chart: a snap-to-day crosshair, a ring
+ * around the active dot, a transparent capture layer, and the HTML tooltip.
+ * Everything keys off data-visible so the static (no-JS / server) render shows
+ * none of it, and the tooltip anchors to the figure, hence position: relative.
+ */
+.community-site .community-allowance-chart { position: relative; }
+.allowance-hover-capture { cursor: crosshair; }
+.allowance-crosshair {
+  stroke: var(--green);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  opacity: .4;
+  pointer-events: none;
+  vector-effect: non-scaling-stroke;
+  transition: opacity .12s ease;
+}
+.allowance-crosshair[data-visible="false"] { opacity: 0; }
+.allowance-hover-dot {
+  fill: var(--white);
+  stroke: var(--green);
+  stroke-width: 2;
+  pointer-events: none;
+  transition: opacity .12s ease;
+}
+.allowance-hover-dot[data-visible="false"] { opacity: 0; }
+.community-site .community-allowance-chart svg { outline: none; }
+.community-site .community-allowance-chart svg:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 2px;
+  border-radius: var(--radius-xs);
+}
+.community-site .allowance-tooltip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 4;
+  min-width: 140px;
+  max-width: 240px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-xs);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-card);
+  color: var(--text);
+  font-size: .72rem;
+  line-height: 1.35;
+  pointer-events: none;
+  opacity: 1;
+  transform: translate(-50%, calc(-100% - 14px));
+  transition: opacity .12s ease;
+}
+.community-site .allowance-tooltip[data-placement="below"] {
+  transform: translate(-50%, 14px);
+}
+.community-site .allowance-tooltip[data-visible="false"] {
+  opacity: 0;
+  visibility: hidden;
+}
+/* Caret: a rotated square peeking out one edge. Above placement points down at
+ * the dot; below points up. */
+.community-site .allowance-tooltip::after {
+  content: "";
+  position: absolute;
+  left: var(--caret-left, 50%);
+  width: 8px;
+  height: 8px;
+  background: var(--surface-raised);
+  border: 1px solid var(--line-strong);
+  transform: translateX(-50%) rotate(45deg);
+}
+.community-site .allowance-tooltip:not([data-placement="below"])::after {
+  bottom: -5px;
+  border-top: none;
+  border-left: none;
+}
+.community-site .allowance-tooltip[data-placement="below"]::after {
+  top: -5px;
+  border-bottom: none;
+  border-right: none;
+}
+.community-site .allowance-tooltip-date {
+  color: var(--muted);
+  font-size: .66rem;
+  letter-spacing: .01em;
+  text-transform: uppercase;
+}
+.community-site .allowance-tooltip-value {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 2px;
+  white-space: nowrap;
+}
+.community-site .allowance-tooltip-value strong {
+  color: var(--green);
+  font-family: var(--serif);
+  font-size: 1.05rem;
+  font-weight: var(--weight-regular);
+  letter-spacing: -.02em;
+}
+.community-site .allowance-tooltip-caption {
+  color: var(--muted);
+  font-size: .62rem;
+}
+.community-site .allowance-tooltip-range {
+  margin-top: 3px;
+  color: var(--green-text);
+}
+.community-site .allowance-tooltip-meta {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: .66rem;
+}
 .community-site .resource-main {
   width: min(960px, calc(100% - 48px));
   margin: 0 auto;

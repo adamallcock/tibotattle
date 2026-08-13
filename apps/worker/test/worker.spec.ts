@@ -19,6 +19,7 @@ import {
   rebuildPendingCommunityWeeklySnapshots,
 } from "../src/community-snapshots";
 import {
+  deleteDueQuarantineObjects,
   hasDeletionTombstone,
   hasIdentityReenrollmentCooldown,
   hasIdentityReenrollmentCooldownDigest,
@@ -2625,7 +2626,7 @@ describe("synthetic usage monitor service", () => {
       },
       historyPolicy: {
         maximumItems: 101,
-        quarantineRetentionMilliseconds: 604_800_000,
+        quarantineRetentionMilliseconds: null,
         canonicalMetadataRetainedAfterQuarantine: true,
         clientSoftwareVersion: "unavailable_in_transport",
       },
@@ -3191,7 +3192,7 @@ describe("synthetic usage monitor service", () => {
           recordCounts: { declared: 2, accepted: 2, deduplicated: 0 },
           quarantine: {
             state: "retained",
-            scheduledDeletionAt: expect.stringMatching(/Z$/u),
+            scheduledDeletionAt: null,
             deletedAt: null,
             canonicalMetadataRetained: true,
           },
@@ -4718,7 +4719,7 @@ describe("synthetic usage monitor service", () => {
     expect(rows?.total).toBe(0);
   });
 
-  it("removes seven-day quarantine objects without removing canonical results", async () => {
+  it("keeps aged quarantine objects because retention is disabled", async () => {
     const participant = await enrollTelemetry();
     const accepted = await uploadEnvelope(
       participant,
@@ -4745,19 +4746,19 @@ describe("synthetic usage monitor service", () => {
       Date.parse("2026-07-25T00:00:00.000Z"),
     );
     expect(result).toEqual({
-      quarantineCutoffAt: "2026-07-18T00:00:00.000Z",
-      quarantineObjectsDeleted: 1,
+      quarantineCutoffAt: null,
+      quarantineObjectsDeleted: 0,
       quarantineRetentionComplete: true,
       restoredParticipantsSuppressed: 0,
       restoreReplayComplete: true,
     });
-    expect(await testBindings().QUARANTINE.head(stored!.r2_key)).toBeNull();
+    expect(await testBindings().QUARANTINE.head(stored!.r2_key)).not.toBeNull();
     const retained = await testBindings().USAGE_MONITOR_DB.prepare(
       `SELECT quarantine_deleted_at FROM telemetry_contributions
         WHERE id = ? AND participant_id = ?`,
     ).bind(receipt.contributionId, participant.participantId)
-      .first<{ quarantine_deleted_at: string }>();
-    expect(retained?.quarantine_deleted_at).toMatch(/Z$/u);
+      .first<{ quarantine_deleted_at: string | null }>();
+    expect(retained?.quarantine_deleted_at).toBeNull();
     const stats = await api("/api/v1/me/stats", {
       headers: personalHeaders(participant),
     });
@@ -4774,9 +4775,9 @@ describe("synthetic usage monitor service", () => {
       contributions: [{
         contributionId: receipt.contributionId,
         quarantine: {
-          state: "deleted",
-          scheduledDeletionAt: "2026-07-24T00:00:00.000Z",
-          deletedAt: expect.stringMatching(/Z$/u),
+          state: "retained",
+          scheduledDeletionAt: null,
+          deletedAt: null,
           canonicalMetadataRetained: true,
         },
       }],
@@ -4883,8 +4884,8 @@ describe("synthetic usage monitor service", () => {
       testBindings().DELETION_LEDGER,
       testBindings().QUARANTINE,
       Date.parse("2026-07-25T00:00:00.000Z"),
-    )).resolves.toMatchObject({ quarantineObjectsDeleted: 1 });
-    expect(await testBindings().QUARANTINE.head(accepted!.r2_key)).toBeNull();
+    )).resolves.toMatchObject({ quarantineObjectsDeleted: 0 });
+    expect(await testBindings().QUARANTINE.head(accepted!.r2_key)).not.toBeNull();
     const retainedMetadata = await baseDb.prepare(
       `SELECT status, quarantine_deleted_at
          FROM telemetry_contributions WHERE id = ?`,
@@ -4894,11 +4895,11 @@ describe("synthetic usage monitor service", () => {
     }>();
     expect(retainedMetadata).toEqual({
       status: "accepted",
-      quarantine_deleted_at: expect.stringMatching(/Z$/u),
+      quarantine_deleted_at: null,
     });
   });
 
-  it("does not mark quarantine retention complete when R2 deletion fails", async () => {
+  it("does not mark quarantine deleted when a retention sweep's R2 delete fails", async () => {
     const participant = await enrollTelemetry();
     const accepted = await uploadEnvelope(
       participant,
@@ -4921,31 +4922,25 @@ describe("synthetic usage monitor service", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    await expect(runBackendLifecycle(
+    // Retention is disabled, so the lifecycle never enters this phase. The
+    // sweep is driven directly to keep the dormant machinery honest: a failed
+    // R2 delete must never leave a row claiming its envelope is gone.
+    await expect(deleteDueQuarantineObjects(
       testBindings().USAGE_MONITOR_DB,
-      testBindings().DELETION_LEDGER,
       failingBucket,
-      Date.parse("2026-07-25T00:00:00.000Z"),
+      "2026-07-18T00:00:00.000Z",
     )).rejects.toThrow("injected retention R2 deletion failure");
-    const failed = await testBindings().USAGE_MONITOR_DB.prepare(
-      `SELECT state, failure_code FROM retention_state WHERE singleton = 1`,
-    ).first<{ state: string; failure_code: string }>();
-    expect(failed).toEqual({
-      state: "failed",
-      failure_code: "LIFECYCLE_PASS_FAILED",
-    });
     const contribution = await testBindings().USAGE_MONITOR_DB.prepare(
       `SELECT quarantine_deleted_at FROM telemetry_contributions WHERE id = ?`,
     ).bind(receipt.contributionId)
       .first<{ quarantine_deleted_at: string | null }>();
     expect(contribution?.quarantine_deleted_at).toBeNull();
 
-    await expect(runBackendLifecycle(
+    await expect(deleteDueQuarantineObjects(
       testBindings().USAGE_MONITOR_DB,
-      testBindings().DELETION_LEDGER,
       testBindings().QUARANTINE,
-      Date.parse("2026-07-25T00:00:00.000Z"),
-    )).resolves.toMatchObject({ quarantineObjectsDeleted: 1 });
+      "2026-07-18T00:00:00.000Z",
+    )).resolves.toMatchObject({ deleted: 1, complete: true });
   });
 
   it("fails participant deletion closed when its independent ledger is unavailable", async () => {

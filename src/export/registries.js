@@ -71,8 +71,20 @@ export const EXPORT_DIAGNOSTIC_CODES = Object.freeze([
   "unattributed_fork_replay_events_skipped",
 ]);
 
+export const TELEMETRY_PROVIDER_IDS = Object.freeze([
+  "anthropic_claude_code",
+  "openai_codex",
+]);
+
 const modelIds = new Set([...OPENAI_CODEX_MODEL_IDS, ...ANTHROPIC_CLAUDE_MODEL_IDS]);
 const limitIds = new Set(OPENAI_CODEX_LIMIT_IDS);
+const providerByModelId = new Map([
+  ...OPENAI_CODEX_MODEL_IDS.map((id) => [id, "openai_codex"]),
+  ...ANTHROPIC_CLAUDE_MODEL_IDS.map((id) => [id, "anthropic_claude_code"]),
+]);
+const providerByLimitId = new Map(
+  OPENAI_CODEX_LIMIT_IDS.map((id) => [id, "openai_codex"]),
+);
 const codexModelIds = new Set(OPENAI_CODEX_MODEL_IDS);
 const codexUnpricedModelIds = new Set(OPENAI_CODEX_UNPRICED_MODEL_IDS);
 
@@ -116,6 +128,26 @@ export function codexModelAllowanceTrack(value) {
 // substitutable for the primary pool, so no dollar comparison is honest.
 export function codexModelApiPriceEquivalentApplicable(value) {
   return codexModelAllowanceTrack(value) !== "spark";
+}
+
+/**
+ * The reviewed model-identity -> provider mapping, and the limit-identity one
+ * for records that carry no model. "unknown" is a deliberate value rather than
+ * a fallback to whichever provider happens to dominate the corpus: an
+ * identifier this registry has never reviewed must not be attributed to a
+ * vendor by guess. Transport admission does not depend on either function —
+ * an unreviewed identifier still ships, labelled honestly.
+ */
+export function exportModelProvider(value) {
+  if (typeof value !== "string") return "unknown";
+  return providerByModelId.get(value.toLowerCase()) ?? "unknown";
+}
+
+export function exportLimitProvider(value) {
+  if (typeof value !== "string") return "unknown";
+  return providerByLimitId.get(
+    value.toLowerCase().replaceAll("_", "-"),
+  ) ?? "unknown";
 }
 
 export function recognizedExportLimitId(value) {

@@ -2,7 +2,11 @@ import { QUARANTINE_RETENTION_MILLISECONDS } from "./constants";
 
 export interface ContributionQuarantineLifecycle {
   state: "retained" | "deleted";
-  scheduledDeletionAt: string;
+  /**
+   * `null` when no age-based deletion is scheduled. A participant reading this
+   * must be told the envelope is kept, not shown a date that never arrives.
+   */
+  scheduledDeletionAt: string | null;
   deletedAt: string | null;
   canonicalMetadataRetained: true;
 }
@@ -20,9 +24,11 @@ export function contributionQuarantineLifecycle(
   }
   return {
     state: deletedAt ? "deleted" : "retained",
-    scheduledDeletionAt: new Date(
-      createdEpoch + QUARANTINE_RETENTION_MILLISECONDS,
-    ).toISOString(),
+    scheduledDeletionAt: QUARANTINE_RETENTION_MILLISECONDS === null
+      ? null
+      : new Date(
+        createdEpoch + QUARANTINE_RETENTION_MILLISECONDS,
+      ).toISOString(),
     deletedAt: deletedAt ?? null,
     canonicalMetadataRetained: true,
   };

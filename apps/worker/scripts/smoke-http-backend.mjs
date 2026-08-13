@@ -864,9 +864,10 @@ try {
   );
   const historyItem = participantProfile.contributions?.[0];
   const historyCreatedAt = Date.parse(historyItem?.createdAt);
-  const historyScheduledDeletionAt = Date.parse(
-    historyItem?.quarantine?.scheduledDeletionAt,
-  );
+  // Retention is disabled: the service must publish a null window and a null
+  // per-contribution schedule rather than a date it will never act on.
+  const historyScheduledDeletionAt =
+    historyItem?.quarantine?.scheduledDeletionAt ?? null;
   const serializedProfile = JSON.stringify(participantProfile);
   if (contributionStatus.recordCounts?.accepted !== expectedTotal
       || contributionStatus.serverAccounting?.verification !== "server_repriced"
@@ -882,7 +883,7 @@ try {
       || participantProfile.contributionCount !== 1
       || participantProfile.historyPolicy?.maximumItems !== 101
       || participantProfile.historyPolicy?.quarantineRetentionMilliseconds
-        !== 7 * DAY_MILLISECONDS
+        !== null
       || participantProfile.historyPolicy?.canonicalMetadataRetainedAfterQuarantine !== true
       || participantProfile.historyPolicy?.clientSoftwareVersion
         !== "unavailable_in_transport"
@@ -898,7 +899,7 @@ try {
       || historyItem?.quarantine?.deletedAt !== null
       || historyItem?.quarantine?.canonicalMetadataRetained !== true
       || !Number.isFinite(historyCreatedAt)
-      || historyScheduledDeletionAt !== historyCreatedAt + 7 * DAY_MILLISECONDS
+      || historyScheduledDeletionAt !== null
       || [
         "r2_key",
         "plaintext_digest",

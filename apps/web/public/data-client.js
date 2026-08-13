@@ -1645,14 +1645,23 @@ export function normalizeParticipantHistory(payload) {
   if (payload.schemaVersion !== PARTICIPANT_PROFILE_SCHEMA_VERSION) {
     return unavailable("unsupported_schema");
   }
+  // `null` is the service stating that raw envelopes carry no age-based
+  // deletion. Any other value must be a positive window the per-contribution
+  // schedule below is then checked against; a zero or absent number is a
+  // malformed contract rather than "delete immediately".
+  const rawQuarantineRetention =
+    payload.historyPolicy?.quarantineRetentionMilliseconds;
+  const quarantineRetentionMilliseconds = rawQuarantineRetention === null
+    ? null
+    : count(rawQuarantineRetention, null);
   if (!PARTICIPANT_CONSENT_VERSIONS.has(payload.consentVersion)
       || !Number.isFinite(Date.parse(payload.createdAt))
       || !Array.isArray(payload.contributions)
       || payload.contributions.length > 101
       || count(payload.contributionCount, null) !== payload.contributions.length
       || count(payload.historyPolicy?.maximumItems, null) !== 101
-      || count(payload.historyPolicy?.quarantineRetentionMilliseconds, null)
-        !== 7 * 24 * 60 * 60 * 1000
+      || (rawQuarantineRetention !== null
+        && !(quarantineRetentionMilliseconds > 0))
       || payload.historyPolicy?.canonicalMetadataRetainedAfterQuarantine !== true
       || payload.historyPolicy?.clientSoftwareVersion !== "unavailable_in_transport") {
     return unavailable("invalid_contract");
@@ -1671,14 +1680,18 @@ export function normalizeParticipantHistory(payload) {
     const clientPlatform = text(candidate?.clientPlatform, "");
     const providerPolicyEpoch = text(candidate?.providerPolicyEpoch, "");
     const quarantineState = text(candidate?.quarantine?.state, "");
-    const scheduledDeletionAt = text(candidate?.quarantine?.scheduledDeletionAt, "");
+    const scheduledDeletionAt = candidate?.quarantine?.scheduledDeletionAt === null
+      ? null
+      : text(candidate?.quarantine?.scheduledDeletionAt, "");
     const deletedAt = candidate?.quarantine?.deletedAt === null
       ? null
       : text(candidate?.quarantine?.deletedAt, "");
     const createdEpoch = Date.parse(createdAt);
     const startEpoch = Date.parse(startAt);
     const endEpoch = Date.parse(endAt);
-    const scheduledEpoch = Date.parse(scheduledDeletionAt);
+    const scheduledEpoch = scheduledDeletionAt === null
+      ? null
+      : Date.parse(scheduledDeletionAt);
     const deletedEpoch = deletedAt === null ? null : Date.parse(deletedAt);
     if (!CONTRIBUTION_ID_PATTERN.test(contributionId)
         || contributionIds.has(contributionId)
@@ -1700,8 +1713,10 @@ export function normalizeParticipantHistory(payload) {
         || !Number.isFinite(startEpoch)
         || !Number.isFinite(endEpoch)
         || endEpoch < startEpoch
-        || !Number.isFinite(scheduledEpoch)
-        || scheduledEpoch !== createdEpoch + (7 * 24 * 60 * 60 * 1000)
+        || (quarantineRetentionMilliseconds === null
+          ? scheduledDeletionAt !== null
+          : !Number.isFinite(scheduledEpoch)
+            || scheduledEpoch !== createdEpoch + quarantineRetentionMilliseconds)
         || !["retained", "deleted"].includes(quarantineState)
         || (quarantineState === "retained" && deletedAt !== null)
         || (quarantineState === "deleted"

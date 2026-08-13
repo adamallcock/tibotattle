@@ -561,3 +561,50 @@ test("a server-refused device still reports its real network activity", async ()
     assert.equal(outcome.daysSynced, 0);
   });
 });
+
+test("a request that stalls past its deadline settles the pass instead of hanging", async () => {
+  await withIndex(async (file) => {
+    let fetchCalls = 0;
+    // A connection wedged mid-flight: the fetch never resolves on its own and
+    // only the composed per-request deadline (or a caller abort) can end it —
+    // exactly the stalled socket a service redeploy leaves behind.
+    const stalledService = {
+      fetchImpl: (url, options) => {
+        fetchCalls += 1;
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener(
+            "abort",
+            () => reject(options.signal.reason ?? new Error("aborted")),
+            { once: true },
+          );
+        });
+      },
+    };
+    const outcome = await runIncrementalContributionSyncOnce(engineOptions(
+      file,
+      stalledService,
+      { requestTimeoutMilliseconds: 1_000 },
+    ));
+    assert.equal(fetchCalls, 1);
+    assert.equal(outcome.status, "failed");
+    assert.equal(outcome.failure.code, "service_unavailable");
+    assert.equal(outcome.failure.retryable, true);
+    // The one request never resolved, so the pass truthfully reports it
+    // contacted nothing and leaves the durable watermark untouched.
+    assert.equal(outcome.networkActivity, false);
+  });
+});
+
+test("an out-of-range request timeout fails closed before any network activity", async () => {
+  await withIndex(async (file) => {
+    const service = createFakeService();
+    await assert.rejects(
+      runIncrementalContributionSyncOnce(engineOptions(file, service, {
+        requestTimeoutMilliseconds: 0,
+      })),
+      (error) => error instanceof ContributionIncrementalSyncError
+        && error.code === "contribution_incremental_sync_invalid_configuration",
+    );
+    assert.equal(service.calls.length, 0);
+  });
+});

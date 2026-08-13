@@ -356,6 +356,12 @@
               <summary data-i18n="dashboard.calibration.perModelSummary">Per-model rates</summary>
               <p class="annotation" data-i18n="dashboard.calibration.perModelExplainer">Each model consumes the weekly allowance at its own rate, so the headline blends these over your recent mix.</p>
               <ul class="calibration-model-list" id="calibration-model-list"></ul>
+              <!--
+                Shown only when the list carries a model the fit could not
+                price on its own, so the reader learns why it sits at a shared
+                rate instead of wondering why its rate matches another's.
+              -->
+              <p class="annotation" id="calibration-model-shared" hidden></p>
             </details>
             <p class="annotation calibration-explanation" id="calibration-explanation">
               This fit uses API prices as a measuring stick. It is not a
