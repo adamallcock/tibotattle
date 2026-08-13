@@ -263,6 +263,12 @@
         { "pattern": "admin.tibotattle.com", "custom_domain": true }
       ],
       "preview_urls": false,
+      // The v1 community-fit analyzer reprices the trailing-100-day usage stream
+      // at read time on a cache-miss cron pass (owner's ~1.22M-record corpus).
+      // Raise the CPU ceiling to 5 min so that reprice + downsample has headroom
+      // well beyond the ~10-18s measured worst case; the fit cache amortizes it
+      // to cache-miss passes only. Phase 2 (at-rest pricing) will drop this back.
+      "limits": { "cpu_ms": 300000 },
       "cache": {
         "enabled": true,
         "cross_version_cache": false

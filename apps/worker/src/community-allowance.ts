@@ -148,6 +148,7 @@ function usd(nanousd: number): number {
  */
 export async function collectCommunityAllowanceFits(
   db: D1Database,
+  nowMs: number = Date.now(),
 ): Promise<CommunityAllowanceFit[]> {
   const participants = await db.prepare(
     `SELECT participant_id, MIN(source) AS source
@@ -207,7 +208,7 @@ export async function collectCommunityAllowanceFits(
     const participantFits: CommunityAllowanceFit[] = [];
     try {
       const analysis = (row.source === "v1"
-        ? await accountScopedQuotaAnalysisV1(db, row.participant_id)
+        ? await accountScopedQuotaAnalysisV1(db, row.participant_id, { nowMs })
         : await accountScopedQuotaAnalysis(db, row.participant_id)) as AnalysisResult;
       if (analysis.status === "ready" && Array.isArray(analysis.tracks)) {
         for (const track of analysis.tracks) {

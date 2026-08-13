@@ -1,4 +1,6 @@
 import {
+  QUOTA_CALIBRATION_POLICY,
+  SEVEN_DAY_WINDOW_MINUTES,
   analyzeQuotaCalibration,
   buildResetEvidence,
   isSupportedQuotaWindowDuration,
@@ -37,19 +39,70 @@ import type { TelemetryUsageEvent } from "./telemetry-validation";
  *      price STAY in the bucket and correctly refuse their reset via
  *      `incomplete_server_pricing`; a price is never dropped or fabricated.
  *
+ * SCALE (why this does not "load all rows then cap"): the owner's genuine dense
+ * v1 corpus is ~1.22M records (a Codex rate_limits snapshot ~every 15s), which
+ * the naive "read everything, LIMIT 50001, refuse over 50k" acquisition always
+ * bailed on. The band's fit numbers flow ONLY through `evidence.boundaries`
+ * plus a per-reset pricing/total refusal (community-allowance.ts) — never the
+ * raw ~15s snapshot stream or per-event usage — so the acquisition is replaced
+ * by two purpose-built reads plus a reduction that is provably identical, per
+ * reset, to what `buildResetEvidence` would compute on the full corpus:
+ *
+ *   - QUOTA: one SQL query that reuses the winning-device dedupe, windows to the
+ *     trailing horizon snapped to whole reset cycles, pre-filters to the only
+ *     track the consumer keeps (limit_id='codex', window=10080), drops reset
+ *     groups the shared calibration always refuses (the fitable HAVING), and
+ *     collapses each flat used_percent run to its endpoints via LAG/LEAD. A
+ *     boundary is emitted only on a strict used_percent increase and anchors
+ *     lowerCost on the LAST row of the preceding run and upperCost on the FIRST
+ *     row of the new run, so keeping both run endpoints is byte-identical for
+ *     the fit while collapsing ~281k raw quota to ~4k rows.
+ *   - USAGE: keyset-paginated, repriced per event, then folded into synthetic
+ *     cost buckets aligned to the retained quota observed_at grid (ceiling
+ *     bucket + singleton-split for grid-exact events, sticky all-fully-priced
+ *     flag). `cumulativeCostAt` samples cost only at boundary anchor timestamps,
+ *     which are all retained grid points, so the summed buckets reproduce every
+ *     boundary cost exactly while collapsing ~306k events to a few hundred rows.
+ *
  * The returned object omits `evidence` and `rolling` (the community consumer
  * reads only `track.continuity.planType`/`planVariant` and
  * `track.calibration.tracks[].resets[]`).
  */
 
-// Row ceiling for the materialized v1 input. A legitimate participant's full
-// history is far below this; it exists so a corrupt or adversarial corpus can
-// never turn a fit read into an unbounded scan. Read full history, not a
-// trailing window: the calibration gates need the whole per-reset series.
-const MAX_ANALYSIS_RECORDS_V1 = 50_000;
+const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
+
+// Trailing read horizon (owner decision 2026-08-13): 100 days, deeper than the
+// band's own trailing-30d window plus one 7d weekly cycle, snapped to whole
+// reset cycles (below). Reading only 30d would truncate the earliest in-window
+// weekly cycle and silently shift its span / capacity / lastObservedAt.
+export const V1_ANALYSIS_WINDOW_DAYS = 100;
+const V1_ANALYSIS_WINDOW_MS = V1_ANALYSIS_WINDOW_DAYS * MILLISECONDS_PER_DAY;
+const SEVEN_DAY_WINDOW_MS = SEVEN_DAY_WINDOW_MINUTES * 60_000;
+
+// Stage-specific caps applied AFTER the reduction, never a raw combined cap and
+// NEVER truncate-and-fit: a truncated usage sum publishes a too-low capacity
+// and a truncated cycle changes span / lastObservedAt — a wrong number is worse
+// than no number. Distinct reason codes let the monitor tell a legit-but-huge
+// corpus from an abusive one. The quota collapse is lossless so a legitimate
+// participant (~4k downsampled) never approaches its cap; exceeding it means a
+// pathological count of distinct resets_at each sweeping the full percent range.
+export const MAX_DOWNSAMPLED_QUOTA_ROWS = 60_000;
+// Running counter across usage pages (observed heaviest ~306k/100d; the local
+// miner's ceiling is 750k/stream).
+export const MAX_WINDOWED_USAGE_ROWS = 1_000_000;
+const USAGE_PAGE_SIZE = 5_000;
 // Identical purpose to the v0.2 path: reject a high-cardinality corpus before
 // any per-track analysis rather than let distinct-seed count multiply the cost.
 const MAX_CONTINUITY_TRACKS = 256;
+
+// The SQL fitable HAVING drops reset groups the shared calibration ALWAYS
+// refuses: a group with fewer than `minimumBoundaries` distinct used_percent can
+// never reach MINIMUM_BOUNDARIES (too_few_boundaries), and a group whose
+// used_percent range is below `minimumDisplayedSpanPp` can never reach
+// MINIMUM_SPAN_PP (insufficient_displayed_span). Derived from the package policy
+// (never hardcoded) so the SQL tracks the calibration gates by construction.
+const MINIMUM_BOUNDARIES = QUOTA_CALIBRATION_POLICY.minimumBoundaries;
+const MINIMUM_DISPLAYED_SPAN_PP = QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp;
 
 // The exact SLOT_VALUES / SAFE_TOKEN the shared quota-tracks validators enforce
 // (packages/quota-analysis/src/quota-tracks.js). v1 BOUNDED_TOKEN permits
@@ -71,12 +124,32 @@ const SAFE_TOKEN = /^[a-z0-9][a-z0-9_.:-]{0,127}$/u;
 // usage matches its track's epoch exactly as in the v0.2 path.
 const V1_POLICY_EPOCH = "v1";
 
-interface AnalysisRecordRowV1 {
+interface DownsampledQuotaRow {
+  occurrence_id: string;
+  observed_at: string;
+  provider: string;
+  plan_type: string;
+  plan_variant: string;
+  limit_id: string;
+  slot: string;
+  used_percent: number;
+  window_duration_minutes: number;
+  resets_at: string;
+}
+
+interface WindowedUsageRow {
+  id: number;
+  observed_at: string;
+  provider: string;
+  record_json: string;
+}
+
+// Row shape for the test-only full reference path (both streams in one read).
+interface ReferenceRecordRowV1 {
   stream: "usage" | "quota";
   occurrence_id: string;
   observed_at: string;
   provider: string;
-  model_id: string | null;
   plan_type: string | null;
   plan_variant: string | null;
   limit_id: string | null;
@@ -85,6 +158,20 @@ interface AnalysisRecordRowV1 {
   window_duration_minutes: number | null;
   resets_at: string | null;
   record_json: string;
+}
+
+// A raw v1 quota row as it can reach the JS domain prefilter (nullable columns).
+interface RawQuotaRow {
+  occurrence_id: string;
+  observed_at: string | null;
+  provider: string;
+  plan_type: string | null;
+  plan_variant: string | null;
+  limit_id: string | null;
+  slot: string | null;
+  used_percent: number | null;
+  window_duration_minutes: number | null;
+  resets_at: string | null;
 }
 
 // Usage events are matched to a track by the subset the per-track usage filter
@@ -103,6 +190,16 @@ interface TrackSeed {
   limitId: string;
   windowDurationMinutes: number;
   policyEpoch: string;
+}
+
+/** Tuning knobs; production uses the defaults, tests pin them for determinism. */
+export interface V1AnalysisOptions {
+  /** Reference instant for the trailing read horizon. Defaults to Date.now(). */
+  nowMs?: number;
+  /** Override the downsampled-quota-row cap (tests exercise the bail cheaply). */
+  maxDownsampledQuotaRows?: number;
+  /** Override the windowed-usage-row cap (tests exercise the bail cheaply). */
+  maxWindowedUsageRows?: number;
 }
 
 function notTestable(reason: string): object {
@@ -181,141 +278,416 @@ function buildPricingEvent(
 }
 
 /**
- * Recompute private participant quota analysis from stored v1 chunk records.
- * No client-declared cost is accepted as the analytical cost basis: every
- * usage event is repriced from tokens by the shared server pricer.
+ * Reprice a single stored v1 usage record from tokens with the shared server
+ * pricer. Returns null for records the pricer cannot even shape (DROP
+ * semantics); a record it can shape but not fully price returns its
+ * (0-cost, partially_priced/unpriced) result so the reset correctly refuses.
  */
-export async function accountScopedQuotaAnalysisV1(
-  db: D1Database,
+function priceV1UsageRecord(
+  recordJson: string,
+  observedAt: string,
+): { costNanousd: number; pricingStatus: PricingStatus } | null {
+  const rec = parseStoredRecordJson(recordJson);
+  if (rec === null) return null;
+  const pricingEvent = buildPricingEvent(rec, observedAt);
+  if (pricingEvent === null) return null;
+  const priced = priceTelemetryUsageEvent(pricingEvent);
+  return {
+    costNanousd: priced.costNanousd,
+    pricingStatus: priced.coverageStatus as PricingStatus,
+  };
+}
+
+/**
+ * Row-level domain prefilter (v0.2-ingest DROP semantics) + synthesis of one
+ * QuotaSnapshotInput. Skips any row outside the shared validators' domain rather
+ * than letting it throw. Left in JS (not SQL) deliberately: the Date.parse and
+ * SAFE_TOKEN / slot-domain checks avoid ISO-format and collation assumptions in
+ * SQLite. Returns null for a dropped row.
+ */
+async function buildQuotaSnapshotInput(
+  row: RawQuotaRow,
+  accountTrackId: string,
+  datasetId: string,
+): Promise<QuotaSnapshotInput | null> {
+  if (row.slot === null || !SLOT_VALUES.has(row.slot)) return null;
+  if (row.resets_at === null || row.observed_at === null) return null;
+  if (Date.parse(row.resets_at) <= Date.parse(row.observed_at)) return null;
+  if (row.used_percent === null
+      || !Number.isFinite(row.used_percent)
+      || row.used_percent < 0
+      || row.used_percent > 100) return null;
+  if (row.plan_type === null
+      || row.plan_variant === null
+      || row.limit_id === null) return null;
+  if (!SAFE_TOKEN.test(row.provider)
+      || !SAFE_TOKEN.test(row.plan_type)
+      || !SAFE_TOKEN.test(row.plan_variant)
+      || !SAFE_TOKEN.test(row.limit_id)
+      || !SAFE_TOKEN.test(row.slot)) return null;
+  // A quota snapshot needs a window; a missing one can neither seed nor bucket
+  // (matching the v0.2 path, where a null window drops out).
+  if (row.window_duration_minutes === null) return null;
+  const snapshotId = `q:v1:${await sha256Hex(row.occurrence_id)}`;
+  return {
+    snapshotId,
+    datasetId,
+    accountTrackId,
+    provider: row.provider,
+    planType: row.plan_type,
+    planVariant: row.plan_variant,
+    limitId: row.limit_id,
+    slot: row.slot as QuotaSlot,
+    windowDurationMinutes:
+      row.window_duration_minutes as QuotaWindowDurationMinutes,
+    resetsAt: row.resets_at,
+    observedAt: row.observed_at,
+    // Receipt lag 0: v1 records carry no receipt timestamp distinct from the
+    // observation, so the reset is never stale or backward on lag.
+    receivedAt: row.observed_at,
+    usedPercent: row.used_percent,
+    displayPrecision: 0,
+    policyEpoch: V1_POLICY_EPOCH,
+  };
+}
+
+async function v1DatasetId(participantId: string): Promise<string> {
+  return `dataset:v1:${await sha256Hex(participantId)}`;
+}
+
+async function v1AccountTrackId(
   participantId: string,
-): Promise<object> {
-  const recordResult = await db.prepare(
-    `WITH day_device_evidence AS (
-        SELECT r.observed_day AS observed_day,
-               r.device_id AS device_id,
-               MAX(c.created_at) AS newest
-          FROM telemetry_v1_records r
-          JOIN telemetry_v1_chunks c ON c.id = r.chunk_row_id
-         WHERE r.participant_id = ?1
-           AND r.stream IN ('usage', 'quota')
-         GROUP BY r.observed_day, r.device_id
-      ),
-      winning_devices AS (
-        SELECT observed_day, device_id
-          FROM day_device_evidence winner
-         WHERE NOT EXISTS (
-           SELECT 1 FROM day_device_evidence rival
-            WHERE rival.observed_day = winner.observed_day
-              AND (
-                rival.newest > winner.newest
-                OR (
-                  rival.newest = winner.newest
-                  AND rival.device_id > winner.device_id
-                )
-              )
-         )
-      )
-      SELECT r.stream, r.occurrence_id, r.observed_at, r.provider, r.model_id,
-             r.plan_type, r.plan_variant, r.limit_id, r.slot, r.used_percent,
-             r.window_duration_minutes, r.resets_at, r.record_json
-        FROM telemetry_v1_records r
-        JOIN winning_devices w
-          ON w.observed_day = r.observed_day AND w.device_id = r.device_id
-        JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
-       WHERE r.participant_id = ?1
-         AND r.stream IN ('usage', 'quota')
-       ORDER BY r.observed_at, r.id
-       LIMIT ?2`,
-  ).bind(participantId, MAX_ANALYSIS_RECORDS_V1 + 1).all<AnalysisRecordRowV1>();
+  provider: string,
+): Promise<string> {
+  return `account-track:v1:${await sha256Hex(`${participantId}|${provider}`)}`;
+}
 
-  if (recordResult.results.length > MAX_ANALYSIS_RECORDS_V1) {
-    return notTestable("analysis_record_limit_exceeded");
+// The winning-device dedupe the daily aggregates use: per (participant, day),
+// count only the records of the device whose current chunks are freshest
+// (newest created_at, tiebreak larger device_id). Considers BOTH streams so the
+// same winner is chosen for the quota and usage reads.
+const WINNING_DEVICE_CTE = `
+  WITH day_device_evidence AS (
+    SELECT r.observed_day AS observed_day,
+           r.device_id AS device_id,
+           MAX(c.created_at) AS newest
+      FROM telemetry_v1_records r
+      JOIN telemetry_v1_chunks c ON c.id = r.chunk_row_id
+     WHERE r.participant_id = ?1
+       AND r.stream IN ('usage', 'quota')
+     GROUP BY r.observed_day, r.device_id
+  ),
+  winning_devices AS (
+    SELECT observed_day, device_id
+      FROM day_device_evidence winner
+     WHERE NOT EXISTS (
+       SELECT 1 FROM day_device_evidence rival
+        WHERE rival.observed_day = winner.observed_day
+          AND (
+            rival.newest > winner.newest
+            OR (
+              rival.newest = winner.newest
+              AND rival.device_id > winner.device_id
+            )
+          )
+     )
+  )`;
+
+/**
+ * Windowed run-endpoint quota downsample.
+ *
+ * Windowing is snapped to whole reset cycles: `observed_at >= :cutoff` bounds
+ * the index range scan, and `resets_at >= :resetsAtCutoff` (cutoff + one weekly
+ * window) includes a reset only when its ENTIRE first..last series is within the
+ * window, so a cycle straddling the cutoff is excluded wholesale rather than
+ * read partially and mis-fit. The fitable HAVING drops reset groups the shared
+ * calibration always refuses; the LAG/LEAD collapse keeps every row that differs
+ * from its predecessor OR successor — the first and last row of every flat
+ * used_percent run — because a boundary anchors lowerCost on the last row of the
+ * preceding run and upperCost on the first row of the new run. The partition
+ * INCLUDES slot (an eligible multi-slot reset has time-disjoint slots); the
+ * fitable GROUP BY EXCLUDES slot (= the shared resetKey).
+ */
+const QUOTA_DOWNSAMPLE_SQL = `${WINNING_DEVICE_CTE},
+  scoped AS (
+    SELECT r.occurrence_id AS occurrence_id,
+           r.observed_at AS observed_at,
+           r.provider AS provider,
+           r.plan_type AS plan_type,
+           r.plan_variant AS plan_variant,
+           r.limit_id AS limit_id,
+           r.slot AS slot,
+           r.used_percent AS used_percent,
+           r.window_duration_minutes AS window_duration_minutes,
+           r.resets_at AS resets_at,
+           r.id AS id
+      FROM telemetry_v1_records r
+      JOIN winning_devices wd
+        ON wd.observed_day = r.observed_day AND wd.device_id = r.device_id
+      JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
+     WHERE r.participant_id = ?1
+       AND r.stream = 'quota'
+       AND r.observed_at >= ?2
+       AND r.resets_at >= ?3
+       AND r.limit_id = 'codex'
+       AND r.window_duration_minutes = ?4
+       AND r.resets_at IS NOT NULL
+       AND r.slot IS NOT NULL
+       AND r.used_percent IS NOT NULL
+       AND r.plan_type IS NOT NULL
+       AND r.plan_variant IS NOT NULL
+  ),
+  fitable AS (
+    SELECT provider, plan_type, plan_variant, limit_id,
+           window_duration_minutes, resets_at
+      FROM scoped
+     GROUP BY provider, plan_type, plan_variant, limit_id,
+              window_duration_minutes, resets_at
+    HAVING COUNT(DISTINCT used_percent) >= ?5
+       AND (MAX(used_percent) - MIN(used_percent)) >= ?6
+  ),
+  survivors AS (
+    SELECT s.*
+      FROM scoped s
+      JOIN fitable f
+        ON f.provider = s.provider
+       AND f.plan_type = s.plan_type
+       AND f.plan_variant = s.plan_variant
+       AND f.limit_id = s.limit_id
+       AND f.window_duration_minutes = s.window_duration_minutes
+       AND f.resets_at = s.resets_at
+  ),
+  marked AS (
+    SELECT survivors.*,
+           LAG(used_percent) OVER win AS prev_up,
+           LEAD(used_percent) OVER win AS next_up
+      FROM survivors
+    WINDOW win AS (
+      PARTITION BY provider, plan_type, plan_variant, limit_id,
+                   window_duration_minutes, resets_at, slot
+      ORDER BY observed_at, id
+    )
+  )
+  SELECT occurrence_id, observed_at, provider, plan_type, plan_variant,
+         limit_id, slot, used_percent, window_duration_minutes, resets_at
+    FROM marked
+   WHERE prev_up IS NULL
+      OR next_up IS NULL
+      OR used_percent <> prev_up
+      OR used_percent <> next_up
+   ORDER BY observed_at, id
+   LIMIT ?7`;
+
+const USAGE_PAGE_SQL = `${WINNING_DEVICE_CTE}
+  SELECT r.id AS id, r.observed_at AS observed_at, r.provider AS provider,
+         r.record_json AS record_json
+    FROM telemetry_v1_records r
+    JOIN winning_devices wd
+      ON wd.observed_day = r.observed_day AND wd.device_id = r.device_id
+    JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
+   WHERE r.participant_id = ?1
+     AND r.stream = 'usage'
+     AND r.observed_at >= ?2
+     AND (r.observed_at > ?3 OR (r.observed_at = ?3 AND r.id > ?4))
+   ORDER BY r.observed_at, r.id
+   LIMIT ?5`;
+
+interface ProviderGrid {
+  sortedMs: number[];
+  set: Set<number>;
+}
+
+/**
+ * The retained quota observed_at grid, per provider (equivalently per account
+ * track). Every boundary anchor of every retained reset of a provider is one of
+ * these instants, so usage summed between consecutive grid points is invisible
+ * to `cumulativeCostAt`.
+ */
+function buildGridByProvider(
+  quotaSnapshots: QuotaSnapshotInput[],
+): Map<string, ProviderGrid> {
+  const msByProvider = new Map<string, Set<number>>();
+  for (const snapshot of quotaSnapshots) {
+    const ms = Date.parse(snapshot.observedAt);
+    if (!Number.isFinite(ms)) continue;
+    const bucket = msByProvider.get(snapshot.provider) ?? new Set<number>();
+    bucket.add(ms);
+    msByProvider.set(snapshot.provider, bucket);
   }
-
-  // Synthetic dataset (single, complete): the v1 chunk journal has no partial
-  // dataset concept, so there is exactly one complete dataset per participant.
-  const datasetId = `dataset:v1:${await sha256Hex(participantId)}`;
-  const datasets = [{ datasetId, complete: true }];
-  // Account track id per provider, assigned identically to that participant's
-  // quota snapshots and usage events so usage attributes to its track.
-  const accountTrackByProvider = new Map<string, string>();
-  for (const row of recordResult.results) {
-    if (!accountTrackByProvider.has(row.provider)) {
-      accountTrackByProvider.set(
-        row.provider,
-        `account-track:v1:${await sha256Hex(`${participantId}|${row.provider}`)}`,
-      );
-    }
-  }
-
-  const quotaSnapshots: QuotaSnapshotInput[] = [];
-  const usageEvents: UsageEventPartial[] = [];
-  for (const row of recordResult.results) {
-    const accountTrackId = accountTrackByProvider.get(row.provider)!;
-    if (row.stream === "quota") {
-      // Row-level domain prefilter (v0.2-ingest DROP semantics): skip any row
-      // outside the shared validators' domain rather than let it throw.
-      if (row.slot === null || !SLOT_VALUES.has(row.slot)) continue;
-      if (row.resets_at === null || row.observed_at === null) continue;
-      if (Date.parse(row.resets_at) <= Date.parse(row.observed_at)) continue;
-      if (row.used_percent === null
-          || !Number.isFinite(row.used_percent)
-          || row.used_percent < 0
-          || row.used_percent > 100) continue;
-      if (row.plan_type === null
-          || row.plan_variant === null
-          || row.limit_id === null) continue;
-      if (!SAFE_TOKEN.test(row.provider)
-          || !SAFE_TOKEN.test(row.plan_type)
-          || !SAFE_TOKEN.test(row.plan_variant)
-          || !SAFE_TOKEN.test(row.limit_id)
-          || !SAFE_TOKEN.test(row.slot)) continue;
-      // A quota snapshot needs a window; a missing one can neither seed nor
-      // bucket (matching the v0.2 path, where a null window drops out).
-      if (row.window_duration_minutes === null) continue;
-      const snapshotId = `q:v1:${await sha256Hex(row.occurrence_id)}`;
-      quotaSnapshots.push({
-        snapshotId,
-        datasetId,
-        accountTrackId,
-        provider: row.provider,
-        planType: row.plan_type,
-        planVariant: row.plan_variant,
-        limitId: row.limit_id,
-        slot: row.slot as QuotaSlot,
-        windowDurationMinutes:
-          row.window_duration_minutes as QuotaWindowDurationMinutes,
-        resetsAt: row.resets_at,
-        observedAt: row.observed_at,
-        // Receipt lag 0: v1 records carry no receipt timestamp distinct from
-        // the observation, so the reset is never stale or backward on lag.
-        receivedAt: row.observed_at,
-        usedPercent: row.used_percent,
-        displayPrecision: 0,
-        policyEpoch: V1_POLICY_EPOCH,
-      });
-      continue;
-    }
-    // usage
-    if (!SAFE_TOKEN.test(row.provider)) continue;
-    const rec = parseStoredRecordJson(row.record_json);
-    if (rec === null) continue;
-    const pricingEvent = buildPricingEvent(rec, row.observed_at);
-    if (pricingEvent === null) continue;
-    const priced = priceTelemetryUsageEvent(pricingEvent);
-    const eventId = `u:v1:${await sha256Hex(row.occurrence_id)}`;
-    usageEvents.push({
-      eventId,
-      datasetId,
-      accountTrackId,
-      provider: row.provider,
-      observedAt: row.observed_at,
-      costNanousd: priced.costNanousd,
-      pricingStatus: priced.coverageStatus as PricingStatus,
-      policyEpoch: V1_POLICY_EPOCH,
+  const grids = new Map<string, ProviderGrid>();
+  for (const [provider, set] of msByProvider) {
+    grids.set(provider, {
+      sortedMs: [...set].sort((left, right) => left - right),
+      set,
     });
   }
+  return grids;
+}
 
+/** Smallest grid instant strictly greater than `value` (the ceiling bucket). */
+function ceilingGrid(sortedMs: number[], value: number): number | null {
+  let low = 0;
+  let high = sortedMs.length;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (sortedMs[mid]! <= value) low = mid + 1;
+    else high = mid;
+  }
+  return low < sortedMs.length ? sortedMs[low]! : null;
+}
+
+interface BucketAccumulator {
+  costNanousd: number;
+  allFullyPriced: boolean;
+  placementMs: number;
+}
+
+/**
+ * Stream the windowed usage (keyset-paginated), reprice each event, and fold it
+ * into synthetic per-bucket rows aligned to the retained quota grid. Returns the
+ * literal string "limit_exceeded" when the windowed usage row count passes the
+ * cap (never truncate-and-fit).
+ */
+async function readAndBucketUsage(
+  db: D1Database,
+  participantId: string,
+  datasetId: string,
+  observedAtCutoff: string,
+  accountTrackByProvider: Map<string, string>,
+  gridByProvider: Map<string, ProviderGrid>,
+  maxWindowedUsageRows: number,
+): Promise<UsageEventPartial[] | "limit_exceeded"> {
+  // Per provider: strictly-interior events keyed by their ceiling grid instant,
+  // and grid-exact events kept as their own singleton at that instant (the
+  // matchedUsage lower bound is inclusive, so a grid-exact event that equals a
+  // reset's firstObserved is in-window while interior events of the same bucket
+  // are not — the singleton-split preserves that distinction).
+  const buckets = new Map<string, Map<number, BucketAccumulator>>();
+  const singletons = new Map<string, Map<number, BucketAccumulator>>();
+
+  let total = 0;
+  let cursorObs = observedAtCutoff;
+  let cursorId = 0;
+  for (;;) {
+    const page = await db.prepare(USAGE_PAGE_SQL)
+      .bind(participantId, observedAtCutoff, cursorObs, cursorId, USAGE_PAGE_SIZE)
+      .all<WindowedUsageRow>();
+    const rows = page.results;
+    if (rows.length === 0) break;
+    total += rows.length;
+    if (total > maxWindowedUsageRows) return "limit_exceeded";
+    for (const row of rows) {
+      if (!SAFE_TOKEN.test(row.provider)) continue;
+      const grid = gridByProvider.get(row.provider);
+      if (!grid || grid.sortedMs.length === 0) continue;
+      const eMs = Date.parse(row.observed_at);
+      if (!Number.isFinite(eMs)) continue;
+      // Events after the last retained quota instant cannot enter any reset's
+      // matched window (matchedUsage requires observedAt <= lastObserved <=
+      // maxG), so they change no fit — drop them.
+      if (eMs > grid.sortedMs[grid.sortedMs.length - 1]!) continue;
+      const priced = priceV1UsageRecord(row.record_json, row.observed_at);
+      if (priced === null) continue;
+      const fullyPriced = priced.pricingStatus === "fully_priced";
+      if (grid.set.has(eMs)) {
+        const providerSingletons = singletons.get(row.provider)
+          ?? new Map<number, BucketAccumulator>();
+        const existing = providerSingletons.get(eMs);
+        if (existing) {
+          existing.costNanousd += priced.costNanousd;
+          existing.allFullyPriced = existing.allFullyPriced && fullyPriced;
+        } else {
+          providerSingletons.set(eMs, {
+            costNanousd: priced.costNanousd,
+            allFullyPriced: fullyPriced,
+            placementMs: eMs,
+          });
+        }
+        singletons.set(row.provider, providerSingletons);
+        continue;
+      }
+      const qc = ceilingGrid(grid.sortedMs, eMs);
+      if (qc === null) continue;
+      const providerBuckets = buckets.get(row.provider)
+        ?? new Map<number, BucketAccumulator>();
+      const existing = providerBuckets.get(qc);
+      if (existing) {
+        existing.costNanousd += priced.costNanousd;
+        existing.allFullyPriced = existing.allFullyPriced && fullyPriced;
+        // Place the synthetic at the MAX constituent observed_at (< qc), so it
+        // sits strictly between the previous grid point and qc.
+        existing.placementMs = Math.max(existing.placementMs, eMs);
+      } else {
+        providerBuckets.set(qc, {
+          costNanousd: priced.costNanousd,
+          allFullyPriced: fullyPriced,
+          placementMs: eMs,
+        });
+      }
+      buckets.set(row.provider, providerBuckets);
+    }
+    if (rows.length < USAGE_PAGE_SIZE) break;
+    const last = rows[rows.length - 1]!;
+    cursorObs = last.observed_at;
+    cursorId = last.id;
+  }
+
+  const usageEvents: UsageEventPartial[] = [];
+  const providers = new Set<string>([...buckets.keys(), ...singletons.keys()]);
+  for (const provider of providers) {
+    const accountTrackId = accountTrackByProvider.get(provider);
+    if (accountTrackId === undefined) continue;
+    for (const [gridMs, acc] of singletons.get(provider) ?? []) {
+      usageEvents.push(await synthUsageRow(
+        accountTrackId, datasetId, provider, acc, `s|${gridMs}`,
+      ));
+    }
+    for (const [qcMs, acc] of buckets.get(provider) ?? []) {
+      usageEvents.push(await synthUsageRow(
+        accountTrackId, datasetId, provider, acc, `b|${qcMs}`,
+      ));
+    }
+  }
+  return usageEvents;
+}
+
+async function synthUsageRow(
+  accountTrackId: string,
+  datasetId: string,
+  provider: string,
+  acc: BucketAccumulator,
+  anchor: string,
+): Promise<UsageEventPartial> {
+  // The eventId is a synthetic OPAQUE_ID over (track|kind|anchor): hundreds of
+  // hashes instead of the ~306k per-event hashes the old path computed. The
+  // kind prefix (s = grid-exact singleton, b = interior bucket) keeps a
+  // singleton and a bucket that share a grid instant distinct.
+  const eventId = `u:v1:${await sha256Hex(`${accountTrackId}|${anchor}`)}`;
+  return {
+    eventId,
+    datasetId,
+    accountTrackId,
+    provider,
+    observedAt: new Date(acc.placementMs).toISOString(),
+    costNanousd: acc.costNanousd,
+    // Sticky AND: fully_priced only if EVERY constituent was, so a bucket that
+    // contains any not-fully-priced event still refuses its reset via
+    // incomplete_server_pricing.
+    pricingStatus: acc.allFullyPriced ? "fully_priced" : "partially_priced",
+    policyEpoch: V1_POLICY_EPOCH,
+  };
+}
+
+/**
+ * The shared seed/bucket/loop: group snapshots into continuity seeds, gate on
+ * track count, and run the per-seed shared calibration. Pure and synchronous —
+ * both the production reduction path and the test-only full reference feed it.
+ */
+function runV1SeedLoop(
+  datasets: { datasetId: string; complete: boolean }[],
+  quotaSnapshots: QuotaSnapshotInput[],
+  usageEvents: UsageEventPartial[],
+): object {
   const seeds = new Map<string, TrackSeed>();
   for (const snapshot of quotaSnapshots) {
     if (!isSupportedQuotaWindowDuration(snapshot.windowDurationMinutes)) continue;
@@ -393,4 +765,166 @@ export async function accountScopedQuotaAnalysisV1(
     status: "ready",
     tracks,
   };
+}
+
+/**
+ * Recompute private participant quota analysis from stored v1 chunk records.
+ * No client-declared cost is accepted as the analytical cost basis: every usage
+ * event is repriced from tokens by the shared server pricer.
+ */
+export async function accountScopedQuotaAnalysisV1(
+  db: D1Database,
+  participantId: string,
+  options: V1AnalysisOptions = {},
+): Promise<object> {
+  const nowMs = options.nowMs ?? Date.now();
+  const maxDownsampledQuotaRows =
+    options.maxDownsampledQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS;
+  const maxWindowedUsageRows =
+    options.maxWindowedUsageRows ?? MAX_WINDOWED_USAGE_ROWS;
+  const cutoffMs = nowMs - V1_ANALYSIS_WINDOW_MS;
+  const observedAtCutoff = new Date(cutoffMs).toISOString();
+  // Snap the window to whole reset cycles: a weekly cycle's observations lie in
+  // [resets_at - 7d, resets_at), so requiring resets_at >= cutoff + 7d includes
+  // a cycle only when its entire series is at or after the observed_at cutoff.
+  const resetsAtCutoff = new Date(cutoffMs + SEVEN_DAY_WINDOW_MS).toISOString();
+
+  const quotaResult = await db.prepare(QUOTA_DOWNSAMPLE_SQL).bind(
+    participantId,
+    observedAtCutoff,
+    resetsAtCutoff,
+    SEVEN_DAY_WINDOW_MINUTES,
+    MINIMUM_BOUNDARIES,
+    MINIMUM_DISPLAYED_SPAN_PP,
+    maxDownsampledQuotaRows + 1,
+  ).all<DownsampledQuotaRow>();
+
+  if (quotaResult.results.length > maxDownsampledQuotaRows) {
+    return notTestable("downsampled_quota_limit_exceeded");
+  }
+  if (quotaResult.results.length === 0) {
+    return notTestable("supported_quota_track_unavailable");
+  }
+
+  const datasetId = await v1DatasetId(participantId);
+  const datasets = [{ datasetId, complete: true }];
+  const accountTrackByProvider = new Map<string, string>();
+  const quotaSnapshots: QuotaSnapshotInput[] = [];
+  for (const row of quotaResult.results) {
+    let accountTrackId = accountTrackByProvider.get(row.provider);
+    if (accountTrackId === undefined) {
+      accountTrackId = await v1AccountTrackId(participantId, row.provider);
+      accountTrackByProvider.set(row.provider, accountTrackId);
+    }
+    const snapshot = await buildQuotaSnapshotInput(row, accountTrackId, datasetId);
+    if (snapshot) quotaSnapshots.push(snapshot);
+  }
+  if (quotaSnapshots.length === 0) {
+    return notTestable("supported_quota_track_unavailable");
+  }
+
+  const gridByProvider = buildGridByProvider(quotaSnapshots);
+  const usageEvents = await readAndBucketUsage(
+    db,
+    participantId,
+    datasetId,
+    observedAtCutoff,
+    accountTrackByProvider,
+    gridByProvider,
+    maxWindowedUsageRows,
+  );
+  if (usageEvents === "limit_exceeded") {
+    return notTestable("windowed_usage_limit_exceeded");
+  }
+
+  return runV1SeedLoop(datasets, quotaSnapshots, usageEvents);
+}
+
+/**
+ * Test-only probe: the raw rows the windowed run-endpoint downsample returns,
+ * so a test can MEASURE the collapse (raw vs retained) and assert the retained
+ * set is exactly the first and last row of every flat used_percent run. Uses the
+ * production SQL and default caps.
+ */
+export async function downsampleQuotaForTest(
+  db: D1Database,
+  participantId: string,
+  nowMs: number = Date.now(),
+): Promise<DownsampledQuotaRow[]> {
+  const cutoffMs = nowMs - V1_ANALYSIS_WINDOW_MS;
+  const observedAtCutoff = new Date(cutoffMs).toISOString();
+  const resetsAtCutoff = new Date(cutoffMs + SEVEN_DAY_WINDOW_MS).toISOString();
+  const result = await db.prepare(QUOTA_DOWNSAMPLE_SQL).bind(
+    participantId,
+    observedAtCutoff,
+    resetsAtCutoff,
+    SEVEN_DAY_WINDOW_MINUTES,
+    MINIMUM_BOUNDARIES,
+    MINIMUM_DISPLAYED_SPAN_PP,
+    MAX_DOWNSAMPLED_QUOTA_ROWS + 1,
+  ).all<DownsampledQuotaRow>();
+  return result.results;
+}
+
+/**
+ * Test-only reference path: the FULL per-event analysis with NO windowing,
+ * downsampling, or usage bucketing. It shares every synthesis primitive with the
+ * production path (winning-device dedupe, quota domain prefilter, server
+ * pricing, id/dataset/track derivation, the seed loop), so the ONLY difference
+ * from `accountScopedQuotaAnalysisV1` is the reduction under test. The golden
+ * parity test asserts the reduced path's band-relevant reset fits are
+ * byte-identical to this oracle. NEVER call this in production: it materializes
+ * every record and would OOM on a dense corpus — the reduction exists precisely
+ * to avoid that.
+ */
+export async function accountScopedQuotaAnalysisV1FullReferenceForTest(
+  db: D1Database,
+  participantId: string,
+): Promise<object> {
+  const result = await db.prepare(`${WINNING_DEVICE_CTE}
+    SELECT r.stream, r.occurrence_id, r.observed_at, r.provider, r.plan_type,
+           r.plan_variant, r.limit_id, r.slot, r.used_percent,
+           r.window_duration_minutes, r.resets_at, r.record_json
+      FROM telemetry_v1_records r
+      JOIN winning_devices wd
+        ON wd.observed_day = r.observed_day AND wd.device_id = r.device_id
+      JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
+     WHERE r.participant_id = ?1
+       AND r.stream IN ('usage', 'quota')
+     ORDER BY r.observed_at, r.id`,
+  ).bind(participantId).all<ReferenceRecordRowV1>();
+
+  const datasetId = await v1DatasetId(participantId);
+  const datasets = [{ datasetId, complete: true }];
+  const accountTrackByProvider = new Map<string, string>();
+  const quotaSnapshots: QuotaSnapshotInput[] = [];
+  const usageEvents: UsageEventPartial[] = [];
+  for (const row of result.results) {
+    let accountTrackId = accountTrackByProvider.get(row.provider);
+    if (accountTrackId === undefined) {
+      accountTrackId = await v1AccountTrackId(participantId, row.provider);
+      accountTrackByProvider.set(row.provider, accountTrackId);
+    }
+    if (row.stream === "quota") {
+      const snapshot = await buildQuotaSnapshotInput(
+        row, accountTrackId, datasetId,
+      );
+      if (snapshot) quotaSnapshots.push(snapshot);
+      continue;
+    }
+    if (!SAFE_TOKEN.test(row.provider)) continue;
+    const priced = priceV1UsageRecord(row.record_json, row.observed_at);
+    if (priced === null) continue;
+    usageEvents.push({
+      eventId: `u:v1:${await sha256Hex(row.occurrence_id)}`,
+      datasetId,
+      accountTrackId,
+      provider: row.provider,
+      observedAt: row.observed_at,
+      costNanousd: priced.costNanousd,
+      pricingStatus: priced.pricingStatus,
+      policyEpoch: V1_POLICY_EPOCH,
+    });
+  }
+  return runV1SeedLoop(datasets, quotaSnapshots, usageEvents);
 }

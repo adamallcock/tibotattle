@@ -10,7 +10,22 @@ import {
   summarizeCommunityCapacityByPlanType,
 } from "../src/community-allowance";
 import type { CommunityAllowanceFit } from "../src/community-allowance";
-import { accountScopedQuotaAnalysisV1 } from "../src/quota-analysis-v1";
+import {
+  accountScopedQuotaAnalysisV1,
+  accountScopedQuotaAnalysisV1FullReferenceForTest,
+  downsampleQuotaForTest,
+  MAX_DOWNSAMPLED_QUOTA_ROWS,
+  MAX_WINDOWED_USAGE_ROWS,
+  V1_ANALYSIS_WINDOW_DAYS,
+} from "../src/quota-analysis-v1";
+import {
+  buildResetEvidence,
+  QUOTA_CALIBRATION_POLICY,
+} from "@app-usagemonitor/quota-analysis";
+import type {
+  QuotaSnapshotInput,
+  QuotaUsageEventInput,
+} from "@app-usagemonitor/quota-analysis";
 import {
   readLatestCommunityDailyAggregate,
   rebuildPendingCommunityDailyAggregates,
@@ -1123,5 +1138,641 @@ describe("community allowance from the v1.0 chunk corpus", () => {
       "SELECT COUNT(*) AS total FROM community_allowance_fit_cache",
     ).first<{ total: number }>();
     expect(cached?.total).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1 analyzer scale fix: the fit-PRESERVING SQL downsample + usage grid-bucket
+// reduction. The core proof is the dense-data golden: the reduced production
+// path and the full per-event reference return byte-identical band-relevant
+// reset fits over a dense corpus, so the community band numbers cannot silently
+// change. Every scale-fix test pins `nowMs` so it is independent of the wall
+// clock, and constructs data relative to that pinned instant.
+
+const SCALE_NOW = Date.parse("2026-08-13T12:00:00.000Z");
+const DAY_MS = 24 * 60 * 60 * 1000;
+const MINUTE_MS = 60_000;
+
+interface ResetFitLike {
+  status: string;
+  limitId: string;
+  windowDurationMinutes: number;
+  capacityNanousd: number | null;
+  displayedSpanPp: number | null;
+  firstObservedAt: string;
+  lastObservedAt: string;
+  resetsAt: string;
+  refusalCodes: string[];
+}
+
+interface AnalysisLike {
+  status: string;
+  reason?: string;
+  tracks: Array<{
+    continuity: { limitId: string; windowDurationMinutes: number; planType: string };
+    calibration: { tracks: Array<{ resets: ResetFitLike[] }> };
+  }>;
+}
+
+function allResets(analysis: AnalysisLike): ResetFitLike[] {
+  return (analysis.tracks ?? [])
+    .flatMap((track) => track.calibration?.tracks ?? [])
+    .flatMap((calibrationTrack) => calibrationTrack.resets ?? []);
+}
+
+// The exact projection the community band consumes: conditional_estimate,
+// limit_id codex, weekly window. Sorted deterministically so control and the
+// reduced path canonicalize identically.
+function bandResets(analysis: AnalysisLike): Array<{
+  resetsAt: string;
+  capacityNanousd: number | null;
+  displayedSpanPp: number | null;
+  firstObservedAt: string;
+  lastObservedAt: string;
+  status: string;
+}> {
+  return allResets(analysis)
+    .filter((reset) => reset.status === "conditional_estimate"
+      && reset.limitId === "codex"
+      && reset.windowDurationMinutes === 10_080)
+    .map((reset) => ({
+      resetsAt: reset.resetsAt,
+      capacityNanousd: reset.capacityNanousd,
+      displayedSpanPp: reset.displayedSpanPp,
+      firstObservedAt: reset.firstObservedAt,
+      lastObservedAt: reset.lastObservedAt,
+      status: reset.status,
+    }))
+    .sort((left, right) => (
+      left.resetsAt.localeCompare(right.resetsAt)
+      || left.firstObservedAt.localeCompare(right.firstObservedAt)
+    ));
+}
+
+// A dense weekly codex reset: rising integer used_percent levels, EACH repeated
+// `repeats` times as a flat run at `snapshotStepMs` spacing (this is what the
+// run-endpoint collapse must reduce), with one priceable usage event `usage
+// offset` after every snapshot. `gridExactLevels` additionally drops a usage
+// event EXACTLY on the last snapshot of that level's run (a retained grid point)
+// to exercise the singleton-split.
+function buildDenseReset(opts: {
+  tag: string;
+  baseMs: number;
+  resetsAt: string;
+  levels: number;
+  startPp: number;
+  stepPp: number;
+  repeats: number;
+  snapshotStepMs: number;
+  usageOffsetMs?: number;
+  gridExactLevels?: number[];
+}): { quota: V1SeedRecord[]; usage: V1SeedRecord[] } {
+  const quota: V1SeedRecord[] = [];
+  const usage: V1SeedRecord[] = [];
+  const usageOffsetMs = opts.usageOffsetMs ?? 7_500;
+  const gridExact = new Set(opts.gridExactLevels ?? []);
+  let step = 0;
+  for (let level = 0; level < opts.levels; level += 1) {
+    const usedPercent = opts.startPp + level * opts.stepPp;
+    let lastObsMs = 0;
+    for (let repeat = 0; repeat < opts.repeats; repeat += 1) {
+      const obsMs = opts.baseMs + step * opts.snapshotStepMs;
+      lastObsMs = obsMs;
+      quota.push({
+        occurrence_id: `q-${opts.tag}-${level}-${repeat}`,
+        observed_at: new Date(obsMs).toISOString(),
+        provider: "openai_codex",
+        plan_type: "pro",
+        plan_variant: "unknown",
+        limit_id: "codex",
+        slot: "seven_day",
+        used_percent: usedPercent,
+        window_duration_minutes: 10_080,
+        resets_at: opts.resetsAt,
+      });
+      usage.push({
+        occurrence_id: `u-${opts.tag}-${level}-${repeat}`,
+        observed_at: new Date(obsMs + usageOffsetMs).toISOString(),
+        provider: "openai_codex",
+        model_id: "gpt-5.6-sol",
+        record_json: v1PriceableUsageJson(),
+      });
+      step += 1;
+    }
+    if (gridExact.has(level)) {
+      usage.push({
+        occurrence_id: `ux-${opts.tag}-${level}`,
+        observed_at: new Date(lastObsMs).toISOString(),
+        provider: "openai_codex",
+        model_id: "gpt-5.6-sol",
+        record_json: v1PriceableUsageJson(),
+      });
+    }
+  }
+  return { quota, usage };
+}
+
+// Nine strictly-increasing snapshots (nine boundaries) with a usage event
+// between each pair — a minimally calibratable reset, with configurable track
+// identity so it can stand in for the weekly, five-hour, or bengalfox tracks.
+function buildCalibratableTrack(opts: {
+  tag: string;
+  startMs: number;
+  resetsAt: string;
+  stepPp: number;
+  limitId?: string;
+  slot?: string;
+  windowMinutes?: number;
+  snapshotStepMs?: number;
+  unpriceableUsageIndex?: number;
+  gridExactUnpriceable?: boolean;
+}): { quota: V1SeedRecord[]; usage: V1SeedRecord[] } {
+  const quota: V1SeedRecord[] = [];
+  const usage: V1SeedRecord[] = [];
+  const limitId = opts.limitId ?? "codex";
+  const slot = opts.slot ?? "seven_day";
+  const windowMinutes = opts.windowMinutes ?? 10_080;
+  const snapshotStepMs = opts.snapshotStepMs ?? 5 * MINUTE_MS;
+  for (let index = 0; index < 9; index += 1) {
+    const obsMs = opts.startMs + index * snapshotStepMs;
+    quota.push({
+      occurrence_id: `q-${opts.tag}-${index}`,
+      observed_at: new Date(obsMs).toISOString(),
+      provider: "openai_codex",
+      plan_type: "pro",
+      plan_variant: "unknown",
+      limit_id: limitId,
+      slot,
+      used_percent: 10 + index * opts.stepPp,
+      window_duration_minutes: windowMinutes,
+      resets_at: opts.resetsAt,
+    });
+    if (index < 8) {
+      const unpriceable = opts.unpriceableUsageIndex === index;
+      // Grid-exact places the flagged event ON snapshot index+1's instant (a
+      // retained grid point); otherwise it sits strictly interior (half a step,
+      // so it stays between consecutive snapshots for any spacing).
+      const usageMs = unpriceable && opts.gridExactUnpriceable
+        ? opts.startMs + (index + 1) * snapshotStepMs
+        : obsMs + Math.floor(snapshotStepMs / 2);
+      usage.push({
+        occurrence_id: `u-${opts.tag}-${index}`,
+        observed_at: new Date(usageMs).toISOString(),
+        provider: "openai_codex",
+        model_id: unpriceable ? "unknown" : "gpt-5.6-sol",
+        record_json: unpriceable
+          ? v1UnpriceableUsageJson()
+          : v1PriceableUsageJson(),
+      });
+    }
+  }
+  return { quota, usage };
+}
+
+// Split records into <=200-per-chunk seed calls (the chunk record_count CHECK),
+// distinct chunk_seq per chunk on the same (participant, device, stream, day).
+async function seedChunkedRecords(
+  participantId: string,
+  deviceId: string,
+  stream: "usage" | "quota",
+  day: string,
+  records: V1SeedRecord[],
+  createdAt = `${day}T20:00:00.000Z`,
+): Promise<void> {
+  for (let offset = 0; offset < records.length; offset += 200) {
+    await seedV1Chunk({
+      participantId,
+      deviceId,
+      stream,
+      chunkDay: day,
+      seq: offset / 200,
+      createdAt,
+      records: records.slice(offset, offset + 200),
+    });
+  }
+}
+
+async function newV1Participant(name: string): Promise<string> {
+  const participantId = await seedV1Participant(name);
+  await seedV1Session(participantId, `v1-session-${name}`);
+  await seedV1Device(participantId, `v1-device-${name}`, `v1-session-${name}`);
+  return participantId;
+}
+
+describe("v1 analyzer scale fix — fit-preserving reduction", () => {
+  it("dense-data golden: reduced path == full per-event reference, byte-identical", async () => {
+    const participantId = await newV1Participant("golden");
+    const device = "v1-device-golden";
+
+    // A dense weekly reset: 17 rising levels (span 80pp) each a 10-row flat run
+    // (170 raw quota rows) with interleaved usage + two grid-exact usage events.
+    const baseMs = SCALE_NOW - 40 * DAY_MS;
+    const dense = buildDenseReset({
+      tag: "dense",
+      baseMs,
+      resetsAt: new Date(baseMs + 7 * DAY_MS).toISOString(),
+      levels: 17,
+      startPp: 10,
+      stepPp: 5,
+      repeats: 10,
+      snapshotStepMs: 15_000,
+      gridExactLevels: [3, 9],
+    });
+    const denseDay = new Date(baseMs).toISOString().slice(0, 10);
+    await seedChunkedRecords(participantId, device, "quota", denseDay, dense.quota);
+    await seedChunkedRecords(participantId, device, "usage", denseDay, dense.usage);
+
+    // Noise 1: a bengalfox resets_at-churn track (limit_id != codex) — ten
+    // single-row groups, each a distinct resets_at, that always refuse.
+    const bengalDay = new Date(SCALE_NOW - 39 * DAY_MS).toISOString().slice(0, 10);
+    const bengalBase = Date.parse(`${bengalDay}T00:00:00.000Z`);
+    const bengal: V1SeedRecord[] = [];
+    for (let index = 0; index < 10; index += 1) {
+      bengal.push({
+        occurrence_id: `q-bengal-${index}`,
+        observed_at: new Date(bengalBase + index * MINUTE_MS).toISOString(),
+        provider: "openai_codex",
+        plan_type: "pro",
+        plan_variant: "unknown",
+        limit_id: "codex_bengalfox",
+        slot: "seven_day",
+        used_percent: 50,
+        window_duration_minutes: 10_080,
+        resets_at: new Date(bengalBase + 7 * DAY_MS + index * 3_600_000)
+          .toISOString(),
+      });
+    }
+    await seedChunkedRecords(participantId, device, "quota", bengalDay, bengal);
+
+    // Noise 2: a calibratable FIVE-HOUR (window 300) track — the reference fits
+    // it as a window-300 estimate; the reduced path must drop it (window filter).
+    const fiveHourDay = new Date(SCALE_NOW - 38 * DAY_MS).toISOString().slice(0, 10);
+    const fiveHourBase = Date.parse(`${fiveHourDay}T00:00:00.000Z`);
+    const fiveHour = buildCalibratableTrack({
+      tag: "fivehour",
+      startMs: fiveHourBase,
+      resetsAt: new Date(fiveHourBase + 5 * 3_600_000).toISOString(),
+      stepPp: 5,
+      slot: "five_hour",
+      windowMinutes: 300,
+      snapshotStepMs: MINUTE_MS,
+    });
+    await seedChunkedRecords(participantId, device, "quota", fiveHourDay, fiveHour.quota);
+    await seedChunkedRecords(participantId, device, "usage", fiveHourDay, fiveHour.usage);
+
+    const reference = await accountScopedQuotaAnalysisV1FullReferenceForTest(
+      db(), participantId,
+    ) as AnalysisLike;
+    const reduced = await accountScopedQuotaAnalysisV1(
+      db(), participantId, { nowMs: SCALE_NOW },
+    ) as AnalysisLike;
+
+    // THE core proof: the band-relevant reset fits are byte-identical.
+    const referenceBand = bandResets(reference);
+    const reducedBand = bandResets(reduced);
+    expect(reducedBand.length).toBe(1);
+    expect(reducedBand).toEqual(referenceBand);
+    expect(reducedBand[0]!.capacityNanousd).toBeGreaterThan(0);
+    expect(reducedBand[0]!.displayedSpanPp).toBe(80);
+
+    // Measure the collapse: 170 raw quota rows -> 34 retained (first + last of
+    // each of the 17 flat runs), and the retained rows are exactly those
+    // endpoints.
+    const downsampled = await downsampleQuotaForTest(db(), participantId, SCALE_NOW);
+    expect(dense.quota.length).toBe(170);
+    expect(downsampled.length).toBe(34);
+    for (let level = 0; level < 17; level += 1) {
+      const runOccurrences = downsampled
+        .filter((row) => row.occurrence_id.startsWith(`q-dense-${level}-`))
+        .map((row) => row.occurrence_id)
+        .sort();
+      expect(runOccurrences).toEqual([
+        `q-dense-${level}-0`,
+        `q-dense-${level}-9`,
+      ]);
+    }
+
+    // Noise handling: the reference fits the five-hour track as a window-300
+    // estimate and forms a bengalfox track; the reduced path drops BOTH.
+    expect(allResets(reference).some((reset) => (
+      reset.status === "conditional_estimate"
+      && reset.windowDurationMinutes === 300
+    ))).toBe(true);
+    expect(allResets(reduced).some((reset) => (
+      reset.windowDurationMinutes === 300
+    ))).toBe(false);
+    expect(reference.tracks.some((track) => (
+      track.continuity.limitId === "codex_bengalfox"
+    ))).toBe(true);
+    expect(reduced.tracks.some((track) => (
+      track.continuity.limitId === "codex_bengalfox"
+    ))).toBe(false);
+  });
+
+  it("run-endpoint negative control: dropping either endpoint corrupts a cost", () => {
+    // A pure-JS proof (on the shared calibration) that the collapse must keep
+    // BOTH the first and last row of every flat run. Build a dense reset with
+    // usage BETWEEN the first and last row of each run, then compare the
+    // boundaries the full series produces against three collapses.
+    const trackId = `account-track:v1:${"a".repeat(64)}`;
+    const dataset = `dataset:v1:${"d".repeat(64)}`;
+    const resetsAt = "2026-07-20T00:00:00.000Z";
+    const baseMs = Date.parse("2026-07-13T00:00:00.000Z");
+    const levels = [10, 20, 30, 40];
+    const repeats = 3;
+    const stepMs = 30_000;
+    const snapshots: Array<{
+      snap: QuotaSnapshotInput;
+      run: number;
+      positionInRun: number;
+    }> = [];
+    const usage: QuotaUsageEventInput[] = [];
+    let step = 0;
+    let idSeq = 1;
+    for (let run = 0; run < levels.length; run += 1) {
+      for (let position = 0; position < repeats; position += 1) {
+        const obsMs = baseMs + step * stepMs;
+        const observedAt = new Date(obsMs).toISOString();
+        snapshots.push({
+          snap: {
+            snapshotId: `q:v1:${hex64(idSeq)}`,
+            datasetId: dataset,
+            accountTrackId: trackId,
+            provider: "openai_codex",
+            planType: "pro",
+            planVariant: "unknown",
+            limitId: "codex",
+            slot: "seven_day",
+            windowDurationMinutes: 10_080,
+            resetsAt,
+            observedAt,
+            receivedAt: observedAt,
+            usedPercent: levels[run]!,
+            displayPrecision: 0,
+            policyEpoch: "v1",
+          },
+          run,
+          positionInRun: position,
+        });
+        idSeq += 1;
+        // Usage 5s after each snapshot (so every flat run carries intra-run
+        // cost, which is exactly what a dropped run endpoint would misattribute).
+        usage.push({
+          eventId: `u:v1:${hex64(idSeq)}`,
+          datasetId: dataset,
+          accountTrackId: trackId,
+          provider: "openai_codex",
+          planType: "pro",
+          planVariant: "unknown",
+          limitId: "codex",
+          observedAt: new Date(obsMs + 5_000).toISOString(),
+          costNanousd: 1_000_000 * (step + 1),
+          pricingStatus: "fully_priced",
+          policyEpoch: "v1",
+        });
+        idSeq += 1;
+        step += 1;
+      }
+    }
+    const datasets = [{ datasetId: dataset, complete: true }];
+    const evidenceBoundaries = (snaps: QuotaSnapshotInput[]) => (
+      (buildResetEvidence({
+        datasets,
+        quotaSnapshots: snaps,
+        usageEvents: usage,
+      }) as { resets: Array<{ boundaries: unknown }> }).resets[0]!.boundaries
+    );
+
+    const full = snapshots.map((entry) => entry.snap);
+    const runEndpoint = snapshots
+      .filter((entry) => entry.positionInRun === 0
+        || entry.positionInRun === repeats - 1)
+      .map((entry) => entry.snap);
+    const firstOfRunOnly = snapshots
+      .filter((entry) => entry.positionInRun === 0)
+      .map((entry) => entry.snap);
+    const lastOfRunOnly = snapshots
+      .filter((entry) => entry.positionInRun === repeats - 1)
+      .map((entry) => entry.snap);
+
+    // Keeping BOTH endpoints reproduces every boundary byte-for-byte.
+    expect(evidenceBoundaries(runEndpoint)).toEqual(evidenceBoundaries(full));
+    // Dropping the LAST row of each run (first-of-run-only, i.e. losing the LEAD
+    // condition) moves the lowerCost anchor and corrupts a boundary cost.
+    expect(evidenceBoundaries(firstOfRunOnly)).not.toEqual(evidenceBoundaries(full));
+    // Dropping the FIRST row of each run (last-of-run-only, i.e. losing the LAG
+    // condition) corrupts the boundaries too.
+    expect(evidenceBoundaries(lastOfRunOnly)).not.toEqual(evidenceBoundaries(full));
+  });
+
+  it("window-straddle: a cycle is fully covered (identical) or fully excluded", async () => {
+    const participantId = await newV1Participant("straddle");
+    const device = "v1-device-straddle";
+    const cutoffMs = SCALE_NOW - V1_ANALYSIS_WINDOW_DAYS * DAY_MS;
+
+    // Covered: entirely after the cutoff -> included, identical to reference.
+    const coveredStart = SCALE_NOW - 50 * DAY_MS;
+    const coveredResetsAt = new Date(coveredStart + 7 * DAY_MS).toISOString();
+    const covered = buildCalibratableTrack({
+      tag: "covered",
+      startMs: coveredStart,
+      resetsAt: coveredResetsAt,
+      stepPp: 5,
+    });
+    const coveredDay = new Date(coveredStart).toISOString().slice(0, 10);
+    await seedChunkedRecords(participantId, device, "quota", coveredDay, covered.quota);
+    await seedChunkedRecords(participantId, device, "usage", coveredDay, covered.usage);
+
+    // Straddler: observations span the cutoff instant AND resets_at is inside
+    // the snap margin -> excluded wholesale by the reduced path, fully read by
+    // the reference. Nine snapshots at 5-minute steps starting 20 minutes before
+    // the cutoff, all within one UTC day (SCALE_NOW is mid-day).
+    const straddleStart = cutoffMs - 20 * MINUTE_MS;
+    const straddleResetsAt = new Date(cutoffMs + 4 * DAY_MS).toISOString();
+    const straddler = buildCalibratableTrack({
+      tag: "straddle",
+      startMs: straddleStart,
+      resetsAt: straddleResetsAt,
+      stepPp: 5,
+    });
+    // Sanity: the straddler genuinely spans the cutoff.
+    expect(Date.parse(straddler.quota[0]!.observed_at)).toBeLessThan(cutoffMs);
+    expect(
+      Date.parse(straddler.quota[straddler.quota.length - 1]!.observed_at),
+    ).toBeGreaterThan(cutoffMs);
+    const straddleDay = new Date(straddleStart).toISOString().slice(0, 10);
+    await seedChunkedRecords(participantId, device, "quota", straddleDay, straddler.quota);
+    await seedChunkedRecords(participantId, device, "usage", straddleDay, straddler.usage);
+
+    const reference = await accountScopedQuotaAnalysisV1FullReferenceForTest(
+      db(), participantId,
+    ) as AnalysisLike;
+    const reduced = await accountScopedQuotaAnalysisV1(
+      db(), participantId, { nowMs: SCALE_NOW },
+    ) as AnalysisLike;
+
+    const referenceBand = bandResets(reference);
+    const reducedBand = bandResets(reduced);
+    // The reference fits both cycles; the reduced path keeps only the covered
+    // one — never a partially-read straddler.
+    expect(referenceBand.map((reset) => reset.resetsAt).sort()).toEqual(
+      [coveredResetsAt, straddleResetsAt].sort(),
+    );
+    expect(reducedBand.map((reset) => reset.resetsAt)).toEqual([coveredResetsAt]);
+    // The covered cycle's fit is byte-identical across paths.
+    expect(reducedBand).toEqual(
+      referenceBand.filter((reset) => reset.resetsAt === coveredResetsAt),
+    );
+    // The straddler never appears as a truncated fit.
+    expect(allResets(reduced).some((reset) => (
+      reset.resetsAt === straddleResetsAt
+    ))).toBe(false);
+  });
+
+  it("pricing-status straddle: an unpriceable event refuses identically, interior or grid-exact", async () => {
+    for (const gridExact of [false, true]) {
+      const name = gridExact ? "gridexact" : "interior";
+      const participantId = await newV1Participant(`pricestraddle-${name}`);
+      const device = `v1-device-pricestraddle-${name}`;
+      const startMs = SCALE_NOW - 45 * DAY_MS;
+      const track = buildCalibratableTrack({
+        tag: `price-${name}`,
+        startMs,
+        resetsAt: new Date(startMs + 7 * DAY_MS).toISOString(),
+        stepPp: 6,
+        unpriceableUsageIndex: 3,
+        gridExactUnpriceable: gridExact,
+      });
+      const day = new Date(startMs).toISOString().slice(0, 10);
+      await seedChunkedRecords(participantId, device, "quota", day, track.quota);
+      await seedChunkedRecords(participantId, device, "usage", day, track.usage);
+
+      const reference = await accountScopedQuotaAnalysisV1FullReferenceForTest(
+        db(), participantId,
+      ) as AnalysisLike;
+      const reduced = await accountScopedQuotaAnalysisV1(
+        db(), participantId, { nowMs: SCALE_NOW },
+      ) as AnalysisLike;
+
+      // The reset must refuse in BOTH paths: the not-fully-priced flag survives
+      // bucketing (and the singleton-split, for the grid-exact case).
+      expect(bandResets(reduced)).toHaveLength(0);
+      expect(bandResets(reference)).toHaveLength(0);
+      const codexReset = (analysis: AnalysisLike) => allResets(analysis)
+        .find((reset) => reset.limitId === "codex"
+          && reset.windowDurationMinutes === 10_080);
+      expect(codexReset(reduced)?.status).toBe("not_testable");
+      expect(codexReset(reduced)?.refusalCodes).toContain("source_evidence_refused");
+      expect(codexReset(reference)?.status).toBe("not_testable");
+    }
+  });
+
+  it("stage caps: just under is ready, just over is the correct distinct bail", async () => {
+    const participantId = await newV1Participant("caps");
+    const device = "v1-device-caps";
+    const baseMs = SCALE_NOW - 30 * DAY_MS;
+    const dense = buildDenseReset({
+      tag: "caps",
+      baseMs,
+      resetsAt: new Date(baseMs + 7 * DAY_MS).toISOString(),
+      levels: 12,
+      startPp: 10,
+      stepPp: 5,
+      repeats: 6,
+      snapshotStepMs: 15_000,
+    });
+    const day = new Date(baseMs).toISOString().slice(0, 10);
+    await seedChunkedRecords(participantId, device, "quota", day, dense.quota);
+    await seedChunkedRecords(participantId, device, "usage", day, dense.usage);
+
+    const downsampledCount =
+      (await downsampleQuotaForTest(db(), participantId, SCALE_NOW)).length;
+    expect(downsampledCount).toBe(24); // 12 runs * 2 endpoints
+    const usageCount = dense.usage.length;
+
+    // Downsampled-quota cap.
+    const overQuota = await accountScopedQuotaAnalysisV1(db(), participantId, {
+      nowMs: SCALE_NOW,
+      maxDownsampledQuotaRows: downsampledCount - 1,
+    }) as AnalysisLike;
+    expect(overQuota.status).toBe("not_testable");
+    expect(overQuota.reason).toBe("downsampled_quota_limit_exceeded");
+    const atQuota = await accountScopedQuotaAnalysisV1(db(), participantId, {
+      nowMs: SCALE_NOW,
+      maxDownsampledQuotaRows: downsampledCount,
+    }) as AnalysisLike;
+    expect(atQuota.status).toBe("ready");
+
+    // Windowed-usage cap.
+    const overUsage = await accountScopedQuotaAnalysisV1(db(), participantId, {
+      nowMs: SCALE_NOW,
+      maxWindowedUsageRows: usageCount - 1,
+    }) as AnalysisLike;
+    expect(overUsage.status).toBe("not_testable");
+    expect(overUsage.reason).toBe("windowed_usage_limit_exceeded");
+    const atUsage = await accountScopedQuotaAnalysisV1(db(), participantId, {
+      nowMs: SCALE_NOW,
+      maxWindowedUsageRows: usageCount,
+    }) as AnalysisLike;
+    expect(atUsage.status).toBe("ready");
+
+    // Production defaults leave real corpora comfortably inside both caps.
+    expect(downsampledCount).toBeLessThan(MAX_DOWNSAMPLED_QUOTA_ROWS);
+    expect(usageCount).toBeLessThan(MAX_WINDOWED_USAGE_ROWS);
+  });
+
+  it("the SQL fitable HAVING tracks the shared calibration policy, not a hardcoded 8/5", async () => {
+    // Behavioural coupling: a reset group with one fewer than the policy's
+    // minimum distinct used_percent is dropped by the downsample; the minimum
+    // survives.
+    const minBoundaries = QUOTA_CALIBRATION_POLICY.minimumBoundaries;
+    const below = await newV1Participant("having-below");
+    const at = await newV1Participant("having-at");
+    const baseMs = SCALE_NOW - 25 * DAY_MS;
+    const resetsAt = new Date(baseMs + 7 * DAY_MS).toISOString();
+
+    const makeLevels = (participantId: string, device: string, distinct: number) => {
+      const quota: V1SeedRecord[] = [];
+      const usage: V1SeedRecord[] = [];
+      for (let level = 0; level < distinct; level += 1) {
+        const obsMs = baseMs + level * MINUTE_MS;
+        // Two rows per level (a flat run) so the group has span far above the
+        // policy minimum — the distinct-count gate is the only thing under test.
+        for (let repeat = 0; repeat < 2; repeat += 1) {
+          quota.push({
+            occurrence_id: `q-${device}-${level}-${repeat}`,
+            observed_at: new Date(obsMs + repeat * 1_000).toISOString(),
+            provider: "openai_codex",
+            plan_type: "pro",
+            plan_variant: "unknown",
+            limit_id: "codex",
+            slot: "seven_day",
+            used_percent: 10 + level * 5,
+            window_duration_minutes: 10_080,
+            resets_at: resetsAt,
+          });
+        }
+        usage.push({
+          occurrence_id: `u-${device}-${level}`,
+          observed_at: new Date(obsMs + 500).toISOString(),
+          provider: "openai_codex",
+          model_id: "gpt-5.6-sol",
+          record_json: v1PriceableUsageJson(),
+        });
+      }
+      const day = new Date(baseMs).toISOString().slice(0, 10);
+      return Promise.all([
+        seedChunkedRecords(participantId, device, "quota", day, quota),
+        seedChunkedRecords(participantId, device, "usage", day, usage),
+      ]);
+    };
+
+    await makeLevels(below, "v1-device-having-below", minBoundaries - 1);
+    await makeLevels(at, "v1-device-having-at", minBoundaries);
+
+    expect(await downsampleQuotaForTest(db(), below, SCALE_NOW)).toHaveLength(0);
+    expect(
+      (await downsampleQuotaForTest(db(), at, SCALE_NOW)).length,
+    ).toBeGreaterThan(0);
   });
 });

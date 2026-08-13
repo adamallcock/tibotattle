@@ -6,6 +6,25 @@ import {
 } from "./community-allowance";
 import type { CommunityAllowanceFit } from "./community-allowance";
 import { sha256Hex } from "./crypto";
+import { V1_ANALYSIS_WINDOW_DAYS } from "./quota-analysis-v1";
+
+const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * The lowest UTC day the drift reconciler still reconciles, given the analyzer's
+ * trailing read horizon. Days that age past it RETIRE (keep their last published
+ * value) rather than churn to a null block every pass: the v1 analyzer reads
+ * only the trailing horizon, so recomputing a long-aged day would find no
+ * in-window fits and republish it empty, erasing the historical series. Bounding
+ * the enumeration to the SAME horizon keeps the reconciler and the analyzer in
+ * lockstep. (No regression today — the band is still all-null — but this must
+ * land with the windowed read before the series grows long.)
+ */
+function driftReconcileFromDay(nowMs: number): string {
+  return new Date(nowMs - V1_ANALYSIS_WINDOW_DAYS * MILLISECONDS_PER_DAY)
+    .toISOString()
+    .slice(0, 10);
+}
 
 /**
  * Day-partitioned community aggregates for telemetry-contribution-v1.0
@@ -64,11 +83,17 @@ interface DailyCellRow {
  */
 type AllowanceFitsForEpoch = (epoch: number) => Promise<CommunityAllowanceFit[]>;
 
-function memoizedAllowanceFits(db: D1Database): AllowanceFitsForEpoch {
+function memoizedAllowanceFits(
+  db: D1Database,
+  nowMs: number,
+): AllowanceFitsForEpoch {
   let cached: { epoch: number; fits: CommunityAllowanceFit[] } | null = null;
   return async (epoch: number) => {
     if (cached === null || cached.epoch !== epoch) {
-      cached = { epoch, fits: await collectCommunityAllowanceFits(db) };
+      // The analyzer's trailing read horizon is anchored to this pass's
+      // scheduled time, so the reconciler and the day builds it feeds share one
+      // horizon.
+      cached = { epoch, fits: await collectCommunityAllowanceFits(db, nowMs) };
     }
     return cached.fits;
   };
@@ -93,6 +118,7 @@ function memoizedAllowanceFits(db: D1Database): AllowanceFitsForEpoch {
 async function enqueueCommunityAllowanceDriftRebuilds(
   db: D1Database,
   allowanceFitsForEpoch: AllowanceFitsForEpoch,
+  nowMs: number,
 ): Promise<void> {
   const epochRow = await db.prepare(
     `SELECT mutation_epoch FROM community_snapshot_mutation_control
@@ -103,18 +129,21 @@ async function enqueueCommunityAllowanceDriftRebuilds(
     throw new Error("community daily aggregate mutation control unavailable");
   }
   const fits = await allowanceFitsForEpoch(reconcileEpoch);
+  // Reconcile only days inside the analyzer's trailing read horizon; aged days
+  // keep their last published value instead of churning to a null block.
+  const reconcileFromDay = driftReconcileFromDay(nowMs);
   const published = await db.prepare(
     `SELECT a.day, a.payload_json
        FROM community_daily_aggregates a
        JOIN (
          SELECT day, MAX(revision) AS revision
            FROM community_daily_aggregates
-          WHERE release_state = 'published'
+          WHERE release_state = 'published' AND day >= ?1
           GROUP BY day
        ) latest ON latest.day = a.day AND latest.revision = a.revision
-      WHERE a.release_state = 'published'
+      WHERE a.release_state = 'published' AND a.day >= ?1
       ORDER BY a.day ASC`,
-  ).all<{ day: string; payload_json: string }>();
+  ).bind(reconcileFromDay).all<{ day: string; payload_json: string }>();
   const drifted: string[] = [];
   for (const row of published.results) {
     const expected = canonicalJson(
@@ -407,10 +436,12 @@ export async function rebuildPendingCommunityDailyAggregates(
       || maximumRebuilds > 48) {
     throw new Error("invalid community daily aggregate rebuild request");
   }
-  const allowanceFitsForEpoch = memoizedAllowanceFits(db);
+  const allowanceFitsForEpoch = memoizedAllowanceFits(db, scheduledTime);
   // Reconcile before draining, so days a late v0.2 contribution drifted are
   // enqueued in time for this same pass to rebuild them.
-  await enqueueCommunityAllowanceDriftRebuilds(db, allowanceFitsForEpoch);
+  await enqueueCommunityAllowanceDriftRebuilds(
+    db, allowanceFitsForEpoch, scheduledTime,
+  );
   const rows = await db.prepare(
     `SELECT day, requested_epoch, requested_at
        FROM community_daily_aggregate_rebuilds
