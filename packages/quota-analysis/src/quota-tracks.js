@@ -292,10 +292,17 @@ function buildOneReset(rows, allUsage, datasetStatus) {
       upperCostNanousd: 0,
       observedAt: ordered[0].observedAt,
     });
+    let runningMaxPercent = ordered[0].usedPercent;
     for (let index = 1; index < ordered.length; index += 1) {
       const prior = ordered[index - 1];
       const current = ordered[index];
-      if (current.usedPercent <= prior.usedPercent) continue;
+      // Skip against the running max, not just the prior observation, so a
+      // tolerated noise dip (MAX_BACKWARD_NOISE_PP) can never emit a boundary
+      // below an earlier one — non-monotonic boundaries break the downstream
+      // fit. For a clean climb the prior observation IS the running max, so this
+      // is byte-identical to the old check.
+      if (current.usedPercent <= runningMaxPercent) continue;
+      runningMaxPercent = current.usedPercent;
       boundaries.push({
         usedPercent: current.usedPercent,
         lowerCostNanousd: cumulativeCostAt(
