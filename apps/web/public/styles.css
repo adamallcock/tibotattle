@@ -3030,13 +3030,13 @@ footer p { margin: 0; }
 }
 .community-site .allowance-tooltip:not([data-placement="below"])::after {
   bottom: -5px;
-  border-top: none;
-  border-left: none;
+  border-block-start: none;
+  border-inline-start: none;
 }
 .community-site .allowance-tooltip[data-placement="below"]::after {
   top: -5px;
-  border-bottom: none;
-  border-right: none;
+  border-block-end: none;
+  border-inline-end: none;
 }
 .community-site .allowance-tooltip-date {
   color: var(--muted);
