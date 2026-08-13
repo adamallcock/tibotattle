@@ -3018,10 +3018,6 @@ test("signed updater replacement contract validates upgrade and rollback artifac
     channel: createReleaseChannelProvenance(STABLE_RELEASE_CHANNEL, {
       publicEdKeySha256: sparklePublicKeySha256,
     }),
-    source: {
-      commit: "a".repeat(40),
-      tag: RELEASE_MANIFEST.tag,
-    },
     assurances: { ...assurances },
     updater: {
       appcastURL: "https://usage.example/appcast.xml",

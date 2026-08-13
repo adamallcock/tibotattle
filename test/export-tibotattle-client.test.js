@@ -10,6 +10,7 @@ import {
   CLIENT_SOURCE_FILES,
   createClientExport,
   forbiddenPathReason,
+  GENERATED_OSV_WORKFLOW_PATH,
   REPOSITORY_ROOT,
   validateAllowlist,
   validateExportDirectory,
@@ -41,12 +42,57 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
     assert.match(workspace, /^  fast-uri: 3\.1\.4$/m);
 
     const osvWorkflow = await readFile(
-      join(output, ".github/workflows/osv-scanner.yml"),
+      join(output, GENERATED_OSV_WORKFLOW_PATH),
       "utf8",
     );
     assert.match(
       osvWorkflow,
       /google\/osv-scanner-action\/\.github\/workflows\/osv-scanner-reusable\.yml@9a498708959aeaef5ef730655706c5a1df1edbc2/u,
+    );
+
+    // The pinned reusable workflow declares actions:read + contents:read +
+    // security-events:write at its top level; GitHub aborts a caller at
+    // startup when it grants less. All three grants must survive a fresh,
+    // history-free export at BOTH the caller (top-level) and job level, even
+    // though upload-sarif is false and nothing is ever written to
+    // security-events. A regex on the pinned SHA alone would let a
+    // permission-starved template pass CI, so assert the grants explicitly.
+    assert.match(
+      osvWorkflow,
+      /\npermissions:\n  actions: read\n  contents: read\n  security-events: write\n/u,
+      "caller-level permissions must grant all three OSV scopes",
+    );
+    assert.match(
+      osvWorkflow,
+      /\n    permissions:\n      actions: read\n      contents: read\n      security-events: write\n/u,
+      "job-level permissions must grant all three OSV scopes",
+    );
+
+    // Expected event triggers.
+    assert.match(osvWorkflow, /^on:$/mu);
+    assert.match(osvWorkflow, /^  pull_request:$/mu);
+    assert.match(osvWorkflow, /^  push:$/mu);
+    assert.match(osvWorkflow, /^    branches: \[main\]$/mu);
+    assert.match(osvWorkflow, /^  schedule:$/mu);
+    assert.match(osvWorkflow, /^    - cron: "23 4 \* \* 1"$/mu);
+    assert.match(osvWorkflow, /^  workflow_dispatch:$/mu);
+
+    // Reporting stays in the job log with SARIF upload disabled, and the scan
+    // fails the build on any vulnerability.
+    assert.match(osvWorkflow, /^      upload-sarif: false$/mu);
+    assert.match(osvWorkflow, /^      fail-on-vuln: true$/mu);
+
+    // Parity: the exporter emits the checked-in workflow verbatim, so a fresh
+    // export must be byte-identical to the single source of truth. This is
+    // what prevents the hardcoded-template drift from ever recurring.
+    const referenceWorkflow = await readFile(
+      join(REPOSITORY_ROOT, GENERATED_OSV_WORKFLOW_PATH),
+      "utf8",
+    );
+    assert.equal(
+      osvWorkflow,
+      referenceWorkflow,
+      "generated OSV workflow must match the checked-in single source of truth",
     );
   } finally {
     await rm(root, { recursive: true, force: true });

@@ -469,9 +469,21 @@ const IMPORT_PATTERNS = Object.freeze([
   /require(?:\.resolve)?\s*\(\s*["']([^"']+)["']\s*\)/gu,
 ]);
 
+/**
+ * The OSV scanning workflow is emitted from the reviewed, checked-in
+ * `.github/workflows/osv-scanner.yml` (the single source of truth) rather than
+ * a hardcoded string, so the exported copy can never drift from the version
+ * the private repository actually runs. The pinned reusable workflow declares
+ * actions:read + contents:read + security-events:write at its top level, and
+ * GitHub fails a caller at startup ("No jobs were run") when it grants less;
+ * reading the file preserves those grants exactly. A parity test in
+ * test/export-tibotattle-client.test.js guards this both ways.
+ */
+export const GENERATED_OSV_WORKFLOW_PATH = ".github/workflows/osv-scanner.yml";
+
 const GENERATED_FILE_NAMES = Object.freeze([
   ".gitignore",
-  ".github/workflows/osv-scanner.yml",
+  GENERATED_OSV_WORKFLOW_PATH,
   "README.md",
   "SECURITY.md",
   "docs/verify-release.md",
@@ -815,7 +827,13 @@ function clientPackageManifest() {
   };
 }
 
-function generatedFiles() {
+function generatedFiles({ osvWorkflow } = {}) {
+  if (typeof osvWorkflow !== "string" || osvWorkflow.length === 0) {
+    fail(
+      "Generated OSV workflow source text is required",
+      "CLIENT_EXPORT_GENERATED_SOURCE_MISSING",
+    );
+  }
   const packageText = stableJson(clientPackageManifest());
   return new Map([
     [".gitignore", [
@@ -833,34 +851,10 @@ function generatedFiles() {
       "*.pem",
       "client-export-manifest.json.tmp",
     ].join("\n") + "\n"],
-    [".github/workflows/osv-scanner.yml", [
-      "name: OSV dependency scan",
-      "",
-      "on:",
-      "  pull_request:",
-      "  push:",
-      "    branches: [main]",
-      "  schedule:",
-      "    - cron: \"23 4 * * 1\"",
-      "  workflow_dispatch:",
-      "",
-      "permissions:",
-      "  contents: read",
-      "",
-      "jobs:",
-      "  osv:",
-      "    name: Scan committed dependency locks",
-      "    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8",
-      "    permissions:",
-      "      contents: read",
-      "    with:",
-      "      upload-sarif: false",
-      "      fail-on-vuln: true",
-      "      scan-args: |-",
-      "        --recursive",
-      "        ./",
-      "",
-    ].join("\n")],
+    // Emitted verbatim from the reviewed, checked-in workflow (see
+    // GENERATED_OSV_WORKFLOW_PATH) so the exported copy cannot drift from the
+    // permission grants the private repository actually runs.
+    [GENERATED_OSV_WORKFLOW_PATH, osvWorkflow],
     ["README.md", [
       "# TiboTattle client export candidate",
       "",
@@ -1088,7 +1082,19 @@ export async function createClientExport({
     paths,
     records,
   });
-  const generated = generatedFiles();
+  // Read the OSV workflow from the reviewed source tree so the exported copy is
+  // byte-identical to the checked-in file rather than a drift-prone template.
+  // readSourceRecords applies the same regular-file, path-escape, and secret
+  // guards used for every other reviewed input.
+  const { records: generatedSources } = await readSourceRecords(
+    sourceRootReal,
+    [GENERATED_OSV_WORKFLOW_PATH],
+  );
+  const generated = generatedFiles({
+    osvWorkflow: generatedSources
+      .get(GENERATED_OSV_WORKFLOW_PATH)
+      .bytes.toString("utf8"),
+  });
   for (const [relativePath, value] of generated) {
     assertSafeRelativePath(relativePath, "generated file");
     scanTextForSecrets(Buffer.from(value, "utf8"), relativePath);

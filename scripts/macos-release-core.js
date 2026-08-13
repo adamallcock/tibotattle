@@ -1225,13 +1225,12 @@ function validateSignedReleaseManifest(manifest, label) {
       || !manifest.artifact.fileName.endsWith(".dmg")
       || typeof manifest.artifact?.sha256 !== "string"
       || !/^[a-f0-9]{64}$/u.test(manifest.artifact.sha256)
-      || typeof manifest.source?.commit !== "string"
-      || !/^[0-9a-f]{40,64}$/u.test(manifest.source.commit)
-      || typeof manifest.source?.tag !== "string"
-      || !/^[0-9A-Za-z][0-9A-Za-z._/-]{0,127}$/u.test(manifest.source.tag)
-      || manifest.source.tag.includes("..")
-      || manifest.source.tag.startsWith("/")
-      || manifest.source.tag.endsWith("/")
+      // The public release manifest no longer carries a `source` commit/tag:
+      // this build runs in the private service repository, and publishing its
+      // Git history would leak private-repo revisions onto a customer-facing
+      // asset. Do not require `source` here; legacy manifests that still carry
+      // it remain acceptable so the previous-stable continuity gate keeps
+      // reading already-published v0.2 manifests.
       || REQUIRED_SIGNED_RELEASE_ASSURANCES.some(
         (key) => manifest.assurances?.[key] !== true,
       )
@@ -2460,7 +2459,13 @@ export async function releaseMacOSApp({
     previousManifest: previousStableManifest,
     stableBootstrap,
   });
-  const sourceProvenance = readMacOSReleaseSourceProvenance();
+  // Enforce the clean-checkout, annotated-tag build gate, but deliberately do
+  // not carry its result forward. This build runs in the private service
+  // repository, so its HEAD commit/tag identify private Git history that must
+  // not be published on the customer-facing release manifest (see
+  // docs/decisions/2026-08-02-public-client-private-service-provenance-decision.md).
+  // Binding a real *public* repository commit/tag is a separate concern.
+  readMacOSReleaseSourceProvenance();
   const credentials = readMacOSReleaseCredentials(environment);
   const inspectedCandidate = await inspectMacOSApp(appPath, {
     channel: releaseChannel.name,
@@ -2636,7 +2641,6 @@ export async function releaseMacOSApp({
         publicEdKeySha256:
           inspected.buildManifest.release.updater.publicEdKeySha256,
       }),
-      source: sourceProvenance,
       privacy: {
         credentialsRecorded: false,
         identityRecorded: false,
