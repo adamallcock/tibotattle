@@ -422,31 +422,32 @@ async function loadWinningDevices(
 }
 
 /**
- * A `(?, ?), (?, ?), …` VALUES list of `count` (observed_day, device_id) pairs,
- * for a row-value `(r.observed_day, r.device_id) IN (VALUES …)` winner filter.
+ * Serialize the winner set to a single JSON array of `[observed_day, device_id]`
+ * pairs, bound as ONE parameter and expanded back to rows with `json_each` in
+ * the winner filter (see WINNER_FILTER_SQL).
  *
- * The filter is a row-value IN rather than a JOIN on purpose: measured against
- * the owner's real corpus, `JOIN winning_devices(VALUES …)` was a 453k×N nested
- * loop (SQLite does not auto-index a small VALUES table here), whereas the IN
- * form evaluates once per scanned row after the observed_at index range scan.
- * Byte-identical to the JOIN because the winner pairs are distinct (one device
- * per day), so neither form multiplies rows.
+ * One JSON parameter rather than a `VALUES (?,?),…` list on purpose: D1 caps a
+ * query at ~100 bound parameters, and a real corpus resolves to ~90 winning
+ * days = ~180 binds, which overflows that cap and throws. json_each takes the
+ * whole set as a single string, so the bind count is fixed regardless of how
+ * many winning days a participant has.
  */
-function winnerPairValuesList(count: number): string {
-  return Array.from({ length: count }, () => "(?, ?)").join(", ");
+function winnersJson(winners: WinningDeviceRow[]): string {
+  return JSON.stringify(winners.map((w) => [w.observed_day, w.device_id]));
 }
 
-/**
- * The positional (observed_day, device_id, …) binds the IN VALUES list consumes,
- * in row order. Bound FIRST, since the winner filter leads each query's WHERE.
- */
-function winningDeviceBinds(winners: WinningDeviceRow[]): string[] {
-  const binds: string[] = [];
-  for (const winner of winners) {
-    binds.push(winner.observed_day, winner.device_id);
-  }
-  return binds;
-}
+// The winner filter shared by the quota and usage reads: keep only rows whose
+// (observed_day, device_id) is a winning pair. A row-value IN over a json_each
+// subquery, NOT a JOIN on a VALUES table — measured against the owner's corpus,
+// `JOIN winning_devices(VALUES …)` was a 453k×N nested loop (SQLite does not
+// auto-index it), whereas this evaluates per row after the observed_at index
+// range scan. Byte-identical to the JOIN because winner pairs are distinct (one
+// device per day), so neither multiplies rows. Binds one parameter: winnersJson.
+const WINNER_FILTER_SQL =
+  `(r.observed_day, r.device_id) IN (
+     SELECT json_extract(je.value, '$[0]'), json_extract(je.value, '$[1]')
+       FROM json_each(?) je
+   )`;
 
 /**
  * Windowed run-endpoint quota downsample.
@@ -463,14 +464,13 @@ function winningDeviceBinds(winners: WinningDeviceRow[]): string[] {
  * INCLUDES slot (an eligible multi-slot reset has time-disjoint slots); the
  * fitable GROUP BY EXCLUDES slot (= the shared resetKey).
  */
-// Binds (in order): the winner (observed_day, device_id) pairs, then
-// participantId, observedAt cutoff, resetsAt cutoff, window minutes, minimum
-// boundaries, minimum span, row limit. Anonymous `?` because the leading winner
-// IN list holds a variable number of binds, so fixed numbering is not possible.
-// `scoped` is MATERIALIZED so its winner-filtered index scan runs once rather
-// than being re-evaluated by both `fitable` and `survivors`.
-function buildQuotaDownsampleSql(winnerCount: number): string {
-  return `WITH scoped AS MATERIALIZED (
+// Binds (in order): winnersJson, participantId, observedAt cutoff, resetsAt
+// cutoff, window minutes, minimum boundaries, minimum span, row limit. Anonymous
+// `?` because the leading json_each winner filter binds one parameter and fixed
+// numbering across the CTE chain buys nothing. `scoped` is MATERIALIZED so its
+// winner-filtered index scan runs once rather than being re-evaluated by both
+// `fitable` and `survivors`.
+const QUOTA_DOWNSAMPLE_SQL = `WITH scoped AS MATERIALIZED (
     SELECT r.occurrence_id AS occurrence_id,
            r.observed_at AS observed_at,
            r.provider AS provider,
@@ -484,7 +484,7 @@ function buildQuotaDownsampleSql(winnerCount: number): string {
            r.id AS id
       FROM telemetry_v1_records r
       JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
-     WHERE (r.observed_day, r.device_id) IN (VALUES ${winnerPairValuesList(winnerCount)})
+     WHERE ${WINNER_FILTER_SQL}
        AND r.participant_id = ?
        AND r.stream = 'quota'
        AND r.observed_at >= ?
@@ -537,25 +537,21 @@ function buildQuotaDownsampleSql(winnerCount: number): string {
       OR used_percent <> next_up
    ORDER BY observed_at, id
    LIMIT ?`;
-}
 
-// Binds (in order): the winner (observed_day, device_id) pairs, then
-// participantId, observedAt cutoff, keyset cursor observed_at (twice — the `>`
-// and `=` legs), keyset cursor id, page size.
-function buildUsagePageSql(winnerCount: number): string {
-  return `
+// Binds (in order): winnersJson, participantId, observedAt cutoff, keyset cursor
+// observed_at (twice — the `>` and `=` legs), keyset cursor id, page size.
+const USAGE_PAGE_SQL = `
   SELECT r.id AS id, r.observed_at AS observed_at, r.provider AS provider,
          r.record_json AS record_json
     FROM telemetry_v1_records r
     JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
-   WHERE (r.observed_day, r.device_id) IN (VALUES ${winnerPairValuesList(winnerCount)})
+   WHERE ${WINNER_FILTER_SQL}
      AND r.participant_id = ?
      AND r.stream = 'usage'
      AND r.observed_at >= ?
      AND (r.observed_at > ? OR (r.observed_at = ? AND r.id > ?))
    ORDER BY r.observed_at, r.id
    LIMIT ?`;
-}
 
 interface ProviderGrid {
   sortedMs: number[];
@@ -623,8 +619,7 @@ async function readAndBucketUsage(
   maxWindowedUsageRows: number,
   winners: WinningDeviceRow[],
 ): Promise<UsageEventPartial[] | "limit_exceeded"> {
-  const winnerBinds = winningDeviceBinds(winners);
-  const usagePageSql = buildUsagePageSql(winners.length);
+  const winnersJsonArg = winnersJson(winners);
   // Per provider: strictly-interior events keyed by their ceiling grid instant,
   // and grid-exact events kept as their own singleton at that instant (the
   // matchedUsage lower bound is inclusive, so a grid-exact event that equals a
@@ -637,9 +632,9 @@ async function readAndBucketUsage(
   let cursorObs = observedAtCutoff;
   let cursorId = 0;
   for (;;) {
-    const page = await db.prepare(usagePageSql)
+    const page = await db.prepare(USAGE_PAGE_SQL)
       .bind(
-        ...winnerBinds,
+        winnersJsonArg,
         participantId,
         observedAtCutoff,
         cursorObs,
@@ -872,12 +867,9 @@ export async function accountScopedQuotaAnalysisV1(
   if (winners.length === 0) {
     return notTestable("supported_quota_track_unavailable");
   }
-  const winnerBinds = winningDeviceBinds(winners);
 
-  const quotaResult = await db.prepare(
-    buildQuotaDownsampleSql(winners.length),
-  ).bind(
-    ...winnerBinds,
+  const quotaResult = await db.prepare(QUOTA_DOWNSAMPLE_SQL).bind(
+    winnersJson(winners),
     participantId,
     observedAtCutoff,
     resetsAtCutoff,
@@ -945,10 +937,8 @@ export async function downsampleQuotaForTest(
   const resetsAtCutoff = new Date(cutoffMs + SEVEN_DAY_WINDOW_MS).toISOString();
   const winners = await loadWinningDevices(db, participantId);
   if (winners.length === 0) return [];
-  const result = await db.prepare(
-    buildQuotaDownsampleSql(winners.length),
-  ).bind(
-    ...winningDeviceBinds(winners),
+  const result = await db.prepare(QUOTA_DOWNSAMPLE_SQL).bind(
+    winnersJson(winners),
     participantId,
     observedAtCutoff,
     resetsAtCutoff,
