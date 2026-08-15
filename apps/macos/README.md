@@ -93,7 +93,7 @@ dashboard destination.
 
 ### Launch-at-login lifecycle
 
-TiboTattle supports macOS 13 or later and uses Apple's
+TiboTattle supports macOS 14 or later and uses Apple's
 `ServiceManagement` `SMAppService.mainApp` API directly. A fresh install does
 not register during launch or status refresh: the first-run checkbox is only a
 preselected choice. On first run, its **Get Started** action is the sole point

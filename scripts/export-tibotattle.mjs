@@ -27,8 +27,8 @@ import { RELEASE_VERSION } from "../config/release-manifest.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 export const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
-export const CLIENT_EXPORT_SCHEMA = "tibotattle-client-export-v1";
-export const CLIENT_REPOSITORY_NAME = "tibotattle-client";
+export const CLIENT_EXPORT_SCHEMA = "tibotattle-export-v1";
+export const CLIENT_REPOSITORY_NAME = "tibotattle";
 export const CLIENT_PACKAGE_NAME = "app-usagemonitor";
 export const CLIENT_PACKAGE_VERSION = RELEASE_VERSION;
 export const CLIENT_MANIFEST_FILE = "client-export-manifest.json";
@@ -42,6 +42,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "apps/local/server.js",
   "apps/local/static-assets.js",
   "apps/local/transport/participant-relay-routes.js",
+  "apps/local/transport/participant-session-cookie-bridge.js",
   "config/deployment-endpoints.js",
   "config/product-brand.js",
   "config/release-channels.js",
@@ -116,6 +117,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/codex-transition-miner.js",
   "src/contribution-device-capability.js",
   "src/contribution-device-client.js",
+  "src/contribution-device-renewal.js",
   "src/contribution-device-sync.js",
   "src/contribution-incremental-sync.js",
   "src/contribution-sync-queue.js",
@@ -331,6 +333,7 @@ export const CLIENT_SCRIPT_FILES = Object.freeze([
 
 export const CLIENT_TEST_FILES = Object.freeze([
   "apps/local/participant-relay-routes.test.mjs",
+  "apps/local/participant-session-cookie-bridge.test.mjs",
   "apps/local/server.test.mjs",
   "apps/web/test/community-site.test.mjs",
   "apps/web/test/lib.test.mjs",
@@ -477,7 +480,7 @@ const IMPORT_PATTERNS = Object.freeze([
  * actions:read + contents:read + security-events:write at its top level, and
  * GitHub fails a caller at startup ("No jobs were run") when it grants less;
  * reading the file preserves those grants exactly. A parity test in
- * test/export-tibotattle-client.test.js guards this both ways.
+ * test/export-tibotattle.test.js guards this both ways.
  */
 export const GENERATED_OSV_WORKFLOW_PATH = ".github/workflows/osv-scanner.yml";
 
@@ -856,10 +859,10 @@ function generatedFiles({ osvWorkflow } = {}) {
     // permission grants the private repository actually runs.
     [GENERATED_OSV_WORKFLOW_PATH, osvWorkflow],
     ["README.md", [
-      "# TiboTattle client export candidate",
+      "# TiboTattle public export candidate",
       "",
-      "This directory is a reviewed, history-free seed for the future private",
-      "`tibotattle-client` repository. It is an export artifact, not a GitHub",
+      "This directory is a reviewed, history-free seed for the public",
+      "`tibotattle` repository. It is an export artifact, not a GitHub",
       "repository-creation receipt, public-release receipt, or service source.",
       "",
       "The exporter copied only the exact paths recorded in",
@@ -900,8 +903,8 @@ function generatedFiles({ osvWorkflow } = {}) {
     ["docs/verify-release.md", [
       "# Client release verification boundary",
       "",
-      "No release is created by the export tool. After the future private",
-      "`tibotattle-client` repository is seeded, a release must be built from an",
+      "No release is created by the export tool. After the `tibotattle`",
+      "repository is seeded, a release must be built from an",
       "immutable client tag and independently checked for source-manifest",
       "integrity, payload integrity, Developer ID signing, notarization, and",
       "Sparkle feed signatures.",
@@ -920,7 +923,7 @@ function generatedFiles({ osvWorkflow } = {}) {
       "  - packages/*",
       "overrides:",
       "  fast-deep-equal: 3.1.3",
-      "  fast-uri: 3.1.4",
+      "  fast-uri: 3.1.5",
       "  json-schema-traverse: 1.0.0",
       "  require-from-string: 2.0.2",
       "",
@@ -1132,7 +1135,7 @@ function parseArguments(argv) {
       if (outputDir !== null) fail("--output may be supplied only once", "CLIENT_EXPORT_ARGUMENTS_INVALID");
       outputDir = argv[++index] ?? null;
     } else if (argument === "--help" || argument === "-h") {
-      process.stdout.write("Usage: node scripts/export-tibotattle-client.mjs --output /path/to/empty-dir\n");
+      process.stdout.write("Usage: node scripts/export-tibotattle.mjs --output /path/to/empty-dir\n");
       return null;
     } else {
       fail(`Unknown argument: ${argument}`, "CLIENT_EXPORT_ARGUMENTS_INVALID");

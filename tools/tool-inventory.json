@@ -205,12 +205,12 @@
     {
       "classification": "build_release_operation",
       "owner": "client_export",
-      "canonicalPath": "scripts/export-tibotattle-client.mjs",
+      "canonicalPath": "scripts/export-tibotattle.mjs",
       "stableAlias": null,
       "stableAliasReason": "Client boundary exporter is invoked directly with an output path and is not a supported npm command.",
       "additionalAliases": [],
       "callers": [
-        "test/export-tibotattle-client.test.js",
+        "test/export-tibotattle.test.js",
         "test/weekly-pace-macos-runtime.test.js"
       ],
       "decision": "retain_until_client_repository_cutover",
@@ -230,7 +230,7 @@
       "callers": [
         "package.json#scripts.i18n:browser:generate",
         "package.json#scripts.i18n:browser:check",
-        "scripts/export-tibotattle-client.mjs",
+        "scripts/export-tibotattle.mjs",
         "apps/web/test/i18n-browser-parity.test.mjs"
       ],
       "decision": "retain_and_relocate_after_inventory",
@@ -356,7 +356,7 @@
         "scripts/build-local-review-artifact.js",
         "scripts/build-macos-app.js",
         "scripts/check-architecture-boundaries.mjs",
-        "scripts/export-tibotattle-client.mjs",
+        "scripts/export-tibotattle.mjs",
         "test/application-quota-sensitivity.test.js",
         "test/architecture-boundaries.test.js",
         "test/codex-local-usage-analysis-boundary.test.js",

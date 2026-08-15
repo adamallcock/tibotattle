@@ -313,6 +313,10 @@ test("the first visit leads with the product, Mac download action, and daily com
   assert.match(html, /private Mac app that estimates how much of your\s+seven-day Codex allowance remains/u);
   assert.match(html, /Your personal dashboard is calculated on your Mac\./u);
   assert.match(html, /Download for macOS/u);
+  assert.match(
+    html,
+    /brew install --cask adamallcock\/tap\/tibotattle/u,
+  );
   assert.match(html, /Latest community evidence/u);
   assert.match(html, /What the Codex allowance is really worth/u);
   assert.match(html, /Install the Mac app/u);
@@ -332,12 +336,17 @@ test("the first visit leads with the product, Mac download action, and daily com
   assert.match(html, /href="\.\/privacy\.html">Privacy<\/a>/u);
   assert.doesNotMatch(
     html,
-    /github\.com\/adamallcock\/(?:app-usagemonitor|tibotattle-client)/u,
+    /github\.com\/adamallcock\/app-usagemonitor/u,
   );
   assert.match(html, /id="installer-link"/u);
   assert.ok(
     html.indexOf('id="installer-link"') < html.indexOf('id="community"'),
     "the primary installer action appears before the community activity section",
+  );
+  assert.ok(
+    html.indexOf("brew install --cask adamallcock/tap/tibotattle")
+      < html.indexOf('id="community"'),
+    "the Homebrew install command appears before the community activity section",
   );
   assert.ok(
     html.indexOf('class="product-window"') < html.indexOf('id="how-it-works"'),

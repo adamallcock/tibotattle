@@ -53,7 +53,7 @@ Login Item automatically. Existing users can opt in from Settings.
 
 ## Implementation boundary
 
-The supported bundle target is macOS 13.0 on Apple silicon. The implementation
+The supported bundle target is macOS 14.0 on Apple silicon. The implementation
 uses Apple's `ServiceManagement` framework and `SMAppService.mainApp` directly;
 it introduces neither a third-party login-item dependency nor legacy
 `SMLoginItemSetEnabled` plumbing.

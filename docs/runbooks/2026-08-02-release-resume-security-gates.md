@@ -70,7 +70,7 @@ channel configured or operational.
 - `adamallcock/app-usagemonitor` is confirmed **private** on GitHub. The
   release branch `codex/release-security-client-split` is pushed through
   commit `f4f133e`.
-- `adamallcock/tibotattle-client` is now confirmed **private** on GitHub. Its
+- `adamallcock/tibotattle` is now confirmed **private** on GitHub. Its
   only commit is the history-free client seed
   `c912c52b6febcc1d7e433a822aec3a96f9977317`; it passed clean-client
   dependency install, client test, and macOS bundle test gates before upload.

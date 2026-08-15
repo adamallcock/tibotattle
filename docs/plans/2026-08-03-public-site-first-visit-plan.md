@@ -147,10 +147,10 @@ option.
 The native app already links to `https://github.com/adamallcock` and
 `https://x.com/adamallcock`. A read-only check on 2026-08-03 confirmed the
 GitHub profile is public and the X profile URL resolves. The public website may
-therefore use those profile links in its footer. It must not link to either
-`app-usagemonitor` or `tibotattle-client` until an owner-approved public source
-repository exists. There is still no public Docs destination, so no Docs link
-will be invented.
+therefore use those profile links in its footer and link to the owner-approved
+public source repository, `adamallcock/tibotattle`. It must not link to the
+private service repository, `app-usagemonitor`. There is still no public Docs
+destination, so no Docs link will be invented.
 
 The Apple, GitHub, and X marks are vendored from Simple Icons 16.21.0, whose
 official repository distributes its SVG library under CC0-1.0. Bundling the

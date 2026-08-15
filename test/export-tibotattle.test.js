@@ -14,10 +14,10 @@ import {
   REPOSITORY_ROOT,
   validateAllowlist,
   validateExportDirectory,
-} from "../scripts/export-tibotattle-client.mjs";
+} from "../scripts/export-tibotattle.mjs";
 
 test("client exporter creates a history-free, verified allow-list artifact", async () => {
-  const root = await mkdtemp(join(tmpdir(), "tibotattle-client-export-test-"));
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-export-test-"));
   const output = join(root, "client");
   await mkdir(output, { mode: 0o700 });
   try {
@@ -39,7 +39,7 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
     assert.equal(verified.files.length, created.fileCount);
 
     const workspace = await readFile(join(output, "pnpm-workspace.yaml"), "utf8");
-    assert.match(workspace, /^  fast-uri: 3\.1\.4$/m);
+    assert.match(workspace, /^  fast-uri: 3\.1\.5$/m);
 
     const osvWorkflow = await readFile(
       join(output, GENERATED_OSV_WORKFLOW_PATH),
@@ -109,7 +109,7 @@ test("client exporter rejects private paths and refuses an output it could overw
     { code: "CLIENT_EXPORT_FORBIDDEN_PATH" },
   );
 
-  const root = await mkdtemp(join(tmpdir(), "tibotattle-client-export-no-clobber-"));
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-export-no-clobber-"));
   const output = join(root, "non-empty-client");
   await mkdir(output, { mode: 0o700 });
   await writeFile(join(output, "existing.txt"), "caller-owned\n", { mode: 0o600 });

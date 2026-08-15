@@ -22,7 +22,7 @@ body:
     attributes:
       label: Install channel
       options:
-        - Release download (tibotattle.com / tibotattle-client releases)
+        - Release download (tibotattle.com / TiboTattle GitHub releases)
         - Built from source
         - Preview / development build
     validations:

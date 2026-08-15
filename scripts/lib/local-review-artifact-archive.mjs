@@ -35,7 +35,7 @@ const EXPECTED_COMPONENTS = Object.freeze([
   Object.freeze({ name: "@github/keytar", version: "7.10.6" }),
   Object.freeze({ name: "ajv", version: "8.20.0" }),
   Object.freeze({ name: "fast-deep-equal", version: "3.1.3" }),
-  Object.freeze({ name: "fast-uri", version: "3.1.4" }),
+  Object.freeze({ name: "fast-uri", version: "3.1.5" }),
   Object.freeze({ name: "json-schema-traverse", version: "1.0.0" }),
   Object.freeze({ name: "node", version: "26.2.0" }),
   Object.freeze({ name: "require-from-string", version: "2.0.2" }),

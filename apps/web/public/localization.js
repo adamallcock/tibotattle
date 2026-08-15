@@ -1359,6 +1359,8 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Understand your Codex week.": ["了解你的 Codex 一周。", "Entiende tu semana de Codex."],
   "TiboTattle is a local-first Mac app for understanding personal Codex usage. It estimates your personal seven-day allowance in API-equivalent terms; the dashboard and its history stay on your Mac.": ["TiboTattle 是一款本地优先的 Mac 应用，用于了解个人 Codex 使用情况。它以 API 等价值估算你的个人七天额度；仪表板及其历史记录保留在你的 Mac 上。", "TiboTattle es una app para Mac que prioriza lo local y ayuda a entender tu uso personal de Codex. Estima tu límite personal de siete días en términos equivalentes de API; el panel y su historial permanecen en tu Mac."],
   "Download for macOS": ["下载 macOS 版", "Descargar para macOS"],
+  "Or install with Homebrew": ["或使用 Homebrew 安装", "O instala con Homebrew"],
+  "brew install --cask adamallcock/tap/tibotattle": ["brew install --cask adamallcock/tap/tibotattle", "brew install --cask adamallcock/tap/tibotattle"],
   "Already installed?": ["已经安装？", "¿Ya está instalada?"],
   "Open TiboTattle": ["打开 TiboTattle", "Abrir TiboTattle"],
   "Signed release coming soon.": ["已签名版本即将推出。", "Próximamente habrá una versión firmada."],

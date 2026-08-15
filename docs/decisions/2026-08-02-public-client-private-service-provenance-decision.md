@@ -16,7 +16,7 @@ below pass and the owner explicitly approves that change.
 
 | Repository | Visibility | Responsibility |
 | --- | --- | --- |
-| [`tibotattle-client`](https://github.com/adamallcock/tibotattle-client) | private during transition; public only after release approval | The complete, buildable macOS/local client; public-safe shared contracts; client tests; release workflow; release verification instructions. |
+| [`tibotattle`](https://github.com/adamallcock/tibotattle) | private during transition; public only after release approval | The complete, buildable macOS/local client; public-safe shared contracts; client tests; release workflow; release verification instructions. |
 | `app-usagemonitor` (the private service repository during transition) | private | Cloudflare Worker, D1 migrations, Cloud Run containment service, operator/admin UI, infrastructure configuration, operational scripts, private test fixtures, and service release credentials. |
 
 The private client source history was created on 2026-08-02 as a single,
@@ -42,8 +42,8 @@ least-privilege Cloudflare bindings, separate secrets, and reviewable public
 API contracts; it must not rely on server implementation secrecy.
 
 The existing `app-usagemonitor` repository remains the private service-side
-repository while the one-way migration is completed. The private
-`tibotattle-client` repository began from a reviewed allow-list export, not
+repository while the one-way migration is completed. The private client
+repository began from a reviewed allow-list export, not
 from this private repository's history. Making either repository public still
 requires an explicit publication instruction.
 
@@ -96,7 +96,7 @@ commit rather than publishing the private repository's history.  Generate a
 candidate export in a disposable directory from an explicit allow-list, scan it
 for secrets and forbidden paths, build and test it independently, then compare
 its source manifest with the release checkout.  Once public, client changes are
-made in `tibotattle-client`; the private repository only updates its pinned
+made in `tibotattle`; the private repository only updates its pinned
 client tag through a reviewed change.
 
 This creates a single clear answer to "which source produced the app?": the
@@ -118,7 +118,7 @@ Each public macOS release should therefore publish all of the following:
    SPDX SBOM.  The attestation cryptographically records the public repository,
    commit, workflow, and build identity.  It is the primary code-to-artifact
    evidence, and GitHub documents verification with
-   `gh attestation verify <artifact> -R <owner>/tibotattle-client`.
+   `gh attestation verify <artifact> -R <owner>/tibotattle`.
 4. A release manifest containing the tag, commit SHA, application bundle
    version, client source-manifest SHA-256, unsigned payload SHA-256, signed
    DMG SHA-256, SBOM digest, workflow run URL, and attestation verification

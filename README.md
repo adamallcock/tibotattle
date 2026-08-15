@@ -40,16 +40,22 @@ artifact.
 
 ## Install
 
-Most people should install the prebuilt app: download it from
-[tibotattle.com](https://tibotattle.com), or pick a version from the
-[tibotattle-client releases page](https://github.com/adamallcock/tibotattle-client/releases).
-This repository is the source of truth; `tibotattle-client` is the filtered
-public release mirror it exports. To build from source instead, follow the
-quick start below.
+Install the signed, notarized app with Homebrew:
+
+```bash
+brew install --cask adamallcock/tap/tibotattle
+```
+
+Or download the DMG from [tibotattle.com](https://tibotattle.com) or the
+[TiboTattle releases page](https://github.com/adamallcock/tibotattle/releases).
+Both routes install the same Developer ID release; the app continues to use its
+signed Sparkle feed for updates. This repository is the source of truth for the
+public app and its releases. To build from source instead, follow the quick
+start below.
 
 ## Quick start (macOS, Apple Silicon)
 
-Requirements: macOS on arm64, Node.js ≥ 22.13 for the repository tooling,
+Requirements: macOS 14 or later on arm64, Node.js ≥ 22.13 for the repository tooling,
 [pnpm](https://pnpm.io) 11, and the Xcode command-line tools. The app-bundle
 build itself requires exactly Node v26.2.0 on macOS arm64: it fails on any
 other runtime rather than producing an unverifiable bundle.
@@ -80,6 +86,20 @@ npm run product:local
 then open <http://localhost:8787>. A useful headline usually appears within
 seconds; the first deep pass over a large history is bounded, cancellable, and
 resumable.
+
+## Uninstall
+
+The ordinary Homebrew uninstall removes the app and preserves local state:
+
+```bash
+brew uninstall --cask tibotattle
+```
+
+To also remove TiboTattle's Application Support data, caches, WebKit storage,
+and preferences, use `brew uninstall --cask --zap tibotattle`. The zap is
+deliberately narrow: it never touches `~/.codex` and preserves TiboTattle's
+Keychain identities and device credentials. Those credentials can be reset
+only from the app's two-confirmation **Identity & Device Reset…** flow.
 
 ## Languages
 
