@@ -65,7 +65,7 @@ unprotected fully accepted sets become eligible when older than seven days or
 beyond the eight most-recent accepted sets, with at most sixteen sets retired
 per pass. The reviewed first-send evidence, active write-ahead claim, and
 pending set are protected from automatic retirement, and work that is
-retryable, in flight, or rejected is never retired. On macOS 13 or later, the
+retryable, in flight, or rejected is never retired. On supported macOS 14 or later, the
 normal app may be registered as a user-controlled Login Item only after an
 affirmative first-run or Settings action; that item merely launches the app at
 login. It is not a daemon, LaunchAgent, privileged helper, autonomous
@@ -192,7 +192,7 @@ npm run product:release-site -- \
   --installer-url "$APPROVED_PUBLIC_DMG_URL" \
   --installer-version 1.2.3 \
   --installer-sha256 "$VERIFIED_DMG_SHA256" \
-  --minimum-macos 13.0 \
+  --minimum-macos 14.0 \
   --architectures arm64 \
   --release-notes-url "$APPROVED_RELEASE_NOTES_URL" \
   --privacy-url "$APPROVED_PRIVACY_URL" \

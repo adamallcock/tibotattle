@@ -2438,6 +2438,30 @@ footer p { margin: 0; }
 .community-site .installer-links a {
   color: rgba(255, 253, 247, .78);
 }
+.community-site .homebrew-install {
+  display: grid;
+  gap: 5px;
+  justify-items: start;
+  margin-top: 4px;
+}
+.community-site .homebrew-install p {
+  margin: 0;
+  color: rgba(255, 253, 247, .66);
+  font-size: .69rem;
+}
+.community-site .homebrew-install code {
+  box-sizing: border-box;
+  max-width: 100%;
+  padding: .62rem .76rem;
+  overflow-wrap: anywhere;
+  border: 1px solid rgba(255, 253, 247, .2);
+  border-radius: var(--radius-sm);
+  color: var(--site-paper);
+  background: rgba(0, 0, 0, .18);
+  font-size: .72rem;
+  user-select: all;
+  white-space: normal;
+}
 .community-site #open-installed-app-status {
   margin: 0;
   color: rgba(255, 253, 247, .7);

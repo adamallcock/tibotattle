@@ -101,7 +101,7 @@ const PINNED_RUNTIME_PACKAGES = Object.freeze({
     license: "MIT",
   }),
   "fast-uri": Object.freeze({
-    version: "3.1.4",
+    version: "3.1.5",
     license: "BSD-3-Clause",
   }),
   "json-schema-traverse": Object.freeze({

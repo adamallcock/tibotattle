@@ -216,7 +216,7 @@ func registerLoginItemForFirstRun(
 }
 
 /// Direct adapter for Apple's modern login-item API.  The app's deployment
-/// target is macOS 13.0, where `SMAppService.mainApp` is available.  No
+/// target is macOS 14.0, where `SMAppService.mainApp` is available.  No
 /// LaunchAgent, daemon, helper, or second executable is involved.
 final class SystemLoginItemManager: LoginItemManaging {
     private let service: SMAppService

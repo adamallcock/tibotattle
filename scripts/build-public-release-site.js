@@ -188,7 +188,7 @@ function usage() {
     "     --installer-url https://downloads.approved.example/UsageMonitor.dmg \\",
     "     --installer-version 1.2.3 \\",
     "     --installer-sha256 <64 lowercase hex> \\",
-    "     --minimum-macos 13.0 --architectures arm64] [--replace]",
+    "     --minimum-macos 14.0 --architectures arm64] [--replace]",
   ].join("\n");
 }
 
@@ -525,7 +525,7 @@ function validateInputs(args) {
   }
   if (!/^(?:1[0-9]|[2-9][0-9])\.(?:0|[1-9][0-9]?)(?:\.(?:0|[1-9][0-9]?))?$/u
     .test(args.minimumMacos)) {
-    throw new TypeError("Minimum macOS must be a canonical version such as 13.0");
+    throw new TypeError("Minimum macOS must be a canonical version such as 14.0");
   }
   const architectures = normalizedArchitectures(args.architectures);
   return {

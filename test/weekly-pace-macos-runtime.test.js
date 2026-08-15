@@ -7,7 +7,7 @@ import {
 import {
   CLIENT_RUNTIME_FILES,
   CLIENT_PACKAGE_FILES,
-} from "../scripts/export-tibotattle-client.mjs";
+} from "../scripts/export-tibotattle.mjs";
 
 test("pace analysis ships in both the macOS bundle and client export", () => {
   assert.equal(

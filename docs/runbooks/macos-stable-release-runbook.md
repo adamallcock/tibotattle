@@ -77,6 +77,29 @@ gh release create vX.Y.Z ".release-build/macos-release/TiboTattle-X.Y.Z-macOS-ar
 ```
 **Never attach `*.dmg.release.json`** — it embeds a private source SHA + infra details (that was the historical leak).
 
+## 5a. Refresh the first-party Homebrew tap
+
+The public [`adamallcock/homebrew-tap`](https://github.com/adamallcock/homebrew-tap)
+workflow polls the latest non-draft GitHub release hourly, verifies the exact
+arm64 DMG asset, updates the cask version and SHA-256, runs the cask gates, and
+commits only when those values changed. It requires no cross-repository token.
+
+For an immediate release, trigger the same workflow instead of waiting for the
+next scheduled poll:
+
+```bash
+gh workflow run update-tibotattle.yml --repo adamallcock/homebrew-tap
+gh run list --repo adamallcock/homebrew-tap \
+  --workflow update-tibotattle.yml --limit 1
+brew update
+brew info --cask adamallcock/tap/tibotattle
+```
+
+The cask keeps `auto_updates true`, so installing through Homebrew does not
+replace or fork the signed Sparkle update channel. Do not submit the cask to
+`Homebrew/homebrew-cask` until the project satisfies Homebrew's current age and
+notability requirements.
+
 ## 6. Rebuild the website + deploy the worker  ← THE STEP MISSED ON 0.1.11
 The site the worker serves is **pre-built** with the installer version/SHA **baked at build time** — a `wrangler deploy` alone leaves the site on the *old* version and does NOT ship web-code changes (this is what showed 0.1.1 and dropped the community band on the 0.1.11 launch). Rebuild it FIRST.
 
