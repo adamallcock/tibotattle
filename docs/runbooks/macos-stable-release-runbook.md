@@ -133,4 +133,4 @@ Then the launch post. Verify a real update: on an installed older build, Check f
 ---
 
 ## Owner-credential steps (need Cloudflare / Apple / Keychain access on the release machine)
-`wrangler deploy`, the R2 publish (`publish-sparkle-update` uses wrangler), `d1 migrations apply`, reading the guard token from your secret store, and `gh repo edit --visibility`. Everything else (build, sign+notarize, appcast generation, `gh release create`) is a plain local/CLI step. The secret values + exact retrieval commands are in `docs/runbooks/release-secrets.local.md` (gitignored).
+`wrangler deploy`, the R2 publish (`publish-sparkle-update` uses wrangler), `d1 migrations apply`, reading the guard token from your secret store, and `gh repo edit --visibility`. Everything else (build, sign+notarize, appcast generation, `gh release create`) is a plain local/CLI step. The secret values, exact retrieval commands, and the **provision/rotate recipe for the appcast guard token** (mandatory for `--publish`; rotating it has zero consumer/auto-update impact) are in `docs/runbooks/release-secrets.local.md` (gitignored).
