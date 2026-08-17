@@ -65,6 +65,9 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     "0031_incremental_contribution_v1.sql",
     "0032_signin_handoff_client_binding.sql",
     "0033_signin_handoff_processing_claim.sql",
+    "0034_backfill_daily_allowance_revisions.sql",
+    "0035_community_allowance_fit_cache.sql",
+    "0036_v1_analysis_read_index.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",
@@ -718,10 +721,13 @@ export function assessStagingConfiguration(
     previewUrlsDisabled: environment?.preview_urls === false,
     observabilityEnabled: environment?.observability?.enabled === true
       && environment?.observability?.head_sampling_rate === 1,
+    // Retain the established check key for receipt compatibility. Scheduled
+    // maintenance moved to every minute in 3e82884 so bounded quarantine
+    // reconciliation drains promptly instead of delaying publication.
     hourlyLifecycleDeclared:
       Array.isArray(environment?.triggers?.crons)
       && environment.triggers.crons.length === 1
-      && environment.triggers.crons[0] === "0 * * * *",
+      && environment.triggers.crons[0] === "* * * * *",
     enrollmentDisabled: environment?.vars?.ENVIRONMENT === "staging"
       && environment?.vars?.ENROLLMENT_MODE === "disabled",
     accountScopedIngestDisabled:
