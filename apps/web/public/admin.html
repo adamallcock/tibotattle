@@ -40,6 +40,23 @@
 
       <div id="notice" class="notice notice-warning" role="status" hidden></div>
 
+      <section class="admin-attention" aria-labelledby="operator-attention-title">
+        <div class="section-heading admin-attention-heading">
+          <div>
+            <p class="eyebrow">Operator attention</p>
+            <h2 id="operator-attention-title">What needs attention now</h2>
+          </div>
+          <span class="admin-source-badge" id="operator-attention-badge">
+            Checking signals…
+          </span>
+        </div>
+        <div
+          class="admin-attention-list"
+          id="operator-attention"
+          aria-live="polite"
+        ></div>
+      </section>
+
       <section class="admin-section" aria-labelledby="counts-title">
         <div class="section-heading">
           <div>
@@ -49,6 +66,66 @@
           <button class="button button-secondary" id="refresh" type="button">Refresh</button>
         </div>
         <div class="admin-card-grid" id="counts" aria-live="polite"></div>
+      </section>
+
+      <section class="admin-section" aria-labelledby="storage-safety-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Upload storage safety</p>
+            <h2 id="storage-safety-title">Crash-safe object reconciliation</h2>
+          </div>
+          <span class="admin-source-badge" id="quarantine-status-badge">
+            Checking storage…
+          </span>
+        </div>
+        <p class="admin-copy admin-distribution-copy">
+          Every upload object receives a crash-safety registration before its
+          database commit. Recent registrations remain for one hour;
+          reconciliation preserves objects referenced by accepted data and
+          removes only unreferenced orphans. This is storage housekeeping, not
+          moderation or a count of rejected submissions.
+        </p>
+        <div class="admin-card-grid admin-storage-grid" id="quarantine-counts" aria-live="polite"></div>
+        <div class="admin-two-column admin-distribution-details">
+          <div class="admin-card" id="quarantine-status" aria-live="polite"></div>
+          <div class="admin-card admin-explainer">
+            <h3>How to read the states</h3>
+            <p><strong>Recent:</strong> normal uploads still inside the safety window.</p>
+            <p><strong>Due and referenced:</strong> valid objects whose temporary marker should clear.</p>
+            <p><strong>Due and unreferenced:</strong> orphan candidates scheduled for safe deletion.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="admin-section" aria-labelledby="distribution-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Distribution evidence</p>
+            <h2 id="distribution-title">App activity and update reach</h2>
+          </div>
+          <span class="admin-source-badge" id="distribution-status">Checking sources…</span>
+        </div>
+        <p class="admin-copy admin-distribution-copy">
+          Active-install figures are distinct source IP address counts observed
+          on first-party update traffic, not people or a device census. NAT,
+          VPNs, dynamic addresses, offline use, and update settings can move the
+          estimate in either direction. Raw addresses are reduced in memory and
+          are never returned by this API or stored by this dashboard.
+        </p>
+        <div class="admin-card-grid admin-distribution-grid" id="distribution-counts" aria-live="polite"></div>
+        <div class="admin-two-column admin-distribution-details">
+          <div class="admin-card admin-table-wrap">
+            <h3>Observed app versions</h3>
+            <table>
+              <thead><tr><th>Version</th><th>Source addresses · 7d</th><th>Checks · 7d</th></tr></thead>
+              <tbody id="distribution-version-rows"></tbody>
+            </table>
+            <p class="admin-empty" id="distribution-version-empty">
+              No app-version evidence is available in this window.
+            </p>
+          </div>
+          <div class="admin-card" id="distribution-source-status" aria-live="polite"></div>
+        </div>
       </section>
 
       <div class="admin-two-column">
@@ -102,6 +179,11 @@
       <section class="admin-section" aria-labelledby="readiness-title">
         <p class="eyebrow">Lifecycle and publication</p>
         <h2 id="readiness-title">Operational readiness</h2>
+        <p class="admin-copy">
+          Compare the latest accepted upload with the latest daily evidence and
+          publication times to distinguish an idle contributor from a stalled
+          rebuild queue.
+        </p>
         <div class="admin-two-column">
           <div class="admin-card" id="lifecycle-status" aria-live="polite"></div>
           <div class="admin-card admin-table-wrap">

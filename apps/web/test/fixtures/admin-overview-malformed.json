@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "admin-overview-v0.1",
+  "schemaVersion": "admin-overview-v0.2",
   "generatedAt": "2026-08-02T12:00:00.000Z",
   "service": { "environment": "production" },
   "collection": {

@@ -17,7 +17,7 @@ const fixture = async (name) => JSON.parse(await readFile(
 test("admin overview fixture projects to the renderer's explicit contract", async () => {
   const overview = projectAdminOverview(await fixture("admin-overview-valid.json"));
   assert.deepEqual(overview, {
-    generatedAt: "2026-08-02T12:00:00.000Z",
+    generatedAt: "2026-08-17T12:00:00.000Z",
     service: { environment: "production" },
     collection: {
       state: "operational",
@@ -36,6 +36,13 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
         enrolledLast7Days: 3,
       },
       contributions: {
+        contributingAccounts: {
+          total: 2,
+          bounded: false,
+          acceptedLast24Hours: 1,
+          acceptedLast7Days: 1,
+          acceptedLast30Days: 1,
+        },
         telemetry: {
           accepted: 9,
           total: 10,
@@ -43,20 +50,50 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
           acceptedLast24Hours: 2,
           acceptedLast7Days: 6,
         },
+        incrementalChunks: {
+          current: 10,
+          total: 12,
+          bounded: false,
+          acceptedLast24Hours: 3,
+          acceptedLast7Days: 8,
+        },
+        acceptedLast24Hours: 5,
+        acceptedLast7Days: 14,
+        latestAcceptedAt: "2026-08-17T11:21:58.898Z",
         storedTelemetryRecords: 22,
         storedTelemetryRecordsBounded: false,
       },
-      pendingQuarantineObjects: 1,
-      pendingQuarantineObjectsBounded: false,
+    },
+    quarantine: {
+      pendingObjects: 110,
+      pendingObjectsBounded: false,
+      gracePeriodMinutes: 60,
+      cutoffAt: "2026-08-17T11:00:00.000Z",
+      withinGrace: 110,
+      dueReferenced: 0,
+      dueUnreferenced: 0,
+      oldestRegisteredAt: "2026-08-17T11:19:32.269Z",
+      newestRegisteredAt: "2026-08-17T11:21:58.898Z",
+      nextEligibleAt: "2026-08-17T12:19:32.269Z",
     },
     lifecycle: {
       state: "completed",
       quarantineRetentionComplete: true,
       restoreReplayComplete: true,
-      maintenanceRunAt: "2026-08-02T11:00:00.000Z",
+      maintenanceRunAt: "2026-08-17T11:59:00.000Z",
       failureCode: null,
     },
-    reconciliation: { state: "completed", reconciliationComplete: true },
+    reconciliation: {
+      state: "completed",
+      lastCompletedAt: "2026-08-17T11:59:00.000Z",
+      maintenanceRunAt: "2026-08-17T11:59:00.000Z",
+      cutoffAt: "2026-08-17T10:59:00.000Z",
+      registrationsExamined: 0,
+      orphanObjectsDeleted: 0,
+      referencedObjectsPreserved: 0,
+      reconciliationComplete: true,
+      failureCode: null,
+    },
     ingress: {
       activeLeases: 3,
       maximumConcurrent: 16,
@@ -66,6 +103,59 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
       startRateDenials: 2,
       lastDeniedAt: "2026-08-02T09:15:00.000Z",
     },
+    distribution: {
+      methodology: {
+        unit: "distinct_source_ip_addresses",
+        lookbackDays: 7,
+        storesRawAddresses: false,
+      },
+      cloudflare: {
+        status: "available",
+        reasonCode: null,
+        sampled: false,
+        bounded: false,
+        window: {
+          startsAt: "2026-08-10T12:00:00.000Z",
+          endsAt: "2026-08-17T12:00:00.000Z",
+        },
+        activeSourceAddresses: { last24Hours: 19, last7Days: 29 },
+        preflight: {
+          requests: { last24Hours: 22, last7Days: 78 },
+          sourceAddresses: { last24Hours: 16, last7Days: 25 },
+        },
+        sparkleChecks: {
+          requests: { last24Hours: 14, last7Days: 40 },
+          sourceAddresses: { last24Hours: 13, last7Days: 21 },
+        },
+        sparkleDownloads: {
+          requests: { last24Hours: 3, last7Days: 3 },
+          sourceAddresses: { last24Hours: 3, last7Days: 3 },
+        },
+        currentVersion: "0.1.12",
+        currentVersionSourceAddresses: { last24Hours: 18, last7Days: 19 },
+        observedVersions: [{
+          version: "0.1.12",
+          requestsLast7Days: 64,
+          sourceAddressesLast7Days: 19,
+        }, {
+          version: "0.1.11",
+          requestsLast7Days: 9,
+          sourceAddressesLast7Days: 5,
+        }],
+        observedVersionsBounded: false,
+      },
+      github: {
+        status: "available",
+        reasonCode: null,
+        repository: "adamallcock/tibotattle",
+        release: {
+          tag: "v0.1.12",
+          publishedAt: "2026-08-15T18:00:00.000Z",
+          dmgDownloads: 88,
+          allAssetDownloads: 101,
+        },
+      },
+    },
     snapshots: [{
       snapshotId: "community-weekly:2026-07-26",
       weekStart: "2026-07-26T00:00:00.000Z",
@@ -73,6 +163,12 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
       releaseState: "published",
       releasedAt: "2026-08-02T11:30:00.000Z",
     }],
+    dailyPublication: {
+      latestEvidenceDay: "2026-08-01",
+      latestReleasedAt: "2026-08-02T11:40:00.000Z",
+      pendingRebuilds: 0,
+      pendingRebuildsBounded: false,
+    },
     pendingHistoricalRebuilds: 0,
     errors: {
       groups: [{
@@ -130,6 +226,61 @@ test("admin overview projector rejects malformed ingress pressure values", async
       /ADMIN_OVERVIEW_INVALID/u,
     );
   }
+});
+
+test("quarantine projection keeps recent, referenced, and orphan counts exhaustive", async () => {
+  const payload = await fixture("admin-overview-valid.json");
+  payload.quarantine.withinGrace = 109;
+  assert.throws(
+    () => projectAdminOverview(payload),
+    /ADMIN_OVERVIEW_INVALID/u,
+  );
+
+  const missingWindow = await fixture("admin-overview-valid.json");
+  missingWindow.quarantine.nextEligibleAt = null;
+  assert.throws(
+    () => projectAdminOverview(missingWindow),
+    /ADMIN_OVERVIEW_INVALID/u,
+  );
+});
+
+test("distribution sources may degrade without invalidating exact D1 counts", async () => {
+  const payload = await fixture("admin-overview-valid.json");
+  payload.distribution.cloudflare = {
+    status: "not_configured",
+    reasonCode: "ANALYTICS_NOT_CONFIGURED",
+    sampled: null,
+    bounded: null,
+    window: null,
+    activeSourceAddresses: null,
+    preflight: null,
+    sparkleChecks: null,
+    sparkleDownloads: null,
+    currentVersion: null,
+    currentVersionSourceAddresses: null,
+    observedVersions: [],
+    observedVersionsBounded: false,
+  };
+  const overview = projectAdminOverview(payload);
+  assert.equal(overview.distribution.cloudflare.status, "not_configured");
+  assert.equal(overview.counts.contributions.contributingAccounts.total, 2);
+});
+
+test("distribution projection rejects stale values behind unavailable sources", async () => {
+  const payload = await fixture("admin-overview-valid.json");
+  payload.distribution.cloudflare.status = "unavailable";
+  payload.distribution.cloudflare.reasonCode = "ANALYTICS_UNAVAILABLE";
+  assert.throws(
+    () => projectAdminOverview(payload),
+    /ADMIN_OVERVIEW_INVALID/u,
+  );
+
+  const inconsistent = await fixture("admin-overview-valid.json");
+  inconsistent.distribution.github.release.dmgDownloads = 102;
+  assert.throws(
+    () => projectAdminOverview(inconsistent),
+    /ADMIN_OVERVIEW_INVALID/u,
+  );
 });
 
 test("admin overview projector rejects missing and malformed render values", async () => {
