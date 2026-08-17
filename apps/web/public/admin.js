@@ -4,10 +4,136 @@ import {
   projectAdminAction,
   projectAdminOverview,
 } from "./admin-client.js";
-import { formatReportingTime } from "./ui-format.js";
+import { formatNumber, formatReportingTime } from "./ui-format.js";
 
 const state = { csrfToken: "", overview: null };
 const $ = (selector) => document.querySelector(selector);
+let infoHintSequence = 0;
+
+const INFO_HINTS = Object.freeze({
+  "Approved community accounts": "Approved identities that are currently active and allowed to contribute. This includes approved accounts that have not yet sent accepted data.",
+  "Accounts with accepted data": "Distinct approved accounts with at least one accepted whole contribution or incremental chunk. The caption shows how many were active in the trailing 30 days.",
+  "Approved last 24h": "Identities first approved during the trailing 24 hours. The caption gives the corresponding trailing seven-day count.",
+  "Telemetry contributions": "Accepted whole-contribution envelopes. Current app versions normally send incremental chunks, so this can be zero while uploads are healthy.",
+  "Current incremental chunks": "Accepted incremental journal chunks that have not been superseded. The caption includes every retained chunk row, including older superseded rows.",
+  "Accepted uploads last 24h": "Accepted whole contributions plus incremental chunks received during the trailing 24 hours. One account can send many uploads.",
+  "Stored telemetry records": "Content-free metadata rows retained by the earlier telemetry-record path. This is a row count, not a contributor count.",
+  "Upload safety registrations": "Crash-safety markers created before uploaded objects are committed to the database. Recent markers are normal; older markers are reconciled.",
+  "Recent registrations": "Upload safety markers still inside the one-hour grace period. They are expected and are not yet eligible for reconciliation.",
+  "Due and referenced": "Markers older than the grace period whose uploaded objects are referenced by accepted database rows. The object is preserved and the temporary marker should clear.",
+  "Due and unreferenced": "Markers older than the grace period with no accepted database row pointing to the object. These are orphan candidates scheduled for safe deletion.",
+  "Pending registrations": "All upload safety markers currently waiting for their grace period or reconciliation pass.",
+  "Oldest registration": "The earliest marker still waiting. Its age helps distinguish normal settling from a stalled reconciliation queue.",
+  "Newest registration": "The most recently created upload safety marker.",
+  "Next registration becomes due": "When the oldest recent marker will leave the grace period and become eligible for reconciliation.",
+  "Eligible cutoff now": "Markers created at or before this time are old enough to be examined by reconciliation.",
+  "Last reconciliation": "When the most recent upload-object reconciliation pass completed.",
+  "Last pass cutoff": "The eligibility cutoff used by the most recent reconciliation pass.",
+  "Registrations examined last pass": "How many eligible markers the most recent bounded reconciliation pass inspected.",
+  "Referenced objects preserved": "Eligible objects confirmed as referenced by accepted data and therefore kept during the most recent pass.",
+  "Orphan objects removed": "Eligible objects with no accepted-data reference that were safely deleted during the most recent pass.",
+  "Reconciliation failure": "The last recorded reconciliation error code. A dash means no failure was recorded.",
+  "Active-install proxy": "Distinct source IP addresses seen on first-party app update traffic in the trailing 24 hours. It is a rough activity proxy, not a count of people or devices.",
+  "App preflight call-ins": "Requests to the app preflight endpoint. They show running copies checking compatibility, but retries and shared addresses prevent a user census.",
+  "Sparkle update checks": "Requests for the Sparkle appcast used to discover updates. A single installation can check more than once.",
+  "Sparkle artifact fetches": "Requests for update artifacts. Fetches can include retries or automated checks and do not prove a completed installation.",
+  "Current-version reach": "Distinct source addresses whose update traffic identifies the current published app version.",
+  "GitHub DMG downloads": "GitHub's cumulative download counter for the latest DMG. It counts asset downloads, not launches, active users, or unique devices.",
+  "Cloudflare analytics": "Whether first-party request analytics were available for this dashboard refresh.",
+  "Evidence window": "The exact request-analytics time range used for the displayed activity estimates.",
+  "Sampling": "Whether Cloudflare returned every matching row or a sampled estimate.",
+  "Result bound": "Whether a query reached its safety row cap. A bounded result is a minimum rather than an exact total.",
+  "GitHub releases": "Whether current release metadata and cumulative asset download totals were available from GitHub.",
+  "Latest release": "The release tag and publication time used for the download totals.",
+  "Raw source addresses stored": "Whether this dashboard persists the source addresses used for distinct-address estimates. It should always say no.",
+  "Upload ingress budget": "Shared admission state that protects the service from too many simultaneous or rapidly starting uploads.",
+  "Active leases": "Uploads currently holding a concurrency slot, compared with the maximum simultaneous allowance.",
+  "Available start tokens": "Upload starts still available in the current rate-limit bucket, compared with the bucket's full burst size.",
+  "Concurrency denials": "Upload starts refused because every simultaneous-upload slot was already occupied.",
+  "Start-rate denials": "Upload starts refused because the per-minute start budget was exhausted.",
+  "Last denied": "When either upload admission limit most recently refused a request.",
+  "Retention lifecycle": "The latest deletion-retention maintenance state and whether quarantine retention completed.",
+  "Restore replay": "Whether deletion protections were replayed completely after restoring stored data.",
+  "Quarantine reconciliation": "The latest upload-object housekeeping state and whether its bounded pass cleared all eligible work.",
+  "Latest accepted upload": "The newest accepted whole contribution or incremental chunk received by the service.",
+  "Weekly rebuild queue": "Weekly community snapshots waiting to be rebuilt from accepted evidence.",
+  "Daily rebuild queue": "Daily community aggregates waiting to be rebuilt from accepted evidence.",
+  "Latest daily evidence": "The newest evidence day represented by a published daily community aggregate.",
+  "Latest daily publication": "When a daily community aggregate was most recently published.",
+  "Last maintenance": "When the latest bounded retention, reconciliation, and publication maintenance pass ran.",
+  "Failure code": "The latest lifecycle failure identifier. A dash means no failure was recorded.",
+});
+
+const AUDIT_ACTIONS = Object.freeze({
+  run_maintenance: Object.freeze({
+    label: "Maintenance pass",
+    explanation: "An owner-initiated pass that applies retention cleanup, reconciles upload objects, and rebuilds eligible community aggregates.",
+  }),
+  set_collection_controls: Object.freeze({
+    label: "Collection controls",
+    explanation: "A revision-checked change to enrollment, upload registration, processing, or publication switches.",
+  }),
+});
+
+const AUDIT_FIELD_LABELS = Object.freeze({
+  phase: "Phase",
+  code: "Result code",
+  expectedRevision: "Expected revision",
+  revision: "Saved revision",
+  state: "Collection state",
+  reasonCode: "Reason",
+  "flags.enrollment": "Enrollment",
+  "flags.uploadRegistration": "Upload registration",
+  "flags.processing": "Processing",
+  "flags.publication": "Publication",
+  lifecycleComplete: "Retention lifecycle complete",
+  quarantineReconciliationComplete: "Upload reconciliation complete",
+  expiredIdentityHandoffsPurged: "Expired sign-in handoffs removed",
+  expiredIdentityHandoffPurgeComplete: "Sign-in handoff cleanup complete",
+  expiredDeletionTombstonesPurged: "Expired deletion protections removed",
+  deletionTombstonePurgeComplete: "Deletion-protection cleanup complete",
+  expiredPrimaryIdentityReenrollmentCooldownsPurged: "Expired primary cooldowns removed",
+  primaryIdentityReenrollmentCooldownPurgeComplete: "Primary cooldown cleanup complete",
+  expiredIdentityReenrollmentCooldownsPurged: "Expired deletion-ledger cooldowns removed",
+  identityReenrollmentCooldownPurgeComplete: "Deletion-ledger cooldown cleanup complete",
+  aggregateRebuildComplete: "Community rebuild complete",
+  publicationEnabled: "Publication enabled",
+});
+
+const AUDIT_FIELD_HINTS = Object.freeze({
+  phase: "The operation stage recorded when this audit entry was written.",
+  code: "The machine-readable result from the operation. OK means every recorded check completed; MAINTENANCE_INCOMPLETE means the pass ran but bounded work remains.",
+  expectedRevision: "The collection-control revision the dashboard expected before applying a change. This prevents overwriting a newer operator decision.",
+  revision: "The collection-control revision saved after a successful change.",
+  state: "The resulting overall collection posture derived from the four collection switches.",
+  reasonCode: "The operator-selected reason stored with the collection-control change.",
+  "flags.enrollment": "Whether new community accounts may be approved.",
+  "flags.uploadRegistration": "Whether approved accounts may register ongoing upload capability.",
+  "flags.processing": "Whether accepted uploads may be processed into usable evidence.",
+  "flags.publication": "Whether eligible community aggregates may be published.",
+  lifecycleComplete: "Whether the bounded retention and deletion lifecycle finished all work available in this pass.",
+  quarantineReconciliationComplete: "Whether upload-object reconciliation cleared every eligible marker in this bounded pass.",
+  expiredIdentityHandoffsPurged: "Number of expired temporary sign-in handoff records removed in this pass.",
+  expiredIdentityHandoffPurgeComplete: "Whether no eligible expired sign-in handoffs remain after this pass.",
+  expiredDeletionTombstonesPurged: "Number of expired deletion-protection records removed in this pass.",
+  deletionTombstonePurgeComplete: "Whether no eligible expired deletion-protection records remain after this pass.",
+  expiredPrimaryIdentityReenrollmentCooldownsPurged: "Number of expired identity re-enrollment cooldowns removed from the primary database.",
+  primaryIdentityReenrollmentCooldownPurgeComplete: "Whether primary-database identity cooldown cleanup finished its eligible work.",
+  expiredIdentityReenrollmentCooldownsPurged: "Number of expired identity re-enrollment cooldowns removed from the deletion ledger.",
+  identityReenrollmentCooldownPurgeComplete: "Whether deletion-ledger identity cooldown cleanup finished its eligible work.",
+  aggregateRebuildComplete: "Whether all queued daily and weekly community aggregate rebuilds completed in this pass.",
+  publicationEnabled: "Whether community publication was enabled while this maintenance pass ran.",
+});
+
+const MAINTENANCE_COMPLETION_FIELDS = Object.freeze([
+  ["lifecycleComplete", "retention lifecycle"],
+  ["quarantineReconciliationComplete", "upload-object reconciliation"],
+  ["expiredIdentityHandoffPurgeComplete", "sign-in handoff cleanup"],
+  ["deletionTombstonePurgeComplete", "deletion-protection cleanup"],
+  ["primaryIdentityReenrollmentCooldownPurgeComplete", "primary identity cooldown cleanup"],
+  ["identityReenrollmentCooldownPurgeComplete", "deletion-ledger cooldown cleanup"],
+  ["aggregateRebuildComplete", "community aggregate rebuilds"],
+]);
 
 function text(value) {
   return value === null || value === undefined ? "—" : String(value);
@@ -19,6 +145,400 @@ function count(value, bounded = false) {
 
 function formatTime(value) {
   return value ? formatReportingTime(value) : "—";
+}
+
+function plainRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : null;
+}
+
+function listPhrase(values) {
+  if (values.length === 0) return "";
+  if (values.length === 1) return values[0];
+  if (values.length === 2) return `${values[0]} and ${values[1]}`;
+  return `${values.slice(0, -1).join(", ")}, and ${values.at(-1)}`;
+}
+
+function humanizeToken(value) {
+  const normalized = String(value ?? "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return normalized
+    ? `${normalized.charAt(0).toUpperCase()}${normalized.slice(1)}`
+    : "Unknown";
+}
+
+function positionInfoHint(trigger, tooltip) {
+  const anchor = trigger.getBoundingClientRect();
+  const viewportPadding = 12;
+  const gap = 8;
+  const width = tooltip.offsetWidth;
+  const height = tooltip.offsetHeight;
+  const left = Math.min(
+    Math.max(viewportPadding, anchor.left),
+    Math.max(viewportPadding, window.innerWidth - width - viewportPadding),
+  );
+  const below = anchor.bottom + gap;
+  const top = below + height <= window.innerHeight - viewportPadding
+    ? below
+    : Math.max(viewportPadding, anchor.top - height - gap);
+  tooltip.style.left = `${Math.round(left)}px`;
+  tooltip.style.top = `${Math.round(top)}px`;
+}
+
+function infoHint(label, explanation = INFO_HINTS[label]) {
+  if (!explanation) return null;
+  const hint = document.createElement("span");
+  hint.className = "admin-info";
+  const trigger = document.createElement("button");
+  trigger.className = "admin-info-trigger";
+  trigger.type = "button";
+  trigger.textContent = "i";
+  trigger.setAttribute("aria-label", `Explain ${label}`);
+  const tooltip = document.createElement("span");
+  tooltip.className = "admin-info-tooltip";
+  tooltip.id = `admin-info-${++infoHintSequence}`;
+  tooltip.setAttribute("role", "tooltip");
+  tooltip.textContent = explanation;
+  trigger.setAttribute("aria-describedby", tooltip.id);
+  trigger.addEventListener("mouseenter", () => positionInfoHint(trigger, tooltip));
+  trigger.addEventListener("focus", () => positionInfoHint(trigger, tooltip));
+  hint.append(trigger, tooltip);
+  return hint;
+}
+
+function labelWithInfo(label, explanation = INFO_HINTS[label]) {
+  const wrapper = document.createElement("span");
+  wrapper.className = "admin-label-with-info";
+  const copy = document.createElement("span");
+  copy.className = "admin-label-text";
+  copy.textContent = label;
+  wrapper.append(copy);
+  const hint = infoHint(label, explanation);
+  if (hint) wrapper.append(hint);
+  return wrapper;
+}
+
+function auditFieldLabel(key) {
+  return AUDIT_FIELD_LABELS[key] ?? humanizeToken(key.split(".").at(-1));
+}
+
+function auditFieldHint(key) {
+  return AUDIT_FIELD_HINTS[key]
+    ?? "An additional value retained in the audit record for troubleshooting.";
+}
+
+function formatAuditValue(key, value) {
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "boolean") {
+    if (key.startsWith("flags.")) return value ? "On" : "Off";
+    if (key.endsWith("Complete")) return value ? "Complete" : "Pending";
+    if (key.endsWith("Enabled")) return value ? "Enabled" : "Disabled";
+    return value ? "Yes" : "No";
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? formatNumber(value) : String(value);
+  }
+  if (typeof value === "string") {
+    if (["phase", "state"].includes(key)) return humanizeToken(value);
+    if (key === "reasonCode") {
+      const readable = humanizeToken(value);
+      return readable.toLowerCase() === value.toLowerCase()
+        ? value
+        : `${readable} (${value})`;
+    }
+    return value;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function flattenAuditDetails(details, limit = 40) {
+  const record = plainRecord(details);
+  if (!record) return [];
+  const fields = [];
+  let truncated = false;
+
+  function visit(value, key, depth) {
+    if (fields.length >= limit) {
+      truncated = true;
+      return;
+    }
+    const nested = plainRecord(value);
+    if (nested && depth < 2) {
+      const entries = Object.entries(nested);
+      if (entries.length === 0) {
+        fields.push({ key, value: "{}" });
+        return;
+      }
+      for (const [childKey, childValue] of entries) {
+        visit(childValue, key ? `${key}.${childKey}` : childKey, depth + 1);
+      }
+      return;
+    }
+    fields.push({ key, value: formatAuditValue(key, value) });
+  }
+
+  for (const [key, value] of Object.entries(record)) visit(value, key, 0);
+  if (truncated) {
+    fields.push({
+      key: "additionalFields",
+      label: "Additional fields",
+      hint: "This audit entry contains more technical values than the compact dashboard displays.",
+      value: `More than ${limit} fields were recorded`,
+    });
+  }
+  return fields;
+}
+
+function auditResult(label, tone, explanation) {
+  return { label, tone, explanation };
+}
+
+function maintenancePresentation(outcome, details) {
+  const code = details?.code;
+  if (outcome === "started") {
+    return {
+      result: auditResult(
+        "In progress",
+        "warning",
+        "The maintenance request was recorded, but this entry does not contain a final result yet.",
+      ),
+      summary: "A maintenance pass was requested; no final outcome has been recorded.",
+    };
+  }
+  if (outcome === "failure") {
+    return {
+      result: auditResult(
+        "Failed",
+        "failure",
+        "The maintenance request failed and may require investigation before it is retried.",
+      ),
+      summary: code
+        ? `The maintenance request failed with result code ${code}.`
+        : "The maintenance request failed before it produced a usable result.",
+    };
+  }
+  if (outcome === "success" && code === "MAINTENANCE_INCOMPLETE") {
+    const remaining = MAINTENANCE_COMPLETION_FIELDS
+      .filter(([key]) => details?.[key] === false)
+      .map(([, label]) => label);
+    return {
+      result: auditResult(
+        "Follow-up needed",
+        "warning",
+        "The request succeeded, but one or more bounded maintenance stages still had eligible work when this pass ended.",
+      ),
+      summary: remaining.length > 0
+        ? `The pass ran, but ${listPhrase(remaining)} ${remaining.length === 1 ? "still has" : "still have"} eligible work remaining. Another bounded pass may finish it.`
+        : "The pass ran, but some bounded maintenance work remained. Another pass may finish it.",
+    };
+  }
+  if (outcome === "success") {
+    return {
+      result: auditResult(
+        "Completed",
+        "success",
+        "The maintenance request finished and its recorded result does not require another bounded pass.",
+      ),
+      summary: code && code !== "OK"
+        ? `The maintenance pass completed with result code ${code}.`
+        : "The maintenance pass completed all recorded retention, reconciliation, cleanup, and publication checks.",
+    };
+  }
+  return {
+    result: auditResult(
+      humanizeToken(outcome),
+      "warning",
+      "This is the outcome stored by the service for the maintenance request.",
+    ),
+    summary: `The service recorded a ${humanizeToken(outcome).toLowerCase()} maintenance outcome.`,
+  };
+}
+
+function collectionControlSummary(details) {
+  const parts = [];
+  if (details?.revision !== undefined) {
+    parts.push(`Collection controls were saved at revision ${details.revision}`);
+  } else {
+    parts.push("Collection controls were saved");
+  }
+  if (details?.state) parts.push(`the service is now ${humanizeToken(details.state).toLowerCase()}`);
+  const flags = plainRecord(details?.flags);
+  if (flags) {
+    const flagLabels = {
+      enrollment: "enrollment",
+      uploadRegistration: "upload registration",
+      processing: "processing",
+      publication: "publication",
+    };
+    const enabled = Object.entries(flagLabels)
+      .filter(([key]) => flags[key] === true)
+      .map(([, label]) => label);
+    const disabled = Object.entries(flagLabels)
+      .filter(([key]) => flags[key] === false)
+      .map(([, label]) => label);
+    if (enabled.length > 0) parts.push(`${listPhrase(enabled)} ${enabled.length === 1 ? "is" : "are"} on`);
+    if (disabled.length > 0) parts.push(`${listPhrase(disabled)} ${disabled.length === 1 ? "is" : "are"} off`);
+  }
+  const summary = `${parts.join("; ")}.`;
+  return details?.reasonCode
+    ? `${summary} Reason: ${humanizeToken(details.reasonCode)}.`
+    : summary;
+}
+
+function collectionControlPresentation(outcome, details) {
+  if (outcome === "started") {
+    return {
+      result: auditResult(
+        "In progress",
+        "warning",
+        "The controls change was recorded, but this entry does not contain a final result yet.",
+      ),
+      summary: "A collection-control change was requested; no final outcome has been recorded.",
+    };
+  }
+  if (outcome === "failure") {
+    const conflict = details?.code === "ADMIN_ACTION_CONFLICT";
+    return {
+      result: auditResult(
+        "Failed",
+        "failure",
+        conflict
+          ? "The service rejected a stale edit so it could not overwrite a newer operator decision."
+          : "The collection-control change was not applied.",
+      ),
+      summary: conflict
+        ? "The change was not applied because the dashboard used an older control revision. Refresh the page before trying again."
+        : details?.code
+          ? `The collection-control change failed with result code ${details.code}.`
+          : "The collection-control change failed before it produced a usable result.",
+    };
+  }
+  if (outcome === "success") {
+    return {
+      result: auditResult(
+        "Applied",
+        "success",
+        "The revision-checked collection-control change was saved successfully.",
+      ),
+      summary: collectionControlSummary(details),
+    };
+  }
+  return {
+    result: auditResult(
+      humanizeToken(outcome),
+      "warning",
+      "This is the outcome stored by the service for the collection-control change.",
+    ),
+    summary: `The service recorded a ${humanizeToken(outcome).toLowerCase()} collection-control outcome.`,
+  };
+}
+
+function auditPresentation(item) {
+  const details = plainRecord(item.details);
+  const action = AUDIT_ACTIONS[item.action] ?? {
+    label: humanizeToken(item.action),
+    explanation: "An owner control action recorded by the service.",
+  };
+  const presentation = item.action === "run_maintenance"
+    ? maintenancePresentation(item.outcome, details)
+    : item.action === "set_collection_controls"
+      ? collectionControlPresentation(item.outcome, details)
+      : {
+          result: auditResult(
+            humanizeToken(item.outcome),
+            item.outcome === "failure" ? "failure" : item.outcome === "success" ? "success" : "warning",
+            "This is the outcome stored by the service for this owner action.",
+          ),
+          summary: `${action.label} recorded a ${humanizeToken(item.outcome).toLowerCase()} outcome.`,
+        };
+  const fields = [
+    {
+      key: "storedAction",
+      label: "Stored action",
+      hint: "The exact machine-readable action name retained in the audit record.",
+      value: text(item.action),
+    },
+    {
+      key: "storedOutcome",
+      label: "Stored outcome",
+      hint: "The exact machine-readable outcome retained in the audit record.",
+      value: text(item.outcome),
+    },
+    ...flattenAuditDetails(item.details),
+  ];
+  return { action, fields, ...presentation };
+}
+
+function auditDetailsNode(fields) {
+  const details = document.createElement("details");
+  details.className = "admin-audit-details";
+  const summary = document.createElement("summary");
+  summary.textContent = `Technical fields (${fields.length})`;
+  const values = document.createElement("dl");
+  values.className = "admin-audit-fields";
+  for (const field of fields) {
+    const name = document.createElement("dt");
+    const label = field.label ?? auditFieldLabel(field.key);
+    name.append(labelWithInfo(label, field.hint ?? auditFieldHint(field.key)));
+    const value = document.createElement("dd");
+    value.textContent = field.value;
+    values.append(name, value);
+  }
+  details.append(summary, values);
+  return details;
+}
+
+function auditRow(item) {
+  const presentation = auditPresentation(item);
+  const row = document.createElement("tr");
+
+  const action = document.createElement("td");
+  action.className = "admin-audit-action";
+  action.setAttribute("data-label", "Action");
+  action.append(labelWithInfo(
+    presentation.action.label,
+    presentation.action.explanation,
+  ));
+
+  const result = document.createElement("td");
+  result.className = "admin-audit-result";
+  result.setAttribute("data-label", "Result");
+  const resultContent = document.createElement("span");
+  resultContent.className = "admin-audit-result-content";
+  const badge = document.createElement("span");
+  badge.className = `admin-audit-badge admin-audit-badge-${presentation.result.tone}`;
+  badge.textContent = presentation.result.label;
+  resultContent.append(
+    badge,
+    infoHint(presentation.result.label, presentation.result.explanation),
+  );
+  result.append(resultContent);
+
+  const happened = document.createElement("td");
+  happened.setAttribute("data-label", "What happened");
+  const summary = document.createElement("p");
+  summary.className = "admin-audit-summary";
+  summary.textContent = presentation.summary;
+  happened.append(summary, auditDetailsNode(presentation.fields));
+
+  const timestamp = document.createElement("td");
+  timestamp.setAttribute("data-label", "Time");
+  const time = document.createElement("time");
+  time.className = "admin-audit-time";
+  if (item.createdAt) time.setAttribute("datetime", item.createdAt);
+  time.textContent = formatTime(item.createdAt);
+  timestamp.append(time);
+
+  row.append(action, result, happened, timestamp);
+  return row;
 }
 
 function tableRow(values) {
@@ -61,8 +581,7 @@ function renderMetricCards(selector, metrics) {
   $(selector).replaceChildren(...metrics.map(([label, value, detail]) => {
     const card = document.createElement("div");
     card.className = "admin-card admin-metric";
-    const name = document.createElement("span");
-    name.textContent = label;
+    const name = labelWithInfo(label);
     const number = document.createElement("strong");
     number.textContent = text(value);
     const caption = document.createElement("small");
@@ -437,8 +956,9 @@ function renderControls(controls) {
 
 function statusLine(label, value) {
   const line = document.createElement("p");
+  line.className = "admin-status-line";
   const name = document.createElement("strong");
-  name.textContent = `${label}: `;
+  name.append(labelWithInfo(label), document.createTextNode(": "));
   line.append(name, document.createTextNode(value));
   return line;
 }
@@ -521,12 +1041,8 @@ function renderOperational(overview) {
 }
 
 function renderAudit(rows) {
-  $("#audit-rows").replaceChildren(...rows.map((item) => tableRow([
-    item.action,
-    item.outcome,
-    JSON.stringify(item.details),
-    formatTime(item.createdAt),
-  ])));
+  $("#audit-rows").replaceChildren(...rows.map(auditRow));
+  $("#audit-empty").hidden = rows.length !== 0;
 }
 
 function render(overview) {
