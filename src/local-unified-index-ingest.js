@@ -70,8 +70,12 @@ function loadCursors(database) {
            sc.carry_tier_observed_at_ms, sc.carry_total_input,
            sc.carry_total_cached, sc.carry_total_cache_write,
            sc.carry_total_output, sc.carry_total_reasoning,
-           sc.carry_total_total, pv.parser_version AS parser_version
+           sc.carry_total_total, cs.compacted_at_ms,
+           cs.source_offset AS compaction_source_offset,
+           cs.turn_context_pending,
+           pv.parser_version AS parser_version
     FROM source_cursor sc
+    LEFT JOIN source_boundary_state cs ON cs.source_local = sc.source_local
     LEFT JOIN ingest_run ir ON ir.id = sc.ingest_run_id
     LEFT JOIN parser_version pv ON pv.id = ir.parser_version_id`).all();
   for (const row of rows) {
@@ -106,6 +110,23 @@ function carriedTier(cursor) {
   };
 }
 
+function carriedCompaction(cursor) {
+  if (cursor.compacted_at_ms === null || cursor.compaction_source_offset === null) {
+    return null;
+  }
+  const observedAtMs = Number(cursor.compacted_at_ms);
+  const sourceOffset = Number(cursor.compaction_source_offset);
+  if (!Number.isSafeInteger(observedAtMs) || observedAtMs < 0
+      || !Number.isSafeInteger(sourceOffset) || sourceOffset < 0) {
+    return null;
+  }
+  return { observedAtMs, sourceOffset };
+}
+
+function carriedTurnContextPending(cursor) {
+  return Number(cursor.turn_context_pending ?? 0) === 1;
+}
+
 /**
  * Decide what this pass has to do for one source.
  *
@@ -134,7 +155,7 @@ export function classifySource(info, cursor, expectedParserVersion = null) {
     return mtimeMs === cursorMtime ? { mode: "skip" } : { mode: "touch" };
   }
   if (size > cursorSize) return { mode: "resume" };
-  return { mode: "rescan" };
+  return { mode: "rescan", reason: "shrink" };
 }
 
 /**
@@ -200,6 +221,14 @@ export async function ingestLocalUnifiedIndexIncrement({
       accountScopeId,
       onCounts: null,
     });
+    const countSourceBoundaries = database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM usage_event_boundary boundary
+      JOIN usage_event event
+        ON event.event_key = boundary.current_event_key
+      WHERE event.source_id = ?`);
+    const deleteSourceUsage = database.prepare(`
+      DELETE FROM usage_event WHERE source_id = ?`);
 
     const diagnostics = {
       sources: infos.length,
@@ -209,12 +238,16 @@ export async function ingestLocalUnifiedIndexIncrement({
       sourcesRescanned: 0,
       sourcesReparsedForParserVersion: 0,
       usageRowsDeletedForReparse: 0,
+      boundaryRowsDeletedForReparse: 0,
+      usageRowsDeletedForSourceRescan: 0,
+      boundaryRowsDeletedForSourceRescan: 0,
       sourcesScanned: 0,
       bytesScanned: 0,
       relevantLines: 0,
       malformedLines: 0,
       partialLines: 0,
       salvagedRecords: 0,
+      compactionEvents: 0,
       oversizedLines: 0,
       forkReplayEventsSkipped: 0,
       unattributedForkReplayEventsSkipped: 0,
@@ -257,6 +290,9 @@ export async function ingestLocalUnifiedIndexIncrement({
       const deleteSessionUsage = database.prepare(
         "DELETE FROM usage_event WHERE session_local = ?",
       );
+      const deleteSessionBoundaries = database.prepare(
+        "DELETE FROM usage_event_boundary WHERE session_local = ?",
+      );
       const healedSessions = new Set();
       for (const info of infos) {
         const cursor = cursors.get(
@@ -273,6 +309,8 @@ export async function ingestLocalUnifiedIndexIncrement({
         const sessionHex = sessionKey.toString("hex");
         if (healedSessions.has(sessionHex)) continue;
         healedSessions.add(sessionHex);
+        diagnostics.boundaryRowsDeletedForReparse +=
+          Number(deleteSessionBoundaries.run(sessionKey).changes ?? 0);
         diagnostics.usageRowsDeletedForReparse +=
           Number(deleteSessionUsage.run(sessionKey).changes ?? 0);
       }
@@ -410,8 +448,11 @@ export async function ingestLocalUnifiedIndexIncrement({
             continue;
           }
           const sessionId = info.lineage?.sessionId ?? info.rolloutKey;
+          const sourceKey = sourceLocal(deviceSalt, info.rolloutKey);
           const state = {
             sessionLocal: localForSession(sessionId),
+            sourceLocal: sourceKey,
+            sourceId: writer.internSource(sourceKey),
             surface: surfaceRow(info.lineage?.surfaceClassification),
           };
           if (mode === "touch") {
@@ -425,10 +466,27 @@ export async function ingestLocalUnifiedIndexIncrement({
                 ? null
                 : Number(cursor.carry_tier_observed_at_ms),
               finalTotals: carriedTotals(cursor),
+              finalCompactionPending: carriedCompaction(cursor),
+              finalTurnContextPending: carriedTurnContextPending(cursor),
               turnContextSeen: Number(cursor.turn_context_seen) === 1,
               snapshotsPersisted: Number(cursor.snapshots_persisted) === 1,
             });
             continue;
+          }
+          // A same-parser shrink means bytes previously indexed from this
+          // exact source no longer exist. Deterministic re-insertion replaces
+          // rows that remain, but it cannot collide with (and therefore
+          // remove) a truncated tail. Delete only rows owned by this interned
+          // salted source before the whole-file rescan; boundary links cascade
+          // from usage_event. Parser-version healing is session-wide
+          // above and therefore does not enter this branch.
+          if (plan.reason === "shrink") {
+            diagnostics.boundaryRowsDeletedForSourceRescan += Number(
+              countSourceBoundaries.get(state.sourceId)?.count ?? 0,
+            );
+            diagnostics.usageRowsDeletedForSourceRescan += Number(
+              deleteSourceUsage.run(state.sourceId).changes ?? 0,
+            );
           }
           const resuming = mode === "resume";
           const seed = resuming
@@ -478,11 +536,15 @@ export async function ingestLocalUnifiedIndexIncrement({
               ? carriedTier(cursor) ?? lineageSeedTier(info)
               : lineageSeedTier(info),
             seedTotals: resuming ? carriedTotals(cursor) : null,
+            seedCompactionPending: resuming ? carriedCompaction(cursor) : null,
+            seedTurnContextPending: resuming
+              && carriedTurnContextPending(cursor),
             seedTurnContextSeen: resuming
               && Number(cursor.turn_context_seen) === 1,
             ...(maximumLineBytes === undefined ? {} : { maximumLineBytes }),
             signal,
             onEvent: (event) => sink.write(state, event),
+            onBoundary: (event) => sink.writeBoundary(state, event),
           });
           if (info.lineage?.sessionId) {
             finalBySessionId.set(info.lineage.sessionId, {
@@ -502,6 +564,8 @@ export async function ingestLocalUnifiedIndexIncrement({
             finalTierRaw: ownObservedTier(outcome.finalTier)?.providerTierRaw ?? null,
             finalTierObservedAtMs: ownObservedTier(outcome.finalTier)?.observedAtMs ?? null,
             finalTotals: outcome.finalTotals,
+            finalCompactionPending: outcome.finalCompactionPending,
+            finalTurnContextPending: outcome.finalTurnContextPending,
             turnContextSeen: outcome.finalTurnContextSeen,
             // A whole-file scan makes the collected set durable; a resumed
             // tail keeps whatever durability the earlier scan established.
@@ -517,6 +581,7 @@ export async function ingestLocalUnifiedIndexIncrement({
           diagnostics.malformedLines += outcome.diagnostics.malformedLines;
           diagnostics.partialLines += outcome.diagnostics.partialLines;
           diagnostics.salvagedRecords += outcome.diagnostics.salvagedRecords;
+          diagnostics.compactionEvents += outcome.diagnostics.compactionEvents;
           diagnostics.oversizedLines += outcome.read.oversizedLines;
           diagnostics.forkReplayEventsSkipped
             += outcome.diagnostics.forkReplayEventsSkipped;
@@ -543,6 +608,9 @@ export async function ingestLocalUnifiedIndexIncrement({
     const totalUsageEvents = Number(
       database.prepare("SELECT COUNT(*) AS events FROM usage_event").get().events,
     );
+    const totalBoundaryLinks = Number(
+      database.prepare("SELECT COUNT(*) AS events FROM usage_event_boundary").get().events,
+    );
     const sourceBytes = infos.reduce(
       (total, info) => total + Number(info.size ?? 0),
       0,
@@ -550,6 +618,7 @@ export async function ingestLocalUnifiedIndexIncrement({
     writer.writeMeta("source_count", infos.length);
     writer.writeMeta("source_bytes", sourceBytes);
     writer.writeMeta("usage_events", totalUsageEvents);
+    writer.writeMeta("boundary_links", totalBoundaryLinks);
     writer.writeMeta("generated_at", new Date().toISOString());
     writer.writeMeta("contract_version", contractVersion);
     writer.writeMeta("status", signal?.aborted ? "partial" : "complete");
@@ -567,7 +636,9 @@ export async function ingestLocalUnifiedIndexIncrement({
       // rows it already holds and those land in `ON CONFLICT DO NOTHING`.
       // This is the number of rows this pass actually added.
       insertedUsageEvents: closed.usageRows,
+      insertedBoundaryLinks: closed.boundaryRows,
       totalUsageEvents,
+      totalBoundaryLinks,
       batches: closed.batches,
       discoveryWallMs: discoveredAt - startedAt,
       scanWallMs: scannedAt - discoveredAt,

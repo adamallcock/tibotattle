@@ -2013,6 +2013,7 @@ const LOCAL_COMPONENT_KEYS = Object.freeze([
 ]);
 const LOCAL_MODELS = new Set([
   "gpt-5.6-sol",
+  "gpt-5.6-sol-wm",
   "gpt-5.6-terra",
   "gpt-5.6-luna",
   "gpt-5.5",
@@ -2035,14 +2036,115 @@ const LOCAL_MODEL_PRICING_STATUSES = new Set([
   "unrecognized"
 ]);
 const LOCAL_MODEL_ALLOWANCE_TRACKS = new Set(["primary", "spark"]);
+const LOCAL_REASONING_EFFORTS = new Set([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+  "unknown"
+]);
+const CACHE_SWITCH_CHANGE_TYPES = Object.freeze([
+  "reasoning_only",
+  "model_only",
+  "model_and_reasoning"
+]);
+const CACHE_SWITCH_CHANGE_TYPE_SET = new Set(CACHE_SWITCH_CHANGE_TYPES);
+const CACHE_SWITCH_PERIOD_IDS = new Set(["24h", "7d", "30d", "all", "history"]);
+const CACHE_SWITCH_RECENT_LIMIT = 20;
+const CACHE_SWITCH_PROXIMITY_CEILING_SECONDS = 300;
+const CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO = 0.5;
+const CACHE_CONTINUITY_MINIMUM_GAP_SECONDS = 0;
+const CACHE_CONTINUITY_GAP_BANDS = Object.freeze({
+  under_one_minute: [0, 60],
+  one_to_five_minutes: [60, 300],
+  five_to_thirty_minutes: [300, 1_800],
+  thirty_minutes_to_one_hour: [1_800, 3_600],
+  one_to_six_hours: [3_600, 21_600],
+  six_to_twenty_four_hours: [21_600, 86_400],
+  over_twenty_four_hours: [86_400, Number.POSITIVE_INFINITY]
+});
+const CACHE_CONTINUITY_GAP_BAND_IDS = Object.freeze(
+  Object.keys(CACHE_CONTINUITY_GAP_BANDS)
+);
+const SIDE_CHAT_ESTIMATE_SCHEMA_VERSION =
+  "development-side-chat-estimate-v0.4";
+const SIDE_CHAT_ESTIMATE_PARSER_VERSION =
+  "desktop-fork-logs2-active-context-v0.3";
+const SIDE_CHAT_HISTORICAL_GAP_SCHEMA_VERSION =
+  "development-side-chat-historical-gap-v0.2";
+const SIDE_CHAT_RECENT_LIMIT = 500;
+const SIDE_CHAT_PERIOD_IDS = new Set(["24h", "7d", "30d", "all"]);
+const SIDE_CHAT_CACHE_ASSUMPTIONS = new Set([
+  "warm_prefix",
+  "cold_after_compaction",
+  "retention_unknown"
+]);
+const SIDE_CHAT_PRICING_BASES = new Set([
+  "reviewed_model_card",
+  "reviewed_alias_assumption",
+  "unavailable"
+]);
+const SIDE_CHAT_CONDITIONAL_ALIAS_MODELS = new Set([
+  "codex-auto-review",
+  "gpt-5.5-codex",
+  "gpt-5.6-sol-wm"
+]);
+const SIDE_CHAT_CALIBRATION_STATUSES = new Set([
+  "eligible_active_retention",
+  "withheld_no_retained_calls",
+  "withheld_unpriced_calls",
+  "withheld_parser_gaps",
+  "withheld_cohort_mismatch",
+  "withheld_context_mismatch",
+  "withheld_stale_calibration",
+  "withheld_unavailable"
+]);
+const SIDE_CHAT_ASSUMPTIONS = Object.freeze({
+  activeToProviderTotal: Object.freeze({
+    lowerCost: 1.1137,
+    point: 1.0172,
+    upperCost: 1.0007
+  }),
+  outputToInput: Object.freeze({
+    lowerCost: 0.00071,
+    point: 0.0024,
+    upperCost: 0.00953
+  }),
+  ordinaryCacheReadShare: Object.freeze({
+    lowerCost: 0.9954,
+    point: 0.9857,
+    upperCost: 0
+  }),
+  postCompactionCacheReadShare: Object.freeze({
+    lowerCost: 0,
+    point: 0,
+    upperCost: 0
+  }),
+  uncachedRemainderCacheWriteShare: Object.freeze({
+    lowerCost: 0,
+    point: 0,
+    upperCost: 1
+  }),
+  warmEligibilitySeconds: Object.freeze({
+    gpt56: 1800,
+    other: 300
+  })
+});
+const CACHE_SWITCH_SAFE_CODE = /^[a-z][a-z0-9_]{0,63}$/u;
+const CACHE_SWITCH_ALLOWANCE_INTERPRETATION =
+  "conditional_historical_estimate_not_provider_allowance";
 const MONITORING_GAP_COPY = Object.freeze({
   quota_snapshots: ["Quota snapshots", "Current provider quota windows and their freshness."],
   account_attribution: ["Account attribution", "Whether quota and usage can be tied safely to one pseudonymous local account scope."],
-  fast_mode: ["Fast-mode accounting", "Codex records the speed mode only when it is applied or changed, never at session start, so turns before the first change in a session carry no recorded tier. An observed tier always wins; the rest is attributed from your stated mode, then a secondary window-level inference, and anything left stays explicitly unknown."],
+  fast_mode: ["Fast-mode accounting", "Codex records the speed mode only when it is applied or changed, never at session start, so turns before the first change in a session carry no recorded tier. An observed tier always wins; a timestamp-covered config declaration comes next, then your stated mode. Window-level inference is diagnostic only and never changes the money. Only an explicit mixed/unknown choice can leave the remainder unknown."],
   subagents: ["Subagents and child rollouts", "Lineage-aware accounting excludes inherited parent snapshots before attributing genuine child-rollout increments; ambiguous lineage remains unknown."],
   shared_pool_surfaces: ["Work, Workspace Agents, Excel and connected Voice", "These shared-pool surfaces may not write complete local Codex evidence."],
   third_party_auth: ["Third-party ChatGPT-authenticated apps", "No complete local accounting source is available for third-party authenticated apps."],
-  reasoning_effort: ["Reasoning effort", "Current retained usage snapshots do not expose a reasoning-effort field."],
+  reasoning_effort: ["Reasoning effort", "The unified index can identify known reasoning changes for the switch diagnostic, but ordinary usage accounting does not yet provide a complete per-request reasoning-effort breakdown."],
   api_service_tier: ["API service tier", "Subscription speed is separate; API standard, priority and flex are never inferred from it."],
   provider_accounting_changes: ["Provider resets and accounting changes", "Reset propagation, credits, account tracks, and provider-side rule changes can move the observed allowance without a matching local usage increment."],
   unknown_token_components: ["Combined output components", "Some older snapshots expose only one combined output count. It is retained once and never added to separated text and reasoning output."],
@@ -2065,6 +2167,749 @@ function normalizeLocalComponentCosts(value) {
       costUsd: nonNegative(row.costUsd, 0)
     }];
   }));
+}
+
+function unavailableAllowanceImpact(reason = null) {
+  return {
+    status: "unavailable",
+    reason: typeof reason === "string" && CACHE_SWITCH_SAFE_CODE.test(reason)
+      ? reason
+      : null,
+    basisFamilyId: null,
+    selectedScenario: null,
+    medianPercentagePoints: null,
+    percentagePointRange: null,
+    plausibleRangePercentagePoints: null,
+    scenarios: {
+      unresolved_as_standard: null,
+      unresolved_as_fast: null
+    },
+    interpretation: CACHE_SWITCH_ALLOWANCE_INTERPRETATION
+  };
+}
+
+function normalizeCacheAllowanceScenario(value, scenario) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.basisId !== allowanceBasisId(scenario)) return null;
+  const premium = nonNegative(value.quotaWeightedPremiumUsd, null);
+  const capacity = nonNegative(value.medianCapacityUsd, null);
+  const median = nonNegative(value.medianPercentagePoints, null);
+  const lower = nonNegative(value?.plausibleRangePercentagePoints?.lower, null);
+  const upper = nonNegative(value?.plausibleRangePercentagePoints?.upper, null);
+  if (premium === null || capacity === null || capacity <= 0 || median === null
+      || lower === null || upper === null || lower > median || median > upper
+      || Math.abs(median - (100 * premium) / capacity) > 0.000002) return null;
+  return {
+    basisId: allowanceBasisId(scenario),
+    quotaWeightedPremiumUsd: premium,
+    medianCapacityUsd: capacity,
+    medianPercentagePoints: median,
+    plausibleRangePercentagePoints: { lower, upper }
+  };
+}
+
+function normalizeCacheSwitchAllowanceImpact(value) {
+  if (value?.status === "unavailable") {
+    return unavailableAllowanceImpact(value?.reason);
+  }
+  if (!new Set(["complete", "range"]).has(value?.status)
+      || value?.basisFamilyId !== ALLOWANCE_BASIS_FAMILY_ID
+      || value?.interpretation !== CACHE_SWITCH_ALLOWANCE_INTERPRETATION
+      || value?.reason !== null) return unavailableAllowanceImpact();
+  const scenarios = Object.fromEntries(ALLOWANCE_SCENARIOS.map((scenario) => [
+    scenario,
+    value.scenarios?.[scenario] === null
+      ? null
+      : normalizeCacheAllowanceScenario(value.scenarios?.[scenario], scenario)
+  ]));
+  const selectedScenario = ALLOWANCE_SCENARIOS.includes(value.selectedScenario)
+    ? value.selectedScenario
+    : null;
+  const median = value.medianPercentagePoints === null
+    ? null
+    : nonNegative(value.medianPercentagePoints, null);
+  const plausibleLower = nonNegative(
+    value?.plausibleRangePercentagePoints?.lower,
+    null
+  );
+  const plausibleUpper = nonNegative(
+    value?.plausibleRangePercentagePoints?.upper,
+    null
+  );
+  if (plausibleLower === null || plausibleUpper === null
+      || plausibleLower > plausibleUpper) return unavailableAllowanceImpact();
+  if (value.status === "complete") {
+    const selected = scenarios[selectedScenario];
+    if (selectedScenario === null || selected === null || median === null
+        || Math.abs(selected.medianPercentagePoints - median) > 0.000002
+        || value.percentagePointRange !== null) {
+      return unavailableAllowanceImpact();
+    }
+    return {
+      status: "complete",
+      reason: null,
+      basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
+      selectedScenario,
+      medianPercentagePoints: median,
+      percentagePointRange: null,
+      plausibleRangePercentagePoints: {
+        lower: plausibleLower,
+        upper: plausibleUpper
+      },
+      scenarios,
+      interpretation: CACHE_SWITCH_ALLOWANCE_INTERPRETATION
+    };
+  }
+  const rangeLower = nonNegative(value?.percentagePointRange?.lower, null);
+  const rangeUpper = nonNegative(value?.percentagePointRange?.upper, null);
+  if (selectedScenario !== null || median !== null
+      || Object.values(scenarios).includes(null)
+      || rangeLower === null || rangeUpper === null || rangeLower > rangeUpper) {
+    return unavailableAllowanceImpact();
+  }
+  const medians = ALLOWANCE_SCENARIOS.map(
+    (scenario) => scenarios[scenario].medianPercentagePoints
+  );
+  if (Math.abs(rangeLower - Math.min(...medians)) > 0.000002
+      || Math.abs(rangeUpper - Math.max(...medians)) > 0.000002) {
+    return unavailableAllowanceImpact();
+  }
+  return {
+    status: "range",
+    reason: null,
+    basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
+    selectedScenario: null,
+    medianPercentagePoints: null,
+    percentagePointRange: { lower: rangeLower, upper: rangeUpper },
+    plausibleRangePercentagePoints: {
+      lower: plausibleLower,
+      upper: plausibleUpper
+    },
+    scenarios,
+    interpretation: CACHE_SWITCH_ALLOWANCE_INTERPRETATION
+  };
+}
+
+function normalizeCachePremiumScenario(value, scenario, pricedDrops) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.basisId !== allowanceBasisId(scenario)
+      || value.basisFamilyId !== ALLOWANCE_BASIS_FAMILY_ID) return null;
+  const premium = nonNegative(value.quotaWeightedPremiumUsd, null);
+  const fields = [
+    "pricedDrops",
+    "observedSpeedDrops",
+    "declaredSpeedDrops",
+    "assumedSpeedDrops",
+    "unknownSpeedDrops"
+  ];
+  const counts = Object.fromEntries(fields.map((field) => [
+    field,
+    count(value[field], null)
+  ]));
+  if (premium === null || Object.values(counts).includes(null)
+      || counts.pricedDrops !== pricedDrops
+      || counts.observedSpeedDrops + counts.declaredSpeedDrops
+        + counts.assumedSpeedDrops + counts.unknownSpeedDrops !== pricedDrops) {
+    return null;
+  }
+  return {
+    basisId: allowanceBasisId(scenario),
+    quotaWeightedPremiumUsd: premium,
+    ...counts
+  };
+}
+
+function normalizeCachePremiumWeighting(value, pricedDrops, standardPremium) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || !["complete", "range", "unavailable"].includes(value.status)
+      || value.basisFamilyId !== ALLOWANCE_BASIS_FAMILY_ID) return null;
+  const scenarios = Object.fromEntries(ALLOWANCE_SCENARIOS.map((scenario) => [
+    scenario,
+    value.scenarios?.[scenario] === null
+      ? null
+      : normalizeCachePremiumScenario(
+        value.scenarios?.[scenario],
+        scenario,
+        pricedDrops
+      )
+  ]));
+  const selectedScenario = ALLOWANCE_SCENARIOS.includes(value.selectedScenario)
+    ? value.selectedScenario
+    : null;
+  const selectedPremiumUsd = nonNegative(value.selectedPremiumUsd, null);
+  if (value.status === "complete") {
+    const selected = scenarios[selectedScenario];
+    if (selectedScenario === null || selected === null
+        || selectedPremiumUsd === null
+        || Math.abs(selectedPremiumUsd - selected.quotaWeightedPremiumUsd)
+          > 0.000002
+        || value.rangePremiumUsd !== null) return null;
+  } else if (value.status === "range") {
+    const lower = nonNegative(value?.rangePremiumUsd?.lower, null);
+    const upper = nonNegative(value?.rangePremiumUsd?.upper, null);
+    const premiums = ALLOWANCE_SCENARIOS.map(
+      (scenario) => scenarios[scenario]?.quotaWeightedPremiumUsd ?? null
+    );
+    if (selectedScenario !== null || selectedPremiumUsd !== null
+        || premiums.includes(null) || lower === null || upper === null
+        || Math.abs(lower - Math.min(...premiums)) > 0.000002
+        || Math.abs(upper - Math.max(...premiums)) > 0.000002) return null;
+  } else if (selectedScenario !== null || selectedPremiumUsd !== null
+      || value.rangePremiumUsd !== null
+      || typeof value.reasonCode !== "string"
+      || !CACHE_SWITCH_SAFE_CODE.test(value.reasonCode)) return null;
+  if (standardPremium !== null) {
+    for (const scenario of ALLOWANCE_SCENARIOS) {
+      const premium = scenarios[scenario]?.quotaWeightedPremiumUsd;
+      if (premium !== null && premium !== undefined
+          && (premium + 0.000002 < standardPremium
+            || premium > standardPremium * 2.5 + 0.000002)) return null;
+    }
+  }
+  return {
+    status: value.status,
+    reasonCode: value.status === "unavailable" ? value.reasonCode : null,
+    basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
+    selectedScenario,
+    selectedPremiumUsd,
+    scenarios,
+    rangePremiumUsd: value.status === "range"
+      ? {
+        lower: value.rangePremiumUsd.lower,
+        upper: value.rangePremiumUsd.upper
+      }
+      : null
+  };
+}
+
+function normalizeCacheSwitchBreakdown(value, includeOrderingCoverage = false) {
+  const configurationChanges = count(value?.configurationChanges, null);
+  const proximateConfigurationChanges = count(
+    value?.proximateConfigurationChanges,
+    null
+  );
+  const cacheReadDrops = count(value?.cacheReadDrops, null);
+  const uncoveredConfigurationChanges = count(
+    value?.uncoveredConfigurationChanges,
+    null
+  );
+  const orderingCoverageGaps = includeOrderingCoverage
+    ? count(value?.orderingCoverageGaps, 0)
+    : 0;
+  const coverageStatus = value?.coverageStatus;
+  const lostCacheTokens = count(value?.lostCacheTokens, null);
+  const pricedDrops = count(value?.pricedDrops, null);
+  const unpricedDrops = count(value?.unpricedDrops, null);
+  const premium = value?.estimatedPremiumUsd === null
+    ? null
+    : nonNegative(value?.estimatedPremiumUsd, null);
+  if (configurationChanges === null
+      || proximateConfigurationChanges === null
+      || cacheReadDrops === null
+      || uncoveredConfigurationChanges === null
+      || orderingCoverageGaps === null
+      || lostCacheTokens === null
+      || pricedDrops === null
+      || unpricedDrops === null
+      || proximateConfigurationChanges > configurationChanges
+      || uncoveredConfigurationChanges > configurationChanges
+      || !new Set(["complete", "incomplete"]).has(coverageStatus)
+      || (coverageStatus === "complete"
+        && uncoveredConfigurationChanges + orderingCoverageGaps !== 0)
+      || (coverageStatus === "incomplete"
+        && uncoveredConfigurationChanges + orderingCoverageGaps === 0)
+      || cacheReadDrops > proximateConfigurationChanges
+      || pricedDrops + unpricedDrops !== cacheReadDrops
+      || (cacheReadDrops === 0 && lostCacheTokens !== 0)
+      || (cacheReadDrops > 0 && lostCacheTokens === 0)
+      || (cacheReadDrops === 0 && premium !== 0 && premium !== null)
+      // One unpriced drop makes the aggregate premium incomplete, so the
+      // companion withholds the entire money sum instead of presenting the
+      // priced subset as the answer.
+      || ((unpricedDrops > 0 || coverageStatus === "incomplete")
+        && premium !== null)
+      || (unpricedDrops === 0 && coverageStatus === "complete"
+        && premium === null)) {
+    return null;
+  }
+  return {
+    configurationChanges,
+    proximateConfigurationChanges,
+    uncoveredConfigurationChanges,
+    ...(includeOrderingCoverage ? { orderingCoverageGaps } : {}),
+    coverageStatus,
+    cacheReadDrops,
+    lostCacheTokens,
+    estimatedPremiumUsd: premium,
+    pricedDrops,
+    unpricedDrops
+  };
+}
+
+function normalizeCacheSwitchState(value) {
+  const model = LOCAL_MODELS.has(value?.model) ? value.model : "unknown";
+  const reasoningEffort = LOCAL_REASONING_EFFORTS.has(value?.reasoningEffort)
+    ? value.reasoningEffort
+    : "unknown";
+  return { model, reasoningEffort };
+}
+
+function effectiveCacheSwitchEffort(value) {
+  return value === "ultra" ? "max" : value;
+}
+
+function normalizeCacheSwitchRecent(rows, maximumRows) {
+  return array(rows)
+    // Bound work before parsing and sorting as well as bounding the output.
+    .slice(0, CACHE_SWITCH_RECENT_LIMIT * 2)
+    .flatMap((row) => {
+      const observedAt = canonicalInstant(row?.observedAt);
+      const changeType = CACHE_SWITCH_CHANGE_TYPE_SET.has(row?.changeType)
+        ? row.changeType
+        : null;
+      const previous = normalizeCacheSwitchState(row?.previous);
+      const current = normalizeCacheSwitchState(row?.current);
+      const previousCacheReadTokens = count(row?.previousCacheReadTokens, null);
+      const currentCacheReadTokens = count(row?.currentCacheReadTokens, null);
+      const lostCacheTokens = count(row?.lostCacheTokens, null);
+      const gapSeconds = nonNegative(row?.gapSeconds, null);
+      const premium = row?.estimatedPremiumUsd === null
+        ? null
+        : nonNegative(row?.estimatedPremiumUsd, null);
+      const modelChanged = previous.model !== "unknown"
+        && current.model !== "unknown"
+        && previous.model !== current.model;
+      const reasoningChanged = previous.reasoningEffort !== "unknown"
+        && current.reasoningEffort !== "unknown"
+        && effectiveCacheSwitchEffort(previous.reasoningEffort)
+          !== effectiveCacheSwitchEffort(current.reasoningEffort);
+      const changeMatches = changeType === "model_only"
+        ? modelChanged && !reasoningChanged
+        : changeType === "reasoning_only"
+          ? !modelChanged && reasoningChanged
+          : modelChanged && reasoningChanged;
+      if (observedAt === null
+          || !changeMatches
+          || previousCacheReadTokens === null
+          || currentCacheReadTokens === null
+          || lostCacheTokens === null
+          || gapSeconds === null
+          || gapSeconds > CACHE_SWITCH_PROXIMITY_CEILING_SECONDS
+          || previousCacheReadTokens <= currentCacheReadTokens
+          || currentCacheReadTokens
+            > previousCacheReadTokens * CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO
+          || lostCacheTokens <= 0
+          || lostCacheTokens > previousCacheReadTokens - currentCacheReadTokens) {
+        return [];
+      }
+      // This explicit projection is also the browser privacy boundary. Any
+      // session, event, path, or rollout fields on a hostile row are dropped.
+      return [{
+        observedAt,
+        changeType,
+        previous,
+        current,
+        previousCacheReadTokens,
+        currentCacheReadTokens,
+        lostCacheTokens,
+        estimatedPremiumUsd: premium
+      }];
+    })
+    .sort((left, right) => Date.parse(right.observedAt) - Date.parse(left.observedAt))
+    .slice(0, Math.min(CACHE_SWITCH_RECENT_LIMIT, maximumRows));
+}
+
+function normalizeCacheSwitchSummary(value) {
+  const totals = normalizeCacheSwitchBreakdown(value, true);
+  if (totals === null) return null;
+  const allowanceWeighting = normalizeCachePremiumWeighting(
+    value?.allowanceWeighting,
+    totals.pricedDrops,
+    totals.estimatedPremiumUsd
+  );
+  if (allowanceWeighting === null) return null;
+  const breakdownRows = CACHE_SWITCH_CHANGE_TYPES.map((key) => (
+    [key, normalizeCacheSwitchBreakdown(value?.byChangeType?.[key])]
+  ));
+  if (breakdownRows.some(([, row]) => row === null)) return null;
+  const byChangeType = Object.fromEntries(breakdownRows);
+  for (const field of [
+    "configurationChanges",
+    "proximateConfigurationChanges",
+    "uncoveredConfigurationChanges",
+    "cacheReadDrops",
+    "lostCacheTokens",
+    "pricedDrops",
+    "unpricedDrops"
+  ]) {
+    if (CACHE_SWITCH_CHANGE_TYPES.reduce(
+      (sum, key) => sum + byChangeType[key][field],
+      0
+    ) !== totals[field]) return null;
+  }
+  if (totals.estimatedPremiumUsd !== null) {
+    const premiumSum = CACHE_SWITCH_CHANGE_TYPES.reduce(
+      (sum, key) => sum + byChangeType[key].estimatedPremiumUsd,
+      0
+    );
+    if (Math.abs(premiumSum - totals.estimatedPremiumUsd) > 1e-9) return null;
+  }
+  return {
+    ...totals,
+    standardApiPremiumUsd: totals.estimatedPremiumUsd,
+    allowanceWeighting,
+    byChangeType,
+    recent: normalizeCacheSwitchRecent(value?.recent, totals.cacheReadDrops),
+    allowanceImpact: normalizeCacheSwitchAllowanceImpact(value?.allowanceImpact)
+  };
+}
+
+function unavailableCacheSwitchImpact(errorCode = null) {
+  return {
+    status: "unavailable",
+    errorCode: typeof errorCode === "string" && CACHE_SWITCH_SAFE_CODE.test(errorCode)
+      ? errorCode
+      : null,
+    periodId: null,
+    periodLabel: "",
+    configurationChanges: 0,
+    proximateConfigurationChanges: 0,
+    uncoveredConfigurationChanges: 0,
+    orderingCoverageGaps: 0,
+    coverageStatus: "incomplete",
+    cacheReadDrops: 0,
+    lostCacheTokens: 0,
+    estimatedPremiumUsd: null,
+    standardApiPremiumUsd: null,
+    allowanceWeighting: null,
+    pricedDrops: 0,
+    unpricedDrops: 0,
+    byChangeType: Object.fromEntries(CACHE_SWITCH_CHANGE_TYPES.map((key) => [key, {
+      configurationChanges: 0,
+      proximateConfigurationChanges: 0,
+      uncoveredConfigurationChanges: 0,
+      coverageStatus: "incomplete",
+      cacheReadDrops: 0,
+      lostCacheTokens: 0,
+      estimatedPremiumUsd: null,
+      pricedDrops: 0,
+      unpricedDrops: 0
+    }])),
+    recent: [],
+    allowanceImpact: unavailableAllowanceImpact(),
+    proximityCeilingSeconds: CACHE_SWITCH_PROXIMITY_CEILING_SECONDS,
+    maximumRetainedCacheRatio: CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
+    recentDetailLimit: CACHE_SWITCH_RECENT_LIMIT,
+    periods: []
+  };
+}
+
+function normalizeCacheSwitchImpact(value) {
+  if (value?.status !== "available") {
+    return unavailableCacheSwitchImpact(value?.errorCode);
+  }
+  if (finite(value.maximumRetainedCacheRatio, null)
+      !== CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO
+      || finite(value.proximityCeilingSeconds, null)
+        !== CACHE_SWITCH_PROXIMITY_CEILING_SECONDS
+      || count(value.recentDetailLimit, null) !== CACHE_SWITCH_RECENT_LIMIT) {
+    return unavailableCacheSwitchImpact("methodology_mismatch");
+  }
+  const periods = array(value.periods)
+    .slice(0, 5)
+    .flatMap((period) => {
+      if (!CACHE_SWITCH_PERIOD_IDS.has(period?.periodId)) return [];
+      const summary = normalizeCacheSwitchSummary(period);
+      return summary === null ? [] : [{
+        status: "available",
+        errorCode: null,
+        periodId: period.periodId,
+        periodLabel: text(period.periodLabel, "Recorded period"),
+        ...summary,
+        allowanceImpact: period.periodId === "7d"
+          ? summary.allowanceImpact
+          : unavailableAllowanceImpact("period_denominator_mismatch"),
+        proximityCeilingSeconds: CACHE_SWITCH_PROXIMITY_CEILING_SECONDS,
+        maximumRetainedCacheRatio: CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
+        recentDetailLimit: CACHE_SWITCH_RECENT_LIMIT,
+        periods: []
+      }];
+    });
+  const selected = normalizeCacheSwitchSummary(value);
+  const periodId = CACHE_SWITCH_PERIOD_IDS.has(value?.periodId)
+    ? value.periodId
+    : null;
+  if (selected === null || periodId === null) {
+    return { ...unavailableCacheSwitchImpact(), periods };
+  }
+  return {
+    status: "available",
+    errorCode: null,
+    periodId,
+    periodLabel: text(value.periodLabel, "Recorded period"),
+    ...selected,
+    allowanceImpact: periodId === "7d"
+      ? selected.allowanceImpact
+      : unavailableAllowanceImpact("period_denominator_mismatch"),
+    proximityCeilingSeconds: CACHE_SWITCH_PROXIMITY_CEILING_SECONDS,
+    maximumRetainedCacheRatio: CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
+    recentDetailLimit: CACHE_SWITCH_RECENT_LIMIT,
+    periods
+  };
+}
+
+function normalizeCacheContinuityBreakdown(value, includeOrderingCoverage = false) {
+  const fields = [
+    "sameConfigurationReturns",
+    "comparableReturns",
+    "compactionConfoundedReturns",
+    "contextContractedReturns",
+    "insufficientEvidenceReturns",
+    "uncoveredReturns",
+    "cacheReadDrops",
+    "lostCacheTokens",
+    "pricedDrops",
+    "unpricedDrops"
+  ];
+  const normalized = Object.fromEntries(fields.map((field) => [
+    field,
+    count(value?.[field], null)
+  ]));
+  if (fields.some((field) => normalized[field] === null)) return null;
+  const orderingCoverageGaps = includeOrderingCoverage
+    ? count(value?.orderingCoverageGaps, 0)
+    : 0;
+  if (orderingCoverageGaps === null) return null;
+  const coverageStatus = value?.coverageStatus;
+  const premium = value?.estimatedPremiumUsd === null
+    ? null
+    : nonNegative(value?.estimatedPremiumUsd, null);
+  const partition = normalized.comparableReturns
+    + normalized.compactionConfoundedReturns
+    + normalized.contextContractedReturns
+    + normalized.insufficientEvidenceReturns
+    + normalized.uncoveredReturns;
+  if (!new Set(["complete", "incomplete"]).has(coverageStatus)
+      || partition !== normalized.sameConfigurationReturns
+      || normalized.cacheReadDrops > normalized.comparableReturns
+      || normalized.pricedDrops + normalized.unpricedDrops
+        !== normalized.cacheReadDrops
+      || (normalized.cacheReadDrops === 0 && normalized.lostCacheTokens !== 0)
+      || (normalized.cacheReadDrops > 0 && normalized.lostCacheTokens === 0)
+      || (coverageStatus === "complete"
+        && normalized.uncoveredReturns + orderingCoverageGaps !== 0)
+      || (coverageStatus === "incomplete"
+        && normalized.uncoveredReturns + orderingCoverageGaps === 0)
+      || (normalized.cacheReadDrops === 0 && premium !== 0 && premium !== null)
+      || ((normalized.unpricedDrops > 0 || coverageStatus === "incomplete")
+        && premium !== null)
+      || (normalized.unpricedDrops === 0 && coverageStatus === "complete"
+        && premium === null)) {
+    return null;
+  }
+  return {
+    ...normalized,
+    ...(includeOrderingCoverage ? { orderingCoverageGaps } : {}),
+    coverageStatus,
+    estimatedPremiumUsd: premium
+  };
+}
+
+function normalizeCacheContinuityRecent(rows, maximumRows) {
+  return array(rows)
+    .slice(0, CACHE_SWITCH_RECENT_LIMIT * 2)
+    .flatMap((row) => {
+      const observedAt = canonicalInstant(row?.observedAt);
+      const gapSeconds = nonNegative(row?.gapSeconds, null);
+      const gapBand = Object.hasOwn(CACHE_CONTINUITY_GAP_BANDS, row?.gapBand)
+        ? row.gapBand
+        : null;
+      const configuration = normalizeCacheSwitchState(row?.configuration);
+      const previousCacheReadTokens = count(row?.previousCacheReadTokens, null);
+      const currentCacheReadTokens = count(row?.currentCacheReadTokens, null);
+      const lostCacheTokens = count(row?.lostCacheTokens, null);
+      const premium = row?.estimatedPremiumUsd === null
+        ? null
+        : nonNegative(row?.estimatedPremiumUsd, null);
+      const bounds = gapBand === null ? null : CACHE_CONTINUITY_GAP_BANDS[gapBand];
+      if (observedAt === null
+          || gapSeconds === null
+          || bounds === null
+          || gapSeconds < bounds[0]
+          || gapSeconds >= bounds[1]
+          || configuration.model === "unknown"
+          || configuration.reasoningEffort === "unknown"
+          || previousCacheReadTokens === null
+          || currentCacheReadTokens === null
+          || lostCacheTokens === null
+          || previousCacheReadTokens <= currentCacheReadTokens
+          || currentCacheReadTokens
+            > previousCacheReadTokens * CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO
+          || lostCacheTokens <= 0
+          || lostCacheTokens > previousCacheReadTokens - currentCacheReadTokens) {
+        return [];
+      }
+      return [{
+        observedAt,
+        gapSeconds,
+        gapBand,
+        configuration,
+        previousCacheReadTokens,
+        currentCacheReadTokens,
+        lostCacheTokens,
+        estimatedPremiumUsd: premium
+      }];
+    })
+    .sort((left, right) => Date.parse(right.observedAt) - Date.parse(left.observedAt))
+    .slice(0, Math.min(CACHE_SWITCH_RECENT_LIMIT, maximumRows));
+}
+
+function normalizeCacheContinuitySummary(value) {
+  const totals = normalizeCacheContinuityBreakdown(value, true);
+  if (totals === null) return null;
+  const allowanceWeighting = normalizeCachePremiumWeighting(
+    value?.allowanceWeighting,
+    totals.pricedDrops,
+    totals.estimatedPremiumUsd
+  );
+  if (allowanceWeighting === null) return null;
+  const byGapBandRows = CACHE_CONTINUITY_GAP_BAND_IDS.map((key) => [
+    key,
+    normalizeCacheContinuityBreakdown(value?.byGapBand?.[key])
+  ]);
+  if (byGapBandRows.some(([, row]) => row === null)) return null;
+  const byGapBand = Object.fromEntries(byGapBandRows);
+  for (const field of [
+    "sameConfigurationReturns",
+    "comparableReturns",
+    "compactionConfoundedReturns",
+    "contextContractedReturns",
+    "insufficientEvidenceReturns",
+    "uncoveredReturns",
+    "cacheReadDrops",
+    "lostCacheTokens",
+    "pricedDrops",
+    "unpricedDrops"
+  ]) {
+    if (CACHE_CONTINUITY_GAP_BAND_IDS.reduce(
+      (sum, key) => sum + byGapBand[key][field],
+      0
+    ) !== totals[field]) return null;
+  }
+  if (totals.estimatedPremiumUsd !== null) {
+    const premiumSum = CACHE_CONTINUITY_GAP_BAND_IDS.reduce(
+      (sum, key) => sum + byGapBand[key].estimatedPremiumUsd,
+      0
+    );
+    if (Math.abs(premiumSum - totals.estimatedPremiumUsd) > 1e-9) return null;
+  }
+  const postCompactionRequests = count(value?.postCompactionRequests, null);
+  const postCompactionCacheReadDrops = count(
+    value?.postCompactionCacheReadDrops,
+    null
+  );
+  if (postCompactionRequests === null
+      || postCompactionCacheReadDrops === null
+      || postCompactionCacheReadDrops > postCompactionRequests) return null;
+  return {
+    ...totals,
+    standardApiPremiumUsd: totals.estimatedPremiumUsd,
+    allowanceWeighting,
+    postCompactionRequests,
+    postCompactionCacheReadDrops,
+    byGapBand,
+    recent: normalizeCacheContinuityRecent(value?.recent, totals.cacheReadDrops),
+    allowanceImpact: normalizeCacheSwitchAllowanceImpact(value?.allowanceImpact)
+  };
+}
+
+function unavailableCacheContinuityImpact(errorCode = null) {
+  return {
+    status: "unavailable",
+    errorCode: typeof errorCode === "string" && CACHE_SWITCH_SAFE_CODE.test(errorCode)
+      ? errorCode
+      : null,
+    periodId: null,
+    periodLabel: "",
+    sameConfigurationReturns: 0,
+    comparableReturns: 0,
+    compactionConfoundedReturns: 0,
+    contextContractedReturns: 0,
+    insufficientEvidenceReturns: 0,
+    uncoveredReturns: 0,
+    orderingCoverageGaps: 0,
+    coverageStatus: "incomplete",
+    cacheReadDrops: 0,
+    lostCacheTokens: 0,
+    estimatedPremiumUsd: null,
+    standardApiPremiumUsd: null,
+    allowanceWeighting: null,
+    pricedDrops: 0,
+    unpricedDrops: 0,
+    postCompactionRequests: 0,
+    postCompactionCacheReadDrops: 0,
+    byGapBand: {},
+    recent: [],
+    allowanceImpact: unavailableAllowanceImpact(),
+    minimumGapSeconds: CACHE_CONTINUITY_MINIMUM_GAP_SECONDS,
+    maximumRetainedCacheRatio: CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
+    recentDetailLimit: CACHE_SWITCH_RECENT_LIMIT,
+    periods: []
+  };
+}
+
+function normalizeCacheContinuityImpact(value) {
+  if (value?.status !== "available") {
+    return unavailableCacheContinuityImpact(value?.errorCode);
+  }
+  if (finite(value.minimumGapSeconds, null)
+      !== CACHE_CONTINUITY_MINIMUM_GAP_SECONDS
+      || finite(value.maximumRetainedCacheRatio, null)
+        !== CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO
+      || count(value.recentDetailLimit, null) !== CACHE_SWITCH_RECENT_LIMIT) {
+    return unavailableCacheContinuityImpact("methodology_mismatch");
+  }
+  const periods = array(value.periods)
+    .slice(0, 5)
+    .flatMap((period) => {
+      if (!CACHE_SWITCH_PERIOD_IDS.has(period?.periodId)) return [];
+      const summary = normalizeCacheContinuitySummary(period);
+      return summary === null ? [] : [{
+        status: "available",
+        errorCode: null,
+        periodId: period.periodId,
+        periodLabel: text(period.periodLabel, "Recorded period"),
+        ...summary,
+        allowanceImpact: period.periodId === "7d"
+          ? summary.allowanceImpact
+          : unavailableAllowanceImpact("period_denominator_mismatch"),
+        minimumGapSeconds: CACHE_CONTINUITY_MINIMUM_GAP_SECONDS,
+        maximumRetainedCacheRatio: CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
+        recentDetailLimit: CACHE_SWITCH_RECENT_LIMIT,
+        periods: []
+      }];
+    });
+  const selected = normalizeCacheContinuitySummary(value);
+  const periodId = CACHE_SWITCH_PERIOD_IDS.has(value?.periodId)
+    ? value.periodId
+    : null;
+  if (selected === null || periodId === null) {
+    return { ...unavailableCacheContinuityImpact(), periods };
+  }
+  return {
+    status: "available",
+    errorCode: null,
+    periodId,
+    periodLabel: text(value.periodLabel, "Recorded period"),
+    ...selected,
+    allowanceImpact: periodId === "7d"
+      ? selected.allowanceImpact
+      : unavailableAllowanceImpact("period_denominator_mismatch"),
+    minimumGapSeconds: CACHE_CONTINUITY_MINIMUM_GAP_SECONDS,
+    maximumRetainedCacheRatio: CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
+    recentDetailLimit: CACHE_SWITCH_RECENT_LIMIT,
+    periods
+  };
 }
 
 const FAST_MODE_PREFERENCES = Object.freeze(["standard", "fast", "mixed_unknown"]);
@@ -2666,6 +3511,888 @@ function normalizeLocalModelUsage(rows) {
   });
 }
 
+function sideChatRange(value, point) {
+  const lower = nonNegative(value?.lower, null);
+  const upper = nonNegative(value?.upper, null);
+  return lower !== null && upper !== null && lower <= point && point <= upper
+    ? { lower, upper }
+    : null;
+}
+
+function sideChatAssumptionsMatch(value) {
+  for (const [group, expected] of Object.entries(SIDE_CHAT_ASSUMPTIONS)) {
+    for (const [key, number] of Object.entries(expected)) {
+      if (finite(value?.[group]?.[key], null) !== number) return false;
+    }
+  }
+  return true;
+}
+
+function unavailableSideChatHistoricalGap(errorCode = null) {
+  return {
+    status: "unavailable",
+    errorCode: typeof errorCode === "string"
+        && CACHE_SWITCH_SAFE_CODE.test(errorCode)
+      ? errorCode
+      : null
+  };
+}
+
+function closeNumber(left, right, tolerance = 1e-6) {
+  return Number.isFinite(left) && Number.isFinite(right)
+    && Math.abs(left - right) <= tolerance;
+}
+
+function historicalGapFastMultiplier(model) {
+  if (model?.startsWith("gpt-5.6-") || model === "gpt-5.5") return 2.5;
+  if (model?.startsWith("gpt-5.4")) return 2;
+  return null;
+}
+
+function normalizeSideChatHistoricalGap(value) {
+  if (value?.status !== "available") {
+    return unavailableSideChatHistoricalGap(value?.errorCode);
+  }
+  const date = typeof value?.date === "string"
+      && /^\d{4}-\d{2}-\d{2}$/u.test(value.date)
+    ? value.date
+    : null;
+  const startAt = canonicalInstant(value?.startAt);
+  const endAt = canonicalInstant(value?.endAt);
+  const startMs = Date.parse(startAt ?? "");
+  const endMs = Date.parse(endAt ?? "");
+  const durationHours = (endMs - startMs) / 3_600_000;
+  const quota = value?.quota;
+  const quotaRows = [
+    quota?.startBefore,
+    quota?.startAfter,
+    quota?.endBefore,
+    quota?.endAfter
+  ].map((row) => ({
+    observedAt: canonicalInstant(row?.observedAt),
+    usedPercent: finite(row?.usedPercent, null)
+  }));
+  const quotaTimes = quotaRows.map((row) => Date.parse(row.observedAt ?? ""));
+  const minimumMovement = finite(
+    quota?.minimumMovementPercentagePoints,
+    null
+  );
+  const maximumMovement = finite(
+    quota?.maximumMovementPercentagePoints,
+    null
+  );
+  const resetAt = canonicalInstant(quota?.resetAt);
+  const exact = value?.exactUsage;
+  const events = count(exact?.events, null);
+  const sessions = count(exact?.sessions, null);
+  const totalTokens = count(exact?.totalTokens, null);
+  const standardCost = nonNegative(
+    exact?.standardApiPriceEquivalentUsd,
+    null
+  );
+  const allowanceWeighting = events === null || standardCost === null
+    ? null
+    : normalizeAllowanceWeighting(
+      exact?.allowanceWeighting,
+      events,
+      standardCost
+    );
+  const weightedLower = nonNegative(
+    exact?.quotaWeightedApiPriceEquivalentRangeUsd?.lower,
+    null
+  );
+  const weightedUpper = nonNegative(
+    exact?.quotaWeightedApiPriceEquivalentRangeUsd?.upper,
+    null
+  );
+  const observedModels = array(exact?.observedModels)
+    .filter((model) => LOCAL_MODELS.has(model));
+  const speedKeys = ["fast", "standard", "unknown", "other"];
+  const bySpeed = Object.fromEntries(speedKeys.map((speed) => {
+    const row = exact?.bySpeed?.[speed];
+    return [speed, {
+      events: count(row?.events, null),
+      totalTokens: count(row?.totalTokens, null),
+      standardApiPriceEquivalentUsd: nonNegative(
+        row?.standardApiPriceEquivalentUsd,
+        null
+      )
+    }];
+  }));
+  const pricedEvents = count(exact?.pricingCoverage?.pricedEvents, null);
+  const unpricedEvents = count(exact?.pricingCoverage?.unpricedEvents, null);
+  const unsupportedEvents = count(
+    exact?.speedWeightingCoverage?.unsupportedEvents,
+    null
+  );
+  const unknownSpeedEvents = count(
+    exact?.speedWeightingCoverage?.unknownSpeedEvents,
+    null
+  );
+  const calibration = value?.calibration;
+  const capacityScenarios = Object.fromEntries(
+    ALLOWANCE_SCENARIOS.map((scenario) => {
+      const row = calibration?.scenarios?.[scenario];
+      return [scenario, {
+        basisId: row?.basisId,
+        generatedAt: canonicalInstant(row?.generatedAt),
+        selectedCostBasis: row?.selectedCostBasis,
+        medianWeeklyCapacityUsd: nonNegative(
+          row?.medianWeeklyCapacityUsd,
+          null
+        ),
+        plausibleWeeklyCapacityRangeUsd: {
+          lower: nonNegative(
+            row?.plausibleWeeklyCapacityRangeUsd?.lower,
+            null
+          ),
+          upper: nonNegative(
+            row?.plausibleWeeklyCapacityRangeUsd?.upper,
+            null
+          )
+        },
+        qualifyingResets: count(row?.qualifyingResets, null),
+        cohortId: typeof row?.cohortId === "string"
+            && /^[0-9a-f]{64}$/u.test(row.cohortId)
+          ? row.cohortId
+          : null
+      }];
+    })
+  );
+  const standardCapacity = capacityScenarios.unresolved_as_standard;
+  const fastCapacity = capacityScenarios.unresolved_as_fast;
+  const estimate = value?.estimate;
+  const assumedMissingModel = LOCAL_MODELS.has(estimate?.assumedMissingModel)
+    ? estimate.assumedMissingModel
+    : null;
+  const fastMultiplier = finite(estimate?.fastQuotaMultiplier, null);
+  const comparison = estimate?.allowanceComparison;
+  const comparisonStatus = ["complete", "range"].includes(comparison?.status)
+    ? comparison.status
+    : null;
+  const comparisonSelectedScenario = ALLOWANCE_SCENARIOS.includes(
+    comparison?.selectedScenario
+  ) ? comparison.selectedScenario : null;
+  const comparisonSelectedExpected = comparison
+      ?.selectedExpectedPercentagePoints === null
+    ? null
+    : nonNegative(
+      comparison?.selectedExpectedPercentagePoints,
+      null
+    );
+  const comparisonScenarios = Object.fromEntries(
+    ALLOWANCE_SCENARIOS.map((scenario) => {
+      const row = comparison?.scenarios?.[scenario];
+      if (row === null || row === undefined) return [scenario, null];
+      return [scenario, {
+        basisId: row?.basisId,
+        numeratorUsd: nonNegative(row?.numeratorUsd, null),
+        capacityUsd: nonNegative(row?.capacityUsd, null),
+        expectedPercentagePoints: nonNegative(
+          row?.expectedPercentagePoints,
+          null
+        )
+      }];
+    })
+  );
+  const comparisonRangeLower = comparison
+      ?.expectedRangePercentagePoints === null
+    ? null
+    : nonNegative(
+      comparison?.expectedRangePercentagePoints?.lower,
+      null
+    );
+  const comparisonRangeUpper = comparison
+      ?.expectedRangePercentagePoints === null
+    ? null
+    : nonNegative(
+      comparison?.expectedRangePercentagePoints?.upper,
+      null
+    );
+  const expectedLower = nonNegative(
+    estimate?.exactCostImpliedMedianRangePercentagePoints?.lower,
+    null
+  );
+  const expectedUpper = nonNegative(
+    estimate?.exactCostImpliedMedianRangePercentagePoints?.upper,
+    null
+  );
+  const unexplainedLower = finite(
+    estimate?.unexplainedMedianRangePercentagePoints?.lower,
+    null
+  );
+  const unexplainedUpper = finite(
+    estimate?.unexplainedMedianRangePercentagePoints?.upper,
+    null
+  );
+  const impliedMissing = estimate?.impliedMissingStandardApiEquivalentUsd
+      === null
+    ? null
+    : nonNegative(estimate?.impliedMissingStandardApiEquivalentUsd, null);
+  const impliedMissingWeighted = estimate
+      ?.impliedMissingQuotaWeightedApiEquivalentUsd === null
+    ? null
+    : nonNegative(
+      estimate?.impliedMissingQuotaWeightedApiEquivalentUsd,
+      null
+    );
+  const sensitivityLower = nonNegative(
+    estimate?.sensitivityRangeUsd?.lower,
+    null
+  );
+  const sensitivityUpper = nonNegative(
+    estimate?.sensitivityRangeUsd?.upper,
+    null
+  );
+  const weightedSensitivityLower = nonNegative(
+    estimate?.quotaWeightedSensitivityRangeUsd?.lower,
+    null
+  );
+  const weightedSensitivityUpper = nonNegative(
+    estimate?.quotaWeightedSensitivityRangeUsd?.upper,
+    null
+  );
+  const speedEvents = speedKeys.reduce(
+    (sum, speed) => sum + (bySpeed[speed].events ?? 0),
+    0
+  );
+  const speedTokens = speedKeys.reduce(
+    (sum, speed) => sum + (bySpeed[speed].totalTokens ?? 0),
+    0
+  );
+  const speedCost = speedKeys.reduce(
+    (sum, speed) => sum
+      + (bySpeed[speed].standardApiPriceEquivalentUsd ?? 0),
+    0
+  );
+  const weightedScenarioValues = allowanceWeighting === null
+    ? []
+    : ALLOWANCE_SCENARIOS.map(
+      (scenario) => allowanceWeighting.scenarios[scenario].quotaWeightedUsd
+    ).filter(Number.isFinite);
+  const comparisonScenariosValid = allowanceWeighting !== null
+    && ALLOWANCE_SCENARIOS.every((scenario) => {
+      const row = comparisonScenarios[scenario];
+      if (row === null) {
+        return allowanceWeighting.scenarios[scenario].quotaWeightedUsd === null;
+      }
+      const capacity = capacityScenarios[scenario];
+      return row.basisId === allowanceBasisId(scenario)
+        && ![
+          row.numeratorUsd,
+          row.capacityUsd,
+          row.expectedPercentagePoints
+        ].includes(null)
+        && row.capacityUsd > 0
+        && closeNumber(
+          row.numeratorUsd,
+          allowanceWeighting.scenarios[scenario].quotaWeightedUsd
+        )
+        && closeNumber(row.capacityUsd, capacity.medianWeeklyCapacityUsd)
+        && closeNumber(
+          row.expectedPercentagePoints,
+          100 * row.numeratorUsd / row.capacityUsd
+        );
+    });
+  const selectedComparison = comparisonSelectedScenario === null
+    ? null
+    : comparisonScenarios[comparisonSelectedScenario];
+  const comparisonExpectedValues = comparisonStatus === "complete"
+    ? [selectedComparison?.expectedPercentagePoints].filter(Number.isFinite)
+    : Object.values(comparisonScenarios)
+      .filter((row) => row !== null)
+      .map((row) => row.expectedPercentagePoints);
+  const derivedExpectedLower = comparisonExpectedValues.length > 0
+    ? Math.min(...comparisonExpectedValues)
+    : null;
+  const derivedExpectedUpper = comparisonExpectedValues.length > 0
+    ? Math.max(...comparisonExpectedValues)
+    : null;
+  const sensitivityRows = ALLOWANCE_SCENARIOS.flatMap((scenario) => {
+    const row = comparisonScenarios[scenario];
+    return row === null ? [] : [{
+      numeratorUsd: row.numeratorUsd,
+      range: capacityScenarios[scenario].plausibleWeeklyCapacityRangeUsd
+    }];
+  });
+  const derivedSensitivityLower = sensitivityRows.length === 0
+    ? null
+    : Math.min(...sensitivityRows.map((row) => Math.max(0, (
+      minimumMovement * row.range.lower / 100 - row.numeratorUsd
+    ) / fastMultiplier)));
+  const derivedSensitivityUpper = sensitivityRows.length === 0
+    ? null
+    : Math.max(...sensitivityRows.map((row) => Math.max(0, (
+      maximumMovement * row.range.upper / 100 - row.numeratorUsd
+    ) / fastMultiplier)));
+  const derivedImpliedMissingWeighted = selectedComparison === null
+    ? null
+    : Math.max(0, (
+      minimumMovement * selectedComparison.capacityUsd / 100
+        - selectedComparison.numeratorUsd
+    ));
+  if (value?.schemaVersion !== SIDE_CHAT_HISTORICAL_GAP_SCHEMA_VERSION
+      || date === null || value?.timeZone !== "America/New_York"
+      || startAt === null || endAt === null
+      || ![23, 24, 25].includes(durationHours)
+      || value?.basis
+          !== "quota_residual_backcast_not_observed_side_chat_usage"
+      || quota?.limitId !== "codex" || quota?.slot !== "primary"
+      || count(quota?.durationMinutes, null) !== 10_080
+      || resetAt === null
+      || quotaRows.some((row) => row.observedAt === null
+        || row.usedPercent === null
+        || row.usedPercent < 0 || row.usedPercent > 100)
+      || quotaTimes.some((time) => !Number.isFinite(time))
+      || !(quotaTimes[0] <= startMs
+        && startMs <= quotaTimes[1]
+        && quotaTimes[1] <= quotaTimes[2]
+        && quotaTimes[2] <= endMs
+        && endMs <= quotaTimes[3])
+      || minimumMovement === null || maximumMovement === null
+      || minimumMovement < 0 || maximumMovement < minimumMovement
+      || !closeNumber(
+        minimumMovement,
+        quotaRows[2].usedPercent - quotaRows[1].usedPercent
+      )
+      || !closeNumber(
+        maximumMovement,
+        quotaRows[3].usedPercent - quotaRows[0].usedPercent
+      )
+      || quota?.observationPrecision !== "whole_percentage_points"
+      || [events, sessions, totalTokens, standardCost, weightedLower,
+        weightedUpper, pricedEvents, unpricedEvents, unsupportedEvents,
+        unknownSpeedEvents].includes(null)
+      || allowanceWeighting === null
+      || events < 1 || sessions < 1 || totalTokens < 1
+      || weightedScenarioValues.length < 1
+      || !closeNumber(weightedLower, Math.min(...weightedScenarioValues))
+      || !closeNumber(weightedUpper, Math.max(...weightedScenarioValues))
+      || weightedLower < standardCost || weightedUpper < weightedLower
+      || observedModels.length !== 1
+      || speedKeys.some((speed) => Object.values(bySpeed[speed]).includes(null))
+      || speedEvents !== events || speedTokens !== totalTokens
+      || !closeNumber(speedCost, standardCost)
+      || pricedEvents !== events || unpricedEvents !== 0
+      || unsupportedEvents !== 0
+      || unknownSpeedEvents !== bySpeed.unknown.events
+      || typeof calibration?.sourceCacheSchemaVersion !== "string"
+      || !/^local-replay-safe-accounting-v0\.\d+$/u.test(
+        calibration.sourceCacheSchemaVersion
+      )
+      || !["current_schema", "validated_newer_schema_subdocument"].includes(
+        calibration?.sourceCacheRelationship
+      )
+      || calibration?.weeklyCalibrationSchemaVersion
+          !== "weekly-calibration-summary-v0.1"
+      || calibration?.basisFamilyId !== ALLOWANCE_BASIS_FAMILY_ID
+      || calibration?.accountAttribution
+          !== "historical_unattributed_may_combine_accounts"
+      || ALLOWANCE_SCENARIOS.some((scenario) => {
+        const row = capacityScenarios[scenario];
+        const lower = row.plausibleWeeklyCapacityRangeUsd.lower;
+        const upper = row.plausibleWeeklyCapacityRangeUsd.upper;
+        return row.basisId !== allowanceBasisId(scenario)
+          || row.generatedAt === null
+          || row.selectedCostBasis !== (scenario === "unresolved_as_fast"
+            ? "speed_upper"
+            : "speed_lower")
+          || row.medianWeeklyCapacityUsd === null
+          || row.medianWeeklyCapacityUsd <= 0
+          || lower === null || lower <= 0
+          || upper === null || upper < row.medianWeeklyCapacityUsd
+          || lower > row.medianWeeklyCapacityUsd
+          || row.qualifyingResets === null || row.qualifyingResets < 1;
+      })
+      || standardCapacity.qualifyingResets !== fastCapacity.qualifyingResets
+      || standardCapacity.cohortId === null
+      || standardCapacity.cohortId !== fastCapacity.cohortId
+      || calibration?.timelineCapacityEligible !== true
+      || estimate?.assumedMissingSpeed !== "fast"
+      || assumedMissingModel === null
+      || assumedMissingModel !== observedModels[0]
+      || estimate?.modelAssumption !== "only_exact_model_observed_that_day"
+      || fastMultiplier !== historicalGapFastMultiplier(assumedMissingModel)
+      || comparison?.basisFamilyId !== ALLOWANCE_BASIS_FAMILY_ID
+      || comparisonStatus === null
+      || comparisonStatus !== allowanceWeighting.status
+      || !comparisonScenariosValid
+      || derivedExpectedLower === null || derivedExpectedUpper === null
+      || [expectedLower, expectedUpper, unexplainedLower, unexplainedUpper,
+        sensitivityLower, sensitivityUpper, weightedSensitivityLower,
+        weightedSensitivityUpper].includes(null)
+      || expectedUpper < expectedLower
+      || unexplainedUpper < unexplainedLower
+      || sensitivityUpper < sensitivityLower
+      || !closeNumber(expectedLower, derivedExpectedLower)
+      || !closeNumber(expectedUpper, derivedExpectedUpper)
+      || !closeNumber(unexplainedLower, minimumMovement - expectedUpper)
+      || !closeNumber(unexplainedUpper, maximumMovement - expectedLower)
+      || !closeNumber(sensitivityLower, derivedSensitivityLower)
+      || !closeNumber(sensitivityUpper, derivedSensitivityUpper)
+      || !closeNumber(
+        weightedSensitivityLower,
+        sensitivityLower * fastMultiplier
+      )
+      || !closeNumber(
+        weightedSensitivityUpper,
+        sensitivityUpper * fastMultiplier
+      )
+      || (comparisonStatus === "complete"
+        ? comparisonSelectedScenario !== allowanceWeighting.selectedScenario
+          || selectedComparison === null
+          || !closeNumber(
+            comparisonSelectedExpected,
+            selectedComparison.expectedPercentagePoints
+          )
+          || comparison?.expectedRangePercentagePoints !== null
+          || impliedMissing === null || impliedMissingWeighted === null
+          || !closeNumber(
+            impliedMissingWeighted,
+            derivedImpliedMissingWeighted
+          )
+          || !closeNumber(
+            impliedMissing,
+            derivedImpliedMissingWeighted / fastMultiplier
+          )
+        : comparisonSelectedScenario !== null
+          || comparisonSelectedExpected !== null
+          || comparisonRangeLower === null || comparisonRangeUpper === null
+          || !closeNumber(comparisonRangeLower, derivedExpectedLower)
+          || !closeNumber(comparisonRangeUpper, derivedExpectedUpper)
+          || impliedMissing !== null || impliedMissingWeighted !== null)
+      || estimate?.includedInExactUsage !== false
+      || estimate?.includedInCalibrationTimeline !== false
+      || estimate?.independentlyObserved !== false) {
+    return unavailableSideChatHistoricalGap("evidence_invalid");
+  }
+  return {
+    status: "available",
+    errorCode: null,
+    date,
+    timeZone: "America/New_York",
+    startAt,
+    endAt,
+    basis: "quota_residual_backcast_not_observed_side_chat_usage",
+    quota: {
+      limitId: "codex",
+      slot: "primary",
+      durationMinutes: 10_080,
+      resetAt,
+      startBefore: quotaRows[0],
+      startAfter: quotaRows[1],
+      endBefore: quotaRows[2],
+      endAfter: quotaRows[3],
+      minimumMovementPercentagePoints: minimumMovement,
+      maximumMovementPercentagePoints: maximumMovement,
+      observationPrecision: "whole_percentage_points"
+    },
+    exactUsage: {
+      events,
+      sessions,
+      totalTokens,
+      observedModels,
+      standardApiPriceEquivalentUsd: standardCost,
+      allowanceWeighting,
+      quotaWeightedApiPriceEquivalentRangeUsd: {
+        lower: weightedLower,
+        upper: weightedUpper
+      },
+      pricingCoverage: { pricedEvents, unpricedEvents: 0 },
+      speedWeightingCoverage: {
+        unsupportedEvents: 0,
+        unknownSpeedEvents
+      },
+      bySpeed
+    },
+    calibration: {
+      sourceCacheSchemaVersion: calibration.sourceCacheSchemaVersion,
+      sourceCacheRelationship: calibration.sourceCacheRelationship,
+      weeklyCalibrationSchemaVersion: "weekly-calibration-summary-v0.1",
+      basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
+      accountAttribution: "historical_unattributed_may_combine_accounts",
+      scenarios: capacityScenarios,
+      timelineCapacityEligible: true
+    },
+    estimate: {
+      assumedMissingSpeed: "fast",
+      assumedMissingModel,
+      modelAssumption: "only_exact_model_observed_that_day",
+      fastQuotaMultiplier: fastMultiplier,
+      allowanceComparison: {
+        status: comparisonStatus,
+        basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
+        selectedScenario: comparisonSelectedScenario,
+        selectedExpectedPercentagePoints: comparisonSelectedExpected,
+        scenarios: comparisonScenarios,
+        expectedRangePercentagePoints: comparisonStatus === "range"
+          ? {
+            lower: comparisonRangeLower,
+            upper: comparisonRangeUpper
+          }
+          : null
+      },
+      exactCostImpliedMedianRangePercentagePoints: {
+        lower: expectedLower,
+        upper: expectedUpper
+      },
+      unexplainedMedianRangePercentagePoints: {
+        lower: unexplainedLower,
+        upper: unexplainedUpper
+      },
+      impliedMissingStandardApiEquivalentUsd: impliedMissing,
+      impliedMissingQuotaWeightedApiEquivalentUsd: impliedMissingWeighted,
+      sensitivityRangeUsd: {
+        lower: sensitivityLower,
+        upper: sensitivityUpper
+      },
+      quotaWeightedSensitivityRangeUsd: {
+        lower: weightedSensitivityLower,
+        upper: weightedSensitivityUpper
+      },
+      includedInExactUsage: false,
+      includedInCalibrationTimeline: false,
+      independentlyObserved: false
+    }
+  };
+}
+
+function unavailableSideChatEstimates(errorCode = null) {
+  return {
+    status: "unavailable",
+    errorCode: typeof errorCode === "string" && CACHE_SWITCH_SAFE_CODE.test(errorCode)
+      ? errorCode
+      : null,
+    generatedAt: "",
+    methodology: null,
+    coverage: null,
+    periods: [],
+    recent: [],
+    recentDetailLimit: SIDE_CHAT_RECENT_LIMIT,
+    recentTruncated: false,
+    historicalGapProbe: unavailableSideChatHistoricalGap()
+  };
+}
+
+function normalizeSideChatPeriod(value) {
+  if (!SIDE_CHAT_PERIOD_IDS.has(value?.periodId)) return null;
+  const detectedSessions = count(value.detectedSessions, null);
+  const retainedSessions = count(value.retainedSessions, null);
+  const visibleTurns = count(value.visibleTurns, null);
+  const samplingCalls = count(value.samplingCalls, null);
+  const activeContextTokens = count(value.activeContextTokens, null);
+  const postCompactionCalls = count(value.postCompactionCalls, null);
+  const pricedCalls = count(value.pricedCalls, null);
+  const unpricedCalls = count(value.unpricedCalls, null);
+  const point = value.estimatedApiPriceEquivalentUsd === null
+    ? null
+    : nonNegative(value.estimatedApiPriceEquivalentUsd, null);
+  const range = point === null ? null : sideChatRange(value.estimatedRangeUsd, point);
+  if ([
+    detectedSessions,
+    retainedSessions,
+    visibleTurns,
+    samplingCalls,
+    activeContextTokens,
+    postCompactionCalls,
+    pricedCalls,
+    unpricedCalls
+  ].includes(null)
+      || postCompactionCalls > samplingCalls
+      || pricedCalls + unpricedCalls !== samplingCalls
+      || (unpricedCalls > 0 && (point !== null || value.estimatedRangeUsd !== null))
+      || (unpricedCalls === 0 && (point === null || range === null))) return null;
+  const startAt = value.startAt === null ? null : canonicalInstant(value.startAt);
+  const endAt = canonicalInstant(value.endAt);
+  if ((value.periodId !== "all" && startAt === null) || endAt === null) return null;
+  return {
+    status: "available",
+    periodId: value.periodId,
+    periodLabel: text(value.periodLabel, "Recorded period"),
+    startAt,
+    endAt,
+    detectedSessions,
+    retainedSessions,
+    visibleTurns,
+    samplingCalls,
+    activeContextTokens,
+    postCompactionCalls,
+    pricedCalls,
+    unpricedCalls,
+    estimatedApiPriceEquivalentUsd: point,
+    estimatedRangeUsd: range
+  };
+}
+
+function normalizeSideChatRecent(rows) {
+  return array(rows).slice(0, SIDE_CHAT_RECENT_LIMIT * 2).flatMap((row) => {
+    const observedAt = canonicalInstant(row?.observedAt);
+    const model = LOCAL_MODELS.has(row?.model) ? row.model : null;
+    const reasoningEffort = LOCAL_REASONING_EFFORTS.has(row?.reasoningEffort)
+      ? row.reasoningEffort
+      : null;
+    const turnOrdinal = count(row?.turnOrdinal, null);
+    const activeContextTokens = count(row?.activeContextTokens, null);
+    const cacheAssumption = SIDE_CHAT_CACHE_ASSUMPTIONS.has(row?.cacheAssumption)
+      ? row.cacheAssumption
+      : null;
+    const point = row?.estimatedApiPriceEquivalentUsd === null
+      ? null
+      : nonNegative(row?.estimatedApiPriceEquivalentUsd, null);
+    const range = point === null ? null : sideChatRange(row?.estimatedRangeUsd, point);
+    const compactionBefore = row?.compactionBefore === true;
+    const pricingBasis = SIDE_CHAT_PRICING_BASES.has(row?.pricingBasis)
+      ? row.pricingBasis
+      : null;
+    if (observedAt === null || model === null || reasoningEffort === null
+        || turnOrdinal === null || turnOrdinal < 1
+        || activeContextTokens === null || activeContextTokens === 0
+        || cacheAssumption === null
+        || (point === null) !== (row?.estimatedRangeUsd === null)
+        || (point !== null && range === null)
+        || pricingBasis === null
+        || (point === null) !== (pricingBasis === "unavailable")
+        || (point !== null
+          && (pricingBasis === "reviewed_alias_assumption")
+            !== SIDE_CHAT_CONDITIONAL_ALIAS_MODELS.has(model))
+        || compactionBefore !== (cacheAssumption === "cold_after_compaction")) {
+      return [];
+    }
+    // Explicit privacy projection: identifiers and source/log fields never
+    // survive a hostile local payload into the rendered dashboard.
+    return [{
+      observedAt,
+      model,
+      reasoningEffort,
+      turnOrdinal,
+      activeContextTokens,
+      cacheAssumption,
+      compactionBefore,
+      estimatedApiPriceEquivalentUsd: point,
+      estimatedRangeUsd: range,
+      pricingBasis
+    }];
+  }).sort(
+    (left, right) => Date.parse(right.observedAt) - Date.parse(left.observedAt)
+  ).slice(0, SIDE_CHAT_RECENT_LIMIT);
+}
+
+function normalizeSideChatEstimates(value) {
+  const historicalGapProbe = normalizeSideChatHistoricalGap(
+    value?.historicalGapProbe
+  );
+  if (value?.status !== "available") {
+    return {
+      ...unavailableSideChatEstimates(value?.errorCode),
+      historicalGapProbe
+    };
+  }
+  if (value.schemaVersion !== SIDE_CHAT_ESTIMATE_SCHEMA_VERSION
+      || value?.methodology?.parserVersion !== SIDE_CHAT_ESTIMATE_PARSER_VERSION
+      || value?.methodology?.ordinaryAssumption !== "warm_prefix"
+      || value?.methodology?.postCompactionAssumption !== "cold_first_request"
+      || value?.methodology?.elapsedRetentionAssumption
+          !== "warm_to_cold_sensitivity"
+      || value?.methodology?.coldUpperInputTreatment
+          !== "cache_write_when_reviewed_else_uncached"
+      || value?.methodology?.parentCacheStateObserved !== false
+      || value?.methodology?.compactionCostIncluded !== false
+      || value?.methodology?.componentEvidence
+          !== "reconstructed_from_active_context"
+      || value?.methodology?.retentionScope
+          !== "active_logs2_approximately_ten_days"
+      || count(value?.methodology?.approximateRetentionDays, null) !== 10
+      || value?.methodology?.includedInExactUsage !== false
+      || typeof value?.methodology?.includedInCalibrationTimeline !== "boolean"
+      || !SIDE_CHAT_CALIBRATION_STATUSES.has(
+        value?.methodology?.calibrationStatus
+      )
+      || value.methodology.includedInCalibrationTimeline
+          !== (value.methodology.calibrationStatus
+            === "eligible_active_retention")
+      || value?.methodology?.calibrationCohort?.model !== "gpt-5.6-sol"
+      || !Array.isArray(value?.methodology?.calibrationCohort?.reasoningEfforts)
+      || value.methodology.calibrationCohort.reasoningEfforts.join("|")
+          !== "high|max|ultra"
+      || count(
+        value?.methodology?.calibrationCohort?.matchedDurableCalls,
+        null
+      ) !== 818
+      || canonicalInstant(
+        value?.methodology?.calibrationCohort?.calibratedAt
+      ) !== "2026-08-17T02:20:00.000Z"
+      || count(
+        value?.methodology?.calibrationCohort?.freshForSeconds,
+        null
+      ) !== 2_592_000
+      || count(
+        value?.methodology?.calibrationCohort?.maximumActiveContextTokens,
+        null
+      ) !== 271_999
+      || !sideChatAssumptionsMatch(value?.methodology?.assumptions)
+      || count(value.recentDetailLimit, null) !== SIDE_CHAT_RECENT_LIMIT
+      || typeof value.recentTruncated !== "boolean") {
+    return {
+      ...unavailableSideChatEstimates("methodology_mismatch"),
+      historicalGapProbe
+    };
+  }
+  const generatedAt = canonicalInstant(value.generatedAt);
+  const desktopStartAt = canonicalInstant(value?.coverage?.desktop?.startAt);
+  const desktopEndAt = canonicalInstant(value?.coverage?.desktop?.endAt);
+  const desktopOversizedLinesSkipped = count(
+    value?.coverage?.desktop?.oversizedLinesSkipped,
+    null
+  );
+  const logs2StartAt = canonicalInstant(value?.coverage?.logs2?.startAt);
+  const logs2EndAt = canonicalInstant(value?.coverage?.logs2?.endAt);
+  const logs2SourceScope = value?.coverage?.logs2?.sourceScope;
+  const detectedSessions = count(value?.coverage?.detectedSessions, null);
+  const retainedNumericSessions = count(
+    value?.coverage?.retainedNumericSessions,
+    null
+  );
+  const completeNumericSessions = count(
+    value?.coverage?.completeNumericSessions,
+    null
+  );
+  const sessionsAtRetentionLimit = count(
+    value?.coverage?.sessionsAtRetentionLimit,
+    null
+  );
+  const sessionsWithoutNumericEvidence = count(
+    value?.coverage?.sessionsWithoutNumericEvidence,
+    null
+  );
+  const coverageStatus = value?.coverage?.status;
+  const duplicateSamplingMarkers = count(
+    value?.coverage?.duplicateSamplingMarkers,
+    null
+  );
+  const ambiguousDuplicateMarkers = count(
+    value?.coverage?.ambiguousDuplicateMarkers,
+    null
+  );
+  const rejectedSamplingMarkers = count(
+    value?.coverage?.rejectedSamplingMarkers,
+    null
+  );
+  const compactionMarkers = count(
+    value?.coverage?.compactionMarkers,
+    null
+  );
+  const rejectedCompactionMarkers = count(
+    value?.coverage?.rejectedCompactionMarkers,
+    null
+  );
+  const periods = array(value.periods).slice(0, 4)
+    .map(normalizeSideChatPeriod);
+  const completeCoverage = completeNumericSessions === detectedSessions
+    && sessionsAtRetentionLimit === 0
+    && sessionsWithoutNumericEvidence === 0
+    && desktopOversizedLinesSkipped === 0
+    && rejectedSamplingMarkers === 0
+    && rejectedCompactionMarkers === 0
+    && ambiguousDuplicateMarkers === 0;
+  const logs2RangeValid = logs2StartAt !== null && logs2EndAt !== null
+    || logs2StartAt === null && logs2EndAt === null
+      && (
+        detectedSessions === 0
+        || coverageStatus === "partial_diagnostic_retention"
+          && retainedNumericSessions === 0
+          && sessionsWithoutNumericEvidence === detectedSessions
+      );
+  if (generatedAt === null || desktopStartAt === null || desktopEndAt === null
+      || !logs2RangeValid
+      || logs2SourceScope !== "active_logs2_retention_only"
+      || desktopOversizedLinesSkipped === null
+      || detectedSessions === null || retainedNumericSessions === null
+      || completeNumericSessions === null
+      || sessionsAtRetentionLimit === null
+      || sessionsWithoutNumericEvidence === null
+      || duplicateSamplingMarkers === null
+      || ambiguousDuplicateMarkers === null
+      || rejectedSamplingMarkers === null
+      || rejectedCompactionMarkers === null
+      || compactionMarkers === null
+      || retainedNumericSessions + sessionsWithoutNumericEvidence !== detectedSessions
+      || completeNumericSessions + sessionsAtRetentionLimit
+          !== retainedNumericSessions
+      || !new Set([
+        "retained_for_all_detected_sessions",
+        "partial_diagnostic_retention"
+      ]).has(coverageStatus)
+      || (coverageStatus === "retained_for_all_detected_sessions")
+          !== completeCoverage
+      || periods.length !== 4 || periods.includes(null)
+      || new Set(periods.map((period) => period.periodId)).size !== 4) {
+    return {
+      ...unavailableSideChatEstimates("evidence_invalid"),
+      historicalGapProbe
+    };
+  }
+  return {
+    status: "available",
+    errorCode: null,
+    generatedAt,
+    methodology: {
+      parserVersion: SIDE_CHAT_ESTIMATE_PARSER_VERSION,
+      ordinaryAssumption: "warm_prefix",
+      postCompactionAssumption: "cold_first_request",
+      elapsedRetentionAssumption: "warm_to_cold_sensitivity",
+      coldUpperInputTreatment: "cache_write_when_reviewed_else_uncached",
+      parentCacheStateObserved: false,
+      compactionCostIncluded: false,
+      componentEvidence: "reconstructed_from_active_context",
+      retentionScope: "active_logs2_approximately_ten_days",
+      approximateRetentionDays: 10,
+      includedInExactUsage: false,
+      includedInCalibrationTimeline:
+        value.methodology.includedInCalibrationTimeline,
+      calibrationStatus: value.methodology.calibrationStatus,
+      calibrationCohort: {
+        model: "gpt-5.6-sol",
+        reasoningEfforts: ["high", "max", "ultra"],
+        matchedDurableCalls: 818,
+        calibratedAt: "2026-08-17T02:20:00.000Z",
+        freshForSeconds: 2_592_000,
+        maximumActiveContextTokens: 271_999
+      },
+      assumptions: SIDE_CHAT_ASSUMPTIONS
+    },
+    coverage: {
+      desktop: {
+        filesScanned: count(value?.coverage?.desktop?.filesScanned, 0),
+        bytesScanned: count(value?.coverage?.desktop?.bytesScanned, 0),
+        oversizedLinesSkipped: desktopOversizedLinesSkipped,
+        startAt: desktopStartAt,
+        endAt: desktopEndAt
+      },
+      logs2: {
+        startAt: logs2StartAt,
+        endAt: logs2EndAt,
+        sourceScope: "active_logs2_retention_only"
+      },
+      detectedSessions,
+      retainedNumericSessions,
+      completeNumericSessions,
+      sessionsAtRetentionLimit,
+      sessionsWithoutNumericEvidence,
+      duplicateSamplingMarkers,
+      ambiguousDuplicateMarkers,
+      rejectedSamplingMarkers,
+      rejectedCompactionMarkers,
+      compactionMarkers,
+      status: coverageStatus
+    },
+    periods,
+    recent: normalizeSideChatRecent(value.recent),
+    recentDetailLimit: SIDE_CHAT_RECENT_LIMIT,
+    recentTruncated: value.recentTruncated,
+    historicalGapProbe
+  };
+}
+
 function normalizeLocalAccounting(value = {}) {
   const models = normalizeLocalModelUsage(value.byModel);
   // Both allowance tracks in one list, each row stating which track it belongs
@@ -2709,6 +4436,11 @@ function normalizeLocalAccounting(value = {}) {
     },
     components: normalizeLocalComponents(value.components),
     componentCosts: normalizeLocalComponentCosts(value.componentCosts),
+    cacheSwitchImpact: normalizeCacheSwitchImpact(value.cacheSwitchImpact),
+    cacheContinuityImpact: normalizeCacheContinuityImpact(
+      value.cacheContinuityImpact
+    ),
+    sideChatEstimates: normalizeSideChatEstimates(value.sideChatEstimates),
     byModel: models,
     modelUsage,
     bySpeed: normalizeAccountingDimension(
@@ -4219,7 +5951,7 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
       });
       rolling.push({
         timestamp,
-        series: "Expected from API cost",
+        series: "Expected from quota-weighted API cost",
         quota_change_pp: Number((observed * .82 + Math.cos(index / 4) * .8 * scale).toFixed(2)),
         smoothing_hours: smoothingHours
       });
@@ -4278,6 +6010,43 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
       usageEvents,
       totalTokens,
       apiPriceEquivalentUsd: cost,
+      allowanceWeighting: {
+        status: "complete",
+        basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
+        selectedScenario: "unresolved_as_standard",
+        selectedUsd: cost,
+        scenarios: {
+          unresolved_as_standard: {
+            basisId: allowanceBasisId("unresolved_as_standard"),
+            sourceWeightingStatus: "complete",
+            quotaWeightedUsd: cost,
+            coveredSubtotalUsd: cost,
+            coverage: {
+              totalEvents: usageEvents,
+              observedEvents: 0,
+              declaredFromConfigEvents: 0,
+              assumedFromPreferenceEvents: usageEvents,
+              inferredEvents: 0,
+              unknownEvents: 0
+            }
+          },
+          unresolved_as_fast: {
+            basisId: allowanceBasisId("unresolved_as_fast"),
+            sourceWeightingStatus: "complete",
+            quotaWeightedUsd: Number((cost * 2.5).toFixed(12)),
+            coveredSubtotalUsd: Number((cost * 2.5).toFixed(12)),
+            coverage: {
+              totalEvents: usageEvents,
+              observedEvents: 0,
+              declaredFromConfigEvents: 0,
+              assumedFromPreferenceEvents: usageEvents,
+              inferredEvents: 0,
+              unknownEvents: 0
+            }
+          }
+        },
+        rangeUsd: null
+      },
       components: splitTokens(totalTokens),
       pricingCoverage: {
         fullyPricedEvents: fullyPriced,
@@ -4423,6 +6192,48 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
       bucketMinutes: 60,
       coveredAt: { startAt: iso(nowMs - 7 * DAY), endAt: nowIso },
       usage: timelineUsage,
+      allowanceCapacity: {
+        status: "available",
+        reason: null,
+        basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
+        selectedScenario: "unresolved_as_standard",
+        scenarios: {
+          unresolved_as_standard: {
+            basisId: allowanceBasisId("unresolved_as_standard"),
+            medianCapacityUsd: 1878.75,
+            plausibleRangeUsd: { lower: 1640.96, upper: 2280.38 },
+            qualifyingResets: 14,
+            cohortId: "c7d59f1f3fc548fa3d52726ec83f47a2a273ee6c3664dcf5ee510be8d8c455a8",
+            validation: {
+              sameResetHoldoutMeanAbsoluteErrorPercentagePoints: 2.16,
+              priorResetMeanAbsoluteErrorPercentagePoints: 3.95,
+              priorResetAbsoluteBiasPercentagePoints: 1.22,
+              forecastErrorP80PercentagePoints: 7.39,
+              scoredPriorResets: 11,
+              scoredPriorPoints: 64
+            }
+          },
+          unresolved_as_fast: {
+            basisId: allowanceBasisId("unresolved_as_fast"),
+            medianCapacityUsd: 4696.875,
+            plausibleRangeUsd: { lower: 4102.4, upper: 5700.95 },
+            qualifyingResets: 14,
+            cohortId: "c7d59f1f3fc548fa3d52726ec83f47a2a273ee6c3664dcf5ee510be8d8c455a8",
+            validation: {
+              sameResetHoldoutMeanAbsoluteErrorPercentagePoints: 2.16,
+              priorResetMeanAbsoluteErrorPercentagePoints: 3.95,
+              priorResetAbsoluteBiasPercentagePoints: 1.22,
+              forecastErrorP80PercentagePoints: 7.39,
+              scoredPriorResets: 11,
+              scoredPriorPoints: 64
+            }
+          }
+        },
+        accountAttribution: {
+          status: "historical_unattributed",
+          maySpanMultipleAccounts: true
+        }
+      },
       quota: timelineQuota
     },
     accounting,

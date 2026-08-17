@@ -8,12 +8,14 @@ import { forEachRolloutLine, ROLLOUT_LINE_BYTES } from "./rollout-line-reader.js
 // one owner-area import is the reviewed `cumulativeSnapshotKey`, measured at
 // 5.1 ms to load per thread.
 //
-// Only three record types are read: `turn_context`, `token_count` and
-// `thread_settings_applied`. Nothing else is parsed, so no prompt, reply,
-// reasoning or file content is ever decoded — and the fields taken from those
-// three are enumerated by hand below rather than copied wholesale, so a new
-// content-bearing field appearing upstream cannot leak in by default. Note in
-// particular that `turn_context` carries `cwd`, `workspace_roots` and a
+// Only three JSON record types are read: `turn_context`, `token_count` and
+// `thread_settings_applied`. A fourth boundary, top-level `compacted`, is
+// recognised from its bounded header without ever parsing its payload. No
+// prompt, reply, reasoning or file content is parsed — and the fields taken
+// from the three JSON records are enumerated by hand below rather than copied
+// wholesale, so a new content-bearing field appearing upstream cannot leak in
+// by default. Note in particular that `turn_context` carries `cwd`,
+// `workspace_roots` and a
 // `collaboration_mode.settings.developer_instructions` block: all three are
 // content or filesystem paths, and none of them is read here.
 
@@ -25,6 +27,59 @@ import { forEachRolloutLine, ROLLOUT_LINE_BYTES } from "./rollout-line-reader.js
 const NEEDLE_TURN_CONTEXT = Buffer.from('"turn_context"');
 const NEEDLE_TOKEN_COUNT = Buffer.from('"token_count"');
 const NEEDLE_THREAD_SETTINGS = Buffer.from('"thread_settings_applied"');
+const COMPACTION_TIMESTAMP_PREFIX = Buffer.from('{"timestamp":"');
+const COMPACTION_TYPE_SUFFIX = Buffer.from(',"type":"compacted"');
+const COMPACTION_TYPE_PREFIX = Buffer.from('{"type":"compacted","timestamp":"');
+
+// A compacted record can contain an enormous replacement_history payload. Its
+// top-level header is bounded and arrives first. Codex's current serializer
+// emits timestamp then type, while a standards-compliant producer may emit
+// the two top-level scalars in the opposite order:
+//
+//   {"timestamp":"...","type":"compacted","payload":...}
+//   {"type":"compacted","timestamp":"...","payload":...}
+//
+// Match only those two exact byte headers and decode only the timestamp
+// scalar. Unknown fields, whitespace variants and any marker appearing after
+// payload fail closed. This is
+// deliberately not JSON.parse, and it never converts even the bounded start
+// of `payload` to text. A nested `"type":"compacted"` inside content cannot
+// match because the byte comparison starts at offset zero.
+export function parseCompactionPrefix(line) {
+  if (!Buffer.isBuffer(line)) return null;
+  let timestampStart;
+  let timestampFirst = false;
+  if (line.length >= COMPACTION_TIMESTAMP_PREFIX.length
+      && line.subarray(0, COMPACTION_TIMESTAMP_PREFIX.length)
+        .equals(COMPACTION_TIMESTAMP_PREFIX)) {
+    timestampStart = COMPACTION_TIMESTAMP_PREFIX.length;
+    timestampFirst = true;
+  } else if (line.length >= COMPACTION_TYPE_PREFIX.length
+      && line.subarray(0, COMPACTION_TYPE_PREFIX.length)
+        .equals(COMPACTION_TYPE_PREFIX)) {
+    timestampStart = COMPACTION_TYPE_PREFIX.length;
+  } else {
+    return null;
+  }
+  const timestampEnd = line.indexOf(0x22, timestampStart);
+  if (timestampEnd < timestampStart
+      || timestampEnd - timestampStart > 64) return null;
+  if (timestampFirst) {
+    const typeStart = timestampEnd + 1;
+    const typeEnd = typeStart + COMPACTION_TYPE_SUFFIX.length;
+    if (line.length <= typeEnd
+        || !line.subarray(typeStart, typeEnd).equals(COMPACTION_TYPE_SUFFIX)
+        || (line[typeEnd] !== 0x2c && line[typeEnd] !== 0x7d)) return null;
+  } else {
+    const headerEnd = timestampEnd + 1;
+    if (line.length <= headerEnd
+        || (line[headerEnd] !== 0x2c && line[headerEnd] !== 0x7d)) return null;
+  }
+  const observedAtMs = Date.parse(
+    line.toString("ascii", timestampStart, timestampEnd),
+  );
+  return Number.isFinite(observedAtMs) ? { observedAtMs } : null;
+}
 
 const REASONING_EFFORT_VALUES = new Set([
   "none",
@@ -245,6 +300,8 @@ export async function extractRolloutUsage(path, {
   seedEffort = null,
   seedTier = null,
   seedTotals = null,
+  seedCompactionPending = null,
+  seedTurnContextPending = false,
   // Cursor resume: whether an earlier scan of THIS file already saw one of
   // its own `turn_context` records. The fork boundary's rule 2 depends on it,
   // so a mid-file resume must carry it rather than re-deriving it wrongly as
@@ -254,9 +311,13 @@ export async function extractRolloutUsage(path, {
   highWaterMark = 1024 * 1024,
   signal = null,
   onEvent,
+  onBoundary = null,
 } = {}) {
   if (typeof onEvent !== "function") {
     throw new TypeError("onEvent must be a function");
+  }
+  if (onBoundary !== null && typeof onBoundary !== "function") {
+    throw new TypeError("onBoundary must be a function or null");
   }
   let currentModel = seedModel;
   let currentEffort = seedEffort;
@@ -267,6 +328,15 @@ export async function extractRolloutUsage(path, {
   let turnContextSeenHere = seedTurnContextSeen === true;
   let tierState = seedTier;
   let previousTotals = seedTotals;
+  let compactionPending = seedCompactionPending !== null
+      && Number.isSafeInteger(seedCompactionPending.observedAtMs)
+      && Number.isSafeInteger(seedCompactionPending.sourceOffset)
+    ? {
+      observedAtMs: seedCompactionPending.observedAtMs,
+      sourceOffset: seedCompactionPending.sourceOffset,
+    }
+    : null;
+  let turnContextPending = seedTurnContextPending === true;
   // Set when the cumulative baseline was re-anchored on a counter regression.
   // Until the next positive swing is derived, the delta from the new anchor
   // may span two interleaved streams, so that swing charges only its own
@@ -285,6 +355,44 @@ export async function extractRolloutUsage(path, {
     }
     previousTotals = total;
   }
+
+  function positiveInput(usage) {
+    return usage !== null && usage !== undefined && usage.input_tokens > 0;
+  }
+
+  // Emit the usage row first, then its exact boundary relation. The host can
+  // therefore insert a foreign-keyed relation without buffering arbitrary
+  // rows. Output-only and quota-only records leave the marker pending: the
+  // continuity lens compares positive-input requests, so only the next one is
+  // a meaningful boundary.
+  async function emitUsage(event, rawUsage) {
+    await onEvent(event);
+    if ((compactionPending === null && !turnContextPending)
+        || !positiveInput(rawUsage)) return;
+    const compaction = compactionPending;
+    const turnContextBefore = turnContextPending;
+    compactionPending = null;
+    turnContextPending = false;
+    await onBoundary?.({
+      compactionBefore: compaction !== null,
+      turnContextBefore,
+      compactedAtMs: compaction?.observedAtMs ?? null,
+      currentObservedAtMs: event.observedAtMs,
+      currentSourceOffset: event.sourceOffset,
+    });
+  }
+
+  // Forks replay parent records into the child file. If the next positive
+  // input is rejected by either fork boundary, pending turn and compaction
+  // markers belong to that replay as well and must be consumed without
+  // linking them to the child's first genuine request.
+  function consumeReplayedBoundary(usage) {
+    if ((compactionPending !== null || turnContextPending)
+        && positiveInput(usage)) {
+      compactionPending = null;
+      turnContextPending = false;
+    }
+  }
   const diagnostics = {
     relevantLines: 0,
     malformedLines: 0,
@@ -297,6 +405,7 @@ export async function extractRolloutUsage(path, {
     unattributedForkReplayEventsSkipped: 0,
     cumulativeCounterRegressions: 0,
     tierEvents: 0,
+    compactionEvents: 0,
     modelSeededFromLineage: 0,
     tierSeededFromLineage: 0,
     modelMissing: 0,
@@ -311,6 +420,17 @@ export async function extractRolloutUsage(path, {
     highWaterMark,
     signal,
     onLine: async (line, lineEndOffset, partial) => {
+      const compaction = parseCompactionPrefix(line);
+      if (compaction !== null) {
+        diagnostics.relevantLines += 1;
+        if (partial) diagnostics.partialLines += 1;
+        diagnostics.compactionEvents += 1;
+        compactionPending = {
+          observedAtMs: compaction.observedAtMs,
+          sourceOffset: lineEndOffset,
+        };
+        return;
+      }
       if (!relevant(line)) return;
       diagnostics.relevantLines += 1;
       const text = line.toString("utf8");
@@ -332,6 +452,7 @@ export async function extractRolloutUsage(path, {
         );
         if (!Number.isFinite(observedAtMs)) return;
         if (text.includes('"turn_context"')) {
+          turnContextPending = true;
           const model = salvageScalar(text, "model", SALVAGE_TOKEN);
           if (model !== null) currentModel = model;
           const effort = salvageScalar(text, "effort", SALVAGE_TOKEN);
@@ -352,6 +473,7 @@ export async function extractRolloutUsage(path, {
         // snapshot key, which a truncated record may not carry, and guessing
         // at it could let a replayed turn through as new spend.
         if (isFork && !turnContextSeenHere) {
+          consumeReplayedBoundary(delta);
           diagnostics.unattributedForkReplayEventsSkipped += 1;
           return;
         }
@@ -360,7 +482,7 @@ export async function extractRolloutUsage(path, {
         // regression the best available charge is the delta from the new
         // anchor — which this already is.
         reAnchored = false;
-        await onEvent({
+        await emitUsage({
           observedAtMs,
           sourceOffset: lineEndOffset,
           model: currentModel,
@@ -369,7 +491,7 @@ export async function extractRolloutUsage(path, {
           components: canonicalComponents(delta),
           quota: [],
           partial: true,
-        });
+        }, delta);
         return;
       }
 
@@ -381,9 +503,15 @@ export async function extractRolloutUsage(path, {
       if (record.type === "turn_context") {
         diagnostics.turnContexts += 1;
         turnContextSeenHere = true;
+        turnContextPending = true;
         // Enumerated by hand. `cwd`, `workspace_roots`, `turn_id`,
         // `personality` and the collaboration-mode developer instructions in
         // the same payload are never touched.
+        // Configuration records are state updates, not presence receipts.
+        // An omitted model or effort means that setting did not change; only
+        // a value that has never been observed is genuinely missing. Keep the
+        // prior state instead of turning a sparse UI update into false unknown
+        // coverage (or a false switch when the field reappears later).
         if (typeof record.payload?.model === "string") {
           currentModel = record.payload.model;
         }
@@ -451,6 +579,7 @@ export async function extractRolloutUsage(path, {
       // total as if it were one enormous turn.
       const snapshotKey = cumulativeSnapshotKey(total, last);
       if (isFork && snapshotKey !== null && inheritedSnapshots?.has(snapshotKey)) {
+        consumeReplayedBoundary(last ?? total);
         if (total) rebaseTotals(total);
         diagnostics.forkReplayEventsSkipped += 1;
         return;
@@ -460,6 +589,7 @@ export async function extractRolloutUsage(path, {
       // by rule 2 is.
       if (snapshotKey !== null) collectSnapshots?.add(snapshotKey);
       if (isFork && !turnContextSeenHere) {
+        consumeReplayedBoundary(last ?? total);
         if (total) rebaseTotals(total);
         diagnostics.unattributedForkReplayEventsSkipped += 1;
         return;
@@ -508,7 +638,7 @@ export async function extractRolloutUsage(path, {
       if ((!usage || (usage.input_tokens === 0 && usage.output_tokens === 0))
           && quota.length === 0) return;
       if (currentModel === null) diagnostics.modelMissing += 1;
-      await onEvent({
+      await emitUsage({
         observedAtMs,
         sourceOffset: lineEndOffset,
         model: currentModel,
@@ -525,7 +655,7 @@ export async function extractRolloutUsage(path, {
         components: usage ? canonicalComponents(usage) : null,
         quota,
         partial: false,
-      });
+      }, usage);
     },
   });
 
@@ -536,6 +666,8 @@ export async function extractRolloutUsage(path, {
     finalEffort: currentEffort,
     finalTier: tierState,
     finalTotals: previousTotals,
+    finalCompactionPending: compactionPending,
+    finalTurnContextPending: turnContextPending,
     finalTurnContextSeen: turnContextSeenHere,
   };
 }

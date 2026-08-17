@@ -175,6 +175,7 @@ function accumulate(totals, source, oversizedLines) {
   totals.forkReplayEventsSkipped += source.forkReplayEventsSkipped;
   totals.unattributedForkReplayEventsSkipped
     += source.unattributedForkReplayEventsSkipped;
+  totals.compactionEvents += source.compactionEvents ?? 0;
   totals.oversizedLines += oversizedLines;
 }
 
@@ -189,6 +190,8 @@ export function writeCursorForOutcome(writer, deviceSalt, info, state, {
   finalTierRaw,
   finalTierObservedAtMs,
   finalTotals,
+  finalCompactionPending = null,
+  finalTurnContextPending = false,
   turnContextSeen,
   snapshotsPersisted = false,
 }) {
@@ -207,6 +210,8 @@ export function writeCursorForOutcome(writer, deviceSalt, info, state, {
     carryTierRaw: finalTierRaw,
     carryTierObservedAtMs: finalTierObservedAtMs,
     carryTotals: finalTotals,
+    compactionPending: finalCompactionPending,
+    turnContextPending: finalTurnContextPending,
   });
 }
 
@@ -242,6 +247,7 @@ function eventKeyFor(deviceSalt, sessionLocalKey, sourceOffset, observedAtMs) {
 export function createEventSink({ writer, deviceSalt, accountScopeId, onCounts }) {
   const counts = {
     usageEvents: 0,
+    boundaryLinks: 0,
     quotaObservations: 0,
     modelMissing: 0,
     modelUnrecognized: 0,
@@ -273,6 +279,8 @@ export function createEventSink({ writer, deviceSalt, accountScopeId, onCounts }
           event.sourceOffset,
           event.observedAtMs,
         ),
+        sourceId: source.sourceId,
+        sourceOffset: event.sourceOffset,
         observedAtMs: event.observedAtMs,
         sessionLocal: source.sessionLocal,
         accountScopeId,
@@ -306,6 +314,21 @@ export function createEventSink({ writer, deviceSalt, accountScopeId, onCounts }
       });
       counts.usageEvents += 1;
       if (counts.usageEvents % 50_000 === 0) onCounts?.(counts);
+    },
+    writeBoundary(source, event) {
+      writer.writeUsageEventBoundary({
+        currentEventKey: eventKeyFor(
+          deviceSalt,
+          source.sessionLocal,
+          event.currentSourceOffset,
+          event.currentObservedAtMs,
+        ),
+        compactionBefore: event.compactionBefore,
+        turnContextBefore: event.turnContextBefore,
+        compactedAtMs: event.compactedAtMs,
+        sessionLocal: source.sessionLocal,
+      });
+      counts.boundaryLinks += 1;
     },
   };
 }
@@ -443,6 +466,7 @@ export async function rebuildLocalUnifiedIndex({
     malformedLines: 0,
     partialLines: 0,
     salvagedRecords: 0,
+    compactionEvents: 0,
     modelSeededFromLineage: 0,
     oversizedLines: 0,
     forkReplayEventsSkipped: 0,
@@ -456,8 +480,11 @@ export async function rebuildLocalUnifiedIndex({
     let state = sourceState.get(key);
     if (state === undefined) {
       const sessionId = info.lineage?.sessionId ?? info.rolloutKey;
+      const sourceKey = sourceLocal(deviceSalt, info.rolloutKey);
       state = {
         sessionLocal: sessionLocal(deviceSalt, sessionId),
+        sourceLocal: sourceKey,
+        sourceId: writer.internSource(sourceKey),
         surface: surfaceRow(info.lineage?.surfaceClassification),
         finalModel: null,
         finalEffort: null,
@@ -525,6 +552,7 @@ export async function rebuildLocalUnifiedIndex({
               maximumLineBytes,
               signal,
               onEvent: (event) => sink.write(state, event),
+              onBoundary: (event) => sink.writeBoundary(state, event),
             });
             state.finalModel = outcome.finalModel;
             state.finalEffort = outcome.finalEffort;
@@ -539,6 +567,8 @@ export async function rebuildLocalUnifiedIndex({
               finalTierRaw: ownObservedTier(outcome.finalTier)?.providerTierRaw ?? null,
               finalTierObservedAtMs: ownObservedTier(outcome.finalTier)?.observedAtMs ?? null,
               finalTotals: outcome.finalTotals,
+              finalCompactionPending: outcome.finalCompactionPending,
+              finalTurnContextPending: outcome.finalTurnContextPending,
               turnContextSeen: outcome.finalTurnContextSeen,
               snapshotsPersisted: collector !== null,
             });
@@ -566,6 +596,9 @@ export async function rebuildLocalUnifiedIndex({
           if (info === undefined) return;
           const state = stateFor(info);
           for (const event of message.events) sink.write(state, event);
+          for (const event of message.boundaries ?? []) {
+            sink.writeBoundary(state, event);
+          }
           for (const key of message.snapshotKeys ?? []) {
             writer.addLineageSnapshot(
               state.sessionLocal,
@@ -603,6 +636,7 @@ export async function rebuildLocalUnifiedIndex({
     writer.writeMeta("source_count", infos.length);
     writer.writeMeta("source_bytes", sourceBytes);
     writer.writeMeta("usage_events", sink.counts.usageEvents);
+    writer.writeMeta("boundary_links", sink.counts.boundaryLinks);
     writer.writeMeta("generated_at", new Date().toISOString());
     writer.writeMeta("contract_version", contractVersion);
     writer.writeMeta("status", signal?.aborted ? "partial" : "complete");

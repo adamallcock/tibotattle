@@ -24,6 +24,7 @@ import {
   readLocalCollectorAccountingCache,
   writeLocalCollectorAccountingCache,
 } from "../src/local-collector-state.js";
+import { emptySpeedWeightingCrossing } from "@app-usagemonitor/accounting";
 
 const ARTIFACT_FILES = {
   gradient: "2026-07-24-simple-quota-gradient-artifact.json",
@@ -271,6 +272,11 @@ test("local companion builds a closed real-data projection without identifiers o
     assert.equal(snapshot.overview.accounting.byAgentScope.subagent.events, 1);
     assert.equal(snapshot.overview.accounting.byLineage.forked.events, 1);
     assert.equal(snapshot.overview.accounting.reasoningEffortAvailable, false);
+    assert.equal(
+      snapshot.overview.monitoringGaps.find((row) => row.id === "reasoning_effort")
+        ?.status,
+      "unavailable",
+    );
     assert.equal(snapshot.overview.accounting.apiPriceCounterfactualTier, "standard");
     assert.deepEqual(snapshot.overview.pricing.historyCoverage, {
       status: "partial",
@@ -366,6 +372,201 @@ test("local companion builds a closed real-data projection without identifiers o
     }
   } finally {
     await rm(root, { recursive: true });
+  }
+});
+
+test("development side-chat estimates adjust only the calibration timeline", async () => {
+  const root = await fixtureRoot();
+  const codexHome = join(root, ".codex-test");
+  try {
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      `${JSON.stringify({
+        schemaVersion: "0.3",
+        kind: "codex_rollout_usage_snapshot",
+        observedAt: "2026-07-25T11:00:00.000Z",
+        model: "gpt-5.6-sol",
+        components: {
+          input_uncached_tokens: 100,
+          input_cache_read_tokens: 50,
+          input_cache_write_tokens: 0,
+          output_text_tokens: 20,
+          output_reasoning_tokens: 30,
+        },
+        tierSemantics: { codexSpeedMode: "standard" },
+      })}\n`,
+      { mode: 0o600 },
+    );
+    const now = () => Date.parse("2026-07-25T12:00:00.000Z");
+    const exact = await buildLocalCompanionSnapshot({
+      root,
+      fastModePreference: "fast",
+      now,
+    });
+    assert.equal(
+      Object.hasOwn(exact.overview.timeline, "calibrationUsage"),
+      false,
+    );
+    assert.equal(
+      Object.hasOwn(exact.overview.accounting, "sideChatEstimates"),
+      false,
+    );
+    let receivedCodexHome = null;
+    let receivedDeclaredBaselines = null;
+    const codexSpeedBaselines = [{
+      mode: "fast",
+      firstSeenAt: "2026-07-25T10:00:00.000Z",
+      lastSeenAt: "2026-07-25T12:00:00.000Z",
+    }];
+    const estimatedSpeedWeighting = emptySpeedWeightingCrossing();
+    estimatedSpeedWeighting.unknown["gpt-5.6"] = {
+      events: 2,
+      apiPriceEquivalentUsd: 1.25,
+    };
+    const sideChatEstimates = {
+      status: "available",
+      methodology: {
+        includedInCalibrationTimeline: true,
+      },
+      timeline: [{
+        startAt: "2026-07-25T11:00:00.000Z",
+        endAt: "2026-07-25T11:15:00.000Z",
+        usageEvents: 2,
+        totalTokens: 1_000,
+        apiPriceEquivalentUsd: 1.25,
+        speedWeighting: estimatedSpeedWeighting,
+        declaredSpeedWeighting: emptySpeedWeightingCrossing(),
+        components: {
+          input_uncached_tokens: 10,
+          input_cache_read_tokens: 900,
+          input_cache_write_tokens: 0,
+          output_text_tokens: 90,
+          output_reasoning_tokens: 0,
+          output_combined_tokens: 0,
+        },
+        pricingCoverage: {
+          fullyPricedEvents: 2,
+          partiallyPricedEvents: 0,
+          unpricedEvents: 0,
+        },
+      }],
+      periods: [],
+      recent: [],
+    };
+    const adjusted = await buildLocalCompanionSnapshot({
+      root,
+      codexHome,
+      includeDevelopmentSideChatEstimates: true,
+      fastModePreference: "fast",
+      codexSpeedBaselines,
+      sideChatEstimateCollector: async (options) => {
+        receivedCodexHome = options.codexHome;
+        receivedDeclaredBaselines = options.declaredSpeedBaselines;
+        return sideChatEstimates;
+      },
+      now,
+    });
+    assert.equal(receivedCodexHome, codexHome);
+    assert.deepEqual(receivedDeclaredBaselines, codexSpeedBaselines);
+    assert.deepEqual(
+      adjusted.overview.timeline.usage,
+      exact.overview.timeline.usage,
+    );
+    assert.equal(
+      adjusted.overview.accounting.apiPriceEquivalentUsd,
+      exact.overview.accounting.apiPriceEquivalentUsd,
+    );
+    assert.equal(
+      adjusted.overview.accounting.sideChatEstimates,
+      sideChatEstimates,
+    );
+    const exactBucket = exact.overview.timeline.usage[0];
+    const calibrationBucket = adjusted.overview.timeline.calibrationUsage[0];
+    assert.equal(calibrationBucket.usageEvents, exactBucket.usageEvents + 2);
+    assert.equal(calibrationBucket.totalTokens, exactBucket.totalTokens + 1_000);
+    assert.equal(
+      calibrationBucket.apiPriceEquivalentUsd,
+      exactBucket.apiPriceEquivalentUsd + 1.25,
+    );
+    assert.deepEqual(
+      adjusted.overview.timeline.allowanceWeightingEncoding,
+      {
+        schemaVersion: "quota-weighted-timeline-v0.1",
+        basisFamilyId:
+          "codex_primary:quota_weighted_api_equivalent:v1:fast_rates_2026_08_01:event_time:observed_declared_scenario",
+        scenarioOrder: [
+          "unresolved_as_standard",
+          "unresolved_as_fast",
+        ],
+        selectedScenario: "unresolved_as_fast",
+      },
+    );
+    assert.equal(calibrationBucket.allowanceWeighting.length, 16);
+    assert.equal(
+      calibrationBucket.allowanceWeighting[9],
+      exactBucket.allowanceWeighting[9] + 3.125,
+    );
+    // Fast scenario block: status, weighted USD, covered USD, observed,
+    // declared, preference-assumed, inferred, unresolved.
+    assert.equal(calibrationBucket.allowanceWeighting[8], 0);
+    assert.equal(calibrationBucket.allowanceWeighting[13], 2);
+    assert.equal(
+      calibrationBucket.components.input_cache_read_tokens,
+      exactBucket.components.input_cache_read_tokens + 900,
+    );
+    const withheld = await buildLocalCompanionSnapshot({
+      root,
+      codexHome,
+      includeDevelopmentSideChatEstimates: true,
+      fastModePreference: "fast",
+      sideChatEstimateCollector: async () => ({
+        ...sideChatEstimates,
+        methodology: {
+          includedInCalibrationTimeline: false,
+          calibrationStatus: "withheld_partial_retention",
+        },
+      }),
+      now,
+    });
+    assert.deepEqual(
+      withheld.overview.timeline.calibrationUsage,
+      exact.overview.timeline.usage,
+    );
+    assert.equal(
+      withheld.overview.accounting.apiPriceEquivalentUsd,
+      exact.overview.accounting.apiPriceEquivalentUsd,
+    );
+    assert.equal(
+      withheld.overview.accounting.sideChatEstimates.methodology
+        .calibrationStatus,
+      "withheld_partial_retention",
+    );
+    let historicalGapOptions = null;
+    await buildLocalCompanionSnapshot({
+      root,
+      codexHome,
+      includeDevelopmentSideChatEstimates: true,
+      fastModePreference: "fast",
+      codexSpeedBaselines,
+      developmentSideChatHistoricalGapDate: "2026-07-13",
+      sideChatEstimateCollector: async () => ({
+        status: "unavailable",
+        methodology: null,
+        timeline: [],
+      }),
+      sideChatHistoricalGapCollector: async (options) => {
+        historicalGapOptions = options;
+        return { status: "unavailable", errorCode: "fixture_unavailable" };
+      },
+      now,
+    });
+    assert.equal(historicalGapOptions.fastModePreference, "fast");
+    assert.deepEqual(
+      historicalGapOptions.declaredSpeedBaselines,
+      codexSpeedBaselines,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -1238,6 +1439,25 @@ test("live weekly cache replaces the repo artifact and labels historical account
     });
     assert.equal(snapshot.weekly.dataClass, "live_replay_safe_cache");
     assert.equal(snapshot.weekly.status, "insufficient_evidence");
+    // The diagnostic contract is still attached when recent accounting comes
+    // from the replay-safe cache. With no unified index, it is explicitly
+    // unavailable rather than presented as a measured zero.
+    assert.equal(
+      snapshot.overview.accounting.cacheSwitchImpact.status,
+      "unavailable",
+    );
+    assert.deepEqual(
+      snapshot.overview.accounting.cacheSwitchImpact.periods,
+      [],
+    );
+    assert.equal(
+      snapshot.overview.accounting.cacheContinuityImpact.status,
+      "unavailable",
+    );
+    assert.deepEqual(
+      snapshot.overview.accounting.cacheContinuityImpact.periods,
+      [],
+    );
     assert.equal(
       snapshot.weekly.accountAttribution.label,
       "Historical estimate; account-unattributed and may combine multiple accounts",
@@ -1549,6 +1769,55 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
     assert.equal(
       snapshot.overview.accounting.accountingSource,
       "unified_local_index_replay_suppressed",
+    );
+    assert.equal(
+      snapshot.overview.accounting.cacheSwitchImpact.status,
+      "available",
+    );
+    assert.equal(
+      snapshot.overview.accounting.cacheSwitchImpact.periods.length,
+      4,
+    );
+    assert.equal(
+      snapshot.overview.accounting.cacheSwitchImpact.cacheReadDrops,
+      0,
+    );
+    assert.equal(
+      snapshot.overview.accounting.cacheSwitchImpact.estimatedPremiumUsd,
+      0,
+    );
+    assert.equal(
+      snapshot.overview.accounting.cacheSwitchImpact.orderingCoverageGaps,
+      0,
+    );
+    assert.equal(
+      snapshot.overview.accounting.cacheContinuityImpact.status,
+      "available",
+    );
+    assert.equal(
+      snapshot.overview.accounting.cacheContinuityImpact.periodId,
+      "7d",
+    );
+    assert.equal(
+      snapshot.overview.accounting.cacheContinuityImpact.periods.length,
+      4,
+    );
+    assert.equal(
+      snapshot.overview.accounting.cacheContinuityImpact.minimumGapSeconds,
+      0,
+    );
+    assert.equal(
+      snapshot.overview.accounting.cacheContinuityImpact.cacheReadDrops,
+      0,
+    );
+    assert.equal(
+      snapshot.overview.accounting.cacheContinuityImpact.orderingCoverageGaps,
+      0,
+    );
+    assert.equal(
+      snapshot.overview.monitoringGaps.find((row) => row.id === "reasoning_effort")
+        ?.status,
+      "partial",
     );
     assert.ok(!snapshot.overview.warnings.some((warning) => (
       warning.includes("live collector projection")

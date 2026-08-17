@@ -162,6 +162,12 @@ const ACCOUNTING_BUDGET_MISS_CODES = new Set([
   "accounting_scan_rss_limit_exceeded",
 ]);
 const ACCOUNTING_RSS_CHECK_INTERVAL = 2_048;
+// This scanner runs inside the same process that immediately expands the
+// full-history calibration corpus. Four extraction workers preserve useful
+// parallelism without leaving ten V8 worker heaps resident for that second
+// phase. The general analysis-index and unified-index worker policies remain
+// unchanged.
+const DEFAULT_ACCOUNTING_INDEX_WORKERS = 4;
 const COMPACT_USAGE_RETAINED_BYTES = 256;
 const COMPACT_SNAPSHOT_RETAINED_BYTES = 192;
 const DEFAULT_TRANSITION_RESOURCE_LIMITS = Object.freeze({
@@ -630,10 +636,15 @@ function transitionUsageProjection(event, projection) {
   const multiplier = fastQuotaMultiplier(projection.model);
   const fastWeightedEquivalentUsd =
     multiplier === null ? null : costUsd * multiplier;
-  const quotaWeightedLowerUsd = projection.speed === "fast"
+  const effectiveSpeed = ["standard", "fast"].includes(projection.speed)
+    ? projection.speed
+    : ["standard", "fast"].includes(projection.declaredSpeed)
+      ? projection.declaredSpeed
+      : "unknown";
+  const quotaWeightedLowerUsd = effectiveSpeed === "fast"
     ? fastWeightedEquivalentUsd
     : costUsd;
-  const quotaWeightedUpperUsd = projection.speed === "standard"
+  const quotaWeightedUpperUsd = effectiveSpeed === "standard"
     ? costUsd
     : fastWeightedEquivalentUsd;
   return [
@@ -1645,6 +1656,14 @@ function compactSnapshotGroupKey(row) {
 // batches against a usage slice that covers every window start in the batch
 // reproduces the unbatched result exactly.
 const CALIBRATION_BATCH_TRANSITION_BUDGET = 8_000;
+// The transition ceiling alone is not a useful memory bound: a few quota
+// changes spread across many high-volume days can still make one batch decode
+// hundreds of thousands of compact usage rows at once. Partition on the
+// actual contiguous usage slice too. This is a working-set bound only; every
+// row remains in exactly one derivation slice (apart from the intentional
+// overlap required by overlapping reset windows), so it does not shorten the
+// calibration history or discard evidence.
+const CALIBRATION_BATCH_USAGE_BUDGET = 50_000;
 
 async function deriveBoundedWeeklyCalibrationSeries({
   startAt,
@@ -1719,7 +1738,8 @@ async function deriveBoundedWeeklyCalibrationSeries({
   throwIfAborted(signal);
   resourceCheck?.();
 
-  if (totalTransitions <= CALIBRATION_BATCH_TRANSITION_BUDGET) {
+  if (totalTransitions <= CALIBRATION_BATCH_TRANSITION_BUDGET
+      && rawUsageEvents.length <= CALIBRATION_BATCH_USAGE_BUDGET) {
     const series = await derive(rawUsageEvents, rateLimitSnapshots);
     return {
       transitions: series.transitions,
@@ -1754,10 +1774,23 @@ async function deriveBoundedWeeklyCalibrationSeries({
   const batches = [];
   let current = null;
   for (const group of orderedGroups) {
+    const nextSliceStartMs = Math.min(
+      current?.sliceStartMs ?? Number.POSITIVE_INFINITY,
+      group.sliceStartMs,
+    );
+    const nextSliceEndMs = Math.max(
+      current?.sliceEndMs ?? Number.NEGATIVE_INFINITY,
+      group.lastMs,
+    );
+    const nextUsageRows = firstIndexAbove(sortedMs, nextSliceEndMs)
+      - (nextSliceStartMs === Number.NEGATIVE_INFINITY
+        ? 0
+        : firstIndexAtLeast(sortedMs, nextSliceStartMs));
     if (current === null
         || (current.groups.length > 0
-          && current.transitions + group.transitions
-            > CALIBRATION_BATCH_TRANSITION_BUDGET)) {
+          && (current.transitions + group.transitions
+              > CALIBRATION_BATCH_TRANSITION_BUDGET
+            || nextUsageRows > CALIBRATION_BATCH_USAGE_BUDGET))) {
       current = {
         groups: [],
         transitions: 0,
@@ -2013,6 +2046,7 @@ async function readUnifiedIndexCalibrationCorpus({
   indexFile,
   endMs,
   limits,
+  declaredSpeedBaselines,
   signal,
   checkRuntimeMemory,
 }) {
@@ -2113,6 +2147,9 @@ async function readUnifiedIndexCalibrationCorpus({
         // The calibration corpus mirrors the scan retention exactly: no
         // zero-token rows, and no separately metered Spark rows.
         if (event === null || event.isSpark) continue;
+        event.declaredSpeed = event.speed === "unknown"
+          ? declaredSpeedModeAt(declaredSpeedBaselines, observedMs) ?? "unknown"
+          : "unknown";
         stampedUsage.push([
           observedMs,
           transitionUsageProjection(rawEvent, event),
@@ -2533,6 +2570,7 @@ export async function buildReplaySafeAccountingCache({
       indexFile: unifiedIndexFile,
       endMs,
       limits,
+      declaredSpeedBaselines: baselines,
       signal,
       checkRuntimeMemory,
     });
@@ -2775,9 +2813,7 @@ export async function refreshReplaySafeAccountingCache({
   const effectiveScan = scan ?? createIndexedCodexLogScan({
     indexFile: selectedIndexFile,
     secretFile: selectedIndexSecretFile,
-    ...(indexWorkerCount === undefined
-      ? {}
-      : { workerCount: indexWorkerCount }),
+    workerCount: indexWorkerCount ?? DEFAULT_ACCOUNTING_INDEX_WORKERS,
     ...(indexChunkBytes === undefined
       ? {}
       : { chunkBytes: indexChunkBytes }),

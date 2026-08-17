@@ -91,7 +91,12 @@ function priceUsageEvent(event, priceCards) {
   const costUsd = Number(ledger.totalUsd);
   const multiplier = fastQuotaMultiplier(event.model);
   const fastWeightedEquivalentUsd = multiplier === null ? null : costUsd * multiplier;
-  const speedMode = event.tierSemantics?.codexSpeedMode ?? "unknown";
+  const observedSpeedMode = event.tierSemantics?.codexSpeedMode ?? "unknown";
+  const speedMode = ["standard", "fast"].includes(observedSpeedMode)
+    ? observedSpeedMode
+    : ["standard", "fast"].includes(event.declaredSpeed)
+      ? event.declaredSpeed
+      : "unknown";
   return {
     ...event,
     costUsd,
@@ -180,11 +185,24 @@ function aggregateCost(events, startExclusiveMs, endInclusiveMs) {
   return roundUsd(endCost - startCost);
 }
 
-function aggregateCumulativeField(events, startExclusiveMs, endInclusiveMs, field) {
+function aggregateCumulativeScenarioField(
+  events,
+  startExclusiveMs,
+  endInclusiveMs,
+  field,
+  unknownField,
+) {
   const startIndex = upperBound(events, startExclusiveMs);
   const endIndex = upperBound(events, endInclusiveMs);
   const startValue = startIndex === 0 ? 0 : events[startIndex - 1][field];
   const endValue = endIndex === 0 ? 0 : events[endIndex - 1][field];
+  const startUnknown = startIndex === 0
+    ? 0
+    : events[startIndex - 1][unknownField];
+  const endUnknown = endIndex === 0 ? 0 : events[endIndex - 1][unknownField];
+  if (!Number.isSafeInteger(startUnknown)
+      || !Number.isSafeInteger(endUnknown)
+      || endUnknown !== startUnknown) return null;
   if (!Number.isFinite(startValue) || !Number.isFinite(endValue)) return null;
   return roundUsd(endValue - startValue);
 }
@@ -277,10 +295,10 @@ function makeTransition({
   const localWindowStartExclusiveMs = Math.max(scanStartMs, windowStartMs) - 1;
   const cumulativePriorCostUsd = aggregateCost(usageEvents, localWindowStartExclusiveMs, prior.timestampMs);
   const cumulativeNextCostUsd = aggregateCost(usageEvents, localWindowStartExclusiveMs, next.timestampMs);
-  const cumulativePriorQuotaWeightedLowerUsd = aggregateCumulativeField(usageEvents, localWindowStartExclusiveMs, prior.timestampMs, "cumulativeQuotaWeightedLowerUsd");
-  const cumulativeNextQuotaWeightedLowerUsd = aggregateCumulativeField(usageEvents, localWindowStartExclusiveMs, next.timestampMs, "cumulativeQuotaWeightedLowerUsd");
-  const cumulativePriorQuotaWeightedUpperUsd = aggregateCumulativeField(usageEvents, localWindowStartExclusiveMs, prior.timestampMs, "cumulativeQuotaWeightedUpperUsd");
-  const cumulativeNextQuotaWeightedUpperUsd = aggregateCumulativeField(usageEvents, localWindowStartExclusiveMs, next.timestampMs, "cumulativeQuotaWeightedUpperUsd");
+  const cumulativePriorQuotaWeightedLowerUsd = aggregateCumulativeScenarioField(usageEvents, localWindowStartExclusiveMs, prior.timestampMs, "cumulativeQuotaWeightedLowerUsd", "cumulativeQuotaWeightedLowerUnknownEvents");
+  const cumulativeNextQuotaWeightedLowerUsd = aggregateCumulativeScenarioField(usageEvents, localWindowStartExclusiveMs, next.timestampMs, "cumulativeQuotaWeightedLowerUsd", "cumulativeQuotaWeightedLowerUnknownEvents");
+  const cumulativePriorQuotaWeightedUpperUsd = aggregateCumulativeScenarioField(usageEvents, localWindowStartExclusiveMs, prior.timestampMs, "cumulativeQuotaWeightedUpperUsd", "cumulativeQuotaWeightedUpperUnknownEvents");
+  const cumulativeNextQuotaWeightedUpperUsd = aggregateCumulativeScenarioField(usageEvents, localWindowStartExclusiveMs, next.timestampMs, "cumulativeQuotaWeightedUpperUsd", "cumulativeQuotaWeightedUpperUnknownEvents");
   const marginal = aggregateUsage(
     usageEvents,
     prior.timestampMs,
@@ -568,6 +586,45 @@ function decodePrepricedCompactAccountingUsage(value) {
   };
 }
 
+// The replay-cache calibration never returns normalized usage events; it only
+// needs the fields consumed while collapsing quota transitions. Decode its v2
+// compact rows directly into that working shape instead of materializing the
+// full public event and then spreading it twice. On a 500k-event history those
+// short-lived copies otherwise dominate the RSS peak even though the durable
+// output is only a bounded reset summary.
+function decodeLeanPrepricedCompactAccountingUsage(value, sequence) {
+  if (!Array.isArray(value)
+      || value.length !== 20
+      || !Array.isArray(value[16])
+      || !Array.isArray(value[17])
+      || !Array.isArray(value[18])
+      || !Array.isArray(value[19])) return null;
+  const timestampMs = Date.parse(value[0]);
+  return {
+    timestamp: value[0],
+    timestampMs,
+    sequence,
+    model: value[1],
+    components: {
+      input_uncached_tokens: value[3],
+      input_cache_read_tokens: value[4],
+      input_cache_write_tokens: value[5],
+      output_text_tokens: value[6],
+      output_reasoning_tokens: value[7],
+      output_combined_tokens: value[8],
+    },
+    tierSemantics: { codexSpeedMode: value[9] },
+    costUsd: value[10],
+    costUsdExact: value[11],
+    quotaWeightedLowerUsd: value[14],
+    quotaWeightedUpperUsd: value[15],
+    coverageWarningCodes: value[17],
+    priceCardIds: value[18],
+    priceCardBreakdown: value[19],
+    prepricedAccountingInput: true,
+  };
+}
+
 function decodeCompactAccountingSnapshot(value) {
   if (!Array.isArray(value) || value.length !== 9) return null;
   return {
@@ -595,6 +652,7 @@ async function normalizeTransitionInputsCooperatively({
   signal,
   consumeInputs,
   inputEncoding,
+  leanPrepricedInput,
   resourceCheck,
 }) {
   let sequence = 0;
@@ -603,6 +661,20 @@ async function normalizeTransitionInputsCooperatively({
     await cooperativeCheckpoint(index, signal, { resourceCheck });
     const source = rawUsageEvents[index];
     if (consumeInputs) rawUsageEvents[index] = null;
+    if (leanPrepricedInput) {
+      const normalized = decodeLeanPrepricedCompactAccountingUsage(
+        source,
+        sequence,
+      );
+      if (normalized === null) continue;
+      sequence += 1;
+      if (Number.isFinite(normalized.timestampMs)
+          && normalized.timestampMs >= scanStartMs
+          && normalized.timestampMs <= scanEndMs) {
+        usageInput.push(normalized);
+      }
+      continue;
+    }
     const event = inputEncoding === "accounting_compact_v1"
       ? decodeCompactAccountingUsage(source)
       : ["accounting_prepriced_compact_v1", "accounting_prepriced_compact_v2"].includes(inputEncoding)
@@ -721,7 +793,8 @@ async function priceUsageEventsCooperatively({
   let cumulativeScanCostUsdExact = "0";
   let cumulativeQuotaWeightedLowerUsd = 0;
   let cumulativeQuotaWeightedUpperUsd = 0;
-  let quotaWeightedSensitivityComplete = true;
+  let cumulativeQuotaWeightedLowerUnknownEvents = 0;
+  let cumulativeQuotaWeightedUpperUnknownEvents = 0;
   const usageEvents = [];
   for (let index = 0; index < usageInput.length; index += 1) {
     await cooperativeCheckpoint(index, signal, { resourceCheck });
@@ -733,28 +806,43 @@ async function priceUsageEventsCooperatively({
       cumulativeScanCostUsdExact,
       priced.costUsdExact,
     );
-    if (!Number.isFinite(priced.quotaWeightedLowerUsd)
-        || !Number.isFinite(priced.quotaWeightedUpperUsd)) {
-      quotaWeightedSensitivityComplete = false;
-    } else {
+    if (Number.isFinite(priced.quotaWeightedLowerUsd)) {
       cumulativeQuotaWeightedLowerUsd = roundUsd(
         cumulativeQuotaWeightedLowerUsd + priced.quotaWeightedLowerUsd,
       );
+    } else {
+      cumulativeQuotaWeightedLowerUnknownEvents += 1;
+    }
+    if (Number.isFinite(priced.quotaWeightedUpperUsd)) {
       cumulativeQuotaWeightedUpperUsd = roundUsd(
         cumulativeQuotaWeightedUpperUsd + priced.quotaWeightedUpperUsd,
       );
+    } else {
+      cumulativeQuotaWeightedUpperUnknownEvents += 1;
     }
-    usageEvents.push({
-      ...priced,
-      cumulativeScanCostUsd,
-      cumulativeScanCostUsdExact,
-      cumulativeQuotaWeightedLowerUsd: quotaWeightedSensitivityComplete
-        ? cumulativeQuotaWeightedLowerUsd
-        : null,
-      cumulativeQuotaWeightedUpperUsd: quotaWeightedSensitivityComplete
-        ? cumulativeQuotaWeightedUpperUsd
-        : null,
-    });
+    if (priced.prepricedAccountingInput === true) {
+      priced.cumulativeScanCostUsd = cumulativeScanCostUsd;
+      priced.cumulativeScanCostUsdExact = cumulativeScanCostUsdExact;
+      priced.cumulativeQuotaWeightedLowerUsd =
+        cumulativeQuotaWeightedLowerUsd;
+      priced.cumulativeQuotaWeightedUpperUsd =
+        cumulativeQuotaWeightedUpperUsd;
+      priced.cumulativeQuotaWeightedLowerUnknownEvents =
+        cumulativeQuotaWeightedLowerUnknownEvents;
+      priced.cumulativeQuotaWeightedUpperUnknownEvents =
+        cumulativeQuotaWeightedUpperUnknownEvents;
+      usageEvents.push(priced);
+    } else {
+      usageEvents.push({
+        ...priced,
+        cumulativeScanCostUsd,
+        cumulativeScanCostUsdExact,
+        cumulativeQuotaWeightedLowerUsd,
+        cumulativeQuotaWeightedUpperUsd,
+        cumulativeQuotaWeightedLowerUnknownEvents,
+        cumulativeQuotaWeightedUpperUnknownEvents,
+      });
+    }
     usageInput[index] = null;
   }
   usageInput.length = 0;
@@ -762,6 +850,9 @@ async function priceUsageEventsCooperatively({
     force: true,
     resourceCheck,
   });
+  const quotaWeightedSensitivityComplete =
+    cumulativeQuotaWeightedLowerUnknownEvents === 0
+    && cumulativeQuotaWeightedUpperUnknownEvents === 0;
   return {
     usageEvents,
     quotaWeightedSensitivityComplete,
@@ -964,6 +1055,9 @@ export async function deriveCodexTransitionSeriesCooperatively({
     signal,
     consumeInputs,
     inputEncoding,
+    leanPrepricedInput:
+      inputEncoding === "accounting_prepriced_compact_v2"
+      && includeNormalizedInputs === false,
     resourceCheck,
   });
   const priced = await priceUsageEventsCooperatively({
@@ -1076,7 +1170,8 @@ export function deriveCodexTransitionSeries({
   let cumulativeScanCostUsdExact = "0";
   let cumulativeQuotaWeightedLowerUsd = 0;
   let cumulativeQuotaWeightedUpperUsd = 0;
-  let quotaWeightedSensitivityComplete = true;
+  let cumulativeQuotaWeightedLowerUnknownEvents = 0;
+  let cumulativeQuotaWeightedUpperUnknownEvents = 0;
   const usageEvents = usageInput.map((event) => {
     const priced = priceUsageEvent(event, priceCards);
     cumulativeScanCostUsd = roundUsd(cumulativeScanCostUsd + priced.costUsd);
@@ -1084,29 +1179,33 @@ export function deriveCodexTransitionSeries({
       cumulativeScanCostUsdExact,
       priced.costUsdExact,
     );
-    if (!Number.isFinite(priced.quotaWeightedLowerUsd)
-        || !Number.isFinite(priced.quotaWeightedUpperUsd)) {
-      quotaWeightedSensitivityComplete = false;
-    } else {
+    if (Number.isFinite(priced.quotaWeightedLowerUsd)) {
       cumulativeQuotaWeightedLowerUsd = roundUsd(
         cumulativeQuotaWeightedLowerUsd + priced.quotaWeightedLowerUsd,
       );
+    } else {
+      cumulativeQuotaWeightedLowerUnknownEvents += 1;
+    }
+    if (Number.isFinite(priced.quotaWeightedUpperUsd)) {
       cumulativeQuotaWeightedUpperUsd = roundUsd(
         cumulativeQuotaWeightedUpperUsd + priced.quotaWeightedUpperUsd,
       );
+    } else {
+      cumulativeQuotaWeightedUpperUnknownEvents += 1;
     }
     return {
       ...priced,
       cumulativeScanCostUsd,
       cumulativeScanCostUsdExact,
-      cumulativeQuotaWeightedLowerUsd: quotaWeightedSensitivityComplete
-        ? cumulativeQuotaWeightedLowerUsd
-        : null,
-      cumulativeQuotaWeightedUpperUsd: quotaWeightedSensitivityComplete
-        ? cumulativeQuotaWeightedUpperUsd
-        : null,
+      cumulativeQuotaWeightedLowerUsd,
+      cumulativeQuotaWeightedUpperUsd,
+      cumulativeQuotaWeightedLowerUnknownEvents,
+      cumulativeQuotaWeightedUpperUnknownEvents,
     };
   });
+  const quotaWeightedSensitivityComplete =
+    cumulativeQuotaWeightedLowerUnknownEvents === 0
+    && cumulativeQuotaWeightedUpperUnknownEvents === 0;
   const collapsed = collapseTransitions({
     snapshots,
     usageEvents,

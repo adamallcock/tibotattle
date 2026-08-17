@@ -2262,8 +2262,19 @@ function createPreparedLocalCompanionServer({
       collectorStateFile: statePaths.collectorStateFile,
       archiveIndexFile: statePaths.archiveAccountingIndexFile,
       unifiedIndexFile: statePaths.unifiedIndexFile,
+      codexHome,
       allowDevelopmentArtifactFallback:
         environment.USAGE_MONITOR_DEVELOPMENT_ARTIFACT_FALLBACK === "1",
+      includeDevelopmentSideChatEstimates:
+        environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_ESTIMATES === "1",
+      developmentSideChatHistoricalGapDate:
+        environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_DATE ?? null,
+      developmentSideChatHistoricalGapTimeZone:
+        environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_TIME_ZONE
+          ?? "America/New_York",
+      developmentSideChatHistoricalGapAssumedSpeed:
+        environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_SPEED
+          ?? "fast",
       // The owner's stated Codex speed mode. It attributes only the turns that
       // precede the first recorded tier change in their session; an observed
       // tier always wins. A missing or unreadable statement degrades to the
