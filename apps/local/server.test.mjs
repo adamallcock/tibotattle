@@ -306,6 +306,7 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     assert.equal(health.status, 200);
     assert.deepEqual((await health.json()).capabilities, {
       localDashboard: true,
+      claudeDesktopQuota: true,
       explicitRefresh: true,
       contributionPreview: true,
       contributionPreparation: true,

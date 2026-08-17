@@ -384,31 +384,30 @@ tombstones, while rebuildable canonical/pricing files are removed.
 - Focused Claude/Phase 0/shared-reader/watchdog suite: 82 passed, 0 failed, 0 skipped.
 - Final change-focused accounting/density/canonicalization/ledger/shadow/local-refresh
   closure suite: 108 passed, 0 failed, 0 skipped. The dormant production wiring's two
-  custom-root/disabled-path regressions also passed without opening a listener. The
-  all-Claude file set reported 98 passed and only the four loopback-route cases below
-  failed in the network sandbox.
-- Claude quota loopback route suite: 4 passed, 0 failed, 0 skipped when rerun outside
-  the network sandbox. Adjacent production
-  companion contribution-route regression suite: 8 passed, 0 failed, 0 skipped.
+  custom-root/disabled-path regressions also passed without opening a listener.
+- The complete `test/claude-desktop-*.test.js` set passed 102/102 outside the restricted
+  network sandbox, including all four loopback quota-route cases.
+- The complete local-product suite passed 196/196 outside the restricted network
+  sandbox after the closed health-capability expectation was updated for
+  `claudeDesktopQuota`.
 - Expanded adjacent boundary suite: 78 passed and 1 failed. The failure is an existing
   exact platform-export inventory mismatch for unrelated contribution-device reader
   symbols; all Claude, bounded-reader, resource-policy, and Codex-provider assertions
   passed.
-- The internal Claude incremental benchmark worker is classified; the gate passed with
-  59 records and 61 executable paths immediately afterward. A concurrently added,
-  unrelated untracked `scripts/preview-public-release-site.js` subsequently made the
-  live whole-repository inventory gate non-green, and that separate work was preserved.
-- Architecture boundary check: passed with 360 production files, 1,376 imports, and no
+- The internal Claude incremental benchmark worker is classified. The clean source-only
+  branch's inventory gate passed with 59 records, 61 executable paths, and 52 aliases.
+- Architecture boundary check: passed with 355 production files, 1,370 imports, and no
   approved debt edges.
-- Direct validation of every new relative documentation link: passed.
-- Repository documentation-link maintenance: blocked before checking these documents
-  by the existing symlink at
-  `.release-archive/stable/0.1.0/TiboTattle.app/Contents/Frameworks/Sparkle.framework/Autoupdate`.
-- The full `npm test` run completed but was not green. Retained R7 release receipts are
-  intentionally stale because they bind the exact `src/` workload digest; they were not
-  regenerated as part of this feature task. Resource-sampling/journal-owner R7 cases,
-  loopback quota routes blocked by sandbox `EPERM`, existing first-run/platform and
-  macOS packaging/runtime cases, and one shared-quota-track assertion also failed. The
-  one failure caused by this work—the missing internal benchmark-worker inventory
-  record—was repaired and the five-test inventory gate passed before the unrelated
-  preview script appeared. Unrelated dirty-worktree paths were preserved.
+- The reviewed client exporter allow-list now closes over the dormant Claude local-server
+  imports. Its artifact and no-clobber tests passed 2/2; no client artifact was published.
+- Repository documentation-link maintenance passed: documentation links are normalized.
+- The authoritative full `npm test` run outside the restricted sandbox completed with
+  2,313 tests: 2,300 passed, 9 failed, and 4 skipped. A detached `origin/main`
+  comparison reproduced every remaining failure: two stale export public-API lists,
+  one stale platform public-API list, one quota-kernel hash and one shared-quota behavior
+  assertion, two retained R7 workload-provenance receipts, and two synthetic R7
+  lifecycle-determinism checks. The Claude branch added no failing test after the client
+  exporter closure was repaired. The retained R7 receipts were not regenerated because
+  dual-runtime client-release qualification is a separate release gate.
+- The source-only extraction was based on the current `0.1.12` source, did not bump the
+  client version, and did not deploy a client, Worker, or public support surface.
