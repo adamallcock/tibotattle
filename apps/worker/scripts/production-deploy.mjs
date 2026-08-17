@@ -37,6 +37,12 @@ import { runReleasePreflight } from "./release-preflight.mjs";
 export const PRODUCTION_DEPLOY_CONFIRMATION =
   "DEPLOY_PRODUCTION";
 const PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS = 10_000;
+// Wrangler creates these runtime-state directories at the node_modules root
+// while release preflight runs. They contain account/Miniflare cache data, not
+// installed package code, and can legitimately appear after the dependency
+// snapshot is taken. Skip only these root entries: identically named paths
+// inside an installed package remain covered by the integrity digest.
+const DEPENDENCY_RUNTIME_STATE_DIRECTORIES = new Set([".cache", ".mf"]);
 const PRODUCTION_PUBLIC_SURFACE_FORBIDDEN_PATHS = Object.freeze([
   "/app.js",
   "/data-client.js",
@@ -397,9 +403,11 @@ async function requireAbsent(path, label) {
  * is realpath-resolved, so a symlinked node_modules digests the bytes of its
  * target. Entries are visited in a fixed sorted order and file content, symlink
  * targets, sizes, and directory structure all contribute, so any post-snapshot
- * mutation of the mutable dependency tree produces a different digest. Symlinks
- * are recorded by target string rather than followed, so internal `.bin` links
- * and cycles neither escape the tree nor double-count content.
+ * mutation of installed dependency content produces a different digest. Known
+ * Wrangler runtime-state directories at the root are excluded because preflight
+ * legitimately creates them after the snapshot. Symlinks are recorded by target
+ * string rather than followed, so internal `.bin` links and cycles neither
+ * escape the tree nor double-count content.
  *
  * This is the mitigation for the ignored-node_modules gap: the snapshot records
  * this digest, and the deploy path reverifies it immediately before and after
@@ -415,6 +423,10 @@ export async function dependencyTreeDigest(rootPath) {
       left.name < right.name ? -1 : left.name > right.name ? 1 : 0
     ));
     for (const entry of entries) {
+      if (relativePath === ""
+          && DEPENDENCY_RUNTIME_STATE_DIRECTORIES.has(entry.name)) {
+        continue;
+      }
       const childAbsolute = join(absolute, entry.name);
       const childRelative = relativePath === ""
         ? entry.name

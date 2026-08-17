@@ -26,6 +26,7 @@ import {
   PRODUCTION_DEPLOY_CONFIRMATION,
   PRODUCTION_MIGRATION_LEDGER_SQL,
   createImmutableSourceSnapshot,
+  dependencyTreeDigest,
   determinePendingProductionMigrations,
   runProductionDeployment,
   recheckProductionHealth,
@@ -198,6 +199,40 @@ function options(overrides = {}) {
     ...overrides,
   };
 }
+
+test("dependency digest ignores only root Wrangler runtime state", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-dependency-digest-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const installedPackage = join(root, "installed-package");
+  await mkdir(installedPackage, { recursive: true });
+  await writeFile(join(installedPackage, "index.js"), "export const value = 1;\n");
+
+  const installedDigest = await dependencyTreeDigest(root);
+  await mkdir(join(root, ".cache", "wrangler"), { recursive: true });
+  await writeFile(
+    join(root, ".cache", "wrangler", "wrangler-account.json"),
+    '{"account":"first-run-cache"}\n',
+  );
+  await mkdir(join(root, ".mf"), { recursive: true });
+  await writeFile(join(root, ".mf", "cf.json"), '{"runtime":"local"}\n');
+  assert.equal(await dependencyTreeDigest(root), installedDigest);
+
+  await writeFile(
+    join(root, ".cache", "wrangler", "wrangler-account.json"),
+    '{"account":"refreshed-cache"}\n',
+  );
+  assert.equal(await dependencyTreeDigest(root), installedDigest);
+
+  // The exception is root-scoped. Package content, including a nested path
+  // with the same name as a runtime cache, remains integrity-bound.
+  await mkdir(join(installedPackage, ".cache"), { recursive: true });
+  await writeFile(join(installedPackage, ".cache", "package-state"), "bound\n");
+  const nestedCacheDigest = await dependencyTreeDigest(root);
+  assert.notEqual(nestedCacheDigest, installedDigest);
+
+  await writeFile(join(installedPackage, "index.js"), "export const value = 2;\n");
+  assert.notEqual(await dependencyTreeDigest(root), nestedCacheDigest);
+});
 
 // Re-pin: this end-to-end path previously required an injected containment
 // proof; it now exercises the real migration gate against the snapshot's
