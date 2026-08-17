@@ -49,6 +49,8 @@ import {
 } from "../../config/product-brand.js";
 import {
   createCentralOutboundFetch,
+  createLocalCompanionServer,
+  resolveClaudeDesktopShadowConfiguration,
   startLocalCompanionServer,
 } from "./server.js";
 
@@ -304,6 +306,7 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     assert.equal(health.status, 200);
     assert.deepEqual((await health.json()).capabilities, {
       localDashboard: true,
+      claudeDesktopQuota: true,
       explicitRefresh: true,
       contributionPreview: true,
       contributionPreparation: true,
@@ -3149,6 +3152,120 @@ test("production root environment keeps writable queue state outside resources",
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
+  }
+});
+
+test("Claude shadow roots follow provider configuration and a real project, not installed resources", async () => {
+  const files = await fixture();
+  const home = join(files.root, "claude-home");
+  const config = join(home, "custom-config");
+  const project = join(files.root, "real-claude-project");
+  await mkdir(config, { recursive: true, mode: 0o700 });
+  await mkdir(project, { recursive: true, mode: 0o700 });
+  try {
+    const fromEnvironment = resolveClaudeDesktopShadowConfiguration({
+      environment: {
+        HOME: home,
+        CLAUDE_CONFIG_DIR: config,
+        CLAUDE_PROJECT_DIR: project,
+      },
+      fallbackProjectDirectory: files.resourceRoot,
+    });
+    assert.deepEqual(fromEnvironment, {
+      claudeConfigDirectory: config,
+      claudeProjectDirectory: project,
+    });
+    assert.notEqual(fromEnvironment.claudeProjectDirectory, files.resourceRoot);
+
+    const fromOptions = resolveClaudeDesktopShadowConfiguration({
+      options: {
+        claudeConfigDirectory: join(files.root, "option-config"),
+        claudeProjectDirectory: join(files.root, "option-project"),
+      },
+      environment: {
+        CLAUDE_CONFIG_DIR: join(files.root, "environment-config"),
+        CLAUDE_PROJECT_DIR: join(files.root, "environment-project"),
+      },
+      fallbackProjectDirectory: files.resourceRoot,
+    });
+    assert.equal(fromOptions.claudeConfigDirectory, join(files.root, "option-config"));
+    assert.equal(fromOptions.claudeProjectDirectory, join(files.root, "option-project"));
+
+    const defaultConfig = resolveClaudeDesktopShadowConfiguration({
+      environment: { HOME: home },
+      fallbackProjectDirectory: project,
+    });
+    assert.equal(defaultConfig.claudeConfigDirectory, undefined);
+    assert.equal(defaultConfig.claudeProjectDirectory, project);
+    assert.throws(
+      () => resolveClaudeDesktopShadowConfiguration({
+        environment: { CLAUDE_CONFIG_DIR: "relative-config" },
+        fallbackProjectDirectory: project,
+      }),
+      (error) => error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID",
+    );
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("Claude shadow wiring ignores malformed env when disabled and forwards roots when enabled", async () => {
+  const disabledFiles = await fixture();
+  try {
+    const disabledApp = createLocalCompanionServer({
+      environment: {
+        HOME: join(disabledFiles.root, "home"),
+        CLAUDE_CONFIG_DIR: "relative-config",
+        CLAUDE_PROJECT_DIR: "relative-project",
+      },
+      resourceRoot: disabledFiles.resourceRoot,
+      stateRoot: disabledFiles.stateRoot,
+      codexHome: disabledFiles.codexHome,
+      staticRoot: disabledFiles.staticRoot,
+      dataStore: fakeStore(),
+      refreshRunner: async () => ({}),
+    });
+    assert.equal(disabledApp.server.listening, false);
+  } finally {
+    await rm(disabledFiles.root, { recursive: true });
+  }
+
+  const enabledFiles = await fixture();
+  const home = join(enabledFiles.root, "claude-home");
+  const config = join(home, "custom-config");
+  const project = join(enabledFiles.root, "real-claude-project");
+  await mkdir(config, { recursive: true, mode: 0o700 });
+  await mkdir(project, { recursive: true, mode: 0o700 });
+  let received;
+  try {
+    const enabledApp = createLocalCompanionServer({
+      environment: {
+        HOME: home,
+        CLAUDE_CONFIG_DIR: config,
+        CLAUDE_PROJECT_DIR: project,
+      },
+      resourceRoot: enabledFiles.resourceRoot,
+      stateRoot: enabledFiles.stateRoot,
+      codexHome: enabledFiles.codexHome,
+      staticRoot: enabledFiles.staticRoot,
+      dataStore: fakeStore(),
+      refreshRunner: async () => ({}),
+      claudeShadowEnabled: true,
+      claudeShadowControllerFactory(configuration) {
+        received = configuration;
+        return { async refresh() { return { status: "disabled" }; } };
+      },
+    });
+    assert.equal(enabledApp.server.listening, false);
+    assert.deepEqual(received, {
+      enabled: true,
+      stateRoot: enabledFiles.stateRoot,
+      homeDirectory: home,
+      projectDirectory: project,
+      claudeConfigDirectory: config,
+    });
+  } finally {
+    await rm(enabledFiles.root, { recursive: true });
   }
 });
 

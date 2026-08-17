@@ -7,6 +7,13 @@ status: partial
 
 # G1 Claude Local Verification Receipt
 
+> **Desktop-app clarification (2026-08-16):** This receipt verifies the
+> transcript exporter and Claude Code CLI status-line callback available in July
+> 2026. It does not establish Claude Code desktop quota coverage. Current local
+> inspection found a separate native desktop quota history and distinct
+> desktop source, schema, coverage, and installed-product work. See
+> [Claude Code Desktop Support Findings](../research/2026-08-16-claude-code-desktop-support-findings.md).
+
 ## Outcome
 
 The local-only Claude usage path is implemented and verified on a real owner-local history. The Claude quota callback lifecycle is installed and its pre-response behavior is verified, but the required real non-null five-hour/seven-day callback remains open because the provider rejected the test request with a revoked-OAuth 401 before a response could expose quota windows.

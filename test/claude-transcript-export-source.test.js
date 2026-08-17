@@ -5,13 +5,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createClaudeTranscriptExportCursor,
+  createClaudeTranscriptExportPlanCheckpoint,
   createClaudeTranscriptExportSourcePlan,
+  restoreClaudeTranscriptExportSourcePlan,
   scanClaudeTranscriptExportSource,
   sliceClaudeTranscriptExportSourcePlan,
   verifyClaudeTranscriptExportSource,
 } from "../src/claude-transcript-export-source.js";
 import { createExportResourceGuard } from "../src/export-resource-policy.js";
 import { normalizeClaudeTranscriptUsageCandidate } from "../src/export-safe-records.js";
+import {
+  parseClaudeTranscriptRecord,
+} from "../src/application/export-sources/claude-transcript-record.js";
 
 const SECRET = Buffer.alloc(32, 71);
 const START_AT = "2026-07-24T12:00:00.000Z";
@@ -95,6 +100,53 @@ async function fixture() {
 function guard(overrides = {}) {
   return createExportResourceGuard({ scope: "export_set", limits: overrides });
 }
+
+test("Claude selective row parsing validates all JSON while discarding private bodies", () => {
+  const record = assistant("2026-07-24T12:10:00.000Z");
+  record.message.content[0].thinking = PRIVATE.repeat(64 * 1024);
+  record.message.content[1].text = PRIVATE.repeat(64 * 1024);
+  record.message.content[2].input = { nested: [PRIVATE.repeat(64 * 1024)] };
+  record.unrelated = { private: PRIVATE.repeat(64 * 1024) };
+  const parsed = parseClaudeTranscriptRecord(JSON.stringify(record));
+  assert.deepEqual(parsed, {
+    isSidechain: false,
+    sessionId: `session-${PRIVATE}`,
+    type: "assistant",
+    timestamp: "2026-07-24T12:10:00.000Z",
+    message: {
+      id: `${PRIVATE}-2026-07-24T12:10:00.000Z`,
+      model: "claude-opus-4-8",
+      content: [
+        { type: "thinking" },
+        { type: "text" },
+        { type: "tool_use", id: `${PRIVATE}-read-2026-07-24T12:10:00.000Z`, name: "Read" },
+        { type: "tool_use", id: `${PRIVATE}-bash-2026-07-24T12:10:00.000Z`, name: "Bash" },
+        { type: "server_tool_use", id: `${PRIVATE}-server-2026-07-24T12:10:00.000Z`, name: "web_search" },
+      ],
+      usage: {
+        input_tokens: 11,
+        cache_creation_input_tokens: 13,
+        cache_read_input_tokens: 17,
+        output_tokens: 19,
+        cache_creation: { ephemeral_5m_input_tokens: 13, ephemeral_1h_input_tokens: 0 },
+        speed: "fast",
+      },
+    },
+  });
+  assert.ok(JSON.stringify(parsed).length < 2_000);
+  assert.throws(
+    () => parseClaudeTranscriptRecord('{"type":"user","ignored":{"deep":[1,]}}'),
+    (error) => error.code === "claude_transcript_record_invalid_json",
+  );
+});
+
+test("Claude selective row parsing preserves JSON duplicate-key last-write semantics", () => {
+  const parsed = parseClaudeTranscriptRecord(
+    '{"type":"user","type":"assistant","message":{"id":"first","id":"last"}}',
+  );
+  assert.equal(parsed.type, "assistant");
+  assert.equal(parsed.message.id, "last");
+});
 
 test("Claude transcript discovery is recursive and scanner emits only closed structural usage", async () => {
   const value = await fixture();
@@ -233,6 +285,35 @@ test("Claude transcript cursor resumes at the exact next line without duplicates
     assert.equal(second.complete, true);
     assert.equal(first.candidates.length + second.candidates.length, 2);
     assert.notEqual(first.candidates[0].occurrenceMaterial, second.candidates[0].occurrenceMaterial);
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("Claude transcript plan checkpoint is content-free and restores against fresh private paths", async () => {
+  const value = await fixture();
+  try {
+    const plan = await createClaudeTranscriptExportSourcePlan({
+      projectsDirectory: value.root, startAt: START_AT, endAt: END_AT, secret: SECRET, resourceGuard: guard(),
+    });
+    const checkpoint = createClaudeTranscriptExportPlanCheckpoint(plan, { secret: SECRET });
+    const serialized = JSON.stringify(checkpoint);
+    assert.equal(serialized.includes(value.root), false);
+    assert.equal(serialized.includes(PRIVATE), false);
+    const restored = await restoreClaudeTranscriptExportSourcePlan(JSON.parse(serialized), {
+      projectsDirectory: value.root,
+      selectedSourcePaths: [value.first, value.second],
+      secret: SECRET,
+    });
+    assert.equal(restored.planSha256, plan.planSha256);
+    assert.deepEqual(
+      restored.sources.map(({ path, ...source }) => source),
+      plan.sources.map(({ path, ...source }) => source),
+    );
+    assert.deepEqual(
+      restored.sources.map((source) => source.path).toSorted(),
+      plan.sources.map((source) => source.path).toSorted(),
+    );
   } finally {
     await rm(value.root, { recursive: true, force: true });
   }

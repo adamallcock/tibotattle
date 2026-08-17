@@ -137,6 +137,22 @@
       "legacyPaths": []
     },
     {
+      "classification": "reusable_benchmark",
+      "owner": "local_analysis",
+      "canonicalPath": "scripts/claude-desktop-incremental-benchmark-worker.js",
+      "stableAlias": null,
+      "stableAliasReason": "Internal benchmark worker is launched only by the Claude Desktop incremental benchmark module.",
+      "additionalAliases": [],
+      "callers": [
+        "src/claude-desktop-incremental-benchmark.js",
+        "test/claude-desktop-phase0-ledger.test.js"
+      ],
+      "decision": "retain_as_internal_test_support",
+      "provenance": "docs/receipts/2026-08-16-claude-desktop-phase0-implementation-receipt.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
       "classification": "build_release_operation",
       "owner": "repository_architecture",
       "canonicalPath": "scripts/check-architecture-boundaries.mjs",
