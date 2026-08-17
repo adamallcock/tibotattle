@@ -228,11 +228,17 @@
       <section class="admin-section" aria-labelledby="audit-title">
         <p class="eyebrow">Owner audit</p>
         <h2 id="audit-title">Recent control actions</h2>
-        <div class="admin-card admin-table-wrap">
-          <table>
-            <thead><tr><th>Action</th><th>Outcome</th><th>Details</th><th>Time</th></tr></thead>
+        <p class="admin-copy admin-audit-copy">
+          Newest first. Each entry explains what the action did and whether any
+          follow-up remains. Open technical fields only when you need the exact
+          stored values.
+        </p>
+        <div class="admin-card admin-audit-wrap">
+          <table class="admin-audit-table">
+            <thead><tr><th>Action</th><th>Result</th><th>What happened</th><th>Time</th></tr></thead>
             <tbody id="audit-rows"></tbody>
           </table>
+          <p class="admin-empty" id="audit-empty">No recent control actions.</p>
         </div>
       </section>
     </main>

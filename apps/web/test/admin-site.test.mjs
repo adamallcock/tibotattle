@@ -16,11 +16,18 @@ class FakeNode {
     this.className = "";
     this.disabled = false;
     this.hidden = false;
+    this.id = "";
     this.innerHTML = "";
     this.listeners = new Map();
+    this.offsetHeight = 0;
+    this.offsetWidth = 0;
+    this.rect = { bottom: 0, left: 0, top: 0 };
+    this.style = {};
     this.textContent = "";
+    this.type = "";
     this.value = "";
     this.checked = false;
+    this.attributes = new Map();
   }
 
   append(...nodes) {
@@ -33,6 +40,20 @@ class FakeNode {
 
   addEventListener(type, listener) {
     this.listeners.set(type, listener);
+  }
+
+  setAttribute(name, value) {
+    const copy = String(value);
+    this.attributes.set(name, copy);
+    if (name === "id") this.id = copy;
+  }
+
+  getAttribute(name) {
+    return this.attributes.get(name) ?? null;
+  }
+
+  getBoundingClientRect() {
+    return this.rect;
   }
 }
 
@@ -62,6 +83,7 @@ function fakeDocument() {
     "diagnostic-lookup",
     "diagnostic-reference",
     "audit-rows",
+    "audit-empty",
     "last-refresh",
     "refresh",
     "diagnostic-form",
@@ -114,6 +136,37 @@ function tableTexts(documentRef, id) {
     row.children.map((cell) => cell.textContent));
 }
 
+function metricTexts(documentRef, id) {
+  return documentRef.byId.get(id).children.map((card) => [
+    card.children[0].children[0].textContent,
+    card.children[1].textContent,
+    card.children[2].textContent,
+  ]);
+}
+
+function statusTexts(documentRef, id) {
+  return documentRef.byId.get(id).children.map((line) => [
+    `${line.children[0].children[0].children[0].textContent}: `,
+    line.children[1].textContent,
+  ]);
+}
+
+function assertInfoHint(labelNode, label) {
+  assert.equal(labelNode.children[0].textContent, label);
+  const hint = labelNode.children[1];
+  assert.equal(hint.className, "admin-info");
+  const [trigger, tooltip] = hint.children;
+  assert.equal(trigger.tag, "button");
+  assert.equal(trigger.type, "button");
+  assert.equal(trigger.textContent, "i");
+  assert.equal(trigger.getAttribute("aria-label"), `Explain ${label}`);
+  assert.equal(trigger.getAttribute("aria-describedby"), tooltip.id);
+  assert.equal(trigger.listeners.has("mouseenter"), true);
+  assert.equal(trigger.listeners.has("focus"), true);
+  assert.equal(tooltip.getAttribute("role"), "tooltip");
+  assert.notEqual(tooltip.textContent.trim(), "");
+}
+
 async function waitFor(predicate) {
   for (let attempt = 0; attempt < 20; attempt += 1) {
     if (predicate()) return;
@@ -128,9 +181,28 @@ test("admin tables preserve row order, text rendering, and empty states", async 
   overview.audit.push({
     action: "set_collection_controls",
     outcome: "failure",
+    details: {
+      code: "ADMIN_ACTION_CONFLICT",
+      expectedRevision: 6,
+      revision: 7,
+    },
     createdAt: "2026-08-02T11:30:00.000Z",
   });
-  overview.audit[0].details = { message: "<details>" };
+  overview.audit.push({
+    action: "set_collection_controls",
+    outcome: "failure",
+    createdAt: "2026-08-02T11:15:00.000Z",
+  });
+  overview.audit[0].details = {
+    code: "MAINTENANCE_INCOMPLETE",
+    lifecycleComplete: true,
+    quarantineReconciliationComplete: false,
+    expiredIdentityHandoffsPurged: 0,
+    expiredIdentityHandoffPurgeComplete: true,
+    aggregateRebuildComplete: true,
+    publicationEnabled: true,
+    message: "<details>",
+  };
   const emptyOverview = {
     ...overview,
     snapshots: [],
@@ -185,8 +257,10 @@ test("admin tables preserve row order, text rendering, and empty states", async 
   const documentRef = fakeDocument();
   const previousDocument = globalThis.document;
   const previousFetch = globalThis.fetch;
+  const previousWindow = globalThis.window;
   globalThis.document = documentRef;
   globalThis.fetch = async () => response(responses[fetchCount++]);
+  globalThis.window = { innerHeight: 844, innerWidth: 390 };
 
   try {
     const moduleUrl = new URL("../public/admin.js", import.meta.url);
@@ -216,8 +290,7 @@ test("admin tables preserve row order, text rendering, and empty states", async 
       ["0.1.11", "5", "9"],
     ]);
     assert.deepEqual(
-      documentRef.byId.get("distribution-counts").children.map((card) =>
-        card.children.map((node) => node.textContent)),
+      metricTexts(documentRef, "distribution-counts"),
       [
         ["Active-install proxy", "19", "29 distinct source addresses in 7 days"],
         ["App preflight call-ins", "22", "16 addresses · 78 requests/7d"],
@@ -229,10 +302,22 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     );
 
     assert.deepEqual(
-      documentRef.byId.get("counts").children.at(-1).children
-        .map((node) => node.textContent),
+      metricTexts(documentRef, "counts").at(-1),
       ["Upload safety registrations", "110", "110 recent · 0 due"],
     );
+    for (const id of ["counts", "quarantine-counts", "distribution-counts"]) {
+      for (const card of documentRef.byId.get(id).children) {
+        assertInfoHint(card.children[0], card.children[0].children[0].textContent);
+      }
+    }
+    const narrowHint = documentRef.byId.get("counts").children[0].children[0]
+      .children[1];
+    const [narrowTrigger, narrowTooltip] = narrowHint.children;
+    narrowTrigger.rect = { bottom: 418, left: 370, top: 400 };
+    narrowTooltip.offsetHeight = 100;
+    narrowTooltip.offsetWidth = 260;
+    narrowTrigger.listeners.get("focus")();
+    assert.deepEqual(narrowTooltip.style, { left: "118px", top: "426px" });
     assert.equal(
       documentRef.byId.get("operator-attention-badge").textContent,
       "No action indicated",
@@ -250,8 +335,7 @@ test("admin tables preserve row order, text rendering, and empty states", async 
       "Healthy · settling",
     );
     assert.deepEqual(
-      documentRef.byId.get("quarantine-counts").children.map((card) =>
-        card.children.map((node) => node.textContent)),
+      metricTexts(documentRef, "quarantine-counts"),
       [
         ["Recent registrations", "110", "normal 60-minute safety window"],
         ["Due and referenced", "0", "valid objects; temporary markers should clear"],
@@ -259,9 +343,7 @@ test("admin tables preserve row order, text rendering, and empty states", async 
       ],
     );
     assert.deepEqual(
-      documentRef.byId.get("quarantine-status").children
-        .slice(0, 7)
-        .map((line) => line.children.map((node) => node.textContent)),
+      statusTexts(documentRef, "quarantine-status").slice(0, 7),
       [
         ["Pending registrations: ", "110"],
         ["Oldest registration: ", formatReportingTime(overview.quarantine.oldestRegisteredAt)],
@@ -272,6 +354,16 @@ test("admin tables preserve row order, text rendering, and empty states", async 
         ["Last pass cutoff: ", formatReportingTime(overview.reconciliation.cutoffAt)],
       ],
     );
+    for (const line of documentRef.byId.get("quarantine-status").children) {
+      const labelNode = line.children[0].children[0];
+      assertInfoHint(labelNode, labelNode.children[0].textContent);
+    }
+    for (const id of ["distribution-source-status", "ingress-status", "lifecycle-status"]) {
+      for (const line of documentRef.byId.get(id).children) {
+        const labelNode = line.children[0].children[0];
+        assertInfoHint(labelNode, labelNode.children[0].textContent);
+      }
+    }
 
     const diagnostic = overview.errors.recentDiagnostics[0];
     assert.deepEqual(tableTexts(documentRef, "recent-diagnostic-rows"), [[
@@ -284,8 +376,7 @@ test("admin tables preserve row order, text rendering, and empty states", async 
 
     const ingress = overview.ingress;
     assert.deepEqual(
-      documentRef.byId.get("ingress-status").children.map((line) =>
-        line.children.map((node) => node.textContent)),
+      statusTexts(documentRef, "ingress-status"),
       [
         ["Active leases: ", `${ingress.activeLeases} of ${ingress.maximumConcurrent}`],
         ["Available start tokens: ", `${ingress.availableStartTokens} of ${ingress.burst}`],
@@ -295,9 +386,7 @@ test("admin tables preserve row order, text rendering, and empty states", async 
       ],
     );
     assert.deepEqual(
-      documentRef.byId.get("lifecycle-status").children
-        .slice(3, 8)
-        .map((line) => line.children.map((node) => node.textContent)),
+      statusTexts(documentRef, "lifecycle-status").slice(3, 8),
       [
         ["Latest accepted upload: ", formatReportingTime(overview.counts.contributions.latestAcceptedAt)],
         ["Weekly rebuild queue: ", String(overview.pendingHistoricalRebuilds)],
@@ -307,24 +396,61 @@ test("admin tables preserve row order, text rendering, and empty states", async 
       ],
     );
 
-    const audit = overview.audit[0];
-    assert.deepEqual(tableTexts(documentRef, "audit-rows"), [
-      [
-        audit.action,
-        audit.outcome,
-        JSON.stringify(audit.details),
-        formatReportingTime(audit.createdAt),
-      ],
-      [
-        overview.audit[1].action,
-        overview.audit[1].outcome,
-        "—",
-        formatReportingTime(overview.audit[1].createdAt),
-      ],
-    ]);
+    const auditRows = documentRef.byId.get("audit-rows").children;
+    assert.equal(auditRows.length, 3);
+    const maintenanceRow = auditRows[0];
+    assertInfoHint(maintenanceRow.children[0].children[0], "Maintenance pass");
+    assert.equal(maintenanceRow.children[0].getAttribute("data-label"), "Action");
+    assert.equal(maintenanceRow.children[1].children[0].children[0].textContent, "Follow-up needed");
+    assert.equal(maintenanceRow.children[1].getAttribute("data-label"), "Result");
+    assert.equal(maintenanceRow.children[1].children[0].children[1].children[1].textContent.includes("bounded maintenance"), true);
+    assert.equal(
+      maintenanceRow.children[2].children[0].textContent,
+      "The pass ran, but upload-object reconciliation still has eligible work remaining. Another bounded pass may finish it.",
+    );
+    assert.equal(maintenanceRow.children[2].children[0].textContent.includes("{"), false);
+    assert.equal(maintenanceRow.children[2].getAttribute("data-label"), "What happened");
+    const maintenanceDetails = maintenanceRow.children[2].children[1];
+    assert.equal(maintenanceDetails.tag, "details");
+    assert.equal(maintenanceDetails.children[0].textContent, "Technical fields (10)");
+    const detailList = maintenanceDetails.children[1];
+    const detailValues = detailList.children.filter((node) => node.tag === "dd");
+    assert.equal(detailValues.at(-1).textContent, "<details>");
+    assert.equal(detailValues.at(-1).innerHTML, "");
+    const detailLabels = detailList.children.filter((node) => node.tag === "dt");
+    for (const label of detailLabels) {
+      assertInfoHint(label.children[0], label.children[0].children[0].textContent);
+    }
+    assert.equal(
+      maintenanceRow.children[3].children[0].textContent,
+      formatReportingTime(overview.audit[0].createdAt),
+    );
+    assert.equal(
+      maintenanceRow.children[3].children[0].getAttribute("datetime"),
+      overview.audit[0].createdAt,
+    );
+
+    const controlsRow = auditRows[1];
+    assertInfoHint(controlsRow.children[0].children[0], "Collection controls");
+    assert.equal(controlsRow.children[1].children[0].children[0].textContent, "Failed");
+    assert.equal(
+      controlsRow.children[2].children[0].textContent,
+      "The change was not applied because the dashboard used an older control revision. Refresh the page before trying again.",
+    );
+    assert.equal(
+      controlsRow.children[2].children[1].children[0].textContent,
+      "Technical fields (5)",
+    );
+    const noDetailsRow = auditRows[2];
+    assert.equal(noDetailsRow.children[1].children[0].children[0].textContent, "Failed");
+    assert.equal(
+      noDetailsRow.children[2].children[0].textContent,
+      "The collection-control change failed before it produced a usable result.",
+    );
     assert.equal(documentRef.byId.get("snapshot-empty").hidden, true);
     assert.equal(documentRef.byId.get("error-empty").hidden, true);
     assert.equal(documentRef.byId.get("recent-diagnostic-empty").hidden, true);
+    assert.equal(documentRef.byId.get("audit-empty").hidden, true);
 
     await documentRef.byId.get("refresh").listeners.get("click")();
     assert.equal(fetchCount, 2);
@@ -337,6 +463,7 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     assert.equal(documentRef.byId.get("error-empty").hidden, false);
     assert.equal(documentRef.byId.get("recent-diagnostic-empty").hidden, false);
     assert.equal(documentRef.byId.get("distribution-version-empty").hidden, false);
+    assert.equal(documentRef.byId.get("audit-empty").hidden, false);
     assert.equal(documentRef.byId.get("distribution-status").textContent, "Partial evidence");
     assert.equal(
       documentRef.byId.get("operator-attention-badge").textContent,
@@ -351,8 +478,7 @@ test("admin tables preserve row order, text rendering, and empty states", async 
       ],
     );
     assert.deepEqual(
-      documentRef.byId.get("ingress-status").children.map((line) =>
-        line.children.map((node) => node.textContent)),
+      statusTexts(documentRef, "ingress-status"),
       [[
         "Upload ingress budget: ",
         "unavailable — the budget binding is not configured or unreachable",
@@ -378,5 +504,7 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     else globalThis.document = previousDocument;
     if (previousFetch === undefined) delete globalThis.fetch;
     else globalThis.fetch = previousFetch;
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
   }
 });
