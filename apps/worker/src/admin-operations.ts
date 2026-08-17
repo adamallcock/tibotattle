@@ -1,4 +1,5 @@
 import { readCollectionControls, type CollectionControls } from "./collection-controls";
+import { QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS } from "./constants";
 import { sha256Hex } from "./crypto";
 import { ApiError } from "./errors";
 import { readQuarantineReconciliationStatus } from "./quarantine-reconciliation";
@@ -38,6 +39,7 @@ export interface AdminOverviewOptions {
 interface CountRow {
   total: number;
   active?: number;
+  current?: number;
   deleting?: number;
   accepted?: number;
   processing?: number;
@@ -45,6 +47,14 @@ interface CountRow {
   enrolled_last_7d?: number;
   accepted_last_24h?: number;
   accepted_last_7d?: number;
+  last_accepted_at?: string | null;
+}
+
+interface ContributingAccountsRow {
+  total: number;
+  accepted_last_24h?: number;
+  accepted_last_7d?: number;
+  accepted_last_30d?: number;
 }
 
 interface BoundedCount {
@@ -91,9 +101,33 @@ interface SnapshotRow {
   released_at: string;
 }
 
+interface DailyPublicationRow {
+  day: string;
+  released_at: string;
+}
+
+interface QuarantineOverviewRow {
+  total: number;
+  within_grace: number | null;
+  due_referenced: number | null;
+  due_unreferenced: number | null;
+  oldest_registered_at: string | null;
+  newest_registered_at: string | null;
+  next_eligible_registered_at: string | null;
+}
+
 function nowIso(nowEpoch: number): string {
   if (!Number.isFinite(nowEpoch)) throw new Error("invalid admin operation time");
   return new Date(nowEpoch).toISOString();
+}
+
+function offsetIso(value: string | null, milliseconds: number): string | null {
+  if (value === null) return null;
+  const epoch = Date.parse(value);
+  if (!Number.isFinite(epoch)) {
+    throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  }
+  return new Date(epoch + milliseconds).toISOString();
 }
 
 function bool(value: number | undefined): boolean {
@@ -396,20 +430,30 @@ export async function readAdminOverview(
   const sinceWeek = new Date(
     nowEpoch - 7 * 24 * 60 * 60 * 1_000,
   ).toISOString();
+  const sinceMonth = new Date(
+    nowEpoch - 30 * 24 * 60 * 60 * 1_000,
+  ).toISOString();
   const diagnosticSince = new Date(
     nowEpoch - DIAGNOSTIC_RETENTION_DAYS * 24 * 60 * 60 * 1_000,
+  ).toISOString();
+  const quarantineCutoffAt = new Date(
+    nowEpoch - QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS,
   ).toISOString();
   const [
     controls,
     participants,
     syntheticContributions,
     telemetryContributions,
+    incrementalChunks,
+    contributingAccounts,
     telemetryRecords,
     pendingQuarantine,
     retention,
     reconciliation,
     snapshots,
     pendingRebuilds,
+    latestDailyPublication,
+    pendingDailyRebuilds,
     deletionTombstones,
     errorGroups,
     recentDiagnostics,
@@ -442,17 +486,106 @@ export async function readAdminOverview(
               SUM(CASE WHEN status = 'accepted' AND created_at >= ?1 THEN 1 ELSE 0 END)
                 AS accepted_last_24h,
               SUM(CASE WHEN status = 'accepted' AND created_at >= ?2 THEN 1 ELSE 0 END)
-                AS accepted_last_7d
+                AS accepted_last_7d,
+              MAX(CASE WHEN status = 'accepted' THEN created_at END)
+                AS last_accepted_at
          FROM (
-           SELECT status, created_at FROM telemetry_contributions ORDER BY id LIMIT ?3
+           SELECT status, created_at FROM telemetry_contributions
+            ORDER BY created_at DESC, id DESC LIMIT ?3
          )`,
     ).bind(since, sinceWeek, MAX_ADMIN_AGGREGATE_ROWS).first<CountRow>(),
+    db.prepare(
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN superseded_at IS NULL THEN 1 ELSE 0 END) AS current,
+              SUM(CASE WHEN created_at >= ?1 THEN 1 ELSE 0 END)
+                AS accepted_last_24h,
+              SUM(CASE WHEN created_at >= ?2 THEN 1 ELSE 0 END)
+                AS accepted_last_7d,
+              MAX(created_at) AS last_accepted_at
+         FROM (
+           SELECT superseded_at, created_at FROM telemetry_v1_chunks
+            ORDER BY created_at DESC, id DESC LIMIT ?3
+         )`,
+    ).bind(since, sinceWeek, MAX_ADMIN_AGGREGATE_ROWS).first<CountRow>(),
+    db.prepare(
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN last_accepted_at >= ?1 THEN 1 ELSE 0 END)
+                AS accepted_last_24h,
+              SUM(CASE WHEN last_accepted_at >= ?2 THEN 1 ELSE 0 END)
+                AS accepted_last_7d,
+              SUM(CASE WHEN last_accepted_at >= ?3 THEN 1 ELSE 0 END)
+                AS accepted_last_30d
+         FROM (
+           SELECT participant_id, MAX(created_at) AS last_accepted_at
+             FROM (
+               SELECT participant_id, created_at FROM (
+                 SELECT participant_id, created_at
+                   FROM telemetry_contributions
+                  WHERE status = 'accepted'
+                  ORDER BY created_at DESC, id DESC LIMIT ?4
+               )
+               UNION ALL
+               SELECT participant_id, created_at FROM (
+                 SELECT participant_id, created_at
+                   FROM telemetry_v1_chunks
+                  ORDER BY created_at DESC, id DESC LIMIT ?4
+               )
+             )
+            GROUP BY participant_id
+            ORDER BY last_accepted_at DESC, participant_id
+            LIMIT ?4
+         )`,
+    ).bind(
+      since,
+      sinceWeek,
+      sinceMonth,
+      MAX_ADMIN_AGGREGATE_ROWS,
+    ).first<ContributingAccountsRow>(),
     db.prepare(
       "SELECT COUNT(*) AS total FROM (SELECT 1 FROM telemetry_records LIMIT ?)",
     ).bind(MAX_ADMIN_AGGREGATE_ROWS).first<CountRow>(),
     db.prepare(
-      "SELECT COUNT(*) AS total FROM (SELECT 1 FROM pending_quarantine_objects LIMIT ?)",
-    ).bind(MAX_ADMIN_AGGREGATE_ROWS).first<CountRow>(),
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN registered_at > ?1 THEN 1 ELSE 0 END)
+                AS within_grace,
+              SUM(CASE WHEN registered_at <= ?1 AND (
+                EXISTS (SELECT 1 FROM contributions WHERE r2_key = pending.r2_key)
+                OR EXISTS (
+                  SELECT 1 FROM telemetry_contributions
+                   WHERE r2_key = pending.r2_key
+                )
+                OR EXISTS (
+                  SELECT 1 FROM telemetry_v1_chunks
+                   WHERE r2_key = pending.r2_key
+                )
+              ) THEN 1 ELSE 0 END) AS due_referenced,
+              SUM(CASE WHEN registered_at <= ?1
+                AND NOT EXISTS (
+                  SELECT 1 FROM contributions WHERE r2_key = pending.r2_key
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM telemetry_contributions
+                   WHERE r2_key = pending.r2_key
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM telemetry_v1_chunks
+                   WHERE r2_key = pending.r2_key
+                )
+                THEN 1 ELSE 0 END) AS due_unreferenced,
+              MIN(registered_at) AS oldest_registered_at,
+              MAX(registered_at) AS newest_registered_at,
+              MIN(CASE WHEN registered_at > ?1 THEN registered_at END)
+                AS next_eligible_registered_at
+         FROM (
+           SELECT r2_key, registered_at
+             FROM pending_quarantine_objects
+            ORDER BY registered_at, r2_key
+            LIMIT ?2
+         ) AS pending`,
+    ).bind(
+      quarantineCutoffAt,
+      MAX_ADMIN_AGGREGATE_ROWS,
+    ).first<QuarantineOverviewRow>(),
     db.prepare(
       `SELECT state, last_started_at, last_completed_at, maintenance_run_at,
               quarantine_cutoff_at, quarantine_objects_deleted,
@@ -471,6 +604,18 @@ export async function readAdminOverview(
     db.prepare(
       `SELECT COUNT(*) AS total FROM (
          SELECT 1 FROM community_weekly_snapshot_rebuilds LIMIT ?
+       )`,
+    ).bind(MAX_ADMIN_AGGREGATE_ROWS).first<{ total: number }>(),
+    db.prepare(
+      `SELECT day, released_at
+         FROM community_daily_aggregates
+        WHERE release_state = 'published'
+        ORDER BY day DESC, revision DESC
+        LIMIT 1`,
+    ).first<DailyPublicationRow>(),
+    db.prepare(
+      `SELECT COUNT(*) AS total FROM (
+         SELECT 1 FROM community_daily_aggregate_rebuilds LIMIT ?
        )`,
     ).bind(MAX_ADMIN_AGGREGATE_ROWS).first<{ total: number }>(),
     deletionLedger.prepare(
@@ -514,12 +659,25 @@ export async function readAdminOverview(
     }>(),
   ]);
   if (!participants || !syntheticContributions || !telemetryContributions
+      || !incrementalChunks
+      || !contributingAccounts
       || !telemetryRecords || !pendingQuarantine || !retention
       || !deletionTombstones) {
     throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
   }
+  const latestAcceptedAt = [
+    telemetryContributions.last_accepted_at,
+    incrementalChunks.last_accepted_at,
+  ]
+    .filter((value): value is string => typeof value === "string")
+    .sort()
+    .at(-1) ?? null;
+  const contributingAccountsBounded =
+    boundedCount(contributingAccounts).bounded
+    || boundedCount(telemetryContributions).bounded
+    || boundedCount(incrementalChunks).bounded;
   return {
-    schemaVersion: "admin-overview-v0.1",
+    schemaVersion: "admin-overview-v0.2",
     generatedAt: now,
     service: {
       environment: options.environment,
@@ -537,6 +695,19 @@ export async function readAdminOverview(
         enrolledLast7Days: Number(participants.enrolled_last_7d ?? 0),
       },
       contributions: {
+        contributingAccounts: {
+          total: boundedCount(contributingAccounts).total,
+          bounded: contributingAccountsBounded,
+          acceptedLast24Hours: Number(
+            contributingAccounts.accepted_last_24h ?? 0,
+          ),
+          acceptedLast7Days: Number(
+            contributingAccounts.accepted_last_7d ?? 0,
+          ),
+          acceptedLast30Days: Number(
+            contributingAccounts.accepted_last_30d ?? 0,
+          ),
+        },
         synthetic: {
           total: boundedCount(syntheticContributions).total,
           bounded: boundedCount(syntheticContributions).bounded,
@@ -551,11 +722,39 @@ export async function readAdminOverview(
           acceptedLast24Hours: Number(telemetryContributions.accepted_last_24h ?? 0),
           acceptedLast7Days: Number(telemetryContributions.accepted_last_7d ?? 0),
         },
+        incrementalChunks: {
+          total: boundedCount(incrementalChunks).total,
+          bounded: boundedCount(incrementalChunks).bounded,
+          current: Number(incrementalChunks.current ?? 0),
+          acceptedLast24Hours: Number(incrementalChunks.accepted_last_24h ?? 0),
+          acceptedLast7Days: Number(incrementalChunks.accepted_last_7d ?? 0),
+        },
+        acceptedLast24Hours:
+          Number(telemetryContributions.accepted_last_24h ?? 0)
+          + Number(incrementalChunks.accepted_last_24h ?? 0),
+        acceptedLast7Days:
+          Number(telemetryContributions.accepted_last_7d ?? 0)
+          + Number(incrementalChunks.accepted_last_7d ?? 0),
+        latestAcceptedAt,
         storedTelemetryRecords: boundedCount(telemetryRecords).total,
         storedTelemetryRecordsBounded: boundedCount(telemetryRecords).bounded,
       },
-      pendingQuarantineObjects: boundedCount(pendingQuarantine).total,
-      pendingQuarantineObjectsBounded: boundedCount(pendingQuarantine).bounded,
+    },
+    quarantine: {
+      pendingObjects: boundedCount(pendingQuarantine).total,
+      pendingObjectsBounded: boundedCount(pendingQuarantine).bounded,
+      gracePeriodMinutes:
+        QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS / (60 * 1_000),
+      cutoffAt: quarantineCutoffAt,
+      withinGrace: Number(pendingQuarantine.within_grace ?? 0),
+      dueReferenced: Number(pendingQuarantine.due_referenced ?? 0),
+      dueUnreferenced: Number(pendingQuarantine.due_unreferenced ?? 0),
+      oldestRegisteredAt: pendingQuarantine.oldest_registered_at,
+      newestRegisteredAt: pendingQuarantine.newest_registered_at,
+      nextEligibleAt: offsetIso(
+        pendingQuarantine.next_eligible_registered_at,
+        QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS,
+      ),
     },
     lifecycle: {
       state: retention.state,
@@ -588,6 +787,14 @@ export async function readAdminOverview(
     pendingHistoricalRebuilds: boundedCount(pendingRebuilds ?? { total: 0 }).total,
     pendingHistoricalRebuildsBounded:
       boundedCount(pendingRebuilds ?? { total: 0 }).bounded,
+    dailyPublication: {
+      latestEvidenceDay: latestDailyPublication?.day ?? null,
+      latestReleasedAt: latestDailyPublication?.released_at ?? null,
+      pendingRebuilds:
+        boundedCount(pendingDailyRebuilds ?? { total: 0 }).total,
+      pendingRebuildsBounded:
+        boundedCount(pendingDailyRebuilds ?? { total: 0 }).bounded,
+    },
     errors: {
       retentionDays: DIAGNOSTIC_RETENTION_DAYS,
       sampled: true,

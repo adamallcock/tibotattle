@@ -53,6 +53,7 @@ import {
   type CollectionControlReason,
 } from "./admin-operations";
 import { authorizeAdminEmail, verifyAdminAccessAssertion } from "./admin-access";
+import { readDistributionAnalytics } from "./distribution-analytics";
 import {
   adminHostname,
   adminUiResponse,
@@ -2936,14 +2937,28 @@ async function handleAdminOverview(
   if (reference !== null && !validDiagnosticReference(reference)) {
     throw new ApiError(400, "BODY_INVALID");
   }
-  return jsonResponse(
-    await readAdminOverview(env.USAGE_MONITOR_DB, env.DELETION_LEDGER, {
+  const nowEpoch = Date.now();
+  const [overview, ingress, distribution] = await Promise.all([
+    readAdminOverview(env.USAGE_MONITOR_DB, env.DELETION_LEDGER, {
       environment: env.ENVIRONMENT,
       enrollmentMode: env.ENROLLMENT_MODE,
       accountScopedIngestMode: env.ACCOUNT_SCOPED_INGEST_MODE,
       diagnosticReference: reference ?? undefined,
-      ingress: await readUploadIngressStatus(env),
+      nowEpoch,
     }),
+    readUploadIngressStatus(env),
+    readDistributionAnalytics({
+      enabled: env.ENVIRONMENT === "production",
+      cloudflareZoneId: Reflect.get(env, "DISTRIBUTION_ANALYTICS_ZONE_ID"),
+      cloudflareApiToken: Reflect.get(
+        env,
+        "DISTRIBUTION_ANALYTICS_API_TOKEN",
+      ),
+      githubApiToken: Reflect.get(env, "DISTRIBUTION_GITHUB_API_TOKEN"),
+    }, nowEpoch),
+  ]);
+  return jsonResponse(
+    { ...overview, ingress, distribution },
     200,
     { "cache-control": "no-store", vary: "Cookie" },
   );

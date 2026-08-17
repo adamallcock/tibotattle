@@ -32,13 +32,19 @@ interface ReconciliationStateRow {
   orphan_objects_deleted: number;
   referenced_objects_preserved: number;
   reconciliation_complete: number;
+  failure_code: "QUARANTINE_RECONCILIATION_FAILED" | null;
 }
 
 export interface QuarantineReconciliationStatus {
   state: ReconciliationStateRow["state"];
   lastCompletedAt: string | null;
   maintenanceRunAt: string | null;
+  cutoffAt: string | null;
+  registrationsExamined: number;
+  orphanObjectsDeleted: number;
+  referencedObjectsPreserved: number;
   reconciliationComplete: boolean;
+  failureCode: ReconciliationStateRow["failure_code"];
 }
 
 export interface QuarantineReconciliationResult {
@@ -127,7 +133,8 @@ export async function readQuarantineReconciliationStatus(
 ): Promise<QuarantineReconciliationStatus> {
   const state = await db.prepare(
     `SELECT state, last_completed_at, maintenance_run_at,
-            reconciliation_complete
+            cutoff_at, registrations_examined, orphan_objects_deleted,
+            referenced_objects_preserved, reconciliation_complete, failure_code
        FROM quarantine_reconciliation_state
       WHERE singleton = 1`,
   ).first<Pick<
@@ -135,14 +142,24 @@ export async function readQuarantineReconciliationStatus(
     | "state"
     | "last_completed_at"
     | "maintenance_run_at"
+    | "cutoff_at"
+    | "registrations_examined"
+    | "orphan_objects_deleted"
+    | "referenced_objects_preserved"
     | "reconciliation_complete"
+    | "failure_code"
   >>();
   if (!state) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
   return {
     state: state.state,
     lastCompletedAt: state.last_completed_at,
     maintenanceRunAt: state.maintenance_run_at,
+    cutoffAt: state.cutoff_at,
+    registrationsExamined: state.registrations_examined,
+    orphanObjectsDeleted: state.orphan_objects_deleted,
+    referencedObjectsPreserved: state.referenced_objects_preserved,
     reconciliationComplete: state.reconciliation_complete === 1,
+    failureCode: state.failure_code,
   };
 }
 
@@ -154,7 +171,7 @@ async function readReconciliationState(
             cutoff_at,
             cursor_registered_at, cursor_r2_key, registrations_examined,
             orphan_objects_deleted, referenced_objects_preserved,
-            reconciliation_complete
+            reconciliation_complete, failure_code
        FROM quarantine_reconciliation_state
       WHERE singleton = 1`,
   ).first<ReconciliationStateRow>();

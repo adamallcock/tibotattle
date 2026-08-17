@@ -324,6 +324,14 @@
         // != this is refused 403 ADMIN_REQUIRED, and an unset value fails the
         // admin host closed with 503 ADMIN_NOT_CONFIGURED. Not a secret.
         "ACCESS_ADMIN_EMAIL": "adamallcock@gmail.com",
+        // Owner-only distribution diagnostics. The zone identifier is public
+        // configuration; DISTRIBUTION_ANALYTICS_API_TOKEN is a separately
+        // provisioned optional secret restricted to Analytics Read for this
+        // zone. Without it, only the Cloudflare-derived cards report
+        // ANALYTICS_NOT_CONFIGURED and the rest of the admin view stays live.
+        // DISTRIBUTION_GITHUB_API_TOKEN is also optional; anonymous GitHub
+        // release reads remain the low-volume fallback.
+        "DISTRIBUTION_ANALYTICS_ZONE_ID": "56e3ffac451aab1d7c2d71fdf45d529a",
         // Sparkle atomic appcast guard (sparkle-appcast-guard.ts): every
         // value below must equal the reviewed release contract
         // (sparkle-release-contract.json) or the guard fails closed as

@@ -2204,6 +2204,61 @@ describe("synthetic usage monitor service", () => {
       error: { code: "ADMIN_REQUIRED" },
     });
 
+    // Keep an approved non-contributor beside one account with accepted data:
+    // the owner view must not conflate enrollment with contribution.
+    await enrollTelemetry();
+    const accepted = await uploadEnvelope(
+      participant,
+      await encrypt(telemetryFixture("d"), true),
+    );
+    expect(accepted.status).toBe(202);
+    const acceptedBody = await accepted.json<{ contributionId: string }>();
+    const acceptedAgain = await uploadEnvelope(
+      participant,
+      await encrypt(telemetryFixture("e"), true),
+    );
+    expect(acceptedAgain.status).toBe(202);
+
+    // Exercise every operator-facing storage-safety bucket. A referenced row
+    // models the v1 chunk path, whose accepted object retains its crash marker
+    // until reconciliation; the two manually registered rows model recent and
+    // due uncommitted registrations without exposing object identifiers in the API.
+    const acceptedStorage = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT id, r2_key FROM telemetry_contributions WHERE id = ?",
+    ).bind(acceptedBody.contributionId).first<{
+      id: string;
+      r2_key: string;
+    }>();
+    expect(acceptedStorage).not.toBeNull();
+    const quarantineNow = Date.now();
+    const dueRegisteredAt = new Date(
+      quarantineNow - 2 * 60 * 60 * 1_000,
+    ).toISOString();
+    const recentRegisteredAt = new Date(quarantineNow).toISOString();
+    await testBindings().USAGE_MONITOR_DB.batch([
+      testBindings().USAGE_MONITOR_DB.prepare(
+        `INSERT INTO pending_quarantine_objects (
+          r2_key, contribution_id, object_kind, registered_at
+        ) VALUES (?, ?, 'telemetry', ?)`,
+      ).bind(
+        acceptedStorage!.r2_key,
+        acceptedStorage!.id,
+        dueRegisteredAt,
+      ),
+      testBindings().USAGE_MONITOR_DB.prepare(
+        `INSERT INTO pending_quarantine_objects (
+          r2_key, contribution_id, object_kind, registered_at
+        ) VALUES ('telemetry/admin-due-orphan',
+                  'contribution:admin-due-orphan', 'telemetry', ?)`,
+      ).bind(dueRegisteredAt),
+      testBindings().USAGE_MONITOR_DB.prepare(
+        `INSERT INTO pending_quarantine_objects (
+          r2_key, contribution_id, object_kind, registered_at
+        ) VALUES ('telemetry/admin-recent',
+                  'contribution:admin-recent', 'telemetry', ?)`,
+      ).bind(recentRegisteredAt),
+    ]);
+
     const failedRequest = await api("/api/v1/this-route-does-not-exist");
     expect(failedRequest.status).toBe(404);
     const failedBody = await failedRequest.json<{
@@ -2222,7 +2277,7 @@ describe("synthetic usage monitor service", () => {
       ingress: { lastDeniedAt: unknown } | null;
     }>();
     expect(overviewBody).toMatchObject({
-      schemaVersion: "admin-overview-v0.1",
+      schemaVersion: "admin-overview-v0.2",
       collection: {
         state: "operational",
         enrollment: true,
@@ -2232,18 +2287,72 @@ describe("synthetic usage monitor service", () => {
       },
       counts: {
         participants: {
-          active: 1,
-          enrolledLast24Hours: 1,
-          enrolledLast7Days: 1,
+          active: 2,
+          enrolledLast24Hours: 2,
+          enrolledLast7Days: 2,
         },
         contributions: {
+          contributingAccounts: {
+            total: 1,
+            acceptedLast24Hours: 1,
+            acceptedLast7Days: 1,
+            acceptedLast30Days: 1,
+          },
           telemetry: {
+            total: 2,
+            accepted: 2,
+            acceptedLast24Hours: 2,
+            acceptedLast7Days: 2,
+          },
+          incrementalChunks: {
             total: 0,
+            current: 0,
             acceptedLast24Hours: 0,
             acceptedLast7Days: 0,
           },
-          storedTelemetryRecords: 0,
+          acceptedLast24Hours: 2,
+          acceptedLast7Days: 2,
+          latestAcceptedAt: expect.any(String),
+          storedTelemetryRecords: 4,
         },
+      },
+      quarantine: {
+        pendingObjects: 3,
+        pendingObjectsBounded: false,
+        gracePeriodMinutes: 60,
+        cutoffAt: expect.any(String),
+        withinGrace: 1,
+        dueReferenced: 1,
+        dueUnreferenced: 1,
+        oldestRegisteredAt: dueRegisteredAt,
+        newestRegisteredAt: recentRegisteredAt,
+        nextEligibleAt: expect.any(String),
+      },
+      reconciliation: {
+        state: "never_run",
+        lastCompletedAt: null,
+        maintenanceRunAt: null,
+        cutoffAt: null,
+        registrationsExamined: 0,
+        orphanObjectsDeleted: 0,
+        referencedObjectsPreserved: 0,
+        reconciliationComplete: false,
+        failureCode: null,
+      },
+      distribution: {
+        cloudflare: {
+          status: "not_configured",
+          reasonCode: "DISTRIBUTION_DISABLED",
+        },
+        github: {
+          status: "not_configured",
+          reasonCode: "DISTRIBUTION_DISABLED",
+        },
+      },
+      dailyPublication: {
+        latestEvidenceDay: null,
+        latestReleasedAt: null,
+        pendingRebuilds: 0,
       },
       // The shared Durable Object runtime may carry leases or denials from
       // sibling tests; only the configured capacities are deterministic here.
@@ -2274,7 +2383,7 @@ describe("synthetic usage monitor service", () => {
     );
     expect(overviewWithoutBudget.status).toBe(200);
     await expect(overviewWithoutBudget.json()).resolves.toMatchObject({
-      schemaVersion: "admin-overview-v0.1",
+      schemaVersion: "admin-overview-v0.2",
       ingress: null,
     });
 

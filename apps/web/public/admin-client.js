@@ -1,4 +1,4 @@
-const ADMIN_OVERVIEW_SCHEMA_VERSION = "admin-overview-v0.1";
+const ADMIN_OVERVIEW_SCHEMA_VERSION = "admin-overview-v0.2";
 const ADMIN_ACTION_SCHEMA_VERSION = "admin-action-v0.1";
 const ADMIN_ACTIONS = new Set(["set_collection_controls", "run_maintenance"]);
 const COLLECTION_STATES = new Set(["operational", "degraded", "contained"]);
@@ -11,6 +11,11 @@ const RECONCILIATION_STATES = new Set([
 ]);
 const SNAPSHOT_STATES = new Set(["published", "suppressed", "withdrawn"]);
 const AUDIT_OUTCOMES = new Set(["started", "success", "failure"]);
+const DISTRIBUTION_SOURCE_STATUSES = new Set([
+  "available",
+  "not_configured",
+  "unavailable",
+]);
 const ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{2,79}$/u;
 const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
@@ -94,7 +99,15 @@ function projectOverviewCounts(value) {
   const counts = record(value, "ADMIN_OVERVIEW_INVALID");
   const participants = record(counts.participants, "ADMIN_OVERVIEW_INVALID");
   const contributions = record(counts.contributions, "ADMIN_OVERVIEW_INVALID");
+  const contributingAccounts = record(
+    contributions.contributingAccounts,
+    "ADMIN_OVERVIEW_INVALID",
+  );
   const telemetry = record(contributions.telemetry, "ADMIN_OVERVIEW_INVALID");
+  const incrementalChunks = record(
+    contributions.incrementalChunks,
+    "ADMIN_OVERVIEW_INVALID",
+  );
   return Object.freeze({
     participants: Object.freeze({
       active: count(participants.active, "ADMIN_OVERVIEW_INVALID"),
@@ -110,6 +123,25 @@ function projectOverviewCounts(value) {
       ),
     }),
     contributions: Object.freeze({
+      contributingAccounts: Object.freeze({
+        total: count(contributingAccounts.total, "ADMIN_OVERVIEW_INVALID"),
+        bounded: boolean(
+          contributingAccounts.bounded,
+          "ADMIN_OVERVIEW_INVALID",
+        ),
+        acceptedLast24Hours: count(
+          contributingAccounts.acceptedLast24Hours,
+          "ADMIN_OVERVIEW_INVALID",
+        ),
+        acceptedLast7Days: count(
+          contributingAccounts.acceptedLast7Days,
+          "ADMIN_OVERVIEW_INVALID",
+        ),
+        acceptedLast30Days: count(
+          contributingAccounts.acceptedLast30Days,
+          "ADMIN_OVERVIEW_INVALID",
+        ),
+      }),
       telemetry: Object.freeze({
         accepted: count(telemetry.accepted, "ADMIN_OVERVIEW_INVALID"),
         total: count(telemetry.total, "ADMIN_OVERVIEW_INVALID"),
@@ -123,6 +155,31 @@ function projectOverviewCounts(value) {
           "ADMIN_OVERVIEW_INVALID",
         ),
       }),
+      incrementalChunks: Object.freeze({
+        current: count(incrementalChunks.current, "ADMIN_OVERVIEW_INVALID"),
+        total: count(incrementalChunks.total, "ADMIN_OVERVIEW_INVALID"),
+        bounded: boolean(incrementalChunks.bounded, "ADMIN_OVERVIEW_INVALID"),
+        acceptedLast24Hours: count(
+          incrementalChunks.acceptedLast24Hours,
+          "ADMIN_OVERVIEW_INVALID",
+        ),
+        acceptedLast7Days: count(
+          incrementalChunks.acceptedLast7Days,
+          "ADMIN_OVERVIEW_INVALID",
+        ),
+      }),
+      acceptedLast24Hours: count(
+        contributions.acceptedLast24Hours,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      acceptedLast7Days: count(
+        contributions.acceptedLast7Days,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      latestAcceptedAt: nullableString(
+        contributions.latestAcceptedAt,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
       storedTelemetryRecords: count(
         contributions.storedTelemetryRecords,
         "ADMIN_OVERVIEW_INVALID",
@@ -132,14 +189,254 @@ function projectOverviewCounts(value) {
         "ADMIN_OVERVIEW_INVALID",
       ),
     }),
-    pendingQuarantineObjects: count(
-      counts.pendingQuarantineObjects,
+  });
+}
+
+function projectQuarantine(value) {
+  const quarantine = record(value, "ADMIN_OVERVIEW_INVALID");
+  const pendingObjects = count(
+    quarantine.pendingObjects,
+    "ADMIN_OVERVIEW_INVALID",
+  );
+  const withinGrace = count(quarantine.withinGrace, "ADMIN_OVERVIEW_INVALID");
+  const dueReferenced = count(
+    quarantine.dueReferenced,
+    "ADMIN_OVERVIEW_INVALID",
+  );
+  const dueUnreferenced = count(
+    quarantine.dueUnreferenced,
+    "ADMIN_OVERVIEW_INVALID",
+  );
+  const oldestRegisteredAt = nullableString(
+    quarantine.oldestRegisteredAt,
+    "ADMIN_OVERVIEW_INVALID",
+  );
+  const newestRegisteredAt = nullableString(
+    quarantine.newestRegisteredAt,
+    "ADMIN_OVERVIEW_INVALID",
+  );
+  const nextEligibleAt = nullableString(
+    quarantine.nextEligibleAt,
+    "ADMIN_OVERVIEW_INVALID",
+  );
+  const hasRegistrationBounds = oldestRegisteredAt !== null
+    && newestRegisteredAt !== null;
+  if (withinGrace + dueReferenced + dueUnreferenced !== pendingObjects
+      || (pendingObjects === 0 && (
+        oldestRegisteredAt !== null || newestRegisteredAt !== null
+      ))
+      || (pendingObjects > 0 && !hasRegistrationBounds)
+      || (withinGrace === 0) !== (nextEligibleAt === null)) {
+    invalid("ADMIN_OVERVIEW_INVALID");
+  }
+  return Object.freeze({
+    pendingObjects,
+    pendingObjectsBounded: boolean(
+      quarantine.pendingObjectsBounded,
       "ADMIN_OVERVIEW_INVALID",
     ),
-    pendingQuarantineObjectsBounded: boolean(
-      counts.pendingQuarantineObjectsBounded,
+    gracePeriodMinutes: positiveInteger(
+      quarantine.gracePeriodMinutes,
       "ADMIN_OVERVIEW_INVALID",
     ),
+    cutoffAt: string(quarantine.cutoffAt, "ADMIN_OVERVIEW_INVALID"),
+    withinGrace,
+    dueReferenced,
+    dueUnreferenced,
+    oldestRegisteredAt,
+    newestRegisteredAt,
+    nextEligibleAt,
+  });
+}
+
+function projectDailyPublication(value) {
+  const publication = record(value, "ADMIN_OVERVIEW_INVALID");
+  return Object.freeze({
+    latestEvidenceDay: nullableString(
+      publication.latestEvidenceDay,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    latestReleasedAt: nullableString(
+      publication.latestReleasedAt,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    pendingRebuilds: count(
+      publication.pendingRebuilds,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    pendingRebuildsBounded: boolean(
+      publication.pendingRebuildsBounded,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+  });
+}
+
+function projectDistributionWindow(value) {
+  const window = record(value, "ADMIN_OVERVIEW_INVALID");
+  return Object.freeze({
+    last24Hours: count(window.last24Hours, "ADMIN_OVERVIEW_INVALID"),
+    last7Days: count(window.last7Days, "ADMIN_OVERVIEW_INVALID"),
+  });
+}
+
+function projectDistributionRequests(value) {
+  const requests = record(value, "ADMIN_OVERVIEW_INVALID");
+  return Object.freeze({
+    requests: projectDistributionWindow(requests.requests),
+    sourceAddresses: projectDistributionWindow(requests.sourceAddresses),
+  });
+}
+
+function projectDistribution(value) {
+  const distribution = record(value, "ADMIN_OVERVIEW_INVALID");
+  const methodology = record(
+    distribution.methodology,
+    "ADMIN_OVERVIEW_INVALID",
+  );
+  if (methodology.unit !== "distinct_source_ip_addresses"
+      || methodology.lookbackDays !== 7
+      || methodology.storesRawAddresses !== false) {
+    invalid("ADMIN_OVERVIEW_INVALID");
+  }
+
+  const cloudflare = record(distribution.cloudflare, "ADMIN_OVERVIEW_INVALID");
+  const cloudflareStatus = enumValue(
+    cloudflare.status,
+    DISTRIBUTION_SOURCE_STATUSES,
+    "ADMIN_OVERVIEW_INVALID",
+  );
+  const observedVersions = array(
+    cloudflare.observedVersions,
+    "ADMIN_OVERVIEW_INVALID",
+  ).map((value) => {
+    const version = record(value, "ADMIN_OVERVIEW_INVALID");
+    return Object.freeze({
+      version: string(version.version, "ADMIN_OVERVIEW_INVALID"),
+      requestsLast7Days: count(
+        version.requestsLast7Days,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      sourceAddressesLast7Days: count(
+        version.sourceAddressesLast7Days,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+    });
+  });
+  let cloudflareWindow = null;
+  let activeSourceAddresses = null;
+  let preflight = null;
+  let sparkleChecks = null;
+  let sparkleDownloads = null;
+  if (cloudflareStatus === "available") {
+    if (cloudflare.reasonCode !== null
+        || typeof cloudflare.sampled !== "boolean"
+        || typeof cloudflare.bounded !== "boolean") {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
+    cloudflareWindow = record(cloudflare.window, "ADMIN_OVERVIEW_INVALID");
+    activeSourceAddresses = projectDistributionWindow(
+      cloudflare.activeSourceAddresses,
+    );
+    preflight = projectDistributionRequests(cloudflare.preflight);
+    sparkleChecks = projectDistributionRequests(cloudflare.sparkleChecks);
+    sparkleDownloads = projectDistributionRequests(cloudflare.sparkleDownloads);
+  } else if (cloudflare.window !== null
+      || cloudflare.activeSourceAddresses !== null
+      || cloudflare.preflight !== null
+      || cloudflare.sparkleChecks !== null
+      || cloudflare.sparkleDownloads !== null
+      || cloudflare.sampled !== null
+      || cloudflare.bounded !== null
+      || cloudflare.currentVersion !== null
+      || cloudflare.currentVersionSourceAddresses !== null
+      || observedVersions.length !== 0
+      || cloudflare.observedVersionsBounded !== false
+      || typeof cloudflare.reasonCode !== "string") {
+    invalid("ADMIN_OVERVIEW_INVALID");
+  }
+  const currentVersion = nullableString(
+    cloudflare.currentVersion,
+    "ADMIN_OVERVIEW_INVALID",
+  );
+  const currentVersionSourceAddresses = cloudflare.currentVersionSourceAddresses
+    === null
+    ? null
+    : projectDistributionWindow(cloudflare.currentVersionSourceAddresses);
+  if ((currentVersion === null) !== (currentVersionSourceAddresses === null)) {
+    invalid("ADMIN_OVERVIEW_INVALID");
+  }
+
+  const github = record(distribution.github, "ADMIN_OVERVIEW_INVALID");
+  const githubStatus = enumValue(
+    github.status,
+    DISTRIBUTION_SOURCE_STATUSES,
+    "ADMIN_OVERVIEW_INVALID",
+  );
+  let release = null;
+  if (githubStatus === "available") {
+    if (github.reasonCode !== null) invalid("ADMIN_OVERVIEW_INVALID");
+    const candidate = record(github.release, "ADMIN_OVERVIEW_INVALID");
+    release = Object.freeze({
+      tag: string(candidate.tag, "ADMIN_OVERVIEW_INVALID"),
+      publishedAt: string(candidate.publishedAt, "ADMIN_OVERVIEW_INVALID"),
+      dmgDownloads: count(
+        candidate.dmgDownloads,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      allAssetDownloads: count(
+        candidate.allAssetDownloads,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+    });
+    if (release.dmgDownloads > release.allAssetDownloads) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
+  } else if (github.release !== null || typeof github.reasonCode !== "string") {
+    invalid("ADMIN_OVERVIEW_INVALID");
+  }
+
+  return Object.freeze({
+    methodology: Object.freeze({
+      unit: methodology.unit,
+      lookbackDays: 7,
+      storesRawAddresses: false,
+    }),
+    cloudflare: Object.freeze({
+      status: cloudflareStatus,
+      reasonCode: nullableString(
+        cloudflare.reasonCode,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      sampled: cloudflare.sampled === null
+        ? null
+        : boolean(cloudflare.sampled, "ADMIN_OVERVIEW_INVALID"),
+      bounded: cloudflare.bounded === null
+        ? null
+        : boolean(cloudflare.bounded, "ADMIN_OVERVIEW_INVALID"),
+      window: cloudflareWindow === null
+        ? null
+        : Object.freeze({
+          startsAt: string(cloudflareWindow.startsAt, "ADMIN_OVERVIEW_INVALID"),
+          endsAt: string(cloudflareWindow.endsAt, "ADMIN_OVERVIEW_INVALID"),
+        }),
+      activeSourceAddresses,
+      preflight,
+      sparkleChecks,
+      sparkleDownloads,
+      currentVersion,
+      currentVersionSourceAddresses,
+      observedVersions: Object.freeze(observedVersions),
+      observedVersionsBounded: boolean(
+        cloudflare.observedVersionsBounded,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+    }),
+    github: Object.freeze({
+      status: githubStatus,
+      reasonCode: nullableString(github.reasonCode, "ADMIN_OVERVIEW_INVALID"),
+      repository: string(github.repository, "ADMIN_OVERVIEW_INVALID"),
+      release,
+    }),
   });
 }
 
@@ -165,16 +462,51 @@ function projectLifecycle(value) {
 
 function projectReconciliation(value) {
   const reconciliation = record(value, "ADMIN_OVERVIEW_INVALID");
+  const state = enumValue(
+    reconciliation.state,
+    RECONCILIATION_STATES,
+    "ADMIN_OVERVIEW_INVALID",
+  );
+  const reconciliationComplete = boolean(
+    reconciliation.reconciliationComplete,
+    "ADMIN_OVERVIEW_INVALID",
+  );
+  const failureCode = nullableString(
+    reconciliation.failureCode,
+    "ADMIN_OVERVIEW_INVALID",
+  );
+  if ((reconciliationComplete && state !== "completed")
+      || (state === "failed") !== (failureCode !== null)) {
+    invalid("ADMIN_OVERVIEW_INVALID");
+  }
   return Object.freeze({
-    state: enumValue(
-      reconciliation.state,
-      RECONCILIATION_STATES,
+    state,
+    lastCompletedAt: nullableString(
+      reconciliation.lastCompletedAt,
       "ADMIN_OVERVIEW_INVALID",
     ),
-    reconciliationComplete: boolean(
-      reconciliation.reconciliationComplete,
+    maintenanceRunAt: nullableString(
+      reconciliation.maintenanceRunAt,
       "ADMIN_OVERVIEW_INVALID",
     ),
+    cutoffAt: nullableString(
+      reconciliation.cutoffAt,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    registrationsExamined: count(
+      reconciliation.registrationsExamined,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    orphanObjectsDeleted: count(
+      reconciliation.orphanObjectsDeleted,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    referencedObjectsPreserved: count(
+      reconciliation.referencedObjectsPreserved,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    reconciliationComplete,
+    failureCode,
   });
 }
 
@@ -296,10 +628,13 @@ export function projectAdminOverview(value) {
     }),
     collection: projectCollection(overview.collection),
     counts: projectOverviewCounts(overview.counts),
+    quarantine: projectQuarantine(overview.quarantine),
     lifecycle: projectLifecycle(overview.lifecycle),
     reconciliation: projectReconciliation(overview.reconciliation),
     ingress: projectIngress(overview.ingress),
+    distribution: projectDistribution(overview.distribution),
     snapshots: Object.freeze(snapshots),
+    dailyPublication: projectDailyPublication(overview.dailyPublication),
     pendingHistoricalRebuilds: count(
       overview.pendingHistoricalRebuilds,
       "ADMIN_OVERVIEW_INVALID",

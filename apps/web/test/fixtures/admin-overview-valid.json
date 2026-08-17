@@ -1,6 +1,6 @@
 {
-  "schemaVersion": "admin-overview-v0.1",
-  "generatedAt": "2026-08-02T12:00:00.000Z",
+  "schemaVersion": "admin-overview-v0.2",
+  "generatedAt": "2026-08-17T12:00:00.000Z",
   "service": { "environment": "production" },
   "collection": {
     "state": "operational",
@@ -19,6 +19,13 @@
       "enrolledLast7Days": 3
     },
     "contributions": {
+      "contributingAccounts": {
+        "total": 2,
+        "bounded": false,
+        "acceptedLast24Hours": 1,
+        "acceptedLast7Days": 1,
+        "acceptedLast30Days": 1
+      },
       "telemetry": {
         "accepted": 9,
         "total": 10,
@@ -26,11 +33,31 @@
         "acceptedLast24Hours": 2,
         "acceptedLast7Days": 6
       },
+      "incrementalChunks": {
+        "current": 10,
+        "total": 12,
+        "bounded": false,
+        "acceptedLast24Hours": 3,
+        "acceptedLast7Days": 8
+      },
+      "acceptedLast24Hours": 5,
+      "acceptedLast7Days": 14,
+      "latestAcceptedAt": "2026-08-17T11:21:58.898Z",
       "storedTelemetryRecords": 22,
       "storedTelemetryRecordsBounded": false
-    },
-    "pendingQuarantineObjects": 1,
-    "pendingQuarantineObjectsBounded": false
+    }
+  },
+  "quarantine": {
+    "pendingObjects": 110,
+    "pendingObjectsBounded": false,
+    "gracePeriodMinutes": 60,
+    "cutoffAt": "2026-08-17T11:00:00.000Z",
+    "withinGrace": 110,
+    "dueReferenced": 0,
+    "dueUnreferenced": 0,
+    "oldestRegisteredAt": "2026-08-17T11:19:32.269Z",
+    "newestRegisteredAt": "2026-08-17T11:21:58.898Z",
+    "nextEligibleAt": "2026-08-17T12:19:32.269Z"
   },
   "ingress": {
     "activeLeases": 3,
@@ -41,14 +68,72 @@
     "startRateDenials": 2,
     "lastDeniedAt": "2026-08-02T09:15:00.000Z"
   },
+  "distribution": {
+    "methodology": {
+      "unit": "distinct_source_ip_addresses",
+      "lookbackDays": 7,
+      "storesRawAddresses": false
+    },
+    "cloudflare": {
+      "status": "available",
+      "reasonCode": null,
+      "sampled": false,
+      "bounded": false,
+      "window": {
+        "startsAt": "2026-08-10T12:00:00.000Z",
+        "endsAt": "2026-08-17T12:00:00.000Z"
+      },
+      "activeSourceAddresses": { "last24Hours": 19, "last7Days": 29 },
+      "preflight": {
+        "requests": { "last24Hours": 22, "last7Days": 78 },
+        "sourceAddresses": { "last24Hours": 16, "last7Days": 25 }
+      },
+      "sparkleChecks": {
+        "requests": { "last24Hours": 14, "last7Days": 40 },
+        "sourceAddresses": { "last24Hours": 13, "last7Days": 21 }
+      },
+      "sparkleDownloads": {
+        "requests": { "last24Hours": 3, "last7Days": 3 },
+        "sourceAddresses": { "last24Hours": 3, "last7Days": 3 }
+      },
+      "currentVersion": "0.1.12",
+      "currentVersionSourceAddresses": { "last24Hours": 18, "last7Days": 19 },
+      "observedVersions": [
+        { "version": "0.1.12", "requestsLast7Days": 64, "sourceAddressesLast7Days": 19 },
+        { "version": "0.1.11", "requestsLast7Days": 9, "sourceAddressesLast7Days": 5 }
+      ],
+      "observedVersionsBounded": false
+    },
+    "github": {
+      "status": "available",
+      "reasonCode": null,
+      "repository": "adamallcock/tibotattle",
+      "release": {
+        "tag": "v0.1.12",
+        "publishedAt": "2026-08-15T18:00:00.000Z",
+        "dmgDownloads": 88,
+        "allAssetDownloads": 101
+      }
+    }
+  },
   "lifecycle": {
     "state": "completed",
     "quarantineRetentionComplete": true,
     "restoreReplayComplete": true,
-    "maintenanceRunAt": "2026-08-02T11:00:00.000Z",
+    "maintenanceRunAt": "2026-08-17T11:59:00.000Z",
     "failureCode": null
   },
-  "reconciliation": { "state": "completed", "reconciliationComplete": true },
+  "reconciliation": {
+    "state": "completed",
+    "lastCompletedAt": "2026-08-17T11:59:00.000Z",
+    "maintenanceRunAt": "2026-08-17T11:59:00.000Z",
+    "cutoffAt": "2026-08-17T10:59:00.000Z",
+    "registrationsExamined": 0,
+    "orphanObjectsDeleted": 0,
+    "referencedObjectsPreserved": 0,
+    "reconciliationComplete": true,
+    "failureCode": null
+  },
   "snapshots": [{
     "snapshotId": "community-weekly:2026-07-26",
     "weekStart": "2026-07-26T00:00:00.000Z",
@@ -57,6 +142,12 @@
     "releasedAt": "2026-08-02T11:30:00.000Z"
   }],
   "pendingHistoricalRebuilds": 0,
+  "dailyPublication": {
+    "latestEvidenceDay": "2026-08-01",
+    "latestReleasedAt": "2026-08-02T11:40:00.000Z",
+    "pendingRebuilds": 0,
+    "pendingRebuildsBounded": false
+  },
   "errors": {
     "groups": [{
       "routeClass": "admin_overview",
