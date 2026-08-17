@@ -20,6 +20,11 @@ import {
 import {
   createAccountingPricer,
 } from "./replay-safe-accounting-cache.js";
+import {
+  readCacheImpacts,
+  unavailableCacheContinuityImpact,
+  unavailableCacheSwitchImpact,
+} from "./cache-switch-impact.js";
 
 // The companion's read over the unified local index.
 //
@@ -60,6 +65,16 @@ function unavailable(status, errorCode = null) {
     indexBytes: 0,
     usage: [],
     timeline: null,
+    cacheSwitchImpact: unavailableCacheSwitchImpact(
+      status === "missing"
+        ? "local_unified_index_missing"
+        : errorCode ?? "local_unified_index_unavailable",
+    ),
+    cacheContinuityImpact: unavailableCacheContinuityImpact(
+      status === "missing"
+        ? "local_unified_index_missing"
+        : errorCode ?? "local_unified_index_unavailable",
+    ),
     readWallMs: null,
   };
 }
@@ -341,6 +356,24 @@ export async function readLocalUnifiedCompanionProjection({
         projection,
       );
     }
+    let cacheSwitchImpact;
+    let cacheContinuityImpact;
+    try {
+      ({ cacheSwitchImpact, cacheContinuityImpact } = readCacheImpacts(
+        database,
+        { nowMs, pricer, declaredSpeedBaselines: baselines },
+      ));
+    } catch {
+      // The ordinary usage projection remains useful if this optional,
+      // read-only diagnostic cannot be evaluated. Never substitute a zero for
+      // a failed transition read.
+      cacheSwitchImpact = unavailableCacheSwitchImpact(
+        "cache_switch_impact_unavailable",
+      );
+      cacheContinuityImpact = unavailableCacheContinuityImpact(
+        "cache_continuity_impact_unavailable",
+      );
+    }
     const quotaSeries = quotaTimelineFor(database, ["codex"], nowMs);
     const sparkQuotaSeries = quotaTimelineFor(
       database,
@@ -373,6 +406,8 @@ export async function readLocalUnifiedCompanionProjection({
       sourceBytes: Number.isSafeInteger(sourceBytes) ? sourceBytes : 0,
       indexBytes: metadata.size,
       usage: periods.map((period) => finalizeUsagePeriod(period.summary)),
+      cacheSwitchImpact,
+      cacheContinuityImpact,
       timeline: {
         bucketMinutes: TIMELINE_BUCKET_MS / 60_000,
         coveredAt: {

@@ -73,6 +73,12 @@ import {
 import {
   resolveLocalLegacyReportReadPath,
 } from "./local-legacy-report-storage.js";
+import {
+  collectHistoricalSideChatGapProbe,
+  collectSideChatEstimates,
+  unavailableHistoricalSideChatGapProbe,
+  unavailableSideChatEstimates,
+} from "./side-chat-estimates.js";
 
 export const LOCAL_COMPANION_SCHEMA_VERSION = "local-companion-v0.1";
 
@@ -897,6 +903,420 @@ function projectAllowanceCapacity(container, preference) {
   };
 }
 
+const CACHE_SWITCH_ALLOWANCE_INTERPRETATION =
+  "conditional_historical_estimate_not_provider_allowance";
+
+function unavailableCacheSwitchAllowance(reason) {
+  return {
+    status: "unavailable",
+    reason,
+    basisFamilyId: null,
+    selectedScenario: null,
+    medianPercentagePoints: null,
+    percentagePointRange: null,
+    plausibleRangePercentagePoints: null,
+    scenarios: {
+      unresolved_as_standard: null,
+      unresolved_as_fast: null,
+    },
+    interpretation: CACHE_SWITCH_ALLOWANCE_INTERPRETATION,
+  };
+}
+
+function projectCachePremiumScenario(value, scenario, basisFamilyId) {
+  const expected = codexPrimaryAllowanceBasis(scenario);
+  if (value?.status !== "complete"
+      || value?.reasonCode !== null
+      || value?.basisId !== expected.basisId
+      || value?.basisFamilyId !== expected.basisFamilyId
+      || basisFamilyId !== expected.basisFamilyId
+      || !Number.isFinite(value?.quotaWeightedPremiumUsd)
+      || value.quotaWeightedPremiumUsd < 0
+      || !Number.isSafeInteger(value?.pricedDrops)
+      || value.pricedDrops < 0) return null;
+  const provenance = [
+    "observedSpeedDrops",
+    "declaredSpeedDrops",
+    "assumedSpeedDrops",
+    "unknownSpeedDrops",
+  ].map((field) => value?.[field]);
+  if (provenance.some((count) => !Number.isSafeInteger(count) || count < 0)
+      || provenance.reduce((sum, count) => sum + count, 0)
+        !== value.pricedDrops) return null;
+  return {
+    basisId: expected.basisId,
+    basisFamilyId: expected.basisFamilyId,
+    quotaWeightedPremiumUsd: value.quotaWeightedPremiumUsd,
+    pricedDrops: value.pricedDrops,
+    observedSpeedDrops: value.observedSpeedDrops,
+    declaredSpeedDrops: value.declaredSpeedDrops,
+    assumedSpeedDrops: value.assumedSpeedDrops,
+    unknownSpeedDrops: value.unknownSpeedDrops,
+  };
+}
+
+function projectCachePremiumWeighting(value, preference) {
+  const expectedFamily = codexPrimaryAllowanceBasis(
+    "unresolved_as_standard",
+  ).basisFamilyId;
+  const unavailable = (reason, scenarios = {
+    unresolved_as_standard: null,
+    unresolved_as_fast: null,
+  }) => ({
+    status: "unavailable",
+    reasonCode: reason,
+    basisFamilyId: expectedFamily,
+    selectedScenario: null,
+    selectedPremiumUsd: null,
+    scenarios,
+    rangePremiumUsd: null,
+  });
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.basisFamilyId !== expectedFamily) {
+    return unavailable("malformed_projection");
+  }
+  const scenarios = Object.fromEntries(ALLOWANCE_SCENARIOS.map((scenario) => [
+    scenario,
+    projectCachePremiumScenario(
+      value.scenarios?.[scenario],
+      scenario,
+      value.basisFamilyId,
+    ),
+  ]));
+  if (preference === "mixed_unknown") {
+    if (scenarios.unresolved_as_standard === null
+        || scenarios.unresolved_as_fast === null) {
+      return unavailable(
+        value.scenarios?.unresolved_as_standard?.reasonCode
+          ?? value.scenarios?.unresolved_as_fast?.reasonCode
+          ?? "weighting_evidence_incomplete",
+        scenarios,
+      );
+    }
+    const endpoints = ALLOWANCE_SCENARIOS.map(
+      (scenario) => scenarios[scenario].quotaWeightedPremiumUsd,
+    );
+    return {
+      status: "range",
+      reasonCode: null,
+      basisFamilyId: expectedFamily,
+      selectedScenario: null,
+      selectedPremiumUsd: null,
+      scenarios,
+      rangePremiumUsd: {
+        lower: Math.min(...endpoints),
+        upper: Math.max(...endpoints),
+      },
+    };
+  }
+  const selectedScenario = preference === "fast"
+    ? "unresolved_as_fast"
+    : "unresolved_as_standard";
+  const selected = scenarios[selectedScenario];
+  if (selected === null) {
+    return unavailable(
+      value.scenarios?.[selectedScenario]?.reasonCode
+        ?? "weighting_evidence_incomplete",
+      scenarios,
+    );
+  }
+  return {
+    status: "complete",
+    reasonCode: null,
+    basisFamilyId: expectedFamily,
+    selectedScenario,
+    selectedPremiumUsd: selected.quotaWeightedPremiumUsd,
+    scenarios,
+    rangePremiumUsd: null,
+  };
+}
+
+function cacheAllowanceScenario(premium, capacity) {
+  if (premium === null || capacity === null
+      || premium.basisId !== capacity.basisId
+      || !Number.isFinite(premium.quotaWeightedPremiumUsd)
+      || !Number.isFinite(capacity.medianCapacityUsd)
+      || capacity.medianCapacityUsd <= 0) return null;
+  const plausible = capacity.plausibleRangeUsd;
+  if (!Number.isFinite(plausible?.lower) || plausible.lower <= 0
+      || !Number.isFinite(plausible?.upper)
+      || plausible.upper < plausible.lower) return null;
+  const round = (value) => Number(value.toFixed(6));
+  return {
+    basisId: premium.basisId,
+    quotaWeightedPremiumUsd: premium.quotaWeightedPremiumUsd,
+    medianCapacityUsd: capacity.medianCapacityUsd,
+    medianPercentagePoints: round(
+      (100 * premium.quotaWeightedPremiumUsd) / capacity.medianCapacityUsd,
+    ),
+    plausibleRangePercentagePoints: {
+      lower: round(
+        (100 * premium.quotaWeightedPremiumUsd) / plausible.upper,
+      ),
+      upper: round(
+        (100 * premium.quotaWeightedPremiumUsd) / plausible.lower,
+      ),
+    },
+  };
+}
+
+export function cacheSwitchAllowanceImpact(period, allowanceCapacity) {
+  // The retained capacity estimate is weekly. Applying that denominator to a
+  // 24-hour, 30-day, or all-history premium would manufacture a percentage of
+  // one week's allowance from a differently sized numerator.
+  if (period?.periodId !== "7d") {
+    return unavailableCacheSwitchAllowance("period_denominator_mismatch");
+  }
+  const weighting = period?.allowanceWeighting;
+  if (!weighting || !["complete", "range"].includes(weighting.status)) {
+    return unavailableCacheSwitchAllowance(
+      weighting?.reasonCode ?? "weighting_evidence_incomplete",
+    );
+  }
+  if (!allowanceCapacity
+      || !["available", "range"].includes(allowanceCapacity.status)) {
+    return unavailableCacheSwitchAllowance("capacity_unavailable");
+  }
+  // The current weekly fit is historical and account-unattributed. Require
+  // that provenance to be explicit so the UI's "may combine accounts"
+  // qualifier can never be separated from the percentage-point conversion.
+  if (allowanceCapacity.accountAttribution?.status
+        !== "historical_unattributed"
+      || allowanceCapacity.accountAttribution?.maySpanMultipleAccounts
+        !== true) {
+    return unavailableCacheSwitchAllowance(
+      "weekly_calibration_account_scope_unverified",
+    );
+  }
+  if (weighting.basisFamilyId !== allowanceCapacity.basisFamilyId) {
+    return unavailableCacheSwitchAllowance("basis_mismatch");
+  }
+  const scenarios = Object.fromEntries(ALLOWANCE_SCENARIOS.map((scenario) => [
+    scenario,
+    cacheAllowanceScenario(
+      weighting.scenarios?.[scenario] ?? null,
+      allowanceCapacity.scenarios?.[scenario] ?? null,
+    ),
+  ]));
+  if (weighting.status === "complete") {
+    const scenario = weighting.selectedScenario;
+    if (allowanceCapacity.status !== "available"
+        || allowanceCapacity.selectedScenario !== scenario
+        || scenarios[scenario] === null) {
+      return unavailableCacheSwitchAllowance("basis_mismatch");
+    }
+    const selected = scenarios[scenario];
+    return {
+      status: "complete",
+      reason: null,
+      basisFamilyId: weighting.basisFamilyId,
+      selectedScenario: scenario,
+      medianPercentagePoints: selected.medianPercentagePoints,
+      percentagePointRange: null,
+      plausibleRangePercentagePoints:
+        selected.plausibleRangePercentagePoints,
+      scenarios,
+      interpretation: CACHE_SWITCH_ALLOWANCE_INTERPRETATION,
+    };
+  }
+  if (allowanceCapacity.status !== "range"
+      || scenarios.unresolved_as_standard === null
+      || scenarios.unresolved_as_fast === null) {
+    return unavailableCacheSwitchAllowance("basis_mismatch");
+  }
+  const medians = ALLOWANCE_SCENARIOS.map(
+    (scenario) => scenarios[scenario].medianPercentagePoints,
+  );
+  const plausibleEndpoints = ALLOWANCE_SCENARIOS.flatMap((scenario) => [
+    scenarios[scenario].plausibleRangePercentagePoints.lower,
+    scenarios[scenario].plausibleRangePercentagePoints.upper,
+  ]);
+  return {
+    status: "range",
+    reason: null,
+    basisFamilyId: weighting.basisFamilyId,
+    selectedScenario: null,
+    medianPercentagePoints: null,
+    percentagePointRange: {
+      lower: Math.min(...medians),
+      upper: Math.max(...medians),
+    },
+    plausibleRangePercentagePoints: {
+      lower: Math.min(...plausibleEndpoints),
+      upper: Math.max(...plausibleEndpoints),
+    },
+    scenarios,
+    interpretation: CACHE_SWITCH_ALLOWANCE_INTERPRETATION,
+  };
+}
+
+function cacheSwitchImpactProjection(
+  impact,
+  selectedPeriodId,
+  allowanceCapacity,
+  preference,
+) {
+  if (impact?.status !== "available" || !Array.isArray(impact.periods)) {
+    return {
+      status: "unavailable",
+      errorCode: impact?.errorCode ?? "local_unified_index_unavailable",
+      periodId: selectedPeriodId,
+      periodLabel: null,
+      proximityCeilingSeconds: impact?.proximityCeilingSeconds ?? 300,
+      maximumRetainedCacheRatio:
+        impact?.maximumRetainedCacheRatio ?? 0.5,
+      recentDetailLimit: impact?.recentDetailLimit ?? 20,
+      allowanceImpact: unavailableCacheSwitchAllowance(
+        "cache_switch_impact_unavailable",
+      ),
+      periods: [],
+    };
+  }
+  const periods = impact.periods.map((period) => {
+    const allowanceWeighting = projectCachePremiumWeighting(
+      period.allowanceWeighting,
+      preference,
+    );
+    const projected = { ...period, allowanceWeighting };
+    return {
+      ...projected,
+      allowanceImpact: cacheSwitchAllowanceImpact(
+        projected,
+        allowanceCapacity,
+      ),
+    };
+  });
+  const selected = periods.find((period) => period.periodId === selectedPeriodId)
+    ?? periods.find((period) => period.periodId === "all")
+    ?? null;
+  if (selected === null) {
+    return {
+      status: "unavailable",
+      errorCode: "cache_switch_impact_period_unavailable",
+      periodId: selectedPeriodId,
+      periodLabel: null,
+      proximityCeilingSeconds: impact.proximityCeilingSeconds,
+      maximumRetainedCacheRatio: impact.maximumRetainedCacheRatio,
+      recentDetailLimit: impact.recentDetailLimit,
+      allowanceImpact: unavailableCacheSwitchAllowance(
+        "cache_switch_impact_unavailable",
+      ),
+      periods: [],
+    };
+  }
+  return {
+    status: "available",
+    errorCode: null,
+    periodId: selected.periodId,
+    periodLabel: selected.periodLabel,
+    proximityCeilingSeconds: impact.proximityCeilingSeconds,
+    maximumRetainedCacheRatio: impact.maximumRetainedCacheRatio,
+    recentDetailLimit: impact.recentDetailLimit,
+    configurationChanges: selected.configurationChanges,
+    proximateConfigurationChanges: selected.proximateConfigurationChanges,
+    uncoveredConfigurationChanges: selected.uncoveredConfigurationChanges,
+    orderingCoverageGaps: selected.orderingCoverageGaps ?? 0,
+    coverageStatus: selected.coverageStatus,
+    cacheReadDrops: selected.cacheReadDrops,
+    lostCacheTokens: selected.lostCacheTokens,
+    pricedDrops: selected.pricedDrops,
+    unpricedDrops: selected.unpricedDrops,
+    estimatedPremiumUsd: selected.estimatedPremiumUsd,
+    estimatedPremiumUsdExact: selected.estimatedPremiumUsdExact,
+    standardApiPremiumUsd: selected.standardApiPremiumUsd,
+    allowanceWeighting: selected.allowanceWeighting,
+    byChangeType: selected.byChangeType,
+    recent: selected.recent,
+    allowanceImpact: selected.allowanceImpact,
+    periods,
+  };
+}
+
+function cacheContinuityImpactProjection(
+  impact,
+  selectedPeriodId,
+  allowanceCapacity,
+  preference,
+) {
+  const methodology = {
+    minimumGapSeconds: impact?.minimumGapSeconds ?? 0,
+    maximumRetainedCacheRatio: impact?.maximumRetainedCacheRatio ?? 0.5,
+    recentDetailLimit: impact?.recentDetailLimit ?? 20,
+  };
+  if (impact?.status !== "available" || !Array.isArray(impact.periods)) {
+    return {
+      status: "unavailable",
+      errorCode: impact?.errorCode ?? "local_unified_index_unavailable",
+      periodId: selectedPeriodId,
+      periodLabel: null,
+      ...methodology,
+      allowanceImpact: unavailableCacheSwitchAllowance(
+        "cache_continuity_impact_unavailable",
+      ),
+      periods: [],
+    };
+  }
+  const periods = impact.periods.map((period) => {
+    const allowanceWeighting = projectCachePremiumWeighting(
+      period.allowanceWeighting,
+      preference,
+    );
+    const projected = { ...period, allowanceWeighting };
+    return {
+      ...projected,
+      allowanceImpact: cacheSwitchAllowanceImpact(
+        projected,
+        allowanceCapacity,
+      ),
+    };
+  });
+  const selected = periods.find((period) => period.periodId === selectedPeriodId)
+    ?? periods.find((period) => period.periodId === "all")
+    ?? null;
+  if (selected === null) {
+    return {
+      status: "unavailable",
+      errorCode: "cache_continuity_impact_period_unavailable",
+      periodId: selectedPeriodId,
+      periodLabel: null,
+      ...methodology,
+      allowanceImpact: unavailableCacheSwitchAllowance(
+        "cache_continuity_impact_unavailable",
+      ),
+      periods: [],
+    };
+  }
+  return {
+    status: "available",
+    errorCode: null,
+    periodId: selected.periodId,
+    periodLabel: selected.periodLabel,
+    ...methodology,
+    sameConfigurationReturns: selected.sameConfigurationReturns,
+    comparableReturns: selected.comparableReturns,
+    compactionConfoundedReturns: selected.compactionConfoundedReturns,
+    contextContractedReturns: selected.contextContractedReturns,
+    insufficientEvidenceReturns: selected.insufficientEvidenceReturns,
+    uncoveredReturns: selected.uncoveredReturns,
+    orderingCoverageGaps: selected.orderingCoverageGaps ?? 0,
+    coverageStatus: selected.coverageStatus,
+    cacheReadDrops: selected.cacheReadDrops,
+    lostCacheTokens: selected.lostCacheTokens,
+    pricedDrops: selected.pricedDrops,
+    unpricedDrops: selected.unpricedDrops,
+    estimatedPremiumUsd: selected.estimatedPremiumUsd,
+    estimatedPremiumUsdExact: selected.estimatedPremiumUsdExact,
+    standardApiPremiumUsd: selected.standardApiPremiumUsd,
+    allowanceWeighting: selected.allowanceWeighting,
+    postCompactionRequests: selected.postCompactionRequests,
+    postCompactionCacheReadDrops: selected.postCompactionCacheReadDrops,
+    byGapBand: selected.byGapBand,
+    recent: selected.recent,
+    allowanceImpact: selected.allowanceImpact,
+    periods,
+  };
+}
+
 async function readCollectorProjection(
   stateFile,
   nowMs,
@@ -1445,6 +1865,101 @@ function fastModeGapStatus(coverage) {
 // accounting-only fallback. Whenever provider allowance is shown, consumers
 // use only this independently projected quota-weighted amount. The full speed
 // crossing stays server-side and an incomplete crossing fails closed.
+// Side-chat estimates are an explicitly development-only calibration overlay.
+// They never enter the exact usage periods or headline accounting totals. The
+// browser can therefore compare the adjusted residual with the same exact
+// ledger it already showed, without making an imputation look observed.
+function mergeCalibrationUsageTimeline(exactRows, estimatedRows) {
+  const buckets = new Map();
+  for (const row of [...exactRows, ...estimatedRows]) {
+    const key = `${row.startAt}|${row.endAt}`;
+    const bucket = buckets.get(key) ?? {
+      startAt: row.startAt,
+      endAt: row.endAt,
+      usageEvents: 0,
+      totalTokens: 0,
+      apiPriceEquivalentUsd: 0,
+      speedWeighting: safeSpeedWeighting(),
+      declaredSpeedWeighting: safeSpeedWeighting(),
+      components: emptyComponents(),
+      pricingCoverage: {
+        fullyPricedEvents: 0,
+        partiallyPricedEvents: 0,
+        unpricedEvents: 0,
+      },
+    };
+    bucket.usageEvents += row.usageEvents;
+    bucket.totalTokens += row.totalTokens;
+    bucket.apiPriceEquivalentUsd += row.apiPriceEquivalentUsd;
+    const rowSpeedWeighting = safeSpeedWeighting(row.speedWeighting);
+    const rowDeclaredSpeedWeighting = safeSpeedWeighting(
+      row.declaredSpeedWeighting,
+    );
+    for (const speed of Object.keys(bucket.speedWeighting)) {
+      for (const family of Object.keys(bucket.speedWeighting[speed])) {
+        const speedCell = rowSpeedWeighting[speed][family];
+        bucket.speedWeighting[speed][family].events += speedCell.events;
+        bucket.speedWeighting[speed][family].apiPriceEquivalentUsd +=
+          speedCell.apiPriceEquivalentUsd;
+        const declaredCell = rowDeclaredSpeedWeighting[speed][family];
+        bucket.declaredSpeedWeighting[speed][family].events +=
+          declaredCell.events;
+        bucket.declaredSpeedWeighting[speed][family]
+          .apiPriceEquivalentUsd += declaredCell.apiPriceEquivalentUsd;
+      }
+    }
+    for (const component of Object.keys(bucket.components)) {
+      bucket.components[component] += row.components?.[component] ?? 0;
+    }
+    for (const status of [
+      "fullyPricedEvents",
+      "partiallyPricedEvents",
+      "unpricedEvents",
+    ]) {
+      bucket.pricingCoverage[status] += row.pricingCoverage?.[status] ?? 0;
+    }
+    buckets.set(key, bucket);
+  }
+  return [...buckets.values()]
+    .sort((left, right) => Date.parse(left.startAt) - Date.parse(right.startAt))
+    .map((row) => ({
+      ...row,
+      apiPriceEquivalentUsd: Number(row.apiPriceEquivalentUsd.toFixed(12)),
+      speedWeighting: Object.fromEntries(
+        Object.entries(row.speedWeighting).map(([speed, families]) => [
+          speed,
+          Object.fromEntries(
+            Object.entries(families).map(([family, cell]) => [family, {
+              ...cell,
+              apiPriceEquivalentUsd: Number(
+                cell.apiPriceEquivalentUsd.toFixed(12),
+              ),
+            }]),
+          ),
+        ]),
+      ),
+      declaredSpeedWeighting: Object.fromEntries(
+        Object.entries(row.declaredSpeedWeighting).map(([speed, families]) => [
+          speed,
+          Object.fromEntries(
+            Object.entries(families).map(([family, cell]) => [family, {
+              ...cell,
+              apiPriceEquivalentUsd: Number(
+                cell.apiPriceEquivalentUsd.toFixed(12),
+              ),
+            }]),
+          ),
+        ]),
+      ),
+    }));
+}
+
+// Timeline rows keep their Standard-price amount for a separately labelled
+// accounting-only chart fallback. Whenever provider allowance is shown, the
+// chart and every other comparison consume only this independently projected,
+// quota-weighted amount. The full speed crossing stays server-side. If an old
+// or malformed producer omitted any event/cost from the crossing, the bucket
+// is explicit unknown and carries no usable weighted scalar.
 function quotaWeightedUsageTimeline(rows, { preference, inference }) {
   return rows.map((row) => {
     const speedWeighting = safeSpeedWeighting(row.speedWeighting);
@@ -1562,6 +2077,15 @@ export async function buildLocalCompanionSnapshot({
   // reading never reaches back before it happened, and an observed tier always
   // wins over it. An absent or unreadable ledger is simply no coverage.
   codexSpeedBaselines = [],
+  // Experimental owner-only side-chat estimation is opt-in so the shipped
+  // snapshot remains byte-for-byte on its exact accounting path by default.
+  codexHome = undefined,
+  includeDevelopmentSideChatEstimates = false,
+  sideChatEstimateCollector = collectSideChatEstimates,
+  developmentSideChatHistoricalGapDate = null,
+  developmentSideChatHistoricalGapTimeZone = "America/New_York",
+  developmentSideChatHistoricalGapAssumedSpeed = "fast",
+  sideChatHistoricalGapCollector = collectHistoricalSideChatGapProbe,
   now = () => Date.now(),
 } = {}) {
   const nowMs = now();
@@ -1576,7 +2100,62 @@ export async function buildLocalCompanionSnapshot({
   const selectedFastModePreference = isFastModePreference(fastModePreference)
     ? fastModePreference
     : DEFAULT_FAST_MODE_PREFERENCE;
-  const [replaySafeAccounting, archiveCoverage, archiveAccounting, unified] =
+  if (typeof includeDevelopmentSideChatEstimates !== "boolean") {
+    throw new TypeError("includeDevelopmentSideChatEstimates must be a boolean");
+  }
+  if (typeof sideChatEstimateCollector !== "function") {
+    throw new TypeError("sideChatEstimateCollector must be a function");
+  }
+  if (developmentSideChatHistoricalGapDate !== null
+      && (typeof developmentSideChatHistoricalGapDate !== "string"
+        || !/^\d{4}-\d{2}-\d{2}$/u.test(
+          developmentSideChatHistoricalGapDate,
+        ))) {
+    throw new TypeError(
+      "developmentSideChatHistoricalGapDate must be an ISO date or null",
+    );
+  }
+  if (developmentSideChatHistoricalGapTimeZone !== "America/New_York"
+      || developmentSideChatHistoricalGapAssumedSpeed !== "fast"
+      || typeof sideChatHistoricalGapCollector !== "function") {
+    throw new TypeError("Historical side-chat gap options are invalid");
+  }
+  const sideChatEstimatePromise = includeDevelopmentSideChatEstimates
+    ? Promise.resolve()
+      .then(() => sideChatEstimateCollector({
+        codexHome,
+        now: () => nowMs,
+        declaredSpeedBaselines,
+      }))
+      .catch(() => unavailableSideChatEstimates(
+        "side_chat_estimate_unavailable",
+      ))
+    : Promise.resolve(null);
+  const sideChatHistoricalGapPromise = includeDevelopmentSideChatEstimates
+      && developmentSideChatHistoricalGapDate !== null
+    ? Promise.resolve()
+      .then(() => sideChatHistoricalGapCollector({
+        unifiedIndexFile,
+        collectorStateFile,
+        date: developmentSideChatHistoricalGapDate,
+        timeZone: developmentSideChatHistoricalGapTimeZone,
+        assumedMissingSpeed: developmentSideChatHistoricalGapAssumedSpeed,
+        fastModePreference: selectedFastModePreference,
+        declaredSpeedBaselines,
+      }))
+      .catch(() => unavailableHistoricalSideChatGapProbe(
+        "side_chat_historical_gap_unavailable",
+        developmentSideChatHistoricalGapDate,
+      ))
+    : Promise.resolve(null);
+  const [
+    replaySafeAccounting,
+    archiveCoverage,
+    archiveAccounting,
+    unified,
+    retainedSideChatEstimates,
+    sideChatHistoricalGapProbe,
+  ] =
     await Promise.all([
       readReplaySafeAccountingCache({
         stateFile: collectorStateFile,
@@ -1590,7 +2169,17 @@ export async function buildLocalCompanionSnapshot({
         nowMs,
         declaredSpeedBaselines,
       }),
+      sideChatEstimatePromise,
+      sideChatHistoricalGapPromise,
     ]);
+  const sideChatEstimates = retainedSideChatEstimates === null
+    ? null
+    : sideChatHistoricalGapProbe === null
+      ? retainedSideChatEstimates
+      : {
+        ...retainedSideChatEstimates,
+        historicalGapProbe: sideChatHistoricalGapProbe,
+      };
   const replaySafeCache = ["available", "stale"].includes(
     replaySafeAccounting.status,
   )
@@ -1699,6 +2288,22 @@ export async function buildLocalCompanionSnapshot({
     : broadUsage;
   const displayUsage = usage.find((period) => period.id === "7d" && period.events > 0)
     ?? usage.find((period) => period.id === "all");
+  // The switch diagnostic always comes from the unified index, independently
+  // of whether the ordinary recent accounting periods came from the faster
+  // replay-safe cache. This keeps the optional lens present without changing
+  // the source or totals of the established accounting projection.
+  const cacheSwitchImpact = cacheSwitchImpactProjection(
+    unified.cacheSwitchImpact,
+    displayUsage?.id ?? "all",
+    allowanceCapacity,
+    selectedFastModePreference,
+  );
+  const cacheContinuityImpact = cacheContinuityImpactProjection(
+    unified.cacheContinuityImpact,
+    displayUsage?.id ?? "all",
+    allowanceCapacity,
+    selectedFastModePreference,
+  );
   const fastModeInference = inferFastModeFromCalibrationWindows(
     fastModeCalibrationWindows(replaySafeCache?.weeklyCalibration),
   );
@@ -1714,14 +2319,6 @@ export async function buildLocalCompanionSnapshot({
   const displayFastMode = displayUsage === undefined
     ? fastModeProjection(undefined, fastModeContext)
     : periodFastMode.get(displayUsage.id);
-  const exactUsageTimelineWithSpeed = unifiedAvailable
-    ? unified.timeline.usage
-    : replaySafeCache?.timeline
-      ?? collector.timeline.usage;
-  const exactUsageTimeline = quotaWeightedUsageTimeline(
-    exactUsageTimelineWithSpeed,
-    fastModeContext,
-  );
   const quota = collector.quota;
   const quotaTimeline = unifiedAvailable
     ? unified.timeline.quota
@@ -1738,6 +2335,26 @@ export async function buildLocalCompanionSnapshot({
     : Array.isArray(replaySafeCache?.sparkUsageTimeline)
       ? replaySafeCache.sparkUsageTimeline
       : collector.timeline.sparkUsage;
+  const exactUsageTimelineWithSpeed = unifiedAvailable
+    ? unified.timeline.usage
+    : replaySafeCache?.timeline
+      ?? collector.timeline.usage;
+  const calibrationUsageTimelineWithSpeed =
+    sideChatEstimates?.status === "available"
+      && sideChatEstimates.methodology?.includedInCalibrationTimeline === true
+    ? mergeCalibrationUsageTimeline(
+      exactUsageTimelineWithSpeed,
+      sideChatEstimates.timeline,
+    )
+    : exactUsageTimelineWithSpeed;
+  const exactUsageTimeline = quotaWeightedUsageTimeline(
+    exactUsageTimelineWithSpeed,
+    fastModeContext,
+  );
+  const calibrationUsageTimeline = quotaWeightedUsageTimeline(
+    calibrationUsageTimelineWithSpeed,
+    fastModeContext,
+  );
   // What span the timelines honestly cover, and out of which source. When the
   // unified index is absent this names the bound instead of hiding it.
   const timelineSource = unifiedAvailable
@@ -1918,6 +2535,9 @@ export async function buildLocalCompanionSnapshot({
           selectedFastModePreference,
         ),
         usage: exactUsageTimeline,
+        ...(includeDevelopmentSideChatEstimates
+          ? { calibrationUsage: calibrationUsageTimeline }
+          : {}),
         allowanceCapacity,
         quota: quotaTimeline,
         sparkUsage: sparkUsageTimeline,
@@ -1959,6 +2579,10 @@ export async function buildLocalCompanionSnapshot({
         toolClasses: tools,
         apiPriceCounterfactualTier: "standard",
         subscriptionSpeedIsSeparate: true,
+        // The ordinary usage projection still cannot provide a complete
+        // reasoning-effort breakdown. The cache-switch diagnostic below is a
+        // narrower read from the unified index and reports only known adjacent
+        // configuration transitions.
         reasoningEffortAvailable: false,
         accountingSource: replaySafeCache !== null
           ? replaySafeCache.accountingMethod
@@ -1967,6 +2591,11 @@ export async function buildLocalCompanionSnapshot({
             : "collector_projection_unverified",
         accountingCacheStatus: accountingStatus,
         replayExclusionDiagnostics: replaySafeCache?.diagnostics ?? null,
+        cacheSwitchImpact,
+        cacheContinuityImpact,
+        ...(includeDevelopmentSideChatEstimates
+          ? { sideChatEstimates }
+          : {}),
         evidenceStartDate: OPENAI_PRICE_EVIDENCE_START_DATE,
         historyCoverage: archiveCoverage,
         historyPeriodStatus: archiveAccounting.status,
@@ -2101,7 +2730,7 @@ export async function buildLocalCompanionSnapshot({
           id: "fast_mode",
           title: "Fast-mode accounting",
           status: fastModeGapStatus(displayFastMode.coverage),
-          explanation: "Codex records the speed mode only when it is applied or changed, never at session start, so turns before the first change in a session carry no recorded tier. Observed tiers always win; the remainder is attributed from the owner's stated mode, then a secondary window-level inference, and anything left stays explicitly unknown.",
+          explanation: "Codex records the speed mode only when it is applied or changed, never at session start, so turns before the first change in a session carry no recorded tier. Observed tiers always win; a timestamp-covered config declaration comes next, then the owner's stated mode. Window-level inference is diagnostic only and never changes the money. Only an explicit mixed/unknown choice can leave the remainder unknown.",
         },
         {
           id: "subagents",
@@ -2128,8 +2757,12 @@ export async function buildLocalCompanionSnapshot({
         {
           id: "reasoning_effort",
           title: "Reasoning effort",
-          status: "unavailable",
-          explanation: "Current retained usage snapshots do not expose a reasoning-effort field.",
+          status: cacheSwitchImpact.status === "available"
+            ? "partial"
+            : "unavailable",
+          explanation: cacheSwitchImpact.status === "available"
+            ? "The unified index exposes reasoning effort for adjacent configuration-change diagnostics, but ordinary usage accounting does not yet provide a complete per-request reasoning-effort breakdown."
+            : "No complete per-request reasoning-effort breakdown is available.",
         },
         {
           id: "api_service_tier",

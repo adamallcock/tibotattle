@@ -1762,18 +1762,16 @@ tbody tr:last-child td { border-bottom: 0; }
    narrow table it overflows into the .table-wrap horizontal scroll rather than
    forcing a spaced name to wrap. */
 .accounting-models-panel table { table-layout: auto; }
-.accounting-models-panel th:first-child,
-.accounting-models-panel td:first-child { width: 100%; white-space: nowrap; }
 .accounting-models-panel th:not(:first-child),
 .accounting-models-panel td:not(:first-child) {
   text-align: end;
   font-variant-numeric: tabular-nums;
 }
-/* Ordinary inline flow, not a flex row. The row used to hold a name and a
-   filled chip side by side; it now holds a name and a reference mark, and a
-   flex item cannot sit against the last word of a name that wrapped — the
-   marker fell onto a line of its own under the model it was marking. */
-.model-identity { display: block; }
+/* Keep the identity `<td>` in native table-cell layout. Setting the cell itself
+   to `display: block` detached it from the table's column calculation, leaving
+   a one-word column followed by what looked like an empty column. Its child
+   name and reference mark already use ordinary inline flow. */
+.model-identity { display: table-cell; }
 /* A reference mark, not a badge: it sits on the name it qualifies and points
    at the one footnote under the table. The dotted underline `abbr` gets by
    default would read as a spelling error on a single glyph. */
@@ -1787,6 +1785,57 @@ tbody tr:last-child td { border-bottom: 0; }
 .model-allowance-footnote::before { content: "* "; }
 /* Digits stay column-aligned so counts can be compared down the column. */
 .numeric-cell, .model-api-equivalent { font-variant-numeric: tabular-nums; }
+.cache-switch-details { margin-top: 18px; }
+.cache-switch-details th:nth-child(n + 3),
+.cache-switch-details td:nth-child(n + 3) { text-align: end; }
+.cache-continuity-details .evidence-subheading {
+  margin: var(--space-5) 0 var(--space-2);
+  font-size: .82rem;
+}
+.cache-continuity-gap-table th:not(:first-child),
+.cache-continuity-gap-table td:not(:first-child) { text-align: end; }
+.cache-continuity-gap-table td:first-child { white-space: normal; }
+.cache-continuity-premium-unavailable { color: var(--muted); }
+.cache-continuity-recent-table th:nth-child(3),
+.cache-continuity-recent-table td:nth-child(3) { text-align: start; }
+.cache-continuity-recent-table th:nth-child(n + 4),
+.cache-continuity-recent-table td:nth-child(n + 4) { text-align: end; }
+.side-chat-evidence-summary { margin: var(--space-4) 0 var(--space-3); }
+.historical-gap-probe {
+  margin: var(--space-5) 0;
+  padding: var(--space-4) var(--pad-tile);
+  border: 1px solid var(--rust);
+  border-radius: var(--radius-sm);
+  background: var(--rust-soft);
+}
+.historical-gap-probe h3 { margin: var(--space-1) 0 var(--space-2); }
+.historical-gap-probe .annotation { margin: 0; }
+.side-chat-historical-gap-summary { margin: var(--space-4) 0; }
+.historical-gap-probe .timeline-confidence { margin-bottom: var(--space-3); }
+.side-chat-details .evidence-subheading {
+  margin: var(--space-5) 0 var(--space-2);
+  font-size: .82rem;
+}
+.side-chat-recent-table th { white-space: normal; }
+.side-chat-recent-table .cache-switch-change { min-width: 9rem; }
+.side-chat-recent-table th:nth-child(3),
+.side-chat-recent-table td:nth-child(3),
+.side-chat-recent-table th:nth-child(5),
+.side-chat-recent-table td:nth-child(5) { text-align: start; }
+.side-chat-recent-table th:nth-child(2),
+.side-chat-recent-table td:nth-child(2),
+.side-chat-recent-table th:nth-child(4),
+.side-chat-recent-table td:nth-child(4),
+.side-chat-recent-table th:nth-child(6),
+.side-chat-recent-table td:nth-child(6) { text-align: end; }
+.side-chat-recent-table td:nth-child(5) {
+  min-width: 11rem;
+  white-space: normal;
+}
+.cache-switch-change {
+  min-width: 15rem;
+  white-space: normal;
+}
 .accounting-bars { display: grid; gap: 10px; }
 .accounting-dimensions {
   display: grid;
@@ -2154,6 +2203,11 @@ footer p { margin: 0; }
     grid-area: download;
   }
   .state-pill { max-width: 118px; overflow: hidden; white-space: nowrap; }
+  /* The detailed in-page history badge shares this class and is defined later
+     in the sheet. Scope the narrow-screen override to the toolbar so that
+     later evidence-card styling cannot make the header badge reappear and
+     widen the page beyond the viewport. */
+  .topbar .history-index-badge { display: none; }
   /* Only the crowded top toolbar sheds its compact buttons on narrow screens. */
   .topbar .button.compact { display: none; }
   .dashboard-sidebar { padding-inline: 14px; }
@@ -2201,6 +2255,7 @@ footer p { margin: 0; }
   h1 { font-size: 2.55rem; }
   h2 { font-size: 2.25rem; }
   .topbar { grid-template-columns: minmax(0, 1fr) auto; }
+  body:not(.community-site) > .topbar .brand > span { display: none; }
   .state-pill {
     justify-content: center;
     width: 28px;

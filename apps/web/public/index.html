@@ -771,6 +771,11 @@
                 <tbody id="accounting-models"></tbody>
               </table>
             </div>
+            <div class="table-pagination" id="accounting-model-pagination" hidden>
+              <button class="button button-quiet compact" id="accounting-model-page-prev" type="button" aria-controls="accounting-models" data-i18n="table.pagination.previous">Previous</button>
+              <span class="table-pagination-status" id="accounting-model-page-status" role="status"></span>
+              <button class="button button-quiet compact" id="accounting-model-page-next" type="button" aria-controls="accounting-models" data-i18n="table.pagination.next">Next</button>
+            </div>
             <p class="annotation" id="accounting-price-coverage" hidden></p>
             <!--
               The expansion of the marker each separately metered row carries.
@@ -784,6 +789,138 @@
               invented cost.
             </p>
         </article>
+        <details class="panel advanced-diagnostics evidence-disclosure cache-switch-details" id="cache-switch-details" hidden>
+          <summary data-i18n="accounting.cacheSwitch.detailsSummary">See possible switch overhead</summary>
+          <p class="annotation" data-i18n="accounting.cacheSwitch.detailsExplanation">
+            These recent rows pair an adjacent model or reasoning change with
+            an observed material cache-read drop within five minutes. The
+            cache-read change is observed; its relationship to the setting
+            change is inferred.
+          </p>
+          <div class="table-wrap">
+            <table>
+              <caption class="sr-only" data-i18n="accounting.cacheSwitch.tableCaption">Recent possible switch-overhead evidence</caption>
+              <thead>
+                <tr>
+                  <th data-i18n="accounting.cacheSwitch.column.localTime">Local time</th>
+                  <th data-i18n="accounting.cacheSwitch.column.change">Configuration change</th>
+                  <th data-i18n="accounting.cacheSwitch.column.cacheRead">Cache read</th>
+                  <th data-i18n="accounting.cacheSwitch.column.lostTokens">Estimated lost reuse</th>
+                  <th data-i18n="accounting.cacheSwitch.column.apiEquivalent">Standard API equivalent</th>
+                </tr>
+              </thead>
+              <tbody id="cache-switch-rows"></tbody>
+            </table>
+          </div>
+          <div class="table-pagination" id="cache-switch-pagination" hidden>
+            <button class="button button-quiet compact" id="cache-switch-page-prev" type="button" aria-controls="cache-switch-rows" data-i18n="table.pagination.previous">Previous</button>
+            <span class="table-pagination-status" id="cache-switch-page-status" role="status"></span>
+            <button class="button button-quiet compact" id="cache-switch-page-next" type="button" aria-controls="cache-switch-rows" data-i18n="table.pagination.next">Next</button>
+          </div>
+        </details>
+        <details class="panel advanced-diagnostics evidence-disclosure cache-switch-details cache-continuity-details" id="cache-continuity-details" hidden>
+          <summary data-i18n="accounting.cacheContinuity.detailsSummary">See possible cache-continuity overhead</summary>
+          <p class="annotation" data-i18n="accounting.cacheContinuity.detailsExplanation">
+            The first table groups comparable adjacent user turns by elapsed
+            time; the recent rows below show qualifying material cache-read
+            drops while the effective model, reasoning, routing, and surface
+            remained unchanged. Time is evidence, not an eligibility rule;
+            compactions and contracted contexts stay out of the cost.
+          </p>
+          <h3 class="evidence-subheading" data-i18n="accounting.cacheContinuity.gapHeading">By time between turns</h3>
+          <div class="table-wrap">
+            <table class="cache-continuity-gap-table">
+              <caption class="sr-only" data-i18n="accounting.cacheContinuity.gapTableCaption">Possible cache-continuity overhead by time between turns</caption>
+              <thead>
+                <tr>
+                  <th data-i18n="accounting.cacheContinuity.column.gapBand">Time between turns</th>
+                  <th data-i18n="accounting.cacheContinuity.column.dropsComparable">Material drops / comparable returns</th>
+                  <th data-i18n="accounting.cacheContinuity.column.lostTokens">Estimated lost reuse</th>
+                  <th data-i18n="accounting.cacheContinuity.column.apiEquivalent">Standard API equivalent</th>
+                </tr>
+              </thead>
+              <tbody id="cache-continuity-gap-rows"></tbody>
+            </table>
+          </div>
+          <div class="table-pagination" id="cache-continuity-gap-pagination" hidden>
+            <button class="button button-quiet compact" id="cache-continuity-gap-page-prev" type="button" aria-controls="cache-continuity-gap-rows" data-i18n="table.pagination.previous">Previous</button>
+            <span class="table-pagination-status" id="cache-continuity-gap-page-status" role="status"></span>
+            <button class="button button-quiet compact" id="cache-continuity-gap-page-next" type="button" aria-controls="cache-continuity-gap-rows" data-i18n="table.pagination.next">Next</button>
+          </div>
+          <h3 class="evidence-subheading" data-i18n="accounting.cacheContinuity.recentHeading">Recent qualifying drops</h3>
+          <div class="table-wrap">
+            <table class="cache-continuity-recent-table">
+              <caption class="sr-only" data-i18n="accounting.cacheContinuity.tableCaption">Recent possible cache-continuity overhead evidence</caption>
+              <thead>
+                <tr>
+                  <th data-i18n="accounting.cacheContinuity.column.localTime">Local time</th>
+                  <th data-i18n="accounting.cacheContinuity.column.gap">Time between turns</th>
+                  <th data-i18n="accounting.cacheContinuity.column.configuration">Unchanged configuration</th>
+                  <th data-i18n="accounting.cacheContinuity.column.cacheRead">Cache read</th>
+                  <th data-i18n="accounting.cacheContinuity.column.lostTokens">Estimated lost reuse</th>
+                  <th data-i18n="accounting.cacheContinuity.column.apiEquivalent">Standard API equivalent</th>
+                </tr>
+              </thead>
+              <tbody id="cache-continuity-rows"></tbody>
+            </table>
+          </div>
+          <div class="table-pagination" id="cache-continuity-pagination" hidden>
+            <button class="button button-quiet compact" id="cache-continuity-page-prev" type="button" aria-controls="cache-continuity-rows" data-i18n="table.pagination.previous">Previous</button>
+            <span class="table-pagination-status" id="cache-continuity-page-status" role="status"></span>
+            <button class="button button-quiet compact" id="cache-continuity-page-next" type="button" aria-controls="cache-continuity-rows" data-i18n="table.pagination.next">Next</button>
+          </div>
+        </details>
+        <details class="panel advanced-diagnostics evidence-disclosure cache-switch-details side-chat-details" id="side-chat-details" hidden>
+          <summary data-i18n="accounting.sideChat.detailsSummary">See experimental side-chat estimate</summary>
+          <p class="annotation" data-i18n="accounting.sideChat.detailsExplanation">
+            This development-only estimate finds confirmed desktop side-chat
+            lifecycles and prices deduplicated sampling markers that still
+            survive in numeric local diagnostics. The active window is
+            approximately 10 days; expired or rotated partitions are unknown
+            and are not reconstructed. Active-context volume is observed,
+            while input, cache, output, and reasoning components are
+            reconstructed. Ordinary calls use the owner-directed mostly-warm
+            point; an observed compaction makes the next point cold. Auto
+            Review and other reviewed aliases retain their conditional
+            alias-rate assumption. Exact totals remain unchanged. Surviving
+            eligible estimates are speed-weighted and added only to the
+            experimental red line, calibration metrics, and AUC, with the
+            exact-ledger baseline kept beside them.
+          </p>
+          <section class="historical-gap-probe" id="side-chat-historical-gap" hidden>
+            <p class="panel-kicker" data-i18n="accounting.sideChat.historicalGap.kicker">Historical test case</p>
+            <h3 data-i18n="accounting.sideChat.historicalGap.heading">Historical quota-gap backcast</h3>
+            <p class="annotation" id="side-chat-historical-gap-explanation"></p>
+            <div class="chart-summary-grid side-chat-historical-gap-summary" id="side-chat-historical-gap-summary"></div>
+            <p class="timeline-confidence low" id="side-chat-historical-gap-note"></p>
+            <button class="button button-secondary compact" id="side-chat-historical-gap-focus" type="button" data-i18n="accounting.sideChat.historicalGap.focus">View this day on the timeline</button>
+          </section>
+          <h3 class="evidence-subheading" data-i18n="accounting.sideChat.retainedHeading">Retained numeric estimate</h3>
+          <div class="chart-summary-grid side-chat-evidence-summary" id="side-chat-evidence-summary"></div>
+          <p class="annotation" id="side-chat-coverage-note"></p>
+          <h3 class="evidence-subheading" data-i18n="accounting.sideChat.recentHeading">Retained sampling calls</h3>
+          <div class="table-wrap">
+            <table class="side-chat-recent-table">
+              <caption class="sr-only" data-i18n="accounting.sideChat.tableCaption">Experimental side-chat sampling-call estimates</caption>
+              <thead>
+                <tr>
+                  <th data-i18n="accounting.sideChat.column.localTime">Local time</th>
+                  <th data-i18n="accounting.sideChat.column.turn">Turn</th>
+                  <th data-i18n="accounting.sideChat.column.configuration">Configuration</th>
+                  <th data-i18n="accounting.sideChat.column.activeContext">Active context</th>
+                  <th data-i18n="accounting.sideChat.column.cacheAssumption">Cache assumption</th>
+                  <th data-i18n="accounting.sideChat.column.apiEstimate">Estimated Standard API equivalent</th>
+                </tr>
+              </thead>
+              <tbody id="side-chat-rows"></tbody>
+            </table>
+          </div>
+          <div class="table-pagination" id="side-chat-pagination" hidden>
+            <button class="button button-quiet compact" id="side-chat-page-prev" type="button" aria-controls="side-chat-rows" data-i18n="table.pagination.previous">Previous</button>
+            <span class="table-pagination-status" id="side-chat-page-status" role="status"></span>
+            <button class="button button-quiet compact" id="side-chat-page-next" type="button" aria-controls="side-chat-rows" data-i18n="table.pagination.next">Next</button>
+          </div>
+        </details>
       </section>
 
       <section

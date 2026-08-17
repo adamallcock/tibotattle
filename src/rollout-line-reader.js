@@ -8,15 +8,16 @@ import { createReadStream } from "node:fs";
 //    `Buffer.prototype.indexOf` drops into a SIMD memchr, and over the local
 //    42 GiB rollout corpus that alone was a 5.93x improvement (228.45s ->
 //    38.52s).
-// 2. Every line this product cares about is tiny. Measured across the largest
-//    rollout files (36,395 relevant lines): the longest `turn_context` was
-//    2 KiB, `token_count` 1 KiB, `thread_settings_applied` 1 KiB. Not one
-//    relevant line reached 64 KiB. The 80 MiB lines in those files are
-//    `compacted`, `response_item` and `agent_reasoning` records, which are
-//    never parsed and must never be read into memory.
+// 2. Every complete JSON payload this product parses is tiny. Measured across
+//    the largest rollout files (36,395 relevant lines): the longest
+//    `turn_context` was 2 KiB, `token_count` 1 KiB and
+//    `thread_settings_applied` 1 KiB. The 80 MiB `compacted` records are never
+//    parsed; only their bounded top-level type/timestamp prefix may be
+//    inspected. Content-bearing `response_item`, `agent_reasoning`, and
+//    compaction payloads must never be read into memory.
 //
-// So a line longer than the cap is provably not one of ours. It is skipped
-// without being buffered or concatenated, which is what makes peak memory
+// So a line longer than the cap never needs full buffering or parsing. Its
+// tail is skipped without concatenation, which is what makes peak memory
 // independent of rollout file size — a 15 GiB single file costs no more than a
 // 1 MiB one.
 //

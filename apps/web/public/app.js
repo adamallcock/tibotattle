@@ -103,6 +103,41 @@ const RESIDUAL_TABLE_PAGE_SIZE = 10;
 let residualTablePage = 0;
 let residualInspectionRows = [];
 let residualInspectionSignature = "";
+// Accounting tables use the dashboard's established ten-row pager rather than
+// growing indefinitely. Each table owns its page because the model, switch,
+// time-band, and recent-continuity row sets change independently. A changed
+// period or refreshed row set returns to page one.
+const CACHE_IMPACT_TABLE_PAGE_SIZE = 10;
+const accountingModelsTablePagination = { page: 0, signature: "" };
+const cacheSwitchTablePagination = { page: 0, signature: "" };
+const cacheContinuityGapTablePagination = { page: 0, signature: "" };
+const cacheContinuityTablePagination = { page: 0, signature: "" };
+const sideChatTablePagination = { page: 0, signature: "" };
+
+function paginateCacheImpactRows(rows, state, signature) {
+  const selectedRows = Array.isArray(rows) ? rows : [];
+  if (state.signature !== signature) {
+    state.signature = signature;
+    state.page = 0;
+  }
+  const pageCount = Math.max(
+    1,
+    Math.ceil(selectedRows.length / CACHE_IMPACT_TABLE_PAGE_SIZE),
+  );
+  state.page = Math.min(Math.max(0, state.page), pageCount - 1);
+  const start = state.page * CACHE_IMPACT_TABLE_PAGE_SIZE;
+  const pageRows = selectedRows.slice(
+    start,
+    start + CACHE_IMPACT_TABLE_PAGE_SIZE,
+  );
+  return {
+    rows: pageRows,
+    start,
+    end: start + pageRows.length,
+    total: selectedRows.length,
+    pageCount,
+  };
+}
 let localCompanionHealth = null;
 // This is an optional, short-lived rendering hint from the public health
 // endpoint. The Worker remains authoritative; a missing or stale health read
@@ -3958,17 +3993,80 @@ function selectedTimelinePoints(data) {
       && timelineSeriesMemo.rangeDays === activeCalibrationRangeDays) {
     return timelineSeriesMemo.selection;
   }
-  const livePoints = liveTimelinePoints(data);
-  const cutoff = timelineCutoffMs(data, activeCalibrationRangeDays);
-  const historicalPoints = groupRolling(
-    [...data.gradient.rollingHistory, ...data.gradient.rolling],
-    CALIBRATION_WINDOW_HOURS,
-  ).filter((row) => pointTimestampMs(row) >= cutoff);
-  const liveMatched = livePoints.filter(
-    (row) => row.observed !== null && row.expected !== null,
-  ).length;
-  const usingLive = liveMatched > 0 || historicalPoints.length === 0;
-  const selection = { points: usingLive ? livePoints : historicalPoints, usingLive };
+  const sideChatAdjusted = data.accounting?.sideChatEstimates?.status
+      === "available"
+    && data.accounting.sideChatEstimates.methodology
+      ?.includedInCalibrationTimeline === true
+    && Array.isArray(data.timeline.calibrationUsage)
+    && data.timeline.calibrationUsage.length > 0;
+  const exactByBucket = new Map(data.timeline.usage.map((row) => [
+    `${row.startAt}|${row.endAt}`,
+    row,
+  ]));
+  // Keep the comparison on identical timestamps. A side-chat-only bucket is
+  // represented by a zero-cost baseline row so a changed sampling grid cannot
+  // masquerade as a changed area under the residual curve.
+  const alignedExactUsage = sideChatAdjusted
+    ? data.timeline.calibrationUsage.map((row) => (
+      exactByBucket.get(`${row.startAt}|${row.endAt}`) ?? {
+        ...row,
+        usageEvents: 0,
+        totalTokens: 0,
+        apiPriceEquivalentUsd: 0,
+        allowanceWeighting: {
+          status: data.timeline.allowanceCapacity?.status === "available"
+            ? "complete"
+            : data.timeline.allowanceCapacity?.status === "range"
+              ? "range"
+              : "unavailable",
+          basisFamilyId: row.allowanceWeighting.basisFamilyId,
+          selectedScenario:
+            data.timeline.allowanceCapacity?.selectedScenario ?? null,
+          selectedUsd:
+            data.timeline.allowanceCapacity?.status === "available" ? 0 : null,
+          scenarios: Object.fromEntries(Object.entries(
+            row.allowanceWeighting.scenarios,
+          ).map(([scenario, value]) => [scenario, {
+            ...value,
+            sourceWeightingStatus: "complete",
+            quotaWeightedUsd: 0,
+            coveredSubtotalUsd: 0,
+            coverage: {
+              totalEvents: 0,
+              observedEvents: 0,
+              declaredFromConfigEvents: 0,
+              assumedFromPreferenceEvents: 0,
+              inferredEvents: 0,
+              unknownEvents: 0,
+              observedSharePercent: null,
+              unknownSharePercent: null,
+            },
+          }])),
+          rangeUsd: data.timeline.allowanceCapacity?.status === "range"
+            ? { lower: 0, upper: 0 }
+            : null,
+        },
+      }
+    ))
+    : [];
+  const exactLivePoints = sideChatAdjusted
+    ? liveTimelinePoints(data, { usage: alignedExactUsage })
+    : [];
+  const livePoints = liveTimelinePoints(data, {
+    usage: sideChatAdjusted
+      ? data.timeline.calibrationUsage
+      : data.timeline.usage,
+  });
+  // Retained gradient artifacts carry only Standard-rate rolling cost. They
+  // can remain historical evidence elsewhere, but may never replace the
+  // quota-weighted allowance comparison. An unavailable weighted live series
+  // therefore stays unavailable instead of silently drawing the old red line.
+  const selection = {
+    points: livePoints,
+    baselinePoints: exactLivePoints,
+    usingLive: true,
+    sideChatAdjusted,
+  };
   timelineSeriesMemo = {
     data,
     rangeDays: activeCalibrationRangeDays,
@@ -3978,9 +4076,18 @@ function selectedTimelinePoints(data) {
 }
 
 function renderTimeline(data) {
-  const { points, usingLive } = selectedTimelinePoints(data);
+  const {
+    points,
+    baselinePoints,
+    usingLive,
+    sideChatAdjusted,
+  } = selectedTimelinePoints(data);
   const viewport = normalizeTimelineViewport(points);
   const visiblePoints = timelinePointsInViewport(points, viewport);
+  const visibleBaselinePoints = timelinePointsInViewport(
+    baselinePoints,
+    viewport,
+  );
   const matchedVisible = visiblePoints.filter(
     (point) => point.observed !== null && point.expected !== null,
   );
@@ -3991,7 +4098,12 @@ function renderTimeline(data) {
     window: windowLabel,
   });
   $("#timeline-chart-copy").textContent = usingLive
-    ? t("dashboard.timeline.liveCopy", { timeZone: formatTimeZoneLabel() })
+    ? t(
+      sideChatAdjusted
+        ? "dashboard.timeline.liveCopySideChatAdjusted"
+        : "dashboard.timeline.liveCopy",
+      { timeZone: formatTimeZoneLabel() },
+    )
     : t("dashboard.timeline.historicalCopy", {
       generatedAt: formatLocal(data.artifactStatus.gradient.generatedAt),
       window: windowLabel,
@@ -4051,7 +4163,7 @@ function renderTimeline(data) {
     data,
     activeCalibrationRangeDays,
   );
-  renderTimelineSummary(data, visiblePoints);
+  renderTimelineSummary(data, visiblePoints, visibleBaselinePoints, usingLive);
   renderTimelineConfidence(points, visiblePoints, usingLive, viewport);
   renderResiduals(data, visiblePoints, viewport);
   // The divergence panel reads the whole selected calibration range, not the
@@ -4210,7 +4322,9 @@ function signedResidualAucPpHours(matched) {
   for (let index = 1; index < matched.length; index += 1) {
     const prior = matched[index - 1];
     const current = matched[index];
-    if (prior.residualSegment !== current.residualSegment) continue;
+    if (prior.residualSegment === null
+        || current.residualSegment === null
+        || prior.residualSegment !== current.residualSegment) continue;
     const elapsedHours =
       (pointTimestampMs(current) - pointTimestampMs(prior)) / 3_600_000;
     if (!Number.isFinite(elapsedHours) || elapsedHours <= 0) continue;
@@ -4240,12 +4354,17 @@ function formatSignedPp(value) {
   return `${number < 0 ? "" : "+"}${formatPp(number)}`;
 }
 
-function renderTimelineSummary(data, points) {
+function renderTimelineSummary(
+  data,
+  points,
+  baselinePoints = [],
+  usingLive = true,
+) {
   const summary = data.gradient.summary ?? {};
   const sensitivity = data.gradient.windowSensitivity.find((row) => finite(row.smoothing_hours ?? row.window_hours ?? row.hours) === CALIBRATION_WINDOW_HOURS);
   const activePoints = points.filter((row) => row.status !== "inactive");
   const matched = activePoints.filter((row) => row.observed !== null && row.expected !== null);
-  const live = points.some((row) => Object.hasOwn(row, "status"));
+  const live = usingLive;
   const liveMae = matched.length
     ? matched.reduce((sum, row) => sum + Math.abs(row.observed - row.expected), 0) / matched.length
     : null;
@@ -4258,6 +4377,20 @@ function renderTimelineSummary(data, points) {
   // summary in src/simple-quota-gradient.js. The historical view reports the
   // artifact's own whole-history figure instead of re-deriving one.
   const liveSignedAuc = signedResidualAucPpHours(matched);
+  const baselineMatched = baselinePoints.filter(
+    (row) => row.status !== "inactive"
+      && row.observed !== null
+      && row.expected !== null,
+  );
+  const baselineSignedAuc = signedResidualAucPpHours(baselineMatched);
+  const baselineByTimestamp = new Map(
+    baselineMatched.map((row) => [row.timestamp, row]),
+  );
+  const sideChatMatchedOverlap = matched.filter((row) => {
+    const baseline = baselineByTimestamp.get(row.timestamp);
+    return baseline !== undefined
+      && Math.abs(row.expected - baseline.expected) > 1e-12;
+  }).length;
   const values = [
     [
       "Matched windows",
@@ -4289,6 +4422,30 @@ function renderTimelineSummary(data, points) {
         : "—",
     ],
   ];
+  if (live && baselineMatched.length > 0) {
+    values.splice(4, 0,
+      [
+        t("dashboard.summary.sideChatBaseline"),
+        t("dashboard.summary.sideChatBaselineExplanation"),
+        formatSignedPpHours(baselineSignedAuc),
+      ],
+      [
+        t("dashboard.summary.sideChatAdjustment"),
+        t(
+          sideChatMatchedOverlap > 0
+            ? "dashboard.summary.sideChatAdjustmentExplanation"
+            : "dashboard.summary.sideChatAdjustmentNoOverlapExplanation",
+        ),
+        sideChatMatchedOverlap > 0
+          ? formatSignedPpHours(
+            liveSignedAuc === null || baselineSignedAuc === null
+              ? null
+              : liveSignedAuc - baselineSignedAuc,
+          )
+          : t("dashboard.summary.sideChatNoMatchedOverlap"),
+      ],
+    );
+  }
   const container = $("#timeline-summary");
   clear(container);
   for (const [label, explanation, value] of values) {
@@ -6538,9 +6695,108 @@ function accountingPeriod(data) {
     (period) => period?.periodId === activeAccountingPeriod,
   );
   if (!selected) return null;
+  // Accounting calls the archive-backed broad period `history`; the switch
+  // analyzer calls the same complete unified-index scan `all`.
+  const cacheSwitchPeriodId = selected.periodId === "history"
+    ? "all"
+    : selected.periodId;
+  const rootCacheSwitchImpact = data.accounting.cacheSwitchImpact;
+  const periodCacheSwitchImpact = Array.isArray(rootCacheSwitchImpact?.periods)
+    ? rootCacheSwitchImpact.periods.find(
+      (period) => period?.periodId === cacheSwitchPeriodId,
+    )
+    : null;
+  const selectedCacheSwitchImpact = selected.cacheSwitchImpact?.status === "available"
+    ? selected.cacheSwitchImpact
+    : periodCacheSwitchImpact?.status === "available"
+      ? periodCacheSwitchImpact
+      : rootCacheSwitchImpact?.status === "available"
+          && rootCacheSwitchImpact.periodId === cacheSwitchPeriodId
+        ? rootCacheSwitchImpact
+        : { status: "unavailable", recent: [], allowanceImpact: { status: "unavailable" } };
+  // The weekly allowance translation is attached only to the selected root
+  // summary unless the companion explicitly places one on this period. Never
+  // let a 7-day translation leak onto a 24-hour or history selection.
+  const allowanceImpact = ["complete", "range"].includes(
+    selectedCacheSwitchImpact.allowanceImpact?.status,
+  )
+    ? selectedCacheSwitchImpact.allowanceImpact
+    : rootCacheSwitchImpact?.periodId === cacheSwitchPeriodId
+      ? rootCacheSwitchImpact.allowanceImpact
+      : { status: "unavailable" };
+  const rootCacheContinuityImpact = data.accounting.cacheContinuityImpact;
+  const periodCacheContinuityImpact = Array.isArray(
+    rootCacheContinuityImpact?.periods,
+  )
+    ? rootCacheContinuityImpact.periods.find(
+      (period) => period?.periodId === cacheSwitchPeriodId,
+    )
+    : null;
+  const selectedCacheContinuityImpact = selected.cacheContinuityImpact?.status
+      === "available"
+    ? selected.cacheContinuityImpact
+    : periodCacheContinuityImpact?.status === "available"
+      ? periodCacheContinuityImpact
+      : rootCacheContinuityImpact?.status === "available"
+          && rootCacheContinuityImpact.periodId === cacheSwitchPeriodId
+        ? rootCacheContinuityImpact
+        : { status: "unavailable", recent: [], allowanceImpact: { status: "unavailable" } };
+  const continuityAllowanceImpact = selectedCacheContinuityImpact
+    .allowanceImpact?.status && ["complete", "range"].includes(
+      selectedCacheContinuityImpact.allowanceImpact.status,
+    )
+    ? selectedCacheContinuityImpact.allowanceImpact
+    : rootCacheContinuityImpact?.periodId === cacheSwitchPeriodId
+      ? rootCacheContinuityImpact.allowanceImpact
+      : { status: "unavailable" };
+  const rootSideChatEstimates = data.accounting.sideChatEstimates;
+  const sideChatPeriod = rootSideChatEstimates?.status === "available"
+    ? rootSideChatEstimates.periods.find(
+      (period) => period?.periodId === cacheSwitchPeriodId,
+    )
+    : null;
+  const sideChatStartMs = Date.parse(sideChatPeriod?.startAt ?? "");
+  const sideChatEndMs = Date.parse(sideChatPeriod?.endAt ?? "");
+  const sideChatNumericCoverageStartMs = Date.parse(
+    rootSideChatEstimates?.coverage?.logs2?.startAt ?? "",
+  );
+  const sideChatSelectionCoverage = sideChatPeriod !== null
+      && Number.isFinite(sideChatStartMs)
+      && Number.isFinite(sideChatNumericCoverageStartMs)
+      && sideChatNumericCoverageStartMs <= sideChatStartMs
+    ? "selected_period_within_numeric_retention"
+    : "retained_subset_of_selected_period";
+  const sideChatRecent = sideChatPeriod === null
+    ? []
+    : rootSideChatEstimates.recent.filter((row) => {
+      const observedMs = Date.parse(row.observedAt);
+      return Number.isFinite(observedMs)
+        && (!Number.isFinite(sideChatStartMs) || observedMs >= sideChatStartMs)
+        && (!Number.isFinite(sideChatEndMs) || observedMs <= sideChatEndMs);
+    });
   return {
     ...data.accounting,
     ...selected,
+    cacheSwitchImpact: {
+      ...selectedCacheSwitchImpact,
+      allowanceImpact,
+    },
+    cacheContinuityImpact: {
+      ...selectedCacheContinuityImpact,
+      allowanceImpact: continuityAllowanceImpact,
+    },
+    sideChatEstimates: sideChatPeriod === null
+      ? rootSideChatEstimates
+      : {
+        ...rootSideChatEstimates,
+        ...sideChatPeriod,
+        periods: rootSideChatEstimates.periods,
+        recent: sideChatRecent,
+        selectedAccountingPeriodId: selected.periodId,
+        selectionCoverage: sideChatSelectionCoverage,
+        retainedEvidenceStartAt:
+          rootSideChatEstimates?.coverage?.logs2?.startAt ?? null,
+      },
     replayExclusionDiagnostics: data.accounting.replayExclusionDiagnostics,
     accountingSource: data.accounting.accountingSource,
   };
@@ -6656,6 +6912,1083 @@ function renderAccountingComponentBars(containerSelector, rows, {
   }
 }
 
+function cacheSwitchMetricValue(impact) {
+  if (impact?.status !== "available") return "—";
+  const weighting = impact.allowanceWeighting;
+  if (weighting?.status === "complete") {
+    const premium = finite(weighting.selectedPremiumUsd, null);
+    return premium === null ? "—" : formatApiMoney(premium);
+  }
+  if (weighting?.status === "range") {
+    const lower = finite(weighting.rangePremiumUsd?.lower, null);
+    const upper = finite(weighting.rangePremiumUsd?.upper, null);
+    return lower === null || upper === null
+      ? "—"
+      : `${formatApiMoney(lower)}–${formatApiMoney(upper)}`;
+  }
+  return "—";
+}
+
+function formatCacheSwitchPercentagePoints(value) {
+  const number = finite(value, null);
+  if (number === null) return "—";
+  if (number > 0 && number < 0.01) return `<${formatDecimal(0.01, 2)}`;
+  return formatDecimal(number, 2);
+}
+
+function appendCacheSwitchMetricNote(container, impact) {
+  if (impact?.status !== "available") {
+    container.append(localizedNode(
+      "span",
+      "",
+      "accounting.cacheSwitch.noteUnavailable",
+    ));
+    return;
+  }
+  if (impact.coverageStatus !== "complete") {
+    const uncovered = finite(impact.uncoveredConfigurationChanges, 0);
+    const ordering = finite(impact.orderingCoverageGaps, 0);
+    container.append(localizedNode(
+      "span",
+      "",
+      ordering > 0
+        ? uncovered > 0
+          ? "accounting.cacheSwitch.noteIncompleteCombined"
+          : "accounting.cacheSwitch.noteIncompleteOrdering"
+        : "accounting.cacheSwitch.noteIncomplete",
+      {
+        uncovered: formatCount(uncovered),
+        ordering: formatCount(ordering),
+      },
+    ));
+    return;
+  }
+  const drops = finite(impact.cacheReadDrops, 0);
+  const proximate = finite(impact.proximateConfigurationChanges, 0);
+  if (drops === 0) {
+    container.append(localizedNode(
+      "span",
+      "",
+      "accounting.cacheSwitch.noteZero",
+      { proximate: formatCount(proximate) },
+    ));
+  } else {
+    container.append(localizedNode(
+      "span",
+      "",
+      "accounting.cacheSwitch.noteObserved",
+      {
+        drops: formatCount(drops),
+        proximate: formatCount(proximate),
+      },
+    ));
+    if (finite(impact.unpricedDrops, 0) > 0) {
+      container.append(
+        document.createTextNode(" "),
+        localizedNode(
+          "span",
+          "",
+          finite(impact.pricedDrops, 0) > 0
+            ? "accounting.cacheSwitch.notePartialPricing"
+            : "accounting.cacheSwitch.noteUnpriced",
+          {
+            priced: formatCount(impact.pricedDrops),
+            total: formatCount(drops),
+          },
+        ),
+      );
+    }
+  }
+  if (finite(impact.standardApiPremiumUsd, null) !== null) {
+    container.append(
+      document.createTextNode(" "),
+      localizedNode(
+        "span",
+        "",
+        "accounting.cacheSwitch.standardPremium",
+        { amount: formatApiMoney(impact.standardApiPremiumUsd) },
+      ),
+    );
+  }
+  const allowance = impact.allowanceImpact;
+  if (!["complete", "range"].includes(allowance?.status)) return;
+  const range = allowance.status === "range"
+    ? allowance.percentagePointRange
+    : allowance.plausibleRangePercentagePoints;
+  container.append(
+    document.createTextNode(" "),
+    localizedNode(
+      "span",
+      "",
+      range === null
+        ? "accounting.cacheSwitch.allowanceMedian"
+        : "accounting.cacheSwitch.allowanceRange",
+      range === null
+        ? { median: formatCacheSwitchPercentagePoints(allowance.medianPercentagePoints) }
+        : {
+          lower: formatCacheSwitchPercentagePoints(range.lower),
+          upper: formatCacheSwitchPercentagePoints(range.upper),
+        },
+    ),
+  );
+}
+
+function cacheSwitchChangeDescription(row) {
+  const previousModel = formatModelName(row?.previous?.model);
+  const currentModel = formatModelName(row?.current?.model);
+  const previousEffort = t(
+    `accounting.cacheSwitch.effort.${row?.previous?.reasoningEffort}`,
+  );
+  const currentEffort = t(
+    `accounting.cacheSwitch.effort.${row?.current?.reasoningEffort}`,
+  );
+  if (row?.changeType === "model_only") {
+    return t("accounting.cacheSwitch.change.model", {
+      previous: previousModel,
+      current: currentModel,
+    });
+  }
+  if (row?.changeType === "reasoning_only") {
+    return t("accounting.cacheSwitch.change.reasoning", {
+      previous: previousEffort,
+      current: currentEffort,
+    });
+  }
+  return t("accounting.cacheSwitch.change.both", {
+    previousModel,
+    currentModel,
+    previousEffort,
+    currentEffort,
+  });
+}
+
+function cacheImpactTableSignature(kind, impact, rows) {
+  const first = rows[0];
+  const last = rows.at(-1);
+  return [
+    kind,
+    impact?.periodId ?? "unavailable",
+    rows.length,
+    first?.observedAt ?? first?.model ?? first?.id ?? "",
+    last?.observedAt ?? last?.model ?? last?.id ?? "",
+  ].join(":");
+}
+
+function renderCacheImpactPagination(prefix, state, page) {
+  const pagination = $(`#${prefix}-pagination`);
+  if (!pagination) return;
+  pagination.hidden = page.total === 0;
+  if (page.total === 0) return;
+  setLocalizedText($(`#${prefix}-page-status`), "table.pagination.page", {
+    start: formatNumber(page.start + 1),
+    end: formatNumber(page.end),
+    total: formatNumber(page.total),
+  });
+  const previous = $(`#${prefix}-page-prev`);
+  const next = $(`#${prefix}-page-next`);
+  if (previous) previous.disabled = state.page === 0;
+  if (next) next.disabled = state.page >= page.pageCount - 1;
+}
+
+function renderAccountingCacheSwitchDetails(impact) {
+  const disclosure = $("#cache-switch-details");
+  const rows = $("#cache-switch-rows");
+  if (!disclosure || !rows) return;
+  clear(rows);
+  const available = impact?.status === "available";
+  disclosure.hidden = !available;
+  if (!available) {
+    disclosure.open = false;
+    renderCacheImpactPagination(
+      "cache-switch",
+      cacheSwitchTablePagination,
+      paginateCacheImpactRows(
+        [],
+        cacheSwitchTablePagination,
+        "switch:unavailable",
+      ),
+    );
+    return;
+  }
+  const recent = Array.isArray(impact.recent) ? impact.recent : [];
+  const page = paginateCacheImpactRows(
+    recent,
+    cacheSwitchTablePagination,
+    cacheImpactTableSignature("switch", impact, recent),
+  );
+  renderCacheImpactPagination("cache-switch", cacheSwitchTablePagination, page);
+  if (!recent.length) {
+    const row = node("tr");
+    const cell = localizedNode(
+      "td",
+      "empty-cell",
+      "accounting.cacheSwitch.detailsEmpty",
+    );
+    cell.colSpan = 5;
+    row.append(cell);
+    rows.append(row);
+    return;
+  }
+  for (const item of page.rows) {
+    const row = node("tr");
+    row.append(
+      rawNode("td", "", formatLocal(item.observedAt)),
+      rawNode("td", "cache-switch-change", cacheSwitchChangeDescription(item)),
+      rawNode(
+        "td",
+        "numeric-cell",
+        `${formatCount(item.previousCacheReadTokens)} → ${formatCount(item.currentCacheReadTokens)}`,
+      ),
+      rawNode("td", "numeric-cell", formatCount(item.lostCacheTokens)),
+      rawNode(
+        "td",
+        "model-api-equivalent",
+        item.estimatedPremiumUsd === null
+          ? "—"
+          : formatApiMoney(item.estimatedPremiumUsd),
+      ),
+    );
+    rows.append(row);
+  }
+}
+
+function appendCacheContinuityAllowance(container, impact) {
+  if (finite(impact?.standardApiPremiumUsd, null) !== null) {
+    container.append(
+      document.createTextNode(" "),
+      localizedNode(
+        "span",
+        "",
+        "accounting.cacheSwitch.standardPremium",
+        { amount: formatApiMoney(impact.standardApiPremiumUsd) },
+      ),
+    );
+  }
+  const allowance = impact?.allowanceImpact;
+  if (!["complete", "range"].includes(allowance?.status)) return;
+  const range = allowance.status === "range"
+    ? allowance.percentagePointRange
+    : allowance.plausibleRangePercentagePoints;
+  container.append(
+    document.createTextNode(" "),
+    localizedNode(
+      "span",
+      "",
+      range === null
+        ? "accounting.cacheSwitch.allowanceMedian"
+        : "accounting.cacheSwitch.allowanceRange",
+      range === null
+        ? { median: formatCacheSwitchPercentagePoints(allowance.medianPercentagePoints) }
+        : {
+          lower: formatCacheSwitchPercentagePoints(range.lower),
+          upper: formatCacheSwitchPercentagePoints(range.upper),
+        },
+    ),
+  );
+}
+
+function appendCacheContinuityMetricNote(container, impact) {
+  if (impact?.status !== "available") {
+    container.append(localizedNode(
+      "span",
+      "",
+      "accounting.cacheContinuity.noteUnavailable",
+    ));
+    return;
+  }
+  if (impact.coverageStatus !== "complete") {
+    const uncovered = finite(impact.uncoveredReturns, 0);
+    const ordering = finite(impact.orderingCoverageGaps, 0);
+    container.append(localizedNode(
+      "span",
+      "",
+      ordering > 0
+        ? uncovered > 0
+          ? "accounting.cacheContinuity.noteIncompleteCombined"
+          : "accounting.cacheContinuity.noteIncompleteOrdering"
+        : "accounting.cacheContinuity.noteIncomplete",
+      {
+        uncovered: formatCount(uncovered),
+        ordering: formatCount(ordering),
+      },
+    ));
+  } else if (finite(impact.cacheReadDrops, 0) === 0) {
+    container.append(localizedNode(
+      "span",
+      "",
+      "accounting.cacheContinuity.noteZero",
+      { comparable: formatCount(impact.comparableReturns) },
+    ));
+  } else {
+    container.append(localizedNode(
+      "span",
+      "",
+      "accounting.cacheContinuity.noteObserved",
+      {
+        drops: formatCount(impact.cacheReadDrops),
+        comparable: formatCount(impact.comparableReturns),
+      },
+    ));
+    if (finite(impact.unpricedDrops, 0) > 0) {
+      container.append(
+        document.createTextNode(" "),
+        localizedNode(
+          "span",
+          "",
+          "accounting.cacheContinuity.noteUnpriced",
+          {
+            priced: formatCount(impact.pricedDrops),
+            total: formatCount(impact.cacheReadDrops),
+          },
+        ),
+      );
+    }
+  }
+  if (finite(impact.postCompactionRequests, 0) > 0) {
+    container.append(
+      document.createTextNode(" "),
+      localizedNode(
+        "span",
+        "",
+        "accounting.cacheContinuity.noteCompaction",
+        {
+          requests: formatCount(impact.postCompactionRequests),
+          drops: formatCount(impact.postCompactionCacheReadDrops),
+        },
+      ),
+    );
+  }
+  if (impact.coverageStatus === "complete"
+      && finite(impact.unpricedDrops, 0) === 0) {
+    appendCacheContinuityAllowance(container, impact);
+  }
+}
+
+function formatCacheContinuityGap(seconds) {
+  const value = finite(seconds, 0);
+  if (value < 3_600) {
+    return t("accounting.cacheContinuity.gapMinutes", {
+      value: formatDecimal(value / 60, value % 60 === 0 ? 0 : 1),
+    });
+  }
+  if (value < 86_400) {
+    return t("accounting.cacheContinuity.gapHours", {
+      value: formatDecimal(value / 3_600, value % 3_600 === 0 ? 0 : 1),
+    });
+  }
+  return t("accounting.cacheContinuity.gapDays", {
+    value: formatDecimal(value / 86_400, value % 86_400 === 0 ? 0 : 1),
+  });
+}
+
+function cacheContinuityConfigurationDescription(row) {
+  return t("accounting.cacheContinuity.configuration", {
+    model: formatModelName(row?.configuration?.model),
+    effort: t(
+      `accounting.cacheSwitch.effort.${row?.configuration?.reasoningEffort}`,
+    ),
+  });
+}
+
+const CACHE_CONTINUITY_GAP_BAND_UI = Object.freeze([
+  Object.freeze({
+    id: "under_one_minute",
+    labelKey: "accounting.cacheContinuity.gapBand.underOneMinute",
+  }),
+  Object.freeze({
+    id: "one_to_five_minutes",
+    labelKey: "accounting.cacheContinuity.gapBand.oneToFiveMinutes",
+  }),
+  Object.freeze({
+    id: "five_to_thirty_minutes",
+    labelKey: "accounting.cacheContinuity.gapBand.fiveToThirtyMinutes",
+  }),
+  Object.freeze({
+    id: "thirty_minutes_to_one_hour",
+    labelKey: "accounting.cacheContinuity.gapBand.thirtyMinutesToOneHour",
+  }),
+  Object.freeze({
+    id: "one_to_six_hours",
+    labelKey: "accounting.cacheContinuity.gapBand.oneToSixHours",
+  }),
+  Object.freeze({
+    id: "six_to_twenty_four_hours",
+    labelKey: "accounting.cacheContinuity.gapBand.sixToTwentyFourHours",
+  }),
+  Object.freeze({
+    id: "over_twenty_four_hours",
+    labelKey: "accounting.cacheContinuity.gapBand.overTwentyFourHours",
+  }),
+]);
+
+function cacheContinuityGapBandSummaries(impact) {
+  if (impact?.status !== "available"
+      || (impact.coverageStatus !== "complete"
+        && impact.coverageStatus !== "incomplete")
+      || typeof impact.byGapBand !== "object"
+      || impact.byGapBand === null
+      || Array.isArray(impact.byGapBand)) return null;
+  const validCount = (value) => Number.isSafeInteger(value) && value >= 0;
+  const summaries = [];
+  for (const band of CACHE_CONTINUITY_GAP_BAND_UI) {
+    if (!Object.hasOwn(impact.byGapBand, band.id)) return null;
+    const summary = impact.byGapBand[band.id];
+    const premium = summary?.estimatedPremiumUsd;
+    if (typeof summary !== "object"
+        || summary === null
+        || Array.isArray(summary)
+        || !validCount(summary.cacheReadDrops)
+        || !validCount(summary.comparableReturns)
+        || !validCount(summary.lostCacheTokens)
+        || !validCount(summary.pricedDrops)
+        || !validCount(summary.unpricedDrops)
+        || summary.cacheReadDrops > summary.comparableReturns
+        || summary.pricedDrops + summary.unpricedDrops
+          !== summary.cacheReadDrops
+        || (summary.cacheReadDrops === 0 && summary.lostCacheTokens !== 0)
+        || (summary.cacheReadDrops > 0 && summary.lostCacheTokens === 0)
+        || (summary.coverageStatus !== "complete"
+          && summary.coverageStatus !== "incomplete")
+        || (premium !== null
+          && (typeof premium !== "number"
+            || !Number.isFinite(premium)
+            || premium < 0))
+        || (summary.cacheReadDrops === 0
+          && premium !== null
+          && premium !== 0)
+        || (premium === null
+          && summary.coverageStatus === "complete"
+          && summary.unpricedDrops === 0)
+        || (premium !== null
+          && (summary.coverageStatus !== "complete"
+            || summary.unpricedDrops > 0))) return null;
+    summaries.push({ ...band, summary });
+  }
+  return summaries;
+}
+
+function renderAccountingCacheContinuityGapRows(impact, rows) {
+  clear(rows);
+  const summaries = cacheContinuityGapBandSummaries(impact);
+  if (summaries === null) {
+    const page = paginateCacheImpactRows(
+      [],
+      cacheContinuityGapTablePagination,
+      cacheImpactTableSignature("continuity-gap-unavailable", impact, []),
+    );
+    renderCacheImpactPagination(
+      "cache-continuity-gap",
+      cacheContinuityGapTablePagination,
+      page,
+    );
+    const row = node("tr");
+    const cell = localizedNode(
+      "td",
+      "empty-cell",
+      "accounting.cacheContinuity.gapBreakdownUnavailable",
+    );
+    cell.colSpan = 4;
+    row.append(cell);
+    rows.append(row);
+    return;
+  }
+  const page = paginateCacheImpactRows(
+    summaries,
+    cacheContinuityGapTablePagination,
+    cacheImpactTableSignature("continuity-gap", impact, summaries),
+  );
+  renderCacheImpactPagination(
+    "cache-continuity-gap",
+    cacheContinuityGapTablePagination,
+    page,
+  );
+  for (const { labelKey, summary } of page.rows) {
+    const row = node("tr");
+    row.append(
+      localizedNode("td", "", labelKey),
+      rawNode(
+        "td",
+        "numeric-cell",
+        `${formatCount(summary.cacheReadDrops)} / ${formatCount(summary.comparableReturns)}`,
+      ),
+      rawNode("td", "numeric-cell", formatCount(summary.lostCacheTokens)),
+      impact.coverageStatus !== "complete"
+        || summary.estimatedPremiumUsd === null
+        ? localizedNode(
+          "td",
+          "cache-continuity-premium-unavailable",
+          "accounting.cacheContinuity.premiumUnavailable",
+        )
+        : rawNode(
+          "td",
+          "model-api-equivalent",
+          formatApiMoney(summary.estimatedPremiumUsd),
+        ),
+    );
+    rows.append(row);
+  }
+}
+
+function renderAccountingCacheContinuityDetails(impact) {
+  const disclosure = $("#cache-continuity-details");
+  const gapRows = $("#cache-continuity-gap-rows");
+  const rows = $("#cache-continuity-rows");
+  if (!disclosure || !gapRows || !rows) return;
+  clear(gapRows);
+  clear(rows);
+  const available = impact?.status === "available";
+  disclosure.hidden = !available;
+  if (!available) {
+    disclosure.open = false;
+    renderCacheImpactPagination(
+      "cache-continuity-gap",
+      cacheContinuityGapTablePagination,
+      paginateCacheImpactRows(
+        [],
+        cacheContinuityGapTablePagination,
+        "continuity-gap:unavailable",
+      ),
+    );
+    renderCacheImpactPagination(
+      "cache-continuity",
+      cacheContinuityTablePagination,
+      paginateCacheImpactRows(
+        [],
+        cacheContinuityTablePagination,
+        "continuity:unavailable",
+      ),
+    );
+    return;
+  }
+  renderAccountingCacheContinuityGapRows(impact, gapRows);
+  const recent = Array.isArray(impact.recent) ? impact.recent : [];
+  const page = paginateCacheImpactRows(
+    recent,
+    cacheContinuityTablePagination,
+    cacheImpactTableSignature("continuity", impact, recent),
+  );
+  renderCacheImpactPagination(
+    "cache-continuity",
+    cacheContinuityTablePagination,
+    page,
+  );
+  if (!recent.length) {
+    const row = node("tr");
+    const cell = localizedNode(
+      "td",
+      "empty-cell",
+      "accounting.cacheContinuity.detailsEmpty",
+    );
+    cell.colSpan = 6;
+    row.append(cell);
+    rows.append(row);
+    return;
+  }
+  for (const item of page.rows) {
+    const row = node("tr");
+    row.append(
+      rawNode("td", "", formatLocal(item.observedAt)),
+      rawNode("td", "numeric-cell", formatCacheContinuityGap(item.gapSeconds)),
+      rawNode(
+        "td",
+        "cache-switch-change",
+        cacheContinuityConfigurationDescription(item),
+      ),
+      rawNode(
+        "td",
+        "numeric-cell",
+        `${formatCount(item.previousCacheReadTokens)} → ${formatCount(item.currentCacheReadTokens)}`,
+      ),
+      rawNode("td", "numeric-cell", formatCount(item.lostCacheTokens)),
+      rawNode(
+        "td",
+        "model-api-equivalent",
+        item.estimatedPremiumUsd === null
+          ? "—"
+          : formatApiMoney(item.estimatedPremiumUsd),
+      ),
+    );
+    rows.append(row);
+  }
+}
+
+function sideChatConfigurationDescription(row) {
+  const configuration = t("accounting.sideChat.configuration", {
+    model: formatModelName(row?.model),
+    effort: t(
+      `accounting.cacheSwitch.effort.${row?.reasoningEffort}`,
+    ),
+  });
+  return row?.pricingBasis === "reviewed_alias_assumption"
+    ? t("accounting.sideChat.configurationAliasAssumption", { configuration })
+    : configuration;
+}
+
+function sideChatEstimateRange(row) {
+  if (row?.estimatedApiPriceEquivalentUsd === null) return "—";
+  const range = row?.estimatedRangeUsd;
+  return range === null
+    ? formatApiMoney(row.estimatedApiPriceEquivalentUsd)
+    : t("accounting.sideChat.estimateRange", {
+      point: formatApiMoney(row.estimatedApiPriceEquivalentUsd),
+      lower: formatApiMoney(range.lower),
+      upper: formatApiMoney(range.upper),
+    });
+}
+
+function sideChatCalibrationKey(status) {
+  return {
+    eligible_active_retention:
+      "accounting.sideChat.calibration.eligibleActiveRetention",
+    withheld_no_retained_calls:
+      "accounting.sideChat.calibration.withheldNoCalls",
+    withheld_unpriced_calls:
+      "accounting.sideChat.calibration.withheldUnpriced",
+    withheld_parser_gaps:
+      "accounting.sideChat.calibration.withheldParserGaps",
+    withheld_cohort_mismatch:
+      "accounting.sideChat.calibration.withheldCohortMismatch",
+    withheld_context_mismatch:
+      "accounting.sideChat.calibration.withheldContextMismatch",
+    withheld_stale_calibration:
+      "accounting.sideChat.calibration.withheldStaleCalibration",
+  }[status] ?? "accounting.sideChat.calibration.withheldUnavailable";
+}
+
+function appendSideChatMetricNote(container, estimate) {
+  if (estimate?.status !== "available") {
+    container.append(localizedNode(
+      "span",
+      "",
+      "accounting.sideChat.noteUnavailable",
+    ));
+    return;
+  }
+  if (estimate.selectionCoverage === "retained_subset_of_selected_period") {
+    container.append(localizedNode(
+      "span",
+      "",
+      "accounting.sideChat.noteRetainedSubset",
+      {
+        estimate: estimate.estimatedApiPriceEquivalentUsd === null
+          ? "—"
+          : formatApiMoney(estimate.estimatedApiPriceEquivalentUsd),
+        start: estimate.retainedEvidenceStartAt
+          ? formatLocal(estimate.retainedEvidenceStartAt, { dateOnly: true })
+          : t("format.unknown"),
+      },
+    ));
+    return;
+  }
+  container.append(localizedNode(
+    "span",
+    "",
+    "accounting.sideChat.noteObserved",
+    {
+      calls: formatCount(estimate.samplingCalls),
+      retained: formatCount(estimate.retainedSessions),
+      detected: formatCount(estimate.detectedSessions),
+    },
+  ));
+  if (estimate.estimatedRangeUsd !== null) {
+    container.append(
+      document.createTextNode(" "),
+      localizedNode(
+        "span",
+        "",
+        "accounting.sideChat.noteRange",
+        {
+          lower: formatApiMoney(estimate.estimatedRangeUsd.lower),
+          upper: formatApiMoney(estimate.estimatedRangeUsd.upper),
+        },
+      ),
+    );
+  }
+  if (estimate.methodology?.calibrationStatus
+      !== "eligible_active_retention") {
+    container.append(
+      document.createTextNode(" "),
+      localizedNode(
+        "span",
+        "",
+        sideChatCalibrationKey(estimate.methodology?.calibrationStatus),
+      ),
+    );
+  }
+}
+
+function formatHistoricalGapPercentagePointRange(range) {
+  const lower = finite(range?.lower, null);
+  const upper = finite(range?.upper, null);
+  if (lower === null || upper === null) return "—";
+  return closeEnough(lower, upper)
+    ? t("accounting.sideChat.historicalGap.percentagePoints", {
+      value: formatDecimal(lower, 2),
+    })
+    : t("accounting.sideChat.historicalGap.percentagePointRange", {
+      lower: formatDecimal(lower, 2),
+      upper: formatDecimal(upper, 2),
+    });
+}
+
+function formatHistoricalGapWeightedUsage(weighting) {
+  if (weighting?.status === "complete") {
+    return formatApiMoney(weighting.selectedUsd);
+  }
+  if (weighting?.status === "range") {
+    return t("accounting.sideChat.historicalGap.moneyRange", {
+      lower: formatApiMoney(weighting.rangeUsd?.lower),
+      upper: formatApiMoney(weighting.rangeUsd?.upper),
+    });
+  }
+  return "—";
+}
+
+function formatHistoricalGapExpected(comparison) {
+  if (comparison?.status === "complete") {
+    return formatHistoricalGapPercentagePointRange({
+      lower: comparison.selectedExpectedPercentagePoints,
+      upper: comparison.selectedExpectedPercentagePoints,
+    });
+  }
+  if (comparison?.status === "range") {
+    return formatHistoricalGapPercentagePointRange(
+      comparison.expectedRangePercentagePoints,
+    );
+  }
+  return "—";
+}
+
+function formatHistoricalGapBackcast(estimate) {
+  if (estimate?.allowanceComparison?.status === "complete") {
+    return t("accounting.sideChat.historicalGap.backcastValue", {
+      standard: formatApiMoney(
+        estimate.impliedMissingStandardApiEquivalentUsd,
+      ),
+      weighted: formatApiMoney(
+        estimate.impliedMissingQuotaWeightedApiEquivalentUsd,
+      ),
+    });
+  }
+  return t("accounting.sideChat.historicalGap.backcastRange", {
+    standard: t("accounting.sideChat.historicalGap.moneyRange", {
+      lower: formatApiMoney(estimate?.sensitivityRangeUsd?.lower),
+      upper: formatApiMoney(estimate?.sensitivityRangeUsd?.upper),
+    }),
+    weighted: t("accounting.sideChat.historicalGap.moneyRange", {
+      lower: formatApiMoney(
+        estimate?.quotaWeightedSensitivityRangeUsd?.lower,
+      ),
+      upper: formatApiMoney(
+        estimate?.quotaWeightedSensitivityRangeUsd?.upper,
+      ),
+    }),
+  });
+}
+
+function closeEnough(left, right) {
+  return Number.isFinite(left) && Number.isFinite(right)
+    && Math.abs(left - right) < 1e-9;
+}
+
+function historicalGapPeakThreeHourPoint(probe) {
+  if (!dashboard || probe?.status !== "available") return null;
+  const startMs = Date.parse(probe.startAt);
+  const endMs = Date.parse(probe.endAt);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return null;
+  return liveTimelinePoints(dashboard, {
+    windowHours: CALIBRATION_WINDOW_HOURS,
+    rangeDays: ALL_HISTORY_RANGE_DAYS,
+  }).filter((point) => (
+    point.timestampMs >= startMs
+      && point.timestampMs <= endMs
+      && point.observed !== null
+      && point.expected !== null
+      && point.residual !== null
+  )).sort((left, right) => right.residual - left.residual)[0] ?? null;
+}
+
+function appendHistoricalGapMetric(container, labelKey, value) {
+  const item = node("div");
+  item.append(
+    localizedNode("span", "", labelKey),
+    rawNode("strong", "", value),
+  );
+  container.append(item);
+}
+
+function renderSideChatHistoricalGapProbe(probe) {
+  const section = $("#side-chat-historical-gap");
+  const summary = $("#side-chat-historical-gap-summary");
+  const explanation = $("#side-chat-historical-gap-explanation");
+  const note = $("#side-chat-historical-gap-note");
+  const focus = $("#side-chat-historical-gap-focus");
+  if (!section || !summary || !explanation || !note || !focus) return;
+  clear(summary);
+  const available = probe?.status === "available";
+  section.hidden = !available;
+  focus.disabled = !available;
+  if (!available) {
+    explanation.textContent = "";
+    note.textContent = "";
+    return;
+  }
+  const exact = probe.exactUsage;
+  const quota = probe.quota;
+  const estimate = probe.estimate;
+  const calibration = probe.calibration;
+  const date = formatLocal(probe.startAt, { dateOnly: true });
+  explanation.textContent = t(
+    "accounting.sideChat.historicalGap.explanation",
+    {
+      date,
+      events: formatCount(exact.events),
+      sessions: formatCount(exact.sessions),
+      model: formatModelName(estimate.assumedMissingModel),
+      multiplier: formatDecimal(estimate.fastQuotaMultiplier, 1),
+    },
+  );
+  appendHistoricalGapMetric(
+    summary,
+    "accounting.sideChat.historicalGap.metric.quota",
+    formatHistoricalGapPercentagePointRange({
+      lower: quota.minimumMovementPercentagePoints,
+      upper: quota.maximumMovementPercentagePoints,
+    }),
+  );
+  appendHistoricalGapMetric(
+    summary,
+    "accounting.sideChat.historicalGap.metric.exact",
+    t("accounting.sideChat.historicalGap.exactValue", {
+      cost: formatApiMoney(exact.standardApiPriceEquivalentUsd),
+      events: formatCount(exact.events),
+    }),
+  );
+  appendHistoricalGapMetric(
+    summary,
+    "accounting.sideChat.historicalGap.metric.weighted",
+    formatHistoricalGapWeightedUsage(exact.allowanceWeighting),
+  );
+  appendHistoricalGapMetric(
+    summary,
+    "accounting.sideChat.historicalGap.metric.expected",
+    formatHistoricalGapExpected(estimate.allowanceComparison),
+  );
+  appendHistoricalGapMetric(
+    summary,
+    "accounting.sideChat.historicalGap.metric.unexplained",
+    formatHistoricalGapPercentagePointRange(
+      estimate.unexplainedMedianRangePercentagePoints,
+    ),
+  );
+  appendHistoricalGapMetric(
+    summary,
+    "accounting.sideChat.historicalGap.metric.backcast",
+    formatHistoricalGapBackcast(estimate),
+  );
+  const peak = historicalGapPeakThreeHourPoint(probe);
+  if (peak !== null) {
+    appendHistoricalGapMetric(
+      summary,
+      "accounting.sideChat.historicalGap.metric.peak",
+      t("accounting.sideChat.historicalGap.peakValue", {
+        residual: formatDecimal(peak.residual, 2),
+        observed: formatDecimal(peak.observed, 2),
+        expected: formatDecimal(peak.expected, 2),
+      }),
+    );
+  }
+  note.textContent = t("accounting.sideChat.historicalGap.note", {
+    fast: formatCount(exact.bySpeed.fast.events),
+    standard: formatCount(exact.bySpeed.standard.events),
+    unknown: formatCount(exact.bySpeed.unknown.events),
+    standardSensitivity: t("accounting.sideChat.historicalGap.moneyRange", {
+      lower: formatApiMoney(estimate.sensitivityRangeUsd.lower),
+      upper: formatApiMoney(estimate.sensitivityRangeUsd.upper),
+    }),
+    weightedSensitivity: t("accounting.sideChat.historicalGap.moneyRange", {
+      lower: formatApiMoney(
+        estimate.quotaWeightedSensitivityRangeUsd.lower,
+      ),
+      upper: formatApiMoney(
+        estimate.quotaWeightedSensitivityRangeUsd.upper,
+      ),
+    }),
+    resets: formatCount(
+      calibration.scenarios.unresolved_as_standard.qualifyingResets,
+    ),
+    capacity: t("accounting.sideChat.historicalGap.moneyRange", {
+      lower: formatApiMoney(Math.min(
+        calibration.scenarios.unresolved_as_standard
+          .medianWeeklyCapacityUsd,
+        calibration.scenarios.unresolved_as_fast.medianWeeklyCapacityUsd,
+      )),
+      upper: formatApiMoney(Math.max(
+        calibration.scenarios.unresolved_as_standard
+          .medianWeeklyCapacityUsd,
+        calibration.scenarios.unresolved_as_fast.medianWeeklyCapacityUsd,
+      )),
+    }),
+  });
+}
+
+function renderAccountingSideChatDetails(estimate) {
+  const disclosure = $("#side-chat-details");
+  const rows = $("#side-chat-rows");
+  const summary = $("#side-chat-evidence-summary");
+  const coverage = $("#side-chat-coverage-note");
+  if (!disclosure || !rows || !summary || !coverage) return;
+  renderSideChatHistoricalGapProbe(estimate?.historicalGapProbe);
+  clear(rows);
+  clear(summary);
+  const available = estimate?.status === "available";
+  const historicalGapAvailable = estimate?.historicalGapProbe?.status
+    === "available";
+  disclosure.hidden = !available && !historicalGapAvailable;
+  if (!available) {
+    disclosure.open = false;
+    coverage.textContent = "";
+    renderCacheImpactPagination(
+      "side-chat",
+      sideChatTablePagination,
+      paginateCacheImpactRows([], sideChatTablePagination, "side-chat:unavailable"),
+    );
+    return;
+  }
+  for (const [labelKey, value] of [
+    ["accounting.sideChat.summary.detected", formatCount(estimate.detectedSessions)],
+    ["accounting.sideChat.summary.visibleTurns", formatCount(estimate.visibleTurns)],
+    ["accounting.sideChat.summary.samplingCalls", formatCount(estimate.samplingCalls)],
+    ["accounting.sideChat.summary.activeContext", compact(estimate.activeContextTokens)],
+  ]) {
+    const item = node("div");
+    item.append(
+      localizedNode("span", "", labelKey),
+      rawNode("strong", "", value),
+    );
+    summary.append(item);
+  }
+  const globalCoverage = estimate.coverage;
+  const coverageParts = [t(
+    globalCoverage?.status === "partial_diagnostic_retention"
+      ? "accounting.sideChat.coveragePartial"
+      : "accounting.sideChat.coverageComplete",
+    {
+      retained: formatCount(globalCoverage?.retainedNumericSessions ?? 0),
+      detected: formatCount(globalCoverage?.detectedSessions ?? 0),
+      missing: formatCount(globalCoverage?.sessionsWithoutNumericEvidence ?? 0),
+    },
+  )];
+  if ((globalCoverage?.sessionsAtRetentionLimit ?? 0) > 0) {
+    coverageParts.push(tPlural(
+      "accounting.sideChat.coverageRetentionLimit",
+      globalCoverage.sessionsAtRetentionLimit,
+      {
+        count: formatCount(globalCoverage.sessionsAtRetentionLimit),
+      },
+    ));
+  }
+  if ((globalCoverage?.duplicateSamplingMarkers ?? 0) > 0) {
+    coverageParts.push(tPlural(
+      "accounting.sideChat.coverageDuplicates",
+      globalCoverage.duplicateSamplingMarkers,
+      {
+        count: formatCount(globalCoverage.duplicateSamplingMarkers),
+      },
+    ));
+  }
+  coverageParts.push(t("accounting.sideChat.coverageActiveRetention"));
+  coverageParts.push(t("accounting.sideChat.coverageKnownFormats"));
+  if ((globalCoverage?.rejectedSamplingMarkers ?? 0) > 0
+      || (globalCoverage?.rejectedCompactionMarkers ?? 0) > 0
+      || (globalCoverage?.ambiguousDuplicateMarkers ?? 0) > 0
+      || (globalCoverage?.desktop?.oversizedLinesSkipped ?? 0) > 0) {
+    coverageParts.push(t("accounting.sideChat.coverageParserGaps", {
+      sampling: formatCount(globalCoverage?.rejectedSamplingMarkers ?? 0),
+      compactions: formatCount(
+        globalCoverage?.rejectedCompactionMarkers ?? 0,
+      ),
+      duplicates: formatCount(
+        globalCoverage?.ambiguousDuplicateMarkers ?? 0,
+      ),
+      lines: formatCount(
+        globalCoverage?.desktop?.oversizedLinesSkipped ?? 0,
+      ),
+    }));
+  }
+  coverageParts.push(t("accounting.sideChat.pricingCoverage", {
+    priced: formatCount(estimate.pricedCalls ?? 0),
+    calls: formatCount(estimate.samplingCalls ?? 0),
+    unpriced: formatCount(estimate.unpricedCalls ?? 0),
+  }));
+  const omittedDetails = Math.max(
+    0,
+    (estimate.samplingCalls ?? 0) - (estimate.recent?.length ?? 0),
+  );
+  if (omittedDetails > 0) {
+    coverageParts.push(tPlural(
+      "accounting.sideChat.detailsTruncated",
+      omittedDetails,
+      {
+        count: formatCount(omittedDetails),
+        limit: formatCount(estimate.recentDetailLimit ?? 500),
+      },
+    ));
+  }
+  coverageParts.push(t(sideChatCalibrationKey(
+    estimate.methodology?.calibrationStatus,
+  )));
+  coverage.textContent = coverageParts.join(" ");
+  const recent = Array.isArray(estimate.recent) ? estimate.recent : [];
+  const page = paginateCacheImpactRows(
+    recent,
+    sideChatTablePagination,
+    cacheImpactTableSignature("side-chat", estimate, recent),
+  );
+  renderCacheImpactPagination("side-chat", sideChatTablePagination, page);
+  if (!recent.length) {
+    const row = node("tr");
+    const cell = localizedNode(
+      "td",
+      "empty-cell",
+      "accounting.sideChat.detailsEmpty",
+    );
+    cell.colSpan = 6;
+    row.append(cell);
+    rows.append(row);
+    return;
+  }
+  for (const item of page.rows) {
+    const row = node("tr");
+    row.append(
+      rawNode("td", "", formatLocal(item.observedAt)),
+      localizedNode(
+        "td",
+        "numeric-cell",
+        "accounting.sideChat.turnOrdinal",
+        { ordinal: formatCount(item.turnOrdinal) },
+      ),
+      rawNode(
+        "td",
+        "cache-switch-change",
+        sideChatConfigurationDescription(item),
+      ),
+      rawNode("td", "numeric-cell", formatCount(item.activeContextTokens)),
+      localizedNode(
+        "td",
+        "",
+        item.cacheAssumption === "cold_after_compaction"
+          ? "accounting.sideChat.cache.coldAfterCompaction"
+          : item.cacheAssumption === "retention_unknown"
+            ? "accounting.sideChat.cache.retentionUnknown"
+            : "accounting.sideChat.cache.warmPrefix",
+      ),
+      rawNode("td", "model-api-equivalent", sideChatEstimateRange(item)),
+    );
+    rows.append(row);
+  }
+}
+
 function renderAccounting(data) {
   syncAccountingPeriodControls(data);
   const accounting = accountingPeriod(data);
@@ -6664,6 +7997,9 @@ function renderAccounting(data) {
     clear($("#accounting-component-counts"));
     clear($("#accounting-component-costs"));
     clear($("#accounting-models"));
+    renderAccountingCacheSwitchDetails(null);
+    renderAccountingCacheContinuityDetails(null);
+    renderAccountingSideChatDetails(null);
     return;
   }
   const summary = $("#accounting-summary");
@@ -6701,6 +8037,73 @@ function renderAccounting(data) {
     );
     summary.append(card);
   }
+  const cacheSwitchImpact = accounting.cacheSwitchImpact;
+  const cacheSwitchCard = node("article", "metric-card compact-metric");
+  const cacheSwitchLabel = node("span", "metric-name");
+  cacheSwitchLabel.append(informationLabel(
+    t("accounting.cacheSwitch.metricLabel"),
+    t("accounting.cacheSwitch.metricExplanation"),
+  ));
+  const cacheSwitchNote = node("p");
+  appendCacheSwitchMetricNote(cacheSwitchNote, cacheSwitchImpact);
+  cacheSwitchCard.append(
+    cacheSwitchLabel,
+    rawNode("strong", "metric-value", cacheSwitchMetricValue(cacheSwitchImpact)),
+    cacheSwitchNote,
+  );
+  summary.append(cacheSwitchCard);
+
+  const cacheContinuityImpact = accounting.cacheContinuityImpact;
+  const cacheContinuityCard = node("article", "metric-card compact-metric");
+  const cacheContinuityLabel = node("span", "metric-name");
+  cacheContinuityLabel.append(informationLabel(
+    t("accounting.cacheContinuity.metricLabel"),
+    t("accounting.cacheContinuity.metricExplanation"),
+  ));
+  const cacheContinuityNote = node("p");
+  appendCacheContinuityMetricNote(
+    cacheContinuityNote,
+    cacheContinuityImpact,
+  );
+  cacheContinuityCard.append(
+    cacheContinuityLabel,
+    rawNode(
+      "strong",
+      "metric-value",
+      cacheSwitchMetricValue(cacheContinuityImpact),
+    ),
+    cacheContinuityNote,
+  );
+  summary.append(cacheContinuityCard);
+
+  const sideChatEstimates = accounting.sideChatEstimates;
+  if (sideChatEstimates?.status === "available") {
+    const sideChatCard = node("article", "metric-card compact-metric");
+    const sideChatLabel = node("span", "metric-name");
+    sideChatLabel.append(informationLabel(
+      t("accounting.sideChat.metricLabel"),
+      t("accounting.sideChat.metricExplanation"),
+    ));
+    const sideChatNote = node("p");
+    appendSideChatMetricNote(sideChatNote, sideChatEstimates);
+    sideChatCard.append(
+      sideChatLabel,
+      rawNode(
+        "strong",
+        "metric-value",
+        sideChatEstimates.selectionCoverage
+            === "retained_subset_of_selected_period"
+          ? "—"
+          : sideChatEstimates.estimatedApiPriceEquivalentUsd === null
+          ? "—"
+          : formatApiMoney(
+            sideChatEstimates.estimatedApiPriceEquivalentUsd,
+          ),
+      ),
+      sideChatNote,
+    );
+    summary.append(sideChatCard);
+  }
 
   const componentCountRows = Object.entries(accounting.components ?? {})
     .filter(([, tokens]) => tokens > 0)
@@ -6730,6 +8133,9 @@ function renderAccounting(data) {
   });
 
   renderAccountingModels(accounting);
+  renderAccountingCacheSwitchDetails(cacheSwitchImpact);
+  renderAccountingCacheContinuityDetails(cacheContinuityImpact);
+  renderAccountingSideChatDetails(sideChatEstimates);
 }
 
 /**
@@ -6840,6 +8246,16 @@ function renderAccountingModels(accounting) {
     coverage.hidden = note === null;
   }
   const modelRows = modelUsageRows(accounting);
+  const page = paginateCacheImpactRows(
+    modelRows,
+    accountingModelsTablePagination,
+    cacheImpactTableSignature("models", accounting, modelRows),
+  );
+  renderCacheImpactPagination(
+    "accounting-model",
+    accountingModelsTablePagination,
+    page,
+  );
   if (!modelRows.length) {
     const row = node("tr");
     const cell = localizedNode("td", "empty-cell", "accounting.model.noneInPeriod");
@@ -6848,7 +8264,7 @@ function renderAccountingModels(accounting) {
     models.append(row);
     return;
   }
-  for (const model of modelRows) {
+  for (const model of page.rows) {
     const row = node("tr");
     const identity = node("td", "model-identity");
     // "Unrecognized model" now means exactly one thing: an identifier this
@@ -10179,6 +11595,100 @@ $("#weekly-table-prev").addEventListener("click", () => {
 $("#weekly-table-next").addEventListener("click", () => {
   weeklyTablePage += 1;
   renderWeeklyTablePage();
+});
+$("#accounting-model-page-prev").addEventListener("click", () => {
+  accountingModelsTablePagination.page -= 1;
+  renderAccountingModels(
+    dashboard === null ? null : accountingPeriod(dashboard),
+  );
+});
+$("#accounting-model-page-next").addEventListener("click", () => {
+  accountingModelsTablePagination.page += 1;
+  renderAccountingModels(
+    dashboard === null ? null : accountingPeriod(dashboard),
+  );
+});
+$("#cache-switch-page-prev").addEventListener("click", () => {
+  cacheSwitchTablePagination.page -= 1;
+  renderAccountingCacheSwitchDetails(
+    dashboard === null ? null : accountingPeriod(dashboard)?.cacheSwitchImpact,
+  );
+});
+$("#cache-switch-page-next").addEventListener("click", () => {
+  cacheSwitchTablePagination.page += 1;
+  renderAccountingCacheSwitchDetails(
+    dashboard === null ? null : accountingPeriod(dashboard)?.cacheSwitchImpact,
+  );
+});
+$("#cache-continuity-gap-page-prev").addEventListener("click", () => {
+  cacheContinuityGapTablePagination.page -= 1;
+  renderAccountingCacheContinuityDetails(
+    dashboard === null
+      ? null
+      : accountingPeriod(dashboard)?.cacheContinuityImpact,
+  );
+});
+$("#cache-continuity-gap-page-next").addEventListener("click", () => {
+  cacheContinuityGapTablePagination.page += 1;
+  renderAccountingCacheContinuityDetails(
+    dashboard === null
+      ? null
+      : accountingPeriod(dashboard)?.cacheContinuityImpact,
+  );
+});
+$("#cache-continuity-page-prev").addEventListener("click", () => {
+  cacheContinuityTablePagination.page -= 1;
+  renderAccountingCacheContinuityDetails(
+    dashboard === null
+      ? null
+      : accountingPeriod(dashboard)?.cacheContinuityImpact,
+  );
+});
+$("#cache-continuity-page-next").addEventListener("click", () => {
+  cacheContinuityTablePagination.page += 1;
+  renderAccountingCacheContinuityDetails(
+    dashboard === null
+      ? null
+      : accountingPeriod(dashboard)?.cacheContinuityImpact,
+  );
+});
+$("#side-chat-page-prev").addEventListener("click", () => {
+  sideChatTablePagination.page -= 1;
+  renderAccountingSideChatDetails(
+    dashboard === null
+      ? null
+      : accountingPeriod(dashboard)?.sideChatEstimates,
+  );
+});
+$("#side-chat-page-next").addEventListener("click", () => {
+  sideChatTablePagination.page += 1;
+  renderAccountingSideChatDetails(
+    dashboard === null
+      ? null
+      : accountingPeriod(dashboard)?.sideChatEstimates,
+  );
+});
+$("#side-chat-historical-gap-focus").addEventListener("click", () => {
+  if (!dashboard) return;
+  const probe = accountingPeriod(dashboard)?.sideChatEstimates
+    ?.historicalGapProbe;
+  const startMs = Date.parse(probe?.startAt ?? "");
+  const endMs = Date.parse(probe?.endAt ?? "");
+  if (probe?.status !== "available"
+      || !Number.isFinite(startMs) || !Number.isFinite(endMs)
+      || endMs <= startMs) return;
+  activeCalibrationRangeDays = ALL_HISTORY_RANGE_DAYS;
+  for (const control of $("#calibration-range-controls").querySelectorAll(
+    "button",
+  )) {
+    const active = Number(control.dataset.days) === ALL_HISTORY_RANGE_DAYS;
+    control.classList.toggle("active", active);
+    control.setAttribute("aria-pressed", String(active));
+  }
+  timelineViewport = { startMs, endMs };
+  timelineSeriesMemo = null;
+  window.location.hash = "#timeline";
+  renderTimeline(dashboard);
 });
 $("#usage-group-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-group]");

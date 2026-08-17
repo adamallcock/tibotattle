@@ -4838,6 +4838,16 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   // chart navigation stays reachable without needing its own exception rule.
   assert.match(styles, /\.topbar \.button\.compact \{ display: none; \}/);
   assert.doesNotMatch(styles, /^\s*\.button\.compact \{ display: none; \}/mu);
+  assert.match(
+    styles,
+    /\.topbar \.history-index-badge \{ display: none; \}/u,
+    "the later evidence-card rule cannot re-show the toolbar badge",
+  );
+  assert.match(
+    styles,
+    /body:not\(\.community-site\) > \.topbar \.brand > span \{ display: none; \}/u,
+    "the local toolbar sheds its wordmark before it can overlap controls",
+  );
   assert.match(styles, /grid-template-columns: repeat\(5, minmax\(0, 1fr\)\)/);
   assert.match(styles, /min-height: 48px/);
   assert.match(styles, /\.primary-nav \{[\s\S]*overflow-x: auto;/);
@@ -7130,6 +7140,22 @@ test("a language change re-translates every localized node from the registry", a
 
 test("the model table separates allowance tracks and never conflates zero with unpriced", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  assert.match(html, /id="accounting-model-pagination"/u);
+  assert.match(html, /id="accounting-model-page-prev"/u);
+  assert.match(html, /id="accounting-model-page-status"/u);
+  assert.match(html, /id="accounting-model-page-next"/u);
+  assert.match(
+    appSource,
+    /paginateCacheImpactRows\(\s*modelRows,\s*accountingModelsTablePagination,/u,
+  );
+  assert.doesNotMatch(
+    styles,
+    /\.model-identity\s*\{[^}]*display:\s*block/u,
+    "the identity td must participate in the native table-column layout",
+  );
+  assert.match(styles, /\.model-identity\s*\{\s*display:\s*table-cell;\s*\}/u);
   const start = appSource.indexOf("function modelUsageRows(accounting) {");
   const end = appSource.indexOf("function renderAccountingModels(", start);
   assert.ok(start >= 0 && end > start, "the model-table helpers are available");
@@ -8360,9 +8386,8 @@ test("cumulative drift sums non-overlapping buckets and re-anchors at each reset
   const firstReset = "2026-08-10T00:00:00.000Z";
   const secondReset = "2026-08-17T00:00:00.000Z";
   const data = {
-    weekly: { summary: { median_weekly_value_usd: 1_000 } },
-    gradient: { summary: {} },
     timeline: {
+      allowanceCapacity: testAllowanceCapacity(),
       usage: Array.from({ length: 9 }, (_, index) => ({
         startAt: hour(index),
         endAt: hour(index + 1),

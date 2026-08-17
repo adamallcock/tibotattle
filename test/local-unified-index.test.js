@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { readCacheImpacts } from "../src/cache-switch-impact.js";
+
 import {
   balanceComponents,
   lineageComponents,
@@ -12,6 +14,7 @@ import {
 } from "../src/local-unified-index-build.js";
 import {
   extractRolloutUsage,
+  parseCompactionPrefix,
   salvagePartialTokenCount,
 } from "../src/local-unified-index-extract.js";
 import {
@@ -108,6 +111,21 @@ function tokenCountTotalOnly(timestamp, total) {
   });
 }
 
+function compacted(timestamp, paddingBytes = 0) {
+  return JSON.stringify({
+    timestamp,
+    type: "compacted",
+    payload: {
+      message: "SECRET COMPACTION SUMMARY DO NOT INDEX",
+      replacement_history: [{
+        role: "user",
+        content: "SECRET REPLACEMENT HISTORY DO NOT INDEX",
+      }],
+      padding: "p".repeat(paddingBytes),
+    },
+  });
+}
+
 function usage(input, output = 0, cached = 0, write = 0, reasoning = 0) {
   return {
     input_tokens: input,
@@ -163,6 +181,67 @@ test("a model declaration separates recognized, unrecognized and never-observed"
     modelId: "unknown",
     recognition: "missing",
   });
+});
+
+test("sparse turn configuration means unchanged rather than missing", async () => {
+  const sparseTurnContext = JSON.stringify({
+    timestamp: "2026-07-25T00:00:02.000Z",
+    type: "turn_context",
+    payload: {
+      turn_id: "turn-2",
+      cwd: "/Users/nobody/project",
+      // Model and effort are intentionally absent: this is a state delta, not
+      // evidence that either applied value became unknown.
+    },
+  });
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-sparse.jsonl": [
+      sessionMeta("session-sparse"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol", "high"),
+      tokenCount(
+        "2026-07-25T00:00:01.000Z",
+        usage(100, 0, 80),
+        usage(100, 0, 80),
+      ),
+      sparseTurnContext,
+      tokenCount(
+        "2026-07-25T00:00:03.000Z",
+        usage(300, 0, 150),
+        usage(200, 0, 70),
+      ),
+    ],
+  });
+  try {
+    await build(root);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), {
+      readOnly: true,
+    });
+    try {
+      const rows = database.prepare(`
+        SELECT m.model_id AS model, m.recognition AS recognition,
+               u.reasoning_effort AS effort
+        FROM usage_event u
+        JOIN model m ON m.id = u.model_id
+        ORDER BY u.observed_at_ms`).all();
+      assert.equal(rows.length, 2);
+      assert.deepEqual(rows.map((row) => row.model), [
+        "gpt-5.6-sol",
+        "gpt-5.6-sol",
+      ]);
+      assert.deepEqual(rows.map((row) => row.recognition), [
+        "recognized",
+        "recognized",
+      ]);
+      assert.deepEqual(rows.map((row) => row.effort), [
+        reasoningEffortOrdinal("high"),
+        reasoningEffortOrdinal("high"),
+      ]);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
 });
 
 test("session_local is a stable irreversible digest and is domain separated from scope_local", () => {
@@ -398,6 +477,7 @@ test("replay after the fork's own first turn_context is still suppressed", async
       sessionMeta("session-parent"),
       turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-terra"),
       tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      compacted("2026-07-25T00:00:01.500Z"),
       tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20)),
     ],
     "rollout-2026-07-25T01-00-00-child.jsonl": [
@@ -405,6 +485,9 @@ test("replay after the fork's own first turn_context is still suppressed", async
       // The replay carries the parent's turn_context with it.
       turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-terra"),
       tokenCount("2026-07-25T01:00:01.000Z", usage(100, 10), usage(100, 10)),
+      // The inherited compaction marker must be consumed with the suppressed
+      // positive replay, not attached to the child's first genuine request.
+      compacted("2026-07-25T01:00:01.500Z"),
       tokenCount("2026-07-25T01:00:02.000Z", usage(300, 30), usage(200, 20)),
       // Only this is new spend.
       tokenCount("2026-07-25T01:00:03.000Z", usage(400, 50), usage(100, 20)),
@@ -415,6 +498,8 @@ test("replay after the fork's own first turn_context is still suppressed", async
     assert.equal(result.usageEvents, 3);
     assert.equal(result.forkReplayEventsSkipped, 2);
     assert.equal(result.unattributedForkReplayEventsSkipped, 0);
+    assert.equal(result.compactionEvents, 2);
+    assert.equal(result.boundaryLinks, 2);
     const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
     try {
       const totals = database.prepare(
@@ -422,6 +507,19 @@ test("replay after the fork's own first turn_context is still suppressed", async
       ).get();
       assert.equal(Number(totals.iu), 400);
       assert.equal(Number(totals.ot), 50);
+      assert.equal(
+        Number(database.prepare(`
+          SELECT COUNT(*) AS c FROM usage_event_boundary
+          WHERE compaction_before = 1`).get().c),
+        1,
+      );
+      const child = database.prepare(`
+        SELECT b.compaction_before, b.turn_context_before
+        FROM usage_event u
+        LEFT JOIN usage_event_boundary b ON b.current_event_key = u.event_key
+        WHERE u.observed_at_ms = ?`).get(Date.parse("2026-07-25T01:00:03.000Z"));
+      assert.equal(child.compaction_before, null);
+      assert.equal(child.turn_context_before, null);
     } finally {
       database.close();
     }
@@ -457,6 +555,7 @@ test("the worker rebuild produces the same index as the single-threaded rebuild"
       sessionMeta(`session-${index}`),
       turnContext(`2026-07-25T0${index}:00:00.000Z`, index % 2 === 0 ? "gpt-5.6-sol" : "gpt-5.5"),
       tokenCount(`2026-07-25T0${index}:00:01.000Z`, usage(100, 10), usage(100, 10), { usedPercent: 5 }),
+      compacted(`2026-07-25T0${index}:00:01.500Z`, 2_000),
       tokenCount(`2026-07-25T0${index}:00:02.000Z`, usage(250, 25), usage(150, 15)),
     ];
   }
@@ -465,15 +564,44 @@ test("the worker rebuild produces the same index as the single-threaded rebuild"
     const single = await build(root, { workerCount: 1 });
     const singleDatabase = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
     const singleAggregate = readUnifiedIndexAggregate(singleDatabase);
+    const singleBoundaries = singleDatabase.prepare(`
+      SELECT hex(current_event_key) AS event_key, compacted_at_ms,
+             compaction_before, turn_context_before,
+             hex(session_local) AS session_local
+      FROM usage_event_boundary ORDER BY event_key`).all();
+    const singleOrder = singleDatabase.prepare(`
+      SELECT hex(event.event_key) AS event_key,
+             hex(source.source_local) AS source_local, event.source_offset
+      FROM usage_event event
+      JOIN source_dimension source ON source.id = event.source_id
+      ORDER BY event_key`).all();
     singleDatabase.close();
 
     const parallel = await build(root, { workerCount: 3 });
     const parallelDatabase = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
     const parallelAggregate = readUnifiedIndexAggregate(parallelDatabase);
+    const parallelBoundaries = parallelDatabase.prepare(`
+      SELECT hex(current_event_key) AS event_key, compacted_at_ms,
+             compaction_before, turn_context_before,
+             hex(session_local) AS session_local
+      FROM usage_event_boundary ORDER BY event_key`).all();
+    const parallelOrder = parallelDatabase.prepare(`
+      SELECT hex(event.event_key) AS event_key,
+             hex(source.source_local) AS source_local, event.source_offset
+      FROM usage_event event
+      JOIN source_dimension source ON source.id = event.source_id
+      ORDER BY event_key`).all();
     parallelDatabase.close();
 
     assert.equal(single.usageEvents, 12);
     assert.equal(parallel.usageEvents, single.usageEvents);
+    assert.equal(single.compactionEvents, 6);
+    assert.equal(parallel.compactionEvents, single.compactionEvents);
+    assert.equal(single.boundaryLinks, 12);
+    assert.equal(parallel.boundaryLinks, single.boundaryLinks);
+    assert.deepEqual(parallelBoundaries, singleBoundaries);
+    assert.equal(singleOrder.length, single.usageEvents);
+    assert.deepEqual(parallelOrder, singleOrder);
     assert.deepEqual(parallelAggregate, singleAggregate);
   } finally {
     await rm(root, { recursive: true });
@@ -582,6 +710,388 @@ test("an oversized token_count is salvaged from its prefix rather than dropped",
   }
 });
 
+test("a compaction is recognized only from its bounded top-level header", async () => {
+  assert.deepEqual(
+    parseCompactionPrefix(Buffer.from(compacted("2026-07-25T00:00:01.000Z"))),
+    { observedAtMs: Date.parse("2026-07-25T00:00:01.000Z") },
+  );
+  // JSON object members are unordered. Accept the only other bounded header
+  // shape without decoding payload or any free text.
+  assert.deepEqual(
+    parseCompactionPrefix(Buffer.from(
+      '{"type":"compacted","timestamp":"2026-07-25T00:00:02.000Z",'
+        + '"payload":{"content":"SECRET"}}',
+    )),
+    { observedAtMs: Date.parse("2026-07-25T00:00:02.000Z") },
+  );
+  // A content-bearing record may itself contain an object whose type happens
+  // to be `compacted`. Anchoring on the top-level timestamp/type header keeps
+  // that nested marker from becoming a false boundary (or making the parser
+  // decode the surrounding content record).
+  const nested = Buffer.from(JSON.stringify({
+    timestamp: "2026-07-25T00:00:01.000Z",
+    type: "response_item",
+    payload: { metadata: { type: "compacted" }, content: "SECRET" },
+  }));
+  assert.equal(parseCompactionPrefix(nested), null);
+  // Do not search later fields: once payload/unknown metadata comes first,
+  // the bounded content-free proof is no longer available.
+  assert.equal(parseCompactionPrefix(Buffer.from(JSON.stringify({
+    timestamp: "2026-07-25T00:00:01.000Z",
+    payload: { content: "SECRET", type: "compacted" },
+    type: "compacted",
+  }))), null);
+});
+
+test("an oversized compaction stores only a content-free boundary with provenance", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unified-compaction-"));
+  const sessions = join(root, "sessions", "2026", "07", "25");
+  await mkdir(sessions, { recursive: true });
+  const compactedAt = "2026-07-25T00:00:01.500Z";
+  const path = join(sessions, "rollout-2026-07-25T00-00-00-aaaa.jsonl");
+  await writeFile(path, `${[
+    sessionMeta("session-a"),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    JSON.stringify({
+      timestamp: "2026-07-25T00:00:01.000Z",
+      type: "response_item",
+      payload: { metadata: { type: "compacted" }, content: "SECRET NESTED" },
+    }),
+    compacted(compactedAt, 20_000),
+    tokenCount("2026-07-25T00:00:02.000Z", usage(100, 10), usage(100, 10)),
+  ].join("\n")}\n`);
+  try {
+    const { size } = await stat(path);
+    const boundaries = [];
+    const extracted = await extractRolloutUsage(path, {
+      size,
+      maximumLineBytes: 512,
+      onEvent: () => {},
+      onBoundary: (event) => boundaries.push(event),
+    });
+    assert.equal(extracted.read.oversizedLines, 1);
+    assert.equal(extracted.diagnostics.compactionEvents, 1);
+    assert.equal(boundaries.length, 1);
+    assert.equal(boundaries[0].compactedAtMs, Date.parse(compactedAt));
+    assert.equal(boundaries[0].compactionBefore, true);
+    assert.equal(boundaries[0].turnContextBefore, true);
+    assert.ok(Number.isSafeInteger(boundaries[0].currentSourceOffset));
+
+    const built = await build(root, { maximumLineBytes: 512 });
+    assert.equal(built.compactionEvents, 1);
+    assert.equal(built.boundaryLinks, 1);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      const rows = database.prepare(`
+        SELECT ce.current_event_key, ce.compaction_before,
+               ce.turn_context_before, ce.compacted_at_ms, ce.session_local,
+               pv.parser_version, ir.received_at_ms
+        FROM usage_event_boundary ce
+        JOIN parser_version pv ON pv.id = ce.parser_version_id
+        JOIN ingest_run ir ON ir.id = ce.ingest_run_id`).all();
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].compacted_at_ms, Date.parse(compactedAt));
+      assert.equal(rows[0].compaction_before, 1);
+      assert.equal(rows[0].turn_context_before, 1);
+      assert.equal(Buffer.from(rows[0].current_event_key).length, 32);
+      assert.equal(Buffer.from(rows[0].session_local).length, 32);
+      assert.equal(rows[0].parser_version, LOCAL_UNIFIED_INDEX_PARSER_VERSION);
+      assert.ok(Number.isSafeInteger(rows[0].received_at_ms));
+      assert.deepEqual(
+        database.prepare("PRAGMA table_info(usage_event_boundary)").all()
+          .map((column) => column.name),
+        [
+          "current_event_key",
+          "compaction_before",
+          "turn_context_before",
+          "compacted_at_ms",
+          "ingest_run_id",
+          "parser_version_id",
+          "session_local",
+        ],
+      );
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("boundaries attach to the exact next positive input and require a real turn marker", async () => {
+  const tied = "2026-07-25T00:05:00.000Z";
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-aaaa.jsonl": [
+      sessionMeta("session-a"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      compacted(tied),
+      // Real logs can co-stamp compaction, a zero-input bookkeeping row and
+      // the first positive request. The zero-input row must not consume the
+      // boundary merely because its timestamp ties.
+      tokenCount(tied, usage(100, 11), usage(0, 1)),
+      turnContext(tied, "gpt-5.6-sol"),
+      tokenCount(tied, usage(200, 20), usage(100, 9)),
+      // A long tool/agent pause inside the same turn is not an older-thread
+      // return: no top-level turn_context appeared before this request.
+      tokenCount("2026-07-25T06:00:00.000Z", usage(300, 30), usage(100, 10)),
+      turnContext("2026-07-25T07:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T07:00:01.000Z", usage(400, 40), usage(100, 10)),
+    ],
+  });
+  try {
+    await build(root);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      const rows = database.prepare(`
+        SELECT u.observed_at_ms, u.tokens_in_uncached, u.tokens_out_text,
+               b.compaction_before, b.turn_context_before, b.compacted_at_ms,
+               u.source_offset, source.source_local
+        FROM usage_event u
+        LEFT JOIN usage_event_boundary b ON b.current_event_key = u.event_key
+        LEFT JOIN source_dimension source ON source.id = u.source_id`).all();
+      const zeroInput = rows.find((row) => (
+        row.observed_at_ms === Date.parse(tied)
+          && row.tokens_in_uncached === 0
+          && row.tokens_out_text === 1
+      ));
+      assert.equal(zeroInput.compaction_before, null);
+      assert.equal(zeroInput.turn_context_before, null);
+
+      const tiedPositive = rows.find((row) => (
+        row.observed_at_ms === Date.parse(tied)
+          && row.tokens_in_uncached === 100
+          && row.tokens_out_text === 9
+      ));
+      assert.equal(tiedPositive.compaction_before, 1);
+      assert.equal(tiedPositive.turn_context_before, 1);
+      assert.equal(tiedPositive.compacted_at_ms, Date.parse(tied));
+      assert.ok(zeroInput.source_offset < tiedPositive.source_offset);
+      assert.equal(Buffer.from(tiedPositive.source_local).length, 32);
+
+      const longToolPause = rows.find((row) => (
+        row.observed_at_ms === Date.parse("2026-07-25T06:00:00.000Z")
+      ));
+      assert.equal(longToolPause.compaction_before, null);
+      assert.equal(longToolPause.turn_context_before, null);
+
+      const realReturn = rows.find((row) => (
+        row.observed_at_ms === Date.parse("2026-07-25T07:00:01.000Z")
+      ));
+      assert.equal(realReturn.compaction_before, 0);
+      assert.equal(realReturn.turn_context_before, 1);
+      assert.equal(
+        Number(database.prepare(`
+          SELECT COUNT(*) AS c FROM usage_event
+          WHERE source_id IS NOT NULL AND source_offset IS NOT NULL`).get().c),
+        rows.length,
+      );
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("cache adjacency follows exact source order and exposes incomplete order coverage", async () => {
+  const tied = "2026-07-25T00:00:01.000Z";
+  // With this fixed local salt/session pair, HMAC event-key order is
+  // [max, high, high], while source order is [high, max, high]. That makes the
+  // fixture a deterministic regression for the former HMAC tie-breaker.
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-aaaa.jsonl": [
+      sessionMeta("session-1"),
+      turnContext(tied, "gpt-5.6-sol", "high"),
+      tokenCount(tied, usage(1_200, 0, 1_000), usage(1_200, 0, 1_000)),
+      turnContext(tied, "gpt-5.6-sol", "max"),
+      tokenCount(tied, usage(2_400, 0, 1_000), usage(1_200, 0, 0)),
+      turnContext(tied, "gpt-5.6-sol", "high"),
+      tokenCount(tied, usage(3_600, 0, 2_000), usage(1_200, 0, 1_000)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const nowMs = Date.parse("2026-07-25T00:10:00.000Z");
+  const zeroPricer = () => ({ coverageStatus: "fully_priced", totalUsd: "0" });
+  try {
+    await writeFile(join(root, "salt"), Buffer.alloc(32, 7), { mode: 0o600 });
+    await build(root);
+    {
+      const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+      try {
+        const sourceOrder = database.prepare(`
+          SELECT source_offset FROM usage_event
+          ORDER BY source_offset`).all().map((row) => row.source_offset);
+        const hmacOrder = database.prepare(`
+          SELECT source_offset FROM usage_event
+          ORDER BY event_key`).all().map((row) => row.source_offset);
+        assert.notDeepEqual(hmacOrder, sourceOrder);
+
+        const impacts = readCacheImpacts(database, { nowMs, pricer: zeroPricer });
+        const switched = impacts.cacheSwitchImpact.periods.find(
+          (period) => period.periodId === "24h",
+        );
+        assert.equal(switched.configurationChanges, 2);
+        assert.equal(switched.cacheReadDrops, 1);
+        assert.equal(switched.recent[0].previous.reasoningEffort, "high");
+        assert.equal(switched.recent[0].current.reasoningEffort, "max");
+      } finally {
+        database.close();
+      }
+    }
+
+    // Simulate one retained older-parser event without exact order. The lens
+    // keeps its periods and observed counts, but withholds affected totals
+    // through a total-only coverage gap rather than inventing a category.
+    {
+      const database = openLocalUnifiedIndex(indexFile, { readOnly: false });
+      database.prepare(`
+        UPDATE usage_event SET source_id = NULL, source_offset = NULL
+        WHERE source_offset = (SELECT MIN(source_offset) FROM usage_event)`).run();
+      database.close();
+    }
+    {
+      const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+      try {
+        const impacts = readCacheImpacts(database, { nowMs, pricer: zeroPricer });
+        for (const projection of [
+          impacts.cacheSwitchImpact,
+          impacts.cacheContinuityImpact,
+        ]) {
+          assert.equal(projection.status, "available");
+          const period = projection.periods.find(
+            (candidate) => candidate.periodId === "24h",
+          );
+          assert.equal(period.orderingCoverageGaps, 1);
+          assert.equal(period.coverageStatus, "incomplete");
+          assert.equal(period.estimatedPremiumUsd, null);
+          assert.equal(period.estimatedPremiumUsdExact, null);
+        }
+        const switchPeriod = impacts.cacheSwitchImpact.periods.find(
+          (candidate) => candidate.periodId === "24h",
+        );
+        assert.ok(Object.values(switchPeriod.byChangeType).every(
+          (summary) => !Object.hasOwn(summary, "orderingCoverageGaps"),
+        ));
+        const continuityPeriod = impacts.cacheContinuityImpact.periods.find(
+          (candidate) => candidate.periodId === "24h",
+        );
+        assert.ok(Object.values(continuityPeriod.byGapBand).every(
+          (summary) => !Object.hasOwn(summary, "orderingCoverageGaps"),
+        ));
+      } finally {
+        database.close();
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("ordering coverage is period-scoped and ignores sessions without adjacency", async () => {
+  const nowMs = Date.parse("2026-07-25T12:00:00.000Z");
+  const oldLatest = "2026-07-15T11:05:00.000Z";
+  const singletonAt = "2026-07-25T10:00:00.000Z";
+  const { root } = await corpus({
+    "rollout-2026-07-25T11-00-00-recent.jsonl": [
+      sessionMeta("session-recent"),
+      turnContext("2026-07-25T11:00:00.000Z", "gpt-5.6-sol", "high"),
+      tokenCount(
+        "2026-07-25T11:00:00.000Z",
+        usage(1_200, 0, 1_000),
+        usage(1_200, 0, 1_000),
+      ),
+      turnContext("2026-07-25T11:05:00.000Z", "gpt-5.6-sol", "max"),
+      tokenCount(
+        "2026-07-25T11:05:00.000Z",
+        usage(2_400, 0, 1_000),
+        usage(1_200, 0, 0),
+      ),
+    ],
+    "rollout-2026-07-15T11-00-00-old.jsonl": [
+      sessionMeta("session-old"),
+      turnContext("2026-07-15T11:00:00.000Z", "gpt-5.6-sol", "high"),
+      tokenCount(
+        "2026-07-15T11:00:00.000Z",
+        usage(100, 0, 50),
+        usage(100, 0, 50),
+      ),
+      tokenCount(
+        oldLatest,
+        usage(200, 0, 100),
+        usage(100, 0, 50),
+      ),
+    ],
+    "rollout-2026-07-25T10-00-00-single.jsonl": [
+      sessionMeta("session-single"),
+      turnContext(singletonAt, "gpt-5.6-sol", "high"),
+      tokenCount(singletonAt, usage(100, 0, 50), usage(100, 0, 50)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const zeroPricer = () => ({ coverageStatus: "fully_priced", totalUsd: "0" });
+  try {
+    await build(root);
+    {
+      const database = openLocalUnifiedIndex(indexFile, { readOnly: false });
+      database.prepare(`
+        UPDATE usage_event SET source_id = NULL, source_offset = NULL
+        WHERE observed_at_ms <= ? OR observed_at_ms = ?`).run(
+        Date.parse(oldLatest),
+        Date.parse(singletonAt),
+      );
+      database.close();
+    }
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      const impacts = readCacheImpacts(database, { nowMs, pricer: zeroPricer });
+      for (const projection of [
+        impacts.cacheSwitchImpact,
+        impacts.cacheContinuityImpact,
+      ]) {
+        assert.equal(projection.status, "available");
+        for (const periodId of ["24h", "7d"]) {
+          const period = projection.periods.find(
+            (candidate) => candidate.periodId === periodId,
+          );
+          assert.equal(period.orderingCoverageGaps, 0, periodId);
+          assert.equal(period.coverageStatus, "complete", periodId);
+          assert.equal(period.estimatedPremiumUsd, 0, periodId);
+        }
+        for (const periodId of ["30d", "all"]) {
+          const period = projection.periods.find(
+            (candidate) => candidate.periodId === periodId,
+          );
+          assert.equal(period.orderingCoverageGaps, 1, periodId);
+          assert.equal(period.coverageStatus, "incomplete", periodId);
+          assert.equal(period.estimatedPremiumUsd, null, periodId);
+        }
+      }
+
+      // The known recent switch remains counted even where an older
+      // unorderable session withholds the period total. The ordering gap is
+      // not fabricated into a change-type bucket.
+      const switchThirty = impacts.cacheSwitchImpact.periods.find(
+        (period) => period.periodId === "30d",
+      );
+      assert.equal(switchThirty.configurationChanges, 1);
+      assert.equal(switchThirty.byChangeType.reasoning_only.configurationChanges, 1);
+      assert.equal(
+        switchThirty.byChangeType.reasoning_only.coverageStatus,
+        "complete",
+      );
+      assert.equal(
+        switchThirty.byChangeType.reasoning_only.estimatedPremiumUsd,
+        0,
+      );
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("an incomplete counter set is never guessed at", () => {
   assert.equal(salvagePartialTokenCount('{"input_tokens":10,"output_tokens":2'), null);
   assert.deepEqual(
@@ -645,14 +1155,21 @@ test("an incremental pass resumes a cold rebuild's cursors and reads only append
   try {
     const built = await build(root);
     assert.equal(built.usageEvents, 2);
+    assert.equal(built.boundaryLinks, 1);
 
     // Append one turn that reports only a cumulative total. The delta can
     // only be computed against the carried baseline, so this fails loudly if
     // the cursor's carry state is wrong.
-    await appendFile(path, `${tokenCountTotalOnly(
+    const appendedBoundary = `${compacted("2026-07-25T00:00:02.500Z")}\n`
+      + `${turnContext("2026-07-25T00:00:02.600Z", "gpt-5.6-sol")}\n`;
+    const appendedUsage = `${tokenCountTotalOnly(
       "2026-07-25T00:00:03.000Z",
       usage(450, 55),
-    )}\n`);
+    )}\n`;
+    // First append only boundary markers. Both must remain in bounded,
+    // content-free source state rather than being lost at EOF or linked to an
+    // earlier request.
+    await appendFile(path, appendedBoundary);
     const first = await ingestLocalUnifiedIndexIncrement({
       codexHome: root,
       indexFile: join(root, "index.sqlite"),
@@ -661,40 +1178,143 @@ test("an incremental pass resumes a cold rebuild's cursors and reads only append
     });
     assert.equal(first.sourcesResumed, 1);
     assert.equal(first.sourcesRescanned, 0);
-    assert.equal(first.insertedUsageEvents, 1);
-    assert.equal(first.totalUsageEvents, 3);
+    assert.equal(first.insertedUsageEvents, 0);
+    assert.equal(first.insertedBoundaryLinks, 0);
+    assert.equal(first.totalUsageEvents, 2);
+    assert.equal(first.totalBoundaryLinks, 1);
     // Only the appended bytes were read.
-    const appended = Buffer.byteLength(
-      `${tokenCountTotalOnly("2026-07-25T00:00:03.000Z", usage(450, 55))}\n`,
-    );
-    assert.equal(first.bytesScanned, appended);
-
-    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
-    try {
-      const rows = database.prepare(`
-        SELECT tokens_in_uncached AS iu, tokens_out_text AS ot,
-               tokens_out_reasoning AS orz
-        FROM usage_event ORDER BY observed_at_ms`).all();
-      assert.equal(rows.length, 3);
-      // 450 - 300 input, 55 - 30 output against the carried baseline.
-      assert.equal(rows[2].iu, 150);
-      assert.equal(rows[2].ot, 25);
-    } finally {
-      database.close();
+    assert.equal(first.bytesScanned, Buffer.byteLength(appendedBoundary));
+    {
+      const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+      try {
+        const pending = database.prepare(`
+          SELECT compacted_at_ms, source_offset, turn_context_pending
+          FROM source_boundary_state`).get();
+        assert.equal(pending.compacted_at_ms, Date.parse("2026-07-25T00:00:02.500Z"));
+        assert.ok(Number.isSafeInteger(pending.source_offset));
+        assert.equal(pending.turn_context_pending, 1);
+      } finally {
+        database.close();
+      }
     }
 
-    // Nothing changed: the next pass reads nothing and inserts nothing.
+    await appendFile(path, appendedUsage);
     const second = await ingestLocalUnifiedIndexIncrement({
       codexHome: root,
       indexFile: join(root, "index.sqlite"),
       secretFile: join(root, "salt"),
       contractVersion: CONTRACT,
     });
-    assert.equal(second.sourcesSkipped, 1);
-    assert.equal(second.sourcesScanned, 0);
-    assert.equal(second.bytesScanned, 0);
-    assert.equal(second.insertedUsageEvents, 0);
+    assert.equal(second.sourcesResumed, 1);
+    assert.equal(second.insertedUsageEvents, 1);
+    assert.equal(second.insertedBoundaryLinks, 1);
     assert.equal(second.totalUsageEvents, 3);
+    assert.equal(second.totalBoundaryLinks, 2);
+    assert.equal(second.bytesScanned, Buffer.byteLength(appendedUsage));
+
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      const rows = database.prepare(`
+        SELECT u.tokens_in_uncached AS iu, u.tokens_out_text AS ot,
+               b.compaction_before, b.turn_context_before
+        FROM usage_event u
+        LEFT JOIN usage_event_boundary b ON b.current_event_key = u.event_key
+        ORDER BY u.observed_at_ms`).all();
+      assert.equal(rows.length, 3);
+      // 450 - 300 input, 55 - 30 output against the carried baseline.
+      assert.equal(rows[2].iu, 150);
+      assert.equal(rows[2].ot, 25);
+      assert.equal(rows[2].compaction_before, 1);
+      assert.equal(rows[2].turn_context_before, 1);
+      assert.equal(
+        Number(database.prepare("SELECT COUNT(*) AS c FROM source_boundary_state").get().c),
+        0,
+      );
+    } finally {
+      database.close();
+    }
+
+    // Nothing changed: the next pass reads nothing and inserts nothing.
+    const settled = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile: join(root, "index.sqlite"),
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(settled.sourcesSkipped, 1);
+    assert.equal(settled.sourcesScanned, 0);
+    assert.equal(settled.bytesScanned, 0);
+    assert.equal(settled.insertedUsageEvents, 0);
+    assert.equal(settled.insertedBoundaryLinks, 0);
+    assert.equal(settled.totalUsageEvents, 3);
+    assert.equal(settled.totalBoundaryLinks, 2);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a same-parser shrink removes stale usage and boundary rows before rescan", async () => {
+  const keptLines = [
+    sessionMeta("session-a"),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    compacted("2026-07-25T00:00:01.500Z"),
+    turnContext("2026-07-25T00:00:01.600Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20)),
+  ];
+  const { root, sessions } = await corpus({
+    "rollout-2026-07-25T00-00-00-aaaa.jsonl": [
+      ...keptLines,
+      turnContext("2026-07-25T00:00:02.500Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:03.000Z", usage(600, 60), usage(300, 30)),
+    ],
+  });
+  const path = join(sessions, "rollout-2026-07-25T00-00-00-aaaa.jsonl");
+  const ingest = () => ingestLocalUnifiedIndexIncrement({
+    codexHome: root,
+    indexFile: join(root, "index.sqlite"),
+    secretFile: join(root, "salt"),
+    contractVersion: CONTRACT,
+  });
+  try {
+    const first = await ingest();
+    assert.equal(first.insertedUsageEvents, 3);
+    assert.equal(first.insertedBoundaryLinks, 3);
+
+    // Replace the file with a valid shorter prefix. The removed request had
+    // both a usage row and a turn-boundary relation, neither of which can be
+    // displaced by deterministic ON CONFLICT re-insertion alone.
+    await writeFile(path, `${keptLines.join("\n")}\n`);
+    const shrunk = await ingest();
+    assert.equal(shrunk.sourcesRescanned, 1);
+    assert.equal(shrunk.usageRowsDeletedForSourceRescan, 3);
+    assert.equal(shrunk.boundaryRowsDeletedForSourceRescan, 3);
+    assert.equal(shrunk.insertedUsageEvents, 2);
+    assert.equal(shrunk.insertedBoundaryLinks, 2);
+    assert.equal(shrunk.totalUsageEvents, 2);
+    assert.equal(shrunk.totalBoundaryLinks, 2);
+
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      assert.deepEqual(database.prepare(`
+        SELECT observed_at_ms FROM usage_event
+        ORDER BY observed_at_ms`).all().map((row) => row.observed_at_ms), [
+        Date.parse("2026-07-25T00:00:01.000Z"),
+        Date.parse("2026-07-25T00:00:02.000Z"),
+      ]);
+      assert.equal(
+        Number(database.prepare(`
+          SELECT COUNT(*) AS c FROM usage_event
+          WHERE source_id IS NOT NULL AND source_offset IS NOT NULL`).get().c),
+        2,
+      );
+      assert.equal(
+        Number(database.prepare("SELECT COUNT(*) AS c FROM usage_event_boundary").get().c),
+        2,
+      );
+    } finally {
+      database.close();
+    }
   } finally {
     await rm(root, { recursive: true });
   }
@@ -790,9 +1410,15 @@ test("a version-1 index is migrated additively, never rebuilt", async () => {
       const { DatabaseSync } = await import("node:sqlite");
       const raw = new DatabaseSync(join(root, "index.sqlite"));
       raw.exec(`
+        DROP TABLE source_boundary_state;
         DROP TABLE source_cursor;
         DROP TABLE lineage_snapshot;
         DROP TABLE session_identity;
+        DROP TABLE usage_event_boundary;
+        UPDATE usage_event SET source_id = NULL, source_offset = NULL;
+        ALTER TABLE usage_event DROP COLUMN source_offset;
+        ALTER TABLE usage_event DROP COLUMN source_id;
+        DROP TABLE source_dimension;
         PRAGMA user_version=1;
       `);
       raw.close();
@@ -809,13 +1435,18 @@ test("a version-1 index is migrated additively, never rebuilt", async () => {
     const writable = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: false });
     assert.equal(
       Number(writable.prepare("PRAGMA user_version").get().user_version),
-      3,
+      6,
     );
     assert.equal(
       Number(writable.prepare("SELECT COUNT(*) AS c FROM usage_event").get().c),
       1,
     );
     writable.prepare("SELECT COUNT(*) AS c FROM source_cursor").get();
+    writable.prepare("SELECT COUNT(*) AS c FROM usage_event_boundary").get();
+    writable.prepare("SELECT COUNT(*) AS c FROM source_dimension").get();
+    assert.ok(writable.prepare("PRAGMA table_info(usage_event)").all()
+      .some((column) => column.name === "source_offset"));
+    writable.prepare("SELECT COUNT(*) AS c FROM source_boundary_state").get();
     writable.close();
   } finally {
     await rm(root, { recursive: true });
@@ -839,7 +1470,7 @@ test("classifySource maps growth, touch, shrink and novelty to the right work", 
   );
   assert.deepEqual(
     classifySource(info, { size_bytes: 160, mtime_ms: 5 }),
-    { mode: "rescan" },
+    { mode: "rescan", reason: "shrink" },
   );
 });
 
@@ -874,12 +1505,90 @@ test("classifySource forces a whole-file rescan for cursors stamped by an older 
   }
 });
 
+test("a v5 development cursor migrates to v6 and backfills nullable source order", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-aaaa.jsonl": [
+      sessionMeta("session-a"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      compacted("2026-07-25T00:00:01.500Z"),
+      tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const ingest = () => ingestLocalUnifiedIndexIncrement({
+    codexHome: root,
+    indexFile,
+    secretFile: join(root, "salt"),
+    contractVersion: CONTRACT,
+  });
+  try {
+    const first = await ingest();
+    assert.equal(first.insertedUsageEvents, 2);
+    assert.equal(first.insertedBoundaryLinks, 2);
+
+    // Reproduce the release-blocking development state: schema version 5,
+    // cursor provenance that would look current if the parser identifier were
+    // not advanced, and newly migrated exact-order columns still NULL.
+    {
+      const database = openLocalUnifiedIndex(indexFile, { readOnly: false });
+      database.prepare(`
+        UPDATE parser_version
+        SET parser_version = 'unified-rollout-typed-v5'`).run();
+      database.prepare(`
+        UPDATE usage_event SET source_id = NULL, source_offset = NULL`).run();
+      database.exec("PRAGMA user_version=5");
+      database.close();
+    }
+
+    const healed = await ingest();
+    assert.equal(healed.sourcesReparsedForParserVersion, 1);
+    assert.equal(healed.usageRowsDeletedForReparse, 2);
+    assert.equal(healed.boundaryRowsDeletedForReparse, 2);
+    assert.equal(healed.sourcesRescanned, 1);
+    assert.equal(healed.insertedUsageEvents, 2);
+    assert.equal(healed.insertedBoundaryLinks, 2);
+
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.equal(
+        Number(database.prepare("PRAGMA user_version").get().user_version),
+        6,
+      );
+      assert.equal(
+        Number(database.prepare(`
+          SELECT COUNT(*) AS c FROM usage_event
+          WHERE source_id IS NULL OR source_offset IS NULL`).get().c),
+        0,
+      );
+      assert.deepEqual(database.prepare(`
+        SELECT DISTINCT parser.parser_version
+        FROM usage_event event
+        JOIN parser_version parser ON parser.id = event.parser_version_id`).all()
+        .map((row) => row.parser_version), [
+        LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+      ]);
+      const cursor = database.prepare(`
+        SELECT parser.parser_version
+        FROM source_cursor source
+        JOIN ingest_run run ON run.id = source.ingest_run_id
+        JOIN parser_version parser ON parser.id = run.parser_version_id`).get();
+      assert.equal(cursor.parser_version, LOCAL_UNIFIED_INDEX_PARSER_VERSION);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("a parser-version bump re-derives poisoned sources and replaces their rows", async () => {
   const { root } = await corpus({
     "rollout-2026-07-25T00-00-00-aaaa.jsonl": [
       sessionMeta("session-a"),
       turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
       tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      compacted("2026-07-25T00:00:01.500Z"),
       tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20)),
     ],
   });
@@ -892,6 +1601,7 @@ test("a parser-version bump re-derives poisoned sources and replaces their rows"
   try {
     const first = await ingest();
     assert.equal(first.insertedUsageEvents, 2);
+    assert.equal(first.insertedBoundaryLinks, 2);
     assert.equal(first.sourcesReparsedForParserVersion, 0);
 
     // Regress the index to an older-parser state: restamp the parser_version
@@ -907,15 +1617,21 @@ test("a parser-version bump re-derives poisoned sources and replaces their rows"
       raw.prepare(
         "UPDATE usage_event SET tokens_in_uncached = 5420000000",
       ).run();
+      raw.prepare(
+        "UPDATE usage_event_boundary SET compacted_at_ms = 0 WHERE compaction_before = 1",
+      ).run();
       raw.close();
     }
 
     const healed = await ingest();
     assert.equal(healed.sourcesReparsedForParserVersion, 1);
     assert.equal(healed.usageRowsDeletedForReparse, 2);
+    assert.equal(healed.boundaryRowsDeletedForReparse, 2);
     assert.equal(healed.sourcesRescanned, 1);
     assert.equal(healed.insertedUsageEvents, 2, "rows are re-derived, not kept");
+    assert.equal(healed.insertedBoundaryLinks, 2);
     assert.equal(healed.totalUsageEvents, 2);
+    assert.equal(healed.totalBoundaryLinks, 2);
 
     const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
     try {
@@ -924,6 +1640,13 @@ test("a parser-version bump re-derives poisoned sources and replaces their rows"
         FROM usage_event`).get();
       assert.equal(Number(totals.iu), 300, "the phantom values are gone");
       assert.equal(Number(totals.max_iu), 200);
+      const boundary = database.prepare(`
+        SELECT ce.compacted_at_ms, pv.parser_version
+        FROM usage_event_boundary ce
+        JOIN parser_version pv ON pv.id = ce.parser_version_id
+        WHERE ce.compaction_before = 1`).get();
+      assert.equal(boundary.compacted_at_ms, Date.parse("2026-07-25T00:00:01.500Z"));
+      assert.equal(boundary.parser_version, LOCAL_UNIFIED_INDEX_PARSER_VERSION);
     } finally {
       database.close();
     }
@@ -934,6 +1657,7 @@ test("a parser-version bump re-derives poisoned sources and replaces their rows"
     assert.equal(settled.sourcesReparsedForParserVersion, 0);
     assert.equal(settled.sourcesSkipped, 1);
     assert.equal(settled.insertedUsageEvents, 0);
+    assert.equal(settled.insertedBoundaryLinks, 0);
   } finally {
     await rm(root, { recursive: true });
   }

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, stat } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -1342,10 +1342,55 @@ test("the unified index supplies the full-history calibration corpus with no sca
     cache.weeklyCalibration.recentResets[0].firstObservedAt,
     "2025-05-01T00:00:00.000Z",
   );
+  assert.equal(
+    cache.allowanceCapacityByScenario.scenarios.unresolved_as_fast
+      .calibration.status,
+    "estimated",
+  );
   // The cache's own scan coverage stays the requested window; only the
   // calibration corpus escapes it.
   assert.equal(cache.coveredAt.endAt, "2026-08-20T12:00:00.000Z");
   assert.equal(cache.schemaVersion, REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION);
+});
+
+test("declared speed baselines resolve unified calibration events before scenario fitting", async () => {
+  const directory = await mkdtemp(join(
+    tmpdir(),
+    "usage-monitor-unified-declared-speed-",
+  ));
+  const indexFile = join(directory, "local-unified-index-v1.sqlite");
+  await writeUnifiedCalibrationFixture(indexFile, {
+    resets: [
+      Date.parse("2025-05-01T00:00:00.000Z"),
+      Date.parse("2025-05-08T00:00:00.000Z"),
+      Date.parse("2025-05-15T00:00:00.000Z"),
+    ],
+  });
+  try {
+    const cache = await buildReplaySafeAccountingCache({
+      now: () => Date.parse("2026-08-20T12:00:00.000Z"),
+      unifiedIndexFile: indexFile,
+      declaredSpeedBaselines: [{
+        firstSeenAt: "2025-05-01T00:00:00.000Z",
+        lastSeenAt: "2025-05-24T00:00:00.000Z",
+        mode: "standard",
+      }],
+      scan: scanner([]),
+    });
+    const standard = cache.allowanceCapacityByScenario.scenarios
+      .unresolved_as_standard.calibration;
+    const fast = cache.allowanceCapacityByScenario.scenarios
+      .unresolved_as_fast.calibration;
+    assert.equal(standard.status, "estimated");
+    assert.equal(fast.status, "estimated");
+    assert.equal(
+      standard.estimate.medianApiPriceEquivalentUsd,
+      fast.estimate.medianApiPriceEquivalentUsd,
+      "a declared Standard corpus has no unresolved events for Fast to inflate",
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("a missing or empty unified index degrades honestly to the windowed corpus", async () => {

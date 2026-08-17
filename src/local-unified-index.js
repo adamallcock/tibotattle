@@ -15,8 +15,10 @@ import { DatabaseSync } from "node:sqlite";
 //
 //   * No prompt, reply, reasoning or file content is read, parsed, retained or
 //     logged. Only `turn_context`, `token_count` and `thread_settings_applied`
-//     records are parsed, and only their metadata fields are projected. There
-//     is no column in this schema that can hold free text from a rollout.
+//     records are parsed, and only their metadata fields are projected. A
+//     top-level `compacted` boundary is recognised from its bounded header;
+//     its payload is never parsed. There is no column in this schema that can
+//     hold free text from a rollout.
 //   * `session_local` is HMAC(device_salt, codex_session_id) — 32 raw bytes,
 //     irreversible, never leaves the Mac, never rotates. The upload pseudonym
 //     stays HMAC(export_secret, session_local), computed at send time, and is
@@ -48,7 +50,26 @@ export const LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v1";
 // threads. Rows derived under v2 label such turns `unobserved` (priced
 // Standard even when the reachable ancestor declaration was Fast), so the
 // incremental ingest forces a whole-file rescan of v2-stamped sources.
-export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v3";
+//
+// v4 (2026-08-16): top-level turn and compaction boundaries are attached to
+// the next accepted positive-input usage row. Compaction is recognised from
+// the bounded record header. The parser bump is intentional: every
+// still-present source is re-scanned once so the new table does not silently
+// mean "no boundary" for files indexed under earlier parsers.
+//
+// v5 (2026-08-16): every usage row also records its content-free source byte
+// order. Event keys are HMACs, so they are deliberately random and cannot
+// break real same-millisecond timestamp ties.
+//
+// v6 (2026-08-16): exact order is stored compactly as an interned integer
+// source id plus source offset directly on the usage fact. The initial
+// pre-release relation duplicated two 32-byte HMACs and indexes per event.
+// This parser bump also forces still-present development-v5 sources to
+// re-scan and backfill those fields instead of leaving a current-looking
+// cursor over NULL order state. Rows retained from rotated older-parser
+// sources remain distinguishable by provenance and are withheld from
+// adjacency analysis rather than guessed into an order.
+export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v6";
 
 // A row salvaged from a line that exceeded the bounded-line cap carries this
 // parser version instead. The agreed schema has no "partial" column and the
@@ -57,7 +78,7 @@ export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v3";
 // degraded row is recorded. Kept in lockstep with the main constant: salvaged
 // rows run the same delta derivation.
 export const LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v3-partial";
+  "unified-rollout-typed-v6-partial";
 
 const INDEX_APPLICATION_ID = 0x554d5549;
 // Version 2 (2026-08-07) widens version 1 with the two incremental-ingest
@@ -65,13 +86,17 @@ const INDEX_APPLICATION_ID = 0x554d5549;
 // adds `session_identity`, the raw provider-issued session UUID beside its
 // local join key: the owner ruled that session identifiers travel raw in
 // telemetry-contribution-v1.0, and the HMAC join key cannot be inverted, so
-// the raw identifier has to be recorded at ingest time. Each widening is
-// purely additive, so an older index opened writable is migrated in place —
-// its rows survive, which matters because rows whose rollout files have
-// rotated away can never be rebuilt. An older index opened read-only stays
+// the raw identifier has to be recorded at ingest time. Version 4 (2026-08-16)
+// adds local-only, content-free usage-boundary state and relation tables.
+// Version 5 (2026-08-16) adds the exact content-free source order of each
+// usage event. Version 6 stores that order compactly as two nullable integer
+// columns on usage_event plus one interned local-source dimension. Each
+// widening is purely additive, so an older index opened writable is migrated
+// in place. Its rows survive, which matters because rows whose rollout files
+// have rotated away can never be rebuilt. An older index opened read-only stays
 // valid as it is: readers never touch the new tables.
-const INDEX_USER_VERSION = 3;
-const MIGRATABLE_USER_VERSIONS = new Set([1, 2, 3]);
+const INDEX_USER_VERSION = 6;
+const MIGRATABLE_USER_VERSIONS = new Set([1, 2, 3, 4, 5, 6]);
 const SECRET_BYTES = 32;
 const MAX_SECRET_BYTES = 256;
 const DEFAULT_COMMIT_ROWS = 10_000;
@@ -173,6 +198,12 @@ const SCHEMA = `
     scope_local BLOB,
     UNIQUE(status, reason, plan_type, scope_local)) STRICT;
 
+  -- One HMAC per rollout source, interned once. Usage facts reference its
+  -- small integer id rather than duplicating a 32-byte local digest per row.
+  CREATE TABLE IF NOT EXISTS source_dimension(
+    id INTEGER PRIMARY KEY,
+    source_local BLOB NOT NULL UNIQUE) STRICT;
+
   -- Quota observations as their own series, referenced by usage events. Quota
   -- is re-observed every few minutes while turns fire continuously, so this
   -- deduplicates heavily while preserving the exact event-to-quota pairing the
@@ -194,6 +225,10 @@ const SCHEMA = `
     observed_at_ms INTEGER NOT NULL,
     ingest_run_id INTEGER NOT NULL REFERENCES ingest_run,
     parser_version_id INTEGER NOT NULL REFERENCES parser_version,
+    -- NULL only on retained rows from a parser/schema that predates exact
+    -- source ordering. Current-parser writers always set both fields.
+    source_id INTEGER REFERENCES source_dimension,
+    source_offset INTEGER,
     session_local BLOB NOT NULL,
     account_scope_id INTEGER NOT NULL REFERENCES account_scope,
     model_id INTEGER NOT NULL REFERENCES model,
@@ -213,6 +248,24 @@ const SCHEMA = `
     tokens_out_reasoning INTEGER,
     tokens_out_combined INTEGER,
     total_input_context INTEGER) STRICT;
+
+  -- Local-only continuity boundary, attached to the exact next accepted
+  -- positive-input usage event. Timestamps can tie in real rollout files, so
+  -- a timestamp-range join is not sufficient. The source payload and
+  -- replacement history are never parsed and have nowhere to be stored.
+  -- Parser and run provenance are explicit so an analyzer can distinguish
+  -- boundaries backfilled by v3 from history retained under an older parser.
+  CREATE TABLE IF NOT EXISTS usage_event_boundary(
+    current_event_key BLOB PRIMARY KEY
+      REFERENCES usage_event(event_key) ON DELETE CASCADE,
+    compaction_before INTEGER NOT NULL CHECK(compaction_before IN (0, 1)),
+    turn_context_before INTEGER NOT NULL CHECK(turn_context_before IN (0, 1)),
+    compacted_at_ms INTEGER,
+    ingest_run_id INTEGER NOT NULL REFERENCES ingest_run,
+    parser_version_id INTEGER NOT NULL REFERENCES parser_version,
+    session_local BLOB NOT NULL,
+    CHECK(compaction_before = (compacted_at_ms IS NOT NULL)),
+    CHECK(compaction_before = 1 OR turn_context_before = 1)) STRICT;
 
   CREATE TABLE IF NOT EXISTS tool_class_count(
     session_local BLOB NOT NULL,
@@ -250,6 +303,22 @@ const SCHEMA = `
     carry_total_total INTEGER,
     ingest_run_id INTEGER NOT NULL REFERENCES ingest_run) STRICT;
 
+  -- A turn or compaction can be the final complete line in the current scan.
+  -- Preserve those bounded markers until an appended positive-input request
+  -- arrives.
+  -- This separate v4 table keeps the schema widening additive: older
+  -- source_cursor rows need no ALTER TABLE rewrite.
+  CREATE TABLE IF NOT EXISTS source_boundary_state(
+    source_local BLOB PRIMARY KEY
+      REFERENCES source_cursor(source_local) ON DELETE CASCADE,
+    compacted_at_ms INTEGER,
+    source_offset INTEGER,
+    turn_context_pending INTEGER NOT NULL
+      CHECK(turn_context_pending IN (0, 1)),
+    ingest_run_id INTEGER NOT NULL REFERENCES ingest_run,
+    CHECK((compacted_at_ms IS NULL) = (source_offset IS NULL)),
+    CHECK(compacted_at_ms IS NOT NULL OR turn_context_pending = 1)) STRICT;
+
   -- Persisted fork-replay boundary. The in-memory-only snapshot sets were
   -- recorded as valid strictly for one-pass rebuilds; the moment ingest became
   -- incremental, an ancestor's set has to outlive the pass that built it so a
@@ -276,6 +345,8 @@ const SCHEMA = `
     ON usage_event(observed_at_ms);
   CREATE INDEX IF NOT EXISTS usage_event_session
     ON usage_event(session_local);
+  CREATE INDEX IF NOT EXISTS usage_event_boundary_session
+    ON usage_event_boundary(session_local);
 `;
 
 function fixedError(code) {
@@ -482,12 +553,25 @@ function migrateDatabase(database) {
   if (!MIGRATABLE_USER_VERSIONS.has(userVersion)) {
     throw fixedError("local_unified_index_schema_invalid");
   }
-  // Every migration is additive: create the widened tables and stamp the new
-  // version. Existing rows are untouched by construction.
-  database.exec(`
-    ${SCHEMA}
-    PRAGMA user_version=${INDEX_USER_VERSION};
-  `);
+  // Every migration is additive: create widened tables, add nullable columns,
+  // and stamp the new version. Existing rows are untouched by construction.
+  database.exec(SCHEMA);
+  const usageColumns = new Set(
+    database.prepare("PRAGMA table_info(usage_event)").all()
+      .map((column) => column.name),
+  );
+  if (!usageColumns.has("source_id")) {
+    database.exec(`
+      ALTER TABLE usage_event
+      ADD COLUMN source_id INTEGER REFERENCES source_dimension;
+    `);
+  }
+  if (!usageColumns.has("source_offset")) {
+    database.exec(`
+      ALTER TABLE usage_event ADD COLUMN source_offset INTEGER;
+    `);
+  }
+  database.exec(`PRAGMA user_version=${INDEX_USER_VERSION};`);
 }
 
 export function openLocalUnifiedIndex(indexFile, {
@@ -592,6 +676,11 @@ export function createUnifiedIndexWriter(database, {
     selectAccountScope: database.prepare(`
       SELECT id FROM account_scope
       WHERE status = ? AND reason IS ? AND plan_type IS ? AND scope_local IS ?`),
+    sourceDimension: database.prepare(`
+      INSERT INTO source_dimension(source_local)
+      VALUES (?) ON CONFLICT(source_local) DO NOTHING`),
+    selectSourceDimension: database.prepare(`
+      SELECT id FROM source_dimension WHERE source_local = ?`),
     // Two rollout files genuinely report the same (observed_at_ms, limit_id,
     // slot) with different readings — a fork replays the parent's older
     // percentage stamped with the fork's own timestamp, alongside the live
@@ -623,14 +712,21 @@ export function createUnifiedIndexWriter(database, {
     usage: database.prepare(`
       INSERT INTO usage_event(
         event_key, observed_at_ms, ingest_run_id, parser_version_id,
-        session_local, account_scope_id, model_id, tier_id, surface_id,
+        source_id, source_offset, session_local, account_scope_id,
+        model_id, tier_id, surface_id,
         quota_observation_id, reasoning_effort, outcome,
         tokens_in_uncached, tokens_in_cache_read, tokens_in_cache_write,
         tokens_in_cache_write_5m, tokens_in_cache_write_1h,
         tokens_out_text, tokens_out_reasoning, tokens_out_combined,
         total_input_context)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(event_key) DO NOTHING`),
+    boundary: database.prepare(`
+      INSERT INTO usage_event_boundary(
+        current_event_key, compaction_before, turn_context_before,
+        compacted_at_ms, ingest_run_id, parser_version_id, session_local)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(current_event_key) DO NOTHING`),
     toolClass: database.prepare(`
       INSERT INTO tool_class_count(session_local, tool_class, count)
       VALUES (?, ?, ?)
@@ -662,6 +758,18 @@ export function createUnifiedIndexWriter(database, {
         carry_total_reasoning = excluded.carry_total_reasoning,
         carry_total_total = excluded.carry_total_total,
         ingest_run_id = excluded.ingest_run_id`),
+    sourceBoundary: database.prepare(`
+      INSERT INTO source_boundary_state(
+        source_local, compacted_at_ms, source_offset, turn_context_pending,
+        ingest_run_id)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(source_local) DO UPDATE SET
+        compacted_at_ms = excluded.compacted_at_ms,
+        source_offset = excluded.source_offset,
+        turn_context_pending = excluded.turn_context_pending,
+        ingest_run_id = excluded.ingest_run_id`),
+    deleteSourceBoundary: database.prepare(`
+      DELETE FROM source_boundary_state WHERE source_local = ?`),
     lineageSnapshot: database.prepare(`
       INSERT INTO lineage_snapshot(session_local, snapshot_local)
       VALUES (?, ?) ON CONFLICT DO NOTHING`),
@@ -682,11 +790,13 @@ export function createUnifiedIndexWriter(database, {
   const tierIds = new Map();
   const surfaceIds = new Map();
   const accountScopeIds = new Map();
+  const sourceIds = new Map();
   const quotaIds = new Map();
 
   let open = false;
   let pending = 0;
   let usageRows = 0;
+  let boundaryRows = 0;
   let toolRows = 0;
   let batches = 0;
 
@@ -806,6 +916,18 @@ export function createUnifiedIndexWriter(database, {
     return id;
   }
 
+  function internSource(sourceLocalKey) {
+    const sourceBlob = Buffer.from(sourceLocalKey);
+    const key = sourceBlob.toString("base64");
+    const cached = sourceIds.get(key);
+    if (cached !== undefined) return cached;
+    begin();
+    statements.sourceDimension.run(sourceBlob);
+    const id = Number(statements.selectSourceDimension.get(sourceBlob).id);
+    sourceIds.set(key, id);
+    return id;
+  }
+
   function internQuota(observation) {
     // The cache key is the whole observation, not just its uniqueness key.
     // Caching on the uniqueness key alone would let the first arrival suppress
@@ -841,6 +963,7 @@ export function createUnifiedIndexWriter(database, {
 
   return {
     get usageRows() { return usageRows; },
+    get boundaryRows() { return boundaryRows; },
     get toolRows() { return toolRows; },
     get batches() { return batches; },
     ingestRunId,
@@ -849,6 +972,7 @@ export function createUnifiedIndexWriter(database, {
     internTier,
     internSurface,
     internAccountScope,
+    internSource,
     internQuota,
     internParserVersion,
 
@@ -861,6 +985,8 @@ export function createUnifiedIndexWriter(database, {
         event.partial
           ? internParserVersion(LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION)
           : defaultParserVersionId,
+        event.sourceId ?? null,
+        event.sourceOffset ?? null,
         event.sessionLocal,
         event.accountScopeId,
         event.modelId,
@@ -881,6 +1007,23 @@ export function createUnifiedIndexWriter(database, {
       );
       const inserted = Number(changes.changes ?? 0);
       usageRows += inserted;
+      step();
+      return inserted;
+    },
+
+    writeUsageEventBoundary(event) {
+      begin();
+      const changes = statements.boundary.run(
+        event.currentEventKey,
+        event.compactionBefore ? 1 : 0,
+        event.turnContextBefore ? 1 : 0,
+        event.compactedAtMs ?? null,
+        ingestRunId,
+        defaultParserVersionId,
+        event.sessionLocal,
+      );
+      const inserted = Number(changes.changes ?? 0);
+      boundaryRows += inserted;
       step();
       return inserted;
     },
@@ -915,6 +1058,19 @@ export function createUnifiedIndexWriter(database, {
         cursor.carryTotals?.total_tokens ?? null,
         ingestRunId,
       );
+      if ((cursor.compactionPending === null
+            || cursor.compactionPending === undefined)
+          && cursor.turnContextPending !== true) {
+        statements.deleteSourceBoundary.run(cursor.sourceLocal);
+      } else {
+        statements.sourceBoundary.run(
+          cursor.sourceLocal,
+          cursor.compactionPending?.observedAtMs ?? null,
+          cursor.compactionPending?.sourceOffset ?? null,
+          cursor.turnContextPending ? 1 : 0,
+          ingestRunId,
+        );
+      }
       step();
     },
 
@@ -970,7 +1126,7 @@ export function createUnifiedIndexWriter(database, {
         await chmod(fsyncPath, 0o600);
         await syncFile(fsyncPath);
       }
-      return { usageRows, toolRows, batches };
+      return { usageRows, boundaryRows, toolRows, batches };
     },
   };
 }

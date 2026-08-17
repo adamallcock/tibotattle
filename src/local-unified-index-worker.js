@@ -61,12 +61,14 @@ async function run() {
           ? null
           : finalBySessionId.get(source.parentId) ?? null;
         let events = [];
+        let boundaries = [];
         let snapshotKeys = [];
         const flush = (rolloutKey, final, diagnostics, cursor = null) => {
           parentPort.postMessage({
             type: "batch",
             rolloutKey,
             events,
+            boundaries,
             // Snapshot keys collected for descendants — "|"-joined token
             // counters, nothing that can hold content. The host persists them
             // so a later incremental ingest can answer for this ancestor.
@@ -76,6 +78,7 @@ async function run() {
             cursor,
           });
           events = [];
+          boundaries = [];
           snapshotKeys = [];
         };
         const collector = snapshots.collectorFor(source);
@@ -97,7 +100,15 @@ async function run() {
           ...(maximumLineBytes === undefined ? {} : { maximumLineBytes }),
           onEvent: (event) => {
             events.push(event);
-            if (events.length >= BATCH_EVENTS) flush(source.rolloutKey, false, null);
+            if (events.length + boundaries.length >= BATCH_EVENTS) {
+              flush(source.rolloutKey, false, null);
+            }
+          },
+          onBoundary: (event) => {
+            boundaries.push(event);
+            if (events.length + boundaries.length >= BATCH_EVENTS) {
+              flush(source.rolloutKey, false, null);
+            }
           },
         });
         if (source.sessionId) {
@@ -112,6 +123,7 @@ async function run() {
           malformedLines: outcome.diagnostics.malformedLines,
           partialLines: outcome.diagnostics.partialLines,
           salvagedRecords: outcome.diagnostics.salvagedRecords,
+          compactionEvents: outcome.diagnostics.compactionEvents,
           forkReplayEventsSkipped: outcome.diagnostics.forkReplayEventsSkipped,
           unattributedForkReplayEventsSkipped:
             outcome.diagnostics.unattributedForkReplayEventsSkipped,
@@ -127,6 +139,8 @@ async function run() {
           finalTierRaw: ownObservedTier(outcome.finalTier)?.providerTierRaw ?? null,
           finalTierObservedAtMs: ownObservedTier(outcome.finalTier)?.observedAtMs ?? null,
           finalTotals: outcome.finalTotals,
+          finalCompactionPending: outcome.finalCompactionPending,
+          finalTurnContextPending: outcome.finalTurnContextPending,
           turnContextSeen: outcome.finalTurnContextSeen,
           snapshotsPersisted: collector !== null,
         });
