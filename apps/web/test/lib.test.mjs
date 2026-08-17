@@ -2018,6 +2018,72 @@ test("web timeline quota normalization accepts documented plan types and fails c
   assert.equal(invalid.timeline.quota[0].planType, "unknown");
 });
 
+test("web timeline expands the compact weighted tuple and rejects encoding drift", () => {
+  const encoding = {
+    schemaVersion: "quota-weighted-timeline-v0.1",
+    basisFamilyId:
+      "codex_primary:quota_weighted_api_equivalent:v1:fast_rates_2026_08_01:event_time:observed_declared_scenario",
+    scenarioOrder: [
+      "unresolved_as_standard",
+      "unresolved_as_fast"
+    ],
+    selectedScenario: "unresolved_as_standard"
+  };
+  const row = {
+    startAt: "2026-08-03T12:00:00.000Z",
+    endAt: "2026-08-03T12:15:00.000Z",
+    usageEvents: 2,
+    totalTokens: 200,
+    apiPriceEquivalentUsd: 10,
+    // Two eight-cell scenario blocks: status, weighted USD, covered USD,
+    // observed, declared, assumed, inferred, unresolved.
+    allowanceWeighting: [
+      0, 10, 10, 0, 0, 2, 0, 0,
+      0, 25, 25, 0, 0, 2, 0, 0
+    ]
+  };
+  const normalized = normalizeDashboardPayload({
+    timeline: {
+      allowanceWeightingEncoding: encoding,
+      usage: [row]
+    }
+  });
+  assert.equal(normalized.timeline.usage.length, 1);
+  assert.equal(
+    normalized.timeline.usage[0].allowanceWeighting.selectedUsd,
+    10
+  );
+  assert.equal(
+    normalized.timeline.usage[0].allowanceWeighting.scenarios
+      .unresolved_as_fast.quotaWeightedUsd,
+    25
+  );
+  assert.equal(
+    normalized.timeline.usage[0].allowanceWeighting.scenarios
+      .unresolved_as_standard.coverage.assumedFromPreferenceEvents,
+    2
+  );
+
+  const malformedTuple = normalizeDashboardPayload({
+    timeline: {
+      allowanceWeightingEncoding: encoding,
+      usage: [{ ...row, allowanceWeighting: row.allowanceWeighting.slice(1) }]
+    }
+  });
+  assert.deepEqual(malformedTuple.timeline.usage, []);
+
+  const mismatchedEncoding = normalizeDashboardPayload({
+    timeline: {
+      allowanceWeightingEncoding: {
+        ...encoding,
+        scenarioOrder: [...encoding.scenarioOrder].reverse()
+      },
+      usage: [row]
+    }
+  });
+  assert.deepEqual(mismatchedEncoding.timeline.usage, []);
+});
+
 test("web quota normalization rejects malformed and out-of-range durations", () => {
   for (const durationMinutes of [
     0,
@@ -4941,7 +5007,7 @@ test("the weekly headline is a stable all-data median and says so on screen", as
     1,
     "the across-reset range never moves when a chart control moves",
   );
-  assert.equal(views[0].label, "All-data median estimate");
+  assert.equal(views[0].label, "Quota-weighted all-data median");
   assert.match(views[0].range, /all data/u, "the range names the population it summarizes");
   assert.equal(
     new Set(views.map((view) => view.explanation)).size,
@@ -5658,10 +5724,20 @@ test("weekly details keep reset evidence concise and do not present speed covera
   assert.doesNotMatch(appSource, /function renderWeeklyTrend|function renderWeeklyStats/u);
 });
 
-test("live timeline uses the primary Codex weekly track and live weekly median first", async () => {
+test("live timeline couples quota-weighted usage to the matching allowance capacity", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  assert.match(html, />Expected from quota-weighted API cost</u);
+  assert.doesNotMatch(html, />Expected from API cost</u);
+  assert.match(html, /id="usage-cost-legend-label">Quota-weighted API-equivalent usage</u);
+  assert.match(html, /id="usage-allowance-legend"/u);
+  assert.match(
+    appSource,
+    /\$\("#usage-cost-legend-label"\)[\s\S]*?chart\.series\.quotaWeightedUsage[\s\S]*?chart\.series\.standardApiUsage/u,
+  );
+  assert.match(appSource, /\$\("#usage-allowance-legend"\)\.hidden = !quotaComparable/u);
   const trackMatch = appSource.match(
-    /function mainWeeklyQuotaTrack\(rows\) \{([\s\S]*?)\n\}\n\nfunction liveTimelinePoints/u,
+    /function mainWeeklyQuotaTrack\(rows\) \{([\s\S]*?)\n\}/u,
   );
   assert.ok(trackMatch, "mainWeeklyQuotaTrack source is available for contract review");
   const trackSource = trackMatch[1];
@@ -5681,20 +5757,57 @@ test("live timeline uses the primary Codex weekly track and live weekly median f
   );
   assert.ok(liveMatch, "liveTimelinePoints source is available for contract review");
   const liveSource = liveMatch[1];
-  assert.match(
-    liveSource,
-    /data\.weekly\.summary\?\.median_weekly_value_usd[\s\S]*?\?\? data\.gradient\.summary\?\.capacity_usd/u,
+  const capacityMatch = appSource.match(
+    /function timelineCalibrationCapacity\(data\) \{([\s\S]*?)\n\}/u,
   );
+  assert.ok(capacityMatch, "timeline capacity source is available for contract review");
+  assert.match(
+    capacityMatch[1],
+    /data\?\.timeline\?\.allowanceCapacity[\s\S]*?capacity\?\.status !== "available"[\s\S]*?selected\.basisId/u,
+  );
+  assert.doesNotMatch(
+    capacityMatch[1],
+    /weekly\.summary|gradient\.summary|historicalGap/u,
+  );
+  assert.match(liveSource, /const capacitySelection = timelineCalibrationCapacity\(data\);/u);
   assert.match(liveSource, /const quota = mainWeeklyQuotaTrack\(data\.timeline\.quota\);/u);
+  assert.match(liveSource, /timelineAllowanceWeightedCost\(row, capacitySelection\)/u);
+  assert.match(liveSource, /capacitySelection\?\.basisId/u);
+  assert.doesNotMatch(liveSource, /current\.apiPriceEquivalentUsd/u);
   assert.doesNotMatch(liveSource, /weeklyQuota|: data\.timeline\.quota/u);
 
   const usageMatch = appSource.match(
-    /function usagePointsWithAllowance\(data, points\) \{([\s\S]*?)\n\}\n\nfunction renderUsageTimeline/u,
+    /function usagePointsWithAllowance\(data, points, includeAllowance\) \{([\s\S]*?)\n\}\n\nfunction usageGroupingsForRange/u,
   );
   assert.ok(usageMatch, "usage allowance source is available for contract review");
   const usageSource = usageMatch[1];
   assert.match(usageSource, /const quota = mainWeeklyQuotaTrack\(data\.timeline\.quota\);/u);
+  assert.match(usageSource, /point\.quotaWeightedCostUsd !== null/u);
   assert.doesNotMatch(usageSource, /fallback|data\.timeline\.quota\.filter/u);
+
+  const groupedMatch = appSource.match(
+    /function groupedUsageTimeline\(data\) \{([\s\S]*?)\n\}\n\nfunction usagePointsWithAllowance/u,
+  );
+  assert.ok(groupedMatch, "grouped usage source is available for contract review");
+  assert.match(groupedMatch[1], /timelineAllowanceWeightedCost\(row, capacitySelection\)/u);
+  assert.doesNotMatch(groupedMatch[1], /group\.apiCostUsd \+= row\.apiPriceEquivalentUsd/u);
+
+  const totalMatch = appSource.match(
+    /function completeUsageTimelineTotal\(points, key\) \{[\s\S]*?\n\}/u,
+  );
+  assert.ok(totalMatch, "usage totals keep the chart's gap semantics");
+  const completeUsageTimelineTotal = new Function(
+    "finite",
+    `${totalMatch[0]}; return completeUsageTimelineTotal;`,
+  )(finite);
+  assert.equal(completeUsageTimelineTotal([
+    { quotaWeightedCostUsd: 10 },
+    { quotaWeightedCostUsd: 25 },
+  ], "quotaWeightedCostUsd"), 35);
+  assert.equal(completeUsageTimelineTotal([
+    { quotaWeightedCostUsd: 10 },
+    { quotaWeightedCostUsd: null },
+  ], "quotaWeightedCostUsd"), null);
 
   const quotaCardsMatch = appSource.match(
     /function renderQuotaCards\(data\) \{([\s\S]*?)\n\}\n\nfunction renderPricing/u,
@@ -8149,13 +8262,46 @@ test("the inspection list keeps every row and restarts paging when the selection
 // change, plus the signed-AUC "Cumulative drift" stat beside MAE and peak.
 // ---------------------------------------------------------------------------
 
+const TEST_ALLOWANCE_BASIS_FAMILY =
+  "codex_primary:quota_weighted_api_equivalent:v1:fast_rates_2026_08_01:event_time:observed_declared_scenario";
+const testAllowanceBasisId = (scenario) =>
+  `${TEST_ALLOWANCE_BASIS_FAMILY}:${scenario}`;
+const testAllowanceWeighting = (selectedUsd, { available = true } = {}) => ({
+  status: available ? "complete" : "unavailable",
+  basisFamilyId: TEST_ALLOWANCE_BASIS_FAMILY,
+  selectedScenario: available ? "unresolved_as_fast" : null,
+  selectedUsd: available ? selectedUsd : null,
+  scenarios: {
+    unresolved_as_standard: {
+      basisId: testAllowanceBasisId("unresolved_as_standard"),
+      quotaWeightedUsd: available ? selectedUsd : null,
+    },
+    unresolved_as_fast: {
+      basisId: testAllowanceBasisId("unresolved_as_fast"),
+      quotaWeightedUsd: available ? selectedUsd : null,
+    },
+  },
+  rangeUsd: null,
+});
+const testAllowanceCapacity = (medianCapacityUsd = 1_000) => ({
+  status: "available",
+  basisFamilyId: TEST_ALLOWANCE_BASIS_FAMILY,
+  selectedScenario: "unresolved_as_fast",
+  scenarios: {
+    unresolved_as_fast: {
+      basisId: testAllowanceBasisId("unresolved_as_fast"),
+      medianCapacityUsd,
+    },
+  },
+});
+
 async function loadLiveTimelinePoints() {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const start = appSource.indexOf("function mainWeeklyQuotaTrack(rows) {");
   const end = appSource.indexOf("\nfunction groupedUsageTimeline(");
   assert.ok(start >= 0 && end > start, "liveTimelinePoints is available");
   const section = appSource.slice(start, end);
-  return Function(
+  const liveTimelinePoints = Function(
     "finite",
     "timelineCutoffMs",
     "createQuotaTimelineLookup",
@@ -8173,6 +8319,30 @@ async function loadLiveTimelinePoints() {
     3,
     36_500,
   );
+  // Existing lifecycle tests predate the weighted DTO. Give those fixtures a
+  // matching basis by default, while tests that exercise a mismatch provide
+  // their own explicit weighting/capacity.
+  return (data, options) => {
+    const legacyCapacity = finite(
+      data?.weekly?.summary?.blended_capacity_usd
+        ?? data?.weekly?.summary?.median_weekly_value_usd
+        ?? data?.gradient?.summary?.capacity_usd,
+      1_000,
+    );
+    return liveTimelinePoints({
+      ...data,
+      timeline: {
+        ...data.timeline,
+        allowanceCapacity: data.timeline.allowanceCapacity
+          ?? testAllowanceCapacity(legacyCapacity),
+        usage: data.timeline.usage.map((row) => ({
+          ...row,
+          allowanceWeighting: row.allowanceWeighting
+            ?? testAllowanceWeighting(row.apiPriceEquivalentUsd),
+        })),
+      },
+    }, options);
+  };
 }
 
 test("cumulative drift sums non-overlapping buckets and re-anchors at each reset boundary", async () => {
@@ -8196,7 +8366,10 @@ test("cumulative drift sums non-overlapping buckets and re-anchors at each reset
       usage: Array.from({ length: 9 }, (_, index) => ({
         startAt: hour(index),
         endAt: hour(index + 1),
-        apiPriceEquivalentUsd: 50,
+        // Standard cost deliberately differs: every allowance-facing result
+        // below must use the quota-weighted $50 instead of this $20.
+        apiPriceEquivalentUsd: 20,
+        allowanceWeighting: testAllowanceWeighting(50),
         usageEvents: 5,
       })),
       quota: [
@@ -8221,6 +8394,47 @@ test("cumulative drift sums non-overlapping buckets and re-anchors at each reset
     points.map((point) => point.cumulativeResidual),
     [0, 7, 4, 0, -4, -9, -14, -19, null],
   );
+  // The first comparable window is recovered forward from hour 1, so this
+  // point legitimately spans two weighted buckets rather than the nominal
+  // three-hour window.
+  assert.equal(points[2].measuredSpanMs, 2 * 60 * 60 * 1_000);
+  assert.equal(points[2].allowanceWeightedUsd, 100);
+});
+
+test("an unweightable bucket creates a red-line gap instead of falling back to Standard cost", async () => {
+  const liveTimelinePoints = await loadLiveTimelinePoints();
+  const hour = (index) => new Date(Date.UTC(2026, 7, 5, index)).toISOString();
+  const data = {
+    timeline: {
+      allowanceCapacity: testAllowanceCapacity(),
+      usage: [
+        {
+          startAt: hour(0),
+          endAt: hour(1),
+          usageEvents: 1,
+          apiPriceEquivalentUsd: 20,
+          allowanceWeighting: testAllowanceWeighting(50),
+        },
+        {
+          startAt: hour(1),
+          endAt: hour(2),
+          usageEvents: 1,
+          apiPriceEquivalentUsd: 20,
+          allowanceWeighting: testAllowanceWeighting(null, {
+            available: false,
+          }),
+        },
+      ],
+      quota: [],
+    },
+  };
+  const points = liveTimelinePoints(data);
+  assert.equal(points[0].expected, 5);
+  assert.equal(points[0].allowanceWeightedUsd, 50);
+  assert.equal(points[1].expected, null);
+  assert.equal(points[1].allowanceWeightedUsd, null);
+  assert.equal(points[1].status, "quota_weighting_unavailable");
+  assert.notEqual(points[0].apiCostUsd, 20);
 });
 
 test("a single stale quota dip suspends one drift point instead of re-anchoring", async () => {
@@ -8600,10 +8814,11 @@ test("the signed AUC stat integrates observed-minus-expected trapezoids over hou
     (value, digits = 0) => Number(value).toFixed(digits),
   );
   const base = Date.UTC(2026, 7, 5, 0);
-  const point = (hours, observed, expected) => ({
+  const point = (hours, observed, expected, residualSegment = 1) => ({
     timestampMs: base + hours * 3_600_000,
     observed,
     expected,
+    residualSegment,
   });
   // Two hours between residuals of +1 and +3 pp integrates to +4 pp·h — the
   // exact trapezoid buildRollingResidual uses for the artifact summary.
@@ -8614,6 +8829,13 @@ test("the signed AUC stat integrates observed-minus-expected trapezoids over hou
   // A backwards or zero-length gap contributes nothing rather than NaN.
   assert.equal(
     scope.signedResidualAucPpHours([point(0, 2, 1), point(0, 4, 1)]),
+    0,
+  );
+  assert.equal(
+    scope.signedResidualAucPpHours([
+      point(0, 2, 1, 1),
+      point(2, 4, 1, 2),
+    ]),
     0,
   );
   assert.equal(scope.signedResidualAucPpHours([point(0, 2, 1)]), null);

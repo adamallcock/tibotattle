@@ -976,7 +976,14 @@ function candidateSummary(candidate, resets) {
   };
 }
 
-export function analyzeWeeklyCalibration(dataset, { priorWindow = 3 } = {}) {
+export function analyzeWeeklyCalibration(
+  dataset,
+  { priorWindow = 3, forcedCandidateId = null } = {},
+) {
+  if (forcedCandidateId !== null
+      && !CANDIDATES.some((candidate) => candidate.id === forcedCandidateId)) {
+    throw new TypeError("Unknown forced weekly calibration candidate");
+  }
   const grouped = selectResetGroups(dataset.transitions ?? []);
   const resetFits = grouped.selected.map((group) => {
     const first = group.first;
@@ -1012,7 +1019,10 @@ export function analyzeWeeklyCalibration(dataset, { priorWindow = 3 } = {}) {
   eligibleCandidates.sort((left, right) => left.medianResetHoldoutMaePp - right.medianResetHoldoutMaePp
     || left.pooledHoldoutMaePp - right.pooledHoldoutMaePp
     || CANDIDATES.findIndex((item) => item.id === left.id) - CANDIDATES.findIndex((item) => item.id === right.id));
-  const selectedCandidate = eligibleCandidates[0] ?? candidates.find((candidate) => candidate.id === "standard_api");
+  const selectedCandidate = forcedCandidateId === null
+    ? eligibleCandidates[0]
+      ?? candidates.find((candidate) => candidate.id === "standard_api")
+    : candidates.find((candidate) => candidate.id === forcedCandidateId);
   const selectedId = selectedCandidate?.id ?? "standard_api";
 
   const rows = resetFits
@@ -1140,7 +1150,10 @@ export function analyzeWeeklyCalibration(dataset, { priorWindow = 3 } = {}) {
     selection: {
       selectedCandidateId: selectedId,
       selectedCandidateLabel: selectedCandidate?.label ?? selectedId,
-      rule: "lowest median reset-level chronological holdout MAE; pooled MAE breaks ties",
+      rule: forcedCandidateId === null
+        ? "lowest median reset-level chronological holdout MAE; pooled MAE breaks ties"
+        : "owner-selected allowance scenario fitted independently with the same reset and no-look-ahead machinery",
+      forcedCandidateId,
       candidateMinimumResets: 3,
       candidateScores: candidates,
       standardBaselineImprovement: comparableStandard ? {

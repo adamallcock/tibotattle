@@ -474,6 +474,21 @@ test("projects replay-safe diagnostics and aggregates costs, dimensions, and 15-
     ],
   );
   assert.equal(cache.timeline[2].apiPriceEquivalentUsd, 53);
+  assert.equal(
+    Object.values(cache.timeline[2].speedWeighting)
+      .flatMap((families) => Object.values(families))
+      .reduce((total, cell) => total + cell.events, 0),
+    cache.timeline[2].usageEvents,
+  );
+  assert.equal(
+    Object.values(cache.timeline[2].speedWeighting)
+      .flatMap((families) => Object.values(families))
+      .reduce(
+        (total, cell) => total + cell.apiPriceEquivalentUsd,
+        0,
+      ),
+    cache.timeline[2].apiPriceEquivalentUsd,
+  );
   // Re-pinned (2026-08-08): the input receipt now names its corpus source and
   // covered span, so full-history unified sourcing is distinguishable from
   // the windowed fallback.
@@ -712,6 +727,7 @@ test("the same lineage-aware scan produces a bounded weekly calibration summary"
           if (boundary > 0) {
             onUsage(usageEvent({
               timestamp: new Date(observedMs).toISOString(),
+              speed: "unknown",
               components: {
                 input_uncached_tokens:
                   1_000_000 + resetIndex * 100_000,
@@ -751,6 +767,44 @@ test("the same lineage-aware scan produces a bounded weekly calibration summary"
   assert.equal(cache.weeklyCalibration.status, "estimated");
   assert.equal(cache.weeklyCalibration.estimate.qualifyingResets, 3);
   assert.equal(cache.weeklyCalibration.recentResets.length, 3);
+  const standardCapacity = cache.allowanceCapacityByScenario.scenarios
+    .unresolved_as_standard;
+  const fastCapacity = cache.allowanceCapacityByScenario.scenarios
+    .unresolved_as_fast;
+  assert.equal(
+    cache.allowanceCapacityByScenario.schemaVersion,
+    "codex-primary-allowance-capacity-v0.1",
+  );
+  assert.equal(
+    standardCapacity.basis.basisFamilyId,
+    fastCapacity.basis.basisFamilyId,
+  );
+  assert.notEqual(standardCapacity.basis.basisId, fastCapacity.basis.basisId);
+  assert.equal(
+    standardCapacity.basis.unresolvedScenario,
+    "unresolved_as_standard",
+  );
+  assert.equal(fastCapacity.basis.unresolvedScenario, "unresolved_as_fast");
+  assert.equal(
+    standardCapacity.basis.multiplierRegistryRecordedAt,
+    "2026-08-01",
+  );
+  assert.equal(
+    standardCapacity.calibration.validation.selectedCostBasis,
+    "speed_lower",
+  );
+  assert.equal(
+    fastCapacity.calibration.validation.selectedCostBasis,
+    "speed_upper",
+  );
+  assert.equal(standardCapacity.calibration.status, "estimated");
+  assert.equal(fastCapacity.calibration.status, "estimated");
+  assert.equal(
+    Number((fastCapacity.calibration.estimate.medianApiPriceEquivalentUsd
+      / standardCapacity.calibration.estimate.medianApiPriceEquivalentUsd)
+      .toFixed(6)),
+    2.5,
+  );
   assert.deepEqual(cache.weeklyCalibration.accountAttribution, {
     status: "historical_unattributed",
     maySpanMultipleAccounts: true,
@@ -2048,16 +2102,45 @@ test("exact retained quota points make an eligible comparison window testable", 
   ]]);
 });
 
-test("cache validation requires the bounded quota timeline so older cache shapes rebuild", async () => {
+test("cache validation requires weighted and bounded timeline evidence so older cache shapes rebuild", async () => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-quota-cache-"));
   const cacheFile = join(directory, "accounting.json");
   const cache = await refreshReplaySafeAccountingCache({
     cacheFile,
     now: () => NOW,
+    scan: scanner([usageEvent({
+      timestamp: new Date(NOW).toISOString(),
+      components: { input_uncached_tokens: 1_000 },
+    })]),
+  });
+  delete cache.timeline[0].speedWeighting;
+  await writeTestCache(cacheFile, cache);
+  assert.deepEqual(await readReplaySafeAccountingCache({ cacheFile }), {
+    status: "unavailable",
+    errorCode: "cache_invalid",
+    cache: null,
+  });
+
+  const withoutAllowanceCapacity = await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
     scan: scanner([]),
   });
-  delete cache.quotaTimeline;
-  await writeTestCache(cacheFile, cache);
+  delete withoutAllowanceCapacity.allowanceCapacityByScenario;
+  await writeTestCache(cacheFile, withoutAllowanceCapacity);
+  assert.deepEqual(await readReplaySafeAccountingCache({ cacheFile }), {
+    status: "unavailable",
+    errorCode: "cache_invalid",
+    cache: null,
+  });
+
+  const withoutQuota = await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
+    scan: scanner([]),
+  });
+  delete withoutQuota.quotaTimeline;
+  await writeTestCache(cacheFile, withoutQuota);
   assert.deepEqual(await readReplaySafeAccountingCache({ cacheFile }), {
     status: "unavailable",
     errorCode: "cache_invalid",
