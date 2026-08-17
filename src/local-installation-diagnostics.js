@@ -162,6 +162,42 @@ export function localCompanionStatePaths(stateRoot) {
       selected,
       "local-unified-index-device-salt-v1",
     ),
+    // Claude Desktop plan quota is intentionally outside the Codex collector
+    // database. Its source/account pseudonyms use a distinct owner-only key,
+    // so neither product's local identity namespace can be joined to the
+    // other by accident.
+    claudeDesktopQuotaStateFile: join(
+      selected,
+      "claude-desktop-quota-state-v1.sqlite",
+    ),
+    claudeDesktopQuotaSecretFile: join(
+      selected,
+      "claude-desktop-quota-state-v1-secret",
+    ),
+    // Reserved, provider-isolated paths for the opt-in development shadow.
+    // Merely resolving installation paths never creates these files; the
+    // installed companion leaves shadow usage disabled until a reviewed
+    // caller explicitly enables it.
+    claudeDesktopShadowCanonicalFile: join(
+      selected,
+      "claude-desktop-shadow-canonical-v1.sqlite",
+    ),
+    claudeDesktopShadowLedgerFile: join(
+      selected,
+      "claude-desktop-shadow-ledger-v1.sqlite",
+    ),
+    claudeDesktopShadowStateFile: join(
+      selected,
+      "claude-desktop-shadow-state-v1.sqlite",
+    ),
+    claudeDesktopShadowSecretFile: join(
+      selected,
+      "claude-desktop-shadow-state-v1-secret",
+    ),
+    claudeDesktopPricingCacheFile: join(
+      selected,
+      "claude-desktop-pricing-cache-v1.sqlite",
+    ),
     accountObservationLockFile: join(
       selected,
       "account-observation-operation.lock",

@@ -320,6 +320,18 @@ test("local refresh requests a bounded recent index and returns only safe progre
 test("local refresh routes collector, credential lock, and accounting writes beneath explicit state", async () => {
   const stateRoot = await mkdtemp(join(tmpdir(), "local-refresh-state-"));
   const paths = localCompanionStatePaths(stateRoot);
+  assert.equal(paths.claudeDesktopShadowCanonicalFile.startsWith(stateRoot), true);
+  assert.equal(paths.claudeDesktopShadowLedgerFile.startsWith(stateRoot), true);
+  assert.equal(paths.claudeDesktopShadowStateFile.startsWith(stateRoot), true);
+  assert.equal(paths.claudeDesktopShadowSecretFile.startsWith(stateRoot), true);
+  assert.equal(paths.claudeDesktopPricingCacheFile.startsWith(stateRoot), true);
+  assert.equal(new Set([
+    paths.claudeDesktopQuotaStateFile,
+    paths.claudeDesktopShadowCanonicalFile,
+    paths.claudeDesktopShadowLedgerFile,
+    paths.claudeDesktopShadowStateFile,
+    paths.claudeDesktopPricingCacheFile,
+  ]).size, 5);
   let collectorOptions;
   let selectionOptions;
   try {
@@ -2229,4 +2241,179 @@ test("a failing diagnostics writer is contained and cannot become a write storm"
   nowMs += 5 * 60_000;
   assert.equal(await record(failure), false);
   assert.equal(attempts, 1);
+});
+
+test("Claude quota refresh runs independently beside the Codex collector", async () => {
+  let releaseCollector;
+  const collectorGate = new Promise((resolve) => { releaseCollector = resolve; });
+  let markClaudeStarted;
+  const claudeStarted = new Promise((resolve) => { markClaudeStarted = resolve; });
+  let claudeOptions;
+  const runner = createLocalCollectorRefreshRunner({
+    selectAccountObservationSecret: () => ({ loadAccountObservationSecret: null }),
+    runCollector: async () => {
+      await collectorGate;
+      return {
+        rolloutRecordsWritten: 0,
+        filesDiscovered: 0,
+        refresh: { attempted: false, recordWritten: false, errorCode: null },
+      };
+    },
+    refreshClaudeQuota: async (options) => {
+      claudeOptions = options;
+      markClaudeStarted();
+      return {
+        provider: "anthropic_claude_code",
+        authority: "claude_desktop_plan_history",
+        status: "available",
+        source: { status: "present", lastSuccessAtMs: 1784895000000 },
+        freshness: "fresh",
+        coverage: { state: "complete", gapCount: 0 },
+        counts: { observations: 8, points: 7, accounts: 2, meters: 4, unknownMeters: 1 },
+        windows: [{
+          meterId: "five_hour",
+          utilizationPercent: 3,
+          remainingPercent: 97,
+          observedAtMs: 1784894520000,
+          resetsAtMs: null,
+          windowDurationMinutes: 300,
+        }],
+      };
+    },
+  });
+
+  const running = runner({ signal: null });
+  await claudeStarted;
+  assert.deepEqual(Object.keys(claudeOptions), ["signal"]);
+  releaseCollector();
+  const result = await running;
+  assert.equal(result.claudeQuota.status, "available");
+  assert.equal(result.claudeQuota.counts.unknownMeters, 1);
+  assert.equal(result.claudeQuota.includesContent, false);
+  assert.equal(result.claudeQuota.includesPaths, false);
+  assert.equal(result.claudeQuota.includesIdentifiers, false);
+  assert.equal(JSON.stringify(result.claudeQuota).includes("sourceKey"), false);
+});
+
+test("Claude quota failure cannot fail or leak into the Codex refresh", async () => {
+  const privateCanary = "/Users/private/Claude/plan-usage-history.json";
+  const runner = createLocalCollectorRefreshRunner({
+    selectAccountObservationSecret: () => ({ loadAccountObservationSecret: null }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 2,
+      filesDiscovered: 1,
+      refresh: { attempted: true, recordWritten: true, errorCode: null },
+    }),
+    refreshClaudeQuota: async () => {
+      throw new Error(privateCanary);
+    },
+  });
+  const result = await runner();
+  assert.equal(result.rolloutRecordsWritten, 2);
+  assert.deepEqual(result.claudeQuota, {
+    schemaVersion: "local-claude-quota-v0.1",
+    provider: "anthropic_claude_code",
+    authority: "claude_desktop_plan_history",
+    status: "failed",
+    errorCode: "claude_quota_refresh_failed",
+    includesContent: false,
+    includesPaths: false,
+    includesIdentifiers: false,
+  });
+  assert.equal(JSON.stringify(result).includes(privateCanary), false);
+});
+
+test("an aborted refresh does not wait for a non-cooperating Claude quota callback", async () => {
+  const controller = new AbortController();
+  let markClaudeStarted;
+  const claudeStarted = new Promise((resolve) => { markClaudeStarted = resolve; });
+  const runner = createLocalCollectorRefreshRunner({
+    selectAccountObservationSecret: () => ({ loadAccountObservationSecret: null }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 0,
+      filesDiscovered: 0,
+      refresh: { attempted: false, recordWritten: false, errorCode: null },
+    }),
+    refreshClaudeQuota: async () => {
+      markClaudeStarted();
+      return new Promise(() => {});
+    },
+  });
+  const running = runner({ signal: controller.signal });
+  await claudeStarted;
+  controller.abort();
+  const result = await running;
+  assert.equal(result.claudeQuota.status, "failed");
+  assert.equal(result.claudeQuota.errorCode, "claude_quota_refresh_failed");
+});
+
+test("Claude usage shadow runs independently without becoming a public refresh field", async () => {
+  let releaseCollector;
+  const collectorGate = new Promise((resolve) => { releaseCollector = resolve; });
+  let markShadowStarted;
+  const shadowStarted = new Promise((resolve) => { markShadowStarted = resolve; });
+  let shadowOptions;
+  const runner = createLocalCollectorRefreshRunner({
+    selectAccountObservationSecret: () => ({ loadAccountObservationSecret: null }),
+    runCollector: async () => {
+      await collectorGate;
+      return {
+        rolloutRecordsWritten: 0,
+        filesDiscovered: 0,
+        refresh: { attempted: false, recordWritten: false, errorCode: null },
+      };
+    },
+    refreshClaudeUsageShadow: async (options) => {
+      shadowOptions = options;
+      markShadowStarted();
+      return {
+        status: "completed",
+        privateCanary: "/Users/private/.claude/projects/secret.jsonl",
+      };
+    },
+  });
+
+  const running = runner();
+  await shadowStarted;
+  assert.deepEqual(Object.keys(shadowOptions), ["signal"]);
+  releaseCollector();
+  const result = await running;
+  assert.equal(Object.hasOwn(result, "claudeShadow"), false);
+  assert.equal(JSON.stringify(result).includes("privateCanary"), false);
+  assert.equal(JSON.stringify(result).includes("secret.jsonl"), false);
+});
+
+test("Claude usage shadow failure is contained and abort releases a non-cooperating callback", async () => {
+  const baseOptions = {
+    selectAccountObservationSecret: () => ({ loadAccountObservationSecret: null }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 1,
+      filesDiscovered: 1,
+      refresh: { attempted: true, recordWritten: true, errorCode: null },
+    }),
+  };
+  const failed = createLocalCollectorRefreshRunner({
+    ...baseOptions,
+    refreshClaudeUsageShadow: async () => {
+      throw new Error("private shadow failure");
+    },
+  });
+  assert.equal((await failed()).rolloutRecordsWritten, 1);
+
+  const controller = new AbortController();
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const hanging = createLocalCollectorRefreshRunner({
+    ...baseOptions,
+    refreshClaudeUsageShadow: async () => {
+      markStarted();
+      return new Promise(() => {});
+    },
+  });
+  const running = hanging({ signal: controller.signal });
+  await started;
+  controller.abort();
+  const result = await running;
+  assert.equal(result.rolloutRecordsWritten, 1);
+  assert.equal(Object.hasOwn(result, "claudeShadow"), false);
 });

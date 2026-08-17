@@ -51,7 +51,18 @@ import {
   createDeferredAccountingRebuildRecorder,
   createLocalCollectorRefreshRunner,
   createTerminalRefreshFailureRecorder,
+  publicClaudeQuotaResult,
 } from "../../src/local-companion-refresh.js";
+import {
+  readOrCreateClaudeDesktopQuotaSecret,
+  refreshClaudeDesktopQuota,
+} from "../../src/claude-desktop-quota-refresh.js";
+import {
+  readClaudeDesktopQuotaProjection,
+} from "../../src/claude-desktop-quota-state.js";
+import {
+  createClaudeDesktopShadowController,
+} from "../../src/claude-desktop-shadow-controller.js";
 import {
   inspectExactNextContributionSyncUpload,
   inspectContributionSyncQueue,
@@ -327,6 +338,7 @@ const API_ROUTES = new Set([
   "/api/local/diagnostics/note",
   "/api/local/onboarding",
   "/api/local/overview",
+  "/api/local/claude/quota",
   "/api/local/gradient",
   "/api/local/weekly",
   "/api/local/quality",
@@ -354,12 +366,13 @@ const API_ROUTES = new Set([
   "/api/local/accounting/fast-mode-preference",
 ]);
 
-// The two routes that must answer while the first snapshot is still being
-// built: readiness, and the channel used to report that a start went wrong.
-// Everything else in API_ROUTES reads the snapshot and waits for it.
+// Routes that do not read the Codex dashboard snapshot must answer while that
+// snapshot is still being built (or even if it fails): readiness, diagnostics,
+// and the separately persisted native Claude quota projection.
 const SNAPSHOT_INDEPENDENT_API_ROUTES = new Set([
   "/api/local/health",
   "/api/local/diagnostics/note",
+  "/api/local/claude/quota",
 ]);
 
 
@@ -1953,9 +1966,54 @@ function configuredHomeDirectory(environment) {
   const selected = process.platform === "win32"
     ? environment.USERPROFILE
     : environment.HOME;
-  return typeof selected === "string" && selected.length > 0
-    ? selected
-    : homedir();
+  if (typeof selected === "string" && selected.length > 0
+      && isAbsolute(selected) && resolve(selected) === selected) {
+    return selected;
+  }
+  const fallback = homedir();
+  if (!isAbsolute(fallback) || resolve(fallback) !== fallback) {
+    throw new TypeError("Home directory is invalid");
+  }
+  return fallback;
+}
+
+/**
+ * Resolve the Claude roots independently from the installed dashboard
+ * resources.  `CLAUDE_CONFIG_DIR` is a provider path configuration, not a
+ * feature toggle; shadow collection remains controlled only by the explicit
+ * programmatic `claudeShadowEnabled` option below.  Claude Code exposes
+ * `CLAUDE_PROJECT_DIR` to its own hooks; the longer directory spelling is
+ * accepted as a companion-launcher override for callers that do not inherit
+ * the hook environment.
+ */
+export function resolveClaudeDesktopShadowConfiguration({
+  options = {},
+  environment = process.env,
+  fallbackProjectDirectory = process.cwd(),
+} = {}) {
+  if (!options || typeof options !== "object" || Array.isArray(options)
+      || !environment || typeof environment !== "object"
+      || Array.isArray(environment)) {
+    throw new TypeError("Claude shadow path configuration is invalid");
+  }
+  const configCandidate = Object.hasOwn(options, "claudeConfigDirectory")
+    ? options.claudeConfigDirectory
+    : Object.hasOwn(environment, "CLAUDE_CONFIG_DIR")
+      ? environment.CLAUDE_CONFIG_DIR
+      : undefined;
+  const projectCandidate = Object.hasOwn(options, "claudeProjectDirectory")
+    ? options.claudeProjectDirectory
+    : Object.hasOwn(environment, "CLAUDE_PROJECT_DIR")
+      ? environment.CLAUDE_PROJECT_DIR
+      : Object.hasOwn(environment, "CLAUDE_PROJECT_DIRECTORY")
+        ? environment.CLAUDE_PROJECT_DIRECTORY
+        : fallbackProjectDirectory;
+  return Object.freeze({
+    claudeConfigDirectory: configCandidate === undefined
+      ? undefined
+      : assertLocalAbsolutePath(configCandidate),
+    claudeProjectDirectory: assertLocalAbsolutePath(projectCandidate),
+  });
 }
 
 function parentWatchdogConfigurationError() {
@@ -2051,6 +2109,25 @@ export function createLocalCompanionServer(options = {}) {
   }
   const parentWatchdogPid = configuredParentWatchdogPid(environment);
   const homeDirectory = configuredHomeDirectory(environment);
+  // A malformed provider path must not make the ordinary disabled companion
+  // fail before it can serve Codex. Resolve and validate Claude roots only
+  // for the explicit programmatic shadow opt-in; the disabled controller can
+  // safely carry the raw values without reading or touching them.
+  const claudeShadowConfiguration = options.claudeShadowEnabled === true
+    ? resolveClaudeDesktopShadowConfiguration({
+      options,
+      environment,
+    })
+    : Object.freeze({
+      claudeConfigDirectory: Object.hasOwn(options, "claudeConfigDirectory")
+        ? options.claudeConfigDirectory
+        : environment.CLAUDE_CONFIG_DIR,
+      claudeProjectDirectory: Object.hasOwn(options, "claudeProjectDirectory")
+        ? options.claudeProjectDirectory
+        : environment.CLAUDE_PROJECT_DIR
+          ?? environment.CLAUDE_PROJECT_DIRECTORY
+          ?? process.cwd(),
+    });
   const resourceRoot = options.resourceRoot
     ?? environment.USAGE_MONITOR_RESOURCE_ROOT
     ?? options.root
@@ -2150,6 +2227,8 @@ export function createLocalCompanionServer(options = {}) {
     preparedContributionDirectory,
     contributionPreparationOptions: selectedPreparationOptions,
     parentWatchdogPid,
+    homeDirectory,
+    ...claudeShadowConfiguration,
   });
 }
 
@@ -2160,6 +2239,9 @@ function createPreparedLocalCompanionServer({
   statePaths,
   staticRoot,
   codexHome,
+  homeDirectory,
+  claudeConfigDirectory,
+  claudeProjectDirectory,
   diagnosticsLogFile,
   parentWatchdogPid,
   fastModePreference = createFastModePreferenceController({
@@ -2203,12 +2285,45 @@ function createPreparedLocalCompanionServer({
     fromMs,
     toMs,
   }),
+  claudeQuotaProvider = () => readClaudeDesktopQuotaProjection(
+    statePaths.claudeDesktopQuotaStateFile,
+  ),
+  // This is a programmatic, development-only gate: no environment variable,
+  // settings control, route, or UI surface enables Claude usage collection.
+  // A caller must explicitly opt into the production-shaped local shadow.
+  claudeShadowEnabled = false,
+  claudeShadowControllerFactory = createClaudeDesktopShadowController,
+  claudeShadowController = claudeShadowControllerFactory({
+    enabled: claudeShadowEnabled,
+    stateRoot,
+    homeDirectory,
+    projectDirectory: claudeProjectDirectory,
+    claudeConfigDirectory,
+  }),
   refreshRunner = createLocalCollectorRefreshRunner({
     codexHome,
     stateFile: statePaths.collectorStateFile,
     accountObservationOperationLockFile:
       statePaths.accountObservationLockFile,
     refreshAccounting: refreshReplaySafeAccountingCache,
+    refreshClaudeQuota: async ({ signal }) => {
+      const secret = await readOrCreateClaudeDesktopQuotaSecret(
+        statePaths.claudeDesktopQuotaSecretFile,
+      );
+      try {
+        return await refreshClaudeDesktopQuota({
+          statePath: statePaths.claudeDesktopQuotaStateFile,
+          homeDirectory,
+          secret,
+          signal,
+        });
+      } finally {
+        secret.fill(0);
+      }
+    },
+    refreshClaudeUsageShadow: claudeShadowEnabled
+      ? ({ signal }) => claudeShadowController.refresh({ signal })
+      : null,
     refreshArchiveIndex: refreshLocalArchiveAccountingIndex,
     archiveIndexFile: statePaths.archiveAccountingIndexFile,
     archiveIndexSecretFile: statePaths.archiveAccountingIndexSecretFile,
@@ -2278,6 +2393,12 @@ function createPreparedLocalCompanionServer({
   }
   if (typeof onboardingProvider !== "function") {
     throw new TypeError("onboardingProvider must be a function");
+  }
+  if (typeof claudeShadowEnabled !== "boolean"
+      || typeof claudeShadowControllerFactory !== "function"
+      || !claudeShadowController
+      || typeof claudeShadowController.refresh !== "function") {
+    throw new TypeError("Claude shadow controller configuration is invalid");
   }
   if (typeof contributionPreviewProvider !== "function") {
     throw new TypeError("contributionPreviewProvider must be a function");
@@ -3018,6 +3139,7 @@ function createPreparedLocalCompanionServer({
           remoteUploadEnabled: false,
           capabilities: {
             localDashboard: true,
+            claudeDesktopQuota: true,
             explicitRefresh: true,
             contributionPreview: true,
             contributionPreparation: true,
@@ -3081,6 +3203,22 @@ function createPreparedLocalCompanionServer({
           return;
         }
         send(response, 200, dataStore.getOverview());
+        return;
+      }
+      if (path === "/api/local/claude/quota") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        let quota = null;
+        try {
+          quota = await claudeQuotaProvider();
+        } catch {
+          // The route never carries filesystem diagnostics. A missing,
+          // inaccessible, or invalid local state collapses to the same closed
+          // content-free projection as a malformed injected provider.
+        }
+        send(response, 200, publicClaudeQuotaResult(quota));
         return;
       }
       if (path === "/api/local/gradient") {
