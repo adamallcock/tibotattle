@@ -79,19 +79,26 @@ export async function* readBoundedUtf8LineEntries(path, {
   const chunksInput = callerOwnedHandle ? {
     async *[Symbol.asyncIterator]() {
       let position = startByte;
+      const scratch = Buffer.allocUnsafe(highWaterMark);
       while (position < maximumTotalBytes) {
         throwIfAborted(signal);
         const remaining = maximumTotalBytes === Number.POSITIVE_INFINITY
           ? highWaterMark
           : Math.min(highWaterMark, maximumTotalBytes - position);
-        const buffer = Buffer.allocUnsafe(remaining);
-        const { bytesRead } = await path.read(buffer, 0, remaining, position);
+        const { bytesRead } = await path.read(scratch, 0, remaining, position);
         if (bytesRead === 0) break;
         position += bytesRead;
-        yield bytesRead === buffer.length ? buffer : buffer.subarray(0, bytesRead);
+        // The same scratch allocation is reused on the next read. The consumer
+        // copies only an unterminated trailing segment that must survive that
+        // boundary; complete lines decode synchronously before reuse.
+        yield { chunk: scratch.subarray(0, bytesRead), reused: true };
       }
     },
-  } : input;
+  } : {
+    async *[Symbol.asyncIterator]() {
+      for await (const chunk of input) yield { chunk, reused: false };
+    },
+  };
   let chunks = [];
   let lineBytes = 0;
   let oversized = false;
@@ -116,7 +123,7 @@ export async function* readBoundedUtf8LineEntries(path, {
     searchTail = tailBytes === 0 ? Buffer.alloc(0) : Buffer.from(searchable.subarray(searchable.length - tailBytes));
   }
 
-  function append(segment) {
+  function append(segment, { retainAcrossRead = false } = {}) {
     if (segment.length === 0) return;
     lineBytes += segment.length;
     if (oversized) {
@@ -134,7 +141,7 @@ export async function* readBoundedUtf8LineEntries(path, {
       chunks = [];
       return;
     }
-    chunks.push(segment);
+    chunks.push(retainAcrossRead ? Buffer.from(segment) : segment);
   }
 
   function completeLine(endByteExclusive) {
@@ -152,13 +159,13 @@ export async function* readBoundedUtf8LineEntries(path, {
       return { ...entry, line: null };
     }
     resourceGuard?.observeLine(lineBytes);
-    const line = Buffer.concat(chunks, lineBytes).toString("utf8");
+    const line = (chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, lineBytes)).toString("utf8");
     chunks = [];
     lineBytes = 0;
     return { ...entry, line: line.endsWith("\r") ? line.slice(0, -1) : line };
   }
 
-  for await (const chunk of chunksInput) {
+  for await (const { chunk, reused } of chunksInput) {
     throwIfAborted(signal);
     resourceGuard?.checkRuntime();
     if (absoluteOffset + chunk.length > maximumTotalBytes) {
@@ -174,7 +181,7 @@ export async function* readBoundedUtf8LineEntries(path, {
       start = index + 1;
       index = chunk.indexOf(0x0a, start);
     }
-    append(chunk.subarray(start));
+    append(chunk.subarray(start), { retainAcrossRead: reused });
     absoluteOffset += chunk.length;
   }
   if (lineBytes > 0) yield completeLine(absoluteOffset);

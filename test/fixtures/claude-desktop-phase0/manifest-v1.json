@@ -1,0 +1,21 @@
+{
+  "schemaVersion": "claude-desktop-phase0-fixture-manifest-v0.1",
+  "files": [
+    {
+      "name": "desktop-corpus-v1.json",
+      "sha256": "c6883656364ce686263f88fe2b43b4a00d13ddde902d8a50ec3e59d65d0be0c7"
+    },
+    {
+      "name": "ledger-lifecycle-v1.json",
+      "sha256": "eafd8c97571da3732eaf706c1c39816ae0827b6bae82d7ad2a504cf50625b57a"
+    },
+    {
+      "name": "quota-history-v2.json",
+      "sha256": "139ffe6af066fb4fe9e4808bfee1f2f69947a61b064c233bf6acea2abf997982"
+    },
+    {
+      "name": "retention-cases-v1.json",
+      "sha256": "cf16102a261a52ab9a057e9a4c5ee0b3e7694da621aaa29ff3fcceff0f801787"
+    }
+  ]
+}

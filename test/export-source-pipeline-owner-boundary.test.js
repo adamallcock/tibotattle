@@ -56,7 +56,9 @@ const LEGACY = Object.freeze({
   "claude-transcript-export-source": ["claudeTranscriptExport", [
     "CLAUDE_TRANSCRIPT_SOURCE_CURSOR_VERSION", "CLAUDE_TRANSCRIPT_SOURCE_PLAN_VERSION",
     "CLAUDE_TRANSCRIPT_USAGE_CANDIDATE_VERSION", "ClaudeTranscriptExportSourceError",
-    "createClaudeTranscriptExportCursor", "createClaudeTranscriptExportSourcePlan", "defaultClaudeProjectsDirectory",
+    "createClaudeTranscriptExportCursor", "createClaudeTranscriptExportPlanCheckpoint",
+    "createClaudeTranscriptExportSourcePlan", "defaultClaudeProjectsDirectory",
+    "minimizeClaudeTranscriptCanonicalOccurrence", "restoreClaudeTranscriptExportSourcePlan",
     "scanClaudeTranscriptExportSource", "sliceClaudeTranscriptExportSourcePlan",
     "sliceClaudeTranscriptExportSourcePlans", "summarizeClaudeTranscriptPlan",
     "verifyClaudeTranscriptExportSource",

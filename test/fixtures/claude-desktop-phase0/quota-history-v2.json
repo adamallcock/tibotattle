@@ -1,0 +1,38 @@
+{
+  "version": 2,
+  "samples": [
+    {
+      "t": 1784894400000,
+      "org": "fixture-organization-a",
+      "u": {
+        "fh": 12.5,
+        "sd": 34,
+        "xu": 0
+      }
+    },
+    {
+      "t": 1784894460000,
+      "org": "fixture-organization-a",
+      "u": {
+        "fh": 17,
+        "future_meter": 9
+      }
+    },
+    {
+      "t": 1784894460000,
+      "org": "fixture-organization-a",
+      "u": {
+        "fh": 15,
+        "future_meter": 9
+      }
+    },
+    {
+      "t": 1784894520000,
+      "org": "fixture-organization-b",
+      "u": {
+        "fh": 3,
+        "sd": 8
+      }
+    }
+  ]
+}

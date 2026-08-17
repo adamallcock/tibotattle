@@ -1,0 +1,34 @@
+{
+  "schemaVersion": "claude-desktop-retention-cases-v0.1",
+  "cases": [
+    {
+      "name": "unset defaults to thirty",
+      "expectedDays": 30,
+      "expectedScope": "default"
+    },
+    {
+      "name": "local overrides project and user",
+      "user": 90,
+      "project": 60,
+      "local": 45,
+      "expectedDays": 45,
+      "expectedScope": "local"
+    },
+    {
+      "name": "managed overrides every writable scope",
+      "user": 90,
+      "project": 60,
+      "local": 45,
+      "managed": 14,
+      "expectedDays": 14,
+      "expectedScope": "managed"
+    },
+    {
+      "name": "invalid user value is disclosed without exposing settings",
+      "user": 0,
+      "expectedDays": 30,
+      "expectedScope": "default",
+      "invalidScope": "user"
+    }
+  ]
+}

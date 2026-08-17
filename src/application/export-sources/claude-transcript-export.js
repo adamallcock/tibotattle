@@ -1,5 +1,6 @@
 import { ExportResourceLimitError, stableJson } from "../../export/index.js";
 import { safeCount, validSha256 } from "./source-validation.js";
+import { parseClaudeTranscriptRecord } from "./claude-transcript-record.js";
 
 export function createClaudeTranscriptExportContext(configuration) {
 const {
@@ -27,6 +28,7 @@ const {
 const CLAUDE_TRANSCRIPT_SOURCE_PLAN_VERSION = "claude-transcript-export-source-plan-v0.2";
 const CLAUDE_TRANSCRIPT_SOURCE_CURSOR_VERSION = "claude-transcript-export-cursor-v0.2";
 const CLAUDE_TRANSCRIPT_USAGE_CANDIDATE_VERSION = "claude-transcript-usage-candidate-v0.2";
+const CLAUDE_TRANSCRIPT_PLAN_CHECKPOINT_VERSION = "claude-transcript-plan-checkpoint-v0.1";
 
 const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 const MAXIMUM_SESSION_ID_BYTES = 4096;
@@ -487,6 +489,70 @@ function mergeCanonicalRow(state, row, sourceKeyValue, lineOrdinal, secret, reso
   }
 }
 
+function minimizeClaudeTranscriptCanonicalOccurrence(line, sourceKeyValue, lineOrdinal, {
+  secret,
+} = {}) {
+  if (typeof line !== "string" || !validSha256(sourceKeyValue)
+      || !Number.isSafeInteger(lineOrdinal) || lineOrdinal < 1) fail("configuration");
+  const key = normalizeSecret(secret);
+  try {
+    let record;
+    try { record = parseClaudeTranscriptRecord(line); } catch { fail("record_invalid"); }
+    const row = rowIdentity(record, key);
+    if (!row) return null;
+    const messageKey = occurrenceMaterial(key, row.messageId);
+    const invariant = privateGroupingDigest(key, "invariant", stableJson({
+      sessionId: row.sessionId,
+      model: row.model,
+      scope: row.scope,
+      inputUncachedTokens: row.inputUncachedTokens,
+      inputCacheReadTokens: row.inputCacheReadTokens,
+      inputCacheWriteTokens: row.inputCacheWriteTokens,
+    }));
+    const selected = {
+      timestamp: row.timestamp,
+      outputCombinedTokens: row.outputCombinedTokens,
+      costEventOutputTokens: row.costEventOutputTokens,
+      hasIterationBreakdown: row.hasIterationBreakdown,
+      sourceKey: sourceKeyValue,
+      lineOrdinal,
+      costEventCount: row.costEvents.length,
+      costStructureSha256: row.costStructureSha256,
+    };
+    const tools = new Map();
+    for (const block of row.content) {
+      if (!block || typeof block !== "object" || Array.isArray(block) || block.type !== "tool_use") continue;
+      if (typeof block.id !== "string" || block.id.length < 1
+          || bufferByteLength(block.id, "utf8") > MAXIMUM_SESSION_ID_BYTES) fail("record_invalid");
+      const category = classifyTool(block.name);
+      const toolKey = privateGroupingDigest(key, "tool", block.id);
+      const prior = tools.get(toolKey);
+      if (prior !== undefined && prior !== category) fail("record_invalid");
+      tools.set(toolKey, category);
+    }
+    const toolClassCounts = emptyToolCounts();
+    for (const category of tools.values()) toolClassCounts[category] += 1;
+    const candidates = classifyAssistantRecords(record, {
+      lineOrdinal,
+      occurrenceMaterial: messageKey,
+      costEventCount: selected.costEventCount,
+      costStructureSha256: selected.costStructureSha256,
+      toolClassCounts,
+    }, key);
+    return {
+      messageKey,
+      invariant,
+      topLevelInvariant: row.hasIterationBreakdown ? null : row.costInvariantSha256,
+      iterationInvariant: row.hasIterationBreakdown ? row.costInvariantSha256 : null,
+      selected,
+      tools: [...tools].map(([toolKey, category]) => ({ toolKey, category })),
+      candidates,
+    };
+  } finally {
+    key.fill(0);
+  }
+}
+
 async function canonicalSelections(sources, bounds, secret, resourceGuard) {
   const state = { groups: new Map(), retainedToolKeys: 0 };
   const prefixLineCounts = new Map(sources.map((source) => [source.sourceKey, 0]));
@@ -506,7 +572,7 @@ async function canonicalSelections(sources, bounds, secret, resourceGuard) {
           prefixLineCounts.set(source.sourceKey, entry.lineOrdinal);
           if (entry.line === null || entry.line.trim() === "") continue;
           let record;
-          try { record = JSON.parse(entry.line); } catch { fail("record_invalid"); }
+          try { record = parseClaudeTranscriptRecord(entry.line); } catch { fail("record_invalid"); }
           const row = rowIdentity(record, secret);
           if (row) mergeCanonicalRow(state, row, source.sourceKey, entry.lineOrdinal, secret, resourceGuard);
         }
@@ -540,14 +606,36 @@ async function canonicalSelections(sources, bounds, secret, resourceGuard) {
 
 async function createClaudeTranscriptExportSourcePlan({
   projectsDirectory = defaultClaudeProjectsDirectory(), startAt, endAt, secret, resourceGuard,
+  selectedSourcePaths = null,
 } = {}) {
-  if (!resourceGuard?.limits) fail("configuration");
+  if (!resourceGuard?.limits || (selectedSourcePaths !== null
+      && (!Array.isArray(selectedSourcePaths)
+        || selectedSourcePaths.some((path) => typeof path !== "string" || path.length === 0)))) {
+    fail("configuration");
+  }
   const bounds = normalizeBounds(startAt, endAt);
   resourceGuard.assertCoveredInterval(bounds.startMs, bounds.endMs);
   const key = normalizeSecret(secret);
   try {
     const root = await verifyRootDirectory(projectsDirectory);
-    const paths = await discoverJsonl(root, resourceGuard);
+    const discoveredPaths = await discoverJsonl(root, resourceGuard);
+    let paths = discoveredPaths;
+    if (selectedSourcePaths !== null) {
+      let selectedRealPaths;
+      try {
+        selectedRealPaths = await Promise.all(selectedSourcePaths.map((path) => realpath(resolve(path))));
+      } catch {
+        fail("source_changed");
+      }
+      const selectedSet = new Set(selectedRealPaths);
+      const rootPrefix = `${root}${platform === "win32" ? "\\" : "/"}`;
+      if (selectedSet.size !== selectedSourcePaths.length
+          || [...selectedSet].some((path) => path !== root && !path.startsWith(rootPrefix))) {
+        fail("configuration");
+      }
+      paths = discoveredPaths.filter((path) => selectedSet.has(path));
+      if (paths.length !== selectedSet.size) fail("source_changed");
+    }
     const selected = [];
     let totalBytes = 0;
     for (const path of paths) {
@@ -623,6 +711,99 @@ function createClaudeTranscriptExportCursor(plan, sourceKeyValue, { secret } = {
       nextLineOrdinal: 1,
       nextCostOrdinal: 0,
     };
+  } finally {
+    key.fill(0);
+  }
+}
+
+function createClaudeTranscriptExportPlanCheckpoint(plan, { secret } = {}) {
+  const key = normalizeSecret(secret);
+  try {
+    assertPlan(plan, key);
+    return Object.freeze({
+      schemaVersion: CLAUDE_TRANSCRIPT_PLAN_CHECKPOINT_VERSION,
+      sourcePlanVersion: CLAUDE_TRANSCRIPT_SOURCE_PLAN_VERSION,
+      startAt: plan.startAt,
+      endAt: plan.endAt,
+      sources: Object.freeze(publicPlanRows(plan.sources).map((source) => Object.freeze({
+        ...source,
+        selections: Object.freeze(plan.sources[source.ordinal].selections.map((selection) => Object.freeze({
+          ...selection,
+          toolClassCounts: Object.freeze({ ...selection.toolClassCounts }),
+        }))),
+      }))),
+      sourceCount: plan.sourceCount,
+      totalBytes: plan.totalBytes,
+      planSha256: plan.planSha256,
+    });
+  } finally {
+    key.fill(0);
+  }
+}
+
+async function restoreClaudeTranscriptExportSourcePlan(checkpoint, {
+  projectsDirectory = defaultClaudeProjectsDirectory(), selectedSourcePaths, secret,
+} = {}) {
+  if (!checkpoint || typeof checkpoint !== "object" || Array.isArray(checkpoint)
+      || checkpoint.schemaVersion !== CLAUDE_TRANSCRIPT_PLAN_CHECKPOINT_VERSION
+      || checkpoint.sourcePlanVersion !== CLAUDE_TRANSCRIPT_SOURCE_PLAN_VERSION
+      || !Array.isArray(checkpoint.sources) || !Array.isArray(selectedSourcePaths)
+      || checkpoint.sources.length !== selectedSourcePaths.length) fail("plan_invalid");
+  const key = normalizeSecret(secret);
+  try {
+    const root = await verifyRootDirectory(projectsDirectory);
+    let paths;
+    try {
+      paths = await Promise.all(selectedSourcePaths.map((path) => realpath(resolve(path))));
+    } catch {
+      fail("source_changed");
+    }
+    const unique = new Set(paths);
+    const rootPrefix = `${root}${platform === "win32" ? "\\" : "/"}`;
+    if (unique.size !== paths.length || paths.some((path) => (
+      (path !== root && !path.startsWith(rootPrefix)) || !path.endsWith(".jsonl")
+    ))) fail("configuration");
+    const pathBySourceKey = new Map();
+    for (const path of paths) {
+      const { handle, stats } = await openSafeFile(path);
+      try {
+        const keyValue = sourceKey(key, path, stats);
+        if (pathBySourceKey.has(keyValue)) fail("plan_invalid");
+        pathBySourceKey.set(keyValue, path);
+      } finally {
+        await handle.close().catch(() => {});
+      }
+    }
+    const sources = checkpoint.sources.map((source) => ({
+      ...source,
+      path: pathBySourceKey.get(source.sourceKey),
+      selections: source.selections?.map((selection) => ({
+        ...selection,
+        toolClassCounts: { ...selection.toolClassCounts },
+      })),
+    }));
+    if (sources.some((source) => typeof source.path !== "string")) fail("source_changed");
+    const plan = {
+      schemaVersion: CLAUDE_TRANSCRIPT_SOURCE_PLAN_VERSION,
+      startAt: checkpoint.startAt,
+      endAt: checkpoint.endAt,
+      rootDirectory: root,
+      sources,
+      sourceCount: checkpoint.sourceCount,
+      totalBytes: checkpoint.totalBytes,
+      planSha256: checkpoint.planSha256,
+    };
+    assertPlan(plan, key);
+    return Object.freeze({
+      ...plan,
+      sources: Object.freeze(sources.map((source) => Object.freeze({
+        ...source,
+        selections: Object.freeze(source.selections.map((selection) => Object.freeze({
+          ...selection,
+          toolClassCounts: Object.freeze({ ...selection.toolClassCounts }),
+        }))),
+      }))),
+    });
   } finally {
     key.fill(0);
   }
@@ -860,7 +1041,7 @@ async function scanClaudeTranscriptExportSource(plan, sourceKeyValue, {
         }
         let record;
         try {
-          record = JSON.parse(entry.line);
+          record = parseClaudeTranscriptRecord(entry.line);
         } catch {
           fail("record_invalid");
         }
@@ -920,9 +1101,12 @@ return Object.freeze({
   CLAUDE_TRANSCRIPT_USAGE_CANDIDATE_VERSION,
   ClaudeTranscriptExportSourceError,
   createClaudeTranscriptExportCursor,
+  createClaudeTranscriptExportPlanCheckpoint,
   createClaudeTranscriptExportSourcePlan,
   defaultClaudeProjectsDirectory,
+  minimizeClaudeTranscriptCanonicalOccurrence,
   scanClaudeTranscriptExportSource,
+  restoreClaudeTranscriptExportSourcePlan,
   sliceClaudeTranscriptExportSourcePlan,
   sliceClaudeTranscriptExportSourcePlans,
   summarizeClaudeTranscriptPlan,
