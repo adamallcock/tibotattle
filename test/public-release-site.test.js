@@ -26,6 +26,10 @@ import { SPARKLE_VERSION } from "../scripts/macos-updater-core.js";
 import {
   collectMacOSWebModuleGraph,
 } from "../scripts/build-macos-app.js";
+import {
+  PUBLIC_RELEASE_MANIFEST_SCHEMA,
+  PUBLIC_RELEASE_SOURCE_PROVENANCE_SCHEMA,
+} from "../scripts/public-release-provenance.js";
 
 const PNG_SIGNATURE = Buffer.from([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
@@ -402,8 +406,25 @@ test("release-site build verifies artifacts and materializes complete public met
   const manifest = JSON.parse(manifestText);
   assert.equal(
     manifest.schemaVersion,
-    "usage-monitor-release-site-manifest-v0.2",
+    PUBLIC_RELEASE_MANIFEST_SCHEMA,
   );
+  assert.equal(
+    manifest.source.schemaVersion,
+    PUBLIC_RELEASE_SOURCE_PROVENANCE_SCHEMA,
+  );
+  assert.equal(manifest.source.repositoryCommit, null);
+  assert.equal(manifest.source.root, null);
+  assert.equal(
+    manifest.source.files.some(({ path }) => path === "community.html"),
+    true,
+  );
+  assert.equal(
+    manifest.source.files.some(({ path }) => path === "community.js"),
+    true,
+  );
+  assert.match(manifest.source.sha256, /^[a-f0-9]{64}$/u);
+  assert.doesNotMatch(manifestText, /a{40}/u);
+  assert.deepEqual(result.source, manifest.source);
   assert.equal(manifest.installer.minimumMacos, "13.0");
   assert.equal(manifest.site.robots.policy, "allow_all");
   assert.deepEqual(
@@ -1031,7 +1052,7 @@ test("release-site build never replaces an existing output without explicit scop
     JSON.parse(
       await readFile(join(value.output, "release-site-manifest.json"), "utf8"),
     ).schemaVersion,
-    "usage-monitor-release-site-manifest-v0.2",
+    PUBLIC_RELEASE_MANIFEST_SCHEMA,
   );
 });
 

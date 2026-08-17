@@ -103,6 +103,12 @@ notability requirements.
 ## 6. Rebuild the website + deploy the worker  ← THE STEP MISSED ON 0.1.11
 The site the worker serves is **pre-built** with the installer version/SHA **baked at build time** — a `wrangler deploy` alone leaves the site on the *old* version and does NOT ship web-code changes (this is what showed 0.1.1 and dropped the community band on the 0.1.11 launch). Rebuild it FIRST.
 
+For a public-site-only change that deliberately reuses the already released
+macOS artifact, use [`2026-08-17-web-only-release.md`](2026-08-17-web-only-release.md)
+instead. It rejects client/runtime/migration/configuration changes and binds
+the generated site to a clean, reviewable candidate. This section remains the
+full macOS-release path.
+
 **CRITICAL — `env.production` serves a DIFFERENT dir than the top-level config.** Per `apps/worker/wrangler.jsonc`: top-level + `env.staging` = `.release-build/worker-assets`, but **`env.production` = `.release-build/public-release-site`**. For a production release you MUST rebuild **`public-release-site`** (rebuilding `worker-assets` deploys nothing to prod). Verify the target with:
 `python3 -c "import json,re;d=json.loads(re.sub(r'^\s*//.*$','',open('apps/worker/wrangler.jsonc').read(),flags=re.M));print(d['env']['production']['assets']['directory'])"`
 ```bash
@@ -119,10 +125,10 @@ npm run product:release-site -- \
   --privacy-url "https://tibotattle.com/privacy.html" \
   --security-url "https://tibotattle.com/docs.html" \
   --support-url "https://tibotattle.com/docs.html" \
-  --social-image "$PWD/.release-build/public-release-site/social-preview.png"
-cd apps/worker && npx wrangler deploy --env production && cd ../..
+  --social-image "$ABSOLUTE_1200X630_PNG_PATH"
+npm --prefix apps/worker run production:deploy -- --confirm DEPLOY_PRODUCTION
 ```
-Note: `--installer-path`/`--installer-release-manifest`/`--social-image`/`--output` must be **absolute**. Deploying the worker here also ships worker code changes and the rebuilt web assets. After deploy the live version may flip old↔new for ~2 min (edge propagation) then converges. No new D1 migrations unless you added one (`d1 migrations list … --remote` to check).
+Note: `--installer-path`/`--installer-release-manifest`/`--social-image`/`--output` must be **absolute**; the social-image input must sit outside the output directory. The guarded production command creates an immutable source snapshot, verifies the generated public closure and migration state, then deploys. Deploying here also ships worker code changes and the rebuilt web assets. After deploy the live version may flip old↔new for ~2 min (edge propagation) then converges. No new D1 migrations unless you added one (`d1 migrations list … --remote` to check). Never substitute raw `wrangler deploy` for the guarded command.
 
 ## 7. Go public + announce
 ```bash

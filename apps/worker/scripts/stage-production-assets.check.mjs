@@ -11,6 +11,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import {
+  createPublicReleaseSourceProvenance,
+  PUBLIC_RELEASE_MANIFEST_SCHEMA,
+} from "../../../scripts/public-release-provenance.js";
 import { stageProductionAssets } from "./stage-production-assets.mjs";
 
 function git(root, arguments_) {
@@ -22,8 +26,17 @@ function git(root, arguments_) {
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-worker-assets-"));
   const source = join(root, ".release-build", "public-release-site");
+  const publicSource = join(root, "apps", "web", "public");
   await mkdir(source, { recursive: true });
+  await mkdir(publicSource, { recursive: true });
   await writeFile(join(root, ".gitignore"), ".release-build/\n");
+  const publicSourceFiles = {
+    "community.html": '<!doctype html><script type="module" src="./community.js"></script>\n',
+    "community.js": "console.log('community source');\n",
+  };
+  for (const [path, contents] of Object.entries(publicSourceFiles)) {
+    await writeFile(join(publicSource, path), contents);
+  }
   const generatedFiles = {
     "404.html": "<!doctype html><title>public fallback</title>\n",
     "apple.svg": "<svg></svg>\n",
@@ -47,7 +60,7 @@ async function fixture() {
     "x.svg": "<svg></svg>\n",
   };
   const manifest = {
-    schemaVersion: "usage-monitor-release-site-manifest-v0.2",
+    schemaVersion: PUBLIC_RELEASE_MANIFEST_SCHEMA,
     files: [],
   };
   for (const [path, contents] of Object.entries(generatedFiles)) {
@@ -59,18 +72,24 @@ async function fixture() {
       sha256: createHash("sha256").update(bytes).digest("hex"),
     });
   }
+  git(root, ["init", "--quiet"]);
+  git(root, ["config", "user.email", "test@example.invalid"]);
+  git(root, ["config", "user.name", "Worker asset test"]);
+  git(root, ["add", ".gitignore", "apps"]);
+  git(root, ["commit", "--quiet", "-m", "fixture"]);
+  manifest.source = await createPublicReleaseSourceProvenance({
+    repositoryRoot: root,
+    sourceRoot: publicSource,
+    sourceFiles: Object.keys(publicSourceFiles).map((path) => join(publicSource, path)),
+  });
   await writeFile(
     join(source, "release-site-manifest.json"),
     `${JSON.stringify(manifest, null, 2)}\n`,
   );
-  git(root, ["init", "--quiet"]);
-  git(root, ["config", "user.email", "test@example.invalid"]);
-  git(root, ["config", "user.name", "Worker asset test"]);
-  git(root, ["add", ".gitignore"]);
-  git(root, ["commit", "--quiet", "-m", "fixture"]);
   return {
     root,
     source,
+    publicSource,
     destination: join(root, ".release-build", "worker-assets"),
     generatedFiles,
   };
@@ -190,4 +209,19 @@ test("stages only verified generated public assets and maps the community entry 
       withheld,
     );
   }
+
+  await writeFile(
+    join(value.publicSource, "community.js"),
+    "console.log('changed after site preparation');\n",
+  );
+  git(value.root, ["add", "apps/web/public/community.js"]);
+  git(value.root, ["commit", "--quiet", "-m", "changed candidate source"]);
+  await assert.rejects(
+    stageProductionAssets({
+      repositoryRoot: value.root,
+      sourceDirectory: value.source,
+      destinationDirectory: value.destination,
+    }),
+    /does not match the source snapshot/u,
+  );
 });

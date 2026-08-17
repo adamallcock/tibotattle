@@ -879,6 +879,7 @@ async function runProductionDeploymentFromSnapshot({
         ".release-build",
         "worker-assets",
       ),
+      expectedSourceCommit: sourceCommit,
       git: snapshotGit,
     });
   } catch {

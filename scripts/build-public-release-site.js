@@ -30,6 +30,10 @@ import {
   validateMacOSDMG,
   validateMacOSSignedReleaseArtifact,
 } from "./macos-release-core.js";
+import {
+  createPublicReleaseSourceProvenance,
+  PUBLIC_RELEASE_MANIFEST_SCHEMA,
+} from "./public-release-provenance.js";
 
 const REPOSITORY_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const DEFAULT_SOURCE = join(REPOSITORY_ROOT, "apps", "web", "public");
@@ -188,11 +192,12 @@ function usage() {
     "     --installer-url https://downloads.approved.example/UsageMonitor.dmg \\",
     "     --installer-version 1.2.3 \\",
     "     --installer-sha256 <64 lowercase hex> \\",
-    "     --minimum-macos 14.0 --architectures arm64] [--replace]",
+    "     --minimum-macos 14.0 --architectures arm64]",
+    "    [--replace]",
   ].join("\n");
 }
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const parsed = { replace: false, source: DEFAULT_SOURCE };
   const keys = {
     "--output": "output",
@@ -877,6 +882,11 @@ export async function buildPublicReleaseSite(rawArgs, {
     source: options.source,
     sourceHtml,
   });
+  const sourceProvenance = await createPublicReleaseSourceProvenance({
+    repositoryRoot: REPOSITORY_ROOT,
+    sourceRoot: options.source,
+    sourceFiles: [...new Set([sourceIndex, ...publicSourceFiles])],
+  });
   assertPublicClosureHasNoDashboardSource(options.source, publicSourceFiles);
   for (const sourceFile of publicSourceFiles) {
     const extension = extname(sourceFile).toLowerCase();
@@ -1053,7 +1063,8 @@ export async function buildPublicReleaseSite(rawArgs, {
     }
   }
   const manifest = {
-    schemaVersion: "usage-monitor-release-site-manifest-v0.2",
+    schemaVersion: PUBLIC_RELEASE_MANIFEST_SCHEMA,
+    source: sourceProvenance,
     site: {
       canonicalUrl: options.siteUrl,
       releaseNotesUrl: options.releaseNotesUrl,
@@ -1145,6 +1156,7 @@ export async function buildPublicReleaseSite(rawArgs, {
     output: options.output,
     site: manifest.site,
     installer: manifest.installer ?? null,
+    source: manifest.source,
     fileCount: manifest.files.length + 1,
   };
 }

@@ -33,6 +33,10 @@ import {
   recheckProductionPublicSurface,
 } from "./production-deploy.mjs";
 import { stageProductionAssets } from "./stage-production-assets.mjs";
+import {
+  createPublicReleaseSourceProvenance,
+  PUBLIC_RELEASE_MANIFEST_SCHEMA,
+} from "../../../scripts/public-release-provenance.js";
 
 const HEALTH_URL = `${DEPLOYMENT_ENDPOINTS.public.origin}/api/health`;
 const PUBLIC_ROOT_URL = `${DEPLOYMENT_ENDPOINTS.public.origin}/`;
@@ -58,12 +62,14 @@ async function immutableSnapshotFixture() {
     ".release-build",
     "public-release-site",
   );
+  const publicSourceDirectory = join(root, "apps", "web", "public");
   await mkdir(join(workerDirectory, "node_modules"), { recursive: true });
   await mkdir(join(workerDirectory, "migrations"), { recursive: true });
   await mkdir(join(workerDirectory, "deletion-ledger-migrations"), {
     recursive: true,
   });
   await mkdir(sourceDirectory, { recursive: true });
+  await mkdir(publicSourceDirectory, { recursive: true });
   await writeFile(
     join(root, ".gitignore"),
     ".release-build/\nnode_modules/\n",
@@ -81,13 +87,20 @@ async function immutableSnapshotFixture() {
     ),
     "CREATE TABLE fixture_ledger (id INTEGER PRIMARY KEY);\n",
   );
+  const publicSourceFiles = {
+    "community.html": '<!doctype html><script type="module" src="./community.js"></script>\n',
+    "community.js": "console.log('snapshot public source');\n",
+  };
+  for (const [path, contents] of Object.entries(publicSourceFiles)) {
+    await writeFile(join(publicSourceDirectory, path), contents);
+  }
 
   const generatedFiles = {
     "community.js": "console.log('snapshot community');\n",
     "index.html": '<script type="module" src="./community.js"></script>\n',
   };
   const manifest = {
-    schemaVersion: "usage-monitor-release-site-manifest-v0.2",
+    schemaVersion: PUBLIC_RELEASE_MANIFEST_SCHEMA,
     files: [],
   };
   for (const [path, contents] of Object.entries(generatedFiles)) {
@@ -99,11 +112,6 @@ async function immutableSnapshotFixture() {
       sha256: createHash("sha256").update(bytes).digest("hex"),
     });
   }
-  await writeFile(
-    join(sourceDirectory, "release-site-manifest.json"),
-    `${JSON.stringify(manifest, null, 2)}\n`,
-  );
-
   git(root, ["init", "--quiet"]);
   git(root, ["config", "user.email", "test@example.invalid"]);
   git(root, ["config", "user.name", "Production snapshot test"]);
@@ -113,14 +121,26 @@ async function immutableSnapshotFixture() {
     "apps/worker/wrangler.jsonc",
     "apps/worker/migrations",
     "apps/worker/deletion-ledger-migrations",
+    "apps/web/public",
   ]);
   git(root, ["commit", "--quiet", "-m", "fixture"]);
+  const sourceCommit = git(root, ["rev-parse", "HEAD"]).trim();
+  manifest.source = await createPublicReleaseSourceProvenance({
+    repositoryRoot: root,
+    sourceRoot: publicSourceDirectory,
+    sourceFiles: Object.keys(publicSourceFiles).map((path) =>
+      join(publicSourceDirectory, path)),
+  });
+  await writeFile(
+    join(sourceDirectory, "release-site-manifest.json"),
+    `${JSON.stringify(manifest, null, 2)}\n`,
+  );
   return {
     root,
     workerDirectory,
     sourceDirectory,
     generatedFiles,
-    sourceCommit: git(root, ["rev-parse", "HEAD"]).trim(),
+    sourceCommit,
   };
 }
 
@@ -321,6 +341,7 @@ test("production deployment creates a real top-level Git snapshot and passes the
     ".release-build",
     "public-release-site",
   ));
+  assert.equal(stageCalls[0].expectedSourceCommit, fixture.sourceCommit);
   assert.notEqual(stageCalls[0].repositoryRoot, join(fixture.root, "apps"));
   assert.equal(stagedIndex[0], fixture.generatedFiles["index.html"]);
   await assert.rejects(
