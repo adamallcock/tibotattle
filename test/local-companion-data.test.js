@@ -685,6 +685,14 @@ test("the stated speed mode attributes unrecorded evidence and never overrides a
       standard.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
       10,
     );
+    assert.equal(
+      standard.overview.timeline.usage[0].allowanceWeighting[1],
+      10,
+    );
+    assert.equal(
+      standard.overview.timeline.allowanceWeightingEncoding.selectedScenario,
+      "unresolved_as_standard",
+    );
 
     // Stating Fast weights only the event whose mode was not recorded; the
     // observed Standard event keeps its observed weight of one. GPT-5.4's
@@ -707,6 +715,18 @@ test("the stated speed mode attributes unrecorded evidence and never overrides a
     assert.deepEqual(fast.overview.accounting.fastMode.appliedMultipliers, {
       "gpt-5.4": 2,
     });
+    assert.equal(
+      fast.overview.timeline.usage[0].allowanceWeighting[9],
+      15,
+    );
+    assert.equal(
+      fast.overview.timeline.usage[0].allowanceWeighting[11],
+      1,
+    );
+    assert.equal(
+      fast.overview.timeline.usage[0].allowanceWeighting[13],
+      1,
+    );
 
     // Stating "not sure" leaves the unrecorded event explicitly unweighted
     // instead of quietly counting it at the Standard rate.
@@ -720,6 +740,12 @@ test("the stated speed mode attributes unrecorded evidence and never overrides a
       5,
     );
     assert.equal(mixed.overview.accounting.fastMode.weightingStatus, "partial");
+    assert.equal(
+      mixed.overview.timeline.allowanceWeightingEncoding.selectedScenario,
+      null,
+    );
+    assert.equal(mixed.overview.timeline.usage[0].allowanceWeighting[1], 10);
+    assert.equal(mixed.overview.timeline.usage[0].allowanceWeighting[9], 15);
     assert.equal(mixed.overview.accounting.fastMode.coverage.unknownEvents, 1);
     assert.equal(
       mixed.overview.accounting.fastMode.coverage.unknownSharePercent,
@@ -1145,7 +1171,10 @@ test("missing and malformed artifacts fail closed while collector evidence remai
     assert.equal(snapshot.gradient.status, "unavailable");
     assert.equal(snapshot.gradient.errorCode, "artifact_malformed");
     assert.equal(snapshot.weekly.status, "unavailable");
-    assert.equal(snapshot.weekly.errorCode, "artifact_missing");
+    assert.equal(
+      snapshot.weekly.errorCode,
+      "allowance_capacity_cache_unavailable",
+    );
     assert.equal(snapshot.reports.every((report) => report.status === "unavailable"), true);
     assert.equal(snapshot.overview.collector.indexingState, "not_started");
   } finally {
@@ -1262,12 +1291,10 @@ test("live weekly cache replaces the repo artifact and labels historical account
   }
 });
 
-// A model under the composition kernel's share floor holds no fitted column of
-// its own, so the capacity vector is silent about it and the calibration card
-// used to omit it entirely — a model the owner had actually used read as one
-// they never had. The fitted mix travels beside the vector so the card can name
-// it against the pooled remainder rate instead.
-test("the fitted mix reaches the card for models with no column of their own", async () => {
+// The diagnostic weekly fit remains Standard-priced. Until composition is
+// fitted independently on the selected quota-weighted basis, its vector must
+// not leak into an allowance-facing card whose scalar uses Fast weighting.
+test("the Standard diagnostic fitted mix does not leak into the weighted allowance card", async () => {
   const root = await fixtureRoot();
   const stateFile = join(root, ".usage-monitor", "local-collector-state-v1.sqlite");
   try {
@@ -1316,14 +1343,8 @@ test("the fitted mix reaches the card for models with no column of their own", a
     });
     const summary = snapshot.weekly.datasets.summary[0];
     assert.equal(snapshot.weekly.dataClass, "live_replay_safe_cache");
-    assert.deepEqual(summary.capacity_by_model, composition.capacityUsdByModel);
-    assert.deepEqual(summary.model_cost_shares, composition.modelCostShares);
-    // The vector alone cannot distinguish "never used" from "too small to fit".
-    assert.equal(
-      Object.hasOwn(summary.capacity_by_model, "gpt-5.6-luna"),
-      false,
-    );
-    assert.equal(summary.model_cost_shares["gpt-5.6-luna"], 0.002);
+    assert.equal(summary.capacity_by_model, null);
+    assert.equal(summary.model_cost_shares, null);
   } finally {
     await rm(root, { recursive: true });
   }
@@ -1372,7 +1393,7 @@ test("an out-of-range fitted-mix share fails closed like any other cache defect"
   }
 });
 
-test("malformed live weekly reset rows fail closed without crashing the dashboard", async () => {
+test("malformed selected allowance-capacity rows fail closed without crashing the dashboard", async () => {
   const root = await fixtureRoot();
   const stateFile = join(root, ".usage-monitor", "local-collector-state-v1.sqlite");
   try {
@@ -1390,7 +1411,8 @@ test("malformed live weekly reset rows fail closed without crashing the dashboar
       scan: async () => ({ diagnostics: {} }),
     });
     const cache = (await readLocalCollectorAccountingCache({ stateFile })).cache;
-    cache.weeklyCalibration.recentResets = [null];
+    cache.allowanceCapacityByScenario.scenarios
+      .unresolved_as_standard.calibration.recentResets = [null];
     await writeLocalCollectorAccountingCache({ stateFile, cache });
 
     const snapshot = await buildLocalCompanionSnapshot({

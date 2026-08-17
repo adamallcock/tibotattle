@@ -25,6 +25,44 @@ test("bounded weekly summary rejects malformed datasets", () => {
     () => projectBoundedWeeklyCalibrationSummary({ transitions: {} }),
     /Weekly calibration dataset is invalid/,
   );
+  assert.throws(
+    () => projectBoundedWeeklyCalibrationSummary(
+      { transitions: [] },
+      { forcedCandidateId: "hostile" },
+    ),
+    /Unknown forced weekly calibration candidate/,
+  );
+});
+
+test("bounded weekly summaries can pin each quota-weighted scenario", () => {
+  const reset = Math.floor(
+    Date.parse("2026-08-20T00:00:00.000Z") / 1_000,
+  );
+  const transitions = resetTransitions({ reset, capacityUsd: 800 }).map(
+    (row) => ({
+      ...row,
+      lastPriorCumulativeQuotaWeightedUpperUsd:
+        row.lastPriorCumulativeApiPricedUsd * 2.5,
+      firstNextCumulativeQuotaWeightedUpperUsd:
+        row.firstNextCumulativeApiPricedUsd * 2.5,
+    }),
+  );
+  const lower = projectBoundedWeeklyCalibrationSummary(
+    dataset(transitions),
+    { forcedCandidateId: "speed_lower" },
+  );
+  const upper = projectBoundedWeeklyCalibrationSummary(
+    dataset(transitions),
+    { forcedCandidateId: "speed_upper" },
+  );
+  assert.equal(lower.validation.selectedCostBasis, "speed_lower");
+  assert.equal(upper.validation.selectedCostBasis, "speed_upper");
+  assert.equal(lower.estimate.medianApiPriceEquivalentUsd, 800);
+  assert.equal(upper.estimate.medianApiPriceEquivalentUsd, 2_000);
+  assert.deepEqual(
+    lower.recentResets.map((row) => row.resetIdentity),
+    upper.recentResets.map((row) => row.resetIdentity),
+  );
 });
 
 test("bounded weekly summary embeds a defensive composition projection", () => {

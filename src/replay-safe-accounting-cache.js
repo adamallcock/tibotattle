@@ -34,6 +34,7 @@ import {
   priceCodexUsageEvent,
   APP_PRICE_REGISTRY_MANIFEST,
 } from "@app-usagemonitor/accounting";
+import { codexPrimaryAllowanceBasis } from "./codex-primary-allowance-basis.js";
 import {
   analyzeQuotaPace,
   blendedCompositionCapacityUsd,
@@ -82,8 +83,19 @@ import { fastQuotaMultiplier } from "./application/index.js";
 // `sparkQuotaTimeline` is empty against every capture to date; it is withheld
 // and rebuilt rather than served as evidence that no Spark quota history
 // exists.
+// v0.9 (2026-08-17): each 15-minute usage bucket retains a sparse observed and
+// declared speed/model-family crossing, and the cache carries independently
+// fitted unresolved-as-Standard and unresolved-as-Fast weekly capacities.
+// Allowance-facing readers can therefore couple every weighted numerator to a
+// denominator derived under the same scenario without replaying raw events.
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
-  "local-replay-safe-accounting-v0.8";
+  "local-replay-safe-accounting-v0.9";
+const ALLOWANCE_CAPACITY_SCHEMA_VERSION =
+  "codex-primary-allowance-capacity-v0.1";
+const ALLOWANCE_SCENARIO_CANDIDATES = Object.freeze({
+  unresolved_as_standard: "speed_lower",
+  unresolved_as_fast: "speed_upper",
+});
 
 const HISTORICAL_PRICE_EPOCH_BASIS =
   "event_time_when_registry_has_effective_evidence";
@@ -1250,6 +1262,25 @@ function finalizeSpeedWeighting(crossing) {
   ]));
 }
 
+function compactSpeedWeighting(crossing) {
+  // Timeline buckets overwhelmingly occupy one or two of the twelve possible
+  // speed/model-family cells. Persist only those cells; readers validate the
+  // allowed sparse keys and treat absence as an exact zero.
+  const compact = {};
+  for (const [speed, families] of Object.entries(crossing)) {
+    const selected = {};
+    for (const [family, cell] of Object.entries(families)) {
+      if (cell.events === 0 && cell.apiPriceEquivalentUsd === 0) continue;
+      selected[family] = {
+        events: cell.events,
+        apiPriceEquivalentUsd: roundedMoney(cell.apiPriceEquivalentUsd),
+      };
+    }
+    if (Object.keys(selected).length > 0) compact[speed] = selected;
+  }
+  return compact;
+}
+
 function addEvent(period, event) {
   if (event.isSpark) {
     addEvent(period.spark, { ...event, isSpark: false });
@@ -1486,6 +1517,8 @@ function newTimelineBucket(startMs) {
     usageEvents: 0,
     totalTokens: 0,
     apiPriceEquivalentUsd: 0,
+    speedWeighting: emptySpeedWeightingCrossing(),
+    declaredSpeedWeighting: emptySpeedWeightingCrossing(),
     components: emptyComponents(),
     pricingCoverage: {
       fullyPricedEvents: 0,
@@ -1504,6 +1537,8 @@ function addTimelineEvent(buckets, event) {
   bucket.usageEvents += 1;
   bucket.totalTokens += event.totalTokens;
   bucket.apiPriceEquivalentUsd += event.apiPriceEquivalentUsd;
+  addSpeedWeighting(bucket.speedWeighting, event);
+  addDeclaredSpeedWeighting(bucket.declaredSpeedWeighting, event);
   addComponents(bucket.components, event.components);
   bucket.pricingCoverage[
     event.pricingCoverageStatus === "fully_priced"
@@ -1524,6 +1559,10 @@ function finalizeTimeline(buckets) {
       usageEvents: bucket.usageEvents,
       totalTokens: bucket.totalTokens,
       apiPriceEquivalentUsd: roundedMoney(bucket.apiPriceEquivalentUsd),
+      speedWeighting: compactSpeedWeighting(bucket.speedWeighting),
+      declaredSpeedWeighting: compactSpeedWeighting(
+        bucket.declaredSpeedWeighting,
+      ),
       components: bucket.components,
       pricingCoverage: bucket.pricingCoverage,
     }));
@@ -2587,7 +2626,7 @@ export async function buildReplaySafeAccountingCache({
     }
     throw error;
   }
-  const weeklyCalibration = projectBoundedWeeklyCalibrationSummary({
+  const weeklyCalibrationDataset = {
     parserVersion: PARSER_VERSION,
     scope: {
       startAt: calibrationCoveredAt.startAt,
@@ -2602,7 +2641,11 @@ export async function buildReplaySafeAccountingCache({
         transitionSeries.deduplicatedSnapshotCount,
     },
     transitions: transitionSeries.transitions,
-  }, { composition });
+  };
+  const weeklyCalibration = projectBoundedWeeklyCalibrationSummary(
+    weeklyCalibrationDataset,
+    { composition },
+  );
   if (compositionFitFailure !== null) {
     // Additive v0.7 field, present only when the fit itself threw: a blank
     // composition caused by a failure must be distinguishable against a
@@ -2613,6 +2656,30 @@ export async function buildReplaySafeAccountingCache({
     // comments as an import specifier.)
     weeklyCalibration.compositionStatus = compositionFitFailure;
   }
+  const allowanceCapacityDataset = {
+    ...weeklyCalibrationDataset,
+    pricing: {
+      basis: "quota_weighted_api_equivalent_by_unresolved_speed_scenario",
+    },
+  };
+  const allowanceScenarios = Object.fromEntries(
+    Object.entries(ALLOWANCE_SCENARIO_CANDIDATES).map(([
+      scenario,
+      forcedCandidateId,
+    ]) => [scenario, {
+      basis: codexPrimaryAllowanceBasis(scenario),
+      calibration: projectBoundedWeeklyCalibrationSummary(
+        allowanceCapacityDataset,
+        { forcedCandidateId },
+      ),
+    }]),
+  );
+  const allowanceCapacityByScenario = {
+    schemaVersion: ALLOWANCE_CAPACITY_SCHEMA_VERSION,
+    basisFamilyId:
+      allowanceScenarios.unresolved_as_standard.basis.basisFamilyId,
+    scenarios: allowanceScenarios,
+  };
   const paceForecast = projectWeeklyPaceForecast(weeklyPaceSnapshots, endMs);
   throwIfAborted(signal);
   return {
@@ -2642,6 +2709,7 @@ export async function buildReplaySafeAccountingCache({
       ? {}
       : { weekly: { paceForecast } }),
     weeklyCalibration,
+    allowanceCapacityByScenario,
     weeklyCalibrationInput: {
       status: "complete",
       encoding: "accounting_compact_v2",
@@ -2985,6 +3053,106 @@ function validPriceCardProvenance(row) {
       === Number(exactNumber.toFixed(6));
 }
 
+function speedWeightingTotals(value) {
+  const shape = emptySpeedWeightingCrossing();
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).some((speed) => !Object.hasOwn(shape, speed))) {
+    return null;
+  }
+  let events = 0;
+  let apiPriceEquivalentUsd = 0;
+  const bySpeed = {};
+  for (const [speed, families] of Object.entries(shape)) {
+    const selected = value[speed] ?? {};
+    if (!selected || typeof selected !== "object" || Array.isArray(selected)
+        || Object.keys(selected).some(
+          (family) => !Object.hasOwn(families, family),
+        )) return null;
+    let speedEvents = 0;
+    let speedUsd = 0;
+    for (const family of Object.keys(families)) {
+      const cell = selected[family];
+      if (cell === undefined) continue;
+      if (!cell || typeof cell !== "object" || Array.isArray(cell)
+          || Object.keys(cell).sort().join(",")
+            !== "apiPriceEquivalentUsd,events"
+          || !Number.isSafeInteger(cell.events) || cell.events < 0
+          || typeof cell.apiPriceEquivalentUsd !== "number"
+          || !Number.isFinite(cell.apiPriceEquivalentUsd)
+          || cell.apiPriceEquivalentUsd < 0) return null;
+      speedEvents += cell.events;
+      speedUsd += cell.apiPriceEquivalentUsd;
+    }
+    bySpeed[speed] = { events: speedEvents, usd: speedUsd };
+    events += speedEvents;
+    apiPriceEquivalentUsd += speedUsd;
+  }
+  return { events, apiPriceEquivalentUsd, bySpeed };
+}
+
+function validTimelineSpeedWeighting(row) {
+  const observed = speedWeightingTotals(row?.speedWeighting);
+  const declared = speedWeightingTotals(row?.declaredSpeedWeighting);
+  if (observed === null || declared === null
+      || observed.events !== row.usageEvents
+      || Math.abs(observed.apiPriceEquivalentUsd - row.apiPriceEquivalentUsd)
+        > 0.00002
+      || declared.events > (observed.bySpeed.unknown?.events ?? 0)
+      || declared.apiPriceEquivalentUsd
+        > (observed.bySpeed.unknown?.usd ?? 0) + 0.00002) return false;
+  return true;
+}
+
+function validAllowanceCalibrationSummary(value, forcedCandidateId) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.schemaVersion !== "weekly-calibration-summary-v0.1"
+      || !["estimated", "insufficient_evidence"].includes(value.status)
+      || canonicalInstant(value.generatedAt) === null
+      || value.accountAttribution?.status !== "historical_unattributed"
+      || value.accountAttribution?.maySpanMultipleAccounts !== true
+      || value.validation?.selectedCostBasis !== forcedCandidateId
+      || !Array.isArray(value.recentResets)
+      || value.recentResets.length > BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT) {
+    return false;
+  }
+  if (value.status === "insufficient_evidence") return value.estimate === null;
+  const estimate = value.estimate;
+  return estimate && typeof estimate === "object" && !Array.isArray(estimate)
+    && Number.isSafeInteger(estimate.qualifyingResets)
+    && estimate.qualifyingResets > 0
+    && Number.isFinite(estimate.medianApiPriceEquivalentUsd)
+    && estimate.medianApiPriceEquivalentUsd > 0
+    && Number.isFinite(estimate.plausibleRangeUsd?.lower)
+    && estimate.plausibleRangeUsd.lower > 0
+    && Number.isFinite(estimate.plausibleRangeUsd?.upper)
+    && estimate.plausibleRangeUsd.upper >= estimate.plausibleRangeUsd.lower;
+}
+
+function validAllowanceCapacityByScenario(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.schemaVersion !== ALLOWANCE_CAPACITY_SCHEMA_VERSION
+      || !value.scenarios || typeof value.scenarios !== "object"
+      || Array.isArray(value.scenarios)
+      || Object.keys(value.scenarios).sort().join(",")
+        !== Object.keys(ALLOWANCE_SCENARIO_CANDIDATES).sort().join(",")) {
+    return false;
+  }
+  for (const [scenario, forcedCandidateId] of Object.entries(
+    ALLOWANCE_SCENARIO_CANDIDATES,
+  )) {
+    const row = value.scenarios[scenario];
+    const expectedBasis = codexPrimaryAllowanceBasis(scenario);
+    if (!row || typeof row !== "object" || Array.isArray(row)
+        || stableJson(row.basis) !== stableJson(expectedBasis)
+        || value.basisFamilyId !== expectedBasis.basisFamilyId
+        || !validAllowanceCalibrationSummary(
+          row.calibration,
+          forcedCandidateId,
+        )) return false;
+  }
+  return true;
+}
+
 const COMPOSITION_CACHE_STATUSES = new Set([
   "fitted",
   "fallback_blended",
@@ -3090,6 +3258,9 @@ function validCache(value) {
       )
       || (value.weekly !== undefined && !validWeeklyPaceContainer(value.weekly))
       || !validWeeklyCalibrationInput(value.weeklyCalibrationInput)
+      || !validAllowanceCapacityByScenario(
+        value.allowanceCapacityByScenario,
+      )
       || value.weeklyCalibration?.schemaVersion
         !== "weekly-calibration-summary-v0.1"
       || canonicalInstant(value.weeklyCalibration.generatedAt) === null
@@ -3135,6 +3306,7 @@ function validCache(value) {
       && typeof row?.apiPriceEquivalentUsd === "number"
       && Number.isFinite(row.apiPriceEquivalentUsd)
       && row.apiPriceEquivalentUsd >= 0
+      && validTimelineSpeedWeighting(row)
     ))
     && Array.isArray(value.sparkUsageTimeline)
     && value.sparkUsageTimeline.every((row) => (
@@ -3147,6 +3319,7 @@ function validCache(value) {
       && typeof row?.apiPriceEquivalentUsd === "number"
       && Number.isFinite(row.apiPriceEquivalentUsd)
       && row.apiPriceEquivalentUsd >= 0
+      && validTimelineSpeedWeighting(row)
     ));
 }
 

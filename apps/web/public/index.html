@@ -364,7 +364,7 @@
               <p class="annotation" id="calibration-model-shared" hidden></p>
             </details>
             <p class="annotation calibration-explanation" id="calibration-explanation">
-              This fit uses API prices as a measuring stick. It is not a
+              This fit uses quota-weighted API prices as a measuring stick. It is not a
               provider-published dollar allowance.
             </p>
           </article>
@@ -382,7 +382,7 @@
 
         <div class="weekly-hero">
           <div>
-            <span id="weekly-estimate-label" data-i18n="weekly.headline.label">All-data median estimate</span>
+            <span id="weekly-estimate-label" data-i18n="weekly.headline.label">Quota-weighted all-data median</span>
             <strong id="weekly-estimate">—</strong>
             <small id="weekly-range">No evidence interval available</small>
           </div>
@@ -558,7 +558,7 @@
           </div>
           <div class="legend calibration-legend" aria-label="Calibration chart legend" data-i18n-aria-label="aria.calibrationLegend">
             <span><i class="legend-dot observed"></i>Observed quota</span>
-            <span><i class="legend-dot expected"></i>Expected from API cost</span>
+            <span><i class="legend-dot expected"></i>Expected from quota-weighted API cost</span>
             <span class="legend-group-sep" aria-hidden="true"></span>
             <span><i class="legend-dot area chart-status-missing"></i>Missing quota bracket</span>
             <span><i class="legend-dot area chart-status-reset"></i>Window boundary or track change</span>
@@ -687,8 +687,8 @@
                 <span class="sr-only" id="usage-zoom-status" aria-live="polite"></span>
               </div>
               <div class="legend compact-legend" aria-label="Usage chart legend" data-i18n-aria-label="aria.usageLegend">
-                <span><i class="legend-dot cost"></i>API-price-equivalent usage</span>
-                <span><i class="legend-dot allowance"></i>Seven-day allowance remaining</span>
+                <span><i class="legend-dot cost"></i><span id="usage-cost-legend-label">Quota-weighted API-equivalent usage</span></span>
+                <span id="usage-allowance-legend"><i class="legend-dot allowance"></i>Seven-day allowance remaining</span>
               </div>
             </div>
           </div>
@@ -747,7 +747,7 @@
             <div class="panel-heading">
               <div>
                 <p class="panel-kicker">Cost contribution</p>
-                <h3>API-equivalent cost</h3>
+                <h3>Standard API-equivalent cost</h3>
               </div>
             </div>
             <p class="annotation">
@@ -767,7 +767,7 @@
             <div class="table-wrap">
               <table>
                 <caption class="sr-only">Replay-safe usage grouped by model, across every allowance</caption>
-                <thead><tr><th>Model</th><th>Usage changes</th><th>Tokens</th><th>API equivalent</th></tr></thead>
+                <thead><tr><th>Model</th><th>Usage changes</th><th>Tokens</th><th>Standard API equivalent</th></tr></thead>
                 <tbody id="accounting-models"></tbody>
               </table>
             </div>

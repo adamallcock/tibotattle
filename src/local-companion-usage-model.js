@@ -502,6 +502,8 @@ function newTimelineBucket(startMs) {
     totalTokens: 0,
     components: emptyComponents(),
     apiPriceEquivalentUsd: 0,
+    speedWeighting: emptySpeedWeightingCrossing(),
+    declaredSpeedWeighting: emptySpeedWeightingCrossing(),
     fullyPricedEvents: 0,
     partiallyPricedEvents: 0,
     unpricedEvents: 0,
@@ -515,6 +517,8 @@ export function addTimelineUsage(buckets, observedMs, projection) {
   bucket.usageEvents += 1;
   bucket.totalTokens += projection.totalTokens;
   bucket.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
+  addSpeedWeighting(bucket.speedWeighting, projection);
+  addDeclaredSpeedWeighting(bucket.declaredSpeedWeighting, projection);
   addComponents(bucket.components, projection.components);
   if (projection.pricingCoverageStatus === "fully_priced") bucket.fullyPricedEvents += 1;
   else if (projection.pricingCoverageStatus === "partially_priced") bucket.partiallyPricedEvents += 1;
@@ -532,6 +536,10 @@ export function finalizeTimelineBuckets(buckets) {
       totalTokens: bucket.totalTokens,
       components: bucket.components,
       apiPriceEquivalentUsd: Number(bucket.apiPriceEquivalentUsd.toFixed(6)),
+      speedWeighting: finalizeSpeedWeighting(bucket.speedWeighting),
+      declaredSpeedWeighting: finalizeSpeedWeighting(
+        bucket.declaredSpeedWeighting,
+      ),
       pricingCoverage: {
         fullyPricedEvents: bucket.fullyPricedEvents,
         partiallyPricedEvents: bucket.partiallyPricedEvents,

@@ -2082,6 +2082,230 @@ const FAST_MODE_METRIC_SHORT_LABEL = "Quota-weighted API equivalent";
 const FAST_MODE_STANDARD_METRIC_LABEL = "Standard-rate API-price equivalent";
 const FAST_MODE_METRIC_EXPLAINER =
   "Standard-rate API prices, multiplied by the published Fast credit rate for events in Fast mode: 2.5x for GPT-5.6 and GPT-5.5, 2x for GPT-5.4. It tracks relative quota consumption, not a bill.";
+const ALLOWANCE_SCENARIOS = Object.freeze([
+  "unresolved_as_standard",
+  "unresolved_as_fast"
+]);
+const ALLOWANCE_BASIS_FAMILY_ID =
+  "codex_primary:quota_weighted_api_equivalent:v1:fast_rates_2026_08_01:event_time:observed_declared_scenario";
+const TIMELINE_ALLOWANCE_WEIGHTING_SCHEMA_VERSION =
+  "quota-weighted-timeline-v0.1";
+const TIMELINE_WEIGHTING_STATUS_BY_CODE = Object.freeze([
+  "complete",
+  "partial",
+  "unknown"
+]);
+
+function allowanceBasisId(scenario) {
+  return `${ALLOWANCE_BASIS_FAMILY_ID}:${scenario}`;
+}
+
+function normalizeAllowanceCoverage(value, usageEvents) {
+  const coverage = {
+    totalEvents: count(value?.totalEvents, null),
+    observedEvents: count(value?.observedEvents, null),
+    declaredFromConfigEvents: count(
+      value?.declaredFromConfigEvents,
+      null
+    ),
+    assumedFromPreferenceEvents: count(
+      value?.assumedFromPreferenceEvents,
+      null
+    ),
+    inferredEvents: count(value?.inferredEvents, null),
+    unknownEvents: count(value?.unknownEvents, null)
+  };
+  if (Object.values(coverage).includes(null)
+      || coverage.totalEvents !== usageEvents
+      || coverage.inferredEvents > coverage.unknownEvents
+      || coverage.observedEvents
+        + coverage.declaredFromConfigEvents
+        + coverage.assumedFromPreferenceEvents
+        + coverage.unknownEvents !== usageEvents) return null;
+  return {
+    ...coverage,
+    observedSharePercent: usageEvents === 0
+      ? null
+      : coverage.observedEvents / usageEvents * 100,
+    unknownSharePercent: usageEvents === 0
+      ? null
+      : coverage.unknownEvents / usageEvents * 100
+  };
+}
+
+function normalizeAllowanceScenario(value, scenario, usageEvents, standardUsd) {
+  const sourceWeightingStatus = ["complete", "partial", "unknown"].includes(
+    value?.sourceWeightingStatus
+  ) ? value.sourceWeightingStatus : null;
+  const quotaWeightedUsd = nonNegative(value?.quotaWeightedUsd, null);
+  const coveredSubtotalUsd = nonNegative(value?.coveredSubtotalUsd, null);
+  const coverage = normalizeAllowanceCoverage(value?.coverage, usageEvents);
+  if (value?.basisId !== allowanceBasisId(scenario)
+      || sourceWeightingStatus === null || coveredSubtotalUsd === null
+      || coverage === null
+      || coveredSubtotalUsd > standardUsd * 2.5 + 0.00002
+      || (sourceWeightingStatus === "complete"
+        ? quotaWeightedUsd === null
+          || Math.abs(coveredSubtotalUsd - quotaWeightedUsd) > 0.00002
+          || quotaWeightedUsd + 0.00002 < standardUsd
+          || quotaWeightedUsd > standardUsd * 2.5 + 0.00002
+        : quotaWeightedUsd !== null)) return null;
+  return {
+    basisId: allowanceBasisId(scenario),
+    sourceWeightingStatus,
+    quotaWeightedUsd,
+    coveredSubtotalUsd,
+    coverage
+  };
+}
+
+function normalizeAllowanceWeighting(value, usageEvents, standardUsd) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.basisFamilyId !== ALLOWANCE_BASIS_FAMILY_ID
+      || !["complete", "range", "unavailable"].includes(value.status)) {
+    return null;
+  }
+  const scenarios = Object.fromEntries(ALLOWANCE_SCENARIOS.map((scenario) => [
+    scenario,
+    normalizeAllowanceScenario(
+      value.scenarios?.[scenario],
+      scenario,
+      usageEvents,
+      standardUsd
+    )
+  ]));
+  if (Object.values(scenarios).includes(null)) return null;
+  const selectedScenario = ALLOWANCE_SCENARIOS.includes(value.selectedScenario)
+    ? value.selectedScenario
+    : null;
+  const selectedUsd = nonNegative(value.selectedUsd, null);
+  const rangeLower = nonNegative(value.rangeUsd?.lower, null);
+  const rangeUpper = nonNegative(value.rangeUsd?.upper, null);
+  if (value.status === "complete") {
+    if (selectedScenario === null || selectedUsd === null
+        || scenarios[selectedScenario].quotaWeightedUsd === null
+        || Math.abs(
+          selectedUsd - scenarios[selectedScenario].quotaWeightedUsd
+        ) > 0.00002
+        || value.rangeUsd !== null) return null;
+  } else if (value.status === "range") {
+    const values = ALLOWANCE_SCENARIOS.map(
+      (scenario) => scenarios[scenario].quotaWeightedUsd
+    );
+    if (selectedScenario !== null || selectedUsd !== null
+        || values.includes(null) || rangeLower === null || rangeUpper === null
+        || Math.abs(rangeLower - Math.min(...values)) > 0.00002
+        || Math.abs(rangeUpper - Math.max(...values)) > 0.00002) return null;
+  } else if (selectedScenario !== null || selectedUsd !== null
+      || value.rangeUsd !== null) return null;
+  return {
+    status: value.status,
+    basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
+    selectedScenario,
+    selectedUsd,
+    scenarios,
+    rangeUsd: value.status === "range"
+      ? { lower: rangeLower, upper: rangeUpper }
+      : null
+  };
+}
+
+function normalizeTimelineAllowanceWeightingEncoding(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).length !== 4
+      || value.schemaVersion
+        !== TIMELINE_ALLOWANCE_WEIGHTING_SCHEMA_VERSION
+      || value.basisFamilyId !== ALLOWANCE_BASIS_FAMILY_ID
+      || !Array.isArray(value.scenarioOrder)
+      || value.scenarioOrder.length !== ALLOWANCE_SCENARIOS.length
+      || !value.scenarioOrder.every(
+        (scenario, index) => scenario === ALLOWANCE_SCENARIOS[index]
+      )
+      || (value.selectedScenario !== null
+        && !ALLOWANCE_SCENARIOS.includes(value.selectedScenario))) {
+    return null;
+  }
+  return {
+    schemaVersion: TIMELINE_ALLOWANCE_WEIGHTING_SCHEMA_VERSION,
+    basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
+    scenarioOrder: [...ALLOWANCE_SCENARIOS],
+    selectedScenario: value.selectedScenario
+  };
+}
+
+function normalizeCompactTimelineAllowanceScenario(
+  tuple,
+  offset,
+  scenario,
+  usageEvents,
+  standardUsd
+) {
+  const sourceWeightingStatus = Number.isSafeInteger(tuple[offset])
+    ? TIMELINE_WEIGHTING_STATUS_BY_CODE[tuple[offset]] ?? null
+    : null;
+  if (sourceWeightingStatus === null) return null;
+  return normalizeAllowanceScenario({
+    basisId: allowanceBasisId(scenario),
+    sourceWeightingStatus,
+    quotaWeightedUsd: tuple[offset + 1],
+    coveredSubtotalUsd: tuple[offset + 2],
+    coverage: {
+      totalEvents: usageEvents,
+      observedEvents: tuple[offset + 3],
+      declaredFromConfigEvents: tuple[offset + 4],
+      assumedFromPreferenceEvents: tuple[offset + 5],
+      inferredEvents: tuple[offset + 6],
+      unknownEvents: tuple[offset + 7]
+    }
+  }, scenario, usageEvents, standardUsd);
+}
+
+function normalizeCompactTimelineAllowanceWeighting(
+  value,
+  encoding,
+  usageEvents,
+  standardUsd
+) {
+  if (!Array.isArray(value) || value.length !== 16) return null;
+  const scenarios = Object.fromEntries(ALLOWANCE_SCENARIOS.map(
+    (scenario, index) => [scenario,
+      normalizeCompactTimelineAllowanceScenario(
+        value,
+        index * 8,
+        scenario,
+        usageEvents,
+        standardUsd
+      )]
+  ));
+  if (Object.values(scenarios).includes(null)) return null;
+  const selectedScenario = encoding.selectedScenario;
+  const scenarioValues = ALLOWANCE_SCENARIOS.map(
+    (scenario) => scenarios[scenario].quotaWeightedUsd
+  );
+  const bothComplete = !scenarioValues.includes(null);
+  const status = selectedScenario === null
+    ? bothComplete ? "range" : "unavailable"
+    : scenarios[selectedScenario].quotaWeightedUsd === null
+      ? "unavailable"
+      : "complete";
+  const selectedUsd = status === "complete"
+    ? scenarios[selectedScenario].quotaWeightedUsd
+    : null;
+  const rangeUsd = status === "range"
+    ? {
+      lower: Math.min(...scenarioValues),
+      upper: Math.max(...scenarioValues)
+    }
+    : null;
+  return normalizeAllowanceWeighting({
+    status,
+    basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
+    selectedScenario: status === "complete" ? selectedScenario : null,
+    selectedUsd,
+    scenarios,
+    rangeUsd
+  }, usageEvents, standardUsd);
+}
 
 function normalizeSpeedWeighting(value) {
   return Object.fromEntries(OBSERVED_SPEED_KEYS.map((speed) => [
@@ -2191,8 +2415,10 @@ function normalizeAccountingDimension(value, allowedKeys) {
   }));
 }
 
-function normalizeLocalTimeline(value = {}) {
-  const usage = array(value.usage).slice(-3_000).flatMap((row) => {
+function normalizeLocalUsageTimeline(value, weightingEncoding = undefined) {
+  if (weightingEncoding === null) return [];
+  const rows = [];
+  for (const row of array(value).slice(-3_000)) {
     const startAt = text(row?.startAt, "");
     const endAt = text(row?.endAt, "");
     const startMs = Date.parse(startAt);
@@ -2201,21 +2427,171 @@ function normalizeLocalTimeline(value = {}) {
     const totalTokens = count(row?.totalTokens, null);
     const cost = nonNegative(row?.apiPriceEquivalentUsd, null);
     if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs
-        || usageEvents === null || totalTokens === null || cost === null) return [];
-    return [{
+        || usageEvents === null || totalTokens === null || cost === null) {
+      return [];
+    }
+    const hasAllowanceWeighting = Object.hasOwn(row ?? {}, "allowanceWeighting");
+    const allowanceWeighting = weightingEncoding === undefined
+      ? hasAllowanceWeighting
+        ? normalizeAllowanceWeighting(
+          row?.allowanceWeighting,
+          usageEvents,
+          cost
+        )
+        : null
+      : normalizeCompactTimelineAllowanceWeighting(
+        row?.allowanceWeighting,
+        weightingEncoding,
+        usageEvents,
+        cost
+      );
+    if (allowanceWeighting === null
+        && (weightingEncoding !== undefined || hasAllowanceWeighting)) {
+      return [];
+    }
+    rows.push({
       startAt,
       endAt,
       usageEvents,
       totalTokens,
       apiPriceEquivalentUsd: cost,
+      allowanceWeighting,
       components: normalizeLocalComponents(row.components),
       pricingCoverage: {
         fullyPricedEvents: count(row?.pricingCoverage?.fullyPricedEvents, 0),
         partiallyPricedEvents: count(row?.pricingCoverage?.partiallyPricedEvents, 0),
         unpricedEvents: count(row?.pricingCoverage?.unpricedEvents, 0)
       }
-    }];
-  });
+    });
+  }
+  return rows;
+}
+
+function unavailableAllowanceCapacity(reason = "allowance_capacity_unavailable") {
+  return {
+    status: "unavailable",
+    reason,
+    basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
+    selectedScenario: null,
+    scenarios: {
+      unresolved_as_standard: null,
+      unresolved_as_fast: null
+    },
+    accountAttribution: {
+      status: "historical_unattributed",
+      maySpanMultipleAccounts: true
+    }
+  };
+}
+
+function normalizeAllowanceCapacityScenario(value, scenario) {
+  if (value === null || value === undefined) return null;
+  const medianCapacityUsd = nonNegative(value?.medianCapacityUsd, null);
+  const lower = nonNegative(value?.plausibleRangeUsd?.lower, null);
+  const upper = nonNegative(value?.plausibleRangeUsd?.upper, null);
+  const qualifyingResets = count(value?.qualifyingResets, null);
+  const cohortId = typeof value?.cohortId === "string"
+      && /^[0-9a-f]{64}$/u.test(value.cohortId)
+    ? value.cohortId
+    : null;
+  const validation = value?.validation ?? {};
+  const validationFields = [
+    "sameResetHoldoutMeanAbsoluteErrorPercentagePoints",
+    "priorResetMeanAbsoluteErrorPercentagePoints",
+    "priorResetAbsoluteBiasPercentagePoints",
+    "forecastErrorP80PercentagePoints"
+  ];
+  const normalizedValidation = Object.fromEntries(validationFields.map((key) => [
+    key,
+    finite(validation[key], null)
+  ]));
+  const scoredPriorResets = count(validation.scoredPriorResets, null);
+  const scoredPriorPoints = count(validation.scoredPriorPoints, null);
+  if (value?.basisId !== allowanceBasisId(scenario)
+      || medianCapacityUsd === null || medianCapacityUsd <= 0
+      || lower === null || lower <= 0 || upper === null
+      || lower > medianCapacityUsd || medianCapacityUsd > upper
+      || qualifyingResets === null || qualifyingResets < 1
+      || cohortId === null
+      || scoredPriorResets === null || scoredPriorPoints === null
+      || normalizedValidation
+        .sameResetHoldoutMeanAbsoluteErrorPercentagePoints === null) {
+    return null;
+  }
+  return {
+    basisId: allowanceBasisId(scenario),
+    medianCapacityUsd,
+    plausibleRangeUsd: { lower, upper },
+    qualifyingResets,
+    cohortId,
+    validation: {
+      ...normalizedValidation,
+      scoredPriorResets,
+      scoredPriorPoints
+    }
+  };
+}
+
+function normalizeAllowanceCapacity(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.basisFamilyId !== ALLOWANCE_BASIS_FAMILY_ID
+      || !["available", "range", "unavailable"].includes(value.status)
+      || value.accountAttribution?.status !== "historical_unattributed"
+      || value.accountAttribution?.maySpanMultipleAccounts !== true) {
+    return unavailableAllowanceCapacity("allowance_capacity_invalid");
+  }
+  const scenarios = Object.fromEntries(ALLOWANCE_SCENARIOS.map((scenario) => [
+    scenario,
+    normalizeAllowanceCapacityScenario(value.scenarios?.[scenario], scenario)
+  ]));
+  const selectedScenario = ALLOWANCE_SCENARIOS.includes(value.selectedScenario)
+    ? value.selectedScenario
+    : null;
+  if (value.status === "available") {
+    if (selectedScenario === null || scenarios[selectedScenario] === null) {
+      return unavailableAllowanceCapacity("allowance_capacity_invalid");
+    }
+  } else if (selectedScenario !== null) {
+    return unavailableAllowanceCapacity("allowance_capacity_invalid");
+  }
+  if (value.status === "range"
+      && (Object.values(scenarios).includes(null)
+        || scenarios.unresolved_as_standard.qualifyingResets
+          !== scenarios.unresolved_as_fast.qualifyingResets
+        || scenarios.unresolved_as_standard.cohortId
+          !== scenarios.unresolved_as_fast.cohortId)) {
+    return unavailableAllowanceCapacity("allowance_capacity_invalid");
+  }
+  return {
+    status: value.status,
+    reason: value.status === "unavailable"
+      ? text(value.reason, "allowance_capacity_unavailable")
+      : null,
+    basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
+    selectedScenario,
+    scenarios,
+    accountAttribution: {
+      status: "historical_unattributed",
+      maySpanMultipleAccounts: true
+    }
+  };
+}
+
+function normalizeLocalTimeline(value = {}) {
+  const hasWeightingEncoding = Object.hasOwn(
+    value,
+    "allowanceWeightingEncoding"
+  );
+  const weightingEncoding = hasWeightingEncoding
+    ? normalizeTimelineAllowanceWeightingEncoding(
+      value.allowanceWeightingEncoding
+    )
+    : undefined;
+  const usage = normalizeLocalUsageTimeline(value.usage, weightingEncoding);
+  const calibrationUsage = normalizeLocalUsageTimeline(
+    value.calibrationUsage,
+    weightingEncoding
+  );
   const quota = array(value.quota).slice(-10_000).flatMap((row) => {
     const observedAt = text(row?.observedAt, "");
     const usedPercent = finite(row?.usedPercent, null);
@@ -2252,6 +2628,8 @@ function normalizeLocalTimeline(value = {}) {
       endAt: text(value?.coveredAt?.endAt, "")
     },
     usage,
+    calibrationUsage,
+    allowanceCapacity: normalizeAllowanceCapacity(value.allowanceCapacity),
     quota
   };
 }

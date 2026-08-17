@@ -1356,38 +1356,40 @@ function humanize(value) {
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
-function latestRollingPair(data) {
+function matchedRollingPairs(data) {
   if (data.timeline?.usage?.length) {
-    const live = liveTimelinePoints(data, {
+    return liveTimelinePoints(data, {
       windowHours: CALIBRATION_WINDOW_HOURS,
       rangeDays: activeUsageRangeDays,
     })
-      .filter((row) => row.observed !== null && row.expected !== null)
-      .at(-1);
-    if (live) return live;
+      .filter((row) => row.observed !== null && row.expected !== null);
   }
-  if (data.gradient.rollingDetail.length) {
-    const row = data.gradient.rollingDetail.at(-1);
-    return {
-      observed: finite(row.observed_quota_change_pp ?? row.observedQuotaChangePp),
-      expected: finite(row.expected_quota_change_pp ?? row.expectedQuotaChangePp),
-      residual: finite(row.residual_pp ?? row.residualPp)
-    };
-  }
-  // The canonical artifact rolling series is the three-hour smoothing; the
-  // hourly rows are diagnostic extras, and the owner fixed every comparison
-  // to the three-hour width (2026-08-06).
-  const groups = groupRolling(data.gradient.rolling, CALIBRATION_WINDOW_HOURS);
-  const last = groups.at(-1);
-  return last ? { observed: last.observed, expected: last.expected, residual: last.observed - last.expected } : null;
+  // Retained gradient artifacts are Standard-priced. They remain historical
+  // diagnostics, but cannot supply an allowance comparison without the
+  // bucket-level speed evidence needed to match the numerator and capacity.
+  return [];
 }
 
 function renderComparison(data) {
-  const pair = latestRollingPair(data);
+  const matchedPairs = matchedRollingPairs(data);
+  const pair = matchedPairs.at(-1) ?? null;
   const summary = data.gradient.summary ?? {};
   const weeklySummary = data.weekly.summary ?? {};
-  const mae = finite(summary.mean_absolute_error_pp ?? summary.meanAbsoluteErrorPp);
-  const within = finite(summary.points_within_80_band_fraction ?? summary.pointsWithin80BandFraction);
+  const legacyDemo = data.mode === "demo";
+  const mae = matchedPairs.length > 0
+    ? matchedPairs.reduce(
+      (sum, row) => sum + Math.abs(row.observed - row.expected),
+      0,
+    ) / matchedPairs.length
+    : legacyDemo
+      ? finite(summary.mean_absolute_error_pp ?? summary.meanAbsoluteErrorPp)
+      : null;
+  const within = legacyDemo
+    ? finite(
+      summary.points_within_80_band_fraction
+        ?? summary.pointsWithin80BandFraction,
+    )
+    : null;
   // The weekly estimator is the canonical fitted-rate source. The
   // composition-aware blended rate (cost-weighted over the recent model mix)
   // is preferred when the v0.7 cache fitted one; the across-reset median is
@@ -1397,8 +1399,7 @@ function renderComparison(data) {
     weeklySummary.blended_capacity_usd
       ?? weeklySummary.median_weekly_value_usd
       ?? weeklySummary.medianWeeklyValueUsd
-      ?? summary.capacity_usd
-      ?? summary.capacityUsd,
+      ?? (legacyDemo ? summary.capacity_usd ?? summary.capacityUsd : null),
   );
   const capacityByModel = weeklySummary.capacity_by_model
       && typeof weeklySummary.capacity_by_model === "object"
@@ -1415,14 +1416,12 @@ function renderComparison(data) {
   const lower = finite(
     weeklySummary.lower_80_across_resets_usd
       ?? weeklySummary.lower80Usd
-      ?? summary.lower_80_usd
-      ?? summary.lower80Usd,
+      ?? (legacyDemo ? summary.lower_80_usd ?? summary.lower80Usd : null),
   );
   const upper = finite(
     weeklySummary.upper_80_across_resets_usd
       ?? weeklySummary.upper80Usd
-      ?? summary.upper_80_usd
-      ?? summary.upper80Usd,
+      ?? (legacyDemo ? summary.upper_80_usd ?? summary.upper80Usd : null),
   );
   const qualifyingResets = finite(
     weeklySummary.qualifying_resets ?? weeklySummary.qualifyingResets,
@@ -3120,6 +3119,7 @@ const TIMELINE_STATUS_KEYS = Object.freeze({
   matched: "chart.status.matched",
   inactive: "chart.status.inactive",
   unpriced_local_activity: "chart.status.unpricedLocalActivity",
+  quota_weighting_unavailable: "chart.status.quotaWeightingUnavailable",
   unexplained_without_local_activity: "chart.status.unexplainedWithoutLocalActivity",
   missing_quota_bracket: "chart.status.missingQuotaBracket",
   reset_or_track_change: "chart.status.resetOrTrackChange",
@@ -3199,21 +3199,43 @@ function sameResetBoundary(before, after) {
   return Math.abs(afterMs - beforeMs) <= RESET_BOUNDARY_TOLERANCE_MS;
 }
 
+function timelineCalibrationCapacity(data) {
+  const capacity = data?.timeline?.allowanceCapacity;
+  if (capacity?.status !== "available") return null;
+  const scenario = capacity.selectedScenario;
+  const selected = capacity.scenarios?.[scenario];
+  const medianCapacityUsd = finite(selected?.medianCapacityUsd);
+  return scenario !== null && medianCapacityUsd !== null
+      && medianCapacityUsd > 0
+    ? {
+      scenario,
+      basisId: selected.basisId,
+      medianCapacityUsd,
+    }
+    : null;
+}
+
+function timelineAllowanceWeightedCost(row, capacitySelection) {
+  const weighting = row?.allowanceWeighting;
+  return capacitySelection !== null
+      && weighting?.status === "complete"
+      && weighting.selectedScenario === capacitySelection.scenario
+      && weighting.scenarios?.[capacitySelection.scenario]?.basisId
+        === capacitySelection.basisId
+    ? finite(weighting.selectedUsd)
+    : null;
+}
+
 function liveTimelinePoints(
   data,
   {
     windowHours = CALIBRATION_WINDOW_HOURS,
     rangeDays = activeCalibrationRangeDays,
+    usage = data.timeline.usage,
   } = {},
 ) {
-  const usage = data.timeline.usage;
-  // Prefer the composition-aware blended rate over the recent mix; the
-  // across-reset median stays as the fallback for older caches.
-  const capacity = finite(
-    data.weekly.summary?.blended_capacity_usd
-      ?? data.weekly.summary?.median_weekly_value_usd
-      ?? data.gradient.summary?.capacity_usd
-  );
+  const capacitySelection = timelineCalibrationCapacity(data);
+  const capacity = capacitySelection?.medianCapacityUsd ?? null;
   if (!usage.length) return [];
   const windowMs = windowHours * 60 * 60 * 1_000;
   const cutoff = timelineCutoffMs(data, rangeDays);
@@ -3223,15 +3245,23 @@ function liveTimelinePoints(
   // forward-recovery branch below) can integrate cost and events over exactly
   // the span it actually measured, instead of scaling the full-window sums.
   const usageEndsMs = usage.map((row) => Date.parse(row.endAt));
+  const weightedCosts = usage.map((row) => (
+    timelineAllowanceWeightedCost(row, capacitySelection)
+  ));
   const costPrefix = new Float64Array(usage.length + 1);
+  const weightingGapPrefix = new Uint32Array(usage.length + 1);
   const eventsPrefix = new Float64Array(usage.length + 1);
   for (let index = 0; index < usage.length; index += 1) {
-    costPrefix[index + 1] = costPrefix[index] + usage[index].apiPriceEquivalentUsd;
+    costPrefix[index + 1] = costPrefix[index]
+      + (weightedCosts[index] ?? 0);
+    weightingGapPrefix[index + 1] = weightingGapPrefix[index]
+      + (weightedCosts[index] === null ? 1 : 0);
     eventsPrefix[index + 1] = eventsPrefix[index] + usage[index].usageEvents;
   }
   const points = [];
   let startIndex = 0;
   let rollingCost = 0;
+  let rollingWeightingGaps = 0;
   let rollingEvents = 0;
   // Cumulative drift (owner-directed, 2026-08-08): the running sum of
   // per-bucket observed-minus-expected movement since the last reset boundary
@@ -3246,15 +3276,28 @@ function liveTimelinePoints(
   // observation read as growing negative drift.
   let driftAnchor = null;
   let driftCostUsd = 0;
+  let comparisonSegment = 0;
+  let previousComparable = false;
   for (let index = 0; index < usage.length; index += 1) {
     const current = usage[index];
     const endMs = Date.parse(current.endAt);
-    rollingCost += current.apiPriceEquivalentUsd;
+    const currentWeightedCost = weightedCosts[index];
+    if (currentWeightedCost === null) rollingWeightingGaps += 1;
+    else rollingCost += currentWeightedCost;
     rollingEvents += current.usageEvents;
-    driftCostUsd += current.apiPriceEquivalentUsd;
+    if (currentWeightedCost === null) {
+      // A missing or basis-mismatched bucket is a hard break. No rolling
+      // comparison or cumulative residual may bridge an unweighted interval.
+      driftAnchor = null;
+      driftCostUsd = 0;
+    } else if (driftAnchor !== null) {
+      driftCostUsd += currentWeightedCost;
+    }
     while (startIndex <= index
         && Date.parse(usage[startIndex].endAt) <= endMs - windowMs) {
-      rollingCost -= usage[startIndex].apiPriceEquivalentUsd;
+      const expiredWeightedCost = weightedCosts[startIndex];
+      if (expiredWeightedCost === null) rollingWeightingGaps -= 1;
+      else rollingCost -= expiredWeightedCost;
       rollingEvents -= usage[startIndex].usageEvents;
       startIndex += 1;
     }
@@ -3312,6 +3355,7 @@ function liveTimelinePoints(
       ? after.usedPercent - before.usedPercent
       : null;
     let windowCostUsd = Math.max(0, rollingCost);
+    let windowWeightingGaps = rollingWeightingGaps;
     let windowEvents = Math.max(0, rollingEvents);
     if (shrunkenSpan) {
       // Only the usage buckets ending inside the measured span count, so the
@@ -3338,20 +3382,27 @@ function liveTimelinePoints(
         }
       }
       windowCostUsd = Math.max(0, costPrefix[top] - costPrefix[lower]);
+      windowWeightingGaps = weightingGapPrefix[top]
+        - weightingGapPrefix[lower];
       windowEvents = Math.max(0, eventsPrefix[top] - eventsPrefix[lower]);
     }
-    const expected = !poolSaturated && capacity !== null && capacity > 0
+    const expected = !poolSaturated
+        && capacity !== null && capacity > 0
+        && windowWeightingGaps === 0
       ? windowCostUsd / capacity * 100
       : null;
-    const evidence = classifyTimelineEvidence({
+    const classifiedEvidence = classifyTimelineEvidence({
       bracketed,
       sameReset,
       observed,
       expected,
       usageEvents: windowEvents,
-      apiCostUsd: windowCostUsd,
+      apiCostUsd: windowWeightingGaps === 0 ? windowCostUsd : 0,
       poolSaturated,
     });
+    const evidence = windowWeightingGaps === 0
+      ? classifiedEvidence
+      : { status: "quota_weighting_unavailable", residual: null };
     let cumulativeResidual = null;
     // A re-anchor marks the first drift observation of a new reset or track:
     // the deviation-period detector splits its runs here, so a sustained drift
@@ -3359,6 +3410,7 @@ function liveTimelinePoints(
     // reset. Stamped on the point so the flag survives viewport filtering.
     let driftReanchor = false;
     if (capacity !== null && capacity > 0
+        && currentWeightedCost !== null
         && after !== null
         && Number.isFinite(finite(after.usedPercent))
         && endMs - afterMatch.timestampMs <= maximumBracketGapMs) {
@@ -3406,7 +3458,7 @@ function liveTimelinePoints(
         if (driftAnchor.maxUsedPercent >= POOL_SATURATION_CEILING_PP) {
           // Still inside a pegged span: keep post-peg cost out of the
           // accumulation exactly as the saturated branch below does.
-          driftCostUsd -= current.apiPriceEquivalentUsd;
+          driftCostUsd -= currentWeightedCost;
         }
         cumulativeResidual = null;
       } else if (driftAnchor.maxUsedPercent >= POOL_SATURATION_CEILING_PP) {
@@ -3415,7 +3467,7 @@ function liveTimelinePoints(
         // measured against a display that can no longer move. Suspend the
         // accumulation (null splits detector runs) and keep the accrued cost
         // out of it, so a later re-anchor starts clean.
-        driftCostUsd -= current.apiPriceEquivalentUsd;
+        driftCostUsd -= currentWeightedCost;
         cumulativeResidual = null;
       } else {
         // Recovery or normal movement clears any unconfirmed drop candidate.
@@ -3428,6 +3480,9 @@ function liveTimelinePoints(
           - driftCostUsd / capacity * 100;
       }
     }
+    const comparable = observed !== null && expected !== null;
+    if (comparable && !previousComparable) comparisonSegment += 1;
+    previousComparable = comparable;
     points.push({
       timestamp: current.endAt,
       timestampMs: endMs,
@@ -3436,7 +3491,15 @@ function liveTimelinePoints(
       residual: evidence.residual,
       cumulativeResidual,
       driftReanchor,
-      apiCostUsd: windowCostUsd,
+      // Kept under the legacy internal key for downstream chart diagnostics,
+      // but this is now the selected quota-weighted amount, never Standard
+      // dollars paired with a Fast-adjusted capacity.
+      apiCostUsd: windowWeightingGaps === 0 ? windowCostUsd : null,
+      allowanceWeightedUsd: windowWeightingGaps === 0
+        ? windowCostUsd
+        : null,
+      allowanceBasisId: capacitySelection?.basisId ?? null,
+      residualSegment: comparable ? comparisonSegment : null,
       usageEvents: windowEvents,
       // The span both lines actually integrate: the nominal window unless the
       // start edge was recovered forward past a collection silence, in which
@@ -3449,6 +3512,7 @@ function liveTimelinePoints(
 }
 
 function groupedUsageTimeline(data) {
+  const capacitySelection = timelineCalibrationCapacity(data);
   const hourMs = 60 * 60 * 1_000;
   const cutoff = timelineCutoffMs(data, activeUsageRangeDays);
   const groups = new Map();
@@ -3482,30 +3546,44 @@ function groupedUsageTimeline(data) {
       sortMs,
       periodStartMs: rowStartMs,
       periodEndMs: rowEndMs,
-      apiCostUsd: 0,
+      standardApiCostUsd: 0,
+      quotaWeightedCostUsd: 0,
+      weightingGaps: 0,
       usageEvents: 0,
       totalTokens: 0
     };
     group.periodStartMs = Math.min(group.periodStartMs, rowStartMs);
     group.periodEndMs = Math.max(group.periodEndMs, rowEndMs);
-    group.apiCostUsd += row.apiPriceEquivalentUsd;
+    group.standardApiCostUsd += row.apiPriceEquivalentUsd;
+    const weighted = timelineAllowanceWeightedCost(row, capacitySelection);
+    if (weighted === null) group.weightingGaps += 1;
+    else group.quotaWeightedCostUsd += weighted;
     group.usageEvents += row.usageEvents;
     group.totalTokens += row.totalTokens;
     groups.set(key, group);
   }
   return [...groups.values()]
     .sort((left, right) => left.sortMs - right.sortMs)
-    .map(({ sortMs: _sortMs, periodStartMs, periodEndMs, ...row }) => ({
-      ...row,
-      timestamp: new Date(periodEndMs).toISOString(),
-      timestampMs: periodEndMs,
-      periodStartAt: new Date(periodStartMs).toISOString(),
-      periodEndAt: new Date(periodEndMs).toISOString(),
-      apiCostUsd: Number(row.apiCostUsd.toFixed(6))
-    }));
+    .map(({ sortMs: _sortMs, periodStartMs, periodEndMs, ...row }) => {
+      const quotaWeightedCostUsd = row.weightingGaps === 0
+        ? Number(row.quotaWeightedCostUsd.toFixed(6))
+        : null;
+      return {
+        ...row,
+        timestamp: new Date(periodEndMs).toISOString(),
+        timestampMs: periodEndMs,
+        periodStartAt: new Date(periodStartMs).toISOString(),
+        periodEndAt: new Date(periodEndMs).toISOString(),
+        standardApiCostUsd: Number(row.standardApiCostUsd.toFixed(6)),
+        quotaWeightedCostUsd,
+        allowanceBasisId: quotaWeightedCostUsd === null
+          ? null
+          : capacitySelection.basisId,
+      };
+    });
 }
 
-function usagePointsWithAllowance(data, points) {
+function usagePointsWithAllowance(data, points, includeAllowance) {
   const quota = mainWeeklyQuotaTrack(data.timeline.quota);
   const quotaLookup = createQuotaTimelineLookup(quota);
   const maximumObservationAgeMs = {
@@ -3521,7 +3599,9 @@ function usagePointsWithAllowance(data, points) {
       : Number.POSITIVE_INFINITY;
     return {
       ...point,
-      allowanceRemaining: observationAge <= maximumObservationAgeMs
+      allowanceRemaining: includeAllowance
+          && point.quotaWeightedCostUsd !== null
+          && observationAge <= maximumObservationAgeMs
         ? finite(observationMatch.row.remainingPercent)
         : null
     };
@@ -3569,10 +3649,20 @@ function usageGroupingUnitKey(grouping = activeUsageGrouping) {
   return USAGE_GROUPING_UNIT_KEYS[grouping] ?? "chart.unit.interval";
 }
 
-function usageChartAxisLabels(grouping = activeUsageGrouping) {
+function usageChartAxisLabels(
+  grouping = activeUsageGrouping,
+  quotaWeighted = true,
+) {
   return Object.freeze({
     primary: {
-      key: USAGE_GROUPING_AXIS_KEYS[grouping] ?? "chart.axis.apiEquivalentPerInterval",
+      key: quotaWeighted
+        ? {
+          hour: "chart.axis.quotaWeightedPerHour",
+          day: "chart.axis.quotaWeightedPerDay",
+          week: "chart.axis.quotaWeightedPerWeek",
+        }[grouping] ?? "chart.axis.quotaWeightedPerInterval"
+        : USAGE_GROUPING_AXIS_KEYS[grouping]
+          ?? "chart.axis.apiEquivalentPerInterval",
     },
     secondary: { key: "chart.axis.sevenDayAllowanceRemaining" },
   });
@@ -3591,7 +3681,12 @@ function selectedUsagePoints(data) {
       && usageSeriesMemo.rangeDays === activeUsageRangeDays) {
     return usageSeriesMemo.points;
   }
-  const points = usagePointsWithAllowance(data, groupedUsageTimeline(data));
+  const includeAllowance = timelineCalibrationCapacity(data) !== null;
+  const points = usagePointsWithAllowance(
+    data,
+    groupedUsageTimeline(data),
+    includeAllowance,
+  );
   usageSeriesMemo = {
     data,
     grouping: activeUsageGrouping,
@@ -3620,6 +3715,16 @@ function resetUsageTimelineViewport() {
   usageTimelineViewport = null;
 }
 
+function completeUsageTimelineTotal(points, key) {
+  let total = 0;
+  for (const point of points) {
+    const value = finite(point?.[key]);
+    if (value === null) return null;
+    total += value;
+  }
+  return total;
+}
+
 function renderUsageTimeline(data) {
   syncUsageGroupingControls();
   const points = selectedUsagePoints(data);
@@ -3631,13 +3736,25 @@ function renderUsageTimeline(data) {
   const shell = $("#usage-timeline-chart");
   const empty = $("#usage-timeline-empty");
   const unit = t(usageGroupingUnitKey());
-  const axisLabels = usageChartAxisLabels();
-  setLocalizedText($("#usage-timeline-title"), "chart.usage.heading", {
+  const quotaComparable = timelineCalibrationCapacity(data) !== null;
+  const axisLabels = usageChartAxisLabels(activeUsageGrouping, quotaComparable);
+  setLocalizedText(
+    $("#usage-cost-legend-label"),
+    quotaComparable
+      ? "chart.series.quotaWeightedUsage"
+      : "chart.series.standardApiUsage",
+  );
+  $("#usage-allowance-legend").hidden = !quotaComparable;
+  setLocalizedText(
+    $("#usage-timeline-title"),
+    quotaComparable ? "chart.usage.heading" : "chart.usage.standardHeading",
+    {
     unit,
     range: tPlural("format.durationDay", activeUsageRangeDays, {
       count: formatDecimal(activeUsageRangeDays, 0),
     }),
-  });
+    },
+  );
   if (!visiblePoints.length) {
     shell.hidden = true;
     empty.hidden = false;
@@ -3647,9 +3764,13 @@ function renderUsageTimeline(data) {
     drawChart(shell, lineChart({
       points: visiblePoints,
       series: [{
-        key: "apiCostUsd",
+        key: quotaComparable ? "quotaWeightedCostUsd" : "standardApiCostUsd",
         className: "chart-line-value",
-        label: { key: "chart.series.apiEquivalentUsage" },
+        label: {
+          key: quotaComparable
+            ? "chart.series.quotaWeightedUsage"
+            : "chart.series.standardApiUsage",
+        },
         // Dense per-interval samples: dots would merge into a solid band, so
         // the line carries the shape and each sample stays hoverable. This is
         // the opposite of the allowance history chart, on purpose.
@@ -3657,17 +3778,23 @@ function renderUsageTimeline(data) {
         format: (value) => formatApiMoney(value),
       }],
       yLabel: axisLabels.primary,
-      secondarySeries: [{
+      secondarySeries: quotaComparable ? [{
         key: "allowanceRemaining",
         className: "chart-line-allowance",
         label: { key: "chart.series.sevenDayAllowanceRemaining" },
         pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
-      }],
-      secondaryYLabel: axisLabels.secondary,
+      }] : [],
+      secondaryYLabel: quotaComparable ? axisLabels.secondary : null,
       yTickFormat: (value) => formatApiMoney(value),
-      title: { key: "chart.usage.title" },
+      title: {
+        key: quotaComparable
+          ? "chart.usage.title"
+          : "chart.usage.standardTitle",
+      },
       description: {
-        key: "chart.usage.description",
+        key: quotaComparable
+          ? "chart.usage.description"
+          : "chart.usage.standardDescription",
         values: { unit, timeZone: formatTimeZoneLabel() },
       },
       includeZero: true,
@@ -3686,7 +3813,13 @@ function renderUsageTimeline(data) {
   );
   const summary = $("#usage-timeline-summary");
   clear(summary);
-  const total = visiblePoints.reduce((sum, row) => sum + row.apiCostUsd, 0);
+  // The plotted weighted series already renders a missing interval as a gap.
+  // Its summary must do the same: adding only finite points would publish a
+  // deceptively partial allowance-facing aggregate.
+  const total = completeUsageTimelineTotal(
+    visiblePoints,
+    quotaComparable ? "quotaWeightedCostUsd" : "standardApiCostUsd",
+  );
   for (const [name, explanation, value] of [
     [
       "Time intervals",
@@ -3694,9 +3827,13 @@ function renderUsageTimeline(data) {
       compact(visiblePoints.length)
     ],
     [
-      "API-price equivalent",
-      "A public API-price measuring stick for the local usage observed here, not a bill.",
-      formatApiMoney(total)
+      quotaComparable
+        ? "Quota-weighted API equivalent"
+        : "Standard-rate API-price equivalent",
+      quotaComparable
+        ? "Standard API prices adjusted by the observed or selected Codex speed mode, compared only with a capacity fitted on the same basis. It is not a bill."
+        : "A Standard-rate accounting series. Provider allowance is hidden because no matching weighted capacity is available.",
+      total === null ? "Unavailable" : formatApiMoney(total)
     ]
   ]) {
     const item = node("div");
@@ -3927,6 +4064,7 @@ function renderTimeline(data) {
 // order. A mechanism with zero windows is never mentioned, so the sentence
 // cannot claim ambiguity (or anything else) that did not occur.
 const TIMELINE_EXCLUSION_MESSAGE_KEYS = Object.freeze([
+  ["quota_weighting_unavailable", "dashboard.timeline.excludedQuotaWeighting"],
   ["missing_quota_bracket", "dashboard.timeline.excludedMissingBracket"],
   ["reset_or_track_change", "dashboard.timeline.excludedResetOrTrackChange"],
   ["backward_or_ambiguous", "dashboard.timeline.excludedAmbiguousMovement"],
@@ -4072,6 +4210,7 @@ function signedResidualAucPpHours(matched) {
   for (let index = 1; index < matched.length; index += 1) {
     const prior = matched[index - 1];
     const current = matched[index];
+    if (prior.residualSegment !== current.residualSegment) continue;
     const elapsedHours =
       (pointTimestampMs(current) - pointTimestampMs(prior)) / 3_600_000;
     if (!Number.isFinite(elapsedHours) || elapsedHours <= 0) continue;
