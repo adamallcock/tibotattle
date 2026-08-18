@@ -3218,6 +3218,7 @@ test("Claude shadow wiring ignores malformed env when disabled and forwards root
     const disabledApp = createLocalCompanionServer({
       environment: {
         HOME: join(disabledFiles.root, "home"),
+        USERPROFILE: join(disabledFiles.root, "home"),
         CLAUDE_CONFIG_DIR: "relative-config",
         CLAUDE_PROJECT_DIR: "relative-project",
       },
@@ -3244,6 +3245,7 @@ test("Claude shadow wiring ignores malformed env when disabled and forwards root
     const enabledApp = createLocalCompanionServer({
       environment: {
         HOME: home,
+        USERPROFILE: home,
         CLAUDE_CONFIG_DIR: config,
         CLAUDE_PROJECT_DIR: project,
       },
