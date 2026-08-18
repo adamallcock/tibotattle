@@ -73,6 +73,77 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /durable prepared\/settled\/recovered credential audit/u);
   assert.doesNotMatch(workflow, /Deferred: cross-process credential mutex/u);
   assert.match(workflow, /passed=\$\{?receipt|Result: \$result/u);
+
+  const qualificationStep = workflow.indexOf(
+    "- name: Run content-free Windows security qualification",
+  );
+  const revisionGate = workflow.indexOf(
+    "- name: Reconfirm checked-out revision before Electron artifact work",
+  );
+  const stagingStep = workflow.indexOf(
+    "- name: Stage exact Windows x64 Electron development inputs",
+  );
+  const packagingStep = workflow.indexOf(
+    "- name: Build unsigned Windows x64 Electron directory artifact",
+  );
+  const verificationStep = workflow.indexOf(
+    "- name: Verify Windows Electron development artifact",
+  );
+  const cleanupStep = workflow.indexOf(
+    "- name: Remove generated Electron artifact tree before clean checkout gate",
+  );
+  const cleanCheckoutStep = workflow.indexOf(
+    "- name: Confirm qualification and artifact work did not modify the checkout",
+  );
+  assert.ok(
+    qualificationStep >= 0
+      && qualificationStep < revisionGate
+      && revisionGate < stagingStep
+      && stagingStep < packagingStep
+      && packagingStep < verificationStep
+      && verificationStep < cleanupStep
+      && cleanupStep < cleanCheckoutStep,
+    "Electron artifact work must follow native qualification and precede the final clean-checkout gate",
+  );
+  assert.match(workflow, /WINDOWS_ELECTRON_REVISION_MISMATCH/u);
+  assert.match(workflow, /WINDOWS_QUALIFICATION_REVISION_MISMATCH/u);
+  assert.match(workflow, /\.release-build\/electron-dev\/windows-x64\/app/u);
+  assert.match(workflow, /\.release-build\/electron-dev\/windows-x64\/artifacts/u);
+  assert.match(workflow, /native\/windows-filesystem\/build\/Release\/windows_filesystem\.node/u);
+  assert.match(workflow, /native\/windows-filesystem\/build\/Release\/windows_filesystem\.node\.manifest\.json/u);
+  assert.match(workflow, /--target win32/u);
+  assert.match(workflow, /--output \$stagedAppPath/u);
+  assert.match(workflow, /--windows-binding \$windowsBindingPath/u);
+  assert.match(workflow, /--windows-manifest \$windowsManifestPath/u);
+  assert.match(workflow, /TIBOTATTLE_ELECTRON_TARGET = 'win32'/u);
+  assert.match(workflow, /pnpm exec electron-builder --version/u);
+  assert.match(workflow, /26\.15\.7/u);
+  assert.match(workflow, /--config apps\/electron\/electron-builder\.config\.cjs/u);
+  assert.match(workflow, /--win dir/u);
+  assert.match(workflow, /--x64/u);
+  assert.match(workflow, /--publish never/u);
+  assert.match(workflow, /win-unpacked/u);
+  assert.match(workflow, /resources\/app\.asar/u);
+  assert.match(workflow, /resources\/app\.asar\.unpacked/u);
+  assert.match(workflow, /--target win32-x64/u);
+  assert.match(workflow, /--app \$env:TIBOTATTLE_ELECTRON_STAGED_APP_PATH/u);
+  assert.match(workflow, /--asar \$env:TIBOTATTLE_ELECTRON_ASAR_PATH/u);
+  assert.match(workflow, /--unpacked \$env:TIBOTATTLE_ELECTRON_UNPACKED_PATH/u);
+  assert.match(workflow, /ELECTRON_DEVELOPMENT_ARTIFACT_VERIFIED/u);
+  assert.match(workflow, /ELECTRON_ARTIFACT_EVIDENCE_NOT_CONTENT_FREE/u);
+  assert.match(workflow, /SHA-256:/u);
+  assert.match(workflow, /Runtime launch: not performed/u);
+  assert.match(workflow, /Windows production readiness: not claimed/u);
+  assert.match(workflow, /Signing, notarization, installer, updater, and publication: not performed/u);
+  assert.match(workflow, /WINDOWS_ELECTRON_INSTALLER_OUTPUT_UNEXPECTED/u);
+  assert.doesNotMatch(
+    workflow.slice(stagingStep, cleanCheckoutStep),
+    /(?:--publish\s+(?!never)|--nsis|--msi|--appx|--portable)/u,
+  );
+  assert.doesNotMatch(
+    workflow.slice(verificationStep, cleanCheckoutStep),
+    /(?:electron(?:\.exe)?\s+launch|Start-Process|child_process\.spawn|app\.quit)/iu,
+  );
   assert.match(qualificationScript, /--test-reporter=tap/u);
   assert.match(qualificationScript, /GITHUB_ACTIONS/u);
   assert.doesNotMatch(workflow, /npm exec --yes|pnpm dlx/u);
