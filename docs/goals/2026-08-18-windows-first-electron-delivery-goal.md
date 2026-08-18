@@ -25,14 +25,20 @@ or a Linux-support claim.
   passed, and the documentation scanner now ignores only reviewed runtime and
   dependency directories.
 - The local Stage 2 safety pass is complete and fail-closed. Windows adapters
-  are centrally branded; forged and copied objects cannot promote production;
-  account collection, Claude callback state, and contribution-device state
-  cannot fall through to Node or SQLite state writes when a Windows production
-  adapter is requested.
-- Windows production remains deliberately disabled. The native replacement
-  change, trusted package/signature verifier, complete adapter-backed consumer
-  state, and adversarial native Windows x64 matrix still require proof before
-  any readiness fact may become true.
+  are centrally branded, and forged or copied objects cannot promote
+  production. The contribution-device binding metadata path now uses the
+  branded boundary for validation, creation, identity-bound reads, deletion,
+  and legacy migration. This is a negative safety guarantee, not proof that all
+  Windows credential state is positively qualified.
+- The native replacement path now revalidates destination-handle security,
+  file identity, and canonical final path immediately before rename. The
+  native adapter still advertises `productionSafe: false` and
+  `pathWalkRaceSafe: false`: the remaining Win32 race and the full native
+  adversarial matrix must be proved on Windows before readiness can change.
+- Claude lifecycle state still needs a shared `WindowsProtectedStateStore`
+  abstraction. The collector, unified-index, and contribution-queue SQLite
+  paths also need a native Windows storage/SQLite boundary; they are not
+  covered by the current byte-file adapter.
 - After rebasing onto current `main`, the final integrated Stage 2 contract run
   passed 211 assertions with 10 explicit
   native-Windows-only skips, and the architecture and preflight checks passed.
@@ -56,8 +62,38 @@ or a Linux-support claim.
   runtime deliberately disabled.
 - Stage 4 is now the active implementation stage. Native Windows x64 remains
   the authority for the Windows addon, credential integration, packaged-app
-  lifecycle, and installer claims; none of those claims follows from the macOS
-  Electron proof.
+  lifecycle, and installer claims. Windows Electron staging and build
+  contracts now require an exact native binding/manifest pair and use
+  target-specific native payload rules, but no Windows runtime or launch claim
+  has been made. The content-free artifact verifier is still in a focused
+  repair pass, and Windows CI packaging verification is still in progress;
+  neither is an exit result yet.
+- Production readiness, authenticated binding provenance, production signing,
+  installer/updater qualification, and the native Windows x64 warm-and-clean
+  run remain gates. Linux compatibility is not claimed, and no version bump,
+  publication, or replacement of the native macOS client has occurred.
+
+### Immediate ordered work
+
+1. Finish and test the artifact verifier. Its exit is an exact stage/ASAR/
+   unpacked inventory, binding/sidecar schema and digest check, and fixed,
+   content-free output on the real macOS artifact. Allow one focused repair
+   pass; after that, record one named blocker and stop this dependent path.
+2. Complete the Windows CI packaging lane. Its exit is a reproducible
+   warm/clean build of the exact binding/manifest pair and a verifier pass;
+   it must not imply that the app launches on Windows.
+3. Build `WindowsProtectedStateStore`, route Claude lifecycle state through it,
+   and define the native Windows storage/SQLite boundary for collector,
+   unified-index, and contribution-queue state. Its exit is focused negative
+   and positive contract coverage with readiness still fail-closed locally.
+4. Run the native Windows x64 security and composition qualification on the
+   same exact revision in warm and clean environments. Its exit is zero
+   unexplained skips, an authenticated binding, complete state coverage, and
+   truthful production capability facts; otherwise retain the disabled flags
+   and record the specific blocker.
+5. Only after steps 1–4 pass, qualify the Windows Electron runtime, installer,
+   upgrade, rollback, uninstall, and credential-retention behavior. Linux
+   preparation follows this shared-shell boundary and is a later stage.
 
 ## Delivery rules
 
