@@ -58,7 +58,7 @@ test("Electron app staging includes the shell and keeps the companion manifest v
 test("Electron builder configuration is an unsigned macOS arm64 directory build", () => {
   assert.equal(BUILDER_CONFIG.appId, "com.adamallcock.tibotattle.electron.dev");
   assert.equal(BUILDER_CONFIG.productName, "TiboTattle Dev");
-  assert.equal(BUILDER_CONFIG.extraMetadata.name, "tibotattle-electron-dev");
+  assert.equal(BUILDER_CONFIG.extraMetadata.name, "app-usagemonitor");
   assert.equal(BUILDER_CONFIG.extraMetadata.productName, "TiboTattle Dev");
   assert.equal(BUILDER_CONFIG.directories.app, DEFAULT_ELECTRON_APP_OUTPUT);
   assert.deepEqual(BUILDER_CONFIG.files, [
@@ -71,6 +71,9 @@ test("Electron builder configuration is an unsigned macOS arm64 directory build"
         "apps/electron/**",
         "apps/local/**",
         "apps/web/public/**",
+        "config/**",
+        "contracts/**",
+        "schemas/**",
         "src/**",
         "generated/**",
       ],
@@ -82,11 +85,14 @@ test("Electron builder configuration is an unsigned macOS arm64 directory build"
     },
   ]);
   assert.equal(BUILDER_CONFIG.asar, true);
-  assert.deepEqual(BUILDER_CONFIG.asarUnpack, ["**/*.node"]);
+  assert.deepEqual(BUILDER_CONFIG.asarUnpack, [
+    "node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
+  ]);
   assert.equal(BUILDER_CONFIG.extraMetadata.main, "apps/electron/main.js");
   assert.equal(BUILDER_CONFIG.publish, "never");
   assert.equal(BUILDER_CONFIG.forceCodeSigning, false);
-  assert.equal(BUILDER_CONFIG.npmRebuild, false);
+  assert.equal(BUILDER_CONFIG.beforeBuild(), false);
+  assert.equal(BUILDER_CONFIG.npmRebuild, true);
   assert.equal(BUILDER_CONFIG.buildDependenciesFromSource, false);
   assert.equal(BUILDER_CONFIG.nodeGypRebuild, false);
   assert.deepEqual(BUILDER_CONFIG.mac.target, [{ target: "dir", arch: ["arm64"] }]);

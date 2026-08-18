@@ -26,6 +26,9 @@ module.exports = {
         "apps/electron/**",
         "apps/local/**",
         "apps/web/public/**",
+        "config/**",
+        "contracts/**",
+        "schemas/**",
         "src/**",
         "generated/**",
       ],
@@ -37,14 +40,21 @@ module.exports = {
     },
   ],
   asar: true,
-  asarUnpack: ["**/*.node"],
+  // Only the reviewed, target-specific native runtime is unpacked. The
+  // Electron shell and JavaScript companion remain in app.asar.
+  asarUnpack: ["node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node"],
   extraMetadata: {
     main: "apps/electron/main.js",
-    name: "tibotattle-electron-dev",
+    name: "app-usagemonitor",
     productName: "TiboTattle Dev",
   },
   forceCodeSigning: false,
-  npmRebuild: false,
+  // The staged app deliberately has no lockfile. Returning false from the
+  // hook keeps electron-builder from walking the checkout's workspace
+  // metadata while npmRebuild still makes its production-dependency phase
+  // select this exact staged app directory.
+  beforeBuild: () => false,
+  npmRebuild: true,
   buildDependenciesFromSource: false,
   nodeGypRebuild: false,
   publish: "never",
