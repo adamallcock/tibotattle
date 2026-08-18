@@ -273,10 +273,190 @@ jobs:
           "- Canonical deferrals: docs/goals/2026-08-17-windows-security-credentials-goal.md" >> $env:GITHUB_STEP_SUMMARY
           "- Deferred: authenticated binary provenance; replacement CAS; complete DACL/path/concurrency matrix; selector and remaining state/SQLite integration; export locking; retention/uninstall policy; packaging, signing, installer, and updater" >> $env:GITHUB_STEP_SUMMARY
 
-      - name: Confirm qualification did not modify the checkout
+      - name: Reconfirm checked-out revision before Electron artifact work
+        shell: pwsh
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = $env:EXPECTED_REVISION.Trim().ToLowerInvariant()
+          $actual = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          $qualified = ($env:TIBOTATTLE_QUALIFICATION_REVISION ?? '').Trim().ToLowerInvariant()
+          if ($expected -notmatch '^[0-9a-f]{40}$' -or $actual -ne $expected -or $qualified -ne $actual) {
+            Write-Error 'WINDOWS_ELECTRON_REVISION_MISMATCH'
+            exit 1
+          }
+
+      - name: Stage exact Windows x64 Electron development inputs
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $stagingLog = Join-Path $env:RUNNER_TEMP 'tibotattle-electron-staging.log'
+          $stagedAppPath = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-dev/windows-x64/app'
+          $windowsBindingPath = Join-Path $env:GITHUB_WORKSPACE 'native/windows-filesystem/build/Release/windows_filesystem.node'
+          $windowsManifestPath = "${windowsBindingPath}.manifest.json"
+          if (-not (Test-Path -LiteralPath $windowsBindingPath -PathType Leaf) -or
+              -not (Test-Path -LiteralPath $windowsManifestPath -PathType Leaf)) {
+            Write-Error 'WINDOWS_ELECTRON_BINDING_PAIR_MISSING'
+            exit 1
+          }
+          node ./scripts/build-electron-app.mjs `
+            --target win32 `
+            --output $stagedAppPath `
+            --replace `
+            --windows-binding $windowsBindingPath `
+            --windows-manifest $windowsManifestPath *> $stagingLog
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_ELECTRON_STAGING_FAILED'
+            exit 1
+          }
+          $runtimeManifestPath = Join-Path $stagedAppPath 'electron-runtime-manifest.json'
+          if (-not (Test-Path -LiteralPath $runtimeManifestPath -PathType Leaf)) {
+            Write-Error 'WINDOWS_ELECTRON_RUNTIME_MANIFEST_MISSING'
+            exit 1
+          }
+          try {
+            $runtimeManifest = Get-Content -LiteralPath $runtimeManifestPath -Raw | ConvertFrom-Json
+            $nativeManifest = Get-Content -LiteralPath $windowsManifestPath -Raw | ConvertFrom-Json
+          } catch {
+            Write-Error 'WINDOWS_ELECTRON_RUNTIME_MANIFEST_INVALID'
+            exit 1
+          }
+          if ($runtimeManifest.target -ne 'win32' -or
+              $runtimeManifest.architecture -ne 'x64' -or
+              $runtimeManifest.windowsBinding.status -ne 'included_unverified' -or
+              $runtimeManifest.windowsBinding.verified -ne $false -or
+              $runtimeManifest.windowsBinding.binding.bytes -ne $nativeManifest.bytes -or
+              $runtimeManifest.windowsBinding.binding.sha256 -ne $nativeManifest.sha256 -or
+              $nativeManifest.bytes.ToString() -ne $env:TIBOTATTLE_WINDOWS_BINDING_BYTES -or
+              $nativeManifest.sha256 -ne $env:TIBOTATTLE_WINDOWS_BINDING_SHA256) {
+            Write-Error 'WINDOWS_ELECTRON_BINDING_INPUT_MISMATCH'
+            exit 1
+          }
+          "TIBOTATTLE_ELECTRON_STAGED_APP_PATH=$stagedAppPath" >> $env:GITHUB_ENV
+          "TIBOTATTLE_ELECTRON_WINDOWS_BINDING_PATH=$windowsBindingPath" >> $env:GITHUB_ENV
+          "TIBOTATTLE_ELECTRON_WINDOWS_MANIFEST_PATH=$windowsManifestPath" >> $env:GITHUB_ENV
+
+      - name: Build unsigned Windows x64 Electron directory artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $builderVersionLog = Join-Path $env:RUNNER_TEMP 'tibotattle-electron-builder-version.log'
+          $builderLog = Join-Path $env:RUNNER_TEMP 'tibotattle-electron-builder.log'
+          pnpm exec electron-builder --version *> $builderVersionLog
+          if ($LASTEXITCODE -ne 0 -or (Get-Content -LiteralPath $builderVersionLog -Raw).Trim() -ne '26.15.7') {
+            Write-Error 'WINDOWS_ELECTRON_BUILDER_VERSION_MISMATCH'
+            exit 1
+          }
+          $env:TIBOTATTLE_ELECTRON_TARGET = 'win32'
+          pnpm exec electron-builder `
+            --config apps/electron/electron-builder.config.cjs `
+            --win dir `
+            --x64 `
+            --publish never *> $builderLog
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_ELECTRON_DIRECTORY_BUILD_FAILED'
+            exit 1
+          }
+          $artifactRoot = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-dev/windows-x64/artifacts'
+          $artifactAppPath = Join-Path $artifactRoot 'win-unpacked'
+          $asarPath = Join-Path $artifactAppPath 'resources/app.asar'
+          $unpackedPath = Join-Path $artifactAppPath 'resources/app.asar.unpacked'
+          if (-not (Test-Path -LiteralPath $artifactAppPath -PathType Container) -or
+              -not (Test-Path -LiteralPath $asarPath -PathType Leaf) -or
+              -not (Test-Path -LiteralPath $unpackedPath -PathType Container)) {
+            Write-Error 'WINDOWS_ELECTRON_DIRECTORY_ARTIFACT_MISSING'
+            exit 1
+          }
+          $topLevelInstallers = @(Get-ChildItem -LiteralPath $artifactRoot -File -Force |
+            Where-Object { $_.Name -match '\.(?:exe|msi|msix|appx|zip|7z|nsis)$' })
+          if ($topLevelInstallers.Count -ne 0) {
+            Write-Error 'WINDOWS_ELECTRON_INSTALLER_OUTPUT_UNEXPECTED'
+            exit 1
+          }
+          "TIBOTATTLE_ELECTRON_ARTIFACT_APP_PATH=$artifactAppPath" >> $env:GITHUB_ENV
+          "TIBOTATTLE_ELECTRON_ASAR_PATH=$asarPath" >> $env:GITHUB_ENV
+          "TIBOTATTLE_ELECTRON_UNPACKED_PATH=$unpackedPath" >> $env:GITHUB_ENV
+
+      - name: Verify Windows Electron development artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $verificationLog = Join-Path $env:RUNNER_TEMP 'tibotattle-electron-verification.log'
+          node ./scripts/verify-electron-development-artifact.mjs `
+            --target win32-x64 `
+            --app $env:TIBOTATTLE_ELECTRON_STAGED_APP_PATH `
+            --asar $env:TIBOTATTLE_ELECTRON_ASAR_PATH `
+            --unpacked $env:TIBOTATTLE_ELECTRON_UNPACKED_PATH *> $verificationLog
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_ELECTRON_ARTIFACT_VERIFICATION_FAILED'
+            exit 1
+          }
+          try {
+            $evidence = Get-Content -LiteralPath $verificationLog -Raw | ConvertFrom-Json
+          } catch {
+            Write-Error 'WINDOWS_ELECTRON_ARTIFACT_EVIDENCE_INVALID'
+            exit 1
+          }
+          $evidenceJson = $evidence | ConvertTo-Json -Depth 10 -Compress
+          if ($evidence.status -ne 'ELECTRON_DEVELOPMENT_ARTIFACT_VERIFIED' -or
+              $evidence.target -ne 'win32-x64' -or
+              $evidence.nativeFileCount -ne 2 -or
+              $evidence.binding.status -ne 'included_unverified' -or
+              $evidence.binding.bytes -ne [int64]$env:TIBOTATTLE_WINDOWS_BINDING_BYTES -or
+              $evidence.binding.sha256 -ne $env:TIBOTATTLE_WINDOWS_BINDING_SHA256 -or
+              $evidenceJson -match '(?i)(?:[A-Za-z]:[\\/]|/Users/|/home/|\\Users\\|password|secret|token|credential)') {
+            Write-Error 'WINDOWS_ELECTRON_ARTIFACT_EVIDENCE_NOT_CONTENT_FREE'
+            exit 1
+          }
+          foreach ($name in @('staged', 'asar', 'unpacked', 'artifact')) {
+            $inventory = $evidence.$name
+            if ($null -eq $inventory -or
+                (($inventory.count -isnot [int]) -and ($inventory.count -isnot [long])) -or
+                (($inventory.bytes -isnot [int]) -and ($inventory.bytes -isnot [long])) -or
+                $inventory.count -lt 0 -or
+                $inventory.bytes -lt 0 -or
+                $inventory.sha256 -notmatch '^[0-9a-f]{64}$') {
+              Write-Error 'WINDOWS_ELECTRON_ARTIFACT_INVENTORY_INVALID'
+              exit 1
+            }
+          }
+          "### Windows Electron development artifact" >> $env:GITHUB_STEP_SUMMARY
+          "- Status: $($evidence.status)" >> $env:GITHUB_STEP_SUMMARY
+          "- Target: $($evidence.target)" >> $env:GITHUB_STEP_SUMMARY
+          "- Checked-out revision: $env:TIBOTATTLE_QUALIFICATION_REVISION" >> $env:GITHUB_STEP_SUMMARY
+          "- Packaging: unsigned directory target only; publication disabled" >> $env:GITHUB_STEP_SUMMARY
+          "- Native file count: $($evidence.nativeFileCount)" >> $env:GITHUB_STEP_SUMMARY
+          "- Staged files: $($evidence.staged.count); bytes: $($evidence.staged.bytes); SHA-256: $($evidence.staged.sha256)" >> $env:GITHUB_STEP_SUMMARY
+          "- app.asar files: $($evidence.asar.count); bytes: $($evidence.asar.bytes); SHA-256: $($evidence.asar.sha256)" >> $env:GITHUB_STEP_SUMMARY
+          "- app.asar.unpacked files: $($evidence.unpacked.count); bytes: $($evidence.unpacked.bytes); SHA-256: $($evidence.unpacked.sha256)" >> $env:GITHUB_STEP_SUMMARY
+          "- Artifact union files: $($evidence.artifact.count); bytes: $($evidence.artifact.bytes); SHA-256: $($evidence.artifact.sha256)" >> $env:GITHUB_STEP_SUMMARY
+          "- Binding bytes: $($evidence.binding.bytes); SHA-256: $($evidence.binding.sha256)" >> $env:GITHUB_STEP_SUMMARY
+          "- Runtime launch: not performed" >> $env:GITHUB_STEP_SUMMARY
+          "- Windows production readiness: not claimed" >> $env:GITHUB_STEP_SUMMARY
+          "- Signing, notarization, installer, updater, and publication: not performed" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Remove generated Electron artifact tree before clean checkout gate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $releaseBuild = Join-Path $env:GITHUB_WORKSPACE '.release-build'
+          if (Test-Path -LiteralPath $releaseBuild) {
+            Remove-Item -LiteralPath $releaseBuild -Recurse -Force
+          }
+
+      - name: Confirm qualification and artifact work did not modify the checkout
+        shell: pwsh
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = $env:EXPECTED_REVISION.Trim().ToLowerInvariant()
+          $actual = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($expected -notmatch '^[0-9a-f]{40}$' -or $actual -ne $expected) {
+            Write-Error 'WINDOWS_QUALIFICATION_REVISION_MISMATCH'
+            exit 1
+          }
           git diff --quiet
           if ($LASTEXITCODE -ne 0) {
             Write-Error 'WINDOWS_QUALIFICATION_WORKTREE_DIRTY'
