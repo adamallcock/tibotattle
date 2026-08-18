@@ -47,6 +47,17 @@ function runWorker(capabilityId) {
   });
 }
 
+function startHoldingWorker(capabilityId) {
+  const worker = new Worker(CHILD, {
+    workerData: { capabilityId, mode: "hold-until-terminated" },
+  });
+  const acquired = new Promise((resolveWorker, rejectWorker) => {
+    worker.once("message", resolveWorker);
+    worker.once("error", rejectWorker);
+  });
+  return { worker, acquired };
+}
+
 test("native named mutex serializes separate Windows processes per capability", {
   skip: process.platform !== "win32" || process.arch !== "x64",
 }, () => {
@@ -97,6 +108,27 @@ test("native mutex registry remains safe across Node worker threads", {
   } finally {
     context.release(lease);
   }
+});
+
+test("worker termination never strands a native credential mutex", {
+  skip: process.platform !== "win32" || process.arch !== "x64",
+}, async () => {
+  const { worker, acquired } = startHoldingWorker(0);
+  assert.equal(
+    await acquired,
+    "WINDOWS_CREDENTIAL_MUTEX_CHILD_ACQUIRED",
+  );
+  await worker.terminate();
+
+  const context = createWindowsCredentialMutexContext();
+  let lease;
+  try {
+    lease = context.acquire(0);
+  } catch (error) {
+    assert.equal(error?.code, "windows_credential_mutex_abandoned");
+    lease = context.acquire(0);
+  }
+  context.release(lease);
 });
 
 test("native lease recovers a durable prepared row after abrupt process termination", {

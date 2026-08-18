@@ -106,9 +106,9 @@
     },
     {
       "file": "test/windows-credential-mutex-native.test.js",
-      "win32BranchCount": 3,
+      "win32BranchCount": 4,
       "classification": "native-windows-qualification",
-      "followUp": "Run same-capability contention and different-capability independence in separate native Windows processes."
+      "followUp": "Run same-capability contention, different-capability independence, abrupt-process recovery, and worker-termination cleanup on native Windows x64."
     },
     {
       "file": "test/windows-credential-mutex.test.js",

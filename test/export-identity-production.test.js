@@ -224,7 +224,7 @@ test("CLI rotation preflight and confirmation use injected selection without dis
 
 test("CLI state renderers expose only closed source and backend vocabularies", () => {
   assert.equal(renderParticipantIdentityBackendMode("macos_keychain"), "macos_keychain");
-  assert.equal(renderParticipantIdentityBackendMode("windows_credential_manager"), "invalid");
+  assert.equal(renderParticipantIdentityBackendMode("windows_credential_manager"), "windows_credential_manager");
   assert.equal(renderParticipantIdentityBackendMode("PRIVATE"), "invalid");
   assert.equal(renderParticipantIdentitySourceState({ source: "environment" }), "external_override");
   assert.equal(renderParticipantIdentitySourceState({ source: "secret_backend" }), "keychain");

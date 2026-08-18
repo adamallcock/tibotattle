@@ -52,6 +52,12 @@ const MUTEX_ID_FOR_CAPABILITY = new Map([
   [EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.claudeSessionPseudonym, 2],
   [EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice, 3],
 ]);
+const CAPABILITIES = Object.freeze([
+  EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity,
+  EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation,
+  EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.claudeSessionPseudonym,
+  EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice,
+]);
 
 // A module-level registry prevents two backend instances in one process from
 // concurrently mutating the same capability. It is intentionally not claimed
@@ -196,7 +202,8 @@ export function createWindowsCredentialOperationLeaseContext(options = {}) {
         && typeof auditStore.settle === "function"
         && typeof auditStore.recover === "function"
         && typeof auditStore.read === "function"
-        && typeof auditStore.readPending === "function";
+        && typeof auditStore.readPending === "function"
+        && typeof auditStore.filesystemProtected === "boolean";
     } catch {
       valid = false;
     }
@@ -209,6 +216,7 @@ export function createWindowsCredentialOperationLeaseContext(options = {}) {
   const auditEvents = [];
   let activeLeaseCount = 0;
   let closed = false;
+  let startupRecoveryComplete = false;
 
   function emit(event) {
     const safeEvent = cloneEvent({
@@ -254,6 +262,103 @@ export function createWindowsCredentialOperationLeaseContext(options = {}) {
     return value;
   }
 
+  function acquireNativeMutex(capability) {
+    if (mutexContext === null) return Object.freeze({ lease: null, abandoned: false });
+    let mutexLease = null;
+    let abandoned = false;
+    for (let attempt = 0; attempt < 2 && mutexLease === null; attempt += 1) {
+      try {
+        mutexLease = mutexContext.acquire(MUTEX_ID_FOR_CAPABILITY.get(capability));
+      } catch (error) {
+        if (isWindowsCredentialMutexError(error)
+            && error.code === "windows_credential_mutex_abandoned"
+            && attempt === 0) {
+          abandoned = true;
+          continue;
+        }
+        if (isWindowsCredentialMutexError(error)
+            && error.code === "windows_credential_mutex_contended") {
+          fail("contended");
+        }
+        fail("mutex_failed");
+      }
+    }
+    if (mutexLease === null) fail("mutex_failed");
+    return Object.freeze({ lease: mutexLease, abandoned });
+  }
+
+  function recoverCapabilityRows(capability) {
+    if (auditStore === null) return 0;
+    const label = capabilityLabel(capability);
+    let recovered = 0;
+    for (const pending of auditStore.readPending()) {
+      if (pending.capability !== label) continue;
+      auditStore.recover({
+        leaseId: pending.leaseId,
+        recoveryClass: "unknown_after_crash",
+      });
+      recovered += 1;
+    }
+    return recovered;
+  }
+
+  function recoverPreparedOperations() {
+    if (closed) fail("invalid_configuration");
+    if (mutexContext === null || auditStore === null) {
+      startupRecoveryComplete = false;
+      return Object.freeze({ complete: false, recovered: 0, contended: 0 });
+    }
+    let recovered = 0;
+    let contended = 0;
+    for (const capability of CAPABILITIES) {
+      const owner = capabilityOwner(capability);
+      const label = capabilityLabel(capability);
+      const registryKey = `${owner}\u0000${label}`;
+      if (ACTIVE_CAPABILITY_LEASES.has(registryKey)) {
+        contended += 1;
+        continue;
+      }
+      const maintenance = Object.freeze({ maintenance: true });
+      ACTIVE_CAPABILITY_LEASES.set(registryKey, maintenance);
+      let mutexLease = null;
+      try {
+        try {
+          mutexLease = acquireNativeMutex(capability).lease;
+        } catch (error) {
+          if (isWindowsCredentialOperationLeaseError(error)
+              && error.code === "windows_credential_operation_lease_contended") {
+            contended += 1;
+            continue;
+          }
+          throw error;
+        }
+        recovered += recoverCapabilityRows(capability);
+      } catch (error) {
+        if (isWindowsCredentialOperationLeaseError(error)) throw error;
+        fail("audit_failed");
+      } finally {
+        let releaseFailed = false;
+        if (mutexLease !== null) {
+          try {
+            mutexContext.release(mutexLease);
+          } catch {
+            releaseFailed = true;
+          }
+        }
+        if (ACTIVE_CAPABILITY_LEASES.get(registryKey) === maintenance) {
+          ACTIVE_CAPABILITY_LEASES.delete(registryKey);
+        }
+        if (releaseFailed) fail("mutex_failed");
+      }
+    }
+    startupRecoveryComplete = contended === 0;
+    return Object.freeze({
+      complete: startupRecoveryComplete,
+      recovered,
+      contended,
+    });
+  }
+
   function acquire(capability, optionsForLease = {}) {
     if (closed) fail("invalid_configuration");
     const configurationForLease = validateOptions(optionsForLease);
@@ -276,28 +381,9 @@ export function createWindowsCredentialOperationLeaseContext(options = {}) {
     if (ACTIVE_CAPABILITY_LEASES.has(registryKey)) fail("contended");
     const leaseId = makeLeaseId();
 
-    let mutexLease = null;
-    let abandoned = false;
-    if (mutexContext !== null) {
-      for (let attempt = 0; attempt < 2 && mutexLease === null; attempt += 1) {
-        try {
-          mutexLease = mutexContext.acquire(MUTEX_ID_FOR_CAPABILITY.get(capability));
-        } catch (error) {
-          if (isWindowsCredentialMutexError(error)
-              && error.code === "windows_credential_mutex_abandoned"
-              && attempt === 0) {
-            abandoned = true;
-            continue;
-          }
-          if (isWindowsCredentialMutexError(error)
-              && error.code === "windows_credential_mutex_contended") {
-            fail("contended");
-          }
-          fail("mutex_failed");
-        }
-      }
-      if (mutexLease === null) fail("mutex_failed");
-    }
+    const nativeMutex = acquireNativeMutex(capability);
+    const mutexLease = nativeMutex.lease;
+    const abandoned = nativeMutex.abandoned;
 
     const lease = Object.freeze({
       version: LEASE_VERSION,
@@ -324,13 +410,7 @@ export function createWindowsCredentialOperationLeaseContext(options = {}) {
     activeLeaseCount += 1;
     try {
       if (auditStore !== null) {
-        for (const pending of auditStore.readPending()) {
-          if (pending.capability !== label) continue;
-          auditStore.recover({
-            leaseId: pending.leaseId,
-            recoveryClass: "unknown_after_crash",
-          });
-        }
+        recoverCapabilityRows(capability);
         auditStore.prepare({
           leaseId,
           owner,
@@ -546,9 +626,14 @@ export function createWindowsCredentialOperationLeaseContext(options = {}) {
     withLease,
     readAuditEvents,
     readDurableAuditRecords,
+    recoverPreparedOperations,
     close,
+    get startupRecoveryComplete() {
+      return startupRecoveryComplete;
+    },
     crossProcessSafe: mutexContext !== null,
     auditDurable: auditStore !== null,
+    auditFilesystemProtected: auditStore?.filesystemProtected === true,
     productionSafe: false,
   });
   trustedLeaseContexts.add(context);

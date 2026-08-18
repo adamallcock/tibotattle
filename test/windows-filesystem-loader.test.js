@@ -33,17 +33,20 @@ function manifest(overrides = {}) {
     sha256: sha256(BINDING_BYTES),
     contractVersion: "windows-filesystem-v1",
     securityContractVersion: "windows-filesystem-security-v1",
+    credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
     requiredMethods: [...WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS],
     nativeClaims: {
       productionSafe: false,
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
+      credentialAuditFileGuardSafe: true,
     },
     approvedPolicy: {
       productionSafe: false,
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
+      credentialAuditFileGuardSafe: true,
     },
     ...overrides,
   };
@@ -53,10 +56,12 @@ function binding(overrides = {}) {
   return {
     contractVersion: "windows-filesystem-v1",
     securityContractVersion: "windows-filesystem-security-v1",
+    credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
+    credentialAuditFileGuardSafe: true,
     inspectPath: () => ({ identity: IDENTITY }),
     ensureDirectory: () => IDENTITY,
     readFile: () => ({ data: Buffer.from("data"), identity: IDENTITY }),
@@ -65,6 +70,8 @@ function binding(overrides = {}) {
     replaceFile: () => IDENTITY,
     acquireCredentialMutex: () => ({ lease: {}, abandoned: false }),
     releaseCredentialMutex: () => {},
+    acquireCredentialAuditFileGuard: () => ({ lease: {} }),
+    releaseCredentialAuditFileGuard: () => {},
     ...overrides,
   };
 }
@@ -183,6 +190,7 @@ test("manifest policy and native claims are cross-checked before loading", () =>
           productionSafe: true,
           pathWalkRaceSafe: true,
           credentialMutexSafe: true,
+          credentialAuditFileGuardSafe: true,
         },
       })),
       readBindingBytes: () => BINDING_BYTES,
@@ -202,6 +210,7 @@ test("manifest policy and native claims are cross-checked before loading", () =>
           productionSafe: true,
           pathWalkRaceSafe: true,
           credentialMutexSafe: true,
+          credentialAuditFileGuardSafe: true,
         },
       }),
       readBindingBytes: () => BINDING_BYTES,

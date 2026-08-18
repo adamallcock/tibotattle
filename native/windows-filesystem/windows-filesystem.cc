@@ -25,6 +25,7 @@
 #include <new>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -187,6 +188,10 @@ Failure CredentialMutexContended() { return {"CREDENTIAL_MUTEX_CONTENDED"}; }
 Failure CredentialMutexAbandoned() { return {"CREDENTIAL_MUTEX_ABANDONED"}; }
 Failure CredentialMutexReleaseFailed() { return {"CREDENTIAL_MUTEX_RELEASE_FAILED"}; }
 Failure CredentialMutexForeign() { return {"CREDENTIAL_MUTEX_FOREIGN"}; }
+Failure CredentialAuditGuardReleaseFailed() {
+  return {"CREDENTIAL_AUDIT_GUARD_RELEASE_FAILED"};
+}
+Failure CredentialAuditGuardForeign() { return {"CREDENTIAL_AUDIT_GUARD_FOREIGN"}; }
 
 bool IsNotFoundError(DWORD error) {
   return error == ERROR_FILE_NOT_FOUND
@@ -795,6 +800,8 @@ struct OpenRelativeOptions {
   bool ownerOnlyOnCreate = false;
   DWORD access = FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
   DWORD shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+  std::size_t protectedAncestorDepth = 0;
+  DWORD protectedAncestorShareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
   ULONG disposition = kFileOpen;
   ULONG extraOptions = 0;
   PSECURITY_DESCRIPTOR securityDescriptor = nullptr;
@@ -824,7 +831,15 @@ bool OpenRelativePath(
     // traversing ancestors.  Creation of missing directories is a separate
     // parent-handle operation in EnsureDirectoryCallback below.
     const DWORD access = final ? options.access : kDirectoryTraversalAccess;
-    const DWORD shareMode = final ? options.shareMode : kDirectoryShareMode;
+    const std::size_t remainingComponents = parsed.components.size() - index - 1;
+    const bool protectedAncestor = !final
+        && options.protectedAncestorDepth > 0
+        && remainingComponents <= options.protectedAncestorDepth;
+    const DWORD shareMode = final
+        ? options.shareMode
+        : protectedAncestor
+          ? options.protectedAncestorShareMode
+          : kDirectoryShareMode;
     const ULONG disposition = final ? options.disposition : kFileOpen;
     const PSECURITY_DESCRIPTOR securityDescriptor = final
         ? options.securityDescriptor
@@ -1149,7 +1164,8 @@ bool OpenSecureExisting(
     DWORD shareMode,
     HANDLE* handle,
     HandleIdentity* identity,
-    Failure* failure) {
+    Failure* failure,
+    SecuritySnapshot* security = nullptr) {
   ParsedPath parsed;
   if (!ParseAndValidatePath(path, false, &parsed, failure)) return false;
   RelativeHandles opened;
@@ -1164,7 +1180,7 @@ bool OpenSecureExisting(
       || finalMissing || opened.final == INVALID_HANDLE_VALUE) {
     return false;
   }
-  if (!ValidateSecurity(opened.final, directory, failure, identity)) {
+  if (!ValidateSecurity(opened.final, directory, failure, identity, security)) {
     return false;
   }
   if (!ResolveFinalPath(opened.final, &parsed)) {
@@ -1807,6 +1823,189 @@ napi_value DeleteFileCallback(napi_env env, napi_callback_info info) {
   return result;
 }
 
+struct CredentialAuditFileGuard {
+  std::vector<HANDLE> handles;
+  bool active = false;
+};
+
+std::array<CredentialAuditFileGuard*, 64> gCredentialAuditFileGuards{};
+std::mutex gCredentialAuditFileGuardsMutex;
+
+bool IsIssuedCredentialAuditFileGuard(CredentialAuditFileGuard* guard) {
+  return std::find(
+      gCredentialAuditFileGuards.begin(),
+      gCredentialAuditFileGuards.end(),
+      guard) != gCredentialAuditFileGuards.end();
+}
+
+bool RegisterCredentialAuditFileGuard(CredentialAuditFileGuard* guard) {
+  const auto available = std::find(
+      gCredentialAuditFileGuards.begin(),
+      gCredentialAuditFileGuards.end(),
+      nullptr);
+  if (available == gCredentialAuditFileGuards.end()) return false;
+  *available = guard;
+  return true;
+}
+
+bool UnregisterCredentialAuditFileGuard(CredentialAuditFileGuard* guard) {
+  const auto existing = std::find(
+      gCredentialAuditFileGuards.begin(),
+      gCredentialAuditFileGuards.end(),
+      guard);
+  if (existing == gCredentialAuditFileGuards.end()) return false;
+  *existing = nullptr;
+  return true;
+}
+
+void FinalizeCredentialAuditFileGuard(napi_env, void* data, void*) {
+  auto* guard = static_cast<CredentialAuditFileGuard*>(data);
+  if (guard == nullptr) return;
+  const std::lock_guard<std::mutex> lock(gCredentialAuditFileGuardsMutex);
+  const bool issued = UnregisterCredentialAuditFileGuard(guard);
+  if (issued && guard->active) {
+    for (auto iterator = guard->handles.rbegin(); iterator != guard->handles.rend(); ++iterator) {
+      if (*iterator != INVALID_HANDLE_VALUE) CloseHandle(*iterator);
+    }
+    guard->handles.clear();
+    guard->active = false;
+  }
+  delete guard;
+}
+
+napi_value AcquireCredentialAuditFileGuardCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 1)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring path;
+  if (!GetString(env, arguments[0], &path)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  Failure failure = OperationFailed();
+  ParsedPath parsed;
+  if (!ParseAndValidatePath(path, false, &parsed, &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  RelativeHandles opened;
+  OpenRelativeOptions options;
+  options.finalDirectoryKnown = true;
+  options.finalDirectory = false;
+  options.access = READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  options.shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+  options.protectedAncestorDepth = 2;
+  options.protectedAncestorShareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+  options.disposition = kFileOpen;
+  bool finalMissing = false;
+  if (!OpenRelativePath(parsed, options, &opened, &finalMissing, &failure)
+      || finalMissing
+      || opened.final == INVALID_HANDLE_VALUE
+      || opened.parents.size() < 2) {
+    return ThrowFailure(env, failure);
+  }
+  HandleIdentity identity;
+  SecuritySnapshot security;
+  if (!ValidateSecurity(opened.final, false, &failure, &identity, &security)
+      || !ResolveFinalPath(opened.final, &parsed)) {
+    return ThrowFailure(env, failure);
+  }
+  if (security.denyAce
+      || security.ownerAllowAceCount != 1
+      || security.ownerAllowMask != FILE_ALL_ACCESS) {
+    return ThrowFailure(env, SecurityPolicy("credential_audit_guard_security"));
+  }
+  for (std::size_t offset = 0; offset < 2; ++offset) {
+    SecuritySnapshot directorySecurity;
+    HANDLE directory = opened.parents[opened.parents.size() - 1 - offset];
+    if (!ValidateSecurity(directory, true, &failure, nullptr, &directorySecurity)
+        || directorySecurity.denyAce
+        || directorySecurity.ownerAllowAceCount != 1
+        || directorySecurity.ownerAllowMask != FILE_ALL_ACCESS) {
+      return ThrowFailure(env, SecurityPolicy("credential_audit_directory_security"));
+    }
+  }
+  std::vector<HANDLE> guardedHandles;
+  guardedHandles.reserve(3);
+  for (std::size_t offset = 0; offset < 2; ++offset) {
+    const std::size_t index = opened.parents.size() - 1 - offset;
+    guardedHandles.push_back(opened.parents[index]);
+    opened.parents[index] = INVALID_HANDLE_VALUE;
+  }
+  guardedHandles.push_back(opened.releaseFinal());
+  auto* guard = new (std::nothrow) CredentialAuditFileGuard{
+      std::move(guardedHandles),
+      true,
+  };
+  if (guard == nullptr) {
+    for (HANDLE guarded : guardedHandles) {
+      if (guarded != INVALID_HANDLE_VALUE) CloseHandle(guarded);
+    }
+    return ThrowFailure(env, OperationFailed());
+  }
+  {
+    const std::lock_guard<std::mutex> lock(gCredentialAuditFileGuardsMutex);
+    if (!RegisterCredentialAuditFileGuard(guard)) {
+      for (HANDLE guarded : guard->handles) {
+        if (guarded != INVALID_HANDLE_VALUE) CloseHandle(guarded);
+      }
+      delete guard;
+      return ThrowFailure(env, OperationFailed());
+    }
+  }
+  napi_value external;
+  if (napi_create_external(
+          env,
+          guard,
+          FinalizeCredentialAuditFileGuard,
+          nullptr,
+          &external) != napi_ok) {
+    FinalizeCredentialAuditFileGuard(env, guard, nullptr);
+    return ThrowFailure(env, OperationFailed());
+  }
+  napi_value result;
+  napi_create_object(env, &result);
+  napi_set_named_property(env, result, "guard", external);
+  napi_set_named_property(env, result, "identity", IdentityValue(env, identity));
+  return result;
+}
+
+napi_value ReleaseCredentialAuditFileGuardCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 1)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, arguments[0], &type) != napi_ok || type != napi_external) {
+    return ThrowFailure(env, CredentialAuditGuardForeign());
+  }
+  void* data = nullptr;
+  if (napi_get_value_external(env, arguments[0], &data) != napi_ok || data == nullptr) {
+    return ThrowFailure(env, CredentialAuditGuardForeign());
+  }
+  auto* guard = static_cast<CredentialAuditFileGuard*>(data);
+  const std::lock_guard<std::mutex> lock(gCredentialAuditFileGuardsMutex);
+  if (!IsIssuedCredentialAuditFileGuard(guard)
+      || !guard->active
+      || guard->handles.empty()) {
+    return ThrowFailure(env, CredentialAuditGuardForeign());
+  }
+  UnregisterCredentialAuditFileGuard(guard);
+  bool closed = true;
+  for (auto iterator = guard->handles.rbegin(); iterator != guard->handles.rend(); ++iterator) {
+    if (*iterator != INVALID_HANDLE_VALUE && !CloseHandle(*iterator)) closed = false;
+  }
+  guard->handles.clear();
+  guard->active = false;
+  if (!closed) return ThrowFailure(env, CredentialAuditGuardReleaseFailed());
+  napi_value undefined;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
 struct CredentialMutexLease {
   HANDLE handle = nullptr;
   DWORD ownerThreadId = 0;
@@ -2042,6 +2241,16 @@ NAPI_MODULE_INIT() {
   DefineMethod(env, exports, "createFile", CreateFileCallback);
   DefineMethod(env, exports, "deleteFile", DeleteFileCallback);
   DefineMethod(env, exports, "replaceFile", ReplaceFileCallback);
+  DefineMethod(
+      env,
+      exports,
+      "acquireCredentialAuditFileGuard",
+      AcquireCredentialAuditFileGuardCallback);
+  DefineMethod(
+      env,
+      exports,
+      "releaseCredentialAuditFileGuard",
+      ReleaseCredentialAuditFileGuardCallback);
   DefineMethod(env, exports, "acquireCredentialMutex", AcquireCredentialMutexCallback);
   DefineMethod(env, exports, "releaseCredentialMutex", ReleaseCredentialMutexCallback);
   napi_value version;
@@ -2061,6 +2270,17 @@ NAPI_MODULE_INIT() {
       exports,
       "credentialMutexContractVersion",
       credentialMutexVersion);
+  napi_value credentialAuditGuardVersion;
+  napi_create_string_utf8(
+      env,
+      "windows-credential-audit-file-guard-v1",
+      NAPI_AUTO_LENGTH,
+      &credentialAuditGuardVersion);
+  napi_set_named_property(
+      env,
+      exports,
+      "credentialAuditFileGuardContractVersion",
+      credentialAuditGuardVersion);
   napi_value productionSafe;
   napi_value pathWalkRaceSafe;
   napi_value credentialMutexSafe;
@@ -2070,5 +2290,12 @@ NAPI_MODULE_INIT() {
   napi_set_named_property(env, exports, "productionSafe", productionSafe);
   napi_set_named_property(env, exports, "pathWalkRaceSafe", pathWalkRaceSafe);
   napi_set_named_property(env, exports, "credentialMutexSafe", credentialMutexSafe);
+  napi_value credentialAuditFileGuardSafe;
+  napi_get_boolean(env, true, &credentialAuditFileGuardSafe);
+  napi_set_named_property(
+      env,
+      exports,
+      "credentialAuditFileGuardSafe",
+      credentialAuditFileGuardSafe);
   return exports;
 }

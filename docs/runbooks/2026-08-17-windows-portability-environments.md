@@ -60,32 +60,25 @@ definition; no long-lived container state is required.
 ## Native Windows x64 lane
 
 The workflow is manual-only so an unreviewed branch cannot consume runner time
-or become support evidence automatically. The milestone used a temporary,
-branch-scoped push trigger to qualify both modes on exact commit `64989c5`,
-then restored this manual-only form. To repeat the qualification after an
-authorized branch push, run both modes against the same revision:
+or become support evidence automatically. One dispatch runs the fixed warm and
+clean dependency-store matrix against the same exact revision:
 
 ```bash
 gh workflow run windows-portability.yml \
   --repo adamallcock/tibotattle \
-  --ref codex/windows-readiness \
-  -f clean-cache=false
-
-gh workflow run windows-portability.yml \
-  --repo adamallcock/tibotattle \
-  --ref codex/windows-readiness \
-  -f clean-cache=true
+  --ref codex/windows-security-credentials
 ```
 
 For each run, preserve the run URL, commit SHA, `ImageOS`, `ImageVersion`,
 architecture, Node and pnpm versions, test counts, skips, binding SHA-256, and
 credential cleanup result. Any failure or unexplained skip keeps the milestone
-open. The clean-cache run intentionally skips only the pnpm store cache; the
+open. The clean matrix job intentionally skips only the pnpm store cache; the
 hosted runner itself is still a Microsoft-provided runner image.
 
-The completed qualification is
-[run 32029951441](https://github.com/adamallcock/tibotattle/actions/runs/32029951441):
-normal-cache job `95387488689` and clean-cache job `95387488776` both passed.
+The latest completed qualification is
+[run 32085366833](https://github.com/adamallcock/tibotattle/actions/runs/32085366833):
+restored/primed-store job `95556686783` and clean-store job `95556687033` both
+passed on revision `b8811349b5b38df0319684ebc0b4377f9d404c94`.
 
 ## Local UTM lane
 

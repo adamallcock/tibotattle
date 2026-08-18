@@ -234,6 +234,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/platform/participant-identity.js",
   "src/platform/telemetry-envelope.js",
   "src/platform/telemetry-v1-envelope.js",
+  "src/platform/windows-production-readiness.js",
   "src/prepared-contribution-compatibility-internal.js",
   "src/providers/claude/statusline.js",
   "src/providers/codex/account-scope.js",

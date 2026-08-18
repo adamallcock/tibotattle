@@ -10,6 +10,7 @@ import {
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import {
   WINDOWS_CREDENTIAL_OPERATION_AUDIT_CAPABILITY_PAIRS,
@@ -93,6 +94,7 @@ test("audit store is branded and creates a fixed SQLite schema", async () => wit
   }), false);
   assert.equal(store.filePath, filePath);
   assert.equal(store.closed, false);
+  assert.equal(store.filesystemProtected, false);
   const bytes = await readFile(filePath);
   assert.ok(bytes.byteLength > 0);
   const text = bytes.toString("utf8");
@@ -277,6 +279,75 @@ test("audit store rejects malformed or tampered files with fixed errors", async 
     );
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("audit store rejects marker-compatible v1 schema without the composite capability check", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-audit-legacy-v1-"));
+  const filePath = join(root, "windows-credential-operation-audit-v1.sqlite");
+  const database = new DatabaseSync(filePath);
+  try {
+    database.exec(`
+      PRAGMA application_id=1430470997;
+      PRAGMA user_version=1;
+      CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+      INSERT INTO meta(key, value)
+        VALUES ('schema_version', 'windows-credential-operation-audit-v1');
+      CREATE TABLE credential_operations (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        lease_id TEXT NOT NULL UNIQUE,
+        owner TEXT NOT NULL,
+        capability TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        result TEXT,
+        failure_class TEXT,
+        prepared_at INTEGER NOT NULL,
+        settled_at INTEGER,
+        recovered_at INTEGER,
+        recovery_class TEXT
+      ) STRICT;
+    `);
+  } finally {
+    database.close();
+  }
+  await chmod(filePath, 0o600);
+  try {
+    assert.throws(
+      () => createWindowsCredentialOperationAuditStore({ filePath }),
+      auditError("schema_invalid"),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("audit store rejects future application and user schema markers without rewriting", async () => {
+  for (const [marker, value] of [
+    ["application_id", 1430470998],
+    ["user_version", 2],
+  ]) {
+    const root = await mkdtemp(join(tmpdir(), `tibotattle-windows-audit-${marker}-`));
+    const filePath = join(root, "windows-credential-operation-audit-v1.sqlite");
+    const store = createWindowsCredentialOperationAuditStore({ filePath });
+    store.close();
+    const database = new DatabaseSync(filePath);
+    try {
+      database.exec(`PRAGMA ${marker}=${value}`);
+    } finally {
+      database.close();
+    }
+    await chmod(filePath, 0o600);
+    try {
+      const before = await readFile(filePath);
+      assert.throws(
+        () => createWindowsCredentialOperationAuditStore({ filePath }),
+        auditError("schema_invalid"),
+      );
+      assert.deepEqual(await readFile(filePath), before);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   }
 });
 

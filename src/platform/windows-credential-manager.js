@@ -18,6 +18,9 @@ import {
   createWindowsCredentialOperationAuditStore,
   defaultWindowsCredentialOperationAuditFile,
 } from "./windows-credential-operation-audit.js";
+import {
+  createWindowsCredentialAuditFileGuardContext,
+} from "./windows-credential-audit-file-guard.js";
 
 const SECRET_BYTES = 32;
 const STORED_SECRET_PATTERN = /^[A-Za-z0-9_-]{43}$/;
@@ -205,9 +208,12 @@ function validateOperationLeaseContext(context) {
       && typeof context.withLease === "function"
       && typeof context.readAuditEvents === "function"
       && typeof context.readDurableAuditRecords === "function"
+      && typeof context.recoverPreparedOperations === "function"
       && typeof context.close === "function"
       && typeof context.crossProcessSafe === "boolean"
       && typeof context.auditDurable === "boolean"
+      && typeof context.auditFilesystemProtected === "boolean"
+      && typeof context.startupRecoveryComplete === "boolean"
       && context.productionSafe === false;
   } catch {
     // Hostile injected contexts are configuration failures, not native errors.
@@ -275,6 +281,10 @@ export function createWindowsCredentialManagerBackend(options = {}) {
           fail("operation_lease_mutex_failed");
         }
         try {
+          const fileGuardContext = createWindowsCredentialAuditFileGuardContext({
+            platform,
+            architecture,
+          });
           const qualificationStateRoot = process.env.GITHUB_ACTIONS === "true"
             && process.env.USAGE_MONITOR_WINDOWS_QUALIFICATION === "1"
             && typeof process.env.TIBOTATTLE_WINDOWS_QUALIFICATION_STATE_ROOT === "string"
@@ -286,6 +296,7 @@ export function createWindowsCredentialManagerBackend(options = {}) {
               platform,
               stateRoot: qualificationStateRoot,
             }),
+            fileGuardContext,
           });
           ownedAuditStore = auditStore;
         } catch {
@@ -298,6 +309,7 @@ export function createWindowsCredentialManagerBackend(options = {}) {
         auditStore,
         ownsAuditStore: auditStore !== null,
       });
+      if (nativeGuarded) leaseContext.recoverPreparedOperations();
     } catch (error) {
       try {
         ownedAuditStore?.close();
@@ -336,6 +348,10 @@ export function createWindowsCredentialManagerBackend(options = {}) {
       productionSafe: false,
       crossProcessSafe: leaseContext.crossProcessSafe,
       auditDurable: leaseContext.auditDurable,
+      auditFilesystemProtected: leaseContext.auditFilesystemProtected,
+      startupRecoveryComplete: leaseContext.startupRecoveryComplete,
+      crossSessionSafe: false,
+      bindingProvenanceAuthenticated: false,
     });
   }
 
@@ -536,6 +552,10 @@ export function createWindowsCredentialManagerBackend(options = {}) {
     close,
     crossProcessSafe: leaseContext.crossProcessSafe,
     auditDurable: leaseContext.auditDurable,
+    auditFilesystemProtected: leaseContext.auditFilesystemProtected,
+    startupRecoveryComplete: leaseContext.startupRecoveryComplete,
+    crossSessionSafe: false,
+    bindingProvenanceAuthenticated: false,
     productionSafe: false,
   });
 }

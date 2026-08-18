@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import {
   link,
   mkdtemp,
+  rename,
   rm,
   symlink,
 } from "node:fs/promises";
@@ -14,6 +15,8 @@ import {
   createWindowsFilesystemAdapter,
   loadWindowsFilesystemBinding,
 } from "../src/platform/windows-filesystem.js";
+import { createWindowsCredentialAuditFileGuardContext } from "../src/platform/windows-credential-audit-file-guard.js";
+import { createWindowsCredentialOperationAuditStore } from "../src/platform/windows-credential-operation-audit.js";
 
 const NATIVE_WINDOWS = process.platform === "win32" && process.arch === "x64";
 const NATIVE_SKIP = NATIVE_WINDOWS ? false : "native Windows x64 only";
@@ -166,5 +169,82 @@ test("native adapter rejects reserved and traversal path components", {
       fixedNativeError("WINDOWS_FILESYSTEM_INVALID_PATH"),
       component,
     );
+  }
+}));
+
+test("native audit guards coexist with SQLite and pin its file and private directory", {
+  skip: NATIVE_SKIP,
+}, async () => withSyntheticRoot(async ({ root }) => {
+  const privateRoot = join(root, "private");
+  const movedPrivateRoot = join(root, "private-moved");
+  const movedStateRoot = `${root}-moved`;
+  const filePath = join(
+    privateRoot,
+    "windows-credential-operation-audit-v1.sqlite",
+  );
+  const guardContext = createWindowsCredentialAuditFileGuardContext();
+  const store = createWindowsCredentialOperationAuditStore({
+    filePath,
+    fileGuardContext: guardContext,
+  });
+  try {
+    store.prepare({
+      leaseId: "00000000-0000-4000-8000-000000000301",
+      owner: "participant-identity",
+      capability: "export_identity",
+      operation: "create",
+    });
+    store.settle({
+      leaseId: "00000000-0000-4000-8000-000000000301",
+      result: "created",
+    });
+    assert.equal(store.read().length, 1);
+    await assert.rejects(rename(filePath, `${filePath}.moved`));
+    await assert.rejects(rm(filePath));
+    await assert.rejects(rename(`${filePath}-journal`, `${filePath}-journal.moved`));
+    await assert.rejects(rm(`${filePath}-journal`));
+    await assert.rejects(rename(privateRoot, movedPrivateRoot));
+    await assert.rejects(rename(root, movedStateRoot));
+  } finally {
+    store.close();
+  }
+  await rename(privateRoot, movedPrivateRoot);
+  await rename(movedPrivateRoot, privateRoot);
+  await rename(root, movedStateRoot);
+  await rename(movedStateRoot, root);
+}));
+
+test("native audit guard rejects hard-linked and reparse-point database files", {
+  skip: NATIVE_SKIP,
+}, async (t) => withSyntheticRoot(async ({ adapter, root }) => {
+  const privateRoot = join(root, "private");
+  const filePath = join(
+    privateRoot,
+    "windows-credential-operation-audit-v1.sqlite",
+  );
+  const aliasPath = `${filePath}.alias`;
+  adapter.ensureDirectory(root);
+  adapter.ensureDirectory(privateRoot);
+  adapter.createFile(filePath, Buffer.alloc(0));
+  await link(filePath, aliasPath);
+  const binding = loadWindowsFilesystemBinding();
+  assert.throws(
+    () => binding.acquireCredentialAuditFileGuard(filePath),
+    fixedNativeError("WINDOWS_FILESYSTEM_HARD_LINK"),
+  );
+  await rm(aliasPath);
+  await rm(filePath);
+  try {
+    await symlink(aliasPath, filePath, "file");
+    assert.throws(
+      () => binding.acquireCredentialAuditFileGuard(filePath),
+      fixedNativeError("WINDOWS_FILESYSTEM_REPARSE_POINT"),
+    );
+  } catch (error) {
+    if (error?.code === "EPERM" || error?.code === "EINVAL") {
+      t.skip("symbolic-link creation is unavailable on this Windows runner");
+      return;
+    }
+    throw error;
   }
 }));

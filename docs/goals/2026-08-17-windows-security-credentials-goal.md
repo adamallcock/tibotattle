@@ -94,9 +94,9 @@ remain separate work.
   are rejected at the private-state and participant-identity boundary.
 - [ ] Sensitive file identity remains stable through write, flush, reopen, and
   post-write validation.
-- [ ] The four production credentials pass create/read/replace/delete,
+- [x] The four production credentials pass create/read/replace/delete,
   conflict, concurrency, restart, and upgrade-retention tests.
-- [x] No macOS capability or existing portable behavior regresses.
+- [ ] No macOS capability or existing portable behavior regresses.
 - [x] Native Windows x64 qualification passes twice, including a clean-cache
   run, with no unexplained skip or failure.
 - [x] The receipt contains no secret, path, SID, account, or user-data content.
@@ -128,6 +128,21 @@ remain separate work.
   vocabularies and a random lease ID. It retains 256 terminal rows, never
   prunes prepared rows, allows at most 16 unresolved rows, rejects mismatched
   owner/capability pairs, and exposes an owned close boundary.
+- Native Windows now holds opaque no-delete handles for the fixed audit
+  database, its persistent rollback journal, and the two owned ancestor
+  directories for the lifetime of SQLite. This blocks path replacement while
+  the store is active and is a separate narrow contract from the still-false
+  general `pathWalkRaceSafe` claim. The supported guard boundary begins at the
+  application state root; its OS-managed parent remains a trust anchor and is
+  not claimed as guarded by this milestone.
+- Manager construction performs a startup sweep across all four capability
+  mutexes before reporting recovery complete. Prepared rows are recovered only
+  while their matching named mutex is held; contention leaves readiness false.
+- One shared readiness gate now fronts export identity, account observation,
+  Claude callback, and contribution-device composition roots. It requires the
+  mutex, durable audit, guarded audit filesystem, completed startup recovery,
+  protected consumer state paths, and authenticated binding provenance. All
+  four selectors remain deliberately disabled.
 - The native build emits a fixed sidecar manifest and the loader verifies the
   binary byte count, SHA-256, contract, and native claims before loading it.
   The manifest's approved production policy remains false; signing or another
@@ -144,6 +159,14 @@ remain separate work.
   The [dated credential-coordination receipt](../receipts/2026-08-17-windows-credential-coordination-receipt.md)
   records the runner, toolchain, both binding digests, and remaining production
   gates.
+- The audit-guard, startup-recovery, mutex-lifecycle, four-consumer readiness,
+  and schema/retention extension passed on exact revision
+  `b8811349b5b38df0319684ebc0b4377f9d404c94` in both the restored/offline and
+  explicitly empty dependency-store lanes. Each job passed all 95 native
+  qualification tests with zero skips in
+  [run 32085366833](https://github.com/adamallcock/tibotattle/actions/runs/32085366833).
+  The [dated audit-guard receipt](../receipts/2026-08-17-windows-credential-audit-guard-receipt.md)
+  records the exact claim boundary and remaining production gates.
 
 ## Deferred follow-on work
 
@@ -151,9 +174,8 @@ remain separate work.
   security adapter into export artifact storage.
 - Extend the adapter to queue, prepared-contribution, SQLite workspace,
   metadata bundle, collector, deletion/discard, and source-reader stores.
-- Add a startup maintenance sweep that acquires each capability mutex before
-  recovering its pending rows; the current safe recovery is deliberately lazy
-  and occurs on the next operation for that same capability.
+- Authenticate the binding manifest through the signed installer or another
+  separately trusted release digest before creating a readiness attestation.
 - Decide whether the supported desktop contract remains one interactive logon
   session (`Local\`) or requires separately qualified cross-session
   coordination. Do not change to `Global\` without that decision and ACL tests.

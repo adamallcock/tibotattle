@@ -12,6 +12,10 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, posix, win32 } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import {
+  isWindowsCredentialAuditFileGuardContext,
+} from "./windows-credential-audit-file-guard.js";
+
 export const WINDOWS_CREDENTIAL_OPERATION_AUDIT_SCHEMA_VERSION =
   "windows-credential-operation-audit-v1";
 export const WINDOWS_CREDENTIAL_OPERATION_AUDIT_APPLICATION_ID = 0x55434155;
@@ -269,7 +273,7 @@ function syncDirectory(path) {
 function configureDatabase(database) {
   try {
     database.exec(`
-      PRAGMA journal_mode=DELETE;
+      PRAGMA journal_mode=PERSIST;
       PRAGMA synchronous=FULL;
       PRAGMA foreign_keys=ON;
       PRAGMA trusted_schema=OFF;
@@ -360,6 +364,42 @@ function validateSchema(database) {
         || schema?.value !== WINDOWS_CREDENTIAL_OPERATION_AUDIT_SCHEMA_VERSION) {
       fail("schema_invalid");
     }
+    const unexpectedObjects = Number(database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM sqlite_master
+      WHERE type IN ('trigger', 'view')
+        AND tbl_name IN ('meta', 'credential_operations')
+    `).get().count);
+    if (unexpectedObjects !== 0) fail("schema_invalid");
+
+    // The initial v1 implementation briefly relied only on marker values.
+    // Probe the owner/capability CHECK inside a rolled-back savepoint so an
+    // earlier or tampered v1-shaped database cannot bypass the composite
+    // constraint while retaining the same application_id and user_version.
+    const probeId = "00000000-0000-4000-8000-000000000000";
+    database.exec("SAVEPOINT credential_schema_probe");
+    let mismatchRejected = false;
+    try {
+      database.prepare(
+        "DELETE FROM credential_operations WHERE lease_id = ?",
+      ).run(probeId);
+      try {
+        database.prepare(`
+          INSERT INTO credential_operations(
+            lease_id, owner, capability, operation, phase,
+            result, failure_class, prepared_at, settled_at,
+            recovered_at, recovery_class
+          ) VALUES (?, 'participant-identity', 'account_observation',
+            'create', 'prepared', NULL, NULL, 0, NULL, NULL, NULL)
+        `).run(probeId);
+      } catch {
+        mismatchRejected = true;
+      }
+    } finally {
+      database.exec("ROLLBACK TO credential_schema_probe");
+      database.exec("RELEASE credential_schema_probe");
+    }
+    if (!mismatchRejected) fail("schema_invalid");
   } catch (error) {
     if (isWindowsCredentialOperationAuditError(error)) throw error;
     fail("schema_invalid");
@@ -373,6 +413,7 @@ function transaction(database, filePath, callback) {
       const result = callback();
       database.exec("COMMIT");
       syncFile(filePath);
+      syncFile(`${filePath}-journal`);
       syncDirectory(filePath);
       return result;
     } catch (error) {
@@ -494,26 +535,56 @@ function normalizeRecovery(value, clock) {
   return Object.freeze({ leaseId, recoveryClass, at });
 }
 
-function openAuditDatabase(filePath) {
+function openAuditDatabase(filePath, fileGuardContext) {
   const path = assertPath(filePath);
   const parent = dirname(path);
-  try {
-    mkdirSync(parent, { recursive: true, mode: 0o700 });
-  } catch {
-    fail("unavailable");
+  let fileGuardLease = null;
+  let existing = null;
+  if (fileGuardContext === null) {
+    try {
+      mkdirSync(parent, { recursive: true, mode: 0o700 });
+    } catch {
+      fail("unavailable");
+    }
+    assertNoSymlinkBoundary(parent);
+    assertDirectory(parent);
+    existing = assertDatabaseFile(path, { allowMissing: true });
+  } else {
+    try {
+      fileGuardLease = fileGuardContext.acquire(path);
+    } catch {
+      fail("unavailable");
+    }
   }
-  assertNoSymlinkBoundary(parent);
-  assertDirectory(parent);
-  const existing = assertDatabaseFile(path, { allowMissing: true });
-  if (existing !== null && existing.size > 0) {
+  if ((fileGuardContext !== null && existing === null)
+      || (existing !== null && existing.size > 0)) {
     let handle;
     try {
       handle = openSync(path, constants.O_RDONLY);
       const bytes = Buffer.alloc(16);
       const count = readSync(handle, bytes, 0, bytes.byteLength, 0);
-      const header = bytes.subarray(0, count).toString("utf8");
-      if (header !== "SQLite format 3\0") fail("schema_invalid");
+      if (count > 0) {
+        const header = bytes.subarray(0, count).toString("utf8");
+        if (header !== "SQLite format 3\0") fail("schema_invalid");
+        if (existing === null) existing = Object.freeze({ size: count });
+      }
     } catch (error) {
+      if (handle !== undefined) {
+        try {
+          closeSync(handle);
+          handle = undefined;
+        } catch {
+          // The fixed read failure below remains authoritative.
+        }
+      }
+      if (fileGuardLease !== null) {
+        try {
+          fileGuardContext.release(fileGuardLease);
+          fileGuardLease = null;
+        } catch {
+          // The fixed read failure below remains authoritative.
+        }
+      }
       if (isWindowsCredentialOperationAuditError(error)) throw error;
       fail("unavailable");
     } finally {
@@ -532,12 +603,17 @@ function openAuditDatabase(filePath) {
     configureDatabase(database);
     if (existing === null || existing.size === 0) initializeSchema(database);
     else validateSchema(database);
-    chmodSync(path, 0o600);
+    if (fileGuardContext === null) chmodSync(path, 0o600);
   } catch (error) {
     try {
       database?.close();
     } catch {
       // The fixed error below is authoritative for database cleanup failures.
+    }
+    try {
+      if (fileGuardLease !== null) fileGuardContext.release(fileGuardLease);
+    } catch {
+      // The fixed open failure below remains authoritative.
     }
     if (isWindowsCredentialOperationAuditError(error)) throw error;
     // A non-empty file that cannot be opened as the reviewed SQLite schema is
@@ -545,8 +621,22 @@ function openAuditDatabase(filePath) {
     // by the fixed filesystem checks before this point.
     fail(existing !== null && existing.size > 0 ? "schema_invalid" : "unavailable");
   }
-  syncFile(path);
-  return database;
+  try {
+    syncFile(path);
+  } catch (error) {
+    try {
+      database.close();
+    } catch {
+      // The fixed sync failure below remains authoritative.
+    }
+    try {
+      if (fileGuardLease !== null) fileGuardContext.release(fileGuardLease);
+    } catch {
+      // The fixed sync failure below remains authoritative.
+    }
+    throw error;
+  }
+  return Object.freeze({ database, fileGuardLease });
 }
 
 export function defaultWindowsCredentialOperationAuditFile({
@@ -592,17 +682,24 @@ export function createWindowsCredentialOperationAuditStore(options = {}) {
   const configuration = assertOptions(options);
   let filePath;
   let clock;
+  let fileGuardContext;
   try {
     filePath = configuration.filePath ?? defaultWindowsCredentialOperationAuditFile();
     clock = configuration.clock ?? (() => Date.now());
+    fileGuardContext = configuration.fileGuardContext ?? null;
   } catch (error) {
     if (isWindowsCredentialOperationAuditError(error)) throw error;
     fail("invalid_configuration");
   }
   assertPath(filePath);
   if (typeof clock !== "function") fail("invalid_configuration");
+  if (fileGuardContext !== null
+      && !isWindowsCredentialAuditFileGuardContext(fileGuardContext)) {
+    fail("invalid_configuration");
+  }
 
-  const database = openAuditDatabase(filePath);
+  const opened = openAuditDatabase(filePath, fileGuardContext);
+  const { database, fileGuardLease } = opened;
   let closed = false;
   const ensureOpen = () => {
     if (closed || !database.isOpen) fail("closed");
@@ -614,6 +711,9 @@ export function createWindowsCredentialOperationAuditStore(options = {}) {
     },
     get closed() {
       return closed;
+    },
+    get filesystemProtected() {
+      return fileGuardContext !== null;
     },
     prepare(value) {
       ensureOpen();
@@ -714,13 +814,22 @@ export function createWindowsCredentialOperationAuditStore(options = {}) {
     },
     close() {
       if (closed) return;
+      let closeFailed = false;
       try {
         database.close();
       } catch {
-        fail("unavailable");
+        closeFailed = true;
       } finally {
         closed = true;
       }
+      if (fileGuardLease !== null) {
+        try {
+          fileGuardContext.release(fileGuardLease);
+        } catch {
+          closeFailed = true;
+        }
+      }
+      if (closeFailed) fail("unavailable");
     },
   };
   Object.freeze(store);

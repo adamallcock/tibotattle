@@ -16,6 +16,7 @@ import {
   createWindowsCredentialMutexContext,
 } from "../src/platform/windows-credential-mutex.js";
 import {
+  WINDOWS_CREDENTIAL_OPERATION_AUDIT_CAPABILITY_PAIRS,
   createWindowsCredentialOperationAuditStore,
 } from "../src/platform/windows-credential-operation-audit.js";
 
@@ -273,6 +274,47 @@ test("Windows operation lease recovers durable prepared rows before the next mut
     assert.equal(records[1].capability, "account_observation");
     assert.equal(records[2].phase, "settled");
     assert.equal(records[2].result, "created");
+  } finally {
+    auditStore.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows operation lease startup sweep recovers every capability under its mutex", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-lease-startup-"));
+  const auditStore = createWindowsCredentialOperationAuditStore({
+    filePath: join(root, "private", "windows-credential-operation-audit-v1.sqlite"),
+  });
+  try {
+    for (let index = 0; index < WINDOWS_CREDENTIAL_OPERATION_AUDIT_CAPABILITY_PAIRS.length; index += 1) {
+      const pair = WINDOWS_CREDENTIAL_OPERATION_AUDIT_CAPABILITY_PAIRS[index];
+      auditStore.prepare({
+        leaseId: `00000000-0000-4000-8000-${String(200 + index).padStart(12, "0")}`,
+        owner: pair.owner,
+        capability: pair.capability,
+        operation: "replace",
+      });
+    }
+    const context = createWindowsCredentialOperationLeaseContext({
+      mutexContext: memoryMutexContext({ abandoned: true }),
+      auditStore,
+    });
+    assert.equal(context.startupRecoveryComplete, false);
+    assert.deepEqual(context.recoverPreparedOperations(), {
+      complete: true,
+      recovered: 4,
+      contended: 0,
+    });
+    assert.equal(context.startupRecoveryComplete, true);
+    assert.deepEqual(auditStore.readPending(), []);
+    assert.equal(auditStore.read().every((row) => (
+      row.phase === "recovered" && row.recoveryClass === "unknown_after_crash"
+    )), true);
+    assert.deepEqual(context.recoverPreparedOperations(), {
+      complete: true,
+      recovered: 0,
+      contended: 0,
+    });
   } finally {
     auditStore.close();
     await rm(root, { recursive: true, force: true });

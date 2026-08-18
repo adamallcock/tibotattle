@@ -51,10 +51,13 @@ function assertBindingShape(binding) {
     valid = valid
       && binding?.contractVersion === "windows-filesystem-v1"
       && binding?.securityContractVersion === "windows-filesystem-security-v1"
+      && binding?.credentialAuditFileGuardContractVersion
+        === "windows-credential-audit-file-guard-v1"
       && binding?.credentialMutexContractVersion === "windows-credential-mutex-v1"
       && typeof binding?.productionSafe === "boolean"
       && typeof binding?.pathWalkRaceSafe === "boolean"
       && binding?.credentialMutexSafe === true;
+    valid = valid && binding?.credentialAuditFileGuardSafe === true;
   } catch {
     valid = false;
   }
@@ -91,17 +94,21 @@ export function createWindowsFilesystemBindingManifest({ bytes, binding }) {
     sha256: bindingSha256(normalizedBytes),
     contractVersion: native.contractVersion,
     securityContractVersion: native.securityContractVersion,
+    credentialAuditFileGuardContractVersion:
+      native.credentialAuditFileGuardContractVersion,
     credentialMutexContractVersion: native.credentialMutexContractVersion,
     requiredMethods: [...WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS],
     nativeClaims: {
       productionSafe: native.productionSafe,
       pathWalkRaceSafe: native.pathWalkRaceSafe,
       credentialMutexSafe: native.credentialMutexSafe,
+      credentialAuditFileGuardSafe: native.credentialAuditFileGuardSafe,
     },
     approvedPolicy: {
       productionSafe: false,
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
+      credentialAuditFileGuardSafe: true,
     },
   });
 }

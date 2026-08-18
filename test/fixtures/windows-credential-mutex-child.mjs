@@ -10,7 +10,11 @@ const capabilityId = isMainThread
   : workerData?.capabilityId;
 const mode = isMainThread ? (process.argv[3] ?? "once") : (workerData?.mode ?? "once");
 const context = createWindowsCredentialMutexContext();
-if (mode === "crash-after-prepare") {
+if (mode === "hold-until-terminated") {
+  const lease = context.acquire(capabilityId);
+  parentPort.postMessage("WINDOWS_CREDENTIAL_MUTEX_CHILD_ACQUIRED");
+  setInterval(() => lease, 1_000);
+} else if (mode === "crash-after-prepare") {
   const auditStore = createWindowsCredentialOperationAuditStore({
     filePath: process.argv[4],
   });

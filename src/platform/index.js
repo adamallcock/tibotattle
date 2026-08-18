@@ -19,6 +19,17 @@ export {
   createLocalContributionSyncQueueStorageContext,
 } from "./local-contribution-sync-queue-storage.js";
 export {
+  WINDOWS_BINDING_PROVENANCE_CONTRACT_VERSION,
+  WINDOWS_PRODUCTION_READINESS,
+  WINDOWS_PRODUCTION_READINESS_CONTRACT_VERSION,
+  WINDOWS_PRODUCTION_READINESS_FACTS,
+  WindowsProductionReadinessError,
+  assertWindowsProductionBackend,
+  assertWindowsProductionReadiness,
+  createWindowsProductionCapabilityBackend,
+  createWindowsProductionReadinessAttestation,
+} from "./windows-production-readiness.js";
+export {
   CONTRIBUTION_DEVICE_READER_CODE_IDENTIFIER,
   CONTRIBUTION_DEVICE_READER_TEAM_IDENTIFIER,
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,

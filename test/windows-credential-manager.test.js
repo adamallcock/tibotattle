@@ -141,6 +141,10 @@ test("Windows backend rejects duck-typed operation lease contexts", () => {
     readAuditEvents() { return []; },
     crossProcessSafe: false,
     auditDurable: false,
+    auditFilesystemProtected: false,
+    startupRecoveryComplete: false,
+    crossSessionSafe: false,
+    bindingProvenanceAuthenticated: false,
     productionSafe: false,
   };
   assert.throws(
@@ -167,6 +171,10 @@ test("Windows backend exposes only fixed capability pairs and no credential valu
     productionSafe: false,
     crossProcessSafe: false,
     auditDurable: false,
+    auditFilesystemProtected: false,
+    startupRecoveryComplete: false,
+    crossSessionSafe: false,
+    bindingProvenanceAuthenticated: false,
   });
   assert.equal(binding.calls.length, 0);
   await assert.rejects(
@@ -518,6 +526,10 @@ test("native Windows x64 qualification adapter loads the audited binding without
         productionSafe: false,
         crossProcessSafe: true,
         auditDurable: true,
+        auditFilesystemProtected: true,
+        startupRecoveryComplete: true,
+        crossSessionSafe: false,
+        bindingProvenanceAuthenticated: false,
       });
     }
   } finally {

@@ -18,6 +18,10 @@ import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
   createExportIdentityKeychainBackend,
 } from "./export-identity-keychain.js";
+import {
+  assertWindowsProductionReadiness,
+  createWindowsProductionCapabilityBackend,
+} from "./platform/index.js";
 
 const SECRET_BYTES = 32;
 const MAXIMUM_STATE_BYTES = 512;
@@ -385,7 +389,30 @@ export function createProductionContributionDeviceBackend({
   // identifier + team are stable across signed updates, so a mint bound to it
   // survives a Sparkle re-sign that the default ACL would deny.
   readerPath = process.execPath,
+  windowsReadiness = null,
+  createWindowsBackend = null,
 } = {}) {
+  if (platform === "win32") {
+    if (architecture !== "x64"
+        || typeof createWindowsBackend !== "function") {
+      fail("invalid_configuration");
+    }
+    try {
+      assertWindowsProductionReadiness({
+        platform,
+        architecture,
+        readiness: windowsReadiness,
+      });
+      const windowsBackend = createWindowsBackend({ platform, architecture });
+      return createWindowsProductionCapabilityBackend({
+        backend: windowsBackend,
+        capability: CAPABILITY,
+        readiness: windowsReadiness,
+      });
+    } catch {
+      fail("invalid_configuration");
+    }
+  }
   if (platform !== "darwin" || architecture !== "arm64" || typeof createBackend !== "function") {
     fail("invalid_configuration");
   }

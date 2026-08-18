@@ -170,6 +170,8 @@ jobs:
               $manifest.approvedPolicy.productionSafe -ne $false -or
               $manifest.approvedPolicy.pathWalkRaceSafe -ne $false -or
               $manifest.approvedPolicy.credentialMutexSafe -ne $true -or
+              $manifest.approvedPolicy.credentialAuditFileGuardSafe -ne $true -or
+              $manifest.credentialAuditFileGuardContractVersion -ne 'windows-credential-audit-file-guard-v1' -or
               $manifest.credentialMutexContractVersion -ne 'windows-credential-mutex-v1') {
             Write-Error 'WINDOWS_FILESYSTEM_BINDING_MANIFEST_INVALID'
             exit 1
@@ -192,6 +194,7 @@ jobs:
           "- Native binding bytes: $env:TIBOTATTLE_WINDOWS_BINDING_BYTES" >> $env:GITHUB_STEP_SUMMARY
           "- Native binding SHA-256: $env:TIBOTATTLE_WINDOWS_BINDING_SHA256" >> $env:GITHUB_STEP_SUMMARY
           "- Credential mutex contract: windows-credential-mutex-v1 (owner-only, per capability)" >> $env:GITHUB_STEP_SUMMARY
+          "- Credential audit file guard: windows-credential-audit-file-guard-v1 (main, journal, and two owned ancestors)" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Run portable Windows qualification
         shell: pwsh
@@ -211,9 +214,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $qualificationStateRoot = Join-Path $env:RUNNER_TEMP 'tibotattle-codex-home'
-          New-Item -ItemType Directory -Force -Path $qualificationStateRoot | Out-Null
-          "CODEX_HOME=$qualificationStateRoot" >> $env:GITHUB_ENV
+          $qualificationCodexHome = Join-Path $env:RUNNER_TEMP 'tibotattle-codex-home'
+          $qualificationStateRoot = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-private-state'
+          New-Item -ItemType Directory -Force -Path $qualificationCodexHome | Out-Null
+          "CODEX_HOME=$qualificationCodexHome" >> $env:GITHUB_ENV
           "TIBOTATTLE_WINDOWS_QUALIFICATION_STATE_ROOT=$qualificationStateRoot" >> $env:GITHUB_ENV
 
       - name: Run content-free Windows security qualification

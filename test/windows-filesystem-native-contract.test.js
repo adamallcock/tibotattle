@@ -164,6 +164,13 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   assert.match(source, /Local\\\\TiboTattle-CredentialMutation-v1-/u);
   assert.match(source, /DefineMethod\(env, exports, "acquireCredentialMutex",/u);
   assert.match(source, /DefineMethod\(env, exports, "releaseCredentialMutex",/u);
+  assert.match(source, /protectedAncestorDepth = 2/u);
+  assert.match(source, /protectedAncestorShareMode = FILE_SHARE_READ \| FILE_SHARE_WRITE/u);
+  assert.match(source, /std::mutex gCredentialAuditFileGuardsMutex/u);
+  assert.match(source, /IsIssuedCredentialAuditFileGuard/u);
+  assert.match(source, /DefineMethod\(\s*env,\s*exports,\s*"acquireCredentialAuditFileGuard",/u);
+  assert.match(source, /DefineMethod\(\s*env,\s*exports,\s*"releaseCredentialAuditFileGuard",/u);
+  assert.match(source, /"windows-credential-audit-file-guard-v1"/u);
   assert.match(source, /napi_get_boolean\(env, false, &productionSafe\)/u);
   assert.match(source, /napi_get_boolean\(env, false, &pathWalkRaceSafe\)/u);
   assert.doesNotMatch(source, /ValidateComponents\(/u);
