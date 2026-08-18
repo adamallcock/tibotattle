@@ -68,6 +68,7 @@ export class WindowsCredentialOperationAuditError extends Error {
     if (!new Set([
       "invalid_configuration",
       "unavailable",
+      "journal_mode_refused",
       "schema_invalid",
       "closed",
       "invalid_record",
@@ -270,17 +271,25 @@ function syncDirectory(path) {
   }
 }
 
-function configureDatabase(database) {
+export function configureDatabase(database) {
   try {
+    // PRAGMA journal_mode returns a row.  Executing it through exec() only
+    // prepares the statement and leaves the connection in its prior mode.
+    // Step it explicitly and fail closed if SQLite grants anything other than
+    // the durable persistent rollback journal requested by this store.
+    const journalMode = database
+      .prepare("PRAGMA journal_mode=PERSIST")
+      .get()?.journal_mode;
+    if (journalMode !== "persist") fail("journal_mode_refused");
     database.exec(`
-      PRAGMA journal_mode=PERSIST;
       PRAGMA synchronous=FULL;
       PRAGMA foreign_keys=ON;
       PRAGMA trusted_schema=OFF;
       PRAGMA temp_store=MEMORY;
       PRAGMA mmap_size=0;
     `);
-  } catch {
+  } catch (error) {
+    if (isWindowsCredentialOperationAuditError(error)) throw error;
     fail("unavailable");
   }
 }
@@ -406,15 +415,21 @@ function validateSchema(database) {
   }
 }
 
-function transaction(database, filePath, callback) {
+function transaction(database, filePath, fileGuardContext, callback) {
   try {
     database.exec("BEGIN IMMEDIATE");
     try {
       const result = callback();
       database.exec("COMMIT");
-      syncFile(filePath);
-      syncFile(`${filePath}-journal`);
-      syncDirectory(filePath);
+      if (fileGuardContext === null) {
+        // The native Windows guard pins both the database and persistent
+        // journal for the whole connection lifetime. SQLite synchronous=FULL
+        // is the durability boundary there; opening another Node fs handle or
+        // fsyncing by path would conflict with that identity-bound guard.
+        syncFile(filePath);
+        syncFile(`${filePath}-journal`);
+        syncDirectory(filePath);
+      }
       return result;
     } catch (error) {
       try {
@@ -535,6 +550,28 @@ function normalizeRecovery(value, clock) {
   return Object.freeze({ leaseId, recoveryClass, at });
 }
 
+function readDatabasePageCount(database) {
+  try {
+    const pageCount = Number(database.prepare("PRAGMA page_count").get()?.page_count);
+    if (!Number.isSafeInteger(pageCount) || pageCount < 0) fail("schema_invalid");
+    return pageCount;
+  } catch (error) {
+    if (isWindowsCredentialOperationAuditError(error)) throw error;
+    fail("schema_invalid");
+  }
+}
+
+function isDatabaseClosed(database) {
+  if (database === undefined || database === null) return true;
+  try {
+    return database.isOpen === false;
+  } catch {
+    // An unreadable connection state is treated as open. Releasing the native
+    // guard in that case could permit a second process to mutate a live file.
+    return false;
+  }
+}
+
 function openAuditDatabase(filePath, fileGuardContext) {
   const path = assertPath(filePath);
   const parent = dirname(path);
@@ -555,9 +592,14 @@ function openAuditDatabase(filePath, fileGuardContext) {
     } catch {
       fail("unavailable");
     }
+    // The native guard creates the database if absent and keeps its identity
+    // pinned. Until SQLite has opened it, assume a non-empty file so a
+    // malformed database cannot be mistaken for a new one if opening or
+    // configuration fails. The page count below distinguishes a newly-created
+    // empty file without using a conflicting Node fs probe.
+    existing = Object.freeze({ size: 1 });
   }
-  if ((fileGuardContext !== null && existing === null)
-      || (existing !== null && existing.size > 0)) {
+  if (fileGuardContext === null && existing !== null && existing.size > 0) {
     let handle;
     try {
       handle = openSync(path, constants.O_RDONLY);
@@ -600,20 +642,30 @@ function openAuditDatabase(filePath, fileGuardContext) {
   let database;
   try {
     database = new DatabaseSync(path, { timeout: 5_000 });
+    if (fileGuardContext !== null) {
+      existing = Object.freeze({
+        size: readDatabasePageCount(database) > 0 ? 1 : 0,
+      });
+    }
     configureDatabase(database);
     if (existing === null || existing.size === 0) initializeSchema(database);
     else validateSchema(database);
     if (fileGuardContext === null) chmodSync(path, 0o600);
   } catch (error) {
+    let databaseClosed = database === undefined;
     try {
       database?.close();
+      databaseClosed = isDatabaseClosed(database);
     } catch {
       // The fixed error below is authoritative for database cleanup failures.
+      databaseClosed = isDatabaseClosed(database);
     }
-    try {
-      if (fileGuardLease !== null) fileGuardContext.release(fileGuardLease);
-    } catch {
-      // The fixed open failure below remains authoritative.
+    if (databaseClosed) {
+      try {
+        if (fileGuardLease !== null) fileGuardContext.release(fileGuardLease);
+      } catch {
+        // The fixed open failure below remains authoritative.
+      }
     }
     if (isWindowsCredentialOperationAuditError(error)) throw error;
     // A non-empty file that cannot be opened as the reviewed SQLite schema is
@@ -621,20 +673,22 @@ function openAuditDatabase(filePath, fileGuardContext) {
     // by the fixed filesystem checks before this point.
     fail(existing !== null && existing.size > 0 ? "schema_invalid" : "unavailable");
   }
-  try {
-    syncFile(path);
-  } catch (error) {
+  if (fileGuardContext === null) {
     try {
-      database.close();
-    } catch {
-      // The fixed sync failure below remains authoritative.
+      syncFile(path);
+    } catch (error) {
+      try {
+        database.close();
+      } catch {
+        // The fixed sync failure below remains authoritative.
+      }
+      try {
+        if (fileGuardLease !== null) fileGuardContext.release(fileGuardLease);
+      } catch {
+        // The fixed sync failure below remains authoritative.
+      }
+      throw error;
     }
-    try {
-      if (fileGuardLease !== null) fileGuardContext.release(fileGuardLease);
-    } catch {
-      // The fixed sync failure below remains authoritative.
-    }
-    throw error;
   }
   return Object.freeze({ database, fileGuardLease });
 }
@@ -699,10 +753,13 @@ export function createWindowsCredentialOperationAuditStore(options = {}) {
   }
 
   const opened = openAuditDatabase(filePath, fileGuardContext);
-  const { database, fileGuardLease } = opened;
+  const { database } = opened;
+  let { fileGuardLease } = opened;
   let closed = false;
+  let closeRequested = false;
+  let databaseClosed = false;
   const ensureOpen = () => {
-    if (closed || !database.isOpen) fail("closed");
+    if (closed || closeRequested || !database.isOpen) fail("closed");
   };
 
   const store = {
@@ -718,7 +775,7 @@ export function createWindowsCredentialOperationAuditStore(options = {}) {
     prepare(value) {
       ensureOpen();
       const record = normalizePrepare(value, clock);
-      return transaction(database, filePath, () => {
+      return transaction(database, filePath, fileGuardContext, () => {
         const pending = Number(database.prepare(
           "SELECT COUNT(*) AS count FROM credential_operations WHERE phase = 'prepared'",
         ).get().count);
@@ -751,7 +808,7 @@ export function createWindowsCredentialOperationAuditStore(options = {}) {
     settle(value) {
       ensureOpen();
       const record = normalizeSettle(value, clock);
-      return transaction(database, filePath, () => {
+      return transaction(database, filePath, fileGuardContext, () => {
         const existing = database.prepare(`
           SELECT phase, owner, capability, operation
           FROM credential_operations WHERE lease_id = ?
@@ -779,7 +836,7 @@ export function createWindowsCredentialOperationAuditStore(options = {}) {
     recover(value) {
       ensureOpen();
       const record = normalizeRecovery(value, clock);
-      return transaction(database, filePath, () => {
+      return transaction(database, filePath, fileGuardContext, () => {
         const existing = database.prepare(
           "SELECT phase FROM credential_operations WHERE lease_id = ?",
         ).get(record.leaseId);
@@ -814,21 +871,31 @@ export function createWindowsCredentialOperationAuditStore(options = {}) {
     },
     close() {
       if (closed) return;
+      closeRequested = true;
       let closeFailed = false;
-      try {
-        database.close();
-      } catch {
-        closeFailed = true;
-      } finally {
-        closed = true;
+      if (!databaseClosed) {
+        try {
+          database.close();
+          databaseClosed = isDatabaseClosed(database);
+          if (!databaseClosed) closeFailed = true;
+        } catch {
+          closeFailed = true;
+          databaseClosed = isDatabaseClosed(database);
+        }
       }
-      if (fileGuardLease !== null) {
+      if (databaseClosed && fileGuardLease !== null) {
+        // SQLite has flushed its FULL-durability connection before the
+        // identity-bound native handles are released. No path-based Node fs
+        // sync is performed after release; the guard owns this database's
+        // Windows durability boundary for its whole lifetime.
         try {
           fileGuardContext.release(fileGuardLease);
+          fileGuardLease = null;
         } catch {
           closeFailed = true;
         }
       }
+      if (databaseClosed && fileGuardLease === null) closed = true;
       if (closeFailed) fail("unavailable");
     },
   };
