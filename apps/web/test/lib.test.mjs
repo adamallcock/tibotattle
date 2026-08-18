@@ -4708,7 +4708,10 @@ test("first run is a truthful install and local preflight journey", async () => 
   assert.match(appSource, /installedAppLink\.href = SEMANTIC_OPEN_TARGET/u);
   assert.doesNotMatch(appSource, /usagemonitor:\/\/open/u);
   assert.match(installSource, /translateMessage\(\s*"installer\.sha256",\s*\{ value: release\.sha256 \}/u);
-  assert.match(installSource, /translateMessage\("installer\.requiresMacOS", \{/u);
+  assert.match(
+    installSource,
+    /translateMessage\(\s*\n\s*compactDetails\s*\n\s*\?\s*"installer\.compatibilitySummary"\s*\n\s*:\s*"installer\.requiresMacOS",/u,
+  );
   assert.match(installSource, /selected\.protocol === "https:"/u);
   assert.doesNotMatch(appSource, /loopbackHttp/u);
   assert.match(appSource, /function openInstalledApp\(\)/u);
