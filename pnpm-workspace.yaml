@@ -3,3 +3,4 @@ packages:
 
 allowBuilds:
   '@github/keytar': false
+  electron-winstaller: false
