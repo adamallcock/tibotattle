@@ -26,6 +26,7 @@ import {
   assertWindowsProductionReadiness,
   createWindowsProductionCapabilityBackend,
   isWindowsFilesystemAdapter,
+  isWindowsFilesystemIdentity,
 } from "./platform/index.js";
 import {
   contributionDeviceKeychainBrokerConfiguration,
@@ -57,12 +58,8 @@ const ERROR_CODES = new Set([
   "confirmation_invalid",
 ]);
 
-// The contribution-device binding metadata is still written by the Node
-// filesystem helpers below. Keep production Windows credential backends
-// branded until that state path is moved onto the native filesystem adapter;
-// this prevents a future readiness promotion from silently re-enabling the
-// current POSIX-style state implementation on Windows.
 const WINDOWS_PRODUCTION_BACKENDS = new WeakSet();
+const WINDOWS_STATE_FILESYSTEM_ADAPTERS = new WeakMap();
 
 export class ContributionDeviceCapabilityError extends Error {
   constructor(code) {
@@ -182,6 +179,10 @@ function parseState(bytes) {
 }
 
 function sameIdentity(left, right) {
+  if (isWindowsFilesystemIdentity(left) && isWindowsFilesystemIdentity(right)) {
+    return left.volumeSerialNumber === right.volumeSerialNumber
+      && left.fileId === right.fileId;
+  }
   return left && right && left.dev === right.dev && left.ino === right.ino;
 }
 
@@ -202,11 +203,91 @@ function assertOwnerOnlyState(stats) {
   }
 }
 
-async function prepareStateDirectory(stateFile) {
+function assertWindowsStateDirectory(metadata, expectedIdentity = null) {
+  if (metadata?.isDirectory !== true
+      || metadata.isRegularFile !== false
+      || metadata.isReparsePoint !== false
+      || metadata.ownerMatches !== true
+      || metadata.nullDacl !== false
+      || metadata.daclProtected !== true
+      || metadata.broadAccess !== false
+      || metadata.nonOwnerAllow !== false
+      || metadata.unrecognizedAce !== false
+      || metadata.finalPathResolved !== true
+      || !isWindowsFilesystemIdentity(metadata.identity)
+      || metadata.identity.linkCount !== 1
+      || (expectedIdentity !== null && !sameIdentity(metadata.identity, expectedIdentity))) {
+    fail("state_unavailable");
+  }
+  return metadata.identity;
+}
+
+function assertWindowsStateFile(metadata) {
+  if (metadata?.isDirectory !== false
+      || metadata.isRegularFile !== true
+      || metadata.isReparsePoint !== false
+      || metadata.ownerMatches !== true
+      || metadata.nullDacl !== false
+      || metadata.daclProtected !== true
+      || metadata.broadAccess !== false
+      || metadata.nonOwnerAllow !== false
+      || metadata.unrecognizedAce !== false
+      || metadata.finalPathResolved !== true
+      || !isWindowsFilesystemIdentity(metadata.identity)
+      || metadata.identity.linkCount !== 1) {
+    fail("state_invalid");
+  }
+  return metadata.identity;
+}
+
+function windowsFilesystemNotFound(error) {
+  return error?.code === "ENOENT"
+    || error?.code === "WINDOWS_FILESYSTEM_NOT_FOUND";
+}
+
+function windowsFilesystemAlreadyExists(error) {
+  return error?.code === "EEXIST"
+    || error?.code === "WINDOWS_FILESYSTEM_ALREADY_EXISTS";
+}
+
+function resolveWindowsStateFilesystem(backend, explicitAdapter = null) {
+  const mappedAdapter = WINDOWS_STATE_FILESYSTEM_ADAPTERS.get(backend) ?? null;
+  const selected = explicitAdapter ?? mappedAdapter;
+  if (selected === null) {
+    if (process.platform === "win32" || WINDOWS_PRODUCTION_BACKENDS.has(backend)) {
+      fail("invalid_configuration");
+    }
+    return null;
+  }
+  if (process.platform !== "win32" || !isWindowsFilesystemAdapter(selected)) {
+    fail("invalid_configuration");
+  }
+  try {
+    return assertWindowsFilesystemProductionSafe(selected);
+  } catch {
+    fail("invalid_configuration");
+  }
+}
+
+async function prepareStateDirectory(stateFile, windowsFilesystem = null) {
   if (typeof stateFile !== "string" || stateFile.length < 1 || stateFile.length > 4096) {
     fail("invalid_configuration");
   }
   const directory = dirname(stateFile);
+  if (windowsFilesystem !== null) {
+    try {
+      const identity = windowsFilesystem.ensureDirectory(directory);
+      const metadata = windowsFilesystem.inspectPath(directory);
+      return {
+        directory,
+        identity: assertWindowsStateDirectory(metadata, identity),
+        windowsFilesystem,
+      };
+    } catch (error) {
+      if (error instanceof ContributionDeviceCapabilityError) throw error;
+      fail("state_unavailable");
+    }
+  }
   try {
     await mkdir(directory, { recursive: true, mode: 0o700 });
     const pathStats = await lstat(directory);
@@ -234,9 +315,56 @@ async function syncDirectory(directory) {
   }
 }
 
-async function inspectState(stateFile) {
+async function inspectState(stateFile, windowsFilesystem = null) {
   if (typeof stateFile !== "string" || stateFile.length < 1 || stateFile.length > 4096) {
     fail("invalid_configuration");
+  }
+  if (windowsFilesystem !== null) {
+    const directory = dirname(stateFile);
+    let directoryMetadata;
+    try {
+      directoryMetadata = windowsFilesystem.inspectPath(directory);
+    } catch (error) {
+      if (windowsFilesystemNotFound(error)) return null;
+      fail("state_unavailable");
+    }
+    try {
+      assertWindowsStateDirectory(directoryMetadata);
+    } catch (error) {
+      if (error instanceof ContributionDeviceCapabilityError) throw error;
+      fail("state_unavailable");
+    }
+    const target = join(directory, basename(stateFile));
+    let metadata;
+    try {
+      metadata = windowsFilesystem.inspectPath(target);
+    } catch (error) {
+      if (windowsFilesystemNotFound(error)) return null;
+      fail("state_unavailable");
+    }
+    const identity = assertWindowsStateFile(metadata);
+    let observed;
+    try {
+      observed = windowsFilesystem.readFile(target);
+      if (!Buffer.isBuffer(observed?.data)
+          || !isWindowsFilesystemIdentity(observed.identity)
+          || observed.identity.linkCount !== 1
+          || !sameIdentity(identity, observed.identity)) {
+        fail("state_invalid");
+      }
+      return Object.freeze({
+        state: parseState(observed.data),
+        target,
+        directory,
+        identity,
+        windowsFilesystem,
+      });
+    } catch (error) {
+      if (error instanceof ContributionDeviceCapabilityError) throw error;
+      fail("state_unavailable");
+    } finally {
+      observed?.data?.fill?.(0);
+    }
   }
   let directory;
   try {
@@ -284,11 +412,58 @@ async function inspectState(stateFile) {
   }
 }
 
-async function readState(stateFile) {
-  return (await inspectState(stateFile))?.state ?? null;
+async function readState(stateFile, windowsFilesystem = null) {
+  return (await inspectState(stateFile, windowsFilesystem))?.state ?? null;
 }
 
-async function writeNewState(stateFile, content) {
+async function writeNewState(stateFile, content, windowsFilesystem = null) {
+  if (windowsFilesystem !== null) {
+    const directoryState = await prepareStateDirectory(stateFile, windowsFilesystem);
+    const { directory } = directoryState;
+    const target = join(directory, basename(stateFile));
+    const bytes = Buffer.from(content, "utf8");
+    let identity = null;
+    try {
+      identity = windowsFilesystem.createFile(target, bytes);
+      const metadata = windowsFilesystem.inspectPath(target);
+      const publishedIdentity = assertWindowsStateFile(metadata);
+      if (!sameIdentity(identity, publishedIdentity)) fail("state_unavailable");
+      const observed = windowsFilesystem.readFile(target);
+      try {
+        if (!Buffer.isBuffer(observed?.data)
+            || !isWindowsFilesystemIdentity(observed.identity)
+            || observed.identity.linkCount !== 1
+            || !sameIdentity(identity, observed.identity)
+            || !observed.data.equals(bytes)) {
+          fail("state_unavailable");
+        }
+      } finally {
+        observed?.data?.fill?.(0);
+      }
+      return Object.freeze({
+        target,
+        directory,
+        identity,
+        windowsFilesystem,
+      });
+    } catch (error) {
+      if (identity !== null) {
+        try {
+          const current = windowsFilesystem.inspectPath(target);
+          if (sameIdentity(current?.identity, identity)) {
+            windowsFilesystem.deleteFile(target, identity);
+          }
+        } catch (cleanupError) {
+          if (!windowsFilesystemNotFound(cleanupError)) fail("state_unavailable");
+        }
+      }
+      if (windowsFilesystemAlreadyExists(error)) fail("credential_conflict");
+      if (error instanceof ContributionDeviceCapabilityError) throw error;
+      fail("state_unavailable");
+    } finally {
+      bytes.fill(0);
+    }
+  }
   const directory = await prepareStateDirectory(stateFile);
   const target = join(directory, basename(stateFile));
   let handle;
@@ -334,6 +509,17 @@ async function writeNewState(stateFile, content) {
 }
 
 async function removeCreatedState(publication) {
+  if (publication.windowsFilesystem !== undefined) {
+    try {
+      const current = publication.windowsFilesystem.inspectPath(publication.target);
+      if (!sameIdentity(current?.identity, publication.identity)) return;
+      assertWindowsStateFile(current);
+      publication.windowsFilesystem.deleteFile(publication.target, publication.identity);
+    } catch (error) {
+      if (!windowsFilesystemNotFound(error)) fail("state_unavailable");
+    }
+    return;
+  }
   try {
     const current = await lstat(publication.target);
     if (!sameIdentity(current, publication.identity)) return;
@@ -346,6 +532,19 @@ async function removeCreatedState(publication) {
 }
 
 async function removeInspectedState(inspection) {
+  if (inspection.windowsFilesystem !== undefined) {
+    try {
+      const current = inspection.windowsFilesystem.inspectPath(inspection.target);
+      assertWindowsStateFile(current);
+      if (!sameIdentity(current.identity, inspection.identity)) fail("state_invalid");
+      inspection.windowsFilesystem.deleteFile(inspection.target, inspection.identity);
+    } catch (error) {
+      if (windowsFilesystemNotFound(error)) fail("state_invalid");
+      if (error instanceof ContributionDeviceCapabilityError) throw error;
+      fail("state_unavailable");
+    }
+    return;
+  }
   try {
     const current = await lstat(inspection.target);
     assertOwnerOnlyState(current);
@@ -429,6 +628,7 @@ export function createProductionContributionDeviceBackend({
         readiness: windowsReadiness,
       });
       WINDOWS_PRODUCTION_BACKENDS.add(selected);
+      WINDOWS_STATE_FILESYSTEM_ADAPTERS.set(selected, windowsFilesystemAdapter);
       return selected;
     } catch {
       fail("invalid_configuration");
@@ -723,13 +923,8 @@ export function createAppBrokeredContributionDeviceBackend({
   return Object.freeze({ read, createIfMissing, replaceExact, deleteExact, describe });
 }
 
-function assertStateFilesystemBoundary(backend) {
-  try {
-    if (WINDOWS_PRODUCTION_BACKENDS.has(backend)) fail("invalid_configuration");
-  } catch (error) {
-    if (error instanceof ContributionDeviceCapabilityError) throw error;
-    fail("invalid_configuration");
-  }
+function assertStateFilesystemBoundary(backend, windowsFilesystemAdapter = null) {
+  return resolveWindowsStateFilesystem(backend, windowsFilesystemAdapter);
 }
 
 // The macOS product state root was renamed after the contribution credential
@@ -742,9 +937,10 @@ export async function migrateLegacyContributionDeviceCapability({
   legacyStateFile,
   stateFile = defaultContributionDeviceStateFile(),
   expectedOrigin = null,
+  windowsFilesystemAdapter = null,
 } = {}) {
   const selected = assertBackend(backend);
-  assertStateFilesystemBoundary(selected);
+  const windowsFilesystem = assertStateFilesystemBoundary(selected, windowsFilesystemAdapter);
   if (typeof legacyStateFile !== "string" || legacyStateFile.length < 1
       || legacyStateFile.length > 4096
       || typeof stateFile !== "string" || stateFile.length < 1
@@ -755,8 +951,8 @@ export async function migrateLegacyContributionDeviceCapability({
   const normalizedExpectedOrigin = expectedOrigin === null
     ? null
     : normalizeOrigin(expectedOrigin);
-  const currentInspection = await inspectState(stateFile);
-  const legacyInspection = await inspectState(legacyStateFile);
+  const currentInspection = await inspectState(stateFile, windowsFilesystem);
+  const legacyInspection = await inspectState(legacyStateFile, windowsFilesystem);
 
   if (legacyInspection === null) {
     if (currentInspection !== null && normalizedExpectedOrigin !== null
@@ -800,8 +996,8 @@ export async function migrateLegacyContributionDeviceCapability({
     // Validate the secret before publishing the state file. publicResult also
     // returns only the stable domain-separated hash, never the secret itself.
     const result = publicResult("migrated", legacyState, stored);
-    await writeNewState(stateFile, canonicalState(legacyState));
-    const published = await inspectState(stateFile);
+    await writeNewState(stateFile, canonicalState(legacyState), windowsFilesystem);
+    const published = await inspectState(stateFile, windowsFilesystem);
     if (published === null || !sameState(published.state, legacyState)) {
       fail("state_invalid");
     }
@@ -818,10 +1014,11 @@ export async function readContributionDeviceCapability({
   backend,
   stateFile = defaultContributionDeviceStateFile(),
   expectedOrigin = null,
+  windowsFilesystemAdapter = null,
 } = {}) {
   const selected = assertBackend(backend);
-  assertStateFilesystemBoundary(selected);
-  const state = await readState(stateFile);
+  const windowsFilesystem = assertStateFilesystemBoundary(selected, windowsFilesystemAdapter);
+  const state = await readState(stateFile, windowsFilesystem);
   let stored = null;
   try {
     stored = await invokeBackend(selected, "read");
@@ -842,9 +1039,10 @@ export async function ensureContributionDeviceCapability({
   generateDeviceId = randomUUID,
   generateSecret = () => randomBytes(SECRET_BYTES),
   clock = () => Date.now(),
+  windowsFilesystemAdapter = null,
 } = {}) {
   const selected = assertBackend(backend);
-  assertStateFilesystemBoundary(selected);
+  const windowsFilesystem = assertStateFilesystemBoundary(selected, windowsFilesystemAdapter);
   const normalizedOrigin = normalizeOrigin(origin);
   if (typeof generateDeviceId !== "function" || typeof generateSecret !== "function"
       || typeof clock !== "function") {
@@ -854,6 +1052,7 @@ export async function ensureContributionDeviceCapability({
     backend: selected,
     stateFile,
     expectedOrigin: normalizedOrigin,
+    windowsFilesystemAdapter: windowsFilesystem,
   });
   if (existing !== null) return Object.freeze({ ...existing, status: "existing" });
 
@@ -891,7 +1090,7 @@ export async function ensureContributionDeviceCapability({
       fail("credential_unavailable");
     }
     generated = copySecret(generatedValue);
-    publication = await writeNewState(stateFile, canonicalState(state));
+    publication = await writeNewState(stateFile, canonicalState(state), windowsFilesystem);
     const outcome = await invokeBackend(selected, "createIfMissing", generated);
     if (outcome !== "created") fail("credential_conflict");
     stored = true;
@@ -931,11 +1130,12 @@ export async function withContributionDeviceSecret({
   stateFile = defaultContributionDeviceStateFile(),
   expectedOrigin = null,
   operation,
+  windowsFilesystemAdapter = null,
 } = {}) {
   const selected = assertBackend(backend);
-  assertStateFilesystemBoundary(selected);
+  const windowsFilesystem = assertStateFilesystemBoundary(selected, windowsFilesystemAdapter);
   if (typeof operation !== "function") fail("invalid_configuration");
-  const state = await readState(stateFile);
+  const state = await readState(stateFile, windowsFilesystem);
   let stored = null;
   let temporary = null;
   try {
@@ -988,14 +1188,15 @@ export async function rotateContributionDeviceCredential({
   expectedOrigin = null,
   performRemoteRotation,
   generateSecret = () => randomBytes(SECRET_BYTES),
+  windowsFilesystemAdapter = null,
 } = {}) {
   const selected = assertBackend(backend);
-  assertStateFilesystemBoundary(selected);
+  const windowsFilesystem = assertStateFilesystemBoundary(selected, windowsFilesystemAdapter);
   if (typeof performRemoteRotation !== "function"
       || typeof generateSecret !== "function") {
     fail("invalid_configuration");
   }
-  const state = await readState(stateFile);
+  const state = await readState(stateFile, windowsFilesystem);
   let oldStored = null;
   let oldSecret = null;
   let newValue = null;
@@ -1082,11 +1283,12 @@ export async function removeContributionDeviceCapability({
   expectedOrigin = null,
   confirmDeviceId,
   remoteRevocationConfirmed = false,
+  windowsFilesystemAdapter = null,
 } = {}) {
   const selected = assertBackend(backend);
-  assertStateFilesystemBoundary(selected);
+  const windowsFilesystem = assertStateFilesystemBoundary(selected, windowsFilesystemAdapter);
   if (remoteRevocationConfirmed !== true) fail("remote_revocation_required");
-  const inspection = await inspectState(stateFile);
+  const inspection = await inspectState(stateFile, windowsFilesystem);
   let stored = null;
   let expected = null;
   try {
