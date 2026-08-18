@@ -120,6 +120,8 @@ async function makeFixture(
     bindingManifestMutation = null,
     foreignUnpacked = null,
     extraArchive = null,
+    physicalUnpackedMutation = null,
+    unpackPattern = "**/*.node",
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-electron-artifact-"));
@@ -218,7 +220,13 @@ async function makeFixture(
     // Exercise the same asar header metadata electron-builder emits for its
     // target-specific asarUnpack rules. The native files are copied into the
     // adjacent .asar.unpacked directory by @electron/asar itself.
-    unpack: "**/*.node",
+    unpack: unpackPattern,
+  });
+  await physicalUnpackedMutation?.({
+    binding,
+    keytar,
+    target,
+    unpackedPath,
   });
   if (foreignUnpacked) {
     await writeRelative(unpackedPath, foreignUnpacked, Buffer.from("foreign native\n"));
@@ -361,6 +369,46 @@ test("keeps the Windows native sidecar in virtual ASAR beside an unpacked .node"
     const result = await verify(fixture, "win32-x64");
     assert.equal(result.status, FIXED_STATUS.verified);
   });
+});
+
+test("rejects a physical unpacked native file without an ASAR unpack marker", async () => {
+  await withFixture(
+    "darwin-arm64",
+    {
+      physicalUnpackedMutation: async ({ keytar, unpackedPath }) => {
+        await writeRelative(unpackedPath, KEYTAR["darwin-arm64"], keytar);
+      },
+      unpackPattern: "native/windows-filesystem/**/*.node",
+    },
+    async (fixture) => {
+      await assert.rejects(
+        () => verify(fixture, "darwin-arm64"),
+        (error) => error.code === FIXED_STATUS.nativeInventoryInvalid
+          && !error.message.includes(fixture.root),
+      );
+    },
+  );
+});
+
+test("rejects an ASAR unpack marker without its physical unpacked file", async () => {
+  await withFixture(
+    "darwin-arm64",
+    {
+      physicalUnpackedMutation: async ({ unpackedPath }) => {
+        await rm(
+          join(unpackedPath, ...KEYTAR["darwin-arm64"].split("/")),
+          { force: true },
+        );
+      },
+    },
+    async (fixture) => {
+      await assert.rejects(
+        () => verify(fixture, "darwin-arm64"),
+        (error) => error.code === FIXED_STATUS.nativeInventoryInvalid
+          && !error.message.includes(fixture.root),
+      );
+    },
+  );
 });
 
 test("rejects qualification and other-platform native binaries", async () => {
