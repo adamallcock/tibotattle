@@ -7560,6 +7560,8 @@ test("the share card names only a known, most-recent Codex plan", async () => {
   assert.equal(shareCardPlanLabel("  "), "");
   assert.equal(shareCardPlanLabel("teamplus"), "");
   assert.equal(shareCardPlanLabel(undefined), "");
+  assert.equal(shareCardPlanLabel(null), "");
+  assert.ok(!Object.hasOwn(SHARE_CARD_PLAN_LABELS, "unknown"));
   for (const plan of Object.keys(SHARE_CARD_PLAN_LABELS)) {
     assert.ok(TELEMETRY_PLAN_TYPES.includes(plan), `${plan} is a KnownPlan value`);
   }
@@ -7594,6 +7596,10 @@ test("the share card names only a known, most-recent Codex plan", async () => {
     "Plus",
   );
   assert.equal(shareCardPlan([{ planType: "unknown" }]), "");
+  assert.equal(
+    shareCardPlan([{ observedAt: "2026-08-20T00:00:00.000Z" }]),
+    "",
+  );
   assert.equal(shareCardPlan([]), "");
   assert.equal(shareCardPlan(null), "");
 });
