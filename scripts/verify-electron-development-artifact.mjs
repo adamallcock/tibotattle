@@ -312,7 +312,10 @@ async function assertRegularFile(path, missingStatus = FIXED_STATUS.inputMissing
  * Read a regular file from an opened descriptor. O_NOFOLLOW protects the
  * final component where supported; Windows falls back to lstat identity
  * checks when that flag is unavailable. Realpath containment is checked
- * before and after the descriptor-bound read for staged files.
+ * before and after the descriptor-bound read for staged files. Ancestor
+ * TOCTOU protection assumes the GitHub Actions checkout and artifact tree are
+ * immutable and have no concurrent writer; this bounded verifier deliberately
+ * does not implement a handle-relative directory walker.
  */
 async function readRegularFile(
   path,
@@ -717,6 +720,7 @@ async function readArchive(asarPath) {
   }
   if (!Array.isArray(listed)) fail(FIXED_STATUS.archiveInvalid);
   const rows = [];
+  const markedUnpacked = new Set();
   const seen = new Set();
   for (const rawPath of listed) {
     const path = archivePath(rawPath);
@@ -738,6 +742,7 @@ async function readArchive(asarPath) {
     // app.asar.unpacked tree, not by app.asar's byte payload. Validate their
     // path and size above, then let the unpacked inventory verify their bytes.
     if (stat.unpacked === true) {
+      markedUnpacked.add(path);
       seen.add(path);
       continue;
     }
@@ -759,7 +764,10 @@ async function readArchive(asarPath) {
     });
   }
   rows.sort((left, right) => comparePathBytes(left.path, right.path));
-  return rows;
+  return Object.freeze({
+    markedUnpacked,
+    rows,
+  });
 }
 
 function expectedNativePaths(target) {
@@ -775,7 +783,14 @@ function expectedNativePaths(target) {
 // loader can execute it, while the adjacent JSON manifest remains readable
 // through the virtual app.asar path. Keep this arrangement unless the actual
 // runtime/package contract changes and is reviewed with it.
-function validateNativeBoundary({ target, staged, archive, unpacked, manifest }) {
+function validateNativeBoundary({
+  target,
+  staged,
+  archive,
+  archiveMarkedUnpacked,
+  unpacked,
+  manifest,
+}) {
   const expected = expectedNativePaths(target);
   const stagedNative = staged.runtimeRows
     .filter(({ path }) => path.toLowerCase().endsWith(".node"))
@@ -792,6 +807,16 @@ function validateNativeBoundary({ target, staged, archive, unpacked, manifest })
   if (unpacked.length !== expected.size
       || unpacked.some(({ path }) => !expected.has(path))) {
     fail(FIXED_STATUS.nativeInventoryInvalid);
+  }
+  const physicalUnpackedPaths = new Set(unpacked.map(({ path }) => path));
+  if (archiveMarkedUnpacked.size !== physicalUnpackedPaths.size
+      || [...archiveMarkedUnpacked].some((path) => !physicalUnpackedPaths.has(path))) {
+    fail(FIXED_STATUS.nativeInventoryInvalid);
+  }
+  for (const path of expected) {
+    if (!archiveMarkedUnpacked.has(path)) {
+      fail(FIXED_STATUS.nativeInventoryInvalid);
+    }
   }
   const actualNative = [...archiveNative, ...unpackedNative];
   if (actualNative.length !== expected.size
@@ -974,12 +999,20 @@ export async function verifyElectronDevelopmentArtifact({
     await assertRegularFile(selectedAsarPath);
     await assertDirectory(selectedUnpackedPath);
     const staged = await validateStagedTree(selectedAppPath, target);
-    const archive = await readArchive(selectedAsarPath);
+    const archiveResult = await readArchive(selectedAsarPath);
+    const archive = archiveResult.rows;
     const unpacked = await walkFiles(selectedUnpackedPath);
     const binding = target === "win32-x64"
       ? await validateWindowsBinding({ appPath: selectedAppPath, staged })
       : null;
-    validateNativeBoundary({ target, staged, archive, unpacked, manifest: staged.manifest });
+    validateNativeBoundary({
+      target,
+      staged,
+      archive,
+      archiveMarkedUnpacked: archiveResult.markedUnpacked,
+      unpacked,
+      manifest: staged.manifest,
+    });
     const artifact = await compareArtifactToStaged({
       appPath: selectedAppPath,
       staged,
