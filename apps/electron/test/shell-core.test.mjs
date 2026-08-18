@@ -14,6 +14,7 @@ import {
 } from "../desktop-lifecycle.js";
 import { launchElectronShell } from "../main.js";
 import {
+  ELECTRON_ENTRY_FAILURE_DIAGNOSTIC,
   ElectronShellError,
 } from "../errors.js";
 import {
@@ -551,11 +552,93 @@ test("desktop lifecycle cancels an in-flight retry before quit and serializes sh
 
 test("Electron entry quits explicitly when composition fails before lifecycle ownership", async () => {
   const app = new FakeApp();
+  const events = [];
+  app.quit = () => {
+    events.push("quit");
+    app.quitCalls += 1;
+  };
+  const diagnostics = [];
   await assert.rejects(
-    launchElectronShell({ electron: { app } }),
+    launchElectronShell({
+      electron: { app },
+      emitFailureDiagnostic: true,
+      writeDiagnostic: (value) => {
+        events.push("diagnostic");
+        diagnostics.push(value);
+      },
+    }),
+    /BrowserWindow is required/u,
+  );
+  assert.deepEqual(diagnostics, [`${ELECTRON_ENTRY_FAILURE_DIAGNOSTIC}\n`]);
+  assert.deepEqual(events, ["diagnostic", "quit"]);
+  assert.equal(app.quitCalls, 1);
+});
+
+test("Electron entry still quits when its fixed diagnostic cannot be written", async () => {
+  const app = new FakeApp();
+  await assert.rejects(
+    launchElectronShell({
+      electron: { app },
+      emitFailureDiagnostic: true,
+      writeDiagnostic() {
+        throw new Error("synthetic diagnostic failure");
+      },
+    }),
     /BrowserWindow is required/u,
   );
   assert.equal(app.quitCalls, 1);
+});
+
+test("packaged Electron composition keeps the companion in app.asar and uses physical Resources as cwd", async () => {
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getAppPath = () => "/private/TiboTattle.app/Contents/Resources/app.asar";
+  app.getPath = (name) => {
+    assert.equal(name, "userData");
+    return "/private/TiboTattle-user-data";
+  };
+  const child = new FakeChild();
+  const spawnCalls = [];
+  const launch = launchElectronShell({
+    electron: {
+      app,
+      BrowserWindow: FakeWindow,
+      Tray: FakeTray,
+      Menu: { buildFromTemplate: (template) => ({ template }) },
+      nativeImage: { createEmpty: () => "empty-icon" },
+    },
+    resourcesPath: "/private/TiboTattle.app/Contents/Resources",
+    supervisorOptions: {
+      spawnChild(command, args, options) {
+        spawnCalls.push({ command, args, options });
+        return child;
+      },
+      startupTimeoutMs: 1_000,
+      shutdownTimeoutMs: 1_000,
+    },
+  });
+  await new Promise((resolveNext) => setImmediate(resolveNext));
+  assert.equal(spawnCalls.length, 1);
+  assert.deepEqual(spawnCalls[0].args, [
+    "/private/TiboTattle.app/Contents/Resources/app.asar/apps/local/server.js",
+  ]);
+  assert.equal(
+    spawnCalls[0].options.cwd,
+    "/private/TiboTattle.app/Contents/Resources",
+  );
+  assert.equal(
+    spawnCalls[0].options.env.USAGE_MONITOR_RESOURCE_ROOT,
+    "/private/TiboTattle.app/Contents/Resources/app.asar",
+  );
+  assert.equal(
+    spawnCalls[0].options.env.USAGE_MONITOR_STATE_ROOT,
+    "/private/TiboTattle-user-data/companion-state",
+  );
+  child.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4711/\n"));
+  const lifecycle = await launch;
+  const dispose = lifecycle.dispose();
+  child.emit("exit", 0, null);
+  await dispose;
 });
 
 test("preload is only a frozen marker and does not import filesystem or IPC APIs", async () => {
