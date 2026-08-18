@@ -30,6 +30,17 @@ const DEVICE_ID = "11111111-1111-4111-8111-111111111111";
 const ORIGIN = "https://usage.example";
 const CANARY = "PRIVATE_DEVICE_SECRET_CANARY";
 
+async function withWin32Platform(callback) {
+  const original = Object.getOwnPropertyDescriptor(process, "platform");
+  const changed = process.platform !== "win32";
+  if (changed) Object.defineProperty(process, "platform", { ...original, value: "win32" });
+  try {
+    return await callback();
+  } finally {
+    if (changed) Object.defineProperty(process, "platform", original);
+  }
+}
+
 function memoryBackend(initial = null) {
   let value = initial && Buffer.from(initial);
   const calls = [];
@@ -626,6 +637,46 @@ test("Windows x64 contribution-device production selection remains fail closed",
     }), fixedError("invalid_configuration"));
   }
   assert.equal(constructions, 0);
+});
+
+test("Windows contribution state rejects missing and unbranded adapters before Node filesystem work", async () => {
+  await fixture(async ({ stateFile }) => {
+    const backend = memoryBackend();
+    const forged = Object.freeze({
+      productionSafe: true,
+      pathWalkRaceSafe: true,
+    });
+    await withWin32Platform(async () => {
+      for (const windowsFilesystemAdapter of [null, forged]) {
+        await assert.rejects(
+          ensureContributionDeviceCapability({
+            backend,
+            origin: ORIGIN,
+            stateFile,
+            windowsFilesystemAdapter,
+          }),
+          fixedError("invalid_configuration"),
+        );
+      }
+    });
+    assert.equal(backend.calls.length, 0);
+    await assert.rejects(readFile(stateFile), { code: "ENOENT" });
+  });
+});
+
+test("Windows contribution readbacks require a canonical single-link identity", async () => {
+  const source = await readFile(
+    new URL("../src/contribution-device-capability.js", import.meta.url),
+    "utf8",
+  );
+  assert.equal(
+    (source.match(/!isWindowsFilesystemIdentity\(observed\.identity\)/gu) ?? []).length,
+    2,
+  );
+  assert.equal(
+    (source.match(/observed\.identity\.linkCount !== 1/gu) ?? []).length,
+    2,
+  );
 });
 
 function rotatableBackend(initial = null) {
