@@ -44,6 +44,7 @@ const QUALIFICATION_TEST_FILES = Object.freeze([
   "test/windows-filesystem-provenance.test.js",
   "test/windows-filesystem-native-contract.test.js",
   "test/windows-filesystem-security.test.js",
+  "test/windows-security-consumer-composition.test.js",
   "test/windows-path-contract.test.js",
   "test/windows-qualification-governance.test.js",
   "test/windows-skip-ledger.test.js",
