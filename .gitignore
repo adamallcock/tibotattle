@@ -62,6 +62,9 @@ verify-debug.png
 # Swift Package Manager build and test output for the macOS app.
 apps/macos/.build/
 
+# Native Windows qualification output.
+native/windows-filesystem/build/
+
 # Package manager store
 .pnpm-store/
 

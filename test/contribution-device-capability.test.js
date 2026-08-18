@@ -608,6 +608,19 @@ test("production selection never falls back from the audited macOS arm64 Keychai
   }), backend);
 });
 
+test("Windows x64 contribution-device production selection remains fail closed", () => {
+  let constructions = 0;
+  assert.throws(() => createProductionContributionDeviceBackend({
+    platform: "win32",
+    architecture: "x64",
+    createBackend() {
+      constructions += 1;
+      return memoryBackend();
+    },
+  }), fixedError("invalid_configuration"));
+  assert.equal(constructions, 0);
+});
+
 function rotatableBackend(initial = null) {
   let value = initial && Buffer.from(initial);
   const calls = [];

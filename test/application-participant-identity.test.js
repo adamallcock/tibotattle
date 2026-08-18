@@ -36,6 +36,19 @@ test("application identity selection is runtime-neutral and port-driven", () => 
   assert.equal(selected.identityOptions.participantSecretBackend.kind, "fixture");
 });
 
+test("application identity selection keeps Windows production unavailable", () => {
+  let constructions = 0;
+  assert.throws(() => selectProductionParticipantIdentity(baseOptions({
+    platform: "win32",
+    architecture: "x64",
+    createKeychainBackend() {
+      constructions += 1;
+      return { kind: "fixture" };
+    },
+  })), (error) => error.code === "EXPORT_IDENTITY_PRODUCTION_BACKEND_UNAVAILABLE");
+  assert.equal(constructions, 0);
+});
+
 test("identity overrides win before native backend construction", () => {
   let constructions = 0;
   const selected = selectProductionParticipantIdentity(baseOptions({

@@ -84,6 +84,13 @@ const PLATFORM_PUBLIC_EXPORTS = Object.freeze([
 
 test("platform adapters expose one exact reviewed public API", () => {
   assert.deepEqual(Object.keys(platform).sort(), [...PLATFORM_PUBLIC_EXPORTS]);
+  for (const privateWindowsAdapter of [
+    "createWindowsCredentialManagerBackend",
+    "createWindowsFilesystemAdapter",
+    "loadWindowsFilesystemBinding",
+  ]) {
+    assert.equal(Object.hasOwn(platform, privateWindowsAdapter), false);
+  }
 });
 
 test("local export resource context injects runtime ports and fixed marker limits", async () => {

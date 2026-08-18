@@ -99,6 +99,18 @@
       "followUp": "Run on native Windows x64; non-Windows hosts skip the native binding round trip."
     },
     {
+      "file": "test/windows-credential-manager.test.js",
+      "win32BranchCount": 2,
+      "classification": "native-windows-qualification",
+      "followUp": "Run all four fixed production credential lifecycles on native Windows x64 with the audited Credential Manager binding and confirm cleanup."
+    },
+    {
+      "file": "test/windows-filesystem-security.test.js",
+      "win32BranchCount": 1,
+      "classification": "native-windows-qualification",
+      "followUp": "Run native owner-DACL, reparse-point, hard-link, and content-free failure checks on Windows x64."
+    },
+    {
       "file": "test/windows-path-contract.test.js",
       "win32BranchCount": 1,
       "classification": "native-windows-qualification",

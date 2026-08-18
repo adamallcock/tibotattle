@@ -901,6 +901,38 @@
       "legacyPaths": []
     },
     {
+      "classification": "build_release_operation",
+      "owner": "export_test_infrastructure",
+      "canonicalPath": "scripts/build-windows-filesystem-manifest.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The content-free native Windows binding manifest is built only by the manually dispatched pinned workflow.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/windows-portability.yml",
+        "test/windows-filesystem-manifest.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-17-windows-security-credentials-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "export_test_infrastructure",
+      "canonicalPath": "scripts/windows-security-qualification.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The content-free native Windows qualification is invoked only by the manually dispatched pinned workflow.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/windows-portability.yml",
+        "test/windows-qualification-governance.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-17-windows-security-credentials-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
       "classification": "historical_research_report",
       "owner": "reporting",
       "canonicalPath": "src/build-monitoring-quality-report.js",

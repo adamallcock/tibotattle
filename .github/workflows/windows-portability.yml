@@ -2,12 +2,6 @@ name: Windows portability canary
 
 on:
   workflow_dispatch:
-    inputs:
-      clean-cache:
-        description: Skip the pnpm store cache for a clean qualification run
-        required: true
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -18,15 +12,40 @@ concurrency:
 
 jobs:
   windows-x64:
-    name: Native Windows x64 portable core
+    name: Native Windows x64 security qualification (${{ matrix.cache-mode }})
     runs-on: windows-2025
-    timeout-minutes: 35
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        cache-mode:
+          - warm
+          - clean
     env:
       CI: "1"
-      USAGE_MONITOR_TEST_LANE_REPORTER: spec
+      USAGE_MONITOR_TEST_LANE_REPORTER: dot
+      TIBOTATTLE_QUALIFICATION_CACHE_MODE: ${{ matrix.cache-mode }}
     steps:
       - name: Check out the requested revision
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the selected revision is immutable
+        shell: pwsh
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = $env:EXPECTED_REVISION.Trim().ToLowerInvariant()
+          $actual = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($expected -notmatch '^[0-9a-f]{40}$' -or $actual -ne $expected) {
+            Write-Error 'WINDOWS_QUALIFICATION_REVISION_MISMATCH'
+            exit 1
+          }
+          "TIBOTATTLE_QUALIFICATION_REVISION=$actual" >> $env:GITHUB_ENV
 
       - name: Install pinned Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
@@ -40,19 +59,45 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           npm install --global corepack@0.34.0 --force
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_QUALIFICATION_COREPACK_INSTALL_FAILED'
+            exit 1
+          }
           corepack enable
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_QUALIFICATION_COREPACK_ENABLE_FAILED'
+            exit 1
+          }
           corepack prepare pnpm@11.9.0 --activate
-          node --version
-          pnpm --version
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_QUALIFICATION_PNPM_ACTIVATION_FAILED'
+            exit 1
+          }
+          $corepackVersion = (corepack --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $corepackVersion -ne '0.34.0') {
+            Write-Error 'WINDOWS_QUALIFICATION_COREPACK_VERSION_MISMATCH'
+            exit 1
+          }
+          $nodeVersion = (node --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $nodeVersion -ne 'v26.2.0') {
+            Write-Error 'WINDOWS_QUALIFICATION_NODE_VERSION_MISMATCH'
+            exit 1
+          }
+          $pnpmVersion = (pnpm --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $pnpmVersion -ne '11.9.0') {
+            Write-Error 'WINDOWS_QUALIFICATION_PNPM_VERSION_MISMATCH'
+            exit 1
+          }
 
       - name: Resolve pnpm store
-        if: ${{ !inputs.clean-cache }}
+        if: ${{ matrix.cache-mode == 'warm' }}
         id: pnpm-store
         shell: pwsh
         run: '"path=$(pnpm store path --silent)" >> $env:GITHUB_OUTPUT'
 
       - name: Restore pnpm store cache
-        if: ${{ !inputs.clean-cache }}
+        if: ${{ matrix.cache-mode == 'warm' }}
+        id: pnpm-cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
@@ -60,7 +105,75 @@ jobs:
 
       - name: Install locked dependencies
         shell: pwsh
-        run: pnpm install --frozen-lockfile
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ('${{ matrix.cache-mode }}' -eq 'clean') {
+            $cleanStore = Join-Path $env:RUNNER_TEMP 'tibotattle-pnpm-clean-store'
+            if (Test-Path -LiteralPath $cleanStore) {
+              Remove-Item -LiteralPath $cleanStore -Recurse -Force
+            }
+            pnpm install --frozen-lockfile --store-dir $cleanStore
+          } else {
+            pnpm install --frozen-lockfile
+            if (Test-Path -LiteralPath 'node_modules') {
+              Remove-Item -LiteralPath 'node_modules' -Recurse -Force
+            }
+            pnpm install --frozen-lockfile --offline
+          }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_QUALIFICATION_DEPENDENCY_INSTALL_FAILED'
+            exit 1
+          }
+
+      - name: Build reviewed native filesystem adapter
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $buildLog = Join-Path $env:RUNNER_TEMP 'windows-filesystem-build.log'
+          $npmCommand = (Get-Command npm.cmd).Source
+          $nodeRoot = Split-Path $npmCommand -Parent
+          $nodeGypScript = Join-Path $nodeRoot 'node_modules\npm\node_modules\node-gyp\bin\node-gyp.js'
+          if (-not (Test-Path -LiteralPath $nodeGypScript -PathType Leaf)) {
+            Write-Error 'WINDOWS_FILESYSTEM_BINDING_BUILDER_UNAVAILABLE'
+            exit 1
+          }
+          node $nodeGypScript rebuild --directory native/windows-filesystem *> $buildLog
+          if ($LASTEXITCODE -ne 0) {
+            # This hosted build runs before credentials or user state are
+            # created. A bounded compiler tail is therefore safe and necessary
+            # to diagnose native source failures without dumping later test
+            # output, paths, SIDs, or credential-shaped values.
+            Get-Content -LiteralPath $buildLog -Tail 200
+            Write-Error 'WINDOWS_FILESYSTEM_BINDING_BUILD_FAILED'
+            exit 1
+          }
+
+      - name: Build the binding integrity manifest
+        shell: pwsh
+        run: node ./scripts/build-windows-filesystem-manifest.mjs
+
+      - name: Verify and record binding integrity metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifestPath = Join-Path $env:GITHUB_WORKSPACE 'native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json'
+          if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+            Write-Error 'WINDOWS_FILESYSTEM_BINDING_MANIFEST_MISSING'
+            exit 1
+          }
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          if ($manifest.schemaVersion -ne 'windows-filesystem-binding-manifest-v1' -or
+              $manifest.platform -ne 'win32' -or
+              $manifest.architecture -ne 'x64' -or
+              $manifest.sha256 -notmatch '^[0-9a-f]{64}$' -or
+              $manifest.bytes -le 0 -or
+              $manifest.approvedPolicy.productionSafe -ne $false -or
+              $manifest.approvedPolicy.pathWalkRaceSafe -ne $false) {
+            Write-Error 'WINDOWS_FILESYSTEM_BINDING_MANIFEST_INVALID'
+            exit 1
+          }
+          "TIBOTATTLE_WINDOWS_BINDING_SHA256=$($manifest.sha256)" >> $env:GITHUB_ENV
+          "TIBOTATTLE_WINDOWS_BINDING_BYTES=$($manifest.bytes)" >> $env:GITHUB_ENV
 
       - name: Record native environment
         shell: pwsh
@@ -70,12 +183,73 @@ jobs:
           "- Architecture: $env:PROCESSOR_ARCHITECTURE" >> $env:GITHUB_STEP_SUMMARY
           "- Node: $(node --version)" >> $env:GITHUB_STEP_SUMMARY
           "- pnpm: $(pnpm --version)" >> $env:GITHUB_STEP_SUMMARY
-          "- Clean cache requested: ${{ inputs.clean-cache }}" >> $env:GITHUB_STEP_SUMMARY
+          "- Revision: $env:TIBOTATTLE_QUALIFICATION_REVISION" >> $env:GITHUB_STEP_SUMMARY
+          "- Cache mode: ${{ matrix.cache-mode }}" >> $env:GITHUB_STEP_SUMMARY
+          "- Cache restore hit: ${{ steps.pnpm-cache.outputs.cache-hit || 'not-applicable' }}" >> $env:GITHUB_STEP_SUMMARY
+          "- Warm proof: restored or online-primed store followed by an offline reinstall" >> $env:GITHUB_STEP_SUMMARY
+          "- Native binding bytes: $env:TIBOTATTLE_WINDOWS_BINDING_BYTES" >> $env:GITHUB_STEP_SUMMARY
+          "- Native binding SHA-256: $env:TIBOTATTLE_WINDOWS_BINDING_SHA256" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Run portable Windows qualification
         shell: pwsh
-        run: pnpm test:portable
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $portableLog = Join-Path $env:RUNNER_TEMP 'windows-portable-qualification.log'
+          pnpm test:portable *> $portableLog
+          if ($LASTEXITCODE -ne 0) {
+            # The portable lane is content-free by contract. Emit only a
+            # bounded tail so a Windows-only test failure remains actionable.
+            Get-Content -LiteralPath $portableLog -Tail 240
+            Write-Error 'WINDOWS_PORTABLE_QUALIFICATION_FAILED'
+            exit 1
+          }
 
-      - name: Confirm tests did not modify tracked files
+      - name: Prepare disposable qualification state root
         shell: pwsh
-        run: git diff --exit-code
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $qualificationStateRoot = Join-Path $env:RUNNER_TEMP 'tibotattle-codex-home'
+          New-Item -ItemType Directory -Force -Path $qualificationStateRoot | Out-Null
+          "CODEX_HOME=$qualificationStateRoot" >> $env:GITHUB_ENV
+
+      - name: Run content-free Windows security qualification
+        shell: pwsh
+        env:
+          USAGE_MONITOR_WINDOWS_QUALIFICATION: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $result = node ./scripts/windows-security-qualification.mjs
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_SECURITY_QUALIFICATION_FAILED'
+            exit 1
+          }
+          "### Content-free security result" >> $env:GITHUB_STEP_SUMMARY
+          "- Command: node ./scripts/windows-security-qualification.mjs" >> $env:GITHUB_STEP_SUMMARY
+          "- Result: $result" >> $env:GITHUB_STEP_SUMMARY
+          "- Production promotion: blocked" >> $env:GITHUB_STEP_SUMMARY
+          "- Canonical deferrals: docs/goals/2026-08-17-windows-security-credentials-goal.md" >> $env:GITHUB_STEP_SUMMARY
+          "- Deferred: cross-process credential mutex and durable audit; authenticated binary provenance; replacement CAS; complete DACL/path/concurrency matrix; selector and state/SQLite integration; export locking; retention/uninstall policy; packaging, signing, installer, and updater" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Confirm qualification did not modify the checkout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git diff --quiet
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_QUALIFICATION_WORKTREE_DIRTY'
+            exit 1
+          }
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_QUALIFICATION_INDEX_DIRTY'
+            exit 1
+          }
+          $untracked = git ls-files --others --exclude-standard
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_QUALIFICATION_UNTRACKED_CHECK_FAILED'
+            exit 1
+          }
+          if ($null -ne $untracked -and $untracked.Count -gt 0) {
+            Write-Error 'WINDOWS_QUALIFICATION_UNTRACKED_OUTPUT'
+            exit 1
+          }

@@ -2,7 +2,7 @@
 title: Windows filesystem and credential security contract
 date: 2026-08-17
 type: research
-status: contract-defined-implementation-deferred
+status: implementation-in-progress
 ---
 
 # Windows filesystem and credential security contract
@@ -13,6 +13,27 @@ This document defines what Windows production storage must prove before the
 current macOS-only identity fail-closed guard may change. The four-day
 readiness milestone adds path tests and a disposable Credential Manager probe;
 it does not implement or approve production Windows identity storage.
+
+The first native adapter slice now exists for Windows x64 qualification, but it
+advertises `productionSafe: false`. It proves handle-based identity, strict
+owner-DACL construction, protected-DACL inspection, reparse-point refusal,
+single-link refusal, flush/reopen validation, and exact-handle deletion. The
+participant identity integration deliberately refuses that adapter on a real
+Windows host. The current slice walks components with `NtCreateFile` relative
+to held parent directory handles and includes a same-directory replacement
+primitive, but the final destination check and replacement are not one atomic
+compare-and-swap operation. Native compilation, adversarial coverage, and that
+last replacement race remain open. This is an intentional fail-closed state,
+not a production Windows support claim.
+
+The native build now emits a content-free sidecar manifest containing the exact
+binary byte count, SHA-256, fixed contract/method set, native capability claims,
+and an explicit `approvedPolicy` that remains false. The loader verifies the
+manifest and binary digest before loading the binding and cross-checks the
+native claims; self-reported booleans alone cannot enable production. This is
+an integrity/mismatch anchor, not a cryptographic provenance signature. A
+future signed installer or separately authenticated manifest/allowlist remains
+required before any Windows production promotion.
 
 ## Filesystem contract
 
@@ -61,6 +82,19 @@ Primary Microsoft references:
 - [GetFinalPathNameByHandleW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew)
 
 ## Credential Manager probe contract
+
+The fixed-capability production adapter now exists as a dormant qualification
+primitive. All four product selectors remain unavailable on Windows because
+their surrounding lock, metadata, and lifecycle files have not yet passed the
+Windows filesystem contract. Native qualification may use disposable hosted
+runner entries; this does not enable production behavior.
+
+The mutation lease introduced for portable qualification is deliberately
+in-process, synchronous, and non-durable. It rejects forged lease objects and
+coordinates backend instances within one Node process, but it is not a
+production concurrency primitive. A named Win32 mutex or equivalent must span
+the full read/expected-check/write/readback transaction before any selector is
+enabled.
 
 The milestone probe is intentionally narrower than a production backend:
 

@@ -40,6 +40,7 @@ export const ROOT_WORKSPACE_POLICY = Object.freeze({
     "experiments",
     "generated",
     "local-review",
+    "native",
     "packages",
     "schemas",
     "scripts",

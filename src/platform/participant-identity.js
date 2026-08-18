@@ -15,6 +15,34 @@ const LEGACY_RETIREMENT_CONTENT = "app-usagemonitor legacy secret retired v1\n";
 const BACKEND_RETIREMENT_CONTENT = "app-usagemonitor owner file backend retired v1\n";
 const ROTATION_CONFIRMATION_ERROR = "Participant secret rotation requires confirmRotation: true";
 
+function resolveWindowsFilesystemAdapter(adapter) {
+  const selected = adapter ?? null;
+  if (process.platform === "win32"
+      && (selected?.productionSafe !== true || selected?.pathWalkRaceSafe !== true)) {
+    const error = new Error("Windows filesystem production policy is unavailable");
+    error.code = "EXPORT_IDENTITY_WINDOWS_FILESYSTEM_POLICY_UNAVAILABLE";
+    throw error;
+  }
+  return selected;
+}
+
+function isWindowsFilesystemNotFound(error) {
+  return error?.code === "ENOENT" || error?.code === "WINDOWS_FILESYSTEM_NOT_FOUND";
+}
+
+function isWindowsFilesystemAlreadyExists(error) {
+  return error?.code === "EEXIST" || error?.code === "WINDOWS_FILESYSTEM_ALREADY_EXISTS";
+}
+
+function sameWindowsFileIdentity(left, right) {
+  return typeof left?.volumeSerialNumber === "string"
+    && typeof left?.fileId === "string"
+    && typeof right?.volumeSerialNumber === "string"
+    && typeof right?.fileId === "string"
+    && left.volumeSerialNumber === right.volumeSerialNumber
+    && left.fileId === right.fileId;
+}
+
 export function defaultExportStateDirectory({
   platform = process.platform,
   homeDirectory = homedir(),
@@ -86,7 +114,18 @@ function assertOwnedRegularSecret(stats) {
   }
 }
 
-async function readSecretFileWithIdentity(path) {
+async function readSecretFileWithIdentity(path, windowsFilesystemAdapter = null) {
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
+  if (windowsFilesystem) {
+    const observed = windowsFilesystem.readFile(path);
+    if (observed.data.byteLength !== 44) {
+      throw new Error("Participant secret file must contain exactly 44 bytes");
+    }
+    return {
+      secret: decodeSecret(observed.data.toString("utf8").trim()),
+      identity: observed.identity,
+    };
+  }
   const pathStats = await lstat(path);
   assertOwnedRegularSecret(pathStats);
   const noFollow = constants.O_NOFOLLOW ?? 0;
@@ -107,19 +146,19 @@ async function readSecretFileWithIdentity(path) {
   }
 }
 
-async function readSecretFile(path) {
-  return (await readSecretFileWithIdentity(path)).secret;
+async function readSecretFile(path, windowsFilesystemAdapter = null) {
+  return (await readSecretFileWithIdentity(path, windowsFilesystemAdapter)).secret;
 }
 
 function isIncompleteConcurrentCreate(error) {
   return error instanceof Error && error.message === "Participant secret file must contain exactly 44 bytes";
 }
 
-async function readSecretFileEventually(path) {
+async function readSecretFileEventually(path, windowsFilesystemAdapter = null) {
   let lastError;
   for (let attempt = 0; attempt < 20; attempt += 1) {
     try {
-      return await readSecretFileWithIdentity(path);
+      return await readSecretFileWithIdentity(path, windowsFilesystemAdapter);
     } catch (error) {
       if (!isIncompleteConcurrentCreate(error)) throw error;
       lastError = error;
@@ -130,6 +169,7 @@ async function readSecretFileEventually(path) {
 }
 
 function sameFileIdentity(left, right) {
+  if (sameWindowsFileIdentity(left, right)) return true;
   return typeof left?.dev === "number" && typeof left?.ino === "number"
     && typeof right?.dev === "number" && typeof right?.ino === "number"
     && left.dev === right.dev && left.ino === right.ino;
@@ -139,8 +179,13 @@ function secretsEqual(left, right) {
   return left.byteLength === right.byteLength && timingSafeEqual(left, right);
 }
 
-async function prepareSecretDirectory(path) {
+async function prepareSecretDirectory(path, windowsFilesystemAdapter = null) {
   const directory = dirname(path);
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
+  if (windowsFilesystem) {
+    windowsFilesystem.ensureDirectory(directory);
+    return;
+  }
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const stats = await lstat(directory);
   if (!stats.isDirectory() || stats.isSymbolicLink()) throw new Error("Participant secret directory must be a real directory");
@@ -152,8 +197,13 @@ async function prepareSecretDirectory(path) {
   }
 }
 
-async function writeNewSecret(path, encoded) {
-  await prepareSecretDirectory(path);
+async function writeNewSecret(path, encoded, windowsFilesystemAdapter = null) {
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
+  await prepareSecretDirectory(path, windowsFilesystem);
+  if (windowsFilesystem) {
+    windowsFilesystem.createFile(path, Buffer.from(`${encoded}\n`, "utf8"));
+    return;
+  }
   const noFollow = constants.O_NOFOLLOW ?? 0;
   const handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow, 0o600);
   try {
@@ -194,55 +244,53 @@ function assertOwnedRegularControlFile(stats, expectedSize) {
   }
 }
 
-async function readLegacyRetirementFile(path) {
+async function readControlFileWithIdentity(path, expectedContent, windowsFilesystemAdapter = null) {
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
+  if (windowsFilesystem) {
+    const observed = windowsFilesystem.readFile(path);
+    if (observed.data.byteLength !== Buffer.byteLength(expectedContent)
+        || observed.data.toString("utf8") !== expectedContent) {
+      throw new Error("Participant secret control file has invalid content");
+    }
+    return observed.identity;
+  }
   const pathStats = await lstat(path);
-  assertOwnedRegularControlFile(pathStats, Buffer.byteLength(LEGACY_RETIREMENT_CONTENT));
+  assertOwnedRegularControlFile(pathStats, Buffer.byteLength(expectedContent));
   const noFollow = constants.O_NOFOLLOW ?? 0;
   const handle = await open(path, constants.O_RDONLY | noFollow);
   try {
     const stats = await handle.stat();
-    assertOwnedRegularControlFile(stats, Buffer.byteLength(LEGACY_RETIREMENT_CONTENT));
+    assertOwnedRegularControlFile(stats, Buffer.byteLength(expectedContent));
     if (typeof stats.dev === "number" && typeof stats.ino === "number"
         && (stats.dev !== pathStats.dev || stats.ino !== pathStats.ino)) {
       throw new Error("Participant secret control file changed while it was being opened");
     }
-    if ((await handle.readFile("utf8")) !== LEGACY_RETIREMENT_CONTENT) {
+    if ((await handle.readFile("utf8")) !== expectedContent) {
       throw new Error("Participant secret control file has invalid content");
     }
+    return { dev: stats.dev, ino: stats.ino };
   } finally {
     await handle.close();
   }
 }
 
-async function readBackendRetirementFile(path) {
-  const pathStats = await lstat(path);
-  assertOwnedRegularControlFile(pathStats, Buffer.byteLength(BACKEND_RETIREMENT_CONTENT));
-  const noFollow = constants.O_NOFOLLOW ?? 0;
-  const handle = await open(path, constants.O_RDONLY | noFollow);
-  try {
-    const stats = await handle.stat();
-    assertOwnedRegularControlFile(stats, Buffer.byteLength(BACKEND_RETIREMENT_CONTENT));
-    if (typeof stats.dev === "number" && typeof stats.ino === "number"
-        && (stats.dev !== pathStats.dev || stats.ino !== pathStats.ino)) {
-      throw new Error("Participant secret control file changed while it was being opened");
-    }
-    if ((await handle.readFile("utf8")) !== BACKEND_RETIREMENT_CONTENT) {
-      throw new Error("Participant secret control file has invalid content");
-    }
-  } finally {
-    await handle.close();
-  }
+async function readLegacyRetirementFile(path, windowsFilesystemAdapter = null) {
+  return readControlFileWithIdentity(path, LEGACY_RETIREMENT_CONTENT, windowsFilesystemAdapter);
+}
+
+async function readBackendRetirementFile(path, windowsFilesystemAdapter = null) {
+  return readControlFileWithIdentity(path, BACKEND_RETIREMENT_CONTENT, windowsFilesystemAdapter);
 }
 
 function isIncompleteConcurrentControlCreate(error) {
   return error instanceof Error && error.message === "Participant secret control file has invalid content";
 }
 
-async function readLegacyRetirementFileEventually(path) {
+async function readLegacyRetirementFileEventually(path, windowsFilesystemAdapter = null) {
   let lastError;
   for (let attempt = 0; attempt < 20; attempt += 1) {
     try {
-      return await readLegacyRetirementFile(path);
+      return await readLegacyRetirementFile(path, windowsFilesystemAdapter);
     } catch (error) {
       if (!isIncompleteConcurrentControlCreate(error)) throw error;
       lastError = error;
@@ -264,20 +312,32 @@ async function syncDirectory(directory) {
   }
 }
 
-async function ensureLegacyRetired(path) {
+async function ensureLegacyRetired(path, windowsFilesystemAdapter = null) {
   try {
-    await readLegacyRetirementFileEventually(path);
+    await readLegacyRetirementFileEventually(path, windowsFilesystemAdapter);
     return false;
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
 
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
+  if (windowsFilesystem) {
+    await prepareSecretDirectory(path, windowsFilesystem);
+    try {
+      windowsFilesystem.createFile(path, Buffer.from(LEGACY_RETIREMENT_CONTENT, "utf8"));
+      return true;
+    } catch (error) {
+      if (!isWindowsFilesystemAlreadyExists(error)) throw error;
+      await readLegacyRetirementFileEventually(path, windowsFilesystem);
+      return false;
+    }
+  }
   const handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
     .catch(async (error) => {
       if (error.code !== "EEXIST") throw error;
       // Another creator exposes the O_EXCL inode before its write/sync has
       // completed. Wait for that bounded critical section, then validate it.
-      await readLegacyRetirementFileEventually(path);
+      await readLegacyRetirementFileEventually(path, windowsFilesystem);
       return null;
     });
   if (!handle) return false;
@@ -292,11 +352,11 @@ async function ensureLegacyRetired(path) {
   return true;
 }
 
-async function readBackendRetirementFileEventually(path) {
+async function readBackendRetirementFileEventually(path, windowsFilesystemAdapter = null) {
   let lastError;
   for (let attempt = 0; attempt < 20; attempt += 1) {
     try {
-      return await readBackendRetirementFile(path);
+      return await readBackendRetirementFile(path, windowsFilesystemAdapter);
     } catch (error) {
       if (!isIncompleteConcurrentControlCreate(error)) throw error;
       lastError = error;
@@ -306,18 +366,29 @@ async function readBackendRetirementFileEventually(path) {
   throw lastError;
 }
 
-async function ensureBackendRetired(path) {
+async function ensureBackendRetired(path, windowsFilesystemAdapter = null) {
   try {
-    await readBackendRetirementFileEventually(path);
+    await readBackendRetirementFileEventually(path, windowsFilesystemAdapter);
     return false;
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
-  await prepareSecretDirectory(path);
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
+  await prepareSecretDirectory(path, windowsFilesystem);
+  if (windowsFilesystem) {
+    try {
+      windowsFilesystem.createFile(path, Buffer.from(BACKEND_RETIREMENT_CONTENT, "utf8"));
+      return true;
+    } catch (error) {
+      if (!isWindowsFilesystemAlreadyExists(error)) throw error;
+      await readBackendRetirementFileEventually(path, windowsFilesystem);
+      return false;
+    }
+  }
   const handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
     .catch(async (error) => {
       if (error.code !== "EEXIST") throw error;
-      await readBackendRetirementFileEventually(path);
+      await readBackendRetirementFileEventually(path, windowsFilesystem);
       return null;
     });
   if (!handle) return false;
@@ -332,20 +403,20 @@ async function ensureBackendRetired(path) {
   return true;
 }
 
-async function readOptionalSecret(path) {
+async function readOptionalSecret(path, windowsFilesystemAdapter = null) {
   try {
-    return { state: "present", ...(await readSecretFileEventually(path)) };
+    return { state: "present", ...(await readSecretFileEventually(path, windowsFilesystemAdapter)) };
   } catch (error) {
-    if (error.code === "ENOENT") return { state: "missing", secret: null, identity: null };
+    if (isWindowsFilesystemNotFound(error)) return { state: "missing", secret: null, identity: null };
     throw error;
   }
 }
 
-async function readRetiredSecretResidue(path) {
+async function readRetiredSecretResidue(path, windowsFilesystemAdapter = null) {
   try {
-    return { state: "retired_retained", ...(await readSecretFileEventually(path)) };
+    return { state: "retired_retained", ...(await readSecretFileEventually(path, windowsFilesystemAdapter)) };
   } catch (error) {
-    if (error.code === "ENOENT") return { state: "retired_removed", secret: null, identity: null };
+    if (isWindowsFilesystemNotFound(error)) return { state: "retired_removed", secret: null, identity: null };
     try {
       await lstat(path);
       return { state: "retired_retained_unverified", secret: null, identity: null };
@@ -356,22 +427,22 @@ async function readRetiredSecretResidue(path) {
   }
 }
 
-async function retirementState(path) {
+async function retirementState(path, windowsFilesystemAdapter = null) {
   try {
-    await readLegacyRetirementFileEventually(path);
+    await readLegacyRetirementFileEventually(path, windowsFilesystemAdapter);
     return true;
   } catch (error) {
-    if (error.code === "ENOENT") return false;
+    if (isWindowsFilesystemNotFound(error)) return false;
     throw error;
   }
 }
 
-async function backendRetirementState(path) {
+async function backendRetirementState(path, windowsFilesystemAdapter = null) {
   try {
-    await readBackendRetirementFileEventually(path);
+    await readBackendRetirementFileEventually(path, windowsFilesystemAdapter);
     return true;
   } catch (error) {
-    if (error.code === "ENOENT") return false;
+    if (isWindowsFilesystemNotFound(error)) return false;
     throw error;
   }
 }
@@ -397,6 +468,7 @@ function assertParticipantSecretBackend(backend, capability) {
 
 function copyBackendSecret(secret) {
   if (!Buffer.isBuffer(secret) || secret.byteLength !== SECRET_BYTES) {
+    if (Buffer.isBuffer(secret)) secret.fill(0);
     const error = new Error("Participant identity backend returned an invalid value");
     error.code = "EXPORT_IDENTITY_BACKEND_INVALID_VALUE";
     throw error;
@@ -439,7 +511,11 @@ async function invokeParticipantSecretBackend(backend, method, ...args) {
 
 async function readBackendSecret(backend, capability) {
   const value = await invokeParticipantSecretBackend(backend, "read", capability);
-  return value === null ? null : copyBackendSecret(value);
+  try {
+    return value === null ? null : copyBackendSecret(value);
+  } finally {
+    if (Buffer.isBuffer(value)) value.fill(0);
+  }
 }
 
 async function describeBackend(backend, capability) {
@@ -467,6 +543,7 @@ async function inspectBackendParticipantSecretInternal({
   participantSecretCapability,
   secretFile,
   legacySecretFile = null,
+  windowsFilesystemAdapter = null,
 }) {
   assertParticipantSecretBackend(participantSecretBackend, participantSecretCapability);
   const path = resolve(secretFile);
@@ -475,18 +552,18 @@ async function inspectBackendParticipantSecretInternal({
   const [backendDescription, backendSecret, retired, legacyRetired] = await Promise.all([
     describeBackend(participantSecretBackend, participantSecretCapability),
     readBackendSecret(participantSecretBackend, participantSecretCapability),
-    backendRetirementState(retirementPath),
-    legacyPath ? retirementState(retirementFileFor(path)) : false,
+    backendRetirementState(retirementPath, windowsFilesystemAdapter),
+    legacyPath ? retirementState(retirementFileFor(path), windowsFilesystemAdapter) : false,
   ]);
   const ownerFile = retired
-    ? await readRetiredSecretResidue(path)
-    : await readOptionalSecret(path);
+    ? await readRetiredSecretResidue(path, windowsFilesystemAdapter)
+    : await readOptionalSecret(path, windowsFilesystemAdapter);
   const legacyFile = retired || legacyRetired
     ? legacyPath
-      ? await readRetiredSecretResidue(legacyPath)
+      ? await readRetiredSecretResidue(legacyPath, windowsFilesystemAdapter)
       : { state: "disabled", secret: null, identity: null }
     : legacyPath
-      ? await readOptionalSecret(legacyPath)
+      ? await readOptionalSecret(legacyPath, windowsFilesystemAdapter)
       : { state: "disabled", secret: null, identity: null };
   const presentSecrets = [
     backendSecret,
@@ -530,6 +607,7 @@ async function inspectParticipantSecretInternal({
   environmentSecret = process.env.APP_USAGEMONITOR_EXPORT_SECRET,
   secretFile = defaultExportSecretFile(),
   legacySecretFile = secretFile === defaultExportSecretFile() ? legacyWorkingDirectorySecretFile() : null,
+  windowsFilesystemAdapter = null,
 } = {}) {
   const path = resolve(secretFile);
   const legacyPath = legacySecretFile && resolve(legacySecretFile) !== path ? resolve(legacySecretFile) : null;
@@ -552,10 +630,10 @@ async function inspectParticipantSecretInternal({
     };
   }
 
-  const canonical = await readOptionalSecret(path);
-  const retired = legacyPath ? await retirementState(retirementFileFor(path)) : false;
+  const canonical = await readOptionalSecret(path, windowsFilesystemAdapter);
+  const retired = legacyPath ? await retirementState(retirementFileFor(path), windowsFilesystemAdapter) : false;
   const legacy = legacyPath && !retired
-    ? await readOptionalSecret(legacyPath)
+    ? await readOptionalSecret(legacyPath, windowsFilesystemAdapter)
     : { state: legacyPath && retired ? "retired" : "disabled", secret: null, identity: null };
   const conflict = canonical.state === "present" && legacy.state === "present"
     && !secretsEqual(canonical.secret, legacy.secret);
@@ -601,6 +679,9 @@ export async function inspectParticipantSecret(options = {}) {
   const environmentSecret = Object.hasOwn(options, "environmentSecret")
     ? options.environmentSecret
     : process.env.APP_USAGEMONITOR_EXPORT_SECRET;
+  const windowsFilesystemAdapter = environmentSecret
+    ? null
+    : resolveWindowsFilesystemAdapter(options.windowsFilesystemAdapter);
   const useBackend = options.participantSecretBackend !== undefined && options.participantSecretBackend !== null;
   const result = useBackend && !environmentSecret
     ? await inspectBackendParticipantSecretInternal({
@@ -609,11 +690,12 @@ export async function inspectParticipantSecret(options = {}) {
       secretFile: options.secretFile ?? defaultExportSecretFile(),
       legacySecretFile: Object.hasOwn(options, "legacySecretFile")
         ? options.legacySecretFile
-        : (options.secretFile ?? defaultExportSecretFile()) === defaultExportSecretFile()
+      : (options.secretFile ?? defaultExportSecretFile()) === defaultExportSecretFile()
           ? legacyWorkingDirectorySecretFile()
           : null,
+      windowsFilesystemAdapter,
     })
-    : await inspectParticipantSecretInternal(options);
+    : await inspectParticipantSecretInternal({ ...options, windowsFilesystemAdapter });
   const {
     canonicalIdentity: _canonicalIdentity,
     ownerFileIdentity: _ownerFileIdentity,
@@ -638,13 +720,13 @@ function backendMutationError(code) {
   return error;
 }
 
-async function revalidateBackendMigrationFiles(inspection) {
+async function revalidateBackendMigrationFiles(inspection, windowsFilesystemAdapter = null) {
   for (const [state, path, identity, expected] of [
     [inspection.ownerFileState, inspection.path, inspection.ownerFileIdentity, inspection.secret],
     [inspection.legacyState, inspection.legacyPath, inspection.legacyIdentity, inspection.secret],
   ]) {
     if (state !== "present") continue;
-    const current = await readSecretFileWithIdentity(path);
+    const current = await readSecretFileWithIdentity(path, windowsFilesystemAdapter);
     if (!sameFileIdentity(identity, current.identity) || !secretsEqual(expected, current.secret)) {
       current.secret.fill(0);
       const error = new Error("Participant identity file changed during backend migration");
@@ -659,19 +741,37 @@ function isRetiredResidueState(state) {
   return state === "present" || state === "retired_retained" || state === "retired_retained_unverified";
 }
 
-async function removeExactRetiredSecret(path, identity, expectedSecret, migrationHook, label) {
+async function removeExactRetiredSecret(
+  path,
+  identity,
+  expectedSecret,
+  migrationHook,
+  label,
+  windowsFilesystemAdapter = null,
+) {
   if (!path || !identity) return "retained_unverified";
   await migrationHook?.(`before-${label}-secret-removal`);
   let opened;
   try {
-    opened = await readSecretFileWithIdentity(path);
+    opened = await readSecretFileWithIdentity(path, windowsFilesystemAdapter);
   } catch (error) {
-    if (error.code === "ENOENT") return "removed";
+    if (isWindowsFilesystemNotFound(error)) return "removed";
     return "retained_unverified";
   }
   try {
     if (!sameFileIdentity(identity, opened.identity) || !secretsEqual(expectedSecret, opened.secret)) {
       return "retained_changed";
+    }
+    const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
+    if (windowsFilesystem) {
+      try {
+        windowsFilesystem.deleteFile(path, opened.identity);
+        return "removed";
+      } catch (error) {
+        if (isWindowsFilesystemNotFound(error)) return "removed";
+        if (error?.code === "WINDOWS_FILESYSTEM_IDENTITY_MISMATCH") return "retained_changed";
+        return "retained_unverified";
+      }
     }
     const current = await lstat(path).catch((error) => {
       if (error.code === "ENOENT") return null;
@@ -687,7 +787,12 @@ async function removeExactRetiredSecret(path, identity, expectedSecret, migratio
   }
 }
 
-async function cleanupRetiredBackendFiles(inspection, expectedSecret, migrationHook = null) {
+async function cleanupRetiredBackendFiles(
+  inspection,
+  expectedSecret,
+  migrationHook = null,
+  windowsFilesystemAdapter = null,
+) {
   const states = {};
   for (const [label, state, path, identity] of [
     ["owner", inspection.ownerFileState, inspection.path, inspection.ownerFileIdentity],
@@ -698,7 +803,14 @@ async function cleanupRetiredBackendFiles(inspection, expectedSecret, migrationH
     } else if (state === "missing" || state === "retired_removed") {
       states[label] = "already_absent";
     } else if (isRetiredResidueState(state)) {
-      states[label] = await removeExactRetiredSecret(path, identity, expectedSecret, migrationHook, label);
+      states[label] = await removeExactRetiredSecret(
+        path,
+        identity,
+        expectedSecret,
+        migrationHook,
+        label,
+        windowsFilesystemAdapter,
+      );
     } else {
       states[label] = "retained_unverified";
     }
@@ -717,22 +829,29 @@ async function loadOrCreateBackendParticipantSecretUnderLease({
   secretFile,
   legacySecretFile,
   migrationHook = null,
+  windowsFilesystemAdapter = null,
 }) {
   const inspection = await inspectBackendParticipantSecretInternal({
     participantSecretBackend,
     participantSecretCapability,
     secretFile,
     legacySecretFile,
+    windowsFilesystemAdapter,
   });
   if (inspection.conflict) throw identityConflictError();
   const retirementPath = backendRetirementFileFor(inspection.path);
 
   if (inspection.backendState === "present") {
-    await revalidateBackendMigrationFiles(inspection);
-    await ensureBackendRetired(retirementPath);
-    if (inspection.legacyPath) await ensureLegacyRetired(retirementFileFor(inspection.path));
+    await revalidateBackendMigrationFiles(inspection, windowsFilesystemAdapter);
+    await ensureBackendRetired(retirementPath, windowsFilesystemAdapter);
+    if (inspection.legacyPath) await ensureLegacyRetired(retirementFileFor(inspection.path), windowsFilesystemAdapter);
     await migrationHook?.("after-retirement-before-cleanup");
-    const cleanup = await cleanupRetiredBackendFiles(inspection, inspection.secret, migrationHook);
+    const cleanup = await cleanupRetiredBackendFiles(
+      inspection,
+      inspection.secret,
+      migrationHook,
+      windowsFilesystemAdapter,
+    );
     return {
       secret: Buffer.from(inspection.secret),
       source: "secret_backend",
@@ -772,11 +891,16 @@ async function loadOrCreateBackendParticipantSecretUnderLease({
     persisted.fill(0);
     throw backendMutationError("EXPORT_IDENTITY_BACKEND_READBACK_FAILED");
   }
-  await revalidateBackendMigrationFiles(inspection);
-  await ensureBackendRetired(retirementPath);
-  if (inspection.legacyPath) await ensureLegacyRetired(retirementFileFor(inspection.path));
+  await revalidateBackendMigrationFiles(inspection, windowsFilesystemAdapter);
+  await ensureBackendRetired(retirementPath, windowsFilesystemAdapter);
+  if (inspection.legacyPath) await ensureLegacyRetired(retirementFileFor(inspection.path), windowsFilesystemAdapter);
   await migrationHook?.("after-retirement-before-cleanup");
-  const cleanup = await cleanupRetiredBackendFiles(inspection, persisted, migrationHook);
+  const cleanup = await cleanupRetiredBackendFiles(
+    inspection,
+    persisted,
+    migrationHook,
+    windowsFilesystemAdapter,
+  );
   const result = {
     secret: Buffer.from(persisted),
     source: "secret_backend",
@@ -797,13 +921,17 @@ export async function loadOrCreateParticipantSecret({
   participantSecretBackend = null,
   participantSecretCapability = null,
   migrationHook = null,
+  windowsFilesystemAdapter = null,
 } = {}) {
+  const windowsFilesystem = environmentSecret
+    ? null
+    : resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
   if (!environmentSecret && participantSecretBackend !== null) {
     assertParticipantSecretBackend(participantSecretBackend, participantSecretCapability);
     const path = resolve(secretFile);
-    await prepareSecretDirectory(path);
+    await prepareSecretDirectory(path, windowsFilesystem);
     const lockPath = `${path}.rotation-lock`;
-    const lock = await acquireRotationLock(lockPath);
+    const lock = await acquireRotationLock(lockPath, windowsFilesystem);
     try {
       return await loadOrCreateBackendParticipantSecretUnderLease({
         participantSecretBackend,
@@ -811,12 +939,18 @@ export async function loadOrCreateParticipantSecret({
         secretFile: path,
         legacySecretFile,
         migrationHook,
+        windowsFilesystemAdapter: windowsFilesystem,
       });
     } finally {
-      await releaseRotationLock(lockPath, lock);
+      await releaseRotationLock(lockPath, lock, windowsFilesystem);
     }
   }
-  const inspection = await inspectParticipantSecretInternal({ environmentSecret, secretFile, legacySecretFile });
+  const inspection = await inspectParticipantSecretInternal({
+    environmentSecret,
+    secretFile,
+    legacySecretFile,
+    windowsFilesystemAdapter: windowsFilesystem,
+  });
   if (inspection.source === "environment") return { secret: inspection.secret, source: "environment", created: false, migrated: false };
   if (inspection.conflict) throw identityConflictError();
 
@@ -824,39 +958,66 @@ export async function loadOrCreateParticipantSecret({
   const legacyPath = legacySecretFile && resolve(legacySecretFile) !== path ? resolve(legacySecretFile) : null;
   const retirementPath = legacyPath ? retirementFileFor(path) : null;
   if (inspection.source === "owner_only_file") {
-    if (retirementPath && !inspection.legacyRetired) await ensureLegacyRetired(retirementPath);
+    if (retirementPath && !inspection.legacyRetired) {
+      await ensureLegacyRetired(retirementPath, windowsFilesystem);
+    }
     return { secret: inspection.secret, source: "owner_only_file", created: false, migrated: false };
   }
 
   if (inspection.source === "legacy_owner_only_file") {
     try {
-      await writeNewSecret(path, encodeParticipantSecret(inspection.secret));
+      await writeNewSecret(path, encodeParticipantSecret(inspection.secret), windowsFilesystem);
     } catch (error) {
-      if (error.code !== "EEXIST") throw error;
+      if (!isWindowsFilesystemAlreadyExists(error)) throw error;
     }
-    const canonicalSecret = (await readSecretFileEventually(path)).secret;
+    const canonicalSecret = (await readSecretFileEventually(path, windowsFilesystem)).secret;
     if (!secretsEqual(canonicalSecret, inspection.secret)) throw identityConflictError();
-    await ensureLegacyRetired(retirementPath);
+    await ensureLegacyRetired(retirementPath, windowsFilesystem);
     return { secret: canonicalSecret, source: "owner_only_file", created: false, migrated: true };
   }
 
   const secret = randomBytes(SECRET_BYTES);
   const encoded = encodeParticipantSecret(secret);
   try {
-    await writeNewSecret(path, encoded);
-    if (retirementPath) await ensureLegacyRetired(retirementPath);
+    await writeNewSecret(path, encoded, windowsFilesystem);
+    if (retirementPath) await ensureLegacyRetired(retirementPath, windowsFilesystem);
     return { secret, source: "owner_only_file", created: true, migrated: false };
   } catch (error) {
-    if (error.code !== "EEXIST") throw error;
-    const concurrent = await inspectParticipantSecretInternal({ environmentSecret: null, secretFile: path, legacySecretFile: legacyPath });
+    if (!isWindowsFilesystemAlreadyExists(error)) throw error;
+    const concurrent = await inspectParticipantSecretInternal({
+      environmentSecret: null,
+      secretFile: path,
+      legacySecretFile: legacyPath,
+      windowsFilesystemAdapter: windowsFilesystem,
+    });
     if (concurrent.conflict) throw identityConflictError();
     if (concurrent.source !== "owner_only_file") throw new Error("Participant secret was not available after concurrent creation");
-    if (retirementPath && !concurrent.legacyRetired) await ensureLegacyRetired(retirementPath);
+    if (retirementPath && !concurrent.legacyRetired) {
+      await ensureLegacyRetired(retirementPath, windowsFilesystem);
+    }
     return { secret: concurrent.secret, source: "owner_only_file", created: false, migrated: false };
   }
 }
 
-async function acquireRotationLock(path) {
+async function acquireRotationLock(path, windowsFilesystemAdapter = null) {
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
+  if (windowsFilesystem) {
+    await prepareSecretDirectory(path, windowsFilesystem);
+    try {
+      const identity = windowsFilesystem.createFile(
+        path,
+        Buffer.from("app-usagemonitor identity operation lock v1\n", "utf8"),
+      );
+      return { handle: null, identity, windowsFilesystem };
+    } catch (error) {
+      if (isWindowsFilesystemAlreadyExists(error)) {
+        const locked = new Error("A participant identity operation is already in progress");
+        locked.code = "EXPORT_IDENTITY_ROTATION_LOCKED";
+        throw locked;
+      }
+      throw error;
+    }
+  }
   let handle;
   try {
     handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
@@ -894,16 +1055,18 @@ export async function withParticipantSecretLease({
   legacySecretFile = secretFile === defaultExportSecretFile() ? legacyWorkingDirectorySecretFile() : null,
   participantSecretBackend = null,
   participantSecretCapability = null,
+  windowsFilesystemAdapter = null,
 } = {}, callback) {
   if (typeof callback !== "function") throw new TypeError("Participant identity lease requires a callback");
   if (environmentSecret) {
     const identity = await loadOrCreateParticipantSecret({ environmentSecret, secretFile, legacySecretFile });
     return callback(identity);
   }
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
   const path = resolve(secretFile);
-  await prepareSecretDirectory(path);
+  await prepareSecretDirectory(path, windowsFilesystem);
   const lockPath = `${path}.rotation-lock`;
-  const lock = await acquireRotationLock(lockPath);
+  const lock = await acquireRotationLock(lockPath, windowsFilesystem);
   try {
     const identity = participantSecretBackend !== null
       ? await loadOrCreateBackendParticipantSecretUnderLease({
@@ -911,28 +1074,49 @@ export async function withParticipantSecretLease({
         participantSecretCapability,
         secretFile: path,
         legacySecretFile,
+        windowsFilesystemAdapter: windowsFilesystem,
       })
       : await loadOrCreateParticipantSecret({
         environmentSecret: null,
         secretFile: path,
         legacySecretFile,
+        windowsFilesystemAdapter: windowsFilesystem,
       });
     return await callback(identity);
   } finally {
-    await releaseRotationLock(lockPath, lock);
+    await releaseRotationLock(lockPath, lock, windowsFilesystem);
   }
 }
 
-async function releaseRotationLock(path, lock) {
+async function releaseRotationLock(path, lock, windowsFilesystemAdapter = null) {
+  const lockLost = () => {
+    const error = new Error("Participant identity operation lock was lost");
+    error.code = "EXPORT_IDENTITY_ROTATION_LOCK_LOST";
+    return error;
+  };
+  const windowsFilesystem = lock?.windowsFilesystem
+    ?? resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
+  if (windowsFilesystem) {
+    try {
+      windowsFilesystem.deleteFile(path, lock.identity);
+    } catch (error) {
+      if (isWindowsFilesystemNotFound(error)
+          || error?.code === "WINDOWS_FILESYSTEM_IDENTITY_MISMATCH") {
+        throw lockLost();
+      }
+      throw error;
+    }
+    return;
+  }
   await lock.handle.close();
   try {
     const current = await lstat(path);
-    if (sameFileIdentity(lock.identity, current)) {
-      await unlink(path);
-      await syncDirectory(dirname(path));
-    }
+    if (!sameFileIdentity(lock.identity, current)) throw lockLost();
+    await unlink(path);
+    await syncDirectory(dirname(path));
   } catch (error) {
-    if (error.code !== "ENOENT") throw error;
+    if (error.code === "ENOENT") throw lockLost();
+    throw error;
   }
 }
 
@@ -952,6 +1136,7 @@ async function rotateBackendParticipantSecret({
   legacySecretFile,
   rotationHook,
   failpoint,
+  windowsFilesystemAdapter = null,
 }) {
   assertParticipantSecretBackend(participantSecretBackend, participantSecretCapability);
   const path = resolve(secretFile);
@@ -960,6 +1145,7 @@ async function rotateBackendParticipantSecret({
     participantSecretCapability,
     secretFile: path,
     legacySecretFile,
+    windowsFilesystemAdapter,
   });
   if (initial.conflict) throw identityConflictError();
   if (initial.backendState !== "present") {
@@ -968,9 +1154,9 @@ async function rotateBackendParticipantSecret({
     throw error;
   }
 
-  await prepareSecretDirectory(path);
+  await prepareSecretDirectory(path, windowsFilesystemAdapter);
   const lockPath = `${path}.rotation-lock`;
-  const lock = await acquireRotationLock(lockPath);
+  const lock = await acquireRotationLock(lockPath, windowsFilesystemAdapter);
   const expected = Buffer.from(initial.secret);
   let replacement = null;
   let readback = null;
@@ -980,6 +1166,7 @@ async function rotateBackendParticipantSecret({
       participantSecretCapability,
       secretFile: path,
       legacySecretFile,
+      windowsFilesystemAdapter,
     });
     if (current.conflict) throw identityConflictError();
     if (current.backendState !== "present" || !secretsEqual(current.secret, expected)) {
@@ -987,10 +1174,15 @@ async function rotateBackendParticipantSecret({
       error.code = "EXPORT_IDENTITY_ROTATION_RACE";
       throw error;
     }
-    await revalidateBackendMigrationFiles(current);
-    await ensureBackendRetired(backendRetirementFileFor(path));
-    if (current.legacyPath) await ensureLegacyRetired(retirementFileFor(path));
-    const cleanup = await cleanupRetiredBackendFiles(current, current.secret, rotationHook);
+    await revalidateBackendMigrationFiles(current, windowsFilesystemAdapter);
+    await ensureBackendRetired(backendRetirementFileFor(path), windowsFilesystemAdapter);
+    if (current.legacyPath) await ensureLegacyRetired(retirementFileFor(path), windowsFilesystemAdapter);
+    const cleanup = await cleanupRetiredBackendFiles(
+      current,
+      current.secret,
+      rotationHook,
+      windowsFilesystemAdapter,
+    );
     replacement = randomBytes(SECRET_BYTES);
     await rotationCheckpoint(rotationHook, failpoint, "before-backend-replace");
     const outcome = await invokeParticipantSecretBackend(
@@ -1024,7 +1216,7 @@ async function rotateBackendParticipantSecret({
     expected.fill(0);
     replacement?.fill(0);
     readback?.fill(0);
-    await releaseRotationLock(lockPath, lock);
+    await releaseRotationLock(lockPath, lock, windowsFilesystemAdapter);
   }
 }
 
@@ -1041,6 +1233,7 @@ export async function rotateParticipantSecret({
   participantSecretCapability = null,
   rotationHook = null,
   failpoint = null,
+  windowsFilesystemAdapter = null,
 } = {}) {
   if (confirmRotation !== true) throw new Error(ROTATION_CONFIRMATION_ERROR);
   if (environmentSecret) {
@@ -1056,7 +1249,15 @@ export async function rotateParticipantSecret({
       legacySecretFile,
       rotationHook,
       failpoint,
+      windowsFilesystemAdapter: resolveWindowsFilesystemAdapter(windowsFilesystemAdapter),
     });
+  }
+
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
+  if (windowsFilesystem) {
+    const error = new Error("Windows participant identity rotation replacement is not yet available");
+    error.code = "EXPORT_IDENTITY_WINDOWS_ROTATION_REPLACEMENT_UNAVAILABLE";
+    throw error;
   }
 
   const path = resolve(secretFile);
@@ -1070,7 +1271,7 @@ export async function rotateParticipantSecret({
     throw error;
   }
 
-  const lock = await acquireRotationLock(lockPath);
+  const lock = await acquireRotationLock(lockPath, windowsFilesystem);
   let stagedPath = null;
   const oldSecret = initial.secret;
   let lockedOldSecret = null;

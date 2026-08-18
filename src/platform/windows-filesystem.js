@@ -1,0 +1,434 @@
+import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { dirname, isAbsolute, resolve, win32 } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const require = createRequire(import.meta.url);
+const NATIVE_BINDING_RELATIVE_PATH = Object.freeze([
+  "native",
+  "windows-filesystem",
+  "build",
+  "Release",
+  "windows_filesystem.node",
+].join("/"));
+const NATIVE_BINDING_MANIFEST_RELATIVE_PATH = Object.freeze(
+  `${NATIVE_BINDING_RELATIVE_PATH}.manifest.json`,
+);
+const NATIVE_BINDING_PATH = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "native",
+  "windows-filesystem",
+  "build",
+  "Release",
+  "windows_filesystem.node",
+);
+const BINDING_MANIFEST_SCHEMA_VERSION =
+  "windows-filesystem-binding-manifest-v1";
+const BINDING_FILE_NAME = "windows_filesystem.node";
+const BINDING_PLATFORM = "win32";
+const BINDING_ARCHITECTURE = "x64";
+const MAXIMUM_BINDING_BYTES = 64 * 1024 * 1024;
+const REQUIRED_METHODS = Object.freeze([
+  "inspectPath",
+  "ensureDirectory",
+  "readFile",
+  "createFile",
+  "deleteFile",
+  "replaceFile",
+]);
+const MANIFEST_KEYS = Object.freeze([
+  "schemaVersion",
+  "bindingFile",
+  "platform",
+  "architecture",
+  "bytes",
+  "sha256",
+  "contractVersion",
+  "securityContractVersion",
+  "requiredMethods",
+  "nativeClaims",
+  "approvedPolicy",
+]);
+
+export const WINDOWS_FILESYSTEM_BINDING_RELATIVE_PATH = NATIVE_BINDING_RELATIVE_PATH;
+export const WINDOWS_FILESYSTEM_BINDING_MANIFEST_RELATIVE_PATH =
+  NATIVE_BINDING_MANIFEST_RELATIVE_PATH;
+export const WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION =
+  BINDING_MANIFEST_SCHEMA_VERSION;
+export const WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS = REQUIRED_METHODS;
+
+function failure(code) {
+  const error = new Error("Windows filesystem native adapter unavailable");
+  error.code = `WINDOWS_FILESYSTEM_${code}`;
+  return error;
+}
+
+function normalizeBindingPath(path, platform) {
+  if (typeof path !== "string"
+      || !(platform === "win32" ? win32.isAbsolute(path) : isAbsolute(path))) {
+    throw failure("INVALID_BINDING_PATH");
+  }
+  if (platform === "win32") {
+    const suffix = ["native", "windows-filesystem", "build", "Release", "windows_filesystem.node"]
+      .join(win32.sep);
+    if (!path.toLowerCase().endsWith(`${win32.sep}${suffix.toLowerCase()}`)) {
+      throw failure("INVALID_BINDING_PATH");
+    }
+  } else if (!path.endsWith("/native/windows-filesystem/build/Release/windows_filesystem.node")) {
+    throw failure("INVALID_BINDING_PATH");
+  }
+  return path;
+}
+
+function normalizeBindingBytes(bytes) {
+  if (!(Buffer.isBuffer(bytes) || bytes instanceof Uint8Array)
+      || bytes.byteLength <= 0
+      || bytes.byteLength > MAXIMUM_BINDING_BYTES) {
+    throw failure("INVALID_BINDING_BYTES");
+  }
+  return Buffer.from(bytes);
+}
+
+function bindingSha256(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function parseBindingManifest(value) {
+  let parsed;
+  try {
+    const text = Buffer.isBuffer(value) || value instanceof Uint8Array
+      ? Buffer.from(value).toString("utf8")
+      : value;
+    if (typeof text !== "string") throw new Error("manifest is not text");
+    parsed = JSON.parse(text);
+  } catch {
+    throw failure("INVALID_MANIFEST");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw failure("INVALID_MANIFEST");
+  }
+  return parsed;
+}
+
+function assertBindingManifest(manifest) {
+  const nativeClaims = manifest.nativeClaims;
+  const approvedPolicy = manifest.approvedPolicy;
+  const requiredMethods = manifest.requiredMethods;
+  const manifestKeys = Object.keys(manifest);
+  const valid = manifestKeys.length === MANIFEST_KEYS.length
+    && MANIFEST_KEYS.every((key) => manifestKeys.includes(key))
+    && manifest.schemaVersion === BINDING_MANIFEST_SCHEMA_VERSION
+    && manifest.bindingFile === BINDING_FILE_NAME
+    && manifest.platform === BINDING_PLATFORM
+    && manifest.architecture === BINDING_ARCHITECTURE
+    && Number.isSafeInteger(manifest.bytes)
+    && manifest.bytes > 0
+    && manifest.bytes <= MAXIMUM_BINDING_BYTES
+    && typeof manifest.sha256 === "string"
+    && /^[0-9a-f]{64}$/u.test(manifest.sha256)
+    && manifest.contractVersion === "windows-filesystem-v1"
+    && manifest.securityContractVersion === "windows-filesystem-security-v1"
+    && Array.isArray(requiredMethods)
+    && requiredMethods.length === REQUIRED_METHODS.length
+    && requiredMethods.every((method, index) => method === REQUIRED_METHODS[index])
+    && nativeClaims !== null
+    && typeof nativeClaims === "object"
+    && !Array.isArray(nativeClaims)
+    && Object.keys(nativeClaims).length === 2
+    && Object.hasOwn(nativeClaims, "productionSafe")
+    && Object.hasOwn(nativeClaims, "pathWalkRaceSafe")
+    && typeof nativeClaims.productionSafe === "boolean"
+    && typeof nativeClaims.pathWalkRaceSafe === "boolean"
+    && approvedPolicy !== null
+    && typeof approvedPolicy === "object"
+    && !Array.isArray(approvedPolicy)
+    && Object.keys(approvedPolicy).length === 2
+    && Object.hasOwn(approvedPolicy, "productionSafe")
+    && Object.hasOwn(approvedPolicy, "pathWalkRaceSafe")
+    && approvedPolicy.productionSafe === false
+    && approvedPolicy.pathWalkRaceSafe === false;
+  if (!valid) throw failure("INVALID_MANIFEST");
+  return Object.freeze({
+    ...manifest,
+    nativeClaims: Object.freeze({ ...nativeClaims }),
+    approvedPolicy: Object.freeze({ ...approvedPolicy }),
+    requiredMethods: Object.freeze([...requiredMethods]),
+  });
+}
+
+function assertBinding(binding) {
+  let valid = binding !== null && typeof binding === "object";
+  try {
+    for (const method of REQUIRED_METHODS) valid = valid && typeof binding?.[method] === "function";
+    valid = valid
+      && binding?.contractVersion === "windows-filesystem-v1"
+      && binding?.securityContractVersion === "windows-filesystem-security-v1"
+      && typeof binding?.productionSafe === "boolean"
+      && typeof binding?.pathWalkRaceSafe === "boolean";
+  } catch {
+    valid = false;
+  }
+  if (!valid) throw failure("INVALID_BINDING");
+  return binding;
+}
+
+function bindingManifestPath(bindingPath) {
+  // The manifest is a fixed sidecar of the repository-owned binary. It is not
+  // caller-selectable, which prevents a caller from pairing a binary with a
+  // manifest from another directory or package.
+  return `${bindingPath}.manifest.json`;
+}
+
+function verifyBindingIntegrity({
+  bindingPath,
+  readManifest,
+  readBindingBytes,
+  requireBinding,
+}) {
+  let manifest;
+  try {
+    manifest = assertBindingManifest(parseBindingManifest(
+      readManifest(bindingManifestPath(bindingPath)),
+    ));
+  } catch (error) {
+    if (error?.code?.startsWith("WINDOWS_FILESYSTEM_")) throw error;
+    throw failure("MANIFEST_UNAVAILABLE");
+  }
+
+  let bytes;
+  try {
+    bytes = normalizeBindingBytes(readBindingBytes(bindingPath));
+  } catch (error) {
+    if (error?.code?.startsWith("WINDOWS_FILESYSTEM_")) throw error;
+    throw failure("BINDING_UNAVAILABLE");
+  }
+  if (bytes.byteLength !== manifest.bytes
+      || bindingSha256(bytes) !== manifest.sha256) {
+    throw failure("BINDING_INTEGRITY_MISMATCH");
+  }
+
+  let binding;
+  try {
+    binding = assertBinding(requireBinding(bindingPath));
+  } catch (error) {
+    if (error?.code?.startsWith("WINDOWS_FILESYSTEM_")) throw error;
+    throw failure("BINDING_UNAVAILABLE");
+  }
+  if (binding.contractVersion !== manifest.contractVersion
+      || binding.securityContractVersion !== manifest.securityContractVersion
+      || binding.productionSafe !== manifest.nativeClaims.productionSafe
+      || binding.pathWalkRaceSafe !== manifest.nativeClaims.pathWalkRaceSafe) {
+    throw failure("MANIFEST_BINDING_MISMATCH");
+  }
+  return Object.freeze({ binding, manifest });
+}
+
+/**
+ * Load the repository-owned native Windows adapter. This is deliberately
+ * platform- and architecture-gated: a missing or unreviewed binary must not
+ * silently turn a POSIX-style path check into a Windows production claim.
+ */
+function loadVerifiedWindowsFilesystemBinding({
+  platform = process.platform,
+  architecture = process.arch,
+  bindingPath = NATIVE_BINDING_PATH,
+  resolveBinding = (path) => path,
+  requireBinding = (path) => require(path),
+  readManifest = (path) => readFileSync(path, "utf8"),
+  readBindingBytes = (path) => readFileSync(path),
+} = {}) {
+  if (platform !== "win32") throw failure("UNSUPPORTED_PLATFORM");
+  if (architecture !== "x64") throw failure("UNSUPPORTED_ARCHITECTURE");
+  if (typeof resolveBinding !== "function"
+      || typeof requireBinding !== "function"
+      || typeof readManifest !== "function"
+      || typeof readBindingBytes !== "function") {
+    throw failure("INVALID_CONFIGURATION");
+  }
+  let resolved;
+  try {
+    resolved = resolveBinding(bindingPath);
+    normalizeBindingPath(resolved, platform);
+  } catch (error) {
+    if (error?.code?.startsWith("WINDOWS_FILESYSTEM_")) throw error;
+    throw failure("BINDING_UNAVAILABLE");
+  }
+  try {
+    return verifyBindingIntegrity({
+      bindingPath: resolved,
+      readManifest,
+      readBindingBytes,
+      requireBinding,
+    });
+  } catch (error) {
+    if (error?.code?.startsWith("WINDOWS_FILESYSTEM_")) throw error;
+    throw failure("BINDING_UNAVAILABLE");
+  }
+}
+
+export function loadWindowsFilesystemBinding(options = {}) {
+  return loadVerifiedWindowsFilesystemBinding(options).binding;
+}
+
+function fixedOperationError(code) {
+  const error = new Error("Windows filesystem operation failed");
+  error.code = code;
+  return error;
+}
+
+function normalizeNativeError(error) {
+  const code = typeof error?.code === "string" ? error.code : "";
+  if (code === "ENOENT" || code === "EEXIST") return error;
+  if (code === "WINDOWS_FILESYSTEM_NOT_FOUND") return fixedOperationError("ENOENT");
+  if (code === "WINDOWS_FILESYSTEM_ALREADY_EXISTS") return fixedOperationError("EEXIST");
+  return error?.code?.startsWith("WINDOWS_FILESYSTEM_")
+    ? error
+    : fixedOperationError("WINDOWS_FILESYSTEM_OPERATION_FAILED");
+}
+
+function normalizeIdentity(identity) {
+  if (!identity || typeof identity !== "object" || Array.isArray(identity)
+      || typeof identity.volumeSerialNumber !== "string"
+      || !/^[0-9a-f]{16}$/u.test(identity.volumeSerialNumber)
+      || typeof identity.fileId !== "string"
+      || !/^[0-9a-f]{32}$/u.test(identity.fileId)
+      || !Number.isSafeInteger(identity.linkCount)
+      || identity.linkCount < 0) {
+    throw failure("INVALID_IDENTITY");
+  }
+  return Object.freeze({
+    volumeSerialNumber: identity.volumeSerialNumber,
+    fileId: identity.fileId,
+    linkCount: identity.linkCount,
+  });
+}
+
+function call(binding, method, args) {
+  try {
+    return binding[method](...args);
+  } catch (error) {
+    throw normalizeNativeError(error);
+  }
+}
+
+/**
+ * Return the adapter for a Windows host, or null on every other host. An
+ * injected binding is supported for portable contract tests; production
+ * callers should let the loader select the repository-owned binary.
+ */
+export function createWindowsFilesystemAdapter({
+  platform = process.platform,
+  architecture = process.arch,
+  binding = null,
+  ...loaderOptions
+} = {}) {
+  if (platform !== "win32") return null;
+  let native;
+  let approvedPolicy = null;
+  if (binding === null) {
+    const loadOptions = {
+      platform,
+      architecture,
+      ...loaderOptions,
+    };
+    const verified = loadVerifiedWindowsFilesystemBinding(loadOptions);
+    native = verified.binding;
+    approvedPolicy = verified.manifest.approvedPolicy;
+  } else {
+    native = assertBinding(binding);
+  }
+  return Object.freeze({
+    productionSafe: approvedPolicy?.productionSafe === true
+      && native.productionSafe === true
+      && native.pathWalkRaceSafe === true,
+    pathWalkRaceSafe: approvedPolicy?.pathWalkRaceSafe === true
+      && native.pathWalkRaceSafe === true,
+    inspectPath(path) {
+      try {
+        const result = call(native, "inspectPath", [path]);
+        return Object.freeze({
+          ...result,
+          identity: normalizeIdentity(result?.identity),
+        });
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
+    ensureDirectory(path) {
+      try {
+        return normalizeIdentity(call(native, "ensureDirectory", [path]));
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
+    readFile(path) {
+      try {
+        const result = call(native, "readFile", [path]);
+        if (!result || !Buffer.isBuffer(result.data)) throw failure("INVALID_RESULT");
+        return Object.freeze({ data: Buffer.from(result.data), identity: normalizeIdentity(result.identity) });
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
+    createFile(path, data) {
+      if (!Buffer.isBuffer(data) && !(data instanceof Uint8Array)) throw failure("INVALID_DATA");
+      try {
+        return normalizeIdentity(call(native, "createFile", [path, Buffer.from(data)]));
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
+    deleteFile(path, identity) {
+      const expected = normalizeIdentity(identity);
+      try {
+        const result = call(native, "deleteFile", [path, expected]);
+        if (!result?.deleted) throw failure("INVALID_RESULT");
+        return Object.freeze({ deleted: true, identity: normalizeIdentity(result.identity) });
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
+    replaceFile(path, identity, data) {
+      const expected = normalizeIdentity(identity);
+      if (!Buffer.isBuffer(data) && !(data instanceof Uint8Array)) throw failure("INVALID_DATA");
+      try {
+        return normalizeIdentity(call(native, "replaceFile", [
+          path,
+          expected,
+          Buffer.from(data),
+        ]));
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
+  });
+}
+
+export function isWindowsFilesystemNotFound(error) {
+  return error?.code === "ENOENT" || error?.code === "WINDOWS_FILESYSTEM_NOT_FOUND";
+}
+
+export function isWindowsFilesystemAlreadyExists(error) {
+  return error?.code === "EEXIST" || error?.code === "WINDOWS_FILESYSTEM_ALREADY_EXISTS";
+}
+
+export function isWindowsFilesystemIdentity(identity) {
+  try {
+    normalizeIdentity(identity);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function assertWindowsFilesystemProductionSafe(adapter) {
+  if (adapter?.productionSafe !== true || adapter?.pathWalkRaceSafe !== true) {
+    const error = new Error("Windows filesystem production policy is unavailable");
+    error.code = "EXPORT_IDENTITY_WINDOWS_FILESYSTEM_POLICY_UNAVAILABLE";
+    throw error;
+  }
+  return adapter;
+}
