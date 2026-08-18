@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import {
@@ -13,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve, win32 } from "node:path";
 import test from "node:test";
+import { once } from "node:events";
 import { Worker } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
 
@@ -59,6 +61,66 @@ function qualificationBindingPath() {
 
 function loadQualificationBinding(bindingPath = qualificationBindingPath()) {
   return requireNative(bindingPath);
+}
+
+async function startSqliteLeaseChild({ bindingPath, root, rootIdentity, databaseName }) {
+  const child = spawn(process.execPath, [
+    "-e",
+    `
+      const binding = require(process.argv[1]);
+      const root = process.argv[2];
+      const rootIdentity = JSON.parse(process.argv[3]);
+      const databaseName = process.argv[4];
+      try {
+        const lease = binding.acquireSqliteStateLease(root, rootIdentity, databaseName);
+        process.stdout.write("READY\\n");
+        process.stdin.once("data", () => {
+          binding.releaseSqliteStateLease(lease.lease);
+          process.exit(0);
+        });
+        process.stdin.resume();
+      } catch (error) {
+        process.stdout.write(\`ERROR:\${typeof error?.code === "string" ? error.code : "UNKNOWN"}\\n\`);
+        process.exit(2);
+      }
+    `,
+    bindingPath,
+    root,
+    JSON.stringify(rootIdentity),
+    databaseName,
+  ], { stdio: ["pipe", "pipe", "ignore"] });
+  const ready = new Promise((resolveReady, rejectReady) => {
+    let settled = false;
+    let output = "";
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      void child.kill();
+      rejectReady(new Error("WINDOWS_FILESYSTEM_SQLITE_CHILD_TIMEOUT"));
+    }, 10_000);
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      if (settled) return;
+      output += chunk;
+      if (output.includes("READY\\n")) {
+        settled = true;
+        clearTimeout(timer);
+        resolveReady();
+      } else if (output.includes("ERROR:")) {
+        settled = true;
+        clearTimeout(timer);
+        rejectReady(new Error("WINDOWS_FILESYSTEM_SQLITE_CHILD_FAILED"));
+      }
+    });
+    child.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      rejectReady(error);
+    });
+  });
+  await ready;
+  return child;
 }
 
 function runReplacementWorker({ bindingPath, path, expectedIdentity, bytes }) {
@@ -515,6 +577,149 @@ test("native protected-child methods reject traversal, repeated, and trailing se
     adapter.readProtectedChild(root, rootIdentity, "state.bin", 1024).data,
     Buffer.from("path-bound-state\n", "utf8"),
   );
+}));
+
+test("native SQLite state lease creates both rollback files and releases exactly once", {
+  skip: NATIVE_SKIP,
+}, () => withSyntheticRoot(({ adapter, root }) => {
+  const rootIdentity = adapter.ensureDirectory(root);
+  const lease = adapter.acquireSqliteStateLease(root, rootIdentity, "state.sqlite");
+  assert.equal(lease.databaseIdentity.linkCount, 1);
+  assert.equal(lease.journalIdentity.linkCount, 1);
+  assert.deepEqual(
+    adapter.inspectProtectedChild(root, rootIdentity, "state.sqlite").identity,
+    lease.databaseIdentity,
+  );
+  assert.deepEqual(
+    adapter.inspectProtectedChild(root, rootIdentity, "state.sqlite-journal").identity,
+    lease.journalIdentity,
+  );
+  assert.equal(adapter.sqliteStateLeaseSafe, false);
+  adapter.releaseSqliteStateLease(lease);
+  assert.throws(
+    () => adapter.releaseSqliteStateLease(lease),
+    (error) => error?.code === "WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_FOREIGN",
+  );
+  const native = loadQualificationBinding();
+  const direct = native.acquireSqliteStateLease(root, rootIdentity, "state.sqlite");
+  native.releaseSqliteStateLease(direct.lease);
+  assert.throws(
+    () => native.releaseSqliteStateLease(direct.lease),
+    fixedNativeError("WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_FOREIGN"),
+  );
+}));
+
+test("native SQLite state lease rejects caller sidecars and non-canonical names", {
+  skip: NATIVE_SKIP,
+}, () => withSyntheticRoot(({ adapter, root }) => {
+  const rootIdentity = adapter.ensureDirectory(root);
+  adapter.createProtectedChild(
+    root,
+    rootIdentity,
+    "state.sqlite-wal",
+    Buffer.from("wal-present\n", "utf8"),
+  );
+  assert.throws(
+    () => adapter.acquireSqliteStateLease(root, rootIdentity, "state.sqlite"),
+    fixedNativeError("WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_SIDECAR_PRESENT"),
+  );
+  for (const name of [
+    "state.sqlite-journal",
+    "state.sqlite-wal",
+    "state.sqlite-shm",
+    "nested\\state.sqlite",
+    "nested/state.sqlite",
+    "..",
+  ]) {
+    assert.throws(
+      () => adapter.acquireSqliteStateLease(root, rootIdentity, name),
+      fixedNativeError("WINDOWS_FILESYSTEM_INVALID_PATH"),
+      name,
+    );
+  }
+}));
+
+test("native SQLite state lease rejects aliases and serializes duplicate leases", {
+  skip: NATIVE_SKIP,
+}, async (t) => withSyntheticRoot(async ({ adapter, root }) => {
+  const rootIdentity = adapter.ensureDirectory(root);
+  const databasePath = join(root, "state.sqlite");
+  const aliasPath = join(root, "state-alias.sqlite");
+  adapter.createFile(databasePath, Buffer.from("database\n", "utf8"));
+  try {
+    await link(databasePath, aliasPath);
+    assert.throws(
+      () => adapter.acquireSqliteStateLease(root, rootIdentity, "state-alias.sqlite"),
+      fixedNativeError("WINDOWS_FILESYSTEM_HARD_LINK"),
+    );
+  } finally {
+    await rm(aliasPath, { force: true });
+  }
+
+  const lease = adapter.acquireSqliteStateLease(root, rootIdentity, "state.sqlite");
+  assert.throws(
+    () => adapter.acquireSqliteStateLease(root, rootIdentity, "state.sqlite"),
+    fixedNativeError("WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_CONTENDED"),
+  );
+  adapter.releaseSqliteStateLease(lease);
+
+  const symlinkPath = join(root, "state-link.sqlite");
+  try {
+    await symlink(databasePath, symlinkPath, "file");
+    assert.throws(
+      () => adapter.acquireSqliteStateLease(root, rootIdentity, "state-link.sqlite"),
+      fixedNativeError("WINDOWS_FILESYSTEM_REPARSE_POINT"),
+    );
+  } catch (error) {
+    if (error?.code === "EPERM" || error?.code === "EINVAL") {
+      t.skip("symbolic-link creation is unavailable on this Windows runner");
+      return;
+    }
+    throw error;
+  } finally {
+    await rm(symlinkPath, { force: true });
+  }
+}));
+
+test("native SQLite state lease pins the root against rename until release", {
+  skip: NATIVE_SKIP,
+}, async () => withSyntheticRoot(async ({ adapter, root }) => {
+  const rootIdentity = adapter.ensureDirectory(root);
+  const movedRoot = `${root}-moved`;
+  const lease = adapter.acquireSqliteStateLease(root, rootIdentity, "state.sqlite");
+  await assert.rejects(rename(root, movedRoot));
+  adapter.releaseSqliteStateLease(lease);
+  await rename(root, movedRoot);
+  await rename(movedRoot, root);
+}));
+
+test("native SQLite state lease contention crosses a process boundary", {
+  skip: NATIVE_SKIP,
+}, async () => withSyntheticRoot(async ({ adapter, root }) => {
+  const rootIdentity = adapter.ensureDirectory(root);
+  const child = await startSqliteLeaseChild({
+    bindingPath: qualificationBindingPath(),
+    root,
+    rootIdentity,
+    databaseName: "cross-process.sqlite",
+  });
+  try {
+    assert.throws(
+      () => adapter.acquireSqliteStateLease(root, rootIdentity, "cross-process.sqlite"),
+      fixedNativeError("WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_CONTENDED"),
+    );
+  } finally {
+    if (child.exitCode === null) {
+      child.stdin.write("release\\n");
+      await once(child, "exit");
+    }
+  }
+  const lease = adapter.acquireSqliteStateLease(
+    root,
+    rootIdentity,
+    "cross-process.sqlite",
+  );
+  adapter.releaseSqliteStateLease(lease);
 }));
 
 test("native protected-child methods reject hard-link and reparse aliases", {

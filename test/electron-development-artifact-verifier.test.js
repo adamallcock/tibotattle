@@ -75,6 +75,7 @@ function bindingManifest(bytes) {
     contractVersion: "windows-filesystem-v1",
     securityContractVersion: "windows-filesystem-security-v1",
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
+    sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
     requiredMethods: [
       "inspectPath",
@@ -89,6 +90,8 @@ function bindingManifest(bytes) {
       "createProtectedChild",
       "deleteProtectedChild",
       "replaceProtectedChild",
+      "acquireSqliteStateLease",
+      "releaseSqliteStateLease",
       "acquireCredentialAuditFileGuard",
       "releaseCredentialAuditFileGuard",
       "acquireCredentialMutex",
@@ -99,12 +102,14 @@ function bindingManifest(bytes) {
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
       credentialAuditFileGuardSafe: true,
+      sqliteStateLeaseSafe: false,
     },
     approvedPolicy: {
       productionSafe: false,
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
       credentialAuditFileGuardSafe: true,
+      sqliteStateLeaseSafe: false,
     },
     bindingProvenance: {
       contractVersion: "windows-binding-provenance-v1",

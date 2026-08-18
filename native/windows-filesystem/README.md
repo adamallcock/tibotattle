@@ -110,3 +110,16 @@ runtime or package is introduced. The native binding remains Windows x64-only.
 Credential mutation audit durability is provided separately by the fixed
 SQLite prepared/settled/recovered journal; neither the mutex nor audit enables
 the still-disabled Windows production selectors.
+
+`acquireSqliteStateLease(rootPath, expectedRootIdentity, databaseName)` is a
+purpose-limited protected SQLite boundary. It accepts one basename, derives
+the rollback journal, rejects pre-existing `-wal`/`-shm` sidecars, and returns
+validated database/journal identities plus an opaque lease. The lease holds
+the root/ancestor, database, and journal handles with read/write sharing but
+without delete sharing, and coordinates duplicate acquisition with a
+current-user owner-only named mutex derived from the validated root/database
+identities. `releaseSqliteStateLease` releases that mutex and every handle
+exactly once. The binding still advertises `sqliteStateLeaseSafe: false`:
+sidecar absence is a defensive preflight rather than a lifetime reservation,
+and native Windows qualification must prove the final SQLite integration
+before any production selector can rely on it.
