@@ -1509,6 +1509,20 @@ napi_value ReplaceFileCallback(napi_env env, napi_callback_info info) {
     success = false;
   }
   if (success) {
+    // Revalidate the identity-bound destination immediately before the rename.
+    // The open handle and its no-delete-sharing mode provide the same-user
+    // race boundary; this second handle check also rejects a security or
+    // namespace change made through a pre-existing privileged handle before
+    // the atomic name replacement is requested. Windows' rename API has no
+    // expected-file-ID argument, so the native claim remains qualification-
+    // only until the supported Windows/filesystem matrix proves this boundary.
+    HandleIdentity latest;
+    success = ValidateSecurity(opened.final, false, &failure, &latest)
+        && EqualIdentity(latest, expected)
+        && ResolveFinalPath(opened.final, &parsed);
+    if (!success && failure.code == OperationFailed().code) failure = IdentityMismatch();
+  }
+  if (success) {
 #if defined(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK)
     PauseBeforeReplacementRename();
 #endif
