@@ -39,6 +39,25 @@ or a Linux-support claim.
   A later full portable rerun was not obtained because the local execution
   approval for its loopback companion timed out twice; the same lane passed at
   the Stage 1 checkpoint.
+- The secure shared Electron shell and deterministic runtime/app staging are
+  implemented. Twenty-five focused shell, runtime-closure, and packaging tests
+  pass, along with architecture and preflight checks.
+- The unsigned macOS arm64 development bundle was rebuilt from the reviewed
+  staging tree and verified at the artifact boundary: the stage and `app.asar`
+  contain the same 416 files with no extras or omissions, and the only unpacked
+  native payload is the Darwin arm64 Keytar binary.
+- The packaged companion launched from inside `app.asar`, returned HTTP 200 on
+  loopback, and released its port after termination. The complete app rendered
+  the real local dashboard under disposable state, reloaded, stayed alive after
+  window close, reopened on activation, and quit without an orphan.
+- The preserved native macOS lane also remains green: its source suite passed
+  44 tests with 3 expected source-only skips, and the native test-profile app
+  built, launched, and completed its one smoke test with the development
+  runtime deliberately disabled.
+- Stage 4 is now the active implementation stage. Native Windows x64 remains
+  the authority for the Windows addon, credential integration, packaged-app
+  lifecycle, and installer claims; none of those claims follows from the macOS
+  Electron proof.
 
 ## Delivery rules
 
