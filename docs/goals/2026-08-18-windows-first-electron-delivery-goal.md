@@ -44,10 +44,25 @@ or a Linux-support claim.
   `nativeReadBounded: false` until the native Windows matrix proves the
   implementation. Stale crash recovery is still unavailable because the
   current lease contract has no authenticated age/heartbeat primitive.
-- A `WindowsSqliteStateSession` is still required for the collector,
-  unified-index, Claude quota, and contribution-queue SQLite paths. Direct
+- A production-qualified `WindowsSqliteStateSession` is still required for
+  the collector, unified-index, Claude quota, and contribution-queue SQLite
+  paths. Direct
   renewal and prepared-artifact paths still need to be wired through the
   protected store rather than falling back to ordinary Node filesystem access.
+- The qualification-only SQLite foundation now exists. The native addon can
+  pin an identity-checked root, database, and persistent rollback journal and
+  serialize sessions across processes with an owner-only kernel mutex. The JS
+  session configures and reads back `PERSIST`, `FULL`, `MEMORY`, and zero-mmap
+  policy, denies ATTACH/DETACH and protected PRAGMA mutations, hides the raw
+  SQLite control surface, and closes SQLite before releasing the lease.
+  `sqliteStateLeaseSafe` remains false because WAL/SHM names are not yet
+  reserved for the lease lifetime, the SQLite connection still needs a final
+  identity binding to the native-held database, and crash recovery has not run
+  on Windows.
+- The existing credential-operation audit now steps and verifies
+  `journal_mode=PERSIST` and avoids conflicting Node filesystem syncs while
+  its native guard is held. A failed SQLite close retains the guard and can be
+  retried; a native guard-release failure remains permanently fail-closed.
 - Claude callback lifecycle and settings state now have an explicit protected
   Windows composition with root matching, content-digest revalidation, and
   prepared-phase recovery tests. Actual Windows remains closed unless a
@@ -97,9 +112,12 @@ or a Linux-support claim.
    zero skips and fixed aggregate evidence, or keep all readiness flags false
    and name the exact failing primitive. This requires separate authorization
    to push and dispatch the manual workflow.
-2. Add the protected `WindowsSqliteStateSession` for collector, unified-index,
-   Claude quota, and contribution-queue state. Exit when Windows composition
-   tests prove that these paths cannot fall back to ordinary Node/SQLite state.
+2. Finish the protected `WindowsSqliteStateSession`: reserve WAL/SHM names for
+   the full lease, bind the live SQLite connection to the native-held database
+   identity, and prove real transactions, rollback recovery, and close/reopen
+   on Windows. Then route collector, unified-index, Claude quota, and
+   contribution-queue state. Exit when Windows composition tests prove that
+   none can fall back to ordinary Node/SQLite state.
 3. Add an authenticated kernel-backed lease/age contract for crash recovery,
    or document a bounded startup-recovery design that remains fail-closed.
    Exit only after native contention, abandonment, stale-state, and exact
