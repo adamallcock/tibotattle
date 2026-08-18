@@ -5,6 +5,11 @@ import {
   isValidQuotaWindowDuration,
 } from "@app-usagemonitor/quota-analysis";
 import { selectProductionAccountObservationSecret } from "./account-observation-production.js";
+import {
+  LOCAL_COLLECTOR_LEGACY_REFRESH_USE_MAX,
+  LOCAL_COLLECTOR_LEGACY_REFRESH_USE_SCHEMA_VERSION,
+  recordLocalCollectorLegacyRefreshAttempt,
+} from "./local-collector-state.js";
 import { runCollectorOnce } from "./passive-collector.js";
 import {
   REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
@@ -77,6 +82,71 @@ const INDEXING_PHASES = new Set([
   "prospective",
 ]);
 const ACCOUNTING_REFRESH_STATUSES = new Set(["reused", "rebuilt", "deferred"]);
+const GENERATION_TOKEN_PATTERN = /^[A-Za-z0-9._:-]{1,256}$/u;
+// Accounting reader failures are deliberately closed over a fixed vocabulary.
+// A caller-controlled `accounting_*` string must never become a public
+// diagnostic or an implicit promise that an unreviewed failure is safe to
+// expose.
+const ACCOUNTING_UNAVAILABLE_CODES = new Set([
+  "accounting_unified_source_unavailable",
+  "accounting_unified_coverage_incomplete",
+  "accounting_unified_coverage_unavailable",
+  "accounting_unified_index_missing",
+  "accounting_unified_index_unavailable",
+  "accounting_unified_generation_changed",
+  "accounting_unified_generation_mismatch",
+  "accounting_unified_generation_required",
+  "accounting_unified_generation_unavailable",
+  "accounting_unified_index_incompatible",
+  "accounting_unified_index_invalid",
+  "accounting_unified_read_failed",
+  "accounting_unified_callback_failed",
+  "accounting_unified_history_unavailable",
+  "accounting_calibration_corpus_unavailable",
+  "accounting_history_unavailable",
+  "accounting_refresh_aborted",
+]);
+const ACCOUNTING_RESOURCE_LIMIT_CODES = new Set([
+  "accounting_scan_source_bytes_limit_exceeded",
+  "accounting_scan_rss_limit_exceeded",
+  "accounting_transition_rss_limit_exceeded",
+  "accounting_transition_memory_budget_exceeded",
+  "accounting_transition_usage_limit_exceeded",
+  "accounting_transition_snapshot_limit_exceeded",
+  "accounting_transition_input_limit_exceeded",
+  "accounting_transition_derivation_limit_exceeded",
+  "accounting_archive_rss_limit_exceeded",
+]);
+const ACCOUNTING_TERMINAL_FAILURE_CODES = new Set([
+  "accounting_transition_rss_measurement_invalid",
+  "accounting_archive_rss_measurement_invalid",
+]);
+// Only reviewed, content-free unified-index failures may cross the public
+// refresh boundary. Prefix/shape validation is insufficient here: an
+// arbitrary internal string can still be well formed while carrying an
+// unreviewed diagnostic promise.
+const UNIFIED_INDEX_PUBLIC_ERROR_CODES = new Set([
+  "local_unified_index_aborted",
+  "local_unified_index_directory_sync_failed",
+  "local_unified_index_file_changed",
+  "local_unified_index_file_invalid",
+  "local_unified_index_generation_invalid",
+  "local_unified_index_generation_mismatch",
+  "local_unified_index_integrity_failed",
+  "local_unified_index_journal_mode_refused",
+  "local_unified_index_meta_invalid",
+  "local_unified_index_missing",
+  "local_unified_index_publication_durability_uncertain",
+  "local_unified_index_schema_invalid",
+  "local_unified_index_secondary_indexes_failed",
+  "local_unified_index_secondary_indexes_missing",
+  "local_unified_index_secret_invalid",
+  "local_unified_index_secret_unavailable",
+  "local_unified_index_unavailable",
+  "local_unified_index_worker_failed",
+]);
+const DEFAULT_UNIFIED_INDEX_PUBLIC_ERROR_CODE =
+  "local_unified_index_refresh_failed";
 const ARCHIVE_INDEX_STATUSES = new Set(["complete", "partial"]);
 const ARCHIVE_INDEX_PHASES = new Set(["complete", "awaiting_resume"]);
 const ARCHIVE_INDEX_ERROR_CODES = new Set([
@@ -108,6 +178,12 @@ const QUOTA_NOTIFICATION_EVIDENCE_SCHEMA =
 const QUOTA_NOTIFICATION_LANES = new Set(["primary", "secondary"]);
 const QUOTA_NOTIFICATION_CONTINUITY_KEY = /^[A-Za-z0-9_-]{43}$/u;
 const MAX_NOTIFICATION_EVIDENCE_AGE_MS = 5 * 60 * 1_000;
+
+function safeUnifiedIndexPublicErrorCode(value) {
+  return UNIFIED_INDEX_PUBLIC_ERROR_CODES.has(value)
+    ? value
+    : DEFAULT_UNIFIED_INDEX_PUBLIC_ERROR_CODE;
+}
 
 // A five-hour refresh_resource_limited loop once wrote NOTHING to
 // diagnostics-v0.1.log: the terminal classification lived only in the
@@ -267,8 +343,7 @@ function isResourceLimitedRefreshError(error) {
   const code = error?.code;
   return typeof code === "string"
     && (
-      code.startsWith("accounting_scan_")
-      || code.startsWith("accounting_transition_")
+      ACCOUNTING_RESOURCE_LIMIT_CODES.has(code)
       || code.startsWith("export_resource_")
       || code.startsWith("collector_resource_")
       || code.startsWith("codex_log_discovery_")
@@ -299,6 +374,144 @@ function safeCount(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
+function safeGenerationToken(value) {
+  if (typeof value === "string" && GENERATION_TOKEN_PATTERN.test(value)) {
+    return value;
+  }
+  if (Number.isSafeInteger(value) && value >= 1) return String(value);
+  return null;
+}
+
+function publicUnifiedGeneration(value) {
+  const source = value?.generationDescriptor ?? value?.generation;
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    return null;
+  }
+  const id = Number(source.id ?? source.generationId);
+  const fingerprint = safeGenerationToken(
+    source.fingerprint ?? source.generationFingerprint,
+  );
+  const status = ["complete", "partial"].includes(source.status)
+    ? source.status
+    : null;
+  if (!Number.isSafeInteger(id) || id < 1 || fingerprint === null
+      || status === null) {
+    return null;
+  }
+  const token = (candidate) => safeGenerationToken(candidate);
+  // The runner projects the ingest descriptor before it uses the generation
+  // as accounting authority, and the controller projects the complete runner
+  // result once more for the HTTP receipt. Accept both the internal
+  // millisecond/count names and that already-bounded public shape so the
+  // second pass is lossless rather than replacing real coverage with zeros.
+  const publicCoveredStart = source.coveredAt?.startAt;
+  const publicCoveredEnd = source.coveredAt?.endAt;
+  const coveredStart = Number.isSafeInteger(source.coveredStartMs)
+    ? new Date(source.coveredStartMs).toISOString()
+    : publicCoveredStart === null || publicCoveredStart === undefined
+      ? null
+      : safeCanonicalInstant(publicCoveredStart);
+  const coveredEnd = Number.isSafeInteger(source.coveredEndMs)
+    ? new Date(source.coveredEndMs).toISOString()
+    : publicCoveredEnd === null || publicCoveredEnd === undefined
+      ? null
+      : safeCanonicalInstant(publicCoveredEnd);
+  if ((publicCoveredStart !== null && publicCoveredStart !== undefined
+        && coveredStart === null)
+      || (publicCoveredEnd !== null && publicCoveredEnd !== undefined
+        && coveredEnd === null)) {
+    return null;
+  }
+  const discoveredSourceCount = safeCount(
+    source.discoveredSourceCount ?? source.sourceCount,
+  );
+  const discoveredSourceBytes = safeCount(
+    source.discoveredSourceBytes ?? source.sourceBytes,
+  );
+  const indexedSourceCount = safeCount(
+    source.indexedSourceCount ?? source.sourceCount
+      ?? source.discoveredSourceCount,
+  );
+  const indexedSourceBytes = safeCount(
+    source.indexedSourceBytes ?? source.sourceBytes
+      ?? source.discoveredSourceBytes,
+  );
+  return {
+    id,
+    fingerprint,
+    status,
+    blockReason: token(source.blockReason),
+    schemaVersion: token(source.schemaVersion),
+    parserVersion: token(source.parserVersion),
+    contractVersion: token(source.contractVersion),
+    coveredAt: {
+      startAt: coveredStart,
+      endAt: coveredEnd,
+    },
+    sourceCount: indexedSourceCount,
+    sourceBytes: indexedSourceBytes,
+    discoveredSourceCount,
+    discoveredSourceBytes,
+    indexedSourceCount,
+    indexedSourceBytes,
+    usageEvents: safeCount(source.usageEvents),
+    quotaOccurrences: safeCount(source.quotaOccurrences),
+    toolFacts: safeCount(source.toolFacts),
+    toolFactFingerprint: safeGenerationToken(source.toolFactFingerprint),
+    discoveryComplete: source.discoveryComplete === true,
+    diagnosticsComplete: source.diagnosticsComplete === true,
+    usageProvenanceComplete: source.usageProvenanceComplete === true,
+    sourceOrderComplete: source.sourceOrderComplete === true,
+    quotaProvenanceComplete: source.quotaProvenanceComplete === true,
+    toolProvenanceComplete: source.toolProvenanceComplete === true,
+  };
+}
+
+function unifiedGenerationAuthoritative(value) {
+  const generation = value?.generation;
+  const accountingStatus = generation?.status === "complete"
+    || (generation?.status === "partial"
+      && generation?.blockReason === "tool_provenance_incomplete"
+      && generation?.toolProvenanceComplete === false);
+  return value?.status === "ingested"
+    && accountingStatus
+    && generation.discoveryComplete === true
+    && generation.diagnosticsComplete === true
+    && generation.usageProvenanceComplete === true
+    && generation.sourceOrderComplete === true
+    && generation.quotaProvenanceComplete === true;
+}
+
+function safeAccountingUnavailableCode(value) {
+  return typeof value === "string"
+      && ACCOUNTING_UNAVAILABLE_CODES.has(value)
+    ? value
+    : "accounting_unified_source_unavailable";
+}
+
+function unifiedAccountingCacheHasZeroFallback(cache) {
+  const fallbackCount = cache?.sourceDescriptor?.fallbackCount;
+  return Number.isSafeInteger(fallbackCount) && fallbackCount === 0;
+}
+
+function publicAccountingCapabilities(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const result = {};
+  for (const key of [
+    "readsRawSources",
+    "deterministicCanonicalOrder",
+    "sourceOrderingProvenance",
+    "sourceOffsetProvenance",
+    "sourceScopedQuotaOccurrences",
+    "durableDiagnostics",
+    "crashSafeGenerationPublication",
+  ]) {
+    if (typeof value[key] !== "boolean") return null;
+    result[key] = value[key];
+  }
+  return result;
+}
+
 function addReportedCounts(left, right) {
   if (!Number.isSafeInteger(left) || left < 0
       || !Number.isSafeInteger(right) || right < 0) return null;
@@ -318,6 +531,30 @@ function safeCanonicalInstant(value) {
   return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value
     ? value
     : null;
+}
+
+function publicLegacyRefreshUse(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.schemaVersion
+        !== LOCAL_COLLECTOR_LEGACY_REFRESH_USE_SCHEMA_VERSION
+      || value.sourceMode !== "legacy"
+      || !Number.isSafeInteger(value.attempts)
+      || value.attempts < 0
+      || value.attempts > LOCAL_COLLECTOR_LEGACY_REFRESH_USE_MAX
+      || typeof value.saturated !== "boolean"
+      || value.saturated
+        !== (value.attempts === LOCAL_COLLECTOR_LEGACY_REFRESH_USE_MAX)
+      || (value.lastAttemptedAt !== null
+        && safeCanonicalInstant(value.lastAttemptedAt) === null)) {
+    return null;
+  }
+  return {
+    schemaVersion: LOCAL_COLLECTOR_LEGACY_REFRESH_USE_SCHEMA_VERSION,
+    sourceMode: "legacy",
+    attempts: value.attempts,
+    saturated: value.saturated,
+    lastAttemptedAt: value.lastAttemptedAt,
+  };
 }
 
 function hasExactKeys(value, keys) {
@@ -603,6 +840,12 @@ export function createLocalCollectorRefreshRunner({
   // injected. Its result is intentionally not part of the public refresh
   // projection; only its provider-isolated local stores are advanced.
   refreshClaudeUsageShadow = null,
+  // Explicit source authority. The legacy default is retained only for direct
+  // compatibility/test callers; the production composition root always passes
+  // its selected mode. Neither path is ever entered as an error fallback.
+  accountingSourceMode = "legacy",
+  legacyAnalysisIndexFile = null,
+  legacyAnalysisIndexSecretFile = null,
   refreshArchiveIndex = null,
   archiveIndexFile = null,
   archiveIndexSecretFile = null,
@@ -639,6 +882,9 @@ export function createLocalCollectorRefreshRunner({
       && typeof refreshClaudeUsageShadow !== "function") {
     throw new TypeError("refreshClaudeUsageShadow must be a function or null");
   }
+  if (!["unified", "legacy"].includes(accountingSourceMode)) {
+    throw new TypeError("accountingSourceMode must be unified or legacy");
+  }
   if (refreshArchiveIndex !== null && typeof refreshArchiveIndex !== "function") {
     throw new TypeError("refreshArchiveIndex must be a function or null");
   }
@@ -652,6 +898,8 @@ export function createLocalCollectorRefreshRunner({
   for (const [name, value] of Object.entries({
     stateFile,
     accountObservationOperationLockFile,
+    legacyAnalysisIndexFile,
+    legacyAnalysisIndexSecretFile,
     archiveIndexFile,
     archiveIndexSecretFile,
     unifiedIndexFile,
@@ -698,6 +946,24 @@ export function createLocalCollectorRefreshRunner({
     };
     try {
       return await (async () => {
+    // Legacy is an explicit rollback authority, never an error fallback. Stamp
+    // the attempted use before any collector/accounting work so a later
+    // failure still leaves a durable, bounded receipt in owner-only state.
+    let legacyRefreshUse = null;
+    if (accountingSourceMode === "legacy" && stateFile !== null) {
+      try {
+        legacyRefreshUse = await recordLocalCollectorLegacyRefreshAttempt({
+          stateFile,
+          clock,
+        });
+      } catch (error) {
+        // Test/injected runners may deliberately point at a non-writable
+        // placeholder path. Do not turn that unrelated setup failure into a
+        // refresh failure; malformed existing receipt metadata still fails
+        // closed so a real owner-state corruption is not hidden.
+        if (error?.code !== "local_collector_state_unavailable") throw error;
+      }
+    }
     // Record the declared baseline before the pass reads any usage, so the
     // reading is stamped no later than the turns it may attribute. A failure
     // here is never allowed to block collection: it simply leaves those turns
@@ -734,8 +1000,17 @@ export function createLocalCollectorRefreshRunner({
       ...(stateFile === null ? {} : { stateFile }),
       staleAfterMs: 0,
       refreshStale: true,
-      backfill: true,
-      backfillSinceAt: new Date(clock() - recentIndexWindowMs).toISOString(),
+      // Usage facts are authoritative in the unified index. In that mode the
+      // collector remains responsible for the provider quota/quick headline,
+      // but must not resume an inherited legacy recent-7d rollout backfill.
+      // Legacy mode keeps the historical two-pass collector unchanged.
+      backfill: accountingSourceMode === "legacy",
+      ...(accountingSourceMode === "legacy"
+        ? { backfillSinceAt: new Date(clock() - recentIndexWindowMs).toISOString() }
+        : {}),
+      ...(accountingSourceMode === "unified"
+        ? { skipRolloutIngestion: true }
+        : {}),
       signal,
       onProgress: async (value) => {
         const progress = publicIndexingResult(value);
@@ -775,7 +1050,13 @@ export function createLocalCollectorRefreshRunner({
     if (earlyIndex?.status === "bounded_pause"
         && signal?.aborted !== true) {
       const earlyLimit = collectorResourceLimit(result);
-      if (earlyLimit !== null
+      if (accountingSourceMode === "unified") {
+        // A custom/injected collector may still report its own bounded pause
+        // even though unified production collection opts out of rollout
+        // ingestion. Remember the fixed limit for the assemble decision, but
+        // never launch a second legacy continuation in unified mode.
+        collectorResourceLimitDeferred = earlyLimit !== null;
+      } else if (earlyLimit !== null
           && earlyLimit.dimension !== "source_bytes") {
         // Preserve the foreground resource-limit receipt, but let the
         // independent archive pass use this same bounded refresh to advance
@@ -793,12 +1074,25 @@ export function createLocalCollectorRefreshRunner({
     }
     const completedIndex = publicIndexingResult(result?.indexing);
     await publishHeadline(completedIndex);
-    const accountingMayRun = completedIndex === null
-      || ["recent_7d_complete", "recent_7d_partial", "prospective_only"]
-        .includes(completedIndex.status);
+    const accountingMayRun = accountingSourceMode === "unified"
+      ? completedIndex === null
+        || [
+          "recent_7d_complete",
+          "recent_7d_partial",
+          "prospective_only",
+          // Unified accounting reads the published index, not the bounded
+          // collector ledger, so a collector-only pause must not suppress a
+          // complete-generation accounting pass.
+          "bounded_pause",
+        ].includes(completedIndex.status)
+      : completedIndex === null
+        || ["recent_7d_complete", "recent_7d_partial", "prospective_only"]
+          .includes(completedIndex.status);
     let unifiedIndex = null;
     refreshStep = "unified_index";
-    if (refreshUnifiedIndex !== null && signal?.aborted !== true) {
+    if (accountingSourceMode === "unified"
+        && refreshUnifiedIndex !== null
+        && signal?.aborted !== true) {
       // The unified index advances by its cursors, so this ordinarily reads
       // only appended bytes. It runs BEFORE accounting so the full-history
       // calibration corpus the accounting rebuild reads from the index
@@ -817,18 +1111,25 @@ export function createLocalCollectorRefreshRunner({
       } catch (error) {
         unifiedIndex = {
           status: "failed",
-          errorCode: typeof error?.code === "string"
-              && error.code.startsWith("local_unified_index_")
-            ? error.code
-            : "local_unified_index_refresh_failed",
+          errorCode: safeUnifiedIndexPublicErrorCode(error?.code),
         };
       }
     }
+    const unifiedAccountingReady = accountingSourceMode === "legacy"
+      || unifiedGenerationAuthoritative(unifiedIndex);
     let accounting = null;
     let accountingRefreshStatus = null;
     let accountingRebuildDeferred = null;
+    let accountingUnavailableCode = accountingSourceMode === "unified"
+        && !unifiedAccountingReady
+      ? unifiedIndex?.status === "failed"
+        ? "accounting_unified_source_unavailable"
+        : "accounting_unified_coverage_incomplete"
+      : null;
     refreshStep = "accounting";
-    if (refreshAccounting !== null && accountingMayRun) {
+    if (refreshAccounting !== null
+        && accountingMayRun
+        && unifiedAccountingReady) {
       // A provider quota observation does not alter replay-safe token
       // accounting. Reuse a current cache when no rollout usage record was
       // added, while the collector state continues to supply the fresh quota
@@ -845,6 +1146,13 @@ export function createLocalCollectorRefreshRunner({
           const existing = await readAccountingCache({
             ...(stateFile === null ? {} : { stateFile }),
             now: clock,
+            sourceMode: accountingSourceMode,
+            ...(accountingSourceMode === "unified"
+              ? {
+                contextBehavior: "legacy_zero",
+                expectedGeneration: unifiedIndex.generation,
+              }
+              : {}),
             // During backoff a labelled estimate beats a blank surface, so the
             // ordinary reuse-age gate is lifted (a valid cache then reads
             // "available" regardless of age). Outside backoff the gate stays,
@@ -856,7 +1164,9 @@ export function createLocalCollectorRefreshRunner({
           if (signal?.aborted !== true
               && existing?.status === "available"
               && existing.cache?.schemaVersion
-                === REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION) {
+                === REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION
+              && (accountingSourceMode !== "unified"
+                || unifiedAccountingCacheHasZeroFallback(existing.cache))) {
             accounting = existing.cache;
             // No new usage -> the reused cache still covers every event, so it
             // is exact ("reused"). Otherwise it is served only because the
@@ -871,21 +1181,56 @@ export function createLocalCollectorRefreshRunner({
         }
       }
       if (accounting === null && !withinRebuildBackoff) {
-        const rebuilt = await refreshAccounting({
-          codexHome,
-          ...(stateFile === null ? {} : { stateFile }),
-          now: clock,
-          // The scan window bounds only the periods/timeline scan and obeys
-          // the standing rule above: extreme, never convenience-sized. The
-          // calibration corpus does not follow this window at all when the
-          // unified index is present — the rebuild reads the full indexed
-          // history through `unifiedIndexFile` and falls back to this window
-          // only when the index is missing or unreadable.
-          windowDays: ACCOUNTING_SCAN_WINDOW_DAYS,
-          ...(unifiedIndexFile === null ? {} : { unifiedIndexFile }),
-          declaredSpeedBaselines,
-          signal,
-        });
+        let rebuilt = null;
+        try {
+          rebuilt = await refreshAccounting({
+            codexHome,
+            ...(stateFile === null ? {} : { stateFile }),
+            now: clock,
+            sourceMode: accountingSourceMode,
+            // The scan window bounds only the periods/timeline scan and obeys
+            // the standing rule above: extreme, never convenience-sized. The
+            // calibration corpus does not follow this window at all when the
+            // unified index is present.
+            windowDays: ACCOUNTING_SCAN_WINDOW_DAYS,
+            ...(unifiedIndexFile === null ? {} : { unifiedIndexFile }),
+            ...(accountingSourceMode === "legacy"
+                && legacyAnalysisIndexFile !== null
+              ? { indexFile: legacyAnalysisIndexFile }
+              : {}),
+            ...(accountingSourceMode === "legacy"
+                && legacyAnalysisIndexSecretFile !== null
+              ? { indexSecretFile: legacyAnalysisIndexSecretFile }
+              : {}),
+            ...(accountingSourceMode === "unified"
+              ? { expectedGeneration: unifiedIndex.generation }
+              : {}),
+            ...(accountingSourceMode === "unified"
+              ? { contextBehavior: "legacy_zero" }
+              : {}),
+            declaredSpeedBaselines,
+            signal,
+          });
+        } catch (error) {
+          if (accountingSourceMode !== "unified"
+              || error?.name === "AbortError") {
+            throw error;
+          }
+          // Resource limits are terminal refresh safety stops, not ordinary
+          // unavailable evidence. Let the controller classify the fixed code
+          // as refresh_resource_limited; swallowing it here would report a
+          // misleading successful refresh with an unavailable cache.
+          if (ACCOUNTING_RESOURCE_LIMIT_CODES.has(error?.code)
+              || ACCOUNTING_TERMINAL_FAILURE_CODES.has(error?.code)) {
+            throw error;
+          }
+          // Unified mode never falls back to raw logs or the old index. Keep
+          // the last cache on disk untouched and return a bounded unavailable
+          // receipt; a later complete generation can validate and reuse it.
+          accountingUnavailableCode = safeAccountingUnavailableCode(
+            error?.code,
+          );
+        }
         if (rebuilt?.status === "accounting_rebuild_deferred") {
           // Memory-budget miss soft-failed inside the rebuild: the prior
           // on-disk cache was retained untouched. Do NOT fail the refresh —
@@ -905,23 +1250,46 @@ export function createLocalCollectorRefreshRunner({
               const existing = await readAccountingCache({
                 ...(stateFile === null ? {} : { stateFile }),
                 now: clock,
+                sourceMode: accountingSourceMode,
+                ...(accountingSourceMode === "unified"
+                  ? {
+                    contextBehavior: "legacy_zero",
+                    expectedGeneration: unifiedIndex.generation,
+                  }
+                  : {}),
               });
               if (existing?.status === "available"
                   && existing.cache?.schemaVersion
-                    === REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION) {
+                    === REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION
+                  && (accountingSourceMode !== "unified"
+                    || unifiedAccountingCacheHasZeroFallback(existing.cache))) {
                 accounting = existing.cache;
                 accountingRefreshStatus = "deferred";
+              } else if (accountingSourceMode === "unified") {
+                accountingUnavailableCode =
+                  "accounting_unified_source_unavailable";
               }
             } catch {
               // Retained-cache read failed; the surface shows honest
               // insufficient-evidence rather than a fabricated total.
             }
           }
-        } else {
-          accounting = rebuilt;
-          accountingRefreshStatus = "rebuilt";
-          // A successful rebuild clears any prior budget-miss backoff.
-          accountingRebuildDeferUntilMs = 0;
+        } else if (rebuilt !== null) {
+          if (accountingSourceMode === "unified"
+              && !unifiedAccountingCacheHasZeroFallback(rebuilt)) {
+            // A unified cache is authoritative only when its source receipt
+            // proves that no legacy/raw fallback was used. Do not publish a
+            // plausible-looking result when the attestation is absent or
+            // non-zero.
+            accountingUnavailableCode = "accounting_unified_source_unavailable";
+          } else {
+            accounting = rebuilt;
+          }
+          if (accounting !== null) {
+            accountingRefreshStatus = "rebuilt";
+            // A successful rebuild clears any prior budget-miss backoff.
+            accountingRebuildDeferUntilMs = 0;
+          }
         }
       }
     }
@@ -931,7 +1299,8 @@ export function createLocalCollectorRefreshRunner({
     );
     let archiveIndex = null;
     refreshStep = "archive_index";
-    if (refreshArchiveIndex !== null
+    if (accountingSourceMode === "legacy"
+        && refreshArchiveIndex !== null
         && signal?.aborted !== true) {
       // Archive coverage is independent of the recent collector's accounting
       // gate. A bounded recent pass may remain paused while this one foreground
@@ -956,7 +1325,12 @@ export function createLocalCollectorRefreshRunner({
     refreshStep = "assemble";
     const claudeQuota = await claudeQuotaPromise;
     await claudeUsageShadowPromise;
-    if (collectorResourceLimitDeferred) throwCollectorResourceLimit();
+    const unifiedCollectorPauseSoftened = accountingSourceMode === "unified"
+      && unifiedAccountingReady
+      && accounting !== null;
+    if (collectorResourceLimitDeferred && !unifiedCollectorPauseSoftened) {
+      throwCollectorResourceLimit();
+    }
     return {
       rolloutRecordsWritten: Number.isSafeInteger(result?.rolloutRecordsWritten)
         ? result.rolloutRecordsWritten
@@ -970,19 +1344,54 @@ export function createLocalCollectorRefreshRunner({
           : null,
       },
       ...(notificationEvidence === null ? {} : { notificationEvidence }),
-      ...(accounting === null
-        ? {}
-        : {
+      ...(legacyRefreshUse === null ? {} : { legacyRefreshUse }),
+      ...(accounting !== null
+        ? {
           accounting: {
             status: "replay_safe",
+            sourceMode: accountingSourceMode,
             refreshStatus: accountingRefreshStatus,
+            readerVersion: accounting.sourceDescriptor?.readerVersion ?? null,
+            compatibilityBehavior:
+              accounting.sourceDescriptor?.contextBehavior ?? null,
+            coverageStatus:
+              accounting.sourceDescriptor?.coverageStatus ?? null,
+            generation: accounting.sourceDescriptor?.generation ?? null,
+            generationFingerprint:
+              accounting.sourceDescriptor?.generationFingerprint ?? null,
+            generationMatched:
+              accounting.sourceDescriptor?.generationMatched === true,
+            fallbackCount:
+              safeCount(accounting.sourceDescriptor?.fallbackCount),
+            diagnosticsAvailable:
+              accounting.sourceDescriptor?.diagnosticsAvailable === true,
+            capabilities: accounting.sourceDescriptor?.capabilities ?? null,
             generatedAt: accounting.generatedAt,
             events: accounting.periods
               ?.find((period) => period.id === "7d")?.events ?? 0,
             forkReplayEventsExcluded:
               accounting.diagnostics?.forkReplayEventsExcluded ?? 0,
           },
-        }),
+        }
+        : accountingSourceMode === "unified"
+          ? {
+            accounting: {
+              status: "unavailable",
+              sourceMode: "unified",
+              errorCode: safeAccountingUnavailableCode(
+                accountingUnavailableCode,
+              ),
+              compatibilityBehavior: "legacy_zero",
+              coverageStatus: unifiedIndex?.generation?.status ?? "unavailable",
+              generation: unifiedIndex?.generation?.id ?? null,
+              generationFingerprint:
+                unifiedIndex?.generation?.fingerprint ?? null,
+              generationMatched: false,
+              fallbackCount: 0,
+              diagnosticsAvailable: false,
+            },
+          }
+          : {}),
       ...(publicArchiveIndexResult(archiveIndex) === null
         ? {}
         : { archiveIndex: publicArchiveIndexResult(archiveIndex) }),
@@ -1007,7 +1416,17 @@ export function createLocalCollectorRefreshRunner({
 // rather than leaking whatever shape the ingest returned.
 function publicUnifiedIndexResult(value) {
   if (value?.status !== "ingested") {
-    return { status: "failed", errorCode: "local_unified_index_refresh_failed" };
+    return {
+      status: "failed",
+      errorCode: DEFAULT_UNIFIED_INDEX_PUBLIC_ERROR_CODE,
+    };
+  }
+  const generation = publicUnifiedGeneration(value);
+  if (generation === null) {
+    return {
+      status: "failed",
+      errorCode: "local_unified_index_generation_invalid",
+    };
   }
   const counts = {};
   for (const key of [
@@ -1029,6 +1448,8 @@ function publicUnifiedIndexResult(value) {
   }
   return {
     status: "ingested",
+    unchanged: value.unchanged === true,
+    generation,
     ...counts,
     wallMs: Number.isFinite(value.wallMs) && value.wallMs >= 0
       ? Math.round(value.wallMs)
@@ -1167,17 +1588,81 @@ function publicRefreshResult(result, now = Date.now()) {
   if (result?.claudeQuota !== undefined) {
     projected.claudeQuota = publicClaudeQuotaResult(result.claudeQuota);
   }
+  const legacyRefreshUse = publicLegacyRefreshUse(result?.legacyRefreshUse);
+  if (legacyRefreshUse !== null) {
+    projected.legacyRefreshUse = legacyRefreshUse;
+  }
+  if (result?.unifiedIndex?.status === "ingested") {
+    projected.unifiedIndex = publicUnifiedIndexResult(result.unifiedIndex);
+  } else if (result?.unifiedIndex?.status === "failed") {
+    projected.unifiedIndex = {
+      status: "failed",
+      errorCode: safeUnifiedIndexPublicErrorCode(
+        result.unifiedIndex.errorCode,
+      ),
+    };
+  }
   if (result?.accounting?.status === "replay_safe"
-      && safeCanonicalInstant(result.accounting.generatedAt) !== null) {
+      && safeCanonicalInstant(result.accounting.generatedAt) !== null
+      && (result.accounting.sourceMode !== "unified"
+        || (Number.isSafeInteger(result.accounting.fallbackCount)
+          && result.accounting.fallbackCount === 0))) {
+    const capabilities = publicAccountingCapabilities(
+      result.accounting.capabilities,
+    );
     projected.accounting = {
       status: "replay_safe",
+      sourceMode: ["unified", "legacy"].includes(result.accounting.sourceMode)
+        ? result.accounting.sourceMode
+        : "legacy",
       ...(ACCOUNTING_REFRESH_STATUSES.has(result.accounting.refreshStatus)
         ? { refreshStatus: result.accounting.refreshStatus }
         : {}),
+      readerVersion: safeGenerationToken(result.accounting.readerVersion),
+      compatibilityBehavior:
+        ["legacy_zero", "source_native"].includes(
+          result.accounting.compatibilityBehavior,
+        )
+          ? result.accounting.compatibilityBehavior
+          : null,
+      coverageStatus: ["complete", "partial"].includes(
+        result.accounting.coverageStatus,
+      ) ? result.accounting.coverageStatus : null,
+      generation: safeGenerationToken(result.accounting.generation),
+      generationFingerprint: safeGenerationToken(
+        result.accounting.generationFingerprint,
+      ),
+      generationMatched: result.accounting.generationMatched === true,
+      fallbackCount: safeCount(result.accounting.fallbackCount),
+      diagnosticsAvailable:
+        result.accounting.diagnosticsAvailable === true,
+      ...(capabilities === null ? {} : { capabilities }),
       generatedAt: result.accounting.generatedAt,
       events: safeCount(result.accounting.events),
       forkReplayEventsExcluded:
         safeCount(result.accounting.forkReplayEventsExcluded),
+    };
+  } else if (result?.accounting?.sourceMode === "unified"
+      && ["unavailable", "replay_safe"].includes(result.accounting.status)) {
+    projected.accounting = {
+      status: "unavailable",
+      sourceMode: "unified",
+      errorCode: safeAccountingUnavailableCode(
+        result.accounting.status === "replay_safe"
+          ? "accounting_unified_source_unavailable"
+          : result.accounting.errorCode,
+      ),
+      compatibilityBehavior: "legacy_zero",
+      coverageStatus: ["complete", "partial"].includes(
+        result.accounting.coverageStatus,
+      ) ? result.accounting.coverageStatus : "unavailable",
+      generation: safeGenerationToken(result.accounting.generation),
+      generationFingerprint: safeGenerationToken(
+        result.accounting.generationFingerprint,
+      ),
+      generationMatched: false,
+      fallbackCount: 0,
+      diagnosticsAvailable: false,
     };
   }
   const archiveIndex = publicArchiveIndexResult(result?.archiveIndex);

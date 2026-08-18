@@ -18,6 +18,9 @@ import {
   localCompanionStatePaths,
 } from "../src/local-installation-diagnostics.js";
 import {
+  readLocalCollectorLegacyRefreshUse,
+} from "../src/local-collector-state.js";
+import {
   REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
 } from "../src/replay-safe-accounting-cache.js";
 
@@ -70,6 +73,23 @@ const REUSABLE_ACCOUNTING_CACHE = Object.freeze({
   diagnostics: Object.freeze({
     forkReplayEventsExcluded: 29,
   }),
+});
+
+const PUBLIC_LEGACY_ACCOUNTING_AUTHORITY = Object.freeze({
+  sourceMode: "legacy",
+  readerVersion: null,
+  compatibilityBehavior: null,
+  coverageStatus: null,
+  generation: null,
+  generationFingerprint: null,
+  generationMatched: false,
+  fallbackCount: 0,
+  diagnosticsAvailable: false,
+});
+
+const INTERNAL_LEGACY_ACCOUNTING_AUTHORITY = Object.freeze({
+  ...PUBLIC_LEGACY_ACCOUNTING_AUTHORITY,
+  capabilities: null,
 });
 
 const FRESH_NOTIFICATION_EVIDENCE = Object.freeze({
@@ -338,6 +358,9 @@ test("local refresh routes collector, credential lock, and accounting writes ben
     const runner = createLocalCollectorRefreshRunner({
       codexHome: join(stateRoot, "read-only-codex-source"),
       stateFile: paths.collectorStateFile,
+      legacyAnalysisIndexFile: paths.legacyAnalysisIndexFile,
+      legacyAnalysisIndexSecretFile:
+        paths.legacyAnalysisIndexSecretFile,
       accountObservationOperationLockFile:
         paths.accountObservationLockFile,
       selectAccountObservationSecret: (options) => {
@@ -356,8 +379,17 @@ test("local refresh routes collector, credential lock, and accounting writes ben
           },
         };
       },
-      refreshAccounting: async ({ stateFile }) => {
+      refreshAccounting: async ({
+        stateFile,
+        indexFile,
+        indexSecretFile,
+      }) => {
         assert.equal(stateFile, paths.collectorStateFile);
+        assert.equal(indexFile, paths.legacyAnalysisIndexFile);
+        assert.equal(
+          indexSecretFile,
+          paths.legacyAnalysisIndexSecretFile,
+        );
         return {
           generatedAt: "2026-07-23T12:00:00.000Z",
           periods: [],
@@ -438,6 +470,716 @@ test("local refresh starts a bounded archive index only after the foreground res
     status: "scanning",
   });
   assert.equal(JSON.stringify(result).includes("/private/"), false);
+});
+
+test("unified accounting mode never advances the legacy archive and passes explicit authority", async () => {
+  const order = [];
+  let accountingOptions = null;
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    codexHome: "/private/codex-home",
+    unifiedIndexFile: "/private/local-unified-index-v1.sqlite",
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 1,
+      filesDiscovered: 1,
+      refresh: {
+        attempted: false,
+        recordWritten: false,
+        errorCode: null,
+      },
+      indexing: COMPLETE_INDEX,
+    }),
+    refreshUnifiedIndex: async () => {
+      order.push("unified");
+      return {
+        status: "ingested",
+        generation: {
+          id: 7,
+          fingerprint: "a".repeat(64),
+          status: "complete",
+          discoveryComplete: true,
+          diagnosticsComplete: true,
+          usageProvenanceComplete: true,
+          sourceOrderComplete: true,
+          quotaProvenanceComplete: true,
+          toolProvenanceComplete: true,
+        },
+      };
+    },
+    refreshAccounting: async (options) => {
+      order.push("accounting");
+      accountingOptions = options;
+      return {
+        generatedAt: "2026-07-23T12:00:00.000Z",
+        periods: [{ id: "7d", events: 1 }],
+        diagnostics: {},
+        sourceDescriptor: { fallbackCount: 0 },
+      };
+    },
+    refreshArchiveIndex: async () => {
+      throw new Error("legacy archive must stay dormant in unified mode");
+    },
+  });
+
+  const result = await runner();
+  assert.deepEqual(order, ["unified", "accounting"]);
+  assert.equal(accountingOptions.sourceMode, "unified");
+  assert.equal(accountingOptions.contextBehavior, "legacy_zero");
+  assert.equal(
+    accountingOptions.unifiedIndexFile,
+    "/private/local-unified-index-v1.sqlite",
+  );
+  assert.equal(result.archiveIndex, undefined);
+  assert.equal(result.accounting.sourceMode, "unified");
+});
+
+test("tool-only partial coverage does not block complete usage accounting", async () => {
+  let accountingCalls = 0;
+  const generation = {
+    id: 8,
+    fingerprint: "t".repeat(64),
+    status: "partial",
+    blockReason: "tool_provenance_incomplete",
+    discoveryComplete: true,
+    diagnosticsComplete: true,
+    usageProvenanceComplete: true,
+    sourceOrderComplete: true,
+    quotaProvenanceComplete: true,
+    toolProvenanceComplete: false,
+  };
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    unifiedIndexFile: "/private/local-unified-index-v1.sqlite",
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 1,
+      filesDiscovered: 1,
+      refresh: { attempted: false, recordWritten: false, errorCode: null },
+      indexing: COMPLETE_INDEX,
+    }),
+    refreshUnifiedIndex: async () => ({ status: "ingested", generation }),
+    refreshAccounting: async (options) => {
+      accountingCalls += 1;
+      assert.equal(options.expectedGeneration.status, "partial");
+      assert.equal(
+        options.expectedGeneration.blockReason,
+        "tool_provenance_incomplete",
+      );
+      return {
+        generatedAt: "2026-07-23T12:00:00.000Z",
+        periods: [{ id: "7d", events: 1 }],
+        diagnostics: {},
+        sourceDescriptor: { fallbackCount: 0 },
+      };
+    },
+  });
+
+  const result = await runner();
+  assert.equal(accountingCalls, 1);
+  assert.equal(result.accounting.sourceMode, "unified");
+  assert.equal(result.accounting.refreshStatus, "rebuilt");
+  assert.equal(result.unifiedIndex.generation.toolProvenanceComplete, false);
+});
+
+test("explicit legacy rollback leaves the unified index untouched", async () => {
+  let unifiedCalls = 0;
+  let archiveCalls = 0;
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "legacy",
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 0,
+      filesDiscovered: 1,
+      refresh: { attempted: false, recordWritten: false, errorCode: null },
+      indexing: COMPLETE_INDEX,
+    }),
+    refreshUnifiedIndex: async () => {
+      unifiedCalls += 1;
+      throw new Error("legacy rollback must not advance the unified index");
+    },
+    refreshArchiveIndex: async () => {
+      archiveCalls += 1;
+      return PARTIAL_ARCHIVE_INDEX;
+    },
+  });
+
+  const result = await runner();
+  assert.equal(unifiedCalls, 0);
+  assert.equal(archiveCalls, 1);
+  assert.equal(Object.hasOwn(result, "unifiedIndex"), false);
+  assert.deepEqual(result.archiveIndex, PARTIAL_ARCHIVE_INDEX);
+});
+
+test("unified authority keeps quota-only collection prospective and softens a collector-only pause", async () => {
+  const collectorOptions = [];
+  const expectedGeneration = {
+    id: 12,
+    fingerprint: "p".repeat(64),
+    status: "complete",
+    discoveryComplete: true,
+    diagnosticsComplete: true,
+    usageProvenanceComplete: true,
+    sourceOrderComplete: true,
+    quotaProvenanceComplete: true,
+    toolProvenanceComplete: true,
+  };
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    unifiedIndexFile: "/private/local-unified-index-v1.sqlite",
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async (options) => {
+      collectorOptions.push(options);
+      return {
+        rolloutRecordsWritten: 0,
+        filesDiscovered: 9,
+        resourceLimit: {
+          code: "collector_resource_source_bytes_limit_exceeded",
+          dimension: "source_bytes",
+          limit: 128 * 1024 * 1024,
+          observed: 128 * 1024 * 1024 + 1,
+        },
+        refresh: {
+          attempted: false,
+          recordWritten: false,
+          errorCode: null,
+        },
+        indexing: PAUSED_INDEX,
+      };
+    },
+    refreshUnifiedIndex: async () => ({
+      status: "ingested",
+      generation: expectedGeneration,
+    }),
+    refreshAccounting: async () => ({
+      generatedAt: "2026-07-23T12:00:00.000Z",
+      periods: [{ id: "7d", events: 3 }],
+      diagnostics: {},
+      sourceDescriptor: { fallbackCount: 0 },
+    }),
+  });
+
+  const result = await runner();
+  assert.equal(collectorOptions.length, 1);
+  assert.equal(collectorOptions[0].backfill, false);
+  assert.equal(collectorOptions[0].skipRolloutIngestion, true);
+  assert.equal(Object.hasOwn(collectorOptions[0], "backfillSinceAt"), false);
+  assert.equal(result.indexing.status, "bounded_pause");
+  assert.equal(result.accounting.sourceMode, "unified");
+  assert.equal(result.accounting.refreshStatus, "rebuilt");
+});
+
+test("unified mode fails closed when the authoritative generation is missing or incomplete", async (t) => {
+  const cases = [
+    {
+      name: "failed ingest",
+      unifiedIndex: {
+        status: "failed",
+        errorCode: "local_unified_index_file_changed",
+      },
+      expectedUnifiedIndex: {
+        status: "failed",
+        errorCode: "local_unified_index_refresh_failed",
+      },
+      expectedAccountingError: "accounting_unified_source_unavailable",
+      expectedCoverage: "unavailable",
+      expectedGeneration: null,
+      expectedFingerprint: null,
+    },
+    {
+      name: "missing generation",
+      unifiedIndex: { status: "ingested" },
+      expectedUnifiedIndex: {
+        status: "failed",
+        errorCode: "local_unified_index_generation_invalid",
+      },
+      expectedAccountingError: "accounting_unified_source_unavailable",
+      expectedCoverage: "unavailable",
+      expectedGeneration: null,
+      expectedFingerprint: null,
+    },
+    {
+      name: "partial generation",
+      unifiedIndex: {
+        status: "ingested",
+        generation: {
+          id: 7,
+          fingerprint: "b".repeat(64),
+          status: "partial",
+          discoveryComplete: false,
+          diagnosticsComplete: true,
+          usageProvenanceComplete: true,
+          sourceOrderComplete: true,
+          quotaProvenanceComplete: true,
+          toolProvenanceComplete: true,
+        },
+      },
+      expectedUnifiedIndex: {
+        status: "ingested",
+        generation: {
+          id: 7,
+          fingerprint: "b".repeat(64),
+          status: "partial",
+          blockReason: null,
+          schemaVersion: null,
+          parserVersion: null,
+          contractVersion: null,
+          coveredAt: { startAt: null, endAt: null },
+          sourceCount: 0,
+          sourceBytes: 0,
+          discoveredSourceCount: 0,
+          discoveredSourceBytes: 0,
+          indexedSourceCount: 0,
+          indexedSourceBytes: 0,
+          usageEvents: 0,
+          quotaOccurrences: 0,
+          toolFacts: 0,
+          toolFactFingerprint: null,
+          discoveryComplete: false,
+          diagnosticsComplete: true,
+          usageProvenanceComplete: true,
+          sourceOrderComplete: true,
+          quotaProvenanceComplete: true,
+          toolProvenanceComplete: true,
+        },
+        unchanged: false,
+        sources: 0,
+        sourcesSkipped: 0,
+        sourcesTouched: 0,
+        sourcesResumed: 0,
+        sourcesRescanned: 0,
+        sourcesScanned: 0,
+        bytesScanned: 0,
+        forkReplayEventsSkipped: 0,
+        unattributedForkReplayEventsSkipped: 0,
+        insertedUsageEvents: 0,
+        totalUsageEvents: 0,
+        wallMs: 0,
+      },
+      expectedAccountingError: "accounting_unified_coverage_incomplete",
+      expectedCoverage: "partial",
+      expectedGeneration: 7,
+      expectedFingerprint: "b".repeat(64),
+    },
+  ];
+
+  for (const fixture of cases) {
+    await t.test(fixture.name, async () => {
+      let accountingCalls = 0;
+      let cacheReads = 0;
+      let archiveCalls = 0;
+      const runner = createLocalCollectorRefreshRunner({
+        accountingSourceMode: "unified",
+        codexHome: "/private/codex-home",
+        unifiedIndexFile: "/private/local-unified-index-v1.sqlite",
+        readAccountingCache: async () => {
+          cacheReads += 1;
+          throw new Error("unified mode must not read a cache without authority");
+        },
+        selectAccountObservationSecret: () => ({
+          loadAccountObservationSecret: null,
+        }),
+        runCollector: async () => ({
+          rolloutRecordsWritten: 1,
+          filesDiscovered: 1,
+          refresh: {
+            attempted: false,
+            recordWritten: false,
+            errorCode: null,
+          },
+          indexing: COMPLETE_INDEX,
+        }),
+        refreshUnifiedIndex: async () => fixture.unifiedIndex,
+        refreshAccounting: async () => {
+          accountingCalls += 1;
+          throw new Error("unified accounting must not run without authority");
+        },
+        refreshArchiveIndex: async () => {
+          archiveCalls += 1;
+          throw new Error("legacy archive must stay dormant in unified mode");
+        },
+      });
+
+      const result = await runner();
+      assert.deepEqual(result.unifiedIndex, fixture.expectedUnifiedIndex);
+      assert.deepEqual(result.accounting, {
+        status: "unavailable",
+        sourceMode: "unified",
+        errorCode: fixture.expectedAccountingError,
+        compatibilityBehavior: "legacy_zero",
+        coverageStatus: fixture.expectedCoverage,
+        generation: fixture.expectedGeneration,
+        generationFingerprint: fixture.expectedFingerprint,
+        generationMatched: false,
+        fallbackCount: 0,
+        diagnosticsAvailable: false,
+      });
+      assert.equal(accountingCalls, 0);
+      assert.equal(cacheReads, 0);
+      assert.equal(archiveCalls, 0);
+      assert.equal(result.archiveIndex, undefined);
+      assert.equal(JSON.stringify(result).includes("/private/"), false);
+    });
+  }
+});
+
+test("unified accounting reader errors stay unavailable without legacy fallback", async () => {
+  let accountingCalls = 0;
+  let archiveCalls = 0;
+  const expectedGeneration = {
+    id: 8,
+    fingerprint: "c".repeat(64),
+    status: "complete",
+    discoveryComplete: true,
+    diagnosticsComplete: true,
+    usageProvenanceComplete: true,
+    sourceOrderComplete: true,
+    quotaProvenanceComplete: true,
+    toolProvenanceComplete: true,
+  };
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    codexHome: "/private/codex-home",
+    unifiedIndexFile: "/private/local-unified-index-v1.sqlite",
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 1,
+      filesDiscovered: 1,
+      refresh: {
+        attempted: false,
+        recordWritten: false,
+        errorCode: null,
+      },
+      indexing: COMPLETE_INDEX,
+    }),
+    refreshUnifiedIndex: async () => ({
+      status: "ingested",
+      generation: expectedGeneration,
+    }),
+    refreshAccounting: async (options) => {
+      accountingCalls += 1;
+      assert.equal(options.sourceMode, "unified");
+      assert.equal(options.contextBehavior, "legacy_zero");
+      assert.equal(options.expectedGeneration.id, expectedGeneration.id);
+      assert.equal(
+        options.expectedGeneration.fingerprint,
+        expectedGeneration.fingerprint,
+      );
+      assert.equal(options.expectedGeneration.status, expectedGeneration.status);
+      const error = new Error("private reader path must not escape");
+      error.code = "accounting_unified_generation_changed";
+      throw error;
+    },
+    refreshArchiveIndex: async () => {
+      archiveCalls += 1;
+      throw new Error("legacy archive must stay dormant in unified mode");
+    },
+  });
+
+  const result = await runner();
+  assert.deepEqual(result.accounting, {
+    status: "unavailable",
+    sourceMode: "unified",
+    errorCode: "accounting_unified_generation_changed",
+    compatibilityBehavior: "legacy_zero",
+    coverageStatus: "complete",
+    generation: 8,
+    generationFingerprint: "c".repeat(64),
+    generationMatched: false,
+    fallbackCount: 0,
+    diagnosticsAvailable: false,
+  });
+  assert.equal(accountingCalls, 1);
+  assert.equal(archiveCalls, 0);
+  assert.equal(result.archiveIndex, undefined);
+  assert.equal(JSON.stringify(result).includes("private reader path"), false);
+});
+
+test("unified accounting resource limits reach the bounded refresh failure", async () => {
+  const expectedGeneration = {
+    id: 9,
+    fingerprint: "d".repeat(64),
+    status: "complete",
+    discoveryComplete: true,
+    diagnosticsComplete: true,
+    usageProvenanceComplete: true,
+    sourceOrderComplete: true,
+    quotaProvenanceComplete: true,
+    toolProvenanceComplete: true,
+  };
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    unifiedIndexFile: "/private/local-unified-index-v1.sqlite",
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 1,
+      filesDiscovered: 1,
+      refresh: { attempted: false, recordWritten: false, errorCode: null },
+      indexing: COMPLETE_INDEX,
+    }),
+    refreshUnifiedIndex: async () => ({
+      status: "ingested",
+      generation: expectedGeneration,
+    }),
+    refreshAccounting: async () => {
+      const error = new Error("private accounting budget detail");
+      error.code = "accounting_transition_usage_limit_exceeded";
+      throw error;
+    },
+  });
+
+  await assert.rejects(
+    runner(),
+    (error) => error?.code === "accounting_transition_usage_limit_exceeded"
+      && error?.refreshStep === "accounting",
+  );
+
+  const controller = new LocalCompanionRefreshController({
+    runner,
+    dataStore: { async reload() {} },
+    clock: () => Date.parse("2026-07-23T12:00:00.000Z"),
+  });
+  assert.equal(controller.start(), true);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (controller.getStatus().status === "failed") break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  const status = controller.getStatus();
+  assert.equal(status.status, "failed");
+  assert.equal(status.errorCode, "refresh_resource_limited");
+  assert.equal(status.failedStep, "accounting");
+  assert.equal(status.failureCode, "accounting_transition_usage_limit_exceeded");
+  assert.equal(JSON.stringify(status).includes("private accounting budget detail"), false);
+});
+
+test("unified accounting measurement-invalid failures remain terminal", async () => {
+  const measurementCodes = [
+    "accounting_transition_rss_measurement_invalid",
+    "accounting_archive_rss_measurement_invalid",
+  ];
+  for (const code of measurementCodes) {
+    const expectedGeneration = {
+      id: 11,
+      fingerprint: "m".repeat(64),
+      status: "complete",
+      discoveryComplete: true,
+      diagnosticsComplete: true,
+      usageProvenanceComplete: true,
+      sourceOrderComplete: true,
+      quotaProvenanceComplete: true,
+      toolProvenanceComplete: true,
+    };
+    const runner = createLocalCollectorRefreshRunner({
+      accountingSourceMode: "unified",
+      unifiedIndexFile: "/private/local-unified-index-v1.sqlite",
+      selectAccountObservationSecret: () => ({
+        loadAccountObservationSecret: null,
+      }),
+      runCollector: async () => ({
+        rolloutRecordsWritten: 1,
+        filesDiscovered: 1,
+        refresh: { attempted: false, recordWritten: false, errorCode: null },
+        indexing: COMPLETE_INDEX,
+      }),
+      refreshUnifiedIndex: async () => ({
+        status: "ingested",
+        generation: expectedGeneration,
+      }),
+      refreshAccounting: async () => {
+        const error = new Error("private RSS measurement detail");
+        error.code = code;
+        throw error;
+      },
+    });
+
+    await assert.rejects(
+      runner(),
+      (error) => error?.code === code && error?.refreshStep === "accounting",
+    );
+
+    const controller = new LocalCompanionRefreshController({
+      runner,
+      dataStore: { async reload() {} },
+      clock: () => Date.parse("2026-07-23T12:00:00.000Z"),
+    });
+    assert.equal(controller.start(), true);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (controller.getStatus().status === "failed") break;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    const status = controller.getStatus();
+    assert.equal(status.status, "failed");
+    assert.equal(status.errorCode, "refresh_failed");
+    assert.equal(status.failedStep, "accounting");
+    assert.equal(status.failureCode, code);
+    assert.equal(JSON.stringify(status).includes("private RSS measurement detail"), false);
+  }
+});
+
+test("public unified accounting errors use the fixed unavailable-code allowlist", async () => {
+  const controller = new LocalCompanionRefreshController({
+    runner: async () => ({
+      accounting: {
+        status: "unavailable",
+        sourceMode: "unified",
+        errorCode: "accounting_private_callback",
+      },
+    }),
+    dataStore: { async reload() {} },
+    clock: () => Date.parse("2026-07-23T12:00:00.000Z"),
+  });
+
+  assert.equal(controller.start(), true);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (controller.getStatus().status === "succeeded") break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  const status = controller.getStatus();
+  assert.equal(status.status, "succeeded");
+  assert.equal(
+    status.result.accounting.errorCode,
+    "accounting_unified_source_unavailable",
+  );
+  assert.equal(JSON.stringify(status).includes("accounting_private_callback"), false);
+});
+
+test("unified accounting rejects a cache whose fallback attestation is nonzero", async () => {
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    unifiedIndexFile: "/private/local-unified-index-v1.sqlite",
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 1,
+      filesDiscovered: 1,
+      refresh: { attempted: false, recordWritten: false, errorCode: null },
+      indexing: COMPLETE_INDEX,
+    }),
+    refreshUnifiedIndex: async () => ({
+      status: "ingested",
+      generation: {
+        id: 10,
+        fingerprint: "e".repeat(64),
+        status: "complete",
+        discoveryComplete: true,
+        diagnosticsComplete: true,
+        usageProvenanceComplete: true,
+        sourceOrderComplete: true,
+        quotaProvenanceComplete: true,
+        toolProvenanceComplete: true,
+      },
+    }),
+    refreshAccounting: async () => ({
+      generatedAt: "2026-07-23T12:00:00.000Z",
+      periods: [{ id: "7d", events: 4 }],
+      sourceDescriptor: { fallbackCount: 1 },
+    }),
+  });
+
+  const result = await runner();
+  assert.equal(result.accounting.status, "unavailable");
+  assert.equal(result.accounting.errorCode, "accounting_unified_source_unavailable");
+  assert.equal(result.accounting.fallbackCount, 0);
+});
+
+test("legacy refresh receipt records failed attempts and unified mode does not increment it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "local-refresh-legacy-receipt-"));
+  const stateFile = join(root, "local-collector-state-v1.sqlite");
+  try {
+    const failingRunner = createLocalCollectorRefreshRunner({
+      accountingSourceMode: "legacy",
+      stateFile,
+      selectAccountObservationSecret: () => ({
+        loadAccountObservationSecret: null,
+      }),
+      runCollector: async () => {
+        const error = new Error("private legacy failure");
+        error.code = "legacy_collector_failure";
+        throw error;
+      },
+    });
+    await assert.rejects(
+      failingRunner(),
+      (error) => error?.code === "legacy_collector_failure",
+    );
+    let receipt = await readLocalCollectorLegacyRefreshUse({ stateFile });
+    assert.equal(receipt.status, "available");
+    assert.equal(receipt.receipt.attempts, 1);
+
+    const succeedingRunner = createLocalCollectorRefreshRunner({
+      accountingSourceMode: "legacy",
+      stateFile,
+      selectAccountObservationSecret: () => ({
+        loadAccountObservationSecret: null,
+      }),
+      runCollector: async () => ({
+        rolloutRecordsWritten: 0,
+        filesDiscovered: 0,
+        refresh: { attempted: false, recordWritten: false, errorCode: null },
+        indexing: COMPLETE_INDEX,
+      }),
+    });
+    const controller = new LocalCompanionRefreshController({
+      runner: succeedingRunner,
+      dataStore: { async reload() {} },
+      clock: () => Date.parse("2026-08-03T00:01:00.000Z"),
+    });
+    assert.equal(controller.start(), true);
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
+      if (controller.getStatus().status === "succeeded") break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(controller.getStatus().status, "succeeded");
+    assert.equal(controller.getStatus().result.legacyRefreshUse.attempts, 2);
+
+    const unifiedRunner = createLocalCollectorRefreshRunner({
+      accountingSourceMode: "unified",
+      stateFile,
+      unifiedIndexFile: join(root, "local-unified-index-v1.sqlite"),
+      selectAccountObservationSecret: () => ({
+        loadAccountObservationSecret: null,
+      }),
+      runCollector: async () => ({
+        rolloutRecordsWritten: 0,
+        filesDiscovered: 0,
+        refresh: { attempted: false, recordWritten: false, errorCode: null },
+        indexing: COMPLETE_INDEX,
+      }),
+      refreshUnifiedIndex: async () => ({
+        status: "ingested",
+        generation: {
+          id: 1,
+          fingerprint: "f".repeat(64),
+          status: "complete",
+          discoveryComplete: true,
+          diagnosticsComplete: true,
+          usageProvenanceComplete: true,
+          sourceOrderComplete: true,
+          quotaProvenanceComplete: true,
+          toolProvenanceComplete: true,
+        },
+      }),
+    });
+    const unifiedResult = await unifiedRunner();
+    assert.equal(Object.hasOwn(unifiedResult, "legacyRefreshUse"), false);
+    receipt = await readLocalCollectorLegacyRefreshUse({ stateFile });
+    assert.equal(receipt.receipt.attempts, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("archive coverage advances while a recent foreground pass remains bounded", async () => {
@@ -567,12 +1309,14 @@ test("zero-write local refresh reuses a current valid accounting cache without a
   assert.deepEqual(readOptions, {
     stateFile: "/private/local-collector-state.sqlite",
     now: clock,
+    sourceMode: "legacy",
     maximumAgeMs: 30 * 60 * 1_000,
   });
   assert.equal(rebuilds, 0);
   assert.deepEqual(REUSABLE_ACCOUNTING_CACHE, before);
   assert.deepEqual(result.accounting, {
     status: "replay_safe",
+    ...INTERNAL_LEGACY_ACCOUNTING_AUTHORITY,
     refreshStatus: "reused",
     generatedAt: "2026-07-23T10:00:00.000Z",
     events: 17,
@@ -657,6 +1401,7 @@ test("zero-write local refresh rebuilds when the cache cannot be safely reused",
       assert.equal(rebuilds, 1);
       assert.deepEqual(result.accounting, {
         status: "replay_safe",
+        ...INTERNAL_LEGACY_ACCOUNTING_AUTHORITY,
         refreshStatus: "rebuilt",
         generatedAt: "2026-07-23T12:00:00.000Z",
         events: 23,
@@ -749,6 +1494,7 @@ test("a memory-budget rebuild miss serves the retained cache, reports deferred, 
   assert.equal(rebuildAttempts, 1);
   assert.deepEqual(first.accounting, {
     status: "replay_safe",
+    ...INTERNAL_LEGACY_ACCOUNTING_AUTHORITY,
     refreshStatus: "deferred",
     generatedAt: "2026-07-23T10:00:00.000Z",
     events: 17,
@@ -1010,6 +1756,7 @@ test("local refresh forwards its AbortSignal into replay-safe accounting", async
   assert.equal(accountingOptions.signal, controller.signal);
   assert.deepEqual(result.accounting, {
     status: "replay_safe",
+    ...INTERNAL_LEGACY_ACCOUNTING_AUTHORITY,
     refreshStatus: "rebuilt",
     generatedAt: "2026-07-23T12:00:00.000Z",
     events: 17,
@@ -1024,6 +1771,7 @@ test("local refresh forwards its AbortSignal into replay-safe accounting", async
 test("the unified index advances before accounting reads it for calibration", async () => {
   const order = [];
   const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
     unifiedIndexFile: "/private/local-unified-index-v1.sqlite",
     unifiedIndexSecretFile: "/private/local-unified-index-device-salt-v1",
     selectAccountObservationSecret: () => ({
@@ -1039,6 +1787,17 @@ test("the unified index advances before accounting reads it for calibration", as
       order.push(["unified_index", options.indexFile, options.secretFile]);
       return {
         status: "ingested",
+        generation: {
+          id: 1,
+          fingerprint: "b".repeat(64),
+          status: "complete",
+          discoveryComplete: true,
+          diagnosticsComplete: true,
+          usageProvenanceComplete: true,
+          sourceOrderComplete: true,
+          quotaProvenanceComplete: true,
+          toolProvenanceComplete: true,
+        },
         sources: 1,
         sourcesTouched: 1,
         insertedUsageEvents: 1,
@@ -1053,6 +1812,7 @@ test("the unified index advances before accounting reads it for calibration", as
         generatedAt: "2026-07-23T12:00:00.000Z",
         periods: [],
         diagnostics: {},
+        sourceDescriptor: { fallbackCount: 0 },
       };
     },
   });
@@ -1805,6 +2565,35 @@ test("refresh controller publishes bounded progress and reloads after success", 
           events: 17,
           forkReplayEventsExcluded: 29,
         },
+        // The runner has already projected this descriptor once before the
+        // controller applies the final HTTP-safe projection.
+        unifiedIndex: {
+          status: "ingested",
+          unchanged: true,
+          generation: {
+            id: 8,
+            fingerprint: `generation-v2-${"a".repeat(64)}`,
+            status: "complete",
+            blockReason: null,
+            schemaVersion: "local-unified-index-v2",
+            parserVersion: "unified-rollout-typed-v4",
+            contractVersion: "telemetry-contribution-v0.1",
+            coveredAt: {
+              startAt: "2026-06-01T00:00:00.000Z",
+              endAt: "2026-07-23T12:00:00.000Z",
+            },
+            sourceCount: 4_566,
+            sourceBytes: 118_712_104_546,
+            usageEvents: 560_047,
+            quotaOccurrences: 778_963,
+            discoveryComplete: true,
+            diagnosticsComplete: true,
+            usageProvenanceComplete: true,
+            sourceOrderComplete: true,
+            quotaProvenanceComplete: true,
+            toolProvenanceComplete: true,
+          },
+        },
         indexing: COMPLETE_INDEX,
       };
     },
@@ -1832,12 +2621,59 @@ test("refresh controller publishes bounded progress and reloads after success", 
   assert.deepEqual(status.result.indexing, COMPLETE_INDEX);
   assert.deepEqual(status.result.accounting, {
     status: "replay_safe",
+    ...PUBLIC_LEGACY_ACCOUNTING_AUTHORITY,
     refreshStatus: "reused",
     generatedAt: "2026-07-23T11:45:00.000Z",
     events: 17,
     forkReplayEventsExcluded: 29,
   });
+  assert.deepEqual(status.result.unifiedIndex.generation.coveredAt, {
+    startAt: "2026-06-01T00:00:00.000Z",
+    endAt: "2026-07-23T12:00:00.000Z",
+  });
+  assert.equal(status.result.unifiedIndex.generation.sourceCount, 4_566);
+  assert.equal(
+    status.result.unifiedIndex.generation.sourceBytes,
+    118_712_104_546,
+  );
   assert.equal(reloads, 1);
+});
+
+test("refresh controller exposes only allowlisted unified-index failure codes", async () => {
+  for (const fixture of [
+    {
+      input: "local_unified_index_file_changed",
+      expected: "local_unified_index_file_changed",
+    },
+    {
+      input: "local_unified_index_private_path_detail",
+      expected: "local_unified_index_refresh_failed",
+    },
+    {
+      input: "Failed reading /Users/private/unified.sqlite",
+      expected: "local_unified_index_refresh_failed",
+    },
+  ]) {
+    const controller = new LocalCompanionRefreshController({
+      runner: async () => ({
+        unifiedIndex: {
+          status: "failed",
+          errorCode: fixture.input,
+        },
+      }),
+      dataStore: { reload: async () => {} },
+    });
+
+    assert.equal(controller.start(), true);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (controller.getStatus().status === "succeeded") break;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    const status = controller.getStatus();
+    assert.equal(status.status, "succeeded");
+    assert.equal(status.result.unifiedIndex.errorCode, fixture.expected);
+    assert.equal(JSON.stringify(status).includes("/Users/private"), false);
+  }
 });
 
 test("refresh controller projects a fixed safety-limit state while retaining the quick result", async () => {

@@ -48,6 +48,7 @@ import {
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../config/product-brand.js";
 import {
+  configuredAccountingSourceMode,
   createCentralOutboundFetch,
   createLocalCompanionServer,
   resolveClaudeDesktopShadowConfiguration,
@@ -200,6 +201,34 @@ async function fixture() {
   );
   return { root, resourceRoot, stateRoot, codexHome, staticRoot };
 }
+
+test("production authority defaults unified and keeps legacy as explicit rollback", () => {
+  assert.equal(configuredAccountingSourceMode({}), "unified");
+  assert.equal(
+    configuredAccountingSourceMode({
+      USAGE_MONITOR_ACCOUNTING_SOURCE_MODE: "unified",
+    }),
+    "unified",
+  );
+  assert.equal(
+    configuredAccountingSourceMode({
+      USAGE_MONITOR_ACCOUNTING_SOURCE_MODE: "legacy",
+    }),
+    "legacy",
+  );
+  assert.throws(
+    () => configuredAccountingSourceMode({
+      USAGE_MONITOR_ACCOUNTING_SOURCE_MODE: "automatic",
+    }),
+    /must be legacy or unified/u,
+  );
+  assert.throws(
+    () => configuredAccountingSourceMode({
+      USAGE_MONITOR_ACCOUNTING_SOURCE_MODE: "",
+    }),
+    /must be legacy or unified/u,
+  );
+});
 
 function rawRequest({ port, path, method = "GET", headers = {}, body = "" }) {
   return new Promise((resolveRequest, rejectRequest) => {

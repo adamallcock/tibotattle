@@ -2017,6 +2017,23 @@ export function resolveClaudeDesktopShadowConfiguration({
   });
 }
 
+// Accounting authority is a composition-root choice. The shipped default is
+// the generation-bound unified index; legacy remains an explicit rollback only.
+// Either mode is selected here and there is no implicit fallback between them.
+export function configuredAccountingSourceMode(environment) {
+  if (!environment || typeof environment !== "object"
+      || Array.isArray(environment)) {
+    throw new TypeError("environment must be an object");
+  }
+  const selected = environment.USAGE_MONITOR_ACCOUNTING_SOURCE_MODE ?? "unified";
+  if (!new Set(["legacy", "unified"]).has(selected)) {
+    throw new TypeError(
+      "USAGE_MONITOR_ACCOUNTING_SOURCE_MODE must be legacy or unified",
+    );
+  }
+  return selected;
+}
+
 function parentWatchdogConfigurationError() {
   const error = new TypeError(
     "Parent watchdog configuration is invalid",
@@ -2257,6 +2274,10 @@ function createPreparedLocalCompanionServer({
   claudeProjectDirectory,
   diagnosticsLogFile,
   parentWatchdogPid,
+  // Explicit reversible authority switch. Unified is the normal authority;
+  // legacy is retained only for an explicit rollback selection.
+  accountingSourceMode =
+    configuredAccountingSourceMode(environment),
   fastModePreference = createFastModePreferenceController({
     settingsFile: statePaths.fastModePreferenceFile,
   }),
@@ -2273,9 +2294,12 @@ function createPreparedLocalCompanionServer({
     builder: async () => buildLocalCompanionSnapshot({
       root: resourceRoot,
       collectorStateFile: statePaths.collectorStateFile,
-      archiveIndexFile: statePaths.archiveAccountingIndexFile,
+      archiveIndexFile: accountingSourceMode === "legacy"
+        ? statePaths.archiveAccountingIndexFile
+        : null,
       unifiedIndexFile: statePaths.unifiedIndexFile,
       codexHome,
+      accountingSourceMode,
       allowDevelopmentArtifactFallback:
         environment.USAGE_MONITOR_DEVELOPMENT_ARTIFACT_FALLBACK === "1",
       includeDevelopmentSideChatEstimates:
@@ -2348,9 +2372,22 @@ function createPreparedLocalCompanionServer({
     refreshClaudeUsageShadow: claudeShadowEnabled
       ? ({ signal }) => claudeShadowController.refresh({ signal })
       : null,
-    refreshArchiveIndex: refreshLocalArchiveAccountingIndex,
-    archiveIndexFile: statePaths.archiveAccountingIndexFile,
-    archiveIndexSecretFile: statePaths.archiveAccountingIndexSecretFile,
+    accountingSourceMode,
+    legacyAnalysisIndexFile: accountingSourceMode === "legacy"
+      ? statePaths.legacyAnalysisIndexFile
+      : null,
+    legacyAnalysisIndexSecretFile: accountingSourceMode === "legacy"
+      ? statePaths.legacyAnalysisIndexSecretFile
+      : null,
+    refreshArchiveIndex: accountingSourceMode === "legacy"
+      ? refreshLocalArchiveAccountingIndex
+      : null,
+    archiveIndexFile: accountingSourceMode === "legacy"
+      ? statePaths.archiveAccountingIndexFile
+      : null,
+    archiveIndexSecretFile: accountingSourceMode === "legacy"
+      ? statePaths.archiveAccountingIndexSecretFile
+      : null,
     // Advance the unified index by its cursors on every foreground refresh:
     // an ordinary pass reads only the bytes the rollout corpus grew.
     refreshUnifiedIndex: (options) => ingestLocalUnifiedIndexIncrement({
