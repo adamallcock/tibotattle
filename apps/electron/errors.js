@@ -12,6 +12,11 @@ const SAFE_ERROR_CODES = new Set([
   "electron_configuration_invalid",
 ]);
 
+// The automatic Electron entrypoint may report this one fixed code to the
+// process boundary. It intentionally never reflects an exception, path, URL,
+// child output, or native diagnostic.
+export const ELECTRON_ENTRY_FAILURE_DIAGNOSTIC = "electron_shell_entry_failed";
+
 /**
  * Errors crossing the desktop boundary carry only a fixed code. Child output,
  * paths, URLs, and native error messages never cross this boundary.
