@@ -74,6 +74,10 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   );
   assert.match(source, /GetLongPathNameW/u);
   assert.match(executableReplaceBody, /ResolveFinalPath\(check, &parsed\)/u);
+  assert.match(
+    executableReplaceBody,
+    /ValidateSecurity\(opened\.final, false, &failure, &latest\)[\s\S]*?EqualIdentity\(latest, expected\)[\s\S]*?ResolveFinalPath\(opened\.final, &parsed\)/u,
+  );
   assert.match(source, /const auto\* sidBytes = static_cast<const BYTE\*>\(user->User.Sid\)/u);
   assert.match(source, /DWORD descriptorRevision = 0/u);
   assert.match(source, /auto\* allowedAce = static_cast<ACCESS_ALLOWED_ACE\*>\(rawAce\)/u);
