@@ -12,6 +12,7 @@ signing, artifacts, an appcast, or updater infrastructure is operational.
 
 | Path | Use |
 |---|---|
+| [`plans/2026-08-14-mac-app-store-compatibility-plan.md`](./plans/2026-08-14-mac-app-store-compatibility-plan.md) | Active Store feasibility and dual-distribution plan; not a Store-readiness or submission claim |
 | [`runbooks/2026-08-04-owner-release-execution.md`](./runbooks/2026-08-04-owner-release-execution.md) | Owner-run release sequence; fail-closed until each external gate is observed |
 | [`runbooks/2026-08-05-internal-dogfood-versus-release-readiness.md`](./runbooks/2026-08-05-internal-dogfood-versus-release-readiness.md) | First-read boundary for the installed ad-hoc preview, future signed `internal-dogfood`, and stable; not a release claim |
 | [`plans/2026-08-05-provider-reported-quota-windows.md`](./plans/2026-08-05-provider-reported-quota-windows.md) | Current provider-reported quota-window implementation and plan-evidence boundary; not release authorization |

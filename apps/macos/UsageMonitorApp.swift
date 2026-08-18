@@ -67,6 +67,7 @@ private enum BundledProduct {
         requiredString("UsageMonitorMonitoredAppDisplayName")
     static let monitoredAppBundleIdentifier =
         requiredString("UsageMonitorMonitoredAppBundleIdentifier")
+    static let nodeRuntimeMode = requiredString("UsageMonitorNodeRuntimeMode")
     static let publicWebsiteOrigin =
         requiredHTTPSOrigin("UsageMonitorPublicWebsiteOrigin")
 }
@@ -80,6 +81,19 @@ private let firstRunReceiptSchema = "usage-monitor-first-run-v1"
 private let firstRunReceiptFileName = "first-run-v1.json"
 private let keychainResetHelperName = "reset-local-keychain.js"
 private let companionStartupTimeoutSeconds = 20
+
+private enum BundledNodeRuntimeMode: String {
+    case standard
+    case jitless
+
+    func arguments(
+        entrypoint: URL,
+        trailing: [String] = []
+    ) -> [String] {
+        let runtimeArguments = self == .jitless ? ["--jitless"] : []
+        return runtimeArguments + [entrypoint.path] + trailing
+    }
+}
 
 private enum AppUpdaterState: Equatable {
     case unavailable
@@ -1340,6 +1354,7 @@ private func ownerOnlyStateRoot() throws -> URL {
 
 private struct CompanionResources {
     let node: URL
+    let nodeRuntimeMode: BundledNodeRuntimeMode
     let resourceRoot: URL
     let entrypoint: URL
     let keychainResetEntrypoint: URL
@@ -1367,7 +1382,10 @@ private struct CompanionResources {
                 keychainResetHelperName,
                 isDirectory: false
             )
-        guard regularFile(node),
+        guard let nodeRuntimeMode = BundledNodeRuntimeMode(
+                  rawValue: BundledProduct.nodeRuntimeMode
+              ),
+              regularFile(node),
               regularFile(entrypoint),
               regularFile(keychainResetEntrypoint)
         else {
@@ -1375,6 +1393,7 @@ private struct CompanionResources {
         }
         return CompanionResources(
             node: node,
+            nodeRuntimeMode: nodeRuntimeMode,
             resourceRoot: resourceRoot,
             entrypoint: entrypoint,
             keychainResetEntrypoint: keychainResetEntrypoint
@@ -1392,17 +1411,20 @@ private final class CompanionProcess {
     private var process: Process?
     private var stopCompletions: [() -> Void] = []
     private var stopped = false
+    private let nodeRuntimeModeOverride: BundledNodeRuntimeMode?
     private let onExit: (Bool, Bool) -> Void
     private let onReady: (URL) -> Void
 
     init(
         centralService: CentralServiceConfiguration?,
         codexHome: URL,
+        nodeRuntimeModeOverride: BundledNodeRuntimeMode? = nil,
         onReady: @escaping (URL) -> Void,
         onExit: @escaping (Bool, Bool) -> Void
     ) {
         self.centralService = centralService
         self.codexHome = codexHome
+        self.nodeRuntimeModeOverride = nodeRuntimeModeOverride
         self.onReady = onReady
         self.onExit = onExit
     }
@@ -1429,7 +1451,9 @@ private final class CompanionProcess {
         let standardError = Pipe()
 
         child.executableURL = resources.node
-        child.arguments = [resources.entrypoint.path]
+        child.arguments = (
+            nodeRuntimeModeOverride ?? resources.nodeRuntimeMode
+        ).arguments(entrypoint: resources.entrypoint)
         child.currentDirectoryURL = resources.resourceRoot
         child.standardInput = FileHandle.nullDevice
         child.standardOutput = standardOutput
@@ -6128,10 +6152,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             let standardOutput = Pipe()
             let standardError = Pipe()
             child.executableURL = resources.node
-            child.arguments = [
-                resources.keychainResetEntrypoint.path,
-                "--confirm-local-keychain-reset",
-            ]
+            child.arguments = resources.nodeRuntimeMode.arguments(
+                entrypoint: resources.keychainResetEntrypoint,
+                trailing: ["--confirm-local-keychain-reset"]
+            )
             child.currentDirectoryURL = resources.resourceRoot
             child.standardInput = FileHandle.nullDevice
             child.standardOutput = standardOutput
@@ -6423,7 +6447,10 @@ private func endpointReportsReady(_ url: URL) -> Bool {
 }
 
 private enum SmokeTest {
-    static func run(requireCentralService: Bool = false) -> Int32 {
+    static func run(
+        requireCentralService: Bool = false,
+        nodeRuntimeModeOverride: BundledNodeRuntimeMode? = nil
+    ) -> Int32 {
         _ = umask(0o077)
         let centralService: CentralServiceConfiguration?
         do {
@@ -6454,6 +6481,7 @@ private enum SmokeTest {
         let companion = CompanionProcess(
             centralService: centralService,
             codexHome: codexHome,
+            nodeRuntimeModeOverride: nodeRuntimeModeOverride,
             onReady: { url in
                 stateLock.lock()
                 dashboardURL = url
@@ -6549,6 +6577,14 @@ private enum SmokeTest {
                     + "host=\(loopbackHost) "
                     + "port=\(selectedURL.port ?? 0) "
                     + "central=\(centralService?.mode.rawValue ?? "invalid")"
+            )
+            return 0
+        }
+        if nodeRuntimeModeOverride == .jitless {
+            print(
+                "USAGE_MONITOR_MACOS_JITLESS_SMOKE_READY "
+                    + "host=\(loopbackHost) "
+                    + "port=\(selectedURL.port ?? 0) state=owner-only"
             )
             return 0
         }
@@ -8000,6 +8036,9 @@ private struct UsageMonitorMain {
         }
         if arguments.contains("--smoke-test") {
             exit(SmokeTest.run())
+        }
+        if arguments.contains("--jitless-smoke-test") {
+            exit(SmokeTest.run(nodeRuntimeModeOverride: .jitless))
         }
         if arguments.contains("--updater-contract-smoke-test") {
             let description = AppUpdater.runtimeDescription

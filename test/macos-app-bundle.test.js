@@ -163,6 +163,18 @@ const RELEASE_CORE = join(
   "scripts",
   "macos-release-core.js",
 );
+const MAC_APP_STORE_ENTITLEMENTS = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "MacAppStore.entitlements",
+);
+const MAC_APP_STORE_NODE_ENTITLEMENTS = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "MacAppStoreNodeRuntime.entitlements",
+);
 const BUILD_SUPPORTED =
   process.platform === "darwin"
   && process.arch === "arm64"
@@ -3441,6 +3453,33 @@ test("signed macOS releases require a clean, annotated source tag and minimal No
   }
 });
 
+test("Mac App Store entitlement contracts stay minimal and distribution-specific", () => {
+  const readEntitlements = (path) => JSON.parse(execFileSync(
+    "/usr/bin/plutil",
+    ["-convert", "json", "-o", "-", path],
+    { encoding: "utf8" },
+  ));
+  const application = readEntitlements(MAC_APP_STORE_ENTITLEMENTS);
+  const nodeRuntime = readEntitlements(MAC_APP_STORE_NODE_ENTITLEMENTS);
+
+  assert.deepEqual(application, {
+    "com.apple.security.app-sandbox": true,
+    "com.apple.security.files.bookmarks.app-scope": true,
+    "com.apple.security.files.user-selected.read-only": true,
+    "com.apple.security.network.client": true,
+    "com.apple.security.network.server": true,
+  });
+  assert.deepEqual(nodeRuntime, {
+    "com.apple.security.app-sandbox": true,
+    "com.apple.security.inherit": true,
+  });
+  assert.equal(
+    Object.keys(nodeRuntime).some((key) => key.startsWith("com.apple.security.cs.")),
+    false,
+    "the Store helper contract must not inherit Developer ID JIT exceptions",
+  );
+});
+
 test("Developer ID and notary hooks are inside-out, hardened, and credential-minimized", async () => {
   const temporaryRoot = await mkdtemp(
     join(await realpath(tmpdir()), "usage-monitor-signing-hook-test-"),
@@ -5366,6 +5405,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       DEPLOYMENT_ENDPOINTS.public.origin,
     );
     assert.equal(plistJson.CFBundleIconFile, "AppIcon");
+    assert.equal(plistJson.UsageMonitorNodeRuntimeMode, "standard");
     assert.equal(Object.hasOwn(plistJson, "UsageMonitorCentralOrigin"), false);
     assert.equal(
       Object.hasOwn(plistJson, "UsageMonitorCentralOriginMode"),
@@ -5635,6 +5675,29 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.match(
       smoke.stdout,
       /^USAGE_MONITOR_MACOS_SMOKE_READY host=127\.0\.0\.1 port=[0-9]+ state=owner-only$/mu,
+    );
+    const jitlessHome = join(temporaryRoot, "jitless-smoke-home");
+    await mkdir(jitlessHome, { recursive: true, mode: 0o700 });
+    const jitlessSmoke = spawnSync(launcher, ["--jitless-smoke-test"], {
+      cwd: temporaryRoot,
+      encoding: "utf8",
+      timeout: 30_000,
+      env: {
+        HOME: jitlessHome,
+        LANG: "en_US.UTF-8",
+        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+        TMPDIR: tmpdir(),
+        USER: "usage-monitor-jitless-smoke",
+      },
+    });
+    assert.equal(
+      jitlessSmoke.status,
+      0,
+      jitlessSmoke.stderr || jitlessSmoke.stdout,
+    );
+    assert.match(
+      jitlessSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_JITLESS_SMOKE_READY host=127\.0\.0\.1 port=[0-9]+ state=owner-only$/mu,
     );
     const refusedInheritedOrigin = spawnSync(
       launcher,
