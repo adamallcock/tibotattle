@@ -254,6 +254,33 @@ test("does not launch an empty worker for one source with many chunks", async ()
   assert.equal(workerLaunches, 1);
 });
 
+test("preserves bounded accounting callback stops for cache-level handling", async () => {
+  const { root, codexHome } = await fixture();
+  const indexFile = join(root, "local-analysis-index-callback-stop.sqlite");
+  const secretFile = join(root, "local-analysis-index-callback-stop-secret");
+  let callbackCount = 0;
+  const callbackStop = new Error("accounting_transition_rss_limit_exceeded");
+  callbackStop.code = "accounting_transition_rss_limit_exceeded";
+
+  await assert.rejects(
+    refreshLocalAnalysisIndex({
+      indexFile,
+      secretFile,
+      codexHome,
+      startAt: START_AT,
+      endAt: END_AT,
+      workerCount: 1,
+      chunkBytes: CHUNK_BYTES,
+      onUsage() {
+        callbackCount += 1;
+        throw callbackStop;
+      },
+    }),
+    { code: "accounting_transition_rss_limit_exceeded" },
+  );
+  assert.equal(callbackCount > 0, true);
+});
+
 test("preserves source-affine shard mapping and chunk order", async () => {
   const { root, codexHome } = await chunkedFixture({
     includeSecondSource: true,
@@ -808,6 +835,7 @@ test("the canonical SQLite accounting state never falls back to an index project
   const nowMs = Date.parse(END_AT);
   const written = await refreshReplaySafeAccountingCache({
     stateFile,
+    sourceMode: "legacy",
     indexFile,
     indexSecretFile,
     codexHome,
