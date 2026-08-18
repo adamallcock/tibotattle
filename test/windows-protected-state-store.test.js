@@ -6,6 +6,7 @@ import {
   createWindowsFilesystemAdapter,
 } from "../src/platform/windows-filesystem.js";
 import {
+  WINDOWS_PROTECTED_STATE_STORE_DEFAULT_MAX_BYTES,
   WINDOWS_PROTECTED_STATE_STORE_NATIVE_READ_BOUNDED,
   WINDOWS_PROTECTED_STATE_STORE_ROOT_BINDING_SAFE,
   createWindowsProtectedStateStore,
@@ -108,6 +109,10 @@ function createFixture({
       }
       return { data: Buffer.from(entry.data), identity: entry.identity };
     },
+    readFileBounded(path, maximumBytes) {
+      calls.push(["readFileBounded", path, maximumBytes]);
+      return this.readFile(path);
+    },
     createFile(path, data) {
       calls.push(["createFile", path, Buffer.from(data)]);
       if (entries.has(path)) throw error("ALREADY_EXISTS");
@@ -135,6 +140,85 @@ function createFixture({
       if (!sameIdentity(entry.identity, expectedIdentity)) throw error("IDENTITY_MISMATCH");
       const identity = cloneIdentity(nextIdentity++);
       entries.set(path, { data: Buffer.from(data), identity });
+      return identity;
+    },
+    // These methods model the native root-bound primitives directly.  They
+    // intentionally do not delegate to the legacy path-only methods above:
+    // tests must prove that the store never bypasses the root identity and
+    // canonical relative-name contract.
+    inspectProtectedChild(rootPath, rootIdentity, childPath) {
+      calls.push(["inspectProtectedChild", rootPath, rootIdentity, childPath]);
+      const rootEntry = entries.get(rootPath);
+      if (!rootEntry || !sameIdentity(rootEntry.identity, rootIdentity)) {
+        throw error("IDENTITY_MISMATCH");
+      }
+      const entry = entries.get(`${rootPath}\\${childPath}`);
+      if (!entry) throw error("NOT_FOUND");
+      return securityMetadata(entry);
+    },
+    readProtectedChild(rootPath, rootIdentity, childPath, maximumBytes) {
+      calls.push(["readProtectedChild", rootPath, rootIdentity, childPath, maximumBytes]);
+      const rootEntry = entries.get(rootPath);
+      if (!rootEntry || !sameIdentity(rootEntry.identity, rootIdentity)) {
+        throw error("IDENTITY_MISMATCH");
+      }
+      const entry = entries.get(`${rootPath}\\${childPath}`);
+      if (!entry) throw error("NOT_FOUND");
+      if (entry.directory) throw error("NOT_REGULAR_FILE");
+      if (entry.reparse === true
+          || entry.ownerMatches === false
+          || entry.broadAccess === true) {
+        throw error(entry.reparse === true ? "REPARSE_POINT" : "SECURITY_POLICY");
+      }
+      // The native contract rejects before materializing the returned bytes.
+      if (!Number.isSafeInteger(maximumBytes) || entry.data.byteLength > maximumBytes) {
+        throw error("FILE_TOO_LARGE");
+      }
+      return { data: Buffer.from(entry.data), identity: entry.identity };
+    },
+    createProtectedChild(rootPath, rootIdentity, childPath, data) {
+      calls.push(["createProtectedChild", rootPath, rootIdentity, childPath]);
+      const rootEntry = entries.get(rootPath);
+      if (!rootEntry || !sameIdentity(rootEntry.identity, rootIdentity)) {
+        throw error("IDENTITY_MISMATCH");
+      }
+      const path = `${rootPath}\\${childPath}`;
+      if (entries.has(path)) throw error("ALREADY_EXISTS");
+      const identity = cloneIdentity(nextIdentity++);
+      entries.set(path, { data: Buffer.from(data), identity });
+      return identity;
+    },
+    deleteProtectedChild(rootPath, rootIdentity, childPath, expectedIdentity) {
+      calls.push(["deleteProtectedChild", rootPath, rootIdentity, childPath]);
+      const rootEntry = entries.get(rootPath);
+      if (!rootEntry || !sameIdentity(rootEntry.identity, rootIdentity)) {
+        throw error("IDENTITY_MISMATCH");
+      }
+      const path = `${rootPath}\\${childPath}`;
+      const entry = entries.get(path);
+      if (!entry) throw error("NOT_FOUND");
+      if (!sameIdentity(entry.identity, expectedIdentity)) throw error("IDENTITY_MISMATCH");
+      const failuresRemaining = deleteFailures.get(path) ?? 0;
+      if (failuresRemaining > 0) {
+        deleteFailures.set(path, failuresRemaining - 1);
+        throw error("OPERATION_FAILED");
+      }
+      entries.delete(path);
+      return { deleted: true, identity: entry.identity };
+    },
+    replaceProtectedChild(rootPath, rootIdentity, childPath, expectedIdentity, data) {
+      calls.push(["replaceProtectedChild", rootPath, rootIdentity, childPath]);
+      const rootEntry = entries.get(rootPath);
+      if (!rootEntry || !sameIdentity(rootEntry.identity, rootIdentity)) {
+        throw error("IDENTITY_MISMATCH");
+      }
+      const path = `${rootPath}\\${childPath}`;
+      const entry = entries.get(path);
+      if (!entry) throw error("NOT_FOUND");
+      if (!sameIdentity(entry.identity, expectedIdentity)) throw error("IDENTITY_MISMATCH");
+      const identity = cloneIdentity(nextIdentity++);
+      entry.data = Buffer.from(data);
+      entry.identity = identity;
       return identity;
     },
     acquireCredentialMutex() {
@@ -175,6 +259,8 @@ test("the store requires the branded adapter and does not import Node fs", () =>
   const fixture = createFixture();
   const store = createStore(fixture);
   assert.equal(isWindowsProtectedStateStore(store), true);
+  assert.equal(WINDOWS_PROTECTED_STATE_STORE_DEFAULT_MAX_BYTES, 1024 * 1024);
+  assert.equal(store.maxBytes, 1024 * 1024);
   assert.equal(store.rootBindingSafe, false);
   assert.equal(store.nativeReadBounded, false);
   assert.equal(WINDOWS_PROTECTED_STATE_STORE_ROOT_BINDING_SAFE, false);
@@ -189,6 +275,10 @@ test("the store requires the branded adapter and does not import Node fs", () =>
   assert.throws(
     () => createWindowsProtectedStateStore({ adapter: {}, rootPath: ROOT }),
     assertStoreError("invalid_adapter"),
+  );
+  assert.throws(
+    () => createStore(fixture, { maxBytes: 1024 * 1024 + 1 }),
+    assertStoreError("invalid_configuration"),
   );
   const source = readFileSync(
     new URL("../src/platform/windows-protected-state-store.js", import.meta.url),
@@ -272,7 +362,67 @@ test("reads, creates, replaces, and deletes are bounded and identity-bound", () 
     identity: cloneIdentity(99),
   });
   assert.throws(() => store.read("oversized.bin"), assertStoreError("too_large"));
-  assert.equal(fixture.calls.some(([method]) => method === "readFile"), true);
+  const createCall = fixture.calls.find(([method]) => method === "createProtectedChild");
+  assert.deepEqual(createCall.slice(0, 4), ["createProtectedChild", ROOT, IDENTITY, "state.json"]);
+  const readCall = fixture.calls.find(([method]) => method === "readProtectedChild");
+  assert.deepEqual(readCall.slice(0, 4), ["readProtectedChild", ROOT, IDENTITY, "state.json"]);
+  assert.equal(readCall[4], 8);
+  const replaceCall = fixture.calls.find(([method]) => method === "replaceProtectedChild");
+  assert.deepEqual(
+    replaceCall.slice(0, 4),
+    ["replaceProtectedChild", ROOT, IDENTITY, "state.json"],
+  );
+  assert.ok(fixture.calls.some(([method]) => method === "deleteProtectedChild"));
+  assert.equal(fixture.calls.some(([method]) => method === "readFile"), false);
+  assert.equal(fixture.calls.some(([method]) => method === "readFileBounded"), false);
+  assert.equal(fixture.calls.some(([method]) => method === "createFile"), false);
+  assert.equal(fixture.calls.some(([method]) => method === "replaceFile"), false);
+  assert.equal(fixture.calls.some(([method]) => method === "deleteFile"), false);
+  const oversizedCall = fixture.calls.find(
+    ([method, , , child]) => method === "readProtectedChild" && child === "oversized.bin",
+  );
+  assert.equal(oversizedCall[4], 8);
+});
+
+test("child inspect uses the root identity and canonical relative name", () => {
+  const fixture = createFixture();
+  const store = createStore(fixture);
+  const created = store.create("nested/state.json", Buffer.from("ok"));
+  const inspected = store.inspect("nested/state.json");
+  assert.equal(inspected.path, created.path);
+  assert.equal(inspected.isDirectory, false);
+  const inspectCall = fixture.calls.find(([method]) => method === "inspectProtectedChild");
+  assert.deepEqual(
+    inspectCall,
+    ["inspectProtectedChild", ROOT, IDENTITY, "nested\\state.json"],
+  );
+  assert.equal(fixture.calls.some(([method]) => method === "readFile"), false);
+});
+
+test("the protected native child method rejects a root swap after preflight", () => {
+  let entries;
+  let callsForSwap;
+  const fixture = createFixture({
+    bindingOverrides: {
+      createProtectedChild(rootPath, rootIdentity) {
+        callsForSwap.push(["createProtectedChild", rootPath, rootIdentity, "state.json"]);
+        entries.get(rootPath).identity = cloneIdentity(88);
+        if (!sameIdentity(entries.get(rootPath).identity, rootIdentity)) {
+          throw error("IDENTITY_MISMATCH");
+        }
+        throw error("OPERATION_FAILED");
+      },
+    },
+  });
+  entries = fixture.entries;
+  callsForSwap = fixture.calls;
+  const store = createStore(fixture);
+  assert.throws(
+    () => store.create("state.json", Buffer.from("x")),
+    assertStoreError("identity_mismatch"),
+  );
+  const createCall = fixture.calls.find(([method]) => method === "createProtectedChild");
+  assert.deepEqual(createCall.slice(0, 4), ["createProtectedChild", ROOT, IDENTITY, "state.json"]);
 });
 
 test("child reparse and security failures remain fail-closed through the adapter", () => {
@@ -340,7 +490,7 @@ test("exclusive leases fail fast, release once in finally, and preserve callback
   store.releaseOperationLease(first);
   assert.throws(() => store.releaseOperationLease(first), assertStoreError("lease_released"));
   const deleteCallsAfterExplicitRelease = fixture.calls.filter(
-    ([method, path]) => method === "deleteFile" && path.endsWith("operation.lock"),
+    ([method, , , child]) => method === "deleteProtectedChild" && child === "operation.lock",
   ).length;
   assert.equal(deleteCallsAfterExplicitRelease, 1);
 
@@ -370,7 +520,8 @@ test("audit failure during lease acquisition cleans the lock and never enables s
   );
   assert.equal(fixture.entries.has(`${ROOT}\\audit.lock`), false);
   assert.equal(
-    fixture.calls.filter(([method, path]) => method === "deleteFile" && path.endsWith("audit.lock")).length,
+    fixture.calls.filter(([method, , , child]) => method === "deleteProtectedChild"
+      && child === "audit.lock").length,
     1,
   );
 });
@@ -389,7 +540,8 @@ test("audit failure during finally still releases the exact lease once", async (
   const path = `${ROOT}\\release-audit.lock`;
   assert.equal(fixture.entries.has(path), false);
   assert.equal(
-    fixture.calls.filter(([method, calledPath]) => method === "deleteFile" && calledPath === path).length,
+    fixture.calls.filter(([method, , , child]) => method === "deleteProtectedChild"
+      && child === "release-audit.lock").length,
     1,
   );
 });
@@ -408,7 +560,8 @@ test("a failed lease release remains retryable and succeeds with the same identi
   assert.equal(fixture.entries.has(path), false);
   assert.throws(() => store.releaseOperationLease(lease), assertStoreError("lease_released"));
   assert.equal(
-    fixture.calls.filter(([method, calledPath]) => method === "deleteFile" && calledPath === path).length,
+    fixture.calls.filter(([method, , , child]) => method === "deleteProtectedChild"
+      && child === "retry.lock").length,
     2,
   );
 });
