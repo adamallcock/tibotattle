@@ -52,6 +52,7 @@ async function fixture() {
     "localization.js": "export const localization = true;\n",
     "privacy.html": "<!doctype html><title>public privacy</title>\n",
     "robots.txt": "User-agent: *\nAllow: /\n",
+    "sitemap.xml": "<?xml version=\"1.0\"?><urlset></urlset>\n",
     "social-preview.png": "reviewed social preview\n",
     "styles.css": "body { color: green; }\n",
     "tibotattle-icon.png": Buffer.from("reviewed public brand asset\n"),

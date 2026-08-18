@@ -53,6 +53,7 @@ const PUBLIC_RELEASE_ASSET_BASENAMES = Object.freeze([
   "install-cta.js",
   "privacy.html",
   "robots.txt",
+  "sitemap.xml",
   "social-preview.png",
   "styles.css",
   "tibotattle-icon.png",
