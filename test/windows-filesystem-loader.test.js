@@ -6,6 +6,7 @@ import {
   assertWindowsFilesystemProductionSafe,
   createWindowsFilesystemAdapter,
   isWindowsFilesystemAlreadyExists,
+  isWindowsFilesystemAdapter,
   isWindowsFilesystemNotFound,
   loadWindowsFilesystemBinding,
   WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION,
@@ -47,6 +48,11 @@ function manifest(overrides = {}) {
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
       credentialAuditFileGuardSafe: true,
+    },
+    bindingProvenance: {
+      contractVersion: "windows-binding-provenance-v1",
+      status: "unqualified",
+      source: "unsigned-development-binding",
     },
     ...overrides,
   };
@@ -177,8 +183,37 @@ test("Windows native loader requires a sidecar manifest and exact binding digest
   );
 });
 
+test("Windows native loader rejects malformed binding provenance before loading", () => {
+  const bindingPath = "C:\\checkout\\native\\windows-filesystem\\build\\Release\\windows_filesystem.node";
+  let required = false;
+  assert.throws(
+    () => loadWindowsFilesystemBinding({
+      platform: "win32",
+      architecture: "x64",
+      bindingPath,
+      resolveBinding: (path) => path,
+      readManifest: () => JSON.stringify(manifest({
+        bindingProvenance: {
+          contractVersion: "windows-binding-provenance-v1",
+          status: "unqualified",
+          source: "unsigned-development-binding",
+          extra: "reject",
+        },
+      })),
+      readBindingBytes: () => BINDING_BYTES,
+      requireBinding: () => {
+        required = true;
+        return binding();
+      },
+    }),
+    (error) => error.code === "WINDOWS_FILESYSTEM_INVALID_MANIFEST",
+  );
+  assert.equal(required, false);
+});
+
 test("manifest policy and native claims are cross-checked before loading", () => {
   const bindingPath = "C:\\checkout\\native\\windows-filesystem\\build\\Release\\windows_filesystem.node";
+  let nativeClaimBindingRequired = false;
   assert.throws(
     () => loadWindowsFilesystemBinding({
       platform: "win32",
@@ -194,10 +229,14 @@ test("manifest policy and native claims are cross-checked before loading", () =>
         },
       })),
       readBindingBytes: () => BINDING_BYTES,
-      requireBinding: () => binding(),
+      requireBinding: () => {
+        nativeClaimBindingRequired = true;
+        return binding();
+      },
     }),
-    (error) => error.code === "WINDOWS_FILESYSTEM_MANIFEST_BINDING_MISMATCH",
+    (error) => error.code === "WINDOWS_FILESYSTEM_PROVENANCE_VERIFIER_UNAVAILABLE",
   );
+  assert.equal(nativeClaimBindingRequired, false);
   assert.throws(
     () => loadWindowsFilesystemBinding({
       platform: "win32",
@@ -231,6 +270,96 @@ test("adapter production flags require the reviewed manifest policy as well as n
     readBindingBytes: () => BINDING_BYTES,
     requireBinding: () => binding(),
   });
+  assert.equal(isWindowsFilesystemAdapter(adapter), true);
+  assert.equal(adapter.productionSafe, false);
+  assert.equal(adapter.pathWalkRaceSafe, false);
+});
+
+test("production promotion remains blocked until a package verifier exists", () => {
+  const bindingPath = "C:\\checkout\\native\\windows-filesystem\\build\\Release\\windows_filesystem.node";
+  const authenticatedManifest = manifest({
+    nativeClaims: {
+      productionSafe: true,
+      pathWalkRaceSafe: true,
+      credentialMutexSafe: true,
+      credentialAuditFileGuardSafe: true,
+    },
+    approvedPolicy: {
+      productionSafe: true,
+      pathWalkRaceSafe: true,
+      credentialMutexSafe: true,
+      credentialAuditFileGuardSafe: true,
+    },
+    bindingProvenance: {
+      contractVersion: "windows-binding-provenance-v1",
+      status: "authenticated",
+      source: "development-package",
+    },
+  });
+  const manifestText = JSON.stringify(authenticatedManifest);
+  let bindingRequired = 0;
+  const common = {
+    platform: "win32",
+    architecture: "x64",
+    bindingPath,
+    resolveBinding: (path) => path,
+    readManifest: () => manifestText,
+    readBindingBytes: () => BINDING_BYTES,
+    requireBinding: () => {
+      bindingRequired += 1;
+      return binding({
+        productionSafe: true,
+        pathWalkRaceSafe: true,
+      });
+    },
+  };
+
+  assert.throws(
+    () => loadWindowsFilesystemBinding(common),
+    (error) => error.code === "WINDOWS_FILESYSTEM_PROVENANCE_VERIFIER_UNAVAILABLE",
+  );
+  assert.equal(bindingRequired, 0);
+  assert.throws(
+    () => createWindowsFilesystemAdapter(common),
+    (error) => error.code === "WINDOWS_FILESYSTEM_PROVENANCE_VERIFIER_UNAVAILABLE",
+  );
+  assert.equal(bindingRequired, 0);
+  let callbackCalled = false;
+  assert.throws(
+    () => createWindowsFilesystemAdapter({
+      ...common,
+      authenticateManifest: () => {
+        callbackCalled = true;
+        return true;
+      },
+    }),
+    (error) => error.code === "WINDOWS_FILESYSTEM_PROVENANCE_VERIFIER_UNAVAILABLE",
+  );
+  assert.equal(callbackCalled, false);
+  assert.throws(
+    () => createWindowsFilesystemAdapter({
+      ...common,
+      authenticateManifest: () => ({
+        contractVersion: "windows-binding-provenance-v1",
+        status: "authenticated",
+        source: "development-package",
+      }),
+    }),
+    (error) => error.code === "WINDOWS_FILESYSTEM_PROVENANCE_VERIFIER_UNAVAILABLE",
+  );
+});
+
+test("injected caller booleans cannot promote a portable binding", () => {
+  const adapter = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding: binding({
+      productionSafe: true,
+      pathWalkRaceSafe: true,
+      bindingProvenanceAuthenticated: true,
+    }),
+  });
+  assert.equal(isWindowsFilesystemAdapter(adapter), true);
   assert.equal(adapter.productionSafe, false);
   assert.equal(adapter.pathWalkRaceSafe, false);
 });
@@ -291,11 +420,49 @@ test("adapter rejects malformed native identities before use", () => {
   );
 });
 
-test("production integration guard rejects the unproven native path walk", () => {
+test("production integration guard requires a branded safe adapter", () => {
   assert.throws(
     () => assertWindowsFilesystemProductionSafe({ productionSafe: false, pathWalkRaceSafe: false }),
     (error) => error.code === "EXPORT_IDENTITY_WINDOWS_FILESYSTEM_POLICY_UNAVAILABLE",
   );
-  const safe = { productionSafe: true, pathWalkRaceSafe: true };
-  assert.equal(assertWindowsFilesystemProductionSafe(safe), safe);
+
+  const fullShape = {
+    productionSafe: true,
+    pathWalkRaceSafe: true,
+    inspectPath() {},
+    ensureDirectory() {},
+    readFile() {},
+    createFile() {},
+    deleteFile() {},
+    replaceFile() {},
+  };
+  assert.equal(isWindowsFilesystemAdapter(fullShape), false);
+  assert.throws(
+    () => assertWindowsFilesystemProductionSafe(fullShape),
+    (error) => error.code === "EXPORT_IDENTITY_WINDOWS_FILESYSTEM_POLICY_UNAVAILABLE",
+  );
+
+  const current = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding: binding(),
+  });
+  assert.equal(isWindowsFilesystemAdapter(current), true);
+  assert.equal(current.productionSafe, false);
+  assert.equal(current.pathWalkRaceSafe, false);
+  assert.throws(
+    () => assertWindowsFilesystemProductionSafe(current),
+    (error) => error.code === "EXPORT_IDENTITY_WINDOWS_FILESYSTEM_POLICY_UNAVAILABLE",
+  );
+
+  const copied = {
+    ...current,
+    productionSafe: true,
+    pathWalkRaceSafe: true,
+  };
+  assert.equal(isWindowsFilesystemAdapter(copied), false);
+  assert.throws(
+    () => assertWindowsFilesystemProductionSafe(copied),
+    (error) => error.code === "EXPORT_IDENTITY_WINDOWS_FILESYSTEM_POLICY_UNAVAILABLE",
+  );
 });

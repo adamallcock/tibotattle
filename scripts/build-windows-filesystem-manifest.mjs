@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION,
+  WINDOWS_FILESYSTEM_BINDING_PROVENANCE_CONTRACT_VERSION,
   WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
 } from "../src/platform/windows-filesystem.js";
 
@@ -109,6 +110,15 @@ export function createWindowsFilesystemBindingManifest({ bytes, binding }) {
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
       credentialAuditFileGuardSafe: true,
+    },
+    // This sidecar is generated from an unsigned development binary. The
+    // runtime verifier currently reports unavailable; a future signed
+    // installer or OS/package verifier must authenticate it before policy
+    // promotion can be enabled.
+    bindingProvenance: {
+      contractVersion: WINDOWS_FILESYSTEM_BINDING_PROVENANCE_CONTRACT_VERSION,
+      status: "unqualified",
+      source: "unsigned-development-binding",
     },
   });
 }
