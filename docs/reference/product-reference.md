@@ -205,16 +205,20 @@ npm run product:release-site -- \
 `APPROVED_PUBLIC_SITE_URL` must end in `/`; this pilot release builder accepts
 only `arm64` and rejects `x86_64` or universal claims. With an installer, the
 output shows its verified download size, compatibility, digest, and support
-links; without one those claims and metadata are omitted. Every build includes
-canonical/Open Graph/Twitter metadata, the supplied image as
-`social-preview.png`, an allow-list `robots.txt`, and a deterministic
-`release-site-manifest.json`. Building does not publish the site or authorize a
-release. Before a production Worker deploy, the staging script consumes only
-that generated directory, verifies its manifest and file hashes, and atomically
-materializes `.release-build/worker-assets`; root, direct index, and SPA
-fallback requests then resolve to the generated community `index.html`. It
-rejects raw dashboard/admin assets and unexpected files. DNS, HTTPS hosting,
-notarization, signing, and the final release decision remain human-controlled.
+links; without one those claims and metadata are omitted. Every build derives
+canonical/Open Graph URLs for each public page, creates `sitemap.xml`, links it
+from an allow-list `robots.txt`, and writes the supplied image as
+`social-preview.png` with a deterministic `release-site-manifest.json`.
+Building does not publish the site or authorize a release. Before a production
+Worker deploy, the staging script consumes only that generated directory,
+verifies its manifest and file hashes, and atomically materializes
+`.release-build/worker-assets`; root, direct index, and SPA fallback requests
+then resolve to the generated community `index.html`. It rejects raw
+dashboard/admin assets and unexpected files. The production public-surface
+recheck also verifies the root canonical tags, `robots.txt`/`sitemap.xml`, and
+the `www` → canonical-host redirect before reporting a successful deploy. DNS,
+HTTPS hosting, notarization, signing, and the final release decision remain
+human-controlled.
 
 ## Current multi-surface and account-aware outcome
 

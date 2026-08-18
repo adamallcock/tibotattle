@@ -739,6 +739,104 @@ export async function recheckProductionPublicSurface({
     return localFailure("PRODUCTION_PUBLIC_SURFACE_PRIVATE_ROOT_EXPOSED");
   }
 
+  const expectedCanonicalLink =
+    `<link rel="canonical" href="${rootURL}">`;
+  const expectedOpenGraphUrl =
+    `<meta property="og:url" content="${rootURL}">`;
+  if (!rootBody.includes(expectedCanonicalLink)
+      || !rootBody.includes(expectedOpenGraphUrl)) {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_CANONICAL_ROOT_INVALID");
+  }
+
+  const robotsURL = new URL("/robots.txt", publicOrigin).href;
+  let robotsResponse;
+  try {
+    robotsResponse = await fetchImpl(robotsURL, {
+      method: "GET",
+      headers: { accept: "text/plain" },
+      credentials: "omit",
+      redirect: "error",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_RECHECK_UNREACHABLE");
+  }
+  if (robotsResponse?.url !== robotsURL
+      || robotsResponse.status !== 200
+      || robotsResponse.headers?.get("content-type")?.split(";", 1)[0]
+        !== "text/plain"
+      || typeof robotsResponse.text !== "function") {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_ROBOTS_INVALID");
+  }
+  let robotsBody;
+  try {
+    robotsBody = await robotsResponse.text();
+  } catch {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_ROBOTS_INVALID");
+  }
+  if (Buffer.byteLength(robotsBody, "utf8") > 64 * 1024) {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_ROBOTS_INVALID");
+  }
+
+  const sitemapURL = new URL("/sitemap.xml", publicOrigin).href;
+  if (!robotsBody.includes(`Sitemap: ${sitemapURL}`)) {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_ROBOTS_INVALID");
+  }
+  let sitemapResponse;
+  try {
+    sitemapResponse = await fetchImpl(sitemapURL, {
+      method: "GET",
+      headers: { accept: "application/xml, text/xml;q=0.9" },
+      credentials: "omit",
+      redirect: "error",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_RECHECK_UNREACHABLE");
+  }
+  const sitemapContentType = sitemapResponse?.headers?.get("content-type")
+    ?.split(";", 1)[0];
+  if (sitemapResponse?.url !== sitemapURL
+      || sitemapResponse.status !== 200
+      || !["application/xml", "text/xml"].includes(sitemapContentType)
+      || typeof sitemapResponse.text !== "function") {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_SITEMAP_INVALID");
+  }
+  let sitemapBody;
+  try {
+    sitemapBody = await sitemapResponse.text();
+  } catch {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_SITEMAP_INVALID");
+  }
+  if (Buffer.byteLength(sitemapBody, "utf8") > 1024 * 1024
+      || !sitemapBody.includes(
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+      )
+      || !sitemapBody.includes(`<loc>${rootURL}</loc>`)) {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_SITEMAP_INVALID");
+  }
+
+  const wwwURL = new URL(publicOrigin);
+  wwwURL.hostname = `www.${wwwURL.hostname}`;
+  const wwwRootURL = new URL("/", wwwURL).href;
+  let wwwResponse;
+  try {
+    wwwResponse = await fetchImpl(wwwRootURL, {
+      method: "GET",
+      headers: { accept: "text/html" },
+      credentials: "omit",
+      redirect: "manual",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_RECHECK_UNREACHABLE");
+  }
+  if (wwwResponse?.url !== wwwRootURL
+      || wwwResponse.status !== 308
+      || wwwResponse.headers?.get("location") !== rootURL) {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_WWW_REDIRECT_INVALID");
+  }
+
   for (const path of PRODUCTION_PUBLIC_SURFACE_FORBIDDEN_PATHS) {
     const url = new URL(path, publicOrigin).href;
     let response;

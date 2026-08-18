@@ -51,8 +51,14 @@ async function fixture() {
     "install-cta.js": "export const installCta = true;\n",
     "localization.js": "export const localization = true;\n",
     "privacy.html": "<!doctype html><title>public privacy</title>\n",
-    "robots.txt": "User-agent: *\nAllow: /\n",
-    "sitemap.xml": "<?xml version=\"1.0\"?><urlset></urlset>\n",
+    "robots.txt": "User-agent: *\nAllow: /\nSitemap: https://usagemonitor.app/sitemap.xml\n",
+    "sitemap.xml": [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+      "  <url><loc>https://usagemonitor.app/</loc></url>",
+      "</urlset>",
+      "",
+    ].join("\n"),
     "social-preview.png": "reviewed social preview\n",
     "styles.css": "body { color: green; }\n",
     "tibotattle-icon.png": Buffer.from("reviewed public brand asset\n"),
@@ -131,6 +137,30 @@ test("stages only verified generated public assets and maps the community entry 
     /local-only asset/u,
   );
   await rm(join(value.source, "data-client.js"));
+
+  const manifestPath = join(value.source, "release-site-manifest.json");
+  const originalManifest = await readFile(manifestPath, "utf8");
+  const missingSitemapManifest = JSON.parse(originalManifest);
+  missingSitemapManifest.files = missingSitemapManifest.files.filter((entry) =>
+    entry.path !== "sitemap.xml");
+  await writeFile(
+    manifestPath,
+    `${JSON.stringify(missingSitemapManifest, null, 2)}\n`,
+  );
+  await rm(join(value.source, "sitemap.xml"));
+  await assert.rejects(
+    stageProductionAssets({
+      repositoryRoot: value.root,
+      sourceDirectory: value.source,
+      destinationDirectory: value.destination,
+    }),
+    /must contain sitemap\.xml/u,
+  );
+  await writeFile(manifestPath, originalManifest);
+  await writeFile(
+    join(value.source, "sitemap.xml"),
+    value.generatedFiles["sitemap.xml"],
+  );
 
   const indexPath = join(value.source, "index.html");
   const originalIndex = await readFile(indexPath, "utf8");
