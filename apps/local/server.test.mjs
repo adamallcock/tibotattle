@@ -51,9 +51,11 @@ import {
   configuredAccountingSourceMode,
   createCentralOutboundFetch,
   createLocalCompanionServer,
+  loadCompanionWindowsFilesystemAdapter,
   resolveClaudeDesktopShadowConfiguration,
   startLocalCompanionServer,
 } from "./server.js";
+import { createWindowsFilesystemAdapter } from "../../src/platform/windows-filesystem.js";
 
 const DEVELOPMENT_COVERAGE = Object.freeze({
   startAt: "2026-07-24T21:00:00.000Z",
@@ -61,6 +63,40 @@ const DEVELOPMENT_COVERAGE = Object.freeze({
 });
 const REVIEW_JOB_ID = "11111111-1111-4111-8111-111111111111";
 const REVIEW_SHA256 = "a".repeat(64);
+
+function unqualifiedWindowsFilesystemAdapter() {
+  const identity = {
+    volumeSerialNumber: "0000000000000001",
+    fileId: "00112233445566778899aabbccddeeff",
+    linkCount: 1,
+  };
+  const binding = {
+    contractVersion: "windows-filesystem-v1",
+    securityContractVersion: "windows-filesystem-security-v1",
+    credentialAuditFileGuardContractVersion:
+      "windows-credential-audit-file-guard-v1",
+    credentialMutexContractVersion: "windows-credential-mutex-v1",
+    productionSafe: false,
+    pathWalkRaceSafe: false,
+    credentialMutexSafe: true,
+    credentialAuditFileGuardSafe: true,
+    inspectPath: () => ({ identity }),
+    ensureDirectory: () => identity,
+    readFile: () => ({ data: Buffer.from("data"), identity }),
+    createFile: () => identity,
+    deleteFile: () => ({ deleted: true, identity }),
+    replaceFile: () => identity,
+    acquireCredentialAuditFileGuard: () => ({ lease: {} }),
+    releaseCredentialAuditFileGuard: () => {},
+    acquireCredentialMutex: () => ({ lease: {}, abandoned: false }),
+    releaseCredentialMutex: () => {},
+  };
+  return createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding,
+  });
+}
 
 function exactReviewContribution() {
   return buildTelemetryContributionsFromBundle({
@@ -228,6 +264,82 @@ test("production authority defaults unified and keeps legacy as explicit rollbac
     }),
     /must be legacy or unified/u,
   );
+});
+
+test("companion composition owns one branded Windows adapter boundary", () => {
+  const adapter = unqualifiedWindowsFilesystemAdapter();
+  let loaderOptions = null;
+  const selected = loadCompanionWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    environment: {},
+    createAdapter(options) {
+      loaderOptions = options;
+      return adapter;
+    },
+  });
+  assert.equal(selected, adapter);
+  assert.deepEqual(loaderOptions, { platform: "win32", architecture: "x64" });
+  assert.equal(
+    loadCompanionWindowsFilesystemAdapter({
+      platform: "win32",
+      environment: {
+        USAGE_MONITOR_WINDOWS_FILESYSTEM_DEVELOPMENT: "1",
+      },
+      windowsFilesystemAdapter: null,
+    }),
+    null,
+  );
+  assert.throws(
+    () => loadCompanionWindowsFilesystemAdapter({
+      platform: "win32",
+      environment: {},
+      windowsFilesystemAdapter: null,
+    }),
+    (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+  );
+  for (const forged of [
+    { ...adapter },
+    Object.freeze({ ...adapter, productionSafe: true, pathWalkRaceSafe: true }),
+  ]) {
+    assert.throws(
+      () => loadCompanionWindowsFilesystemAdapter({
+        platform: "win32",
+        environment: {},
+        windowsFilesystemAdapter: forged,
+      }),
+      (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID"
+        && error.message === "Windows filesystem adapter configuration is invalid",
+    );
+  }
+});
+
+test("Windows root rejects the unqualified branded adapter before state creation", async () => {
+  const files = await fixture();
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+  try {
+    assert.throws(
+      () => createLocalCompanionServer({
+        environment: {
+          USERPROFILE: join(files.root, "home"),
+        },
+        resourceRoot: files.resourceRoot,
+        stateRoot: files.stateRoot,
+        codexHome: files.codexHome,
+        staticRoot: files.staticRoot,
+        dataStore: fakeStore(),
+        refreshRunner: async () => ({}),
+        windowsFilesystemAdapter: unqualifiedWindowsFilesystemAdapter(),
+      }),
+      (error) => error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID"
+        && error.message === "Local installation configuration is invalid",
+    );
+    await assert.rejects(lstat(files.stateRoot), { code: "ENOENT" });
+  } finally {
+    Object.defineProperty(process, "platform", originalPlatform);
+    await rm(files.root, { recursive: true, force: true });
+  }
 });
 
 function rawRequest({ port, path, method = "GET", headers = {}, body = "" }) {
