@@ -66,6 +66,21 @@ resources per `apps/worker/wrangler.jsonc` (and their own Cloud Run
 resources for `apps/cloud-run`). Nothing in the local app requires the
 hosted service: local analysis works fully offline.
 
+Production writes to the owner's account (`wrangler deploy --env production`,
+`wrangler d1 migrations apply --remote`, and any D1 `DELETE`/`UPDATE`) are an
+owner action; read-only `wrangler d1 execute … --remote` is suitable for
+inspection and cost profiling. Two facts are important before changing the
+Worker:
+
+- **`wrangler deploy` does not apply D1 migrations.** Run
+  `wrangler d1 migrations apply` separately, or a schema-dependent change can
+  ship without its required schema.
+- A stale Wrangler OAuth token can return D1 write error `7403` while reads
+  still succeed; `wrangler login` refreshes it.
+
+Worker-side D1 query and deployment diagnostics are documented in the
+[community allowance diagnosis runbook](docs/runbooks/2026-08-13-community-allowance-band-diagnosis.md).
+
 ## No session content in issues or pull requests
 
 TiboTattle exists to keep coding-agent session content private. Keep it out
