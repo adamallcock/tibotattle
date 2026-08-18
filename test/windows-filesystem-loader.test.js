@@ -71,9 +71,15 @@ function binding(overrides = {}) {
     inspectPath: () => ({ identity: IDENTITY }),
     ensureDirectory: () => IDENTITY,
     readFile: () => ({ data: Buffer.from("data"), identity: IDENTITY }),
+    readFileBounded: () => ({ data: Buffer.from("data"), identity: IDENTITY }),
     createFile: () => IDENTITY,
     deleteFile: () => ({ deleted: true, identity: IDENTITY }),
     replaceFile: () => IDENTITY,
+    inspectProtectedChild: () => ({ identity: IDENTITY }),
+    readProtectedChild: () => ({ data: Buffer.from("data"), identity: IDENTITY }),
+    createProtectedChild: () => IDENTITY,
+    deleteProtectedChild: () => ({ deleted: true, identity: IDENTITY }),
+    replaceProtectedChild: () => IDENTITY,
     acquireCredentialMutex: () => ({ lease: {}, abandoned: false }),
     releaseCredentialMutex: () => {},
     acquireCredentialAuditFileGuard: () => ({ lease: {} }),
@@ -227,6 +233,17 @@ test("manifest policy and native claims are cross-checked before loading", () =>
           credentialMutexSafe: true,
           credentialAuditFileGuardSafe: true,
         },
+        approvedPolicy: {
+          productionSafe: true,
+          pathWalkRaceSafe: true,
+          credentialMutexSafe: true,
+          credentialAuditFileGuardSafe: true,
+        },
+        bindingProvenance: {
+          contractVersion: "windows-binding-provenance-v1",
+          status: "authenticated",
+          source: "development-package",
+        },
       })),
       readBindingBytes: () => BINDING_BYTES,
       requireBinding: () => {
@@ -257,6 +274,36 @@ test("manifest policy and native claims are cross-checked before loading", () =>
     }),
     (error) => error.code === "WINDOWS_FILESYSTEM_INVALID_MANIFEST",
   );
+  let mismatchedClaimBindingRequired = false;
+  assert.throws(
+    () => loadWindowsFilesystemBinding({
+      platform: "win32",
+      architecture: "x64",
+      bindingPath,
+      resolveBinding: (path) => path,
+      readManifest: () => JSON.stringify(manifest({
+        nativeClaims: {
+          productionSafe: false,
+          pathWalkRaceSafe: false,
+          credentialMutexSafe: false,
+          credentialAuditFileGuardSafe: true,
+        },
+        approvedPolicy: {
+          productionSafe: false,
+          pathWalkRaceSafe: false,
+          credentialMutexSafe: true,
+          credentialAuditFileGuardSafe: true,
+        },
+      })),
+      readBindingBytes: () => BINDING_BYTES,
+      requireBinding: () => {
+        mismatchedClaimBindingRequired = true;
+        return binding();
+      },
+    }),
+    (error) => error.code === "WINDOWS_FILESYSTEM_INVALID_MANIFEST",
+  );
+  assert.equal(mismatchedClaimBindingRequired, false);
 });
 
 test("adapter production flags require the reviewed manifest policy as well as native claims", () => {
@@ -404,6 +451,47 @@ test("adapter validates native identities and keeps operation errors fixed", () 
   });
   assert.equal(isWindowsFilesystemNotFound({ code: "ENOENT" }), true);
   assert.equal(isWindowsFilesystemAlreadyExists({ code: "EEXIST" }), true);
+});
+
+test("adapter exposes bounded and root-identity-bound state primitives", () => {
+  const calls = [];
+  const adapter = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding: binding({
+      readFileBounded(path, maximumBytes) {
+        calls.push(["readFileBounded", path, maximumBytes]);
+        return { data: Buffer.from("bounded"), identity: IDENTITY };
+      },
+      inspectProtectedChild(rootPath, rootIdentity, childPath) {
+        calls.push(["inspectProtectedChild", rootPath, rootIdentity, childPath]);
+        return { identity: IDENTITY };
+      },
+      readProtectedChild(rootPath, rootIdentity, childPath, maximumBytes) {
+        calls.push(["readProtectedChild", rootPath, rootIdentity, childPath, maximumBytes]);
+        return { data: Buffer.from("child"), identity: IDENTITY };
+      },
+    }),
+  });
+  assert.deepEqual(
+    adapter.readFileBounded("C:\\state\\state.json", 32),
+    { data: Buffer.from("bounded"), identity: IDENTITY },
+  );
+  assert.deepEqual(
+    adapter.inspectProtectedChild("C:\\state", IDENTITY, "state.json").identity,
+    IDENTITY,
+  );
+  assert.deepEqual(
+    adapter.readProtectedChild("C:\\state", IDENTITY, "state.json", 32),
+    { data: Buffer.from("child"), identity: IDENTITY },
+  );
+  assert.throws(
+    () => adapter.readFileBounded("C:\\state\\state.json", 1024 * 1024 + 1),
+    (error) => error.code === "WINDOWS_FILESYSTEM_INVALID_MAXIMUM_BYTES",
+  );
+  assert.equal(calls.some(([method]) => method === "readFileBounded"), true);
+  assert.equal(calls.some(([method]) => method === "inspectProtectedChild"), true);
+  assert.equal(calls.some(([method]) => method === "readProtectedChild"), true);
 });
 
 test("adapter rejects malformed native identities before use", () => {

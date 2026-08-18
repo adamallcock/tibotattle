@@ -5,6 +5,7 @@ import {
   link,
   lstat,
   mkdtemp,
+  readdir,
   rename,
   rm,
   symlink,
@@ -313,6 +314,333 @@ test("native adapter creates owner-only roots and stable content-free identities
     identity: created,
   });
   assert.throws(() => adapter.readFile(file), fixedNativeError("ENOENT"));
+}));
+
+test("native protected-child methods inspect, create, read, replace, and delete", {
+  skip: NATIVE_SKIP,
+}, () => withSyntheticRoot(({ adapter, root }) => {
+  const rootIdentity = adapter.ensureDirectory(root);
+  const childPath = "state.bin";
+  const originalBytes = Buffer.from("protected-child-original\n", "utf8");
+  const replacementBytes = Buffer.from("protected-child-replacement\n", "utf8");
+  const createdIdentity = adapter.createProtectedChild(
+    root,
+    rootIdentity,
+    childPath,
+    originalBytes,
+  );
+  assert.match(createdIdentity.fileId, /^[0-9a-f]{32}$/u);
+  assert.equal(createdIdentity.linkCount, 1);
+
+  const metadata = adapter.inspectProtectedChild(root, rootIdentity, childPath);
+  assert.equal(metadata.isDirectory, false);
+  assert.equal(metadata.isRegularFile, true);
+  assert.equal(metadata.isReparsePoint, false);
+  assert.equal(metadata.ownerMatches, true);
+  assert.equal(metadata.nullDacl, false);
+  assert.equal(metadata.daclProtected, true);
+  assert.equal(metadata.broadAccess, false);
+  assert.equal(metadata.nonOwnerAllow, false);
+  assert.equal(metadata.finalPathResolved, true);
+  assert.deepEqual(metadata.identity, createdIdentity);
+
+  const read = adapter.readProtectedChild(
+    root,
+    rootIdentity,
+    childPath,
+    originalBytes.byteLength,
+  );
+  assert.deepEqual(read.data, originalBytes);
+  assert.deepEqual(read.identity, createdIdentity);
+
+  const replacedIdentity = adapter.replaceProtectedChild(
+    root,
+    rootIdentity,
+    childPath,
+    createdIdentity,
+    replacementBytes,
+  );
+  assert.notDeepEqual(replacedIdentity, createdIdentity);
+  assert.equal(replacedIdentity.linkCount, 1);
+  assert.deepEqual(
+    adapter.readProtectedChild(root, rootIdentity, childPath, replacementBytes.byteLength).data,
+    replacementBytes,
+  );
+
+  const deleted = adapter.deleteProtectedChild(
+    root,
+    rootIdentity,
+    childPath,
+    replacedIdentity,
+  );
+  assert.deepEqual(deleted, { deleted: true, identity: replacedIdentity });
+  assert.throws(
+    () => adapter.inspectProtectedChild(root, rootIdentity, childPath),
+    fixedNativeError("ENOENT"),
+  );
+}));
+
+test("native protected-child bounded reads reject over-limit content without disclosure", {
+  skip: NATIVE_SKIP,
+}, () => withSyntheticRoot(({ adapter, root }) => {
+  const rootIdentity = adapter.ensureDirectory(root);
+  const childPath = "bounded-state.bin";
+  const secretBytes = Buffer.from("bounded protected content must not leak\n", "utf8");
+  adapter.createProtectedChild(root, rootIdentity, childPath, secretBytes);
+
+  assert.throws(
+    () => adapter.readProtectedChild(
+      root,
+      rootIdentity,
+      childPath,
+      secretBytes.byteLength - 1,
+    ),
+    (error) => {
+      assert.equal(error?.code, "WINDOWS_FILESYSTEM_FILE_TOO_LARGE");
+      assert.equal(error?.message, "Windows filesystem operation failed");
+      const rendered = `${error.stack}\n${JSON.stringify(error)}`;
+      assert.equal(rendered.includes(secretBytes.toString("utf8")), false);
+      assert.equal(rendered.includes(root), false);
+      return true;
+    },
+  );
+  assert.deepEqual(
+    adapter.readProtectedChild(root, rootIdentity, childPath, secretBytes.byteLength).data,
+    secretBytes,
+  );
+}));
+
+test("native protected-child operations bind to the expected root identity", {
+  skip: NATIVE_SKIP,
+}, async () => withSyntheticRoot(async ({ adapter, root }) => {
+  const rootIdentity = adapter.ensureDirectory(root);
+  const childPath = "state.bin";
+  const childBytes = Buffer.from("root-bound-state\n", "utf8");
+  const childIdentity = adapter.createProtectedChild(
+    root,
+    rootIdentity,
+    childPath,
+    childBytes,
+  );
+  const forgedRootIdentity = {
+    ...rootIdentity,
+    fileId: "ffffffffffffffffffffffffffffffff",
+  };
+  const expectMismatch = (operation) => assert.throws(
+    operation,
+    fixedNativeError("WINDOWS_FILESYSTEM_IDENTITY_MISMATCH"),
+  );
+
+  expectMismatch(() => adapter.inspectProtectedChild(root, forgedRootIdentity, childPath));
+  expectMismatch(() => adapter.readProtectedChild(root, forgedRootIdentity, childPath, 1024));
+  expectMismatch(() => adapter.createProtectedChild(
+    root,
+    forgedRootIdentity,
+    "other-state.bin",
+    Buffer.from("should not be created\n", "utf8"),
+  ));
+  expectMismatch(() => adapter.deleteProtectedChild(
+    root,
+    forgedRootIdentity,
+    childPath,
+    childIdentity,
+  ));
+  expectMismatch(() => adapter.replaceProtectedChild(
+    root,
+    forgedRootIdentity,
+    childPath,
+    childIdentity,
+    Buffer.from("should not replace\n", "utf8"),
+  ));
+
+  const movedRoot = `${root}-moved`;
+  await rename(root, movedRoot);
+  adapter.ensureDirectory(root);
+  expectMismatch(() => adapter.inspectProtectedChild(root, rootIdentity, childPath));
+  assert.deepEqual(
+    adapter.readFile(join(movedRoot, childPath)).data,
+    childBytes,
+  );
+}));
+
+test("native protected-child methods reject traversal, repeated, and trailing separators", {
+  skip: NATIVE_SKIP,
+}, () => withSyntheticRoot(({ adapter, root }) => {
+  const rootIdentity = adapter.ensureDirectory(root);
+  const childIdentity = adapter.createProtectedChild(
+    root,
+    rootIdentity,
+    "state.bin",
+    Buffer.from("path-bound-state\n", "utf8"),
+  );
+  const invalidChildPaths = [
+    "..",
+    ".",
+    "nested\\..\\state.bin",
+    "nested\\\\state.bin",
+    "nested//state.bin",
+    "nested\\",
+    "\\state.bin",
+    "C:\\state.bin",
+  ];
+  for (const childPath of invalidChildPaths) {
+    const expectInvalidPath = (operation) => assert.throws(
+      operation,
+      fixedNativeError("WINDOWS_FILESYSTEM_INVALID_PATH"),
+      childPath,
+    );
+    expectInvalidPath(() => adapter.inspectProtectedChild(root, rootIdentity, childPath));
+    expectInvalidPath(() => adapter.readProtectedChild(root, rootIdentity, childPath, 1024));
+    expectInvalidPath(() => adapter.createProtectedChild(
+      root,
+      rootIdentity,
+      childPath,
+      Buffer.from("must not be written\n", "utf8"),
+    ));
+    expectInvalidPath(() => adapter.deleteProtectedChild(
+      root,
+      rootIdentity,
+      childPath,
+      childIdentity,
+    ));
+    expectInvalidPath(() => adapter.replaceProtectedChild(
+      root,
+      rootIdentity,
+      childPath,
+      childIdentity,
+      Buffer.from("must not replace\n", "utf8"),
+    ));
+  }
+  assert.deepEqual(
+    adapter.readProtectedChild(root, rootIdentity, "state.bin", 1024).data,
+    Buffer.from("path-bound-state\n", "utf8"),
+  );
+}));
+
+test("native protected-child methods reject hard-link and reparse aliases", {
+  skip: NATIVE_SKIP,
+}, async (t) => withSyntheticRoot(async ({ adapter, root }) => {
+  const rootIdentity = adapter.ensureDirectory(root);
+  const childPath = "state.bin";
+  const sourcePath = join(root, childPath);
+  const childIdentity = adapter.createProtectedChild(
+    root,
+    rootIdentity,
+    childPath,
+    Buffer.from("alias-resistant-state\n", "utf8"),
+  );
+  const hardLinkPath = join(root, "state-hard-link.bin");
+  const reparsePath = join(root, "state-reparse-link.bin");
+  try {
+    await link(sourcePath, hardLinkPath);
+    assert.throws(
+      () => adapter.readProtectedChild(root, rootIdentity, "state-hard-link.bin", 1024),
+      fixedNativeError("WINDOWS_FILESYSTEM_HARD_LINK"),
+    );
+    assert.throws(
+      () => adapter.replaceProtectedChild(
+        root,
+        rootIdentity,
+        "state-hard-link.bin",
+        childIdentity,
+        Buffer.from("must not replace\n", "utf8"),
+      ),
+      fixedNativeError("WINDOWS_FILESYSTEM_HARD_LINK"),
+    );
+  } finally {
+    await rm(hardLinkPath, { force: true });
+  }
+
+  try {
+    await symlink(sourcePath, reparsePath, "file");
+    assert.throws(
+      () => adapter.inspectProtectedChild(root, rootIdentity, "state-reparse-link.bin"),
+      fixedNativeError("WINDOWS_FILESYSTEM_REPARSE_POINT"),
+    );
+    assert.throws(
+      () => adapter.readProtectedChild(root, rootIdentity, "state-reparse-link.bin", 1024),
+      fixedNativeError("WINDOWS_FILESYSTEM_REPARSE_POINT"),
+    );
+  } catch (error) {
+    if (error?.code === "EPERM" || error?.code === "EINVAL") {
+      t.skip("symbolic-link creation is unavailable on this Windows runner");
+      return;
+    }
+    throw error;
+  } finally {
+    await rm(reparsePath, { force: true });
+  }
+}));
+
+test("native protected-child traversal rejects a reparse-point ancestor", {
+  skip: NATIVE_SKIP,
+}, async (t) => withSyntheticRoot(async ({ adapter, root }) => {
+  const outside = await mkdtemp(join(tmpdir(), "tibotattle-windows-protected-child-outside-"));
+  const rootIdentity = adapter.ensureDirectory(root);
+  const junction = join(root, "state-junction");
+  try {
+    await symlink(outside, junction, "junction");
+    assert.throws(
+      () => adapter.readProtectedChild(
+        root,
+        rootIdentity,
+        "state-junction\\secret.bin",
+        1024,
+      ),
+      fixedNativeError("WINDOWS_FILESYSTEM_REPARSE_POINT"),
+    );
+  } catch (error) {
+    if (error?.code === "EPERM" || error?.code === "EINVAL") {
+      t.skip("junction creation is unavailable on this Windows runner");
+      return;
+    }
+    throw error;
+  } finally {
+    await rm(junction, { force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+}));
+
+test("native protected-child replacement leaves no temporary artifacts", {
+  skip: NATIVE_SKIP,
+}, async () => withSyntheticRoot(async ({ adapter, root }) => {
+  const rootIdentity = adapter.ensureDirectory(root);
+  const childPath = "state.bin";
+  const originalBytes = Buffer.from("temporary cleanup original\n", "utf8");
+  const replacementBytes = Buffer.from("temporary cleanup replacement\n", "utf8");
+  const childIdentity = adapter.createProtectedChild(
+    root,
+    rootIdentity,
+    childPath,
+    originalBytes,
+  );
+  assert.throws(
+    () => adapter.replaceProtectedChild(
+      root,
+      rootIdentity,
+      childPath,
+      { ...childIdentity, fileId: "ffffffffffffffffffffffffffffffff" },
+      replacementBytes,
+    ),
+    fixedNativeError("WINDOWS_FILESYSTEM_IDENTITY_MISMATCH"),
+  );
+  assert.deepEqual(
+    adapter.readProtectedChild(root, rootIdentity, childPath, originalBytes.byteLength).data,
+    originalBytes,
+  );
+  const replacementIdentity = adapter.replaceProtectedChild(
+    root,
+    rootIdentity,
+    childPath,
+    childIdentity,
+    replacementBytes,
+  );
+  assert.notDeepEqual(replacementIdentity, childIdentity);
+  const entries = await readdir(root);
+  assert.equal(
+    entries.some((entry) => entry.startsWith(".tibotattle-rotation-")),
+    false,
+  );
 }));
 
 test("native adapter rejects hard-link aliases and reparse-point aliases", {

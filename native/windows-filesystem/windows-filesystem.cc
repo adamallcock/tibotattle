@@ -21,6 +21,7 @@
 #endif
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <cwchar>
 #include <cwctype>
 #include <iomanip>
@@ -193,6 +194,7 @@ Failure SecurityPolicy(const char* detail = "unspecified") {
 Failure NotDirectory() { return {"NOT_DIRECTORY"}; }
 Failure NotRegularFile() { return {"NOT_REGULAR_FILE"}; }
 Failure TooLarge() { return {"FILE_TOO_LARGE"}; }
+Failure FileSizeChanged() { return {"FILE_SIZE_CHANGED"}; }
 Failure IdentityMismatch() { return {"IDENTITY_MISMATCH"}; }
 Failure OperationFailed() { return {"OPERATION_FAILED"}; }
 Failure CredentialMutexInvalidCapability() { return {"CREDENTIAL_MUTEX_INVALID_CAPABILITY"}; }
@@ -283,6 +285,24 @@ bool GetUint32(napi_env env, napi_value value, std::uint32_t* result) {
   std::uint32_t candidate = 0;
   if (napi_get_value_uint32(env, value, &candidate) != napi_ok) return false;
   *result = candidate;
+  return true;
+}
+
+// A caller-supplied read ceiling is checked before the file-sized vector is
+// materialized.  Keep this separate from GetUint32: N-API's integer helper
+// accepts coercions that are not a safe, explicit byte ceiling.
+bool GetSafeReadMaximum(napi_env env, napi_value value, std::size_t* result) {
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok || type != napi_number) return false;
+  double candidate = 0;
+  if (napi_get_value_double(env, value, &candidate) != napi_ok
+      || !std::isfinite(candidate)
+      || candidate < 0
+      || std::floor(candidate) != candidate
+      || candidate > static_cast<double>(kMaximumFileBytes)) {
+    return false;
+  }
+  *result = static_cast<std::size_t>(candidate);
   return true;
 }
 
@@ -397,6 +417,43 @@ bool ParsePath(const std::wstring& supplied, ParsedPath* result) {
     result->components.push_back(std::move(component));
   }
   return !result->components.empty();
+}
+
+bool ParseRelativeComponents(
+    const std::wstring& supplied,
+    std::vector<std::wstring>* components) {
+  if (supplied.empty()
+      || supplied.size() > static_cast<std::size_t>(USHRT_MAX / sizeof(wchar_t))
+      || supplied.find(L'\0') != std::wstring::npos) {
+    return false;
+  }
+  std::wstring path = supplied;
+  std::replace(path.begin(), path.end(), L'/', L'\\');
+  if (path.front() == L'\\'
+      || (path.size() >= 2 && IsDriveLetter(path[0]) && path[1] == L':')) {
+    return false;
+  }
+  std::size_t offset = 0;
+  while (offset < path.size()) {
+    const std::size_t start = offset;
+    while (offset < path.size() && path[offset] != L'\\') ++offset;
+    const std::wstring component = path.substr(start, offset - start);
+    if (component.empty()
+        || component == L"."
+        || component == L".."
+        || component.back() == L'.'
+        || component.back() == L' '
+        || IsReservedDeviceName(component)
+        || component.find_first_of(L"<>:\"|?*") != std::wstring::npos) {
+      return false;
+    }
+    components->push_back(component);
+    while (offset < path.size() && path[offset] == L'\\') {
+      ++offset;
+      if (offset == path.size() || path[offset] == L'\\') return false;
+    }
+  }
+  return !components->empty();
 }
 
 std::wstring JoinComponent(const std::wstring& parent, const std::wstring& component) {
@@ -815,6 +872,7 @@ struct OpenRelativeOptions {
   bool finalDirectoryKnown = false;
   bool finalDirectory = false;
   bool ownerOnlyOnCreate = false;
+  bool protectAllAncestors = false;
   DWORD access = FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
   DWORD shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
   std::size_t protectedAncestorDepth = 0;
@@ -850,8 +908,9 @@ bool OpenRelativePath(
     const DWORD access = final ? options.access : kDirectoryTraversalAccess;
     const std::size_t remainingComponents = parsed.components.size() - index - 1;
     const bool protectedAncestor = !final
-        && options.protectedAncestorDepth > 0
-        && remainingComponents <= options.protectedAncestorDepth;
+        && (options.protectAllAncestors
+          || (options.protectedAncestorDepth > 0
+            && remainingComponents <= options.protectedAncestorDepth));
     const DWORD shareMode = final
         ? options.shareMode
         : protectedAncestor
@@ -997,6 +1056,161 @@ bool ValidateSecurity(
   if (identity != nullptr) *identity = observed;
   if (security != nullptr) *security = descriptor;
   return true;
+}
+
+// Open one protected state root and then traverse the caller's relative child
+// name from that already-open root handle.  The root identity check is part of
+// this operation, before a child handle is opened; callers must not implement
+// this as an inspect-then-path-open sequence.  The root and every traversed
+// child parent remain held in `opened` until the operation completes.
+bool OpenProtectedRootAndChild(
+    const std::wstring& rootPath,
+    const HandleIdentity& expectedRoot,
+    const std::wstring& childPath,
+    const OpenRelativeOptions& options,
+    RelativeHandles* opened,
+    bool* finalMissing,
+    ParsedPath* fullPath,
+    Failure* failure) {
+  *finalMissing = false;
+  ParsedPath parsedRoot;
+  if (!ParseAndValidatePath(rootPath, false, &parsedRoot, failure)) return false;
+  std::vector<std::wstring> childComponents;
+  if (!ParseRelativeComponents(childPath, &childComponents)) {
+    *failure = InvalidPath();
+    return false;
+  }
+
+  OpenRelativeOptions rootOptions;
+  rootOptions.finalDirectoryKnown = true;
+  rootOptions.finalDirectory = true;
+  rootOptions.access = kDirectoryTraversalAccess;
+  // Keep the protected root and its traversed ancestors renameable only by a
+  // caller that can satisfy the same Windows sharing policy.  The held root
+  // handle is the security boundary for the child walk; this share mode is a
+  // defense-in-depth lock while the operation is in flight.
+  rootOptions.shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+  rootOptions.protectedAncestorDepth = parsedRoot.components.size() - 1;
+  rootOptions.protectedAncestorShareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+  rootOptions.disposition = kFileOpen;
+  RelativeHandles rootOpened;
+  bool rootMissing = false;
+  if (!OpenRelativePath(
+          parsedRoot,
+          rootOptions,
+          &rootOpened,
+          &rootMissing,
+          failure)
+      || rootMissing
+      || rootOpened.final == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+
+  HandleIdentity observedRoot;
+  if (!ValidateSecurity(rootOpened.final, true, failure, &observedRoot)
+      || !EqualIdentity(observedRoot, expectedRoot)) {
+    if (failure->code == OperationFailed().code) *failure = IdentityMismatch();
+    return false;
+  }
+  if (!ResolveFinalPath(rootOpened.final, &parsedRoot)) {
+    *failure = IdentityMismatch();
+    return false;
+  }
+
+  // Transfer the root handle, not its path, into the child operation.  The
+  // drive and root ancestors can close now; NtCreateFile receives this handle
+  // as RootDirectory for every child component below.
+  const HANDLE protectedRoot = rootOpened.releaseFinal();
+  if (protectedRoot == INVALID_HANDLE_VALUE) {
+    *failure = OperationFailed();
+    return false;
+  }
+  opened->parents.push_back(protectedRoot);
+  HANDLE current = protectedRoot;
+  *fullPath = parsedRoot;
+  fullPath->components.insert(
+      fullPath->components.end(),
+      childComponents.begin(),
+      childComponents.end());
+
+  for (std::size_t index = 0; index < childComponents.size(); ++index) {
+    const bool final = index + 1 == childComponents.size();
+    const ULONG typeOption = !final
+        ? kFileDirectoryFile
+        : options.finalDirectoryKnown
+          ? (options.finalDirectory ? kFileDirectoryFile : kFileNonDirectoryFile)
+          : 0;
+    const DWORD access = final ? options.access : kDirectoryTraversalAccess;
+    const std::size_t remainingComponents = childComponents.size() - index - 1;
+    const bool protectedAncestor = !final
+        && (options.protectAllAncestors
+          || (options.protectedAncestorDepth > 0
+            && remainingComponents <= options.protectedAncestorDepth));
+    const DWORD shareMode = final
+        ? options.shareMode
+        : protectedAncestor
+          ? options.protectedAncestorShareMode
+          : kDirectoryShareMode;
+    const ULONG disposition = final ? options.disposition : kFileOpen;
+    const PSECURITY_DESCRIPTOR securityDescriptor = final
+        ? options.securityDescriptor
+        : nullptr;
+    HANDLE next = INVALID_HANDLE_VALUE;
+    ULONG_PTR information = 0;
+    if (!OpenRelativeComponent(
+            current,
+            childComponents[index],
+            access,
+            shareMode,
+            disposition,
+            options.extraOptions | typeOption,
+            securityDescriptor,
+            &next,
+            &information,
+            failure)) {
+      if (final && options.finalMayBeMissing && failure->code == NotFound().code) {
+        *finalMissing = true;
+        return true;
+      }
+      return false;
+    }
+    const bool created = information == kFileCreated;
+    const auto rejectCreated = [&](Failure reason) -> bool {
+      if (created && !MarkHandleForDeletion(next)) {
+        *failure = OperationFailed();
+      } else {
+        *failure = reason;
+      }
+      CloseHandle(next);
+      return false;
+    };
+    bool reparse = false;
+    DWORD attributes = 0;
+    if (!GetFileAttributesFromHandle(next, &attributes)
+        || !HasReparsePoint(next, &reparse)) {
+      return rejectCreated(OperationFailed());
+    }
+    if (reparse) return rejectCreated(ReparsePoint());
+    if (!final && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+      return rejectCreated(NotDirectory());
+    }
+    if (final && options.finalDirectoryKnown
+        && (((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) != options.finalDirectory)) {
+      return rejectCreated(options.finalDirectory ? NotDirectory() : NotRegularFile());
+    }
+    if (final && options.ownerOnlyOnCreate && created
+        && !SetOwnerOnlyDacl(next)) {
+      return rejectCreated(SecurityPolicy("dacl_update_failed"));
+    }
+    if (final) {
+      opened->final = next;
+      return true;
+    }
+    opened->parents.push_back(next);
+    current = next;
+  }
+  *failure = InvalidPath();
+  return false;
 }
 
 bool BuildOwnerOnlyObjectSecurity(
@@ -1164,8 +1378,12 @@ bool GetArguments(
     napi_callback_info info,
     std::vector<napi_value>* arguments,
     std::size_t expected) {
-  napi_value values[3] = {};
-  std::size_t count = 3;
+  // Protected-child replacement is the widest callback surface (root path,
+  // expected root identity, child name, expected child identity, bytes).
+  // Keep the exact-count check below: this is capacity, not permission to
+  // accept arbitrary trailing arguments.
+  napi_value values[5] = {};
+  std::size_t count = 5;
   if (napi_get_cb_info(env, info, &count, values, nullptr, nullptr) != napi_ok
       || count != expected) {
     return false;
@@ -1208,30 +1426,62 @@ bool OpenSecureExisting(
   return true;
 }
 
-bool ReadHandle(HANDLE handle, std::vector<std::uint8_t>* bytes, Failure* failure) {
+bool ReadHandleBounded(
+    HANDLE handle,
+    std::size_t maximumBytes,
+    std::vector<std::uint8_t>* bytes,
+    Failure* failure) {
   LARGE_INTEGER size{};
-  if (!GetFileSizeEx(handle, &size) || size.QuadPart < 0
-      || static_cast<unsigned long long>(size.QuadPart) > kMaximumFileBytes) {
-    *failure = size.QuadPart > static_cast<LONGLONG>(kMaximumFileBytes)
-        ? TooLarge() : OperationFailed();
+  if (!GetFileSizeEx(handle, &size) || size.QuadPart < 0) {
+    *failure = OperationFailed();
+    return false;
+  }
+  // This comparison is deliberately before vector::assign.  A hostile or
+  // unexpectedly large file therefore cannot make the native binding reserve
+  // memory before the caller's explicit safety ceiling is enforced.
+  if (static_cast<unsigned long long>(size.QuadPart)
+      > static_cast<unsigned long long>(maximumBytes)) {
+    *failure = TooLarge();
     return false;
   }
   bytes->assign(static_cast<std::size_t>(size.QuadPart), 0);
   std::size_t offset = 0;
   while (offset < bytes->size()) {
-    const DWORD requested = static_cast<DWORD>(std::min<std::size_t>(bytes->size() - offset, 1 << 20));
+    const std::size_t remaining = bytes->size() - offset;
+    const DWORD requested = static_cast<DWORD>(std::min<std::size_t>(remaining, 1 << 20));
     DWORD read = 0;
     if (!ReadFile(handle, bytes->data() + offset, requested, &read, nullptr)) {
       *failure = FromLastError();
       return false;
     }
-    if (read == 0) {
+    // A synchronous read must make progress without ever writing beyond the
+    // size captured before allocation.  A premature EOF or an impossible
+    // count is a rejection, never a truncated successful prefix.
+    if (read == 0 || static_cast<std::size_t>(read) > remaining) {
       *failure = OperationFailed();
       return false;
     }
     offset += read;
   }
+  LARGE_INTEGER finalSize{};
+  if (!GetFileSizeEx(handle, &finalSize) || finalSize.QuadPart < 0) {
+    *failure = OperationFailed();
+    return false;
+  }
+  if (static_cast<unsigned long long>(finalSize.QuadPart)
+      > static_cast<unsigned long long>(maximumBytes)) {
+    *failure = TooLarge();
+    return false;
+  }
+  if (finalSize.QuadPart != size.QuadPart) {
+    *failure = FileSizeChanged();
+    return false;
+  }
   return true;
+}
+
+bool ReadHandle(HANDLE handle, std::vector<std::uint8_t>* bytes, Failure* failure) {
+  return ReadHandleBounded(handle, kMaximumFileBytes, bytes, failure);
 }
 
 bool MarkHandleForDeletion(HANDLE handle) {
@@ -1636,6 +1886,476 @@ napi_value ReadFileCallback(napi_env env, napi_callback_info info) {
   napi_create_buffer_copy(env, bytes.size(), bytes.data(), nullptr, &data);
   napi_set_named_property(env, result, "data", data);
   napi_set_named_property(env, result, "identity", identityValue);
+  return result;
+}
+
+napi_value ReadFileBoundedCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 2)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring path;
+  std::size_t maximumBytes = 0;
+  if (!GetString(env, arguments[0], &path)
+      || !GetSafeReadMaximum(env, arguments[1], &maximumBytes)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  Failure failure = OperationFailed();
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  HandleIdentity identity;
+  if (!OpenSecureExisting(
+          path,
+          false,
+          GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+          FILE_SHARE_READ,
+          &handle,
+          &identity,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  std::vector<std::uint8_t> bytes;
+  const bool read = ReadHandleBounded(handle, maximumBytes, &bytes, &failure);
+  CloseHandle(handle);
+  if (!read) return ThrowFailure(env, failure);
+  napi_value result;
+  napi_value data;
+  napi_create_object(env, &result);
+  napi_create_buffer_copy(env, bytes.size(), bytes.data(), nullptr, &data);
+  napi_set_named_property(env, result, "data", data);
+  napi_set_named_property(env, result, "identity", IdentityValue(env, identity));
+  return result;
+}
+
+bool ParseProtectedChildArguments(
+    napi_env env,
+    const std::vector<napi_value>& arguments,
+    std::wstring* rootPath,
+    HandleIdentity* expectedRoot,
+    std::wstring* childPath,
+    Failure* failure) {
+  if (!GetString(env, arguments[0], rootPath)
+      || !ParseExpectedIdentity(env, arguments[1], expectedRoot)
+      || !GetString(env, arguments[2], childPath)) {
+    *failure = InvalidConfiguration();
+    return false;
+  }
+  return true;
+}
+
+napi_value InspectProtectedChildCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 3)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring rootPath;
+  std::wstring childPath;
+  HandleIdentity expectedRoot;
+  Failure failure = OperationFailed();
+  if (!ParseProtectedChildArguments(
+          env,
+          arguments,
+          &rootPath,
+          &expectedRoot,
+          &childPath,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  OpenRelativeOptions options;
+  options.access = FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
+  options.shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+  options.finalDirectoryKnown = false;
+  options.disposition = kFileOpen;
+  RelativeHandles opened;
+  bool finalMissing = false;
+  ParsedPath fullPath;
+  if (!OpenProtectedRootAndChild(
+          rootPath,
+          expectedRoot,
+          childPath,
+          options,
+          &opened,
+          &finalMissing,
+          &fullPath,
+          &failure)
+      || finalMissing
+      || opened.final == INVALID_HANDLE_VALUE) {
+    return ThrowFailure(env, failure);
+  }
+  HandleIdentity identity;
+  SecuritySnapshot security;
+  bool valid = GetIdentity(opened.final, &identity)
+      && ReadSecurity(opened.final, &security)
+      && ResolveFinalPath(opened.final, &fullPath);
+  bool reparse = false;
+  if (!HasReparsePoint(opened.final, &reparse)) valid = false;
+  if (!valid) return ThrowFailure(env, OperationFailed());
+  napi_value result = MetadataValue(env, identity, security, true);
+  napi_value isReparse;
+  napi_get_boolean(env, reparse, &isReparse);
+  napi_set_named_property(env, result, "isReparsePoint", isReparse);
+  return result;
+}
+
+napi_value ReadProtectedChildCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 4)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring rootPath;
+  std::wstring childPath;
+  HandleIdentity expectedRoot;
+  std::size_t maximumBytes = 0;
+  Failure failure = OperationFailed();
+  const bool validChildArguments = ParseProtectedChildArguments(
+          env,
+          {arguments[0], arguments[1], arguments[2]},
+          &rootPath,
+          &expectedRoot,
+          &childPath,
+          &failure);
+  if (!validChildArguments
+      || !GetSafeReadMaximum(env, arguments[3], &maximumBytes)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  OpenRelativeOptions options;
+  options.access = GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  options.shareMode = FILE_SHARE_READ;
+  options.finalDirectoryKnown = true;
+  options.finalDirectory = false;
+  options.disposition = kFileOpen;
+  RelativeHandles opened;
+  bool finalMissing = false;
+  ParsedPath fullPath;
+  if (!OpenProtectedRootAndChild(
+          rootPath,
+          expectedRoot,
+          childPath,
+          options,
+          &opened,
+          &finalMissing,
+          &fullPath,
+          &failure)
+      || finalMissing
+      || opened.final == INVALID_HANDLE_VALUE) {
+    return ThrowFailure(env, failure);
+  }
+  HandleIdentity identity;
+  if (!ValidateSecurity(opened.final, false, &failure, &identity)
+      || !ResolveFinalPath(opened.final, &fullPath)) {
+    return ThrowFailure(env, failure);
+  }
+  std::vector<std::uint8_t> bytes;
+  if (!ReadHandleBounded(opened.final, maximumBytes, &bytes, &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  napi_value result;
+  napi_value data;
+  napi_create_object(env, &result);
+  napi_create_buffer_copy(env, bytes.size(), bytes.data(), nullptr, &data);
+  napi_set_named_property(env, result, "data", data);
+  napi_set_named_property(env, result, "identity", IdentityValue(env, identity));
+  return result;
+}
+
+napi_value CreateProtectedChildCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 4)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring rootPath;
+  std::wstring childPath;
+  HandleIdentity expectedRoot;
+  Failure failure = OperationFailed();
+  if (!ParseProtectedChildArguments(
+          env,
+          {arguments[0], arguments[1], arguments[2]},
+          &rootPath,
+          &expectedRoot,
+          &childPath,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  const std::uint8_t* bytes = nullptr;
+  std::size_t byteCount = 0;
+  if (!GetBuffer(env, arguments[3], &bytes, &byteCount)
+      || byteCount > kMaximumFileBytes) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+
+  std::vector<BYTE> ownerSid;
+  PACL acl = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  SECURITY_ATTRIBUTES attributes{};
+  if (!BuildOwnerOnlySecurity(&ownerSid, &acl, &descriptor, &attributes)) {
+    return ThrowFailure(env, OperationFailed());
+  }
+  OpenRelativeOptions options;
+  options.finalDirectoryKnown = true;
+  options.finalDirectory = false;
+  options.access = GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC
+      | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  options.shareMode = FILE_SHARE_READ;
+  options.disposition = kFileCreate;
+  options.ownerOnlyOnCreate = true;
+  options.securityDescriptor = attributes.lpSecurityDescriptor;
+  options.protectAllAncestors = true;
+  RelativeHandles opened;
+  bool finalMissing = false;
+  ParsedPath fullPath;
+  const bool openedOk = OpenProtectedRootAndChild(
+      rootPath,
+      expectedRoot,
+      childPath,
+      options,
+      &opened,
+      &finalMissing,
+      &fullPath,
+      &failure);
+  FreeOwnerOnlySecurity(acl, descriptor);
+  if (!openedOk || finalMissing || opened.final == INVALID_HANDLE_VALUE) {
+    return ThrowFailure(env, failure);
+  }
+
+  bool success = WriteAndFlushHandle(opened.final, bytes, byteCount, &failure)
+      && SetOwnerOnlyDacl(opened.final);
+  if (!success && failure.code == OperationFailed().code) {
+    failure = SecurityPolicy("dacl_update_failed");
+  }
+  HandleIdentity identity;
+  if (success && !ValidateSecurity(opened.final, false, &failure, &identity)) {
+    success = false;
+  }
+  if (success && !ResolveFinalPath(opened.final, &fullPath)) {
+    failure = IdentityMismatch();
+    success = false;
+  }
+  if (!success) {
+    if (!MarkHandleForDeletion(opened.final)) failure = OperationFailed();
+    return ThrowFailure(env, failure);
+  }
+  return IdentityValue(env, identity);
+}
+
+napi_value ReplaceProtectedChildCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 5)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring rootPath;
+  std::wstring childPath;
+  HandleIdentity expectedRoot;
+  Failure failure = OperationFailed();
+  if (!ParseProtectedChildArguments(
+          env,
+          {arguments[0], arguments[1], arguments[2]},
+          &rootPath,
+          &expectedRoot,
+          &childPath,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  HandleIdentity expected;
+  const std::uint8_t* bytes = nullptr;
+  std::size_t byteCount = 0;
+  if (!ParseExpectedIdentity(env, arguments[3], &expected)
+      || !GetBuffer(env, arguments[4], &bytes, &byteCount)
+      || byteCount > kMaximumFileBytes) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+
+  OpenRelativeOptions targetOptions;
+  targetOptions.finalDirectoryKnown = true;
+  targetOptions.finalDirectory = false;
+  targetOptions.access = DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  targetOptions.shareMode = FILE_SHARE_READ;
+  targetOptions.disposition = kFileOpen;
+  targetOptions.protectAllAncestors = true;
+  RelativeHandles opened;
+  bool finalMissing = false;
+  ParsedPath fullPath;
+  if (!OpenProtectedRootAndChild(
+          rootPath,
+          expectedRoot,
+          childPath,
+          targetOptions,
+          &opened,
+          &finalMissing,
+          &fullPath,
+          &failure)
+      || finalMissing
+      || opened.final == INVALID_HANDLE_VALUE) {
+    return ThrowFailure(env, failure);
+  }
+  HandleIdentity current;
+  if (!ValidateSecurity(opened.final, false, &failure, &current)
+      || !EqualIdentity(current, expected)) {
+    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    return ThrowFailure(env, failure);
+  }
+  if (opened.parents.empty()) return ThrowFailure(env, OperationFailed());
+  HANDLE parent = opened.parents.back();
+
+  std::vector<BYTE> ownerSid;
+  PACL acl = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  SECURITY_ATTRIBUTES attributes{};
+  if (!BuildOwnerOnlySecurity(&ownerSid, &acl, &descriptor, &attributes)) {
+    return ThrowFailure(env, OperationFailed());
+  }
+  HANDLE replacement = INVALID_HANDLE_VALUE;
+  std::wstring temporaryName;
+  ULONG_PTR createInformation = 0;
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    temporaryName = TemporaryReplacementName();
+    if (OpenRelativeComponent(
+            parent,
+            temporaryName,
+            FILE_READ_DATA | GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC
+                | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ,
+            kFileCreate,
+            kFileNonDirectoryFile,
+            attributes.lpSecurityDescriptor,
+            &replacement,
+            &createInformation,
+            &failure)) {
+      break;
+    }
+    if (failure.code != AlreadyExists().code) {
+      FreeOwnerOnlySecurity(acl, descriptor);
+      return ThrowFailure(env, failure);
+    }
+  }
+  FreeOwnerOnlySecurity(acl, descriptor);
+  if (replacement == INVALID_HANDLE_VALUE) return ThrowFailure(env, AlreadyExists());
+
+  bool renamed = false;
+  bool success = WriteAndFlushHandle(replacement, bytes, byteCount, &failure)
+      && SetOwnerOnlyDacl(replacement);
+  HandleIdentity replacementIdentity;
+  if (success && !ValidateSecurity(replacement, false, &failure, &replacementIdentity)) {
+    success = false;
+  }
+  if (success) {
+    // Complete every replacement-handle check before the name mutation.  A
+    // successful rename is deliberately the last fallible filesystem step;
+    // returning an identity after it therefore cannot hide a failed
+    // post-commit verification.
+    std::vector<std::uint8_t> persisted;
+    LARGE_INTEGER beginning{};
+    ParsedPath replacementPath = fullPath;
+    replacementPath.components.back() = temporaryName;
+    if (SetFilePointerEx(replacement, beginning, nullptr, FILE_BEGIN) == FALSE) {
+      failure = FromLastError();
+      success = false;
+    } else if (!ReadHandleBounded(
+                   replacement,
+                   kMaximumFileBytes,
+                   &persisted,
+                   &failure)) {
+      success = false;
+    } else if (persisted.size() != byteCount
+        || !std::equal(persisted.begin(), persisted.end(), bytes)) {
+      failure = IdentityMismatch();
+      success = false;
+    } else if (!ResolveFinalPath(replacement, &replacementPath)) {
+      failure = IdentityMismatch();
+      success = false;
+    }
+  }
+  if (success) {
+    HandleIdentity latest;
+    success = ValidateSecurity(opened.final, false, &failure, &latest)
+        && EqualIdentity(latest, expected)
+        && ResolveFinalPath(opened.final, &fullPath);
+    if (!success && failure.code == OperationFailed().code) failure = IdentityMismatch();
+  }
+  if (success) {
+    success = RenameHandleRelative(
+        replacement,
+        parent,
+        fullPath.components.back(),
+        &failure);
+    renamed = success;
+  }
+  if (!success && !renamed && !MarkHandleForDeletion(replacement)) {
+    failure = OperationFailed();
+  }
+  CloseHandle(replacement);
+  if (!success) return ThrowFailure(env, failure);
+  return IdentityValue(env, replacementIdentity);
+}
+
+napi_value DeleteProtectedChildCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 4)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring rootPath;
+  std::wstring childPath;
+  HandleIdentity expectedRoot;
+  Failure failure = OperationFailed();
+  if (!ParseProtectedChildArguments(
+          env,
+          {arguments[0], arguments[1], arguments[2]},
+          &rootPath,
+          &expectedRoot,
+          &childPath,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  HandleIdentity expected;
+  if (!ParseExpectedIdentity(env, arguments[3], &expected)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  OpenRelativeOptions options;
+  options.finalDirectoryKnown = true;
+  options.finalDirectory = false;
+  options.access = DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  options.shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+  options.disposition = kFileOpen;
+  options.protectAllAncestors = true;
+  RelativeHandles opened;
+  bool finalMissing = false;
+  ParsedPath fullPath;
+  if (!OpenProtectedRootAndChild(
+          rootPath,
+          expectedRoot,
+          childPath,
+          options,
+          &opened,
+          &finalMissing,
+          &fullPath,
+          &failure)
+      || finalMissing
+      || opened.final == INVALID_HANDLE_VALUE) {
+    return ThrowFailure(env, failure);
+  }
+  HandleIdentity current;
+  if (!ValidateSecurity(opened.final, false, &failure, &current)
+      || !EqualIdentity(current, expected)) {
+    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    return ThrowFailure(env, failure);
+  }
+  if (!ResolveFinalPath(opened.final, &fullPath)) {
+    failure = IdentityMismatch();
+    return ThrowFailure(env, failure);
+  }
+  FILE_DISPOSITION_INFO disposition{};
+  disposition.DeleteFile = TRUE;
+  if (!SetFileInformationByHandle(
+          opened.final,
+          FileDispositionInfo,
+          &disposition,
+          sizeof(disposition))) {
+    return ThrowFailure(env, FromLastError());
+  }
+  napi_value result;
+  napi_value deleted;
+  napi_create_object(env, &result);
+  napi_get_boolean(env, true, &deleted);
+  napi_set_named_property(env, result, "deleted", deleted);
+  napi_set_named_property(env, result, "identity", IdentityValue(env, current));
   return result;
 }
 
@@ -2343,9 +3063,35 @@ NAPI_MODULE_INIT() {
   DefineMethod(env, exports, "inspectPath", InspectPathCallback);
   DefineMethod(env, exports, "ensureDirectory", EnsureDirectoryCallback);
   DefineMethod(env, exports, "readFile", ReadFileCallback);
+  DefineMethod(env, exports, "readFileBounded", ReadFileBoundedCallback);
   DefineMethod(env, exports, "createFile", CreateFileCallback);
   DefineMethod(env, exports, "deleteFile", DeleteFileCallback);
   DefineMethod(env, exports, "replaceFile", ReplaceFileCallback);
+  DefineMethod(
+      env,
+      exports,
+      "inspectProtectedChild",
+      InspectProtectedChildCallback);
+  DefineMethod(
+      env,
+      exports,
+      "readProtectedChild",
+      ReadProtectedChildCallback);
+  DefineMethod(
+      env,
+      exports,
+      "createProtectedChild",
+      CreateProtectedChildCallback);
+  DefineMethod(
+      env,
+      exports,
+      "deleteProtectedChild",
+      DeleteProtectedChildCallback);
+  DefineMethod(
+      env,
+      exports,
+      "replaceProtectedChild",
+      ReplaceProtectedChildCallback);
 #if defined(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK)
   DefineMethod(
       env,
