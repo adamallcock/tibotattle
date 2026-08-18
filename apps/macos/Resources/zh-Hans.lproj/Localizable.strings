@@ -55,6 +55,7 @@
 "menuBar.quotaRemaining" = "%@：剩余 %@";
 "menuBar.quotaResetUnavailable" = "%@：%@ · 重置时间不可用";
 "menuBar.quotaResets" = "%@：%@ · 于 %@ 重置";
+"menuBar.quotaWeeklyPositionResets" = "%@：已过 %@ · 已用 %@ · 于 %@ 重置";
 "menuBar.quotaValuesUnavailable" = "在获得新的本地观测之前，额度数值不可用。";
 "menuBar.resetDaysHours" = "%d 天 %d 小时后";
 "menuBar.resetHoursMinutes" = "%d 小时 %d 分钟后";

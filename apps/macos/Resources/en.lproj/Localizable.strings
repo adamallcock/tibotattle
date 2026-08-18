@@ -154,6 +154,7 @@
 "menuBar.quotaRemaining" = "%@: %@ remaining";
 "menuBar.quotaResetUnavailable" = "%@: %@ · reset time unavailable";
 "menuBar.quotaResets" = "%@: %@ · resets %@";
+"menuBar.quotaWeeklyPositionResets" = "%@: %@ elapsed · %@ used · resets %@";
 "menuBar.quotaValuesUnavailable" = "Quota values are unavailable until a fresh local observation.";
 "menuBar.resetDaysHours" = "in %dd %dh";
 "menuBar.resetHoursMinutes" = "in %dh %dm";

@@ -7197,6 +7197,51 @@ private enum MenuBarContractSmokeTest {
     static func run() -> Int32 {
         let application = NSApplication.shared
         application.setActivationPolicy(.accessory)
+        let durationSeconds = TimeInterval(
+            CodexQuotaWindowDuration.sevenDayMinutes * 60
+        )
+        let resetAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let observedAt = resetAt.addingTimeInterval(
+            -durationSeconds * 0.76
+        )
+        let weeklyLane = ObservedQuotaLane(
+            label: TiboTattleLocalization.string(.menuBarSevenDayAllowance),
+            remainingPercent: 71,
+            durationMinutes: CodexQuotaWindowDuration.sevenDayMinutes,
+            resetAt: resetAt,
+            observedAt: observedAt,
+            isPrimary: true
+        )
+        let weeklyPosition = weeklyWindowPosition(weeklyLane)
+        var liveSnapshot = MenuBarStatusSnapshot()
+        liveSnapshot.phase = .ready
+        liveSnapshot.evidence = .live
+        liveSnapshot.lanes = [weeklyLane]
+        liveSnapshot.observedAt = observedAt
+        let liveSummary = liveSnapshot.laneSummary(
+            weeklyLane,
+            now: observedAt
+        )
+        var staleSnapshot = liveSnapshot
+        staleSnapshot.evidence = .stale
+        let staleSummary = staleSnapshot.laneSummary(
+            weeklyLane,
+            now: observedAt
+        )
+        let reset = resetCountdown(resetAt, now: observedAt)
+        let expectedLiveSummary = reset.map {
+            TiboTattleLocalization.format(
+                .menuBarQuotaWeeklyPositionResets,
+                weeklyLane.label,
+                TiboTattleLocalization.percentString(24),
+                TiboTattleLocalization.percentString(29),
+                $0
+            )
+        }
+        let expectedStaleSummary = TiboTattleLocalization.format(
+            .menuBarQuotaLastObserved,
+            weeklyLane.label
+        )
         let controller = MenuBarStatusController(
             productName: BundledProduct.displayName,
             actions: MenuBarStatusController.Actions(
@@ -7222,7 +7267,13 @@ private enum MenuBarContractSmokeTest {
               starting.usesNativeStatusItemMenu,
               starting.escapeDismissalMonitorInstalled,
               starting.sameAppClickAwayMonitorInstalled,
-              starting.appDeactivationDismissalObserverInstalled
+              starting.appDeactivationDismissalObserverInstalled,
+              weeklyPosition == WeeklyWindowPosition(
+                  elapsedPercent: 24,
+                  usedPercent: 29
+              ),
+              liveSummary == expectedLiveSummary,
+              staleSummary == expectedStaleSummary
         else {
             FileHandle.standardError.write(
                 Data("macOS menu bar contract smoke failed\\n".utf8)
@@ -7233,7 +7284,8 @@ private enum MenuBarContractSmokeTest {
             "USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT "
                 + "native_rows=true titles=true states=starting,unavailable "
                 + "shortcuts=cmd-r,cmd-comma,cmd-q "
-                + "dismissal=native,escape,same-app,deactivation"
+                + "dismissal=native,escape,same-app,deactivation "
+                + "weekly_position=fresh-only"
         )
         return 0
     }

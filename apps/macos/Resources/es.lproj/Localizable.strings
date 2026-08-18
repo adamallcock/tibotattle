@@ -55,6 +55,7 @@
 "menuBar.quotaRemaining" = "%@: queda %@";
 "menuBar.quotaResetUnavailable" = "%@: %@ · hora de reinicio no disponible";
 "menuBar.quotaResets" = "%@: %@ · se reinicia %@";
+"menuBar.quotaWeeklyPositionResets" = "%@: %@ transcurrido · %@ usado · se reinicia %@";
 "menuBar.quotaValuesUnavailable" = "Los valores de límite no están disponibles hasta que haya una observación local reciente.";
 "menuBar.resetDaysHours" = "en %d d %d h";
 "menuBar.resetHoursMinutes" = "en %d h %d min";

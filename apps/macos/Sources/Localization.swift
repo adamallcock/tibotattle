@@ -219,6 +219,7 @@ enum TiboTattleLocalization {
         case menuBarQuotaRemaining = "menuBar.quotaRemaining"
         case menuBarQuotaResetUnavailable = "menuBar.quotaResetUnavailable"
         case menuBarQuotaResets = "menuBar.quotaResets"
+        case menuBarQuotaWeeklyPositionResets = "menuBar.quotaWeeklyPositionResets"
         case menuBarQuotaValuesUnavailable = "menuBar.quotaValuesUnavailable"
         case menuBarResetDaysHours = "menuBar.resetDaysHours"
         case menuBarResetHoursMinutes = "menuBar.resetHoursMinutes"
@@ -642,6 +643,8 @@ enum TiboTattleLocalization {
                 "%@: %@ · reset time unavailable"
             case .menuBarQuotaResets:
                 "%@: %@ · resets %@"
+            case .menuBarQuotaWeeklyPositionResets:
+                "%@: %@ elapsed · %@ used · resets %@"
             case .menuBarQuotaValuesUnavailable:
                 "Quota values are unavailable until a fresh local observation."
             case .menuBarResetDaysHours:

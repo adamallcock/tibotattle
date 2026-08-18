@@ -1685,6 +1685,17 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   );
   assert.match(source, /let candidates = rows\.compactMap/u);
   assert.match(source, /guard Self\.isSupportedCodexAllowance\(/u);
+  assert.match(source, /let durationMinutes: Int/u);
+  assert.match(
+    source,
+    /func weeklyWindowPosition\(_ lane: ObservedQuotaLane\) -> WeeklyWindowPosition\?/u,
+  );
+  assert.match(source, /lane\.durationMinutes == weeklyWindowDurationMinutes/u);
+  assert.match(source, /let observedAt = lane\.observedAt/u);
+  assert.match(
+    source,
+    /TiboTattleLocalization\.format\(\s*\.menuBarQuotaWeeklyPositionResets,/u,
+  );
   assert.match(
     source,
     /return TiboTattleLocalization\.string\(\.menuBarFiveHourAllowance\)/u,
@@ -5112,7 +5123,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       menuBarSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT native_rows=true titles=true states=starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q dismissal=native,escape,same-app,deactivation$/mu,
+      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT native_rows=true titles=true states=starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q dismissal=native,escape,same-app,deactivation weekly_position=fresh-only$/mu,
     );
     const quotaNotificationSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),

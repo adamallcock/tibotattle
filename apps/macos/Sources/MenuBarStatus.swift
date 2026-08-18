@@ -21,6 +21,7 @@ import Foundation
 struct ObservedQuotaLane: Equatable {
     let label: String
     let remainingPercent: Double
+    let durationMinutes: Int
     let resetAt: Date?
     let observedAt: Date?
     let isPrimary: Bool
@@ -28,6 +29,12 @@ struct ObservedQuotaLane: Equatable {
     /// Whole-percent rendering matches the dashboard quota cards.
     var roundedRemainingPercent: Int {
         Int(min(100, max(0, remainingPercent)).rounded())
+    }
+
+    /// Keep the displayed used and remaining values exact complements after
+    /// whole-percent rendering.
+    var roundedUsedPercent: Int {
+        100 - roundedRemainingPercent
     }
 }
 
@@ -217,6 +224,15 @@ struct MenuBarStatusSnapshot: Equatable {
                 TiboTattleLocalization.percentString(lane.roundedRemainingPercent)
             )
         }
+        if let position = weeklyWindowPosition(lane) {
+            return TiboTattleLocalization.format(
+                .menuBarQuotaWeeklyPositionResets,
+                lane.label,
+                TiboTattleLocalization.percentString(position.elapsedPercent),
+                TiboTattleLocalization.percentString(position.usedPercent),
+                reset
+            )
+        }
         return TiboTattleLocalization.format(
             .menuBarQuotaResets,
             lane.label,
@@ -254,6 +270,42 @@ private let weeklyWindowDurationMinutes =
 private let supportedCodexAllowanceWindowDurations =
     1...CodexQuotaWindowDuration.maximumMinutes
 private let defaultStaleAfterSeconds: Double = 30 * 60
+
+/// A one-observation, non-predictive comparison for the seven-day allowance.
+/// Both values are aligned to the provider observation time: using wall-clock
+/// time with an older quota observation would quietly compare different
+/// instants. This is a menu-bar presentation fact, not an exhaustion forecast
+/// or the cost-implied expected line used by the dashboard.
+struct WeeklyWindowPosition: Equatable {
+    let elapsedPercent: Int
+    let usedPercent: Int
+}
+
+func weeklyWindowPosition(_ lane: ObservedQuotaLane) -> WeeklyWindowPosition? {
+    guard lane.durationMinutes == weeklyWindowDurationMinutes,
+          let resetAt = lane.resetAt,
+          let observedAt = lane.observedAt
+    else {
+        return nil
+    }
+    let durationSeconds = TimeInterval(lane.durationMinutes * 60)
+    let startedAt = resetAt.addingTimeInterval(-durationSeconds)
+    let elapsedSeconds = observedAt.timeIntervalSince(startedAt)
+    guard durationSeconds > 0,
+          elapsedSeconds >= 0,
+          elapsedSeconds < durationSeconds
+    else {
+        return nil
+    }
+    let elapsedPercent = min(
+        100,
+        max(0, elapsedSeconds / durationSeconds * 100)
+    )
+    return WeeklyWindowPosition(
+        elapsedPercent: Int(elapsedPercent.rounded()),
+        usedPercent: lane.roundedUsedPercent
+    )
+}
 
 /// Deterministic, locale-independent age wording. Deliberately coarse: the
 /// menu should say "about how old", never imply precision the evidence
@@ -359,6 +411,7 @@ enum LocalCompanionOverviewProjection {
             let lane = ObservedQuotaLane(
                 label: laneLabel(durationMinutes: duration),
                 remainingPercent: remaining,
+                durationMinutes: duration,
                 resetAt: timestamp(resetAtText),
                 observedAt: timestamp(row["observedAt"]),
                 // This marker is replaced after the bounded selection below;
@@ -394,6 +447,7 @@ enum LocalCompanionOverviewProjection {
             ObservedQuotaLane(
                 label: candidate.lane.label,
                 remainingPercent: candidate.lane.remainingPercent,
+                durationMinutes: candidate.lane.durationMinutes,
                 resetAt: candidate.lane.resetAt,
                 observedAt: candidate.lane.observedAt,
                 // The first valid, longest normal Codex lane is the compact
