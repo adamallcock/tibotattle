@@ -18,6 +18,11 @@ import {
   sep,
 } from "node:path";
 import { defaultExportStateDirectory } from "./export-identity.js";
+import {
+  assertWindowsFilesystemProductionSafe,
+  isWindowsFilesystemAdapter,
+  isWindowsFilesystemIdentity,
+} from "./platform/index.js";
 
 export const LOCAL_ONBOARDING_SCHEMA_VERSION = "local-onboarding-v0.2";
 export const MAXIMUM_OBSERVED_ROLLOUT_FILES = 100;
@@ -34,11 +39,26 @@ const SOURCE_STATUSES = new Set([
   "session_directories_unreadable",
   "no_rollout_files",
 ]);
-
 function configurationError() {
   const error = new TypeError("Local installation configuration is invalid");
   error.code = "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID";
   return error;
+}
+
+function resolveWindowsFilesystemAdapter(adapter) {
+  const selected = adapter ?? null;
+  // Keep the existing Node filesystem path available for portable and
+  // development Windows runs. A supplied adapter is a privileged native
+  // boundary and cannot be a virtual or copied object.
+  if (selected === null) return null;
+  if (process.platform !== "win32" || !isWindowsFilesystemAdapter(selected)) {
+    throw configurationError();
+  }
+  try {
+    return assertWindowsFilesystemProductionSafe(selected);
+  } catch {
+    throw configurationError();
+  }
 }
 
 function normalizedAbsolutePath(value) {
@@ -67,7 +87,36 @@ function pathWithin(root, candidate, { allowRoot = false } = {}) {
       && !isAbsolute(child));
 }
 
-function assertDirectory(path, { ownerOnly = false } = {}) {
+function assertDirectory(
+  path,
+  { ownerOnly = false, windowsFilesystemAdapter = null } = {},
+) {
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
+  if (windowsFilesystem) {
+    let metadata;
+    try {
+      metadata = windowsFilesystem.inspectPath(path);
+    } catch {
+      throw configurationError();
+    }
+    const protectedDirectory = metadata !== null
+      && typeof metadata === "object"
+      && !Array.isArray(metadata)
+      && metadata.isDirectory === true
+      && metadata.isReparsePoint === false
+      && metadata.finalPathResolved === true
+      && isWindowsFilesystemIdentity(metadata.identity)
+      && (!ownerOnly || (metadata.ownerMatches === true
+        && metadata.daclProtected === true
+        && metadata.nullDacl === false
+        && metadata.broadAccess === false
+        && metadata.nonOwnerAllow === false
+        && metadata.unrecognizedAce === false));
+    if (!protectedDirectory) {
+      throw configurationError();
+    }
+    return metadata;
+  }
   let metadata;
   try {
     metadata = lstatSync(path);
@@ -267,10 +316,25 @@ export function localCompanionStatePaths(stateRoot) {
   });
 }
 
-export function assertLocalStatePath(stateRoot, value) {
+export function assertLocalStatePath(
+  stateRoot,
+  value,
+  { windowsFilesystemAdapter = null } = {},
+) {
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
   const selectedRoot = normalizedAbsolutePath(stateRoot);
   const selected = normalizedAbsolutePath(value);
   if (!pathWithin(selectedRoot, selected)) throw configurationError();
+  if (windowsFilesystem) {
+    // The native adapter owns reparse-point, hard-link, DACL, and final-handle
+    // checks on Windows.  A not-yet-created child is intentionally checked
+    // only lexically here; its eventual create/open must use the same adapter.
+    assertDirectory(selectedRoot, {
+      ownerOnly: true,
+      windowsFilesystemAdapter: windowsFilesystem,
+    });
+    return selected;
+  }
   assertNoSymlinkBelow(selectedRoot, selected);
   let canonicalRoot;
   let canonicalSelected;
@@ -316,7 +380,9 @@ export function assertLocalResourceDirectory(resourceRoot, value) {
 export function prepareLocalInstallationRoots({
   resourceRoot,
   stateRoot,
+  windowsFilesystemAdapter = null,
 } = {}) {
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
   const selectedResourceRoot = normalizedAbsolutePath(resourceRoot);
   const selectedStateRoot = normalizedAbsolutePath(stateRoot);
   if (pathWithin(selectedResourceRoot, selectedStateRoot, { allowRoot: true })
@@ -328,7 +394,9 @@ export function prepareLocalInstallationRoots({
   let prospectiveStateRoot;
   try {
     canonicalResourceRoot = realpathSync(selectedResourceRoot);
-    prospectiveStateRoot = canonicalProspectivePath(selectedStateRoot);
+    prospectiveStateRoot = windowsFilesystem
+      ? selectedStateRoot
+      : canonicalProspectivePath(selectedStateRoot);
   } catch {
     throw configurationError();
   }
@@ -339,35 +407,51 @@ export function prepareLocalInstallationRoots({
   })) {
     throw configurationError();
   }
-  try {
-    const created = mkdirSync(selectedStateRoot, {
-      recursive: true,
-      mode: 0o700,
-    });
-    if (created !== undefined) {
-      assertDirectory(selectedStateRoot, { ownerOnly: true });
-    }
-  } catch {
-    throw configurationError();
-  }
-  assertDirectory(selectedStateRoot, { ownerOnly: true });
-  try {
-    const canonicalStateRoot = realpathSync(selectedStateRoot);
-    const finalCanonicalResourceRoot = realpathSync(selectedResourceRoot);
-    if (pathWithin(canonicalStateRoot, finalCanonicalResourceRoot, {
-      allowRoot: true,
-    }) || pathWithin(finalCanonicalResourceRoot, canonicalStateRoot, {
-      allowRoot: true,
-    })) {
+  if (windowsFilesystem) {
+    try {
+      windowsFilesystem.ensureDirectory(selectedStateRoot);
+    } catch {
       throw configurationError();
     }
-  } catch (error) {
-    if (error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID") throw error;
-    throw configurationError();
+    assertDirectory(selectedStateRoot, {
+      ownerOnly: true,
+      windowsFilesystemAdapter: windowsFilesystem,
+    });
+  } else {
+    try {
+      const created = mkdirSync(selectedStateRoot, {
+        recursive: true,
+        mode: 0o700,
+      });
+      if (created !== undefined) {
+        assertDirectory(selectedStateRoot, { ownerOnly: true });
+      }
+    } catch {
+      throw configurationError();
+    }
+    assertDirectory(selectedStateRoot, { ownerOnly: true });
+  }
+  if (!windowsFilesystem) {
+    try {
+      const canonicalStateRoot = realpathSync(selectedStateRoot);
+      const finalCanonicalResourceRoot = realpathSync(selectedResourceRoot);
+      if (pathWithin(canonicalStateRoot, finalCanonicalResourceRoot, {
+        allowRoot: true,
+      }) || pathWithin(finalCanonicalResourceRoot, canonicalStateRoot, {
+        allowRoot: true,
+      })) {
+        throw configurationError();
+      }
+    } catch (error) {
+      if (error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID") throw error;
+      throw configurationError();
+    }
   }
   const paths = localCompanionStatePaths(selectedStateRoot);
   for (const path of Object.values(paths)) {
-    assertLocalStatePath(selectedStateRoot, path);
+    assertLocalStatePath(selectedStateRoot, path, {
+      windowsFilesystemAdapter: windowsFilesystem,
+    });
   }
   return Object.freeze({
     resourceRoot: selectedResourceRoot,
@@ -425,7 +509,34 @@ async function countRolloutFiles(roots) {
   });
 }
 
-async function stateDirectoryWritable(stateRoot) {
+async function stateDirectoryWritable(stateRoot, windowsFilesystemAdapter = null) {
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
+  if (windowsFilesystem) {
+    let probe = null;
+    let identity = null;
+    try {
+      assertDirectory(stateRoot, {
+        ownerOnly: true,
+        windowsFilesystemAdapter: windowsFilesystem,
+      });
+      probe = join(stateRoot, `.onboarding-write-probe-${randomUUID()}`);
+      identity = windowsFilesystem.createFile(
+        probe,
+        Buffer.from("app-usagemonitor onboarding write probe v1\n", "utf8"),
+      );
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (probe !== null && identity !== null) {
+        try {
+          windowsFilesystem.deleteFile(probe, identity);
+        } catch {
+          // The diagnostic is intentionally boolean and content-free.
+        }
+      }
+    }
+  }
   let handle = null;
   let probe = null;
   try {
@@ -559,7 +670,9 @@ export async function inspectLocalOnboarding({
   stateRoot,
   explicitRefresh = true,
   customCodexHomeConfigured = false,
+  windowsFilesystemAdapter = null,
 } = {}) {
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
   const selectedCodexHome = normalizedAbsolutePath(codexHome);
   const selectedStateRoot = normalizedAbsolutePath(stateRoot);
   const sessions = join(selectedCodexHome, "sessions");
@@ -574,7 +687,7 @@ export async function inspectLocalOnboarding({
       directoryStatus(selectedCodexHome),
       directoryStatus(sessions),
       directoryStatus(archivedSessions),
-      stateDirectoryWritable(selectedStateRoot),
+      stateDirectoryWritable(selectedStateRoot, windowsFilesystem),
     ]);
   const sessionsReadable = sessionsStatus === "readable";
   const archivedSessionsReadable = archivedSessionsStatus === "readable";

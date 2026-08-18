@@ -420,6 +420,36 @@ test("local refresh routes collector, credential lock, and accounting writes ben
   }
 });
 
+test("local refresh rejects forged and copied Windows adapters before runCollector", async () => {
+  let runCollectorCalls = 0;
+  const forged = Object.freeze({
+    productionSafe: true,
+    pathWalkRaceSafe: true,
+  });
+  const copied = { ...forged };
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+  try {
+    for (const windowsFilesystemAdapter of [forged, copied]) {
+      const runner = createLocalCollectorRefreshRunner({
+        windowsFilesystemAdapter,
+        runCollector: async () => {
+          runCollectorCalls += 1;
+          throw new Error("runCollector must not be called");
+        },
+      });
+      await assert.rejects(
+        runner(),
+        (error) => error.code === "local_collector_state_unavailable"
+          && error.message === "local_collector_state_unavailable",
+      );
+    }
+  } finally {
+    Object.defineProperty(process, "platform", originalPlatform);
+  }
+  assert.equal(runCollectorCalls, 0);
+});
+
 test("local refresh starts a bounded archive index only after the foreground result is safe", async () => {
   const controller = new AbortController();
   const clock = () => Date.parse("2026-07-23T12:00:00.000Z");
