@@ -36,6 +36,17 @@ export {
   isWindowsFilesystemIdentity,
 } from "./windows-filesystem.js";
 export {
+  WINDOWS_PROTECTED_STATE_STORE_CONTRACT_VERSION,
+  WINDOWS_PROTECTED_STATE_STORE_DEFAULT_MAX_BYTES,
+  WINDOWS_PROTECTED_STATE_STORE_LEASE_VERSION,
+  WINDOWS_PROTECTED_STATE_STORE_NATIVE_READ_BOUNDED,
+  WINDOWS_PROTECTED_STATE_STORE_ROOT_BINDING_SAFE,
+  WindowsProtectedStateStoreError,
+  createWindowsProtectedStateStore,
+  isWindowsProtectedStateStore,
+  isWindowsProtectedStateStoreError,
+} from "./windows-protected-state-store.js";
+export {
   CONTRIBUTION_DEVICE_READER_CODE_IDENTIFIER,
   CONTRIBUTION_DEVICE_READER_TEAM_IDENTIFIER,
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
