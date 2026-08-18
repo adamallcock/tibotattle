@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { renameSync } from "node:fs";
 import {
   mkdir,
   mkdtemp,
@@ -25,6 +26,13 @@ import {
   writeLocalCollectorAccountingCache,
 } from "../src/local-collector-state.js";
 import { emptySpeedWeightingCrossing } from "@app-usagemonitor/accounting";
+import {
+  openLocalUnifiedIndex,
+  readUnifiedIndexGenerationDescriptor,
+} from "../src/local-unified-index.js";
+import {
+  readLocalUnifiedCompanionProjection,
+} from "../src/local-unified-companion-source.js";
 
 const ARTIFACT_FILES = {
   gradient: "2026-07-24-simple-quota-gradient-artifact.json",
@@ -1728,6 +1736,24 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
       count("2026-07-25T11:30:00.000Z", usageTotals(100, 10), usageTotals(100, 10)),
       count("2026-07-25T11:30:01.000Z", usageTotals(300, 30), usageTotals(200, 20)),
       turn("2026-07-25T11:30:02.000Z"),
+      ...Array.from({ length: 4 }, (_, index) => line({
+        timestamp: `2026-07-25T11:30:02.${String(index + 1).padStart(3, "0")}Z`,
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "thread_spawn",
+          call_id: `private-subagent-call-${index}`,
+        },
+      })),
+      ...Array.from({ length: 2 }, (_, index) => line({
+        timestamp: `2026-07-25T11:30:02.${String(index + 5).padStart(3, "0")}Z`,
+        type: "response_item",
+        payload: {
+          type: "custom_tool_call",
+          name: "private-tool-class",
+          call_id: `private-other-call-${index}`,
+        },
+      })),
       count("2026-07-25T11:30:03.000Z", usageTotals(400, 50), usageTotals(100, 20)),
     ].join("\n")}\n`);
     const { rebuildLocalUnifiedIndex } = await import("../src/local-unified-index-build.js");
@@ -1739,6 +1765,53 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
     });
     assert.equal(built.usageEvents, 3);
     assert.equal(built.forkReplayEventsSkipped, 2);
+    assert.equal(built.toolEvents, 6);
+
+    // A readable SQLite publication whose ingest status is partial remains
+    // useful coverage metadata, but it is not an accounting authority.
+    const partialIndexFile = join(
+      root,
+      ".usage-monitor",
+      "local-unified-index-v1.sqlite",
+    );
+    const partialDatabase = openLocalUnifiedIndex(partialIndexFile, {
+      readOnly: false,
+    });
+    partialDatabase.prepare(
+      "UPDATE meta SET value = ? WHERE key = 'status'",
+    ).run("partial");
+    partialDatabase.close();
+    const partialSnapshot = await buildLocalCompanionSnapshot({
+      root,
+      accountingSourceMode: "unified",
+      unifiedIndexFile: partialIndexFile,
+      allowDevelopmentArtifactFallback: false,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(partialSnapshot.overview.timeline.history.status, "partial");
+    assert.equal(
+      partialSnapshot.overview.timeline.history.reason,
+      "unified_index_partial",
+    );
+    assert.equal(partialSnapshot.overview.timeline.source, "insufficient_evidence");
+    assert.equal(
+      partialSnapshot.overview.accounting.accountingSource,
+      "insufficient_evidence",
+    );
+    assert.equal(
+      partialSnapshot.overview.usage.find((period) => period.id === "all").events,
+      0,
+    );
+    assert.ok(partialSnapshot.overview.warnings.some((warning) => (
+      warning.includes("readable but only partially covered")
+    )));
+    const restoredDatabase = openLocalUnifiedIndex(partialIndexFile, {
+      readOnly: false,
+    });
+    restoredDatabase.prepare(
+      "UPDATE meta SET value = ? WHERE key = 'status'",
+    ).run("complete");
+    restoredDatabase.close();
 
     const snapshot = await buildLocalCompanionSnapshot({
       root,
@@ -1819,6 +1892,9 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
         ?.status,
       "partial",
     );
+    // Legacy rollback mode continues to read the collector ledger; it must
+    // not silently adopt typed unified-index tool counts.
+    assert.equal(snapshot.overview.tools.total, 0);
     assert.ok(!snapshot.overview.warnings.some((warning) => (
       warning.includes("live collector projection")
     )));
@@ -1829,6 +1905,194 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
     const serialized = JSON.stringify(snapshot);
     assert.ok(!serialized.includes("session-deep-parent"));
     assert.ok(!serialized.includes("/Users/private"));
+
+    // Cutover mode reads its long history from the generation-bound cache,
+    // never from the rollback archive. A deliberately invalid archive
+    // sentinel proves the old reader is not even consulted.
+    const stateDirectory = join(root, ".usage-monitor");
+    const collectorStateFile = join(
+      stateDirectory,
+      "local-collector-state-v1.sqlite",
+    );
+    const unifiedIndexFile = join(
+      stateDirectory,
+      "local-unified-index-v1.sqlite",
+    );
+    const archiveIndexFile = join(
+      stateDirectory,
+      "local-archive-accounting-index-v1.sqlite",
+    );
+    await writeFile(archiveIndexFile, "rollback-sentinel", { mode: 0o600 });
+    const archiveBefore = await stat(archiveIndexFile);
+    await refreshReplaySafeAccountingCache({
+      stateFile: collectorStateFile,
+      sourceMode: "unified",
+      unifiedIndexFile,
+      expectedGeneration: built.generation,
+      contextBehavior: "legacy_zero",
+      codexHome: root,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    const unifiedSnapshot = await buildLocalCompanionSnapshot({
+      root,
+      accountingSourceMode: "unified",
+      archiveIndexFile,
+      unifiedIndexFile,
+      allowDevelopmentArtifactFallback: false,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    const archiveAfter = await stat(archiveIndexFile);
+    assert.equal(archiveAfter.size, archiveBefore.size);
+    assert.equal(archiveAfter.mtimeMs, archiveBefore.mtimeMs);
+    const history = unifiedSnapshot.overview.accounting.periods
+      .find((period) => period.periodId === "history");
+    assert.equal(history.events, 3);
+    assert.equal(history.totalTokens, 110 + 220 + 120);
+    assert.equal(
+      unifiedSnapshot.overview.accounting.historyPeriodStatus,
+      "available",
+    );
+    assert.equal(
+      unifiedSnapshot.overview.accounting.historyCoverage.status,
+      "complete",
+    );
+    assert.equal(
+      unifiedSnapshot.overview.accounting.historyCoverage.sourceMode,
+      "unified",
+    );
+    assert.equal(unifiedSnapshot.overview.accounting.sourceMode, "unified");
+    assert.equal(
+      unifiedSnapshot.overview.accounting.compatibilityBehavior,
+      "legacy_zero",
+    );
+    assert.equal(
+      unifiedSnapshot.overview.accounting.generationMatched,
+      true,
+    );
+    assert.equal(
+      unifiedSnapshot.overview.accounting.diagnosticsAvailable,
+      true,
+    );
+    assert.equal(
+      unifiedSnapshot.overview.accounting.sourceCapabilities
+        .crashSafeGenerationPublication,
+      true,
+    );
+    assert.equal(unifiedSnapshot.overview.tools.total, 6);
+    assert.equal(unifiedSnapshot.overview.tools.counts.subagent, 4);
+    assert.equal(unifiedSnapshot.overview.tools.counts.other, 2);
+    assert.equal(unifiedSnapshot.overview.evidenceStatus, "available");
+    assert.equal(unifiedSnapshot.overview.freshness.status, "live");
+    assert.equal(
+      unifiedSnapshot.overview.freshness.latestObservedAt,
+      "2026-07-25T11:30:03.000Z",
+    );
+    assert.deepEqual(unifiedSnapshot.overview.collector.exportableCoveredAt, {
+      startAt: "2026-06-01T12:00:01.000Z",
+      endAt: "2026-07-25T11:30:03.000Z",
+    });
+
+    const toolPartialDatabase = openLocalUnifiedIndex(unifiedIndexFile, {
+      readOnly: false,
+    });
+    toolPartialDatabase.prepare(`
+      UPDATE index_generation
+      SET status = 'partial', block_reason = 'tool_provenance_incomplete',
+          tool_provenance_complete = 0
+      WHERE id = (SELECT CAST(value AS INTEGER) FROM meta
+                  WHERE key = 'current_generation_id')
+    `).run();
+    toolPartialDatabase.prepare(
+      "UPDATE meta SET value = 'partial' WHERE key = 'status'",
+    ).run();
+    const toolPartialGeneration = readUnifiedIndexGenerationDescriptor(
+      toolPartialDatabase,
+    );
+    toolPartialDatabase.close();
+    await refreshReplaySafeAccountingCache({
+      stateFile: collectorStateFile,
+      sourceMode: "unified",
+      unifiedIndexFile,
+      expectedGeneration: toolPartialGeneration,
+      contextBehavior: "legacy_zero",
+      codexHome: root,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    const toolPartialSnapshot = await buildLocalCompanionSnapshot({
+      root,
+      accountingSourceMode: "unified",
+      archiveIndexFile,
+      unifiedIndexFile,
+      allowDevelopmentArtifactFallback: false,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(
+      toolPartialSnapshot.overview.usage.find((period) => period.id === "all")
+        .events,
+      3,
+    );
+    assert.equal(toolPartialSnapshot.overview.tools.total, 0);
+    assert.ok(toolPartialSnapshot.overview.warnings.some((warning) => (
+      warning.includes("typed tool history is partial")
+    )));
+    const restoreToolDatabase = openLocalUnifiedIndex(unifiedIndexFile, {
+      readOnly: false,
+    });
+    restoreToolDatabase.prepare(`
+      UPDATE index_generation
+      SET status = 'complete', block_reason = NULL,
+          tool_provenance_complete = 1
+      WHERE id = (SELECT CAST(value AS INTEGER) FROM meta
+                  WHERE key = 'current_generation_id')
+    `).run();
+    restoreToolDatabase.prepare(
+      "UPDATE meta SET value = 'complete' WHERE key = 'status'",
+    ).run();
+    restoreToolDatabase.close();
+
+    // A copy-on-write publisher replacing the path mid-read must not let the
+    // old opened inode masquerade as the current publication.
+    const movedIndexFile = `${unifiedIndexFile}.reader-race`;
+    let moved = false;
+    const raceBaselines = [];
+    raceBaselines[Symbol.iterator] = function* triggerReplacement() {
+      if (!moved) {
+        moved = true;
+        renameSync(unifiedIndexFile, movedIndexFile);
+      }
+    };
+    let raced;
+    try {
+      raced = await readLocalUnifiedCompanionProjection({
+        indexFile: unifiedIndexFile,
+        declaredSpeedBaselines: raceBaselines,
+        nowMs: Date.parse("2026-07-25T12:00:00.000Z"),
+      });
+    } finally {
+      if (moved) renameSync(movedIndexFile, unifiedIndexFile);
+    }
+    assert.equal(raced.status, "unavailable");
+    assert.equal(raced.errorCode, "local_unified_index_file_changed");
+
+    // The descriptor commits to the exact fixed-class fact set. Any in-place
+    // edit after publication is withheld rather than silently displayed.
+    const tamperedDatabase = openLocalUnifiedIndex(unifiedIndexFile, {
+      readOnly: false,
+    });
+    tamperedDatabase.prepare(`
+      UPDATE tool_class_fact SET tool_class = 'web_search'
+      WHERE event_key = (SELECT event_key FROM tool_class_fact LIMIT 1)
+    `).run();
+    tamperedDatabase.close();
+    const tampered = await readLocalUnifiedCompanionProjection({
+      indexFile: unifiedIndexFile,
+      nowMs: Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(tampered.status, "unavailable");
+    assert.equal(
+      tampered.errorCode,
+      "local_unified_index_tool_attestation_mismatch",
+    );
   } finally {
     await rm(root, { recursive: true });
   }
@@ -1862,6 +2126,55 @@ test("a missing unified index keeps the bounded window and says so in the payloa
     )));
     const broadest = snapshot.overview.usage.find((period) => period.id === "all");
     assert.equal(broadest.label, "Cached 31-day collector window");
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("unified mode with no valid generation withholds the provisional collector projection", async () => {
+  const root = await fixtureRoot();
+  try {
+    const usage = JSON.stringify({
+      schemaVersion: "0.3",
+      kind: "codex_rollout_usage_snapshot",
+      observedAt: "2026-07-25T11:00:00.000Z",
+      model: "gpt-5.6-sol",
+      components: { input_uncached_tokens: 100 },
+    });
+    const tool = JSON.stringify({
+      kind: "codex_tool_class_event",
+      observedAt: "2026-07-25T11:01:00.000Z",
+      toolClass: "subagent",
+    });
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      `${usage}\n${tool}\n`,
+      { mode: 0o600 },
+    );
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      accountingSourceMode: "unified",
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(snapshot.overview.timeline.source, "insufficient_evidence");
+    assert.deepEqual(snapshot.overview.timeline.usage, []);
+    assert.equal(
+      snapshot.overview.accounting.accountingSource,
+      "insufficient_evidence",
+    );
+    assert.equal(snapshot.overview.pricing.totalCostUsd, 0);
+    assert.equal(snapshot.overview.pricing.eventCount, 0);
+    assert.equal(snapshot.overview.tools.total, 0);
+    assert.deepEqual(snapshot.overview.collector.exportableCoveredAt, {
+      startAt: null,
+      endAt: null,
+    });
+    assert.ok(snapshot.overview.warnings.some((warning) => (
+      warning.includes("Usage totals and timelines remain unavailable")
+    )));
+    assert.ok(!snapshot.overview.warnings.some((warning) => (
+      warning.includes("live collector projection")
+    )));
   } finally {
     await rm(root, { recursive: true });
   }

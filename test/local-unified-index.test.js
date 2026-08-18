@@ -1,10 +1,24 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  symlink,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import { readCacheImpacts } from "../src/cache-switch-impact.js";
+import { readLocalUnifiedCompanionProjection } from "../src/local-unified-companion-source.js";
+import { createLocalUnifiedAccountingSource } from "../src/local-unified-accounting-source.js";
 
 import {
   balanceComponents,
@@ -22,6 +36,9 @@ import {
   ingestLocalUnifiedIndexIncrement,
 } from "../src/local-unified-index-ingest.js";
 import {
+  createLocalUnifiedIndexSecondaryIndexes,
+  createUnifiedIndexWriter,
+  beginUnifiedIndexGeneration,
   inspectLocalUnifiedIndex,
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
   localDigest,
@@ -29,6 +46,7 @@ import {
   OUTCOMES,
   outcomeOrdinal,
   readUnifiedIndexAggregate,
+  readUnifiedIndexGenerationDescriptor,
   REASONING_EFFORTS,
   reasoningEffortOrdinal,
   sessionLocal,
@@ -78,6 +96,14 @@ function threadSettings(timestamp, serviceTier) {
       type: "thread_settings_applied",
       thread_settings: { service_tier: serviceTier, reasoning_effort: "medium" },
     },
+  });
+}
+
+function toolCall(timestamp, payload) {
+  return JSON.stringify({
+    timestamp,
+    type: "response_item",
+    payload,
   });
 }
 
@@ -155,6 +181,64 @@ async function build(root, extra = {}) {
     contractVersion: CONTRACT,
     ...extra,
   });
+}
+
+const SECONDARY_INDEX_NAMES = [
+  "usage_event_observed",
+  "usage_event_session",
+  "usage_event_boundary_session",
+  "usage_event_replay_order",
+  "quota_occurrence_canonical",
+  "quota_occurrence_replay_order",
+  "tool_class_fact_generation",
+  "tool_class_fact_source",
+];
+
+function secondaryIndexNames(database) {
+  const placeholders = SECONDARY_INDEX_NAMES.map(() => "?").join(", ");
+  return database.prepare(
+    `SELECT name FROM sqlite_master
+     WHERE type = 'index' AND name IN (${placeholders}) ORDER BY name`,
+  ).all(...SECONDARY_INDEX_NAMES).map((row) => row.name);
+}
+
+function logicalProjection(database) {
+  return {
+    usage: database.prepare(`
+      SELECT hex(u.event_key) AS event_key, u.observed_at_ms,
+             m.model_id, t.billing_surface, t.codex_speed_mode,
+             t.api_service_tier, t.tier_source,
+             s.surface, s.thread_source, s.agent_scope,
+             s.lineage_disposition,
+             u.tokens_in_uncached, u.tokens_in_cache_read,
+             u.tokens_in_cache_write, u.tokens_in_cache_write_5m,
+             u.tokens_in_cache_write_1h, u.tokens_out_text,
+             u.tokens_out_reasoning, u.tokens_out_combined,
+             u.total_input_context, hex(u.source_local) AS source_local,
+             u.source_offset, u.source_ordinal, u.tier_observed_at_ms
+      FROM usage_event u
+      JOIN model m ON m.id = u.model_id
+      JOIN tier_semantics t ON t.id = u.tier_id
+      JOIN surface_class s ON s.id = u.surface_id
+      ORDER BY u.observed_at_ms, u.source_ordinal, u.source_local,
+               u.source_offset, u.event_key`).all(),
+    quotaObservations: database.prepare(`
+      SELECT observed_at_ms, limit_id, slot, plan_type, used_percent,
+             resets_at_ms, duration_mins
+      FROM quota_observation
+      ORDER BY observed_at_ms, limit_id, slot`).all(),
+    quotaOccurrences: database.prepare(`
+      SELECT hex(q.source_local) AS source_local, q.source_offset,
+             q.source_ordinal, q.observed_at_ms, q.provider, q.plan_type,
+             q.limit_id, q.slot, q.slot_order, q.used_percent,
+             q.resets_at_ms, q.duration_mins, q.admission,
+             s.surface, s.thread_source, s.agent_scope,
+             s.lineage_disposition
+      FROM quota_occurrence q
+      JOIN surface_class s ON s.id = q.surface_id
+      ORDER BY q.observed_at_ms, q.source_ordinal, q.source_local,
+               q.source_offset, q.slot_order`).all(),
+  };
 }
 
 test("the enum ordinals match the telemetry contract's fixed member lists", () => {
@@ -321,6 +405,409 @@ test("a rebuild indexes typed usage events and never stores content", async () =
       assert.ok(!dump.includes("/Users/nobody"));
       assert.ok(!dump.includes("session-a"));
       assert.ok(!dump.includes("turn-1"));
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("deferred secondary indexes preserve logical facts and are present before publication", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-deferred.jsonl": [
+      sessionMeta("session-deferred"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      threadSettings("2026-07-25T00:00:01.000Z", "priority"),
+      tokenCount(
+        "2026-07-25T00:00:02.000Z",
+        usage(100, 10),
+        usage(100, 10),
+        { usedPercent: 12 },
+      ),
+      tokenCount(
+        "2026-07-25T00:00:03.000Z",
+        usage(300, 40),
+        usage(200, 30),
+      ),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const readProjection = () => {
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      return {
+        aggregate: readUnifiedIndexAggregate(database),
+        logical: logicalProjection(database),
+        secondaryIndexes: secondaryIndexNames(database),
+      };
+    } finally {
+      database.close();
+    }
+  };
+  try {
+    await build(root, { deferSecondaryIndexes: false });
+    const online = readProjection();
+    assert.deepEqual(online.secondaryIndexes, [...SECONDARY_INDEX_NAMES].sort());
+
+    const deferred = await build(root, { deferSecondaryIndexes: true });
+    assert.equal(deferred.generation.status, "complete");
+    const rebuilt = readProjection();
+    assert.deepEqual(rebuilt.secondaryIndexes, [...SECONDARY_INDEX_NAMES].sort());
+    assert.deepEqual(rebuilt.aggregate, online.aggregate);
+    assert.deepEqual(rebuilt.logical, online.logical);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("quota coverage proof is planned through its canonical-occurrence index", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-proof-index.jsonl": [
+      sessionMeta("session-proof-index"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount(
+        "2026-07-25T00:00:01.000Z",
+        usage(100, 10),
+        usage(100, 10),
+        { usedPercent: 12 },
+      ),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root, { deferSecondaryIndexes: true });
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      const plan = database.prepare(`
+        EXPLAIN QUERY PLAN
+        SELECT COUNT(*) AS count FROM quota_observation q
+        WHERE NOT EXISTS (
+          SELECT 1 FROM quota_occurrence o
+          WHERE o.canonical_observation_id = q.id)
+      `).all();
+      assert.ok(
+        plan.some((row) => String(row.detail).includes(
+          "quota_occurrence_canonical",
+        )),
+        () => `quota proof plan did not use canonical index: ${JSON.stringify(plan)}`,
+      );
+      assert.equal(
+        Number(database.prepare(`
+          SELECT COUNT(*) AS count FROM quota_observation q
+          WHERE NOT EXISTS (
+            SELECT 1 FROM quota_occurrence o
+            WHERE o.canonical_observation_id = q.id)
+        `).get().count),
+        0,
+      );
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("existing incremental indexes repair the quota proof index while read-only validation rejects its absence", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-proof-migration.jsonl": [
+      sessionMeta("session-proof-migration"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const writable = openLocalUnifiedIndex(indexFile, { readOnly: false });
+    writable.exec("DROP INDEX quota_occurrence_canonical");
+    writable.close();
+
+    assert.throws(
+      () => openLocalUnifiedIndex(indexFile, { readOnly: true }),
+      (error) => error?.code === "local_unified_index_secondary_indexes_missing",
+    );
+
+    const result = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(result.status, "ingested");
+    assert.equal(result.insertedUsageEvents, 0);
+    assert.equal(result.totalUsageEvents, 1);
+
+    const repaired = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.deepEqual(
+        secondaryIndexNames(repaired),
+        [...SECONDARY_INDEX_NAMES].sort(),
+      );
+    } finally {
+      repaired.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("deferred secondary-index failure rolls back the stage and cannot target an existing index", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-deferred-failure.jsonl": [
+      sessionMeta("session-deferred-failure"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const stageFile = join(root, "blocked-stage.sqlite");
+  try {
+    await build(root, { deferSecondaryIndexes: false });
+    const before = await stat(indexFile);
+    const beforeProjection = (() => {
+      const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+      try {
+        return logicalProjection(database);
+      } finally {
+        database.close();
+      }
+    })();
+
+    const staging = openLocalUnifiedIndex(stageFile, {
+      readOnly: false,
+      create: true,
+      staging: true,
+      deferSecondaryIndexes: true,
+    });
+    try {
+      assert.deepEqual(secondaryIndexNames(staging), []);
+      // The first index can be created, but the second is deliberately blocked
+      // by a table with the same name. The helper's transaction must roll the
+      // first one back rather than leaving a partially indexed stage.
+      staging.exec("CREATE TABLE usage_event_session(blocked INTEGER)");
+      assert.throws(
+        () => createLocalUnifiedIndexSecondaryIndexes(staging),
+        (error) => error?.code === "local_unified_index_secondary_indexes_failed",
+      );
+      assert.deepEqual(secondaryIndexNames(staging), []);
+    } finally {
+      staging.close();
+    }
+
+    assert.throws(
+      () => openLocalUnifiedIndex(indexFile, {
+        readOnly: false,
+        create: true,
+        staging: true,
+        deferSecondaryIndexes: true,
+      }),
+      (error) => error?.code
+        === "local_unified_index_deferred_indexes_requires_new_stage",
+    );
+    const after = await stat(indexFile);
+    assert.equal(after.size, before.size);
+    assert.equal(after.mtimeMs, before.mtimeMs);
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.deepEqual(logicalProjection(database), beforeProjection);
+      assert.deepEqual(secondaryIndexNames(database), [...SECONDARY_INDEX_NAMES].sort());
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a published generation attests provenance, source order and quota occurrences", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-attested.jsonl": [
+      sessionMeta("session-attested"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      threadSettings("2026-07-25T00:00:01.000Z", "priority"),
+      tokenCount(
+        "2026-07-25T00:00:02.000Z",
+        usage(100, 10),
+        usage(100, 10),
+        { usedPercent: 12 },
+      ),
+    ],
+  });
+  try {
+    const built = await build(root);
+    assert.equal(built.generation.status, "complete");
+    assert.equal(built.generation.usageProvenanceComplete, true);
+    assert.equal(built.generation.sourceOrderComplete, true);
+    assert.equal(built.generation.quotaProvenanceComplete, true);
+
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      const generation = database.prepare(`
+        SELECT status, usage_events, quota_occurrences,
+               usage_provenance_complete, source_order_complete,
+               quota_provenance_complete
+        FROM index_generation
+        WHERE id = (SELECT CAST(value AS INTEGER)
+                    FROM meta WHERE key = 'current_generation_id')
+      `).get();
+      assert.equal(generation.status, "complete");
+      assert.equal(generation.usage_events, 1);
+      assert.equal(generation.quota_occurrences, 1);
+      assert.equal(generation.usage_provenance_complete, 1);
+      assert.equal(generation.source_order_complete, 1);
+      assert.equal(generation.quota_provenance_complete, 1);
+
+      const usageRow = database.prepare(`
+        SELECT length(source_local) AS source_bytes, source_offset,
+               source_ordinal, tier_observed_at_ms
+        FROM usage_event
+      `).get();
+      assert.equal(usageRow.source_bytes, 32);
+      assert.ok(Number.isSafeInteger(usageRow.source_offset));
+      assert.equal(usageRow.source_ordinal, 0);
+      assert.ok(Number.isSafeInteger(usageRow.tier_observed_at_ms));
+
+      const quota = database.prepare(`
+        SELECT length(source_local) AS source_bytes, source_offset,
+               source_ordinal, slot_order, admission, resets_at_ms
+        FROM quota_occurrence
+      `).get();
+      assert.equal(quota.source_bytes, 32);
+      assert.ok(Number.isSafeInteger(quota.source_offset));
+      assert.equal(quota.source_ordinal, 0);
+      assert.equal(quota.slot_order, 0);
+      assert.equal(quota.admission, "admitted");
+      assert.ok(Number.isSafeInteger(quota.resets_at_ms));
+
+      const source = database.prepare(`
+        SELECT source_ordinal, status, diagnostics_complete
+        FROM generation_source
+      `).get();
+      assert.equal(source.source_ordinal, 0);
+      assert.equal(source.status, "complete");
+      assert.equal(source.diagnostics_complete, 1);
+
+      const descriptor = readUnifiedIndexGenerationDescriptor(database);
+      assert.equal(descriptor.fingerprint, built.generation.fingerprint);
+      assert.equal(descriptor.usageProvenanceComplete, true);
+      assert.equal(descriptor.sourceOrderComplete, true);
+      assert.equal(descriptor.quotaProvenanceComplete, true);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("generation finalization rejects a cursor with missing source ordinal", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-cursor-order.jsonl": [
+      sessionMeta("session-cursor-order"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: false });
+    const source = database.prepare(`
+      SELECT source_local, source_ordinal, session_local, surface_id,
+             discovered_size_bytes, scanned_bytes, mtime_ms, diagnostics_complete
+      FROM generation_source
+      WHERE generation_id = (SELECT CAST(value AS INTEGER) FROM meta
+                             WHERE key = 'current_generation_id')`).get();
+    database.prepare("UPDATE source_cursor SET source_ordinal = NULL").run();
+    const generation = beginUnifiedIndexGeneration(database, {
+      contractVersion: CONTRACT,
+    });
+    const writer = createUnifiedIndexWriter(database, {
+      contractVersion: CONTRACT,
+      generationId: generation.generationId,
+      parserVersionId: generation.parserVersionId,
+      ingestRunId: generation.ingestRunId,
+    });
+    writer.writeGenerationSource({
+      sourceLocal: Buffer.from(source.source_local),
+      sourceOrdinal: Number(source.source_ordinal),
+      sessionLocal: Buffer.from(source.session_local),
+      surfaceId: Number(source.surface_id),
+      status: "complete",
+      discoveredSizeBytes: Number(source.discovered_size_bytes),
+      scannedBytes: Number(source.scanned_bytes),
+      mtimeMs: Number(source.mtime_ms),
+      diagnosticsComplete: Number(source.diagnostics_complete) === 1,
+    });
+    writer.finalizeGeneration({
+      status: "complete",
+      discoveryComplete: true,
+      diagnosticsComplete: true,
+    });
+    await writer.close({ integrityCheck: true, fsyncPath: null });
+    const published = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    // The staged test generation is not published over the path, but its
+    // descriptor is durable in this connection before close; the source-order
+    // proof itself is asserted by the generation row below.
+    try {
+      const row = published.prepare(`
+        SELECT source_order_complete, status, block_reason
+        FROM index_generation WHERE id = ?`).get(generation.generationId);
+      assert.equal(row.source_order_complete, 0);
+      assert.equal(row.status, "partial");
+      assert.equal(row.block_reason, "source_order_incomplete");
+    } finally {
+      published.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("held and suppressed quota observations remain represented by a complete generation", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-quota-gate.jsonl": [
+      sessionMeta("session-quota-gate"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount(
+        "2026-07-25T00:00:01.000Z",
+        usage(100, 10),
+        usage(100, 10),
+        { usedPercent: 12 },
+      ),
+      // The quick ten-minute rise is withheld as a contradicted leading
+      // snapshot; the later reading is admitted when the source is flushed.
+      tokenCount(
+        "2026-07-25T00:00:02.000Z",
+        usage(200, 20),
+        usage(100, 10),
+        { usedPercent: 25 },
+      ),
+    ],
+  });
+  try {
+    const built = await build(root);
+    assert.equal(built.generation.status, "complete");
+    assert.equal(built.generation.quotaProvenanceComplete, true);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      const rows = database.prepare(`
+        SELECT admission, canonical_observation_id
+        FROM quota_occurrence ORDER BY slot_order, id
+      `).all();
+      assert.ok(rows.some((row) => row.admission === "suppressed"));
+      assert.ok(rows.some((row) => row.admission === "admitted"));
+      assert.equal(
+        Number(database.prepare(`
+          SELECT COUNT(*) AS c FROM quota_observation q
+          WHERE NOT EXISTS (
+            SELECT 1 FROM quota_occurrence o
+            WHERE o.canonical_observation_id = q.id)
+        `).get().c),
+        0,
+      );
     } finally {
       database.close();
     }
@@ -1140,6 +1627,44 @@ test("a rebuild refuses an unstated contract version", async () => {
   }
 });
 
+test("a rebuild setup failure removes its unpublished staging database", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-setup.jsonl": [sessionMeta("session-setup")],
+  });
+  try {
+    await assert.rejects(
+      build(root, { commitRows: 0 }),
+      /commitRows must be a positive safe integer/u,
+    );
+    assert.deepEqual(
+      (await readdir(root)).filter((name) => name.includes(".building-")),
+      [],
+    );
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("writers refuse to replace an unsafe published-index target", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-target.jsonl": [sessionMeta("session-target")],
+  });
+  const sentinel = join(root, "sentinel.txt");
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await writeFile(sentinel, "do-not-touch", { mode: 0o600 });
+    await symlink(sentinel, indexFile);
+    await assert.rejects(
+      build(root),
+      (error) => error?.code === "local_unified_index_file_invalid",
+    );
+    assert.equal(await readFile(sentinel, "utf8"), "do-not-touch");
+    assert.equal((await lstat(indexFile)).isSymbolicLink(), true);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 // --- Incremental ingest -----------------------------------------------------
 
 test("an incremental pass resumes a cold rebuild's cursors and reads only appended bytes", async () => {
@@ -1320,6 +1845,483 @@ test("a same-parser shrink removes stale usage and boundary rows before rescan",
   }
 });
 
+test("an unchanged incremental pass preserves the live generation and file metadata", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-unchanged.jsonl": [
+      sessionMeta("session-unchanged"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    const built = await build(root);
+    const before = await stat(indexFile);
+    const result = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    const after = await stat(indexFile);
+    assert.equal(result.unchanged, true);
+    assert.equal(result.bytesScanned, 0);
+    assert.equal(result.insertedUsageEvents, 0);
+    assert.equal(result.generation.fingerprint, built.generation.fingerprint);
+    assert.equal(after.size, before.size);
+    assert.equal(after.mtimeMs, before.mtimeMs);
+    assert.deepEqual(
+      (await readdir(root)).filter((name) => name.includes(".incremental-")),
+      [],
+    );
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("tool facts are private, generation-bound, incremental and rescan-safe", async () => {
+  const sourceName = "rollout-2026-07-25T00-00-00-tools.jsonl";
+  const privateToolName = "PRIVATE_TOOL_NAME_CANARY";
+  const privateCallId = "PRIVATE_TOOL_CALL_ID_CANARY";
+  const initialLines = [
+    sessionMeta("session-tools"),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    toolCall("2026-07-25T00:00:01.000Z", {
+      type: "function_call",
+      name: "thread_spawn",
+      call_id: privateCallId,
+    }),
+    toolCall("2026-07-25T00:00:02.000Z", {
+      type: "custom_tool_call",
+      name: privateToolName,
+      call_id: `${privateCallId}-other`,
+    }),
+  ];
+  const { root, sessions } = await corpus({ [sourceName]: initialLines });
+  const sourceFile = join(sessions, sourceName);
+  const indexFile = join(root, "index.sqlite");
+  const ingest = () => ingestLocalUnifiedIndexIncrement({
+    codexHome: root,
+    indexFile,
+    secretFile: join(root, "salt"),
+    contractVersion: CONTRACT,
+  });
+  const readFacts = () => {
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      return {
+        descriptor: readUnifiedIndexGenerationDescriptor(database),
+        facts: database.prepare(`
+          SELECT hex(event_key) AS event_key, tool_class, source_kind,
+                 source_offset, tool_ordinal, generation_id
+          FROM tool_class_fact ORDER BY source_offset, tool_ordinal`).all(),
+        compatibility: database.prepare(`
+          SELECT tool_class, SUM(count) AS count
+          FROM tool_class_count GROUP BY tool_class ORDER BY tool_class`).all()
+          .map((row) => ({
+            tool_class: row.tool_class,
+            count: Number(row.count),
+          })),
+      };
+    } finally {
+      database.close();
+    }
+  };
+  try {
+    const built = await build(root);
+    assert.equal(built.toolEvents, 2);
+    assert.equal(built.generation.toolFacts, 2);
+    assert.equal(built.generation.toolProvenanceComplete, true);
+    assert.match(built.generation.toolFactFingerprint, /^tool-facts-v1-[a-f0-9]{64}$/u);
+    const cold = readFacts();
+    assert.deepEqual(cold.facts.map((row) => row.tool_class), [
+      "subagent",
+      "other",
+    ]);
+    assert.deepEqual(cold.compatibility, [
+      { tool_class: "other", count: 1 },
+      { tool_class: "subagent", count: 1 },
+    ]);
+    const publishedBytes = await readFile(indexFile);
+    assert.equal(publishedBytes.includes(privateToolName), false);
+    assert.equal(publishedBytes.includes(privateCallId), false);
+
+    const before = await stat(indexFile);
+    const unchanged = await ingest();
+    const after = await stat(indexFile);
+    assert.equal(unchanged.unchanged, true);
+    assert.equal(unchanged.bytesScanned, 0);
+    assert.equal(after.size, before.size);
+    assert.equal(after.mtimeMs, before.mtimeMs);
+
+    await appendFile(sourceFile, `${toolCall(
+      "2026-07-25T00:00:03.000Z",
+      { type: "web_search_call", id: `${privateCallId}-server` },
+    )}\n`);
+    const appended = await ingest();
+    assert.equal(appended.sourcesResumed, 1);
+    assert.equal(appended.toolEvents, 1);
+    assert.equal(appended.generation.toolFacts, 3);
+    assert.equal(appended.generation.toolProvenanceComplete, true);
+    const afterAppend = readFacts();
+    assert.deepEqual(afterAppend.facts.slice(0, 2).map((row) => row.event_key),
+      cold.facts.map((row) => row.event_key));
+    assert.deepEqual(afterAppend.facts.map((row) => row.tool_class), [
+      "subagent",
+      "other",
+      "web_search",
+    ]);
+    assert.ok(afterAppend.facts.every((row) => (
+      row.generation_id === appended.generation.id
+    )));
+
+    await writeFile(sourceFile, `${[
+      sessionMeta("session-tools"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      toolCall("2026-07-25T00:00:04.000Z", {
+        type: "shell_call",
+        id: `${privateCallId}-replacement`,
+      }),
+    ].join("\n")}\n`);
+    const rescanned = await ingest();
+    assert.equal(rescanned.sourcesRescanned, 1);
+    assert.equal(rescanned.generation.toolFacts, 1);
+    const afterRescan = readFacts();
+    assert.deepEqual(afterRescan.facts.map((row) => row.tool_class), [
+      "hosted_shell",
+    ]);
+    assert.deepEqual(afterRescan.compatibility, [
+      { tool_class: "hosted_shell", count: 1 },
+    ]);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("an oversized typed tool record blocks complete generation publication", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-tool-limit.jsonl": [
+      sessionMeta("session-tool-limit"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      toolCall("2026-07-25T00:00:01.000Z", {
+        type: "custom_tool_call",
+        name: "exec",
+        input: `PRIVATE_OVERSIZED_TOOL_INPUT_${"x".repeat(4_096)}`,
+      }),
+    ],
+  });
+  try {
+    const built = await build(root, { maximumLineBytes: 512 });
+    assert.equal(built.generation.status, "partial");
+    assert.equal(built.generation.blockReason, "tool_provenance_incomplete");
+    assert.equal(built.generation.toolProvenanceComplete, false);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), {
+      readOnly: true,
+    });
+    try {
+      const skipped = database.prepare(`
+        SELECT count FROM source_diagnostic
+        WHERE generation_id = ? AND code = 'toolRecordsSkipped'
+      `).get(built.generation.id);
+      assert.equal(Number(skipped?.count), 1);
+      assert.equal(Number(database.prepare(
+        "SELECT COUNT(*) AS count FROM tool_class_fact",
+      ).get().count), 0);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("same-size replacement and truncation replace source usage and quota facts", async () => {
+  const sourceName = "rollout-2026-07-25T00-00-00-replaced.jsonl";
+  const initialLines = [
+    sessionMeta("session-replaced"),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount(
+      "2026-07-25T00:00:01.000Z",
+      usage(100, 10),
+      usage(100, 10),
+      { usedPercent: 12 },
+    ),
+  ];
+  const { root, sessions } = await corpus({ [sourceName]: initialLines });
+  const sourceFile = join(sessions, sourceName);
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const original = await stat(sourceFile);
+    const replacementLines = [
+      sessionMeta("session-replaced"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount(
+        "2026-07-25T00:00:01.000Z",
+        usage(900, 90),
+        usage(900, 90),
+        { usedPercent: 92 },
+      ),
+    ];
+    await writeFile(sourceFile, `${replacementLines.join("\n")}\n`);
+    assert.equal((await stat(sourceFile)).size, original.size);
+    await utimes(
+      sourceFile,
+      original.atime,
+      new Date(original.mtimeMs + 2_000),
+    );
+
+    const replaced = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(replaced.sourcesRescanned, 1);
+    assert.equal(replaced.totalUsageEvents, 1);
+    assert.equal(replaced.quotaOccurrenceRowsDeletedForRescan, 1);
+    {
+      const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+      try {
+        assert.equal(Number(database.prepare(`
+          SELECT SUM(tokens_in_uncached) AS total FROM usage_event`).get().total), 900);
+        assert.equal(Number(database.prepare(`
+          SELECT used_percent FROM quota_observation`).get().used_percent), 92);
+        assert.equal(Number(database.prepare(`
+          SELECT COUNT(*) AS count FROM quota_occurrence`).get().count), 1);
+      } finally {
+        database.close();
+      }
+    }
+
+    await writeFile(sourceFile, `${initialLines.slice(0, 2).join("\n")}\n`);
+    const truncated = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(truncated.sourcesRescanned, 1);
+    assert.equal(truncated.totalUsageEvents, 0);
+    {
+      const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+      try {
+        assert.equal(Number(database.prepare(`
+          SELECT COUNT(*) AS count FROM usage_event`).get().count), 0);
+        assert.equal(Number(database.prepare(`
+          SELECT COUNT(*) AS count FROM quota_occurrence`).get().count), 0);
+        assert.equal(Number(database.prepare(`
+          SELECT COUNT(*) AS count FROM quota_observation`).get().count), 0);
+      } finally {
+        database.close();
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a shrunken discovered source set publishes a new generation", async () => {
+  const firstName = "rollout-2026-07-25T00-00-00-source-a.jsonl";
+  const secondName = "rollout-2026-07-25T00-00-00-source-b.jsonl";
+  const { root, sessions } = await corpus({
+    [firstName]: [
+      sessionMeta("session-source-a"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+    [secondName]: [
+      sessionMeta("session-source-b"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(200, 20), usage(200, 20)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    const built = await build(root);
+    assert.equal(built.generation.discoveredSourceCount, 2);
+    await rm(join(sessions, secondName));
+
+    const result = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+
+    assert.notEqual(result.unchanged, true);
+    assert.ok(result.generation.id > built.generation.id);
+    assert.equal(result.generation.discoveredSourceCount, 1);
+    assert.equal(result.generation.indexedSourceCount, 2);
+    assert.equal(result.generation.status, "complete");
+    assert.equal(result.sources, 1);
+    assert.equal(result.sourcesSkipped, 1);
+    assert.equal(result.bytesScanned, 0);
+    assert.equal(result.totalUsageEvents, 2, "rotated raw sources remain indexed");
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.equal(Number(database.prepare(`
+        SELECT COUNT(*) AS count FROM generation_source
+        WHERE generation_id = ?`).get(result.generation.id).count), 2);
+    } finally {
+      database.close();
+    }
+    const projection = await readLocalUnifiedCompanionProjection({
+      indexFile,
+      nowMs: Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(projection.status, "available");
+    assert.equal(projection.discoveredSourceCount, 1);
+    assert.equal(projection.indexedSourceCount, 2);
+    assert.ok(projection.indexedSourceBytes > projection.discoveredSourceBytes);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a rotated pre-tool source withholds tools without blocking accounting", async () => {
+  const firstName = "rollout-2026-07-25T00-00-00-current-tools.jsonl";
+  const secondName = "rollout-2026-07-25T00-00-00-rotated-v7.jsonl";
+  const { root, sessions } = await corpus({
+    [firstName]: [
+      sessionMeta("session-current-tools"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+    [secondName]: [
+      sessionMeta("session-rotated-v7"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:02.000Z", usage(200, 20), usage(200, 20)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: false });
+    database.prepare(`
+      INSERT INTO parser_version(parser_version, contract_version)
+      VALUES ('unified-rollout-typed-v7', ?)
+      ON CONFLICT(parser_version, contract_version) DO NOTHING
+    `).run(CONTRACT);
+    const parserVersionId = database.prepare(`
+      SELECT id FROM parser_version
+      WHERE parser_version = 'unified-rollout-typed-v7'
+        AND contract_version = ?
+    `).get(CONTRACT).id;
+    const runId = database.prepare(`
+      INSERT INTO ingest_run(received_at_ms, parser_version_id)
+      VALUES (?, ?)
+    `).run(Date.parse("2026-07-25T00:00:03.000Z"), parserVersionId)
+      .lastInsertRowid;
+    database.prepare(`
+      UPDATE source_cursor SET ingest_run_id = ? WHERE source_ordinal = 1
+    `).run(runId);
+    database.close();
+    await rm(join(sessions, secondName));
+
+    const ingested = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(ingested.generation.status, "partial");
+    assert.equal(
+      ingested.generation.blockReason,
+      "tool_provenance_incomplete",
+    );
+    assert.equal(ingested.generation.usageProvenanceComplete, true);
+    assert.equal(ingested.generation.sourceOrderComplete, true);
+    assert.equal(ingested.generation.quotaProvenanceComplete, true);
+    assert.equal(ingested.generation.toolProvenanceComplete, false);
+
+    const source = createLocalUnifiedAccountingSource({
+      indexFile,
+      requireComplete: true,
+      expectedGeneration: ingested.generation,
+      contextBehavior: "legacy_zero",
+    });
+    const accounting = await source({
+      startAt: "2026-07-25T00:00:00.000Z",
+      endAt: "2026-07-26T00:00:00.000Z",
+    });
+    assert.equal(accounting.coverage.status, "complete");
+    assert.equal(accounting.coverage.generationProof, true);
+    assert.equal(accounting.coverage.toolFactsComplete, false);
+
+    const projection = await readLocalUnifiedCompanionProjection({
+      indexFile,
+      nowMs: Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(projection.status, "available");
+    assert.equal(projection.toolCoverageStatus, "partial");
+    assert.equal(projection.tools.total, 0);
+    assert.equal(projection.discoveredSourceCount, 1);
+    assert.equal(projection.indexedSourceCount, 2);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("an aborted incremental pass discards its staged clone and preserves the live index", async () => {
+  const { root, sessions } = await corpus({
+    "rollout-2026-07-25T00-00-00-abort.jsonl": [
+      sessionMeta("session-abort"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const sourceFile = join(
+    sessions,
+    "rollout-2026-07-25T00-00-00-abort.jsonl",
+  );
+  try {
+    const built = await build(root);
+    const before = await stat(indexFile);
+    await appendFile(
+      sourceFile,
+      `${tokenCountTotalOnly("2026-07-25T00:00:02.000Z", usage(150, 15))}\n`,
+    );
+    const controller = new AbortController();
+    await assert.rejects(
+      () => ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile,
+        secretFile: join(root, "salt"),
+        contractVersion: CONTRACT,
+        signal: controller.signal,
+        onProgress: () => controller.abort(),
+      }),
+      (error) => error?.code === "local_unified_index_aborted",
+    );
+    const after = await stat(indexFile);
+    assert.equal(after.size, before.size);
+    assert.equal(after.mtimeMs, before.mtimeMs);
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.equal(
+        Number(database.prepare("SELECT COUNT(*) AS c FROM usage_event").get().c),
+        built.usageEvents,
+      );
+      assert.equal(
+        Number(database.prepare(
+          "SELECT value FROM meta WHERE key = 'current_generation_id'",
+        ).get().value),
+        built.generation.id,
+      );
+    } finally {
+      database.close();
+    }
+    assert.deepEqual(
+      (await readdir(root)).filter((name) => name.includes(".incremental-")),
+      [],
+    );
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("a fork created after its parent was indexed still suppresses replay", async () => {
   // The parent is indexed in one pass, alone: nothing references it yet, so
   // no snapshot set was collected for it. The fork appears later and replays
@@ -1415,10 +2417,13 @@ test("a version-1 index is migrated additively, never rebuilt", async () => {
         DROP TABLE lineage_snapshot;
         DROP TABLE session_identity;
         DROP TABLE usage_event_boundary;
+        DROP INDEX usage_event_replay_order;
         UPDATE usage_event SET source_id = NULL, source_offset = NULL;
         ALTER TABLE usage_event DROP COLUMN source_offset;
         ALTER TABLE usage_event DROP COLUMN source_id;
         DROP TABLE source_dimension;
+        INSERT INTO meta(key, value) VALUES ('schema_version', 'local-unified-index-v1')
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value;
         PRAGMA user_version=1;
       `);
       raw.close();
@@ -1435,7 +2440,7 @@ test("a version-1 index is migrated additively, never rebuilt", async () => {
     const writable = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: false });
     assert.equal(
       Number(writable.prepare("PRAGMA user_version").get().user_version),
-      6,
+      8,
     );
     assert.equal(
       Number(writable.prepare("SELECT COUNT(*) AS c FROM usage_event").get().c),
@@ -1453,6 +2458,162 @@ test("a version-1 index is migrated additively, never rebuilt", async () => {
   }
 });
 
+test("v7 diagnostic rows survive the closed-vocabulary v8 migration", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-v7-diagnostics.jsonl": [
+      sessionMeta("session-v7-diagnostics"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const old = new DatabaseSync(indexFile);
+    const before = Number(old.prepare(
+      "SELECT COUNT(*) AS count FROM source_diagnostic",
+    ).get().count);
+    old.exec(`
+      BEGIN IMMEDIATE;
+      ALTER TABLE source_diagnostic RENAME TO source_diagnostic_v8;
+      CREATE TABLE source_diagnostic(
+        generation_id INTEGER NOT NULL REFERENCES index_generation ON DELETE CASCADE,
+        source_local BLOB NOT NULL CHECK(length(source_local) = 32),
+        code TEXT NOT NULL CHECK(code IN (
+          'relevantLines', 'malformedLines', 'malformedTimestamps',
+          'partialLines', 'salvagedRecords', 'turnContexts', 'tokenCounts',
+          'forkReplayEventsSkipped', 'unattributedForkReplayEventsSkipped',
+          'cumulativeCounterRegressions', 'tierEvents', 'modelSeededFromLineage',
+          'tierSeededFromLineage', 'modelMissing', 'oversizedLines',
+          'contradictedLeadingSnapshotsSkipped')),
+        count INTEGER NOT NULL CHECK(count >= 0),
+        PRIMARY KEY(generation_id, source_local, code)) STRICT, WITHOUT ROWID;
+      INSERT INTO source_diagnostic(generation_id, source_local, code, count)
+        SELECT generation_id, source_local, code, count
+        FROM source_diagnostic_v8
+        WHERE code NOT IN ('toolRecords', 'toolEvents', 'toolRecordsSkipped');
+      DROP TABLE source_diagnostic_v8;
+      PRAGMA user_version=7;
+      COMMIT;
+    `);
+    const retained = Number(old.prepare(
+      "SELECT COUNT(*) AS count FROM source_diagnostic",
+    ).get().count);
+    assert.ok(retained <= before);
+    old.close();
+
+    const migrated = openLocalUnifiedIndex(indexFile, { readOnly: false });
+    try {
+      assert.equal(
+        Number(migrated.prepare("PRAGMA user_version").get().user_version),
+        8,
+      );
+      assert.equal(Number(migrated.prepare(
+        "SELECT COUNT(*) AS count FROM source_diagnostic",
+      ).get().count), retained);
+      const sql = migrated.prepare(`
+        SELECT sql FROM sqlite_master
+        WHERE type = 'table' AND name = 'source_diagnostic'
+      `).get()?.sql;
+      assert.match(sql, /toolRecordsSkipped/u);
+    } finally {
+      migrated.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("the first ingest after a legacy migration publishes a clean authoritative rebuild", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-migrated.jsonl": [
+      sessionMeta("session-migrated"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount(
+        "2026-07-25T00:00:01.000Z",
+        usage(100, 10),
+        usage(100, 10),
+        { usedPercent: 12 },
+      ),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    {
+      const { DatabaseSync } = await import("node:sqlite");
+      const raw = new DatabaseSync(indexFile);
+      raw.exec(`
+        UPDATE usage_event SET source_local = NULL, source_offset = NULL,
+          source_ordinal = NULL;
+        INSERT INTO meta(key, value) VALUES ('schema_version', 'local-unified-index-v1')
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+        PRAGMA user_version=1;
+      `);
+      raw.close();
+    }
+
+    const healed = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(healed.rebuilt, true);
+    assert.equal(healed.rebuildReason, "legacy_schema");
+    assert.equal(healed.generation.status, "complete");
+    assert.equal(healed.generation.usageProvenanceComplete, true);
+    assert.equal(healed.generation.sourceOrderComplete, true);
+    assert.equal(healed.generation.quotaProvenanceComplete, true);
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.equal(Number(database.prepare(`
+        SELECT COUNT(*) AS count FROM usage_event
+        WHERE source_local IS NULL OR source_offset IS NULL
+          OR source_ordinal IS NULL`).get().count), 0);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("an additively widened but unattested generation rebuilds in one refresh", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-unattested.jsonl": [
+      sessionMeta("session-unattested"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    {
+      const database = openLocalUnifiedIndex(indexFile, { readOnly: false });
+      database.prepare(`
+        UPDATE index_generation SET usage_provenance_complete = 0,
+          source_order_complete = 0, quota_provenance_complete = 0
+        WHERE id = (SELECT CAST(value AS INTEGER) FROM meta
+                    WHERE key = 'current_generation_id')`).run();
+      database.close();
+    }
+    const healed = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(healed.rebuilt, true);
+    assert.equal(healed.rebuildReason, "incomplete_generation");
+    assert.equal(healed.generation.status, "complete");
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("classifySource maps growth, touch, shrink and novelty to the right work", () => {
   const info = { size: 100, mtimeMs: 5 };
   assert.deepEqual(classifySource(info, undefined), { mode: "rescan" });
@@ -1462,7 +2623,7 @@ test("classifySource maps growth, touch, shrink and novelty to the right work", 
   );
   assert.deepEqual(
     classifySource(info, { size_bytes: 100, mtime_ms: 4 }),
-    { mode: "touch" },
+    { mode: "rescan", reason: "same_size_changed" },
   );
   assert.deepEqual(
     classifySource(info, { size_bytes: 60, mtime_ms: 5 }),
@@ -1505,7 +2666,7 @@ test("classifySource forces a whole-file rescan for cursors stamped by an older 
   }
 });
 
-test("a v5 development cursor migrates to v6 and backfills nullable source order", async () => {
+test("a v5 development cursor migrates to v8 with complete source order", async () => {
   const { root } = await corpus({
     "rollout-2026-07-25T00-00-00-aaaa.jsonl": [
       sessionMeta("session-a"),
@@ -1545,6 +2706,9 @@ test("a v5 development cursor migrates to v6 and backfills nullable source order
     assert.equal(healed.sourcesReparsedForParserVersion, 1);
     assert.equal(healed.usageRowsDeletedForReparse, 2);
     assert.equal(healed.boundaryRowsDeletedForReparse, 2);
+    assert.equal(healed.generation.status, "complete");
+    assert.equal(healed.generation.usageProvenanceComplete, true);
+    assert.equal(healed.generation.sourceOrderComplete, true);
     assert.equal(healed.sourcesRescanned, 1);
     assert.equal(healed.insertedUsageEvents, 2);
     assert.equal(healed.insertedBoundaryLinks, 2);
@@ -1553,14 +2717,18 @@ test("a v5 development cursor migrates to v6 and backfills nullable source order
     try {
       assert.equal(
         Number(database.prepare("PRAGMA user_version").get().user_version),
-        6,
+        8,
       );
       assert.equal(
         Number(database.prepare(`
           SELECT COUNT(*) AS c FROM usage_event
-          WHERE source_id IS NULL OR source_offset IS NULL`).get().c),
+          WHERE source_id IS NULL OR source_local IS NULL
+            OR source_offset IS NULL OR source_ordinal IS NULL`).get().c),
         0,
       );
+      assert.equal(Number(database.prepare(
+        "SELECT COUNT(*) AS c FROM usage_event_boundary",
+      ).get().c), 2);
       assert.deepEqual(database.prepare(`
         SELECT DISTINCT parser.parser_version
         FROM usage_event event
@@ -1658,6 +2826,95 @@ test("a parser-version bump re-derives poisoned sources and replaces their rows"
     assert.equal(settled.sourcesSkipped, 1);
     assert.equal(settled.insertedUsageEvents, 0);
     assert.equal(settled.insertedBoundaryLinks, 0);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("parser healing preserves stored shared-session sibling facts and quota occurrences", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-segment-a.jsonl": [
+      sessionMeta("session-segment-a"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount(
+        "2026-07-25T00:00:01.000Z",
+        usage(100, 10),
+        usage(100, 10),
+        { usedPercent: 12 },
+      ),
+    ],
+    "rollout-2026-07-25T00-00-00-segment-b.jsonl": [
+      sessionMeta("session-segment-b"),
+      turnContext("2026-07-25T00:01:00.000Z", "gpt-5.6-sol"),
+      tokenCount(
+        "2026-07-25T00:01:01.000Z",
+        usage(200, 20),
+        usage(200, 20),
+        { usedPercent: 22 },
+      ),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    {
+      const database = openLocalUnifiedIndex(indexFile, { readOnly: false });
+      database.prepare(`
+        INSERT INTO parser_version(parser_version, contract_version)
+        VALUES ('unified-rollout-typed-v1', ?)
+        ON CONFLICT DO NOTHING`).run(CONTRACT);
+      const parserId = Number(database.prepare(`
+        SELECT id FROM parser_version
+        WHERE parser_version = 'unified-rollout-typed-v1'
+          AND contract_version = ?`).get(CONTRACT).id);
+      const ingestRunId = Number(database.prepare(`
+        INSERT INTO ingest_run(received_at_ms, parser_version_id)
+        VALUES (?, ?)`).run(Date.now(), parserId).lastInsertRowid);
+      const sources = database.prepare(`
+        SELECT source_local, session_local FROM source_cursor
+        ORDER BY source_ordinal`).all();
+      const firstSource = sources[0];
+      const secondSource = sources[1];
+      database.prepare(`
+        UPDATE source_cursor SET ingest_run_id = ? WHERE source_local = ?`)
+        .run(ingestRunId, firstSource.source_local);
+      // Model a migrated segmented session: two distinct rollout sources share
+      // one stored session key. The old session-wide parser repair deleted both
+      // sources while rescanning only the stale one.
+      database.prepare(`
+        UPDATE source_cursor SET session_local = ? WHERE source_local = ?`)
+        .run(firstSource.session_local, secondSource.source_local);
+      database.prepare(`
+        UPDATE usage_event SET session_local = ? WHERE source_local = ?`)
+        .run(firstSource.session_local, secondSource.source_local);
+      database.close();
+    }
+
+    const healed = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(healed.sourcesReparsedForParserVersion, 1);
+    assert.equal(healed.sourcesRescanned, 1);
+    assert.equal(healed.totalUsageEvents, 2);
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.equal(Number(database.prepare(`
+        SELECT COUNT(*) AS count FROM usage_event`).get().count), 2);
+      assert.equal(Number(database.prepare(`
+        SELECT SUM(tokens_in_uncached) AS total FROM usage_event`).get().total), 300);
+      assert.equal(Number(database.prepare(`
+        SELECT COUNT(*) AS count FROM quota_occurrence`).get().count), 2);
+      assert.equal(Number(database.prepare(`
+        SELECT COUNT(*) AS count FROM quota_observation q
+        WHERE NOT EXISTS (
+          SELECT 1 FROM quota_occurrence o
+          WHERE o.canonical_observation_id = q.id)`).get().count), 0);
+    } finally {
+      database.close();
+    }
   } finally {
     await rm(root, { recursive: true });
   }

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
+import { DatabaseSync } from "node:sqlite";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,8 +16,11 @@ import {
   migrateLegacyLocalCollectorState,
   planLocalCollectorStateRetention,
   prepareLocalCollectorState,
+  LOCAL_COLLECTOR_LEGACY_REFRESH_USE_MAX,
+  readLocalCollectorLegacyRefreshUse,
   readLocalCollectorRolloutStalenessSummary,
   readLocalCollectorState,
+  recordLocalCollectorLegacyRefreshAttempt,
 } from "../src/local-collector-state.js";
 import { stableJson } from "../src/storage.js";
 
@@ -92,6 +96,99 @@ test("SQLite commits collector records and checkpoints atomically", async () => 
     if (process.platform !== "win32") {
       assert.equal((await stat(value.stateFile)).mode & 0o777, 0o600);
     }
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("legacy refresh-use receipt increments durably in one fixed meta row", async () => {
+  const value = await fixture();
+  try {
+    const first = await recordLocalCollectorLegacyRefreshAttempt({
+      stateFile: value.stateFile,
+      clock: () => Date.parse("2026-08-03T00:00:00.000Z"),
+    });
+    assert.deepEqual(first, {
+      schemaVersion: "local-collector-legacy-refresh-use-v1",
+      sourceMode: "legacy",
+      attempts: 1,
+      saturated: false,
+      lastAttemptedAt: "2026-08-03T00:00:00.000Z",
+    });
+    const second = await recordLocalCollectorLegacyRefreshAttempt({
+      stateFile: value.stateFile,
+      clock: () => Date.parse("2026-08-03T00:01:00.000Z"),
+    });
+    assert.equal(second.attempts, 2);
+    assert.equal(
+      (await readLocalCollectorLegacyRefreshUse({ stateFile: value.stateFile }))
+        .receipt.lastAttemptedAt,
+      "2026-08-03T00:01:00.000Z",
+    );
+    const state = await readLocalCollectorState({
+      stateFile: value.stateFile,
+      includeRecords: false,
+    });
+    assert.deepEqual(state.legacyRefreshUse, second);
+    const database = new DatabaseSync(value.stateFile, { readOnly: true });
+    const rowCount = Number(database.prepare(
+      "SELECT COUNT(*) AS count FROM meta WHERE key = 'legacy_refresh_use'",
+    ).get().count);
+    database.close();
+    assert.equal(rowCount, 1);
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("legacy refresh-use receipt saturates without growing rows and rejects corrupt shape", async () => {
+  const value = await fixture();
+  try {
+    await recordLocalCollectorLegacyRefreshAttempt({
+      stateFile: value.stateFile,
+      clock: () => Date.parse("2026-08-03T00:00:00.000Z"),
+    });
+    let database = new DatabaseSync(value.stateFile, { readOnly: false });
+    database.prepare(
+      "UPDATE meta SET value_json = ? WHERE key = 'legacy_refresh_use'",
+    ).run(JSON.stringify({
+      schemaVersion: "local-collector-legacy-refresh-use-v1",
+      sourceMode: "legacy",
+      attempts: LOCAL_COLLECTOR_LEGACY_REFRESH_USE_MAX - 1,
+      saturated: false,
+      lastAttemptedAt: "2026-08-03T00:00:00.000Z",
+    }));
+    database.close();
+
+    const saturated = await recordLocalCollectorLegacyRefreshAttempt({
+      stateFile: value.stateFile,
+      clock: () => Date.parse("2026-08-03T00:02:00.000Z"),
+    });
+    assert.equal(saturated.attempts, LOCAL_COLLECTOR_LEGACY_REFRESH_USE_MAX);
+    assert.equal(saturated.saturated, true);
+    const stillSaturated = await recordLocalCollectorLegacyRefreshAttempt({
+      stateFile: value.stateFile,
+      clock: () => Date.parse("2026-08-03T00:03:00.000Z"),
+    });
+    assert.equal(stillSaturated.attempts, LOCAL_COLLECTOR_LEGACY_REFRESH_USE_MAX);
+    assert.equal(stillSaturated.lastAttemptedAt, "2026-08-03T00:03:00.000Z");
+
+    database = new DatabaseSync(value.stateFile, { readOnly: true });
+    const rowCount = Number(database.prepare(
+      "SELECT COUNT(*) AS count FROM meta WHERE key = 'legacy_refresh_use'",
+    ).get().count);
+    database.close();
+    assert.equal(rowCount, 1);
+
+    database = new DatabaseSync(value.stateFile, { readOnly: false });
+    database.prepare(
+      "UPDATE meta SET value_json = ? WHERE key = 'legacy_refresh_use'",
+    ).run(JSON.stringify({ attempts: "not-a-count" }));
+    database.close();
+    await assert.rejects(
+      () => readLocalCollectorLegacyRefreshUse({ stateFile: value.stateFile }),
+      { code: "local_collector_state_corrupt" },
+    );
   } finally {
     await rm(value.root, { recursive: true, force: true });
   }

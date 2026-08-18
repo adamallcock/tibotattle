@@ -2,7 +2,10 @@ import { availableParallelism } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { Worker } from "node:worker_threads";
 
-import { discoverCodexRolloutInfos } from "./codex-log-scan.js";
+import {
+  createLeadingRateLimitGate,
+  discoverCodexRolloutInfos,
+} from "./codex-log-scan.js";
 import { recognizedExportModelId } from "./export/index.js";
 import {
   createLineageSnapshots,
@@ -11,7 +14,11 @@ import {
   ownObservedTier,
 } from "./local-unified-index-extract.js";
 import {
+  assertSafeLocalUnifiedIndexTarget,
   createUnifiedIndexWriter,
+  createLocalUnifiedIndexSecondaryIndexes,
+  beginUnifiedIndexGeneration,
+  recoverUnifiedIndexGenerations,
   defaultLocalUnifiedIndexPath,
   defaultLocalUnifiedIndexSecretPath,
   localDigest,
@@ -19,6 +26,7 @@ import {
   outcomeOrdinal,
   publishStagedUnifiedIndex,
   readOrCreateDeviceSalt,
+  readUnifiedIndexGenerationDescriptor,
   reasoningEffortOrdinal,
   removeIfPresent,
   sessionLocal,
@@ -197,6 +205,7 @@ export function writeCursorForOutcome(writer, deviceSalt, info, state, {
 }) {
   writer.writeSourceCursor({
     sourceLocal: sourceLocal(deviceSalt, info.rolloutKey),
+    sourceOrdinal: state.sourceOrdinal ?? null,
     sessionLocal: state.sessionLocal,
     scannedBytes: nextOffset,
     sizeBytes: Number(info.size ?? 0),
@@ -240,19 +249,57 @@ function eventKeyFor(deviceSalt, sessionLocalKey, sourceOffset, observedAtMs) {
   return localDigest(
     deviceSalt,
     "unified-index-event",
-    `${sessionLocalKey.toString("hex")} ${sourceOffset} ${observedAtMs}`,
+    `${sessionLocalKey.toString("hex")}\0${sourceOffset}\0${observedAtMs}`,
   );
 }
 
-export function createEventSink({ writer, deviceSalt, accountScopeId, onCounts }) {
+function toolFactKey(deviceSalt, sourceLocalKey, sourceOffset, toolOrdinal) {
+  return localDigest(
+    deviceSalt,
+    "unified-index-tool-event",
+    `${Buffer.from(sourceLocalKey).toString("hex")}\0${sourceOffset}\0${toolOrdinal}`,
+  );
+}
+
+export function createEventSink({
+  writer,
+  deviceSalt,
+  accountScopeId,
+  generationId = null,
+  onCounts,
+}) {
   const counts = {
     usageEvents: 0,
     boundaryLinks: 0,
     quotaObservations: 0,
+    quotaOccurrences: 0,
+    contradictedLeadingSnapshotsSkipped: 0,
+    toolEvents: 0,
     modelMissing: 0,
     modelUnrecognized: 0,
     partialEvents: 0,
   };
+  const gates = new Map();
+  const settled = new Map();
+  const sourceSuppressed = new Map();
+
+  function gateFor(source) {
+    const key = source.sourceLocal.toString("hex");
+    let gate = gates.get(key);
+    if (gate !== undefined) return gate;
+    const windows = settled.get(key)
+      ?? writer.loadSettledQuotaWindows(source.sourceLocal);
+    settled.set(key, windows);
+    gate = createLeadingRateLimitGate(windows);
+    gates.set(key, gate);
+    return gate;
+  }
+
+  function occurrence(entry, admission) {
+    writer.writeQuotaOccurrence({ ...entry, generationId, admission });
+    if (admission === "admitted") counts.quotaOccurrences += 1;
+  }
+
   return {
     counts,
     write(source, event) {
@@ -261,14 +308,54 @@ export function createEventSink({ writer, deviceSalt, accountScopeId, onCounts }
       if (declaration.recognition === "unrecognized") counts.modelUnrecognized += 1;
       if (event.partial) counts.partialEvents += 1;
       let quotaObservationId = null;
-      for (const window of event.quota) {
+      const gate = gateFor(source);
+      for (const [slotOrder, window] of event.quota.entries()) {
         const id = writer.internQuota(window);
         counts.quotaObservations += 1;
-        // A token_count record can report a primary and a secondary window.
-        // The event references the primary pairing, which is the one the
-        // calibration reads; both remain in the quota series.
         if (quotaObservationId === null || window.slot === "primary") {
           quotaObservationId = id;
+        }
+        const entry = {
+          sourceLocal: source.sourceLocal,
+          sourceOffset: event.sourceOffset,
+          sourceOrdinal: source.sourceOrdinal,
+          surfaceId: source.surfaceId,
+          canonicalObservationId: id,
+          observedAtMs: window.observedAtMs,
+          provider: "openai_codex",
+          planType: window.planType ?? null,
+          limitId: window.limitId,
+          slot: window.slot,
+          slotOrder,
+          usedPercent: window.usedPercent,
+          resetsAtMs: window.resetsAtMs ?? null,
+          durationMins: window.durationMins,
+        };
+        // The replay callback contract requires a positive reset epoch. Keep
+        // the canonical observation for diagnostics, but never admit a
+        // reset-less window into the source-scoped callback series.
+        if (entry.resetsAtMs === null || entry.resetsAtMs <= 0) {
+          occurrence(entry, "suppressed");
+          continue;
+        }
+        const decision = gate.offer({
+          provider: entry.provider,
+          planType: entry.planType,
+          limitId: entry.limitId,
+          slot: entry.slot,
+          usedPercent: entry.usedPercent,
+          resetsAt: entry.resetsAtMs,
+          windowDurationMins: entry.durationMins,
+        }, entry.observedAtMs, entry);
+        for (const withheld of decision.withheld) {
+          counts.contradictedLeadingSnapshotsSkipped += 1;
+          const key = source.sourceLocal.toString("hex");
+          sourceSuppressed.set(key, (sourceSuppressed.get(key) ?? 0) + 1);
+          occurrence(withheld, "suppressed");
+        }
+        for (const released of decision.released) occurrence(released, "admitted");
+        if (decision.released.length === 0 && decision.withheld.length === 0) {
+          occurrence(entry, "held");
         }
       }
       const components = event.components;
@@ -282,33 +369,27 @@ export function createEventSink({ writer, deviceSalt, accountScopeId, onCounts }
         sourceId: source.sourceId,
         sourceOffset: event.sourceOffset,
         observedAtMs: event.observedAtMs,
+        generationId,
+        sourceLocal: source.sourceLocal,
+        sourceOffset: event.sourceOffset,
+        sourceOrdinal: source.sourceOrdinal,
+        tierObservedAtMs: event.tier?.observedAtMs ?? null,
         sessionLocal: source.sessionLocal,
         accountScopeId,
         modelId: writer.internModel(declaration.modelId, declaration.recognition),
         tierId: writer.internTier(tierRow(event.tier)),
-        surfaceId: writer.internSurface(source.surface),
+        surfaceId: source.surfaceId,
         quotaObservationId,
         reasoningEffort: reasoningEffortOrdinal(event.reasoningEffort ?? "unknown"),
-        // Codex rollout logs do not report a turn outcome. `unknown` is the
-        // contract's own member for that, and is not a stand-in for failure.
         outcome: outcomeOrdinal("unknown"),
         tokensInUncached: components?.inputUncachedTokens ?? null,
         tokensInCacheRead: components?.inputCacheReadTokens ?? null,
         tokensInCacheWrite: components?.inputCacheWriteTokens ?? null,
-        // Codex does not split cache writes by TTL and does not report a
-        // combined output figure. NULL is the honest value; a zero here would
-        // be indistinguishable from an observed zero, and the pricing tests
-        // deliberately pin the missing-TTL-split failure mode.
         tokensInCacheWrite5m: null,
         tokensInCacheWrite1h: null,
         tokensOutText: components?.outputTextTokens ?? null,
         tokensOutReasoning: components?.outputReasoningTokens ?? null,
         tokensOutCombined: null,
-        // Provider-reported only. Codex reports `model_context_window` (a
-        // property of the model, not of the turn) and the component counts
-        // whose sum we must never promote into a pricing band. Decision 1 of
-        // the agreed design requires NULL to stay distinguishable from a real
-        // provider total, so NULL is what it gets.
         totalInputContext: null,
         partial: event.partial === true,
       });
@@ -329,6 +410,37 @@ export function createEventSink({ writer, deviceSalt, accountScopeId, onCounts }
         sessionLocal: source.sessionLocal,
       });
       counts.boundaryLinks += 1;
+    },
+    writeTool(source, event) {
+      const inserted = writer.writeToolClassFact({
+        eventKey: toolFactKey(
+          deviceSalt,
+          source.sourceLocal,
+          event.sourceOffset,
+          event.toolOrdinal,
+        ),
+        generationId,
+        sourceLocal: source.sourceLocal,
+        sourceOffset: event.sourceOffset,
+        sourceOrdinal: source.sourceOrdinal,
+        sessionLocal: source.sessionLocal,
+        observedAtMs: event.observedAtMs,
+        toolOrdinal: event.toolOrdinal,
+        toolClass: event.toolClass,
+        sourceKind: event.sourceKind,
+      });
+      counts.toolEvents += inserted;
+    },
+    finishSource(source) {
+      const gate = gates.get(source.sourceLocal.toString("hex"));
+      if (gate === undefined) return;
+      for (const entry of gate.flush()) occurrence(entry, "admitted");
+    },
+    diagnosticsForSource(source) {
+      return {
+        contradictedLeadingSnapshotsSkipped:
+          sourceSuppressed.get(source.sourceLocal.toString("hex")) ?? 0,
+      };
     },
   };
 }
@@ -404,6 +516,7 @@ export async function rebuildLocalUnifiedIndex({
   contractVersion,
   workerCount = 1,
   commitRows = 10_000,
+  deferSecondaryIndexes = true,
   maximumLineBytes,
   signal = null,
   onProgress = null,
@@ -419,8 +532,14 @@ export async function rebuildLocalUnifiedIndex({
       || workerCount > MAXIMUM_WORKERS) {
     throw new TypeError(`workerCount must be between 1 and ${MAXIMUM_WORKERS}`);
   }
+  if (typeof deferSecondaryIndexes !== "boolean") {
+    throw new TypeError("deferSecondaryIndexes must be a boolean");
+  }
   const startedAt = performance.now();
   const resolvedIndexFile = resolve(indexFile);
+  await assertSafeLocalUnifiedIndexTarget(resolvedIndexFile, {
+    allowMissing: true,
+  });
   const deviceSalt = await readOrCreateDeviceSalt(
     secretFile ?? defaultLocalUnifiedIndexSecretPath(resolvedIndexFile),
   );
@@ -436,27 +555,57 @@ export async function rebuildLocalUnifiedIndex({
 
   const stageFile = `${resolvedIndexFile}.building-${process.pid}-${Date.now().toString(36)}`;
   await removeIfPresent(stageFile);
-  const database = openLocalUnifiedIndex(stageFile, {
-    readOnly: false,
-    create: true,
-    staging: true,
-  });
-  const writer = createUnifiedIndexWriter(database, {
-    commitRows,
-    contractVersion,
-  });
+  let database = null;
+  let generation = null;
+  let writer = null;
+  let sink = null;
+  try {
+    database = openLocalUnifiedIndex(stageFile, {
+      readOnly: false,
+      create: true,
+      staging: true,
+      deferSecondaryIndexes,
+    });
+    recoverUnifiedIndexGenerations(database);
+    generation = beginUnifiedIndexGeneration(database, {
+      contractVersion,
+      discoveredSourceCount: infos.length,
+      discoveredSourceBytes: sourceBytes,
+    });
+    writer = createUnifiedIndexWriter(database, {
+      commitRows,
+      contractVersion,
+      generationId: generation.generationId,
+      parserVersionId: generation.parserVersionId,
+      ingestRunId: generation.ingestRunId,
+    });
 
-  // Rollout logs carry no account identity at all; the account scope the
-  // collector attaches comes from a contemporaneous app-server marker, which a
-  // historical rebuild has no honest way to reconstruct.
-  const accountScopeId = writer.internAccountScope({
-    status: "unavailable",
-    reason: "missing_account",
-    planType: null,
-    scopeLocal: null,
-  });
+    // Rollout logs carry no account identity at all; the account scope the
+    // collector attaches comes from a contemporaneous app-server marker, which a
+    // historical rebuild has no honest way to reconstruct.
+    const accountScopeId = writer.internAccountScope({
+      status: "unavailable",
+      reason: "missing_account",
+      planType: null,
+      scopeLocal: null,
+    });
 
-  const sink = createEventSink({ writer, deviceSalt, accountScopeId, onCounts: null });
+    sink = createEventSink({
+      writer,
+      deviceSalt,
+      accountScopeId,
+      generationId: generation.generationId,
+      onCounts: null,
+    });
+  } catch (error) {
+    try {
+      database?.close();
+    } catch {
+      // Preserve the setup failure; the incomplete stage is discarded below.
+    }
+    await removeIfPresent(stageFile);
+    throw error;
+  }
   const diagnostics = {
     sources: infos.length,
     sourceBytes,
@@ -474,18 +623,24 @@ export async function rebuildLocalUnifiedIndex({
     peakRetainedSnapshotKeys: 0,
   };
 
+  const sourceOrdinals = new Map(
+    infos.map((info, ordinal) => [info.rolloutKey, ordinal]),
+  );
   const sourceState = new Map();
   function stateFor(info) {
     const key = info.rolloutKey;
     let state = sourceState.get(key);
     if (state === undefined) {
       const sessionId = info.lineage?.sessionId ?? info.rolloutKey;
-      const sourceKey = sourceLocal(deviceSalt, info.rolloutKey);
+      const local = sourceLocal(deviceSalt, info.rolloutKey);
+      const surface = surfaceRow(info.lineage?.surfaceClassification);
       state = {
         sessionLocal: sessionLocal(deviceSalt, sessionId),
-        sourceLocal: sourceKey,
-        sourceId: writer.internSource(sourceKey),
-        surface: surfaceRow(info.lineage?.surfaceClassification),
+        sourceLocal: local,
+        sourceId: writer.internSource(local),
+        sourceOrdinal: sourceOrdinals.get(info.rolloutKey),
+        surface,
+        surfaceId: writer.internSurface(surface),
         finalModel: null,
         finalEffort: null,
         finalTier: null,
@@ -494,6 +649,16 @@ export async function rebuildLocalUnifiedIndex({
       // decision). The writer refuses anything that is not UUID-shaped, so a
       // rollout-key fallback id is never recorded.
       writer.recordSessionIdentity(state.sessionLocal, sessionId);
+      writer.writeGenerationSource({
+        sourceLocal: local,
+        sourceOrdinal: state.sourceOrdinal,
+        sessionLocal: state.sessionLocal,
+        surfaceId: state.surfaceId,
+        status: "pending",
+        discoveredSizeBytes: Number(info.size ?? 0),
+        scannedBytes: 0,
+        mtimeMs: Math.floor(Number(info.mtimeMs ?? 0)),
+      });
       sourceState.set(key, state);
     }
     return state;
@@ -553,10 +718,12 @@ export async function rebuildLocalUnifiedIndex({
               signal,
               onEvent: (event) => sink.write(state, event),
               onBoundary: (event) => sink.writeBoundary(state, event),
+              onTool: (event) => sink.writeTool(state, event),
             });
             state.finalModel = outcome.finalModel;
             state.finalEffort = outcome.finalEffort;
             state.finalTier = outcome.finalTier;
+            sink.finishSource(state);
             writeCursorForOutcome(writer, deviceSalt, info, state, {
               nextOffset: outcome.read.nextOffset,
               finalModel: outcome.finalModel,
@@ -571,6 +738,22 @@ export async function rebuildLocalUnifiedIndex({
               finalTurnContextPending: outcome.finalTurnContextPending,
               turnContextSeen: outcome.finalTurnContextSeen,
               snapshotsPersisted: collector !== null,
+            });
+            writer.writeSourceDiagnostics(state.sourceLocal, {
+              ...outcome.diagnostics,
+              oversizedLines: outcome.read.oversizedLines,
+              ...sink.diagnosticsForSource(state),
+            });
+            writer.writeGenerationSource({
+              sourceLocal: state.sourceLocal,
+              sourceOrdinal: state.sourceOrdinal,
+              sessionLocal: state.sessionLocal,
+              surfaceId: state.surfaceId,
+              status: "complete",
+              discoveredSizeBytes: Number(info.size ?? 0),
+              scannedBytes: outcome.read.nextOffset,
+              mtimeMs: Math.floor(Number(info.mtimeMs ?? 0)),
+              diagnosticsComplete: true,
             });
             diagnostics.sourcesScanned += 1;
             diagnostics.bytesScanned += Number(info.size ?? 0);
@@ -599,6 +782,9 @@ export async function rebuildLocalUnifiedIndex({
           for (const event of message.boundaries ?? []) {
             sink.writeBoundary(state, event);
           }
+          for (const event of message.tools ?? []) {
+            sink.writeTool(state, event);
+          }
           for (const key of message.snapshotKeys ?? []) {
             writer.addLineageSnapshot(
               state.sessionLocal,
@@ -606,6 +792,7 @@ export async function rebuildLocalUnifiedIndex({
             );
           }
           if (message.final === true) {
+            sink.finishSource(state);
             if (message.cursor) {
               writeCursorForOutcome(
                 writer,
@@ -615,6 +802,22 @@ export async function rebuildLocalUnifiedIndex({
                 message.cursor,
               );
             }
+            writer.writeSourceDiagnostics(state.sourceLocal, {
+              ...message.diagnostics,
+              oversizedLines: message.diagnostics.oversizedLines,
+              ...sink.diagnosticsForSource(state),
+            });
+            writer.writeGenerationSource({
+              sourceLocal: state.sourceLocal,
+              sourceOrdinal: state.sourceOrdinal,
+              sessionLocal: state.sessionLocal,
+              surfaceId: state.surfaceId,
+              status: "complete",
+              discoveredSizeBytes: Number(info.size ?? 0),
+              scannedBytes: Number(message.cursor?.nextOffset ?? info.size ?? 0),
+              mtimeMs: Math.floor(Number(info.mtimeMs ?? 0)),
+              diagnosticsComplete: true,
+            });
             diagnostics.sourcesScanned += 1;
             diagnostics.bytesScanned += Number(info.size ?? 0);
             accumulate(
@@ -633,18 +836,43 @@ export async function rebuildLocalUnifiedIndex({
     }
 
     const scannedAt = performance.now();
+    if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+    if (deferSecondaryIndexes) {
+      // All fact writes are settled before SQLite builds the reader-only
+      // indexes in one fixed-order operation. Primary/UNIQUE indexes remain
+      // online throughout the load because the writer's conflict semantics
+      // depend on them.
+      writer.flush();
+      createLocalUnifiedIndexSecondaryIndexes(database);
+    }
     writer.writeMeta("source_count", infos.length);
     writer.writeMeta("source_bytes", sourceBytes);
     writer.writeMeta("usage_events", sink.counts.usageEvents);
     writer.writeMeta("boundary_links", sink.counts.boundaryLinks);
     writer.writeMeta("generated_at", new Date().toISOString());
     writer.writeMeta("contract_version", contractVersion);
-    writer.writeMeta("status", signal?.aborted ? "partial" : "complete");
+    if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+    writer.writeMeta("status", "complete");
+    writer.finalizeGeneration({
+      status: "complete",
+      discoveredSourceCount: infos.length,
+      discoveredSourceBytes: sourceBytes,
+      indexedSourceCount: infos.length,
+      indexedSourceBytes: sourceBytes,
+      discoveryComplete: true,
+      diagnosticsComplete: true,
+    });
+    const generationDescriptor = readUnifiedIndexGenerationDescriptor(
+      database,
+      generation.generationId,
+    );
     const closed = await writer.close({ integrityCheck: true, fsyncPath: null });
     await publishStagedUnifiedIndex(stageFile, resolvedIndexFile);
     return {
       status: "built",
       indexFile: resolvedIndexFile,
+      generation: generationDescriptor,
+      generationDescriptor,
       ...diagnostics,
       ...sink.counts,
       batches: closed.batches,
@@ -656,7 +884,15 @@ export async function rebuildLocalUnifiedIndex({
     };
   } catch (error) {
     try {
-      database.close();
+      writer?.failGeneration(error?.code === "local_unified_index_aborted"
+        ? "aborted"
+        : "exception");
+    } catch {
+      // The staging file is discarded below; an uncommitted generation cannot
+      // affect the live publication.
+    }
+    try {
+      database?.close();
     } catch {
       // The connection may already be closed by the writer.
     }

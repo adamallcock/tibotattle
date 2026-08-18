@@ -2060,10 +2060,123 @@ function timelineAllowanceWeightingEncoding(preference) {
   };
 }
 
+function completeUnifiedGeneration(value) {
+  const accountingStatus = value?.status === "complete"
+    || (value?.status === "partial"
+      && value?.blockReason === "tool_provenance_incomplete"
+      && value?.toolProvenanceComplete === false);
+  return value
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Number.isSafeInteger(value.id)
+    && value.id >= 1
+    && accountingStatus
+    && value.discoveryComplete === true
+    && value.diagnosticsComplete === true
+    && value.usageProvenanceComplete === true
+    && value.sourceOrderComplete === true
+    && value.quotaProvenanceComplete === true;
+}
+
+function safeHistoryCoveredAt(value) {
+  const startAt = typeof value?.startAt === "string" ? value.startAt : null;
+  const endAt = typeof value?.endAt === "string" ? value.endAt : null;
+  return Number.isFinite(Date.parse(startAt ?? ""))
+      && Number.isFinite(Date.parse(endAt ?? ""))
+      && Date.parse(startAt) <= Date.parse(endAt)
+    ? { startAt, endAt }
+    : { startAt: null, endAt: null };
+}
+
+function insufficientEvidenceUsagePeriods() {
+  return [
+    ["24h", "Last 24 hours"],
+    ["7d", "Last 7 days"],
+    ["30d", "Last 30 days"],
+    ["all", RECENT_COLLECTOR_PERIOD_LABEL],
+  ].map(([id, label]) => finalizeUsagePeriod(newUsagePeriod(id, label)));
+}
+
+function unifiedPartialReason(unified) {
+  return unified?.indexStatus === "partial"
+    ? "unified_index_partial"
+    : "unified_index_generation_incomplete";
+}
+
+function unifiedHistoryState({ cache, unified, cacheErrorCode }) {
+  const history = cache?.history;
+  const descriptor = cache?.sourceDescriptor;
+  const generationMatched = descriptor?.generationMatched === true;
+  const available = history?.status === "available"
+    && history.period !== null
+    && history.coverage?.status === "complete"
+    && descriptor?.coverageStatus === "complete"
+    && generationMatched;
+  const sourceCount = Number.isSafeInteger(unified?.discoveredSourceCount)
+    && unified.discoveredSourceCount >= 0
+    ? unified.discoveredSourceCount
+    : 0;
+  const sourceBytes = Number.isSafeInteger(unified?.discoveredSourceBytes)
+    && unified.discoveredSourceBytes >= 0
+    ? unified.discoveredSourceBytes
+    : 0;
+  const indexedSourceCount = Number.isSafeInteger(unified?.indexedSourceCount)
+    && unified.indexedSourceCount >= 0
+    ? unified.indexedSourceCount
+    : 0;
+  const indexedSourceBytes = Number.isSafeInteger(unified?.indexedSourceBytes)
+    && unified.indexedSourceBytes >= 0
+    ? unified.indexedSourceBytes
+    : 0;
+  const coveredAt = safeHistoryCoveredAt(history?.coverage?.coveredAt);
+  const errorCode = available
+    ? null
+    : typeof history?.errorCode === "string"
+      ? history.errorCode
+      : typeof cacheErrorCode === "string"
+        ? cacheErrorCode
+        : "accounting_unified_history_unavailable";
+  return {
+    accounting: available
+      ? {
+        status: "available",
+        errorCode: null,
+        generatedAt: history.coverage.generatedAt,
+        coveredAt,
+        period: history.period,
+      }
+      : {
+        status: "unavailable",
+        errorCode,
+        generatedAt: null,
+        coveredAt,
+        period: null,
+      },
+    coverage: {
+      status: available ? "complete" : "partial",
+      phase: available ? "complete" : cache === null ? "not_started" : "unavailable",
+      errorCode,
+      generatedAt: available ? history.coverage.generatedAt : null,
+      coveredAt,
+      sourceCount,
+      indexedSourceCount,
+      pendingSourceCount: Math.max(0, sourceCount - indexedSourceCount),
+      sourceBytes,
+      indexedBytes: indexedSourceBytes,
+      sourceMode: "unified",
+      generationMatched,
+    },
+  };
+}
+
 export async function buildLocalCompanionSnapshot({
   root = process.cwd(),
   collectorStateFile = defaultLocalCollectorStatePath(root),
   archiveIndexFile = defaultLocalArchiveAccountingIndexPath(root),
+  // The legacy default is a direct compatibility/test seam; production always
+  // passes its composition-root selection. Unified mode sources history from
+  // the generation-bound cache and never touches the old archive database.
+  accountingSourceMode = "legacy",
   // The unified local index. When it is present the "All" period and the
   // timelines draw from its whole fork-replay-suppressed history; when it is
   // absent the snapshot says so and stays on the bounded recent window.
@@ -2090,6 +2203,9 @@ export async function buildLocalCompanionSnapshot({
 } = {}) {
   const nowMs = now();
   if (!Number.isFinite(nowMs)) throw new TypeError("now must return a finite epoch timestamp");
+  if (!["unified", "legacy"].includes(accountingSourceMode)) {
+    throw new TypeError("accountingSourceMode must be unified or legacy");
+  }
   // Make a legacy installation converge before any snapshot readers race to
   // inspect it. Once complete this is a cheap receipt check; it never revives
   // JSON as an active state backend.
@@ -2149,21 +2265,37 @@ export async function buildLocalCompanionSnapshot({
       ))
     : Promise.resolve(null);
   const [
-    replaySafeAccounting,
+    initialReplaySafeAccounting,
     archiveCoverage,
     archiveAccounting,
     unified,
     retainedSideChatEstimates,
     sideChatHistoricalGapProbe,
-  ] =
-    await Promise.all([
+  ] = await Promise.all([
       readReplaySafeAccountingCache({
         stateFile: collectorStateFile,
         now: () => nowMs,
         maximumAgeMs: MAX_REPLAY_SAFE_CACHE_AGE_MS,
+        // Unified authority is bound only after the parallel index projection
+        // supplies its immutable generation below. This first read is merely a
+        // cheap cache-presence probe; never label it as a bound unified read.
+        ...(accountingSourceMode === "legacy"
+          ? { sourceMode: "legacy" }
+          : {}),
+        ...(accountingSourceMode === "unified"
+          ? { contextBehavior: "legacy_zero" }
+          : {}),
       }),
-      inspectLocalArchiveAccountingIndex({ indexFile: archiveIndexFile }),
-      readLocalArchiveAccountingPeriod({ indexFile: archiveIndexFile }),
+      accountingSourceMode === "legacy"
+        ? inspectLocalArchiveAccountingIndex({ indexFile: archiveIndexFile })
+        : Promise.resolve({
+          status: "dormant",
+          indexedSourceCount: 0,
+          sourceCount: 0,
+        }),
+      accountingSourceMode === "legacy"
+        ? readLocalArchiveAccountingPeriod({ indexFile: archiveIndexFile })
+        : Promise.resolve({ status: "unavailable", period: null }),
       readLocalUnifiedCompanionProjection({
         indexFile: unifiedIndexFile,
         nowMs,
@@ -2180,12 +2312,78 @@ export async function buildLocalCompanionSnapshot({
         ...retainedSideChatEstimates,
         historicalGapProbe: sideChatHistoricalGapProbe,
       };
-  const replaySafeCache = ["available", "stale"].includes(
+  const unifiedProjectionAvailable = unified.status === "available";
+  const unifiedGenerationReady = unifiedProjectionAvailable
+    && (unified.indexStatus === "complete"
+      || (unified.indexStatus === "partial"
+        && unified.generation?.blockReason === "tool_provenance_incomplete"
+        && unified.generation?.toolProvenanceComplete === false))
+    && completeUnifiedGeneration(unified.generation);
+  let replaySafeAccounting = initialReplaySafeAccounting;
+  if (accountingSourceMode === "unified"
+      && ["available", "stale"].includes(replaySafeAccounting.status)) {
+    if (!unifiedGenerationReady) {
+      replaySafeAccounting = {
+        status: "unavailable",
+        errorCode: "cache_generation_unavailable",
+        cache: null,
+      };
+    } else {
+      // The first cache read overlaps the potentially large companion index
+      // projection. Once that projection has supplied its immutable
+      // generation descriptor, this cheap second SQLite read binds the cache
+      // to exactly that publication before any totals are selected.
+      replaySafeAccounting = await readReplaySafeAccountingCache({
+        stateFile: collectorStateFile,
+        now: () => nowMs,
+        maximumAgeMs: MAX_REPLAY_SAFE_CACHE_AGE_MS,
+        sourceMode: "unified",
+        contextBehavior: "legacy_zero",
+        expectedGeneration: unified.generation,
+      });
+    }
+  }
+  let replaySafeCache = ["available", "stale"].includes(
     replaySafeAccounting.status,
   )
     ? replaySafeAccounting.cache
     : null;
-  const unifiedAvailable = unified.status === "available";
+  if (accountingSourceMode === "unified"
+      && replaySafeCache !== null
+      && (!Number.isSafeInteger(replaySafeCache.sourceDescriptor?.fallbackCount)
+        || replaySafeCache.sourceDescriptor.fallbackCount !== 0)) {
+    // A cache that cannot prove zero fallback use is not a valid unified
+    // authority, even if its periods happen to be structurally readable.
+    replaySafeAccounting = {
+      status: "unavailable",
+      errorCode: "cache_fallback_disallowed",
+      cache: null,
+    };
+    replaySafeCache = null;
+  }
+  // Legacy rollback mode may continue to use a readable pre-v2 unified file
+  // for broad display history. Unified authority requires the complete,
+  // attested generation above; a merely readable legacy file is insufficient.
+  const unifiedAvailable = unifiedProjectionAvailable
+    && (accountingSourceMode === "legacy" || unifiedGenerationReady);
+  const unifiedAuthorityPartial = accountingSourceMode === "unified"
+    && unifiedProjectionAvailable
+    && !unifiedGenerationReady;
+  const unifiedAccountingWithheld = accountingSourceMode === "unified"
+    && replaySafeCache === null
+    && !unifiedAvailable;
+  const selectedHistory = accountingSourceMode === "unified"
+    ? unifiedHistoryState({
+      cache: replaySafeCache,
+      unified,
+      cacheErrorCode: replaySafeAccounting.errorCode,
+    })
+    : {
+      accounting: archiveAccounting,
+      coverage: archiveCoverage,
+    };
+  const historyAccounting = selectedHistory.accounting;
+  const historyCoverage = selectedHistory.coverage;
   if (typeof allowDevelopmentArtifactFallback !== "boolean") {
     throw new TypeError("allowDevelopmentArtifactFallback must be a boolean");
   }
@@ -2197,7 +2395,10 @@ export async function buildLocalCompanionSnapshot({
       // re-summarizing 600k+ JSON rows here was the old startup cost, and the
       // raw collector projection also counts fork replay the owner has ruled
       // is not real spend.
-      summarizeUsageEvents: replaySafeCache === null && !unifiedAvailable,
+      summarizeUsageEvents:
+        accountingSourceMode !== "unified"
+        && replaySafeCache === null
+        && !unifiedAvailable,
       declaredSpeedBaselines,
     }),
     reportProjection(root),
@@ -2223,9 +2424,22 @@ export async function buildLocalCompanionSnapshot({
     ...weeklyBase,
     paceForecast: collector.paceForecast,
   };
-  const latestRecordAt = collector.latestRecordAt;
+  const collectorLatestRecordAt = collector.latestRecordAt;
+  const unifiedLatestExportableMs = accountingSourceMode === "unified"
+      && unifiedAvailable
+      && typeof unified.latestExportableRecordAt === "string"
+    ? Date.parse(unified.latestExportableRecordAt)
+    : Number.NaN;
+  const latestRecordAt = Number.isSafeInteger(unifiedLatestExportableMs)
+    ? collectorLatestRecordAt === null
+      ? unifiedLatestExportableMs
+      : Math.max(collectorLatestRecordAt, unifiedLatestExportableMs)
+    : collectorLatestRecordAt;
   const indexing = await readCollectorIndexProjection(collectorStateFile, collector);
   const latestEvidenceAt = latestRecordAt === null ? null : new Date(latestRecordAt).toISOString();
+  const collectorLatestEvidenceAt = collectorLatestRecordAt === null
+    ? null
+    : new Date(collectorLatestRecordAt).toISOString();
   const evidenceAgeSeconds = latestRecordAt === null ? null : Math.max(0, Math.round((nowMs - latestRecordAt) / 1_000));
   const collectorFreshnessStatus = evidenceAgeSeconds === null
     ? "unavailable"
@@ -2258,9 +2472,18 @@ export async function buildLocalCompanionSnapshot({
   const accountingCoverageEndMs = replaySafeCache === null
     ? Number.NaN
     : Date.parse(replaySafeCache.coveredAt.endAt);
+  // Unified refreshes deliberately skip legacy rollout ingestion. When the
+  // published unified projection is authoritative, its newest typed usage
+  // timestamp is the exportable-evidence clock; consulting the dormant
+  // collector ledger here would make cache/index freshness appear frozen.
+  const latestExportableRecordAt = Number.isSafeInteger(unifiedLatestExportableMs)
+    ? unifiedLatestExportableMs
+    : accountingSourceMode === "unified" && unifiedAvailable
+      ? null
+      : collector.latestExportableRecordAt;
   const accountingCoversKnownEvidence = Number.isFinite(accountingCoverageEndMs)
-    && (collector.latestExportableRecordAt === null
-      || collector.latestExportableRecordAt - accountingCoverageEndMs
+    && (latestExportableRecordAt === null
+      || latestExportableRecordAt - accountingCoverageEndMs
         <= MAX_REPLAY_SAFE_CACHE_AGE_MS);
   const accountingStatus =
     replaySafeAccounting.status === "stale" && accountingCoversKnownEvidence
@@ -2270,7 +2493,11 @@ export async function buildLocalCompanionSnapshot({
   // unified index (also replay-suppressed), and fall back to the raw collector
   // projection — which counts fork replay — only when neither exists.
   const recentUsage = replaySafeCache?.periods
-    ?? (unifiedAvailable ? unified.usage : collector.usage);
+    ?? (unifiedAvailable
+      ? unified.usage
+      : unifiedAccountingWithheld
+        ? insufficientEvidenceUsagePeriods()
+        : collector.usage);
   // The unified index owns the broadest period whenever it is present: its
   // "all" spans the whole suppressed corpus rather than a bounded recent
   // window, which is what removes the 31-day ceiling.
@@ -2280,10 +2507,10 @@ export async function buildLocalCompanionSnapshot({
       unified.usage.find((period) => period.id === "all"),
     ]
     : recentUsage;
-  const usage = archiveAccounting.status === "available"
+  const usage = historyAccounting.status === "available"
     ? [
       ...broadUsage.filter((period) => period.id !== "history"),
-      archiveAccounting.period,
+      historyAccounting.period,
     ]
     : broadUsage;
   const displayUsage = usage.find((period) => period.id === "7d" && period.events > 0)
@@ -2330,15 +2557,19 @@ export async function buildLocalCompanionSnapshot({
     : Array.isArray(replaySafeCache?.sparkQuotaTimeline)
       ? replaySafeCache.sparkQuotaTimeline
       : collector.timeline.sparkQuota;
-  const sparkUsageTimeline = unifiedAvailable
-    ? unified.timeline.sparkUsage
-    : Array.isArray(replaySafeCache?.sparkUsageTimeline)
-      ? replaySafeCache.sparkUsageTimeline
-      : collector.timeline.sparkUsage;
-  const exactUsageTimelineWithSpeed = unifiedAvailable
-    ? unified.timeline.usage
-    : replaySafeCache?.timeline
-      ?? collector.timeline.usage;
+  const sparkUsageTimeline = unifiedAccountingWithheld
+    ? []
+    : unifiedAvailable
+      ? unified.timeline.sparkUsage
+      : Array.isArray(replaySafeCache?.sparkUsageTimeline)
+        ? replaySafeCache.sparkUsageTimeline
+        : collector.timeline.sparkUsage;
+  const exactUsageTimelineWithSpeed = unifiedAccountingWithheld
+    ? []
+    : unifiedAvailable
+      ? unified.timeline.usage
+      : replaySafeCache?.timeline
+        ?? collector.timeline.usage;
   const calibrationUsageTimelineWithSpeed =
     sideChatEstimates?.status === "available"
       && sideChatEstimates.methodology?.includedInCalibrationTimeline === true
@@ -2355,13 +2586,21 @@ export async function buildLocalCompanionSnapshot({
     calibrationUsageTimelineWithSpeed,
     fastModeContext,
   );
+  const timelineCoveredAt = unifiedAccountingWithheld
+    ? { startAt: null, endAt: null }
+    : unifiedAvailable
+      ? unified.timeline.coveredAt
+      : replaySafeCache?.coveredAt
+        ?? collector.timeline.coveredAt;
   // What span the timelines honestly cover, and out of which source. When the
   // unified index is absent this names the bound instead of hiding it.
   const timelineSource = unifiedAvailable
     ? "unified_local_index"
     : replaySafeCache !== null
       ? "replay_safe_cache"
-      : "recent_collector_window";
+      : unifiedAccountingWithheld
+        ? "insufficient_evidence"
+        : "recent_collector_window";
   const timelineHistory = unifiedAvailable
     ? {
       status: unified.indexStatus === "complete" ? "complete" : "partial",
@@ -2371,6 +2610,16 @@ export async function buildLocalCompanionSnapshot({
       sourceCount: unified.sourceCount,
       indexBytes: unified.indexBytes,
     }
+    : unifiedAuthorityPartial
+      ? {
+        status: "partial",
+        reason: unifiedPartialReason(unified),
+        coveredAt: unified.coveredAt,
+        usageEvents: unified.usageEvents,
+        generatedAt: unified.generatedAt,
+        sourceCount: unified.sourceCount,
+        indexBytes: unified.indexBytes,
+      }
     : {
       status: "unavailable",
       reason: unified.status === "missing"
@@ -2379,7 +2628,27 @@ export async function buildLocalCompanionSnapshot({
       boundedDays: RECENT_TIMELINE_DAYS,
       coveredAt: null,
     };
-  const tools = collector.tools;
+  // Tool-class counts are durable typed facts in the unified index. Prefer
+  // them only in unified authority mode; legacy rollback keeps its collector
+  // projection exactly as before.
+  const tools = accountingSourceMode === "unified"
+    ? unifiedAvailable ? unified.tools : summarizeToolClasses([])
+    : collector.tools;
+  const exportableCoveredAt = accountingSourceMode === "unified"
+    ? unifiedAvailable
+      ? {
+        startAt: unified.coveredAt.startAt,
+        endAt: unified.latestExportableRecordAt ?? unified.coveredAt.endAt,
+      }
+      : { startAt: null, endAt: null }
+    : {
+      startAt: collector.firstExportableRecordAt === null
+        ? null
+        : new Date(collector.firstExportableRecordAt).toISOString(),
+      endAt: collector.latestExportableRecordAt === null
+        ? null
+        : new Date(collector.latestExportableRecordAt).toISOString(),
+    };
   const pricedEvents = (displayUsage?.pricingCoverage.fullyPricedEvents ?? 0)
     + (displayUsage?.pricingCoverage.partiallyPricedEvents ?? 0);
   const pricingCoveragePercent = (displayUsage?.events ?? 0) === 0
@@ -2414,13 +2683,23 @@ export async function buildLocalCompanionSnapshot({
       "Recent cost accounting is using the live collector projection. It may include inherited snapshots from forked child rollouts until the replay-safe cache is refreshed.",
     );
   }
-  if (!unifiedAvailable) {
+  if (unifiedAccountingWithheld) {
+    warnings.push(unifiedAuthorityPartial
+      ? "The unified local index is readable but only partially covered. Usage totals and timelines are withheld until a complete generation-bound publication is available."
+      : unified.status === "missing"
+        ? "The unified local index has not been built yet. Usage totals and timelines remain unavailable until a complete generation-bound publication is available."
+        : "The unified local index is unavailable. Usage totals and timelines remain unavailable until a complete generation-bound publication is available.");
+  } else if (!unifiedAvailable) {
     warnings.push(unified.status === "missing"
       ? `The unified local index has not been built yet. Usage history and the broadest period are bounded to the recent ${RECENT_TIMELINE_DAYS}-day collector window until it is.`
       : `The unified local index is unreadable. Usage history and the broadest period are bounded to the recent ${RECENT_TIMELINE_DAYS}-day collector window until it recovers.`);
   } else {
     const indexEndMs = Date.parse(unified.coveredAt.endAt ?? "");
-    const newestUsageMs = collector.latestExportableRecordAt;
+    // In unified authority mode rollout ingestion is deliberately skipped in
+    // the legacy collector. Compare against the typed index clock so a
+    // current publication is not reported as lagging behind a dormant
+    // collector ledger.
+    const newestUsageMs = latestExportableRecordAt;
     if (Number.isFinite(indexEndMs)
         && Number.isSafeInteger(newestUsageMs)
         && newestUsageMs - indexEndMs > MAX_COLLECTOR_LIVE_AGE_MS) {
@@ -2428,6 +2707,11 @@ export async function buildLocalCompanionSnapshot({
         `The unified local index is ${Math.round((newestUsageMs - indexEndMs) / 60_000)} minutes behind the newest collector evidence and catches up on the next refresh.`,
       );
     }
+  }
+  if (unifiedAvailable && unified.toolCoverageStatus === "partial") {
+    warnings.push(
+      "Usage accounting is complete, but typed tool history is partial. Tool totals are withheld rather than reported as zero.",
+    );
   }
   if (indexing.status === "prospective_only") {
     warnings.push("The retained collector state began prospectively and does not prove recent-history coverage.");
@@ -2450,11 +2734,11 @@ export async function buildLocalCompanionSnapshot({
       `Verified OpenAI price evidence was reviewed beginning ${OPENAI_PRICE_EVIDENCE_START_DATE}; events without a recognized or separately evidenced card remain unpriced.`,
     );
   }
-  if (archiveCoverage.status !== "complete") {
-    warnings.push(archiveAccounting.status === "available"
-      ? `Indexed-history totals currently cover ${archiveCoverage.indexedSourceCount}/${archiveCoverage.sourceCount} discovered sources and expand as later foreground refreshes advance the index.`
+  if (historyCoverage.status !== "complete") {
+    warnings.push(historyAccounting.status === "available"
+      ? `Indexed-history totals currently cover ${historyCoverage.indexedSourceCount}/${historyCoverage.sourceCount} discovered sources and expand as later foreground refreshes advance the index.`
       : "History indexing is still advancing. Complete historical totals stay hidden until an indexed aggregate is available.");
-  } else if (archiveAccounting.status !== "available") {
+  } else if (historyAccounting.status !== "available") {
     warnings.push(
       "Historical sources are indexed, but their aggregate is temporarily unavailable and is not substituted with a recent-window total.",
     );
@@ -2470,13 +2754,30 @@ export async function buildLocalCompanionSnapshot({
     ? displayUsage.priceCardBreakdown
     : [];
   const mixedPriceCardWindows = priceCardIds.length > 1;
+  const accountingDescriptor = replaySafeCache?.sourceDescriptor ?? null;
+  const accountingGeneration = accountingDescriptor?.generation
+    ?? unified.generation?.id
+    ?? null;
+  const accountingGenerationFingerprint =
+    accountingDescriptor?.generationFingerprint
+      ?? unified.generation?.fingerprint
+      ?? null;
+  const accountingSource = replaySafeCache !== null
+    ? replaySafeCache.accountingMethod
+    : unifiedAvailable
+      ? "unified_local_index_replay_suppressed"
+      : unifiedAccountingWithheld
+        ? "insufficient_evidence"
+        : "collector_projection_unverified";
   return {
     schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
     mode: "real_local_evidence",
     generatedAt: new Date(nowMs).toISOString(),
     overview: {
       status: freshnessStatus,
-      evidenceStatus: collector.recordCount > 0 ? "available" : "unavailable",
+      evidenceStatus: collector.recordCount > 0 || unifiedAvailable
+        ? "available"
+        : "unavailable",
       latestEvidenceAt,
       latestObservedAt: latestEvidenceAt,
         freshness: {
@@ -2492,7 +2793,7 @@ export async function buildLocalCompanionSnapshot({
         records: collector.recordCount,
         recordCounts: collector.recordCounts,
         malformedLines: collector.malformedLines,
-        lastScanAt: latestEvidenceAt,
+        lastScanAt: collectorLatestEvidenceAt,
         safeRecordCount: collector.recordCount,
         identityMode: "prospective_pseudonymous_not_exposed",
         sourceMode: "content_free_collector_state",
@@ -2502,16 +2803,9 @@ export async function buildLocalCompanionSnapshot({
           startAt: collector.firstRecordAt === null
             ? null
             : new Date(collector.firstRecordAt).toISOString(),
-          endAt: latestEvidenceAt,
+          endAt: collectorLatestEvidenceAt,
         },
-        exportableCoveredAt: {
-          startAt: collector.firstExportableRecordAt === null
-            ? null
-            : new Date(collector.firstExportableRecordAt).toISOString(),
-          endAt: collector.latestExportableRecordAt === null
-            ? null
-            : new Date(collector.latestExportableRecordAt).toISOString(),
-        },
+        exportableCoveredAt,
       },
       quota,
       quotaWindows: quota.windows.map((window) => ({
@@ -2527,10 +2821,7 @@ export async function buildLocalCompanionSnapshot({
           ? unified.timeline.bucketMinutes
           : replaySafeCache?.bucketMinutes
             ?? collector.timeline.bucketMinutes,
-        coveredAt: unifiedAvailable
-          ? unified.timeline.coveredAt
-          : replaySafeCache?.coveredAt
-            ?? collector.timeline.coveredAt,
+        coveredAt: timelineCoveredAt,
         allowanceWeightingEncoding: timelineAllowanceWeightingEncoding(
           selectedFastModePreference,
         ),
@@ -2546,6 +2837,23 @@ export async function buildLocalCompanionSnapshot({
         history: timelineHistory,
       },
       accounting: {
+        sourceMode: accountingSourceMode,
+        readerVersion: accountingDescriptor?.readerVersion ?? null,
+        compatibilityBehavior:
+          accountingDescriptor?.contextBehavior ?? null,
+        sourceCoverageStatus:
+          accountingDescriptor?.coverageStatus ?? "unavailable",
+        generation: accountingGeneration,
+        generationFingerprint: accountingGenerationFingerprint,
+        generationMatched: accountingSourceMode === "unified"
+          ? accountingDescriptor?.generationMatched === true
+          : null,
+        fallbackCount: Number.isSafeInteger(accountingDescriptor?.fallbackCount)
+          ? accountingDescriptor.fallbackCount
+          : 0,
+        diagnosticsAvailable:
+          accountingDescriptor?.diagnosticsAvailable === true,
+        sourceCapabilities: accountingDescriptor?.capabilities ?? null,
         periodId: displayUsage?.id ?? "all",
         periodLabel: displayUsage?.label ?? RECENT_COLLECTOR_PERIOD_LABEL,
         events: displayUsage?.events ?? 0,
@@ -2584,11 +2892,7 @@ export async function buildLocalCompanionSnapshot({
         // narrower read from the unified index and reports only known adjacent
         // configuration transitions.
         reasoningEffortAvailable: false,
-        accountingSource: replaySafeCache !== null
-          ? replaySafeCache.accountingMethod
-          : unifiedAvailable
-            ? "unified_local_index_replay_suppressed"
-            : "collector_projection_unverified",
+        accountingSource,
         accountingCacheStatus: accountingStatus,
         replayExclusionDiagnostics: replaySafeCache?.diagnostics ?? null,
         cacheSwitchImpact,
@@ -2597,10 +2901,10 @@ export async function buildLocalCompanionSnapshot({
           ? { sideChatEstimates }
           : {}),
         evidenceStartDate: OPENAI_PRICE_EVIDENCE_START_DATE,
-        historyCoverage: archiveCoverage,
-        historyPeriodStatus: archiveAccounting.status,
-        historyGeneratedAt: archiveAccounting.generatedAt ?? null,
-        historyCoveredAt: archiveAccounting.coveredAt ?? null,
+        historyCoverage,
+        historyPeriodStatus: historyAccounting.status,
+        historyGeneratedAt: historyAccounting.generatedAt ?? null,
+        historyCoveredAt: historyAccounting.coveredAt ?? null,
         generatedAt: replaySafeCache?.generatedAt ?? null,
         coveredAt: replaySafeCache?.coveredAt ?? null,
         unknownModelEvents: displayUsage?.byModel
@@ -2641,6 +2945,11 @@ export async function buildLocalCompanionSnapshot({
         lastScanAt: latestEvidenceAt,
       },
       pricing: {
+        accountingSourceMode,
+        accountingGeneration,
+        accountingGenerationMatched: accountingSourceMode === "unified"
+          ? accountingDescriptor?.generationMatched === true
+          : null,
         basis: "official_api_price_equivalent_not_subscription_allowance",
         totalCostUsd: displayUsage?.apiPriceEquivalentUsd ?? 0,
         spark: displayUsage?.spark ?? null,
@@ -2692,19 +3001,15 @@ export async function buildLocalCompanionSnapshot({
         // at that event's timestamp; a reset may therefore contain mixed
         // historical card windows.
         priceEpochBasis: "event_time_when_registry_has_effective_evidence",
-        accountingSource: replaySafeCache !== null
-          ? replaySafeCache.accountingMethod
-          : unifiedAvailable
-            ? "unified_local_index_replay_suppressed"
-            : "collector_projection_unverified",
+        accountingSource,
         accountingCacheStatus: accountingStatus,
         replayExclusionDiagnostics: replaySafeCache?.diagnostics ?? null,
-        historyCoverage: archiveCoverage,
-        historyPeriodStatus: archiveAccounting.status,
+        historyCoverage,
+        historyPeriodStatus: historyAccounting.status,
       },
       coverage: {
         overallPercent: pricingCoveragePercent,
-        history: archiveCoverage,
+        history: historyCoverage,
       },
       warnings,
       monitoringGaps: [

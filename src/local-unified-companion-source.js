@@ -5,6 +5,7 @@ import {
   addUsageToPeriod,
   finalizeTimelineBuckets,
   finalizeUsagePeriod,
+  KNOWN_TOOL_CLASSES,
   MAX_QUOTA_TIMELINE_POINTS,
   newUsagePeriod,
   quotaWindowProjection,
@@ -15,7 +16,9 @@ import {
   usageProjection,
 } from "./local-companion-usage-model.js";
 import {
+  createUnifiedIndexToolFactFingerprintAccumulator,
   openLocalUnifiedIndex,
+  readUnifiedIndexGenerationDescriptor,
 } from "./local-unified-index.js";
 import {
   createAccountingPricer,
@@ -57,12 +60,21 @@ function unavailable(status, errorCode = null) {
     errorCode,
     generatedAt: null,
     indexStatus: null,
+    generation: null,
     coveredAt: { startAt: null, endAt: null },
     usageEvents: 0,
     quotaObservations: 0,
     sourceCount: 0,
     sourceBytes: 0,
+    discoveredSourceCount: 0,
+    discoveredSourceBytes: 0,
+    indexedSourceCount: 0,
+    indexedSourceBytes: 0,
     indexBytes: 0,
+    latestExportableRecordAt: null,
+    tools: emptyToolProjection(),
+    toolCoverageStatus: "unavailable",
+    toolCoverageBlockReason: null,
     usage: [],
     timeline: null,
     cacheSwitchImpact: unavailableCacheSwitchImpact(
@@ -77,6 +89,123 @@ function unavailable(status, errorCode = null) {
     ),
     readWallMs: null,
   };
+}
+
+function emptyToolProjection() {
+  return {
+    total: 0,
+    counts: Object.fromEntries([...KNOWN_TOOL_CLASSES].map((toolClass) => [
+      toolClass,
+      0,
+    ])),
+  };
+}
+
+function tableExists(database, tableName) {
+  return database.prepare(
+    "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?",
+  ).get(tableName)?.present === 1;
+}
+
+function isDigest(value) {
+  return value instanceof Uint8Array && value.byteLength === 32;
+}
+
+function sameOpenedFile(before, after) {
+  if (!after?.isFile?.() || after.isSymbolicLink()) return false;
+  const canCompareIdentity = [before.dev, before.ino, after.dev, after.ino]
+    .every((value) => value !== undefined && value !== null);
+  return !canCompareIdentity
+    || (before.dev === after.dev && before.ino === after.ino);
+}
+
+async function revalidatePublishedPath(indexFile, metadata) {
+  let first;
+  let second;
+  try {
+    first = await lstat(indexFile);
+    second = await lstat(indexFile);
+  } catch {
+    throw fixedError("local_unified_index_file_changed");
+  }
+  if (!sameOpenedFile(metadata, first) || !sameOpenedFile(first, second)) {
+    throw fixedError("local_unified_index_file_changed");
+  }
+}
+
+function toolProjection(database, generation) {
+  const projection = emptyToolProjection();
+  if (tableExists(database, "tool_class_fact")) {
+    if (generation?.toolProvenanceComplete !== true) {
+      // The rest of a readable partial publication still supplies honest
+      // coverage metadata. Withhold only the un-attested tool projection; the
+      // companion's generation gate prevents it from becoming unified
+      // authority.
+      return projection;
+    }
+    const expectedCount = Number(generation.toolFacts);
+    if (!Number.isSafeInteger(expectedCount) || expectedCount < 0) {
+      throw fixedError("local_unified_index_tool_attestation_mismatch");
+    }
+    let count = 0;
+    const fingerprint = createUnifiedIndexToolFactFingerprintAccumulator();
+    for (const row of database.prepare(`
+      SELECT f.event_key, f.source_local, f.source_offset, f.source_ordinal,
+             f.session_local, f.observed_at_ms, f.tool_ordinal,
+             f.tool_class, f.source_kind, gs.source_ordinal AS attested_ordinal
+      FROM tool_class_fact f
+      LEFT JOIN generation_source gs
+        ON gs.generation_id = f.generation_id
+       AND gs.source_local = f.source_local
+      WHERE f.generation_id = ?
+      ORDER BY f.event_key`).iterate(generation.id)) {
+      if (!isDigest(row.event_key)
+          || !isDigest(row.source_local)
+          || !isDigest(row.session_local)
+          || !Number.isSafeInteger(Number(row.source_offset))
+          || Number(row.source_offset) < 0
+          || !Number.isSafeInteger(Number(row.source_ordinal))
+          || Number(row.source_ordinal) < 0
+          || Number(row.attested_ordinal) !== Number(row.source_ordinal)
+          || !Number.isSafeInteger(Number(row.observed_at_ms))
+          || !Number.isSafeInteger(Number(row.tool_ordinal))
+          || Number(row.tool_ordinal) < 0
+          || typeof row.tool_class !== "string"
+          || !/^[a-z0-9._:-]{1,64}$/u.test(row.tool_class)
+          || typeof row.source_kind !== "string"
+          || !/^[a-z0-9._:-]{1,64}$/u.test(row.source_kind)) {
+        throw fixedError("local_unified_index_tool_attestation_mismatch");
+      }
+      const toolClass = KNOWN_TOOL_CLASSES.has(row.tool_class)
+        ? row.tool_class
+        : "other";
+      projection.counts[toolClass] += 1;
+      projection.total += 1;
+      count += 1;
+      fingerprint.add(row);
+    }
+    if (count !== expectedCount
+        || fingerprint.digest() !== generation.toolFactFingerprint) {
+      throw fixedError("local_unified_index_tool_attestation_mismatch");
+    }
+    return projection;
+  }
+  // A pre-v8 read-only index can still be displayed in explicit legacy mode.
+  // It is never accepted as the unified authority because its generation has
+  // no tool attestation fields.
+  if (!tableExists(database, "tool_class_count")) return projection;
+  for (const row of database.prepare(
+    "SELECT tool_class, SUM(count) AS count FROM tool_class_count GROUP BY tool_class",
+  ).iterate()) {
+    const count = Number(row.count);
+    if (!Number.isSafeInteger(count) || count < 0) continue;
+    const toolClass = KNOWN_TOOL_CLASSES.has(row.tool_class)
+      ? row.tool_class
+      : "other";
+    projection.counts[toolClass] += count;
+    projection.total += count;
+  }
+  return projection;
 }
 
 function isoOrNull(milliseconds) {
@@ -301,6 +430,17 @@ export async function readLocalUnifiedCompanionProjection({
     );
   }
   try {
+    await revalidatePublishedPath(indexFile, metadata);
+    // A legacy read-only file may still satisfy the projection queries, but
+    // only v2 publications carry the immutable generation proof accounting
+    // needs. Keep that distinction explicit instead of upgrading a legacy
+    // projection into authority merely because its rows are readable.
+    let generation = null;
+    try {
+      generation = readUnifiedIndexGenerationDescriptor(database);
+    } catch {
+      generation = null;
+    }
     const periods = [
       { summary: newUsagePeriod("24h", "Last 24 hours"), start: nowMs - 24 * 60 * 60 * 1_000 },
       { summary: newUsagePeriod("7d", "Last 7 days"), start: nowMs - 7 * 24 * 60 * 60 * 1_000 },
@@ -391,11 +531,18 @@ export async function readLocalUnifiedCompanionProjection({
       : Math.max(...timelineBuckets.keys()) + TIMELINE_BUCKET_MS;
     const sourceCount = Number(readMeta(database, "source_count"));
     const sourceBytes = Number(readMeta(database, "source_bytes"));
-    return {
+    const discoveredSourceCount = generation?.discoveredSourceCount
+      ?? (Number.isSafeInteger(sourceCount) ? sourceCount : 0);
+    const discoveredSourceBytes = generation?.discoveredSourceBytes
+      ?? (Number.isSafeInteger(sourceBytes) ? sourceBytes : 0);
+    const indexedSourceCount = generation?.indexedSourceCount;
+    const indexedSourceBytes = generation?.indexedSourceBytes;
+    const result = {
       status: "available",
       errorCode: null,
       generatedAt: readMeta(database, "generated_at"),
       indexStatus: readMeta(database, "status") ?? "unknown",
+      generation,
       coveredAt: {
         startAt: isoOrNull(firstObservedMs),
         endAt: isoOrNull(lastObservedMs),
@@ -404,7 +551,23 @@ export async function readLocalUnifiedCompanionProjection({
       quotaObservations,
       sourceCount: Number.isSafeInteger(sourceCount) ? sourceCount : 0,
       sourceBytes: Number.isSafeInteger(sourceBytes) ? sourceBytes : 0,
+      discoveredSourceCount: Number.isSafeInteger(discoveredSourceCount)
+        ? discoveredSourceCount : 0,
+      discoveredSourceBytes: Number.isSafeInteger(discoveredSourceBytes)
+        ? discoveredSourceBytes : 0,
+      indexedSourceCount: Number.isSafeInteger(indexedSourceCount)
+        ? indexedSourceCount : 0,
+      indexedSourceBytes: Number.isSafeInteger(indexedSourceBytes)
+        ? indexedSourceBytes : 0,
       indexBytes: metadata.size,
+      latestExportableRecordAt: isoOrNull(lastObservedMs),
+      tools: toolProjection(database, generation),
+      toolCoverageStatus: generation?.toolProvenanceComplete === true
+        ? "complete"
+        : generation === null ? "unavailable" : "partial",
+      toolCoverageBlockReason: generation?.toolProvenanceComplete === true
+        ? null
+        : generation?.blockReason ?? "tool_provenance_incomplete",
       usage: periods.map((period) => finalizeUsagePeriod(period.summary)),
       cacheSwitchImpact,
       cacheContinuityImpact,
@@ -421,6 +584,19 @@ export async function readLocalUnifiedCompanionProjection({
       },
       readWallMs: performance.now() - startedAt,
     };
+    let settledGeneration = null;
+    try {
+      settledGeneration = readUnifiedIndexGenerationDescriptor(database);
+    } catch {
+      settledGeneration = null;
+    }
+    if ((generation?.id ?? null) !== (settledGeneration?.id ?? null)
+        || (generation?.fingerprint ?? null)
+          !== (settledGeneration?.fingerprint ?? null)) {
+      throw fixedError("local_unified_index_generation_mismatch");
+    }
+    await revalidatePublishedPath(indexFile, metadata);
+    return result;
   } catch (error) {
     if (error?.code?.startsWith("local_unified_index_")) {
       return unavailable("unavailable", error.code);

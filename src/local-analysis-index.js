@@ -100,6 +100,24 @@ const COVERAGE_BLOCK_REASONS = new Set([
   "disk_space",
   "storage_unavailable",
 ]);
+// Accounting callbacks can stop an otherwise valid legacy scan at a fixed,
+// bounded resource or transition limit. Preserve those codes so the
+// accounting owner can retain/defer its cache; wrapping one as the generic
+// local-index failure would turn a recoverable budget miss into a false
+// rollback failure. This is an explicit allowlist: arbitrary callback errors
+// remain content-free local_analysis_index_failed failures.
+const BOUNDED_ACCOUNTING_CALLBACK_ERROR_CODES = new Set([
+  "accounting_refresh_aborted",
+  "accounting_scan_rss_limit_exceeded",
+  "accounting_scan_source_bytes_limit_exceeded",
+  "accounting_transition_rss_measurement_invalid",
+  "accounting_transition_rss_limit_exceeded",
+  "accounting_transition_memory_budget_exceeded",
+  "accounting_transition_usage_limit_exceeded",
+  "accounting_transition_snapshot_limit_exceeded",
+  "accounting_transition_input_limit_exceeded",
+  "accounting_transition_derivation_limit_exceeded",
+]);
 
 function canonicalInstant(value) {
   if (typeof value !== "string") return null;
@@ -113,6 +131,38 @@ function fixedError(code) {
   const error = new Error(code);
   error.code = code;
   return error;
+}
+
+function boundedFailureCategory(error) {
+  const code = typeof error?.code === "string" ? error.code : "";
+  if (code === "ENOSPC") return "storage_full";
+  if (code === "EMFILE" || code === "ENFILE") return "file_handle_limit";
+  if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") {
+    return "sqlite_lock";
+  }
+  if (code === "SQLITE_FULL") return "storage_full";
+  if (code === "ENOENT") return "missing_resource";
+  if (code === "EACCES" || code === "EPERM") return "permission";
+  if (error?.name === "TypeError") return "type_error";
+  if (error?.name === "RangeError") return "range_error";
+  return "unknown";
+}
+
+function fixedRefreshFailure(phase, error) {
+  const fixed = fixedError("local_analysis_index_failed");
+  // Keep diagnostic evidence bounded and non-enumerable. Public callers still
+  // receive only the fixed content-free error code.
+  Object.defineProperties(fixed, {
+    failurePhase: {
+      value: phase,
+      enumerable: false,
+    },
+    failureCategory: {
+      value: boundedFailureCategory(error),
+      enumerable: false,
+    },
+  });
+  return fixed;
 }
 
 function throwIfAborted(signal) {
@@ -2611,6 +2661,7 @@ export async function refreshLocalAnalysisIndex({
   let shardDirectory = null;
   let attachedSchemas = [];
   let streamedScanResult = null;
+  let failurePhase = "stage_open";
   try {
     if (existing === null) {
       database = createFreshIndex(stageFile);
@@ -2623,6 +2674,7 @@ export async function refreshLocalAnalysisIndex({
         requireComplete: false,
       }).database;
     }
+    failurePhase = "source_update";
     database.exec("BEGIN IMMEDIATE");
     try {
       const deleteSource = database.prepare(
@@ -2676,6 +2728,7 @@ export async function refreshLocalAnalysisIndex({
         0,
       );
       if (slice.length > 0) {
+        failurePhase = "extraction";
         const extracted = await extractTasks({
           tasks: slice,
           workerCount,
@@ -2688,6 +2741,7 @@ export async function refreshLocalAnalysisIndex({
           + extracted.extractWallMs;
         phaseWallMs.shardMerge = (phaseWallMs.shardMerge ?? 0)
           + extracted.mergeWallMs;
+        failurePhase = "shard_attach";
         attachedSchemas = attachExtractedShards(
           database,
           extracted.shardFiles,
@@ -2704,6 +2758,7 @@ export async function refreshLocalAnalysisIndex({
           [...resetPending].filter((key) => selectedKeys.has(key)),
         );
         const derivationStartedAt = performance.now();
+        failurePhase = "derivation";
         database.exec("BEGIN IMMEDIATE");
         try {
           await deriveChangedSources({
@@ -2731,9 +2786,11 @@ export async function refreshLocalAnalysisIndex({
           + performance.now() - derivationStartedAt;
         detachExtractedShards(database, attachedSchemas);
         attachedSchemas = [];
+        failurePhase = "shard_cleanup";
         await rm(shardDirectory, { recursive: true, force: true });
         shardDirectory = null;
         const factIndexStartedAt = performance.now();
+        failurePhase = "fact_indexes";
         database.exec(`
           CREATE INDEX IF NOT EXISTS usage_facts_time
             ON usage_facts(timestamp_ms, source_key, source_offset);
@@ -2754,6 +2811,7 @@ export async function refreshLocalAnalysisIndex({
           throw error;
         }
       }
+      failurePhase = "coverage_meta";
       coverage = indexCoverage(database, sources);
       updateMeta(database, {
         startAt: new Date(startAt).toISOString(),
@@ -2768,6 +2826,7 @@ export async function refreshLocalAnalysisIndex({
         phaseWallMs,
       });
       const finalizeStartedAt = performance.now();
+      failurePhase = "finalize";
       database.exec("PRAGMA optimize");
       const integrity = database.prepare("PRAGMA quick_check").get();
       if (integrity?.quick_check !== "ok") {
@@ -2795,6 +2854,7 @@ export async function refreshLocalAnalysisIndex({
         serverBillableUnits: {},
       };
     }
+    failurePhase = "close";
     database.close();
     database = null;
     return {
@@ -2829,10 +2889,21 @@ export async function refreshLocalAnalysisIndex({
       }
     }
     if (database?.isOpen) database.close();
-    if (error?.name === "AbortError"
-        || (typeof error?.code === "string"
-          && error.code.startsWith("local_analysis_"))) throw error;
-    throw fixedError("local_analysis_index_failed");
+    const code = typeof error?.code === "string" ? error.code : null;
+    if (error?.name === "AbortError") {
+      const boundedCode = code !== null
+          && (code.startsWith("local_analysis_")
+            || BOUNDED_ACCOUNTING_CALLBACK_ERROR_CODES.has(code))
+        ? code
+        : "local_analysis_index_aborted";
+      throw fixedError(boundedCode, "AbortError");
+    }
+    if (code?.startsWith("local_analysis_")) throw fixedError(code);
+    if (code !== null
+        && BOUNDED_ACCOUNTING_CALLBACK_ERROR_CODES.has(code)) {
+      throw fixedError(code);
+    }
+    throw fixedRefreshFailure(failurePhase, error);
   } finally {
     if (shardDirectory !== null) {
       await rm(shardDirectory, { recursive: true, force: true })

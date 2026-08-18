@@ -1,0 +1,1188 @@
+import { lstat } from "node:fs/promises";
+
+import { isValidQuotaWindowDuration } from "@app-usagemonitor/quota-analysis";
+
+import {
+  LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+  openLocalUnifiedIndex,
+  readUnifiedIndexGenerationDescriptor,
+  readUnifiedIndexToolFactFingerprint,
+} from "./local-unified-index.js";
+import { validAbortSignal } from "./valid-abort-signal.js";
+
+// Read-only adapter from the current unified fact store to the callback
+// contract consumed by replay-safe accounting. This module never discovers
+// or opens rollout JSONL. Coverage is complete only for an attested staged
+// generation whose persisted provenance, quota occurrences, diagnostics, and
+// publication state prove the reader contract.
+export const LOCAL_UNIFIED_ACCOUNTING_SOURCE_VERSION =
+  "local-unified-accounting-source-v2";
+
+const SAFE_TOKEN = /^[A-Za-z0-9._:-]{1,64}$/u;
+const GENERATION_FINGERPRINT = /^generation-v2-[a-f0-9]{64}$/u;
+const TOOL_FACT_FINGERPRINT = /^tool-facts-v1-[a-f0-9]{64}$/u;
+const QUOTA_SLOTS = new Set(["primary", "secondary"]);
+const REQUIRED_META_KEYS = Object.freeze([
+  "schema_version",
+  "status",
+  "contract_version",
+  "current_generation_id",
+]);
+const CALLBACK_RESOURCE_CODES = new Set([
+  "accounting_refresh_aborted",
+  "accounting_scan_source_bytes_limit_exceeded",
+  "accounting_scan_rss_limit_exceeded",
+  "accounting_transition_rss_measurement_invalid",
+  "accounting_transition_rss_limit_exceeded",
+  "accounting_transition_memory_budget_exceeded",
+  "accounting_transition_usage_limit_exceeded",
+  "accounting_transition_snapshot_limit_exceeded",
+  "accounting_transition_input_limit_exceeded",
+  "accounting_transition_derivation_limit_exceeded",
+  "accounting_archive_rss_measurement_invalid",
+  "accounting_archive_rss_limit_exceeded",
+]);
+const GENERATION_STATUSES = new Set([
+  "in_progress",
+  "complete",
+  "partial",
+  "failed",
+]);
+const CONTEXT_BEHAVIORS = new Set(["source_native", "legacy_zero"]);
+const ADAPTER_ABORT = Symbol("local-unified-accounting-source-abort");
+
+function fixedError(code, name = "Error") {
+  const error = new Error(code);
+  error.name = name;
+  error.code = code;
+  return error;
+}
+
+function canonicalInstant(value) {
+  if (typeof value !== "string") return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp)
+      && new Date(timestamp).toISOString() === value
+    ? value
+    : null;
+}
+
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  const error = fixedError("local_unified_index_read_aborted", "AbortError");
+  error[ADAPTER_ABORT] = true;
+  throw error;
+}
+
+function ownerOnlyRegularFile(metadata) {
+  return metadata.isFile()
+    && !metadata.isSymbolicLink()
+    && metadata.nlink === 1
+    && (typeof process.getuid !== "function" || metadata.uid === process.getuid())
+    && (process.platform === "win32" || (metadata.mode & 0o077) === 0);
+}
+
+function safeInteger(value, { nullable = false, nullValue = null } = {}) {
+  if (value === null && nullable) return nullValue;
+  if (value === undefined
+      || (typeof value !== "number" && typeof value !== "bigint")) {
+    throw fixedError("local_unified_index_row_invalid");
+  }
+  const numeric = Number(value);
+  if (!Number.isSafeInteger(numeric)) {
+    throw fixedError("local_unified_index_row_invalid");
+  }
+  return numeric;
+}
+
+function safeNonNegativeInteger(value, options = {}) {
+  const numeric = safeInteger(value, {
+    nullValue: 0,
+    ...options,
+  });
+  if (numeric === null) return null;
+  if (!Number.isSafeInteger(numeric) || numeric < 0) {
+    throw fixedError("local_unified_index_row_invalid");
+  }
+  return numeric;
+}
+
+function safeText(value, { nullable = false } = {}) {
+  if (value === null && nullable) return "unknown";
+  if (typeof value !== "string" || !SAFE_TOKEN.test(value)) {
+    throw fixedError("local_unified_index_row_invalid");
+  }
+  return value;
+}
+
+function safeDigest(value, { nullable = false } = {}) {
+  if (value === null && nullable) return null;
+  if (!(value instanceof Uint8Array) || value.byteLength !== 32) {
+    throw fixedError("local_unified_index_row_invalid");
+  }
+  return Buffer.from(value);
+}
+
+function readMeta(database) {
+  const result = {};
+  for (const row of database.prepare(
+    "SELECT key, value FROM meta ORDER BY key",
+  ).iterate()) {
+    if (typeof row.key !== "string" || typeof row.value !== "string") {
+      throw fixedError("local_unified_index_meta_invalid");
+    }
+    result[row.key] = row.value;
+  }
+  return result;
+}
+
+function requiredMetaText(meta, key) {
+  if (!Object.hasOwn(meta, key)
+      || typeof meta[key] !== "string"
+      || meta[key].length < 1) {
+    throw fixedError("local_unified_index_meta_invalid");
+  }
+  return meta[key];
+}
+
+function metaCount(meta, key) {
+  const value = requiredMetaText(meta, key);
+  if (!/^\d+$/u.test(value)) {
+    throw fixedError("local_unified_index_meta_invalid");
+  }
+  const numeric = Number(value);
+  if (!Number.isSafeInteger(numeric) || numeric < 0) {
+    throw fixedError("local_unified_index_meta_invalid");
+  }
+  return numeric;
+}
+
+function metaCountOptional(meta, key) {
+  if (!Object.hasOwn(meta, key)) return null;
+  return metaCount(meta, key);
+}
+
+function generationIdFromValue(value) {
+  if (typeof value === "number" || typeof value === "bigint") {
+    const id = Number(value);
+    if (Number.isSafeInteger(id) && id > 0) return id;
+    return null;
+  }
+  if (typeof value !== "string" || !/^\d+(?:\.0+)?$/u.test(value)) return null;
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+function validateStoredGenerationFingerprint(meta, canonicalFingerprint) {
+  for (const key of [
+    "current_generation_fingerprint",
+    "generation_fingerprint",
+  ]) {
+    if (!Object.hasOwn(meta, key)) continue;
+    if (meta[key] !== canonicalFingerprint) {
+      throw fixedError("local_unified_index_generation_invalid");
+    }
+  }
+}
+
+function expectedGenerationDescriptor(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number" || typeof value === "bigint") {
+    const id = generationIdFromValue(value);
+    if (id === null) {
+      throw fixedError(
+        "local_unified_index_generation_request_invalid",
+        "TypeError",
+      );
+    }
+    return { id, fingerprint: null };
+  }
+  if (typeof value === "string") {
+    const id = generationIdFromValue(value);
+    if (id !== null) return { id, fingerprint: null };
+    if (!SAFE_TOKEN.test(value) && !GENERATION_FINGERPRINT.test(value)) {
+      throw fixedError(
+        "local_unified_index_generation_request_invalid",
+        "TypeError",
+      );
+    }
+    return { id: null, fingerprint: value };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw fixedError(
+      "local_unified_index_generation_request_invalid",
+      "TypeError",
+    );
+  }
+  const id = generationIdFromValue(
+    value.id ?? value.generationId ?? value.currentGenerationId,
+  );
+  const fingerprint = value.fingerprint
+    ?? value.generationFingerprint
+    ?? value.currentGenerationFingerprint
+    ?? null;
+  if (fingerprint !== null
+      && (typeof fingerprint !== "string"
+        || (!SAFE_TOKEN.test(fingerprint)
+          && !GENERATION_FINGERPRINT.test(fingerprint)))) {
+    throw fixedError(
+      "local_unified_index_generation_request_invalid",
+      "TypeError",
+    );
+  }
+  if (id === null && (typeof fingerprint !== "string"
+      || (!SAFE_TOKEN.test(fingerprint)
+        && !GENERATION_FINGERPRINT.test(fingerprint)))) {
+    throw fixedError(
+      "local_unified_index_generation_request_invalid",
+      "TypeError",
+    );
+  }
+  return { id, fingerprint };
+}
+
+function boundedCount(value) {
+  const numeric = Number(value);
+  return Number.isSafeInteger(numeric) && numeric >= 0 ? numeric : null;
+}
+
+function parserCompatibility(database, contractVersion, generationId) {
+  // Dimension history is retained across additive migrations. Only parser
+  // versions referenced by facts (plus the current generation for an empty
+  // index) describe the published generation; an orphaned old dimension row
+  // must not make every read look mixed forever.
+  const rows = database.prepare(`
+    SELECT DISTINCT p.parser_version, p.contract_version
+    FROM parser_version p
+    JOIN (
+      SELECT DISTINCT parser_version_id
+      FROM usage_event
+      UNION
+      SELECT parser_version_id
+      FROM index_generation
+      WHERE id = ?
+    ) referenced ON referenced.parser_version_id = p.id
+    ORDER BY p.parser_version, p.contract_version
+  `).all(generationId);
+  if (rows.length === 0) {
+    throw fixedError("local_unified_index_compatibility_invalid");
+  }
+  const parserVersions = [];
+  const contractVersions = [];
+  for (const row of rows) {
+    const parserVersion = safeText(row.parser_version);
+    const rowContractVersion = safeText(row.contract_version);
+    if (rowContractVersion !== contractVersion) {
+      throw fixedError("local_unified_index_compatibility_invalid");
+    }
+    parserVersions.push(parserVersion);
+    contractVersions.push(rowContractVersion);
+  }
+  const uniqueParserVersions = [...new Set(parserVersions)];
+  const uniqueContractVersions = [...new Set(contractVersions)];
+  return {
+    status: uniqueParserVersions.length === 1
+      ? "compatible"
+      : "mixed_parser_versions",
+    parserVersions: uniqueParserVersions,
+    contractVersions: uniqueContractVersions,
+    contractVersion,
+  };
+}
+
+function queryCount(database, sql, ...parameters) {
+  const value = database.prepare(sql).get(...parameters)?.count;
+  const count = boundedCount(value ?? 0);
+  if (count === null) throw fixedError("local_unified_index_meta_invalid");
+  return count;
+}
+
+function readCurrentGeneration(
+  database,
+  meta,
+  requestedWindow,
+  { verifyPublishedGeneration = false } = {},
+) {
+  for (const key of REQUIRED_META_KEYS) requiredMetaText(meta, key);
+  const schemaVersion = requiredMetaText(meta, "schema_version");
+  if (schemaVersion !== LOCAL_UNIFIED_INDEX_SCHEMA_VERSION) {
+    throw fixedError("local_unified_index_meta_invalid");
+  }
+  const indexStatus = requiredMetaText(meta, "status");
+  if (!["complete", "partial"].includes(indexStatus)) {
+    throw fixedError("local_unified_index_meta_invalid");
+  }
+  const currentGenerationId = generationIdFromValue(
+    requiredMetaText(meta, "current_generation_id"),
+  );
+  if (currentGenerationId === null) {
+    throw fixedError("local_unified_index_generation_invalid");
+  }
+  let generation;
+  try {
+    generation = database.prepare(`
+      SELECT id, started_at_ms, completed_at_ms, parser_version_id,
+             contract_version, status, block_reason,
+             discovered_source_count, discovered_source_bytes,
+             indexed_source_count, indexed_source_bytes, usage_events,
+             quota_occurrences, covered_start_ms, covered_end_ms,
+             discovery_complete, diagnostics_complete,
+             usage_provenance_complete, source_order_complete,
+             quota_provenance_complete, tool_facts,
+             tool_fact_fingerprint, tool_provenance_complete
+      FROM index_generation
+      WHERE id = ?
+    `).get(currentGenerationId);
+  } catch {
+    throw fixedError("local_unified_index_generation_invalid");
+  }
+  if (!generation || Number(generation.id) !== currentGenerationId
+      || !GENERATION_STATUSES.has(generation.status)) {
+    throw fixedError("local_unified_index_generation_invalid");
+  }
+  const contractVersion = requiredMetaText(meta, "contract_version");
+  if (generation.contract_version !== contractVersion
+      || !SAFE_TOKEN.test(contractVersion)) {
+    throw fixedError("local_unified_index_compatibility_invalid");
+  }
+  // The fingerprint is derived only from the published generation row. Meta
+  // values are compatibility breadcrumbs, not an authority that can replace
+  // the canonical identity handed to downstream accounting.
+  const descriptor = readUnifiedIndexGenerationDescriptor(
+    database,
+    currentGenerationId,
+  );
+  if (!descriptor || descriptor.id !== currentGenerationId
+      || !GENERATION_FINGERPRINT.test(descriptor.fingerprint)) {
+    throw fixedError("local_unified_index_generation_invalid");
+  }
+  validateStoredGenerationFingerprint(meta, descriptor.fingerprint);
+  const fingerprint = descriptor.fingerprint;
+  const generatedAtMs = boundedCount(
+    generation.completed_at_ms ?? generation.started_at_ms,
+  );
+  if (generatedAtMs === null) {
+    throw fixedError("local_unified_index_generation_invalid");
+  }
+  const generatedAt = new Date(generatedAtMs).toISOString();
+  const coveredStartMs = boundedCount(generation.covered_start_ms);
+  const coveredEndMs = boundedCount(generation.covered_end_ms);
+  const coveredAt = coveredStartMs !== null && coveredEndMs !== null
+    && coveredEndMs >= coveredStartMs
+    ? {
+      startAt: new Date(coveredStartMs).toISOString(),
+      endAt: new Date(coveredEndMs).toISOString(),
+    }
+    : null;
+
+  const declaredUsageEvents = boundedCount(generation.usage_events);
+  const declaredQuotaOccurrences = boundedCount(generation.quota_occurrences);
+  const declaredToolFacts = boundedCount(generation.tool_facts);
+  const declaredToolFactFingerprint = typeof generation.tool_fact_fingerprint
+      === "string" && TOOL_FACT_FINGERPRINT.test(
+        generation.tool_fact_fingerprint,
+      )
+    ? generation.tool_fact_fingerprint
+    : null;
+  const declaredSourceCount = boundedCount(generation.indexed_source_count);
+  const declaredSourceBytes = boundedCount(generation.indexed_source_bytes);
+  const usageProvenanceAttested = generation.usage_provenance_complete === 1;
+  const sourceOrderAttested = generation.source_order_complete === 1;
+  const quotaProvenanceAttested = generation.quota_provenance_complete === 1;
+  const toolProvenanceAttested = generation.tool_provenance_complete === 1;
+  const generationAttestationComplete = usageProvenanceAttested
+    && sourceOrderAttested
+    && quotaProvenanceAttested;
+  if (declaredUsageEvents === null
+      || declaredQuotaOccurrences === null
+      || declaredToolFacts === null
+      || declaredToolFactFingerprint === null
+      || declaredSourceCount === null
+      || declaredSourceBytes === null) {
+    // A completed generation without its immutable count attestation is not a
+    // safe publication. The optional full verifier below can explain the
+    // mismatch, but the normal reader must fail closed immediately.
+    return {
+      status: "partial",
+      indexStatus,
+      blockReason: "generation_attestation_incomplete",
+      generatedAt,
+      coveredAt,
+      generationId: currentGenerationId,
+      generationFingerprint: fingerprint,
+      generationProof: false,
+      requestedWindow,
+      sourceCount: declaredSourceCount ?? 0,
+      sourceBytes: declaredSourceBytes ?? 0,
+      usageEvents: declaredUsageEvents ?? 0,
+      quotaObservations: metaCountOptional(meta, "quota_observations"),
+      quotaOccurrences: declaredQuotaOccurrences ?? 0,
+      toolFacts: declaredToolFacts ?? 0,
+      toolFactFingerprint: declaredToolFactFingerprint,
+      admittedQuotaOccurrences: metaCountOptional(
+        meta,
+        "admitted_quota_occurrences",
+      ),
+      provenanceComplete: false,
+      quotaOccurrencesComplete: false,
+      toolFactsComplete: false,
+      diagnosticsComplete: false,
+      usageProvenanceAttested,
+      sourceOrderAttested,
+      quotaProvenanceAttested,
+      toolProvenanceAttested,
+      currentGeneration: generation,
+    };
+  }
+
+  // Staged publication persists these values before the rename. Keep the hot
+  // accounting path on the generation attestation; the explicit verifier is
+  // available for migration audits and tests that need to prove every row.
+  let usageEvents = declaredUsageEvents;
+  let quotaOccurrences = declaredQuotaOccurrences;
+  let toolFacts = declaredToolFacts;
+  let admittedQuotaOccurrences = metaCountOptional(
+    meta,
+    "admitted_quota_occurrences",
+  );
+  let quotaObservations = metaCountOptional(meta, "quota_observations");
+  let sourceCount = declaredSourceCount;
+  let sourceBytes = declaredSourceBytes;
+  let countsMatch = true;
+  let sourceIncomplete = false;
+  let sourceOrdinalMissing = false;
+  let usageProvenanceMissing = false;
+  let quotaProvenanceMissing = false;
+  let toolProvenanceMissing = false;
+  let toolFactFingerprintMatches = true;
+
+  if (verifyPublishedGeneration) {
+    // These checks deliberately inspect the facts themselves. A generation's
+    // summary is not proof when a migrated row still has NULL provenance or
+    // when an occurrence was lost between a source cursor and publication.
+    usageEvents = queryCount(database, `
+      SELECT COUNT(*) AS count FROM usage_event
+    `);
+    quotaOccurrences = queryCount(database, `
+      SELECT COUNT(*) AS count FROM quota_occurrence
+    `);
+    toolFacts = queryCount(database, `
+      SELECT COUNT(*) AS count FROM tool_class_fact
+      WHERE generation_id = ?
+    `, currentGenerationId);
+    admittedQuotaOccurrences = queryCount(database, `
+      SELECT COUNT(*) AS count FROM quota_occurrence
+      WHERE admission = 'admitted'
+    `);
+    quotaObservations = queryCount(database, `
+      SELECT COUNT(*) AS count FROM quota_observation
+    `);
+    sourceCount = queryCount(database, `
+      SELECT COUNT(*) AS count FROM generation_source
+      WHERE generation_id = ?
+    `, currentGenerationId);
+    const sourceBytesValue = database.prepare(`
+      SELECT COALESCE(SUM(discovered_size_bytes), 0) AS bytes
+      FROM generation_source WHERE generation_id = ?
+    `).get(currentGenerationId)?.bytes;
+    sourceBytes = boundedCount(sourceBytesValue);
+    if (sourceBytes === null) {
+      throw fixedError("local_unified_index_meta_invalid");
+    }
+    sourceIncomplete = queryCount(database, `
+      SELECT COUNT(*) AS count FROM generation_source
+      WHERE generation_id = ?
+        AND (status IN ('pending', 'failed') OR diagnostics_complete <> 1)
+    `, currentGenerationId) > 0;
+    sourceOrdinalMissing = queryCount(database, `
+      SELECT COUNT(*) AS count FROM generation_source
+      WHERE generation_id = ? AND source_ordinal IS NULL
+    `, currentGenerationId) > 0;
+    sourceOrdinalMissing = sourceOrdinalMissing || queryCount(database, `
+      SELECT COUNT(*) AS count
+      FROM (
+        SELECT source_ordinal
+        FROM generation_source
+        WHERE generation_id = ?
+        GROUP BY source_ordinal
+        HAVING COUNT(*) > 1
+      )
+    `, currentGenerationId) > 0;
+    sourceOrdinalMissing = sourceOrdinalMissing || queryCount(database, `
+      SELECT (
+        (SELECT COUNT(*) FROM source_cursor sc
+         WHERE NOT EXISTS (
+           SELECT 1 FROM generation_source gs
+           WHERE gs.generation_id = ? AND gs.source_local = sc.source_local
+             AND gs.source_ordinal = sc.source_ordinal))
+        +
+        (SELECT COUNT(*) FROM generation_source gs
+         LEFT JOIN source_cursor sc ON sc.source_local = gs.source_local
+         WHERE gs.generation_id = ?
+           AND (sc.source_local IS NULL OR sc.source_ordinal IS NULL
+             OR sc.source_ordinal != gs.source_ordinal))
+      ) AS count
+    `, currentGenerationId, currentGenerationId) > 0;
+    usageProvenanceMissing = queryCount(database, `
+      SELECT COUNT(*) AS count FROM usage_event
+      WHERE source_local IS NULL OR source_offset IS NULL
+        OR source_ordinal IS NULL
+        OR NOT EXISTS (
+          SELECT 1 FROM generation_source gs
+          WHERE gs.generation_id = ?
+            AND gs.source_local = usage_event.source_local
+            AND gs.source_ordinal = usage_event.source_ordinal)
+    `, currentGenerationId) > 0;
+    quotaProvenanceMissing = queryCount(database, `
+      SELECT COUNT(*) AS count FROM quota_occurrence
+      WHERE source_local IS NULL OR source_offset IS NULL
+        OR source_ordinal IS NULL OR slot_order IS NULL
+        OR surface_id IS NULL OR admission IS NULL
+        OR NOT EXISTS (
+          SELECT 1 FROM generation_source gs
+          WHERE gs.generation_id = ?
+            AND gs.source_local = quota_occurrence.source_local
+            AND gs.source_ordinal = quota_occurrence.source_ordinal)
+    `, currentGenerationId) > 0 || queryCount(database, `
+      SELECT COUNT(*) AS count
+      FROM quota_observation q
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM quota_occurrence o
+        WHERE o.canonical_observation_id = q.id
+      )
+    `) > 0;
+    toolProvenanceMissing = queryCount(database, `
+      SELECT COUNT(*) AS count FROM tool_class_fact f
+      WHERE f.generation_id = ?
+        AND (f.source_local IS NULL OR f.source_offset IS NULL
+          OR f.source_ordinal IS NULL OR f.session_local IS NULL
+          OR f.tool_class IS NULL OR f.source_kind IS NULL
+          OR NOT EXISTS (
+            SELECT 1 FROM generation_source gs
+            WHERE gs.generation_id = ?
+              AND gs.source_local = f.source_local
+              AND gs.source_ordinal = f.source_ordinal))
+    `, currentGenerationId, currentGenerationId) > 0;
+    toolFactFingerprintMatches = readUnifiedIndexToolFactFingerprint(
+      database,
+      currentGenerationId,
+    ) === declaredToolFactFingerprint;
+    countsMatch = declaredUsageEvents === usageEvents
+      && declaredQuotaOccurrences === quotaOccurrences
+      && declaredToolFacts === toolFacts
+      && declaredSourceCount === sourceCount
+      && declaredSourceBytes === sourceBytes;
+  } else {
+    // Range-scoped checks catch a legacy nullable row before it can be
+    // emitted, without turning every short history read into a full-table
+    // audit. The generation attestation remains the source of whole-index
+    // counts and publication capabilities.
+    const startMs = Date.parse(requestedWindow.startAt);
+    const endMs = Date.parse(requestedWindow.endAt);
+    usageProvenanceMissing = queryCount(database, `
+      SELECT COUNT(*) AS count FROM usage_event
+      WHERE observed_at_ms >= ? AND observed_at_ms <= ?
+        AND (source_local IS NULL OR source_offset IS NULL
+          OR source_ordinal IS NULL OR NOT EXISTS (
+            SELECT 1 FROM generation_source gs
+            WHERE gs.generation_id = ?
+              AND gs.source_local = usage_event.source_local
+              AND gs.source_ordinal = usage_event.source_ordinal))
+    `, startMs, endMs, currentGenerationId) > 0;
+    quotaProvenanceMissing = queryCount(database, `
+      SELECT COUNT(*) AS count FROM quota_occurrence
+      WHERE observed_at_ms >= ? AND observed_at_ms <= ?
+        AND (source_local IS NULL OR source_offset IS NULL
+          OR source_ordinal IS NULL OR slot_order IS NULL
+          OR surface_id IS NULL OR admission IS NULL OR NOT EXISTS (
+            SELECT 1 FROM generation_source gs
+            WHERE gs.generation_id = ?
+              AND gs.source_local = quota_occurrence.source_local
+              AND gs.source_ordinal = quota_occurrence.source_ordinal))
+    `, startMs, endMs, currentGenerationId) > 0;
+  }
+  const toolOnlyPartial = generation.status === "partial"
+    && indexStatus === "partial"
+    && generation.block_reason === "tool_provenance_incomplete"
+    && !toolProvenanceAttested;
+  const generationComplete = ((generation.status === "complete"
+      && indexStatus === "complete") || toolOnlyPartial)
+    && generation.discovery_complete === 1
+    && generation.diagnostics_complete === 1;
+  const diagnosticsComplete = !sourceIncomplete
+    && generation.diagnostics_complete === 1;
+  const provenanceComplete = !usageProvenanceMissing
+    && !quotaProvenanceMissing
+    && !sourceOrdinalMissing
+    && generationAttestationComplete;
+  const quotaOccurrencesComplete = declaredQuotaOccurrences !== null
+    && quotaOccurrences === declaredQuotaOccurrences
+    && quotaProvenanceAttested
+    && !quotaProvenanceMissing;
+  const toolFactsComplete = declaredToolFacts !== null
+    && toolFacts === declaredToolFacts
+    && toolProvenanceAttested
+    && !toolProvenanceMissing
+    && toolFactFingerprintMatches;
+  let blockReason = null;
+  if (!generationComplete) {
+    blockReason = typeof generation.block_reason === "string"
+      && SAFE_TOKEN.test(generation.block_reason)
+      ? generation.block_reason
+      : "generation_incomplete";
+  } else if (!generationAttestationComplete) {
+    blockReason = "generation_attestation_incomplete";
+  }
+  else if (!countsMatch) blockReason = "generation_counts_mismatch";
+  else if (!provenanceComplete) blockReason = "legacy_nullable_rows";
+  else if (!quotaOccurrencesComplete) {
+    blockReason = "quota_occurrences_incomplete";
+  } else if (!diagnosticsComplete) {
+    blockReason = "source_diagnostics_incomplete";
+  }
+  const generationProof = blockReason === null;
+  return {
+    status: generationProof ? "complete" : "partial",
+    indexStatus,
+    blockReason,
+    generatedAt,
+    coveredAt,
+    generationId: currentGenerationId,
+    generationFingerprint: fingerprint,
+    generationProof,
+    requestedWindow,
+    sourceCount,
+    sourceBytes,
+    usageEvents,
+    quotaObservations,
+    quotaOccurrences,
+    toolFacts,
+    toolFactFingerprint: declaredToolFactFingerprint,
+    admittedQuotaOccurrences,
+    provenanceComplete,
+    quotaOccurrencesComplete,
+    toolFactsComplete,
+    diagnosticsComplete,
+    usageProvenanceAttested,
+    sourceOrderAttested,
+    quotaProvenanceAttested,
+    toolProvenanceAttested,
+    currentGeneration: generation,
+  };
+}
+
+function validateUsageJoins(
+  database,
+  { startAt, endAt, verifyPublishedGeneration = false } = {},
+) {
+  const where = verifyPublishedGeneration ? "" : `
+    WHERE u.observed_at_ms >= ? AND u.observed_at_ms <= ?`;
+  const parameters = verifyPublishedGeneration
+    ? []
+    : [Date.parse(startAt), Date.parse(endAt)];
+  const usageCount = Number(database.prepare(`
+    SELECT COUNT(*) AS count FROM usage_event u${where}
+  `).get(...parameters)?.count ?? 0);
+  const joinedEvents = Number(database.prepare(`
+    SELECT COUNT(*) AS count
+    FROM usage_event u
+    JOIN model m ON m.id = u.model_id
+    JOIN tier_semantics t ON t.id = u.tier_id
+    JOIN surface_class s ON s.id = u.surface_id
+    JOIN account_scope a ON a.id = u.account_scope_id
+    ${where}
+  `).get(...parameters)?.count ?? 0);
+  if (!Number.isSafeInteger(usageCount)
+      || !Number.isSafeInteger(joinedEvents)
+      || joinedEvents !== usageCount) {
+    throw fixedError("local_unified_index_row_invalid");
+  }
+}
+
+function validateEventKey(value) {
+  if (!(value instanceof Uint8Array) || value.byteLength !== 32) {
+    throw fixedError("local_unified_index_row_invalid");
+  }
+}
+
+function timestampForMs(value) {
+  const observedAtMs = safeInteger(value);
+  try {
+    const timestamp = new Date(observedAtMs).toISOString();
+    if (canonicalInstant(timestamp) === null) {
+      throw fixedError("local_unified_index_row_invalid");
+    }
+    return { observedAtMs, timestamp };
+  } catch (error) {
+    if (error?.code === "local_unified_index_row_invalid") throw error;
+    throw fixedError("local_unified_index_row_invalid");
+  }
+}
+
+function usageComponents(row) {
+  return {
+    input_uncached_tokens: safeNonNegativeInteger(
+      row.tokens_in_uncached,
+      { nullable: true },
+    ),
+    input_cache_read_tokens: safeNonNegativeInteger(
+      row.tokens_in_cache_read,
+      { nullable: true },
+    ),
+    input_cache_write_tokens: safeNonNegativeInteger(
+      row.tokens_in_cache_write,
+      { nullable: true },
+    ),
+    output_text_tokens: safeNonNegativeInteger(
+      row.tokens_out_text,
+      { nullable: true },
+    ),
+    output_reasoning_tokens: safeNonNegativeInteger(
+      row.tokens_out_reasoning,
+      { nullable: true },
+    ),
+    output_combined_tokens: safeNonNegativeInteger(
+      row.tokens_out_combined,
+      { nullable: true },
+    ),
+  };
+}
+
+function hasUsage(components) {
+  return Object.values(components).some((value) => value > 0);
+}
+
+async function invoke(callback, value, signal) {
+  if (callback === undefined) return;
+  try {
+    const result = callback(value);
+    if (result && typeof result.then === "function") await result;
+  } catch (error) {
+    if (error?.name === "AbortError"
+        || error?.code === "ABORT_ERR"
+        || signal?.aborted) {
+      const aborted = fixedError(
+        "local_unified_index_read_aborted",
+        "AbortError",
+      );
+      aborted[ADAPTER_ABORT] = true;
+      throw aborted;
+    }
+    if (CALLBACK_RESOURCE_CODES.has(error?.code)) {
+      throw fixedError(error.code);
+    }
+    throw fixedError("local_unified_index_callback_failed");
+  }
+}
+
+function readDiagnostics(database, generationId) {
+  const diagnostics = {};
+  for (const row of database.prepare(`
+    SELECT code, SUM(count) AS count
+    FROM source_diagnostic
+    WHERE generation_id = ?
+    GROUP BY code
+    ORDER BY code
+  `).iterate(generationId)) {
+    const code = safeText(row.code);
+    const count = safeNonNegativeInteger(row.count);
+    diagnostics[code] = count;
+  }
+  return diagnostics;
+}
+
+function sameOpenedFile(before, after) {
+  if (!ownerOnlyRegularFile(after)) return false;
+  const canCompareIdentity = [before.dev, before.ino, after.dev, after.ino]
+    .every((value) => value !== undefined && value !== null);
+  return !canCompareIdentity
+    || (before.dev === after.dev && before.ino === after.ino);
+}
+
+async function revalidatePublishedSnapshot({
+  indexFile,
+  metadata,
+  database,
+  coverage,
+  requestedWindow,
+  verifyPublishedGeneration,
+}) {
+  let finalMetadata;
+  try {
+    finalMetadata = await lstat(indexFile);
+  } catch {
+    throw fixedError("local_unified_index_file_changed");
+  }
+  if (!sameOpenedFile(metadata, finalMetadata)) {
+    throw fixedError("local_unified_index_file_changed");
+  }
+
+  const finalCoverage = readCurrentGeneration(
+    database,
+    readMeta(database),
+    requestedWindow,
+    { verifyPublishedGeneration },
+  );
+  if (finalCoverage.generationId !== coverage.generationId
+      || finalCoverage.generationFingerprint
+        !== coverage.generationFingerprint) {
+    throw fixedError("local_unified_index_generation_mismatch");
+  }
+
+  // Close the race between the final lstat and the generation read. A
+  // copy-on-write publisher must leave the same inode at the path for the
+  // entire callback/read boundary.
+  let settledMetadata;
+  try {
+    settledMetadata = await lstat(indexFile);
+  } catch {
+    throw fixedError("local_unified_index_file_changed");
+  }
+  if (!sameOpenedFile(finalMetadata, settledMetadata)) {
+    throw fixedError("local_unified_index_file_changed");
+  }
+}
+
+function validateRequest({
+  startAt,
+  endAt,
+  signal,
+  onUsage,
+  onRateLimitSnapshot,
+}) {
+  const start = canonicalInstant(startAt);
+  const end = canonicalInstant(endAt);
+  if (start === null || end === null || Date.parse(start) > Date.parse(end)
+      || !validAbortSignal(signal)
+      || (onUsage !== undefined && typeof onUsage !== "function")
+      || (onRateLimitSnapshot !== undefined
+        && typeof onRateLimitSnapshot !== "function")) {
+    throw fixedError("local_unified_index_read_request_invalid", "TypeError");
+  }
+  return { startAt: start, endAt: end };
+}
+
+/**
+ * Return a scanner-shaped function over one already-published unified index.
+ * The connection is always read-only and is closed after callbacks settle.
+ */
+export function createLocalUnifiedAccountingSource({
+  indexFile,
+  requireComplete = false,
+  expectedGeneration = null,
+  contextBehavior = "source_native",
+  verifyPublishedGeneration = false,
+  fullIntegrity = false,
+} = {}) {
+  if (typeof indexFile !== "string" || indexFile.length < 1
+      || typeof requireComplete !== "boolean"
+      || typeof verifyPublishedGeneration !== "boolean"
+      || typeof fullIntegrity !== "boolean"
+      || !CONTEXT_BEHAVIORS.has(contextBehavior)) {
+    throw fixedError("local_unified_index_source_options_invalid", "TypeError");
+  }
+  const verifyGeneration = verifyPublishedGeneration || fullIntegrity;
+  const expected = expectedGenerationDescriptor(expectedGeneration);
+  return async function scanLocalUnifiedAccountingSource({
+    startAt,
+    endAt,
+    signal = null,
+    onUsage,
+    onRateLimitSnapshot,
+  } = {}) {
+    const window = validateRequest({
+      startAt,
+      endAt,
+      signal,
+      onUsage,
+      onRateLimitSnapshot,
+    });
+    throwIfAborted(signal);
+    let metadata;
+    try {
+      metadata = await lstat(indexFile);
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        throw fixedError("local_unified_index_missing");
+      }
+      throw fixedError("local_unified_index_unavailable");
+    }
+    if (!ownerOnlyRegularFile(metadata)) {
+      throw fixedError("local_unified_index_file_invalid");
+    }
+
+    let database;
+    try {
+      database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+      let reopenedMetadata;
+      try {
+        reopenedMetadata = await lstat(indexFile);
+      } catch {
+        throw fixedError("local_unified_index_file_changed");
+      }
+      if (!sameOpenedFile(metadata, reopenedMetadata)) {
+        throw fixedError("local_unified_index_file_changed");
+      }
+      const meta = readMeta(database);
+      const coverage = readCurrentGeneration(database, meta, window, {
+        verifyPublishedGeneration: verifyGeneration,
+      });
+      if (expected !== null
+          && ((expected.id !== null && expected.id !== coverage.generationId)
+            || (expected.fingerprint !== null
+              && expected.fingerprint !== coverage.generationFingerprint))) {
+        throw fixedError("local_unified_index_generation_mismatch");
+      }
+      const contractVersion = requiredMetaText(meta, "contract_version");
+      if (!SAFE_TOKEN.test(contractVersion)) {
+        throw fixedError("local_unified_index_meta_invalid");
+      }
+      validateUsageJoins(database, {
+        ...window,
+        verifyPublishedGeneration: verifyGeneration,
+      });
+      const compatibility = parserCompatibility(
+        database,
+        contractVersion,
+        coverage.generationId,
+      );
+      if (compatibility.status !== "compatible"
+          && coverage.status === "complete") {
+        coverage.status = "partial";
+        coverage.generationProof = false;
+        coverage.blockReason = "mixed_parser_versions";
+      }
+      if (requireComplete && coverage.status !== "complete") {
+        throw fixedError("local_unified_index_accounting_coverage_incomplete");
+      }
+      const diagnostics = readDiagnostics(database, coverage.generationId);
+      const startMs = Date.parse(window.startAt);
+      const endMs = Date.parse(window.endAt);
+      let sequence = 0;
+      const usageStatement = database.prepare(`
+        SELECT u.event_key,
+               u.observed_at_ms,
+               u.total_input_context,
+               u.tokens_in_uncached,
+               u.tokens_in_cache_read,
+               u.tokens_in_cache_write,
+               u.tokens_out_text,
+               u.tokens_out_reasoning,
+               u.tokens_out_combined,
+               u.source_local,
+               u.source_offset,
+               u.source_ordinal,
+               u.tier_observed_at_ms,
+               m.model_id,
+               t.billing_surface,
+               t.codex_speed_mode,
+               t.api_service_tier,
+               t.tier_source,
+               s.surface,
+               s.thread_source,
+               s.agent_scope,
+               s.lineage_disposition
+        FROM usage_event u
+        JOIN model m ON m.id = u.model_id
+        JOIN tier_semantics t ON t.id = u.tier_id
+        JOIN surface_class s ON s.id = u.surface_id
+        JOIN account_scope a ON a.id = u.account_scope_id
+        WHERE u.observed_at_ms >= ? AND u.observed_at_ms <= ?
+        ORDER BY u.observed_at_ms,
+                 COALESCE(u.source_ordinal, 2147483647),
+                 COALESCE(u.source_local, zeroblob(32)),
+                 COALESCE(u.source_offset, 9223372036854775807),
+                 u.event_key
+      `);
+      for (const row of usageStatement.iterate(startMs, endMs)) {
+        throwIfAborted(signal);
+        validateEventKey(row.event_key);
+        const { observedAtMs, timestamp } = timestampForMs(row.observed_at_ms);
+        const components = usageComponents(row);
+        if (!hasUsage(components)) continue;
+        const totalInputContextTokens = safeNonNegativeInteger(
+          row.total_input_context,
+          { nullable: true, nullValue: null },
+        );
+        const sourceLocal = safeDigest(row.source_local, { nullable: true });
+        const sourceOffset = safeNonNegativeInteger(
+          row.source_offset,
+          { nullable: true },
+        );
+        const sourceOrdinal = safeNonNegativeInteger(
+          row.source_ordinal,
+          { nullable: true },
+        );
+        const tierObservedAtMs = safeNonNegativeInteger(
+          row.tier_observed_at_ms,
+          { nullable: true },
+        );
+        const tierObservedAt = tierObservedAtMs === null
+          ? null
+          : timestampForMs(tierObservedAtMs).timestamp;
+        const usage = {
+          timestamp,
+          timestampMs: observedAtMs,
+          model: safeText(row.model_id),
+          components,
+          tierSemantics: {
+            billingSurface: safeText(row.billing_surface),
+            codexSpeedMode: safeText(row.codex_speed_mode),
+            apiServiceTier: safeText(row.api_service_tier),
+            tierSource: safeText(row.tier_source),
+            tierObservedAt,
+          },
+          surfaceClassification: {
+            surface: safeText(row.surface),
+            threadSource: safeText(row.thread_source),
+            agentScope: safeText(row.agent_scope),
+            lineageDisposition: safeText(row.lineage_disposition),
+          },
+        };
+        if (totalInputContextTokens !== null
+            || contextBehavior === "legacy_zero") {
+          usage.totalInputContextTokens = totalInputContextTokens ?? 0;
+        }
+        if (sourceLocal !== null) usage.sourceLocal = sourceLocal;
+        if (sourceOffset !== null) {
+          usage.sourceRecordOrdinal = sourceOffset;
+          usage.sourceOffset = sourceOffset;
+        }
+        if (sourceOrdinal !== null) {
+          usage.sourceRolloutOrdinal = sourceOrdinal;
+          usage.sourceOrdinal = sourceOrdinal;
+        }
+        if (onUsage !== undefined) {
+          usage.sequence = sequence++;
+          await invoke(onUsage, usage, signal);
+        }
+      }
+
+      const quotaStatement = database.prepare(`
+        SELECT q.id, q.observed_at_ms, q.provider, q.limit_id, q.slot,
+               q.plan_type, q.used_percent, q.resets_at_ms,
+               q.duration_mins, q.source_local, q.source_offset,
+               q.source_ordinal, q.slot_order,
+               s.surface, s.thread_source, s.agent_scope,
+               s.lineage_disposition
+        FROM quota_occurrence q
+        JOIN surface_class s ON s.id = q.surface_id
+        WHERE q.admission = 'admitted'
+          AND q.observed_at_ms >= ? AND q.observed_at_ms <= ?
+        ORDER BY q.observed_at_ms,
+                 q.source_ordinal,
+                 q.source_local,
+                 q.source_offset,
+                 q.slot_order,
+                 q.id
+      `);
+      for (const row of quotaStatement.iterate(startMs, endMs)) {
+        throwIfAborted(signal);
+        const { observedAtMs, timestamp } = timestampForMs(row.observed_at_ms);
+        const durationMins = safeNonNegativeInteger(row.duration_mins);
+        const resetsAtMs = safeNonNegativeInteger(row.resets_at_ms, {
+          nullable: true,
+          nullValue: null,
+        });
+        if (row.used_percent === null
+            || (typeof row.used_percent !== "number"
+              && typeof row.used_percent !== "bigint")) {
+          throw fixedError("local_unified_index_row_invalid");
+        }
+        const usedPercent = Number(row.used_percent);
+        const slot = safeText(row.slot);
+        const sourceLocal = safeDigest(row.source_local);
+        const sourceOffset = safeNonNegativeInteger(row.source_offset);
+        const sourceOrdinal = safeNonNegativeInteger(row.source_ordinal);
+        const slotOrder = safeNonNegativeInteger(row.slot_order);
+        if (!isValidQuotaWindowDuration(durationMins)
+            || resetsAtMs === null
+            || resetsAtMs <= 0
+            || resetsAtMs % 1_000 !== 0
+            || !Number.isFinite(usedPercent)
+            || usedPercent < 0
+            || usedPercent > 100
+            || !QUOTA_SLOTS.has(slot)) {
+          throw fixedError("local_unified_index_row_invalid");
+        }
+        const quota = {
+          timestamp,
+          timestampMs: observedAtMs,
+          window: {
+            provider: safeText(row.provider),
+            planType: safeText(row.plan_type, { nullable: true }),
+            limitId: safeText(row.limit_id),
+            slot,
+            usedPercent,
+            windowDurationMins: durationMins,
+            resetsAt: resetsAtMs / 1_000,
+          },
+          surfaceClassification: {
+            surface: safeText(row.surface),
+            threadSource: safeText(row.thread_source),
+            agentScope: safeText(row.agent_scope),
+            lineageDisposition: safeText(row.lineage_disposition),
+          },
+          sourceRolloutOrdinal: sourceOrdinal,
+          sourceRecordOrdinal: sourceOffset,
+          sourceLocal,
+          sourceOrdinal,
+          sourceOffset,
+          slotOrder,
+        };
+        if (onRateLimitSnapshot !== undefined) {
+          quota.sequence = sequence++;
+          await invoke(onRateLimitSnapshot, quota, signal);
+        }
+      }
+      throwIfAborted(signal);
+      await revalidatePublishedSnapshot({
+        indexFile,
+        metadata,
+        database,
+        coverage,
+        requestedWindow: window,
+        verifyPublishedGeneration: verifyGeneration,
+      });
+      const capabilities = {
+        readsRawSources: false,
+        deterministicCanonicalOrder: coverage.generationProof,
+        sourceOrderingProvenance: coverage.provenanceComplete,
+        sourceOffsetProvenance: coverage.provenanceComplete,
+        sourceScopedQuotaOccurrences: coverage.quotaOccurrencesComplete,
+        durableDiagnostics: coverage.diagnosticsComplete,
+        crashSafeGenerationPublication: coverage.generationProof,
+      };
+      return {
+        readerVersion: LOCAL_UNIFIED_ACCOUNTING_SOURCE_VERSION,
+        schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+        parserVersion: compatibility.parserVersions.length === 1
+          ? compatibility.parserVersions[0]
+          : null,
+        contractVersion,
+        compatibility,
+        coverage,
+        capabilities,
+        diagnosticCoverage: coverage.diagnosticsComplete
+          ? "complete"
+          : "partial",
+        diagnosticsAvailable: coverage.diagnosticsComplete,
+        diagnostics,
+        toolCallsByClass: {},
+        toolObservationsBySource: {},
+        serverBillableUnits: {},
+      };
+    } catch (error) {
+      if (typeof error?.code === "string"
+          && (error.code.startsWith("local_unified_index_")
+            || CALLBACK_RESOURCE_CODES.has(error.code)
+            || error[ADAPTER_ABORT] === true)) {
+        throw error;
+      }
+      throw fixedError("local_unified_index_read_failed");
+    } finally {
+      database?.close();
+    }
+  };
+}

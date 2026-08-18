@@ -17,6 +17,7 @@ import {
   writeLocalCollectorAccountingCache,
 } from "../src/local-collector-state.js";
 import {
+  beginUnifiedIndexGeneration,
   createUnifiedIndexWriter,
   openLocalUnifiedIndex,
 } from "../src/local-unified-index.js";
@@ -60,6 +61,363 @@ test("production replay-cache APIs reject the retired JSON cacheFile option", as
   await assert.rejects(
     readReplaySafeAccountingCacheImpl({ cacheFile: "/private/retired.json" }),
     /cacheFile was retired; use stateFile/u,
+  );
+});
+
+test("a direct cache build without a scanner or explicit source mode fails closed", async () => {
+  await assert.rejects(
+    buildReplaySafeAccountingCache({ now: () => NOW }),
+    (error) => error?.code === "accounting_source_required",
+  );
+  await assert.rejects(
+    buildReplaySafeAccountingCache({
+      sourceMode: "unified",
+      scan: completeUnifiedScanner([]),
+      now: () => NOW,
+    }),
+    (error) => error?.code === "accounting_unified_generation_required",
+  );
+  await assert.rejects(
+    readReplaySafeAccountingCacheImpl({
+      stateFile: "/private/unbound-unified-cache.sqlite",
+      sourceMode: "unified",
+    }),
+    (error) => error?.code === "accounting_unified_generation_required",
+  );
+});
+
+test("refresh defaults to the unified reader without consulting the legacy index", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-unified-default-"));
+  const stateFile = join(directory, "local-collector-state-v1.sqlite");
+  const legacyIndexFile = join(directory, "local-analysis-index-v2.sqlite");
+  await assert.rejects(
+    refreshReplaySafeAccountingCacheImpl({
+      stateFile,
+      codexHome: directory,
+      now: () => NOW,
+    }),
+    (error) => error?.code === "accounting_unified_generation_required",
+  );
+  await assert.rejects(
+    stat(legacyIndexFile),
+    (error) => error?.code === "ENOENT",
+  );
+  await assert.rejects(
+    refreshReplaySafeAccountingCacheImpl({
+      stateFile,
+      codexHome: directory,
+      expectedGeneration: "generation-test-1",
+      now: () => NOW,
+    }),
+    (error) => error?.code === "accounting_unified_index_missing",
+  );
+  await assert.rejects(
+    stat(legacyIndexFile),
+    (error) => error?.code === "ENOENT",
+  );
+});
+
+test("explicit legacy refresh keeps the injected characterization scanner on legacy authority", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-legacy-mode-"));
+  const cache = await refreshReplaySafeAccountingCacheImpl({
+    stateFile: join(directory, "local-collector-state-v1.sqlite"),
+    sourceMode: "legacy",
+    scan: scanner([]),
+    now: () => NOW,
+  });
+  assert.equal(cache.sourceDescriptor.mode, "legacy");
+  assert.equal(cache.sourceDescriptor.contextBehavior, "legacy_zero");
+  assert.equal(cache.history.status, "unavailable");
+});
+
+test("unified builds reject incomplete coverage and generation mismatches", async () => {
+  await assert.rejects(
+    buildReplaySafeAccountingCache({
+      sourceMode: "unified",
+      expectedGeneration: "generation-test-1",
+      scan: completeUnifiedScanner([], { coverageStatus: "partial" }),
+      now: () => NOW,
+    }),
+    (error) => error?.code === "accounting_unified_coverage_incomplete",
+  );
+  await assert.rejects(
+    buildReplaySafeAccountingCache({
+      sourceMode: "unified",
+      expectedGeneration: "generation-test-2",
+      scan: completeUnifiedScanner([]),
+      now: () => NOW,
+    }),
+    (error) => error?.code === "accounting_unified_generation_mismatch",
+  );
+  await assert.rejects(
+    buildReplaySafeAccountingCache({
+      sourceMode: "unified",
+      expectedGeneration: {
+        id: "generation-test-1",
+        fingerprint: "generation-fingerprint-expected",
+      },
+      scan: completeUnifiedScanner([], {
+        generationFingerprint: "generation-fingerprint-observed",
+      }),
+      now: () => NOW,
+    }),
+    (error) => error?.code === "accounting_unified_generation_mismatch",
+  );
+});
+
+test("numeric-like object generation ids normalize without changing fingerprints", async () => {
+  const cache = await buildReplaySafeAccountingCache({
+    sourceMode: "unified",
+    expectedGeneration: {
+      id: "1.0",
+      fingerprint: "generation-fingerprint-test-1",
+    },
+    scan: completeUnifiedScanner([], { generation: 1 }),
+    now: () => NOW,
+  });
+  assert.equal(cache.sourceDescriptor.generation, "1");
+  assert.equal(
+    cache.sourceDescriptor.generationFingerprint,
+    "generation-fingerprint-test-1",
+  );
+
+  await assert.rejects(
+    buildReplaySafeAccountingCache({
+      sourceMode: "unified",
+      expectedGeneration: {
+        id: "1.0",
+        fingerprint: "1.0",
+      },
+      scan: completeUnifiedScanner([], {
+        generation: 1,
+        generationFingerprint: "1",
+      }),
+      now: () => NOW,
+    }),
+    (error) => error?.code === "accounting_unified_generation_mismatch",
+  );
+});
+
+test("unified cache history is attached only after a matching second generation read", async () => {
+  const scan = completeUnifiedScanner([
+    usageEvent({
+      timestamp: "2026-07-27T11:00:00.000Z",
+      components: { input_uncached_tokens: 1_000 },
+    }),
+  ]);
+  const cache = await buildReplaySafeAccountingCache({
+    sourceMode: "unified",
+    expectedGeneration: "generation-test-1",
+    scan,
+    now: () => NOW,
+  });
+  assert.equal(scan.calls, 2);
+  assert.equal(cache.sourceDescriptor.mode, "unified");
+  assert.equal(cache.sourceDescriptor.generation, "generation-test-1");
+  assert.equal(cache.history.status, "available");
+  assert.equal(cache.history.coverage.status, "complete");
+  assert.equal(cache.history.generation, "generation-test-1");
+  assert.equal(
+    cache.history.generationFingerprint,
+    "generation-fingerprint-test-1",
+  );
+  assert.equal(
+    cache.history.coverage.generationFingerprint,
+    "generation-fingerprint-test-1",
+  );
+  assert.equal(cache.history.period.id, "history");
+  assert.equal(cache.history.period.events, 1);
+});
+
+test("cache reads invalidate when the unified generation no longer matches", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-generation-reuse-"));
+  const stateFile = join(directory, "local-collector-state-v1.sqlite");
+  const scan = completeUnifiedScanner([]);
+  await refreshReplaySafeAccountingCacheImpl({
+    stateFile,
+    sourceMode: "unified",
+    expectedGeneration: "generation-test-1",
+    scan,
+    now: () => NOW,
+  });
+  const available = await readReplaySafeAccountingCacheImpl({
+    stateFile,
+    sourceMode: "unified",
+    expectedGeneration: "generation-test-1",
+    contextBehavior: "legacy_zero",
+  });
+  assert.equal(available.status, "available");
+  assert.deepEqual(available.cache.sourceDescriptor, {
+    schemaVersion: "local-accounting-source-descriptor-v1",
+    mode: "unified",
+    contextBehavior: "legacy_zero",
+    readerVersion: "test-unified-reader-v1",
+    schemaVersionUsed: "test-unified-schema-v1",
+    parserVersion: "test-parser-v1",
+    contractVersion: "test-contract-v1",
+    generation: "generation-test-1",
+    generationFingerprint: "generation-fingerprint-test-1",
+    coverageStatus: "complete",
+    coverage: {
+      status: "complete",
+      generatedAt: "2026-07-27T12:00:00.000Z",
+      coveredAt: {
+        startAt: "2026-07-20T12:00:00.000Z",
+        endAt: "2026-07-27T12:00:00.000Z",
+      },
+      sourceCount: null,
+      sourceBytes: null,
+      usageEvents: null,
+      quotaObservations: null,
+      quotaOccurrences: null,
+      admittedQuotaOccurrences: null,
+      generationProof: true,
+    },
+    diagnosticsAvailable: true,
+    generationMatched: true,
+    fallbackCount: 0,
+    capabilities: {
+      readsRawSources: false,
+      deterministicCanonicalOrder: true,
+      sourceOrderingProvenance: true,
+      sourceOffsetProvenance: true,
+      sourceScopedQuotaOccurrences: true,
+      durableDiagnostics: true,
+      crashSafeGenerationPublication: true,
+    },
+  });
+  const contextInvalidated = await readReplaySafeAccountingCacheImpl({
+    stateFile,
+    sourceMode: "unified",
+    expectedGeneration: "generation-test-1",
+    contextBehavior: "source_native",
+  });
+  assert.deepEqual(contextInvalidated, {
+    status: "unavailable",
+    errorCode: "cache_context_behavior_mismatch",
+    cache: null,
+  });
+  const invalidated = await readReplaySafeAccountingCacheImpl({
+    stateFile,
+    sourceMode: "unified",
+    expectedGeneration: "generation-test-2",
+    contextBehavior: "legacy_zero",
+  });
+  assert.deepEqual(invalidated, {
+    status: "unavailable",
+    errorCode: "cache_generation_mismatch",
+    cache: null,
+  });
+
+  const fingerprintScan = completeUnifiedScanner([], {
+    generationFingerprint: "generation-fingerprint-current",
+  });
+  await refreshReplaySafeAccountingCacheImpl({
+    stateFile,
+    sourceMode: "unified",
+    expectedGeneration: {
+      id: "generation-test-1",
+      fingerprint: "generation-fingerprint-current",
+    },
+    scan: fingerprintScan,
+    now: () => NOW,
+  });
+  const fingerprintInvalidated = await readReplaySafeAccountingCacheImpl({
+    stateFile,
+    sourceMode: "unified",
+    expectedGeneration: {
+      id: "generation-test-1",
+      fingerprint: "generation-fingerprint-stale",
+    },
+    contextBehavior: "legacy_zero",
+  });
+  assert.deepEqual(fingerprintInvalidated, {
+    status: "unavailable",
+    errorCode: "cache_generation_mismatch",
+    cache: null,
+  });
+
+  const tampered = await readTestCache(stateFile);
+  tampered.sourceDescriptor.fallbackCount = 1;
+  await writeTestCache(stateFile, tampered);
+  const fallbackInvalidated = await readReplaySafeAccountingCacheImpl({
+    stateFile,
+    sourceMode: "unified",
+    expectedGeneration: {
+      id: "generation-test-1",
+      fingerprint: "generation-fingerprint-current",
+    },
+  });
+  assert.deepEqual(fallbackInvalidated, {
+    status: "unavailable",
+    errorCode: "cache_invalid",
+    cache: null,
+  });
+  tampered.sourceDescriptor.fallbackCount = 0;
+  tampered.history.generationFingerprint = "generation-fingerprint-tampered";
+  await writeTestCache(stateFile, tampered);
+  const historyInvalidated = await readReplaySafeAccountingCacheImpl({
+    stateFile,
+    sourceMode: "unified",
+    expectedGeneration: {
+      id: "generation-test-1",
+      fingerprint: "generation-fingerprint-current",
+    },
+    contextBehavior: "legacy_zero",
+  });
+  assert.deepEqual(historyInvalidated, {
+    status: "unavailable",
+    errorCode: "cache_invalid",
+    cache: null,
+  });
+});
+
+test("unified reader errors map to closed content-free accounting codes", async () => {
+  await assert.rejects(
+    buildReplaySafeAccountingCache({
+      sourceMode: "unified",
+      expectedGeneration: "generation-test-1",
+      now: () => NOW,
+      scan: async () => {
+        const error = new Error("private path and row contents");
+        error.code = "local_unified_index_row_invalid";
+        throw error;
+      },
+    }),
+    (error) => (
+      error?.code === "accounting_unified_index_invalid"
+      && error?.message === "accounting_unified_index_invalid"
+    ),
+  );
+  await assert.rejects(
+    buildReplaySafeAccountingCache({
+      sourceMode: "unified",
+      expectedGeneration: "generation-test-1",
+      now: () => NOW,
+      scan: async () => {
+        throw new Error("private path and row contents");
+      },
+    }),
+    (error) => (
+      error?.code === "accounting_unified_read_failed"
+      && error?.message === "accounting_unified_read_failed"
+    ),
+  );
+  await assert.rejects(
+    buildReplaySafeAccountingCache({
+      sourceMode: "unified",
+      expectedGeneration: "generation-test-1",
+      now: () => NOW,
+      scan: async () => {
+        const error = new Error("private path and row contents");
+        error.code = "accounting_private_internal_detail";
+        throw error;
+      },
+    }),
+    (error) => (
+      error?.code === "accounting_unified_read_failed"
+      && error?.message === "accounting_unified_read_failed"
+    ),
   );
 });
 
@@ -244,6 +602,56 @@ function scanner(events, diagnostics = {}) {
       },
     };
   };
+}
+
+function completeUnifiedScanner(
+  events = [],
+  {
+    generation = "generation-test-1",
+    generationFingerprint = "generation-fingerprint-test-1",
+    startAt = "2026-07-20T12:00:00.000Z",
+    endAt = "2026-07-27T12:00:00.000Z",
+    coverageStatus = "complete",
+    generationProof = true,
+  } = {},
+) {
+  let calls = 0;
+  const scan = async (options) => {
+    calls += 1;
+    for (const event of events) {
+      await options.onUsage?.(event);
+    }
+    return {
+      readerVersion: "test-unified-reader-v1",
+      schemaVersion: "test-unified-schema-v1",
+      parserVersion: "test-parser-v1",
+      contractVersion: "test-contract-v1",
+      generation,
+      generationFingerprint,
+      coverage: {
+        status: coverageStatus,
+        generationProof,
+        generatedAt: endAt,
+        coveredAt: { startAt, endAt },
+      },
+      diagnosticsAvailable: true,
+      capabilities: {
+        readsRawSources: false,
+        deterministicCanonicalOrder: true,
+        sourceOrderingProvenance: true,
+        sourceOffsetProvenance: true,
+        sourceScopedQuotaOccurrences: true,
+        durableDiagnostics: true,
+        crashSafeGenerationPublication: true,
+      },
+      diagnostics: {},
+    };
+  };
+  Object.defineProperty(scan, "calls", {
+    enumerable: true,
+    get: () => calls,
+  });
+  return scan;
 }
 
 function weeklySnapshot({
@@ -588,6 +996,37 @@ test("replay-safe cache rejects price-card event and exact-cost reconciliation d
     errorCode: "cache_invalid",
     cache: null,
   });
+});
+
+test("exact decimal totals survive a floating-point half-boundary round trip", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-exact-money-rounding-"));
+  const stateFile = join(directory, "local-collector-state-v1.sqlite");
+  const events = Array.from({ length: 31 }, (_, index) => usageEvent({
+    timestamp: new Date(NOW - 60_000 + index).toISOString(),
+    model: "gpt-5.6-terra",
+    components: { input_uncached_tokens: 1 },
+  }));
+
+  // At $2.50 / million tokens, the exact sum is on a seventh-decimal half
+  // boundary. Repeated binary-float addition lands on the other side of that
+  // boundary on some totals, so the published numeric projection must be
+  // derived from the exact decimal ledger rather than the accumulated float.
+  const cache = await refreshReplaySafeAccountingCache({
+    cacheFile: stateFile,
+    now: () => NOW,
+    scan: scanner(events),
+  });
+  const all = period(cache, "all");
+  assert.equal(all.apiPriceEquivalentUsdExact, "0.0000775");
+  assert.equal(all.apiPriceEquivalentUsd, 0.000078);
+  assert.doesNotThrow(() => assertReplaySafeAccountingCache(cache));
+
+  const stored = await readReplaySafeAccountingCache({
+    cacheFile: stateFile,
+    now: () => NOW,
+  });
+  assert.equal(stored.status, "available");
+  assert.equal(period(stored.cache, "all").apiPriceEquivalentUsd, 0.000078);
 });
 
 test("separated output takes precedence over a duplicate combined alias", async () => {
@@ -1250,8 +1689,16 @@ async function writeUnifiedCalibrationFixture(indexFile, {
   boundaries = 10,
 }) {
   const database = openLocalUnifiedIndex(indexFile, { create: true });
+  const generation = beginUnifiedIndexGeneration(database, {
+    contractVersion: "unified-calibration-test-v1",
+    discoveredSourceCount: 0,
+    discoveredSourceBytes: 0,
+  });
   const writer = createUnifiedIndexWriter(database, {
     contractVersion: "unified-calibration-test-v1",
+    generationId: generation.generationId,
+    parserVersionId: generation.parserVersionId,
+    ingestRunId: generation.ingestRunId,
   });
   const modelId = writer.internModel("gpt-5.6-terra", "recognized");
   const tierId = writer.internTier({
@@ -1305,6 +1752,16 @@ async function writeUnifiedCalibrationFixture(indexFile, {
       });
     }
   }
+  writer.finalizeGeneration({
+    status: "partial",
+    blockReason: "calibration_fixture",
+    discoveredSourceCount: 0,
+    discoveredSourceBytes: 0,
+    indexedSourceCount: 0,
+    indexedSourceBytes: 0,
+    discoveryComplete: false,
+    diagnosticsComplete: false,
+  });
   await writer.close({ integrityCheck: true, fsyncPath: indexFile });
 }
 
@@ -1391,6 +1848,42 @@ test("declared speed baselines resolve unified calibration events before scenari
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("unified calibration canonicalizes a decimal SQLite generation id", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-unified-generation-token-"));
+  const indexFile = join(directory, "local-unified-index-v1.sqlite");
+  await writeUnifiedCalibrationFixture(indexFile, {
+    resets: [Date.parse("2025-05-01T00:00:00.000Z")],
+    boundaries: 4,
+  });
+
+  const database = openLocalUnifiedIndex(indexFile);
+  database.prepare(
+    "INSERT INTO meta(key, value) VALUES (?, ?) "
+      + "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+  ).run("current_generation_id", "1.0");
+  assert.equal(database.prepare(
+    "SELECT value FROM meta WHERE key = 'current_generation_id'",
+  ).get()?.value, "1.0");
+  database.close();
+
+  const cache = await buildReplaySafeAccountingCache({
+    now: () => Date.parse("2026-08-20T12:00:00.000Z"),
+    sourceMode: "unified",
+    expectedGeneration: 1,
+    unifiedIndexFile: indexFile,
+    scan: completeUnifiedScanner([], {
+      generation: 1,
+      startAt: "2026-07-20T12:00:00.000Z",
+      endAt: "2026-07-27T12:00:00.000Z",
+    }),
+  });
+
+  assert.equal(cache.sourceDescriptor.mode, "unified");
+  assert.equal(cache.sourceDescriptor.generation, "1");
+  assert.equal(cache.weeklyCalibrationInput.source, "unified_index");
+  assert.equal(cache.weeklyCalibrationInput.retainedUsageEvents, 3);
 });
 
 test("a missing or empty unified index degrades honestly to the windowed corpus", async () => {

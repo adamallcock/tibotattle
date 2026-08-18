@@ -1400,6 +1400,12 @@ export async function runCollectorOnce({
   refreshStale = true,
   backfill = false,
   backfillSinceAt = null,
+  // Unified-index authority does not need the legacy rollout ledger. This
+  // opt-in path keeps the checkpoint and quota snapshot semantics, but skips
+  // rollout discovery/ingestion entirely so an inherited recent backfill can
+  // never keep growing collector state. It is intentionally false by
+  // default; legacy callers retain the existing collection behavior.
+  skipRolloutIngestion = false,
   signal = null,
   onProgress = null,
   maximumBufferedLineBytes = MAX_BUFFERED_ROLLOUT_LINE_BYTES,
@@ -1424,6 +1430,9 @@ export async function runCollectorOnce({
   if (backfillSinceAt !== null) {
     canonicalInstant(backfillSinceAt, "backfillSinceAt");
     if (!backfill) throw new TypeError("backfillSinceAt requires backfill");
+  }
+  if (typeof skipRolloutIngestion !== "boolean") {
+    throw new TypeError("skipRolloutIngestion must be boolean");
   }
   if (typeof stateFile !== "string" || stateFile.length < 1) {
     throw new TypeError("stateFile must be a non-empty string");
@@ -1466,6 +1475,87 @@ export async function runCollectorOnce({
       backfillSinceAt: requestedBackfillStart,
       nowIso,
     });
+
+    if (skipRolloutIngestion) {
+      // The unified index owns usage facts. Keep the existing bounded
+      // indexing descriptor available to the quick headline, then perform
+      // only the independent provider quota refresh below. No raw rollout
+      // files are discovered or read, and no legacy collector records are
+      // appended.
+      await emitIndexingProgress(onProgress, indexing);
+      const lastObservedMs = checkpoint.lastQuotaObservedAt
+        ? Date.parse(checkpoint.lastQuotaObservedAt)
+        : Number.NEGATIVE_INFINITY;
+      const shouldRefresh = !signal?.aborted
+        && refreshStale
+        && clock() - lastObservedMs > staleAfterMs;
+      let refresh = { attempted: false, recordWritten: false, errorCode: null };
+      if (shouldRefresh) {
+        refresh.attempted = true;
+        try {
+          client = appServerFactory();
+          abortClient = () => client?.close();
+          signal?.addEventListener("abort", abortClient, { once: true });
+          await client.start();
+          if (signal?.aborted) throw new Error("collector_aborted");
+          const capturedAt = new Date(clock()).toISOString();
+          const payload = await readSanitizedAppServerSnapshot(
+            client,
+            capturedAt,
+            loadAccountObservationSecret,
+          );
+          if (signal?.aborted) throw new Error("collector_aborted");
+          const record = await appendAppRecord({
+            payload,
+            source: "app_server_read",
+            checkpoint,
+            clock,
+            commitRecord: commitRecords,
+          });
+          refresh.recordWritten = record !== null;
+          if (record !== null) {
+            const notificationEvidence = notificationEvidenceFromAppServerRecord(record);
+            if (notificationEvidence !== null) {
+              refresh.notificationEvidence = notificationEvidence;
+            }
+          }
+        } catch (error) {
+          const restored = await readLocalCollectorCheckpoint({ stateFile });
+          if (!restored) throw new Error("Collector app-record recovery completed without a durable checkpoint");
+          for (const key of Object.keys(checkpoint)) delete checkpoint[key];
+          Object.assign(checkpoint, restored);
+          if (!signal?.aborted) refresh.errorCode = recordAppServerError(checkpoint, error);
+        } finally {
+          signal?.removeEventListener("abort", abortClient);
+          abortClient = null;
+          client?.close();
+        }
+      }
+      checkpoint.savedAt = new Date(clock()).toISOString();
+      await saveCheckpoint();
+      await emitIndexingProgress(onProgress, checkpoint.indexing);
+      const skippedResult = {
+        mode: "run_once",
+        status: signal?.aborted ? "bounded_pause" : "complete",
+        pauseReason: signal?.aborted ? "collector_aborted" : null,
+        resourceLimit: null,
+        rolloutRecordsWritten: 0,
+        recordBatchesWritten: 0,
+        maximumBufferedRecords: 0,
+        filesDiscovered: 0,
+        filesSelected: 0,
+        filesProcessed: 0,
+        refresh,
+        indexing: cloneIndexing(checkpoint.indexing),
+        diagnostics: publicDiagnostics(checkpoint.diagnostics),
+      };
+      if (pooled !== null) {
+        sessionSettled = true;
+        await pooled.close();
+      }
+      return resultStateProperties(skippedResult, { stateFile });
+    }
+
     const indexingRun = indexing.mode === "recent_7d"
       && !["recent_7d_complete", "recent_7d_partial"].includes(indexing.status);
     const priorIndexedRecords = indexing.status === "bounded_pause"

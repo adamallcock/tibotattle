@@ -23,6 +23,9 @@ import { readBoundedUtf8LineEntries } from "./platform/index.js";
 // Raw Codex rollout JSONL is input owned by Codex, not application state.
 export const LOCAL_COLLECTOR_STATE_SCHEMA_VERSION =
   "local-collector-state-v1";
+export const LOCAL_COLLECTOR_LEGACY_REFRESH_USE_SCHEMA_VERSION =
+  "local-collector-legacy-refresh-use-v1";
+export const LOCAL_COLLECTOR_LEGACY_REFRESH_USE_MAX = 1_000_000;
 
 const STATE_APPLICATION_ID = 0x554d4353;
 const STATE_USER_VERSION = 1;
@@ -82,6 +85,40 @@ function validIso(value) {
   const milliseconds = Date.parse(value);
   return Number.isFinite(milliseconds)
     && new Date(milliseconds).toISOString() === value;
+}
+
+function emptyLegacyRefreshUse() {
+  return {
+    schemaVersion: LOCAL_COLLECTOR_LEGACY_REFRESH_USE_SCHEMA_VERSION,
+    sourceMode: "legacy",
+    attempts: 0,
+    saturated: false,
+    lastAttemptedAt: null,
+  };
+}
+
+function normalizeLegacyRefreshUse(value) {
+  if (value === null) return emptyLegacyRefreshUse();
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.schemaVersion
+        !== LOCAL_COLLECTOR_LEGACY_REFRESH_USE_SCHEMA_VERSION
+      || value.sourceMode !== "legacy"
+      || !Number.isSafeInteger(value.attempts)
+      || value.attempts < 0
+      || value.attempts > LOCAL_COLLECTOR_LEGACY_REFRESH_USE_MAX
+      || typeof value.saturated !== "boolean"
+      || value.saturated
+        !== (value.attempts === LOCAL_COLLECTOR_LEGACY_REFRESH_USE_MAX)
+      || (value.lastAttemptedAt !== null && !validIso(value.lastAttemptedAt))) {
+    throw fixedError("local_collector_state_corrupt");
+  }
+  return {
+    schemaVersion: LOCAL_COLLECTOR_LEGACY_REFRESH_USE_SCHEMA_VERSION,
+    sourceMode: "legacy",
+    attempts: value.attempts,
+    saturated: value.saturated,
+    lastAttemptedAt: value.lastAttemptedAt,
+  };
 }
 
 function sha256(value) {
@@ -678,6 +715,7 @@ export async function readLocalCollectorState({
       status: "missing",
       checkpoint: null,
       accountingCache: null,
+      legacyRefreshUse: emptyLegacyRefreshUse(),
       migration: null,
       records: includeRecords ? [] : null,
     };
@@ -689,12 +727,73 @@ export async function readLocalCollectorState({
       status: "available",
       checkpoint: readMeta(database, "checkpoint"),
       accountingCache: readMeta(database, "accounting_cache"),
+      legacyRefreshUse: normalizeLegacyRefreshUse(
+        readMeta(database, "legacy_refresh_use"),
+      ),
       migration: readMeta(database, "legacy_migration"),
       records: includeRecords ? readRecords(database) : null,
     };
   } finally {
     database?.close();
   }
+}
+
+export async function recordLocalCollectorLegacyRefreshAttempt({
+  stateFile = defaultLocalCollectorStatePath(),
+  clock = () => Date.now(),
+} = {}) {
+  if (typeof stateFile !== "string" || stateFile.length < 1
+      || typeof clock !== "function") {
+    throw new TypeError("Local legacy refresh receipt request is invalid");
+  }
+  const nowMs = clock();
+  if (!Number.isFinite(nowMs)) {
+    throw new TypeError("clock must return a finite epoch timestamp");
+  }
+  const lastAttemptedAt = new Date(nowMs).toISOString();
+  await ensureDatabase(stateFile);
+  let database;
+  let receipt;
+  try {
+    database = openDatabase(stateFile, { readOnly: false });
+    receipt = transaction(database, () => {
+      const current = normalizeLegacyRefreshUse(
+        readMeta(database, "legacy_refresh_use"),
+      );
+      const attempts = Math.min(
+        LOCAL_COLLECTOR_LEGACY_REFRESH_USE_MAX,
+        current.attempts + 1,
+      );
+      const next = {
+        schemaVersion: LOCAL_COLLECTOR_LEGACY_REFRESH_USE_SCHEMA_VERSION,
+        sourceMode: "legacy",
+        attempts,
+        saturated: attempts === LOCAL_COLLECTOR_LEGACY_REFRESH_USE_MAX,
+        lastAttemptedAt,
+      };
+      writeMeta(database, "legacy_refresh_use", next);
+      return next;
+    });
+    database.exec("PRAGMA optimize");
+  } finally {
+    database?.close();
+  }
+  await chmod(stateFile, 0o600);
+  await syncStateFile(stateFile);
+  return receipt;
+}
+
+export async function readLocalCollectorLegacyRefreshUse({
+  stateFile = defaultLocalCollectorStatePath(),
+} = {}) {
+  const state = await readLocalCollectorState({
+    stateFile,
+    includeRecords: false,
+  });
+  return {
+    status: state.status,
+    receipt: state.legacyRefreshUse,
+  };
 }
 
 export async function readLocalCollectorCheckpoint({

@@ -1,5 +1,5 @@
-import { createHmac, randomBytes } from "node:crypto";
-import { constants } from "node:fs";
+import { createHash, createHmac, randomBytes } from "node:crypto";
+import { constants, lstatSync } from "node:fs";
 import { chmod, lstat, mkdir, open, rename, unlink } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -26,7 +26,8 @@ import { DatabaseSync } from "node:sqlite";
 //     under the old shape each rotation invalidated the whole index.
 //   * `scope_local` is the same construction over the local account scope id.
 
-export const LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v1";
+export const LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v2";
+const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v1";
 
 // Stamped onto every row. A parser change re-scans only the affected rows'
 // source files; rows whose rollout files have rotated away keep their
@@ -69,7 +70,15 @@ export const LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v1";
 // cursor over NULL order state. Rows retained from rotated older-parser
 // sources remain distinguishable by provenance and are withheld from
 // adjacency analysis rather than guessed into an order.
-export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v6";
+//
+// v7 (2026-08-17): every current usage and quota fact is bound to a staged,
+// attested publication generation with exact source-local ordering and
+// source-scoped quota admission. This composes the v6 boundary/order contract
+// with the unified accounting cutover's provenance contract.
+// v8 (2026-08-17): typed response-item tool observations are source-scoped and
+// generation-bound. Existing v7 cursors must rescan so a complete generation
+// cannot silently publish an empty tool projection for already indexed files.
+export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v8";
 
 // A row salvaged from a line that exceeded the bounded-line cap carries this
 // parser version instead. The agreed schema has no "partial" column and the
@@ -78,7 +87,7 @@ export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v6";
 // degraded row is recorded. Kept in lockstep with the main constant: salvaged
 // rows run the same delta derivation.
 export const LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v6-partial";
+  "unified-rollout-typed-v8-partial";
 
 const INDEX_APPLICATION_ID = 0x554d5549;
 // Version 2 (2026-08-07) widens version 1 with the two incremental-ingest
@@ -90,16 +99,39 @@ const INDEX_APPLICATION_ID = 0x554d5549;
 // adds local-only, content-free usage-boundary state and relation tables.
 // Version 5 (2026-08-16) adds the exact content-free source order of each
 // usage event. Version 6 stores that order compactly as two nullable integer
-// columns on usage_event plus one interned local-source dimension. Each
-// widening is purely additive, so an older index opened writable is migrated
-// in place. Its rows survive, which matters because rows whose rollout files
-// have rotated away can never be rebuilt. An older index opened read-only stays
-// valid as it is: readers never touch the new tables.
-const INDEX_USER_VERSION = 6;
-const MIGRATABLE_USER_VERSIONS = new Set([1, 2, 3, 4, 5, 6]);
+// columns on usage_event plus one interned local-source dimension. Version 7
+// adds generation-bound usage/quota provenance. Version 8 adds source-scoped,
+// generation-bound tool facts and widens the closed diagnostic vocabulary.
+// Each widening is additive except that closed diagnostic CHECK widening,
+// which is rebuilt transactionally while preserving every existing row.
+export const LOCAL_UNIFIED_INDEX_USER_VERSION = 8;
+const INDEX_USER_VERSION = LOCAL_UNIFIED_INDEX_USER_VERSION;
+const MIGRATABLE_USER_VERSIONS = new Set([1, 2, 3, 4, 5, 6, 7, 8]);
 const SECRET_BYTES = 32;
 const MAX_SECRET_BYTES = 256;
 const DEFAULT_COMMIT_ROWS = 10_000;
+const DIAGNOSTIC_CODES = new Set([
+  "relevantLines",
+  "malformedLines",
+  "malformedTimestamps",
+  "partialLines",
+  "salvagedRecords",
+  "turnContexts",
+  "tokenCounts",
+  "forkReplayEventsSkipped",
+  "unattributedForkReplayEventsSkipped",
+  "cumulativeCounterRegressions",
+  "tierEvents",
+  "modelSeededFromLineage",
+  "tierSeededFromLineage",
+  "modelMissing",
+  "oversizedLines",
+  "contradictedLeadingSnapshotsSkipped",
+  "toolRecords",
+  "toolEvents",
+  "toolRecordsSkipped",
+  "toolSourceHistoryUnavailable",
+]);
 // The one shape a stored raw session identity may take: the provider-issued
 // UUID. Deliberately narrower than the transport regex so a filename-shaped
 // rollout-key fallback can never be recorded as an identity.
@@ -167,6 +199,41 @@ const SCHEMA = `
     received_at_ms INTEGER NOT NULL,
     parser_version_id INTEGER NOT NULL REFERENCES parser_version) STRICT;
 
+  -- A generation is the publication unit. Facts may be committed in batches,
+  -- but only a generation whose final transaction says complete may become
+  -- the reader's current publication.
+  CREATE TABLE IF NOT EXISTS index_generation(
+    id INTEGER PRIMARY KEY,
+    started_at_ms INTEGER NOT NULL,
+    completed_at_ms INTEGER,
+    parser_version_id INTEGER NOT NULL REFERENCES parser_version,
+    contract_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN
+      ('in_progress', 'complete', 'partial', 'failed')),
+    block_reason TEXT,
+    discovered_source_count INTEGER,
+    discovered_source_bytes INTEGER,
+    indexed_source_count INTEGER,
+    indexed_source_bytes INTEGER,
+    usage_events INTEGER,
+    quota_occurrences INTEGER,
+    covered_start_ms INTEGER,
+    covered_end_ms INTEGER,
+    discovery_complete INTEGER NOT NULL DEFAULT 0
+      CHECK(discovery_complete IN (0, 1)),
+    diagnostics_complete INTEGER NOT NULL DEFAULT 0
+      CHECK(diagnostics_complete IN (0, 1)),
+    usage_provenance_complete INTEGER NOT NULL DEFAULT 0
+      CHECK(usage_provenance_complete IN (0, 1)),
+    source_order_complete INTEGER NOT NULL DEFAULT 0
+      CHECK(source_order_complete IN (0, 1)),
+    quota_provenance_complete INTEGER NOT NULL DEFAULT 0
+      CHECK(quota_provenance_complete IN (0, 1)),
+    tool_facts INTEGER,
+    tool_fact_fingerprint TEXT,
+    tool_provenance_complete INTEGER NOT NULL DEFAULT 0
+      CHECK(tool_provenance_complete IN (0, 1))) STRICT;
+
   CREATE TABLE IF NOT EXISTS model(
     id INTEGER PRIMARY KEY,
     model_id TEXT NOT NULL UNIQUE,
@@ -219,22 +286,50 @@ const SCHEMA = `
     duration_mins INTEGER,
     UNIQUE(observed_at_ms, limit_id, slot)) STRICT;
 
+  -- Source-scoped quota occurrences preserve the readings that canonical
+  -- quota_observation deliberately deduplicates. admission is the closed
+  -- leading-window gate result; readers emit only admitted rows.
+  CREATE TABLE IF NOT EXISTS quota_occurrence(
+    id INTEGER PRIMARY KEY,
+    generation_id INTEGER REFERENCES index_generation,
+    source_local BLOB NOT NULL CHECK(length(source_local) = 32),
+    source_offset INTEGER NOT NULL CHECK(source_offset >= 0),
+    source_ordinal INTEGER NOT NULL CHECK(source_ordinal >= 0),
+    surface_id INTEGER NOT NULL REFERENCES surface_class,
+    canonical_observation_id INTEGER NOT NULL REFERENCES quota_observation,
+    observed_at_ms INTEGER NOT NULL,
+    provider TEXT NOT NULL,
+    plan_type TEXT,
+    limit_id TEXT NOT NULL,
+    slot TEXT NOT NULL,
+    slot_order INTEGER NOT NULL CHECK(slot_order >= 0),
+    used_percent REAL NOT NULL CHECK(used_percent >= 0 AND used_percent <= 100),
+    resets_at_ms INTEGER,
+    duration_mins INTEGER NOT NULL CHECK(duration_mins >= 1),
+    admission TEXT NOT NULL CHECK(admission IN
+      ('admitted', 'held', 'suppressed')),
+    UNIQUE(source_local, source_offset, slot_order)) STRICT;
+
   -- Facts. Fixed width, typed, no JSON.
   CREATE TABLE IF NOT EXISTS usage_event(
     event_key BLOB PRIMARY KEY,
     observed_at_ms INTEGER NOT NULL,
+    generation_id INTEGER REFERENCES index_generation,
     ingest_run_id INTEGER NOT NULL REFERENCES ingest_run,
     parser_version_id INTEGER NOT NULL REFERENCES parser_version,
     -- NULL only on retained rows from a parser/schema that predates exact
     -- source ordering. Current-parser writers always set both fields.
     source_id INTEGER REFERENCES source_dimension,
-    source_offset INTEGER,
     session_local BLOB NOT NULL,
     account_scope_id INTEGER NOT NULL REFERENCES account_scope,
     model_id INTEGER NOT NULL REFERENCES model,
     tier_id INTEGER NOT NULL REFERENCES tier_semantics,
     surface_id INTEGER NOT NULL REFERENCES surface_class,
     quota_observation_id INTEGER REFERENCES quota_observation,
+    source_local BLOB CHECK(source_local IS NULL OR length(source_local) = 32),
+    source_offset INTEGER CHECK(source_offset IS NULL OR source_offset >= 0),
+    source_ordinal INTEGER CHECK(source_ordinal IS NULL OR source_ordinal >= 0),
+    tier_observed_at_ms INTEGER,
     reasoning_effort INTEGER NOT NULL,
     outcome INTEGER NOT NULL,
     -- Token counts. Integers only. No prompt, reply, reasoning or file content
@@ -273,6 +368,23 @@ const SCHEMA = `
     count INTEGER NOT NULL,
     PRIMARY KEY(session_local, tool_class)) STRICT, WITHOUT ROWID;
 
+  -- Source-scoped, generation-bound tool observations. The compatibility
+  -- aggregate above remains for older contribution readers, but this table is
+  -- the authoritative unified projection: one deterministic fact per typed
+  -- response item and no raw tool name or input.
+  CREATE TABLE IF NOT EXISTS tool_class_fact(
+    event_key BLOB PRIMARY KEY CHECK(length(event_key) = 32),
+    generation_id INTEGER NOT NULL REFERENCES index_generation ON DELETE CASCADE,
+    source_local BLOB NOT NULL CHECK(length(source_local) = 32),
+    source_offset INTEGER NOT NULL CHECK(source_offset >= 0),
+    source_ordinal INTEGER NOT NULL CHECK(source_ordinal >= 0),
+    session_local BLOB NOT NULL CHECK(length(session_local) = 32),
+    observed_at_ms INTEGER NOT NULL,
+    tool_ordinal INTEGER NOT NULL CHECK(tool_ordinal >= 0),
+    tool_class TEXT NOT NULL CHECK(length(tool_class) BETWEEN 1 AND 64),
+    source_kind TEXT NOT NULL CHECK(length(source_kind) BETWEEN 1 AND 64),
+    UNIQUE(source_local, source_offset, tool_ordinal)) STRICT;
+
   -- Incremental ingest state (schema widening of 2026-08-07).
   --
   -- One row per rollout source: how far it has been scanned and the carried
@@ -281,6 +393,7 @@ const SCHEMA = `
   -- six cumulative token counters. No path, no content.
   CREATE TABLE IF NOT EXISTS source_cursor(
     source_local BLOB PRIMARY KEY,     -- HMAC(device_salt, rollout key)
+    source_ordinal INTEGER CHECK(source_ordinal IS NULL OR source_ordinal >= 0),
     session_local BLOB,
     scanned_bytes INTEGER NOT NULL,
     size_bytes INTEGER NOT NULL,
@@ -341,13 +454,81 @@ const SCHEMA = `
     session_local BLOB PRIMARY KEY,
     session_uuid TEXT NOT NULL) STRICT;
 
+  -- One row per discovered source in a generation. No path or rollout text is
+  -- retained; source_local is the device-local HMAC of the rollout key.
+  CREATE TABLE IF NOT EXISTS generation_source(
+    generation_id INTEGER NOT NULL REFERENCES index_generation ON DELETE CASCADE,
+    source_local BLOB NOT NULL CHECK(length(source_local) = 32),
+    source_ordinal INTEGER NOT NULL CHECK(source_ordinal >= 0),
+    session_local BLOB,
+    surface_id INTEGER NOT NULL REFERENCES surface_class,
+    status TEXT NOT NULL CHECK(status IN
+      ('pending', 'skipped', 'touched', 'resumed', 'rescanned', 'complete', 'failed')),
+    discovered_size_bytes INTEGER NOT NULL CHECK(discovered_size_bytes >= 0),
+    scanned_bytes INTEGER NOT NULL CHECK(scanned_bytes >= 0),
+    mtime_ms INTEGER NOT NULL,
+    diagnostics_complete INTEGER NOT NULL DEFAULT 0
+      CHECK(diagnostics_complete IN (0, 1)),
+    PRIMARY KEY(generation_id, source_local)) STRICT, WITHOUT ROWID;
+
+  -- Diagnostic names are deliberately a closed set. Counts contain no source
+  -- path, message or content and are only meaningful when the owning source
+  -- row says diagnostics_complete=1.
+  CREATE TABLE IF NOT EXISTS source_diagnostic(
+    generation_id INTEGER NOT NULL REFERENCES index_generation ON DELETE CASCADE,
+    source_local BLOB NOT NULL CHECK(length(source_local) = 32),
+    code TEXT NOT NULL CHECK(code IN (
+      'relevantLines', 'malformedLines', 'malformedTimestamps',
+      'partialLines', 'salvagedRecords', 'turnContexts', 'tokenCounts',
+      'forkReplayEventsSkipped', 'unattributedForkReplayEventsSkipped',
+      'cumulativeCounterRegressions', 'tierEvents', 'modelSeededFromLineage',
+      'tierSeededFromLineage', 'modelMissing', 'oversizedLines',
+      'contradictedLeadingSnapshotsSkipped', 'toolRecords', 'toolEvents',
+      'toolRecordsSkipped', 'toolSourceHistoryUnavailable')),
+    count INTEGER NOT NULL CHECK(count >= 0),
+    PRIMARY KEY(generation_id, source_local, code)) STRICT, WITHOUT ROWID;
+
+`;
+
+// These indexes accelerate readers or generation attestation but are not
+// needed by the writer's primary/UNIQUE conflict paths. A cold rebuild may
+// omit them while loading facts and build them once, after the load, so
+// SQLite does not maintain these secondary b-trees for every inserted row.
+// Keep this list fixed and ordered: it is part of the staged-publication
+// contract, not a caller-provided SQL surface. In particular,
+// quota_occurrence_canonical must exist before finalizeGeneration runs its
+// quota-observation coverage proof.
+const SECONDARY_INDEX_SCHEMA = `
   CREATE INDEX IF NOT EXISTS usage_event_observed
     ON usage_event(observed_at_ms);
   CREATE INDEX IF NOT EXISTS usage_event_session
     ON usage_event(session_local);
   CREATE INDEX IF NOT EXISTS usage_event_boundary_session
     ON usage_event_boundary(session_local);
+  CREATE INDEX IF NOT EXISTS usage_event_replay_order
+    ON usage_event(observed_at_ms, source_ordinal, source_local,
+                   source_offset, event_key);
+  CREATE INDEX IF NOT EXISTS quota_occurrence_canonical
+    ON quota_occurrence(canonical_observation_id);
+  CREATE INDEX IF NOT EXISTS quota_occurrence_replay_order
+    ON quota_occurrence(observed_at_ms, source_ordinal, source_local,
+                        source_offset, slot_order, id);
+  CREATE INDEX IF NOT EXISTS tool_class_fact_generation
+    ON tool_class_fact(generation_id, event_key);
+  CREATE INDEX IF NOT EXISTS tool_class_fact_source
+    ON tool_class_fact(source_local);
 `;
+
+const SECONDARY_INDEX_NAMES = Object.freeze([
+  "usage_event_observed",
+  "usage_event_session",
+  "usage_event_boundary_session",
+  "usage_event_replay_order",
+  "quota_occurrence_canonical",
+  "quota_occurrence_replay_order",
+  "tool_class_fact_generation",
+  "tool_class_fact_source",
+]);
 
 function fixedError(code) {
   const error = new Error(code);
@@ -371,6 +552,24 @@ function ownerOnlyRegularFile(metadata) {
     && metadata.nlink === 1
     && (typeof process.getuid !== "function" || metadata.uid === process.getuid())
     && (process.platform === "win32" || (metadata.mode & 0o077) === 0);
+}
+
+export async function assertSafeLocalUnifiedIndexTarget(
+  indexFile,
+  { allowMissing = true } = {},
+) {
+  let metadata;
+  try {
+    metadata = await lstat(resolve(indexFile));
+  } catch (error) {
+    if (allowMissing && error?.code === "ENOENT") return null;
+    if (error?.code?.startsWith("local_unified_index_")) throw error;
+    throw fixedError("local_unified_index_unavailable");
+  }
+  if (!ownerOnlyRegularFile(metadata)) {
+    throw fixedError("local_unified_index_file_invalid");
+  }
+  return metadata;
 }
 
 /**
@@ -512,17 +711,123 @@ function configureDatabase(database, { readOnly = false, staging = false } = {})
   database.enableDefensive?.(true);
 }
 
-function initializeSchema(database) {
+function schemaSql({ deferSecondaryIndexes = false } = {}) {
+  return deferSecondaryIndexes
+    ? SCHEMA
+    : `${SCHEMA}\n${SECONDARY_INDEX_SCHEMA}`;
+}
+
+function assertSecondaryIndexes(database) {
+  const placeholders = SECONDARY_INDEX_NAMES.map(() => "?").join(", ");
+  const present = new Set(database.prepare(
+    `SELECT name FROM sqlite_master
+     WHERE type = 'index' AND name IN (${placeholders})`,
+  ).all(...SECONDARY_INDEX_NAMES).map((row) => row.name));
+  const missing = SECONDARY_INDEX_NAMES.filter((name) => !present.has(name));
+  if (missing.length > 0) {
+    throw fixedError("local_unified_index_secondary_indexes_missing");
+  }
+}
+
+/**
+ * Build the reader-only secondary indexes on a fully loaded staging database.
+ * The transaction makes a partial index set invisible to any caller that
+ * keeps the stage open, and the caller publishes only after this succeeds.
+ */
+export function createLocalUnifiedIndexSecondaryIndexes(database) {
+  try {
+    database.exec("BEGIN IMMEDIATE");
+    database.exec(SECONDARY_INDEX_SCHEMA);
+    assertSecondaryIndexes(database);
+    database.exec("COMMIT");
+  } catch (error) {
+    try {
+      database.exec("ROLLBACK");
+    } catch {
+      // Preserve the index-creation failure; the staging owner discards the
+      // connection and file below.
+    }
+    if (error?.code?.startsWith("local_unified_index_")) throw error;
+    throw fixedError("local_unified_index_secondary_indexes_failed");
+  }
+}
+
+function initializeSchema(database, { deferSecondaryIndexes = false } = {}) {
   database.exec(`
     PRAGMA application_id=${INDEX_APPLICATION_ID};
     PRAGMA user_version=${INDEX_USER_VERSION};
-    ${SCHEMA}
+    ${schemaSql({ deferSecondaryIndexes })}
   `);
   database.prepare("INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)")
     .run("schema_version", LOCAL_UNIFIED_INDEX_SCHEMA_VERSION);
 }
 
-function validateDatabase(database, { readOnly = false } = {}) {
+function tableColumns(database, tableName) {
+  return new Set(database.prepare(`PRAGMA table_info(${tableName})`).all()
+    .map((row) => row.name));
+}
+
+function tableExists(database, tableName) {
+  return database.prepare(
+    "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?",
+  ).get(tableName) !== undefined;
+}
+
+function addColumnIfMissing(database, tableName, columnName, definition) {
+  if (tableColumns(database, tableName).has(columnName)) return;
+  database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+}
+
+function ensureGenerationAttestationColumns(database) {
+  addColumnIfMissing(database, "index_generation", "usage_provenance_complete",
+    "INTEGER NOT NULL DEFAULT 0 CHECK(usage_provenance_complete IN (0, 1))");
+  addColumnIfMissing(database, "index_generation", "source_order_complete",
+    "INTEGER NOT NULL DEFAULT 0 CHECK(source_order_complete IN (0, 1))");
+  addColumnIfMissing(database, "index_generation", "quota_provenance_complete",
+    "INTEGER NOT NULL DEFAULT 0 CHECK(quota_provenance_complete IN (0, 1))");
+  addColumnIfMissing(database, "index_generation", "tool_facts", "INTEGER");
+  addColumnIfMissing(database, "index_generation", "tool_fact_fingerprint", "TEXT");
+  addColumnIfMissing(database, "index_generation", "tool_provenance_complete",
+    "INTEGER NOT NULL DEFAULT 0 CHECK(tool_provenance_complete IN (0, 1))");
+}
+
+function ensureToolDiagnosticCodes(database) {
+  const sql = database.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'source_diagnostic'",
+  ).get()?.sql;
+  if (typeof sql !== "string"
+      || (sql.includes("toolRecordsSkipped")
+        && sql.includes("toolSourceHistoryUnavailable"))) return;
+  // SQLite cannot widen a CHECK constraint in place. Rebuild this small,
+  // content-free count table inside the caller's migration transaction so a
+  // v7 index either retains every diagnostic row under the v8 vocabulary or
+  // remains wholly v7 after rollback.
+  database.exec(`
+    ALTER TABLE source_diagnostic RENAME TO source_diagnostic_v7;
+    CREATE TABLE source_diagnostic(
+      generation_id INTEGER NOT NULL REFERENCES index_generation ON DELETE CASCADE,
+      source_local BLOB NOT NULL CHECK(length(source_local) = 32),
+      code TEXT NOT NULL CHECK(code IN (
+        'relevantLines', 'malformedLines', 'malformedTimestamps',
+        'partialLines', 'salvagedRecords', 'turnContexts', 'tokenCounts',
+        'forkReplayEventsSkipped', 'unattributedForkReplayEventsSkipped',
+        'cumulativeCounterRegressions', 'tierEvents', 'modelSeededFromLineage',
+        'tierSeededFromLineage', 'modelMissing', 'oversizedLines',
+        'contradictedLeadingSnapshotsSkipped', 'toolRecords', 'toolEvents',
+        'toolRecordsSkipped', 'toolSourceHistoryUnavailable')),
+      count INTEGER NOT NULL CHECK(count >= 0),
+      PRIMARY KEY(generation_id, source_local, code)) STRICT, WITHOUT ROWID;
+    INSERT INTO source_diagnostic(generation_id, source_local, code, count)
+      SELECT generation_id, source_local, code, count
+      FROM source_diagnostic_v7;
+    DROP TABLE source_diagnostic_v7;
+  `);
+}
+
+function validateDatabase(database, {
+  readOnly = false,
+  deferSecondaryIndexes = false,
+} = {}) {
   const applicationId = Number(
     database.prepare("PRAGMA application_id").get().application_id,
   );
@@ -532,66 +837,304 @@ function validateDatabase(database, { readOnly = false } = {}) {
   const schema = database.prepare(
     "SELECT value FROM meta WHERE key = 'schema_version'",
   ).get();
-  // Read-only connections accept any migratable version: readers never touch
-  // the widened tables, and rejecting a version-1 file here would force a
-  // rebuild that cannot recover rows whose rollout files have rotated away.
-  const acceptable = readOnly
-    ? MIGRATABLE_USER_VERSIONS.has(userVersion)
-    : userVersion === INDEX_USER_VERSION;
-  if (applicationId !== INDEX_APPLICATION_ID
-      || !acceptable
-      || schema?.value !== LOCAL_UNIFIED_INDEX_SCHEMA_VERSION) {
+  // Read-only connections may inspect a pre-v4 file, but it is explicitly a
+  // legacy partial source. Writable opens must migrate it before use.
+  const legacy = MIGRATABLE_USER_VERSIONS.has(userVersion)
+    && userVersion < INDEX_USER_VERSION
+    && schema?.value === LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION;
+  const current = userVersion === INDEX_USER_VERSION
+    && schema?.value === LOCAL_UNIFIED_INDEX_SCHEMA_VERSION;
+  const acceptable = readOnly ? (legacy || current) : current;
+  if (applicationId !== INDEX_APPLICATION_ID || !acceptable) {
     throw fixedError("local_unified_index_schema_invalid");
   }
+  if (current && !deferSecondaryIndexes) assertSecondaryIndexes(database);
+  return { userVersion, schemaVersion: schema?.value ?? null, legacy };
 }
 
-function migrateDatabase(database) {
+function migrateDatabase(database, { deferSecondaryIndexes = false } = {}) {
   const userVersion = Number(
     database.prepare("PRAGMA user_version").get().user_version,
   );
-  if (userVersion === INDEX_USER_VERSION) return;
   if (!MIGRATABLE_USER_VERSIONS.has(userVersion)) {
     throw fixedError("local_unified_index_schema_invalid");
   }
-  // Every migration is additive: create widened tables, add nullable columns,
-  // and stamp the new version. Existing rows are untouched by construction.
-  database.exec(SCHEMA);
-  const usageColumns = new Set(
-    database.prepare("PRAGMA table_info(usage_event)").all()
-      .map((column) => column.name),
-  );
-  if (!usageColumns.has("source_id")) {
-    database.exec(`
-      ALTER TABLE usage_event
-      ADD COLUMN source_id INTEGER REFERENCES source_dimension;
-    `);
+  // Every migration is additive and transactional: existing rows are left
+  // untouched, while old rows receive NULL generation/provenance by
+  // construction. A subsequent ingest sees the incomplete attestation and
+  // performs the staged rebuild before those rows can become authoritative.
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    // Create every missing table first, then widen pre-existing tables before
+    // creating indexes that refer to the new columns.
+    database.exec(SCHEMA);
+    addColumnIfMissing(database, "usage_event", "source_id",
+      "INTEGER REFERENCES source_dimension");
+    addColumnIfMissing(database, "usage_event", "generation_id",
+      "INTEGER REFERENCES index_generation");
+    addColumnIfMissing(database, "usage_event", "source_local",
+      "BLOB CHECK(source_local IS NULL OR length(source_local) = 32)");
+    addColumnIfMissing(database, "usage_event", "source_offset",
+      "INTEGER CHECK(source_offset IS NULL OR source_offset >= 0)");
+    addColumnIfMissing(database, "usage_event", "source_ordinal",
+      "INTEGER CHECK(source_ordinal IS NULL OR source_ordinal >= 0)");
+    addColumnIfMissing(database, "usage_event", "tier_observed_at_ms", "INTEGER");
+    addColumnIfMissing(database, "source_cursor", "source_ordinal",
+      "INTEGER CHECK(source_ordinal IS NULL OR source_ordinal >= 0)");
+    ensureToolDiagnosticCodes(database);
+    if (!deferSecondaryIndexes) database.exec(SECONDARY_INDEX_SCHEMA);
+    ensureGenerationAttestationColumns(database);
+    database.prepare(
+      "INSERT INTO meta(key, value) VALUES (?, ?) "
+        + "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    ).run("schema_version", LOCAL_UNIFIED_INDEX_SCHEMA_VERSION);
+    database.exec(`PRAGMA user_version=${INDEX_USER_VERSION}`);
+    database.exec("COMMIT");
+  } catch (error) {
+    try {
+      database.exec("ROLLBACK");
+    } catch {
+      // Preserve the original migration failure.
+    }
+    throw error;
   }
-  if (!usageColumns.has("source_offset")) {
-    database.exec(`
-      ALTER TABLE usage_event ADD COLUMN source_offset INTEGER;
-    `);
-  }
-  database.exec(`PRAGMA user_version=${INDEX_USER_VERSION};`);
 }
 
 export function openLocalUnifiedIndex(indexFile, {
   readOnly = false,
   create = false,
   staging = false,
+  deferSecondaryIndexes = false,
 } = {}) {
+  if (deferSecondaryIndexes && (readOnly || !create || !staging)) {
+    throw fixedError("local_unified_index_deferred_indexes_invalid");
+  }
+  if (deferSecondaryIndexes) {
+    try {
+      lstatSync(resolve(indexFile));
+      throw fixedError("local_unified_index_deferred_indexes_requires_new_stage");
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        // The stage is genuinely new. DatabaseSync creates it below.
+      } else if (error?.code?.startsWith("local_unified_index_")) {
+        throw error;
+      } else {
+        throw fixedError("local_unified_index_unavailable");
+      }
+    }
+  }
   let database;
   try {
     database = new DatabaseSync(indexFile, { readOnly, timeout: 5_000 });
     configureDatabase(database, { readOnly, staging });
-    if (create) initializeSchema(database);
-    if (!readOnly) migrateDatabase(database);
-    validateDatabase(database, { readOnly });
+    if (create) initializeSchema(database, { deferSecondaryIndexes });
+    if (!readOnly) migrateDatabase(database, { deferSecondaryIndexes });
+    validateDatabase(database, { readOnly, deferSecondaryIndexes });
     return database;
   } catch (error) {
     if (database?.isOpen) database.close();
     if (error?.code?.startsWith("local_unified_index_")) throw error;
     throw fixedError("local_unified_index_unavailable");
   }
+}
+
+/**
+ * Mark abandoned writer generations before starting a new publication. A
+ * reader treats in_progress as partial, so this is recovery bookkeeping, not
+ * an attempt to make an interrupted pass appear complete.
+ */
+export function recoverUnifiedIndexGenerations(database) {
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const result = database.prepare(`
+      UPDATE index_generation
+      SET status = 'partial', block_reason = 'crash_recovered',
+          completed_at_ms = COALESCE(completed_at_ms, ?)
+      WHERE status = 'in_progress'`).run(Date.now());
+    database.exec("COMMIT");
+    return Number(result.changes ?? 0);
+  } catch (error) {
+    try {
+      database.exec("ROLLBACK");
+    } catch {
+      // Preserve original failure.
+    }
+    throw error;
+  }
+}
+
+/** Begin a durable generation before any source facts are changed. */
+export function beginUnifiedIndexGeneration(database, {
+  parserVersion = LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  contractVersion,
+  receivedAtMs = Date.now(),
+  discoveredSourceCount = null,
+  discoveredSourceBytes = null,
+} = {}) {
+  if (typeof contractVersion !== "string" || contractVersion.length < 1) {
+    throw new TypeError("contractVersion must be a non-empty string");
+  }
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database.prepare(`
+      INSERT INTO parser_version(parser_version, contract_version)
+      VALUES (?, ?) ON CONFLICT DO NOTHING`).run(parserVersion, contractVersion);
+    const parserVersionId = Number(database.prepare(`
+      SELECT id FROM parser_version
+      WHERE parser_version = ? AND contract_version = ?
+    `).get(parserVersion, contractVersion).id);
+    const ingestRunId = Number(database.prepare(`
+      INSERT INTO ingest_run(received_at_ms, parser_version_id)
+      VALUES (?, ?)
+    `).run(receivedAtMs, parserVersionId).lastInsertRowid);
+    const generationId = Number(database.prepare(`
+      INSERT INTO index_generation(
+        started_at_ms, parser_version_id, contract_version, status,
+        discovered_source_count, discovered_source_bytes)
+      VALUES (?, ?, ?, 'in_progress', ?, ?)
+    `).run(
+      receivedAtMs,
+      parserVersionId,
+      contractVersion,
+      discoveredSourceCount,
+      discoveredSourceBytes,
+    ).lastInsertRowid);
+    database.exec("COMMIT");
+    return { generationId, parserVersionId, ingestRunId };
+  } catch (error) {
+    try {
+      database.exec("ROLLBACK");
+    } catch {
+      // Preserve original failure.
+    }
+    throw error;
+  }
+}
+
+/** A bounded publication descriptor safe to hand to a downstream reader. */
+export function readUnifiedIndexGenerationDescriptor(database, generationId = null) {
+  const meta = Object.fromEntries(database.prepare(
+    "SELECT key, value FROM meta",
+  ).all().map((row) => [row.key, row.value]));
+  const id = generationId === null
+    ? Number(meta.current_generation_id)
+    : Number(generationId);
+  if (!Number.isSafeInteger(id) || id < 1) return null;
+  const row = database.prepare(`
+    SELECT id, started_at_ms, completed_at_ms, parser_version_id,
+           contract_version, status, block_reason,
+           discovered_source_count, discovered_source_bytes,
+           indexed_source_count, indexed_source_bytes, usage_events,
+           quota_occurrences, covered_start_ms, covered_end_ms,
+           discovery_complete, diagnostics_complete,
+           usage_provenance_complete, source_order_complete,
+           quota_provenance_complete, tool_facts, tool_fact_fingerprint,
+           tool_provenance_complete
+    FROM index_generation WHERE id = ?
+  `).get(id);
+  if (row === undefined) return null;
+  const parser = database.prepare(
+    "SELECT parser_version FROM parser_version WHERE id = ?",
+  ).get(row.parser_version_id)?.parser_version ?? null;
+  const material = [
+    row.id, row.started_at_ms, row.completed_at_ms, row.parser_version_id,
+    row.contract_version, row.status, row.block_reason,
+    row.discovered_source_count, row.discovered_source_bytes,
+    row.indexed_source_count, row.indexed_source_bytes, row.usage_events,
+    row.quota_occurrences, row.covered_start_ms, row.covered_end_ms,
+    row.discovery_complete, row.diagnostics_complete,
+    row.usage_provenance_complete, row.source_order_complete,
+    row.quota_provenance_complete, row.tool_facts, row.tool_fact_fingerprint,
+    row.tool_provenance_complete,
+  ].map((value) => value === null || value === undefined ? "" : String(value));
+  const first = row.covered_start_ms === null ? null : Number(row.covered_start_ms);
+  const last = row.covered_end_ms === null ? null : Number(row.covered_end_ms);
+  return {
+    id,
+    fingerprint: `generation-v2-${createHash("sha256")
+      .update(material.join("\u001f"), "utf8").digest("hex")}`,
+    status: row.status,
+    blockReason: row.block_reason ?? null,
+    schemaVersion: meta.schema_version ?? null,
+    parserVersion: parser,
+    contractVersion: row.contract_version,
+    startedAtMs: Number(row.started_at_ms),
+    completedAtMs: row.completed_at_ms === null ? null : Number(row.completed_at_ms),
+    discoveredSourceCount: row.discovered_source_count === null
+      ? null : Number(row.discovered_source_count),
+    discoveredSourceBytes: row.discovered_source_bytes === null
+      ? null : Number(row.discovered_source_bytes),
+    indexedSourceCount: row.indexed_source_count === null
+      ? null : Number(row.indexed_source_count),
+    indexedSourceBytes: row.indexed_source_bytes === null
+      ? null : Number(row.indexed_source_bytes),
+    usageEvents: row.usage_events === null ? null : Number(row.usage_events),
+    quotaOccurrences: row.quota_occurrences === null
+      ? null : Number(row.quota_occurrences),
+    coveredStartMs: first,
+    coveredEndMs: last,
+    discoveryComplete: Number(row.discovery_complete) === 1,
+    diagnosticsComplete: Number(row.diagnostics_complete) === 1,
+    usageProvenanceComplete: Number(row.usage_provenance_complete) === 1,
+    sourceOrderComplete: Number(row.source_order_complete) === 1,
+    quotaProvenanceComplete: Number(row.quota_provenance_complete) === 1,
+    toolFacts: row.tool_facts === null ? null : Number(row.tool_facts),
+    toolFactFingerprint: row.tool_fact_fingerprint ?? null,
+    toolProvenanceComplete: Number(row.tool_provenance_complete) === 1,
+  };
+}
+
+/**
+ * Return a deterministic digest over one generation's typed tool facts. The
+ * digest is content-free: it commits only to local HMACs, offsets, ordinals,
+ * timestamps and fixed classifications. Readers use it to detect a fact row
+ * edited or appended after publication without retaining any raw tool data.
+ */
+export function createUnifiedIndexToolFactFingerprintAccumulator() {
+  const hash = createHash("sha256");
+  let settled = false;
+  return {
+    add(row) {
+      if (settled) throw new TypeError("tool fact fingerprint is settled");
+      hash.update([
+        Buffer.from(row.event_key).toString("hex"),
+        Buffer.from(row.source_local).toString("hex"),
+        row.source_offset,
+        row.source_ordinal,
+        Buffer.from(row.session_local).toString("hex"),
+        row.observed_at_ms,
+        row.tool_ordinal,
+        row.tool_class,
+        row.source_kind,
+      ].map((value) => String(value)).join("\u001f"), "utf8");
+      hash.update("\n", "utf8");
+    },
+    digest() {
+      if (settled) throw new TypeError("tool fact fingerprint is settled");
+      settled = true;
+      return `tool-facts-v1-${hash.digest("hex")}`;
+    },
+  };
+}
+
+export function readUnifiedIndexToolFactFingerprint(database, generationId) {
+  if (!Number.isSafeInteger(Number(generationId)) || Number(generationId) < 1) {
+    return null;
+  }
+  const present = database.prepare(
+    "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'tool_class_fact'",
+  ).get();
+  if (present === undefined) return null;
+  const fingerprint = createUnifiedIndexToolFactFingerprintAccumulator();
+  for (const row of database.prepare(`
+    SELECT event_key, source_local, source_offset, source_ordinal,
+           session_local, observed_at_ms, tool_ordinal, tool_class, source_kind
+    FROM tool_class_fact
+    WHERE generation_id = ?
+    ORDER BY event_key`).iterate(Number(generationId))) {
+    fingerprint.add(row);
+  }
+  return fingerprint.digest();
 }
 
 async function syncFile(path) {
@@ -611,9 +1154,11 @@ async function syncDirectoryPath(path) {
   try {
     handle = await open(path, constants.O_RDONLY);
     await handle.sync();
-  } catch {
-    // Directory fsync is a best-effort durability step on platforms that
-    // refuse to open a directory read-only. The rename itself is still atomic.
+  } catch (error) {
+    if (error?.code === "local_unified_index_directory_sync_failed") {
+      throw error;
+    }
+    throw fixedError("local_unified_index_directory_sync_failed");
   } finally {
     await handle?.close();
   }
@@ -635,6 +1180,9 @@ export function createUnifiedIndexWriter(database, {
   receivedAtMs = Date.now(),
   parserVersion = LOCAL_UNIFIED_INDEX_PARSER_VERSION,
   contractVersion,
+  generationId = null,
+  parserVersionId = null,
+  ingestRunId: suppliedIngestRunId = null,
 } = {}) {
   if (!Number.isSafeInteger(commitRows) || commitRows < 1) {
     throw new TypeError("commitRows must be a positive safe integer");
@@ -712,17 +1260,50 @@ export function createUnifiedIndexWriter(database, {
     selectQuota: database.prepare(`
       SELECT id FROM quota_observation
       WHERE observed_at_ms = ? AND limit_id = ? AND slot = ?`),
+    quotaOccurrence: database.prepare(`
+      INSERT INTO quota_occurrence(
+        generation_id, source_local, source_offset, source_ordinal, surface_id,
+        canonical_observation_id, observed_at_ms, provider, plan_type,
+        limit_id, slot, slot_order, used_percent, resets_at_ms,
+        duration_mins, admission)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(source_local, source_offset, slot_order) DO UPDATE SET
+        generation_id = excluded.generation_id,
+        source_ordinal = excluded.source_ordinal,
+        surface_id = excluded.surface_id,
+        canonical_observation_id = excluded.canonical_observation_id,
+        observed_at_ms = excluded.observed_at_ms,
+        provider = excluded.provider,
+        plan_type = excluded.plan_type,
+        limit_id = excluded.limit_id,
+        slot = excluded.slot,
+        used_percent = excluded.used_percent,
+        resets_at_ms = excluded.resets_at_ms,
+        duration_mins = excluded.duration_mins,
+        admission = excluded.admission`),
+    selectSettledQuota: database.prepare(`
+      SELECT provider, plan_type AS planType, limit_id AS limitId,
+             slot, used_percent AS usedPercent,
+             resets_at_ms AS resetsAt, duration_mins AS windowDurationMins
+      FROM quota_occurrence
+      WHERE source_local = ? AND admission = 'admitted'
+      GROUP BY provider, plan_type, limit_id, slot, used_percent,
+               resets_at_ms, duration_mins`),
     usage: database.prepare(`
       INSERT INTO usage_event(
-        event_key, observed_at_ms, ingest_run_id, parser_version_id,
-        source_id, source_offset, session_local, account_scope_id,
-        model_id, tier_id, surface_id,
-        quota_observation_id, reasoning_effort, outcome,
+        event_key, observed_at_ms, generation_id, ingest_run_id,
+        parser_version_id, source_id, source_offset,
+        session_local, account_scope_id, model_id, tier_id, surface_id,
+        quota_observation_id, source_local, source_ordinal,
+        tier_observed_at_ms, reasoning_effort, outcome,
         tokens_in_uncached, tokens_in_cache_read, tokens_in_cache_write,
         tokens_in_cache_write_5m, tokens_in_cache_write_1h,
         tokens_out_text, tokens_out_reasoning, tokens_out_combined,
         total_input_context)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(event_key) DO NOTHING`),
     boundary: database.prepare(`
       INSERT INTO usage_event_boundary(
@@ -735,15 +1316,33 @@ export function createUnifiedIndexWriter(database, {
       VALUES (?, ?, ?)
       ON CONFLICT(session_local, tool_class)
       DO UPDATE SET count = count + excluded.count`),
+    toolFact: database.prepare(`
+      INSERT INTO tool_class_fact(
+        event_key, generation_id, source_local, source_offset, source_ordinal,
+        session_local, observed_at_ms, tool_ordinal, tool_class, source_kind)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(event_key) DO NOTHING`),
+    deleteToolFactsForSource: database.prepare(
+      "DELETE FROM tool_class_fact WHERE source_local = ?",
+    ),
+    rebindToolFactsForSource: database.prepare(`
+      UPDATE tool_class_fact SET generation_id = ? WHERE source_local = ?`),
+    clearToolClasses: database.prepare("DELETE FROM tool_class_count"),
+    rebuildToolClasses: database.prepare(`
+      INSERT INTO tool_class_count(session_local, tool_class, count)
+      SELECT session_local, tool_class, COUNT(*)
+      FROM tool_class_fact
+      GROUP BY session_local, tool_class`),
     sourceCursor: database.prepare(`
       INSERT INTO source_cursor(
-        source_local, session_local, scanned_bytes, size_bytes, mtime_ms,
+        source_local, source_ordinal, session_local, scanned_bytes, size_bytes, mtime_ms,
         snapshots_persisted, turn_context_seen, carry_model, carry_effort,
         carry_tier_raw, carry_tier_observed_at_ms, carry_total_input,
         carry_total_cached, carry_total_cache_write, carry_total_output,
         carry_total_reasoning, carry_total_total, ingest_run_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(source_local) DO UPDATE SET
+        source_ordinal = excluded.source_ordinal,
         session_local = excluded.session_local,
         scanned_bytes = excluded.scanned_bytes,
         size_bytes = excluded.size_bytes,
@@ -779,6 +1378,48 @@ export function createUnifiedIndexWriter(database, {
     sessionIdentity: database.prepare(`
       INSERT INTO session_identity(session_local, session_uuid)
       VALUES (?, ?) ON CONFLICT DO NOTHING`),
+    generationSource: database.prepare(`
+      INSERT INTO generation_source(
+        generation_id, source_local, source_ordinal, session_local, surface_id,
+        status, discovered_size_bytes, scanned_bytes, mtime_ms,
+        diagnostics_complete)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(generation_id, source_local) DO UPDATE SET
+        source_ordinal = excluded.source_ordinal,
+        session_local = excluded.session_local,
+        surface_id = excluded.surface_id,
+        status = excluded.status,
+        discovered_size_bytes = excluded.discovered_size_bytes,
+        scanned_bytes = excluded.scanned_bytes,
+        mtime_ms = excluded.mtime_ms,
+        diagnostics_complete = excluded.diagnostics_complete`),
+    sourceDiagnostic: database.prepare(`
+      INSERT INTO source_diagnostic(generation_id, source_local, code, count)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(generation_id, source_local, code)
+      DO UPDATE SET count = excluded.count`),
+    copySourceDiagnostics: database.prepare(`
+      INSERT INTO source_diagnostic(generation_id, source_local, code, count)
+      SELECT ?, source_local, code, count
+      FROM source_diagnostic
+      WHERE generation_id = ? AND source_local = ?
+      ON CONFLICT(generation_id, source_local, code)
+      DO UPDATE SET count = excluded.count`),
+    selectGenerationSource: database.prepare(`
+      SELECT diagnostics_complete, scanned_bytes, status
+      FROM generation_source
+      WHERE generation_id = ? AND source_local = ?`),
+    generation: database.prepare(`
+      UPDATE index_generation SET
+        completed_at_ms = ?, status = ?, block_reason = ?,
+        indexed_source_count = ?, indexed_source_bytes = ?,
+        usage_events = ?, quota_occurrences = ?,
+        covered_start_ms = ?, covered_end_ms = ?,
+        discovery_complete = ?, diagnostics_complete = ?,
+        usage_provenance_complete = ?, source_order_complete = ?,
+        quota_provenance_complete = ?, tool_facts = ?,
+        tool_fact_fingerprint = ?, tool_provenance_complete = ?
+      WHERE id = ?`),
     meta: database.prepare(`
       INSERT INTO meta(key, value) VALUES (?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value`),
@@ -801,6 +1442,7 @@ export function createUnifiedIndexWriter(database, {
   let usageRows = 0;
   let boundaryRows = 0;
   let toolRows = 0;
+  let quotaOccurrenceRows = 0;
   let batches = 0;
 
   function begin() {
@@ -832,16 +1474,20 @@ export function createUnifiedIndexWriter(database, {
     return id;
   }
 
-  const defaultParserVersionId = (() => {
-    begin();
-    return internParserVersion(parserVersion);
-  })();
-  const ingestRunId = (() => {
-    begin();
-    return Number(
-      statements.ingestRun.run(receivedAtMs, defaultParserVersionId).lastInsertRowid,
-    );
-  })();
+  const defaultParserVersionId = parserVersionId === null
+    ? (() => {
+      begin();
+      return internParserVersion(parserVersion);
+    })()
+    : Number(parserVersionId);
+  const ingestRunId = suppliedIngestRunId === null
+    ? (() => {
+      begin();
+      return Number(
+        statements.ingestRun.run(receivedAtMs, defaultParserVersionId).lastInsertRowid,
+      );
+    })()
+    : Number(suppliedIngestRunId);
 
   function internModel(modelId, recognition) {
     const cached = modelIds.get(modelId);
@@ -854,7 +1500,7 @@ export function createUnifiedIndexWriter(database, {
   }
 
   function internTier(tier) {
-    const key = `${tier.apiServiceTier} ${tier.billingSurface} ${tier.codexSpeedMode} ${tier.tierSource} ${tier.providerTierRaw ?? ""} ${tier.providerTierRaw === null ? "n" : "s"}`;
+    const key = `${tier.apiServiceTier}\0${tier.billingSurface}\0${tier.codexSpeedMode}\0${tier.tierSource}\0${tier.providerTierRaw ?? ""}\0${tier.providerTierRaw === null ? "n" : "s"}`;
     const cached = tierIds.get(key);
     if (cached !== undefined) return cached;
     begin();
@@ -877,7 +1523,7 @@ export function createUnifiedIndexWriter(database, {
   }
 
   function internSurface(surface) {
-    const key = `${surface.agentScope} ${surface.surface} ${surface.threadSource} ${surface.lineageDisposition}`;
+    const key = `${surface.agentScope}\0${surface.surface}\0${surface.threadSource}\0${surface.lineageDisposition}`;
     const cached = surfaceIds.get(key);
     if (cached !== undefined) return cached;
     begin();
@@ -899,7 +1545,7 @@ export function createUnifiedIndexWriter(database, {
 
   function internAccountScope(scope) {
     const scopeBlob = scope.scopeLocal ?? null;
-    const key = `${scope.status} ${scope.reason ?? ""} ${scope.reason === null ? "n" : "s"} ${scope.planType ?? ""} ${scope.planType === null ? "n" : "s"} ${scopeBlob === null ? "" : Buffer.from(scopeBlob).toString("base64")}`;
+    const key = `${scope.status}\0${scope.reason ?? ""}\0${scope.reason === null ? "n" : "s"}\0${scope.planType ?? ""}\0${scope.planType === null ? "n" : "s"}\0${scopeBlob === null ? "" : Buffer.from(scopeBlob).toString("base64")}`;
     const cached = accountScopeIds.get(key);
     if (cached !== undefined) return cached;
     begin();
@@ -936,9 +1582,9 @@ export function createUnifiedIndexWriter(database, {
     // Caching on the uniqueness key alone would let the first arrival suppress
     // a genuinely different reading for the same millisecond, reintroducing the
     // arrival-order dependence the upsert above exists to remove.
-    const key = `${observation.observedAtMs} ${observation.limitId} ${observation.slot}`
-      + ` ${observation.planType ?? ""} ${observation.usedPercent ?? ""}`
-      + ` ${observation.resetsAtMs ?? ""} ${observation.durationMins ?? ""}`;
+    const key = `${observation.observedAtMs}\0${observation.limitId}\0${observation.slot}`
+      + `\0${observation.planType ?? ""}\0${observation.usedPercent ?? ""}`
+      + `\0${observation.resetsAtMs ?? ""}\0${observation.durationMins ?? ""}`;
     const cached = quotaIds.get(key);
     if (cached !== undefined) return cached;
     begin();
@@ -968,8 +1614,10 @@ export function createUnifiedIndexWriter(database, {
     get usageRows() { return usageRows; },
     get boundaryRows() { return boundaryRows; },
     get toolRows() { return toolRows; },
+    get quotaOccurrenceRows() { return quotaOccurrenceRows; },
     get batches() { return batches; },
     ingestRunId,
+    generationId,
 
     internModel,
     internTier,
@@ -979,11 +1627,50 @@ export function createUnifiedIndexWriter(database, {
     internQuota,
     internParserVersion,
 
+    loadSettledQuotaWindows(sourceLocalKey) {
+      begin();
+      return statements.selectSettledQuota.all(sourceLocalKey).map((row) => ({
+        provider: row.provider,
+        planType: row.planType,
+        limitId: row.limitId,
+        slot: row.slot,
+        usedPercent: Number(row.usedPercent),
+        resetsAt: row.resetsAt === null ? null : Number(row.resetsAt),
+        windowDurationMins: Number(row.windowDurationMins),
+      }));
+    },
+
+    writeQuotaOccurrence(occurrence) {
+      begin();
+      const result = statements.quotaOccurrence.run(
+        occurrence.generationId ?? generationId,
+        occurrence.sourceLocal,
+        occurrence.sourceOffset,
+        occurrence.sourceOrdinal,
+        occurrence.surfaceId,
+        occurrence.canonicalObservationId,
+        occurrence.observedAtMs,
+        occurrence.provider,
+        occurrence.planType ?? null,
+        occurrence.limitId,
+        occurrence.slot,
+        occurrence.slotOrder,
+        occurrence.usedPercent,
+        occurrence.resetsAtMs ?? null,
+        occurrence.durationMins,
+        occurrence.admission,
+      );
+      quotaOccurrenceRows += Number(result.changes ?? 0);
+      step();
+      return Number(result.changes ?? 0);
+    },
+
     writeUsageEvent(event) {
       begin();
       const changes = statements.usage.run(
         event.eventKey,
         event.observedAtMs,
+        event.generationId ?? generationId,
         ingestRunId,
         event.partial
           ? internParserVersion(LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION)
@@ -996,6 +1683,9 @@ export function createUnifiedIndexWriter(database, {
         event.tierId,
         event.surfaceId,
         event.quotaObservationId ?? null,
+        event.sourceLocal ?? null,
+        event.sourceOrdinal ?? null,
+        event.tierObservedAtMs ?? null,
         event.reasoningEffort,
         event.outcome,
         event.tokensInUncached ?? null,
@@ -1039,10 +1729,61 @@ export function createUnifiedIndexWriter(database, {
       step();
     },
 
+    writeToolClassFact(fact) {
+      if (generationId === null && fact.generationId === undefined) {
+        throw fixedError("local_unified_index_generation_required");
+      }
+      begin();
+      const result = statements.toolFact.run(
+        fact.eventKey,
+        fact.generationId ?? generationId,
+        fact.sourceLocal,
+        fact.sourceOffset,
+        fact.sourceOrdinal,
+        fact.sessionLocal,
+        fact.observedAtMs,
+        fact.toolOrdinal,
+        fact.toolClass,
+        fact.sourceKind,
+      );
+      const inserted = Number(result.changes ?? 0);
+      if (inserted > 0) {
+        // Keep the pre-cutover aggregate populated for rollback/compatibility
+        // consumers, but only after the source-scoped fact's UNIQUE key says
+        // this observation is new. A crash/re-scan therefore cannot inflate
+        // the compatibility count.
+        statements.toolClass.run(fact.sessionLocal, fact.toolClass, 1);
+        toolRows += 1;
+      }
+      step();
+      return inserted;
+    },
+
+    deleteToolFactsForSource(sourceLocalKey) {
+      begin();
+      const result = statements.deleteToolFactsForSource.run(sourceLocalKey);
+      step();
+      return Number(result.changes ?? 0);
+    },
+
+    rebindToolFactsForSource(sourceLocalKey, targetGenerationId = generationId) {
+      if (targetGenerationId === null || targetGenerationId === undefined) {
+        throw fixedError("local_unified_index_generation_required");
+      }
+      begin();
+      const result = statements.rebindToolFactsForSource.run(
+        targetGenerationId,
+        sourceLocalKey,
+      );
+      step();
+      return Number(result.changes ?? 0);
+    },
+
     writeSourceCursor(cursor) {
       begin();
       statements.sourceCursor.run(
         cursor.sourceLocal,
+        cursor.sourceOrdinal ?? null,
         cursor.sessionLocal ?? null,
         cursor.scannedBytes,
         cursor.sizeBytes,
@@ -1077,6 +1818,75 @@ export function createUnifiedIndexWriter(database, {
       step();
     },
 
+    writeGenerationSource(source) {
+      if (generationId === null && source.generationId === undefined) {
+        throw fixedError("local_unified_index_generation_required");
+      }
+      begin();
+      statements.generationSource.run(
+        source.generationId ?? generationId,
+        source.sourceLocal,
+        source.sourceOrdinal,
+        source.sessionLocal ?? null,
+        source.surfaceId,
+        source.status,
+        source.discoveredSizeBytes,
+        source.scannedBytes,
+        source.mtimeMs,
+        source.diagnosticsComplete ? 1 : 0,
+      );
+      step();
+    },
+
+    writeSourceDiagnostics(sourceLocalKey, diagnostics, {
+      generationId: sourceGenerationId = generationId,
+    } = {}) {
+      if (sourceGenerationId === null) {
+        throw fixedError("local_unified_index_generation_required");
+      }
+      begin();
+      for (const [code, value] of Object.entries(diagnostics ?? {})) {
+        if (!Number.isSafeInteger(Number(value)) || Number(value) < 0) continue;
+        if (!DIAGNOSTIC_CODES.has(code)) continue;
+        statements.sourceDiagnostic.run(
+          sourceGenerationId,
+          sourceLocalKey,
+          code,
+          Number(value),
+        );
+      }
+      step();
+    },
+
+    copySourceDiagnostics(sourceLocalKey, fromGenerationId, {
+      toGenerationId = generationId,
+    } = {}) {
+      if (toGenerationId === null || fromGenerationId === null) return false;
+      begin();
+      const result = statements.copySourceDiagnostics.run(
+        toGenerationId,
+        fromGenerationId,
+        sourceLocalKey,
+      );
+      step();
+      return Number(result.changes ?? 0) > 0;
+    },
+
+    previousGenerationSource(sourceLocalKey, previousGenerationId) {
+      if (previousGenerationId === null || previousGenerationId === undefined) {
+        return null;
+      }
+      const row = statements.selectGenerationSource.get(
+        previousGenerationId,
+        sourceLocalKey,
+      );
+      return row === undefined ? null : {
+        diagnosticsComplete: Number(row.diagnostics_complete) === 1,
+        scannedBytes: Number(row.scanned_bytes),
+        status: row.status,
+      };
+    },
+
     addLineageSnapshot(sessionLocalKey, snapshotLocalKey) {
       begin();
       statements.lineageSnapshot.run(sessionLocalKey, snapshotLocalKey);
@@ -1108,6 +1918,216 @@ export function createUnifiedIndexWriter(database, {
       step();
     },
 
+    finalizeGeneration({
+      status = "complete",
+      blockReason = null,
+      discoveredSourceCount = null,
+      discoveredSourceBytes = null,
+      indexedSourceCount = null,
+      indexedSourceBytes = null,
+      coveredStartMs = null,
+      coveredEndMs = null,
+      discoveryComplete = status === "complete",
+      diagnosticsComplete = status === "complete",
+      completedAtMs = Date.now(),
+    } = {}) {
+      if (generationId === null) return;
+      if (!["complete", "partial", "failed"].includes(status)) {
+        throw new TypeError("invalid generation status");
+      }
+      begin();
+      // `tool_class_count` remains a rollback/transport compatibility table.
+      // Re-derive it from the source-scoped facts before every publication so
+      // rescanning one source cannot erase or double-count a same-session
+      // sibling's aggregate.
+      statements.clearToolClasses.run();
+      statements.rebuildToolClasses.run();
+      // A generation publishes the complete clone, not only rows inserted by
+      // this pass. Include retained and legacy rows in the durable totals and
+      // covered interval.
+      const counts = database.prepare(`
+        SELECT
+          (SELECT COUNT(*) FROM usage_event) AS usage_events,
+          (SELECT COUNT(*) FROM quota_occurrence) AS quota_occurrences,
+          (SELECT MIN(observed_at_ms) FROM usage_event) AS usage_first_ms,
+          (SELECT MAX(observed_at_ms) FROM usage_event) AS usage_last_ms,
+          (SELECT MIN(observed_at_ms) FROM quota_occurrence) AS quota_first_ms,
+          (SELECT MAX(observed_at_ms) FROM quota_occurrence) AS quota_last_ms
+      `).get();
+      const starts = [counts?.usage_first_ms, counts?.quota_first_ms]
+        .filter((value) => value !== null && value !== undefined)
+        .map(Number);
+      const ends = [counts?.usage_last_ms, counts?.quota_last_ms]
+        .filter((value) => value !== null && value !== undefined)
+        .map(Number);
+      const sourceCompleteness = database.prepare(`
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN diagnostics_complete <> 1
+                          OR status IN ('pending', 'failed')
+                        THEN 1 ELSE 0 END) AS incomplete
+        FROM generation_source
+        WHERE generation_id = ?
+      `).get(generationId);
+      const actualDiagnosticsComplete = diagnosticsComplete
+        && Number(sourceCompleteness?.incomplete ?? 0) === 0;
+      const usageProvenanceComplete = Number(database.prepare(`
+        SELECT COUNT(*) AS count FROM usage_event
+        WHERE source_local IS NULL OR source_offset IS NULL
+          OR source_ordinal IS NULL
+      `).get()?.count ?? 0) === 0;
+      const sourceOrderMissing = Number(database.prepare(`
+        SELECT (
+          (SELECT COUNT(*) FROM generation_source
+           WHERE generation_id = ? AND source_ordinal IS NULL)
+          +
+          (SELECT COUNT(*) FROM (
+             SELECT source_ordinal FROM generation_source
+             WHERE generation_id = ?
+             GROUP BY source_ordinal HAVING COUNT(*) > 1
+           ))
+          +
+          (SELECT COUNT(*) FROM usage_event
+           WHERE source_local IS NOT NULL AND source_ordinal IS NULL)
+          +
+          (SELECT COUNT(*) FROM quota_occurrence
+           WHERE source_local IS NOT NULL AND source_ordinal IS NULL)
+          +
+          (SELECT COUNT(*) FROM source_cursor sc
+           WHERE NOT EXISTS (
+             SELECT 1 FROM generation_source gs
+             WHERE gs.generation_id = ?
+               AND gs.source_local = sc.source_local))
+          +
+          (SELECT COUNT(*) FROM usage_event u
+           WHERE u.source_local IS NOT NULL AND NOT EXISTS (
+             SELECT 1 FROM generation_source gs
+             WHERE gs.generation_id = ?
+               AND gs.source_local = u.source_local
+               AND gs.source_ordinal = u.source_ordinal))
+          +
+          (SELECT COUNT(*) FROM quota_occurrence q
+           WHERE NOT EXISTS (
+             SELECT 1 FROM generation_source gs
+               WHERE gs.generation_id = ?
+                 AND gs.source_local = q.source_local
+                 AND gs.source_ordinal = q.source_ordinal))
+          +
+          -- A source cursor is the durable owner of the source ordinal. A
+          -- generation that merely has a non-NULL ordinal on its source row
+          -- is not attested if the cursor is missing, NULL, or disagrees.
+          (SELECT COUNT(*) FROM generation_source gs
+           LEFT JOIN source_cursor sc ON sc.source_local = gs.source_local
+           WHERE gs.generation_id = ?
+             AND (sc.source_local IS NULL OR sc.source_ordinal IS NULL
+               OR sc.source_ordinal != gs.source_ordinal))
+        ) AS count
+      `).get(
+        generationId,
+        generationId,
+        generationId,
+        generationId,
+        generationId,
+        generationId,
+      )?.count ?? 0);
+      const quotaProvenanceMissing = Number(database.prepare(`
+        SELECT (
+          (SELECT COUNT(*) FROM quota_occurrence
+           WHERE source_local IS NULL OR source_offset IS NULL
+             OR source_ordinal IS NULL OR slot_order IS NULL
+             OR surface_id IS NULL OR admission IS NULL)
+          +
+          (SELECT COUNT(*) FROM quota_observation q
+           WHERE NOT EXISTS (
+             SELECT 1 FROM quota_occurrence o
+             WHERE o.canonical_observation_id = q.id))
+        ) AS count
+      `).get()?.count ?? 0);
+      const toolFacts = Number(database.prepare(`
+        SELECT COUNT(*) AS count FROM tool_class_fact
+        WHERE generation_id = ?
+      `).get(generationId)?.count ?? 0);
+      const toolProvenanceMissing = Number(database.prepare(`
+        SELECT (
+          (SELECT COUNT(*) FROM tool_class_fact f
+           WHERE f.generation_id = ?
+             AND (f.source_local IS NULL OR f.source_offset IS NULL
+               OR f.source_ordinal IS NULL OR f.session_local IS NULL
+               OR f.tool_class IS NULL OR f.source_kind IS NULL
+               OR NOT EXISTS (
+                 SELECT 1 FROM generation_source gs
+                 WHERE gs.generation_id = ?
+                   AND gs.source_local = f.source_local
+                   AND gs.source_ordinal = f.source_ordinal)))
+          +
+          (SELECT COUNT(*) FROM source_diagnostic
+           WHERE generation_id = ?
+             AND code IN ('toolRecordsSkipped', 'toolSourceHistoryUnavailable')
+             AND count > 0)
+        ) AS count
+      `).get(generationId, generationId, generationId)?.count ?? 0);
+      const toolProvenanceComplete = toolProvenanceMissing === 0;
+      const toolFactFingerprint = readUnifiedIndexToolFactFingerprint(
+        database,
+        generationId,
+      );
+      const sourceOrderComplete = sourceOrderMissing === 0;
+      const quotaProvenanceComplete = quotaProvenanceMissing === 0;
+      let publishedStatus = status;
+      let publishedReason = blockReason;
+      if (publishedStatus === "complete" && !usageProvenanceComplete) {
+        publishedStatus = "partial";
+        publishedReason = "legacy_nullable_rows";
+      } else if (publishedStatus === "complete" && !sourceOrderComplete) {
+        publishedStatus = "partial";
+        publishedReason = "source_order_incomplete";
+      } else if (publishedStatus === "complete" && !quotaProvenanceComplete) {
+        publishedStatus = "partial";
+        publishedReason = "quota_occurrences_incomplete";
+      } else if (publishedStatus === "complete" && !actualDiagnosticsComplete) {
+        publishedStatus = "partial";
+        publishedReason = "source_diagnostics_incomplete";
+      } else if (publishedStatus === "complete" && !toolProvenanceComplete) {
+        publishedStatus = "partial";
+        publishedReason = "tool_provenance_incomplete";
+      }
+      statements.generation.run(
+        completedAtMs,
+        publishedStatus,
+        publishedReason,
+        indexedSourceCount ?? discoveredSourceCount,
+        indexedSourceBytes ?? discoveredSourceBytes,
+        Number(counts?.usage_events ?? 0),
+        Number(counts?.quota_occurrences ?? 0),
+        starts.length === 0 ? coveredStartMs : Math.min(...starts),
+        ends.length === 0 ? coveredEndMs : Math.max(...ends),
+        discoveryComplete ? 1 : 0,
+        actualDiagnosticsComplete ? 1 : 0,
+        usageProvenanceComplete ? 1 : 0,
+        sourceOrderComplete ? 1 : 0,
+        quotaProvenanceComplete ? 1 : 0,
+        toolFacts,
+        toolFactFingerprint,
+        toolProvenanceComplete ? 1 : 0,
+        generationId,
+      );
+      if (publishedStatus === "complete" || publishedStatus === "partial") {
+        statements.meta.run("current_generation_id", generationId);
+        statements.meta.run("status", publishedStatus);
+      }
+      commit();
+    },
+
+    failGeneration(blockReason = "exception") {
+      if (generationId === null) return;
+      begin();
+      statements.generation.run(
+        Date.now(), "failed", blockReason,
+        null, null, null, null, null, null, 0, 0, 0, 0, 0,
+        null, null, 0, generationId,
+      );
+      commit();
+    },
+
     flush() {
       commit();
     },
@@ -1129,7 +2149,13 @@ export function createUnifiedIndexWriter(database, {
         await chmod(fsyncPath, 0o600);
         await syncFile(fsyncPath);
       }
-      return { usageRows, boundaryRows, toolRows, batches };
+      return {
+        usageRows,
+        boundaryRows,
+        toolRows,
+        quotaOccurrenceRows,
+        batches,
+      };
     },
   };
 }
@@ -1142,9 +2168,21 @@ export function createUnifiedIndexWriter(database, {
 export async function publishStagedUnifiedIndex(stageFile, indexFile) {
   await chmod(stageFile, 0o600);
   await syncFile(stageFile);
+  await assertSafeLocalUnifiedIndexTarget(indexFile, { allowMissing: true });
   await rename(stageFile, indexFile);
-  await syncDirectoryPath(dirname(resolve(indexFile)));
-  await syncFile(indexFile);
+  try {
+    await syncDirectoryPath(dirname(resolve(indexFile)));
+    await syncFile(indexFile);
+  } catch {
+    // The rename has already happened. Report that exact bounded state so the
+    // caller retains its last generation-bound cache and retries inspection;
+    // never pretend the old file is still live or attempt a destructive undo.
+    const error = fixedError(
+      "local_unified_index_publication_durability_uncertain",
+    );
+    error.published = true;
+    throw error;
+  }
 }
 
 export async function removeIfPresent(path) {
@@ -1205,7 +2243,11 @@ export async function inspectLocalUnifiedIndex({
         database.prepare("SELECT COUNT(*) AS c FROM quota_observation").get()?.c ?? 0,
       ),
       toolClassRows: Number(
-        database.prepare("SELECT COUNT(*) AS c FROM tool_class_count").get()?.c ?? 0,
+        database.prepare(`SELECT COUNT(*) AS c FROM ${
+          database.prepare(
+            "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'tool_class_fact'",
+          ).get() === undefined ? "tool_class_count" : "tool_class_fact"
+        }`).get()?.c ?? 0,
       ),
       sessions: Number(usage?.sessions ?? 0),
       models,

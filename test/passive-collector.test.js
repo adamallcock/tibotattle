@@ -305,6 +305,75 @@ test("run-once restarts from byte checkpoints without duplicate records", async 
   }
 });
 
+test("unified quota-only collection does not resume an inherited rollout backfill", async () => {
+  const fixture = await collectorFixture([
+    tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),
+    tokenRecord("2026-07-23T00:00:02.000Z", usage(20), usage(10), 2),
+  ]);
+  const clock = () => Date.parse("2026-07-23T00:01:00.000Z");
+  class MinimalClient {
+    async start() {}
+    async readRateLimits() { return appPayload(2); }
+    async readAccount() { return null; }
+    async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+    close() {}
+  }
+  try {
+    const paused = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-20T00:00:00.000Z",
+      maximumRecentRunBytes: 1,
+      clock,
+    });
+    assert.equal(paused.status, "bounded_pause");
+    const before = await readLocalCollectorState({
+      stateFile: fixture.stateFile,
+      includeRecords: true,
+    });
+
+    // The unified authority must remain usable even if the raw source is not
+    // available to this collector pass. No discovery or rollout read is
+    // needed for the independent provider quota snapshot.
+    await rm(fixture.codexHome, { recursive: true, force: true });
+    const options = {
+      ...fixture,
+      backfill: false,
+      skipRolloutIngestion: true,
+      staleAfterMs: 0,
+      appServerFactory: () => new MinimalClient(),
+      clock,
+    };
+    const first = await runCollectorOnce(options);
+    const second = await runCollectorOnce(options);
+    assert.equal(first.status, "complete");
+    assert.equal(first.indexing.status, "bounded_pause");
+    assert.equal(first.rolloutRecordsWritten, 0);
+    assert.equal(first.filesDiscovered, 0);
+    assert.equal(first.refresh.attempted, true);
+    assert.equal(second.rolloutRecordsWritten, 0);
+    const after = await readLocalCollectorState({
+      stateFile: fixture.stateFile,
+      includeRecords: true,
+    });
+    const rolloutCount = (state) => state.records.filter(
+      (record) => record.kind === "codex_rollout_usage_snapshot",
+    ).length;
+    assert.equal(rolloutCount(after), rolloutCount(before));
+    assert.equal(
+      after.records.filter((record) => record.kind === "codex_rollout_usage_snapshot").length,
+      0,
+    );
+    assert.equal(
+      after.records.filter((record) => record.kind === "codex_quota_snapshot").length,
+      1,
+    );
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("fresh recent backfill selects only overlapping archives and reports content-free progress", async () => {
   const fixture = await collectorFixture([
     tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),

@@ -62,6 +62,7 @@ async function run() {
           : finalBySessionId.get(source.parentId) ?? null;
         let events = [];
         let boundaries = [];
+        let tools = [];
         let snapshotKeys = [];
         const flush = (rolloutKey, final, diagnostics, cursor = null) => {
           parentPort.postMessage({
@@ -69,6 +70,7 @@ async function run() {
             rolloutKey,
             events,
             boundaries,
+            tools,
             // Snapshot keys collected for descendants — "|"-joined token
             // counters, nothing that can hold content. The host persists them
             // so a later incremental ingest can answer for this ancestor.
@@ -79,6 +81,7 @@ async function run() {
           });
           events = [];
           boundaries = [];
+          tools = [];
           snapshotKeys = [];
         };
         const collector = snapshots.collectorFor(source);
@@ -100,13 +103,19 @@ async function run() {
           ...(maximumLineBytes === undefined ? {} : { maximumLineBytes }),
           onEvent: (event) => {
             events.push(event);
-            if (events.length + boundaries.length >= BATCH_EVENTS) {
+            if (events.length + boundaries.length + tools.length >= BATCH_EVENTS) {
               flush(source.rolloutKey, false, null);
             }
           },
           onBoundary: (event) => {
             boundaries.push(event);
-            if (events.length + boundaries.length >= BATCH_EVENTS) {
+            if (events.length + boundaries.length + tools.length >= BATCH_EVENTS) {
+              flush(source.rolloutKey, false, null);
+            }
+          },
+          onTool: (event) => {
+            tools.push(event);
+            if (events.length + boundaries.length + tools.length >= BATCH_EVENTS) {
               flush(source.rolloutKey, false, null);
             }
           },
@@ -127,6 +136,9 @@ async function run() {
           forkReplayEventsSkipped: outcome.diagnostics.forkReplayEventsSkipped,
           unattributedForkReplayEventsSkipped:
             outcome.diagnostics.unattributedForkReplayEventsSkipped,
+          toolRecords: outcome.diagnostics.toolRecords,
+          toolEvents: outcome.diagnostics.toolEvents,
+          toolRecordsSkipped: outcome.diagnostics.toolRecordsSkipped,
           oversizedLines: outcome.read.oversizedLines,
           retainedSnapshotKeys: snapshots.retainedKeys,
           seeded: seed?.model != null,

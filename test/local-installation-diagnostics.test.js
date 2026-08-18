@@ -18,6 +18,7 @@ import {
   assertLocalStatePath,
   defaultLocalCompanionStateRoot,
   inspectLocalOnboarding,
+  localCompanionStatePaths,
   prepareLocalInstallationRoots,
   projectLocalOnboarding,
 } from "../src/local-installation-diagnostics.js";
@@ -71,6 +72,28 @@ test("installation roots separate immutable resources from owner-only state", as
   } finally {
     await rm(files.root, { recursive: true });
   }
+});
+
+test("legacy accounting rollback paths stay explicit and state-scoped", () => {
+  const stateRoot = join(tmpdir(), "local-installation-explicit-state");
+  const paths = localCompanionStatePaths(stateRoot);
+
+  assert.equal(
+    paths.legacyAnalysisIndexFile,
+    join(stateRoot, "local-analysis-index-v2.sqlite"),
+  );
+  assert.equal(
+    paths.legacyAnalysisIndexSecretFile,
+    join(stateRoot, "local-analysis-index-secret-v2"),
+  );
+  assert.equal(
+    paths.archiveAccountingIndexFile,
+    join(stateRoot, "local-archive-accounting-index-v1.sqlite"),
+  );
+  assert.equal(
+    paths.archiveAccountingIndexSecretFile,
+    join(stateRoot, "local-archive-accounting-index-v1-secret"),
+  );
 });
 
 test("installation roots reject relative, overlapping, symlink, and open state directories", async () => {

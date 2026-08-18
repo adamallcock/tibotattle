@@ -2,12 +2,17 @@ import { lstat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { scanCodexLogEvents } from "./codex-log-scan.js";
-import { openLocalUnifiedIndex } from "./local-unified-index.js";
+import {
+  defaultLocalUnifiedIndexPath,
+  openLocalUnifiedIndex,
+  readUnifiedIndexGenerationDescriptor,
+} from "./local-unified-index.js";
 import { declaredSpeedModeAt } from "./codex-speed-baseline.js";
 import {
   createIndexedCodexLogScan,
   defaultLocalAnalysisIndexSecretPath,
 } from "./local-analysis-index.js";
+import { createLocalUnifiedAccountingSource } from "./local-unified-accounting-source.js";
 import {
   CODEX_TRANSITION_DERIVATION_CEILINGS,
   deriveCodexTransitionSeriesCooperatively,
@@ -88,13 +93,48 @@ import { fastQuotaMultiplier } from "./application/index.js";
 // fitted unresolved-as-Standard and unresolved-as-Fast weekly capacities.
 // Allowance-facing readers can therefore couple every weighted numerator to a
 // denominator derived under the same scenario without replaying raw events.
+// v0.10 (2026-08-17): production refreshes select the unified typed index by
+// default, record the source/generation/context contract, and attach a
+// separate full-history period. A v0.9 cache cannot prove which scanner or
+// generation produced its totals, so it is withheld and rebuilt.
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
-  "local-replay-safe-accounting-v0.9";
+  "local-replay-safe-accounting-v0.10";
 const ALLOWANCE_CAPACITY_SCHEMA_VERSION =
   "codex-primary-allowance-capacity-v0.1";
 const ALLOWANCE_SCENARIO_CANDIDATES = Object.freeze({
   unresolved_as_standard: "speed_lower",
   unresolved_as_fast: "speed_upper",
+});
+
+export const REPLAY_SAFE_ACCOUNTING_SOURCE_MODES = Object.freeze([
+  "unified",
+  "legacy",
+]);
+
+export const REPLAY_SAFE_ACCOUNTING_CONTEXT_BEHAVIORS = Object.freeze([
+  "legacy_zero",
+  "source_native",
+]);
+
+const DEFAULT_ACCOUNTING_CONTEXT_BEHAVIOR = "legacy_zero";
+const SOURCE_DESCRIPTOR_VERSION = "local-accounting-source-descriptor-v1";
+const GENERATION_TOKEN = /^[A-Za-z0-9._:-]{1,256}$/u;
+const ACCOUNTING_SOURCE_ERROR_CODES = Object.freeze({
+  local_unified_index_missing: "accounting_unified_index_missing",
+  local_unified_index_unavailable: "accounting_unified_index_unavailable",
+  local_unified_index_file_invalid: "accounting_unified_index_unavailable",
+  local_unified_index_file_changed: "accounting_unified_generation_changed",
+  local_unified_index_schema_invalid: "accounting_unified_index_incompatible",
+  local_unified_index_compatibility_invalid: "accounting_unified_index_incompatible",
+  local_unified_index_meta_invalid: "accounting_unified_index_invalid",
+  local_unified_index_row_invalid: "accounting_unified_index_invalid",
+  local_unified_index_accounting_coverage_incomplete:
+    "accounting_unified_coverage_incomplete",
+  local_unified_index_generation_mismatch:
+    "accounting_unified_generation_mismatch",
+  local_unified_index_read_aborted: "accounting_refresh_aborted",
+  local_unified_index_callback_failed: "accounting_unified_callback_failed",
+  local_unified_index_read_failed: "accounting_unified_read_failed",
 });
 
 const HISTORICAL_PRICE_EPOCH_BASIS =
@@ -161,6 +201,25 @@ const ACCOUNTING_BUDGET_MISS_CODES = new Set([
   "accounting_transition_memory_budget_exceeded",
   "accounting_scan_rss_limit_exceeded",
 ]);
+const ACCOUNTING_READER_PASSTHROUGH_CODES = new Set([
+  ...Object.values(ACCOUNTING_SOURCE_ERROR_CODES),
+  "accounting_refresh_aborted",
+  "accounting_scan_source_bytes_limit_exceeded",
+  "accounting_scan_rss_limit_exceeded",
+  "accounting_transition_rss_measurement_invalid",
+  "accounting_transition_rss_limit_exceeded",
+  "accounting_transition_memory_budget_exceeded",
+  "accounting_transition_usage_limit_exceeded",
+  "accounting_transition_snapshot_limit_exceeded",
+  "accounting_transition_input_limit_exceeded",
+  "accounting_transition_derivation_limit_exceeded",
+  "accounting_archive_rss_measurement_invalid",
+  "accounting_archive_rss_limit_exceeded",
+  "accounting_unified_coverage_unavailable",
+  "accounting_unified_generation_unavailable",
+  "accounting_unified_generation_required",
+  "accounting_unified_history_unavailable",
+]);
 const ACCOUNTING_RSS_CHECK_INTERVAL = 2_048;
 // This scanner runs inside the same process that immediately expands the
 // full-history calibration corpus. Four extraction workers preserve useful
@@ -203,10 +262,386 @@ const LINEAGE = new Set(["standalone", "forked", "parent_linked", "unknown"]);
 const QUOTA_PLANS = new Set(TELEMETRY_PLAN_TYPES);
 const QUOTA_SLOTS = new Set(["primary", "secondary"]);
 
-function fixedError(code) {
+function fixedError(code, name = "Error") {
   const error = new Error(code);
+  error.name = name;
   error.code = code;
   return error;
+}
+
+function normalizeAccountingSourceMode(value, { defaultValue = "legacy" } = {}) {
+  const selected = value ?? defaultValue;
+  if (!REPLAY_SAFE_ACCOUNTING_SOURCE_MODES.includes(selected)) {
+    throw new TypeError("sourceMode must be unified or legacy");
+  }
+  return selected;
+}
+
+function normalizeContextBehavior(value, {
+  defaultValue = DEFAULT_ACCOUNTING_CONTEXT_BEHAVIOR,
+} = {}) {
+  const selected = value ?? defaultValue;
+  if (!REPLAY_SAFE_ACCOUNTING_CONTEXT_BEHAVIORS.includes(selected)) {
+    throw new TypeError("contextBehavior is invalid");
+  }
+  return selected;
+}
+
+function generationToken(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") {
+    return GENERATION_TOKEN.test(value) ? value : null;
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value)) {
+    return String(value);
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  for (const key of ["generation", "generationId", "id", "fingerprint"]) {
+    if (Object.hasOwn(value, key)) {
+      const token = generationToken(value[key]);
+      if (token !== null) return token;
+    }
+  }
+  return null;
+}
+
+// SQLite stores the published generation id in the TEXT-valued meta table.
+// Keep generation fingerprints byte-for-byte exact, but accept the
+// integer-like decimal spelling SQLite can produce for an id (for example,
+// `"1.0"`) and compare it using the same canonical token as the reader's
+// numeric generation descriptor.
+function generationIdMetaToken(value) {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value >= 0
+      ? String(value)
+      : null;
+  }
+  if (typeof value !== "string" || !/^\d+(?:\.0+)?$/u.test(value)) {
+    return null;
+  }
+  const numeric = Number(value);
+  return Number.isSafeInteger(numeric) && numeric >= 0
+    ? String(numeric)
+    : null;
+}
+
+function expectedGenerationIdToken(value) {
+  return generationIdMetaToken(value) ?? generationToken(value);
+}
+
+function scannerGeneration(scanned) {
+  return generationToken(
+    scanned?.generation
+      ?? scanned?.generationId
+      ?? scanned?.coverage?.generation
+      ?? scanned?.coverage?.generationId
+      ?? scanned?.coverage?.generationFingerprint
+      ?? scanned?.coverage?.fingerprint,
+  );
+}
+
+function scannerGenerationTokens(scanned) {
+  const values = [
+    scanned?.generation,
+    scanned?.generationId,
+    scanned?.generationFingerprint,
+    scanned?.coverage?.generation,
+    scanned?.coverage?.generationId,
+    scanned?.coverage?.generationFingerprint,
+    scanned?.coverage?.fingerprint,
+  ];
+  return [...new Set(values.map(generationToken).filter((value) => value !== null))];
+}
+
+function expectedGenerationParts(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    const token = generationToken(value);
+    return token === null
+      ? null
+      : { opaque: token, id: null, fingerprint: null };
+  }
+  const collect = (keys, tokenForValue = generationToken) => {
+    const present = keys.filter((key) => Object.hasOwn(value, key));
+    const tokens = present.map((key) => tokenForValue(value[key]));
+    if (tokens.some((token) => token === null)) return null;
+    const unique = [...new Set(tokens)];
+    return unique.length <= 1 ? unique[0] ?? null : null;
+  };
+  const id = collect([
+    "generation",
+    "generationId",
+    "currentGenerationId",
+    "id",
+  ], expectedGenerationIdToken);
+  const fingerprint = collect([
+    "fingerprint",
+    "generationFingerprint",
+    "currentGenerationFingerprint",
+  ]);
+  const hasId = [
+    "generation",
+    "generationId",
+    "currentGenerationId",
+    "id",
+  ].some((key) => Object.hasOwn(value, key));
+  const hasFingerprint = [
+    "fingerprint",
+    "generationFingerprint",
+    "currentGenerationFingerprint",
+  ].some((key) => Object.hasOwn(value, key));
+  if ((hasId && id === null) || (hasFingerprint && fingerprint === null)
+      || (!hasId && !hasFingerprint)) return null;
+  return { opaque: null, id, fingerprint };
+}
+
+function expectedGenerationTokens(value) {
+  const parts = expectedGenerationParts(value);
+  return parts === null
+    ? []
+    : [...new Set([
+      parts.opaque,
+      parts.id,
+      parts.fingerprint,
+    ].filter((token) => token !== null))];
+}
+
+function generationMatchesExpected(value, observedTokens) {
+  const parts = expectedGenerationParts(value);
+  if (parts === null) return false;
+  const observed = new Set(observedTokens);
+  if (parts.opaque !== null) return observed.has(parts.opaque);
+  return (parts.id === null || observed.has(parts.id))
+    && (parts.fingerprint === null || observed.has(parts.fingerprint));
+}
+
+function coverageWindow(coverage) {
+  const coveredAt = coverage?.coveredAt ?? coverage?.coverage ?? null;
+  const startAt = canonicalInstant(coveredAt?.startAt);
+  const endAt = canonicalInstant(coveredAt?.endAt);
+  if (startAt === null || endAt === null || Date.parse(startAt) > Date.parse(endAt)) {
+    return null;
+  }
+  return { startAt, endAt };
+}
+
+function boundedDescriptorText(value) {
+  return typeof value === "string" && GENERATION_TOKEN.test(value)
+    ? value
+    : null;
+}
+
+function boundedDescriptorCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function descriptorCapability(value, key) {
+  return typeof value?.[key] === "boolean" ? value[key] : null;
+}
+
+function sourceDescriptor({
+  mode,
+  contextBehavior,
+  scanned,
+  coverage,
+  generation,
+  generationMatched = false,
+}) {
+  const coveredAt = mode === "unified" ? coverageWindow(coverage) : null;
+  return {
+    schemaVersion: SOURCE_DESCRIPTOR_VERSION,
+    mode,
+    contextBehavior,
+    readerVersion: boundedDescriptorText(scanned?.readerVersion),
+    schemaVersionUsed: boundedDescriptorText(scanned?.schemaVersion),
+    parserVersion: boundedDescriptorText(scanned?.parserVersion),
+    contractVersion: boundedDescriptorText(scanned?.contractVersion),
+    generation,
+    generationFingerprint: boundedDescriptorText(
+      scanned?.generationFingerprint
+        ?? coverage?.generationFingerprint
+        ?? coverage?.fingerprint,
+    ),
+    coverageStatus: mode === "unified"
+      ? boundedDescriptorText(coverage?.status)
+      : null,
+    coverage: mode === "unified"
+      ? {
+        status: boundedDescriptorText(coverage?.status),
+        generatedAt: canonicalInstant(coverage?.generatedAt) ?? null,
+        coveredAt,
+        sourceCount: boundedDescriptorCount(coverage?.sourceCount),
+        sourceBytes: boundedDescriptorCount(coverage?.sourceBytes),
+        usageEvents: boundedDescriptorCount(coverage?.usageEvents),
+        quotaObservations: boundedDescriptorCount(coverage?.quotaObservations),
+        quotaOccurrences: boundedDescriptorCount(coverage?.quotaOccurrences),
+        admittedQuotaOccurrences: boundedDescriptorCount(
+          coverage?.admittedQuotaOccurrences,
+        ),
+        generationProof: coverage?.generationProof === true,
+      }
+      : null,
+    diagnosticsAvailable: mode === "unified"
+      ? (typeof scanned?.diagnosticsAvailable === "boolean"
+        ? scanned.diagnosticsAvailable
+        : null)
+      : null,
+    generationMatched,
+    fallbackCount: 0,
+    capabilities: mode === "unified"
+      ? {
+        readsRawSources: descriptorCapability(
+          scanned?.capabilities,
+          "readsRawSources",
+        ),
+        deterministicCanonicalOrder: descriptorCapability(
+          scanned?.capabilities,
+          "deterministicCanonicalOrder",
+        ),
+        sourceOrderingProvenance: descriptorCapability(
+          scanned?.capabilities,
+          "sourceOrderingProvenance",
+        ),
+        sourceOffsetProvenance: descriptorCapability(
+          scanned?.capabilities,
+          "sourceOffsetProvenance",
+        ),
+        sourceScopedQuotaOccurrences: descriptorCapability(
+          scanned?.capabilities,
+          "sourceScopedQuotaOccurrences",
+        ),
+        durableDiagnostics: descriptorCapability(
+          scanned?.capabilities,
+          "durableDiagnostics",
+        ),
+        crashSafeGenerationPublication: descriptorCapability(
+          scanned?.capabilities,
+          "crashSafeGenerationPublication",
+        ),
+      }
+      : null,
+  };
+}
+
+function normalizeUnifiedCoverage(scanned, expectedGeneration) {
+  const coverage = scanned?.coverage;
+  if (!coverage || typeof coverage !== "object" || Array.isArray(coverage)) {
+    throw fixedError("accounting_unified_coverage_unavailable");
+  }
+  if (coverage.status !== "complete" || coverage.generationProof !== true) {
+    throw fixedError("accounting_unified_coverage_incomplete");
+  }
+  const capabilities = scanned?.capabilities;
+  if (scanned?.diagnosticsAvailable !== true
+      || !capabilities
+      || capabilities.readsRawSources !== false
+      || capabilities.deterministicCanonicalOrder !== true
+      || capabilities.sourceOrderingProvenance !== true
+      || capabilities.sourceOffsetProvenance !== true
+      || capabilities.sourceScopedQuotaOccurrences !== true
+      || capabilities.durableDiagnostics !== true
+      || capabilities.crashSafeGenerationPublication !== true) {
+    throw fixedError("accounting_unified_coverage_incomplete");
+  }
+  const coveredAt = coverageWindow(coverage);
+  if (coveredAt === null) {
+    throw fixedError("accounting_unified_coverage_unavailable");
+  }
+  const generation = scannerGeneration(scanned);
+  if (generation === null) {
+    throw fixedError("accounting_unified_generation_unavailable");
+  }
+  const generationFingerprint = generationToken(
+    scanned?.generationFingerprint
+      ?? coverage?.generationFingerprint
+      ?? coverage?.fingerprint,
+  );
+  if (generationFingerprint === null) {
+    throw fixedError("accounting_unified_generation_unavailable");
+  }
+  const expected = expectedGenerationTokens(expectedGeneration);
+  if (expectedGeneration !== null && expected.length === 0) {
+    throw new TypeError("expectedGeneration is invalid");
+  }
+  const observed = scannerGenerationTokens(scanned);
+  if (expected.length > 0
+      && !generationMatchesExpected(expectedGeneration, observed)) {
+    throw fixedError("accounting_unified_generation_mismatch");
+  }
+  return {
+    coverage,
+    coveredAt,
+    generation,
+    generationFingerprint,
+  };
+}
+
+function mapUnifiedReaderError(error) {
+  const code = error?.code;
+  if (typeof code === "string" && !code.startsWith("local_unified_index_")) {
+    if (ACCOUNTING_READER_PASSTHROUGH_CODES.has(code)) {
+      return fixedError(
+        code,
+        error?.name === "AbortError" ? "AbortError" : "Error",
+      );
+    }
+    return fixedError("accounting_unified_read_failed");
+  }
+  const mappedCode = ACCOUNTING_SOURCE_ERROR_CODES[code]
+    ?? "accounting_unified_read_failed";
+  const mapped = fixedError(
+    mappedCode,
+    error?.name === "AbortError"
+      || (typeof code === "string" && code.endsWith("_aborted"))
+      ? "AbortError"
+      : "Error",
+  );
+  return mapped;
+}
+
+function historyUnavailable(
+  errorCode,
+  coverage = null,
+  generation = null,
+  generationFingerprint = null,
+) {
+  const coveredAt = coverage?.coveredAt ?? coverage;
+  return {
+    status: "unavailable",
+    errorCode,
+    coverage: {
+      status: "unavailable",
+      generatedAt: null,
+      coveredAt: coveredAt?.startAt && coveredAt?.endAt
+        ? {
+          startAt: coveredAt.startAt,
+          endAt: coveredAt.endAt,
+        }
+        : { startAt: null, endAt: null },
+      generation,
+      generationFingerprint,
+    },
+    generation,
+    generationFingerprint,
+    period: null,
+  };
+}
+
+function historyProjection(value, coverage, generation, generationFingerprint) {
+  return {
+    status: "available",
+    errorCode: null,
+    coverage: {
+      status: "complete",
+      generatedAt: value.generatedAt,
+      coveredAt: value.coveredAt,
+      generation,
+      generationFingerprint,
+    },
+    generation,
+    generationFingerprint,
+    period: value.period,
+  };
 }
 
 // True for the RSS/byte memory-budget misses that the refresh wrapper treats
@@ -1363,6 +1798,26 @@ function roundedMoney(value) {
   return Number(value.toFixed(6));
 }
 
+// The period's numeric total is a display projection of the exact decimal
+// ledger, not an independently accumulated binary-float sum. Round the
+// decimal string at six places with decimal half-up semantics before converting
+// it to the bounded numeric projection. This keeps a large aggregation stable
+// at the exact half boundary (and avoids Number#toFixed's representation
+// dependent result for values such as 0.0000005).
+function roundedExactMoney(value) {
+  if (typeof value !== "string" || !/^\d+(?:\.\d+)?$/u.test(value)) {
+    return Number.NaN;
+  }
+  const [whole, fraction = ""] = value.split(".");
+  const retainedFraction = fraction.padEnd(6, "0").slice(0, 6);
+  let scaled = BigInt(`${whole}${retainedFraction}`);
+  if ((fraction[6] ?? "0") >= "5") scaled += 1n;
+  const integerPart = scaled / 1_000_000n;
+  const fractionalPart = String(scaled % 1_000_000n).padStart(6, "0");
+  const numeric = Number(`${integerPart}.${fractionalPart}`);
+  return Number.isFinite(numeric) ? numeric : Number.NaN;
+}
+
 function finalizeDimension(dimension) {
   return Object.fromEntries(Object.entries(dimension).map(([key, row]) => [
     key,
@@ -1398,7 +1853,9 @@ function finalizePeriod(period) {
     + period.pricingCoverage.partiallyPricedEvents;
   const finalized = {
     ...period,
-    apiPriceEquivalentUsd: roundedMoney(period.apiPriceEquivalentUsd),
+    apiPriceEquivalentUsd: roundedExactMoney(
+      period.apiPriceEquivalentUsdExact,
+    ),
     priceCardIds: [...period.priceCardIds].sort(),
     priceCardBreakdown: Object.values(period.priceCardBreakdown).sort(
       (left, right) => left.priceCardId.localeCompare(right.priceCardId),
@@ -2019,6 +2476,26 @@ async function probeUnifiedCalibrationCorpus(indexFile) {
   }
 }
 
+function sameIndexFileIdentity(before, after) {
+  const canCompareIdentity = [
+    before?.dev,
+    before?.ino,
+    after?.dev,
+    after?.ino,
+  ].every((value) => value !== undefined && value !== null);
+  return !canCompareIdentity
+    || (before.dev === after.dev && before.ino === after.ino);
+}
+
+function publishedUnifiedGenerationTokens(database) {
+  const descriptor = readUnifiedIndexGenerationDescriptor(database);
+  if (descriptor === null) return [];
+  return [
+    generationIdMetaToken(descriptor.id),
+    generationToken(descriptor.fingerprint),
+  ].filter((token) => token !== null);
+}
+
 /**
  * The full-history weekly-calibration corpus, read from the unified local
  * index in the same compact pre-priced encoding the windowed scan retains.
@@ -2049,6 +2526,7 @@ async function readUnifiedIndexCalibrationCorpus({
   declaredSpeedBaselines,
   signal,
   checkRuntimeMemory,
+  expectedGeneration = null,
 }) {
   let metadata;
   try {
@@ -2064,6 +2542,15 @@ async function readUnifiedIndexCalibrationCorpus({
     return null;
   }
   try {
+    if (expectedGeneration !== null
+        && expectedGeneration !== undefined) {
+      const expected = expectedGenerationTokens(expectedGeneration);
+      const observed = publishedUnifiedGenerationTokens(database);
+      if (expected.length === 0
+          || !generationMatchesExpected(expectedGeneration, observed)) {
+        throw fixedError("accounting_unified_generation_mismatch");
+      }
+    }
     const usageGraceMs = endMs + 5 * 60_000;
     const usageCount = Number(database.prepare(
       "SELECT COUNT(*) AS c FROM usage_event WHERE observed_at_ms <= ?",
@@ -2295,6 +2782,24 @@ async function readUnifiedIndexCalibrationCorpus({
     const coveredStartMs = firstSnapshotMs === null
       ? firstUsageMs
       : Math.min(firstUsageMs, firstSnapshotMs);
+    if (expectedGeneration !== null
+        && expectedGeneration !== undefined) {
+      const expected = expectedGenerationTokens(expectedGeneration);
+      const observed = publishedUnifiedGenerationTokens(database);
+      if (expected.length === 0
+          || !generationMatchesExpected(expectedGeneration, observed)) {
+        throw fixedError("accounting_unified_generation_mismatch");
+      }
+    }
+    let finalMetadata;
+    try {
+      finalMetadata = await lstat(indexFile);
+    } catch {
+      throw fixedError("accounting_unified_generation_changed");
+    }
+    if (!sameIndexFileIdentity(metadata, finalMetadata)) {
+      throw fixedError("accounting_unified_generation_changed");
+    }
     return {
       rawUsageEvents,
       weeklyRateLimitSnapshots,
@@ -2319,7 +2824,13 @@ export async function buildReplaySafeAccountingCache({
   codexHome = join(homedir(), ".codex"),
   now = () => Date.now(),
   windowDays = DEFAULT_WINDOW_DAYS,
-  scan = scanCodexLogEvents,
+  // Direct builders historically accepted an injected raw scanner. Keep that
+  // characterization seam usable, while refreshReplaySafeAccountingCache
+  // selects the unified reader explicitly for production.
+  scan = null,
+  sourceMode = null,
+  expectedGeneration = null,
+  contextBehavior = DEFAULT_ACCOUNTING_CONTEXT_BEHAVIOR,
   signal = null,
   // Timestamped Codex `service_tier` readings. Each covers only the interval
   // it was actually observed over, so a reading can never reach back before it
@@ -2334,6 +2845,32 @@ export async function buildReplaySafeAccountingCache({
   rss = () => process.memoryUsage().rss,
   maximumRssBytes = MAX_ACCOUNTING_RSS_BYTES,
 } = {}) {
+  if (scan === null && (sourceMode === null || sourceMode === undefined)) {
+    throw fixedError("accounting_source_required");
+  }
+  const selectedSourceMode = normalizeAccountingSourceMode(sourceMode);
+  const selectedContextBehavior = normalizeContextBehavior(contextBehavior);
+  if (selectedSourceMode === "unified"
+      && (expectedGeneration === null || expectedGeneration === undefined)) {
+    throw fixedError("accounting_unified_generation_required");
+  }
+  if (expectedGeneration !== null
+      && expectedGeneration !== undefined
+      && expectedGenerationTokens(expectedGeneration).length === 0) {
+    throw new TypeError("expectedGeneration is invalid");
+  }
+  const selectedUnifiedIndexFile = unifiedIndexFile
+    ?? (selectedSourceMode === "unified"
+      ? defaultLocalUnifiedIndexPath()
+      : null);
+  const effectiveScan = scan ?? (selectedSourceMode === "unified"
+    ? createLocalUnifiedAccountingSource({
+      indexFile: selectedUnifiedIndexFile,
+      requireComplete: true,
+      expectedGeneration,
+      contextBehavior: selectedContextBehavior,
+    })
+    : scanCodexLogEvents);
   const endMs = now();
   if (!Number.isFinite(endMs)
       || !Number.isSafeInteger(windowDays)
@@ -2341,7 +2878,7 @@ export async function buildReplaySafeAccountingCache({
       || windowDays > MAXIMUM_WINDOW_DAYS
       || (unifiedIndexFile !== null
         && (typeof unifiedIndexFile !== "string" || unifiedIndexFile.length < 1))
-      || typeof scan !== "function"
+      || typeof effectiveScan !== "function"
       || !validAbortSignal(signal)
       || typeof rss !== "function"
       || !Number.isSafeInteger(maximumRssBytes)
@@ -2403,8 +2940,8 @@ export async function buildReplaySafeAccountingCache({
   // keeping the two working sets sequential rather than resident together. A
   // missing or unusable index degrades to the windowed corpus here; it never
   // fails the build.
-  const useUnifiedCalibration = unifiedIndexFile !== null
-    && await probeUnifiedCalibrationCorpus(unifiedIndexFile);
+  const useUnifiedCalibration = selectedUnifiedIndexFile !== null
+    && await probeUnifiedCalibrationCorpus(selectedUnifiedIndexFile);
   const retainWindowedCalibrationInputs = !useUnifiedCalibration;
   throwIfAborted(signal);
   const startMs = endMs - windowDays * 24 * 60 * 60 * 1_000;
@@ -2469,8 +3006,9 @@ export async function buildReplaySafeAccountingCache({
     }
   };
   let scanned;
+  let unifiedCoverage = null;
   try {
-    scanned = await scan({
+    scanned = await effectiveScan({
       startAt: new Date(startMs).toISOString(),
       endAt: new Date(endMs).toISOString(),
       codexHome,
@@ -2557,22 +3095,103 @@ export async function buildReplaySafeAccountingCache({
         }
       },
     });
+    if (selectedSourceMode === "unified") {
+      unifiedCoverage = normalizeUnifiedCoverage(scanned, expectedGeneration);
+    }
   } catch (error) {
     const bounded = accountingScanResourceError(error);
     if (bounded !== null) throw bounded;
+    if (selectedSourceMode === "unified") {
+      if (error?.name === "AbortError"
+          || error?.code === "accounting_refresh_aborted") {
+        const aborted = fixedError("accounting_refresh_aborted", "AbortError");
+        throw aborted;
+      }
+      throw mapUnifiedReaderError(error) ?? error;
+    }
     throw error;
   }
   throwIfAborted(signal);
   checkRuntimeMemory();
+  let history = historyUnavailable(
+    selectedSourceMode === "unified"
+      ? "accounting_unified_history_unavailable"
+      : "accounting_history_unavailable",
+    unifiedCoverage?.coveredAt ?? null,
+    unifiedCoverage?.generation ?? null,
+    unifiedCoverage?.generationFingerprint ?? null,
+  );
+  if (selectedSourceMode === "unified" && unifiedCoverage !== null) {
+    let historyScanned = null;
+    const historyScan = async (scanOptions) => {
+      historyScanned = await effectiveScan(scanOptions);
+      return historyScanned;
+    };
+    try {
+      const historyValue = await buildReplaySafeAccountingPeriod({
+        id: "history",
+        label: "Indexed history",
+        startAt: unifiedCoverage.coveredAt.startAt,
+        endAt: unifiedCoverage.coveredAt.endAt,
+        scan: historyScan,
+        signal,
+        declaredSpeedBaselines: baselines,
+        rss,
+        maximumRssBytes: effectiveMaximumRssBytes,
+      });
+      const historyCoverage = normalizeUnifiedCoverage(
+        historyScanned,
+        expectedGeneration,
+      );
+      if (historyCoverage.generation !== unifiedCoverage.generation
+          || historyCoverage.generationFingerprint
+            !== unifiedCoverage.generationFingerprint
+          || historyCoverage.coveredAt.startAt
+            !== unifiedCoverage.coveredAt.startAt
+          || historyCoverage.coveredAt.endAt
+            !== unifiedCoverage.coveredAt.endAt) {
+        throw fixedError("accounting_unified_generation_mismatch");
+      }
+      history = historyProjection(
+        historyValue,
+        historyCoverage,
+        historyCoverage.generation,
+        historyCoverage.generationFingerprint,
+      );
+    } catch (error) {
+      if (error?.name === "AbortError"
+          || error?.code === "accounting_refresh_aborted") {
+        throw fixedError("accounting_refresh_aborted", "AbortError");
+      }
+      const mapped = mapUnifiedReaderError(error) ?? error;
+      if (mapped?.code === "accounting_unified_generation_mismatch"
+          || mapped?.name === "AbortError"
+          || isAccountingBudgetMiss(mapped)
+          || mapped?.code === "accounting_archive_rss_limit_exceeded"
+          || (typeof mapped?.code === "string"
+            && !mapped.code.startsWith("accounting_unified_"))) {
+        throw mapped;
+      }
+      history = historyUnavailable(
+        mapped?.code ?? "accounting_unified_history_unavailable",
+        unifiedCoverage.coveredAt,
+        unifiedCoverage.generation,
+        unifiedCoverage.generationFingerprint,
+      );
+    }
+  }
   let unifiedCalibration = null;
   if (useUnifiedCalibration) {
     unifiedCalibration = await readUnifiedIndexCalibrationCorpus({
-      indexFile: unifiedIndexFile,
+      indexFile: selectedUnifiedIndexFile,
       endMs,
       limits,
       declaredSpeedBaselines: baselines,
       signal,
       checkRuntimeMemory,
+      ...(selectedSourceMode === "unified"
+        ? { expectedGeneration: unifiedCoverage?.generation ?? null }
+        : {}),
     });
     // The probe accepted this index, so the scan retained no windowed
     // fallback corpus. If the full read then fails, the only honest outputs
@@ -2734,6 +3353,17 @@ export async function buildReplaySafeAccountingCache({
     priceEpochBasis: HISTORICAL_PRICE_EPOCH_BASIS,
     priceRegistryVersion: APP_PRICE_REGISTRY_MANIFEST.version,
     priceRegistryObservedAt: APP_PRICE_REGISTRY_MANIFEST.observedAt,
+    sourceDescriptor: sourceDescriptor({
+      mode: selectedSourceMode,
+      contextBehavior: selectedContextBehavior,
+      scanned,
+      coverage: unifiedCoverage?.coverage ?? null,
+      generation: unifiedCoverage?.generation ?? null,
+      generationMatched: selectedSourceMode === "unified"
+        && expectedGeneration !== null
+        && expectedGeneration !== undefined,
+    }),
+    history,
     periods: [...periods.values()].map(finalizePeriod),
     timeline: finalizeTimeline(timeline),
     sparkUsageTimeline: finalizeTimeline(sparkTimeline),
@@ -2777,6 +3407,10 @@ export async function refreshReplaySafeAccountingCache({
   indexFile = null,
   indexSecretFile = null,
   scan = null,
+  sourceMode = null,
+  unifiedIndexFile = null,
+  expectedGeneration = null,
+  contextBehavior = null,
   indexWorkerCount,
   indexChunkBytes,
   // Optional, layer-local hook fired when a rebuild misses its memory budget
@@ -2797,6 +3431,24 @@ export async function refreshReplaySafeAccountingCache({
     throw new TypeError("onAccountingRebuildDeferred must be a function or null");
   }
   const selectedStateFile = stateFile ?? defaultReplaySafeAccountingCachePath();
+  const selectedSourceMode = normalizeAccountingSourceMode(
+    sourceMode,
+    { defaultValue: scan === null ? "unified" : "legacy" },
+  );
+  const selectedContextBehavior = normalizeContextBehavior(
+    contextBehavior,
+  );
+  if (expectedGeneration !== null
+      && expectedGeneration !== undefined
+      && expectedGenerationTokens(expectedGeneration).length === 0) {
+    throw new TypeError("expectedGeneration is invalid");
+  }
+  if (selectedSourceMode === "unified"
+      && (expectedGeneration === null || expectedGeneration === undefined)) {
+    throw fixedError("accounting_unified_generation_required");
+  }
+  const selectedUnifiedIndexFile = unifiedIndexFile
+    ?? resolve(dirname(selectedStateFile), "local-unified-index-v1.sqlite");
   const selectedIndexFile = indexFile ?? resolve(
     dirname(selectedStateFile),
     "local-analysis-index-v2.sqlite",
@@ -2804,20 +3456,29 @@ export async function refreshReplaySafeAccountingCache({
   const selectedIndexSecretFile = indexSecretFile
     ?? defaultLocalAnalysisIndexSecretPath(selectedIndexFile);
   if (typeof selectedStateFile !== "string" || selectedStateFile.length < 1
+      || typeof selectedUnifiedIndexFile !== "string"
+      || selectedUnifiedIndexFile.length < 1
       || typeof selectedIndexFile !== "string" || selectedIndexFile.length < 1) {
     throw new TypeError("Replay-safe SQLite state paths are invalid");
   }
   if (scan !== null && typeof scan !== "function") {
     throw new TypeError("scan must be a function or null");
   }
-  const effectiveScan = scan ?? createIndexedCodexLogScan({
-    indexFile: selectedIndexFile,
-    secretFile: selectedIndexSecretFile,
-    workerCount: indexWorkerCount ?? DEFAULT_ACCOUNTING_INDEX_WORKERS,
-    ...(indexChunkBytes === undefined
-      ? {}
-      : { chunkBytes: indexChunkBytes }),
-  });
+  const effectiveScan = scan ?? (selectedSourceMode === "unified"
+    ? createLocalUnifiedAccountingSource({
+      indexFile: selectedUnifiedIndexFile,
+      requireComplete: true,
+      expectedGeneration,
+      contextBehavior: selectedContextBehavior,
+    })
+    : createIndexedCodexLogScan({
+      indexFile: selectedIndexFile,
+      secretFile: selectedIndexSecretFile,
+      workerCount: indexWorkerCount ?? DEFAULT_ACCOUNTING_INDEX_WORKERS,
+      ...(indexChunkBytes === undefined
+        ? {}
+        : { chunkBytes: indexChunkBytes }),
+    }));
   // Converge legacy state before spending a potentially substantial raw-log
   // scan. A live old JSON collector or an unverified parity mismatch must
   // fail before we derive a cache that cannot be committed safely.
@@ -2827,6 +3488,12 @@ export async function refreshReplaySafeAccountingCache({
     cache = await buildReplaySafeAccountingCache({
       ...options,
       scan: effectiveScan,
+      sourceMode: selectedSourceMode,
+      contextBehavior: selectedContextBehavior,
+      expectedGeneration,
+      unifiedIndexFile: selectedSourceMode === "unified"
+        ? selectedUnifiedIndexFile
+        : unifiedIndexFile,
     });
   } catch (error) {
     if (!isAccountingBudgetMiss(error)) throw error;
@@ -2869,6 +3536,10 @@ export async function refreshReplaySafeAccountingCache({
     }
     return deferred;
   }
+  // Validate the complete derived artifact before publication. The write is
+  // atomic, but atomicity alone would preserve a newly-created invalid cache;
+  // fail closed here so a bad build leaves the prior valid state untouched.
+  assertReplaySafeAccountingCache(cache);
   if (Buffer.byteLength(stableJson(cache)) > MAX_CACHE_BYTES) {
     throw fixedError("cache_invalid_size");
   }
@@ -3084,9 +3755,194 @@ function validPriceCardProvenance(row) {
     return false;
   }
   const exactNumber = Number(row.apiPriceEquivalentUsdExact);
+  const expectedRounded = roundedExactMoney(row.apiPriceEquivalentUsdExact);
   return Number.isFinite(exactNumber)
-    && Number(row.apiPriceEquivalentUsd.toFixed(6))
-      === Number(exactNumber.toFixed(6));
+    && Number.isFinite(expectedRounded)
+    && row.apiPriceEquivalentUsd === expectedRounded;
+}
+
+function validSourceDescriptor(value) {
+  const expectedKeys = [
+    "contextBehavior",
+    "contractVersion",
+    "coverageStatus",
+    "coverage",
+    "diagnosticsAvailable",
+    "fallbackCount",
+    "generation",
+    "generationFingerprint",
+    "generationMatched",
+    "mode",
+    "parserVersion",
+    "readerVersion",
+    "schemaVersion",
+    "schemaVersionUsed",
+    "capabilities",
+  ].sort().join("\0");
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join("\0") !== expectedKeys
+      || value.schemaVersion !== SOURCE_DESCRIPTOR_VERSION
+      || !REPLAY_SAFE_ACCOUNTING_SOURCE_MODES.includes(value.mode)
+      || !REPLAY_SAFE_ACCOUNTING_CONTEXT_BEHAVIORS.includes(
+        value.contextBehavior,
+      )) return false;
+  const optionalText = [
+    "contractVersion",
+    "parserVersion",
+    "readerVersion",
+    "schemaVersionUsed",
+  ];
+  if (!optionalText.every((key) => (
+    value[key] === null || boundedDescriptorText(value[key]) !== null
+  ))) return false;
+  if (!Number.isSafeInteger(value.fallbackCount)
+      || value.fallbackCount < 0
+      || typeof value.generationMatched !== "boolean") {
+    return false;
+  }
+  if (value.mode === "unified") {
+    if (value.fallbackCount !== 0
+        || value.generationMatched !== true
+        || generationToken(value.generationFingerprint) === null) {
+      return false;
+    }
+    const coverage = value.coverage;
+    const coverageKeys = [
+      "admittedQuotaOccurrences",
+      "coveredAt",
+      "generatedAt",
+      "generationProof",
+      "quotaObservations",
+      "quotaOccurrences",
+      "sourceBytes",
+      "sourceCount",
+      "status",
+      "usageEvents",
+    ].sort().join("\0");
+    const capabilityKeys = [
+      "crashSafeGenerationPublication",
+      "deterministicCanonicalOrder",
+      "durableDiagnostics",
+      "readsRawSources",
+      "sourceOffsetProvenance",
+      "sourceOrderingProvenance",
+      "sourceScopedQuotaOccurrences",
+    ].sort().join("\0");
+    const validCoveredAt = coverage?.coveredAt === null
+      || (coverage?.coveredAt
+        && canonicalInstant(coverage.coveredAt.startAt) !== null
+        && canonicalInstant(coverage.coveredAt.endAt) !== null
+        && Date.parse(coverage.coveredAt.startAt)
+          <= Date.parse(coverage.coveredAt.endAt));
+    const validCount = (candidate) => (
+      candidate === null
+      || (Number.isSafeInteger(candidate) && candidate >= 0)
+    );
+    const capabilities = value.capabilities;
+    if (value.generationFingerprint !== null
+        && boundedDescriptorText(value.generationFingerprint) === null) {
+      return false;
+    }
+    return value.coverageStatus === "complete"
+      && value.diagnosticsAvailable === true
+      && value.generationMatched === true
+      && coverage
+      && typeof coverage === "object"
+      && !Array.isArray(coverage)
+      && Object.keys(coverage).sort().join("\0") === coverageKeys
+      && coverage.status === "complete"
+      && (coverage.generatedAt === null
+        || canonicalInstant(coverage.generatedAt) !== null)
+      && validCoveredAt
+      && [
+        coverage.sourceCount,
+        coverage.sourceBytes,
+        coverage.usageEvents,
+        coverage.quotaObservations,
+        coverage.quotaOccurrences,
+        coverage.admittedQuotaOccurrences,
+      ].every(validCount)
+      && coverage.generationProof === true
+      && capabilities
+      && typeof capabilities === "object"
+      && !Array.isArray(capabilities)
+      && Object.keys(capabilities).sort().join("\0") === capabilityKeys
+      && capabilities.readsRawSources === false
+      && capabilities.deterministicCanonicalOrder === true
+      && capabilities.sourceOrderingProvenance === true
+      && capabilities.sourceOffsetProvenance === true
+      && capabilities.sourceScopedQuotaOccurrences === true
+      && capabilities.durableDiagnostics === true
+      && capabilities.crashSafeGenerationPublication === true
+      && generationToken(value.generation) !== null;
+  }
+  return value.coverageStatus === null
+    && value.generation === null
+    && value.generationFingerprint === null
+    && value.coverage === null
+    && value.diagnosticsAvailable === null
+    && value.generationMatched === false
+    && value.capabilities === null;
+}
+
+function validHistoryPeriod(value) {
+  return value
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && value.id === "history"
+    && typeof value.label === "string"
+    && value.label.length > 0
+    && value.label.length <= 96
+    && Number.isSafeInteger(value.events)
+    && value.events >= 0
+    && Number.isSafeInteger(value.totalTokens)
+    && value.totalTokens >= 0
+    && typeof value.apiPriceEquivalentUsd === "number"
+    && Number.isFinite(value.apiPriceEquivalentUsd)
+    && value.apiPriceEquivalentUsd >= 0
+    && validPriceCardProvenance(value);
+}
+
+function validHistory(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || !["available", "unavailable"].includes(value.status)
+      || (value.errorCode !== null
+        && (typeof value.errorCode !== "string"
+          || !/^[a-z][a-z0-9_.-]{0,95}$/u.test(value.errorCode)))
+      || !value.coverage
+      || typeof value.coverage !== "object"
+      || Array.isArray(value.coverage)
+      || !["complete", "unavailable"].includes(value.coverage.status)
+      || (value.generation !== null
+        && generationToken(value.generation) === null)
+      || (value.generationFingerprint !== null
+        && generationToken(value.generationFingerprint) === null)
+      || value.coverage.generation !== value.generation
+      || value.coverage.generationFingerprint
+        !== value.generationFingerprint) return false;
+  const coveredAt = value.coverage.coveredAt;
+  if (!coveredAt || typeof coveredAt !== "object" || Array.isArray(coveredAt)) {
+    return false;
+  }
+  const validCoveredAt = value.coverage.status === "unavailable"
+    ? ((coveredAt.startAt === null && coveredAt.endAt === null)
+      || (canonicalInstant(coveredAt.startAt) !== null
+        && canonicalInstant(coveredAt.endAt) !== null
+        && Date.parse(coveredAt.startAt) <= Date.parse(coveredAt.endAt)))
+    : canonicalInstant(coveredAt.startAt) !== null
+      && canonicalInstant(coveredAt.endAt) !== null
+      && Date.parse(coveredAt.startAt) <= Date.parse(coveredAt.endAt)
+      && canonicalInstant(value.coverage.generatedAt) !== null;
+  if (!validCoveredAt) return false;
+  if (value.status === "available") {
+    return value.errorCode === null
+      && value.coverage.status === "complete"
+      && value.generation !== null
+      && validHistoryPeriod(value.period);
+  }
+  return value.errorCode !== null
+    && value.period === null
+    && value.coverage.status === "unavailable";
 }
 
 function speedWeightingTotals(value) {
@@ -3284,6 +4140,11 @@ function validCache(value) {
       // survive a registry correction just because its JSON shape is valid.
       || value.priceRegistryVersion !== APP_PRICE_REGISTRY_MANIFEST.version
       || value.priceRegistryObservedAt !== APP_PRICE_REGISTRY_MANIFEST.observedAt
+      || !validSourceDescriptor(value.sourceDescriptor)
+      || !validHistory(value.history)
+      || value.history.generation !== value.sourceDescriptor.generation
+      || value.history.generationFingerprint
+        !== value.sourceDescriptor.generationFingerprint
       || !Array.isArray(value.periods)
       || !Array.isArray(value.timeline)
       || !validQuotaTimeline(value.quotaTimeline, value.coveredAt)
@@ -3364,6 +4225,9 @@ export async function readReplaySafeAccountingCache({
   cacheFile = undefined,
   now = null,
   maximumAgeMs = null,
+  sourceMode = null,
+  expectedGeneration = null,
+  contextBehavior = null,
 } = {}) {
   if (cacheFile !== undefined) {
     throw new TypeError("cacheFile was retired; use stateFile");
@@ -3378,6 +4242,21 @@ export async function readReplaySafeAccountingCache({
   if (maximumAgeMs !== null
       && (!Number.isSafeInteger(maximumAgeMs) || maximumAgeMs < 0)) {
     throw new TypeError("maximumAgeMs must be a non-negative safe integer or null");
+  }
+  if (sourceMode !== null && sourceMode !== undefined) {
+    normalizeAccountingSourceMode(sourceMode);
+  }
+  if (sourceMode === "unified"
+      && (expectedGeneration === null || expectedGeneration === undefined)) {
+    throw fixedError("accounting_unified_generation_required");
+  }
+  if (contextBehavior !== null && contextBehavior !== undefined) {
+    normalizeContextBehavior(contextBehavior);
+  }
+  if (expectedGeneration !== null
+      && expectedGeneration !== undefined
+      && expectedGenerationTokens(expectedGeneration).length === 0) {
+    throw new TypeError("expectedGeneration is invalid");
   }
   let unavailableErrorCode = null;
   let parsed = null;
@@ -3417,6 +4296,41 @@ export async function readReplaySafeAccountingCache({
       errorCode: unavailableErrorCode ?? "cache_unavailable",
       cache: null,
     };
+  }
+  const descriptor = parsed.sourceDescriptor;
+  if (sourceMode !== null
+      && sourceMode !== undefined
+      && descriptor.mode !== sourceMode) {
+    return {
+      status: "unavailable",
+      errorCode: "cache_source_mode_mismatch",
+      cache: null,
+    };
+  }
+  if (contextBehavior !== null
+      && contextBehavior !== undefined
+      && descriptor.contextBehavior !== contextBehavior) {
+    return {
+      status: "unavailable",
+      errorCode: "cache_context_behavior_mismatch",
+      cache: null,
+    };
+  }
+  if (expectedGeneration !== null && expectedGeneration !== undefined) {
+    const expectedTokens = expectedGenerationTokens(expectedGeneration);
+    const storedGenerations = [
+      generationToken(descriptor.generation),
+      generationToken(descriptor.generationFingerprint),
+    ].filter((value) => value !== null);
+    if (storedGenerations.length === 0
+        || expectedTokens.length === 0
+        || !generationMatchesExpected(expectedGeneration, storedGenerations)) {
+      return {
+        status: "unavailable",
+        errorCode: "cache_generation_mismatch",
+        cache: null,
+      };
+    }
   }
   if (now !== null) {
     const nowMs = now();

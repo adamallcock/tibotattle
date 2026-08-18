@@ -147,6 +147,17 @@ export function localCompanionStatePaths(stateRoot) {
     // legacy JSON/JSONL files are discovered privately by the migration code
     // and removed only after its parity receipt is durable.
     collectorStateFile: join(selected, "local-collector-state-v1.sqlite"),
+    // Dormant rollback-only state. Unified mode never reads or advances these
+    // files, but their exact locations remain stable for one reversible
+    // release so selecting legacy authority is explicit and diagnosable.
+    legacyAnalysisIndexFile: join(
+      selected,
+      "local-analysis-index-v2.sqlite",
+    ),
+    legacyAnalysisIndexSecretFile: join(
+      selected,
+      "local-analysis-index-secret-v2",
+    ),
     archiveAccountingIndexFile: join(
       selected,
       "local-archive-accounting-index-v1.sqlite",
