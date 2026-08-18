@@ -21,11 +21,13 @@ function fakeWindowsBinding() {
     contractVersion: "windows-filesystem-v1",
     securityContractVersion: "windows-filesystem-security-v1",
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
+    sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
     credentialAuditFileGuardSafe: true,
+    sqliteStateLeaseSafe: false,
     inspectPath: () => ({ identity: WINDOWS_IDENTITY }),
     ensureDirectory: () => WINDOWS_IDENTITY,
     readFile: () => ({ data: Buffer.from("data"), identity: WINDOWS_IDENTITY }),
@@ -42,6 +44,12 @@ function fakeWindowsBinding() {
     releaseCredentialMutex: () => {},
     acquireCredentialAuditFileGuard: () => ({ lease: {} }),
     releaseCredentialAuditFileGuard: () => {},
+    acquireSqliteStateLease: () => ({
+      lease: {},
+      databaseIdentity: WINDOWS_IDENTITY,
+      journalIdentity: WINDOWS_IDENTITY,
+    }),
+    releaseSqliteStateLease: () => {},
   };
 }
 

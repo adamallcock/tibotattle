@@ -171,11 +171,13 @@ function windowsStoreFixture(settings = {
     contractVersion: "windows-filesystem-v1",
     securityContractVersion: "windows-filesystem-security-v1",
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
+    sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
     credentialAuditFileGuardSafe: true,
+    sqliteStateLeaseSafe: false,
     inspectPath(path) {
       calls.push(["inspectPath", path]);
       const entry = entries.get(path);
@@ -247,6 +249,14 @@ function windowsStoreFixture(settings = {
     releaseCredentialAuditFileGuard() {},
     acquireCredentialMutex() { return { lease: {}, abandoned: false }; },
     releaseCredentialMutex() {},
+    acquireSqliteStateLease() {
+      return {
+        lease: {},
+        databaseIdentity: WINDOWS_IDENTITY,
+        journalIdentity: WINDOWS_IDENTITY,
+      };
+    },
+    releaseSqliteStateLease() {},
   };
   const adapter = createWindowsFilesystemAdapter({ platform: "win32", architecture: "x64", binding });
   const lifecycleStore = createWindowsProtectedStateStore({

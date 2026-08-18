@@ -90,6 +90,7 @@ const WINDOWS_NATIVE_MANIFEST_KEYS = Object.freeze([
   "contractVersion",
   "securityContractVersion",
   "credentialAuditFileGuardContractVersion",
+  "sqliteStateLeaseContractVersion",
   "credentialMutexContractVersion",
   "requiredMethods",
   "nativeClaims",
@@ -109,6 +110,8 @@ const WINDOWS_REQUIRED_METHODS = Object.freeze([
   "createProtectedChild",
   "deleteProtectedChild",
   "replaceProtectedChild",
+  "acquireSqliteStateLease",
+  "releaseSqliteStateLease",
   "acquireCredentialAuditFileGuard",
   "releaseCredentialAuditFileGuard",
   "acquireCredentialMutex",
@@ -119,6 +122,7 @@ const WINDOWS_NATIVE_CLAIM_KEYS = Object.freeze([
   "pathWalkRaceSafe",
   "credentialMutexSafe",
   "credentialAuditFileGuardSafe",
+  "sqliteStateLeaseSafe",
 ]);
 const WINDOWS_APPROVED_POLICY_KEYS = WINDOWS_NATIVE_CLAIM_KEYS;
 const MAXIMUM_WINDOWS_BINDING_BYTES = 64 * 1024 * 1024;
@@ -538,6 +542,7 @@ function validateNativeManifestShape(value) {
       || value.securityContractVersion !== "windows-filesystem-security-v1"
       || value.credentialAuditFileGuardContractVersion
         !== "windows-credential-audit-file-guard-v1"
+      || value.sqliteStateLeaseContractVersion !== "windows-sqlite-state-lease-v1"
       || value.credentialMutexContractVersion !== "windows-credential-mutex-v1"
       || !Array.isArray(value.requiredMethods)
       || value.requiredMethods.length !== WINDOWS_REQUIRED_METHODS.length
@@ -548,10 +553,12 @@ function validateNativeManifestShape(value) {
       || nativeClaims.pathWalkRaceSafe !== false
       || nativeClaims.credentialMutexSafe !== true
       || nativeClaims.credentialAuditFileGuardSafe !== true
+      || nativeClaims.sqliteStateLeaseSafe !== false
       || approvedPolicy.productionSafe !== false
       || approvedPolicy.pathWalkRaceSafe !== false
       || approvedPolicy.credentialMutexSafe !== true
       || approvedPolicy.credentialAuditFileGuardSafe !== true
+      || approvedPolicy.sqliteStateLeaseSafe !== false
       || WINDOWS_NATIVE_CLAIM_KEYS.some((key) => nativeClaims[key] !== approvedPolicy[key])
       || !exactObjectKeys(bindingProvenance, ["contractVersion", "source", "status"])
       || bindingProvenance.contractVersion !== "windows-binding-provenance-v1"
