@@ -66,6 +66,16 @@ const WINDOWS_BINDING_RELATIVE_PATH =
   "native/windows-filesystem/build/Release/windows_filesystem.node";
 const WINDOWS_MANIFEST_RELATIVE_PATH =
   `${WINDOWS_BINDING_RELATIVE_PATH}.manifest.json`;
+export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
+  "apps/electron/companion-supervisor.js",
+  "apps/electron/desktop-lifecycle.js",
+  "apps/electron/errors.js",
+  "apps/electron/loopback-policy.js",
+  "apps/electron/main.js",
+  "apps/electron/platform-gate.js",
+  "apps/electron/preload.js",
+  "apps/electron/ready-line.js",
+]);
 const READ_ONLY_FLAG = fileSystemConstants.O_RDONLY ?? 0;
 const NO_FOLLOW_FLAG = fileSystemConstants.O_NOFOLLOW ?? 0;
 const UNSUPPORTED_NO_FOLLOW_CODES = new Set([
@@ -103,6 +113,7 @@ const WORKSPACE_RUNTIME_PACKAGE_FILES = Object.freeze({
 });
 
 const SOURCE_FILE_KIND = "companion_source";
+const ELECTRON_SHELL_KIND = "electron_shell";
 const WEB_FILE_KIND = "dashboard_asset";
 const WORKSPACE_PACKAGE_KIND = "workspace_dependency";
 const THIRD_PARTY_KIND = "third_party_dependency";
@@ -110,6 +121,7 @@ const NATIVE_KIND = "windows_native_binding";
 const METADATA_KIND = "runtime_metadata";
 const INVENTORY_KINDS = new Set([
   SOURCE_FILE_KIND,
+  ELECTRON_SHELL_KIND,
   WEB_FILE_KIND,
   WORKSPACE_PACKAGE_KIND,
   THIRD_PARTY_KIND,
@@ -681,7 +693,8 @@ async function collectInventory(stagingRoot) {
     assertReviewedRuntimePath(path, "staged runtime path");
     const captured = await captureRegularFile(file, "staged runtime file");
     let kind = SOURCE_FILE_KIND;
-    if (path.startsWith("apps/web/public/")) kind = WEB_FILE_KIND;
+    if (ELECTRON_SHELL_RUNTIME_FILES.includes(path)) kind = ELECTRON_SHELL_KIND;
+    else if (path.startsWith("apps/web/public/")) kind = WEB_FILE_KIND;
     else if (path.startsWith("node_modules/@app-usagemonitor/")) {
       kind = WORKSPACE_PACKAGE_KIND;
     } else if (path.startsWith("node_modules/")) kind = THIRD_PARTY_KIND;
@@ -758,7 +771,7 @@ function validateRuntimeManifestShape(manifest) {
   }
   if (manifest.schemaVersion !== MANIFEST_SCHEMA
       || manifest.releaseVersion !== RELEASE_VERSION
-      || manifest.entrypoint !== "apps/local/server.js"
+      || !["apps/local/server.js", "apps/electron/main.js"].includes(manifest.entrypoint)
       || manifest.dashboardRoot !== "apps/web/public"
       || ![DARWIN_TARGET, WINDOWS_TARGET].includes(manifest.target)
       || manifest.architecture !== (manifest.target === WINDOWS_TARGET ? "x64" : "arm64")) {
@@ -785,6 +798,10 @@ function validateRuntimeManifestShape(manifest) {
     }
     previousPath = path;
     seenPaths.add(path);
+  }
+  if (manifest.entrypoint === "apps/electron/main.js"
+      && !ELECTRON_SHELL_RUNTIME_FILES.every((path) => seenPaths.has(path))) {
+    fail("EXISTING_OUTPUT_INVALID", "Electron shell entrypoint has an incomplete shell closure");
   }
   if (!exactObjectKeys(manifest.payload, ["bytes", "sha256"])
       || !Number.isSafeInteger(manifest.payload.bytes)
@@ -915,7 +932,11 @@ export async function buildElectronRuntime({
   replace = false,
   windowsBindingPath,
   windowsManifestPath,
+  includeElectronShell = false,
 } = {}) {
+  if (typeof includeElectronShell !== "boolean") {
+    fail("INVALID_SHELL_MODE", "includeElectronShell must be a boolean");
+  }
   const selectedTarget = normalizeTarget(target);
   if (selectedTarget !== WINDOWS_TARGET
       && (windowsBindingPath || windowsManifestPath)) {
@@ -955,6 +976,17 @@ export async function buildElectronRuntime({
       }));
     }
 
+    if (includeElectronShell) {
+      for (const relativePath of ELECTRON_SHELL_RUNTIME_FILES) {
+        staged.push(await stageRepositoryFile({
+          repositoryRoot: REPOSITORY_ROOT,
+          stagingRoot: temporaryRoot,
+          relativePath,
+          kind: ELECTRON_SHELL_KIND,
+        }));
+      }
+    }
+
     const captures = await captureMacOSWorkspaceRuntimePackages();
     staged.push(...await stageCapturedWorkspacePackages({
       stagingRoot: temporaryRoot,
@@ -970,7 +1002,7 @@ export async function buildElectronRuntime({
       outputPath(temporaryRoot, "package.json"),
       stableJson({
         engines: { node: ">=22.13.0" },
-        main: "apps/local/server.js",
+        main: includeElectronShell ? "apps/electron/main.js" : "apps/local/server.js",
         name: "app-usagemonitor",
         private: true,
         type: "module",
@@ -1021,7 +1053,7 @@ export async function buildElectronRuntime({
       target: selectedTarget,
       architecture: selectedTarget === WINDOWS_TARGET ? "x64" : "arm64",
       releaseVersion: RELEASE_VERSION,
-      entrypoint: "apps/local/server.js",
+      entrypoint: includeElectronShell ? "apps/electron/main.js" : "apps/local/server.js",
       dashboardRoot: "apps/web/public",
       files: inventory,
       payload,
