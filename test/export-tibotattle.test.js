@@ -38,6 +38,18 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
     assert.equal(verified.files.some((path) => path.startsWith("apps/web/public/admin")), false);
     assert.equal(verified.files.length, created.fileCount);
 
+    // The unified reader is part of the shipped local client. Keep the old
+    // index/archive modules in the reviewed runtime inventory while rollback
+    // remains supported; this test makes both halves of that boundary explicit.
+    for (const path of [
+      "src/local-unified-accounting-source.js",
+      "src/local-analysis-index.js",
+      "src/local-archive-accounting-index.js",
+      "src/replay-safe-accounting-cache.js",
+    ]) {
+      assert.equal(verified.files.includes(path), true, `export must include ${path}`);
+    }
+
     const workspace = await readFile(join(output, "pnpm-workspace.yaml"), "utf8");
     assert.match(workspace, /^  fast-uri: 3\.1\.5$/m);
 

@@ -121,9 +121,13 @@ function accountingProjection(cache) {
   };
 }
 
-async function fileReceipt(indexFile, unified = false) {
+async function fileReceipt(
+  indexFile,
+  unified = false,
+  contextBehavior = "source_native",
+) {
   const scan = unified
-    ? createLocalUnifiedAccountingSource({ indexFile })
+    ? createLocalUnifiedAccountingSource({ indexFile, contextBehavior })
     : createLocalAnalysisIndexReadScan({ indexFile, requireComplete: true });
   return createLocalAccountingSemanticReceipt({
     scan,
@@ -187,28 +191,61 @@ test("published legacy and unified indexes classify context-presence mismatch th
       startAt: START_AT,
       endAt: END_AT,
     });
-    assert.equal(unifiedReadResult.coverage.status, "partial");
-    assert.equal(
-      unifiedReadResult.coverage.blockReason,
-      "accounting_contract_incomplete",
-    );
-    assert.equal(unifiedReadResult.diagnosticCoverage, "unavailable");
-    assert.deepEqual(unifiedReadResult.diagnostics, {});
+    assert.equal(unifiedReadResult.coverage.status, "complete");
+    assert.equal(unifiedReadResult.coverage.blockReason, null);
+    assert.equal(unifiedReadResult.diagnosticCoverage, "complete");
+    assert.deepEqual(unifiedReadResult.diagnostics, {
+      contradictedLeadingSnapshotsSkipped: 0,
+      cumulativeCounterRegressions: 0,
+      forkReplayEventsSkipped: 0,
+      malformedLines: 0,
+      malformedTimestamps: 0,
+      modelMissing: 0,
+      modelSeededFromLineage: 0,
+      oversizedLines: 0,
+      partialLines: 0,
+      relevantLines: 3,
+      salvagedRecords: 0,
+      tierEvents: 0,
+      tierSeededFromLineage: 0,
+      tokenCounts: 2,
+      toolEvents: 0,
+      toolRecords: 0,
+      toolRecordsSkipped: 0,
+      turnContexts: 1,
+      unattributedForkReplayEventsSkipped: 0,
+    });
     assert.deepEqual(unifiedReadResult.capabilities, {
       readsRawSources: false,
       deterministicCanonicalOrder: true,
-      sourceOrderingProvenance: false,
-      sourceOffsetProvenance: false,
-      sourceScopedQuotaOccurrences: false,
-      durableDiagnostics: false,
-      crashSafeGenerationPublication: false,
+      sourceOrderingProvenance: true,
+      sourceOffsetProvenance: true,
+      sourceScopedQuotaOccurrences: true,
+      durableDiagnostics: true,
+      crashSafeGenerationPublication: true,
     });
 
     const legacyReceipt = await fileReceipt(legacyIndexFile);
-    const unifiedReceipt = await fileReceipt(unifiedIndexFile, true);
+    const unifiedReceipt = await fileReceipt(
+      unifiedIndexFile,
+      true,
+      "source_native",
+    );
+    const unifiedLegacyZeroReceipt = await fileReceipt(
+      unifiedIndexFile,
+      true,
+      "legacy_zero",
+    );
     assert.equal(legacyReceipt.version, LOCAL_ACCOUNTING_PARITY_RECEIPT_VERSION);
     assert.equal(unifiedReceipt.version, LOCAL_ACCOUNTING_PARITY_RECEIPT_VERSION);
     assertContextPresenceMismatch(legacyReceipt, unifiedReceipt);
+    assert.deepEqual(
+      compareLocalAccountingSemanticReceipts(
+        legacyReceipt,
+        unifiedLegacyZeroReceipt,
+      ),
+      { equal: true, mismatchCategories: [] },
+    );
 
     const legacyCache = await buildReplaySafeAccountingCache({
       codexHome,
@@ -294,14 +331,40 @@ test("published readers stay usable after raw fixture sources disappear", async 
       stat(unifiedIndexFile),
     ]);
     const expectedLegacy = await fileReceipt(legacyIndexFile);
-    const expectedUnified = await fileReceipt(unifiedIndexFile, true);
+    const expectedUnified = await fileReceipt(
+      unifiedIndexFile,
+      true,
+      "source_native",
+    );
+    const expectedUnifiedLegacyZero = await fileReceipt(
+      unifiedIndexFile,
+      true,
+      "legacy_zero",
+    );
     await rm(codexHome, { recursive: true, force: true });
 
     const actualLegacy = await fileReceipt(legacyIndexFile);
-    const actualUnified = await fileReceipt(unifiedIndexFile, true);
+    const actualUnified = await fileReceipt(
+      unifiedIndexFile,
+      true,
+      "source_native",
+    );
+    const actualUnifiedLegacyZero = await fileReceipt(
+      unifiedIndexFile,
+      true,
+      "legacy_zero",
+    );
     assert.deepEqual(actualLegacy, expectedLegacy);
     assert.deepEqual(actualUnified, expectedUnified);
+    assert.deepEqual(actualUnifiedLegacyZero, expectedUnifiedLegacyZero);
     assertContextPresenceMismatch(actualLegacy, actualUnified);
+    assert.deepEqual(
+      compareLocalAccountingSemanticReceipts(
+        actualLegacy,
+        actualUnifiedLegacyZero,
+      ),
+      { equal: true, mismatchCategories: [] },
+    );
 
     const after = await Promise.all([
       stat(legacyIndexFile),
