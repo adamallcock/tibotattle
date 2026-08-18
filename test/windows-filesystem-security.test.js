@@ -57,10 +57,16 @@ test("native adapter creates owner-only roots and stable content-free identities
   assert.equal(metadata.isReparsePoint, false);
   assert.equal(metadata.ownerMatches, true);
   assert.equal(metadata.nullDacl, false);
+  if (Object.hasOwn(metadata, "daclProtected")) {
+    assert.equal(metadata.daclProtected, true);
+  }
   assert.equal(metadata.broadAccess, false);
   assert.equal(metadata.nonOwnerAllow, false);
   assert.equal(metadata.finalPathResolved, true);
+  assert.deepEqual(metadata.identity, created);
+  assert.deepEqual(adapter.inspectPath(file).identity, created);
   assert.deepEqual(adapter.readFile(file).data, bytes);
+  assert.deepEqual(adapter.readFile(file).identity, created);
   assert.deepEqual(adapter.deleteFile(file, created), {
     deleted: true,
     identity: created,
@@ -137,6 +143,62 @@ test("native handle-bound replacement is conditional on the expected identity", 
   assert.deepEqual(adapter.readFile(path).data, newBytes);
   assert.equal(binding.productionSafe, false);
   assert.equal(binding.pathWalkRaceSafe, false);
+}));
+
+test("native replacement rejects a path replaced after identity capture", {
+  skip: NATIVE_SKIP,
+}, async () => withSyntheticRoot(async ({ adapter, root }) => {
+  adapter.ensureDirectory(root);
+  const path = join(root, "state.bin");
+  const displacedPath = join(root, "state-displaced.bin");
+  const originalBytes = Buffer.from("original-state\n", "utf8");
+  const currentBytes = Buffer.from("current-state\n", "utf8");
+  const replacementBytes = Buffer.from("replacement-state\n", "utf8");
+  const capturedIdentity = adapter.createFile(path, originalBytes);
+  const binding = loadWindowsFilesystemBinding();
+
+  await rename(path, displacedPath);
+  adapter.createFile(path, currentBytes);
+
+  assert.throws(
+    () => binding.replaceFile(path, capturedIdentity, replacementBytes),
+    (error) => {
+      assert.equal(error?.code, "WINDOWS_FILESYSTEM_IDENTITY_MISMATCH");
+      assert.equal(error?.message, "Windows filesystem operation failed");
+      const rendered = `${error.stack}\n${JSON.stringify(error)}`;
+      assert.equal(rendered.includes(path), false);
+      assert.equal(rendered.includes(originalBytes.toString("utf8")), false);
+      assert.equal(rendered.includes(replacementBytes.toString("utf8")), false);
+      return true;
+    },
+  );
+  assert.deepEqual(adapter.readFile(path).data, currentBytes);
+  assert.deepEqual(adapter.readFile(displacedPath).data, originalBytes);
+}));
+
+test("native adapter supports case-insensitive access through long paths", {
+  skip: NATIVE_SKIP,
+}, () => withSyntheticRoot(({ adapter, root }) => {
+  const segments = Array.from(
+    { length: 8 },
+    (_, index) => `long-segment-${index}-${"x".repeat(30)}`,
+  );
+  const directory = join(root, ...segments);
+  const path = join(directory, "State.Case");
+  const bytes = Buffer.from("long-case-state\n", "utf8");
+  adapter.ensureDirectory(root);
+  adapter.ensureDirectory(directory);
+  const identity = adapter.createFile(path, bytes);
+  const caseVariant = path.replace(/[A-Za-z]/gu, (character) => (
+    character === character.toUpperCase()
+      ? character.toLowerCase()
+      : character.toUpperCase()
+  ));
+
+  assert.ok(path.length > 260);
+  assert.notEqual(caseVariant, path);
+  assert.deepEqual(adapter.readFile(caseVariant).data, bytes);
+  assert.deepEqual(adapter.readFile(caseVariant).identity, identity);
 }));
 
 test("native adapter keeps hostile path failures fixed and content-free", {

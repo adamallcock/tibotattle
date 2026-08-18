@@ -25,6 +25,9 @@ const BINDING_MANIFEST_PATH = join(
   "Release",
   "windows_filesystem.node.manifest.json",
 );
+const BINDING_PROVENANCE_CONTRACT_VERSION = "windows-binding-provenance-v1";
+const BINDING_PROVENANCE_STATUS = "unqualified";
+const BINDING_PROVENANCE_SOURCE = "unsigned-development-binding";
 const FILESYSTEM_SECURITY_TEST_FILE = /^windows-(?:filesystem|security)(?:-[a-z0-9-]+)?\.test\.(?:js|mjs)$/u;
 const CREDENTIAL_TEST_FILE = /^windows-(?:credential|production-credential)(?:-[a-z0-9-]+)?\.test\.(?:js|mjs)$/u;
 const QUALIFICATION_TEST_FILES = Object.freeze([
@@ -38,6 +41,7 @@ const QUALIFICATION_TEST_FILES = Object.freeze([
   "test/windows-production-readiness.test.js",
   "test/windows-filesystem-loader.test.js",
   "test/windows-filesystem-manifest.test.js",
+  "test/windows-filesystem-provenance.test.js",
   "test/windows-filesystem-native-contract.test.js",
   "test/windows-filesystem-security.test.js",
   "test/windows-path-contract.test.js",
@@ -71,7 +75,7 @@ function fixedError(status) {
   return error;
 }
 
-async function readVerifiedBindingManifest({
+export async function readVerifiedBindingManifest({
   manifestPath = BINDING_MANIFEST_PATH,
   readManifest = readFile,
 } = {}) {
@@ -81,6 +85,7 @@ async function readVerifiedBindingManifest({
   } catch {
     throw fixedError(FIXED_STATUS.manifestMissing);
   }
+  const bindingProvenance = manifest?.bindingProvenance;
   const valid = manifest
     && typeof manifest === "object"
     && !Array.isArray(manifest)
@@ -99,7 +104,14 @@ async function readVerifiedBindingManifest({
     && manifest.nativeClaims?.credentialAuditFileGuardSafe === true
     && manifest.credentialAuditFileGuardContractVersion
       === "windows-credential-audit-file-guard-v1"
-    && manifest.credentialMutexContractVersion === "windows-credential-mutex-v1";
+    && manifest.credentialMutexContractVersion === "windows-credential-mutex-v1"
+    && bindingProvenance !== null
+    && typeof bindingProvenance === "object"
+    && !Array.isArray(bindingProvenance)
+    && Object.keys(bindingProvenance).length === 3
+    && bindingProvenance.contractVersion === BINDING_PROVENANCE_CONTRACT_VERSION
+    && bindingProvenance.status === BINDING_PROVENANCE_STATUS
+    && bindingProvenance.source === BINDING_PROVENANCE_SOURCE;
   if (!valid) throw fixedError(FIXED_STATUS.manifestInvalid);
   return Object.freeze({
     bytes: manifest.bytes,

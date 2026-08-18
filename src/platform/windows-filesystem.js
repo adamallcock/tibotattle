@@ -4,6 +4,11 @@ import { readFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  verifyWindowsFilesystemBindingProvenance,
+  WINDOWS_FILESYSTEM_BINDING_PROVENANCE_STATUS,
+} from "./windows-binding-provenance.js";
+
 const require = createRequire(import.meta.url);
 const NATIVE_BINDING_RELATIVE_PATH = Object.freeze([
   "native",
@@ -27,10 +32,16 @@ const NATIVE_BINDING_PATH = resolve(
 );
 const BINDING_MANIFEST_SCHEMA_VERSION =
   "windows-filesystem-binding-manifest-v1";
+const BINDING_PROVENANCE_CONTRACT_VERSION = "windows-binding-provenance-v1";
 const BINDING_FILE_NAME = "windows_filesystem.node";
 const BINDING_PLATFORM = "win32";
 const BINDING_ARCHITECTURE = "x64";
 const MAXIMUM_BINDING_BYTES = 64 * 1024 * 1024;
+const UNQUALIFIED_BINDING_PROVENANCE_SOURCE = "unsigned-development-binding";
+const AUTHENTICATED_BINDING_PROVENANCE_SOURCES = Object.freeze([
+  "development-package",
+  "audited-signed-native-binding",
+]);
 const REQUIRED_METHODS = Object.freeze([
   "inspectPath",
   "ensureDirectory",
@@ -57,13 +68,17 @@ const MANIFEST_KEYS = Object.freeze([
   "requiredMethods",
   "nativeClaims",
   "approvedPolicy",
+  "bindingProvenance",
 ]);
+const WINDOWS_FILESYSTEM_ADAPTERS = new WeakSet();
 
 export const WINDOWS_FILESYSTEM_BINDING_RELATIVE_PATH = NATIVE_BINDING_RELATIVE_PATH;
 export const WINDOWS_FILESYSTEM_BINDING_MANIFEST_RELATIVE_PATH =
   NATIVE_BINDING_MANIFEST_RELATIVE_PATH;
 export const WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION =
   BINDING_MANIFEST_SCHEMA_VERSION;
+export const WINDOWS_FILESYSTEM_BINDING_PROVENANCE_CONTRACT_VERSION =
+  BINDING_PROVENANCE_CONTRACT_VERSION;
 export const WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS = REQUIRED_METHODS;
 
 function failure(code) {
@@ -102,14 +117,18 @@ function bindingSha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+function normalizeManifestBytes(value) {
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+    return Buffer.from(value);
+  }
+  if (typeof value === "string") return Buffer.from(value, "utf8");
+  throw failure("INVALID_MANIFEST");
+}
+
 function parseBindingManifest(value) {
   let parsed;
   try {
-    const text = Buffer.isBuffer(value) || value instanceof Uint8Array
-      ? Buffer.from(value).toString("utf8")
-      : value;
-    if (typeof text !== "string") throw new Error("manifest is not text");
-    parsed = JSON.parse(text);
+    parsed = JSON.parse(normalizeManifestBytes(value).toString("utf8"));
   } catch {
     throw failure("INVALID_MANIFEST");
   }
@@ -119,9 +138,52 @@ function parseBindingManifest(value) {
   return parsed;
 }
 
+function validBindingProvenance(value) {
+  let valid = false;
+  try {
+    valid = value !== null
+      && typeof value === "object"
+      && !Array.isArray(value)
+      && Object.keys(value).length === 3
+      && value.contractVersion === BINDING_PROVENANCE_CONTRACT_VERSION
+      && ((value.status === "unqualified"
+        && value.source === UNQUALIFIED_BINDING_PROVENANCE_SOURCE)
+        || (value.status === "authenticated"
+          && AUTHENTICATED_BINDING_PROVENANCE_SOURCES.includes(value.source)));
+  } catch {
+    // Treat hostile provenance objects as unqualified.
+  }
+  return valid;
+}
+
+function policyRequiresAuthenticatedProvenance(policy) {
+  return policy.productionSafe === true || policy.pathWalkRaceSafe === true;
+}
+
+function manifestRequiresAuthenticatedProvenance(manifest) {
+  return manifest.nativeClaims.productionSafe === true
+    || manifest.nativeClaims.pathWalkRaceSafe === true
+    || policyRequiresAuthenticatedProvenance(manifest.approvedPolicy);
+}
+
+function assertBindingProvenanceAvailable({ bindingPath, bindingBytes, manifest }) {
+  const provenance = verifyWindowsFilesystemBindingProvenance({
+    bindingPath,
+    bindingBytes,
+    manifest,
+  });
+  if (provenance.status !== "verified") {
+    const reason = provenance.status === WINDOWS_FILESYSTEM_BINDING_PROVENANCE_STATUS.unavailable
+      ? "PROVENANCE_VERIFIER_UNAVAILABLE"
+      : "MANIFEST_PROVENANCE_UNAUTHENTICATED";
+    throw failure(reason);
+  }
+}
+
 function assertBindingManifest(manifest) {
   const nativeClaims = manifest.nativeClaims;
   const approvedPolicy = manifest.approvedPolicy;
+  const bindingProvenance = manifest.bindingProvenance;
   const requiredMethods = manifest.requiredMethods;
   const manifestKeys = Object.keys(manifest);
   const valid = manifestKeys.length === MANIFEST_KEYS.length
@@ -163,15 +225,19 @@ function assertBindingManifest(manifest) {
     && Object.hasOwn(approvedPolicy, "pathWalkRaceSafe")
     && Object.hasOwn(approvedPolicy, "credentialMutexSafe")
     && Object.hasOwn(approvedPolicy, "credentialAuditFileGuardSafe")
-    && approvedPolicy.productionSafe === false
-    && approvedPolicy.pathWalkRaceSafe === false
+    && typeof approvedPolicy.productionSafe === "boolean"
+    && typeof approvedPolicy.pathWalkRaceSafe === "boolean"
     && approvedPolicy.credentialMutexSafe === true
-    && approvedPolicy.credentialAuditFileGuardSafe === true;
+    && approvedPolicy.credentialAuditFileGuardSafe === true
+    && validBindingProvenance(bindingProvenance)
+    && (!policyRequiresAuthenticatedProvenance(approvedPolicy)
+      || bindingProvenance.status === "authenticated");
   if (!valid) throw failure("INVALID_MANIFEST");
   return Object.freeze({
     ...manifest,
     nativeClaims: Object.freeze({ ...nativeClaims }),
     approvedPolicy: Object.freeze({ ...approvedPolicy }),
+    bindingProvenance: Object.freeze({ ...bindingProvenance }),
     requiredMethods: Object.freeze([...requiredMethods]),
   });
 }
@@ -211,10 +277,12 @@ function verifyBindingIntegrity({
   requireBinding,
 }) {
   let manifest;
+  let manifestBytes;
   try {
-    manifest = assertBindingManifest(parseBindingManifest(
+    manifestBytes = normalizeManifestBytes(
       readManifest(bindingManifestPath(bindingPath)),
-    ));
+    );
+    manifest = assertBindingManifest(parseBindingManifest(manifestBytes));
   } catch (error) {
     if (error?.code?.startsWith("WINDOWS_FILESYSTEM_")) throw error;
     throw failure("MANIFEST_UNAVAILABLE");
@@ -230,6 +298,17 @@ function verifyBindingIntegrity({
   if (bytes.byteLength !== manifest.bytes
       || bindingSha256(bytes) !== manifest.sha256) {
     throw failure("BINDING_INTEGRITY_MISMATCH");
+  }
+
+  // Reject any manifest/native production claim before loading executable
+  // binding code. The current verifier has no trusted OS/package boundary,
+  // so an authenticated-looking sidecar cannot cause requireBinding() to run.
+  if (manifestRequiresAuthenticatedProvenance(manifest)) {
+    assertBindingProvenanceAvailable({
+      bindingPath,
+      bindingBytes: bytes,
+      manifest,
+    });
   }
 
   let binding;
@@ -251,6 +330,7 @@ function verifyBindingIntegrity({
       || binding.credentialMutexContractVersion !== manifest.credentialMutexContractVersion) {
     throw failure("MANIFEST_BINDING_MISMATCH");
   }
+
   return Object.freeze({ binding, manifest });
 }
 
@@ -355,7 +435,6 @@ export function createWindowsFilesystemAdapter({
 } = {}) {
   if (platform !== "win32") return null;
   let native;
-  let approvedPolicy = null;
   if (binding === null) {
     const loadOptions = {
       platform,
@@ -364,16 +443,14 @@ export function createWindowsFilesystemAdapter({
     };
     const verified = loadVerifiedWindowsFilesystemBinding(loadOptions);
     native = verified.binding;
-    approvedPolicy = verified.manifest.approvedPolicy;
   } else {
     native = assertBinding(binding);
   }
-  return Object.freeze({
-    productionSafe: approvedPolicy?.productionSafe === true
-      && native.productionSafe === true
-      && native.pathWalkRaceSafe === true,
-    pathWalkRaceSafe: approvedPolicy?.pathWalkRaceSafe === true
-      && native.pathWalkRaceSafe === true,
+  const adapter = Object.freeze({
+    // The current loader has no trusted package verifier, so these remain
+    // false even if an injected/native object or sidecar claims otherwise.
+    productionSafe: false,
+    pathWalkRaceSafe: false,
     inspectPath(path) {
       try {
         const result = call(native, "inspectPath", [path]);
@@ -433,6 +510,18 @@ export function createWindowsFilesystemAdapter({
       }
     },
   });
+  WINDOWS_FILESYSTEM_ADAPTERS.add(adapter);
+  return adapter;
+}
+
+export function isWindowsFilesystemAdapter(adapter) {
+  try {
+    return adapter !== null
+      && typeof adapter === "object"
+      && WINDOWS_FILESYSTEM_ADAPTERS.has(adapter);
+  } catch {
+    return false;
+  }
 }
 
 export function isWindowsFilesystemNotFound(error) {
@@ -453,7 +542,15 @@ export function isWindowsFilesystemIdentity(identity) {
 }
 
 export function assertWindowsFilesystemProductionSafe(adapter) {
-  if (adapter?.productionSafe !== true || adapter?.pathWalkRaceSafe !== true) {
+  let valid = false;
+  try {
+    valid = isWindowsFilesystemAdapter(adapter)
+      && adapter.productionSafe === true
+      && adapter.pathWalkRaceSafe === true;
+  } catch {
+    valid = false;
+  }
+  if (!valid) {
     const error = new Error("Windows filesystem production policy is unavailable");
     error.code = "EXPORT_IDENTITY_WINDOWS_FILESYSTEM_POLICY_UNAVAILABLE";
     throw error;
