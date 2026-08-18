@@ -38,6 +38,15 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /pnpm test:portable/u);
   assert.match(workflow, /windows-security-qualification\.mjs/u);
   assert.match(workflow, /\$nodeGypScript rebuild --directory native\/windows-filesystem/u);
+  assert.match(
+    workflow,
+    /-- -Dtibotattle_build_qualification=1/u,
+  );
+  assert.match(workflow, /windows_filesystem_qualification\.node/u);
+  assert.match(workflow, /Move-Item -LiteralPath \$qualificationBindingPath -Destination \$qualificationDestination/u);
+  assert.match(workflow, /TIBOTATTLE_WINDOWS_QUALIFICATION_BINDING_PATH=\$qualificationDestination/u);
+  assert.match(workflow, /WINDOWS_FILESYSTEM_QUALIFICATION_BINDING_MOVE_FAILED/u);
+  assert.match(workflow, /WINDOWS_FILESYSTEM_PRODUCTION_BUILD_EMITTED_QUALIFICATION/u);
   assert.match(workflow, /ref: \$\{\{ github\.sha \}\}/u);
   assert.match(workflow, /persist-credentials: false/u);
   assert.match(workflow, /WINDOWS_QUALIFICATION_REVISION_MISMATCH/u);
@@ -48,7 +57,8 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /WINDOWS_QUALIFICATION_NODE_VERSION_MISMATCH/u);
   assert.match(workflow, /WINDOWS_QUALIFICATION_PNPM_VERSION_MISMATCH/u);
   assert.match(workflow, /WINDOWS_QUALIFICATION_COREPACK_VERSION_MISMATCH/u);
-  assert.match(workflow, /Get-Content -LiteralPath \$buildLog -Tail 200/u);
+  assert.match(workflow, /Get-Content -LiteralPath \$productionBuildLog -Tail 200/u);
+  assert.match(workflow, /Get-Content -LiteralPath \$qualificationBuildLog -Tail 200/u);
   assert.match(workflow, /Get-Content -LiteralPath \$portableLog -Tail 240/u);
   assert.ok(
     workflow.indexOf("Run portable Windows qualification")
