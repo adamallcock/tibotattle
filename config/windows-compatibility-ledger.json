@@ -70,9 +70,9 @@
     },
     {
       "file": "test/local-installation-diagnostics.test.js",
-      "win32BranchCount": 3,
+      "win32BranchCount": 4,
       "classification": "windows-equivalent-needed",
-      "followUp": "Validate owner-only state roots with Windows ACLs and reject reparse-point escapes."
+      "followUp": "Validate the branded native adapter path on Windows x64, including owner-only DACLs, reparse-point escapes, and rejection of non-Windows injection."
     },
     {
       "file": "test/local-metadata-bundle-files.test.js",

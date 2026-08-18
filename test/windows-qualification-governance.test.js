@@ -10,6 +10,7 @@ import {
   parseTapSummary,
   qualificationReceiptMetadata,
   qualificationTestFiles,
+  readVerifiedBindingManifest,
 } from "../scripts/windows-security-qualification.mjs";
 
 const REPOSITORY_ROOT = resolve(
@@ -108,6 +109,7 @@ test("qualification selection is the exact reviewed Windows test set", async () 
     "test/windows-production-readiness.test.js",
     "test/windows-filesystem-loader.test.js",
     "test/windows-filesystem-manifest.test.js",
+    "test/windows-filesystem-provenance.test.js",
     "test/windows-filesystem-native-contract.test.js",
     "test/windows-filesystem-security.test.js",
     "test/windows-path-contract.test.js",
@@ -162,6 +164,70 @@ test("qualification receipts accept only fixed aggregate revision and cache meta
     }),
     (error) => error.code === FIXED_STATUS.environmentInvalid,
   );
+});
+
+test("qualification manifest requires the exact unqualified development provenance", async () => {
+  const baseManifest = {
+    schemaVersion: "windows-filesystem-binding-manifest-v1",
+    bindingFile: "windows_filesystem.node",
+    platform: "win32",
+    architecture: "x64",
+    bytes: 1,
+    sha256: "0".repeat(64),
+    approvedPolicy: {
+      productionSafe: false,
+      pathWalkRaceSafe: false,
+      credentialMutexSafe: true,
+      credentialAuditFileGuardSafe: true,
+    },
+    nativeClaims: {
+      credentialAuditFileGuardSafe: true,
+    },
+    credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
+    credentialMutexContractVersion: "windows-credential-mutex-v1",
+    bindingProvenance: {
+      contractVersion: "windows-binding-provenance-v1",
+      status: "unqualified",
+      source: "unsigned-development-binding",
+    },
+  };
+  const valid = await readVerifiedBindingManifest({
+    readManifest: async () => JSON.stringify(baseManifest),
+  });
+  assert.deepEqual(valid, { bytes: 1, sha256: "0".repeat(64) });
+
+  for (const bindingProvenance of [
+    null,
+    {},
+    {
+      contractVersion: "windows-binding-provenance-v2",
+      status: "unqualified",
+      source: "unsigned-development-binding",
+    },
+    {
+      contractVersion: "windows-binding-provenance-v1",
+      status: "authenticated",
+      source: "unsigned-development-binding",
+    },
+    {
+      contractVersion: "windows-binding-provenance-v1",
+      status: "unqualified",
+      source: "audited-signed-native-binding",
+    },
+    {
+      contractVersion: "windows-binding-provenance-v1",
+      status: "unqualified",
+      source: "unsigned-development-binding",
+      extra: "reject",
+    },
+  ]) {
+    await assert.rejects(
+      readVerifiedBindingManifest({
+        readManifest: async () => JSON.stringify({ ...baseManifest, bindingProvenance }),
+      }),
+      (error) => error.code === FIXED_STATUS.manifestInvalid,
+    );
+  }
 });
 
 test("qualification TAP receipts reject skips and malformed summaries", () => {
