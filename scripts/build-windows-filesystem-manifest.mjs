@@ -54,11 +54,15 @@ function assertBindingShape(binding) {
       && binding?.securityContractVersion === "windows-filesystem-security-v1"
       && binding?.credentialAuditFileGuardContractVersion
         === "windows-credential-audit-file-guard-v1"
+      && binding?.sqliteStateLeaseContractVersion
+        === "windows-sqlite-state-lease-v1"
       && binding?.credentialMutexContractVersion === "windows-credential-mutex-v1"
       && typeof binding?.productionSafe === "boolean"
       && typeof binding?.pathWalkRaceSafe === "boolean"
       && binding?.credentialMutexSafe === true;
-    valid = valid && binding?.credentialAuditFileGuardSafe === true;
+    valid = valid
+      && binding?.credentialAuditFileGuardSafe === true
+      && binding?.sqliteStateLeaseSafe === false;
   } catch {
     valid = false;
   }
@@ -97,6 +101,7 @@ export function createWindowsFilesystemBindingManifest({ bytes, binding }) {
     securityContractVersion: native.securityContractVersion,
     credentialAuditFileGuardContractVersion:
       native.credentialAuditFileGuardContractVersion,
+    sqliteStateLeaseContractVersion: native.sqliteStateLeaseContractVersion,
     credentialMutexContractVersion: native.credentialMutexContractVersion,
     requiredMethods: [...WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS],
     nativeClaims: {
@@ -104,12 +109,14 @@ export function createWindowsFilesystemBindingManifest({ bytes, binding }) {
       pathWalkRaceSafe: native.pathWalkRaceSafe,
       credentialMutexSafe: native.credentialMutexSafe,
       credentialAuditFileGuardSafe: native.credentialAuditFileGuardSafe,
+      sqliteStateLeaseSafe: native.sqliteStateLeaseSafe,
     },
     approvedPolicy: {
       productionSafe: false,
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
       credentialAuditFileGuardSafe: true,
+      sqliteStateLeaseSafe: false,
     },
     // This sidecar is generated from an unsigned development binary. The
     // runtime verifier currently reports unavailable; a future signed

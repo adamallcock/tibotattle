@@ -261,11 +261,14 @@ test("qualification manifest requires the exact unqualified development provenan
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
       credentialAuditFileGuardSafe: true,
+      sqliteStateLeaseSafe: false,
     },
     nativeClaims: {
       credentialAuditFileGuardSafe: true,
+      sqliteStateLeaseSafe: false,
     },
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
+    sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
     bindingProvenance: {
       contractVersion: "windows-binding-provenance-v1",

@@ -206,6 +206,15 @@ Failure CredentialAuditGuardReleaseFailed() {
   return {"CREDENTIAL_AUDIT_GUARD_RELEASE_FAILED"};
 }
 Failure CredentialAuditGuardForeign() { return {"CREDENTIAL_AUDIT_GUARD_FOREIGN"}; }
+Failure SqliteStateLeaseContended() { return {"SQLITE_STATE_LEASE_CONTENDED"}; }
+Failure SqliteStateLeaseAbandoned() { return {"SQLITE_STATE_LEASE_ABANDONED"}; }
+Failure SqliteStateLeaseSidecarPresent() {
+  return {"SQLITE_STATE_LEASE_SIDECAR_PRESENT"};
+}
+Failure SqliteStateLeaseForeign() { return {"SQLITE_STATE_LEASE_FOREIGN"}; }
+Failure SqliteStateLeaseReleaseFailed() {
+  return {"SQLITE_STATE_LEASE_RELEASE_FAILED"};
+}
 #if defined(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK)
 Failure QualificationPauseAlreadyArmed() {
   return {"QUALIFICATION_PAUSE_ALREADY_ARMED"};
@@ -751,6 +760,11 @@ bool ResolveFinalPath(HANDLE handle, const ParsedPath* parsed = nullptr) {
 // the NT API declarations while the descriptor builder remains below it.
 bool SetOwnerOnlyDacl(HANDLE handle);
 bool MarkHandleForDeletion(HANDLE handle);
+bool BuildOwnerOnlySecurity(
+    std::vector<BYTE>* ownerSid,
+    PACL* acl,
+    PSECURITY_DESCRIPTOR* descriptor,
+    SECURITY_ATTRIBUTES* attributes);
 
 struct RelativeHandles {
   std::vector<HANDLE> parents;
@@ -1211,6 +1225,194 @@ bool OpenProtectedRootAndChild(
   }
   *failure = InvalidPath();
   return false;
+}
+
+bool EndsWithInsensitive(const std::wstring& value, const wchar_t* suffix) {
+  const std::size_t suffixLength = std::wcslen(suffix);
+  if (value.size() < suffixLength) return false;
+  const std::size_t offset = value.size() - suffixLength;
+  for (std::size_t index = 0; index < suffixLength; ++index) {
+    if (std::towlower(value[offset + index]) != std::towlower(suffix[index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ParseSqliteDatabaseName(
+    const std::wstring& supplied,
+    std::wstring* databaseName,
+    Failure* failure) {
+  // SQLite's rollback journal is derived from one basename.  Do not accept
+  // a path here: accepting a separator would let the caller choose a child
+  // outside the identity-bound root walk, and accepting a journal/WAL/SHM
+  // basename would make the derived sidecar names ambiguous.
+  if (supplied.empty()
+      || supplied.find_first_of(L"\\/") != std::wstring::npos
+      || EndsWithInsensitive(supplied, L"-journal")
+      || EndsWithInsensitive(supplied, L"-wal")
+      || EndsWithInsensitive(supplied, L"-shm")) {
+    *failure = InvalidPath();
+    return false;
+  }
+  std::vector<std::wstring> components;
+  if (!ParseRelativeComponents(supplied, &components) || components.size() != 1) {
+    *failure = InvalidPath();
+    return false;
+  }
+  *databaseName = std::move(components.front());
+  return true;
+}
+
+bool OpenSqliteChild(
+    HANDLE protectedRoot,
+    const ParsedPath& parsedRoot,
+    const std::wstring& childName,
+    RelativeHandles* opened,
+    HandleIdentity* identity,
+    Failure* failure) {
+  OpenRelativeOptions options;
+  options.finalDirectoryKnown = true;
+  options.finalDirectory = false;
+  options.access = READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  options.shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+  options.disposition = kFileOpen;
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  ULONG_PTR information = 0;
+  if (!OpenRelativeComponent(
+          protectedRoot,
+          childName,
+          options.access,
+          options.shareMode,
+          options.disposition,
+          kFileNonDirectory,
+          nullptr,
+          &handle,
+          &information,
+          failure)) {
+    if (failure->code != NotFound().code) return false;
+
+    std::vector<BYTE> ownerSid;
+    PACL acl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    SECURITY_ATTRIBUTES attributes{};
+    if (!BuildOwnerOnlySecurity(&ownerSid, &acl, &descriptor, &attributes)) {
+      *failure = OperationFailed();
+      return false;
+    }
+    options.access = GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC
+        | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+    options.disposition = kFileCreate;
+    options.ownerOnlyOnCreate = true;
+    options.securityDescriptor = attributes.lpSecurityDescriptor;
+    const bool created = OpenRelativeComponent(
+        protectedRoot,
+        childName,
+        options.access,
+        options.shareMode,
+        options.disposition,
+        kFileNonDirectory,
+        options.securityDescriptor,
+        &handle,
+        &information,
+        failure);
+    FreeOwnerOnlySecurity(acl, descriptor);
+    if (!created) return false;
+    if (information != kFileCreated) {
+      CloseHandle(handle);
+      *failure = AlreadyExists();
+      return false;
+    }
+    if (!FlushFileBuffers(handle)) {
+      *failure = FromLastError();
+      if (!MarkHandleForDeletion(handle)) *failure = OperationFailed();
+      CloseHandle(handle);
+      return false;
+    }
+  }
+
+  bool reparse = false;
+  DWORD attributes = 0;
+  if (!GetFileAttributesFromHandle(handle, &attributes)
+      || !HasReparsePoint(handle, &reparse)) {
+    CloseHandle(handle);
+    *failure = OperationFailed();
+    return false;
+  }
+  if (reparse) {
+    CloseHandle(handle);
+    *failure = ReparsePoint();
+    return false;
+  }
+  if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+    CloseHandle(handle);
+    *failure = NotRegularFile();
+    return false;
+  }
+
+  ParsedPath fullPath = parsedRoot;
+  fullPath.components.push_back(childName);
+  SecuritySnapshot security;
+  if (!ValidateSecurity(handle, false, failure, identity, &security)
+      || security.denyAce
+      || security.ownerAllowAceCount != 1
+      || security.ownerAllowMask != FILE_ALL_ACCESS
+      || !ResolveFinalPath(handle, &fullPath)) {
+    if (failure->code == OperationFailed().code) *failure = IdentityMismatch();
+    if (failure->code == IdentityMismatch().code
+        && (security.denyAce
+          || security.ownerAllowAceCount != 1
+          || security.ownerAllowMask != FILE_ALL_ACCESS)) {
+      *failure = SecurityPolicy("sqlite_state_lease_security");
+    }
+    CloseHandle(handle);
+    return false;
+  }
+  opened->final = handle;
+  return true;
+}
+
+bool EnsureSqliteSidecarAbsent(
+    HANDLE protectedRoot,
+    const std::wstring& sidecarName,
+    Failure* failure) {
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  ULONG_PTR information = 0;
+  const bool opened = OpenRelativeComponent(
+      protectedRoot,
+      sidecarName,
+      FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      kFileOpen,
+      kFileNonDirectory,
+      nullptr,
+      &handle,
+      &information,
+      failure);
+  if (!opened) {
+    if (failure->code == NotFound().code) return true;
+    // The name is reserved by SQLite even when an attacker has made it
+    // unreadable.  Treat every non-missing result as present and fail closed.
+    *failure = SqliteStateLeaseSidecarPresent();
+    return false;
+  }
+  CloseHandle(handle);
+  *failure = SqliteStateLeaseSidecarPresent();
+  return false;
+}
+
+std::vector<HANDLE> TakeAllHandles(RelativeHandles* opened) {
+  std::vector<HANDLE> handles;
+  handles.reserve(opened->parents.size() + 1);
+  for (HANDLE handle : opened->parents) {
+    if (handle != INVALID_HANDLE_VALUE) handles.push_back(handle);
+  }
+  opened->parents.clear();
+  if (opened->final != INVALID_HANDLE_VALUE) {
+    handles.push_back(opened->final);
+    opened->final = INVALID_HANDLE_VALUE;
+  }
+  return handles;
 }
 
 bool BuildOwnerOnlyObjectSecurity(
@@ -2831,6 +3033,387 @@ napi_value ReleaseCredentialAuditFileGuardCallback(
   return undefined;
 }
 
+struct SqliteStateLease {
+  std::vector<HANDLE> handles;
+  HandleIdentity databaseIdentity;
+  HandleIdentity journalIdentity;
+  HANDLE coordination = nullptr;
+  DWORD ownerThreadId = 0;
+  bool coordinationHeld = false;
+  bool active = false;
+};
+
+std::array<SqliteStateLease*, 128> gSqliteStateLeases{};
+std::mutex gSqliteStateLeasesMutex;
+
+bool IsIssuedSqliteStateLease(SqliteStateLease* lease) {
+  return std::find(
+      gSqliteStateLeases.begin(),
+      gSqliteStateLeases.end(),
+      lease) != gSqliteStateLeases.end();
+}
+
+bool RegisterSqliteStateLease(SqliteStateLease* lease) {
+  const auto available = std::find(
+      gSqliteStateLeases.begin(),
+      gSqliteStateLeases.end(),
+      nullptr);
+  if (available == gSqliteStateLeases.end()) return false;
+  *available = lease;
+  return true;
+}
+
+bool UnregisterSqliteStateLease(SqliteStateLease* lease) {
+  const auto existing = std::find(
+      gSqliteStateLeases.begin(),
+      gSqliteStateLeases.end(),
+      lease);
+  if (existing == gSqliteStateLeases.end()) return false;
+  *existing = nullptr;
+  return true;
+}
+
+void CloseSqliteStateLeaseHandles(SqliteStateLease* lease) {
+  for (auto iterator = lease->handles.rbegin();
+       iterator != lease->handles.rend();
+       ++iterator) {
+    if (*iterator != INVALID_HANDLE_VALUE) CloseHandle(*iterator);
+  }
+  lease->handles.clear();
+  if (lease->coordination != nullptr) {
+    if (lease->coordinationHeld && lease->ownerThreadId == GetCurrentThreadId()) {
+      ReleaseMutex(lease->coordination);
+    }
+    CloseHandle(lease->coordination);
+    lease->coordination = nullptr;
+    lease->coordinationHeld = false;
+  }
+  lease->active = false;
+}
+
+void FinalizeSqliteStateLease(napi_env, void* data, void*) {
+  auto* lease = static_cast<SqliteStateLease*>(data);
+  if (lease == nullptr) return;
+  const std::lock_guard<std::mutex> lock(gSqliteStateLeasesMutex);
+  const bool issued = UnregisterSqliteStateLease(lease);
+  if (issued && lease->active) CloseSqliteStateLeaseHandles(lease);
+  delete lease;
+}
+
+void AppendHandles(std::vector<HANDLE>* destination, std::vector<HANDLE>&& source) {
+  destination->reserve(destination->size() + source.size());
+  for (HANDLE handle : source) destination->push_back(handle);
+}
+
+std::wstring SqliteStateLeaseMutexName(
+    const HandleIdentity& rootIdentity,
+    const HandleIdentity& databaseIdentity) {
+  std::wostringstream stream;
+  stream << L"Local\\TiboTattle-SqliteStateLease-v1-"
+         << std::hex << std::setfill(L'0') << std::setw(16)
+         << rootIdentity.volumeSerialNumber << L'-';
+  for (BYTE byte : rootIdentity.fileId) {
+    stream << std::setw(2) << static_cast<unsigned int>(byte);
+  }
+  stream << L'-' << std::setw(16) << databaseIdentity.volumeSerialNumber << L'-';
+  for (BYTE byte : databaseIdentity.fileId) {
+    stream << std::setw(2) << static_cast<unsigned int>(byte);
+  }
+  return stream.str();
+}
+
+bool AcquireSqliteStateLeaseMutex(
+    const HandleIdentity& rootIdentity,
+    const HandleIdentity& databaseIdentity,
+    HANDLE* result,
+    Failure* failure) {
+  std::vector<BYTE> ownerSid;
+  PACL acl = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  SECURITY_ATTRIBUTES attributes{};
+  if (!BuildOwnerOnlyObjectSecurity(
+          kCredentialMutexAccess,
+          &ownerSid,
+          &acl,
+          &descriptor,
+          &attributes)) {
+    *failure = OperationFailed();
+    return false;
+  }
+  const std::wstring name = SqliteStateLeaseMutexName(rootIdentity, databaseIdentity);
+  HANDLE mutex = CreateMutexExW(
+      &attributes,
+      name.c_str(),
+      0,
+      kCredentialMutexAccess);
+  FreeOwnerOnlySecurity(acl, descriptor);
+  if (mutex == nullptr) {
+    *failure = FromLastError();
+    return false;
+  }
+  SecuritySnapshot security;
+  if (!ReadObjectSecurity(mutex, SE_KERNEL_OBJECT, &security)
+      || !IsOwnerOnlySecurity(security)) {
+    CloseHandle(mutex);
+    *failure = SecurityPolicy("sqlite_state_lease_mutex_security");
+    return false;
+  }
+  const DWORD waitResult = WaitForSingleObject(mutex, 0);
+  if (waitResult == WAIT_TIMEOUT) {
+    CloseHandle(mutex);
+    *failure = SqliteStateLeaseContended();
+    return false;
+  }
+  if (waitResult == WAIT_ABANDONED_0) {
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
+    *failure = SqliteStateLeaseAbandoned();
+    return false;
+  }
+  if (waitResult != WAIT_OBJECT_0) {
+    CloseHandle(mutex);
+    *failure = OperationFailed();
+    return false;
+  }
+  *result = mutex;
+  return true;
+}
+
+napi_value AcquireSqliteStateLeaseCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 3)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring rootPath;
+  std::wstring suppliedDatabaseName;
+  std::wstring databaseName;
+  HandleIdentity expectedRoot;
+  Failure failure = OperationFailed();
+  if (!GetString(env, arguments[0], &rootPath)
+      || !ParseExpectedIdentity(env, arguments[1], &expectedRoot)
+      || !GetString(env, arguments[2], &suppliedDatabaseName)
+      || !ParseSqliteDatabaseName(suppliedDatabaseName, &databaseName, &failure)) {
+    return ThrowFailure(env, failure.code == OperationFailed().code
+        ? InvalidConfiguration()
+        : failure);
+  }
+  if (databaseName.size() > static_cast<std::size_t>(USHRT_MAX / sizeof(wchar_t)) - 7) {
+    return ThrowFailure(env, InvalidPath());
+  }
+  const std::wstring journalName = databaseName + L"-journal";
+  const std::wstring walName = databaseName + L"-wal";
+  const std::wstring shmName = databaseName + L"-shm";
+
+  ParsedPath parsedRoot;
+  if (!ParseAndValidatePath(rootPath, false, &parsedRoot, &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  OpenRelativeOptions rootOptions;
+  rootOptions.finalDirectoryKnown = true;
+  rootOptions.finalDirectory = true;
+  rootOptions.access = kDirectoryTraversalAccess;
+  rootOptions.shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+  rootOptions.protectedAncestorDepth = parsedRoot.components.size() - 1;
+  rootOptions.protectedAncestorShareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+  rootOptions.disposition = kFileOpen;
+  RelativeHandles rootOpened;
+  bool rootMissing = false;
+  if (!OpenRelativePath(
+          parsedRoot,
+          rootOptions,
+          &rootOpened,
+          &rootMissing,
+          &failure)
+      || rootMissing
+      || rootOpened.final == INVALID_HANDLE_VALUE) {
+    return ThrowFailure(env, failure);
+  }
+
+  HandleIdentity observedRoot;
+  SecuritySnapshot rootSecurity;
+  if (!ValidateSecurity(
+          rootOpened.final,
+          true,
+          &failure,
+          &observedRoot,
+          &rootSecurity)
+      || rootSecurity.denyAce
+      || rootSecurity.ownerAllowAceCount != 1
+      || rootSecurity.ownerAllowMask != FILE_ALL_ACCESS
+      || !EqualIdentity(observedRoot, expectedRoot)
+      || !ResolveFinalPath(rootOpened.final, &parsedRoot)) {
+    if (rootSecurity.denyAce
+        || rootSecurity.ownerAllowAceCount != 1
+        || rootSecurity.ownerAllowMask != FILE_ALL_ACCESS) {
+      failure = SecurityPolicy("sqlite_state_lease_root_security");
+    }
+    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    return ThrowFailure(env, failure);
+  }
+
+  // A live WAL/SHM file means the database is not using the single rollback
+  // journal contract this lease protects.  These are defensive preflight
+  // checks only; the still-false sqliteStateLeaseSafe claim deliberately does
+  // not pretend that a missing sidecar can be reserved against an unrelated
+  // same-user writer for the whole lease lifetime.
+  if (!EnsureSqliteSidecarAbsent(rootOpened.final, walName, &failure)
+      || !EnsureSqliteSidecarAbsent(rootOpened.final, shmName, &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  RelativeHandles databaseOpened;
+  RelativeHandles journalOpened;
+  HandleIdentity databaseIdentity;
+  HandleIdentity journalIdentity;
+  if (!OpenSqliteChild(
+          rootOpened.final,
+          parsedRoot,
+          databaseName,
+          &databaseOpened,
+          &databaseIdentity,
+          &failure)
+      || !OpenSqliteChild(
+          rootOpened.final,
+          parsedRoot,
+          journalName,
+          &journalOpened,
+          &journalIdentity,
+          &failure)
+      || !EnsureSqliteSidecarAbsent(rootOpened.final, walName, &failure)
+      || !EnsureSqliteSidecarAbsent(rootOpened.final, shmName, &failure)) {
+    return ThrowFailure(env, failure);
+  }
+
+  HANDLE coordination = nullptr;
+  if (!AcquireSqliteStateLeaseMutex(
+          observedRoot,
+          databaseIdentity,
+          &coordination,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+
+  // The named mutex is the cross-process boundary.  This registry closes the
+  // recursive same-thread behavior of Win32 mutexes, so a second call in one
+  // Node process cannot accidentally acquire the same lease twice.
+  {
+    const std::lock_guard<std::mutex> lock(gSqliteStateLeasesMutex);
+    for (SqliteStateLease* existing : gSqliteStateLeases) {
+      if (existing != nullptr
+          && existing->active
+          && EqualIdentity(existing->databaseIdentity, databaseIdentity)) {
+        ReleaseMutex(coordination);
+        CloseHandle(coordination);
+        return ThrowFailure(env, SqliteStateLeaseContended());
+      }
+    }
+  }
+
+  std::vector<HANDLE> handles = TakeAllHandles(&rootOpened);
+  AppendHandles(&handles, TakeAllHandles(&databaseOpened));
+  AppendHandles(&handles, TakeAllHandles(&journalOpened));
+  auto* lease = new (std::nothrow) SqliteStateLease;
+  if (lease == nullptr) {
+    for (auto iterator = handles.rbegin(); iterator != handles.rend(); ++iterator) {
+      if (*iterator != INVALID_HANDLE_VALUE) CloseHandle(*iterator);
+    }
+    ReleaseMutex(coordination);
+    CloseHandle(coordination);
+    return ThrowFailure(env, OperationFailed());
+  }
+  lease->handles = std::move(handles);
+  lease->databaseIdentity = databaseIdentity;
+  lease->journalIdentity = journalIdentity;
+  lease->coordination = coordination;
+  lease->ownerThreadId = GetCurrentThreadId();
+  lease->coordinationHeld = true;
+  lease->active = true;
+  {
+    const std::lock_guard<std::mutex> lock(gSqliteStateLeasesMutex);
+    if (!RegisterSqliteStateLease(lease)) {
+      CloseSqliteStateLeaseHandles(lease);
+      delete lease;
+      return ThrowFailure(env, OperationFailed());
+    }
+  }
+
+  napi_value external;
+  if (napi_create_external(
+          env,
+          lease,
+          FinalizeSqliteStateLease,
+          nullptr,
+          &external) != napi_ok) {
+    const std::lock_guard<std::mutex> lock(gSqliteStateLeasesMutex);
+    UnregisterSqliteStateLease(lease);
+    CloseSqliteStateLeaseHandles(lease);
+    delete lease;
+    return ThrowFailure(env, OperationFailed());
+  }
+  napi_value result;
+  napi_create_object(env, &result);
+  napi_set_named_property(env, result, "lease", external);
+  napi_set_named_property(
+      env,
+      result,
+      "databaseIdentity",
+      IdentityValue(env, databaseIdentity));
+  napi_set_named_property(
+      env,
+      result,
+      "journalIdentity",
+      IdentityValue(env, journalIdentity));
+  return result;
+}
+
+napi_value ReleaseSqliteStateLeaseCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 1)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, arguments[0], &type) != napi_ok
+      || type != napi_external) {
+    return ThrowFailure(env, SqliteStateLeaseForeign());
+  }
+  void* data = nullptr;
+  if (napi_get_value_external(env, arguments[0], &data) != napi_ok || data == nullptr) {
+    return ThrowFailure(env, SqliteStateLeaseForeign());
+  }
+  auto* lease = static_cast<SqliteStateLease*>(data);
+  const std::lock_guard<std::mutex> lock(gSqliteStateLeasesMutex);
+  if (!IsIssuedSqliteStateLease(lease) || !lease->active || lease->handles.empty()) {
+    return ThrowFailure(env, SqliteStateLeaseForeign());
+  }
+  UnregisterSqliteStateLease(lease);
+  bool closed = true;
+  for (auto iterator = lease->handles.rbegin();
+       iterator != lease->handles.rend();
+       ++iterator) {
+    if (*iterator != INVALID_HANDLE_VALUE && !CloseHandle(*iterator)) closed = false;
+  }
+  lease->handles.clear();
+  if (lease->coordination != nullptr) {
+    if (lease->coordinationHeld) {
+      if (lease->ownerThreadId != GetCurrentThreadId()
+          || !ReleaseMutex(lease->coordination)) {
+        closed = false;
+      }
+    }
+    if (!CloseHandle(lease->coordination)) closed = false;
+    lease->coordination = nullptr;
+    lease->coordinationHeld = false;
+  }
+  lease->active = false;
+  if (!closed) return ThrowFailure(env, SqliteStateLeaseReleaseFailed());
+  napi_value undefined;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
 struct CredentialMutexLease {
   HANDLE handle = nullptr;
   DWORD ownerThreadId = 0;
@@ -3092,6 +3675,16 @@ NAPI_MODULE_INIT() {
       exports,
       "replaceProtectedChild",
       ReplaceProtectedChildCallback);
+  DefineMethod(
+      env,
+      exports,
+      "acquireSqliteStateLease",
+      AcquireSqliteStateLeaseCallback);
+  DefineMethod(
+      env,
+      exports,
+      "releaseSqliteStateLease",
+      ReleaseSqliteStateLeaseCallback);
 #if defined(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK)
   DefineMethod(
       env,
@@ -3149,15 +3742,29 @@ NAPI_MODULE_INIT() {
       exports,
       "credentialAuditFileGuardContractVersion",
       credentialAuditGuardVersion);
+  napi_value sqliteStateLeaseVersion;
+  napi_create_string_utf8(
+      env,
+      "windows-sqlite-state-lease-v1",
+      NAPI_AUTO_LENGTH,
+      &sqliteStateLeaseVersion);
+  napi_set_named_property(
+      env,
+      exports,
+      "sqliteStateLeaseContractVersion",
+      sqliteStateLeaseVersion);
   napi_value productionSafe;
   napi_value pathWalkRaceSafe;
   napi_value credentialMutexSafe;
+  napi_value sqliteStateLeaseSafe;
   napi_get_boolean(env, false, &productionSafe);
   napi_get_boolean(env, false, &pathWalkRaceSafe);
   napi_get_boolean(env, true, &credentialMutexSafe);
+  napi_get_boolean(env, false, &sqliteStateLeaseSafe);
   napi_set_named_property(env, exports, "productionSafe", productionSafe);
   napi_set_named_property(env, exports, "pathWalkRaceSafe", pathWalkRaceSafe);
   napi_set_named_property(env, exports, "credentialMutexSafe", credentialMutexSafe);
+  napi_set_named_property(env, exports, "sqliteStateLeaseSafe", sqliteStateLeaseSafe);
   napi_value credentialAuditFileGuardSafe;
   napi_get_boolean(env, true, &credentialAuditFileGuardSafe);
   napi_set_named_property(

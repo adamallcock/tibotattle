@@ -33,6 +33,7 @@ const NATIVE_BINDING_PATH = resolve(
 const BINDING_MANIFEST_SCHEMA_VERSION =
   "windows-filesystem-binding-manifest-v1";
 const BINDING_PROVENANCE_CONTRACT_VERSION = "windows-binding-provenance-v1";
+const SQLITE_STATE_LEASE_CONTRACT_VERSION = "windows-sqlite-state-lease-v1";
 const BINDING_FILE_NAME = "windows_filesystem.node";
 const BINDING_PLATFORM = "win32";
 const BINDING_ARCHITECTURE = "x64";
@@ -56,6 +57,8 @@ const REQUIRED_METHODS = Object.freeze([
   "createProtectedChild",
   "deleteProtectedChild",
   "replaceProtectedChild",
+  "acquireSqliteStateLease",
+  "releaseSqliteStateLease",
   "acquireCredentialAuditFileGuard",
   "releaseCredentialAuditFileGuard",
   "acquireCredentialMutex",
@@ -71,6 +74,7 @@ const MANIFEST_KEYS = Object.freeze([
   "contractVersion",
   "securityContractVersion",
   "credentialAuditFileGuardContractVersion",
+  "sqliteStateLeaseContractVersion",
   "credentialMutexContractVersion",
   "requiredMethods",
   "nativeClaims",
@@ -86,6 +90,8 @@ export const WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION =
   BINDING_MANIFEST_SCHEMA_VERSION;
 export const WINDOWS_FILESYSTEM_BINDING_PROVENANCE_CONTRACT_VERSION =
   BINDING_PROVENANCE_CONTRACT_VERSION;
+export const WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_CONTRACT_VERSION =
+  SQLITE_STATE_LEASE_CONTRACT_VERSION;
 export const WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS = REQUIRED_METHODS;
 
 function failure(code) {
@@ -208,6 +214,8 @@ function assertBindingManifest(manifest) {
     && manifest.securityContractVersion === "windows-filesystem-security-v1"
     && manifest.credentialAuditFileGuardContractVersion
       === "windows-credential-audit-file-guard-v1"
+    && manifest.sqliteStateLeaseContractVersion
+      === SQLITE_STATE_LEASE_CONTRACT_VERSION
     && manifest.credentialMutexContractVersion === "windows-credential-mutex-v1"
     && Array.isArray(requiredMethods)
     && requiredMethods.length === REQUIRED_METHODS.length
@@ -215,32 +223,37 @@ function assertBindingManifest(manifest) {
     && nativeClaims !== null
     && typeof nativeClaims === "object"
     && !Array.isArray(nativeClaims)
-    && Object.keys(nativeClaims).length === 4
+    && Object.keys(nativeClaims).length === 5
     && Object.hasOwn(nativeClaims, "productionSafe")
     && Object.hasOwn(nativeClaims, "pathWalkRaceSafe")
     && Object.hasOwn(nativeClaims, "credentialMutexSafe")
     && Object.hasOwn(nativeClaims, "credentialAuditFileGuardSafe")
+    && Object.hasOwn(nativeClaims, "sqliteStateLeaseSafe")
     && typeof nativeClaims.productionSafe === "boolean"
     && typeof nativeClaims.pathWalkRaceSafe === "boolean"
     && typeof nativeClaims.credentialMutexSafe === "boolean"
     && typeof nativeClaims.credentialAuditFileGuardSafe === "boolean"
+    && typeof nativeClaims.sqliteStateLeaseSafe === "boolean"
     && approvedPolicy !== null
     && typeof approvedPolicy === "object"
     && !Array.isArray(approvedPolicy)
-    && Object.keys(approvedPolicy).length === 4
+    && Object.keys(approvedPolicy).length === 5
     && Object.hasOwn(approvedPolicy, "productionSafe")
     && Object.hasOwn(approvedPolicy, "pathWalkRaceSafe")
     && Object.hasOwn(approvedPolicy, "credentialMutexSafe")
     && Object.hasOwn(approvedPolicy, "credentialAuditFileGuardSafe")
+    && Object.hasOwn(approvedPolicy, "sqliteStateLeaseSafe")
     && typeof approvedPolicy.productionSafe === "boolean"
     && typeof approvedPolicy.pathWalkRaceSafe === "boolean"
     && approvedPolicy.credentialMutexSafe === true
     && approvedPolicy.credentialAuditFileGuardSafe === true
+    && approvedPolicy.sqliteStateLeaseSafe === false
     && nativeClaims.productionSafe === approvedPolicy.productionSafe
     && nativeClaims.pathWalkRaceSafe === approvedPolicy.pathWalkRaceSafe
     && nativeClaims.credentialMutexSafe === approvedPolicy.credentialMutexSafe
     && nativeClaims.credentialAuditFileGuardSafe
       === approvedPolicy.credentialAuditFileGuardSafe
+    && nativeClaims.sqliteStateLeaseSafe === approvedPolicy.sqliteStateLeaseSafe
     && validBindingProvenance(bindingProvenance)
     && (!policyRequiresAuthenticatedProvenance(approvedPolicy)
       || bindingProvenance.status === "authenticated");
@@ -263,11 +276,15 @@ function assertBinding(binding) {
       && binding?.securityContractVersion === "windows-filesystem-security-v1"
       && binding?.credentialAuditFileGuardContractVersion
         === "windows-credential-audit-file-guard-v1"
+      && binding?.sqliteStateLeaseContractVersion
+        === SQLITE_STATE_LEASE_CONTRACT_VERSION
       && binding?.credentialMutexContractVersion === "windows-credential-mutex-v1"
       && typeof binding?.productionSafe === "boolean"
       && typeof binding?.pathWalkRaceSafe === "boolean"
       && binding?.credentialMutexSafe === true;
-    valid = valid && binding?.credentialAuditFileGuardSafe === true;
+    valid = valid
+      && binding?.credentialAuditFileGuardSafe === true
+      && binding?.sqliteStateLeaseSafe === false;
   } catch {
     valid = false;
   }
@@ -336,9 +353,12 @@ function verifyBindingIntegrity({
       || binding.pathWalkRaceSafe !== manifest.nativeClaims.pathWalkRaceSafe
       || binding.credentialAuditFileGuardSafe
         !== manifest.nativeClaims.credentialAuditFileGuardSafe
+      || binding.sqliteStateLeaseSafe !== manifest.nativeClaims.sqliteStateLeaseSafe
       || binding.credentialMutexSafe !== manifest.nativeClaims.credentialMutexSafe
       || binding.credentialAuditFileGuardContractVersion
         !== manifest.credentialAuditFileGuardContractVersion
+      || binding.sqliteStateLeaseContractVersion
+        !== manifest.sqliteStateLeaseContractVersion
       || binding.credentialMutexContractVersion !== manifest.credentialMutexContractVersion) {
     throw failure("MANIFEST_BINDING_MISMATCH");
   }
@@ -491,11 +511,13 @@ export function createWindowsFilesystemAdapter({
   } else {
     native = assertBinding(binding);
   }
+  const sqliteStateLeases = new WeakMap();
   const adapter = Object.freeze({
     // The current loader has no trusted package verifier, so these remain
     // false even if an injected/native object or sidecar claims otherwise.
     productionSafe: false,
     pathWalkRaceSafe: false,
+    sqliteStateLeaseSafe: false,
     inspectPath(path) {
       try {
         return normalizeMetadataResult(call(native, "inspectPath", [path]));
@@ -634,6 +656,53 @@ export function createWindowsFilesystemAdapter({
       } catch (error) {
         throw normalizeNativeError(error);
       }
+    },
+    acquireSqliteStateLease(rootPath, rootIdentity, databaseName) {
+      const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);
+      let result;
+      try {
+        result = call(native, "acquireSqliteStateLease", [
+          rootPath,
+          expectedRoot,
+          databaseName,
+        ]);
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+      let valid = false;
+      try {
+        valid = result !== null
+          && typeof result === "object"
+          && !Array.isArray(result)
+          && Object.keys(result).sort().join("\0")
+            === "databaseIdentity\0journalIdentity\0lease"
+          && result.lease !== null
+          && (typeof result.lease === "object" || typeof result.lease === "function");
+      } catch {
+        valid = false;
+      }
+      if (!valid) throw failure("INVALID_RESULT");
+      const lease = Object.freeze({
+        databaseIdentity: normalizeIdentity(result.databaseIdentity),
+        journalIdentity: normalizeIdentity(result.journalIdentity),
+      });
+      sqliteStateLeases.set(lease, result.lease);
+      return lease;
+    },
+    releaseSqliteStateLease(lease) {
+      let nativeLease;
+      try {
+        nativeLease = sqliteStateLeases.get(lease);
+      } catch {
+        nativeLease = undefined;
+      }
+      if (nativeLease === undefined) throw failure("SQLITE_STATE_LEASE_FOREIGN");
+      try {
+        call(native, "releaseSqliteStateLease", [nativeLease]);
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+      sqliteStateLeases.delete(lease);
     },
   });
   WINDOWS_FILESYSTEM_ADAPTERS.add(adapter);
