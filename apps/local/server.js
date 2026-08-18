@@ -124,6 +124,10 @@ import {
   selectProductionParticipantIdentity,
 } from "../../src/export-identity-production.js";
 import {
+  createWindowsFilesystemAdapter,
+  isWindowsFilesystemAdapter,
+} from "../../src/platform/index.js";
+import {
   PRODUCT_BRAND,
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../config/product-brand.js";
@@ -262,6 +266,8 @@ export const LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION =
   "local-contribution-device-disconnect-v0.1";
 const MAX_DIAGNOSTICS_LOG_BYTES = 256 * 1024;
 const DIAGNOSTIC_REFERENCE = /^TT-[0-9A-HJKMNP-TV-Z]{6}$/u;
+const WINDOWS_FILESYSTEM_DEVELOPMENT_ENV =
+  "USAGE_MONITOR_WINDOWS_FILESYSTEM_DEVELOPMENT";
 // Fixed journey names. Anything else is refused, so no free-form label can
 // ever be written to the log.
 const DIAGNOSTIC_SURFACES = new Set([
@@ -2367,6 +2373,66 @@ export function configuredAccountingSourceMode(environment) {
   return selected;
 }
 
+function windowsFilesystemConfigurationError() {
+  const error = new TypeError("Windows filesystem adapter configuration is invalid");
+  error.code = "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID";
+  return error;
+}
+
+/**
+ * Select the single Windows filesystem boundary owned by this composition
+ * root. Packaged Windows starts by loading the repository-owned adapter;
+ * callers may explicitly select the existing no-adapter development path with
+ * USAGE_MONITOR_WINDOWS_FILESYSTEM_DEVELOPMENT=1.
+ * Non-null injected values must be branded by the platform module, which
+ * rejects copied or shape-compatible virtual backends.
+ */
+export function loadCompanionWindowsFilesystemAdapter({
+  platform = process.platform,
+  architecture = process.arch,
+  environment = process.env,
+  windowsFilesystemAdapter = undefined,
+  createAdapter = createWindowsFilesystemAdapter,
+} = {}) {
+  if (!environment || typeof environment !== "object"
+      || Array.isArray(environment)
+      || (platform === "win32" && typeof createAdapter !== "function")) {
+    throw windowsFilesystemConfigurationError();
+  }
+  const supplied = windowsFilesystemAdapter !== undefined;
+  if (platform !== "win32") {
+    if (supplied && windowsFilesystemAdapter !== null) {
+      throw windowsFilesystemConfigurationError();
+    }
+    return null;
+  }
+  if (supplied) {
+    if (windowsFilesystemAdapter === null) {
+      if (environment[WINDOWS_FILESYSTEM_DEVELOPMENT_ENV] !== "1") {
+        throw windowsFilesystemConfigurationError();
+      }
+      return null;
+    }
+    if (!isWindowsFilesystemAdapter(windowsFilesystemAdapter)) {
+      throw windowsFilesystemConfigurationError();
+    }
+    return windowsFilesystemAdapter;
+  }
+  if (environment[WINDOWS_FILESYSTEM_DEVELOPMENT_ENV] === "1") return null;
+  let adapter;
+  try {
+    adapter = createAdapter({ platform, architecture });
+  } catch {
+    // Keep native loader details and paths out of the process boundary. The
+    // caller fails before the private state root can be created.
+    throw windowsFilesystemConfigurationError();
+  }
+  if (!isWindowsFilesystemAdapter(adapter)) {
+    throw windowsFilesystemConfigurationError();
+  }
+  return adapter;
+}
+
 function parentWatchdogConfigurationError() {
   const error = new TypeError(
     "Parent watchdog configuration is invalid",
@@ -2501,9 +2567,20 @@ export function createLocalCompanionServer(options = {}) {
       homeDirectory,
       environment,
     });
+  const windowsFilesystemAdapter = loadCompanionWindowsFilesystemAdapter({
+    platform: process.platform,
+    architecture: process.arch,
+    environment,
+    windowsFilesystemAdapter: Object.hasOwn(options, "windowsFilesystemAdapter")
+      ? options.windowsFilesystemAdapter
+      : undefined,
+    createAdapter: options.createWindowsFilesystemAdapter
+      ?? createWindowsFilesystemAdapter,
+  });
   const installation = prepareLocalInstallationRoots({
     resourceRoot,
     stateRoot,
+    windowsFilesystemAdapter,
   });
   const staticRoot = assertLocalResourceDirectory(
     installation.resourceRoot,
@@ -2520,11 +2597,13 @@ export function createLocalCompanionServer(options = {}) {
     options.contributionQueueFile
       ?? environment.USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE
       ?? installation.paths.contributionQueueFile,
+    { windowsFilesystemAdapter },
   );
   const diagnosticsLogFile = assertLocalStatePath(
     installation.stateRoot,
     options.diagnosticsLogFile
       ?? join(installation.stateRoot, DIAGNOSTICS_LOG_FILE_NAME),
+    { windowsFilesystemAdapter },
   );
   const legacyContributionDeviceStateCandidate = Object.hasOwn(
     options,
@@ -2555,7 +2634,9 @@ export function createLocalCompanionServer(options = {}) {
       : installation.paths.preparedSpoolDirectory;
   const preparedContributionDirectory = preparedCandidate === null
     ? null
-    : assertLocalStatePath(installation.stateRoot, preparedCandidate);
+    : assertLocalStatePath(installation.stateRoot, preparedCandidate, {
+      windowsFilesystemAdapter,
+    });
   const contributionPreparationOptions =
     options.contributionPreparationOptions ?? {};
   if (!contributionPreparationOptions
@@ -2569,11 +2650,13 @@ export function createLocalCompanionServer(options = {}) {
       installation.stateRoot,
       contributionPreparationOptions.activityFile
         ?? installation.paths.activityMarkersFile,
+      { windowsFilesystemAdapter },
     ),
     reviewArchiveDirectory: assertLocalStatePath(
       installation.stateRoot,
       contributionPreparationOptions.reviewArchiveDirectory
         ?? installation.paths.reviewArchiveDirectory,
+      { windowsFilesystemAdapter },
     ),
   };
   return createPreparedLocalCompanionServer({
@@ -2589,6 +2672,7 @@ export function createLocalCompanionServer(options = {}) {
     legacyContributionDeviceStateFile,
     preparedContributionDirectory,
     contributionPreparationOptions: selectedPreparationOptions,
+    windowsFilesystemAdapter,
     parentWatchdogPid,
     homeDirectory,
     ...claudeShadowConfiguration,
@@ -2606,6 +2690,7 @@ function createPreparedLocalCompanionServer({
   claudeConfigDirectory,
   claudeProjectDirectory,
   diagnosticsLogFile,
+  windowsFilesystemAdapter = null,
   parentWatchdogPid,
   // Explicit reversible authority switch. Unified is the normal authority;
   // legacy is retained only for an explicit rollback selection.
@@ -2689,6 +2774,7 @@ function createPreparedLocalCompanionServer({
     stateFile: statePaths.collectorStateFile,
     accountObservationOperationLockFile:
       statePaths.accountObservationLockFile,
+    windowsFilesystemAdapter,
     refreshAccounting: refreshReplaySafeAccountingCache,
     refreshClaudeQuota: async ({ signal }) => {
       const secret = await readOrCreateClaudeDesktopQuotaSecret(
@@ -2743,6 +2829,7 @@ function createPreparedLocalCompanionServer({
     customCodexHomeConfigured:
       typeof environment.CODEX_HOME === "string"
       && environment.CODEX_HOME.length > 0,
+    windowsFilesystemAdapter,
   }),
   refreshTimeoutMs = 300_000,
   centralOrigin = environment.USAGE_MONITOR_CENTRAL_ORIGIN ?? null,
@@ -2824,6 +2911,10 @@ function createPreparedLocalCompanionServer({
   }
   if (!dataStore || typeof dataStore.initialize !== "function") {
     throw new TypeError("dataStore.initialize must be a function");
+  }
+  if (windowsFilesystemAdapter !== null
+      && !isWindowsFilesystemAdapter(windowsFilesystemAdapter)) {
+    throw windowsFilesystemConfigurationError();
   }
   if (typeof onboardingProvider !== "function") {
     throw new TypeError("onboardingProvider must be a function");
@@ -2947,7 +3038,9 @@ function createPreparedLocalCompanionServer({
         queueFile: contributionQueueFile,
       }));
   const createContributionDeviceBackend = async () => {
-    const backend = contributionDeviceBackendFactory();
+    const backend = contributionDeviceBackendFactory({
+      windowsFilesystemAdapter,
+    });
     if (legacyContributionDeviceStateFile !== null) {
       await migrateLegacyContributionDeviceCapability({
         backend,
@@ -3178,6 +3271,7 @@ function createPreparedLocalCompanionServer({
               createKeychainBackend:
                 contributionPreparationCreateKeychainBackend,
             }),
+          windowsFilesystemAdapter,
         })
       ),
   });
