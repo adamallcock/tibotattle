@@ -126,6 +126,11 @@ test("web-only scope accepts only committed public source and release controls",
   }]);
   assert.match(scope.sha256, /^[a-f0-9]{64}$/u);
   assert.equal(isAllowedWebReleasePath("apps/web/public/community.js"), true);
+  assert.equal(isAllowedWebReleasePath("scripts/preview-public-release-site.js"), true);
+  assert.equal(
+    isAllowedWebReleasePath("docs/runbooks/2026-08-17-public-site-local-preview.md"),
+    true,
+  );
   assert.equal(isAllowedWebReleasePath("apps/macos/Sources/UsageMonitorApp.swift"), false);
 });
 

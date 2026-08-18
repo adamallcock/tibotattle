@@ -39,6 +39,7 @@ const REPOSITORY_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const DEFAULT_SOURCE = join(REPOSITORY_ROOT, "apps", "web", "public");
 const SOCIAL_PREVIEW_FILENAME = "social-preview.png";
 const ROBOTS_FILENAME = "robots.txt";
+const SITEMAP_FILENAME = "sitemap.xml";
 const PUBLIC_COMMUNITY_ROUTE_FILENAME = "community.html";
 const PUBLIC_FALLBACK_ROUTE_FILENAME = "404.html";
 const SITE_ENTRY_MODULE_BASENAME = "community.js";
@@ -53,6 +54,14 @@ const PUBLIC_AUXILIARY_PAGE_BASENAMES = Object.freeze([
   "docs.html",
   "privacy.html",
 ]);
+// Source filenames do not define public canonical URLs. Keeping this mapping
+// beside the generator ensures HTML metadata, the sitemap, and robots policy
+// stay in lockstep with the configured public origin.
+const PUBLIC_PAGE_ROUTE_BY_SOURCE_BASENAME = Object.freeze({
+  [SITE_INDEX_SOURCE_BASENAME]: "/",
+  "docs.html": "/docs",
+  "privacy.html": "/privacy",
+});
 /**
  * Defense-in-depth absence ledger for the in-app dashboard surface. The
  * release is selected from the public module and asset closures below; these
@@ -640,7 +649,104 @@ function replaceExactlyOnce(html, token, replacement, label) {
   return html.replace(token, replacement);
 }
 
-function injectReleaseMetadata(html, values) {
+function canonicalPageUrl(siteUrl, sourceBasename) {
+  if (!Object.hasOwn(PUBLIC_PAGE_ROUTE_BY_SOURCE_BASENAME, sourceBasename)) {
+    throw new TypeError(
+      `Public source page has no reviewed canonical route: ${sourceBasename}`,
+    );
+  }
+  return new URL(PUBLIC_PAGE_ROUTE_BY_SOURCE_BASENAME[sourceBasename], siteUrl).href;
+}
+
+function canonicalMetadataCounts(html) {
+  return {
+    canonical: [...html.matchAll(
+      /<link\b[^>]*\brel\s*=\s*(?:"canonical"|'canonical'|canonical)(?=\s|\/?>)/giu,
+    )].length,
+    openGraphUrl: [...html.matchAll(
+      /<meta\b[^>]*\bproperty\s*=\s*(?:"og:url"|'og:url'|og:url)(?=\s|\/?>)/giu,
+    )].length,
+  };
+}
+
+function assertCanonicalMetadata(html, canonicalUrl, label, ErrorType = TypeError) {
+  const expectedCanonical =
+    `<link rel="canonical" href="${htmlAttribute(canonicalUrl)}">`;
+  const expectedOpenGraphUrl =
+    `<meta property="og:url" content="${htmlAttribute(canonicalUrl)}">`;
+  const counts = canonicalMetadataCounts(html);
+  if (counts.canonical !== 1
+      || counts.openGraphUrl !== 1
+      || !html.includes(expectedCanonical)
+      || !html.includes(expectedOpenGraphUrl)) {
+    throw new ErrorType(
+      `${label} must contain exactly one generated canonical and Open Graph URL`,
+    );
+  }
+}
+
+function injectCanonicalMetadata(
+  html,
+  canonicalUrl,
+  label,
+  { requireSlots = false } = {},
+) {
+  const canonicalSlot = '<link rel="canonical" href="">';
+  const openGraphUrlSlot = '<meta property="og:url" content="">';
+  const hasCanonicalSlot = html.includes(canonicalSlot);
+  const hasOpenGraphUrlSlot = html.includes(openGraphUrlSlot);
+  let output = html;
+  if (hasCanonicalSlot || hasOpenGraphUrlSlot) {
+    if (!hasCanonicalSlot || !hasOpenGraphUrlSlot) {
+      throw new TypeError(
+        `${label} must expose canonical and Open Graph URL slots together`,
+      );
+    }
+    output = replaceExactlyOnce(
+      output,
+      canonicalSlot,
+      `<link rel="canonical" href="${htmlAttribute(canonicalUrl)}">`,
+      "empty canonical link",
+    );
+    output = replaceExactlyOnce(
+      output,
+      openGraphUrlSlot,
+      `<meta property="og:url" content="${htmlAttribute(canonicalUrl)}">`,
+      "empty Open Graph URL",
+    );
+  } else {
+    if (requireSlots) {
+      throw new TypeError(
+        `${label} must expose empty canonical and Open Graph URL slots`,
+      );
+    }
+    const counts = canonicalMetadataCounts(output);
+    if (counts.canonical !== 0 || counts.openGraphUrl !== 0) {
+      throw new TypeError(
+        `${label} must not hard-code canonical or Open Graph URLs`,
+      );
+    }
+    const closingHead = output.match(/(^|\n)([\t ]*)<\/head>/u);
+    const indentation = closingHead?.[2] ?? "";
+    const closingHeadToken = closingHead
+      ? `${indentation}</head>`
+      : "</head>";
+    output = replaceExactlyOnce(
+      output,
+      closingHeadToken,
+      [
+        `${indentation}  <link rel="canonical" href="${htmlAttribute(canonicalUrl)}">`,
+        `${indentation}  <meta property="og:url" content="${htmlAttribute(canonicalUrl)}">`,
+        `${indentation}</head>`,
+      ].join("\n"),
+      `closing </head> tag for ${label}`,
+    );
+  }
+  assertCanonicalMetadata(output, canonicalUrl, label);
+  return output;
+}
+
+function injectReleaseMetadata(html, values, canonicalUrl) {
   let output = html;
   for (const [name, valueKey] of Object.entries(SITE_META)) {
     const token = `<meta name="${name}" content="">`;
@@ -671,16 +777,6 @@ function injectReleaseMetadata(html, values) {
   }
   for (const [token, replacement, label] of [
     [
-      '<link rel="canonical" href="">',
-      `<link rel="canonical" href="${htmlAttribute(values.siteUrl)}">`,
-      "empty canonical link",
-    ],
-    [
-      '<meta property="og:url" content="">',
-      `<meta property="og:url" content="${htmlAttribute(values.siteUrl)}">`,
-      "empty Open Graph URL",
-    ],
-    [
       '<meta property="og:image" content="">',
       `<meta property="og:image" content="${htmlAttribute(values.socialImageUrl)}">`,
       "empty Open Graph image",
@@ -693,7 +789,48 @@ function injectReleaseMetadata(html, values) {
   ]) {
     output = replaceExactlyOnce(output, token, replacement, label);
   }
-  return output;
+  return injectCanonicalMetadata(
+    output,
+    canonicalUrl,
+    "Public community entry",
+    { requireSlots: true },
+  );
+}
+
+function publicPageSourceBasenames(source, publicSourceFiles) {
+  const selectedNames = new Set(publicSourceFiles.map((sourceFile) =>
+    relativePublicSourceName(source, sourceFile)));
+  return [
+    SITE_INDEX_SOURCE_BASENAME,
+    ...PUBLIC_AUXILIARY_PAGE_BASENAMES.filter((basename) =>
+      selectedNames.has(basename)),
+  ];
+}
+
+function xmlText(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function renderSitemap(canonicalUrls) {
+  return [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+    ...canonicalUrls.map((url) => `  <url><loc>${xmlText(url)}</loc></url>`),
+    "</urlset>",
+    "",
+  ].join("\n");
+}
+
+function renderRobots(siteUrl) {
+  return [
+    "User-agent: *",
+    "Allow: /",
+    `Sitemap: ${new URL(SITEMAP_FILENAME, siteUrl).href}`,
+    "",
+  ].join("\n");
 }
 
 async function fileManifest(root, { excludedFiles = new Set() } = {}) {
@@ -887,6 +1024,17 @@ export async function buildPublicReleaseSite(rawArgs, {
     sourceRoot: options.source,
     sourceFiles: [...new Set([sourceIndex, ...publicSourceFiles])],
   });
+  const publicPageSources = publicPageSourceBasenames(
+    options.source,
+    publicSourceFiles,
+  );
+  const canonicalUrlBySourceBasename = new Map(
+    publicPageSources.map((basename) => [
+      basename,
+      canonicalPageUrl(options.siteUrl, basename),
+    ]),
+  );
+  const canonicalPageUrls = [...canonicalUrlBySourceBasename.values()];
   assertPublicClosureHasNoDashboardSource(options.source, publicSourceFiles);
   for (const sourceFile of publicSourceFiles) {
     const extension = extname(sourceFile).toLowerCase();
@@ -967,7 +1115,11 @@ export async function buildPublicReleaseSite(rawArgs, {
     installerBytes: installerEvidence?.artifact.bytes ?? null,
     installerSha256: installerEvidence?.artifact.sha256 ?? null,
   };
-  const releaseHtml = injectReleaseMetadata(sourceHtml, releaseValues);
+  const releaseHtml = injectReleaseMetadata(
+    sourceHtml,
+    releaseValues,
+    canonicalUrlBySourceBasename.get(SITE_INDEX_SOURCE_BASENAME),
+  );
 
   if (await pathExists(options.output)) {
     if (!options.replace) {
@@ -984,8 +1136,17 @@ export async function buildPublicReleaseSite(rawArgs, {
     );
     await mkdir(dirname(outputFile), { recursive: true });
     if (extname(sourceFile).toLowerCase() === ".html") {
-      const auxiliaryHtml = renderAuxiliaryPublicHtml(
-        await readFile(sourceFile, "utf8"),
+      const sourceBasename = relativePublicSourceName(options.source, sourceFile);
+      const canonicalUrl = canonicalUrlBySourceBasename.get(sourceBasename);
+      if (canonicalUrl === undefined) {
+        throw new TypeError(
+          `Public source page has no generated canonical URL: ${sourceBasename}`,
+        );
+      }
+      const auxiliaryHtml = injectCanonicalMetadata(
+        renderAuxiliaryPublicHtml(await readFile(sourceFile, "utf8")),
+        canonicalUrl,
+        `Public auxiliary page ${sourceBasename}`,
       );
       await writeFile(outputFile, auxiliaryHtml, {
         encoding: "utf8",
@@ -1016,7 +1177,13 @@ export async function buildPublicReleaseSite(rawArgs, {
     socialBytes,
     { mode: 0o644 },
   );
-  const robots = "User-agent: *\nAllow: /\n";
+  const sitemap = renderSitemap(canonicalPageUrls);
+  await writeFile(
+    join(options.output, SITEMAP_FILENAME),
+    sitemap,
+    { encoding: "utf8", mode: 0o644 },
+  );
+  const robots = renderRobots(options.siteUrl);
   await writeFile(
     join(options.output, ROBOTS_FILENAME),
     robots,
@@ -1042,6 +1209,7 @@ export async function buildPublicReleaseSite(rawArgs, {
     PUBLIC_COMMUNITY_ROUTE_FILENAME,
     PUBLIC_FALLBACK_ROUTE_FILENAME,
     ROBOTS_FILENAME,
+    SITEMAP_FILENAME,
     SOCIAL_PREVIEW_FILENAME,
   ]);
   for (const publishedName of publishedNames) {
@@ -1084,6 +1252,10 @@ export async function buildPublicReleaseSite(rawArgs, {
         path: ROBOTS_FILENAME,
         policy: "allow_all",
       },
+      sitemap: {
+        path: SITEMAP_FILENAME,
+        canonicalUrls: canonicalPageUrls,
+      },
     },
     ...(installerEvidence
       ? {
@@ -1124,6 +1296,17 @@ export async function buildPublicReleaseSite(rawArgs, {
       );
     }
   }
+  for (const [sourceBasename, canonicalUrl] of canonicalUrlBySourceBasename) {
+    const outputFilename = sourceBasename === SITE_INDEX_SOURCE_BASENAME
+      ? "index.html"
+      : sourceBasename;
+    assertCanonicalMetadata(
+      await readFile(join(options.output, outputFilename), "utf8"),
+      canonicalUrl,
+      `Release output ${outputFilename}`,
+      Error,
+    );
+  }
   for (const name of Object.keys(SITE_META)) {
     if (verifiedHtml.includes(`<meta name="${name}" content="">`)) {
       throw new Error(`Release output retained empty ${name} metadata`);
@@ -1151,6 +1334,9 @@ export async function buildPublicReleaseSite(rawArgs, {
   }
   if (await readFile(join(options.output, ROBOTS_FILENAME), "utf8") !== robots) {
     throw new Error("Release output robots policy was not written deterministically");
+  }
+  if (await readFile(join(options.output, SITEMAP_FILENAME), "utf8") !== sitemap) {
+    throw new Error("Release output sitemap was not written deterministically");
   }
   return {
     output: options.output,

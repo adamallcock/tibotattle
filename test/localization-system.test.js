@@ -90,6 +90,51 @@ function fakeWindow({ host = null, languages = ["en-US"], storage = null } = {})
   };
 }
 
+function fakeLanguagePickerDocument({ resolved = false } = {}) {
+  const listeners = new Map();
+  const attributes = new Map(
+    resolved ? [["data-language-picker-resolved", ""]] : [],
+  );
+  const picker = {
+    children: [],
+    dataset: {},
+    value: "",
+    addEventListener(type, listener) {
+      listeners.set(type, listener);
+    },
+    append(node) {
+      this.children.push(node);
+    },
+    emit(type) {
+      listeners.get(type)?.({ target: this, type });
+    },
+    getAttribute(name) {
+      return attributes.get(name) ?? null;
+    },
+    hasAttribute(name) {
+      return attributes.has(name);
+    },
+    replaceChildren() {
+      this.children = [];
+    },
+    setAttribute(name, value) {
+      attributes.set(name, String(value));
+    },
+  };
+  return {
+    documentRef: {
+      createElement() {
+        return { textContent: "", value: "" };
+      },
+      documentElement: { dir: "ltr", lang: "en-US" },
+      querySelectorAll(selector) {
+        return selector === "[data-language-picker]" ? [picker] : [];
+      },
+    },
+    picker,
+  };
+}
+
 test("browser catalogs preserve placeholders, plural forms, and legacy text has both initial translations", () => {
   assert.deepEqual(SUPPORTED_LOCALES, ["en-US", "zh-Hans", "es"]);
   for (const [key, values] of Object.entries(WEB_MESSAGES)) {
@@ -164,8 +209,11 @@ test("shipped static web copy has a complete translated inventory and localizabl
     new URL(`../apps/web/public/${file}`, import.meta.url),
     "utf8",
   )));
-  const copyThatNeedsNoTranslation = new Set(["TiboTattle"]);
-  const neutralGlyph = /^[+＋−—⇢→←\d\s.]+$/u;
+  const copyThatNeedsNoTranslation = new Set([
+    "TiboTattle",
+    "brew install --cask adamallcock/tap/tibotattle",
+  ]);
+  const neutralGlyph = /^[+$·＋−—⇢→←\d\s.]+$/u;
 
   for (const [index, source] of sourceFiles.entries()) {
     assert.match(source, /<body\b[^>]*\bdata-i18n-root\b/u, staticPages[index]);
@@ -310,6 +358,43 @@ test("browser override persists while native override is message-validated and d
   });
   assert.equal(native.locale(), "zh-Hans");
   assert.equal(messages.length, 1, "host event does not echo back into a loop");
+});
+
+test("the public language picker shows the resolved language without removing the dashboard system preference", () => {
+  const publicPicker = fakeLanguagePickerDocument({ resolved: true });
+  const publicLocalizer = createBrowserLocalization({
+    documentRef: publicPicker.documentRef,
+    windowRef: fakeWindow({ languages: ["es-MX"] }),
+  });
+  assert.equal(publicLocalizer.preference(), "system");
+  assert.equal(publicLocalizer.locale(), "es");
+  assert.deepEqual(
+    publicPicker.picker.children.map(({ value }) => value),
+    ["en-US", "zh-Hans", "es"],
+  );
+  assert.deepEqual(
+    publicPicker.picker.children.map(({ textContent }) => textContent),
+    ["English", "简体中文", "Español"],
+  );
+  assert.equal(publicPicker.picker.value, "es");
+
+  publicPicker.picker.value = "zh-Hans";
+  publicPicker.picker.emit("change");
+  assert.equal(publicLocalizer.preference(), "zh-Hans");
+  assert.equal(publicLocalizer.locale(), "zh-Hans");
+  assert.equal(publicPicker.picker.value, "zh-Hans");
+
+  const dashboardPicker = fakeLanguagePickerDocument();
+  const dashboardLocalizer = createBrowserLocalization({
+    documentRef: dashboardPicker.documentRef,
+    windowRef: fakeWindow({ languages: ["es-MX"] }),
+  });
+  assert.equal(dashboardLocalizer.preference(), "system");
+  assert.deepEqual(
+    dashboardPicker.picker.children.map(({ value }) => value),
+    ["system", "en-US", "zh-Hans", "es"],
+  );
+  assert.equal(dashboardPicker.picker.value, "system");
 });
 
 test("localizer is root-bounded, preserves raw-data boundaries, and never interpolates HTML", async () => {

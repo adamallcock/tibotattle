@@ -143,8 +143,16 @@ export function formatInstallerSize(bytes, {
   });
 }
 
+export function compactMacOSVersion(version) {
+  return typeof version === "string"
+    ? version.replace(/(?:\.0)+$/u, "")
+    : version;
+}
+
 export function renderInstallerJourney(documentRef, {
+  compactDetails = false,
   showUnavailableAction = false,
+  showReleaseLinks = true,
   formatLocale = getFormattingLocale(),
   translateMessage = defaultMessage,
 } = {}) {
@@ -169,11 +177,17 @@ export function renderInstallerJourney(documentRef, {
       "installer.version",
       { version: release.version },
     );
-    select("#installer-compatibility").textContent =
-      translateMessage("installer.requiresMacOS", {
+    select("#installer-compatibility").textContent = translateMessage(
+      compactDetails
+        ? "installer.compatibilitySummary"
+        : "installer.requiresMacOS",
+      {
         architecture: architectureLabel,
-        version: release.minimumMacos,
-      });
+        version: compactDetails
+          ? compactMacOSVersion(release.minimumMacos)
+          : release.minimumMacos,
+      },
+    );
     select("#installer-size").textContent = formatInstallerSize(release.bytes, {
       formatLocale,
       translateMessage,
@@ -192,10 +206,15 @@ export function renderInstallerJourney(documentRef, {
       ]
     ) {
       const item = select(`#${id}`);
-      item.href = url;
-      item.hidden = false;
+      if (showReleaseLinks) {
+        item.href = url;
+        item.hidden = false;
+      } else {
+        item.removeAttribute("href");
+        item.hidden = true;
+      }
     }
-    releaseLinks.hidden = false;
+    releaseLinks.hidden = !showReleaseLinks;
     unavailable.hidden = true;
     return release;
   }

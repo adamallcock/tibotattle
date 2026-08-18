@@ -38,6 +38,7 @@ const WEB_RELEASE_TOOLING_PATHS = new Set([
   "scripts/build-public-release-site.js",
   "scripts/deploy-web-release.js",
   "scripts/prepare-web-release.js",
+  "scripts/preview-public-release-site.js",
   "scripts/public-release-provenance.js",
   "scripts/web-release-lane.js",
   "apps/worker/scripts/production-deploy.check.mjs",
@@ -46,6 +47,7 @@ const WEB_RELEASE_TOOLING_PATHS = new Set([
   "apps/worker/scripts/stage-production-assets.mjs",
   "apps/web/test/community-site.test.mjs",
   "docs/runbooks/2026-08-17-web-only-release.md",
+  "docs/runbooks/2026-08-17-public-site-local-preview.md",
   "docs/runbooks/macos-stable-release-runbook.md",
   "test/localization-system.test.js",
   "test/public-release-site-preview.test.js",
@@ -54,7 +56,8 @@ const WEB_RELEASE_TOOLING_PATHS = new Set([
 ]);
 const WEB_RELEASE_PACKAGE_SCRIPTS = Object.freeze({
   "product:release-site:test":
-    "node --test test/public-release-site.test.js test/web-release-lane.test.js",
+    "node --test test/public-release-site.test.js test/public-release-site-preview.test.js test/web-release-lane.test.js",
+  "product:release-site:preview": "node ./scripts/preview-public-release-site.js",
   "product:web-release:prepare": "node ./scripts/prepare-web-release.js",
   "product:web-release:deploy": "node ./scripts/deploy-web-release.js",
   "product:web-release:test": "node --test test/web-release-lane.test.js",

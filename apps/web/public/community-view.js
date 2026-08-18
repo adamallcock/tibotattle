@@ -75,6 +75,18 @@ function communityDayStartMs(day) {
   return Date.parse(`${day}T00:00:00.000Z`);
 }
 
+function formatCommunityDay(day) {
+  // A published day is a UTC calendar label, not an instant in the viewer's
+  // time zone. Formatting UTC midnight locally would show the preceding day
+  // everywhere west of Greenwich.
+  return dateTimeFormatter({
+    timeZone: "UTC",
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  }).format(new Date(communityDayStartMs(day)));
+}
+
 /**
  * A round tick step (1/2/2.5/5 × 10^n) that covers the value range with the
  * requested number of divisions. Same shape as the dashboard's chart axes so
@@ -567,7 +579,7 @@ export function renderCommunityDailySeries({
   const latest = series.days[series.days.length - 1];
   const quality = node("dl", "snapshot-quality-grid");
   for (const [term, value] of [
-    [t("community.daily.latestDay"), formatLocal(latest.day, { dateOnly: true })],
+    [t("community.daily.latestDay"), formatCommunityDay(latest.day)],
     [t("community.daily.revision"), `r${latest.revision}`],
     [t("community.released"), formatLocal(latest.releasedAt)],
     [
@@ -1064,7 +1076,7 @@ export function renderCommunityAllowanceSection({
     "allowance-headline-caveat",
     t("community.allowance.caveatSentence", {
       latest: t("community.allowance.latestLabel", {
-        day: formatLocal(model.latest.day, { dateOnly: true }),
+        day: formatCommunityDay(model.latest.day),
       }),
       accounts: plural(
         "community.allowance.accountCount",

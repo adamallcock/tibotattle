@@ -325,7 +325,14 @@ test("production deployment creates a real top-level Git snapshot and passes the
   assert.deepEqual(result.pendingMigrations, []);
   assert.equal(healthChecks, 2);
   assert.deepEqual(healthTimeouts, [10_000, 10_000]);
-  assert.deepEqual(deployArgs, [["deploy", "--env", "production", "--strict"]]);
+  assert.deepEqual(deployArgs, [[
+    "deploy",
+    "--env",
+    "production",
+    "--strict",
+    "--var",
+    `DEPLOYMENT_SOURCE_COMMIT:${fixture.sourceCommit}`,
+  ]]);
   assert.equal(d1Queries.length, 2);
   assert.deepEqual(d1Queries.map((args) => args[2]), [
     "USAGE_MONITOR_DB",
@@ -693,7 +700,14 @@ test("a no-unapplied-migration deployment routes through local checks and then t
     "workspace",
     "endpoints",
     "assets",
-    ["deploy", "--env", "production", "--strict"],
+    [
+      "deploy",
+      "--env",
+      "production",
+      "--strict",
+      "--var",
+      "DEPLOYMENT_SOURCE_COMMIT:c26823c",
+    ],
   ]);
   assert.equal(healthCalls.length, 2);
   assert.equal(healthCalls[0].url, HEALTH_URL);
