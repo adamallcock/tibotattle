@@ -28,6 +28,7 @@ signing, artifacts, an appcast, or updater infrastructure is operational.
 | [`runbooks/2026-08-13-community-allowance-band-diagnosis.md`](./runbooks/2026-08-13-community-allowance-band-diagnosis.md) | Diagnose a missing or stale public allowance band through fit-cache and aggregate state; production writes remain owner-run |
 | [`runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md`](./runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md) | When retained R7 receipts go stale (any workload-source change) and the exact dual-runtime regeneration procedure, including the fresh-checkout 0600 guard |
 | [`decisions/2026-08-15-homebrew-distribution-and-macos-support.md`](./decisions/2026-08-15-homebrew-distribution-and-macos-support.md) | First-party Homebrew tap, update automation, uninstall boundary, and supported macOS floor |
+| [`goals/2026-08-18-windows-first-electron-delivery-goal.md`](./goals/2026-08-18-windows-first-electron-delivery-goal.md) | Active Windows-first Electron delivery stages, exit criteria, stop conditions, and non-publication boundary |
 | [`goals/2026-08-17-four-day-windows-readiness-goal.md`](./goals/2026-08-17-four-day-windows-readiness-goal.md) | Bounded portable-core qualification for issue #3; explicitly not Windows support |
 | [`runbooks/2026-08-17-windows-portability-environments.md`](./runbooks/2026-08-17-windows-portability-environments.md) | Restore macOS, network-isolated Linux, native Windows x64, and optional UTM development lanes |
 
