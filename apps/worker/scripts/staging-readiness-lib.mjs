@@ -440,23 +440,11 @@ const ALLOWED_WORKER_FIRST_ROUTES = Object.freeze([
   "/api/*",
   "/.well-known/apple-developer-domain-association.txt",
 ]);
-// Production-only additions (2026-08-09): the admin surface is worker-first
-// by design. The admin hostname exists only on production, where the Worker
-// gates these paths on that hostname, 404s them on the public origin, and
-// serves the embedded admin UI only behind the Cloudflare Access JWT.
-// Asset-first serving 404s them on the admin host, so worker-first is the
-// only way the Access-authenticated operator reaches the admin UI. Staging and
-// synthetic have no admin hostname, so they keep the base list and still
-// reject /admin* worker-first. Exact enumeration keeps arbitrary paths out.
-const ALLOWED_PRODUCTION_WORKER_FIRST_ROUTES = Object.freeze([
-  ...ALLOWED_WORKER_FIRST_ROUTES,
-  "/admin",
-  "/admin/*",
-  "/admin.html",
-  "/admin.js",
-  "/admin-client.js",
-  "/admin.css",
-]);
+// Production serves an explicit canonical public host. Its Worker must run
+// before every asset so the www alias redirects before static HTML is served;
+// the regular ASSETS.fetch fallback then handles all allowed public files.
+// Staging and synthetic have no public canonical host, so they retain their
+// narrow worker-first allow-list.
 const FORBIDDEN_PUBLIC_ROUTE_PATTERN =
   /(?:^|\/)(?:app-open|contribution|sign-?in|signin)(?:\/|\*|$)/iu;
 
@@ -612,12 +600,7 @@ function safeProductionAssetRoute(value) {
   return value?.binding === "ASSETS"
     && value?.directory === PRODUCTION_PUBLIC_ASSET_DIRECTORY
     && value?.not_found_handling === "404-page"
-    && Array.isArray(value?.run_worker_first)
-    && value.run_worker_first.length >= 1
-    && value.run_worker_first.every((route) =>
-      typeof route === "string"
-      && ALLOWED_PRODUCTION_WORKER_FIRST_ROUTES.includes(route)
-      && !FORBIDDEN_PUBLIC_ROUTE_PATTERN.test(route));
+    && value?.run_worker_first === true;
 }
 
 function deployableAssetRoutesClosed(config) {

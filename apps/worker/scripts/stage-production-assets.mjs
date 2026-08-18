@@ -38,6 +38,10 @@ export const PRODUCTION_ASSET_DIRECTORY = join(
 );
 
 const RELEASE_MANIFEST_BASENAME = "release-site-manifest.json";
+const REQUIRED_SEO_ASSET_BASENAMES = Object.freeze([
+  "robots.txt",
+  "sitemap.xml",
+]);
 const PUBLIC_RELEASE_ASSET_BASENAMES = Object.freeze([
   "404.html",
   "apple.svg",
@@ -232,6 +236,13 @@ async function verifiedGeneratedSite(sourceDirectory) {
   }
   if (!expectedFiles.has("index.html")) {
     throw new Error("Generated public release output must contain index.html.");
+  }
+  for (const basename of REQUIRED_SEO_ASSET_BASENAMES) {
+    if (!expectedFiles.has(basename)) {
+      throw new Error(
+        `Generated public release output must contain ${basename}.`,
+      );
+    }
   }
 
   const actualFiles = await fileManifest(sourceDirectory);

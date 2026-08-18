@@ -36,6 +36,9 @@ import {
   createBrowserLocalization,
 } from "./localization.js";
 import {
+  TELEMETRY_PLAN_TYPES,
+} from "./telemetry-shared.generated.js";
+import {
   compact,
   adaptiveChartTickCount,
   classifyTimelineEvidence,
@@ -1732,6 +1735,65 @@ const SHARE_CARD_WINDOW_KEYS = Object.freeze({
   other: "share.window.other",
   seven_day: "share.window.sevenDay",
 });
+// The friendly name the card prints for a reported Codex plan. The keys are
+// Codex's own KnownPlan vocabulary (TELEMETRY_PLAN_TYPES) verbatim, so the
+// card never invents a plan label. The usage multiplier is intrinsic to the
+// plan (pro = 20x, prolite = 5x), so a plan that documents one states it
+// inline; a plan that documents none is named without a fabricated number.
+// "unknown" is Codex's sentinel for an unnamed plan and is deliberately
+// absent, so it — like any unmapped or empty reading — draws no chip.
+const SHARE_CARD_PLAN_LABELS = Object.freeze({
+  free: "Free",
+  go: "Go",
+  plus: "Plus",
+  pro: "Pro (20×)",
+  prolite: "Pro Lite (5×)",
+  business: "Business",
+  enterprise: "Enterprise",
+  ent26: "Enterprise",
+  team: "Team",
+  edu: "Edu",
+  self_serve_business_prolite: "Business · Pro Lite (5×)",
+  self_serve_business_usage_based: "Business · usage-based",
+  enterprise_cbp_automation: "Enterprise · automation",
+  enterprise_cbp_usage_based: "Enterprise · usage-based",
+});
+
+/**
+ * The display label for one reported plan_type, or "" when nothing nameable
+ * was reported. Only the bounded KnownPlan enum reaches a label: "unknown",
+ * an empty reading, and any value outside the map all resolve to "", so the
+ * card prints no plan chip rather than an invented label.
+ */
+function shareCardPlanLabel(planType) {
+  const candidate = typeof planType === "string" ? planType.trim() : "";
+  return TELEMETRY_PLAN_TYPES.includes(candidate)
+    && Object.hasOwn(SHARE_CARD_PLAN_LABELS, candidate)
+    ? SHARE_CARD_PLAN_LABELS[candidate]
+    : "";
+}
+
+/**
+ * The reader's most-recently-observed plan, as a display label.
+ *
+ * Reads only the bounded plan_type enum and the observation time the card
+ * already holds on each quota window. A window with no parseable time sorts
+ * as the oldest, so a timestamped reading always wins recency. "" is
+ * returned when no window names a plan, and the card then omits the chip.
+ */
+function shareCardPlan(windows) {
+  let label = "";
+  let newest = -Infinity;
+  for (const observation of Array.isArray(windows) ? windows : []) {
+    const candidate = shareCardPlanLabel(observation.planType);
+    if (candidate === "") continue;
+    const at = finite(Date.parse(observation.observedAt), -Infinity);
+    if (at < newest) continue;
+    label = candidate;
+    newest = at;
+  }
+  return label;
+}
 let shareCard = null;
 let shareCardReference = "";
 let shareCardSignature = "";
@@ -1829,8 +1891,8 @@ function shareCardWindowLabel(window) {
 }
 
 /**
- * A date-only label for a derived reset estimate. The card deliberately omits
- * a time of day and any raw-log timestamp.
+ * A date-only label for a derived reset estimate or the latest observation.
+ * The card deliberately omits a time of day and any raw-log timestamp.
  */
 function shareCardDateLabel(timestamp) {
   if (!Number.isFinite(timestamp)) return "";
@@ -1840,6 +1902,14 @@ function shareCardDateLabel(timestamp) {
     day: "numeric",
     year: "numeric",
   }).format(timestamp);
+}
+
+function shareCardHeadlineDate(data, history) {
+  const latestObservedAt = Date.parse(data?.freshness?.latestObservedAt ?? "");
+  const timestamp = Number.isFinite(history?.anchorAt)
+    ? history.anchorAt
+    : latestObservedAt;
+  return shareCardDateLabel(timestamp);
 }
 
 /**
@@ -1929,6 +1999,7 @@ function buildShareCard(data, {
     throw new TypeError("A results card requires a minted reference.");
   }
   const isDemo = data?.mode === "demo";
+  const headlineDate = shareCardHeadlineDate(data, history);
   const pricing = data?.pricing ?? {};
   // The activity figure follows the usage chart's selected date range
   // (owner-directed, 2026-08-10) whenever the accounting periods carry that
@@ -1944,6 +2015,9 @@ function buildShareCard(data, {
   const isWeeklyWindow = shareCardWindowKind(allowanceWindow) === "seven_day";
   const remaining = finite(allowanceWindow?.remainingPercent);
   const windowLabel = shareCardWindowLabel(allowanceWindow);
+  // The reader's most-recent plan, read from the same bounded plan_type enum
+  // the quota cards use. "" leaves the header chip off entirely.
+  const planLabel = shareCardPlan(data?.quotaWindows ?? []);
 
   const weighted = activity !== null
     ? activity.quotaWeightedTotalCostUsd
@@ -2053,14 +2127,18 @@ function buildShareCard(data, {
     reference,
     isDemo,
     title: t("share.title"),
-    // The strongest claim on the card is the one a fixture must not borrow.
-    // A demo card says so in the line under the title and in a mark beside the
-    // wordmark, not only in the smallest copy on the image, because a reader
-    // scrolling a timeline reads the title and the figures and nothing else.
+    // A real card carries the same newest-fit date as the weekly headline,
+    // falling back to the latest observation only when no weekly history is
+    // available. The strongest claim on the card is still the one a fixture
+    // must not borrow, so a demo keeps its warning here and beside the mark.
     subtitle: isDemo
       ? t("share.subtitle.demo")
-      : t("share.subtitle.local"),
+      : headlineDate,
     badge: isDemo ? t("share.badge.demo") : "",
+    // The Codex plan name is presented as-is; only the surrounding word is
+    // localized (share.plan). "" when no window named a plan, so a card that
+    // cannot name a plan carries no chip and no empty wrapper.
+    plan: planLabel === "" ? "" : t("share.plan", { plan: planLabel }),
     stats: Object.freeze(stats.map((stat) => Object.freeze({ ...stat }))),
     // Reset-fit history is an explicitly seven-day model. It is never drawn
     // behind a five-hour or provider-reported generic allowance window.
@@ -2128,6 +2206,9 @@ function shareCardText(card) {
     });
   return [
     t("share.text.header", { subtitle: card.subtitle, title: card.title }),
+    // Already the fully composed "Plan …" line, or "" — the trailing filter
+    // drops it so the transcript names the plan only when one was reported.
+    card.plan,
     figures,
     shareCardTrendText(card),
     card.caveats.join(" "),
@@ -2259,6 +2340,32 @@ function drawShareCardBadge(context, badge, x, y) {
   context.fill();
   context.fillStyle = "#fdf6f2";
   context.fillText(badge, x + 13, y);
+  context.restore();
+  return width;
+}
+
+/**
+ * Draw the reader's current plan as a quiet chip beside the subtitle.
+ *
+ * The plan name is Codex's own, so it keeps its friendly case rather than
+ * being upper-cased like the loud demo mark. The caller only reaches this
+ * with a non-empty label; an absent plan draws nothing.
+ */
+function drawShareCardPlan(context, plan, right, baseline) {
+  context.save();
+  context.textAlign = "left";
+  context.font = shareCardFont(700, 15);
+  const width = context.measureText(plan).width + 26;
+  const x = right - width;
+  context.fillStyle = "rgba(23, 79, 69, .08)";
+  context.strokeStyle = "rgba(23, 79, 69, .28)";
+  context.lineWidth = 1;
+  context.beginPath();
+  context.roundRect(x + .5, baseline - 17.5, width - 1, 26, 13);
+  context.fill();
+  context.stroke();
+  context.fillStyle = "#174f45";
+  context.fillText(plan, x + 13, baseline);
   context.restore();
   return width;
 }
@@ -2461,6 +2568,12 @@ function drawShareCard(canvas, card) {
   context.font = shareCardFont(600, 20);
   context.fillStyle = "#65706b";
   context.fillText(shareCardFit(context, card.subtitle, inner), margin, 156);
+  // The reader's plan sits right-aligned on the subtitle row, above the
+  // figures it contextualises. Empty when no window named a plan, so the row
+  // stays a single subtitle rather than carrying an empty chip.
+  if (card.plan !== "") {
+    drawShareCardPlan(context, card.plan, SHARE_CARD_WIDTH - margin, 156);
+  }
 
   const gap = 22;
   const columnWidth = (inner - gap * 2) / 3;
@@ -2686,11 +2799,16 @@ function renderShareCard(data, { history: sharedHistory = null } = {}) {
     : null;
   const trend = isWeeklyWindow ? shareCardTrend(history) : null;
   const activity = shareCardActivitySelection(data, activeUsageRangeDays);
+  const headlineDate = shareCardHeadlineDate(data, history);
   const signature = JSON.stringify([
     data?.mode,
+    // The date is printed in the header, so a different visible date is a
+    // different card even when its three figures happen to be unchanged.
+    headlineDate,
     shareCardWindowKind(allowanceWindow),
     finite(allowanceWindow?.durationMinutes),
     finite(allowanceWindow?.remainingPercent),
+    shareCardPlan(data?.quotaWindows ?? []),
     finite(data?.pricing?.quotaWeightedTotalCostUsd),
     finite(data?.pricing?.totalCostUsd),
     finite(data?.pricing?.coveragePercent),
@@ -8720,11 +8838,15 @@ async function retryIncrementalReviewBootstrap() {
   await refreshContributionSyncControls();
 }
 
-/**
- * Stop only this installation's background upload capability. The hosted
- * contribution account/session remains intact: sign-out and metadata deletion
- * are separate controls with their own explicit confirmation.
- */
+/** Mark the first real local-dashboard render for the native shell. */
+function markLocalDashboardReady() {
+  // The native shell uses this app-owned marker instead of mistaking static
+  // hero copy for a loaded evidence view. It contains no data; it means only
+  // that the first local dashboard result (available or honestly unavailable)
+  // has finished rendering.
+  document.documentElement.dataset.localDashboardReady = "true";
+}
+
 async function loadLocalDashboard() {
   const previousBusy = localActionBusy;
   localActionBusy = true;
@@ -8772,6 +8894,7 @@ async function loadLocalDashboard() {
     await loadIncrementalSyncStatus();
     renderContributionSyncPreview(sync.preview);
     renderLocalOnboarding(onboarding);
+    markLocalDashboardReady();
   } catch {
     const [localHealth, onboarding] = await Promise.all([
       localClient.health().catch(() => null),
@@ -8787,6 +8910,7 @@ async function loadLocalDashboard() {
     renderDashboardUnavailableState(
       localHealth ? "dashboard-unavailable" : "companion-unavailable",
     );
+    markLocalDashboardReady();
   } finally {
     localActionBusy = previousBusy;
     updateLocalActionButtons();

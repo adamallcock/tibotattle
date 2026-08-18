@@ -131,11 +131,104 @@
       "additionalAliases": [],
       "callers": [
         "package.json#scripts.product:release-site",
-        "test/public-release-site.test.js"
+        "test/public-release-site.test.js",
+        "scripts/prepare-web-release.js",
+        "scripts/preview-public-release-site.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
       "provenanceReason": "No standalone dated provenance artifact exists; release behavior is covered by the public-release-site test.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "public_site_release",
+      "canonicalPath": "scripts/deploy-web-release.js",
+      "stableAlias": "product:web-release:deploy",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.product:web-release:deploy",
+        "test/web-release-lane.test.js",
+        "docs/runbooks/2026-08-17-web-only-release.md"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": "docs/runbooks/2026-08-17-web-only-release.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "public_site_release",
+      "canonicalPath": "scripts/prepare-web-release.js",
+      "stableAlias": "product:web-release:prepare",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.product:web-release:prepare",
+        "test/web-release-lane.test.js",
+        "docs/runbooks/2026-08-17-web-only-release.md"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": "docs/runbooks/2026-08-17-web-only-release.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "public_site_release",
+      "canonicalPath": "scripts/preview-public-release-site.js",
+      "stableAlias": "product:release-site:preview",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.product:release-site:preview",
+        "test/public-release-site-preview.test.js",
+        "test/web-release-lane.test.js",
+        "docs/runbooks/2026-08-17-public-site-local-preview.md"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": "docs/runbooks/2026-08-17-public-site-local-preview.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "public_site_release",
+      "canonicalPath": "scripts/public-release-provenance.js",
+      "stableAlias": null,
+      "stableAliasReason": "Internal helper for hashing the generated public source closure; it is not a supported standalone command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/build-public-release-site.js",
+        "scripts/web-release-lane.js",
+        "apps/worker/scripts/production-deploy.check.mjs",
+        "apps/worker/scripts/stage-production-assets.check.mjs",
+        "apps/worker/scripts/stage-production-assets.mjs",
+        "test/public-release-site.test.js",
+        "test/web-release-lane.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": null,
+      "provenanceReason": "The helper binds the generated public manifest to the selected source closure and is covered by public release and staging tests; no separate dated provenance artifact identifies it.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "public_site_release",
+      "canonicalPath": "scripts/web-release-lane.js",
+      "stableAlias": null,
+      "stableAliasReason": "Internal scope and receipt guard for the web-only release lane; it is not a supported standalone command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/deploy-web-release.js",
+        "scripts/prepare-web-release.js",
+        "test/web-release-lane.test.js",
+        "docs/runbooks/2026-08-17-web-only-release.md"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/runbooks/2026-08-17-web-only-release.md",
+      "provenanceReason": null,
       "legacyPaths": []
     },
     {

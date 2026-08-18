@@ -32,6 +32,7 @@ const NEEDLE_TURN_CONTEXT = Buffer.from('"turn_context"');
 const NEEDLE_TOKEN_COUNT = Buffer.from('"token_count"');
 const NEEDLE_THREAD_SETTINGS = Buffer.from('"thread_settings_applied"');
 const NEEDLE_RESPONSE_ITEM = Buffer.from('"type":"response_item"');
+const NEEDLE_RELEVANT_PREFIX = Buffer.from('"t');
 const COMPACTION_TIMESTAMP_PREFIX = Buffer.from('{"timestamp":"');
 const COMPACTION_TYPE_SUFFIX = Buffer.from(',"type":"compacted"');
 const COMPACTION_TYPE_PREFIX = Buffer.from('{"type":"compacted","timestamp":"');
@@ -107,10 +108,22 @@ const TOKEN_KEYS = [
 ];
 
 function relevant(line) {
-  return line.includes(NEEDLE_TOKEN_COUNT)
-    || line.includes(NEEDLE_TURN_CONTEXT)
-    || line.includes(NEEDLE_THREAD_SETTINGS)
-    || line.includes(NEEDLE_RESPONSE_ITEM);
+  if (line.includes(NEEDLE_RESPONSE_ITEM)) return true;
+  let from = 0;
+  for (;;) {
+    const at = line.indexOf(NEEDLE_RELEVANT_PREFIX, from);
+    if (at < 0) return false;
+    let needle = null;
+    if (line[at + 2] === 0x6f) needle = NEEDLE_TOKEN_COUNT;
+    else if (line[at + 2] === 0x75) needle = NEEDLE_TURN_CONTEXT;
+    else if (line[at + 2] === 0x68) needle = NEEDLE_THREAD_SETTINGS;
+    if (needle !== null
+        && at + needle.length <= line.length
+        && line.compare(needle, 0, needle.length, at, at + needle.length) === 0) {
+      return true;
+    }
+    from = at + NEEDLE_RELEVANT_PREFIX.length;
+  }
 }
 
 function normalizeUsage(value) {
@@ -375,21 +388,53 @@ export async function extractRolloutUsage(path, {
   // rows. Output-only and quota-only records leave the marker pending: the
   // continuity lens compares positive-input requests, so only the next one is
   // a meaningful boundary.
-  async function emitUsage(event, rawUsage) {
-    await onEvent(event);
-    if ((compactionPending === null && !turnContextPending)
-        || !positiveInput(rawUsage)) return;
-    const compaction = compactionPending;
-    const turnContextBefore = turnContextPending;
-    compactionPending = null;
-    turnContextPending = false;
-    await onBoundary?.({
-      compactionBefore: compaction !== null,
-      turnContextBefore,
-      compactedAtMs: compaction?.observedAtMs ?? null,
-      currentObservedAtMs: event.observedAtMs,
-      currentSourceOffset: event.sourceOffset,
-    });
+  function emitUsage(event, rawUsage) {
+    const finish = () => {
+      if ((compactionPending === null && !turnContextPending)
+          || !positiveInput(rawUsage)) return;
+      const compaction = compactionPending;
+      const turnContextBefore = turnContextPending;
+      compactionPending = null;
+      turnContextPending = false;
+      return onBoundary?.({
+        compactionBefore: compaction !== null,
+        turnContextBefore,
+        compactedAtMs: compaction?.observedAtMs ?? null,
+        currentObservedAtMs: event.observedAtMs,
+        currentSourceOffset: event.sourceOffset,
+      });
+    };
+    const pending = onEvent(event);
+    if (pending === null
+        || (typeof pending !== "object" && typeof pending !== "function")) {
+      return finish();
+    }
+    return Promise.resolve(pending).then(finish);
+  }
+
+  function emitToolObservations(observations, observedAtMs, sourceOffset) {
+    let pending = null;
+    for (const [toolOrdinal, observation] of observations.entries()) {
+      const event = {
+        observedAtMs,
+        sourceOffset,
+        toolOrdinal,
+        toolClass: observation.toolClass,
+        sourceKind: observation.sourceKind,
+      };
+      diagnostics.toolEvents += 1;
+      const emit = () => onTool?.(event);
+      if (pending !== null) {
+        pending = pending.then(emit);
+        continue;
+      }
+      const candidate = emit();
+      if (candidate !== null
+          && (typeof candidate === "object" || typeof candidate === "function")) {
+        pending = Promise.resolve(candidate);
+      }
+    }
+    return pending;
   }
 
   // Forks replay parent records into the child file. If the next positive
@@ -432,7 +477,7 @@ export async function extractRolloutUsage(path, {
     maximumLineBytes,
     highWaterMark,
     signal,
-    onLine: async (line, lineEndOffset, partial) => {
+    onLine: (line, lineEndOffset, partial) => {
       const compaction = parseCompactionPrefix(line);
       if (compaction !== null) {
         diagnostics.relevantLines += 1;
@@ -505,7 +550,7 @@ export async function extractRolloutUsage(path, {
         // regression the best available charge is the delta from the new
         // anchor — which this already is.
         reAnchored = false;
-        await emitUsage({
+        return emitUsage({
           observedAtMs,
           sourceOffset: lineEndOffset,
           model: currentModel,
@@ -515,7 +560,6 @@ export async function extractRolloutUsage(path, {
           quota: [],
           partial: true,
         }, delta);
-        return;
       }
 
       const observedAtMs = Date.parse(record?.timestamp);
@@ -548,18 +592,11 @@ export async function extractRolloutUsage(path, {
         const observations = extractToolObservations(record.payload);
         if (observations.length === 0) return;
         diagnostics.toolRecords += 1;
-        for (const [toolOrdinal, observation] of observations.entries()) {
-          const event = {
-            observedAtMs,
-            sourceOffset: lineEndOffset,
-            toolOrdinal,
-            toolClass: observation.toolClass,
-            sourceKind: observation.sourceKind,
-          };
-          diagnostics.toolEvents += 1;
-          await onTool?.(event);
-        }
-        return;
+        return emitToolObservations(
+          observations,
+          observedAtMs,
+          lineEndOffset,
+        );
       }
       if (record.type !== "event_msg") return;
       if (record.payload?.type === "thread_settings_applied") {
@@ -678,7 +715,7 @@ export async function extractRolloutUsage(path, {
       if ((!usage || (usage.input_tokens === 0 && usage.output_tokens === 0))
           && quota.length === 0) return;
       if (currentModel === null) diagnostics.modelMissing += 1;
-      await emitUsage({
+      return emitUsage({
         observedAtMs,
         sourceOffset: lineEndOffset,
         model: currentModel,

@@ -40,6 +40,11 @@ import {
 
 const HEALTH_URL = `${DEPLOYMENT_ENDPOINTS.public.origin}/api/health`;
 const PUBLIC_ROOT_URL = `${DEPLOYMENT_ENDPOINTS.public.origin}/`;
+const PUBLIC_ROBOTS_URL = `${DEPLOYMENT_ENDPOINTS.public.origin}/robots.txt`;
+const PUBLIC_SITEMAP_URL = `${DEPLOYMENT_ENDPOINTS.public.origin}/sitemap.xml`;
+const PUBLIC_WWW_ROOT_URL = `https://www.${new URL(
+  DEPLOYMENT_ENDPOINTS.public.origin,
+).hostname}/`;
 const FIXTURE_PRIMARY_MIGRATION = "0001_fixture_schema.sql";
 const FIXTURE_LEDGER_MIGRATION = "0001_fixture_ledger.sql";
 // The fixed dependency-tree digest the mocked-snapshot options carry; the
@@ -98,6 +103,14 @@ async function immutableSnapshotFixture() {
   const generatedFiles = {
     "community.js": "console.log('snapshot community');\n",
     "index.html": '<script type="module" src="./community.js"></script>\n',
+    "robots.txt": "User-agent: *\nAllow: /\nSitemap: https://example.test/sitemap.xml\n",
+    "sitemap.xml": [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+      "  <url><loc>https://example.test/</loc></url>",
+      "</urlset>",
+      "",
+    ].join("\n"),
   };
   const manifest = {
     schemaVersion: PUBLIC_RELEASE_MANIFEST_SCHEMA,
@@ -176,17 +189,43 @@ function jsonHealthResponse(value = liveOpenHealth(), status = 200) {
 function textResponse(url, body, {
   status = 200,
   contentType = "text/html; charset=utf-8",
+  location = null,
 } = {}) {
   return {
     url,
     status,
     headers: {
       get(name) {
-        return name === "content-type" ? contentType : undefined;
+        if (name === "content-type") return contentType;
+        if (name === "location") return location;
+        return undefined;
       },
     },
     text: async () => body,
   };
+}
+
+function publicRootHtml(extra = "") {
+  return [
+    "<!doctype html>",
+    `<link rel="canonical" href="${PUBLIC_ROOT_URL}">`,
+    `<meta property="og:url" content="${PUBLIC_ROOT_URL}">`,
+    extra,
+  ].join("\n");
+}
+
+function publicRobots() {
+  return `User-agent: *\nAllow: /\nSitemap: ${PUBLIC_SITEMAP_URL}\n`;
+}
+
+function publicSitemap() {
+  return [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+    `  <url><loc>${PUBLIC_ROOT_URL}</loc></url>`,
+    "</urlset>",
+    "",
+  ].join("\n");
 }
 
 function options(overrides = {}) {
@@ -1157,7 +1196,23 @@ test("production public-surface recheck requires a public root and real 404s for
     fetchImpl: async (url, request) => {
       calls.push({ url: String(url), request });
       if (String(url) === PUBLIC_ROOT_URL) {
-        return textResponse(String(url), "<!doctype html><title>TiboTattle</title>");
+        return textResponse(String(url), publicRootHtml());
+      }
+      if (String(url) === PUBLIC_ROBOTS_URL) {
+        return textResponse(String(url), publicRobots(), {
+          contentType: "text/plain; charset=utf-8",
+        });
+      }
+      if (String(url) === PUBLIC_SITEMAP_URL) {
+        return textResponse(String(url), publicSitemap(), {
+          contentType: "application/xml; charset=utf-8",
+        });
+      }
+      if (String(url) === PUBLIC_WWW_ROOT_URL) {
+        return textResponse(String(url), "", {
+          location: PUBLIC_ROOT_URL,
+          status: 308,
+        });
       }
       return textResponse(String(url), "not found", {
         status: 404,
@@ -1168,14 +1223,20 @@ test("production public-surface recheck requires a public root and real 404s for
   assert.deepEqual(result, { ok: true, code: null });
   assert.equal(calls[0].url, PUBLIC_ROOT_URL);
   assert.equal(calls[0].request.headers.accept, "text/html");
-  assert.equal(calls.length, 9);
+  assert.equal(calls[1].url, PUBLIC_ROBOTS_URL);
+  assert.equal(calls[2].url, PUBLIC_SITEMAP_URL);
+  assert.equal(calls[3].url, PUBLIC_WWW_ROOT_URL);
+  assert.equal(calls[3].request.redirect, "manual");
+  assert.equal(calls.length, 12);
 });
 
 test("production public-surface recheck rejects dashboard markers at the root", async () => {
   const result = await recheckProductionPublicSurface({
     fetchImpl: async (url) => textResponse(
       String(url),
-      '<main id="share-panel"><script src="./app.js"></script></main>',
+      publicRootHtml(
+        '<main id="share-panel"><script src="./app.js"></script></main>',
+      ),
     ),
   });
   assert.deepEqual(result, {
@@ -1186,12 +1247,31 @@ test("production public-surface recheck rejects dashboard markers at the root", 
 
 test("production public-surface recheck rejects any publicly served private asset", async () => {
   const result = await recheckProductionPublicSurface({
-    fetchImpl: async (url) => String(url) === PUBLIC_ROOT_URL
-      ? textResponse(String(url), "<!doctype html><title>TiboTattle</title>")
-      : textResponse(String(url), "private source", {
+    fetchImpl: async (url) => {
+      if (String(url) === PUBLIC_ROOT_URL) {
+        return textResponse(String(url), publicRootHtml());
+      }
+      if (String(url) === PUBLIC_ROBOTS_URL) {
+        return textResponse(String(url), publicRobots(), {
+          contentType: "text/plain; charset=utf-8",
+        });
+      }
+      if (String(url) === PUBLIC_SITEMAP_URL) {
+        return textResponse(String(url), publicSitemap(), {
+          contentType: "application/xml; charset=utf-8",
+        });
+      }
+      if (String(url) === PUBLIC_WWW_ROOT_URL) {
+        return textResponse(String(url), "", {
+          location: PUBLIC_ROOT_URL,
+          status: 308,
+        });
+      }
+      return textResponse(String(url), "private source", {
         status: 200,
         contentType: "text/javascript; charset=utf-8",
-      }),
+      });
+    },
   });
   assert.deepEqual(result, {
     ok: false,

@@ -11,6 +11,7 @@ import {
   dateTimeFormatter,
   formatAge,
   formatLocal,
+  formatUtcCalendarDay,
   numberFormatter,
 } from "./ui-format.js";
 import { translate, translatePlural } from "./localization.js";
@@ -73,18 +74,6 @@ const MONTH_TICK_SPAN_DAYS = 150;
 
 function communityDayStartMs(day) {
   return Date.parse(`${day}T00:00:00.000Z`);
-}
-
-function formatCommunityDay(day) {
-  // A published day is a UTC calendar label, not an instant in the viewer's
-  // time zone. Formatting UTC midnight locally would show the preceding day
-  // everywhere west of Greenwich.
-  return dateTimeFormatter({
-    timeZone: "UTC",
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-  }).format(new Date(communityDayStartMs(day)));
 }
 
 /**
@@ -579,7 +568,7 @@ export function renderCommunityDailySeries({
   const latest = series.days[series.days.length - 1];
   const quality = node("dl", "snapshot-quality-grid");
   for (const [term, value] of [
-    [t("community.daily.latestDay"), formatCommunityDay(latest.day)],
+    [t("community.daily.latestDay"), formatUtcCalendarDay(latest.day)],
     [t("community.daily.revision"), `r${latest.revision}`],
     [t("community.released"), formatLocal(latest.releasedAt)],
     [
@@ -1076,7 +1065,7 @@ export function renderCommunityAllowanceSection({
     "allowance-headline-caveat",
     t("community.allowance.caveatSentence", {
       latest: t("community.allowance.latestLabel", {
-        day: formatCommunityDay(model.latest.day),
+        day: formatUtcCalendarDay(model.latest.day),
       }),
       accounts: plural(
         "community.allowance.accountCount",

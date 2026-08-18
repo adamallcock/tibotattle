@@ -1,4 +1,9 @@
-import { createHash, createHmac, randomBytes } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  createSecretKey,
+  randomBytes,
+} from "node:crypto";
 import { constants, lstatSync } from "node:fs";
 import { chmod, lstat, mkdir, open, rename, unlink } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -110,6 +115,7 @@ const MIGRATABLE_USER_VERSIONS = new Set([1, 2, 3, 4, 5, 6, 7, 8]);
 const SECRET_BYTES = 32;
 const MAX_SECRET_BYTES = 256;
 const DEFAULT_COMMIT_ROWS = 10_000;
+const LOCAL_DIGEST_KEYS = new WeakMap();
 const DIAGNOSTIC_CODES = new Set([
   "relevantLines",
   "malformedLines",
@@ -625,6 +631,31 @@ export async function readOrCreateDeviceSalt(
   }
 }
 
+function reusableLocalDigestKey(deviceSalt) {
+  const bytes = Buffer.isBuffer(deviceSalt)
+    ? deviceSalt
+    : new Uint8Array(
+      deviceSalt.buffer,
+      deviceSalt.byteOffset,
+      deviceSalt.byteLength,
+    );
+  // `localDigest` remains a general byte-buffer API. Only retain key material
+  // inside the same bound enforced for an on-disk device secret; unusually
+  // large caller-owned buffers keep the one-shot behavior.
+  if (bytes.byteLength > MAX_SECRET_BYTES) return deviceSalt;
+  let cached = LOCAL_DIGEST_KEYS.get(deviceSalt);
+  if (cached === undefined || !cached.bytes.equals(bytes)) {
+    cached = {
+      // Keep a comparison copy so a caller that mutates a supplied view gets a
+      // freshly keyed digest, exactly as it did before this cache existed.
+      bytes: Buffer.from(bytes),
+      key: createSecretKey(bytes),
+    };
+    LOCAL_DIGEST_KEYS.set(deviceSalt, cached);
+  }
+  return cached.key;
+}
+
 /**
  * The single local one-way derivation used by this index.
  *
@@ -644,7 +675,7 @@ export function localDigest(deviceSalt, domain, subject) {
   if (typeof subject !== "string" || subject.length < 1 || subject.length > 4096) {
     throw new TypeError("subject must be a bounded string");
   }
-  return createHmac("sha256", deviceSalt)
+  return createHmac("sha256", reusableLocalDigestKey(deviceSalt))
     .update(`app-usagemonitor/${domain}/v1\0`, "utf8")
     .update(subject, "utf8")
     .digest();

@@ -590,9 +590,9 @@ async function forEachCompleteLine(path, offset, size, onLine, {
     maximumLineBytes: maximumBufferedLineBytes,
     highWaterMark,
     signal,
-    onLine: async (line, lineEndOffset, partial) => {
+    onLine: (line, lineEndOffset, partial) => {
       if (partial) oversizedLinesSkipped += 1;
-      await onLine(line, lineEndOffset, partial);
+      return onLine(line, lineEndOffset, partial);
     },
   });
   return {

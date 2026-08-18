@@ -820,9 +820,12 @@ export async function forEachLocalCollectorRecord({
   stateFile = defaultLocalCollectorStatePath(),
   onRecord,
   orderBy = "record_id",
+  kinds = null,
 } = {}) {
   if (typeof onRecord !== "function"
-      || !["record_id", "observed_at"].includes(orderBy)) {
+      || !["record_id", "observed_at"].includes(orderBy)
+      || (kinds !== null && (!Array.isArray(kinds)
+        || kinds.some((kind) => typeof kind !== "string" || kind.length < 1)))) {
     throw new TypeError("Local collector record callback must be a function");
   }
   const metadata = await assertSafeStateFile(stateFile, { allowMissing: true });
@@ -831,10 +834,20 @@ export async function forEachLocalCollectorRecord({
   let recordCount = 0;
   try {
     database = openDatabase(stateFile, { readOnly: true });
-    const query = orderBy === "observed_at"
-      ? "SELECT record_json FROM records ORDER BY observed_at_ms ASC, record_id ASC"
-      : "SELECT record_json FROM records ORDER BY record_id ASC";
-    for (const row of database.prepare(query).iterate()) {
+    const selectedKinds = kinds === null ? null : [...new Set(kinds)];
+    if (selectedKinds?.length === 0) {
+      return { status: "available", recordCount: 0 };
+    }
+    const where = selectedKinds === null
+      ? ""
+      : ` WHERE kind IN (${selectedKinds.map(() => "?").join(", ")})`;
+    const order = orderBy === "observed_at"
+      ? " ORDER BY observed_at_ms ASC, record_id ASC"
+      : " ORDER BY record_id ASC";
+    const statement = database.prepare(
+      `SELECT record_json FROM records${where}${order}`,
+    );
+    for (const row of statement.iterate(...(selectedKinds ?? []))) {
       let record;
       try {
         record = JSON.parse(row.record_json);
@@ -853,6 +866,98 @@ export async function forEachLocalCollectorRecord({
 function finiteDatabaseInteger(value) {
   const numeric = Number(value);
   return Number.isSafeInteger(numeric) && numeric >= 0 ? numeric : null;
+}
+
+// The dashboard often has an authoritative replay-safe usage projection and
+// needs only current quota/tool records from the collector. These indexed
+// facts retain exact whole-ledger counts and time bounds without parsing
+// hundreds of thousands of usage JSON records that it will not use.
+export async function readLocalCollectorRecordSummary({
+  stateFile = defaultLocalCollectorStatePath(),
+  maximumUsageObservedAtMs = Number.MAX_SAFE_INTEGER,
+} = {}) {
+  if (typeof stateFile !== "string" || stateFile.length < 1
+      || !Number.isSafeInteger(maximumUsageObservedAtMs)) {
+    throw new TypeError("Local collector record summary request is invalid");
+  }
+  const metadata = await assertSafeStateFile(stateFile, { allowMissing: true });
+  if (metadata === null) {
+    return {
+      status: "missing",
+      recordCount: 0,
+      recordCounts: { usage: 0, quota: 0, tools: 0, other: 0 },
+      firstObservedAtMs: null,
+      latestObservedAtMs: null,
+      firstUsageObservedAtMs: null,
+      latestUsageObservedAtMs: null,
+    };
+  }
+  let database;
+  try {
+    database = openDatabase(stateFile, { readOnly: true });
+    const row = database.prepare(`
+      SELECT COUNT(*) AS record_count,
+             COALESCE(SUM(CASE WHEN kind = 'codex_rollout_usage_snapshot' THEN 1 ELSE 0 END), 0)
+               AS usage_count,
+             COALESCE(SUM(CASE WHEN kind = 'codex_quota_snapshot' THEN 1 ELSE 0 END), 0)
+               AS quota_count,
+             COALESCE(SUM(CASE WHEN kind = 'codex_tool_class_event' THEN 1 ELSE 0 END), 0)
+               AS tool_count,
+             MIN(observed_at_ms) AS first_observed_at_ms,
+             MAX(observed_at_ms) AS latest_observed_at_ms,
+             MIN(CASE
+               WHEN kind = 'codex_rollout_usage_snapshot'
+                 AND observed_at_ms <= ?
+               THEN observed_at_ms END) AS first_usage_observed_at_ms,
+             MAX(CASE
+               WHEN kind = 'codex_rollout_usage_snapshot'
+                 AND observed_at_ms <= ?
+               THEN observed_at_ms END) AS latest_usage_observed_at_ms
+      FROM records
+    `).get(maximumUsageObservedAtMs, maximumUsageObservedAtMs);
+    const recordCount = finiteDatabaseInteger(row?.record_count);
+    const usage = finiteDatabaseInteger(row?.usage_count);
+    const quota = finiteDatabaseInteger(row?.quota_count);
+    const tools = finiteDatabaseInteger(row?.tool_count);
+    if ([recordCount, usage, quota, tools].includes(null)
+        || usage + quota + tools > recordCount) {
+      throw fixedError("local_collector_state_corrupt");
+    }
+    const nullableInteger = (value) => (
+      value === null ? null : finiteDatabaseInteger(value)
+    );
+    const firstObservedAtMs = nullableInteger(row.first_observed_at_ms);
+    const latestObservedAtMs = nullableInteger(row.latest_observed_at_ms);
+    const firstUsageObservedAtMs = nullableInteger(row.first_usage_observed_at_ms);
+    const latestUsageObservedAtMs = nullableInteger(row.latest_usage_observed_at_ms);
+    if ([firstObservedAtMs, latestObservedAtMs,
+      firstUsageObservedAtMs, latestUsageObservedAtMs].some(
+      (value, index) => value === null && [
+        row.first_observed_at_ms,
+        row.latest_observed_at_ms,
+        row.first_usage_observed_at_ms,
+        row.latest_usage_observed_at_ms,
+      ][index] !== null,
+    )) {
+      throw fixedError("local_collector_state_corrupt");
+    }
+    return {
+      status: "available",
+      recordCount,
+      recordCounts: {
+        usage,
+        quota,
+        tools,
+        other: recordCount - usage - quota - tools,
+      },
+      firstObservedAtMs,
+      latestObservedAtMs,
+      firstUsageObservedAtMs,
+      latestUsageObservedAtMs,
+    };
+  } finally {
+    database?.close();
+  }
 }
 
 function safeNonNegativeDifference(left, right) {

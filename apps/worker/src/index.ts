@@ -57,6 +57,7 @@ import { readDistributionAnalytics } from "./distribution-analytics";
 import {
   adminHostname,
   adminUiResponse,
+  canonicalPublicRedirectUrl,
   isAdminSurfacePath,
 } from "./admin-ui";
 import {
@@ -3446,6 +3447,10 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   const url = new URL(request.url);
   const route = matchWorkerRoute(url.pathname);
   try {
+    const canonicalRedirectUrl = canonicalPublicRedirectUrl(url, env);
+    if (canonicalRedirectUrl !== null) {
+      return Response.redirect(canonicalRedirectUrl, 308);
+    }
     // Hostname split for the owner-only admin surface. When PUBLIC_ORIGIN is
     // pinned, the admin UI and /api/v1/admin/* exist solely on
     // admin.<public host> behind Cloudflare Access; every request there must

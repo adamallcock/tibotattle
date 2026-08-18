@@ -117,6 +117,10 @@ test("deployable Worker asset environments fail closed around generated public t
     "404-page",
   );
   assert.equal(
+    checkedInConfig.env.production.assets.run_worker_first,
+    true,
+  );
+  assert.equal(
     assessStagingConfiguration(checkedInConfig).checks.deployableAssetsClosed,
     true,
   );
@@ -144,6 +148,18 @@ test("staging readiness rejects dashboard source and local control asset routes"
     const result = assessStagingConfiguration(config);
     assert.equal(result.checks.assetsClosed, false, route);
     assert.equal(result.checks.deployableAssetsClosed, false, route);
+  }
+});
+
+test("production asset routing fails closed without full Worker-first canonicalization", () => {
+  for (const runWorkerFirst of [
+    false,
+    ["/api/*", "/admin", "/admin/*"],
+  ]) {
+    const config = structuredClone(checkedInConfig);
+    config.env.production.assets.run_worker_first = runWorkerFirst;
+    const result = assessStagingConfiguration(config);
+    assert.equal(result.checks.deployableAssetsClosed, false);
   }
 });
 

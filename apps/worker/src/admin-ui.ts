@@ -4,9 +4,8 @@ import { ADMIN_UI_ASSETS } from "./admin-ui.generated";
  * Hostname routing policy for the owner-only admin surface.
  *
  * When a hosted environment pins PUBLIC_ORIGIN, the admin surface exists only
- * on `admin.<public host>`: the embedded admin UI and the /api/v1/admin/*
- * routes are served there and nowhere else, while the public origin keeps its
- * deliberate 404 for every admin path. Development environments configure no
+ * on `admin.<public host>` and the public website canonicalizes
+ * `www.<public host>` to that origin. Development environments configure no
  * PUBLIC_ORIGIN and keep their single-origin behaviour for the offline
  * laboratory and the existing suites.
  */
@@ -29,12 +28,12 @@ export function isAdminSurfacePath(pathname: string): boolean {
 }
 
 /**
- * The admin hostname is derived, never request-supplied: it exists only when
+ * The public origin is derived, never request-supplied: it exists only when
  * the environment pins a canonical HTTPS PUBLIC_ORIGIN, exactly as the OAuth
- * callback pinning does. A malformed origin yields no admin hostname, which
- * keeps every admin path on its existing refusal.
+ * callback pinning does. A malformed origin disables hostname-specific
+ * behaviour rather than trusting an incoming Host header.
  */
-export function adminHostname(env: Env): string | null {
+export function canonicalPublicOrigin(env: Env): URL | null {
   const rawOrigin = Reflect.get(env, "PUBLIC_ORIGIN");
   if (typeof rawOrigin !== "string" || rawOrigin.length === 0) return null;
   let configured: URL;
@@ -48,7 +47,37 @@ export function adminHostname(env: Env): string | null {
       || configured.hostname.length === 0) {
     return null;
   }
-  return `admin.${configured.hostname}`;
+  return configured;
+}
+
+/**
+ * Redirect only the configured public www alias, retaining the request path
+ * and query. The Worker runs before production assets, so this covers both
+ * present and future public pages without a separately maintained edge rule.
+ */
+export function canonicalPublicRedirectUrl(
+  requestUrl: URL,
+  env: Env,
+): string | null {
+  const configured = canonicalPublicOrigin(env);
+  if (configured === null
+      || requestUrl.hostname !== `www.${configured.hostname}`) {
+    return null;
+  }
+  return new URL(
+    `${requestUrl.pathname}${requestUrl.search}`,
+    configured,
+  ).href;
+}
+
+/**
+ * The admin hostname is derived from the same pinned canonical public origin.
+ * A malformed origin yields no admin hostname, which keeps every admin path
+ * on its existing refusal.
+ */
+export function adminHostname(env: Env): string | null {
+  const configured = canonicalPublicOrigin(env);
+  return configured === null ? null : `admin.${configured.hostname}`;
 }
 
 function adminUiAssetPath(pathname: string): string | null {

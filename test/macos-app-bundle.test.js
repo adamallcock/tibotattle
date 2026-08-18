@@ -982,7 +982,15 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /private func loadWhenViewportIsReady\(\)/u);
   assert.match(source, /viewport\.width >= 120, viewport\.height >= 120/u);
   assert.match(source, /nativeDashboardChrome\?\.prepareReportViewport\(\)/u);
-  assert.match(source, /document\.querySelector\('#main'\)\?\.innerText/u);
+  // `didFinish` only means that WebKit has loaded the document shell. The
+  // dashboard then reads the local companion and renders asynchronously, so
+  // the native host waits for the page-owned readiness contract instead of
+  // sampling a transient DOM node that is legitimately empty during startup.
+  assert.match(
+    source,
+    /private func awaitDashboardContent\([\s\S]*?webView\.evaluateJavaScript\(\s*"document\.documentElement\?\.dataset\.localDashboardReady === 'true';"\s*\) \{[\s\S]*?guard let self, self\.hasDashboardTarget else \{ return \}[\s\S]*?let localDashboardReady = \(value as\? NSNumber\)\?\.boolValue \?\? false[\s\S]*?if error == nil, localDashboardReady \{[\s\S]*?self\.onLoaded\(\)[\s\S]*?return/u,
+  );
+  assert.doesNotMatch(source, /document\.querySelector\('#main'\)\?\.innerText/u);
   assert.match(source, /addSplitViewItem\(reportItem\)/u);
   assert.doesNotMatch(source, /addSplitViewItem\(webView\)/u);
   assert.doesNotMatch(source, /split\.addArrangedSubview\(webView\)/u);
@@ -1365,6 +1373,75 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   assert.match(source, /UM_MACOS_DASHBOARD_DOWNLOAD_FAILED/u);
 });
 
+test("native dashboard launch gates its first refresh on the rendered page", async () => {
+  const source = await readFile(SWIFT_SOURCE, "utf8");
+  const section = (startNeedle, endNeedle) => {
+    const start = source.indexOf(startNeedle);
+    const end = source.indexOf(endNeedle, start + startNeedle.length);
+    assert.ok(start >= 0 && end > start, `${startNeedle} section is present`);
+    return source.slice(start, end);
+  };
+
+  const companionReady = section(
+    "private func companionReady(",
+    "private func companionExited(",
+  );
+  const dashboardLoaded = section(
+    "private func dashboardWebViewLoaded()",
+    "private func navigateNativeDashboard(",
+  );
+  const dashboardFailure = section(
+    "private func dashboardWebViewFailed(code: String)",
+    "private func hideDashboardWebView()",
+  );
+  const dashboardTeardown = section(
+    "private func hideDashboardWebView()",
+    "/// A link the embedded dashboard cannot load itself.",
+  );
+  const companionExit = section(
+    "private func companionExited(",
+    "private func showFailure(",
+  );
+
+  // The companion becoming reachable only arms the launch-only refresh. It
+  // must not start collection while the page is still doing its first local
+  // reads, or the collector can win the loopback race against first paint.
+  assert.match(
+    companionReady,
+    /startupAutomaticRefreshPending = true[\s\S]*?openDashboard\(\)/u,
+  );
+  assert.doesNotMatch(
+    companionReady,
+    /refreshLocalUsage\(automatic: true\)/u,
+  );
+
+  // The page-host callback is the only consumer of that pending flag: clear
+  // it before starting the refresh, so re-entrant callbacks cannot launch a
+  // second startup pass.
+  assert.match(
+    dashboardLoaded,
+    /if startupAutomaticRefreshPending \{\s*\n\s*startupAutomaticRefreshPending = false\s*\n\s*refreshLocalUsage\(automatic: true\)/u,
+  );
+  assert.equal(
+    dashboardLoaded.indexOf("startupAutomaticRefreshPending = false")
+      < dashboardLoaded.indexOf("refreshLocalUsage(automatic: true)"),
+    true,
+    "the launch-only refresh is consumed before collection starts",
+  );
+
+  // A page that never marks its result ready, a navigation failure, a
+  // companion exit, or an explicit teardown all discard the pending work.
+  assert.match(
+    dashboardFailure,
+    /cancelNativeRefreshSchedule\(\)[\s\S]*?startupAutomaticRefreshPending = false/u,
+  );
+  assert.match(
+    dashboardTeardown,
+    /cancelNativeRefreshSchedule\(\)[\s\S]*?startupAutomaticRefreshPending = false/u,
+  );
+  assert.match(companionExit, /startupAutomaticRefreshPending = false/u);
+});
+
 test("unified toolbar preserves the rich loopback report and single authority", async () => {
   const source = await readFile(SWIFT_SOURCE, "utf8");
   assert.match(
@@ -1685,6 +1762,17 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   );
   assert.match(source, /let candidates = rows\.compactMap/u);
   assert.match(source, /guard Self\.isSupportedCodexAllowance\(/u);
+  assert.match(source, /let durationMinutes: Int/u);
+  assert.match(
+    source,
+    /func weeklyWindowPosition\(_ lane: ObservedQuotaLane\) -> WeeklyWindowPosition\?/u,
+  );
+  assert.match(source, /lane\.durationMinutes == weeklyWindowDurationMinutes/u);
+  assert.match(source, /let observedAt = lane\.observedAt/u);
+  assert.match(
+    source,
+    /TiboTattleLocalization\.format\(\s*\.menuBarQuotaWeeklyPositionResets,/u,
+  );
   assert.match(
     source,
     /return TiboTattleLocalization\.string\(\.menuBarFiveHourAllowance\)/u,
@@ -5112,7 +5200,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       menuBarSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT native_rows=true titles=true states=starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q dismissal=native,escape,same-app,deactivation$/mu,
+      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT native_rows=true titles=true states=starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q dismissal=native,escape,same-app,deactivation weekly_position=fresh-only$/mu,
     );
     const quotaNotificationSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),

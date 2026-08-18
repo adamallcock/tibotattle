@@ -374,10 +374,12 @@ function declaredUnobservedSplit(declaredSpeedWeighting, family, unobserved) {
  * caller is responsible for the coverage test, because only it knows each
  * event's timestamp; this function enforces the precedence, never the dates.
  *
- * `inferredFastEvents` is a secondary, window-level count. It reclassifies
- * events out of "unknown" into "inferred" for reporting only: a window-level
- * signal cannot be attributed to an individual event without the mode field
- * the provider stopped emitting, so it never changes the weighted total.
+ * `inferredFastEvents` is a secondary, window-level count. It reports an
+ * overlapping subset of the events whose individual mode remains unknown; it
+ * does not reclassify events out of `unknown` or change the coverage
+ * partition. A window-level signal cannot be attributed to an individual
+ * event without the mode field the provider stopped emitting, so it never
+ * changes the weighted total.
  */
 export function summarizeQuotaWeightedAccounting({
   speedWeighting,
@@ -463,7 +465,6 @@ export function summarizeQuotaWeightedAccounting({
       && inferredFastEvents > 0
     ? Math.min(inferredFastEvents, unknownEvents)
     : 0;
-  const remainingUnknownEvents = unknownEvents - reportableInferred;
   const weightingStatus = unweightedUnknownUsd === 0
     ? "complete"
     : weightedUsd === 0 ? "unknown" : "partial";
@@ -489,13 +490,16 @@ export function summarizeQuotaWeightedAccounting({
       declaredFromConfigEvents: declaredEvents,
       assumedFromPreferenceEvents: assumedEvents,
       inferredEvents: reportableInferred,
-      unknownEvents: remainingUnknownEvents,
+      // Inference is a window-level label over unresolved events. Keep the
+      // full unknown provenance count so the four provenance buckets still
+      // partition the total event count; inferredEvents is an overlap.
+      unknownEvents,
       observedSharePercent: totalEvents === 0
         ? null
         : roundFraction((observedEvents / totalEvents) * 100),
       unknownSharePercent: totalEvents === 0
         ? null
-        : roundFraction((remainingUnknownEvents / totalEvents) * 100),
+        : roundFraction((unknownEvents / totalEvents) * 100),
     }),
     inference: Object.freeze({
       status: inference?.status ?? "not_run",

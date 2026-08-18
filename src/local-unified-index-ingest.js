@@ -11,6 +11,7 @@ import {
 } from "./local-unified-index-extract.js";
 import {
   createEventSink,
+  defaultRebuildWorkerCount,
   lineageComponents,
   persistingCollector,
   rebuildLocalUnifiedIndex,
@@ -36,6 +37,9 @@ import {
   snapshotLocal,
   sourceLocal,
 } from "./local-unified-index.js";
+
+const MAXIMUM_COLD_BACKFILL_WORKERS = 10;
+const MINIMUM_AUTOMATIC_PARALLEL_BACKFILL_BYTES = 1024 * 1024 * 1024;
 
 // Incremental ingest: advance the live unified index by exactly the bytes the
 // rollout corpus grew since the last pass.
@@ -185,6 +189,7 @@ export async function ingestLocalUnifiedIndexIncrement({
   endAt = null,
   commitRows = 10_000,
   maximumLineBytes,
+  coldBackfillWorkerCount = null,
   signal = null,
   onProgress = null,
   discoveryLimits = null,
@@ -194,6 +199,14 @@ export async function ingestLocalUnifiedIndexIncrement({
   }
   if (typeof contractVersion !== "string" || contractVersion.length < 1) {
     throw new TypeError("contractVersion must be a non-empty string");
+  }
+  if (coldBackfillWorkerCount !== null
+      && (!Number.isSafeInteger(coldBackfillWorkerCount)
+        || coldBackfillWorkerCount < 1
+        || coldBackfillWorkerCount > MAXIMUM_COLD_BACKFILL_WORKERS)) {
+    throw new TypeError(
+      `coldBackfillWorkerCount must be null or between 1 and ${MAXIMUM_COLD_BACKFILL_WORKERS}`,
+    );
   }
   const startedAt = performance.now();
   const resolvedIndexFile = resolve(indexFile);
@@ -358,6 +371,11 @@ export async function ingestLocalUnifiedIndexIncrement({
     }
   }
   if (coldRebuildReason !== null) {
+    const parallelBackfillRequested = coldBackfillWorkerCount !== null
+      || sourceBytes >= MINIMUM_AUTOMATIC_PARALLEL_BACKFILL_BYTES;
+    const workerCount = parallelBackfillRequested
+      ? coldBackfillWorkerCount ?? defaultRebuildWorkerCount()
+      : 1;
     const rebuilt = await rebuildLocalUnifiedIndex({
       codexHome,
       indexFile: resolvedIndexFile,
@@ -366,7 +384,7 @@ export async function ingestLocalUnifiedIndexIncrement({
       startAt,
       endAt,
       contractVersion,
-      workerCount: 1,
+      workerCount,
       commitRows,
       maximumLineBytes,
       signal,

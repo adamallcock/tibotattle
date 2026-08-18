@@ -91,6 +91,7 @@ import {
   formatLocal,
   formatReportingTime,
   formatTimeZoneLabel,
+  formatUtcCalendarDay,
   REPORTING_TIME_ZONE,
   reportingCalendarParts,
   selectAvailableAccountingPeriod,
@@ -103,6 +104,9 @@ import {
   translate,
   translatePlural,
 } from "../public/localization.js";
+import {
+  TELEMETRY_PLAN_TYPES,
+} from "../public/telemetry-shared.generated.js";
 
 class FakeSvgElement {
   constructor(tagName, renderedWidth = 0) {
@@ -495,6 +499,23 @@ test("browser reporting timestamps use one explicit system time zone", () => {
     }).format(date),
   );
   assert.equal(formatReportingTime("not a timestamp"), "Unknown");
+});
+
+test("UTC calendar-day formatting preserves published days and rejects invalid dates", () => {
+  const expected = new Intl.DateTimeFormat(USER_LOCALE, {
+    timeZone: "UTC",
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  }).format(new Date("2024-02-29T00:00:00.000Z"));
+
+  assert.equal(formatUtcCalendarDay("2024-02-29"), expected);
+  assert.equal(formatUtcCalendarDay(null), "Unknown");
+  assert.equal(formatUtcCalendarDay(undefined), "Unknown");
+  assert.equal(formatUtcCalendarDay(""), "Unknown");
+  assert.equal(formatUtcCalendarDay("2023-02-29"), "Unknown");
+  assert.equal(formatUtcCalendarDay("2024-02-30"), "Unknown");
+  assert.equal(formatUtcCalendarDay("not-a-day"), "Unknown");
 });
 
 test("human time-zone labels are direct localized Intl fixtures", () => {
@@ -1777,9 +1798,9 @@ test("the closed accounting normalizer keeps the quota-weighted metric and its c
           observedEvents: 6,
           assumedFromPreferenceEvents: 0,
           inferredEvents: 3,
-          unknownEvents: 1,
+          unknownEvents: 4,
           observedSharePercent: 60,
-          unknownSharePercent: 10
+          unknownSharePercent: 40
         },
         inference: {
           status: "inferred",
@@ -1805,10 +1826,12 @@ test("the closed accounting normalizer keeps the quota-weighted metric and its c
     observedEvents: 6,
     assumedFromPreferenceEvents: 0,
     inferredEvents: 3,
-    unknownEvents: 1,
+    unknownEvents: 4,
     observedSharePercent: 60,
-    unknownSharePercent: 10
+    unknownSharePercent: 40
   });
+  assert.ok(accounting.fastMode.coverage.inferredEvents
+    <= accounting.fastMode.coverage.unknownEvents);
   // The multipliers and the metric name are stated by this page, never taken
   // from the server, and inference can never be reported as weighted.
   assert.deepEqual(accounting.fastMode.multipliers, {
@@ -4601,6 +4624,42 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.doesNotMatch(loadBody, /demoDashboard/);
 });
 
+test("native dashboard readiness follows both first-render outcomes", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const markerStart = appSource.indexOf("function markLocalDashboardReady() {");
+  const markerEnd = appSource.indexOf(
+    "\n}\n\nasync function loadLocalDashboard",
+    markerStart,
+  );
+  const loadStart = appSource.indexOf("async function loadLocalDashboard() {");
+  const loadEnd = appSource.indexOf(
+    "\n}\n\n// The \"preparation identity\"",
+    loadStart,
+  );
+  assert.ok(markerStart >= 0 && markerEnd > markerStart, "readiness marker is present");
+  assert.ok(loadStart >= 0 && loadEnd > loadStart, "dashboard loader is present");
+
+  const marker = appSource.slice(markerStart, markerEnd);
+  const loader = appSource.slice(loadStart, loadEnd);
+  assert.match(
+    marker,
+    /document\.documentElement\.dataset\.localDashboardReady = "true";/u,
+  );
+  assert.doesNotMatch(marker, /querySelector\('#main'\)|innerText/u);
+
+  const successRender = loader.indexOf("renderDashboard(data);");
+  const successMarker = loader.indexOf("markLocalDashboardReady();", successRender);
+  const unavailableRender = loader.indexOf("renderDashboardUnavailableState(");
+  const unavailableMarker = loader.indexOf("markLocalDashboardReady();", unavailableRender);
+  assert.ok(successRender >= 0 && successMarker > successRender);
+  assert.ok(unavailableRender >= 0 && unavailableMarker > unavailableRender);
+  assert.equal(
+    (loader.match(/markLocalDashboardReady\(\)/gu) ?? []).length,
+    2,
+    "the first available or unavailable render marks readiness exactly once",
+  );
+});
+
 test("first run is a truthful install and local preflight journey", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
@@ -4690,7 +4749,10 @@ test("first run is a truthful install and local preflight journey", async () => 
   assert.match(appSource, /installedAppLink\.href = SEMANTIC_OPEN_TARGET/u);
   assert.doesNotMatch(appSource, /usagemonitor:\/\/open/u);
   assert.match(installSource, /translateMessage\(\s*"installer\.sha256",\s*\{ value: release\.sha256 \}/u);
-  assert.match(installSource, /translateMessage\("installer\.requiresMacOS", \{/u);
+  assert.match(
+    installSource,
+    /translateMessage\(\s*\n\s*compactDetails\s*\n\s*\?\s*"installer\.compatibilitySummary"\s*\n\s*:\s*"installer\.requiresMacOS",/u,
+  );
   assert.match(installSource, /selected\.protocol === "https:"/u);
   assert.doesNotMatch(appSource, /loopbackHttp/u);
   assert.match(appSource, /function openInstalledApp\(\)/u);
@@ -7460,6 +7522,131 @@ function firstArguments(source, call) {
   return found;
 }
 
+/**
+ * Load the plan-label helpers in isolation, injecting the two values they
+ * intentionally depend on from the surrounding browser module.
+ */
+async function loadShareCardPlan() {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("const SHARE_CARD_PLAN_LABELS");
+  const end = appSource.indexOf("\nlet shareCard = null;", start);
+  assert.ok(start >= 0 && end > start, "the plan-label helpers are available");
+  const section = appSource.slice(start, end);
+  return Function(
+    "finite",
+    "TELEMETRY_PLAN_TYPES",
+    `${section}\nreturn { SHARE_CARD_PLAN_LABELS, shareCardPlanLabel, shareCardPlan };`,
+  )(
+    (value, fallback = null) => (
+      typeof value === "number" && Number.isFinite(value) ? value : fallback
+    ),
+    TELEMETRY_PLAN_TYPES,
+  );
+}
+
+test("the share card names only a known, most-recent Codex plan", async () => {
+  const { SHARE_CARD_PLAN_LABELS, shareCardPlanLabel, shareCardPlan } =
+    await loadShareCardPlan();
+
+  assert.equal(shareCardPlanLabel("pro"), "Pro (20×)");
+  assert.equal(shareCardPlanLabel("prolite"), "Pro Lite (5×)");
+  assert.equal(shareCardPlanLabel("plus"), "Plus");
+  assert.equal(
+    shareCardPlanLabel("self_serve_business_prolite"),
+    "Business · Pro Lite (5×)",
+  );
+  assert.equal(shareCardPlanLabel("unknown"), "");
+  assert.equal(shareCardPlanLabel(""), "");
+  assert.equal(shareCardPlanLabel("  "), "");
+  assert.equal(shareCardPlanLabel("teamplus"), "");
+  assert.equal(shareCardPlanLabel(undefined), "");
+  assert.equal(shareCardPlanLabel(null), "");
+  assert.ok(!Object.hasOwn(SHARE_CARD_PLAN_LABELS, "unknown"));
+  for (const plan of Object.keys(SHARE_CARD_PLAN_LABELS)) {
+    assert.ok(TELEMETRY_PLAN_TYPES.includes(plan), `${plan} is a KnownPlan value`);
+  }
+
+  assert.equal(
+    shareCardPlan([
+      { planType: "plus", observedAt: "2026-08-01T00:00:00.000Z" },
+      { planType: "pro", observedAt: "2026-08-13T00:00:00.000Z" },
+    ]),
+    "Pro (20×)",
+  );
+  assert.equal(
+    shareCardPlan([
+      { planType: "pro", observedAt: "2026-08-13T00:00:00.000Z" },
+      { planType: "plus", observedAt: "2026-08-01T00:00:00.000Z" },
+    ]),
+    "Pro (20×)",
+  );
+  assert.equal(
+    shareCardPlan([
+      { planType: "pro", observedAt: "2026-08-13T00:00:00.000Z" },
+      { planType: "unknown", observedAt: "2026-08-20T00:00:00.000Z" },
+    ]),
+    "Pro (20×)",
+  );
+  assert.equal(shareCardPlan([{ planType: "pro", observedAt: "" }]), "Pro (20×)");
+  assert.equal(
+    shareCardPlan([
+      { planType: "plus", observedAt: "2026-08-13T00:00:00.000Z" },
+      { planType: "pro", observedAt: "" },
+    ]),
+    "Plus",
+  );
+  assert.equal(shareCardPlan([{ planType: "unknown" }]), "");
+  assert.equal(
+    shareCardPlan([{ observedAt: "2026-08-20T00:00:00.000Z" }]),
+    "",
+  );
+  assert.equal(shareCardPlan([]), "");
+  assert.equal(shareCardPlan(null), "");
+});
+
+test("the share card wires plan copy through the canvas and transcript", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const section = shareCardSource(appSource);
+
+  assert.match(
+    section,
+    /const planLabel = shareCardPlan\(data\?\.quotaWindows \?\? \[\]\);/u,
+  );
+  assert.match(
+    section,
+    /plan: planLabel === "" \? "" : t\("share\.plan", \{ plan: planLabel \}\),/u,
+  );
+  assert.match(
+    section,
+    /if \(card\.plan !== ""\) \{\s*\n\s*drawShareCardPlan\(context, card\.plan, SHARE_CARD_WIDTH - margin, 156\);/u,
+  );
+  assert.match(section, /function drawShareCardPlan\(context, plan, right, baseline\) \{/u);
+  assert.match(section, /context\.fillText\(plan, x \+ 13, baseline\);/u);
+  assert.doesNotMatch(
+    section.match(/function drawShareCardPlan[\s\S]*?\n\}/u)?.[0] ?? "",
+    /toLocaleUpperCase/u,
+  );
+  assert.match(
+    section,
+    /t\("share\.text\.header", \{ subtitle: card\.subtitle, title: card\.title \}\),\s*\n(?:\s*\/\/[^\n]*\n)*\s*card\.plan,/u,
+  );
+
+  assert.ok(Object.hasOwn(WEB_MESSAGES, "share.plan"));
+  assert.equal(WEB_MESSAGES["share.plan"].length, SUPPORTED_LOCALES.length);
+  for (const locale of SUPPORTED_LOCALES) {
+    const copy = translate("share.plan", { plan: "Pro (20×)" }, locale);
+    assert.match(copy, /Pro \(20×\)/u, locale);
+    assert.doesNotMatch(copy, /\{plan\}/u, locale);
+  }
+
+  // The additive plan field must not replace the evidence date in the image
+  // signature: a card remains tied to its observed headline date.
+  const signature = section.match(/const signature = JSON\.stringify\(\[([\s\S]*?)\]\);/u)?.[1];
+  assert.ok(signature, "the share-card signature is available");
+  assert.match(signature, /headlineDate,/u);
+  assert.match(signature, /shareCardPlan\(data\?\.quotaWindows \?\? \[\]\),/u);
+});
+
 test("a posted results card can carry only fixed copy and formatted figures", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const section = shareCardSource(appSource);
@@ -7486,6 +7673,7 @@ test("a posted results card can carry only fixed copy and formatted figures", as
       "card.versionLabel",
       "formatMoney(value, axisDigits)",
       "line",
+      "plan",
       "shareCardFit(context, card.subtitle, inner)",
       "shareCardFit(context, card.title, inner)",
       "shareCardFit(context, stat.value, textWidth)",
@@ -7509,6 +7697,7 @@ test("a posted results card can carry only fixed copy and formatted figures", as
     [
       "data.accounting",
       "data?.accounting?.periods",
+      "data?.freshness?.latestObservedAt",
       "data?.mode",
       "data?.pricing",
       "data?.pricing?.coveragePercent",
@@ -7565,6 +7754,10 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   assert.match(
     section,
     /if \(!Number\.isFinite\(timestamp\)\) return "";/u,
+  );
+  assert.match(
+    section,
+    /function shareCardHeadlineDate\(data, history\) \{\s*\n\s*const latestObservedAt = Date\.parse\(data\?\.freshness\?\.latestObservedAt \?\? ""\);\s*\n\s*const timestamp = Number\.isFinite\(history\?\.anchorAt\)\s*\n\s*\? history\.anchorAt\s*\n\s*: latestObservedAt;\s*\n\s*return shareCardDateLabel\(timestamp\);\s*\n\}/u,
   );
   assert.match(section, /const yAxisLabel = t\("share\.axis\.allowance"\);/u);
   assert.match(section, /const xAxisLabel = t\("share\.axis\.resetEstimateDate"\);/u);
@@ -7828,6 +8021,7 @@ test("a posted results card always carries a diagnostic-format reference", async
   assert.ok(signature, "the figure signature is available");
   for (const figure of [
     "data?.mode",
+    "headlineDate,",
     "shareCardWindowKind(allowanceWindow)",
     "finite(allowanceWindow?.durationMinutes)",
     "finite(allowanceWindow?.remainingPercent)",
@@ -7879,9 +8073,10 @@ test("a posted results card always carries a diagnostic-format reference", async
   assert.doesNotMatch(html, /id="share-card-readout"/u);
 });
 
-test("a posted results card states a figure in full and marks a fixture as one", async () => {
+test("a posted results card states a figure in full, dates real evidence, and marks a fixture", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const section = shareCardSource(appSource);
+  const localizationSource = await readFile(new URL("../public/localization.js", import.meta.url), "utf8");
 
   // One type size for the whole row, chosen so the longest figure fits its
   // column whole. "Not estimable" and a seven-figure total both overrun the
@@ -7908,13 +8103,17 @@ test("a posted results card states a figure in full and marks a fixture as one",
     assert.ok(section.includes(`t("${key}")`), `${key} is one of the fixed figures`);
   }
 
-  // A fixture is marked where a reader scrolling a timeline will see it: in
-  // the line under the title and on a mark beside the wordmark, not only in
-  // the smallest copy on the image.
+  // A real card uses the line under the title for the weekly headline's
+  // newest-fit date. The old local-privacy tagline is intentionally absent.
   assert.match(
     section,
-    /subtitle: isDemo\s*\n\s*\? t\("share\.subtitle\.demo"\)\s*\n\s*: t\("share\.subtitle\.local"\),/u,
+    /subtitle: isDemo\s*\n\s*\? t\("share\.subtitle\.demo"\)\s*\n\s*: headlineDate,/u,
   );
+  assert.doesNotMatch(appSource, /share\.subtitle\.local/u);
+  assert.doesNotMatch(localizationSource, /Measured on my own Mac\. Nothing left it\./u);
+  // A fixture is marked where a reader scrolling a timeline will see it: in
+  // that same line and on a mark beside the wordmark, not only in the smallest
+  // copy on the image.
   assert.match(section, /badge: isDemo \? t\("share\.badge\.demo"\) : "",/u);
   assert.match(section, /if \(card\.badge !== ""\) \{\s*\n\s*drawShareCardBadge\(/u);
   // The mark is drawn in the header, above the figures it qualifies.

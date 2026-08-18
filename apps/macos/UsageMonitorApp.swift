@@ -2073,11 +2073,11 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     private func awaitDashboardContent(in webView: WKWebView, deadline: Date) {
         guard hasDashboardTarget else { return }
         webView.evaluateJavaScript(
-            "(document.querySelector('#main')?.innerText || '').trim().length;"
+            "document.documentElement?.dataset.localDashboardReady === 'true';"
         ) { [weak self] value, error in
             guard let self, self.hasDashboardTarget else { return }
-            let textLength = (value as? NSNumber)?.intValue ?? 0
-            if error == nil, textLength >= 32 {
+            let localDashboardReady = (value as? NSNumber)?.boolValue ?? false
+            if error == nil, localDashboardReady {
                 self.onLoaded()
                 return
             }
@@ -3010,6 +3010,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private var nativeRefreshPoll: DispatchWorkItem?
     private var nativeRefreshSchedule: DispatchWorkItem?
     private var nativeRefreshInFlight = false
+    /// One launch-only refresh waits until the page has rendered its first
+    /// local result. This prevents the heavy collector from winning the
+    /// loopback race against the dashboard's own initial reads.
+    private var startupAutomaticRefreshPending = false
     private var nativeEvidenceState: NativeDashboardEvidenceState = .unknown
     private var nativeEvidenceObservedAt: Date?
     /// The companion's own history-index coverage and terminal refresh
@@ -4014,6 +4018,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         if let webView = dashboardWebHost?.webView {
             window?.makeFirstResponder(webView)
         }
+        if startupAutomaticRefreshPending {
+            startupAutomaticRefreshPending = false
+            refreshLocalUsage(automatic: true)
+        }
     }
 
     private func navigateNativeDashboard(to destination: NativeDashboardDestination) {
@@ -4435,6 +4443,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func dashboardWebViewFailed(code: String) {
         cancelNativeRefreshSchedule()
+        startupAutomaticRefreshPending = false
         nativeEvidenceState = .readFailed
         dashboardWebViewShowing = false
         dashboardContainer.isHidden = true
@@ -4479,6 +4488,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             return
         }
         cancelNativeRefreshSchedule()
+        startupAutomaticRefreshPending = false
         dashboardWebViewShowing = false
         dashboardContainer.isHidden = true
         statusStack.isHidden = false
@@ -4614,11 +4624,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         menuBarStatus?.companionReady(dashboardURL: url)
         // A companion restart moves to a new ephemeral port, so the native
         // dashboard is always reloaded rather than leaving a stale launcher
-        // on screen. This also starts the bounded foreground refresh without
-        // making someone hunt for a dashboard button.
+        // on screen. The first automatic refresh is armed here but starts only
+        // after the page confirms that its initial local result has rendered.
+        // That keeps collection from blocking the reads needed for first paint
+        // while still requiring no manual dashboard action.
         pendingDashboardOpen = false
+        startupAutomaticRefreshPending = true
         openDashboard()
-        refreshLocalUsage(automatic: true)
     }
 
     private func companionExited(
@@ -4629,6 +4641,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         guard generation == launchGeneration else { return }
         startupTimeout?.cancel()
         startupTimeout = nil
+        startupAutomaticRefreshPending = false
         if quitting || requested { return }
         dashboardURL = nil
         companion = nil
@@ -7197,6 +7210,51 @@ private enum MenuBarContractSmokeTest {
     static func run() -> Int32 {
         let application = NSApplication.shared
         application.setActivationPolicy(.accessory)
+        let durationSeconds = TimeInterval(
+            CodexQuotaWindowDuration.sevenDayMinutes * 60
+        )
+        let resetAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let observedAt = resetAt.addingTimeInterval(
+            -durationSeconds * 0.76
+        )
+        let weeklyLane = ObservedQuotaLane(
+            label: TiboTattleLocalization.string(.menuBarSevenDayAllowance),
+            remainingPercent: 71,
+            durationMinutes: CodexQuotaWindowDuration.sevenDayMinutes,
+            resetAt: resetAt,
+            observedAt: observedAt,
+            isPrimary: true
+        )
+        let weeklyPosition = weeklyWindowPosition(weeklyLane)
+        var liveSnapshot = MenuBarStatusSnapshot()
+        liveSnapshot.phase = .ready
+        liveSnapshot.evidence = .live
+        liveSnapshot.lanes = [weeklyLane]
+        liveSnapshot.observedAt = observedAt
+        let liveSummary = liveSnapshot.laneSummary(
+            weeklyLane,
+            now: observedAt
+        )
+        var staleSnapshot = liveSnapshot
+        staleSnapshot.evidence = .stale
+        let staleSummary = staleSnapshot.laneSummary(
+            weeklyLane,
+            now: observedAt
+        )
+        let reset = resetCountdown(resetAt, now: observedAt)
+        let expectedLiveSummary = reset.map {
+            TiboTattleLocalization.format(
+                .menuBarQuotaWeeklyPositionResets,
+                weeklyLane.label,
+                TiboTattleLocalization.percentString(24),
+                TiboTattleLocalization.percentString(29),
+                $0
+            )
+        }
+        let expectedStaleSummary = TiboTattleLocalization.format(
+            .menuBarQuotaLastObserved,
+            weeklyLane.label
+        )
         let controller = MenuBarStatusController(
             productName: BundledProduct.displayName,
             actions: MenuBarStatusController.Actions(
@@ -7222,7 +7280,13 @@ private enum MenuBarContractSmokeTest {
               starting.usesNativeStatusItemMenu,
               starting.escapeDismissalMonitorInstalled,
               starting.sameAppClickAwayMonitorInstalled,
-              starting.appDeactivationDismissalObserverInstalled
+              starting.appDeactivationDismissalObserverInstalled,
+              weeklyPosition == WeeklyWindowPosition(
+                  elapsedPercent: 24,
+                  usedPercent: 29
+              ),
+              liveSummary == expectedLiveSummary,
+              staleSummary == expectedStaleSummary
         else {
             FileHandle.standardError.write(
                 Data("macOS menu bar contract smoke failed\\n".utf8)
@@ -7233,7 +7297,8 @@ private enum MenuBarContractSmokeTest {
             "USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT "
                 + "native_rows=true titles=true states=starting,unavailable "
                 + "shortcuts=cmd-r,cmd-comma,cmd-q "
-                + "dismissal=native,escape,same-app,deactivation"
+                + "dismissal=native,escape,same-app,deactivation "
+                + "weekly_position=fresh-only"
         )
         return 0
     }

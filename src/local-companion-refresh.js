@@ -1856,7 +1856,7 @@ export class LocalCompanionRefreshController {
               && projected.phase === "quick_result"
               && !this.#cancelRequested) {
             try {
-              await this.#dataStore.reload();
+              await this.#dataStore.reload({ purpose: "quick" });
               quickResultAt = new Date(this.#clock()).toISOString();
             } catch {
               // Keep the previous good dashboard. Deep accounting can still
@@ -1874,7 +1874,7 @@ export class LocalCompanionRefreshController {
       .then(async (result) => {
         if (this.#cancelRequested) {
           try {
-            await this.#dataStore.reload();
+            await this.#dataStore.reload({ purpose: "full" });
           } catch {
             // Cancellation preserves the last good dashboard snapshot.
           }
@@ -1895,7 +1895,7 @@ export class LocalCompanionRefreshController {
         }
         if (timedOut) {
           try {
-            await this.#dataStore.reload();
+            await this.#dataStore.reload({ purpose: "full" });
           } catch {
             // The timeout remains authoritative; the last good dashboard
             // snapshot is already retained by the data store.
@@ -1917,7 +1917,7 @@ export class LocalCompanionRefreshController {
           this.#notifyTerminalFailure();
           return;
         }
-        await this.#dataStore.reload();
+        await this.#dataStore.reload({ purpose: "full" });
         const finalProgress = publicIndexingResult(result?.indexing);
         this.#state = {
           status: "succeeded",
@@ -1958,7 +1958,7 @@ export class LocalCompanionRefreshController {
           // that content-free coverage receipt while retaining the previous
           // foreground result.
           try {
-            await this.#dataStore.reload();
+            await this.#dataStore.reload({ purpose: "full" });
           } catch {
             // Keep the prior good dashboard if the receipt reload is unavailable.
           }

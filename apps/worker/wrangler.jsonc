@@ -455,24 +455,13 @@
         // Missing dashboard/admin paths must remain real 404s rather than
         // falling through to the public landing page.
         "not_found_handling": "404-page",
-        // Prevent the legacy association filename from receiving the SPA
-        // fallback. It is deliberately a 404, not an Apple release gate.
-        //
-        // The admin surface MUST be worker-first: the worker gates on the
-        // admin hostname (404 on the public origin), verifies the Cloudflare
-        // Access JWT, and serves the embedded admin UI. Without these paths
-        // the asset layer answers /admin before the worker runs, so the
-        // Access-authenticated operator saw the public landing page.
-        "run_worker_first": [
-          "/api/*",
-          "/admin",
-          "/admin/*",
-          "/admin.html",
-          "/admin.js",
-          "/admin-client.js",
-          "/admin.css",
-          "/.well-known/apple-developer-domain-association.txt"
-        ]
+        // The public www alias, the admin hostname, APIs, and static assets
+        // all need the Worker before asset serving. That makes the configured
+        // PUBLIC_ORIGIN the single canonical host for every present/future
+        // public path, while the normal ASSETS.fetch fallback still serves the
+        // manifest-verified static tree. It also preserves the existing admin
+        // Access gate and deliberate 404s for legacy/private paths.
+        "run_worker_first": true
       }
     }
   }
