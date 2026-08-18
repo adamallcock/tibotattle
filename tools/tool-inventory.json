@@ -88,6 +88,7 @@
         "package.json#scripts.product:macos:preview:validate",
         "apps/worker/scripts/check-deployment-endpoints.mjs",
         "scripts/macos-release-core.js",
+        "scripts/build-electron-runtime.mjs",
         "scripts/build-public-release-site.js",
         "scripts/install-macos-preview-app.js",
         "scripts/verify-macos-preview-remote.js",
@@ -1040,6 +1041,53 @@
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/goals/2026-08-17-windows-security-credentials-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/build-electron-app.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Development-only Electron app staging has no supported product command while the Windows-first delivery goal is active.",
+      "additionalAliases": [],
+      "callers": [
+        "test/electron-app-package.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/build-electron-runtime.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Exact Electron companion staging is an internal local-build boundary, not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/build-electron-app.mjs",
+        "test/electron-app-package.test.js",
+        "test/electron-package-layout.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/verify-electron-development-artifact.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Content-free Electron artifact verification is an internal packaging qualification gate, not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/electron-development-artifact-verifier.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
       "provenanceReason": null,
       "legacyPaths": []
     },
