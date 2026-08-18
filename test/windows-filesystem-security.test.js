@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
 import {
   link,
+  lstat,
   mkdtemp,
   rename,
   rm,
   symlink,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve, win32 } from "node:path";
 import test from "node:test";
+import { Worker } from "node:worker_threads";
+import { fileURLToPath } from "node:url";
 
 import {
   createWindowsFilesystemAdapter,
@@ -20,6 +24,232 @@ import { createWindowsCredentialOperationAuditStore } from "../src/platform/wind
 
 const NATIVE_WINDOWS = process.platform === "win32" && process.arch === "x64";
 const NATIVE_SKIP = NATIVE_WINDOWS ? false : "native Windows x64 only";
+const QUALIFICATION_HOOK_METHODS = Object.freeze([
+  "armReplacementPause",
+  "waitForReplacementPause",
+  "releaseReplacementPause",
+]);
+const requireNative = createRequire(import.meta.url);
+const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const QUALIFICATION_BINDING_ENVIRONMENT =
+  "TIBOTATTLE_WINDOWS_QUALIFICATION_BINDING_PATH";
+const QUALIFICATION_BINDING_FILE = "windows_filesystem_qualification.node";
+
+function qualificationBindingPath() {
+  const configured = process.env[QUALIFICATION_BINDING_ENVIRONMENT];
+  if (!NATIVE_WINDOWS) {
+    return resolve(
+      REPOSITORY_ROOT,
+      "native",
+      "windows-filesystem",
+      "build",
+      "Release",
+      QUALIFICATION_BINDING_FILE,
+    );
+  }
+  if (typeof configured !== "string"
+      || !win32.isAbsolute(configured)
+      || win32.basename(configured).toLowerCase()
+        !== QUALIFICATION_BINDING_FILE.toLowerCase()) {
+    throw new Error("WINDOWS_FILESYSTEM_QUALIFICATION_BINDING_PATH_INVALID");
+  }
+  return configured;
+}
+
+function loadQualificationBinding(bindingPath = qualificationBindingPath()) {
+  return requireNative(bindingPath);
+}
+
+function runReplacementWorker({ bindingPath, path, expectedIdentity, bytes }) {
+  const worker = new Worker(`
+    const { parentPort, workerData } = require("node:worker_threads");
+    try {
+      const binding = require(workerData.bindingPath);
+      binding.replaceFile(
+        workerData.path,
+        workerData.expectedIdentity,
+        Buffer.from(workerData.bytes),
+      );
+      parentPort.postMessage({ status: "ok" });
+    } catch (error) {
+      parentPort.postMessage({
+        status: "error",
+        code: typeof error?.code === "string"
+          ? error.code
+          : "WINDOWS_FILESYSTEM_UNKNOWN",
+      });
+    }
+  `, {
+    eval: true,
+    workerData: {
+      bindingPath,
+      path,
+      expectedIdentity,
+      bytes: [...bytes],
+    },
+  });
+
+  const result = new Promise((resolveResult, rejectResult) => {
+    let settled = false;
+    let messageReceived = false;
+    let message;
+    let exitReceived = false;
+    let exitCode;
+    let timeout;
+    const finishIfClean = () => {
+      if (settled || !messageReceived || !exitReceived) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (exitCode !== 0) {
+        rejectResult(new Error("WINDOWS_FILESYSTEM_QUALIFICATION_WORKER_EXIT"));
+        return;
+      }
+      resolveResult(message);
+    };
+    timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      void worker.terminate();
+      rejectResult(new Error("WINDOWS_FILESYSTEM_QUALIFICATION_WORKER_TIMEOUT"));
+    }, 10000);
+    worker.once("message", (value) => {
+      if (settled) return;
+      messageReceived = true;
+      message = value;
+      finishIfClean();
+    });
+    worker.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      rejectResult(error);
+    });
+    worker.once("exit", (code) => {
+      if (settled) return;
+      exitReceived = true;
+      exitCode = code;
+      if (code !== 0) {
+        settled = true;
+        clearTimeout(timeout);
+        rejectResult(new Error("WINDOWS_FILESYSTEM_QUALIFICATION_WORKER_EXIT"));
+        return;
+      }
+      finishIfClean();
+    });
+  });
+  return { worker, result };
+}
+
+const REVIEWED_SHARING_OR_PERMISSION_CODES = new Set([
+  "EACCES",
+  "EBUSY",
+  "EPERM",
+]);
+
+async function assertBoundedFilesystemRejection(operation, attackerPromises) {
+  let timer;
+  const attempt = Promise.resolve().then(operation);
+  attackerPromises.push(attempt);
+  try {
+    await assert.rejects(
+      Promise.race([
+        attempt,
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error("WINDOWS_FILESYSTEM_QUALIFICATION_RACE_TIMEOUT")),
+            5000,
+          );
+        }),
+      ]),
+      (error) => REVIEWED_SHARING_OR_PERMISSION_CODES.has(error?.code),
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function withPausedReplacement(run) {
+  const parent = await mkdtemp(join(tmpdir(), "tibotattle-windows-qualification-race-"));
+  const root = join(parent, `private state Ω ${randomUUID()}`);
+  const ancestor = join(root, "nested");
+  const path = join(ancestor, "state.bin");
+  const movedAncestor = join(root, "nested-moved");
+  const originalBytes = Buffer.from("original-state\n", "utf8");
+  const replacementBytes = Buffer.from("replacement-state\n", "utf8");
+  const bindingPath = qualificationBindingPath();
+  const binding = loadQualificationBinding(bindingPath);
+  let operation;
+  const attackerPromises = [];
+  try {
+    binding.ensureDirectory(root);
+    binding.ensureDirectory(ancestor);
+    const identity = binding.createFile(path, originalBytes);
+    binding.armReplacementPause();
+    assert.throws(
+      () => binding.armReplacementPause(),
+      fixedNativeError("WINDOWS_FILESYSTEM_QUALIFICATION_PAUSE_ALREADY_ARMED"),
+    );
+    operation = runReplacementWorker({
+      bindingPath,
+      path,
+      expectedIdentity: identity,
+      bytes: replacementBytes,
+    });
+    assert.equal(binding.waitForReplacementPause(5000), true);
+    assert.throws(
+      () => binding.armReplacementPause(),
+      fixedNativeError("WINDOWS_FILESYSTEM_QUALIFICATION_PAUSE_ALREADY_ARMED"),
+    );
+    return await run({
+      binding,
+      root,
+      ancestor,
+      movedAncestor,
+      path,
+      originalBytes,
+      replacementBytes,
+      operation,
+      attackerPromises,
+      release: () => binding.releaseReplacementPause(),
+    });
+  } finally {
+    if (operation !== undefined) {
+      binding.releaseReplacementPause();
+      await Promise.allSettled(attackerPromises);
+      await operation.result.catch(() => {});
+      await operation.worker.terminate();
+    }
+    await rm(parent, { recursive: true, force: true });
+  }
+}
+
+async function assertOriginalReplacementPaths({
+  binding,
+  path,
+  ancestor,
+  movedAncestor,
+  alias,
+  originalBytes,
+}) {
+  const ancestorStat = await lstat(ancestor);
+  assert.equal(ancestorStat.isDirectory(), true);
+  assert.equal(ancestorStat.isSymbolicLink(), false);
+  const sourceStat = await lstat(path);
+  assert.equal(sourceStat.isFile(), true);
+  assert.equal(sourceStat.isSymbolicLink(), false);
+  assert.equal(sourceStat.size, originalBytes.byteLength);
+  assert.deepEqual(binding.readFile(path).data, originalBytes);
+  await assert.rejects(
+    lstat(movedAncestor),
+    (error) => error?.code === "ENOENT",
+  );
+  if (alias !== undefined) {
+    await assert.rejects(
+      lstat(alias),
+      (error) => error?.code === "ENOENT",
+    );
+  }
+}
 
 async function withSyntheticRoot(run) {
   const parent = await mkdtemp(join(tmpdir(), "tibotattle-windows-security-"));
@@ -31,6 +261,17 @@ async function withSyntheticRoot(run) {
     await rm(parent, { recursive: true, force: true });
   }
 }
+
+test("production binding has no qualification hooks and qualification binding has all hooks", {
+  skip: NATIVE_SKIP,
+}, () => {
+  const production = loadWindowsFilesystemBinding();
+  const qualification = loadQualificationBinding();
+  for (const method of QUALIFICATION_HOOK_METHODS) {
+    assert.equal(Object.hasOwn(production, method), false, method);
+    assert.equal(typeof qualification[method], "function", method);
+  }
+});
 
 function fixedNativeError(code) {
   return (error) => {
@@ -309,4 +550,78 @@ test("native audit guard rejects hard-linked and reparse-point database files", 
     }
     throw error;
   }
+}));
+
+test("qualification hook blocks ancestor rename and recursive delete during replacement", {
+  skip: NATIVE_SKIP,
+}, () => withPausedReplacement(async ({
+  binding,
+  ancestor,
+  movedAncestor,
+  operation,
+  path,
+  originalBytes,
+  replacementBytes,
+  release,
+  attackerPromises,
+}) => {
+  await assertBoundedFilesystemRejection(
+    () => rename(ancestor, movedAncestor),
+    attackerPromises,
+  );
+  await assertBoundedFilesystemRejection(
+    () => rm(ancestor, { recursive: true }),
+    attackerPromises,
+  );
+  await assertOriginalReplacementPaths({
+    binding,
+    path,
+    ancestor,
+    movedAncestor,
+    originalBytes,
+  });
+  release();
+  const result = await operation.result;
+  assert.deepEqual(result, { status: "ok" });
+  assert.deepEqual(binding.readFile(path).data, replacementBytes);
+  await assert.rejects(
+    lstat(movedAncestor),
+    (error) => error?.code === "ENOENT",
+  );
+}));
+
+test("qualification hook blocks hard-link creation during replacement", {
+  skip: NATIVE_SKIP,
+}, () => withPausedReplacement(async ({
+  binding,
+  operation,
+  path,
+  ancestor,
+  movedAncestor,
+  originalBytes,
+  replacementBytes,
+  release,
+  attackerPromises,
+}) => {
+  const alias = join(ancestor, "state-hard-link-alias.bin");
+  await assertBoundedFilesystemRejection(
+    () => link(path, alias),
+    attackerPromises,
+  );
+  await assertOriginalReplacementPaths({
+    binding,
+    path,
+    ancestor,
+    movedAncestor,
+    alias,
+    originalBytes,
+  });
+  release();
+  const result = await operation.result;
+  assert.deepEqual(result, { status: "ok" });
+  assert.deepEqual(binding.readFile(path).data, replacementBytes);
+  await assert.rejects(
+    lstat(alias),
+    (error) => error?.code === "ENOENT",
+  );
 }));
