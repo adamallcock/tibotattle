@@ -48,7 +48,7 @@
     <meta name="twitter:image" content="">
     <meta
       name="description"
-      content="See where your Codex allowance stands with a private Mac app that calculates your personal dashboard locally."
+      content="Understand what your Codex allowance is really worth with a private Mac app that calculates your personal dashboard locally."
     >
     <title>TiboTattle</title>
     <link rel="icon" type="image/png" href="./tibotattle-icon.png">
@@ -60,6 +60,14 @@
     <a class="skip-link" href="#main">Skip to TiboTattle</a>
 
     <header class="topbar" data-i18n-legacy-root>
+      <label class="language-picker">
+        <span class="sr-only" data-i18n="language.label">Language</span>
+        <select
+          data-language-picker
+          data-language-picker-resolved
+          aria-label="Language"
+        ></select>
+      </label>
       <a
         class="brand"
         href="#install"
@@ -78,10 +86,6 @@
         <a href="#community">Community</a>
         <a href="./docs.html">Docs</a>
       </nav>
-      <label class="language-picker">
-        <span class="sr-only" data-i18n="language.label">Language</span>
-        <select data-language-picker aria-label="Language"></select>
-      </label>
       <p
         class="sr-only"
         data-language-announcement
@@ -91,18 +95,18 @@
       ></p>
       <a class="header-download" href="#download">
         <img src="./apple.svg" alt="" width="14" height="14">
-        <span id="header-download-label">Get the Mac app</span>
+        <span class="header-download-label" id="header-download-label">Get the Mac app</span>
       </a>
     </header>
 
     <main id="main" tabindex="-1" data-i18n-legacy-root>
       <section class="product-hero" id="install" aria-labelledby="install-title">
         <div class="hero-copy">
-          <h1 id="install-title">See where your Codex allowance stands.</h1>
+          <h1 id="install-title">What the Codex allowance is really worth.</h1>
           <p class="hero-lede">
-            TiboTattle is a private Mac app that estimates how much of your
-            seven-day Codex allowance remains and shows how your usage changes
-            over time. Your personal dashboard is calculated on your Mac.
+            TiboTattle turns your seven-day Codex allowance into an
+            API-price-equivalent estimate, shows how it changes over time, and
+            calculates your personal dashboard on your Mac.
           </p>
 
           <div
@@ -130,15 +134,70 @@
                 <img class="download-platform-icon" src="./apple.svg" alt="" width="22" height="22">
                 Download for macOS
               </button>
+              <div
+                class="homebrew-install"
+                id="homebrew-install"
+                role="group"
+                aria-label="Install with Homebrew"
+                data-i18n-aria-label="aria.installWithHomebrew"
+                hidden
+              >
+                <span class="homebrew-prompt" aria-hidden="true">$</span>
+                <code id="homebrew-install-command" data-i18n-skip>brew install --cask adamallcock/tap/tibotattle</code>
+                <button
+                  class="homebrew-copy-button"
+                  id="homebrew-copy-button"
+                  type="button"
+                  aria-label="Copy Homebrew install command"
+                  aria-describedby="homebrew-copy-status"
+                  data-i18n-aria-label="aria.copyHomebrewCommand"
+                >
+                  <span id="homebrew-copy-label" data-i18n="installer.homebrew.copy">Copy</span>
+                </button>
+              </div>
+              <span
+                class="sr-only"
+                id="homebrew-copy-status"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+              ></span>
               <span class="installer-unavailable" id="installer-unavailable">
                 Public download coming soon.
               </span>
             </div>
-            <div class="installer-details" id="installer-details" hidden>
-              <span id="installer-version"></span>
-              <span id="installer-compatibility"></span>
-              <span id="installer-size"></span>
-              <span id="installer-sha256"></span>
+            <div class="installer-details installer-details-compact" id="installer-details" hidden>
+              <span class="installer-summary">
+                <span id="installer-version"></span>
+                <span class="installer-summary-divider" aria-hidden="true">·</span>
+                <span id="installer-compatibility"></span>
+              </span>
+              <button
+                class="installer-checksum-copy"
+                id="installer-sha256-copy"
+                type="button"
+                aria-label="Copy the published SHA-256 checksum"
+                aria-describedby="installer-sha256-copy-status"
+                data-i18n-aria-label="aria.copyInstallerSha256"
+              >
+                <span id="installer-sha256-copy-label" data-i18n="installer.sha256.copy">Copy SHA-256</span>
+              </button>
+              <code
+                class="installer-checksum-fallback"
+                id="installer-sha256"
+                aria-label="SHA-256 checksum"
+                data-i18n-aria-label="aria.installerSha256"
+                data-i18n-skip
+                hidden
+              ></code>
+              <span class="sr-only" id="installer-size" aria-hidden="true"></span>
+              <span
+                class="sr-only"
+                id="installer-sha256-copy-status"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+              ></span>
             </div>
             <nav class="installer-links" id="installer-links" aria-label="Release information" data-i18n-aria-label="aria.releaseInformation" hidden>
               <a id="release-notes-link" href="" hidden>Release notes</a>
@@ -146,10 +205,6 @@
               <a id="security-link" href="" hidden>Security</a>
               <a id="support-link" href="" hidden>Support</a>
             </nav>
-            <div class="homebrew-install">
-              <p>Or install with Homebrew</p>
-              <code data-i18n-raw>brew install --cask adamallcock/tap/tibotattle</code>
-            </div>
           </div>
 
           <a class="community-inline" href="#community">
@@ -159,42 +214,69 @@
           </a>
         </div>
 
-        <figure class="product-window" aria-labelledby="product-preview-title">
-          <div class="product-window-bar">
-            <span class="preview-brand">
+        <section class="community-window" aria-labelledby="community-allowance-heading">
+          <div class="community-window-bar">
+            <span class="community-window-brand">
               <img src="./tibotattle-icon.png" alt="" width="32" height="32">
               <strong>TiboTattle</strong>
             </span>
-            <span class="preview-demo">Demo data</span>
+            <span class="community-window-context" data-i18n="community.hero.context">Community view</span>
           </div>
-          <div class="product-window-content">
-            <p class="preview-label" id="product-preview-title">Seven-day allowance estimate</p>
-            <div class="preview-value">
-              <strong>$1,879</strong>
-              <span>API equivalent<br>per 7 days</span>
+          <div class="community-window-content">
+            <div class="community-allowance hero-community-allowance" id="community-allowance-figure">
+              <div class="activity-heading">
+                <div>
+                  <h2 id="community-allowance-heading" data-i18n="community.allowance.heading">Fitted seven-day allowance</h2>
+                  <p data-i18n="community.allowance.heroCopy">Fitted estimates, plausible ranges, and per-day evidence across contributing Codex Pro (20x) accounts, valued at API prices.</p>
+                </div>
+                <div class="allowance-controls">
+                  <span class="evidence-chip neutral" id="community-allowance-state">
+                    Checking allowance estimates
+                  </span>
+                  <div
+                    class="segmented-control"
+                    id="community-allowance-range-controls"
+                    role="group"
+                    aria-label="Allowance estimate date range"
+                    data-i18n-aria-label="aria.allowanceRange"
+                  >
+                    <button type="button" data-range-days="30" aria-pressed="false">30d</button>
+                    <button type="button" data-range-days="90" aria-pressed="false">90d</button>
+                    <button type="button" data-range-days="" class="active" aria-pressed="true">All</button>
+                  </div>
+                </div>
+              </div>
+              <div class="result-summary" id="community-allowance-result">
+                <p>Checking for published allowance estimates…</p>
+              </div>
             </div>
-            <p class="preview-qualification">Example only — not your usage or a bill.</p>
-            <dl class="preview-stats">
-              <div>
-                <dt>Observed resets</dt>
-                <dd>14</dd>
-              </div>
-              <div>
-                <dt>Allowance remaining</dt>
-                <dd>61%</dd>
-              </div>
-            </dl>
-            <img
-              class="preview-chart"
-              src="./tibotattle-weekly-preview.jpg"
-              width="914"
-              height="430"
-              alt="Sample seven-day allowance history with reset-level uncertainty ranges"
-              data-i18n-alt="alt.previewWeeklyHistory"
-            >
           </div>
-          <figcaption>Your dashboard is calculated privately on your Mac.</figcaption>
-        </figure>
+        </section>
+      </section>
+
+      <section
+        class="community-proof community-proof-compact"
+        id="community"
+        data-community-state="checking"
+        aria-labelledby="community-method-summary"
+      >
+        <details class="community-method">
+          <summary id="community-method-summary">See community activity details</summary>
+          <div class="community-method-body">
+            <div class="activity-heading">
+              <div>
+                <h3>Daily activity series</h3>
+                <p>Delayed daily totals for the past year. Each day shows its latest published revision.</p>
+              </div>
+              <span class="evidence-chip neutral" id="community-daily-state">
+                Checking daily series
+              </span>
+            </div>
+            <div class="result-summary" id="community-daily-result">
+              <p>Checking for published daily activity…</p>
+            </div>
+          </div>
+        </details>
       </section>
 
       <section
@@ -218,77 +300,6 @@
           <h2>Share only if you choose</h2>
           <p>Review a content-free summary before any optional community contribution.</p>
         </article>
-      </section>
-
-      <section
-        class="community-proof"
-        id="community"
-        data-community-state="checking"
-        aria-labelledby="community-title"
-      >
-        <div class="community-proof-heading">
-          <div>
-            <h2 id="community-title">What the Codex allowance is really worth</h2>
-            <p>When available, this leads with the fitted seven-day Codex allowance in API-price-equivalent dollars across every contributing account on the Codex Pro (20x) plan, from delayed, anonymous contributions. Other plan cohorts are never mixed into this series. The daily activity series sits below. A late contribution never edits history: it publishes a replacement revision for its day.</p>
-            <p class="annotation">
-              Personal dashboards and contributions stay in the Mac app.
-            </p>
-          </div>
-          <div class="community-estimate-summary">
-            <span class="evidence-chip neutral" id="community-daily-panel-state">
-              Checking daily activity
-            </span>
-            <div id="community-daily-status" role="status">
-              <p>Checking for published daily activity…</p>
-            </div>
-          </div>
-        </div>
-
-        <div class="community-allowance" id="community-allowance-figure">
-          <div class="activity-heading">
-            <div>
-              <h3>Fitted seven-day allowance</h3>
-              <p>Central fit, plausible range, and per-day estimates across contributing accounts on the Codex Pro (20x) plan, valued at API prices.</p>
-            </div>
-            <div class="allowance-controls">
-              <span class="evidence-chip neutral" id="community-allowance-state">
-                Checking allowance estimates
-              </span>
-              <div
-                class="segmented-control"
-                id="community-allowance-range-controls"
-                role="group"
-                aria-label="Allowance estimate date range"
-                data-i18n-aria-label="aria.allowanceRange"
-              >
-                <button type="button" data-range-days="30" aria-pressed="false">30d</button>
-                <button type="button" data-range-days="90" aria-pressed="false">90d</button>
-                <button type="button" data-range-days="" class="active" aria-pressed="true">All</button>
-              </div>
-            </div>
-          </div>
-          <div class="result-summary" id="community-allowance-result">
-            <p>Checking for published allowance estimates…</p>
-          </div>
-        </div>
-
-        <details class="community-method">
-          <summary>See community activity details</summary>
-          <div class="community-method-body">
-            <div class="activity-heading">
-              <div>
-                <h3>Daily activity series</h3>
-                <p>Delayed daily totals for the past year. Each day shows its latest published revision.</p>
-              </div>
-              <span class="evidence-chip neutral" id="community-daily-state">
-                Checking daily series
-              </span>
-            </div>
-            <div class="result-summary" id="community-daily-result">
-              <p>Checking for published daily activity…</p>
-            </div>
-          </div>
-        </details>
       </section>
     </main>
 

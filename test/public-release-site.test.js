@@ -26,6 +26,10 @@ import { SPARKLE_VERSION } from "../scripts/macos-updater-core.js";
 import {
   collectMacOSWebModuleGraph,
 } from "../scripts/build-macos-app.js";
+import {
+  PUBLIC_RELEASE_MANIFEST_SCHEMA,
+  PUBLIC_RELEASE_SOURCE_PROVENANCE_SCHEMA,
+} from "../scripts/public-release-provenance.js";
 
 const PNG_SIGNATURE = Buffer.from([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
@@ -291,11 +295,10 @@ async function serveReleaseOutput(output) {
 }
 
 function assertPublicEntryClaimBoundary(html, label = "public entry") {
-  // Re-pinned 2026-08-10 (owner-directed): the community section leads with
-  // the fitted allowance estimate, honestly labeled with its participant
-  // count, above the daily activity series.
-  assert.match(html, /What the Codex allowance is really worth/u, label);
+  // The hero carries the live fitted allowance estimate. Its compact daily
+  // activity disclosure sits before the supporting feature strip.
   assert.match(html, /id="community-allowance-figure"/u, label);
+  assert.match(html, /id="community-method-summary"/u, label);
   assert.match(html, /delayed, aggregate activity/u, label);
   // The retired sealed-snapshot presentation must not resurface on the
   // published site: daily revisions are the only public activity surface.
@@ -331,7 +334,7 @@ test("release-site build verifies artifacts and materializes complete public met
     },
   });
 
-  assert.equal(result.fileCount, 12);
+  assert.equal(result.fileCount, 13);
   assert.deepEqual(validatedArtifacts, [[
     value.installerPath,
     { production: true },
@@ -380,6 +383,10 @@ test("release-site build verifies artifacts and materializes complete public met
   );
   assert.match(
     html,
+    /property="og:url" content="https:\/\/usagemonitor\.app\/"/u,
+  );
+  assert.match(
+    html,
     /property="og:image" content="https:\/\/usagemonitor\.app\/social-preview\.png"/u,
   );
   assert.match(
@@ -388,7 +395,17 @@ test("release-site build verifies artifacts and materializes complete public met
   );
   assert.equal(
     await readFile(join(value.output, "robots.txt"), "utf8"),
-    "User-agent: *\nAllow: /\n",
+    "User-agent: *\nAllow: /\nSitemap: https://usagemonitor.app/sitemap.xml\n",
+  );
+  assert.equal(
+    await readFile(join(value.output, "sitemap.xml"), "utf8"),
+    [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+      "  <url><loc>https://usagemonitor.app/</loc></url>",
+      "</urlset>",
+      "",
+    ].join("\n"),
   );
   assert.deepEqual(
     await readFile(join(value.output, "social-preview.png")),
@@ -402,10 +419,31 @@ test("release-site build verifies artifacts and materializes complete public met
   const manifest = JSON.parse(manifestText);
   assert.equal(
     manifest.schemaVersion,
-    "usage-monitor-release-site-manifest-v0.2",
+    PUBLIC_RELEASE_MANIFEST_SCHEMA,
   );
+  assert.equal(
+    manifest.source.schemaVersion,
+    PUBLIC_RELEASE_SOURCE_PROVENANCE_SCHEMA,
+  );
+  assert.equal(manifest.source.repositoryCommit, null);
+  assert.equal(manifest.source.root, null);
+  assert.equal(
+    manifest.source.files.some(({ path }) => path === "community.html"),
+    true,
+  );
+  assert.equal(
+    manifest.source.files.some(({ path }) => path === "community.js"),
+    true,
+  );
+  assert.match(manifest.source.sha256, /^[a-f0-9]{64}$/u);
+  assert.doesNotMatch(manifestText, /a{40}/u);
+  assert.deepEqual(result.source, manifest.source);
   assert.equal(manifest.installer.minimumMacos, "13.0");
   assert.equal(manifest.site.robots.policy, "allow_all");
+  assert.deepEqual(manifest.site.sitemap, {
+    path: "sitemap.xml",
+    canonicalUrls: ["https://usagemonitor.app/"],
+  });
   assert.deepEqual(
     manifest.files.map(({ path }) => path),
     [
@@ -416,6 +454,7 @@ test("release-site build verifies artifacts and materializes complete public met
       "index.html",
       "localization.js",
       "robots.txt",
+      "sitemap.xml",
       "social-preview.png",
       "styles.css",
       "tibotattle-icon.png",
@@ -537,7 +576,7 @@ test("public static routes keep root, community, docs, privacy, and fallback out
       assert.equal(html.includes(forbidden), false, `${route}: ${forbidden}`);
     }
   }
-  assert.match(root, /<h1 id="install-title">See where your Codex allowance stands\.<\/h1>/u);
+  assert.match(root, /<h1 id="install-title">What the Codex allowance is really worth\.<\/h1>/u);
   assert.match(root, /id="community-daily-result"/u);
   assert.match(root, /id="installer-unavailable-action"[\s\S]*disabled/u);
   assert.match(root, /Public download coming soon\./u);
@@ -682,10 +721,10 @@ test("checked-in public source satisfies the complete release contract", async (
       "localization.js",
       "privacy.html",
       "robots.txt",
+      "sitemap.xml",
       "social-preview.png",
       "styles.css",
       "tibotattle-icon.png",
-      "tibotattle-weekly-preview.jpg",
       "ui-format.js",
       "x.svg",
     ],
@@ -697,7 +736,6 @@ test("checked-in public source satisfies the complete release contract", async (
     "apple.svg",
     "github.svg",
     "tibotattle-icon.png",
-    "tibotattle-weekly-preview.jpg",
     "x.svg",
   ]) {
     assert.ok(publishedNames.has(publicAsset), `Missing public asset ${publicAsset}`);
@@ -729,6 +767,34 @@ test("checked-in public source satisfies the complete release contract", async (
     assert.doesNotMatch(auxiliaryHtml, /href="\.\/community\.html/u);
     assert.doesNotMatch(auxiliaryHtml, /<script/u);
   }
+  assert.match(
+    docsHtml,
+    /<link rel="canonical" href="https:\/\/usagemonitor\.app\/docs">/u,
+  );
+  assert.match(
+    docsHtml,
+    /property="og:url" content="https:\/\/usagemonitor\.app\/docs"/u,
+  );
+  assert.match(
+    privacyHtml,
+    /<link rel="canonical" href="https:\/\/usagemonitor\.app\/privacy">/u,
+  );
+  assert.match(
+    privacyHtml,
+    /property="og:url" content="https:\/\/usagemonitor\.app\/privacy"/u,
+  );
+  assert.equal(
+    await readFile(join(value.output, "sitemap.xml"), "utf8"),
+    [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+      "  <url><loc>https://usagemonitor.app/</loc></url>",
+      "  <url><loc>https://usagemonitor.app/docs</loc></url>",
+      "  <url><loc>https://usagemonitor.app/privacy</loc></url>",
+      "</urlset>",
+      "",
+    ].join("\n"),
+  );
   // The install call to action and the community view are present; the
   // companion-only dashboard surfaces are not.
   assert.match(html, /id="installer-link"/u);
@@ -736,8 +802,10 @@ test("checked-in public source satisfies the complete release contract", async (
   assert.match(html, /src="\.\/community\.js"/u);
   assert.match(
     html,
-    /id="community-title">What the Codex allowance is really worth<\/h2>/u,
+    /id="community-method-summary">See community activity details<\/summary>/u,
   );
+  assert.match(html, /id="installer-sha256-copy"/u);
+  assert.doesNotMatch(html, /The community signal|installer-verification/u);
   const publishedHtml = [html, docsHtml, privacyHtml].join("\n");
   for (
     const dashboardOnly of [
@@ -903,13 +971,21 @@ test("release-site build resolves alternate quoting in auxiliary page links", as
   );
   await writeFile(
     join(value.source, "docs.html"),
-    "<!doctype html><a href='./community.html#download'>Download</a>\n",
+    "<!doctype html><html><head></head><body><a href='./community.html#download'>Download</a></body></html>\n",
   );
 
   await buildFixtureSite(releaseArgs(value));
   const docsHtml = await readFile(join(value.output, "docs.html"), "utf8");
   assert.match(docsHtml, /href='\.\/index\.html#download'/u);
   assert.doesNotMatch(docsHtml, /community\.html/u);
+  assert.match(
+    docsHtml,
+    /<link rel="canonical" href="https:\/\/usagemonitor\.app\/docs">/u,
+  );
+  assert.match(
+    docsHtml,
+    /property="og:url" content="https:\/\/usagemonitor\.app\/docs"/u,
+  );
 });
 
 test("release-site build fails closed for unsafe or incomplete release metadata", async (t) => {
@@ -1031,7 +1107,7 @@ test("release-site build never replaces an existing output without explicit scop
     JSON.parse(
       await readFile(join(value.output, "release-site-manifest.json"), "utf8"),
     ).schemaVersion,
-    "usage-monitor-release-site-manifest-v0.2",
+    PUBLIC_RELEASE_MANIFEST_SCHEMA,
   );
 });
 

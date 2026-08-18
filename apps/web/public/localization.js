@@ -825,6 +825,10 @@ export const WEB_MESSAGES = Object.freeze({
   "aria.siteSections": ["Site sections", "网站分区", "Secciones del sitio"],
   "aria.releaseInformation": ["Release information", "发行信息", "Información de lanzamiento"],
   "aria.getTiboTattleForMac": ["Get TiboTattle for Mac", "获取适用于 Mac 的 TiboTattle", "Obtén TiboTattle para Mac"],
+  "aria.installWithHomebrew": ["Install with Homebrew", "使用 Homebrew 安装", "Instalar con Homebrew"],
+  "aria.copyHomebrewCommand": ["Copy Homebrew install command", "复制 Homebrew 安装命令", "Copiar el comando de instalación de Homebrew"],
+  "aria.copyInstallerSha256": ["Copy the published SHA-256 checksum", "复制已发布的 SHA-256 校验和", "Copiar la suma de comprobación SHA-256 publicada"],
+  "aria.installerSha256": ["SHA-256 checksum", "SHA-256 校验和", "Suma de comprobación SHA-256"],
   "aria.tibotattleFeatures": ["What TiboTattle provides", "TiboTattle 提供的功能", "Qué ofrece TiboTattle"],
   "aria.findTiboTattleOnline": ["Find TiboTattle online", "在线查找 TiboTattle", "Encuentra TiboTattle en línea"],
   "aria.githubExternal": ["GitHub (opens in a new tab)", "GitHub（在新标签页中打开）", "GitHub (se abre en una pestaña nueva)"],
@@ -1062,12 +1066,22 @@ export const WEB_MESSAGES = Object.freeze({
   "title.panUsageLater": ["Pan usage later", "向后平移使用情况", "Desplazar el uso hacia después"],
   "installer.version": ["Version {version}", "版本 {version}", "Versión {version}"],
   "installer.requiresMacOS": ["Requires macOS {version} or later · {architecture}", "需要 macOS {version} 或更高版本 · {architecture}", "Requiere macOS {version} o posterior · {architecture}"],
+  "installer.compatibilitySummary": ["macOS {version} or later · {architecture}", "macOS {version} 或更高版本 · {architecture}", "macOS {version} o posterior · {architecture}"],
   "installer.downloadKiB": ["{value} KiB download", "下载 {value} KiB", "Descarga de {value} KiB"],
   "installer.downloadMiB": ["{value} MiB download", "下载 {value} MiB", "Descarga de {value} MiB"],
   "installer.sha256": ["SHA-256 {value}", "SHA-256 {value}", "SHA-256 {value}"],
+  "installer.sha256.copy": ["Copy SHA-256", "复制 SHA-256", "Copiar SHA-256"],
+  "installer.sha256.copied": ["SHA-256 copied", "SHA-256 已复制", "SHA-256 copiado"],
+  "installer.sha256.copySuccess": ["SHA-256 checksum copied.", "SHA-256 校验和已复制。", "Se copió la suma de comprobación SHA-256."],
+  "installer.sha256.copyFailure": ["Automatic copy was blocked. Select the displayed SHA-256 checksum to copy it manually.", "自动复制被阻止。请选择显示的 SHA-256 校验和以手动复制。", "Se bloqueó la copia automática. Selecciona la suma de comprobación SHA-256 mostrada para copiarla manualmente."],
   "installer.appleSilicon": ["Apple silicon", "Apple 芯片", "Apple Silicon"],
   "installer.intel": ["Intel", "Intel", "Intel"],
   "installer.appleSiliconAndIntel": ["Apple silicon and Intel", "Apple 芯片和 Intel", "Apple Silicon e Intel"],
+  "installer.homebrew.copy": ["Copy", "复制", "Copiar"],
+  "installer.homebrew.copied": ["Copied", "已复制", "Copiado"],
+  "installer.homebrew.copyManually": ["Copy manually", "手动复制", "Copiar manualmente"],
+  "installer.homebrew.copySuccess": ["Homebrew install command copied.", "已复制 Homebrew 安装命令。", "Comando de instalación de Homebrew copiado."],
+  "installer.homebrew.copyFailure": ["Automatic copy was blocked. The command is selected; copy it manually.", "自动复制被阻止。命令已选中；请手动复制。", "La copia automática fue bloqueada. El comando está seleccionado; cópialo manualmente."],
   "community.daily.title": ["Community daily activity", "社区每日活动", "Actividad comunitaria diaria"],
   "community.reportedCause": ["Reported cause: {code}.", "报告原因：{code}。", "Causa informada: {code}."],
   "community.serviceReference": ["Service reference {reference}.", "服务参考：{reference}。", "Referencia del servicio {reference}."],
@@ -1098,6 +1112,9 @@ export const WEB_MESSAGES = Object.freeze({
   // participant counts are owner-approved for publication; the participant
   // count is part of the claim and always rendered as visible copy.
   "community.title": ["What the Codex allowance is really worth", "Codex 额度到底值多少", "Cuánto vale realmente la asignación de Codex"],
+  "community.hero.context": ["Community view", "社区视图", "Vista de la comunidad"],
+  "community.allowance.heading": ["Fitted seven-day allowance", "拟合的七天额度", "Asignación ajustada de siete días"],
+  "community.allowance.heroCopy": ["Fitted estimates, plausible ranges, and per-day evidence across contributing Codex Pro (20x) accounts, valued at API prices.", "基于贡献的 Codex Pro（20x）账户的拟合估计、合理范围和逐日证据，按 API 价格计值。", "Estimaciones ajustadas, rangos plausibles y evidencia diaria de las cuentas contribuyentes de Codex Pro (20x), valoradas a precios de API."],
   "community.allowance.state.serviceUnavailable": ["The community allowance series is temporarily unavailable. This does not tell us whether any estimate has been published.", "社区额度序列暂时不可用。这并不能说明是否已发布任何估计。", "La serie comunitaria de asignación no está disponible temporalmente. Esto no indica si se ha publicado alguna estimación."],
   "community.allowance.state.unsupportedSchema": ["The community allowance series cannot be displayed safely with this version of TiboTattle.", "此版本的 TiboTattle 无法安全显示社区额度序列。", "La serie comunitaria de asignación no se puede mostrar de forma segura con esta versión de TiboTattle."],
   "community.allowance.state.nonePublished": ["No community days have been published for the year window yet.", "此一年窗口内尚未发布任何社区日期。", "Todavía no se ha publicado ningún día comunitario para la ventana anual."],
@@ -1518,6 +1535,10 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Docs": ["文档", "Documentación"],
   "Release status": ["发布状态", "Estado de la versión"],
   "See where your Codex allowance stands.": ["查看你的 Codex 额度状况。", "Consulta el estado de tu límite de Codex."],
+  "What the Codex allowance is really worth.": ["Codex 额度到底值多少。", "Cuánto vale realmente la asignación de Codex."],
+  "TiboTattle turns your seven-day Codex allowance into an API-price-equivalent estimate, shows how it changes over time, and calculates your personal dashboard on your Mac.": ["TiboTattle 将你的七天 Codex 额度换算为 API 价格等价估计，展示它如何随时间变化，并在你的 Mac 上计算个人仪表板。", "TiboTattle convierte tu asignación de Codex de siete días en una estimación equivalente al precio de API, muestra cómo cambia con el tiempo y calcula tu panel personal en tu Mac."],
+  "Copy SHA-256": ["复制 SHA-256", "Copiar SHA-256"],
+  "Copy": ["复制", "Copiar"],
   "TiboTattle is a private Mac app that estimates how much of your seven-day Codex allowance remains and shows how your usage changes over time. Your personal dashboard is calculated on your Mac.": ["TiboTattle 是一款私密的 Mac 应用，可估算你的 Codex 七天额度还剩多少，并展示使用情况随时间的变化。你的个人仪表板会在 Mac 上计算。", "TiboTattle es una app privada para Mac que estima cuánto queda de tu límite de Codex de siete días y muestra cómo cambia tu uso con el tiempo. Tu panel personal se calcula en tu Mac."],
   "Public download coming soon.": ["公开下载即将推出。", "La descarga pública estará disponible pronto."],
   "Latest community evidence": ["最新社区证据", "Evidencia comunitaria más reciente"],
@@ -1529,7 +1550,9 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Review a content-free summary before any optional community contribution.": ["在选择向社区贡献之前，先查看不含内容的摘要。", "Revisa un resumen sin contenido antes de cualquier contribución opcional a la comunidad."],
   "When available, this leads with the fitted seven-day Codex allowance in API-price-equivalent dollars across every contributing account on the Codex Pro (20x) plan, from delayed, anonymous contributions. Other plan cohorts are never mixed into this series. The daily activity series sits below. A late contribution never edits history: it publishes a replacement revision for its day.": ["如有可用数据，这里会首先展示按 API 价格等价美元计算的、覆盖 Codex Pro（20x）方案所有贡献账户的拟合七天 Codex 额度，数据来自延迟的匿名贡献。其他方案群组绝不会混入此序列。每日活动序列位于下方。迟到的贡献绝不会改写历史：它会为该日发布替代修订。", "Cuando esté disponible, aquí se muestra primero la asignación de Codex de siete días ajustada, en dólares equivalentes al precio de API, sobre todas las cuentas contribuyentes del plan Codex Pro (20x), a partir de contribuciones anónimas y diferidas. Otras cohortes de plan nunca se mezclan en esta serie. La serie de actividad diaria está debajo. Una contribución tardía nunca edita la historia: publica una revisión de reemplazo para su día."],
   "What the Codex allowance is really worth": ["Codex 额度到底值多少", "Cuánto vale realmente la asignación de Codex"],
+  "Community view": ["社区视图", "Vista de la comunidad"],
   "Fitted seven-day allowance": ["拟合的七天额度", "Asignación de siete días ajustada"],
+  "Fitted estimates, plausible ranges, and per-day evidence across contributing Codex Pro (20x) accounts, valued at API prices.": ["基于贡献的 Codex Pro（20x）账户的拟合估计、合理范围和逐日证据，按 API 价格计值。", "Estimaciones ajustadas, rangos plausibles y evidencia diaria de las cuentas contribuyentes de Codex Pro (20x), valoradas a precios de API."],
   "Central fit, plausible range, and per-day estimates across contributing accounts on the Codex Pro (20x) plan, valued at API prices.": ["中心拟合、合理范围以及 Codex Pro（20x）方案贡献账户的每日估计，按 API 价格计值。", "Ajuste central, rango plausible y estimaciones por día sobre las cuentas contribuyentes del plan Codex Pro (20x), valoradas a precios de API."],
   "Checking allowance estimates": ["正在检查额度估计", "Comprobando las estimaciones de asignación"],
   "Checking for published allowance estimates…": ["正在检查已发布的额度估计…", "Comprobando las estimaciones de asignación publicadas…"],
@@ -2109,6 +2132,14 @@ export function createBrowserLocalization({
     return option.nativeLabel;
   }
 
+  function usesResolvedLanguagePickerValue(element) {
+    return element?.hasAttribute?.("data-language-picker-resolved") === true;
+  }
+
+  function languagePickerValue(element) {
+    return usesResolvedLanguagePickerValue(element) ? locale : preference;
+  }
+
   function bindLanguagePicker(element) {
     if (!element) return;
     const wasBound = element.dataset.tibotattleLanguagePicker === "true";
@@ -2120,25 +2151,29 @@ export function createBrowserLocalization({
     // itself follows the active UI language. Rebuild option text on every
     // locale refresh without registering a second change handler.
     element.replaceChildren();
-    for (const option of LANGUAGE_OPTIONS) {
+    const options = usesResolvedLanguagePickerValue(element)
+      ? LANGUAGE_OPTIONS.filter(({ id }) => id !== SYSTEM_LANGUAGE_PREFERENCE)
+      : LANGUAGE_OPTIONS;
+    for (const option of options) {
       const node = documentRef.createElement("option");
       node.value = option.id;
       node.textContent = languageOptionLabel(option);
       element.append(node);
     }
-    element.value = preference;
+    element.value = languagePickerValue(element);
   }
 
   function refreshLanguagePickers() {
     for (const element of documentRef?.querySelectorAll?.("[data-language-picker]") ?? []) {
       bindLanguagePicker(element);
-      element.value = preference;
+      element.value = languagePickerValue(element);
       element.setAttribute("aria-label", t("language.label"));
     }
   }
 
   function announceLanguageChange() {
-    const option = LANGUAGE_OPTIONS.find(({ id }) => id === preference);
+    const option = LANGUAGE_OPTIONS.find(({ id }) => id === locale)
+      ?? LANGUAGE_OPTIONS.find(({ id }) => id === preference);
     const language = option ? languageOptionLabel(option) : locale;
     const message = t("language.changed", { language });
     for (const element of documentRef?.querySelectorAll?.("[data-language-announcement]") ?? []) {

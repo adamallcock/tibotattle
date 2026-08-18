@@ -13,6 +13,11 @@ import {
 import { dirname, join, relative, resolve, sep } from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  PUBLIC_RELEASE_MANIFEST_SCHEMA,
+  PUBLIC_RELEASE_SOURCE_COMMIT_PATTERN,
+  verifyPublicReleaseSourceProvenance,
+} from "../../../scripts/public-release-provenance.js";
 
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 export const REPOSITORY_ROOT = resolve(SCRIPT_DIRECTORY, "../../..");
@@ -48,6 +53,7 @@ const PUBLIC_RELEASE_ASSET_BASENAMES = Object.freeze([
   "install-cta.js",
   "privacy.html",
   "robots.txt",
+  "sitemap.xml",
   "social-preview.png",
   "styles.css",
   "tibotattle-icon.png",
@@ -193,7 +199,7 @@ function safeManifestPath(path) {
     && !path.split("/").some((part) => part === "" || part === "." || part === "..");
 }
 
-async function verifiedGeneratedFiles(sourceDirectory) {
+async function verifiedGeneratedSite(sourceDirectory) {
   const manifestPath = join(sourceDirectory, RELEASE_MANIFEST_BASENAME);
   await regularFile(
     manifestPath,
@@ -205,7 +211,7 @@ async function verifiedGeneratedFiles(sourceDirectory) {
   } catch {
     throw new Error("Generated public release manifest is not valid JSON.");
   }
-  if (manifest?.schemaVersion !== "usage-monitor-release-site-manifest-v0.2"
+  if (manifest?.schemaVersion !== PUBLIC_RELEASE_MANIFEST_SCHEMA
       || !Array.isArray(manifest.files)) {
     throw new Error("Generated public release manifest has an unsupported shape.");
   }
@@ -273,13 +279,26 @@ async function verifiedGeneratedFiles(sourceDirectory) {
       }
     }
   }
-  return actualFiles;
+  return Object.freeze({ files: actualFiles, manifest });
 }
 
 export async function verifyGeneratedCommunityAssetTree(
   sourceDirectory = PRODUCTION_ASSET_SOURCE,
 ) {
-  return verifiedGeneratedFiles(resolve(sourceDirectory));
+  return (await verifiedGeneratedSite(resolve(sourceDirectory))).files;
+}
+
+function checkedOutSourceCommit(repositoryRoot, git) {
+  let value;
+  try {
+    value = git(repositoryRoot, ["rev-parse", "HEAD"]).trim();
+  } catch {
+    value = "";
+  }
+  if (!PUBLIC_RELEASE_SOURCE_COMMIT_PATTERN.test(value)) {
+    throw new Error("Production source revision is unavailable for public asset staging.");
+  }
+  return value;
 }
 
 async function replaceGeneratedDirectory(destination, temporaryDirectory) {
@@ -307,10 +326,21 @@ export async function stageProductionAssets({
   repositoryRoot = REPOSITORY_ROOT,
   sourceDirectory = PRODUCTION_ASSET_SOURCE,
   destinationDirectory = PRODUCTION_ASSET_DIRECTORY,
+  expectedSourceCommit = null,
   git = runGit,
 } = {}) {
   await requireCleanReleaseTree(repositoryRoot, git);
-  const sourceFiles = await verifiedGeneratedFiles(sourceDirectory);
+  const sourceCommit = checkedOutSourceCommit(repositoryRoot, git);
+  if (expectedSourceCommit !== null && expectedSourceCommit !== sourceCommit) {
+    throw new Error("Production source revision changed before public asset staging.");
+  }
+  const generated = await verifiedGeneratedSite(sourceDirectory);
+  await verifyPublicReleaseSourceProvenance({
+    repositoryRoot,
+    expectedSourceCommit: sourceCommit,
+    provenance: generated.manifest.source,
+  });
+  const sourceFiles = generated.files;
   const destinationParent = dirname(destinationDirectory);
   await mkdir(destinationParent, { recursive: true, mode: 0o755 });
   const temporaryDirectory = await mkdtemp(join(destinationParent, ".worker-assets-"));

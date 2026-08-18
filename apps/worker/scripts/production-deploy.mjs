@@ -879,6 +879,7 @@ async function runProductionDeploymentFromSnapshot({
         ".release-build",
         "worker-assets",
       ),
+      expectedSourceCommit: sourceCommit,
       git: snapshotGit,
     });
   } catch {
@@ -919,7 +920,17 @@ async function runProductionDeploymentFromSnapshot({
   try {
     deployment = spawn(
       wrangler,
-      ["deploy", "--env", "production", "--strict"],
+      [
+        "deploy",
+        "--env",
+        "production",
+        "--strict",
+        // This is deliberately non-secret provenance. It lets the canonical
+        // health endpoint identify the exact immutable snapshot that is live,
+        // which is required to form the base for the next web-only release.
+        "--var",
+        `DEPLOYMENT_SOURCE_COMMIT:${sourceCommit}`,
+      ],
       {
         cwd: workerDirectory,
         encoding: "utf8",

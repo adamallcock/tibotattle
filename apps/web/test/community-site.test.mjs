@@ -19,6 +19,12 @@ import {
   renderCommunityDailySeries,
 } from "../public/community-view.js";
 import {
+  HOMEBREW_INSTALL_COMMAND,
+  copyInstallerChecksum,
+  copyHomebrewInstallCommand,
+} from "../public/community.js";
+import {
+  compactMacOSVersion,
   configuredInstallerRelease,
   formatInstallerSize,
   renderInstallerJourney,
@@ -164,13 +170,21 @@ test("the public site presents only the install call to action and the community
   assert.match(html, /id="installer-link"/u);
   assert.match(html, /id="installer-unavailable-action"/u);
   assert.match(html, /id="installer-details"/u);
+  assert.match(
+    html,
+    /id="installer-sha256-copy"[\s\S]*?aria-describedby="installer-sha256-copy-status"/u,
+  );
+  assert.match(html, /id="installer-sha256"[\s\S]*?data-i18n-skip[\s\S]*?hidden/u);
+  assert.doesNotMatch(html, /installer-verification|role="tooltip"/u);
   assert.match(html, /id="installer-unavailable"/u);
+  assert.match(html, /id="homebrew-install"[^>]*hidden/u);
+  assert.match(html, /id="homebrew-copy-button"/u);
   assert.doesNotMatch(html, /open-installed-app|usage-monitor-semantic-open-target|usagemonitor:\/\//u);
   assert.match(html, /id="community-daily-result"/u);
   assert.match(html, /id="community-daily-state"/u);
-  assert.match(html, /id="community-daily-status"/u);
-  assert.match(html, /id="community-daily-panel-state"/u);
   assert.match(html, /id="community-daily-hero"/u);
+  assert.match(html, /id="community-method-summary">See community activity details<\/summary>/u);
+  assert.doesNotMatch(html, /community-daily-status|community-daily-panel-state/u);
 
   // The legacy sealed-snapshot presentation is retired: the page carries no
   // snapshot banner, no provenance expander, and no snapshot copy at all.
@@ -237,13 +251,14 @@ test("the public site presents only the install call to action and the community
   assert.match(html, /<a class="skip-link" href="#main">/u);
   assert.match(html, /<main id="main" tabindex="-1" data-i18n-legacy-root>/u);
   assert.match(html, /data-language-picker/u);
+  assert.match(html, /data-language-picker-resolved/u);
   assert.match(html, /data-language-announcement[^>]*aria-live="polite"/u);
   assert.match(
     html,
     /<nav\s+class="primary-nav"\s+aria-label="Site sections"(?:\s[^>]*)?>/u,
   );
   assert.match(html, /aria-labelledby="install-title"/u);
-  assert.match(html, /aria-labelledby="community-title"/u);
+  assert.match(html, /aria-labelledby="community-method-summary"/u);
   assert.match(
     await readFile(new URL("../public/styles.css", import.meta.url), "utf8"),
     /button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible, summary:focus-visible/u,
@@ -309,26 +324,32 @@ test("the public community client exposes only the read-only daily request", asy
 
 test("the first visit leads with the product, Mac download action, and daily community view", async () => {
   const html = await readFile(SITE_HTML, "utf8");
-  assert.match(html, /<h1 id="install-title">See where your Codex allowance stands\.<\/h1>/u);
-  assert.match(html, /private Mac app that estimates how much of your\s+seven-day Codex allowance remains/u);
-  assert.match(html, /Your personal dashboard is calculated on your Mac\./u);
+  assert.match(html, /<h1 id="install-title">What the Codex allowance is really worth\.<\/h1>/u);
+  assert.match(html, /turns your seven-day Codex allowance into an\s+API-price-equivalent estimate/u);
+  assert.match(html, /calculates your personal dashboard on your Mac\./u);
   assert.match(html, /Download for macOS/u);
+  assert.match(html, /Copy SHA-256/u);
   assert.match(
     html,
     /brew install --cask adamallcock\/tap\/tibotattle/u,
   );
   assert.match(html, /Latest community evidence/u);
-  assert.match(html, /What the Codex allowance is really worth/u);
+  assert.match(html, /See community activity details/u);
+  assert.doesNotMatch(html, /The community signal|Personal dashboards and contributions stay in the Mac app\./u);
+  assert.doesNotMatch(html, /community-estimate-summary|community-daily-panel-state|community-daily-status/u);
   assert.match(html, /Install the Mac app/u);
   assert.match(html, /See your week/u);
   assert.match(html, /Share only if you choose/u);
   assert.match(html, /<section class="product-hero"[^>]*id="install"/u);
   assert.match(html, /src="\.\/tibotattle-icon\.png"/u);
-  assert.match(html, /src="\.\/tibotattle-weekly-preview\.jpg"/u);
   assert.match(html, /src="\.\/apple\.svg"/u);
-  assert.match(html, /Demo data/u);
-  assert.match(html, /Example only — not your usage or a bill\./u);
-  assert.match(html, /Your dashboard is calculated privately on your Mac\./u);
+  assert.match(html, /<section class="community-window" aria-labelledby="community-allowance-heading">/u);
+  assert.match(html, /Community view/u);
+  assert.match(html, /id="community-allowance-figure"/u);
+  assert.doesNotMatch(
+    html,
+    /tibotattle-weekly-preview\.jpg|Demo data|Example only — not your usage or a bill\./u,
+  );
   assert.match(html, /href="https:\/\/github\.com\/adamallcock\/tibotattle"/u);
   assert.match(html, /href="https:\/\/x\.com\/adamallcock"/u);
   assert.match(html, /footer-social-label">X<\/span>/u);
@@ -344,13 +365,8 @@ test("the first visit leads with the product, Mac download action, and daily com
     "the primary installer action appears before the community activity section",
   );
   assert.ok(
-    html.indexOf("brew install --cask adamallcock/tap/tibotattle")
-      < html.indexOf('id="community"'),
-    "the Homebrew install command appears before the community activity section",
-  );
-  assert.ok(
-    html.indexOf('class="product-window"') < html.indexOf('id="how-it-works"'),
-    "the app preview appears before the supporting feature strip",
+    html.indexOf('id="community-allowance-figure"') < html.indexOf('id="how-it-works"'),
+    "the live community allowance appears before the supporting feature strip",
   );
   assert.doesNotMatch(
     html,
@@ -366,6 +382,56 @@ test("the first visit leads with the product, Mac download action, and daily com
   );
 });
 
+test("the Homebrew action copies only the fixed first-party tap command", async () => {
+  const writes = [];
+  assert.equal(
+    await copyHomebrewInstallCommand({
+      async writeText(value) {
+        writes.push(value);
+      },
+    }),
+    true,
+  );
+  assert.deepEqual(writes, [HOMEBREW_INSTALL_COMMAND]);
+  assert.equal(
+    HOMEBREW_INSTALL_COMMAND,
+    "brew install --cask adamallcock/tap/tibotattle",
+  );
+  assert.equal(await copyHomebrewInstallCommand(null), false);
+  assert.equal(
+    await copyHomebrewInstallCommand({
+      async writeText() {
+        throw new Error("clipboard blocked");
+      },
+    }),
+    false,
+  );
+});
+
+test("the installer checksum action copies only a complete SHA-256 digest", async () => {
+  const checksum = "a".repeat(64);
+  const writes = [];
+  assert.equal(
+    await copyInstallerChecksum(checksum, {
+      async writeText(value) {
+        writes.push(value);
+      },
+    }),
+    true,
+  );
+  assert.deepEqual(writes, [checksum]);
+  assert.equal(await copyInstallerChecksum("a".repeat(63), null), false);
+  assert.equal(await copyInstallerChecksum("A".repeat(64), null), false);
+  assert.equal(
+    await copyInstallerChecksum(checksum, {
+      async writeText() {
+        throw new Error("clipboard blocked");
+      },
+    }),
+    false,
+  );
+});
+
 test("the public hero keeps equal columns and a bounded stacked preview", async () => {
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
   assert.match(
@@ -375,10 +441,31 @@ test("the public hero keeps equal columns and a bounded stacked preview", async 
   assert.match(styles, /@media \(max-width: 1120px\)/u);
   assert.match(styles, /width: min\(100%, 620px\);/u);
   assert.match(styles, /justify-self: center;/u);
+  assert.match(
+    styles,
+    /\.community-site \.community-window-content \{\s*padding: 22px;/u,
+  );
   assert.doesNotMatch(styles, /font-size: clamp\(3\.15rem, 16vw, 5\.2rem\);/u);
 });
 
+test("the Homebrew command stays bounded and readable at narrow widths", async () => {
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  assert.match(
+    styles,
+    /\.community-site \.hero-copy \{[\s\S]*?min-width: 0;/u,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 420px\) \{[\s\S]*?\.community-site \.install-actions \{\s*flex-direction: column;/u,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 420px\) \{[\s\S]*?\.community-site \.homebrew-install code \{\s*overflow-x: visible;\s*white-space: normal;/u,
+  );
+});
+
 test("the public header and footer stay compact on narrow screens", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
   assert.match(
     styles,
@@ -386,7 +473,52 @@ test("the public header and footer stay compact on narrow screens", async () => 
   );
   assert.match(
     styles,
-    /@media \(max-width: 700px\) \{[\s\S]*?\.community-site \.topbar \{\s*min-height: 56px;/u,
+    /\.community-site \.primary-nav a \{[\s\S]*?width: auto;[\s\S]*?white-space: nowrap;/u,
+  );
+  assert.match(
+    styles,
+    /\.community-site \.primary-nav \{[\s\S]*?flex-wrap: nowrap;/u,
+  );
+  assert.match(
+    styles,
+    /\.community-site \.topbar \.primary-nav \{\s*justify-self: stretch;/u,
+  );
+  assert.match(
+    styles,
+    /\.community-site \.language-picker select \{[\s\S]*?min-width: 5\.2rem;[\s\S]*?background: rgba\(255, 253, 247, \.07\);/u,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 700px\) \{[\s\S]*?\.community-site \.topbar \{\s*min-height: 0;/u,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 700px\) \{[\s\S]*?\.community-site \.primary-nav \{\s*display: flex;/u,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 700px\) \{[\s\S]*?\.community-site \.brand \{\s*gap: \.45rem;[\s\S]*?\.community-site \.header-download \{\s*justify-content: center;\s*width: 36px;/u,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 700px\) \{[\s\S]*?\.community-site \.brand > span \{\s*min-width: 0;[\s\S]*?max-width: clamp\(4\.4rem, 15vw, 7\.2rem\);[\s\S]*?text-overflow: ellipsis;[\s\S]*?white-space: nowrap;/u,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 700px\) \{[\s\S]*?\.community-site \.header-download-label \{\s*position: absolute;/u,
+  );
+  assert.match(styles, /\.community-site \.brand \{\s*min-width: 0;/u);
+  assert.doesNotMatch(
+    styles,
+    /@media \(max-width: 700px\) \{[\s\S]*?\.community-site \.primary-nav \{\s*display: none;/u,
+  );
+  assert.doesNotMatch(styles, /grid-template-areas:|navigation navigation/u);
+  assert.ok(
+    html.indexOf('class="language-picker"')
+      < html.indexOf('class="brand"')
+      && html.indexOf('class="brand"') < html.indexOf('class="primary-nav"')
+      && html.indexOf('class="primary-nav"') < html.indexOf('class="header-download"'),
+    "the narrow header keeps language, brand, navigation, and download in one source order",
   );
   assert.match(
     styles,
@@ -395,6 +527,10 @@ test("the public header and footer stay compact on narrow screens", async () => 
   assert.doesNotMatch(
     styles,
     /@media \(max-width: 420px\) \{[\s\S]*?\.community-site footer \{[\s\S]*?flex-direction: column;/u,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 420px\) \{[\s\S]*?\.community-site \.topbar \{\s*column-gap: 3px;\s*padding-inline: 8px;[\s\S]*?\.community-site \.brand-icon \{\s*width: 26px;/u,
   );
 });
 
@@ -405,11 +541,15 @@ test("unavailable community activity uses the compact public state", async () =>
   assert.match(html, /data-community-state="checking"/u);
   assert.match(
     html,
-    /<h2 id="community-title">What the Codex allowance is really worth<\/h2>/u,
+    /class="community-proof community-proof-compact"[\s\S]*?aria-labelledby="community-method-summary"/u,
   );
   assert.match(
     html,
-    /When available, this leads with the fitted seven-day Codex allowance in API-price-equivalent dollars across every contributing account on the Codex Pro \(20x\) plan, from delayed, anonymous contributions\. Other plan cohorts are never mixed into this series\./u,
+    /<summary id="community-method-summary">See community activity details<\/summary>/u,
+  );
+  assert.doesNotMatch(
+    html,
+    /community-proof-heading|The community signal|The community view pools delayed, anonymous contributions|Personal dashboards and contributions stay in the Mac app\./u,
   );
   assert.doesNotMatch(
     html,
@@ -420,14 +560,8 @@ test("unavailable community activity uses the compact public state", async () =>
     /renderCommunityEstimate|estimateContainer|estimateHero|estimateStates|id="community-estimate/u,
   );
   assert.match(source, /\.dataset\.communityState = state;/u);
-  assert.match(styles, /\[data-community-state="service_unavailable"\]/u);
-  assert.match(styles, /\[data-community-state="none_published"\]/u);
-  assert.doesNotMatch(styles, /\[data-community-state="not_yet_published"\]/u);
-  assert.doesNotMatch(styles, /\[data-community-state="withdrawn"\]/u);
-  assert.match(
-    styles,
-    /@media \(max-width: 1120px\) \{[\s\S]*?\.community-site \.community-proof\[data-community-state\] \.community-proof-heading \{\s*grid-template-columns: 1fr;/u,
-  );
+  assert.match(styles, /\.community-site \.community-proof-compact \{\s*padding: clamp\(24px, 3vw, 36px\) 0 0;/u);
+  assert.doesNotMatch(styles, /installer-verification|text-decoration-style:\s*wavy/u);
 });
 
 test("the public guidance pages are useful stubs without app-only controls", async () => {
@@ -519,12 +653,11 @@ test("the retained weekly snapshot normalizer still guards the app's closed cont
   assert.equal(published.cells[0].metrics.usageEvents.value, 30);
 });
 
-// Re-pinned 2026-08-10 (owner-directed): the community section now leads with
-// THE product insight — the fitted seven-day allowance across all
-// contributing accounts. The earlier "no community estimate surface" guard is
-// replaced by honest-labeling guards: the surface must exist, sit above the
-// daily activity block, carry real time controls, and keep hedge copy out.
-test("the community allowance surface leads the section with honest labeling", async () => {
+// The real community allowance is the hero visual. It must remain a live,
+// honestly-labelled aggregate rather than turning back into a static dashboard
+// mockup, while the compact daily-activity disclosure stays immediately above
+// the supporting feature strip.
+test("the community allowance surface leads the product hero with honest labeling", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   const source = await readFile(SITE_SOURCE, "utf8");
 
@@ -532,15 +665,18 @@ test("the community allowance surface leads the section with honest labeling", a
   assert.match(html, /id="community-allowance-result"/u);
   assert.match(html, /id="community-allowance-state"/u);
   assert.match(html, /id="community-allowance-range-controls"/u);
-  // The allowance figure is the first block inside the community section,
-  // above the daily-activity disclosure.
+  // The allowance figure occupies the hero. The compact daily-activity
+  // disclosure follows it, before the supporting feature strip.
+  const heroIndex = html.indexOf('class="product-hero"');
+  const featureIndex = html.indexOf('id="how-it-works"');
   const communityIndex = html.indexOf('id="community"');
   const allowanceIndex = html.indexOf('id="community-allowance-figure"');
   const dailyIndex = html.indexOf('class="community-method"');
-  assert.ok(communityIndex >= 0 && allowanceIndex > communityIndex);
+  assert.ok(heroIndex >= 0 && allowanceIndex > heroIndex);
+  assert.ok(allowanceIndex < featureIndex);
   assert.ok(
-    allowanceIndex < dailyIndex,
-    "the allowance figure renders above the daily activity block",
+    allowanceIndex < communityIndex && communityIndex < dailyIndex && dailyIndex < featureIndex,
+    "the daily-activity disclosure renders above the supporting feature strip",
   );
   // Segmented time controls follow the app's established range pattern.
   for (const control of [
@@ -555,7 +691,11 @@ test("the community allowance surface leads the section with honest labeling", a
   assert.match(source, /community-allowance-range-controls/u);
 
   const publicCopy = `${html}\n${source}`;
-  assert.match(publicCopy, /delayed, anonymous contributions/u);
+  assert.doesNotMatch(
+    publicCopy,
+    /The community signal|The community view pools delayed, anonymous contributions|Personal dashboards and contributions stay in the Mac app\./u,
+  );
+  assert.doesNotMatch(publicCopy, /Demo data|Example only — not your usage or a bill\./u);
   assert.doesNotMatch(
     publicCopy,
     /best guess|privacy[- ]reviewed|privacy and quality checks/u,
@@ -748,6 +888,8 @@ test("a published daily series renders revision freshness, latest-first", () => 
   assert.equal(state, "published");
   assert.equal(stateNode.textContent, "Daily series available");
   assert.match(container.text, /Latest published day/u);
+  assert.match(container.text, /Aug 7, 2026/u);
+  assert.doesNotMatch(container.text, /Aug 6, 2026/u);
   assert.match(container.text, /r2/u);
   assert.match(container.text, /Revision age/u);
   assert.match(container.text, /Published days in window/u);
@@ -1199,6 +1341,8 @@ test("the allowance section renders the estimate with its visible caveat", () =>
   // contributing, the page says so plainly.
   assert.match(container.text, /from 1 contributing account\b/u);
   assert.match(container.text, /5 qualifying reset fits in the trailing 30 days/u);
+  assert.match(container.text, /Latest published estimate \(Aug 7, 2026\)/u);
+  assert.doesNotMatch(container.text, /Latest published estimate \(Aug 6, 2026\)/u);
   // The methodology note names the shared gates and the absent span floor.
   assert.match(container.text, /no display-side span floor/u);
   // Chart present with band, line, and fit dots; sparse two-point series
@@ -1321,6 +1465,9 @@ test("the install card refuses a partially injected release", () => {
   const release = configuredInstallerRelease(ready);
   assert.equal(release.version, "1.2.3");
   assert.equal(formatInstallerSize(12_582_912), "12 MiB download");
+  assert.equal(compactMacOSVersion("14.0"), "14");
+  assert.equal(compactMacOSVersion("14.0.0"), "14");
+  assert.equal(compactMacOSVersion("14.1"), "14.1");
   assert.equal(renderInstallerJourney(ready)?.version, "1.2.3");
   assert.equal(ready.byId.get("installer-link").hidden, false);
   assert.equal(ready.byId.get("installer-unavailable-action").hidden, true);
@@ -1333,6 +1480,29 @@ test("the install card refuses a partially injected release", () => {
     ready.byId.get("installer-compatibility").textContent,
     /Requires macOS 13\.0 or later · Apple silicon/u,
   );
+
+  const compact = fakeDocument(complete);
+  assert.equal(
+    renderInstallerJourney(compact, {
+      compactDetails: true,
+      showReleaseLinks: false,
+    })?.version,
+    "1.2.3",
+  );
+  assert.equal(
+    compact.byId.get("installer-compatibility").textContent,
+    "macOS 13 or later · Apple silicon",
+  );
+  assert.equal(compact.byId.get("installer-links").hidden, true);
+  for (const id of [
+    "release-notes-link",
+    "privacy-link",
+    "security-link",
+    "support-link",
+  ]) {
+    assert.equal(compact.byId.get(id).hidden, true, id);
+    assert.equal(Object.hasOwn(compact.byId.get(id), "href"), false, id);
+  }
 
   for (
     const [name, hostile] of [

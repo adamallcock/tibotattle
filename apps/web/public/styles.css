@@ -2179,29 +2179,6 @@ footer p { margin: 0; }
 @media (max-width: 760px) {
   main, footer { width: min(100% - 28px, 1240px); }
   .topbar { padding-inline: 14px; }
-  /* Keep the public header's localized controls reachable on a second row. */
-  .community-site .topbar {
-    grid-template-areas:
-      "brand language download"
-      "navigation navigation navigation";
-    grid-template-columns: minmax(0, 1fr) auto auto;
-    row-gap: .2rem;
-    min-height: 0;
-    padding-block: .45rem;
-  }
-  .community-site .topbar .brand { grid-area: brand; min-width: 0; }
-  .community-site .topbar .primary-nav {
-    grid-area: navigation;
-    justify-self: stretch;
-    min-width: 0;
-  }
-  .community-site .topbar .language-picker {
-    grid-area: language;
-    justify-self: end;
-  }
-  .community-site .topbar .header-download {
-    grid-area: download;
-  }
   .state-pill { max-width: 118px; overflow: hidden; white-space: nowrap; }
   /* The detailed in-page history badge shares this class and is defined later
      in the sheet. Scope the narrow-screen override to the toolbar so that
@@ -2308,37 +2285,57 @@ footer p { margin: 0; }
   background: var(--site-paper);
 }
 .community-site .topbar {
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
   min-height: 64px;
+  column-gap: 10px;
   padding-inline: max(24px, calc((100vw - 1180px) / 2));
   border-color: rgba(255, 253, 247, .14);
   background: rgba(8, 47, 42, .92);
   backdrop-filter: blur(18px);
 }
 .community-site .brand {
-  gap: .72rem;
+  min-width: 0;
+  gap: .68rem;
   color: var(--site-paper);
-  font-size: .94rem;
+  font-size: 1rem;
   letter-spacing: -.02em;
 }
+.community-site .brand > span {
+  font-size: 1.18rem;
+  line-height: 1;
+}
 .community-site .brand-icon {
-  width: 36px;
-  height: 36px;
+  width: 40px;
+  height: 40px;
   border-radius: var(--radius-sm);
   box-shadow: 0 8px 22px rgba(0, 0, 0, .2);
 }
 .community-site .primary-nav {
   display: flex;
-  justify-self: end;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  justify-self: stretch;
   justify-content: flex-end;
+  flex-wrap: nowrap;
   gap: 4px;
-  margin-inline-end: 12px;
+  margin-inline: 0;
+  scrollbar-width: none;
+}
+.community-site .topbar .primary-nav {
+  justify-self: stretch;
+}
+.community-site .primary-nav::-webkit-scrollbar {
+  display: none;
 }
 .community-site .primary-nav a {
+  width: auto;
+  min-height: 40px;
   padding: .45rem .68rem;
   color: rgba(255, 253, 247, .7);
   font-size: .72rem;
   letter-spacing: .01em;
+  white-space: nowrap;
 }
 .community-site .primary-nav a:hover,
 .community-site .primary-nav a:focus-visible {
@@ -2350,33 +2347,46 @@ footer p { margin: 0; }
   align-items: center;
   gap: .42rem;
   justify-self: end;
-  min-height: 34px;
-  padding: .45rem .82rem;
-  border-radius: var(--radius-sm);
+  min-height: 38px;
+  padding: .48rem .9rem;
+  border: 1px solid rgba(255, 253, 247, .34);
+  border-radius: var(--radius-pill);
   color: var(--site-green-deep);
   background: var(--site-paper);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .95), 0 5px 14px rgba(0, 0, 0, .12);
   font-size: .72rem;
   font-weight: var(--weight-bold);
   text-decoration: none;
+  transition: transform .12s ease, box-shadow .12s ease, background-color .12s ease;
+}
+.community-site .header-download:hover {
+  color: var(--site-green-deep);
+  background: #ffffff;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 1), 0 9px 19px rgba(0, 0, 0, .18);
+  transform: translateY(-1px);
 }
 .community-site .language-picker {
-  justify-self: end;
+  justify-self: start;
 }
 .community-site .language-picker select {
   min-height: 34px;
-  max-width: 8rem;
-  padding-block: .34rem;
-  color: var(--site-green-deep);
-  background: var(--site-paper);
-  border-color: rgba(255, 253, 247, .34);
-  font-size: .68rem;
+  min-width: 5.2rem;
+  max-width: 6.5rem;
+  padding: .32rem 1.3rem .32rem .55rem;
+  border-color: rgba(255, 253, 247, .2);
+  border-radius: var(--radius-sm);
+  color: rgba(255, 253, 247, .78);
+  background: rgba(255, 253, 247, .07);
+  box-shadow: none;
+  font-size: .65rem;
+  font-weight: var(--weight-semibold);
 }
 @media (max-width: 760px) {
   .community-site .topbar {
-    grid-template-areas:
-      "brand language download"
-      "navigation navigation navigation";
-    grid-template-columns: minmax(0, 1fr) auto auto;
+    grid-template-columns: auto auto minmax(0, 1fr) auto;
+    min-height: 0;
+    column-gap: 8px;
+    padding-block: .45rem;
   }
 }
 .community-site main {
@@ -2403,6 +2413,7 @@ footer p { margin: 0; }
 .community-site .hero-copy {
   position: relative;
   z-index: 1;
+  min-width: 0;
 }
 .community-site .product-hero h1 {
   max-width: 690px;
@@ -2422,38 +2433,112 @@ footer p { margin: 0; }
 .community-site .install-cluster {
   display: grid;
   gap: 10px;
+  min-width: 0;
   margin-top: 30px;
 }
 .community-site .install-actions {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
+  min-width: 0;
   gap: 12px 18px;
 }
 .community-site .mac-download-button {
   gap: .65rem;
   min-height: 54px;
-  padding: .8rem 1.15rem;
-  border-radius: var(--radius-md);
+  padding: .8rem 1.3rem .8rem 1.05rem;
+  border: 1px solid rgba(255, 253, 247, .56);
+  border-radius: var(--radius-pill);
   color: var(--site-green-deep);
   background: var(--site-paper);
-  box-shadow: 0 14px 30px rgba(0, 0, 0, .2);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .96), 0 14px 30px rgba(0, 0, 0, .2);
   font-size: .84rem;
   text-decoration: none;
 }
 .community-site .mac-download-button:hover:not(:disabled) {
   color: var(--site-green-deep);
-  box-shadow: 0 18px 34px rgba(0, 0, 0, .25);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 1), 0 19px 36px rgba(0, 0, 0, .27);
 }
 .community-site .mac-download-button:disabled {
-  border: 0;
+  border-color: rgba(255, 253, 247, .24);
   opacity: .78;
   cursor: default;
+}
+.community-site .homebrew-install {
+  display: flex;
+  flex: 1 1 330px;
+  align-items: stretch;
+  min-width: 0;
+  max-width: 420px;
+  min-height: 54px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 253, 247, .2);
+  border-radius: var(--radius-md);
+  color: var(--site-paper);
+  background: rgba(0, 0, 0, .18);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .04);
+}
+.community-site .homebrew-prompt {
+  align-self: center;
+  padding-inline-start: .82rem;
+  color: rgba(255, 253, 247, .48);
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: .69rem;
+}
+.community-site .homebrew-install code {
+  align-self: center;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: .75rem .62rem;
+  overflow-x: auto;
+  color: rgba(255, 253, 247, .88);
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: .64rem;
+  line-height: 1.35;
+  scrollbar-width: none;
+  white-space: nowrap;
+}
+.community-site .homebrew-install code::-webkit-scrollbar {
+  display: none;
+}
+.community-site .homebrew-copy-button {
+  appearance: none;
+  flex: 0 0 auto;
+  min-width: var(--hit-target);
+  padding: .65rem .72rem;
+  border: 0;
+  border-inline-start: 1px solid rgba(255, 253, 247, .14);
+  color: rgba(255, 253, 247, .72);
+  background: rgba(255, 255, 255, .06);
+  font-size: .61rem;
+  font-weight: var(--weight-bold);
+  cursor: pointer;
+}
+.community-site .homebrew-copy-button:hover:not(:disabled) {
+  color: var(--site-paper);
+  background: rgba(255, 255, 255, .12);
+}
+.community-site .homebrew-copy-button[data-copy-state="copied"] {
+  color: var(--site-green-deep);
+  background: var(--site-green-bright);
+}
+.community-site .homebrew-copy-button:disabled {
+  cursor: wait;
+  opacity: .72;
+}
+.community-site .product-hero a:focus-visible,
+.community-site .homebrew-copy-button:focus-visible {
+  outline-color: var(--site-green-bright);
 }
 .community-site .download-platform-icon {
   width: 22px;
   height: 22px;
   flex: 0 0 auto;
+}
+@media (min-width: 1121px) {
+  .community-site .install-actions {
+    width: calc(100% + 44px);
+  }
 }
 .community-site .installer-unavailable {
   flex-basis: 100%;
@@ -2478,44 +2563,67 @@ footer p { margin: 0; }
   opacity: .48;
   cursor: not-allowed;
 }
-.community-site .installer-details {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  max-width: 590px;
-  gap: 3px 14px;
-  margin-top: 2px;
+.community-site .installer-details-compact {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  max-width: 620px;
+  margin-top: 0;
   color: rgba(255, 253, 247, .56);
   font-size: .67rem;
 }
-.community-site .installer-links {
-  margin-top: 0;
-  font-size: .69rem;
+.community-site .installer-summary {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
 }
-.community-site .installer-links a {
-  color: rgba(255, 253, 247, .78);
+.community-site .installer-summary-divider {
+  color: rgba(255, 253, 247, .34);
 }
-.community-site .homebrew-install {
-  display: grid;
-  gap: 5px;
-  justify-items: start;
-  margin-top: 4px;
-}
-.community-site .homebrew-install p {
-  margin: 0;
-  color: rgba(255, 253, 247, .66);
-  font-size: .69rem;
-}
-.community-site .homebrew-install code {
-  box-sizing: border-box;
-  max-width: 100%;
-  padding: .62rem .76rem;
-  overflow-wrap: anywhere;
+.community-site .installer-checksum-copy {
+  display: inline-flex;
+  align-items: center;
+  min-height: 27px;
+  padding: .2rem .45rem;
   border: 1px solid rgba(255, 253, 247, .2);
-  border-radius: var(--radius-sm);
+  border-radius: 5px;
+  color: rgba(255, 253, 247, .72);
+  background: rgba(255, 253, 247, .04);
+  cursor: pointer;
+  font: inherit;
+  font-size: .62rem;
+  font-weight: var(--weight-semibold);
+  line-height: 1;
+  transition: background-color .12s ease, border-color .12s ease, color .12s ease;
+}
+.community-site .installer-checksum-copy:hover:not(:disabled) {
+  border-color: rgba(101, 195, 170, .62);
   color: var(--site-paper);
-  background: rgba(0, 0, 0, .18);
-  font-size: .72rem;
-  user-select: all;
-  white-space: normal;
+  background: rgba(101, 195, 170, .12);
+}
+.community-site .installer-checksum-copy[data-copy-state="copied"] {
+  border-color: rgba(101, 195, 170, .72);
+  color: var(--site-green-bright);
+}
+.community-site .installer-checksum-copy:disabled {
+  cursor: wait;
+  opacity: .72;
+}
+.community-site .installer-checksum-copy:focus-visible {
+  outline: 2px solid var(--site-green-bright);
+  outline-offset: 3px;
+}
+.community-site .installer-checksum-fallback {
+  flex-basis: 100%;
+  max-width: min(100%, 42rem);
+  margin-top: 2px;
+  color: rgba(255, 253, 247, .72);
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: .62rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 .community-site #open-installed-app-status {
   margin: 0;
@@ -2577,7 +2685,7 @@ footer p { margin: 0; }
     box-shadow: 0 0 0 5px rgba(74, 222, 128, .25);
   }
 }
-.community-site .product-window {
+.community-site .community-window {
   position: relative;
   width: min(100%, 670px);
   margin: 0;
@@ -2589,7 +2697,7 @@ footer p { margin: 0; }
   box-shadow: 0 38px 80px rgba(0, 0, 0, .32);
   transform: rotate(.35deg);
 }
-.community-site .product-window::before {
+.community-site .community-window::before {
   position: absolute;
   z-index: -1;
   inset: 12% -12% -18% 14%;
@@ -2598,7 +2706,7 @@ footer p { margin: 0; }
   filter: blur(45px);
   content: "";
 }
-.community-site .product-window-bar {
+.community-site .community-window-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -2607,105 +2715,75 @@ footer p { margin: 0; }
   border-bottom: 1px solid var(--line);
   background: #f0ebdf;
 }
-.community-site .preview-brand {
+.community-site .community-window-brand {
   display: inline-flex;
   align-items: center;
   gap: 8px;
   font-size: .72rem;
 }
-.community-site .preview-brand img {
+.community-site .community-window-brand img {
   border-radius: var(--radius-sm);
 }
-.community-site .preview-demo {
+.community-site .community-window-context {
   padding: .28rem .48rem;
-  border: 1px solid rgba(49, 95, 132, .16);
+  border: 1px solid rgba(23, 79, 69, .16);
   border-radius: var(--radius-pill);
-  color: var(--blue);
-  background: var(--blue-soft);
+  color: var(--site-green);
+  background: rgba(101, 195, 170, .12);
   font-size: .55rem;
   font-weight: var(--weight-bold);
   letter-spacing: .05em;
   text-transform: uppercase;
 }
-.community-site .product-window-content {
-  padding: clamp(21px, 3.2vw, 34px);
+.community-site .community-window-content {
+  padding: 22px;
 }
-.community-site .preview-label {
-  margin: 0 0 6px;
-  color: var(--muted);
-  font-size: .66rem;
+.community-site .hero-community-allowance .activity-heading {
+  padding-top: 0;
+  border-top: 0;
+}
+.community-site .community-window .activity-heading {
+  gap: 18px;
+}
+.community-site .community-window .activity-heading h2 {
+  margin: 0 0 5px;
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: .68rem;
   font-weight: var(--weight-bold);
   letter-spacing: .08em;
+  line-height: 1.25;
   text-transform: uppercase;
 }
-.community-site .preview-value {
-  display: flex;
-  gap: 17px;
-  align-items: center;
-}
-.community-site .preview-value strong {
-  font-family: var(--serif);
-  font-size: clamp(3.2rem, 6vw, 5rem);
-  font-weight: var(--weight-display);
-  letter-spacing: -.06em;
-  line-height: .9;
-}
-.community-site .preview-value span {
-  max-width: 11rem;
+.community-site .community-window .activity-heading p {
+  max-width: 46ch;
   color: var(--muted);
   font-size: .69rem;
-  font-weight: var(--weight-semibold);
-  line-height: 1.35;
+  line-height: 1.45;
 }
-.community-site .preview-qualification {
-  margin: 8px 0 17px;
-  color: var(--blue);
-  font-size: .63rem;
-  font-weight: var(--weight-semibold);
+.community-site .community-window .allowance-controls {
+  gap: 8px;
 }
-.community-site .preview-stats {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 9px;
-  margin: 0 0 14px;
+.community-site .community-window .allowance-controls .evidence-chip {
+  font-size: .52rem;
 }
-.community-site .preview-stats > div {
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-xs);
-  background: #faf7ef;
+.community-site .community-window .result-summary {
+  margin-top: 18px;
 }
-.community-site .preview-stats dt {
-  color: var(--muted);
-  font-size: .56rem;
-  font-weight: var(--weight-semibold);
-  letter-spacing: .05em;
-  text-transform: uppercase;
+.community-site .community-window .allowance-headline-value strong {
+  font-size: clamp(2.65rem, 5.5vw, 4.35rem);
 }
-.community-site .preview-stats dd {
-  margin: 3px 0 0;
-  font-family: var(--serif);
-  font-size: 1.35rem;
-  font-weight: var(--weight-display);
-}
-.community-site .preview-chart {
-  display: block;
-  width: 100%;
-  height: auto;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-}
-.community-site .product-window figcaption {
-  padding: 0 34px 20px;
-  color: var(--muted);
-  font-size: .61rem;
+.community-site .community-window .snapshot-disclosure {
+  margin: 12px 0 0;
+  font-size: .65rem;
+  line-height: 1.45;
 }
 .community-site .feature-strip {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   width: min(1180px, calc(100% - 48px));
   margin-inline: auto;
-  padding: clamp(58px, 8vw, 88px) 0;
+  padding: clamp(38px, 5vw, 58px) 0;
   border-bottom: 1px solid var(--line);
 }
 .community-site .feature-strip article {
@@ -2725,7 +2803,7 @@ footer p { margin: 0; }
   place-items: center;
   width: 28px;
   height: 28px;
-  margin-bottom: 16px;
+  margin-bottom: 11px;
   border: 1px solid rgba(23, 79, 69, .18);
   border-radius: var(--radius-pill);
   color: var(--site-green);
@@ -2734,7 +2812,7 @@ footer p { margin: 0; }
   font-weight: var(--weight-bold);
 }
 .community-site .feature-strip h2 {
-  margin: 0 0 10px;
+  margin: 0 0 7px;
   font-family: var(--serif);
   font-size: clamp(1.6rem, 2.3vw, 2.2rem);
   font-weight: var(--weight-display);
@@ -2751,49 +2829,12 @@ footer p { margin: 0; }
 .community-site .community-proof {
   width: min(1180px, calc(100% - 48px));
   margin: 0 auto;
-  padding: clamp(62px, 8vw, 96px) 0;
 }
-.community-site .community-proof-heading {
-  display: grid;
-  grid-template-columns: minmax(0, 1.05fr) minmax(340px, .95fr);
-  gap: 52px;
-  align-items: center;
-}
-.community-site .community-proof h2 {
-  max-width: 720px;
-  margin: 0 0 14px;
-  font-family: var(--serif);
-  font-size: clamp(2.6rem, 4.6vw, 4.5rem);
-  font-weight: var(--weight-regular);
-  letter-spacing: -.055em;
-  line-height: .94;
-  text-wrap: balance;
-}
-.community-site .community-proof-heading > div > p {
-  max-width: 60ch;
-  margin: 0;
-  color: var(--muted);
-  font-size: .81rem;
-}
-.community-site .community-estimate-summary {
-  display: grid;
-  gap: 14px;
-  padding: 24px;
-  border: 1px solid rgba(23, 79, 69, .18);
-  border-radius: var(--radius-md);
-  background: rgba(255, 253, 247, .74);
-}
-.community-site .community-estimate-summary .evidence-chip {
-  margin: 0;
-}
-.community-site .community-estimate-summary p {
-  margin: 0;
-  color: var(--ink);
-  font-size: .8rem;
-  line-height: 1.6;
+.community-site .community-proof-compact {
+  padding: clamp(24px, 3vw, 36px) 0 0;
 }
 .community-site .community-method {
-  margin-top: 28px;
+  margin: 0;
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
   background: rgba(255, 253, 247, .54);
@@ -2822,49 +2863,6 @@ footer p { margin: 0; }
 }
 .community-site .community-method-body {
   padding: 2px 18px 20px;
-}
-.community-site .community-proof:is(
-  [data-community-state="checking"],
-  [data-community-state="service_unavailable"],
-  [data-community-state="unsupported_schema"],
-  [data-community-state="none_published"]
-) {
-  padding: clamp(44px, 6vw, 68px) 0;
-}
-.community-site .community-proof:is(
-  [data-community-state="checking"],
-  [data-community-state="service_unavailable"],
-  [data-community-state="unsupported_schema"],
-  [data-community-state="none_published"]
-) .community-proof-heading {
-  grid-template-columns: minmax(0, 1.1fr) minmax(320px, .9fr);
-  gap: 36px;
-}
-.community-site .community-proof:is(
-  [data-community-state="checking"],
-  [data-community-state="service_unavailable"],
-  [data-community-state="unsupported_schema"],
-  [data-community-state="none_published"]
-) h2 {
-  max-width: 620px;
-  font-size: clamp(2.35rem, 3.7vw, 3.6rem);
-}
-.community-site .community-proof:is(
-  [data-community-state="checking"],
-  [data-community-state="service_unavailable"],
-  [data-community-state="unsupported_schema"],
-  [data-community-state="none_published"]
-) .community-estimate-summary {
-  gap: 10px;
-  padding: 18px;
-}
-.community-site .community-proof:is(
-  [data-community-state="checking"],
-  [data-community-state="service_unavailable"],
-  [data-community-state="unsupported_schema"],
-  [data-community-state="none_published"]
-) .community-method {
-  margin-top: 18px;
 }
 .community-site .activity-heading {
   display: flex;
@@ -2962,7 +2960,7 @@ footer p { margin: 0; }
  * the blue activity series below it.
  */
 .community-site .community-allowance {
-  margin-top: 28px;
+  margin: 0;
 }
 .community-site .allowance-controls {
   display: flex;
@@ -3292,15 +3290,10 @@ footer p { margin: 0; }
   .community-site .hero-copy {
     width: min(100%, 760px);
   }
-  .community-site .product-window {
+  .community-site .community-window {
     width: min(100%, 620px);
     justify-self: center;
     transform: none;
-  }
-  .community-site .community-proof-heading,
-  .community-site .community-proof[data-community-state] .community-proof-heading {
-    grid-template-columns: 1fr;
-    gap: 30px;
   }
   .community-site .snapshot-quality-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3309,12 +3302,22 @@ footer p { margin: 0; }
 
 @media (max-width: 700px) {
   .community-site .topbar {
-    min-height: 56px;
+    min-height: 0;
     padding-inline: 14px;
-    grid-template-columns: minmax(0, 1fr) auto auto;
+    grid-template-columns: auto auto minmax(0, 1fr) auto;
+    column-gap: 7px;
   }
   .community-site .brand {
+    gap: .45rem;
     font-size: .82rem;
+  }
+  .community-site .brand > span {
+    min-width: 0;
+    max-width: clamp(4.4rem, 15vw, 7.2rem);
+    overflow: hidden;
+    font-size: clamp(.78rem, 2.1vw, .95rem);
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .community-site .brand-icon {
     width: 32px;
@@ -3322,14 +3325,40 @@ footer p { margin: 0; }
     border-radius: var(--radius-sm);
   }
   .community-site .primary-nav {
+    display: flex;
+    justify-content: flex-start;
+    gap: 2px;
+    margin-inline-end: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+  }
+  .community-site .primary-nav::-webkit-scrollbar {
     display: none;
   }
+  .community-site .primary-nav a {
+    min-height: 34px;
+    padding-inline: .48rem;
+    font-size: .67rem;
+  }
   .community-site .header-download {
-    min-height: 32px;
-    padding-inline: .65rem;
+    justify-content: center;
+    width: 36px;
+    min-height: 36px;
+    padding-inline: 0;
+  }
+  .community-site .header-download-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
   }
   .community-site .language-picker select {
-    max-width: 6.6rem;
+    min-width: 4.75rem;
+    max-width: 5.6rem;
   }
   .community-site .product-hero {
     gap: 32px;
@@ -3345,6 +3374,10 @@ footer p { margin: 0; }
   .community-site .install-cluster {
     margin-top: 24px;
   }
+  .community-site .homebrew-install {
+    flex-basis: 100%;
+    max-width: 100%;
+  }
   .community-site .community-inline {
     grid-template-columns: auto minmax(0, 1fr);
     row-gap: 2px;
@@ -3355,19 +3388,16 @@ footer p { margin: 0; }
     grid-column: 2;
     white-space: normal;
   }
-  .community-site .preview-value strong {
-    font-size: clamp(2.8rem, 14vw, 4.2rem);
-  }
-  .community-site .product-window-content {
+  .community-site .community-window-content {
     padding: 20px;
   }
-  .community-site .product-window figcaption {
-    padding: 0 20px 16px;
+  .community-site .community-window .activity-heading {
+    gap: 12px;
   }
   .community-site .feature-strip {
     grid-template-columns: 1fr;
     width: min(100% - 36px, 1180px);
-    padding: 44px 0;
+    padding: 34px 0;
   }
   .community-site .feature-strip article,
   .community-site .feature-strip article:first-child,
@@ -3385,54 +3415,9 @@ footer p { margin: 0; }
   }
   .community-site .community-proof {
     width: min(100% - 36px, 1180px);
-    padding: 54px 0;
   }
-  .community-site .community-proof h2 {
-    font-size: clamp(2.55rem, 12vw, 3.8rem);
-  }
-  .community-site .community-estimate-summary {
-    padding: 19px;
-  }
-  .community-site .community-proof:is(
-    [data-community-state="checking"],
-    [data-community-state="service_unavailable"],
-    [data-community-state="unsupported_schema"],
-    [data-community-state="none_published"]
-  ) {
-    padding: 38px 0;
-  }
-  .community-site .community-proof:is(
-    [data-community-state="checking"],
-    [data-community-state="service_unavailable"],
-    [data-community-state="unsupported_schema"],
-    [data-community-state="none_published"]
-  ) .community-proof-heading {
-    gap: 18px;
-  }
-  .community-site .community-proof:is(
-    [data-community-state="checking"],
-    [data-community-state="service_unavailable"],
-    [data-community-state="unsupported_schema"],
-    [data-community-state="none_published"]
-  ) h2 {
-    margin-bottom: 10px;
-    font-size: clamp(2.15rem, 10vw, 3rem);
-  }
-  .community-site .community-proof:is(
-    [data-community-state="checking"],
-    [data-community-state="service_unavailable"],
-    [data-community-state="unsupported_schema"],
-    [data-community-state="none_published"]
-  ) .community-estimate-summary {
-    padding: 16px;
-  }
-  .community-site .community-proof:is(
-    [data-community-state="checking"],
-    [data-community-state="service_unavailable"],
-    [data-community-state="unsupported_schema"],
-    [data-community-state="none_published"]
-  ) .community-method {
-    margin-top: 14px;
+  .community-site .community-proof-compact {
+    padding: 20px 0 0;
   }
   .community-site .activity-heading {
     display: grid;
@@ -3491,23 +3476,50 @@ footer p { margin: 0; }
   .community-site .brand span {
     display: none;
   }
+  .community-site .topbar {
+    column-gap: 3px;
+    padding-inline: 8px;
+  }
+  .community-site .brand-icon {
+    width: 26px;
+    height: 26px;
+  }
+  .community-site .primary-nav a {
+    padding-inline: .18rem;
+    font-size: .61rem;
+  }
+  .community-site .header-download {
+    padding-inline: 0;
+  }
+  .community-site .language-picker select {
+    min-width: 4.5rem;
+    max-width: 5.1rem;
+    padding-inline: .42rem 1.05rem;
+    font-size: .58rem;
+  }
   .community-site .install-actions {
+    flex-direction: column;
     align-items: flex-start;
   }
   .community-site .mac-download-button,
+  .community-site .homebrew-install,
   .community-site .installer-unavailable {
     width: 100%;
+  }
+  .community-site .homebrew-install {
+    flex-basis: auto;
+  }
+  .community-site .homebrew-install code {
+    overflow-x: visible;
+    white-space: normal;
   }
   .community-site .open-installed-copy {
     width: 100%;
   }
-  .community-site .preview-stats {
-    grid-template-columns: 1fr 1fr;
-  }
-  .community-site .product-window-bar {
+  .community-site .community-window-bar {
     padding: 10px 12px;
   }
-  .community-site .preview-demo {
+  .community-site .community-window-context {
     font-size: .5rem;
   }
   .community-site .snapshot-quality-grid {
