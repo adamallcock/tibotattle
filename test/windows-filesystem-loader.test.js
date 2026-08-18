@@ -35,6 +35,7 @@ function manifest(overrides = {}) {
     contractVersion: "windows-filesystem-v1",
     securityContractVersion: "windows-filesystem-security-v1",
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
+    sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
     requiredMethods: [...WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS],
     nativeClaims: {
@@ -42,12 +43,14 @@ function manifest(overrides = {}) {
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
       credentialAuditFileGuardSafe: true,
+      sqliteStateLeaseSafe: false,
     },
     approvedPolicy: {
       productionSafe: false,
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
       credentialAuditFileGuardSafe: true,
+      sqliteStateLeaseSafe: false,
     },
     bindingProvenance: {
       contractVersion: "windows-binding-provenance-v1",
@@ -63,11 +66,13 @@ function binding(overrides = {}) {
     contractVersion: "windows-filesystem-v1",
     securityContractVersion: "windows-filesystem-security-v1",
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
+    sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
     credentialAuditFileGuardSafe: true,
+    sqliteStateLeaseSafe: false,
     inspectPath: () => ({ identity: IDENTITY }),
     ensureDirectory: () => IDENTITY,
     readFile: () => ({ data: Buffer.from("data"), identity: IDENTITY }),
@@ -84,6 +89,12 @@ function binding(overrides = {}) {
     releaseCredentialMutex: () => {},
     acquireCredentialAuditFileGuard: () => ({ lease: {} }),
     releaseCredentialAuditFileGuard: () => {},
+    acquireSqliteStateLease: () => ({
+      lease: {},
+      databaseIdentity: IDENTITY,
+      journalIdentity: IDENTITY,
+    }),
+    releaseSqliteStateLease: () => {},
     ...overrides,
   };
 }
@@ -232,12 +243,14 @@ test("manifest policy and native claims are cross-checked before loading", () =>
           pathWalkRaceSafe: true,
           credentialMutexSafe: true,
           credentialAuditFileGuardSafe: true,
+          sqliteStateLeaseSafe: false,
         },
         approvedPolicy: {
           productionSafe: true,
           pathWalkRaceSafe: true,
           credentialMutexSafe: true,
           credentialAuditFileGuardSafe: true,
+          sqliteStateLeaseSafe: false,
         },
         bindingProvenance: {
           contractVersion: "windows-binding-provenance-v1",
@@ -287,12 +300,14 @@ test("manifest policy and native claims are cross-checked before loading", () =>
           pathWalkRaceSafe: false,
           credentialMutexSafe: false,
           credentialAuditFileGuardSafe: true,
+          sqliteStateLeaseSafe: false,
         },
         approvedPolicy: {
           productionSafe: false,
           pathWalkRaceSafe: false,
           credentialMutexSafe: true,
           credentialAuditFileGuardSafe: true,
+          sqliteStateLeaseSafe: false,
         },
       })),
       readBindingBytes: () => BINDING_BYTES,
@@ -330,12 +345,14 @@ test("production promotion remains blocked until a package verifier exists", () 
       pathWalkRaceSafe: true,
       credentialMutexSafe: true,
       credentialAuditFileGuardSafe: true,
+      sqliteStateLeaseSafe: false,
     },
     approvedPolicy: {
       productionSafe: true,
       pathWalkRaceSafe: true,
       credentialMutexSafe: true,
       credentialAuditFileGuardSafe: true,
+      sqliteStateLeaseSafe: false,
     },
     bindingProvenance: {
       contractVersion: "windows-binding-provenance-v1",
@@ -505,6 +522,45 @@ test("adapter rejects malformed native identities before use", () => {
   assert.throws(
     () => malformed.readFile("C:\\state\\secret"),
     (error) => error.code === "WINDOWS_FILESYSTEM_INVALID_IDENTITY",
+  );
+});
+
+test("adapter wraps SQLite state leases with branded identities and one-shot release", () => {
+  const calls = [];
+  const adapter = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding: binding({
+      acquireSqliteStateLease(rootPath, rootIdentity, databaseName) {
+        calls.push(["acquireSqliteStateLease", rootPath, rootIdentity, databaseName]);
+        return {
+          lease: {},
+          databaseIdentity: IDENTITY,
+          journalIdentity: IDENTITY,
+        };
+      },
+      releaseSqliteStateLease(lease) {
+        calls.push(["releaseSqliteStateLease", lease]);
+      },
+    }),
+  });
+  const lease = adapter.acquireSqliteStateLease(
+    "C:\\state",
+    IDENTITY,
+    "state.sqlite",
+  );
+  assert.deepEqual(lease.databaseIdentity, IDENTITY);
+  assert.deepEqual(lease.journalIdentity, IDENTITY);
+  adapter.releaseSqliteStateLease(lease);
+  assert.equal(calls[0][0], "acquireSqliteStateLease");
+  assert.equal(calls[1][0], "releaseSqliteStateLease");
+  assert.throws(
+    () => adapter.releaseSqliteStateLease(lease),
+    (error) => error.code === "WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_FOREIGN",
+  );
+  assert.throws(
+    () => adapter.releaseSqliteStateLease({ ...lease }),
+    (error) => error.code === "WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_FOREIGN",
   );
 });
 
