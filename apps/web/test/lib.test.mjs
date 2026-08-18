@@ -91,6 +91,7 @@ import {
   formatLocal,
   formatReportingTime,
   formatTimeZoneLabel,
+  formatUtcCalendarDay,
   REPORTING_TIME_ZONE,
   reportingCalendarParts,
   selectAvailableAccountingPeriod,
@@ -495,6 +496,23 @@ test("browser reporting timestamps use one explicit system time zone", () => {
     }).format(date),
   );
   assert.equal(formatReportingTime("not a timestamp"), "Unknown");
+});
+
+test("UTC calendar-day formatting preserves published days and rejects invalid dates", () => {
+  const expected = new Intl.DateTimeFormat(USER_LOCALE, {
+    timeZone: "UTC",
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  }).format(new Date("2024-02-29T00:00:00.000Z"));
+
+  assert.equal(formatUtcCalendarDay("2024-02-29"), expected);
+  assert.equal(formatUtcCalendarDay(null), "Unknown");
+  assert.equal(formatUtcCalendarDay(undefined), "Unknown");
+  assert.equal(formatUtcCalendarDay(""), "Unknown");
+  assert.equal(formatUtcCalendarDay("2023-02-29"), "Unknown");
+  assert.equal(formatUtcCalendarDay("2024-02-30"), "Unknown");
+  assert.equal(formatUtcCalendarDay("not-a-day"), "Unknown");
 });
 
 test("human time-zone labels are direct localized Intl fixtures", () => {

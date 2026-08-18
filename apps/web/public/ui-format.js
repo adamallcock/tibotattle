@@ -138,6 +138,14 @@ const LOCAL_DATE_OPTIONS = Object.freeze({
   year: "numeric",
 });
 
+const UTC_CALENDAR_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
+const UTC_CALENDAR_DAY_OPTIONS = Object.freeze({
+  timeZone: "UTC",
+  month: "short",
+  day: "numeric",
+  year: "numeric",
+});
+
 const LOCAL_DATE_TIME_OPTIONS = Object.freeze({
   ...USER_TIME_ZONE_OPTION,
   month: "short",
@@ -152,6 +160,24 @@ export function formatLocal(value, { dateOnly = false } = {}) {
   if (date === null) return translate("format.unknown", {}, messageLocale);
   return dateTimeFormatter(dateOnly ? LOCAL_DATE_OPTIONS : LOCAL_DATE_TIME_OPTIONS)
     .format(date);
+}
+
+/**
+ * Format an API day partition without turning it into a local instant.
+ *
+ * Community `day` values are UTC calendar-day identifiers, not timestamps.
+ * JavaScript parses `2026-08-14` as midnight UTC, which becomes Aug 13 in a
+ * time zone west of Greenwich when passed through `formatLocal`.
+ */
+export function formatUtcCalendarDay(value) {
+  if (typeof value !== "string" || !UTC_CALENDAR_DAY_PATTERN.test(value)) {
+    return translate("format.unknown", {}, messageLocale);
+  }
+  const date = instant(`${value}T00:00:00.000Z`);
+  if (date === null || date.toISOString().slice(0, 10) !== value) {
+    return translate("format.unknown", {}, messageLocale);
+  }
+  return dateTimeFormatter(UTC_CALENDAR_DAY_OPTIONS).format(date);
 }
 
 // Existing browser imports use this name. Keep it as an alias so all
