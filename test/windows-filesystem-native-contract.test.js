@@ -53,17 +53,72 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   const renameStart = source.indexOf("bool RenameHandleRelative(");
   const replaceStart = source.indexOf("napi_value ReplaceFileCallback(");
   const inspectStart = source.indexOf("napi_value InspectPathCallback(", replaceStart);
-  assert.ok(renameStart >= 0 && replaceStart > renameStart && inspectStart > replaceStart);
+  const protectedReplaceStart = source.indexOf("napi_value ReplaceProtectedChildCallback(");
+  const protectedDeleteStart = source.indexOf("napi_value DeleteProtectedChildCallback(");
+  const ownerOnlyResourcesStart = source.indexOf(
+    "struct OwnerOnlySecurityResources",
+    protectedDeleteStart,
+  );
+  assert.ok(
+    renameStart >= 0
+      && replaceStart > renameStart
+      && inspectStart > replaceStart
+      && protectedReplaceStart > inspectStart
+      && protectedDeleteStart > inspectStart
+      && protectedDeleteStart > protectedReplaceStart
+      && ownerOnlyResourcesStart > protectedDeleteStart,
+  );
   const renameBody = source.slice(renameStart, replaceStart);
   const replaceBody = source.slice(replaceStart, inspectStart);
+  const protectedDeleteBody = source.slice(protectedDeleteStart, ownerOnlyResourcesStart);
   const withoutCppComments = (value) => value
     .replace(/\/\*[\s\S]*?\*\//gu, "")
     .replace(/\/\/.*$/gmu, "");
   const executableRenameBody = withoutCppComments(renameBody);
   const executableReplaceBody = withoutCppComments(replaceBody);
+  const protectedReplaceBody = source.slice(protectedReplaceStart, protectedDeleteStart);
+  const executableProtectedDeleteBody = withoutCppComments(protectedDeleteBody);
+  const executableProtectedReplaceBody = withoutCppComments(protectedReplaceBody);
   assert.match(source, /NtCreateFile/u);
   assert.match(source, /RootDirectory/u);
   assert.match(source, /NtSetInformationFile/u);
+  assert.match(source, /napi_value values\[5\] = \{\}/u);
+  assert.match(source, /std::size_t count = 5;[\s\S]*?count != expected/u);
+  assert.match(source, /OpenProtectedRootAndChild\(/u);
+  assert.match(source, /ParseExpectedIdentity\(env, arguments\[1\]/u);
+  assert.match(source, /ValidateSecurity\(rootOpened\.final, true, failure, &observedRoot\)/u);
+  assert.match(
+    source,
+    /ReadHandleBounded\([\s\S]*?maximumBytes[\s\S]*?bytes->assign\(/u,
+  );
+  assert.match(
+    source,
+    /static_cast<unsigned long long>\(size\.QuadPart\)[\s\S]*?maximumBytes[\s\S]*?TooLarge\(\)/u,
+  );
+  assert.match(source, /const std::size_t remaining = bytes->size\(\) - offset;/u);
+  assert.match(
+    source,
+    /if \(read == 0 \|\| static_cast<std::size_t>\(read\) > remaining\)/u,
+  );
+  assert.match(source, /GetFileSizeEx\(handle, &finalSize\)/u);
+  assert.match(
+    source,
+    /finalSize\.QuadPart != size\.QuadPart[\s\S]*?FileSizeChanged\(\)/u,
+  );
+  assert.match(
+    source,
+    /if \(offset == path\.size\(\) \|\| path\[offset\] == L'\\\\'\) return false;/u,
+  );
+  for (const method of [
+    "readFileBounded",
+    "inspectProtectedChild",
+    "readProtectedChild",
+    "createProtectedChild",
+    "deleteProtectedChild",
+    "replaceProtectedChild",
+  ]) {
+    assert.match(source, new RegExp(`DefineMethod[\\s\\S]+"${method}"`, "u"));
+  }
   assert.match(
     executableRenameBody,
     /information->flags = kFileRenameReplaceIfExists \| kFileRenamePosixSemantics;/u,
@@ -77,6 +132,33 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   assert.match(
     executableReplaceBody,
     /ValidateSecurity\(opened\.final, false, &failure, &latest\)[\s\S]*?EqualIdentity\(latest, expected\)[\s\S]*?ResolveFinalPath\(opened\.final, &parsed\)/u,
+  );
+  assert.match(
+    executableProtectedDeleteBody,
+    /ValidateSecurity\(opened\.final, false, &failure, &current\)[\s\S]*?EqualIdentity\(current, expected\)[\s\S]*?ResolveFinalPath\(opened\.final, &fullPath\)[\s\S]*?FILE_DISPOSITION_INFO/u,
+  );
+  const protectedReadbackOffset = executableProtectedReplaceBody.indexOf(
+    "ReadHandleBounded(",
+  );
+  const protectedReplacementPathOffset = executableProtectedReplaceBody.indexOf(
+    "ResolveFinalPath(replacement",
+  );
+  const protectedTargetRevalidationOffset = executableProtectedReplaceBody.indexOf(
+    "ValidateSecurity(opened.final",
+    protectedReplacementPathOffset,
+  );
+  const protectedRenameOffset = executableProtectedReplaceBody.indexOf(
+    "RenameHandleRelative(",
+  );
+  assert.ok(
+    protectedReadbackOffset >= 0
+      && protectedReplacementPathOffset > protectedReadbackOffset
+      && protectedTargetRevalidationOffset > protectedReplacementPathOffset
+      && protectedRenameOffset > protectedTargetRevalidationOffset,
+  );
+  assert.doesNotMatch(
+    executableProtectedReplaceBody.slice(protectedRenameOffset),
+    /ReadHandleBounded\(|OpenRelativeComponent\(|ResolveFinalPath\(/u,
   );
   assert.match(source, /const auto\* sidBytes = static_cast<const BYTE\*>\(user->User.Sid\)/u);
   assert.match(source, /DWORD descriptorRevision = 0/u);

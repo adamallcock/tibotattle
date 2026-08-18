@@ -37,6 +37,7 @@ const BINDING_FILE_NAME = "windows_filesystem.node";
 const BINDING_PLATFORM = "win32";
 const BINDING_ARCHITECTURE = "x64";
 const MAXIMUM_BINDING_BYTES = 64 * 1024 * 1024;
+const MAXIMUM_FILE_BYTES = 1024 * 1024;
 const UNQUALIFIED_BINDING_PROVENANCE_SOURCE = "unsigned-development-binding";
 const AUTHENTICATED_BINDING_PROVENANCE_SOURCES = Object.freeze([
   "development-package",
@@ -46,9 +47,15 @@ const REQUIRED_METHODS = Object.freeze([
   "inspectPath",
   "ensureDirectory",
   "readFile",
+  "readFileBounded",
   "createFile",
   "deleteFile",
   "replaceFile",
+  "inspectProtectedChild",
+  "readProtectedChild",
+  "createProtectedChild",
+  "deleteProtectedChild",
+  "replaceProtectedChild",
   "acquireCredentialAuditFileGuard",
   "releaseCredentialAuditFileGuard",
   "acquireCredentialMutex",
@@ -229,6 +236,11 @@ function assertBindingManifest(manifest) {
     && typeof approvedPolicy.pathWalkRaceSafe === "boolean"
     && approvedPolicy.credentialMutexSafe === true
     && approvedPolicy.credentialAuditFileGuardSafe === true
+    && nativeClaims.productionSafe === approvedPolicy.productionSafe
+    && nativeClaims.pathWalkRaceSafe === approvedPolicy.pathWalkRaceSafe
+    && nativeClaims.credentialMutexSafe === approvedPolicy.credentialMutexSafe
+    && nativeClaims.credentialAuditFileGuardSafe
+      === approvedPolicy.credentialAuditFileGuardSafe
     && validBindingProvenance(bindingProvenance)
     && (!policyRequiresAuthenticatedProvenance(approvedPolicy)
       || bindingProvenance.status === "authenticated");
@@ -414,6 +426,39 @@ function normalizeIdentity(identity) {
   });
 }
 
+function normalizeReadMaximum(maximumBytes) {
+  if (!Number.isSafeInteger(maximumBytes)
+      || maximumBytes < 0
+      || maximumBytes > MAXIMUM_FILE_BYTES) {
+    throw failure("INVALID_MAXIMUM_BYTES");
+  }
+  return maximumBytes;
+}
+
+function normalizeProtectedRootIdentity(identity) {
+  const normalized = normalizeIdentity(identity);
+  if (normalized.linkCount !== 1) throw failure("INVALID_IDENTITY");
+  return normalized;
+}
+
+function normalizeDataResult(result) {
+  if (!result || !Buffer.isBuffer(result.data)) throw failure("INVALID_RESULT");
+  return Object.freeze({
+    data: Buffer.from(result.data),
+    identity: normalizeIdentity(result.identity),
+  });
+}
+
+function normalizeMetadataResult(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    throw failure("INVALID_RESULT");
+  }
+  return Object.freeze({
+    ...result,
+    identity: normalizeIdentity(result.identity),
+  });
+}
+
 function call(binding, method, args) {
   try {
     return binding[method](...args);
@@ -453,11 +498,7 @@ export function createWindowsFilesystemAdapter({
     pathWalkRaceSafe: false,
     inspectPath(path) {
       try {
-        const result = call(native, "inspectPath", [path]);
-        return Object.freeze({
-          ...result,
-          identity: normalizeIdentity(result?.identity),
-        });
+        return normalizeMetadataResult(call(native, "inspectPath", [path]));
       } catch (error) {
         throw normalizeNativeError(error);
       }
@@ -471,9 +512,15 @@ export function createWindowsFilesystemAdapter({
     },
     readFile(path) {
       try {
-        const result = call(native, "readFile", [path]);
-        if (!result || !Buffer.isBuffer(result.data)) throw failure("INVALID_RESULT");
-        return Object.freeze({ data: Buffer.from(result.data), identity: normalizeIdentity(result.identity) });
+        return normalizeDataResult(call(native, "readFile", [path]));
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
+    readFileBounded(path, maximumBytes) {
+      const maximum = normalizeReadMaximum(maximumBytes);
+      try {
+        return normalizeDataResult(call(native, "readFileBounded", [path, maximum]));
       } catch (error) {
         throw normalizeNativeError(error);
       }
@@ -502,6 +549,85 @@ export function createWindowsFilesystemAdapter({
       try {
         return normalizeIdentity(call(native, "replaceFile", [
           path,
+          expected,
+          Buffer.from(data),
+        ]));
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
+    inspectProtectedChild(rootPath, rootIdentity, childPath) {
+      const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);
+      try {
+        return normalizeMetadataResult(call(native, "inspectProtectedChild", [
+          rootPath,
+          expectedRoot,
+          childPath,
+        ]));
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
+    readProtectedChild(rootPath, rootIdentity, childPath, maximumBytes) {
+      const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);
+      const maximum = normalizeReadMaximum(maximumBytes);
+      try {
+        return normalizeDataResult(call(native, "readProtectedChild", [
+          rootPath,
+          expectedRoot,
+          childPath,
+          maximum,
+        ]));
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
+    createProtectedChild(rootPath, rootIdentity, childPath, data) {
+      const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);
+      if (!Buffer.isBuffer(data) && !(data instanceof Uint8Array)) {
+        throw failure("INVALID_DATA");
+      }
+      try {
+        return normalizeIdentity(call(native, "createProtectedChild", [
+          rootPath,
+          expectedRoot,
+          childPath,
+          Buffer.from(data),
+        ]));
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
+    deleteProtectedChild(rootPath, rootIdentity, childPath, identity) {
+      const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);
+      const expected = normalizeIdentity(identity);
+      try {
+        const result = call(native, "deleteProtectedChild", [
+          rootPath,
+          expectedRoot,
+          childPath,
+          expected,
+        ]);
+        if (!result?.deleted) throw failure("INVALID_RESULT");
+        return Object.freeze({
+          deleted: true,
+          identity: normalizeIdentity(result.identity),
+        });
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
+    replaceProtectedChild(rootPath, rootIdentity, childPath, identity, data) {
+      const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);
+      const expected = normalizeIdentity(identity);
+      if (!Buffer.isBuffer(data) && !(data instanceof Uint8Array)) {
+        throw failure("INVALID_DATA");
+      }
+      try {
+        return normalizeIdentity(call(native, "replaceProtectedChild", [
+          rootPath,
+          expectedRoot,
+          childPath,
           expected,
           Buffer.from(data),
         ]));
