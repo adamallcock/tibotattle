@@ -89,6 +89,7 @@ export const PORTABLE_TEST_GROUPS = Object.freeze({
     "test/windows-filesystem-native-contract.test.js",
     "test/windows-filesystem-security.test.js",
     "test/windows-qualification-governance.test.js",
+    "test/windows-sqlite-state-session-contract.test.js",
     "test/windows-path-contract.test.js",
     "test/windows-skip-ledger.test.js",
     "test/windows-test-manifest.test.js",
