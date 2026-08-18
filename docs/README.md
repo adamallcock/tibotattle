@@ -44,6 +44,7 @@ and date before relying on it for a fresh state claim.
 | [`governance/`](./governance/) | Risk register, control traceability, privacy contract, preregistrations |
 | [`reports/`](./reports/) | Consolidated readiness and status reports |
 | [`audits/`](./audits/) | Journey audits and gap reviews |
+| [`reviews/`](./reviews/) | Point-in-time implementation, architecture, and reconciliation reviews |
 | [`research/`](./research/) | Source notes and supporting research artifacts |
 | [`qa/`](./qa/) | Browser and native visual QA receipts and screenshots |
 | [`design/`](./design/) | Product and visual design briefs |
