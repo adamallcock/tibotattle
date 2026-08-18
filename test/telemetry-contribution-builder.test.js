@@ -245,7 +245,9 @@ test("materializer re-verifies a reviewed bundle and writes owner-only no-clobbe
   );
   for (const file of result.files) {
     const metadata = await stat(file.file);
-    assert.equal(metadata.mode & 0o077, 0);
+    if (process.platform !== "win32") {
+      assert.equal(metadata.mode & 0o077, 0);
+    }
     const payload = JSON.parse(await readFile(file.file, "utf8"));
     assert.equal(payload.schemaVersion, "telemetry-contribution-v0.1");
   }

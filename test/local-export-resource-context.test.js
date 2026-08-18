@@ -12,6 +12,8 @@ import * as platform from "../src/platform/index.js";
 const PLATFORM_PUBLIC_EXPORTS = Object.freeze([
   "CODEX_CONFIG_RETAINED_KEYS",
   "CODEX_CONFIG_SERVICE_TIER_STATUSES",
+  "CONTRIBUTION_DEVICE_READER_CODE_IDENTIFIER",
+  "CONTRIBUTION_DEVICE_READER_TEAM_IDENTIFIER",
   "ClaudeCallbackLifecycleError",
   "EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES",
   "ExportIdentityKeychainError",
@@ -19,6 +21,9 @@ const PLATFORM_PUBLIC_EXPORTS = Object.freeze([
   "KEYTAR_SIGNING_CODE_IDENTIFIER",
   "KEYTAR_SIGNING_TEAM_IDENTIFIER",
   "assertOwnerControlledDirectory",
+  "contributionDeviceDurableAddArguments",
+  "contributionDeviceReaderRequirement",
+  "contributionDeviceReaderRequirementVerificationArguments",
   "createClaudeCallbackLifecycleContext",
   "createExportIdentityKeychainBackend",
   "createExportSetVerificationStorageContext",

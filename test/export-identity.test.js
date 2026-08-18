@@ -103,7 +103,15 @@ test("export identity uses stable platform application-state paths", () => {
   );
   assert.equal(
     defaultExportSecretFile({ platform: "win32", homeDirectory: "C:\\Users\\example", environment: { LOCALAPPDATA: "C:\\Local" } }),
-    "C:\\Local/app-usagemonitor/export-participant-secret",
+    "C:\\Local\\app-usagemonitor\\export-participant-secret",
+  );
+  assert.equal(
+    defaultExportStateDirectory({
+      platform: "win32",
+      homeDirectory: "D:\\Profiles\\Ada Lovelace-测试",
+      environment: {},
+    }),
+    "D:\\Profiles\\Ada Lovelace-测试\\AppData\\Local\\app-usagemonitor",
   );
 });
 

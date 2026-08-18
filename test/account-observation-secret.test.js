@@ -240,9 +240,11 @@ test("account observation stale-lock recovery does not remove a replacement or u
     await assert.rejects(load(), (error) => error.code === "account_observation_credential_locked");
     assert.equal(await readFile(lock, "utf8"), replacement);
 
-    await chmod(lock, 0o644);
-    await assert.rejects(load(), (error) => error.code === "account_observation_credential_unavailable");
-    assert.equal(await readFile(lock, "utf8"), replacement);
+    if (process.platform !== "win32") {
+      await chmod(lock, 0o644);
+      await assert.rejects(load(), (error) => error.code === "account_observation_credential_unavailable");
+      assert.equal(await readFile(lock, "utf8"), replacement);
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }

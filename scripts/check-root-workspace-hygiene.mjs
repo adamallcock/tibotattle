@@ -17,6 +17,7 @@ const DEFAULT_REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
  */
 export const ROOT_WORKSPACE_POLICY = Object.freeze({
   files: Object.freeze([
+    ".dockerignore",
     ".gitattributes",
     ".gitignore",
     ".gitleaksignore",
@@ -33,6 +34,7 @@ export const ROOT_WORKSPACE_POLICY = Object.freeze({
     ".github",
     "apps",
     "config",
+    "containers",
     "contracts",
     "docs",
     "experiments",

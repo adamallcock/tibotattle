@@ -5,9 +5,15 @@ import { access, lstat } from "node:fs/promises";
 import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  PORTABLE_TEST_FILES,
+  WINDOWS_PORTABLE_TEST_FILES,
+} from "./portable-test-manifest.mjs";
+
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 export const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
 const NPM_COMMAND = process.platform === "win32" ? "npm.cmd" : "npm";
+const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
 const TEST_REPORTER_ENVIRONMENT_VARIABLE = "USAGE_MONITOR_TEST_LANE_REPORTER";
 const SUPPORTED_TEST_REPORTERS = new Set(["dot", "spec", "tap"]);
 
@@ -41,6 +47,7 @@ const ALL_EXPLICIT_TEST_FILES = Object.freeze([
     ...MACOS_ARTIFACT_TEST_FILES,
     ...MACOS_SMOKE_TEST_FILES,
     ...LANE_REGRESSION_TEST_FILES,
+    ...PORTABLE_TEST_FILES,
   ]),
 ]);
 
@@ -54,6 +61,7 @@ const LANE_ORDER = Object.freeze([
 
 const VALID_COMMANDS = new Set([
   "preflight",
+  "portable",
   "fast",
   "changed",
   "plan",
@@ -331,7 +339,7 @@ async function checkUntrackedWhitespace() {
       "--no-index",
       "--check",
       "--",
-      "/dev/null",
+      NULL_DEVICE,
       resolve(REPOSITORY_ROOT, path),
     ], { acceptedExitCodes: [0, 1] });
     if (output.trim().length > 0) {
@@ -371,6 +379,13 @@ function assertMacOSSmokeBuildSupported() {
 }
 
 async function runLane(lane) {
+  if (lane === "portable") {
+    const files = process.platform === "win32"
+      ? WINDOWS_PORTABLE_TEST_FILES
+      : PORTABLE_TEST_FILES;
+    await runNodeTests(["--test-concurrency=1", ...files]);
+    return;
+  }
   if (lane === "i18n") {
     await runNodeTests(["--test-concurrency=1", "test/i18n-foundation.test.js"]);
     await runCommand(NPM_COMMAND, ["run", "product:ui:test"]);
@@ -464,6 +479,7 @@ function usage() {
 
 Lanes:
   preflight       Validate selected test files, tracked/untracked whitespace, and docs links.
+  portable        Run the explicit platform-neutral Node, web, and companion manifest.
   fast            Run fast macOS source/configuration checks.
   changed         Select conservative lanes from branch plus active-worktree paths.
   plan            Print the selected lanes without running them.

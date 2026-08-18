@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { resolve } from "node:path";
 
 import { parseArgs, run } from "../src/cli.js";
 
@@ -108,8 +109,8 @@ test("queue-backed one-shot sync prints only bounded aggregate status", async ()
 });
 
 test("inspect-next prints only a bounded local projection", async () => {
-  const privateDirectory = "/private/canary/prepared-spool";
-  const privateQueue = "/private/canary/queue.sqlite3";
+  const privateDirectory = resolve("/private/canary/prepared-spool");
+  const privateQueue = resolve("/private/canary/queue.sqlite3");
   const output = await captureLogs(() => run([
     "sync-contributions-inspect-next",
     "--directory",
@@ -160,7 +161,7 @@ test("inspect-next prints only a bounded local projection", async () => {
 });
 
 test("status and pause lifecycle remain local and content-free", async () => {
-  const privateCanary = "/private/canary/queue.sqlite3";
+  const privateCanary = resolve("/private/canary/queue.sqlite3");
   const status = {
     paused: false,
     dueNow: 1,

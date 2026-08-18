@@ -2,7 +2,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, rename, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, posix, resolve, win32 } from "node:path";
 
 import {
   deriveExportPseudonym,
@@ -20,15 +20,36 @@ export function defaultExportStateDirectory({
   homeDirectory = homedir(),
   environment = process.env,
 } = {}) {
-  if (platform === "darwin") return join(homeDirectory, "Library", "Application Support", "app-usagemonitor");
-  if (platform === "win32") {
-    return join(environment.LOCALAPPDATA || join(homeDirectory, "AppData", "Local"), "app-usagemonitor");
+  const platformPath = platform === "win32" ? win32 : posix;
+  if (platform === "darwin") {
+    return platformPath.join(
+      homeDirectory,
+      "Library",
+      "Application Support",
+      "app-usagemonitor",
+    );
   }
-  return join(environment.XDG_STATE_HOME || join(homeDirectory, ".local", "state"), "app-usagemonitor");
+  if (platform === "win32") {
+    return platformPath.join(
+      environment.LOCALAPPDATA
+        || platformPath.join(homeDirectory, "AppData", "Local"),
+      "app-usagemonitor",
+    );
+  }
+  return platformPath.join(
+    environment.XDG_STATE_HOME
+      || platformPath.join(homeDirectory, ".local", "state"),
+    "app-usagemonitor",
+  );
 }
 
 export function defaultExportSecretFile(options) {
-  return join(defaultExportStateDirectory(options), "export-participant-secret");
+  const platform = options?.platform ?? process.platform;
+  const platformPath = platform === "win32" ? win32 : posix;
+  return platformPath.join(
+    defaultExportStateDirectory(options),
+    "export-participant-secret",
+  );
 }
 
 export function legacyWorkingDirectorySecretFile({ workingDirectory = process.cwd() } = {}) {
@@ -126,7 +147,9 @@ async function prepareSecretDirectory(path) {
   if (typeof process.getuid === "function" && typeof stats.uid === "number" && stats.uid !== process.getuid()) {
     throw new Error("Participant secret directory must be owned by the current user");
   }
-  if ((stats.mode & 0o022) !== 0) throw new Error("Participant secret directory must not be group- or world-writable");
+  if (process.platform !== "win32" && (stats.mode & 0o022) !== 0) {
+    throw new Error("Participant secret directory must not be group- or world-writable");
+  }
 }
 
 async function writeNewSecret(path, encoded) {

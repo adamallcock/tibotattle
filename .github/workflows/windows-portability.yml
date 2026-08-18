@@ -1,0 +1,81 @@
+name: Windows portability canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      clean-cache:
+        description: Skip the pnpm store cache for a clean qualification run
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-portability-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-x64:
+    name: Native Windows x64 portable core
+    runs-on: windows-2025
+    timeout-minutes: 35
+    env:
+      CI: "1"
+      USAGE_MONITOR_TEST_LANE_REPORTER: spec
+    steps:
+      - name: Check out the requested revision
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 26.2.0
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Activate pinned pnpm
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm install --global corepack@0.34.0 --force
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          node --version
+          pnpm --version
+
+      - name: Resolve pnpm store
+        if: ${{ !inputs.clean-cache }}
+        id: pnpm-store
+        shell: pwsh
+        run: '"path=$(pnpm store path --silent)" >> $env:GITHUB_OUTPUT'
+
+      - name: Restore pnpm store cache
+        if: ${{ !inputs.clean-cache }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: windows-2025-x64-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Install locked dependencies
+        shell: pwsh
+        run: pnpm install --frozen-lockfile
+
+      - name: Record native environment
+        shell: pwsh
+        run: |
+          "### Native Windows x64 environment" >> $env:GITHUB_STEP_SUMMARY
+          "- Runner image: $env:ImageOS $env:ImageVersion" >> $env:GITHUB_STEP_SUMMARY
+          "- Architecture: $env:PROCESSOR_ARCHITECTURE" >> $env:GITHUB_STEP_SUMMARY
+          "- Node: $(node --version)" >> $env:GITHUB_STEP_SUMMARY
+          "- pnpm: $(pnpm --version)" >> $env:GITHUB_STEP_SUMMARY
+          "- Clean cache requested: ${{ inputs.clean-cache }}" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Run portable Windows qualification
+        shell: pwsh
+        run: pnpm test:portable
+
+      - name: Confirm tests did not modify tracked files
+        shell: pwsh
+        run: git diff --exit-code

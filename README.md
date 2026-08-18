@@ -177,6 +177,19 @@ service.
 npm test
 ```
 
+The selected cross-platform core has an explicit portability lane and a pinned,
+network-isolated Linux container:
+
+```bash
+pnpm test:portable
+pnpm container:portable:build
+pnpm container:portable:test
+```
+
+These commands are preparation evidence only. The shipping application remains
+macOS-only; see the [four-day Windows readiness goal](docs/goals/2026-08-17-four-day-windows-readiness-goal.md)
+for the native Windows gate and the work still required before a support claim.
+
 ```bash
 npm run product:check
 ```

@@ -1870,7 +1870,10 @@ test("contribution preview returns counts and accounting only", async () => {
   }
 });
 
-test("development file override drives the real default preparation runner without Keychain", async () => {
+test("development file override drives the real default preparation runner without Keychain", async (t) => {
+  if (process.platform === "win32") {
+    return t.skip("development file identity requires the deferred Windows ACL contract");
+  }
   const files = await fixture();
   const privateCanary = "private-session-that-must-not-leak";
   const secretCanary = Buffer.alloc(32, 37).toString("base64url");
@@ -3653,7 +3656,9 @@ test("diagnostic notes are bounded, fixed-vocabulary, and land in a local log", 
         requestId: "0f2c7a11-4b93-4bb2-9a7c-1c0d2e3f4a5b",
       },
     ]);
-    assert.equal((await lstat(diagnosticsLogFile)).mode & 0o777, 0o600);
+    if (process.platform !== "win32") {
+      assert.equal((await lstat(diagnosticsLogFile)).mode & 0o777, 0o600);
+    }
 
     // Only the fixed vocabulary is accepted, so a free-form label, a sentence
     // masquerading as a code, or an extra member can never be logged.
@@ -4478,7 +4483,9 @@ test("the Fast-mode preference is owner-only, fixed-valued, and rebuilds the acc
       "fast-mode-preference-v0.1.json",
     );
     const metadata = await lstat(settingsFile);
-    assert.equal(metadata.mode & 0o077, 0);
+    if (process.platform !== "win32") {
+      assert.equal(metadata.mode & 0o077, 0);
+    }
     const document = JSON.parse(await readFile(settingsFile, "utf8"));
     assert.deepEqual(Object.keys(document).sort(), [
       "mode",

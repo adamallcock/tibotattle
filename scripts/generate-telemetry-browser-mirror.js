@@ -11,6 +11,8 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { syncDirectory } from "../src/platform/owner-only-filesystem.js";
+
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPO_ROOT = resolve(dirname(SCRIPT_FILE), "..");
 const TELEMETRY_SOURCE_DIRECTORY = join(
@@ -246,12 +248,7 @@ export async function writeTelemetryBrowserMirror({
     await handle.close();
     handle = null;
     await rename(temporaryFile, outputFile);
-    const directoryHandle = await open(dirname(outputFile), "r");
-    try {
-      await directoryHandle.sync();
-    } finally {
-      await directoryHandle.close();
-    }
+    await syncDirectory(dirname(outputFile));
   } finally {
     if (handle !== null) {
       await handle.close().catch(() => {});

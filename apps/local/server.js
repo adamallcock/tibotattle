@@ -147,6 +147,7 @@ const PARENT_PID_ENV = "USAGE_MONITOR_PARENT_PID";
 const PARENT_PID = /^[1-9][0-9]{0,9}$/u;
 const MAXIMUM_PARENT_PID = 2_147_483_647;
 const PARENT_WATCHDOG_INTERVAL_MS = 250;
+const PARENT_WATCHDOG_EXIT_GRACE_MS = 1_000;
 const MAX_REQUEST_BODY_BYTES = 1_024;
 const MAX_STATIC_BYTES = 2 * 1024 * 1024;
 const MAX_REPORT_BYTES = 4 * 1024 * 1024;
@@ -2082,9 +2083,21 @@ function startParentDeathWatchdog({
     if (!active || declaredParentIsCurrent(expectedParentPid)) return;
     active = false;
     clearInterval(timer);
+    let forcedExit = null;
+    if (terminateProcess) {
+      // `server.close()` can wait indefinitely on platform-specific socket
+      // bookkeeping after the launcher has already disappeared. Preserve a
+      // short graceful-close window, then guarantee that the orphan cannot
+      // survive its declared parent on Linux or Windows.
+      forcedExit = setTimeout(
+        () => process.exit(0),
+        PARENT_WATCHDOG_EXIT_GRACE_MS,
+      );
+    }
     void closeHttpServer(server)
       .catch(() => {})
       .then(() => {
+        if (forcedExit !== null) clearTimeout(forcedExit);
         if (terminateProcess) process.exit(0);
       });
   }, PARENT_WATCHDOG_INTERVAL_MS);

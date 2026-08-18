@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { join, resolve } from "node:path";
 
 import {
   createOwnerOnlyLocalMetadataBundlePairReader,
@@ -15,9 +16,9 @@ class SafeFileError extends Error {
 const OWNER_UID = typeof process.getuid === "function"
   ? process.getuid()
   : 501;
-const PARENT_PATH = "/virtual";
-const BUNDLE_PATH = `${PARENT_PATH}/bundle.json`;
-const RECEIPT_PATH = `${PARENT_PATH}/receipt.json`;
+const PARENT_PATH = resolve("virtual");
+const BUNDLE_PATH = join(PARENT_PATH, "bundle.json");
+const RECEIPT_PATH = join(PARENT_PATH, "receipt.json");
 
 function directoryStats({
   dev = 1,
@@ -330,7 +331,7 @@ test("detects growth with the one-byte probe before post-read parsing", async ()
 });
 
 test("rejects oversized and non-owner artifacts before open or allocation", async () => {
-  for (const scenario of [
+  const scenarios = [
     {
       lstatOverride(path) {
         if (path === RECEIPT_PATH) {
@@ -353,7 +354,10 @@ test("rejects oversized and non-owner artifacts before open or allocation", asyn
       },
       code: "receipt_owner",
     },
-  ]) {
+  ];
+  for (const scenario of process.platform === "win32"
+    ? scenarios.slice(0, 1)
+    : scenarios) {
     const { calls, fileSystem } = createFakeFileSystem(scenario);
     const readPair = createOwnerOnlyLocalMetadataBundlePairReader({
       fileSystem,
@@ -368,16 +372,20 @@ test("rejects oversized and non-owner artifacts before open or allocation", asyn
 });
 
 test("requires both requested paths to resolve under one canonical parent", async () => {
+  const bundleParent = resolve("bundle-parent");
+  const receiptParent = resolve("receipt-parent");
+  const canonicalBundleParent = resolve("canonical-bundle-parent");
+  const canonicalReceiptParent = resolve("canonical-receipt-parent");
   const { calls, fileSystem } = createFakeFileSystem({
     realpathOverride(path) {
-      return path === "/bundle-parent"
-        ? "/canonical-bundle-parent"
-        : "/canonical-receipt-parent";
+      return path === bundleParent
+        ? canonicalBundleParent
+        : canonicalReceiptParent;
     },
     lstatOverride(path) {
       if (
-        path === "/canonical-bundle-parent"
-        || path === "/canonical-receipt-parent"
+        path === canonicalBundleParent
+        || path === canonicalReceiptParent
       ) {
         return directoryStats();
       }
@@ -389,8 +397,8 @@ test("requires both requested paths to resolve under one canonical parent", asyn
   });
   await assert.rejects(
     readPair(readerOptions({
-      bundleFile: "/bundle-parent/bundle.json",
-      receiptFile: "/receipt-parent/receipt.json",
+      bundleFile: join(bundleParent, "bundle.json"),
+      receiptFile: join(receiptParent, "receipt.json"),
     })),
     assertCode("paths_not_adjacent"),
   );

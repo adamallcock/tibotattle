@@ -12,7 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test from "node:test";
 import {
   REAL_LOCAL_BACKEND_ACCEPTANCE_CONFIRMATION,
@@ -209,12 +209,10 @@ test("synthetic local logs bind preparation to backend evidence without Keychain
         backendCalls += 1;
         assert.equal(port, 8793);
         assert.equal(
-          contributionFile.endsWith(
-            "/telemetry-contribution-000001.json",
-          ),
-          true,
+          basename(contributionFile),
+          "telemetry-contribution-000001.json",
         );
-        assert.equal(stateDirectory.endsWith("/backend-lab"), true);
+        assert.equal(basename(stateDirectory), "backend-lab");
         const contribution = JSON.parse(await readFile(
           contributionFile,
           "utf8",

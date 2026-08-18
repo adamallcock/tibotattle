@@ -27,6 +27,7 @@ const REGISTRY_EXPORTS = Object.freeze([
   "OPENAI_CODEX_SPARK_LIMIT_ID",
   "OPENAI_CODEX_SPARK_MODEL_ID",
   "OPENAI_CODEX_UNPRICED_MODEL_IDS",
+  "TELEMETRY_PROVIDER_IDS",
   "TELEMETRY_V01_REGISTRY_VERSION",
   "TELEMETRY_V01_REVIEWED_AT",
   // Codex-scoped model recognition and the priced / known-unpriced /
@@ -34,6 +35,8 @@ const REGISTRY_EXPORTS = Object.freeze([
   "codexModelAllowanceTrack",
   "codexModelApiPriceEquivalentApplicable",
   "codexModelPricingStatus",
+  "exportLimitProvider",
+  "exportModelProvider",
   "exportRegistrySnapshot",
   "recognizedCodexModelId",
   "recognizedExportLimitId",

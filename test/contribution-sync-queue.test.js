@@ -541,7 +541,9 @@ test("queue persists one path-free job and deduplicates subsequent scans", async
   const stats = await lstat(value.queueFile);
   assert.equal(stats.isFile(), true);
   assert.equal(stats.nlink, 1);
-  assert.equal(stats.mode & 0o077, 0);
+  if (process.platform !== "win32") {
+    assert.equal(stats.mode & 0o077, 0);
+  }
   const database = new DatabaseSync(value.queueFile, { readOnly: true });
   const columns = database.prepare(
     "PRAGMA table_info(contribution_jobs)",
@@ -1229,7 +1231,10 @@ test("bounded retirement eventually compacts accepted sets beyond one query wind
   finalDatabase.close();
 });
 
-test("queue refuses symlinked or non-owner-only database locations", async () => {
+test("queue refuses symlinked or non-owner-only database locations", async (t) => {
+  if (process.platform === "win32") {
+    return t.skip("Windows ACL and reparse-point refusal is deferred");
+  }
   const value = await fixture();
   const target = join(value.root, "target.sqlite3");
   await writeFile(target, "", { mode: 0o600 });

@@ -50,7 +50,10 @@ const SOURCE_HASHES = Object.freeze({
   "quota-rolling.js":
     "2afca11d40c61c463524cc8f4d267c128dbe427c72fb6c2e3ed68b056ca70977",
   "quota-tracks.js":
-    "85118466c257497a72c07c05cda6224c8d0a7e6a7b85aa69b4d950bf823d2170",
+    // Re-pinned for the reviewed 5pp noise tolerance and running-maximum
+    // boundary correction. The executable kernel changed in ea84c35 while
+    // this byte-identity receipt remained on the pre-correction digest.
+    "d15a78931e10c8bccf82ea262f722ea84b5fd02d0cb3c9fd37b18dbd169fa3f0",
   "quota-windows.js":
     "fbf4bdcfb8417efcc2cdf3d7e3e92f1302048e523d6722b06eb9c47b44861366",
   // Re-pinned with the slot-identity change: `slot` left TRACK_KEYS because

@@ -421,7 +421,14 @@ async function recoverPendingLocalCollectorRollbackJournal(stateFile) {
 }
 
 async function syncStateFile(stateFile) {
-  const handle = await open(stateFile, constants.O_RDONLY);
+  // Windows FlushFileBuffers rejects a read-only file handle with EPERM.
+  // This state database is already opened read/write for every call site;
+  // request the writable handle Windows requires while retaining the narrower
+  // POSIX handle used by the existing durability path.
+  const flags = process.platform === "win32"
+    ? constants.O_RDWR
+    : constants.O_RDONLY;
+  const handle = await open(stateFile, flags);
   try {
     await handle.sync();
   } finally {

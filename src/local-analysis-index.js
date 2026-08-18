@@ -738,7 +738,10 @@ export function configureDatabase(
 }
 
 async function syncPath(path) {
-  const handle = await open(path, constants.O_RDONLY);
+  const handle = await open(
+    path,
+    process.platform === "win32" ? constants.O_RDWR : constants.O_RDONLY,
+  );
   try {
     await handle.sync();
   } finally {
@@ -752,7 +755,7 @@ async function syncDirectory(path) {
     handle = await open(path, constants.O_RDONLY);
     await handle.sync();
   } catch (error) {
-    if (!["EINVAL", "ENOTSUP", "EISDIR"].includes(error?.code)) {
+    if (!["EINVAL", "ENOTSUP", "EISDIR", "EPERM"].includes(error?.code)) {
       throw error;
     }
   } finally {
@@ -941,7 +944,9 @@ function createFreshIndex(indexFile) {
 function readStoredSources(database) {
   return new Map([...database.prepare(`
     SELECT source_key, parent_source_key, ordinal, is_fork, parent_missing,
-           device, inode, birthtime_ms, file_size, prefix_bytes, mtime_ms,
+           CAST(device AS TEXT) AS device_text,
+           CAST(inode AS TEXT) AS inode_text,
+           birthtime_ms, file_size, prefix_bytes, mtime_ms,
            ctime_ms, ctime_ns, boundary_start, boundary_hmac, surface, thread_source,
            agent_scope, lineage_disposition, current_model,
            current_model_seen, previous_totals_json, previous_presence_json,
@@ -953,8 +958,12 @@ function readStoredSources(database) {
     ordinal: Number(row.ordinal),
     isFork: row.is_fork === 1,
     parentMissing: row.parent_missing === 1,
-    dev: Number(row.device),
-    ino: Number(row.inode),
+    // Windows file IDs can exceed Number.MAX_SAFE_INTEGER. node:fs already
+    // exposes those default stats as Numbers, so read the persisted integers
+    // through text and reconstruct the same comparison representation instead
+    // of asking node:sqlite to reject the out-of-range integer row.
+    dev: Number(row.device_text),
+    ino: Number(row.inode_text),
     birthtimeMs: Number(row.birthtime_ms),
     fileSize: Number(row.file_size),
     prefixBytes: Number(row.prefix_bytes),

@@ -6,6 +6,22 @@ import { join } from "node:path";
 import { scanCodexLogEvents } from "../src/codex-log-scan.js";
 import { createIndexedCodexLogScan } from "../src/local-analysis-index.js";
 
+async function removeIndexedFixture(path) {
+  try {
+    await rm(path, {
+      recursive: true,
+      force: true,
+      maxRetries: process.platform === "win32" ? 5 : 0,
+      retryDelay: 20,
+    });
+  } catch (error) {
+    // Node's synchronous SQLite binding can retain a Windows delete-sharing
+    // lock until the test process exits even after DatabaseSync.close(). The
+    // runner workspace is disposable; never mask any other teardown failure.
+    if (process.platform !== "win32" || error?.code !== "EBUSY") throw error;
+  }
+}
+
 const START_AT = "2026-07-25T00:00:00.000Z";
 const END_AT = "2026-07-25T02:00:00.000Z";
 const WEEKLY_RESETS_AT = 1785441981;
@@ -341,7 +357,7 @@ test("a leading reading corroborated outside the requested interval is kept, in 
     assert.deepEqual(await collect(indexedScan, codexHome), streamed);
   } finally {
     await rm(codexHome, { recursive: true, force: true });
-    await rm(root, { recursive: true, force: true });
+    await removeIndexedFixture(root);
   }
 });
 
@@ -374,6 +390,6 @@ test("the persistent index withholds the same stale reading as the streaming sca
     );
   } finally {
     await rm(codexHome, { recursive: true, force: true });
-    await rm(root, { recursive: true, force: true });
+    await removeIndexedFixture(root);
   }
 });

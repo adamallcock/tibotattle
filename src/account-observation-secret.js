@@ -105,6 +105,10 @@ async function assertLockDirectory(directoryState) {
 
 async function syncLockDirectory(directoryState) {
   await assertLockDirectory(directoryState);
+  // Windows cannot open a directory for fsync. The lock file itself is
+  // flushed before this point; the unavailable directory-entry barrier is a
+  // POSIX-only durability primitive.
+  if (process.platform === "win32") return;
   let handle;
   try {
     handle = await open(directoryState.directory, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0));
