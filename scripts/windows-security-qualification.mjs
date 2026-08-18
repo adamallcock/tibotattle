@@ -102,10 +102,13 @@ export async function readVerifiedBindingManifest({
     && manifest.approvedPolicy?.pathWalkRaceSafe === false
     && manifest.approvedPolicy?.credentialMutexSafe === true
     && manifest.approvedPolicy?.credentialAuditFileGuardSafe === true
+    && manifest.approvedPolicy?.sqliteStateLeaseSafe === false
     && manifest.nativeClaims?.credentialAuditFileGuardSafe === true
+    && manifest.nativeClaims?.sqliteStateLeaseSafe === false
     && manifest.credentialAuditFileGuardContractVersion
       === "windows-credential-audit-file-guard-v1"
     && manifest.credentialMutexContractVersion === "windows-credential-mutex-v1"
+    && manifest.sqliteStateLeaseContractVersion === "windows-sqlite-state-lease-v1"
     && bindingProvenance !== null
     && typeof bindingProvenance === "object"
     && !Array.isArray(bindingProvenance)

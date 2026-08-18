@@ -116,6 +116,8 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
     "createProtectedChild",
     "deleteProtectedChild",
     "replaceProtectedChild",
+    "acquireSqliteStateLease",
+    "releaseSqliteStateLease",
   ]) {
     assert.match(source, new RegExp(`DefineMethod[\\s\\S]+"${method}"`, "u"));
   }
@@ -179,6 +181,25 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   );
   assert.match(source, /FILE_READ_DATA \| GENERIC_WRITE \| DELETE \| READ_CONTROL \| WRITE_DAC/u);
   assert.match(source, /DefineMethod\(env, exports, "replaceFile",/u);
+  assert.match(source, /DefineMethod\(\s*env,\s*exports,\s*"acquireSqliteStateLease",/u);
+  assert.match(source, /DefineMethod\(\s*env,\s*exports,\s*"releaseSqliteStateLease",/u);
+  assert.match(source, /"windows-sqlite-state-lease-v1"/u);
+  assert.match(source, /napi_get_boolean\(env, false, &sqliteStateLeaseSafe\)/u);
+  assert.match(source, /std::mutex gSqliteStateLeasesMutex/u);
+  assert.match(source, /IsIssuedSqliteStateLease/u);
+  assert.match(source, /SqliteStateLeaseContended/u);
+  assert.match(source, /SqliteStateLeaseSidecarPresent/u);
+  assert.match(source, /SqliteStateLeaseMutexName/u);
+  assert.match(source, /CreateMutexExW/u);
+  assert.match(source, /WaitForSingleObject\(mutex, 0\)/u);
+  assert.match(source, /waitResult == WAIT_ABANDONED_0[\s\S]*?ReleaseMutex\(mutex\)/u);
+  assert.match(source, /ownerThreadId != GetCurrentThreadId\(\)/u);
+  assert.match(source, /SqliteStateLeaseReleaseFailed/u);
+  assert.match(source, /FILE_SHARE_READ \| FILE_SHARE_WRITE/u);
+  assert.match(source, /EndsWithInsensitive\(supplied, L"-journal"\)/u);
+  assert.match(source, /EndsWithInsensitive\(supplied, L"-wal"\)/u);
+  assert.match(source, /EndsWithInsensitive\(supplied, L"-shm"\)/u);
+  assert.match(source, /TakeAllHandles\(&rootOpened\)/u);
   assert.match(source, /ArmReplacementPauseCallback/u);
   assert.match(source, /WaitForReplacementPauseCallback/u);
   assert.match(source, /ReleaseReplacementPauseCallback/u);

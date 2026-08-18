@@ -76,11 +76,13 @@ function createFixture({
     contractVersion: "windows-filesystem-v1",
     securityContractVersion: "windows-filesystem-security-v1",
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
+    sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
     credentialAuditFileGuardSafe: true,
+    sqliteStateLeaseSafe: false,
     inspectPath(path) {
       calls.push(["inspectPath", path]);
       const entry = entries.get(path);
@@ -142,6 +144,14 @@ function createFixture({
       entries.set(path, { data: Buffer.from(data), identity });
       return identity;
     },
+    acquireSqliteStateLease() {
+      return {
+        lease: {},
+        databaseIdentity: IDENTITY,
+        journalIdentity: IDENTITY,
+      };
+    },
+    releaseSqliteStateLease() {},
     // These methods model the native root-bound primitives directly.  They
     // intentionally do not delegate to the legacy path-only methods above:
     // tests must prove that the store never bypasses the root identity and
