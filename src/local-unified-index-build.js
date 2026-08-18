@@ -626,6 +626,20 @@ export async function rebuildLocalUnifiedIndex({
   const sourceOrdinals = new Map(
     infos.map((info, ordinal) => [info.rolloutKey, ordinal]),
   );
+  let progressTail = Promise.resolve();
+  let progressFailure = null;
+  function queueProgress() {
+    if (onProgress === null) return;
+    const progress = {
+      ...diagnostics,
+      usageEvents: sink.counts.usageEvents,
+    };
+    progressTail = progressTail
+      .then(() => onProgress(progress))
+      .catch((error) => {
+        progressFailure ??= error;
+      });
+  }
   const sourceState = new Map();
   function stateFor(info) {
     const key = info.rolloutKey;
@@ -830,9 +844,12 @@ export async function rebuildLocalUnifiedIndex({
               message.diagnostics.retainedSnapshotKeys ?? 0,
             );
             if (message.diagnostics.seeded) diagnostics.modelSeededFromLineage += 1;
+            queueProgress();
           }
         },
       })));
+      await progressTail;
+      if (progressFailure !== null) throw progressFailure;
     }
 
     const scannedAt = performance.now();

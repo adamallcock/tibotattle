@@ -8733,11 +8733,15 @@ async function retryIncrementalReviewBootstrap() {
   await refreshContributionSyncControls();
 }
 
-/**
- * Stop only this installation's background upload capability. The hosted
- * contribution account/session remains intact: sign-out and metadata deletion
- * are separate controls with their own explicit confirmation.
- */
+/** Mark the first real local-dashboard render for the native shell. */
+function markLocalDashboardReady() {
+  // The native shell uses this app-owned marker instead of mistaking static
+  // hero copy for a loaded evidence view. It contains no data; it means only
+  // that the first local dashboard result (available or honestly unavailable)
+  // has finished rendering.
+  document.documentElement.dataset.localDashboardReady = "true";
+}
+
 async function loadLocalDashboard() {
   const previousBusy = localActionBusy;
   localActionBusy = true;
@@ -8785,6 +8789,7 @@ async function loadLocalDashboard() {
     await loadIncrementalSyncStatus();
     renderContributionSyncPreview(sync.preview);
     renderLocalOnboarding(onboarding);
+    markLocalDashboardReady();
   } catch {
     const [localHealth, onboarding] = await Promise.all([
       localClient.health().catch(() => null),
@@ -8800,6 +8805,7 @@ async function loadLocalDashboard() {
     renderDashboardUnavailableState(
       localHealth ? "dashboard-unavailable" : "companion-unavailable",
     );
+    markLocalDashboardReady();
   } finally {
     localActionBusy = previousBusy;
     updateLocalActionButtons();

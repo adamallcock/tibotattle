@@ -294,5 +294,13 @@ export function extractToolObservations(payload) {
 
 export function cumulativeSnapshotKey(total, last) {
   if (!total) return null;
-  return [...COMPONENT_KEYS.map((key) => total[key]), ...(last ? COMPONENT_KEYS.map((key) => last[key]) : [])].join("|");
+  let key = `${total.input_tokens ?? ""}|${total.cached_input_tokens ?? ""}`
+    + `|${total.cache_write_input_tokens ?? ""}|${total.output_tokens ?? ""}`
+    + `|${total.reasoning_output_tokens ?? ""}|${total.total_tokens ?? ""}`;
+  if (last) {
+    key += `|${last.input_tokens ?? ""}|${last.cached_input_tokens ?? ""}`
+      + `|${last.cache_write_input_tokens ?? ""}|${last.output_tokens ?? ""}`
+      + `|${last.reasoning_output_tokens ?? ""}|${last.total_tokens ?? ""}`;
+  }
+  return key;
 }

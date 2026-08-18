@@ -18,6 +18,7 @@ import {
   prepareLocalCollectorState,
   LOCAL_COLLECTOR_LEGACY_REFRESH_USE_MAX,
   readLocalCollectorLegacyRefreshUse,
+  readLocalCollectorRecordSummary,
   readLocalCollectorRolloutStalenessSummary,
   readLocalCollectorState,
   recordLocalCollectorLegacyRefreshAttempt,
@@ -602,6 +603,66 @@ test("state record iteration is bounded by rows rather than a whole-ledger read"
     });
     assert.deepEqual(result, { status: "available", recordCount: 2 });
     assert.deepEqual(keys, ["one", "two"]);
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("state summaries and kind filters avoid replaying usage JSON rows", async () => {
+  const value = await fixture();
+  try {
+    await prepareLocalCollectorState({ stateFile: value.stateFile });
+    assert.deepEqual(
+      await readLocalCollectorRecordSummary({ stateFile: value.stateFile }),
+      {
+        status: "available",
+        recordCount: 0,
+        recordCounts: { usage: 0, quota: 0, tools: 0, other: 0 },
+        firstObservedAtMs: null,
+        latestObservedAtMs: null,
+        firstUsageObservedAtMs: null,
+        latestUsageObservedAtMs: null,
+      },
+    );
+    const usage = {
+      schemaVersion: "0.3",
+      kind: "codex_rollout_usage_snapshot",
+      observedAt: "2026-08-03T00:01:00.000Z",
+      eventKey: "usage",
+    };
+    const quota = {
+      kind: "codex_quota_snapshot",
+      observedAt: "2026-08-03T00:02:00.000Z",
+      eventKey: "quota",
+    };
+    await commitLocalCollectorState({
+      stateFile: value.stateFile,
+      checkpoint: checkpoint(),
+      records: [usage, quota, record("tool")],
+    });
+    const selected = [];
+    const selectedResult = await forEachLocalCollectorRecord({
+      stateFile: value.stateFile,
+      kinds: ["codex_tool_class_event", "codex_tool_class_event"],
+      onRecord: (valueRecord) => selected.push(valueRecord.eventKey),
+    });
+    assert.deepEqual(selectedResult, { status: "available", recordCount: 1 });
+    assert.deepEqual(selected, ["tool"]);
+    assert.deepEqual(
+      await readLocalCollectorRecordSummary({
+        stateFile: value.stateFile,
+        maximumUsageObservedAtMs: Date.parse("2026-08-03T00:01:30.000Z"),
+      }),
+      {
+        status: "available",
+        recordCount: 3,
+        recordCounts: { usage: 1, quota: 1, tools: 1, other: 0 },
+        firstObservedAtMs: Date.parse("2026-08-03T00:00:00.000Z"),
+        latestObservedAtMs: Date.parse("2026-08-03T00:02:00.000Z"),
+        firstUsageObservedAtMs: Date.parse("2026-08-03T00:01:00.000Z"),
+        latestUsageObservedAtMs: Date.parse("2026-08-03T00:01:00.000Z"),
+      },
+    );
   } finally {
     await rm(value.root, { recursive: true, force: true });
   }

@@ -46,7 +46,9 @@ export const UNIFIED_COMPANION_PERIOD_LABEL = "All indexed local history";
 
 // Streaming batch for the usage read. Keyset pagination on the observed-at
 // index keeps peak memory at one batch of typed rows regardless of index size.
-const USAGE_READ_BATCH_ROWS = 20_000;
+const USAGE_READ_BATCH_ROWS = 10_000;
+const USAGE_PROCESS_YIELD_ROWS = 2_000;
+const UNIFIED_PROJECTION_MODES = new Set(["full", "deferred"]);
 
 function fixedError(code) {
   const error = new Error(code);
@@ -221,7 +223,11 @@ function readMeta(database, key) {
   return typeof row?.value === "string" ? row.value : null;
 }
 
-function* usageRows(database) {
+function cooperativeYield() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+async function* usageBatches(database) {
   // Rowid keyset pagination: bounded memory (one batch of typed rows) with no
   // per-batch sort. The aggregation downstream is order-independent — periods
   // and timeline buckets key on the row's own timestamp — so arrival order is
@@ -254,9 +260,10 @@ function* usageRows(database) {
   for (;;) {
     const batch = statement.all(afterRowId);
     if (batch.length === 0) return;
-    yield* batch;
+    yield batch;
     afterRowId = Number(batch.at(-1).row_id);
     if (batch.length < USAGE_READ_BATCH_ROWS) return;
+    await cooperativeYield();
   }
 }
 
@@ -399,12 +406,24 @@ export async function readLocalUnifiedCompanionProjection({
   indexFile,
   nowMs = Date.now(),
   declaredSpeedBaselines = [],
+  mode = "full",
 } = {}) {
   if (typeof indexFile !== "string" || indexFile.length < 1) {
     throw new TypeError("indexFile must be a non-empty string");
   }
   if (!Number.isFinite(nowMs)) {
     throw new TypeError("nowMs must be a finite epoch timestamp");
+  }
+  if (!UNIFIED_PROJECTION_MODES.has(mode)) {
+    throw new TypeError("mode must be full or deferred");
+  }
+  // Startup and the refresh controller's provisional headline do not need to
+  // replay the whole unified index before they can publish a useful dashboard.
+  // Their caller falls back to the already replay-safe accounting cache and
+  // labels the full-history projection as loading. The terminal refresh calls
+  // this reader in full mode and replaces that provisional snapshot.
+  if (mode === "deferred") {
+    return unavailable("deferred", "local_unified_index_deferred");
   }
   const baselines = Array.isArray(declaredSpeedBaselines)
     ? declaredSpeedBaselines
@@ -461,40 +480,48 @@ export async function readLocalUnifiedCompanionProjection({
     let firstObservedMs = null;
     let lastObservedMs = null;
     const futureLimitMs = nowMs + 5 * 60_000;
-    for (const row of usageRows(database)) {
-      const observedMs = Number(row.observed_at_ms);
-      if (!Number.isSafeInteger(observedMs) || observedMs > futureLimitMs) {
-        continue;
-      }
-      usageEvents += 1;
-      if (firstObservedMs === null || observedMs < firstObservedMs) {
-        firstObservedMs = observedMs;
-      }
-      if (lastObservedMs === null || observedMs > lastObservedMs) {
-        lastObservedMs = observedMs;
-      }
-      const record = recordShape(row);
-      // An observed tier always wins, so a declaration is only ever looked up
-      // for the turns the rollout log left unobserved — identical to the
-      // collector projection's rule.
-      const projection = usageProjection(
-        record,
-        safeSpeed(record.tierSemantics.codexSpeedMode) === "unknown"
-          ? declaredSpeedModeAt(baselines, observedMs) ?? "unknown"
-          : "unknown",
-        pricer,
-      );
-      if (projection === null) continue;
-      for (const period of periods) {
-        if (observedMs >= period.start) {
-          addUsageToPeriod(period.summary, projection);
+    for await (const batch of usageBatches(database)) {
+      let rowsSinceYield = 0;
+      for (const row of batch) {
+        if (rowsSinceYield === USAGE_PROCESS_YIELD_ROWS) {
+          await cooperativeYield();
+          rowsSinceYield = 0;
         }
+        rowsSinceYield += 1;
+        const observedMs = Number(row.observed_at_ms);
+        if (!Number.isSafeInteger(observedMs) || observedMs > futureLimitMs) {
+          continue;
+        }
+        usageEvents += 1;
+        if (firstObservedMs === null || observedMs < firstObservedMs) {
+          firstObservedMs = observedMs;
+        }
+        if (lastObservedMs === null || observedMs > lastObservedMs) {
+          lastObservedMs = observedMs;
+        }
+        const record = recordShape(row);
+        // An observed tier always wins, so a declaration is only ever looked up
+        // for the turns the rollout log left unobserved — identical to the
+        // collector projection's rule.
+        const projection = usageProjection(
+          record,
+          safeSpeed(record.tierSemantics.codexSpeedMode) === "unknown"
+            ? declaredSpeedModeAt(baselines, observedMs) ?? "unknown"
+            : "unknown",
+          pricer,
+        );
+        if (projection === null) continue;
+        for (const period of periods) {
+          if (observedMs >= period.start) {
+            addUsageToPeriod(period.summary, projection);
+          }
+        }
+        addTimelineUsage(
+          projection.isSpark ? sparkTimelineBuckets : timelineBuckets,
+          observedMs,
+          projection,
+        );
       }
-      addTimelineUsage(
-        projection.isSpark ? sparkTimelineBuckets : timelineBuckets,
-        observedMs,
-        projection,
-      );
     }
     let cacheSwitchImpact;
     let cacheContinuityImpact;

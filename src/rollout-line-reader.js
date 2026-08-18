@@ -114,13 +114,13 @@ export async function forEachRolloutLine(path, {
     if (carryBytes === 0 && !truncated) {
       // Fast path: the whole line arrived inside one chunk. Hand over a view.
       if (segment.length > maximumLineBytes) {
-        return { line: segment.subarray(0, maximumLineBytes), partial: true };
+        truncated = true;
+        return segment.subarray(0, maximumLineBytes);
       }
-      return { line: segment, partial: false };
+      return segment;
     }
     appendSegment(segment);
-    const line = carry.length === 1 ? carry[0] : Buffer.concat(carry, carryBytes);
-    return { line, partial: truncated };
+    return carry.length === 1 ? carry[0] : Buffer.concat(carry, carryBytes);
   }
 
   for await (const chunk of input) {
@@ -132,14 +132,33 @@ export async function forEachRolloutLine(path, {
     for (;;) {
       const newline = chunk.indexOf(NEWLINE, from);
       if (newline < 0) break;
-      const { line, partial } = completeLine(chunk.subarray(from, newline));
+      const line = completeLine(chunk.subarray(from, newline));
+      const partial = truncated;
       const lineEndOffset = absolutePosition + newline + 1;
       carry = [];
       carryBytes = 0;
       truncated = false;
       completeLines += 1;
       if (partial) oversizedLines += 1;
-      await onLine(line, lineEndOffset, partial);
+      const pending = onLine(line, lineEndOffset, partial);
+      if (pending !== null
+          && (typeof pending === "object" || typeof pending === "function")) {
+        if (pending instanceof Promise) {
+          await pending;
+        } else {
+          // Avoid an await/Promise assimilation on the overwhelmingly common
+          // synchronous callback path, while still preserving foreign
+          // thenable behavior for asynchronous callers.
+          const then = pending.then;
+          if (typeof then === "function") {
+            await {
+              then(resolve, reject) {
+                Reflect.apply(then, pending, [resolve, reject]);
+              },
+            };
+          }
+        }
+      }
       nextOffset = lineEndOffset;
       from = newline + 1;
       if (signal?.aborted) {

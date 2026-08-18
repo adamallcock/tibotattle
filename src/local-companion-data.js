@@ -61,6 +61,7 @@ import {
   defaultLocalCollectorStatePath,
   forEachLocalCollectorRecord,
   prepareLocalCollectorState,
+  readLocalCollectorRecordSummary,
   readLocalCollectorState,
 } from "./local-collector-state.js";
 import {
@@ -1363,8 +1364,19 @@ async function readCollectorProjection(
       start: nowMs - RECENT_TIMELINE_DAYS * 24 * 60 * 60 * 1_000,
     },
   ];
+  const indexedSummary = summarizeUsageEvents
+    ? null
+    : await readLocalCollectorRecordSummary({
+      stateFile,
+      maximumUsageObservedAtMs: nowMs + 5 * 60_000,
+    });
+  if (indexedSummary?.status === "missing") throw fixedError("collector_unavailable");
+  if (indexedSummary !== null && indexedSummary.recordCount > MAX_LEDGER_RECORDS) {
+    throw fixedError("collector_invalid_size");
+  }
   const toolCounts = Object.fromEntries([...KNOWN_TOOL_CLASSES].map((toolClass) => [toolClass, 0]));
-  const recordCounts = { usage: 0, quota: 0, tools: 0, other: 0 };
+  const recordCounts = indexedSummary?.recordCounts
+    ?? { usage: 0, quota: 0, tools: 0, other: 0 };
   const pricer = createAccountingPricer();
   const recentStartMs = nowMs - RECENT_TIMELINE_DAYS * 24 * 60 * 60 * 1_000;
   const timelineBuckets = new Map();
@@ -1372,105 +1384,88 @@ async function readCollectorProjection(
   const quotaTimeline = [];
   const weeklyPaceSnapshots = [];
   let toolTotal = 0;
-  let recordCount = 0;
+  let recordCount = indexedSummary?.recordCount ?? 0;
   const malformedLines = Number.isSafeInteger(state.migration?.source?.malformedLines)
     ? state.migration.source.malformedLines
     : 0;
-  let firstRecordAt = null;
-  let latestRecordAt = null;
-  let firstExportableRecordAt = null;
-  let latestExportableRecordAt = null;
+  let firstRecordAt = indexedSummary?.firstObservedAtMs ?? null;
+  let latestRecordAt = indexedSummary?.latestObservedAtMs ?? null;
+  let firstExportableRecordAt = indexedSummary?.firstUsageObservedAtMs ?? null;
+  let latestExportableRecordAt = indexedSummary?.latestUsageObservedAtMs ?? null;
   let latestQuotaRecord = null;
-  await forEachLocalCollectorRecord({ stateFile, onRecord: async (value) => {
-    recordCount += 1;
-    if (recordCount > MAX_LEDGER_RECORDS) throw fixedError("collector_invalid_size");
-    const observedMs = validObservedAt(value);
-    if (observedMs !== null && (firstRecordAt === null || observedMs < firstRecordAt)) {
-      firstRecordAt = observedMs;
-    }
-    if (observedMs !== null && (latestRecordAt === null || observedMs > latestRecordAt)) {
-      latestRecordAt = observedMs;
-    }
-    if (value.kind === "codex_quota_snapshot") {
-      recordCounts.quota += 1;
-    } else if (value.kind === "codex_rollout_usage_snapshot") {
-      recordCounts.usage += 1;
-    } else if (value.kind === "codex_tool_class_event") {
-      recordCounts.tools += 1;
-    } else {
-      recordCounts.other += 1;
-    }
-    if (value.kind === "codex_quota_snapshot" && observedMs !== null) {
-      if (latestQuotaRecord === null
-          || value.observedAt.localeCompare(latestQuotaRecord.observedAt) > 0) {
-        latestQuotaRecord = value;
+  await forEachLocalCollectorRecord({
+    stateFile,
+    // When replay-safe usage already exists, only records that still feed the
+    // live quota, pace, and tool projections need JSON parsing. Counts and
+    // time bounds above come from the same indexed collector rows.
+    kinds: indexedSummary === null
+      ? null
+      : ["codex_quota_snapshot", "codex_tool_class_event"],
+    onRecord: (value) => {
+      if (indexedSummary === null) {
+        recordCount += 1;
+        if (recordCount > MAX_LEDGER_RECORDS) {
+          throw fixedError("collector_invalid_size");
+        }
       }
-      if (observedMs >= recentStartMs && observedMs <= nowMs + 5 * 60_000) {
-        weeklyPaceSnapshots.push(
-          ...weeklyPaceSnapshotsFromCollectorRecord(value),
-        );
-        if (weeklyPaceSnapshots.length > MAX_WEEKLY_PACE_OBSERVATIONS * 2) {
-          weeklyPaceSnapshots.sort((left, right) => (
-            left.observedAt.localeCompare(right.observedAt)
-            || left.receivedAt.localeCompare(right.receivedAt)
-            || left.accountTrackId.localeCompare(right.accountTrackId)
-            || left.slot.localeCompare(right.slot)
-          ));
-          weeklyPaceSnapshots.splice(
-            0,
-            weeklyPaceSnapshots.length - MAX_WEEKLY_PACE_OBSERVATIONS,
+      const observedMs = validObservedAt(value);
+      if (indexedSummary === null) {
+        if (observedMs !== null
+            && (firstRecordAt === null || observedMs < firstRecordAt)) {
+          firstRecordAt = observedMs;
+        }
+        if (observedMs !== null
+            && (latestRecordAt === null || observedMs > latestRecordAt)) {
+          latestRecordAt = observedMs;
+        }
+        if (value.kind === "codex_quota_snapshot") {
+          recordCounts.quota += 1;
+        } else if (value.kind === "codex_rollout_usage_snapshot") {
+          recordCounts.usage += 1;
+        } else if (value.kind === "codex_tool_class_event") {
+          recordCounts.tools += 1;
+        } else {
+          recordCounts.other += 1;
+        }
+      }
+      if (value.kind === "codex_quota_snapshot" && observedMs !== null) {
+        if (latestQuotaRecord === null
+            || value.observedAt.localeCompare(latestQuotaRecord.observedAt) > 0) {
+          latestQuotaRecord = value;
+        }
+        if (observedMs >= recentStartMs && observedMs <= nowMs + 5 * 60_000) {
+          weeklyPaceSnapshots.push(
+            ...weeklyPaceSnapshotsFromCollectorRecord(value),
           );
+          if (weeklyPaceSnapshots.length > MAX_WEEKLY_PACE_OBSERVATIONS * 2) {
+            weeklyPaceSnapshots.sort((left, right) => (
+              left.observedAt.localeCompare(right.observedAt)
+              || left.receivedAt.localeCompare(right.receivedAt)
+              || left.accountTrackId.localeCompare(right.accountTrackId)
+              || left.slot.localeCompare(right.slot)
+            ));
+            weeklyPaceSnapshots.splice(
+              0,
+              weeklyPaceSnapshots.length - MAX_WEEKLY_PACE_OBSERVATIONS,
+            );
+          }
+        }
+        if (observedMs >= recentStartMs && observedMs <= nowMs + 5 * 60_000) {
+          for (const window of Array.isArray(value.windows) ? value.windows : []) {
+            const projected = quotaWindowProjection(window);
+            if (projected === null) continue;
+            quotaTimeline.push({
+              observedAt: new Date(observedMs).toISOString(),
+              ...projected,
+              accountAttribution: value.accountScope?.status === "available"
+                ? "attributed_pseudonymous"
+                : "unattributed",
+            });
+          }
         }
       }
-      if (observedMs >= recentStartMs && observedMs <= nowMs + 5 * 60_000) {
-        for (const window of Array.isArray(value.windows) ? value.windows : []) {
-          const projected = quotaWindowProjection(window);
-          if (projected === null) continue;
-          quotaTimeline.push({
-            observedAt: new Date(observedMs).toISOString(),
-            ...projected,
-            accountAttribution: value.accountScope?.status === "available"
-              ? "attributed_pseudonymous"
-              : "unattributed",
-          });
-        }
-      }
-    }
-    if (value.kind === "codex_rollout_usage_snapshot"
-        && observedMs !== null && observedMs <= nowMs + 5 * 60_000) {
-      if (firstExportableRecordAt === null
-          || observedMs < firstExportableRecordAt) {
-        firstExportableRecordAt = observedMs;
-      }
-      if (latestExportableRecordAt === null
-          || observedMs > latestExportableRecordAt) {
-        latestExportableRecordAt = observedMs;
-      }
-      if (summarizeUsageEvents) {
-        const observedSpeed = safeSpeed(value.tierSemantics?.codexSpeedMode);
-        // An observed tier always wins, so a declaration is only ever looked
-        // up for the turns the rollout log left unobserved.
-        const projection = usageProjection(
-          value,
-          observedSpeed === "unknown"
-            ? declaredSpeedModeAt(declaredSpeedBaselines, observedMs) ?? "unknown"
-            : "unknown",
-          pricer,
-        );
-        for (const period of periods) {
-          if (observedMs >= period.start) addUsageToPeriod(period.summary, projection);
-        }
-        if (observedMs >= recentStartMs) {
-          addTimelineUsage(
-            projection?.isSpark ? sparkTimelineBuckets : timelineBuckets,
-            observedMs,
-            projection,
-          );
-        }
-      }
-    }
-    if (value.kind === "codex_tool_class_event") {
-      if (observedMs !== null && observedMs <= nowMs + 5 * 60_000) {
+      if (value.kind === "codex_rollout_usage_snapshot"
+          && observedMs !== null && observedMs <= nowMs + 5 * 60_000) {
         if (firstExportableRecordAt === null
             || observedMs < firstExportableRecordAt) {
           firstExportableRecordAt = observedMs;
@@ -1479,12 +1474,46 @@ async function readCollectorProjection(
             || observedMs > latestExportableRecordAt) {
           latestExportableRecordAt = observedMs;
         }
+        if (summarizeUsageEvents) {
+          const observedSpeed = safeSpeed(value.tierSemantics?.codexSpeedMode);
+          // An observed tier always wins, so a declaration is only ever looked
+          // up for the turns the rollout log left unobserved.
+          const projection = usageProjection(
+            value,
+            observedSpeed === "unknown"
+              ? declaredSpeedModeAt(declaredSpeedBaselines, observedMs) ?? "unknown"
+              : "unknown",
+            pricer,
+          );
+          for (const period of periods) {
+            if (observedMs >= period.start) addUsageToPeriod(period.summary, projection);
+          }
+          if (observedMs >= recentStartMs) {
+            addTimelineUsage(
+              projection?.isSpark ? sparkTimelineBuckets : timelineBuckets,
+              observedMs,
+              projection,
+            );
+          }
+        }
       }
-      const toolClass = KNOWN_TOOL_CLASSES.has(value.toolClass) ? value.toolClass : "other";
-      toolCounts[toolClass] += 1;
-      toolTotal += 1;
-    }
-  } });
+      if (value.kind === "codex_tool_class_event") {
+        if (observedMs !== null && observedMs <= nowMs + 5 * 60_000) {
+          if (firstExportableRecordAt === null
+              || observedMs < firstExportableRecordAt) {
+            firstExportableRecordAt = observedMs;
+          }
+          if (latestExportableRecordAt === null
+              || observedMs > latestExportableRecordAt) {
+            latestExportableRecordAt = observedMs;
+          }
+        }
+        const toolClass = KNOWN_TOOL_CLASSES.has(value.toolClass) ? value.toolClass : "other";
+        toolCounts[toolClass] += 1;
+        toolTotal += 1;
+      }
+    },
+  });
   if (weeklyPaceSnapshots.length > MAX_WEEKLY_PACE_OBSERVATIONS) {
     weeklyPaceSnapshots.sort((left, right) => (
       left.observedAt.localeCompare(right.observedAt)
@@ -2181,6 +2210,11 @@ export async function buildLocalCompanionSnapshot({
   // timelines draw from its whole fork-replay-suppressed history; when it is
   // absent the snapshot says so and stays on the bounded recent window.
   unifiedIndexFile = defaultLocalUnifiedIndexPath(root),
+  // Startup and the quick-result publication may defer the expensive
+  // full-history projection. They still use the replay-safe accounting cache
+  // and current collector evidence; the terminal refresh always rebuilds in
+  // full mode before it becomes authoritative.
+  unifiedProjectionMode = "full",
   allowDevelopmentArtifactFallback = false,
   // Owner-stated Codex speed mode. The composition root reads it from
   // owner-only local state; an unrecognised value never becomes a silent Fast.
@@ -2300,6 +2334,7 @@ export async function buildLocalCompanionSnapshot({
         indexFile: unifiedIndexFile,
         nowMs,
         declaredSpeedBaselines,
+        mode: unifiedProjectionMode,
       }),
       sideChatEstimatePromise,
       sideChatHistoricalGapPromise,
@@ -2620,6 +2655,14 @@ export async function buildLocalCompanionSnapshot({
         sourceCount: unified.sourceCount,
         indexBytes: unified.indexBytes,
       }
+    : unified.status === "deferred"
+      ? {
+        status: "loading",
+        reason: "unified_index_deferred",
+        source: timelineSource,
+        coveredAt: replaySafeCache?.coveredAt
+          ?? collector.timeline.coveredAt,
+      }
     : {
       status: "unavailable",
       reason: unified.status === "missing"
@@ -2684,15 +2727,23 @@ export async function buildLocalCompanionSnapshot({
     );
   }
   if (unifiedAccountingWithheld) {
-    warnings.push(unifiedAuthorityPartial
-      ? "The unified local index is readable but only partially covered. Usage totals and timelines are withheld until a complete generation-bound publication is available."
-      : unified.status === "missing"
-        ? "The unified local index has not been built yet. Usage totals and timelines remain unavailable until a complete generation-bound publication is available."
-        : "The unified local index is unavailable. Usage totals and timelines remain unavailable until a complete generation-bound publication is available.");
+    warnings.push(unified.status === "deferred"
+      ? "Full indexed history is loading. The latest replay-safe snapshot is shown meanwhile and will be replaced only by the completed full projection."
+      : unifiedAuthorityPartial
+        ? "The unified local index is readable but only partially covered. Usage totals and timelines are withheld until a complete generation-bound publication is available."
+        : unified.status === "missing"
+          ? "The unified local index has not been built yet. Usage totals and timelines remain unavailable until a complete generation-bound publication is available."
+          : "The unified local index is unavailable. Usage totals and timelines remain unavailable until a complete generation-bound publication is available.");
   } else if (!unifiedAvailable) {
-    warnings.push(unified.status === "missing"
-      ? `The unified local index has not been built yet. Usage history and the broadest period are bounded to the recent ${RECENT_TIMELINE_DAYS}-day collector window until it is.`
-      : `The unified local index is unreadable. Usage history and the broadest period are bounded to the recent ${RECENT_TIMELINE_DAYS}-day collector window until it recovers.`);
+    if (unified.status === "deferred") {
+      warnings.push(
+        "Full indexed history is loading. The latest replay-safe snapshot is shown meanwhile and will be replaced only by the completed full projection.",
+      );
+    } else {
+      warnings.push(unified.status === "missing"
+        ? `The unified local index has not been built yet. Usage history and the broadest period are bounded to the recent ${RECENT_TIMELINE_DAYS}-day collector window until it is.`
+        : `The unified local index is unreadable. Usage history and the broadest period are bounded to the recent ${RECENT_TIMELINE_DAYS}-day collector window until it recovers.`);
+    }
   } else {
     const indexEndMs = Date.parse(unified.coveredAt.endAt ?? "");
     // In unified authority mode rollout ingestion is deliberately skipped in
@@ -3146,13 +3197,13 @@ export class LocalCompanionDataStore {
     this.#builder = builder;
   }
 
-  async initialize() {
-    if (this.#snapshot === null) await this.reload();
+  async initialize(options) {
+    if (this.#snapshot === null) await this.reload(options);
     return this.getOverview();
   }
 
-  async reload() {
-    const candidate = await this.#builder();
+  async reload(options) {
+    const candidate = await this.#builder(options);
     if (!candidate || candidate.schemaVersion !== LOCAL_COMPANION_SCHEMA_VERSION) {
       throw fixedError("snapshot_invalid");
     }

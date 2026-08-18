@@ -2291,7 +2291,7 @@ function createPreparedLocalCompanionServer({
     configFile: join(codexHome, "config.toml"),
   }),
   dataStore = new LocalCompanionDataStore({
-    builder: async () => buildLocalCompanionSnapshot({
+    builder: async ({ purpose = "full" } = {}) => buildLocalCompanionSnapshot({
       root: resourceRoot,
       collectorStateFile: statePaths.collectorStateFile,
       archiveIndexFile: accountingSourceMode === "legacy"
@@ -2300,6 +2300,9 @@ function createPreparedLocalCompanionServer({
       unifiedIndexFile: statePaths.unifiedIndexFile,
       codexHome,
       accountingSourceMode,
+      unifiedProjectionMode: ["startup", "quick"].includes(purpose)
+        ? "deferred"
+        : "full",
       allowDevelopmentArtifactFallback:
         environment.USAGE_MONITOR_DEVELOPMENT_ARTIFACT_FALLBACK === "1",
       includeDevelopmentSideChatEstimates:

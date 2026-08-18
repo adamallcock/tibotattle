@@ -2131,6 +2131,32 @@ test("a missing unified index keeps the bounded window and says so in the payloa
   }
 });
 
+test("a deferred unified projection publishes a loading history receipt", async () => {
+  const root = await fixtureRoot();
+  try {
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      unifiedProjectionMode: "deferred",
+      allowDevelopmentArtifactFallback: true,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.deepEqual(snapshot.overview.timeline.history, {
+      status: "loading",
+      reason: "unified_index_deferred",
+      source: "recent_collector_window",
+      coveredAt: {
+        startAt: null,
+        endAt: null,
+      },
+    });
+    assert.ok(snapshot.overview.warnings.some((warning) => (
+      warning.includes("Full indexed history is loading")
+    )));
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("unified mode with no valid generation withholds the provisional collector projection", async () => {
   const root = await fixtureRoot();
   try {
