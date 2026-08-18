@@ -20,7 +20,10 @@ export const WINDOWS_PROTECTED_STATE_STORE_CONTRACT_VERSION =
   "windows-protected-state-store-v1";
 export const WINDOWS_PROTECTED_STATE_STORE_LEASE_VERSION =
   "windows-protected-state-store-lease-v1";
-export const WINDOWS_PROTECTED_STATE_STORE_DEFAULT_MAX_BYTES = 8 * 1024 * 1024;
+// Keep the store's bound at or below the native adapter's authenticated
+// read ceiling.  The native implementation currently rejects a larger
+// request before allocating a result buffer.
+export const WINDOWS_PROTECTED_STATE_STORE_DEFAULT_MAX_BYTES = 1024 * 1024;
 // These are explicit readiness facts, not claims.  The current native
 // adapter does not bind a root identity/handle to each child operation, and
 // its read method can materialize more than this store's post-read bound.
@@ -169,6 +172,10 @@ function splitRelativeName(name) {
     fail("path_escape");
   }
   return components;
+}
+
+function canonicalRelativeName(name) {
+  return splitRelativeName(name).join("\\");
 }
 
 function childPath(root, name) {
@@ -435,19 +442,29 @@ export function createWindowsProtectedStateStore(options = {}) {
   }
 
   function pathFor(name) {
-    // Revalidate the expected root before each access.  This detects a root
-    // identity change observed before the child call, but is not an atomic
-    // root binding: the native adapter must bind the root identity/handle to
-    // the child operation before `rootBindingSafe` can become true.
-    inspectRoot();
-    return childPath(root, name);
+    const relativeName = canonicalRelativeName(name);
+    // Revalidate the expected root before each access.  The native protected
+    // child primitive receives this exact identity and binds it to the child
+    // operation; the readiness flag remains false until that behavior is
+    // proven on Windows.
+    const expectedRootIdentity = inspectRoot();
+    return Object.freeze({
+      path: childPath(root, relativeName),
+      relativeName,
+      rootIdentity: expectedRootIdentity,
+    });
   }
 
   function read(name) {
-    const path = pathFor(name);
+    const reference = pathFor(name);
     let result;
     try {
-      result = adapter.readFile(path);
+      result = adapter.readProtectedChild(
+        root,
+        reference.rootIdentity,
+        reference.relativeName,
+        maxBytes,
+      );
     } catch (error) {
       mapAdapterError(error, "read");
     }
@@ -465,16 +482,21 @@ export function createWindowsProtectedStateStore(options = {}) {
       if (isWindowsProtectedStateStoreError(error)) throw error;
       fail("unavailable");
     }
-    return Object.freeze({ data, identity, path });
+    return Object.freeze({ data, identity, path: reference.path });
   }
 
   function create(name, data) {
-    const path = pathFor(name);
+    const reference = pathFor(name);
     const bytes = toBoundedBytes(data, maxBytes);
     try {
       return Object.freeze({
-        path,
-        identity: exactIdentity(adapter.createFile(path, bytes)),
+        path: reference.path,
+        identity: exactIdentity(adapter.createProtectedChild(
+          root,
+          reference.rootIdentity,
+          reference.relativeName,
+          bytes,
+        )),
       });
     } catch (error) {
       mapAdapterError(error, "create");
@@ -482,13 +504,19 @@ export function createWindowsProtectedStateStore(options = {}) {
   }
 
   function replace(name, expectedIdentity, data) {
-    const path = pathFor(name);
+    const reference = pathFor(name);
     const expected = exactIdentity(expectedIdentity);
     const bytes = toBoundedBytes(data, maxBytes);
     try {
       return Object.freeze({
-        path,
-        identity: exactIdentity(adapter.replaceFile(path, expected, bytes)),
+        path: reference.path,
+        identity: exactIdentity(adapter.replaceProtectedChild(
+          root,
+          reference.rootIdentity,
+          reference.relativeName,
+          expected,
+          bytes,
+        )),
       });
     } catch (error) {
       mapAdapterError(error, "replace");
@@ -496,12 +524,21 @@ export function createWindowsProtectedStateStore(options = {}) {
   }
 
   function remove(name, expectedIdentity) {
-    const path = pathFor(name);
+    const reference = pathFor(name);
     const expected = exactIdentity(expectedIdentity);
     try {
-      const result = adapter.deleteFile(path, expected);
+      const result = adapter.deleteProtectedChild(
+        root,
+        reference.rootIdentity,
+        reference.relativeName,
+        expected,
+      );
       if (result?.deleted !== true) fail("unavailable");
-      return Object.freeze({ deleted: true, path, identity: exactIdentity(result.identity) });
+      return Object.freeze({
+        deleted: true,
+        path: reference.path,
+        identity: exactIdentity(result.identity),
+      });
     } catch (error) {
       mapAdapterError(error, "delete");
     }
@@ -529,7 +566,7 @@ export function createWindowsProtectedStateStore(options = {}) {
       } catch (error) {
         if (isWindowsProtectedStateStoreError(error)
             && error.code === "windows_protected_state_store_missing") {
-          return Object.freeze({ deleted: false, path: childPath(root, name) });
+          return Object.freeze({ deleted: false, path: childPath(root, canonicalRelativeName(name)) });
         }
         throw error;
       }
@@ -538,7 +575,7 @@ export function createWindowsProtectedStateStore(options = {}) {
   }
 
   function acquireOperationLease(name) {
-    const path = pathFor(name);
+    const reference = pathFor(name);
     let candidateId;
     try {
       candidateId = idFactory();
@@ -551,12 +588,23 @@ export function createWindowsProtectedStateStore(options = {}) {
     const bytes = Buffer.from(`${WINDOWS_PROTECTED_STATE_STORE_LEASE_VERSION}:${candidateId}\n`, "utf8");
     let identity;
     try {
-      identity = exactIdentity(adapter.createFile(path, bytes));
+      identity = exactIdentity(adapter.createProtectedChild(
+        root,
+        reference.rootIdentity,
+        reference.relativeName,
+        bytes,
+      ));
     } catch (error) {
       mapAdapterError(error, "lease");
     }
-    const lease = makeLeaseRecord(path, identity);
-    const record = { active: true, identity, path };
+    const lease = makeLeaseRecord(reference.path, identity);
+    const record = {
+      active: true,
+      identity,
+      path: reference.path,
+      relativeName: reference.relativeName,
+      rootIdentity: reference.rootIdentity,
+    };
     records.set(lease, record);
     try {
       safeAudit(audit, { event: "lease_acquired" });
@@ -566,7 +614,12 @@ export function createWindowsProtectedStateStore(options = {}) {
       records.delete(lease);
       let cleanupFailed = false;
       try {
-        const result = adapter.deleteFile(path, identity);
+        const result = adapter.deleteProtectedChild(
+          root,
+          reference.rootIdentity,
+          reference.relativeName,
+          identity,
+        );
         cleanupFailed = result?.deleted !== true;
       } catch {
         cleanupFailed = true;
@@ -588,7 +641,12 @@ export function createWindowsProtectedStateStore(options = {}) {
     if (!record) fail("lease_foreign");
     if (!record.active) fail("lease_released");
     try {
-      const result = adapter.deleteFile(record.path, record.identity);
+      const result = adapter.deleteProtectedChild(
+        root,
+        record.rootIdentity,
+        record.relativeName,
+        record.identity,
+      );
       if (result?.deleted !== true) fail("lease_release_failed");
       // Mark inactive only after the exact identity-bound deletion succeeds.
       // A failed release remains retryable, while audit failure after this
@@ -647,6 +705,21 @@ export function createWindowsProtectedStateStore(options = {}) {
     acquireOperationLease,
     releaseOperationLease,
     withOperationLease,
+    inspect(name) {
+      const reference = pathFor(name);
+      let metadata;
+      try {
+        metadata = adapter.inspectProtectedChild(
+          root,
+          reference.rootIdentity,
+          reference.relativeName,
+        );
+      } catch (error) {
+        mapAdapterError(error, "inspect");
+      }
+      const identity = validateSecurityMetadata(metadata, false);
+      return Object.freeze({ ...metadata, identity, path: reference.path });
+    },
   });
   CONTEXTS.add(context);
   ensureProtectedDirectory();
