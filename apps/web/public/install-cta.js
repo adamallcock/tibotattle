@@ -126,6 +126,75 @@ export function configuredInstallerRelease(documentRef) {
   };
 }
 
+/**
+ * Return the published DMG's basename for local verification commands. The
+ * release-site builder already validates the URL as an HTTPS `.dmg`; this
+ * narrower check keeps shell examples fail-closed if a future release URL
+ * carries an unexpected path segment or encoded character.
+ */
+export function installerFileName(installerUrl) {
+  if (typeof installerUrl !== "string") return null;
+  try {
+    const pathname = new URL(installerUrl).pathname;
+    const encodedName = pathname.slice(pathname.lastIndexOf("/") + 1);
+    const name = decodeURIComponent(encodedName);
+    return /^[A-Za-z0-9][A-Za-z0-9._-]*\.dmg$/u.test(name) ? name : null;
+  } catch {
+    return null;
+  }
+}
+
+function shellQuote(value) {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * Materialize the trust disclosure only when the release metadata passed the
+ * same closed installer contract as the download CTA. Version, filename, and
+ * checksum therefore come from the generated release-site metadata rather
+ * than becoming stale source literals in the page.
+ */
+export function renderInstallerTrust(documentRef, release) {
+  const select = (selector) => documentRef.querySelector(selector);
+  const disclosure = select("#download-trust");
+  if (!disclosure) return null;
+  const dynamicIds = [
+    "installer-trust-version",
+    "installer-trust-sha256",
+    "installer-trust-sha-command",
+    "installer-trust-app-command",
+    "installer-trust-signature-command",
+    "installer-trust-deep-command",
+    "installer-trust-dmg-command",
+  ];
+  const fileName = installerFileName(release?.installerUrl);
+  if (!release || fileName === null) {
+    disclosure.hidden = true;
+    for (const id of dynamicIds) select(`#${id}`).textContent = "";
+    return null;
+  }
+
+  const quotedFileName = shellQuote(fileName);
+  const commands = {
+    "installer-trust-sha-command": `shasum -a 256 ${quotedFileName}`,
+    "installer-trust-app-command":
+      "spctl --assess --type execute --verbose=4 /Applications/TiboTattle.app",
+    "installer-trust-signature-command":
+      "codesign -dv --verbose=4 /Applications/TiboTattle.app",
+    "installer-trust-deep-command":
+      "codesign --verify --deep --strict --verbose=2 /Applications/TiboTattle.app",
+    "installer-trust-dmg-command":
+      `spctl --assess --type open --context context:primary-signature --verbose=4 ${quotedFileName}`,
+  };
+  select("#installer-trust-version").textContent = release.version;
+  select("#installer-trust-sha256").textContent = release.sha256;
+  for (const [id, command] of Object.entries(commands)) {
+    select(`#${id}`).textContent = command;
+  }
+  disclosure.hidden = false;
+  return Object.freeze({ fileName, commands });
+}
+
 export function formatInstallerSize(bytes, {
   formatLocale = getFormattingLocale(),
   translateMessage = defaultMessage,

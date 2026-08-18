@@ -27,7 +27,9 @@ import {
   compactMacOSVersion,
   configuredInstallerRelease,
   formatInstallerSize,
+  installerFileName,
   renderInstallerJourney,
+  renderInstallerTrust,
 } from "../public/install-cta.js";
 
 const SITE_HTML = new URL("../public/community.html", import.meta.url);
@@ -175,6 +177,14 @@ test("the public site presents only the install call to action and the community
     /id="installer-sha256-copy"[\s\S]*?aria-describedby="installer-sha256-copy-status"/u,
   );
   assert.match(html, /id="installer-sha256"[\s\S]*?data-i18n-skip[\s\S]*?hidden/u);
+  assert.match(html, /id="download-trust"[^>]*hidden/u);
+  assert.match(html, /How can I trust this download\?/u);
+  assert.match(html, /Developer ID signed/u);
+  assert.match(html, /Apple notarized/u);
+  assert.match(html, /Published SHA-256/u);
+  assert.match(html, /id="installer-trust-sha-command"/u);
+  assert.match(html, /id="installer-trust-dmg-command"/u);
+  assert.match(html, /A checksum proves integrity, not safety\./u);
   assert.doesNotMatch(html, /installer-verification|role="tooltip"/u);
   assert.match(html, /id="installer-unavailable"/u);
   assert.match(html, /id="homebrew-install"[^>]*hidden/u);
@@ -1504,6 +1514,27 @@ test("the install card refuses a partially injected release", () => {
     assert.equal(Object.hasOwn(compact.byId.get(id), "href"), false, id);
   }
 
+  assert.equal(installerFileName(complete["usage-monitor-installer-url"]), "TiboTattle.dmg");
+  const trust = fakeDocument(complete);
+  const trustRelease = configuredInstallerRelease(trust);
+  const renderedTrust = renderInstallerTrust(trust, trustRelease);
+  assert.equal(renderedTrust.fileName, "TiboTattle.dmg");
+  assert.equal(trust.byId.get("download-trust").hidden, false);
+  assert.equal(trust.byId.get("installer-trust-version").textContent, "1.2.3");
+  assert.equal(trust.byId.get("installer-trust-sha256").textContent, "a".repeat(64));
+  assert.equal(
+    trust.byId.get("installer-trust-sha-command").textContent,
+    "shasum -a 256 'TiboTattle.dmg'",
+  );
+  assert.match(
+    trust.byId.get("installer-trust-app-command").textContent,
+    /spctl --assess --type execute --verbose=4 \/Applications\/TiboTattle\.app/u,
+  );
+  assert.match(
+    trust.byId.get("installer-trust-dmg-command").textContent,
+    /context:primary-signature --verbose=4 'TiboTattle\.dmg'/u,
+  );
+
   for (
     const [name, hostile] of [
       ["usage-monitor-installer-url", "http://downloads.example.org/x.dmg"],
@@ -1517,6 +1548,8 @@ test("the install card refuses a partially injected release", () => {
     const documentRef = fakeDocument({ ...complete, [name]: hostile });
     assert.equal(configuredInstallerRelease(documentRef), null, `${name}=${hostile}`);
     assert.equal(renderInstallerJourney(documentRef), null);
+    assert.equal(renderInstallerTrust(documentRef, null), null);
+    assert.equal(documentRef.byId.get("download-trust").hidden, true);
     assert.equal(documentRef.byId.get("installer-link").hidden, true);
     assert.equal(documentRef.byId.get("installer-unavailable-action").hidden, true);
     assert.equal(documentRef.byId.get("installer-unavailable").hidden, false);
