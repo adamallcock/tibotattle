@@ -217,7 +217,7 @@ test("an unrecorded mode is weighted from the preference and never defaults to o
   assert.equal(mixed.coverage.unknownSharePercent, 100);
 });
 
-test("coverage reports observed, assumed, inferred and remaining unknown shares", () => {
+test("coverage partitions provenance while inference remains an unknown overlap", () => {
   const summary = summarizeQuotaWeightedAccounting({
     speedWeighting: crossing([
       ["fast", "gpt-5.6", 2, 4],
@@ -234,24 +234,39 @@ test("coverage reports observed, assumed, inferred and remaining unknown shares"
     declaredFromConfigEvents: 0,
     assumedFromPreferenceEvents: 0,
     inferredEvents: 4,
-    unknownEvents: 2,
+    unknownEvents: 6,
     observedSharePercent: 40,
-    unknownSharePercent: 20,
+    unknownSharePercent: 60,
   });
+  assert.equal(
+    summary.coverage.observedEvents
+      + summary.coverage.declaredFromConfigEvents
+      + summary.coverage.assumedFromPreferenceEvents
+      + summary.coverage.unknownEvents,
+    summary.coverage.totalEvents,
+  );
+  assert.ok(summary.coverage.inferredEvents <= summary.coverage.unknownEvents);
   // Inference labels windows, so it never moves the weighted total.
   assert.equal(summary.inference.appliedToWeighting, false);
   assert.equal(summary.inference.inferredFastWindows, 2);
   assert.equal(summary.quotaWeightedApiPriceEquivalentUsd, 14);
 });
 
-test("inferred event counts can never exceed the unknown events they reclassify", () => {
+test("inferred event counts clamp to unknown provenance without subtracting it", () => {
   const summary = summarizeQuotaWeightedAccounting({
     speedWeighting: crossing([["unknown", "gpt-5.6", 3, 6]]),
     preference: "mixed_unknown",
     inferredFastEvents: 99,
   });
   assert.equal(summary.coverage.inferredEvents, 3);
-  assert.equal(summary.coverage.unknownEvents, 0);
+  assert.equal(summary.coverage.unknownEvents, 3);
+  assert.equal(
+    summary.coverage.observedEvents
+      + summary.coverage.declaredFromConfigEvents
+      + summary.coverage.assumedFromPreferenceEvents
+      + summary.coverage.unknownEvents,
+    summary.coverage.totalEvents,
+  );
 });
 
 function window(id, capacityUsd, overrides = {}) {

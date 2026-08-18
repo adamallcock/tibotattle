@@ -1798,9 +1798,9 @@ test("the closed accounting normalizer keeps the quota-weighted metric and its c
           observedEvents: 6,
           assumedFromPreferenceEvents: 0,
           inferredEvents: 3,
-          unknownEvents: 1,
+          unknownEvents: 4,
           observedSharePercent: 60,
-          unknownSharePercent: 10
+          unknownSharePercent: 40
         },
         inference: {
           status: "inferred",
@@ -1826,10 +1826,12 @@ test("the closed accounting normalizer keeps the quota-weighted metric and its c
     observedEvents: 6,
     assumedFromPreferenceEvents: 0,
     inferredEvents: 3,
-    unknownEvents: 1,
+    unknownEvents: 4,
     observedSharePercent: 60,
-    unknownSharePercent: 10
+    unknownSharePercent: 40
   });
+  assert.ok(accounting.fastMode.coverage.inferredEvents
+    <= accounting.fastMode.coverage.unknownEvents);
   // The multipliers and the metric name are stated by this page, never taken
   // from the server, and inference can never be reported as weighted.
   assert.deepEqual(accounting.fastMode.multipliers, {
