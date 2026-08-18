@@ -30,6 +30,11 @@ export {
   createWindowsProductionReadinessAttestation,
 } from "./windows-production-readiness.js";
 export {
+  assertWindowsFilesystemProductionSafe,
+  isWindowsFilesystemAdapter,
+  isWindowsFilesystemIdentity,
+} from "./windows-filesystem.js";
+export {
   CONTRIBUTION_DEVICE_READER_CODE_IDENTIFIER,
   CONTRIBUTION_DEVICE_READER_TEAM_IDENTIFIER,
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,

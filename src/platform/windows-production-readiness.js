@@ -8,7 +8,12 @@ const READINESS_ERROR_CODES = new Set([
   "backend_unqualified",
 ]);
 
+// These registries are deliberately module-private. A readiness-shaped object
+// or a backend-shaped object copied from a receipt must never become a
+// production authorization merely by crossing a JavaScript API boundary.
 const READINESS_ATTESTATIONS = new WeakSet();
+const TRUSTED_PRODUCTION_BACKENDS = new WeakSet();
+const TRUSTED_CONSTRUCTION_AUTHORITY = Object.freeze({});
 
 /**
  * The Windows credential consumers all depend on the same four facts. Keep
@@ -26,7 +31,7 @@ export const WINDOWS_PRODUCTION_READINESS_FACTS = Object.freeze([
  * This is the current product state, intentionally unqualified. It is a
  * summary for diagnostics and tests, not an attestation that can enable a
  * selector. A future Windows qualification step must create a branded
- * attestation with createWindowsProductionReadinessAttestation().
+ * attestation through a trusted verifier inside this module.
  */
 export const WINDOWS_PRODUCTION_READINESS = Object.freeze({
   contractVersion: READINESS_CONTRACT_VERSION,
@@ -83,28 +88,22 @@ function validBindingProvenance(value) {
 }
 
 /**
- * Construct the only kind of readiness object a production selector accepts.
- * The all-true requirement is deliberate: this helper cannot turn a partial
- * Windows implementation into a production backend.
+ * Internal-only construction hook for a future trusted verifier. The
+ * authority is module-private and is not returned by any public API. No
+ * current code calls this hook because the native/package provenance verifier
+ * does not exist yet.
  */
-export function createWindowsProductionReadinessAttestation({
+function issueTrustedWindowsProductionReadinessAttestation({
+  authority,
   qualifiedAt,
   qualificationReceipt,
-  credentialMutexSafe,
-  durableAuditSafe,
-  protectedStatePathsSafe,
-  authenticatedBindingSafe,
-  bindingProvenance,
 } = {}) {
-  for (const fact of WINDOWS_PRODUCTION_READINESS_FACTS) {
-    if (arguments[0]?.[fact] !== true) fail("invalid_configuration");
-  }
+  if (authority !== TRUSTED_CONSTRUCTION_AUTHORITY) fail("invalid_configuration");
   if (typeof qualificationReceipt !== "string"
       || !/^windows-[a-z0-9][a-z0-9-]{2,127}$/u.test(qualificationReceipt)) {
     fail("invalid_configuration");
   }
   exactQualifiedTimestamp(qualifiedAt);
-  if (!validBindingProvenance(bindingProvenance)) fail("invalid_configuration");
 
   const attestation = Object.freeze({
     contractVersion: READINESS_CONTRACT_VERSION,
@@ -125,6 +124,17 @@ export function createWindowsProductionReadinessAttestation({
   });
   READINESS_ATTESTATIONS.add(attestation);
   return attestation;
+}
+
+/**
+ * The old public constructor is retained as a compatibility surface for
+ * callers that have not migrated, but it cannot mint an authorization. Until
+ * a trusted native/package verifier exists, every attempted promotion is
+ * unavailable, including one supplied with four true booleans and a receipt
+ * that merely has the expected shape.
+ */
+export function createWindowsProductionReadinessAttestation() {
+  fail("unqualified");
 }
 
 /**
@@ -165,7 +175,8 @@ export function assertWindowsProductionReadiness({
 export function assertWindowsProductionBackend(backend) {
   let valid = false;
   try {
-    valid = backend !== null
+    valid = TRUSTED_PRODUCTION_BACKENDS.has(backend)
+      && backend !== null
       && typeof backend === "object"
       && typeof backend.read === "function"
       && typeof backend.createIfMissing === "function"
@@ -182,6 +193,17 @@ export function assertWindowsProductionBackend(backend) {
     // Collapse hostile backends to the fixed gate error.
   }
   if (!valid) fail("backend_unqualified");
+  return backend;
+}
+
+/**
+ * Internal-only backend branding hook for the future Windows manager. The
+ * current manager deliberately cannot call this without a trusted native
+ * binding/provenance verifier, so production promotion remains unavailable.
+ */
+function issueTrustedWindowsProductionBackend(backend, authority) {
+  if (authority !== TRUSTED_CONSTRUCTION_AUTHORITY) fail("invalid_configuration");
+  TRUSTED_PRODUCTION_BACKENDS.add(backend);
   return backend;
 }
 
