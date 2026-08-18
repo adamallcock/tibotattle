@@ -31,6 +31,7 @@ export {
 } from "./windows-production-readiness.js";
 export {
   assertWindowsFilesystemProductionSafe,
+  createWindowsFilesystemAdapter,
   isWindowsFilesystemAdapter,
   isWindowsFilesystemIdentity,
 } from "./windows-filesystem.js";
