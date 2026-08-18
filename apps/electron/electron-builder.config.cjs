@@ -1,18 +1,36 @@
 const path = require("node:path");
 
 const repositoryRoot = path.resolve(__dirname, "../..");
+const requestedTarget = process.env.TIBOTATTLE_ELECTRON_TARGET ?? "darwin";
+if (!["darwin", "macos", "win32", "windows", "win"].includes(requestedTarget)) {
+  throw new Error("TIBOTATTLE_ELECTRON_TARGET must be darwin or win32");
+}
+const windowsTarget = ["win32", "windows", "win"].includes(requestedTarget);
+const appDirectory = path.join(
+  repositoryRoot,
+  windowsTarget
+    ? ".release-build/electron-dev/windows-x64/app"
+    : ".release-build/electron-dev/mac-arm64/app",
+);
+const artifactDirectory = path.join(
+  repositoryRoot,
+  windowsTarget
+    ? ".release-build/electron-dev/windows-x64/artifacts"
+    : ".release-build/electron-dev/artifacts",
+);
 
 /**
  * Development-only Electron configuration. `build-electron-app.mjs` creates
  * this app directory first; electron-builder is intentionally a later,
- * explicit `--mac dir --arm64` step.
+ * explicit `--mac dir --arm64` or `--win dir --x64` step. Set
+ * TIBOTATTLE_ELECTRON_TARGET=win32 when packaging the Windows staging tree.
  */
 module.exports = {
   appId: "com.adamallcock.tibotattle.electron.dev",
   productName: "TiboTattle Dev",
   directories: {
-    app: path.join(repositoryRoot, ".release-build/electron-dev/mac-arm64/app"),
-    output: path.join(repositoryRoot, ".release-build/electron-dev/artifacts"),
+    app: appDirectory,
+    output: artifactDirectory,
   },
   // These patterns run against the exact staged app directory, never the
   // repository checkout. Keep the manually captured native/runtime closure.
@@ -28,6 +46,8 @@ module.exports = {
         "apps/web/public/**",
         "config/**",
         "contracts/**",
+        "native/windows-filesystem/build/Release/windows_filesystem.node",
+        "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
         "schemas/**",
         "src/**",
         "generated/**",
@@ -42,7 +62,12 @@ module.exports = {
   asar: true,
   // Only the reviewed, target-specific native runtime is unpacked. The
   // Electron shell and JavaScript companion remain in app.asar.
-  asarUnpack: ["node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node"],
+  asarUnpack: windowsTarget
+    ? [
+      "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node",
+      "native/windows-filesystem/build/Release/windows_filesystem.node",
+    ]
+    : ["node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node"],
   extraMetadata: {
     main: "apps/electron/main.js",
     name: "app-usagemonitor",
@@ -64,5 +89,10 @@ module.exports = {
     hardenedRuntime: false,
     gatekeeperAssess: false,
     notarize: false,
+  },
+  win: {
+    target: [{ target: "dir", arch: ["x64"] }],
+    signAndEditExecutable: false,
+    signExecutable: false,
   },
 };
