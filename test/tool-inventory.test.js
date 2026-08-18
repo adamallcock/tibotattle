@@ -303,8 +303,8 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  assert.equal(result.records, 77);
-  assert.equal(result.candidates.length, 79);
+  assert.equal(result.records, 80);
+  assert.equal(result.candidates.length, 82);
   assert.ok(result.aliases >= 25);
 });
 
