@@ -5,11 +5,23 @@ import { join, dirname, relative } from "node:path";
 const ROOT = join(import.meta.dirname, "..", "..");
 const skipDirs = new Set([
   ".git",
+  // Claude's local settings and agent worktrees are ignored runtime state;
+  // they may contain complete repository copies and symlinks.
+  ".claude",
   ".release-build",
   ".release-deps",
+  ".release-archive",
   ".release-repro",
   ".wrangler",
   ".build",
+  // pnpm's ignored content-addressed store contains implementation symlinks;
+  // it is dependency state, not repository documentation to inspect.
+  ".pnpm-store",
+  // Local reports and evidence can contain private values and are not source
+  // documentation; keep maintenance from reading or rewriting them.
+  ".usage-monitor",
+  // Export bundles and receipts are data artifacts, not repository docs.
+  "exports",
   "build",
   "coverage",
   "dist",
