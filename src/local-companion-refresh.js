@@ -15,6 +15,10 @@ import {
   REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
   readReplaySafeAccountingCache,
 } from "./replay-safe-accounting-cache.js";
+import {
+  assertWindowsFilesystemProductionSafe,
+  isWindowsFilesystemAdapter,
+} from "./platform/index.js";
 
 const PUBLIC_REFRESH_ERROR_CODES = new Set([
   "app_server_unavailable",
@@ -374,6 +378,34 @@ function throwCollectorResourceLimit() {
 
 function safeCollectorErrorCode(code) {
   return PUBLIC_REFRESH_ERROR_CODES.has(code) ? code : "collection_failed";
+}
+
+function fixedWindowsCollectorStateUnavailable() {
+  const error = new Error("local_collector_state_unavailable");
+  error.code = "local_collector_state_unavailable";
+  return error;
+}
+
+function assertWindowsCollectorFilesystemBoundary(adapter) {
+  if (adapter === null) return;
+  // A shape-compatible object, or a copied native adapter, is not an
+  // authenticated boundary. The central module brands only adapters it
+  // created, and its production assertion remains disabled until the native
+  // state/JOURNAL/WAL sidecars are qualified.
+  if (!isWindowsFilesystemAdapter(adapter)) {
+    throw fixedWindowsCollectorStateUnavailable();
+  }
+  try {
+    assertWindowsFilesystemProductionSafe(adapter);
+  } catch {
+    throw fixedWindowsCollectorStateUnavailable();
+  }
+  // Even a future qualified adapter cannot be used by this collector until
+  // SQLite's database and every journal/WAL/SHM sidecar share the same native
+  // replacement and identity guarantees.
+  if (process.platform === "win32") {
+    throw fixedWindowsCollectorStateUnavailable();
+  }
 }
 
 function safeCount(value) {
@@ -834,6 +866,12 @@ export function createLocalCollectorRefreshRunner({
   codexHome = join(homedir(), ".codex"),
   stateFile = null,
   accountObservationOperationLockFile = null,
+  // A qualified Windows filesystem boundary is deliberately carried through
+  // the composition root even while the current collector still uses Node's
+  // SQLite path. The native adapter presently cannot pin SQLite's journal/WAL
+  // sidecars; keeping this value explicit prevents a later caller from
+  // silently falling back to POSIX checks while that prerequisite is closed.
+  windowsFilesystemAdapter = null,
   selectAccountObservationSecret = selectProductionAccountObservationSecret,
   runCollector = runCollectorOnce,
   readAccountingCache = readReplaySafeAccountingCache,
@@ -901,6 +939,11 @@ export function createLocalCollectorRefreshRunner({
       && typeof recordCodexSpeedBaseline !== "function") {
     throw new TypeError("recordCodexSpeedBaseline must be a function or null");
   }
+  if (windowsFilesystemAdapter !== null
+      && (typeof windowsFilesystemAdapter !== "object"
+        || Array.isArray(windowsFilesystemAdapter))) {
+    throw new TypeError("windowsFilesystemAdapter must be an object or null");
+  }
   for (const [name, value] of Object.entries({
     stateFile,
     accountObservationOperationLockFile,
@@ -944,6 +987,10 @@ export function createLocalCollectorRefreshRunner({
         || typeof signal.addEventListener !== "function")) {
       throw new TypeError("signal must be an AbortSignal or null");
     }
+    // Validate the optional native boundary before recording a refresh receipt
+    // or invoking the collector. The current SQLite state path still creates
+    // journal/WAL/SHM sidecars that are not covered by the Windows adapter.
+    assertWindowsCollectorFilesystemBoundary(windowsFilesystemAdapter);
     // A refresh failure that reaches the app collapses to one generic code,
     // and companion stderr is deliberately discarded. Stamp every escaping
     // error with the pipeline step it left from, so the refresh status can
@@ -1002,6 +1049,9 @@ export function createLocalCollectorRefreshRunner({
           : {
             operationLockFile:
               accountObservationOperationLockFile,
+            ...(windowsFilesystemAdapter === null
+              ? {}
+              : { windowsFilesystemAdapter }),
           },
       );
     } catch {
@@ -1032,6 +1082,9 @@ export function createLocalCollectorRefreshRunner({
       maximumRecordBatchSize: 500,
       maximumRecentEventKeys: 5_000,
       loadAccountObservationSecret: selection.loadAccountObservationSecret,
+      ...(windowsFilesystemAdapter === null
+        ? {}
+        : { windowsFilesystemAdapter }),
     };
     // The headline pass uses the collector's ordinary atomic SQLite state
     // transaction with a much smaller read budget. It therefore publishes
