@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   chmod,
   link,
@@ -191,6 +192,67 @@ test("inspection binding never hashes or exposes the private existing command", 
     assert.match(first.targetBinding, /^[a-f0-9]{64}$/);
     assert.equal(JSON.stringify(first).includes(EXISTING_COMMAND), false);
   });
+});
+
+test("Windows callback lifecycle state is blocked before touching settings, state, or locks", async () => {
+  const root = await mkdtemp(join(tmpdir(), "claude-callback-windows-gate-"));
+  const ownerUrl = new URL("../src/platform/claude-callback-lifecycle.js", import.meta.url).href;
+  const script = `
+    Object.defineProperty(process, "platform", { value: "win32" });
+    const { createClaudeCallbackLifecycleContext } = await import(${JSON.stringify(ownerUrl)});
+    const { join } = await import("node:path");
+    class CapabilityError extends Error {}
+    const calls = [];
+    const context = createClaudeCallbackLifecycleContext({
+      ClaudeCallbackCapabilityError: CapabilityError,
+      ensureClaudeCallbackCapability: async () => { calls.push("ensure"); return { status: "created", secret: Buffer.alloc(32) }; },
+      planClaudeCallbackCapabilityRemoval: async () => { calls.push("plan"); return { status: "missing", confirmationToken: null }; },
+      removeClaudeCallbackCapability: async () => { calls.push("remove"); return { status: "removed", secureErasure: false }; },
+      rotateClaudeCallbackCapability: async () => { calls.push("rotate"); return { status: "rotated" }; },
+      runtimeScript: "/safe/runtime.js",
+    });
+    const options = {
+      settingsFile: join(process.env.CLAUDE_WINDOWS_GATE_ROOT, "settings.json"),
+      lifecycleDirectory: join(process.env.CLAUDE_WINDOWS_GATE_ROOT, "lifecycle"),
+      installedStatusLine: context.buildManagedClaudeStatusLine({ nodeExecutable: "/safe/node" }),
+      backend: {},
+    };
+    const operations = [
+      () => context.inspectClaudeCallbackLifecycle(options),
+      () => context.recoverClaudeCallbackLifecycle(options),
+      () => context.installClaudeCallback(options),
+      () => context.uninstallClaudeCallback(options),
+      () => context.rotateManagedClaudeCallbackCapability(options),
+      () => context.planManagedClaudeCallbackCapabilityRemoval(options),
+      () => context.removeManagedClaudeCallbackCapability({ ...options, providedToken: "" }),
+      () => context.readClaudeCallbackRuntimeConfiguration(options),
+    ];
+    const codes = [];
+    for (const operation of operations) {
+      try {
+        await operation();
+      } catch (error) {
+        codes.push(error?.code ?? "unknown");
+      }
+    }
+    process.stdout.write(JSON.stringify({ calls, codes }));
+  `;
+  try {
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      cwd: process.cwd(),
+      env: { ...process.env, CLAUDE_WINDOWS_GATE_ROOT: root },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      calls: [],
+      codes: Array.from({ length: 8 }, () => "claude_callback_lifecycle_windows_state_unqualified"),
+    });
+    await assert.rejects(lstat(join(root, "settings.json")), { code: "ENOENT" });
+    await assert.rejects(lstat(join(root, "lifecycle")), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("install and uninstall prepared phases recover deterministically after interruptions", async () => {

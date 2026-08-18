@@ -8,6 +8,10 @@ import {
   createWindowsProductionCapabilityBackend,
 } from "./platform/index.js";
 import {
+  assertWindowsFilesystemProductionSafe,
+  isWindowsFilesystemAdapter,
+} from "./platform/index.js";
+import {
   selectProductionParticipantIdentity as selectParticipantIdentityPolicy,
 } from "./application/index.js";
 
@@ -40,12 +44,12 @@ export function selectProductionParticipantIdentity({
   if (platform === "win32" && !environmentSecret && !explicitSecretFile) {
     if (architecture !== "x64"
         || typeof createWindowsBackend !== "function"
-        || windowsFilesystemAdapter?.productionSafe !== true
-        || windowsFilesystemAdapter?.pathWalkRaceSafe !== true
+        || !isWindowsFilesystemAdapter(windowsFilesystemAdapter)
         || keychainCapability !== EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity) {
       failWindowsProductionSelection();
     }
     try {
+      assertWindowsFilesystemProductionSafe(windowsFilesystemAdapter);
       assertWindowsProductionReadiness({
         platform,
         architecture,
