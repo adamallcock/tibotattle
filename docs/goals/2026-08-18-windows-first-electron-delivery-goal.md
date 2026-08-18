@@ -30,29 +30,36 @@ or a Linux-support claim.
   branded boundary for validation, creation, identity-bound reads, deletion,
   and legacy migration. This is a negative safety guarantee, not proof that all
   Windows credential state is positively qualified.
-- The native replacement path now revalidates destination-handle security,
-  file identity, and canonical final path immediately before rename. The
-  native adapter still advertises `productionSafe: false` and
-  `pathWalkRaceSafe: false`: the remaining Win32 race and the full native
-  adversarial matrix must be proved on Windows before readiness can change.
-- A local `WindowsProtectedStateStore` implementation now exists with
-  identity-bound root/child operations, bounded JSON/file operations, and an
-  exclusive operation lease. It deliberately reports
-  `productionSafe: false`, and stale recovery is unavailable because the
-  current native contract has no authenticated age/heartbeat primitive.
-- The remaining native store blockers are root-identity-bound child
-  operations, a bounded native read, and an authenticated age/kernel lease.
-  A `WindowsSqliteStateSession` is also required for the collector,
+- The native protected-child boundary now opens children relative to an
+  identity-checked protected root, rejects ambiguous relative names, bounds
+  reads before allocation and rechecks size after reading, and performs every
+  fallible replacement check before the atomic rename. Protected deletion
+  revalidates the opened final path before disposition. The runtime loader and
+  packaged-artifact verifier also require exact agreement between native
+  claims and approved policy.
+- `WindowsProtectedStateStore` now routes inspect, read, create, replace,
+  delete, pending cleanup, and operation leases through those native
+  root-identity-bound child methods with a one-MiB ceiling. It deliberately
+  continues to report `productionSafe: false`, `rootBindingSafe: false`, and
+  `nativeReadBounded: false` until the native Windows matrix proves the
+  implementation. Stale crash recovery is still unavailable because the
+  current lease contract has no authenticated age/heartbeat primitive.
+- A `WindowsSqliteStateSession` is still required for the collector,
   unified-index, Claude quota, and contribution-queue SQLite paths. Direct
-  JSON settings, renewal, and artifact paths still need to be wired through
-  the protected store rather than falling back to ordinary Node filesystem
-  access.
-- After rebasing onto current `main`, the final integrated Stage 2 contract run
-  passed 211 assertions with 10 explicit
-  native-Windows-only skips, and the architecture and preflight checks passed.
-  A later full portable rerun was not obtained because the local execution
-  approval for its loopback companion timed out twice; the same lane passed at
-  the Stage 1 checkpoint.
+  renewal and prepared-artifact paths still need to be wired through the
+  protected store rather than falling back to ordinary Node filesystem access.
+- Claude callback lifecycle and settings state now have an explicit protected
+  Windows composition with root matching, content-digest revalidation, and
+  prepared-phase recovery tests. Actual Windows remains closed unless a
+  branded readiness attestation and two fully qualified protected stores are
+  supplied. The production runtime/CLI does not yet compose those stores and
+  still builds a POSIX `/bin/sh` command, so this is plumbing rather than a
+  Windows support claim.
+- The latest integrated local contract run passed 102 runnable assertions with
+  20 explicit native-Windows-only tests dormant on macOS. Architecture and
+  preflight checks passed. The new Windows-only matrix covers the protected
+  child lifecycle, bounded reads, root swaps, hostile paths, hard links,
+  reparse points, and replacement cleanup, but it has not yet run on Windows.
 - The secure shared Electron shell and deterministic runtime/app staging are
   implemented. Twenty-five focused shell, runtime-closure, and packaging tests
   pass, along with architecture and preflight checks.
@@ -72,12 +79,11 @@ or a Linux-support claim.
   their focused verifier, packaging, and governance checks pass locally. The
   native Windows workflow has not been dispatched, so there is no Windows
   workflow or runtime result to report.
-- Stage 4 is now the active implementation stage. Native Windows x64 remains
-  the authority for the Windows addon, credential integration, packaged-app
-  lifecycle, and installer claims. Windows Electron staging and build
-  contracts require an exact native binding/manifest pair and use
-  target-specific native payload rules, but no Windows runtime or launch claim
-  has been made.
+- Stage 3 is locally complete. The Stage 4 package structure is ready, but its
+  native launch gate remains blocked by the unfinished Stage 2 production
+  persistence composition. Native Windows x64 remains the authority for the
+  addon, credential integration, packaged-app lifecycle, and installer claims.
+  No Windows runtime or launch claim has been made.
 - Production readiness, authenticated binding provenance, production signing,
   installer/updater qualification, and the native Windows x64 warm-and-clean
   run remain gates. Windows support is not claimed, Linux compatibility is not
@@ -86,30 +92,36 @@ or a Linux-support claim.
 
 ### Immediate ordered work
 
-1. Complete the native store primitives: root-identity-bound child operations,
-   bounded native reads, and an authenticated age/kernel lease. Exit only when
-   the native qualification proves each primitive; keep production flags
-   disabled if any proof is missing.
+1. Run the native Windows qualification for the implemented protected-child
+   and credential-coordination primitives on the exact revision. Exit with
+   zero skips and fixed aggregate evidence, or keep all readiness flags false
+   and name the exact failing primitive. This requires separate authorization
+   to push and dispatch the manual workflow.
 2. Add the protected `WindowsSqliteStateSession` for collector, unified-index,
    Claude quota, and contribution-queue state. Exit when Windows composition
    tests prove that these paths cannot fall back to ordinary Node/SQLite state.
-3. Finish fixed JSON/Claude wiring: route settings, renewal, artifact, and
-   Claude lifecycle paths through the protected store. Exit with focused
-   crash/recovery, identity, and no-fallback contract coverage.
-4. Finish contribution and artifact wiring against the same protected
-   boundaries. Exit when their state, leases, and metadata use one branded
+3. Add an authenticated kernel-backed lease/age contract for crash recovery,
+   or document a bounded startup-recovery design that remains fail-closed.
+   Exit only after native contention, abandonment, stale-state, and exact
+   release tests pass.
+4. Finish contribution, renewal, and prepared-artifact wiring against the same
+   protected boundaries. Exit when state, leases, and metadata use one branded
    composition without silently reverting to portable storage.
-5. Compose readiness only from the authenticated binding, qualified native
+5. Finish Claude production composition and replace the POSIX `/bin/sh`
+   callback command path with a Windows-safe process contract. Exit with
+   install, uninstall, interruption recovery, and no-fallback coverage.
+6. Compose readiness only from the authenticated binding, qualified native
    store/session, and one shared branded capability set. Exit when negative
    forgery/copy tests and positive composition tests agree; do not mint
    readiness locally while native proof is absent.
-6. Dispatch the native Windows x64 workflow on the exact revision and qualify
+7. Dispatch the packaged Electron Windows x64 workflow on the exact revision
+   after the production persistence boundary is complete, and qualify
    warm and clean app launch, companion lifecycle, dashboard, and shutdown.
    Exit with zero unexplained skips and no orphan; no macOS or simulated
    `win32` run can substitute for this evidence.
-7. Qualify the Windows installer, upgrade, rollback, uninstall, and
+8. Qualify the Windows installer, upgrade, rollback, uninstall, and
    credential-retention behavior only after the native launch gate passes.
-8. Prepare Linux only after the shared shell/core boundary is stable, with an
+9. Prepare Linux only after the shared shell/core boundary is stable, with an
    explicit distro and GUI matrix; this does not claim Linux support.
 
 ## Delivery rules
