@@ -2,141 +2,123 @@
 title: Working Tree Reconciliation and Cleanup
 date: 2026-08-18
 type: review
-status: locally reconciled; unpublished
+status: locally consolidated; active Windows lane pending
 ---
 
 # Working Tree Reconciliation and Cleanup
 
 ## Outcome
 
-The previously dirty `ship/v0.1.11` checkout has a byte-exact recovery commit,
-and the changes that remain valid on current `origin/main` have been assembled
-on an isolated integration branch. No branch was deleted, no remote ref was
-deleted, and no integration branch was pushed, merged, deployed, or published
-as part of this reconciliation.
+The repository's registered worktrees were reduced from 13 to two without
+deleting any remote ref, pushing, deploying, or publishing. All dirty,
+untracked, ignored-artifact, ancestry, tree-equivalence, and stable-patch
+boundaries were checked before removal.
 
-| Boundary | Local evidence |
-|---|---|
-| Current integration base | `origin/main` and local `main` at `6c191224301b2ac846f77a3d7708fd9577ef2199` |
-| Full pre-reconciliation recovery point | `backup/2026-08-18-pre-main-reconciliation` at `102c998748b9dda654822d100a41c0e86a66df24` |
-| Forward integration branch | `codex/working-tree-reconciliation` |
-| Website-owned lane | `codex/web-release-lane-main` at `f099d377a94e9c1a8cdf526da92e4caed7cd79a6`; squash-merged as PR #15 at `6c19122` |
-| App Store-owned lane | `codex/mac-app-store-compatibility-plan` at `dcb796b08fa8ccb3cba7d71066f4ae1da223da61`; squash-merged as PR #16 at `d22a6bd` |
+The two worktrees still registered are:
 
-The recovery commit was created without changing the live checkout or index.
-It includes every tracked change and every non-ignored untracked file that was
-present in the original checkout. A temporary index loaded from `102c998` was
-refreshed against the live working tree; both `git diff-files` and
-`git ls-files --others --exclude-standard` returned no paths. This proves the
-recovery commit still exactly represented the original working tree before its
-normalization.
+- the root checkout on `codex/windows-electron-delivery`, which is actively
+  dirty and owned by another in-progress thread; and
+- the clean `codex/working-tree-reconciliation` integration worktree.
 
-After PRs #15 and #16 merged, local `main` was fast-forwarded from `f42b26e`
-to `6c19122`. The combined website patch has the same stable patch ID
-(`c5bb765e723c46f1541039ed4b2f5cbf08518bd9`) and raw binary-diff SHA-256
-(`dfa6bf0d94597c9de114a0ac4e59241eb50f50639eb32f53f9e501a8779f7e73`)
-before and after its squash merge. The App Store patches share stable patch ID
-`48aa1037d78e97837c75f93b22496a5c82062e0a`.
-Accordingly, neither merged change was replayed on the rebuilt integration
-branch. The rebuilt tree at `12295e1` exactly matched the previously validated
-integration tree at
-`backup/2026-08-18-reconciliation-before-pr15-pr16`; both resolved to tree
-`3c82e1f2d4b406412647f95051aece10567c88f8`.
+Local `main` and `origin/main` were verified equal at `6c19122`. Website PR
+#15 and App Store PR #16 are each present exactly once on that base. Their old
+topic commits were patch-equivalent and were not replayed.
 
-## Forward changes
+## Recovery boundary
 
-The integration branch now starts from the two merged ownership lanes on
-current `origin/main`, followed only by independently reviewed work that was
-not part of either squash merge.
+Before cleanup, all 146 then-visible refs and tags were preserved in:
+
+`/.release-archive/worktree-consolidation/2026-08-18/pre-consolidation-all-refs.bundle`
+
+Its SHA-256 is
+`825586afe9c5fb7a2a64313d6f26d422a58d67e3d4b0ec6fac40bc54e90d550f`,
+and `git bundle verify` passed.
+
+Unique dirty files, browser evidence, generated evidence, release metadata,
+and Sparkle tooling were separately archived in the same directory. The
+signed v0.1.12 rollback app remains under
+`/.release-archive/stable/0.1.12/` and passed recursive strict code-signature
+verification.
+
+The v0.1.13 development app and receipt are archived as
+`v0.1.13-development-artifact-and-receipt.tgz` (SHA-256
+`d2aa1ce9f2a69b8815cbe3f22b8c9bd40470a9ef2aff2cbc9388e687aba1d9f1`).
+Performance plans and receipts are archived as
+`performance-branch-receipts.tgz` (SHA-256
+`26fdfa2cedcf698f8ea8871362fc5292e7eb816a2da935ae8a21a1ea41e9c94e`).
+
+## Forward integration
+
+The integration branch retains only work that was absent from current main:
 
 | Commit | Purpose |
 |---|---|
 | `ec56b4e` | Show weekly macOS allowance position |
 | `555d8af` | Establish the canonical public web origin |
-| `9ce607a` | Preserve unique documentation and quality findings |
-| `ca23ab7` | Classify all web release tools |
+| `9ce607a` | Preserve unique quality and operations findings |
+| `ca23ab7` | Classify web release tooling |
 | `aba2924` | Add the download trust and verification disclosure |
 | `e9f7957` | Preserve UTC community calendar days |
 | `7656168` | Date share cards from observed evidence |
 | `964e9e3` | Align installer tests with shared formatting |
+| `1a11090` | Port validated log-processing performance layers |
+| `b7336c6` | Label share cards with a bounded reported Codex plan |
+| `a955a22` | Redact a generated-image UUID from durable documentation |
+| `256cfaa` | Retain full unknown provenance when inference overlaps it |
+| `0a90d41` | Gate native startup refresh on rendered-dashboard readiness |
+| `5b6b65d` | Preserve the original share-card boundary assertions |
 
-The download disclosure deliberately distinguishes checksum integrity from
-software safety and source-to-binary provenance. Its version, DMG filename,
-and SHA-256 are derived from verified installer metadata rather than frozen
-page copy. No provenance or reproducible-build attestation was added because
-the repository does not yet expose a public cryptographic attestation that
-would support that claim.
+The download disclosure distinguishes checksum integrity from software safety
+and source-to-binary provenance. Version, DMG filename, and SHA-256 values are
+derived from verified release metadata rather than frozen page copy. No public
+cryptographic source-to-binary attestation is claimed.
+
+The old worker-isolation coordinator and v0.1.13 release wrapper were
+intentionally not ported. The worker source was syntactically invalid, and
+parity with the current accounting, Claude, and side-chat configuration
+contracts was not proven. Their refs, receipt, manifest, and development app
+remain recoverable from the bundle and archives.
 
 ## Validation
 
 | Check | Result |
 |---|---|
 | `git diff --check` | Pass |
-| `npm run architecture:check` | Pass; 369 production files, 1,444 imports, zero debt edges |
-| `npm run tools:inventory:check` | Pass; 68 records, 70 executable paths |
+| `npm run architecture:check` | Pass; 371 production files, 1,447 imports, zero debt edges |
 | `npm run docs:links:check` | Pass |
-| `npm run product:ui:test` | 280/280 pass |
-| `npm run product:release-site:test` | 29/29 pass with normal loopback access |
-| `npm run test:macos:source` | 43 pass; 3 intentionally excluded |
-| Worker script checks | 149/149 pass |
-| Worker runtime tests | 385/385 pass |
-| Production Worker dry run | Pass with 20 generated public assets |
-| Staging configuration and dry run | Pass; closed and intentionally unprovisioned |
-| Signed 0.1.12 site generation | Pass after local stapling validation; exact checksum and trust copy inspected |
+| Performance-path focused tests | 177/177 pass |
+| `npm run product:ui:test` | 283/283 pass after readiness coverage |
+| Share-card focused tests | 182/182 pass after final boundary assertions |
+| `npm run product:release-site:test` | 29/29 pass with loopback access |
+| Local companion server | 47/47 pass with loopback access |
+| Fast-mode accounting | 16/16 pass against this worktree's package source |
+| `npm run test:macos:source` | 44 pass; 3 artifact-only checks intentionally skipped |
+| Worker runtime tests | 385/385 pass in the independent reconciliation audit |
 
-The staging receipt reports `STAGING_RESOURCE_IDENTIFIERS_NOT_CONFIGURED` and
-`safe_unprovisioned`. That is the intended static boundary, not a live staging
-readiness claim. The missing envelope-key warnings in the Worker tests are also
-expected because the test environment does not load production secrets.
+The worktree-local `node_modules` symlink resolves workspace aliases through
+the root checkout. The accounting suite was therefore rerun with an ephemeral
+loader pinned to this worktree's `packages/accounting/index.js`; all 16 tests
+passed. The loader was then removed.
 
-## Worktree cleanup
+## Cleanup result
 
-The registered worktree set was reduced from 35 to 13 after ancestry, status,
-untracked-file, remote-ref, and patch-equivalence checks. Roughly 3.7 GiB of
-worktree storage was reclaimed. Branch refs were retained even when a worktree
-was removed, and no remote branch was deleted.
+Historical worktrees were removed only after unique files and artifacts were
+archived or their commits were proven landed, superseded, or represented on
+the integration branch. The final four historical carriers reclaimed about
+965 MiB of apparent disk usage; earlier verified removals reclaimed additional
+space. Local branch refs remain available and shared Git objects were retained.
 
-Before removing worktrees that contained generated or untracked evidence, the
-relevant output was archived under:
+## Final one-worktree transition
 
-`/.release-archive/worktree-cleanup/2026-08-18/`
+The repository can safely reach one worktree only after the Windows owner
+commits and validates its complete change. The remaining steps are:
 
-The archive is approximately 10 MiB and includes release-build outputs,
-validation logs, browser screenshots, stale raw Claude worktree directories,
-and the detached origin-baseline inventory and release metadata. Archives were
-listed and checksummed before their source worktrees were removed.
+1. apply the completed Windows commit to this integration branch;
+2. resolve and test any cross-lane conflicts;
+3. fast-forward local `main` to the resulting linear tip;
+4. remove this temporary integration worktree; and
+5. switch the clean root checkout to local `main`.
 
-Removed worktrees were limited to proven ancestors, exact patch-equivalents,
-superseded detached baselines, completed ephemeral agent worktrees, and invalid
-registrations whose raw directories and branch refs had first been preserved.
-After PR #15 merged, its clean 24 MiB worktree was also removed only after a
-fresh check showed no untracked evidence and no ignored content beyond
-dependency directories. Its local and remote branch refs remain at `f099d37`.
-
-## Worktrees still preserved
-
-The remaining worktrees are intentionally retained until their unique commits,
-dirty files, active ownership, or release artifacts are resolved:
-
-- the clean `main` checkout and this integration worktree;
-- local-index release and checkpoint worktrees;
-- admin v0.2 and Claude foundation worktrees;
-- log-processing performance and cache-switch/cost-lens worktrees;
-- the detached signed v0.1.12 artifact carrier;
-- v0.1.13 performance-client and UI red-team worktrees;
-- the share-card plan worktree, whose unique commit has not been fully replaced
-  by the narrower share-card change on the integration branch; and
-- the public-prep worktree.
-
-Removal from this set requires a fresh status and untracked-file check plus
-proof of ancestry, patch equivalence, or explicit abandonment. Release artifacts
-must be archived before their carrier is removed.
-
-## Publication boundary
-
-This document records local reconciliation only. It does not authorize pushing
-`codex/working-tree-reconciliation`, deploying the website or Worker,
-submitting to the App Store, publishing an update feed, or deleting any
-remaining branch or remote ref. PRs #15 and #16 were merged by their owning
-threads; this reconciliation only verified and consumed their resulting
-history.
+Capturing the root before that handoff would risk committing a partial Windows
+implementation. This document does not authorize a push, deployment, release,
+remote-ref deletion, or publication.
