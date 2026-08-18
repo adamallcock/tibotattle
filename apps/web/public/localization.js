@@ -777,7 +777,6 @@ export const WEB_MESSAGES = Object.freeze({
   "share.caveat.coverage": ["{percent} of recorded usage changes have a reviewed public price; the remainder is omitted from the estimate.", "记录的使用变化中有 {percent} 具备经审核的公开价格；其余部分不纳入估算。", "El {percent} de los cambios de uso registrados tiene un precio público revisado; el resto queda fuera de la estimación."],
   "share.title": ["What my Codex allowance is really worth", "我的 Codex 额度到底值多少", "Lo que realmente vale mi asignación de Codex"],
   "share.subtitle.demo": ["Illustrative demo data. Not a measurement.", "示例性演示数据。不是测量结果。", "Datos de demostración ilustrativos. No son una medición."],
-  "share.subtitle.local": ["Measured on my own Mac. Nothing left it.", "在我自己的 Mac 上测得。没有任何内容离开它。", "Medido en mi propio Mac. Nada salió de él."],
   "share.badge.demo": ["DEMO DATA", "演示数据", "DATOS DEMO"],
   "share.trend.label": ["7-day allowance estimates", "七天额度估计", "Estimaciones de asignación de 7 días"],
   "share.trend.empty": ["Not enough observed reset history yet.", "尚无足够的已观测重置历史。", "Aún no hay suficiente historial de restablecimientos observados."],

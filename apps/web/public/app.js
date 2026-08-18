@@ -1829,8 +1829,8 @@ function shareCardWindowLabel(window) {
 }
 
 /**
- * A date-only label for a derived reset estimate. The card deliberately omits
- * a time of day and any raw-log timestamp.
+ * A date-only label for a derived reset estimate or the latest observation.
+ * The card deliberately omits a time of day and any raw-log timestamp.
  */
 function shareCardDateLabel(timestamp) {
   if (!Number.isFinite(timestamp)) return "";
@@ -1840,6 +1840,14 @@ function shareCardDateLabel(timestamp) {
     day: "numeric",
     year: "numeric",
   }).format(timestamp);
+}
+
+function shareCardHeadlineDate(data, history) {
+  const latestObservedAt = Date.parse(data?.freshness?.latestObservedAt ?? "");
+  const timestamp = Number.isFinite(history?.anchorAt)
+    ? history.anchorAt
+    : latestObservedAt;
+  return shareCardDateLabel(timestamp);
 }
 
 /**
@@ -1929,6 +1937,7 @@ function buildShareCard(data, {
     throw new TypeError("A results card requires a minted reference.");
   }
   const isDemo = data?.mode === "demo";
+  const headlineDate = shareCardHeadlineDate(data, history);
   const pricing = data?.pricing ?? {};
   // The activity figure follows the usage chart's selected date range
   // (owner-directed, 2026-08-10) whenever the accounting periods carry that
@@ -2053,13 +2062,13 @@ function buildShareCard(data, {
     reference,
     isDemo,
     title: t("share.title"),
-    // The strongest claim on the card is the one a fixture must not borrow.
-    // A demo card says so in the line under the title and in a mark beside the
-    // wordmark, not only in the smallest copy on the image, because a reader
-    // scrolling a timeline reads the title and the figures and nothing else.
+    // A real card carries the same newest-fit date as the weekly headline,
+    // falling back to the latest observation only when no weekly history is
+    // available. The strongest claim on the card is still the one a fixture
+    // must not borrow, so a demo keeps its warning here and beside the mark.
     subtitle: isDemo
       ? t("share.subtitle.demo")
-      : t("share.subtitle.local"),
+      : headlineDate,
     badge: isDemo ? t("share.badge.demo") : "",
     stats: Object.freeze(stats.map((stat) => Object.freeze({ ...stat }))),
     // Reset-fit history is an explicitly seven-day model. It is never drawn
@@ -2686,8 +2695,12 @@ function renderShareCard(data, { history: sharedHistory = null } = {}) {
     : null;
   const trend = isWeeklyWindow ? shareCardTrend(history) : null;
   const activity = shareCardActivitySelection(data, activeUsageRangeDays);
+  const headlineDate = shareCardHeadlineDate(data, history);
   const signature = JSON.stringify([
     data?.mode,
+    // The date is printed in the header, so a different visible date is a
+    // different card even when its three figures happen to be unchanged.
+    headlineDate,
     shareCardWindowKind(allowanceWindow),
     finite(allowanceWindow?.durationMinutes),
     finite(allowanceWindow?.remainingPercent),

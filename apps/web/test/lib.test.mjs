@@ -7527,6 +7527,7 @@ test("a posted results card can carry only fixed copy and formatted figures", as
     [
       "data.accounting",
       "data?.accounting?.periods",
+      "data?.freshness?.latestObservedAt",
       "data?.mode",
       "data?.pricing",
       "data?.pricing?.coveragePercent",
@@ -7583,6 +7584,10 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   assert.match(
     section,
     /if \(!Number\.isFinite\(timestamp\)\) return "";/u,
+  );
+  assert.match(
+    section,
+    /function shareCardHeadlineDate\(data, history\) \{\s*\n\s*const latestObservedAt = Date\.parse\(data\?\.freshness\?\.latestObservedAt \?\? ""\);\s*\n\s*const timestamp = Number\.isFinite\(history\?\.anchorAt\)\s*\n\s*\? history\.anchorAt\s*\n\s*: latestObservedAt;\s*\n\s*return shareCardDateLabel\(timestamp\);\s*\n\}/u,
   );
   assert.match(section, /const yAxisLabel = t\("share\.axis\.allowance"\);/u);
   assert.match(section, /const xAxisLabel = t\("share\.axis\.resetEstimateDate"\);/u);
@@ -7846,6 +7851,7 @@ test("a posted results card always carries a diagnostic-format reference", async
   assert.ok(signature, "the figure signature is available");
   for (const figure of [
     "data?.mode",
+    "headlineDate,",
     "shareCardWindowKind(allowanceWindow)",
     "finite(allowanceWindow?.durationMinutes)",
     "finite(allowanceWindow?.remainingPercent)",
@@ -7897,9 +7903,10 @@ test("a posted results card always carries a diagnostic-format reference", async
   assert.doesNotMatch(html, /id="share-card-readout"/u);
 });
 
-test("a posted results card states a figure in full and marks a fixture as one", async () => {
+test("a posted results card states a figure in full, dates real evidence, and marks a fixture", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const section = shareCardSource(appSource);
+  const localizationSource = await readFile(new URL("../public/localization.js", import.meta.url), "utf8");
 
   // One type size for the whole row, chosen so the longest figure fits its
   // column whole. "Not estimable" and a seven-figure total both overrun the
@@ -7926,13 +7933,17 @@ test("a posted results card states a figure in full and marks a fixture as one",
     assert.ok(section.includes(`t("${key}")`), `${key} is one of the fixed figures`);
   }
 
-  // A fixture is marked where a reader scrolling a timeline will see it: in
-  // the line under the title and on a mark beside the wordmark, not only in
-  // the smallest copy on the image.
+  // A real card uses the line under the title for the weekly headline's
+  // newest-fit date. The old local-privacy tagline is intentionally absent.
   assert.match(
     section,
-    /subtitle: isDemo\s*\n\s*\? t\("share\.subtitle\.demo"\)\s*\n\s*: t\("share\.subtitle\.local"\),/u,
+    /subtitle: isDemo\s*\n\s*\? t\("share\.subtitle\.demo"\)\s*\n\s*: headlineDate,/u,
   );
+  assert.doesNotMatch(appSource, /share\.subtitle\.local/u);
+  assert.doesNotMatch(localizationSource, /Measured on my own Mac\. Nothing left it\./u);
+  // A fixture is marked where a reader scrolling a timeline will see it: in
+  // that same line and on a mark beside the wordmark, not only in the smallest
+  // copy on the image.
   assert.match(section, /badge: isDemo \? t\("share\.badge\.demo"\) : "",/u);
   assert.match(section, /if \(card\.badge !== ""\) \{\s*\n\s*drawShareCardBadge\(/u);
   // The mark is drawn in the header, above the figures it qualifies.
