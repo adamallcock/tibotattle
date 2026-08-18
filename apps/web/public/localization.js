@@ -778,6 +778,7 @@ export const WEB_MESSAGES = Object.freeze({
   "share.title": ["What my Codex allowance is really worth", "我的 Codex 额度到底值多少", "Lo que realmente vale mi asignación de Codex"],
   "share.subtitle.demo": ["Illustrative demo data. Not a measurement.", "示例性演示数据。不是测量结果。", "Datos de demostración ilustrativos. No son una medición."],
   "share.badge.demo": ["DEMO DATA", "演示数据", "DATOS DEMO"],
+  "share.plan": ["Plan {plan}", "套餐 {plan}", "Plan {plan}"],
   "share.trend.label": ["7-day allowance estimates", "七天额度估计", "Estimaciones de asignación de 7 días"],
   "share.trend.empty": ["Not enough observed reset history yet.", "尚无足够的已观测重置历史。", "Aún no hay suficiente historial de restablecimientos observados."],
   "share.trend.emptyDetail": ["A completed reset becomes a point once enough of its allowance was observed.", "一旦观测到足够额度，完成的重置就会成为一个点。", "Un restablecimiento completado se convierte en un punto cuando se observa una parte suficiente de su asignación."],

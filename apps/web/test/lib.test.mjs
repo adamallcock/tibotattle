@@ -104,6 +104,9 @@ import {
   translate,
   translatePlural,
 } from "../public/localization.js";
+import {
+  TELEMETRY_PLAN_TYPES,
+} from "../public/telemetry-shared.generated.js";
 
 class FakeSvgElement {
   constructor(tagName, renderedWidth = 0) {
@@ -7481,6 +7484,125 @@ function firstArguments(source, call) {
   return found;
 }
 
+/**
+ * Load the plan-label helpers in isolation, injecting the two values they
+ * intentionally depend on from the surrounding browser module.
+ */
+async function loadShareCardPlan() {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("const SHARE_CARD_PLAN_LABELS");
+  const end = appSource.indexOf("\nlet shareCard = null;", start);
+  assert.ok(start >= 0 && end > start, "the plan-label helpers are available");
+  const section = appSource.slice(start, end);
+  return Function(
+    "finite",
+    "TELEMETRY_PLAN_TYPES",
+    `${section}\nreturn { SHARE_CARD_PLAN_LABELS, shareCardPlanLabel, shareCardPlan };`,
+  )(
+    (value, fallback = null) => (
+      typeof value === "number" && Number.isFinite(value) ? value : fallback
+    ),
+    TELEMETRY_PLAN_TYPES,
+  );
+}
+
+test("the share card names only a known, most-recent Codex plan", async () => {
+  const { SHARE_CARD_PLAN_LABELS, shareCardPlanLabel, shareCardPlan } =
+    await loadShareCardPlan();
+
+  assert.equal(shareCardPlanLabel("pro"), "Pro (20×)");
+  assert.equal(shareCardPlanLabel("prolite"), "Pro Lite (5×)");
+  assert.equal(shareCardPlanLabel("plus"), "Plus");
+  assert.equal(
+    shareCardPlanLabel("self_serve_business_prolite"),
+    "Business · Pro Lite (5×)",
+  );
+  assert.equal(shareCardPlanLabel("unknown"), "");
+  assert.equal(shareCardPlanLabel(""), "");
+  assert.equal(shareCardPlanLabel("  "), "");
+  assert.equal(shareCardPlanLabel("teamplus"), "");
+  assert.equal(shareCardPlanLabel(undefined), "");
+  for (const plan of Object.keys(SHARE_CARD_PLAN_LABELS)) {
+    assert.ok(TELEMETRY_PLAN_TYPES.includes(plan), `${plan} is a KnownPlan value`);
+  }
+
+  assert.equal(
+    shareCardPlan([
+      { planType: "plus", observedAt: "2026-08-01T00:00:00.000Z" },
+      { planType: "pro", observedAt: "2026-08-13T00:00:00.000Z" },
+    ]),
+    "Pro (20×)",
+  );
+  assert.equal(
+    shareCardPlan([
+      { planType: "pro", observedAt: "2026-08-13T00:00:00.000Z" },
+      { planType: "plus", observedAt: "2026-08-01T00:00:00.000Z" },
+    ]),
+    "Pro (20×)",
+  );
+  assert.equal(
+    shareCardPlan([
+      { planType: "pro", observedAt: "2026-08-13T00:00:00.000Z" },
+      { planType: "unknown", observedAt: "2026-08-20T00:00:00.000Z" },
+    ]),
+    "Pro (20×)",
+  );
+  assert.equal(shareCardPlan([{ planType: "pro", observedAt: "" }]), "Pro (20×)");
+  assert.equal(
+    shareCardPlan([
+      { planType: "plus", observedAt: "2026-08-13T00:00:00.000Z" },
+      { planType: "pro", observedAt: "" },
+    ]),
+    "Plus",
+  );
+  assert.equal(shareCardPlan([{ planType: "unknown" }]), "");
+  assert.equal(shareCardPlan([]), "");
+  assert.equal(shareCardPlan(null), "");
+});
+
+test("the share card wires plan copy through the canvas and transcript", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const section = shareCardSource(appSource);
+
+  assert.match(
+    section,
+    /const planLabel = shareCardPlan\(data\?\.quotaWindows \?\? \[\]\);/u,
+  );
+  assert.match(
+    section,
+    /plan: planLabel === "" \? "" : t\("share\.plan", \{ plan: planLabel \}\),/u,
+  );
+  assert.match(
+    section,
+    /if \(card\.plan !== ""\) \{\s*\n\s*drawShareCardPlan\(context, card\.plan, SHARE_CARD_WIDTH - margin, 156\);/u,
+  );
+  assert.match(section, /function drawShareCardPlan\(context, plan, right, baseline\) \{/u);
+  assert.match(section, /context\.fillText\(plan, x \+ 13, baseline\);/u);
+  assert.doesNotMatch(
+    section.match(/function drawShareCardPlan[\s\S]*?\n\}/u)?.[0] ?? "",
+    /toLocaleUpperCase/u,
+  );
+  assert.match(
+    section,
+    /t\("share\.text\.header", \{ subtitle: card\.subtitle, title: card\.title \}\),\s*\n(?:\s*\/\/[^\n]*\n)*\s*card\.plan,/u,
+  );
+
+  assert.ok(Object.hasOwn(WEB_MESSAGES, "share.plan"));
+  assert.equal(WEB_MESSAGES["share.plan"].length, SUPPORTED_LOCALES.length);
+  for (const locale of SUPPORTED_LOCALES) {
+    const copy = translate("share.plan", { plan: "Pro (20×)" }, locale);
+    assert.match(copy, /Pro \(20×\)/u, locale);
+    assert.doesNotMatch(copy, /\{plan\}/u, locale);
+  }
+
+  // The additive plan field must not replace the evidence date in the image
+  // signature: a card remains tied to its observed headline date.
+  const signature = section.match(/const signature = JSON\.stringify\(\[([\s\S]*?)\]\);/u)?.[1];
+  assert.ok(signature, "the share-card signature is available");
+  assert.match(signature, /headlineDate,/u);
+  assert.match(signature, /shareCardPlan\(data\?\.quotaWindows \?\? \[\]\),/u);
+});
+
 test("a posted results card can carry only fixed copy and formatted figures", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const section = shareCardSource(appSource);
@@ -7507,6 +7629,7 @@ test("a posted results card can carry only fixed copy and formatted figures", as
       "card.versionLabel",
       "formatMoney(value, axisDigits)",
       "line",
+      "plan",
       "shareCardFit(context, card.subtitle, inner)",
       "shareCardFit(context, card.title, inner)",
       "shareCardFit(context, stat.value, textWidth)",
