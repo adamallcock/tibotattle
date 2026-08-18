@@ -22,8 +22,10 @@ import {
   exportIdentityKeychainItemPresenceByAttributes,
 } from "./export-identity-keychain.js";
 import {
+  assertWindowsFilesystemProductionSafe,
   assertWindowsProductionReadiness,
   createWindowsProductionCapabilityBackend,
+  isWindowsFilesystemAdapter,
 } from "./platform/index.js";
 import {
   contributionDeviceKeychainBrokerConfiguration,
@@ -54,6 +56,13 @@ const ERROR_CODES = new Set([
   "remote_revocation_required",
   "confirmation_invalid",
 ]);
+
+// The contribution-device binding metadata is still written by the Node
+// filesystem helpers below. Keep production Windows credential backends
+// branded until that state path is moved onto the native filesystem adapter;
+// this prevents a future readiness promotion from silently re-enabling the
+// current POSIX-style state implementation on Windows.
+const WINDOWS_PRODUCTION_BACKENDS = new WeakSet();
 
 export class ContributionDeviceCapabilityError extends Error {
   constructor(code) {
@@ -398,24 +407,29 @@ export function createProductionContributionDeviceBackend({
   readerPath = process.execPath,
   windowsReadiness = null,
   createWindowsBackend = null,
+  windowsFilesystemAdapter = null,
 } = {}) {
   if (platform === "win32") {
     if (architecture !== "x64"
-        || typeof createWindowsBackend !== "function") {
+        || typeof createWindowsBackend !== "function"
+        || !isWindowsFilesystemAdapter(windowsFilesystemAdapter)) {
       fail("invalid_configuration");
     }
     try {
+      assertWindowsFilesystemProductionSafe(windowsFilesystemAdapter);
       assertWindowsProductionReadiness({
         platform,
         architecture,
         readiness: windowsReadiness,
       });
       const windowsBackend = createWindowsBackend({ platform, architecture });
-      return createWindowsProductionCapabilityBackend({
+      const selected = createWindowsProductionCapabilityBackend({
         backend: windowsBackend,
         capability: CAPABILITY,
         readiness: windowsReadiness,
       });
+      WINDOWS_PRODUCTION_BACKENDS.add(selected);
+      return selected;
     } catch {
       fail("invalid_configuration");
     }
@@ -709,6 +723,15 @@ export function createAppBrokeredContributionDeviceBackend({
   return Object.freeze({ read, createIfMissing, replaceExact, deleteExact, describe });
 }
 
+function assertStateFilesystemBoundary(backend) {
+  try {
+    if (WINDOWS_PRODUCTION_BACKENDS.has(backend)) fail("invalid_configuration");
+  } catch (error) {
+    if (error instanceof ContributionDeviceCapabilityError) throw error;
+    fail("invalid_configuration");
+  }
+}
+
 // The macOS product state root was renamed after the contribution credential
 // shipped. Keep the Keychain secret in place and move only its public binding
 // metadata, lazily, when a contribution operation actually needs it. This
@@ -721,6 +744,7 @@ export async function migrateLegacyContributionDeviceCapability({
   expectedOrigin = null,
 } = {}) {
   const selected = assertBackend(backend);
+  assertStateFilesystemBoundary(selected);
   if (typeof legacyStateFile !== "string" || legacyStateFile.length < 1
       || legacyStateFile.length > 4096
       || typeof stateFile !== "string" || stateFile.length < 1
@@ -796,6 +820,7 @@ export async function readContributionDeviceCapability({
   expectedOrigin = null,
 } = {}) {
   const selected = assertBackend(backend);
+  assertStateFilesystemBoundary(selected);
   const state = await readState(stateFile);
   let stored = null;
   try {
@@ -819,6 +844,7 @@ export async function ensureContributionDeviceCapability({
   clock = () => Date.now(),
 } = {}) {
   const selected = assertBackend(backend);
+  assertStateFilesystemBoundary(selected);
   const normalizedOrigin = normalizeOrigin(origin);
   if (typeof generateDeviceId !== "function" || typeof generateSecret !== "function"
       || typeof clock !== "function") {
@@ -907,6 +933,7 @@ export async function withContributionDeviceSecret({
   operation,
 } = {}) {
   const selected = assertBackend(backend);
+  assertStateFilesystemBoundary(selected);
   if (typeof operation !== "function") fail("invalid_configuration");
   const state = await readState(stateFile);
   let stored = null;
@@ -963,6 +990,7 @@ export async function rotateContributionDeviceCredential({
   generateSecret = () => randomBytes(SECRET_BYTES),
 } = {}) {
   const selected = assertBackend(backend);
+  assertStateFilesystemBoundary(selected);
   if (typeof performRemoteRotation !== "function"
       || typeof generateSecret !== "function") {
     fail("invalid_configuration");
@@ -1056,6 +1084,7 @@ export async function removeContributionDeviceCapability({
   remoteRevocationConfirmed = false,
 } = {}) {
   const selected = assertBackend(backend);
+  assertStateFilesystemBoundary(selected);
   if (remoteRevocationConfirmed !== true) fail("remote_revocation_required");
   const inspection = await inspectState(stateFile);
   let stored = null;

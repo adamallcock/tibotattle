@@ -72,6 +72,13 @@ export function selectProductionClaudeCallbackBackend({
   architecture,
   createBackend,
 } = {}) {
+  // The Windows callback path remains closed until both its Credential
+  // Manager backend and callback lifecycle state/lock boundary are qualified.
+  // Keep this explicit so a future platform branch cannot silently reuse the
+  // macOS-only backend contract.
+  if (platform === "win32") {
+    fail("invalid_configuration");
+  }
   if (
     platform !== "darwin"
     || architecture !== "arm64"

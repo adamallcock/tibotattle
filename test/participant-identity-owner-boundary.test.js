@@ -82,7 +82,7 @@ test("legacy participant identity is implementation-free and local-review uses t
   );
 });
 
-test("participant identity owner depends only on its exact Node runtime ports", async () => {
+test("participant identity owner uses the central Windows adapter contract", async () => {
   const ownerSource = await readFile(
     resolve(
       REPOSITORY_ROOT,
@@ -95,6 +95,7 @@ test("participant identity owner depends only on its exact Node runtime ports", 
     .map(({ specifier }) => specifier)
       .sort(),
     [
+      "./windows-filesystem.js",
       "@app-usagemonitor/identity-core",
       "node:crypto",
       "node:fs",
@@ -103,7 +104,7 @@ test("participant identity owner depends only on its exact Node runtime ports", 
       "node:path",
     ],
   );
-  assert.doesNotMatch(ownerSource, /windows-filesystem/u);
+  assert.match(ownerSource, /from "\.\/windows-filesystem\.js";/u);
 });
 
 test("the exact participant identity migration allowance is removed", async () => {
@@ -123,4 +124,26 @@ test("the exact participant identity migration allowance is removed", async () =
     ),
   );
   assert.doesNotMatch(baseline, /src\/export-identity\.js/u);
+});
+
+test("Windows participant identity rejects a partial adapter instead of falling back to Node paths", async () => {
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+  try {
+    await assert.rejects(
+      participantIdentity.loadOrCreateParticipantSecret({
+        environmentSecret: null,
+        secretFile: "C:\\Users\\example\\AppData\\Local\\app-usagemonitor\\export-participant-secret",
+        legacySecretFile: null,
+        windowsFilesystemAdapter: {
+          productionSafe: true,
+          pathWalkRaceSafe: true,
+          readFile() {},
+        },
+      }),
+      (error) => error?.code === "EXPORT_IDENTITY_WINDOWS_FILESYSTEM_ADAPTER_INVALID",
+    );
+  } finally {
+    Object.defineProperty(process, "platform", originalPlatform);
+  }
 });

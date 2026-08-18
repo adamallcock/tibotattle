@@ -13,6 +13,10 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { isProxy } from "node:util/types";
 import { defaultExportStateDirectory } from "./participant-identity.js";
+import {
+  assertWindowsFilesystemProductionSafe,
+  isWindowsFilesystemAdapter,
+} from "./windows-filesystem.js";
 
 const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 const STATE_SCHEMA = "claude-callback-lifecycle-v1";
@@ -49,6 +53,7 @@ const ERROR_CODES = new Set([
   "coexistence_unsupported",
   "runtime_state",
   "not_uninstalled",
+  "windows_state_unqualified",
 ]);
 
 export class ClaudeCallbackLifecycleError extends Error {
@@ -62,6 +67,34 @@ export class ClaudeCallbackLifecycleError extends Error {
 
 function fail(code) {
   throw new ClaudeCallbackLifecycleError(code);
+}
+
+/**
+ * The callback lifecycle owns Windows-sensitive settings, state, and lock
+ * paths. Node's path-based open/rename/unlink sequence is not a qualified
+ * Windows boundary for those operations yet: the current native adapter does
+ * not expose the handle-held lock and atomic settings replacement contract
+ * this owner needs. Keep the check at every public state entry point so a
+ * future caller cannot accidentally make a partial adapter look production
+ * safe. macOS and Linux retain their existing local implementation.
+ */
+function assertWindowsLifecycleStateSupported(options = {}) {
+  if (process.platform !== "win32") return;
+  let adapter = null;
+  try {
+    adapter = options?.windowsFilesystemAdapter ?? null;
+  } catch {
+    fail("invalid_configuration");
+  }
+  if (!isWindowsFilesystemAdapter(adapter)) fail("windows_state_unqualified");
+  try {
+    assertWindowsFilesystemProductionSafe(adapter);
+  } catch {
+    fail("windows_state_unqualified");
+  }
+  // Even a future qualified adapter must grow lifecycle-specific primitives
+  // before this state owner may touch a real Windows path.
+  fail("windows_state_unqualified");
 }
 
 function currentUid() {
@@ -799,11 +832,13 @@ async function inspectUnlocked({ directory, settingsFile, installedStatusLine })
   return { status, state, targetBinding };
 }
 
-async function inspectClaudeCallbackLifecycle({
-  settingsFile = defaultClaudeSettingsFile(),
-  lifecycleDirectory = defaultClaudeCallbackLifecycleDirectory(),
-  installedStatusLine = buildManagedClaudeStatusLine(),
-} = {}) {
+async function inspectClaudeCallbackLifecycle(options = {}) {
+  assertWindowsLifecycleStateSupported(options);
+  const {
+    settingsFile = defaultClaudeSettingsFile(),
+    lifecycleDirectory = defaultClaudeCallbackLifecycleDirectory(),
+    installedStatusLine = buildManagedClaudeStatusLine(),
+  } = options;
   validateManagedStatusLine(installedStatusLine);
   const directoryStats = await lstatIfExists(lifecycleDirectory);
   if (!directoryStats) {
@@ -825,6 +860,7 @@ async function inspectClaudeCallbackLifecycle({
 }
 
 async function recoverClaudeCallbackLifecycle(options = {}) {
+  assertWindowsLifecycleStateSupported(options);
   const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile();
   const directory = options.lifecycleDirectory ?? defaultClaudeCallbackLifecycleDirectory();
   const installedStatusLine = options.installedStatusLine ?? buildManagedClaudeStatusLine();
@@ -839,6 +875,7 @@ async function recoverClaudeCallbackLifecycle(options = {}) {
 }
 
 async function installClaudeCallback(options = {}) {
+  assertWindowsLifecycleStateSupported(options);
   const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile();
   const directory = options.lifecycleDirectory ?? defaultClaudeCallbackLifecycleDirectory();
   const installedStatusLine = options.installedStatusLine ?? buildManagedClaudeStatusLine();
@@ -875,6 +912,7 @@ async function installClaudeCallback(options = {}) {
 }
 
 async function uninstallClaudeCallback(options = {}) {
+  assertWindowsLifecycleStateSupported(options);
   const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile();
   const directory = options.lifecycleDirectory ?? defaultClaudeCallbackLifecycleDirectory();
   const installedStatusLine = options.installedStatusLine ?? buildManagedClaudeStatusLine();
@@ -899,6 +937,7 @@ async function uninstallClaudeCallback(options = {}) {
 }
 
 async function rotateManagedClaudeCallbackCapability(options = {}) {
+  assertWindowsLifecycleStateSupported(options);
   const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile();
   const directory = options.lifecycleDirectory ?? defaultClaudeCallbackLifecycleDirectory();
   const installedStatusLine = options.installedStatusLine ?? buildManagedClaudeStatusLine();
@@ -921,6 +960,7 @@ async function rotateManagedClaudeCallbackCapability(options = {}) {
 }
 
 async function planManagedClaudeCallbackCapabilityRemoval(options = {}) {
+  assertWindowsLifecycleStateSupported(options);
   const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile();
   const directory = options.lifecycleDirectory ?? defaultClaudeCallbackLifecycleDirectory();
   const installedStatusLine = options.installedStatusLine ?? buildManagedClaudeStatusLine();
@@ -944,6 +984,7 @@ async function planManagedClaudeCallbackCapabilityRemoval(options = {}) {
 }
 
 async function removeManagedClaudeCallbackCapability(options = {}) {
+  assertWindowsLifecycleStateSupported(options);
   const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile();
   const directory = options.lifecycleDirectory ?? defaultClaudeCallbackLifecycleDirectory();
   const installedStatusLine = options.installedStatusLine ?? buildManagedClaudeStatusLine();
@@ -968,10 +1009,12 @@ async function removeManagedClaudeCallbackCapability(options = {}) {
 
 // Runtime-only accessor. It returns the command to the local callback process,
 // never to inspect/CLI output, and reads only the owner-only lifecycle state.
-async function readClaudeCallbackRuntimeConfiguration({
-  lifecycleDirectory = defaultClaudeCallbackLifecycleDirectory(),
-  installedStatusLine = buildManagedClaudeStatusLine(),
-} = {}) {
+async function readClaudeCallbackRuntimeConfiguration(options = {}) {
+  assertWindowsLifecycleStateSupported(options);
+  const {
+    lifecycleDirectory = defaultClaudeCallbackLifecycleDirectory(),
+    installedStatusLine = buildManagedClaudeStatusLine(),
+  } = options;
   await assertCanonicalOwnedDirectory(lifecycleDirectory, "runtime_state", { ownerOnly: true });
   const state = await readLifecycleState(lifecycleDirectory);
   if (!state || !["install_prepared", "installed", "uninstall_prepared"].includes(state.phase)) {

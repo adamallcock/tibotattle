@@ -8,6 +8,36 @@ import {
   selectProductionParticipantIdentity,
 } from "../src/export-identity-production.js";
 import { EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES } from "../src/export-identity-keychain.js";
+import { createWindowsFilesystemAdapter } from "../src/platform/windows-filesystem.js";
+
+const WINDOWS_IDENTITY = Object.freeze({
+  volumeSerialNumber: "0000000000000001",
+  fileId: "00112233445566778899aabbccddeeff",
+  linkCount: 1,
+});
+
+function fakeWindowsBinding() {
+  return {
+    contractVersion: "windows-filesystem-v1",
+    securityContractVersion: "windows-filesystem-security-v1",
+    credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
+    credentialMutexContractVersion: "windows-credential-mutex-v1",
+    productionSafe: false,
+    pathWalkRaceSafe: false,
+    credentialMutexSafe: true,
+    credentialAuditFileGuardSafe: true,
+    inspectPath: () => ({ identity: WINDOWS_IDENTITY }),
+    ensureDirectory: () => WINDOWS_IDENTITY,
+    readFile: () => ({ data: Buffer.from("data"), identity: WINDOWS_IDENTITY }),
+    createFile: () => WINDOWS_IDENTITY,
+    deleteFile: () => ({ deleted: true, identity: WINDOWS_IDENTITY }),
+    replaceFile: () => WINDOWS_IDENTITY,
+    acquireCredentialMutex: () => ({ lease: {}, abandoned: false }),
+    releaseCredentialMutex: () => {},
+    acquireCredentialAuditFileGuard: () => ({ lease: {} }),
+    releaseCredentialAuditFileGuard: () => {},
+  };
+}
 
 function fakeBackend() {
   return Object.freeze({
@@ -60,6 +90,50 @@ test("Windows x64 export-identity production selection remains fail closed", () 
     }),
     (error) => error.code === "EXPORT_IDENTITY_PRODUCTION_BACKEND_UNAVAILABLE",
   );
+  assert.equal(constructions, 0);
+});
+
+test("Windows production selection rejects forged and copied filesystem adapters", () => {
+  const branded = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding: fakeWindowsBinding(),
+  });
+  const copied = {
+    ...branded,
+    productionSafe: true,
+    pathWalkRaceSafe: true,
+  };
+  const forged = {
+    productionSafe: true,
+    pathWalkRaceSafe: true,
+    inspectPath() {},
+    ensureDirectory() {},
+    readFile() {},
+    createFile() {},
+    deleteFile() {},
+    replaceFile() {},
+  };
+  let constructions = 0;
+  const baseOptions = {
+    environmentSecret: null,
+    explicitSecretFile: null,
+    platform: "win32",
+    architecture: "x64",
+    createWindowsBackend() {
+      constructions += 1;
+      throw new Error("must not construct an unqualified backend");
+    },
+  };
+  for (const windowsFilesystemAdapter of [forged, copied, branded]) {
+    assert.throws(
+      () => selectProductionParticipantIdentity({
+        ...baseOptions,
+        windowsFilesystemAdapter,
+      }),
+      (error) => error.code === "EXPORT_IDENTITY_PRODUCTION_BACKEND_UNAVAILABLE",
+    );
+  }
   assert.equal(constructions, 0);
 });
 
