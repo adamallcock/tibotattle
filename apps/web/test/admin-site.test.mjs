@@ -234,6 +234,18 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     errors: { ...overview.errors, groups: [], recentDiagnostics: [] },
     audit: [],
   };
+  const githubUnavailableOverview = {
+    ...overview,
+    distribution: {
+      ...overview.distribution,
+      github: {
+        ...overview.distribution.github,
+        status: "unavailable",
+        reasonCode: "GITHUB_UNAVAILABLE",
+        release: null,
+      },
+    },
+  };
   const alertOverview = {
     ...overview,
     collection: {
@@ -250,6 +262,7 @@ test("admin tables preserve row order, text rendering, and empty states", async 
   // token — each load is a single /api/v1/admin/overview request.
   const responses = [
     overview,
+    githubUnavailableOverview,
     emptyOverview,
     alertOverview,
   ];
@@ -327,7 +340,7 @@ test("admin tables preserve row order, text rendering, and empty states", async 
         .map((node) => node.textContent),
       [
         "No current action is indicated by this snapshot",
-        "Collection is operational, no reconciliation or rebuild work is due, monitoring sources are available, and no sampled 5xx event was retained in the last 24 hours.",
+        "Collection is operational, no reconciliation or rebuild work is due, first-party activity evidence is available, and no sampled 5xx event was retained in the last 24 hours.",
       ],
     );
     assert.equal(
@@ -454,6 +467,29 @@ test("admin tables preserve row order, text rendering, and empty states", async 
 
     await documentRef.byId.get("refresh").listeners.get("click")();
     assert.equal(fetchCount, 2);
+    assert.equal(
+      documentRef.byId.get("distribution-status").textContent,
+      "Activity available · GitHub unavailable",
+    );
+    assert.deepEqual(
+      metricTexts(documentRef, "distribution-counts").at(-1),
+      [
+        "GitHub DMG downloads",
+        "—",
+        "unavailable from GitHub; activity counts are unaffected",
+      ],
+    );
+    assert.equal(
+      documentRef.byId.get("operator-attention-badge").textContent,
+      "No action indicated",
+    );
+    assert.deepEqual(
+      statusTexts(documentRef, "distribution-source-status").slice(-3, -2),
+      [["GitHub releases: ", "unavailable"]],
+    );
+
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.equal(fetchCount, 3);
     assert.deepEqual(tableTexts(documentRef, "error-groups"), []);
     assert.deepEqual(tableTexts(documentRef, "snapshot-rows"), []);
     assert.deepEqual(tableTexts(documentRef, "audit-rows"), []);
@@ -464,7 +500,10 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     assert.equal(documentRef.byId.get("recent-diagnostic-empty").hidden, false);
     assert.equal(documentRef.byId.get("distribution-version-empty").hidden, false);
     assert.equal(documentRef.byId.get("audit-empty").hidden, false);
-    assert.equal(documentRef.byId.get("distribution-status").textContent, "Partial evidence");
+    assert.equal(
+      documentRef.byId.get("distribution-status").textContent,
+      "Activity evidence unavailable",
+    );
     assert.equal(
       documentRef.byId.get("operator-attention-badge").textContent,
       "Review · 1",
@@ -473,8 +512,8 @@ test("admin tables preserve row order, text rendering, and empty states", async 
       documentRef.byId.get("operator-attention").children[0].children[1].children
         .map((node) => node.textContent),
       [
-        "Monitoring evidence is incomplete",
-        "upload ingress budget, Cloudflare analytics, GitHub release totals are unavailable.",
+        "Operational evidence is incomplete",
+        "Upload protection status and first-party app activity analytics could not be refreshed.",
       ],
     );
     assert.deepEqual(
@@ -486,7 +525,7 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     );
 
     await documentRef.byId.get("refresh").listeners.get("click")();
-    assert.equal(fetchCount, 3);
+    assert.equal(fetchCount, 4);
     assert.equal(
       documentRef.byId.get("operator-attention-badge").textContent,
       "Action required · 1",

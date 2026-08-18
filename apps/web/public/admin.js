@@ -38,12 +38,12 @@ const INFO_HINTS = Object.freeze({
   "Sparkle update checks": "Requests for the Sparkle appcast used to discover updates. A single installation can check more than once.",
   "Sparkle artifact fetches": "Requests for update artifacts. Fetches can include retries or automated checks and do not prove a completed installation.",
   "Current-version reach": "Distinct source addresses whose update traffic identifies the current published app version.",
-  "GitHub DMG downloads": "GitHub's cumulative download counter for the latest DMG. It counts asset downloads, not launches, active users, or unique devices.",
+  "GitHub DMG downloads": "GitHub's cumulative download counter for the latest DMG. It counts asset downloads, not launches, active users, or unique devices. This optional total does not affect the first-party activity estimates.",
   "Cloudflare analytics": "Whether first-party request analytics were available for this dashboard refresh.",
   "Evidence window": "The exact request-analytics time range used for the displayed activity estimates.",
   "Sampling": "Whether Cloudflare returned every matching row or a sampled estimate.",
   "Result bound": "Whether a query reached its safety row cap. A bounded result is a minimum rather than an exact total.",
-  "GitHub releases": "Whether current release metadata and cumulative asset download totals were available from GitHub.",
+  "GitHub releases": "Whether current release metadata and cumulative asset download totals were available from GitHub. If this source is unavailable, the first-party app activity evidence above is still valid.",
   "Latest release": "The release tag and publication time used for the download totals.",
   "Raw source addresses stored": "Whether this dashboard persists the source addresses used for distinct-address estimates. It should always say no.",
   "Upload ingress budget": "Shared admission state that protects the service from too many simultaneous or rapidly starting uploads.",
@@ -707,20 +707,24 @@ function renderAttention(overview) {
     );
   }
 
-  const missingEvidence = [];
-  if (overview.ingress === null) missingEvidence.push("upload ingress budget");
-  if (overview.distribution.cloudflare.status !== "available") {
-    missingEvidence.push("Cloudflare analytics");
-  }
-  if (overview.distribution.github.status !== "available") {
-    missingEvidence.push("GitHub release totals");
-  }
-  if (missingEvidence.length > 0) {
+  const ingressUnavailable = overview.ingress === null;
+  const activityEvidenceUnavailable =
+    overview.distribution.cloudflare.status !== "available";
+  if (ingressUnavailable || activityEvidenceUnavailable) {
+    let title = "Operational evidence is incomplete";
+    let detail = "Upload protection status and first-party app activity analytics could not be refreshed.";
+    if (ingressUnavailable && !activityEvidenceUnavailable) {
+      title = "Upload protection status is unavailable";
+      detail = "The dashboard could not read the current upload admission budget.";
+    } else if (!ingressUnavailable && activityEvidenceUnavailable) {
+      title = "App activity evidence is unavailable";
+      detail = "First-party preflight and Sparkle activity counts could not be refreshed.";
+    }
     addAttentionItem(
       items,
       "warning",
-      "Monitoring evidence is incomplete",
-      `${missingEvidence.join(", ")} ${missingEvidence.length === 1 ? "is" : "are"} unavailable.`,
+      title,
+      detail,
       "#distribution-title",
       "Review evidence",
     );
@@ -757,7 +761,7 @@ function renderAttention(overview) {
     $("#operator-attention").replaceChildren(attentionRow({
       level: "ok",
       title: "No current action is indicated by this snapshot",
-      detail: "Collection is operational, no reconciliation or rebuild work is due, monitoring sources are available, and no sampled 5xx event was retained in the last 24 hours.",
+      detail: "Collection is operational, no reconciliation or rebuild work is due, first-party activity evidence is available, and no sampled 5xx event was retained in the last 24 hours.",
       target: null,
       linkLabel: null,
     }));
@@ -849,9 +853,11 @@ function renderDistribution(distribution) {
   }`;
   badge.textContent = cloudflareAvailable && githubAvailable
     ? "Sources available"
-    : cloudflare.status === "not_configured" && github.status === "not_configured"
-      ? "Setup required"
-      : "Partial evidence";
+    : cloudflareAvailable
+      ? "Activity available · GitHub unavailable"
+      : cloudflare.status === "not_configured" && github.status === "not_configured"
+        ? "Setup required"
+        : "Activity evidence unavailable";
 
   const active = cloudflare.activeSourceAddresses;
   const preflight = cloudflare.preflight;
@@ -892,7 +898,7 @@ function renderDistribution(distribution) {
       release ? count(release.dmgDownloads) : "—",
       release
         ? `${release.tag} cumulative · ${count(release.allAssetDownloads)} all release assets`
-        : "latest public release count unavailable",
+        : "unavailable from GitHub; activity counts are unaffected",
     ],
   ]);
 
@@ -909,9 +915,7 @@ function renderDistribution(distribution) {
   $("#distribution-source-status").replaceChildren(
     statusLine(
       "Cloudflare analytics",
-      cloudflare.reasonCode
-        ? `${cloudflare.status} · ${cloudflare.reasonCode}`
-        : cloudflare.status,
+      cloudflare.status === "not_configured" ? "not configured" : cloudflare.status,
     ),
     statusLine(
       "Evidence window",
@@ -937,7 +941,7 @@ function renderDistribution(distribution) {
     ),
     statusLine(
       "GitHub releases",
-      github.reasonCode ? `${github.status} · ${github.reasonCode}` : github.status,
+      github.status === "not_configured" ? "not configured" : github.status,
     ),
     statusLine(
       "Latest release",
