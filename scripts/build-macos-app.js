@@ -1772,6 +1772,8 @@ function infoPlist(centralService, {
   <string>${xmlString(PRODUCT_BRAND.monitoredAppBundleIdentifier)}</string>
   <key>UsageMonitorMonitoredAppDisplayName</key>
   <string>${xmlString(PRODUCT_BRAND.monitoredAppDisplayName)}</string>
+  <key>UsageMonitorNodeRuntimeMode</key>
+  <string>standard</string>
   <key>UsageMonitorStateDirectoryName</key>
   <string>${xmlString(PRODUCT_BRAND.stateDirectoryName)}</string>
   <key>LSApplicationCategoryType</key>
