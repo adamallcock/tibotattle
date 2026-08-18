@@ -93,6 +93,10 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   );
   assert.match(source, /FILE_READ_DATA \| GENERIC_WRITE \| DELETE \| READ_CONTROL \| WRITE_DAC/u);
   assert.match(source, /DefineMethod\(env, exports, "replaceFile",/u);
+  assert.match(source, /ArmReplacementPauseCallback/u);
+  assert.match(source, /WaitForReplacementPauseCallback/u);
+  assert.match(source, /ReleaseReplacementPauseCallback/u);
+  assert.match(source, /QUALIFICATION_PAUSE_ALREADY_ARMED/u);
   assert.match(source, /CreateMutexExW/u);
   assert.match(source, /WaitForSingleObject\(handle, 0\)/u);
   assert.match(source, /waitResult == WAIT_ABANDONED_0/u);
@@ -115,4 +119,39 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   assert.match(source, /napi_get_boolean\(env, false, &productionSafe\)/u);
   assert.match(source, /napi_get_boolean\(env, false, &pathWalkRaceSafe\)/u);
   assert.doesNotMatch(source, /ValidateComponents\(/u);
+});
+
+test("qualification hooks are opt-in and cannot become the production artifact", async () => {
+  const gyp = JSON.parse(await readFile(
+    resolve(REPOSITORY_ROOT, "native/windows-filesystem/binding.gyp"),
+    "utf8",
+  ));
+  const production = gyp.targets.find(({ target_name }) => target_name === "windows_filesystem");
+  const qualification = gyp.conditions
+    .find(([expression]) => expression === "tibotattle_build_qualification==1")?.[1]
+    ?.targets?.find(({ target_name }) => target_name === "windows_filesystem_qualification");
+  assert.ok(production);
+  assert.ok(qualification);
+  assert.equal(
+    production.defines.includes("TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK=1"),
+    false,
+  );
+  assert.equal(
+    qualification.defines.includes("TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK=1"),
+    true,
+  );
+  assert.match(
+    await readFile(
+      resolve(REPOSITORY_ROOT, "native/windows-filesystem/windows-filesystem.cc"),
+      "utf8",
+    ),
+    /ArmReplacementPauseCallback/u,
+  );
+  assert.match(
+    await readFile(
+      resolve(REPOSITORY_ROOT, "native/windows-filesystem/windows-filesystem.cc"),
+      "utf8",
+    ),
+    /#if defined\(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK\)/u,
+  );
 });

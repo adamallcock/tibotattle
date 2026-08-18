@@ -15,6 +15,10 @@
 #include <atomic>
 #include <array>
 #include <cctype>
+#if defined(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK)
+#include <chrono>
+#include <condition_variable>
+#endif
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
@@ -200,6 +204,11 @@ Failure CredentialAuditGuardReleaseFailed() {
   return {"CREDENTIAL_AUDIT_GUARD_RELEASE_FAILED"};
 }
 Failure CredentialAuditGuardForeign() { return {"CREDENTIAL_AUDIT_GUARD_FOREIGN"}; }
+#if defined(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK)
+Failure QualificationPauseAlreadyArmed() {
+  return {"QUALIFICATION_PAUSE_ALREADY_ARMED"};
+}
+#endif
 
 bool IsNotFoundError(DWORD error) {
   return error == ERROR_FILE_NOT_FOUND
@@ -1319,6 +1328,94 @@ std::wstring TemporaryReplacementName() {
   return stream.str();
 }
 
+#if defined(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK)
+// This state is compiled only into the qualification-only target.  It is
+// deliberately process-global so a Node Worker that enters replaceFile can
+// be coordinated by the test thread that attempts the competing filesystem
+// operation.  No production binding export or wait point is generated.
+struct ReplacementPauseState {
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool armed = false;
+  bool entered = false;
+  bool released = false;
+};
+
+ReplacementPauseState gReplacementPauseState;
+
+void PauseBeforeReplacementRename() {
+  std::unique_lock<std::mutex> lock(gReplacementPauseState.mutex);
+  if (!gReplacementPauseState.armed) return;
+  gReplacementPauseState.entered = true;
+  gReplacementPauseState.condition.notify_all();
+  gReplacementPauseState.condition.wait(lock, [] {
+    return gReplacementPauseState.released;
+  });
+  gReplacementPauseState.armed = false;
+  gReplacementPauseState.entered = false;
+  gReplacementPauseState.released = false;
+  gReplacementPauseState.condition.notify_all();
+}
+
+napi_value ArmReplacementPauseCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 0)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  {
+    std::lock_guard<std::mutex> lock(gReplacementPauseState.mutex);
+    if (gReplacementPauseState.armed || gReplacementPauseState.entered) {
+      return ThrowFailure(env, QualificationPauseAlreadyArmed());
+    }
+    gReplacementPauseState.armed = true;
+    gReplacementPauseState.entered = false;
+    gReplacementPauseState.released = false;
+  }
+  gReplacementPauseState.condition.notify_all();
+  napi_value result;
+  napi_get_boolean(env, true, &result);
+  return result;
+}
+
+napi_value WaitForReplacementPauseCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 1)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::uint32_t timeoutMilliseconds = 0;
+  if (!GetUint32(env, arguments[0], &timeoutMilliseconds)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::unique_lock<std::mutex> lock(gReplacementPauseState.mutex);
+  gReplacementPauseState.condition.wait_for(
+      lock,
+      std::chrono::milliseconds(timeoutMilliseconds),
+      [] {
+        return gReplacementPauseState.entered
+            || gReplacementPauseState.released
+            || !gReplacementPauseState.armed;
+      });
+  napi_value result;
+  napi_get_boolean(env, gReplacementPauseState.entered, &result);
+  return result;
+}
+
+napi_value ReleaseReplacementPauseCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 0)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  {
+    std::lock_guard<std::mutex> lock(gReplacementPauseState.mutex);
+    gReplacementPauseState.released = true;
+  }
+  gReplacementPauseState.condition.notify_all();
+  napi_value result;
+  napi_get_boolean(env, true, &result);
+  return result;
+}
+#endif
+
 napi_value ReplaceFileCallback(napi_env env, napi_callback_info info) {
   std::vector<napi_value> arguments;
   if (!GetArguments(env, info, &arguments, 3)) return ThrowFailure(env, InvalidConfiguration());
@@ -1412,6 +1509,9 @@ napi_value ReplaceFileCallback(napi_env env, napi_callback_info info) {
     success = false;
   }
   if (success) {
+#if defined(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK)
+    PauseBeforeReplacementRename();
+#endif
     // Legacy FileRenameInformation rejects replacement while the destination
     // handle is open.  FileRenameInformationEx with FILE_RENAME_POSIX_SEMANTICS
     // permits the replacement while that handle is open.  The old close path
@@ -2232,6 +2332,23 @@ NAPI_MODULE_INIT() {
   DefineMethod(env, exports, "createFile", CreateFileCallback);
   DefineMethod(env, exports, "deleteFile", DeleteFileCallback);
   DefineMethod(env, exports, "replaceFile", ReplaceFileCallback);
+#if defined(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK)
+  DefineMethod(
+      env,
+      exports,
+      "armReplacementPause",
+      ArmReplacementPauseCallback);
+  DefineMethod(
+      env,
+      exports,
+      "waitForReplacementPause",
+      WaitForReplacementPauseCallback);
+  DefineMethod(
+      env,
+      exports,
+      "releaseReplacementPause",
+      ReleaseReplacementPauseCallback);
+#endif
   DefineMethod(
       env,
       exports,
