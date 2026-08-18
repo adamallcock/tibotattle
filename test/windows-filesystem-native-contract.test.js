@@ -152,6 +152,18 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   assert.match(source, /Legacy FileRenameInformation rejects replacement/u);
   assert.match(source, /FILE_READ_DATA \| GENERIC_WRITE \| DELETE \| READ_CONTROL \| WRITE_DAC/u);
   assert.match(source, /DefineMethod\(env, exports, "replaceFile",/u);
+  assert.match(source, /CreateMutexExW/u);
+  assert.match(source, /WaitForSingleObject\(handle, 0\)/u);
+  assert.match(source, /waitResult == WAIT_ABANDONED_0/u);
+  assert.match(source, /return ThrowFailure\(env, CredentialMutexAbandoned\(\)\)/u);
+  assert.match(source, /IsIssuedCredentialMutexLease/u);
+  assert.match(source, /std::mutex gCredentialMutexLeasesMutex/u);
+  assert.match(source, /std::lock_guard<std::mutex> lock\(gCredentialMutexLeasesMutex\)/u);
+  assert.match(source, /SE_KERNEL_OBJECT/u);
+  assert.match(source, /ConvertSidToStringSidW/u);
+  assert.match(source, /Local\\\\TiboTattle-CredentialMutation-v1-/u);
+  assert.match(source, /DefineMethod\(env, exports, "acquireCredentialMutex",/u);
+  assert.match(source, /DefineMethod\(env, exports, "releaseCredentialMutex",/u);
   assert.match(source, /napi_get_boolean\(env, false, &productionSafe\)/u);
   assert.match(source, /napi_get_boolean\(env, false, &pathWalkRaceSafe\)/u);
   assert.doesNotMatch(source, /ValidateComponents\(/u);

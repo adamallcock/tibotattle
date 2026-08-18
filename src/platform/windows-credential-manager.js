@@ -11,6 +11,13 @@ import {
   isWindowsCredentialOperationLeaseContext,
   isWindowsCredentialOperationLeaseError,
 } from "./windows-credential-operation-lease.js";
+import {
+  createWindowsCredentialMutexContext,
+} from "./windows-credential-mutex.js";
+import {
+  createWindowsCredentialOperationAuditStore,
+  defaultWindowsCredentialOperationAuditFile,
+} from "./windows-credential-operation-audit.js";
 
 const SECRET_BYTES = 32;
 const STORED_SECRET_PATTERN = /^[A-Za-z0-9_-]{43}$/;
@@ -37,6 +44,7 @@ const ERROR_CODES = new Set([
   "operation_lease_released",
   "operation_lease_foreign",
   "operation_lease_audit_failed",
+  "operation_lease_mutex_failed",
 ]);
 
 export class WindowsCredentialManagerError extends Error {
@@ -196,8 +204,10 @@ function validateOperationLeaseContext(context) {
       && typeof context.release === "function"
       && typeof context.withLease === "function"
       && typeof context.readAuditEvents === "function"
-      && context.crossProcessSafe === false
-      && context.auditDurable === false
+      && typeof context.readDurableAuditRecords === "function"
+      && typeof context.close === "function"
+      && typeof context.crossProcessSafe === "boolean"
+      && typeof context.auditDurable === "boolean"
       && context.productionSafe === false;
   } catch {
     // Hostile injected contexts are configuration failures, not native errors.
@@ -235,20 +245,6 @@ export function createWindowsCredentialManagerBackend(options = {}) {
     fail("operation_lease_invalid_configuration");
   }
 
-  let leaseContext;
-  if (operationLeaseContext === undefined) {
-    try {
-      leaseContext = createWindowsCredentialOperationLeaseContext({ audit: operationAudit });
-    } catch (error) {
-      if (isWindowsCredentialOperationLeaseError(error)) {
-        fail(leaseErrorCode(error));
-      }
-      fail("operation_lease_invalid_configuration");
-    }
-  } else {
-    leaseContext = validateOperationLeaseContext(operationLeaseContext);
-  }
-
   let selectedBinding = binding;
   if (selectedBinding === undefined) {
     try {
@@ -260,6 +256,69 @@ export function createWindowsCredentialManagerBackend(options = {}) {
   }
   const nativeBinding = validateBinding(selectedBinding);
 
+  const ownsLeaseContext = operationLeaseContext === undefined;
+  let leaseContext;
+  if (operationLeaseContext === undefined) {
+    let ownedAuditStore = null;
+    try {
+      const injectedNativeBoundary = Object.hasOwn(options, "binding")
+        || Object.hasOwn(options, "loadBinding");
+      const nativeGuarded = !injectedNativeBoundary
+        && platform === process.platform
+        && architecture === process.arch;
+      let mutexContext = null;
+      let auditStore = null;
+      if (nativeGuarded) {
+        try {
+          mutexContext = createWindowsCredentialMutexContext({ platform, architecture });
+        } catch {
+          fail("operation_lease_mutex_failed");
+        }
+        try {
+          const qualificationStateRoot = process.env.GITHUB_ACTIONS === "true"
+            && process.env.USAGE_MONITOR_WINDOWS_QUALIFICATION === "1"
+            && typeof process.env.TIBOTATTLE_WINDOWS_QUALIFICATION_STATE_ROOT === "string"
+            && process.env.TIBOTATTLE_WINDOWS_QUALIFICATION_STATE_ROOT.length > 0
+            ? process.env.TIBOTATTLE_WINDOWS_QUALIFICATION_STATE_ROOT
+            : null;
+          auditStore = createWindowsCredentialOperationAuditStore({
+            filePath: defaultWindowsCredentialOperationAuditFile({
+              platform,
+              stateRoot: qualificationStateRoot,
+            }),
+          });
+          ownedAuditStore = auditStore;
+        } catch {
+          fail("operation_lease_audit_failed");
+        }
+      }
+      leaseContext = createWindowsCredentialOperationLeaseContext({
+        audit: operationAudit,
+        mutexContext,
+        auditStore,
+        ownsAuditStore: auditStore !== null,
+      });
+    } catch (error) {
+      try {
+        ownedAuditStore?.close();
+      } catch {
+        // The fixed construction failure below remains authoritative.
+      }
+      if (error instanceof WindowsCredentialManagerError) throw error;
+      if (isWindowsCredentialOperationLeaseError(error)) {
+        fail(leaseErrorCode(error));
+      }
+      fail("operation_lease_invalid_configuration");
+    }
+  } else {
+    leaseContext = validateOperationLeaseContext(operationLeaseContext);
+  }
+  let disposed = false;
+
+  function assertOpen() {
+    if (disposed) fail("invalid_configuration");
+  }
+
   async function invoke(method, ...args) {
     try {
       return await nativeBinding[method](...args);
@@ -269,16 +328,19 @@ export function createWindowsCredentialManagerBackend(options = {}) {
   }
 
   async function describe(capability) {
+    assertOpen();
     capabilityPair(capability);
     return Object.freeze({
       backend: "windows_credential_manager",
       status: "qualification_only",
       productionSafe: false,
-      crossProcessSafe: false,
+      crossProcessSafe: leaseContext.crossProcessSafe,
+      auditDurable: leaseContext.auditDurable,
     });
   }
 
   async function withOperationLease(capability, operationOptions, callback) {
+    assertOpen();
     if (typeof callback !== "function") fail("operation_lease_invalid_configuration");
     try {
       return await leaseContext.withLease(capability, operationOptions, callback);
@@ -310,7 +372,26 @@ export function createWindowsCredentialManagerBackend(options = {}) {
       throw error;
     } finally {
       try {
-        leaseContext.recordMutation(lease, capability, operation, outcome);
+        let failureClass = null;
+        if (outcome === "failed") {
+          const code = operationError instanceof WindowsCredentialManagerError
+            ? operationError.code
+            : null;
+          failureClass = code === "windows_credential_manager_locked"
+            ? "locked"
+            : code === "windows_credential_manager_denied"
+              ? "denied"
+              : code === "windows_credential_manager_readback_mismatch"
+                ? "readback_mismatch"
+                : "operation_failed";
+        }
+        leaseContext.recordMutation(
+          lease,
+          capability,
+          operation,
+          outcome,
+          failureClass,
+        );
       } catch (error) {
         // Preserve the native/mutation error if the operation was already
         // failing. A successful mutation must surface an audit failure rather
@@ -321,10 +402,21 @@ export function createWindowsCredentialManagerBackend(options = {}) {
   }
 
   function readAuditEvents() {
+    assertOpen();
     try {
       return leaseContext.readAuditEvents();
     } catch {
       fail("operation_lease_invalid_configuration");
+    }
+  }
+
+  function readDurableAuditRecords() {
+    assertOpen();
+    try {
+      return leaseContext.readDurableAuditRecords();
+    } catch (error) {
+      if (isWindowsCredentialOperationLeaseError(error)) fail(leaseErrorCode(error));
+      fail("operation_lease_audit_failed");
     }
   }
 
@@ -336,6 +428,7 @@ export function createWindowsCredentialManagerBackend(options = {}) {
   }
 
   async function read(capability) {
+    assertOpen();
     let secret = null;
     try {
       secret = await readInternal(capability);
@@ -346,6 +439,7 @@ export function createWindowsCredentialManagerBackend(options = {}) {
   }
 
   async function createIfMissing(capability, generatedSecret, lease) {
+    assertOpen();
     const pair = capabilityPair(capability);
     return runMutation(capability, "create", lease, async () => {
       let generated = null;
@@ -368,6 +462,7 @@ export function createWindowsCredentialManagerBackend(options = {}) {
   }
 
   async function replaceExact(capability, expectedSecret, replacementSecret, lease) {
+    assertOpen();
     const pair = capabilityPair(capability);
     return runMutation(capability, "replace", lease, async () => {
       let expected = null;
@@ -394,6 +489,7 @@ export function createWindowsCredentialManagerBackend(options = {}) {
   }
 
   async function deleteExact(capability, expectedSecret, lease) {
+    assertOpen();
     const pair = capabilityPair(capability);
     return runMutation(capability, "delete", lease, async () => {
       let expected = null;
@@ -416,6 +512,18 @@ export function createWindowsCredentialManagerBackend(options = {}) {
     });
   }
 
+  function close() {
+    if (disposed) return;
+    if (!ownsLeaseContext) fail("invalid_configuration");
+    try {
+      leaseContext.close();
+    } catch (error) {
+      if (isWindowsCredentialOperationLeaseError(error)) fail(leaseErrorCode(error));
+      fail("operation_lease_invalid_configuration");
+    }
+    disposed = true;
+  }
+
   return Object.freeze({
     read,
     createIfMissing,
@@ -424,7 +532,10 @@ export function createWindowsCredentialManagerBackend(options = {}) {
     describe,
     withOperationLease,
     readAuditEvents,
-    crossProcessSafe: false,
+    readDurableAuditRecords,
+    close,
+    crossProcessSafe: leaseContext.crossProcessSafe,
+    auditDurable: leaseContext.auditDurable,
     productionSafe: false,
   });
 }

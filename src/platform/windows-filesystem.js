@@ -38,6 +38,8 @@ const REQUIRED_METHODS = Object.freeze([
   "createFile",
   "deleteFile",
   "replaceFile",
+  "acquireCredentialMutex",
+  "releaseCredentialMutex",
 ]);
 const MANIFEST_KEYS = Object.freeze([
   "schemaVersion",
@@ -48,6 +50,7 @@ const MANIFEST_KEYS = Object.freeze([
   "sha256",
   "contractVersion",
   "securityContractVersion",
+  "credentialMutexContractVersion",
   "requiredMethods",
   "nativeClaims",
   "approvedPolicy",
@@ -131,25 +134,30 @@ function assertBindingManifest(manifest) {
     && /^[0-9a-f]{64}$/u.test(manifest.sha256)
     && manifest.contractVersion === "windows-filesystem-v1"
     && manifest.securityContractVersion === "windows-filesystem-security-v1"
+    && manifest.credentialMutexContractVersion === "windows-credential-mutex-v1"
     && Array.isArray(requiredMethods)
     && requiredMethods.length === REQUIRED_METHODS.length
     && requiredMethods.every((method, index) => method === REQUIRED_METHODS[index])
     && nativeClaims !== null
     && typeof nativeClaims === "object"
     && !Array.isArray(nativeClaims)
-    && Object.keys(nativeClaims).length === 2
+    && Object.keys(nativeClaims).length === 3
     && Object.hasOwn(nativeClaims, "productionSafe")
     && Object.hasOwn(nativeClaims, "pathWalkRaceSafe")
+    && Object.hasOwn(nativeClaims, "credentialMutexSafe")
     && typeof nativeClaims.productionSafe === "boolean"
     && typeof nativeClaims.pathWalkRaceSafe === "boolean"
+    && typeof nativeClaims.credentialMutexSafe === "boolean"
     && approvedPolicy !== null
     && typeof approvedPolicy === "object"
     && !Array.isArray(approvedPolicy)
-    && Object.keys(approvedPolicy).length === 2
+    && Object.keys(approvedPolicy).length === 3
     && Object.hasOwn(approvedPolicy, "productionSafe")
     && Object.hasOwn(approvedPolicy, "pathWalkRaceSafe")
+    && Object.hasOwn(approvedPolicy, "credentialMutexSafe")
     && approvedPolicy.productionSafe === false
-    && approvedPolicy.pathWalkRaceSafe === false;
+    && approvedPolicy.pathWalkRaceSafe === false
+    && approvedPolicy.credentialMutexSafe === true;
   if (!valid) throw failure("INVALID_MANIFEST");
   return Object.freeze({
     ...manifest,
@@ -166,8 +174,10 @@ function assertBinding(binding) {
     valid = valid
       && binding?.contractVersion === "windows-filesystem-v1"
       && binding?.securityContractVersion === "windows-filesystem-security-v1"
+      && binding?.credentialMutexContractVersion === "windows-credential-mutex-v1"
       && typeof binding?.productionSafe === "boolean"
-      && typeof binding?.pathWalkRaceSafe === "boolean";
+      && typeof binding?.pathWalkRaceSafe === "boolean"
+      && binding?.credentialMutexSafe === true;
   } catch {
     valid = false;
   }
@@ -220,7 +230,9 @@ function verifyBindingIntegrity({
   if (binding.contractVersion !== manifest.contractVersion
       || binding.securityContractVersion !== manifest.securityContractVersion
       || binding.productionSafe !== manifest.nativeClaims.productionSafe
-      || binding.pathWalkRaceSafe !== manifest.nativeClaims.pathWalkRaceSafe) {
+      || binding.pathWalkRaceSafe !== manifest.nativeClaims.pathWalkRaceSafe
+      || binding.credentialMutexSafe !== manifest.nativeClaims.credentialMutexSafe
+      || binding.credentialMutexContractVersion !== manifest.credentialMutexContractVersion) {
     throw failure("MANIFEST_BINDING_MISMATCH");
   }
   return Object.freeze({ binding, manifest });

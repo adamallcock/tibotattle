@@ -30,6 +30,9 @@ const CREDENTIAL_TEST_FILE = /^windows-(?:credential|production-credential)(?:-[
 const QUALIFICATION_TEST_FILES = Object.freeze([
   "test/windows-credential-manager-probe.test.js",
   "test/windows-credential-manager.test.js",
+  "test/windows-credential-mutex-native.test.js",
+  "test/windows-credential-mutex.test.js",
+  "test/windows-credential-operation-audit.test.js",
   "test/windows-credential-operation-lease.test.js",
   "test/windows-filesystem-loader.test.js",
   "test/windows-filesystem-manifest.test.js",
@@ -88,7 +91,9 @@ async function readVerifiedBindingManifest({
     && typeof manifest.sha256 === "string"
     && /^[0-9a-f]{64}$/u.test(manifest.sha256)
     && manifest.approvedPolicy?.productionSafe === false
-    && manifest.approvedPolicy?.pathWalkRaceSafe === false;
+    && manifest.approvedPolicy?.pathWalkRaceSafe === false
+    && manifest.approvedPolicy?.credentialMutexSafe === true
+    && manifest.credentialMutexContractVersion === "windows-credential-mutex-v1";
   if (!valid) throw fixedError(FIXED_STATUS.manifestInvalid);
   return Object.freeze({
     bytes: manifest.bytes,

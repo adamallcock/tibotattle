@@ -30,6 +30,7 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.doesNotMatch(workflow, /^\s+(?:push|pull_request):/mu);
   assert.match(workflow, /permissions:\n  contents: read\n/u);
   assert.match(workflow, /USAGE_MONITOR_WINDOWS_QUALIFICATION: "1"/u);
+  assert.match(workflow, /TIBOTATTLE_WINDOWS_QUALIFICATION_STATE_ROOT/u);
   assert.match(workflow, /cache-mode:\n\s+- warm\n\s+- clean/u);
   assert.match(workflow, /matrix\.cache-mode == 'warm'/u);
   assert.doesNotMatch(workflow, /inputs\.clean-cache/u);
@@ -56,6 +57,9 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /pnpm install --frozen-lockfile --offline/u);
   assert.match(workflow, /--store-dir \$cleanStore/u);
   assert.match(workflow, /Canonical deferrals:/u);
+  assert.match(workflow, /Credential mutex contract: windows-credential-mutex-v1/u);
+  assert.match(workflow, /durable prepared\/settled\/recovered credential audit/u);
+  assert.doesNotMatch(workflow, /Deferred: cross-process credential mutex/u);
   assert.match(workflow, /passed=\$\{?receipt|Result: \$result/u);
   assert.match(qualificationScript, /--test-reporter=tap/u);
   assert.match(qualificationScript, /GITHUB_ACTIONS/u);
@@ -95,6 +99,9 @@ test("qualification selection is the exact reviewed Windows test set", async () 
   assert.deepEqual(selected.files, [
     "test/windows-credential-manager-probe.test.js",
     "test/windows-credential-manager.test.js",
+    "test/windows-credential-mutex-native.test.js",
+    "test/windows-credential-mutex.test.js",
+    "test/windows-credential-operation-audit.test.js",
     "test/windows-credential-operation-lease.test.js",
     "test/windows-filesystem-loader.test.js",
     "test/windows-filesystem-manifest.test.js",

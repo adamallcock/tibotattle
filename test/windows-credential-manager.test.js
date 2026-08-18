@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -10,7 +13,10 @@ import {
 } from "../src/platform/windows-credential-manager.js";
 import {
   WINDOWS_CREDENTIAL_CAPABILITY_OWNERS,
+  createWindowsCredentialOperationLeaseContext,
 } from "../src/platform/windows-credential-operation-lease.js";
+import { createWindowsCredentialMutexContext } from "../src/platform/windows-credential-mutex.js";
+import { createWindowsCredentialOperationAuditStore } from "../src/platform/windows-credential-operation-audit.js";
 
 const EXPORT_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity;
 const ACCOUNT_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation;
@@ -55,6 +61,31 @@ function memoryBinding(entries = []) {
       return values.delete(credentialKey(service, account));
     },
   };
+}
+
+function memoryMutexContext() {
+  const active = new Set();
+  return createWindowsCredentialMutexContext({
+    platform: "win32",
+    architecture: "x64",
+    binding: {
+      credentialMutexContractVersion: "windows-credential-mutex-v1",
+      credentialMutexSafe: true,
+      acquireCredentialMutex(capabilityId) {
+        if (active.has(capabilityId)) {
+          const error = new Error("contended");
+          error.code = "WINDOWS_FILESYSTEM_CREDENTIAL_MUTEX_CONTENDED";
+          throw error;
+        }
+        const lease = { capabilityId };
+        active.add(capabilityId);
+        return { lease, abandoned: false };
+      },
+      releaseCredentialMutex(lease) {
+        active.delete(lease.capabilityId);
+      },
+    },
+  });
 }
 
 function assertCredentialError(code) {
@@ -135,6 +166,7 @@ test("Windows backend exposes only fixed capability pairs and no credential valu
     status: "qualification_only",
     productionSafe: false,
     crossProcessSafe: false,
+    auditDurable: false,
   });
   assert.equal(binding.calls.length, 0);
   await assert.rejects(
@@ -328,6 +360,56 @@ test("Windows backend records secret-free, capability-derived mutation audit eve
   assert.deepEqual(backend.readAuditEvents(), auditEvents);
 });
 
+test("Windows backend durably prepares before native access and settles after readback", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-manager-audit-"));
+  const auditStore = createWindowsCredentialOperationAuditStore({
+    filePath: join(root, "private", "windows-credential-operation-audit-v1.sqlite"),
+  });
+  try {
+    const binding = memoryBinding();
+    const originalGetPassword = binding.getPassword.bind(binding);
+    binding.getPassword = async (...args) => {
+      assert.equal(auditStore.readPending().length, 1);
+      return originalGetPassword(...args);
+    };
+    const operationLeaseContext = createWindowsCredentialOperationLeaseContext({
+      mutexContext: memoryMutexContext(),
+      auditStore,
+    });
+    const backend = createWindowsCredentialManagerBackend({
+      platform: "win32",
+      architecture: "x64",
+      binding,
+      operationLeaseContext,
+    });
+    const secret = Buffer.alloc(32, 27);
+    assert.equal(
+      await withMutationLease(backend, EXPORT_CAPABILITY, "create", (lease) => (
+        backend.createIfMissing(EXPORT_CAPABILITY, secret, lease)
+      )),
+      "created",
+    );
+    assert.equal(backend.crossProcessSafe, true);
+    assert.equal(backend.auditDurable, true);
+    const records = backend.readDurableAuditRecords();
+    assert.equal(records.length, 1);
+    assert.equal(records[0].phase, "settled");
+    assert.equal(records[0].result, "created");
+    const serialized = JSON.stringify(records);
+    for (const forbidden of [
+      secret.toString("base64url"),
+      EXPORT_CAPABILITY.service,
+      EXPORT_CAPABILITY.account,
+      root,
+    ]) {
+      assert.equal(serialized.includes(forbidden), false);
+    }
+  } finally {
+    auditStore.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Windows backend rejects missing and forged leases before native mutation", async () => {
   const binding = memoryBinding();
   const backend = createWindowsCredentialManagerBackend({
@@ -351,6 +433,30 @@ test("Windows backend rejects missing and forged leases before native mutation",
     "created",
   );
   assert.equal(binding.calls.filter(([method]) => method === "setPassword").length, 1);
+});
+
+test("Windows backend closes owned lease resources only after active work finishes", async () => {
+  const backend = createWindowsCredentialManagerBackend({
+    platform: "win32",
+    architecture: "x64",
+    binding: memoryBinding(),
+  });
+  await withMutationLease(backend, EXPORT_CAPABILITY, "create", async (lease) => {
+    assert.throws(
+      () => backend.close(),
+      assertCredentialError("operation_lease_invalid_configuration"),
+    );
+    assert.equal(
+      await backend.createIfMissing(EXPORT_CAPABILITY, Buffer.alloc(32, 29), lease),
+      "created",
+    );
+  });
+  backend.close();
+  backend.close();
+  await assert.rejects(
+    backend.read(EXPORT_CAPABILITY),
+    assertCredentialError("invalid_configuration"),
+  );
 });
 
 test("Windows backend collapses hostile lease options to a fixed configuration error", async () => {
@@ -399,18 +505,23 @@ test("native Windows x64 qualification adapter loads the audited binding without
   skip: process.platform !== "win32" || process.arch !== "x64",
 }, async () => {
   const backend = createWindowsCredentialManagerBackend();
-  for (const capability of [
-    EXPORT_CAPABILITY,
-    ACCOUNT_CAPABILITY,
-    CLAUDE_CAPABILITY,
-    DEVICE_CAPABILITY,
-  ]) {
-    assert.deepEqual(await backend.describe(capability), {
-      backend: "windows_credential_manager",
-      status: "qualification_only",
-      productionSafe: false,
-      crossProcessSafe: false,
-    });
+  try {
+    for (const capability of [
+      EXPORT_CAPABILITY,
+      ACCOUNT_CAPABILITY,
+      CLAUDE_CAPABILITY,
+      DEVICE_CAPABILITY,
+    ]) {
+      assert.deepEqual(await backend.describe(capability), {
+        backend: "windows_credential_manager",
+        status: "qualification_only",
+        productionSafe: false,
+        crossProcessSafe: true,
+        auditDurable: true,
+      });
+    }
+  } finally {
+    backend.close();
   }
 });
 
@@ -426,55 +537,63 @@ test("native qualification exercises and cleans all four fixed credential lifecy
     CLAUDE_CAPABILITY,
     DEVICE_CAPABILITY,
   ];
-  for (let index = 0; index < capabilities.length; index += 1) {
-    const capability = capabilities[index];
-    const initial = await firstBackend.read(capability);
-    assert.equal(initial, null);
-    const created = Buffer.alloc(32, 31 + index);
+  try {
+    for (let index = 0; index < capabilities.length; index += 1) {
+      const capability = capabilities[index];
+      const initial = await firstBackend.read(capability);
+      assert.equal(initial, null);
+      const created = Buffer.alloc(32, 31 + index);
       const replacement = Buffer.alloc(32, 63 + index);
       try {
-      assert.equal(
-        await withMutationLease(firstBackend, capability, "create", (lease) => (
-          firstBackend.createIfMissing(capability, created, lease)
-        )),
-        "created",
-      );
-      assert.deepEqual(await firstBackend.read(capability), created);
+        assert.equal(
+          await withMutationLease(firstBackend, capability, "create", (lease) => (
+            firstBackend.createIfMissing(capability, created, lease)
+          )),
+          "created",
+        );
+        assert.deepEqual(await firstBackend.read(capability), created);
 
       // Reconstructing the audited adapter models a process restart or upgrade
       // without changing the fixed service/account contract.
-      const restartedBackend = createWindowsCredentialManagerBackend();
-      assert.deepEqual(await restartedBackend.read(capability), created);
-      assert.equal(
-        await withMutationLease(restartedBackend, capability, "replace", (lease) => (
-          restartedBackend.replaceExact(capability, created, replacement, lease)
-        )),
-        "replaced",
-      );
-      assert.deepEqual(await firstBackend.read(capability), replacement);
-      assert.equal(
-        await withMutationLease(firstBackend, capability, "delete", (lease) => (
-          firstBackend.deleteExact(capability, replacement, lease)
-        )),
-        "deleted",
-      );
-      assert.equal(await firstBackend.read(capability), null);
-    } finally {
-      created.fill(0);
-      replacement.fill(0);
-      const residue = await firstBackend.read(capability);
-      if (residue !== null) {
+        const restartedBackend = createWindowsCredentialManagerBackend();
         try {
+          assert.deepEqual(await restartedBackend.read(capability), created);
           assert.equal(
-            await withMutationLease(firstBackend, capability, "delete", (lease) => (
-              firstBackend.deleteExact(capability, residue, lease)
+            await withMutationLease(restartedBackend, capability, "replace", (lease) => (
+              restartedBackend.replaceExact(capability, created, replacement, lease)
             )),
-            "deleted",
+            "replaced",
           );
         } finally {
-          residue.fill(0);
+          restartedBackend.close();
+        }
+        assert.deepEqual(await firstBackend.read(capability), replacement);
+        assert.equal(
+          await withMutationLease(firstBackend, capability, "delete", (lease) => (
+            firstBackend.deleteExact(capability, replacement, lease)
+          )),
+          "deleted",
+        );
+        assert.equal(await firstBackend.read(capability), null);
+      } finally {
+        created.fill(0);
+        replacement.fill(0);
+        const residue = await firstBackend.read(capability);
+        if (residue !== null) {
+          try {
+            assert.equal(
+              await withMutationLease(firstBackend, capability, "delete", (lease) => (
+                firstBackend.deleteExact(capability, residue, lease)
+              )),
+              "deleted",
+            );
+          } finally {
+            residue.fill(0);
+          }
         }
       }
     }
+  } finally {
+    firstBackend.close();
   }
 });

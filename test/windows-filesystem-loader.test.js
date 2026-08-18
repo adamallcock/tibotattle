@@ -33,14 +33,17 @@ function manifest(overrides = {}) {
     sha256: sha256(BINDING_BYTES),
     contractVersion: "windows-filesystem-v1",
     securityContractVersion: "windows-filesystem-security-v1",
+    credentialMutexContractVersion: "windows-credential-mutex-v1",
     requiredMethods: [...WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS],
     nativeClaims: {
       productionSafe: false,
       pathWalkRaceSafe: false,
+      credentialMutexSafe: true,
     },
     approvedPolicy: {
       productionSafe: false,
       pathWalkRaceSafe: false,
+      credentialMutexSafe: true,
     },
     ...overrides,
   };
@@ -50,14 +53,18 @@ function binding(overrides = {}) {
   return {
     contractVersion: "windows-filesystem-v1",
     securityContractVersion: "windows-filesystem-security-v1",
+    credentialMutexContractVersion: "windows-credential-mutex-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
+    credentialMutexSafe: true,
     inspectPath: () => ({ identity: IDENTITY }),
     ensureDirectory: () => IDENTITY,
     readFile: () => ({ data: Buffer.from("data"), identity: IDENTITY }),
     createFile: () => IDENTITY,
     deleteFile: () => ({ deleted: true, identity: IDENTITY }),
     replaceFile: () => IDENTITY,
+    acquireCredentialMutex: () => ({ lease: {}, abandoned: false }),
+    releaseCredentialMutex: () => {},
     ...overrides,
   };
 }
@@ -172,7 +179,11 @@ test("manifest policy and native claims are cross-checked before loading", () =>
       bindingPath,
       resolveBinding: (path) => path,
       readManifest: () => JSON.stringify(manifest({
-        nativeClaims: { productionSafe: true, pathWalkRaceSafe: true },
+        nativeClaims: {
+          productionSafe: true,
+          pathWalkRaceSafe: true,
+          credentialMutexSafe: true,
+        },
       })),
       readBindingBytes: () => BINDING_BYTES,
       requireBinding: () => binding(),
@@ -187,7 +198,11 @@ test("manifest policy and native claims are cross-checked before loading", () =>
       resolveBinding: (path) => path,
       readManifest: () => JSON.stringify({
         ...manifest(),
-        approvedPolicy: { productionSafe: true, pathWalkRaceSafe: true },
+        approvedPolicy: {
+          productionSafe: true,
+          pathWalkRaceSafe: true,
+          credentialMutexSafe: true,
+        },
       }),
       readBindingBytes: () => BINDING_BYTES,
       requireBinding: () => binding(),

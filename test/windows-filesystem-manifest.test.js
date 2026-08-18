@@ -25,14 +25,18 @@ function binding(overrides = {}) {
   return {
     contractVersion: "windows-filesystem-v1",
     securityContractVersion: "windows-filesystem-security-v1",
+    credentialMutexContractVersion: "windows-credential-mutex-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
+    credentialMutexSafe: true,
     inspectPath: () => ({ identity: IDENTITY }),
     ensureDirectory: () => IDENTITY,
     readFile: () => ({ data: Buffer.from("data"), identity: IDENTITY }),
     createFile: () => IDENTITY,
     deleteFile: () => ({ deleted: true, identity: IDENTITY }),
     replaceFile: () => IDENTITY,
+    acquireCredentialMutex: () => ({ lease: {}, abandoned: false }),
+    releaseCredentialMutex: () => {},
     ...overrides,
   };
 }
@@ -51,6 +55,7 @@ test("binding manifest is deterministic, content-free, and policy-disabled", () 
     sha256: createHash("sha256").update(BYTES).digest("hex"),
     contractVersion: "windows-filesystem-v1",
     securityContractVersion: "windows-filesystem-security-v1",
+    credentialMutexContractVersion: "windows-credential-mutex-v1",
     requiredMethods: [
       "inspectPath",
       "ensureDirectory",
@@ -58,14 +63,18 @@ test("binding manifest is deterministic, content-free, and policy-disabled", () 
       "createFile",
       "deleteFile",
       "replaceFile",
+      "acquireCredentialMutex",
+      "releaseCredentialMutex",
     ],
     nativeClaims: {
       productionSafe: false,
       pathWalkRaceSafe: false,
+      credentialMutexSafe: true,
     },
     approvedPolicy: {
       productionSafe: false,
       pathWalkRaceSafe: false,
+      credentialMutexSafe: true,
     },
   });
   assert.equal(Object.keys(manifest).some((key) => /path|account|secret|content/iu.test(key)), false);

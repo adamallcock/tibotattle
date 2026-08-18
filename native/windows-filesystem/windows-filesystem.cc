@@ -21,6 +21,8 @@
 #include <cwctype>
 #include <iomanip>
 #include <limits>
+#include <mutex>
+#include <new>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -102,6 +104,9 @@ constexpr DWORD kDirectoryTraversalAccess = FILE_LIST_DIRECTORY
 constexpr DWORD kDirectoryShareMode = FILE_SHARE_READ
     | FILE_SHARE_WRITE
     | FILE_SHARE_DELETE;
+constexpr DWORD kCredentialMutexAccess = READ_CONTROL
+    | SYNCHRONIZE
+    | MUTEX_MODIFY_STATE;
 constexpr NativeNtStatus kStatusObjectNameNotFound = static_cast<NativeNtStatus>(0xC0000034L);
 constexpr NativeNtStatus kStatusObjectPathNotFound = static_cast<NativeNtStatus>(0xC000003AL);
 constexpr NativeNtStatus kStatusObjectNameCollision = static_cast<NativeNtStatus>(0xC0000035L);
@@ -177,6 +182,11 @@ Failure NotRegularFile() { return {"NOT_REGULAR_FILE"}; }
 Failure TooLarge() { return {"FILE_TOO_LARGE"}; }
 Failure IdentityMismatch() { return {"IDENTITY_MISMATCH"}; }
 Failure OperationFailed() { return {"OPERATION_FAILED"}; }
+Failure CredentialMutexInvalidCapability() { return {"CREDENTIAL_MUTEX_INVALID_CAPABILITY"}; }
+Failure CredentialMutexContended() { return {"CREDENTIAL_MUTEX_CONTENDED"}; }
+Failure CredentialMutexAbandoned() { return {"CREDENTIAL_MUTEX_ABANDONED"}; }
+Failure CredentialMutexReleaseFailed() { return {"CREDENTIAL_MUTEX_RELEASE_FAILED"}; }
+Failure CredentialMutexForeign() { return {"CREDENTIAL_MUTEX_FOREIGN"}; }
 
 bool IsNotFoundError(DWORD error) {
   return error == ERROR_FILE_NOT_FOUND
@@ -467,9 +477,15 @@ struct SecuritySnapshot {
   bool broadAccess = false;
   bool nonOwnerAllow = false;
   bool unrecognizedAce = false;
+  bool denyAce = false;
+  DWORD ownerAllowAceCount = 0;
+  DWORD ownerAllowMask = 0;
 };
 
-bool ReadSecurity(HANDLE handle, SecuritySnapshot* snapshot) {
+bool ReadObjectSecurity(
+    HANDLE handle,
+    SE_OBJECT_TYPE objectType,
+    SecuritySnapshot* snapshot) {
   std::vector<BYTE> currentSid;
   if (!GetCurrentUserSid(&currentSid)) return false;
   PSID ownerSid = nullptr;
@@ -477,7 +493,7 @@ bool ReadSecurity(HANDLE handle, SecuritySnapshot* snapshot) {
   PSECURITY_DESCRIPTOR descriptor = nullptr;
   const DWORD result = GetSecurityInfo(
       handle,
-      SE_FILE_OBJECT,
+      objectType,
       OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
       &ownerSid,
       nullptr,
@@ -519,7 +535,10 @@ bool ReadSecurity(HANDLE handle, SecuritySnapshot* snapshot) {
         continue;
       }
       if (header->AceType == ACCESS_DENIED_ACE_TYPE
-          || header->AceType == ACCESS_DENIED_OBJECT_ACE_TYPE) continue;
+          || header->AceType == ACCESS_DENIED_OBJECT_ACE_TYPE) {
+        snapshot->denyAce = true;
+        continue;
+      }
       PSID aceSid = nullptr;
       DWORD sidOffset = 0;
       if (header->AceType == ACCESS_ALLOWED_ACE_TYPE) {
@@ -556,11 +575,33 @@ bool ReadSecurity(HANDLE handle, SecuritySnapshot* snapshot) {
         continue;
       }
       if (IsBroadSid(aceSid)) snapshot->broadAccess = true;
-      if (!IsSidEqual(aceSid, currentSid.data())) snapshot->nonOwnerAllow = true;
+      if (!IsSidEqual(aceSid, currentSid.data())) {
+        snapshot->nonOwnerAllow = true;
+      } else if (header->AceType == ACCESS_ALLOWED_ACE_TYPE) {
+        const auto* allowedAce = static_cast<const ACCESS_ALLOWED_ACE*>(rawAce);
+        snapshot->ownerAllowAceCount += 1;
+        snapshot->ownerAllowMask |= allowedAce->Mask;
+      }
     }
   }
   LocalFree(descriptor);
   return true;
+}
+
+bool ReadSecurity(HANDLE handle, SecuritySnapshot* snapshot) {
+  return ReadObjectSecurity(handle, SE_FILE_OBJECT, snapshot);
+}
+
+bool IsOwnerOnlySecurity(const SecuritySnapshot& descriptor) {
+  return descriptor.ownerMatches
+      && !descriptor.nullDacl
+      && descriptor.daclProtected
+      && !descriptor.broadAccess
+      && !descriptor.nonOwnerAllow
+      && !descriptor.unrecognizedAce
+      && !descriptor.denyAce
+      && descriptor.ownerAllowAceCount == 1
+      && descriptor.ownerAllowMask == kCredentialMutexAccess;
 }
 
 bool HasReparsePoint(HANDLE handle, bool* result) {
@@ -926,14 +967,15 @@ bool ValidateSecurity(
   return true;
 }
 
-bool BuildOwnerOnlySecurity(
+bool BuildOwnerOnlyObjectSecurity(
+    DWORD accessMask,
     std::vector<BYTE>* ownerSid,
     PACL* acl,
     PSECURITY_DESCRIPTOR* descriptor,
     SECURITY_ATTRIBUTES* attributes) {
   if (!GetCurrentUserSid(ownerSid)) return false;
   EXPLICIT_ACCESSW entry{};
-  entry.grfAccessPermissions = FILE_ALL_ACCESS;
+  entry.grfAccessPermissions = accessMask;
   entry.grfAccessMode = SET_ACCESS;
   entry.grfInheritance = NO_INHERITANCE;
   entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
@@ -963,6 +1005,19 @@ bool BuildOwnerOnlySecurity(
   attributes->lpSecurityDescriptor = *descriptor;
   attributes->bInheritHandle = FALSE;
   return true;
+}
+
+bool BuildOwnerOnlySecurity(
+    std::vector<BYTE>* ownerSid,
+    PACL* acl,
+    PSECURITY_DESCRIPTOR* descriptor,
+    SECURITY_ATTRIBUTES* attributes) {
+  return BuildOwnerOnlyObjectSecurity(
+      FILE_ALL_ACCESS,
+      ownerSid,
+      acl,
+      descriptor,
+      attributes);
 }
 
 void FreeOwnerOnlySecurity(PACL acl, PSECURITY_DESCRIPTOR descriptor) {
@@ -1752,6 +1807,226 @@ napi_value DeleteFileCallback(napi_env env, napi_callback_info info) {
   return result;
 }
 
+struct CredentialMutexLease {
+  HANDLE handle = nullptr;
+  DWORD ownerThreadId = 0;
+  bool active = false;
+};
+
+std::array<CredentialMutexLease*, 256> gCredentialMutexLeases{};
+std::mutex gCredentialMutexLeasesMutex;
+
+// Callers must hold gCredentialMutexLeasesMutex while reading or mutating the
+// issued-token registry and the state of a registered lease.
+bool IsIssuedCredentialMutexLease(CredentialMutexLease* lease) {
+  return std::find(
+      gCredentialMutexLeases.begin(),
+      gCredentialMutexLeases.end(),
+      lease) != gCredentialMutexLeases.end();
+}
+
+bool RegisterCredentialMutexLease(CredentialMutexLease* lease) {
+  const auto available = std::find(
+      gCredentialMutexLeases.begin(),
+      gCredentialMutexLeases.end(),
+      nullptr);
+  if (available == gCredentialMutexLeases.end()) return false;
+  *available = lease;
+  return true;
+}
+
+bool UnregisterCredentialMutexLease(CredentialMutexLease* lease) {
+  const auto existing = std::find(
+      gCredentialMutexLeases.begin(),
+      gCredentialMutexLeases.end(),
+      lease);
+  if (existing == gCredentialMutexLeases.end()) return false;
+  *existing = nullptr;
+  return true;
+}
+
+void FinalizeCredentialMutexLease(
+    napi_env,
+    void* data,
+    void*) {
+  auto* lease = static_cast<CredentialMutexLease*>(data);
+  if (lease == nullptr) return;
+  const std::lock_guard<std::mutex> lock(gCredentialMutexLeasesMutex);
+  const bool issued = UnregisterCredentialMutexLease(lease);
+  if (issued && lease->active && lease->handle != nullptr) {
+    if (lease->ownerThreadId == GetCurrentThreadId()) {
+      ReleaseMutex(lease->handle);
+    }
+    CloseHandle(lease->handle);
+    lease->handle = nullptr;
+    lease->active = false;
+  }
+  delete lease;
+}
+
+bool CredentialMutexName(std::uint32_t capabilityId, std::wstring* name) {
+  const wchar_t* label = nullptr;
+  switch (capabilityId) {
+    case 0:
+      label = L"export-identity";
+      break;
+    case 1:
+      label = L"account-observation";
+      break;
+    case 2:
+      label = L"claude-callback";
+      break;
+    case 3:
+      label = L"contribution-device";
+      break;
+    default:
+      return false;
+  }
+  std::vector<BYTE> ownerSid;
+  if (!GetCurrentUserSid(&ownerSid)) return false;
+  LPWSTR sidText = nullptr;
+  if (!ConvertSidToStringSidW(ownerSid.data(), &sidText) || sidText == nullptr) {
+    return false;
+  }
+  *name = L"Local\\TiboTattle-CredentialMutation-v1-";
+  name->append(sidText);
+  name->push_back(L'-');
+  name->append(label);
+  LocalFree(sidText);
+  return true;
+}
+
+napi_value AcquireCredentialMutexCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 1)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::uint32_t capabilityId = 0;
+  std::wstring name;
+  if (!GetUint32(env, arguments[0], &capabilityId)
+      || !CredentialMutexName(capabilityId, &name)) {
+    return ThrowFailure(env, CredentialMutexInvalidCapability());
+  }
+
+  std::vector<BYTE> ownerSid;
+  PACL acl = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  SECURITY_ATTRIBUTES attributes{};
+  if (!BuildOwnerOnlyObjectSecurity(
+          kCredentialMutexAccess,
+          &ownerSid,
+          &acl,
+          &descriptor,
+          &attributes)) {
+    return ThrowFailure(env, OperationFailed());
+  }
+  HANDLE handle = CreateMutexExW(
+      &attributes,
+      name.c_str(),
+      0,
+      kCredentialMutexAccess);
+  FreeOwnerOnlySecurity(acl, descriptor);
+  if (handle == nullptr) return ThrowFailure(env, FromLastError());
+
+  SecuritySnapshot security;
+  if (!ReadObjectSecurity(handle, SE_KERNEL_OBJECT, &security)
+      || !IsOwnerOnlySecurity(security)) {
+    CloseHandle(handle);
+    return ThrowFailure(env, SecurityPolicy("credential_mutex_security"));
+  }
+
+  const DWORD waitResult = WaitForSingleObject(handle, 0);
+  if (waitResult == WAIT_TIMEOUT) {
+    CloseHandle(handle);
+    return ThrowFailure(env, CredentialMutexContended());
+  }
+  if (waitResult == WAIT_ABANDONED_0) {
+    ReleaseMutex(handle);
+    CloseHandle(handle);
+    return ThrowFailure(env, CredentialMutexAbandoned());
+  }
+  if (waitResult != WAIT_OBJECT_0) {
+    CloseHandle(handle);
+    return ThrowFailure(env, OperationFailed());
+  }
+
+  auto* lease = new (std::nothrow) CredentialMutexLease{
+      handle,
+      GetCurrentThreadId(),
+      true,
+  };
+  if (lease == nullptr) {
+    ReleaseMutex(handle);
+    CloseHandle(handle);
+    return ThrowFailure(env, OperationFailed());
+  }
+  {
+    const std::lock_guard<std::mutex> lock(gCredentialMutexLeasesMutex);
+    if (!RegisterCredentialMutexLease(lease)) {
+      ReleaseMutex(handle);
+      CloseHandle(handle);
+      delete lease;
+      return ThrowFailure(env, OperationFailed());
+    }
+  }
+  napi_value external;
+  if (napi_create_external(
+          env,
+          lease,
+          FinalizeCredentialMutexLease,
+          nullptr,
+          &external) != napi_ok) {
+    FinalizeCredentialMutexLease(env, lease, nullptr);
+    return ThrowFailure(env, OperationFailed());
+  }
+  napi_value result;
+  napi_value abandoned;
+  napi_create_object(env, &result);
+  napi_get_boolean(env, false, &abandoned);
+  napi_set_named_property(env, result, "lease", external);
+  napi_set_named_property(env, result, "abandoned", abandoned);
+  return result;
+}
+
+napi_value ReleaseCredentialMutexCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 1)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, arguments[0], &type) != napi_ok || type != napi_external) {
+    return ThrowFailure(env, CredentialMutexForeign());
+  }
+  void* data = nullptr;
+  if (napi_get_value_external(env, arguments[0], &data) != napi_ok || data == nullptr) {
+    return ThrowFailure(env, CredentialMutexForeign());
+  }
+  auto* lease = static_cast<CredentialMutexLease*>(data);
+  const std::lock_guard<std::mutex> lock(gCredentialMutexLeasesMutex);
+  if (!IsIssuedCredentialMutexLease(lease)) {
+    return ThrowFailure(env, CredentialMutexForeign());
+  }
+  if (!lease->active
+      || lease->handle == nullptr
+      || lease->ownerThreadId != GetCurrentThreadId()) {
+    return ThrowFailure(env, CredentialMutexForeign());
+  }
+  if (!ReleaseMutex(lease->handle)) {
+    UnregisterCredentialMutexLease(lease);
+    CloseHandle(lease->handle);
+    lease->handle = nullptr;
+    lease->active = false;
+    return ThrowFailure(env, CredentialMutexReleaseFailed());
+  }
+  UnregisterCredentialMutexLease(lease);
+  CloseHandle(lease->handle);
+  lease->handle = nullptr;
+  lease->active = false;
+  napi_value undefined;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
 void DefineMethod(napi_env env, napi_value exports, const char* name, napi_callback callback) {
   napi_value function;
   napi_create_function(env, name, NAPI_AUTO_LENGTH, callback, nullptr, &function);
@@ -1767,17 +2042,33 @@ NAPI_MODULE_INIT() {
   DefineMethod(env, exports, "createFile", CreateFileCallback);
   DefineMethod(env, exports, "deleteFile", DeleteFileCallback);
   DefineMethod(env, exports, "replaceFile", ReplaceFileCallback);
+  DefineMethod(env, exports, "acquireCredentialMutex", AcquireCredentialMutexCallback);
+  DefineMethod(env, exports, "releaseCredentialMutex", ReleaseCredentialMutexCallback);
   napi_value version;
   napi_create_string_utf8(env, "windows-filesystem-v1", NAPI_AUTO_LENGTH, &version);
   napi_set_named_property(env, exports, "contractVersion", version);
   napi_value securityVersion;
   napi_create_string_utf8(env, "windows-filesystem-security-v1", NAPI_AUTO_LENGTH, &securityVersion);
   napi_set_named_property(env, exports, "securityContractVersion", securityVersion);
+  napi_value credentialMutexVersion;
+  napi_create_string_utf8(
+      env,
+      "windows-credential-mutex-v1",
+      NAPI_AUTO_LENGTH,
+      &credentialMutexVersion);
+  napi_set_named_property(
+      env,
+      exports,
+      "credentialMutexContractVersion",
+      credentialMutexVersion);
   napi_value productionSafe;
   napi_value pathWalkRaceSafe;
+  napi_value credentialMutexSafe;
   napi_get_boolean(env, false, &productionSafe);
   napi_get_boolean(env, false, &pathWalkRaceSafe);
+  napi_get_boolean(env, true, &credentialMutexSafe);
   napi_set_named_property(env, exports, "productionSafe", productionSafe);
   napi_set_named_property(env, exports, "pathWalkRaceSafe", pathWalkRaceSafe);
+  napi_set_named_property(env, exports, "credentialMutexSafe", credentialMutexSafe);
   return exports;
 }

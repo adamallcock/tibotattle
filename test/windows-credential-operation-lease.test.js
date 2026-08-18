@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -9,6 +12,12 @@ import {
   WindowsCredentialOperationLeaseError,
   createWindowsCredentialOperationLeaseContext,
 } from "../src/platform/windows-credential-operation-lease.js";
+import {
+  createWindowsCredentialMutexContext,
+} from "../src/platform/windows-credential-mutex.js";
+import {
+  createWindowsCredentialOperationAuditStore,
+} from "../src/platform/windows-credential-operation-audit.js";
 
 const CAPABILITIES = [
   [
@@ -37,6 +46,38 @@ function leaseError(code) {
     assert.equal(Object.hasOwn(error, "cause"), false);
     return true;
   };
+}
+
+function memoryMutexContext({ abandoned = false } = {}) {
+  const active = new Set();
+  let abandonedPending = abandoned;
+  return createWindowsCredentialMutexContext({
+    platform: "win32",
+    architecture: "x64",
+    binding: {
+      credentialMutexContractVersion: "windows-credential-mutex-v1",
+      credentialMutexSafe: true,
+      acquireCredentialMutex(capabilityId) {
+        if (abandonedPending) {
+          abandonedPending = false;
+          const error = new Error("abandoned");
+          error.code = "WINDOWS_FILESYSTEM_CREDENTIAL_MUTEX_ABANDONED";
+          throw error;
+        }
+        if (active.has(capabilityId)) {
+          const error = new Error("contended");
+          error.code = "WINDOWS_FILESYSTEM_CREDENTIAL_MUTEX_CONTENDED";
+          throw error;
+        }
+        const lease = { capabilityId };
+        active.add(capabilityId);
+        return { lease, abandoned: false };
+      },
+      releaseCredentialMutex(lease) {
+        active.delete(lease.capabilityId);
+      },
+    },
+  });
 }
 
 test("Windows operation leases bind every owner to one exact capability and operation", () => {
@@ -174,4 +215,94 @@ test("Windows operation lease preserves a primary operation error when release a
   const healthy = createWindowsCredentialOperationLeaseContext();
   const lease = healthy.acquire(capability, { operation: "replace" });
   healthy.release(lease);
+});
+
+test("Windows operation lease holds a branded cross-process mutex across the callback", async () => {
+  const [capability] = CAPABILITIES[0];
+  const context = createWindowsCredentialOperationLeaseContext({
+    mutexContext: memoryMutexContext({ abandoned: true }),
+  });
+  assert.equal(context.crossProcessSafe, true);
+  await context.withLease(capability, { operation: "replace" }, async (lease) => {
+    assert.throws(
+      () => createWindowsCredentialOperationLeaseContext({
+        mutexContext: memoryMutexContext(),
+      }).acquire(capability, { operation: "replace" }),
+      leaseError("contended"),
+    );
+    context.recordMutation(lease, capability, "replace", "conflict");
+  });
+  assert.equal(
+    context.readAuditEvents()[0].recovery,
+    "abandoned_owner",
+  );
+});
+
+test("Windows operation lease recovers durable prepared rows before the next mutation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-lease-recovery-"));
+  const auditStore = createWindowsCredentialOperationAuditStore({
+    filePath: join(root, "private", "windows-credential-operation-audit-v1.sqlite"),
+  });
+  try {
+    auditStore.prepare({
+      leaseId: "00000000-0000-4000-8000-000000000099",
+      owner: WINDOWS_CREDENTIAL_CAPABILITY_OWNERS.exportIdentity,
+      capability: "export_identity",
+      operation: "replace",
+    });
+    auditStore.prepare({
+      leaseId: "00000000-0000-4000-8000-000000000098",
+      owner: WINDOWS_CREDENTIAL_CAPABILITY_OWNERS.accountObservation,
+      capability: "account_observation",
+      operation: "delete",
+    });
+    const context = createWindowsCredentialOperationLeaseContext({
+      mutexContext: memoryMutexContext(),
+      auditStore,
+      idFactory: () => "00000000-0000-4000-8000-000000000100",
+    });
+    const capability = CAPABILITIES[0][0];
+    await context.withLease(capability, { operation: "create" }, async (lease) => {
+      assert.equal(auditStore.readPending().length, 2);
+      context.recordMutation(lease, capability, "create", "created");
+    });
+    const records = auditStore.read();
+    assert.equal(records[0].phase, "recovered");
+    assert.equal(records[0].recoveryClass, "unknown_after_crash");
+    assert.equal(records[1].phase, "prepared");
+    assert.equal(records[1].capability, "account_observation");
+    assert.equal(records[2].phase, "settled");
+    assert.equal(records[2].result, "created");
+  } finally {
+    auditStore.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows operation lease validates its ID before acquiring the native mutex", () => {
+  let nativeAcquisitions = 0;
+  const mutexContext = createWindowsCredentialMutexContext({
+    platform: "win32",
+    architecture: "x64",
+    binding: {
+      credentialMutexContractVersion: "windows-credential-mutex-v1",
+      credentialMutexSafe: true,
+      acquireCredentialMutex() {
+        nativeAcquisitions += 1;
+        return { lease: {}, abandoned: false };
+      },
+      releaseCredentialMutex() {},
+    },
+  });
+  const context = createWindowsCredentialOperationLeaseContext({
+    mutexContext,
+    idFactory() {
+      throw new Error("DO-NOT-LEAK-id-factory");
+    },
+  });
+  assert.throws(
+    () => context.acquire(CAPABILITIES[0][0], { operation: "create" }),
+    leaseError("invalid_configuration"),
+  );
+  assert.equal(nativeAcquisitions, 0);
 });

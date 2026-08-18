@@ -111,9 +111,23 @@ remain separate work.
   and replacement are not yet an atomic compare-and-swap. The native binding
   therefore advertises `productionSafe: false` and `pathWalkRaceSafe: false`.
 - Credential mutations require opaque, capability-bound leases. The current
-  lease coordinates only one Node process, records only non-secret in-memory
-  audit metadata, and reports `crossProcessSafe: false`, `auditDurable: false`,
-  and `productionSafe: false`.
+  native-Windows lease combines an in-process recursion guard with one
+  current-user, owner-only `Local\` Win32 named mutex per fixed capability.
+  It prepares and settles a bounded SQLite journal around the complete
+  read/compare/write-or-delete/readback transaction and reports
+  `crossProcessSafe: true`, `auditDurable: true`, and
+  `productionSafe: false`. Injected portable bindings remain explicitly
+  qualification-only and do not acquire these claims.
+- An abandoned mutex is released and rejected before mutation. The lease then
+  reacquires normally and recovers only that capability's durable prepared
+  rows as `unknown_after_crash`; it never retries, overwrites, or deletes a
+  credential automatically. A child-process fixture also leaves a real
+  prepared SQLite row through abrupt termination for the next holder to
+  recover.
+- The audit schema stores only fixed owner/capability/operation/result/failure
+  vocabularies and a random lease ID. It retains 256 terminal rows, never
+  prunes prepared rows, allows at most 16 unresolved rows, rejects mismatched
+  owner/capability pairs, and exposes an owned close boundary.
 - The native build emits a fixed sidecar manifest and the loader verifies the
   binary byte count, SHA-256, contract, and native claims before loading it.
   The manifest's approved production policy remains false; signing or another
@@ -121,12 +135,15 @@ remain separate work.
 - Native qualification may exercise these dormant primitives on a disposable
   hosted runner. It may not promote them into product behavior until the open
   race, integrity, state/lease, and atomic-replacement gates are complete.
-- The manual workflow passed on exact revision
-  `829d9cdfedfb79d307939757d28e948df3def6de` in both the primed/offline and
-  explicitly empty dependency-store lanes. Native compilation, manifest
-  verification, the portable lane, all 55 fixed native qualification tests
-  with zero skips, cleanup, and the clean-checkout gate passed. The dated
-  receipt records the runner, toolchain, binding digest, and remaining gates.
+- The mutex/audit extension passed on exact revision
+  `2d171410c333bd9c0c001a1f2a879995d3e6623f` in both the restored/offline and
+  explicitly empty dependency-store lanes. Native compilation, per-build
+  manifest verification, the portable lane, all 79 fixed native qualification
+  tests with zero skips, disposable cleanup, and the clean-checkout gate passed
+  in [run 32066242226](https://github.com/adamallcock/tibotattle/actions/runs/32066242226).
+  The [dated credential-coordination receipt](../receipts/2026-08-17-windows-credential-coordination-receipt.md)
+  records the runner, toolchain, both binding digests, and remaining production
+  gates.
 
 ## Deferred follow-on work
 
@@ -134,6 +151,12 @@ remain separate work.
   security adapter into export artifact storage.
 - Extend the adapter to queue, prepared-contribution, SQLite workspace,
   metadata bundle, collector, deletion/discard, and source-reader stores.
+- Add a startup maintenance sweep that acquires each capability mutex before
+  recovering its pending rows; the current safe recovery is deliberately lazy
+  and occurs on the next operation for that same capability.
+- Decide whether the supported desktop contract remains one interactive logon
+  session (`Local\`) or requires separately qualified cross-session
+  coordination. Do not change to `Global\` without that decision and ACL tests.
 - Build and qualify the Windows desktop shell, installer, signing, updater,
   upgrade/rollback, and uninstall policy.
 - Build and qualify the Linux shell and distribution formats.

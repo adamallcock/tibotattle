@@ -105,6 +105,18 @@
       "followUp": "Run all four fixed production credential lifecycles on native Windows x64 with the audited Credential Manager binding and confirm cleanup."
     },
     {
+      "file": "test/windows-credential-mutex-native.test.js",
+      "win32BranchCount": 3,
+      "classification": "native-windows-qualification",
+      "followUp": "Run same-capability contention and different-capability independence in separate native Windows processes."
+    },
+    {
+      "file": "test/windows-credential-mutex.test.js",
+      "win32BranchCount": 1,
+      "classification": "native-windows-qualification",
+      "followUp": "Load and exercise the reviewed native named-mutex binding on Windows x64."
+    },
+    {
       "file": "test/windows-filesystem-security.test.js",
       "win32BranchCount": 1,
       "classification": "native-windows-qualification",

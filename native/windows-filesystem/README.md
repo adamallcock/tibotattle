@@ -1,7 +1,8 @@
-# Windows filesystem native adapter
+# Windows native security adapter
 
-This directory contains the reviewed Windows-only filesystem boundary for
-private TiboTattle state. The binding is deliberately a small C N-API module;
+This directory contains the reviewed Windows-only filesystem and credential
+mutex boundary for private TiboTattle state. The binding is deliberately a
+small C N-API module;
 it does not depend on a JavaScript filesystem path check being equivalent to a
 Windows ACL or reparse-point check.
 
@@ -16,14 +17,16 @@ The resulting `build/Release/windows_filesystem.node` and its adjacent
 `windows_filesystem.node.manifest.json` are loaded only on native
 Windows x64 by `src/platform/windows-filesystem.js`. macOS, Linux, Windows
 ARM64, and missing/invalid bindings fail closed. The source is not a production
-credential backend; it only protects local files and directories. Credential
-storage remains a separate capability boundary.
+credential backend: Credential Manager storage remains a separate capability
+boundary, while this binding supplies its cross-process mutation lock.
 
 The loader reads the fixed sidecar manifest, verifies the binary byte count and
 SHA-256 before loading it, and cross-checks the binding's contract and native
 capability claims against the manifest. The manifest has an explicit
-`approvedPolicy` which remains `false` for both production flags. This prevents
-self-reported booleans from enabling a production path. The sidecar digest is
+`approvedPolicy`. Overall production and path-walk policy remain `false`; only
+the narrow `credentialMutexSafe` contract is approved after native
+qualification. This prevents self-reported booleans from enabling a production
+path. The sidecar digest is
 an integrity/mismatch check, not a provenance signature: a production release
 must authenticate the manifest through a signed installer, signed manifest, or
 equivalent allowlist before enabling Windows behavior.
@@ -68,6 +71,18 @@ step fails.
   protects ordinary application races; a same-user process can still swap the
   destination name in the final kernel operation, so callers must retain the
   production gate until a stronger conditional-replacement proof is accepted.
+- `acquireCredentialMutex(capabilityId)` accepts only one of four fixed numeric
+  capability IDs, derives a per-user `Local\` kernel-object name from the
+  current SID, applies and revalidates a protected owner-only DACL, and performs
+  a non-blocking wait. It returns an opaque native lease only after a normal
+  acquisition. An abandoned-owner result is released and closed, then surfaced
+  as a fixed error so the JavaScript lease layer can retry once before any
+  credential mutation begins.
+- `releaseCredentialMutex(lease)` accepts only that opaque lease, verifies
+  same-thread ownership and active state, releases exactly once, and closes the
+  non-inheritable handle. The native issued-token registry is protected against
+  concurrent Node worker-thread calls. JavaScript retains an in-process guard
+  because Win32 mutex acquisition is recursive on one thread.
 
 The protected DACL is deliberately strict: only the current user
 SID is an allow principal. Inherited SYSTEM/Administrators/user-group allows
@@ -78,3 +93,6 @@ prove a narrower service-account exception.
 The native implementation resolves `NtCreateFile`, `NtSetInformationFile`, and
 `RtlNtStatusToDosError` from the Windows system `ntdll.dll`; no third-party
 runtime or package is introduced. The native binding remains Windows x64-only.
+Credential mutation audit durability is provided separately by the fixed
+SQLite prepared/settled/recovered journal; neither the mutex nor audit enables
+the still-disabled Windows production selectors.

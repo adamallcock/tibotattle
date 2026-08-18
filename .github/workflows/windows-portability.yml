@@ -168,7 +168,9 @@ jobs:
               $manifest.sha256 -notmatch '^[0-9a-f]{64}$' -or
               $manifest.bytes -le 0 -or
               $manifest.approvedPolicy.productionSafe -ne $false -or
-              $manifest.approvedPolicy.pathWalkRaceSafe -ne $false) {
+              $manifest.approvedPolicy.pathWalkRaceSafe -ne $false -or
+              $manifest.approvedPolicy.credentialMutexSafe -ne $true -or
+              $manifest.credentialMutexContractVersion -ne 'windows-credential-mutex-v1') {
             Write-Error 'WINDOWS_FILESYSTEM_BINDING_MANIFEST_INVALID'
             exit 1
           }
@@ -189,6 +191,7 @@ jobs:
           "- Warm proof: restored or online-primed store followed by an offline reinstall" >> $env:GITHUB_STEP_SUMMARY
           "- Native binding bytes: $env:TIBOTATTLE_WINDOWS_BINDING_BYTES" >> $env:GITHUB_STEP_SUMMARY
           "- Native binding SHA-256: $env:TIBOTATTLE_WINDOWS_BINDING_SHA256" >> $env:GITHUB_STEP_SUMMARY
+          "- Credential mutex contract: windows-credential-mutex-v1 (owner-only, per capability)" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Run portable Windows qualification
         shell: pwsh
@@ -211,6 +214,7 @@ jobs:
           $qualificationStateRoot = Join-Path $env:RUNNER_TEMP 'tibotattle-codex-home'
           New-Item -ItemType Directory -Force -Path $qualificationStateRoot | Out-Null
           "CODEX_HOME=$qualificationStateRoot" >> $env:GITHUB_ENV
+          "TIBOTATTLE_WINDOWS_QUALIFICATION_STATE_ROOT=$qualificationStateRoot" >> $env:GITHUB_ENV
 
       - name: Run content-free Windows security qualification
         shell: pwsh
@@ -227,8 +231,9 @@ jobs:
           "- Command: node ./scripts/windows-security-qualification.mjs" >> $env:GITHUB_STEP_SUMMARY
           "- Result: $result" >> $env:GITHUB_STEP_SUMMARY
           "- Production promotion: blocked" >> $env:GITHUB_STEP_SUMMARY
+          "- Qualified here: per-capability Win32 named mutex and durable prepared/settled/recovered credential audit" >> $env:GITHUB_STEP_SUMMARY
           "- Canonical deferrals: docs/goals/2026-08-17-windows-security-credentials-goal.md" >> $env:GITHUB_STEP_SUMMARY
-          "- Deferred: cross-process credential mutex and durable audit; authenticated binary provenance; replacement CAS; complete DACL/path/concurrency matrix; selector and state/SQLite integration; export locking; retention/uninstall policy; packaging, signing, installer, and updater" >> $env:GITHUB_STEP_SUMMARY
+          "- Deferred: authenticated binary provenance; replacement CAS; complete DACL/path/concurrency matrix; selector and remaining state/SQLite integration; export locking; retention/uninstall policy; packaging, signing, installer, and updater" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Confirm qualification did not modify the checkout
         shell: pwsh
