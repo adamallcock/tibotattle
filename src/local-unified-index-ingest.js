@@ -1,3 +1,5 @@
+import { constants } from "node:fs";
+import { copyFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { discoverCodexRolloutInfos } from "./codex-log-scan.js";
@@ -11,16 +13,25 @@ import {
   createEventSink,
   lineageComponents,
   persistingCollector,
+  rebuildLocalUnifiedIndex,
   surfaceRow,
   writeCursorForOutcome,
 } from "./local-unified-index-build.js";
 import {
+  assertSafeLocalUnifiedIndexTarget,
   createUnifiedIndexWriter,
+  beginUnifiedIndexGeneration,
   defaultLocalUnifiedIndexPath,
   defaultLocalUnifiedIndexSecretPath,
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+  LOCAL_UNIFIED_INDEX_USER_VERSION,
   openLocalUnifiedIndex,
+  publishStagedUnifiedIndex,
+  recoverUnifiedIndexGenerations,
   readOrCreateDeviceSalt,
+  readUnifiedIndexGenerationDescriptor,
+  removeIfPresent,
   sessionLocal,
   snapshotLocal,
   sourceLocal,
@@ -64,7 +75,8 @@ function loadCursors(database) {
   // missing; a NULL parser_version then reads as "unknown", which classifies
   // as a forced rescan — the safe direction.
   const rows = database.prepare(`
-    SELECT sc.source_local, sc.session_local, sc.scanned_bytes, sc.size_bytes,
+    SELECT sc.source_local, sc.source_ordinal, sc.session_local,
+           sc.scanned_bytes, sc.size_bytes,
            sc.mtime_ms, sc.snapshots_persisted, sc.turn_context_seen,
            sc.carry_model, sc.carry_effort, sc.carry_tier_raw,
            sc.carry_tier_observed_at_ms, sc.carry_total_input,
@@ -152,7 +164,9 @@ export function classifySource(info, cursor, expectedParserVersion = null) {
   const cursorSize = Number(cursor.size_bytes);
   const cursorMtime = Number(cursor.mtime_ms);
   if (size === cursorSize) {
-    return mtimeMs === cursorMtime ? { mode: "skip" } : { mode: "touch" };
+    return mtimeMs === cursorMtime
+      ? { mode: "skip" }
+      : { mode: "rescan", reason: "same_size_changed" };
   }
   if (size > cursorSize) return { mode: "resume" };
   return { mode: "rescan", reason: "shrink" };
@@ -183,6 +197,9 @@ export async function ingestLocalUnifiedIndexIncrement({
   }
   const startedAt = performance.now();
   const resolvedIndexFile = resolve(indexFile);
+  await assertSafeLocalUnifiedIndexTarget(resolvedIndexFile, {
+    allowMissing: true,
+  });
   const deviceSalt = await readOrCreateDeviceSalt(
     secretFile ?? defaultLocalUnifiedIndexSecretPath(resolvedIndexFile),
   );
@@ -194,13 +211,227 @@ export async function ingestLocalUnifiedIndexIncrement({
     discoveryLimits,
   });
   const discoveredAt = performance.now();
-
-  const database = openLocalUnifiedIndex(resolvedIndexFile, {
-    readOnly: false,
-    create: true,
-  });
+  const sourceBytes = infos.reduce(
+    (total, info) => total + Number(info.size ?? 0),
+    0,
+  );
+  let coldRebuildReason = null;
+  // Read-only preflight avoids cloning/publishing when every current source
+  // is byte-for-byte unchanged. A same-size mtime change is deliberately a
+  // rescan (classifySource's conservative race policy), so this reads no
+  // rollout body bytes and still catches replacement files.
+  if (!signal?.aborted) {
+    let unchangedDatabase = null;
+    try {
+      unchangedDatabase = openLocalUnifiedIndex(resolvedIndexFile, { readOnly: true });
+      const schema = unchangedDatabase.prepare(
+        "SELECT value FROM meta WHERE key = 'schema_version'",
+      ).get()?.value;
+      const userVersion = Number(
+        unchangedDatabase.prepare("PRAGMA user_version").get()?.user_version,
+      );
+      if (schema !== LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
+          || userVersion !== LOCAL_UNIFIED_INDEX_USER_VERSION) {
+        coldRebuildReason = "legacy_schema";
+      }
+      const storedContract = unchangedDatabase.prepare(
+        "SELECT value FROM meta WHERE key = 'contract_version'",
+      ).get()?.value;
+      if (coldRebuildReason === null && storedContract !== contractVersion) {
+        coldRebuildReason = "contract_changed";
+      }
+      if (coldRebuildReason === null
+          && schema === LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
+          && storedContract === contractVersion) {
+        const cursors = loadCursors(unchangedDatabase);
+        const descriptor = readUnifiedIndexGenerationDescriptor(
+          unchangedDatabase,
+        );
+        if (descriptor !== null && (
+          descriptor.status !== "complete"
+          || descriptor.discoveryComplete !== true
+          || descriptor.diagnosticsComplete !== true
+          || descriptor.usageProvenanceComplete !== true
+          || descriptor.sourceOrderComplete !== true
+          || descriptor.quotaProvenanceComplete !== true
+          || descriptor.toolProvenanceComplete !== true
+        )) {
+          coldRebuildReason = "incomplete_generation";
+        }
+        if (coldRebuildReason === null && descriptor !== null) {
+          const unattestedSources = Number(unchangedDatabase.prepare(`
+            SELECT (
+              (SELECT COUNT(*) FROM source_cursor sc
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM generation_source gs
+                 WHERE gs.generation_id = ?
+                   AND gs.source_local = sc.source_local))
+              +
+              (SELECT COUNT(*) FROM usage_event u
+               WHERE u.source_local IS NOT NULL AND NOT EXISTS (
+                 SELECT 1 FROM generation_source gs
+                 WHERE gs.generation_id = ?
+                   AND gs.source_local = u.source_local))
+              +
+              (SELECT COUNT(*) FROM quota_occurrence q
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM generation_source gs
+                 WHERE gs.generation_id = ?
+                   AND gs.source_local = q.source_local))
+              +
+              (SELECT COUNT(*) FROM usage_event u
+               WHERE u.source_local IS NOT NULL AND NOT EXISTS (
+                 SELECT 1 FROM source_cursor sc
+                 WHERE sc.source_local = u.source_local))
+              +
+              (SELECT COUNT(*) FROM quota_occurrence q
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM source_cursor sc
+                 WHERE sc.source_local = q.source_local))
+            ) AS count`).get(
+            descriptor.id,
+            descriptor.id,
+            descriptor.id,
+          )?.count ?? 0);
+          if (unattestedSources > 0) {
+            coldRebuildReason = "source_attestation_incomplete";
+          }
+        }
+        const generationAuthoritative = descriptor?.status === "complete"
+          && descriptor.discoveryComplete === true
+          && descriptor.diagnosticsComplete === true
+          && descriptor.usageProvenanceComplete === true
+          && descriptor.sourceOrderComplete === true
+          && descriptor.quotaProvenanceComplete === true
+          && descriptor.toolProvenanceComplete === true;
+        const sourceSetUnchanged = descriptor?.discoveredSourceCount
+            === infos.length
+          && descriptor?.discoveredSourceBytes === sourceBytes;
+        const unchanged = generationAuthoritative
+          && sourceSetUnchanged
+          && infos.every((info) => classifySource(
+            info,
+            cursors.get(
+              sourceLocal(deviceSalt, info.rolloutKey).toString("hex"),
+            ),
+            LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+          ).mode === "skip");
+        if (unchanged) {
+          const totalBoundaryLinks = Number(
+            unchangedDatabase.prepare(
+              "SELECT COUNT(*) AS count FROM usage_event_boundary",
+            ).get()?.count ?? 0,
+          );
+          return {
+            status: "ingested",
+            unchanged: true,
+            indexFile: resolvedIndexFile,
+            generation: descriptor,
+            generationDescriptor: descriptor,
+            sources: infos.length,
+            sourceBytes,
+            sourcesSkipped: infos.length,
+            sourcesTouched: 0,
+            sourcesResumed: 0,
+            sourcesRescanned: 0,
+            sourcesReparsedForParserVersion: 0,
+            usageRowsDeletedForReparse: 0,
+            sourcesScanned: 0,
+            bytesScanned: 0,
+            insertedUsageEvents: 0,
+            insertedBoundaryLinks: 0,
+            totalUsageEvents: descriptor.usageEvents ?? 0,
+            totalBoundaryLinks,
+            quotaOccurrences: descriptor.quotaOccurrences ?? 0,
+            discoveryWallMs: discoveredAt - startedAt,
+            scanWallMs: 0,
+            wallMs: performance.now() - startedAt,
+            peakRssBytes: process.memoryUsage.rss(),
+          };
+        }
+      }
+    } catch {
+      // The normal staged path handles missing/legacy indexes and any cursor
+      // shape mismatch. Preflight is an optimization, never a gate.
+    } finally {
+      unchangedDatabase?.close();
+    }
+  }
+  if (coldRebuildReason !== null) {
+    const rebuilt = await rebuildLocalUnifiedIndex({
+      codexHome,
+      indexFile: resolvedIndexFile,
+      secretFile: secretFile
+        ?? defaultLocalUnifiedIndexSecretPath(resolvedIndexFile),
+      startAt,
+      endAt,
+      contractVersion,
+      workerCount: 1,
+      commitRows,
+      maximumLineBytes,
+      signal,
+      onProgress,
+      discoveryLimits,
+    });
+    return {
+      ...rebuilt,
+      status: "ingested",
+      unchanged: false,
+      rebuilt: true,
+      rebuildReason: coldRebuildReason,
+      sourcesSkipped: 0,
+      sourcesTouched: 0,
+      sourcesResumed: 0,
+      sourcesRescanned: rebuilt.sourcesScanned,
+      sourcesReparsedForParserVersion: 0,
+      usageRowsDeletedForReparse: 0,
+      quotaOccurrenceRowsDeletedForRescan: 0,
+      insertedUsageEvents: rebuilt.usageEvents,
+      insertedBoundaryLinks: rebuilt.boundaryLinks ?? 0,
+      totalUsageEvents: rebuilt.usageEvents,
+      totalBoundaryLinks: rebuilt.boundaryLinks ?? 0,
+    };
+  }
+  const stageFile = `${resolvedIndexFile}.incremental-${process.pid}-${Date.now().toString(36)}`;
+  await removeIfPresent(stageFile);
+  let database = null;
   let writer = null;
+  let generation = null;
   try {
+    const liveExists = await assertSafeLocalUnifiedIndexTarget(
+      resolvedIndexFile,
+      { allowMissing: true },
+    ) !== null;
+    if (liveExists) {
+      try {
+        await copyFile(
+          resolvedIndexFile,
+          stageFile,
+          constants.COPYFILE_FICLONE ?? 0,
+        );
+      } catch {
+        // APFS clone is the cheap path, but not every filesystem supports it.
+        // A regular copy preserves the same atomic publication boundary.
+        await copyFile(resolvedIndexFile, stageFile);
+      }
+    }
+    database = openLocalUnifiedIndex(stageFile, {
+      readOnly: false,
+      create: !liveExists,
+      staging: true,
+    });
+    const previousGenerationValue = database.prepare(
+      "SELECT value FROM meta WHERE key = 'current_generation_id'",
+    ).get()?.value;
+    const previousGenerationId = previousGenerationValue === undefined
+      ? null
+      : Number(previousGenerationValue);
+    recoverUnifiedIndexGenerations(database);
+    generation = beginUnifiedIndexGeneration(database, {
+      contractVersion,
+      discoveredSourceCount: infos.length,
+      discoveredSourceBytes: sourceBytes,
+    });
     const cursors = loadCursors(database);
     const selectLineageSnapshot = database.prepare(`
       SELECT 1 AS present FROM lineage_snapshot
@@ -208,6 +439,9 @@ export async function ingestLocalUnifiedIndexIncrement({
     writer = createUnifiedIndexWriter(database, {
       commitRows,
       contractVersion,
+      generationId: generation.generationId,
+      parserVersionId: generation.parserVersionId,
+      ingestRunId: generation.ingestRunId,
     });
     const accountScopeId = writer.internAccountScope({
       status: "unavailable",
@@ -219,6 +453,7 @@ export async function ingestLocalUnifiedIndexIncrement({
       writer,
       deviceSalt,
       accountScopeId,
+      generationId: generation.generationId,
       onCounts: null,
     });
     const countSourceBoundaries = database.prepare(`
@@ -226,9 +461,7 @@ export async function ingestLocalUnifiedIndexIncrement({
       FROM usage_event_boundary boundary
       JOIN usage_event event
         ON event.event_key = boundary.current_event_key
-      WHERE event.source_id = ?`);
-    const deleteSourceUsage = database.prepare(`
-      DELETE FROM usage_event WHERE source_id = ?`);
+      WHERE event.source_local = ?`);
 
     const diagnostics = {
       sources: infos.length,
@@ -241,6 +474,7 @@ export async function ingestLocalUnifiedIndexIncrement({
       boundaryRowsDeletedForReparse: 0,
       usageRowsDeletedForSourceRescan: 0,
       boundaryRowsDeletedForSourceRescan: 0,
+      quotaOccurrenceRowsDeletedForRescan: 0,
       sourcesScanned: 0,
       bytesScanned: 0,
       relevantLines: 0,
@@ -276,44 +510,172 @@ export async function ingestLocalUnifiedIndexIncrement({
     // Final carried state for sources scanned in THIS pass, keyed by session
     // id, so a child scanned after its parent seeds from the freshest values.
     const finalBySessionId = new Map();
-
-    // Parser-version healing. A cursor stamped by an older parser version
-    // names a source whose stored rows were derived by the old (possibly
-    // poisoned) logic. Re-derived rows share their event keys with the old
-    // ones — the key is (session, byte offset, observed-at), not the token
-    // values — so `ON CONFLICT DO NOTHING` would silently keep the poison.
-    // Delete those sessions' rows up front, before anything is scanned, so
-    // the forced whole-file rescans below re-insert clean values. Rows whose
-    // rollout files have rotated away have no discovered source here and are
-    // untouched, exactly as the parser-version design records.
-    {
-      const deleteSessionUsage = database.prepare(
-        "DELETE FROM usage_event WHERE session_local = ?",
-      );
-      const deleteSessionBoundaries = database.prepare(
-        "DELETE FROM usage_event_boundary WHERE session_local = ?",
-      );
-      const healedSessions = new Set();
-      for (const info of infos) {
-        const cursor = cursors.get(
-          sourceLocal(deviceSalt, info.rolloutKey).toString("hex"),
-        );
-        if (cursor === undefined) continue;
-        if (cursor.parser_version === LOCAL_UNIFIED_INDEX_PARSER_VERSION) {
-          continue;
-        }
-        diagnostics.sourcesReparsedForParserVersion += 1;
-        const sessionKey = cursor.session_local === null
-          ? localForSession(info.lineage?.sessionId ?? info.rolloutKey)
-          : Buffer.from(cursor.session_local);
-        const sessionHex = sessionKey.toString("hex");
-        if (healedSessions.has(sessionHex)) continue;
-        healedSessions.add(sessionHex);
-        diagnostics.boundaryRowsDeletedForReparse +=
-          Number(deleteSessionBoundaries.run(sessionKey).changes ?? 0);
-        diagnostics.usageRowsDeletedForReparse +=
-          Number(deleteSessionUsage.run(sessionKey).changes ?? 0);
+    const sourceOrdinals = new Map();
+    let nextSourceOrdinal = -1;
+    for (const cursor of cursors.values()) {
+      const ordinal = Number(cursor.source_ordinal);
+      if (Number.isSafeInteger(ordinal) && ordinal >= 0) {
+        nextSourceOrdinal = Math.max(nextSourceOrdinal, ordinal);
       }
+    }
+    for (const info of infos) {
+      const sourceKey = sourceLocal(deviceSalt, info.rolloutKey).toString("hex");
+      const existing = cursors.get(sourceKey);
+      const stored = Number(existing?.source_ordinal);
+      if (Number.isSafeInteger(stored) && stored >= 0) {
+        sourceOrdinals.set(info.rolloutKey, stored);
+      } else {
+        // Allocate missing ordinals in deterministic discovery order. The
+        // ordinal is only a local ordering token; no path is persisted.
+        sourceOrdinals.set(info.rolloutKey, ++nextSourceOrdinal);
+      }
+    }
+    const currentSourceKeys = new Set(infos.map((info) => (
+      sourceLocal(deviceSalt, info.rolloutKey).toString("hex")
+    )));
+    const previousRetainedSource = previousGenerationId === null
+      ? null
+      : database.prepare(`
+        SELECT source_ordinal, session_local, surface_id, status,
+               discovered_size_bytes, scanned_bytes, mtime_ms,
+               diagnostics_complete
+        FROM generation_source
+        WHERE generation_id = ? AND source_local = ?`);
+    for (const [sourceHex, cursor] of cursors) {
+      if (currentSourceKeys.has(sourceHex) || previousRetainedSource === null) {
+        continue;
+      }
+      const sourceKey = Buffer.from(sourceHex, "hex");
+      const retained = previousRetainedSource.get(previousGenerationId, sourceKey);
+      if (retained === undefined) continue;
+      writer.copySourceDiagnostics(sourceKey, previousGenerationId);
+      if (cursor.parser_version !== LOCAL_UNIFIED_INDEX_PARSER_VERSION) {
+        // This source rotated away before the v8 typed-tool pass could rescan
+        // it. Preserve its usage/quota facts, but permanently attest the tool
+        // history gap instead of publishing a false zero.
+        writer.writeSourceDiagnostics(sourceKey, {
+          toolSourceHistoryUnavailable: 1,
+        });
+      }
+      writer.rebindToolFactsForSource(sourceKey);
+      writer.writeGenerationSource({
+        sourceLocal: sourceKey,
+        sourceOrdinal: Number(retained.source_ordinal),
+        sessionLocal: retained.session_local === null
+          ? cursor.session_local
+          : Buffer.from(retained.session_local),
+        surfaceId: Number(retained.surface_id),
+        status: "skipped",
+        discoveredSizeBytes: Number(retained.discovered_size_bytes),
+        scannedBytes: Number(retained.scanned_bytes),
+        mtimeMs: Number(retained.mtime_ms),
+        diagnosticsComplete: Number(retained.diagnostics_complete) === 1,
+      });
+    }
+
+    const deleteUsageForSource = database.prepare(
+      "DELETE FROM usage_event WHERE source_local = ?",
+    );
+    const affectedQuotaForSource = database.prepare(`
+      SELECT DISTINCT canonical_observation_id AS id
+      FROM quota_occurrence WHERE source_local = ?`);
+    const deleteQuotaForSource = database.prepare(
+      "DELETE FROM quota_occurrence WHERE source_local = ?",
+    );
+    const replacementQuota = database.prepare(`
+      SELECT plan_type, used_percent, resets_at_ms, duration_mins
+      FROM quota_occurrence WHERE canonical_observation_id = ?
+      ORDER BY used_percent DESC, COALESCE(resets_at_ms, -1) DESC, id ASC
+      LIMIT 1`);
+    const updateCanonicalQuota = database.prepare(`
+      UPDATE quota_observation SET plan_type = ?, used_percent = ?,
+        resets_at_ms = ?, duration_mins = ? WHERE id = ?`);
+    const deleteOrphanQuota = database.prepare(`
+      DELETE FROM quota_observation WHERE id = ?
+        AND NOT EXISTS (
+          SELECT 1 FROM quota_occurrence WHERE canonical_observation_id = ?)
+        AND NOT EXISTS (
+          SELECT 1 FROM usage_event WHERE quota_observation_id = ?)`);
+    const deleteLineageSnapshots = database.prepare(
+      "DELETE FROM lineage_snapshot WHERE session_local = ?",
+    );
+    const deleteToolCounts = database.prepare(
+      "DELETE FROM tool_class_count WHERE session_local = ?",
+    );
+    const deleteToolFactsForSource = database.prepare(
+      "DELETE FROM tool_class_fact WHERE source_local = ?",
+    );
+    const resetSessions = new Set();
+
+    function replaceSourceFacts(sourceKey, sessionKey, { parserReparse }) {
+      const deletedBoundaries = Number(
+        countSourceBoundaries.get(sourceKey)?.count ?? 0,
+      );
+      const affectedQuotaIds = affectedQuotaForSource.all(sourceKey)
+        .map((row) => Number(row.id));
+      const deletedUsage = Number(
+        deleteUsageForSource.run(sourceKey).changes ?? 0,
+      );
+      diagnostics.quotaOccurrenceRowsDeletedForRescan += Number(
+        deleteQuotaForSource.run(sourceKey).changes ?? 0,
+      );
+      deleteToolFactsForSource.run(sourceKey);
+      for (const quotaId of affectedQuotaIds) {
+        const replacement = replacementQuota.get(quotaId);
+        if (replacement === undefined) {
+          deleteOrphanQuota.run(quotaId, quotaId, quotaId);
+        } else {
+          updateCanonicalQuota.run(
+            replacement.plan_type,
+            replacement.used_percent,
+            replacement.resets_at_ms,
+            replacement.duration_mins,
+            quotaId,
+          );
+        }
+      }
+      if (parserReparse) {
+        diagnostics.sourcesReparsedForParserVersion += 1;
+        diagnostics.usageRowsDeletedForReparse += deletedUsage;
+        diagnostics.boundaryRowsDeletedForReparse += deletedBoundaries;
+      } else {
+        diagnostics.usageRowsDeletedForSourceRescan += deletedUsage;
+        diagnostics.boundaryRowsDeletedForSourceRescan += deletedBoundaries;
+      }
+      const sessionHex = sessionKey.toString("hex");
+      if (!resetSessions.has(sessionHex)) {
+        resetSessions.add(sessionHex);
+        deleteLineageSnapshots.run(sessionKey);
+        deleteToolCounts.run(sessionKey);
+      }
+    }
+
+    const replacementReasons = new Set([
+      "parser_version",
+      "same_size_changed",
+      "shrink",
+    ]);
+    const replacementSessionIds = new Set();
+    for (const info of infos) {
+      const cursor = cursors.get(
+        sourceLocal(deviceSalt, info.rolloutKey).toString("hex"),
+      );
+      const classification = classifySource(
+        info,
+        cursor,
+        LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+      );
+      if (cursor !== undefined && replacementReasons.has(classification.reason)) {
+        replacementSessionIds.add(
+          info.lineage?.sessionId ?? info.rolloutKey,
+        );
+      }
+    }
+    for (const sessionId of replacementSessionIds) {
+      const sessionKey = localForSession(sessionId);
+      resetSessions.add(sessionKey.toString("hex"));
+      deleteLineageSnapshots.run(sessionKey);
+      deleteToolCounts.run(sessionKey);
     }
 
     function seedForNew(info) {
@@ -401,7 +763,13 @@ export async function ingestLocalUnifiedIndexIncrement({
           plan.cursor,
           LOCAL_UNIFIED_INDEX_PARSER_VERSION,
         ),
-      }));
+      })).map((plan) => (
+        replacementSessionIds.has(
+          plan.info.lineage?.sessionId ?? plan.info.rolloutKey,
+        ) && plan.mode !== "rescan"
+          ? { ...plan, mode: "rescan", reason: "session_rescan" }
+          : plan
+      ));
       const planBySessionId = new Map();
       for (const plan of plans) {
         if (plan.info.lineage?.sessionId) {
@@ -428,35 +796,83 @@ export async function ingestLocalUnifiedIndexIncrement({
                 && ["skip", "touch", "resume"].includes(ancestor.mode)
                 && Number(ancestor.cursor?.snapshots_persisted ?? 0) !== 1) {
               ancestor.mode = "rescan";
+              ancestor.reason = "snapshot_persistence";
               changed = true;
             }
             parentId = bySessionId.get(parentId)?.lineage?.parentId ?? null;
           }
         }
-      }
-      if (plans.every((plan) => plan.mode === "skip")) {
-        diagnostics.sourcesSkipped += plans.length;
-        continue;
+        const rescanSessions = new Set(plans
+          .filter((plan) => plan.mode === "rescan")
+          .map((plan) => plan.info.lineage?.sessionId ?? plan.info.rolloutKey));
+        for (const plan of plans) {
+          const sessionId = plan.info.lineage?.sessionId ?? plan.info.rolloutKey;
+          if (plan.mode !== "rescan" && rescanSessions.has(sessionId)) {
+            plan.mode = "rescan";
+            plan.reason = "session_rescan";
+            changed = true;
+          }
+        }
       }
       const snapshots = createLineageSnapshots(component.members);
       try {
         for (const plan of plans) {
           if (signal?.aborted) throw fixedError("local_unified_index_aborted");
-          const { info, cursor, mode } = plan;
+          const {
+            info,
+            cursor,
+            mode,
+            reason,
+          } = plan;
+          const sourceKey = sourceLocal(deviceSalt, info.rolloutKey);
+          const sourceOrdinal = sourceOrdinals.get(info.rolloutKey);
+          const sessionId = info.lineage?.sessionId ?? info.rolloutKey;
+          const surface = surfaceRow(info.lineage?.surfaceClassification);
+          const surfaceId = writer.internSurface(surface);
+          const sessionKey = localForSession(sessionId);
+          const previousSource = writer.previousGenerationSource(
+            sourceKey,
+            previousGenerationId,
+          );
+          writer.writeGenerationSource({
+            sourceLocal: sourceKey,
+            sourceOrdinal,
+            sessionLocal: sessionKey,
+            surfaceId,
+            status: "pending",
+            discoveredSizeBytes: Number(info.size ?? 0),
+            scannedBytes: Number(cursor?.scanned_bytes ?? 0),
+            mtimeMs: Math.floor(Number(info.mtimeMs ?? 0)),
+            diagnosticsComplete: false,
+          });
           if (mode === "skip") {
             diagnostics.sourcesSkipped += 1;
+            writer.rebindToolFactsForSource(sourceKey);
+            writer.copySourceDiagnostics(sourceKey, previousGenerationId);
+            writer.writeGenerationSource({
+              sourceLocal: sourceKey,
+              sourceOrdinal,
+              sessionLocal: sessionKey,
+              surfaceId,
+              status: "skipped",
+              discoveredSizeBytes: Number(info.size ?? 0),
+              scannedBytes: Number(cursor?.scanned_bytes ?? 0),
+              mtimeMs: Math.floor(Number(info.mtimeMs ?? 0)),
+              diagnosticsComplete: previousSource?.diagnosticsComplete === true,
+            });
             continue;
           }
-          const sessionId = info.lineage?.sessionId ?? info.rolloutKey;
-          const sourceKey = sourceLocal(deviceSalt, info.rolloutKey);
           const state = {
-            sessionLocal: localForSession(sessionId),
+            sessionLocal: sessionKey,
             sourceLocal: sourceKey,
             sourceId: writer.internSource(sourceKey),
-            surface: surfaceRow(info.lineage?.surfaceClassification),
+            sourceOrdinal,
+            surface,
+            surfaceId,
           };
           if (mode === "touch") {
             diagnostics.sourcesTouched += 1;
+            writer.rebindToolFactsForSource(sourceKey);
             writeCursorForOutcome(writer, deviceSalt, info, state, {
               nextOffset: Number(cursor.scanned_bytes),
               finalModel: cursor.carry_model ?? null,
@@ -471,24 +887,32 @@ export async function ingestLocalUnifiedIndexIncrement({
               turnContextSeen: Number(cursor.turn_context_seen) === 1,
               snapshotsPersisted: Number(cursor.snapshots_persisted) === 1,
             });
+            writer.copySourceDiagnostics(sourceKey, previousGenerationId);
+            writer.writeGenerationSource({
+              sourceLocal: sourceKey,
+              sourceOrdinal,
+              sessionLocal: sessionKey,
+              surfaceId,
+              status: "touched",
+              discoveredSizeBytes: Number(info.size ?? 0),
+              scannedBytes: Number(cursor.scanned_bytes),
+              mtimeMs: Math.floor(Number(info.mtimeMs ?? 0)),
+              diagnosticsComplete: previousSource?.diagnosticsComplete === true,
+            });
             continue;
           }
-          // A same-parser shrink means bytes previously indexed from this
-          // exact source no longer exist. Deterministic re-insertion replaces
-          // rows that remain, but it cannot collide with (and therefore
-          // remove) a truncated tail. Delete only rows owned by this interned
-          // salted source before the whole-file rescan; boundary links cascade
-          // from usage_event. Parser-version healing is session-wide
-          // above and therefore does not enter this branch.
-          if (plan.reason === "shrink") {
-            diagnostics.boundaryRowsDeletedForSourceRescan += Number(
-              countSourceBoundaries.get(state.sourceId)?.count ?? 0,
-            );
-            diagnostics.usageRowsDeletedForSourceRescan += Number(
-              deleteSourceUsage.run(state.sourceId).changes ?? 0,
-            );
-          }
           const resuming = mode === "resume";
+          if (resuming) {
+            // Existing facts from the scanned prefix remain authoritative;
+            // bind them to this publication before appending the new tail.
+            writer.rebindToolFactsForSource(sourceKey);
+          }
+          if (!resuming && cursor !== undefined
+              && replacementReasons.has(reason)) {
+            replaceSourceFacts(sourceKey, sessionKey, {
+              parserReparse: reason === "parser_version",
+            });
+          }
           const seed = resuming
             ? {
               seedModel: cursor.carry_model ?? null,
@@ -545,7 +969,9 @@ export async function ingestLocalUnifiedIndexIncrement({
             signal,
             onEvent: (event) => sink.write(state, event),
             onBoundary: (event) => sink.writeBoundary(state, event),
+            onTool: (event) => sink.writeTool(state, event),
           });
+          sink.finishSource(state);
           if (info.lineage?.sessionId) {
             finalBySessionId.set(info.lineage.sessionId, {
               model: outcome.finalModel,
@@ -572,6 +998,22 @@ export async function ingestLocalUnifiedIndexIncrement({
             snapshotsPersisted: collector !== null
               && (startOffset === 0
                 || Number(cursor?.snapshots_persisted ?? 0) === 1),
+          });
+          writer.writeSourceDiagnostics(state.sourceLocal, {
+            ...outcome.diagnostics,
+            oversizedLines: outcome.read.oversizedLines,
+            ...sink.diagnosticsForSource(state),
+          });
+          writer.writeGenerationSource({
+            sourceLocal: state.sourceLocal,
+            sourceOrdinal: state.sourceOrdinal,
+            sessionLocal: state.sessionLocal,
+            surfaceId: state.surfaceId,
+            status: resuming ? "resumed" : "rescanned",
+            discoveredSizeBytes: Number(info.size ?? 0),
+            scannedBytes: outcome.read.nextOffset,
+            mtimeMs: Math.floor(Number(info.mtimeMs ?? 0)),
+            diagnosticsComplete: true,
           });
           diagnostics[resuming ? "sourcesResumed" : "sourcesRescanned"] += 1;
           diagnostics.sourcesScanned += 1;
@@ -611,9 +1053,11 @@ export async function ingestLocalUnifiedIndexIncrement({
     const totalBoundaryLinks = Number(
       database.prepare("SELECT COUNT(*) AS events FROM usage_event_boundary").get().events,
     );
-    const sourceBytes = infos.reduce(
-      (total, info) => total + Number(info.size ?? 0),
-      0,
+    const indexedSources = database.prepare(`
+      SELECT COUNT(*) AS count,
+             COALESCE(SUM(discovered_size_bytes), 0) AS bytes
+      FROM generation_source WHERE generation_id = ?`).get(
+      generation.generationId,
     );
     writer.writeMeta("source_count", infos.length);
     writer.writeMeta("source_bytes", sourceBytes);
@@ -621,15 +1065,32 @@ export async function ingestLocalUnifiedIndexIncrement({
     writer.writeMeta("boundary_links", totalBoundaryLinks);
     writer.writeMeta("generated_at", new Date().toISOString());
     writer.writeMeta("contract_version", contractVersion);
-    writer.writeMeta("status", signal?.aborted ? "partial" : "complete");
+    if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+    writer.writeMeta("status", "complete");
+    writer.finalizeGeneration({
+      status: "complete",
+      discoveredSourceCount: infos.length,
+      discoveredSourceBytes: sourceBytes,
+      indexedSourceCount: Number(indexedSources.count),
+      indexedSourceBytes: Number(indexedSources.bytes),
+      discoveryComplete: true,
+      diagnosticsComplete: true,
+    });
+    const generationDescriptor = readUnifiedIndexGenerationDescriptor(
+      database,
+      generation.generationId,
+    );
     const closed = await writer.close({
       integrityCheck: true,
-      fsyncPath: resolvedIndexFile,
+      fsyncPath: stageFile,
     });
     writer = null;
+    await publishStagedUnifiedIndex(stageFile, resolvedIndexFile);
     return {
       status: "ingested",
       indexFile: resolvedIndexFile,
+      generation: generationDescriptor,
+      generationDescriptor,
       ...diagnostics,
       ...sink.counts,
       // `usageEvents` above counts write attempts; a resumed pass can re-scan
@@ -646,14 +1107,23 @@ export async function ingestLocalUnifiedIndexIncrement({
       peakRssBytes: process.memoryUsage.rss(),
     };
   } catch (error) {
-    if (writer === null && database.isOpen) database.close();
-    else if (writer !== null) {
+    if (writer !== null) {
+      try {
+        writer.failGeneration(error?.code === "local_unified_index_aborted"
+          ? "aborted"
+          : "exception");
+      } catch {
+        // If the stage is already closed or storage failed, it is discarded.
+      }
+    }
+    if (database?.isOpen) {
       try {
         database.close();
       } catch {
         // The connection may already be closed.
       }
     }
+    await removeIfPresent(stageFile);
     throw error;
   }
 }

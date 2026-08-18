@@ -1,4 +1,7 @@
-import { cumulativeSnapshotKey } from "./providers/codex/logs.js";
+import {
+  cumulativeSnapshotKey,
+  extractToolObservations,
+} from "./providers/codex/logs.js";
 import { forEachRolloutLine, ROLLOUT_LINE_BYTES } from "./rollout-line-reader.js";
 
 // Projection from one Codex rollout file to typed usage facts.
@@ -8,25 +11,27 @@ import { forEachRolloutLine, ROLLOUT_LINE_BYTES } from "./rollout-line-reader.js
 // one owner-area import is the reviewed `cumulativeSnapshotKey`, measured at
 // 5.1 ms to load per thread.
 //
-// Only three JSON record types are read: `turn_context`, `token_count` and
-// `thread_settings_applied`. A fourth boundary, top-level `compacted`, is
-// recognised from its bounded header without ever parsing its payload. No
-// prompt, reply, reasoning or file content is parsed — and the fields taken
-// from the three JSON records are enumerated by hand below rather than copied
-// wholesale, so a new content-bearing field appearing upstream cannot leak in
-// by default. Note in particular that `turn_context` carries `cwd`,
+// The accounting records are `turn_context`, `token_count` and
+// `thread_settings_applied`; typed `response_item` tool descriptors are also
+// classified through the reviewed privacy-safe normalizer. A fourth boundary,
+// top-level `compacted`, is recognised from its bounded header without ever
+// parsing its payload. No prompt, reply, reasoning, tool name, tool input or
+// file content is retained — the normalizer returns only fixed classes. The
+// fields taken from accounting records are enumerated by hand below rather
+// than copied wholesale, so a new content-bearing field appearing upstream
+// cannot leak in by default. Note in particular that `turn_context` carries `cwd`,
 // `workspace_roots` and a
 // `collaboration_mode.settings.developer_instructions` block: all three are
 // content or filesystem paths, and none of them is read here.
 
 // Byte-level needles. Matching on the raw Buffer avoids decoding the ~99% of
-// lines that are irrelevant. `"custom_tool_call"` is deliberately absent: a
-// loose `tool_call` marker matched large response records and cost measurable
-// time, and tool classification is not one of the three permitted record
-// types.
+// lines that are irrelevant. The response-item marker is exact and is decoded
+// only far enough for typed tool classification; arbitrary response content
+// never becomes an index value.
 const NEEDLE_TURN_CONTEXT = Buffer.from('"turn_context"');
 const NEEDLE_TOKEN_COUNT = Buffer.from('"token_count"');
 const NEEDLE_THREAD_SETTINGS = Buffer.from('"thread_settings_applied"');
+const NEEDLE_RESPONSE_ITEM = Buffer.from('"type":"response_item"');
 const COMPACTION_TIMESTAMP_PREFIX = Buffer.from('{"timestamp":"');
 const COMPACTION_TYPE_SUFFIX = Buffer.from(',"type":"compacted"');
 const COMPACTION_TYPE_PREFIX = Buffer.from('{"type":"compacted","timestamp":"');
@@ -104,7 +109,8 @@ const TOKEN_KEYS = [
 function relevant(line) {
   return line.includes(NEEDLE_TOKEN_COUNT)
     || line.includes(NEEDLE_TURN_CONTEXT)
-    || line.includes(NEEDLE_THREAD_SETTINGS);
+    || line.includes(NEEDLE_THREAD_SETTINGS)
+    || line.includes(NEEDLE_RESPONSE_ITEM);
 }
 
 function normalizeUsage(value) {
@@ -312,12 +318,16 @@ export async function extractRolloutUsage(path, {
   signal = null,
   onEvent,
   onBoundary = null,
+  onTool = null,
 } = {}) {
   if (typeof onEvent !== "function") {
     throw new TypeError("onEvent must be a function");
   }
   if (onBoundary !== null && typeof onBoundary !== "function") {
     throw new TypeError("onBoundary must be a function or null");
+  }
+  if (onTool !== null && typeof onTool !== "function") {
+    throw new TypeError("onTool must be a function or null");
   }
   let currentModel = seedModel;
   let currentEffort = seedEffort;
@@ -409,6 +419,9 @@ export async function extractRolloutUsage(path, {
     modelSeededFromLineage: 0,
     tierSeededFromLineage: 0,
     modelMissing: 0,
+    toolRecords: 0,
+    toolEvents: 0,
+    toolRecordsSkipped: 0,
   };
   if (seedModel !== null) diagnostics.modelSeededFromLineage = 1;
   if (seedTier?.inherited === true) diagnostics.tierSeededFromLineage = 1;
@@ -442,6 +455,9 @@ export async function extractRolloutUsage(path, {
           record = JSON.parse(text);
         } catch {
           diagnostics.malformedLines += 1;
+          if (text.includes(NEEDLE_RESPONSE_ITEM)) {
+            diagnostics.toolRecordsSkipped += 1;
+          }
           return;
         }
       }
@@ -460,6 +476,13 @@ export async function extractRolloutUsage(path, {
             currentEffort = effort;
           }
           diagnostics.salvagedRecords += 1;
+          return;
+        }
+        if (text.includes(NEEDLE_RESPONSE_ITEM)) {
+          // A response item that exceeds the bounded line cap cannot be
+          // classified without decoding its payload. Withhold it and let the
+          // generation attestation mark tool evidence incomplete.
+          diagnostics.toolRecordsSkipped += 1;
           return;
         }
         if (!text.includes('"token_count"')) return;
@@ -518,6 +541,23 @@ export async function extractRolloutUsage(path, {
         const effort = record.payload?.effort;
         if (typeof effort === "string" && REASONING_EFFORT_VALUES.has(effort)) {
           currentEffort = effort;
+        }
+        return;
+      }
+      if (record.type === "response_item") {
+        const observations = extractToolObservations(record.payload);
+        if (observations.length === 0) return;
+        diagnostics.toolRecords += 1;
+        for (const [toolOrdinal, observation] of observations.entries()) {
+          const event = {
+            observedAtMs,
+            sourceOffset: lineEndOffset,
+            toolOrdinal,
+            toolClass: observation.toolClass,
+            sourceKind: observation.sourceKind,
+          };
+          diagnostics.toolEvents += 1;
+          await onTool?.(event);
         }
         return;
       }
