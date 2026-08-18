@@ -5,7 +5,7 @@ import { readDistributionAnalytics } from "../src/distribution-analytics";
 const NOW = Date.parse("2026-08-17T12:00:00.000Z");
 const ANALYTICS_ENDPOINT = "https://api.cloudflare.com/client/v4/graphql";
 const GITHUB_ENDPOINT =
-  "https://api.github.com/repos/adamallcock/tibotattle/releases/latest";
+  "https://api.github.com/repos/adamallcock/tibotattle/releases?per_page=100&page=1";
 
 function analyticsRow({
   count = 1,
@@ -34,15 +34,31 @@ function jsonResponse(value: unknown, status = 200): Response {
   });
 }
 
-function githubRelease(): object {
-  return {
+function pagedJsonResponse(
+  value: unknown,
+  link: string | null,
+): Response {
+  return new Response(JSON.stringify(value), {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      ...(link === null ? {} : { link }),
+    },
+  });
+}
+
+function githubRelease(): object[] {
+  return [{
+    id: 12,
     tag_name: "v0.1.12",
     published_at: "2026-08-15T18:00:00.000Z",
+    draft: false,
+    prerelease: false,
     assets: [
-      { name: "TiboTattle-0.1.12.dmg", download_count: 88 },
-      { name: "SHA256SUMS.txt", download_count: 13 },
+      { id: 1201, name: "TiboTattle-0.1.12.dmg", download_count: 88 },
+      { id: 1202, name: "SHA256SUMS.txt", download_count: 13 },
     ],
-  };
+  }];
 }
 
 describe("owner distribution analytics", () => {
@@ -169,6 +185,19 @@ describe("owner distribution analytics", () => {
         dmgDownloads: 88,
         allAssetDownloads: 101,
       },
+      summary: {
+        dmgDownloads: 88,
+        allAssetDownloads: 101,
+        dmgAssetCount: 1,
+        assetCount: 2,
+        releaseCount: 1,
+      },
+      releases: [{
+        id: 12,
+        tag: "v0.1.12",
+        prerelease: false,
+        dmgDownloads: 88,
+      }],
     });
     const serialized = JSON.stringify(overview);
     expect(serialized).not.toContain("203.0.113");
@@ -204,6 +233,58 @@ describe("owner distribution analytics", () => {
       reasonCode: "ANALYTICS_NOT_CONFIGURED",
     });
     expect(overview.github.status).toBe("available");
+  });
+
+  it("follows GitHub pagination, excludes drafts, and keeps prereleases distinct", async () => {
+    const pageTwo =
+      "https://api.github.com/repos/adamallcock/tibotattle/releases?per_page=100&page=2";
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === GITHUB_ENDPOINT) {
+        return pagedJsonResponse([
+          {
+            id: 99,
+            tag_name: "draft",
+            published_at: "2026-08-17T00:00:00.000Z",
+            draft: true,
+            prerelease: false,
+            assets: [],
+          },
+          {
+            id: 12,
+            tag_name: "v0.1.12",
+            published_at: "2026-08-15T18:00:00.000Z",
+            draft: false,
+            prerelease: false,
+            assets: [{ id: 1201, name: "TiboTattle-0.1.12.dmg", download_count: 88 }],
+          },
+        ], `<${pageTwo}>; rel="next"`);
+      }
+      if (String(input) === pageTwo) {
+        return pagedJsonResponse([{
+          id: 11,
+          tag_name: "v0.1.11-rc.1",
+          published_at: "2026-08-01T18:00:00.000Z",
+          draft: false,
+          prerelease: true,
+          assets: [{ id: 1101, name: "TiboTattle-0.1.11-rc.1.dmg", download_count: 12 }],
+        }], null);
+      }
+      throw new Error(`unexpected URL: ${String(input)}`);
+    }) as unknown as typeof fetch;
+
+    const overview = await readDistributionAnalytics(
+      { enabled: true },
+      NOW,
+      fetcher,
+    );
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(overview.github).toMatchObject({
+      status: "available",
+      summary: { releaseCount: 2, dmgDownloads: 100 },
+      releases: [{ tag: "v0.1.12", prerelease: false }, {
+        tag: "v0.1.11-rc.1", prerelease: true,
+      }],
+    });
   });
 
   it("keeps a valid empty analytics window available with explicit zeroes", async () => {

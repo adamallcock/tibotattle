@@ -4,10 +4,41 @@ import {
   projectAdminAction,
   projectAdminOverview,
 } from "./admin-client.js";
+import { PublicCommunityClient } from "./community-data.js";
+import { renderCommunityAllowanceSection } from "./community-view.js";
 import { formatNumber, formatReportingTime } from "./ui-format.js";
 
-const state = { csrfToken: "", overview: null };
+const state = {
+  csrfToken: "",
+  overview: null,
+  loading: false,
+  refreshTimer: null,
+  refreshStatusTimer: null,
+  nextRefreshAt: null,
+  lastSuccessfulLoadAt: null,
+  retryDelayMilliseconds: 30_000,
+  communityPayload: null,
+  communityRangeDays: null,
+  notificationPreferences: null,
+};
 const $ = (selector) => document.querySelector(selector);
+const ADMIN_PAGE_CLASS = "admin-operator-page";
+const AUTO_REFRESH_STORAGE_KEY = "tibotattle-admin-auto-refresh-minutes-v1";
+const NOTIFICATION_STORAGE_KEY = "tibotattle-admin-notifications-v1";
+const DEFAULT_AUTO_REFRESH_MINUTES = 5;
+const AUTO_REFRESH_OPTIONS = new Set([0, 1, 5, 15]);
+const NOTIFICATION_REPEAT_OPTIONS = new Set([0, 5, 15, 60]);
+const ADMIN_TITLE = "TiboTattle operations";
+const isAdminPage = document.body?.classList?.contains(ADMIN_PAGE_CLASS) === true;
+const communityClient = new PublicCommunityClient({
+  fetchImpl(path, init = {}) {
+    return fetch(path, {
+      ...init,
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+  },
+});
 let infoHintSequence = 0;
 
 const INFO_HINTS = Object.freeze({
@@ -38,12 +69,16 @@ const INFO_HINTS = Object.freeze({
   "Sparkle update checks": "Requests for the Sparkle appcast used to discover updates. A single installation can check more than once.",
   "Sparkle artifact fetches": "Requests for update artifacts. Fetches can include retries or automated checks and do not prove a completed installation.",
   "Current-version reach": "Distinct source addresses whose update traffic identifies the current published app version.",
-  "GitHub DMG downloads": "GitHub's cumulative download counter for the latest DMG. It counts asset downloads, not launches, active users, or unique devices. This optional total does not affect the first-party activity estimates.",
+  "GitHub DMG downloads": "GitHub's cumulative download counter for every currently published DMG asset. It counts asset downloads, not launches, active users, or unique devices. This optional total does not affect the first-party activity estimates.",
+  "GitHub DMG downloads since prior snapshot": "The non-negative change in current GitHub DMG counters since the last complete owner snapshot. It begins after the first successful sync and does not infer downloads before this dashboard started recording snapshots.",
   "Cloudflare analytics": "Whether first-party request analytics were available for this dashboard refresh.",
   "Evidence window": "The exact request-analytics time range used for the displayed activity estimates.",
   "Sampling": "Whether Cloudflare returned every matching row or a sampled estimate.",
   "Result bound": "Whether a query reached its safety row cap. A bounded result is a minimum rather than an exact total.",
-  "GitHub releases": "Whether current release metadata and cumulative asset download totals were available from GitHub. If this source is unavailable, the first-party app activity evidence above is still valid.",
+  "GitHub releases": "Whether the most recent complete all-release snapshot was available. If this source is unavailable, the first-party app activity evidence above is still valid. A failed GitHub poll retains the last known good snapshot rather than showing zero downloads.",
+  "GitHub snapshot": "When the most recent complete, all-release GitHub asset snapshot was recorded. GitHub exposes cumulative counters; this private dashboard stores snapshots to calculate future changes safely.",
+  "GitHub sync": "The most recent owner or scheduled attempt to refresh GitHub release counters. A stale or failed source never erases the last known good totals.",
+  "Counter regressions": "How many currently observed DMG assets reported a lower cumulative counter than their previous snapshot. This can happen when an asset is replaced or corrected; the dashboard never presents it as a negative download total.",
   "Latest release": "The release tag and publication time used for the download totals.",
   "Raw source addresses stored": "Whether this dashboard persists the source addresses used for distinct-address estimates. It should always say no.",
   "Upload ingress budget": "Shared admission state that protects the service from too many simultaneous or rapidly starting uploads.",
@@ -73,6 +108,10 @@ const AUDIT_ACTIONS = Object.freeze({
     label: "Collection controls",
     explanation: "A revision-checked change to enrollment, upload registration, processing, or publication switches.",
   }),
+  sync_distribution: Object.freeze({
+    label: "GitHub distribution sync",
+    explanation: "A bounded, owner-initiated read of every published GitHub release that records an all-release asset snapshot.",
+  }),
 });
 
 const AUDIT_FIELD_LABELS = Object.freeze({
@@ -98,6 +137,7 @@ const AUDIT_FIELD_LABELS = Object.freeze({
   identityReenrollmentCooldownPurgeComplete: "Deletion-ledger cooldown cleanup complete",
   aggregateRebuildComplete: "Community rebuild complete",
   publicationEnabled: "Publication enabled",
+  observedAt: "Snapshot observed at",
 });
 
 const AUDIT_FIELD_HINTS = Object.freeze({
@@ -123,6 +163,7 @@ const AUDIT_FIELD_HINTS = Object.freeze({
   identityReenrollmentCooldownPurgeComplete: "Whether deletion-ledger identity cooldown cleanup finished its eligible work.",
   aggregateRebuildComplete: "Whether all queued daily and weekly community aggregate rebuilds completed in this pass.",
   publicationEnabled: "Whether community publication was enabled while this maintenance pass ran.",
+  observedAt: "When the complete GitHub release snapshot was recorded.",
 });
 
 const MAINTENANCE_COMPLETION_FIELDS = Object.freeze([
@@ -637,7 +678,7 @@ function attentionRow({ level, title, detail, target, linkLabel }) {
   return row;
 }
 
-function renderAttention(overview) {
+function collectAttentionItems(overview) {
   const items = [];
   const collection = overview.collection;
   const lifecycle = overview.lifecycle;
@@ -730,6 +771,41 @@ function renderAttention(overview) {
     );
   }
 
+  const github = overview.distribution.github;
+  if (github.status !== "available") {
+    addAttentionItem(
+      items,
+      "warning",
+      "GitHub release evidence is unavailable",
+      github.reasonCode === "GITHUB_SNAPSHOT_PENDING"
+        ? "The first complete all-release snapshot has not been recorded yet."
+        : `The dashboard retained no complete GitHub release snapshot (${github.reasonCode}).`,
+      "#distribution-title",
+      "Review distribution",
+    );
+  } else if (github.sync.stale || github.sync.lastFailureCode !== null) {
+    addAttentionItem(
+      items,
+      "warning",
+      "GitHub release evidence needs a refresh",
+      github.sync.lastFailureCode !== null
+        ? `Latest GitHub sync failed (${github.sync.lastFailureCode}); last good totals remain visible.`
+        : "The last complete GitHub release snapshot is older than the normal refresh window.",
+      "#distribution-title",
+      "Sync releases",
+    );
+  }
+  if (github.history.counterRegressions > 0) {
+    addAttentionItem(
+      items,
+      "warning",
+      `${github.history.counterRegressions} GitHub DMG ${github.history.counterRegressions === 1 ? "counter decreased" : "counters decreased"}`,
+      "The affected asset may have been replaced or corrected; no negative download total is shown.",
+      "#distribution-title",
+      "Review releases",
+    );
+  }
+
   const generatedAt = Date.parse(overview.generatedAt);
   const recentServerFailures = overview.errors.recentDiagnostics.filter((event) => {
     const occurredAt = Date.parse(event.occurredAt);
@@ -754,6 +830,11 @@ function renderAttention(overview) {
     );
   }
 
+  return items;
+}
+
+function renderAttention(overview) {
+  const items = collectAttentionItems(overview);
   const badge = $("#operator-attention-badge");
   if (items.length === 0) {
     badge.className = "admin-source-badge admin-source-available";
@@ -765,7 +846,7 @@ function renderAttention(overview) {
       target: null,
       linkLabel: null,
     }));
-    return;
+    return [];
   }
 
   const alerts = items.filter((item) => item.level === "alert");
@@ -778,6 +859,7 @@ function renderAttention(overview) {
   items.sort((left, right) => Number(right.level === "alert")
     - Number(left.level === "alert"));
   $("#operator-attention").replaceChildren(...items.map(attentionRow));
+  return items;
 }
 
 function renderQuarantine(overview) {
@@ -840,6 +922,13 @@ function distributionCount(value, cloudflare) {
   return `${cloudflare.sampled ? "≈" : ""}${value}${cloudflare.bounded ? "+" : ""}`;
 }
 
+function percentage(value, total) {
+  if (!Number.isFinite(value) || !Number.isFinite(total) || total <= 0) {
+    return "—";
+  }
+  return `${Math.round((value / total) * 100)}%`;
+}
+
 function renderDistribution(distribution) {
   const cloudflare = distribution.cloudflare;
   const github = distribution.github;
@@ -865,6 +954,8 @@ function renderDistribution(distribution) {
   const downloads = cloudflare.sparkleDownloads;
   const current = cloudflare.currentVersionSourceAddresses;
   const release = github.release;
+  const summary = github.summary;
+  const history = github.history;
   renderMetricCards("#distribution-counts", [
     [
       "Active-install proxy",
@@ -895,22 +986,45 @@ function renderDistribution(distribution) {
     ],
     [
       "GitHub DMG downloads",
-      release ? count(release.dmgDownloads) : "—",
-      release
-        ? `${release.tag} cumulative · ${count(release.allAssetDownloads)} all release assets`
+      summary ? count(summary.dmgDownloads) : "—",
+      summary
+        ? `${summary.releaseCount} releases · ${summary.dmgAssetCount} DMG assets · all time`
         : "unavailable from GitHub; activity counts are unaffected",
+    ],
+    [
+      "GitHub DMG downloads since prior snapshot",
+      history.dmgDownloadsSincePrevious === null
+        ? "—"
+        : count(history.dmgDownloadsSincePrevious),
+      history.previousObservedAt
+        ? `${formatTime(history.previousObservedAt)} → ${formatTime(history.latestObservedAt)}`
+        : "available after a second complete snapshot",
     ],
   ]);
 
   const versions = cloudflare.observedVersions;
+  const activeAddresses = active?.last7Days ?? 0;
   $("#distribution-version-rows").replaceChildren(
     ...versions.map((version) => tableRow([
       version.version,
+      percentage(version.sourceAddressesLast7Days, activeAddresses),
       distributionCount(version.sourceAddressesLast7Days, cloudflare),
       distributionCount(version.requestsLast7Days, cloudflare),
     ])),
   );
   $("#distribution-version-empty").hidden = versions.length !== 0;
+
+  const releases = github.releases;
+  $("#github-release-rows").replaceChildren(
+    ...releases.map((githubRelease) => tableRow([
+      githubRelease.tag,
+      githubRelease.prerelease ? "Prerelease" : "Stable",
+      count(githubRelease.dmgDownloads),
+      percentage(githubRelease.dmgDownloads, summary?.dmgDownloads ?? 0),
+      formatTime(githubRelease.publishedAt),
+    ])),
+  );
+  $("#github-release-empty").hidden = releases.length !== 0;
 
   $("#distribution-source-status").replaceChildren(
     statusLine(
@@ -947,6 +1061,21 @@ function renderDistribution(distribution) {
       "Latest release",
       release ? `${release.tag} · ${formatTime(release.publishedAt)}` : "—",
     ),
+    statusLine(
+      "GitHub snapshot",
+      history.latestObservedAt ? formatTime(history.latestObservedAt) : "—",
+    ),
+    statusLine(
+      "GitHub sync",
+      github.sync.lastFailureCode
+        ? `failed · ${github.sync.lastFailureCode}`
+        : github.sync.stale
+          ? "stale"
+          : github.sync.lastSuccessAt
+            ? `healthy · ${formatTime(github.sync.lastSuccessAt)}`
+            : "pending",
+    ),
+    statusLine("Counter regressions", text(history.counterRegressions)),
     statusLine("Raw source addresses stored", "no"),
   );
 }
@@ -1049,9 +1178,262 @@ function renderAudit(rows) {
   $("#audit-empty").hidden = rows.length !== 0;
 }
 
+function storageRead(key, fallback) {
+  try {
+    const raw = globalThis.localStorage?.getItem(key);
+    if (raw === null || raw === undefined) return fallback;
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function storageWrite(key, value) {
+  try {
+    globalThis.localStorage?.setItem(key, JSON.stringify(value));
+  } catch {
+    // Private mode or restrictive browser settings should never break the
+    // owner dashboard. The preference simply remains session-local.
+  }
+}
+
+function selectedAutoRefreshMinutes() {
+  const saved = Number(storageRead(AUTO_REFRESH_STORAGE_KEY, DEFAULT_AUTO_REFRESH_MINUTES));
+  return AUTO_REFRESH_OPTIONS.has(saved) ? saved : DEFAULT_AUTO_REFRESH_MINUTES;
+}
+
+function notificationDefaults() {
+  return {
+    enabled: false,
+    repeatMinutes: 0,
+    lastFingerprint: null,
+    lastSentAt: null,
+  };
+}
+
+function readNotificationPreferences() {
+  const saved = storageRead(NOTIFICATION_STORAGE_KEY, notificationDefaults());
+  const repeatMinutes = Number(saved?.repeatMinutes);
+  return {
+    enabled: saved?.enabled === true,
+    repeatMinutes: NOTIFICATION_REPEAT_OPTIONS.has(repeatMinutes)
+      ? repeatMinutes
+      : 0,
+    lastFingerprint: typeof saved?.lastFingerprint === "string"
+      ? saved.lastFingerprint
+      : null,
+    lastSentAt: Number.isFinite(saved?.lastSentAt) ? saved.lastSentAt : null,
+  };
+}
+
+function saveNotificationPreferences(preferences) {
+  state.notificationPreferences = preferences;
+  storageWrite(NOTIFICATION_STORAGE_KEY, preferences);
+}
+
+function notificationApi() {
+  return typeof globalThis.Notification === "function"
+    ? globalThis.Notification
+    : null;
+}
+
+function setNotificationStatus(message) {
+  const node = $("#notification-status");
+  if (node) node.textContent = message;
+}
+
+function updateNotificationControls() {
+  if (!isAdminPage) return;
+  const preferences = state.notificationPreferences ?? readNotificationPreferences();
+  state.notificationPreferences = preferences;
+  const enabled = $("#browser-notifications");
+  const repeat = $("#notification-repeat-minutes");
+  const test = $("#notification-test");
+  const api = notificationApi();
+  if (!api) {
+    enabled.checked = false;
+    enabled.disabled = true;
+    repeat.disabled = true;
+    test.disabled = true;
+    setNotificationStatus("This browser does not support native notifications.");
+    return;
+  }
+  enabled.checked = preferences.enabled && api.permission === "granted";
+  repeat.value = String(preferences.repeatMinutes);
+  repeat.disabled = !enabled.checked;
+  test.disabled = !enabled.checked;
+  if (api.permission === "denied") {
+    setNotificationStatus("Blocked in browser settings.");
+  } else if (enabled.checked) {
+    setNotificationStatus(
+      preferences.repeatMinutes === 0
+        ? "Enabled: once for each new attention state."
+        : `Enabled: unresolved alerts repeat every ${preferences.repeatMinutes} minutes.`,
+    );
+  } else {
+    setNotificationStatus("Off.");
+  }
+}
+
+function notificationFingerprint(items) {
+  return items
+    .filter((item) => item.level !== "ok")
+    .map((item) => `${item.level}:${item.title}:${item.detail}`)
+    .sort()
+    .join("|");
+}
+
+function notifyAttention(items) {
+  if (!isAdminPage) return;
+  const alerts = items.filter((item) => item.level !== "ok");
+  document.title = alerts.length > 0 ? `• ${ADMIN_TITLE}` : ADMIN_TITLE;
+  const preferences = state.notificationPreferences ?? readNotificationPreferences();
+  if (!preferences.enabled || alerts.length === 0) return;
+  const api = notificationApi();
+  if (!api || api.permission !== "granted") return;
+  const fingerprint = notificationFingerprint(alerts);
+  const now = Date.now();
+  const repeatAfter = preferences.repeatMinutes * 60 * 1_000;
+  const shouldRepeat = preferences.lastFingerprint === fingerprint
+    && repeatAfter > 0
+    && preferences.lastSentAt !== null
+    && now - preferences.lastSentAt >= repeatAfter;
+  if (preferences.lastFingerprint === fingerprint && !shouldRepeat) return;
+  const titles = alerts.slice(0, 2).map((item) => item.title);
+  try {
+    new api(
+      alerts.some((item) => item.level === "alert")
+        ? "TiboTattle admin: action required"
+        : "TiboTattle admin: attention needed",
+      {
+        body: titles.join(" · "),
+        tag: "tibotattle-admin-attention",
+        renotify: shouldRepeat,
+      },
+    );
+    saveNotificationPreferences({
+      ...preferences,
+      lastFingerprint: fingerprint,
+      lastSentAt: now,
+    });
+  } catch {
+    setNotificationStatus("The browser could not show the configured alert.");
+  }
+}
+
+function refreshStatusText() {
+  if (!isAdminPage) return;
+  const node = $("#auto-refresh-status");
+  if (!node) return;
+  const minutes = Number($("#auto-refresh-minutes").value);
+  if (minutes === 0) {
+    node.textContent = "Automatic refresh is off.";
+    return;
+  }
+  if (navigator.onLine === false) {
+    node.textContent = "Paused while offline.";
+    return;
+  }
+  if (document.visibilityState === "hidden") {
+    node.textContent = "Paused while this tab is hidden.";
+    return;
+  }
+  if (state.loading) {
+    node.textContent = "Refreshing…";
+    return;
+  }
+  if (state.nextRefreshAt === null) {
+    node.textContent = `Every ${minutes} minute${minutes === 1 ? "" : "s"}.`;
+    return;
+  }
+  const seconds = Math.max(0, Math.ceil((state.nextRefreshAt - Date.now()) / 1_000));
+  const minutesRemaining = Math.floor(seconds / 60);
+  const secondsRemaining = seconds % 60;
+  node.textContent = `Next refresh in ${minutesRemaining}:${String(secondsRemaining).padStart(2, "0")}.`;
+}
+
+function clearRefreshSchedule() {
+  if (state.refreshTimer !== null) clearTimeout(state.refreshTimer);
+  state.refreshTimer = null;
+  state.nextRefreshAt = null;
+}
+
+function scheduleRefresh({ retry = false } = {}) {
+  if (!isAdminPage) return;
+  clearRefreshSchedule();
+  const minutes = Number($("#auto-refresh-minutes").value);
+  if (!AUTO_REFRESH_OPTIONS.has(minutes) || minutes === 0) {
+    refreshStatusText();
+    return;
+  }
+  if (navigator.onLine === false || document.visibilityState === "hidden") {
+    refreshStatusText();
+    return;
+  }
+  const interval = retry
+    ? Math.min(state.retryDelayMilliseconds, minutes * 60 * 1_000)
+    : minutes * 60 * 1_000;
+  state.nextRefreshAt = Date.now() + interval;
+  state.refreshTimer = setTimeout(() => {
+    state.refreshTimer = null;
+    state.nextRefreshAt = null;
+    if (document.visibilityState === "hidden" || navigator.onLine === false) {
+      refreshStatusText();
+      return;
+    }
+    void load({ automatic: true });
+  }, interval);
+  refreshStatusText();
+}
+
+function renderCommunityRangeControls() {
+  const controls = $("#admin-community-range-controls");
+  if (!controls) return;
+  for (const button of controls.querySelectorAll("button[data-range-days]")) {
+    const value = button.dataset.rangeDays;
+    const selected = value === "all"
+      ? state.communityRangeDays === null
+      : Number(value) === state.communityRangeDays;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  }
+}
+
+function renderAdminCommunityAllowance(payload) {
+  if (!isAdminPage) return;
+  const container = $("#admin-community-allowance-result");
+  const stateNode = $("#admin-community-allowance-state");
+  if (!container || !stateNode) return;
+  const result = renderCommunityAllowanceSection({
+    documentRef: document,
+    container,
+    stateNode,
+    payload,
+    rangeDays: state.communityRangeDays,
+  });
+  const badge = $("#admin-community-status");
+  const available = result === "published";
+  badge.className = `admin-source-badge ${
+    available ? "admin-source-available" : "admin-source-partial"
+  }`;
+  badge.textContent = available ? "Public graph available" : "Public graph unavailable";
+  renderCommunityRangeControls();
+}
+
+async function loadAdminCommunityAllowance() {
+  if (!isAdminPage) return;
+  try {
+    state.communityPayload = await communityClient.communityDaily();
+    renderAdminCommunityAllowance(state.communityPayload);
+  } catch {
+    state.communityPayload = null;
+    renderAdminCommunityAllowance(null);
+  }
+}
+
 function render(overview) {
   state.overview = overview;
-  renderAttention(overview);
+  const attention = renderAttention(overview);
   renderCounts(overview);
   renderQuarantine(overview);
   renderDistribution(overview.distribution);
@@ -1062,10 +1444,15 @@ function render(overview) {
   renderAudit(overview.audit);
   $("#last-refresh").textContent = formatTime(overview.generatedAt);
   $("#service-state").textContent = `${overview.service.environment} · ${overview.collection.state}`;
+  notifyAttention(attention);
 }
 
 async function load() {
+  if (state.loading) return;
+  state.loading = true;
+  let succeeded = false;
   $("#refresh").disabled = true;
+  refreshStatusText();
   try {
     // No app session on the admin host: authentication is Cloudflare Access and
     // the owner-email pin, and CSRF is the always-sent x-usage-monitor-admin
@@ -1075,17 +1462,27 @@ async function load() {
     const query = reference ? `?diagnosticReference=${encodeURIComponent(reference)}` : "";
     render(projectAdminOverview(await request(`/api/v1/admin/overview${query}`)));
     $("#notice").hidden = true;
+    state.lastSuccessfulLoadAt = Date.now();
+    state.retryDelayMilliseconds = 30_000;
+    succeeded = true;
+    void loadAdminCommunityAllowance();
   } catch (error) {
     showNotice(`Operations view unavailable: ${error.message}.`);
+    state.retryDelayMilliseconds = Math.min(
+      state.retryDelayMilliseconds * 2,
+      5 * 60 * 1_000,
+    );
   } finally {
+    state.loading = false;
     $("#refresh").disabled = false;
+    if (isAdminPage) scheduleRefresh({ retry: !succeeded });
   }
 }
 
-$("#refresh").addEventListener("click", load);
+$("#refresh").addEventListener("click", () => load());
 $("#diagnostic-form").addEventListener("submit", (event) => {
   event.preventDefault();
-  load();
+  void load();
 });
 $("#controls-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1128,4 +1525,136 @@ $("#run-maintenance").addEventListener("click", async () => {
   }
 });
 
-load();
+if (isAdminPage) {
+  const autoRefresh = $("#auto-refresh-minutes");
+  autoRefresh.value = String(selectedAutoRefreshMinutes());
+  autoRefresh.addEventListener("change", () => {
+    const minutes = Number(autoRefresh.value);
+    const safeMinutes = AUTO_REFRESH_OPTIONS.has(minutes)
+      ? minutes
+      : DEFAULT_AUTO_REFRESH_MINUTES;
+    autoRefresh.value = String(safeMinutes);
+    storageWrite(AUTO_REFRESH_STORAGE_KEY, safeMinutes);
+    scheduleRefresh();
+  });
+  state.refreshStatusTimer = setInterval(refreshStatusText, 1_000);
+
+  state.notificationPreferences = readNotificationPreferences();
+  updateNotificationControls();
+  $("#browser-notifications").addEventListener("change", async (event) => {
+    const control = event.currentTarget;
+    const preferences = state.notificationPreferences ?? readNotificationPreferences();
+    const api = notificationApi();
+    if (!control.checked) {
+      saveNotificationPreferences({ ...preferences, enabled: false });
+      updateNotificationControls();
+      return;
+    }
+    if (!api) {
+      control.checked = false;
+      setNotificationStatus("This browser does not support native notifications.");
+      return;
+    }
+    const permission = api.permission === "default"
+      ? await api.requestPermission()
+      : api.permission;
+    if (permission !== "granted") {
+      control.checked = false;
+      saveNotificationPreferences({ ...preferences, enabled: false });
+      updateNotificationControls();
+      return;
+    }
+    saveNotificationPreferences({ ...preferences, enabled: true });
+    updateNotificationControls();
+    if (state.overview) notifyAttention(collectAttentionItems(state.overview));
+  });
+  $("#notification-repeat-minutes").addEventListener("change", (event) => {
+    const repeatMinutes = Number(event.currentTarget.value);
+    const preferences = state.notificationPreferences ?? readNotificationPreferences();
+    saveNotificationPreferences({
+      ...preferences,
+      repeatMinutes: NOTIFICATION_REPEAT_OPTIONS.has(repeatMinutes)
+        ? repeatMinutes
+        : 0,
+    });
+    updateNotificationControls();
+  });
+  $("#notification-test").addEventListener("click", () => {
+    const api = notificationApi();
+    if (!api || api.permission !== "granted") {
+      setNotificationStatus("Enable browser alerts before sending a test.");
+      return;
+    }
+    try {
+      new api("TiboTattle admin test", {
+        body: "Browser alerts are enabled for this private admin browser.",
+        tag: "tibotattle-admin-test",
+        renotify: true,
+      });
+      setNotificationStatus("Test alert sent.");
+    } catch {
+      setNotificationStatus("The browser could not show a test alert.");
+    }
+  });
+  $("#admin-community-range-controls").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-range-days]");
+    if (!button) return;
+    state.communityRangeDays = button.dataset.rangeDays === "all"
+      ? null
+      : Number(button.dataset.rangeDays);
+    renderAdminCommunityAllowance(state.communityPayload);
+  });
+  $("#sync-distribution").addEventListener("click", async () => {
+    const button = $("#sync-distribution");
+    button.disabled = true;
+    try {
+      const result = projectAdminAction(await request("/api/v1/admin/action", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "sync_distribution" }),
+      }), "sync_distribution");
+      showNotice(
+        result.result.code === "GITHUB_SYNCED"
+          ? "GitHub release snapshot completed and was written to the owner history."
+          : `GitHub release sync: ${result.result.code}.`,
+        "info",
+      );
+      await load();
+    } catch (error) {
+      showNotice(`GitHub release sync did not complete: ${adminActionErrorMessage(error)}`);
+    } finally {
+      button.disabled = false;
+    }
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      const minutes = Number($("#auto-refresh-minutes").value);
+      const stale = state.lastSuccessfulLoadAt === null
+        || Date.now() - state.lastSuccessfulLoadAt >= minutes * 60 * 1_000;
+      if (minutes > 0 && stale && navigator.onLine !== false) {
+        void load({ automatic: true });
+      } else {
+        scheduleRefresh();
+      }
+    } else {
+      clearRefreshSchedule();
+      refreshStatusText();
+    }
+  });
+  window.addEventListener("online", () => {
+    const minutes = Number($("#auto-refresh-minutes").value);
+    const stale = state.lastSuccessfulLoadAt === null
+      || Date.now() - state.lastSuccessfulLoadAt >= minutes * 60 * 1_000;
+    if (minutes > 0 && stale && document.visibilityState !== "hidden") {
+      void load({ automatic: true });
+    } else {
+      scheduleRefresh();
+    }
+  });
+  window.addEventListener("offline", () => {
+    clearRefreshSchedule();
+    refreshStatusText();
+  });
+}
+
+void load();

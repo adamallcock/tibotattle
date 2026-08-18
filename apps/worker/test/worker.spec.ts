@@ -2277,7 +2277,7 @@ describe("synthetic usage monitor service", () => {
       ingress: { lastDeniedAt: unknown } | null;
     }>();
     expect(overviewBody).toMatchObject({
-      schemaVersion: "admin-overview-v0.2",
+      schemaVersion: "admin-overview-v0.3",
       collection: {
         state: "operational",
         enrollment: true,
@@ -2383,7 +2383,7 @@ describe("synthetic usage monitor service", () => {
     );
     expect(overviewWithoutBudget.status).toBe(200);
     await expect(overviewWithoutBudget.json()).resolves.toMatchObject({
-      schemaVersion: "admin-overview-v0.2",
+      schemaVersion: "admin-overview-v0.3",
       ingress: null,
     });
 
@@ -2400,6 +2400,28 @@ describe("synthetic usage monitor service", () => {
       ownerEnv,
     );
     expect(csrfRejected.status).toBe(403);
+
+    // The owner-only GitHub refresh has its own audited action. Development
+    // deliberately returns a disabled result without contacting GitHub rather
+    // than exposing a network-dependent test path.
+    const distributionSync = await api(
+      "/api/v1/admin/action",
+      {
+        method: "POST",
+        headers: {
+          ...personalHeaders(participant, { csrf: true }),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ action: "sync_distribution" }),
+      },
+      ownerEnv,
+    );
+    expect(distributionSync.status).toBe(200);
+    await expect(distributionSync.json()).resolves.toMatchObject({
+      schemaVersion: "admin-action-v0.1",
+      action: "sync_distribution",
+      result: { code: "DISTRIBUTION_DISABLED" },
+    });
 
     const changed = await api(
       "/api/v1/admin/action",

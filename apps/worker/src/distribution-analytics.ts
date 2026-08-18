@@ -1,9 +1,14 @@
 import stableSparkleReleaseContract from "./sparkle-release-contract.json";
+import {
+  githubUnavailable,
+  readGithubDistributionInventory,
+  type DistributionSourceStatus,
+  type GithubDistributionAnalytics,
+} from "./github-distribution-history";
+
+export type { GithubDistributionAnalytics } from "./github-distribution-history";
 
 const ANALYTICS_ENDPOINT = "https://api.cloudflare.com/client/v4/graphql";
-const GITHUB_REPOSITORY = "adamallcock/tibotattle";
-const GITHUB_RELEASE_ENDPOINT =
-  `https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest`;
 const UPDATE_HOST = new URL(stableSparkleReleaseContract.updateOrigin).hostname;
 const LOOKBACK_DAYS = 7 as const;
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
@@ -49,7 +54,7 @@ const ANALYTICS_QUERY = `
   }
 `;
 
-type SourceStatus = "available" | "not_configured" | "unavailable";
+type SourceStatus = DistributionSourceStatus;
 
 export interface DistributionAnalyticsConfiguration {
   /** Disable all external reads outside the production owner console. */
@@ -57,6 +62,12 @@ export interface DistributionAnalyticsConfiguration {
   readonly cloudflareZoneId?: unknown;
   readonly cloudflareApiToken?: unknown;
   readonly githubApiToken?: unknown;
+  /**
+   * Production overview passes the durable snapshot here. Keeping the fetch
+   * path injectable preserves the small live-reader contract used in tests and
+   * avoids every browser refresh polling GitHub.
+   */
+  readonly githubSnapshot?: GithubDistributionAnalytics;
 }
 
 export interface DistributionWindowCounts {
@@ -94,18 +105,6 @@ export interface CloudflareDistributionAnalytics {
   readonly observedVersionsBounded: boolean;
 }
 
-export interface GithubDistributionAnalytics {
-  readonly status: SourceStatus;
-  readonly reasonCode: string | null;
-  readonly repository: string;
-  readonly release: {
-    readonly tag: string;
-    readonly publishedAt: string;
-    readonly dmgDownloads: number;
-    readonly allAssetDownloads: number;
-  } | null;
-}
-
 export interface DistributionAnalyticsOverview {
   readonly methodology: {
     readonly unit: "distinct_source_ip_addresses";
@@ -130,13 +129,6 @@ interface AnalyticsSegment {
   readonly appcast: readonly AnalyticsRow[];
   readonly releases: readonly AnalyticsRow[];
   readonly bounded: boolean;
-}
-
-interface GithubRelease {
-  readonly tag: string;
-  readonly publishedAt: string;
-  readonly dmgDownloads: number;
-  readonly allAssetDownloads: number;
 }
 
 interface VersionAccumulator {
@@ -205,18 +197,6 @@ function sourceUnavailable(
     currentVersionSourceAddresses: null,
     observedVersions: [],
     observedVersionsBounded: false,
-  };
-}
-
-function githubUnavailable(
-  status: Exclude<SourceStatus, "available">,
-  reasonCode: string,
-): GithubDistributionAnalytics {
-  return {
-    status,
-    reasonCode,
-    repository: GITHUB_REPOSITORY,
-    release: null,
   };
 }
 
@@ -533,38 +513,6 @@ function aggregateAnalytics(
   };
 }
 
-async function readGithubRelease(
-  apiToken: string | null,
-  fetcher: typeof fetch,
-): Promise<GithubRelease> {
-  const headers: Record<string, string> = {
-    accept: "application/vnd.github+json",
-    "user-agent": "TiboTattle-owner-dashboard",
-    "x-github-api-version": "2022-11-28",
-  };
-  if (apiToken !== null) headers.authorization = `Bearer ${apiToken}`;
-  const response = await fetchWithTimeout(fetcher, GITHUB_RELEASE_ENDPOINT, {
-    method: "GET",
-    headers,
-  });
-  if (!response.ok) throw new Error("GitHub release query failed");
-  const body = record(await boundedJson(response));
-  const tag = string(body.tag_name);
-  const publishedAt = string(body.published_at);
-  let dmgDownloads = 0;
-  let allAssetDownloads = 0;
-  for (const value of array(body.assets)) {
-    const asset = record(value);
-    const name = string(asset.name);
-    const downloads = count(asset.download_count);
-    allAssetDownloads = safeAdd(allAssetDownloads, downloads);
-    if (name.toLowerCase().endsWith(".dmg")) {
-      dmgDownloads = safeAdd(dmgDownloads, downloads);
-    }
-  }
-  return { tag, publishedAt, dmgDownloads, allAssetDownloads };
-}
-
 /**
  * Reads only aggregate distribution evidence for the Access-protected owner
  * console. Cloudflare source addresses exist only in this function's transient
@@ -591,15 +539,9 @@ export async function readDistributionAnalytics(
 
   const zoneId = configuredString(configuration.cloudflareZoneId);
   const cloudflareApiToken = configuredString(configuration.cloudflareApiToken);
-  const githubApiToken = configuredString(configuration.githubApiToken);
-  const githubPromise = readGithubRelease(githubApiToken, fetcher)
-    .then((release): GithubDistributionAnalytics => ({
-      status: "available",
-      reasonCode: null,
-      repository: GITHUB_REPOSITORY,
-      release,
-    }))
-    .catch(() => githubUnavailable("unavailable", "GITHUB_UNAVAILABLE"));
+  const githubPromise = configuration.githubSnapshot === undefined
+    ? readGithubDistributionInventory(configuration.githubApiToken, fetcher)
+    : Promise.resolve(configuration.githubSnapshot);
 
   const analyticsPromise = zoneId === null || cloudflareApiToken === null
     ? Promise.resolve<readonly AnalyticsSegment[] | null>(null)

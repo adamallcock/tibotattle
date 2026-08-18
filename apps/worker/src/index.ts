@@ -55,6 +55,11 @@ import {
 import { authorizeAdminEmail, verifyAdminAccessAssertion } from "./admin-access";
 import { readDistributionAnalytics } from "./distribution-analytics";
 import {
+  githubUnavailable,
+  readGithubDistributionSnapshot,
+  syncGithubDistributionSnapshots,
+} from "./github-distribution-history";
+import {
   adminHostname,
   adminUiResponse,
   canonicalPublicRedirectUrl,
@@ -2892,6 +2897,7 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
 const ADMIN_ACTIONS = new Set<AdminAction>([
   "set_collection_controls",
   "run_maintenance",
+  "sync_distribution",
 ]);
 const ADMIN_CONTROL_REASONS = new Set<CollectionControlReason>([
   "drill_containment",
@@ -2939,7 +2945,8 @@ async function handleAdminOverview(
     throw new ApiError(400, "BODY_INVALID");
   }
   const nowEpoch = Date.now();
-  const [overview, ingress, distribution] = await Promise.all([
+  const distributionEnabled = env.ENVIRONMENT === "production";
+  const [overview, ingress, githubSnapshot] = await Promise.all([
     readAdminOverview(env.USAGE_MONITOR_DB, env.DELETION_LEDGER, {
       environment: env.ENVIRONMENT,
       enrollmentMode: env.ENROLLMENT_MODE,
@@ -2948,16 +2955,21 @@ async function handleAdminOverview(
       nowEpoch,
     }),
     readUploadIngressStatus(env),
-    readDistributionAnalytics({
-      enabled: env.ENVIRONMENT === "production",
-      cloudflareZoneId: Reflect.get(env, "DISTRIBUTION_ANALYTICS_ZONE_ID"),
-      cloudflareApiToken: Reflect.get(
-        env,
-        "DISTRIBUTION_ANALYTICS_API_TOKEN",
-      ),
-      githubApiToken: Reflect.get(env, "DISTRIBUTION_GITHUB_API_TOKEN"),
-    }, nowEpoch),
+    distributionEnabled
+      ? readGithubDistributionSnapshot(env.USAGE_MONITOR_DB, nowEpoch)
+        .catch(() => githubUnavailable("unavailable", "GITHUB_SNAPSHOT_UNAVAILABLE"))
+      : Promise.resolve(undefined),
   ]);
+  const distribution = await readDistributionAnalytics({
+    enabled: distributionEnabled,
+    cloudflareZoneId: Reflect.get(env, "DISTRIBUTION_ANALYTICS_ZONE_ID"),
+    cloudflareApiToken: Reflect.get(
+      env,
+      "DISTRIBUTION_ANALYTICS_API_TOKEN",
+    ),
+    githubApiToken: Reflect.get(env, "DISTRIBUTION_GITHUB_API_TOKEN"),
+    githubSnapshot,
+  }, nowEpoch);
   return jsonResponse(
     { ...overview, ingress, distribution },
     200,
@@ -3045,6 +3057,66 @@ async function handleAdminAction(
         );
       } catch {
         // Preserve the original maintenance failure response.
+      }
+      throw error;
+    }
+  }
+
+  if (action === "sync_distribution") {
+    if (Object.keys(body.value).length !== 1) throw new ApiError(400, "BODY_INVALID");
+    const operationId = await beginAdminOperation(
+      env.USAGE_MONITOR_DB,
+      identityKey,
+      "sync_distribution",
+      { phase: "started" },
+    );
+    try {
+      const result = await syncGithubDistributionSnapshots(
+        env.USAGE_MONITOR_DB,
+        {
+          enabled: env.ENVIRONMENT === "production",
+          githubApiToken: Reflect.get(env, "DISTRIBUTION_GITHUB_API_TOKEN"),
+        },
+        Date.now(),
+        fetch,
+        { force: true },
+      );
+      if (result.code === "GITHUB_SYNC_FAILED") {
+        await finishAdminOperation(
+          env.USAGE_MONITOR_DB,
+          operationId,
+          "failure",
+          { code: result.failureCode ?? "GITHUB_UNAVAILABLE" },
+        );
+        throw new ApiError(503, "DISTRIBUTION_SYNC_UNAVAILABLE");
+      }
+      await finishAdminOperation(
+        env.USAGE_MONITOR_DB,
+        operationId,
+        "success",
+        {
+          code: result.code,
+          observedAt: result.observedAt,
+        },
+      );
+      return jsonResponse(
+        { schemaVersion: "admin-action-v0.1", action, result },
+        200,
+        { "cache-control": "no-store", vary: "Cookie" },
+      );
+    } catch (error) {
+      if (!(error instanceof ApiError
+          && error.code === "DISTRIBUTION_SYNC_UNAVAILABLE")) {
+        try {
+          await finishAdminOperation(
+            env.USAGE_MONITOR_DB,
+            operationId,
+            "failure",
+            { code: error instanceof ApiError ? error.code : "INTERNAL_ERROR" },
+          );
+        } catch {
+          // Preserve the original sync failure response.
+        }
       }
       throw error;
     }
@@ -3779,6 +3851,30 @@ export async function runScheduledMaintenance(
     const ownedMaintenanceLease = maintenanceLease;
     await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
     await pruneDiagnosticErrors(env.USAGE_MONITOR_DB);
+    // Distribution snapshots are independent owner diagnostics. A transient
+    // GitHub failure must be recorded for the admin view but must never block
+    // deletion retention, object reconciliation, or community publication.
+    try {
+      const distributionSync = await syncGithubDistributionSnapshots(
+        env.USAGE_MONITOR_DB,
+        {
+          enabled: env.ENVIRONMENT === "production",
+          githubApiToken: Reflect.get(env, "DISTRIBUTION_GITHUB_API_TOKEN"),
+        },
+        Date.now(),
+      );
+      if (distributionSync.code === "GITHUB_SYNC_FAILED") {
+        console.warn(JSON.stringify({
+          level: "warn",
+          event: "github_distribution_sync",
+          outcome: "failure",
+          code: distributionSync.failureCode,
+        }));
+      }
+    } catch {
+      // The regular maintenance work below remains authoritative. The next
+      // overview will surface a snapshot-storage failure as source-unavailable.
+    }
     const handoffPurge = await purgeExpiredIdentityHandoffs(
       env.USAGE_MONITOR_DB,
       // A delayed Cron invocation must still clear handoffs that have expired

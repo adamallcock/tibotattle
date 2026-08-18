@@ -14,7 +14,10 @@ const MAX_ADMIN_AGGREGATE_ROWS = 10_000;
 const DIAGNOSTIC_REFERENCE_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
-export type AdminAction = "set_collection_controls" | "run_maintenance";
+export type AdminAction =
+  | "set_collection_controls"
+  | "run_maintenance"
+  | "sync_distribution";
 export type CollectionControlReason =
   | "drill_containment"
   | "drill_restore"
@@ -677,7 +680,7 @@ export async function readAdminOverview(
     || boundedCount(telemetryContributions).bounded
     || boundedCount(incrementalChunks).bounded;
   return {
-    schemaVersion: "admin-overview-v0.2",
+    schemaVersion: "admin-overview-v0.3",
     generatedAt: now,
     service: {
       environment: options.environment,

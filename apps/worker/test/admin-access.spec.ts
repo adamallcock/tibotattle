@@ -359,7 +359,7 @@ describe("admin surface hostname gating", () => {
     );
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      schemaVersion: "admin-overview-v0.2",
+      schemaVersion: "admin-overview-v0.3",
     });
   });
 
