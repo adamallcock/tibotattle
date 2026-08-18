@@ -207,98 +207,11 @@
             </nav>
           </div>
 
-          <details class="download-trust" id="download-trust" hidden>
-            <summary id="download-trust-summary">
-              <span class="download-trust-summary-copy">
-                <span class="download-trust-eyebrow" data-i18n="installer.trust.eyebrow">Download trust</span>
-                <strong data-i18n="installer.trust.title">How can I trust this download?</strong>
-              </span>
-            </summary>
-            <div class="download-trust-body">
-              <p class="download-trust-intro" data-i18n="installer.trust.intro">
-                TiboTattle is open source. Inspect the source on GitHub, install with Homebrew, or download the DMG directly.
-              </p>
-              <a
-                class="download-trust-source"
-                href="https://github.com/adamallcock/tibotattle"
-                target="_blank"
-                rel="noreferrer"
-                aria-label="GitHub (opens in a new tab)"
-                data-i18n-aria-label="aria.githubExternal"
-              >GitHub</a>
-              <p class="download-trust-release">
-                <span data-i18n="installer.trust.releaseLabel">Release</span>
-                <code id="installer-trust-version" data-i18n-skip></code>
-              </p>
-              <ul class="download-trust-signals">
-                <li>
-                  <span class="download-trust-check" aria-hidden="true"></span>
-                  <div>
-                    <strong data-i18n="installer.trust.openSource">Open source</strong>
-                    <p data-i18n="installer.trust.openSourceDetail">Inspect the public source on GitHub or build TiboTattle yourself.</p>
-                  </div>
-                </li>
-                <li>
-                  <span class="download-trust-check" aria-hidden="true"></span>
-                  <div>
-                    <strong data-i18n="installer.trust.developerId">Developer ID signed</strong>
-                    <p data-i18n="installer.trust.developerIdDetail">The distributed app is required to use a hardened-runtime Developer ID signature.</p>
-                  </div>
-                </li>
-                <li>
-                  <span class="download-trust-check" aria-hidden="true"></span>
-                  <div>
-                    <strong data-i18n="installer.trust.notarized">Apple notarized</strong>
-                    <p data-i18n="installer.trust.notarizedDetail">Apple notarization, stapling, and Gatekeeper assessment are required before this release is published.</p>
-                  </div>
-                </li>
-                <li>
-                  <span class="download-trust-check" aria-hidden="true"></span>
-                  <div>
-                    <strong data-i18n="installer.trust.checksum">Published SHA-256</strong>
-                    <p>
-                      <span data-i18n="installer.trust.checksumDetail">The verified installer metadata publishes this exact checksum:</span>
-                      <code id="installer-trust-sha256" data-i18n-skip></code>
-                    </p>
-                  </div>
-                </li>
-              </ul>
-              <p class="download-trust-caveat" data-i18n="installer.trust.caveat">
-                A checksum proves integrity, not safety. Apple signing and notarization help macOS verify the publisher and artifact, but neither proves source-to-binary provenance or that software is safe.
-              </p>
-              <details class="download-trust-verify">
-                <summary data-i18n="installer.trust.verifyTitle">Verify it yourself</summary>
-                <div class="download-trust-verify-body">
-                  <p data-i18n="installer.trust.verifyIntro">With the DMG downloaded, run these commands in Terminal:</p>
-                  <ol class="download-trust-commands">
-                    <li>
-                      <span data-i18n="installer.trust.verifyChecksum">Compare the downloaded DMG with the published checksum.</span>
-                      <code id="installer-trust-sha-command" data-i18n-skip></code>
-                    </li>
-                    <li>
-                      <span data-i18n="installer.trust.verifyApp">Ask macOS Gatekeeper to assess the installed app.</span>
-                      <code id="installer-trust-app-command" data-i18n-skip></code>
-                    </li>
-                    <li>
-                      <span data-i18n="installer.trust.inspectSignature">Inspect the app's signing identity.</span>
-                      <code id="installer-trust-signature-command" data-i18n-skip></code>
-                    </li>
-                    <li>
-                      <span data-i18n="installer.trust.verifyDeep">Verify the app signature recursively.</span>
-                      <code id="installer-trust-deep-command" data-i18n-skip></code>
-                    </li>
-                    <li>
-                      <span data-i18n="installer.trust.verifyDmg">Assess the DMG signature before opening it.</span>
-                      <code id="installer-trust-dmg-command" data-i18n-skip></code>
-                    </li>
-                  </ol>
-                  <p class="download-trust-verify-note" data-i18n="installer.trust.verifyNote">
-                    These checks answer different questions: the checksum checks downloaded bytes, while Apple checks the signature and notarization. None is a cryptographic proof that this binary came from a particular source commit.
-                  </p>
-                </div>
-              </details>
-            </div>
-          </details>
+          <p class="download-assurance" id="download-assurance" hidden>
+            <span class="download-assurance-mark" aria-hidden="true"></span>
+            <strong data-i18n="installer.assurance.message">Developer ID signed and Apple notarized.</strong>
+            <a href="./docs.html#download-security" data-i18n="installer.assurance.details">Security and verification</a>
+          </p>
 
           <a class="community-inline" href="#community">
             <span class="community-dot" aria-hidden="true"></span>

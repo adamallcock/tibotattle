@@ -16,8 +16,8 @@ import {
   renderCommunityDailySeries,
 } from "./community-view.js";
 import {
+  renderInstallerAssurance,
   renderInstallerJourney,
-  renderInstallerTrust,
 } from "./install-cta.js";
 import { createBrowserLocalization, translate } from "./localization.js";
 import {
@@ -116,7 +116,7 @@ function renderPublicInstallerJourney() {
     checksumFallback.textContent = release?.sha256 ?? "";
     checksumFallback.hidden = true;
   }
-  renderInstallerTrust(document, release);
+  renderInstallerAssurance(document, release);
   return release;
 }
 

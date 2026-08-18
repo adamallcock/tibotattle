@@ -52,6 +52,77 @@
       </header>
 
       <div class="resource-grid">
+        <article class="resource-card wide download-security-card" id="download-security">
+          <p class="security-eyebrow">Download security</p>
+          <h2>How TiboTattle protects every macOS release</h2>
+          <p class="security-lede">
+            Every published DMG must come from an exact tagged source checkout
+            and pass Developer ID signing, Apple notarization, stapling,
+            Gatekeeper assessment, and checksum verification before the
+            download appears on the website.
+          </p>
+          <ul class="security-signals">
+            <li>
+              <strong>Open source</strong>
+              <span>Review the app and its release tooling in the <a href="https://github.com/adamallcock/tibotattle" target="_blank" rel="noreferrer">public repository</a>.</span>
+            </li>
+            <li>
+              <strong>Clean tagged build</strong>
+              <span>The release tooling refuses a signed release from a dirty checkout or a commit that does not match its exact release tag.</span>
+            </li>
+            <li>
+              <strong>Developer ID signed and Apple notarized</strong>
+              <span>macOS can verify the publisher, hardened signature, notarization ticket, and Gatekeeper result.</span>
+            </li>
+            <li>
+              <strong>Exact bytes published</strong>
+              <span>The download page and Homebrew pin the release DMG to its SHA-256 checksum.</span>
+            </li>
+          </ul>
+
+          <section class="verification-guide" aria-labelledby="verify-download-title">
+            <h3 id="verify-download-title">Verify your download</h3>
+            <p>
+              Compare the first command's output with the SHA-256 shown beside
+              the Download button. Replace <code>/path/to/TiboTattle.dmg</code>
+              with the DMG you downloaded.
+            </p>
+            <ol class="verification-steps">
+              <li>
+                <span>Check the downloaded bytes.</span>
+                <code class="verification-command">shasum -a 256 "/path/to/TiboTattle.dmg"</code>
+              </li>
+              <li>
+                <span>Ask Gatekeeper to assess the DMG before opening it.</span>
+                <code class="verification-command">spctl --assess --type open --context context:primary-signature --verbose=4 "/path/to/TiboTattle.dmg"</code>
+              </li>
+              <li>
+                <span>Ask Gatekeeper to assess the installed app.</span>
+                <code class="verification-command">spctl --assess --type execute --verbose=4 /Applications/TiboTattle.app</code>
+              </li>
+              <li>
+                <span>Inspect and verify the complete app signature.</span>
+                <code class="verification-command">codesign -dv --verbose=4 /Applications/TiboTattle.app
+codesign --verify --deep --strict --verbose=2 /Applications/TiboTattle.app</code>
+              </li>
+            </ol>
+          </section>
+
+          <aside class="verification-boundary">
+            <h3>What these checks establish</h3>
+            <p>
+              The checksum confirms that your copy matches the published DMG.
+              The Apple checks confirm its Developer ID signature and
+              notarization. TiboTattle's release gate separately requires a
+              clean, exactly tagged source checkout.
+            </p>
+            <p>
+              A public cryptographic source-to-binary build attestation is the
+              remaining supply-chain hardening step. It will be added to this
+              guide when the release pipeline publishes one.
+            </p>
+          </aside>
+        </article>
         <article class="resource-card" id="start">
           <h2>Start on your Mac</h2>
           <p>
