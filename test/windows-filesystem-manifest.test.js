@@ -85,6 +85,11 @@ test("binding manifest is deterministic, content-free, and policy-disabled", () 
       credentialMutexSafe: true,
       credentialAuditFileGuardSafe: true,
     },
+    bindingProvenance: {
+      contractVersion: "windows-binding-provenance-v1",
+      status: "unqualified",
+      source: "unsigned-development-binding",
+    },
   });
   assert.equal(Object.keys(manifest).some((key) => /path|account|secret|content/iu.test(key)), false);
 });

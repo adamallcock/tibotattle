@@ -92,7 +92,15 @@ constexpr ULONG kFileOpenReparsePoint = 0x00200000;
 constexpr ULONG kFileSynchronousIoNonalert = 0x00000020;
 constexpr ULONG kFileDirectoryFile = 0x00000001;
 constexpr ULONG kFileNonDirectoryFile = 0x00000040;
+// FileRenameInformation is the legacy rename operation.  It has no
+// conditional/handle-preserving replacement mode, so replacement uses the
+// FileRenameInformationEx class available starting with Windows 10 1709.
 constexpr ULONG kFileRenameInformation = 10;
+constexpr ULONG kFileRenameInformationEx = 65;
+constexpr ULONG kFileRenameReplaceIfExists = 0x00000001;
+constexpr ULONG kFileRenamePosixSemantics = 0x00000002;
+static_assert(kFileRenameInformation == 10, "legacy rename class value");
+static_assert(kFileRenameInformationEx == 65, "extended rename class value");
 constexpr ULONG kFileOpen = 1;
 constexpr ULONG kFileCreate = 2;
 constexpr ULONG_PTR kFileOpened = 1;
@@ -1251,8 +1259,8 @@ bool WriteAndFlushHandle(
   return true;
 }
 
-struct NativeFileRenameInformation {
-  BOOLEAN replaceIfExists;
+struct NativeFileRenameInformationEx {
+  ULONG flags;
   HANDLE rootDirectory;
   ULONG fileNameLength;
   WCHAR fileName[1];
@@ -1274,10 +1282,10 @@ bool RenameHandleRelative(
     return false;
   }
   const std::size_t bytes = target.size() * sizeof(wchar_t);
-  const std::size_t headerBytes = offsetof(NativeFileRenameInformation, fileName);
+  const std::size_t headerBytes = offsetof(NativeFileRenameInformationEx, fileName);
   std::vector<BYTE> buffer(headerBytes + bytes, 0);
-  auto* information = reinterpret_cast<NativeFileRenameInformation*>(buffer.data());
-  information->replaceIfExists = TRUE;
+  auto* information = reinterpret_cast<NativeFileRenameInformationEx*>(buffer.data());
+  information->flags = kFileRenameReplaceIfExists | kFileRenamePosixSemantics;
   information->rootDirectory = parent;
   information->fileNameLength = static_cast<ULONG>(bytes);
   std::memcpy(information->fileName, target.data(), bytes);
@@ -1287,7 +1295,7 @@ bool RenameHandleRelative(
       &ioStatus,
       information,
       static_cast<ULONG>(buffer.size()),
-      kFileRenameInformation);
+      kFileRenameInformationEx);
   if (status < 0) {
     SetLastError(NativeStatusToWin32(status));
     *failure = FromLastError();
@@ -1337,7 +1345,16 @@ napi_value ReplaceFileCallback(napi_env env, napi_callback_info info) {
   targetOptions.finalDirectoryKnown = true;
   targetOptions.finalDirectory = false;
   targetOptions.access = DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
-  targetOptions.shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+  // Keep the identity-bound destination handle open with write/delete sharing
+  // disabled.  A later same-user open capable of changing or removing the
+  // destination then fails the Windows sharing check before the rename call.
+  targetOptions.shareMode = FILE_SHARE_READ;
+  // Keep every renameable ancestor from the state root through the
+  // destination parent open without FILE_SHARE_DELETE for the complete
+  // replacement transaction.  The drive root is opened separately as the OS
+  // trust anchor and is intentionally not included in this count.
+  targetOptions.protectedAncestorDepth = parsed.components.size() - 1;
+  targetOptions.protectedAncestorShareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
   targetOptions.disposition = kFileOpen;
   bool finalMissing = false;
   if (!OpenRelativePath(parsed, targetOptions, &opened, &finalMissing, &failure)
@@ -1395,38 +1412,12 @@ napi_value ReplaceFileCallback(napi_env env, napi_callback_info info) {
     success = false;
   }
   if (success) {
-    // Re-open the destination relative to the still-held parent immediately
-    // before rename.  This closes ordinary application races; a hostile
-    // same-user process can still swap the name in the final syscall window,
-    // which is why this binding remains productionSafe=false.
-    HANDLE check = INVALID_HANDLE_VALUE;
-    ULONG_PTR checkInformation = 0;
-    if (!OpenRelativeComponent(
-            parent,
-            parsed.components.back(),
-            DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            kFileOpen,
-            kFileNonDirectoryFile,
-            nullptr,
-            &check,
-            &checkInformation,
-            &failure)) {
-      success = false;
-    } else {
-      HandleIdentity checkIdentity;
-      success = ValidateSecurity(check, false, &failure, &checkIdentity)
-          && EqualIdentity(checkIdentity, expected);
-      if (!success && failure.code == OperationFailed().code) failure = IdentityMismatch();
-      CloseHandle(check);
-    }
-  }
-  if (success) {
     // Legacy FileRenameInformation rejects replacement while the destination
-    // has an open handle, even when that handle shares delete access. Keep the
-    // identity-bound handles through the final check, then close both before
-    // rename. The residual same-user swap window is why productionSafe=false.
-    opened.closeFinal();
+    // handle is open.  FileRenameInformationEx with FILE_RENAME_POSIX_SEMANTICS
+    // permits the replacement while that handle is open.  The old close path
+    // (`opened.closeFinal()`) would recreate the identity-check/rename race;
+    // this handle-bound operation prevents a same-user rename/delete between
+    // the identity check and the final kernel operation.
     success = RenameHandleRelative(replacement, parent, parsed.components.back(), &failure);
     renamed = success;
   }

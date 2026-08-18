@@ -62,15 +62,29 @@ step fails.
   identity and security, and marks that exact handle for deletion.
 - `replaceFile(path, expectedIdentity, bytes)` creates a protected temporary
   file in the already-open parent directory, flushes and validates it, and
-  atomically renames it over the target with `NtSetInformationFile` using the
-  parent handle as `RootDirectory`. It reopens the destination and verifies
-  the replacement handle identity, canonical final path, and bytes before
-  returning. Expected paths are normalized through `GetLongPathNameW`, so a
-  valid 8.3 short-name spelling can be compared with the normalized handle
-  path. The operation
-  protects ordinary application races; a same-user process can still swap the
-  destination name in the final kernel operation, so callers must retain the
-  production gate until a stronger conditional-replacement proof is accepted.
+  replaces the target with `NtSetInformationFile` using the parent handle as
+  `RootDirectory`. The expected destination handle is held with write/delete
+  sharing disabled from identity validation through the rename, and every
+  renameable ancestor from the state root through that parent is held without
+  delete sharing for the same transaction. The binding
+  uses the Windows 10 1709+ `FileRenameInformationEx` class with
+  `FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS`, which permits
+  replacement while that identity-bound handle remains open; a same-user
+  rename/delete of the held destination or ancestors therefore fails the
+  sharing check instead of racing the identity check. Existing hard-link
+  aliases are rejected by the link-count validation, and the replacement is
+  created and revalidated as a single-link object. This is an OS sharing and
+  identity boundary, not a claim that a pre-existing privileged handle or
+  every filesystem-specific hard-link operation is impossible; the native
+  production flags remain false until the supported Windows/filesystem matrix
+  proves that race explicitly. Unsupported OS/filesystem combinations fail
+  closed. It reopens the destination and verifies the replacement handle
+  identity, canonical final path, and bytes before returning. Expected paths are
+  normalized through `GetLongPathNameW`, so a valid 8.3 short-name spelling can
+  be compared with the normalized handle path. The binding still advertises
+  `productionSafe: false` until native Windows qualification proves the exact
+  OS/filesystem matrix and the remaining replacement and binding-integrity
+  gates.
 - `acquireCredentialMutex(capabilityId)` accepts only one of four fixed numeric
   capability IDs, derives a per-user `Local\` kernel-object name from the
   current SID, applies and revalidates a protected owner-only DACL, and performs
