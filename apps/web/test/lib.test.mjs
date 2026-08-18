@@ -4624,6 +4624,42 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.doesNotMatch(loadBody, /demoDashboard/);
 });
 
+test("native dashboard readiness follows both first-render outcomes", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const markerStart = appSource.indexOf("function markLocalDashboardReady() {");
+  const markerEnd = appSource.indexOf(
+    "\n}\n\nasync function loadLocalDashboard",
+    markerStart,
+  );
+  const loadStart = appSource.indexOf("async function loadLocalDashboard() {");
+  const loadEnd = appSource.indexOf(
+    "\n}\n\n// The \"preparation identity\"",
+    loadStart,
+  );
+  assert.ok(markerStart >= 0 && markerEnd > markerStart, "readiness marker is present");
+  assert.ok(loadStart >= 0 && loadEnd > loadStart, "dashboard loader is present");
+
+  const marker = appSource.slice(markerStart, markerEnd);
+  const loader = appSource.slice(loadStart, loadEnd);
+  assert.match(
+    marker,
+    /document\.documentElement\.dataset\.localDashboardReady = "true";/u,
+  );
+  assert.doesNotMatch(marker, /querySelector\('#main'\)|innerText/u);
+
+  const successRender = loader.indexOf("renderDashboard(data);");
+  const successMarker = loader.indexOf("markLocalDashboardReady();", successRender);
+  const unavailableRender = loader.indexOf("renderDashboardUnavailableState(");
+  const unavailableMarker = loader.indexOf("markLocalDashboardReady();", unavailableRender);
+  assert.ok(successRender >= 0 && successMarker > successRender);
+  assert.ok(unavailableRender >= 0 && unavailableMarker > unavailableRender);
+  assert.equal(
+    (loader.match(/markLocalDashboardReady\(\)/gu) ?? []).length,
+    2,
+    "the first available or unavailable render marks readiness exactly once",
+  );
+});
+
 test("first run is a truthful install and local preflight journey", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
