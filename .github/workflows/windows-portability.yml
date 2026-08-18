@@ -129,7 +129,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $buildLog = Join-Path $env:RUNNER_TEMP 'windows-filesystem-build.log'
+          $productionBuildLog = Join-Path $env:RUNNER_TEMP 'windows-filesystem-production-build.log'
+          $qualificationBuildLog = Join-Path $env:RUNNER_TEMP 'windows-filesystem-qualification-build.log'
           $npmCommand = (Get-Command npm.cmd).Source
           $nodeRoot = Split-Path $npmCommand -Parent
           $nodeGypScript = Join-Path $nodeRoot 'node_modules\npm\node_modules\node-gyp\bin\node-gyp.js'
@@ -137,16 +138,49 @@ jobs:
             Write-Error 'WINDOWS_FILESYSTEM_BINDING_BUILDER_UNAVAILABLE'
             exit 1
           }
-          node $nodeGypScript rebuild --directory native/windows-filesystem *> $buildLog
+          # The ordinary build has an explicit default of zero in binding.gyp;
+          # it must emit only the production target. The qualification target
+          # is compiled in a second, explicit pass with test hooks enabled.
+          node $nodeGypScript rebuild --directory native/windows-filesystem *> $productionBuildLog
           if ($LASTEXITCODE -ne 0) {
             # This hosted build runs before credentials or user state are
             # created. A bounded compiler tail is therefore safe and necessary
             # to diagnose native source failures without dumping later test
             # output, paths, SIDs, or credential-shaped values.
-            Get-Content -LiteralPath $buildLog -Tail 200
-            Write-Error 'WINDOWS_FILESYSTEM_BINDING_BUILD_FAILED'
+            Get-Content -LiteralPath $productionBuildLog -Tail 200
+            Write-Error 'WINDOWS_FILESYSTEM_PRODUCTION_BUILD_FAILED'
             exit 1
           }
+          $qualificationBindingPath = Join-Path $env:GITHUB_WORKSPACE 'native/windows-filesystem/build/Release/windows_filesystem_qualification.node'
+          if (Test-Path -LiteralPath $qualificationBindingPath -PathType Leaf) {
+            Write-Error 'WINDOWS_FILESYSTEM_PRODUCTION_BUILD_EMITTED_QUALIFICATION'
+            exit 1
+          }
+          node $nodeGypScript rebuild --directory native/windows-filesystem -- -Dtibotattle_build_qualification=1 *> $qualificationBuildLog
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content -LiteralPath $qualificationBuildLog -Tail 200
+            Write-Error 'WINDOWS_FILESYSTEM_QUALIFICATION_BUILD_FAILED'
+            exit 1
+          }
+          if (-not (Test-Path -LiteralPath $qualificationBindingPath -PathType Leaf)) {
+            Write-Error 'WINDOWS_FILESYSTEM_QUALIFICATION_BUILD_OUTPUT_MISSING'
+            exit 1
+          }
+          $qualificationDestination = Join-Path $env:RUNNER_TEMP 'windows_filesystem_qualification.node'
+          if (Test-Path -LiteralPath $qualificationDestination -PathType Leaf) {
+            Write-Error 'WINDOWS_FILESYSTEM_QUALIFICATION_DESTINATION_EXISTS'
+            exit 1
+          }
+          Move-Item -LiteralPath $qualificationBindingPath -Destination $qualificationDestination
+          if (Test-Path -LiteralPath $qualificationBindingPath -PathType Leaf) {
+            Write-Error 'WINDOWS_FILESYSTEM_PRODUCTION_BUILD_EMITTED_QUALIFICATION'
+            exit 1
+          }
+          if (-not (Test-Path -LiteralPath $qualificationDestination -PathType Leaf)) {
+            Write-Error 'WINDOWS_FILESYSTEM_QUALIFICATION_BINDING_MOVE_FAILED'
+            exit 1
+          }
+          "TIBOTATTLE_WINDOWS_QUALIFICATION_BINDING_PATH=$qualificationDestination" >> $env:GITHUB_ENV
 
       - name: Build the binding integrity manifest
         shell: pwsh
