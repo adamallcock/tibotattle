@@ -8,6 +8,7 @@ import {
   createExportIdentityKeychainBackend,
 } from "./export-identity-keychain.js";
 import {
+  assertWindowsFilesystemProductionSafe,
   assertWindowsProductionReadiness,
   createWindowsProductionCapabilityBackend,
 } from "./platform/index.js";
@@ -27,6 +28,7 @@ export function selectProductionAccountObservationSecret({
   developmentSecret = null,
   windowsReadiness = null,
   createWindowsBackend = null,
+  windowsFilesystemAdapter = null,
 } = {}) {
   if (developmentSecret !== null) {
     return Object.freeze({
@@ -35,11 +37,11 @@ export function selectProductionAccountObservationSecret({
     });
   }
   if (platform === "win32") {
-    if (architecture !== "x64"
-        || typeof createWindowsBackend !== "function") {
+    if (architecture !== "x64" || typeof createWindowsBackend !== "function") {
       fail("ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_UNAVAILABLE");
     }
     try {
+      assertWindowsFilesystemProductionSafe(windowsFilesystemAdapter);
       assertWindowsProductionReadiness({
         platform,
         architecture,
@@ -57,6 +59,7 @@ export function selectProductionAccountObservationSecret({
           backend,
           capability: keychainCapability,
           operationLockFile,
+          windowsFilesystemAdapter,
         }),
       });
     } catch {
