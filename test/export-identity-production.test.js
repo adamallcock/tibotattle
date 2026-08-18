@@ -45,6 +45,24 @@ test("macOS arm64 production selection constructs only the audited injected Keyc
   assert.equal(Object.hasOwn(selected.identityOptions, "legacySecretFile"), false);
 });
 
+test("Windows x64 export-identity production selection remains fail closed", () => {
+  let constructions = 0;
+  assert.throws(
+    () => selectProductionParticipantIdentity({
+      environmentSecret: null,
+      explicitSecretFile: null,
+      platform: "win32",
+      architecture: "x64",
+      createKeychainBackend() {
+        constructions += 1;
+        return fakeBackend();
+      },
+    }),
+    (error) => error.code === "EXPORT_IDENTITY_PRODUCTION_BACKEND_UNAVAILABLE",
+  );
+  assert.equal(constructions, 0);
+});
+
 test("explicit file and environment development overrides never construct or mix with Keychain", () => {
   let constructions = 0;
   const createKeychainBackend = () => {
@@ -206,9 +224,14 @@ test("CLI rotation preflight and confirmation use injected selection without dis
 
 test("CLI state renderers expose only closed source and backend vocabularies", () => {
   assert.equal(renderParticipantIdentityBackendMode("macos_keychain"), "macos_keychain");
+  assert.equal(renderParticipantIdentityBackendMode("windows_credential_manager"), "windows_credential_manager");
   assert.equal(renderParticipantIdentityBackendMode("PRIVATE"), "invalid");
   assert.equal(renderParticipantIdentitySourceState({ source: "environment" }), "external_override");
   assert.equal(renderParticipantIdentitySourceState({ source: "secret_backend" }), "keychain");
+  assert.equal(renderParticipantIdentitySourceState({
+    source: "secret_backend",
+    backend: { backend: "windows_credential_manager" },
+  }), "keychain");
   assert.equal(renderParticipantIdentitySourceState({ status: "PRIVATE" }), "invalid");
   assert.equal(renderParticipantIdentityFileResidueState("retired_removed"), "absent");
   assert.equal(renderParticipantIdentityFileResidueState("retired_retained"), "retained");

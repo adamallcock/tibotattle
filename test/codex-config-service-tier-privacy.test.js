@@ -171,7 +171,10 @@ test("service_tier declared only inside a table - of either header shape - is no
 // pointing at an otherwise perfectly valid config - is refused.
 // ---------------------------------------------------------------------------
 
-test("reading through a symlink is refused (O_NOFOLLOW), while the real file works", async () => {
+test("reading through a symlink is refused (O_NOFOLLOW), while the real file works", async (t) => {
+  if (process.platform === "win32") {
+    return t.skip("Windows reparse-point refusal is deferred to the ACL filesystem milestone");
+  }
   const root = await tempRoot();
   try {
     const realFile = join(root, "real-config.toml");

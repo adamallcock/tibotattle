@@ -1,0 +1,7 @@
+.git
+.release-build
+.release-deps
+.usage-monitor
+node_modules
+**/node_modules
+*.log

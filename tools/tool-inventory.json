@@ -766,6 +766,7 @@
       "stableAlias": "test:preflight",
       "stableAliasReason": null,
       "additionalAliases": [
+        "test:portable",
         "test:fast",
         "test:changed",
         "test:changed:full",
@@ -775,6 +776,7 @@
       ],
       "callers": [
         "package.json#scripts.test:preflight",
+        "package.json#scripts.test:portable",
         "package.json#scripts.test:fast",
         "package.json#scripts.test:changed",
         "package.json#scripts.test:changed:full",
@@ -787,6 +789,25 @@
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
       "provenanceReason": "Test lane selection is shared repository test infrastructure rather than a standalone dated research artifact.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "export_test_infrastructure",
+      "canonicalPath": "scripts/portable-test-manifest.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Manifest is executable-adjacent data imported by the portable test lane, not a standalone command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/test-lanes.mjs",
+        "test/test-lanes.test.js",
+        "test/windows-skip-ledger.test.js",
+        "test/windows-test-manifest.test.js",
+        "docs/runbooks/2026-08-17-windows-portability-environments.md"
+      ],
+      "decision": "retain_as_internal_test_support",
+      "provenance": "docs/goals/2026-08-17-four-day-windows-readiness-goal.md",
+      "provenanceReason": null,
       "legacyPaths": []
     },
     {
@@ -877,6 +898,38 @@
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
       "provenanceReason": "Preview remote verification is a test-covered macOS release operation with runbook guidance but no separate dated provenance artifact.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "export_test_infrastructure",
+      "canonicalPath": "scripts/build-windows-filesystem-manifest.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The content-free native Windows binding manifest is built only by the manually dispatched pinned workflow.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/windows-portability.yml",
+        "test/windows-filesystem-manifest.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-17-windows-security-credentials-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "export_test_infrastructure",
+      "canonicalPath": "scripts/windows-security-qualification.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The content-free native Windows qualification is invoked only by the manually dispatched pinned workflow.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/windows-portability.yml",
+        "test/windows-qualification-governance.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-17-windows-security-credentials-goal.md",
+      "provenanceReason": null,
       "legacyPaths": []
     },
     {

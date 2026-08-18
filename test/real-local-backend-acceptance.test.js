@@ -12,8 +12,11 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test from "node:test";
+import {
+  prepareLatestHourLocalContribution,
+} from "../src/local-contribution-preparation.js";
 import {
   REAL_LOCAL_BACKEND_ACCEPTANCE_CONFIRMATION,
   RealLocalBackendAcceptanceError,
@@ -164,6 +167,26 @@ function labReceipt(recordCount) {
   };
 }
 
+function syntheticPreparationDependencies() {
+  return {
+    // This test owns the acceptance orchestration boundary, so use a
+    // deterministic in-memory lease on every host. Dedicated identity suites
+    // qualify the platform file and credential implementations separately.
+    prepareContribution: (options) => prepareLatestHourLocalContribution({
+      ...options,
+      selectIdentity: () => ({ identityOptions: Object.freeze({}) }),
+      withIdentityLease: async (_identityOptions, callback) => {
+        const secret = Buffer.alloc(32, 7);
+        try {
+          return await callback(Object.freeze({ secret }));
+        } finally {
+          secret.fill(0);
+        }
+      },
+    }),
+  };
+}
+
 test("argument gate rejects missing confirmation and non-bounded periods", async () => {
   const files = await localFixture();
   try {
@@ -203,18 +226,17 @@ test("synthetic local logs bind preparation to backend evidence without Keychain
       argumentsFor(files),
     );
     const receipt = await runRealLocalBackendAcceptance(options, {
+      ...syntheticPreparationDependencies(),
       uuid: () => PREPARATION_ID,
       clock: () => "2026-07-27T02:05:00.000Z",
       async runBackendLab({ contributionFile, stateDirectory, port }) {
         backendCalls += 1;
         assert.equal(port, 8793);
         assert.equal(
-          contributionFile.endsWith(
-            "/telemetry-contribution-000001.json",
-          ),
-          true,
+          basename(contributionFile),
+          "telemetry-contribution-000001.json",
         );
-        assert.equal(stateDirectory.endsWith("/backend-lab"), true);
+        assert.equal(basename(stateDirectory), "backend-lab");
         const contribution = JSON.parse(await readFile(
           contributionFile,
           "utf8",
@@ -345,6 +367,7 @@ test("failed recoverable cleanup retains the workspace and publishes no receipt"
       runRealLocalBackendAcceptance(
         parseRealLocalBackendAcceptanceArguments(argumentsFor(files)),
         {
+          ...syntheticPreparationDependencies(),
           uuid: () => PREPARATION_ID,
           async runBackendLab({ contributionFile }) {
             const contribution = JSON.parse(await readFile(

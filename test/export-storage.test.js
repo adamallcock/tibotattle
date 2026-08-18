@@ -21,7 +21,9 @@ test("single-file durable publication preserves text and binary bytes without cl
     assert.deepEqual(await readFile(binaryFile), Buffer.from([0x00, 0xff, 0x41]));
     for (const path of [textFile, binaryFile]) {
       const stats = await stat(path);
-      assert.equal(stats.mode & 0o777, 0o600);
+      if (process.platform !== "win32") {
+        assert.equal(stats.mode & 0o777, 0o600);
+      }
       assert.equal(stats.nlink, 1);
     }
     await assert.rejects(
@@ -64,10 +66,12 @@ test("single-file durable publication rejects oversize content before copy and u
       writeOwnerOnlyNoClobberDurable(join(safe, "unsupported"), { private: "value" }),
       /string, Buffer, or Uint8Array/,
     );
-    await assert.rejects(
-      writeOwnerOnlyNoClobberDurable(join(unsafe, "file"), "value"),
-      /group- or world-writable/,
-    );
+    if (process.platform !== "win32") {
+      await assert.rejects(
+        writeOwnerOnlyNoClobberDurable(join(unsafe, "file"), "value"),
+        /group- or world-writable/,
+      );
+    }
     await assert.rejects(
       writeOwnerOnlyNoClobberDurable(join(alias, "file"), "value"),
       /real directory/,
@@ -165,8 +169,10 @@ test("paired exports publish receipt then bundle without overwrite", async () =>
     });
     assert.equal(await readFile(bundle, "utf8"), "bundle");
     assert.equal(await readFile(receipt, "utf8"), "receipt");
-    assert.equal((await stat(bundle)).mode & 0o777, 0o600);
-    assert.equal((await stat(receipt)).mode & 0o777, 0o600);
+    if (process.platform !== "win32") {
+      assert.equal((await stat(bundle)).mode & 0o777, 0o600);
+      assert.equal((await stat(receipt)).mode & 0o777, 0o600);
+    }
     assert.equal((await stat(bundle)).nlink, 1);
     assert.equal((await stat(receipt)).nlink, 1);
     assert.deepEqual((await readdir(directory)).sort(), ["review.privacy-receipt.json", "review.umx.json"]);
@@ -191,8 +197,10 @@ test("paired exports preserve Buffer and Uint8Array bytes exactly", async () => 
     });
     assert.deepEqual(await readFile(bundle), bundleBytes);
     assert.deepEqual(await readFile(receipt), Buffer.from([0xfe, 0x00, 0x42]));
-    assert.equal((await stat(bundle)).mode & 0o777, 0o600);
-    assert.equal((await stat(receipt)).mode & 0o777, 0o600);
+    if (process.platform !== "win32") {
+      assert.equal((await stat(bundle)).mode & 0o777, 0o600);
+      assert.equal((await stat(receipt)).mode & 0o777, 0o600);
+    }
     assert.equal((await stat(bundle)).nlink, 1);
     assert.equal((await stat(receipt)).nlink, 1);
   } finally {

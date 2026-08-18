@@ -40,6 +40,7 @@ function assertBackend(backend, capability) {
 
 function copySecret(value) {
   if (!Buffer.isBuffer(value) || value.byteLength !== SECRET_BYTES) {
+    if (Buffer.isBuffer(value)) value.fill(0);
     fail("account_observation_credential_unavailable");
   }
   return Buffer.from(value);
@@ -56,6 +57,7 @@ async function invokeBackend(backend, method, ...args) {
       // Hostile backend errors are collapsed below.
     }
     fail(code === "export_identity_keychain_locked"
+      || code === "windows_credential_manager_locked"
       ? "account_observation_credential_locked"
       : "account_observation_credential_unavailable");
   }
@@ -105,6 +107,10 @@ async function assertLockDirectory(directoryState) {
 
 async function syncLockDirectory(directoryState) {
   await assertLockDirectory(directoryState);
+  // Windows cannot open a directory for fsync. The lock file itself is
+  // flushed before this point; the unavailable directory-entry barrier is a
+  // POSIX-only durability primitive.
+  if (process.platform === "win32") return;
   let handle;
   try {
     handle = await open(directoryState.directory, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0));
@@ -352,6 +358,7 @@ export function createAccountObservationSecretLoader({
       operationHook,
     });
     let generated = null;
+    let generatedValue = null;
     let persisted = null;
     try {
       const existing = await invokeBackend(backend, "read", capability);
@@ -361,7 +368,7 @@ export function createAccountObservationSecretLoader({
         return result;
       }
 
-      const generatedValue = generateSecret();
+      generatedValue = generateSecret();
       generated = copySecret(generatedValue);
       if (Buffer.isBuffer(generatedValue)) generatedValue.fill(0);
       const outcome = await invokeBackend(backend, "createIfMissing", capability, generated);
@@ -377,6 +384,7 @@ export function createAccountObservationSecretLoader({
       }
       return result;
     } finally {
+      if (Buffer.isBuffer(generatedValue)) generatedValue.fill(0);
       generated?.fill(0);
       if (Buffer.isBuffer(persisted)) persisted.fill(0);
       await releaseOperationLease(operationLockFile, lease);

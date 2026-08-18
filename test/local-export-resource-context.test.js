@@ -12,13 +12,25 @@ import * as platform from "../src/platform/index.js";
 const PLATFORM_PUBLIC_EXPORTS = Object.freeze([
   "CODEX_CONFIG_RETAINED_KEYS",
   "CODEX_CONFIG_SERVICE_TIER_STATUSES",
+  "CONTRIBUTION_DEVICE_READER_CODE_IDENTIFIER",
+  "CONTRIBUTION_DEVICE_READER_TEAM_IDENTIFIER",
   "ClaudeCallbackLifecycleError",
   "EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES",
   "ExportIdentityKeychainError",
   "KEYTAR_DARWIN_ARM64_SHA256",
   "KEYTAR_SIGNING_CODE_IDENTIFIER",
   "KEYTAR_SIGNING_TEAM_IDENTIFIER",
+  "WINDOWS_BINDING_PROVENANCE_CONTRACT_VERSION",
+  "WINDOWS_PRODUCTION_READINESS",
+  "WINDOWS_PRODUCTION_READINESS_CONTRACT_VERSION",
+  "WINDOWS_PRODUCTION_READINESS_FACTS",
+  "WindowsProductionReadinessError",
   "assertOwnerControlledDirectory",
+  "assertWindowsProductionBackend",
+  "assertWindowsProductionReadiness",
+  "contributionDeviceDurableAddArguments",
+  "contributionDeviceReaderRequirement",
+  "contributionDeviceReaderRequirementVerificationArguments",
   "createClaudeCallbackLifecycleContext",
   "createExportIdentityKeychainBackend",
   "createExportSetVerificationStorageContext",
@@ -33,6 +45,8 @@ const PLATFORM_PUBLIC_EXPORTS = Object.freeze([
   "createOwnerOnlyExportWorkspaceDiscardStorage",
   "createOwnerOnlyExportWorkspaceLeaseContext",
   "createOwnerOnlyExportWorkspaceStorageContext",
+  "createWindowsProductionCapabilityBackend",
+  "createWindowsProductionReadinessAttestation",
   "defaultActivityMarkerFile",
   "defaultExportSecretFile",
   "defaultExportStateDirectory",
@@ -79,6 +93,13 @@ const PLATFORM_PUBLIC_EXPORTS = Object.freeze([
 
 test("platform adapters expose one exact reviewed public API", () => {
   assert.deepEqual(Object.keys(platform).sort(), [...PLATFORM_PUBLIC_EXPORTS]);
+  for (const privateWindowsAdapter of [
+    "createWindowsCredentialManagerBackend",
+    "createWindowsFilesystemAdapter",
+    "loadWindowsFilesystemBinding",
+  ]) {
+    assert.equal(Object.hasOwn(platform, privateWindowsAdapter), false);
+  }
 });
 
 test("local export resource context injects runtime ports and fixed marker limits", async () => {

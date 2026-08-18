@@ -21,6 +21,8 @@ signing, artifacts, an appcast, or updater infrastructure is operational.
 | [`runbooks/2026-08-02-r2-sparkle-update-publisher.md`](./runbooks/2026-08-02-r2-sparkle-update-publisher.md) | Local Sparkle/R2 publication contract; remote feed readiness still requires owner evidence |
 | [`runbooks/2026-08-04-open-enrollment-controlled-release.md`](./runbooks/2026-08-04-open-enrollment-controlled-release.md) | Account-gated contribution release path; external authorization remains an owner action |
 | [`decisions/2026-08-15-homebrew-distribution-and-macos-support.md`](./decisions/2026-08-15-homebrew-distribution-and-macos-support.md) | First-party Homebrew tap, update automation, uninstall boundary, and supported macOS floor |
+| [`goals/2026-08-17-four-day-windows-readiness-goal.md`](./goals/2026-08-17-four-day-windows-readiness-goal.md) | Bounded portable-core qualification for issue #3; explicitly not Windows support |
+| [`runbooks/2026-08-17-windows-portability-environments.md`](./runbooks/2026-08-17-windows-portability-environments.md) | Restore macOS, network-isolated Linux, native Windows x64, and optional UTM development lanes |
 
 Documents not listed above remain records, evidence, or supporting context
 rather than current operational authority. Treat receipts, audits, reports,

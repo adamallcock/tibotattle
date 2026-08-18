@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmod, link, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -103,7 +103,15 @@ test("export identity uses stable platform application-state paths", () => {
   );
   assert.equal(
     defaultExportSecretFile({ platform: "win32", homeDirectory: "C:\\Users\\example", environment: { LOCALAPPDATA: "C:\\Local" } }),
-    "C:\\Local/app-usagemonitor/export-participant-secret",
+    "C:\\Local\\app-usagemonitor\\export-participant-secret",
+  );
+  assert.equal(
+    defaultExportStateDirectory({
+      platform: "win32",
+      homeDirectory: "D:\\Profiles\\Ada Lovelace-测试",
+      environment: {},
+    }),
+    "D:\\Profiles\\Ada Lovelace-测试\\AppData\\Local\\app-usagemonitor",
   );
 });
 
@@ -790,6 +798,40 @@ test("backend rotation uses exact replacement/readback and shares the publicatio
   }
 });
 
+test("participant identity leases fail when their lock is removed or replaced", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "app-usagemonitor-lock-loss-"));
+  const canonical = join(directory, "state", "secret");
+  const backend = memoryParticipantSecretBackend(Buffer.alloc(32, 94));
+  const options = {
+    environmentSecret: null,
+    secretFile: canonical,
+    legacySecretFile: null,
+    participantSecretBackend: backend,
+    participantSecretCapability: TEST_BACKEND_CAPABILITY,
+  };
+  try {
+    await assert.rejects(
+      withParticipantSecretLease(options, async () => {
+        await unlink(`${canonical}.rotation-lock`);
+        return "must-not-succeed";
+      }),
+      (error) => error.code === "EXPORT_IDENTITY_ROTATION_LOCK_LOST",
+    );
+
+    await assert.rejects(
+      withParticipantSecretLease(options, async () => {
+        const lockPath = `${canonical}.rotation-lock`;
+        await unlink(lockPath);
+        await writeFile(lockPath, "replacement\n", { mode: 0o600 });
+        return "must-not-succeed";
+      }),
+      (error) => error.code === "EXPORT_IDENTITY_ROTATION_LOCK_LOST",
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("adversarial backend failures and malformed values fail closed without content disclosure", async () => {
   const directory = await mkdtemp(join(tmpdir(), "app-usagemonitor-backend-adversarial-"));
   const canonical = join(directory, "state", "secret");
@@ -818,8 +860,9 @@ test("adversarial backend failures and malformed values fail closed without cont
       },
     );
 
+    const malformedSecret = Buffer.alloc(31, 93);
     const malformed = memoryParticipantSecretBackend(null, {
-      async read() { return new Uint8Array(32); },
+      async read() { return malformedSecret; },
     });
     await assert.rejects(
       inspectParticipantSecret({
@@ -831,6 +874,7 @@ test("adversarial backend failures and malformed values fail closed without cont
       }),
       (error) => error.code === "EXPORT_IDENTITY_BACKEND_INVALID_VALUE",
     );
+    assert.deepEqual(malformedSecret, Buffer.alloc(31));
 
     const hostileDescription = memoryParticipantSecretBackend(null, {
       async describe() {

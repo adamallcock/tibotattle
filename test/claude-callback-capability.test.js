@@ -143,3 +143,16 @@ test("production selector rejects unsupported hosts before creating a backend", 
   }), fixedError("invalid_configuration"));
   assert.equal(called, false);
 });
+
+test("Windows x64 Claude callback production selection remains fail closed", () => {
+  let constructions = 0;
+  assert.throws(() => createProductionClaudeCallbackBackend({
+    platform: "win32",
+    architecture: "x64",
+    createBackend() {
+      constructions += 1;
+      return memoryBackend();
+    },
+  }), fixedError("invalid_configuration"));
+  assert.equal(constructions, 0);
+});

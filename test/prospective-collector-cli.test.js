@@ -38,7 +38,9 @@ test("prospective CLI writes an owner-only deterministic empty evidence artifact
     assert.equal(first.status, 0, first.stderr);
     assert.equal(second.status, 0, second.stderr);
     assert.equal(await readFile(firstOutput, "utf8"), await readFile(secondOutput, "utf8"));
-    assert.equal((await stat(firstOutput)).mode & 0o777, 0o600);
+    if (process.platform !== "win32") {
+      assert.equal((await stat(firstOutput)).mode & 0o777, 0o600);
+    }
     assert.match(first.stdout, /^Built 0 account-partitioned prospective transitions/u);
     assert.equal(first.stdout.includes(input), false);
     assert.equal(first.stdout.includes(firstOutput), false);

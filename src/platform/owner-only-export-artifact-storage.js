@@ -83,7 +83,9 @@ function assertOwnerOnlyFileStats(stats, {
     && (expectedBytes === null || stats.size === expectedBytes)
     && (typeof process.getuid !== "function" || stats.uid === process.getuid())
     && (process.platform === "win32" || (stats.mode & 0o077) === 0)
-    && (exactMode === null || (stats.mode & 0o777) === exactMode);
+    && (exactMode === null
+      || process.platform === "win32"
+      || (stats.mode & 0o777) === exactMode);
   if (!valid) throw new Error(errorMessage ?? `Invalid owner-only export ${label}`);
 }
 

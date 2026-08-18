@@ -595,7 +595,10 @@ export function openLocalUnifiedIndex(indexFile, {
 }
 
 async function syncFile(path) {
-  const handle = await open(path, constants.O_RDONLY);
+  const handle = await open(
+    path,
+    process.platform === "win32" ? constants.O_RDWR : constants.O_RDONLY,
+  );
   try {
     await handle.sync();
   } finally {

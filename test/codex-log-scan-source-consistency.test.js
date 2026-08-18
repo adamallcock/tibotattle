@@ -153,7 +153,10 @@ test("active rollout scan rejects truncation while parsing the frozen prefix", a
   }
 });
 
-test("active rollout scan rejects path replacement while retaining the opened descriptor", async () => {
+test("active rollout scan rejects path replacement while retaining the opened descriptor", async (t) => {
+  if (process.platform === "win32") {
+    return t.skip("Windows replacement semantics require the deferred handle-identity contract");
+  }
   const value = await fixture();
   try {
     const replacement = join(value.codexHome, "replacement.jsonl");

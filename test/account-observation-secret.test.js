@@ -240,9 +240,11 @@ test("account observation stale-lock recovery does not remove a replacement or u
     await assert.rejects(load(), (error) => error.code === "account_observation_credential_locked");
     assert.equal(await readFile(lock, "utf8"), replacement);
 
-    await chmod(lock, 0o644);
-    await assert.rejects(load(), (error) => error.code === "account_observation_credential_unavailable");
-    assert.equal(await readFile(lock, "utf8"), replacement);
+    if (process.platform !== "win32") {
+      await chmod(lock, 0o644);
+      await assert.rejects(load(), (error) => error.code === "account_observation_credential_unavailable");
+      assert.equal(await readFile(lock, "utf8"), replacement);
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -339,6 +341,44 @@ test("backend, malformed, and readback failures collapse to fixed content-free e
   }
 });
 
+test("malformed backend and generated buffers are erased before failure", async () => {
+  const root = await mkdtemp(join(tmpdir(), "app-usagemonitor-account-zeroize-"));
+  const malformedStored = Buffer.alloc(31, 91);
+  const malformedGenerated = Buffer.alloc(31, 92);
+  try {
+    const storedLoader = createAccountObservationSecretLoader({
+      backend: {
+        async read() { return malformedStored; },
+        async createIfMissing() { return "created"; },
+      },
+      capability: ACCOUNT_CAPABILITY,
+      operationLockFile: join(root, "stored.lock"),
+    });
+    await assert.rejects(
+      storedLoader(),
+      (error) => error.code === "account_observation_credential_unavailable",
+    );
+    assert.deepEqual(malformedStored, Buffer.alloc(31));
+
+    const generatedLoader = createAccountObservationSecretLoader({
+      backend: {
+        async read() { return null; },
+        async createIfMissing() { return "created"; },
+      },
+      capability: ACCOUNT_CAPABILITY,
+      operationLockFile: join(root, "generated.lock"),
+      generateSecret: () => malformedGenerated,
+    });
+    await assert.rejects(
+      generatedLoader(),
+      (error) => error.code === "account_observation_credential_unavailable",
+    );
+    assert.deepEqual(malformedGenerated, Buffer.alloc(31));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a locked Keychain backend remains distinct without exposing its native error", async () => {
   const root = await mkdtemp(join(tmpdir(), "app-usagemonitor-account-keychain-locked-"));
   const canary = "DO-NOT-LEAK-native-keychain-lock";
@@ -397,6 +437,22 @@ test("production selection cannot reuse export identity and never reads the lega
     else process.env.APP_USAGEMONITOR_ACCOUNT_HMAC_KEY = prior;
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("Windows x64 account-observation production selection remains fail closed", () => {
+  let constructions = 0;
+  assert.throws(
+    () => selectProductionAccountObservationSecret({
+      platform: "win32",
+      architecture: "x64",
+      createKeychainBackend() {
+        constructions += 1;
+        return memoryBackend(Buffer.alloc(32, 76));
+      },
+    }),
+    (error) => error.code === "ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_UNAVAILABLE",
+  );
+  assert.equal(constructions, 0);
 });
 
 test("development account secret injection is explicit and returns disposable copies", async () => {

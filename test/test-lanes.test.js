@@ -8,6 +8,10 @@ import {
   parseTestLaneArguments,
   selectTestLanes,
 } from "../scripts/test-lanes.mjs";
+import {
+  PORTABLE_TEST_FILES,
+  PORTABLE_TEST_GROUPS,
+} from "../scripts/portable-test-manifest.mjs";
 
 test("lane manifests include every executable macOS test target", () => {
   assert.deepEqual(MACOS_SOURCE_TEST_FILES, [
@@ -23,6 +27,20 @@ test("lane manifests include every executable macOS test target", () => {
   assert.deepEqual(MACOS_SMOKE_TEST_FILES, [
     "test/macos-test-build.test.mjs",
   ]);
+});
+
+test("portable manifest is explicit, unique, and excludes native release gates", () => {
+  assert.equal(PORTABLE_TEST_FILES.length, new Set(PORTABLE_TEST_FILES).size);
+  assert.deepEqual(
+    PORTABLE_TEST_FILES,
+    Object.values(PORTABLE_TEST_GROUPS).flat(),
+  );
+  assert.equal(PORTABLE_TEST_FILES.includes("apps/local/server.test.mjs"), true);
+  assert.equal(PORTABLE_TEST_FILES.includes("apps/web/test/lib.test.mjs"), true);
+  assert.equal(PORTABLE_TEST_FILES.includes("test/accounting-package-parity.test.js"), true);
+  for (const path of PORTABLE_TEST_FILES) {
+    assert.doesNotMatch(path, /(?:^|\/)macos-|sparkle|release-site/u);
+  }
 });
 
 test("test-lane arguments retain explicit paths and reject ambiguous input", () => {
@@ -60,6 +78,7 @@ test("test-lane arguments retain explicit paths and reject ambiguous input", () 
     ["changed", "--path", "/outside.md"],
     ["changed", "--base", ""],
     ["macos-source", "--path", "apps/macos/UsageMonitorApp.swift"],
+    ["portable", "--path", "apps/local/server.js"],
   ]) {
     assert.throws(() => parseTestLaneArguments(argv));
   }

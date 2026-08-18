@@ -2,12 +2,20 @@ import {
   defaultExportSecretFile,
 } from "./export-identity.js";
 import {
+  assertWindowsProductionReadiness,
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
   createExportIdentityKeychainBackend,
+  createWindowsProductionCapabilityBackend,
 } from "./platform/index.js";
 import {
   selectProductionParticipantIdentity as selectParticipantIdentityPolicy,
 } from "./application/index.js";
+
+function failWindowsProductionSelection() {
+  const error = new Error("Production participant identity backend selection failed");
+  error.code = "EXPORT_IDENTITY_PRODUCTION_BACKEND_UNAVAILABLE";
+  throw error;
+}
 
 /**
  * Select the participant identity storage contract without reading or creating
@@ -23,7 +31,46 @@ export function selectProductionParticipantIdentity({
   appStateSecretFile = defaultExportSecretFile(),
   createKeychainBackend = createExportIdentityKeychainBackend,
   keychainCapability = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity,
+  windowsReadiness = null,
+  createWindowsBackend = null,
+  windowsFilesystemAdapter = null,
 } = {}) {
+  // Development overrides retain their existing precedence on every host.
+  // Only the production Windows path is routed through the shared gate.
+  if (platform === "win32" && !environmentSecret && !explicitSecretFile) {
+    if (architecture !== "x64"
+        || typeof createWindowsBackend !== "function"
+        || windowsFilesystemAdapter?.productionSafe !== true
+        || windowsFilesystemAdapter?.pathWalkRaceSafe !== true
+        || keychainCapability !== EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity) {
+      failWindowsProductionSelection();
+    }
+    try {
+      assertWindowsProductionReadiness({
+        platform,
+        architecture,
+        readiness: windowsReadiness,
+      });
+      const windowsBackend = createWindowsBackend({ platform, architecture });
+      const participantSecretBackend = createWindowsProductionCapabilityBackend({
+        backend: windowsBackend,
+        capability: keychainCapability,
+        readiness: windowsReadiness,
+      });
+      return Object.freeze({
+        mode: "windows_credential_manager",
+        identityOptions: Object.freeze({
+          environmentSecret: null,
+          secretFile: appStateSecretFile,
+          participantSecretBackend,
+          participantSecretCapability: keychainCapability,
+          windowsFilesystemAdapter,
+        }),
+      });
+    } catch {
+      failWindowsProductionSelection();
+    }
+  }
   return selectParticipantIdentityPolicy({
     explicitSecretFile,
     environmentSecret,
@@ -39,6 +86,7 @@ export function selectProductionParticipantIdentity({
 
 export function renderParticipantIdentityBackendMode(mode) {
   if (mode === "macos_keychain") return "macos_keychain";
+  if (mode === "windows_credential_manager") return "windows_credential_manager";
   if (mode === "owner_file_override") return "owner_only_file_development_override";
   if (mode === "external_environment_override") return "external_environment_development_override";
   return "invalid";

@@ -177,7 +177,9 @@ test("partial, stale, backward, and incompletely priced evidence fails closed", 
   );
 
   const backward = fixture({ idOffset: 200 });
-  backward.quotaSnapshots[4].usedPercent = 2;
+  // The kernel deliberately tolerates up to 5pp of measured jitter. Exercise
+  // a reset-sized 6pp drop so this refusal assertion remains above that gate.
+  backward.quotaSnapshots[7].usedPercent = 0;
   assert.ok(
     buildResetEvidence(backward).resets[0].refusalCodes.includes(
       "backward_quota_observation",

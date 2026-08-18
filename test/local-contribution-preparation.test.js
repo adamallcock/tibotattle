@@ -180,8 +180,10 @@ test("latest-hour preparation retains a verified review pair and atomically publ
     });
     assert.equal(review.verdict, "passed");
     assert.equal(review.transportReady, false);
-    assert.equal((await stat(bundleFile)).mode & 0o077, 0);
-    assert.equal((await stat(receiptFile)).mode & 0o077, 0);
+    if (process.platform !== "win32") {
+      assert.equal((await stat(bundleFile)).mode & 0o077, 0);
+      assert.equal((await stat(receiptFile)).mode & 0o077, 0);
+    }
 
     const names = await readdir(files.preparedSpoolDirectory);
     assert.deepEqual(names, [`prepared-set-${UUID_ONE}`]);
@@ -209,7 +211,9 @@ test("latest-hour preparation retains a verified review pair and atomically publ
       assert.equal(serializedContribution.includes(forbidden), false);
     }
     assert.equal(contribution.createdAt, COVERAGE.endAt);
-    assert.equal((await lstat(preparedDirectory)).mode & 0o077, 0);
+    if (process.platform !== "win32") {
+      assert.equal((await lstat(preparedDirectory)).mode & 0o077, 0);
+    }
   } finally {
     await rm(files.root, { recursive: true });
   }
@@ -639,12 +643,14 @@ test("coverage, owner-only directories, runner injection, and public errors fail
       recursive: true,
       mode: 0o700,
     });
-    await chmod(files.preparedSpoolDirectory, 0o755);
-    await assert.rejects(
-      runPreparation(files, UUID_ONE),
-      (error) => error instanceof LocalContributionPreparationError
-        && error.code === "prepared_spool_invalid",
-    );
+    if (process.platform !== "win32") {
+      await chmod(files.preparedSpoolDirectory, 0o755);
+      await assert.rejects(
+        runPreparation(files, UUID_ONE),
+        (error) => error instanceof LocalContributionPreparationError
+          && error.code === "prepared_spool_invalid",
+      );
+    }
 
     const hostile = new Error(
       `${files.root} private-session-that-must-not-leak`,

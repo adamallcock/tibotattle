@@ -89,7 +89,9 @@ test("SQLite commits collector records and checkpoints atomically", async () => 
     const durable = await readLocalCollectorState({ stateFile: value.stateFile });
     assert.deepEqual(durable.checkpoint, first);
     assert.deepEqual(durable.records, [record("first")]);
-    assert.equal((await stat(value.stateFile)).mode & 0o777, 0o600);
+    if (process.platform !== "win32") {
+      assert.equal((await stat(value.stateFile)).mode & 0o777, 0o600);
+    }
   } finally {
     await rm(value.root, { recursive: true, force: true });
   }

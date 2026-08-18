@@ -93,7 +93,9 @@ test("the correction ledger lock excludes concurrent migrations and is cleaned a
   try {
     const first = withOwnerOnlyFileLock(lockPath, async () => {
       const metadata = await stat(lockPath);
-      assert.equal(metadata.mode & 0o777, 0o600);
+      if (process.platform !== "win32") {
+        assert.equal(metadata.mode & 0o777, 0o600);
+      }
       signalEntered();
       await held;
     });

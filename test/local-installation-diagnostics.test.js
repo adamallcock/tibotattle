@@ -11,7 +11,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative } from "node:path";
+import { isAbsolute, join, posix, relative } from "node:path";
 import {
   LOCAL_ONBOARDING_SCHEMA_VERSION,
   MAXIMUM_OBSERVED_ROLLOUT_FILES,
@@ -60,11 +60,10 @@ test("installation roots separate immutable resources from owner-only state", as
     }
     assert.equal(defaultLocalCompanionStateRoot({
       platform: "linux",
-      homeDirectory: join(files.root, "portable-home"),
+      homeDirectory: "/portable-home",
       environment: {},
-    }), join(
-      files.root,
-      "portable-home",
+    }), posix.join(
+      "/portable-home",
       ".local",
       "state",
       "app-usagemonitor",

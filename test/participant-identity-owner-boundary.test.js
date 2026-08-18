@@ -92,7 +92,7 @@ test("participant identity owner depends only on its exact Node runtime ports", 
   );
   assert.deepEqual(
     (await extractEsmImports(ownerSource))
-      .map(({ specifier }) => specifier)
+    .map(({ specifier }) => specifier)
       .sort(),
     [
       "@app-usagemonitor/identity-core",
@@ -103,6 +103,7 @@ test("participant identity owner depends only on its exact Node runtime ports", 
       "node:path",
     ],
   );
+  assert.doesNotMatch(ownerSource, /windows-filesystem/u);
 });
 
 test("the exact participant identity migration allowance is removed", async () => {

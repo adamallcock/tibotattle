@@ -57,7 +57,7 @@ test("local export CLI requires explicit bounded paths and keeps upload absent",
   assert.equal(args.command, "export-local");
   assert.equal(args.startAt, "2026-07-24T12:00:00.000Z");
   assert.equal(args.endAt, "2026-07-24T13:00:00.000Z");
-  assert.match(args.outputFile, /exports\/review\.umx\.json$/);
-  assert.match(args.receiptFile, /exports\/review\.receipt\.json$/);
+  assert.match(args.outputFile, /exports[\\/]review\.umx\.json$/);
+  assert.match(args.receiptFile, /exports[\\/]review\.receipt\.json$/);
   assert.throws(() => parseArgs(["upload", "--server", "https://example.invalid"]), /Unknown argument/);
 });
