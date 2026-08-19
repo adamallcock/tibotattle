@@ -482,7 +482,7 @@
     "resourcePolicyValuesSha256": "a3dde0db440015886144b76b88a8a663095c7e5eb08f0a68f062e597e95552f6",
     "schemaModuleSha256": "9d598e56c71be1c3257c2e25c1334e49fdc6b5e825c46ba3e1ce68a83490e54f",
     "workloadCodeFileCount": 340,
-    "workloadCodeSha256": "44cb2f250f199c9fdca3231c977db676ae7597a75a2f95c623ebe770f20e844e"
+    "workloadCodeSha256": "609f9fe2f3010e6342f1d828aacc86296a8c7832f200d3000a890410b23637bf"
   },
   "determinism": {
     "comparisons": {
@@ -500,8 +500,8 @@
     "projectionVersion": "g1-r7-release-deterministic-projection-v0.1",
     "runCount": 2,
     "runProjectionSha256es": [
-      "d35b5151f5f9075b89bccc49aed13078b7febcf15b02cb0cfe8240691fd705a8",
-      "d35b5151f5f9075b89bccc49aed13078b7febcf15b02cb0cfe8240691fd705a8"
+      "1274f0982a3dc813e72bc36391ebb6a7fed08cafa19ba118592311dc854bcd55",
+      "1274f0982a3dc813e72bc36391ebb6a7fed08cafa19ba118592311dc854bcd55"
     ],
     "status": "partial"
   },
@@ -822,16 +822,16 @@
       "decodedBytes": 0,
       "durablePeakRssBytes": 0,
       "encodedBytes": 0,
-      "externalPeakRssBytes": 347668480,
-      "externalRssSampleCount": 66,
+      "externalPeakRssBytes": 350519296,
+      "externalRssSampleCount": 64,
       "externalRssSampleFailureCount": 0,
       "filesystem": {
         "afterBytes": 0,
         "beforeBytes": 0,
-        "sampledHighWaterBytes": 30815874
+        "sampledHighWaterBytes": 30815733
       },
       "outputRecords": 0,
-      "parentElapsedMs": 3310,
+      "parentElapsedMs": 3207,
       "runCount": 2,
       "sourceBytes": 0,
       "sourceFiles": 0,
@@ -894,7 +894,7 @@
     }
   },
   "protocolVersion": "g1-r7-release-evidence-v0.1",
-  "receiptSha256": "64478dec32528987c0acbebc2b641383a48bb82c728a561d5b61e1857d3b8edd",
+  "receiptSha256": "dc626bded3c677d60f91d5c3be1a77368a16d866c8db519cc61a0cddca23e2ba",
   "runtimeProvenance": {
     "architecture": "arm64",
     "elapsedClock": "parent_monotonic",
