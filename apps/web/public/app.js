@@ -4956,7 +4956,8 @@ function renderResidualInspectionTable() {
     table.append(row);
   }
   if (!pagination) return;
-  pagination.hidden = false;
+  // Same rule as the weekly and model tables: no pager for a single page.
+  pagination.hidden = pageCount <= 1;
   setLocalizedText($("#residual-page-status"), "residual.table.page", {
     start: formatNumber(start + 1),
     end: formatNumber(start + pageRows.length),
@@ -7620,8 +7621,13 @@ function cacheImpactTableSignature(kind, impact, rows) {
 function renderCacheImpactPagination(prefix, state, page) {
   const pagination = $(`#${prefix}-pagination`);
   if (!pagination) return;
-  pagination.hidden = page.total === 0;
-  if (page.total === 0) return;
+  // The pager renders only when there is something to page through; a set that
+  // fits one page keeps the plain table. A control whose two buttons are both
+  // disabled above a "1–6 of 6" status is furniture: it says only what the
+  // rows underneath it already show. This matches the weekly table, which has
+  // always drawn its pager this way.
+  pagination.hidden = page.total === 0 || page.pageCount <= 1;
+  if (pagination.hidden) return;
   setLocalizedText($(`#${prefix}-page-status`), "table.pagination.page", {
     start: formatNumber(page.start + 1),
     end: formatNumber(page.end),
