@@ -18,6 +18,7 @@ import {
 import {
   assertWindowsFilesystemProductionSafe,
   isWindowsFilesystemAdapter,
+  withLocalCollectorStateSessionBoundary,
 } from "./platform/index.js";
 
 const PUBLIC_REFRESH_ERROR_CODES = new Set([
@@ -387,6 +388,9 @@ function fixedWindowsCollectorStateUnavailable() {
 }
 
 function assertWindowsCollectorFilesystemBoundary(adapter) {
+  if (process.platform === "win32" && adapter === null) {
+    throw fixedWindowsCollectorStateUnavailable();
+  }
   if (adapter === null) return;
   // A shape-compatible object, or a copied native adapter, is not an
   // authenticated boundary. The central module brands only adapters it
@@ -400,10 +404,12 @@ function assertWindowsCollectorFilesystemBoundary(adapter) {
   } catch {
     throw fixedWindowsCollectorStateUnavailable();
   }
-  // Even a future qualified adapter cannot be used by this collector until
-  // SQLite's database and every journal/WAL/SHM sidecar share the same native
-  // replacement and identity guarantees.
-  if (process.platform === "win32") {
+  // The current adapter deliberately reports sqliteStateLeaseSafe=false, so
+  // this remains a fail-closed gate today.  Once the native lease and its
+  // sidecar qualification are positively proven, the state-session boundary
+  // below becomes the only Windows database path.
+  if (process.platform === "win32"
+      && adapter.sqliteStateLeaseSafe !== true) {
     throw fixedWindowsCollectorStateUnavailable();
   }
 }
@@ -872,6 +878,10 @@ export function createLocalCollectorRefreshRunner({
   // sidecars; keeping this value explicit prevents a later caller from
   // silently falling back to POSIX checks while that prerequisite is closed.
   windowsFilesystemAdapter = null,
+  // Windows SQLite must be opened through the native lease/session seam. This
+  // is qualification-only plumbing until sqliteStateLeaseSafe is true; the
+  // current production refresh remains fail-closed on Windows.
+  windowsSqliteStateSessionFactory = null,
   selectAccountObservationSecret = selectProductionAccountObservationSecret,
   runCollector = runCollectorOnce,
   readAccountingCache = readReplaySafeAccountingCache,
@@ -944,6 +954,10 @@ export function createLocalCollectorRefreshRunner({
         || Array.isArray(windowsFilesystemAdapter))) {
     throw new TypeError("windowsFilesystemAdapter must be an object or null");
   }
+  if (windowsSqliteStateSessionFactory !== null
+      && typeof windowsSqliteStateSessionFactory !== "function") {
+    throw new TypeError("windowsSqliteStateSessionFactory must be a function or null");
+  }
   for (const [name, value] of Object.entries({
     stateFile,
     accountObservationOperationLockFile,
@@ -1004,7 +1018,10 @@ export function createLocalCollectorRefreshRunner({
       throw error;
     };
     try {
-      return await (async () => {
+      return await withLocalCollectorStateSessionBoundary({
+        windowsFilesystemAdapter,
+        windowsSqliteStateSessionFactory,
+      }, async () => {
     // Legacy is an explicit rollback authority, never an error fallback. Stamp
     // the attempted use before any collector/accounting work so a later
     // failure still leaves a durable, bounded receipt in owner-only state.
@@ -1473,7 +1490,7 @@ export function createLocalCollectorRefreshRunner({
         ? {}
         : { indexing: publicIndexingResult(result.indexing) }),
     };
-      })();
+      });
     } catch (error) {
       stampStep(error);
     }
