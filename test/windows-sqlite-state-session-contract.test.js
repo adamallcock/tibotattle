@@ -280,6 +280,8 @@ test("the Windows SQLite session is branded, root-bound, and lease-first", () =>
   assert.equal(session.contractVersion, WINDOWS_SQLITE_STATE_SESSION_CONTRACT_VERSION);
   assert.equal(session.productionSafe, false);
   assert.equal(session.sqliteStateLeaseSafe, false);
+  assert.equal(session.rootPath, ROOT);
+  assert.equal(session.databaseName, DATABASE_NAME);
   assert.notEqual(session.database, database);
   assert.equal(isWindowsSqliteStateDatabase(session.database), true);
   assert.equal(isWindowsSqliteStateDatabase({ ...session.database }), false);
