@@ -26,8 +26,11 @@ const REPOSITORY_ROOT = resolve(
   "..",
 );
 const OWNER_EXPORTS = Object.freeze([
+  "buildClaudeCallbackRunnerInvocation",
   "ClaudeCallbackLifecycleError",
   "createClaudeCallbackLifecycleContext",
+  "selectClaudeCallbackRunner",
+  "validateClaudeCallbackRunner",
 ]);
 const CONTEXT_EXPORTS = Object.freeze([
   "buildManagedClaudeStatusLine",
@@ -43,8 +46,11 @@ const CONTEXT_EXPORTS = Object.freeze([
   "uninstallClaudeCallback",
 ]);
 const LEGACY_EXPORTS = Object.freeze([
+  "buildClaudeCallbackRunnerInvocation",
   "ClaudeCallbackLifecycleError",
   ...CONTEXT_EXPORTS,
+  "selectClaudeCallbackRunner",
+  "validateClaudeCallbackRunner",
 ]);
 
 function capabilityOperations() {
