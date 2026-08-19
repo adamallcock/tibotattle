@@ -341,6 +341,57 @@ test("the hosted sign-in recovery handle survives a real companion restart on a 
   }
 });
 
+test("the dashboard's origin-less same-origin GET can read the recovery handle", async () => {
+  // Per the Fetch specification a browser appends Origin only to non-GET/HEAD
+  // or CORS-tainted requests, so the dashboard's own same-origin GET arrives
+  // with NO Origin header. The packaged 0.1.13 (1011) build refused exactly
+  // that read (403), which silently disabled restart recovery: the page's
+  // resume saw "unavailable" and returned. The custom header remains the
+  // cross-origin boundary — a foreign page cannot attach it without a CORS
+  // preflight this server never grants.
+  const files = await fixture();
+  const state = "s".repeat(64);
+  const verifier = "v".repeat(64);
+  const startedAt = Date.parse("2026-08-19T12:00:00.000Z");
+  const app = await startApp(files, { clock: () => startedAt });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    await fetch(`${base}/api/local/identity/hosted-signin-handoff`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1",
+        Origin: base,
+      },
+      body: JSON.stringify({ action: "store", provider: "google", state, verifier }),
+    });
+    const originLess = await fetch(
+      `${base}/api/local/identity/hosted-signin-handoff`,
+      { headers: { "X-Usage-Monitor-Local": "1" } },
+    );
+    assert.equal(originLess.status, 200);
+    assert.equal((await originLess.json()).status, "pending");
+    const foreignOrigin = await fetch(
+      `${base}/api/local/identity/hosted-signin-handoff`,
+      {
+        headers: {
+          "X-Usage-Monitor-Local": "1",
+          Origin: "http://evil.example",
+        },
+      },
+    );
+    assert.equal(foreignOrigin.status, 403);
+    const headerless = await fetch(
+      `${base}/api/local/identity/hosted-signin-handoff`,
+      { headers: { Origin: base } },
+    );
+    assert.equal(headerless.status, 403);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
 test("an expired hosted sign-in handle is discarded without exposing its bound values", async () => {
   const files = await fixture();
   const startedAt = Date.parse("2026-08-19T12:00:00.000Z");

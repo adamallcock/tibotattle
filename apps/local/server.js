@@ -1132,7 +1132,17 @@ async function authorizeDiagnosticNote(request, response) {
 }
 
 function authorizeHostedSignInHandoffRead(request, response) {
-  if (!sameOrigin(request)
+  // Per the Fetch specification, a browser only appends an Origin header to
+  // requests whose method is not GET/HEAD or whose tainting is CORS. The
+  // dashboard's own same-origin GET therefore arrives WITHOUT an Origin
+  // header (found live in the packaged 0.1.13 (1011) build: the restart
+  // recovery read was refused 403 and resume silently did nothing). Accept
+  // an absent Origin, refuse a present-but-foreign one, and always require
+  // the custom header — a cross-origin page cannot attach it without a CORS
+  // preflight this server never grants, and the global allowedHostHeader
+  // gate already rejects DNS-rebinding hosts before routing.
+  const origin = request.headers.origin;
+  if ((origin !== undefined && !sameOrigin(request))
       || request.headers["x-usage-monitor-local"] !== "1") {
     sendError(response, 403, "hosted_signin_handoff_not_authorized");
     return false;
