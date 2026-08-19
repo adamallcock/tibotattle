@@ -87,24 +87,42 @@ function projection(document, { source }) {
 
 export function createFastModePreferenceController({
   settingsFile,
-  storage = createOwnerOnlyAutomaticContributionStorageContext({
-    createError: (code) => new FastModePreferenceError(
-      code === "configuration_invalid"
-        ? "fast_mode_preference_invalid"
-        : "fast_mode_preference_unavailable",
-    ),
-  }),
+  storage = undefined,
+  platform = process.platform,
+  windowsProtectedStateStore = null,
   now = () => new Date(),
 } = {}) {
   if (typeof settingsFile !== "string" || settingsFile.length < 1) {
     throw new TypeError("settingsFile must be a non-empty path");
   }
   if (typeof now !== "function") throw new TypeError("now must be a function");
+  if (process.platform === "win32" && platform !== "win32") {
+    throw new FastModePreferenceError("fast_mode_preference_invalid");
+  }
+  if (platform !== "win32" && windowsProtectedStateStore !== null) {
+    throw new FastModePreferenceError("fast_mode_preference_invalid");
+  }
+  if (platform === "win32" && storage !== undefined) {
+    // Windows callers must not bypass the protected child boundary with an
+    // injected reader/writer object, including a null or forged replacement.
+    throw new FastModePreferenceError("fast_mode_preference_invalid");
+  }
+  const selectedStorage = storage === undefined
+    ? createOwnerOnlyAutomaticContributionStorageContext({
+      createError: (code) => new FastModePreferenceError(
+        code === "configuration_invalid"
+          ? "fast_mode_preference_invalid"
+          : "fast_mode_preference_unavailable",
+      ),
+      platform,
+      windowsProtectedStateStore,
+    })
+    : storage;
 
   async function readDocument() {
     let text;
     try {
-      text = await storage.readSettingsText({
+      text = await selectedStorage.readSettingsText({
         settingsFile,
         maximumBytes: MAXIMUM_SETTINGS_BYTES,
       });
@@ -175,7 +193,7 @@ export function createFastModePreferenceController({
         recordedAt,
       };
       try {
-        await storage.writeSettingsText({
+        await selectedStorage.writeSettingsText({
           settingsFile,
           text: `${JSON.stringify(document)}\n`,
           maximumBytes: MAXIMUM_SETTINGS_BYTES,
