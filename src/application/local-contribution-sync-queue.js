@@ -167,6 +167,11 @@ async function discoverCommittedPreparedSets({
     [directory],
   );
   const discovered = [];
+  // A null root is the never-prepared first-run state: the spool directory
+  // does not exist until the first successful preparation creates it, and
+  // zero discovered sets is what lets the preview report "empty" so the page
+  // can run that very first preparation.
+  if (root === null) return discovered;
   if (await Reflect.apply(runtime.storage.manifestExists, undefined, [
     root,
     PREPARED_CONTRIBUTION_SET_MANIFEST,

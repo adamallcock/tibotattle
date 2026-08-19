@@ -639,9 +639,22 @@ export function createLocalContributionSyncQueueStorageContext({
     if (typeof directory !== "string" || directory.length < 1) {
       failures.fail("configuration_invalid");
     }
+    const requested = resolve(directory);
+    let requestedStats;
     try {
-      const requested = resolve(directory);
-      const requestedStats = await lstat(requested);
+      requestedStats = await lstat(requested);
+    } catch (error) {
+      // A prepared root that was never created is the normal first-run state
+      // on a fresh account: nothing has been prepared yet, so discovery must
+      // see zero sets rather than an invalid root. Without this, a brand-new
+      // account deadlocks: the preview reports unavailable, so the page never
+      // runs the preparation that would create this directory (found live on
+      // a fresh macOS account, 2026-08-19). Only absence is tolerated; every
+      // other condition below stays fail-closed.
+      if (error?.code === "ENOENT") return null;
+      failures.fail("prepared_root_invalid");
+    }
+    try {
       assertOwnerOnlyDirectory(requestedStats, "prepared_root_invalid");
       const canonical = await realpath(requested);
       const canonicalStats = await lstat(canonical);

@@ -8,6 +8,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  rm,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -686,6 +687,38 @@ test("retryable failures honor Retry-After before adding bounded client spread",
   // 60 seconds is the service floor; the half-random client adds 7.5 seconds
   // (half of the bounded 15-second, 25% spread).
   assert.equal(result.queue.nextAttemptAt, "2026-07-26T12:01:07.500Z");
+});
+
+test("a never-prepared account previews empty instead of unavailable", async () => {
+  // Fresh-account bootstrap: the prepared spool is only created by the first
+  // successful preparation, and the page only runs that preparation when the
+  // preview reports empty. A missing spool must therefore be the empty state,
+  // never prepared_root_invalid — otherwise a brand-new account deadlocks on
+  // Check again forever (found live on a fresh macOS account, 2026-08-19).
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-sync-queue-"));
+  const privateRoot = join(root, "private");
+  await mkdir(privateRoot, { mode: 0o700 });
+  const neverCreated = join(root, "never-created-prepared-root");
+  const queueFile = join(privateRoot, "sync.sqlite3");
+  try {
+    const preview = await inspectNextContributionSyncUpload({
+      directory: neverCreated,
+      queueFile,
+      now: () => new Date("2026-07-26T12:00:00.000Z"),
+    });
+    assert.equal(preview.state, "empty");
+    assert.equal(preview.discoveredSets, 0);
+    assert.equal(preview.enqueued, 0);
+    assert.equal(preview.item, null);
+    const review = await inspectExactNextContributionSyncUpload({
+      directory: neverCreated,
+      queueFile,
+      now: () => new Date("2026-07-26T12:00:00.000Z"),
+    });
+    assert.equal(review.state, "empty");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("retry and pause survive a queue reopen without invalidating exact review", async () => {
