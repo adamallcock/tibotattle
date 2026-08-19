@@ -8,6 +8,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import {
   createDeferredAccountingRebuildRecorder,
   createLocalCollectorRefreshRunner,
@@ -18,8 +19,15 @@ import {
   localCompanionStatePaths,
 } from "../src/local-installation-diagnostics.js";
 import {
+  readLocalCollectorCheckpoint,
   readLocalCollectorLegacyRefreshUse,
 } from "../src/local-collector-state.js";
+import {
+  runCollectorOnce,
+} from "../src/passive-collector.js";
+import {
+  CodexAppServerError,
+} from "../src/providers/codex/account.js";
 import {
   REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
 } from "../src/replay-safe-accounting-cache.js";
@@ -675,6 +683,169 @@ test("unified authority keeps quota-only collection prospective and softens a co
   assert.equal(result.indexing.status, "bounded_pause");
   assert.equal(result.accounting.sourceMode, "unified");
   assert.equal(result.accounting.refreshStatus, "rebuilt");
+});
+
+test("a fresh unified machine completes its first refresh when the app-server read fails", async () => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "local-refresh-fresh-machine-"));
+  const expectedGeneration = {
+    id: 1,
+    fingerprint: "f".repeat(64),
+    status: "complete",
+    discoveryComplete: true,
+    diagnosticsComplete: true,
+    usageProvenanceComplete: true,
+    sourceOrderComplete: true,
+    quotaProvenanceComplete: true,
+    toolProvenanceComplete: true,
+  };
+  try {
+    // A machine on its very first pass: real session logs exist, but the
+    // Codex app-server quota read fails (no per-user Codex session). The
+    // refresh must still reach the unified index and accounting instead of
+    // aborting at the collector with nothing indexed.
+    const codexHome = join(stateRoot, "codex-home");
+    await mkdir(join(codexHome, "sessions"), { recursive: true });
+    await writeFile(
+      join(codexHome, "sessions", "rollout-2026-08-19T00-00-00-fresh.jsonl"),
+      "",
+    );
+    const stateFile = join(stateRoot, "state", "local-collector-state-v1.sqlite");
+    let unifiedIndexRuns = 0;
+    const runner = createLocalCollectorRefreshRunner({
+      accountingSourceMode: "unified",
+      codexHome,
+      stateFile,
+      unifiedIndexFile: join(stateRoot, "state", "local-unified-index-v1.sqlite"),
+      selectAccountObservationSecret: () => ({
+        loadAccountObservationSecret: null,
+      }),
+      runCollector: (options) => runCollectorOnce({
+        ...options,
+        appServerFactory: () => ({
+          async start() {
+            throw new CodexAppServerError(
+              "app_server_unavailable",
+              "Unable to start the Codex app-server",
+            );
+          },
+          close() {},
+        }),
+      }),
+      refreshUnifiedIndex: async () => {
+        unifiedIndexRuns += 1;
+        return { status: "ingested", generation: expectedGeneration };
+      },
+      refreshAccounting: async () => ({
+        generatedAt: "2026-08-19T12:00:00.000Z",
+        periods: [{ id: "7d", events: 0 }],
+        diagnostics: {},
+        sourceDescriptor: { fallbackCount: 0 },
+      }),
+      clock: () => Date.parse("2026-08-19T12:00:00.000Z"),
+    });
+
+    const first = await runner();
+    assert.equal(unifiedIndexRuns, 1);
+    assert.deepEqual(first.quotaRefresh, {
+      attempted: true,
+      recordWritten: false,
+      errorCode: "app_server_unavailable",
+    });
+    assert.equal(first.unifiedIndex.status, "ingested");
+    assert.equal(first.accounting.status, "replay_safe");
+    assert.equal(first.accounting.refreshStatus, "rebuilt");
+
+    // The failed pass still persisted its checkpoint, so the loop is broken:
+    // the next pass recovers from the durable row and completes the same way.
+    const checkpoint = await readLocalCollectorCheckpoint({ stateFile });
+    assert.equal(
+      checkpoint.diagnostics.appServerErrorCounts.app_server_unavailable,
+      1,
+    );
+    const second = await runner();
+    assert.equal(unifiedIndexRuns, 2);
+    assert.equal(second.quotaRefresh.errorCode, "app_server_unavailable");
+    assert.equal(second.unifiedIndex.status, "ingested");
+  } finally {
+    await rm(stateRoot, { recursive: true, force: true });
+  }
+});
+
+test("a mid-run checkpoint loss fails the refresh under the stable collector code", async () => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "local-refresh-store-fault-"));
+  const clock = () => Date.parse("2026-08-19T12:00:00.000Z");
+  try {
+    const codexHome = join(stateRoot, "codex-home");
+    await mkdir(join(codexHome, "sessions"), { recursive: true });
+    const stateFile = join(stateRoot, "state", "local-collector-state-v1.sqlite");
+    const seed = () => runCollectorOnce({
+      codexHome,
+      stateFile,
+      refreshStale: false,
+      clock,
+    });
+    let unifiedIndexRuns = 0;
+    const runner = createLocalCollectorRefreshRunner({
+      accountingSourceMode: "unified",
+      codexHome,
+      stateFile,
+      unifiedIndexFile: join(stateRoot, "state", "local-unified-index-v1.sqlite"),
+      selectAccountObservationSecret: () => ({
+        loadAccountObservationSecret: null,
+      }),
+      runCollector: (options) => runCollectorOnce({
+        ...options,
+        appServerFactory: () => ({
+          async start() {
+            // Externally strip the durable checkpoint row mid-run. This is a
+            // real store fault, not a first run, so it must stay terminal.
+            const database = new DatabaseSync(stateFile);
+            try {
+              database.prepare("DELETE FROM meta WHERE key = 'checkpoint'").run();
+            } finally {
+              database.close();
+            }
+            throw new CodexAppServerError("temporary_disconnect", "connection lost");
+          },
+          close() {},
+        }),
+      }),
+      refreshUnifiedIndex: async () => {
+        unifiedIndexRuns += 1;
+        return { status: "ingested", generation: null };
+      },
+      clock,
+    });
+
+    await seed();
+    await assert.rejects(
+      runner(),
+      (error) => error?.code === "app_record_checkpoint_unavailable"
+        && error?.refreshStep === "collector",
+    );
+    assert.equal(unifiedIndexRuns, 0);
+
+    await seed();
+    const controller = new LocalCompanionRefreshController({
+      runner,
+      dataStore: { async reload() {} },
+      clock,
+    });
+    assert.equal(controller.start(), true);
+    // The runner performs real collector-state I/O, so settle on wall time
+    // rather than event-loop ticks.
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+      if (controller.getStatus().status === "failed") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const status = controller.getStatus();
+    assert.equal(status.status, "failed");
+    assert.equal(status.errorCode, "refresh_failed");
+    assert.equal(status.failedStep, "collector");
+    assert.equal(status.failureCode, "app_record_checkpoint_unavailable");
+  } finally {
+    await rm(stateRoot, { recursive: true, force: true });
+  }
 });
 
 test("unified mode fails closed when the authoritative generation is missing or incomplete", async (t) => {

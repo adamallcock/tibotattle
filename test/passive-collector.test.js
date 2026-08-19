@@ -14,6 +14,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import {
   CodexAppServerError,
   deriveOpenAIAccountScope,
@@ -1367,6 +1368,117 @@ test("run-once distinguishes an app-server authentication failure without losing
     assert.equal((await stat(fixture.checkpointFile)).mode & 0o777, 0o600);
   } finally {
     await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("a first-ever unified pass records a failed quota read instead of failing forever", async () => {
+  const fixture = await collectorFixture();
+  class UnavailableClient {
+    async start() {
+      throw new CodexAppServerError("app_server_unavailable", "Unable to start the Codex app-server");
+    }
+    close() {}
+  }
+  try {
+    // No durable checkpoint exists before the first pass: the row is only
+    // written after the quota refresh, so a failed provider read here used to
+    // abort this pass — and, because the abort also skipped the save, every
+    // later pass too.
+    const options = {
+      ...fixture,
+      backfill: false,
+      skipRolloutIngestion: true,
+      staleAfterMs: 0,
+      appServerFactory: () => new UnavailableClient(),
+      clock: () => Date.parse("2026-08-19T00:01:00.000Z"),
+    };
+    const first = await runCollectorOnce(options);
+    assert.equal(first.status, "complete");
+    assert.equal(first.refresh.attempted, true);
+    assert.equal(first.refresh.recordWritten, false);
+    assert.equal(first.refresh.errorCode, "app_server_unavailable");
+    assert.equal(first.diagnostics.appServerErrorCounts.app_server_unavailable, 1);
+    const checkpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    assert.equal(checkpoint.diagnostics.appServerErrorCounts.app_server_unavailable, 1);
+    assert.equal(checkpoint.lastQuotaObservedAt, null);
+    assert.equal(checkpoint.recentEventKeys.length, 0);
+
+    // The pass persisted its checkpoint, so the next failing pass recovers
+    // from the durable row and keeps counting.
+    const second = await runCollectorOnce(options);
+    assert.equal(second.status, "complete");
+    assert.equal(second.refresh.errorCode, "app_server_unavailable");
+    assert.equal(second.diagnostics.appServerErrorCounts.app_server_unavailable, 2);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("a first-ever legacy pass with no rollouts survives a failed quota read", async () => {
+  const fixture = await collectorFixture();
+  class FailingClient {
+    async start() {
+      throw new CodexAppServerError("authentication_failure", "not authenticated");
+    }
+    close() {}
+  }
+  try {
+    // A machine with no rollout history commits no ingestion change, so
+    // nothing durable exists when the quota refresh fails.
+    await rm(fixture.rollout);
+    const result = await runCollectorOnce({
+      ...fixture,
+      staleAfterMs: 0,
+      appServerFactory: () => new FailingClient(),
+      clock: () => Date.parse("2026-08-19T00:01:00.000Z"),
+    });
+    assert.equal(result.status, "complete");
+    assert.equal(result.refresh.attempted, true);
+    assert.equal(result.refresh.errorCode, "authentication_failure");
+    assert.equal(result.diagnostics.appServerErrorCounts.authentication_failure, 1);
+    const checkpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    assert.equal(checkpoint.diagnostics.appServerErrorCounts.authentication_failure, 1);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("a checkpoint that disappears mid-run still fails the pass under a stable code", async () => {
+  const fixture = await collectorFixture();
+  const clock = () => Date.parse("2026-08-19T00:01:00.000Z");
+  class VanishingCheckpointClient {
+    async start() {
+      // Externally strip the checkpoint row between the run's opening read
+      // and its recovery read, leaving the store itself healthy. First-run
+      // recovery must not soften this: the run STARTED from a durable
+      // checkpoint.
+      const database = new DatabaseSync(fixture.stateFile);
+      try {
+        database.prepare("DELETE FROM meta WHERE key = 'checkpoint'").run();
+      } finally {
+        database.close();
+      }
+      throw new CodexAppServerError("temporary_disconnect", "connection lost");
+    }
+    close() {}
+  }
+  try {
+    const seeded = await runCollectorOnce({ ...fixture, refreshStale: false, clock });
+    assert.equal(seeded.status, "complete");
+    await assert.rejects(
+      () => runCollectorOnce({
+        ...fixture,
+        staleAfterMs: 0,
+        appServerFactory: () => new VanishingCheckpointClient(),
+        clock,
+      }),
+      (error) => {
+        assert.equal(error.code, "app_record_checkpoint_unavailable");
+        return true;
+      },
+    );
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
   }
 });
 
