@@ -43,6 +43,7 @@ const QUALIFICATION_TEST_FILES = Object.freeze([
   "test/windows-filesystem-manifest.test.js",
   "test/windows-filesystem-provenance.test.js",
   "test/windows-filesystem-native-contract.test.js",
+  "test/windows-filesystem-companion-instance-lease.test.js",
   "test/windows-filesystem-security.test.js",
   "test/windows-security-consumer-composition.test.js",
   "test/windows-sqlite-state-session-native.test.js",
@@ -102,13 +103,17 @@ export async function readVerifiedBindingManifest({
     && manifest.approvedPolicy?.productionSafe === false
     && manifest.approvedPolicy?.pathWalkRaceSafe === false
     && manifest.approvedPolicy?.credentialMutexSafe === true
+    && manifest.approvedPolicy?.companionInstanceMutexSafe === false
     && manifest.approvedPolicy?.credentialAuditFileGuardSafe === true
     && manifest.approvedPolicy?.sqliteStateLeaseSafe === false
     && manifest.nativeClaims?.credentialAuditFileGuardSafe === true
+    && manifest.nativeClaims?.companionInstanceMutexSafe === false
     && manifest.nativeClaims?.sqliteStateLeaseSafe === false
     && manifest.credentialAuditFileGuardContractVersion
       === "windows-credential-audit-file-guard-v1"
     && manifest.credentialMutexContractVersion === "windows-credential-mutex-v1"
+    && manifest.companionInstanceMutexContractVersion
+      === "windows-companion-instance-mutex-v1"
     && manifest.sqliteStateLeaseContractVersion === "windows-sqlite-state-lease-v1"
     && bindingProvenance !== null
     && typeof bindingProvenance === "object"

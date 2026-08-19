@@ -36,6 +36,8 @@ const BINDING_PROVENANCE_CONTRACT_VERSION = "windows-binding-provenance-v1";
 const SQLITE_STATE_LEASE_CONTRACT_VERSION = "windows-sqlite-state-lease-v1";
 const SQLITE_STATE_STAGING_CONTRACT_VERSION =
   "windows-sqlite-state-staging-v1";
+const COMPANION_INSTANCE_MUTEX_CONTRACT_VERSION =
+  "windows-companion-instance-mutex-v1";
 const BINDING_FILE_NAME = "windows_filesystem.node";
 const BINDING_PLATFORM = "win32";
 const BINDING_ARCHITECTURE = "x64";
@@ -65,6 +67,8 @@ const REQUIRED_METHODS = Object.freeze([
   "releaseCredentialAuditFileGuard",
   "acquireCredentialMutex",
   "releaseCredentialMutex",
+  "acquireCompanionInstanceMutex",
+  "releaseCompanionInstanceMutex",
 ]);
 const MANIFEST_KEYS = Object.freeze([
   "schemaVersion",
@@ -78,6 +82,7 @@ const MANIFEST_KEYS = Object.freeze([
   "credentialAuditFileGuardContractVersion",
   "sqliteStateLeaseContractVersion",
   "credentialMutexContractVersion",
+  "companionInstanceMutexContractVersion",
   "requiredMethods",
   "nativeClaims",
   "approvedPolicy",
@@ -96,6 +101,8 @@ export const WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_CONTRACT_VERSION =
   SQLITE_STATE_LEASE_CONTRACT_VERSION;
 export const WINDOWS_FILESYSTEM_SQLITE_STATE_STAGING_CONTRACT_VERSION =
   SQLITE_STATE_STAGING_CONTRACT_VERSION;
+export const WINDOWS_FILESYSTEM_COMPANION_INSTANCE_MUTEX_CONTRACT_VERSION =
+  COMPANION_INSTANCE_MUTEX_CONTRACT_VERSION;
 export const WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS = REQUIRED_METHODS;
 
 function failure(code) {
@@ -221,40 +228,48 @@ function assertBindingManifest(manifest) {
     && manifest.sqliteStateLeaseContractVersion
       === SQLITE_STATE_LEASE_CONTRACT_VERSION
     && manifest.credentialMutexContractVersion === "windows-credential-mutex-v1"
+    && manifest.companionInstanceMutexContractVersion
+      === COMPANION_INSTANCE_MUTEX_CONTRACT_VERSION
     && Array.isArray(requiredMethods)
     && requiredMethods.length === REQUIRED_METHODS.length
     && requiredMethods.every((method, index) => method === REQUIRED_METHODS[index])
     && nativeClaims !== null
     && typeof nativeClaims === "object"
     && !Array.isArray(nativeClaims)
-    && Object.keys(nativeClaims).length === 5
+    && Object.keys(nativeClaims).length === 6
     && Object.hasOwn(nativeClaims, "productionSafe")
     && Object.hasOwn(nativeClaims, "pathWalkRaceSafe")
     && Object.hasOwn(nativeClaims, "credentialMutexSafe")
+    && Object.hasOwn(nativeClaims, "companionInstanceMutexSafe")
     && Object.hasOwn(nativeClaims, "credentialAuditFileGuardSafe")
     && Object.hasOwn(nativeClaims, "sqliteStateLeaseSafe")
     && typeof nativeClaims.productionSafe === "boolean"
     && typeof nativeClaims.pathWalkRaceSafe === "boolean"
     && typeof nativeClaims.credentialMutexSafe === "boolean"
+    && typeof nativeClaims.companionInstanceMutexSafe === "boolean"
     && typeof nativeClaims.credentialAuditFileGuardSafe === "boolean"
     && typeof nativeClaims.sqliteStateLeaseSafe === "boolean"
     && approvedPolicy !== null
     && typeof approvedPolicy === "object"
     && !Array.isArray(approvedPolicy)
-    && Object.keys(approvedPolicy).length === 5
+    && Object.keys(approvedPolicy).length === 6
     && Object.hasOwn(approvedPolicy, "productionSafe")
     && Object.hasOwn(approvedPolicy, "pathWalkRaceSafe")
     && Object.hasOwn(approvedPolicy, "credentialMutexSafe")
+    && Object.hasOwn(approvedPolicy, "companionInstanceMutexSafe")
     && Object.hasOwn(approvedPolicy, "credentialAuditFileGuardSafe")
     && Object.hasOwn(approvedPolicy, "sqliteStateLeaseSafe")
     && typeof approvedPolicy.productionSafe === "boolean"
     && typeof approvedPolicy.pathWalkRaceSafe === "boolean"
     && approvedPolicy.credentialMutexSafe === true
+    && approvedPolicy.companionInstanceMutexSafe === false
     && approvedPolicy.credentialAuditFileGuardSafe === true
     && approvedPolicy.sqliteStateLeaseSafe === false
     && nativeClaims.productionSafe === approvedPolicy.productionSafe
     && nativeClaims.pathWalkRaceSafe === approvedPolicy.pathWalkRaceSafe
     && nativeClaims.credentialMutexSafe === approvedPolicy.credentialMutexSafe
+    && nativeClaims.companionInstanceMutexSafe
+      === approvedPolicy.companionInstanceMutexSafe
     && nativeClaims.credentialAuditFileGuardSafe
       === approvedPolicy.credentialAuditFileGuardSafe
     && nativeClaims.sqliteStateLeaseSafe === approvedPolicy.sqliteStateLeaseSafe
@@ -283,11 +298,14 @@ function assertBinding(binding) {
       && binding?.sqliteStateLeaseContractVersion
         === SQLITE_STATE_LEASE_CONTRACT_VERSION
       && binding?.credentialMutexContractVersion === "windows-credential-mutex-v1"
+      && binding?.companionInstanceMutexContractVersion
+        === COMPANION_INSTANCE_MUTEX_CONTRACT_VERSION
       && typeof binding?.productionSafe === "boolean"
       && typeof binding?.pathWalkRaceSafe === "boolean"
       && binding?.credentialMutexSafe === true;
     valid = valid
       && binding?.credentialAuditFileGuardSafe === true
+      && binding?.companionInstanceMutexSafe === false
       && binding?.sqliteStateLeaseSafe === false;
   } catch {
     valid = false;
@@ -363,7 +381,11 @@ function verifyBindingIntegrity({
         !== manifest.credentialAuditFileGuardContractVersion
       || binding.sqliteStateLeaseContractVersion
         !== manifest.sqliteStateLeaseContractVersion
-      || binding.credentialMutexContractVersion !== manifest.credentialMutexContractVersion) {
+      || binding.credentialMutexContractVersion !== manifest.credentialMutexContractVersion
+      || binding.companionInstanceMutexContractVersion
+        !== manifest.companionInstanceMutexContractVersion
+      || binding.companionInstanceMutexSafe
+        !== manifest.nativeClaims.companionInstanceMutexSafe) {
     throw failure("MANIFEST_BINDING_MISMATCH");
   }
 
@@ -528,6 +550,7 @@ export function createWindowsFilesystemAdapter({
     native = assertBinding(binding);
   }
   const sqliteStateLeases = new WeakMap();
+  const companionInstanceMutexLeases = new WeakMap();
   const adapter = Object.freeze({
     // The current loader has no trusted package verifier, so these remain
     // false even if an injected/native object or sidecar claims otherwise.
@@ -536,6 +559,8 @@ export function createWindowsFilesystemAdapter({
     sqliteStateLeaseSafe: false,
     sqliteStateStagingSafe: false,
     sqliteStateStagingContractVersion: SQLITE_STATE_STAGING_CONTRACT_VERSION,
+    companionInstanceMutexContractVersion: COMPANION_INSTANCE_MUTEX_CONTRACT_VERSION,
+    companionInstanceMutexSafe: false,
     inspectPath(path) {
       try {
         return normalizeMetadataResult(call(native, "inspectPath", [path]));
@@ -674,6 +699,52 @@ export function createWindowsFilesystemAdapter({
       } catch (error) {
         throw normalizeNativeError(error);
       }
+    },
+    acquireCompanionInstanceMutex() {
+      if (typeof native.acquireCompanionInstanceMutex !== "function") {
+        throw failure("COMPANION_INSTANCE_MUTEX_UNAVAILABLE");
+      }
+      let result;
+      try {
+        result = call(native, "acquireCompanionInstanceMutex", []);
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+      let valid = false;
+      try {
+        valid = result !== null
+          && typeof result === "object"
+          && !Array.isArray(result)
+          && Object.keys(result).sort().join("\0") === "abandoned\0lease"
+          && typeof result.abandoned === "boolean"
+          && result.lease !== null
+          && (typeof result.lease === "object" || typeof result.lease === "function");
+      } catch {
+        valid = false;
+      }
+      if (!valid) throw failure("INVALID_RESULT");
+      const lease = Object.freeze({ abandoned: result.abandoned });
+      companionInstanceMutexLeases.set(lease, result.lease);
+      return lease;
+    },
+    releaseCompanionInstanceMutex(lease) {
+      let nativeLease;
+      try {
+        nativeLease = companionInstanceMutexLeases.get(lease);
+      } catch {
+        nativeLease = undefined;
+      }
+      if (nativeLease === undefined) throw failure("COMPANION_INSTANCE_MUTEX_FOREIGN");
+      try {
+        if (typeof native.releaseCompanionInstanceMutex !== "function") {
+          throw failure("COMPANION_INSTANCE_MUTEX_UNAVAILABLE");
+        }
+        call(native, "releaseCompanionInstanceMutex", [nativeLease]);
+      } catch (error) {
+        companionInstanceMutexLeases.delete(lease);
+        throw normalizeNativeError(error);
+      }
+      companionInstanceMutexLeases.delete(lease);
     },
     acquireSqliteStateLease(rootPath, rootIdentity, databaseName) {
       const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);

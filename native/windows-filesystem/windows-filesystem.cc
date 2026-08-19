@@ -18,6 +18,7 @@
 #if defined(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK)
 #include <chrono>
 #include <condition_variable>
+#include <thread>
 #endif
 #include <cstdint>
 #include <cstring>
@@ -207,6 +208,15 @@ Failure CredentialMutexContended() { return {"CREDENTIAL_MUTEX_CONTENDED"}; }
 Failure CredentialMutexAbandoned() { return {"CREDENTIAL_MUTEX_ABANDONED"}; }
 Failure CredentialMutexReleaseFailed() { return {"CREDENTIAL_MUTEX_RELEASE_FAILED"}; }
 Failure CredentialMutexForeign() { return {"CREDENTIAL_MUTEX_FOREIGN"}; }
+Failure CompanionInstanceMutexContended() {
+  return {"COMPANION_INSTANCE_MUTEX_CONTENDED"};
+}
+Failure CompanionInstanceMutexReleaseFailed() {
+  return {"COMPANION_INSTANCE_MUTEX_RELEASE_FAILED"};
+}
+Failure CompanionInstanceMutexForeign() {
+  return {"COMPANION_INSTANCE_MUTEX_FOREIGN"};
+}
 Failure CredentialAuditGuardReleaseFailed() {
   return {"CREDENTIAL_AUDIT_GUARD_RELEASE_FAILED"};
 }
@@ -4176,6 +4186,290 @@ napi_value ReleaseCredentialMutexCallback(napi_env env, napi_callback_info info)
   return undefined;
 }
 
+// The companion lifetime is guarded by one fixed, per-user kernel mutex.  No
+// caller-provided path, PID, label, or mutex name participates in this
+// boundary.  In particular, the mutex is deliberately separate from the
+// automatic-contribution JSON lock: a filesystem marker cannot provide
+// process-wide exclusion on Windows.
+struct CompanionInstanceMutexLease {
+  HANDLE handle = nullptr;
+  DWORD ownerThreadId = 0;
+  bool active = false;
+};
+
+std::array<CompanionInstanceMutexLease*, 16> gCompanionInstanceMutexLeases{};
+std::mutex gCompanionInstanceMutexLeasesMutex;
+
+bool IsIssuedCompanionInstanceMutexLease(CompanionInstanceMutexLease* lease) {
+  return std::find(
+      gCompanionInstanceMutexLeases.begin(),
+      gCompanionInstanceMutexLeases.end(),
+      lease) != gCompanionInstanceMutexLeases.end();
+}
+
+bool RegisterCompanionInstanceMutexLease(CompanionInstanceMutexLease* lease) {
+  const auto available = std::find(
+      gCompanionInstanceMutexLeases.begin(),
+      gCompanionInstanceMutexLeases.end(),
+      nullptr);
+  if (available == gCompanionInstanceMutexLeases.end()) return false;
+  *available = lease;
+  return true;
+}
+
+bool UnregisterCompanionInstanceMutexLease(CompanionInstanceMutexLease* lease) {
+  const auto existing = std::find(
+      gCompanionInstanceMutexLeases.begin(),
+      gCompanionInstanceMutexLeases.end(),
+      lease);
+  if (existing == gCompanionInstanceMutexLeases.end()) return false;
+  *existing = nullptr;
+  return true;
+}
+
+enum class CompanionInstanceMutexReleaseResult {
+  kReleased,
+  kForeign,
+  kReleaseFailed,
+};
+
+CompanionInstanceMutexReleaseResult ReleaseCompanionInstanceMutexLease(
+    CompanionInstanceMutexLease* lease) {
+  const std::lock_guard<std::mutex> lock(gCompanionInstanceMutexLeasesMutex);
+  if (!IsIssuedCompanionInstanceMutexLease(lease)
+      || !lease->active
+      || lease->handle == nullptr
+      || lease->ownerThreadId != GetCurrentThreadId()) {
+    return CompanionInstanceMutexReleaseResult::kForeign;
+  }
+  if (!ReleaseMutex(lease->handle)) {
+    UnregisterCompanionInstanceMutexLease(lease);
+    CloseHandle(lease->handle);
+    lease->handle = nullptr;
+    lease->active = false;
+    return CompanionInstanceMutexReleaseResult::kReleaseFailed;
+  }
+  UnregisterCompanionInstanceMutexLease(lease);
+  CloseHandle(lease->handle);
+  lease->handle = nullptr;
+  lease->active = false;
+  return CompanionInstanceMutexReleaseResult::kReleased;
+}
+
+void FinalizeCompanionInstanceMutexLease(
+    napi_env,
+    void* data,
+    void*) {
+  auto* lease = static_cast<CompanionInstanceMutexLease*>(data);
+  if (lease == nullptr) return;
+  const std::lock_guard<std::mutex> lock(gCompanionInstanceMutexLeasesMutex);
+  const bool issued = UnregisterCompanionInstanceMutexLease(lease);
+  if (issued && lease->active && lease->handle != nullptr) {
+    // Explicit release is the normal lifecycle.  If V8 finalizes the
+    // external on its owning thread, release before closing; a finalizer on a
+    // different thread cannot safely call ReleaseMutex and therefore only
+    // closes the handle, allowing Windows to report an abandoned mutex to the
+    // next process rather than pretending it was cleanly released.
+    if (lease->ownerThreadId == GetCurrentThreadId()) {
+      ReleaseMutex(lease->handle);
+    }
+    CloseHandle(lease->handle);
+    lease->handle = nullptr;
+    lease->active = false;
+  }
+  delete lease;
+}
+
+bool CompanionInstanceMutexName(std::wstring* name) {
+  std::vector<BYTE> ownerSid;
+  if (!GetCurrentUserSid(&ownerSid)) return false;
+  LPWSTR sidText = nullptr;
+  if (!ConvertSidToStringSidW(ownerSid.data(), &sidText) || sidText == nullptr) {
+    return false;
+  }
+  *name = L"Local\\TiboTattle-CompanionInstance-v1-";
+  name->append(sidText);
+  LocalFree(sidText);
+  return true;
+}
+
+napi_value AcquireCompanionInstanceMutexCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 0)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+
+  std::wstring name;
+  if (!CompanionInstanceMutexName(&name)) {
+    return ThrowFailure(env, OperationFailed());
+  }
+  std::vector<BYTE> ownerSid;
+  PACL acl = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  SECURITY_ATTRIBUTES attributes{};
+  if (!BuildOwnerOnlyObjectSecurity(
+          kCredentialMutexAccess,
+          &ownerSid,
+          &acl,
+          &descriptor,
+          &attributes)) {
+    return ThrowFailure(env, OperationFailed());
+  }
+  HANDLE handle = CreateMutexExW(
+      &attributes,
+      name.c_str(),
+      0,
+      kCredentialMutexAccess);
+  FreeOwnerOnlySecurity(acl, descriptor);
+  if (handle == nullptr) return ThrowFailure(env, FromLastError());
+
+  SecuritySnapshot security;
+  if (!ReadObjectSecurity(handle, SE_KERNEL_OBJECT, &security)
+      || !IsOwnerOnlySecurity(security)) {
+    CloseHandle(handle);
+    return ThrowFailure(env, SecurityPolicy("companion_instance_mutex_security"));
+  }
+
+  const DWORD waitResult = WaitForSingleObject(handle, 0);
+  bool abandoned = false;
+  if (waitResult == WAIT_TIMEOUT) {
+    CloseHandle(handle);
+    return ThrowFailure(env, CompanionInstanceMutexContended());
+  }
+  if (waitResult == WAIT_ABANDONED_0) {
+    // Ownership transfers atomically to this process.  The JS boundary only
+    // receives the fixed boolean below; no stale process content is exposed.
+    abandoned = true;
+  } else if (waitResult != WAIT_OBJECT_0) {
+    CloseHandle(handle);
+    return ThrowFailure(env, OperationFailed());
+  }
+
+  auto* lease = new (std::nothrow) CompanionInstanceMutexLease{
+      handle,
+      GetCurrentThreadId(),
+      true,
+  };
+  if (lease == nullptr) {
+    ReleaseMutex(handle);
+    CloseHandle(handle);
+    return ThrowFailure(env, OperationFailed());
+  }
+  {
+    const std::lock_guard<std::mutex> lock(gCompanionInstanceMutexLeasesMutex);
+    // Win32 mutexes are recursive for one thread.  The registry closes that
+    // loophole: a second acquisition in this process is rejected without
+    // changing the already-issued lease's ownership or lifetime.
+    for (CompanionInstanceMutexLease* existing : gCompanionInstanceMutexLeases) {
+      if (existing != nullptr && existing->active) {
+        ReleaseMutex(handle);
+        CloseHandle(handle);
+        delete lease;
+        return ThrowFailure(env, CompanionInstanceMutexContended());
+      }
+    }
+    if (!RegisterCompanionInstanceMutexLease(lease)) {
+      ReleaseMutex(handle);
+      CloseHandle(handle);
+      delete lease;
+      return ThrowFailure(env, OperationFailed());
+    }
+  }
+
+  napi_value external;
+  if (napi_create_external(
+          env,
+          lease,
+          FinalizeCompanionInstanceMutexLease,
+          nullptr,
+          &external) != napi_ok) {
+    const std::lock_guard<std::mutex> lock(gCompanionInstanceMutexLeasesMutex);
+    UnregisterCompanionInstanceMutexLease(lease);
+    ReleaseMutex(handle);
+    CloseHandle(handle);
+    delete lease;
+    return ThrowFailure(env, OperationFailed());
+  }
+  napi_value result;
+  napi_value abandonedValue;
+  napi_create_object(env, &result);
+  napi_get_boolean(env, abandoned, &abandonedValue);
+  napi_set_named_property(env, result, "lease", external);
+  napi_set_named_property(env, result, "abandoned", abandonedValue);
+  return result;
+}
+
+napi_value ReleaseCompanionInstanceMutexCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 1)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, arguments[0], &type) != napi_ok
+      || type != napi_external) {
+    return ThrowFailure(env, CompanionInstanceMutexForeign());
+  }
+  void* data = nullptr;
+  if (napi_get_value_external(env, arguments[0], &data) != napi_ok || data == nullptr) {
+    return ThrowFailure(env, CompanionInstanceMutexForeign());
+  }
+  auto* lease = static_cast<CompanionInstanceMutexLease*>(data);
+  const CompanionInstanceMutexReleaseResult releaseResult =
+      ReleaseCompanionInstanceMutexLease(lease);
+  if (releaseResult == CompanionInstanceMutexReleaseResult::kForeign) {
+    return ThrowFailure(env, CompanionInstanceMutexForeign());
+  }
+  if (releaseResult == CompanionInstanceMutexReleaseResult::kReleaseFailed) {
+    return ThrowFailure(env, CompanionInstanceMutexReleaseFailed());
+  }
+  napi_value undefined;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+#if defined(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK)
+napi_value AttemptCompanionInstanceMutexReleaseFromWorkerCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 1)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, arguments[0], &type) != napi_ok
+      || type != napi_external) {
+    return ThrowFailure(env, CompanionInstanceMutexForeign());
+  }
+  void* data = nullptr;
+  if (napi_get_value_external(env, arguments[0], &data) != napi_ok || data == nullptr) {
+    return ThrowFailure(env, CompanionInstanceMutexForeign());
+  }
+  auto* lease = static_cast<CompanionInstanceMutexLease*>(data);
+  std::atomic<int> result(
+      static_cast<int>(CompanionInstanceMutexReleaseResult::kForeign));
+  std::thread worker([lease, &result] {
+    result.store(
+        static_cast<int>(ReleaseCompanionInstanceMutexLease(lease)),
+        std::memory_order_release);
+  });
+  worker.join();
+  napi_value response;
+  napi_value rejected;
+  napi_create_object(env, &response);
+  napi_get_boolean(
+      env,
+      result.load(std::memory_order_acquire)
+          != static_cast<int>(CompanionInstanceMutexReleaseResult::kReleased),
+      &rejected);
+  napi_set_named_property(env, response, "rejected", rejected);
+  return response;
+}
+#endif
+
 void DefineMethod(napi_env env, napi_value exports, const char* name, napi_callback callback) {
   napi_value function;
   napi_create_function(env, name, NAPI_AUTO_LENGTH, callback, nullptr, &function);
@@ -4258,6 +4552,11 @@ NAPI_MODULE_INIT() {
       exports,
       "releaseReplacementPause",
       ReleaseReplacementPauseCallback);
+  DefineMethod(
+      env,
+      exports,
+      "attemptCompanionInstanceMutexReleaseFromWorker",
+      AttemptCompanionInstanceMutexReleaseFromWorkerCallback);
 #endif
   DefineMethod(
       env,
@@ -4271,6 +4570,16 @@ NAPI_MODULE_INIT() {
       ReleaseCredentialAuditFileGuardCallback);
   DefineMethod(env, exports, "acquireCredentialMutex", AcquireCredentialMutexCallback);
   DefineMethod(env, exports, "releaseCredentialMutex", ReleaseCredentialMutexCallback);
+  DefineMethod(
+      env,
+      exports,
+      "acquireCompanionInstanceMutex",
+      AcquireCompanionInstanceMutexCallback);
+  DefineMethod(
+      env,
+      exports,
+      "releaseCompanionInstanceMutex",
+      ReleaseCompanionInstanceMutexCallback);
   napi_value version;
   napi_create_string_utf8(env, "windows-filesystem-v1", NAPI_AUTO_LENGTH, &version);
   napi_set_named_property(env, exports, "contractVersion", version);
@@ -4288,6 +4597,17 @@ NAPI_MODULE_INIT() {
       exports,
       "credentialMutexContractVersion",
       credentialMutexVersion);
+  napi_value companionInstanceMutexVersion;
+  napi_create_string_utf8(
+      env,
+      "windows-companion-instance-mutex-v1",
+      NAPI_AUTO_LENGTH,
+      &companionInstanceMutexVersion);
+  napi_set_named_property(
+      env,
+      exports,
+      "companionInstanceMutexContractVersion",
+      companionInstanceMutexVersion);
   napi_value credentialAuditGuardVersion;
   napi_create_string_utf8(
       env,
@@ -4313,16 +4633,23 @@ NAPI_MODULE_INIT() {
   napi_value productionSafe;
   napi_value pathWalkRaceSafe;
   napi_value credentialMutexSafe;
+  napi_value companionInstanceMutexSafe;
   napi_value sqliteStateLeaseSafe;
   napi_value sqliteStateStagingContractVersion;
   napi_value sqliteStateStagingSafe;
   napi_get_boolean(env, false, &productionSafe);
   napi_get_boolean(env, false, &pathWalkRaceSafe);
   napi_get_boolean(env, true, &credentialMutexSafe);
+  napi_get_boolean(env, false, &companionInstanceMutexSafe);
   napi_get_boolean(env, false, &sqliteStateLeaseSafe);
   napi_set_named_property(env, exports, "productionSafe", productionSafe);
   napi_set_named_property(env, exports, "pathWalkRaceSafe", pathWalkRaceSafe);
   napi_set_named_property(env, exports, "credentialMutexSafe", credentialMutexSafe);
+  napi_set_named_property(
+      env,
+      exports,
+      "companionInstanceMutexSafe",
+      companionInstanceMutexSafe);
   napi_set_named_property(env, exports, "sqliteStateLeaseSafe", sqliteStateLeaseSafe);
   napi_create_string_utf8(
       env,
