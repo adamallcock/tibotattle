@@ -3,8 +3,16 @@ import { fileURLToPath } from "node:url";
 
 import { createCompanionSupervisor } from "./companion-supervisor.js";
 import { createDesktopLifecycle } from "./desktop-lifecycle.js";
-import { ELECTRON_ENTRY_FAILURE_DIAGNOSTIC } from "./errors.js";
+import { ELECTRON_ENTRY_FAILURE_DIAGNOSTIC, shellError } from "./errors.js";
 import { assertElectronPlatformGate } from "./platform-gate.js";
+import {
+  createWindowsElectronQualificationContext,
+  WINDOWS_ELECTRON_QUALIFICATION_MARKER,
+  WINDOWS_ELECTRON_TEST_LANE,
+  runWindowsElectronQualificationCredentialCommand,
+  runWindowsElectronQualificationCredentialProbe,
+  assertWindowsElectronQualificationContext,
+} from "./windows-qualification.js";
 
 const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_COMPANION_SCRIPT = resolve(MODULE_DIRECTORY, "../local/server.js");
@@ -17,6 +25,10 @@ const WINDOWS_ELECTRON_SMOKE_COMMANDS = new Set([
   "tray-show-v1",
   "tray-hide-v1",
   "tray-toggle-v1",
+  "credential-probe-v1",
+  "credential-create-v1",
+  "credential-read-v1",
+  "credential-delete-v1",
   "quit-v1",
 ]);
 
@@ -83,6 +95,35 @@ function emitEntryFailureDiagnostic(writeDiagnostic = process.stderr?.write?.bin
   }
 }
 
+export function assertElectronQualificationLaunchOptions({
+  qualificationContext,
+  companionScript,
+  resourceRoot,
+  resourcesPath,
+  supervisorOptions = {},
+  lifecycleOptions = {},
+} = {}) {
+  if (qualificationContext === null) return;
+  assertWindowsElectronQualificationContext({
+    context: qualificationContext,
+    platform: "win32",
+    architecture: "x64",
+  });
+  if (companionScript !== undefined
+      || resourceRoot !== undefined
+      || resourcesPath !== undefined
+      || supervisorOptions === null
+      || typeof supervisorOptions !== "object"
+      || Array.isArray(supervisorOptions)
+      || Object.keys(supervisorOptions).length !== 0
+      || lifecycleOptions === null
+      || typeof lifecycleOptions !== "object"
+      || Array.isArray(lifecycleOptions)
+      || Object.keys(lifecycleOptions).length !== 0) {
+    throw shellError("windows_qualification_launch_override_forbidden");
+  }
+}
+
 function windowsSmokeStateLine(lifecycle) {
   const state = lifecycle?.state ?? {};
   return `TIBOTATTLE_ELECTRON_SMOKE_STATE started=${state.started === true ? 1 : 0}`
@@ -98,20 +139,35 @@ function windowsSmokeStateLine(lifecycle) {
  * loopback endpoint, or production readiness override is introduced. Unknown
  * commands are ignored and every accepted response is fixed/content-free.
  */
-function installWindowsSmokeControl(lifecycle, {
+export function installWindowsSmokeControl(lifecycle, {
   environment = process.env,
   input = process.stdin,
   output = process.stdout,
+  qualificationContext = null,
 } = {}) {
   if (process.platform !== "win32"
       || environment.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL
         !== WINDOWS_ELECTRON_SMOKE_CONTROL
+      || environment.USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION
+        !== WINDOWS_ELECTRON_QUALIFICATION_MARKER
+      || environment.USAGE_MONITOR_TEST_LANE !== WINDOWS_ELECTRON_TEST_LANE
       || lifecycle?.state?.primaryInstance !== true
+      || !qualificationContext
       || typeof input?.on !== "function") {
+    return () => {};
+  }
+  try {
+    assertWindowsElectronQualificationContext({
+      context: qualificationContext,
+      platform: "win32",
+      architecture: "x64",
+    });
+  } catch {
     return () => {};
   }
   let buffered = "";
   let active = true;
+  let credentialOperation = Promise.resolve();
   const write = (value) => {
     try {
       output?.write?.(value);
@@ -139,6 +195,36 @@ function installWindowsSmokeControl(lifecycle, {
     if (command === "tray-toggle-v1") {
       lifecycle.invokeTrayCommand?.("toggle");
       write(windowsSmokeStateLine(lifecycle));
+      return;
+    }
+    if (command === "credential-probe-v1") {
+      credentialOperation = credentialOperation.then(async () => {
+        try {
+          await runWindowsElectronQualificationCredentialProbe(qualificationContext);
+          write("TIBOTATTLE_ELECTRON_SMOKE_CREDENTIAL_PROBE_PASSED\n");
+        } catch {
+          write("TIBOTATTLE_ELECTRON_SMOKE_CREDENTIAL_PROBE_FAILED\n");
+        }
+      });
+      credentialOperation.catch(() => {});
+      return;
+    }
+    if (command.startsWith("credential-") && command.endsWith("-v1")) {
+      credentialOperation = credentialOperation.then(async () => {
+        try {
+          await runWindowsElectronQualificationCredentialCommand({
+            context: qualificationContext,
+            command: command.slice("credential-".length),
+            runId: environment.USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID,
+          });
+          write(`TIBOTATTLE_ELECTRON_SMOKE_CREDENTIAL_${command
+            .slice("credential-".length, -3).toUpperCase()}_PASSED\n`);
+        } catch {
+          write(`TIBOTATTLE_ELECTRON_SMOKE_CREDENTIAL_${command
+            .slice("credential-".length, -3).toUpperCase()}_FAILED\n`);
+        }
+      });
+      credentialOperation.catch(() => {});
       return;
     }
     // Quit is acknowledged before the window/tray and child are torn down so
@@ -184,7 +270,6 @@ export async function launchElectronShell({
   resourceRoot,
   resourcesPath,
   environment = process.env,
-  readiness = null,
   supervisorOptions = {},
   lifecycleOptions = {},
   emitFailureDiagnostic = false,
@@ -196,6 +281,18 @@ export async function launchElectronShell({
     throw new TypeError("Electron app runtime is unavailable");
   }
   try {
+    const qualificationContext = await createWindowsElectronQualificationContext({
+      app,
+      environment,
+    });
+    assertElectronQualificationLaunchOptions({
+      qualificationContext,
+      companionScript,
+      resourceRoot,
+      resourcesPath,
+      supervisorOptions,
+      lifecycleOptions,
+    });
     const paths = resolveCompanionLaunchPaths({
       app,
       companionScript,
@@ -205,7 +302,7 @@ export async function launchElectronShell({
     assertElectronPlatformGate({
       platform: process.platform,
       architecture: process.arch,
-      readiness,
+      qualificationContext,
     });
     const supervisor = createCompanionSupervisor({
       command: process.execPath,
@@ -233,9 +330,14 @@ export async function launchElectronShell({
       icon: runtime.nativeImage?.createEmpty?.(),
       preloadPath: resolve(MODULE_DIRECTORY, "preload.js"),
       supervisor,
+      appName: isPackagedElectronApp(app) ? "TiboTattle Dev" : "TiboTattle",
       ...lifecycleOptions,
     });
     await lifecycle.start();
+    installWindowsSmokeControl(lifecycle, {
+      environment,
+      qualificationContext,
+    });
     return lifecycle;
   } catch (error) {
     // This includes platform-gate and dependency/configuration failures that
@@ -264,7 +366,6 @@ if (process.versions.electron) {
           });
         });
       }
-      installWindowsSmokeControl(lifecycle);
     })
     .catch(() => {
       process.exitCode = 1;
