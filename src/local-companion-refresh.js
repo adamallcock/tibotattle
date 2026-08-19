@@ -882,6 +882,7 @@ export function createLocalCollectorRefreshRunner({
   // is qualification-only plumbing until sqliteStateLeaseSafe is true; the
   // current production refresh remains fail-closed on Windows.
   windowsSqliteStateSessionFactory = null,
+  windowsSqliteStateStaging = null,
   selectAccountObservationSecret = selectProductionAccountObservationSecret,
   runCollector = runCollectorOnce,
   readAccountingCache = readReplaySafeAccountingCache,
@@ -957,6 +958,11 @@ export function createLocalCollectorRefreshRunner({
   if (windowsSqliteStateSessionFactory !== null
       && typeof windowsSqliteStateSessionFactory !== "function") {
     throw new TypeError("windowsSqliteStateSessionFactory must be a function or null");
+  }
+  if (windowsSqliteStateStaging !== null
+      && (typeof windowsSqliteStateStaging !== "object"
+        || Array.isArray(windowsSqliteStateStaging))) {
+    throw new TypeError("windowsSqliteStateStaging must be an object or null");
   }
   for (const [name, value] of Object.entries({
     stateFile,
@@ -1188,6 +1194,12 @@ export function createLocalCollectorRefreshRunner({
           ...(unifiedIndexSecretFile === null
             ? {}
             : { secretFile: unifiedIndexSecretFile }),
+          ...(windowsSqliteStateSessionFactory === null
+            ? {}
+            : { windowsSqliteStateSessionFactory }),
+          ...(windowsSqliteStateStaging === null
+            ? {}
+            : { windowsSqliteStateStaging }),
           signal,
         }));
       } catch (error) {
