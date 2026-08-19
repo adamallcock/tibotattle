@@ -1,0 +1,356 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tibotattle.com/schemas/release-evidence-v1/manifest.schema.json",
+  "title": "TiboTattle cross-platform release evidence manifest",
+  "description": "Structural form of the offline release-evidence contract. The Node validator additionally checks local file bytes, canonical ordering, duplicate subjects, and platform policy.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "product",
+    "version",
+    "tag",
+    "commit",
+    "repository",
+    "artifacts"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "usage-monitor-release-evidence-v1" },
+    "product": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 1024 }
+      }
+    },
+    "version": { "$ref": "#/$defs/version" },
+    "tag": { "$ref": "#/$defs/tag" },
+    "commit": { "$ref": "#/$defs/commit" },
+    "repository": { "$ref": "#/$defs/repository" },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/artifact" }
+    }
+  },
+  "$defs": {
+    "version": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:[-+][0-9A-Za-z.-]+)?$"
+    },
+    "tag": {
+      "type": "string",
+      "pattern": "^v(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:[-+][0-9A-Za-z.-]+)?$"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40,64}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "repository": {
+      "type": "string",
+      "pattern": "^https://[^/?#]+/[^/?#]+(?:/[^/?#]+)+$"
+    },
+    "fileName": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "tag", "commit", "repository"],
+      "properties": {
+        "version": { "$ref": "#/$defs/version" },
+        "tag": { "$ref": "#/$defs/tag" },
+        "commit": { "$ref": "#/$defs/commit" },
+        "repository": { "$ref": "#/$defs/repository" }
+      }
+    },
+    "attestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "mediaType",
+        "predicateType",
+        "builderId",
+        "signerRepository",
+        "signerWorkflow",
+        "signerDigest",
+        "runUrl",
+        "verificationInputs",
+        "fileName",
+        "bytes",
+        "sha256",
+        "subjectSha256",
+        "source"
+      ],
+      "properties": {
+        "format": { "const": "sigstore-bundle" },
+        "mediaType": { "const": "application/vnd.dev.sigstore.bundle+json;version=0.3" },
+        "predicateType": { "type": "string", "minLength": 1 },
+        "builderId": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "signerRepository": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$" },
+        "signerWorkflow": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/\\.github/workflows/[A-Za-z0-9_.-]+$" },
+        "signerDigest": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+        "runUrl": { "type": "string", "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[1-9][0-9]*(?:/attempt/[1-9][0-9]*)?$" },
+        "verificationInputs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["command", "bundleRequired", "denySelfHostedRunners"],
+          "properties": {
+            "command": { "const": "gh attestation verify --bundle" },
+            "bundleRequired": { "const": true },
+            "denySelfHostedRunners": { "const": true }
+          }
+        },
+        "fileName": { "$ref": "#/$defs/fileName" },
+        "bytes": { "type": "integer", "minimum": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "subjectSha256": { "$ref": "#/$defs/sha256" },
+        "source": { "$ref": "#/$defs/source" }
+      }
+    },
+    "sbom": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "fileName", "bytes", "sha256", "subjectSha256", "source", "attestation"],
+      "properties": {
+        "format": { "const": "spdx-json" },
+        "fileName": { "$ref": "#/$defs/fileName" },
+        "bytes": { "type": "integer", "minimum": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "subjectSha256": { "$ref": "#/$defs/sha256" },
+        "source": { "$ref": "#/$defs/source" },
+        "attestation": {
+          "allOf": [
+            { "$ref": "#/$defs/attestation" },
+            {
+              "type": "object",
+              "properties": {
+                "predicateType": { "const": "https://spdx.dev/Document/v2.3" }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "assurances": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cleanInstallSmokePassed": { "type": "boolean" },
+        "developerIdSigned": { "type": "boolean" },
+        "hardenedRuntime": { "type": "boolean" },
+        "notarizationAccepted": { "type": "boolean" },
+        "ticketStapled": { "type": "boolean" },
+        "gatekeeperAssessmentPassed": { "type": "boolean" },
+        "appNotarizationAccepted": { "type": "boolean" },
+        "appTicketStapled": { "type": "boolean" },
+        "dmgNotarizationAccepted": { "type": "boolean" },
+        "dmgTicketStapled": { "type": "boolean" },
+        "dmgGatekeeperAssessmentPassed": { "type": "boolean" },
+        "cleanProfileSmokePassed": { "type": "boolean" },
+        "sparkleFeedSigned": { "type": "boolean" },
+        "authenticodeSigned": { "type": "boolean" },
+        "timestamped": { "type": "boolean" },
+        "installerSignatureVerified": { "type": "boolean" },
+        "smartScreenReputationObserved": { "type": "boolean" },
+        "artifactIntegrityVerified": { "type": "boolean" },
+        "packageSignatureVerified": { "type": "boolean" },
+        "repositoryMetadataSigned": { "type": "boolean" },
+        "storePublisherVerified": { "type": "boolean" },
+        "storeBuildVerified": { "type": "boolean" },
+        "storeSignatureVerified": { "type": "boolean" },
+        "storeSubmissionAccepted": { "type": "boolean" }
+      }
+    },
+    "nativeTrust": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["signerIdentity", "teamId"],
+          "properties": {
+            "signerIdentity": { "type": "string", "minLength": 1, "maxLength": 512 },
+            "teamId": { "type": "string", "pattern": "^[A-Z0-9]{10}$" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["publisher", "certificateSha256"],
+          "properties": {
+            "publisher": { "type": "string", "minLength": 1, "maxLength": 512 },
+            "certificateSha256": { "$ref": "#/$defs/sha256" },
+            "timestampAuthority": { "type": "string", "minLength": 1, "maxLength": 512 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scheme"],
+          "properties": {
+            "scheme": { "enum": ["none", "appimage-detached", "apt-repository", "rpm-repository"] },
+            "keyFingerprint": { "type": "string", "pattern": "^[A-Fa-f0-9]{40,64}$" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["provider", "publisher", "listing"],
+          "properties": {
+            "provider": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$" },
+            "publisher": { "type": "string", "minLength": 1, "maxLength": 512 },
+            "listing": { "type": "string", "minLength": 1, "maxLength": 512 }
+          }
+        }
+      ]
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceManifestSha256", "unsignedPayloadSha256"],
+      "properties": {
+        "sourceManifestSha256": { "$ref": "#/$defs/sha256" },
+        "unsignedPayloadSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "store": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider"],
+      "properties": {
+        "provider": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$" },
+        "listing": { "type": "string", "minLength": 1, "maxLength": 512 }
+      }
+    },
+    "updaterMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fileName", "bytes", "sha256", "subjectSha256"],
+      "properties": {
+        "fileName": { "$ref": "#/$defs/fileName" },
+        "bytes": { "type": "integer", "minimum": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "subjectSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "updater": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "mechanism", "metadata"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "mechanism": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$" },
+        "metadata": {
+          "anyOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/updaterMetadata" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "enabled": { "const": true } } },
+          "then": { "required": ["metadata"], "properties": { "metadata": { "$ref": "#/$defs/updaterMetadata" } } }
+        },
+        {
+          "if": { "properties": { "enabled": { "const": false } } },
+          "then": { "properties": { "metadata": { "type": "null" } } }
+        }
+      ]
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "platform",
+        "channel",
+        "architecture",
+        "format",
+        "version",
+        "distribution",
+        "downloadUrl",
+        "fileName",
+        "bytes",
+        "sha256",
+        "source",
+        "nativeTrust",
+        "build",
+        "sbom",
+        "provenance",
+        "assurances",
+        "store",
+        "updater"
+      ],
+      "properties": {
+        "platform": { "enum": ["macos", "windows", "linux"] },
+        "channel": { "enum": ["direct", "store"] },
+        "architecture": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,31}$" },
+        "format": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,31}$" },
+        "version": { "$ref": "#/$defs/version" },
+        "distribution": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$" },
+        "downloadUrl": { "type": "string", "pattern": "^https://[^?#]+$" },
+        "fileName": { "$ref": "#/$defs/fileName" },
+        "bytes": { "type": "integer", "minimum": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "source": { "$ref": "#/$defs/source" },
+        "nativeTrust": { "$ref": "#/$defs/nativeTrust" },
+        "build": {
+          "anyOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/build" }
+          ]
+        },
+        "sbom": { "$ref": "#/$defs/sbom" },
+        "provenance": {
+          "allOf": [
+            { "$ref": "#/$defs/attestation" },
+            {
+              "type": "object",
+              "properties": {
+                "predicateType": { "const": "https://slsa.dev/provenance/v1" }
+              }
+            }
+          ]
+        },
+        "assurances": { "$ref": "#/$defs/assurances" },
+        "store": {
+          "anyOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/store" }
+          ]
+        },
+        "updater": { "$ref": "#/$defs/updater" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "channel": { "const": "direct" } } },
+          "then": {
+            "properties": { "build": { "$ref": "#/$defs/build" } }
+          }
+        },
+        {
+          "if": { "properties": { "channel": { "const": "store" } } },
+          "then": {
+            "properties": {
+              "updater": {
+                "type": "object",
+                "properties": {
+                  "enabled": { "const": false },
+                  "mechanism": { "const": "store-managed" },
+                  "metadata": { "type": "null" }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
