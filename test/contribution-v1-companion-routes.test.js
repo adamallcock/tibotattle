@@ -1310,3 +1310,217 @@ test("the credential reset falls back to attribute delete when the read is broke
     await rm(files.root, { recursive: true });
   }
 });
+
+test("the pre-consent review preparation refuses once the v1.0 consent is current", async () => {
+  const files = await fixture();
+  const controller = fakeIncrementalController();
+  let preparations = 0;
+  const app = await startApp(files, {
+    incrementalContributionController: controller,
+    contributionPreparationRunner: async () => {
+      preparations += 1;
+      throw new Error("no coverage in this fixture");
+    },
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const prepare = () => fetch(`${base}/api/local/contribution/prepare`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ lookbackHours: 24 }),
+    });
+
+    // Pre-consent, the ceremony's silent bootstrap reaches preparation: the
+    // stub throws, which is proof the route ran it.
+    const preConsent = await prepare();
+    assert.equal(preConsent.status, 500);
+    assert.equal((await preConsent.json()).errorCode, "preparation_failed");
+    assert.equal(preparations, 1);
+
+    // Approved and current: a prepared set could never deliver — no
+    // scheduler drains the v0.1 queue for this consent model — so the route
+    // refuses before any set is minted (the owner install grew a stranded
+    // 70-file set exactly this way, observed 2026-08-19).
+    await controller.approve();
+    const refused = await prepare();
+    assert.equal(refused.status, 409);
+    const refusal = await refused.json();
+    assert.equal(
+      refusal.schemaVersion,
+      "local-contribution-preparation-error-v0.1",
+    );
+    assert.equal(refusal.errorCode, "consent_already_current");
+    assert.equal(refusal.status, "failed");
+    assert.equal(
+      preparations,
+      1,
+      "an approved Mac never mints a new prepared set",
+    );
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a consent-version change still prepares the fresh review its ceremony needs", async () => {
+  const files = await fixture();
+  // Approved under an older consent version: approved=true, current=false.
+  // The re-approval ceremony legitimately needs one fresh local review
+  // instance, so preparation must stay reachable.
+  const staleController = {
+    async start() {},
+    async stop() {},
+    async approve() {
+      throw new Error("unexpected approve");
+    },
+    async resume() {
+      throw new Error("unexpected resume");
+    },
+    async inspect() {
+      return {
+        schemaVersion: "incremental-contribution-sync-status-v1.0",
+        contractVersion: "telemetry-contribution-v1.0",
+        configured: true,
+        settingsAvailable: true,
+        consent: {
+          approved: true,
+          current: false,
+          consentedAt: "2026-08-08T17:31:13.735Z",
+        },
+        paused: false,
+        pausedReason: null,
+        running: false,
+        progress: null,
+        lastAttemptAt: null,
+        nextAttemptAt: null,
+        lastOutcome: null,
+      };
+    },
+  };
+  let preparations = 0;
+  const app = await startApp(files, {
+    incrementalContributionController: staleController,
+    contributionPreparationRunner: async () => {
+      preparations += 1;
+      throw new Error("no coverage in this fixture");
+    },
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const response = await fetch(`${base}/api/local/contribution/prepare`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1",
+        Origin: base,
+      },
+      body: JSON.stringify({ lookbackHours: 24 }),
+    });
+    assert.equal(response.status, 500);
+    assert.equal((await response.json()).errorCode, "preparation_failed");
+    assert.equal(preparations, 1);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("an approved consent's startup and approval converge superseded v0.1 sets", async () => {
+  const files = await fixture();
+  const controller = fakeIncrementalController();
+  const retirements = [];
+  const retirementRunner = async () => {
+    retirements.push("pass");
+    return {
+      retiredSets: 0,
+      retiredJobs: 0,
+      interrupted: false,
+      networkActivity: false,
+    };
+  };
+
+  // Pre-consent, nothing is superseded and nothing may be retired: the
+  // pending set IS the ceremony's review bootstrap.
+  let app = await startApp(files, {
+    incrementalContributionController: controller,
+    supersededContributionRetirementRunner: retirementRunner,
+  });
+  try {
+    await app.snapshotReady;
+    await settleKicks();
+    assert.equal(retirements.length, 0, "pre-consent startup retires nothing");
+  } finally {
+    await app.close();
+  }
+
+  // The approval itself converges the queue in this process, without waiting
+  // for a relaunch — the same fire-and-forget contract as the first-pass kick.
+  const reviewedPayload = exactReviewContribution();
+  app = await startApp(files, {
+    incrementalContributionController: controller,
+    supersededContributionRetirementRunner: retirementRunner,
+    contributionSyncExactReviewProvider: async () => ({
+      schemaVersion: "contribution-sync-exact-review-v0.1",
+      state: "ready",
+      networkActivity: false,
+      discoveredSets: 1,
+      enqueued: 0,
+      payloadBytes: Buffer.byteLength(JSON.stringify(reviewedPayload), "utf8"),
+      payload: reviewedPayload,
+      reviewBinding: {
+        jobId: REVIEW_JOB_ID,
+        contributionSha256: REVIEW_SHA256,
+      },
+    }),
+  });
+  try {
+    await app.snapshotReady;
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const review = await fetch(
+      `${base}/api/local/contribution/sync-inspect-exact`,
+      { method: "POST", headers, body: "{}" },
+    ).then((response) => response.json());
+    const approve = await fetch(
+      `${base}/api/local/contribution/incremental-approve`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ reviewToken: review.reviewToken }),
+      },
+    );
+    assert.equal(approve.status, 200);
+    await settleKicks();
+    assert.equal(
+      retirements.length,
+      1,
+      "the approval converges the queue without a relaunch",
+    );
+  } finally {
+    await app.close();
+  }
+
+  // Every later launch of the approved Mac runs one bounded pass, which is
+  // how installs that predate this fix (73 stranded jobs) converge.
+  app = await startApp(files, {
+    incrementalContributionController: controller,
+    supersededContributionRetirementRunner: retirementRunner,
+  });
+  try {
+    await app.snapshotReady;
+    await settleKicks();
+    assert.equal(retirements.length, 2, "an approved startup runs one pass");
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});

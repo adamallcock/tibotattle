@@ -228,7 +228,8 @@ const LOCAL_PREPARATION_ERROR_CODES = new Set([
   "review_archive_invalid",
   "prepared_spool_invalid",
   "preparation_in_progress",
-  "preparation_failed"
+  "preparation_failed",
+  "consent_already_current"
 ]);
 
 function array(value) {

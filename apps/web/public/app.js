@@ -19,6 +19,7 @@ import {
   createQuotaTimelineLookup,
   createRefreshPollingBudget,
   contributionReviewBootstrapAction,
+  contributionReviewPreparationPermitted,
   detectDeviationPeriods,
   diagnosticErrorCode,
   diagnosticReferenceSentence,
@@ -9397,11 +9398,24 @@ function maybeReviewPreparedSummary() {
     maybeReportContributionReviewUnavailable();
     return;
   }
-  contributionReviewUnavailableKey = null;
   if (action === "prepare") {
+    // Preparing mints a durable prepared set, so it needs more than "not
+    // known to be approved": the consent verdict must have been positively
+    // read as pre-consent this page load. The approved gate above is
+    // in-memory only — it starts false and a transient status-read failure
+    // leaves it false — and a set prepared on an approved Mac can never
+    // deliver, it only strands queue and disk weight (observed live
+    // 2026-08-19). An unknown verdict shows the explicit recovery instead;
+    // "Check again" re-reads the verdict before walking this path again.
+    if (!contributionReviewPreparationPermitted(incrementalSyncStatus)) {
+      maybeReportContributionReviewUnavailable();
+      return;
+    }
+    contributionReviewUnavailableKey = null;
     maybePrepareIncrementalReviewInstance();
     return;
   }
+  contributionReviewUnavailableKey = null;
   if (contributionSyncExactReview?.state === "ready") return;
   const key = preparedSummaryIdentity();
   if (key === null || key === contributionSyncAutoReviewedKey) return;
@@ -9524,6 +9538,8 @@ const INCREMENTAL_PREPARATION_ERROR_COPY = {
     "Privacy verification rejected the prepared data, so it was not queued or uploaded.",
   preparation_in_progress:
     "A local preparation is already running. Nothing has been uploaded.",
+  consent_already_current:
+    "This Mac already holds the current approval, so no new review instance is needed. Nothing was prepared or uploaded.",
   local_review_timed_out:
     "The local review did not finish within one minute. Choose Check again. If it repeats, reopen TiboTattle. Nothing was uploaded.",
   review_archive_invalid:
@@ -9592,6 +9608,11 @@ async function retryIncrementalReviewBootstrap() {
   contributionReviewUnavailableKey = null;
   setContributionReviewRecoveryVisible(false);
   try {
+    // Consent is re-read before the queue renders, exactly like page load:
+    // the prepare bootstrap requires a positively read pre-consent verdict,
+    // so a retry after a transient status failure must refresh that verdict
+    // or it would report unavailable forever.
+    await loadIncrementalSyncStatus();
     await withContributionReviewDeadline(
       refreshContributionSyncControls(generation),
     );

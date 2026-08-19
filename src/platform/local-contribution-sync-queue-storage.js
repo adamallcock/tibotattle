@@ -557,6 +557,54 @@ export function createLocalContributionSyncQueueStorageContext({
       `).all(limit);
     }
 
+    // The first-review provenance has no durable record of its own under the
+    // approve-once flow, but it is recoverable: the exact review always reads
+    // the oldest still-deliverable job (the same states and order as
+    // nextQueuedJob), so the set holding that job is the instance the local
+    // consent was granted against.
+    function oldestPreparedSetId() {
+      const row = database.prepare(`
+        SELECT prepared_set_id
+          FROM contribution_jobs
+         WHERE state IN ('pending', 'retryable')
+         GROUP BY prepared_set_id
+         ORDER BY MIN(created_at) ASC, prepared_set_id ASC
+         LIMIT 1
+      `).get();
+      return row?.prepared_set_id ?? null;
+    }
+
+    // Sets whose every job is still awaiting delivery. Any accepted row is
+    // upload evidence and any in-flight or rejected row is delivery history;
+    // both keep the whole set out of superseded-pending retirement.
+    function inactivePendingSets(limit) {
+      return database.prepare(`
+        SELECT prepared_set_id, set_name,
+               COUNT(*) AS total_jobs,
+               MIN(created_at) AS enqueued_at
+          FROM contribution_jobs
+         GROUP BY prepared_set_id, set_name
+        HAVING SUM(CASE WHEN state IN ('pending', 'retryable')
+                        THEN 0 ELSE 1 END) = 0
+           AND total_jobs > 0
+         ORDER BY enqueued_at ASC, prepared_set_id ASC
+         LIMIT ?
+      `).all(limit);
+    }
+
+    function deleteInactiveSet(preparedSetId) {
+      return transaction(database, () => database.prepare(`
+        DELETE FROM contribution_jobs
+         WHERE prepared_set_id = ?
+           AND NOT EXISTS (
+             SELECT 1
+               FROM contribution_jobs AS held
+              WHERE held.prepared_set_id = ?
+                AND held.state NOT IN ('pending', 'retryable')
+           )
+      `).run(preparedSetId, preparedSetId));
+    }
+
     function deleteAcceptedSet(preparedSetId) {
       return transaction(database, () => database.prepare(`
         DELETE FROM contribution_jobs
@@ -575,10 +623,13 @@ export function createLocalContributionSyncQueueStorageContext({
       claimJob,
       close: () => database.close(),
       deleteAcceptedSet,
+      deleteInactiveSet,
       enqueueJob,
       finishAccepted,
       finishFailed,
+      inactivePendingSets,
       nextQueuedJob,
+      oldestPreparedSetId,
       preparedSetNextAttemptAt,
       preparedSetStatus,
       readyJobs,

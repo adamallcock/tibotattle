@@ -72,6 +72,7 @@ import {
   inspectContributionSyncQueue,
   inspectNextContributionSyncUpload,
   retireAcceptedContributionArtifacts,
+  retireSupersededPendingContributionArtifacts,
   runContributionSyncQueueOnce,
   setContributionSyncPaused,
 } from "../../src/contribution-sync-queue.js";
@@ -2055,6 +2056,7 @@ const PREPARATION_ERROR_CODES = new Set([
   "prepared_spool_invalid",
   "preparation_in_progress",
   "preparation_failed",
+  "consent_already_current",
 ]);
 
 function preparationResultProjection(value) {
@@ -2154,7 +2156,8 @@ function preparationErrorProjection(error, overrideCode = null) {
 }
 
 function preparationErrorStatus(code) {
-  if (code === "preparation_in_progress") return 409;
+  if (code === "preparation_in_progress"
+      || code === "consent_already_current") return 409;
   if (code === "export_too_large") return 413;
   if (code === "coverage_unavailable"
       || code === "identity_unavailable") return 503;
@@ -2643,6 +2646,7 @@ function createPreparedLocalCompanionServer({
   contributionSyncExactReviewProvider = null,
   contributionSyncOnceRunner = null,
   automaticContributionRetirementRunner = null,
+  supersededContributionRetirementRunner = null,
   contributionSyncPauseSetter = null,
   contributionSyncTimeoutMs = 60_000,
   automaticContributionController = null,
@@ -2762,6 +2766,8 @@ function createPreparedLocalCompanionServer({
         && typeof contributionSyncOnceRunner !== "function")
       || (automaticContributionRetirementRunner !== null
         && typeof automaticContributionRetirementRunner !== "function")
+      || (supersededContributionRetirementRunner !== null
+        && typeof supersededContributionRetirementRunner !== "function")
       || (contributionSyncPauseSetter !== null
         && typeof contributionSyncPauseSetter !== "function")
       || !Number.isSafeInteger(contributionSyncTimeoutMs)
@@ -3008,6 +3014,23 @@ function createPreparedLocalCompanionServer({
           protectedPreparedSetIds,
           signal,
         }));
+  const runSupersededContributionRetirement =
+    supersededContributionRetirementRunner
+    ?? (preparedContributionDirectory === null
+      ? async () => ({
+        retiredSets: 0,
+        retiredJobs: 0,
+        interrupted: false,
+        networkActivity: false,
+      })
+      : ({ signal } = {}) =>
+        retireSupersededPendingContributionArtifacts({
+          preparedSpoolDirectory: preparedContributionDirectory,
+          reviewArchiveDirectory:
+            contributionPreparationOptions.reviewArchiveDirectory,
+          queueFile: contributionQueueFile,
+          signal,
+        }));
   const runAutomaticContributionPreparation = async (request) => {
     if (contributionPreparationInProgress) {
       const error = new Error("preparation_in_progress");
@@ -3150,6 +3173,34 @@ function createPreparedLocalCompanionServer({
       return false;
     }
   };
+  // The durable v1.0 consent verdict, read best-effort. `null` means the
+  // verdict could not be read right now — callers must treat that as unknown,
+  // never as either approved or pre-consent.
+  const incrementalConsentVerdict = async () => {
+    if (incrementalContribution === null) return null;
+    try {
+      const consent = (await incrementalContribution.inspect())?.consent;
+      return consent && typeof consent === "object" ? consent : null;
+    } catch {
+      return null;
+    }
+  };
+  // v0.1 prepared sets on a Mac whose uploads ride the approved v1.0
+  // incremental consent can never deliver — no scheduler drains that queue
+  // any more — so they only accumulate (observed live 2026-08-19: 73 pending
+  // jobs, dueNow 74, lastAcceptedAt null). One bounded pass per trigger
+  // converges such installs while keeping the oldest set: it is the instance
+  // the approve-once consent was reviewed against. Failures are swallowed —
+  // the next launch retries, and delivery state is never touched.
+  const maybeRetireSupersededPreparedSets = async () => {
+    const verdict = await incrementalConsentVerdict();
+    if (verdict?.approved !== true || verdict?.current !== true) return;
+    try {
+      await runSupersededContributionRetirement({});
+    } catch {
+      // Bounded cleanup only; the queue converges on a later pass.
+    }
+  };
   let automaticContributionInstanceLock = null;
   let automaticContributionInstanceLockRelease = null;
   let automaticContributionShutdown = null;
@@ -3222,6 +3273,9 @@ function createPreparedLocalCompanionServer({
           } catch {
             onError("incremental_contribution_start_failed");
           }
+          // Fire-and-forget: superseded v0.1 sets are cleanup, not readiness,
+          // so the snapshot never waits on (or fails with) the pass.
+          void maybeRetireSupersededPreparedSets().catch(() => {});
           snapshotState = { status: "ready", errorCode: null };
           announceSnapshotOutcome();
         } catch (error) {
@@ -3721,6 +3775,24 @@ function createPreparedLocalCompanionServer({
           response,
         );
         if (preparationRequest === null) return;
+        // The v0.1 review preparation exists only for the pre-consent
+        // ceremony. Once the v1.0 incremental consent is approved and
+        // current, a prepared set could never deliver — no scheduler drains
+        // the v0.1 queue for that model — so minting one would only strand
+        // disk and queue weight (observed live 2026-08-19: a 70-file set
+        // pending forever). A consent-version change reads current=false and
+        // legitimately prepares a fresh review; an unreadable verdict also
+        // proceeds, because refusing would deadlock a fresh Mac's ceremony.
+        const consentVerdict = await incrementalConsentVerdict();
+        if (consentVerdict?.approved === true
+            && consentVerdict?.current === true) {
+          send(
+            response,
+            409,
+            preparationErrorProjection(null, "consent_already_current"),
+          );
+          return;
+        }
         if (contributionPreparationInProgress) {
           send(
             response,
@@ -3924,6 +3996,10 @@ function createPreparedLocalCompanionServer({
         } catch {
           // deliberately ignored
         }
+        // The freshly current consent also supersedes any v0.1 sets beyond
+        // the just-reviewed provenance; converge now instead of waiting for
+        // the next launch. Same fire-and-forget contract as the run kick.
+        void maybeRetireSupersededPreparedSets().catch(() => {});
         return;
       }
       if (path === "/api/local/contribution/incremental-run") {

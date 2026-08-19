@@ -24,6 +24,7 @@ import {
   createTelemetryEnvelope,
   detectDeviationPeriods,
   contributionReviewBootstrapAction,
+  contributionReviewPreparationPermitted,
   withContributionReviewDeadline,
   DEVIATION_DRIFT_THRESHOLD_PP,
   DEVIATION_MIN_DURATION_MS,
@@ -3139,6 +3140,45 @@ test("the local review bootstrap is independent of delivery scheduling", () => {
       contributionReviewBootstrapAction(preview),
       "unavailable",
       "a missing or unusable review must become an explicit recovery state",
+    );
+  }
+});
+
+test("the prepare bootstrap requires a positively read pre-consent verdict", () => {
+  assert.equal(
+    contributionReviewPreparationPermitted({
+      status: "available",
+      consent: { approved: false, current: false, consentedAt: null },
+    }),
+    true,
+    "a fresh Mac's ceremony prepares its review instance",
+  );
+  assert.equal(
+    contributionReviewPreparationPermitted({
+      status: "available",
+      consent: { approved: true, current: false, consentedAt: "2026-08-08T17:31:13.735Z" },
+    }),
+    true,
+    "a consent-version change legitimately needs a fresh review",
+  );
+  assert.equal(
+    contributionReviewPreparationPermitted({
+      status: "available",
+      consent: { approved: true, current: true, consentedAt: "2026-08-08T17:31:13.735Z" },
+    }),
+    false,
+    "an approved Mac never mints a set the v0.1 queue cannot deliver",
+  );
+  for (const status of [
+    null,
+    undefined,
+    { status: "unavailable", consent: { approved: false, current: false } },
+    { status: "not_configured", consent: { approved: false, current: false } },
+  ]) {
+    assert.equal(
+      contributionReviewPreparationPermitted(status),
+      false,
+      "an unreadable consent verdict must never prepare",
     );
   }
 });
