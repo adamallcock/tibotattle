@@ -703,6 +703,8 @@ export function createWindowsSqliteStateSession({
 
   const session = {
     contractVersion: WINDOWS_SQLITE_STATE_SESSION_CONTRACT_VERSION,
+    rootPath: root,
+    databaseName: name,
     productionSafe: WINDOWS_SQLITE_STATE_SESSION_PRODUCTION_SAFE,
     sqliteStateLeaseSafe: false,
     database: createDatabaseFacade(database),
