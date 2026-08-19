@@ -832,6 +832,15 @@ bool ResolveFinalPath(HANDLE handle, const ParsedPath* parsed = nullptr) {
 // the NT API declarations while the descriptor builder remains below it.
 bool SetOwnerOnlyDacl(HANDLE handle);
 bool MarkHandleForDeletion(HANDLE handle);
+void FreeOwnerOnlySecurity(PACL acl, PSECURITY_DESCRIPTOR descriptor);
+napi_value IdentityValue(napi_env env, const HandleIdentity& identity);
+bool ParseProtectedChildArguments(
+    napi_env env,
+    const std::vector<napi_value>& arguments,
+    std::wstring* rootPath,
+    HandleIdentity* expectedRoot,
+    std::wstring* childPath,
+    Failure* failure);
 bool BuildOwnerOnlySecurity(
     std::vector<BYTE>* ownerSid,
     PACL* acl,
@@ -1881,7 +1890,7 @@ bool RequireSqliteSidecarsAbsent(
             FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             kFileOpen,
-            kFileNonDirectory,
+            kFileNonDirectoryFile,
             nullptr,
             &sidecar,
             &information,
@@ -1925,7 +1934,7 @@ bool OpenSqliteChild(
           options.access,
           options.shareMode,
           options.disposition,
-          kFileNonDirectory,
+          kFileNonDirectoryFile,
           nullptr,
           &handle,
           &information,
@@ -1951,7 +1960,7 @@ bool OpenSqliteChild(
         options.access,
         options.shareMode,
         options.disposition,
-        kFileNonDirectory,
+        kFileNonDirectoryFile,
         options.securityDescriptor,
         &handle,
         &information,
@@ -2056,7 +2065,7 @@ bool ReserveSqliteSidecar(
       options.access,
       options.shareMode,
       options.disposition,
-      kFileNonDirectory | options.extraOptions,
+      kFileNonDirectoryFile | options.extraOptions,
       options.securityDescriptor,
       &handle,
       &information,
@@ -3365,7 +3374,7 @@ napi_value DeletePreparedFileCallback(
           DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
           FILE_SHARE_READ | FILE_SHARE_WRITE,
           kFileOpen,
-          kFileNonDirectory,
+          kFileNonDirectoryFile,
           nullptr,
           &handle,
           nullptr,

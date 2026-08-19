@@ -15,12 +15,8 @@
       "libraries": ["Advapi32.lib"],
       "msvs_settings": {
         "VCCLCompilerTool": {
-          "ExceptionHandling": 1,
-          "AdditionalOptions": ["/std:c++17"]
+          "ExceptionHandling": 1
         }
-      },
-      "xcode_settings": {
-        "OTHER_CPLUSPLUSFLAGS": ["-std=c++17"]
       }
     }
   ],
@@ -42,12 +38,8 @@
             "libraries": ["Advapi32.lib"],
             "msvs_settings": {
               "VCCLCompilerTool": {
-                "ExceptionHandling": 1,
-                "AdditionalOptions": ["/std:c++17"]
+                "ExceptionHandling": 1
               }
-            },
-            "xcode_settings": {
-              "OTHER_CPLUSPLUSFLAGS": ["-std=c++17"]
             }
           }
         ]
