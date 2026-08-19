@@ -303,10 +303,8 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // Current main contributes the social-preview entry; this Electron slice
-  // adds the app builder, runtime builder, and development verifier.
-  assert.equal(result.records, 81);
-  assert.equal(result.candidates.length, 83);
+  assert.equal(result.records, 84);
+  assert.equal(result.candidates.length, 86);
   assert.ok(result.aliases >= 25);
 });
 
