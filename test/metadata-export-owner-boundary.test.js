@@ -39,6 +39,51 @@ const SAFE_RECORD_EXPORTS = [
   "usageEventIdentitySubject",
 ].sort();
 
+function metadataExportConfiguration({
+  platformName = () => "macos",
+  writeOwnerOnlyPairNoClobber,
+  reviewPairStorage,
+  reviewPairStorageValidator,
+} = {}) {
+  const configuration = {
+    clock: () => 0,
+    codexLogPorts: createLocalCodexLogPorts(),
+    createHash,
+    deriveAccountScopeId: () => "account",
+    deriveEventOccurrenceId: () => "event",
+    deriveMarkerOccurrenceId: () => "marker",
+    deriveModelFingerprint: () => "model",
+    deriveParticipantId: () => "participant",
+    deriveQuotaStateId: () => "quota",
+    deriveSessionScopeId: () => "session",
+    deriveSnapshotObservationId: () => "snapshot",
+    exportCompatibilityTuple: () => ({ version: "test" }),
+    platformName,
+    randomBundleId: () => "bundle:v1:test",
+    resolvePath: resolve,
+    rss: () => 0,
+    sha256Hex: () => "0".repeat(64),
+    writeOwnerOnlyPairNoClobber,
+  };
+  if (reviewPairStorage !== undefined) configuration.reviewPairStorage = reviewPairStorage;
+  if (reviewPairStorageValidator !== undefined) {
+    configuration.reviewPairStorageValidator = reviewPairStorageValidator;
+  }
+  return configuration;
+}
+
+function fakeReviewPairStorage({ writer, reader = async () => ({}) }) {
+  return Object.freeze({
+    contractVersion: "windows-review-pair-storage-v1",
+    writeReviewPair: async () => ({ status: "published" }),
+    readReviewPair: reader,
+    recoverReviewPairTransactions: async () => ({ recovered: 0, transactionsFound: 0 }),
+    recoverOwnerOnlyPairTransactions: async () => ({ recovered: 0, transactionsFound: 0 }),
+    writeOwnerOnlyPairNoClobber: writer,
+    readOwnerOnlyLocalMetadataBundlePair: reader,
+  });
+}
+
 test("metadata export owners expose only their reviewed factories and exact legacy APIs", () => {
   assert.equal(typeof createLocalMetadataExportContext, "function");
   assert.equal(typeof createSafeRecordsContext, "function");
@@ -108,6 +153,85 @@ test("new safe-record and metadata option boundaries fail without reflecting pri
     (error) => error instanceof TypeError
       && !`${error.stack}${JSON.stringify(error)}`.includes("PRIVATE-METADATA-CANARY"),
   );
+});
+
+test("Windows metadata export uses only the reviewed injected writer", async () => {
+  const calls = [];
+  const fallbackCalls = [];
+  const storage = fakeReviewPairStorage({
+    writer: async (request) => {
+      calls.push(request);
+      return { status: "published" };
+    },
+  });
+  const context = createLocalMetadataExportContext(metadataExportConfiguration({
+    platformName: () => "windows",
+    reviewPairStorage: storage,
+    reviewPairStorageValidator: (candidate) => candidate === storage,
+    writeOwnerOnlyPairNoClobber: async () => {
+      fallbackCalls.push(true);
+    },
+  }));
+
+  const result = await context.writeLocalMetadataBundle({
+    bundle: { schemaVersion: "test-bundle" },
+    receipt: { schemaVersion: "test-receipt" },
+    outputFile: "/tmp/review.umx.json",
+    receiptFile: "/tmp/review.privacy-receipt.json",
+  });
+  assert.equal(result.outputFile, "/tmp/review.umx.json");
+  assert.equal(calls.length, 1);
+  assert.equal(fallbackCalls.length, 0);
+  assert.deepEqual(JSON.parse(calls[0].firstContent), { schemaVersion: "test-bundle" });
+  assert.deepEqual(JSON.parse(calls[0].secondContent), { schemaVersion: "test-receipt" });
+});
+
+test("Windows metadata export fails closed without a reviewed writer", async () => {
+  const fallbackCalls = [];
+  const context = createLocalMetadataExportContext(metadataExportConfiguration({
+    platformName: () => "windows",
+    writeOwnerOnlyPairNoClobber: async () => {
+      fallbackCalls.push(true);
+    },
+  }));
+
+  await assert.rejects(
+    context.writeLocalMetadataBundle({
+      bundle: { schemaVersion: "test-bundle" },
+      receipt: { schemaVersion: "test-receipt" },
+      outputFile: "/tmp/review.umx.json",
+      receiptFile: "/tmp/review.privacy-receipt.json",
+    }),
+    (error) => error instanceof TypeError
+      && error.message === "Windows review pair storage writer is required",
+  );
+  assert.equal(fallbackCalls.length, 0);
+});
+
+test("macOS metadata export retains the default writer when a Windows port is present", async () => {
+  const injectedCalls = [];
+  const fallbackCalls = [];
+  const storage = fakeReviewPairStorage({
+    writer: async () => {
+      injectedCalls.push(true);
+    },
+  });
+  const context = createLocalMetadataExportContext(metadataExportConfiguration({
+    platformName: () => "macos",
+    reviewPairStorage: storage,
+    writeOwnerOnlyPairNoClobber: async () => {
+      fallbackCalls.push(true);
+    },
+  }));
+
+  await context.writeLocalMetadataBundle({
+    bundle: { schemaVersion: "test-bundle" },
+    receipt: { schemaVersion: "test-receipt" },
+    outputFile: "/tmp/review.umx.json",
+    receiptFile: "/tmp/review.privacy-receipt.json",
+  });
+  assert.equal(fallbackCalls.length, 1);
+  assert.equal(injectedCalls.length, 0);
 });
 
 test("local Codex ports observe CODEX_HOME at each default-home call and reject hostile values", () => {
