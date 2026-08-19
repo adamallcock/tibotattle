@@ -11,6 +11,14 @@ const DEFAULT_COMPANION_SCRIPT = resolve(MODULE_DIRECTORY, "../local/server.js")
 const DEFAULT_RESOURCE_ROOT = resolve(MODULE_DIRECTORY, "../..");
 const DEFAULT_COMPANION_STATE_DIRECTORY = "companion-state";
 const ELECTRON_SMOKE_CONTROL = "quit-v1";
+const WINDOWS_ELECTRON_SMOKE_CONTROL = "windows-v1";
+const WINDOWS_ELECTRON_SMOKE_COMMANDS = new Set([
+  "status-v1",
+  "tray-show-v1",
+  "tray-hide-v1",
+  "tray-toggle-v1",
+  "quit-v1",
+]);
 
 function isPackagedElectronApp(app) {
   return app?.isPackaged === true;
@@ -73,6 +81,96 @@ function emitEntryFailureDiagnostic(writeDiagnostic = process.stderr?.write?.bin
       // Diagnostic delivery must never prevent fail-closed shutdown.
     }
   }
+}
+
+function windowsSmokeStateLine(lifecycle) {
+  const state = lifecycle?.state ?? {};
+  return `TIBOTATTLE_ELECTRON_SMOKE_STATE started=${state.started === true ? 1 : 0}`
+    + ` primary=${state.primaryInstance === true ? 1 : 0}`
+    + ` window=${state.hasWindow === true ? 1 : 0}`
+    + ` visible=${state.windowVisible === true ? 1 : 0}`
+    + ` tray=${state.hasTray === true ? 1 : 0}\n`;
+}
+
+/**
+ * Install the packaged Windows smoke control only for the exact opt-in test
+ * environment.  It is deliberately stdin-only: no renderer, preload, IPC,
+ * loopback endpoint, or production readiness override is introduced. Unknown
+ * commands are ignored and every accepted response is fixed/content-free.
+ */
+function installWindowsSmokeControl(lifecycle, {
+  environment = process.env,
+  input = process.stdin,
+  output = process.stdout,
+} = {}) {
+  if (process.platform !== "win32"
+      || environment.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL
+        !== WINDOWS_ELECTRON_SMOKE_CONTROL
+      || lifecycle?.state?.primaryInstance !== true
+      || typeof input?.on !== "function") {
+    return () => {};
+  }
+  let buffered = "";
+  let active = true;
+  const write = (value) => {
+    try {
+      output?.write?.(value);
+    } catch {
+      // The smoke harness owns process lifetime; a closed control pipe must
+      // never change the shell's normal shutdown policy.
+    }
+  };
+  const handleCommand = (command) => {
+    if (!WINDOWS_ELECTRON_SMOKE_COMMANDS.has(command)) return;
+    if (command === "status-v1") {
+      write(windowsSmokeStateLine(lifecycle));
+      return;
+    }
+    if (command === "tray-show-v1") {
+      lifecycle.invokeTrayCommand?.("show");
+      write(windowsSmokeStateLine(lifecycle));
+      return;
+    }
+    if (command === "tray-hide-v1") {
+      lifecycle.invokeTrayCommand?.("hide");
+      write(windowsSmokeStateLine(lifecycle));
+      return;
+    }
+    if (command === "tray-toggle-v1") {
+      lifecycle.invokeTrayCommand?.("toggle");
+      write(windowsSmokeStateLine(lifecycle));
+      return;
+    }
+    // Quit is acknowledged before the window/tray and child are torn down so
+    // the harness can distinguish a requested clean quit from a forced kill.
+    write("TIBOTATTLE_ELECTRON_SMOKE_QUIT_ACCEPTED\n");
+    input.pause?.();
+    void Promise.resolve(lifecycle.requestQuit?.()).catch(() => {
+      process.exitCode = 1;
+    });
+  };
+  const onData = (chunk) => {
+    if (!active) return;
+    buffered += String(chunk);
+    while (true) {
+      const lineEnd = buffered.indexOf("\n");
+      if (lineEnd < 0) break;
+      const line = buffered.slice(0, lineEnd).replace(/\r$/u, "");
+      buffered = buffered.slice(lineEnd + 1);
+      handleCommand(line);
+    }
+    // A control line is intentionally tiny. Drop an unbounded unterminated
+    // input rather than allowing a test pipe to become a memory sink.
+    if (buffered.length > 256) buffered = "";
+  };
+  input.setEncoding?.("utf8");
+  input.on("data", onData);
+  input.resume?.();
+  return () => {
+    active = false;
+    input.off?.("data", onData);
+    input.pause?.();
+  };
 }
 
 /**
@@ -166,6 +264,7 @@ if (process.versions.electron) {
           });
         });
       }
+      installWindowsSmokeControl(lifecycle);
     })
     .catch(() => {
       process.exitCode = 1;
