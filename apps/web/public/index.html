@@ -767,8 +767,17 @@
           </div>
             <div class="table-wrap">
               <table>
-                <caption class="sr-only">Replay-safe usage grouped by model, across every allowance</caption>
-                <thead><tr><th>Model</th><th>Usage changes</th><th>Tokens</th><th>Standard API equivalent</th></tr></thead>
+                <caption class="sr-only">Replay-safe usage grouped by model, across every allowance. Each model expands into its token components as rows of the same table.</caption>
+                <thead>
+                  <tr>
+                    <th>Model</th>
+                    <th>Usage changes</th>
+                    <th>Tokens</th>
+                    <th class="model-share-head" data-i18n="accounting.model.shareHeading">Share</th>
+                    <th>Standard API equivalent</th>
+                    <th class="model-share-head" data-i18n="accounting.model.shareHeading">Share</th>
+                  </tr>
+                </thead>
                 <tbody id="accounting-models"></tbody>
               </table>
             </div>
@@ -777,12 +786,28 @@
               <span class="table-pagination-status" id="accounting-model-page-status" role="status"></span>
               <button class="button button-quiet compact" id="accounting-model-page-next" type="button" aria-controls="accounting-models" data-i18n="table.pagination.next">Next</button>
             </div>
+            <p class="annotation" data-i18n="accounting.model.shareOfPeriod">
+              Both share columns are a share of the whole period, so components
+              add up to their model and models add up to the total.
+            </p>
             <p class="annotation" id="accounting-price-coverage" hidden></p>
             <!--
               The expansion of the marker each separately metered row carries.
               The asterisk itself is drawn by the stylesheet so this stays one
               translated sentence rather than a sentence plus a glyph.
             -->
+            <!--
+              The component rows' two withheld cells, explained where they can
+              be read rather than only in a hover title: a title is unreachable
+              on touch and easy to miss with a keyboard, and this table already
+              settles such things in a standing sentence under the rows.
+            -->
+            <p class="annotation" data-i18n="accounting.model.componentFootnote">
+              A component row shows no usage-change count, because one usage
+              change carries every component at once and cannot be divided
+              between them. Where a model states no API equivalent, its
+              components state none either.
+            </p>
             <p class="annotation model-allowance-footnote">
               A model on a separate allowance is listed on its own row and
               carries no API equivalent, because that figure cannot be compared

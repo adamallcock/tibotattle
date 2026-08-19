@@ -1919,6 +1919,66 @@ tbody tr:last-child td { border-bottom: 0; }
 .model-allowance-footnote::before { content: "* "; }
 /* Digits stay column-aligned so counts can be compared down the column. */
 .numeric-cell, .model-api-equivalent { font-variant-numeric: tabular-nums; }
+
+/* A share is the supporting reading of the figure beside it, so it is set
+   smaller and quieter than the amount it qualifies. It keeps its own column
+   rather than stacking under that amount: one column then holds one kind of
+   number, and the decimal points line up down the page. */
+.model-share, .model-share-head {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+/* Only the data cell steps down. The header row keeps one size across every
+   column, so shrinking this one too would make the row look misaligned. */
+.model-share { font-size: .84em; }
+
+/* An expandable model row is a control, so it says so on hover and focus. */
+.model-row-expandable { cursor: pointer; }
+.model-row-expandable:hover > td { background: var(--surface-quiet); }
+.model-row-expandable:focus-visible {
+  outline: 3px solid rgba(49, 95, 132, .42);
+  outline-offset: -3px;
+}
+.model-disclosure-caret {
+  width: .9em;
+  height: .9em;
+  margin-inline-end: var(--space-2);
+  color: var(--muted);
+  vertical-align: -.08em;
+  transition: transform .18s ease;
+}
+.model-row-expandable[aria-expanded="true"] .model-disclosure-caret {
+  transform: rotate(90deg);
+}
+
+/* A component row carries the same columns as the model above it, one level in
+   and one shade quieter, so nothing about its shape has to be relearned. */
+.model-component-row > td { background: var(--surface-quiet); }
+.model-component-identity {
+  padding-inline-start: calc(var(--space-4) + var(--space-5));
+  font-weight: var(--weight-regular);
+}
+.model-component-withheld { color: var(--muted); }
+.component-swatch {
+  display: inline-block;
+  width: .58em;
+  height: .58em;
+  margin-inline-end: var(--space-2);
+  border-radius: 2px;
+  background: var(--muted);
+}
+/* The same four colours the component bars above the table already use, so the
+   rows and the bars read as one encoding rather than two. */
+.component-swatch-input-cache-read-tokens { background: var(--blue); }
+.component-swatch-input-uncached-tokens { background: var(--green-2); }
+.component-swatch-input-cache-write-tokens { background: var(--chart-accent); }
+.component-swatch-output-text-tokens { background: var(--rust); }
+.component-swatch-output-reasoning-tokens { background: var(--amber); }
+.component-swatch-output-combined-tokens { background: var(--ink); }
+
+@media (prefers-reduced-motion: reduce) {
+  .model-disclosure-caret { transition: none; }
+}
 .cache-switch-details { margin-top: 18px; }
 .cache-switch-details th:nth-child(n + 3),
 .cache-switch-details td:nth-child(n + 3) { text-align: end; }

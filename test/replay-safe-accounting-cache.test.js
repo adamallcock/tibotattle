@@ -848,6 +848,52 @@ test("projects replay-safe diagnostics and aggregates costs, dimensions, and 15-
     latest.apiPriceEquivalentUsd,
   );
 
+  // The model table and the component bars are the two margins of one
+  // crossing, so the cells must reconcile in both directions: each model's
+  // components add up to that model's own totals, and the models add up to the
+  // period. Without this a per-model breakdown could drift from the headline
+  // it sits under and still look plausible.
+  for (const row of latest.byModel) {
+    assert.equal(
+      Object.values(row.componentCosts).reduce((sum, cost) => sum + cost.costUsd, 0),
+      row.apiPriceEquivalentUsd,
+      `${row.model} component costs reconcile with its own total`,
+    );
+    assert.equal(
+      Object.entries(row.components).reduce((sum, [key, tokens]) => (
+        // `output_combined_tokens` is an alternative to the text/reasoning
+        // split, never an addition to it, so it is excluded exactly as the
+        // period's own token total excludes it.
+        key === "output_combined_tokens" ? sum : sum + tokens
+      ), row.components.output_combined_tokens),
+      row.totalTokens,
+      `${row.model} components reconcile with its own token total`,
+    );
+  }
+  for (const key of Object.keys(latest.components)) {
+    assert.equal(
+      latest.byModel.reduce((sum, row) => sum + row.components[key], 0),
+      latest.components[key],
+      `${key} tokens add up across models`,
+    );
+    assert.equal(
+      Number(latest.byModel
+        .reduce((sum, row) => sum + row.componentCosts[key].costUsd, 0)
+        .toFixed(6)),
+      latest.componentCosts[key].costUsd,
+      `${key} cost adds up across models`,
+    );
+  }
+  // An unpriced event must stay visible as unpriced on the model row too,
+  // rather than being folded into a priced zero.
+  assert.equal(
+    latest.byModel.reduce(
+      (sum, row) => sum + row.componentCosts.input_uncached_tokens.unpricedTokens,
+      0,
+    ),
+    latest.componentCosts.input_uncached_tokens.unpricedTokens,
+  );
+
   assert.equal(period(cache, "7d").events, 4);
   assert.equal(period(cache, "7d").totalTokens, 7_000_100);
   assert.equal(period(cache, "30d").events, 4);

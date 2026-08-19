@@ -50,7 +50,11 @@ import {
   SEVEN_DAY_WINDOW_MINUTES,
 } from "@app-usagemonitor/quota-analysis";
 import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
-import { SPARK_QUOTA_LIMIT_IDS } from "./local-companion-usage-model.js";
+import {
+  addComponentCosts,
+  emptyComponentCosts,
+  SPARK_QUOTA_LIMIT_IDS,
+} from "./local-companion-usage-model.js";
 import {
   defaultLocalCollectorStatePath,
   prepareLocalCollectorState,
@@ -101,8 +105,14 @@ import { fastQuotaMultiplier } from "./application/index.js";
 // separately and its ETA follows the wall-clock one. A v0.10 cache carries a
 // single `percentagePointsPerHour` whose ETA assumed the reader never paused,
 // so it is withheld and rebuilt rather than reinterpreted.
+// v0.12 (2026-08-19): every `byModel` row carries its own token components and
+// per-component priced cost, so the model table and the component bars are the
+// two margins of one crossing that can now be read cell by cell. A v0.11 row
+// holds only its totals, and the missing cells cannot be recovered by dividing
+// them, so the cache is withheld and rebuilt rather than served with the
+// components silently absent.
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
-  "local-replay-safe-accounting-v0.11";
+  "local-replay-safe-accounting-v0.12";
 const ALLOWANCE_CAPACITY_SCHEMA_VERSION =
   "codex-primary-allowance-capacity-v0.1";
 const ALLOWANCE_SCENARIO_CANDIDATES = Object.freeze({
@@ -714,18 +724,6 @@ function emptyComponents() {
   return Object.fromEntries(COMPONENT_KEYS.map((key) => [key, 0]));
 }
 
-function emptyComponentCosts() {
-  return Object.fromEntries(COMPONENT_KEYS.map((key) => [
-    key,
-    {
-      tokens: 0,
-      pricedTokens: 0,
-      unpricedTokens: 0,
-      costUsd: 0,
-    },
-  ]));
-}
-
 function tokenTotal(components) {
   const input = (components.input_uncached_tokens ?? 0)
     + (components.input_cache_read_tokens ?? 0)
@@ -804,26 +802,6 @@ function addDimension(target, key, event) {
   row.events += 1;
   row.totalTokens += event.totalTokens;
   row.apiPriceEquivalentUsd += event.apiPriceEquivalentUsd;
-}
-
-function addComponentCosts(target, components, priced) {
-  const pricedByName = new Map(
-    (Array.isArray(priced?.components) ? priced.components : [])
-      .map((row) => [row.name, row]),
-  );
-  for (const key of COMPONENT_KEYS) {
-    const tokens = components[key] ?? 0;
-    const row = target[key];
-    const pricedRow = pricedByName.get(key);
-    row.tokens += tokens;
-    if (pricedRow?.pricingStatus === "priced") {
-      row.pricedTokens += tokens;
-      const cost = Number(pricedRow.costUsd);
-      if (Number.isFinite(cost) && cost >= 0) row.costUsd += cost;
-    } else {
-      row.unpricedTokens += tokens;
-    }
-  }
 }
 
 const FAST_PRICE_SCALE = 1_000_000_000;
@@ -1774,6 +1752,14 @@ function addEvent(period, event) {
     events: 0,
     totalTokens: 0,
     apiPriceEquivalentUsd: 0,
+    // The same two crossings the period keeps, kept per model as well. Without
+    // them a reader can see that a model holds most of the tokens and most of
+    // the money but not which component carries either, which is the one
+    // question a model table is asked. Each cell accumulates the amount the
+    // event was actually priced at, so a card revised mid-period is carried
+    // rather than flattened to a single rate.
+    components: emptyComponents(),
+    componentCosts: emptyComponentCosts(),
     pricingCoverage: {
       fullyPricedEvents: 0,
       partiallyPricedEvents: 0,
@@ -1783,6 +1769,8 @@ function addEvent(period, event) {
   model.events += 1;
   model.totalTokens += event.totalTokens;
   model.apiPriceEquivalentUsd += event.apiPriceEquivalentUsd;
+  addComponents(model.components, event.components);
+  addComponentCosts(model.componentCosts, event.components, event.priced);
   model.pricingCoverage[
     event.pricingCoverageStatus === "fully_priced"
       ? "fullyPricedEvents"
@@ -1885,6 +1873,12 @@ function finalizePeriod(period) {
       .map((row) => ({
         ...row,
         apiPriceEquivalentUsd: roundedMoney(row.apiPriceEquivalentUsd),
+        componentCosts: Object.fromEntries(
+          Object.entries(row.componentCosts).map(([key, cost]) => [
+            key,
+            { ...cost, costUsd: roundedMoney(cost.costUsd) },
+          ]),
+        ),
       }))
       .sort(modelUsageRowSort),
     bySpeed: finalizeDimension(period.bySpeed),

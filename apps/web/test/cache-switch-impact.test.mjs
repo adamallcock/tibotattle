@@ -598,6 +598,60 @@ test("cache-switch money rendering distinguishes unavailable from evaluated zero
   }), "$0.01–$0.03");
 });
 
+test("a pager is drawn only when there is more than one page to reach", async () => {
+  const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = source.indexOf("function renderCacheImpactPagination(prefix, state, page) {");
+  const end = source.indexOf("\nfunction renderAccountingCacheSwitchDetails(", start);
+  assert.ok(start >= 0 && end > start, "the pagination renderer is available");
+
+  const build = () => {
+    const nodes = {
+      "#t-pagination": { hidden: null },
+      "#t-page-status": { textContent: "" },
+      "#t-page-prev": { disabled: null },
+      "#t-page-next": { disabled: null },
+    };
+    const render = Function(
+      "$",
+      "setLocalizedText",
+      "formatNumber",
+      `${source.slice(start, end)}\nreturn renderCacheImpactPagination;`,
+    )(
+      (selector) => nodes[selector] ?? null,
+      (element, _key, values) => {
+        if (element) element.textContent = `${values.start}–${values.end} of ${values.total}`;
+      },
+      (value) => String(value),
+    );
+    return { nodes, render };
+  };
+
+  // Every row already visible: the control would say only what the rows say.
+  const single = build();
+  single.render("t", { page: 0 }, { start: 0, end: 6, total: 6, pageCount: 1 });
+  assert.equal(single.nodes["#t-pagination"].hidden, true);
+
+  // Nothing at all is likewise nothing to page through.
+  const empty = build();
+  empty.render("t", { page: 0 }, { start: 0, end: 0, total: 0, pageCount: 1 });
+  assert.equal(empty.nodes["#t-pagination"].hidden, true);
+
+  // More rows than fit: the pager appears and reports the real span, with the
+  // buttons reflecting which end of the set the reader is standing on.
+  const many = build();
+  many.render("t", { page: 0 }, { start: 0, end: 10, total: 25, pageCount: 3 });
+  assert.equal(many.nodes["#t-pagination"].hidden, false);
+  assert.equal(many.nodes["#t-page-status"].textContent, "1–10 of 25");
+  assert.equal(many.nodes["#t-page-prev"].disabled, true);
+  assert.equal(many.nodes["#t-page-next"].disabled, false);
+
+  const last = build();
+  last.render("t", { page: 2 }, { start: 20, end: 25, total: 25, pageCount: 3 });
+  assert.equal(last.nodes["#t-pagination"].hidden, false);
+  assert.equal(last.nodes["#t-page-prev"].disabled, false);
+  assert.equal(last.nodes["#t-page-next"].disabled, true);
+});
+
 test("accounting tables page ten rows and reset for a changed set", async () => {
   const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const start = source.indexOf("const CACHE_IMPACT_TABLE_PAGE_SIZE = 10;");
