@@ -1,4 +1,5 @@
 .git
+.claude
 .pnpm-store
 .release-archive
 .release-build
