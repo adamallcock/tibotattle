@@ -3,8 +3,18 @@ import {
   SEVEN_DAY_WINDOW_MINUTES,
 } from "./quota-windows.js";
 
-const SCHEMA_VERSION = "quota-pace-forecast-v0.1";
+// v0.2 (2026-08-19): the forecast carries two named rates instead of one
+// ambiguous `percentagePointsPerHour`, and the ETA is derived from the
+// wall-clock rate rather than the working-time one. The old key is removed
+// rather than redefined so a reader that never validated the shape gets
+// `undefined` instead of a silently different number.
+const SCHEMA_VERSION = "quota-pace-forecast-v0.2";
+// Names how the ACTIVE rate is derived. The overall rate is a plain
+// movement-over-elapsed quotient and needs no method label.
 const METHOD = "median_adjacent_quota_slope";
+// Which of the two rates `etaAt`, `hoursToExhaustion` and `status` are built
+// from. Stated on the policy object so a consumer never has to infer it.
+const ETA_BASIS = "overall_percentage_points_per_hour";
 const MAXIMUM_RECEIPT_LAG_MS = 5 * 60_000;
 const MAXIMUM_PACE_PP_PER_HOUR = 100;
 const HOUR_MS = 3_600_000;
@@ -130,7 +140,8 @@ function emptyPace() {
     sampleCount: 0,
     elapsedHours: null,
     movementPp: null,
-    percentagePointsPerHour: null,
+    activePercentagePointsPerHour: null,
+    overallPercentagePointsPerHour: null,
   };
 }
 
@@ -182,13 +193,53 @@ function finalResult(current, points, refusalCodes) {
       rates.push(movement / (elapsedMs / HOUR_MS));
     }
   }
-  const percentagePointsPerHour = median(rates);
+  // Two rates, because they answer two different questions and routinely
+  // disagree by an order of magnitude.
+  //
+  // The ACTIVE rate is the median of the adjacent slopes that actually moved.
+  // Dropping the still intervals is load-bearing, not incidental: at a
+  // five-minute polling cadence a normal week has far more still intervals
+  // than moving ones, so an unfiltered median would be exactly zero, trip
+  // `non_positive_pace`, and no forecast would ever be produced. Taking the
+  // median rather than a mean is equally deliberate - it keeps one burst from
+  // defining the working rate.
+  //
+  // The OVERALL rate is total movement over total elapsed time, idle included.
+  //
+  // The ETA is built from the overall rate and never from the active one. The
+  // active rate is measured per *working* hour, so dividing a remaining
+  // allowance by it and reporting the quotient as *wall-clock* hours is a unit
+  // error: it silently assumes the reader never stops. That is what made every
+  // published ETA arrive early (community report, 2026-08-18; 11.3pp/hour
+  // active against 0.97pp/hour overall on 1,109 observations over 4d 4h).
+  const activePercentagePointsPerHour = median(rates);
+  // Both rates are reported only when they are a real, positive rate. A
+  // backward observation makes `movementPp` negative and a still window makes
+  // it zero; neither is a pace, and a negative one would be read downstream as
+  // a rate rather than as the refusal it actually is. The active rate is
+  // already null in both cases - no adjacent interval moved forwards - so this
+  // just keeps the two fields agreeing.
+  const overallPercentagePointsPerHour = elapsedHours > 0 && movementPp > 0
+    ? movementPp / elapsedHours
+    : null;
   const pace = {
     method: METHOD,
     sampleCount: Math.max(0, sorted.length - 1),
     elapsedHours: round(elapsedHours),
     movementPp: round(movementPp),
-    percentagePointsPerHour: round(percentagePointsPerHour),
+    // A working rate above the cap is reported as "not stateable" rather than
+    // taken as grounds to refuse the forecast. Over a five-minute poll the cap
+    // is only 8.3pp, which an ordinary burst clears easily, and this rate no
+    // longer decides anything: it is the without-pausing marker, and the ETA
+    // is built from the wall-clock rate below. Refusing here would blank a
+    // card whose actual forecast is sound.
+    activePercentagePointsPerHour:
+      activePercentagePointsPerHour !== null
+        && activePercentagePointsPerHour > 0
+        && activePercentagePointsPerHour <= MAXIMUM_PACE_PP_PER_HOUR
+        ? round(activePercentagePointsPerHour)
+        : null,
+    overallPercentagePointsPerHour: round(overallPercentagePointsPerHour),
   };
   const result = resultBase(current, "unavailable", refusalCodes, pace);
   if (refusalCodes.length > 0) return result;
@@ -197,16 +248,21 @@ function finalResult(current, points, refusalCodes) {
     result.refusalCodes = ["insufficient_observations"];
     return result;
   }
-  if (!(elapsedHours > 0) || !(movementPp > 0) || !(percentagePointsPerHour > 0)) {
+  // Positive movement over positive elapsed time implies a positive working
+  // rate too, so the wall-clock rate is the only one worth guarding here.
+  if (!(elapsedHours > 0)
+      || !(movementPp > 0)
+      || !(overallPercentagePointsPerHour > 0)) {
     result.refusalCodes = ["non_positive_pace"];
     return result;
   }
-  if (percentagePointsPerHour > MAXIMUM_PACE_PP_PER_HOUR) {
+  // Only the rate the ETA is built from can make the ETA implausible.
+  if (overallPercentagePointsPerHour > MAXIMUM_PACE_PP_PER_HOUR) {
     result.refusalCodes = ["implausible_pace"];
     return result;
   }
   const remainingPp = Math.max(0, 100 - current.usedPercent);
-  const hoursToExhaustion = remainingPp / percentagePointsPerHour;
+  const hoursToExhaustion = remainingPp / overallPercentagePointsPerHour;
   const resetMs = Date.parse(current.resetsAt);
   const etaMs = currentMs + hoursToExhaustion * HOUR_MS;
   const etaDate = new Date(etaMs);
@@ -287,6 +343,7 @@ export function analyzeQuotaPace(input) {
 export const QUOTA_PACE_POLICY = Object.freeze({
   schemaVersion: SCHEMA_VERSION,
   method: METHOD,
+  etaBasis: ETA_BASIS,
   windowDurationMinutes: SEVEN_DAY_WINDOW_MINUTES,
   maximumReceiptLagMs: MAXIMUM_RECEIPT_LAG_MS,
   maximumPacePpPerHour: MAXIMUM_PACE_PP_PER_HOUR,

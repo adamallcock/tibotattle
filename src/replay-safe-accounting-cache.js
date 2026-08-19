@@ -97,8 +97,12 @@ import { fastQuotaMultiplier } from "./application/index.js";
 // default, record the source/generation/context contract, and attach a
 // separate full-history period. A v0.9 cache cannot prove which scanner or
 // generation produced its totals, so it is withheld and rebuilt.
+// v0.11 (2026-08-19): the retained pace forecast names its two rates
+// separately and its ETA follows the wall-clock one. A v0.10 cache carries a
+// single `percentagePointsPerHour` whose ETA assumed the reader never paused,
+// so it is withheld and rebuilt rather than reinterpreted.
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
-  "local-replay-safe-accounting-v0.10";
+  "local-replay-safe-accounting-v0.11";
 const ALLOWANCE_CAPACITY_SCHEMA_VERSION =
   "codex-primary-allowance-capacity-v0.1";
 const ALLOWANCE_SCENARIO_CANDIDATES = Object.freeze({
@@ -1574,7 +1578,10 @@ function paceUnavailable(row, status = "unavailable") {
     currentUsedPercent: Number(row.usedPercent.toFixed(3)),
     remainingPercent: Number(Math.max(0, 100 - row.usedPercent).toFixed(3)),
     resetsAt: row.resetsAt,
-    pace: { percentagePointsPerHour: null },
+    pace: {
+      activePercentagePointsPerHour: null,
+      overallPercentagePointsPerHour: null,
+    },
     etaAt: null,
     hoursToExhaustion: null,
     hoursToReset: Number(
@@ -1598,12 +1605,15 @@ function sanitizeWeeklyPaceForecast(result) {
       || canonicalInstant(result.resetsAt) === null) {
     return null;
   }
-  const rate = result.pace?.percentagePointsPerHour;
+  const activeRate = result.pace?.activePercentagePointsPerHour;
+  const overallRate = result.pace?.overallPercentagePointsPerHour;
   const hoursToExhaustion = result.hoursToExhaustion;
   const hoursToReset = result.hoursToReset;
   const etaAt = result.etaAt === null ? null : canonicalInstant(result.etaAt);
-  if ((rate !== null
-        && (!Number.isFinite(rate) || rate < 0 || rate > 100))
+  const invalidRate = (rate) => rate !== null
+    && (!Number.isFinite(rate) || rate < 0 || rate > 100);
+  if (invalidRate(activeRate)
+      || invalidRate(overallRate)
       || (hoursToExhaustion !== null
         && (!Number.isFinite(hoursToExhaustion) || hoursToExhaustion < 0))
       || (hoursToReset !== null
@@ -1617,8 +1627,10 @@ function sanitizeWeeklyPaceForecast(result) {
     remainingPercent: Number(result.remainingPercent.toFixed(3)),
     resetsAt: result.resetsAt,
     pace: {
-      percentagePointsPerHour:
-        rate === null ? null : Number(rate.toFixed(6)),
+      activePercentagePointsPerHour:
+        activeRate === null ? null : Number(activeRate.toFixed(6)),
+      overallPercentagePointsPerHour:
+        overallRate === null ? null : Number(overallRate.toFixed(6)),
     },
     etaAt,
     hoursToExhaustion: hoursToExhaustion === null
@@ -3650,6 +3662,11 @@ function validQuotaTimeline(
   return true;
 }
 
+function validRetainedPaceRate(rate) {
+  return rate === null
+    || (Number.isFinite(rate) && rate >= 0 && rate <= 100);
+}
+
 function validWeeklyPaceForecast(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)
       || Object.keys(value).sort().join("\0") !== [
@@ -3676,11 +3693,12 @@ function validWeeklyPaceForecast(value) {
       || typeof value.pace !== "object"
       || Array.isArray(value.pace)
       || Object.keys(value.pace).sort().join("\0")
-        !== "percentagePointsPerHour"
-      || (value.pace.percentagePointsPerHour !== null
-        && (!Number.isFinite(value.pace.percentagePointsPerHour)
-          || value.pace.percentagePointsPerHour < 0
-          || value.pace.percentagePointsPerHour > 100))
+        !== [
+          "activePercentagePointsPerHour",
+          "overallPercentagePointsPerHour",
+        ].sort().join("\0")
+      || !validRetainedPaceRate(value.pace.activePercentagePointsPerHour)
+      || !validRetainedPaceRate(value.pace.overallPercentagePointsPerHour)
       || (value.etaAt !== null && canonicalInstant(value.etaAt) === null)
       || (value.hoursToExhaustion !== null
         && (!Number.isFinite(value.hoursToExhaustion)

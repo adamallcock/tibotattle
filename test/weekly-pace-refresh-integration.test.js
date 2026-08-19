@@ -69,7 +69,10 @@ test("refresh projects a safe account-scoped weekly pace ETA", async () => {
     currentUsedPercent: 30,
     remainingPercent: 70,
     resetsAt: "2026-08-10T12:00:00.000Z",
-    pace: { percentagePointsPerHour: 40 },
+    pace: {
+      activePercentagePointsPerHour: 40,
+      overallPercentagePointsPerHour: 40,
+    },
     etaAt: "2026-08-03T14:15:00.000Z",
     hoursToExhaustion: 1.75,
     hoursToReset: 167.5,
@@ -125,7 +128,14 @@ test("pace refresh never combines observations from different account scopes", a
   ]);
 
   assert.equal(cache.weekly.paceForecast.status, "insufficient_observations");
-  assert.equal(cache.weekly.paceForecast.pace.percentagePointsPerHour, null);
+  assert.equal(
+    cache.weekly.paceForecast.pace.activePercentagePointsPerHour,
+    null,
+  );
+  assert.equal(
+    cache.weekly.paceForecast.pace.overallPercentagePointsPerHour,
+    null,
+  );
   assert.equal(cache.weekly.paceForecast.etaAt, null);
 });
 
@@ -159,7 +169,14 @@ test("stale and backward account-scoped history fail closed", async (t) => {
       }),
     ], Date.parse("2026-08-03T13:30:00.000Z"));
     assert.equal(cache.weekly.paceForecast.status, "unavailable");
-    assert.equal(cache.weekly.paceForecast.pace.percentagePointsPerHour, null);
+    assert.equal(
+      cache.weekly.paceForecast.pace.activePercentagePointsPerHour,
+      null,
+    );
+    assert.equal(
+      cache.weekly.paceForecast.pace.overallPercentagePointsPerHour,
+      null,
+    );
     assert.equal(cache.weekly.paceForecast.etaAt, null);
   });
 
