@@ -95,12 +95,14 @@ function createProtectedStoreFixture() {
     sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
     companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
+    preparedArtifactContractVersion: "windows-prepared-artifact-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
     companionInstanceMutexSafe: false,
     credentialAuditFileGuardSafe: true,
     sqliteStateLeaseSafe: false,
+    preparedArtifactSafe: false,
     inspectPath(path) {
       calls.push(["inspectPath", path]);
       return metadata(entryAt(path));
@@ -188,6 +190,18 @@ function createProtectedStoreFixture() {
       entry.identity = identity(nextIdentity++);
       return entry.identity;
     },
+    // Prepared-artifact methods are outside this fixture's scope; provide
+    // valid contract doubles so the adapter can be constructed and the
+    // fixed-state assertions reach the code under test.
+    inspectPreparedChild: () => ({ identity: ROOT_IDENTITY }),
+    ensurePreparedDirectory: () => ROOT_IDENTITY,
+    enumeratePreparedDirectory: () => [],
+    removePreparedDirectory: () => ({ removed: true, identity: ROOT_IDENTITY }),
+    renamePreparedDirectory: () => ({ renamed: true, identity: ROOT_IDENTITY }),
+    createPreparedFile: () => ROOT_IDENTITY,
+    readPreparedFile: () => ({ data: Buffer.from("data"), identity: ROOT_IDENTITY }),
+    deletePreparedFile: () => ({ deleted: true, identity: ROOT_IDENTITY }),
+    publishPreparedFile: () => ({ published: true, identity: ROOT_IDENTITY }),
     acquireSqliteStateLease() {
       return { lease: {}, databaseIdentity: ROOT_IDENTITY, journalIdentity: ROOT_IDENTITY };
     },
