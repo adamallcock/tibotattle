@@ -1,11 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import {
   createServer as createHttpServer,
   request as httpRequest,
 } from "node:http";
+import {
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import {
   chmod,
   lstat,
@@ -62,6 +68,7 @@ import { createWindowsFilesystemAdapter } from "../../src/platform/windows-files
 import {
   WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_ARTIFACT_BYTES,
   WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_CONTRIBUTION_BYTES,
+  createWindowsQualificationModeContext,
 } from "../../src/platform/index.js";
 
 const DEVELOPMENT_COVERAGE = Object.freeze({
@@ -159,6 +166,128 @@ function unqualifiedWindowsFilesystemAdapter({
     architecture: "x64",
     binding,
   });
+}
+
+const WINDOWS_QUALIFICATION_RESOURCE_ROOT = mkdtempSync(
+  join(tmpdir(), "tibotattle-local-qualification-resource-"),
+);
+
+function qualificationResourceSha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function writeQualificationResourceManifest() {
+  const paths = [
+    "apps/electron/companion-supervisor.js",
+    "apps/electron/desktop-lifecycle.js",
+    "apps/electron/errors.js",
+    "apps/electron/loopback-policy.js",
+    "apps/electron/main.js",
+    "apps/electron/platform-gate.js",
+    "apps/electron/preload.js",
+    "apps/electron/ready-line.js",
+    "apps/electron/windows-qualification.js",
+    "apps/local/server.js",
+    "apps/web/public/index.html",
+    "native/windows-filesystem/build/Release/windows_filesystem.node",
+    "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
+    "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node",
+  ].sort((left, right) => Buffer.from(left).compare(Buffer.from(right)));
+  const files = paths.map((path) => {
+    const bytes = Buffer.from(path, "utf8");
+    return {
+      bytes: bytes.byteLength,
+      kind: path.startsWith("apps/electron/")
+        ? "electron_shell"
+        : path.startsWith("apps/web/")
+          ? "dashboard_asset"
+          : path === "apps/local/server.js"
+            ? "companion_source"
+          : path.startsWith("native/")
+            ? "windows_native_binding"
+            : "third_party_dependency",
+      path,
+      sha256: qualificationResourceSha256(bytes),
+    };
+  });
+  const payloadHash = createHash("sha256");
+  let payloadBytes = 0;
+  for (const row of files) {
+    payloadBytes += row.bytes;
+    payloadHash.update(`F\0${row.path}\0${row.bytes}\0${row.sha256}\0${row.kind}\0`);
+  }
+  const binding = files.find((row) =>
+    row.path === "native/windows-filesystem/build/Release/windows_filesystem.node");
+  writeFileSync(
+    join(WINDOWS_QUALIFICATION_RESOURCE_ROOT, "electron-runtime-manifest.json"),
+    `${JSON.stringify({
+      architecture: "x64",
+      dashboardRoot: "apps/web/public",
+      entrypoint: "apps/electron/main.js",
+      files,
+      payload: {
+        bytes: payloadBytes,
+        sha256: payloadHash.digest("hex"),
+      },
+      releaseVersion: "0.1.0-dev",
+      schemaVersion: "usage-monitor-electron-runtime-v0.1",
+      target: "win32",
+      windowsBinding: {
+        binding: {
+          bytes: binding.bytes,
+          path: binding.path,
+          sha256: binding.sha256,
+        },
+        included: true,
+        manifest: {
+          path: "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
+        },
+        status: "included_unverified",
+        verified: false,
+      },
+    })}\n`,
+  );
+}
+
+writeQualificationResourceManifest();
+test.after(() => rmSync(WINDOWS_QUALIFICATION_RESOURCE_ROOT, {
+  recursive: true,
+  force: true,
+}));
+
+function windowsElectronQualificationContext({ adapter, stateRoot, environment = {
+  USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION: "windows-electron-v1",
+  USAGE_MONITOR_TEST_LANE: "windows-electron-smoke",
+  USAGE_MONITOR_ACCOUNTING_SOURCE_MODE: "unified",
+  TEMP: "C:\\Users\\tester\\AppData\\Local\\TiboTattle",
+  HOME: "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\home",
+  USERPROFILE: "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\home",
+  CODEX_HOME: "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\home\\.codex",
+  CLAUDE_CONFIG_DIR: "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\home\\.claude",
+  USAGE_MONITOR_RESOURCE_ROOT: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+  USAGE_MONITOR_STATE_ROOT: stateRoot,
+} }) {
+  return createWindowsQualificationModeContext({
+    platform: "win32",
+    architecture: "x64",
+    environment,
+    adapter,
+    resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+    stateRoot,
+  });
+}
+
+function withNativeWindowsPlatform(callback) {
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", {
+    ...originalPlatform,
+    value: "win32",
+  });
+  try {
+    return callback();
+  } finally {
+    Object.defineProperty(process, "platform", originalPlatform);
+  }
 }
 
 function exactReviewContribution() {
@@ -463,6 +592,101 @@ test("Windows state composition shares one branded adapter and remains unqualifi
     }),
     (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
   );
+});
+
+test("Windows Electron qualification context enables only the bound native composition", () => {
+  const adapter = unqualifiedWindowsFilesystemAdapter();
+  const stateRoot = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state";
+  const context = windowsElectronQualificationContext({ adapter, stateRoot });
+  withNativeWindowsPlatform(() => {
+    const composition = createCompanionWindowsStateComposition({
+      platform: "win32",
+      architecture: "x64",
+      resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+      stateRoot,
+      windowsFilesystemAdapter: adapter,
+      windowsQualificationModeContext: context,
+    });
+    // Qualification mode permits construction only; it must not promote any
+    // production selector or readiness claim.
+    assert.equal(composition.protectedStateStore.productionSafe, false);
+    assert.equal(composition.protectedStateStore.rootBindingSafe, false);
+    assert.equal(composition.protectedStateStore.nativeReadBounded, false);
+    assert.equal(composition.preparedArtifactStorage.readiness, false);
+    assert.equal(composition.preparedContributionContext.productionSafe, false);
+  });
+});
+
+test("Windows Electron qualification stays closed for absent, copied, and path-mismatched contexts", () => {
+  const adapter = unqualifiedWindowsFilesystemAdapter();
+  const stateRoot = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state";
+  const context = windowsElectronQualificationContext({ adapter, stateRoot });
+  const copiedContext = Object.freeze({ ...context });
+  withNativeWindowsPlatform(() => {
+    for (const candidate of [
+      null,
+      copiedContext,
+      windowsElectronQualificationContext({
+        adapter,
+        stateRoot: "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\other",
+      }),
+    ]) {
+      assert.throws(
+        () => createCompanionWindowsStateComposition({
+          platform: "win32",
+          architecture: "x64",
+          resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+          stateRoot,
+          windowsFilesystemAdapter: adapter,
+          windowsQualificationModeContext: candidate,
+        }),
+        (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+      );
+    }
+    assert.throws(
+      () => createCompanionWindowsStateComposition({
+        platform: "win32",
+        architecture: "x64",
+        resourceRoot: join(WINDOWS_QUALIFICATION_RESOURCE_ROOT, "missing"),
+        stateRoot,
+        windowsFilesystemAdapter: adapter,
+        windowsQualificationModeContext: context,
+      }),
+      (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+    );
+  });
+});
+
+test("Windows Electron qualification does not accept a null adapter or a secret-origin marker", async () => {
+  const files = await fixture();
+  const marker = "USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION";
+  const originalMarker = process.env[marker];
+  process.env[marker] = "windows-electron-v1";
+  try {
+    withNativeWindowsPlatform(() => {
+      assert.throws(
+        () => createLocalCompanionServer({
+          environment: {
+            USERPROFILE: join(files.root, "home"),
+            USAGE_MONITOR_WINDOWS_FILESYSTEM_DEVELOPMENT: "1",
+          },
+          resourceRoot: files.resourceRoot,
+          stateRoot: files.stateRoot,
+          codexHome: files.codexHome,
+          staticRoot: files.staticRoot,
+          dataStore: fakeStore(),
+          refreshRunner: async () => ({}),
+          windowsFilesystemAdapter: null,
+        }),
+        (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID"
+          || error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID",
+      );
+    });
+  } finally {
+    if (originalMarker === undefined) delete process.env[marker];
+    else process.env[marker] = originalMarker;
+    await rm(files.root, { recursive: true, force: true });
+  }
 });
 
 test("Windows materializer receives the composed metadata verifier", async () => {

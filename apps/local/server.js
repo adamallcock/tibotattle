@@ -175,6 +175,8 @@ import {
   WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_ARTIFACT_BYTES,
   sha256Hex,
   WINDOWS_SQLITE_STATE_SESSION_PRODUCTION_SAFE,
+  createWindowsQualificationModeContext,
+  isWindowsQualificationModeContextFor,
 } from "../../src/platform/index.js";
 import {
   PRODUCT_BRAND,
@@ -317,6 +319,9 @@ const MAX_DIAGNOSTICS_LOG_BYTES = 256 * 1024;
 const DIAGNOSTIC_REFERENCE = /^TT-[0-9A-HJKMNP-TV-Z]{6}$/u;
 const WINDOWS_FILESYSTEM_DEVELOPMENT_ENV =
   "USAGE_MONITOR_WINDOWS_FILESYSTEM_DEVELOPMENT";
+const WINDOWS_ELECTRON_QUALIFICATION_ENV =
+  "USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION";
+const WINDOWS_ELECTRON_QUALIFICATION_MARKER = "windows-electron-v1";
 // Fixed journey names. Anything else is refused, so no free-form label can
 // ever be written to the log.
 const DIAGNOSTIC_SURFACES = new Set([
@@ -3117,8 +3122,10 @@ export function loadCompanionWindowsFilesystemAdapter({
 export function createCompanionWindowsStateComposition({
   platform = process.platform,
   architecture = process.arch,
+  resourceRoot = null,
   stateRoot,
   windowsFilesystemAdapter = null,
+  windowsQualificationModeContext = null,
   environment = process.env,
   homeDirectory = homedir(),
 } = {}) {
@@ -3146,6 +3153,29 @@ export function createCompanionWindowsStateComposition({
       || !isWindowsFilesystemAdapter(windowsFilesystemAdapter)) {
     throw windowsFilesystemConfigurationError();
   }
+  // The qualification context is a capability, not configuration.  Validate
+  // it against the exact branded adapter and canonical state root before it
+  // is threaded into either of the two qualification-only state consumers.
+  // Hostile/copy-shaped values are treated as absent and therefore remain
+  // behind the normal Windows readiness stop below.
+  let windowsQualificationModeActive = false;
+  try {
+    windowsQualificationModeActive = process.platform === "win32"
+      && isWindowsQualificationModeContextFor(
+        {
+          context: windowsQualificationModeContext,
+          adapter: windowsFilesystemAdapter,
+          stateRoot,
+          resourceRoot,
+        },
+      ) === true;
+  } catch {
+    windowsQualificationModeActive = false;
+  }
+  const authenticWindowsQualificationModeContext =
+    windowsQualificationModeActive
+      ? windowsQualificationModeContext
+      : null;
   let preparedArtifactStorage;
   try {
     preparedArtifactStorage = createWindowsPreparedArtifactStorageContext({
@@ -3230,6 +3260,8 @@ export function createCompanionWindowsStateComposition({
     protectedStateStore = createWindowsProtectedStateStore({
       adapter: windowsFilesystemAdapter,
       rootPath: stateRoot,
+      windowsQualificationModeContext:
+        authenticWindowsQualificationModeContext,
     });
   } catch {
     throw windowsFilesystemConfigurationError();
@@ -3261,7 +3293,8 @@ export function createCompanionWindowsStateComposition({
       && (protectedStateStore.productionSafe !== true
         || protectedStateStore.rootBindingSafe !== true
         || protectedStateStore.nativeReadBounded !== true
-        || WINDOWS_SQLITE_STATE_SESSION_PRODUCTION_SAFE !== true)) {
+        || WINDOWS_SQLITE_STATE_SESSION_PRODUCTION_SAFE !== true)
+      && !windowsQualificationModeActive) {
     throw windowsFilesystemConfigurationError();
   }
   const sqliteStateSessionFactory = (options = {}) => {
@@ -3277,6 +3310,8 @@ export function createCompanionWindowsStateComposition({
       platform,
       architecture,
       adapter: windowsFilesystemAdapter,
+      windowsQualificationModeContext:
+        authenticWindowsQualificationModeContext,
       ...(process.platform === "win32" || databaseFactory === null
         ? {}
         : { databaseFactory }),
@@ -3491,11 +3526,40 @@ export function createLocalCompanionServer(options = {}) {
     stateRoot,
     windowsFilesystemAdapter,
   });
+  const codexHome = assertLocalAbsolutePath(
+    options.codexHome
+      ?? environment.CODEX_HOME
+      ?? join(homeDirectory, ".codex"),
+  );
+  // This mode is deliberately opt-in and exact.  It is constructed only
+  // after the native adapter has been branded and installation has canonical-
+  // ized the state root, so the platform capability can bind itself to the
+  // actual roots the companion will use.  No equivalent is accepted through
+  // a production selector or the older filesystem-development flag.
+  const windowsQualificationModeContext =
+    process.platform === "win32"
+      && environment[WINDOWS_ELECTRON_QUALIFICATION_ENV]
+        === WINDOWS_ELECTRON_QUALIFICATION_MARKER
+      ? createWindowsQualificationModeContext({
+        platform: process.platform,
+        architecture: process.arch,
+        environment,
+        adapter: windowsFilesystemAdapter,
+        resourceRoot: installation.resourceRoot,
+        codexHome,
+        ...(Object.hasOwn(options, "claudeConfigDirectory")
+          ? { claudeConfigDirectory: options.claudeConfigDirectory }
+          : {}),
+        stateRoot: installation.stateRoot,
+      })
+      : null;
   const windowsStateComposition = createCompanionWindowsStateComposition({
     platform: process.platform,
     architecture: process.arch,
+    resourceRoot: installation.resourceRoot,
     stateRoot: installation.stateRoot,
     windowsFilesystemAdapter,
+    windowsQualificationModeContext,
     environment,
     homeDirectory,
   });
@@ -3503,11 +3567,6 @@ export function createLocalCompanionServer(options = {}) {
     installation.resourceRoot,
     options.staticRoot
       ?? resolve(installation.resourceRoot, "apps", "web", "public"),
-  );
-  const codexHome = assertLocalAbsolutePath(
-    options.codexHome
-      ?? environment.CODEX_HOME
-      ?? join(homeDirectory, ".codex"),
   );
   const contributionQueueFile = assertLocalStatePath(
     installation.stateRoot,
