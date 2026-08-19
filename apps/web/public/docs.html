@@ -35,7 +35,7 @@
       </nav>
       <a class="header-download" href="./community.html#download">
         <img src="./apple.svg" alt="" width="14" height="14">
-        <span>Download</span>
+        <span class="header-download-label">Download</span>
       </a>
     </header>
 
@@ -54,12 +54,11 @@
       <div class="resource-grid">
         <article class="resource-card wide download-security-card" id="download-security">
           <p class="security-eyebrow">Download security</p>
-          <h2>How TiboTattle protects every macOS release</h2>
+          <h2>A download you can check</h2>
           <p class="security-lede">
-            Every published DMG must come from an exact tagged source checkout
-            and pass Developer ID signing, Apple notarization, stapling,
-            Gatekeeper assessment, and checksum verification before the
-            download appears on the website.
+            For each published release, TiboTattle gives you a small set of
+            independent signals: public source, platform signing, and the
+            exact bytes for the download you chose.
           </p>
           <ul class="security-signals">
             <li>
@@ -67,61 +66,63 @@
               <span>Review the app and its release tooling in the <a href="https://github.com/adamallcock/tibotattle" target="_blank" rel="noreferrer">public repository</a>.</span>
             </li>
             <li>
-              <strong>Clean tagged build</strong>
-              <span>The release tooling refuses a signed release from a dirty checkout or a commit that does not match its exact release tag.</span>
+              <strong>Signed for the platform</strong>
+              <span>A published direct macOS download is Developer ID signed and notarized. Store subjects use their own signing and acceptance evidence. Other platforms appear here only after their own native release gates pass.</span>
             </li>
             <li>
-              <strong>Developer ID signed and Apple notarized</strong>
-              <span>macOS can verify the publisher, hardened signature, notarization ticket, and Gatekeeper result.</span>
+              <strong>Exact bytes</strong>
+              <span>The website shows the version and SHA-256 for an available download; the release page carries the matching artifact.</span>
             </li>
             <li>
-              <strong>Exact bytes published</strong>
-              <span>The download page and Homebrew pin the release DMG to its SHA-256 checksum.</span>
+              <strong>Release evidence</strong>
+              <span>For a specific release, the GitHub release may also publish a canonical v1 manifest, SBOM, and release-specific provenance bundles that an independent verifier can check against the artifact; fields not published are explicitly null.</span>
             </li>
           </ul>
 
           <section class="verification-guide" aria-labelledby="verify-download-title">
-            <h3 id="verify-download-title">Verify your download</h3>
+            <h3 id="verify-download-title">Four quick checks</h3>
             <p>
-              Compare the first command's output with the SHA-256 shown beside
-              the Download button. Replace <code>/path/to/TiboTattle.dmg</code>
-              with the DMG you downloaded.
+              Open the exact GitHub release, compare its checksum with your
+              download, and let your operating system verify the publisher.
+              For a release that publishes them, the canonical
+              <code>release-manifest.json</code>, SPDX SBOM, and artifact-named
+              provenance bundles are release assets on GitHub and must be
+              independently checked against their named artifact. The website
+              exposes availability and digest; it is not a second evidence
+              store.
             </p>
             <ol class="verification-steps">
-              <li>
-                <span>Check the downloaded bytes.</span>
-                <code class="verification-command">shasum -a 256 "/path/to/TiboTattle.dmg"</code>
-              </li>
-              <li>
-                <span>Ask Gatekeeper to assess the DMG before opening it.</span>
-                <code class="verification-command">spctl --assess --type open --context context:primary-signature --verbose=4 "/path/to/TiboTattle.dmg"</code>
-              </li>
-              <li>
-                <span>Ask Gatekeeper to assess the installed app.</span>
-                <code class="verification-command">spctl --assess --type execute --verbose=4 /Applications/TiboTattle.app</code>
-              </li>
-              <li>
-                <span>Inspect and verify the complete app signature.</span>
-                <code class="verification-command">codesign -dv --verbose=4 /Applications/TiboTattle.app
-codesign --verify --deep --strict --verbose=2 /Applications/TiboTattle.app</code>
-              </li>
+              <li>Use the release page for the exact version and artifact distribution.</li>
+              <li>Compare the published SHA-256 with the downloaded bytes.</li>
+              <li>Use Gatekeeper, Authenticode, a package signature, or the relevant store to verify the platform subject.</li>
+              <li>For source/build evidence, follow the release-specific commands in the canonical guide.</li>
             </ol>
           </section>
 
           <aside class="verification-boundary">
-            <h3>What these checks establish</h3>
+            <h3>Evidence for this release</h3>
             <p>
-              The checksum confirms that your copy matches the published DMG.
-              The Apple checks confirm its Developer ID signature and
-              notarization. TiboTattle's release gate separately requires a
-              clean, exactly tagged source checkout.
+              These checks let you confirm the publisher and channel, the exact
+              downloaded bytes, and—when a trusted hosted workflow for that
+              release publishes and verifies evidence for its exact final
+              bytes—the source/build identity.
+              They are practical, release-specific assurances, not a promise
+              that software is vulnerability-free.
             </p>
             <p>
-              A public cryptographic source-to-binary build attestation is the
-              remaining supply-chain hardening step. It will be added to this
-              guide when the release pipeline publishes one.
+              macOS is the currently available lane. Windows and Linux become
+              official only when their final native artifact and v1 manifest
+              entry are listed in that release. A complete non-null evidence set
+              is the attested path; provenance is never inferred from a public
+              repository or a checksum.
             </p>
           </aside>
+
+          <p class="verification-guide-link">
+            <a href="https://github.com/adamallcock/tibotattle/blob/main/docs/verify-release.md" target="_blank" rel="noreferrer">Read the full verification guide on GitHub</a>
+            for exact commands, release-manifest fields, direct-download versus
+            Store distribution, and authoritative platform documentation.
+          </p>
         </article>
         <article class="resource-card" id="start">
           <h2>Start on your Mac</h2>

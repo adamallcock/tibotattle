@@ -61,6 +61,8 @@ const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
 const BUILD_MANIFEST_SCHEMA = "usage-monitor-macos-app-build-v0.1";
 const RELEASE_MANIFEST_SCHEMA = "usage-monitor-macos-release-v0.2";
+const PUBLIC_RELEASE_SOURCE_REPOSITORY =
+  "https://github.com/adamallcock/tibotattle";
 const STABLE_RELEASE_MANIFEST_MAX_BYTES = 1024 * 1024;
 const PUBLIC_KEY_FINGERPRINT_PATTERN = /^[a-f0-9]{64}$/u;
 const REPLACEMENT_CONTRACT_SCHEMA =
@@ -196,6 +198,90 @@ function requiredReleaseGitOutput(repositoryRoot, arguments_, code) {
   return String(result.stdout ?? "").trim();
 }
 
+function normalizePublicReleaseSourceOrigin(origin) {
+  if (typeof origin !== "string" || origin.length === 0
+      || origin.trim() !== origin || /[\s\0]/u.test(origin)
+      || origin.includes("?") || origin.includes("#")) {
+    return null;
+  }
+  if (origin.startsWith("https://")) {
+    let parsed;
+    try {
+      parsed = new URL(origin);
+    } catch {
+      return null;
+    }
+    const authority = origin.slice("https://".length)
+      .split(/[/?#]/u, 1)[0];
+    const path = parsed.pathname.replace(/\/$/u, "");
+    if (parsed.protocol !== "https:"
+        || authority !== "github.com"
+        || parsed.username
+        || parsed.password
+        || parsed.port
+        || parsed.search
+        || parsed.hash
+        || path !== "/adamallcock/tibotattle"
+          && path !== "/adamallcock/tibotattle.git") {
+      return null;
+    }
+    return PUBLIC_RELEASE_SOURCE_REPOSITORY;
+  }
+  if (/^git@github\.com:/u.test(origin)) {
+    const path = origin.slice("git@github.com:".length);
+    if (/^adamallcock\/tibotattle(?:\.git)?$/u.test(path)) {
+      return PUBLIC_RELEASE_SOURCE_REPOSITORY;
+    }
+    return null;
+  }
+  if (origin.startsWith("ssh://")) {
+    let parsed;
+    try {
+      parsed = new URL(origin);
+    } catch {
+      return null;
+    }
+    const authority = origin.slice("ssh://".length)
+      .split(/[/?#]/u, 1)[0];
+    const path = parsed.pathname.replace(/^\//u, "").replace(/\/$/u, "");
+    if (parsed.protocol !== "ssh:"
+        || authority !== "git@github.com"
+        || parsed.username !== "git"
+        || parsed.password
+        || parsed.port
+        || parsed.search
+        || parsed.hash
+        || !/^adamallcock\/tibotattle(?:\.git)?$/u.test(path)) {
+      return null;
+    }
+    return PUBLIC_RELEASE_SOURCE_REPOSITORY;
+  }
+  return null;
+}
+
+function validateMacOSReleaseSource(source, label = "Release source") {
+  if (!source || typeof source !== "object" || Array.isArray(source)
+      || Object.keys(source).sort().join(",") !== "commit,repository,tag"
+      || source.repository !== PUBLIC_RELEASE_SOURCE_REPOSITORY
+      || typeof source.tag !== "string"
+      || !/^[0-9A-Za-z][0-9A-Za-z._/-]{0,127}$/u.test(source.tag)
+      || source.tag.includes("..")
+      || source.tag.startsWith("/")
+      || source.tag.endsWith("/")
+      || typeof source.commit !== "string"
+      || !/^[0-9a-f]{40,64}$/u.test(source.commit)) {
+    fail(
+      `${label} is not a public TiboTattle source identity`,
+      "MACOS_RELEASE_SOURCE_INVALID",
+    );
+  }
+  return Object.freeze({
+    repository: PUBLIC_RELEASE_SOURCE_REPOSITORY,
+    tag: source.tag,
+    commit: source.commit,
+  });
+}
+
 /**
  * A notarized DMG must name an immutable source revision. Refuse a dirty,
  * lightweight-tagged, or untagged checkout instead of relying on the local
@@ -203,6 +289,7 @@ function requiredReleaseGitOutput(repositoryRoot, arguments_, code) {
  */
 export function readMacOSReleaseSourceProvenance({
   repositoryRoot = REPOSITORY_ROOT,
+  expectedVersion = null,
 } = {}) {
   const root = resolve(repositoryRoot);
   const status = releaseGit(
@@ -216,6 +303,27 @@ export function readMacOSReleaseSourceProvenance({
     fail(
       "A signed release requires a clean source checkout",
       "MACOS_RELEASE_SOURCE_DIRTY",
+    );
+  }
+  const originResult = releaseGit(
+    root,
+    ["config", "--get-all", "remote.origin.url"],
+  );
+  if (originResult.error || originResult.status !== 0) {
+    fail(
+      "A signed release requires the public TiboTattle origin",
+      "MACOS_RELEASE_SOURCE_ORIGIN_REQUIRED",
+    );
+  }
+  const origins = String(originResult.stdout ?? "")
+    .split(/\r?\n/u)
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+  if (origins.length !== 1
+      || normalizePublicReleaseSourceOrigin(origins[0]) === null) {
+    fail(
+      "A signed release requires the exact public TiboTattle origin",
+      "MACOS_RELEASE_SOURCE_ORIGIN_INVALID",
     );
   }
   const commit = requiredReleaseGitOutput(
@@ -259,7 +367,21 @@ export function readMacOSReleaseSourceProvenance({
       "MACOS_RELEASE_PROVENANCE_INVALID",
     );
   }
-  return Object.freeze({ commit, tag });
+  if (expectedVersion !== null
+      && (typeof expectedVersion !== "string"
+        || !/^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:[-+][0-9A-Za-z.-]+)?$/u
+          .test(expectedVersion)
+        || tag !== `v${expectedVersion}`)) {
+    fail(
+      "Release source tag does not identify the app version",
+      "MACOS_RELEASE_SOURCE_VERSION_MISMATCH",
+    );
+  }
+  return validateMacOSReleaseSource({
+    repository: PUBLIC_RELEASE_SOURCE_REPOSITORY,
+    commit,
+    tag,
+  });
 }
 
 /**
@@ -1225,12 +1347,6 @@ function validateSignedReleaseManifest(manifest, label) {
       || !manifest.artifact.fileName.endsWith(".dmg")
       || typeof manifest.artifact?.sha256 !== "string"
       || !/^[a-f0-9]{64}$/u.test(manifest.artifact.sha256)
-      // The public release manifest no longer carries a `source` commit/tag:
-      // this build runs in the private service repository, and publishing its
-      // Git history would leak private-repo revisions onto a customer-facing
-      // asset. Do not require `source` here; legacy manifests that still carry
-      // it remain acceptable so the previous-stable continuity gate keeps
-      // reading already-published v0.2 manifests.
       || REQUIRED_SIGNED_RELEASE_ASSURANCES.some(
         (key) => manifest.assurances?.[key] !== true,
       )
@@ -1252,6 +1368,15 @@ function validateSignedReleaseManifest(manifest, label) {
       `${label} is not a complete signed replacement release manifest`,
       "MACOS_REPLACEMENT_MANIFEST_INVALID",
     );
+  }
+  if (manifest.source !== undefined) {
+    validateMacOSReleaseSource(manifest.source, label);
+    if (manifest.source.tag !== `v${manifest.application.shortVersion}`) {
+      fail(
+        `${label} source tag does not identify the application version`,
+        "MACOS_RELEASE_SOURCE_VERSION_MISMATCH",
+      );
+    }
   }
   if (manifest.channel !== undefined) {
     validateSignedReleaseChannel(manifest, label);
@@ -2150,6 +2275,29 @@ export function validateMacOSLoginItemReleaseRehearsal(receipt, {
   });
 }
 
+function parseMacOSDeveloperIDNativeTrust(signature) {
+  const authorities = [
+    ...signature.matchAll(
+      /^Authority=(Developer ID Application: [^\r\n]+ \(([A-Z0-9]{10})\))$/gmu,
+    ),
+  ];
+  const teamIdentifiers = [
+    ...signature.matchAll(/^TeamIdentifier=([A-Z0-9]{10})$/gmu),
+  ];
+  if (authorities.length !== 1
+      || teamIdentifiers.length !== 1
+      || authorities[0][2] !== teamIdentifiers[0][1]) {
+    fail(
+      "Installed application Developer ID identity is incomplete or ambiguous",
+      "MACOS_DEVELOPER_ID_SIGNATURE_INVALID",
+    );
+  }
+  return Object.freeze({
+    developerIdAuthority: authorities[0][1],
+    teamIdentifier: teamIdentifiers[0][1],
+  });
+}
+
 export async function validateInstalledMacOSApp(appPath, {
   channel = "stable",
   expectedBundleIdentifier = null,
@@ -2181,6 +2329,7 @@ export async function validateInstalledMacOSApp(appPath, {
   ], {
     failureMessage: "Installed application signature verification failed",
   });
+  let nativeTrust = null;
   if (production) {
     const description = runMacOSReleaseCommand("/usr/bin/codesign", [
       "-d",
@@ -2190,10 +2339,10 @@ export async function validateInstalledMacOSApp(appPath, {
       failureMessage: "Installed application signature inspection failed",
     });
     const signature = `${description.stdout}${description.stderr}`;
-    if (!signature.includes("Authority=Developer ID Application:")
-        || !/flags=0x[0-9a-f]+\(runtime\)/iu.test(signature)) {
+    if (!/flags=0x[0-9a-f]+\(runtime\)/iu.test(signature)) {
       fail("Installed application is not Developer ID hardened");
     }
+    nativeTrust = parseMacOSDeveloperIDNativeTrust(signature);
     runMacOSReleaseCommand("/usr/bin/xcrun", [
       "stapler",
       "validate",
@@ -2253,11 +2402,16 @@ export async function validateInstalledMacOSApp(appPath, {
   } finally {
     await rm(isolatedRoot, { recursive: true, force: true });
   }
-  return Object.freeze({
+  const result = {
     bundleIdentifier: inspected.bundleIdentifier,
     production,
     shortVersion: inspected.shortVersion,
-  });
+  };
+  if (nativeTrust !== null) {
+    result.developerIdAuthority = nativeTrust.developerIdAuthority;
+    result.teamIdentifier = nativeTrust.teamIdentifier;
+  }
+  return Object.freeze(result);
 }
 
 export async function validateMacOSDMG(path, {
@@ -2459,17 +2613,17 @@ export async function releaseMacOSApp({
     previousManifest: previousStableManifest,
     stableBootstrap,
   });
-  // Enforce the clean-checkout, annotated-tag build gate, but deliberately do
-  // not carry its result forward. This build runs in the private service
-  // repository, so its HEAD commit/tag identify private Git history that must
-  // not be published on the customer-facing release manifest (see
-  // docs/decisions/2026-08-02-public-client-private-service-provenance-decision.md).
-  // Binding a real *public* repository commit/tag is a separate concern.
-  readMacOSReleaseSourceProvenance();
+  // Bind the signed receipt to the exact public checkout that passed the
+  // clean, annotated-tag gate. The source object is deliberately reduced to
+  // a canonical public URL plus immutable tag/commit values; no local path or
+  // raw Git remote is ever written to a customer-facing artifact.
   const credentials = readMacOSReleaseCredentials(environment);
   const inspectedCandidate = await inspectMacOSApp(appPath, {
     channel: releaseChannel.name,
     requireExternalDistribution: true,
+  });
+  const source = readMacOSReleaseSourceProvenance({
+    expectedVersion: inspectedCandidate.shortVersion,
   });
   if (inspectedCandidate.plist.UsageMonitorCentralOrigin
         !== buildConfiguration.productionOrigin
@@ -2621,6 +2775,7 @@ export async function releaseMacOSApp({
         fileName: basename(selectedOutput),
         sha256: await sha256File(selectedOutput),
       },
+      source,
       assurances: {
         appNotarizationAccepted: true,
         appTicketStapled: true,

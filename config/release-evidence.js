@@ -45,6 +45,29 @@ export const RELEASE_EVIDENCE_TAG_PATTERN =
 export const RELEASE_EVIDENCE_SAFE_FILE_NAME_PATTERN =
   /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/u;
 
+// Bounds are part of the offline contract as well as resource hygiene.  They
+// prevent a downloaded manifest or a descriptor-controlled metadata directory
+// from turning validation into an unbounded memory/CPU operation.
+export const RELEASE_EVIDENCE_MAX_ARTIFACTS = 64;
+export const RELEASE_EVIDENCE_MAX_METADATA_BYTES = 64 * 1024 * 1024;
+export const RELEASE_EVIDENCE_MAX_TOTAL_METADATA_BYTES = 256 * 1024 * 1024;
+export const RELEASE_EVIDENCE_MAX_MANIFEST_BYTES = 8 * 1024 * 1024;
+export const RELEASE_EVIDENCE_MAX_PATH_BYTES = 4096;
+export const RELEASE_EVIDENCE_STORE_RECEIPT_SCHEMA_VERSION =
+  "usage-monitor-store-delivery-receipt-v1";
+export const RELEASE_EVIDENCE_STORE_RECEIPT_FORMAT = "store-delivery-receipt";
+
+export const RELEASE_EVIDENCE_STORE_LISTING_HOSTS = Object.freeze({
+  "mac-app-store": Object.freeze(["apps.apple.com"]),
+  "microsoft-store": Object.freeze(["apps.microsoft.com"]),
+  flathub: Object.freeze(["flathub.org"]),
+  snap: Object.freeze(["snapcraft.io"]),
+  // APT/RPM repositories are intentionally host-neutral: organizations may
+  // operate their own repository.  They still require a canonical HTTPS URL.
+  apt: Object.freeze([]),
+  rpm: Object.freeze([]),
+});
+
 /**
  * The minimum positive assurances for a final artifact.  Linux direct
  * downloads deliberately do not claim a universal OS signing mechanism:
@@ -144,7 +167,7 @@ export const RELEASE_EVIDENCE_STORE_PROVIDERS = Object.freeze({
 });
 
 export const RELEASE_EVIDENCE_PROVENANCE_MEDIA_TYPE_PATTERN =
-  /^application\/vnd\.dev\.sigstore\.bundle\+json;version=0\.3$/u;
+  /^application\/vnd\.dev\.sigstore\.bundle\.v0\.3\+json$/u;
 export const RELEASE_EVIDENCE_PROVENANCE_PREDICATE_PATTERN =
   /^https:\/\/slsa\.dev\/provenance\/v1$/u;
 export const RELEASE_EVIDENCE_SBOM_PREDICATE_PATTERN =

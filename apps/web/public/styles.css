@@ -3285,10 +3285,17 @@ footer p { margin: 0; }
   line-height: 1.55;
 }
 .community-site .security-signals a,
-.community-site .verification-guide a {
+.community-site .verification-guide a,
+.community-site .verification-guide-link a {
   color: var(--green-text);
   font-weight: var(--weight-semibold);
   text-underline-offset: 3px;
+}
+.community-site .verification-guide-link {
+  margin: 22px 0 0;
+  color: var(--muted);
+  font-size: .75rem;
+  line-height: 1.65;
 }
 .community-site .verification-guide {
   margin-top: 30px;
@@ -3312,10 +3319,6 @@ footer p { margin: 0; }
   font-size: .75rem;
   line-height: 1.65;
 }
-.community-site .verification-guide p code {
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-  font-size: .7rem;
-}
 .community-site .verification-steps {
   display: grid;
   gap: 14px;
@@ -3326,21 +3329,6 @@ footer p { margin: 0; }
   padding-inline-start: 4px;
   color: var(--muted);
   font-size: .73rem;
-}
-.community-site .verification-command {
-  display: block;
-  margin-top: 6px;
-  padding: 10px 12px;
-  border: 1px solid rgba(8, 47, 42, .16);
-  border-radius: 6px;
-  color: var(--site-paper);
-  background: var(--site-green-deep);
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-  font-size: .66rem;
-  line-height: 1.55;
-  overflow-x: auto;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
 }
 .community-site .verification-boundary {
   margin-top: 24px;

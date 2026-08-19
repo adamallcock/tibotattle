@@ -1,0 +1,88 @@
+name: Release trust policy
+
+on:
+  pull_request:
+    paths:
+      - ".github/**"
+      - "config/release-evidence.js"
+      - "schemas/release-evidence-v1/**"
+      - "scripts/check-release-workflow-policy.mjs"
+      - "scripts/release-attestation-evidence.mjs"
+      - "scripts/release-evidence.js"
+      - "scripts/release-evidence-*.js"
+      - "scripts/generate-release-evidence.js"
+      - "scripts/macos-release-core.js"
+      - "scripts/build-public-release-site.js"
+      - "scripts/validate-release-sbom.mjs"
+      - "test/release-*.test.js"
+      - "test/macos-app-bundle.test.js"
+      - "test/public-release-site.test.js"
+      - "README.md"
+      - "SECURITY.md"
+      - "docs/**"
+      - "apps/web/public/**"
+      - "apps/web/test/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/**"
+      - "config/release-evidence.js"
+      - "schemas/release-evidence-v1/**"
+      - "scripts/check-release-workflow-policy.mjs"
+      - "scripts/release-attestation-evidence.mjs"
+      - "scripts/release-evidence.js"
+      - "scripts/release-evidence-*.js"
+      - "scripts/generate-release-evidence.js"
+      - "scripts/macos-release-core.js"
+      - "scripts/build-public-release-site.js"
+      - "scripts/validate-release-sbom.mjs"
+      - "test/release-*.test.js"
+      - "test/macos-app-bundle.test.js"
+      - "test/public-release-site.test.js"
+      - "README.md"
+      - "SECURITY.md"
+      - "docs/**"
+      - "apps/web/public/**"
+      - "apps/web/test/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-trust-policy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    name: Release evidence and workflow policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the selected revision
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 26.2.0
+          check-latest: false
+
+      - name: Enforce immutable workflow dependencies and runner policy
+        run: node ./scripts/check-release-workflow-policy.mjs
+
+      - name: Test release evidence and attestation contracts
+        run: node --test test/release-workflow-policy.test.js test/release-evidence.test.js test/release-attestation-action.test.js test/release-sbom-action.test.js
+
+      - name: Test public verification documentation
+        run: node --test apps/web/test/community-site.test.mjs
+
+      - name: Check documentation links
+        run: npm run docs:links:check

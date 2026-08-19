@@ -1,0 +1,222 @@
+name: Attest frozen release artifact
+description: >-
+  Validate a frozen release subject and its SPDX SBOM, then create GitHub
+  artifact and SBOM attestations without uploading artifact/SBOM bytes or
+  publishing a release.
+
+# This action is intentionally local and composable. Each native platform
+# finalizer must invoke it only after signing, packaging, timestamping, and all
+# other operations that can change the final subject bytes are complete.
+#
+# The caller, not this action, owns the permission boundary. A caller must
+# grant id-token: write, attestations: write, and artifact-metadata: write (and
+# normally contents: read) to the protected finalizer job. The action does not
+# accept, print, or persist a custom token or any signing credential.
+#
+# github.repository/ref/sha and job.workflow_ref/job.workflow_sha below are
+# injected from GitHub's trusted context rather than exposed as action inputs.
+# github.workflow_ref/workflow_sha are a compatibility fallback for contexts
+# where the job fields are unavailable. The helper derives the signer identity
+# from those values and fails closed when neither context is present.
+#
+# The action stages an exclusive private copy before actions/attest runs. Both
+# the staged subject and the original input are rehashed before and after
+# cryptographic `gh attestation verify --bundle` checks. This action only
+# preserves verified bundles; it never uploads bytes or publishes a release.
+# Verification uses an official GitHub CLI 2.96.0 archive whose platform-
+# specific SHA-256 is pinned in scripts/release-attestation-evidence.mjs. The
+# action does not trust a preinstalled runner `gh` binary.
+#
+# The release descriptor is checked for an exact artifact/SBOM association and
+# digest when those fields are present. Once both bundles have been verified,
+# the action emits a no-clobber, machine-generated enriched descriptor. It
+# contains the verified bundle metadata and is ready for
+# scripts/generate-release-evidence.js with the emitted base-directory output;
+# callers do not hand-author signer, predicate, builder, run, or runner fields.
+# The canonical cross-platform manifest is generated only after these steps.
+
+inputs:
+  artifact-path:
+    description: Path to the final, immutable artifact subject.
+    required: true
+  sbom-path:
+    description: Path to the SPDX JSON SBOM for the exact artifact subject.
+    required: true
+  evidence-directory:
+    description: Existing or new directory where attestation bundles are copied.
+    required: true
+  release-descriptor-path:
+    description: Path to the release descriptor or generated manifest that identifies this artifact and SBOM.
+    required: true
+outputs:
+  artifact-sha256:
+    description: SHA-256 of the final artifact at preflight and post-attestation.
+    value: ${{ steps.preflight.outputs.artifact-sha256 }}
+  sbom-sha256:
+    description: SHA-256 of the SPDX SBOM at preflight and post-attestation.
+    value: ${{ steps.preflight.outputs.sbom-sha256 }}
+  provenance-bundle-path:
+    description: Workspace path to the artifact-named provenance bundle.
+    value: ${{ steps.collect.outputs.provenance-bundle-path }}
+  sbom-bundle-path:
+    description: Workspace path to the artifact-named SBOM attestation bundle.
+    value: ${{ steps.collect.outputs.sbom-bundle-path }}
+  provenance-bundle-sha256:
+    description: SHA-256 of the copied artifact provenance bundle.
+    value: ${{ steps.collect.outputs.provenance-bundle-sha256 }}
+  sbom-bundle-sha256:
+    description: SHA-256 of the copied SBOM attestation bundle.
+    value: ${{ steps.collect.outputs.sbom-bundle-sha256 }}
+  frozen-artifact-path:
+    description: Private temporary staged artifact path used as the attestation subject.
+    value: ${{ steps.preflight.outputs.frozen-artifact-path }}
+  frozen-sbom-path:
+    description: Private temporary staged SBOM path used during finalization.
+    value: ${{ steps.preflight.outputs.frozen-sbom-path }}
+  signer-workflow:
+    description: Signer workflow identity derived from the trusted GitHub job context.
+    value: ${{ steps.preflight.outputs.signer-workflow }}
+  signer-digest:
+    description: Signer workflow digest derived from the trusted GitHub job context.
+    value: ${{ steps.preflight.outputs.signer-digest }}
+  enriched-release-descriptor-path:
+    description: No-clobber machine-generated descriptor containing metadata bound to the verified bundles.
+    value: ${{ steps.collect.outputs.enriched-release-descriptor-path }}
+  enriched-release-descriptor-base-dir:
+    description: Base directory to pass to scripts/generate-release-evidence.js for the enriched descriptor.
+    value: ${{ steps.collect.outputs.enriched-release-descriptor-base-dir }}
+  verifier-path:
+    description: Absolute path to the pinned GitHub CLI verifier used by the finalizer.
+    value: ${{ steps.verifier.outputs.verifier-path }}
+  verifier-version:
+    description: Exact GitHub CLI verifier version used by the finalizer.
+    value: ${{ steps.verifier.outputs.verifier-version }}
+  verifier-sha256:
+    description: SHA-256 of the exact extracted GitHub CLI verifier binary.
+    value: ${{ steps.verifier.outputs.verifier-sha256 }}
+  verifier-archive-sha256:
+    description: SHA-256 of the pinned official GitHub CLI verifier archive.
+    value: ${{ steps.verifier.outputs.verifier-archive-sha256 }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install pinned GitHub CLI verifier
+      id: verifier
+      shell: node {0}
+      run: |
+        Promise.all([import("node:child_process"), import("node:path")])
+          .then(async ([{ spawnSync }, path]) => {
+            const script = path.join(
+              process.env.GITHUB_WORKSPACE || process.cwd(),
+              "scripts",
+              "release-attestation-evidence.mjs",
+            );
+            const result = spawnSync(process.execPath, [script, "install-verifier"], {
+              stdio: "inherit",
+            });
+            if (result.error) throw result.error;
+            process.exit(result.status ?? 1);
+          })
+          .catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+
+    - name: Validate frozen artifact, SBOM, and release descriptor
+      id: preflight
+      shell: node {0}
+      env:
+        ARTIFACT_PATH: ${{ inputs.artifact-path }}
+        SBOM_PATH: ${{ inputs.sbom-path }}
+        EVIDENCE_DIRECTORY: ${{ inputs.evidence-directory }}
+        RELEASE_DESCRIPTOR_PATH: ${{ inputs.release-descriptor-path }}
+        RELEASE_TRUSTED_REPOSITORY: ${{ github.repository }}
+        RELEASE_TRUSTED_REF: ${{ github.ref }}
+        RELEASE_TRUSTED_SHA: ${{ github.sha }}
+        RELEASE_TRUSTED_WORKFLOW_REF: ${{ job.workflow_ref || github.workflow_ref }}
+        RELEASE_TRUSTED_WORKFLOW_SHA: ${{ job.workflow_sha || github.workflow_sha }}
+        RELEASE_TRUSTED_SERVER_URL: ${{ github.server_url }}
+        RELEASE_TRUSTED_RUN_ID: ${{ github.run_id }}
+        RELEASE_TRUSTED_RUN_ATTEMPT: ${{ github.run_attempt }}
+        RELEASE_ATTESTATION_GH_PATH: ${{ steps.verifier.outputs.verifier-path }}
+        RELEASE_ATTESTATION_GH_VERSION: ${{ steps.verifier.outputs.verifier-version }}
+        RELEASE_ATTESTATION_GH_SHA256: ${{ steps.verifier.outputs.verifier-sha256 }}
+      run: |
+        Promise.all([import("node:child_process"), import("node:path")])
+          .then(([{ spawnSync }, path]) => {
+            const script = path.join(
+              process.env.GITHUB_WORKSPACE || process.cwd(),
+              "scripts",
+              "release-attestation-evidence.mjs",
+            );
+            const result = spawnSync(process.execPath, [script, "preflight"], {
+              stdio: "inherit",
+            });
+            if (result.error) throw result.error;
+            process.exit(result.status ?? 1);
+          })
+          .catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+
+    - name: Attest final artifact provenance
+      id: provenance
+      uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+      with:
+        subject-path: ${{ steps.preflight.outputs.frozen-artifact-path }}
+        show-summary: true
+
+    - name: Attest final artifact SBOM
+      id: sbom
+      uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+      with:
+        subject-path: ${{ steps.preflight.outputs.frozen-artifact-path }}
+        sbom-path: ${{ steps.preflight.outputs.frozen-sbom-path }}
+        show-summary: true
+
+    - name: Preserve and recheck attestation evidence
+      id: collect
+      shell: node {0}
+      env:
+        ARTIFACT_PATH: ${{ inputs.artifact-path }}
+        SBOM_PATH: ${{ inputs.sbom-path }}
+        FROZEN_ARTIFACT_PATH: ${{ steps.preflight.outputs.frozen-artifact-path }}
+        FROZEN_SBOM_PATH: ${{ steps.preflight.outputs.frozen-sbom-path }}
+        EVIDENCE_DIRECTORY: ${{ inputs.evidence-directory }}
+        EXPECTED_ARTIFACT_SHA256: ${{ steps.preflight.outputs.artifact-sha256 }}
+        EXPECTED_SBOM_SHA256: ${{ steps.preflight.outputs.sbom-sha256 }}
+        EXPECTED_DESCRIPTOR_SHA256: ${{ steps.preflight.outputs.descriptor-sha256 }}
+        RELEASE_DESCRIPTOR_PATH: ${{ inputs.release-descriptor-path }}
+        RELEASE_TRUSTED_REPOSITORY: ${{ github.repository }}
+        RELEASE_TRUSTED_REF: ${{ github.ref }}
+        RELEASE_TRUSTED_SHA: ${{ github.sha }}
+        RELEASE_TRUSTED_WORKFLOW_REF: ${{ job.workflow_ref || github.workflow_ref }}
+        RELEASE_TRUSTED_WORKFLOW_SHA: ${{ job.workflow_sha || github.workflow_sha }}
+        RELEASE_TRUSTED_SERVER_URL: ${{ github.server_url }}
+        RELEASE_TRUSTED_RUN_ID: ${{ github.run_id }}
+        RELEASE_TRUSTED_RUN_ATTEMPT: ${{ github.run_attempt }}
+        RELEASE_ATTESTATION_GH_PATH: ${{ steps.verifier.outputs.verifier-path }}
+        RELEASE_ATTESTATION_GH_VERSION: ${{ steps.verifier.outputs.verifier-version }}
+        RELEASE_ATTESTATION_GH_SHA256: ${{ steps.verifier.outputs.verifier-sha256 }}
+        PROVENANCE_BUNDLE_PATH: ${{ steps.provenance.outputs.bundle-path }}
+        SBOM_BUNDLE_PATH: ${{ steps.sbom.outputs.bundle-path }}
+      run: |
+        Promise.all([import("node:child_process"), import("node:path")])
+          .then(([{ spawnSync }, path]) => {
+            const script = path.join(
+              process.env.GITHUB_WORKSPACE || process.cwd(),
+              "scripts",
+              "release-attestation-evidence.mjs",
+            );
+            const result = spawnSync(process.execPath, [script, "collect"], {
+              stdio: "inherit",
+            });
+            if (result.error) throw result.error;
+            process.exit(result.status ?? 1);
+          })
+          .catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });

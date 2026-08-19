@@ -2,27 +2,17 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://tibotattle.com/schemas/release-evidence-v1/manifest.schema.json",
   "title": "TiboTattle cross-platform release evidence manifest",
-  "description": "Structural form of the offline release-evidence contract. The Node validator additionally checks local file bytes, canonical ordering, duplicate subjects, and platform policy.",
+  "description": "Structural form of the offline release-evidence contract. The Node policy validator additionally checks local file bytes, source equality, final Store delivery, canonical ordering, duplicate subjects, and cross-field identity.",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "schemaVersion",
-    "product",
-    "version",
-    "tag",
-    "commit",
-    "repository",
-    "artifacts"
-  ],
+  "required": ["schemaVersion", "product", "version", "tag", "commit", "repository", "artifacts"],
   "properties": {
     "schemaVersion": { "const": "usage-monitor-release-evidence-v1" },
     "product": {
       "type": "object",
       "additionalProperties": false,
       "required": ["name"],
-      "properties": {
-        "name": { "type": "string", "minLength": 1, "maxLength": 1024 }
-      }
+      "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 1024 } }
     },
     "version": { "$ref": "#/$defs/version" },
     "tag": { "$ref": "#/$defs/tag" },
@@ -31,6 +21,7 @@
     "artifacts": {
       "type": "array",
       "minItems": 1,
+      "maxItems": 64,
       "items": { "$ref": "#/$defs/artifact" }
     }
   },
@@ -43,17 +34,11 @@
       "type": "string",
       "pattern": "^v(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:[-+][0-9A-Za-z.-]+)?$"
     },
-    "commit": {
-      "type": "string",
-      "pattern": "^[a-f0-9]{40,64}$"
-    },
-    "sha256": {
-      "type": "string",
-      "pattern": "^[a-f0-9]{64}$"
-    },
+    "commit": { "type": "string", "pattern": "^[a-f0-9]{40,64}$" },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
     "repository": {
       "type": "string",
-      "pattern": "^https://[^/?#]+/[^/?#]+(?:/[^/?#]+)+$"
+      "pattern": "^(?!https://[a-z0-9.-]+(?::[0-9]{1,5})?/.*\\.git$)https://[a-z0-9.-]+(?::[0-9]{1,5})?/[^/?#]+(?:/[^/?#]+)*$"
     },
     "fileName": {
       "type": "string",
@@ -70,48 +55,35 @@
         "repository": { "$ref": "#/$defs/repository" }
       }
     },
+    "verificationInputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "bundleRequired", "denySelfHostedRunners"],
+      "properties": {
+        "command": { "const": "gh attestation verify --bundle" },
+        "bundleRequired": { "const": true },
+        "denySelfHostedRunners": { "const": true }
+      }
+    },
     "attestation": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "format",
-        "mediaType",
-        "predicateType",
-        "builderId",
-        "signerRepository",
-        "signerWorkflow",
-        "signerDigest",
-        "runUrl",
-        "verificationInputs",
-        "fileName",
-        "bytes",
-        "sha256",
-        "subjectSha256",
-        "source"
-      ],
+      "required": ["format", "mediaType", "predicateType", "builderId", "signerRepository", "signerWorkflow", "signerDigest", "runUrl", "verificationInputs", "fileName", "bytes", "sha256", "subjectSha256", "verificationStatus", "source"],
       "properties": {
         "format": { "const": "sigstore-bundle" },
-        "mediaType": { "const": "application/vnd.dev.sigstore.bundle+json;version=0.3" },
+        "mediaType": { "const": "application/vnd.dev.sigstore.bundle.v0.3+json" },
         "predicateType": { "type": "string", "minLength": 1 },
         "builderId": { "type": "string", "minLength": 1, "maxLength": 2048 },
         "signerRepository": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$" },
         "signerWorkflow": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/\\.github/workflows/[A-Za-z0-9_.-]+$" },
         "signerDigest": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
         "runUrl": { "type": "string", "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[1-9][0-9]*(?:/attempt/[1-9][0-9]*)?$" },
-        "verificationInputs": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["command", "bundleRequired", "denySelfHostedRunners"],
-          "properties": {
-            "command": { "const": "gh attestation verify --bundle" },
-            "bundleRequired": { "const": true },
-            "denySelfHostedRunners": { "const": true }
-          }
-        },
+        "verificationInputs": { "$ref": "#/$defs/verificationInputs" },
         "fileName": { "$ref": "#/$defs/fileName" },
-        "bytes": { "type": "integer", "minimum": 1 },
+        "bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
         "sha256": { "$ref": "#/$defs/sha256" },
         "subjectSha256": { "$ref": "#/$defs/sha256" },
+        "verificationStatus": { "const": "unverified" },
         "source": { "$ref": "#/$defs/source" }
       }
     },
@@ -122,19 +94,17 @@
       "properties": {
         "format": { "const": "spdx-json" },
         "fileName": { "$ref": "#/$defs/fileName" },
-        "bytes": { "type": "integer", "minimum": 1 },
+        "bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
         "sha256": { "$ref": "#/$defs/sha256" },
         "subjectSha256": { "$ref": "#/$defs/sha256" },
         "source": { "$ref": "#/$defs/source" },
         "attestation": {
-          "allOf": [
-            { "$ref": "#/$defs/attestation" },
-            {
-              "type": "object",
-              "properties": {
-                "predicateType": { "const": "https://spdx.dev/Document/v2.3" }
-              }
-            }
+          "anyOf": [
+            { "type": "null" },
+            { "allOf": [
+              { "$ref": "#/$defs/attestation" },
+              { "properties": { "predicateType": { "const": "https://spdx.dev/Document/v2.3" } } }
+            ] }
           ]
         }
       }
@@ -169,51 +139,54 @@
         "storeSubmissionAccepted": { "type": "boolean" }
       }
     },
-    "nativeTrust": {
-      "oneOf": [
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["signerIdentity", "teamId"],
-          "properties": {
-            "signerIdentity": { "type": "string", "minLength": 1, "maxLength": 512 },
-            "teamId": { "type": "string", "pattern": "^[A-Z0-9]{10}$" }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["publisher", "certificateSha256"],
-          "properties": {
-            "publisher": { "type": "string", "minLength": 1, "maxLength": 512 },
-            "certificateSha256": { "$ref": "#/$defs/sha256" },
-            "timestampAuthority": { "type": "string", "minLength": 1, "maxLength": 512 }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["scheme"],
-          "properties": {
-            "scheme": { "enum": ["none", "appimage-detached", "apt-repository", "rpm-repository"] },
-            "keyFingerprint": { "type": "string", "pattern": "^[A-Fa-f0-9]{40,64}$" }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["provider", "publisher", "listing"],
-          "properties": {
-            "provider": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$" },
-            "publisher": { "type": "string", "minLength": 1, "maxLength": 512 },
-            "listing": { "type": "string", "minLength": 1, "maxLength": 512 }
-          }
-        }
-      ]
+    "macDirectTrust": {
+      "type": "object", "additionalProperties": false,
+      "required": ["signerIdentity", "teamId"],
+      "properties": {
+        "signerIdentity": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "teamId": { "type": "string", "pattern": "^[A-Z0-9]{10}$" }
+      }
+    },
+    "windowsDirectTrust": {
+      "type": "object", "additionalProperties": false,
+      "required": ["publisher", "certificateSha256"],
+      "properties": {
+        "publisher": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "certificateSha256": { "$ref": "#/$defs/sha256" },
+        "timestampAuthority": { "type": "string", "minLength": 1, "maxLength": 512 }
+      }
+    },
+    "linuxDirectTrust": {
+      "type": "object", "additionalProperties": false,
+      "required": ["scheme"],
+      "properties": {
+        "scheme": { "enum": ["none", "appimage-detached", "apt-repository", "rpm-repository"] },
+        "keyFingerprint": { "type": "string", "pattern": "^[A-Fa-f0-9]{40,64}$" }
+      }
+    },
+    "storeTrust": {
+      "type": "object", "additionalProperties": false,
+      "required": ["provider", "publisher", "listing"],
+      "properties": {
+        "provider": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$" },
+        "publisher": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "listing": { "type": "string", "pattern": "^https://[a-z0-9.-]+(?::[0-9]{1,5})?(?:/[^?#]*)?$" }
+      }
+    },
+    "macStoreListing": {
+      "type": "string", "pattern": "^https://apps\\.apple\\.com(?::[0-9]{1,5})?(?:/[^?#]*)?$"
+    },
+    "microsoftStoreListing": {
+      "type": "string", "pattern": "^https://apps\\.microsoft\\.com(?::[0-9]{1,5})?(?:/[^?#]*)?$"
+    },
+    "flathubListing": {
+      "type": "string", "pattern": "^https://flathub\\.org(?::[0-9]{1,5})?(?:/[^?#]*)?$"
+    },
+    "snapListing": {
+      "type": "string", "pattern": "^https://snapcraft\\.io(?::[0-9]{1,5})?(?:/[^?#]*)?$"
     },
     "build": {
-      "type": "object",
-      "additionalProperties": false,
+      "type": "object", "additionalProperties": false,
       "required": ["sourceManifestSha256", "unsignedPayloadSha256"],
       "properties": {
         "sourceManifestSha256": { "$ref": "#/$defs/sha256" },
@@ -221,46 +194,78 @@
       }
     },
     "store": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["provider"],
+      "type": "object", "additionalProperties": false,
+      "required": ["provider", "listing", "receipt"],
       "properties": {
         "provider": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$" },
-        "listing": { "type": "string", "minLength": 1, "maxLength": 512 }
+        "listing": { "type": "string", "pattern": "^https://[a-z0-9.-]+(?::[0-9]{1,5})?(?:/[^?#]*)?$" },
+        "receipt": { "$ref": "#/$defs/storeReceipt" }
+      }
+    },
+    "storeReceipt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["format", "schemaVersion", "fileName", "bytes", "sha256", "subjectSha256"],
+      "properties": {
+        "format": { "const": "store-delivery-receipt" },
+        "schemaVersion": { "const": "usage-monitor-store-delivery-receipt-v1" },
+        "fileName": { "$ref": "#/$defs/fileName" },
+        "bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "subjectSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "storeDeliveryReceiptDocument": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "schemaVersion", "format", "product", "provider", "listing",
+        "version", "tag", "commit", "repository", "artifactFileName",
+        "artifactBytes", "artifactSha256", "subjectKind", "deliveryState",
+        "uploadCandidate", "retrievedAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "usage-monitor-store-delivery-receipt-v1" },
+        "format": { "const": "store-delivery-receipt" },
+        "product": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "provider": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$" },
+        "listing": { "type": "string", "pattern": "^https://[a-z0-9.-]+(?::[0-9]{1,5})?(?:/[^?#]*)?$" },
+        "version": { "$ref": "#/$defs/version" },
+        "tag": { "$ref": "#/$defs/tag" },
+        "commit": { "$ref": "#/$defs/commit" },
+        "repository": { "$ref": "#/$defs/repository" },
+        "artifactFileName": { "$ref": "#/$defs/fileName" },
+        "artifactBytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "artifactSha256": { "$ref": "#/$defs/sha256" },
+        "subjectKind": { "const": "store-retrieved" },
+        "deliveryState": { "const": "final" },
+        "uploadCandidate": { "const": false },
+        "retrievedAt": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})Z$" }
       }
     },
     "updaterMetadata": {
-      "type": "object",
-      "additionalProperties": false,
+      "type": "object", "additionalProperties": false,
       "required": ["fileName", "bytes", "sha256", "subjectSha256"],
       "properties": {
         "fileName": { "$ref": "#/$defs/fileName" },
-        "bytes": { "type": "integer", "minimum": 1 },
+        "bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
         "sha256": { "$ref": "#/$defs/sha256" },
         "subjectSha256": { "$ref": "#/$defs/sha256" }
       }
     },
     "updater": {
-      "type": "object",
-      "additionalProperties": false,
+      "type": "object", "additionalProperties": false,
       "required": ["enabled", "mechanism", "metadata"],
       "properties": {
         "enabled": { "type": "boolean" },
         "mechanism": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$" },
-        "metadata": {
-          "anyOf": [
-            { "type": "null" },
-            { "$ref": "#/$defs/updaterMetadata" }
-          ]
-        }
+        "metadata": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/updaterMetadata" }] }
       },
       "allOf": [
         {
-          "if": { "properties": { "enabled": { "const": true } } },
-          "then": { "required": ["metadata"], "properties": { "metadata": { "$ref": "#/$defs/updaterMetadata" } } }
+          "if": { "properties": { "enabled": { "const": true } }, "required": ["enabled"] },
+          "then": { "properties": { "metadata": { "$ref": "#/$defs/updaterMetadata" } } }
         },
         {
-          "if": { "properties": { "enabled": { "const": false } } },
+          "if": { "properties": { "enabled": { "const": false } }, "required": ["enabled"] },
           "then": { "properties": { "metadata": { "type": "null" } } }
         }
       ]
@@ -268,26 +273,7 @@
     "artifact": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "platform",
-        "channel",
-        "architecture",
-        "format",
-        "version",
-        "distribution",
-        "downloadUrl",
-        "fileName",
-        "bytes",
-        "sha256",
-        "source",
-        "nativeTrust",
-        "build",
-        "sbom",
-        "provenance",
-        "assurances",
-        "store",
-        "updater"
-      ],
+      "required": ["platform", "channel", "architecture", "format", "version", "distribution", "downloadUrl", "fileName", "bytes", "sha256", "source", "nativeTrust", "build", "sbom", "provenance", "assurances", "store", "updater"],
       "properties": {
         "platform": { "enum": ["macos", "windows", "linux"] },
         "channel": { "enum": ["direct", "store"] },
@@ -297,56 +283,120 @@
         "distribution": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$" },
         "downloadUrl": { "type": "string", "pattern": "^https://[^?#]+$" },
         "fileName": { "$ref": "#/$defs/fileName" },
-        "bytes": { "type": "integer", "minimum": 1 },
+        "bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
         "sha256": { "$ref": "#/$defs/sha256" },
         "source": { "$ref": "#/$defs/source" },
-        "nativeTrust": { "$ref": "#/$defs/nativeTrust" },
-        "build": {
-          "anyOf": [
-            { "type": "null" },
-            { "$ref": "#/$defs/build" }
+        "nativeTrust": {
+          "oneOf": [
+            { "$ref": "#/$defs/macDirectTrust" },
+            { "$ref": "#/$defs/windowsDirectTrust" },
+            { "$ref": "#/$defs/linuxDirectTrust" },
+            { "$ref": "#/$defs/storeTrust" }
           ]
         },
-        "sbom": { "$ref": "#/$defs/sbom" },
+        "build": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/build" }] },
+        "sbom": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/sbom" }] },
         "provenance": {
-          "allOf": [
-            { "$ref": "#/$defs/attestation" },
-            {
-              "type": "object",
-              "properties": {
-                "predicateType": { "const": "https://slsa.dev/provenance/v1" }
-              }
-            }
+          "anyOf": [
+            { "type": "null" },
+            { "allOf": [
+              { "$ref": "#/$defs/attestation" },
+              { "properties": { "predicateType": { "const": "https://slsa.dev/provenance/v1" } } }
+            ] }
           ]
         },
         "assurances": { "$ref": "#/$defs/assurances" },
-        "store": {
-          "anyOf": [
-            { "type": "null" },
-            { "$ref": "#/$defs/store" }
-          ]
-        },
+        "store": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/store" }] },
         "updater": { "$ref": "#/$defs/updater" }
       },
       "allOf": [
         {
-          "if": { "properties": { "channel": { "const": "direct" } } },
+          "if": { "properties": { "platform": { "const": "macos" }, "channel": { "const": "direct" } }, "required": ["platform", "channel"] },
           "then": {
-            "properties": { "build": { "$ref": "#/$defs/build" } }
+            "properties": {
+              "nativeTrust": { "$ref": "#/$defs/macDirectTrust" },
+              "build": { "$ref": "#/$defs/build" },
+              "store": { "type": "null" },
+              "distribution": { "not": { "enum": ["mac-app-store", "microsoft-store", "flathub", "snap", "apt", "rpm"] } },
+              "assurances": { "required": ["cleanInstallSmokePassed", "developerIdSigned", "hardenedRuntime", "notarizationAccepted", "ticketStapled", "gatekeeperAssessmentPassed"], "properties": { "cleanInstallSmokePassed": { "const": true }, "developerIdSigned": { "const": true }, "hardenedRuntime": { "const": true }, "notarizationAccepted": { "const": true }, "ticketStapled": { "const": true }, "gatekeeperAssessmentPassed": { "const": true } } },
+              "updater": { "properties": { "mechanism": { "enum": ["sparkle", "none"] } } }
+            }
           }
         },
         {
-          "if": { "properties": { "channel": { "const": "store" } } },
+          "if": { "properties": { "platform": { "const": "windows" }, "channel": { "const": "direct" } }, "required": ["platform", "channel"] },
           "then": {
             "properties": {
-              "updater": {
-                "type": "object",
-                "properties": {
-                  "enabled": { "const": false },
-                  "mechanism": { "const": "store-managed" },
-                  "metadata": { "type": "null" }
-                }
-              }
+              "nativeTrust": { "$ref": "#/$defs/windowsDirectTrust" },
+              "build": { "$ref": "#/$defs/build" },
+              "store": { "type": "null" },
+              "distribution": { "not": { "enum": ["mac-app-store", "microsoft-store", "flathub", "snap", "apt", "rpm"] } },
+              "assurances": { "required": ["cleanInstallSmokePassed", "authenticodeSigned", "timestamped"], "properties": { "cleanInstallSmokePassed": { "const": true }, "authenticodeSigned": { "const": true }, "timestamped": { "const": true } } },
+              "updater": { "properties": { "mechanism": { "enum": ["electron-updater", "none"] } } }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "platform": { "const": "linux" }, "channel": { "const": "direct" } }, "required": ["platform", "channel"] },
+          "then": {
+            "properties": {
+              "nativeTrust": { "$ref": "#/$defs/linuxDirectTrust" },
+              "build": { "$ref": "#/$defs/build" },
+              "store": { "type": "null" },
+              "distribution": { "not": { "enum": ["mac-app-store", "microsoft-store", "flathub", "snap", "apt", "rpm"] } },
+              "assurances": { "required": ["cleanInstallSmokePassed", "artifactIntegrityVerified"], "properties": { "cleanInstallSmokePassed": { "const": true }, "artifactIntegrityVerified": { "const": true } } },
+              "updater": { "properties": { "mechanism": { "enum": ["none"] } } }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "platform": { "const": "macos" }, "channel": { "const": "store" } }, "required": ["platform", "channel"] },
+          "then": {
+            "properties": {
+              "nativeTrust": { "allOf": [{ "$ref": "#/$defs/storeTrust" }, { "properties": { "provider": { "const": "mac-app-store" }, "listing": { "$ref": "#/$defs/macStoreListing" } } }] },
+              "build": { "type": "null" },
+              "store": { "allOf": [{ "$ref": "#/$defs/store" }, { "properties": { "provider": { "const": "mac-app-store" }, "listing": { "$ref": "#/$defs/macStoreListing" } } }] },
+              "distribution": { "const": "mac-app-store" },
+              "assurances": { "required": ["storePublisherVerified", "storeBuildVerified", "storeSignatureVerified"], "properties": { "storePublisherVerified": { "const": true }, "storeBuildVerified": { "const": true }, "storeSignatureVerified": { "const": true } } },
+              "updater": { "properties": { "enabled": { "const": false }, "mechanism": { "const": "store-managed" }, "metadata": { "type": "null" } } }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "platform": { "const": "windows" }, "channel": { "const": "store" } }, "required": ["platform", "channel"] },
+          "then": {
+            "properties": {
+              "nativeTrust": { "allOf": [{ "$ref": "#/$defs/storeTrust" }, { "properties": { "provider": { "const": "microsoft-store" }, "listing": { "$ref": "#/$defs/microsoftStoreListing" } } }] },
+              "build": { "type": "null" },
+              "store": { "allOf": [{ "$ref": "#/$defs/store" }, { "properties": { "provider": { "const": "microsoft-store" }, "listing": { "$ref": "#/$defs/microsoftStoreListing" } } }] },
+              "distribution": { "const": "microsoft-store" },
+              "assurances": { "required": ["storePublisherVerified", "storeBuildVerified", "storeSignatureVerified"], "properties": { "storePublisherVerified": { "const": true }, "storeBuildVerified": { "const": true }, "storeSignatureVerified": { "const": true } } },
+              "updater": { "properties": { "enabled": { "const": false }, "mechanism": { "const": "store-managed" }, "metadata": { "type": "null" } } }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "platform": { "const": "linux" }, "channel": { "const": "store" } }, "required": ["platform", "channel"] },
+          "then": {
+            "properties": {
+              "nativeTrust": {
+                "oneOf": [
+                  { "allOf": [{ "$ref": "#/$defs/storeTrust" }, { "properties": { "provider": { "const": "flathub" }, "listing": { "$ref": "#/$defs/flathubListing" } } }] },
+                  { "allOf": [{ "$ref": "#/$defs/storeTrust" }, { "properties": { "provider": { "const": "snap" }, "listing": { "$ref": "#/$defs/snapListing" } } }] },
+                  { "allOf": [{ "$ref": "#/$defs/storeTrust" }, { "properties": { "provider": { "enum": ["apt", "rpm"] } } }] }
+                ]
+              },
+              "build": { "type": "null" },
+              "store": {
+                "oneOf": [
+                  { "allOf": [{ "$ref": "#/$defs/store" }, { "properties": { "provider": { "const": "flathub" }, "listing": { "$ref": "#/$defs/flathubListing" } } }] },
+                  { "allOf": [{ "$ref": "#/$defs/store" }, { "properties": { "provider": { "const": "snap" }, "listing": { "$ref": "#/$defs/snapListing" } } }] },
+                  { "allOf": [{ "$ref": "#/$defs/store" }, { "properties": { "provider": { "enum": ["apt", "rpm"] } } }] }
+                ]
+              },
+              "distribution": { "enum": ["flathub", "snap", "apt", "rpm"] },
+              "assurances": { "required": ["storePublisherVerified", "storeBuildVerified", "storeSignatureVerified"], "properties": { "storePublisherVerified": { "const": true }, "storeBuildVerified": { "const": true }, "storeSignatureVerified": { "const": true } } },
+              "updater": { "properties": { "enabled": { "const": false }, "mechanism": { "const": "store-managed" }, "metadata": { "type": "null" } } }
             }
           }
         }

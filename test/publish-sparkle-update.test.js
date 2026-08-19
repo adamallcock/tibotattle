@@ -111,7 +111,8 @@ async function createReleaseFixture({
     replacement: createMacOSSignedReplacementContract(),
     source: {
       commit: "a".repeat(40),
-      tag: "v0.1.0",
+      repository: "https://github.com/adamallcock/tibotattle",
+      tag: `v${RELEASE_VERSION}`,
     },
     assurances: {
       appNotarizationAccepted: true,
@@ -2263,4 +2264,3 @@ test("appcast generator fails open to full-only, then produces a signed validate
     await rm(temporaryRoot, { recursive: true, force: true });
   }
 });
-

@@ -1225,6 +1225,172 @@
       "legacyPaths": [
         "scripts/build-prospective-collector-transitions.js"
       ]
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "repository_operations",
+      "canonicalPath": "scripts/check-release-workflow-policy.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Protected workflow policy is enforced by the pinned release-trust workflow and its focused tests, not a supported standalone npm command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/release-trust-policy.yml",
+        "test/release-workflow-policy.test.js",
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+      ],
+      "decision": "retain_as_protected_release_quality_gate",
+      "provenance": null,
+      "provenanceReason": "The checker enforces immutable action, runner, checkout, and workflow-boundary policy; its contract is maintained by the pinned workflow and focused tests.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "release_evidence",
+      "canonicalPath": "scripts/generate-release-evidence.js",
+      "stableAlias": "release:evidence:generate",
+      "stableAliasReason": null,
+      "additionalAliases": [
+        "release:evidence:validate"
+      ],
+      "callers": [
+        "package.json#scripts.release:evidence:generate",
+        "package.json#scripts.release:evidence:validate",
+        ".github/actions/attest-release-artifact/action.yml",
+        "scripts/release-attestation-evidence.mjs",
+        "test/release-evidence.test.js",
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+        "docs/runbooks/macos-stable-release-runbook.md"
+      ],
+      "decision": "retain_as_cross_platform_release_manifest_entrypoint",
+      "provenance": null,
+      "provenanceReason": "The offline generator and validator define the checked-in v1 manifest boundary; focused release-evidence tests cover generation and validation.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "release_evidence",
+      "canonicalPath": "scripts/release-attestation-evidence.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Attestation preflight and collection are invoked by the protected composite action; operators do not run this helper as a standalone npm command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/actions/attest-release-artifact/action.yml",
+        "test/release-attestation-action.test.js",
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+      ],
+      "decision": "retain_as_protected_release_evidence_support",
+      "provenance": null,
+      "provenanceReason": "The helper freezes and rechecks final subjects, verifies both attestation bundles, and copies only verified evidence; focused action tests cover its boundary.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "release_evidence",
+      "canonicalPath": "scripts/release-evidence-descriptor.js",
+      "stableAlias": null,
+      "stableAliasReason": "Descriptor normalization is an imported manifest-generation helper, not a standalone command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/release-evidence.js",
+        "test/release-evidence.test.js"
+      ],
+      "decision": "retain_as_internal_release_evidence_support",
+      "provenance": null,
+      "provenanceReason": "The descriptor layer consumes local staging paths and returns the canonical public manifest; its behavior is covered through release-evidence tests.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "release_evidence",
+      "canonicalPath": "scripts/release-evidence-output.js",
+      "stableAlias": null,
+      "stableAliasReason": "Manifest and SHA256SUMS output locking is an imported release-generation helper, not a standalone command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/release-evidence.js",
+        "test/release-evidence.test.js",
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+      ],
+      "decision": "retain_as_internal_release_evidence_support",
+      "provenance": null,
+      "provenanceReason": "The output layer provides collision-safe, no-clobber manifest and checksum writes and preserves partial output for explicit inspection rather than racing cleanup; its contract is covered through release-evidence tests.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "release_evidence",
+      "canonicalPath": "scripts/release-evidence-policy.js",
+      "stableAlias": null,
+      "stableAliasReason": "The cross-platform manifest policy is an imported validation helper, not a standalone command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/release-evidence-descriptor.js",
+        "scripts/release-evidence-output.js",
+        "scripts/release-evidence.js",
+        "test/release-evidence.test.js"
+      ],
+      "decision": "retain_as_checked_in_release_contract",
+      "provenance": null,
+      "provenanceReason": "The policy module owns the channel/distribution, native assurance, SPDX, and attestation vocabulary exercised by the release-evidence tests.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "release_evidence",
+      "canonicalPath": "scripts/release-evidence-primitives.js",
+      "stableAlias": null,
+      "stableAliasReason": "Path, digest, metadata, and output-lock primitives are imported by the release-evidence modules, not exposed as a standalone command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/release-evidence-descriptor.js",
+        "scripts/release-evidence-output.js",
+        "scripts/release-evidence-policy.js",
+        "scripts/release-evidence.js",
+        "test/release-evidence.test.js"
+      ],
+      "decision": "retain_as_internal_release_evidence_support",
+      "provenance": null,
+      "provenanceReason": "The primitives centralize bounded file reads, digest checks, safe paths, and no-clobber writes for the release evidence contract.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "release_evidence",
+      "canonicalPath": "scripts/release-evidence.js",
+      "stableAlias": null,
+      "stableAliasReason": "This module is the internal compatibility facade for release-evidence consumers; supported generation and validation commands use scripts/generate-release-evidence.js.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/build-public-release-site.js",
+        "scripts/generate-release-evidence.js",
+        "scripts/public-release-provenance.js",
+        "scripts/release-attestation-evidence.mjs",
+        "scripts/validate-release-sbom.mjs",
+        "test/public-release-site.test.js",
+        "test/release-attestation-action.test.js",
+        "test/release-evidence.test.js"
+      ],
+      "decision": "retain_as_release_evidence_compatibility_facade",
+      "provenance": null,
+      "provenanceReason": "The facade preserves one import surface while the implementation is split into bounded policy, descriptor, output, and primitive modules.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "release_evidence",
+      "canonicalPath": "scripts/validate-release-sbom.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "SBOM generation and validation are invoked by the protected composite action and focused tests, not as a supported standalone npm command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/actions/generate-release-sbom/action.yml",
+        "test/release-sbom-action.test.js",
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+      ],
+      "decision": "retain_as_protected_release_sbom_support",
+      "provenance": null,
+      "provenanceReason": "The helper downloads and verifies the pinned Syft release, bounds SPDX output, and validates the final SBOM subject; focused SBOM action tests cover the boundary.",
+      "legacyPaths": []
     }
   ]
 }

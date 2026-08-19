@@ -52,7 +52,6 @@ jobs:
         with:
           node-version: 26.2.0
           check-latest: false
-          package-manager-cache: false
 
       - name: Activate pinned pnpm
         shell: pwsh

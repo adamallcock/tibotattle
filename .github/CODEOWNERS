@@ -1,0 +1,16 @@
+# Release trust boundaries require an explicit owner review. Repository rules
+# decide whether this file is enforced; keeping the boundary here also makes
+# review intent visible in forks and local audits.
+/.github/ @adamallcock
+/config/release-evidence.js @adamallcock
+/schemas/release-evidence-v1/ @adamallcock
+/scripts/check-release-workflow-policy.mjs @adamallcock
+/scripts/generate-release-evidence.js @adamallcock
+/scripts/release-evidence.js @adamallcock
+/scripts/*release* @adamallcock
+/scripts/*attestation* @adamallcock
+/apps/macos/*.entitlements @adamallcock
+/apps/electron/electron-builder*.cjs @adamallcock
+/apps/web/public/docs.html @adamallcock
+/docs/verify-release.md @adamallcock
+/docs/runbooks/*release*.md @adamallcock

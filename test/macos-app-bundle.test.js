@@ -3206,6 +3206,45 @@ test("signed updater replacement contract validates upgrade and rollback artifac
         previousBundleVersion: "10",
       },
     );
+    assert.doesNotThrow(() => validateMacOSSignedReplacementPair({
+      previousManifest: {
+        ...previousManifest,
+        source: {
+          repository: "https://github.com/adamallcock/tibotattle",
+          tag: "v0.1.12",
+          commit: "a".repeat(40),
+        },
+      },
+      candidateManifest,
+    }));
+    assert.throws(
+      () => validateMacOSSignedReplacementPair({
+        previousManifest: {
+          ...previousManifest,
+          source: {
+            repository: "https://github.com/adamallcock/tibotattle",
+            tag: "v9.9.9",
+            commit: "a".repeat(40),
+          },
+        },
+        candidateManifest,
+      }),
+      { code: "MACOS_RELEASE_SOURCE_VERSION_MISMATCH" },
+    );
+    assert.throws(
+      () => validateMacOSSignedReplacementPair({
+        previousManifest: {
+          ...previousManifest,
+          source: {
+            repository: "https://github.com/private/tibotattle",
+            tag: "v0.1.12",
+            commit: "b".repeat(40),
+          },
+        },
+        candidateManifest,
+      }),
+      { code: "MACOS_RELEASE_SOURCE_INVALID" },
+    );
     assert.deepEqual(
       assertStableSparkleKeyContinuity({
         candidateBundleVersion: "1",
@@ -3512,11 +3551,83 @@ test("signed macOS releases require a clean, annotated source tag and minimal No
     execFileSync("/usr/bin/git", ["tag", "-a", RELEASE_MANIFEST.tag, "-m", "release"], {
       cwd: temporaryRoot,
     });
+    execFileSync("/usr/bin/git", [
+      "remote",
+      "add",
+      "origin",
+      "https://github.com/adamallcock/tibotattle.git",
+    ], { cwd: temporaryRoot });
     const provenance = readMacOSReleaseSourceProvenance({
       repositoryRoot: temporaryRoot,
     });
+    assert.deepEqual(provenance, {
+      repository: "https://github.com/adamallcock/tibotattle",
+      commit: provenance.commit,
+      tag: RELEASE_MANIFEST.tag,
+    });
     assert.match(provenance.commit, /^[0-9a-f]{40}$/u);
     assert.equal(provenance.tag, RELEASE_MANIFEST.tag);
+    assert.equal(
+      readMacOSReleaseSourceProvenance({
+        repositoryRoot: temporaryRoot,
+        expectedVersion: RELEASE_MANIFEST.tag.slice(1),
+      }).tag,
+      RELEASE_MANIFEST.tag,
+    );
+    assert.throws(
+      () => readMacOSReleaseSourceProvenance({
+        repositoryRoot: temporaryRoot,
+        expectedVersion: "9.9.9",
+      }),
+      { code: "MACOS_RELEASE_SOURCE_VERSION_MISMATCH" },
+    );
+
+    execFileSync("/usr/bin/git", [
+      "remote",
+      "set-url",
+      "origin",
+      "git@github.com:adamallcock/tibotattle.git",
+    ], { cwd: temporaryRoot });
+    assert.equal(
+      readMacOSReleaseSourceProvenance({ repositoryRoot: temporaryRoot }).repository,
+      "https://github.com/adamallcock/tibotattle",
+    );
+    execFileSync("/usr/bin/git", [
+      "remote",
+      "set-url",
+      "origin",
+      "ssh://git@github.com/adamallcock/tibotattle.git",
+    ], { cwd: temporaryRoot });
+    assert.equal(
+      readMacOSReleaseSourceProvenance({ repositoryRoot: temporaryRoot }).repository,
+      "https://github.com/adamallcock/tibotattle",
+    );
+    for (const origin of [
+      "https://github.com/other-owner/tibotattle.git",
+      "https://user:password@github.com/adamallcock/tibotattle.git",
+      "https://github.com/adamallcock/tibotattle?ref=main",
+    ]) {
+      execFileSync("/usr/bin/git", ["remote", "set-url", "origin", origin], {
+        cwd: temporaryRoot,
+      });
+      assert.throws(
+        () => readMacOSReleaseSourceProvenance({ repositoryRoot: temporaryRoot }),
+        { code: "MACOS_RELEASE_SOURCE_ORIGIN_INVALID" },
+      );
+    }
+    execFileSync("/usr/bin/git", ["remote", "remove", "origin"], {
+      cwd: temporaryRoot,
+    });
+    assert.throws(
+      () => readMacOSReleaseSourceProvenance({ repositoryRoot: temporaryRoot }),
+      { code: "MACOS_RELEASE_SOURCE_ORIGIN_REQUIRED" },
+    );
+    execFileSync("/usr/bin/git", [
+      "remote",
+      "add",
+      "origin",
+      "https://github.com/adamallcock/tibotattle.git",
+    ], { cwd: temporaryRoot });
 
     await writeFile(join(temporaryRoot, "release-input.txt"), "dirty\n");
     assert.throws(

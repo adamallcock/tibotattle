@@ -5,6 +5,7 @@ import {
   lstat,
   mkdir,
   readFile,
+  realpath,
   readdir,
   rm,
   writeFile,
@@ -13,6 +14,7 @@ import { createHash } from "node:crypto";
 import { isIP } from "node:net";
 import { homedir } from "node:os";
 import {
+  basename,
   dirname,
   extname,
   isAbsolute,
@@ -30,6 +32,18 @@ import {
   validateMacOSDMG,
   validateMacOSSignedReleaseArtifact,
 } from "./macos-release-core.js";
+import {
+  RELEASE_EVIDENCE_PLATFORM_ASSURANCES,
+  RELEASE_EVIDENCE_MAX_MANIFEST_BYTES,
+  RELEASE_EVIDENCE_SCHEMA_VERSION,
+} from "../config/release-evidence.js";
+import {
+  digestRegularFile,
+  readJsonFile,
+  readTextFile,
+  validateReleaseEvidenceManifest,
+} from "./release-evidence.js";
+import { PRODUCT_BRAND } from "../config/product-brand.js";
 import {
   createPublicReleaseSourceProvenance,
   PUBLIC_RELEASE_MANIFEST_SCHEMA,
@@ -184,6 +198,15 @@ const REQUIRED_STATIC_SOCIAL_TAGS = Object.freeze([
   '<meta name="twitter:card" content="summary_large_image">',
 ]);
 const RELEASE_ARCHITECTURE = "arm64";
+const RELEASE_PRODUCT_NAME = PRODUCT_BRAND.displayName;
+const RELEASE_SOURCE_REPOSITORY =
+  "https://github.com/adamallcock/tibotattle";
+const RELEASE_EVIDENCE_MACOS_NATIVE_ASSURANCES =
+  RELEASE_EVIDENCE_PLATFORM_ASSURANCES.macos.direct;
+
+function releaseEvidenceErrorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
 
 function usage() {
   return [
@@ -564,6 +587,120 @@ async function pathExists(path) {
   } catch (error) {
     if (error?.code === "ENOENT") return false;
     throw error;
+  }
+}
+
+/**
+ * Resolve the path boundaries used by a site build before any source copy or
+ * replacement. macOS exposes /var as a compatibility symlink to /private/var;
+ * that one system alias is permitted, while an operator-supplied symlinked
+ * root or ancestor is rejected. The returned canonical path is used only for
+ * containment checks; the original path remains the I/O spelling so /var
+ * callers continue to work.
+ */
+async function canonicalReleasePath(path, label, {
+  directory = false,
+  allowMissing = false,
+} = {}) {
+  const selected = resolve(path);
+  const root = parse(selected).root;
+  const components = selected.slice(root.length).split(sep).filter(Boolean);
+  let current = root;
+  for (let index = 0; index < components.length; index += 1) {
+    current = join(current, components[index]);
+    let metadata;
+    try {
+      metadata = await lstat(current);
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw new TypeError(`${label} cannot be inspected`);
+      }
+      if (!allowMissing || directory) {
+        throw new TypeError(`${label} does not exist or cannot be inspected`);
+      }
+      let existingParent = dirname(current);
+      while (true) {
+        try {
+          const canonicalParent = await realpath(existingParent);
+          return join(canonicalParent, ...components.slice(index));
+        } catch (parentError) {
+          if (parentError?.code !== "ENOENT") {
+            throw new TypeError(`${label} has no safe existing parent`);
+          }
+          const nextParent = dirname(existingParent);
+          if (nextParent === existingParent) {
+            throw new TypeError(`${label} has no safe existing parent`);
+          }
+          existingParent = nextParent;
+        }
+      }
+    }
+    // /var is the only expected system alias on macOS. All other symlinked
+    // components make lexical containment checks unreliable.
+    if (metadata.isSymbolicLink() && current !== "/var") {
+      throw new TypeError(`${label} must not traverse a symbolic link`);
+    }
+    if (index === components.length - 1
+        && directory
+        && !metadata.isDirectory()) {
+      throw new TypeError(`${label} must be a directory`);
+    }
+  }
+  try {
+    return await realpath(selected);
+  } catch (error) {
+    if (allowMissing && error?.code === "ENOENT") {
+      let existingParent = dirname(selected);
+      while (true) {
+        try {
+          return join(await realpath(existingParent), basename(selected));
+        } catch (parentError) {
+          if (parentError?.code !== "ENOENT") {
+            throw new TypeError(`${label} cannot be resolved safely`);
+          }
+          const nextParent = dirname(existingParent);
+          if (nextParent === existingParent) {
+            throw new TypeError(`${label} cannot be resolved safely`);
+          }
+          existingParent = nextParent;
+        }
+      }
+    }
+    throw new TypeError(`${label} cannot be resolved safely`);
+  }
+}
+
+async function assertReleaseSitePathBoundaries(options) {
+  const source = await canonicalReleasePath(options.source, "Public source", {
+    directory: true,
+  });
+  const output = await canonicalReleasePath(options.output, "Release output", {
+    allowMissing: true,
+  });
+  const socialImage = await canonicalReleasePath(
+    options.socialImage,
+    "Social preview",
+  );
+  const installerPath = options.installerPath === null
+    ? null
+    : await canonicalReleasePath(options.installerPath, "Installer artifact");
+  const installerManifest = options.installerReleaseManifest === null
+    ? null
+    : await canonicalReleasePath(
+      options.installerReleaseManifest,
+      "Installer release manifest",
+    );
+  const releaseInputs = [installerPath, installerManifest].filter(Boolean);
+  if (output === source
+      || isWithin(output, source)
+      || isWithin(source, output)
+      || releaseInputs.some((path) => isWithin(output, path))
+      || isWithin(output, socialImage)
+      || releaseInputs.some((path) => isWithin(source, path))
+      || isWithin(source, socialImage)) {
+    throw new TypeError(
+      "Release paths must remain outside the canonical public source and output boundaries",
+    );
   }
 }
 
@@ -995,6 +1132,265 @@ async function collectPublicSourceFiles({ source, sourceHtml }) {
     relative(source, left).localeCompare(relative(source, right)));
 }
 
+async function digestInstallerFile(path) {
+  try {
+    const digest = await digestRegularFile(path, "Installer artifact");
+    return {
+      path: digest.path,
+      bytes: digest.bytes,
+      sha256: digest.sha256,
+    };
+  } catch (error) {
+    throw new TypeError(
+      `Installer artifact could not be read: ${releaseEvidenceErrorMessage(error)}`,
+    );
+  }
+}
+
+async function verifyPublishedSourceClosure({
+  source,
+  output,
+  sourceProvenance,
+  releaseValues,
+  releaseHtml,
+  canonicalUrlBySourceBasename,
+}) {
+  for (const expected of sourceProvenance.files) {
+    const sourcePath = resolve(source, expected.path);
+    const extension = extname(expected.path).toLowerCase();
+    let sourceDigest;
+    let rendered = null;
+    if (extension === ".html") {
+      const sourceText = await readTextFile(
+        sourcePath,
+        `Public release source ${expected.path}`,
+        RELEASE_EVIDENCE_MAX_MANIFEST_BYTES,
+        source,
+      );
+      sourceDigest = sourceText;
+      const canonicalUrl = canonicalUrlBySourceBasename.get(expected.path);
+      if (canonicalUrl === undefined) {
+        throw new TypeError(
+          `Public source page has no generated canonical URL: ${expected.path}`,
+        );
+      }
+      rendered = expected.path === SITE_INDEX_SOURCE_BASENAME
+        ? injectReleaseMetadata(sourceText.text, releaseValues, canonicalUrl)
+        : injectCanonicalMetadata(
+          renderAuxiliaryPublicHtml(sourceText.text),
+          canonicalUrl,
+          `Public auxiliary page ${expected.path}`,
+        );
+      if (expected.path === SITE_INDEX_SOURCE_BASENAME
+          && rendered !== releaseHtml) {
+        throw new TypeError(
+          "Public release source changed while its rendered entry was prepared",
+        );
+      }
+    } else {
+      sourceDigest = await digestRegularFile(
+        sourcePath,
+        `Public release source ${expected.path}`,
+        null,
+        source,
+      );
+    }
+    if (sourceDigest.bytes !== expected.bytes
+        || sourceDigest.sha256 !== expected.sha256) {
+      throw new TypeError(
+        `Public release source changed after provenance capture: ${expected.path}`,
+      );
+    }
+    const outputName = expected.path === SITE_INDEX_SOURCE_BASENAME
+      ? "index.html"
+      : expected.path;
+    const outputPath = resolve(output, outputName);
+    const outputDigest = await digestRegularFile(
+      outputPath,
+      `Published public release source ${outputName}`,
+      null,
+      output,
+    );
+    const expectedOutput = rendered === null
+      ? sourceDigest
+      : {
+        bytes: Buffer.byteLength(rendered, "utf8"),
+        sha256: createHash("sha256").update(rendered, "utf8").digest("hex"),
+      };
+    if (outputDigest.bytes !== expectedOutput.bytes
+        || outputDigest.sha256 !== expectedOutput.sha256) {
+      throw new TypeError(
+        `Published public release source does not match the captured closure: ${outputName}`,
+      );
+    }
+  }
+}
+
+async function readReleaseManifestJson(path) {
+  let value;
+  try {
+    value = (await readJsonFile(
+      path,
+      "release-manifest.json",
+      RELEASE_EVIDENCE_MAX_MANIFEST_BYTES,
+    )).value;
+  } catch (error) {
+    // Preserve the legacy validator's established diagnostics for old
+    // receipts and malformed inputs. New evidence manifests are selected by
+    // schemaVersion below and validated by their canonical validator.
+    if (error?.code === "RELEASE_EVIDENCE_JSON_INVALID") return null;
+    throw new TypeError(
+      `Installer release manifest could not be read: ${releaseEvidenceErrorMessage(error)}`,
+    );
+  }
+  if (value?.schemaVersion !== RELEASE_EVIDENCE_SCHEMA_VERSION) return null;
+  await validateReleaseEvidenceManifest(value, {
+    artifactRoot: dirname(path),
+    manifestPath: path,
+  });
+  return value;
+}
+
+function assertMacOSReleaseEvidenceTrust(artifact) {
+  for (const assurance of RELEASE_EVIDENCE_MACOS_NATIVE_ASSURANCES) {
+    if (artifact.assurances?.[assurance] !== true) {
+      throw new TypeError(
+        `Cross-platform release manifest is missing required macOS assurance: ${assurance}`,
+      );
+    }
+  }
+  const signerIdentity = artifact.nativeTrust?.signerIdentity;
+  const teamId = artifact.nativeTrust?.teamId;
+  if (typeof signerIdentity !== "string"
+      || !/^Developer ID Application:\s*\S/u.test(signerIdentity)
+      || typeof teamId !== "string"
+      || !/^[A-Z0-9]{10}$/u.test(teamId)) {
+    throw new TypeError(
+      "Cross-platform release manifest does not identify a valid macOS Developer ID signer",
+    );
+  }
+}
+
+function assertMacOSNativeValidationMatches(artifact, validation) {
+  const authority = validation?.developerIdAuthority;
+  const teamIdentifier = validation?.teamIdentifier;
+  if (typeof authority !== "string"
+      || typeof teamIdentifier !== "string"
+      || artifact.nativeTrust?.signerIdentity !== authority
+      || artifact.nativeTrust?.teamId !== teamIdentifier) {
+    throw new TypeError(
+      "macOS native validation does not match the cross-platform release signer",
+    );
+  }
+}
+
+function installerUrlFileName(installerUrl) {
+  let pathname;
+  try {
+    pathname = new URL(installerUrl).pathname;
+    return decodeURIComponent(pathname.split("/").at(-1) ?? "");
+  } catch {
+    throw new TypeError("Installer URL contains an invalid encoded artifact name");
+  }
+}
+
+async function validateCrossPlatformReleaseArtifact({
+  releaseManifestPath,
+  releaseManifest: suppliedReleaseManifest = null,
+  artifactPath,
+  installerUrl,
+  installerVersion,
+  installerSha256,
+  validateArtifact,
+}) {
+  if (artifactPath === null) {
+    throw new TypeError(
+      "Cross-platform release manifests require an explicit local installer artifact",
+    );
+  }
+  const releaseManifest = suppliedReleaseManifest
+    ?? await readReleaseManifestJson(releaseManifestPath);
+  if (releaseManifest === null) {
+    throw new TypeError("Expected a cross-platform release evidence manifest");
+  }
+  if (releaseManifest.product?.name !== RELEASE_PRODUCT_NAME
+      || releaseManifest.repository !== RELEASE_SOURCE_REPOSITORY
+      || releaseManifest.tag !== `v${installerVersion}`) {
+    throw new TypeError(
+      "Cross-platform release manifest is not the exact TiboTattle tagged release",
+    );
+  }
+  const candidates = releaseManifest.artifacts.filter((artifact) =>
+    artifact.platform === "macos"
+      && artifact.channel === "direct"
+      && artifact.architecture === RELEASE_ARCHITECTURE
+      && artifact.format === "dmg");
+  if (candidates.length !== 1) {
+    throw new TypeError(
+      `Cross-platform release manifest must contain exactly one macOS direct arm64 DMG (found ${candidates.length})`,
+    );
+  }
+  const selected = candidates[0];
+  if (releaseManifest.version !== installerVersion
+      || selected.version !== installerVersion) {
+    throw new TypeError(
+      "Installer version does not match the cross-platform release manifest",
+    );
+  }
+  if (selected.fileName !== installerUrlFileName(installerUrl)
+      || selected.downloadUrl !== installerUrl) {
+    throw new TypeError(
+      "Installer URL does not match the canonical cross-platform release artifact",
+    );
+  }
+  const localArtifact = await digestInstallerFile(artifactPath);
+  if (localArtifact.bytes !== selected.bytes
+      || localArtifact.sha256 !== selected.sha256) {
+    throw new TypeError(
+      "Installer artifact does not match the cross-platform release manifest",
+    );
+  }
+  if (installerSha256 !== null && installerSha256 !== localArtifact.sha256) {
+    throw new TypeError(
+      "Installer SHA-256 does not match the cross-platform release manifest",
+    );
+  }
+  assertMacOSReleaseEvidenceTrust(selected);
+  const nativeValidation = await validateArtifact(localArtifact.path, {
+    expectedShortVersion: installerVersion,
+    production: true,
+  });
+  assertMacOSNativeValidationMatches(selected, nativeValidation);
+  const finalArtifact = await digestInstallerFile(localArtifact.path);
+  if (finalArtifact.bytes !== selected.bytes
+      || finalArtifact.sha256 !== selected.sha256) {
+    throw new TypeError(
+      "Installer artifact changed after native validation",
+    );
+  }
+  return Object.freeze({
+    artifact: Object.freeze(finalArtifact),
+    manifest: Object.freeze({
+      schemaVersion: releaseManifest.schemaVersion,
+      version: releaseManifest.version,
+      tag: releaseManifest.tag,
+      commit: releaseManifest.commit,
+      repository: releaseManifest.repository,
+      application: Object.freeze({ shortVersion: releaseManifest.version }),
+      artifact: Object.freeze({
+        fileName: selected.fileName,
+        bytes: selected.bytes,
+        sha256: selected.sha256,
+      }),
+      evidencePresence: Object.freeze({
+        sbom: selected.sbom !== null,
+        provenance: selected.provenance !== null,
+        sbomAttestation: selected.sbom?.attestation != null,
+      }),
+    }),
+  });
+}
+
 export async function buildPublicReleaseSite(rawArgs, {
   validateInstallerArtifact = validateMacOSDMG,
   verifyPublishedInstaller = verifyPublishedInstallerRemote,
@@ -1006,6 +1402,7 @@ export async function buildPublicReleaseSite(rawArgs, {
     throw new TypeError("verifyPublishedInstaller must be a function");
   }
   const options = validateInputs(rawArgs);
+  await assertReleaseSitePathBoundaries(options);
   const sourceIndex = join(options.source, SITE_INDEX_SOURCE_BASENAME);
   await regularFile(
     sourceIndex,
@@ -1058,11 +1455,27 @@ export async function buildPublicReleaseSite(rawArgs, {
   );
   let installerEvidence = null;
   if (options.installerConfigured) {
-    installerEvidence = await validateMacOSSignedReleaseArtifact({
-      releaseManifestPath: options.installerReleaseManifest,
-      artifactPath: options.installerPath,
-      validateArtifact: validateInstallerArtifact,
-    });
+    // The platform-neutral v1 manifest is the forward path.  A receipt that
+    // does not carry that exact schema is deliberately handed to the legacy
+    // macOS validator so existing v0.1.12 web-only rebuilds keep working.
+    const releaseManifest = await readReleaseManifestJson(
+      options.installerReleaseManifest,
+    );
+    installerEvidence = releaseManifest === null
+      ? await validateMacOSSignedReleaseArtifact({
+        releaseManifestPath: options.installerReleaseManifest,
+        artifactPath: options.installerPath,
+        validateArtifact: validateInstallerArtifact,
+      })
+      : await validateCrossPlatformReleaseArtifact({
+        releaseManifestPath: options.installerReleaseManifest,
+        releaseManifest,
+        artifactPath: options.installerPath,
+        installerUrl: options.installerUrl,
+        installerVersion: options.installerVersion,
+        installerSha256: options.installerSha256,
+        validateArtifact: validateInstallerArtifact,
+      });
     const releaseVersion = installerEvidence.manifest.application.shortVersion;
     if (releaseVersion !== options.installerVersion) {
       throw new TypeError(
@@ -1189,6 +1602,14 @@ export async function buildPublicReleaseSite(rawArgs, {
     robots,
     { encoding: "utf8", mode: 0o644 },
   );
+  await verifyPublishedSourceClosure({
+    source: options.source,
+    output: options.output,
+    sourceProvenance,
+    releaseValues,
+    releaseHtml,
+    canonicalUrlBySourceBasename,
+  });
   const files = await fileManifest(options.output);
   const publishedNames = new Set(files.map(({ path }) => path));
   // `index.html` is the rendered community entry. Every app-only file must
@@ -1266,10 +1687,20 @@ export async function buildPublicReleaseSite(rawArgs, {
           bytes: installerEvidence.artifact.bytes,
           minimumMacos: options.minimumMacos,
           architectures: options.architectures,
-          verifiedSignedReleaseEvidence: true,
+          ...(installerEvidence.manifest.schemaVersion === RELEASE_EVIDENCE_SCHEMA_VERSION
+            ? { artifactAndNativeTrustVerified: true }
+            : { verifiedSignedReleaseEvidence: true }),
           releaseEvidence: {
             schemaVersion: installerEvidence.manifest.schemaVersion,
-            verification: "signed-release-manifest-and-platform-validation",
+            verificationScope: installerEvidence.manifest.schemaVersion === RELEASE_EVIDENCE_SCHEMA_VERSION
+              ? ["artifact-bytes", "native-platform-trust"]
+              : ["signed-release-manifest", "native-platform-trust"],
+            ...(installerEvidence.manifest.schemaVersion === RELEASE_EVIDENCE_SCHEMA_VERSION
+              ? {
+                evidenceDeclared: installerEvidence.manifest.evidencePresence,
+                attestationVerificationPerformedBySiteBuild: false,
+              }
+              : {}),
           },
         },
       }

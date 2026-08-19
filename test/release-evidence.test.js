@@ -11,14 +11,17 @@ import {
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import test from "node:test";
+import Ajv2020 from "ajv/dist/2020.js";
 
 import {
   buildSha256Sums,
   generateReleaseEvidence,
+  readJsonFile,
   ReleaseEvidenceError,
   stableStringify,
   validateReleaseEvidenceManifest,
   writeReleaseEvidenceFiles,
+  assertRepository,
 } from "../scripts/release-evidence.js";
 import {
   main as releaseEvidenceCliMain,
@@ -97,6 +100,7 @@ function digest(value) {
 function sbom(name) {
   return JSON.stringify({
     spdxVersion: "SPDX-2.3",
+    dataLicense: "CC0-1.0",
     SPDXID: "SPDXRef-DOCUMENT",
     name,
     documentNamespace: `https://example.invalid/spdx/${name}`,
@@ -110,8 +114,37 @@ function sbom(name) {
 
 function provenance() {
   return JSON.stringify({
-    verificationMaterial: {},
-    dsseEnvelope: {},
+    mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json",
+    verificationMaterial: {
+      certificate: { rawBytes: "AA==" },
+      tlogEntries: [],
+    },
+    dsseEnvelope: {
+      payload: "AA==",
+      payloadType: "application/vnd.in-toto+json",
+      signatures: [{ sig: "AA==" }],
+    },
+  });
+}
+
+function storeReceipt({ provider, listing, artifactName, artifactContents }) {
+  return JSON.stringify({
+    schemaVersion: "usage-monitor-store-delivery-receipt-v1",
+    format: "store-delivery-receipt",
+    product: RELEASE.product.name,
+    provider,
+    listing,
+    version: RELEASE.version,
+    tag: RELEASE.tag,
+    commit: RELEASE.commit,
+    repository: RELEASE.repository,
+    artifactFileName: artifactName,
+    artifactBytes: Buffer.byteLength(artifactContents),
+    artifactSha256: digest(artifactContents),
+    subjectKind: "store-retrieved",
+    deliveryState: "final",
+    uploadCandidate: false,
+    retrievedAt: "2026-08-18T00:00:00.000Z",
   });
 }
 
@@ -147,7 +180,7 @@ async function fixture() {
       channel,
       architecture,
       format,
-      path: artifactPath,
+      path: relative(root, artifactPath),
       fileName: artifactName,
       source: { ...RELEASE_SOURCE },
       downloadUrl: `https://github.com/adamallcock/tibotattle/releases/download/${RELEASE.tag}/${artifactName}`,
@@ -158,12 +191,12 @@ async function fixture() {
           ? { publisher: "TiboTattle, Inc.", certificateSha256: "1".repeat(64) }
           : { scheme: "none" },
       sbom: {
-        path: sbomPath,
+        path: relative(root, sbomPath),
         fileName: sbomName,
         attestation: {
-          path: sbomAttestationPath,
+          path: relative(root, sbomAttestationPath),
           fileName: sbomAttestationName,
-          mediaType: "application/vnd.dev.sigstore.bundle+json;version=0.3",
+          mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json",
           predicateType: "https://spdx.dev/Document/v2.3",
           builderId: "https://github.com/actions/runner",
           signerWorkflow: "adamallcock/tibotattle/.github/workflows/release.yml",
@@ -173,15 +206,15 @@ async function fixture() {
         },
       },
       provenance: {
-        path: provenancePath,
+        path: relative(root, provenancePath),
         fileName: provenanceName,
-        mediaType: "application/vnd.dev.sigstore.bundle+json;version=0.3",
-          predicateType: "https://slsa.dev/provenance/v1",
-          builderId: "https://github.com/actions/runner",
-          signerWorkflow: "adamallcock/tibotattle/.github/workflows/release.yml",
-          signerDigest: "b".repeat(40),
-          runUrl: "https://github.com/adamallcock/tibotattle/actions/runs/123456",
-          denySelfHostedRunners: true,
+        mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json",
+        predicateType: "https://slsa.dev/provenance/v1",
+        builderId: "https://github.com/actions/runner",
+        signerWorkflow: "adamallcock/tibotattle/.github/workflows/release.yml",
+        signerDigest: "b".repeat(40),
+        runUrl: "https://github.com/adamallcock/tibotattle/actions/runs/123456",
+        denySelfHostedRunners: true,
       },
       assurances,
       ...(store === undefined ? {} : { store }),
@@ -207,6 +240,15 @@ async function buildBaseFixture() {
     ["TiboTattle-0.1.12-macOS-arm64.sbom.sigstore.json", provenance()],
     ["TiboTattle-0.1.12-macOS-arm64.sigstore.json", provenance()],
     ["TiboTattle-0.1.12-macOS-arm64-appcast.xml", "<rss>signed</rss>"],
+    [
+      "TiboTattle-0.1.12-macOS-arm64.store-receipt.json",
+      storeReceipt({
+        provider: "mac-app-store",
+        listing: "https://apps.apple.com/app/tibotattle/id123456789",
+        artifactName: "TiboTattle-0.1.12-macOS-arm64.dmg",
+        artifactContents: "mac artifact",
+      }),
+    ],
   ];
   for (const [name, bytes] of names) await value.add(name, bytes);
   const artifactName = names[0][0];
@@ -222,7 +264,7 @@ async function buildBaseFixture() {
         channel: "direct",
         architecture: "arm64",
         format: "dmg",
-        path: value.files.get(artifactName),
+        path: relative(value.root, value.files.get(artifactName)),
         fileName: artifactName,
         source: { ...RELEASE_SOURCE },
         downloadUrl: `https://github.com/adamallcock/tibotattle/releases/download/${RELEASE.tag}/${artifactName}`,
@@ -236,12 +278,12 @@ async function buildBaseFixture() {
           unsignedPayloadSha256: "3".repeat(64),
         },
         sbom: {
-          path: value.files.get(sbomName),
+          path: relative(value.root, value.files.get(sbomName)),
           fileName: sbomName,
           attestation: {
-            path: value.files.get(sbomAttestationName),
+            path: relative(value.root, value.files.get(sbomAttestationName)),
             fileName: sbomAttestationName,
-            mediaType: "application/vnd.dev.sigstore.bundle+json;version=0.3",
+            mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json",
             predicateType: "https://spdx.dev/Document/v2.3",
             builderId: "https://github.com/actions/runner",
             signerWorkflow: "adamallcock/tibotattle/.github/workflows/release.yml",
@@ -251,9 +293,9 @@ async function buildBaseFixture() {
           },
         },
         provenance: {
-          path: value.files.get(provenanceName),
+          path: relative(value.root, value.files.get(provenanceName)),
           fileName: provenanceName,
-          mediaType: "application/vnd.dev.sigstore.bundle+json;version=0.3",
+          mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json",
           predicateType: "https://slsa.dev/provenance/v1",
           builderId: "https://github.com/actions/runner",
           signerWorkflow: "adamallcock/tibotattle/.github/workflows/release.yml",
@@ -266,7 +308,7 @@ async function buildBaseFixture() {
           enabled: true,
           mechanism: "sparkle",
           metadata: {
-            path: value.files.get("TiboTattle-0.1.12-macOS-arm64-appcast.xml"),
+            path: relative(value.root, value.files.get("TiboTattle-0.1.12-macOS-arm64-appcast.xml")),
             fileName: "TiboTattle-0.1.12-macOS-arm64-appcast.xml",
           },
         },
@@ -298,23 +340,23 @@ test("published JSON Schema stays aligned with the v1 runtime vocabulary", async
   assert.equal(schema.properties.schemaVersion.const, RELEASE_EVIDENCE_SCHEMA_VERSION);
   assert.equal(
     schema.$defs.attestation.properties.mediaType.const,
-    "application/vnd.dev.sigstore.bundle+json;version=0.3",
+    "application/vnd.dev.sigstore.bundle.v0.3+json",
   );
   assert.equal(
     new RegExp(schema.$defs.attestation.properties.mediaType.const.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u").test(
-      "application/vnd.dev.sigstore.bundle+json;version=0.3",
+      "application/vnd.dev.sigstore.bundle.v0.3+json",
     ),
     RELEASE_EVIDENCE_PROVENANCE_MEDIA_TYPE_PATTERN.test(
-      "application/vnd.dev.sigstore.bundle+json;version=0.3",
+      "application/vnd.dev.sigstore.bundle.v0.3+json",
     ),
   );
   assert.equal(
-    schema.$defs.sbom.properties.attestation.allOf[1]
+    schema.$defs.sbom.properties.attestation.anyOf[1].allOf[1]
       .properties.predicateType.const,
     "https://spdx.dev/Document/v2.3",
   );
   assert.equal(
-    schema.$defs.artifact.properties.provenance.allOf[1]
+    schema.$defs.artifact.properties.provenance.anyOf[1].allOf[1]
       .properties.predicateType.const,
     "https://slsa.dev/provenance/v1",
   );
@@ -340,11 +382,45 @@ test("published JSON Schema stays aligned with the v1 runtime vocabulary", async
   }
   assert.equal(
     RELEASE_EVIDENCE_PROVENANCE_PREDICATE_PATTERN.test(
-      schema.$defs.artifact.properties.provenance.allOf[1]
+      schema.$defs.artifact.properties.provenance.anyOf[1].allOf[1]
         .properties.predicateType.const,
     ),
     true,
   );
+  const ajv = new Ajv2020({ strict: false });
+  const validateSchema = ajv.compile(schema);
+  const validateRepositorySchema = ajv.compile(schema.$defs.repository);
+  for (const [candidate, expected] of [
+    ["https://github.com/adamallcock/tibotattle", true],
+    ["https://github.com/adamallcock/tibotattle.git", false],
+    ["https://github.com/adamallcock/tibotattle/", false],
+    ["https://GITHUB.com/adamallcock/tibotattle", false],
+  ]) {
+    let runtimeAccepted = true;
+    try {
+      assertRepository(candidate);
+    } catch {
+      runtimeAccepted = false;
+    }
+    assert.equal(runtimeAccepted, expected, candidate);
+    assert.equal(validateRepositorySchema(candidate), expected, candidate);
+  }
+  const value = await buildBaseFixture();
+  try {
+    const manifest = await generateReleaseEvidence({ descriptor: value.input, baseDir: value.root });
+    assert.equal(validateSchema(manifest), true, JSON.stringify(validateSchema.errors));
+    const invalid = structuredClone(manifest);
+    invalid.artifacts[0].store = { provider: "mac-app-store" };
+    assert.equal(validateSchema(invalid), false);
+    const wrongNativeTrust = structuredClone(manifest);
+    wrongNativeTrust.artifacts[0].nativeTrust = { scheme: "none" };
+    assert.equal(validateSchema(wrongNativeTrust), false);
+    const wrongStoreCondition = structuredClone(manifest);
+    wrongStoreCondition.artifacts[0].channel = "store";
+    assert.equal(validateSchema(wrongStoreCondition), false);
+  } finally {
+    await value.close();
+  }
 });
 
 test("generator emits a deterministic cross-platform manifest and SHA256SUMS", async () => {
@@ -366,6 +442,7 @@ test("generator emits a deterministic cross-platform manifest and SHA256SUMS", a
     assert.equal(artifact.sbom.format, "spdx-json");
     assert.equal(artifact.sbom.subjectSha256, artifact.sha256);
     assert.equal(artifact.provenance.subjectSha256, artifact.sha256);
+    assert.equal(artifact.provenance.verificationStatus, "unverified");
     assert.equal(
       artifact.downloadUrl,
       `https://github.com/adamallcock/tibotattle/releases/download/${RELEASE.tag}/${artifact.fileName}`,
@@ -406,6 +483,47 @@ test("generator emits a deterministic cross-platform manifest and SHA256SUMS", a
   }
 });
 
+test("canonical runtime rejects an omitted direct Store field with a controlled error", async () => {
+  const value = await buildBaseFixture();
+  try {
+    const manifest = await generateReleaseEvidence({ descriptor: value.input, baseDir: value.root });
+    delete manifest.artifacts[0].store;
+    await assertCode("RELEASE_EVIDENCE_ARTIFACT_INVALID",
+      () => validateReleaseEvidenceManifest(manifest));
+  } finally {
+    await value.close();
+  }
+});
+
+test("direct artifacts reject Store providers from every platform", async () => {
+  const value = await buildBaseFixture();
+  try {
+    const manifest = await generateReleaseEvidence({ descriptor: value.input, baseDir: value.root });
+    for (const provider of ["mac-app-store", "microsoft-store", "flathub", "snap", "apt", "rpm"]) {
+      const invalid = structuredClone(manifest);
+      invalid.artifacts[0].distribution = provider;
+      await assertCode("RELEASE_EVIDENCE_STORE_DIRECT_CONFLATION",
+        () => validateReleaseEvidenceManifest(invalid));
+    }
+  } finally {
+    await value.close();
+  }
+});
+
+test("release identity does not pair a base version with a suffixed tag", async () => {
+  const value = await buildBaseFixture();
+  try {
+    const prereleaseTag = structuredClone(value.input);
+    prereleaseTag.tag = `${RELEASE.tag}-rc.1`;
+    await assertCode("RELEASE_EVIDENCE_VERSION_MISMATCH", () => generateReleaseEvidence({
+      descriptor: prereleaseTag,
+      baseDir: value.root,
+    }));
+  } finally {
+    await value.close();
+  }
+});
+
 test("generator supports Windows and Linux store/direct artifacts without inventing absent artifacts", async () => {
   const value = await fixture();
   try {
@@ -426,22 +544,35 @@ test("generator supports Windows and Linux store/direct artifacts without invent
       await value.add(provenanceName, provenance());
       const platform = name.includes("Windows") ? "windows" : "linux";
       const channel = name.includes("store") ? "store" : "direct";
+      const storeProvider = platform === "windows" ? "microsoft-store" : "flathub";
+      const storeListing = platform === "windows"
+        ? "https://apps.microsoft.com/detail/tibotattle"
+        : "https://flathub.org/apps/com.tibotattle";
+      const storeReceiptName = `${prefix}.store-receipt.json`;
+      if (channel === "store") {
+        await value.add(storeReceiptName, storeReceipt({
+          provider: storeProvider,
+          listing: storeListing,
+          artifactName: name,
+          artifactContents: contents,
+        }));
+      }
       descriptors.push({
         platform,
         channel,
         architecture: platform === "windows" ? "x64" : "x86_64",
         format: platform === "windows" ? (channel === "store" ? "msix" : "exe") : (channel === "store" ? "flatpak" : "appimage"),
-        path: value.files.get(name),
+        path: relative(value.root, value.files.get(name)),
         fileName: name,
-        downloadUrl: `https://github.com/adamallcock/tibotattle/releases/download/${RELEASE.tag}/${name}`,
-        distribution: channel === "store"
-          ? (platform === "windows" ? "microsoft-store" : "flathub")
-          : "github-release",
+        downloadUrl: channel === "store"
+          ? storeListing
+          : `https://github.com/adamallcock/tibotattle/releases/download/${RELEASE.tag}/${name}`,
+        distribution: channel === "store" ? storeProvider : "github-release",
         nativeTrust: channel === "store"
           ? {
-              provider: platform === "windows" ? "microsoft-store" : "flathub",
+              provider: storeProvider,
               publisher: "TiboTattle",
-              listing: "tibotattle",
+              listing: storeListing,
             }
           : platform === "windows"
             ? { publisher: "TiboTattle, Inc.", certificateSha256: "1".repeat(64) }
@@ -453,12 +584,12 @@ test("generator supports Windows and Linux store/direct artifacts without invent
               unsignedPayloadSha256: "3".repeat(64),
             },
         sbom: {
-          path: value.files.get(sbomName),
+          path: relative(value.root, value.files.get(sbomName)),
           fileName: sbomName,
           attestation: {
-            path: value.files.get(sbomAttestationName),
+            path: relative(value.root, value.files.get(sbomAttestationName)),
             fileName: sbomAttestationName,
-            mediaType: "application/vnd.dev.sigstore.bundle+json;version=0.3",
+            mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json",
             predicateType: "https://spdx.dev/Document/v2.3",
             builderId: "https://github.com/actions/runner",
             signerWorkflow: "adamallcock/tibotattle/.github/workflows/release.yml",
@@ -468,9 +599,9 @@ test("generator supports Windows and Linux store/direct artifacts without invent
           },
         },
         provenance: {
-          path: value.files.get(provenanceName),
+          path: relative(value.root, value.files.get(provenanceName)),
           fileName: provenanceName,
-          mediaType: "application/vnd.dev.sigstore.bundle+json;version=0.3",
+          mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json",
           predicateType: "https://slsa.dev/provenance/v1",
           builderId: "https://github.com/actions/runner",
           signerWorkflow: "adamallcock/tibotattle/.github/workflows/release.yml",
@@ -480,7 +611,16 @@ test("generator supports Windows and Linux store/direct artifacts without invent
         },
         assurances: ASSURANCES[platform][channel],
         ...(channel === "store"
-          ? { store: { provider: platform === "windows" ? "microsoft-store" : "flathub" } }
+          ? {
+              store: {
+                provider: storeProvider,
+                listing: storeListing,
+                receipt: {
+                  path: relative(value.root, value.files.get(storeReceiptName)),
+                  fileName: storeReceiptName,
+                },
+              },
+            }
           : {}),
         updater: {
           enabled: false,
@@ -499,6 +639,109 @@ test("generator supports Windows and Linux store/direct artifacts without invent
     );
     assert.equal(manifest.artifacts.find((item) => item.channel === "direct").store, null);
     assert.equal(manifest.artifacts.find((item) => item.channel === "store").updater.mechanism, "store-managed");
+    assert.equal(
+      manifest.artifacts.find((item) => item.channel === "store").store.receipt.subjectSha256,
+      manifest.artifacts.find((item) => item.channel === "store").sha256,
+    );
+  } finally {
+    await value.close();
+  }
+});
+
+test("missing SBOM and provenance are explicit null evidence, not inferred claims", async () => {
+  const value = await buildBaseFixture();
+  try {
+    const noSbomAttestation = structuredClone(value.input);
+    noSbomAttestation.artifacts[0].sbom.attestation = null;
+    const attestationless = await generateReleaseEvidence({
+      descriptor: noSbomAttestation,
+      baseDir: value.root,
+    });
+    assert.equal(attestationless.artifacts[0].sbom.attestation, null);
+
+    const input = structuredClone(value.input);
+    input.artifacts[0].sbom = null;
+    input.artifacts[0].provenance = null;
+    input.artifacts[0].updater = { enabled: false, mechanism: "none" };
+    const manifest = await generateReleaseEvidence({ descriptor: input, baseDir: value.root });
+    assert.equal(manifest.artifacts[0].sbom, null);
+    assert.equal(manifest.artifacts[0].provenance, null);
+    assert.equal(buildSha256Sums(manifest).trim().split("\n").length, 2);
+    await validateReleaseEvidenceManifest(manifest, { artifactRoot: value.root });
+  } finally {
+    await value.close();
+  }
+});
+
+test("Store entries require a verified final listing subject and cannot masquerade as GitHub downloads", async () => {
+  const value = await buildBaseFixture();
+  try {
+    const input = structuredClone(value.input);
+    const artifact = input.artifacts[0];
+    artifact.channel = "store";
+    artifact.distribution = "mac-app-store";
+    artifact.downloadUrl = "https://apps.apple.com/app/tibotattle/id123456789";
+    artifact.store = {
+      provider: "mac-app-store",
+      listing: artifact.downloadUrl,
+      receipt: {
+        path: relative(value.root,
+          value.files.get("TiboTattle-0.1.12-macOS-arm64.store-receipt.json")),
+        fileName: "TiboTattle-0.1.12-macOS-arm64.store-receipt.json",
+      },
+    };
+    artifact.nativeTrust = {
+      provider: "mac-app-store",
+      publisher: "TiboTattle",
+      listing: artifact.downloadUrl,
+    };
+    artifact.assurances = ASSURANCES.macos.store;
+    artifact.build = null;
+    artifact.sbom = null;
+    artifact.provenance = null;
+    artifact.updater = { enabled: false, mechanism: "store-managed" };
+    const manifest = await generateReleaseEvidence({ descriptor: input, baseDir: value.root });
+    assert.equal(manifest.artifacts[0].store.receipt.format, "store-delivery-receipt");
+    assert.equal(manifest.artifacts[0].store.receipt.subjectSha256,
+      manifest.artifacts[0].sha256);
+    assert.equal(manifest.artifacts[0].downloadUrl, manifest.artifacts[0].store.listing);
+
+    const deliveredReceiptPath = value.files.get(
+      "TiboTattle-0.1.12-macOS-arm64.store-receipt.json",
+    );
+    const deliveredReceipt = JSON.parse(await readFile(deliveredReceiptPath, "utf8"));
+    deliveredReceipt.uploadCandidate = true;
+    const tamperedReceiptText = JSON.stringify(deliveredReceipt);
+    await writeFile(deliveredReceiptPath, tamperedReceiptText, "utf8");
+    const receiptTamperedManifest = structuredClone(manifest);
+    receiptTamperedManifest.artifacts[0].store.receipt.sha256 = digest(tamperedReceiptText);
+    receiptTamperedManifest.artifacts[0].store.receipt.bytes = Buffer.byteLength(
+      tamperedReceiptText,
+    );
+    await assertCode("RELEASE_EVIDENCE_STORE_RECEIPT_NOT_DELIVERED", () =>
+      validateReleaseEvidenceManifest(receiptTamperedManifest, {
+        artifactRoot: value.root,
+      }));
+    deliveredReceipt.uploadCandidate = false;
+    await writeFile(deliveredReceiptPath, JSON.stringify(deliveredReceipt), "utf8");
+
+    const wrongUrl = structuredClone(input);
+    wrongUrl.artifacts[0].downloadUrl =
+      `https://github.com/adamallcock/tibotattle/releases/download/${RELEASE.tag}/${wrongUrl.artifacts[0].fileName}`;
+    await assertCode("RELEASE_EVIDENCE_STORE_INVALID", () => generateReleaseEvidence({
+      descriptor: wrongUrl,
+      baseDir: value.root,
+    }));
+
+    const unverified = structuredClone(input);
+    const receiptPath = value.files.get("TiboTattle-0.1.12-macOS-arm64.store-receipt.json");
+    const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+    receipt.uploadCandidate = true;
+    await writeFile(receiptPath, JSON.stringify(receipt), "utf8");
+    await assertCode("RELEASE_EVIDENCE_STORE_RECEIPT_NOT_DELIVERED", () => generateReleaseEvidence({
+      descriptor: unverified,
+      baseDir: value.root,
+    }));
   } finally {
     await value.close();
   }
@@ -523,10 +766,27 @@ test("generator rejects unsafe paths, symlinks, and mismatched file metadata", a
       baseDir: value.root,
     }));
 
+    const absolute = structuredClone(value.input);
+    absolute.artifacts[0].path = value.files.get("TiboTattle-0.1.12-macOS-arm64.dmg");
+    await assertCode("RELEASE_EVIDENCE_UNSAFE_PATH", () => generateReleaseEvidence({
+      descriptor: absolute,
+      baseDir: value.root,
+    }));
+
+    const linkedDirectory = join(value.root, "linked-directory");
+    await symlink(outside, linkedDirectory, "dir");
+    const ancestorEscape = structuredClone(value.input);
+    ancestorEscape.artifacts[0].path = "linked-directory/outside.dmg";
+    ancestorEscape.artifacts[0].fileName = "outside.dmg";
+    await assertCode("RELEASE_EVIDENCE_UNSAFE_PATH", () => generateReleaseEvidence({
+      descriptor: ancestorEscape,
+      baseDir: value.root,
+    }));
+
     const symlinkPath = join(value.root, "linked.dmg");
     await symlink(value.files.get("TiboTattle-0.1.12-macOS-arm64.dmg"), symlinkPath);
     const linked = structuredClone(value.input);
-    linked.artifacts[0].path = symlinkPath;
+    linked.artifacts[0].path = relative(value.root, symlinkPath);
     linked.artifacts[0].fileName = "linked.dmg";
     await assertCode("RELEASE_EVIDENCE_SYMLINK_OR_NONFILE", () => generateReleaseEvidence({ descriptor: linked, baseDir: value.root }));
 
@@ -572,6 +832,24 @@ test("validator rejects source drift, incomplete assurances, subject drift, dupl
     unknownCanonicalField.artifacts[0].provenance.unreviewedClaim = true;
     await assertCode("RELEASE_EVIDENCE_PROVENANCE_INVALID", () =>
       validateReleaseEvidenceManifest(unknownCanonicalField));
+
+    const unknownUpdaterField = structuredClone(manifest);
+    unknownUpdaterField.artifacts[0].updater.unreviewedClaim = true;
+    await assertCode("RELEASE_EVIDENCE_UPDATER_INVALID", () =>
+      validateReleaseEvidenceManifest(unknownUpdaterField));
+
+    const caseCollision = structuredClone(manifest);
+    caseCollision.artifacts[0].provenance.fileName =
+      caseCollision.artifacts[0].fileName.toUpperCase();
+    await assertCode("RELEASE_EVIDENCE_DUPLICATE_FILE_NAME", () =>
+      validateReleaseEvidenceManifest(caseCollision));
+
+    const sumsCollision = structuredClone(manifest);
+    sumsCollision.artifacts[0].fileName = "SHA256SUMS";
+    sumsCollision.artifacts[0].downloadUrl =
+      `https://github.com/adamallcock/tibotattle/releases/download/${RELEASE.tag}/SHA256SUMS`;
+    await assertCode("RELEASE_EVIDENCE_DUPLICATE_FILE_NAME", () =>
+      validateReleaseEvidenceManifest(sumsCollision));
   } finally {
     await value.close();
   }
@@ -584,6 +862,17 @@ test("validator rejects a non-SPDX SBOM and unsafe metadata filename", async () 
     await assertCode("RELEASE_EVIDENCE_SBOM_INVALID", () => generateReleaseEvidence({ descriptor: value.input, baseDir: value.root }));
 
     const restored = sbom("mac");
+    await writeFile(value.files.get("TiboTattle-0.1.12-macOS-arm64.spdx.json"), restored, "utf8");
+    for (const version of ["SPDX-2.2", "SPDX-3.0"]) {
+      const wrongVersion = JSON.parse(restored);
+      wrongVersion.spdxVersion = version;
+      await writeFile(value.files.get("TiboTattle-0.1.12-macOS-arm64.spdx.json"),
+        JSON.stringify(wrongVersion), "utf8");
+      await assertCode("RELEASE_EVIDENCE_SBOM_INVALID", () => generateReleaseEvidence({
+        descriptor: value.input,
+        baseDir: value.root,
+      }));
+    }
     await writeFile(value.files.get("TiboTattle-0.1.12-macOS-arm64.spdx.json"), restored, "utf8");
     const unsafe = structuredClone(value.input);
     unsafe.artifacts[0].provenance.fileName = "metadata/attestation.json";
@@ -622,6 +911,28 @@ test("claims, native trust, and the two attestation kinds fail closed", async ()
     delete missingSigner.artifacts[0].provenance.runUrl;
     await assertCode("RELEASE_EVIDENCE_PROVENANCE_INVALID", () => generateReleaseEvidence({
       descriptor: missingSigner,
+      baseDir: value.root,
+    }));
+
+    await writeFile(
+      value.files.get("TiboTattle-0.1.12-macOS-arm64.sigstore.json"),
+      JSON.stringify({
+        mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json",
+        verificationMaterial: {},
+        dsseEnvelope: {},
+      }),
+      "utf8",
+    );
+    await assertCode("RELEASE_EVIDENCE_PROVENANCE_INVALID", () => generateReleaseEvidence({
+      descriptor: value.input,
+      baseDir: value.root,
+    }));
+
+    const malformedRunUrl = structuredClone(value.input);
+    malformedRunUrl.artifacts[0].provenance.runUrl =
+      "https://github.com/adamallcock/tibotattle/actions/runs/not-a-number";
+    await assertCode("RELEASE_EVIDENCE_PROVENANCE_INVALID", () => generateReleaseEvidence({
+      descriptor: malformedRunUrl,
       baseDir: value.root,
     }));
   } finally {
@@ -700,16 +1011,17 @@ test("generator rejects collisions across metadata and attestation filenames", a
     await value.add(secondProvenanceName, provenance());
     const second = structuredClone(value.input.artifacts[0]);
     second.architecture = "x64";
-    second.path = value.files.get(secondArtifactName);
+    second.path = relative(value.root, value.files.get(secondArtifactName));
     second.fileName = secondArtifactName;
     second.downloadUrl = `https://github.com/adamallcock/tibotattle/releases/download/${RELEASE.tag}/${secondArtifactName}`;
-    second.sbom.path = value.files.get(secondSbomName);
+    second.sbom.path = relative(value.root, value.files.get(secondSbomName));
     second.sbom.fileName = secondSbomName;
-    second.provenance.path = value.files.get(secondProvenanceName);
+    second.provenance.path = relative(value.root, value.files.get(secondProvenanceName));
     second.provenance.fileName = secondProvenanceName;
     // This is a different supplied file, but reusing the first public name is
     // still ambiguous in a flat release and must fail closed.
-    second.sbom.attestation.path = value.files.get("TiboTattle-0.1.12-macOS-arm64.sbom.sigstore.json");
+    second.sbom.attestation.path = relative(value.root,
+      value.files.get("TiboTattle-0.1.12-macOS-arm64.sbom.sigstore.json"));
     second.sbom.attestation.fileName = "TiboTattle-0.1.12-macOS-arm64.sbom.sigstore.json";
     second.updater = { enabled: false, mechanism: "none" };
     await assertCode("RELEASE_EVIDENCE_DUPLICATE_FILE_NAME", () => generateReleaseEvidence({
@@ -740,6 +1052,52 @@ test("default output writing refuses collisions before creating a partial pair",
   }
 });
 
+test("output writing rejects a directory symlink that escapes the trusted artifact root", async () => {
+  const value = await buildBaseFixture();
+  const outside = await mkdtemp(join(tmpdir(), "tibotattle-release-output-outside-"));
+  try {
+    const manifest = await generateReleaseEvidence({ descriptor: value.input, baseDir: value.root });
+    const redirected = join(value.root, "redirected-output");
+    await symlink(outside, redirected);
+    await assertCode("RELEASE_EVIDENCE_UNSAFE_PATH", () => writeReleaseEvidenceFiles({
+      manifest,
+      manifestPath: join(redirected, "release-manifest.json"),
+      artifactRoot: value.root,
+    }));
+    await assert.rejects(readFile(join(outside, "release-manifest.json")), { code: "ENOENT" });
+    await assert.rejects(readFile(join(outside, "SHA256SUMS")), { code: "ENOENT" });
+  } finally {
+    await rm(outside, { recursive: true, force: true });
+    await value.close();
+  }
+});
+
+test("concurrent output writers never overwrite or mix a manifest pair", async () => {
+  const value = await buildBaseFixture();
+  try {
+    const manifest = await generateReleaseEvidence({ descriptor: value.input, baseDir: value.root });
+    const manifestPath = join(value.root, "concurrent", "release-manifest.json");
+    const attempts = await Promise.allSettled([
+      writeReleaseEvidenceFiles({ manifest, manifestPath }),
+      writeReleaseEvidenceFiles({ manifest, manifestPath }),
+    ]);
+    assert.equal(attempts.filter((result) => result.status === "fulfilled").length, 1);
+    assert.equal(attempts.filter((result) => result.status === "rejected").length, 1);
+    const rejected = attempts.find((result) => result.status === "rejected");
+    assert.ok(["RELEASE_EVIDENCE_OUTPUT_BUSY", "RELEASE_EVIDENCE_OUTPUT_EXISTS"]
+      .includes(rejected.reason.code));
+    await validateReleaseEvidenceManifest(manifest, {
+      artifactRoot: value.root,
+      manifestPath,
+    });
+    await rm(manifestPath, { force: true });
+    await rm(join(value.root, "concurrent", "SHA256SUMS"), { force: true });
+    await writeReleaseEvidenceFiles({ manifest, manifestPath });
+  } finally {
+    await value.close();
+  }
+});
+
 test("SHA256SUMS is stable and includes every supplied final evidence file", async () => {
   const value = await buildBaseFixture();
   try {
@@ -751,6 +1109,21 @@ test("SHA256SUMS is stable and includes every supplied final evidence file", asy
       lines.map((line) => line.slice(line.indexOf("  ") + 2)),
       [...lines.map((line) => line.slice(line.indexOf("  ") + 2))].sort(),
     );
+  } finally {
+    await value.close();
+  }
+});
+
+test("bounded JSON reads fail before accepting oversized metadata", async () => {
+  const value = await fixture();
+  try {
+    const oversized = join(value.root, "oversized.json");
+    await writeFile(oversized, Buffer.alloc(65, 0x20));
+    await assertCode("RELEASE_EVIDENCE_FILE_TOO_LARGE", () => readJsonFile(
+      oversized,
+      "oversized metadata",
+      64,
+    ));
   } finally {
     await value.close();
   }

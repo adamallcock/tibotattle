@@ -34,6 +34,7 @@ import {
 const SITE_HTML = new URL("../public/community.html", import.meta.url);
 const SITE_SOURCE = new URL("../public/community.js", import.meta.url);
 const DOCS_HTML = new URL("../public/docs.html", import.meta.url);
+const VERIFY_RELEASE = new URL("../../../docs/verify-release.md", import.meta.url);
 const PRIVACY_HTML = new URL("../public/privacy.html", import.meta.url);
 const APP_HTML = new URL("../public/index.html", import.meta.url);
 const APP_SOURCE = new URL("../public/app.js", import.meta.url);
@@ -574,6 +575,7 @@ test("unavailable community activity uses the compact public state", async () =>
 
 test("the public guidance pages are useful stubs without app-only controls", async () => {
   const docs = await readFile(DOCS_HTML, "utf8");
+  const verifyRelease = await readFile(VERIFY_RELEASE, "utf8");
   const privacy = await readFile(PRIVACY_HTML, "utf8");
   assert.match(docs, /<title>TiboTattle Docs<\/title>/u);
   assert.match(
@@ -582,16 +584,47 @@ test("the public guidance pages are useful stubs without app-only controls", asy
   );
   assert.match(docs, /Activity totals alone are never presented as an allowance\./u);
   assert.match(docs, /id="download-security"/u);
-  assert.match(docs, /How TiboTattle protects every macOS release/u);
-  assert.match(docs, /Clean tagged build/u);
-  assert.match(docs, /shasum -a 256/u);
-  assert.match(docs, /codesign --verify --deep --strict/u);
-  assert.match(docs, /public cryptographic source-to-binary build attestation/u);
+  assert.match(docs, /A download you can check/u);
+  assert.match(docs, /Signed for the platform/u);
+  assert.match(docs, /release-manifest\.json/u);
+  assert.match(docs, /fields not published are explicitly null/u);
+  assert.match(docs, /complete non-null evidence set/u);
+  assert.match(docs, /independent verifier can check against the artifact/u);
+  assert.doesNotMatch(docs, /verified provenance bundles/u);
+  assert.match(docs, /website\s+exposes availability and digest/u);
+  assert.match(docs, /Read the full verification guide on GitHub/u);
+  assert.doesNotMatch(docs, /gh attestation verify|Get-AuthenticodeSignature|sha256sum|verification-command/u);
+  assert.match(verifyRelease, /# Verify a TiboTattle release/u);
+  assert.match(verifyRelease, /gh release verify-asset/u);
+  assert.match(verifyRelease, /gh release download "\$VERSION" --repo "\$REPO"/u);
+  assert.match(verifyRelease, /npm run release:evidence:validate --/u);
+  assert.match(verifyRelease, /### Important: v0\.1\.12 is a legacy release/u);
+  assert.ok(
+    verifyRelease.indexOf("### Important: v0.1.12 is a legacy release")
+      < verifyRelease.indexOf('gh release verify "$VERSION"'),
+    "the legacy release caveat appears before release-level verification commands",
+  );
+  assert.match(verifyRelease, /--bundle "\$PROVENANCE_BUNDLE"/u);
+  assert.match(verifyRelease, /--bundle "\$SBOM_BUNDLE"/u);
+  assert.match(verifyRelease, /https:\/\/spdx\.dev\/Document\/v2\.3/u);
+  assert.match(verifyRelease, /--source-ref "refs\/tags\/\$VERSION"/u);
+  assert.match(verifyRelease, /--source-digest "\$COMMIT"/u);
+  assert.match(verifyRelease, /--signer-workflow/u);
+  assert.match(verifyRelease, /### macOS direct DMG/u);
+  assert.match(verifyRelease, /### Windows direct installer or MSIX/u);
+  assert.match(verifyRelease, /### Linux AppImage/u);
+  assert.match(verifyRelease, /Mac App Store/u);
+  assert.match(verifyRelease, /does not prove safety/u);
   assert.match(privacy, /<title>TiboTattle Privacy Overview<\/title>/u);
   assert.match(privacy, /This website cannot read local Codex files\./u);
   assert.match(privacy, /Nothing is contributed unless you review and opt in\./u);
   for (const page of [docs, privacy]) {
     assert.match(page, /href="\.\/community\.html#download"/u);
+    assert.match(
+      page,
+      /<span class="header-download-label">Download<\/span>/u,
+      "resource-page download labels must collapse without clipping on narrow headers",
+    );
     assert.match(page, /href="\.\/docs\.html"/u);
     assert.match(page, /href="\.\/privacy\.html"/u);
     assert.doesNotMatch(

@@ -19,7 +19,6 @@
  * requests.  It only reads supplied local bytes and writes local evidence.
  */
 
-import { readFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -27,11 +26,15 @@ import {
   buildSha256Sums,
   generateReleaseEvidence,
   RELEASE_EVIDENCE_MANIFEST_FILE_NAME,
+  RELEASE_EVIDENCE_SUMS_FILE_NAME,
   ReleaseEvidenceError,
+  readJsonFile,
+  readTextFile,
   stableStringify,
   validateReleaseEvidenceManifest,
   writeReleaseEvidenceFiles,
 } from "./release-evidence.js";
+import { RELEASE_EVIDENCE_MAX_MANIFEST_BYTES } from "../config/release-evidence.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 
@@ -39,7 +42,7 @@ function usage() {
   return [
     "Generate: node scripts/generate-release-evidence.js",
     "  --input <descriptor.json> --output <release-manifest.json>",
-    "  [--base-dir <directory>] [--sha256sums <SHA256SUMS>] [--replace]",
+    "  [--base-dir <directory>] [--sha256sums <SHA256SUMS>]",
     "Validate: node scripts/generate-release-evidence.js --validate",
     "  --manifest <release-manifest.json> [--artifacts-dir <directory>]",
     "  [--sha256sums <SHA256SUMS>]",
@@ -55,7 +58,6 @@ function parseArguments(argv) {
     baseDir: null,
     artifactsDir: null,
     sums: null,
-    replace: false,
   };
   const values = new Set([
     "--input",
@@ -71,11 +73,6 @@ function parseArguments(argv) {
     if (argument === "--validate") {
       if (options.validate) throw new Error("--validate was repeated");
       options.validate = true;
-      continue;
-    }
-    if (argument === "--replace") {
-      if (options.replace) throw new Error("--replace was repeated");
-      options.replace = true;
       continue;
     }
     if (!values.has(argument)) throw new Error(`Unknown argument: ${argument}`);
@@ -104,21 +101,14 @@ function parseArguments(argv) {
 }
 
 async function readManifest(path) {
-  let text;
   try {
-    text = await readFile(resolve(path), "utf8");
+    return (await readJsonFile(resolve(path), "release-manifest.json",
+      RELEASE_EVIDENCE_MAX_MANIFEST_BYTES)).value;
   } catch (error) {
+    if (error instanceof ReleaseEvidenceError) throw error;
     throw new ReleaseEvidenceError(
       "RELEASE_EVIDENCE_MANIFEST_UNAVAILABLE",
       `Could not read manifest: ${error.message}`,
-    );
-  }
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new ReleaseEvidenceError(
-      "RELEASE_EVIDENCE_MANIFEST_INVALID",
-      "Manifest is not valid JSON",
     );
   }
 }
@@ -141,9 +131,23 @@ async function main(argv = process.argv.slice(2)) {
       manifestPath,
     });
     if (options.sums !== null) {
+      const sumsPath = resolve(options.sums);
+      if (basename(sumsPath) !== RELEASE_EVIDENCE_SUMS_FILE_NAME) {
+        throw new ReleaseEvidenceError(
+          "RELEASE_EVIDENCE_SUMS_FILE_NAME_INVALID",
+          `SHA256SUMS path must end in ${RELEASE_EVIDENCE_SUMS_FILE_NAME}`,
+        );
+      }
+      if (dirname(sumsPath) !== dirname(manifestPath)) {
+        throw new ReleaseEvidenceError(
+          "RELEASE_EVIDENCE_OUTPUT_DIR_MISMATCH",
+          "manifest and SHA256SUMS must be in the same directory",
+        );
+      }
       const expected = buildSha256Sums(manifest);
-      const actual = await readFile(resolve(options.sums), "utf8");
-      if (actual !== expected) {
+      const actual = await readTextFile(sumsPath, "SHA256SUMS",
+        RELEASE_EVIDENCE_MAX_MANIFEST_BYTES);
+      if (actual.text !== expected) {
         throw new ReleaseEvidenceError(
           "RELEASE_EVIDENCE_SUMS_MISMATCH",
           "SHA256SUMS does not match the canonical manifest",
@@ -155,14 +159,15 @@ async function main(argv = process.argv.slice(2)) {
   }
 
   const inputPath = resolve(options.input);
-  const inputText = await readFile(inputPath, "utf8");
   let descriptor;
   try {
-    descriptor = JSON.parse(inputText);
-  } catch {
+    descriptor = (await readJsonFile(inputPath,
+      "release descriptor", RELEASE_EVIDENCE_MAX_MANIFEST_BYTES)).value;
+  } catch (error) {
+    if (error instanceof ReleaseEvidenceError) throw error;
     throw new ReleaseEvidenceError(
       "RELEASE_EVIDENCE_INPUT_INVALID",
-      "Release descriptor is not valid JSON",
+      `Release descriptor could not be read: ${error.message}`,
     );
   }
   const manifest = await generateReleaseEvidence({
@@ -176,7 +181,7 @@ async function main(argv = process.argv.slice(2)) {
     manifest,
     manifestPath: options.output,
     sumsPath,
-    replace: options.replace,
+    artifactRoot: options.baseDir === null ? dirname(inputPath) : resolve(options.baseDir),
   });
   console.log("RELEASE_EVIDENCE_GENERATED");
   console.log(`Manifest: ${resolve(options.output)}`);
