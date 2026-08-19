@@ -438,7 +438,7 @@ test("local refresh rejects forged and copied Windows adapters before runCollect
   const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
   Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
   try {
-    for (const windowsFilesystemAdapter of [forged, copied]) {
+    for (const windowsFilesystemAdapter of [null, forged, copied]) {
       const runner = createLocalCollectorRefreshRunner({
         windowsFilesystemAdapter,
         runCollector: async () => {
