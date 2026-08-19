@@ -74,6 +74,7 @@ jobs:
         with:
           node-version: 26.2.0
           check-latest: false
+          package-manager-cache: false
 
       - name: Enforce immutable workflow dependencies and runner policy
         run: node ./scripts/check-release-workflow-policy.mjs

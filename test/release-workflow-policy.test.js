@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 
 import {
@@ -10,6 +11,22 @@ test("checked-in GitHub workflows pin actions and avoid unsafe release triggers"
   const result = await checkReleaseWorkflowPolicy();
   assert.ok(result.files.includes(".github/workflows/osv-scanner.yml"));
   assert.ok(result.files.includes(".github/workflows/windows-portability.yml"));
+});
+
+test("setup-node never initializes a package-manager cache before pnpm exists", async () => {
+  for (const workflowPath of [
+    ".github/workflows/release-trust-policy.yml",
+    ".github/workflows/windows-portability.yml",
+  ]) {
+    const workflow = await readFile(new URL(`../${workflowPath}`, import.meta.url), "utf8");
+    const setupNodeSteps = workflow.split(/\n\s+- name:/u)
+      .filter((step) => step.includes("actions/setup-node@"));
+    assert.ok(setupNodeSteps.length > 0, `${workflowPath} must configure setup-node`);
+    for (const step of setupNodeSteps) {
+      assert.match(step, /^\s*package-manager-cache:\s*false\s*$/mu,
+        `${workflowPath} must disable setup-node's pre-pnpm automatic cache`);
+    }
+  }
 });
 
 test("workflow policy accepts local actions and full immutable action SHAs", () => {
