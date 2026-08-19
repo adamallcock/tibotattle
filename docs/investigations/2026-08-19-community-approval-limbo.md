@@ -232,3 +232,35 @@ installed app, or public release has been changed by this work.
 
 Do not delete the SQLite files, prepared sets, or Keychain items as a routine
 workaround. The fixed client is designed to recover the retained review.
+
+## Post-investigation updates (2026-08-19, later the same day)
+
+Live dogfood validation of the ceremony began after this document was
+recorded; the following landed on the same branch and supersede the
+corresponding notes above:
+
+- Internal-dogfood builds were published from the branch for live first-run
+  ceremony debugging on a fresh macOS account (0.1.13 tag builds 1013–1015;
+  signed-feed appcast path). These are `internal-dogfood` distribution only:
+  no stable release was published, and the deployed production Worker remains
+  the prior lineage — merging this branch does not deploy it.
+- Two further defects were found live and fixed: a never-created prepared
+  spool was classified as invalid instead of empty (956efb1), and the
+  exact-review summary identity was derived from stale state rather than the
+  real record arrays (55f562f). The consent column layout was reworked for
+  narrow widths (ee0b49b).
+- The sign-in recovery handle read-back was blocked by an Origin-header
+  assumption (same-origin GETs carry no Origin header); fixed in 719978f.
+- The two R7 release-evidence failures listed under Validation are resolved:
+  the retained receipts were regenerated under the exact pinned dual
+  runtimes (procedure now documented in
+  `../runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md`), and
+  the repository root run is green at the branch tip.
+- The publisher-side dogfood signed-feed gap noted alongside this work was
+  closed: the SURequireSignedFeed preflight now covers both named channels
+  (59dea15; see `../runbooks/2026-08-02-r2-sparkle-update-publisher.md`).
+
+The remaining release gates stated above (one installed production-configured
+OAuth pass, Developer ID signing/notarization checks, and the extracted
+local-review artifact packaging mismatch) are unchanged by these updates
+except as the live dogfood runs progressively discharge them.
