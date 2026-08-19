@@ -129,6 +129,12 @@
       "followUp": "Run native owner-DACL, reparse-point, hard-link, and content-free failure checks on Windows x64."
     },
     {
+      "file": "test/windows-filesystem-companion-instance-lease.test.js",
+      "win32BranchCount": 4,
+      "classification": "native-windows-qualification",
+      "followUp": "Run child-process contention, crash abandonment, clean reacquisition, same-process recursive rejection, and worker-thread wrong-thread release rejection on native Windows x64."
+    },
+    {
       "file": "test/windows-path-contract.test.js",
       "win32BranchCount": 1,
       "classification": "native-windows-qualification",
