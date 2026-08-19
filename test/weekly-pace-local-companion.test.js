@@ -13,6 +13,9 @@ import {
   projectWeeklyPaceForecast,
   weeklyPaceSnapshotsFromCollectorRecord,
 } from "../src/weekly-pace-projection.js";
+import {
+  normalizeDashboardPayload,
+} from "../apps/web/public/data-client.js";
 
 const NOW = Date.parse("2026-08-03T12:30:00.000Z");
 const RESETS_AT = Math.floor(Date.parse("2026-08-10T12:00:00.000Z") / 1_000);
@@ -89,7 +92,7 @@ test("local companion sends a private account-scoped pace ETA as a safe public p
       allowDevelopmentArtifactFallback: false,
     });
     assert.deepEqual(snapshot.weekly.paceForecast, {
-      schemaVersion: "local-weekly-pace-forecast-v0.1",
+      schemaVersion: "local-weekly-pace-forecast-v0.2",
       status: "available",
       currentUsedPercent: 30,
       remainingPercent: 70,
@@ -99,7 +102,10 @@ test("local companion sends a private account-scoped pace ETA as a safe public p
         sampleCount: 1,
         elapsedHours: 0.25,
         movementPp: 10,
-        percentagePointsPerHour: 40,
+        // One 15-minute interval that moved, so the working rate and the
+        // wall-clock rate are the same 40pp/hour here.
+        activePercentagePointsPerHour: 40,
+        overallPercentagePointsPerHour: 40,
       },
       observationCount: 2,
       etaAt: "2026-08-03T14:15:00.000Z",
@@ -160,7 +166,7 @@ test("local companion retains one safe observation as a non-predictive waiting s
       allowDevelopmentArtifactFallback: false,
     });
     assert.deepEqual(snapshot.weekly.paceForecast, {
-      schemaVersion: "local-weekly-pace-forecast-v0.1",
+      schemaVersion: "local-weekly-pace-forecast-v0.2",
       status: "insufficient_observations",
       currentUsedPercent: 20,
       remainingPercent: 80,
@@ -170,7 +176,8 @@ test("local companion retains one safe observation as a non-predictive waiting s
         sampleCount: 0,
         elapsedHours: 0,
         movementPp: 0,
-        percentagePointsPerHour: null,
+        activePercentagePointsPerHour: null,
+        overallPercentagePointsPerHour: null,
       },
       observationCount: 1,
       etaAt: null,
@@ -180,4 +187,43 @@ test("local companion retains one safe observation as a non-predictive waiting s
   } finally {
     await rm(root, { recursive: true });
   }
+});
+
+test("the projection the companion publishes survives the browser boundary", () => {
+  // Three files hold an independent exact-key check on this payload: the
+  // engine builds it, `publicForecast` republishes it, and the browser's
+  // `normalizeWeeklyPaceForecast` refuses anything whose shape or schema
+  // version it does not recognise. Each layer has its own tests, and all of
+  // them would still pass if a field were renamed in two places out of three -
+  // the card would simply stop rendering, silently, in production only.
+  //
+  // This is the assertion that closes that gap: a real projection, run through
+  // the real browser validator, must come back byte-identical.
+  const observations = [];
+  for (let minute = 0; minute < 240; minute += 10) {
+    observations.push(quotaRecord({
+      observedAt: new Date(Date.parse("2026-08-03T08:00:00.000Z") + minute * 60_000)
+        .toISOString(),
+      usedPercent: minute < 20 ? 0 : 1,
+    }));
+  }
+  const snapshots = observations.flatMap(weeklyPaceSnapshotsFromCollectorRecord);
+  const forecast = projectWeeklyPaceForecast({
+    currentRecord: quotaRecord({
+      observedAt: "2026-08-03T12:00:00.000Z",
+      usedPercent: 1,
+    }),
+    observations: snapshots,
+    nowMs: NOW,
+  });
+
+  // Dense polling with one moving interval: the two rates must be far apart,
+  // or this fixture is not exercising the thing it exists to protect.
+  assert.equal(forecast.pace.activePercentagePointsPerHour, 6);
+  assert.equal(forecast.pace.overallPercentagePointsPerHour, 0.25);
+
+  const normalized = normalizeDashboardPayload({
+    weekly: { paceForecast: forecast },
+  });
+  assert.deepEqual(normalized.weekly.paceForecast, forecast);
 });

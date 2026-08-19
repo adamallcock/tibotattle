@@ -2344,6 +2344,33 @@ function normalizeLocalComponentCosts(value) {
   }));
 }
 
+/**
+ * A model row's own token split, or `null` when the row carried none.
+ *
+ * Absence and zero are different claims here. A projection that never
+ * accumulated components must not be normalised into six zeroes, because the
+ * renderer would then draw a complete breakdown asserting the model read no
+ * tokens of any kind. `null` keeps "this row cannot say" separate from "this
+ * row says none", exactly as the model table already does for a price it does
+ * not have.
+ */
+function normalizeLocalModelComponents(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const present = LOCAL_COMPONENT_KEYS.some((key) => (
+    Number.isSafeInteger(value[key]) && value[key] >= 0
+  ));
+  return present ? normalizeLocalComponents(value) : null;
+}
+
+/** The same rule for the per-component priced amounts. */
+function normalizeLocalModelComponentCosts(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const present = LOCAL_COMPONENT_KEYS.some((key) => (
+    value[key] !== null && typeof value[key] === "object"
+  ));
+  return present ? normalizeLocalComponentCosts(value) : null;
+}
+
 function unavailableAllowanceImpact(reason = null) {
   return {
     status: "unavailable",
@@ -3681,7 +3708,9 @@ function normalizeLocalModelUsage(rows) {
       // dollar comparison against it is honest. Only an explicit `false` or a
       // Spark row withholds the figure.
       apiPriceEquivalentApplicable:
-        row.apiPriceEquivalentApplicable !== false && allowanceTrack !== "spark"
+        row.apiPriceEquivalentApplicable !== false && allowanceTrack !== "spark",
+      components: normalizeLocalModelComponents(row.components),
+      componentCosts: normalizeLocalModelComponentCosts(row.componentCosts)
     }];
   });
 }
@@ -4931,7 +4960,7 @@ function normalizeGradient(payload = {}) {
   };
 }
 
-const WEEKLY_PACE_FORECAST_SCHEMA_VERSION = "local-weekly-pace-forecast-v0.1";
+const WEEKLY_PACE_FORECAST_SCHEMA_VERSION = "local-weekly-pace-forecast-v0.2";
 const WEEKLY_PACE_FORECAST_STATUSES = new Set([
   "unavailable",
   "insufficient_observations",
@@ -4974,7 +5003,8 @@ function normalizeWeeklyPaceForecast(value) {
         "sampleCount",
         "elapsedHours",
         "movementPp",
-        "percentagePointsPerHour"
+        "activePercentagePointsPerHour",
+        "overallPercentagePointsPerHour"
       ])) return null;
   const currentUsedPercent = weeklyPaceNumber(value.currentUsedPercent, {
     minimum: 0,
@@ -4986,8 +5016,12 @@ function normalizeWeeklyPaceForecast(value) {
   });
   const elapsedHours = weeklyPaceNumber(value.pace.elapsedHours, { minimum: 0 });
   const movementPp = weeklyPaceNumber(value.pace.movementPp, { minimum: 0 });
-  const percentagePointsPerHour = weeklyPaceNumber(
-    value.pace.percentagePointsPerHour,
+  const activePercentagePointsPerHour = weeklyPaceNumber(
+    value.pace.activePercentagePointsPerHour,
+    { minimum: 0, maximum: 100 }
+  );
+  const overallPercentagePointsPerHour = weeklyPaceNumber(
+    value.pace.overallPercentagePointsPerHour,
     { minimum: 0, maximum: 100 }
   );
   const hoursToExhaustion = weeklyPaceNumber(value.hoursToExhaustion, {
@@ -5000,7 +5034,8 @@ function normalizeWeeklyPaceForecast(value) {
       || remainingPercent === undefined
       || elapsedHours === undefined
       || movementPp === undefined
-      || percentagePointsPerHour === undefined
+      || activePercentagePointsPerHour === undefined
+      || overallPercentagePointsPerHour === undefined
       || hoursToExhaustion === undefined
       || hoursToReset === undefined
       || (value.resetsAt !== null && resetsAt === null)
@@ -5018,8 +5053,8 @@ function normalizeWeeklyPaceForecast(value) {
         || remainingPercent === null
         || resetsAt === null
         || etaAt === null
-        || percentagePointsPerHour === null
-        || percentagePointsPerHour <= 0
+        || overallPercentagePointsPerHour === null
+        || overallPercentagePointsPerHour <= 0
         || hoursToExhaustion === null
         || hoursToReset === null
         || Date.parse(etaAt) >= Date.parse(resetsAt)) return null;
@@ -5037,7 +5072,8 @@ function normalizeWeeklyPaceForecast(value) {
       sampleCount: value.pace.sampleCount,
       elapsedHours,
       movementPp,
-      percentagePointsPerHour
+      activePercentagePointsPerHour,
+      overallPercentagePointsPerHour
     },
     observationCount: value.observationCount,
     etaAt,
@@ -6228,6 +6264,16 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
     output_reasoning_tokens: .0117,
     output_combined_tokens: 0
   };
+  // What each component contributes to a demo period's cost. Shared by the
+  // period and by every model row inside it, so the two cannot drift.
+  const componentCostShares = {
+    input_uncached_tokens: .458,
+    input_cache_read_tokens: .1535,
+    input_cache_write_tokens: .0128,
+    output_text_tokens: .2128,
+    output_reasoning_tokens: .1629,
+    output_combined_tokens: 0
+  };
   const splitTokens = (tokens) => Object.fromEntries(
     Object.entries(componentShares).map(([key, share]) => [key, Math.round(tokens * share)])
   );
@@ -6334,6 +6380,32 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
     const cost = Number((totalDemoCost * factor).toFixed(2));
     const total = { events, tokens, cost };
     const componentTokens = splitTokens(tokens);
+    // One demo model row, split across the same components the period uses so
+    // the row reconciles with its own totals rather than with an unrelated
+    // ratio. A row whose pricing status withholds a price still carries the
+    // split; the table declines to show its money cells on the strength of
+    // that status, which is the behaviour worth being able to review.
+    const demoModelRow = (model, eventShare, tokenShare, costShare, pricingStatus) => {
+      const rowTokens = Math.round(tokens * tokenShare);
+      const rowCost = Number((cost * costShare).toFixed(2));
+      const rowComponents = splitTokens(rowTokens);
+      return {
+        model,
+        events: Math.round(events * eventShare),
+        totalTokens: rowTokens,
+        apiPriceEquivalentUsd: rowCost,
+        pricingStatus,
+        allowanceTrack: "primary",
+        apiPriceEquivalentApplicable: true,
+        components: rowComponents,
+        componentCosts: Object.fromEntries(
+          Object.entries(rowComponents).map(([key, count]) => [key, {
+            tokens: count,
+            costUsd: Number((rowCost * componentCostShares[key]).toFixed(2))
+          }])
+        )
+      };
+    };
     return {
       periodId: id,
       periodLabel: label,
@@ -6348,24 +6420,21 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
       components: componentTokens,
       componentCosts: Object.fromEntries(Object.entries(componentTokens).map(([key, count]) => [key, {
         tokens: count,
-        costUsd: Number((cost * ({
-          input_uncached_tokens: .458,
-          input_cache_read_tokens: .1535,
-          input_cache_write_tokens: .0128,
-          output_text_tokens: .2128,
-          output_reasoning_tokens: .1629,
-          output_combined_tokens: 0
-        })[key]).toFixed(2))
+        costUsd: Number((cost * componentCostShares[key]).toFixed(2))
       }])),
       // The labeled demo carries every model-row state the real payload can
       // produce, so the model table can be reviewed without waiting for a
-      // matching day of real usage.
+      // matching day of real usage. That now includes the per-model token
+      // split and its priced amounts, and one row that deliberately carries
+      // neither, so the withheld case is reviewable too.
       byModel: [
-        { model: "gpt-5.6-sol", events: Math.round(events * .62), totalTokens: Math.round(tokens * .64), apiPriceEquivalentUsd: Number((cost * .66).toFixed(2)), pricingStatus: "priced", allowanceTrack: "primary", apiPriceEquivalentApplicable: true },
-        { model: "gpt-5.6-terra", events: Math.round(events * .18), totalTokens: Math.round(tokens * .19), apiPriceEquivalentUsd: Number((cost * .21).toFixed(2)), pricingStatus: "priced", allowanceTrack: "primary", apiPriceEquivalentApplicable: true },
-        { model: "gpt-5.4-mini", events: Math.round(events * .15), totalTokens: Math.round(tokens * .13), apiPriceEquivalentUsd: Number((cost * .09).toFixed(2)), pricingStatus: "priced", allowanceTrack: "primary", apiPriceEquivalentApplicable: true },
+        demoModelRow("gpt-5.6-sol", .62, .64, .66, "priced"),
+        demoModelRow("gpt-5.6-terra", .18, .19, .21, "priced"),
+        demoModelRow("gpt-5.4-mini", .15, .13, .09, "priced"),
         // Recognised, and deliberately carries no published price card.
-        { model: "codex-auto-review", events: Math.round(events * .04), totalTokens: Math.round(tokens * .02), apiPriceEquivalentUsd: 0, pricingStatus: "known_unpriced", allowanceTrack: "primary", apiPriceEquivalentApplicable: true },
+        demoModelRow("codex-auto-review", .04, .02, 0, "known_unpriced"),
+        // Deliberately carries no component split at all, so the table's
+        // "this row cannot say" path stays reviewable beside the rows that can.
         { model: "unknown", events: Math.round(events * .05), totalTokens: Math.round(tokens * .04), apiPriceEquivalentUsd: 0, pricingStatus: "unrecognized", allowanceTrack: "primary", apiPriceEquivalentApplicable: true }
       ],
       // Metered against its own subscription allowance, so it is kept out of

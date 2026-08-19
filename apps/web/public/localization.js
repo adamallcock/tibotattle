@@ -290,8 +290,8 @@ export const WEB_MESSAGES = Object.freeze({
   "accounting.cacheSwitch.column.localTime": ["Local time", "本地时间", "Hora local"],
   "accounting.cacheSwitch.column.change": ["Configuration change", "配置更改", "Cambio de configuración"],
   "accounting.cacheSwitch.column.cacheRead": ["Cache read", "缓存读取", "Lectura de caché"],
-  "accounting.cacheSwitch.column.lostTokens": ["Estimated lost reuse", "估算的复用损失", "Reutilización perdida estimada"],
-  "accounting.cacheSwitch.column.apiEquivalent": ["Standard API equivalent", "Standard API 等价值", "Equivalente de API Standard"],
+  "accounting.cacheSwitch.column.lostTokens": ["Est. lost reuse", "估算的复用损失", "Reutilización perdida estimada"],
+  "accounting.cacheSwitch.column.apiEquivalent": ["API equivalent", "Standard API 等价值", "Equivalente de API Standard"],
   "accounting.cacheSwitch.change.model": ["Model: {previous} → {current}", "模型：{previous} → {current}", "Modelo: {previous} → {current}"],
   "accounting.cacheSwitch.change.reasoning": ["Reasoning: {previous} → {current}", "推理强度：{previous} → {current}", "Razonamiento: {previous} → {current}"],
   "accounting.cacheSwitch.change.both": ["Model + reasoning: {previousModel} / {previousEffort} → {currentModel} / {currentEffort}", "模型和推理强度：{previousModel} / {previousEffort} → {currentModel} / {currentEffort}", "Modelo y razonamiento: {previousModel} / {previousEffort} → {currentModel} / {currentEffort}"],
@@ -422,6 +422,29 @@ export const WEB_MESSAGES = Object.freeze({
   "accounting.model.notReported": ["Not reported", "未报告", "No informado"],
   "accounting.model.notReportedTitle": ["No usable figure was reported for this row. It is shown as missing rather than as zero.", "此行没有报告可用的数值。它显示为缺失而不是零。", "No se informó ninguna cifra utilizable para esta fila. Se muestra como ausente, no como cero."],
   "accounting.model.zeroTitle": ["A priced total that rounds to zero for this period.", "此期间计价后的总额四舍五入为零。", "Un total con precio que se redondea a cero en este período."],
+  // Component rows under a model. Every share in this table is against the
+  // whole period, so components add up to their model and models add up to the
+  // total; the denominator is stated once in the caption rather than on each
+  // row, where it would be text to read past on every comparison.
+  "accounting.model.componentCached": ["Cached input", "缓存输入", "Entrada en caché"],
+  "accounting.model.componentUncached": ["Uncached input", "未缓存输入", "Entrada sin caché"],
+  "accounting.model.componentCacheWrite": ["Cache write", "缓存写入", "Escritura en caché"],
+  "accounting.model.componentOutputText": ["Output text", "输出文本", "Texto de salida"],
+  "accounting.model.componentReasoning": ["Reasoning output", "推理输出", "Salida de razonamiento"],
+  "accounting.model.componentCombined": ["Combined output", "合并输出", "Salida combinada"],
+  "accounting.model.expand": ["Show the token components of {model}", "显示 {model} 的令牌组成", "Mostrar los componentes de tokens de {model}"],
+  "accounting.model.collapse": ["Hide the token components of {model}", "隐藏 {model} 的令牌组成", "Ocultar los componentes de tokens de {model}"],
+  // A usage change carries every component at once, so the count does not
+  // divide between them. Withheld rather than shown as zero.
+  "accounting.model.componentEventsWithheld": ["—", "—", "—"],
+  "accounting.model.componentEventsWithheldTitle": ["A usage change carries every token component at once, so it cannot be divided between them.", "一次使用变更同时包含所有令牌组成部分，因此无法在它们之间划分。", "Un cambio de uso incluye todos los componentes de tokens a la vez, por lo que no puede dividirse entre ellos."],
+  "accounting.model.componentsUnavailable": ["This row reported no token components, so none are shown rather than shown as zero.", "此行未报告令牌组成，因此不显示，而不是显示为零。", "Esta fila no informó componentes de tokens, por lo que no se muestran en lugar de mostrarse como cero."],
+  "accounting.model.componentCostWithheld": ["—", "—", "—"],
+  "accounting.model.componentCostWithheldTitle": ["No priced amount was reported for this component, so none is shown rather than shown as a priced zero.", "此组成部分没有报告计价金额，因此不显示，而不是显示为计价零。", "No se informó ningún importe con precio para este componente, así que no se muestra en lugar de mostrarse como un cero con precio."],
+  "accounting.model.componentFootnote": ["A component row shows no usage-change count, because one usage change carries every component at once and cannot be divided between them. Where a model states no API equivalent, its components state none either.", "组成部分行不显示使用变更计数，因为一次使用变更同时包含所有组成部分，无法在它们之间划分。若某个模型没有 API 等价值，其组成部分也不会显示。", "Una fila de componente no muestra recuento de cambios de uso, porque un cambio de uso incluye todos los componentes a la vez y no puede dividirse entre ellos. Cuando un modelo no indica equivalente de API, sus componentes tampoco lo indican."],
+  "accounting.model.shareHeading": ["Share", "占比", "Proporción"],
+  "accounting.model.shareOfPeriod": ["Both share columns are a share of the whole period, so components add up to their model and models add up to the total.", "两个占比列均相对于整个期间，因此各组成部分之和等于其模型，各模型之和等于总计。", "Ambas columnas de proporción son respecto al período completo, por lo que los componentes suman su modelo y los modelos suman el total."],
+  "accounting.model.shareWithheld": ["—", "—", "—"],
   "accounting.period.indexedHistory": ["Indexed history", "已索引历史", "Historial indexado"],
   "accounting.period.indexedHistorySoFar": ["Indexed history so far", "目前已索引的历史", "Historial indexado hasta ahora"],
   "accounting.fastMode.noUsage": ["No usage increments in this period, so there is no speed-mode attribution to report.", "此期间没有使用增量，因此没有可报告的速度模式归因。", "No hay incrementos de uso en este período, por lo que no hay atribución de modo de velocidad que informar."],
@@ -1318,6 +1341,13 @@ export const WEB_PLURAL_MESSAGES = Object.freeze({
     one: ["{count} reset fit", "{count} 个重置拟合", "{count} ajuste de restablecimiento"],
     other: ["{count} reset fits", "{count} 个重置拟合", "{count} ajustes de restablecimiento"],
   }),
+  // The card's outlined marker, in words. A reader of the text transcript
+  // cannot see the plot, so the difference the image draws has to be stated
+  // rather than left to the picture.
+  "share.text.shortObservation": Object.freeze({
+    one: ["{count} of these is a short observation, drawn as an outlined marker.", "其中 {count} 个为短观测，以空心标记绘制。", "{count} de estos es una observación corta, dibujada como un marcador sin relleno."],
+    other: ["{count} of these are short observations, drawn as outlined markers.", "其中 {count} 个为短观测，以空心标记绘制。", "{count} de estos son observaciones cortas, dibujadas como marcadores sin relleno."],
+  }),
   // The community allowance caveat: the participant count backing every point
   // is visible copy, so "from 1 contributing account" reads plainly.
   "community.allowance.accountCount": Object.freeze({
@@ -1479,6 +1509,10 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Local usage over time": ["本地使用情况随时间变化", "Uso local a lo largo del tiempo"],
   "Observed allowance remaining": ["观测到的剩余额度", "Cuota restante observada"],
   "Window boundary or track change": ["窗口边界或额度轨道变化", "Límite de ventana o cambio de seguimiento"],
+  // Same wording as `chart.status.quotaWeightingUnavailable` above, reused
+  // verbatim: the legend swatch and the band's own tooltip name one mechanism,
+  // so they must not drift into two different phrasings per locale.
+  "Quota weighting unavailable": ["额度加权不可用", "Ponderación por cuota no disponible"],
   "Movement needs context": ["变化需要上下文", "El movimiento necesita contexto"],
   "Allowance exhausted": ["额度已用尽", "Asignación agotada"],
   "Per-model rates": ["各模型费率", "Tasas por modelo"],
@@ -1486,7 +1520,7 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Indexed history": ["已索引历史", "Historial indexado"],
   "Model usage": ["模型使用情况", "Uso por modelo"],
   "A model on a separate allowance is listed on its own row and carries no API equivalent, because that figure cannot be compared with the main allowance. Nothing unavailable is replaced with an invented cost.": ["使用独立额度的模型会单独列为一行，并且不显示 API 等价值，因为该数值无法与主额度比较。任何不可用的数据都不会被虚构成本替代。", "Un modelo con una cuota independiente aparece en su propia fila y no lleva equivalente de API, porque esa cifra no se puede comparar con la cuota principal. Nada que no esté disponible se sustituye por un coste inventado."],
-  "Replay-safe usage grouped by model, across every allowance": ["按模型分组的可安全重放使用情况，涵盖所有额度", "Uso seguro para reproducción agrupado por modelo, en todas las cuotas"],
+  "Replay-safe usage grouped by model, across every allowance. Each model expands into its token components as rows of the same table.": ["按模型分组的可安全重放使用情况，涵盖所有额度。每个模型可展开为同一表格中的令牌组成行。", "Uso seguro para reproducción agrupado por modelo, en todas las cuotas. Cada modelo se expande en sus componentes de tokens como filas de la misma tabla."],
   "Review before sending": ["发送前审阅", "Revisar antes de enviar"],
   "Prepare and review a contribution": ["准备并审阅贡献", "Preparar y revisar una contribución"],
   "Nothing sends automatically": ["不会自动发送任何内容", "Nada se envía automáticamente"],
@@ -1784,11 +1818,14 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Standard API equivalent": ["Standard API 等值", "Equivalente de API Standard"],
   "API equivalent": ["API 等值", "Equivalente de API"],
   "See possible switch overhead": ["查看可能的切换开销", "Ver el posible coste adicional al cambiar"],
+  "A component row shows no usage-change count, because one usage change carries every component at once and cannot be divided between them. Where a model states no API equivalent, its components state none either.": ["组成部分行不显示使用变更计数，因为一次使用变更同时包含所有组成部分，无法在它们之间划分。若某个模型没有 API 等价值，其组成部分也不会显示。", "Una fila de componente no muestra recuento de cambios de uso, porque un cambio de uso incluye todos los componentes a la vez y no puede dividirse entre ellos. Cuando un modelo no indica equivalente de API, sus componentes tampoco lo indican."],
+  "Both share columns are a share of the whole period, so components add up to their model and models add up to the total.": ["两个占比列均相对于整个期间，因此各组成部分之和等于其模型，各模型之和等于总计。", "Ambas columnas de proporción son respecto al período completo, por lo que los componentes suman su modelo y los modelos suman el total."],
   "These recent rows pair an adjacent model or reasoning change with an observed material cache-read drop within five minutes. The cache-read change is observed; its relationship to the setting change is inferred.": ["这些近期记录将相邻的模型或推理强度更改与五分钟内观测到的缓存读取量大幅下降配对。缓存读取量的变化是观测结果；它与设置更改之间的关系是推断结果。", "Estas filas recientes emparejan un cambio adyacente de modelo o razonamiento con una caída material observada de lectura de caché en un plazo de cinco minutos. El cambio de lectura de caché se observa; su relación con el cambio de configuración se infiere."],
   "Recent possible switch-overhead evidence": ["近期可能的切换开销证据", "Evidencia reciente de posible coste adicional al cambiar"],
   "Configuration change": ["配置更改", "Cambio de configuración"],
   "Cache read": ["缓存读取", "Lectura de caché"],
   "Estimated lost reuse": ["估算的复用损失", "Reutilización perdida estimada"],
+  "Est. lost reuse": ["估算的复用损失", "Reutilización perdida estimada"],
   "See possible cache-continuity overhead": ["查看可能的缓存连续性开销", "Ver el posible coste adicional de continuidad de caché"],
   "The first table groups comparable adjacent user turns by elapsed time; the recent rows below show qualifying material cache-read drops while the effective model, reasoning, routing, and surface remained unchanged. Time is evidence, not an eligibility rule; compactions and contracted contexts stay out of the cost.": ["第一张表按经过时间对可比较的相邻用户轮次分组；下方的近期记录显示符合条件的缓存读取量大幅下降，且有效模型、推理强度、路由和界面均未改变。时间仅作为证据，而不是资格规则；上下文压缩和收缩的上下文不会计入成本。", "La primera tabla agrupa los turnos adyacentes comparables del usuario por tiempo transcurrido; las filas recientes de abajo muestran las caídas materiales de lectura de caché que cumplen los requisitos, sin cambios en el modelo efectivo, el razonamiento, el enrutamiento ni la superficie. El tiempo es evidencia, no una regla de inclusión; las compactaciones y los contextos reducidos no se incluyen en el coste."],
   "By time between turns": ["按轮次间隔", "Por tiempo entre turnos"],

@@ -4,7 +4,7 @@ import { normalizeDashboardPayload } from "../public/data-client.js";
 
 function forecast(overrides = {}) {
   return {
-    schemaVersion: "local-weekly-pace-forecast-v0.1",
+    schemaVersion: "local-weekly-pace-forecast-v0.2",
     status: "available",
     currentUsedPercent: 30,
     remainingPercent: 70,
@@ -14,7 +14,8 @@ function forecast(overrides = {}) {
       sampleCount: 1,
       elapsedHours: 0.25,
       movementPp: 10,
-      percentagePointsPerHour: 40,
+      activePercentagePointsPerHour: 40,
+      overallPercentagePointsPerHour: 40,
     },
     observationCount: 2,
     etaAt: "2026-08-03T14:15:00.000Z",
@@ -60,7 +61,8 @@ test("weekly browser data boundary retains one clean observation as an explainab
       sampleCount: 0,
       elapsedHours: null,
       movementPp: null,
-      percentagePointsPerHour: null,
+      activePercentagePointsPerHour: null,
+      overallPercentagePointsPerHour: null,
     },
     observationCount: 1,
     etaAt: null,

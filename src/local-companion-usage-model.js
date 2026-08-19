@@ -162,6 +162,48 @@ export function addComponents(target, components) {
   }
 }
 
+export function emptyComponentCosts() {
+  return Object.fromEntries(COMPONENT_KEYS.map((key) => [
+    key,
+    {
+      tokens: 0,
+      pricedTokens: 0,
+      unpricedTokens: 0,
+      costUsd: 0,
+    },
+  ]));
+}
+
+/**
+ * Add one event's per-component priced amounts.
+ *
+ * Tokens are counted whether or not they carried a price, and the priced and
+ * unpriced counts are kept apart, so a component that was never priced stays
+ * visible as unpriced rather than collapsing into a priced zero. Shared with
+ * the replay-safe cache so both accounting sources add money up identically —
+ * a difference between them must be a difference in evidence, never in
+ * arithmetic.
+ */
+export function addComponentCosts(target, components, priced) {
+  const pricedByName = new Map(
+    (Array.isArray(priced?.components) ? priced.components : [])
+      .map((row) => [row.name, row]),
+  );
+  for (const key of COMPONENT_KEYS) {
+    const tokens = components[key] ?? 0;
+    const row = target[key];
+    const pricedRow = pricedByName.get(key);
+    row.tokens += tokens;
+    if (pricedRow?.pricingStatus === "priced") {
+      row.pricedTokens += tokens;
+      const cost = Number(pricedRow.costUsd);
+      if (Number.isFinite(cost) && cost >= 0) row.costUsd += cost;
+    } else {
+      row.unpricedTokens += tokens;
+    }
+  }
+}
+
 export function safeModel(model) {
   return recognizedCodexModelId(model) ?? "unknown";
 }
@@ -241,6 +283,25 @@ export function usageProjection(record, declaredSpeed = "unknown", pricer = null
       && /^\d+(?:\.\d+)?$/u.test(item.costUsd)
     ))
     : [];
+  // The per-component priced breakdown, kept only where the pricer said the
+  // component was actually priced. Without it this projection could report a
+  // model's tokens by component but never its money by component, so the
+  // companion's own accounting could not answer the question the replay-safe
+  // cache already answers.
+  const pricedComponents = Array.isArray(priced.components)
+    ? priced.components.filter((item) => (
+      item
+      && typeof item === "object"
+      && typeof item.name === "string"
+      && item.pricingStatus === "priced"
+      && typeof item.costUsd === "string"
+      && /^\d+(?:\.\d+)?$/u.test(item.costUsd)
+    )).map((item) => ({
+      name: item.name,
+      pricingStatus: "priced",
+      costUsd: item.costUsd,
+    }))
+    : [];
   return {
     model,
     modelPricingStatus: modelPricingStatus(record.model),
@@ -259,6 +320,7 @@ export function usageProjection(record, declaredSpeed = "unknown", pricer = null
       : null,
     priceCardIds,
     priceCardBreakdown,
+    pricedComponents,
     pricingCoverageStatus: ["fully_priced", "partially_priced"].includes(priced.coverageStatus)
       ? priced.coverageStatus
       : "unpriced",
@@ -282,6 +344,7 @@ export function newUsagePeriod(id, label, { includeSpark = true } = {}) {
     events: 0,
     totalTokens: 0,
     components: emptyComponents(),
+    componentCosts: emptyComponentCosts(),
     apiPriceEquivalentUsd: 0,
     apiPriceEquivalentUsdExact: null,
     priceCardIds: [],
@@ -386,6 +449,11 @@ export function addUsageToPeriod(period, projection) {
   period.events += 1;
   period.totalTokens += projection.totalTokens;
   addComponents(period.components, projection.components);
+  addComponentCosts(
+    period.componentCosts,
+    projection.components,
+    { components: projection.pricedComponents },
+  );
   const modelSummary = period.byModel[projection.model] ??= {
     model: projection.model,
     pricingStatus: projection.modelPricingStatus,
@@ -394,10 +462,20 @@ export function addUsageToPeriod(period, projection) {
     events: 0,
     totalTokens: 0,
     apiPriceEquivalentUsd: 0,
+    // The same two crossings the replay-safe cache keeps per model, so a model
+    // table reads the same whichever source produced the period.
+    components: emptyComponents(),
+    componentCosts: emptyComponentCosts(),
   };
   modelSummary.events += 1;
   modelSummary.totalTokens += projection.totalTokens;
   modelSummary.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
+  addComponents(modelSummary.components, projection.components);
+  addComponentCosts(
+    modelSummary.componentCosts,
+    projection.components,
+    { components: projection.pricedComponents },
+  );
   period.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
   if (projection.apiPriceEquivalentUsdExact !== null) {
     period.apiPriceEquivalentUsdExact = period.apiPriceEquivalentUsdExact === null
@@ -451,6 +529,15 @@ function finalizeDimension(dimension) {
   ]));
 }
 
+function roundComponentCosts(componentCosts) {
+  return Object.fromEntries(
+    Object.entries(componentCosts).map(([key, cost]) => [
+      key,
+      { ...cost, costUsd: Number(cost.costUsd.toFixed(6)) },
+    ]),
+  );
+}
+
 export function finalizeUsagePeriod(period) {
   const priced = period.pricingCoverage.fullyPricedEvents + period.pricingCoverage.partiallyPricedEvents;
   const finalized = {
@@ -461,8 +548,13 @@ export function finalizeUsagePeriod(period) {
       (left, right) => left.priceCardId.localeCompare(right.priceCardId),
     ),
     pricedEventFraction: period.events === 0 ? null : Number((priced / period.events).toFixed(6)),
+    componentCosts: roundComponentCosts(period.componentCosts),
     byModel: Object.values(period.byModel)
-      .map((row) => ({ ...row, apiPriceEquivalentUsd: Number(row.apiPriceEquivalentUsd.toFixed(6)) }))
+      .map((row) => ({
+        ...row,
+        apiPriceEquivalentUsd: Number(row.apiPriceEquivalentUsd.toFixed(6)),
+        componentCosts: roundComponentCosts(row.componentCosts),
+      }))
       .sort((left, right) => right.apiPriceEquivalentUsd - left.apiPriceEquivalentUsd || left.model.localeCompare(right.model)),
     bySpeed: finalizeDimension(period.bySpeed),
     byApiServiceTier: finalizeDimension(period.byApiServiceTier),

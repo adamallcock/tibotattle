@@ -116,6 +116,9 @@ let residualInspectionSignature = "";
 // period or refreshed row set returns to page one.
 const CACHE_IMPACT_TABLE_PAGE_SIZE = 10;
 const accountingModelsTablePagination = { page: 0, signature: "" };
+// Which model rows the reader has opened. Held outside the render so a
+// background refresh redraws the table without collapsing a row mid-read.
+const accountingExpandedModels = new Set();
 const cacheSwitchTablePagination = { page: 0, signature: "" };
 const cacheContinuityGapTablePagination = { page: 0, signature: "" };
 const cacheContinuityTablePagination = { page: 0, signature: "" };
@@ -564,6 +567,37 @@ function formatPercent(value, digits = 0) {
   const rendered = format(number);
   if (number > 0 && rendered === format(0)) return `<${format(step)}`;
   if (number < 100 && rendered === format(100)) return `>${format(100 - step)}`;
+  return rendered;
+}
+
+/**
+ * A share for a table column, always at one decimal place.
+ *
+ * `formatPercent` drops to whole numbers whenever the value happens to be an
+ * integer, which is right for a sentence and wrong for a column: it renders
+ * "20%" directly above "20.9%", so the decimal point moves down the page and
+ * two figures that exist to be compared have to be read digit by digit. Here
+ * the precision is fixed, and the same bounded "<" idiom keeps a sliver from
+ * rendering as an exact zero it is not.
+ *
+ * Returns `null` when the denominator cannot carry a share at all, so callers
+ * withhold the cell rather than printing a share of nothing.
+ */
+function formatSharePercent(part, whole) {
+  const numerator = finite(part);
+  const denominator = finite(whole);
+  if (numerator === null || denominator === null || denominator <= 0) return null;
+  if (numerator < 0) return null;
+  const percentFormatter = numberFormatter({
+    maximumFractionDigits: 1,
+    minimumFractionDigits: 1,
+    style: "percent",
+  });
+  const format = (amount) => percentFormatter.format(amount / 100);
+  const value = numerator / denominator * 100;
+  const rendered = format(value);
+  if (value > 0 && rendered === format(0)) return `<${format(.1)}`;
+  if (value < 100 && rendered === format(100)) return `>${format(99.9)}`;
   return rendered;
 }
 
@@ -1979,6 +2013,13 @@ function shareCardTrend(history) {
     }),
     xTicks: Object.freeze([...(history?.xTicks ?? [])]),
     count: points.length,
+    // How many plotted fits carry the outlined short-observation marker, and
+    // the floor that classified them. The outline is a claim about evidence
+    // quality that the picture cannot explain on its own, so the key beside
+    // the plot and the transcript's sentence both read these instead of
+    // re-deriving a classification the dashboard already made.
+    shortCount: points.filter((point) => !point.wellObserved).length,
+    wellObservedFloorPp: finite(history?.wellObservedFloorPp, 0),
     // The population the count sentence names. The page headline counts the
     // whole corpus while the chart draws the filtered subset; the card used
     // to print only the subset count, which read as a different dataset. The
@@ -2161,6 +2202,11 @@ function buildShareCard(data, {
     // behind a five-hour or provider-reported generic allowance window.
     trend,
     trendLabel: t("share.trend.label"),
+    // The plot's marker key. The dashboard reveals its own only when a short
+    // observation is actually drawn (`#weekly-partial-legend`), and the card
+    // follows: a card whose fits are all well observed carries no key, and
+    // the labels are the chart's own, so the two surfaces say one thing.
+    trendLegend: shareCardTrendLegend(trend),
     // The count sentence mirrors the Allowance hero's phrasing: shown of
     // total, plus the range and span filter the shared model applied. A bare
     // subset count beside the page's corpus count read as two different
@@ -2209,6 +2255,33 @@ function shareCardTrendCountLabel(trend) {
 }
 
 /**
+ * The plot's two markers, named: filled for a well-observed fit, outlined for
+ * a short observation.
+ *
+ * Empty unless a short observation is actually plotted, so the common card
+ * spends no pixels explaining a marker it never draws. The branch mirrors the
+ * dashboard's own series label, so a card and the page it came from describe
+ * the same classification.
+ */
+function shareCardTrendLegend(trend) {
+  if (trend === null || trend.shortCount === 0) return Object.freeze([]);
+  return Object.freeze([
+    Object.freeze({
+      filled: true,
+      label: trend.wellObservedFloorPp > 0
+        ? t("weekly.series.wellObserved", {
+          span: formatDecimal(trend.wellObservedFloorPp, 0),
+        })
+        : t("weekly.series.allSpans"),
+    }),
+    Object.freeze({
+      filled: false,
+      label: t("weekly.series.shortObservation"),
+    }),
+  ]);
+}
+
+/**
  * The same card as a sentence, for a screen reader and for a text-only post.
  */
 function shareCardText(card) {
@@ -2228,6 +2301,7 @@ function shareCardText(card) {
     card.plan,
     figures,
     shareCardTrendText(card),
+    shareCardTrendShortText(card),
     card.caveats.join(" "),
     t("share.text.trailer", { trailer }),
     card.home === "" ? "" : t("share.text.more", { home: card.home }),
@@ -2254,6 +2328,22 @@ function shareCardTrendText(card) {
       label: card.trendLabel,
       low: formatMoney(card.trend.low, 0),
       start: card.trend.firstDateLabel,
+    });
+}
+
+/**
+ * The outlined marker, in words.
+ *
+ * The plot draws a short observation differently from a well-observed fit,
+ * and a difference a reader can see is a claim the transcript owes them.
+ * "" when every plotted fit is well observed, which is also when the image
+ * draws no key.
+ */
+function shareCardTrendShortText(card) {
+  return card.trend === null || card.trend.shortCount === 0
+    ? ""
+    : tPlural("share.text.shortObservation", card.trend.shortCount, {
+      count: formatNumber(card.trend.shortCount),
     });
 }
 
@@ -2513,6 +2603,39 @@ function drawShareCardTrend(context, card, x, y, width, height) {
   context.textAlign = "left";
   context.font = shareCardFont(700, 13);
   context.fillText(yAxisLabel, plotLeft, y + 22);
+
+  // The marker key shares that strip, right-aligned to the plot's right edge:
+  // the panel's top padding is already reserved and the axis label leaves it
+  // free. Each swatch is drawn by the same two calls the points are, at the
+  // same radius, so the key cannot drift from what it explains.
+  if (card.trendLegend.length > 0) {
+    context.save();
+    context.font = shareCardFont(600, 13);
+    const swatch = 9;
+    const gap = 7;
+    const between = 18;
+    const widths = card.trendLegend.map((entry) =>
+      swatch + gap + context.measureText(entry.label).width);
+    let cursor = plotRight - widths.reduce(
+      (total, width) => total + width + between,
+      -between,
+    );
+    card.trendLegend.forEach((entry, index) => {
+      context.fillStyle = entry.filled ? "#315f84" : "#fffef9";
+      context.beginPath();
+      context.arc(cursor + swatch / 2, y + 17, 4.5, 0, Math.PI * 2);
+      context.fill();
+      if (!entry.filled) {
+        context.strokeStyle = "#a9492f";
+        context.lineWidth = 2.4;
+        context.stroke();
+      }
+      context.fillStyle = "#65706b";
+      context.fillText(entry.label, cursor + swatch + gap, y + 22);
+      cursor += widths[index] + between;
+    });
+    context.restore();
+  }
 
   for (const tick of xTicks) {
     // SVG uses `middle`; Canvas uses the equivalent `center` value.
@@ -3312,16 +3435,32 @@ function timelineStatusIntervals(points, viewport) {
     .map((point) => ({ point, at: pointTimestampMs(point) }))
     .filter(({ at }) => Number.isFinite(at))
     .sort((left, right) => left.at - right.at);
-  return rows.flatMap(({ point, at: current }, index) => {
-    if (!point.status || point.status === "matched" || point.status === "inactive") return [];
+  // A run of consecutive windows excluded by ONE mechanism is one region, and
+  // merging it is a correctness fix rather than a tidy-up. Emitted per window,
+  // each rect is floored to a full viewBox unit by the renderer; at 30d the
+  // spacing between windows is well under a unit, so neighbours in a run
+  // overlapped and composited their alpha on top of each other. The wash then
+  // darkened with point DENSITY instead of duration — dense runs read as solid
+  // blocks while isolated windows stayed invisible, which is precisely the
+  // "I never see them" the exclusion legend was failing to explain.
+  const merged = [];
+  rows.forEach(({ point, at: current }, index) => {
+    if (!TIMELINE_STATUS_BAND_CLASSES[point.status]) return;
     const previous = index === 0 ? viewport.startMs : rows[index - 1].at;
     const next = index === rows.length - 1 ? viewport.endMs : rows[index + 1].at;
-    return [{
-      status: point.status,
-      startMs: Math.max(viewport.startMs, (previous + current) / 2),
-      endMs: Math.min(viewport.endMs, (current + next) / 2),
-    }];
+    const startMs = Math.max(viewport.startMs, (previous + current) / 2);
+    const endMs = Math.min(viewport.endMs, (current + next) / 2);
+    const last = merged[merged.length - 1];
+    // Adjacent windows meet exactly at their shared midpoint, so touching is
+    // the test for contiguity. A matched window in between pushes the next
+    // start past the previous end and correctly breaks the run.
+    if (last && last.status === point.status && startMs <= last.endMs) {
+      last.endMs = Math.max(last.endMs, endMs);
+      return;
+    }
+    merged.push({ status: point.status, startMs, endMs });
   });
+  return merged;
 }
 
 // The weekly track is identified by (limitId, duration) alone. The provider's
@@ -3517,7 +3656,17 @@ function liveTimelinePoints(
     // Pool saturated: the window STARTS at the ceiling, so the display
     // cannot move no matter what the workload costs. Both series suspend —
     // a zero observed against a live expected here is not a measurement.
-    const poolSaturated = sameReset
+    //
+    // Gated on `bracketed`, NOT on `sameReset`. Exhausting a pool spawns a
+    // fresh pool carrying a new `resets_at`, so a window that starts pegged
+    // almost always ends on a different boundary; requiring `sameReset` here
+    // made saturation unobservable in exactly the case it exists to describe,
+    // and every such window was booked as a plain track change instead. This
+    // also restores parity with the local pipeline, which has always read
+    // saturation off the start edge alone (`src/simple-quota-gradient.js`).
+    // `observed` already required `sameReset`, so no window changes from
+    // measured to suspended — only the label it is suspended under.
+    const poolSaturated = Boolean(bracketed)
       && before.usedPercent >= POOL_SATURATION_CEILING_PP;
     const observed = !poolSaturated
         && sameReset
@@ -4824,7 +4973,8 @@ function renderResidualInspectionTable() {
     table.append(row);
   }
   if (!pagination) return;
-  pagination.hidden = false;
+  // Same rule as the weekly and model tables: no pager for a single page.
+  pagination.hidden = pageCount <= 1;
   setLocalizedText($("#residual-page-status"), "residual.table.page", {
     start: formatNumber(start + 1),
     end: formatNumber(start + pageRows.length),
@@ -5374,6 +5524,37 @@ function chartSeriesCaption(label, value) {
   return t("chart.seriesValue", { label, value });
 }
 
+/**
+ * Which evidence states shade the plot, and under which hue.
+ *
+ * This is an explicit table with NO fallback, and both properties matter. The
+ * renderer used to end its status test in `: "ambiguous"`, so three unrelated
+ * states — `quota_weighting_unavailable`, `unpriced_local_activity` and
+ * `unexplained_without_local_activity` — all drew in the violet the legend
+ * captions "Movement needs context". Violet therefore meant four different
+ * things and mapped back to nothing.
+ *
+ * Worse, the last two carry BOTH series and are counted as matched windows, so
+ * the chart was shading spans the caption underneath it calls excluded. A
+ * status absent from this table is not shaded at all: shading is reserved for
+ * the mechanisms that actually suspend a measurement, which is exactly the set
+ * `TIMELINE_EXCLUSION_MESSAGE_KEYS` enumerates and the legend keys.
+ */
+const TIMELINE_STATUS_BAND_CLASSES = Object.freeze({
+  missing_quota_bracket: "missing",
+  reset_or_track_change: "reset",
+  quota_weighting_unavailable: "weighting",
+  backward_or_ambiguous: "ambiguous",
+  pool_saturated: "saturated",
+});
+
+// A band narrower than this cannot be seen, so every region also draws a
+// full-strength tick along the top edge of the plot at no less than this
+// width. The wash keeps the true extent and never widens; the tick is an
+// explicit presence marker, which is why the two are allowed to disagree.
+const STATUS_TICK_MINIMUM_WIDTH = 3;
+const STATUS_TICK_HEIGHT = 4;
+
 function lineChart({
   points,
   series,
@@ -5841,28 +6022,54 @@ function lineChart({
   for (const interval of statusIntervals) {
     if (!Number.isFinite(interval.startMs) || !Number.isFinite(interval.endMs)
         || interval.endMs <= interval.startMs) continue;
+    const band = TIMELINE_STATUS_BAND_CLASSES[interval.status];
+    // No entry means no legend swatch, so nothing is drawn. Silently shading
+    // an unkeyed status is what made the violet band unreadable.
+    if (!band) continue;
+    const plotWidth = width - margin.left - margin.right;
     const start = margin.left + (interval.startMs - domainStartMs)
-      / (safeDomainEndMs - domainStartMs) * (width - margin.left - margin.right);
+      / (safeDomainEndMs - domainStartMs) * plotWidth;
     const end = margin.left + (interval.endMs - domainStartMs)
-      / (safeDomainEndMs - domainStartMs) * (width - margin.left - margin.right);
-    const rect = document.createElementNS(svg.namespaceURI, "rect");
-    rect.setAttribute("x", String(Math.max(margin.left, start)));
-    rect.setAttribute("y", String(margin.top));
-    rect.setAttribute("width", String(Math.max(1, Math.min(width - margin.right, end) - Math.max(margin.left, start))));
-    rect.setAttribute("height", String(height - margin.top - margin.bottom));
-    rect.setAttribute("class", `chart-status-${
-      interval.status === "reset_or_track_change" ? "reset"
-        : interval.status === "missing_quota_bracket" ? "missing"
-          : interval.status === "pool_saturated" ? "saturated"
-            : "ambiguous"
-    }`);
-    const intervalTitle = document.createElementNS(svg.namespaceURI, "title");
-    setRawText(
-      intervalTitle,
-      chartText({ key: timelineStatusKey(interval.status) }, "status interval"),
+      / (safeDomainEndMs - domainStartMs) * plotWidth;
+    const left = Math.max(margin.left, start);
+    const bandWidth = Math.max(1, Math.min(width - margin.right, end) - left);
+    const label = chartText(
+      { key: timelineStatusKey(interval.status) },
+      "status interval",
     );
-    rect.append(intervalTitle);
-    svg.append(rect);
+    const shade = (element) => {
+      const elementTitle = document.createElementNS(svg.namespaceURI, "title");
+      setRawText(elementTitle, label);
+      element.append(elementTitle);
+      svg.append(element);
+    };
+
+    const rect = document.createElementNS(svg.namespaceURI, "rect");
+    rect.setAttribute("x", String(left));
+    rect.setAttribute("y", String(margin.top));
+    rect.setAttribute("width", String(bandWidth));
+    rect.setAttribute("height", String(height - margin.top - margin.bottom));
+    rect.setAttribute("class", `chart-status-${band}`);
+    shade(rect);
+
+    // The wash carries EXTENT and is never widened, so it cannot overstate how
+    // long a mechanism was in force. This tick carries IDENTITY: a fixed
+    // minimum width at legend-swatch strength, so a single excluded window —
+    // four in the owner's 30d view, each under half a unit wide — reads as a
+    // marker in its own hue instead of resolving to nothing. Drawn before the
+    // series, so a line crossing the top of the plot still wins.
+    const tickWidth = Math.max(STATUS_TICK_MINIMUM_WIDTH, bandWidth);
+    const tickLeft = Math.min(
+      width - margin.right - tickWidth,
+      Math.max(margin.left, left + bandWidth / 2 - tickWidth / 2),
+    );
+    const tick = document.createElementNS(svg.namespaceURI, "rect");
+    tick.setAttribute("x", String(tickLeft));
+    tick.setAttribute("y", String(margin.top));
+    tick.setAttribute("width", String(tickWidth));
+    tick.setAttribute("height", String(STATUS_TICK_HEIGHT));
+    tick.setAttribute("class", `chart-status-tick chart-status-${band}`);
+    shade(tick);
   }
 
   for (const item of chartSeries) {
@@ -6176,6 +6383,13 @@ function allowanceHistoryChartModel(data, {
     totalCount: allPoints.length,
     inRangeCount: inRange.length,
     spanFloorPp,
+    // The floor `wellObserved` classified against, which a relaxed range
+    // leaves above `spanFloorPp`: the inclusion filter and the marker split
+    // are two different decisions, and a surface that named the applied floor
+    // beside an outlined point would explain the outline with the wrong
+    // number. It travels with the model so the card can name it without
+    // reading the slider itself.
+    wellObservedFloorPp: activeWeeklyMinimumObservedSpanPp,
     rangeDays: boundedRangeDays,
     anchorAt: latestObservedAt,
   });
@@ -6433,18 +6647,198 @@ function ensureWeeklyPaceForecastCard() {
   return card;
 }
 
-function weeklyPaceDirection(percentagePointsPerHour, baseline = null) {
-  const pace = finite(percentagePointsPerHour);
-  const steady = firstFiniteForecastNumber(
-    baseline,
-    // A seven-day allowance paced evenly across its full window is the only
-    // baseline this card can derive without inventing a user schedule.
-    100 / (CODEX_WEEKLY_ALLOWANCE_MINUTES / 60),
+// Over, on and under pace are judged against the pace this window can still
+// sustain - the allowance that is left, spread evenly across the time that is
+// left - and never against a fixed 100%-per-seven-days rate.
+//
+// The fixed rate cannot answer the question a reader is actually asking,
+// because it ignores where in the window they already stand. At 3% left with
+// a day to go, "a steady weekly pace" is more than ten times too fast to
+// survive the reset, yet the card called that "ahead of a steady weekly pace"
+// and stayed green, because colour tracked whether the engine had an ETA
+// rather than whether the reader was about to run dry (community report,
+// 2026-08-18).
+const PACE_ON_TRACK_LOWER_RATIO = .85;
+const PACE_ON_TRACK_UPPER_RATIO = 1.15;
+// At twice the sustainable pace the allowance covers less than half the time
+// that is left, so the window ends with more dry hours than covered ones.
+const PACE_CRITICAL_RATIO = 2;
+// Under an hour of observations an overall rate is whatever the reader
+// happened to be doing in that hour, so the headline falls back to the
+// engine's active-interval pace and the card keeps saying it is early.
+const PACE_AVERAGE_MINIMUM_HOURS = 1;
+const PACE_STATE_LABELS = Object.freeze({
+  over: "Over pace",
+  on: "On pace",
+  under: "Under pace",
+});
+
+/**
+ * The two rates this card carries answer different questions and routinely
+ * disagree by an order of magnitude.
+ *
+ * `pace.activePercentagePointsPerHour` is the engine's median over adjacent
+ * intervals that actually moved, so it measures the pace *while working* and
+ * discards every idle gap. Extrapolated across a whole window it assumes the
+ * reader never stops, which is why a forecast built on it alone always lands
+ * earlier than what happens - the "it always underestimates the time I have
+ * left" complaint this card drew.
+ *
+ * `pace.overallPercentagePointsPerHour` is the same window's rate with idle
+ * time included, and since quota-pace-forecast-v0.2 it is what the engine's
+ * own `etaAt` and `status` are built from. That is the honest headline; the
+ * active rate stays on the card as the without-pausing edge, drawn as a
+ * separate mark on the track.
+ *
+ * The `movementPp / elapsedHours` fallback covers a payload that predates the
+ * named rates. It carries a minimum-span guard the engine field does not need,
+ * because a derived average over a few minutes is whatever the reader happened
+ * to be doing; the engine gates the same risk through `earlyEstimate` instead.
+ */
+function weeklyPaceRates(pace, forecast) {
+  const active = firstFiniteForecastNumber(
+    pace.activePercentagePointsPerHour,
+    pace.percentPerHour,
+    pace.pacePercentPerHour,
+    forecast.percentagePointsPerHour,
+    forecast.pacePercentPerHour,
+    forecast.pacePpPerHour,
   );
-  if (pace === null || steady === null || steady <= 0) return null;
-  if (pace > steady * 1.1) return "Recent pace is ahead of a steady weekly pace.";
-  if (pace < steady * .9) return "Recent pace is behind a steady weekly pace.";
-  return "Recent pace is close to a steady weekly pace.";
+  const elapsedHours = firstFiniteForecastNumber(pace.elapsedHours);
+  const movementPp = firstFiniteForecastNumber(pace.movementPp);
+  const derivedAverage = elapsedHours !== null
+    && elapsedHours >= PACE_AVERAGE_MINIMUM_HOURS
+    && movementPp !== null
+    && movementPp > 0
+    ? movementPp / elapsedHours
+    : null;
+  const reported = firstFiniteForecastNumber(
+    pace.overallPercentagePointsPerHour,
+  );
+  const average = reported !== null && reported > 0 ? reported : derivedAverage;
+  return {
+    active: active !== null && active > 0 ? active : null,
+    average,
+    // The wall-clock rate leads. Falling back to the working rate keeps the
+    // card readable rather than blank when only that one is available.
+    headline: average ?? (active !== null && active > 0 ? active : null),
+  };
+}
+
+/**
+ * Where the reader stands relative to the pace that just reaches the reset.
+ *
+ * `ratio` is the whole classification: 1 means the allowance runs out exactly
+ * at the reset, above 1 means it runs out early, below 1 means some is left
+ * over. Because the sustainable pace is `remaining / hoursToReset`, the ratio
+ * is also `hoursToReset / hoursToExhaustion`, so the track below can be drawn
+ * straight from it without a second, separately-rounded division.
+ */
+function weeklyPaceStanding({ remainingPercent, hoursToReset, pacePpPerHour }) {
+  const remaining = finite(remainingPercent);
+  const hoursLeft = finite(hoursToReset);
+  const pace = finite(pacePpPerHour);
+  if (remaining === null
+      || hoursLeft === null
+      || hoursLeft <= 0
+      || remaining <= 0
+      || pace === null
+      || pace <= 0) return null;
+  const sustainable = remaining / hoursLeft;
+  const ratio = pace / sustainable;
+  if (!Number.isFinite(ratio) || ratio <= 0) return null;
+  const coveredHours = Math.min(hoursLeft, remaining / pace);
+  const state = ratio > PACE_ON_TRACK_UPPER_RATIO
+    ? "over"
+    : ratio < PACE_ON_TRACK_LOWER_RATIO ? "under" : "on";
+  return {
+    ratio,
+    state,
+    critical: state === "over" && ratio >= PACE_CRITICAL_RATIO,
+    sustainable,
+    coveredHours,
+    dryHours: Math.max(0, hoursLeft - coveredHours),
+    // Only meaningful when the pace does not exhaust the window; an over-pace
+    // reading leaves nothing spare by definition.
+    sparePercent: Math.max(0, remaining - pace * hoursLeft),
+  };
+}
+
+function formatPaceRatio(ratio) {
+  const value = finite(ratio);
+  if (value === null) return null;
+  return `${formatDecimal(value, value < 10 ? 1 : 0)}×`;
+}
+
+/**
+ * The window as a single track: how much of the time left to the reset the
+ * remaining allowance actually covers, and how much of it is dry.
+ *
+ * The bar is deliberately a picture of time, not of allowance. "You have 3%
+ * left" tells a reader nothing on its own; "that covers the next 20 minutes
+ * of a day and five hours" is the fact they act on. The state name, the
+ * heading and this track's own label all state the standing in words, so
+ * colour is never the only carrier.
+ */
+function weeklyPaceTrack(standing, hoursToReset, activePace, remainingPercent) {
+  const hoursLeft = finite(hoursToReset);
+  if (!standing || hoursLeft === null || hoursLeft <= 0) return null;
+  const coveredShare = Math.max(0, Math.min(1, standing.coveredHours / hoursLeft));
+  const track = node("div", "weekly-pace-track");
+  const bar = node("div", "weekly-pace-track-bar");
+  const covered = node("div", "weekly-pace-track-covered");
+  covered.style.inlineSize = `${(coveredShare * 100).toFixed(2)}%`;
+  bar.append(covered);
+
+  // The engine's active-interval pace, drawn only where it would run the
+  // allowance out sooner than the headline rate does. It is the edge of the
+  // estimate, not the estimate: it answers "and if I do not stop?".
+  const remaining = finite(remainingPercent);
+  const active = finite(activePace);
+  const flatOutHours = active !== null && active > 0 && remaining !== null
+    ? remaining / active
+    : null;
+  let flatOutLabel = null;
+  if (flatOutHours !== null && flatOutHours < standing.coveredHours * .95) {
+    const flatOutShare = Math.max(0, Math.min(1, flatOutHours / hoursLeft));
+    const mark = node("div", "weekly-pace-track-mark");
+    mark.style.insetInlineStart = `${(flatOutShare * 100).toFixed(2)}%`;
+    bar.append(mark);
+    flatOutLabel = formatForecastDuration(flatOutHours);
+  }
+
+  const resetDuration = formatForecastDuration(hoursLeft);
+  const coveredDuration = formatForecastDuration(standing.coveredHours);
+  const dryDuration = formatForecastDuration(standing.dryHours);
+  bar.setAttribute("role", "img");
+  bar.setAttribute(
+    "aria-label",
+    // Whether a gap exists is arithmetic, not a state name: the on-pace band
+    // straddles the point where the allowance lands exactly on the reset, so
+    // an on-pace card can still end with a short dry stretch.
+    dryDuration
+      ? `Of the ${resetDuration ?? "time"} left before the reset, the remaining allowance covers about ${coveredDuration ?? "none of it"}, leaving about ${dryDuration} with none left.`
+      : `The remaining allowance covers all ${resetDuration ?? "of the time"} left before the reset.`,
+  );
+
+  const scale = node("div", "weekly-pace-track-scale");
+  scale.append(
+    node("span", "", "Now"),
+    node(
+      "span",
+      "weekly-pace-track-scale-end",
+      resetDuration ? `Reset in ${resetDuration}` : "Reset",
+    ),
+  );
+  track.append(bar, scale);
+  if (flatOutLabel) {
+    track.append(node(
+      "p",
+      "weekly-pace-track-note",
+      `The mark is where the allowance ends if the recent active pace continues without a pause: about ${flatOutLabel} from now.`,
+    ));
+  }
+  return track;
 }
 
 function renderWeeklyPaceForecast(data) {
@@ -6487,14 +6881,8 @@ function renderWeeklyPaceForecast(data) {
   if (remaining === null && used !== null) remaining = 100 - used;
   if (remaining !== null && (remaining < 0 || remaining > 100)) remaining = null;
 
-  const percentagePointsPerHour = firstFiniteForecastNumber(
-    pace.percentagePointsPerHour,
-    pace.percentPerHour,
-    pace.pacePercentPerHour,
-    forecast.percentagePointsPerHour,
-    forecast.pacePercentPerHour,
-    forecast.pacePpPerHour,
-  );
+  const rates = weeklyPaceRates(pace, forecast);
+  const headlinePace = rates.headline;
   const hoursToReset = firstFiniteForecastNumber(
     (resetAt - now) / 3_600_000,
     forecast.hoursToReset,
@@ -6514,7 +6902,7 @@ function renderWeeklyPaceForecast(data) {
     etaAt = now + suppliedHoursToExhaustion * 3_600_000;
   }
   const available = status === "available"
-    || (status === "" && etaAt !== null && percentagePointsPerHour !== null);
+    || (status === "" && etaAt !== null && headlinePace !== null);
   const reachesResetFirst = status === "will_reach_reset_first"
     || status === "reset_before_exhaustion";
   const paceIntervals = firstFiniteForecastNumber(pace.sampleCount);
@@ -6541,19 +6929,40 @@ function renderWeeklyPaceForecast(data) {
   if (collectingEvidence && remaining === null) return;
   if (!collectingEvidence
       && remaining === null
-      && percentagePointsPerHour === null
+      && headlinePace === null
       && !reachesResetFirst) return;
+
+  // The standing is computed from the headline rate, so the card's colour,
+  // its heading and its arithmetic all come from one number. The engine's own
+  // `available` / `will_reach_reset_first` split still gates whether a card
+  // appears at all, but it no longer decides how the card reads: an engine ETA
+  // built on the active-interval pace is exactly the reading that overstated
+  // the burn.
+  const standing = collectingEvidence
+    ? null
+    : weeklyPaceStanding({
+      remainingPercent: remaining,
+      hoursToReset,
+      pacePpPerHour: headlinePace,
+    });
+  const paceState = standing?.state
+    ?? (collectingEvidence ? null : reachesResetFirst ? "under" : null);
+  const projectedEtaAt = standing !== null && standing.state === "over"
+    ? now + standing.coveredHours * 3_600_000
+    : null;
 
   const title = node("h3", "weekly-pace-forecast-title");
   const cardId = "weekly-pace-forecast-title";
   title.id = cardId;
   title.textContent = collectingEvidence
     ? "Pace estimate ready after one more refresh"
-    : reachesResetFirst
-      ? "At the recent pace, the weekly allowance should last to reset"
-      : etaAt === null
-        ? "At this pace: weekly allowance exhaustion is approaching"
-        : `At this pace: reaches weekly allowance ${formatReportingTime(etaAt)}`;
+    : paceState === "over"
+      ? projectedEtaAt === null
+        ? "At this pace the weekly allowance runs out before the reset"
+        : `At this pace the weekly allowance runs out ${formatReportingTime(projectedEtaAt)}`
+      : paceState === "on"
+        ? "At this pace the weekly allowance runs close to the reset"
+        : "At this pace the weekly allowance lasts to the reset with room to spare";
   card.setAttribute("aria-labelledby", cardId);
 
   const heading = node("div", "weekly-pace-forecast-heading");
@@ -6563,95 +6972,112 @@ function renderWeeklyPaceForecast(data) {
       "panel-kicker",
       collectingEvidence ? "Collecting forecast evidence" : "Forecast from recent pace",
     ),
-    node(
+  );
+  if (collectingEvidence) {
+    heading.append(node(
       "span",
-      collectingEvidence
-        ? "evidence-chip weekly-pace-forecast-collecting-chip"
-        : earlyEstimate
-          ? "evidence-chip weekly-pace-forecast-early-chip"
-          : "evidence-chip",
-      collectingEvidence ? "One more refresh" : earlyEstimate ? "Early estimate" : "Observed pace",
-    ),
-  );
+      "evidence-chip weekly-pace-forecast-collecting-chip",
+      "One more refresh",
+    ));
+  } else if (paceState) {
+    // The standing is named in words on the chip as well as carried in the
+    // card's colour, so the over/on/under reading survives a monochrome
+    // screen, a colour-vision difference and a screen reader alike.
+    heading.append(node(
+      "span",
+      "evidence-chip weekly-pace-forecast-state-chip",
+      PACE_STATE_LABELS[paceState],
+    ));
+  }
+  if (earlyEstimate) {
+    heading.append(node(
+      "span",
+      "evidence-chip weekly-pace-forecast-early-chip",
+      "Early estimate",
+    ));
+  }
 
-  const direction = weeklyPaceDirection(
-    percentagePointsPerHour,
-    firstFiniteForecastNumber(
-      pace.steadyPercentagePointsPerHour,
-      forecast.steadyPercentagePointsPerHour,
-    ),
-  );
+  const ratioLabel = standing === null ? null : formatPaceRatio(standing.ratio);
+  const dryDuration = standing === null
+    ? null
+    : formatForecastDuration(standing.dryHours);
   const copy = node("p", "weekly-pace-forecast-copy");
   copy.textContent = collectingEvidence
     ? "One clean weekly allowance observation is saved. The next fresh observation for this account and reset will establish its pace."
-    : earlyEstimate
-      ? "This is an early estimate from a small amount of recent evidence; it will settle as more observations arrive."
-      : direction ?? (reachesResetFirst
-        ? "Recent allowance movement is not fast enough to exhaust this window before its reset."
-        : "The estimate uses the latest clean allowance observations.");
+    : standing === null
+      ? "Recent allowance movement is not fast enough to exhaust this window before its reset."
+      : standing.state === "over"
+        ? `Recent use is running about ${ratioLabel} the pace this window can still sustain${dryDuration ? `, which leaves roughly ${dryDuration} with none left before the reset` : ""}.`
+        : standing.state === "on"
+          ? `Recent use is close to the pace this window can still sustain, so the allowance should land near the reset with little to spare.`
+          : `Recent use is running about ${ratioLabel} the pace this window can still sustain, so some of the allowance should still be unused at the reset.`;
+  if (earlyEstimate) {
+    copy.textContent += " This is an early estimate from a small amount of recent evidence; it will settle as more observations arrive.";
+  }
 
   const metrics = node("div", "weekly-pace-forecast-metrics");
-  if (remaining !== null) {
-    metrics.append(
-      node("div", "weekly-pace-forecast-metric", "Allowance left"),
-    );
-    const item = metrics.lastElementChild;
-    item.replaceChildren(
-      node("span", "", "Allowance left"),
-      node("strong", "", formatPercent(remaining)),
-    );
-  }
+  const addMetric = (label, value) => {
+    const item = node("div", "weekly-pace-forecast-metric");
+    item.append(node("span", "", label), node("strong", "", value));
+    metrics.append(item);
+  };
+  if (remaining !== null) addMetric("Allowance left", formatPercent(remaining));
   const resetDuration = formatForecastDuration(hoursToReset);
-  if (resetDuration) {
-    metrics.append(
-      node("div", "weekly-pace-forecast-metric"),
-    );
-    const item = metrics.lastElementChild;
-    item.append(
-      node("span", "", "Reset"),
-      node("strong", "", `in ${resetDuration}`),
-    );
-  }
+  if (resetDuration) addMetric("Reset", `in ${resetDuration}`);
   if (collectingEvidence) {
-    metrics.append(
-      node("div", "weekly-pace-forecast-metric"),
-    );
-    const item = metrics.lastElementChild;
-    item.append(
-      node("span", "", "Evidence"),
-      node("strong", "", "1 saved"),
-    );
-  } else if (percentagePointsPerHour !== null && percentagePointsPerHour > 0) {
-    metrics.append(
-      node("div", "weekly-pace-forecast-metric"),
-    );
-    const item = metrics.lastElementChild;
-    item.append(
-      node("span", "", "Recent pace"),
-      node("strong", "", `${formatDecimal(percentagePointsPerHour, 1)} pp/hour`),
-    );
+    addMetric("Evidence", "1 saved");
+  } else if (dryDuration) {
+    // A dry stretch and spare allowance are mutually exclusive, and the tile
+    // reports whichever one the reading actually produced rather than pinning
+    // itself to the state name.
+    addMetric("Nothing left for", dryDuration);
+  } else if (standing !== null) {
+    addMetric("Spare at reset", formatPercent(standing.sparePercent));
+  } else if (headlinePace !== null && headlinePace > 0) {
+    addMetric("Recent pace", `${formatDecimal(headlinePace, 1)} pp/hour`);
   }
 
+  const track = collectingEvidence
+    ? null
+    : weeklyPaceTrack(standing, hoursToReset, rates.active, remaining);
+
+  // The evidence line names both rates. A reader who wondered why the old
+  // card's forecast kept arriving early can see the difference between the
+  // pace with idle time counted and the pace while working, instead of being
+  // handed one number with no way to tell which it was.
   const observationDuration = formatForecastDuration(paceElapsedHours);
+  const rateSentences = [];
+  if (rates.average !== null) {
+    rateSentences.push(`${formatDecimal(rates.average, 1)} pp/hour overall`);
+  }
+  if (rates.active !== null) {
+    rateSentences.push(`${formatDecimal(rates.active, 1)} pp/hour while active`);
+  }
   const evidence = observations !== null && observations >= 1
     ? node(
       "p",
       "weekly-pace-forecast-evidence",
       collectingEvidence
         ? "One fresh allowance observation is saved for this weekly reset."
-        : `Based on ${Math.round(observations)} recent allowance observation${Math.round(observations) === 1 ? "" : "s"}${observationDuration ? ` over ${observationDuration}` : ""}.`,
+        : `Based on ${formatDecimal(Math.round(observations), 0)} recent allowance observation${Math.round(observations) === 1 ? "" : "s"}${observationDuration ? ` over ${observationDuration}` : ""}${rateSentences.length > 0 ? `: ${rateSentences.join(", ")}` : ""}.`,
     )
     : null;
   card.className = [
     "weekly-pace-forecast",
     collectingEvidence
       ? "is-insufficient"
-      : reachesResetFirst
-        ? "is-reset-first"
-        : "is-available",
+      : paceState === "over"
+        ? "is-over-pace"
+        : paceState === "on" ? "is-on-pace" : "is-under-pace",
+    standing?.critical ? "is-critical" : "",
     earlyEstimate ? "is-early-estimate" : "",
+    // Retained so the engine's own split stays inspectable from the DOM even
+    // though it no longer drives presentation.
+    reachesResetFirst ? "is-reset-first" : "",
+    available ? "is-available" : "",
   ].filter(Boolean).join(" ");
   card.append(heading, title, copy, metrics);
+  if (track) card.append(track);
   if (evidence) card.append(evidence);
   card.hidden = false;
 }
@@ -7212,8 +7638,13 @@ function cacheImpactTableSignature(kind, impact, rows) {
 function renderCacheImpactPagination(prefix, state, page) {
   const pagination = $(`#${prefix}-pagination`);
   if (!pagination) return;
-  pagination.hidden = page.total === 0;
-  if (page.total === 0) return;
+  // The pager renders only when there is something to page through; a set that
+  // fits one page keeps the plain table. A control whose two buttons are both
+  // disabled above a "1–6 of 6" status is furniture: it says only what the
+  // rows underneath it already show. This matches the weekly table, which has
+  // always drawn its pager this way.
+  pagination.hidden = page.total === 0 || page.pageCount <= 1;
+  if (pagination.hidden) return;
   setLocalizedText($(`#${prefix}-page-status`), "table.pagination.page", {
     start: formatNumber(page.start + 1),
     end: formatNumber(page.end),
@@ -8321,6 +8752,23 @@ function modelRowIsSeparateAllowance(row) {
  *                        never silently shown as zero.
  *   a real amount      - including an honest, priced $0.00.
  */
+/**
+ * Whether this row states an API-price equivalent that can be compared with
+ * the pool's total at all.
+ *
+ * The share column has to ask the same question the amount column already
+ * asks. A row whose amount reads "No published price" holds no money figure,
+ * so its share of the period's money is not zero — it is unknown, and printing
+ * "0.0%" beside "No published price" would contradict the cell next to it.
+ */
+function modelHasComparableCost(row) {
+  if (modelRowIsSeparateAllowance(row)) return false;
+  if (row?.pricingStatus === "known_unpriced") return false;
+  if (row?.pricingStatus === "unrecognized") return false;
+  const amount = finite(row?.apiPriceEquivalentUsd);
+  return amount !== null && amount >= 0;
+}
+
 function modelApiEquivalentCell(row) {
   const cell = node("td", "model-api-equivalent");
   if (modelRowIsSeparateAllowance(row)) {
@@ -8370,6 +8818,102 @@ function pricingCoverageNote(accounting) {
   });
 }
 
+/**
+ * The token components a model row can break down into, in reading order:
+ * input before output, and within each the cheaper-per-token part first. The
+ * label is a key rather than a string so the rows retranslate in place.
+ */
+const MODEL_COMPONENT_ROWS = Object.freeze([
+  ["input_cache_read_tokens", "accounting.model.componentCached"],
+  ["input_uncached_tokens", "accounting.model.componentUncached"],
+  ["input_cache_write_tokens", "accounting.model.componentCacheWrite"],
+  ["output_text_tokens", "accounting.model.componentOutputText"],
+  ["output_reasoning_tokens", "accounting.model.componentReasoning"],
+  ["output_combined_tokens", "accounting.model.componentCombined"],
+]);
+
+/**
+ * A share cell. `null` prints the same withheld glyph the rest of this table
+ * uses, so "no denominator to divide by" never renders as an exact 0.0%.
+ */
+function modelShareCell(part, whole) {
+  const share = formatSharePercent(part, whole);
+  if (share === null) {
+    return localizedNode("td", "numeric-cell model-share", "accounting.model.shareWithheld");
+  }
+  return rawNode("td", "numeric-cell model-share", share);
+}
+
+/**
+ * One component of one model, built as a row of the same table rather than a
+ * nested grid: same columns, same alignment, one level of indent. Only the
+ * denominator differs from the model row above it, and that is stated once in
+ * the caption under the table.
+ */
+function modelComponentRow(model, key, labelKey, totals) {
+  const row = node("tr", "model-component-row");
+  row.dataset.componentOf = model.model;
+
+  const identity = node("td", "model-identity model-component-identity");
+  const swatch = node("span", `component-swatch component-swatch-${key.replace(/_/gu, "-")}`);
+  swatch.setAttribute("aria-hidden", "true");
+  identity.append(swatch, localizedNode("span", "", labelKey));
+
+  // A usage change carries every component at once, so the count does not
+  // divide between them. Withheld with its reason, never shown as zero.
+  const events = localizedNode(
+    "td",
+    "numeric-cell model-component-withheld",
+    "accounting.model.componentEventsWithheld",
+  );
+  events.title = t("accounting.model.componentEventsWithheldTitle");
+
+  const tokens = finite(model.components?.[key], 0);
+  const cost = model.componentCosts?.[key] ?? null;
+
+  // A separate allowance carries no comparable money, and a row whose
+  // components were never priced carries none either. Both withhold the
+  // amount instead of dividing the row total into an invented one.
+  let costCell;
+  let costShareCell;
+  if (!modelHasComparableCost(model) || cost === null) {
+    costCell = localizedNode(
+      "td",
+      "numeric-cell model-component-withheld",
+      "accounting.model.componentCostWithheld",
+    );
+    costCell.title = t(
+      modelRowIsSeparateAllowance(model)
+        ? "accounting.model.separateAllowanceTitle"
+        : model.pricingStatus === "known_unpriced"
+          ? "accounting.model.noPublishedPriceTitle"
+          : model.pricingStatus === "unrecognized"
+            ? "accounting.model.notPricedUnknownTitle"
+            : "accounting.model.componentCostWithheldTitle",
+    );
+    costShareCell = localizedNode(
+      "td",
+      "numeric-cell model-share",
+      "accounting.model.shareWithheld",
+    );
+  } else {
+    costCell = rawNode("td", "numeric-cell", formatApiMoney(finite(cost.costUsd, 0)));
+    costShareCell = modelShareCell(finite(cost.costUsd, 0), totals.cost);
+  }
+
+  row.append(
+    identity,
+    events,
+    rawNode("td", "numeric-cell", formatCount(tokens)),
+    modelRowIsSeparateAllowance(model)
+      ? localizedNode("td", "numeric-cell model-share", "accounting.model.shareWithheld")
+      : modelShareCell(tokens, totals.tokens),
+    costCell,
+    costShareCell,
+  );
+  return row;
+}
+
 function renderAccountingModels(accounting) {
   const models = $("#accounting-models");
   if (!models) return;
@@ -8394,11 +8938,19 @@ function renderAccountingModels(accounting) {
   if (!modelRows.length) {
     const row = node("tr");
     const cell = localizedNode("td", "empty-cell", "accounting.model.noneInPeriod");
-    cell.colSpan = 4;
+    cell.colSpan = 6;
     row.append(cell);
     models.append(row);
     return;
   }
+  // Both share columns are against the primary pool's own totals, so the model
+  // rows add up to 100% and each model's components add up to their model. A
+  // separately metered row is not part of that pool and withholds both shares,
+  // the same rule its money cell already follows.
+  const totals = {
+    tokens: finite(accounting?.totalTokens, 0),
+    cost: finite(accounting?.apiPriceEquivalentUsd, 0),
+  };
   for (const model of page.rows) {
     const row = node("tr");
     const identity = node("td", "model-identity");
@@ -8426,14 +8978,85 @@ function renderAccountingModels(accounting) {
     }
     // One formatter for both count columns. Compact notation put "154.9K"
     // beside "74" in the same column, which no reader can compare by eye.
+    const separate = modelRowIsSeparateAllowance(model);
     row.append(
       identity,
       rawNode("td", "numeric-cell", formatCount(model.events)),
       rawNode("td", "numeric-cell", formatCount(model.totalTokens)),
+      separate
+        ? localizedNode("td", "numeric-cell model-share", "accounting.model.shareWithheld")
+        : modelShareCell(model.totalTokens, totals.tokens),
       modelApiEquivalentCell(model),
+      modelHasComparableCost(model)
+        ? modelShareCell(model.apiPriceEquivalentUsd, totals.cost)
+        : localizedNode("td", "numeric-cell model-share", "accounting.model.shareWithheld"),
     );
-    models.append(row);
+
+    // A row can only be opened when it actually carries a split. Older cached
+    // projections have none, and drawing four zeroed rows for them would be a
+    // claim the row never made.
+    const componentRows = model.components === null || model.components === undefined
+      ? []
+      : MODEL_COMPONENT_ROWS
+        .filter(([key]) => finite(model.components[key], 0) > 0)
+        .map(([key, labelKey]) => modelComponentRow(model, key, labelKey, totals));
+
+    if (componentRows.length > 0) {
+      const expanded = accountingExpandedModels.has(model.model);
+      row.classList.add("model-row-expandable");
+      row.tabIndex = 0;
+      row.setAttribute("role", "button");
+      row.setAttribute("aria-expanded", String(expanded));
+      const describe = () => {
+        row.setAttribute(
+          "aria-label",
+          t(
+            row.getAttribute("aria-expanded") === "true"
+              ? "accounting.model.collapse"
+              : "accounting.model.expand",
+            { model: formatModelName(model.model) },
+          ),
+        );
+      };
+      describe();
+      identity.prepend(modelDisclosureCaret());
+      for (const componentRow of componentRows) componentRow.hidden = !expanded;
+      const toggle = () => {
+        const open = row.getAttribute("aria-expanded") === "true";
+        row.setAttribute("aria-expanded", String(!open));
+        if (open) accountingExpandedModels.delete(model.model);
+        else accountingExpandedModels.add(model.model);
+        for (const componentRow of componentRows) componentRow.hidden = open;
+        describe();
+      };
+      row.addEventListener("click", toggle);
+      row.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        toggle();
+      });
+    }
+
+    models.append(row, ...componentRows);
   }
+}
+
+/** The affordance that says a model row opens. Decorative; the row is the control. */
+function modelDisclosureCaret() {
+  const caret = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  caret.setAttribute("class", "model-disclosure-caret");
+  caret.setAttribute("viewBox", "0 0 16 16");
+  caret.setAttribute("aria-hidden", "true");
+  caret.setAttribute("focusable", "false");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", "M6 3.5 10.5 8 6 12.5");
+  path.setAttribute("fill", "none");
+  path.setAttribute("stroke", "currentColor");
+  path.setAttribute("stroke-width", "1.8");
+  path.setAttribute("stroke-linecap", "round");
+  path.setAttribute("stroke-linejoin", "round");
+  caret.append(path);
+  return caret;
 }
 
 function fastModeCoverageSentence(fastMode) {

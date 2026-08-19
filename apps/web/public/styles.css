@@ -1432,30 +1432,63 @@ h2 {
 .legend-dot.allowance { color: var(--green); }
 .compact-legend { justify-content: flex-end; margin-top: var(--space-2); }
 .chart-area-confidence { fill: rgba(49, 95, 132, .14); }
-/* Four exclusion bands, four distinct hues, so a shaded region on the chart
-   maps to exactly one legend entry. "Missing bracket" and "movement needs
-   context" both drew in the same grey and were indistinguishable; the latter
-   is violet now. Each legend swatch carries its band's hue at a higher alpha
-   so a 12px square reads where the faint plot-width wash would not. */
-.chart-status-missing { fill: rgba(101, 112, 107, .08); }
-.chart-status-reset { fill: rgba(49, 95, 132, .08); }
-.chart-status-ambiguous { fill: rgba(124, 92, 173, .1); }
+/* Five exclusion bands, five distinct hues, so a shaded region on the chart
+   maps to exactly one legend entry.
+
+   The hues were already distinct on paper; the alpha destroyed them. At .08
+   over the card's cream every band composited to within two to five RGB units
+   of every other, which is below the threshold at which a hue is a hue — the
+   whole key read as one grey. The washes sit at .16-.22 now, far enough apart
+   to be told apart, and the neutral was pulled off its green cast so it cannot
+   be confused with the teal.
+
+   Alpha is graded by how much of the plot a mechanism typically covers, not by
+   importance: "missing bracket" arrives in long collection gaps and is the
+   lightest, while "movement needs context" is usually a single window and is
+   the strongest. Each band also draws a top-edge tick at identity strength —
+   see `.chart-status-tick` below, which is what actually makes a lone window
+   visible. The legend swatch carries the tick's exact colour, so the key shows
+   the mark the reader is hunting for rather than the wash behind it. */
+.chart-status-missing { fill: rgba(99, 99, 104, .16); }
+.chart-status-reset { fill: rgba(31, 111, 168, .18); }
+/* "Quota weighting unavailable": a priced-cost gap, so the window carries no
+   expected value to difference against. It is a counted exclusion mechanism
+   with its own message, but it had no hue and no legend entry, and so fell
+   through the renderer's old default into the violet that captions
+   "movement needs context". */
+.chart-status-weighting { fill: rgba(20, 120, 104, .18); }
+.chart-status-ambiguous { fill: rgba(124, 92, 173, .22); }
 /* "Allowance exhausted": the pool is pegged at 100%, so no residual is
    measurable across the span. Warmer than the neutral exclusions so a
    deliberate suspension never reads as a data gap. */
-.chart-status-saturated { fill: rgba(176, 101, 43, .1); }
-.legend-dot.chart-status-missing { background: rgba(101, 112, 107, .54); }
-.legend-dot.chart-status-reset { background: rgba(49, 95, 132, .54); }
-.legend-dot.chart-status-ambiguous { background: rgba(124, 92, 173, .54); }
-.legend-dot.chart-status-saturated { background: rgba(176, 101, 43, .54); }
-/* Two line series (a short stroke swatch) and four shaded-window categories
+.chart-status-saturated { fill: rgba(176, 101, 43, .2); }
+
+/* Identity marker. A band is only as wide as the span it excludes, and at a
+   month's zoom a single excluded window is a fraction of a viewBox unit — no
+   alpha makes that readable, so widening the wash was never the fix (it would
+   claim an exclusion lasted longer than it did). The renderer pairs every band
+   with a fixed-minimum tick along the top edge instead, and these are its
+   colours: the same hue at roughly four times the wash, where the difference
+   between blue, teal and violet is unmistakable. */
+.chart-status-tick.chart-status-missing { fill: rgba(99, 99, 104, .58); }
+.chart-status-tick.chart-status-reset { fill: rgba(31, 111, 168, .62); }
+.chart-status-tick.chart-status-weighting { fill: rgba(20, 120, 104, .62); }
+.chart-status-tick.chart-status-ambiguous { fill: rgba(124, 92, 173, .66); }
+.chart-status-tick.chart-status-saturated { fill: rgba(176, 101, 43, .64); }
+
+.legend-dot.chart-status-missing { background: rgba(99, 99, 104, .58); }
+.legend-dot.chart-status-reset { background: rgba(31, 111, 168, .62); }
+.legend-dot.chart-status-weighting { background: rgba(20, 120, 104, .62); }
+.legend-dot.chart-status-ambiguous { background: rgba(124, 92, 173, .66); }
+.legend-dot.chart-status-saturated { background: rgba(176, 101, 43, .64); }
+/* Two line series (a short stroke swatch) and five shaded-window categories
    share one key. The area swatches are filled squares — the shape the bands
    take on the chart — and a hairline separator sets the two groups apart, so
    a reader tells a line from a band at a glance without a per-locale sublabel. */
 .legend-dot.area { width: 12px; height: 12px; border-radius: 3px; }
 .legend-group-sep { width: 1px; height: 15px; align-self: center; background: var(--line); }
 /* The calibration legend is a full-width horizontal row beneath the chart
-   heading. A slightly tighter column gap keeps all seven entries on one line
+   heading. A slightly tighter column gap keeps the entries on one or two lines
    on a full-width English card; longer labels and narrower cards wrap it, but
    never back into the three-high stack it made inside the control column. */
 .calibration-legend { width: 100%; margin-top: var(--space-4); justify-content: flex-start; column-gap: 14px; }
@@ -1578,33 +1611,70 @@ tbody tr:last-child td { border-bottom: 0; }
 .weekly-hero span, .weekly-hero small { color: rgba(255,255,255,.7); font-size: .72rem; }
 .weekly-hero > div:first-child strong { margin: .2rem 0; font-family: var(--serif); font-size: clamp(3rem, 6vw, 5rem); font-weight: var(--weight-regular); line-height: 1; }
 .weekly-hero > p { max-width: 55ch; margin: 0; color: rgba(255,255,255,.8); font-size: .86rem; line-height: 1.5; }
+/*
+ * Pace forecast card.
+ *
+ * One accent token drives the whole card - rule, wash, chip and track - and
+ * the state class is the only thing that sets it. Colour used to follow
+ * whether the engine had produced an ETA, which put the card's calmest colour
+ * on its most urgent reading: "you run out before the reset" rendered green.
+ * The ramp now runs green (under pace) -> blue (on pace) -> amber (over) ->
+ * rust (over by more than double), and every step is also named in words on
+ * the chip, so nothing here is carried by colour alone.
+ */
 .weekly-pace-forecast {
+  --pace-accent: var(--green);
+  --pace-accent-text: var(--green-text);
+  --pace-accent-soft: var(--green-soft);
+  --pace-accent-edge: rgba(23, 79, 69, .24);
+  --pace-accent-wash: rgba(223, 236, 230, .8);
   display: grid;
   grid-template-columns: minmax(260px, 1fr) minmax(310px, .95fr);
   gap: 15px 24px;
   align-items: start;
   margin: 0 0 18px;
   padding: 22px 24px;
-  border: 1px solid rgba(38, 107, 91, .26);
-  border-inline-start: 4px solid var(--green);
+  border: 1px solid var(--pace-accent-edge);
+  border-inline-start: 4px solid var(--pace-accent);
   border-radius: var(--radius-md);
-  background: linear-gradient(100deg, rgba(221, 239, 233, .75), rgba(255, 253, 247, .94));
+  background: linear-gradient(100deg, var(--pace-accent-wash), rgba(255, 253, 247, .94));
 }
 .weekly-pace-forecast[hidden] { display: none; }
-.weekly-pace-forecast.is-reset-first {
-  border-inline-start-color: var(--blue);
-  border-color: rgba(49, 95, 132, .24);
-  background: linear-gradient(100deg, rgba(226, 235, 243, .76), rgba(255, 253, 247, .94));
+.weekly-pace-forecast.is-on-pace {
+  --pace-accent: var(--blue);
+  --pace-accent-text: var(--blue);
+  --pace-accent-soft: var(--blue-soft);
+  --pace-accent-edge: rgba(49, 95, 132, .24);
+  --pace-accent-wash: rgba(226, 235, 243, .76);
+}
+.weekly-pace-forecast.is-over-pace {
+  --pace-accent: var(--amber);
+  --pace-accent-text: var(--amber);
+  --pace-accent-soft: var(--amber-soft);
+  --pace-accent-edge: rgba(129, 87, 24, .26);
+  --pace-accent-wash: rgba(244, 234, 215, .8);
+}
+/* Past twice the sustainable pace the window ends with more dry hours than
+   covered ones, which is a different message from "ease off". */
+.weekly-pace-forecast.is-over-pace.is-critical {
+  --pace-accent: var(--rust);
+  --pace-accent-text: var(--rust);
+  --pace-accent-soft: var(--rust-soft);
+  --pace-accent-edge: rgba(151, 64, 42, .26);
+  --pace-accent-wash: rgba(244, 228, 222, .82);
 }
 .weekly-pace-forecast.is-insufficient {
-  border-inline-start-color: var(--blue);
-  border-color: rgba(49, 95, 132, .24);
-  background: linear-gradient(100deg, rgba(226, 235, 243, .76), rgba(255, 253, 247, .94));
+  --pace-accent: var(--blue);
+  --pace-accent-text: var(--blue);
+  --pace-accent-soft: var(--blue-soft);
+  --pace-accent-edge: rgba(49, 95, 132, .24);
+  --pace-accent-wash: rgba(226, 235, 243, .76);
 }
+.weekly-pace-forecast-state-chip,
 .weekly-pace-forecast-collecting-chip {
-  color: var(--blue);
-  border-color: rgba(49, 95, 132, .18);
-  background: var(--blue-soft);
+  color: var(--pace-accent-text);
+  border-color: var(--pace-accent-edge);
+  background: var(--pace-accent-soft);
 }
 .weekly-pace-forecast-early-chip {
   color: var(--amber);
@@ -1636,11 +1706,11 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .weekly-pace-forecast-metrics {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(88px, 1fr));
   grid-column: 2;
   grid-row: 2 / span 2;
   gap: 8px;
-  align-self: stretch;
+  align-self: start;
 }
 .weekly-pace-forecast-metric {
   display: flex;
@@ -1667,8 +1737,72 @@ tbody tr:last-child td { border-bottom: 0; }
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
+/*
+ * The window track. Its width is the time left before the reset, and the
+ * filled part is how much of that time the remaining allowance covers - so an
+ * under-pace card fills the bar and an over-pace card shows the gap it will
+ * spend with nothing left. Drawing time rather than allowance is deliberate:
+ * "3% left" carries no urgency on its own, "that covers 20 minutes of the 29
+ * hours left" carries all of it.
+ */
+.weekly-pace-track {
+  display: flex;
+  flex-direction: column;
+  grid-column: 1 / -1;
+  gap: 6px;
+}
+.weekly-pace-track-bar {
+  position: relative;
+  overflow: hidden;
+  block-size: 12px;
+  border: 1px solid var(--pace-accent-edge);
+  border-radius: var(--radius-pill);
+  /* The dry remainder is hatched as well as pale, so the covered/dry split
+     survives a greyscale print or a colour-vision difference. */
+  background-color: var(--surface-raised);
+  background-image: repeating-linear-gradient(
+    135deg,
+    var(--pace-accent-soft) 0 5px,
+    transparent 5px 10px
+  );
+}
+.weekly-pace-track-covered {
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 0;
+  min-inline-size: 2px;
+  border-start-end-radius: 2px;
+  border-end-end-radius: 2px;
+  background: var(--pace-accent);
+}
+/* Where the allowance ends if the recent active bursts continue without a
+   pause. It is the fast edge of the estimate, never the estimate itself. */
+.weekly-pace-track-mark {
+  position: absolute;
+  inset-block: -1px;
+  inline-size: 2px;
+  border-radius: 1px;
+  background: var(--surface-raised);
+  box-shadow: 0 0 0 1px var(--pace-accent);
+}
+.weekly-pace-track-scale {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: .62rem;
+  letter-spacing: .045em;
+  text-transform: uppercase;
+}
+.weekly-pace-track-scale-end { text-align: end; }
+.weekly-pace-track-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: .67rem;
+  line-height: 1.5;
+}
 .weekly-pace-forecast-evidence {
-  grid-column: 1;
+  grid-column: 1 / -1;
   margin: 0;
   color: var(--muted);
   font-size: .67rem;
@@ -1785,7 +1919,69 @@ tbody tr:last-child td { border-bottom: 0; }
 .model-allowance-footnote::before { content: "* "; }
 /* Digits stay column-aligned so counts can be compared down the column. */
 .numeric-cell, .model-api-equivalent { font-variant-numeric: tabular-nums; }
+
+/* A share is the supporting reading of the figure beside it, so it is set
+   smaller and quieter than the amount it qualifies. It keeps its own column
+   rather than stacking under that amount: one column then holds one kind of
+   number, and the decimal points line up down the page. */
+.model-share, .model-share-head {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+/* Only the data cell steps down. The header row keeps one size across every
+   column, so shrinking this one too would make the row look misaligned. */
+.model-share { font-size: .84em; }
+
+/* An expandable model row is a control, so it says so on hover and focus. */
+.model-row-expandable { cursor: pointer; }
+.model-row-expandable:hover > td { background: var(--surface-quiet); }
+.model-row-expandable:focus-visible {
+  outline: 3px solid rgba(49, 95, 132, .42);
+  outline-offset: -3px;
+}
+.model-disclosure-caret {
+  width: .9em;
+  height: .9em;
+  margin-inline-end: var(--space-2);
+  color: var(--muted);
+  vertical-align: -.08em;
+  transition: transform .18s ease;
+}
+.model-row-expandable[aria-expanded="true"] .model-disclosure-caret {
+  transform: rotate(90deg);
+}
+
+/* A component row carries the same columns as the model above it, one level in
+   and one shade quieter, so nothing about its shape has to be relearned. */
+.model-component-row > td { background: var(--surface-quiet); }
+.model-component-identity {
+  padding-inline-start: calc(var(--space-4) + var(--space-5));
+  font-weight: var(--weight-regular);
+}
+.model-component-withheld { color: var(--muted); }
+.component-swatch {
+  display: inline-block;
+  width: .58em;
+  height: .58em;
+  margin-inline-end: var(--space-2);
+  border-radius: 2px;
+  background: var(--muted);
+}
+/* The same four colours the component bars above the table already use, so the
+   rows and the bars read as one encoding rather than two. */
+.component-swatch-input-cache-read-tokens { background: var(--blue); }
+.component-swatch-input-uncached-tokens { background: var(--green-2); }
+.component-swatch-input-cache-write-tokens { background: var(--chart-accent); }
+.component-swatch-output-text-tokens { background: var(--rust); }
+.component-swatch-output-reasoning-tokens { background: var(--amber); }
+.component-swatch-output-combined-tokens { background: var(--ink); }
+
+@media (prefers-reduced-motion: reduce) {
+  .model-disclosure-caret { transition: none; }
+}
 .cache-switch-details { margin-top: 18px; }
+.cache-switch-details th,
+.cache-switch-details td { padding-inline: var(--space-2); }
 .cache-switch-details th:nth-child(n + 3),
 .cache-switch-details td:nth-child(n + 3) { text-align: end; }
 .cache-continuity-details .evidence-subheading {

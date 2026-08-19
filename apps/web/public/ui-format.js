@@ -301,11 +301,20 @@ export function classifyTimelineEvidence({
     ? null
     : observedValue - expectedValue;
   // A pegged pool is its own evidence state, not an ambiguity: the window is
-  // fully bracketed inside one reset, but a display at its ceiling cannot
-  // move, so no residual is measurable there ("allowance exhausted").
+  // bracketed, but a display at its ceiling cannot move, so no residual is
+  // measurable there ("allowance exhausted").
+  //
+  // Saturation is tested BEFORE the reset check, and that order is the whole
+  // reason the state is reachable. Exhausting a pool spawns a fresh one with a
+  // new `resets_at`, so the boundary changes at the very instant the ceiling is
+  // hit: behind `!sameReset` the saturated branch was shadowed by its own
+  // precondition and had never once classified a window. The peg is also the
+  // more specific fact — it names WHY the window is unmeasurable, where
+  // "boundary changed" only names when. `bracketed` still comes first, because
+  // without a reading on the start edge there is no ceiling to observe.
   const status = !bracketed ? "missing_quota_bracket"
-    : !sameReset ? "reset_or_track_change"
-      : poolSaturated === true ? "pool_saturated"
+    : poolSaturated === true ? "pool_saturated"
+      : !sameReset ? "reset_or_track_change"
         : observedValue === null ? "backward_or_ambiguous"
           : observedValue === 0 && events === 0 && cost === 0 ? "inactive"
             : observedValue > 0 && events === 0

@@ -444,3 +444,88 @@ test("pinned windows, byte keys, and aborts are validated", async () => {
     ),
   );
 });
+
+test("the companion projection accounts money by component per model, as the replay-safe cache does", async () => {
+  const {
+    addUsageToPeriod,
+    finalizeUsagePeriod,
+    newUsagePeriod,
+    usageProjection,
+  } = await import("../src/local-companion-usage-model.js");
+
+  const usageRecord = (model, observedAt, components) => ({
+    model,
+    observedAt,
+    components,
+    tierSemantics: { codexSpeedMode: "standard", apiServiceTier: "standard" },
+    surfaceClassification: { surface: "cli_exec", agentScope: "root" },
+  });
+
+  const period = newUsagePeriod("test", "Test period");
+  const records = [
+    usageRecord("gpt-5.6-sol", "2026-08-01T10:00:00.000Z", {
+      input_cache_read_tokens: 1_000_000,
+      input_uncached_tokens: 200_000,
+      output_text_tokens: 40_000,
+      output_reasoning_tokens: 10_000,
+    }),
+    usageRecord("gpt-5.6-sol", "2026-08-01T11:00:00.000Z", {
+      input_cache_read_tokens: 500_000,
+      input_uncached_tokens: 100_000,
+      output_text_tokens: 20_000,
+      output_reasoning_tokens: 5_000,
+    }),
+    usageRecord("gpt-5.6-luna", "2026-08-01T12:00:00.000Z", {
+      input_cache_read_tokens: 2_000_000,
+      input_uncached_tokens: 50_000,
+      output_text_tokens: 8_000,
+      output_reasoning_tokens: 4_000,
+    }),
+  ];
+  for (const record of records) {
+    addUsageToPeriod(period, usageProjection(record));
+  }
+  const finalized = finalizeUsagePeriod(period);
+
+  // Money by component per model was previously unavailable on this source:
+  // the projection carried the token split but never the priced breakdown, so
+  // the model table could show a model's tokens by component and none of its
+  // cost. Every row must now reconcile against its own total.
+  assert.equal(finalized.byModel.length, 2);
+  for (const row of finalized.byModel) {
+    const componentTotal = Object.values(row.componentCosts)
+      .reduce((sum, cost) => sum + cost.costUsd, 0);
+    assert.equal(
+      Number(componentTotal.toFixed(6)),
+      row.apiPriceEquivalentUsd,
+      `${row.model} component costs reconcile with its own total`,
+    );
+    assert.ok(
+      row.apiPriceEquivalentUsd > 0,
+      `${row.model} is priced, so its components are not all zero`,
+    );
+  }
+
+  // And the models must reconcile against the period, in both units, so the
+  // model table and the component bars stay two margins of one crossing.
+  for (const key of Object.keys(finalized.components)) {
+    assert.equal(
+      finalized.byModel.reduce((sum, row) => sum + row.components[key], 0),
+      finalized.components[key],
+      `${key} tokens add up across models`,
+    );
+    assert.equal(
+      Number(finalized.byModel
+        .reduce((sum, row) => sum + row.componentCosts[key].costUsd, 0)
+        .toFixed(6)),
+      finalized.componentCosts[key].costUsd,
+      `${key} cost adds up across models`,
+    );
+  }
+  assert.equal(
+    Number(Object.values(finalized.componentCosts)
+      .reduce((sum, cost) => sum + cost.costUsd, 0)
+      .toFixed(6)),
+    finalized.apiPriceEquivalentUsd,
+  );
+});

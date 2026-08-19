@@ -343,11 +343,14 @@ export interface QuotaPaceEstimate {
   sampleCount: number;
   elapsedHours: number | null;
   movementPp: number | null;
-  percentagePointsPerHour: number | null;
+  /** Median of adjacent slopes that moved: pace per *working* hour. */
+  activePercentagePointsPerHour: number | null;
+  /** Total movement over total elapsed time: pace per *wall-clock* hour. */
+  overallPercentagePointsPerHour: number | null;
 }
 
 export interface QuotaPaceForecast {
-  schemaVersion: "quota-pace-forecast-v0.1";
+  schemaVersion: "quota-pace-forecast-v0.2";
   status: QuotaPaceStatus;
   refusalCodes: QuotaPaceRefusalCode[];
   accountTrackId: string;
@@ -369,8 +372,10 @@ export interface QuotaPaceForecast {
 }
 
 export const QUOTA_PACE_POLICY: Readonly<{
-  schemaVersion: "quota-pace-forecast-v0.1";
+  schemaVersion: "quota-pace-forecast-v0.2";
   method: "median_adjacent_quota_slope";
+  /** Which rate `etaAt`, `hoursToExhaustion` and `status` are derived from. */
+  etaBasis: "overall_percentage_points_per_hour";
   windowDurationMinutes: 10080;
   maximumReceiptLagMs: number;
   maximumPacePpPerHour: number;
