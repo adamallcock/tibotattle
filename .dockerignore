@@ -1,7 +1,12 @@
 .git
+.pnpm-store
+.release-archive
 .release-build
 .release-deps
+.release-repro
 .usage-monitor
+exports
 node_modules
 **/node_modules
+reports
 *.log
