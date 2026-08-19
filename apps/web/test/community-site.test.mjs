@@ -27,14 +27,14 @@ import {
   compactMacOSVersion,
   configuredInstallerRelease,
   formatInstallerSize,
-  installerFileName,
+  renderInstallerAssurance,
   renderInstallerJourney,
-  renderInstallerTrust,
 } from "../public/install-cta.js";
 
 const SITE_HTML = new URL("../public/community.html", import.meta.url);
 const SITE_SOURCE = new URL("../public/community.js", import.meta.url);
 const DOCS_HTML = new URL("../public/docs.html", import.meta.url);
+const VERIFY_RELEASE = new URL("../../../docs/verify-release.md", import.meta.url);
 const PRIVACY_HTML = new URL("../public/privacy.html", import.meta.url);
 const APP_HTML = new URL("../public/index.html", import.meta.url);
 const APP_SOURCE = new URL("../public/app.js", import.meta.url);
@@ -177,14 +177,13 @@ test("the public site presents only the install call to action and the community
     /id="installer-sha256-copy"[\s\S]*?aria-describedby="installer-sha256-copy-status"/u,
   );
   assert.match(html, /id="installer-sha256"[\s\S]*?data-i18n-skip[\s\S]*?hidden/u);
-  assert.match(html, /id="download-trust"[^>]*hidden/u);
-  assert.match(html, /How can I trust this download\?/u);
-  assert.match(html, /Developer ID signed/u);
-  assert.match(html, /Apple notarized/u);
-  assert.match(html, /Published SHA-256/u);
-  assert.match(html, /id="installer-trust-sha-command"/u);
-  assert.match(html, /id="installer-trust-dmg-command"/u);
-  assert.match(html, /A checksum proves integrity, not safety\./u);
+  assert.match(html, /id="download-assurance"[^>]*hidden/u);
+  assert.match(html, /Developer ID signed and Apple notarized\./u);
+  assert.match(html, /href="\.\/docs\.html#download-security"/u);
+  assert.doesNotMatch(
+    html,
+    /How can I trust this download\?|Published SHA-256|integrity, not safety|installer-trust-/u,
+  );
   assert.doesNotMatch(html, /installer-verification|role="tooltip"/u);
   assert.match(html, /id="installer-unavailable"/u);
   assert.match(html, /id="homebrew-install"[^>]*hidden/u);
@@ -576,6 +575,7 @@ test("unavailable community activity uses the compact public state", async () =>
 
 test("the public guidance pages are useful stubs without app-only controls", async () => {
   const docs = await readFile(DOCS_HTML, "utf8");
+  const verifyRelease = await readFile(VERIFY_RELEASE, "utf8");
   const privacy = await readFile(PRIVACY_HTML, "utf8");
   assert.match(docs, /<title>TiboTattle Docs<\/title>/u);
   assert.match(
@@ -583,11 +583,48 @@ test("the public guidance pages are useful stubs without app-only controls", asy
     /Estimated API-equivalent value of the observed seven-day allowance\./u,
   );
   assert.match(docs, /Activity totals alone are never presented as an allowance\./u);
+  assert.match(docs, /id="download-security"/u);
+  assert.match(docs, /A download you can check/u);
+  assert.match(docs, /Signed for the platform/u);
+  assert.match(docs, /release-manifest\.json/u);
+  assert.match(docs, /fields not published are explicitly null/u);
+  assert.match(docs, /complete non-null evidence set/u);
+  assert.match(docs, /independent verifier can check against the artifact/u);
+  assert.doesNotMatch(docs, /verified provenance bundles/u);
+  assert.match(docs, /website\s+exposes availability and digest/u);
+  assert.match(docs, /Read the full verification guide on GitHub/u);
+  assert.doesNotMatch(docs, /gh attestation verify|Get-AuthenticodeSignature|sha256sum|verification-command/u);
+  assert.match(verifyRelease, /# Verify a TiboTattle release/u);
+  assert.match(verifyRelease, /gh release verify-asset/u);
+  assert.match(verifyRelease, /gh release download "\$VERSION" --repo "\$REPO"/u);
+  assert.match(verifyRelease, /npm run release:evidence:validate --/u);
+  assert.match(verifyRelease, /### Important: v0\.1\.12 is a legacy release/u);
+  assert.ok(
+    verifyRelease.indexOf("### Important: v0.1.12 is a legacy release")
+      < verifyRelease.indexOf('gh release verify "$VERSION"'),
+    "the legacy release caveat appears before release-level verification commands",
+  );
+  assert.match(verifyRelease, /--bundle "\$PROVENANCE_BUNDLE"/u);
+  assert.match(verifyRelease, /--bundle "\$SBOM_BUNDLE"/u);
+  assert.match(verifyRelease, /https:\/\/spdx\.dev\/Document\/v2\.3/u);
+  assert.match(verifyRelease, /--source-ref "refs\/tags\/\$VERSION"/u);
+  assert.match(verifyRelease, /--source-digest "\$COMMIT"/u);
+  assert.match(verifyRelease, /--signer-workflow/u);
+  assert.match(verifyRelease, /### macOS direct DMG/u);
+  assert.match(verifyRelease, /### Windows direct installer or MSIX/u);
+  assert.match(verifyRelease, /### Linux AppImage/u);
+  assert.match(verifyRelease, /Mac App Store/u);
+  assert.match(verifyRelease, /does not prove safety/u);
   assert.match(privacy, /<title>TiboTattle Privacy Overview<\/title>/u);
   assert.match(privacy, /This website cannot read local Codex files\./u);
   assert.match(privacy, /Nothing is contributed unless you review and opt in\./u);
   for (const page of [docs, privacy]) {
     assert.match(page, /href="\.\/community\.html#download"/u);
+    assert.match(
+      page,
+      /<span class="header-download-label">Download<\/span>/u,
+      "resource-page download labels must collapse without clipping on narrow headers",
+    );
     assert.match(page, /href="\.\/docs\.html"/u);
     assert.match(page, /href="\.\/privacy\.html"/u);
     assert.doesNotMatch(
@@ -1514,26 +1551,12 @@ test("the install card refuses a partially injected release", () => {
     assert.equal(Object.hasOwn(compact.byId.get(id), "href"), false, id);
   }
 
-  assert.equal(installerFileName(complete["usage-monitor-installer-url"]), "TiboTattle.dmg");
-  const trust = fakeDocument(complete);
-  const trustRelease = configuredInstallerRelease(trust);
-  const renderedTrust = renderInstallerTrust(trust, trustRelease);
-  assert.equal(renderedTrust.fileName, "TiboTattle.dmg");
-  assert.equal(trust.byId.get("download-trust").hidden, false);
-  assert.equal(trust.byId.get("installer-trust-version").textContent, "1.2.3");
-  assert.equal(trust.byId.get("installer-trust-sha256").textContent, "a".repeat(64));
-  assert.equal(
-    trust.byId.get("installer-trust-sha-command").textContent,
-    "shasum -a 256 'TiboTattle.dmg'",
-  );
-  assert.match(
-    trust.byId.get("installer-trust-app-command").textContent,
-    /spctl --assess --type execute --verbose=4 \/Applications\/TiboTattle\.app/u,
-  );
-  assert.match(
-    trust.byId.get("installer-trust-dmg-command").textContent,
-    /context:primary-signature --verbose=4 'TiboTattle\.dmg'/u,
-  );
+  const assurance = fakeDocument(complete);
+  const assuranceRelease = configuredInstallerRelease(assurance);
+  assert.equal(renderInstallerAssurance(assurance, assuranceRelease), assuranceRelease);
+  assert.equal(assurance.byId.get("download-assurance").hidden, false);
+  assert.equal(renderInstallerAssurance(assurance, undefined), null);
+  assert.equal(assurance.byId.get("download-assurance").hidden, true);
 
   for (
     const [name, hostile] of [
@@ -1548,8 +1571,8 @@ test("the install card refuses a partially injected release", () => {
     const documentRef = fakeDocument({ ...complete, [name]: hostile });
     assert.equal(configuredInstallerRelease(documentRef), null, `${name}=${hostile}`);
     assert.equal(renderInstallerJourney(documentRef), null);
-    assert.equal(renderInstallerTrust(documentRef, null), null);
-    assert.equal(documentRef.byId.get("download-trust").hidden, true);
+    assert.equal(renderInstallerAssurance(documentRef, null), null);
+    assert.equal(documentRef.byId.get("download-assurance").hidden, true);
     assert.equal(documentRef.byId.get("installer-link").hidden, true);
     assert.equal(documentRef.byId.get("installer-unavailable-action").hidden, true);
     assert.equal(documentRef.byId.get("installer-unavailable").hidden, false);

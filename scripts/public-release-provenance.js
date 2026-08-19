@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import { lstat, readFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
+
+import { digestRegularFile } from "./release-evidence.js";
 
 export const PUBLIC_RELEASE_MANIFEST_SCHEMA =
   "usage-monitor-release-site-manifest-v0.3";
@@ -26,19 +27,6 @@ function safeRelativePath(path) {
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
-}
-
-async function regularFile(path, label) {
-  let metadata;
-  try {
-    metadata = await lstat(path);
-  } catch {
-    throw new TypeError(`${label} is missing or cannot be inspected`);
-  }
-  if (!metadata.isFile() || metadata.isSymbolicLink()) {
-    throw new TypeError(`${label} must be a regular file`);
-  }
-  return metadata;
 }
 
 function canonicalEntriesDigest(entries) {
@@ -79,12 +67,16 @@ export async function createPublicReleaseSourceProvenance({
       throw new TypeError("Public release source provenance has an unsafe file name");
     }
     seen.add(name);
-    const metadata = await regularFile(path, `Public release source ${name}`);
-    const bytes = await readFile(path);
+    const digest = await digestRegularFile(
+      path,
+      `Public release source ${name}`,
+      null,
+      root,
+    );
     entries.push({
       path: name,
-      bytes: metadata.size,
-      sha256: sha256(bytes),
+      bytes: digest.bytes,
+      sha256: digest.sha256,
     });
   }
   entries.sort((left, right) => left.path.localeCompare(right.path));
@@ -149,12 +141,13 @@ export async function verifyPublicReleaseSourceProvenance({
     if (!pathWithin(sourceRoot, sourcePath)) {
       throw new TypeError("Generated public release provenance escaped its source root");
     }
-    const metadata = await regularFile(
+    const digest = await digestRegularFile(
       sourcePath,
       `Public release provenance source ${row.path}`,
+      null,
+      sourceRoot,
     );
-    const bytes = await readFile(sourcePath);
-    if (metadata.size !== row.bytes || sha256(bytes) !== row.sha256) {
+    if (digest.bytes !== row.bytes || digest.sha256 !== row.sha256) {
       throw new TypeError(
         `Generated public release provenance does not match the source snapshot: ${row.path}`,
       );

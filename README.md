@@ -40,18 +40,27 @@ artifact.
 
 ## Install
 
-Install the signed, notarized app with Homebrew:
+For a published macOS release, install the signed, notarized app with Homebrew:
 
 ```bash
 brew install --cask adamallcock/tap/tibotattle
 ```
 
-Or download the DMG from [tibotattle.com](https://tibotattle.com) or the
+Or, when the website exposes a current download, download the DMG from
+[tibotattle.com](https://tibotattle.com) or the
 [TiboTattle releases page](https://github.com/adamallcock/tibotattle/releases).
-Both routes install the same Developer ID release; the app continues to use its
-signed Sparkle feed for updates. This repository is the source of truth for the
-public app and its releases. To build from source instead, follow the quick
-start below.
+When both refer to the same published version, those channels point to the same
+Developer ID artifact; the app continues to use its signed Sparkle feed for
+updates. A missing website slot is not a release claim—use the GitHub release
+page for the exact version and digest. A v1 release manifest may explicitly
+leave SBOM or provenance fields `null`; source-to-binary provenance is claimed
+only when a trusted hosted workflow generated/finalized and cryptographically
+verified the exact final bytes for that specific release. This repository is
+the source of truth for the public app and its releases. To build from source
+instead, follow the quick start below.
+See [Verify a TiboTattle release](docs/verify-release.md) to check the downloaded
+bytes, Apple signature and notarization, and any non-null release-specific
+GitHub provenance evidence yourself.
 
 ## Quick start (macOS, Apple Silicon)
 
@@ -234,7 +243,7 @@ vulnerabilities privately.
 
 ## Status
 
-This is an early, personal-pilot release (v0.1.1). It is not a
+This is an early, personal-pilot release (v0.1.12). It is not a
 provider-authoritative billing dashboard: quota estimates carry explicit
 uncertainty, and unknown models or tiers stay explicit unknowns rather than
 silently defaulted. See

@@ -1,0 +1,96 @@
+name: Generate release SBOM
+description: >-
+  Generate and validate an SPDX-2.3 SBOM for a finalized unpacked
+  platform payload without uploading or publishing it.
+
+inputs:
+  scan-path:
+    description: Exact finalized unpacked app or payload directory to scan.
+    required: true
+  output-path:
+    description: Exact new SPDX JSON file to create.
+    required: true
+
+outputs:
+  sbom-path:
+    description: Validated SPDX-2.3 SBOM path.
+    value: ${{ steps.validate.outputs.sbom-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check fresh SBOM output path
+      shell: node {0}
+      env:
+        RELEASE_SBOM_SCAN_PATH: ${{ inputs.scan-path }}
+        RELEASE_SBOM_OUTPUT_PATH: ${{ inputs.output-path }}
+      run: |
+        Promise.all([import("node:path"), import("node:url")])
+          .then(async ([{ join }, { pathToFileURL }]) => {
+            const script = pathToFileURL(join(
+              process.env.GITHUB_WORKSPACE || process.cwd(),
+              "scripts",
+              "validate-release-sbom.mjs",
+            )).href;
+            const { prepareReleaseSbom } = await import(script);
+            prepareReleaseSbom({
+              scanPath: process.env.RELEASE_SBOM_SCAN_PATH,
+              outputPath: process.env.RELEASE_SBOM_OUTPUT_PATH,
+            });
+          })
+          .catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+
+    - name: Download, verify, and run pinned Syft
+      shell: node {0}
+      env:
+        RELEASE_SBOM_SCAN_PATH: ${{ inputs.scan-path }}
+        RELEASE_SBOM_OUTPUT_PATH: ${{ inputs.output-path }}
+      run: |
+        Promise.all([import("node:path"), import("node:url")])
+          .then(async ([{ join }, { pathToFileURL }]) => {
+            const script = pathToFileURL(join(
+              process.env.GITHUB_WORKSPACE || process.cwd(),
+              "scripts",
+              "validate-release-sbom.mjs",
+            )).href;
+            const { generateReleaseSbom } = await import(script);
+            await generateReleaseSbom({
+              scanPath: process.env.RELEASE_SBOM_SCAN_PATH,
+              outputPath: process.env.RELEASE_SBOM_OUTPUT_PATH,
+            });
+          })
+          .catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+
+    # Syft is downloaded directly from the official Anchore release and its
+    # archive is checked against a hardcoded SHA-256 before extraction or
+    # execution. This avoids Anchore's mutable installer/action download path.
+    # The helper selects the exact macOS/Linux/Windows asset for the runner.
+    - name: Assert generated SPDX-2.3 document
+      id: validate
+      shell: node {0}
+      env:
+        RELEASE_SBOM_OUTPUT_PATH: ${{ inputs.output-path }}
+      run: |
+        Promise.all([import("node:path"), import("node:url")])
+          .then(async ([{ join }, { pathToFileURL }]) => {
+            const script = pathToFileURL(join(
+              process.env.GITHUB_WORKSPACE || process.cwd(),
+              "scripts",
+              "validate-release-sbom.mjs",
+            )).href;
+            const { validateReleaseSbom } = await import(script);
+            validateReleaseSbom({
+              outputPath: process.env.RELEASE_SBOM_OUTPUT_PATH,
+              githubOutput: process.env.GITHUB_OUTPUT,
+            });
+          })
+          .catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });

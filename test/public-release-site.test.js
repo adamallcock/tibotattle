@@ -10,7 +10,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { deflateSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
@@ -30,6 +30,9 @@ import {
   PUBLIC_RELEASE_MANIFEST_SCHEMA,
   PUBLIC_RELEASE_SOURCE_PROVENANCE_SCHEMA,
 } from "../scripts/public-release-provenance.js";
+import {
+  stableStringify,
+} from "../scripts/release-evidence.js";
 
 const PNG_SIGNATURE = Buffer.from([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
@@ -160,6 +163,7 @@ async function fixture() {
       sha256: createHash("sha256").update(installerBytes).digest("hex"),
     },
     source: {
+      repository: "https://github.com/adamallcock/tibotattle",
       commit: "a".repeat(40),
       tag: "v1.2.3",
     },
@@ -231,9 +235,137 @@ function releaseArgs(value, overrides = {}) {
   };
 }
 
+async function writeCrossPlatformReleaseManifest(value, overrides = {}) {
+  const artifactName = basename(value.installerPath);
+  const artifactSha256 = value.installerSha256;
+  const release = {
+    version: "1.2.3",
+    tag: "v1.2.3",
+    commit: "a".repeat(40),
+    repository: "https://github.com/adamallcock/tibotattle",
+  };
+  const source = { ...release };
+  const sbomName = `${artifactName}.spdx.json`;
+  const sbomAttestationName = `${artifactName}.sbom.sigstore.json`;
+  const provenanceName = `${artifactName}.sigstore.json`;
+  const sigstoreBundle = JSON.stringify({
+    mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json",
+    verificationMaterial: { tlogEntries: [{ logIndex: "1" }] },
+    dsseEnvelope: {
+      payload: "cGF5bG9hZA==",
+      payloadType: "application/vnd.in-toto+json",
+      signatures: [{ sig: "c2ln" }],
+    },
+  });
+  const metadata = [
+    [sbomName, JSON.stringify({
+      spdxVersion: "SPDX-2.3",
+      dataLicense: "CC0-1.0",
+      SPDXID: "SPDXRef-DOCUMENT",
+      name: artifactName,
+      documentNamespace: `https://spdx.dev/${artifactName}`,
+      creationInfo: { created: "2026-08-18T00:00:00Z", creators: ["Tool: test"] },
+      packages: [],
+    })],
+    [sbomAttestationName, sigstoreBundle],
+    [provenanceName, sigstoreBundle],
+  ];
+  const metadataDigests = new Map();
+  for (const [name, contents] of metadata) {
+    const path = join(value.root, name);
+    await writeFile(path, contents, "utf8");
+    const bytes = Buffer.byteLength(contents);
+    metadataDigests.set(name, {
+      bytes,
+      sha256: createHash("sha256").update(contents).digest("hex"),
+    });
+  }
+  function attestation(name, predicateType) {
+    const digest = metadataDigests.get(name);
+    return {
+      format: "sigstore-bundle",
+      mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json",
+      predicateType,
+      builderId: "https://github.com/actions/runner",
+      fileName: name,
+      bytes: digest.bytes,
+      sha256: digest.sha256,
+      subjectSha256: artifactSha256,
+      verificationStatus: "unverified",
+      source,
+      signerRepository: "adamallcock/tibotattle",
+      signerWorkflow: "adamallcock/tibotattle/.github/workflows/release.yml",
+      signerDigest: "b".repeat(40),
+      runUrl: "https://github.com/adamallcock/tibotattle/actions/runs/123456",
+      verificationInputs: {
+        command: "gh attestation verify --bundle",
+        bundleRequired: true,
+        denySelfHostedRunners: true,
+      },
+    };
+  }
+  const target = {
+    platform: "macos",
+    channel: "direct",
+    architecture: "arm64",
+    format: "dmg",
+    version: release.version,
+    fileName: artifactName,
+    bytes: value.installerBytes.length,
+    sha256: artifactSha256,
+    source,
+    downloadUrl:
+      "https://downloads.usagemonitor.app/releases/TiboTattle-1.2.3-macOS-arm64.dmg",
+    distribution: "direct-download",
+    store: null,
+    nativeTrust: {
+      signerIdentity: "Developer ID Application: TiboTattle (ABCDE12345)",
+      teamId: "ABCDE12345",
+    },
+    assurances: {
+      cleanInstallSmokePassed: true,
+      developerIdSigned: true,
+      hardenedRuntime: true,
+      notarizationAccepted: true,
+      ticketStapled: true,
+      gatekeeperAssessmentPassed: true,
+    },
+    build: {
+      sourceManifestSha256: "c".repeat(64),
+      unsignedPayloadSha256: "d".repeat(64),
+    },
+    sbom: {
+      format: "spdx-json",
+      fileName: sbomName,
+      ...metadataDigests.get(sbomName),
+      subjectSha256: artifactSha256,
+      source,
+      attestation: attestation(
+        sbomAttestationName,
+        "https://spdx.dev/Document/v2.3",
+      ),
+    },
+    provenance: attestation(provenanceName, "https://slsa.dev/provenance/v1"),
+    updater: { enabled: false, mechanism: "none", metadata: null },
+    ...overrides,
+  };
+  const manifest = {
+    schemaVersion: "usage-monitor-release-evidence-v1",
+    product: { name: "TiboTattle" },
+    ...release,
+    artifacts: [target],
+  };
+  const path = join(value.root, "release-manifest.json");
+  await writeFile(path, `${stableStringify(manifest)}\n`, "utf8");
+  return { path, manifest };
+}
+
 function buildFixtureSite(args, overrides = {}) {
   return buildPublicReleaseSite(args, {
-    validateInstallerArtifact: async () => {},
+    validateInstallerArtifact: async () => ({
+      developerIdAuthority: "Developer ID Application: TiboTattle (ABCDE12345)",
+      teamIdentifier: "ABCDE12345",
+    }),
     verifyPublishedInstaller: async ({
       installerUrl,
       expectedBytes,
@@ -467,6 +599,141 @@ test("release-site build verifies artifacts and materializes complete public met
     "usage-monitor-macos-release-v0.2",
   );
   assert.doesNotMatch(manifestText, /release-preview\.png/u);
+});
+
+test("release-site build accepts the canonical cross-platform macOS evidence entry", async (t) => {
+  const value = await fixture();
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+  const evidence = await writeCrossPlatformReleaseManifest(value);
+  const validations = [];
+  const result = await buildFixtureSite(
+    releaseArgs(value, { installerReleaseManifest: evidence.path }),
+    {
+      validateInstallerArtifact: async (...args) => {
+        validations.push(args);
+        return {
+          developerIdAuthority: "Developer ID Application: TiboTattle (ABCDE12345)",
+          teamIdentifier: "ABCDE12345",
+        };
+      },
+    },
+  );
+
+  assert.equal(result.installer.bytes, value.installerBytes.length);
+  assert.deepEqual(validations, [[
+    value.installerPath,
+    { expectedShortVersion: "1.2.3", production: true },
+  ]]);
+  assert.equal(result.installer.artifactAndNativeTrustVerified, true);
+  assert.equal(Object.hasOwn(result.installer, "verifiedSignedReleaseEvidence"), false);
+  assert.deepEqual(result.installer.releaseEvidence.verificationScope, [
+    "artifact-bytes",
+    "native-platform-trust",
+  ]);
+  assert.deepEqual(result.installer.releaseEvidence.evidenceDeclared, {
+    sbom: true,
+    provenance: true,
+    sbomAttestation: true,
+  });
+  assert.equal(
+    result.installer.releaseEvidence.attestationVerificationPerformedBySiteBuild,
+    false,
+  );
+  const siteManifestPath = join(value.output, "release-site-manifest.json");
+  const siteManifestText = await readFile(siteManifestPath, "utf8");
+  assert.doesNotMatch(siteManifestText, /signerWorkflow|private|release-manifest\.json/u);
+  assert.doesNotMatch(siteManifestText, new RegExp(value.root.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+});
+
+test("release-site v1 output preserves nullable evidence presence", async (t) => {
+  const value = await fixture();
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+  const evidence = await writeCrossPlatformReleaseManifest(value, {
+    sbom: null,
+    provenance: null,
+  });
+  const result = await buildFixtureSite(
+    releaseArgs(value, { installerReleaseManifest: evidence.path }),
+  );
+  assert.deepEqual(result.installer.releaseEvidence.evidenceDeclared, {
+    sbom: false,
+    provenance: false,
+    sbomAttestation: false,
+  });
+});
+
+test("release-site build rejects ambiguous, mismatched, or tampered cross-platform entries", async (t) => {
+  const value = await fixture();
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+
+  const evidence = await writeCrossPlatformReleaseManifest(value);
+  const base = releaseArgs(value, { installerReleaseManifest: evidence.path });
+
+  const wrongUrl = structuredClone(evidence.manifest);
+  wrongUrl.artifacts[0].downloadUrl =
+    "https://downloads.usagemonitor.app/releases/other.dmg";
+  await writeFile(evidence.path, `${stableStringify(wrongUrl)}\n`, "utf8");
+  await assert.rejects(
+    buildFixtureSite(base),
+    /canonical cross-platform release artifact|DOWNLOAD_URL_MISMATCH/u,
+  );
+
+  const tampered = structuredClone(evidence.manifest);
+  tampered.artifacts[0].sha256 = "0".repeat(64);
+  await writeFile(evidence.path, `${stableStringify(tampered)}\n`, "utf8");
+  await assert.rejects(
+    buildFixtureSite(base),
+    /does not match the cross-platform release manifest|HASH_MISMATCH|subjectSha256/u,
+  );
+
+  const missingTrust = structuredClone(evidence.manifest);
+  missingTrust.artifacts[0].assurances.notarizationAccepted = false;
+  await writeFile(evidence.path, `${stableStringify(missingTrust)}\n`, "utf8");
+  await assert.rejects(
+    buildFixtureSite(base),
+    /assurances|notarizationAccepted/u,
+  );
+
+  const signerMismatch = structuredClone(evidence.manifest);
+  signerMismatch.artifacts[0].assurances.notarizationAccepted = true;
+  await writeFile(evidence.path, `${stableStringify(signerMismatch)}\n`, "utf8");
+  await assert.rejects(
+    buildFixtureSite(base, {
+      validateInstallerArtifact: async () => ({
+        developerIdAuthority: "Developer ID Application: A Different App (ABCDE12345)",
+        teamIdentifier: "ABCDE12345",
+      }),
+    }),
+    /native validation does not match the cross-platform release signer/u,
+  );
+
+  const ambiguous = structuredClone(evidence.manifest);
+  ambiguous.artifacts.push(structuredClone(ambiguous.artifacts[0]));
+  await writeFile(evidence.path, `${stableStringify(ambiguous)}\n`, "utf8");
+  await assert.rejects(
+    buildFixtureSite(base),
+    /duplicate artifact|exactly one macOS direct arm64 DMG/u,
+  );
+});
+
+test("release-site build rejects a source mutation after provenance capture", async (t) => {
+  const value = await fixture();
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+  await assert.rejects(
+    buildFixtureSite(releaseArgs(value), {
+      validateInstallerArtifact: async () => {
+        await writeFile(
+          join(value.source, "community.js"),
+          'export const changedAfterCapture = true;\n',
+        );
+      },
+    }),
+    /source changed after provenance capture/u,
+  );
+  await assert.rejects(
+    readFile(join(value.output, "release-site-manifest.json")),
+    { code: "ENOENT" },
+  );
 });
 
 test("no-installer release-site build succeeds without installer claims and disables the CTA", async (t) => {
@@ -1092,7 +1359,29 @@ test("release-site build compares digest, dimensions, and regular artifact paths
       ...releaseArgs(value),
       installerPath: linkedInstaller,
     }),
-    /does not match the release manifest artifact/u,
+    /must not traverse a symbolic link|does not match the release manifest artifact/u,
+  );
+
+  const linkedSource = join(value.root, "source-link");
+  await symlink(value.source, linkedSource);
+  await assert.rejects(
+    buildFixtureSite({
+      ...releaseArgs(value),
+      source: linkedSource,
+    }),
+    /Public source must not traverse a symbolic link/u,
+  );
+
+  const outputTarget = join(value.root, "release-target");
+  await mkdir(outputTarget);
+  const linkedOutput = join(value.root, "release-link");
+  await symlink(outputTarget, linkedOutput);
+  await assert.rejects(
+    buildFixtureSite({
+      ...releaseArgs(value),
+      output: linkedOutput,
+    }),
+    /Release output must not traverse a symbolic link/u,
   );
 });
 

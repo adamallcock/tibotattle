@@ -2625,114 +2625,21 @@ footer p { margin: 0; }
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
-.community-site .download-trust {
-  max-width: 620px;
-  margin-top: 18px;
-  border: 1px solid rgba(255, 253, 247, .2);
-  border-radius: var(--radius-md);
-  color: rgba(255, 253, 247, .78);
-  background: rgba(0, 0, 0, .16);
-}
-.community-site .download-trust > summary {
+.community-site .download-assurance {
   display: flex;
+  flex-wrap: wrap;
+  gap: 5px 8px;
   align-items: center;
-  justify-content: space-between;
-  gap: 18px;
-  min-height: 48px;
-  padding: 10px 14px;
-  color: var(--site-paper);
-  cursor: pointer;
-  list-style: none;
+  max-width: 620px;
+  margin: 16px 0 0;
+  color: rgba(255, 253, 247, .72);
+  font-size: .68rem;
+  line-height: 1.45;
 }
-.community-site .download-trust > summary::-webkit-details-marker,
-.community-site .download-trust-verify > summary::-webkit-details-marker {
+.community-site .download-assurance[hidden] {
   display: none;
 }
-.community-site .download-trust > summary::after,
-.community-site .download-trust-verify > summary::after {
-  flex: 0 0 auto;
-  color: var(--site-green-bright);
-  content: "Show";
-  font-size: .62rem;
-  font-weight: var(--weight-bold);
-}
-.community-site .download-trust[open] > summary::after,
-.community-site .download-trust-verify[open] > summary::after {
-  content: "Hide";
-}
-.community-site .download-trust > summary:focus-visible,
-.community-site .download-trust-verify > summary:focus-visible {
-  outline: 2px solid var(--site-green-bright);
-  outline-offset: 3px;
-}
-.community-site .download-trust-summary-copy {
-  display: grid;
-  gap: 3px;
-  min-width: 0;
-}
-.community-site .download-trust-eyebrow {
-  color: rgba(255, 253, 247, .5);
-  font-size: .58rem;
-  font-weight: var(--weight-bold);
-  letter-spacing: .08em;
-  text-transform: uppercase;
-}
-.community-site .download-trust-summary-copy strong {
-  font-size: .76rem;
-  font-weight: var(--weight-semibold);
-}
-.community-site .download-trust-body {
-  display: grid;
-  gap: 14px;
-  padding: 0 14px 15px;
-  border-top: 1px solid rgba(255, 253, 247, .12);
-}
-.community-site .download-trust-intro,
-.community-site .download-trust-caveat,
-.community-site .download-trust-verify-note {
-  margin: 14px 0 0;
-  color: rgba(255, 253, 247, .7);
-  font-size: .7rem;
-  line-height: 1.55;
-}
-.community-site .download-trust-source {
-  justify-self: start;
-  margin-top: -8px;
-  color: var(--site-green-bright);
-  font-size: .68rem;
-  font-weight: var(--weight-semibold);
-  text-underline-offset: 3px;
-}
-.community-site .download-trust-release {
-  display: inline-flex;
-  gap: 7px;
-  align-items: baseline;
-  margin: -5px 0 0;
-  color: rgba(255, 253, 247, .52);
-  font-size: .65rem;
-}
-.community-site .download-trust-release code,
-.community-site .download-trust-signals code {
-  color: rgba(255, 253, 247, .86);
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-  font-size: .62rem;
-  overflow-wrap: anywhere;
-}
-.community-site .download-trust-signals {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-.community-site .download-trust-signals li {
-  display: grid;
-  grid-template-columns: 20px minmax(0, 1fr);
-  gap: 8px;
-  min-width: 0;
-}
-.community-site .download-trust-check {
+.community-site .download-assurance-mark {
   display: inline-grid;
   place-items: center;
   width: 18px;
@@ -2743,88 +2650,17 @@ footer p { margin: 0; }
   font-size: .65rem;
   font-weight: var(--weight-bold);
 }
-.community-site .download-trust-check::before {
+.community-site .download-assurance-mark::before {
   content: "✓";
 }
-.community-site .download-trust-signals strong {
-  display: block;
-  color: var(--site-paper);
-  font-size: .68rem;
+.community-site .download-assurance strong {
+  color: rgba(255, 253, 247, .9);
   font-weight: var(--weight-semibold);
 }
-.community-site .download-trust-signals p {
-  margin: 3px 0 0;
-  color: rgba(255, 253, 247, .56);
-  font-size: .64rem;
-  line-height: 1.48;
-}
-.community-site .download-trust-signals p code {
-  display: block;
-  margin-top: 4px;
-}
-.community-site .download-trust-caveat {
-  margin-top: 0;
-  padding: 10px 11px;
-  border-inline-start: 2px solid rgba(246, 190, 79, .72);
-  color: rgba(255, 253, 247, .72);
-  background: rgba(246, 190, 79, .07);
-}
-.community-site .download-trust-verify {
-  border-top: 1px solid rgba(255, 253, 247, .12);
-}
-.community-site .download-trust-verify > summary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding-top: 13px;
+.community-site .download-assurance a {
   color: var(--site-green-bright);
-  cursor: pointer;
-  font-size: .69rem;
   font-weight: var(--weight-semibold);
-  list-style: none;
-}
-.community-site .download-trust-verify-body {
-  display: grid;
-  gap: 9px;
-  padding-top: 10px;
-}
-.community-site .download-trust-verify-body > p {
-  margin: 0;
-  color: rgba(255, 253, 247, .64);
-  font-size: .67rem;
-  line-height: 1.5;
-}
-.community-site .download-trust-commands {
-  display: grid;
-  gap: 10px;
-  margin: 0;
-  padding-inline-start: 1.4rem;
-}
-.community-site .download-trust-commands li {
-  padding-inline-start: 2px;
-  color: rgba(255, 253, 247, .64);
-  font-size: .66rem;
-  line-height: 1.45;
-}
-.community-site .download-trust-commands code {
-  display: block;
-  margin-top: 4px;
-  padding: 7px 8px;
-  border: 1px solid rgba(255, 253, 247, .14);
-  border-radius: 4px;
-  color: rgba(255, 253, 247, .84);
-  background: rgba(0, 0, 0, .24);
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-  font-size: .59rem;
-  line-height: 1.45;
-  overflow-x: auto;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-.community-site .download-trust-verify-note {
-  margin-top: 0;
-  color: rgba(255, 253, 247, .55);
+  text-underline-offset: 3px;
 }
 .community-site #open-installed-app-status {
   margin: 0;
@@ -3405,6 +3241,105 @@ footer p { margin: 0; }
   margin: 0;
   padding-inline-start: 1.2rem;
 }
+.community-site .download-security-card {
+  padding: clamp(26px, 4vw, 40px);
+}
+.community-site .download-security-card .security-eyebrow {
+  margin: 0 0 8px;
+  color: var(--green-text);
+  font-size: .65rem;
+  font-weight: var(--weight-bold);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.community-site .download-security-card .security-lede {
+  max-width: 74ch;
+  margin: 0;
+  color: var(--ink);
+  font-size: .86rem;
+}
+.community-site .security-signals {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 24px;
+  padding: 0;
+  list-style: none;
+}
+.community-site .security-signals li {
+  display: grid;
+  gap: 4px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, .52);
+}
+.community-site .security-signals strong {
+  color: var(--ink);
+  font-size: .76rem;
+  font-weight: var(--weight-semibold);
+}
+.community-site .security-signals span {
+  color: var(--muted);
+  font-size: .72rem;
+  line-height: 1.55;
+}
+.community-site .security-signals a,
+.community-site .verification-guide a,
+.community-site .verification-guide-link a {
+  color: var(--green-text);
+  font-weight: var(--weight-semibold);
+  text-underline-offset: 3px;
+}
+.community-site .verification-guide-link {
+  margin: 22px 0 0;
+  color: var(--muted);
+  font-size: .75rem;
+  line-height: 1.65;
+}
+.community-site .verification-guide {
+  margin-top: 30px;
+  padding-top: 26px;
+  border-top: 1px solid var(--line);
+}
+.community-site .verification-guide h3,
+.community-site .verification-boundary h3 {
+  margin: 0 0 8px;
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 1.35rem;
+  font-weight: var(--weight-display);
+  letter-spacing: -.025em;
+}
+.community-site .verification-guide > p,
+.community-site .verification-boundary p {
+  max-width: 76ch;
+  margin: 0;
+  color: var(--muted);
+  font-size: .75rem;
+  line-height: 1.65;
+}
+.community-site .verification-steps {
+  display: grid;
+  gap: 14px;
+  margin: 20px 0 0;
+  padding-inline-start: 1.35rem;
+}
+.community-site .verification-steps li {
+  padding-inline-start: 4px;
+  color: var(--muted);
+  font-size: .73rem;
+}
+.community-site .verification-boundary {
+  margin-top: 24px;
+  padding: 18px 20px;
+  border-inline-start: 3px solid var(--site-green);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: rgba(101, 195, 170, .08);
+}
+.community-site .verification-boundary p + p {
+  margin-top: 8px;
+}
 .community-site .resource-actions {
   display: flex;
   flex-wrap: wrap;
@@ -3575,9 +3510,6 @@ footer p { margin: 0; }
   .community-site .install-cluster {
     margin-top: 24px;
   }
-  .community-site .download-trust-signals {
-    grid-template-columns: 1fr;
-  }
   .community-site .homebrew-install {
     flex-basis: 100%;
     max-width: 100%;
@@ -3642,6 +3574,9 @@ footer p { margin: 0; }
   }
   .community-site .resource-card.wide {
     grid-column: auto;
+  }
+  .community-site .security-signals {
+    grid-template-columns: 1fr;
   }
   .community-site footer {
     display: grid;

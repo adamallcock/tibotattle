@@ -1,122 +1,458 @@
+---
+title: macOS stable release
+date: 2026-08-18
+type: runbook
+status: canonical
+---
+
 # macOS stable release runbook (canonical)
 
-The end-to-end sequence to cut a stable TiboTattle release, with every sharp edge
-worth remembering. Do the steps in order. Placeholders: `X.Y.Z` = new version,
-`P.Q.R` = previous stable version.
+This is the macOS-specific half of the stable release procedure. The publication
+order, evidence contract, and cross-platform gates are in
+[2026-08-18-cross-platform-release-publication.md](./2026-08-18-cross-platform-release-publication.md).
+Do both documents in order. Placeholders: X.Y.Z = new version and P.Q.R =
+previous stable version.
 
-> Secrets (the appcast guard token, its storage location, exact retrieval
+> Secrets (the appcast guard token, its storage location, and exact retrieval
 > commands) are intentionally **not** in this file. They live in the gitignored
-> `docs/runbooks/release-secrets.local.md` on the release machine. This runbook
-> references them by env-var name only.
+> docs/runbooks/release-secrets.local.md on the release machine.
+>
+> **Receipt boundary:** `*.dmg.release.json` is a sanitized macOS finalizer
+> receipt. The guarded Sparkle publisher intentionally stores its bytes under a
+> content-addressed R2 key named `release-manifest.json` so the signed updater
+> subject can be read back. That narrow updater publication is separate from
+> the canonical cross-platform `release-manifest.json` and general public
+> evidence. Never publish credentials, signing logs, raw local paths, staging
+> descriptors, or unrelated receipts to R2, GitHub, or the website.
 
 ---
 
-## 0. Version lockstep (BEFORE building — these are all "release commits")
-A version bump is **not** just `package.json`. Bump/​regenerate all of:
-1. `package.json` **and** `packages/{accounting,identity-core,quota-analysis,telemetry-contract}/package.json` → `X.Y.Z`. (Not `apps/worker` / `packages/i18n` — independent.)
-2. `schemas/telemetry-v0.1/compatibility.schema.json` → `"packageVersion": { "const": "X.Y.Z" }` (**hand-edited every release**; the generator only *reads* it).
-3. Regenerate derived artifacts: `npm run telemetry:generate` (writes `generated/telemetry-v0.1-compatibility.json` **and** `-field-dictionary.json` — commit both).
-4. If `apps/worker/worker-configuration.d.ts` drifts: `cd apps/worker && npx wrangler types worker-configuration.d.ts --env-file .dev.vars.example` and commit.
-5. **Refresh worker workspace copies** (they are COPIES, not symlinks — they go stale): `cd apps/worker && npm ci`. Otherwise `product:worker:check` and the bundle use old package versions.
+## 0. Version lockstep and preflight
 
-Gates: `npm test`, `npm run product:worker:check` (needs step 5), `npm run architecture:check`, `cd apps/worker && npx vitest run`. Known pre-existing non-blockers: `staging-readiness.check.mjs`, the export allow-list drift (`apps/local/server.js → src/contribution-device-renewal.js`), and two Fix-B quota-tracks reference snapshots.
+A version bump is **not** just package.json. Bump or regenerate all of:
 
-## 1. Clean tree + annotated tag (REQUIRED before signing)
-`release-macos-app` runs `git status --porcelain --untracked-files=all` (must be **empty**, incl. untracked) and `git describe --exact-match --tags HEAD` (HEAD must be on an **annotated** tag).
-```bash
+1. package.json and
+   packages/{accounting,identity-core,quota-analysis,telemetry-contract}/package.json
+   to X.Y.Z. (apps/worker and packages/i18n have independent versions).
+2. schemas/telemetry-v0.1/compatibility.schema.json to
+   "packageVersion": { "const": "X.Y.Z" }.
+3. The generated telemetry artifacts with npm run telemetry:generate, then
+   commit generated/telemetry-v0.1-compatibility.json and
+   generated/telemetry-v0.1-field-dictionary.json.
+4. apps/worker/worker-configuration.d.ts if it drifts, using the repository's
+   pinned Wrangler command.
+5. The worker workspace copies with cd apps/worker && npm ci; they are copies,
+   not symlinks, and stale copies make the worker check and bundle use old
+   package versions.
+
+Run the release preflight before tagging:
+
+~~~bash
+npm test
+npm run product:worker:check
+npm run architecture:check
+cd apps/worker && npx vitest run
+~~~
+
+Known pre-existing non-blockers are recorded in release planning documents. Do
+not silently treat a new failure as one of those non-blockers.
+
+## 1. Exact source and protected tag
+
+The macOS finalizer requires an empty tree (including untracked files) and an
+exact annotated tag. The tag must identify the reviewed release commit and be
+protected by the repository's version-tag rules.
+
+~~~bash
 git status --porcelain=v1 --untracked-files=all   # must print nothing
-git tag -a vX.Y.Z <sha> -m "TiboTattle X.Y.Z ..." && git push origin vX.Y.Z
-```
+git describe --exact-match --tags HEAD             # must print vX.Y.Z
+git tag -a vX.Y.Z <reviewed-commit> -m "TiboTattle X.Y.Z ..."
+git push origin vX.Y.Z
+~~~
 
-## 2. Build + sign + notarize (ONE command)
-`--external-distribution` is **refused on the CLI by design** — never call `build-macos-app.js --external-distribution` directly. Drive it through `release-macos-app --prepare-candidate`. Delete any stale candidate first (it refuses a non-fresh output). Set the `USAGE_MONITOR_*` release env vars first — the exact Developer ID / notary-profile values are in `release-secrets.local.md`; the Sparkle public key below is public by design.
-```bash
+Do not sign from a branch that is ahead of or different from the tag. The
+source identity later recorded in the release evidence descriptor must be the
+same version, tag, commit, and repository URL.
+
+## 2. Build, sign, notarize, staple, and freeze the DMG
+
+--external-distribution is refused by the build CLI by design. Drive the
+release through release-macos-app --prepare-candidate. Delete only a stale,
+known candidate directory first; the finalizer refuses a non-fresh output.
+The exact Developer ID and notary-profile values are in
+docs/runbooks/release-secrets.local.md; the Sparkle public key is public by
+design.
+
+~~~bash
 rm -rf .release-build/macos-production
-export USAGE_MONITOR_DEVELOPER_ID_APPLICATION="Developer ID Application: … (…)"   # see release-secrets.local.md
-export USAGE_MONITOR_NOTARY_PROFILE="…"                                          # see release-secrets.local.md
+export USAGE_MONITOR_DEVELOPER_ID_APPLICATION="Developer ID Application: … (…)"
+export USAGE_MONITOR_NOTARY_PROFILE="…"
 export USAGE_MONITOR_BUNDLE_VERSION="X.Y.Z"
 export USAGE_MONITOR_SPARKLE_FRAMEWORK=".release-deps/Sparkle.framework"
 export USAGE_MONITOR_SPARKLE_APPCAST_URL="https://updates.tibotattle.com/appcast.xml"
 export USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY="jhgPwmvWLMr7TGURJUoi6sXias7YP1F+hejZawKVTGw="
-node scripts/release-macos-app.js --app ".release-build/macos-production/TiboTattle.app" \
-  --channel stable --prepare-candidate \
-  --previous-stable-manifest "<path to P.Q.R .release.json>"
-```
-Codesign prompts the Keychain once → **Always Allow** (won't prompt again). Prints the **DMG SHA-256** → save it. DMG lands at `.release-build/macos-release/TiboTattle-X.Y.Z-macOS-arm64.dmg`.
 
-## 3. Generate the signed appcast
-```bash
-npm run product:macos:appcast -- --channel stable \
+node scripts/release-macos-app.js \
+  --app ".release-build/macos-production/TiboTattle.app" \
+  --channel stable \
+  --prepare-candidate \
+  --previous-stable-manifest "<path to P.Q.R .release.json>"
+~~~
+
+Codesign may prompt for Keychain access once; choose **Always Allow** on the
+release machine. The finalizer validates Developer ID signing, hardened
+runtime, notarization, stapling, Gatekeeper, and clean installation. It emits
+the final arm64 DMG at:
+
+~~~text
+.release-build/macos-release/TiboTattle-X.Y.Z-macOS-arm64.dmg
+~~~
+
+At this point the DMG is the final subject. Record its SHA-256 and freeze the
+bytes. Do not re-sign, repackage, compress, mount-and-edit, or otherwise mutate
+the DMG after this point. Any mutation requires restarting this section and all
+following evidence steps.
+
+The local macOS finalizer's sanitized *.dmg.release.json updater receipt is useful for
+local/site validation, but it is **not** a GitHub build attestation. A local
+checkout cannot honestly claim that GitHub Actions built these bytes. Do not
+create a fake Sigstore bundle, copy a local receipt into an attestation field,
+or describe this local output as source-to-binary proven. A genuine GitHub
+artifact attestation can only be made by the protected GitHub native finalizer
+after that trusted workflow has built and finalized the exact bytes from the
+checked-out source. Merely receiving a locally built DMG and attesting its
+digest does not establish source-to-binary provenance; see the cross-platform
+publication runbook.
+
+## 3. Generate the signed updater metadata, without publishing it
+
+Generate the complete Sparkle appcast while the DMG is frozen. Appcast
+generation signs the feed metadata; it must not alter the DMG.
+
+~~~bash
+npm run product:macos:appcast -- \
+  --channel stable \
   --app ".release-build/macos-production/TiboTattle.app" \
   --dmg ".release-build/macos-release/TiboTattle-X.Y.Z-macOS-arm64.dmg" \
   --bundle-version "X.Y.Z" \
   --sparkle-public-ed-key "jhgPwmvWLMr7TGURJUoi6sXias7YP1F+hejZawKVTGw="
-```
-This uses the pinned `generate_appcast` → embeds the feed signature the app's `SURequireSignedFeed=true` requires. A hand-built "minimal" appcast is rejected by every installed client — do not do that.
+~~~
 
-## 4. Publish to R2 — the flags the npm wrapper does NOT add
-Export `SPARKLE_APPCAST_GUARD_TOKEN` from your secret store first (retrieval is in `release-secrets.local.md`). The npm wrapper omits `--publish`; without it the script only *validates*. A new version also needs `--replace-appcast` (permitted for a real upgrade — the code refuses only regressions + same-version artifact swaps) and `--previous-stable-manifest`.
-```bash
-export SPARKLE_APPCAST_GUARD_TOKEN="…"   # see release-secrets.local.md (never hardcode / commit)
+This uses the pinned generate_appcast and embeds the feed signature required by
+the installed client's SURequireSignedFeed=true. A hand-built minimal appcast
+is not a valid updater subject.
+
+Do **not** run the publishing command yet. The appcast is carried as updater
+metadata in the release evidence descriptor and is published only after the
+draft release has been freshly downloaded and verified.
+
+## 4. Native finalizer evidence and the public manifest
+
+Every official macOS artifact is represented by a v1 manifest entry. Its
+`sbom` and `provenance` fields may be `null`; if `sbom` is non-null, its
+`attestation` field is required and may also be `null`. `null` explicitly means
+that the corresponding evidence was not published. For an artifact claiming
+the attested v1 profile/path, the protected GitHub native finalizer must
+produce, for this exact frozen DMG subject:
+
+- an SPDX JSON SBOM;
+- a Sigstore provenance bundle;
+- a Sigstore SBOM-attestation bundle;
+- the final release-evidence descriptor naming those files and the
+  source/tag identity; and
+- updater metadata for this direct-download subject.
+
+The checked-in attestation action and its required permissions are specified in
+[2026-08-18-cross-platform-release-publication.md](./2026-08-18-cross-platform-release-publication.md).
+The finalizer must run the action against final bytes after signing,
+notarization, stapling, packaging, and timestamp operations are complete. A
+post-attestation mutation invalidates the evidence and requires a new finalizer
+run.
+
+If the protected finalizer has not produced and cryptographically verified all
+three evidence files, do not claim the attested v1 profile/path. The existing
+local macOS route may still publish a v1 manifest with explicit `null` evidence
+fields and carry native signing and checksum evidence for its exact DMG, but it
+must not be described as source-to-binary attested. That provenance claim is
+valid only when a trusted hosted workflow generated/finalized and verified the
+exact final bytes.
+
+For the attested v1 profile/path, invoke the checked-in composite exactly once
+for this frozen DMG. It derives signer identity from the trusted hosted job
+context; the caller passes no signer fields. It runs both pinned
+`actions/attest` steps (SLSA provenance and the SPDX `sbom.attestation`) and
+preserves artifact-specific bundle names; do not add a second caller step:
+
+~~~yaml
+- name: Attest the frozen final subject
+  id: attest
+  uses: ./.github/actions/attest-release-artifact
+  with:
+    artifact-path: <final-artifact>
+    sbom-path: <artifact.spdx.json>
+    evidence-directory: <evidence-directory>
+    release-descriptor-path: <release-evidence-input.json>
+~~~
+
+Once those files are present in one staging directory, generate the canonical
+public manifest with the repository's actual offline CLI. For the attested v1
+path, consume the composite's machine-generated outputs:
+`steps.attest.outputs.enriched-release-descriptor-path` and
+`steps.attest.outputs.enriched-release-descriptor-base-dir`. The first is the
+descriptor passed to `--input`; the second is passed to `--base-dir`. Do not
+hand-author bundle, signer, predicate, builder, run, or runner metadata. If the
+outputs are absent, stop publication. For a native/checksum-only local path,
+use the original staging descriptor and its staging directory instead.
+Descriptor paths are resolved relative to `--base-dir` and are never serialized
+as absolute operator paths.
+
+~~~bash
+RELEASE_DIR="$PWD/.release-build/macos-release"
+# For the protected attested path, these values come from the composite action:
+# steps.attest.outputs.enriched-release-descriptor-path and
+# steps.attest.outputs.enriched-release-descriptor-base-dir.
+EVIDENCE_INPUT="<steps.attest.outputs.enriched-release-descriptor-path>"
+EVIDENCE_BASE_DIR="<steps.attest.outputs.enriched-release-descriptor-base-dir>"
+RELEASE_MANIFEST="$RELEASE_DIR/release-manifest.json"
+SHA256SUMS="$RELEASE_DIR/SHA256SUMS"
+
+npm run release:evidence:generate -- \
+  --input "$EVIDENCE_INPUT" \
+  --base-dir "$EVIDENCE_BASE_DIR" \
+  --output "$RELEASE_MANIFEST" \
+  --sha256sums "$SHA256SUMS"
+
+npm run release:evidence:validate -- \
+  --manifest "$RELEASE_MANIFEST" \
+  --artifacts-dir "$RELEASE_DIR" \
+  --sha256sums "$SHA256SUMS"
+~~~
+
+The generator recomputes every supplied final-file digest and requires any
+non-null SBOM, `sbom.attestation`, and provenance subject digests to equal the
+DMG digest. It always emits the v1 evidence keys; explicit `null` values are
+valid for a native/checksum-only path. It also requires the platform assurances
+and updater contract for macOS/direct. Treat a supplied-but-invalid value as a
+release stop. The canonical manifest, any non-null SBOM, and any non-null
+artifact-specific bundles are GitHub release assets; the descriptor itself may
+contain local paths and should remain staging input.
+
+## 5. Draft GitHub release and verify it before publication
+
+Create a **draft** release and upload only public release assets. Every macOS
+direct subject includes the final DMG, `release-manifest.json`, `SHA256SUMS`,
+and `verify-release.md`. For the attested v1 profile/path, also upload the SPDX
+SBOM and both artifact-specific Sigstore bundles; for a native/checksum-only
+path, keep those manifest fields `null` and do not upload placeholder bundles.
+Do not upload the sanitized Sparkle receipt, local descriptor, credentials, or
+a staging directory as general GitHub evidence.
+
+~~~bash
+TAG="vX.Y.Z"
+REPO="adamallcock/tibotattle"
+DMG="$RELEASE_DIR/TiboTattle-X.Y.Z-macOS-arm64.dmg"
+ARTIFACT_NAME="$(basename "$DMG")"
+SPDX="$RELEASE_DIR/TiboTattle-X.Y.Z-macOS-arm64.spdx.json"
+SPDX_NAME="$(basename "$SPDX")"
+PROVENANCE="$RELEASE_DIR/$ARTIFACT_NAME.provenance.bundle.json"
+PROVENANCE_NAME="$(basename "$PROVENANCE")"
+SBOM_ATTESTATION="$RELEASE_DIR/$ARTIFACT_NAME.sbom.bundle.json"
+SBOM_ATTESTATION_NAME="$(basename "$SBOM_ATTESTATION")"
+VERIFY_GUIDE="$PWD/docs/verify-release.md"
+NOTES_FILE="./release-notes/X.Y.Z.md"
+test -s "$NOTES_FILE"
+
+gh release create "$TAG" --repo "$REPO" --verify-tag --draft \
+  --title "TiboTattle X.Y.Z" --notes-file "$NOTES_FILE"
+# Use this baseline upload for a native/checksum-only manifest (null evidence):
+gh release upload "$TAG" --repo "$REPO" \
+  "$DMG" "$RELEASE_MANIFEST" "$SHA256SUMS" "$VERIFY_GUIDE"
+
+# For the attested v1 profile/path, use this command instead:
+gh release upload "$TAG" --repo "$REPO" \
+  "$DMG" "$SPDX" "$PROVENANCE" "$SBOM_ATTESTATION" \
+  "$RELEASE_MANIFEST" "$SHA256SUMS" "$VERIFY_GUIDE"
+~~~
+
+Download every asset into a fresh directory. During the draft phase, verify the
+local final bytes, manifest, and SHA256SUMS; do not call gh release verify or
+gh release verify-asset yet because GitHub's immutable-release attestation is
+created only when the draft is published.
+
+~~~bash
+VERIFY_DIR="$(mktemp -d /tmp/tibotattle-release-XXXXXX)"
+gh release download "$TAG" --repo "$REPO" --dir "$VERIFY_DIR"
+
+npm run release:evidence:validate -- \
+  --manifest "$VERIFY_DIR/release-manifest.json" \
+  --artifacts-dir "$VERIFY_DIR" \
+  --sha256sums "$VERIFY_DIR/SHA256SUMS"
+~~~
+
+For the attested v1 profile/path only, run the two separate constrained
+attestation commands below, using the repository, exact protected tag/source
+commit, signer workflow, and signer digest recorded by this release. Include
+`--deny-self-hosted-runners`; an unconstrained attestation is not equivalent
+evidence. GitHub may not resolve a draft attestation until publication, but a
+bundle or source-identity failure remains a publication gate. A draft is never
+a stable release. A native/checksum-only path does not run these commands and
+must retain explicit `null` evidence fields.
+
+~~~bash
+COMMIT="<40-character source commit from the release manifest>"
+SIGNER_WORKFLOW="<signer workflow path from the release manifest>"
+SIGNER_DIGEST="<trusted signer-workflow commit from the release manifest>"
+
+gh attestation verify "$VERIFY_DIR/$ARTIFACT_NAME" \
+  --bundle "$VERIFY_DIR/$PROVENANCE_NAME" \
+  --repo "$REPO" \
+  --predicate-type "https://slsa.dev/provenance/v1" \
+  --signer-workflow "$SIGNER_WORKFLOW" \
+  --signer-digest "$SIGNER_DIGEST" \
+  --source-ref "refs/tags/$TAG" \
+  --source-digest "$COMMIT" \
+  --deny-self-hosted-runners
+
+gh attestation verify "$VERIFY_DIR/$ARTIFACT_NAME" \
+  --bundle "$VERIFY_DIR/$SBOM_ATTESTATION_NAME" \
+  --repo "$REPO" \
+  --predicate-type "https://spdx.dev/Document/v2.3" \
+  --signer-workflow "$SIGNER_WORKFLOW" \
+  --signer-digest "$SIGNER_DIGEST" \
+  --source-ref "refs/tags/$TAG" \
+  --source-digest "$COMMIT" \
+  --deny-self-hosted-runners
+~~~
+
+`--bundle` reads the attestation bundle from the downloaded file instead of
+fetching that bundle through the GitHub API; trusted-root resolution may still
+use the normal GitHub CLI/network trust path.
+
+## 6. Publish, read back, and verify the immutable release
+
+After all draft assets pass fresh verification, publish and read the release
+back. The repository's immutable-release setting must be enabled before the
+first stable publication.
+
+~~~bash
+gh release edit "$TAG" --repo "$REPO" --draft=false
+gh release view "$TAG" --repo "$REPO" \
+  --json tagName,isDraft,isImmutable,assets
+test "$(gh release view "$TAG" --repo "$REPO" --json tagName --jq '.tagName')" = "$TAG"
+test "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq '.isDraft')" = "false"
+test "$(gh release view "$TAG" --repo "$REPO" --json isImmutable --jq '.isImmutable')" = "true"
+~~~
+
+Now run GitHub's release-level checks for the published release. Download every
+published asset again into a new directory; never reuse the draft download for
+this read-back. These are deliberately post-publication checks: gh release
+verify and gh release verify-asset validate GitHub's immutable-release
+attestation, not just the draft's local bytes.
+
+~~~bash
+PUBLISHED_VERIFY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tibotattle-published-release.XXXXXX")"
+gh release download "$TAG" --repo "$REPO" \
+  --dir "$PUBLISHED_VERIFY_DIR" --pattern "*" --clobber
+npm run release:evidence:validate -- \
+  --manifest "$PUBLISHED_VERIFY_DIR/release-manifest.json" \
+  --artifacts-dir "$PUBLISHED_VERIFY_DIR" \
+  --sha256sums "$PUBLISHED_VERIFY_DIR/SHA256SUMS"
+
+gh release verify "$TAG" --repo "$REPO"
+gh release verify-asset "$TAG" "$PUBLISHED_VERIFY_DIR/$ARTIFACT_NAME" --repo "$REPO"
+gh release verify-asset "$TAG" "$PUBLISHED_VERIFY_DIR/release-manifest.json" --repo "$REPO"
+gh release verify-asset "$TAG" "$PUBLISHED_VERIFY_DIR/SHA256SUMS" --repo "$REPO"
+gh release verify-asset "$TAG" "$PUBLISHED_VERIFY_DIR/verify-release.md" --repo "$REPO"
+~~~
+
+For an attested v1 profile/path, also verify each published evidence asset:
+
+~~~bash
+gh release verify-asset "$TAG" "$PUBLISHED_VERIFY_DIR/$SPDX_NAME" --repo "$REPO"
+gh release verify-asset "$TAG" "$PUBLISHED_VERIFY_DIR/$PROVENANCE_NAME" --repo "$REPO"
+gh release verify-asset "$TAG" "$PUBLISHED_VERIFY_DIR/$SBOM_ATTESTATION_NAME" --repo "$REPO"
+~~~
+
+If any check fails, stop publication of every downstream surface and preserve
+the evidence of the failed release. Do not replace an immutable release's
+assets in place.
+
+## 7. Publish update feeds and distribution surfaces last
+
+Only after the immutable GitHub release is published and all release/asset
+checks pass may the following external surfaces change:
+
+1. publish Sparkle/R2 with the existing guarded command;
+2. trigger and verify the first-party Homebrew tap updater;
+3. rebuild and deploy the public website with the final DMG and its
+   availability/digest metadata; the canonical release-manifest.json, any
+   non-null SBOM, and any non-null artifact-specific bundles remain GitHub
+   release assets; and
+4. update Store or other platform metadata when that separate subject has passed
+   its own native finalizer gates.
+
+The current Sparkle command is:
+
+~~~bash
+export SPARKLE_APPCAST_GUARD_TOKEN="…"   # see release-secrets.local.md
 node scripts/publish-sparkle-update.js --publish --replace-appcast --channel stable \
-  --appcast ".release-build/macos-release/appcast.xml" \
-  --dmg ".release-build/macos-release/TiboTattle-X.Y.Z-macOS-arm64.dmg" \
-  --release-manifest ".release-build/macos-release/TiboTattle-X.Y.Z-macOS-arm64.dmg.release.json" \
+  --appcast "$RELEASE_DIR/appcast.xml" \
+  --dmg "$DMG" \
+  --release-manifest "$RELEASE_DIR/TiboTattle-X.Y.Z-macOS-arm64.dmg.release.json" \
   --previous-stable-manifest "<path to P.Q.R .release.json>" \
   --bucket tibotattle-updates \
   --sparkle-public-ed-key "jhgPwmvWLMr7TGURJUoi6sXias7YP1F+hejZawKVTGw=" \
   --atomic-appcast-guard-endpoint "https://tibotattle.com/api/v1/internal/release/appcast" \
   --atomic-appcast-guard-token-env SPARKLE_APPCAST_GUARD_TOKEN
-```
-Verify: `curl -s https://updates.tibotattle.com/appcast.xml | grep -E 'sparkle:version|enclosure url'` shows `X.Y.Z`.
+~~~
 
-## 5. GitHub release — DMG ONLY
-```bash
-gh release create vX.Y.Z ".release-build/macos-release/TiboTattle-X.Y.Z-macOS-arm64.dmg" \
-  --repo adamallcock/tibotattle --title "TiboTattle X.Y.Z" --notes-file <notes.md>
-```
-**Never attach `*.dmg.release.json`** — it embeds a private source SHA + infra details (that was the historical leak).
+The sanitized `.dmg.release.json` input is intentionally published by this
+command under Sparkle's immutable, content-addressed R2 `release-manifest.json`
+key so the signed updater subject can be read back. That narrow updater receipt
+is separate from the canonical cross-platform release evidence and from the
+website's availability/digest view. Never add credentials, signing logs, raw
+local paths, staging descriptors, or unrelated receipts to R2, GitHub, or the
+website. Verify the live appcast, Homebrew cask, website download, and installed
+older-client update path after each corresponding publication.
 
-## 5a. Refresh the first-party Homebrew tap
+### Refresh the first-party Homebrew tap
 
 The public [`adamallcock/homebrew-tap`](https://github.com/adamallcock/homebrew-tap)
 workflow polls the latest non-draft GitHub release hourly, verifies the exact
 arm64 DMG asset, updates the cask version and SHA-256, runs the cask gates, and
 commits only when those values changed. It requires no cross-repository token.
-
 For an immediate release, trigger the same workflow instead of waiting for the
 next scheduled poll:
 
-```bash
+~~~bash
 gh workflow run update-tibotattle.yml --repo adamallcock/homebrew-tap
 gh run list --repo adamallcock/homebrew-tap \
   --workflow update-tibotattle.yml --limit 1
 brew update
 brew info --cask adamallcock/tap/tibotattle
-```
+~~~
 
 The cask keeps `auto_updates true`, so installing through Homebrew does not
 replace or fork the signed Sparkle update channel. Do not submit the cask to
 `Homebrew/homebrew-cask` until the project satisfies Homebrew's current age and
 notability requirements.
 
-## 6. Rebuild the website + deploy the worker  ← THE STEP MISSED ON 0.1.11
-The site the worker serves is **pre-built** with the installer version/SHA **baked at build time** — a `wrangler deploy` alone leaves the site on the *old* version and does NOT ship web-code changes (this is what showed 0.1.1 and dropped the community band on the 0.1.11 launch). Rebuild it FIRST.
+For the production website, the guarded release-site command must target
+env.production's .release-build/public-release-site directory. Rebuild it
+before npm --prefix apps/worker run production:deploy -- --confirm
+DEPLOY_PRODUCTION; a raw Wrangler deploy does not rebuild the baked installer
+metadata. See [2026-08-17-web-only-release.md](./2026-08-17-web-only-release.md)
+only for an intentionally website-only change that reuses an already released
+artifact.
 
-For a public-site-only change that deliberately reuses the already released
-macOS artifact, use [`2026-08-17-web-only-release.md`](2026-08-17-web-only-release.md)
-instead. It rejects client/runtime/migration/configuration changes and binds
-the generated site to a clean, reviewable candidate. This section remains the
-full macOS-release path.
+The current macOS release-site operation is:
 
-**CRITICAL — `env.production` serves a DIFFERENT dir than the top-level config.** Per `apps/worker/wrangler.jsonc`: top-level + `env.staging` = `.release-build/worker-assets`, but **`env.production` = `.release-build/public-release-site`**. For a production release you MUST rebuild **`public-release-site`** (rebuilding `worker-assets` deploys nothing to prod). Verify the target with:
-`python3 -c "import json,re;d=json.loads(re.sub(r'^\s*//.*$','',open('apps/worker/wrangler.jsonc').read(),flags=re.M));print(d['env']['production']['assets']['directory'])"`
-```bash
+~~~bash
 npm run product:release-site -- \
   --output "$PWD/.release-build/public-release-site" --replace \
   --site-url "https://tibotattle.com/" \
   --installer-path "$PWD/.release-build/macos-release/TiboTattle-X.Y.Z-macOS-arm64.dmg" \
-  --installer-release-manifest "$PWD/.release-build/macos-release/TiboTattle-X.Y.Z-macOS-arm64.dmg.release.json" \
+  --installer-release-manifest "$PWD/.release-build/macos-release/release-manifest.json" \
   --installer-url "https://github.com/adamallcock/tibotattle/releases/download/vX.Y.Z/TiboTattle-X.Y.Z-macOS-arm64.dmg" \
   --installer-version X.Y.Z \
   --installer-sha256 "<DMG SHA-256 from step 2>" \
@@ -127,16 +463,23 @@ npm run product:release-site -- \
   --support-url "https://tibotattle.com/docs.html" \
   --social-image "$ABSOLUTE_1200X630_PNG_PATH"
 npm --prefix apps/worker run production:deploy -- --confirm DEPLOY_PRODUCTION
-```
-Note: `--installer-path`/`--installer-release-manifest`/`--social-image`/`--output` must be **absolute**; the social-image input must sit outside the output directory. The guarded production command creates an immutable source snapshot, verifies the generated public closure and migration state, then deploys. Deploying here also ships worker code changes and the rebuilt web assets. After deploy the live version may flip old↔new for ~2 min (edge propagation) then converges. No new D1 migrations unless you added one (`d1 migrations list … --remote` to check). Never substitute raw `wrangler deploy` for the guarded command.
+~~~
 
-## 7. Go public + announce
-```bash
-gh repo edit adamallcock/tibotattle --visibility public --accept-visibility-change-consequences   # once, if not already
-```
-Then the launch post. Verify a real update: on an installed older build, Check for Updates → should offer X.Y.Z and install.
+For a v1 release, the command above passes the canonical
+`release-manifest.json`. The legacy `*.dmg.release.json` receipt is limited to
+the v0.1.12/web-only compatibility path. In either mode, the generated site exposes only installer
+availability and digest; the canonical manifest, any non-null SBOM, and any
+non-null artifact-specific bundles stay on the GitHub release. The installer,
+manifest/receipt, social image, and output paths must be absolute, and the
+social image must stay outside the output directory.
 
----
+## Owner-credential steps
 
-## Owner-credential steps (need Cloudflare / Apple / Keychain access on the release machine)
-`wrangler deploy`, the R2 publish (`publish-sparkle-update` uses wrangler), `d1 migrations apply`, reading the guard token from your secret store, and `gh repo edit --visibility`. Everything else (build, sign+notarize, appcast generation, `gh release create`) is a plain local/CLI step. The secret values, exact retrieval commands, and the **provision/rotate recipe for the appcast guard token** (mandatory for `--publish`; rotating it has zero consumer/auto-update impact) are in `docs/runbooks/release-secrets.local.md` (gitignored).
+The owner-only operations are Keychain/codesign/notarization, GitHub release
+publication, Cloudflare/R2 publication, production deployment, and Store
+submission. Secret values and the appcast guard-token provision/rotation recipe
+remain in docs/runbooks/release-secrets.local.md (gitignored). Never put secret
+values, credentials, signing logs, raw local paths, or staging descriptors into
+a public manifest, release note, website asset, or attestation input. The
+sanitized Sparkle receipt is the only deliberate R2 updater publication and is
+handled by the guarded command above.

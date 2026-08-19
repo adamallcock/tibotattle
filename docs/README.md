@@ -12,6 +12,10 @@ signing, artifacts, an appcast, or updater infrastructure is operational.
 
 | Path | Use |
 |---|---|
+| [`verify-release.md`](./verify-release.md) | User-facing verification for direct and Store artifacts; v1 evidence fields are explicit nullable claims, and only a release-specific complete non-null set is the attested profile/path |
+| [`decisions/2026-08-18-cross-platform-release-trust.md`](./decisions/2026-08-18-cross-platform-release-trust.md) | Cross-platform release-evidence decision, nullable v1 manifest, native platform trust boundaries, artifact subjects, and staged rollout |
+| [`runbooks/2026-08-18-cross-platform-release-publication.md`](./runbooks/2026-08-18-cross-platform-release-publication.md) | Activation-gated common publication order, nullable final-byte evidence, artifact-specific attestations, and immutable GitHub release handoff |
+| [`runbooks/macos-stable-release-runbook.md`](./runbooks/macos-stable-release-runbook.md) | Canonical macOS build, signing, notarization, Sparkle, Homebrew, website, and release-publication sequence |
 | [`plans/2026-08-14-mac-app-store-compatibility-plan.md`](./plans/2026-08-14-mac-app-store-compatibility-plan.md) | Active Store feasibility and dual-distribution plan; not a Store-readiness or submission claim |
 | [`runbooks/2026-08-04-owner-release-execution.md`](./runbooks/2026-08-04-owner-release-execution.md) | Owner-run release sequence; fail-closed until each external gate is observed |
 | [`runbooks/2026-08-05-internal-dogfood-versus-release-readiness.md`](./runbooks/2026-08-05-internal-dogfood-versus-release-readiness.md) | First-read boundary for the installed ad-hoc preview, future signed `internal-dogfood`, and stable; not a release claim |
@@ -25,6 +29,12 @@ signing, artifacts, an appcast, or updater infrastructure is operational.
 | [`decisions/2026-08-15-homebrew-distribution-and-macos-support.md`](./decisions/2026-08-15-homebrew-distribution-and-macos-support.md) | First-party Homebrew tap, update automation, uninstall boundary, and supported macOS floor |
 | [`goals/2026-08-17-four-day-windows-readiness-goal.md`](./goals/2026-08-17-four-day-windows-readiness-goal.md) | Bounded portable-core qualification for issue #3; explicitly not Windows support |
 | [`runbooks/2026-08-17-windows-portability-environments.md`](./runbooks/2026-08-17-windows-portability-environments.md) | Restore macOS, network-isolated Linux, native Windows x64, and optional UTM development lanes |
+
+For macOS, `macos-stable-release-runbook.md` is the authority for artifact
+publication and the immutable GitHub release ordering. The older
+`2026-08-04-owner-release-execution.md` remains authoritative only for its
+service/appcast and intake operations; its stable-release section does not
+supersede the canonical publication sequence.
 
 Documents not listed above remain records, evidence, or supporting context
 rather than current operational authority. Treat receipts, audits, reports,
