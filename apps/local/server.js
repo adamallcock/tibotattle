@@ -4022,9 +4022,17 @@ export function createPreparedLocalCompanionServer({
     environmentExportSecretPresent:
       Object.hasOwn(environment, EXPORT_IDENTITY_ENV),
   });
-  contributionSyncStatusProvider ??= contributionSyncQueueContext
-    ?.inspectContributionSyncQueue
-    ?? ((options) => inspectContributionSyncQueue(options));
+  // Keep status inspection on the installation-owned queue file.  The
+  // Windows queue context is deliberately root-bound, but its public method
+  // still accepts an explicit path; omitting it would fall back to the
+  // process-working-directory queue and can put writable state beside the
+  // packaged resources.  macOS/Linux use the same explicit path through the
+  // legacy POSIX storage implementation.
+  contributionSyncStatusProvider ??= contributionSyncQueueContext === null
+    ? () => inspectContributionSyncQueue({ queueFile: contributionQueueFile })
+    : () => contributionSyncQueueContext.inspectContributionSyncQueue({
+      queueFile: contributionQueueFile,
+    });
   if (typeof contributionSyncStatusProvider !== "function") {
     throw new TypeError("contributionSyncStatusProvider must be a function");
   }
