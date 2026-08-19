@@ -353,17 +353,43 @@ function deltaEnclosureBlock(deltas) {
 }
 
 /**
- * A dogfood release fixture mirroring what generate-sparkle-appcast.js emits:
- * one item carrying the signed full DMG enclosure plus signed delta
- * enclosures inside the item's sparkle:deltas container, with the delta
- * artifacts beside the DMG.
+ * Fixture-only appcast policy for the retained hand-built dogfood delta
+ * shape below. Since 2026-08-19 the signed-feed preflight covers BOTH named
+ * channels, so these fixtures publish only behind this explicit spec-injected
+ * policy (unreachable from the CLI, refused outright for stable). The
+ * machinery they keep regression-tested comes back into production via
+ * generate_appcast's own prior-version staging at the reviewed delta policy
+ * flip.
+ */
+const FIXTURE_ONLY_HAND_BUILT_APPCAST_POLICY = Object.freeze({
+  ...CANONICAL_STABLE_APPCAST_POLICY,
+  fixtureOnlyUnsignedHandBuiltFeed: true,
+});
+
+/**
+ * A dogfood release fixture. By default it builds the RETAINED hand-built
+ * delta shape (one item carrying the signed full DMG enclosure plus signed
+ * delta enclosures inside the item's sparkle:deltas container, delta
+ * artifacts beside the DMG) — a shape generate-sparkle-appcast.js refuses to
+ * emit since the 2026-08-19 signed-feed routing fix, kept fixture-only for
+ * the reviewed delta policy flip and publishable only under
+ * FIXTURE_ONLY_HAND_BUILT_APPCAST_POLICY. With officialSignedFeed: true it
+ * instead mirrors the production dogfood path: the pinned official
+ * generate_appcast document shape carrying the signed sparkle-signatures
+ * trailer (full DMG only; the official shape has no delta container).
  */
 async function createDogfoodReleaseFixture({
   bundleVersion = "2",
   deltaSources = ["1"],
   mutateAppcast = (value) => value,
+  officialSignedFeed = false,
   writeDeltaFiles = true,
 } = {}) {
+  assert.equal(
+    officialSignedFeed && deltaSources.length > 0,
+    false,
+    "the official generate_appcast shape is full-only; delta sources require the hand-built fixture",
+  );
   const channel = DOGFOOD_CHANNEL;
   const root = await mkdtemp(
     join(await realpath(tmpdir()), "tibotattle-dogfood-publisher-test-"),
@@ -442,7 +468,28 @@ async function createDogfoodReleaseFixture({
       requiresSignedFeed: true,
     },
   };
-  const appcast = mutateAppcast(`<?xml version="1.0" encoding="utf-8"?>
+  // The official variant reuses the exact pinned generate_appcast document
+  // shape from the stable fixture (the signed-feed validator is
+  // origin-agnostic; only the enclosure URL carries the channel), signed with
+  // the same in-test keypair the trailer preflight verifies against.
+  const appcast = officialSignedFeed
+    ? signOfficialFeedPrefix(mutateAppcast(`<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:
+IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
+--><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>TiboTattle</title>
+        <item>
+            <title>${RELEASE_VERSION}</title>
+            <pubDate>Wed, 05 Aug 2026 14:55:05 -0400</pubDate>
+            <sparkle:version>${bundleVersion}</sparkle:version>
+            <sparkle:shortVersionString>${RELEASE_VERSION}</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="${artifactURL}" length="${dmgBytes.length}" type="application/octet-stream" sparkle:edSignature="${signature}"></enclosure>
+        </item>
+    </channel>
+</rss>`))
+    : mutateAppcast(`<?xml version="1.0" encoding="utf-8"?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0"><channel><item>
 <sparkle:version>${bundleVersion}</sparkle:version>
 <enclosure url="${artifactURL}" length="${dmgBytes.length}" type="application/x-apple-diskimage" sparkle:edSignature="${signature}" />
@@ -1746,6 +1793,7 @@ test("validates a delta-carrying dogfood appcast and receipts the local signed d
   try {
     const publication = await publishSparkleUpdateRaw({
       appcastPath: fixture.appcastPath,
+      appcastPolicy: FIXTURE_ONLY_HAND_BUILT_APPCAST_POLICY,
       bucket: fixture.bucket,
       channel: "internal-dogfood",
       dmgPath: fixture.dmgPath,
@@ -1780,6 +1828,7 @@ test("publishes the delta as a fourth immutable object and read-backs delta and 
   try {
     const publication = await publishSparkleUpdateRaw({
       appcastPath: fixture.appcastPath,
+      appcastPolicy: FIXTURE_ONLY_HAND_BUILT_APPCAST_POLICY,
       atomicAppcastGuard: runner.run.atomicAppcastGuard,
       bucket: fixture.bucket,
       channel: "internal-dogfood",
@@ -1822,6 +1871,7 @@ test("fails closed before any remote call when an advertised delta is not beside
     await assert.rejects(
       publishSparkleUpdateRaw({
         appcastPath: fixture.appcastPath,
+        appcastPolicy: FIXTURE_ONLY_HAND_BUILT_APPCAST_POLICY,
         bucket: fixture.bucket,
         channel: "internal-dogfood",
         dmgPath: fixture.dmgPath,
@@ -1845,6 +1895,7 @@ test("fails closed when the local delta bytes do not match the content-addressed
     await assert.rejects(
       publishSparkleUpdateRaw({
         appcastPath: fixture.appcastPath,
+        appcastPolicy: FIXTURE_ONLY_HAND_BUILT_APPCAST_POLICY,
         bucket: fixture.bucket,
         channel: "internal-dogfood",
         dmgPath: fixture.dmgPath,
@@ -1875,6 +1926,7 @@ test("fails closed when the delta signature does not verify against the release 
     await assert.rejects(
       publishSparkleUpdateRaw({
         appcastPath: fixture.appcastPath,
+        appcastPolicy: FIXTURE_ONLY_HAND_BUILT_APPCAST_POLICY,
         bucket: fixture.bucket,
         channel: "internal-dogfood",
         dmgPath: fixture.dmgPath,
@@ -1900,6 +1952,7 @@ test("rejects a delta enclosure outside the sparkle:deltas fallback container", 
     await assert.rejects(
       publishSparkleUpdateRaw({
         appcastPath: fixture.appcastPath,
+        appcastPolicy: FIXTURE_ONLY_HAND_BUILT_APPCAST_POLICY,
         bucket: fixture.bucket,
         channel: "internal-dogfood",
         dmgPath: fixture.dmgPath,
@@ -1909,6 +1962,111 @@ test("rejects a delta enclosure outside the sparkle:deltas fallback container", 
         validateDMG: async () => {},
       }),
       { code: "SPARKLE_UPDATE_APPCAST_DELTA_INVALID" },
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("refuses an unsigned hand-built dogfood candidate before any network call", async () => {
+  // 2026-08-10 incident parity, extended to internal-dogfood on 2026-08-19:
+  // dogfood builds also ship SURequireSignedFeed=true, so a hand-built
+  // unsigned dogfood feed would strand every installed dogfood updater. The
+  // retained delta fixtures above publish only behind the explicit
+  // fixture-only policy; the production default — and a delta-enabled
+  // reviewed policy flip on its own — both fail closed with the named error.
+  const fixture = await createDogfoodReleaseFixture();
+  try {
+    for (const appcastPolicy of [
+      undefined,
+      { ...CANONICAL_STABLE_APPCAST_POLICY, allowDeltaFrom: true },
+    ]) {
+      await assert.rejects(
+        publishSparkleUpdateRaw({
+          appcastPath: fixture.appcastPath,
+          ...(appcastPolicy === undefined ? {} : { appcastPolicy }),
+          bucket: fixture.bucket,
+          channel: "internal-dogfood",
+          dmgPath: fixture.dmgPath,
+          releaseManifestPath: fixture.releaseManifestPath,
+          sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+          runWrangler: async () =>
+            assert.fail("unsigned dogfood must not call Wrangler"),
+          validateDMG: async () => {},
+        }),
+        { code: "SPARKLE_UPDATE_DOGFOOD_FEED_UNSIGNED" },
+      );
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("validates a feed-signed official dogfood candidate; a delta-enabled policy fails closed", async () => {
+  // The production dogfood path (verified live with 0.1.13): the pinned
+  // official generate_appcast shape with the signed trailer passes the
+  // extended preflight, and — exactly like stable — flipping allowDeltaFrom
+  // does not skip it but fails closed until the signed-feed validator (and
+  // the Worker guard's official parser) understand delta-carrying feeds.
+  const fixture = await createDogfoodReleaseFixture({
+    deltaSources: [],
+    officialSignedFeed: true,
+  });
+  const options = {
+    appcastPath: fixture.appcastPath,
+    bucket: fixture.bucket,
+    channel: "internal-dogfood",
+    dmgPath: fixture.dmgPath,
+    releaseManifestPath: fixture.releaseManifestPath,
+    sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+    runWrangler: async () => assert.fail("dry run must not call Wrangler"),
+    validateDMG: async () => {},
+  };
+  try {
+    const publication = await publishSparkleUpdateRaw(options);
+    assert.equal(publication.published, false);
+    assert.equal(publication.status, "validated");
+    assert.equal(publication.deltas.length, 0);
+    assert.equal(
+      publication.appcast.url,
+      fixture.channel.sparkle.appcastURL,
+    );
+    await assert.rejects(
+      publishSparkleUpdateRaw({
+        ...options,
+        appcastPolicy: {
+          ...CANONICAL_STABLE_APPCAST_POLICY,
+          allowDeltaFrom: true,
+        },
+      }),
+      { code: "SPARKLE_UPDATE_DOGFOOD_DELTA_FEED_VALIDATION_UNSUPPORTED" },
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("the fixture-only unsigned feed policy is refused outright for the stable channel", async () => {
+  // The escape hatch that keeps the hand-built dogfood delta fixtures
+  // testable must never weaken stable: even a perfectly signed official
+  // stable candidate is refused when the fixture-only policy is injected,
+  // so no combination of policy values can reopen the 2026-08-10 path.
+  const fixture = await createReleaseFixture();
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        appcastPolicy: FIXTURE_ONLY_HAND_BUILT_APPCAST_POLICY,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: async () =>
+          assert.fail("stable fixture policy must not call Wrangler"),
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_STABLE_FIXTURE_POLICY_FORBIDDEN" },
     );
   } finally {
     await fixture.cleanup();

@@ -618,27 +618,54 @@ export function validateCandidateAppcastShape(text, channelName, {
 }
 
 /**
- * 2026-08-10 incident preflight. Every installed stable client ships
+ * Per-channel named failure codes for the signed-feed preflight below. The
+ * stable codes predate the dogfood extension and are pinned by the runbook
+ * and regression suite; keep them stable. Any future named channel must be
+ * added here explicitly — the preflight fails closed on an unknown channel
+ * rather than silently skipping the 2026-08-10 incident gate.
+ */
+const NAMED_CHANNEL_FEED_PREFLIGHT_CODES = Object.freeze({
+  stable: Object.freeze({
+    deltaUnsupported: "SPARKLE_UPDATE_STABLE_DELTA_FEED_VALIDATION_UNSUPPORTED",
+    unsigned: "SPARKLE_UPDATE_STABLE_FEED_UNSIGNED",
+  }),
+  "internal-dogfood": Object.freeze({
+    deltaUnsupported: "SPARKLE_UPDATE_DOGFOOD_DELTA_FEED_VALIDATION_UNSUPPORTED",
+    unsigned: "SPARKLE_UPDATE_DOGFOOD_FEED_UNSIGNED",
+  }),
+});
+
+/**
+ * 2026-08-10 incident preflight, extended to internal-dogfood on 2026-08-19.
+ * Every installed production client on BOTH named channels ships
  * SURequireSignedFeed=true, so the moment an unsigned appcast document goes
- * live the entire fleet shows "The update feed is improperly signed and
- * could not be validated" and stops updating. Refuse an unsigned stable
- * candidate outright, before any network call; and when the candidate does
- * carry the generate_appcast `sparkle-signatures` trailer, validate it
- * completely (trailer well-formedness, declared length, Ed25519 envelope,
- * the exact official document shape the Worker guard accepts, and enclosure
- * consistency with the release DMG bytes) with named failure reasons.
+ * live that channel's entire fleet shows "The update feed is improperly
+ * signed and could not be validated" and stops updating. Refuse an unsigned
+ * named-channel candidate outright, before any network call; and when the
+ * candidate does carry the generate_appcast `sparkle-signatures` trailer,
+ * validate it completely (trailer well-formedness, declared length, Ed25519
+ * envelope, the exact official document shape the Worker guard accepts, and
+ * enclosure consistency with the release DMG bytes) with named failure
+ * reasons.
  *
- * This preflight runs UNCONDITIONALLY for the stable channel — the trailer
- * requirement is a property of the installed fleet (SURequireSignedFeed),
- * not of the delta policy, so no policy value may disable it. Because
- * scripts/sparkle-signed-feed-validation.js only understands the pinned
- * full-only official generate_appcast shape today, a delta-enabled stable
+ * This preflight runs UNCONDITIONALLY for both named channels — the trailer
+ * requirement is a property of each installed fleet (SURequireSignedFeed),
+ * not of the delta policy, so no reviewable policy value may disable it.
+ * Because scripts/sparkle-signed-feed-validation.js only understands the
+ * pinned full-only official generate_appcast shape today, a delta-enabled
  * policy (allowDeltaFrom: true) FAILS CLOSED here with a named error instead
  * of silently skipping validation: extend the validator (and the Worker
  * guard's official parser) for delta-carrying signed feeds before flipping
  * config/sparkle-appcast-policy.js.
+ *
+ * The ONLY exception is the spec-injected fixture policy
+ * (fixtureOnlyUnsignedHandBuiltFeed: true), which keeps the retained
+ * hand-built delta machinery regression-tested until that reviewed flip.
+ * appcastPolicy is deliberately unreachable from the CLI, and the fixture
+ * policy is REFUSED outright for the stable channel, so it cannot weaken
+ * the stable path.
  */
-function assertStableCandidateFeedSigned({
+function assertNamedChannelCandidateFeedSigned({
   appcastPolicy,
   appcastText,
   channel,
@@ -648,16 +675,32 @@ function assertStableCandidateFeedSigned({
   manifest,
   sparklePublicKey,
 }) {
+  const codes = NAMED_CHANNEL_FEED_PREFLIGHT_CODES[channel.name];
+  if (codes === undefined) {
+    fail(
+      `Release channel ${channel.name} has no reviewed signed-feed preflight contract; refuse to publish rather than skip the SURequireSignedFeed gate`,
+      "SPARKLE_UPDATE_FEED_PREFLIGHT_UNDEFINED",
+    );
+  }
+  if (appcastPolicy.fixtureOnlyUnsignedHandBuiltFeed === true) {
+    if (channel.name === "stable") {
+      fail(
+        "The fixture-only unsigned hand-built feed policy is refused for the stable channel: installed stable clients set SURequireSignedFeed and the 2026-08-10 incident preflight cannot be disabled",
+        "SPARKLE_UPDATE_STABLE_FIXTURE_POLICY_FORBIDDEN",
+      );
+    }
+    return;
+  }
   if (!hasSparkleSignedFeedTrailer(appcastText)) {
     fail(
-      "Stable appcast candidate is not feed-signed: installed clients set SURequireSignedFeed and would refuse it. Generate the stable appcast with scripts/generate-sparkle-appcast.js --channel stable, which drives the pinned official generate_appcast and embeds the signed sparkle-signatures trailer.",
-      "SPARKLE_UPDATE_STABLE_FEED_UNSIGNED",
+      `The ${channel.name} appcast candidate is not feed-signed: installed clients set SURequireSignedFeed and would refuse it. Generate the appcast with scripts/generate-sparkle-appcast.js --channel ${channel.name}, which drives the pinned official generate_appcast and embeds the signed sparkle-signatures trailer.`,
+      codes.unsigned,
     );
   }
   if (appcastPolicy.allowDeltaFrom === true) {
     fail(
-      "Stable delta publication is enabled by the appcast policy, but the signed-feed preflight only validates the full-only official generate_appcast shape. Extend scripts/sparkle-signed-feed-validation.js (and the Worker guard's official parser) for delta-carrying signed feeds before enabling allowDeltaFrom for the stable channel.",
-      "SPARKLE_UPDATE_STABLE_DELTA_FEED_VALIDATION_UNSUPPORTED",
+      `Delta publication is enabled by the appcast policy for the ${channel.name} channel, but the signed-feed preflight only validates the full-only official generate_appcast shape. Extend scripts/sparkle-signed-feed-validation.js (and the Worker guard's official parser) for delta-carrying signed feeds before enabling allowDeltaFrom.`,
+      codes.deltaUnsupported,
     );
   }
   const validated = validateSignedSparkleFeed({
@@ -1642,8 +1685,10 @@ export async function publishSparkleUpdate({
   appcastPath,
   // The reviewed canonical policy is the only production value; this seam is
   // injectable (like runWrangler and validateDMG) so specs can exercise the
-  // delta-enabled appcast shape ahead of the reviewed config/guard change.
-  // It is deliberately not reachable from the CLI argument parser.
+  // delta-enabled appcast shape ahead of the reviewed config/guard change,
+  // and — via fixtureOnlyUnsignedHandBuiltFeed, refused for stable — the
+  // retained hand-built dogfood delta fixtures. It is deliberately not
+  // reachable from the CLI argument parser.
   appcastPolicy = CANONICAL_STABLE_APPCAST_POLICY,
   bucket,
   channel,
@@ -1755,18 +1800,16 @@ export async function publishSparkleUpdate({
   if (appcastBytes.length !== appcast.size) {
     fail("Appcast changed while it was being read");
   }
-  if (releaseChannel.name === "stable") {
-    assertStableCandidateFeedSigned({
-      appcastPolicy,
-      appcastText: appcastBytes.toString("utf8"),
-      channel: releaseChannel,
-      dmgBytes: dmgWithSha256.bytes,
-      dmgFileName: basename(dmg.path),
-      dmgSha256: observedDMGSha256,
-      manifest,
-      sparklePublicKey: normalizedSparklePublicKey,
-    });
-  }
+  assertNamedChannelCandidateFeedSigned({
+    appcastPolicy,
+    appcastText: appcastBytes.toString("utf8"),
+    channel: releaseChannel,
+    dmgBytes: dmgWithSha256.bytes,
+    dmgFileName: basename(dmg.path),
+    dmgSha256: observedDMGSha256,
+    manifest,
+    sparklePublicKey: normalizedSparklePublicKey,
+  });
   const appcastUpdate = validateAppcast(
     appcastBytes.toString("utf8"),
     {
