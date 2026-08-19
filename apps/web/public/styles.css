@@ -2260,15 +2260,19 @@ h2 { font-size: clamp(2rem, 3.8vw, 3.25rem); }
    lives in the narrow consent column, where three side-by-side tiles wrap
    one word per line; each fact is instead a full-width row with the label
    on the start edge and the value on the end edge. */
-.incremental-review-facts { grid-template-columns: 1fr; margin: 0; }
-.incremental-review-facts > div {
+/* Compound selectors on purpose: the element carries both classes and the
+   .summary-facts base rules are declared BELOW this block, so a lone
+   .incremental-review-facts override loses the cascade at equal specificity
+   (which is exactly how the 4-track squeeze shipped twice). */
+.summary-facts.incremental-review-facts { grid-template-columns: 1fr; margin: 0; }
+.summary-facts.incremental-review-facts > div {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
   gap: var(--space-2);
 }
-.incremental-review-facts dt { flex-shrink: 0; }
-.incremental-review-facts dd { margin: 0; text-align: end; }
+.summary-facts.incremental-review-facts dt { flex-shrink: 0; }
+.summary-facts.incremental-review-facts dd { margin: 0; text-align: end; }
 .summary-facts { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--space-2); margin: var(--space-5) 0; }
 .sync-facts { grid-template-columns: repeat(3, 1fr); }
 .summary-facts > div { min-width: 0; padding: var(--pad-tile); border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-quiet); }
