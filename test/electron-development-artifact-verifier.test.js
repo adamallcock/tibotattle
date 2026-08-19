@@ -31,6 +31,7 @@ const SHELL_FILES = [
   "apps/electron/platform-gate.js",
   "apps/electron/preload.js",
   "apps/electron/ready-line.js",
+  "apps/electron/windows-qualification.js",
 ];
 const KEYTAR = Object.freeze({
   "darwin-arm64": "node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
@@ -148,6 +149,7 @@ async function makeFixture(
     bindingManifestMutation = null,
     foreignUnpacked = null,
     extraArchive = null,
+    keytarMutation = null,
     physicalUnpackedMutation = null,
     unpackPattern = "**/*.node",
   } = {},
@@ -174,8 +176,15 @@ async function makeFixture(
   ]);
   for (const path of SHELL_FILES) files.set(path, Buffer.from(`// ${path}\n`));
 
-  const keytar = Buffer.from(`${target} keytar bytes\n`);
-  files.set(KEYTAR[target], keytar);
+  const keytar = target === "win32-x64"
+    ? Buffer.from(await readFile(require.resolve(
+      "@github/keytar/prebuilds/win32-x64/keytar.node",
+    )))
+    : Buffer.from(`${target} keytar bytes\n`);
+  const fixtureKeytar = keytarMutation === null
+    ? keytar
+    : Buffer.from(keytarMutation(Buffer.from(keytar)));
+  files.set(KEYTAR[target], fixtureKeytar);
   const binding = Buffer.from("reviewed Windows production binding\n");
   if (target === "win32-x64") {
     files.set(WINDOWS_BINDING, binding);
@@ -252,7 +261,7 @@ async function makeFixture(
   });
   await physicalUnpackedMutation?.({
     binding,
-    keytar,
+    keytar: fixtureKeytar,
     target,
     unpackedPath,
   });
@@ -322,6 +331,26 @@ test("verifies Windows x64 binding and sidecar digests without promoting provena
     assert.equal(result.binding.sha256, sha256(fixture.binding));
     assert.equal(result.staged.sha256, result.artifact.sha256);
   });
+});
+
+test("rejects a Windows keytar prebuild whose bytes do not match the pinned digest", async () => {
+  await withFixture(
+    "win32-x64",
+    {
+      keytarMutation: (bytes) => {
+        bytes[0] ^= 0xff;
+        return bytes;
+      },
+    },
+    async (fixture) => {
+      await assert.rejects(
+        () => verify(fixture, "win32-x64"),
+        (error) => error.code === FIXED_STATUS.bindingInvalid
+          && error.message === FIXED_STATUS.bindingInvalid
+          && !error.message.includes(fixture.root),
+      );
+    },
+  );
 });
 
 test("requires the exact versioned Windows sidecar schema and policy consistency", async () => {
