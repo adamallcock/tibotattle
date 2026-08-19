@@ -9,6 +9,7 @@ const SAFE_ERROR_CODES = new Set([
   "companion_not_running",
   "invalid_loopback_origin",
   "windows_readiness_unavailable",
+  "windows_qualification_launch_override_forbidden",
   "electron_configuration_invalid",
 ]);
 
