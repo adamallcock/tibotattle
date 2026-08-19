@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "createdAt": "2026-08-18T22:38:51.477Z",
+  "includeContent": false,
+  "summary": {
+    "ok": true,
+    "status": "ok",
+    "warnings": [],
+    "context": {
+      "timestamp": "2026-08-18T22:38:51.477Z",
+      "url": "[redacted:62 chars]",
+      "title": "[redacted:7 chars]",
+      "turnCount": 2,
+      "assistantTurnCount": 1,
+      "conversationId": "[redacted:40 chars]"
+    }
+  },
+  "steps": [
+    {
+      "id": "bootstrap",
+      "command": "session.bootstrap",
+      "status": "ok",
+      "ok": true,
+      "startedAt": "2026-08-18T22:38:30.601Z",
+      "endedAt": "2026-08-18T22:38:30.654Z",
+      "warnings": [],
+      "dataPreview": {
+        "browserName": "[redacted:6 chars]",
+        "tabId": "[redacted:10 chars]",
+        "url": "[redacted:20 chars]",
+        "loggedIn": true
+      }
+    },
+    {
+      "id": "new",
+      "command": "threads.new",
+      "status": "ok",
+      "ok": true,
+      "startedAt": "2026-08-18T22:38:30.654Z",
+      "endedAt": "2026-08-18T22:38:34.852Z",
+      "warnings": [],
+      "dataPreview": {
+        "url": "[redacted:20 chars]",
+        "title": "[redacted:7 chars]"
+      }
+    },
+    {
+      "id": "mode",
+      "command": "modes.set",
+      "status": "ok",
+      "ok": true,
+      "startedAt": "2026-08-18T22:38:34.852Z",
+      "endedAt": "2026-08-18T22:38:47.799Z",
+      "warnings": [],
+      "dataPreview": {
+        "selected": [
+          "[redacted:3 chars]"
+        ],
+        "candidates": [
+          "[redacted:3 chars]"
+        ]
+      }
+    },
+    {
+      "id": "ask",
+      "command": "messages.ask",
+      "status": "ok",
+      "ok": true,
+      "startedAt": "2026-08-18T22:38:47.799Z",
+      "endedAt": "2026-08-18T22:38:51.477Z",
+      "warnings": [],
+      "dataPreview": {
+        "prompt": "[redacted:122 chars]",
+        "conversationId": "[redacted:40 chars]",
+        "title": "[redacted:7 chars]",
+        "submissionState": "[redacted:9 chars]",
+        "completionState": "[redacted:10 chars]",
+        "generationActive": true,
+        "generationSignals": [
+          "[redacted:14 chars]"
+        ]
+      }
+    }
+  ],
+  "data": {
+    "prompt": "[redacted:3246 chars]",
+    "conversationId": "[redacted:40 chars]",
+    "title": "[redacted:7 chars]",
+    "submissionState": "[redacted:9 chars]",
+    "completionState": "[redacted:10 chars]",
+    "generationActive": true,
+    "generationSignals": [
+      "[redacted:14 chars]"
+    ]
+  }
+}
