@@ -60,8 +60,17 @@ const SOURCE_HASHES = Object.freeze({
   // track compatibility is judged by (limit, duration) — the provider's
   // primary/secondary slots are UI roles that flipped for the weekly window
   // around 2026-07-06 without the window itself changing.
+  // Re-pinned 2026-08-19 for quota-pace-forecast-v0.2. The kernel now reports
+  // a named working-time rate and a named wall-clock rate instead of one
+  // ambiguous `percentagePointsPerHour`, and `etaAt`/`status` are derived
+  // from the wall-clock one. The old ETA divided a remaining allowance by a
+  // per-working-hour rate and reported the quotient as wall-clock hours, which
+  // made every published forecast arrive early. The plausibility cap moved to
+  // the wall-clock rate with it, since that is the only rate the ETA depends
+  // on; an over-cap working rate is now reported as null rather than refusing
+  // an otherwise sound forecast.
   "quota-pace-forecast.js":
-    "7cb7e1fd014a214fd922a7f285ef976dc52189ed24a575c85be6919aa4c6156a",
+    "793ee450768a193609e1659ce62c33f11af897e5e562b8a7393f4644d0a24891",
   // Not a pre-extraction kernel: authored 2026-08-11 for the
   // composition-aware expected line (per-model NNLS calibration, design:
   // docs/design/composition-aware-expected-line.md). Pinned the same way so

@@ -6625,20 +6625,27 @@ const PACE_STATE_LABELS = Object.freeze({
  * The two rates this card carries answer different questions and routinely
  * disagree by an order of magnitude.
  *
- * `pace.percentagePointsPerHour` is the engine's median over adjacent
+ * `pace.activePercentagePointsPerHour` is the engine's median over adjacent
  * intervals that actually moved, so it measures the pace *while working* and
  * discards every idle gap. Extrapolated across a whole window it assumes the
  * reader never stops, which is why a forecast built on it alone always lands
  * earlier than what happens - the "it always underestimates the time I have
  * left" complaint this card drew.
  *
- * `movementPp / elapsedHours` is the same window's overall rate with idle
- * time included. That is the honest headline; the active rate stays on the
- * card as the without-pausing edge, drawn as a separate mark on the track.
+ * `pace.overallPercentagePointsPerHour` is the same window's rate with idle
+ * time included, and since quota-pace-forecast-v0.2 it is what the engine's
+ * own `etaAt` and `status` are built from. That is the honest headline; the
+ * active rate stays on the card as the without-pausing edge, drawn as a
+ * separate mark on the track.
+ *
+ * The `movementPp / elapsedHours` fallback covers a payload that predates the
+ * named rates. It carries a minimum-span guard the engine field does not need,
+ * because a derived average over a few minutes is whatever the reader happened
+ * to be doing; the engine gates the same risk through `earlyEstimate` instead.
  */
 function weeklyPaceRates(pace, forecast) {
   const active = firstFiniteForecastNumber(
-    pace.percentagePointsPerHour,
+    pace.activePercentagePointsPerHour,
     pace.percentPerHour,
     pace.pacePercentPerHour,
     forecast.percentagePointsPerHour,
@@ -6647,17 +6654,21 @@ function weeklyPaceRates(pace, forecast) {
   );
   const elapsedHours = firstFiniteForecastNumber(pace.elapsedHours);
   const movementPp = firstFiniteForecastNumber(pace.movementPp);
-  const average = elapsedHours !== null
+  const derivedAverage = elapsedHours !== null
     && elapsedHours >= PACE_AVERAGE_MINIMUM_HOURS
     && movementPp !== null
     && movementPp > 0
     ? movementPp / elapsedHours
     : null;
+  const reported = firstFiniteForecastNumber(
+    pace.overallPercentagePointsPerHour,
+  );
+  const average = reported !== null && reported > 0 ? reported : derivedAverage;
   return {
     active: active !== null && active > 0 ? active : null,
     average,
-    // The overall rate leads whenever the observed span is long enough to
-    // contain a realistic mix of work and rest.
+    // The wall-clock rate leads. Falling back to the working rate keeps the
+    // card readable rather than blank when only that one is available.
     headline: average ?? (active !== null && active > 0 ? active : null),
   };
 }
@@ -6819,7 +6830,7 @@ function renderWeeklyPaceForecast(data) {
   if (remaining !== null && (remaining < 0 || remaining > 100)) remaining = null;
 
   const rates = weeklyPaceRates(pace, forecast);
-  const percentagePointsPerHour = rates.headline;
+  const headlinePace = rates.headline;
   const hoursToReset = firstFiniteForecastNumber(
     (resetAt - now) / 3_600_000,
     forecast.hoursToReset,
@@ -6839,7 +6850,7 @@ function renderWeeklyPaceForecast(data) {
     etaAt = now + suppliedHoursToExhaustion * 3_600_000;
   }
   const available = status === "available"
-    || (status === "" && etaAt !== null && percentagePointsPerHour !== null);
+    || (status === "" && etaAt !== null && headlinePace !== null);
   const reachesResetFirst = status === "will_reach_reset_first"
     || status === "reset_before_exhaustion";
   const paceIntervals = firstFiniteForecastNumber(pace.sampleCount);
@@ -6866,7 +6877,7 @@ function renderWeeklyPaceForecast(data) {
   if (collectingEvidence && remaining === null) return;
   if (!collectingEvidence
       && remaining === null
-      && percentagePointsPerHour === null
+      && headlinePace === null
       && !reachesResetFirst) return;
 
   // The standing is computed from the headline rate, so the card's colour,
@@ -6880,7 +6891,7 @@ function renderWeeklyPaceForecast(data) {
     : weeklyPaceStanding({
       remainingPercent: remaining,
       hoursToReset,
-      pacePpPerHour: percentagePointsPerHour,
+      pacePpPerHour: headlinePace,
     });
   const paceState = standing?.state
     ?? (collectingEvidence ? null : reachesResetFirst ? "under" : null);
@@ -6970,8 +6981,8 @@ function renderWeeklyPaceForecast(data) {
     addMetric("Nothing left for", dryDuration);
   } else if (standing !== null) {
     addMetric("Spare at reset", formatPercent(standing.sparePercent));
-  } else if (percentagePointsPerHour !== null && percentagePointsPerHour > 0) {
-    addMetric("Recent pace", `${formatDecimal(percentagePointsPerHour, 1)} pp/hour`);
+  } else if (headlinePace !== null && headlinePace > 0) {
+    addMetric("Recent pace", `${formatDecimal(headlinePace, 1)} pp/hour`);
   }
 
   const track = collectingEvidence

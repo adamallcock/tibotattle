@@ -4756,7 +4756,7 @@ function normalizeGradient(payload = {}) {
   };
 }
 
-const WEEKLY_PACE_FORECAST_SCHEMA_VERSION = "local-weekly-pace-forecast-v0.1";
+const WEEKLY_PACE_FORECAST_SCHEMA_VERSION = "local-weekly-pace-forecast-v0.2";
 const WEEKLY_PACE_FORECAST_STATUSES = new Set([
   "unavailable",
   "insufficient_observations",
@@ -4799,7 +4799,8 @@ function normalizeWeeklyPaceForecast(value) {
         "sampleCount",
         "elapsedHours",
         "movementPp",
-        "percentagePointsPerHour"
+        "activePercentagePointsPerHour",
+        "overallPercentagePointsPerHour"
       ])) return null;
   const currentUsedPercent = weeklyPaceNumber(value.currentUsedPercent, {
     minimum: 0,
@@ -4811,8 +4812,12 @@ function normalizeWeeklyPaceForecast(value) {
   });
   const elapsedHours = weeklyPaceNumber(value.pace.elapsedHours, { minimum: 0 });
   const movementPp = weeklyPaceNumber(value.pace.movementPp, { minimum: 0 });
-  const percentagePointsPerHour = weeklyPaceNumber(
-    value.pace.percentagePointsPerHour,
+  const activePercentagePointsPerHour = weeklyPaceNumber(
+    value.pace.activePercentagePointsPerHour,
+    { minimum: 0, maximum: 100 }
+  );
+  const overallPercentagePointsPerHour = weeklyPaceNumber(
+    value.pace.overallPercentagePointsPerHour,
     { minimum: 0, maximum: 100 }
   );
   const hoursToExhaustion = weeklyPaceNumber(value.hoursToExhaustion, {
@@ -4825,7 +4830,8 @@ function normalizeWeeklyPaceForecast(value) {
       || remainingPercent === undefined
       || elapsedHours === undefined
       || movementPp === undefined
-      || percentagePointsPerHour === undefined
+      || activePercentagePointsPerHour === undefined
+      || overallPercentagePointsPerHour === undefined
       || hoursToExhaustion === undefined
       || hoursToReset === undefined
       || (value.resetsAt !== null && resetsAt === null)
@@ -4843,8 +4849,8 @@ function normalizeWeeklyPaceForecast(value) {
         || remainingPercent === null
         || resetsAt === null
         || etaAt === null
-        || percentagePointsPerHour === null
-        || percentagePointsPerHour <= 0
+        || overallPercentagePointsPerHour === null
+        || overallPercentagePointsPerHour <= 0
         || hoursToExhaustion === null
         || hoursToReset === null
         || Date.parse(etaAt) >= Date.parse(resetsAt)) return null;
@@ -4862,7 +4868,8 @@ function normalizeWeeklyPaceForecast(value) {
       sampleCount: value.pace.sampleCount,
       elapsedHours,
       movementPp,
-      percentagePointsPerHour
+      activePercentagePointsPerHour,
+      overallPercentagePointsPerHour
     },
     observationCount: value.observationCount,
     etaAt,

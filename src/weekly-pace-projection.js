@@ -4,7 +4,10 @@ import {
 } from "@app-usagemonitor/quota-analysis";
 import { sanitizeAccountScope } from "./providers/codex/account.js";
 
-const SCHEMA_VERSION = "local-weekly-pace-forecast-v0.1";
+// v0.2 (2026-08-19): mirrors quota-pace-forecast-v0.2 - the single ambiguous
+// `percentagePointsPerHour` is replaced by a named working-time rate and a
+// named wall-clock rate, and the ETA follows the wall-clock one.
+const SCHEMA_VERSION = "local-weekly-pace-forecast-v0.2";
 const PROVIDER = "openai_codex";
 const LIMIT_ID = "codex";
 const SLOT_PRIORITY = Object.freeze(["primary", "secondary"]);
@@ -169,8 +172,14 @@ function publicForecast(result) {
       sampleCount,
       elapsedHours: numberOrNull(pace.elapsedHours, { minimum: 0 }),
       movementPp: numberOrNull(pace.movementPp, { minimum: 0 }),
-      percentagePointsPerHour: numberOrNull(
-        pace.percentagePointsPerHour,
+      // Both rates travel to the surface. The active one is the "if you never
+      // pause" edge; the overall one is what `etaAt` below is built from.
+      activePercentagePointsPerHour: numberOrNull(
+        pace.activePercentagePointsPerHour,
+        { minimum: 0, maximum: 100 },
+      ),
+      overallPercentagePointsPerHour: numberOrNull(
+        pace.overallPercentagePointsPerHour,
         { minimum: 0, maximum: 100 },
       ),
     },
@@ -195,7 +204,8 @@ function unavailableForecast() {
       sampleCount: 0,
       elapsedHours: null,
       movementPp: null,
-      percentagePointsPerHour: null,
+      activePercentagePointsPerHour: null,
+      overallPercentagePointsPerHour: null,
     },
     observationCount: 0,
     etaAt: null,

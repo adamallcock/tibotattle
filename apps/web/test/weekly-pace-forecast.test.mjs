@@ -132,11 +132,28 @@ test("pace standing refuses readings it cannot classify", () => {
 });
 
 test("the headline rate counts idle time and the active rate stays separate", () => {
-  // The engine's percentagePointsPerHour is a median over intervals that
-  // moved, so it measures the pace while working. Extrapolating it alone is
-  // what made every forecast land earlier than it should.
+  // Since quota-pace-forecast-v0.2 the engine names both rates, and the
+  // wall-clock one is what its own ETA is built from. The card follows it.
   const rates = pace.weeklyPaceRates(
-    { percentagePointsPerHour: 11.3, elapsedHours: 100, movementPp: 97 },
+    {
+      activePercentagePointsPerHour: 11.3,
+      overallPercentagePointsPerHour: .97,
+      elapsedHours: 100,
+      movementPp: 97,
+    },
+    {},
+  );
+  assert.equal(rates.active, 11.3);
+  assert.equal(rates.average, .97);
+  assert.equal(rates.headline, .97);
+});
+
+test("a payload without the named wall-clock rate derives one", () => {
+  // Pre-v0.2 shape: the rate has to come from movement over elapsed time, and
+  // carries a minimum-span guard because a derived average over a few minutes
+  // is whatever the reader happened to be doing.
+  const rates = pace.weeklyPaceRates(
+    { activePercentagePointsPerHour: 11.3, elapsedHours: 100, movementPp: 97 },
     {},
   );
   assert.equal(rates.active, 11.3);
@@ -146,14 +163,14 @@ test("the headline rate counts idle time and the active rate stays separate", ()
 
 test("too short an observation span falls back to the active rate", () => {
   const rates = pace.weeklyPaceRates(
-    { percentagePointsPerHour: 4, elapsedHours: .5, movementPp: 2 },
+    { activePercentagePointsPerHour: 4, elapsedHours: .5, movementPp: 2 },
     {},
   );
   assert.equal(rates.average, null);
   assert.equal(rates.headline, 4);
 
   const noMovement = pace.weeklyPaceRates(
-    { percentagePointsPerHour: 4, elapsedHours: 12, movementPp: 0 },
+    { activePercentagePointsPerHour: 4, elapsedHours: 12, movementPp: 0 },
     {},
   );
   assert.equal(noMovement.average, null);
