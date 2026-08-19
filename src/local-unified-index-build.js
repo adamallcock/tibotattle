@@ -15,6 +15,7 @@ import {
 } from "./local-unified-index-extract.js";
 import {
   assertSafeLocalUnifiedIndexTarget,
+  assertWindowsUnifiedIndexStagingUnavailable,
   createUnifiedIndexWriter,
   createLocalUnifiedIndexSecondaryIndexes,
   beginUnifiedIndexGeneration,
@@ -521,7 +522,13 @@ export async function rebuildLocalUnifiedIndex({
   signal = null,
   onProgress = null,
   discoveryLimits = null,
+  windowsProtectedStateStore = null,
+  windowsSqliteStateSession = null,
 } = {}) {
+  // Rebuild requires a native handle-bound stage and publication primitive on
+  // Windows. That primitive is not implemented yet; fail before discovery,
+  // secret access, temp naming, or any Node filesystem mutation.
+  assertWindowsUnifiedIndexStagingUnavailable();
   if (typeof codexHome !== "string" || codexHome.length < 1) {
     throw new TypeError("codexHome must be a non-empty string");
   }
@@ -542,6 +549,7 @@ export async function rebuildLocalUnifiedIndex({
   });
   const deviceSalt = await readOrCreateDeviceSalt(
     secretFile ?? defaultLocalUnifiedIndexSecretPath(resolvedIndexFile),
+    { windowsProtectedStateStore },
   );
   const infos = await discoverCodexRolloutInfos({
     codexHome,
