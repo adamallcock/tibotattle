@@ -19,7 +19,71 @@ production signing, a public artifact, a GitHub release, an appcast change, a
 Homebrew update, a service deployment, replacement of the native macOS client,
 or a Linux-support claim.
 
-## Progress checkpoint: 2026-08-18
+## Progress checkpoint: 2026-08-19
+
+- The secure shared Electron shell, companion supervision, platform gate,
+  deterministic runtime staging, Windows x64 directory packaging workflow,
+  and content-free runtime smoke are implemented. The Windows smoke covers
+  dashboard readiness, a CDP-proven renderer reload, tray/window lifecycle,
+  single-instance rejection, credential probe plus deterministic
+  create/read/delete, relaunch persistence, descendant monitoring, and clean
+  quit.
+- Windows remains deliberately qualification-only. The packaged development
+  context requires the exact `TiboTattle Dev` brand, real packaged resource
+  root, canonical runtime inventory and payload digest, complete file-byte
+  revalidation, the reviewed native sidecar, and the pinned Windows Keytar
+  digest. Copied contexts, reader injection, launcher path/supervisor
+  overrides, central origins, development identity, and provider paths outside
+  disposable `TEMP` are rejected. Every existing Windows path component is
+  inspected through the native adapter and reparse points are refused.
+  `productionSafe` and every production selector remain false.
+- The exact native Windows security qualification set contains 31 reviewed
+  files. Its parent runner has a bounded timeout, bounded content capture,
+  Windows process-tree termination, fixed content-free status codes, and a
+  fail-closed termination result. Native Windows x64 has not run this revision,
+  so the remaining reparse, Credential Manager, native addon, and process-tree
+  claims are not yet proven.
+- The frozen local source passed the combined Electron/qualification/server
+  suite with 128 of 128 tests, architecture with 395 production files and zero
+  debt edges, tool inventory with 83 records and 85 executable paths, preflight,
+  and workflow lint. The authoritative portable lane passed 1,142 tests:
+  1,100 passed, zero failed, and 42 expected native-platform skips.
+- Ten R7 source-bound receipts were regenerated once after source freeze and
+  independently revalidated under pinned Node 24.14.0 and Node 26.2.0. They
+  cover 351 source files with SHA-256
+  `8700d636a4a38d00b02203f8523d2968db7cf56d3e579c15988d956b1c486dcd`.
+- The unsigned macOS arm64 Electron stage contains 431 reviewed files and was
+  rebuilt with Electron 43.2.0. The packaged application launched against a
+  disposable synthetic home, rendered the loopback dashboard, reloaded the
+  renderer, exposed the supervised descendant tree, and quit cleanly. The
+  existing native macOS application remains unchanged.
+- The pinned Debian/Xvfb Linux Electron image was rebuilt from the frozen
+  source and passed with `--network none`: dashboard ready, renderer reload,
+  eight supervised descendants at readiness, clean quit, and no retained
+  container. This is a shared-shell development proof, not a Linux support or
+  packaging claim.
+- No version bump, push, workflow dispatch, signing, publication, deployment,
+  native macOS replacement, Windows support claim, or Linux support claim has
+  occurred.
+
+### Immediate ordered work
+
+1. Commit the reviewed local slices while preserving the unrelated untracked
+   `reports/` directory, then record the exact source revision.
+2. Obtain explicit authorization to push that revision and dispatch the manual
+   Windows warm/clean workflow. Do not dispatch a different revision.
+3. Accept Stage 4 only if native Windows x64 returns zero skips and proves the
+   addon, Credential Manager lifecycle, packaged renderer/tray/single-instance
+   behavior, relaunch persistence, process-tree cleanup, and content-free
+   receipt. Use at most one focused repair pass for a concrete native failure.
+4. After native launch qualification, implement and qualify the Windows
+   installer, upgrade, rollback, uninstall/data-retention, and signing/
+   provenance boundary without publishing.
+5. Extend Linux into a declared distro, credential-store, desktop-manager tray,
+   autostart, packaging, and installed-app matrix only after the Windows shell
+   contract is stable.
+
+## Historical progress checkpoint: 2026-08-18
 
 - Stage 1 is complete: the current-main portable lane and real companion smoke
   passed, and the documentation scanner now ignores only reviewed runtime and
@@ -137,7 +201,7 @@ or a Linux-support claim.
   claimed, and no version bump, publication, or replacement of the native
   macOS client has occurred.
 
-### Immediate ordered work
+### Historical ordered work (superseded by the 2026-08-19 checkpoint)
 
 1. Finish the fixed Windows state composition: add a caller-unnameable native
    companion lifetime mutex, pass the protected store into automatic,
