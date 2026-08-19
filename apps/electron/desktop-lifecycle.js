@@ -84,6 +84,16 @@ export function createDesktopLifecycle({
     return showWindow();
   }
 
+  // Keep tray menu actions on the same bounded window operations used by the
+  // test-only packaged smoke control. The control never receives this method
+  // through the renderer or preload boundary.
+  function invokeTrayCommand(command) {
+    if (command === "show") return showWindow();
+    if (command === "hide") return hideWindow();
+    if (command === "toggle") return toggleWindow();
+    return false;
+  }
+
   function enqueueExclusive(operation) {
     const previous = lifecycleOperation;
     const current = previous.catch(() => {}).then(operation);
@@ -153,15 +163,15 @@ export function createDesktopLifecycle({
     tray = new Tray(icon);
     tray.setToolTip?.(appName);
     const template = [
-      { label: `Show ${appName}`, click: showWindow },
-      { label: `Hide ${appName}`, click: hideWindow },
+      { label: `Show ${appName}`, click: () => invokeTrayCommand("show") },
+      { label: `Hide ${appName}`, click: () => invokeTrayCommand("hide") },
       { label: "Retry", click: () => retry() },
       { type: "separator" },
       { label: "Quit", click: () => { void requestQuit(); } },
     ];
     const menu = Menu?.buildFromTemplate?.(template);
     tray.setContextMenu?.(menu);
-    tray.on?.("click", toggleWindow);
+    tray.on?.("click", () => invokeTrayCommand("toggle"));
     return tray;
   }
 
@@ -311,6 +321,7 @@ export function createDesktopLifecycle({
     showWindow,
     hideWindow,
     toggleWindow,
+    invokeTrayCommand,
     requestQuit,
     dispose,
     createWindow,
@@ -320,6 +331,9 @@ export function createDesktopLifecycle({
         quitting,
         primaryInstance,
         hasWindow: window !== null && !window.isDestroyed?.(),
+        windowVisible: window !== null
+          && !window.isDestroyed?.()
+          && window.isVisible?.() === true,
         hasTray: tray !== null,
         origin: ready?.origin ?? null,
       });
