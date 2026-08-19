@@ -50,6 +50,7 @@ import {
 import {
   configuredAccountingSourceMode,
   createCentralOutboundFetch,
+  createCompanionWindowsStateComposition,
   createLocalCompanionServer,
   loadCompanionWindowsFilesystemAdapter,
   resolveClaudeDesktopShadowConfiguration,
@@ -82,7 +83,19 @@ function unqualifiedWindowsFilesystemAdapter() {
     credentialMutexSafe: true,
     credentialAuditFileGuardSafe: true,
     sqliteStateLeaseSafe: false,
-    inspectPath: () => ({ identity }),
+    inspectPath: () => ({
+      identity,
+      isDirectory: true,
+      isRegularFile: false,
+      isReparsePoint: false,
+      ownerMatches: true,
+      nullDacl: false,
+      daclProtected: true,
+      broadAccess: false,
+      nonOwnerAllow: false,
+      unrecognizedAce: false,
+      finalPathResolved: true,
+    }),
     ensureDirectory: () => identity,
     readFile: () => ({ data: Buffer.from("data"), identity }),
     readFileBounded: () => ({ data: Buffer.from("data"), identity }),
@@ -326,6 +339,34 @@ test("companion composition owns one branded Windows adapter boundary", () => {
         && error.message === "Windows filesystem adapter configuration is invalid",
     );
   }
+});
+
+test("Windows state composition shares one branded adapter and remains unqualified", () => {
+  const adapter = unqualifiedWindowsFilesystemAdapter();
+  const composition = createCompanionWindowsStateComposition({
+    platform: "win32",
+    architecture: "x64",
+    stateRoot: "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state",
+    windowsFilesystemAdapter: adapter,
+  });
+  assert.equal(composition.protectedStateStore.productionSafe, false);
+  assert.equal(composition.protectedStateStore.rootBindingSafe, false);
+  assert.equal(composition.protectedStateStore.nativeReadBounded, false);
+  assert.equal(typeof composition.sqliteStateSessionFactory, "function");
+  assert.equal(typeof composition.sqliteStateSessionForPath, "function");
+  assert.equal(
+    typeof composition.contributionSyncQueue.inspectContributionSyncQueue,
+    "function",
+  );
+  assert.throws(
+    () => createCompanionWindowsStateComposition({
+      platform: "win32",
+      architecture: "x64",
+      stateRoot: "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state",
+      windowsFilesystemAdapter: { ...adapter },
+    }),
+    (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+  );
 });
 
 test("Windows root rejects the unqualified branded adapter before state creation", async () => {

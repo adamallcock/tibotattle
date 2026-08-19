@@ -47,6 +47,8 @@ export {
   isWindowsProtectedStateStoreError,
 } from "./windows-protected-state-store.js";
 export {
+  WINDOWS_SQLITE_STATE_SESSION_PRODUCTION_SAFE,
+  createWindowsSqliteStateSession,
   isWindowsSqliteStateDatabase,
   isWindowsSqliteStateSession,
 } from "./windows-sqlite-state-session.js";
