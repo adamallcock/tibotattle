@@ -21,6 +21,7 @@ import {
   WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION,
   WINDOWS_FILESYSTEM_BINDING_PROVENANCE_CONTRACT_VERSION,
   WINDOWS_FILESYSTEM_COMPANION_INSTANCE_MUTEX_CONTRACT_VERSION,
+  WINDOWS_FILESYSTEM_PREPARED_ARTIFACT_CONTRACT_VERSION,
   WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
 } from "../src/platform/windows-filesystem.js";
 
@@ -60,13 +61,16 @@ function assertBindingShape(binding) {
       && binding?.credentialMutexContractVersion === "windows-credential-mutex-v1"
       && binding?.companionInstanceMutexContractVersion
         === WINDOWS_FILESYSTEM_COMPANION_INSTANCE_MUTEX_CONTRACT_VERSION
+      && binding?.preparedArtifactContractVersion
+        === WINDOWS_FILESYSTEM_PREPARED_ARTIFACT_CONTRACT_VERSION
       && typeof binding?.productionSafe === "boolean"
       && typeof binding?.pathWalkRaceSafe === "boolean"
       && binding?.credentialMutexSafe === true;
     valid = valid
       && binding?.credentialAuditFileGuardSafe === true
       && binding?.companionInstanceMutexSafe === false
-      && binding?.sqliteStateLeaseSafe === false;
+      && binding?.sqliteStateLeaseSafe === false
+      && binding?.preparedArtifactSafe === false;
   } catch {
     valid = false;
   }
@@ -109,6 +113,7 @@ export function createWindowsFilesystemBindingManifest({ bytes, binding }) {
     credentialMutexContractVersion: native.credentialMutexContractVersion,
     companionInstanceMutexContractVersion:
       native.companionInstanceMutexContractVersion,
+    preparedArtifactContractVersion: native.preparedArtifactContractVersion,
     requiredMethods: [...WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS],
     nativeClaims: {
       productionSafe: native.productionSafe,
@@ -117,6 +122,7 @@ export function createWindowsFilesystemBindingManifest({ bytes, binding }) {
       companionInstanceMutexSafe: native.companionInstanceMutexSafe,
       credentialAuditFileGuardSafe: native.credentialAuditFileGuardSafe,
       sqliteStateLeaseSafe: native.sqliteStateLeaseSafe,
+      preparedArtifactSafe: native.preparedArtifactSafe,
     },
     approvedPolicy: {
       productionSafe: false,
@@ -125,6 +131,7 @@ export function createWindowsFilesystemBindingManifest({ bytes, binding }) {
       companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
       sqliteStateLeaseSafe: false,
+      preparedArtifactSafe: false,
     },
     // This sidecar is generated from an unsigned development binary. The
     // runtime verifier currently reports unavailable; a future signed
