@@ -1980,8 +1980,8 @@ tbody tr:last-child td { border-bottom: 0; }
   .model-disclosure-caret { transition: none; }
 }
 .cache-switch-details { margin-top: 18px; }
-.cache-switch-details th,
-.cache-switch-details td { padding-inline: var(--space-2); }
+#cache-switch-details th,
+#cache-switch-details td { padding-inline: var(--space-2); }
 .cache-switch-details th:nth-child(n + 3),
 .cache-switch-details td:nth-child(n + 3) { text-align: end; }
 .cache-continuity-details .evidence-subheading {
@@ -2031,6 +2031,55 @@ tbody tr:last-child td { border-bottom: 0; }
 .cache-switch-change {
   min-width: 15rem;
   white-space: normal;
+}
+/* A five-column evidence table is readable on a desktop but not at phone
+   width. Retain its table semantics there, then turn each row into a labelled
+   card here instead of leaving an off-screen horizontal scroller. */
+@media (max-width: 640px) {
+  #cache-switch-details .table-wrap {
+    overflow-x: visible;
+    border: 0;
+    border-radius: 0;
+  }
+  #cache-switch-details table,
+  #cache-switch-details tbody {
+    display: block;
+    width: 100%;
+  }
+  #cache-switch-details table { min-width: 0; }
+  #cache-switch-details thead { display: none; }
+  #cache-switch-details tbody { display: grid; gap: var(--space-2); }
+  #cache-switch-details tbody tr {
+    display: block;
+    padding: var(--space-3);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    background: var(--surface-raised);
+  }
+  #cache-switch-details tbody td {
+    display: grid;
+    grid-template-columns: minmax(0, 42%) minmax(0, 1fr);
+    gap: var(--space-2);
+    padding: var(--space-2) 0;
+    text-align: end;
+    white-space: normal;
+  }
+  #cache-switch-details tbody td::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-size: .62rem;
+    font-weight: var(--weight-bold);
+    letter-spacing: .05em;
+    text-align: start;
+    text-transform: uppercase;
+  }
+  #cache-switch-details tbody td:last-child { border-bottom: 0; }
+  #cache-switch-details .cache-switch-change { min-width: 0; }
+  #cache-switch-details .empty-cell {
+    display: block;
+    text-align: center;
+  }
+  #cache-switch-details .empty-cell::before { content: none; }
 }
 .accounting-bars { display: grid; gap: 10px; }
 .accounting-dimensions {

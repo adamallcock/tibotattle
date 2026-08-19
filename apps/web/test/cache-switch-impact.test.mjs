@@ -652,6 +652,93 @@ test("a pager is drawn only when there is more than one page to reach", async ()
   assert.equal(last.nodes["#t-page-next"].disabled, true);
 });
 
+test("cache-switch mobile cards carry their translated column labels", async () => {
+  const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const helperStart = source.indexOf("function cacheSwitchDataCell(");
+  const helperEnd = source.indexOf("\nfunction renderAccountingCacheSwitchDetails", helperStart);
+  const renderStart = helperEnd + 1;
+  const renderEnd = source.indexOf("\nfunction appendCacheContinuityAllowance", renderStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, "the mobile label helper is available");
+  assert.ok(renderEnd > renderStart, "the cache-switch renderer is available");
+
+  const element = (tagName, className = "", textContent = "") => ({
+    tagName,
+    className,
+    textContent,
+    children: [],
+    attributes: new Map(),
+    append(...items) { this.children.push(...items); },
+    setAttribute(name, value) { this.attributes.set(name, value); },
+    getAttribute(name) { return this.attributes.get(name) ?? null; },
+  });
+  const cacheSwitchDataCell = Function(
+    "rawNode",
+    "t",
+    `${source.slice(helperStart, helperEnd)}\nreturn cacheSwitchDataCell;`,
+  )(
+    element,
+    (key) => `translated:${key}`,
+  );
+  const disclosure = { hidden: true, open: false };
+  const rows = element("tbody");
+  const render = Function(
+    "$",
+    "clear",
+    "node",
+    "localizedNode",
+    "cacheSwitchDataCell",
+    "formatCount",
+    "formatApiMoney",
+    "formatLocal",
+    "cacheSwitchChangeDescription",
+    "paginateCacheImpactRows",
+    "cacheSwitchTablePagination",
+    "cacheImpactTableSignature",
+    "renderCacheImpactPagination",
+    `${source.slice(renderStart, renderEnd)}\nreturn renderAccountingCacheSwitchDetails;`,
+  )(
+    (selector) => ({
+      "#cache-switch-details": disclosure,
+      "#cache-switch-rows": rows,
+    })[selector] ?? null,
+    (target) => { target.children.length = 0; },
+    element,
+    (tagName, className, key) => element(tagName, className, key),
+    cacheSwitchDataCell,
+    String,
+    (value) => `$${value.toFixed(2)}`,
+    (value) => value,
+    () => "Model: GPT-5.6 Terra → GPT-5.6 Sol",
+    (values) => ({ rows: values, start: 0, end: values.length, total: values.length, pageCount: 1 }),
+    { page: 0, signature: "" },
+    () => "test",
+    () => {},
+  );
+
+  render({
+    status: "available",
+    recent: [{
+      observedAt: "Aug 16, 11:33 AM EDT",
+      previousCacheReadTokens: 207_616,
+      currentCacheReadTokens: 6_912,
+      lostCacheTokens: 200_704,
+      estimatedPremiumUsd: 0.9,
+    }],
+  });
+
+  assert.equal(disclosure.hidden, false);
+  assert.deepEqual(
+    rows.children[0].children.map((cell) => cell.getAttribute("data-label")),
+    [
+      "translated:accounting.cacheSwitch.column.localTime",
+      "translated:accounting.cacheSwitch.column.change",
+      "translated:accounting.cacheSwitch.column.cacheRead",
+      "translated:accounting.cacheSwitch.column.lostTokens",
+      "translated:accounting.cacheSwitch.column.apiEquivalent",
+    ],
+  );
+});
+
 test("accounting tables page ten rows and reset for a changed set", async () => {
   const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const start = source.indexOf("const CACHE_IMPACT_TABLE_PAGE_SIZE = 10;");

@@ -7656,6 +7656,12 @@ function renderCacheImpactPagination(prefix, state, page) {
   if (next) next.disabled = state.page >= page.pageCount - 1;
 }
 
+function cacheSwitchDataCell(className, value, labelKey) {
+  const cell = rawNode("td", className, value);
+  cell.setAttribute("data-label", t(labelKey));
+  return cell;
+}
+
 function renderAccountingCacheSwitchDetails(impact) {
   const disclosure = $("#cache-switch-details");
   const rows = $("#cache-switch-rows");
@@ -7698,20 +7704,32 @@ function renderAccountingCacheSwitchDetails(impact) {
   for (const item of page.rows) {
     const row = node("tr");
     row.append(
-      rawNode("td", "", formatLocal(item.observedAt)),
-      rawNode("td", "cache-switch-change", cacheSwitchChangeDescription(item)),
-      rawNode(
-        "td",
+      cacheSwitchDataCell(
+        "",
+        formatLocal(item.observedAt),
+        "accounting.cacheSwitch.column.localTime",
+      ),
+      cacheSwitchDataCell(
+        "cache-switch-change",
+        cacheSwitchChangeDescription(item),
+        "accounting.cacheSwitch.column.change",
+      ),
+      cacheSwitchDataCell(
         "numeric-cell",
         `${formatCount(item.previousCacheReadTokens)} → ${formatCount(item.currentCacheReadTokens)}`,
+        "accounting.cacheSwitch.column.cacheRead",
       ),
-      rawNode("td", "numeric-cell", formatCount(item.lostCacheTokens)),
-      rawNode(
-        "td",
+      cacheSwitchDataCell(
+        "numeric-cell",
+        formatCount(item.lostCacheTokens),
+        "accounting.cacheSwitch.column.lostTokens",
+      ),
+      cacheSwitchDataCell(
         "model-api-equivalent",
         item.estimatedPremiumUsd === null
           ? "—"
           : formatApiMoney(item.estimatedPremiumUsd),
+        "accounting.cacheSwitch.column.apiEquivalent",
       ),
     );
     rows.append(row);
