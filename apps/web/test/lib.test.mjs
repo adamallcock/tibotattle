@@ -89,9 +89,11 @@ import {
   finite,
   formatChartTimestamp,
   formatLocal,
+  formatNumber,
   formatReportingTime,
   formatTimeZoneLabel,
   formatUtcCalendarDay,
+  numberFormatter,
   REPORTING_TIME_ZONE,
   reportingCalendarParts,
   selectAvailableAccountingPeriod,
@@ -7671,6 +7673,11 @@ test("a posted results card can carry only fixed copy and formatted figures", as
       "card.trendEmptyDetail",
       "card.trendLabel.toLocaleUpperCase(localization.locale())",
       "card.versionLabel",
+      // The plot's marker key, composed in `buildShareCard` from the chart's
+      // own series labels and frozen onto `card.trendLegend` (2026-08-19):
+      // the outlined short-observation marker is a claim about evidence the
+      // picture could not otherwise explain.
+      "entry.label",
       "formatMoney(value, axisDigits)",
       "line",
       "plan",
@@ -7956,6 +7963,158 @@ test("a posted results card can carry only fixed copy and formatted figures", as
     /renderWeeklyTable\(values\);\s*\n[\s\S]{0,640}?renderShareCard\(data, \{ history \}\);\s*\n\}/u,
   );
   assert.doesNotMatch(appSource, /renderShareCard\(dashboard\);/u);
+});
+
+/**
+ * The plotted-history helpers in isolation, with the same two formatters and
+ * the real catalogue behind them, so the strings asserted here are the ones a
+ * reader gets.
+ */
+async function loadShareCardTrendHelpers() {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const section = shareCardSource(appSource);
+  const helper = (name) => {
+    const match = section.match(
+      new RegExp(`function ${name}\\([\\s\\S]*?\\n\\}`, "u"),
+    );
+    assert.ok(match, `${name} is available`);
+    return match[0];
+  };
+  const names = [
+    "shareCardTrend",
+    "shareCardTrendLegend",
+    "shareCardTrendShortText",
+  ];
+  return Function(
+    "finite",
+    "t",
+    "tPlural",
+    "formatDecimal",
+    "formatNumber",
+    `${names.map(helper).join("\n")}\nreturn { ${names.join(", ")} };`,
+  )(
+    finite,
+    (key, values) => translate(key, values),
+    (key, count, values) => translatePlural(key, count, values),
+    (value, digits = 0) => numberFormatter({
+      maximumFractionDigits: digits,
+      minimumFractionDigits: digits,
+    }).format(value),
+    formatNumber,
+  );
+}
+
+function shareCardTrendHistory(shortSpans) {
+  return {
+    points: shortSpans.map((short, index) => ({
+      at: Date.parse(`2026-08-1${index + 2}T00:00:00.000Z`),
+      dateLabel: `Aug 1${index + 2}, 2026`,
+      value: 1_900 + index,
+      low: 1_800,
+      high: 2_000,
+      historicalMedian: 1_874,
+      acrossResetLow: 1_541,
+      acrossResetHigh: 2_432,
+      wellObserved: !short,
+    })),
+    axis: { low: 1_000, high: 3_000, ticks: [1_000, 2_000, 3_000] },
+    xTicks: [],
+    totalCount: 31,
+    spanFloorPp: 0,
+    wellObservedFloorPp: 50,
+    rangeDays: 7,
+  };
+}
+
+test("a posted card explains its outlined marker, or draws none", async () => {
+  const {
+    shareCardTrend,
+    shareCardTrendLegend,
+    shareCardTrendShortText,
+  } = await loadShareCardTrendHelpers();
+
+  // A short observation only reaches the plot because a range of seven days
+  // or less relaxes the inclusion floor to zero. The classification floor it
+  // failed is a different number, and it is the one the key must name.
+  const mixed = shareCardTrend(shareCardTrendHistory([true, false, false]));
+  assert.equal(mixed.count, 3);
+  assert.equal(mixed.shortCount, 1);
+  assert.equal(mixed.spanFloorPp, 0);
+  assert.equal(mixed.wellObservedFloorPp, 50);
+
+  const legend = shareCardTrendLegend(mixed);
+  assert.deepEqual(legend.map((entry) => entry.filled), [true, false]);
+  assert.equal(legend[0].label, translate("weekly.series.wellObserved", { span: "50" }));
+  assert.match(legend[0].label, /50/u);
+  assert.equal(legend[1].label, translate("weekly.series.shortObservation"));
+  assert.ok(Object.isFrozen(legend) && legend.every((entry) => Object.isFrozen(entry)));
+
+  // The text transcript is the only card a screen reader or a text-only post
+  // gets, so the difference the picture draws is stated there too.
+  const sentence = shareCardTrendShortText({ trend: mixed });
+  assert.match(sentence, /1 of these is a short observation/u);
+  assert.match(sentence, /outlined marker/u);
+  assert.equal(
+    shareCardTrendShortText({ trend: { ...mixed, shortCount: 2 } }),
+    translatePlural("share.text.shortObservation", 2, { count: "2" }),
+  );
+
+  // The common card draws no key and claims nothing: every plotted fit
+  // carries the filled marker, so there is no difference to explain.
+  const clean = shareCardTrend(shareCardTrendHistory([false, false]));
+  assert.equal(clean.shortCount, 0);
+  assert.deepEqual(shareCardTrendLegend(clean), []);
+  assert.equal(shareCardTrendShortText({ trend: clean }), "");
+  assert.deepEqual(shareCardTrendLegend(null), []);
+  assert.equal(shareCardTrendShortText({ trend: null }), "");
+
+  // A slider left at zero classifies nothing as short, but a fit with no
+  // recorded span is still never promoted, so the key names the honest
+  // all-spans series rather than a "0+ pp" threshold nobody set.
+  const unfloored = shareCardTrend({
+    ...shareCardTrendHistory([true, false]),
+    wellObservedFloorPp: 0,
+  });
+  assert.equal(
+    shareCardTrendLegend(unfloored)[0].label,
+    translate("weekly.series.allSpans"),
+  );
+
+  // Every locale carries both forms, and both count the fits they describe.
+  const entry = WEB_PLURAL_MESSAGES["share.text.shortObservation"];
+  assert.ok(entry, "the short-observation sentence is catalogued");
+  for (const form of ["one", "other"]) {
+    assert.equal(entry[form].length, SUPPORTED_LOCALES.length);
+    for (const message of entry[form]) assert.ok(message.includes("{count}"));
+  }
+});
+
+test("the posted card's marker key is drawn by the same calls as its points", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const section = shareCardSource(appSource);
+
+  // One palette, two draw sites: a key painted from its own colours could
+  // drift from the markers it explains without any test noticing.
+  assert.match(section, /context\.fillStyle = point\.wellObserved \? "#315f84" : "#fffef9";/u);
+  assert.match(section, /context\.fillStyle = entry\.filled \? "#315f84" : "#fffef9";/u);
+  assert.equal(section.match(/#a9492f/gu).length, 2);
+  assert.equal(section.match(/context\.arc\([^\n]*4\.5, 0, Math\.PI \* 2\);/gu).length, 2);
+
+  // The key is drawn only when the model composed one, and it restores the
+  // canvas state the axis labels below it inherit.
+  assert.match(
+    section,
+    /if \(card\.trendLegend\.length > 0\) \{\s*\n\s*context\.save\(\);[\s\S]*?context\.restore\(\);\s*\n\s*\}/u,
+  );
+  assert.match(section, /trendLegend: shareCardTrendLegend\(trend\),/u);
+  // The transcript line joins the composed card text, where an empty string
+  // is dropped by the existing filter.
+  assert.match(section, /figures,\s*\n\s*shareCardTrendText\(card\),\s*\n\s*shareCardTrendShortText\(card\),/u);
+
+  // The classification floor travels with the shared history model rather
+  // than being read from the slider at paint time.
+  assert.match(appSource, /wellObservedFloorPp: activeWeeklyMinimumObservedSpanPp,/u);
+  assert.match(section, /wellObservedFloorPp: finite\(history\?\.wellObservedFloorPp, 0\),/u);
 });
 
 test("the posted allowance graph uses the exact history model from the dashboard", async () => {

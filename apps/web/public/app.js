@@ -1962,6 +1962,13 @@ function shareCardTrend(history) {
     }),
     xTicks: Object.freeze([...(history?.xTicks ?? [])]),
     count: points.length,
+    // How many plotted fits carry the outlined short-observation marker, and
+    // the floor that classified them. The outline is a claim about evidence
+    // quality that the picture cannot explain on its own, so the key beside
+    // the plot and the transcript's sentence both read these instead of
+    // re-deriving a classification the dashboard already made.
+    shortCount: points.filter((point) => !point.wellObserved).length,
+    wellObservedFloorPp: finite(history?.wellObservedFloorPp, 0),
     // The population the count sentence names. The page headline counts the
     // whole corpus while the chart draws the filtered subset; the card used
     // to print only the subset count, which read as a different dataset. The
@@ -2144,6 +2151,11 @@ function buildShareCard(data, {
     // behind a five-hour or provider-reported generic allowance window.
     trend,
     trendLabel: t("share.trend.label"),
+    // The plot's marker key. The dashboard reveals its own only when a short
+    // observation is actually drawn (`#weekly-partial-legend`), and the card
+    // follows: a card whose fits are all well observed carries no key, and
+    // the labels are the chart's own, so the two surfaces say one thing.
+    trendLegend: shareCardTrendLegend(trend),
     // The count sentence mirrors the Allowance hero's phrasing: shown of
     // total, plus the range and span filter the shared model applied. A bare
     // subset count beside the page's corpus count read as two different
@@ -2192,6 +2204,33 @@ function shareCardTrendCountLabel(trend) {
 }
 
 /**
+ * The plot's two markers, named: filled for a well-observed fit, outlined for
+ * a short observation.
+ *
+ * Empty unless a short observation is actually plotted, so the common card
+ * spends no pixels explaining a marker it never draws. The branch mirrors the
+ * dashboard's own series label, so a card and the page it came from describe
+ * the same classification.
+ */
+function shareCardTrendLegend(trend) {
+  if (trend === null || trend.shortCount === 0) return Object.freeze([]);
+  return Object.freeze([
+    Object.freeze({
+      filled: true,
+      label: trend.wellObservedFloorPp > 0
+        ? t("weekly.series.wellObserved", {
+          span: formatDecimal(trend.wellObservedFloorPp, 0),
+        })
+        : t("weekly.series.allSpans"),
+    }),
+    Object.freeze({
+      filled: false,
+      label: t("weekly.series.shortObservation"),
+    }),
+  ]);
+}
+
+/**
  * The same card as a sentence, for a screen reader and for a text-only post.
  */
 function shareCardText(card) {
@@ -2211,6 +2250,7 @@ function shareCardText(card) {
     card.plan,
     figures,
     shareCardTrendText(card),
+    shareCardTrendShortText(card),
     card.caveats.join(" "),
     t("share.text.trailer", { trailer }),
     card.home === "" ? "" : t("share.text.more", { home: card.home }),
@@ -2237,6 +2277,22 @@ function shareCardTrendText(card) {
       label: card.trendLabel,
       low: formatMoney(card.trend.low, 0),
       start: card.trend.firstDateLabel,
+    });
+}
+
+/**
+ * The outlined marker, in words.
+ *
+ * The plot draws a short observation differently from a well-observed fit,
+ * and a difference a reader can see is a claim the transcript owes them.
+ * "" when every plotted fit is well observed, which is also when the image
+ * draws no key.
+ */
+function shareCardTrendShortText(card) {
+  return card.trend === null || card.trend.shortCount === 0
+    ? ""
+    : tPlural("share.text.shortObservation", card.trend.shortCount, {
+      count: formatNumber(card.trend.shortCount),
     });
 }
 
@@ -2496,6 +2552,39 @@ function drawShareCardTrend(context, card, x, y, width, height) {
   context.textAlign = "left";
   context.font = shareCardFont(700, 13);
   context.fillText(yAxisLabel, plotLeft, y + 22);
+
+  // The marker key shares that strip, right-aligned to the plot's right edge:
+  // the panel's top padding is already reserved and the axis label leaves it
+  // free. Each swatch is drawn by the same two calls the points are, at the
+  // same radius, so the key cannot drift from what it explains.
+  if (card.trendLegend.length > 0) {
+    context.save();
+    context.font = shareCardFont(600, 13);
+    const swatch = 9;
+    const gap = 7;
+    const between = 18;
+    const widths = card.trendLegend.map((entry) =>
+      swatch + gap + context.measureText(entry.label).width);
+    let cursor = plotRight - widths.reduce(
+      (total, width) => total + width + between,
+      -between,
+    );
+    card.trendLegend.forEach((entry, index) => {
+      context.fillStyle = entry.filled ? "#315f84" : "#fffef9";
+      context.beginPath();
+      context.arc(cursor + swatch / 2, y + 17, 4.5, 0, Math.PI * 2);
+      context.fill();
+      if (!entry.filled) {
+        context.strokeStyle = "#a9492f";
+        context.lineWidth = 2.4;
+        context.stroke();
+      }
+      context.fillStyle = "#65706b";
+      context.fillText(entry.label, cursor + swatch + gap, y + 22);
+      cursor += widths[index] + between;
+    });
+    context.restore();
+  }
 
   for (const tick of xTicks) {
     // SVG uses `middle`; Canvas uses the equivalent `center` value.
@@ -6159,6 +6248,13 @@ function allowanceHistoryChartModel(data, {
     totalCount: allPoints.length,
     inRangeCount: inRange.length,
     spanFloorPp,
+    // The floor `wellObserved` classified against, which a relaxed range
+    // leaves above `spanFloorPp`: the inclusion filter and the marker split
+    // are two different decisions, and a surface that named the applied floor
+    // beside an outlined point would explain the outline with the wrong
+    // number. It travels with the model so the card can name it without
+    // reading the slider itself.
+    wellObservedFloorPp: activeWeeklyMinimumObservedSpanPp,
     rangeDays: boundedRangeDays,
     anchorAt: latestObservedAt,
   });
