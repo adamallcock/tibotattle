@@ -28,6 +28,65 @@ const BINDING_MANIFEST_PATH = join(
 const BINDING_PROVENANCE_CONTRACT_VERSION = "windows-binding-provenance-v1";
 const BINDING_PROVENANCE_STATUS = "unqualified";
 const BINDING_PROVENANCE_SOURCE = "unsigned-development-binding";
+const WINDOWS_REQUIRED_METHODS = Object.freeze([
+  "inspectPath",
+  "ensureDirectory",
+  "readFile",
+  "readFileBounded",
+  "createFile",
+  "deleteFile",
+  "replaceFile",
+  "inspectProtectedChild",
+  "readProtectedChild",
+  "createProtectedChild",
+  "deleteProtectedChild",
+  "replaceProtectedChild",
+  "acquireSqliteStateLease",
+  "releaseSqliteStateLease",
+  "acquireCredentialAuditFileGuard",
+  "releaseCredentialAuditFileGuard",
+  "acquireCredentialMutex",
+  "releaseCredentialMutex",
+  "acquireCompanionInstanceMutex",
+  "releaseCompanionInstanceMutex",
+  "inspectPreparedChild",
+  "ensurePreparedDirectory",
+  "enumeratePreparedDirectory",
+  "removePreparedDirectory",
+  "renamePreparedDirectory",
+  "createPreparedFile",
+  "readPreparedFile",
+  "deletePreparedFile",
+  "publishPreparedFile",
+]);
+const WINDOWS_NATIVE_MANIFEST_KEYS = Object.freeze([
+  "schemaVersion",
+  "bindingFile",
+  "platform",
+  "architecture",
+  "bytes",
+  "sha256",
+  "contractVersion",
+  "securityContractVersion",
+  "credentialAuditFileGuardContractVersion",
+  "sqliteStateLeaseContractVersion",
+  "credentialMutexContractVersion",
+  "companionInstanceMutexContractVersion",
+  "preparedArtifactContractVersion",
+  "requiredMethods",
+  "nativeClaims",
+  "approvedPolicy",
+  "bindingProvenance",
+]);
+const WINDOWS_NATIVE_CLAIM_KEYS = Object.freeze([
+  "productionSafe",
+  "pathWalkRaceSafe",
+  "credentialMutexSafe",
+  "companionInstanceMutexSafe",
+  "credentialAuditFileGuardSafe",
+  "sqliteStateLeaseSafe",
+  "preparedArtifactSafe",
+]);
 const FILESYSTEM_SECURITY_TEST_FILE = /^windows-(?:filesystem|security)(?:-[a-z0-9-]+)?\.test\.(?:js|mjs)$/u;
 const CREDENTIAL_TEST_FILE = /^windows-(?:credential|production-credential)(?:-[a-z0-9-]+)?\.test\.(?:js|mjs)$/u;
 const QUALIFICATION_TEST_FILES = Object.freeze([
@@ -45,8 +104,10 @@ const QUALIFICATION_TEST_FILES = Object.freeze([
   "test/windows-filesystem-native-contract.test.js",
   "test/windows-filesystem-companion-instance-lease.test.js",
   "test/windows-filesystem-security.test.js",
+  "test/windows-filesystem-prepared-artifact-native.test.js",
   "test/windows-security-consumer-composition.test.js",
   "test/windows-sqlite-state-session-native.test.js",
+  "test/claude-callback-windows-native.test.js",
   "test/windows-path-contract.test.js",
   "test/windows-qualification-governance.test.js",
   "test/windows-skip-ledger.test.js",
@@ -89,9 +150,17 @@ export async function readVerifiedBindingManifest({
     throw fixedError(FIXED_STATUS.manifestMissing);
   }
   const bindingProvenance = manifest?.bindingProvenance;
+  const exactKeys = (value, keys) => value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.keys(value).length === keys.length
+    && keys.every((key) => Object.hasOwn(value, key));
+  const exactBooleanClaims = (value) => exactKeys(value, WINDOWS_NATIVE_CLAIM_KEYS)
+    && WINDOWS_NATIVE_CLAIM_KEYS.every((key) => typeof value[key] === "boolean");
   const valid = manifest
     && typeof manifest === "object"
     && !Array.isArray(manifest)
+    && exactKeys(manifest, WINDOWS_NATIVE_MANIFEST_KEYS)
     && manifest.schemaVersion === "windows-filesystem-binding-manifest-v1"
     && manifest.bindingFile === "windows_filesystem.node"
     && manifest.platform === "win32"
@@ -100,12 +169,15 @@ export async function readVerifiedBindingManifest({
     && manifest.bytes > 0
     && typeof manifest.sha256 === "string"
     && /^[0-9a-f]{64}$/u.test(manifest.sha256)
+    && manifest.contractVersion === "windows-filesystem-v1"
+    && manifest.securityContractVersion === "windows-filesystem-security-v1"
     && manifest.approvedPolicy?.productionSafe === false
     && manifest.approvedPolicy?.pathWalkRaceSafe === false
     && manifest.approvedPolicy?.credentialMutexSafe === true
     && manifest.approvedPolicy?.companionInstanceMutexSafe === false
     && manifest.approvedPolicy?.credentialAuditFileGuardSafe === true
     && manifest.approvedPolicy?.sqliteStateLeaseSafe === false
+    && manifest.approvedPolicy?.preparedArtifactSafe === false
     && manifest.nativeClaims?.credentialAuditFileGuardSafe === true
     && manifest.nativeClaims?.companionInstanceMutexSafe === false
     && manifest.nativeClaims?.sqliteStateLeaseSafe === false
@@ -115,6 +187,21 @@ export async function readVerifiedBindingManifest({
     && manifest.companionInstanceMutexContractVersion
       === "windows-companion-instance-mutex-v1"
     && manifest.sqliteStateLeaseContractVersion === "windows-sqlite-state-lease-v1"
+    && manifest.preparedArtifactContractVersion === "windows-prepared-artifact-v1"
+    && Array.isArray(manifest.requiredMethods)
+    && manifest.requiredMethods.length === WINDOWS_REQUIRED_METHODS.length
+    && manifest.requiredMethods.every((method, index) => method === WINDOWS_REQUIRED_METHODS[index])
+    && exactBooleanClaims(manifest.nativeClaims)
+    && exactBooleanClaims(manifest.approvedPolicy)
+    && manifest.nativeClaims.productionSafe === false
+    && manifest.nativeClaims.pathWalkRaceSafe === false
+    && manifest.nativeClaims.credentialMutexSafe === true
+    && manifest.nativeClaims.companionInstanceMutexSafe === false
+    && manifest.nativeClaims.credentialAuditFileGuardSafe === true
+    && manifest.nativeClaims.sqliteStateLeaseSafe === false
+    && manifest.nativeClaims.preparedArtifactSafe === false
+    && WINDOWS_NATIVE_CLAIM_KEYS.every((key) =>
+      manifest.nativeClaims[key] === manifest.approvedPolicy[key])
     && bindingProvenance !== null
     && typeof bindingProvenance === "object"
     && !Array.isArray(bindingProvenance)
