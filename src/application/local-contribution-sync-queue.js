@@ -35,6 +35,7 @@ const MAXIMUM_RESERVED_UPLOAD_BYTES_PER_PASS = 256 * 1024 * 1024;
 const ACCEPTED_ARTIFACT_MAXIMUM_AGE_DAYS = 7;
 const ACCEPTED_ARTIFACT_MAXIMUM_RETAINED_SETS = 8;
 const ACCEPTED_ARTIFACT_MAXIMUM_RETIREMENTS_PER_PASS = 16;
+const SUPERSEDED_PENDING_MAXIMUM_RETIREMENTS_PER_PASS = 16;
 const RESERVED_UPLOAD_ENVELOPE_OVERHEAD_BYTES = 8 * 1024;
 const MINIMUM_WATCH_INTERVAL_SECONDS = 30;
 const MAXIMUM_WATCH_INTERVAL_SECONDS = 3600;
@@ -317,6 +318,134 @@ async function retireAcceptedContributionArtifacts({
       }]);
       await failpoint("before_queue_compaction", context);
       const removed = repository.deleteAcceptedSet(row.prepared_set_id);
+      if (removed.changes !== Number(row.total_jobs)) {
+        fail("retirement_invalid");
+      }
+      retiredSets += 1;
+      retiredJobs += removed.changes;
+      await failpoint("after_queue_compaction", context);
+    }
+    return Object.freeze({
+      retiredSets,
+      retiredJobs,
+      interrupted: signal?.aborted === true,
+      networkActivity: false,
+    });
+  } finally {
+    repository.close();
+  }
+}
+
+/**
+ * Retire pending prepared sets that a newer consent model has superseded.
+ *
+ * The v0.1 prepared-set queue drains only through its own delivery
+ * schedulers; on a Mac whose uploads ride the v1.0 incremental consent those
+ * schedulers never run, so every still-pending v0.1 set is disk and queue
+ * weight that can never deliver (observed live 2026-08-19: a 70-file
+ * pre-consent set plus the ceremony set, pending forever). The caller gates
+ * this pass on that superseding consent being approved and current.
+ *
+ * Two retentions are deliberate. The set holding the earliest still-
+ * deliverable job is always kept: the exact review reads exactly that job,
+ * so that set is the real instance the local approve-once consent was
+ * granted against — the same provenance role the accepted-retirement pass
+ * protects. And any set with an accepted, in-flight, or rejected job is left
+ * alone: accepted rows are the page's upload-authority evidence and belong
+ * to the accepted pass.
+ *
+ * Crash ordering matches the accepted pass: artifacts are removed before
+ * queue rows, so a crash can leave rows whose set is gone — the next pass
+ * deletes them, and discovery can never re-queue a set whose files no longer
+ * exist — but never a still-present set without its dedupe rows.
+ */
+async function retireSupersededPendingContributionArtifacts({
+  preparedSpoolDirectory,
+  reviewArchiveDirectory,
+  queueFile = undefined,
+  protectedPreparedSetIds = [],
+  maximumRetirements =
+    SUPERSEDED_PENDING_MAXIMUM_RETIREMENTS_PER_PASS,
+  now = () => new Date(),
+  signal = undefined,
+  failpoint = async () => {},
+} = {}, runtime) {
+  if (!Array.isArray(protectedPreparedSetIds)
+      || protectedPreparedSetIds.length > 8
+      || protectedPreparedSetIds.some((value) => !SHA256.test(value))
+      || new Set(protectedPreparedSetIds).size
+        !== protectedPreparedSetIds.length
+      || !integer(maximumRetirements, 1, 64)
+      || typeof failpoint !== "function"
+      || (signal !== undefined && !(signal instanceof AbortSignal))) {
+    fail("configuration_invalid");
+  }
+  const preparedRoot = await Reflect.apply(
+    runtime.storage.prepareRetentionRoot,
+    undefined,
+    [preparedSpoolDirectory],
+  );
+  const reviewRoot = await Reflect.apply(
+    runtime.storage.prepareRetentionRoot,
+    undefined,
+    [reviewArchiveDirectory],
+  );
+  const selectedQueueFile = queueFile
+    ?? defaultContributionSyncQueueFile(runtime);
+  const repository = await openQueueRepository(selectedQueueFile, now, runtime);
+  try {
+    if (signal?.aborted) {
+      return Object.freeze({
+        retiredSets: 0,
+        retiredJobs: 0,
+        interrupted: true,
+        networkActivity: false,
+      });
+    }
+    // One extra row beyond the bound and the protections, so a full page of
+    // protected sets can never starve the candidates behind them.
+    const queryLimit = maximumRetirements
+      + protectedPreparedSetIds.length
+      + 1;
+    const rows = repository.inactivePendingSets(queryLimit);
+    const protectedIds = new Set(protectedPreparedSetIds);
+    const firstReviewSetId = repository.oldestPreparedSetId();
+    const candidates = rows.filter((row) => (
+      row.prepared_set_id !== firstReviewSetId
+      && !protectedIds.has(row.prepared_set_id)
+    )).slice(0, maximumRetirements);
+    let retiredSets = 0;
+    let retiredJobs = 0;
+    for (const row of candidates) {
+      if (signal?.aborted) break;
+      if (!SHA256.test(row.prepared_set_id)
+          || !SET_NAME.test(row.set_name)
+          || !integer(Number(row.total_jobs), 1, MAX_QUEUE_JOBS)
+          || iso(row.enqueued_at) !== row.enqueued_at) {
+        fail("retirement_invalid");
+      }
+      const suffix = row.set_name.slice("prepared-set-".length);
+      const reviewName = `review-${suffix}`;
+      if (!REVIEW_NAME.test(reviewName)) fail("retirement_invalid");
+      const context = Object.freeze({
+        preparedSetId: row.prepared_set_id,
+        setName: row.set_name,
+        reviewName,
+      });
+      await failpoint("before_artifact_retirement", context);
+      await Reflect.apply(runtime.storage.retireFlatDirectory, undefined, [{
+        root: preparedRoot,
+        name: row.set_name,
+        maximumEntries: 128,
+      }]);
+      await failpoint("after_prepared_retirement", context);
+      await Reflect.apply(runtime.storage.retireFlatDirectory, undefined, [{
+        root: reviewRoot,
+        name: reviewName,
+        maximumEntries: 4,
+      }]);
+      await failpoint("before_queue_compaction", context);
+      const removed = repository.deleteInactiveSet(row.prepared_set_id);
       if (removed.changes !== Number(row.total_jobs)) {
         fail("retirement_invalid");
       }
@@ -1100,6 +1229,7 @@ export function createLocalContributionSyncQueueContext({
     ACCEPTED_ARTIFACT_MAXIMUM_AGE_DAYS,
     ACCEPTED_ARTIFACT_MAXIMUM_RETAINED_SETS,
     ACCEPTED_ARTIFACT_MAXIMUM_RETIREMENTS_PER_PASS,
+    SUPERSEDED_PENDING_MAXIMUM_RETIREMENTS_PER_PASS,
     CONTRIBUTION_SYNC_EXACT_REVIEW_SCHEMA,
     CONTRIBUTION_SYNC_PREVIEW_SCHEMA,
     CONTRIBUTION_SYNC_QUEUE_LIMITS,
@@ -1120,6 +1250,8 @@ export function createLocalContributionSyncQueueContext({
       inspectNextContributionSyncUpload(options, runtime),
     retireAcceptedContributionArtifacts: (options) =>
       retireAcceptedContributionArtifacts(options, runtime),
+    retireSupersededPendingContributionArtifacts: (options) =>
+      retireSupersededPendingContributionArtifacts(options, runtime),
     runContributionSyncQueueOnce: (options) =>
       runContributionSyncQueueOnce(options, runtime),
     runContributionSyncQueueWatch: (options) =>

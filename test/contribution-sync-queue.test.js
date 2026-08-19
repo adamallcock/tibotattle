@@ -23,6 +23,7 @@ import {
   inspectNextContributionSyncUpload,
   RETRY_BACKOFF_POLICY,
   retireAcceptedContributionArtifacts,
+  retireSupersededPendingContributionArtifacts,
   runContributionSyncQueueOnce,
   runContributionSyncQueueWatch,
   setContributionSyncPaused,
@@ -1308,6 +1309,219 @@ test("bounded retirement eventually compacts accepted sets beyond one query wind
     1,
   );
   finalDatabase.close();
+});
+
+// Superseded-pending fixture: sets are created and enqueued one at a time
+// with an advancing clock, because the first-review protection is derived
+// from enqueue order — every set enqueued in one preview pass would share
+// one created_at.
+async function supersededFixture(definitions) {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-superseded-"));
+  const preparedRoot = join(root, "prepared");
+  const reviewRoot = join(root, "reviews");
+  const privateRoot = join(root, "private");
+  await mkdir(preparedRoot, { mode: 0o700 });
+  await mkdir(reviewRoot, { mode: 0o700 });
+  await mkdir(privateRoot, { mode: 0o700 });
+  const queueFile = join(privateRoot, "sync.sqlite3");
+  let tick = Date.parse("2026-08-06T23:00:00.000Z");
+  const sets = {};
+  for (const [key, uuid, index] of definitions) {
+    const setName = `prepared-set-${uuid}`;
+    const prepared = await createPreparedSet(preparedRoot, { setName, index });
+    await createReviewForPreparedSet(reviewRoot, setName);
+    const enqueuedAt = tick;
+    const preview = await inspectNextContributionSyncUpload({
+      directory: preparedRoot,
+      queueFile,
+      now: () => new Date(enqueuedAt),
+    });
+    assert.equal(preview.state, "ready");
+    tick += 60_000;
+    sets[key] = {
+      setName,
+      preparedSetId: preparedContributionSetId(prepared.manifest),
+    };
+  }
+  return { root, preparedRoot, reviewRoot, queueFile, sets };
+}
+
+test("superseded pending retirement keeps the first-review provenance and is crash-resumable", async () => {
+  const value = await supersededFixture([
+    ["ceremony", "00000000-0000-4000-8000-000000000031", 31],
+    ["strandedA", "00000000-0000-4000-8000-000000000032", 32],
+    ["strandedB", "00000000-0000-4000-8000-000000000033", 33],
+  ]);
+  const { preparedRoot, reviewRoot, queueFile, sets } = value;
+
+  await assert.rejects(
+    retireSupersededPendingContributionArtifacts({
+      preparedSpoolDirectory: preparedRoot,
+      reviewArchiveDirectory: reviewRoot,
+      queueFile,
+      failpoint: async (name, context) => {
+        if (name === "after_prepared_retirement"
+            && context.preparedSetId === sets.strandedA.preparedSetId) {
+          throw new Error("simulated retirement crash");
+        }
+      },
+    }),
+    /simulated retirement crash/u,
+  );
+  // The crash left rows whose prepared directory is gone. The preview stays
+  // healthy through the window because the protected first-review job still
+  // sorts first, and discovery can never re-queue the removed files.
+  await assert.rejects(
+    lstat(join(preparedRoot, sets.strandedA.setName)),
+    (error) => error?.code === "ENOENT",
+  );
+  let database = new DatabaseSync(queueFile, { readOnly: true });
+  assert.equal(
+    database.prepare(`
+      SELECT COUNT(*) AS count
+        FROM contribution_jobs
+       WHERE prepared_set_id = ?
+    `).get(sets.strandedA.preparedSetId).count,
+    1,
+  );
+  database.close();
+  const crashedPreview = await inspectNextContributionSyncUpload({
+    directory: preparedRoot,
+    queueFile,
+    now: () => new Date("2026-08-07T00:00:00.000Z"),
+  });
+  assert.equal(crashedPreview.state, "ready");
+
+  const resumed = await retireSupersededPendingContributionArtifacts({
+    preparedSpoolDirectory: preparedRoot,
+    reviewArchiveDirectory: reviewRoot,
+    queueFile,
+  });
+  assert.equal(resumed.retiredSets, 2);
+  assert.equal(resumed.retiredJobs, 2);
+  assert.deepEqual(await readdir(preparedRoot), [sets.ceremony.setName]);
+  assert.deepEqual(await readdir(reviewRoot), [
+    sets.ceremony.setName.replace("prepared-set-", "review-"),
+  ]);
+  database = new DatabaseSync(queueFile, { readOnly: true });
+  assert.deepEqual(
+    database.prepare(`
+      SELECT prepared_set_id, state FROM contribution_jobs
+    `).all().map((row) => ({ ...row })),
+    [{ prepared_set_id: sets.ceremony.preparedSetId, state: "pending" }],
+  );
+  database.close();
+
+  // Converged installs stay converged: repeated passes retire nothing, and
+  // the retained provenance still previews for a later consent ceremony.
+  const idle = await retireSupersededPendingContributionArtifacts({
+    preparedSpoolDirectory: preparedRoot,
+    reviewArchiveDirectory: reviewRoot,
+    queueFile,
+  });
+  assert.equal(idle.retiredSets, 0);
+  assert.equal(idle.retiredJobs, 0);
+  const preview = await inspectNextContributionSyncUpload({
+    directory: preparedRoot,
+    queueFile,
+    now: () => new Date("2026-08-07T01:00:00.000Z"),
+  });
+  assert.equal(preview.state, "ready");
+  assert.equal(preview.discoveredSets, 1);
+});
+
+test("superseded pending retirement is bounded per pass and never touches delivered or delivering sets", async () => {
+  const value = await supersededFixture([
+    ["oldest", "00000000-0000-4000-8000-000000000041", 41],
+    ["accepted", "00000000-0000-4000-8000-000000000042", 42],
+    ["inFlight", "00000000-0000-4000-8000-000000000043", 43],
+    ["rejected", "00000000-0000-4000-8000-000000000044", 44],
+    ["strandedA", "00000000-0000-4000-8000-000000000045", 45],
+    ["strandedB", "00000000-0000-4000-8000-000000000046", 46],
+    ["strandedC", "00000000-0000-4000-8000-000000000047", 47],
+  ]);
+  const { preparedRoot, reviewRoot, queueFile, sets } = value;
+  // Delivery-state surgery, exactly like the accepted-retention test: any
+  // accepted row is upload-authority evidence and any in-flight or rejected
+  // row is delivery history, so those whole sets must survive every pass.
+  let database = new DatabaseSync(queueFile);
+  database.prepare(`
+    UPDATE contribution_jobs
+       SET state = 'accepted',
+           accepted_at = '2026-08-06T23:30:00.000Z',
+           contribution_id = ?
+     WHERE prepared_set_id = ?
+  `).run(ACCEPTED_ID, sets.accepted.preparedSetId);
+  database.prepare(`
+    UPDATE contribution_jobs SET state = 'in_flight'
+     WHERE prepared_set_id = ?
+  `).run(sets.inFlight.preparedSetId);
+  database.prepare(`
+    UPDATE contribution_jobs SET state = 'rejected'
+     WHERE prepared_set_id = ?
+  `).run(sets.rejected.preparedSetId);
+  database.close();
+
+  // Pass one: bounded to two retirements, with strandedA additionally under
+  // the caller's protection. Only strandedB and strandedC may go.
+  const first = await retireSupersededPendingContributionArtifacts({
+    preparedSpoolDirectory: preparedRoot,
+    reviewArchiveDirectory: reviewRoot,
+    queueFile,
+    protectedPreparedSetIds: [sets.strandedA.preparedSetId],
+    maximumRetirements: 2,
+  });
+  assert.equal(first.retiredSets, 2);
+  assert.equal(first.retiredJobs, 2);
+  assert.equal(
+    (await lstat(join(preparedRoot, sets.strandedA.setName))).isDirectory(),
+    true,
+  );
+
+  // Pass two: without the protection the remaining stranded set converges;
+  // the oldest set is still held back as the first-review provenance.
+  const second = await retireSupersededPendingContributionArtifacts({
+    preparedSpoolDirectory: preparedRoot,
+    reviewArchiveDirectory: reviewRoot,
+    queueFile,
+    maximumRetirements: 2,
+  });
+  assert.equal(second.retiredSets, 1);
+  assert.equal(second.retiredJobs, 1);
+  const third = await retireSupersededPendingContributionArtifacts({
+    preparedSpoolDirectory: preparedRoot,
+    reviewArchiveDirectory: reviewRoot,
+    queueFile,
+    maximumRetirements: 2,
+  });
+  assert.equal(third.retiredSets, 0);
+
+  const retainedNames = [
+    sets.oldest.setName,
+    sets.accepted.setName,
+    sets.inFlight.setName,
+    sets.rejected.setName,
+  ].sort();
+  assert.deepEqual((await readdir(preparedRoot)).sort(), retainedNames);
+  assert.deepEqual((await readdir(reviewRoot)).sort(), retainedNames.map(
+    (name) => name.replace("prepared-set-", "review-"),
+  ));
+  database = new DatabaseSync(queueFile, { readOnly: true });
+  assert.deepEqual(
+    database.prepare(`
+      SELECT state FROM contribution_jobs ORDER BY state
+    `).all().map((row) => row.state),
+    ["accepted", "in_flight", "pending", "rejected"],
+  );
+  database.close();
+  // The accepted evidence the dashboard's upload-authority claim reads from
+  // survives retirement.
+  const status = await inspectContributionSyncQueue({
+    queueFile,
+    now: () => new Date("2026-08-07T02:00:00.000Z"),
+  });
+  assert.equal(status.counts.accepted, 1);
+  assert.equal(status.lastAcceptedAt, "2026-08-06T23:30:00.000Z");
 });
 
 test("queue refuses symlinked or non-owner-only database locations", async (t) => {

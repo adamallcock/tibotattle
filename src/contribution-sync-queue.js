@@ -29,6 +29,8 @@ export const ACCEPTED_ARTIFACT_MAXIMUM_RETAINED_SETS =
   contributionSyncQueue.ACCEPTED_ARTIFACT_MAXIMUM_RETAINED_SETS;
 export const ACCEPTED_ARTIFACT_MAXIMUM_RETIREMENTS_PER_PASS =
   contributionSyncQueue.ACCEPTED_ARTIFACT_MAXIMUM_RETIREMENTS_PER_PASS;
+export const SUPERSEDED_PENDING_MAXIMUM_RETIREMENTS_PER_PASS =
+  contributionSyncQueue.SUPERSEDED_PENDING_MAXIMUM_RETIREMENTS_PER_PASS;
 export const CONTRIBUTION_SYNC_EXACT_REVIEW_SCHEMA =
   contributionSyncQueue.CONTRIBUTION_SYNC_EXACT_REVIEW_SCHEMA;
 export const CONTRIBUTION_SYNC_PREVIEW_SCHEMA =
@@ -57,6 +59,8 @@ export const inspectNextContributionSyncUpload =
   contributionSyncQueue.inspectNextContributionSyncUpload;
 export const retireAcceptedContributionArtifacts =
   contributionSyncQueue.retireAcceptedContributionArtifacts;
+export const retireSupersededPendingContributionArtifacts =
+  contributionSyncQueue.retireSupersededPendingContributionArtifacts;
 export const runContributionSyncQueueOnce =
   contributionSyncQueue.runContributionSyncQueueOnce;
 export const runContributionSyncQueueWatch =
