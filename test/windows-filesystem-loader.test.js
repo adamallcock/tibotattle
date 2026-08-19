@@ -38,6 +38,7 @@ function manifest(overrides = {}) {
     sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
     companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
+    preparedArtifactContractVersion: "windows-prepared-artifact-v1",
     requiredMethods: [...WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS],
     nativeClaims: {
       productionSafe: false,
@@ -46,6 +47,7 @@ function manifest(overrides = {}) {
       companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
       sqliteStateLeaseSafe: false,
+      preparedArtifactSafe: false,
     },
     approvedPolicy: {
       productionSafe: false,
@@ -54,6 +56,7 @@ function manifest(overrides = {}) {
       companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
       sqliteStateLeaseSafe: false,
+      preparedArtifactSafe: false,
     },
     bindingProvenance: {
       contractVersion: "windows-binding-provenance-v1",
@@ -72,12 +75,14 @@ function binding(overrides = {}) {
     sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
     companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
+    preparedArtifactContractVersion: "windows-prepared-artifact-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
     credentialAuditFileGuardSafe: true,
     sqliteStateLeaseSafe: false,
     companionInstanceMutexSafe: false,
+    preparedArtifactSafe: false,
     inspectPath: () => ({ identity: IDENTITY }),
     ensureDirectory: () => IDENTITY,
     readFile: () => ({ data: Buffer.from("data"), identity: IDENTITY }),
@@ -90,6 +95,15 @@ function binding(overrides = {}) {
     createProtectedChild: () => IDENTITY,
     deleteProtectedChild: () => ({ deleted: true, identity: IDENTITY }),
     replaceProtectedChild: () => IDENTITY,
+    inspectPreparedChild: () => ({ identity: IDENTITY }),
+    ensurePreparedDirectory: () => IDENTITY,
+    enumeratePreparedDirectory: () => [],
+    removePreparedDirectory: () => ({ removed: true, identity: IDENTITY }),
+    renamePreparedDirectory: () => ({ renamed: true, identity: IDENTITY }),
+    createPreparedFile: () => IDENTITY,
+    readPreparedFile: () => ({ data: Buffer.from("data"), identity: IDENTITY }),
+    deletePreparedFile: () => ({ deleted: true, identity: IDENTITY }),
+    publishPreparedFile: () => ({ published: true, identity: IDENTITY }),
     acquireCredentialMutex: () => ({ lease: {}, abandoned: false }),
     releaseCredentialMutex: () => {},
     acquireCompanionInstanceMutex: () => ({ lease: {}, abandoned: false }),
@@ -235,6 +249,32 @@ test("Windows native loader rejects a stale sidecar before loading an older bind
   assert.equal(required, false);
 });
 
+test("Windows native loader rejects a sidecar missing a prepared method before loading", () => {
+  const bindingPath = "C:\\checkout\\native\\windows-filesystem\\build\\Release\\windows_filesystem.node";
+  const staleManifest = manifest({
+    requiredMethods: manifest().requiredMethods.filter(
+      (method) => method !== "deletePreparedFile",
+    ),
+  });
+  let required = false;
+  assert.throws(
+    () => loadWindowsFilesystemBinding({
+      platform: "win32",
+      architecture: "x64",
+      bindingPath,
+      resolveBinding: (path) => path,
+      readManifest: () => JSON.stringify(staleManifest),
+      readBindingBytes: () => BINDING_BYTES,
+      requireBinding: () => {
+        required = true;
+        return binding();
+      },
+    }),
+    (error) => error.code === "WINDOWS_FILESYSTEM_INVALID_MANIFEST",
+  );
+  assert.equal(required, false);
+});
+
 test("Windows native loader rejects malformed binding provenance before loading", () => {
   const bindingPath = "C:\\checkout\\native\\windows-filesystem\\build\\Release\\windows_filesystem.node";
   let required = false;
@@ -280,6 +320,7 @@ test("manifest policy and native claims are cross-checked before loading", () =>
           companionInstanceMutexSafe: false,
           credentialAuditFileGuardSafe: true,
           sqliteStateLeaseSafe: false,
+          preparedArtifactSafe: false,
         },
         approvedPolicy: {
           productionSafe: true,
@@ -288,6 +329,7 @@ test("manifest policy and native claims are cross-checked before loading", () =>
           companionInstanceMutexSafe: false,
           credentialAuditFileGuardSafe: true,
           sqliteStateLeaseSafe: false,
+          preparedArtifactSafe: false,
         },
         bindingProvenance: {
           contractVersion: "windows-binding-provenance-v1",
@@ -339,6 +381,7 @@ test("manifest policy and native claims are cross-checked before loading", () =>
           companionInstanceMutexSafe: false,
           credentialAuditFileGuardSafe: true,
           sqliteStateLeaseSafe: false,
+          preparedArtifactSafe: false,
         },
         approvedPolicy: {
           productionSafe: false,
@@ -347,6 +390,7 @@ test("manifest policy and native claims are cross-checked before loading", () =>
           companionInstanceMutexSafe: false,
           credentialAuditFileGuardSafe: true,
           sqliteStateLeaseSafe: false,
+          preparedArtifactSafe: false,
         },
       })),
       readBindingBytes: () => BINDING_BYTES,
@@ -386,6 +430,7 @@ test("production promotion remains blocked until a package verifier exists", () 
       companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
       sqliteStateLeaseSafe: false,
+      preparedArtifactSafe: false,
     },
     approvedPolicy: {
       productionSafe: true,
@@ -394,6 +439,7 @@ test("production promotion remains blocked until a package verifier exists", () 
       companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
       sqliteStateLeaseSafe: false,
+      preparedArtifactSafe: false,
     },
     bindingProvenance: {
       contractVersion: "windows-binding-provenance-v1",

@@ -109,6 +109,41 @@ step fails.
   The binding remains development-only until the native Windows qualification
   proves child-process contention, crash recovery, and clean reacquisition.
 
+## Prepared-artifact contract
+
+The `windows-prepared-artifact-v1` methods are a separate, still-unqualified
+surface for staged contribution and review artifacts. Every call repeats the
+absolute state-root path and its expected single-link root identity. Native
+code opens the root and each descendant with `NtCreateFile` relative to held
+handles; it rejects absolute/UNC/traversal/reserved names, reparse points,
+regular-file hard links, owner/DACL drift, and final-path changes. Directory
+enumeration is capped at 256 entries and returns only validated names, types,
+and identities. Directory removal requires the expected identity and an empty
+directory. Directory renames and staged-file publication require same-parent
+relative names and use `FileRenameInformationEx` without
+`FILE_RENAME_REPLACE_IF_EXISTS`, so an existing destination is never clobbered.
+
+Prepared files are created exclusively with an owner-only DACL, read back only
+through a validated handle, and may be explicitly removed with an expected
+identity through `deletePreparedFile`; no future caller is permitted to fall
+back to path-based JavaScript unlink. Native reads and writes use fixed 1 MiB
+chunks. The total binding ceiling is 34 MiB, which covers the current
+1,310,720-byte contribution payload and the review-bundle ceiling without an
+unbounded native allocation. File contents are flushed with
+`FlushFileBuffers` before create or publication completes. Windows has no
+portable directory-entry fsync equivalent: the binding attempts
+`FlushFileBuffers` on the held parent directory and treats the documented
+`ERROR_INVALID_HANDLE` result as the explicit metadata-durability boundary.
+Callers must retain and recover a staged directory if a process exits after a
+file deletion/rename but before the parent-directory metadata boundary can be
+observed.
+
+The native and adapter `preparedArtifactSafe` claims remain `false` until the
+Windows x64 qualification proves child-process cleanup, crash/reopen behavior,
+ancestor and destination races, size limits, ACL/hard-link rejection, and the
+supported filesystem matrix. The contract is therefore usable for adapter and
+qualification tests now, but it is not a production storage selector.
+
 The protected DACL is deliberately strict: only the current user
 SID is an allow principal. Inherited SYSTEM/Administrators/user-group allows
 are not treated as an acceptable owner-only substitute; the later production

@@ -93,6 +93,7 @@ const WINDOWS_NATIVE_MANIFEST_KEYS = Object.freeze([
   "sqliteStateLeaseContractVersion",
   "credentialMutexContractVersion",
   "companionInstanceMutexContractVersion",
+  "preparedArtifactContractVersion",
   "requiredMethods",
   "nativeClaims",
   "approvedPolicy",
@@ -119,6 +120,15 @@ const WINDOWS_REQUIRED_METHODS = Object.freeze([
   "releaseCredentialMutex",
   "acquireCompanionInstanceMutex",
   "releaseCompanionInstanceMutex",
+  "inspectPreparedChild",
+  "ensurePreparedDirectory",
+  "enumeratePreparedDirectory",
+  "removePreparedDirectory",
+  "renamePreparedDirectory",
+  "createPreparedFile",
+  "readPreparedFile",
+  "deletePreparedFile",
+  "publishPreparedFile",
 ]);
 const WINDOWS_NATIVE_CLAIM_KEYS = Object.freeze([
   "productionSafe",
@@ -127,6 +137,7 @@ const WINDOWS_NATIVE_CLAIM_KEYS = Object.freeze([
   "companionInstanceMutexSafe",
   "credentialAuditFileGuardSafe",
   "sqliteStateLeaseSafe",
+  "preparedArtifactSafe",
 ]);
 const WINDOWS_APPROVED_POLICY_KEYS = WINDOWS_NATIVE_CLAIM_KEYS;
 const MAXIMUM_WINDOWS_BINDING_BYTES = 64 * 1024 * 1024;
@@ -550,6 +561,8 @@ function validateNativeManifestShape(value) {
       || value.credentialMutexContractVersion !== "windows-credential-mutex-v1"
       || value.companionInstanceMutexContractVersion
         !== "windows-companion-instance-mutex-v1"
+      || value.preparedArtifactContractVersion
+        !== "windows-prepared-artifact-v1"
       || !Array.isArray(value.requiredMethods)
       || value.requiredMethods.length !== WINDOWS_REQUIRED_METHODS.length
       || value.requiredMethods.some((method, index) => method !== WINDOWS_REQUIRED_METHODS[index])
@@ -561,12 +574,14 @@ function validateNativeManifestShape(value) {
       || nativeClaims.companionInstanceMutexSafe !== false
       || nativeClaims.credentialAuditFileGuardSafe !== true
       || nativeClaims.sqliteStateLeaseSafe !== false
+      || nativeClaims.preparedArtifactSafe !== false
       || approvedPolicy.productionSafe !== false
       || approvedPolicy.pathWalkRaceSafe !== false
       || approvedPolicy.credentialMutexSafe !== true
       || approvedPolicy.companionInstanceMutexSafe !== false
       || approvedPolicy.credentialAuditFileGuardSafe !== true
       || approvedPolicy.sqliteStateLeaseSafe !== false
+      || approvedPolicy.preparedArtifactSafe !== false
       || WINDOWS_NATIVE_CLAIM_KEYS.some((key) => nativeClaims[key] !== approvedPolicy[key])
       || !exactObjectKeys(bindingProvenance, ["contractVersion", "source", "status"])
       || bindingProvenance.contractVersion !== "windows-binding-provenance-v1"

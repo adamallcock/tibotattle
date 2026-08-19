@@ -37,6 +37,17 @@
 namespace {
 
 constexpr std::size_t kMaximumFileBytes = 1024 * 1024;
+// Prepared contribution payloads are bounded by the public contribution
+// contract. Review/encoded artifacts use the existing 34 MiB resource ceiling.
+// Both operations stream through a fixed 1 MiB native buffer; the N-API
+// boundary still applies the total ceiling before allocation or publication.
+constexpr std::size_t kMaximumPreparedContributionBytes = 1'310'720;
+constexpr std::size_t kMaximumPreparedArtifactBytes = 34 * 1024 * 1024;
+constexpr std::size_t kMaximumPreparedDirectoryEntries = 256;
+constexpr std::size_t kPreparedChunkBytes = 1 << 20;
+static_assert(
+    kMaximumPreparedContributionBytes <= kMaximumPreparedArtifactBytes,
+    "contribution ceiling must fit the prepared artifact ceiling");
 
 // The Win32 CreateFile API has no root-directory parameter.  Calling it once
 // for every component, even with FILE_FLAG_OPEN_REPARSE_POINT, leaves a
@@ -200,6 +211,8 @@ Failure SecurityPolicy(const char* detail = "unspecified") {
 Failure NotDirectory() { return {"NOT_DIRECTORY"}; }
 Failure NotRegularFile() { return {"NOT_REGULAR_FILE"}; }
 Failure TooLarge() { return {"FILE_TOO_LARGE"}; }
+Failure PreparedDirectoryLimit() { return {"PREPARED_DIRECTORY_LIMIT"}; }
+Failure PreparedDirectoryNotEmpty() { return {"PREPARED_DIRECTORY_NOT_EMPTY"}; }
 Failure FileSizeChanged() { return {"FILE_SIZE_CHANGED"}; }
 Failure IdentityMismatch() { return {"IDENTITY_MISMATCH"}; }
 Failure OperationFailed() { return {"OPERATION_FAILED"}; }
@@ -333,6 +346,39 @@ bool GetSafeReadMaximum(napi_env env, napi_value value, std::size_t* result) {
   return true;
 }
 
+bool GetSafePreparedMaximum(napi_env env, napi_value value, std::size_t* result) {
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok || type != napi_number) return false;
+  double candidate = 0;
+  if (napi_get_value_double(env, value, &candidate) != napi_ok
+      || !std::isfinite(candidate)
+      || candidate < 1
+      || std::floor(candidate) != candidate
+      || candidate > static_cast<double>(kMaximumPreparedArtifactBytes)) {
+    return false;
+  }
+  *result = static_cast<std::size_t>(candidate);
+  return true;
+}
+
+bool GetSafePreparedDirectoryMaximum(
+    napi_env env,
+    napi_value value,
+    std::size_t* result) {
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok || type != napi_number) return false;
+  double candidate = 0;
+  if (napi_get_value_double(env, value, &candidate) != napi_ok
+      || !std::isfinite(candidate)
+      || candidate < 1
+      || std::floor(candidate) != candidate
+      || candidate > static_cast<double>(kMaximumPreparedDirectoryEntries)) {
+    return false;
+  }
+  *result = static_cast<std::size_t>(candidate);
+  return true;
+}
+
 bool GetNamedString(napi_env env, napi_value object, const char* name, std::string* result) {
   napi_value value;
   bool present = false;
@@ -371,6 +417,14 @@ bool EqualInsensitive(const std::wstring& left, const wchar_t* right) {
   if (left.size() != std::wcslen(right)) return false;
   for (std::size_t i = 0; i < left.size(); ++i) {
     if (std::towlower(left[i]) != std::towlower(right[i])) return false;
+  }
+  return true;
+}
+
+bool EqualInsensitive(const std::wstring& left, const std::wstring& right) {
+  if (left.size() != right.size()) return false;
+  for (std::size_t index = 0; index < left.size(); ++index) {
+    if (std::towlower(left[index]) != std::towlower(right[index])) return false;
   }
   return true;
 }
@@ -1012,6 +1066,532 @@ bool OpenRelativePath(
   return false;
 }
 
+// The prepared-artifact surface deliberately repeats the root identity and
+// validates every retained directory handle before exposing a result. Existing
+// protected-child methods only need the final object for their narrower
+// contracts; prepared publication additionally keeps every child ancestor
+// bound for enumeration, deletion, and no-clobber rename.
+bool ParseAndValidatePath(
+    const std::wstring& path,
+    bool finalMayBeMissing,
+    ParsedPath* parsed,
+    Failure* failure);
+bool ValidateSecurity(
+    HANDLE handle,
+    bool directory,
+    Failure* failure,
+    HandleIdentity* identity = nullptr,
+    SecuritySnapshot* security = nullptr);
+bool OpenProtectedRootAndChild(
+    const std::wstring& rootPath,
+    const HandleIdentity& expectedRoot,
+    const std::wstring& childPath,
+    const OpenRelativeOptions& options,
+    RelativeHandles* opened,
+    bool* finalMissing,
+    ParsedPath* fullPath,
+    Failure* failure);
+
+bool ValidatePreparedAncestors(
+    const RelativeHandles& opened,
+    const ParsedPath& fullPath,
+    std::size_t rootComponentCount,
+    Failure* failure) {
+  if (opened.parents.empty() || rootComponentCount > fullPath.components.size()) {
+    *failure = InvalidPath();
+    return false;
+  }
+  for (std::size_t index = 0; index < opened.parents.size(); ++index) {
+    HandleIdentity identity;
+    if (!ValidateSecurity(opened.parents[index], true, failure, &identity)) {
+      return false;
+    }
+    ParsedPath prefix = fullPath;
+    const std::size_t componentCount = rootComponentCount + index;
+    if (componentCount > prefix.components.size()) {
+      *failure = InvalidPath();
+      return false;
+    }
+    prefix.components.resize(componentCount);
+    if (!ResolveFinalPath(opened.parents[index], &prefix)) {
+      *failure = IdentityMismatch();
+      return false;
+    }
+  }
+  return true;
+}
+
+bool OpenPreparedExistingChild(
+    const std::wstring& rootPath,
+    const HandleIdentity& expectedRoot,
+    const std::wstring& childPath,
+    bool finalDirectoryKnown,
+    bool finalDirectory,
+    DWORD access,
+    DWORD shareMode,
+    RelativeHandles* opened,
+    ParsedPath* fullPath,
+    Failure* failure) {
+  OpenRelativeOptions options;
+  options.finalDirectoryKnown = finalDirectoryKnown;
+  options.finalDirectory = finalDirectory;
+  options.access = access;
+  options.shareMode = shareMode;
+  options.protectAllAncestors = true;
+  options.disposition = kFileOpen;
+  bool finalMissing = false;
+  if (!OpenProtectedRootAndChild(
+          rootPath,
+          expectedRoot,
+          childPath,
+          options,
+          opened,
+          &finalMissing,
+          fullPath,
+          failure)
+      || finalMissing
+      || opened->final == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  std::vector<std::wstring> childComponents;
+  if (!ParseRelativeComponents(childPath, &childComponents)
+      || childComponents.size() > fullPath->components.size()) {
+    *failure = InvalidPath();
+    return false;
+  }
+  ParsedPath parsedRoot = *fullPath;
+  parsedRoot.components.resize(
+      fullPath->components.size() - childComponents.size());
+  const std::size_t rootComponentCount = parsedRoot.components.size();
+  if (!ValidatePreparedAncestors(*opened, *fullPath, rootComponentCount, failure)) {
+    return false;
+  }
+  HandleIdentity identity;
+  if (!GetIdentity(opened->final, &identity)
+      || !ValidateSecurity(opened->final, identity.directory, failure, &identity)
+      || !ResolveFinalPath(opened->final, fullPath)) {
+    if (failure->code == OperationFailed().code) *failure = IdentityMismatch();
+    return false;
+  }
+  return true;
+}
+
+bool OpenPreparedRootOnly(
+    const std::wstring& rootPath,
+    const HandleIdentity& expectedRoot,
+    RelativeHandles* opened,
+    ParsedPath* parsedRoot,
+    Failure* failure) {
+  if (!ParseAndValidatePath(rootPath, false, parsedRoot, failure)) return false;
+  OpenRelativeOptions rootOptions;
+  rootOptions.finalDirectoryKnown = true;
+  rootOptions.finalDirectory = true;
+  rootOptions.access = kDirectoryTraversalAccess;
+  rootOptions.shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+  rootOptions.protectedAncestorDepth = parsedRoot->components.size() - 1;
+  rootOptions.protectedAncestorShareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+  rootOptions.disposition = kFileOpen;
+  bool rootMissing = false;
+  RelativeHandles rootOpened;
+  if (!OpenRelativePath(
+          *parsedRoot,
+          rootOptions,
+          &rootOpened,
+          &rootMissing,
+          failure)
+      || rootMissing
+      || rootOpened.final == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  HandleIdentity observedRoot;
+  if (!ValidateSecurity(rootOpened.final, true, failure, &observedRoot)
+      || !EqualIdentity(observedRoot, expectedRoot)
+      || !ResolveFinalPath(rootOpened.final, parsedRoot)) {
+    if (failure->code == OperationFailed().code) *failure = IdentityMismatch();
+    return false;
+  }
+  HANDLE protectedRoot = rootOpened.releaseFinal();
+  if (protectedRoot == INVALID_HANDLE_VALUE) {
+    *failure = OperationFailed();
+    return false;
+  }
+  opened->parents.push_back(protectedRoot);
+  return ValidatePreparedAncestors(
+      *opened,
+      *parsedRoot,
+      parsedRoot->components.size(),
+      failure);
+}
+
+bool OpenPreparedRootAndDirectory(
+    const std::wstring& rootPath,
+    const HandleIdentity& expectedRoot,
+    const std::wstring& childPath,
+    bool createMissing,
+    RelativeHandles* opened,
+    ParsedPath* fullPath,
+    Failure* failure) {
+  ParsedPath parsedRoot;
+  if (!ParseAndValidatePath(rootPath, false, &parsedRoot, failure)) return false;
+  std::vector<std::wstring> childComponents;
+  if (!ParseRelativeComponents(childPath, &childComponents)) {
+    *failure = InvalidPath();
+    return false;
+  }
+
+  RelativeHandles rootOpened;
+  if (!OpenPreparedRootOnly(rootPath, expectedRoot, &rootOpened, &parsedRoot, failure)) {
+    return false;
+  }
+  HANDLE protectedRoot = rootOpened.parents.back();
+  opened->parents.push_back(protectedRoot);
+  rootOpened.parents.pop_back();
+  HANDLE current = protectedRoot;
+  *fullPath = parsedRoot;
+
+  for (std::size_t index = 0; index < childComponents.size(); ++index) {
+    const bool final = index + 1 == childComponents.size();
+    HANDLE next = INVALID_HANDLE_VALUE;
+    ULONG_PTR information = 0;
+    Failure openFailure = OperationFailed();
+    if (!OpenRelativeComponent(
+            current,
+            childComponents[index],
+            kDirectoryTraversalAccess,
+            kDirectoryShareMode,
+            kFileOpen,
+            kFileDirectoryFile,
+            nullptr,
+            &next,
+            &information,
+            &openFailure)) {
+      if (!createMissing || openFailure.code != NotFound().code) {
+        *failure = openFailure;
+        return false;
+      }
+      std::vector<BYTE> ownerSid;
+      PACL acl = nullptr;
+      PSECURITY_DESCRIPTOR descriptor = nullptr;
+      SECURITY_ATTRIBUTES attributes{};
+      if (!BuildOwnerOnlySecurity(
+              &ownerSid,
+              &acl,
+              &descriptor,
+              &attributes)) {
+        *failure = OperationFailed();
+        return false;
+      }
+      bool created = OpenRelativeComponent(
+          current,
+          childComponents[index],
+          kDirectoryTraversalAccess | WRITE_DAC | DELETE,
+          kDirectoryShareMode,
+          kFileCreate,
+          kFileDirectoryFile,
+          attributes.lpSecurityDescriptor,
+          &next,
+          &information,
+          &openFailure);
+      FreeOwnerOnlySecurity(acl, descriptor);
+      // A competing ensure may win the create between our initial open and
+      // this create-new attempt. Re-open the now-existing directory relative
+      // to the same held parent instead of surfacing a spurious race failure.
+      if (!created && openFailure.code == AlreadyExists().code) {
+        openFailure = OperationFailed();
+        created = OpenRelativeComponent(
+            current,
+            childComponents[index],
+            kDirectoryTraversalAccess,
+            kDirectoryShareMode,
+            kFileOpen,
+            kFileDirectoryFile,
+            nullptr,
+            &next,
+            &information,
+            &openFailure);
+      }
+      if (!created || (information != kFileCreated && information != kFileOpened)) {
+        *failure = created ? AlreadyExists() : openFailure;
+        if (next != INVALID_HANDLE_VALUE) CloseHandle(next);
+        return false;
+      }
+    }
+
+    bool reparse = false;
+    DWORD attributes = 0;
+    if (!GetFileAttributesFromHandle(next, &attributes)
+        || !HasReparsePoint(next, &reparse)) {
+      if (information == kFileCreated) MarkHandleForDeletion(next);
+      CloseHandle(next);
+      *failure = OperationFailed();
+      return false;
+    }
+    if (reparse || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+      if (information == kFileCreated) MarkHandleForDeletion(next);
+      CloseHandle(next);
+      *failure = reparse ? ReparsePoint() : NotDirectory();
+      return false;
+    }
+    fullPath->components.push_back(childComponents[index]);
+    HandleIdentity identity;
+    if (!ValidateSecurity(next, true, failure, &identity)
+        || !ResolveFinalPath(next, fullPath)) {
+      if (information == kFileCreated) MarkHandleForDeletion(next);
+      CloseHandle(next);
+      if (failure->code == OperationFailed().code) *failure = IdentityMismatch();
+      return false;
+    }
+    if (final) {
+      opened->final = next;
+      return ValidatePreparedAncestors(
+          *opened,
+          *fullPath,
+          parsedRoot.components.size(),
+          failure);
+    }
+    opened->parents.push_back(next);
+    current = next;
+  }
+  *failure = InvalidPath();
+  return false;
+}
+
+bool SplitPreparedSiblingPaths(
+    const std::wstring& sourcePath,
+    const std::wstring& targetPath,
+    std::wstring* sourceName,
+    std::wstring* targetName,
+    Failure* failure) {
+  std::vector<std::wstring> source;
+  std::vector<std::wstring> target;
+  if (!ParseRelativeComponents(sourcePath, &source)
+      || !ParseRelativeComponents(targetPath, &target)
+      || source.size() != target.size()
+      || source.empty()) {
+    *failure = InvalidPath();
+    return false;
+  }
+  for (std::size_t index = 0; index + 1 < source.size(); ++index) {
+    if (!EqualInsensitive(source[index], target[index])) {
+      *failure = InvalidPath();
+      return false;
+    }
+  }
+  *sourceName = source.back();
+  *targetName = target.back();
+  if (EqualInsensitive(*sourceName, *targetName)) {
+    *failure = AlreadyExists();
+    return false;
+  }
+  return true;
+}
+
+bool CreatePreparedResultEntry(
+    napi_env env,
+    napi_value array,
+    std::uint32_t index,
+    const std::wstring& name,
+    const HandleIdentity& identity,
+    bool isDirectory,
+    bool isReparsePoint) {
+  napi_value entry;
+  napi_value nameValue;
+  napi_value identityValue;
+  napi_value directory;
+  napi_value regular;
+  napi_value reparse;
+  napi_create_object(env, &entry);
+  napi_create_string_utf16(
+      env,
+      reinterpret_cast<const char16_t*>(name.data()),
+      name.size(),
+      &nameValue);
+  identityValue = IdentityValue(env, identity);
+  napi_get_boolean(env, isDirectory, &directory);
+  napi_get_boolean(env, !isDirectory, &regular);
+  napi_get_boolean(env, isReparsePoint, &reparse);
+  napi_set_named_property(env, entry, "name", nameValue);
+  napi_set_named_property(env, entry, "identity", identityValue);
+  napi_set_named_property(env, entry, "isDirectory", directory);
+  napi_set_named_property(env, entry, "isRegularFile", regular);
+  napi_set_named_property(env, entry, "isReparsePoint", reparse);
+  napi_set_element(env, array, index, entry);
+  return true;
+}
+
+bool EnumeratePreparedDirectoryEntries(
+    HANDLE directory,
+    const ParsedPath& directoryPath,
+    std::size_t maximumEntries,
+    napi_env env,
+    napi_value result,
+    Failure* failure) {
+  if (maximumEntries < 1 || maximumEntries > kMaximumPreparedDirectoryEntries) {
+    *failure = PreparedDirectoryLimit();
+    return false;
+  }
+  std::array<BYTE, 64 * 1024> buffer{};
+  std::size_t count = 0;
+  for (;;) {
+    if (!GetFileInformationByHandleEx(
+            directory,
+            FileIdBothDirectoryInfo,
+            buffer.data(),
+            static_cast<DWORD>(buffer.size()))) {
+      const DWORD error = GetLastError();
+      if (error == ERROR_NO_MORE_FILES) break;
+      *failure = FromLastError(error);
+      return false;
+    }
+    std::size_t offset = 0;
+    for (;;) {
+      if (offset + sizeof(FILE_ID_BOTH_DIR_INFO) > buffer.size()) {
+        *failure = OperationFailed();
+        return false;
+      }
+      auto* entry = reinterpret_cast<const FILE_ID_BOTH_DIR_INFO*>(
+          buffer.data() + offset);
+      const std::size_t entryHeader = FIELD_OFFSET(FILE_ID_BOTH_DIR_INFO, FileName);
+      if (entry->FileNameLength % sizeof(WCHAR) != 0
+          || entryHeader > buffer.size() - offset
+          || entry->FileNameLength > buffer.size() - offset - entryHeader) {
+        *failure = OperationFailed();
+        return false;
+      }
+      const std::size_t recordBytes = entryHeader + entry->FileNameLength;
+      if (entry->NextEntryOffset != 0
+          && entry->NextEntryOffset < recordBytes) {
+        *failure = OperationFailed();
+        return false;
+      }
+      const std::wstring name(
+          entry->FileName,
+          entry->FileNameLength / sizeof(WCHAR));
+      if (name != L"." && name != L"..") {
+        std::vector<std::wstring> components;
+        if (!ParseRelativeComponents(name, &components) || components.size() != 1) {
+          *failure = InvalidPath();
+          return false;
+        }
+        if (++count > maximumEntries) {
+          *failure = PreparedDirectoryLimit();
+          return false;
+        }
+        HANDLE child = INVALID_HANDLE_VALUE;
+        if (!OpenRelativeComponent(
+                directory,
+                name,
+                FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                kFileOpen,
+                0,
+                nullptr,
+                &child,
+                nullptr,
+                failure)) {
+          return false;
+        }
+        bool reparse = false;
+        DWORD attributes = 0;
+        HandleIdentity identity;
+        const bool valid = GetFileAttributesFromHandle(child, &attributes)
+            && HasReparsePoint(child, &reparse)
+            && !reparse
+            && GetIdentity(child, &identity)
+            && ValidateSecurity(child, identity.directory, failure, &identity);
+        if (!valid) {
+          CloseHandle(child);
+          if (failure->code == OperationFailed().code) *failure = IdentityMismatch();
+          return false;
+        }
+        ParsedPath childPath = directoryPath;
+        childPath.components.push_back(name);
+        if (!ResolveFinalPath(child, &childPath)) {
+          CloseHandle(child);
+          *failure = IdentityMismatch();
+          return false;
+        }
+        CreatePreparedResultEntry(
+            env,
+            result,
+            static_cast<std::uint32_t>(count - 1),
+            name,
+            identity,
+            identity.directory,
+            reparse);
+        CloseHandle(child);
+      }
+      if (entry->NextEntryOffset == 0) break;
+      if (entry->NextEntryOffset % sizeof(ULONG) != 0
+          || entry->NextEntryOffset > buffer.size() - offset) {
+        *failure = OperationFailed();
+        return false;
+      }
+      offset += entry->NextEntryOffset;
+    }
+  }
+  return true;
+}
+
+bool OpenPreparedParentForChild(
+    const std::wstring& rootPath,
+    const HandleIdentity& expectedRoot,
+    const std::wstring& childPath,
+    RelativeHandles* opened,
+    ParsedPath* parentPath,
+    std::wstring* childName,
+    Failure* failure) {
+  std::vector<std::wstring> components;
+  if (!ParseRelativeComponents(childPath, &components) || components.empty()) {
+    *failure = InvalidPath();
+    return false;
+  }
+  *childName = components.back();
+  std::wstring relativeParent;
+  for (std::size_t index = 0; index + 1 < components.size(); ++index) {
+    if (!relativeParent.empty()) relativeParent.append(L"\\");
+    relativeParent.append(components[index]);
+  }
+  if (relativeParent.empty()) {
+    if (!OpenPreparedRootOnly(rootPath, expectedRoot, opened, parentPath, failure)) {
+      return false;
+    }
+    return true;
+  }
+  if (!OpenPreparedExistingChild(
+          rootPath,
+          expectedRoot,
+          relativeParent,
+          true,
+          true,
+          kDirectoryTraversalAccess,
+          FILE_SHARE_READ | FILE_SHARE_WRITE,
+          opened,
+          parentPath,
+          failure)) {
+    return false;
+  }
+  if (opened->final == INVALID_HANDLE_VALUE) {
+    *failure = OperationFailed();
+    return false;
+  }
+  opened->parents.push_back(opened->final);
+  opened->final = INVALID_HANDLE_VALUE;
+  return true;
+}
+
+bool FlushPreparedDirectoryBoundary(HANDLE directory, Failure* failure) {
+  // Windows does not expose a portable directory-entry fsync equivalent. A
+  // successful directory flush is used where the filesystem supports it; an
+  // INVALID_HANDLE failure is recorded as the documented metadata-durability
+  // boundary while the file bytes themselves are always flushed before this
+  // point. Other failures are real operation failures.
+  if (FlushFileBuffers(directory)) return true;
+  if (GetLastError() == ERROR_INVALID_HANDLE) return true;
+  *failure = FromLastError();
+  return false;
+}
+
 bool ParseAndValidatePath(
     const std::wstring& path,
     bool /*finalMayBeMissing*/,
@@ -1032,8 +1612,8 @@ bool ValidateSecurity(
     HANDLE handle,
     bool directory,
     Failure* failure,
-    HandleIdentity* identity = nullptr,
-    SecuritySnapshot* security = nullptr) {
+    HandleIdentity* identity,
+    SecuritySnapshot* security) {
   bool reparse = false;
   if (!HasReparsePoint(handle, &reparse)) {
     *failure = OperationFailed();
@@ -1701,13 +2281,13 @@ bool GetArguments(
     napi_callback_info info,
     std::vector<napi_value>* arguments,
     std::size_t expected) {
-  // SQLite publication is the widest callback surface (root path, expected
-  // root identity, stage name, expected stage identity, target name, and
-  // optional expected target identity).
-  // Keep the exact-count check below: this is capacity, not permission to
-  // accept arbitrary trailing arguments.
-  napi_value values[6] = {};
-  std::size_t count = 6;
+  // Prepared-artifact publication is the widest callback surface (root path,
+  // expected root identity, stage name, expected stage identity, and target
+  // name); SQLite publication also uses six arguments. Keep the exact-count
+  // check below: this is capacity, not permission to accept arbitrary trailing
+  // arguments.
+  napi_value values[8] = {};
+  std::size_t count = 8;
   if (napi_get_cb_info(env, info, &count, values, nullptr, nullptr) != napi_ok
       || count != expected) {
     return false;
@@ -1772,7 +2352,8 @@ bool ReadHandleBounded(
   std::size_t offset = 0;
   while (offset < bytes->size()) {
     const std::size_t remaining = bytes->size() - offset;
-    const DWORD requested = static_cast<DWORD>(std::min<std::size_t>(remaining, 1 << 20));
+    const DWORD requested = static_cast<DWORD>(
+        std::min<std::size_t>(remaining, kPreparedChunkBytes));
     DWORD read = 0;
     if (!ReadFile(handle, bytes->data() + offset, requested, &read, nullptr)) {
       *failure = FromLastError();
@@ -1826,10 +2407,11 @@ bool WriteAndFlushHandle(
   std::size_t offset = 0;
   while (offset < byteCount) {
     const DWORD requested = static_cast<DWORD>(
-        std::min<std::size_t>(byteCount - offset, 1 << 20));
+        std::min<std::size_t>(byteCount - offset, kPreparedChunkBytes));
     DWORD written = 0;
     if (!WriteFile(handle, bytes + offset, requested, &written, nullptr)
-        || written == 0) {
+        || written == 0
+        || written > requested) {
       *failure = FromLastError();
       return false;
     }
@@ -1910,7 +2492,8 @@ bool RenameHandleRelative(
     HANDLE handle,
     HANDLE parent,
     const std::wstring& target,
-    Failure* failure) {
+    Failure* failure,
+    bool replaceIfExists = true) {
   if (target.empty()
       || target.size() > static_cast<std::size_t>(ULONG_MAX / sizeof(wchar_t))) {
     *failure = InvalidPath();
@@ -1925,7 +2508,8 @@ bool RenameHandleRelative(
   const std::size_t headerBytes = offsetof(NativeFileRenameInformationEx, fileName);
   std::vector<BYTE> buffer(headerBytes + bytes, 0);
   auto* information = reinterpret_cast<NativeFileRenameInformationEx*>(buffer.data());
-  information->flags = kFileRenameReplaceIfExists | kFileRenamePosixSemantics;
+  information->flags = kFileRenamePosixSemantics
+      | (replaceIfExists ? kFileRenameReplaceIfExists : 0);
   information->rootDirectory = parent;
   information->fileNameLength = static_cast<ULONG>(bytes);
   std::memcpy(information->fileName, target.data(), bytes);
@@ -2237,6 +2821,694 @@ napi_value InspectPathCallback(napi_env env, napi_callback_info info) {
   napi_value isReparse;
   napi_get_boolean(env, reparse, &isReparse);
   napi_set_named_property(env, result, "isReparsePoint", isReparse);
+  return result;
+}
+
+napi_value InspectPreparedChildCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 3)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring rootPath;
+  std::wstring childPath;
+  HandleIdentity expectedRoot;
+  Failure failure = OperationFailed();
+  if (!ParseProtectedChildArguments(
+          env,
+          arguments,
+          &rootPath,
+          &expectedRoot,
+          &childPath,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  RelativeHandles opened;
+  ParsedPath fullPath;
+  if (!OpenPreparedExistingChild(
+          rootPath,
+          expectedRoot,
+          childPath,
+          false,
+          false,
+          FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+          FILE_SHARE_READ | FILE_SHARE_WRITE,
+          &opened,
+          &fullPath,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  HandleIdentity identity;
+  SecuritySnapshot security;
+  if (!GetIdentity(opened.final, &identity)
+      || !ReadSecurity(opened.final, &security)) {
+    return ThrowFailure(env, OperationFailed());
+  }
+  napi_value result = MetadataValue(env, identity, security, true);
+  napi_value isReparse;
+  napi_get_boolean(env, false, &isReparse);
+  napi_set_named_property(env, result, "isReparsePoint", isReparse);
+  return result;
+}
+
+napi_value EnsurePreparedDirectoryCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 3)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring rootPath;
+  std::wstring childPath;
+  HandleIdentity expectedRoot;
+  Failure failure = OperationFailed();
+  if (!ParseProtectedChildArguments(
+          env,
+          arguments,
+          &rootPath,
+          &expectedRoot,
+          &childPath,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  RelativeHandles opened;
+  ParsedPath fullPath;
+  if (!OpenPreparedRootAndDirectory(
+          rootPath,
+          expectedRoot,
+          childPath,
+          true,
+          &opened,
+          &fullPath,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  HandleIdentity identity;
+  if (!GetIdentity(opened.final, &identity)
+      || !ValidateSecurity(opened.final, true, &failure, &identity)
+      || !ResolveFinalPath(opened.final, &fullPath)) {
+    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    return ThrowFailure(env, failure);
+  }
+  return IdentityValue(env, identity);
+}
+
+napi_value EnumeratePreparedDirectoryCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 4)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring rootPath;
+  std::wstring childPath;
+  HandleIdentity expectedRoot;
+  std::size_t maximumEntries = 0;
+  Failure failure = OperationFailed();
+  if (!ParseProtectedChildArguments(
+          env,
+          {arguments[0], arguments[1], arguments[2]},
+          &rootPath,
+          &expectedRoot,
+          &childPath,
+          &failure)
+      || !GetSafePreparedDirectoryMaximum(env, arguments[3], &maximumEntries)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  RelativeHandles opened;
+  ParsedPath fullPath;
+  if (!OpenPreparedExistingChild(
+          rootPath,
+          expectedRoot,
+          childPath,
+          true,
+          true,
+          FILE_LIST_DIRECTORY | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+          FILE_SHARE_READ | FILE_SHARE_WRITE,
+          &opened,
+          &fullPath,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  HandleIdentity before;
+  if (!GetIdentity(opened.final, &before)) {
+    return ThrowFailure(env, OperationFailed());
+  }
+  napi_value result;
+  napi_create_array(env, &result);
+  if (!EnumeratePreparedDirectoryEntries(
+          opened.final,
+          fullPath,
+          maximumEntries,
+          env,
+          result,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  HandleIdentity after;
+  if (!ValidateSecurity(opened.final, true, &failure, &after)
+      || !EqualIdentity(after, before)
+      || !ResolveFinalPath(opened.final, &fullPath)) {
+    // The final directory is not the protected root; compare against its
+    // identity captured before enumeration instead of the root identity.
+    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    return ThrowFailure(env, failure);
+  }
+  return result;
+}
+
+napi_value RemovePreparedDirectoryCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 4)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring rootPath;
+  std::wstring childPath;
+  HandleIdentity expectedRoot;
+  HandleIdentity expected;
+  Failure failure = OperationFailed();
+  if (!ParseProtectedChildArguments(
+          env,
+          {arguments[0], arguments[1], arguments[2]},
+          &rootPath,
+          &expectedRoot,
+          &childPath,
+          &failure)
+      || !ParseExpectedIdentity(env, arguments[3], &expected)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  RelativeHandles opened;
+  ParsedPath fullPath;
+  if (!OpenPreparedExistingChild(
+          rootPath,
+          expectedRoot,
+          childPath,
+          true,
+          true,
+          DELETE | FILE_LIST_DIRECTORY | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+          FILE_SHARE_READ | FILE_SHARE_WRITE,
+          &opened,
+          &fullPath,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  HandleIdentity current;
+  if (!ValidateSecurity(opened.final, true, &failure, &current)
+      || !EqualIdentity(current, expected)
+      || !ResolveFinalPath(opened.final, &fullPath)) {
+    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    return ThrowFailure(env, failure);
+  }
+  napi_value entries;
+  napi_create_array(env, &entries);
+  if (!EnumeratePreparedDirectoryEntries(
+          opened.final,
+          fullPath,
+          1,
+          env,
+          entries,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  std::uint32_t entryCount = 0;
+  if (napi_get_array_length(env, entries, &entryCount) != napi_ok) {
+    return ThrowFailure(env, OperationFailed());
+  }
+  if (entryCount != 0) return ThrowFailure(env, PreparedDirectoryNotEmpty());
+  HandleIdentity afterEnumeration;
+  if (!ValidateSecurity(opened.final, true, &failure, &afterEnumeration)
+      || !EqualIdentity(afterEnumeration, current)
+      || !ResolveFinalPath(opened.final, &fullPath)) {
+    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    return ThrowFailure(env, failure);
+  }
+  FILE_DISPOSITION_INFO disposition{};
+  disposition.DeleteFile = TRUE;
+  if (!SetFileInformationByHandle(
+          opened.final,
+          FileDispositionInfo,
+          &disposition,
+          sizeof(disposition))) {
+    return ThrowFailure(env, FromLastError());
+  }
+  if (!FlushPreparedDirectoryBoundary(opened.parents.back(), &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  napi_value result;
+  napi_value removed;
+  napi_create_object(env, &result);
+  napi_get_boolean(env, true, &removed);
+  napi_set_named_property(env, result, "removed", removed);
+  napi_set_named_property(env, result, "identity", IdentityValue(env, current));
+  return result;
+}
+
+napi_value RenamePreparedDirectoryCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 5)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring rootPath;
+  std::wstring sourcePath;
+  std::wstring targetPath;
+  HandleIdentity expectedRoot;
+  HandleIdentity expectedSource;
+  Failure failure = OperationFailed();
+  if (!GetString(env, arguments[0], &rootPath)
+      || !ParseExpectedIdentity(env, arguments[1], &expectedRoot)
+      || !GetString(env, arguments[2], &sourcePath)
+      || !ParseExpectedIdentity(env, arguments[3], &expectedSource)
+      || !GetString(env, arguments[4], &targetPath)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring sourceName;
+  std::wstring targetName;
+  if (!SplitPreparedSiblingPaths(
+          sourcePath,
+          targetPath,
+          &sourceName,
+          &targetName,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  RelativeHandles opened;
+  ParsedPath parentFullPath;
+  if (!OpenPreparedParentForChild(
+          rootPath,
+          expectedRoot,
+          sourcePath,
+          &opened,
+          &parentFullPath,
+          &sourceName,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  // The helper returns the source basename through the final out parameter;
+  // targetName was already validated from the same sibling path above.
+  HANDLE parent = opened.parents.back();
+  HANDLE source = INVALID_HANDLE_VALUE;
+  if (!OpenRelativeComponent(
+          parent,
+          sourceName,
+          DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+          FILE_SHARE_READ | FILE_SHARE_WRITE,
+          kFileOpen,
+          kFileDirectoryFile,
+          nullptr,
+          &source,
+          nullptr,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  ParsedPath sourceFullPath = parentFullPath;
+  sourceFullPath.components.push_back(sourceName);
+  HandleIdentity current;
+  if (!ValidateSecurity(source, true, &failure, &current)
+      || !EqualIdentity(current, expectedSource)
+      || !ResolveFinalPath(source, &sourceFullPath)) {
+    CloseHandle(source);
+    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    return ThrowFailure(env, failure);
+  }
+  HANDLE existingTarget = INVALID_HANDLE_VALUE;
+  Failure targetFailure = OperationFailed();
+  if (OpenRelativeComponent(
+          parent,
+          targetName,
+          FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+          kFileOpen,
+          0,
+          nullptr,
+          &existingTarget,
+          nullptr,
+          &targetFailure)) {
+    CloseHandle(existingTarget);
+    CloseHandle(source);
+    return ThrowFailure(env, AlreadyExists());
+  }
+  if (targetFailure.code != NotFound().code) {
+    CloseHandle(source);
+    return ThrowFailure(env, targetFailure);
+  }
+  if (!RenameHandleRelative(source, parent, targetName, &failure, false)
+      || !FlushPreparedDirectoryBoundary(parent, &failure)) {
+    CloseHandle(source);
+    return ThrowFailure(env, failure);
+  }
+  ParsedPath targetFullPath = parentFullPath;
+  targetFullPath.components.push_back(targetName);
+  if (!ValidateSecurity(source, true, &failure, &current)
+      || !ResolveFinalPath(source, &targetFullPath)) {
+    CloseHandle(source);
+    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    return ThrowFailure(env, failure);
+  }
+  CloseHandle(source);
+  napi_value result;
+  napi_value renamed;
+  napi_create_object(env, &result);
+  napi_get_boolean(env, true, &renamed);
+  napi_set_named_property(env, result, "renamed", renamed);
+  napi_set_named_property(env, result, "identity", IdentityValue(env, current));
+  return result;
+}
+
+napi_value CreatePreparedFileCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 4)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring rootPath;
+  std::wstring childPath;
+  HandleIdentity expectedRoot;
+  const std::uint8_t* bytes = nullptr;
+  std::size_t byteCount = 0;
+  Failure failure = OperationFailed();
+  if (!ParseProtectedChildArguments(
+          env,
+          {arguments[0], arguments[1], arguments[2]},
+          &rootPath,
+          &expectedRoot,
+          &childPath,
+          &failure)
+      || !GetBuffer(env, arguments[3], &bytes, &byteCount)
+      || byteCount < 1
+      || byteCount > kMaximumPreparedArtifactBytes) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  RelativeHandles opened;
+  ParsedPath parentFullPath;
+  std::wstring childName;
+  if (!OpenPreparedParentForChild(
+          rootPath,
+          expectedRoot,
+          childPath,
+          &opened,
+          &parentFullPath,
+          &childName,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  HANDLE parent = opened.parents.back();
+  std::vector<BYTE> ownerSid;
+  PACL acl = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  SECURITY_ATTRIBUTES attributes{};
+  if (!BuildOwnerOnlySecurity(&ownerSid, &acl, &descriptor, &attributes)) {
+    return ThrowFailure(env, OperationFailed());
+  }
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  ULONG_PTR information = 0;
+  const bool created = OpenRelativeComponent(
+      parent,
+      childName,
+      GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC
+          | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      FILE_SHARE_READ,
+      kFileCreate,
+      kFileNonDirectoryFile,
+      attributes.lpSecurityDescriptor,
+      &handle,
+      &information,
+      &failure);
+  FreeOwnerOnlySecurity(acl, descriptor);
+  if (!created || information != kFileCreated) {
+    if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+    return ThrowFailure(env, created ? AlreadyExists() : failure);
+  }
+  bool success = WriteAndFlushHandle(handle, bytes, byteCount, &failure)
+      && SetOwnerOnlyDacl(handle);
+  HandleIdentity identity;
+  if (success && !ValidateSecurity(handle, false, &failure, &identity)) success = false;
+  LARGE_INTEGER finalSize{};
+  if (success && (!GetFileSizeEx(handle, &finalSize)
+      || finalSize.QuadPart != static_cast<LONGLONG>(byteCount))) {
+    success = false;
+    failure = FileSizeChanged();
+  }
+  ParsedPath fullPath = parentFullPath;
+  fullPath.components.push_back(childName);
+  if (success && !ResolveFinalPath(handle, &fullPath)) {
+    success = false;
+    failure = IdentityMismatch();
+  }
+  if (!success) {
+    if (!MarkHandleForDeletion(handle)) failure = OperationFailed();
+    CloseHandle(handle);
+    return ThrowFailure(env, failure);
+  }
+  CloseHandle(handle);
+  return IdentityValue(env, identity);
+}
+
+napi_value ReadPreparedFileCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 4)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring rootPath;
+  std::wstring childPath;
+  HandleIdentity expectedRoot;
+  std::size_t maximumBytes = 0;
+  Failure failure = OperationFailed();
+  if (!ParseProtectedChildArguments(
+          env,
+          {arguments[0], arguments[1], arguments[2]},
+          &rootPath,
+          &expectedRoot,
+          &childPath,
+          &failure)
+      || !GetSafePreparedMaximum(env, arguments[3], &maximumBytes)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  RelativeHandles opened;
+  ParsedPath fullPath;
+  if (!OpenPreparedExistingChild(
+          rootPath,
+          expectedRoot,
+          childPath,
+          true,
+          false,
+          GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+          FILE_SHARE_READ,
+          &opened,
+          &fullPath,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  std::vector<std::uint8_t> bytes;
+  HandleIdentity identity;
+  if (!GetIdentity(opened.final, &identity)
+      || !ReadHandleBounded(opened.final, maximumBytes, &bytes, &failure)
+      || !ValidateSecurity(opened.final, false, &failure, &identity)
+      || !ResolveFinalPath(opened.final, &fullPath)) {
+    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    return ThrowFailure(env, failure);
+  }
+  napi_value result;
+  napi_value data;
+  napi_create_object(env, &result);
+  napi_create_buffer_copy(env, bytes.size(), bytes.data(), nullptr, &data);
+  napi_set_named_property(env, result, "data", data);
+  napi_set_named_property(env, result, "identity", IdentityValue(env, identity));
+  return result;
+}
+
+napi_value DeletePreparedFileCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 4)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring rootPath;
+  std::wstring childPath;
+  HandleIdentity expectedRoot;
+  HandleIdentity expected;
+  Failure failure = OperationFailed();
+  if (!ParseProtectedChildArguments(
+          env,
+          {arguments[0], arguments[1], arguments[2]},
+          &rootPath,
+          &expectedRoot,
+          &childPath,
+          &failure)
+      || !ParseExpectedIdentity(env, arguments[3], &expected)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  RelativeHandles opened;
+  ParsedPath parentFullPath;
+  std::wstring childName;
+  if (!OpenPreparedParentForChild(
+          rootPath,
+          expectedRoot,
+          childPath,
+          &opened,
+          &parentFullPath,
+          &childName,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  HANDLE parent = opened.parents.back();
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  if (!OpenRelativeComponent(
+          parent,
+          childName,
+          DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+          FILE_SHARE_READ | FILE_SHARE_WRITE,
+          kFileOpen,
+          kFileNonDirectory,
+          nullptr,
+          &handle,
+          nullptr,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  ParsedPath fullPath = parentFullPath;
+  fullPath.components.push_back(childName);
+  HandleIdentity current;
+  if (!ValidateSecurity(handle, false, &failure, &current)
+      || !EqualIdentity(current, expected)
+      || !ResolveFinalPath(handle, &fullPath)) {
+    CloseHandle(handle);
+    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    return ThrowFailure(env, failure);
+  }
+  if (!MarkHandleForDeletion(handle)) {
+    failure = FromLastError();
+    CloseHandle(handle);
+    return ThrowFailure(env, failure);
+  }
+  if (!FlushPreparedDirectoryBoundary(parent, &failure)) {
+    CloseHandle(handle);
+    return ThrowFailure(env, failure);
+  }
+  CloseHandle(handle);
+  napi_value result;
+  napi_value deleted;
+  napi_create_object(env, &result);
+  napi_get_boolean(env, true, &deleted);
+  napi_set_named_property(env, result, "deleted", deleted);
+  napi_set_named_property(env, result, "identity", IdentityValue(env, current));
+  return result;
+}
+
+napi_value PublishPreparedFileCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 5)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring rootPath;
+  std::wstring stagePath;
+  std::wstring targetPath;
+  HandleIdentity expectedRoot;
+  HandleIdentity expectedStage;
+  Failure failure = OperationFailed();
+  if (!GetString(env, arguments[0], &rootPath)
+      || !ParseExpectedIdentity(env, arguments[1], &expectedRoot)
+      || !GetString(env, arguments[2], &stagePath)
+      || !ParseExpectedIdentity(env, arguments[3], &expectedStage)
+      || !GetString(env, arguments[4], &targetPath)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring stageName;
+  std::wstring targetName;
+  if (!SplitPreparedSiblingPaths(
+          stagePath,
+          targetPath,
+          &stageName,
+          &targetName,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  RelativeHandles opened;
+  ParsedPath parentFullPath;
+  if (!OpenPreparedParentForChild(
+          rootPath,
+          expectedRoot,
+          stagePath,
+          &opened,
+          &parentFullPath,
+          &stageName,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  HANDLE parent = opened.parents.back();
+  HANDLE stage = INVALID_HANDLE_VALUE;
+  if (!OpenRelativeComponent(
+          parent,
+          stageName,
+          DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+          FILE_SHARE_READ,
+          kFileOpen,
+          kFileNonDirectoryFile,
+          nullptr,
+          &stage,
+          nullptr,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  ParsedPath stageFullPath = parentFullPath;
+  stageFullPath.components.push_back(stageName);
+  HandleIdentity identity;
+  if (!ValidateSecurity(stage, false, &failure, &identity)
+      || !EqualIdentity(identity, expectedStage)
+      || !ResolveFinalPath(stage, &stageFullPath)) {
+    CloseHandle(stage);
+    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    return ThrowFailure(env, failure);
+  }
+  HANDLE existingTarget = INVALID_HANDLE_VALUE;
+  Failure targetFailure = OperationFailed();
+  if (OpenRelativeComponent(
+          parent,
+          targetName,
+          FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+          kFileOpen,
+          0,
+          nullptr,
+          &existingTarget,
+          nullptr,
+          &targetFailure)) {
+    CloseHandle(existingTarget);
+    CloseHandle(stage);
+    return ThrowFailure(env, AlreadyExists());
+  }
+  if (targetFailure.code != NotFound().code) {
+    CloseHandle(stage);
+    return ThrowFailure(env, targetFailure);
+  }
+  if (!RenameHandleRelative(stage, parent, targetName, &failure, false)
+      || !FlushPreparedDirectoryBoundary(parent, &failure)) {
+    CloseHandle(stage);
+    return ThrowFailure(env, failure);
+  }
+  ParsedPath targetFullPath = parentFullPath;
+  targetFullPath.components.push_back(targetName);
+  if (!ValidateSecurity(stage, false, &failure, &identity)
+      || !ResolveFinalPath(stage, &targetFullPath)) {
+    CloseHandle(stage);
+    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    return ThrowFailure(env, failure);
+  }
+  CloseHandle(stage);
+  napi_value result;
+  napi_value published;
+  napi_create_object(env, &result);
+  napi_get_boolean(env, true, &published);
+  napi_set_named_property(env, result, "published", published);
+  napi_set_named_property(env, result, "identity", IdentityValue(env, identity));
   return result;
 }
 
@@ -4514,6 +5786,51 @@ NAPI_MODULE_INIT() {
   DefineMethod(
       env,
       exports,
+      "inspectPreparedChild",
+      InspectPreparedChildCallback);
+  DefineMethod(
+      env,
+      exports,
+      "ensurePreparedDirectory",
+      EnsurePreparedDirectoryCallback);
+  DefineMethod(
+      env,
+      exports,
+      "enumeratePreparedDirectory",
+      EnumeratePreparedDirectoryCallback);
+  DefineMethod(
+      env,
+      exports,
+      "removePreparedDirectory",
+      RemovePreparedDirectoryCallback);
+  DefineMethod(
+      env,
+      exports,
+      "renamePreparedDirectory",
+      RenamePreparedDirectoryCallback);
+  DefineMethod(
+      env,
+      exports,
+      "createPreparedFile",
+      CreatePreparedFileCallback);
+  DefineMethod(
+      env,
+      exports,
+      "readPreparedFile",
+      ReadPreparedFileCallback);
+  DefineMethod(
+      env,
+      exports,
+      "deletePreparedFile",
+      DeletePreparedFileCallback);
+  DefineMethod(
+      env,
+      exports,
+      "publishPreparedFile",
+      PublishPreparedFileCallback);
+  DefineMethod(
+      env,
+      exports,
       "acquireSqliteStateLease",
       AcquireSqliteStateLeaseCallback);
   DefineMethod(
@@ -4630,11 +5947,23 @@ NAPI_MODULE_INIT() {
       exports,
       "sqliteStateLeaseContractVersion",
       sqliteStateLeaseVersion);
+  napi_value preparedArtifactVersion;
+  napi_create_string_utf8(
+      env,
+      "windows-prepared-artifact-v1",
+      NAPI_AUTO_LENGTH,
+      &preparedArtifactVersion);
+  napi_set_named_property(
+      env,
+      exports,
+      "preparedArtifactContractVersion",
+      preparedArtifactVersion);
   napi_value productionSafe;
   napi_value pathWalkRaceSafe;
   napi_value credentialMutexSafe;
   napi_value companionInstanceMutexSafe;
   napi_value sqliteStateLeaseSafe;
+  napi_value preparedArtifactSafe;
   napi_value sqliteStateStagingContractVersion;
   napi_value sqliteStateStagingSafe;
   napi_get_boolean(env, false, &productionSafe);
@@ -4642,6 +5971,7 @@ NAPI_MODULE_INIT() {
   napi_get_boolean(env, true, &credentialMutexSafe);
   napi_get_boolean(env, false, &companionInstanceMutexSafe);
   napi_get_boolean(env, false, &sqliteStateLeaseSafe);
+  napi_get_boolean(env, false, &preparedArtifactSafe);
   napi_set_named_property(env, exports, "productionSafe", productionSafe);
   napi_set_named_property(env, exports, "pathWalkRaceSafe", pathWalkRaceSafe);
   napi_set_named_property(env, exports, "credentialMutexSafe", credentialMutexSafe);
@@ -4651,6 +5981,7 @@ NAPI_MODULE_INIT() {
       "companionInstanceMutexSafe",
       companionInstanceMutexSafe);
   napi_set_named_property(env, exports, "sqliteStateLeaseSafe", sqliteStateLeaseSafe);
+  napi_set_named_property(env, exports, "preparedArtifactSafe", preparedArtifactSafe);
   napi_create_string_utf8(
       env,
       "windows-sqlite-state-staging-v1",
