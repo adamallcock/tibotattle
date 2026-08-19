@@ -1,6 +1,10 @@
-const ADMIN_OVERVIEW_SCHEMA_VERSION = "admin-overview-v0.2";
+const ADMIN_OVERVIEW_SCHEMA_VERSION = "admin-overview-v0.3";
 const ADMIN_ACTION_SCHEMA_VERSION = "admin-action-v0.1";
-const ADMIN_ACTIONS = new Set(["set_collection_controls", "run_maintenance"]);
+const ADMIN_ACTIONS = new Set([
+  "set_collection_controls",
+  "run_maintenance",
+  "sync_distribution",
+]);
 const COLLECTION_STATES = new Set(["operational", "degraded", "contained"]);
 const LIFECYCLE_STATES = new Set(["never_run", "running", "completed", "failed"]);
 const RECONCILIATION_STATES = new Set([
@@ -372,26 +376,172 @@ function projectDistribution(value) {
     DISTRIBUTION_SOURCE_STATUSES,
     "ADMIN_OVERVIEW_INVALID",
   );
-  let release = null;
-  if (githubStatus === "available") {
-    if (github.reasonCode !== null) invalid("ADMIN_OVERVIEW_INVALID");
-    const candidate = record(github.release, "ADMIN_OVERVIEW_INVALID");
-    release = Object.freeze({
+  const projectGithubRelease = (value) => {
+    const candidate = record(value, "ADMIN_OVERVIEW_INVALID");
+    const release = Object.freeze({
+      id: positiveInteger(candidate.id, "ADMIN_OVERVIEW_INVALID"),
       tag: string(candidate.tag, "ADMIN_OVERVIEW_INVALID"),
       publishedAt: string(candidate.publishedAt, "ADMIN_OVERVIEW_INVALID"),
-      dmgDownloads: count(
-        candidate.dmgDownloads,
-        "ADMIN_OVERVIEW_INVALID",
-      ),
+      prerelease: boolean(candidate.prerelease, "ADMIN_OVERVIEW_INVALID"),
+      dmgDownloads: count(candidate.dmgDownloads, "ADMIN_OVERVIEW_INVALID"),
       allAssetDownloads: count(
         candidate.allAssetDownloads,
         "ADMIN_OVERVIEW_INVALID",
       ),
+      dmgAssetCount: count(candidate.dmgAssetCount, "ADMIN_OVERVIEW_INVALID"),
+      assetCount: count(candidate.assetCount, "ADMIN_OVERVIEW_INVALID"),
     });
-    if (release.dmgDownloads > release.allAssetDownloads) {
+    if (release.dmgDownloads > release.allAssetDownloads
+        || release.dmgAssetCount > release.assetCount) {
       invalid("ADMIN_OVERVIEW_INVALID");
     }
-  } else if (github.release !== null || typeof github.reasonCode !== "string") {
+    return release;
+  };
+  const projectGithubHistory = (value) => {
+    const history = record(value, "ADMIN_OVERVIEW_INVALID");
+    const projected = Object.freeze({
+      firstObservedAt: nullableString(
+        history.firstObservedAt,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      previousObservedAt: nullableString(
+        history.previousObservedAt,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      latestObservedAt: nullableString(
+        history.latestObservedAt,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      dmgDownloadsSincePrevious: history.dmgDownloadsSincePrevious === null
+        ? null
+        : count(history.dmgDownloadsSincePrevious, "ADMIN_OVERVIEW_INVALID"),
+      counterRegressions: count(
+        history.counterRegressions,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+    });
+    if ((projected.firstObservedAt === null) !== (projected.latestObservedAt === null)
+        || (projected.previousObservedAt === null)
+          !== (projected.dmgDownloadsSincePrevious === null)) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
+    return projected;
+  };
+  const projectGithubSync = (value) => {
+    const sync = record(value, "ADMIN_OVERVIEW_INVALID");
+    return Object.freeze({
+      lastAttemptedAt: nullableString(
+        sync.lastAttemptedAt,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      lastSuccessAt: nullableString(
+        sync.lastSuccessAt,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      lastFailureCode: nullableString(
+        sync.lastFailureCode,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      stale: boolean(sync.stale, "ADMIN_OVERVIEW_INVALID"),
+    });
+  };
+  const githubHistory = projectGithubHistory(github.history);
+  const githubSync = projectGithubSync(github.sync);
+  const releasesBounded = boolean(
+    github.releasesBounded,
+    "ADMIN_OVERVIEW_INVALID",
+  );
+  const releases = array(github.releases, "ADMIN_OVERVIEW_INVALID")
+    .map(projectGithubRelease);
+  const releaseIds = new Set();
+  for (const candidate of releases) {
+    if (releaseIds.has(candidate.id)) invalid("ADMIN_OVERVIEW_INVALID");
+    releaseIds.add(candidate.id);
+  }
+  let release = null;
+  let summary = null;
+  if (githubStatus === "available") {
+    if (github.reasonCode !== null || releasesBounded) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
+    const candidate = github.release === null
+      ? null
+      : record(github.release, "ADMIN_OVERVIEW_INVALID");
+    release = candidate === null
+      ? null
+      : Object.freeze({
+        tag: string(candidate.tag, "ADMIN_OVERVIEW_INVALID"),
+        publishedAt: string(candidate.publishedAt, "ADMIN_OVERVIEW_INVALID"),
+        dmgDownloads: count(candidate.dmgDownloads, "ADMIN_OVERVIEW_INVALID"),
+        allAssetDownloads: count(
+          candidate.allAssetDownloads,
+          "ADMIN_OVERVIEW_INVALID",
+        ),
+      });
+    if (release !== null && release.dmgDownloads > release.allAssetDownloads) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
+    const candidateSummary = record(github.summary, "ADMIN_OVERVIEW_INVALID");
+    summary = Object.freeze({
+      dmgDownloads: count(candidateSummary.dmgDownloads, "ADMIN_OVERVIEW_INVALID"),
+      allAssetDownloads: count(
+        candidateSummary.allAssetDownloads,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      dmgAssetCount: count(
+        candidateSummary.dmgAssetCount,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      assetCount: count(candidateSummary.assetCount, "ADMIN_OVERVIEW_INVALID"),
+      releaseCount: count(
+        candidateSummary.releaseCount,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+    });
+    if (summary.dmgDownloads > summary.allAssetDownloads
+        || summary.dmgAssetCount > summary.assetCount
+        || summary.releaseCount !== releases.length) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
+    const calculated = releases.reduce((totals, candidateRelease) => ({
+      dmgDownloads: totals.dmgDownloads + candidateRelease.dmgDownloads,
+      allAssetDownloads: totals.allAssetDownloads + candidateRelease.allAssetDownloads,
+      dmgAssetCount: totals.dmgAssetCount + candidateRelease.dmgAssetCount,
+      assetCount: totals.assetCount + candidateRelease.assetCount,
+    }), {
+      dmgDownloads: 0,
+      allAssetDownloads: 0,
+      dmgAssetCount: 0,
+      assetCount: 0,
+    });
+    if (!Number.isSafeInteger(calculated.dmgDownloads)
+        || !Number.isSafeInteger(calculated.allAssetDownloads)
+        || !Number.isSafeInteger(calculated.dmgAssetCount)
+        || !Number.isSafeInteger(calculated.assetCount)
+        || calculated.dmgDownloads !== summary.dmgDownloads
+        || calculated.allAssetDownloads !== summary.allAssetDownloads
+        || calculated.dmgAssetCount !== summary.dmgAssetCount
+        || calculated.assetCount !== summary.assetCount
+        || (release === null) !== (releases.length === 0)) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
+    if (release !== null && !releases.some((candidateRelease) =>
+      candidateRelease.tag === release.tag
+      && candidateRelease.publishedAt === release.publishedAt
+      && candidateRelease.dmgDownloads === release.dmgDownloads
+      && candidateRelease.allAssetDownloads === release.allAssetDownloads)) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
+  } else if (github.release !== null
+      || github.summary !== null
+      || releases.length !== 0
+      || releasesBounded
+      || githubHistory.firstObservedAt !== null
+      || githubHistory.previousObservedAt !== null
+      || githubHistory.latestObservedAt !== null
+      || githubHistory.dmgDownloadsSincePrevious !== null
+      || githubHistory.counterRegressions !== 0
+      || typeof github.reasonCode !== "string") {
     invalid("ADMIN_OVERVIEW_INVALID");
   }
 
@@ -436,6 +586,11 @@ function projectDistribution(value) {
       reasonCode: nullableString(github.reasonCode, "ADMIN_OVERVIEW_INVALID"),
       repository: string(github.repository, "ADMIN_OVERVIEW_INVALID"),
       release,
+      summary,
+      releases: Object.freeze(releases),
+      releasesBounded,
+      history: githubHistory,
+      sync: githubSync,
     }),
   });
 }

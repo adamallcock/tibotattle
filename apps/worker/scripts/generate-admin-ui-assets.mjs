@@ -31,7 +31,9 @@ export const ADMIN_UI_GENERATED_FILE = join(
 
 // The embedded set is exactly the admin-only module graph. Shared public
 // modules the admin page imports at runtime (styles.css, ui-format.js,
-// localization.js) stay in the ordinary asset directory on both hostnames.
+// localization.js, community-data.js, community-view.js) stay in the ordinary
+// asset directory on both hostnames. This lets the admin dashboard render the
+// exact public community graph without embedding or duplicating it here.
 export const ADMIN_UI_SOURCES = Object.freeze([
   Object.freeze({
     route: "/admin.html",

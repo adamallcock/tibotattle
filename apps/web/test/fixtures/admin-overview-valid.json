@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "admin-overview-v0.2",
+  "schemaVersion": "admin-overview-v0.3",
   "generatedAt": "2026-08-17T12:00:00.000Z",
   "service": { "environment": "production" },
   "collection": {
@@ -113,6 +113,49 @@
         "publishedAt": "2026-08-15T18:00:00.000Z",
         "dmgDownloads": 88,
         "allAssetDownloads": 101
+      },
+      "summary": {
+        "dmgDownloads": 110,
+        "allAssetDownloads": 135,
+        "dmgAssetCount": 2,
+        "assetCount": 4,
+        "releaseCount": 2
+      },
+      "releases": [
+        {
+          "id": 12,
+          "tag": "v0.1.12",
+          "publishedAt": "2026-08-15T18:00:00.000Z",
+          "prerelease": false,
+          "dmgDownloads": 88,
+          "allAssetDownloads": 101,
+          "dmgAssetCount": 1,
+          "assetCount": 2
+        },
+        {
+          "id": 11,
+          "tag": "v0.1.11",
+          "publishedAt": "2026-08-01T18:00:00.000Z",
+          "prerelease": false,
+          "dmgDownloads": 22,
+          "allAssetDownloads": 34,
+          "dmgAssetCount": 1,
+          "assetCount": 2
+        }
+      ],
+      "releasesBounded": false,
+      "history": {
+        "firstObservedAt": "2026-08-16T12:00:00.000Z",
+        "previousObservedAt": "2026-08-16T12:00:00.000Z",
+        "latestObservedAt": "2026-08-17T12:00:00.000Z",
+        "dmgDownloadsSincePrevious": 6,
+        "counterRegressions": 0
+      },
+      "sync": {
+        "lastAttemptedAt": "2026-08-17T12:00:00.000Z",
+        "lastSuccessAt": "2026-08-17T12:00:00.000Z",
+        "lastFailureCode": null,
+        "stale": false
       }
     }
   },

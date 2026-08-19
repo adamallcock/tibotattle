@@ -71,6 +71,8 @@ function fakeDocument() {
     "distribution-version-rows",
     "distribution-version-empty",
     "distribution-source-status",
+    "github-release-rows",
+    "github-release-empty",
     "service-state",
     "ingress-status",
     "lifecycle-status",
@@ -229,6 +231,16 @@ test("admin tables preserve row order, text rendering, and empty states", async 
         status: "unavailable",
         reasonCode: "GITHUB_UNAVAILABLE",
         release: null,
+        summary: null,
+        releases: [],
+        releasesBounded: false,
+        history: {
+          firstObservedAt: null,
+          previousObservedAt: null,
+          latestObservedAt: null,
+          dmgDownloadsSincePrevious: null,
+          counterRegressions: 0,
+        },
       },
     },
     errors: { ...overview.errors, groups: [], recentDiagnostics: [] },
@@ -243,6 +255,16 @@ test("admin tables preserve row order, text rendering, and empty states", async 
         status: "unavailable",
         reasonCode: "GITHUB_UNAVAILABLE",
         release: null,
+        summary: null,
+        releases: [],
+        releasesBounded: false,
+        history: {
+          firstObservedAt: null,
+          previousObservedAt: null,
+          latestObservedAt: null,
+          dmgDownloadsSincePrevious: null,
+          counterRegressions: 0,
+        },
       },
     },
   };
@@ -299,8 +321,8 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     ]]);
 
     assert.deepEqual(tableTexts(documentRef, "distribution-version-rows"), [
-      ["0.1.12", "19", "64"],
-      ["0.1.11", "5", "9"],
+      ["0.1.12", "66%", "19", "64"],
+      ["0.1.11", "17%", "5", "9"],
     ]);
     assert.deepEqual(
       metricTexts(documentRef, "distribution-counts"),
@@ -310,9 +332,14 @@ test("admin tables preserve row order, text rendering, and empty states", async 
         ["Sparkle update checks", "14", "13 addresses · 40 checks/7d"],
         ["Sparkle artifact fetches", "3", "3 addresses · 3 fetches/7d"],
         ["Current-version reach", "18", "v0.1.12 · 19 addresses/7d"],
-        ["GitHub DMG downloads", "88", "v0.1.12 cumulative · 101 all release assets"],
+        ["GitHub DMG downloads", "110", "2 releases · 2 DMG assets · all time"],
+        ["GitHub DMG downloads since prior snapshot", "6", `${formatReportingTime("2026-08-16T12:00:00.000Z")} → ${formatReportingTime("2026-08-17T12:00:00.000Z")}`],
       ],
     );
+    assert.deepEqual(tableTexts(documentRef, "github-release-rows"), [
+      ["v0.1.12", "Stable", "88", "80%", formatReportingTime("2026-08-15T18:00:00.000Z")],
+      ["v0.1.11", "Stable", "22", "20%", formatReportingTime("2026-08-01T18:00:00.000Z")],
+    ]);
 
     assert.deepEqual(
       metricTexts(documentRef, "counts").at(-1),
@@ -472,7 +499,7 @@ test("admin tables preserve row order, text rendering, and empty states", async 
       "Activity available · GitHub unavailable",
     );
     assert.deepEqual(
-      metricTexts(documentRef, "distribution-counts").at(-1),
+      metricTexts(documentRef, "distribution-counts").at(-2),
       [
         "GitHub DMG downloads",
         "—",
@@ -481,11 +508,12 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     );
     assert.equal(
       documentRef.byId.get("operator-attention-badge").textContent,
-      "No action indicated",
+      "Review · 1",
     );
-    assert.deepEqual(
-      statusTexts(documentRef, "distribution-source-status").slice(-3, -2),
-      [["GitHub releases: ", "unavailable"]],
+    assert.equal(
+      statusTexts(documentRef, "distribution-source-status").some((line) =>
+        line[0] === "GitHub releases: " && line[1] === "unavailable"),
+      true,
     );
 
     await documentRef.byId.get("refresh").listeners.get("click")();
@@ -506,7 +534,7 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     );
     assert.equal(
       documentRef.byId.get("operator-attention-badge").textContent,
-      "Review · 1",
+      "Review · 2",
     );
     assert.deepEqual(
       documentRef.byId.get("operator-attention").children[0].children[1].children
@@ -546,4 +574,20 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     if (previousWindow === undefined) delete globalThis.window;
     else globalThis.window = previousWindow;
   }
+});
+
+test("the owner dashboard imports the public community graph rather than copying it", async () => {
+  const source = await readFile(
+    new URL("../public/admin.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    source,
+    /import \{ PublicCommunityClient \} from "\.\/community-data\.js";/u,
+  );
+  assert.match(
+    source,
+    /import \{ renderCommunityAllowanceSection \} from "\.\/community-view\.js";/u,
+  );
+  assert.doesNotMatch(source, /from "\.\/community\.js"/u);
 });
