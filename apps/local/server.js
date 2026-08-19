@@ -2882,6 +2882,10 @@ function createPreparedLocalCompanionServer({
             await writeContributionDeviceRenewalState(
               statePaths.contributionDeviceRenewalStateFile,
               { deviceId: paired.deviceId, expiresAt: paired.expiresAt },
+              {
+                platform: process.platform,
+                windowsProtectedStateStore,
+              },
             );
           } catch {
             // A missing due-tracker only defers the first silent renewal until
@@ -3175,6 +3179,8 @@ function createPreparedLocalCompanionServer({
               await renewContributionDeviceCredentialIfDue({
                 origin: contributionServiceOrigin,
                 renewalStateFile: statePaths.contributionDeviceRenewalStateFile,
+                platform: process.platform,
+                windowsProtectedStateStore,
                 capabilityOptions: {
                   backend,
                   stateFile: statePaths.contributionDeviceStateFile,
