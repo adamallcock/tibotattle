@@ -117,6 +117,12 @@
       "followUp": "Load and exercise the reviewed native named-mutex binding on Windows x64."
     },
     {
+      "file": "test/windows-credential-operation-audit.test.js",
+      "win32BranchCount": 1,
+      "classification": "native-windows-qualification",
+      "followUp": "Prove guarded SQLite durability and cleanup ordering with the native Windows filesystem binding."
+    },
+    {
       "file": "test/windows-filesystem-security.test.js",
       "win32BranchCount": 1,
       "classification": "native-windows-qualification",
