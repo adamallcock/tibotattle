@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { resolve } from "node:path";
+import { resolve, win32 } from "node:path";
 
 import {
   createLocalAutomaticContributionContext,
@@ -38,8 +38,46 @@ export const AUTOMATIC_CONTRIBUTION_LIMITS =
   automaticContribution.AUTOMATIC_CONTRIBUTION_LIMITS;
 export const AutomaticContributionController =
   automaticContribution.AutomaticContributionController;
-export const createAutomaticContributionController =
-  automaticContribution.createAutomaticContributionController;
+
+function createAutomaticContributionStorage({
+  platform = process.platform,
+  windowsProtectedStateStore = null,
+} = {}) {
+  return createOwnerOnlyAutomaticContributionStorageContext({
+    createError: (code) => new AutomaticContributionError(code),
+    platform,
+    windowsProtectedStateStore,
+  });
+}
+
+// The ordinary Mac/Linux factory remains bound to its reviewed local storage
+// context. A Windows composition must opt into the branded protected store;
+// constructing a fresh application context here keeps that dependency
+// explicit until the companion server wires its complete state composition.
+export function createAutomaticContributionController(options = {}) {
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("automatic contribution options must be an object");
+  }
+  const hasWindowsComposition = Object.hasOwn(options, "platform")
+    || Object.hasOwn(options, "windowsProtectedStateStore");
+  if (!hasWindowsComposition) {
+    return automaticContribution.createAutomaticContributionController(options);
+  }
+  const {
+    platform = process.platform,
+    windowsProtectedStateStore = null,
+    ...controllerOptions
+  } = options;
+  const context = createLocalAutomaticContributionContext({
+    storage: createAutomaticContributionStorage({
+      platform,
+      windowsProtectedStateStore,
+    }),
+    randomUuid: randomUUID,
+    resolvePath: platform === "win32" ? win32.resolve : resolve,
+  });
+  return context.createAutomaticContributionController(controllerOptions);
+}
 
 export function acquireAutomaticContributionInstanceLock({
   lockFile,
