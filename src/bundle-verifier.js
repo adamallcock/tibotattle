@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { platform as nodePlatform } from "node:os";
 
 import {
   createLocalMetadataBundleVerificationContext,
@@ -9,10 +10,18 @@ import {
   sha256Hex,
 } from "./platform/index.js";
 
+function platformName() {
+  if (nodePlatform() === "darwin") return "macos";
+  if (nodePlatform() === "linux") return "linux";
+  if (nodePlatform() === "win32") return "windows";
+  return "other";
+}
+
 const legacyVerifier = createLocalMetadataBundleVerificationContext({
   readOwnerOnlyLocalMetadataBundlePair,
   sha256Hex,
   compatibilityTuple: exportCompatibilityTuple,
+  platformName,
 });
 
 export {
@@ -35,7 +44,42 @@ export function loadVerifiedLocalMetadataBundleBytes({
   });
 }
 
-export const loadVerifiedLocalMetadataBundleFiles =
-  legacyVerifier.loadVerifiedLocalMetadataBundleFiles;
-export const verifyLocalMetadataBundleFiles =
-  legacyVerifier.verifyLocalMetadataBundleFiles;
+function createInjectedVerifier(reviewPairStorage, reviewPairStorageValidator) {
+  return createLocalMetadataBundleVerificationContext({
+    sha256Hex,
+    compatibilityTuple: exportCompatibilityTuple,
+    platformName: () => "windows",
+    reviewPairStorage,
+    reviewPairStorageValidator,
+  });
+}
+
+export async function loadVerifiedLocalMetadataBundleFiles(options = {}) {
+  const {
+    reviewPairStorage,
+    reviewPairStorageValidator,
+    ...files
+  } = options;
+  if (reviewPairStorage !== undefined) {
+    return createInjectedVerifier(
+      reviewPairStorage,
+      reviewPairStorageValidator,
+    ).loadVerifiedLocalMetadataBundleFiles(files);
+  }
+  return legacyVerifier.loadVerifiedLocalMetadataBundleFiles(files);
+}
+
+export async function verifyLocalMetadataBundleFiles(options = {}) {
+  const {
+    reviewPairStorage,
+    reviewPairStorageValidator,
+    ...files
+  } = options;
+  if (reviewPairStorage !== undefined) {
+    return createInjectedVerifier(
+      reviewPairStorage,
+      reviewPairStorageValidator,
+    ).verifyLocalMetadataBundleFiles(files);
+  }
+  return legacyVerifier.verifyLocalMetadataBundleFiles(files);
+}
