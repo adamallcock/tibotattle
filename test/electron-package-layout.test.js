@@ -43,6 +43,16 @@ function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+function payloadFor(rows) {
+  const hash = createHash("sha256");
+  let bytes = 0;
+  for (const row of rows) {
+    bytes += row.bytes;
+    hash.update(`F\0${row.path}\0${row.bytes}\0${row.sha256}\0${row.kind}\0`);
+  }
+  return { bytes, sha256: hash.digest("hex") };
+}
+
 test("Electron runtime staging is deterministic and contains only the reviewed companion closure", async () => {
   await withTemporaryDirectory(async (root) => {
     const first = await buildElectronRuntime({
@@ -135,6 +145,36 @@ test("Electron runtime replacement refuses foreign or tampered directories", asy
   });
 });
 
+test("Electron shell replacement accepts an authenticated older reviewed closure", async () => {
+  await withTemporaryDirectory(async (root) => {
+    const output = join(root, "runtime");
+    const built = await buildElectronRuntime({
+      output,
+      includeElectronShell: true,
+    });
+    const historicalModule = "apps/electron/windows-qualification.js";
+    const historicalManifest = {
+      ...built.manifest,
+      files: built.manifest.files.filter(({ path }) => path !== historicalModule),
+    };
+    historicalManifest.payload = payloadFor(historicalManifest.files);
+    await rm(join(output, ...historicalModule.split("/")));
+    await chmod(join(output, "electron-runtime-manifest.json"), 0o600);
+    await writeFile(
+      join(output, "electron-runtime-manifest.json"),
+      `${JSON.stringify(historicalManifest)}\n`,
+      "utf8",
+    );
+
+    const replaced = await buildElectronRuntime({
+      output,
+      includeElectronShell: true,
+      replace: true,
+    });
+    assert.ok(filePaths(replaced.manifest).includes(historicalModule));
+  });
+});
+
 test("Electron runtime rejects symlinked output components", async () => {
   await withTemporaryDirectory(async (root) => {
     const target = join(root, "target");
@@ -196,7 +236,9 @@ test("Windows target can include an exact binding pair while remaining explicitl
         sha256: sha256(bytes),
       },
     );
-    assert.ok(!paths.some((path) => path.includes("qualification")));
+    assert.ok(paths.includes("src/platform/windows-qualification-mode.js"));
+    assert.ok(!paths.includes("apps/electron/windows-qualification.js"));
+    assert.ok(!paths.some((path) => path.endsWith("windows_filesystem_qualification.node")));
     assert.equal(
       await readFile(join(result.output, "native/windows-filesystem/build/Release/windows_filesystem.node"), "utf8"),
       bytes.toString("utf8"),
