@@ -2065,6 +2065,13 @@ test("targeted local Keychain reset removes only exact local capabilities and re
   );
   const exportResidue = join(stateRoot, "export-participant-secret");
   const stored = new Map([
+    // Both contribution-device storage generations: the app-minted broker
+    // item and the companion-minted legacy item are one credential surface
+    // and the reset must clear whichever exist.
+    [
+      "app-usagemonitor.contribution-device.app.v1",
+      Buffer.alloc(32, 0x30),
+    ],
     [
       "app-usagemonitor.contribution-device.v1",
       Buffer.alloc(32, 0x31),
@@ -2139,6 +2146,7 @@ test("targeted local Keychain reset removes only exact local capabilities and re
     assert.deepEqual(
       calls.filter(([method]) => method === "deleteExact"),
       [
+        ["deleteExact", "app-usagemonitor.contribution-device.app.v1"],
         ["deleteExact", "app-usagemonitor.contribution-device.v1"],
         ["deleteExact", "app-usagemonitor.export-identity.v1"],
       ],

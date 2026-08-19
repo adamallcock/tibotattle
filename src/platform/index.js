@@ -48,6 +48,14 @@ export {
   loadExportIdentityKeychainBinding,
 } from "./export-identity-keychain.js";
 export {
+  CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_FD_ENV,
+  CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_PROTOCOL_VERSION,
+  ContributionDeviceKeychainBrokerError,
+  contributionDeviceKeychainBrokerConfiguration,
+  createContributionDeviceKeychainBrokerBinding,
+  createContributionDeviceKeychainBrokerTransport,
+} from "./contribution-device-keychain-broker.js";
+export {
   readOwnerOnlyLocalMetadataBundlePair,
   sha256Hex,
 } from "./local-metadata-bundle-files.js";

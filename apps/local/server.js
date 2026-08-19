@@ -77,6 +77,7 @@ import {
   setContributionSyncPaused,
 } from "../../src/contribution-sync-queue.js";
 import {
+  createAppBrokeredContributionDeviceBackend,
   createProductionContributionDeviceBackend,
   migrateLegacyContributionDeviceCapability,
   readContributionDeviceCapability,
@@ -86,6 +87,10 @@ import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
   deleteExportIdentityKeychainItemByAttributes,
 } from "../../src/platform/export-identity-keychain.js";
+import {
+  contributionDeviceKeychainBrokerConfiguration,
+  createContributionDeviceKeychainBrokerTransport,
+} from "../../src/platform/index.js";
 import {
   claimContributionDevicePairing,
   disconnectContributionDevice as disconnectContributionDeviceRemotely,
@@ -283,6 +288,8 @@ const HOSTED_SIGNIN_HANDOFF_PROVIDERS = new Set(["google", "apple"]);
 const MAX_RECENT_DIAGNOSTIC_REFERENCES = 5;
 const CONTRIBUTION_DEVICE_KEYCHAIN_CAPABILITY =
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice;
+const CONTRIBUTION_DEVICE_APP_KEYCHAIN_CAPABILITY =
+  EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp;
 const MAX_CONTRIBUTION_DEVICE_STATE_BYTES = 512;
 
 function developmentIdentityConfigurationError() {
@@ -624,9 +631,19 @@ async function resetContributionDeviceCredentialLocally({
   backend,
   stateFile,
   legacyStateFile = null,
-  attributeDelete = () => deleteExportIdentityKeychainItemByAttributes(
-    CONTRIBUTION_DEVICE_KEYCHAIN_CAPABILITY,
-  ),
+  // Both storage generations are addressed: the app-minted
+  // `.app.v1` item and the companion-minted `.v1` item. Attribute deletes
+  // never decrypt, so clearing the generation that does not exist is a free
+  // "missing" rather than a prompt or a failure.
+  attributeDelete = () => {
+    const app = deleteExportIdentityKeychainItemByAttributes(
+      CONTRIBUTION_DEVICE_APP_KEYCHAIN_CAPABILITY,
+    );
+    const legacy = deleteExportIdentityKeychainItemByAttributes(
+      CONTRIBUTION_DEVICE_KEYCHAIN_CAPABILITY,
+    );
+    return app === "deleted" || legacy === "deleted" ? "deleted" : "missing";
+  },
 }) {
   let stored = null;
   let expected = null;
@@ -2633,8 +2650,35 @@ function createPreparedLocalCompanionServer({
   }),
   preparedContributionDirectory,
   contributionServiceOrigin = centralOrigin,
-  contributionDeviceBackendFactory =
-    createProductionContributionDeviceBackend,
+  // When the signed app spawned this companion it hands over a Keychain
+  // broker channel (a socketpair end on the named descriptor): fresh
+  // contribution-device credentials are then minted and read by the app —
+  // the structural fix for the first-pairing Keychain dialog — while legacy
+  // items keep their companion-side keytar path until the rotation-time
+  // migration. Without the announcement (development, tests, Windows) the
+  // production keytar backend stays authoritative, exactly as before. The
+  // transport is shared across backend constructions: the channel is one
+  // kernel socketpair whose lifetime is the app's.
+  contributionDeviceBackendFactory = (() => {
+    // A malformed environment is rejected by the body's own validation; the
+    // selection here must not preempt that error with a different one.
+    const brokerConfiguration = environment && typeof environment === "object"
+        && !Array.isArray(environment)
+      ? contributionDeviceKeychainBrokerConfiguration(environment)
+      : null;
+    if (brokerConfiguration === null) {
+      return createProductionContributionDeviceBackend;
+    }
+    let brokerTransport = null;
+    return () => {
+      brokerTransport ??= createContributionDeviceKeychainBrokerTransport(
+        brokerConfiguration,
+      );
+      return createAppBrokeredContributionDeviceBackend({
+        transport: brokerTransport,
+      });
+    };
+  })(),
   contributionDevicePairingProvider = null,
   contributionDeviceCredentialResetRunner = null,
   contributionDeviceCredentialAttributeDelete = null,

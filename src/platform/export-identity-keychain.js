@@ -61,6 +61,17 @@ export const EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES = Object.freeze({
     service: "app-usagemonitor.contribution-device.v1",
     account: "installation",
   }),
+  // The app-managed storage generation of the contribution-device credential:
+  // minted by the signed TiboTattle.app via SecItemAdd (an app-created item
+  // never raises the partition/ACL dialog for its creator) and served to the
+  // companion over the app's Keychain broker channel. A different service
+  // string, not a marker attribute, separates the generations so app-side
+  // code can never accidentally decrypt a `security`-CLI-minted `.v1` item —
+  // that read is exactly the partition prompt the broker exists to eliminate.
+  contributionDeviceApp: Object.freeze({
+    service: "app-usagemonitor.contribution-device.app.v1",
+    account: "installation",
+  }),
 });
 
 const ERROR_CODES = new Set([
@@ -315,6 +326,9 @@ function capabilityPair(capability) {
   }
   if (capability === EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice) {
     return EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice;
+  }
+  if (capability === EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp) {
+    return EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp;
   }
   fail("invalid_capability");
 }
