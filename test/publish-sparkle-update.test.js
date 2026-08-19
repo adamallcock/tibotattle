@@ -2091,7 +2091,16 @@ function runAppcastGenerator(generatorArguments) {
   });
 }
 
-test("appcast generator fails open to full-only, then produces a signed validated delta", async (context) => {
+test("no named channel can emit the unsigned hand-built feed from the CLI", async (context) => {
+  // 2026-08-10 incident, extended to internal-dogfood on 2026-08-19: every
+  // installed fleet ships SURequireSignedFeed=true, so BOTH named channels
+  // must drive the pinned official generate_appcast. That tool cannot process
+  // this synthetic non-mountable DMG, so each run must fail closed instead of
+  // silently emitting the unsigned hand-built shape that would strand every
+  // installed updater. Delta production machinery remains policy-disabled and
+  // fixture-covered (the delta validation suites above); the reviewed delta
+  // policy flip re-adds generator coverage through generate_appcast's own
+  // prior-version staging.
   const preparedTools = join(
     REPOSITORY_ROOT,
     ".release-deps",
@@ -2107,159 +2116,48 @@ test("appcast generator fails open to full-only, then produces a signed validate
     throw error;
   }
   const temporaryRoot = await mkdtemp(
-    join(await realpath(tmpdir()), "usage-monitor-delta-generator-test-"),
+    join(await realpath(tmpdir()), "usage-monitor-signed-feed-cli-test-"),
   );
   try {
     const key = sparkleEdKeyFixture();
     const keyFilePath = join(temporaryRoot, "test-sparkle-ed-key");
     await writeFile(keyFilePath, key.keyFileContents);
     const archiveRoot = join(temporaryRoot, "release-archive");
-    const releases = [];
-    for (const bundleVersion of ["1", "2"]) {
-      const releaseRoot = join(temporaryRoot, `release-${bundleVersion}`);
-      await mkdir(releaseRoot, { recursive: true });
-      const appPath = await writeFakeAppBundle(releaseRoot, {
-        bundleVersion,
-        payloadSuffix: `release-payload-${bundleVersion}`,
-      });
-      const dmgPath = join(
-        releaseRoot,
-        `TiboTattle-0.1.${bundleVersion}-macOS-arm64.dmg`,
+    const releaseRoot = join(temporaryRoot, "release-1");
+    await mkdir(releaseRoot, { recursive: true });
+    const appPath = await writeFakeAppBundle(releaseRoot, {
+      bundleVersion: "1",
+      payloadSuffix: "release-payload-1",
+    });
+    const dmgPath = join(releaseRoot, "TiboTattle-0.1.1-macOS-arm64.dmg");
+    await writeFile(
+      dmgPath,
+      Buffer.concat([
+        Buffer.from("fake-dmg-1-"),
+        Buffer.alloc(180_000, 66),
+      ]),
+    );
+    for (const channelName of ["internal-dogfood", "stable"]) {
+      const run = runAppcastGenerator([
+        "--channel", channelName,
+        "--app", appPath,
+        "--dmg", dmgPath,
+        "--bundle-version", "1",
+        "--short-version", "0.1.1",
+        "--archive-root", archiveRoot,
+        "--ed-key-file", keyFilePath,
+        "--sparkle-public-ed-key", key.publicEdKey,
+      ]);
+      assert.notEqual(run.status, 0, `${channelName} must fail closed`);
+      assert.match(run.stderr, /generate_appcast/u);
+      const appcastExists = await readFile(join(releaseRoot, "appcast.xml"))
+        .then(() => true, () => false);
+      assert.equal(
+        appcastExists,
+        false,
+        `${channelName} must not write an unsigned appcast`,
       );
-      await writeFile(
-        dmgPath,
-        Buffer.concat([
-          Buffer.from(`fake-dmg-${bundleVersion}-`),
-          Buffer.alloc(180_000, 66),
-        ]),
-      );
-      releases.push({ appPath, bundleVersion, dmgPath, releaseRoot });
     }
-
-    // First release: no retained archive exists yet. The generator must fail
-    // OPEN to a full-only appcast with a loud warning and must not block.
-    const first = runAppcastGenerator([
-      "--channel", "internal-dogfood",
-      "--app", releases[0].appPath,
-      "--dmg", releases[0].dmgPath,
-      "--bundle-version", "1",
-      "--short-version", "0.1.1",
-      "--archive-root", archiveRoot,
-      "--ed-key-file", keyFilePath,
-      "--sparkle-public-ed-key", key.publicEdKey,
-    ]);
-    assert.equal(first.status, 0, first.stderr || first.stdout);
-    assert.match(first.stderr, /FULL-ONLY appcast/u);
-    assert.match(first.stderr, /never blocks a release/u);
-    const firstAppcast = await readFile(
-      join(releases[0].releaseRoot, "appcast.xml"),
-      "utf8",
-    );
-    assert.equal(firstAppcast.includes("sparkle:deltas"), false);
-    const retainedMetadata = JSON.parse(await readFile(
-      join(archiveRoot, "internal-dogfood", "1", RETAINED_ARCHIVE_METADATA_FILE),
-      "utf8",
-    ));
-    assert.equal(retainedMetadata.schemaVersion, RETAINED_ARCHIVE_SCHEMA);
-    assert.equal(retainedMetadata.bundleVersion, "1");
-    assert.equal(retainedMetadata.appName, "TiboTattle.app");
-
-    // Second release: the retained archive provides version 1, so the
-    // generator must produce a signed delta plus the full fallback.
-    const second = runAppcastGenerator([
-      "--channel", "internal-dogfood",
-      "--app", releases[1].appPath,
-      "--dmg", releases[1].dmgPath,
-      "--bundle-version", "2",
-      "--short-version", "0.1.2",
-      "--archive-root", archiveRoot,
-      "--ed-key-file", keyFilePath,
-      "--sparkle-public-ed-key", key.publicEdKey,
-    ]);
-    assert.equal(second.status, 0, second.stderr || second.stdout);
-    assert.match(second.stdout, /Delta from 1:/u);
-    const secondAppcast = await readFile(
-      join(releases[1].releaseRoot, "appcast.xml"),
-      "utf8",
-    );
-    const enclosures = validateCandidateAppcastShape(
-      secondAppcast,
-      "internal-dogfood",
-    );
-    assert.equal(enclosures.length, 2);
-    const fullEnclosure = enclosures.find(
-      (enclosure) => enclosure.deltaFrom === undefined,
-    );
-    const deltaEnclosure = enclosures.find(
-      (enclosure) => enclosure.deltaFrom !== undefined,
-    );
-    assert.equal(fullEnclosure.version, "2");
-    assert.equal(deltaEnclosure.version, "2");
-    assert.equal(deltaEnclosure.deltaFrom, "1");
-    assert.equal(deltaEnclosure.objectKey.endsWith(".delta"), true);
-
-    const deltaFileName = deltaEnclosure.objectKey.split("/").at(-1);
-    const deltaPath = join(releases[1].releaseRoot, deltaFileName);
-    const deltaBytes = await readFile(deltaPath);
-    assert.equal(deltaBytes.length, deltaEnclosure.length);
-    assert.equal(
-      createHash("sha256").update(deltaBytes).digest("hex"),
-      deltaEnclosure.objectSha256,
-    );
-    assert.equal(
-      verify(
-        null,
-        deltaBytes,
-        key.publicKeyObject,
-        Buffer.from(deltaEnclosure.signature, "base64"),
-      ),
-      true,
-    );
-    const dmgBytes = await readFile(releases[1].dmgPath);
-    assert.equal(deltaBytes.length < dmgBytes.length, true);
-    assert.equal(
-      verify(
-        null,
-        dmgBytes,
-        key.publicKeyObject,
-        Buffer.from(fullEnclosure.signature, "base64"),
-      ),
-      true,
-    );
-
-    // The generator's own BinaryDelta apply-check ran (it fails the run on a
-    // mismatch), and both versions are now retained for the next release.
-    await lstat(join(archiveRoot, "internal-dogfood", "2", "TiboTattle.app"));
-
-    // The stable channel never falls back to the hand-built shape
-    // (SURequireSignedFeed, 2026-08-10 incident): it must drive the pinned
-    // official generate_appcast, which cannot process this synthetic
-    // non-mountable DMG — so the run fails closed instead of silently
-    // emitting an unsigned feed, and the previously written appcast is left
-    // untouched.
-    const beforeStable = await readFile(
-      join(releases[1].releaseRoot, "appcast.xml"),
-      "utf8",
-    );
-    const stable = runAppcastGenerator([
-      "--channel", "stable",
-      "--app", releases[1].appPath,
-      "--dmg", releases[1].dmgPath,
-      "--bundle-version", "2",
-      "--short-version", "0.1.2",
-      "--archive-root", archiveRoot,
-      "--ed-key-file", keyFilePath,
-      "--sparkle-public-ed-key", key.publicEdKey,
-      "--replace",
-    ]);
-    assert.notEqual(stable.status, 0);
-    assert.match(stable.stderr, /generate_appcast/u);
-    const afterStable = await readFile(
-      join(releases[1].releaseRoot, "appcast.xml"),
-      "utf8",
-    );
-    assert.equal(afterStable, beforeStable);
-    assert.equal(afterStable.includes("sparkle-signatures"), false);
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }

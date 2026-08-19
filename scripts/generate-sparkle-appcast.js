@@ -3,24 +3,29 @@
  * Generate the canonical single-item Sparkle appcast for one signed release
  * artifact.
  *
- * STABLE CHANNEL (feed-signed, official tool only): production apps ship with
- * SURequireSignedFeed=true, so Sparkle 2.9.3 refuses any appcast document
- * that does not end with the embedded `sparkle-signatures` trailer comment —
- * an Ed25519 signature over every byte of the document before the comment
- * (see Sparkle's SPUExtractSignedFeed.m). A hand-built appcast published on
- * 2026-08-10 broke every installed updater with "The update feed is
- * improperly signed and could not be validated". The stable path therefore
- * drives the pinned `.release-deps/SparkleTools/generate_appcast` binary
+ * NAMED CHANNELS (feed-signed, official tool only): every production build —
+ * stable AND internal-dogfood — ships SURequireSignedFeed=true, so Sparkle
+ * 2.9.3 refuses any appcast document that does not end with the embedded
+ * `sparkle-signatures` trailer comment — an Ed25519 signature over every
+ * byte of the document before the comment (see Sparkle's
+ * SPUExtractSignedFeed.m). A hand-built appcast published on 2026-08-10
+ * broke every installed updater with "The update feed is improperly signed
+ * and could not be validated". Both named channels therefore drive the
+ * pinned `.release-deps/SparkleTools/generate_appcast` binary
  * (integrity-verified via inspectPinnedSparkleTools): the release DMG is
  * staged ALONE in a temporary directory, the tool runs with the
  * deterministic content-addressed `--download-url-prefix`, and its output is
  * adopted byte-for-byte after local validation
  * (scripts/sparkle-signed-feed-validation.js mirrors the Worker guard's
  * official-shape parser and verifies both Ed25519 signatures). The
- * hand-built renderSparkleAppcast below must NEVER be the stable-feed path.
+ * hand-built renderSparkleAppcast below must NEVER be a published feed.
+ * Each channel signs with its own reviewed key: `--account` selects the
+ * channel's Keychain item (generate_appcast's default account is stable's),
+ * and `--ed-key-file` remains the CI path.
  *
- * NON-STABLE CHANNELS keep the reviewed minimal shape and locally generated
- * EdDSA-signed BinaryDelta updates from retained prior versions.
+ * The reviewed minimal shape and the locally generated EdDSA-signed
+ * BinaryDelta machinery below remain for retained-archive fixtures and the
+ * reviewed future delta policy flip; no named channel publishes them today.
  *
  * This is signing-gate machinery: it runs where the operator already runs
  * Sparkle's offline signing tools today, and signs with exactly that key
@@ -476,6 +481,7 @@ function enclosureURL(channel, bundleVersion, digest, fileName) {
 }
 
 function defaultRunGenerateAppcastTool({
+  account,
   appcastOutputPath,
   downloadURLPrefix,
   edKeyFile,
@@ -486,8 +492,13 @@ function defaultRunGenerateAppcastTool({
   // the EdDSA private key from the macOS Keychain silently (or from
   // --ed-key-file in CI), reads SURequireSignedFeed from the app inside the
   // staged DMG, and appends the signed sparkle-signatures trailer itself.
+  // --account selects a non-default Keychain item (the internal-dogfood
+  // channel key) without the private key ever leaving the Keychain.
   runTool(generateAppcastPath, [
     ...(edKeyFile === null ? [] : ["--ed-key-file", edKeyFile]),
+    ...(edKeyFile === null && account !== null
+      ? ["--account", account]
+      : []),
     "--download-url-prefix",
     downloadURLPrefix,
     "-o",
@@ -497,14 +508,15 @@ function defaultRunGenerateAppcastTool({
 }
 
 /**
- * Produce the stable channel's feed-signed appcast by driving the pinned
+ * Produce a named channel's feed-signed appcast by driving the pinned
  * official Sparkle generate_appcast binary, then validating its output
  * locally before it is adopted. The DMG is staged ALONE so the tool cannot
- * pick up stray archives or generate deltas (stable delta publication is
- * policy-disabled), and the emitted bytes are adopted verbatim — re-writing
- * even one byte would invalidate the embedded feed signature.
+ * pick up stray archives or generate deltas (delta publication is
+ * policy-disabled for both named channels), and the emitted bytes are
+ * adopted verbatim — re-writing even one byte would invalidate the embedded
+ * feed signature.
  */
-async function generateOfficialSignedStableAppcast({
+async function generateOfficialSignedAppcast({
   channel,
   dmg,
   dmgFileName,
@@ -524,6 +536,7 @@ async function generateOfficialSignedStableAppcast({
     await writeFile(join(stagingDirectory, dmgFileName), dmg.bytes);
     const appcastOutputPath = join(outputDirectory, "appcast.xml");
     await runGenerateAppcastTool({
+      account: options.account,
       appcastOutputPath,
       downloadURLPrefix,
       edKeyFile: options.edKeyFile,
@@ -604,14 +617,15 @@ export function renderSparkleAppcast({
     ? ""
     : `<sparkle:deltas>\n${deltas.map((delta) =>
       `<enclosure url="${delta.url}" sparkle:version="${bundleVersion}" sparkle:deltaFrom="${delta.deltaFrom}" length="${delta.size}" type="${DELTA_ENCLOSURE_CONTENT_TYPE}" sparkle:edSignature="${delta.signature}" />`).join("\n")}\n</sparkle:deltas>\n`;
-  // NON-STABLE / TEST SHAPE ONLY. This hand-built minimal document is NOT
+  // TEST/FIXTURE SHAPE ONLY. This hand-built minimal document is NOT
   // feed-signed, and every production build ships SURequireSignedFeed=true:
   // Sparkle refuses any feed without the generate_appcast signature trailer
   // ("The update feed is improperly signed and could not be validated" —
-  // this broke every installed stable updater on 2026-08-10). The stable
-  // published feed therefore always comes from the pinned generate_appcast
-  // binary via generateOfficialSignedStableAppcast; renderSparkleAppcast
-  // remains only for non-stable channels and test fixtures.
+  // this broke every installed stable updater on 2026-08-10). Every named
+  // channel's published feed therefore comes from the pinned
+  // generate_appcast binary via generateOfficialSignedAppcast;
+  // renderSparkleAppcast remains only for test fixtures and future
+  // explicitly reviewed channels.
   //
   // The Worker's atomic appcast guard (sparkle-appcast-guard.ts) minimal
   // fallback accepts ONLY the elements rss > channel > item > enclosure — no
@@ -631,6 +645,7 @@ ${deltasBlock}</item></channel></rss>
 
 export function parseGenerateSparkleAppcastArguments(argv) {
   const options = {
+    account: null,
     appPath: null,
     archiveRoot: null,
     bundleVersion: null,
@@ -647,6 +662,7 @@ export function parseGenerateSparkleAppcastArguments(argv) {
     sparkleTools: null,
   };
   const flags = new Map([
+    ["--account", "account"],
     ["--app", "appPath"],
     ["--archive-root", "archiveRoot"],
     ["--bundle-version", "bundleVersion"],
@@ -693,6 +709,15 @@ export function parseGenerateSparkleAppcastArguments(argv) {
   if (options.shortVersion !== null
       && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(options.shortVersion)) {
     fail("--short-version must be a short safe version string");
+  }
+  if (options.account !== null
+      && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(options.account)) {
+    fail("--account must be a short safe Keychain account name");
+  }
+  if (options.account !== null && options.edKeyFile !== null) {
+    fail(
+      "--account and --ed-key-file are mutually exclusive; the Keychain account is ignored when a key file is supplied",
+    );
   }
   if (options.maxDeltas === null) {
     options.maxDeltas = DEFAULT_MAX_DELTAS;
@@ -745,27 +770,33 @@ export async function generateSparkleAppcast(options) {
     typeof options.runGenerateAppcastTool === "function"
       ? options.runGenerateAppcastTool
       : null;
-  const tools = channel.name === "stable" && injectedGenerateAppcastTool !== null
+  // Every named release channel ships SURequireSignedFeed=true, so every
+  // published feed must be the official generate_appcast output. The
+  // hand-built shape below survives only for future channels an explicit
+  // review routes differently, and for retained-archive delta fixtures.
+  const officialSignedFeedChannel =
+    channel.name === "stable" || channel.name === "internal-dogfood";
+  const tools = officialSignedFeedChannel && injectedGenerateAppcastTool !== null
     ? null
     : await inspectPinnedSparkleTools(options.sparkleTools);
   const toolPath = (name) => tools.tools.find(
     (tool) => tool.name === name,
   ).path;
 
-  if (channel.name === "stable") {
-    // SURequireSignedFeed: the installed stable fleet refuses any feed the
+  if (officialSignedFeedChannel) {
+    // SURequireSignedFeed: both installed fleets refuse any feed the
     // official generate_appcast did not sign, so the hand-built
-    // renderSparkleAppcast is forbidden here (2026-08-10 incident). Stable
-    // deltas stay policy-disabled; staging the DMG alone guarantees the tool
+    // renderSparkleAppcast is forbidden here (2026-08-10 incident). Deltas
+    // stay policy-disabled; staging the DMG alone guarantees the tool
     // emits a full-only feed, while the archive is still retained below so
     // delta machinery stays ready for the reviewed policy/guard change.
     if (options.sparklePublicEdKey === null) {
       warn([
-        "--sparkle-public-ed-key was not supplied: the generated stable feed's Ed25519 signatures cannot be verified locally.",
+        `--sparkle-public-ed-key was not supplied: the generated ${channel.name} feed's Ed25519 signatures cannot be verified locally.`,
         "Supply the reviewed public key so a signing-key mix-up fails here instead of on every installed client.",
       ]);
     }
-    const official = await generateOfficialSignedStableAppcast({
+    const official = await generateOfficialSignedAppcast({
       channel,
       dmg,
       dmgFileName,
@@ -825,9 +856,9 @@ export async function generateSparkleAppcast(options) {
     url: enclosureURL(channel, options.bundleVersion, dmg.sha256, dmgFileName),
   });
 
-  // Only non-stable channels reach this point (the stable channel returned
-  // above through the official signed-feed path), so the reviewed stable
-  // policy gate reduces to the retained-archive delta flow.
+  // No named channel reaches this point (both returned above through the
+  // official signed-feed path); the retained-archive delta flow below stays
+  // exercised by fixtures until the reviewed delta policy flip.
   let deltas = [];
   const archiveState = await discoverRetainedVersions({
     archiveRoot: options.archiveRoot,
