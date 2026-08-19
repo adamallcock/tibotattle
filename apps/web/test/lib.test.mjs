@@ -3307,6 +3307,7 @@ test("local pairing preserves fixed identifier-shaped codes and drops anything e
   // cause instead of collapsing all of them into one vague sentence.
   for (const [code, status] of [
     ["contribution_device_recovery_required", 409],
+    ["contribution_device_keychain_access_denied", 409],
     ["contribution_device_pairing_not_authorized", 403],
     ["contribution_device_pairing_not_configured", 409],
     ["sync_in_progress", 409],
@@ -6550,7 +6551,14 @@ test("stale local device conflicts name the leftover credential and offer the re
   assert.match(recoverySource, /action\.href = SEMANTIC_OPEN_TARGET/u);
   assert.match(
     appSource,
-    /error\?\.code === "contribution_device_recovery_required"\s*\n\s*\|\| error\?\.code === "contribution_device_credential_conflict"/u,
+    /error\?\.code === "contribution_device_recovery_required"\s*\n\s*\|\| error\?\.code === "contribution_device_credential_conflict"\s*\n\s*\|\| error\?\.code === "contribution_device_keychain_access_denied"/u,
+  );
+  // A denied macOS access dialog reaches the same reset ceremony with its own
+  // sentence (2026-08-19): it names the dialog and the answer — Always Allow
+  // on the next approval — instead of the leftover-credential story.
+  assert.match(
+    appSource,
+    /contribution_device_keychain_access_denied:\n\s*"macOS did not let TiboTattle read the upload credential/u,
   );
   assert.equal(
     (appSource.match(/id = "reset-device-credential"/gu) ?? []).length,
@@ -6602,6 +6610,14 @@ test("the approve card shows one verified review instance before one explicit ap
   );
   assert.match(html, /See what the community published/u);
   assert.doesNotMatch(appSource, /loadCommunityResults\(\).*renderSharedCommunitySnapshot/su);
+  // The card prepares the reader for the macOS keychain dialog BEFORE the
+  // click that triggers it (2026-08-19, first pairing on a fresh Mac): the
+  // connect step stores the upload credential in the login keychain, and the
+  // OS dialog itself explains nothing.
+  assert.match(
+    html,
+    /Connecting stores this Mac's upload credential in your login\s+keychain\. If macOS asks for permission, choose Always Allow so\s+background uploads keep working\./u,
+  );
 });
 
 test("the community journey states its stages and gates effort behind sign-in and connection", async () => {
@@ -7720,6 +7736,7 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
     "contribution_device_pairing_response_invalid",
     "contribution_device_pairing_not_configured",
     "contribution_device_pairing_failed",
+    "contribution_device_keychain_access_denied",
     "unsupported_media_type",
     "request_too_large",
     "invalid_json",
@@ -7781,6 +7798,21 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
   assert.match(connect, /contributionConnectStep\(\s*"service_check"/u);
   assert.match(connect, /contributionConnectStep\(\s*"hosted_enrollment"/u);
   assert.match(connect, /contributionConnectStep\(\s*"device_pairing"/u);
+  // The pairing step is the one that stores the upload credential in the
+  // login keychain, so its progress line — on screen before the macOS access
+  // dialog can appear (2026-08-19, first pairing on a fresh Mac) — must
+  // prepare the reader: what asks, that the requester is the bundled helper
+  // macOS lists as node, and that Always Allow keeps background uploads
+  // working instead of re-prompting every pass.
+  const pairingStep = appSource.match(
+    /device_pairing: Object\.freeze\(\{([\s\S]*?)\}\),/u,
+  )?.[1] ?? "";
+  assert.match(pairingStep, /macOS may ask for your login password/u);
+  assert.match(pairingStep, /which macOS lists as node/u);
+  assert.match(
+    pairingStep,
+    /Choose Always Allow so background uploads keep working/u,
+  );
   // Re-pinned 2026-08-08 (owner-directed, second round): queue_refresh left
   // with the separate connect flow — the merged ceremony's invisible
   // bootstrap owns the queue and reports its own failures with the same

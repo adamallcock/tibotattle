@@ -1042,6 +1042,60 @@ test("an approval on a Mac that already holds a device binding keeps the immedia
   }
 });
 
+test("a denied Keychain read at pairing answers with its dialog-specific recovery code", async () => {
+  // Deny (or cancel) in the macOS access dialog surfaces from the capability
+  // layer as contribution_device_credential_denied. The route must keep that
+  // one cause distinguishable — the dashboard tells the user which dialog to
+  // answer differently — while every other broken-credential state stays on
+  // the generic recovery code, and non-recovery failures stay 502.
+  const files = await fixture();
+  const failures = [
+    ["contribution_device_credential_denied", 409,
+      "contribution_device_keychain_access_denied"],
+    ["contribution_device_credential_locked", 409,
+      "contribution_device_recovery_required"],
+    ["contribution_device_credential_conflict", 409,
+      "contribution_device_recovery_required"],
+    ["contribution_device_client_pairing_rejected", 502,
+      "contribution_device_pairing_failed"],
+  ];
+  let thrownCode = null;
+  const app = await startApp(files, {
+    incrementalContributionController: fakeIncrementalController(),
+    contributionDevicePairingProvider: async () => {
+      const error = new Error("pairing failed");
+      error.code = thrownCode;
+      throw error;
+    },
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    for (const [capabilityCode, status, routeCode] of failures) {
+      thrownCode = capabilityCode;
+      const pairing = await fetch(
+        `${base}/api/local/contribution/device-pair`,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            pairingCode: `um_pair_${REVIEW_JOB_ID}.${"C".repeat(43)}`,
+          }),
+        },
+      );
+      assert.equal(pairing.status, status, capabilityCode);
+      assert.equal((await pairing.json()).error.code, routeCode, capabilityCode);
+    }
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
 test("the local kick route resumes the schedule now and starts a due pass (2026-08-10)", async () => {
   // The operator's lever against an inherited retry backoff: during the live
   // 86-day backfill stall, resume() was reachable only through device-pair,

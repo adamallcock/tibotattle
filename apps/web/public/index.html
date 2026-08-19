@@ -1172,6 +1172,18 @@
               Approval is asked once. Only a change to the kind of data or the
               destination asks again.
             </p>
+            <!--
+              The connect step stores the upload credential in the login
+              keychain, and macOS raises its own password dialog for that with
+              zero context (observed live 2026-08-19, first pairing on a fresh
+              Mac). This prepares the reader before the click; the ceremony's
+              pairing step repeats the guidance at the moment it applies.
+            -->
+            <p class="annotation">
+              Connecting stores this Mac's upload credential in your login
+              keychain. If macOS asks for permission, choose Always Allow so
+              background uploads keep working.
+            </p>
             <p class="participant-action-status" id="incremental-consent-status" role="status" hidden></p>
             <!--
               The modest status line for the running sync after approval:

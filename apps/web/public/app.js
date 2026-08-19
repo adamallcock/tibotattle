@@ -10405,6 +10405,8 @@ const LOCAL_COMPANION_ERROR_COPY = {
     "The contribution service did not complete device pairing. Nothing was uploaded; try again shortly.",
   contribution_device_recovery_required: CONTRIBUTION_DEVICE_CONFLICT_COPY,
   contribution_device_credential_conflict: CONTRIBUTION_DEVICE_CONFLICT_COPY,
+  contribution_device_keychain_access_denied:
+    "macOS did not let TiboTattle read the upload credential it just stored for this Mac — this happens when Deny is chosen in the macOS keychain dialog. Nothing was uploaded. Clear the credential below, choose Review and approve again, and choose Always Allow when macOS asks.",
   unsupported_media_type:
     "The local companion rejected this request format. Nothing was uploaded; reload TiboTattle and try again.",
   request_too_large:
@@ -12156,7 +12158,8 @@ async function deleteCommunityContributions() {
 function contributionDeviceRecoveryIsRequired(error) {
   try {
     return error?.code === "contribution_device_recovery_required"
-      || error?.code === "contribution_device_credential_conflict";
+      || error?.code === "contribution_device_credential_conflict"
+      || error?.code === "contribution_device_keychain_access_denied";
   } catch {
     return false;
   }
@@ -12363,7 +12366,14 @@ const CONTRIBUTION_CONNECT_STEPS = Object.freeze({
   }),
   device_pairing: Object.freeze({
     connects: true,
-    progress: "Connecting this Mac as an upload-only device…",
+    // This step is the one that stores the upload credential in the login
+    // keychain, so the macOS access dialog — a password prompt naming the
+    // bundled helper, node, with zero context of its own — can appear the
+    // moment it runs (observed live 2026-08-19, first pairing on a fresh
+    // Mac). The preparation must already be on screen when that happens:
+    // what asks, why, and that Always Allow is the answer that keeps
+    // background passes running instead of re-prompting every six hours.
+    progress: "Connecting this Mac as an upload-only device… macOS may ask for your login password to protect this Mac's upload credential; the request comes from TiboTattle's bundled helper, which macOS lists as node. Choose Always Allow so background uploads keep working.",
     stopped: "Connecting stopped at step 3 of 3, pairing this Mac as an upload-only device.",
     failure:
       "The pairing was not completed, so this Mac is not connected. Nothing was uploaded; retrying is safe.",

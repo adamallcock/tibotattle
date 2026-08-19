@@ -4142,11 +4142,20 @@ function createPreparedLocalCompanionServer({
         } catch (error) {
           const recoveryRequired =
             contributionDeviceRecoveryRequired(error);
+          // A denied Keychain read is the one recovery cause the user acted
+          // on directly — Deny (or cancel) in the macOS access dialog the
+          // mint's read-back raises — so it keeps its own code and the
+          // dashboard can say which dialog to answer differently. The reset
+          // ceremony is the cure for every recovery code either way.
+          const keychainAccessDenied =
+            error?.code === "contribution_device_credential_denied";
           sendError(
             response,
             recoveryRequired ? 409 : 502,
             recoveryRequired
-              ? "contribution_device_recovery_required"
+              ? keychainAccessDenied
+                ? "contribution_device_keychain_access_denied"
+                : "contribution_device_recovery_required"
               : "contribution_device_pairing_failed",
           );
         }
