@@ -974,6 +974,31 @@ export const WEB_MESSAGES = Object.freeze({
     "正在这台 Mac 上准备一份涵盖数据的真实实例供你审阅。不会执行任何网络上传。",
     "Preparando en este Mac una instancia real de los datos cubiertos para que la revises. No se realiza ninguna subida de red.",
   ],
+  "consent.reviewUnavailable": [
+    "TiboTattle could not read the local review state. Choose Check again. Nothing was uploaded.",
+    "TiboTattle 无法读取本地审阅状态。请选择“再次检查”。未上传任何内容。",
+    "TiboTattle no pudo leer el estado de revisión local. Elige Comprobar de nuevo. No se cargó nada.",
+  ],
+  "contribution.diagnostics.copy": [
+    "Copy diagnostics",
+    "复制诊断信息",
+    "Copiar diagnóstico",
+  ],
+  "contribution.diagnostics.copying": [
+    "Copying…",
+    "正在复制…",
+    "Copiando…",
+  ],
+  "contribution.diagnostics.copied": [
+    "Diagnostics copied",
+    "诊断信息已复制",
+    "Diagnóstico copiado",
+  ],
+  "contribution.diagnostics.failed": [
+    "Could not copy diagnostics",
+    "无法复制诊断信息",
+    "No se pudo copiar el diagnóstico",
+  ],
   "consent.syncProgress": [
     "Sync: {synced} of {total} days synced · {pending} pending.",
     "同步：{total} 天中已同步 {synced} 天 · 待同步 {pending} 天。",
@@ -1026,11 +1051,12 @@ export const WEB_MESSAGES = Object.freeze({
   ],
   "consent.stateApproved": ["Approved", "已核准", "Aprobado"],
   "consent.stateNotApproved": ["Not approved", "未核准", "No aprobado"],
-  // The merged four-state identity status shown at the sign-in chip, and the
+  // The merged five-state identity status shown at the sign-in chip, and the
   // one next action beside it (owner-reported contradictory states,
-  // 2026-08-08/10). New / Signing in… / Reconnecting / Connected.
+  // 2026-08-08/10). New / Signing in… / Signed in / Reconnecting / Connected.
   "identity.state.new": ["New", "新", "Nuevo"],
   "identity.state.signingIn": ["Signing in…", "正在登录…", "Iniciando sesión…"],
+  "identity.state.signedIn": ["Signed in", "已登录", "Sesión iniciada"],
   "identity.state.reconnecting": ["Reconnecting", "正在重新连接", "Reconectando"],
   "identity.state.connected": ["Connected", "已连接", "Conectado"],
   "identity.next.new": [
@@ -1042,6 +1068,11 @@ export const WEB_MESSAGES = Object.freeze({
     "Finish in your browser; TiboTattle returns when it's ready.",
     "请在浏览器中完成；准备就绪后 TiboTattle 会自动返回。",
     "Termina en tu navegador; TiboTattle vuelve cuando esté listo.",
+  ],
+  "identity.next.signedIn": [
+    "Review below, then approve to connect this Mac. Nothing uploads before approval.",
+    "请在下方审阅并核准以连接这台 Mac。核准前不会上传任何内容。",
+    "Revisa abajo y aprueba para conectar este Mac. Nada se sube antes de aprobar.",
   ],
   "identity.next.reconnecting": [
     "Reconnecting this Mac automatically. Nothing was uploaded.",
@@ -1397,6 +1428,7 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Covered: token counts, model identifiers or keyed fingerprints, tier, surface and outcome categories, timestamps, quota percentages, tool-class counts per session, and stable pseudonymous session identifiers.": ["涵盖：令牌数量、模型标识符或密钥指纹、层级、界面与结果类别、时间戳、额度百分比、每个会话的工具类别计数，以及稳定的化名会话标识符。", "Cubierto: recuentos de tokens, identificadores de modelo o huellas con clave, categorías de nivel, superficie y resultado, marcas de tiempo, porcentajes de cuota, recuentos de clases de herramientas por sesión e identificadores de sesión seudónimos estables."],
   "Never covered: prompts, responses, file names, paths, commands, or any account identifier.": ["绝不涵盖：提示词、回复、文件名、路径、命令或任何帐户标识符。", "Nunca cubierto: indicaciones, respuestas, nombres de archivo, rutas, comandos ni ningún identificador de cuenta."],
   "Review and approve": ["审阅并核准", "Revisar y aprobar"],
+  "Copy diagnostics": ["复制诊断信息", "Copiar diagnóstico"],
   "Retry now": ["立即重试", "Reintentar ahora"],
   "Approval is asked once. Only a change to the kind of data or the destination asks again.": ["核准只询问一次。只有数据类型或目的地发生变化时才会再次询问。", "La aprobación se pide una sola vez. Solo un cambio en el tipo de datos o el destino vuelve a preguntar."],
   "Minimum observed quota span": ["最低观测额度跨度", "Intervalo mínimo de cuota observado"],
