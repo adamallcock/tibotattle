@@ -1202,6 +1202,8 @@ export function createLocalContributionSyncQueueContext({
   verifyPreparedSet,
   loadPreparedContribution,
   syncPreparedEntry,
+  platform = process.platform,
+  windowsSqliteStateSessionFactory = null,
 } = {}) {
   const storageFactory = requireFunction(createStorage, "createStorage");
   const storage = Reflect.apply(storageFactory, undefined, [{
@@ -1211,6 +1213,8 @@ export function createLocalContributionSyncQueueContext({
     maximumQueueBytes: MAX_QUEUE_BYTES,
     maximumQueueJobs: MAX_QUEUE_JOBS,
     jobStates: JOB_STATES,
+    platform,
+    windowsSqliteStateSessionFactory,
   }]);
   const runtime = Object.freeze({
     storage: captureStorage(storage),
