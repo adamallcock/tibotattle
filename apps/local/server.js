@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { constants, lstatSync } from "node:fs";
 import { lstat, open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -13,7 +13,14 @@ import {
 } from "../../src/local-companion-data.js";
 import {
   createLocalContributionSyncQueueContext,
+  createLocalMetadataBundleVerificationContext,
+  createLocalMetadataExportContext,
+  createWindowsPreparedContributionContext,
+  isWindowsPreparedContributionContext,
 } from "../../src/application/index.js";
+import {
+  createLocalContributionPreparationContext,
+} from "../../src/application/local-contribution-preparation.js";
 import {
   defaultClaudeSettingsFile,
 } from "../../src/claude-callback-lifecycle.js";
@@ -47,9 +54,8 @@ import {
 } from "../../src/contribution-incremental-sync.js";
 import { syncPreparedContributionEntryOnce } from "../../src/contribution-device-sync.js";
 import {
-  loadVerifiedPreparedContribution,
-  verifyPreparedContributionSet,
-} from "../../src/telemetry-prepared-set.js";
+  materializeTelemetryContributions,
+} from "../../src/telemetry-contribution-builder.js";
 import {
   createFastModePreferenceController,
 } from "../../src/fast-mode-preference.js";
@@ -135,16 +141,39 @@ import {
   selectProductionParticipantIdentity,
 } from "../../src/export-identity-production.js";
 import {
+  deriveAccountScopeId,
+  deriveEventOccurrenceId,
+  deriveMarkerOccurrenceId,
+  deriveModelFingerprint,
+  deriveParticipantId,
+  deriveQuotaStateId,
+  deriveSessionScopeId,
+  deriveSnapshotObservationId,
+  randomBundleId,
+  withParticipantSecretLease,
+} from "../../src/export-identity.js";
+import { exportCompatibilityTuple } from "../../src/export-contract.js";
+import { createExportResourceGuard } from "../../src/export-resource-policy.js";
+import { readBoundedJsonLines } from "../../src/bounded-jsonl.js";
+import {
+  createLocalCodexLogPorts,
   createWindowsFilesystemAdapter,
   createWindowsCompanionInstanceLeaseContext,
+  createWindowsPreparedArtifactStorageContext,
+  createWindowsReviewPairStorageContext,
   createWindowsProtectedStateStore,
   createWindowsSqliteStateSession,
   createWindowsSqliteStateStaging,
   createLocalContributionSyncQueueStorageContext,
   isWindowsCompanionInstanceLeaseContext,
   isWindowsFilesystemAdapter,
+  isWindowsPreparedArtifactStorage,
+  isWindowsPreparedArtifactStorageError,
+  isWindowsReviewPairStorage,
   isWindowsProtectedStateStore,
   isWindowsSqliteStateStaging,
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_ARTIFACT_BYTES,
+  sha256Hex,
   WINDOWS_SQLITE_STATE_SESSION_PRODUCTION_SAFE,
 } from "../../src/platform/index.js";
 import {
@@ -2417,6 +2446,609 @@ function windowsFilesystemConfigurationError() {
   return error;
 }
 
+function sameWindowsStateRoot(left, right) {
+  if (typeof left !== "string" || typeof right !== "string") return false;
+  try {
+    return win32.normalize(left.replaceAll("/", "\\")).toLowerCase()
+      === win32.normalize(right.replaceAll("/", "\\")).toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+const WINDOWS_REVIEW_DIRECTORY =
+  /^review-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const WINDOWS_REVIEW_PAIR_STORAGE_ROOTS = new WeakMap();
+const WINDOWS_REVIEW_PAIR_STORAGE_BACKENDS = new WeakMap();
+const WINDOWS_METADATA_EXPORT_CONTEXTS = new WeakSet();
+const WINDOWS_METADATA_VERIFICATION_CONTEXTS = new WeakSet();
+const WINDOWS_METADATA_EXPORT_REVIEW_PAIR_STORAGES = new WeakMap();
+const WINDOWS_METADATA_VERIFICATION_REVIEW_PAIR_STORAGES = new WeakMap();
+const WINDOWS_PREPARED_CONTRIBUTION_STORAGES = new WeakMap();
+
+function isWindowsReviewPairStorageForRoot(value, root) {
+  if (!isWindowsReviewPairStorage(value)) return false;
+  try {
+    return sameWindowsStateRoot(
+      WINDOWS_REVIEW_PAIR_STORAGE_ROOTS.get(value),
+      root,
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isWindowsReviewPairStorageForStorage(value, storage) {
+  if (!isWindowsReviewPairStorage(value)
+      || !isWindowsPreparedArtifactStorage(storage)) {
+    return false;
+  }
+  try {
+    return WINDOWS_REVIEW_PAIR_STORAGE_BACKENDS.get(value) === storage;
+  } catch {
+    return false;
+  }
+}
+
+function isWindowsMetadataExportContext(value) {
+  try {
+    return value !== null
+      && typeof value === "object"
+      && WINDOWS_METADATA_EXPORT_CONTEXTS.has(value);
+  } catch {
+    return false;
+  }
+}
+
+function isWindowsMetadataVerificationContext(value) {
+  try {
+    return value !== null
+      && typeof value === "object"
+      && WINDOWS_METADATA_VERIFICATION_CONTEXTS.has(value);
+  } catch {
+    return false;
+  }
+}
+
+function isWindowsMetadataExportContextForReviewPairStorage(
+  value,
+  reviewPairStorage,
+) {
+  if (!isWindowsMetadataExportContext(value)
+      || !isWindowsReviewPairStorage(reviewPairStorage)) {
+    return false;
+  }
+  try {
+    return WINDOWS_METADATA_EXPORT_REVIEW_PAIR_STORAGES.get(value)
+      === reviewPairStorage;
+  } catch {
+    return false;
+  }
+}
+
+function isWindowsMetadataVerificationContextForReviewPairStorage(
+  value,
+  reviewPairStorage,
+) {
+  if (!isWindowsMetadataVerificationContext(value)
+      || !isWindowsReviewPairStorage(reviewPairStorage)) {
+    return false;
+  }
+  try {
+    return WINDOWS_METADATA_VERIFICATION_REVIEW_PAIR_STORAGES.get(value)
+      === reviewPairStorage;
+  } catch {
+    return false;
+  }
+}
+
+function isWindowsPreparedContributionContextForStorage(
+  value,
+  storage,
+) {
+  if (!isWindowsPreparedContributionContext(value)
+      || !isWindowsPreparedArtifactStorage(storage)) {
+    return false;
+  }
+  try {
+    return WINDOWS_PREPARED_CONTRIBUTION_STORAGES.get(value) === storage;
+  } catch {
+    return false;
+  }
+}
+
+const WINDOWS_PREPARATION_STAGING_DIRECTORY =
+  /^\.preparing-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const WINDOWS_PREPARATION_STORAGE_CONTEXTS = new WeakSet();
+
+/**
+ * Remove only abandoned Windows contribution staging directories before a
+ * preparation attempt. The prepared-artifact context deliberately uses
+ * no-clobber publication, so a crash between staged-manifest creation and
+ * publication must not leave a stage file that makes the next recovery pass
+ * fail closed forever. Review-pair files are outside this helper's scope and
+ * remain owned by the metadata storage seam.
+ */
+function recoverWindowsPreparedStagingEvidence({
+  storage,
+  preparedContributionDirectory,
+} = {}) {
+  if (!isWindowsPreparedArtifactStorage(storage)
+      || typeof storage.rootPath !== "string"
+      || typeof preparedContributionDirectory !== "string") {
+    throw new TypeError("Windows prepared staging recovery is invalid");
+  }
+  const root = win32.normalize(storage.rootPath.replaceAll("/", "\\"));
+  const candidate = win32.normalize(
+    preparedContributionDirectory.replaceAll("/", "\\"),
+  );
+  const relative = win32.relative(root, candidate);
+  if (!relative
+      || relative === ".."
+      || relative.startsWith("..\\")
+      || win32.isAbsolute(relative)) {
+    throw new TypeError("Windows prepared staging recovery is invalid");
+  }
+  let entries;
+  try {
+    entries = storage.enumerateDirectory(relative, 256);
+  } catch {
+    throw new Error("Windows prepared staging recovery failed");
+  }
+  if (!Array.isArray(entries)) {
+    throw new Error("Windows prepared staging recovery failed");
+  }
+  for (const entry of entries) {
+    if (!entry?.isDirectory
+        || entry.isReparsePoint !== false
+        || !WINDOWS_PREPARATION_STAGING_DIRECTORY.test(entry.name)) {
+      continue;
+    }
+    const stagingRelative = win32.join(relative, entry.name);
+    let children;
+    try {
+      children = storage.enumerateDirectory(stagingRelative, 256);
+    } catch {
+      throw new Error("Windows prepared staging recovery failed");
+    }
+    if (!Array.isArray(children)
+        || children.some((child) => !child?.isRegularFile
+          || child.isDirectory
+          || child.isReparsePoint !== false)) {
+      throw new Error("Windows prepared staging recovery failed");
+    }
+    try {
+      for (const child of children) {
+        storage.deleteFile(
+          win32.join(stagingRelative, child.name),
+          child.identity,
+        );
+      }
+      storage.removeDirectory(stagingRelative, entry.identity);
+    } catch {
+      throw new Error("Windows prepared staging recovery failed");
+    }
+  }
+}
+
+function windowsPreparationFailure(createError, code) {
+  if (typeof createError !== "function") {
+    throw new TypeError("Windows preparation error factory is invalid");
+  }
+  let error;
+  try {
+    error = createError(code);
+  } catch {
+    throw new TypeError("Windows preparation error factory is invalid");
+  }
+  if (!(error instanceof Error)) {
+    throw new TypeError("Windows preparation error factory is invalid");
+  }
+  throw error;
+}
+
+function windowsPreparedRelativePath(
+  storage,
+  value,
+  createError,
+  code,
+) {
+  if (!isWindowsPreparedArtifactStorage(storage)
+      || typeof value !== "string"
+      || value.length < 1) {
+    windowsPreparationFailure(createError, code);
+  }
+  const root = win32.normalize(storage.rootPath.replaceAll("/", "\\"));
+  const candidate = win32.normalize(value.replaceAll("/", "\\"));
+  const relative = win32.relative(root, candidate);
+  if (!relative
+      || relative === ".."
+      || relative.startsWith("..\\")
+      || win32.isAbsolute(relative)) {
+    windowsPreparationFailure(createError, code);
+  }
+  return relative;
+}
+
+function createWindowsMetadataContexts({
+  reviewPairStorage,
+  stateRoot,
+  environment = process.env,
+  homeDirectory = homedir(),
+} = {}) {
+  if (!isWindowsReviewPairStorage(reviewPairStorage)
+      || !isWindowsReviewPairStorageForRoot(
+        reviewPairStorage,
+        stateRoot,
+      )) {
+    throw windowsFilesystemConfigurationError();
+  }
+  const platformName = () => "windows";
+  let metadataExport;
+  let metadataVerification;
+  try {
+    const codexLogPorts = createLocalCodexLogPorts({
+      environment,
+      homeDirectory,
+    });
+    metadataExport = createLocalMetadataExportContext({
+      clock: () => Date.now(),
+      codexLogPorts,
+      createHash,
+      deriveAccountScopeId,
+      deriveEventOccurrenceId,
+      deriveMarkerOccurrenceId,
+      deriveModelFingerprint,
+      deriveParticipantId,
+      deriveQuotaStateId,
+      deriveSessionScopeId,
+      deriveSnapshotObservationId,
+      exportCompatibilityTuple,
+      platformName,
+      randomBundleId,
+      // The Windows review-pair context accepts the absolute compatibility
+      // paths emitted by the metadata application facade and resolves them
+      // with Windows semantics even when a contract test runs on another OS.
+      resolvePath: win32.resolve,
+      rss: () => process.memoryUsage().rss,
+      sha256Hex,
+      reviewPairStorage,
+      reviewPairStorageValidator: isWindowsReviewPairStorage,
+    });
+    metadataVerification = createLocalMetadataBundleVerificationContext({
+      compatibilityTuple: exportCompatibilityTuple,
+      platformName,
+      reviewPairStorage,
+      reviewPairStorageValidator: isWindowsReviewPairStorage,
+      sha256Hex,
+    });
+  } catch {
+    throw windowsFilesystemConfigurationError();
+  }
+  if (!metadataExport
+      || typeof metadataExport.buildLocalMetadataBundle !== "function"
+      || typeof metadataExport.writeLocalMetadataBundle !== "function"
+      || !metadataVerification
+      || typeof metadataVerification.loadVerifiedLocalMetadataBundleFiles
+        !== "function") {
+    throw windowsFilesystemConfigurationError();
+  }
+  WINDOWS_METADATA_EXPORT_CONTEXTS.add(metadataExport);
+  WINDOWS_METADATA_VERIFICATION_CONTEXTS.add(metadataVerification);
+  WINDOWS_METADATA_EXPORT_REVIEW_PAIR_STORAGES.set(
+    metadataExport,
+    reviewPairStorage,
+  );
+  WINDOWS_METADATA_VERIFICATION_REVIEW_PAIR_STORAGES.set(
+    metadataVerification,
+    reviewPairStorage,
+  );
+  return Object.freeze({
+    metadataExport,
+    metadataVerification,
+  });
+}
+
+function createWindowsContributionPreparationContext({
+  preparationStorage,
+  preparationStorageValidator,
+  stateRoot,
+  codexHome,
+  activityFile,
+  selectIdentity,
+  metadataExport,
+  metadataVerification,
+  materialize,
+  verifyPreparedSet,
+} = {}) {
+  if (!isWindowsContributionPreparationStorage(preparationStorage)
+      || typeof preparationStorageValidator !== "function"
+      || typeof selectIdentity !== "function"
+      || !isWindowsMetadataExportContext(metadataExport)
+      || !isWindowsMetadataVerificationContext(metadataVerification)
+      || typeof materialize !== "function"
+      || typeof verifyPreparedSet !== "function") {
+    throw windowsFilesystemConfigurationError();
+  }
+  try {
+    return createLocalContributionPreparationContext({
+      defaultStateDirectory: () => stateRoot,
+      defaultCodexHome: () => codexHome,
+      defaultActivityFile: () => activityFile,
+      joinPath: win32.join,
+      storage: preparationStorage,
+      storageValidator: preparationStorageValidator,
+      uuid: randomUUID,
+      createResourceGuard: createExportResourceGuard,
+      readActivityMarkers: readBoundedJsonLines,
+      selectIdentity,
+      withIdentityLease: withParticipantSecretLease,
+      buildBundle: metadataExport.buildLocalMetadataBundle,
+      writeBundle: metadataExport.writeLocalMetadataBundle,
+      verifySource: metadataVerification.loadVerifiedLocalMetadataBundleFiles,
+      materialize,
+      verifyPreparedSet,
+    });
+  } catch {
+    throw windowsFilesystemConfigurationError();
+  }
+}
+
+/**
+ * Bind telemetry materialization to the root-bound Windows contribution and
+ * metadata contexts. The caller-supplied contexts have already been proven to
+ * belong to one composition by createPreparedLocalCompanionServer; keeping
+ * the adapter here small makes it impossible for a Windows preparation runner
+ * to fall back to the module-level POSIX source verifier.
+ */
+export function createWindowsContributionMaterializer({
+  preparedContributionContext,
+  windowsPreparedArtifactStorage,
+  windowsReviewPairStorage,
+  windowsMetadataBundleVerificationContext,
+} = {}) {
+  if (!isWindowsPreparedContributionContextForStorage(
+    preparedContributionContext,
+    windowsPreparedArtifactStorage,
+  )
+      || !isWindowsMetadataVerificationContextForReviewPairStorage(
+        windowsMetadataBundleVerificationContext,
+        windowsReviewPairStorage,
+      )
+      || typeof windowsMetadataBundleVerificationContext
+        .loadVerifiedLocalMetadataBundleFiles !== "function") {
+    throw windowsFilesystemConfigurationError();
+  }
+  const loadVerifiedSource =
+    windowsMetadataBundleVerificationContext
+      .loadVerifiedLocalMetadataBundleFiles;
+  return (options = {}) => materializeTelemetryContributions({
+    ...options,
+    preparedContributionContext,
+    isPreparedContributionContext: isWindowsPreparedContributionContext,
+    loadVerifiedSource,
+  });
+}
+
+async function recoverWindowsReviewPairEvidence({
+  storage,
+  reviewPairStorage,
+  reviewArchiveDirectory,
+} = {}) {
+  if (!isWindowsPreparedArtifactStorage(storage)
+      || !isWindowsReviewPairStorageForRoot(
+        reviewPairStorage,
+        storage.rootPath,
+      )
+      || typeof reviewArchiveDirectory !== "string") {
+    throw new Error("Windows review-pair recovery is invalid");
+  }
+  const relative = windowsPreparedRelativePath(
+    storage,
+    reviewArchiveDirectory,
+    () => new Error("Windows review-pair recovery is invalid"),
+    "review_archive_invalid",
+  );
+  let archive;
+  try {
+    archive = storage.inspect(relative);
+  } catch (error) {
+    if (windowsPreparedStorageErrorIsMissing(error)) return;
+    throw new Error("Windows review-pair recovery failed");
+  }
+  if (!archive?.isDirectory || archive.isReparsePoint !== false) {
+    throw new Error("Windows review-pair recovery failed");
+  }
+  let entries;
+  try {
+    entries = storage.enumerateDirectory(relative, 256);
+  } catch {
+    throw new Error("Windows review-pair recovery failed");
+  }
+  if (!Array.isArray(entries)) {
+    throw new Error("Windows review-pair recovery failed");
+  }
+  for (const entry of entries) {
+    if (typeof entry?.name !== "string"
+        || !entry.name.toLowerCase().startsWith("review-")) continue;
+    if (!WINDOWS_REVIEW_DIRECTORY.test(entry.name)
+        || !entry.isDirectory
+        || entry.isReparsePoint !== false) {
+      throw new Error("Windows review-pair recovery failed");
+    }
+    try {
+      await reviewPairStorage.recoverReviewPairTransactions({
+        directory: win32.join(reviewArchiveDirectory, entry.name),
+      });
+    } catch {
+      throw new Error("Windows review-pair recovery failed");
+    }
+  }
+}
+
+function windowsPreparedStorageErrorIsMissing(error) {
+  return isWindowsPreparedArtifactStorageError(error)
+    && typeof error.code === "string"
+    && error.code.endsWith("_missing");
+}
+
+/**
+ * Adapt the root-bound prepared-artifact capability to the directory
+ * lifecycle ports consumed by the application preparation state machine.
+ * Every operation is translated to a root-relative native call; none of the
+ * six ports can reach Node's path-based filesystem implementation.
+ */
+function createWindowsContributionPreparationStorage({ storage }) {
+  if (!isWindowsPreparedArtifactStorage(storage)) {
+    throw windowsFilesystemConfigurationError();
+  }
+  const inspectDirectory = async (path, code, createError) => {
+    const relative = windowsPreparedRelativePath(
+      storage,
+      path,
+      createError,
+      code,
+    );
+    try {
+      const inspected = storage.inspect(relative);
+      if (!inspected?.isDirectory
+          || inspected.isReparsePoint !== false
+          || !inspected.identity) {
+        windowsPreparationFailure(createError, code);
+      }
+      return { relative, inspected };
+    } catch (error) {
+      if (error instanceof Error && error.code?.startsWith(
+        "local-contribution-preparation-",
+      )) {
+        throw error;
+      }
+      if (windowsPreparedStorageErrorIsMissing(error)) return null;
+      windowsPreparationFailure(createError, code);
+    }
+  };
+  const ensureDirectory = async (path, code, createError, allowExisting) => {
+    const selected = await inspectDirectory(path, code, createError);
+    if (selected !== null && !allowExisting) {
+      windowsPreparationFailure(createError, code);
+    }
+    const relative = selected?.relative
+      ?? windowsPreparedRelativePath(storage, path, createError, code);
+    try {
+      storage.ensureDirectory(relative);
+    } catch {
+      windowsPreparationFailure(createError, code);
+    }
+    return path;
+  };
+  const context = Object.freeze({
+    assertPathAbsent: async (path, code, createError) => {
+      const selected = await inspectDirectory(path, code, createError);
+      if (selected !== null) windowsPreparationFailure(createError, code);
+    },
+    createOwnerOnlyDirectory: (path, code, createError) => ensureDirectory(
+      path,
+      code,
+      createError,
+      false,
+    ),
+    ownerOnlyDirectoryExists: async (path, code, createError) => (
+      (await inspectDirectory(path, code, createError)) !== null
+    ),
+    prepareOwnerOnlyDirectory: (path, code, createError) => ensureDirectory(
+      path,
+      code,
+      createError,
+      true,
+    ),
+    removeEmptyOwnerOnlyDirectory: async (
+      path,
+      parentDirectory,
+      createError,
+    ) => {
+      const selected = await inspectDirectory(
+        path,
+        "preparation_failed",
+        createError,
+      );
+      if (selected === null) return;
+      let entries;
+      try {
+        entries = storage.enumerateDirectory(selected.relative, 256);
+      } catch {
+        // Cleanup is deliberately best-effort; the outer recovery pass will
+        // inspect the same staging directory before the next attempt.
+        return;
+      }
+      if (!Array.isArray(entries) || entries.length !== 0) return;
+      try {
+        storage.removeDirectory(selected.relative, selected.inspected.identity);
+      } catch {
+        // Preserve the original preparation error and leave evidence for the
+        // next guarded recovery pass.
+      }
+    },
+    renameDirectory: async (source, target) => {
+      const sourceRelative = windowsPreparedRelativePath(
+        storage,
+        source,
+        () => new Error("Windows prepared directory rename failed"),
+        "preparation_failed",
+      );
+      const targetRelative = windowsPreparedRelativePath(
+        storage,
+        target,
+        () => new Error("Windows prepared directory rename failed"),
+        "preparation_failed",
+      );
+      let inspected;
+      try {
+        inspected = storage.inspect(sourceRelative);
+        if (!inspected?.isDirectory || inspected.isReparsePoint !== false) {
+          throw new Error("Windows prepared directory rename failed");
+        }
+        storage.renameDirectory(
+          sourceRelative,
+          inspected.identity,
+          targetRelative,
+        );
+      } catch {
+        throw new Error("Windows prepared directory rename failed");
+      }
+      return target;
+    },
+    syncDirectory: async (path) => {
+      const relative = windowsPreparedRelativePath(
+        storage,
+        path,
+        () => new Error("Windows prepared directory sync failed"),
+        "preparation_failed",
+      );
+      // Current native prepared operations are synchronous and perform their
+      // own handle-bound flush. If a future reviewed context exposes an
+      // explicit directory sync port, prefer it without changing the
+      // application contract.
+      if (typeof storage.syncDirectory === "function") {
+        storage.syncDirectory(relative);
+      } else {
+        storage.ensureDirectory(relative);
+      }
+    },
+  });
+  WINDOWS_PREPARATION_STORAGE_CONTEXTS.add(context);
+  return context;
+}
+
+function isWindowsContributionPreparationStorage(value) {
+  try {
+    return value !== null
+      && typeof value === "object"
+      && WINDOWS_PREPARATION_STORAGE_CONTEXTS.has(value);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Select the single Windows filesystem boundary owned by this composition
  * root. Packaged Windows starts by loading the repository-owned adapter;
@@ -2487,6 +3119,8 @@ export function createCompanionWindowsStateComposition({
   architecture = process.arch,
   stateRoot,
   windowsFilesystemAdapter = null,
+  environment = process.env,
+  homeDirectory = homedir(),
 } = {}) {
   if (windowsFilesystemAdapter === null) {
     return Object.freeze({
@@ -2496,12 +3130,99 @@ export function createCompanionWindowsStateComposition({
       sqliteStateStaging: null,
       contributionSyncQueue: null,
       windowsCompanionInstanceLease: null,
+      preparedArtifactStorage: null,
+      preparedContributionContext: null,
+      windowsPreparedArtifactStorage: null,
+      windowsPreparedContributionContext: null,
+      windowsReviewPairStorage: null,
+      reviewPairStorage: null,
+      windowsMetadataExportContext: null,
+      windowsMetadataBundleVerificationContext: null,
     });
   }
   if (platform !== "win32"
       || typeof architecture !== "string"
       || architecture.length < 1
       || !isWindowsFilesystemAdapter(windowsFilesystemAdapter)) {
+    throw windowsFilesystemConfigurationError();
+  }
+  let preparedArtifactStorage;
+  try {
+    preparedArtifactStorage = createWindowsPreparedArtifactStorageContext({
+      adapter: windowsFilesystemAdapter,
+      // The shared root context must admit the larger reviewed metadata pair
+      // (34 MiB), while the Windows prepared-contribution application facade
+      // still enforces its narrower per-contribution limit on every payload.
+      maximumFileBytes:
+        WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_ARTIFACT_BYTES,
+      rootPath: stateRoot,
+    });
+  } catch {
+    // The native context is the only authority allowed to touch prepared
+    // contribution state.  Collapse its native details before the companion
+    // composition can expose any state-path information.
+    throw windowsFilesystemConfigurationError();
+  }
+  if (!isWindowsPreparedArtifactStorage(preparedArtifactStorage)
+      || !sameWindowsStateRoot(preparedArtifactStorage.rootPath, stateRoot)) {
+    throw windowsFilesystemConfigurationError();
+  }
+  let preparedContributionContext;
+  try {
+    preparedContributionContext = createWindowsPreparedContributionContext({
+      storage: preparedArtifactStorage,
+      isStorage: isWindowsPreparedArtifactStorage,
+      isStorageError: isWindowsPreparedArtifactStorageError,
+    });
+  } catch {
+    throw windowsFilesystemConfigurationError();
+  }
+  if (!isWindowsPreparedContributionContext(preparedContributionContext)
+      || !sameWindowsStateRoot(
+        preparedContributionContext.rootPath,
+        preparedArtifactStorage.rootPath,
+      )) {
+    throw windowsFilesystemConfigurationError();
+  }
+  WINDOWS_PREPARED_CONTRIBUTION_STORAGES.set(
+    preparedContributionContext,
+    preparedArtifactStorage,
+  );
+  let windowsReviewPairStorage;
+  try {
+    windowsReviewPairStorage = createWindowsReviewPairStorageContext({
+      platform,
+      storage: preparedArtifactStorage,
+    });
+  } catch {
+    throw windowsFilesystemConfigurationError();
+  }
+  if (!isWindowsReviewPairStorage(windowsReviewPairStorage)) {
+    throw windowsFilesystemConfigurationError();
+  }
+  WINDOWS_REVIEW_PAIR_STORAGE_ROOTS.set(
+    windowsReviewPairStorage,
+    preparedArtifactStorage.rootPath,
+  );
+  WINDOWS_REVIEW_PAIR_STORAGE_BACKENDS.set(
+    windowsReviewPairStorage,
+    preparedArtifactStorage,
+  );
+  if (!isWindowsReviewPairStorageForRoot(
+    windowsReviewPairStorage,
+    preparedArtifactStorage.rootPath,
+  )) {
+    throw windowsFilesystemConfigurationError();
+  }
+  let windowsMetadataContexts;
+  try {
+    windowsMetadataContexts = createWindowsMetadataContexts({
+      environment,
+      homeDirectory,
+      reviewPairStorage: windowsReviewPairStorage,
+      stateRoot: preparedArtifactStorage.rootPath,
+    });
+  } catch {
     throw windowsFilesystemConfigurationError();
   }
   let protectedStateStore;
@@ -2576,11 +3297,28 @@ export function createCompanionWindowsStateComposition({
     contributionSyncQueue = createLocalContributionSyncQueueContext({
       createStorage: createLocalContributionSyncQueueStorageContext,
       resolvePath: resolve,
-      verifyPreparedSet: verifyPreparedContributionSet,
-      loadPreparedContribution: loadVerifiedPreparedContribution,
+      // Keep these explicit even though the branded application context is
+      // also supplied below.  This makes the Windows selection visible at the
+      // composition boundary and prevents a future queue refactor from
+      // silently falling back to the module-level POSIX verifier.
+      verifyPreparedSet:
+        preparedContributionContext.verifyPreparedContributionSet,
+      loadPreparedContribution:
+        preparedContributionContext.loadVerifiedPreparedContribution,
       syncPreparedEntry: syncPreparedContributionEntryOnce,
       platform,
       windowsSqliteStateSessionFactory: sqliteStateSessionFactory,
+      windowsPreparedArtifactStorage: preparedArtifactStorage,
+      windowsPreparedContributionContext: preparedContributionContext,
+      isWindowsPreparedContributionContext,
+      windowsSyncPreparedEntry: (options = {}) => (
+        syncPreparedContributionEntryOnce({
+          ...options,
+          platform,
+          loadContribution:
+            preparedContributionContext.loadVerifiedPreparedContribution,
+        })
+      ),
     });
   } catch {
     throw windowsFilesystemConfigurationError();
@@ -2592,6 +3330,15 @@ export function createCompanionWindowsStateComposition({
     sqliteStateStaging,
     contributionSyncQueue,
     windowsCompanionInstanceLease,
+    preparedArtifactStorage,
+    preparedContributionContext,
+    windowsPreparedArtifactStorage: preparedArtifactStorage,
+    windowsPreparedContributionContext: preparedContributionContext,
+    windowsReviewPairStorage,
+    reviewPairStorage: windowsReviewPairStorage,
+    windowsMetadataExportContext: windowsMetadataContexts.metadataExport,
+    windowsMetadataBundleVerificationContext:
+      windowsMetadataContexts.metadataVerification,
   });
 }
 
@@ -2749,6 +3496,8 @@ export function createLocalCompanionServer(options = {}) {
     architecture: process.arch,
     stateRoot: installation.stateRoot,
     windowsFilesystemAdapter,
+    environment,
+    homeDirectory,
   });
   const staticRoot = assertLocalResourceDirectory(
     installation.resourceRoot,
@@ -2850,13 +3599,23 @@ export function createLocalCompanionServer(options = {}) {
     contributionSyncQueueContext: windowsStateComposition.contributionSyncQueue,
     windowsCompanionInstanceLease:
       windowsStateComposition.windowsCompanionInstanceLease,
+    windowsPreparedArtifactStorage:
+      windowsStateComposition.preparedArtifactStorage,
+    windowsPreparedContributionContext:
+      windowsStateComposition.preparedContributionContext,
+    windowsReviewPairStorage:
+      windowsStateComposition.windowsReviewPairStorage,
+    windowsMetadataExportContext:
+      windowsStateComposition.windowsMetadataExportContext,
+    windowsMetadataBundleVerificationContext:
+      windowsStateComposition.windowsMetadataBundleVerificationContext,
     parentWatchdogPid,
     homeDirectory,
     ...claudeShadowConfiguration,
   });
 }
 
-function createPreparedLocalCompanionServer({
+export function createPreparedLocalCompanionServer({
   environment,
   resourceRoot,
   stateRoot,
@@ -2874,6 +3633,11 @@ function createPreparedLocalCompanionServer({
   windowsSqliteStateStaging = null,
   contributionSyncQueueContext = null,
   windowsCompanionInstanceLease = null,
+  windowsPreparedArtifactStorage = null,
+  windowsPreparedContributionContext = null,
+  windowsReviewPairStorage = null,
+  windowsMetadataExportContext = null,
+  windowsMetadataBundleVerificationContext = null,
   parentWatchdogPid,
   // Explicit reversible authority switch. Unified is the normal authority;
   // legacy is retained only for an explicit rollback selection.
@@ -3011,7 +3775,12 @@ function createPreparedLocalCompanionServer({
         || windowsSqliteStateSessionForPath !== null
         || windowsSqliteStateStaging !== null
         || contributionSyncQueueContext !== null
-        || windowsCompanionInstanceLease !== null)) {
+        || windowsCompanionInstanceLease !== null
+        || windowsPreparedArtifactStorage !== null
+        || windowsPreparedContributionContext !== null
+        || windowsReviewPairStorage !== null
+        || windowsMetadataExportContext !== null
+        || windowsMetadataBundleVerificationContext !== null)) {
     throw windowsFilesystemConfigurationError();
   }
   if (windowsFilesystemAdapter !== null
@@ -3022,7 +3791,49 @@ function createPreparedLocalCompanionServer({
         || contributionSyncQueueContext === null
         || !isWindowsCompanionInstanceLeaseContext(
           windowsCompanionInstanceLease,
+        )
+        || !isWindowsPreparedArtifactStorage(windowsPreparedArtifactStorage)
+        || !isWindowsPreparedContributionContextForStorage(
+          windowsPreparedContributionContext,
+          windowsPreparedArtifactStorage,
+        )
+        || !isWindowsReviewPairStorageForRoot(
+          windowsReviewPairStorage,
+          stateRoot,
+        )
+        || !isWindowsReviewPairStorageForStorage(
+          windowsReviewPairStorage,
+          windowsPreparedArtifactStorage,
+        )
+        || !isWindowsMetadataExportContextForReviewPairStorage(
+          windowsMetadataExportContext,
+          windowsReviewPairStorage,
+        )
+        || !isWindowsMetadataVerificationContextForReviewPairStorage(
+          windowsMetadataBundleVerificationContext,
+          windowsReviewPairStorage,
+        )
+        || !sameWindowsStateRoot(
+          windowsPreparedArtifactStorage.rootPath,
+          stateRoot,
+        )
+        || !sameWindowsStateRoot(
+          windowsPreparedContributionContext.rootPath,
+          windowsPreparedArtifactStorage.rootPath,
         ))) {
+    throw windowsFilesystemConfigurationError();
+  }
+  if (contributionPreparationRunner !== null
+      && typeof contributionPreparationRunner !== "function") {
+    throw new TypeError(
+      "contributionPreparationRunner must be a function or null",
+    );
+  }
+  if (process.platform === "win32"
+      && contributionPreparationRunner !== null) {
+    // The Windows runner is created only after the native preparation context
+    // has captured the root-bound storage and verifier. A caller-supplied
+    // runner could otherwise reintroduce the ordinary POSIX preparation path.
     throw windowsFilesystemConfigurationError();
   }
   // These defaults used to be constructed as parameter initializers. That
@@ -3176,12 +3987,6 @@ function createPreparedLocalCompanionServer({
   }
   if (typeof contributionPreviewProvider !== "function") {
     throw new TypeError("contributionPreviewProvider must be a function");
-  }
-  if (contributionPreparationRunner !== null
-      && typeof contributionPreparationRunner !== "function") {
-    throw new TypeError(
-      "contributionPreparationRunner must be a function or null",
-    );
   }
   if (!contributionPreparationOptions
       || typeof contributionPreparationOptions !== "object"
@@ -3537,31 +4342,100 @@ function createPreparedLocalCompanionServer({
     (preparedContributionDirectory !== null
       && contributionServiceOrigin !== null)
     || contributionSyncOnceRunner !== null;
-  const runContributionPreparation = contributionPreparationRunner
-    ?? createLocalContributionPreparationRunner({
+  const selectedContributionPreparationOptions = process.platform === "win32"
+    ? {
       ...contributionPreparationOptions,
-      coverageProvider: () => (
-        dataStore.getOverview()?.collector?.exportableCoveredAt
-      ),
-      ...(preparedContributionDirectory === null
+      // Every Windows preparation dependency is supplied by the one root-bound
+      // composition. The metadata contexts below provide the review-pair
+      // writer/reader; the materializer and prepared-set verifier use the same
+      // branded contribution context so no POSIX operation is reachable from a
+      // Windows attempt.
+      materialize: createWindowsContributionMaterializer({
+        preparedContributionContext: windowsPreparedContributionContext,
+        windowsPreparedArtifactStorage,
+        windowsReviewPairStorage,
+        windowsMetadataBundleVerificationContext,
+      }),
+      verifyPreparedSet:
+        windowsPreparedContributionContext.verifyPreparedContributionSet,
+    }
+    : contributionPreparationOptions;
+  const selectedPreparationIdentity = ({ explicitSecretFile }) => (
+    selectProductionParticipantIdentity({
+      explicitSecretFile,
+      environmentSecret: environment[EXPORT_IDENTITY_ENV],
+      appStateSecretFile: statePaths.exportParticipantSecretFile,
+      ...(contributionPreparationCreateKeychainBackend === undefined
         ? {}
-        : { preparedSpoolDirectory: preparedContributionDirectory }),
-      explicitSecretFile: developmentIdentity.explicitSecretFile,
-      selectIdentity: ({ explicitSecretFile }) => (
-        selectProductionParticipantIdentity({
-          explicitSecretFile,
-          environmentSecret: environment[EXPORT_IDENTITY_ENV],
-          appStateSecretFile: statePaths.exportParticipantSecretFile,
-          ...(contributionPreparationCreateKeychainBackend === undefined
-            ? {}
-            : {
-              createKeychainBackend:
-                contributionPreparationCreateKeychainBackend,
-            }),
-          windowsFilesystemAdapter,
-        })
-      ),
-  });
+        : {
+          createKeychainBackend:
+            contributionPreparationCreateKeychainBackend,
+        }),
+      windowsFilesystemAdapter,
+    })
+  );
+  const preparationRunnerOptions = {
+    ...selectedContributionPreparationOptions,
+    coverageProvider: () => (
+      dataStore.getOverview()?.collector?.exportableCoveredAt
+    ),
+    ...(preparedContributionDirectory === null
+      ? {}
+      : { preparedSpoolDirectory: preparedContributionDirectory }),
+    explicitSecretFile: developmentIdentity.explicitSecretFile,
+    selectIdentity: selectedPreparationIdentity,
+  };
+  const windowsPreparationStorage = process.platform === "win32"
+    ? createWindowsContributionPreparationStorage({
+      storage: windowsPreparedArtifactStorage,
+    })
+    : null;
+  const selectedPreparationRunnerOptions = process.platform === "win32"
+    ? {
+      ...preparationRunnerOptions,
+      // The application preparation context captures these ports once. They
+      // cannot be replaced by an attempt-level rename/sync option, preventing
+      // a Windows retry from selecting the POSIX owner-only storage.
+      preparationStorage: windowsPreparationStorage,
+      preparationStorageValidator: isWindowsContributionPreparationStorage,
+    }
+    : preparationRunnerOptions;
+  const windowsPreparationContext = process.platform === "win32"
+    ? createWindowsContributionPreparationContext({
+      preparationStorage: windowsPreparationStorage,
+      preparationStorageValidator: isWindowsContributionPreparationStorage,
+      stateRoot,
+      codexHome,
+      activityFile: contributionPreparationOptions.activityFile
+        ?? statePaths.activityMarkersFile,
+      selectIdentity: selectedPreparationIdentity,
+      metadataExport: windowsMetadataExportContext,
+      metadataVerification: windowsMetadataBundleVerificationContext,
+      materialize: selectedContributionPreparationOptions.materialize,
+      verifyPreparedSet: selectedContributionPreparationOptions.verifyPreparedSet,
+    })
+    : null;
+  const windowsPreparationRunnerOptions = process.platform === "win32"
+    ? (() => {
+      const {
+        preparationStorage: _preparationStorage,
+        preparationStorageValidator: _preparationStorageValidator,
+        buildBundle: _buildBundle,
+        writeBundle: _writeBundle,
+        verifySource: _verifySource,
+        materialize: _materialize,
+        verifyPreparedSet: _verifyPreparedSet,
+        ...runnerOptions
+      } = selectedPreparationRunnerOptions;
+      return runnerOptions;
+    })()
+    : null;
+  const runContributionPreparation = contributionPreparationRunner
+    ?? (process.platform === "win32"
+      ? windowsPreparationContext.createLocalContributionPreparationRunner(
+        windowsPreparationRunnerOptions,
+      )
+      : createLocalContributionPreparationRunner(selectedPreparationRunnerOptions));
   let contributionPreparationInProgress = false;
   let contributionSyncInProgress = false;
   const runAutomaticContributionRetirement =
@@ -3611,6 +4485,21 @@ function createPreparedLocalCompanionServer({
     }
     contributionPreparationInProgress = true;
     try {
+      if (process.platform === "win32"
+          && windowsPreparedArtifactStorage !== null) {
+        await recoverWindowsReviewPairEvidence({
+          storage: windowsPreparedArtifactStorage,
+          reviewPairStorage: windowsReviewPairStorage,
+          reviewArchiveDirectory:
+            contributionPreparationOptions.reviewArchiveDirectory,
+        });
+        if (preparedContributionDirectory !== null) {
+          recoverWindowsPreparedStagingEvidence({
+            storage: windowsPreparedArtifactStorage,
+            preparedContributionDirectory,
+          });
+        }
+      }
       return await runContributionPreparation(request);
     } finally {
       contributionPreparationInProgress = false;
@@ -3866,6 +4755,15 @@ function createPreparedLocalCompanionServer({
     if (snapshotPromise === null) {
       snapshotPromise = (async () => {
         try {
+          if (process.platform === "win32"
+              && windowsPreparedArtifactStorage !== null) {
+            await recoverWindowsReviewPairEvidence({
+              storage: windowsPreparedArtifactStorage,
+              reviewPairStorage: windowsReviewPairStorage,
+              reviewArchiveDirectory:
+                contributionPreparationOptions.reviewArchiveDirectory,
+            });
+          }
           await dataStore.initialize();
           await automaticContribution.start();
           // v1.0 incremental sync starts beside the v0.1 scheduler; a
