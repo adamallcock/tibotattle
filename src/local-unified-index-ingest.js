@@ -20,6 +20,7 @@ import {
 } from "./local-unified-index-build.js";
 import {
   assertSafeLocalUnifiedIndexTarget,
+  assertWindowsUnifiedIndexStagingUnavailable,
   createUnifiedIndexWriter,
   beginUnifiedIndexGeneration,
   defaultLocalUnifiedIndexPath,
@@ -193,7 +194,13 @@ export async function ingestLocalUnifiedIndexIncrement({
   signal = null,
   onProgress = null,
   discoveryLimits = null,
+  windowsProtectedStateStore = null,
+  windowsSqliteStateSession = null,
 } = {}) {
+  // Incremental ingest needs a native handle-bound clone/stage/publication
+  // contract on Windows. Until that primitive exists, do not reach discovery,
+  // secret access, temp naming, copy, rename, or ordinary SQLite.
+  assertWindowsUnifiedIndexStagingUnavailable();
   if (typeof codexHome !== "string" || codexHome.length < 1) {
     throw new TypeError("codexHome must be a non-empty string");
   }
@@ -215,6 +222,7 @@ export async function ingestLocalUnifiedIndexIncrement({
   });
   const deviceSalt = await readOrCreateDeviceSalt(
     secretFile ?? defaultLocalUnifiedIndexSecretPath(resolvedIndexFile),
+    { windowsProtectedStateStore },
   );
   const infos = await discoverCodexRolloutInfos({
     codexHome,
@@ -236,7 +244,10 @@ export async function ingestLocalUnifiedIndexIncrement({
   if (!signal?.aborted) {
     let unchangedDatabase = null;
     try {
-      unchangedDatabase = openLocalUnifiedIndex(resolvedIndexFile, { readOnly: true });
+      unchangedDatabase = openLocalUnifiedIndex(resolvedIndexFile, {
+        readOnly: true,
+        windowsSqliteStateSession,
+      });
       const schema = unchangedDatabase.prepare(
         "SELECT value FROM meta WHERE key = 'schema_version'",
       ).get()?.value;
@@ -390,6 +401,8 @@ export async function ingestLocalUnifiedIndexIncrement({
       signal,
       onProgress,
       discoveryLimits,
+      windowsProtectedStateStore,
+      windowsSqliteStateSession,
     });
     return {
       ...rebuilt,
