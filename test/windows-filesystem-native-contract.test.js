@@ -82,8 +82,8 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   assert.match(source, /NtCreateFile/u);
   assert.match(source, /RootDirectory/u);
   assert.match(source, /NtSetInformationFile/u);
-  assert.match(source, /napi_value values\[5\] = \{\}/u);
-  assert.match(source, /std::size_t count = 5;[\s\S]*?count != expected/u);
+  assert.match(source, /napi_value values\[6\] = \{\}/u);
+  assert.match(source, /std::size_t count = 6;[\s\S]*?count != expected/u);
   assert.match(source, /OpenProtectedRootAndChild\(/u);
   assert.match(source, /ParseExpectedIdentity\(env, arguments\[1\]/u);
   assert.match(source, /ValidateSecurity\(rootOpened\.final, true, failure, &observedRoot\)/u);
@@ -118,6 +118,9 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
     "replaceProtectedChild",
     "acquireSqliteStateLease",
     "releaseSqliteStateLease",
+    "createSqliteDatabase",
+    "cloneSqliteDatabase",
+    "publishSqliteDatabase",
   ]) {
     assert.match(source, new RegExp(`DefineMethod[\\s\\S]+"${method}"`, "u"));
   }
@@ -183,6 +186,13 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   assert.match(source, /DefineMethod\(env, exports, "replaceFile",/u);
   assert.match(source, /DefineMethod\(\s*env,\s*exports,\s*"acquireSqliteStateLease",/u);
   assert.match(source, /DefineMethod\(\s*env,\s*exports,\s*"releaseSqliteStateLease",/u);
+  assert.match(source, /DefineMethod\(\s*env,\s*exports,\s*"createSqliteDatabase",/u);
+  assert.match(source, /DefineMethod\(\s*env,\s*exports,\s*"cloneSqliteDatabase",/u);
+  assert.match(source, /DefineMethod\(\s*env,\s*exports,\s*"publishSqliteDatabase",/u);
+  assert.match(source, /CopyHandleToHandle\(/u);
+  assert.match(source, /RequireSqliteSidecarsAbsent\(/u);
+  assert.match(source, /windows-sqlite-state-staging-v1/u);
+  assert.match(source, /napi_get_boolean\(env, false, &sqliteStateStagingSafe\)/u);
   assert.match(source, /"windows-sqlite-state-lease-v1"/u);
   assert.match(source, /napi_get_boolean\(env, false, &sqliteStateLeaseSafe\)/u);
   assert.match(source, /std::mutex gSqliteStateLeasesMutex/u);
