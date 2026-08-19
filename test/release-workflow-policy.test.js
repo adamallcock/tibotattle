@@ -29,6 +29,17 @@ test("setup-node never initializes a package-manager cache before pnpm exists", 
   }
 });
 
+test("the release trust job installs only its pinned locked dependency graph", async () => {
+  const workflow = await readFile(new URL(
+    "../.github/workflows/release-trust-policy.yml",
+    import.meta.url,
+  ), "utf8");
+  assert.match(workflow, /npm install --global corepack@0\.34\.0 --force --ignore-scripts/u);
+  assert.match(workflow, /corepack prepare pnpm@11\.9\.0 --activate/u);
+  assert.match(workflow, /test "\$\(pnpm --version\)" = "11\.9\.0"/u);
+  assert.match(workflow, /pnpm install --frozen-lockfile --ignore-scripts/u);
+});
+
 test("workflow policy accepts local actions and full immutable action SHAs", () => {
   assert.deepEqual(inspectWorkflowSource(`
 steps:

@@ -76,6 +76,14 @@ jobs:
           check-latest: false
           package-manager-cache: false
 
+      - name: Install locked test dependencies
+        run: |
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          test "$(pnpm --version)" = "11.9.0"
+          pnpm install --frozen-lockfile --ignore-scripts
+
       - name: Enforce immutable workflow dependencies and runner policy
         run: node ./scripts/check-release-workflow-policy.mjs
 
