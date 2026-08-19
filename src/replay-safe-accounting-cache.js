@@ -2104,9 +2104,13 @@ function firstIndexAbove(values, target) {
 // encoding [timestamp, timestampMs, provider, planType, limitId, slot,
 // windowDurationMins, resetsAt, usedPercent]. Transitions are derived from
 // consecutive snapshots WITHIN one of these groups, never across groups,
-// which is what makes the batched derivation below exact.
+// which is what makes the batched derivation below exact. Window identity is
+// slot-agnostic (v0.6), exactly like the miner's windowKey: slot is a UI
+// role, so grouping on it here would split one window's rows across batches
+// wherever the server-side slot flipped mid-history and silently drop the
+// transition that crosses the flip.
 function compactSnapshotGroupKey(row) {
-  return [row[2], row[3], row[4], row[5], row[6], row[7]].join("|");
+  return [row[2], row[3], row[4], row[6], row[7]].join("|");
 }
 
 // The transition miner refuses more than 10,000 derived rows per call — a
