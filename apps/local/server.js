@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { constants, lstatSync } from "node:fs";
 import { lstat, open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   LOCAL_COMPANION_REPORT_FILES,
@@ -11,6 +11,9 @@ import {
   LocalCompanionDataStore,
   buildLocalCompanionSnapshot,
 } from "../../src/local-companion-data.js";
+import {
+  createLocalContributionSyncQueueContext,
+} from "../../src/application/index.js";
 import {
   resolveLocalLegacyReportReadPath,
 } from "../../src/local-legacy-report-storage.js";
@@ -39,6 +42,11 @@ import {
 import {
   runIncrementalContributionSyncOnce,
 } from "../../src/contribution-incremental-sync.js";
+import { syncPreparedContributionEntryOnce } from "../../src/contribution-device-sync.js";
+import {
+  loadVerifiedPreparedContribution,
+  verifyPreparedContributionSet,
+} from "../../src/telemetry-prepared-set.js";
 import {
   createFastModePreferenceController,
 } from "../../src/fast-mode-preference.js";
@@ -125,7 +133,11 @@ import {
 } from "../../src/export-identity-production.js";
 import {
   createWindowsFilesystemAdapter,
+  createWindowsProtectedStateStore,
+  createWindowsSqliteStateSession,
+  createLocalContributionSyncQueueStorageContext,
   isWindowsFilesystemAdapter,
+  WINDOWS_SQLITE_STATE_SESSION_PRODUCTION_SAFE,
 } from "../../src/platform/index.js";
 import {
   PRODUCT_BRAND,
@@ -2433,6 +2445,107 @@ export function loadCompanionWindowsFilesystemAdapter({
   return adapter;
 }
 
+/**
+ * Compose every Windows-owned state consumer from the one branded adapter.
+ *
+ * This is intentionally a qualification-only composition on the current
+ * tree: the protected store and SQLite session still report their readiness
+ * flags as false.  The returned factories nevertheless fail closed before
+ * ordinary Node filesystem/DatabaseSync work when called on Windows, while
+ * macOS/Linux continue using their existing static queue and POSIX stores.
+ * A non-Windows caller may use the `platform: "win32"` option for contract
+ * tests; that path never promotes either readiness flag.
+ */
+export function createCompanionWindowsStateComposition({
+  platform = process.platform,
+  architecture = process.arch,
+  stateRoot,
+  windowsFilesystemAdapter = null,
+} = {}) {
+  if (windowsFilesystemAdapter === null) {
+    return Object.freeze({
+      protectedStateStore: null,
+      sqliteStateSessionFactory: null,
+      sqliteStateSessionForPath: null,
+      contributionSyncQueue: null,
+    });
+  }
+  if (platform !== "win32"
+      || typeof architecture !== "string"
+      || architecture.length < 1
+      || !isWindowsFilesystemAdapter(windowsFilesystemAdapter)) {
+    throw windowsFilesystemConfigurationError();
+  }
+  let protectedStateStore;
+  try {
+    protectedStateStore = createWindowsProtectedStateStore({
+      adapter: windowsFilesystemAdapter,
+      rootPath: stateRoot,
+    });
+  } catch {
+    throw windowsFilesystemConfigurationError();
+  }
+  // The current store/session readiness facts are deliberately false.  A
+  // native Windows process must stop here rather than construct the rest of
+  // the companion, while a macOS contract test may still inspect the routing
+  // and the unqualified flags without promoting them.
+  if (process.platform === "win32"
+      && (protectedStateStore.productionSafe !== true
+        || protectedStateStore.rootBindingSafe !== true
+        || protectedStateStore.nativeReadBounded !== true
+        || WINDOWS_SQLITE_STATE_SESSION_PRODUCTION_SAFE !== true)) {
+    throw windowsFilesystemConfigurationError();
+  }
+  const sqliteStateSessionFactory = (options = {}) => {
+    if (!options || typeof options !== "object" || Array.isArray(options)) {
+      throw windowsFilesystemConfigurationError();
+    }
+    const {
+      databaseFactory = null,
+      ...sessionOptions
+    } = options;
+    return createWindowsSqliteStateSession({
+      ...sessionOptions,
+      platform,
+      architecture,
+      adapter: windowsFilesystemAdapter,
+      ...(process.platform === "win32" || databaseFactory === null
+        ? {}
+        : { databaseFactory }),
+    });
+  };
+  const sqliteStateSessionForPath = (path) => {
+    if (typeof path !== "string" || path.length < 1) {
+      throw windowsFilesystemConfigurationError();
+    }
+    const selected = win32.normalize(path.replaceAll("/", "\\"));
+    return sqliteStateSessionFactory({
+      rootPath: win32.dirname(selected),
+      databaseName: win32.basename(selected),
+    });
+  };
+  let contributionSyncQueue;
+  try {
+    contributionSyncQueue = createLocalContributionSyncQueueContext({
+      createStorage: createLocalContributionSyncQueueStorageContext,
+      resolvePath: resolve,
+      verifyPreparedSet: verifyPreparedContributionSet,
+      loadPreparedContribution: loadVerifiedPreparedContribution,
+      syncPreparedEntry: syncPreparedContributionEntryOnce,
+      platform,
+      windowsSqliteStateSessionFactory: sqliteStateSessionFactory,
+    });
+  } catch {
+    throw windowsFilesystemConfigurationError();
+  }
+  return Object.freeze({
+    protectedStateStore,
+    sqliteStateSessionFactory,
+    sqliteStateSessionForPath,
+    contributionSyncQueue,
+  });
+}
+
 function parentWatchdogConfigurationError() {
   const error = new TypeError(
     "Parent watchdog configuration is invalid",
@@ -2582,6 +2695,12 @@ export function createLocalCompanionServer(options = {}) {
     stateRoot,
     windowsFilesystemAdapter,
   });
+  const windowsStateComposition = createCompanionWindowsStateComposition({
+    platform: process.platform,
+    architecture: process.arch,
+    stateRoot: installation.stateRoot,
+    windowsFilesystemAdapter,
+  });
   const staticRoot = assertLocalResourceDirectory(
     installation.resourceRoot,
     options.staticRoot
@@ -2673,6 +2792,12 @@ export function createLocalCompanionServer(options = {}) {
     preparedContributionDirectory,
     contributionPreparationOptions: selectedPreparationOptions,
     windowsFilesystemAdapter,
+    windowsProtectedStateStore: windowsStateComposition.protectedStateStore,
+    windowsSqliteStateSessionFactory:
+      windowsStateComposition.sqliteStateSessionFactory,
+    windowsSqliteStateSessionForPath:
+      windowsStateComposition.sqliteStateSessionForPath,
+    contributionSyncQueueContext: windowsStateComposition.contributionSyncQueue,
     parentWatchdogPid,
     homeDirectory,
     ...claudeShadowConfiguration,
@@ -2691,6 +2816,10 @@ function createPreparedLocalCompanionServer({
   claudeProjectDirectory,
   diagnosticsLogFile,
   windowsFilesystemAdapter = null,
+  windowsProtectedStateStore = null,
+  windowsSqliteStateSessionFactory = null,
+  windowsSqliteStateSessionForPath = null,
+  contributionSyncQueueContext = null,
   parentWatchdogPid,
   // Explicit reversible authority switch. Unified is the normal authority;
   // legacy is retained only for an explicit rollback selection.
@@ -2756,6 +2885,15 @@ function createPreparedLocalCompanionServer({
   }),
   claudeQuotaProvider = () => readClaudeDesktopQuotaProjection(
     statePaths.claudeDesktopQuotaStateFile,
+    {
+      platform: process.platform,
+      windowsSqliteStateSession:
+        windowsSqliteStateSessionForPath === null
+          ? null
+          : windowsSqliteStateSessionForPath(
+            statePaths.claudeDesktopQuotaStateFile,
+          ),
+    },
   ),
   // This is a programmatic, development-only gate: no environment variable,
   // settings control, route, or UI surface enables Claude usage collection.
@@ -2775,10 +2913,15 @@ function createPreparedLocalCompanionServer({
     accountObservationOperationLockFile:
       statePaths.accountObservationLockFile,
     windowsFilesystemAdapter,
+    windowsSqliteStateSessionFactory,
     refreshAccounting: refreshReplaySafeAccountingCache,
     refreshClaudeQuota: async ({ signal }) => {
       const secret = await readOrCreateClaudeDesktopQuotaSecret(
         statePaths.claudeDesktopQuotaSecretFile,
+        {
+          platform: process.platform,
+          windowsProtectedStateStore,
+        },
       );
       try {
         return await refreshClaudeDesktopQuota({
@@ -2786,6 +2929,13 @@ function createPreparedLocalCompanionServer({
           homeDirectory,
           secret,
           signal,
+          platform: process.platform,
+          windowsSqliteStateSession:
+            windowsSqliteStateSessionForPath === null
+              ? null
+              : windowsSqliteStateSessionForPath(
+                statePaths.claudeDesktopQuotaStateFile,
+              ),
         });
       } finally {
         secret.fill(0);
@@ -2844,9 +2994,7 @@ function createPreparedLocalCompanionServer({
     environment[DEVELOPMENT_IDENTITY_OPT_IN_ENV] ?? null,
   contributionQueueFile,
   legacyContributionDeviceStateFile = null,
-  contributionSyncStatusProvider = () => inspectContributionSyncQueue({
-    queueFile: contributionQueueFile,
-  }),
+  contributionSyncStatusProvider = null,
   preparedContributionDirectory,
   contributionServiceOrigin = centralOrigin,
   // When the signed app spawned this companion it hands over a Keychain
@@ -2916,6 +3064,20 @@ function createPreparedLocalCompanionServer({
       && !isWindowsFilesystemAdapter(windowsFilesystemAdapter)) {
     throw windowsFilesystemConfigurationError();
   }
+  if (windowsFilesystemAdapter === null
+      && (windowsProtectedStateStore !== null
+        || windowsSqliteStateSessionFactory !== null
+        || windowsSqliteStateSessionForPath !== null
+        || contributionSyncQueueContext !== null)) {
+    throw windowsFilesystemConfigurationError();
+  }
+  if (windowsFilesystemAdapter !== null
+      && (windowsProtectedStateStore === null
+        || typeof windowsSqliteStateSessionFactory !== "function"
+        || typeof windowsSqliteStateSessionForPath !== "function"
+        || contributionSyncQueueContext === null)) {
+    throw windowsFilesystemConfigurationError();
+  }
   if (typeof onboardingProvider !== "function") {
     throw new TypeError("onboardingProvider must be a function");
   }
@@ -2968,12 +3130,31 @@ function createPreparedLocalCompanionServer({
     environmentExportSecretPresent:
       Object.hasOwn(environment, EXPORT_IDENTITY_ENV),
   });
+  contributionSyncStatusProvider ??= contributionSyncQueueContext
+    ?.inspectContributionSyncQueue
+    ?? ((options) => inspectContributionSyncQueue(options));
   if (typeof contributionSyncStatusProvider !== "function") {
     throw new TypeError("contributionSyncStatusProvider must be a function");
   }
   if (typeof contributionQueueFile !== "string"
       || contributionQueueFile.length < 1) {
     throw new TypeError("contributionQueueFile must be a non-empty string");
+  }
+  if (contributionSyncQueueContext !== null
+      && (typeof contributionSyncQueueContext !== "object"
+        || typeof contributionSyncQueueContext.inspectContributionSyncQueue
+          !== "function"
+        || typeof contributionSyncQueueContext.inspectExactNextContributionSyncUpload
+          !== "function"
+        || typeof contributionSyncQueueContext.inspectNextContributionSyncUpload
+          !== "function"
+        || typeof contributionSyncQueueContext.runContributionSyncQueueOnce
+          !== "function"
+        || typeof contributionSyncQueueContext.setContributionSyncPaused
+          !== "function"
+        || typeof contributionSyncQueueContext.retireAcceptedContributionArtifacts
+          !== "function")) {
+    throw new TypeError("contributionSyncQueueContext is invalid");
   }
   if (preparedContributionDirectory !== null
       && typeof preparedContributionDirectory !== "string") {
@@ -3033,10 +3214,15 @@ function createPreparedLocalCompanionServer({
   const nextContribution = contributionSyncNextProvider
     ?? (preparedContributionDirectory === null
       ? async () => null
-      : () => inspectNextContributionSyncUpload({
-        directory: preparedContributionDirectory,
-        queueFile: contributionQueueFile,
-      }));
+      : contributionSyncQueueContext === null
+        ? () => inspectNextContributionSyncUpload({
+          directory: preparedContributionDirectory,
+          queueFile: contributionQueueFile,
+        })
+        : () => contributionSyncQueueContext.inspectNextContributionSyncUpload({
+          directory: preparedContributionDirectory,
+          queueFile: contributionQueueFile,
+        }));
   const createContributionDeviceBackend = async () => {
     const backend = contributionDeviceBackendFactory({
       windowsFilesystemAdapter,
@@ -3203,10 +3389,15 @@ function createPreparedLocalCompanionServer({
   const reviewExactContribution = contributionSyncExactReviewProvider
     ?? (preparedContributionDirectory === null
       ? async () => null
-      : () => inspectExactNextContributionSyncUpload({
-        directory: preparedContributionDirectory,
-        queueFile: contributionQueueFile,
-      }));
+      : contributionSyncQueueContext === null
+        ? () => inspectExactNextContributionSyncUpload({
+          directory: preparedContributionDirectory,
+          queueFile: contributionQueueFile,
+        })
+        : () => contributionSyncQueueContext.inspectExactNextContributionSyncUpload({
+          directory: preparedContributionDirectory,
+          queueFile: contributionQueueFile,
+        }));
   const runContributionPass = contributionSyncOnceRunner
     ?? (preparedContributionDirectory === null
         || contributionServiceOrigin === null
@@ -3220,7 +3411,7 @@ function createPreparedLocalCompanionServer({
           LOCAL_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES,
       }) => {
         const backend = await createContributionDeviceBackend();
-        return runContributionSyncQueueOnce({
+        const options = {
           directory: preparedContributionDirectory,
           origin: contributionServiceOrigin,
           backend,
@@ -3231,13 +3422,18 @@ function createPreparedLocalCompanionServer({
           reviewedJob,
           preparedSetId,
           signal,
-        });
+        };
+        return contributionSyncQueueContext === null
+          ? runContributionSyncQueueOnce(options)
+          : contributionSyncQueueContext.runContributionSyncQueueOnce(options);
       });
   const setContributionPaused = contributionSyncPauseSetter
-    ?? (({ paused }) => setContributionSyncPaused({
-      paused,
-      queueFile: contributionQueueFile,
-    }));
+    ?? (({ paused }) => {
+      const options = { paused, queueFile: contributionQueueFile };
+      return contributionSyncQueueContext === null
+        ? setContributionSyncPaused(options)
+        : contributionSyncQueueContext.setContributionSyncPaused(options);
+    });
   const syncPreviewConfigured = preparedContributionDirectory !== null
     || contributionSyncNextProvider !== null;
   const contributionDevicePairingConfigured =
@@ -3286,15 +3482,19 @@ function createPreparedLocalCompanionServer({
         interrupted: false,
         networkActivity: false,
       })
-      : ({ protectedPreparedSetIds, signal }) =>
-        retireAcceptedContributionArtifacts({
+      : ({ protectedPreparedSetIds, signal }) => {
+        const options = {
           preparedSpoolDirectory: preparedContributionDirectory,
           reviewArchiveDirectory:
             contributionPreparationOptions.reviewArchiveDirectory,
           queueFile: contributionQueueFile,
           protectedPreparedSetIds,
           signal,
-        }));
+        };
+        return contributionSyncQueueContext === null
+          ? retireAcceptedContributionArtifacts(options)
+          : contributionSyncQueueContext.retireAcceptedContributionArtifacts(options);
+      });
   const runSupersededContributionRetirement =
     supersededContributionRetirementRunner
     ?? (preparedContributionDirectory === null
