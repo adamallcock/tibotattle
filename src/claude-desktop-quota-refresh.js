@@ -2,12 +2,13 @@ import { createHmac, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, win32 } from "node:path";
 import {
   CLAUDE_DESKTOP_QUOTA_AUTHORITY,
   CLAUDE_DESKTOP_QUOTA_PROVIDER,
   openClaudeDesktopQuotaState,
 } from "./claude-desktop-quota-state.js";
+import { isWindowsProtectedStateStore } from "./platform/index.js";
 import {
   readClaudeDesktopPlanHistory,
 } from "./claude-desktop-plan-history.js";
@@ -20,6 +21,8 @@ export const CLAUDE_DESKTOP_PLAN_HISTORY_SOURCE_ID =
 
 const DEFAULT_STALE_AFTER_MS = 30 * 60 * 1000;
 const SECRET_BYTES = 32;
+export const CLAUDE_DESKTOP_QUOTA_SECRET_BASENAME =
+  "claude-desktop-quota-state-v1-secret";
 
 export class ClaudeDesktopQuotaRefreshError extends Error {
   constructor(code) {
@@ -59,6 +62,83 @@ function safeStatePath(path) {
   return selected;
 }
 
+function safeWindowsSecretPath(path) {
+  if (typeof path !== "string" || path.length === 0 || path.includes("\0")) {
+    fail("configuration");
+  }
+  let selected;
+  try {
+    selected = win32.normalize(path.replaceAll("/", "\\"));
+  } catch {
+    fail("configuration");
+  }
+  if (!win32.isAbsolute(selected) || selected.endsWith("\\")) fail("configuration");
+  return selected;
+}
+
+function normalizedPlatform(platform) {
+  if (typeof platform !== "string" || platform.length === 0) fail("configuration");
+  // Do not allow a Windows process to opt into the ordinary Node filesystem
+  // implementation by passing a downgraded platform label.
+  if (process.platform === "win32" && platform !== "win32") {
+    fail("windows_secret_unqualified");
+  }
+  return platform;
+}
+
+function qualifiedWindowsProtectedStateStore(store) {
+  let valid = false;
+  try {
+    valid = isWindowsProtectedStateStore(store)
+      && store.contractVersion === "windows-protected-state-store-v1"
+      && store.productionSafe === true
+      && store.rootBindingSafe === true
+      && store.nativeReadBounded === true
+      && typeof store.ensureProtectedDirectory === "function"
+      && typeof store.read === "function"
+      && typeof store.create === "function";
+  } catch {
+    valid = false;
+  }
+  if (!valid) fail("windows_secret_unqualified");
+  return store;
+}
+
+function windowsSecretName(store, secretFile) {
+  const selected = safeWindowsSecretPath(secretFile);
+  let root;
+  try {
+    root = win32.normalize(store.rootPath.replaceAll("/", "\\"));
+  } catch {
+    fail("configuration");
+  }
+  const prefix = root.endsWith("\\") ? root : `${root}\\`;
+  if (!win32.isAbsolute(root)
+      || !selected.toLowerCase().startsWith(prefix.toLowerCase())) {
+    fail("configuration");
+  }
+  const relative = selected.slice(prefix.length);
+  // Keep the quota secret directly below the protected state root. This
+  // avoids silently changing a caller's intended boundary or traversing into
+  // another provider's state namespace.
+  if (relative.length === 0 || relative.includes("\\") || relative.includes("/")) {
+    fail("configuration");
+  }
+  return relative;
+}
+
+function protectedStoreErrorCode(error) {
+  return typeof error?.code === "string" ? error.code : "";
+}
+
+function secretFromProtectedResult(result) {
+  if (!result || (!Buffer.isBuffer(result.data) && !(result.data instanceof Uint8Array))
+      || result.data.byteLength !== SECRET_BYTES) {
+    fail("secret_unsafe");
+  }
+  return Buffer.from(result.data);
+}
+
 function ownerOnlyRegularFile(stats, expectedBytes = null) {
   return stats.isFile() && !stats.isSymbolicLink() && stats.nlink === 1
     && (typeof process.getuid !== "function" || stats.uid === process.getuid())
@@ -85,7 +165,53 @@ async function assertOwnerOnlyDirectory(path) {
  * It is deliberately separate from Codex and contribution identities, and
  * the existing file is never silently chmod-repaired or rotated.
  */
-export async function readOrCreateClaudeDesktopQuotaSecret(secretFile) {
+export async function readOrCreateClaudeDesktopQuotaSecret(
+  secretFile,
+  {
+    platform = process.platform,
+    windowsProtectedStateStore = null,
+  } = {},
+) {
+  platform = normalizedPlatform(platform);
+  if (platform === "win32") {
+    // Windows production must use the branded, future-qualified protected
+    // store. Do not silently fall back to mkdir/open/readFile or accept a
+    // copied object that merely resembles the store contract.
+    const store = qualifiedWindowsProtectedStateStore(windowsProtectedStateStore);
+    const name = windowsSecretName(store, secretFile);
+    try {
+      store.ensureProtectedDirectory();
+      try {
+        return secretFromProtectedResult(store.read(name));
+      } catch (error) {
+        if (protectedStoreErrorCode(error)
+            !== "windows_protected_state_store_missing") {
+          throw error;
+        }
+      }
+      const candidate = randomBytes(SECRET_BYTES);
+      try {
+        try {
+          store.create(name, candidate);
+        } catch (error) {
+          // Another qualified writer may have won the create race. Read that
+          // exact protected child rather than using a filesystem fallback.
+          if (protectedStoreErrorCode(error)
+              !== "windows_protected_state_store_already_exists") {
+            throw error;
+          }
+          return secretFromProtectedResult(store.read(name));
+        }
+        return Buffer.from(candidate);
+      } finally {
+        candidate.fill(0);
+      }
+    } catch (error) {
+      if (error?.code === "claude_desktop_quota_refresh_secret_unsafe") throw error;
+      fail("secret_unavailable");
+    }
+  }
+  if (windowsProtectedStateStore !== null) fail("configuration");
   const selected = safeStatePath(secretFile);
   const parent = dirname(selected);
   try {
@@ -274,11 +400,16 @@ export async function refreshClaudeDesktopQuota({
   homeDirectory = null,
   applicationSupportDirectory = null,
   secret,
+  platform = process.platform,
+  windowsSqliteStateSession = null,
   observedAtMs = Date.now(),
   staleAfterMs = DEFAULT_STALE_AFTER_MS,
   signal = null,
 } = {}) {
-  const selectedStatePath = safeStatePath(statePath);
+  platform = normalizedPlatform(platform);
+  const selectedStatePath = platform === "win32"
+    ? safeWindowsSecretPath(statePath)
+    : safeStatePath(statePath);
   const timestamp = safeTimestamp(observedAtMs);
   if (!Number.isSafeInteger(staleAfterMs) || staleAfterMs < 0) fail("stale_after");
   checkSignal(signal);
@@ -298,7 +429,10 @@ export async function refreshClaudeDesktopQuota({
     sourceFailure = error;
   }
   checkSignal(signal);
-  const state = openClaudeDesktopQuotaState(selectedStatePath);
+  const state = openClaudeDesktopQuotaState(selectedStatePath, {
+    platform,
+    windowsSqliteStateSession,
+  });
   try {
     if (sourceFailure !== null) {
       const error = sourceFailure;
