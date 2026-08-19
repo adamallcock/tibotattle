@@ -149,6 +149,13 @@ function paginateCacheImpactRows(rows, state, signature) {
   };
 }
 let localCompanionHealth = null;
+// The last refresh run's accounting-rebuild deferral, read from the local
+// refresh status alongside each dashboard load. A rebuild that keeps missing
+// its memory budget is otherwise invisible here: the refresh SUCCEEDS, the
+// cache-derived figures simply never appear, and the 2026-08-19 livelock ran
+// for hours behind that silence. Only a successful status read updates this,
+// so a transient poll failure cannot clear an honest note.
+let accountingRebuildDeferral = null;
 // This is an optional, short-lived rendering hint from the public health
 // endpoint. The Worker remains authoritative; a missing or stale health read
 // never blocks a legitimate sign-in, while an explicit paused state avoids
@@ -8573,8 +8580,37 @@ function renderAccountingSideChatDetails(estimate) {
   }
 }
 
+/**
+ * Say WHY the replay-safe accounting artifacts are missing when the rebuild
+ * keeps being postponed, instead of leaving bare zero cards. The rebuild
+ * defers softly when it would push the app past its memory ceiling; one miss
+ * is routine backoff, but a streak with no cache on disk means the reader is
+ * looking at an empty cost view with a cause the app knows and was not
+ * saying (the 2026-08-19 livelock recurred hourly for a whole afternoon).
+ */
+function renderAccountingRebuildDeferral(data) {
+  const element = $("#accounting-rebuild-deferred");
+  if (!element) return;
+  const deferral = accountingRebuildDeferral;
+  const persistent = Number.isSafeInteger(deferral?.consecutive)
+    && deferral.consecutive >= 2;
+  // With a retained cache the figures still render; the honest-empty copy is
+  // for the state where no replay-safe cache exists at all.
+  const cacheMissing = data?.accounting?.accountingCacheStatus === "unavailable";
+  if (!persistent || !cacheMissing) {
+    element.hidden = true;
+    setRawText(element, "");
+    return;
+  }
+  element.hidden = false;
+  setLocalizedText(element, "accounting.rebuildDeferred.persistent", {
+    count: formatNumber(deferral.consecutive),
+  });
+}
+
 function renderAccounting(data) {
   syncAccountingPeriodControls(data);
+  renderAccountingRebuildDeferral(data);
   const accounting = accountingPeriod(data);
   if (accounting === null) {
     clear($("#accounting-summary"));
@@ -9771,15 +9807,20 @@ async function loadLocalDashboard() {
         }
       }
     };
-    const [data, sync, localHealth, onboarding, speedPreference] = await Promise.all([
+    const [data, sync, localHealth, onboarding, speedPreference, refreshState] = await Promise.all([
       loadDashboardData(),
       syncState,
       localClient.health().catch(() => null),
       localClient.onboarding().catch(() => null),
-      localClient.fastModePreference().catch(() => null)
+      localClient.fastModePreference().catch(() => null),
+      localClient.refreshStatus().catch(() => null)
     ]);
     localCompanionHealth = localHealth;
     fastModePreference = speedPreference;
+    if (refreshState !== null) {
+      accountingRebuildDeferral =
+        refreshState?.refresh?.result?.accountingRebuildDeferred ?? null;
+    }
     renderDashboard(data);
     // Health arrives after the first paint, and the sign-in controls are gated
     // on a capability it carries. Without this re-render they keep the

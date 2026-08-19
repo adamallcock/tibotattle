@@ -267,6 +267,15 @@ export const WEB_MESSAGES = Object.freeze({
     "索引将在下次更新时继续；完成时间未知。",
     "La indexación continúa en la próxima actualización; no se conoce la hora de finalización.",
   ],
+  // Why the replay-safe accounting artifacts are missing when the rebuild has
+  // deferred repeatedly: the rebuild misses its memory ceiling, softly, and
+  // retries — this names the cause and the streak instead of showing bare
+  // zeros with no explanation.
+  "accounting.rebuildDeferred.persistent": [
+    "The fuller cost-accounting rebuild has been postponed {count} times in a row because it would push the app past its memory ceiling. It retries automatically; restarting the menu-bar app frees memory and usually lets the next attempt complete.",
+    "更完整的成本核算重建已连续推迟 {count} 次，因为它会使应用超出内存上限。应用会自动重试；重启菜单栏应用可释放内存，通常能让下一次尝试完成。",
+    "La reconstrucción más completa de la contabilidad de costes se ha pospuesto {count} veces seguidas porque llevaría la aplicación más allá de su límite de memoria. Se reintenta automáticamente; reiniciar la aplicación de la barra de menús libera memoria y normalmente permite completar el siguiente intento.",
+  ],
  "accounting.pricing.partialCoverage": ["{percent} of usage changes have a reviewed price; coverage is partial.", "使用变化中有 {percent} 使用了经审核的价格；覆盖率不完整。", "El {percent} de los cambios de uso tiene un precio revisado; la cobertura es parcial."],
  "accounting.pricing.coverageReviewed": ["All usage changes in this period have reviewed pricing.", "此期间的所有使用变化都有经审核的价格。", "Todos los cambios de uso de este período tienen precios revisados."],
   "accounting.pricing.coverageShort": ["{percent} coverage", "{percent} 覆盖率", "{percent} de cobertura"],
