@@ -75,6 +75,21 @@ export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
   "apps/electron/platform-gate.js",
   "apps/electron/preload.js",
   "apps/electron/ready-line.js",
+  "apps/electron/windows-qualification.js",
+]);
+// Existing outputs are authenticated against their own complete manifest and
+// payload before replacement. Keep this stable identity subset separate from
+// the current shell closure so adding a reviewed shell module does not make a
+// previously valid generated output impossible to replace.
+const ELECTRON_SHELL_IDENTITY_FILES = Object.freeze([
+  "apps/electron/companion-supervisor.js",
+  "apps/electron/desktop-lifecycle.js",
+  "apps/electron/errors.js",
+  "apps/electron/loopback-policy.js",
+  "apps/electron/main.js",
+  "apps/electron/platform-gate.js",
+  "apps/electron/preload.js",
+  "apps/electron/ready-line.js",
 ]);
 const READ_ONLY_FLAG = fileSystemConstants.O_RDONLY ?? 0;
 const NO_FOLLOW_FLAG = fileSystemConstants.O_NOFOLLOW ?? 0;
@@ -800,7 +815,7 @@ function validateRuntimeManifestShape(manifest) {
     seenPaths.add(path);
   }
   if (manifest.entrypoint === "apps/electron/main.js"
-      && !ELECTRON_SHELL_RUNTIME_FILES.every((path) => seenPaths.has(path))) {
+      && !ELECTRON_SHELL_IDENTITY_FILES.every((path) => seenPaths.has(path))) {
     fail("EXISTING_OUTPUT_INVALID", "Electron shell entrypoint has an incomplete shell closure");
   }
   if (!exactObjectKeys(manifest.payload, ["bytes", "sha256"])

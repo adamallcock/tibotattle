@@ -31,6 +31,8 @@ import {
 } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { KEYTAR_WIN32_X64_SHA256 } from "../src/platform/index.js";
+
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const require = createRequire(import.meta.url);
 
@@ -61,6 +63,7 @@ const ELECTRON_SHELL_FILES = Object.freeze([
   "apps/electron/platform-gate.js",
   "apps/electron/preload.js",
   "apps/electron/ready-line.js",
+  "apps/electron/windows-qualification.js",
 ]);
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const INVENTORY_KINDS = new Set([
@@ -814,6 +817,22 @@ function expectedNativePaths(target) {
   ]);
 }
 
+/**
+ * The Windows development artifact may only ship the audited keytar
+ * prebuild. The staged inventory has already been read and hashed from the
+ * exact app tree, so checking its row here covers both the staged source and
+ * (via compareArtifactToStaged) the archive/unpacked union without reading or
+ * logging credential-binding bytes a second time. The existing bindingInvalid
+ * status intentionally covers any native binding integrity failure.
+ */
+function validateWindowsKeytar({ target, staged }) {
+  if (target !== "win32-x64") return;
+  const keytarRow = staged.rowMap.get(TARGETS[target].keytar);
+  if (!keytarRow || keytarRow.sha256 !== KEYTAR_WIN32_X64_SHA256) {
+    fail(FIXED_STATUS.bindingInvalid);
+  }
+}
+
 // Electron's virtual-ASAR contract intentionally separates the executable
 // native module from its content-free sidecar: the .node is unpacked so the
 // loader can execute it, while the adjacent JSON manifest remains readable
@@ -1041,6 +1060,7 @@ export async function verifyElectronDevelopmentArtifact({
     const binding = target === "win32-x64"
       ? await validateWindowsBinding({ appPath: selectedAppPath, staged })
       : null;
+    validateWindowsKeytar({ target, staged });
     validateNativeBoundary({
       target,
       staged,
