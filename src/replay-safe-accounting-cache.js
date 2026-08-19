@@ -50,7 +50,11 @@ import {
   SEVEN_DAY_WINDOW_MINUTES,
 } from "@app-usagemonitor/quota-analysis";
 import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
-import { SPARK_QUOTA_LIMIT_IDS } from "./local-companion-usage-model.js";
+import {
+  addComponentCosts,
+  emptyComponentCosts,
+  SPARK_QUOTA_LIMIT_IDS,
+} from "./local-companion-usage-model.js";
 import {
   defaultLocalCollectorStatePath,
   prepareLocalCollectorState,
@@ -720,18 +724,6 @@ function emptyComponents() {
   return Object.fromEntries(COMPONENT_KEYS.map((key) => [key, 0]));
 }
 
-function emptyComponentCosts() {
-  return Object.fromEntries(COMPONENT_KEYS.map((key) => [
-    key,
-    {
-      tokens: 0,
-      pricedTokens: 0,
-      unpricedTokens: 0,
-      costUsd: 0,
-    },
-  ]));
-}
-
 function tokenTotal(components) {
   const input = (components.input_uncached_tokens ?? 0)
     + (components.input_cache_read_tokens ?? 0)
@@ -810,26 +802,6 @@ function addDimension(target, key, event) {
   row.events += 1;
   row.totalTokens += event.totalTokens;
   row.apiPriceEquivalentUsd += event.apiPriceEquivalentUsd;
-}
-
-function addComponentCosts(target, components, priced) {
-  const pricedByName = new Map(
-    (Array.isArray(priced?.components) ? priced.components : [])
-      .map((row) => [row.name, row]),
-  );
-  for (const key of COMPONENT_KEYS) {
-    const tokens = components[key] ?? 0;
-    const row = target[key];
-    const pricedRow = pricedByName.get(key);
-    row.tokens += tokens;
-    if (pricedRow?.pricingStatus === "priced") {
-      row.pricedTokens += tokens;
-      const cost = Number(pricedRow.costUsd);
-      if (Number.isFinite(cost) && cost >= 0) row.costUsd += cost;
-    } else {
-      row.unpricedTokens += tokens;
-    }
-  }
 }
 
 const FAST_PRICE_SCALE = 1_000_000_000;
