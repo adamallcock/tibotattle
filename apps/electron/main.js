@@ -10,6 +10,7 @@ const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_COMPANION_SCRIPT = resolve(MODULE_DIRECTORY, "../local/server.js");
 const DEFAULT_RESOURCE_ROOT = resolve(MODULE_DIRECTORY, "../..");
 const DEFAULT_COMPANION_STATE_DIRECTORY = "companion-state";
+const ELECTRON_SMOKE_CONTROL = "quit-v1";
 
 function isPackagedElectronApp(app) {
   return app?.isPackaged === true;
@@ -150,7 +151,23 @@ export async function launchElectronShell({
 // Node-based tests and repository tooling import this entry without executing
 // a desktop launch. An actual Electron process is the only executable caller.
 if (process.versions.electron) {
-  launchElectronShell({ emitFailureDiagnostic: true }).catch(() => {
-    process.exitCode = 1;
-  });
+  launchElectronShell({ emitFailureDiagnostic: true })
+    .then((lifecycle) => {
+      // The Linux GUI smoke needs a deterministic way to exercise the same
+      // main-process shutdown path as the tray's Quit action. Keep that
+      // control test-only, opt-in, and out of the renderer/preload boundary.
+      // SIGUSR2 is not installed on Windows, so this cannot become a Windows
+      // production contract by accident.
+      if (process.platform !== "win32"
+          && process.env.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL === ELECTRON_SMOKE_CONTROL) {
+        process.once("SIGUSR2", () => {
+          void lifecycle.requestQuit().catch(() => {
+            process.exitCode = 1;
+          });
+        });
+      }
+    })
+    .catch(() => {
+      process.exitCode = 1;
+    });
 }
