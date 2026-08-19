@@ -39,6 +39,11 @@ const APPLICATION_PUBLIC_EXPORTS = [
   "createLocalExportResourceContext",
   "createLocalMetadataExportContext",
   "createLocalMetadataBundleVerificationContext",
+  "createWindowsPreparedContributionContext",
+  "isWindowsPreparedContributionContext",
+  "WINDOWS_PREPARED_CONTRIBUTION_CONTEXT_CONTRACT_VERSION",
+  "WINDOWS_PREPARED_CONTRIBUTION_CONTEXT_PRODUCTION_SAFE",
+  "WINDOWS_PREPARED_CONTRIBUTION_CONTEXT_READINESS",
   "selectProductionParticipantIdentity",
   "selectProductionClaudeCallbackBackend",
 ].sort();
