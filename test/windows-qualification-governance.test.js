@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import test from "node:test";
-import { dirname, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import test from "node:test";
 
 import {
   FIXED_STATUS,
@@ -12,6 +14,13 @@ import {
   qualificationTestFiles,
   readVerifiedBindingManifest,
 } from "../scripts/windows-security-qualification.mjs";
+import {
+  FIXED_STATUS as WINDOWS_RECEIPT_STATUS,
+  buildWindowsElectronQualificationReceipt,
+  parseQualificationResult,
+  validatePackagedEvidence,
+  validateRuntimeEvidence,
+} from "../scripts/build-windows-electron-qualification-receipt.mjs";
 
 const REPOSITORY_ROOT = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -89,6 +98,15 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   const verificationStep = workflow.indexOf(
     "- name: Verify Windows Electron development artifact",
   );
+  const runtimeStep = workflow.indexOf(
+    "- name: Run Windows Electron x64 runtime smoke",
+  );
+  const receiptStep = workflow.indexOf(
+    "- name: Create content-free Windows Electron qualification receipt",
+  );
+  const uploadStep = workflow.indexOf(
+    "- name: Retain exact Windows x64 development artifact and qualification receipt",
+  );
   const cleanupStep = workflow.indexOf(
     "- name: Remove generated Electron artifact tree before clean checkout gate",
   );
@@ -101,9 +119,12 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
       && revisionGate < stagingStep
       && stagingStep < packagingStep
       && packagingStep < verificationStep
+      && verificationStep < runtimeStep
+      && runtimeStep < receiptStep
+      && receiptStep < uploadStep
       && verificationStep < cleanupStep
       && cleanupStep < cleanCheckoutStep,
-    "Electron artifact work must follow native qualification and precede the final clean-checkout gate",
+    "Electron verification, runtime smoke, receipt, upload, cleanup, and final clean-checkout gate must remain ordered",
   );
   assert.match(workflow, /WINDOWS_ELECTRON_REVISION_MISMATCH/u);
   assert.match(workflow, /WINDOWS_QUALIFICATION_REVISION_MISMATCH/u);
@@ -132,7 +153,16 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /ELECTRON_DEVELOPMENT_ARTIFACT_VERIFIED/u);
   assert.match(workflow, /ELECTRON_ARTIFACT_EVIDENCE_NOT_CONTENT_FREE/u);
   assert.match(workflow, /SHA-256:/u);
-  assert.match(workflow, /Runtime launch: not performed/u);
+  assert.match(workflow, /Runtime qualification: deferred to the native Windows Electron smoke step/u);
+  assert.match(workflow, /smoke-electron-windows\.mjs/u);
+  assert.match(workflow, /WINDOWS_ELECTRON_RUNTIME_SMOKE_EVIDENCE_NOT_CONTENT_FREE/u);
+  assert.match(workflow, /build-windows-electron-qualification-receipt\.mjs/u);
+  assert.match(workflow, /TIBOTATTLE_ELECTRON_QUALIFICATION_RECEIPT_PATH/u);
+  assert.match(workflow, /WINDOWS_ELECTRON_DEVELOPMENT_QUALIFICATION_PASSED/u);
+  assert.match(workflow, /actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/u);
+  assert.match(workflow, /tibotattle-windows-x64-electron-\$\{\{ github\.sha \}\}-\$\{\{ matrix\.cache-mode \}\}/u);
+  assert.match(workflow, /if-no-files-found: error/u);
+  assert.match(workflow, /retention-days: 3/u);
   assert.match(workflow, /Windows production readiness: not claimed/u);
   assert.match(workflow, /Signing, notarization, installer, updater, and publication: not performed/u);
   assert.match(workflow, /WINDOWS_ELECTRON_INSTALLER_OUTPUT_UNEXPECTED/u);
@@ -152,6 +182,8 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.doesNotMatch(workflow, /git diff --exit-code/u);
   assert.doesNotMatch(workflow, /USAGE_MONITOR_TEST_LANE_REPORTER: spec/u);
   assert.doesNotMatch(workflow, /(?:icacls|Get-Acl|GetAccessControl|Write-Host)/iu);
+  assert.match(workflow, /- name: Remove generated Electron artifact tree before clean checkout gate\n\s+if: \$\{\{ always\(\) \}\}/u);
+  assert.match(workflow, /- name: Confirm qualification and artifact work did not modify the checkout\n\s+if: \$\{\{ always\(\) \}\}/u);
 
   const actions = [...workflow.matchAll(/^\s+uses:\s+([^\s#]+)/gmu)]
     .map((match) => match[1]);
@@ -390,4 +422,231 @@ test("qualification TAP receipts reject skips and malformed summaries", () => {
     () => parseTapSummary("# tests 1\n# pass 1"),
     (error) => error.code === FIXED_STATUS.resultInvalid,
   );
+});
+
+function windowsReceiptFixture({
+  revision = "a".repeat(40),
+  cacheMode = "warm",
+  bindingBytes = 1234,
+  bindingSha256 = "b".repeat(64),
+} = {}) {
+  const aggregate = {
+    bytes: 4567,
+    count: 89,
+    sha256: "c".repeat(64),
+  };
+  const binding = {
+    bytes: bindingBytes,
+    sha256: bindingSha256,
+  };
+  return {
+    revision,
+    target: "win32-x64",
+    cacheMode,
+    bindingSha256,
+    bindingBytes,
+    qualificationResult: [
+      "WINDOWS_SECURITY_QUALIFICATION_PASSED",
+      "files=22",
+      "filesystem=10",
+      "credentials=8",
+      `revision=${revision}`,
+      `cache=${cacheMode}`,
+      `binding_bytes=${bindingBytes}`,
+      `binding_sha256=${bindingSha256}`,
+      "tests=37",
+      "passed=37",
+      "failed=0",
+      "skipped=0",
+      "duration_ms=42",
+    ].join(" "),
+    packagedEvidence: {
+      artifact: aggregate,
+      asar: aggregate,
+      binding: {
+        ...binding,
+        status: "included_unverified",
+      },
+      nativeFileCount: 2,
+      staged: aggregate,
+      status: "ELECTRON_DEVELOPMENT_ARTIFACT_VERIFIED",
+      target: "win32-x64",
+      unpacked: aggregate,
+    },
+    runtimeEvidence: {
+      artifact: true,
+      cleanQuit: true,
+      contentFree: true,
+      dashboardReady: true,
+      noOrphan: true,
+      relaunchPersistence: true,
+      secondInstanceRejected: true,
+      showHideTrayLifecycle: true,
+      status: "passed",
+      syntheticRefresh: true,
+      target: "win32-x64",
+    },
+  };
+}
+
+test("Windows Electron qualification receipt is exact-revision and content-free", () => {
+  const fixture = windowsReceiptFixture();
+  const receipt = buildWindowsElectronQualificationReceipt(fixture);
+  assert.deepEqual(receipt, {
+    binding: {
+      bytes: 1234,
+      sha256: "b".repeat(64),
+    },
+    cacheMode: "warm",
+    packaged: {
+      artifact: { bytes: 4567, count: 89, sha256: "c".repeat(64) },
+      asar: { bytes: 4567, count: 89, sha256: "c".repeat(64) },
+      binding: {
+        bytes: 1234,
+        sha256: "b".repeat(64),
+        status: "included_unverified",
+      },
+      nativeFileCount: 2,
+      staged: { bytes: 4567, count: 89, sha256: "c".repeat(64) },
+      status: "ELECTRON_DEVELOPMENT_ARTIFACT_VERIFIED",
+      target: "win32-x64",
+      unpacked: { bytes: 4567, count: 89, sha256: "c".repeat(64) },
+    },
+    qualification: {
+      credentialTestFileCount: 8,
+      filesystemTestFileCount: 10,
+      failed: 0,
+      passed: 37,
+      skipped: 0,
+      status: "WINDOWS_SECURITY_QUALIFICATION_PASSED",
+      testFileCount: 22,
+      tests: 37,
+    },
+    revision: "a".repeat(40),
+    runtime: {
+      checks: {
+        cleanQuit: true,
+        dashboardReady: true,
+        diagnostics: "content-free",
+        launched: true,
+        noOrphanProcesses: true,
+        relaunchPersistence: true,
+        singleInstanceRejected: true,
+        syntheticRefresh: true,
+        trayWindowLifecycle: true,
+      },
+      status: "WINDOWS_ELECTRON_RUNTIME_SMOKE_PASSED",
+      target: "win32-x64",
+    },
+    schemaVersion: "tibotattle-windows-electron-development-qualification-v1",
+    status: "WINDOWS_ELECTRON_DEVELOPMENT_QUALIFICATION_PASSED",
+    target: "win32-x64",
+  });
+  const serialized = JSON.stringify(receipt);
+  assert.doesNotMatch(serialized, /[A-Za-z]:[\\/]/u);
+  assert.doesNotMatch(serialized, /\/Users\/|\/home\//u);
+  assert.equal(serialized.includes("\\Users\\"), false);
+  assert.doesNotMatch(serialized, /username|(?:password|secret|token|pid|process|env)(?:["':=]|$)/iu);
+  assert.doesNotMatch(serialized, /(?:stdout|stderr|command|executable|diagnostic[^s])/iu);
+});
+
+test("Windows Electron qualification receipt rejects incomplete or mismatched evidence", () => {
+  const fixture = windowsReceiptFixture();
+  assert.deepEqual(
+    validatePackagedEvidence(fixture.packagedEvidence, {
+      bytes: fixture.bindingBytes,
+      sha256: fixture.bindingSha256,
+    }).binding,
+    {
+      bytes: fixture.bindingBytes,
+      sha256: fixture.bindingSha256,
+      status: "included_unverified",
+    },
+  );
+  assert.deepEqual(
+    parseQualificationResult(fixture.qualificationResult, {
+      binding: { bytes: fixture.bindingBytes, sha256: fixture.bindingSha256 },
+      cacheMode: fixture.cacheMode,
+      revision: fixture.revision,
+    }).status,
+    "WINDOWS_SECURITY_QUALIFICATION_PASSED",
+  );
+  assert.deepEqual(
+    validateRuntimeEvidence(fixture.runtimeEvidence).status,
+    "WINDOWS_ELECTRON_RUNTIME_SMOKE_PASSED",
+  );
+  assert.throws(
+    () => buildWindowsElectronQualificationReceipt({
+      ...fixture,
+      revision: "d".repeat(40),
+    }),
+    (error) => error.code === WINDOWS_RECEIPT_STATUS.qualificationInvalid,
+  );
+  assert.throws(
+    () => buildWindowsElectronQualificationReceipt({
+      ...fixture,
+      runtimeEvidence: {
+        ...fixture.runtimeEvidence,
+        noOrphan: false,
+      },
+    }),
+    (error) => error.code === WINDOWS_RECEIPT_STATUS.runtimeInvalid,
+  );
+  assert.throws(
+    () => buildWindowsElectronQualificationReceipt({
+      ...fixture,
+      packagedEvidence: {
+        ...fixture.packagedEvidence,
+        appPath: "/Users/owner/private",
+      },
+    }),
+    (error) => error.code === WINDOWS_RECEIPT_STATUS.packageInvalid,
+  );
+  assert.throws(
+    () => buildWindowsElectronQualificationReceipt({
+      ...fixture,
+      qualificationResult: `${fixture.qualificationResult} username=owner`,
+    }),
+    (error) => error.code === WINDOWS_RECEIPT_STATUS.qualificationInvalid,
+  );
+});
+
+test("Windows Electron qualification receipt CLI validates and writes its canonical receipt", async () => {
+  const fixture = windowsReceiptFixture();
+  const directory = await mkdtemp(join(tmpdir(), "tibotattle-windows-receipt-"));
+  const qualificationPath = join(directory, "qualification.txt");
+  const packagedPath = join(directory, "packaged.json");
+  const runtimePath = join(directory, "runtime.json");
+  const outputPath = join(directory, "receipt.json");
+  try {
+    await Promise.all([
+      writeFile(qualificationPath, `${fixture.qualificationResult}\n`),
+      writeFile(packagedPath, `${JSON.stringify(fixture.packagedEvidence)}\n`),
+      writeFile(runtimePath, `${JSON.stringify(fixture.runtimeEvidence)}\n`),
+    ]);
+    const result = spawnSync(process.execPath, [
+      "scripts/build-windows-electron-qualification-receipt.mjs",
+      "--output", outputPath,
+      "--revision", fixture.revision,
+      "--target", fixture.target,
+      "--cache-mode", fixture.cacheMode,
+      "--binding-sha256", fixture.bindingSha256,
+      "--binding-bytes", String(fixture.bindingBytes),
+      "--qualification-result", qualificationPath,
+      "--packaged-evidence", packagedPath,
+      "--runtime-evidence", runtimePath,
+    ], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      cacheMode: fixture.cacheMode,
+      revision: fixture.revision,
+      status: "WINDOWS_ELECTRON_DEVELOPMENT_QUALIFICATION_PASSED",
+      target: fixture.target,
+    });
+    const receipt = JSON.parse(await readFile(outputPath, "utf8"));
+    assert.equal(receipt.status, "WINDOWS_ELECTRON_DEVELOPMENT_QUALIFICATION_PASSED");
+    assert.equal(receipt.runtime.status, "WINDOWS_ELECTRON_RUNTIME_SMOKE_PASSED");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
