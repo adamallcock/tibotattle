@@ -3384,16 +3384,32 @@ function timelineStatusIntervals(points, viewport) {
     .map((point) => ({ point, at: pointTimestampMs(point) }))
     .filter(({ at }) => Number.isFinite(at))
     .sort((left, right) => left.at - right.at);
-  return rows.flatMap(({ point, at: current }, index) => {
-    if (!point.status || point.status === "matched" || point.status === "inactive") return [];
+  // A run of consecutive windows excluded by ONE mechanism is one region, and
+  // merging it is a correctness fix rather than a tidy-up. Emitted per window,
+  // each rect is floored to a full viewBox unit by the renderer; at 30d the
+  // spacing between windows is well under a unit, so neighbours in a run
+  // overlapped and composited their alpha on top of each other. The wash then
+  // darkened with point DENSITY instead of duration — dense runs read as solid
+  // blocks while isolated windows stayed invisible, which is precisely the
+  // "I never see them" the exclusion legend was failing to explain.
+  const merged = [];
+  rows.forEach(({ point, at: current }, index) => {
+    if (!TIMELINE_STATUS_BAND_CLASSES[point.status]) return;
     const previous = index === 0 ? viewport.startMs : rows[index - 1].at;
     const next = index === rows.length - 1 ? viewport.endMs : rows[index + 1].at;
-    return [{
-      status: point.status,
-      startMs: Math.max(viewport.startMs, (previous + current) / 2),
-      endMs: Math.min(viewport.endMs, (current + next) / 2),
-    }];
+    const startMs = Math.max(viewport.startMs, (previous + current) / 2);
+    const endMs = Math.min(viewport.endMs, (current + next) / 2);
+    const last = merged[merged.length - 1];
+    // Adjacent windows meet exactly at their shared midpoint, so touching is
+    // the test for contiguity. A matched window in between pushes the next
+    // start past the previous end and correctly breaks the run.
+    if (last && last.status === point.status && startMs <= last.endMs) {
+      last.endMs = Math.max(last.endMs, endMs);
+      return;
+    }
+    merged.push({ status: point.status, startMs, endMs });
   });
+  return merged;
 }
 
 // The weekly track is identified by (limitId, duration) alone. The provider's
@@ -3589,7 +3605,17 @@ function liveTimelinePoints(
     // Pool saturated: the window STARTS at the ceiling, so the display
     // cannot move no matter what the workload costs. Both series suspend —
     // a zero observed against a live expected here is not a measurement.
-    const poolSaturated = sameReset
+    //
+    // Gated on `bracketed`, NOT on `sameReset`. Exhausting a pool spawns a
+    // fresh pool carrying a new `resets_at`, so a window that starts pegged
+    // almost always ends on a different boundary; requiring `sameReset` here
+    // made saturation unobservable in exactly the case it exists to describe,
+    // and every such window was booked as a plain track change instead. This
+    // also restores parity with the local pipeline, which has always read
+    // saturation off the start edge alone (`src/simple-quota-gradient.js`).
+    // `observed` already required `sameReset`, so no window changes from
+    // measured to suspended — only the label it is suspended under.
+    const poolSaturated = Boolean(bracketed)
       && before.usedPercent >= POOL_SATURATION_CEILING_PP;
     const observed = !poolSaturated
         && sameReset
@@ -5446,6 +5472,37 @@ function chartSeriesCaption(label, value) {
   return t("chart.seriesValue", { label, value });
 }
 
+/**
+ * Which evidence states shade the plot, and under which hue.
+ *
+ * This is an explicit table with NO fallback, and both properties matter. The
+ * renderer used to end its status test in `: "ambiguous"`, so three unrelated
+ * states — `quota_weighting_unavailable`, `unpriced_local_activity` and
+ * `unexplained_without_local_activity` — all drew in the violet the legend
+ * captions "Movement needs context". Violet therefore meant four different
+ * things and mapped back to nothing.
+ *
+ * Worse, the last two carry BOTH series and are counted as matched windows, so
+ * the chart was shading spans the caption underneath it calls excluded. A
+ * status absent from this table is not shaded at all: shading is reserved for
+ * the mechanisms that actually suspend a measurement, which is exactly the set
+ * `TIMELINE_EXCLUSION_MESSAGE_KEYS` enumerates and the legend keys.
+ */
+const TIMELINE_STATUS_BAND_CLASSES = Object.freeze({
+  missing_quota_bracket: "missing",
+  reset_or_track_change: "reset",
+  quota_weighting_unavailable: "weighting",
+  backward_or_ambiguous: "ambiguous",
+  pool_saturated: "saturated",
+});
+
+// A band narrower than this cannot be seen, so every region also draws a
+// full-strength tick along the top edge of the plot at no less than this
+// width. The wash keeps the true extent and never widens; the tick is an
+// explicit presence marker, which is why the two are allowed to disagree.
+const STATUS_TICK_MINIMUM_WIDTH = 3;
+const STATUS_TICK_HEIGHT = 4;
+
 function lineChart({
   points,
   series,
@@ -5913,28 +5970,54 @@ function lineChart({
   for (const interval of statusIntervals) {
     if (!Number.isFinite(interval.startMs) || !Number.isFinite(interval.endMs)
         || interval.endMs <= interval.startMs) continue;
+    const band = TIMELINE_STATUS_BAND_CLASSES[interval.status];
+    // No entry means no legend swatch, so nothing is drawn. Silently shading
+    // an unkeyed status is what made the violet band unreadable.
+    if (!band) continue;
+    const plotWidth = width - margin.left - margin.right;
     const start = margin.left + (interval.startMs - domainStartMs)
-      / (safeDomainEndMs - domainStartMs) * (width - margin.left - margin.right);
+      / (safeDomainEndMs - domainStartMs) * plotWidth;
     const end = margin.left + (interval.endMs - domainStartMs)
-      / (safeDomainEndMs - domainStartMs) * (width - margin.left - margin.right);
-    const rect = document.createElementNS(svg.namespaceURI, "rect");
-    rect.setAttribute("x", String(Math.max(margin.left, start)));
-    rect.setAttribute("y", String(margin.top));
-    rect.setAttribute("width", String(Math.max(1, Math.min(width - margin.right, end) - Math.max(margin.left, start))));
-    rect.setAttribute("height", String(height - margin.top - margin.bottom));
-    rect.setAttribute("class", `chart-status-${
-      interval.status === "reset_or_track_change" ? "reset"
-        : interval.status === "missing_quota_bracket" ? "missing"
-          : interval.status === "pool_saturated" ? "saturated"
-            : "ambiguous"
-    }`);
-    const intervalTitle = document.createElementNS(svg.namespaceURI, "title");
-    setRawText(
-      intervalTitle,
-      chartText({ key: timelineStatusKey(interval.status) }, "status interval"),
+      / (safeDomainEndMs - domainStartMs) * plotWidth;
+    const left = Math.max(margin.left, start);
+    const bandWidth = Math.max(1, Math.min(width - margin.right, end) - left);
+    const label = chartText(
+      { key: timelineStatusKey(interval.status) },
+      "status interval",
     );
-    rect.append(intervalTitle);
-    svg.append(rect);
+    const shade = (element) => {
+      const elementTitle = document.createElementNS(svg.namespaceURI, "title");
+      setRawText(elementTitle, label);
+      element.append(elementTitle);
+      svg.append(element);
+    };
+
+    const rect = document.createElementNS(svg.namespaceURI, "rect");
+    rect.setAttribute("x", String(left));
+    rect.setAttribute("y", String(margin.top));
+    rect.setAttribute("width", String(bandWidth));
+    rect.setAttribute("height", String(height - margin.top - margin.bottom));
+    rect.setAttribute("class", `chart-status-${band}`);
+    shade(rect);
+
+    // The wash carries EXTENT and is never widened, so it cannot overstate how
+    // long a mechanism was in force. This tick carries IDENTITY: a fixed
+    // minimum width at legend-swatch strength, so a single excluded window —
+    // four in the owner's 30d view, each under half a unit wide — reads as a
+    // marker in its own hue instead of resolving to nothing. Drawn before the
+    // series, so a line crossing the top of the plot still wins.
+    const tickWidth = Math.max(STATUS_TICK_MINIMUM_WIDTH, bandWidth);
+    const tickLeft = Math.min(
+      width - margin.right - tickWidth,
+      Math.max(margin.left, left + bandWidth / 2 - tickWidth / 2),
+    );
+    const tick = document.createElementNS(svg.namespaceURI, "rect");
+    tick.setAttribute("x", String(tickLeft));
+    tick.setAttribute("y", String(margin.top));
+    tick.setAttribute("width", String(tickWidth));
+    tick.setAttribute("height", String(STATUS_TICK_HEIGHT));
+    tick.setAttribute("class", `chart-status-tick chart-status-${band}`);
+    shade(tick);
   }
 
   for (const item of chartSeries) {
