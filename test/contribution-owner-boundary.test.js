@@ -424,6 +424,7 @@ test("contribution implementations use only reviewed package and owner edges", a
     [
       "./bounded-directory-reader.js",
       "./owner-only-filesystem.js",
+      "./windows-sqlite-state-session.js",
       "node:crypto",
       "node:fs",
       "node:fs/promises",
