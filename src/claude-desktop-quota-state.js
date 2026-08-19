@@ -6,8 +6,13 @@ import {
   mkdirSync,
   openSync,
 } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, resolve, win32 } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+
+import {
+  isWindowsSqliteStateDatabase,
+  isWindowsSqliteStateSession,
+} from "./platform/index.js";
 
 export const CLAUDE_DESKTOP_QUOTA_STATE_VERSION =
   "claude-desktop-quota-state-v0.1";
@@ -103,6 +108,51 @@ function safeStatePath(path) {
   return selected;
 }
 
+function safeStatePathForPlatform(path, platform) {
+  if (platform !== "win32") return safeStatePath(path);
+  if (typeof path !== "string" || path.length === 0 || path.includes("\0")) {
+    fail("configuration");
+  }
+  let selected;
+  try {
+    selected = win32.normalize(path.replaceAll("/", "\\"));
+  } catch {
+    fail("configuration");
+  }
+  if (!win32.isAbsolute(selected) || selected.endsWith("\\")) fail("configuration");
+  return selected;
+}
+
+function normalizedPlatform(platform) {
+  if (typeof platform !== "string" || platform.length === 0) fail("configuration");
+  // A real Windows process may not downgrade itself into the POSIX path by
+  // supplying a friendlier platform label.
+  if (process.platform === "win32" && platform !== "win32") {
+    fail("windows_state_unqualified");
+  }
+  return platform;
+}
+
+function qualifiedWindowsSqliteSession(session, selectedPath) {
+  let valid = false;
+  try {
+    const sessionPath = win32.join(session.rootPath, session.databaseName);
+    valid = isWindowsSqliteStateSession(session)
+      && isWindowsSqliteStateDatabase(session.database)
+      && session.contractVersion === "windows-sqlite-state-session-v1"
+      && win32.normalize(sessionPath).toLowerCase()
+        === win32.normalize(selectedPath).toLowerCase()
+      && session.productionSafe === true
+      && session.sqliteStateLeaseSafe === true
+      && typeof session.close === "function"
+      && typeof session.abort === "function";
+  } catch {
+    valid = false;
+  }
+  if (!valid) fail("windows_state_unqualified");
+  return session;
+}
+
 function assertOwnerOnlyDirectory(path, { create = false } = {}) {
   if (create) {
     try {
@@ -161,17 +211,25 @@ function createOwnerOnlyDatabase(path) {
   assertOwnerOnlyDatabase(path);
 }
 
-function configure(database) {
+function configure(database, { protectedWindowsSession = false } = {}) {
   database.exec("PRAGMA busy_timeout = 5000;");
-  database.exec(`
-    PRAGMA foreign_keys = ON;
-    PRAGMA journal_mode = DELETE;
-    PRAGMA synchronous = FULL;
-    PRAGMA trusted_schema = OFF;
-    PRAGMA temp_store = FILE;
-    PRAGMA cache_size = -8192;
-    PRAGMA mmap_size = 0;
-  `);
+  if (protectedWindowsSession) {
+    // The qualified Windows session has already configured and locked the
+    // durable PERSIST/FULL/MEMORY/zero-mmap policy. Do not fight that policy
+    // with this store's historical DELETE/FILE settings; its authorizer
+    // intentionally rejects such mutations.
+    database.exec("PRAGMA cache_size = -8192;");
+  } else {
+    database.exec(`
+      PRAGMA foreign_keys = ON;
+      PRAGMA journal_mode = DELETE;
+      PRAGMA synchronous = FULL;
+      PRAGMA trusted_schema = OFF;
+      PRAGMA temp_store = FILE;
+      PRAGMA cache_size = -8192;
+      PRAGMA mmap_size = 0;
+    `);
+  }
   database.exec(`
     CREATE TABLE IF NOT EXISTS ledger_meta (
       key TEXT PRIMARY KEY,
@@ -590,15 +648,42 @@ export function defaultClaudeDesktopQuotaStatePath(dataDirectory = null) {
   return resolve(directory, "claude-desktop-quota.sqlite");
 }
 
-export function openClaudeDesktopQuotaState(path) {
-  const selectedPath = safeStatePath(path);
-  createOwnerOnlyDatabase(selectedPath);
+export function openClaudeDesktopQuotaState(
+  path,
+  {
+    platform = process.platform,
+    windowsSqliteStateSession = null,
+  } = {},
+) {
+  platform = normalizedPlatform(platform);
+  const selectedPath = safeStatePathForPlatform(path, platform);
   let database;
+  let session = null;
   try {
-    database = new DatabaseSync(selectedPath);
-    configure(database);
+    if (platform === "win32") {
+      // Windows production must receive the branded, qualified session. The
+      // session owns DatabaseSync and the native root/SQLite lease; this
+      // module is intentionally not allowed to open a path or touch Node fs
+      // on that platform. A plain object, copied receipt, or unqualified
+      // development session cannot become a fallback.
+      session = qualifiedWindowsSqliteSession(
+        windowsSqliteStateSession,
+        selectedPath,
+      );
+      database = session.database;
+    } else {
+      if (windowsSqliteStateSession !== null) fail("configuration");
+      createOwnerOnlyDatabase(selectedPath);
+      database = new DatabaseSync(selectedPath);
+    }
+    configure(database, { protectedWindowsSession: session !== null });
   } catch (error) {
-    database?.close();
+    try {
+      if (session !== null) session.abort();
+      else database?.close();
+    } catch {
+      // Preserve the original fixed state error; cleanup is best effort.
+    }
     throw error;
   }
 
@@ -853,15 +938,24 @@ export function openClaudeDesktopQuotaState(path) {
     },
 
     close() {
-      database.close();
+      if (session !== null) session.close();
+      else database.close();
     },
   };
 }
 
 export function readClaudeDesktopQuotaProjection(path, options = {}) {
-  const state = openClaudeDesktopQuotaState(path);
+  const {
+    platform = process.platform,
+    windowsSqliteStateSession = null,
+    ...projectionOptions
+  } = options;
+  const state = openClaudeDesktopQuotaState(path, {
+    platform,
+    windowsSqliteStateSession,
+  });
   try {
-    return state.readProjection(options);
+    return state.readProjection(projectionOptions);
   } finally {
     state.close();
   }
