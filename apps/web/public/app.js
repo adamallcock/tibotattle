@@ -6512,18 +6512,187 @@ function ensureWeeklyPaceForecastCard() {
   return card;
 }
 
-function weeklyPaceDirection(percentagePointsPerHour, baseline = null) {
-  const pace = finite(percentagePointsPerHour);
-  const steady = firstFiniteForecastNumber(
-    baseline,
-    // A seven-day allowance paced evenly across its full window is the only
-    // baseline this card can derive without inventing a user schedule.
-    100 / (CODEX_WEEKLY_ALLOWANCE_MINUTES / 60),
+// Over, on and under pace are judged against the pace this window can still
+// sustain - the allowance that is left, spread evenly across the time that is
+// left - and never against a fixed 100%-per-seven-days rate.
+//
+// The fixed rate cannot answer the question a reader is actually asking,
+// because it ignores where in the window they already stand. At 3% left with
+// a day to go, "a steady weekly pace" is more than ten times too fast to
+// survive the reset, yet the card called that "ahead of a steady weekly pace"
+// and stayed green, because colour tracked whether the engine had an ETA
+// rather than whether the reader was about to run dry (community report,
+// 2026-08-18).
+const PACE_ON_TRACK_LOWER_RATIO = .85;
+const PACE_ON_TRACK_UPPER_RATIO = 1.15;
+// At twice the sustainable pace the allowance covers less than half the time
+// that is left, so the window ends with more dry hours than covered ones.
+const PACE_CRITICAL_RATIO = 2;
+// Under an hour of observations an overall rate is whatever the reader
+// happened to be doing in that hour, so the headline falls back to the
+// engine's active-interval pace and the card keeps saying it is early.
+const PACE_AVERAGE_MINIMUM_HOURS = 1;
+const PACE_STATE_LABELS = Object.freeze({
+  over: "Over pace",
+  on: "On pace",
+  under: "Under pace",
+});
+
+/**
+ * The two rates this card carries answer different questions and routinely
+ * disagree by an order of magnitude.
+ *
+ * `pace.percentagePointsPerHour` is the engine's median over adjacent
+ * intervals that actually moved, so it measures the pace *while working* and
+ * discards every idle gap. Extrapolated across a whole window it assumes the
+ * reader never stops, which is why a forecast built on it alone always lands
+ * earlier than what happens - the "it always underestimates the time I have
+ * left" complaint this card drew.
+ *
+ * `movementPp / elapsedHours` is the same window's overall rate with idle
+ * time included. That is the honest headline; the active rate stays on the
+ * card as the without-pausing edge, drawn as a separate mark on the track.
+ */
+function weeklyPaceRates(pace, forecast) {
+  const active = firstFiniteForecastNumber(
+    pace.percentagePointsPerHour,
+    pace.percentPerHour,
+    pace.pacePercentPerHour,
+    forecast.percentagePointsPerHour,
+    forecast.pacePercentPerHour,
+    forecast.pacePpPerHour,
   );
-  if (pace === null || steady === null || steady <= 0) return null;
-  if (pace > steady * 1.1) return "Recent pace is ahead of a steady weekly pace.";
-  if (pace < steady * .9) return "Recent pace is behind a steady weekly pace.";
-  return "Recent pace is close to a steady weekly pace.";
+  const elapsedHours = firstFiniteForecastNumber(pace.elapsedHours);
+  const movementPp = firstFiniteForecastNumber(pace.movementPp);
+  const average = elapsedHours !== null
+    && elapsedHours >= PACE_AVERAGE_MINIMUM_HOURS
+    && movementPp !== null
+    && movementPp > 0
+    ? movementPp / elapsedHours
+    : null;
+  return {
+    active: active !== null && active > 0 ? active : null,
+    average,
+    // The overall rate leads whenever the observed span is long enough to
+    // contain a realistic mix of work and rest.
+    headline: average ?? (active !== null && active > 0 ? active : null),
+  };
+}
+
+/**
+ * Where the reader stands relative to the pace that just reaches the reset.
+ *
+ * `ratio` is the whole classification: 1 means the allowance runs out exactly
+ * at the reset, above 1 means it runs out early, below 1 means some is left
+ * over. Because the sustainable pace is `remaining / hoursToReset`, the ratio
+ * is also `hoursToReset / hoursToExhaustion`, so the track below can be drawn
+ * straight from it without a second, separately-rounded division.
+ */
+function weeklyPaceStanding({ remainingPercent, hoursToReset, pacePpPerHour }) {
+  const remaining = finite(remainingPercent);
+  const hoursLeft = finite(hoursToReset);
+  const pace = finite(pacePpPerHour);
+  if (remaining === null
+      || hoursLeft === null
+      || hoursLeft <= 0
+      || remaining <= 0
+      || pace === null
+      || pace <= 0) return null;
+  const sustainable = remaining / hoursLeft;
+  const ratio = pace / sustainable;
+  if (!Number.isFinite(ratio) || ratio <= 0) return null;
+  const coveredHours = Math.min(hoursLeft, remaining / pace);
+  const state = ratio > PACE_ON_TRACK_UPPER_RATIO
+    ? "over"
+    : ratio < PACE_ON_TRACK_LOWER_RATIO ? "under" : "on";
+  return {
+    ratio,
+    state,
+    critical: state === "over" && ratio >= PACE_CRITICAL_RATIO,
+    sustainable,
+    coveredHours,
+    dryHours: Math.max(0, hoursLeft - coveredHours),
+    // Only meaningful when the pace does not exhaust the window; an over-pace
+    // reading leaves nothing spare by definition.
+    sparePercent: Math.max(0, remaining - pace * hoursLeft),
+  };
+}
+
+function formatPaceRatio(ratio) {
+  const value = finite(ratio);
+  if (value === null) return null;
+  return `${formatDecimal(value, value < 10 ? 1 : 0)}×`;
+}
+
+/**
+ * The window as a single track: how much of the time left to the reset the
+ * remaining allowance actually covers, and how much of it is dry.
+ *
+ * The bar is deliberately a picture of time, not of allowance. "You have 3%
+ * left" tells a reader nothing on its own; "that covers the next 20 minutes
+ * of a day and five hours" is the fact they act on. The state name, the
+ * heading and this track's own label all state the standing in words, so
+ * colour is never the only carrier.
+ */
+function weeklyPaceTrack(standing, hoursToReset, activePace, remainingPercent) {
+  const hoursLeft = finite(hoursToReset);
+  if (!standing || hoursLeft === null || hoursLeft <= 0) return null;
+  const coveredShare = Math.max(0, Math.min(1, standing.coveredHours / hoursLeft));
+  const track = node("div", "weekly-pace-track");
+  const bar = node("div", "weekly-pace-track-bar");
+  const covered = node("div", "weekly-pace-track-covered");
+  covered.style.inlineSize = `${(coveredShare * 100).toFixed(2)}%`;
+  bar.append(covered);
+
+  // The engine's active-interval pace, drawn only where it would run the
+  // allowance out sooner than the headline rate does. It is the edge of the
+  // estimate, not the estimate: it answers "and if I do not stop?".
+  const remaining = finite(remainingPercent);
+  const active = finite(activePace);
+  const flatOutHours = active !== null && active > 0 && remaining !== null
+    ? remaining / active
+    : null;
+  let flatOutLabel = null;
+  if (flatOutHours !== null && flatOutHours < standing.coveredHours * .95) {
+    const flatOutShare = Math.max(0, Math.min(1, flatOutHours / hoursLeft));
+    const mark = node("div", "weekly-pace-track-mark");
+    mark.style.insetInlineStart = `${(flatOutShare * 100).toFixed(2)}%`;
+    bar.append(mark);
+    flatOutLabel = formatForecastDuration(flatOutHours);
+  }
+
+  const resetDuration = formatForecastDuration(hoursLeft);
+  const coveredDuration = formatForecastDuration(standing.coveredHours);
+  const dryDuration = formatForecastDuration(standing.dryHours);
+  bar.setAttribute("role", "img");
+  bar.setAttribute(
+    "aria-label",
+    // Whether a gap exists is arithmetic, not a state name: the on-pace band
+    // straddles the point where the allowance lands exactly on the reset, so
+    // an on-pace card can still end with a short dry stretch.
+    dryDuration
+      ? `Of the ${resetDuration ?? "time"} left before the reset, the remaining allowance covers about ${coveredDuration ?? "none of it"}, leaving about ${dryDuration} with none left.`
+      : `The remaining allowance covers all ${resetDuration ?? "of the time"} left before the reset.`,
+  );
+
+  const scale = node("div", "weekly-pace-track-scale");
+  scale.append(
+    node("span", "", "Now"),
+    node(
+      "span",
+      "weekly-pace-track-scale-end",
+      resetDuration ? `Reset in ${resetDuration}` : "Reset",
+    ),
+  );
+  track.append(bar, scale);
+  if (flatOutLabel) {
+    track.append(node(
+      "p",
+      "weekly-pace-track-note",
+      `The mark is where the allowance ends if the recent active pace continues without a pause: about ${flatOutLabel} from now.`,
+    ));
+  }
+  return track;
 }
 
 function renderWeeklyPaceForecast(data) {
@@ -6566,14 +6735,8 @@ function renderWeeklyPaceForecast(data) {
   if (remaining === null && used !== null) remaining = 100 - used;
   if (remaining !== null && (remaining < 0 || remaining > 100)) remaining = null;
 
-  const percentagePointsPerHour = firstFiniteForecastNumber(
-    pace.percentagePointsPerHour,
-    pace.percentPerHour,
-    pace.pacePercentPerHour,
-    forecast.percentagePointsPerHour,
-    forecast.pacePercentPerHour,
-    forecast.pacePpPerHour,
-  );
+  const rates = weeklyPaceRates(pace, forecast);
+  const percentagePointsPerHour = rates.headline;
   const hoursToReset = firstFiniteForecastNumber(
     (resetAt - now) / 3_600_000,
     forecast.hoursToReset,
@@ -6623,16 +6786,37 @@ function renderWeeklyPaceForecast(data) {
       && percentagePointsPerHour === null
       && !reachesResetFirst) return;
 
+  // The standing is computed from the headline rate, so the card's colour,
+  // its heading and its arithmetic all come from one number. The engine's own
+  // `available` / `will_reach_reset_first` split still gates whether a card
+  // appears at all, but it no longer decides how the card reads: an engine ETA
+  // built on the active-interval pace is exactly the reading that overstated
+  // the burn.
+  const standing = collectingEvidence
+    ? null
+    : weeklyPaceStanding({
+      remainingPercent: remaining,
+      hoursToReset,
+      pacePpPerHour: percentagePointsPerHour,
+    });
+  const paceState = standing?.state
+    ?? (collectingEvidence ? null : reachesResetFirst ? "under" : null);
+  const projectedEtaAt = standing !== null && standing.state === "over"
+    ? now + standing.coveredHours * 3_600_000
+    : null;
+
   const title = node("h3", "weekly-pace-forecast-title");
   const cardId = "weekly-pace-forecast-title";
   title.id = cardId;
   title.textContent = collectingEvidence
     ? "Pace estimate ready after one more refresh"
-    : reachesResetFirst
-      ? "At the recent pace, the weekly allowance should last to reset"
-      : etaAt === null
-        ? "At this pace: weekly allowance exhaustion is approaching"
-        : `At this pace: reaches weekly allowance ${formatReportingTime(etaAt)}`;
+    : paceState === "over"
+      ? projectedEtaAt === null
+        ? "At this pace the weekly allowance runs out before the reset"
+        : `At this pace the weekly allowance runs out ${formatReportingTime(projectedEtaAt)}`
+      : paceState === "on"
+        ? "At this pace the weekly allowance runs close to the reset"
+        : "At this pace the weekly allowance lasts to the reset with room to spare";
   card.setAttribute("aria-labelledby", cardId);
 
   const heading = node("div", "weekly-pace-forecast-heading");
@@ -6642,95 +6826,112 @@ function renderWeeklyPaceForecast(data) {
       "panel-kicker",
       collectingEvidence ? "Collecting forecast evidence" : "Forecast from recent pace",
     ),
-    node(
+  );
+  if (collectingEvidence) {
+    heading.append(node(
       "span",
-      collectingEvidence
-        ? "evidence-chip weekly-pace-forecast-collecting-chip"
-        : earlyEstimate
-          ? "evidence-chip weekly-pace-forecast-early-chip"
-          : "evidence-chip",
-      collectingEvidence ? "One more refresh" : earlyEstimate ? "Early estimate" : "Observed pace",
-    ),
-  );
+      "evidence-chip weekly-pace-forecast-collecting-chip",
+      "One more refresh",
+    ));
+  } else if (paceState) {
+    // The standing is named in words on the chip as well as carried in the
+    // card's colour, so the over/on/under reading survives a monochrome
+    // screen, a colour-vision difference and a screen reader alike.
+    heading.append(node(
+      "span",
+      "evidence-chip weekly-pace-forecast-state-chip",
+      PACE_STATE_LABELS[paceState],
+    ));
+  }
+  if (earlyEstimate) {
+    heading.append(node(
+      "span",
+      "evidence-chip weekly-pace-forecast-early-chip",
+      "Early estimate",
+    ));
+  }
 
-  const direction = weeklyPaceDirection(
-    percentagePointsPerHour,
-    firstFiniteForecastNumber(
-      pace.steadyPercentagePointsPerHour,
-      forecast.steadyPercentagePointsPerHour,
-    ),
-  );
+  const ratioLabel = standing === null ? null : formatPaceRatio(standing.ratio);
+  const dryDuration = standing === null
+    ? null
+    : formatForecastDuration(standing.dryHours);
   const copy = node("p", "weekly-pace-forecast-copy");
   copy.textContent = collectingEvidence
     ? "One clean weekly allowance observation is saved. The next fresh observation for this account and reset will establish its pace."
-    : earlyEstimate
-      ? "This is an early estimate from a small amount of recent evidence; it will settle as more observations arrive."
-      : direction ?? (reachesResetFirst
-        ? "Recent allowance movement is not fast enough to exhaust this window before its reset."
-        : "The estimate uses the latest clean allowance observations.");
+    : standing === null
+      ? "Recent allowance movement is not fast enough to exhaust this window before its reset."
+      : standing.state === "over"
+        ? `Recent use is running about ${ratioLabel} the pace this window can still sustain${dryDuration ? `, which leaves roughly ${dryDuration} with none left before the reset` : ""}.`
+        : standing.state === "on"
+          ? `Recent use is close to the pace this window can still sustain, so the allowance should land near the reset with little to spare.`
+          : `Recent use is running about ${ratioLabel} the pace this window can still sustain, so some of the allowance should still be unused at the reset.`;
+  if (earlyEstimate) {
+    copy.textContent += " This is an early estimate from a small amount of recent evidence; it will settle as more observations arrive.";
+  }
 
   const metrics = node("div", "weekly-pace-forecast-metrics");
-  if (remaining !== null) {
-    metrics.append(
-      node("div", "weekly-pace-forecast-metric", "Allowance left"),
-    );
-    const item = metrics.lastElementChild;
-    item.replaceChildren(
-      node("span", "", "Allowance left"),
-      node("strong", "", formatPercent(remaining)),
-    );
-  }
+  const addMetric = (label, value) => {
+    const item = node("div", "weekly-pace-forecast-metric");
+    item.append(node("span", "", label), node("strong", "", value));
+    metrics.append(item);
+  };
+  if (remaining !== null) addMetric("Allowance left", formatPercent(remaining));
   const resetDuration = formatForecastDuration(hoursToReset);
-  if (resetDuration) {
-    metrics.append(
-      node("div", "weekly-pace-forecast-metric"),
-    );
-    const item = metrics.lastElementChild;
-    item.append(
-      node("span", "", "Reset"),
-      node("strong", "", `in ${resetDuration}`),
-    );
-  }
+  if (resetDuration) addMetric("Reset", `in ${resetDuration}`);
   if (collectingEvidence) {
-    metrics.append(
-      node("div", "weekly-pace-forecast-metric"),
-    );
-    const item = metrics.lastElementChild;
-    item.append(
-      node("span", "", "Evidence"),
-      node("strong", "", "1 saved"),
-    );
+    addMetric("Evidence", "1 saved");
+  } else if (dryDuration) {
+    // A dry stretch and spare allowance are mutually exclusive, and the tile
+    // reports whichever one the reading actually produced rather than pinning
+    // itself to the state name.
+    addMetric("Nothing left for", dryDuration);
+  } else if (standing !== null) {
+    addMetric("Spare at reset", formatPercent(standing.sparePercent));
   } else if (percentagePointsPerHour !== null && percentagePointsPerHour > 0) {
-    metrics.append(
-      node("div", "weekly-pace-forecast-metric"),
-    );
-    const item = metrics.lastElementChild;
-    item.append(
-      node("span", "", "Recent pace"),
-      node("strong", "", `${formatDecimal(percentagePointsPerHour, 1)} pp/hour`),
-    );
+    addMetric("Recent pace", `${formatDecimal(percentagePointsPerHour, 1)} pp/hour`);
   }
 
+  const track = collectingEvidence
+    ? null
+    : weeklyPaceTrack(standing, hoursToReset, rates.active, remaining);
+
+  // The evidence line names both rates. A reader who wondered why the old
+  // card's forecast kept arriving early can see the difference between the
+  // pace with idle time counted and the pace while working, instead of being
+  // handed one number with no way to tell which it was.
   const observationDuration = formatForecastDuration(paceElapsedHours);
+  const rateSentences = [];
+  if (rates.average !== null) {
+    rateSentences.push(`${formatDecimal(rates.average, 1)} pp/hour overall`);
+  }
+  if (rates.active !== null) {
+    rateSentences.push(`${formatDecimal(rates.active, 1)} pp/hour while active`);
+  }
   const evidence = observations !== null && observations >= 1
     ? node(
       "p",
       "weekly-pace-forecast-evidence",
       collectingEvidence
         ? "One fresh allowance observation is saved for this weekly reset."
-        : `Based on ${Math.round(observations)} recent allowance observation${Math.round(observations) === 1 ? "" : "s"}${observationDuration ? ` over ${observationDuration}` : ""}.`,
+        : `Based on ${formatDecimal(Math.round(observations), 0)} recent allowance observation${Math.round(observations) === 1 ? "" : "s"}${observationDuration ? ` over ${observationDuration}` : ""}${rateSentences.length > 0 ? `: ${rateSentences.join(", ")}` : ""}.`,
     )
     : null;
   card.className = [
     "weekly-pace-forecast",
     collectingEvidence
       ? "is-insufficient"
-      : reachesResetFirst
-        ? "is-reset-first"
-        : "is-available",
+      : paceState === "over"
+        ? "is-over-pace"
+        : paceState === "on" ? "is-on-pace" : "is-under-pace",
+    standing?.critical ? "is-critical" : "",
     earlyEstimate ? "is-early-estimate" : "",
+    // Retained so the engine's own split stays inspectable from the DOM even
+    // though it no longer drives presentation.
+    reachesResetFirst ? "is-reset-first" : "",
+    available ? "is-available" : "",
   ].filter(Boolean).join(" ");
   card.append(heading, title, copy, metrics);
+  if (track) card.append(track);
   if (evidence) card.append(evidence);
   card.hidden = false;
 }
