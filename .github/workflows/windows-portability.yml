@@ -265,6 +265,13 @@ jobs:
             Write-Error 'WINDOWS_SECURITY_QUALIFICATION_FAILED'
             exit 1
           }
+          $qualificationResultPath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-security-qualification.txt'
+          [IO.File]::WriteAllText(
+            $qualificationResultPath,
+            "$result`n",
+            [Text.UTF8Encoding]::new($false)
+          )
+          "TIBOTATTLE_WINDOWS_SECURITY_QUALIFICATION_RESULT_PATH=$qualificationResultPath" >> $env:GITHUB_ENV
           "### Content-free security result" >> $env:GITHUB_STEP_SUMMARY
           "- Command: node ./scripts/windows-security-qualification.mjs" >> $env:GITHUB_STEP_SUMMARY
           "- Result: $result" >> $env:GITHUB_STEP_SUMMARY
@@ -382,7 +389,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $verificationLog = Join-Path $env:RUNNER_TEMP 'tibotattle-electron-verification.log'
+          $verificationLog = Join-Path $env:RUNNER_TEMP 'tibotattle-electron-verification.json'
           node ./scripts/verify-electron-development-artifact.mjs `
             --target win32-x64 `
             --app $env:TIBOTATTLE_ELECTRON_STAGED_APP_PATH `
@@ -392,6 +399,7 @@ jobs:
             Write-Error 'WINDOWS_ELECTRON_ARTIFACT_VERIFICATION_FAILED'
             exit 1
           }
+          "TIBOTATTLE_ELECTRON_VERIFICATION_EVIDENCE_PATH=$verificationLog" >> $env:GITHUB_ENV
           try {
             $evidence = Get-Content -LiteralPath $verificationLog -Raw | ConvertFrom-Json
           } catch {
@@ -432,11 +440,119 @@ jobs:
           "- app.asar.unpacked files: $($evidence.unpacked.count); bytes: $($evidence.unpacked.bytes); SHA-256: $($evidence.unpacked.sha256)" >> $env:GITHUB_STEP_SUMMARY
           "- Artifact union files: $($evidence.artifact.count); bytes: $($evidence.artifact.bytes); SHA-256: $($evidence.artifact.sha256)" >> $env:GITHUB_STEP_SUMMARY
           "- Binding bytes: $($evidence.binding.bytes); SHA-256: $($evidence.binding.sha256)" >> $env:GITHUB_STEP_SUMMARY
-          "- Runtime launch: not performed" >> $env:GITHUB_STEP_SUMMARY
+          "- Runtime qualification: deferred to the native Windows Electron smoke step" >> $env:GITHUB_STEP_SUMMARY
           "- Windows production readiness: not claimed" >> $env:GITHUB_STEP_SUMMARY
           "- Signing, notarization, installer, updater, and publication: not performed" >> $env:GITHUB_STEP_SUMMARY
 
+      - name: Run Windows Electron x64 runtime smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runtimeEvidencePath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.json'
+          node ./scripts/smoke-electron-windows.mjs *> $runtimeEvidencePath
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_FAILED'
+            exit 1
+          }
+          try {
+            $runtimeEvidence = Get-Content -LiteralPath $runtimeEvidencePath -Raw | ConvertFrom-Json
+          } catch {
+            Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_EVIDENCE_INVALID'
+            exit 1
+          }
+          $runtimeJson = $runtimeEvidence | ConvertTo-Json -Depth 10 -Compress
+          $requiredChecks = @(
+            'artifact',
+            'dashboardReady',
+            'syntheticRefresh',
+            'secondInstanceRejected',
+            'showHideTrayLifecycle',
+            'cleanQuit',
+            'noOrphan',
+            'relaunchPersistence'
+          )
+          if ($runtimeEvidence.status -ne 'passed' -or
+              $runtimeEvidence.target -ne 'win32-x64' -or
+              $runtimeEvidence.contentFree -ne $true -or
+              $runtimeJson -match '(?i)(?:[A-Za-z]:[\\/]|/Users/|/home/|\\Users\\|username|password|secret|token|pid|process|stdout|stderr|command|executable)') {
+            Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_EVIDENCE_NOT_CONTENT_FREE'
+            exit 1
+          }
+          foreach ($check in $requiredChecks) {
+            if ($runtimeEvidence.$check -ne $true) {
+              Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_CHECK_FAILED'
+              exit 1
+            }
+          }
+          "TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH=$runtimeEvidencePath" >> $env:GITHUB_ENV
+          "### Windows Electron runtime smoke" >> $env:GITHUB_STEP_SUMMARY
+          "- Status: $($runtimeEvidence.status)" >> $env:GITHUB_STEP_SUMMARY
+          "- Target: $($runtimeEvidence.target)" >> $env:GITHUB_STEP_SUMMARY
+          "- Dashboard readiness: passed" >> $env:GITHUB_STEP_SUMMARY
+          "- Synthetic refresh: passed" >> $env:GITHUB_STEP_SUMMARY
+          "- Tray/window lifecycle: passed" >> $env:GITHUB_STEP_SUMMARY
+          "- Single-instance rejection: passed" >> $env:GITHUB_STEP_SUMMARY
+          "- Clean quit and no orphan: passed" >> $env:GITHUB_STEP_SUMMARY
+          "- Relaunch persistence: passed" >> $env:GITHUB_STEP_SUMMARY
+          "- Diagnostics: content-free" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Create content-free Windows Electron qualification receipt
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $receiptPath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-qualification-receipt.json'
+          node ./scripts/build-windows-electron-qualification-receipt.mjs `
+            --output $receiptPath `
+            --revision $env:TIBOTATTLE_QUALIFICATION_REVISION `
+            --target win32-x64 `
+            --cache-mode $env:TIBOTATTLE_QUALIFICATION_CACHE_MODE `
+            --binding-sha256 $env:TIBOTATTLE_WINDOWS_BINDING_SHA256 `
+            --binding-bytes $env:TIBOTATTLE_WINDOWS_BINDING_BYTES `
+            --qualification-result $env:TIBOTATTLE_WINDOWS_SECURITY_QUALIFICATION_RESULT_PATH `
+            --packaged-evidence $env:TIBOTATTLE_ELECTRON_VERIFICATION_EVIDENCE_PATH `
+            --runtime-evidence $env:TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_ELECTRON_QUALIFICATION_RECEIPT_FAILED'
+            exit 1
+          }
+          try {
+            $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
+          } catch {
+            Write-Error 'WINDOWS_ELECTRON_QUALIFICATION_RECEIPT_INVALID'
+            exit 1
+          }
+          $receiptJson = $receipt | ConvertTo-Json -Depth 20 -Compress
+          if ($receipt.status -ne 'WINDOWS_ELECTRON_DEVELOPMENT_QUALIFICATION_PASSED' -or
+              $receipt.schemaVersion -ne 'tibotattle-windows-electron-development-qualification-v1' -or
+              $receipt.target -ne 'win32-x64' -or
+              $receipt.revision -ne $env:TIBOTATTLE_QUALIFICATION_REVISION -or
+              $receipt.cacheMode -ne $env:TIBOTATTLE_QUALIFICATION_CACHE_MODE -or
+              $receiptJson -match '(?i)(?:[A-Za-z]:[\\/]|/Users/|/home/|\\Users\\|username|password|secret|token|pid|stdout|stderr|command|executable)') {
+            Write-Error 'WINDOWS_ELECTRON_QUALIFICATION_RECEIPT_NOT_CONTENT_FREE'
+            exit 1
+          }
+          "TIBOTATTLE_ELECTRON_QUALIFICATION_RECEIPT_PATH=$receiptPath" >> $env:GITHUB_ENV
+          "### Windows Electron qualification receipt" >> $env:GITHUB_STEP_SUMMARY
+          "- Status: $($receipt.status)" >> $env:GITHUB_STEP_SUMMARY
+          "- Revision: $($receipt.revision)" >> $env:GITHUB_STEP_SUMMARY
+          "- Target: $($receipt.target)" >> $env:GITHUB_STEP_SUMMARY
+          "- Cache mode: $($receipt.cacheMode)" >> $env:GITHUB_STEP_SUMMARY
+          "- Binding bytes: $($receipt.binding.bytes); SHA-256: $($receipt.binding.sha256)" >> $env:GITHUB_STEP_SUMMARY
+          "- Runtime and package evidence: aggregate-only" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Retain exact Windows x64 development artifact and qualification receipt
+        if: ${{ success() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tibotattle-windows-x64-electron-${{ github.sha }}-${{ matrix.cache-mode }}
+          path: |
+            ${{ env.TIBOTATTLE_ELECTRON_ARTIFACT_APP_PATH }}
+            ${{ env.TIBOTATTLE_ELECTRON_QUALIFICATION_RECEIPT_PATH }}
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Remove generated Electron artifact tree before clean checkout gate
+        if: ${{ always() }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -446,6 +562,7 @@ jobs:
           }
 
       - name: Confirm qualification and artifact work did not modify the checkout
+        if: ${{ always() }}
         shell: pwsh
         env:
           EXPECTED_REVISION: ${{ github.sha }}
