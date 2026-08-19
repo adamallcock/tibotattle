@@ -29,12 +29,14 @@ function binding(overrides = {}) {
     sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
     companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
+    preparedArtifactContractVersion: "windows-prepared-artifact-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
     companionInstanceMutexSafe: false,
     credentialAuditFileGuardSafe: true,
     sqliteStateLeaseSafe: false,
+    preparedArtifactSafe: false,
     inspectPath: () => ({ identity: IDENTITY }),
     ensureDirectory: () => IDENTITY,
     readFile: () => ({ data: Buffer.from("data"), identity: IDENTITY }),
@@ -47,6 +49,15 @@ function binding(overrides = {}) {
     createProtectedChild: () => IDENTITY,
     deleteProtectedChild: () => ({ deleted: true, identity: IDENTITY }),
     replaceProtectedChild: () => IDENTITY,
+    inspectPreparedChild: () => ({ identity: IDENTITY }),
+    ensurePreparedDirectory: () => IDENTITY,
+    enumeratePreparedDirectory: () => [],
+    removePreparedDirectory: () => ({ removed: true, identity: IDENTITY }),
+    renamePreparedDirectory: () => ({ renamed: true, identity: IDENTITY }),
+    createPreparedFile: () => IDENTITY,
+    readPreparedFile: () => ({ data: Buffer.from("data"), identity: IDENTITY }),
+    deletePreparedFile: () => ({ deleted: true, identity: IDENTITY }),
+    publishPreparedFile: () => ({ published: true, identity: IDENTITY }),
     acquireSqliteStateLease: () => ({
       lease: {},
       databaseIdentity: IDENTITY,
@@ -81,6 +92,7 @@ test("binding manifest is deterministic, content-free, and policy-disabled", () 
     sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
     companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
+    preparedArtifactContractVersion: "windows-prepared-artifact-v1",
     requiredMethods: [
       "inspectPath",
       "ensureDirectory",
@@ -102,6 +114,15 @@ test("binding manifest is deterministic, content-free, and policy-disabled", () 
       "releaseCredentialMutex",
       "acquireCompanionInstanceMutex",
       "releaseCompanionInstanceMutex",
+      "inspectPreparedChild",
+      "ensurePreparedDirectory",
+      "enumeratePreparedDirectory",
+      "removePreparedDirectory",
+      "renamePreparedDirectory",
+      "createPreparedFile",
+      "readPreparedFile",
+      "deletePreparedFile",
+      "publishPreparedFile",
     ],
     nativeClaims: {
       productionSafe: false,
@@ -110,6 +131,7 @@ test("binding manifest is deterministic, content-free, and policy-disabled", () 
       companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
       sqliteStateLeaseSafe: false,
+      preparedArtifactSafe: false,
     },
     approvedPolicy: {
       productionSafe: false,
@@ -118,6 +140,7 @@ test("binding manifest is deterministic, content-free, and policy-disabled", () 
       companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
       sqliteStateLeaseSafe: false,
+      preparedArtifactSafe: false,
     },
     bindingProvenance: {
       contractVersion: "windows-binding-provenance-v1",
@@ -148,6 +171,16 @@ test("manifest builder refuses a binding without the companion mutex contract", 
         acquireCompanionInstanceMutex: undefined,
         releaseCompanionInstanceMutex: undefined,
       }),
+    }),
+    (error) => error.code === "WINDOWS_FILESYSTEM_MANIFEST_INVALID_BINDING",
+  );
+});
+
+test("manifest builder refuses a binding without prepared cleanup", () => {
+  assert.throws(
+    () => createWindowsFilesystemBindingManifest({
+      bytes: BYTES,
+      binding: binding({ deletePreparedFile: undefined }),
     }),
     (error) => error.code === "WINDOWS_FILESYSTEM_MANIFEST_INVALID_BINDING",
   );

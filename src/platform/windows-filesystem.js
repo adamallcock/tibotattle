@@ -38,11 +38,24 @@ const SQLITE_STATE_STAGING_CONTRACT_VERSION =
   "windows-sqlite-state-staging-v1";
 const COMPANION_INSTANCE_MUTEX_CONTRACT_VERSION =
   "windows-companion-instance-mutex-v1";
+const PREPARED_ARTIFACT_CONTRACT_VERSION =
+  "windows-prepared-artifact-v1";
 const BINDING_FILE_NAME = "windows_filesystem.node";
 const BINDING_PLATFORM = "win32";
 const BINDING_ARCHITECTURE = "x64";
 const MAXIMUM_BINDING_BYTES = 64 * 1024 * 1024;
 const MAXIMUM_FILE_BYTES = 1024 * 1024;
+// Prepared contribution files are capped at the current contribution
+// contract ceiling, while review/transport artifacts may use the existing
+// 34 MiB encoded-artifact ceiling. The native binding writes and reads these
+// in bounded 1 MiB chunks; callers still receive one bounded Buffer.
+const MAXIMUM_PREPARED_ARTIFACT_BYTES = 34 * 1024 * 1024;
+const MAXIMUM_PREPARED_DIRECTORY_ENTRIES = 256;
+const RESERVED_PREPARED_DEVICE_NAMES = new Set([
+  "CON", "PRN", "AUX", "NUL",
+  "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+  "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+]);
 const UNQUALIFIED_BINDING_PROVENANCE_SOURCE = "unsigned-development-binding";
 const AUTHENTICATED_BINDING_PROVENANCE_SOURCES = Object.freeze([
   "development-package",
@@ -69,6 +82,15 @@ const REQUIRED_METHODS = Object.freeze([
   "releaseCredentialMutex",
   "acquireCompanionInstanceMutex",
   "releaseCompanionInstanceMutex",
+  "inspectPreparedChild",
+  "ensurePreparedDirectory",
+  "enumeratePreparedDirectory",
+  "removePreparedDirectory",
+  "renamePreparedDirectory",
+  "createPreparedFile",
+  "readPreparedFile",
+  "deletePreparedFile",
+  "publishPreparedFile",
 ]);
 const MANIFEST_KEYS = Object.freeze([
   "schemaVersion",
@@ -83,6 +105,7 @@ const MANIFEST_KEYS = Object.freeze([
   "sqliteStateLeaseContractVersion",
   "credentialMutexContractVersion",
   "companionInstanceMutexContractVersion",
+  "preparedArtifactContractVersion",
   "requiredMethods",
   "nativeClaims",
   "approvedPolicy",
@@ -103,6 +126,8 @@ export const WINDOWS_FILESYSTEM_SQLITE_STATE_STAGING_CONTRACT_VERSION =
   SQLITE_STATE_STAGING_CONTRACT_VERSION;
 export const WINDOWS_FILESYSTEM_COMPANION_INSTANCE_MUTEX_CONTRACT_VERSION =
   COMPANION_INSTANCE_MUTEX_CONTRACT_VERSION;
+export const WINDOWS_FILESYSTEM_PREPARED_ARTIFACT_CONTRACT_VERSION =
+  PREPARED_ARTIFACT_CONTRACT_VERSION;
 export const WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS = REQUIRED_METHODS;
 
 function failure(code) {
@@ -230,41 +255,47 @@ function assertBindingManifest(manifest) {
     && manifest.credentialMutexContractVersion === "windows-credential-mutex-v1"
     && manifest.companionInstanceMutexContractVersion
       === COMPANION_INSTANCE_MUTEX_CONTRACT_VERSION
+    && manifest.preparedArtifactContractVersion
+      === PREPARED_ARTIFACT_CONTRACT_VERSION
     && Array.isArray(requiredMethods)
     && requiredMethods.length === REQUIRED_METHODS.length
     && requiredMethods.every((method, index) => method === REQUIRED_METHODS[index])
     && nativeClaims !== null
     && typeof nativeClaims === "object"
     && !Array.isArray(nativeClaims)
-    && Object.keys(nativeClaims).length === 6
+    && Object.keys(nativeClaims).length === 7
     && Object.hasOwn(nativeClaims, "productionSafe")
     && Object.hasOwn(nativeClaims, "pathWalkRaceSafe")
     && Object.hasOwn(nativeClaims, "credentialMutexSafe")
     && Object.hasOwn(nativeClaims, "companionInstanceMutexSafe")
     && Object.hasOwn(nativeClaims, "credentialAuditFileGuardSafe")
     && Object.hasOwn(nativeClaims, "sqliteStateLeaseSafe")
+    && Object.hasOwn(nativeClaims, "preparedArtifactSafe")
     && typeof nativeClaims.productionSafe === "boolean"
     && typeof nativeClaims.pathWalkRaceSafe === "boolean"
     && typeof nativeClaims.credentialMutexSafe === "boolean"
     && typeof nativeClaims.companionInstanceMutexSafe === "boolean"
     && typeof nativeClaims.credentialAuditFileGuardSafe === "boolean"
     && typeof nativeClaims.sqliteStateLeaseSafe === "boolean"
+    && typeof nativeClaims.preparedArtifactSafe === "boolean"
     && approvedPolicy !== null
     && typeof approvedPolicy === "object"
     && !Array.isArray(approvedPolicy)
-    && Object.keys(approvedPolicy).length === 6
+    && Object.keys(approvedPolicy).length === 7
     && Object.hasOwn(approvedPolicy, "productionSafe")
     && Object.hasOwn(approvedPolicy, "pathWalkRaceSafe")
     && Object.hasOwn(approvedPolicy, "credentialMutexSafe")
     && Object.hasOwn(approvedPolicy, "companionInstanceMutexSafe")
     && Object.hasOwn(approvedPolicy, "credentialAuditFileGuardSafe")
     && Object.hasOwn(approvedPolicy, "sqliteStateLeaseSafe")
+    && Object.hasOwn(approvedPolicy, "preparedArtifactSafe")
     && typeof approvedPolicy.productionSafe === "boolean"
     && typeof approvedPolicy.pathWalkRaceSafe === "boolean"
     && approvedPolicy.credentialMutexSafe === true
     && approvedPolicy.companionInstanceMutexSafe === false
     && approvedPolicy.credentialAuditFileGuardSafe === true
     && approvedPolicy.sqliteStateLeaseSafe === false
+    && approvedPolicy.preparedArtifactSafe === false
     && nativeClaims.productionSafe === approvedPolicy.productionSafe
     && nativeClaims.pathWalkRaceSafe === approvedPolicy.pathWalkRaceSafe
     && nativeClaims.credentialMutexSafe === approvedPolicy.credentialMutexSafe
@@ -273,6 +304,7 @@ function assertBindingManifest(manifest) {
     && nativeClaims.credentialAuditFileGuardSafe
       === approvedPolicy.credentialAuditFileGuardSafe
     && nativeClaims.sqliteStateLeaseSafe === approvedPolicy.sqliteStateLeaseSafe
+    && nativeClaims.preparedArtifactSafe === approvedPolicy.preparedArtifactSafe
     && validBindingProvenance(bindingProvenance)
     && (!policyRequiresAuthenticatedProvenance(approvedPolicy)
       || bindingProvenance.status === "authenticated");
@@ -300,13 +332,16 @@ function assertBinding(binding) {
       && binding?.credentialMutexContractVersion === "windows-credential-mutex-v1"
       && binding?.companionInstanceMutexContractVersion
         === COMPANION_INSTANCE_MUTEX_CONTRACT_VERSION
+      && binding?.preparedArtifactContractVersion
+        === PREPARED_ARTIFACT_CONTRACT_VERSION
       && typeof binding?.productionSafe === "boolean"
       && typeof binding?.pathWalkRaceSafe === "boolean"
       && binding?.credentialMutexSafe === true;
     valid = valid
       && binding?.credentialAuditFileGuardSafe === true
       && binding?.companionInstanceMutexSafe === false
-      && binding?.sqliteStateLeaseSafe === false;
+      && binding?.sqliteStateLeaseSafe === false
+      && binding?.preparedArtifactSafe === false;
   } catch {
     valid = false;
   }
@@ -384,8 +419,12 @@ function verifyBindingIntegrity({
       || binding.credentialMutexContractVersion !== manifest.credentialMutexContractVersion
       || binding.companionInstanceMutexContractVersion
         !== manifest.companionInstanceMutexContractVersion
+      || binding.preparedArtifactContractVersion
+        !== manifest.preparedArtifactContractVersion
       || binding.companionInstanceMutexSafe
-        !== manifest.nativeClaims.companionInstanceMutexSafe) {
+        !== manifest.nativeClaims.companionInstanceMutexSafe
+      || binding.preparedArtifactSafe
+        !== manifest.nativeClaims.preparedArtifactSafe) {
     throw failure("MANIFEST_BINDING_MISMATCH");
   }
 
@@ -481,6 +520,56 @@ function normalizeReadMaximum(maximumBytes) {
   return maximumBytes;
 }
 
+function normalizePreparedReadMaximum(maximumBytes) {
+  if (!Number.isSafeInteger(maximumBytes)
+      || maximumBytes < 1
+      || maximumBytes > MAXIMUM_PREPARED_ARTIFACT_BYTES) {
+    throw failure("INVALID_PREPARED_MAXIMUM_BYTES");
+  }
+  return maximumBytes;
+}
+
+function normalizePreparedData(data) {
+  if (!Buffer.isBuffer(data) && !(data instanceof Uint8Array)) {
+    throw failure("INVALID_DATA");
+  }
+  const normalized = Buffer.from(data);
+  if (normalized.byteLength < 1
+      || normalized.byteLength > MAXIMUM_PREPARED_ARTIFACT_BYTES) {
+    throw failure("PREPARED_FILE_TOO_LARGE");
+  }
+  return normalized;
+}
+
+function normalizePreparedEntry(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)
+      || typeof entry.name !== "string"
+      || entry.name.length < 1
+      || entry.name.includes("\0")
+      || entry.name.includes("\\")
+      || entry.name.includes("/")
+      || entry.name === "."
+      || entry.name === ".."
+      || entry.name.endsWith(".")
+      || entry.name.endsWith(" ")
+      || RESERVED_PREPARED_DEVICE_NAMES.has(entry.name.split(".", 1)[0].toUpperCase())
+      || !isWindowsFilesystemIdentity(entry.identity)
+      || typeof entry.isDirectory !== "boolean"
+      || typeof entry.isRegularFile !== "boolean"
+      || typeof entry.isReparsePoint !== "boolean"
+      || entry.isReparsePoint
+      || (entry.isDirectory === entry.isRegularFile)) {
+    throw failure("INVALID_RESULT");
+  }
+  return Object.freeze({
+    name: entry.name,
+    identity: normalizeIdentity(entry.identity),
+    isDirectory: entry.isDirectory,
+    isRegularFile: entry.isRegularFile,
+    isReparsePoint: entry.isReparsePoint,
+  });
+}
+
 function normalizeSqliteDatabaseName(name) {
   if (typeof name !== "string"
       || name.length < 1
@@ -557,6 +646,8 @@ export function createWindowsFilesystemAdapter({
     productionSafe: false,
     pathWalkRaceSafe: false,
     sqliteStateLeaseSafe: false,
+    preparedArtifactSafe: false,
+    preparedArtifactContractVersion: PREPARED_ARTIFACT_CONTRACT_VERSION,
     sqliteStateStagingSafe: false,
     sqliteStateStagingContractVersion: SQLITE_STATE_STAGING_CONTRACT_VERSION,
     companionInstanceMutexContractVersion: COMPANION_INSTANCE_MUTEX_CONTRACT_VERSION,
@@ -699,6 +790,180 @@ export function createWindowsFilesystemAdapter({
       } catch (error) {
         throw normalizeNativeError(error);
       }
+    },
+    inspectPreparedChild(rootPath, rootIdentity, childPath) {
+      const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);
+      try {
+        return normalizeMetadataResult(call(native, "inspectPreparedChild", [
+          rootPath,
+          expectedRoot,
+          childPath,
+        ]));
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
+    ensurePreparedDirectory(rootPath, rootIdentity, childPath) {
+      const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);
+      try {
+        return normalizeIdentity(call(native, "ensurePreparedDirectory", [
+          rootPath,
+          expectedRoot,
+          childPath,
+        ]));
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
+    enumeratePreparedDirectory(
+      rootPath,
+      rootIdentity,
+      childPath,
+      maximumEntries,
+    ) {
+      const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);
+      if (!Number.isSafeInteger(maximumEntries)
+          || maximumEntries < 1
+          || maximumEntries > MAXIMUM_PREPARED_DIRECTORY_ENTRIES) {
+        throw failure("INVALID_PREPARED_DIRECTORY_LIMIT");
+      }
+      let result;
+      try {
+        result = call(native, "enumeratePreparedDirectory", [
+          rootPath,
+          expectedRoot,
+          childPath,
+          maximumEntries,
+        ]);
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+      if (!Array.isArray(result) || result.length > maximumEntries) {
+        throw failure("INVALID_RESULT");
+      }
+      return Object.freeze(result.map(normalizePreparedEntry));
+    },
+    removePreparedDirectory(rootPath, rootIdentity, childPath, identity) {
+      const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);
+      const expected = normalizeIdentity(identity);
+      let result;
+      try {
+        result = call(native, "removePreparedDirectory", [
+          rootPath,
+          expectedRoot,
+          childPath,
+          expected,
+        ]);
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+      if (!result?.removed) throw failure("INVALID_RESULT");
+      return Object.freeze({
+        removed: true,
+        identity: normalizeIdentity(result.identity),
+      });
+    },
+    renamePreparedDirectory(
+      rootPath,
+      rootIdentity,
+      sourceChildPath,
+      expectedSourceIdentity,
+      targetChildPath,
+    ) {
+      const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);
+      const expectedSource = normalizeIdentity(expectedSourceIdentity);
+      let result;
+      try {
+        result = call(native, "renamePreparedDirectory", [
+          rootPath,
+          expectedRoot,
+          sourceChildPath,
+          expectedSource,
+          targetChildPath,
+        ]);
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+      if (!result?.renamed) throw failure("INVALID_RESULT");
+      return Object.freeze({
+        renamed: true,
+        identity: normalizeIdentity(result.identity),
+      });
+    },
+    createPreparedFile(rootPath, rootIdentity, childPath, data) {
+      const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);
+      const bytes = normalizePreparedData(data);
+      try {
+        return normalizeIdentity(call(native, "createPreparedFile", [
+          rootPath,
+          expectedRoot,
+          childPath,
+          bytes,
+        ]));
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
+    readPreparedFile(rootPath, rootIdentity, childPath, maximumBytes) {
+      const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);
+      const maximum = normalizePreparedReadMaximum(maximumBytes);
+      try {
+        return normalizeDataResult(call(native, "readPreparedFile", [
+          rootPath,
+          expectedRoot,
+          childPath,
+          maximum,
+        ]));
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
+    deletePreparedFile(rootPath, rootIdentity, childPath, identity) {
+      const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);
+      const expected = normalizeIdentity(identity);
+      let result;
+      try {
+        result = call(native, "deletePreparedFile", [
+          rootPath,
+          expectedRoot,
+          childPath,
+          expected,
+        ]);
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+      if (!result?.deleted) throw failure("INVALID_RESULT");
+      return Object.freeze({
+        deleted: true,
+        identity: normalizeIdentity(result.identity),
+      });
+    },
+    publishPreparedFile(
+      rootPath,
+      rootIdentity,
+      stageChildPath,
+      expectedStageIdentity,
+      targetChildPath,
+    ) {
+      const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);
+      const expectedStage = normalizeIdentity(expectedStageIdentity);
+      let result;
+      try {
+        result = call(native, "publishPreparedFile", [
+          rootPath,
+          expectedRoot,
+          stageChildPath,
+          expectedStage,
+          targetChildPath,
+        ]);
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+      if (!result?.published) throw failure("INVALID_RESULT");
+      return Object.freeze({
+        published: true,
+        identity: normalizeIdentity(result.identity),
+      });
     },
     acquireCompanionInstanceMutex() {
       if (typeof native.acquireCompanionInstanceMutex !== "function") {
