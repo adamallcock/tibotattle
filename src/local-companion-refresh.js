@@ -920,6 +920,12 @@ export function createLocalCollectorRefreshRunner({
   // rebuild defers, the FULL rebuild is skipped (the retained cache is served)
   // until this instant passes. A successful rebuild resets it to 0.
   let accountingRebuildDeferUntilMs = 0;
+  // How many rebuild ATTEMPTS in a row deferred over budget, across ticks.
+  // Backoff passes that never attempt the rebuild do not count and do not
+  // reset it; only a completed rebuild does. The count is what lets a surface
+  // distinguish one soft miss from a rebuild that is never landing (the
+  // 2026-08-19 livelock ran for hours behind a bare unavailable estimate).
+  let accountingRebuildDeferredStreak = 0;
   return async function refreshLocalCollector({
     signal = null,
     onProgress = null,
@@ -1239,11 +1245,13 @@ export function createLocalCollectorRefreshRunner({
           // blanking.
           accountingRebuildDeferUntilMs = clock()
             + ACCOUNTING_REBUILD_BUDGET_BACKOFF_MS;
+          accountingRebuildDeferredStreak += 1;
           accountingRebuildDeferred = {
             reason: REFRESH_FAILURE_CODE_PATTERN.test(rebuilt.reason ?? "")
               ? rebuilt.reason
               : "accounting_rebuild_deferred",
             retained: rebuilt.retained === true,
+            consecutive: accountingRebuildDeferredStreak,
           };
           if (rebuilt.retained === true && signal?.aborted !== true) {
             try {
@@ -1287,8 +1295,10 @@ export function createLocalCollectorRefreshRunner({
           }
           if (accounting !== null) {
             accountingRefreshStatus = "rebuilt";
-            // A successful rebuild clears any prior budget-miss backoff.
+            // A successful rebuild clears any prior budget-miss backoff and
+            // ends the deferral streak.
             accountingRebuildDeferUntilMs = 0;
+            accountingRebuildDeferredStreak = 0;
           }
         }
       }
@@ -1673,7 +1683,9 @@ function publicRefreshResult(result, now = Date.now()) {
     // succeeded serving the retained cache. Surface it so a first-party caller
     // can show "using the estimate from <time>; a fuller rebuild is pending"
     // instead of treating the run as breakage. Content-free: a fixed status
-    // plus the bounded budget reason code.
+    // plus the bounded budget reason code, and how many rebuild attempts in a
+    // row have now deferred — the count that separates one soft miss from a
+    // rebuild that is never landing.
     projected.accountingRebuildDeferred = {
       status: "deferred",
       reason: typeof deferred.reason === "string"
@@ -1681,6 +1693,10 @@ function publicRefreshResult(result, now = Date.now()) {
         ? deferred.reason
         : "accounting_rebuild_deferred",
       retained: deferred.retained === true,
+      consecutive: Number.isSafeInteger(deferred.consecutive)
+          && deferred.consecutive >= 1
+        ? deferred.consecutive
+        : 1,
     };
   }
   return projected;

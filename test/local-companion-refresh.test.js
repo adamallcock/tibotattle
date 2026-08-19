@@ -1674,28 +1674,53 @@ test("a memory-budget rebuild miss serves the retained cache, reports deferred, 
   assert.deepEqual(first.accountingRebuildDeferred, {
     reason: "accounting_transition_rss_limit_exceeded",
     retained: true,
+    consecutive: 1,
   });
 
   // Second pass a minute later, still within the backoff window: the doomed
   // full rebuild is skipped entirely and the retained cache is served again.
+  // A backoff pass attempts nothing, so it neither reports a deferral nor
+  // advances the streak.
   nowMs += 60_000;
   const second = await runner();
   assert.equal(rebuildAttempts, 1);
   assert.equal(second.accounting.refreshStatus, "deferred");
+  assert.equal(second.accountingRebuildDeferred, undefined);
+
+  // Once the backoff elapses the rebuild is re-attempted and misses again:
+  // the streak counts consecutive ATTEMPTS, across backoff windows.
+  nowMs += 31 * 60_000;
+  const stillDeferred = await runner();
+  assert.equal(rebuildAttempts, 2);
+  assert.deepEqual(stillDeferred.accountingRebuildDeferred, {
+    reason: "accounting_transition_rss_limit_exceeded",
+    retained: true,
+    consecutive: 2,
+  });
 
   // Once the backoff elapses the full rebuild is re-attempted; now it fits and
   // succeeds, and the backoff is cleared so later passes rebuild immediately.
   nowMs += 31 * 60_000;
   deferForNextRebuild = false;
   const third = await runner();
-  assert.equal(rebuildAttempts, 2);
+  assert.equal(rebuildAttempts, 3);
   assert.equal(third.accounting.refreshStatus, "rebuilt");
   assert.equal(third.accounting.events, 41);
   assert.equal(third.accountingRebuildDeferred, undefined);
 
   const fourth = await runner();
-  assert.equal(rebuildAttempts, 3);
+  assert.equal(rebuildAttempts, 4);
   assert.equal(fourth.accounting.refreshStatus, "rebuilt");
+
+  // A later miss starts a fresh streak: the successful rebuild reset it.
+  deferForNextRebuild = true;
+  const fifth = await runner();
+  assert.equal(rebuildAttempts, 5);
+  assert.deepEqual(fifth.accountingRebuildDeferred, {
+    reason: "accounting_transition_rss_limit_exceeded",
+    retained: true,
+    consecutive: 1,
+  });
 });
 
 test("a budget miss with no retained cache defers without fabricating an accounting block", async () => {
@@ -1728,6 +1753,7 @@ test("a budget miss with no retained cache defers without fabricating an account
   assert.deepEqual(result.accountingRebuildDeferred, {
     reason: "accounting_transition_rss_limit_exceeded",
     retained: false,
+    consecutive: 1,
   });
 });
 
@@ -1822,6 +1848,9 @@ test("the controller files a degraded note, not a terminal one, for a soft budge
     status: "deferred",
     reason: "accounting_transition_rss_limit_exceeded",
     retained: true,
+    // The runner in this harness reports no streak, so the projection
+    // presents the one attempt it is looking at.
+    consecutive: 1,
   });
 });
 
