@@ -15,14 +15,18 @@ import {
 import {
   DIAGNOSTIC_REFERENCE_PATTERN,
   createDiagnosticReference,
+  createLatestContributionReviewFence,
   createQuotaTimelineLookup,
   createRefreshPollingBudget,
+  contributionReviewBootstrapAction,
   detectDeviationPeriods,
   diagnosticErrorCode,
   diagnosticReferenceSentence,
   diagnosticSurface,
+  isContributionReviewableQueueState,
   refreshNeedsContinuation,
   serviceRequestId,
+  withContributionReviewDeadline,
   validateContributionForUpload
 } from "./lib.js";
 import {
@@ -154,6 +158,10 @@ let contributionSyncStatus = null;
 let contributionSyncPreview = null;
 let contributionSyncExactReview = null;
 let contributionSyncBusy = false;
+// A timed-out loopback operation can still finish after the UI exposes its
+// retry. Only the newest generation may commit preview/review state, so an old
+// response can never overwrite the result of Check again or a fresh approval.
+const contributionReviewFence = createLatestContributionReviewFence();
 // The prepared set the page last verified by itself. The summary card is the
 // review — there is no separate reveal click — so when a ready prepared set
 // appears, the page runs the exact local verification once for that set. The
@@ -181,6 +189,10 @@ let incrementalSyncRetryBusy = false;
 // data at most once per queue state, so a failing preparation cannot loop;
 // trying again is the explicit "Check again" action.
 let incrementalReviewPrepareAttempted = false;
+// A missing/unusable queue preview used to strand the approve button without
+// producing either recovery UI or a diagnostics file. Record each distinct
+// unavailable state once per page load; an explicit Check again resets it.
+let contributionReviewUnavailableKey = null;
 // One silent authorization repair per page load (owner-directed 2026-08-08):
 // a Mac whose earlier pairing carried the v0.1 consent has no server-side
 // v1.0 grant, so its uploads pause with consent_rejected. When the page holds
@@ -224,13 +236,18 @@ let communityDevicePairedV1 = false;
 // a mint records a timestamp, so an old session is never mistaken for fresh.
 let communitySessionMintedAt = null;
 // The opaque sign-in proof lives only in this module-scoped memory; it is
-// never persisted to storage and disappears with the tab.
+// never persisted to storage and disappears with the tab. Only its bounded
+// state+verifier recovery handle is persisted below.
 let hostedIdentity = null;
 let hostedIdentityBusy = false;
 // A single page-local attempt owns the short polling loop. It is never stored
 // with the opaque proof and lets the user cancel a stalled browser handoff
-// without waiting for the server's five-minute expiry.
+// without waiting for the server's authorization expiry.
 let activeHostedSignIn = null;
+// Clearing the durable handoff is asynchronous. Fence that short interval so
+// a second sign-in cannot store a new state+verifier immediately before the
+// first attempt's cancellation clears the shared recovery file.
+let hostedSignInCancellationInFlight = false;
 // Only the contribution service knows whether each hosted provider is
 // configured, so these stay false until a start attempt says otherwise.
 let appleSignInUnavailable = false;
@@ -9247,14 +9264,49 @@ function showIncrementalReviewStatusKey(key, values = {}) {
   setLocalizedText(status, key, values);
 }
 
+function setContributionReviewRecoveryVisible(visible) {
+  for (const id of ["#incremental-review-retry", "#incremental-copy-diagnostics"]) {
+    const control = $(id);
+    if (control) control.hidden = !visible;
+  }
+}
+
 function clearContributionSyncExactReview() {
   contributionSyncExactReview = null;
+}
+
+function exactReviewSummaryIdentity(value) {
+  const payload = value?.payload;
+  // The telemetry-contribution-v0.1 document carries its records as ARRAYS
+  // (usageEvents, quotaSnapshots, activityMarkers); only the queue item
+  // summarizes them as a recordCounts object. Counting the arrays compares
+  // like with like against the preview card. Reading a payload-shaped
+  // recordCounts object here made this identity null on every real payload,
+  // so every first-time approval failed review_expired_or_changed (found by
+  // the first live first-time ceremony, 2026-08-19).
+  if (typeof payload?.coveredAt?.startAt !== "string"
+      || typeof payload?.coveredAt?.endAt !== "string"
+      || !Array.isArray(payload?.usageEvents)
+      || !Array.isArray(payload?.quotaSnapshots)
+      || !Array.isArray(payload?.activityMarkers)
+      || !Number.isSafeInteger(value?.payloadBytes)) {
+    return null;
+  }
+  const total = payload.usageEvents.length
+    + payload.quotaSnapshots.length
+    + payload.activityMarkers.length;
+  return [
+    payload.coveredAt.startAt,
+    payload.coveredAt.endAt,
+    value.payloadBytes,
+    total,
+  ].join("|");
 }
 
 function renderContributionSyncExactReview(value) {
   if (value?.schemaVersion !== "contribution-sync-exact-review-v0.1"
       || value.status !== "available"
-      || value.state !== "ready"
+      || !isContributionReviewableQueueState(value.state)
       || value.networkActivity !== false
       || value.includesExactRetainedFields !== true
       || value.includesRawContent !== false
@@ -9268,21 +9320,32 @@ function renderContributionSyncExactReview(value) {
     throw new Error("The exact local review response was not usable.");
   }
   validateContributionForUpload(value.payload);
+  const summaryIdentity = exactReviewSummaryIdentity(value);
+  if (summaryIdentity === null || summaryIdentity !== preparedSummaryIdentity()) {
+    const error = new Error("The reviewed contribution changed.");
+    error.code = "review_expired_or_changed";
+    throw error;
+  }
   contributionSyncExactReview = {
-    state: value.state,
+    // Local review readiness is intentionally independent of whether the
+    // uploader is ready, waiting for a retry deadline, or paused.
+    state: "ready",
     payloadBytes: value.payloadBytes,
     reviewToken: value.reviewToken,
+    summaryIdentity,
   };
 }
 
-async function refreshContributionSyncControls() {
-  clearContributionSyncExactReview();
+async function refreshContributionSyncControls(generation) {
   // Preview discovery commits newly prepared sets to the queue. Read queue
   // status afterwards so the two cards describe the same durable state.
   const preview = await localClient.contributionSyncPreview();
   const status = await localClient.contributionSyncStatus();
+  if (!contributionReviewFence.isCurrent(generation)) return false;
+  clearContributionSyncExactReview();
   renderContributionSyncStatus(status);
   renderContributionSyncPreview(preview);
+  return true;
 }
 
 // The manual "Send summary" action is gone with the prepare-and-review
@@ -9329,9 +9392,13 @@ function maybeReviewPreparedSummary() {
   // begins. The bootstrap is purely local — prepare and verify on this Mac,
   // no network — and the minted token still only ever feeds the explicit
   // approval.
-  if (contributionSyncPreview?.status !== "available") return;
-  if (contributionSyncPreview.state !== "ready"
-      || contributionSyncPreview.item == null) {
+  const action = contributionReviewBootstrapAction(contributionSyncPreview);
+  if (action === "unavailable") {
+    maybeReportContributionReviewUnavailable();
+    return;
+  }
+  contributionReviewUnavailableKey = null;
+  if (action === "prepare") {
     maybePrepareIncrementalReviewInstance();
     return;
   }
@@ -9340,6 +9407,33 @@ function maybeReviewPreparedSummary() {
   if (key === null || key === contributionSyncAutoReviewedKey) return;
   contributionSyncAutoReviewedKey = key;
   void reviewPreparedSummary({ refreshFirst: false });
+}
+
+function maybeReportContributionReviewUnavailable() {
+  const status = contributionSyncPreview?.status ?? "missing";
+  const state = contributionSyncPreview?.state ?? "missing";
+  const key = `${status}:${state}`;
+  if (key === contributionReviewUnavailableKey) return;
+  contributionReviewUnavailableKey = key;
+  setContributionReviewRecoveryVisible(true);
+  // State the recovery immediately; recording the bounded diagnostic note is
+  // asynchronous and must not leave the old optimistic gate as the only copy.
+  showIncrementalReviewStatusKey("consent.reviewUnavailable");
+  const error = new Error("The local contribution review is unavailable.");
+  error.code = "local_review_bootstrap_unavailable";
+  void describeFailure({
+    surface: "contribution_prepare",
+    error,
+    fallback:
+      "TiboTattle could not read the local review state. Choose Check again. Nothing was uploaded.",
+  }).then((described) => {
+    if (contributionReviewUnavailableKey !== key
+        || contributionReviewBootstrapAction(contributionSyncPreview)
+          !== "unavailable") {
+      return;
+    }
+    showIncrementalReviewStatus(described.text, true);
+  });
 }
 
 /**
@@ -9357,9 +9451,9 @@ function maybePrepareIncrementalReviewInstance() {
 
 async function prepareIncrementalReviewInstance() {
   if (contributionSyncBusy) return;
+  const generation = contributionReviewFence.begin();
   contributionSyncBusy = true;
-  const retry = $("#incremental-review-retry");
-  if (retry) retry.hidden = true;
+  setContributionReviewRecoveryVisible(false);
   renderContributionActionState();
   showIncrementalReviewStatusKey("consent.preparingReview");
   clearContributionSyncExactReview();
@@ -9370,14 +9464,18 @@ async function prepareIncrementalReviewInstance() {
   try {
     let prepared;
     try {
-      prepared = await localClient.prepareContribution({ lookbackHours: 24 });
+      prepared = await withContributionReviewDeadline(
+        localClient.prepareContribution({ lookbackHours: 24 }),
+      );
     } catch (error) {
       // A very active day can exceed the fixed reviewed-set safety bound at
       // 24 hours. The lookback was only ever a size guard — never a consent
       // decision — so the bootstrap narrows to the latest hour by itself
       // instead of surfacing a window picker the owner removed.
       if (error?.code !== "export_too_large") throw error;
-      prepared = await localClient.prepareContribution({ lookbackHours: 1 });
+      prepared = await withContributionReviewDeadline(
+        localClient.prepareContribution({ lookbackHours: 1 }),
+      );
     }
     if (prepared.status !== "prepared") {
       const error = new Error("Preparation did not return a verified contribution.");
@@ -9387,10 +9485,14 @@ async function prepareIncrementalReviewInstance() {
     // The busy flag this preparation holds makes the refresh's automatic
     // verification pass bail out, so the pass is re-run explicitly below
     // once the flag is released.
-    await refreshContributionSyncControls();
+    const refreshed = await withContributionReviewDeadline(
+      refreshContributionSyncControls(generation),
+    );
+    if (!refreshed) return;
     preparedCommitted = true;
   } catch (error) {
-    if (retry) retry.hidden = false;
+    if (!contributionReviewFence.isCurrent(generation)) return;
+    setContributionReviewRecoveryVisible(true);
     showIncrementalReviewStatus((await describeFailure({
       surface: "contribution_prepare",
       error,
@@ -9422,6 +9524,8 @@ const INCREMENTAL_PREPARATION_ERROR_COPY = {
     "Privacy verification rejected the prepared data, so it was not queued or uploaded.",
   preparation_in_progress:
     "A local preparation is already running. Nothing has been uploaded.",
+  local_review_timed_out:
+    "The local review did not finish within one minute. Choose Check again. If it repeats, reopen TiboTattle. Nothing was uploaded.",
   review_archive_invalid:
     "TiboTattle could not save the copy you would review, so nothing was queued and nothing was uploaded.",
   prepared_spool_invalid:
@@ -9432,29 +9536,39 @@ const INCREMENTAL_PREPARATION_ERROR_COPY = {
 
 async function reviewPreparedSummary({ refreshFirst = true } = {}) {
   if (contributionSyncBusy) return;
+  const generation = contributionReviewFence.begin();
   contributionSyncBusy = true;
-  const retry = $("#incremental-review-retry");
-  if (retry) retry.hidden = true;
+  setContributionReviewRecoveryVisible(false);
   renderContributionActionState();
   showIncrementalReviewStatusKey("syncStatus.verifyingSummary");
   try {
     // Preview discovery commits newly prepared sets to the queue, so an
     // explicit re-check refreshes first; the automatic verification is
     // itself triggered by a fresh render and skips the redundant read.
-    if (refreshFirst) await refreshContributionSyncControls();
-    const review = await localClient.contributionSyncExactReview();
+    if (refreshFirst) {
+      const refreshed = await withContributionReviewDeadline(
+        refreshContributionSyncControls(generation),
+      );
+      if (!refreshed) return;
+    }
+    const review = await withContributionReviewDeadline(
+      localClient.contributionSyncExactReview(),
+    );
+    if (!contributionReviewFence.isCurrent(generation)) return;
     renderContributionSyncExactReview(review);
     contributionSyncAutoReviewedKey = preparedSummaryIdentity();
     showIncrementalReviewStatusKey("syncStatus.summaryVerified");
   } catch (error) {
+    if (!contributionReviewFence.isCurrent(generation)) return;
     // A bare `catch {}` discarded the only evidence of what actually failed
     // and printed one sentence for every cause. Surface the real one, and
     // offer the explicit re-check: automatic verification never retries a
     // failure by itself.
-    if (retry) retry.hidden = false;
+    setContributionReviewRecoveryVisible(true);
     showIncrementalReviewStatus((await describeFailure({
       surface: "contribution_prepare",
       error,
+      messages: INCREMENTAL_PREPARATION_ERROR_COPY,
       fallback:
         "The prepared instance could not be verified on this Mac. Nothing was uploaded."
     })).text, true);
@@ -9472,11 +9586,154 @@ async function reviewPreparedSummary({ refreshFirst = true } = {}) {
  */
 async function retryIncrementalReviewBootstrap() {
   if (contributionSyncBusy) return;
+  const generation = contributionReviewFence.begin();
   incrementalReviewPrepareAttempted = false;
   contributionSyncAutoReviewedKey = null;
-  const retry = $("#incremental-review-retry");
-  if (retry) retry.hidden = true;
-  await refreshContributionSyncControls();
+  contributionReviewUnavailableKey = null;
+  setContributionReviewRecoveryVisible(false);
+  try {
+    await withContributionReviewDeadline(
+      refreshContributionSyncControls(generation),
+    );
+  } catch (error) {
+    if (!contributionReviewFence.isCurrent(generation)) return;
+    setContributionReviewRecoveryVisible(true);
+    showIncrementalReviewStatus((await describeFailure({
+      surface: "contribution_prepare",
+      error,
+      messages: INCREMENTAL_PREPARATION_ERROR_COPY,
+      fallback:
+        "TiboTattle could not re-check the local review state. Nothing was uploaded."
+    })).text, true);
+  }
+}
+
+function browserContributionDiagnosticState() {
+  const signedIn = hostedIdentity !== null || hasCommunitySession();
+  const paired = communityDevicePairedV1 || communityUploadAuthorityEvidence();
+  const previewState = contributionSyncPreview?.status === "available"
+      && ["empty", "ready", "retry_wait", "paused"].includes(
+        contributionSyncPreview.state,
+      )
+    ? contributionSyncPreview.state
+    : "not_observed";
+  let journeyPhase;
+  if (!contributionServiceConfigured()) {
+    journeyPhase = "not_configured";
+  } else if (!incrementalSyncCapabilityAdvertised()) {
+    journeyPhase = "unavailable";
+  } else if (incrementalConsentBusy || communityConnectBusy) {
+    journeyPhase = "connecting";
+  } else if (incrementalConsentApproved) {
+    if (incrementalUploadAuthorityLost() || !paired) {
+      journeyPhase = "approved_connection_needed";
+    } else if (incrementalSyncStatus?.paused) {
+      journeyPhase = "approved_paused";
+    } else if (incrementalSyncStatus?.running
+        || (incrementalSyncStatus?.progress?.daysPending ?? 0) > 0) {
+      journeyPhase = "approved_syncing";
+    } else {
+      journeyPhase = "approved_idle";
+    }
+  } else if (!signedIn) {
+    journeyPhase = "sign_in_required";
+  } else if (contributionSyncExactReview?.state === "ready") {
+    journeyPhase = "review_ready";
+  } else {
+    journeyPhase = "preparing_review";
+  }
+  return Object.freeze({
+    journeyPhase,
+    previewState,
+    consent: Object.freeze({
+      approved: incrementalConsentApproved,
+      current: incrementalSyncStatus?.status === "available"
+        ? incrementalSyncStatus.consent.current === true
+        : incrementalConsentApproved,
+    }),
+    signedIn: Object.freeze({ observed: true, value: signedIn }),
+    pairing: Object.freeze({ observed: paired, paired }),
+  });
+}
+
+// Native Data & Diagnostics reads only this fixed-vocabulary snapshot from
+// the active page. It intentionally exposes no proof, state, verifier,
+// session, identifier, path, or contribution payload.
+window.__tibotattleContributionDiagnostics = browserContributionDiagnosticState;
+
+async function collectContributionDiagnostics() {
+  const local = await localClient.contributionDiagnostics();
+  const browser = browserContributionDiagnosticState();
+  const localAvailable = local?.status === "available";
+  return Object.freeze({
+    journeyPhase: browser.journeyPhase,
+    previewState: browser.previewState === "not_observed" && localAvailable
+      ? local.previewState
+      : browser.previewState,
+    queueState: localAvailable ? local.queueState : "unavailable",
+    consent: browser.consent,
+    signedIn: browser.signedIn,
+    pairing: browser.pairing.paired || !localAvailable
+      ? browser.pairing
+      : local.pairing,
+    recentDiagnosticReferences: localAvailable
+      ? local.recentDiagnosticReferences
+      : Object.freeze([]),
+  });
+}
+
+function formatContributionDiagnostics(value) {
+  const lines = [
+    "TiboTattle contribution diagnostics",
+    "schema: tibotattle-contribution-diagnostics-v1",
+    `journey_phase: ${value.journeyPhase}`,
+    `preview_state: ${value.previewState}`,
+    `queue_state: ${value.queueState}`,
+    `consent_approved: ${value.consent.approved}`,
+    `consent_current: ${value.consent.current}`,
+    `signed_in_observed: ${value.signedIn.observed}`,
+    `signed_in: ${value.signedIn.value}`,
+    `pairing_observed: ${value.pairing.observed}`,
+    `paired: ${value.pairing.paired}`,
+  ];
+  value.recentDiagnosticReferences.forEach((item, index) => {
+    lines.push(
+      `diagnostic_reference_${index + 1}: ${item.reference} @ ${item.recordedAt}`,
+    );
+  });
+  lines.push(
+    "tokens_included: false",
+    "oauth_state_included: false",
+    "verifiers_included: false",
+    "device_identifiers_included: false",
+    "account_identifiers_included: false",
+    "paths_included: false",
+    "content_included: false",
+  );
+  return lines.join("\n");
+}
+
+async function copyContributionDiagnostics() {
+  const button = $("#incremental-copy-diagnostics");
+  if (!button || button.disabled) return;
+  button.disabled = true;
+  setLocalizedText(button, "contribution.diagnostics.copying");
+  try {
+    if (typeof navigator.clipboard?.writeText !== "function") {
+      throw new Error("Clipboard is unavailable.");
+    }
+    await navigator.clipboard.writeText(
+      formatContributionDiagnostics(await collectContributionDiagnostics()),
+    );
+    setLocalizedText(button, "contribution.diagnostics.copied");
+  } catch {
+    setLocalizedText(button, "contribution.diagnostics.failed");
+  } finally {
+    window.setTimeout(() => {
+      button.disabled = false;
+      setLocalizedText(button, "contribution.diagnostics.copy");
+    }, 2_000);
+  }
 }
 
 /** Mark the first real local-dashboard render for the native shell. */
@@ -10427,6 +10684,7 @@ function renderHostedIdentity() {
     || !serviceConfigured
     || enrollmentPaused;
   googleButton.disabled = hostedIdentityBusy
+    || hostedSignInCancellationInFlight
     || signedIn
     || googleUnavailableNow;
   googleUnavailable.hidden = !googleUnavailableNow || signedIn;
@@ -10455,13 +10713,16 @@ function renderHostedIdentity() {
     ? "Hosted Apple sign-in is not configured for this build."
     : "This build has no contribution service, so hosted sign-in is unavailable.");
   appleButton.disabled = hostedIdentityBusy
+    || hostedSignInCancellationInFlight
     || signedIn
     || appleUnavailableNow;
   // Exactly one of the two states is present: the provider choices, or the
   // signed-in account row that can hand the page back to the choices.
   $("#identity-signin-choices").hidden = signedIn;
   $("#identity-account").hidden = !signedIn;
-  $("#identity-signout").disabled = hostedIdentityBusy || !signedIn;
+  $("#identity-signout").disabled = hostedIdentityBusy
+    || hostedSignInCancellationInFlight
+    || !signedIn;
   pendingActions.hidden = !hostedIdentityBusy || signedIn;
   checkButton.disabled = !hostedIdentityBusy || signedIn;
   cancelButton.disabled = !hostedIdentityBusy || signedIn;
@@ -10476,7 +10737,7 @@ function renderHostedIdentity() {
       ? "Signing out ends this app's contribution session."
       : "This app already has a contribution session. Signing out ends it.",
   );
-  // One honest, four-state identity status (owner-reported contradictions,
+  // One honest, five-state identity status (owner-reported contradictions,
   // 2026-08-08/10). A single flat "Signed in"/"Not signed in" chip could not
   // tell never-tried from signing-in from reconnecting from connected, so it
   // showed a live in-page proof as "Signed in", a completed Google round trip
@@ -10485,6 +10746,7 @@ function renderHostedIdentity() {
   // the chip and the action can never disagree.
   const identityState = hostedIdentityStatusState({
     signingIn: hostedIdentityBusy
+      || hostedSignInCancellationInFlight
       || activeHostedSignIn !== null
       || pendingHostedSignInResumeInFlight,
     signedIn,
@@ -10508,18 +10770,20 @@ function renderHostedIdentity() {
   renderContributionActionState();
 }
 
-// The four merged identity states and their one-next-action lines. Kept beside
+// The five merged identity states and their one-next-action lines. Kept beside
 // renderHostedIdentity so the chip vocabulary and the action vocabulary are
 // read from the same place.
 const IDENTITY_STATE_CHIP_KEYS = Object.freeze({
   new: "identity.state.new",
   signingIn: "identity.state.signingIn",
+  signedIn: "identity.state.signedIn",
   reconnecting: "identity.state.reconnecting",
   connected: "identity.state.connected",
 });
 const IDENTITY_STATE_NEXT_KEYS = Object.freeze({
   new: "identity.next.new",
   signingIn: "identity.next.signingIn",
+  signedIn: "identity.next.signedIn",
   reconnecting: "identity.next.reconnecting",
   connected: "identity.next.connected",
 });
@@ -10527,14 +10791,15 @@ const IDENTITY_STATE_NEXT_KEYS = Object.freeze({
 /**
  * The one honest identity status, from the underlying facts. Signing-in wins
  * over everything: an in-flight ceremony is the truest current state. Otherwise
- * a Mac that holds only an in-page proof, or whose upload authority is being
- * re-paired, is Reconnecting rather than a flat "Connected"; a real server
- * session with nothing pending is Connected; and nothing at all is New — never
- * "Not signed in" right after a completed round trip left a live proof.
+ * a Mac that holds only an in-page proof is Signed in and waiting for explicit
+ * review; only upload authority actually being re-paired is Reconnecting. A
+ * real server session with nothing pending is Connected; and nothing at all is
+ * New — never "Not signed in" right after a completed round trip left a proof.
  */
 function hostedIdentityStatusState({ signingIn, signedIn, hasServerSession, repairPending }) {
   if (signingIn) return "signingIn";
-  if (repairPending || (signedIn && !hasServerSession)) return "reconnecting";
+  if (repairPending) return "reconnecting";
+  if (signedIn && !hasServerSession) return "signedIn";
   if (signedIn) return "connected";
   return "new";
 }
@@ -10547,8 +10812,9 @@ function hostedIdentityNextActionKey(identityState, signInRequired) {
     : IDENTITY_STATE_NEXT_KEYS[identityState];
 }
 
-// A completed hosted handoff is memory-only, but enrollment also creates an
-// HttpOnly service session. When one exists, acknowledge its server-side
+// A completed hosted handoff is memory-only, but its state+verifier recovery
+// handle remains durable until enrollment. Enrollment also creates an HttpOnly
+// service session. When one exists, acknowledge its server-side
 // revocation before changing the UI: otherwise this page would say "signed
 // out" while the browser still held a usable session cookie. A proof that was
 // never enrolled has no session and can be forgotten locally.
@@ -10566,6 +10832,11 @@ async function signOutHostedIdentity() {
     ? "contribution.signOutStarting"
     : "contribution.signOutForgetting");
   try {
+    // Retire the crash-recovery capability before revoking the hosted
+    // session. A failed remote logout may be retried while the page still
+    // truthfully shows signed in; a failed local clear must never let an
+    // unconsumed proof silently sign the user back in after they chose out.
+    await clearPendingHostedSignIn();
     if (hadServerSession) await communityClient.logout();
     hostedIdentity = null;
     setCommunitySession(null);
@@ -10596,11 +10867,16 @@ async function signOutHostedIdentity() {
 // authorization can no longer be redeemed rather than minutes earlier.
 const HOSTED_SIGNIN_POLL_ATTEMPTS = 300;
 const HOSTED_SIGNIN_POLL_INTERVAL_MS = 2_000;
-// The service-side hold, stated once: the poll budget IS the validity window,
-// and the persisted pending handoff below uses the same bound so this page
-// never claims a proof the service has already discarded.
+// A callback can finish at the very end of the ten-minute authorization
+// window and then mint a proof with its own five-minute delivery window. The
+// page cannot observe the callback timestamp while it is closed, so retain the
+// state+verifier for the conservative sum. The Worker remains the exact expiry
+// authority and rejects an earlier-dead handle; this bound only prevents the
+// client from deleting a still-live recovery path.
+const HOSTED_SIGNIN_RESULT_DELIVERY_VALIDITY_MS = 5 * 60 * 1_000;
 const HOSTED_SIGNIN_HANDOFF_VALIDITY_MS =
-  HOSTED_SIGNIN_POLL_ATTEMPTS * HOSTED_SIGNIN_POLL_INTERVAL_MS;
+  HOSTED_SIGNIN_POLL_ATTEMPTS * HOSTED_SIGNIN_POLL_INTERVAL_MS
+    + HOSTED_SIGNIN_RESULT_DELIVERY_VALIDITY_MS;
 
 // A failure at the local relay to the contribution service — not a verdict
 // from the Worker — surfaces as one of the companion's fixed
@@ -10678,23 +10954,31 @@ function checkHostedSignInNow() {
   if (activeHostedSignIn !== null) wakeHostedSignInPoll(activeHostedSignIn);
 }
 
-function cancelHostedSignIn() {
+async function cancelHostedSignIn() {
   const attempt = activeHostedSignIn;
-  if (attempt === null) return;
+  if (attempt === null || hostedSignInCancellationInFlight) return;
+  hostedSignInCancellationInFlight = true;
   attempt.cancelled = true;
   activeHostedSignIn = null;
-  hostedIdentityBusy = false;
+  // Wake the polling loop before the local clear so its finally block cannot
+  // keep a cancelled request asleep for another interval.
+  attempt.wake?.();
+  renderHostedIdentity();
   // An explicit cancel is a user decision: the persisted handoff must not
   // resurrect this sign-in on the next reactivation.
-  clearPendingHostedSignIn();
-  attempt.wake?.();
-  const status = $("#identity-signin-status");
-  status.hidden = false;
-  status.className = "participant-action-status";
-  setLocalizedText(status, "contribution.signInCancelled", {
-    provider: attempt.label,
-  });
-  renderHostedIdentity();
+  try {
+    await clearPendingHostedSignIn().catch(() => {});
+    const status = $("#identity-signin-status");
+    status.hidden = false;
+    status.className = "participant-action-status";
+    setLocalizedText(status, "contribution.signInCancelled", {
+      provider: attempt.label,
+    });
+  } finally {
+    hostedIdentityBusy = false;
+    hostedSignInCancellationInFlight = false;
+    renderHostedIdentity();
+  }
 }
 
 // One shape for both providers. Neither can complete inside this page: Apple
@@ -10720,7 +11004,7 @@ const HOSTED_SIGNIN_FLOWS = {
     signedIn:
       "Signed in with Google. This page holds only a short-lived opaque proof; the service keeps only an irreversible identity hash, never your email or name.",
     timedOut:
-      "Google sign-in did not finish in time. Nothing was stored. Press Sign in with Google again to start a fresh sign-in.",
+      "Google sign-in did not finish within the live check. Nothing was uploaded. TiboTattle will check the bounded recovery handle again when the app returns; you can also sign in again.",
     unconfigured: "Hosted Google sign-in is not configured for this build.",
     failed: "Google sign-in could not be completed. Sign in again.",
     markUnavailable: () => {
@@ -10737,7 +11021,7 @@ const HOSTED_SIGNIN_FLOWS = {
     signedIn:
       "Signed in with Apple. This page holds only a short-lived opaque proof; the service keeps only an irreversible identity hash, never your email or name.",
     timedOut:
-      "Apple sign-in did not finish in time. Nothing was stored. Press Sign in with Apple again to start a fresh sign-in.",
+      "Apple sign-in did not finish within the live check. Nothing was uploaded. TiboTattle will check the bounded recovery handle again when the app returns; you can also sign in again.",
     unconfigured: "Hosted Apple sign-in is not configured for this build.",
     failed: "Apple sign-in could not be completed. Sign in again.",
     markUnavailable: () => {
@@ -10746,70 +11030,33 @@ const HOSTED_SIGNIN_FLOWS = {
   },
 };
 
-// The pending sign-in handoff survives a dashboard reload (owner-reported
-// orphaned proof, 2026-08-08: a server-side COMPLETED Google sign-in expired
-// unread because the state token needed to collect it lived only in page
-// memory, and the native deep-link reactivation reloaded the page). The
-// moment the browser is opened, {provider, state, startedAt} is persisted to
-// sessionStorage — tab-scoped and gone when the tab closes, holding only the
-// single-use five-minute read-back handle, never a proof or a session. These
-// three helpers are the ONLY place this page touches web storage; the source
-// contract test cuts this block out and holds the rest of the file to zero.
-const PENDING_HOSTED_SIGNIN_STORAGE_KEY = "tibotattle.pending-hosted-sign-in.v1";
-
-function persistPendingHostedSignIn(providerId, state, verifier) {
-  try {
-    window.sessionStorage?.setItem(
-      PENDING_HOSTED_SIGNIN_STORAGE_KEY,
-      JSON.stringify({
-        provider: providerId,
-        state,
-        verifier,
-        startedAt: Date.now(),
-      }),
-    );
-  } catch {
-    // Storage being unavailable only removes the reload resilience; the live
-    // poll still collects the proof exactly as before.
-  }
+// The native companion binds a fresh random loopback port on every launch, so
+// browser storage is not a cross-relaunch boundary: localStorage belongs to
+// the origin including that port. Keep the short-lived {provider, state,
+// verifier, startedAt} read-back capability in the companion's owner-only
+// state instead. The companion validates the exact shape, applies the
+// fifteen-minute expiry, and returns no proof, session, account fact, device
+// identifier, path, or contribution content. OAuth is not opened unless the
+// durable write succeeds.
+async function persistPendingHostedSignIn(providerId, state, verifier) {
+  return localClient.storeHostedSignInHandoff({
+    provider: providerId,
+    state,
+    verifier,
+  });
 }
 
-function clearPendingHostedSignIn() {
-  try {
-    window.sessionStorage?.removeItem(PENDING_HOSTED_SIGNIN_STORAGE_KEY);
-  } catch {
-    // Nothing to clear when storage is unavailable.
-  }
+async function clearPendingHostedSignIn() {
+  return localClient.clearHostedSignInHandoff();
 }
 
-function readPendingHostedSignIn() {
-  try {
-    const raw = window.sessionStorage?.getItem(PENDING_HOSTED_SIGNIN_STORAGE_KEY);
-    if (typeof raw !== "string" || raw === "") return null;
-    const value = JSON.parse(raw);
-    // The state token and the client verifier keep the exact shape the service
-    // mints and requires (the same bounds the client's own read-back enforces),
-    // so a corrupt record is discarded here instead of failing the read-back
-    // forever. The verifier is the initiator binding: without it a resumed poll
-    // can no longer collect the proof, so a record missing it is unusable.
-    if (!Object.hasOwn(HOSTED_SIGNIN_FLOWS, value?.provider ?? "")
-        || typeof value?.state !== "string"
-        || !/^[A-Za-z0-9_-]{43,128}$/u.test(value.state)
-        || typeof value?.verifier !== "string"
-        || !/^[A-Za-z0-9_-]{43,128}$/u.test(value.verifier)
-        || !Number.isFinite(value?.startedAt)) {
-      clearPendingHostedSignIn();
-      return null;
-    }
-    return value;
-  } catch {
-    clearPendingHostedSignIn();
-    return null;
-  }
+async function readPendingHostedSignIn() {
+  const value = await localClient.hostedSignInHandoff();
+  return ["pending", "expired"].includes(value?.status) ? value : null;
 }
 
 // One resume at a time; re-entrant activations (load + focus + deep link in
-// the same second) must not race two read-backs of the one-time result.
+// the same second) must not race two read-backs of the bounded result.
 let pendingHostedSignInResumeInFlight = false;
 
 /**
@@ -10817,24 +11064,34 @@ let pendingHostedSignInResumeInFlight = false;
  * orphaned proof, 2026-08-08). Runs on load and on every reactivation —
  * deep-link return, visibilitychange to visible, window focus — and reads the
  * persisted handoff's result with a couple of bounded retries inside the
- * five-minute validity window. Success completes the identical journey the
- * live poll would have: identity adopted, record cleared, and the pending
+ * conservative authorization-plus-delivery validity window. Success completes
+ * the identical journey the
+ * live poll would have: identity adopted while the recovery record remains
+ * until enrollment succeeds, and the pending
  * repair ceremony resumed. A proof that expired unread, or a definite service
  * verdict, is reported through describeFailure so a reference and request id
  * reach the local diagnostics log; an unreachable service leaves the record
  * for the next activation instead of logging a note per focus change.
  */
 async function resumePendingHostedSignIn({ retries = 2 } = {}) {
-  if (pendingHostedSignInResumeInFlight) return;
+  if (pendingHostedSignInResumeInFlight || hostedSignInCancellationInFlight) return;
   if (hostedIdentityBusy || activeHostedSignIn !== null || hostedIdentity !== null) {
     return;
   }
-  const pending = readPendingHostedSignIn();
+  // A restored HttpOnly service session is already the completed recovery
+  // outcome. Retire any stale local handle without polling it into a false
+  // "token invalid" failure after a successful enrollment.
+  if (hasCommunitySession()) {
+    await clearPendingHostedSignIn().catch(() => {});
+    return;
+  }
+  const pending = await readPendingHostedSignIn();
   if (pending === null) return;
   const flow = HOSTED_SIGNIN_FLOWS[pending.provider];
   const status = $("#identity-signin-status");
-  if (Date.now() - pending.startedAt > HOSTED_SIGNIN_HANDOFF_VALIDITY_MS) {
-    clearPendingHostedSignIn();
+  if (pending.status === "expired"
+      || Date.now() >= pending.expiresAt) {
+    await clearPendingHostedSignIn().catch(() => {});
     const error = new Error("The completed sign-in expired before this Mac collected it.");
     error.code = "HOSTED_SIGNIN_HANDOFF_EXPIRED";
     await showFailure(status, {
@@ -10874,7 +11131,7 @@ async function resumePendingHostedSignIn({ retries = 2 } = {}) {
           // than logging a note per focus change.
           return;
         } else {
-          clearPendingHostedSignIn();
+          await clearPendingHostedSignIn().catch(() => {});
           await showFailure(status, {
             surface: "hosted_identity",
             error,
@@ -10885,7 +11142,6 @@ async function resumePendingHostedSignIn({ retries = 2 } = {}) {
         }
       }
       if (identity !== null) {
-        clearPendingHostedSignIn();
         hostedIdentity = identity;
         status.hidden = false;
         status.className = "participant-action-status";
@@ -10925,7 +11181,8 @@ function signalHostedSignInInFlight(inFlight) {
 async function beginHostedSignIn(providerId) {
   const flow = HOSTED_SIGNIN_FLOWS[providerId];
   if (flow === undefined || hostedIdentityBusy || hostedIdentity !== null
-      || pendingHostedSignInResumeInFlight) {
+      || pendingHostedSignInResumeInFlight
+      || hostedSignInCancellationInFlight) {
     return;
   }
   const status = $("#identity-signin-status");
@@ -10949,11 +11206,20 @@ async function beginHostedSignIn(providerId) {
   });
   try {
     const request = await flow.start();
+    if (attempt.cancelled || activeHostedSignIn !== attempt) return;
     // Persisted BEFORE the browser opens: from this moment a completed
     // sign-in exists server-side that only this state token AND the client
     // verifier can collect, so both must survive a dashboard reload
     // (owner-reported orphaned proof, 2026-08-08).
-    persistPendingHostedSignIn(providerId, request.state, request.verifier);
+    await persistPendingHostedSignIn(
+      providerId,
+      request.state,
+      request.verifier,
+    );
+    if (attempt.cancelled || activeHostedSignIn !== attempt) {
+      await clearPendingHostedSignIn().catch(() => {});
+      return;
+    }
     openHostedSignInInBrowser(request.authorizeUrl);
     status.textContent = flow.waiting;
     for (let poll = 0; poll < HOSTED_SIGNIN_POLL_ATTEMPTS; poll += 1) {
@@ -10968,31 +11234,13 @@ async function beginHostedSignIn(providerId) {
         // definite verdict still throws and is handled below.
         const pendingResult = error?.code === "IDENTITY_RESULT_PENDING";
         if (!pendingResult && !isTransientSignInRelayError(error)) throw error;
-        // The fixed callback page wakes the native dashboard only after the
-        // provider has returned. A current service turns a cancelled callback
-        // into IDENTITY_TOKEN_INVALID; this branch preserves the same safe UI
-        // outcome while a previously deployed service still reports pending.
-        if (pendingResult && attempt.returnedToApp) {
-          // A completed callback whose result stays pending is a read-back
-          // failure the user acted on, so it is referenced and logged like
-          // one (owner-reported silent failure, 2026-08-08) instead of
-          // rendering copy with no diagnostic note behind it.
-          clearPendingHostedSignIn();
-          await showFailure(status, {
-            surface: "hosted_identity",
-            error,
-            messages: {
-              IDENTITY_RESULT_PENDING:
-                `${flow.label} sign-in did not complete. Nothing was uploaded. You can try again.`,
-            },
-            fallback: flow.failed,
-          });
-          return;
-        }
+        // The callback can wake the app a few milliseconds before its D1
+        // completion write is visible. Pending remains normal polling even
+        // after return; keep the recovery record and continue the bounded
+        // loop instead of destroying a sign-in that is still completing.
       }
       if (identity !== null) {
         if (attempt.cancelled || activeHostedSignIn !== attempt) return;
-        clearPendingHostedSignIn();
         hostedIdentity = identity;
         activeHostedSignIn = null;
         hostedIdentityBusy = false;
@@ -11007,10 +11255,10 @@ async function beginHostedSignIn(providerId) {
       }
     }
     // A bounded poll that ran out is still a failed action from the user's
-    // side, so it is referenced and logged like any other. The poll budget IS
-    // the handoff's validity window, so the persisted record is expired with
-    // it.
-    clearPendingHostedSignIn();
+    // side, so it is referenced and logged like any other. Do not discard the
+    // persisted recovery handle here: a provider callback can complete at the
+    // edge of the authorization window and mint a proof with its own delivery
+    // window. Relaunch/focus may still recover that result safely.
     await showFailure(status, {
       surface: "hosted_identity",
       error: null,
@@ -11022,7 +11270,7 @@ async function beginHostedSignIn(providerId) {
     // persisted handoff; a transient unreachable-service throw keeps it, so
     // the reactivation resume can still collect the proof inside its window.
     if (error?.code !== undefined || error?.status !== undefined) {
-      clearPendingHostedSignIn();
+      await clearPendingHostedSignIn().catch(() => {});
     }
     const unconfigured = error?.code === "IDENTITY_CONFIGURATION_INVALID";
     if (unconfigured) flow.markUnavailable();
@@ -11528,14 +11776,60 @@ async function loadIncrementalSyncStatus() {
   scheduleIncrementalSyncStatusPoll();
 }
 
+async function freshReviewTokenForApproval(generation, expectedSummaryIdentity) {
+  const review = await withContributionReviewDeadline(
+    localClient.contributionSyncExactReview(),
+  );
+  if (!contributionReviewFence.isCurrent(generation)) return null;
+  renderContributionSyncExactReview(review);
+  if (contributionSyncExactReview?.summaryIdentity !== expectedSummaryIdentity) {
+    const error = new Error("The local contribution review changed.");
+    error.code = "review_expired_or_changed";
+    throw error;
+  }
+  return contributionSyncExactReview.reviewToken;
+}
+
+/**
+ * Commit the user's local consent before any hosted enrollment or pairing.
+ * The ten-minute review capability is refreshed at click time. If it expires
+ * in the tiny interval before the local mutation, discard it, mint one fresh
+ * authorization for the same on-screen summary, and retry exactly once.
+ */
+async function recordFreshLocalContributionApproval(
+  generation,
+  expectedSummaryIdentity,
+) {
+  let reviewToken = await freshReviewTokenForApproval(
+    generation,
+    expectedSummaryIdentity,
+  );
+  if (reviewToken === null) return null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await localClient.approveIncrementalContribution(reviewToken);
+    } catch (error) {
+      if (attempt > 0 || error?.code !== "review_expired_or_changed") {
+        throw error;
+      }
+      clearContributionSyncExactReview();
+      reviewToken = await freshReviewTokenForApproval(
+        generation,
+        expectedSummaryIdentity,
+      );
+      if (reviewToken === null) return null;
+    }
+  }
+  return null;
+}
+
 /**
  * The one-step ceremony (owner-directed, 2026-08-08): a single "Review and
- * approve" interaction does everything after sign-in. It mints the pairing
- * WITH the v1.0 consent identifier (the server session is already held), has
- * the companion claim it — the claim is what records the server-side
- * consent-once grant every chunk upload is verified against — then records
- * the local approve-once consent with the review token, and the companion
- * starts the first sync pass immediately.
+ * approve" interaction does everything after sign-in. It first refreshes the
+ * local review authorization and records the local approve-once consent. Only
+ * then does it mint and claim the hosted v1.0 pairing. A process interruption
+ * can therefore leave an approved Mac that still needs connection (which is
+ * recoverable), never a server-authorized Mac whose local consent is missing.
  *
  * The same ceremony is the transparent re-pair path: a Mac whose earlier
  * claim carried the v0.1 consent has no grant, so its uploads pause with
@@ -11569,14 +11863,31 @@ async function approveIncrementalContribution() {
     return;
   }
   incrementalConsentBusy = true;
-  // A hosted proof is intentionally one-use. If enrollment itself fails, the
-  // page must not claim the same proof can be retried: it is dropped and the
-  // next action is a fresh browser sign-in. Failures after a session is
-  // established can be retried without authenticating again.
+  const reviewGeneration = contributionReviewFence.begin();
+  const expectedSummaryIdentity = contributionSyncExactReview?.summaryIdentity
+    ?? null;
   let enrollmentAttemptedWithHostedIdentity = false;
   let enrollmentEstablished = false;
   renderContributionActionState();
   try {
+    // --- Local consent is durable before hosted state can change. ----------
+    if (needsLocalApproval) {
+      status.hidden = false;
+      status.className = "participant-action-status";
+      setLocalizedText(status, "consent.approving");
+      const result = await recordFreshLocalContributionApproval(
+        reviewGeneration,
+        expectedSummaryIdentity,
+      );
+      if (result?.status !== "approved") {
+        const error = new Error("The local companion did not record the approval.");
+        error.code = "incremental_consent_failed";
+        throw error;
+      }
+      incrementalConsentApproved = true;
+      clearContributionSyncExactReview();
+      setLocalizedText(status, "consent.approved");
+    }
     // --- Upload authority, inside the same interaction. -------------------
     // Only a v1.0-consent claim made by THIS session proves the server-side
     // grant exists; anything less re-pairs. The claim is idempotent for a
@@ -11619,26 +11930,11 @@ async function approveIncrementalContribution() {
         // that can carry the v1.0 consent (2026-08-08).
         enrollmentAttemptedWithHostedIdentity = hostedIdentity !== null;
         pairing = await contributionConnectStep("hosted_enrollment", status, async () => {
-          let enrollment;
-          try {
-            enrollment = await communityClient.enroll(
-              null,
-              "telemetry-contribution-v0.1",
-              { deviceBootstrap: false, identity: hostedIdentity }
-            );
-          } finally {
-            // Consume the one-use proof the instant enroll has been ATTEMPTED
-            // with it — success or failure. A hosted proof is a single-use
-            // provider authorization code; the moment it reaches the wire it is
-            // dead, so it is dropped here and can never be re-sent by a
-            // re-entry, an auto-resume, or an auto-repair. Everything after this
-            // point that still needs authority uses the SESSION the enroll
-            // established (the cookie-commit mint retry below), never the proof.
-            // This is what stops a second ceremony execution from re-enrolling a
-            // consumed proof and drawing IDENTITY_TOKEN_INVALID (owner-reported
-            // two-note failure, 2026-08-11).
-            hostedIdentity = null;
-          }
+          const enrollment = await communityClient.enroll(
+            null,
+            "telemetry-contribution-v0.1",
+            { deviceBootstrap: false, identity: hostedIdentity }
+          );
           if (enrollment?.schemaVersion !== "participant-bootstrap-v0.1"
               || typeof enrollment?.csrfToken !== "string") {
             const error = new Error(
@@ -11652,6 +11948,11 @@ async function approveIncrementalContribution() {
             participantId: enrollment.participantId ?? null,
             consentVersion: "privacy-safe-telemetry-v0.1"
           });
+          // The state+verifier handoff remains durable until enrollment is
+          // confirmed. A quit after result collection can therefore re-read
+          // the same server proof and resume here after relaunch.
+          await clearPendingHostedSignIn().catch(() => {});
+          hostedIdentity = null;
           enrollmentEstablished = true;
           // Stamp the mint instant BEFORE the pairing goes out: the __Host-
           // session cookie the enroll response just set may not have committed
@@ -11671,22 +11972,7 @@ async function approveIncrementalContribution() {
       pairing = null;
       communityDevicePairedV1 = true;
     }
-    // --- Local consent, and the first pass starts now. --------------------
-    if (needsLocalApproval) {
-      status.hidden = false;
-      status.className = "participant-action-status";
-      setLocalizedText(status, "consent.approving");
-      const result = await localClient.approveIncrementalContribution(
-        contributionSyncExactReview.reviewToken
-      );
-      if (result?.status !== "approved") {
-        const error = new Error("The local companion did not record the approval.");
-        error.code = "incremental_consent_failed";
-        throw error;
-      }
-      incrementalConsentApproved = true;
-      setLocalizedText(status, "consent.approved");
-    } else {
+    if (!needsLocalApproval) {
       // The transparent re-pair: the local approval already stands, the
       // fresh claim recorded the grant, and the companion's pairing route
       // resumed and kicked the engine. Say what happened, not "failed".
@@ -12138,16 +12424,17 @@ async function reportContributionConnectFailure(status, error, {
     return;
   }
   const step = contributionConnectStepOf(error);
-  // The one-use proof is already dropped by the ceremony the instant enroll is
-  // attempted (consume-once), so this no longer keys off hostedIdentity still
-  // being present — after the drop that is always false. "Enroll was attempted
-  // with a proof and never established a session" is exactly a dead proof: the
-  // one honest next step is a fresh sign-in, never a retry with the consumed
-  // one. The redundant clear + re-render below keeps the identity card's state
-  // truthful even if a caller reached here by another path.
+  // Keep the proof and its persisted state+verifier across transport and
+  // service failures: the Worker allows the same bound handle to retrieve the
+  // result until enrollment consumes it or it expires. Only a definitive
+  // IDENTITY_TOKEN_INVALID verdict proves this handle cannot recover. Clearing
+  // on a timeout or 5xx would recreate the crash window this recovery path is
+  // specifically designed to close.
   const retryNeedsFreshSignIn = enrollmentAttemptedWithHostedIdentity
-    && !enrollmentEstablished;
+    && !enrollmentEstablished
+    && error?.code === "IDENTITY_TOKEN_INVALID";
   if (retryNeedsFreshSignIn) {
+    await clearPendingHostedSignIn().catch(() => {});
     hostedIdentity = null;
     renderHostedIdentity();
   }
@@ -12234,7 +12521,7 @@ window.addEventListener("tibotattle:hosted-sign-in-return", checkHostedSignInNow
 // proof, 2026-08-08): the deep-link return, the page becoming visible again,
 // and the window regaining focus each try to collect a pending sign-in this
 // page (or its pre-reload incarnation) started. The resume self-guards, so
-// overlapping activations cannot race the one-time read-back.
+// overlapping activations cannot race the bounded read-back.
 window.addEventListener("tibotattle:hosted-sign-in-return", () => {
   void resumePendingHostedSignIn();
 });
@@ -12257,6 +12544,9 @@ $("#demo-button").addEventListener("click", () => renderDashboard(demoDashboard(
 // the error-recovery re-check for its invisible review bootstrap.
 $("#incremental-review-retry").addEventListener("click", () => {
   void retryIncrementalReviewBootstrap();
+});
+$("#incremental-copy-diagnostics").addEventListener("click", () => {
+  void copyContributionDiagnostics();
 });
 $("#incremental-consent-approve").addEventListener("click", () => {
   void approveIncrementalContribution();
@@ -12543,7 +12833,7 @@ async function bootstrapDashboard() {
   }
   await loadCommunityResults();
   // A sign-in the pre-reload page started but never read back is collected
-  // now, while its five-minute handoff is still valid (owner-reported
+  // now, while its bounded recovery handle may still be valid (owner-reported
   // orphaned proof, 2026-08-08).
   void resumePendingHostedSignIn();
   scheduleReturningUserRefresh();

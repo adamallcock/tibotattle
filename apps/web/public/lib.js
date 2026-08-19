@@ -762,3 +762,101 @@ export function detectDeviationPeriods(points, {
     hasDriftSeries,
   };
 }
+
+const CONTRIBUTION_REVIEWABLE_QUEUE_STATES = new Set([
+  "ready",
+  "retry_wait",
+  "paused",
+]);
+
+/**
+ * Delivery scheduling never changes whether a locally verified payload can be
+ * reviewed. A retry deadline or a paused uploader is transport state only.
+ */
+export function isContributionReviewableQueueState(state) {
+  return CONTRIBUTION_REVIEWABLE_QUEUE_STATES.has(state);
+}
+
+/**
+ * Decide the next local-only review-bootstrap action from the bounded preview.
+ * No usable preview is an explicit recovery state; it must never degrade into
+ * an indefinitely disabled approval button with no explanation.
+ */
+export function contributionReviewBootstrapAction(preview) {
+  if (preview?.status !== "available") return "unavailable";
+  if (preview.state === "empty") {
+    return preview.item === null ? "prepare" : "unavailable";
+  }
+  return isContributionReviewableQueueState(preview.state)
+      && preview.item !== null
+      && typeof preview.item === "object"
+      && !Array.isArray(preview.item)
+    ? "review"
+    : "unavailable";
+}
+
+/**
+ * A local preparation or exact-review read crosses native Keychain, SQLite,
+ * and loopback boundaries. None may leave the contribution ceremony busy
+ * forever: after one minute the page exposes its explicit retry so the caller
+ * can record a bounded diagnostic, while the local operation remains free to
+ * settle safely in the companion.
+ */
+export function withContributionReviewDeadline(operation, {
+  timeoutMilliseconds = 60_000,
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
+} = {}) {
+  if (!Number.isSafeInteger(timeoutMilliseconds)
+      || timeoutMilliseconds < 1
+      || timeoutMilliseconds > 60_000
+      || typeof setTimer !== "function"
+      || typeof clearTimer !== "function") {
+    throw new TypeError("Contribution review deadline is invalid.");
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimer(() => {
+      if (settled) return;
+      settled = true;
+      const error = new Error("The local contribution review did not finish.");
+      error.code = "local_review_timed_out";
+      reject(error);
+    }, timeoutMilliseconds);
+    Promise.resolve(operation).then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimer(timer);
+        resolve(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimer(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
+ * Fence asynchronous review reads by a monotonically increasing generation.
+ * A timeout cannot cancel every native/loopback operation already in flight,
+ * so callers must also refuse to commit results from any superseded attempt.
+ */
+export function createLatestContributionReviewFence() {
+  let generation = 0;
+  return Object.freeze({
+    begin() {
+      generation = generation === Number.MAX_SAFE_INTEGER ? 1 : generation + 1;
+      return generation;
+    },
+    isCurrent(candidate) {
+      return Number.isSafeInteger(candidate) && candidate === generation;
+    },
+    current() {
+      return generation;
+    },
+  });
+}

@@ -163,4 +163,11 @@ Regression specs pin the machinery: `test/macos-updater.test.js` watches the
 generator fail open, produce, sign, and apply-validate a delta with the real
 pinned tools, and `test/publish-sparkle-update.test.js` covers delta
 publication, read-back, every fail-closed path, the fallback-container
-placement rule, and the stable policy flip.
+placement rule, and the stable policy flip. Since 2026-08-19 the publisher's
+signed-feed preflight covers both named channels, so the hand-built delta
+shape proven above no longer publishes as-is: the delta specs exercise it
+behind an explicit spec-injected fixture policy (unreachable from the CLI,
+refused for stable), and reviving delta publication for real goes through
+the reviewed delta policy flip — extending
+`sparkle-signed-feed-validation.js` and the Worker guard's official parser
+for delta-carrying signed feeds — not through the hand-built shape.

@@ -5,6 +5,10 @@ import { join, dirname, relative } from "node:path";
 const ROOT = join(import.meta.dirname, "..", "..");
 const skipDirs = new Set([
   ".git",
+  // The retained release archive holds real .app bundles whose frameworks
+  // contain symbolic links by construction; it is a build byproduct like the
+  // other release directories, not documentation.
+  ".release-archive",
   ".release-build",
   ".release-deps",
   ".release-repro",

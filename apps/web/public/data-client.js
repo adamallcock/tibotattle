@@ -109,6 +109,10 @@ const SERVICE_REQUEST_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 export const LOCAL_DIAGNOSTIC_NOTE_SCHEMA_VERSION =
   "local-diagnostic-note-v0.1";
+export const LOCAL_CONTRIBUTION_DIAGNOSTICS_SCHEMA_VERSION =
+  "local-contribution-diagnostics-v0.1";
+export const HOSTED_SIGNIN_HANDOFF_SCHEMA_VERSION =
+  "local-hosted-signin-handoff-v1";
 export const LOCAL_CONTRIBUTION_DEVICE_RESET_VERSION =
   "local-contribution-device-reset-v0.1";
 export const LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION =
@@ -1315,6 +1319,177 @@ export function normalizeLocalDiagnosticNote(payload) {
     return unavailable;
   }
   return { status: "recorded", reference: payload.reference };
+}
+
+const HOSTED_SIGNIN_HANDOFF_BOUND_VALUE = /^[A-Za-z0-9_-]{43,128}$/u;
+
+export function normalizeHostedSignInHandoff(payload) {
+  const unavailable = Object.freeze({
+    status: "unavailable",
+    provider: null,
+    state: null,
+    verifier: null,
+    startedAt: null,
+    expiresAt: null,
+  });
+  if (hasExactKeys(payload, ["schemaVersion", "status"])
+      && payload.schemaVersion === HOSTED_SIGNIN_HANDOFF_SCHEMA_VERSION
+      && payload.status === "absent") {
+    return Object.freeze({ ...unavailable, status: "absent" });
+  }
+  if (hasExactKeys(payload, ["schemaVersion", "status", "provider"])
+      && payload.schemaVersion === HOSTED_SIGNIN_HANDOFF_SCHEMA_VERSION
+      && payload.status === "expired"
+      && ["google", "apple"].includes(payload.provider)) {
+    return Object.freeze({
+      ...unavailable,
+      status: "expired",
+      provider: payload.provider,
+    });
+  }
+  if (!hasExactKeys(payload, [
+        "schemaVersion",
+        "status",
+        "provider",
+        "state",
+        "verifier",
+        "startedAt",
+        "expiresAt",
+      ])
+      || payload.schemaVersion !== HOSTED_SIGNIN_HANDOFF_SCHEMA_VERSION
+      || payload.status !== "pending"
+      || !["google", "apple"].includes(payload.provider)
+      || typeof payload.state !== "string"
+      || !HOSTED_SIGNIN_HANDOFF_BOUND_VALUE.test(payload.state)
+      || typeof payload.verifier !== "string"
+      || !HOSTED_SIGNIN_HANDOFF_BOUND_VALUE.test(payload.verifier)
+      || !Number.isSafeInteger(payload.startedAt)
+      || payload.startedAt < 0
+      || !Number.isSafeInteger(payload.expiresAt)
+      || payload.expiresAt <= payload.startedAt
+      || payload.expiresAt - payload.startedAt !== 15 * 60 * 1_000) {
+    return unavailable;
+  }
+  return Object.freeze({
+    status: "pending",
+    provider: payload.provider,
+    state: payload.state,
+    verifier: payload.verifier,
+    startedAt: payload.startedAt,
+    expiresAt: payload.expiresAt,
+  });
+}
+
+const CONTRIBUTION_DIAGNOSTIC_PHASES = new Set([
+  "not_configured",
+  "unavailable",
+  "sign_in_required",
+  "preparing_review",
+  "review_ready",
+  "connecting",
+  "approved_connection_needed",
+  "approved_paused",
+  "approved_syncing",
+  "approved_idle",
+]);
+const CONTRIBUTION_DIAGNOSTIC_QUEUE_STATES = new Set([
+  "unavailable",
+  "empty",
+  "ready",
+  "retry_wait",
+  "paused",
+]);
+const CONTRIBUTION_DIAGNOSTIC_PREVIEW_STATES = new Set([
+  "not_observed",
+  ...CONTRIBUTION_DIAGNOSTIC_QUEUE_STATES,
+]);
+
+export function normalizeLocalContributionDiagnostics(payload) {
+  const unavailable = Object.freeze({
+    status: "unavailable",
+    journeyPhase: "unavailable",
+    previewState: "not_observed",
+    queueState: "unavailable",
+    consent: Object.freeze({ approved: false, current: false }),
+    signedIn: Object.freeze({ observed: false, value: false }),
+    pairing: Object.freeze({ observed: false, paired: false }),
+    recentDiagnosticReferences: Object.freeze([]),
+  });
+  const references = payload?.recentDiagnosticReferences;
+  if (!hasExactKeys(payload, [
+        "schemaVersion",
+        "journeyPhase",
+        "previewState",
+        "queueState",
+        "consent",
+        "signedIn",
+        "pairing",
+        "recentDiagnosticReferences",
+        "includesTokens",
+        "includesOauthState",
+        "includesVerifiers",
+        "includesDeviceIdentifiers",
+        "includesAccountIdentifiers",
+        "includesContent",
+        "includesPaths",
+      ])
+      || payload.schemaVersion !== LOCAL_CONTRIBUTION_DIAGNOSTICS_SCHEMA_VERSION
+      || !CONTRIBUTION_DIAGNOSTIC_PHASES.has(payload?.journeyPhase)
+      || !CONTRIBUTION_DIAGNOSTIC_PREVIEW_STATES.has(payload?.previewState)
+      || !CONTRIBUTION_DIAGNOSTIC_QUEUE_STATES.has(payload?.queueState)
+      || !hasExactKeys(payload?.consent, ["approved", "current"])
+      || typeof payload?.consent?.approved !== "boolean"
+      || typeof payload?.consent?.current !== "boolean"
+      || !hasExactKeys(payload?.signedIn, ["observed", "value"])
+      || typeof payload?.signedIn?.observed !== "boolean"
+      || typeof payload?.signedIn?.value !== "boolean"
+      || !hasExactKeys(payload?.pairing, ["observed", "paired"])
+      || typeof payload?.pairing?.observed !== "boolean"
+      || typeof payload?.pairing?.paired !== "boolean"
+      || !Array.isArray(references)
+      || references.length > 5
+      || payload?.includesTokens !== false
+      || payload?.includesOauthState !== false
+      || payload?.includesVerifiers !== false
+      || payload?.includesDeviceIdentifiers !== false
+      || payload?.includesAccountIdentifiers !== false
+      || payload?.includesContent !== false
+      || payload?.includesPaths !== false) {
+    return unavailable;
+  }
+  const normalizedReferences = [];
+  for (const value of references) {
+    const recordedAt = text(value?.recordedAt, "");
+    if (!hasExactKeys(value, ["reference", "recordedAt"])
+        || !DIAGNOSTIC_REFERENCE_PATTERN.test(value?.reference ?? "")
+        || !Number.isFinite(Date.parse(recordedAt))
+        || new Date(Date.parse(recordedAt)).toISOString() !== recordedAt) {
+      return unavailable;
+    }
+    normalizedReferences.push(Object.freeze({
+      reference: value.reference,
+      recordedAt,
+    }));
+  }
+  return Object.freeze({
+    status: "available",
+    journeyPhase: payload.journeyPhase,
+    previewState: payload.previewState,
+    queueState: payload.queueState,
+    consent: Object.freeze({
+      approved: payload.consent.approved,
+      current: payload.consent.current,
+    }),
+    signedIn: Object.freeze({
+      observed: payload.signedIn.observed,
+      value: payload.signedIn.value,
+    }),
+    pairing: Object.freeze({
+      observed: payload.pairing.observed,
+      paired: payload.pairing.paired,
+    }),
+    recentDiagnosticReferences: Object.freeze(normalizedReferences),
+  });
 }
 
 export function normalizeLocalContributionDeviceReset(payload) {
@@ -5318,6 +5493,78 @@ export class LocalCompanionClient {
     } catch {
       return normalizeContributionSyncStatus(null);
     }
+  }
+
+  async contributionDiagnostics() {
+    try {
+      return normalizeLocalContributionDiagnostics(
+        await fetchJson(
+          this.fetchImpl,
+          `${LOCAL_ROOT}/diagnostics/contribution`
+        )
+      );
+    } catch {
+      return normalizeLocalContributionDiagnostics(null);
+    }
+  }
+
+  async hostedSignInHandoff() {
+    try {
+      return normalizeHostedSignInHandoff(await fetchJson(
+        this.fetchImpl,
+        `${LOCAL_ROOT}/identity/hosted-signin-handoff`,
+        { headers: { "X-Usage-Monitor-Local": "1" } }
+      ));
+    } catch {
+      return normalizeHostedSignInHandoff(null);
+    }
+  }
+
+  async storeHostedSignInHandoff({ provider, state, verifier } = {}) {
+    if (!["google", "apple"].includes(provider)
+        || typeof state !== "string"
+        || !HOSTED_SIGNIN_HANDOFF_BOUND_VALUE.test(state)
+        || typeof verifier !== "string"
+        || !HOSTED_SIGNIN_HANDOFF_BOUND_VALUE.test(verifier)) {
+      throw new TypeError("Hosted sign-in handoff is invalid.");
+    }
+    const payload = await fetchJson(
+      this.fetchImpl,
+      `${LOCAL_ROOT}/identity/hosted-signin-handoff`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1"
+        },
+        body: JSON.stringify({ action: "store", provider, state, verifier })
+      }
+    );
+    const normalized = normalizeHostedSignInHandoff(payload);
+    if (normalized.status !== "pending") {
+      throw new Error("The local companion did not retain the sign-in handoff.");
+    }
+    return normalized;
+  }
+
+  async clearHostedSignInHandoff() {
+    const payload = await fetchJson(
+      this.fetchImpl,
+      `${LOCAL_ROOT}/identity/hosted-signin-handoff`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1"
+        },
+        body: JSON.stringify({ action: "clear" })
+      }
+    );
+    const normalized = normalizeHostedSignInHandoff(payload);
+    if (normalized.status !== "absent") {
+      throw new Error("The local companion did not clear the sign-in handoff.");
+    }
+    return normalized;
   }
 
   async automaticContributionStatus() {

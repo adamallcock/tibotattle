@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { applyD1Migrations, reset } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
@@ -165,10 +165,11 @@ beforeEach(async () => {
 
 afterEach(() => {
   globalThis.fetch = realFetch;
+  vi.restoreAllMocks();
 });
 
 describe("hosted Google sign-in", () => {
-  it("carries a start, a Google redirect, and a single-use result end to end", async () => {
+  it("keeps a completed result recoverable until enrollment consumes it", async () => {
     const started = await startSignIn();
     expect(started.state).toMatch(/^[A-Za-z0-9_-]{64}$/u);
     const authorize = new URL(started.authorizeUrl);
@@ -192,6 +193,8 @@ describe("hosted Google sign-in", () => {
     expect(started.authorizeUrl.includes(stored!.verifier)).toBe(false);
     expect(JSON.stringify(started).includes(CLIENT_SECRET)).toBe(false);
 
+    const infoLog = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnLog = vi.spyOn(console, "warn").mockImplementation(() => {});
     const pending = await json("/api/v1/identity/google/result", {
       state: started.state,
       verifier: started.verifier,
@@ -200,6 +203,18 @@ describe("hosted Google sign-in", () => {
     expect(await pending.json()).toMatchObject({
       error: { code: "IDENTITY_RESULT_PENDING" },
     });
+    expect(infoLog.mock.calls.some(([message]) => (
+      typeof message === "string"
+      && message.includes('"level":"info"')
+      && message.includes('"event":"request_pending"')
+      && message.includes('"code":"IDENTITY_RESULT_PENDING"')
+    ))).toBe(true);
+    expect(warnLog).not.toHaveBeenCalled();
+    expect(await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM diagnostic_error_events",
+    ).first<{ total: number }>()).toEqual({ total: 0 });
+    infoLog.mockRestore();
+    warnLog.mockRestore();
 
     const landed = await callback(new URLSearchParams({
       code: "google-one-time-code",
@@ -248,7 +263,10 @@ describe("hosted Google sign-in", () => {
       verifier: started.verifier,
     });
     expect(result.status).toBe(200);
-    const payload = await result.json();
+    const payload = await result.json<{
+      schemaVersion: string;
+      proof: string;
+    }>();
     expect(payload).toMatchObject({
       schemaVersion: "identity-google-result-v0.1",
       proof: expect.stringMatching(/^[A-Za-z0-9_-]{64}$/u),
@@ -264,14 +282,39 @@ describe("hosted Google sign-in", () => {
       expect(serialized.includes(leak), leak).toBe(false);
     }
 
-    // Single use: the winning read consumed the row, so a replay is
-    // indistinguishable from an expired handoff.
+    // Collection is idempotent. If the app quits after this response but
+    // before enrollment, the persisted state+verifier can recover the same
+    // opaque proof after relaunch.
     const replay = await json("/api/v1/identity/google/result", {
       state: started.state,
       verifier: started.verifier,
     });
-    expect(replay.status).toBe(401);
-    expect(await replay.json()).toMatchObject({
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toEqual(payload);
+
+    const identityEnv = bindings({
+      IDENTITY_LINK_SECRET: "identity-link-secret-for-tests-0123456789abcdef",
+      IDENTITY_LINK_SECRET_VERSION: "test-v1",
+    });
+    const enrolled = await json("/api/v1/enroll", {
+      consentVersion: "privacy-safe-telemetry-v0.1",
+      syntheticOnly: false,
+      identity: {
+        provider: "google",
+        proof: payload.proof,
+        verifier: started.verifier,
+      },
+    }, identityEnv);
+    expect(enrolled.status).toBe(201);
+
+    // Enrollment is the one-use sink. Once it mutates hosted identity state,
+    // the recovery handle can no longer collect the already-consumed proof.
+    const consumed = await json("/api/v1/identity/google/result", {
+      state: started.state,
+      verifier: started.verifier,
+    }, identityEnv);
+    expect(consumed.status).toBe(401);
+    expect(await consumed.json()).toMatchObject({
       error: { code: "IDENTITY_TOKEN_INVALID" },
     });
 
@@ -283,10 +326,7 @@ describe("hosted Google sign-in", () => {
       proof: string;
       deliveredAt: string | null;
     }>();
-    expect(rows.results).toHaveLength(1);
-    expect(rows.results[0]?.linkKey).toMatch(/^[0-9a-f]{64}$/u);
-    expect(rows.results[0]?.proof).toMatch(/^[A-Za-z0-9_-]{64}$/u);
-    expect(rows.results[0]?.deliveredAt).not.toBeNull();
+    expect(rows.results).toHaveLength(0);
     expect(JSON.stringify(rows.results)).not.toContain(GOOGLE_ID_TOKEN);
   });
 

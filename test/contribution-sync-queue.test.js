@@ -8,6 +8,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  rm,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -686,6 +687,84 @@ test("retryable failures honor Retry-After before adding bounded client spread",
   // 60 seconds is the service floor; the half-random client adds 7.5 seconds
   // (half of the bounded 15-second, 25% spread).
   assert.equal(result.queue.nextAttemptAt, "2026-07-26T12:01:07.500Z");
+});
+
+test("a never-prepared account previews empty instead of unavailable", async () => {
+  // Fresh-account bootstrap: the prepared spool is only created by the first
+  // successful preparation, and the page only runs that preparation when the
+  // preview reports empty. A missing spool must therefore be the empty state,
+  // never prepared_root_invalid — otherwise a brand-new account deadlocks on
+  // Check again forever (found live on a fresh macOS account, 2026-08-19).
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-sync-queue-"));
+  const privateRoot = join(root, "private");
+  await mkdir(privateRoot, { mode: 0o700 });
+  const neverCreated = join(root, "never-created-prepared-root");
+  const queueFile = join(privateRoot, "sync.sqlite3");
+  try {
+    const preview = await inspectNextContributionSyncUpload({
+      directory: neverCreated,
+      queueFile,
+      now: () => new Date("2026-07-26T12:00:00.000Z"),
+    });
+    assert.equal(preview.state, "empty");
+    assert.equal(preview.discoveredSets, 0);
+    assert.equal(preview.enqueued, 0);
+    assert.equal(preview.item, null);
+    const review = await inspectExactNextContributionSyncUpload({
+      directory: neverCreated,
+      queueFile,
+      now: () => new Date("2026-07-26T12:00:00.000Z"),
+    });
+    assert.equal(review.state, "empty");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("retry and pause survive a queue reopen without invalidating exact review", async () => {
+  const value = await fixture();
+  const now = () => new Date("2026-07-26T12:00:00.000Z");
+  const failed = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    now,
+    random: () => 0.5,
+    syncEntry: async () => {
+      throw new ContributionDeviceSyncError("service_unavailable", {
+        retryable: true,
+      });
+    },
+  });
+  assert.equal(failed.retryable, 1);
+
+  // Every queue API closes its SQLite connection before returning. These
+  // reads therefore model a companion/app restart against the same durable
+  // Application Support state rather than an in-memory continuation.
+  const retryReview = await inspectExactNextContributionSyncUpload({
+    directory: value.preparedRoot,
+    queueFile: value.queueFile,
+    now,
+  });
+  assert.equal(retryReview.state, "retry_wait");
+  assert.equal(retryReview.payload?.schemaVersion, "telemetry-contribution-v0.1");
+  assert.match(retryReview.reviewBinding?.jobId ?? "", /^[0-9a-f-]{36}$/u);
+  assert.match(retryReview.reviewBinding?.contributionSha256 ?? "", /^[0-9a-f]{64}$/u);
+
+  await setContributionSyncPaused({
+    paused: true,
+    queueFile: value.queueFile,
+    now,
+  });
+  const pausedReview = await inspectExactNextContributionSyncUpload({
+    directory: value.preparedRoot,
+    queueFile: value.queueFile,
+    now,
+  });
+  assert.equal(pausedReview.state, "paused");
+  assert.deepEqual(pausedReview.payload, retryReview.payload);
+  assert.deepEqual(pausedReview.reviewBinding, retryReview.reviewBinding);
 });
 
 test("an interruption cannot undercut a Retry-After floor", async () => {

@@ -1183,9 +1183,10 @@ async function handleIdentityAppleCallback(
 }
 
 /**
- * Reads a completed sign-in back exactly once. This releases a short-lived,
- * opaque proof only; provider credentials never leave the callback and never
- * reach D1. Enrollment atomically deletes the proof when it uses it.
+ * Reads a completed sign-in back idempotently for the same state+verifier.
+ * This releases a short-lived, opaque proof only; provider credentials never
+ * leave the callback and never reach D1. Enrollment atomically deletes the
+ * proof when it uses it, so result recovery ends at consumption or expiry.
  *
  * This route is deliberately not attempt-limited: the page polls it on a
  * fixed short schedule while the user finishes at Apple, and it discloses
@@ -1239,8 +1240,8 @@ async function handleIdentityAppleResult(
 /**
  * Starts a hosted Google sign-in, in the same shape as Apple's: the state row
  * is the whole handoff. It is created empty here with its PKCE verifier,
- * filled by Google's redirect, and read back exactly once by the page that
- * started the flow. No participant, session, or provider identifier is
+ * filled by Google's redirect, and read back by the page that started the
+ * flow until enrollment consumes it. No participant, session, or provider identifier is
  * involved at this point, and the verifier never leaves this service.
  */
 async function handleIdentityGoogleStart(
@@ -1422,8 +1423,8 @@ async function handleIdentityGoogleCallback(
 }
 
 /**
- * Reads the completed Google sign-in back exactly once, on the same opaque
- * proof terms as Apple's result route.
+ * Reads the completed Google sign-in back idempotently for the same
+ * state+verifier, on the same opaque proof terms as Apple's result route.
  *
  * This route is deliberately not attempt-limited: the page polls it on a fixed
  * short schedule while the user finishes at Google, and it discloses nothing
@@ -1457,12 +1458,11 @@ async function handleIdentityGoogleResult(
   // neither delivered nor consumed and stays collectable by the initiator.
   const delivered = await env.USAGE_MONITOR_DB.prepare(
     `UPDATE google_signin_handoffs
-        SET delivered_at = ?
+        SET delivered_at = COALESCE(delivered_at, ?)
       WHERE state = ?
         AND binding_hash = ?
         AND identity_link_key IS NOT NULL
         AND proof IS NOT NULL
-        AND delivered_at IS NULL
         AND expires_at > ?
       RETURNING proof`,
   ).bind(nowIso, state, bindingHash, nowIso).first<{ proof: string }>();
@@ -3670,6 +3670,21 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     const apiError = error instanceof ApiError
       ? error
       : new ApiError(500, "INTERNAL_ERROR");
+    if (apiError.code === "IDENTITY_RESULT_PENDING") {
+      // The desktop polls this route while the provider is still open. A 404
+      // here is flow control, not a support incident: keep one structured
+      // info event in live logs and never persist it as a diagnostic failure.
+      console.log(JSON.stringify({
+        level: "info",
+        event: "request_pending",
+        requestId,
+        method: request.method,
+        routeClass: route.routeClass,
+        code: apiError.code,
+        status: apiError.status,
+      }));
+      return noStore(errorResponse(apiError, requestId));
+    }
     const expectedContainment = [
       "COLLECTION_ENROLLMENT_DISABLED",
       "UPLOAD_REGISTRATION_DISABLED",

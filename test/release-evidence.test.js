@@ -326,9 +326,13 @@ async function assertCode(code, callback) {
 }
 
 test("existing macOS RELEASE_MANIFEST filename compatibility remains intact", () => {
+  // The compatibility surface is the filename SHAPE (brand, version slot,
+  // arch suffix); the version itself tracks RELEASE_VERSION so bumps stop
+  // breaking this pin (same derivation move as the replacement-contract
+  // fixture tags).
   assert.equal(
     RELEASE_MANIFEST.macOS.arm64DmgFileName,
-    "TiboTattle-0.1.12-macOS-arm64.dmg",
+    `TiboTattle-${RELEASE_MANIFEST.version}-macOS-arm64.dmg`,
   );
 });
 

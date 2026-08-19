@@ -145,7 +145,7 @@
 "dialog.manageLocalDataDescription" = "El estado local de la app, las capacidades locales del Llavero y los datos alojados son independientes. Elige la capa exacta que quieres gestionar.";
 "dialog.moveDataToTrash" = "Mover datos a la Papelera";
 "dialog.moveLocalDataToTrash" = "¿Mover todos los datos locales de %@ a la Papelera?";
-"dialog.moveLocalDataToTrashDescription" = "Estado de la app: los índices locales, el análisis en caché, las contribuciones preparadas, la configuración personalizada de Codex y el estado de vinculación local del dispositivo se mueven a la Papelera.\n\nLlavero: la identidad seudónima y las credenciales del dispositivo permanecen.\n\nServicio alojado: los datos comunitarios enviados y los dispositivos registrados permanecen. Los registros de Codex nunca se modifican.";
+"dialog.moveLocalDataToTrashDescription" = "Estado de la app: se borran los índices locales, el análisis en caché, las contribuciones preparadas, la configuración personalizada de Codex, la vinculación local del dispositivo y el estado de inicio de sesión y sesión de TiboTattle. Los archivos se mueven a la Papelera.\n\nLlavero: la identidad seudónima y las credenciales del dispositivo permanecen.\n\nServicio alojado: los datos comunitarios enviados y los dispositivos registrados permanecen. Los registros de Codex nunca se modifican.";
 "dialog.resetCapabilities" = "¿Restablecer ahora exactamente dos capacidades locales del Llavero?";
 "dialog.resetCapabilitiesDescription" = "%@ detendrá su acompañante en primer plano, eliminará del Llavero su identidad de exportación y credencial de dispositivo emparejado, eliminará solo sus dos archivos de residuo locales y luego se reiniciará.\n\nLos datos preparados o alojados existentes no se reescribirán ni eliminarán. La actividad de contribución futura usará una identidad nueva y requerirá emparejar el dispositivo de nuevo.";
 "dialog.resetFinishing" = "El restablecimiento de identidad local está terminando";
@@ -190,7 +190,7 @@
 "launcher.errorKeychainReset" = "El restablecimiento de identidad y dispositivo locales no terminó.";
 "launcher.errorKeychainResetPartial" = "El restablecimiento de identidad y dispositivo locales terminó solo parcialmente.";
 "launcher.recoveryCheckAccess" = "Comprueba el acceso a tus carpetas de inicio y Application Support, y vuelve a intentarlo.";
-"launcher.recoveryChooseCodexHome" = "Elige Origen de Codex y selecciona una carpeta de inicio de Codex legible, o restaura el valor predeterminado.";
+"launcher.recoveryChooseCodexHome" = "Elige Origen de Codex y selecciona una carpeta de inicio de Codex legible que pertenezca a tu cuenta de usuario de macOS, o restaura el valor predeterminado.";
 "launcher.recoveryDashboardDownload" = "Comprueba el acceso a tu carpeta Descargas y vuelve a guardar el archivo.";
 "launcher.recoveryDashboardWebView" = "Elige Abrir panel para intentarlo de nuevo, o Abrir en el navegador para usar el mismo panel local en tu navegador.";
 "launcher.recoveryDataErase" = "Cierra otros procesos que usen datos de %@ y vuelve a intentar el borrado.";
@@ -204,7 +204,7 @@
 "nativeDashboard.currentEvidenceTooltip" = "El estado actual de la evidencia local.";
 "menuBar.analysisRequestRejected" = "El acompañante local no pudo aceptar una solicitud de análisis.";
 "menuBar.failureRecovery" = "No está en ejecución: %@. Abre la ventana para ver el paso de recuperación.";
-"settings.codexFolderCustomSelected" = "Carpeta personalizada seleccionada";
+"settings.codexFolderCustomSelectedPath" = "Carpeta personalizada: %@";
 "settings.codexFolderDefaultLocation" = "Ubicación predeterminada (~/.codex)";
 "settings.updateDisclosureAutomaticOff" = "Las actualizaciones de la app firmada están disponibles en Acerca de → Buscar actualizaciones. Las descargas automáticas están desactivadas; puedes activarlas en Configuración → Acerca de cuando estén disponibles.";
 "settings.updateDisclosureAutomaticOn" = "Las actualizaciones de la app firmada se comprueban automáticamente. De forma predeterminada, una actualización verificada se descarga en segundo plano y se instala al salir; puedes desactivarlo en Configuración → Acerca de.";

@@ -648,11 +648,63 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     /TiboTattleLocalization\.string\(\.dialogCopyDiagnostics\)/u,
   );
   assert.match(source, /usage-monitor-macos-diagnostics-v1/u);
+  assert.match(
+    menuBarStatusSource,
+    /path: "\/api\/local\/diagnostics\/contribution"/u,
+  );
+  assert.match(
+    menuBarStatusSource,
+    /local-contribution-diagnostics-v0\.1/u,
+  );
+  assert.match(source, /func readContributionDiagnostics\(/u);
+  assert.match(source, /private struct ContributionDiagnosticsSnapshot/u);
+  assert.match(source, /contribution_tokens_included: false/u);
+  assert.match(source, /contribution_oauth_state_included: false/u);
+  assert.match(source, /contribution_device_identifiers_included: false/u);
+  assert.match(source, /contribution_content_included: false/u);
   assert.match(source, /UM_MACOS_COMPANION_START_TIMEOUT/u);
   assert.match(source, /companionStartupTimeoutSeconds/u);
   assert.match(source, /NSOpenPanel/u);
   assert.match(source, /launcher-settings-v1\.json/u);
   assert.match(source, /settingsCodexFolderDefaultLocation/u);
+  // A rejected Codex-home selection must answer as an alert at the
+  // frontmost Settings window: the main window's failure surface sits
+  // behind it, and the companion keeps running with the previous folder.
+  const codexHomeSelectionSource = source.slice(
+    source.indexOf("private func presentCodexHomeSelectionRejection"),
+    source.indexOf("private func restartCompanionAfterCodexHomeChange"),
+  );
+  assert.match(codexHomeSelectionSource, /NSOpenPanel\(\)/u);
+  assert.match(codexHomeSelectionSource, /launcherErrorInvalidCodexHome/u);
+  assert.match(
+    codexHomeSelectionSource,
+    /let alert = NSAlert\(\)[\s\S]*?\.launcherFailureDetails[\s\S]*?launcherError\.failureCode,\s*launcherError\.recoverySuggestion/u,
+  );
+  assert.match(
+    codexHomeSelectionSource,
+    /beginSheetModal\(for: settingsWindow\)/u,
+  );
+  assert.match(codexHomeSelectionSource, /alert\.runModal\(\)/u);
+  assert.match(
+    codexHomeSelectionSource,
+    /catch \{\s*presentCodexHomeSelectionRejection\(error\)\s*\}/u,
+  );
+  assert.doesNotMatch(codexHomeSelectionSource, /showFailure/u);
+  // The Settings summary names the selected folder, tilde-abbreviated;
+  // Data & Diagnostics keeps paths_included: false and never renders it.
+  assert.match(
+    source,
+    /\.settingsCodexFolderCustomSelectedPath,\s*\(configuration\.url\.path as NSString\)\.abbreviatingWithTildeInPath/u,
+  );
+  const lifecycleDiagnosticsSource = source.slice(
+    source.indexOf("private struct LifecycleDiagnostics"),
+    source.indexOf("private func regularFile"),
+  );
+  assert.match(lifecycleDiagnosticsSource, /codexHomeMode: CodexHomeMode/u);
+  assert.doesNotMatch(
+    lifecycleDiagnosticsSource,
+    /abbreviatingWithTildeInPath|url\.path/u,
+  );
   assert.match(
     source,
     /title: TiboTattleLocalization\.format\([\s\S]*?\.settingsAboutProduct[\s\S]*?BundledProduct\.displayName/u,
@@ -881,7 +933,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /let group = NSBox\(\)/u);
   const settingsSource = source.slice(
     source.indexOf("private func showSettings(selecting index: Int)"),
-    source.indexOf("    private func diagnosticText()"),
+    source.indexOf("    private func diagnosticText("),
   );
   assert.ok(settingsSource, "settings construction source should be present");
   const generalSettings = settingsSource.match(
@@ -1264,9 +1316,18 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
     /private func isCompanionURL\(_ url: URL\) -> Bool \{[\s\S]*?url\.scheme\?\.lowercased\(\) == "http"[\s\S]*?url\.host == loopbackHost[\s\S]*?url\.port == allowedPort[\s\S]*?url\.user == nil[\s\S]*?url\.password == nil/u,
   );
   // Persistent by owner decision (sign-in-once durability, part 3): a valid
-  // web session and an in-flight sign-in handoff survive an app relaunch. The
-  // durable upload authority is the Keychain device credential regardless.
+  // web session survives an app relaunch. The in-flight handoff lives in the
+  // owner-only companion state root instead, while durable upload authority
+  // remains the Keychain device credential.
   assert.match(source, /configuration\.websiteDataStore = \.default\(\)/u);
+  assert.match(
+    source,
+    /static func clearPersistentWebsiteData[\s\S]*WKWebsiteDataStore\.allWebsiteDataTypes\(\)[\s\S]*modifiedSince: \.distantPast/u,
+  );
+  assert.match(
+    source,
+    /private func eraseLocalData\(\)[\s\S]*dashboardWebHost\?\.stop\(\)[\s\S]*trashItem[\s\S]*clearPersistentWebsiteData[\s\S]*startCompanion\(\)/u,
+  );
   assert.match(source, /WKUserScript\([\s\S]*injectionTime: \.atDocumentStart/u);
   assert.match(source, /document\.documentElement\.classList\.add\('native-dashboard'\)/u);
   assert.match(
@@ -1993,7 +2054,11 @@ test("targeted local Keychain reset removes only exact local capabilities and re
     join(await realpath(tmpdir()), "usage-monitor-keychain-reset-test-"),
   );
   const stateRoot = join(temporaryRoot, "state");
-  const retained = join(stateRoot, "retained-cache.json");
+  const retained = join(
+    stateRoot,
+    "private",
+    "contribution-sync-v0.1.sqlite3",
+  );
   const deviceState = join(
     stateRoot,
     "contribution-device-binding-v1.json",
@@ -2041,6 +2106,7 @@ test("targeted local Keychain reset removes only exact local capabilities and re
   };
   try {
     await mkdir(stateRoot, { mode: 0o700 });
+    await mkdir(join(stateRoot, "private"), { mode: 0o700 });
     await writeFile(deviceState, "{}\n", { mode: 0o600 });
     await writeFile(exportResidue, `${"A".repeat(43)}\n`, {
       mode: 0o600,
@@ -3211,7 +3277,10 @@ test("signed updater replacement contract validates upgrade and rollback artifac
         ...previousManifest,
         source: {
           repository: "https://github.com/adamallcock/tibotattle",
-          tag: "v0.1.12",
+          // The fixture manifests stamp shortVersion from the live
+          // RELEASE_VERSION, so the matching tag must derive from it too or
+          // every version bump breaks this pair for a hardcoded reason.
+          tag: `v${RELEASE_VERSION}`,
           commit: "a".repeat(40),
         },
       },
@@ -3237,7 +3306,7 @@ test("signed updater replacement contract validates upgrade and rollback artifac
           ...previousManifest,
           source: {
             repository: "https://github.com/private/tibotattle",
-            tag: "v0.1.12",
+            tag: `v${RELEASE_VERSION}`,
             commit: "b".repeat(40),
           },
         },
@@ -5689,6 +5758,39 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.match(diagnostics.stdout, /^paths_included: false$/mu);
     assert.match(diagnostics.stdout, /^identifiers_included: false$/mu);
     assert.match(diagnostics.stdout, /^content_included: false$/mu);
+    assert.match(
+      diagnostics.stdout,
+      /^contribution_journey_phase: approved_connection_needed$/mu,
+    );
+    assert.match(
+      diagnostics.stdout,
+      /^contribution_preview_state: not_observed$/mu,
+    );
+    assert.match(
+      diagnostics.stdout,
+      /^contribution_queue_state: retry_wait$/mu,
+    );
+    assert.match(
+      diagnostics.stdout,
+      /^contribution_tokens_included: false$/mu,
+    );
+    assert.match(
+      diagnostics.stdout,
+      /^contribution_oauth_state_included: false$/mu,
+    );
+    assert.match(
+      diagnostics.stdout,
+      /^contribution_device_identifiers_included: false$/mu,
+    );
+    assert.match(
+      diagnostics.stdout,
+      /^contribution_content_included: false$/mu,
+    );
+    assert.match(
+      diagnostics.stdout,
+      /^contribution_diagnostic_reference_1: TT-7QF3K2 @ 2026-08-19T13:01:00\.000Z$/mu,
+    );
+    assert.equal(diagnostics.stdout.includes("MUST_NOT_APPEAR"), false);
     assert.equal(diagnostics.stdout.includes("/Users/"), false);
 
     const settingsHome = join(temporaryRoot, "settings-home");
@@ -5780,6 +5882,41 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       repairedSettings.stderr || repairedSettings.stdout,
     );
     assert.equal((await stat(settingsFile)).mode & 0o777, 0o600);
+
+    // The ownership predicate itself: a root-owned directory passes every
+    // other validation step (canonical path, directory, world-readable), so
+    // this refusal proves the st_uid == getuid() branch fires — the same
+    // rejection the Settings-window alert reports for a dogfood pick.
+    if (typeof process.getuid === "function" && process.getuid() !== 0) {
+      const refusedForeignOwner = spawnSync(launcher, [
+        "--codex-home-settings-smoke-test",
+        "/usr/bin",
+      ], {
+        cwd: temporaryRoot,
+        encoding: "utf8",
+        timeout: 5_000,
+        env: {
+          HOME: settingsHome,
+          LANG: "en_US.UTF-8",
+          PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+          TMPDIR: tmpdir(),
+        },
+      });
+      assert.equal(refusedForeignOwner.status, 1);
+      assert.equal(
+        refusedForeignOwner.stderr,
+        "macOS Codex home settings smoke failed\n",
+      );
+      // A refused pick leaves the previously saved custom folder untouched;
+      // the visible Settings summary re-reads exactly this file.
+      assert.deepEqual(
+        JSON.parse(await readFile(settingsFile, "utf8")),
+        {
+          codexHome: customCodexHome,
+          schemaVersion: "usage-monitor-launcher-settings-v1",
+        },
+      );
+    }
 
     const firstRunHome = join(temporaryRoot, "first-run-home");
     await mkdir(firstRunHome, { mode: 0o700 });

@@ -140,8 +140,9 @@ toolbar or usage accounting.
 
 The troubleshooting-only local erase action moves only
 `~/Library/Application Support/Usage Monitor` to Trash after the companion has
-stopped. It does not modify Codex logs, revoke already-sent community data, or
-remove a pseudonymous identity stored in Keychain.
+stopped, and clears the app's persistent WebKit cookies, caches, and bounded
+sign-in recovery state. It does not modify Codex logs, revoke already-sent
+community data, or remove a pseudonymous identity stored in Keychain.
 
 The separate **Identity & Device Reset…** diagnostic action remains available
 for support cases. It has two native confirmation steps and targets exactly two

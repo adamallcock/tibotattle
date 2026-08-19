@@ -211,7 +211,7 @@
 "dialog.manageLocalDataDescription" = "Local app state, local Keychain capabilities, and hosted data are separate. Choose the exact layer you intend to manage.";
 "dialog.moveDataToTrash" = "Move Data to Trash";
 "dialog.moveLocalDataToTrash" = "Move all local %@ data to Trash?";
-"dialog.moveLocalDataToTrashDescription" = "App state: local indexes, cached analysis, prepared contributions, custom Codex settings, and local device-binding state move to Trash.\n\nKeychain: pseudonymous identity and device credentials remain.\n\nHosted service: sent community data and registered devices remain. Codex logs are never changed.";
+"dialog.moveLocalDataToTrashDescription" = "App state: local indexes, cached analysis, prepared contributions, custom Codex settings, local device-binding state, and TiboTattle sign-in/session state are cleared. Files move to Trash.\n\nKeychain: pseudonymous identity and device credentials remain.\n\nHosted service: sent community data and registered devices remain. Codex logs are never changed.";
 "dialog.resetCapabilities" = "Reset exactly two local Keychain capabilities now?";
 "dialog.resetCapabilitiesDescription" = "%@ will stop its foreground companion, remove its export identity and paired-device credential from Keychain, remove only their two local residue files, and then restart.\n\nExisting prepared or hosted data will not be rewritten or deleted. Future contribution activity will use a new identity and require device pairing again.";
 "dialog.resetFinishing" = "Local identity reset is finishing";
@@ -256,7 +256,7 @@
 "launcher.errorKeychainReset" = "The local identity and device reset did not finish.";
 "launcher.errorKeychainResetPartial" = "The local identity and device reset finished only partially.";
 "launcher.recoveryCheckAccess" = "Check access to your home and Application Support folders, then retry.";
-"launcher.recoveryChooseCodexHome" = "Choose Codex Source and select a readable Codex home, or restore the default.";
+"launcher.recoveryChooseCodexHome" = "Choose Codex Source and select a readable Codex home owned by your macOS user account, or restore the default.";
 "launcher.recoveryDashboardDownload" = "Check access to your Downloads folder, then save the file again.";
 "launcher.recoveryDashboardWebView" = "Choose Open Dashboard to try again, or Open in Browser to use the same local dashboard in your browser.";
 "launcher.recoveryDataErase" = "Quit other processes using %@ data, then try the erase again.";
@@ -270,7 +270,7 @@
 "nativeDashboard.currentEvidenceTooltip" = "The current local evidence state.";
 "menuBar.analysisRequestRejected" = "The local companion could not accept an analysis request.";
 "menuBar.failureRecovery" = "Not running: %@. Open the window for the recovery step.";
-"settings.codexFolderCustomSelected" = "Custom folder selected";
+"settings.codexFolderCustomSelectedPath" = "Custom folder: %@";
 "settings.codexFolderDefaultLocation" = "Default location (~/.codex)";
 "settings.updateDisclosureAutomaticOff" = "Signed app updates are available from About → Check for Updates. Automatic downloads are currently off; you can turn them on in Settings → About when available.";
 "settings.updateDisclosureAutomaticOn" = "Signed app updates are checked automatically. By default, a verified update downloads in the background and installs when you quit; you can turn that off in Settings → About.";

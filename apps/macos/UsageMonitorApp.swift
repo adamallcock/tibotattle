@@ -1,4 +1,5 @@
 import AppKit
+import CoreFoundation
 import Darwin
 import Foundation
 import WebKit
@@ -1015,6 +1016,159 @@ private struct FirstRunReceipt: Codable {
     let acknowledged: Bool
 }
 
+private struct DashboardContributionDiagnostics {
+    let journeyPhase: String
+    let previewState: String
+    let consentApproved: Bool
+    let consentCurrent: Bool
+    let signedInObserved: Bool
+    let signedIn: Bool
+    let pairingObserved: Bool
+    let paired: Bool
+
+    private static let phases: Set<String> = [
+        "not_configured", "unavailable", "sign_in_required",
+        "preparing_review", "review_ready", "connecting",
+        "approved_connection_needed", "approved_paused",
+        "approved_syncing", "approved_idle",
+    ]
+    private static let previewStates: Set<String> = [
+        "not_observed", "unavailable", "empty", "ready", "retry_wait",
+        "paused",
+    ]
+
+    private static func exactBoolean(_ value: Any?) -> Bool? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) == CFBooleanGetTypeID()
+        else {
+            return nil
+        }
+        return number.boolValue
+    }
+
+    private static func hasExactKeys(
+        _ value: [String: Any],
+        _ keys: Set<String>
+    ) -> Bool {
+        Set(value.keys) == keys
+    }
+
+    static func decode(_ value: Any?) -> DashboardContributionDiagnostics? {
+        guard let root = value as? [String: Any],
+              hasExactKeys(root, [
+                "journeyPhase", "previewState", "consent", "signedIn",
+                "pairing",
+              ]),
+              let journeyPhase = root["journeyPhase"] as? String,
+              phases.contains(journeyPhase),
+              let previewState = root["previewState"] as? String,
+              previewStates.contains(previewState),
+              let consent = root["consent"] as? [String: Any],
+              hasExactKeys(consent, ["approved", "current"]),
+              let consentApproved = exactBoolean(consent["approved"]),
+              let consentCurrent = exactBoolean(consent["current"]),
+              let signedInValue = root["signedIn"] as? [String: Any],
+              hasExactKeys(signedInValue, ["observed", "value"]),
+              let signedInObserved = exactBoolean(signedInValue["observed"]),
+              let signedIn = exactBoolean(signedInValue["value"]),
+              let pairing = root["pairing"] as? [String: Any],
+              hasExactKeys(pairing, ["observed", "paired"]),
+              let pairingObserved = exactBoolean(pairing["observed"]),
+              let paired = exactBoolean(pairing["paired"])
+        else {
+            return nil
+        }
+        return DashboardContributionDiagnostics(
+            journeyPhase: journeyPhase,
+            previewState: previewState,
+            consentApproved: consentApproved,
+            consentCurrent: consentCurrent,
+            signedInObserved: signedInObserved,
+            signedIn: signedIn,
+            pairingObserved: pairingObserved,
+            paired: paired
+        )
+    }
+}
+
+private struct ContributionDiagnosticsSnapshot {
+    let journeyPhase: String
+    let previewState: String
+    let queueState: String
+    let consentApproved: Bool
+    let consentCurrent: Bool
+    let signedInObserved: Bool
+    let signedIn: Bool
+    let pairingObserved: Bool
+    let paired: Bool
+    let references: [LocalContributionDiagnosticReference]
+
+    static func merge(
+        local: LocalContributionDiagnostics?,
+        dashboard: DashboardContributionDiagnostics?
+    ) -> ContributionDiagnosticsSnapshot {
+        ContributionDiagnosticsSnapshot(
+            journeyPhase: dashboard?.journeyPhase
+                ?? local?.journeyPhase
+                ?? "unavailable",
+            previewState: dashboard?.previewState
+                ?? local?.previewState
+                ?? "not_observed",
+            queueState: local?.queueState ?? "unavailable",
+            consentApproved: local?.consentApproved
+                ?? dashboard?.consentApproved
+                ?? false,
+            consentCurrent: local?.consentCurrent
+                ?? dashboard?.consentCurrent
+                ?? false,
+            signedInObserved: dashboard?.signedInObserved
+                ?? local?.signedInObserved
+                ?? false,
+            signedIn: dashboard?.signedIn
+                ?? local?.signedIn
+                ?? false,
+            pairingObserved: local?.pairingObserved
+                ?? dashboard?.pairingObserved
+                ?? false,
+            paired: local?.pairingObserved == true
+                ? local?.paired == true
+                : dashboard?.paired ?? local?.paired ?? false,
+            references: local?.recentDiagnosticReferences ?? []
+        )
+    }
+
+    var lines: [String] {
+        var output = [
+            "contribution_diagnostics_schema: tibotattle-contribution-diagnostics-v1",
+            "contribution_journey_phase: \(journeyPhase)",
+            "contribution_preview_state: \(previewState)",
+            "contribution_queue_state: \(queueState)",
+            "contribution_consent_approved: \(consentApproved)",
+            "contribution_consent_current: \(consentCurrent)",
+            "contribution_signed_in_observed: \(signedInObserved)",
+            "contribution_signed_in: \(signedIn)",
+            "contribution_pairing_observed: \(pairingObserved)",
+            "contribution_paired: \(paired)",
+        ]
+        for (index, reference) in references.prefix(5).enumerated() {
+            output.append(
+                "contribution_diagnostic_reference_\(index + 1): "
+                    + "\(reference.reference) @ \(reference.recordedAt)"
+            )
+        }
+        output.append(contentsOf: [
+            "contribution_tokens_included: false",
+            "contribution_oauth_state_included: false",
+            "contribution_verifiers_included: false",
+            "contribution_device_identifiers_included: false",
+            "contribution_account_identifiers_included: false",
+            "contribution_paths_included: false",
+            "contribution_content_included: false",
+        ])
+        return output
+    }
+}
+
 private struct LifecycleDiagnostics {
     static func render(
         version: String,
@@ -1027,9 +1181,10 @@ private struct LifecycleDiagnostics {
         codexHomeValidated: Bool,
         appStateAvailable: Bool,
         loginItemStatus: LoginItemStatus,
-        loginItemLastOperation: LoginItemDiagnosticAction
+        loginItemLastOperation: LoginItemDiagnosticAction,
+        contribution: ContributionDiagnosticsSnapshot
     ) -> String {
-        [
+        ([
             "\(BundledProduct.displayName) diagnostics",
             "schema: usage-monitor-macos-diagnostics-v1",
             "app_version: \(version)",
@@ -1046,10 +1201,11 @@ private struct LifecycleDiagnostics {
             "login_item_service: main_app_only",
             "process_lifecycle: foreground_only",
             "automatic_upload: off",
+        ] + contribution.lines + [
             "paths_included: false",
             "identifiers_included: false",
             "content_included: false",
-        ].joined(separator: "\n")
+        ]).joined(separator: "\n")
     }
 }
 
@@ -1895,6 +2051,23 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         webView.loadHTMLString("", baseURL: nil)
     }
 
+    /// Completes the native "all local data" reset by removing this app's
+    /// persistent WebKit state. The embedded view only admits the loopback
+    /// companion; provider pages always open in the system browser, so this
+    /// store contains only TiboTattle cookies and caches rather than
+    /// browser-wide data. The bounded OAuth recovery handle lives under the
+    /// owner-only app state root and is removed when that root is trashed.
+    static func clearPersistentWebsiteData(
+        completion: @escaping () -> Void
+    ) {
+        WKWebsiteDataStore.default().removeData(
+            ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
+            modifiedSince: .distantPast
+        ) {
+            DispatchQueue.main.async(execute: completion)
+        }
+    }
+
     /// The fixed app URL never carries provider data. It is only a wake-up
     /// signal from the browser callback, so the already-loaded local document
     /// can collect the opaque result without being reloaded and losing its
@@ -1923,9 +2096,34 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         )
     }
 
+    /// Reads only the dashboard's fixed-vocabulary contribution support
+    /// snapshot. The JavaScript function itself is allowlisted in app.js and
+    /// this decoder independently rejects every non-boolean or open-text
+    /// value, so no OAuth material, identifier, path, or content can enter the
+    /// native diagnostics receipt through this bridge.
+    func readContributionDiagnostics(
+        completion: @escaping (DashboardContributionDiagnostics?) -> Void
+    ) {
+        guard hasDashboardTarget else {
+            completion(nil)
+            return
+        }
+        webView.evaluateJavaScript("""
+        (() => {
+          const read = window.__tibotattleContributionDiagnostics;
+          return typeof read === 'function' ? read() : null;
+        })();
+        """) { value, error in
+            let diagnostics = error == nil
+                ? DashboardContributionDiagnostics.decode(value)
+                : nil
+            DispatchQueue.main.async { completion(diagnostics) }
+        }
+    }
+
     /// Change the copy in the existing loopback document without reloading it.
-    /// In particular, this must not disturb the in-memory hosted-sign-in
-    /// handoff that is signalled separately above.
+    /// In particular, this must not disturb an active hosted-sign-in attempt;
+    /// its restart recovery handle is stored separately by the companion.
     func notifyLanguagePreferenceChange(
         _ preference: TiboTattleLocalization.LanguagePreference
     ) {
@@ -1942,7 +2140,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         // locale-change event. A deferred resize lets charts, popovers, and
         // other width-sensitive controls measure their translated labels
         // after that redraw has committed, without reloading the document or
-        // losing its in-memory hosted-sign-in handoff.
+        // interrupting the active hosted-sign-in attempt.
         window.requestAnimationFrame?.(() => {
           window.dispatchEvent(new Event('resize'));
         });
@@ -4477,13 +4675,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private func hideDashboardWebView() {
         // Refuse to tear the web view down while a hosted sign-in is in flight
         // (owner-reported, 2026-08-10). stop() below wipes the live page; the
-        // web store is now persistent (sign-in-once durability, part 3), so a
-        // pending handoff and a valid session survive a relaunch, but tearing
-        // the live page down mid-flow would still discard the in-memory
-        // continuation the page is driving. The page clears this flag the
-        // moment the sign-in settles, cancels, or times out, and a fresh
-        // navigation clears it too, so this can only defer teardown for the
-        // brief window it protects.
+        // owner-only companion state preserves the pending handoff across a
+        // relaunch, and persistent WebKit state preserves a valid session.
+        // Tearing the live page down mid-flow would still discard the active
+        // in-memory continuation the page is driving. The page clears this
+        // flag the moment the sign-in settles, cancels, or times out, and a
+        // fresh navigation clears it too, so this can only defer teardown for
+        // the brief window it protects.
         if dashboardWebHost?.hostedSignInInFlight == true {
             return
         }
@@ -4802,9 +5000,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func codexHomeSettingsSummary() -> String {
-        codexHomeConfiguration?.mode == .custom
-            ? TiboTattleLocalization.string(.settingsCodexFolderCustomSelected)
-            : TiboTattleLocalization.string(.settingsCodexFolderDefaultLocation)
+        guard let configuration = codexHomeConfiguration,
+              configuration.mode == .custom
+        else {
+            return TiboTattleLocalization.string(
+                .settingsCodexFolderDefaultLocation
+            )
+        }
+        // The Settings label may name the folder; Data & Diagnostics keeps
+        // its paths_included: false promise and never carries this value.
+        return TiboTattleLocalization.format(
+            .settingsCodexFolderCustomSelectedPath,
+            (configuration.url.path as NSString).abbreviatingWithTildeInPath
+        )
     }
 
     private func updateSettingsCodexHomeSummary() {
@@ -5846,7 +6054,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         updateStartAtLoginSettingsControl()
     }
 
-    private func diagnosticText() -> String {
+    private func diagnosticText(
+        contribution: ContributionDiagnosticsSnapshot
+    ) -> String {
         let version =
             Bundle.main.object(
                 forInfoDictionaryKey: "CFBundleShortVersionString"
@@ -5876,12 +6086,45 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             codexHomeValidated: codexValidated,
             appStateAvailable: appStateAvailable,
             loginItemStatus: observeLoginItemStatus(),
-            loginItemLastOperation: lastLoginItemDiagnosticAction
+            loginItemLastOperation: lastLoginItemDiagnosticAction,
+            contribution: contribution
         )
     }
 
     @objc private func showDiagnostics() {
-        let diagnostics = diagnosticText()
+        var localDiagnostics: LocalContributionDiagnostics?
+        var dashboardDiagnostics: DashboardContributionDiagnostics?
+        let reads = DispatchGroup()
+        if let dashboardURL {
+            reads.enter()
+            nativeEvidenceReader.readContributionDiagnostics(
+                base: dashboardURL
+            ) { value in
+                localDiagnostics = value
+                reads.leave()
+            }
+        }
+        if let dashboardWebHost {
+            reads.enter()
+            dashboardWebHost.readContributionDiagnostics { value in
+                dashboardDiagnostics = value
+                reads.leave()
+            }
+        }
+        reads.notify(queue: .main) { [weak self] in
+            guard let self else { return }
+            self.presentDiagnostics(
+                self.diagnosticText(
+                    contribution: .merge(
+                        local: localDiagnostics,
+                        dashboard: dashboardDiagnostics
+                    )
+                )
+            )
+        }
+    }
+
+    private func presentDiagnostics(_ diagnostics: String) {
         let alert = NSAlert()
         alert.messageText = TiboTattleLocalization.format(
             .dialogDataAndDiagnostics,
@@ -5999,6 +6242,32 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         }
     }
 
+    // A rejected folder change alters nothing: the companion keeps running
+    // with the previous configuration, so the main window's failure surface
+    // would be both invisible behind the frontmost Settings window and
+    // dishonest about the lifecycle. The rejection answers as an alert where
+    // the user is looking instead.
+    private func presentCodexHomeSelectionRejection(_ error: Error) {
+        let launcherError = error as? LauncherError
+            ?? LauncherError.invalidCodexHome
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = TiboTattleLocalization.string(.settingsCodexFolder)
+        alert.informativeText = TiboTattleLocalization.format(
+            .launcherFailureDetails,
+            launcherError.errorDescription
+                ?? TiboTattleLocalization.string(.launcherErrorInvalidCodexHome),
+            launcherError.failureCode,
+            launcherError.recoverySuggestion
+        )
+        alert.addButton(withTitle: TiboTattleLocalization.string(.commonOK))
+        if let settingsWindow, settingsWindow.isVisible {
+            alert.beginSheetModal(for: settingsWindow)
+        } else {
+            alert.runModal()
+        }
+    }
+
     private func chooseCustomCodexHome() {
         let panel = NSOpenPanel()
         panel.title = TiboTattleLocalization.string(.dialogChooseCodexHomeFolder)
@@ -6026,7 +6295,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             retryAllowed = true
             restartCompanionAfterCodexHomeChange()
         } catch {
-            showFailure(error)
+            presentCodexHomeSelectionRejection(error)
         }
     }
 
@@ -6039,7 +6308,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             retryAllowed = true
             restartCompanionAfterCodexHomeChange()
         } catch {
-            showFailure(error)
+            presentCodexHomeSelectionRejection(error)
         }
     }
 
@@ -6262,7 +6531,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         )
         openButton.isEnabled = false
         retryButton.isEnabled = false
-        // This status has to be readable, so the embedded dashboard yields.
+        // This explicit destructive reset is also the cancellation boundary
+        // for any in-flight hosted sign-in. Stop first so the normal teardown
+        // protection cannot preserve a page whose owner-only recovery file
+        // and web data are about to be cleared, then reveal the native
+        // progress state.
+        dashboardWebHost?.stop()
         hideDashboardWebView()
         launchGeneration += 1
         let previous = companion
@@ -6276,27 +6550,29 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                         resultingItemURL: nil
                     )
                     DispatchQueue.main.async {
-                        guard let self, !self.quitting else { return }
-                        do {
-                            self.codexHomeConfiguration =
-                                CodexHomeConfiguration(
-                                    mode: .defaultLocation,
-                                    url: try defaultCodexHome()
+                        DashboardWebHost.clearPersistentWebsiteData {
+                            guard let self, !self.quitting else { return }
+                            do {
+                                self.codexHomeConfiguration =
+                                    CodexHomeConfiguration(
+                                        mode: .defaultLocation,
+                                        url: try defaultCodexHome()
+                                    )
+                            } catch {
+                                self.showFailure(error)
+                                return
+                            }
+                            self.lastLifecycleStatus = "Local data erased"
+                            self.statusLabel.stringValue =
+                                TiboTattleLocalization.string(
+                                    .launcherLocalDataMovedToTrash
                                 )
-                        } catch {
-                            self.showFailure(error)
-                            return
+                            self.detailLabel.stringValue =
+                                TiboTattleLocalization.string(
+                                    .launcherLocalDataMovedToTrashDetail
+                                )
+                            self.startCompanion()
                         }
-                        self.lastLifecycleStatus = "Local data erased"
-                        self.statusLabel.stringValue =
-                            TiboTattleLocalization.string(
-                                .launcherLocalDataMovedToTrash
-                            )
-                        self.detailLabel.stringValue =
-                            TiboTattleLocalization.string(
-                                .launcherLocalDataMovedToTrashDetail
-                            )
-                        self.startCompanion()
                     }
                 } catch {
                     DispatchQueue.main.async {
@@ -6705,6 +6981,43 @@ private enum WatchdogSmokeTest {
 
 private enum LifecycleContractSmokeTest {
     static func diagnostics() -> Int32 {
+        let contributionPayload = Data(#"""
+        {
+          "schemaVersion": "local-contribution-diagnostics-v0.1",
+          "journeyPhase": "approved_connection_needed",
+          "previewState": "not_observed",
+          "queueState": "retry_wait",
+          "consent": {"approved": true, "current": true},
+          "signedIn": {"observed": false, "value": false},
+          "pairing": {"observed": true, "paired": false},
+          "recentDiagnosticReferences": [
+            {"reference": "TT-7QF3K2", "recordedAt": "2026-08-19T13:01:00.000Z"}
+          ],
+          "includesTokens": false,
+          "includesOauthState": false,
+          "includesVerifiers": false,
+          "includesDeviceIdentifiers": false,
+          "includesAccountIdentifiers": false,
+          "includesContent": false,
+          "includesPaths": false
+        }
+        """#.utf8)
+        guard let localContribution = LocalContributionDiagnostics.decode(
+            contributionPayload
+        ) else {
+            return 1
+        }
+        guard var unsafeObject = try? JSONSerialization.jsonObject(
+            with: contributionPayload
+        ) as? [String: Any] else {
+            return 1
+        }
+        unsafeObject["token"] = "MUST_NOT_APPEAR"
+        guard let unsafePayload = try? JSONSerialization.data(
+            withJSONObject: unsafeObject
+        ), LocalContributionDiagnostics.decode(unsafePayload) == nil else {
+            return 1
+        }
         let rendered = LifecycleDiagnostics.render(
             version: Bundle.main.object(
                 forInfoDictionaryKey: "CFBundleShortVersionString"
@@ -6718,8 +7031,17 @@ private enum LifecycleContractSmokeTest {
             codexHomeValidated: true,
             appStateAvailable: true,
             loginItemStatus: .requiresApproval,
-            loginItemLastOperation: .registerRequiresApproval
+            loginItemLastOperation: .registerRequiresApproval,
+            contribution: .merge(
+                local: localContribution,
+                dashboard: nil
+            )
         )
+        guard rendered.contains("TT-7QF3K2"),
+              !rendered.contains("MUST_NOT_APPEAR")
+        else {
+            return 1
+        }
         print(rendered)
         return rendered.contains("/") ? 1 : 0
     }

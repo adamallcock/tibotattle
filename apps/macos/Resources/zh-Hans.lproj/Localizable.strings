@@ -145,7 +145,7 @@
 "dialog.manageLocalDataDescription" = "本地应用状态、本地钥匙串能力和托管数据彼此独立。请选择你要管理的确切层级。";
 "dialog.moveDataToTrash" = "将数据移到废纸篓";
 "dialog.moveLocalDataToTrash" = "要将所有 %@ 本地数据移到废纸篓吗？";
-"dialog.moveLocalDataToTrashDescription" = "应用状态：本地索引、缓存分析、准备的贡献、自定义 Codex 设置和本地设备绑定状态会移到废纸篓。\n\n钥匙串：假名身份和设备凭据会保留。\n\n托管服务：已发送的社区数据和已注册设备会保留。绝不会更改 Codex 日志。";
+"dialog.moveLocalDataToTrashDescription" = "应用状态：本地索引、缓存分析、准备的贡献、自定义 Codex 设置、本地设备绑定状态以及 TiboTattle 登录和会话状态都会被清除。文件会移到废纸篓。\n\n钥匙串：假名身份和设备凭据会保留。\n\n托管服务：已发送的社区数据和已注册设备会保留。绝不会更改 Codex 日志。";
 "dialog.resetCapabilities" = "现在重置恰好两项本地钥匙串能力吗？";
 "dialog.resetCapabilitiesDescription" = "%@ 将停止其前台伴随程序，从钥匙串中移除导出身份和已配对设备凭据，只移除它们的两个本地残留文件，然后重新启动。\n\n现有准备或托管数据不会被重写或删除。未来的贡献活动将使用新身份，并要求再次配对设备。";
 "dialog.resetFinishing" = "本地身份重置即将完成";
@@ -190,7 +190,7 @@
 "launcher.errorKeychainReset" = "本地身份和设备重置未完成。";
 "launcher.errorKeychainResetPartial" = "本地身份和设备重置仅部分完成。";
 "launcher.recoveryCheckAccess" = "请检查对主目录和 Application Support 文件夹的访问权限，然后重试。";
-"launcher.recoveryChooseCodexHome" = "请选择“Codex 来源”并选择可读取的 Codex 主文件夹，或恢复默认设置。";
+"launcher.recoveryChooseCodexHome" = "请选择“Codex 来源”并选择可读取且归你的 macOS 用户帐户所有的 Codex 主文件夹，或恢复默认设置。";
 "launcher.recoveryDashboardDownload" = "请检查对“下载”文件夹的访问权限，然后再次保存该文件。";
 "launcher.recoveryDashboardWebView" = "请选择“打开仪表板”重试，或选择“在浏览器中打开”以在浏览器中使用同一份本地仪表板。";
 "launcher.recoveryDataErase" = "请退出正在使用 %@ 数据的其他进程，然后再次尝试抹掉。";
@@ -204,7 +204,7 @@
 "nativeDashboard.currentEvidenceTooltip" = "当前本地证据状态。";
 "menuBar.analysisRequestRejected" = "本地伴随程序无法接受分析请求。";
 "menuBar.failureRecovery" = "未在运行：%@。请打开窗口查看恢复步骤。";
-"settings.codexFolderCustomSelected" = "已选择自定义文件夹";
+"settings.codexFolderCustomSelectedPath" = "自定义文件夹：%@";
 "settings.codexFolderDefaultLocation" = "默认位置（~/.codex）";
 "settings.updateDisclosureAutomaticOff" = "已签名应用更新可在“关于”→“检查更新”中获取。自动下载目前已关闭；可在“设置”→“关于”中开启（如可用）。";
 "settings.updateDisclosureAutomaticOn" = "会自动检查已签名应用更新。默认情况下，已验证的更新会在后台下载并在退出时安装；可在“设置”→“关于”中关闭此项。";

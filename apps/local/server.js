@@ -43,6 +43,10 @@ import {
   createFastModePreferenceController,
 } from "../../src/fast-mode-preference.js";
 import {
+  HostedSignInHandoffError,
+  createHostedSignInHandoffController,
+} from "../../src/hosted-signin-handoff.js";
+import {
   createCodexSpeedBaselineController,
 } from "../../src/codex-speed-baseline.js";
 import { createLocalCentralProxy } from "../../src/local-companion-central-proxy.js";
@@ -74,6 +78,7 @@ import {
 import {
   createProductionContributionDeviceBackend,
   migrateLegacyContributionDeviceCapability,
+  readContributionDeviceCapability,
   removeContributionDeviceCapability,
 } from "../../src/contribution-device-capability.js";
 import {
@@ -222,18 +227,26 @@ const DEVELOPMENT_IDENTITY_OPT_IN_ENV =
   "USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY";
 const EXPORT_IDENTITY_ENV = "APP_USAGEMONITOR_EXPORT_SECRET";
 const REVIEW_TOKEN = /^[A-Za-z0-9_-]{43}$/u;
+const REVIEWABLE_CONTRIBUTION_QUEUE_STATES = new Set([
+  "ready",
+  "retry_wait",
+  "paused",
+]);
 const CONTRIBUTION_DEVICE_PAIRING_CODE =
   /^um_pair_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/u;
 const REVIEW_JOB_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
 const REVIEW_AUTHORIZATION_LIFETIME_MS = 10 * 60 * 1000;
+const MAX_ACTIVE_REVIEW_AUTHORIZATIONS = 8;
 // One appended line per user-visible failure, so a support conversation can
 // quote a reference the user can also see on the page. The file name is fixed
 // and lives beside the other local state.
 const DIAGNOSTICS_LOG_FILE_NAME = "diagnostics-v0.1.log";
 export const LOCAL_DIAGNOSTIC_NOTE_SCHEMA_VERSION =
   "local-diagnostic-note-v0.1";
+export const LOCAL_CONTRIBUTION_DIAGNOSTICS_SCHEMA_VERSION =
+  "local-contribution-diagnostics-v0.1";
 export const LOCAL_CONTRIBUTION_DEVICE_RESET_VERSION =
   "local-contribution-device-reset-v0.1";
 export const LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION =
@@ -264,6 +277,9 @@ const DIAGNOSTIC_ERROR_CODE =
   /^(?:[A-Z][A-Z0-9_]{1,63}|[a-z][a-z0-9_]{1,63})$/u;
 const DIAGNOSTIC_SERVICE_REQUEST_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const HOSTED_SIGNIN_HANDOFF_BOUND_VALUE = /^[A-Za-z0-9_-]{43,128}$/u;
+const HOSTED_SIGNIN_HANDOFF_PROVIDERS = new Set(["google", "apple"]);
+const MAX_RECENT_DIAGNOSTIC_REFERENCES = 5;
 const CONTRIBUTION_DEVICE_KEYCHAIN_CAPABILITY =
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice;
 const MAX_CONTRIBUTION_DEVICE_STATE_BYTES = 512;
@@ -336,7 +352,9 @@ const REPORT_ROUTES = createLocalCompanionReportRoutes(
 
 const API_ROUTES = new Set([
   "/api/local/health",
+  "/api/local/diagnostics/contribution",
   "/api/local/diagnostics/note",
+  "/api/local/identity/hosted-signin-handoff",
   "/api/local/onboarding",
   "/api/local/overview",
   "/api/local/claude/quota",
@@ -372,7 +390,9 @@ const API_ROUTES = new Set([
 // and the separately persisted native Claude quota projection.
 const SNAPSHOT_INDEPENDENT_API_ROUTES = new Set([
   "/api/local/health",
+  "/api/local/diagnostics/contribution",
   "/api/local/diagnostics/note",
+  "/api/local/identity/hosted-signin-handoff",
   "/api/local/claude/quota",
 ]);
 
@@ -524,6 +544,62 @@ async function appendDiagnosticNote({
   } finally {
     await handle?.close().catch(() => {});
   }
+}
+
+async function readDiagnosticReferenceGeneration(file) {
+  let metadata;
+  try {
+    metadata = await lstat(file);
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+  if (!metadata.isFile()
+      || metadata.isSymbolicLink()
+      || metadata.nlink !== 1
+      || metadata.size > MAX_DIAGNOSTICS_LOG_BYTES) {
+    return [];
+  }
+  const references = [];
+  for (const line of (await readFile(file, "utf8")).split("\n")) {
+    if (line === "") continue;
+    let value;
+    try {
+      value = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (value?.schemaVersion !== LOCAL_DIAGNOSTIC_NOTE_SCHEMA_VERSION
+        || !DIAGNOSTIC_REFERENCE.test(value?.reference ?? "")
+        || nullableInstant(value?.recordedAt) === null) {
+      continue;
+    }
+    references.push(Object.freeze({
+      reference: value.reference,
+      recordedAt: value.recordedAt,
+    }));
+  }
+  return references;
+}
+
+export async function readRecentDiagnosticReferences({
+  file,
+  maximum = MAX_RECENT_DIAGNOSTIC_REFERENCES,
+} = {}) {
+  if (typeof file !== "string"
+      || !isAbsolute(file)
+      || !Number.isSafeInteger(maximum)
+      || maximum < 1
+      || maximum > MAX_RECENT_DIAGNOSTIC_REFERENCES) {
+    throw new TypeError("recent diagnostic reference request is invalid");
+  }
+  const [previous, current] = await Promise.all([
+    readDiagnosticReferenceGeneration(`${file}.previous`),
+    readDiagnosticReferenceGeneration(file),
+  ]);
+  return Object.freeze(
+    [...previous, ...current].slice(-maximum).reverse(),
+  );
 }
 
 /**
@@ -1052,6 +1128,60 @@ async function authorizeDiagnosticNote(request, response) {
     surface: value.surface,
     code: value.code,
     requestId: value.requestId,
+  });
+}
+
+function authorizeHostedSignInHandoffRead(request, response) {
+  // Per the Fetch specification, a browser only appends an Origin header to
+  // requests whose method is not GET/HEAD or whose tainting is CORS. The
+  // dashboard's own same-origin GET therefore arrives WITHOUT an Origin
+  // header (found live in the packaged 0.1.13 (1011) build: the restart
+  // recovery read was refused 403 and resume silently did nothing). Accept
+  // an absent Origin, refuse a present-but-foreign one, and always require
+  // the custom header — a cross-origin page cannot attach it without a CORS
+  // preflight this server never grants, and the global allowedHostHeader
+  // gate already rejects DNS-rebinding hosts before routing.
+  const origin = request.headers.origin;
+  if ((origin !== undefined && !sameOrigin(request))
+      || request.headers["x-usage-monitor-local"] !== "1") {
+    sendError(response, 403, "hosted_signin_handoff_not_authorized");
+    return false;
+  }
+  return true;
+}
+
+async function authorizeHostedSignInHandoffMutation(request, response) {
+  if (!authorizeHostedSignInHandoffRead(request, response)) return null;
+  let value;
+  try {
+    value = await readBoundedJsonObject(request);
+  } catch (error) {
+    sendError(
+      response,
+      boundedRequestStatus(error),
+      error.code ?? "invalid_request",
+    );
+    return null;
+  }
+  const keys = Object.keys(value).sort().join("\0");
+  if (value.action === "clear" && keys === "action") {
+    return Object.freeze({ action: "clear" });
+  }
+  if (value.action !== "store"
+      || keys !== "action\0provider\0state\0verifier"
+      || !HOSTED_SIGNIN_HANDOFF_PROVIDERS.has(value.provider)
+      || typeof value.state !== "string"
+      || !HOSTED_SIGNIN_HANDOFF_BOUND_VALUE.test(value.state)
+      || typeof value.verifier !== "string"
+      || !HOSTED_SIGNIN_HANDOFF_BOUND_VALUE.test(value.verifier)) {
+    sendError(response, 400, "invalid_request");
+    return null;
+  }
+  return Object.freeze({
+    action: "store",
+    provider: value.provider,
+    state: value.state,
+    verifier: value.verifier,
   });
 }
 
@@ -1843,6 +1973,77 @@ function incrementalSyncStatusProjection(value, { configured = false } = {}) {
   };
 }
 
+function contributionDiagnosticQueueState(queue) {
+  if (queue?.status !== "available") return "unavailable";
+  if (queue.paused === true) return "paused";
+  if (queue.counts.inFlight > 0 || queue.counts.pending > 0) return "ready";
+  if (queue.counts.retryable > 0) return "retry_wait";
+  return "empty";
+}
+
+function contributionDiagnosticJourneyPhase({
+  configured,
+  queueState,
+  incremental,
+  pairingObserved,
+  paired,
+}) {
+  if (!configured) return "not_configured";
+  if (incremental.status !== "available") return "unavailable";
+  if (!incremental.consent.approved || !incremental.consent.current) {
+    return queueState === "empty" ? "preparing_review" : "review_ready";
+  }
+  if (!pairingObserved || !paired) return "approved_connection_needed";
+  if (incremental.paused) return "approved_paused";
+  if (incremental.running || (incremental.progress?.daysPending ?? 0) > 0) {
+    return "approved_syncing";
+  }
+  return "approved_idle";
+}
+
+function localContributionDiagnosticsProjection({
+  queue,
+  incremental,
+  configured,
+  pairingObserved,
+  paired,
+  recentDiagnosticReferences,
+}) {
+  const queueState = contributionDiagnosticQueueState(queue);
+  return Object.freeze({
+    schemaVersion: LOCAL_CONTRIBUTION_DIAGNOSTICS_SCHEMA_VERSION,
+    journeyPhase: contributionDiagnosticJourneyPhase({
+      configured,
+      queueState,
+      incremental,
+      pairingObserved,
+      paired,
+    }),
+    // Preview discovery is a local mutation (it can enqueue a prepared set),
+    // so this read-only support route never runs it. The page merges its
+    // already-observed preview state into copied diagnostics when available.
+    previewState: "not_observed",
+    queueState,
+    consent: Object.freeze({
+      approved: incremental.consent.approved === true,
+      current: incremental.consent.current === true,
+    }),
+    signedIn: Object.freeze({ observed: false, value: false }),
+    pairing: Object.freeze({
+      observed: pairingObserved,
+      paired,
+    }),
+    recentDiagnosticReferences: Object.freeze(recentDiagnosticReferences),
+    includesTokens: false,
+    includesOauthState: false,
+    includesVerifiers: false,
+    includesDeviceIdentifiers: false,
+    includesAccountIdentifiers: false,
+    includesContent: false,
+    includesPaths: false,
+  });
+}
+
 const PREPARATION_ERROR_CODES = new Set([
   "coverage_unavailable",
   "coverage_invalid",
@@ -2437,6 +2638,7 @@ function createPreparedLocalCompanionServer({
   contributionDeviceDisconnectRunner = null,
   diagnosticNoteRecorder = null,
   clock = () => Date.now(),
+  hostedSignInHandoffController = null,
   contributionSyncNextProvider = null,
   contributionSyncExactReviewProvider = null,
   contributionSyncOnceRunner = null,
@@ -2535,6 +2737,13 @@ function createPreparedLocalCompanionServer({
       || (diagnosticNoteRecorder !== null
         && typeof diagnosticNoteRecorder !== "function")) {
     throw new TypeError("local diagnostics controls are invalid");
+  }
+  if (hostedSignInHandoffController !== null
+      && (!hostedSignInHandoffController
+        || typeof hostedSignInHandoffController.inspect !== "function"
+        || typeof hostedSignInHandoffController.store !== "function"
+        || typeof hostedSignInHandoffController.clear !== "function")) {
+    throw new TypeError("hosted sign-in handoff controller is invalid");
   }
   if (typeof contributionDeviceBackendFactory !== "function"
       || (contributionDevicePairingProvider !== null
@@ -2700,6 +2909,11 @@ function createPreparedLocalCompanionServer({
       note,
       now: clock(),
     }));
+  const hostedSignInHandoff = hostedSignInHandoffController
+    ?? createHostedSignInHandoffController({
+      handoffFile: statePaths.hostedSignInHandoffFile,
+      now: clock,
+    });
   const reviewExactContribution = contributionSyncExactReviewProvider
     ?? (preparedContributionDirectory === null
       ? async () => null
@@ -3072,7 +3286,77 @@ function createPreparedLocalCompanionServer({
     centralOrigin,
     fetchImpl: centralOutbound.fetch,
   });
-  let reviewedContributionAuthorization = null;
+  const readLocalContributionDiagnostics = async () => {
+    let queueValue = null;
+    let incrementalValue = null;
+    let pairingObserved = false;
+    let paired = false;
+    try {
+      queueValue = await contributionSyncStatusProvider();
+    } catch {
+      queueValue = null;
+    }
+    if (incrementalContribution !== null) {
+      try {
+        incrementalValue = await incrementalContribution.inspect();
+      } catch {
+        incrementalValue = null;
+      }
+    }
+    if (contributionServiceOrigin !== null) {
+      try {
+        const capability = await readContributionDeviceCapability({
+          backend: contributionDeviceBackendFactory(),
+          stateFile: statePaths.contributionDeviceStateFile,
+          expectedOrigin: contributionServiceOrigin,
+        });
+        pairingObserved = true;
+        paired = capability !== null;
+      } catch {
+        pairingObserved = false;
+        paired = false;
+      }
+    } else {
+      pairingObserved = true;
+    }
+    let recentDiagnosticReferences = [];
+    try {
+      recentDiagnosticReferences = await readRecentDiagnosticReferences({
+        file: diagnosticsLogFile,
+      });
+    } catch {
+      recentDiagnosticReferences = [];
+    }
+    return localContributionDiagnosticsProjection({
+      queue: syncStatusProjection(queueValue),
+      incremental: incrementalSyncStatusProjection(incrementalValue, {
+        configured: incrementalContribution !== null,
+      }),
+      configured: incrementalContribution !== null,
+      pairingObserved,
+      paired,
+      recentDiagnosticReferences,
+    });
+  };
+  // Keep a small bounded set rather than one mutable slot. A loopback review
+  // request that timed out in the page may still finish after a newer retry;
+  // it must not invalidate the newer token merely by arriving last.
+  const reviewedContributionAuthorizations = new Map();
+  const purgeReviewedContributionAuthorizations = (now) => {
+    for (const [token, authorization] of reviewedContributionAuthorizations) {
+      if (authorization.expiresAt <= now) {
+        reviewedContributionAuthorizations.delete(token);
+      }
+    }
+  };
+  const consumeReviewedContributionAuthorization = (reviewToken) => {
+    const now = clock();
+    purgeReviewedContributionAuthorizations(now);
+    const authorization = reviewedContributionAuthorizations.get(reviewToken)
+      ?? null;
+    reviewedContributionAuthorizations.delete(reviewToken);
+    return authorization;
+  };
 
   const server = createServer(async (request, response) => {
     try {
@@ -3226,6 +3510,14 @@ function createPreparedLocalCompanionServer({
         });
         return;
       }
+      if (path === "/api/local/diagnostics/contribution") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        send(response, 200, await readLocalContributionDiagnostics());
+        return;
+      }
       if (path === "/api/local/diagnostics/note") {
         if (request.method !== "POST") {
           sendError(response, 405, "method_not_allowed");
@@ -3244,6 +3536,44 @@ function createPreparedLocalCompanionServer({
           status: "recorded",
           reference: note.reference,
         });
+        return;
+      }
+      if (path === "/api/local/identity/hosted-signin-handoff") {
+        if (request.method === "GET") {
+          if (!authorizeHostedSignInHandoffRead(request, response)) return;
+          try {
+            send(response, 200, await hostedSignInHandoff.inspect());
+          } catch {
+            sendError(response, 500, "hosted_signin_handoff_unavailable");
+          }
+          return;
+        }
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        const mutation = await authorizeHostedSignInHandoffMutation(
+          request,
+          response,
+        );
+        if (mutation === null) return;
+        try {
+          const result = mutation.action === "clear"
+            ? await hostedSignInHandoff.clear()
+            : await hostedSignInHandoff.store(mutation);
+          send(response, 200, result);
+        } catch (error) {
+          sendError(
+            response,
+            error instanceof HostedSignInHandoffError
+              && error.code === "hosted_signin_handoff_invalid"
+              ? 400
+              : 500,
+            error instanceof HostedSignInHandoffError
+              ? error.code
+              : "hosted_signin_handoff_unavailable",
+          );
+        }
         return;
       }
       if (path === "/api/local/onboarding") {
@@ -3553,11 +3883,10 @@ function createPreparedLocalCompanionServer({
           sendError(response, 409, "incremental_sync_not_configured");
           return;
         }
-        const authorization = reviewedContributionAuthorization;
-        reviewedContributionAuthorization = null;
-        if (authorization === null
-            || authorization.expiresAt < Date.now()
-            || authorization.reviewToken !== reviewToken) {
+        const authorization = consumeReviewedContributionAuthorization(
+          reviewToken,
+        );
+        if (authorization === null) {
           sendError(response, 409, "review_expired_or_changed");
           return;
         }
@@ -3896,22 +4225,35 @@ function createPreparedLocalCompanionServer({
           review = null;
         }
         const binding = review?.reviewBinding;
-        const bindingValid = review?.state === "ready"
+        // Retry and pause are upload scheduling states. The payload and its
+        // binding already passed the same local verification as a ready job,
+        // so neither may suppress the local-only review authorization.
+        const bindingValid = REVIEWABLE_CONTRIBUTION_QUEUE_STATES.has(
+          review?.state,
+        )
           && REVIEW_JOB_ID.test(binding?.jobId ?? "")
           && SHA256.test(binding?.contributionSha256 ?? "");
         const reviewToken = bindingValid
           ? randomBytes(32).toString("base64url")
           : null;
-        reviewedContributionAuthorization = bindingValid
-          ? {
+        if (bindingValid) {
+          const now = clock();
+          purgeReviewedContributionAuthorizations(now);
+          while (reviewedContributionAuthorizations.size
+              >= MAX_ACTIVE_REVIEW_AUTHORIZATIONS) {
+            const oldest = reviewedContributionAuthorizations.keys().next().value;
+            if (oldest === undefined) break;
+            reviewedContributionAuthorizations.delete(oldest);
+          }
+          reviewedContributionAuthorizations.set(reviewToken, {
             reviewToken,
             reviewedJob: {
               jobId: binding.jobId,
               contributionSha256: binding.contributionSha256,
             },
-            expiresAt: Date.now() + REVIEW_AUTHORIZATION_LIFETIME_MS,
-          }
-          : null;
+            expiresAt: now + REVIEW_AUTHORIZATION_LIFETIME_MS,
+          });
+        }
         send(response, 200, syncExactReviewProjection(review, {
           configured: syncExactReviewConfigured,
           reviewToken,
@@ -3929,11 +4271,10 @@ function createPreparedLocalCompanionServer({
           "sync_not_authorized",
         );
         if (reviewToken === null) return;
-        const authorization = reviewedContributionAuthorization;
-        reviewedContributionAuthorization = null;
-        if (authorization === null
-            || authorization.expiresAt < Date.now()
-            || authorization.reviewToken !== reviewToken) {
+        const authorization = consumeReviewedContributionAuthorization(
+          reviewToken,
+        );
+        if (authorization === null) {
           sendError(response, 409, "review_expired_or_changed");
           return;
         }

@@ -311,15 +311,20 @@ document is acceptable to the installed fleet.
   literals ever diverge), and the enclosure URL/length/signature agree with
   the DMG bytes and SHA-256.
 - `scripts/publish-sparkle-update.js` runs the same validation as a
-  preflight before any network call, and **refuses an unsigned stable
-  candidate outright** (`SPARKLE_UPDATE_STABLE_FEED_UNSIGNED`). The
-  preflight is unconditional for the stable channel: flipping
+  preflight before any network call, and **refuses an unsigned candidate
+  outright on both named channels** (`SPARKLE_UPDATE_STABLE_FEED_UNSIGNED` /
+  `SPARKLE_UPDATE_DOGFOOD_FEED_UNSIGNED`; extended to internal-dogfood on
+  2026-08-19). The preflight is unconditional for both channels: flipping
   `allowDeltaFrom` in `config/sparkle-appcast-policy.js` does not skip it —
   the publisher then fails closed with
-  `SPARKLE_UPDATE_STABLE_DELTA_FEED_VALIDATION_UNSUPPORTED` until
+  `SPARKLE_UPDATE_STABLE_DELTA_FEED_VALIDATION_UNSUPPORTED` (or
+  `SPARKLE_UPDATE_DOGFOOD_DELTA_FEED_VALIDATION_UNSUPPORTED`) until
   `sparkle-signed-feed-validation.js` (and the Worker guard's official
   parser) are extended for delta-carrying signed feeds. No policy value can
-  turn stable publication into a preflight-free path.
+  turn named-channel publication into a preflight-free path; the spec-only
+  fixture policy that keeps the retained hand-built delta machinery
+  regression-tested is unreachable from the CLI and is itself refused for
+  stable (`SPARKLE_UPDATE_STABLE_FIXTURE_POLICY_FORBIDDEN`).
 
 ### End-to-end publication recipe (stable)
 
@@ -351,11 +356,16 @@ document is acceptable to the installed fleet.
    post-publication check above; an installed app's Sparkle "Check for
    Updates" is the final word.
 
-### Known gap (deliberate scope)
+### Known gap (closed 2026-08-19)
 
-`internal-dogfood` builds also carry `SURequireSignedFeed=true`, but the
-dogfood generator path still emits the minimal (unsigned) shape because its
-delta machinery cannot come from `generate_appcast` single-DMG staging. A
-dogfood feed publication would hit the same client-side signature refusal;
-route dogfood through the signed path (and extend the validator for delta
-containers) before the next dogfood update rehearsal.
+`internal-dogfood` builds also carry `SURequireSignedFeed=true`. The gap this
+section used to describe is now closed at both ends: the generator routes
+both named channels through the pinned official `generate_appcast` (with
+`--account` selecting the dogfood Keychain key) and fails closed rather than
+emitting the unsigned minimal shape, and the publisher's signed-feed
+preflight refuses an unsigned candidate on either named channel — including
+a hand-built feed handed to it directly. The hand-built delta shape survives
+only as regression fixtures behind a spec-injected fixture policy
+(unreachable from the CLI, refused for stable) until the reviewed delta
+policy flip re-adds delta production through `generate_appcast`'s own
+prior-version staging.
