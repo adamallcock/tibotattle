@@ -1454,6 +1454,10 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Local usage over time": ["本地使用情况随时间变化", "Uso local a lo largo del tiempo"],
   "Observed allowance remaining": ["观测到的剩余额度", "Cuota restante observada"],
   "Window boundary or track change": ["窗口边界或额度轨道变化", "Límite de ventana o cambio de seguimiento"],
+  // Same wording as `chart.status.quotaWeightingUnavailable` above, reused
+  // verbatim: the legend swatch and the band's own tooltip name one mechanism,
+  // so they must not drift into two different phrasings per locale.
+  "Quota weighting unavailable": ["额度加权不可用", "Ponderación por cuota no disponible"],
   "Movement needs context": ["变化需要上下文", "El movimiento necesita contexto"],
   "Allowance exhausted": ["额度已用尽", "Asignación agotada"],
   "Per-model rates": ["各模型费率", "Tasas por modelo"],

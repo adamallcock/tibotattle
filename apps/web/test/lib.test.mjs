@@ -10527,12 +10527,12 @@ test("Trends calibration legend is a full-width row with distinct line and area 
     html.indexOf("calibration-legend") < html.indexOf('id="timeline-empty"'),
     "the legend precedes the chart body",
   );
-  // The two line series keep a stroke swatch; the four exclusion categories
+  // The two line series keep a stroke swatch; the five exclusion categories
   // carry the `area` class that renders a filled square.
   assert.match(html, /<i class="legend-dot observed">/u);
   assert.match(html, /<i class="legend-dot expected">/u);
   assert.doesNotMatch(html, /legend-dot area (?:observed|expected)/u);
-  for (const status of ["missing", "reset", "ambiguous", "saturated"]) {
+  for (const status of ["missing", "reset", "weighting", "ambiguous", "saturated"]) {
     assert.match(
       html,
       new RegExp(`<i class="legend-dot area chart-status-${status}">`, "u"),
@@ -10546,46 +10546,75 @@ test("Trends calibration legend is a full-width row with distinct line and area 
 
 // Owner polish (2026-08-11): "Missing quota bracket" and "Movement needs
 // context" shared one grey, so a shaded region could not be mapped back to its
-// exclusion. Each of the four exclusion categories now owns a distinct hue, and
-// the legend swatch carries the same hue as the band it keys.
-test("Trends exclusion bands and legend swatches use four distinct, matching hues", async () => {
+// exclusion. Each exclusion category now owns a distinct hue, and the legend
+// swatch carries the same hue as the band it keys.
+//
+// Owner sanity check (2026-08-19): distinct hues were necessary but not
+// sufficient. Every wash sat at .08-.1, where the composite over the card's
+// cream lands within a few RGB units of every other and no hue survives, so the
+// legend looked colourful and the plot did not. `quota_weighting_unavailable`
+// was also a counted exclusion with no hue at all, and fell through the
+// renderer's default into violet. Both are pinned here.
+test("Trends exclusion bands and legend swatches use five distinct, matching, legible hues", async () => {
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
-  const names = ["missing", "reset", "ambiguous", "saturated"];
-  const bandHue = (name) =>
-    styles.match(new RegExp(`\\.chart-status-${name} \\{ fill: rgba\\((\\d+, \\d+, \\d+)`, "u"))?.[1];
-  const swatchHue = (name) =>
-    styles.match(new RegExp(`\\.legend-dot\\.chart-status-${name} \\{ background: rgba\\((\\d+, \\d+, \\d+)`, "u"))?.[1];
+  const names = ["missing", "reset", "weighting", "ambiguous", "saturated"];
+  const declaration = (selector) =>
+    styles.match(new RegExp(`${selector} \\{ (?:fill|background): rgba\\((\\d+, \\d+, \\d+), (\\.\\d+)\\)`, "u"));
+  const bandRule = (name) => declaration(`\\.chart-status-${name}`);
+  const tickRule = (name) => declaration(`\\.chart-status-tick\\.chart-status-${name}`);
+  const swatchRule = (name) => declaration(`\\.legend-dot\\.chart-status-${name}`);
 
-  const bands = names.map(bandHue);
-  const swatches = names.map(swatchHue);
-  assert.ok(bands.every(Boolean), "every exclusion band declares an rgb fill");
-  assert.ok(swatches.every(Boolean), "every legend swatch declares an rgb background");
-  assert.equal(new Set(bands).size, 4, "the four exclusion bands use four distinct hues");
-  assert.equal(new Set(swatches).size, 4, "the four legend swatches use four distinct hues");
+  const bands = names.map(bandRule);
+  const ticks = names.map(tickRule);
+  const swatches = names.map(swatchRule);
+  assert.ok(bands.every(Boolean), "every exclusion band declares an rgba fill");
+  assert.ok(ticks.every(Boolean), "every exclusion band declares an rgba tick fill");
+  assert.ok(swatches.every(Boolean), "every legend swatch declares an rgba background");
+  assert.equal(
+    new Set(bands.map((rule) => rule[1])).size,
+    5,
+    "the five exclusion bands use five distinct hues",
+  );
   for (let index = 0; index < names.length; index += 1) {
-    assert.equal(
-      swatches[index],
-      bands[index],
-      `the ${names[index]} legend swatch matches its on-chart band hue`,
+    const name = names[index];
+    // The wash has to be dense enough for the hue to survive compositing onto
+    // cream. Below roughly .12 the five bands are indistinguishable greys, which
+    // is the whole defect this test exists to prevent regressing.
+    assert.ok(
+      Number(bands[index][2]) >= 0.14,
+      `the ${name} band wash is dense enough to carry its hue (got ${bands[index][2]})`,
+    );
+    // The legend shows the reader the TICK, because at a month's zoom the tick
+    // is the mark a single excluded window actually leaves on the plot.
+    assert.equal(swatches[index][1], ticks[index][1], `${name} swatch matches its tick hue`);
+    assert.equal(swatches[index][2], ticks[index][2], `${name} swatch matches its tick alpha`);
+    assert.equal(ticks[index][1], bands[index][1], `${name} tick matches its band hue`);
+    assert.ok(
+      Number(ticks[index][2]) > Number(bands[index][2]) * 2,
+      `the ${name} tick reads at identity strength, well above its wash`,
     );
   }
 });
 
 // Owner polish (2026-08-11): verify the allowance-exhausted band is wired, not
-// silently broken — the owner never pegged their pool, so they see no such
-// band, and this proves it renders (with the saturated class the CSS colours
-// rust) the moment a pool_saturated window is present.
-test("timeline status bands render one shaded rect per exclusion, including allowance-exhausted", async () => {
+// silently broken. It renders (with the saturated class the CSS colours rust)
+// the moment a pool_saturated window is present.
+//
+// Owner sanity check (2026-08-19): each exclusion now draws TWO rects — a wash
+// at the interval's true extent, and a fixed-minimum tick along the top edge
+// carrying the hue at identity strength. Widening the wash itself was rejected:
+// it would claim a mechanism was in force for longer than it was.
+test("timeline status bands render a wash and an identity tick per exclusion", async () => {
   const documentRef = new FakeSvgDocument(900);
   const { lineChart, CHART_POINT_STYLE } = await loadLineChartRenderer(documentRef);
   const base = Date.UTC(2026, 0, 1);
   const hour = 3_600_000;
   const at = (index) => base + index * hour;
-  const points = [0, 1, 2, 3, 4].map((index) => ({
+  const points = [0, 1, 2, 3, 4, 5].map((index) => ({
     timestamp: new Date(at(index)).toISOString(),
     value: index,
   }));
-  const svg = lineChart({
+  const draw = (statusIntervals) => lineChart({
     points,
     series: [{
       key: "value",
@@ -10596,21 +10625,204 @@ test("timeline status bands render one shaded rect per exclusion, including allo
     title: { key: "chart.title" },
     description: { key: "chart.description" },
     yLabel: { key: "chart.yLabel" },
-    statusIntervals: [
-      { status: "missing_quota_bracket", startMs: at(0), endMs: at(1) },
-      { status: "reset_or_track_change", startMs: at(1), endMs: at(2) },
-      { status: "backward_or_ambiguous", startMs: at(2), endMs: at(3) },
-      { status: "pool_saturated", startMs: at(3), endMs: at(4) },
-    ],
+    statusIntervals,
   });
-  assert.equal(svg.querySelectorAll("rect.chart-status-missing").length, 1);
-  assert.equal(svg.querySelectorAll("rect.chart-status-reset").length, 1);
-  assert.equal(svg.querySelectorAll("rect.chart-status-ambiguous").length, 1);
+
+  const svg = draw([
+    { status: "missing_quota_bracket", startMs: at(0), endMs: at(1) },
+    { status: "reset_or_track_change", startMs: at(1), endMs: at(2) },
+    { status: "quota_weighting_unavailable", startMs: at(2), endMs: at(3) },
+    { status: "backward_or_ambiguous", startMs: at(3), endMs: at(4) },
+    { status: "pool_saturated", startMs: at(4), endMs: at(5) },
+  ]);
+
+  for (const band of ["missing", "reset", "weighting", "ambiguous", "saturated"]) {
+    const rects = svg.querySelectorAll(`rect.chart-status-${band}`);
+    assert.equal(rects.length, 2, `${band} draws a wash and a tick`);
+    const [wash, tick] = rects;
+    assert.equal(wash.getAttribute("class"), `chart-status-${band}`);
+    assert.equal(tick.getAttribute("class"), `chart-status-tick chart-status-${band}`);
+    assert.ok(
+      Number(wash.getAttribute("height")) > Number(tick.getAttribute("height")),
+      `the ${band} wash spans the plot and its tick does not`,
+    );
+    // Both are hoverable and name the same mechanism: at a month's zoom the
+    // wash is too narrow to be a usable pointer target on its own.
+    assert.equal(wash.children[0].tagName, "title");
+    assert.equal(tick.children[0].tagName, "title");
+    assert.equal(tick.children[0].textContent, wash.children[0].textContent);
+  }
   assert.equal(
     svg.querySelectorAll("rect.chart-status-saturated").length,
-    1,
+    2,
     "a pool_saturated window draws the allowance-exhausted band",
   );
+
+  // A sub-unit interval is what the owner's 30d view is made of: four ambiguous
+  // windows across 1,713, each well under a viewBox unit. The wash stays at its
+  // (floored) true width while the tick widens to the legibility minimum.
+  const sliver = draw([
+    { status: "backward_or_ambiguous", startMs: at(2), endMs: at(2) + 1_000 },
+  ]);
+  const [washSliver, tickSliver] = sliver.querySelectorAll("rect.chart-status-ambiguous");
+  assert.equal(Number(washSliver.getAttribute("width")), 1, "the wash never overstates extent");
+  assert.ok(
+    Number(tickSliver.getAttribute("width")) >= 3,
+    "the tick widens to stay visible",
+  );
+  // Widening is symmetric, so the marker still points at the window it keys.
+  const washCentre = Number(washSliver.getAttribute("x")) + 0.5;
+  const tickCentre = Number(tickSliver.getAttribute("x"))
+    + Number(tickSliver.getAttribute("width")) / 2;
+  assert.ok(Math.abs(washCentre - tickCentre) < 0.001, "the tick is centred on its band");
+});
+
+// Owner sanity check (2026-08-19): "Allowance exhausted" was in the legend but
+// had never once classified a window, and the cause was the classifier's order
+// rather than the owner's data. Exhausting a pool spawns a fresh pool with a
+// new `resets_at`, so the boundary changes at the instant the ceiling is hit —
+// behind `!sameReset`, the saturated branch was shadowed by its own
+// precondition. Saturation is tested first now; only `bracketed` outranks it.
+test("a pegged pool classifies as exhausted even though its reset boundary moved", () => {
+  const pegged = {
+    bracketed: true,
+    observed: null,
+    expected: 4,
+    usageEvents: 6,
+    apiCostUsd: 9,
+    poolSaturated: true,
+  };
+  assert.deepEqual(
+    classifyTimelineEvidence({ ...pegged, sameReset: false }),
+    { status: "pool_saturated", residual: null },
+    "the peg is the reason the window is unmeasurable, so it is the label",
+  );
+  assert.deepEqual(
+    classifyTimelineEvidence({ ...pegged, sameReset: true }),
+    { status: "pool_saturated", residual: null },
+  );
+  // Without a reading on the start edge there is no ceiling to have observed,
+  // so the missing bracket still outranks saturation.
+  assert.equal(
+    classifyTimelineEvidence({ ...pegged, bracketed: false, sameReset: false }).status,
+    "missing_quota_bracket",
+  );
+  // A boundary change with no peg is still a plain track change.
+  assert.equal(
+    classifyTimelineEvidence({ ...pegged, poolSaturated: false, sameReset: false }).status,
+    "reset_or_track_change",
+  );
+});
+
+// Owner sanity check (2026-08-19): the intervals were emitted one per window and
+// each is floored to a full viewBox unit by the renderer. At a month's zoom the
+// spacing between windows is under half a unit, so neighbours in a run
+// overlapped and composited their alpha repeatedly — the wash reported point
+// DENSITY, not duration. Runs are merged before they reach the renderer.
+test("timeline status intervals merge a run of one mechanism into one region", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("function timelineStatusIntervals(");
+  const end = appSource.indexOf("\n// The weekly track is identified", start);
+  assert.ok(start >= 0 && end > start, "the interval builder is available");
+  const timelineStatusIntervals = Function(
+    "pointTimestampMs",
+    "TIMELINE_STATUS_BAND_CLASSES",
+    `${appSource.slice(start, end)}\nreturn timelineStatusIntervals;`,
+  )(
+    (point) => Date.parse(point.timestamp),
+    Object.freeze({
+      missing_quota_bracket: "missing",
+      reset_or_track_change: "reset",
+      quota_weighting_unavailable: "weighting",
+      backward_or_ambiguous: "ambiguous",
+      pool_saturated: "saturated",
+    }),
+  );
+
+  const base = Date.UTC(2026, 0, 1);
+  const hour = 3_600_000;
+  const at = (index) => base + index * hour;
+  const point = (index, status) => ({
+    timestamp: new Date(at(index)).toISOString(),
+    status,
+  });
+  const viewport = { startMs: at(0), endMs: at(9) };
+
+  const merged = timelineStatusIntervals([
+    point(0, "missing_quota_bracket"),
+    point(1, "missing_quota_bracket"),
+    point(2, "missing_quota_bracket"),
+    point(3, "matched"),
+    point(4, "missing_quota_bracket"),
+    point(5, "reset_or_track_change"),
+    point(6, "inactive"),
+    point(7, "unpriced_local_activity"),
+    point(8, "pool_saturated"),
+  ], viewport);
+
+  assert.deepEqual(
+    merged.map((interval) => interval.status),
+    [
+      "missing_quota_bracket",
+      "missing_quota_bracket",
+      "reset_or_track_change",
+      "pool_saturated",
+    ],
+    "a contiguous run collapses; a matched window in between breaks it, and a"
+      + " measured state is never shaded at all",
+  );
+  assert.equal(merged[0].startMs, at(0), "the run is clamped to the viewport");
+  assert.equal(merged[0].endMs, at(2) + hour / 2, "the run ends at its last window");
+  assert.ok(
+    merged[0].endMs - merged[0].startMs > merged[1].endMs - merged[1].startMs,
+    "the merged run spans more than the isolated window that follows it",
+  );
+  // Regions never overlap, so no span composites its own alpha twice.
+  for (let index = 1; index < merged.length; index += 1) {
+    assert.ok(
+      merged[index].startMs >= merged[index - 1].endMs,
+      "shaded regions are disjoint",
+    );
+  }
+});
+
+// Owner sanity check (2026-08-19): the renderer's status test used to end in a
+// bare `: "ambiguous"`, so three states with no legend entry drew in the violet
+// captioned "Movement needs context" — two of which carry both series and are
+// COUNTED AS MATCHED, meaning the chart shaded spans the caption beneath it
+// calls excluded. Shading is now table-driven with no fallback.
+test("timeline status bands shade only the mechanisms the legend keys", async () => {
+  const documentRef = new FakeSvgDocument(900);
+  const { lineChart, CHART_POINT_STYLE } = await loadLineChartRenderer(documentRef);
+  const base = Date.UTC(2026, 0, 1);
+  const hour = 3_600_000;
+  const at = (index) => base + index * hour;
+  const svg = lineChart({
+    points: [0, 1, 2, 3].map((index) => ({
+      timestamp: new Date(at(index)).toISOString(),
+      value: index,
+    })),
+    series: [{
+      key: "value",
+      className: "chart-line-observed",
+      label: { key: "series.observed" },
+      pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+    }],
+    title: { key: "chart.title" },
+    description: { key: "chart.description" },
+    yLabel: { key: "chart.yLabel" },
+    statusIntervals: [
+      { status: "unpriced_local_activity", startMs: at(0), endMs: at(1) },
+      { status: "unexplained_without_local_activity", startMs: at(1), endMs: at(2) },
+      { status: "matched", startMs: at(2), endMs: at(3) },
+    ],
+  });
+  assert.equal(
+    svg.querySelectorAll("rect.chart-status-ambiguous").length,
+    0,
+    "a measured window is never shaded as an exclusion",
+  );
+  assert.equal(svg.querySelectorAll("rect.chart-status-tick").length, 0);
 });
 
 // Owner polish (2026-08-11): the five calibration summary tiles laid out
