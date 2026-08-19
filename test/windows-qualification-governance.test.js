@@ -194,6 +194,7 @@ test("qualification selection is the exact reviewed Windows test set", async () 
     "test/windows-filesystem-native-contract.test.js",
     "test/windows-filesystem-security.test.js",
     "test/windows-security-consumer-composition.test.js",
+    "test/windows-sqlite-state-session-native.test.js",
     "test/windows-path-contract.test.js",
     "test/windows-qualification-governance.test.js",
     "test/windows-skip-ledger.test.js",
