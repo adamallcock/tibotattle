@@ -104,6 +104,11 @@ constexpr ULONG kFileRenameInformation = 10;
 constexpr ULONG kFileRenameInformationEx = 65;
 constexpr ULONG kFileRenameReplaceIfExists = 0x00000001;
 constexpr ULONG kFileRenamePosixSemantics = 0x00000002;
+// FILE_DELETE_ON_CLOSE is intentionally kept local rather than relying on a
+// particular SDK header spelling.  SQLite sidecar reservations use this
+// create option so the reservation file cannot outlive the native lease after
+// every held handle has been closed.
+constexpr ULONG kFileDeleteOnClose = 0x00001000;
 static_assert(kFileRenameInformation == 10, "legacy rename class value");
 static_assert(kFileRenameInformationEx == 65, "extended rename class value");
 constexpr ULONG kFileOpen = 1;
@@ -1372,33 +1377,94 @@ bool OpenSqliteChild(
   return true;
 }
 
-bool EnsureSqliteSidecarAbsent(
+// Reserve a SQLite WAL/SHM basename for the complete native lease lifetime.
+// A missing sidecar cannot be protected by an existence check alone: another
+// process could create it immediately after that check.  Instead, create an
+// owner-only placeholder relative to the already-held root and keep an
+// exclusive, delete-on-close handle open.  A SQLite writer attempting to
+// create or open the sidecar then receives a sharing violation.  The file is
+// removed automatically only after the lease has closed every reservation
+// handle, so a crash does not leave a permanent sentinel behind.
+bool ReserveSqliteSidecar(
     HANDLE protectedRoot,
+    const ParsedPath& parsedRoot,
     const std::wstring& sidecarName,
+    HANDLE* result,
     Failure* failure) {
+  *result = INVALID_HANDLE_VALUE;
+  std::vector<BYTE> ownerSid;
+  PACL acl = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  SECURITY_ATTRIBUTES attributes{};
+  if (!BuildOwnerOnlySecurity(&ownerSid, &acl, &descriptor, &attributes)) {
+    *failure = OperationFailed();
+    return false;
+  }
+
+  OpenRelativeOptions options;
+  options.finalDirectoryKnown = true;
+  options.finalDirectory = false;
+  options.access = GENERIC_READ | GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC
+      | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  // No sharing is deliberate: both opens and creates of the reserved name
+  // must be rejected while this handle remains live.
+  options.shareMode = 0;
+  options.disposition = kFileCreate;
+  options.extraOptions = kFileDeleteOnClose;
+  options.ownerOnlyOnCreate = true;
+  options.securityDescriptor = attributes.lpSecurityDescriptor;
   HANDLE handle = INVALID_HANDLE_VALUE;
   ULONG_PTR information = 0;
   const bool opened = OpenRelativeComponent(
       protectedRoot,
       sidecarName,
-      FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-      kFileOpen,
-      kFileNonDirectory,
-      nullptr,
+      options.access,
+      options.shareMode,
+      options.disposition,
+      kFileNonDirectory | options.extraOptions,
+      options.securityDescriptor,
       &handle,
       &information,
       failure);
+  FreeOwnerOnlySecurity(acl, descriptor);
   if (!opened) {
-    if (failure->code == NotFound().code) return true;
-    // The name is reserved by SQLite even when an attacker has made it
-    // unreadable.  Treat every non-missing result as present and fail closed.
+    // An existing-but-unreadable sidecar is still a present sidecar.  Do not
+    // expose whether its owner or ACL differs from the expected state.
+    if (failure->code == AlreadyExists().code
+        || failure->code == AccessDenied().code) {
+      *failure = SqliteStateLeaseSidecarPresent();
+    }
+    return false;
+  }
+  if (information != kFileCreated) {
+    CloseHandle(handle);
     *failure = SqliteStateLeaseSidecarPresent();
     return false;
   }
-  CloseHandle(handle);
-  *failure = SqliteStateLeaseSidecarPresent();
-  return false;
+
+  bool reparse = false;
+  DWORD attributesValue = 0;
+  HandleIdentity identity;
+  SecuritySnapshot security;
+  ParsedPath fullPath = parsedRoot;
+  fullPath.components.push_back(sidecarName);
+  const bool valid = GetFileAttributesFromHandle(handle, &attributesValue)
+      && HasReparsePoint(handle, &reparse)
+      && !reparse
+      && (attributesValue & FILE_ATTRIBUTE_DIRECTORY) == 0
+      && FlushFileBuffers(handle)
+      && ValidateSecurity(handle, false, failure, &identity, &security)
+      && !security.denyAce
+      && security.ownerAllowAceCount == 1
+      && security.ownerAllowMask == FILE_ALL_ACCESS
+      && ResolveFinalPath(handle, &fullPath);
+  if (!valid) {
+    if (!MarkHandleForDeletion(handle)) *failure = OperationFailed();
+    CloseHandle(handle);
+    return false;
+  }
+  *result = handle;
+  return true;
 }
 
 std::vector<HANDLE> TakeAllHandles(RelativeHandles* opened) {
@@ -3165,10 +3231,14 @@ bool AcquireSqliteStateLeaseMutex(
     return false;
   }
   if (waitResult == WAIT_ABANDONED_0) {
-    ReleaseMutex(mutex);
-    CloseHandle(mutex);
-    *failure = SqliteStateLeaseAbandoned();
-    return false;
+    // The previous process has already lost every database, journal, and
+    // sidecar reservation handle.  Windows transfers ownership of the mutex
+    // to this caller, so retain it and let SQLite perform its bounded hot
+    // rollback-journal recovery before exposing a session.  The production
+    // capability bit remains false until native qualification proves this
+    // crash/reopen path across the supported filesystem matrix.
+    *result = mutex;
+    return true;
   }
   if (waitResult != WAIT_OBJECT_0) {
     CloseHandle(mutex);
@@ -3253,15 +3323,6 @@ napi_value AcquireSqliteStateLeaseCallback(
     return ThrowFailure(env, failure);
   }
 
-  // A live WAL/SHM file means the database is not using the single rollback
-  // journal contract this lease protects.  These are defensive preflight
-  // checks only; the still-false sqliteStateLeaseSafe claim deliberately does
-  // not pretend that a missing sidecar can be reserved against an unrelated
-  // same-user writer for the whole lease lifetime.
-  if (!EnsureSqliteSidecarAbsent(rootOpened.final, walName, &failure)
-      || !EnsureSqliteSidecarAbsent(rootOpened.final, shmName, &failure)) {
-    return ThrowFailure(env, failure);
-  }
   RelativeHandles databaseOpened;
   RelativeHandles journalOpened;
   HandleIdentity databaseIdentity;
@@ -3280,8 +3341,7 @@ napi_value AcquireSqliteStateLeaseCallback(
           &journalOpened,
           &journalIdentity,
           &failure)
-      || !EnsureSqliteSidecarAbsent(rootOpened.final, walName, &failure)
-      || !EnsureSqliteSidecarAbsent(rootOpened.final, shmName, &failure)) {
+      ) {
     return ThrowFailure(env, failure);
   }
 
@@ -3310,9 +3370,49 @@ napi_value AcquireSqliteStateLeaseCallback(
     }
   }
 
+  // Reserve both names after the identity mutex has been acquired and before
+  // exposing a lease.  The delete-on-close handles remain in the lease's
+  // handle vector and are therefore held until after the SQLite connection
+  // has closed.  This is the lifetime boundary that an existence preflight
+  // cannot provide.  Acquiring the mutex first also makes a second contender
+  // report the stable lease-contended result instead of racing the sidecar
+  // placeholder and reporting a misleading sidecar-present result.
+  std::vector<HANDLE> sidecarReservations;
+  sidecarReservations.reserve(2);
+  HANDLE walReservation = INVALID_HANDLE_VALUE;
+  if (!ReserveSqliteSidecar(
+          rootOpened.final,
+          parsedRoot,
+          walName,
+          &walReservation,
+          &failure)) {
+    ReleaseMutex(coordination);
+    CloseHandle(coordination);
+    return ThrowFailure(env, failure);
+  }
+  sidecarReservations.push_back(walReservation);
+  HANDLE shmReservation = INVALID_HANDLE_VALUE;
+  if (!ReserveSqliteSidecar(
+          rootOpened.final,
+          parsedRoot,
+          shmName,
+          &shmReservation,
+          &failure)) {
+    for (auto iterator = sidecarReservations.rbegin();
+         iterator != sidecarReservations.rend();
+         ++iterator) {
+      if (*iterator != INVALID_HANDLE_VALUE) CloseHandle(*iterator);
+    }
+    ReleaseMutex(coordination);
+    CloseHandle(coordination);
+    return ThrowFailure(env, failure);
+  }
+  sidecarReservations.push_back(shmReservation);
+
   std::vector<HANDLE> handles = TakeAllHandles(&rootOpened);
   AppendHandles(&handles, TakeAllHandles(&databaseOpened));
   AppendHandles(&handles, TakeAllHandles(&journalOpened));
+  AppendHandles(&handles, std::move(sidecarReservations));
   auto* lease = new (std::nothrow) SqliteStateLease;
   if (lease == nullptr) {
     for (auto iterator = handles.rbegin(); iterator != handles.rend(); ++iterator) {
@@ -3388,6 +3488,15 @@ napi_value ReleaseSqliteStateLeaseCallback(
   if (!IsIssuedSqliteStateLease(lease) || !lease->active || lease->handles.empty()) {
     return ThrowFailure(env, SqliteStateLeaseForeign());
   }
+  // A Win32 mutex can be released only by its owning thread. Reject before
+  // unregistering or closing anything so the owner can still perform the
+  // complete release; partial cleanup here would strand an owned mutex until
+  // that thread exits.
+  if (lease->coordination != nullptr
+      && lease->coordinationHeld
+      && lease->ownerThreadId != GetCurrentThreadId()) {
+    return ThrowFailure(env, SqliteStateLeaseForeign());
+  }
   UnregisterSqliteStateLease(lease);
   bool closed = true;
   for (auto iterator = lease->handles.rbegin();
@@ -3398,8 +3507,7 @@ napi_value ReleaseSqliteStateLeaseCallback(
   lease->handles.clear();
   if (lease->coordination != nullptr) {
     if (lease->coordinationHeld) {
-      if (lease->ownerThreadId != GetCurrentThreadId()
-          || !ReleaseMutex(lease->coordination)) {
+      if (!ReleaseMutex(lease->coordination)) {
         closed = false;
       }
     }
