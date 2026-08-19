@@ -767,8 +767,17 @@
           </div>
             <div class="table-wrap">
               <table>
-                <caption class="sr-only">Replay-safe usage grouped by model, across every allowance</caption>
-                <thead><tr><th>Model</th><th>Usage changes</th><th>Tokens</th><th>Standard API equivalent</th></tr></thead>
+                <caption class="sr-only">Replay-safe usage grouped by model, across every allowance. Each model expands into its token components as rows of the same table.</caption>
+                <thead>
+                  <tr>
+                    <th>Model</th>
+                    <th>Usage changes</th>
+                    <th>Tokens</th>
+                    <th class="model-share-head" data-i18n="accounting.model.shareHeading">Share</th>
+                    <th>Standard API equivalent</th>
+                    <th class="model-share-head" data-i18n="accounting.model.shareHeading">Share</th>
+                  </tr>
+                </thead>
                 <tbody id="accounting-models"></tbody>
               </table>
             </div>
@@ -777,6 +786,10 @@
               <span class="table-pagination-status" id="accounting-model-page-status" role="status"></span>
               <button class="button button-quiet compact" id="accounting-model-page-next" type="button" aria-controls="accounting-models" data-i18n="table.pagination.next">Next</button>
             </div>
+            <p class="annotation" data-i18n="accounting.model.shareOfPeriod">
+              Both share columns are a share of the whole period, so components
+              add up to their model and models add up to the total.
+            </p>
             <p class="annotation" id="accounting-price-coverage" hidden></p>
             <!--
               The expansion of the marker each separately metered row carries.

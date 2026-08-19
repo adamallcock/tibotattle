@@ -1614,6 +1614,67 @@ test("the cost card drops its metadata line while coverage honesty stays elsewhe
   assert.doesNotMatch(appSource, /pricedEventCoveragePercent[^\n]*priced/u);
 });
 
+test("a model row carries its own components, and a row without them says so rather than reporting zeroes", () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    accounting: {
+      periodId: "7d",
+      byModel: [
+        {
+          model: "gpt-5.6-sol",
+          events: 4,
+          totalTokens: 3_300,
+          apiPriceEquivalentUsd: 12.5,
+          pricingStatus: "priced",
+          allowanceTrack: "primary",
+          apiPriceEquivalentApplicable: true,
+          components: {
+            input_cache_read_tokens: 3_000,
+            input_uncached_tokens: 200,
+            output_text_tokens: 60,
+            output_reasoning_tokens: 40,
+          },
+          componentCosts: {
+            input_cache_read_tokens: { tokens: 3_000, costUsd: 1.5 },
+            input_uncached_tokens: { tokens: 200, costUsd: 8 },
+            output_text_tokens: { tokens: 60, costUsd: 1.8 },
+            output_reasoning_tokens: { tokens: 40, costUsd: 1.2 },
+          },
+        },
+        {
+          // An older projection that never accumulated a split.
+          model: "gpt-5.6-luna",
+          events: 2,
+          totalTokens: 900,
+          apiPriceEquivalentUsd: 0.4,
+          pricingStatus: "priced",
+          allowanceTrack: "primary",
+          apiPriceEquivalentApplicable: true,
+        },
+      ],
+    },
+  });
+  const [sol, luna] = result.accounting.byModel;
+
+  assert.equal(sol.components.input_cache_read_tokens, 3_000);
+  assert.equal(sol.components.output_reasoning_tokens, 40);
+  // Keys the row never mentioned are a real zero, because the row did report a
+  // split and that split contained none of them.
+  assert.equal(sol.components.input_cache_write_tokens, 0);
+  assert.equal(sol.componentCosts.input_uncached_tokens.costUsd, 8);
+  assert.equal(
+    Object.values(sol.componentCosts).reduce((sum, cost) => sum + cost.costUsd, 0),
+    sol.apiPriceEquivalentUsd,
+  );
+
+  // A row that reported no split at all must stay distinguishable from one
+  // that reported an all-zero split: normalising it to six zeroes would make
+  // the table draw a complete breakdown the row never claimed.
+  assert.equal(luna.components, null);
+  assert.equal(luna.componentCosts, null);
+  assert.equal(luna.totalTokens, 900);
+});
+
 test("the client keeps both allowance tracks and the pricing status of each model", () => {
   const result = normalizeDashboardPayload({
     mode: "real_local_evidence",

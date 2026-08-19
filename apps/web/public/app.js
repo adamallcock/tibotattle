@@ -112,6 +112,9 @@ let residualInspectionSignature = "";
 // period or refreshed row set returns to page one.
 const CACHE_IMPACT_TABLE_PAGE_SIZE = 10;
 const accountingModelsTablePagination = { page: 0, signature: "" };
+// Which model rows the reader has opened. Held outside the render so a
+// background refresh redraws the table without collapsing a row mid-read.
+const accountingExpandedModels = new Set();
 const cacheSwitchTablePagination = { page: 0, signature: "" };
 const cacheContinuityGapTablePagination = { page: 0, signature: "" };
 const cacheContinuityTablePagination = { page: 0, signature: "" };
@@ -547,6 +550,37 @@ function formatPercent(value, digits = 0) {
   const rendered = format(number);
   if (number > 0 && rendered === format(0)) return `<${format(step)}`;
   if (number < 100 && rendered === format(100)) return `>${format(100 - step)}`;
+  return rendered;
+}
+
+/**
+ * A share for a table column, always at one decimal place.
+ *
+ * `formatPercent` drops to whole numbers whenever the value happens to be an
+ * integer, which is right for a sentence and wrong for a column: it renders
+ * "20%" directly above "20.9%", so the decimal point moves down the page and
+ * two figures that exist to be compared have to be read digit by digit. Here
+ * the precision is fixed, and the same bounded "<" idiom keeps a sliver from
+ * rendering as an exact zero it is not.
+ *
+ * Returns `null` when the denominator cannot carry a share at all, so callers
+ * withhold the cell rather than printing a share of nothing.
+ */
+function formatSharePercent(part, whole) {
+  const numerator = finite(part);
+  const denominator = finite(whole);
+  if (numerator === null || denominator === null || denominator <= 0) return null;
+  if (numerator < 0) return null;
+  const percentFormatter = numberFormatter({
+    maximumFractionDigits: 1,
+    minimumFractionDigits: 1,
+    style: "percent",
+  });
+  const format = (amount) => percentFormatter.format(amount / 100);
+  const value = numerator / denominator * 100;
+  const rendered = format(value);
+  if (value > 0 && rendered === format(0)) return `<${format(.1)}`;
+  if (value < 100 && rendered === format(100)) return `>${format(99.9)}`;
   return rendered;
 }
 
@@ -8695,6 +8729,23 @@ function modelRowIsSeparateAllowance(row) {
  *                        never silently shown as zero.
  *   a real amount      - including an honest, priced $0.00.
  */
+/**
+ * Whether this row states an API-price equivalent that can be compared with
+ * the pool's total at all.
+ *
+ * The share column has to ask the same question the amount column already
+ * asks. A row whose amount reads "No published price" holds no money figure,
+ * so its share of the period's money is not zero — it is unknown, and printing
+ * "0.0%" beside "No published price" would contradict the cell next to it.
+ */
+function modelHasComparableCost(row) {
+  if (modelRowIsSeparateAllowance(row)) return false;
+  if (row?.pricingStatus === "known_unpriced") return false;
+  if (row?.pricingStatus === "unrecognized") return false;
+  const amount = finite(row?.apiPriceEquivalentUsd);
+  return amount !== null && amount >= 0;
+}
+
 function modelApiEquivalentCell(row) {
   const cell = node("td", "model-api-equivalent");
   if (modelRowIsSeparateAllowance(row)) {
@@ -8744,6 +8795,102 @@ function pricingCoverageNote(accounting) {
   });
 }
 
+/**
+ * The token components a model row can break down into, in reading order:
+ * input before output, and within each the cheaper-per-token part first. The
+ * label is a key rather than a string so the rows retranslate in place.
+ */
+const MODEL_COMPONENT_ROWS = Object.freeze([
+  ["input_cache_read_tokens", "accounting.model.componentCached"],
+  ["input_uncached_tokens", "accounting.model.componentUncached"],
+  ["input_cache_write_tokens", "accounting.model.componentCacheWrite"],
+  ["output_text_tokens", "accounting.model.componentOutputText"],
+  ["output_reasoning_tokens", "accounting.model.componentReasoning"],
+  ["output_combined_tokens", "accounting.model.componentCombined"],
+]);
+
+/**
+ * A share cell. `null` prints the same withheld glyph the rest of this table
+ * uses, so "no denominator to divide by" never renders as an exact 0.0%.
+ */
+function modelShareCell(part, whole) {
+  const share = formatSharePercent(part, whole);
+  if (share === null) {
+    return localizedNode("td", "numeric-cell model-share", "accounting.model.shareWithheld");
+  }
+  return rawNode("td", "numeric-cell model-share", share);
+}
+
+/**
+ * One component of one model, built as a row of the same table rather than a
+ * nested grid: same columns, same alignment, one level of indent. Only the
+ * denominator differs from the model row above it, and that is stated once in
+ * the caption under the table.
+ */
+function modelComponentRow(model, key, labelKey, totals) {
+  const row = node("tr", "model-component-row");
+  row.dataset.componentOf = model.model;
+
+  const identity = node("td", "model-identity model-component-identity");
+  const swatch = node("span", `component-swatch component-swatch-${key.replace(/_/gu, "-")}`);
+  swatch.setAttribute("aria-hidden", "true");
+  identity.append(swatch, localizedNode("span", "", labelKey));
+
+  // A usage change carries every component at once, so the count does not
+  // divide between them. Withheld with its reason, never shown as zero.
+  const events = localizedNode(
+    "td",
+    "numeric-cell model-component-withheld",
+    "accounting.model.componentEventsWithheld",
+  );
+  events.title = t("accounting.model.componentEventsWithheldTitle");
+
+  const tokens = finite(model.components?.[key], 0);
+  const cost = model.componentCosts?.[key] ?? null;
+
+  // A separate allowance carries no comparable money, and a row whose
+  // components were never priced carries none either. Both withhold the
+  // amount instead of dividing the row total into an invented one.
+  let costCell;
+  let costShareCell;
+  if (!modelHasComparableCost(model) || cost === null) {
+    costCell = localizedNode(
+      "td",
+      "numeric-cell model-component-withheld",
+      "accounting.model.componentCostWithheld",
+    );
+    costCell.title = t(
+      modelRowIsSeparateAllowance(model)
+        ? "accounting.model.separateAllowanceTitle"
+        : model.pricingStatus === "known_unpriced"
+          ? "accounting.model.noPublishedPriceTitle"
+          : model.pricingStatus === "unrecognized"
+            ? "accounting.model.notPricedUnknownTitle"
+            : "accounting.model.componentCostWithheldTitle",
+    );
+    costShareCell = localizedNode(
+      "td",
+      "numeric-cell model-share",
+      "accounting.model.shareWithheld",
+    );
+  } else {
+    costCell = rawNode("td", "numeric-cell", formatApiMoney(finite(cost.costUsd, 0)));
+    costShareCell = modelShareCell(finite(cost.costUsd, 0), totals.cost);
+  }
+
+  row.append(
+    identity,
+    events,
+    rawNode("td", "numeric-cell", formatCount(tokens)),
+    modelRowIsSeparateAllowance(model)
+      ? localizedNode("td", "numeric-cell model-share", "accounting.model.shareWithheld")
+      : modelShareCell(tokens, totals.tokens),
+    costCell,
+    costShareCell,
+  );
+  return row;
+}
+
 function renderAccountingModels(accounting) {
   const models = $("#accounting-models");
   if (!models) return;
@@ -8768,11 +8915,19 @@ function renderAccountingModels(accounting) {
   if (!modelRows.length) {
     const row = node("tr");
     const cell = localizedNode("td", "empty-cell", "accounting.model.noneInPeriod");
-    cell.colSpan = 4;
+    cell.colSpan = 6;
     row.append(cell);
     models.append(row);
     return;
   }
+  // Both share columns are against the primary pool's own totals, so the model
+  // rows add up to 100% and each model's components add up to their model. A
+  // separately metered row is not part of that pool and withholds both shares,
+  // the same rule its money cell already follows.
+  const totals = {
+    tokens: finite(accounting?.totalTokens, 0),
+    cost: finite(accounting?.apiPriceEquivalentUsd, 0),
+  };
   for (const model of page.rows) {
     const row = node("tr");
     const identity = node("td", "model-identity");
@@ -8800,14 +8955,85 @@ function renderAccountingModels(accounting) {
     }
     // One formatter for both count columns. Compact notation put "154.9K"
     // beside "74" in the same column, which no reader can compare by eye.
+    const separate = modelRowIsSeparateAllowance(model);
     row.append(
       identity,
       rawNode("td", "numeric-cell", formatCount(model.events)),
       rawNode("td", "numeric-cell", formatCount(model.totalTokens)),
+      separate
+        ? localizedNode("td", "numeric-cell model-share", "accounting.model.shareWithheld")
+        : modelShareCell(model.totalTokens, totals.tokens),
       modelApiEquivalentCell(model),
+      modelHasComparableCost(model)
+        ? modelShareCell(model.apiPriceEquivalentUsd, totals.cost)
+        : localizedNode("td", "numeric-cell model-share", "accounting.model.shareWithheld"),
     );
-    models.append(row);
+
+    // A row can only be opened when it actually carries a split. Older cached
+    // projections have none, and drawing four zeroed rows for them would be a
+    // claim the row never made.
+    const componentRows = model.components === null || model.components === undefined
+      ? []
+      : MODEL_COMPONENT_ROWS
+        .filter(([key]) => finite(model.components[key], 0) > 0)
+        .map(([key, labelKey]) => modelComponentRow(model, key, labelKey, totals));
+
+    if (componentRows.length > 0) {
+      const expanded = accountingExpandedModels.has(model.model);
+      row.classList.add("model-row-expandable");
+      row.tabIndex = 0;
+      row.setAttribute("role", "button");
+      row.setAttribute("aria-expanded", String(expanded));
+      const describe = () => {
+        row.setAttribute(
+          "aria-label",
+          t(
+            row.getAttribute("aria-expanded") === "true"
+              ? "accounting.model.collapse"
+              : "accounting.model.expand",
+            { model: formatModelName(model.model) },
+          ),
+        );
+      };
+      describe();
+      identity.prepend(modelDisclosureCaret());
+      for (const componentRow of componentRows) componentRow.hidden = !expanded;
+      const toggle = () => {
+        const open = row.getAttribute("aria-expanded") === "true";
+        row.setAttribute("aria-expanded", String(!open));
+        if (open) accountingExpandedModels.delete(model.model);
+        else accountingExpandedModels.add(model.model);
+        for (const componentRow of componentRows) componentRow.hidden = open;
+        describe();
+      };
+      row.addEventListener("click", toggle);
+      row.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        toggle();
+      });
+    }
+
+    models.append(row, ...componentRows);
   }
+}
+
+/** The affordance that says a model row opens. Decorative; the row is the control. */
+function modelDisclosureCaret() {
+  const caret = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  caret.setAttribute("class", "model-disclosure-caret");
+  caret.setAttribute("viewBox", "0 0 16 16");
+  caret.setAttribute("aria-hidden", "true");
+  caret.setAttribute("focusable", "false");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", "M6 3.5 10.5 8 6 12.5");
+  path.setAttribute("fill", "none");
+  path.setAttribute("stroke", "currentColor");
+  path.setAttribute("stroke-width", "1.8");
+  path.setAttribute("stroke-linecap", "round");
+  path.setAttribute("stroke-linejoin", "round");
+  caret.append(path);
+  return caret;
 }
 
 function fastModeCoverageSentence(fastMode) {

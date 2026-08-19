@@ -422,6 +422,28 @@ export const WEB_MESSAGES = Object.freeze({
   "accounting.model.notReported": ["Not reported", "未报告", "No informado"],
   "accounting.model.notReportedTitle": ["No usable figure was reported for this row. It is shown as missing rather than as zero.", "此行没有报告可用的数值。它显示为缺失而不是零。", "No se informó ninguna cifra utilizable para esta fila. Se muestra como ausente, no como cero."],
   "accounting.model.zeroTitle": ["A priced total that rounds to zero for this period.", "此期间计价后的总额四舍五入为零。", "Un total con precio que se redondea a cero en este período."],
+  // Component rows under a model. Every share in this table is against the
+  // whole period, so components add up to their model and models add up to the
+  // total; the denominator is stated once in the caption rather than on each
+  // row, where it would be text to read past on every comparison.
+  "accounting.model.componentCached": ["Cached input", "缓存输入", "Entrada en caché"],
+  "accounting.model.componentUncached": ["Uncached input", "未缓存输入", "Entrada sin caché"],
+  "accounting.model.componentCacheWrite": ["Cache write", "缓存写入", "Escritura en caché"],
+  "accounting.model.componentOutputText": ["Output text", "输出文本", "Texto de salida"],
+  "accounting.model.componentReasoning": ["Reasoning output", "推理输出", "Salida de razonamiento"],
+  "accounting.model.componentCombined": ["Combined output", "合并输出", "Salida combinada"],
+  "accounting.model.expand": ["Show the token components of {model}", "显示 {model} 的令牌组成", "Mostrar los componentes de tokens de {model}"],
+  "accounting.model.collapse": ["Hide the token components of {model}", "隐藏 {model} 的令牌组成", "Ocultar los componentes de tokens de {model}"],
+  // A usage change carries every component at once, so the count does not
+  // divide between them. Withheld rather than shown as zero.
+  "accounting.model.componentEventsWithheld": ["—", "—", "—"],
+  "accounting.model.componentEventsWithheldTitle": ["A usage change carries every token component at once, so it cannot be divided between them.", "一次使用变更同时包含所有令牌组成部分，因此无法在它们之间划分。", "Un cambio de uso incluye todos los componentes de tokens a la vez, por lo que no puede dividirse entre ellos."],
+  "accounting.model.componentsUnavailable": ["This row reported no token components, so none are shown rather than shown as zero.", "此行未报告令牌组成，因此不显示，而不是显示为零。", "Esta fila no informó componentes de tokens, por lo que no se muestran en lugar de mostrarse como cero."],
+  "accounting.model.componentCostWithheld": ["—", "—", "—"],
+  "accounting.model.componentCostWithheldTitle": ["No priced amount was reported for this component, so none is shown rather than shown as a priced zero.", "此组成部分没有报告计价金额，因此不显示，而不是显示为计价零。", "No se informó ningún importe con precio para este componente, así que no se muestra en lugar de mostrarse como un cero con precio."],
+  "accounting.model.shareHeading": ["Share", "占比", "Proporción"],
+  "accounting.model.shareOfPeriod": ["Both share columns are a share of the whole period, so components add up to their model and models add up to the total.", "两个占比列均相对于整个期间，因此各组成部分之和等于其模型，各模型之和等于总计。", "Ambas columnas de proporción son respecto al período completo, por lo que los componentes suman su modelo y los modelos suman el total."],
+  "accounting.model.shareWithheld": ["—", "—", "—"],
   "accounting.period.indexedHistory": ["Indexed history", "已索引历史", "Historial indexado"],
   "accounting.period.indexedHistorySoFar": ["Indexed history so far", "目前已索引的历史", "Historial indexado hasta ahora"],
   "accounting.fastMode.noUsage": ["No usage increments in this period, so there is no speed-mode attribution to report.", "此期间没有使用增量，因此没有可报告的速度模式归因。", "No hay incrementos de uso en este período, por lo que no hay atribución de modo de velocidad que informar."],
@@ -1465,7 +1487,7 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Indexed history": ["已索引历史", "Historial indexado"],
   "Model usage": ["模型使用情况", "Uso por modelo"],
   "A model on a separate allowance is listed on its own row and carries no API equivalent, because that figure cannot be compared with the main allowance. Nothing unavailable is replaced with an invented cost.": ["使用独立额度的模型会单独列为一行，并且不显示 API 等价值，因为该数值无法与主额度比较。任何不可用的数据都不会被虚构成本替代。", "Un modelo con una cuota independiente aparece en su propia fila y no lleva equivalente de API, porque esa cifra no se puede comparar con la cuota principal. Nada que no esté disponible se sustituye por un coste inventado."],
-  "Replay-safe usage grouped by model, across every allowance": ["按模型分组的可安全重放使用情况，涵盖所有额度", "Uso seguro para reproducción agrupado por modelo, en todas las cuotas"],
+  "Replay-safe usage grouped by model, across every allowance. Each model expands into its token components as rows of the same table.": ["按模型分组的可安全重放使用情况，涵盖所有额度。每个模型可展开为同一表格中的令牌组成行。", "Uso seguro para reproducción agrupado por modelo, en todas las cuotas. Cada modelo se expande en sus componentes de tokens como filas de la misma tabla."],
   "Review before sending": ["发送前审阅", "Revisar antes de enviar"],
   "Prepare and review a contribution": ["准备并审阅贡献", "Preparar y revisar una contribución"],
   "Nothing sends automatically": ["不会自动发送任何内容", "Nada se envía automáticamente"],
@@ -1763,6 +1785,7 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Standard API equivalent": ["Standard API 等值", "Equivalente de API Standard"],
   "API equivalent": ["API 等值", "Equivalente de API"],
   "See possible switch overhead": ["查看可能的切换开销", "Ver el posible coste adicional al cambiar"],
+  "Both share columns are a share of the whole period, so components add up to their model and models add up to the total.": ["两个占比列均相对于整个期间，因此各组成部分之和等于其模型，各模型之和等于总计。", "Ambas columnas de proporción son respecto al período completo, por lo que los componentes suman su modelo y los modelos suman el total."],
   "These recent rows pair an adjacent model or reasoning change with an observed material cache-read drop within five minutes. The cache-read change is observed; its relationship to the setting change is inferred.": ["这些近期记录将相邻的模型或推理强度更改与五分钟内观测到的缓存读取量大幅下降配对。缓存读取量的变化是观测结果；它与设置更改之间的关系是推断结果。", "Estas filas recientes emparejan un cambio adyacente de modelo o razonamiento con una caída material observada de lectura de caché en un plazo de cinco minutos. El cambio de lectura de caché se observa; su relación con el cambio de configuración se infiere."],
   "Recent possible switch-overhead evidence": ["近期可能的切换开销证据", "Evidencia reciente de posible coste adicional al cambiar"],
   "Configuration change": ["配置更改", "Cambio de configuración"],

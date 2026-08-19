@@ -394,10 +394,17 @@ export function addUsageToPeriod(period, projection) {
     events: 0,
     totalTokens: 0,
     apiPriceEquivalentUsd: 0,
+    // Token components per model, matching the crossing the replay-safe cache
+    // keeps. This projection carries no per-component priced breakdown, so it
+    // contributes the token split only; a reader that finds no `componentCosts`
+    // on a row shows the token cells and withholds the money cells rather than
+    // dividing the row total into an invented one.
+    components: emptyComponents(),
   };
   modelSummary.events += 1;
   modelSummary.totalTokens += projection.totalTokens;
   modelSummary.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
+  addComponents(modelSummary.components, projection.components);
   period.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
   if (projection.apiPriceEquivalentUsdExact !== null) {
     period.apiPriceEquivalentUsdExact = period.apiPriceEquivalentUsdExact === null
