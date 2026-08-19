@@ -34,5 +34,44 @@ const incrementalContribution = createLocalIncrementalContributionSyncContext({
   storage,
 });
 
-export const createIncrementalContributionSyncController =
-  incrementalContribution.createIncrementalContributionSyncController;
+function createIncrementalContributionStorage({
+  platform = process.platform,
+  windowsProtectedStateStore = null,
+} = {}) {
+  return createOwnerOnlyAutomaticContributionStorageContext({
+    createError: (code) => new IncrementalContributionSyncError(
+      code === "instance_lock_unavailable" || code === "instance_active"
+        ? "settings_unavailable"
+        : code,
+    ),
+    platform,
+    windowsProtectedStateStore,
+  });
+}
+
+// Keep the default Mac/Linux context and expose an explicit Windows
+// composition seam. The latter can only reach the controller through the
+// protected-store-backed storage port, never through an arbitrary reader or
+// writer object.
+export function createIncrementalContributionSyncController(options = {}) {
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("incremental contribution options must be an object");
+  }
+  const hasWindowsComposition = Object.hasOwn(options, "platform")
+    || Object.hasOwn(options, "windowsProtectedStateStore");
+  if (!hasWindowsComposition) {
+    return incrementalContribution.createIncrementalContributionSyncController(options);
+  }
+  const {
+    platform = process.platform,
+    windowsProtectedStateStore = null,
+    ...controllerOptions
+  } = options;
+  const context = createLocalIncrementalContributionSyncContext({
+    storage: createIncrementalContributionStorage({
+      platform,
+      windowsProtectedStateStore,
+    }),
+  });
+  return context.createIncrementalContributionSyncController(controllerOptions);
+}

@@ -9,9 +9,13 @@ import {
   rename,
   unlink,
 } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, win32 } from "node:path";
 
 import { syncDirectory } from "./owner-only-filesystem.js";
+import {
+  isWindowsProtectedStateStore,
+  isWindowsProtectedStateStoreError,
+} from "./windows-protected-state-store.js";
 
 const INSTANCE_LOCK_SCHEMA_VERSION =
   "automatic-contribution-instance-lock-v0.1";
@@ -120,14 +124,127 @@ function validInstanceLockPayload(value) {
     && UUID_V4.test(value.nonce);
 }
 
+function normalizedPlatform(platform) {
+  if (typeof platform !== "string" || platform.length < 1) {
+    throw new TypeError("platform must be a non-empty string");
+  }
+  // A Windows process must not be able to opt into the ordinary Node
+  // filesystem path by passing a different platform label.  The explicit
+  // platform argument is retained for Mac/Linux contract tests that exercise
+  // the Windows routing branch with a synthetic protected-store adapter.
+  if (process.platform === "win32" && platform !== "win32") {
+    throw new TypeError("platform downgrade is not permitted on Windows");
+  }
+  return platform;
+}
+
+function protectedStoreErrorCode(error) {
+  try {
+    return isWindowsProtectedStateStoreError(error) && typeof error.code === "string"
+      ? error.code
+      : "";
+  } catch {
+    return "";
+  }
+}
+
+function isProtectedStoreMissing(error) {
+  return protectedStoreErrorCode(error)
+    === "windows_protected_state_store_missing";
+}
+
+function isProtectedStoreAlreadyExists(error) {
+  return protectedStoreErrorCode(error)
+    === "windows_protected_state_store_already_exists";
+}
+
+function windowsChildReference(settingsFile, store, failures) {
+  let selected;
+  let root;
+  try {
+    if (typeof settingsFile !== "string" || settingsFile.length < 1) {
+      failures.fail("configuration_invalid");
+    }
+    if (!isWindowsProtectedStateStore(store)
+        || store.contractVersion !== "windows-protected-state-store-v1"
+        || typeof store.rootPath !== "string") {
+      // A missing or unqualified Windows store is an operational boundary
+      // failure, not permission to use the POSIX path implementation.
+      failures.fail("settings_unavailable");
+    }
+    const raw = settingsFile.replaceAll("/", "\\");
+    const rootRaw = store.rootPath.replaceAll("/", "\\");
+    // Do not let win32.normalize turn a caller-supplied traversal into a
+    // seemingly valid direct child. The protected store repeats this check,
+    // but the storage port must bind the caller's state path before invoking
+    // any operation on the store.
+    if (raw.includes("\0") || rootRaw.includes("\0")
+        || raw.split("\\").some((component) => component === "." || component === "..")) {
+      failures.fail("configuration_invalid");
+    }
+    selected = win32.normalize(raw);
+    root = win32.normalize(rootRaw);
+    if (!win32.isAbsolute(selected)
+        || !win32.isAbsolute(root)
+        || win32.dirname(selected).toLowerCase() !== root.toLowerCase()) {
+      failures.fail("configuration_invalid");
+    }
+    const child = win32.basename(selected);
+    if (child.length < 1
+        || child === "."
+        || child === ".."
+        || child.includes("\\")
+        || child.includes("/")) {
+      failures.fail("configuration_invalid");
+    }
+    return Object.freeze({
+      child,
+      path: win32.join(root, child),
+      root,
+      store,
+    });
+  } catch (error) {
+    if (failures.issued(error)) throw error;
+    failures.fail("configuration_invalid");
+  }
+}
+
+function assertProtectedRecord(record, expectedPath, maximumBytes, failures) {
+  let data;
+  let path;
+  try {
+    data = record?.data;
+    path = record?.path;
+  } catch {
+    failures.fail("settings_unavailable");
+  }
+  if ((!Buffer.isBuffer(data) && !(data instanceof Uint8Array))
+      || data.byteLength < 1
+      || data.byteLength > maximumBytes
+      || typeof path !== "string"
+      || win32.normalize(path).toLowerCase()
+        !== win32.normalize(expectedPath).toLowerCase()) {
+    failures.fail("settings_unavailable");
+  }
+  return Buffer.from(data);
+}
+
 export function createOwnerOnlyAutomaticContributionStorageContext({
   createError,
   uuid = randomUUID,
   processId = process.pid,
   defaultProcessLiveness = defaultProcessIsAlive,
+  platform = process.platform,
+  windowsProtectedStateStore = null,
 } = {}) {
   const failures = failureContext(createError);
   const createUuid = requireFunction(uuid, "uuid");
+  const runtimePlatform = normalizedPlatform(platform);
+  if (runtimePlatform === "win32"
+      && windowsProtectedStateStore !== null
+      && !isWindowsProtectedStateStore(windowsProtectedStateStore)) {
+    throw new TypeError("windowsProtectedStateStore must be repository branded");
+  }
   const processIsAliveByDefault = requireFunction(
     defaultProcessLiveness,
     "defaultProcessLiveness",
@@ -147,6 +264,103 @@ export function createOwnerOnlyAutomaticContributionStorageContext({
     }
     if (typeof value !== "string" || !UUID_V4.test(value)) failures.fail(code);
     return value;
+  }
+
+  function protectedStateTarget(settingsFile) {
+    let target;
+    try {
+      target = windowsChildReference(
+        settingsFile,
+        windowsProtectedStateStore,
+        failures,
+      );
+      target.store.ensureProtectedDirectory();
+      return target;
+    } catch (error) {
+      if (failures.issued(error)) throw error;
+      failures.fail("settings_unavailable");
+    }
+  }
+
+  function assertProtectedOperation(result, expectedPath) {
+    let path;
+    try {
+      path = result?.path;
+    } catch {
+      failures.fail("settings_unavailable");
+    }
+    if (typeof path !== "string"
+        || win32.normalize(path).toLowerCase()
+          !== win32.normalize(expectedPath).toLowerCase()) {
+      failures.fail("settings_unavailable");
+    }
+  }
+
+  function readProtectedSettingsText({ settingsFile, maximumBytes }) {
+    const target = protectedStateTarget(settingsFile);
+    let bytes;
+    try {
+      const record = target.store.read(target.child);
+      bytes = assertProtectedRecord(
+        record,
+        target.path,
+        maximumBytes,
+        failures,
+      );
+      return bytes.toString("utf8");
+    } catch (error) {
+      if (isProtectedStoreMissing(error)) return null;
+      if (failures.issued(error)) throw error;
+      failures.fail("settings_unavailable");
+    } finally {
+      bytes?.fill(0);
+    }
+  }
+
+  function writeProtectedSettingsText({ settingsFile, text, maximumBytes }) {
+    const target = protectedStateTarget(settingsFile);
+    let payload;
+    try {
+      payload = Buffer.from(text, "utf8");
+      if (payload.length < 1 || payload.length > maximumBytes) {
+        failures.fail("settings_unavailable");
+      }
+      try {
+        const created = target.store.create(target.child, payload);
+        assertProtectedOperation(created, target.path);
+        return;
+      } catch (error) {
+        if (!isProtectedStoreAlreadyExists(error)) throw error;
+      }
+
+      // Replacement is identity-bound.  A caller cannot turn the create
+      // race into an unqualified path overwrite by supplying a reader/writer
+      // pair or by reusing an identity from another child.
+      let current;
+      let currentBytes;
+      try {
+        current = target.store.read(target.child);
+        currentBytes = assertProtectedRecord(
+          current,
+          target.path,
+          maximumBytes,
+          failures,
+        );
+        const replaced = target.store.replace(
+          target.child,
+          current.identity,
+          payload,
+        );
+        assertProtectedOperation(replaced, target.path);
+      } finally {
+        currentBytes?.fill(0);
+      }
+    } catch (error) {
+      if (failures.issued(error)) throw error;
+      failures.fail("settings_unavailable");
+    } finally {
+      payload?.fill(0);
+    }
   }
 
   async function canonicalTarget(path, unavailableCode) {
@@ -178,6 +392,9 @@ export function createOwnerOnlyAutomaticContributionStorageContext({
   async function readSettingsText({ settingsFile, maximumBytes } = {}) {
     if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1) {
       failures.fail("configuration_invalid");
+    }
+    if (runtimePlatform === "win32") {
+      return readProtectedSettingsText({ settingsFile, maximumBytes });
     }
     const target = await canonicalTarget(settingsFile, "settings_unavailable");
     let handle;
@@ -228,6 +445,9 @@ export function createOwnerOnlyAutomaticContributionStorageContext({
         || !Number.isSafeInteger(maximumBytes)
         || maximumBytes < 1) {
       failures.fail("configuration_invalid");
+    }
+    if (runtimePlatform === "win32") {
+      return writeProtectedSettingsText({ settingsFile, text, maximumBytes });
     }
     const target = await canonicalTarget(settingsFile, "settings_unavailable");
     try {
@@ -352,6 +572,12 @@ export function createOwnerOnlyAutomaticContributionStorageContext({
     processIsAlive = processIsAliveByDefault,
     maximumBytes,
   } = {}) {
+    // The JSON lock is not a valid Windows process-wide mutex.  Keep the
+    // existing fixed error until the kernel-backed lease is integrated; in
+    // particular, never fall back to O_EXCL and an unlink race on Windows.
+    if (runtimePlatform === "win32") {
+      failures.fail("instance_lock_unavailable");
+    }
     if (!Number.isSafeInteger(pid)
         || pid < 1
         || pid > 2_147_483_647
