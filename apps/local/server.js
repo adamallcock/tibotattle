@@ -122,11 +122,14 @@ import {
 } from "../../src/export-identity-production.js";
 import {
   createWindowsFilesystemAdapter,
+  createWindowsCompanionInstanceLeaseContext,
   createWindowsProtectedStateStore,
   createWindowsSqliteStateSession,
   createWindowsSqliteStateStaging,
   createLocalContributionSyncQueueStorageContext,
+  isWindowsCompanionInstanceLeaseContext,
   isWindowsFilesystemAdapter,
+  isWindowsProtectedStateStore,
   isWindowsSqliteStateStaging,
   WINDOWS_SQLITE_STATE_SESSION_PRODUCTION_SAFE,
 } from "../../src/platform/index.js";
@@ -2159,6 +2162,7 @@ export function createCompanionWindowsStateComposition({
       sqliteStateSessionForPath: null,
       sqliteStateStaging: null,
       contributionSyncQueue: null,
+      windowsCompanionInstanceLease: null,
     });
   }
   if (platform !== "win32"
@@ -2181,6 +2185,16 @@ export function createCompanionWindowsStateComposition({
     sqliteStateStaging = createWindowsSqliteStateStaging({
       adapter: windowsFilesystemAdapter,
       rootPath: stateRoot,
+    });
+  } catch {
+    throw windowsFilesystemConfigurationError();
+  }
+  let windowsCompanionInstanceLease;
+  try {
+    windowsCompanionInstanceLease = createWindowsCompanionInstanceLeaseContext({
+      platform,
+      architecture,
+      adapter: windowsFilesystemAdapter,
     });
   } catch {
     throw windowsFilesystemConfigurationError();
@@ -2244,6 +2258,7 @@ export function createCompanionWindowsStateComposition({
     sqliteStateSessionForPath,
     sqliteStateStaging,
     contributionSyncQueue,
+    windowsCompanionInstanceLease,
   });
 }
 
@@ -2500,6 +2515,8 @@ export function createLocalCompanionServer(options = {}) {
       windowsStateComposition.sqliteStateSessionForPath,
     windowsSqliteStateStaging: windowsStateComposition.sqliteStateStaging,
     contributionSyncQueueContext: windowsStateComposition.contributionSyncQueue,
+    windowsCompanionInstanceLease:
+      windowsStateComposition.windowsCompanionInstanceLease,
     parentWatchdogPid,
     homeDirectory,
     ...claudeShadowConfiguration,
@@ -2523,59 +2540,20 @@ function createPreparedLocalCompanionServer({
   windowsSqliteStateSessionForPath = null,
   windowsSqliteStateStaging = null,
   contributionSyncQueueContext = null,
+  windowsCompanionInstanceLease = null,
   parentWatchdogPid,
   // Explicit reversible authority switch. Unified is the normal authority;
   // legacy is retained only for an explicit rollback selection.
   accountingSourceMode =
     configuredAccountingSourceMode(environment),
-  fastModePreference = createFastModePreferenceController({
-    settingsFile: statePaths.fastModePreferenceFile,
-  }),
+  fastModePreference,
   // The declared Codex speed-mode baseline. Codex records the mode only when
   // it is applied or changed, never at session start, so the baseline lives
   // nowhere but the configuration's top-level `service_tier` key - and only
   // that key is ever read from that file. Each reading is stamped with the
   // moment it happened and attributes only turns from then on.
-  codexSpeedBaseline = createCodexSpeedBaselineController({
-    ledgerFile: statePaths.codexSpeedBaselineFile,
-    configFile: join(codexHome, "config.toml"),
-  }),
-  dataStore = new LocalCompanionDataStore({
-    builder: async ({ purpose = "full" } = {}) => buildLocalCompanionSnapshot({
-      root: resourceRoot,
-      collectorStateFile: statePaths.collectorStateFile,
-      archiveIndexFile: accountingSourceMode === "legacy"
-        ? statePaths.archiveAccountingIndexFile
-        : null,
-      unifiedIndexFile: statePaths.unifiedIndexFile,
-      codexHome,
-      accountingSourceMode,
-      unifiedProjectionMode: ["startup", "quick"].includes(purpose)
-        ? "deferred"
-        : "full",
-      allowDevelopmentArtifactFallback:
-        environment.USAGE_MONITOR_DEVELOPMENT_ARTIFACT_FALLBACK === "1",
-      includeDevelopmentSideChatEstimates:
-        environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_ESTIMATES === "1",
-      developmentSideChatHistoricalGapDate:
-        environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_DATE ?? null,
-      developmentSideChatHistoricalGapTimeZone:
-        environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_TIME_ZONE
-          ?? "America/New_York",
-      developmentSideChatHistoricalGapAssumedSpeed:
-        environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_SPEED
-          ?? "fast",
-      // The owner's stated Codex speed mode. It attributes only the turns that
-      // precede the first recorded tier change in their session; an observed
-      // tier always wins. A missing or unreadable statement degrades to the
-      // Standard default rather than inventing a Fast attribution.
-      fastModePreference: await fastModePreference.readMode(),
-      // Timestamped declared baselines. They fill only the turns the rollout
-      // log left unobserved and that a reading actually covers; an observed
-      // tier always wins, and an unreadable ledger is simply no coverage.
-      codexSpeedBaselines: await codexSpeedBaseline.readWindows(),
-    }),
-  }),
+  codexSpeedBaseline,
+  dataStore,
   // Reprice the usage events inside a bounded [from, to] window from the
   // unified local index, grouped by model and observed speed. Injected so a
   // test can drive the route's range validation and response shape without a
@@ -2603,79 +2581,8 @@ function createPreparedLocalCompanionServer({
   // A caller must explicitly opt into the production-shaped local shadow.
   claudeShadowEnabled = false,
   claudeShadowControllerFactory = createClaudeDesktopShadowController,
-  claudeShadowController = claudeShadowControllerFactory({
-    enabled: claudeShadowEnabled,
-    stateRoot,
-    homeDirectory,
-    projectDirectory: claudeProjectDirectory,
-    claudeConfigDirectory,
-  }),
-  refreshRunner = createLocalCollectorRefreshRunner({
-    codexHome,
-    stateFile: statePaths.collectorStateFile,
-    accountObservationOperationLockFile:
-      statePaths.accountObservationLockFile,
-    windowsFilesystemAdapter,
-    windowsSqliteStateSessionFactory,
-    windowsSqliteStateStaging,
-    refreshAccounting: refreshReplaySafeAccountingCache,
-    refreshClaudeQuota: async ({ signal }) => {
-      const secret = await readOrCreateClaudeDesktopQuotaSecret(
-        statePaths.claudeDesktopQuotaSecretFile,
-        {
-          platform: process.platform,
-          windowsProtectedStateStore,
-        },
-      );
-      try {
-        return await refreshClaudeDesktopQuota({
-          statePath: statePaths.claudeDesktopQuotaStateFile,
-          homeDirectory,
-          secret,
-          signal,
-          platform: process.platform,
-          windowsSqliteStateSession:
-            windowsSqliteStateSessionForPath === null
-              ? null
-              : windowsSqliteStateSessionForPath(
-                statePaths.claudeDesktopQuotaStateFile,
-              ),
-        });
-      } finally {
-        secret.fill(0);
-      }
-    },
-    refreshClaudeUsageShadow: claudeShadowEnabled
-      ? ({ signal }) => claudeShadowController.refresh({ signal })
-      : null,
-    accountingSourceMode,
-    legacyAnalysisIndexFile: accountingSourceMode === "legacy"
-      ? statePaths.legacyAnalysisIndexFile
-      : null,
-    legacyAnalysisIndexSecretFile: accountingSourceMode === "legacy"
-      ? statePaths.legacyAnalysisIndexSecretFile
-      : null,
-    refreshArchiveIndex: accountingSourceMode === "legacy"
-      ? refreshLocalArchiveAccountingIndex
-      : null,
-    archiveIndexFile: accountingSourceMode === "legacy"
-      ? statePaths.archiveAccountingIndexFile
-      : null,
-    archiveIndexSecretFile: accountingSourceMode === "legacy"
-      ? statePaths.archiveAccountingIndexSecretFile
-      : null,
-    // Advance the unified index by its cursors on every foreground refresh:
-    // an ordinary pass reads only the bytes the rollout corpus grew.
-    refreshUnifiedIndex: (options) => ingestLocalUnifiedIndexIncrement({
-      ...options,
-      contractVersion: TELEMETRY_SCHEMA_VERSION,
-    }),
-    unifiedIndexFile: statePaths.unifiedIndexFile,
-    unifiedIndexSecretFile: statePaths.unifiedIndexSecretFile,
-    recordCodexSpeedBaseline: async () => (
-      (await codexSpeedBaseline.record()).windows
-    ),
-  }),
+  claudeShadowController,
+  refreshRunner,
   onboardingProvider = () => inspectLocalOnboarding({
     codexHome,
     stateRoot,
@@ -2724,9 +2631,6 @@ function createPreparedLocalCompanionServer({
       || Array.isArray(environment)) {
     throw new TypeError("environment must be an object");
   }
-  if (!dataStore || typeof dataStore.initialize !== "function") {
-    throw new TypeError("dataStore.initialize must be a function");
-  }
   if (windowsFilesystemAdapter !== null
       && !isWindowsFilesystemAdapter(windowsFilesystemAdapter)) {
     throw windowsFilesystemConfigurationError();
@@ -2736,16 +2640,160 @@ function createPreparedLocalCompanionServer({
         || windowsSqliteStateSessionFactory !== null
         || windowsSqliteStateSessionForPath !== null
         || windowsSqliteStateStaging !== null
-        || contributionSyncQueueContext !== null)) {
+        || contributionSyncQueueContext !== null
+        || windowsCompanionInstanceLease !== null)) {
     throw windowsFilesystemConfigurationError();
   }
   if (windowsFilesystemAdapter !== null
-      && (windowsProtectedStateStore === null
+      && (!isWindowsProtectedStateStore(windowsProtectedStateStore)
         || typeof windowsSqliteStateSessionFactory !== "function"
         || typeof windowsSqliteStateSessionForPath !== "function"
         || !isWindowsSqliteStateStaging(windowsSqliteStateStaging)
-        || contributionSyncQueueContext === null)) {
+        || contributionSyncQueueContext === null
+        || !isWindowsCompanionInstanceLeaseContext(
+          windowsCompanionInstanceLease,
+        ))) {
     throw windowsFilesystemConfigurationError();
+  }
+  // These defaults used to be constructed as parameter initializers. That
+  // meant a Windows call could instantiate the ordinary module-level storage
+  // context before this composition had proved the protected store and
+  // companion lease. Construct them only after the one branded composition is
+  // validated, and pass that exact store through every fixed-state consumer.
+  const windowsFixedStateOptions = process.platform === "win32"
+    ? {
+      platform: process.platform,
+      windowsProtectedStateStore,
+    }
+    : {};
+  if (fastModePreference === undefined) {
+    fastModePreference = createFastModePreferenceController({
+      settingsFile: statePaths.fastModePreferenceFile,
+      ...windowsFixedStateOptions,
+    });
+  }
+  if (codexSpeedBaseline === undefined) {
+    codexSpeedBaseline = createCodexSpeedBaselineController({
+      ledgerFile: statePaths.codexSpeedBaselineFile,
+      configFile: join(codexHome, "config.toml"),
+      ...windowsFixedStateOptions,
+    });
+  }
+  if (claudeShadowController === undefined) {
+    claudeShadowController = claudeShadowControllerFactory({
+      enabled: claudeShadowEnabled,
+      stateRoot,
+      homeDirectory,
+      projectDirectory: claudeProjectDirectory,
+      claudeConfigDirectory,
+    });
+  }
+  if (dataStore === undefined) {
+    dataStore = new LocalCompanionDataStore({
+      builder: async ({ purpose = "full" } = {}) => buildLocalCompanionSnapshot({
+        root: resourceRoot,
+        collectorStateFile: statePaths.collectorStateFile,
+        archiveIndexFile: accountingSourceMode === "legacy"
+          ? statePaths.archiveAccountingIndexFile
+          : null,
+        unifiedIndexFile: statePaths.unifiedIndexFile,
+        codexHome,
+        accountingSourceMode,
+        unifiedProjectionMode: ["startup", "quick"].includes(purpose)
+          ? "deferred"
+          : "full",
+        allowDevelopmentArtifactFallback:
+          environment.USAGE_MONITOR_DEVELOPMENT_ARTIFACT_FALLBACK === "1",
+        includeDevelopmentSideChatEstimates:
+          environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_ESTIMATES === "1",
+        developmentSideChatHistoricalGapDate:
+          environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_DATE ?? null,
+        developmentSideChatHistoricalGapTimeZone:
+          environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_TIME_ZONE
+            ?? "America/New_York",
+        developmentSideChatHistoricalGapAssumedSpeed:
+          environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_SPEED
+            ?? "fast",
+        // The owner's stated Codex speed mode. It attributes only the turns
+        // that precede the first recorded tier change in their session; an
+        // observed tier always wins. A missing or unreadable statement
+        // degrades to the Standard default rather than inventing Fast.
+        fastModePreference: await fastModePreference.readMode(),
+        // Timestamped declared baselines fill only unobserved turns covered by
+        // a reading. An unreadable ledger is simply no coverage.
+        codexSpeedBaselines: await codexSpeedBaseline.readWindows(),
+      }),
+    });
+  }
+  if (refreshRunner === undefined) {
+    refreshRunner = createLocalCollectorRefreshRunner({
+      codexHome,
+      stateFile: statePaths.collectorStateFile,
+      accountObservationOperationLockFile:
+        statePaths.accountObservationLockFile,
+      windowsFilesystemAdapter,
+      windowsSqliteStateSessionFactory,
+      windowsSqliteStateStaging,
+      refreshAccounting: refreshReplaySafeAccountingCache,
+      refreshClaudeQuota: async ({ signal }) => {
+        const secret = await readOrCreateClaudeDesktopQuotaSecret(
+          statePaths.claudeDesktopQuotaSecretFile,
+          {
+            platform: process.platform,
+            windowsProtectedStateStore,
+          },
+        );
+        try {
+          return await refreshClaudeDesktopQuota({
+            statePath: statePaths.claudeDesktopQuotaStateFile,
+            homeDirectory,
+            secret,
+            signal,
+            platform: process.platform,
+            windowsSqliteStateSession:
+              windowsSqliteStateSessionForPath === null
+                ? null
+                : windowsSqliteStateSessionForPath(
+                  statePaths.claudeDesktopQuotaStateFile,
+                ),
+          });
+        } finally {
+          secret.fill(0);
+        }
+      },
+      refreshClaudeUsageShadow: claudeShadowEnabled
+        ? ({ signal }) => claudeShadowController.refresh({ signal })
+        : null,
+      accountingSourceMode,
+      legacyAnalysisIndexFile: accountingSourceMode === "legacy"
+        ? statePaths.legacyAnalysisIndexFile
+        : null,
+      legacyAnalysisIndexSecretFile: accountingSourceMode === "legacy"
+        ? statePaths.legacyAnalysisIndexSecretFile
+        : null,
+      refreshArchiveIndex: accountingSourceMode === "legacy"
+        ? refreshLocalArchiveAccountingIndex
+        : null,
+      archiveIndexFile: accountingSourceMode === "legacy"
+        ? statePaths.archiveAccountingIndexFile
+        : null,
+      archiveIndexSecretFile: accountingSourceMode === "legacy"
+        ? statePaths.archiveAccountingIndexSecretFile
+        : null,
+      // Advance the unified index by its cursors on every foreground refresh.
+      refreshUnifiedIndex: (options) => ingestLocalUnifiedIndexIncrement({
+        ...options,
+        contractVersion: TELEMETRY_SCHEMA_VERSION,
+      }),
+      unifiedIndexFile: statePaths.unifiedIndexFile,
+      unifiedIndexSecretFile: statePaths.unifiedIndexSecretFile,
+      recordCodexSpeedBaseline: async () => (
+        (await codexSpeedBaseline.record()).windows
+      ),
+    });
+  }
+  if (!dataStore || typeof dataStore.initialize !== "function") {
+    throw new TypeError("dataStore.initialize must be a function");
   }
   if (typeof onboardingProvider !== "function") {
     throw new TypeError("onboardingProvider must be a function");
@@ -3170,6 +3218,10 @@ function createPreparedLocalCompanionServer({
   const automaticContribution = automaticContributionController
     ?? createAutomaticContributionController({
       ...automaticContributionOptions,
+      ...windowsFixedStateOptions,
+      ...(process.platform === "win32"
+        ? { windowsCompanionInstanceLease }
+        : {}),
       settingsFile: statePaths.automaticContributionSettingsFile,
       destinationOrigin: syncDeliveryConfigured
         ? contributionServiceOrigin
@@ -3196,6 +3248,7 @@ function createPreparedLocalCompanionServer({
     ?? (contributionServiceOrigin === null
       ? null
       : createIncrementalContributionSyncController({
+        ...windowsFixedStateOptions,
         settingsFile: statePaths.incrementalContributionSyncSettingsFile,
         destinationOrigin: contributionServiceOrigin,
         runner: async ({ signal }) => {
@@ -3320,6 +3373,8 @@ function createPreparedLocalCompanionServer({
         automaticContributionInstanceLock =
           await acquireAutomaticContributionInstanceLock({
             lockFile: statePaths.automaticContributionLockFile,
+            platform: process.platform,
+            windowsCompanionInstanceLease,
           });
       })();
     }

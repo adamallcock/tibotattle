@@ -78,11 +78,16 @@ function unqualifiedWindowsFilesystemAdapter() {
       "windows-credential-audit-file-guard-v1",
     sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
+    companionInstanceMutexContractVersion:
+      "windows-companion-instance-mutex-v1",
+    preparedArtifactContractVersion: "windows-prepared-artifact-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
+    companionInstanceMutexSafe: false,
     credentialAuditFileGuardSafe: true,
     sqliteStateLeaseSafe: false,
+    preparedArtifactSafe: false,
     inspectPath: () => ({
       identity,
       isDirectory: true,
@@ -117,6 +122,22 @@ function unqualifiedWindowsFilesystemAdapter() {
     releaseCredentialAuditFileGuard: () => {},
     acquireCredentialMutex: () => ({ lease: {}, abandoned: false }),
     releaseCredentialMutex: () => {},
+    acquireCompanionInstanceMutex: () => ({ lease: {}, abandoned: false }),
+    releaseCompanionInstanceMutex: () => {},
+    inspectPreparedChild: () => ({
+      identity,
+      isDirectory: true,
+      isRegularFile: false,
+      isReparsePoint: false,
+    }),
+    ensurePreparedDirectory: () => identity,
+    enumeratePreparedDirectory: () => [],
+    removePreparedDirectory: () => ({ removed: true, identity }),
+    renamePreparedDirectory: () => ({ renamed: true, identity }),
+    createPreparedFile: () => identity,
+    readPreparedFile: () => ({ data: Buffer.from("data"), identity }),
+    deletePreparedFile: () => ({ deleted: true, identity }),
+    publishPreparedFile: () => ({ published: true, identity }),
   };
   return createWindowsFilesystemAdapter({
     platform: "win32",
@@ -358,6 +379,8 @@ test("Windows state composition shares one branded adapter and remains unqualifi
     typeof composition.contributionSyncQueue.inspectContributionSyncQueue,
     "function",
   );
+  assert.equal(composition.windowsCompanionInstanceLease.crossProcessSafe, true);
+  assert.equal(composition.windowsCompanionInstanceLease.productionSafe, false);
   assert.throws(
     () => createCompanionWindowsStateComposition({
       platform: "win32",
