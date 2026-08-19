@@ -67,9 +67,11 @@ function createFixture({
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
     sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
+    companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
+    companionInstanceMutexSafe: false,
     credentialAuditFileGuardSafe: true,
     sqliteStateLeaseSafe: false,
     inspectPath(path) {
@@ -126,6 +128,10 @@ function createFixture({
       throw nativeError("OPERATION_FAILED");
     },
     releaseCredentialMutex() {},
+    acquireCompanionInstanceMutex() {
+      throw nativeError("OPERATION_FAILED");
+    },
+    releaseCompanionInstanceMutex() {},
     acquireSqliteStateLease(rootPath, rootIdentity, databaseName) {
       calls.push(["acquireSqliteStateLease", rootPath, rootIdentity, databaseName]);
       if (rootPath !== ROOT || !sameIdentity(rootIdentity, IDENTITY)) {

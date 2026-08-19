@@ -94,9 +94,11 @@ function createProtectedStoreFixture() {
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
     sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
+    companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
+    companionInstanceMutexSafe: false,
     credentialAuditFileGuardSafe: true,
     sqliteStateLeaseSafe: false,
     inspectPath(path) {
@@ -198,6 +200,10 @@ function createProtectedStoreFixture() {
       return { lease: {}, abandoned: false };
     },
     releaseCredentialMutex() {},
+    acquireCompanionInstanceMutex() {
+      return { lease: {}, abandoned: false };
+    },
+    releaseCompanionInstanceMutex() {},
   };
   const adapter = createWindowsFilesystemAdapter({
     platform: "win32",

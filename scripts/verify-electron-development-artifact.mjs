@@ -92,6 +92,7 @@ const WINDOWS_NATIVE_MANIFEST_KEYS = Object.freeze([
   "credentialAuditFileGuardContractVersion",
   "sqliteStateLeaseContractVersion",
   "credentialMutexContractVersion",
+  "companionInstanceMutexContractVersion",
   "requiredMethods",
   "nativeClaims",
   "approvedPolicy",
@@ -116,11 +117,14 @@ const WINDOWS_REQUIRED_METHODS = Object.freeze([
   "releaseCredentialAuditFileGuard",
   "acquireCredentialMutex",
   "releaseCredentialMutex",
+  "acquireCompanionInstanceMutex",
+  "releaseCompanionInstanceMutex",
 ]);
 const WINDOWS_NATIVE_CLAIM_KEYS = Object.freeze([
   "productionSafe",
   "pathWalkRaceSafe",
   "credentialMutexSafe",
+  "companionInstanceMutexSafe",
   "credentialAuditFileGuardSafe",
   "sqliteStateLeaseSafe",
 ]);
@@ -544,6 +548,8 @@ function validateNativeManifestShape(value) {
         !== "windows-credential-audit-file-guard-v1"
       || value.sqliteStateLeaseContractVersion !== "windows-sqlite-state-lease-v1"
       || value.credentialMutexContractVersion !== "windows-credential-mutex-v1"
+      || value.companionInstanceMutexContractVersion
+        !== "windows-companion-instance-mutex-v1"
       || !Array.isArray(value.requiredMethods)
       || value.requiredMethods.length !== WINDOWS_REQUIRED_METHODS.length
       || value.requiredMethods.some((method, index) => method !== WINDOWS_REQUIRED_METHODS[index])
@@ -552,11 +558,13 @@ function validateNativeManifestShape(value) {
       || nativeClaims.productionSafe !== false
       || nativeClaims.pathWalkRaceSafe !== false
       || nativeClaims.credentialMutexSafe !== true
+      || nativeClaims.companionInstanceMutexSafe !== false
       || nativeClaims.credentialAuditFileGuardSafe !== true
       || nativeClaims.sqliteStateLeaseSafe !== false
       || approvedPolicy.productionSafe !== false
       || approvedPolicy.pathWalkRaceSafe !== false
       || approvedPolicy.credentialMutexSafe !== true
+      || approvedPolicy.companionInstanceMutexSafe !== false
       || approvedPolicy.credentialAuditFileGuardSafe !== true
       || approvedPolicy.sqliteStateLeaseSafe !== false
       || WINDOWS_NATIVE_CLAIM_KEYS.some((key) => nativeClaims[key] !== approvedPolicy[key])
