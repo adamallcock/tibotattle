@@ -1565,6 +1565,7 @@ private final class CompanionProcess {
     private var pendingStandardError = ""
     private var activeInstanceDetected = false
     private var process: Process?
+    private var keychainBroker: ContributionDeviceKeychainBroker?
     private var stopCompletions: [() -> Void] = []
     private var stopped = false
     private let nodeRuntimeModeOverride: BundledNodeRuntimeMode?
@@ -1611,7 +1612,19 @@ private final class CompanionProcess {
             nodeRuntimeModeOverride ?? resources.nodeRuntimeMode
         ).arguments(entrypoint: resources.entrypoint)
         child.currentDirectoryURL = resources.resourceRoot
-        child.standardInput = FileHandle.nullDevice
+        // The companion's standard input is the app's Keychain broker
+        // channel: fresh contribution-device credentials are minted and read
+        // by this signed app, never by the companion's own Keychain access,
+        // which is what raised the first-pairing dialog. The environment
+        // names only the descriptor — the socketpair itself is the
+        // authority, so no token or secret crosses argv or the environment.
+        // If the broker cannot be created (descriptor exhaustion), the
+        // companion runs without one and its own explained pairing path
+        // remains the net.
+        let broker = try? ContributionDeviceKeychainBroker(
+            nodeRuntimePath: resources.node.path
+        )
+        child.standardInput = broker?.childEndpoint ?? FileHandle.nullDevice
         child.standardOutput = standardOutput
         child.standardError = standardError
 
@@ -1626,6 +1639,11 @@ private final class CompanionProcess {
             "USAGE_MONITOR_STATE_ROOT": stateRoot.path,
             "CODEX_HOME": codexHome.path,
         ]
+        if broker?.childEndpoint != nil {
+            environment[
+                ContributionDeviceKeychainBroker.environmentVariable
+            ] = "0"
+        }
         for name in ["LANG", "LC_ALL", "TMPDIR"] {
             if let value = inherited[name], !value.contains("\0") {
                 environment[name] = value
@@ -1657,6 +1675,7 @@ private final class CompanionProcess {
 
         lock.lock()
         process = child
+        keychainBroker = broker
         stopped = false
         pendingOutput = ""
         pendingStandardError = ""
@@ -1667,9 +1686,14 @@ private final class CompanionProcess {
         } catch {
             lock.lock()
             process = nil
+            keychainBroker = nil
             lock.unlock()
+            broker?.shutdown()
             throw LauncherError.companionLaunch("run")
         }
+        // The child holds its dup2'd copy; dropping ours is what turns a
+        // companion exit into end-of-file on the broker channel.
+        broker?.closeChildEndpoint()
     }
 
     private func consumeStandardOutput(_ data: Data) {
@@ -1724,11 +1748,14 @@ private final class CompanionProcess {
     private func didTerminate(success: Bool) {
         lock.lock()
         process = nil
+        let broker = keychainBroker
+        keychainBroker = nil
         let completions = stopCompletions
         stopCompletions.removeAll()
         let wasStopped = stopped
         let anotherInstanceIsActive = activeInstanceDetected
         lock.unlock()
+        broker?.shutdown()
         for completion in completions {
             completion()
         }
