@@ -34,6 +34,8 @@ const BINDING_MANIFEST_SCHEMA_VERSION =
   "windows-filesystem-binding-manifest-v1";
 const BINDING_PROVENANCE_CONTRACT_VERSION = "windows-binding-provenance-v1";
 const SQLITE_STATE_LEASE_CONTRACT_VERSION = "windows-sqlite-state-lease-v1";
+const SQLITE_STATE_STAGING_CONTRACT_VERSION =
+  "windows-sqlite-state-staging-v1";
 const BINDING_FILE_NAME = "windows_filesystem.node";
 const BINDING_PLATFORM = "win32";
 const BINDING_ARCHITECTURE = "x64";
@@ -92,6 +94,8 @@ export const WINDOWS_FILESYSTEM_BINDING_PROVENANCE_CONTRACT_VERSION =
   BINDING_PROVENANCE_CONTRACT_VERSION;
 export const WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_CONTRACT_VERSION =
   SQLITE_STATE_LEASE_CONTRACT_VERSION;
+export const WINDOWS_FILESYSTEM_SQLITE_STATE_STAGING_CONTRACT_VERSION =
+  SQLITE_STATE_STAGING_CONTRACT_VERSION;
 export const WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS = REQUIRED_METHODS;
 
 function failure(code) {
@@ -455,6 +459,18 @@ function normalizeReadMaximum(maximumBytes) {
   return maximumBytes;
 }
 
+function normalizeSqliteDatabaseName(name) {
+  if (typeof name !== "string"
+      || name.length < 1
+      || name.includes("\0")
+      || name.includes("\\")
+      || name.includes("/")
+      || /(?:-journal|-wal|-shm)$/iu.test(name)) {
+    throw failure("INVALID_SQLITE_DATABASE_NAME");
+  }
+  return name;
+}
+
 function normalizeProtectedRootIdentity(identity) {
   const normalized = normalizeIdentity(identity);
   if (normalized.linkCount !== 1) throw failure("INVALID_IDENTITY");
@@ -518,6 +534,8 @@ export function createWindowsFilesystemAdapter({
     productionSafe: false,
     pathWalkRaceSafe: false,
     sqliteStateLeaseSafe: false,
+    sqliteStateStagingSafe: false,
+    sqliteStateStagingContractVersion: SQLITE_STATE_STAGING_CONTRACT_VERSION,
     inspectPath(path) {
       try {
         return normalizeMetadataResult(call(native, "inspectPath", [path]));
@@ -659,12 +677,13 @@ export function createWindowsFilesystemAdapter({
     },
     acquireSqliteStateLease(rootPath, rootIdentity, databaseName) {
       const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);
+      const name = normalizeSqliteDatabaseName(databaseName);
       let result;
       try {
         result = call(native, "acquireSqliteStateLease", [
           rootPath,
           expectedRoot,
-          databaseName,
+          name,
         ]);
       } catch (error) {
         throw normalizeNativeError(error);
@@ -688,6 +707,100 @@ export function createWindowsFilesystemAdapter({
       });
       sqliteStateLeases.set(lease, result.lease);
       return lease;
+    },
+    createSqliteDatabase(rootPath, rootIdentity, databaseName) {
+      const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);
+      const name = normalizeSqliteDatabaseName(databaseName);
+      if (typeof native.createSqliteDatabase !== "function") {
+        throw failure("SQLITE_STATE_STAGING_UNAVAILABLE");
+      }
+      try {
+        return normalizeIdentity(call(native, "createSqliteDatabase", [
+          rootPath,
+          expectedRoot,
+          name,
+        ]));
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
+    cloneSqliteDatabase(rootPath, rootIdentity, sourceName, stageName) {
+      const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);
+      const source = normalizeSqliteDatabaseName(sourceName);
+      const stage = normalizeSqliteDatabaseName(stageName);
+      if (source.toLowerCase() === stage.toLowerCase()) {
+        throw failure("INVALID_SQLITE_DATABASE_NAME");
+      }
+      if (typeof native.cloneSqliteDatabase !== "function") {
+        throw failure("SQLITE_STATE_STAGING_UNAVAILABLE");
+      }
+      let result;
+      try {
+        result = call(native, "cloneSqliteDatabase", [
+          rootPath,
+          expectedRoot,
+          source,
+          stage,
+        ]);
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+      let valid = false;
+      try {
+        valid = result !== null
+          && typeof result === "object"
+          && !Array.isArray(result)
+          && Object.keys(result).sort().join("\0")
+            === "sourceIdentity\0stageIdentity"
+          && isWindowsFilesystemIdentity(result.sourceIdentity)
+          && isWindowsFilesystemIdentity(result.stageIdentity);
+      } catch {
+        valid = false;
+      }
+      if (!valid) throw failure("INVALID_RESULT");
+      return Object.freeze({
+        sourceIdentity: normalizeIdentity(result.sourceIdentity),
+        stageIdentity: normalizeIdentity(result.stageIdentity),
+      });
+    },
+    publishSqliteDatabase(
+      rootPath,
+      rootIdentity,
+      stageName,
+      expectedStageIdentity,
+      targetName,
+      expectedTargetIdentity = null,
+    ) {
+      const expectedRoot = normalizeProtectedRootIdentity(rootIdentity);
+      const stage = normalizeSqliteDatabaseName(stageName);
+      const target = normalizeSqliteDatabaseName(targetName);
+      const expectedStage = normalizeIdentity(expectedStageIdentity);
+      const expectedTarget = expectedTargetIdentity === null
+        ? null
+        : normalizeIdentity(expectedTargetIdentity);
+      if (stage.toLowerCase() === target.toLowerCase()) {
+        throw failure("INVALID_SQLITE_DATABASE_NAME");
+      }
+      if (typeof native.publishSqliteDatabase !== "function") {
+        throw failure("SQLITE_STATE_STAGING_UNAVAILABLE");
+      }
+      try {
+        const result = call(native, "publishSqliteDatabase", [
+          rootPath,
+          expectedRoot,
+          stage,
+          expectedStage,
+          target,
+          expectedTarget,
+        ]);
+        if (!result?.published) throw failure("INVALID_RESULT");
+        return Object.freeze({
+          published: true,
+          identity: normalizeIdentity(result.identity),
+        });
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
     },
     releaseSqliteStateLease(lease) {
       let nativeLease;

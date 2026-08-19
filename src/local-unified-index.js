@@ -13,6 +13,7 @@ import {
   isWindowsSqliteStateDatabase,
   isWindowsSqliteStateSession,
   isWindowsProtectedStateStore,
+  isWindowsSqliteStateStaging,
 } from "./platform/index.js";
 
 // The one local index.
@@ -554,6 +555,8 @@ const WINDOWS_UNIFIED_INDEX_STAGING_UNAVAILABLE =
   "local_unified_index_windows_staging_unavailable";
 const WINDOWS_UNIFIED_INDEX_INSPECTION_UNAVAILABLE =
   "local_unified_index_windows_inspection_unavailable";
+const WINDOWS_UNIFIED_INDEX_STAGING_INVALID =
+  "local_unified_index_windows_staging_invalid";
 
 function windowsPath(path) {
   if (typeof path !== "string" || path.length < 1 || path.includes("\0")) {
@@ -623,13 +626,39 @@ function qualifiedWindowsProtectedStateStore(store, secretFile) {
   return store;
 }
 
-export function assertWindowsUnifiedIndexStagingUnavailable() {
+function qualifiedWindowsSqliteStateStaging(staging) {
+  let valid = false;
+  try {
+    valid = isWindowsSqliteStateStaging(staging)
+      && staging.contractVersion === "windows-sqlite-state-staging-v1"
+      && staging.stagingSafe === true
+      && typeof staging.create === "function"
+      && typeof staging.clone === "function"
+      && typeof staging.publish === "function"
+      && typeof staging.discard === "function";
+  } catch {
+    valid = false;
+  }
+  if (!valid) throw fixedError(WINDOWS_UNIFIED_INDEX_STAGING_INVALID);
+  return staging;
+}
+
+export function assertWindowsUnifiedIndexStagingUnavailable(
+  { windowsSqliteStateStaging = null } = {},
+) {
   if (process.platform === "win32") {
-    // Native handle-bound clone/stage/publication is not implemented yet.
-    // Keep every rebuild/incremental path closed instead of falling back to
-    // Node copy/rename/unlink, which would lose the protected identity
-    // boundary even when the live SQLite session is qualified.
-    throw fixedError(WINDOWS_UNIFIED_INDEX_STAGING_UNAVAILABLE);
+    // The native coordinator is now wired, but its readiness bit remains
+    // false until a real Windows qualification proves clone, sidecar, and
+    // atomic-replacement behavior across the supported filesystem matrix.
+    if (windowsSqliteStateStaging === null) {
+      throw fixedError(WINDOWS_UNIFIED_INDEX_STAGING_UNAVAILABLE);
+    }
+    qualifiedWindowsSqliteStateStaging(windowsSqliteStateStaging);
+    if (windowsSqliteStateStaging.stagingSafe !== true) {
+      throw fixedError(WINDOWS_UNIFIED_INDEX_STAGING_UNAVAILABLE);
+    }
+  } else if (windowsSqliteStateStaging !== null) {
+    throw new TypeError("windowsSqliteStateStaging is only valid on Windows");
   }
 }
 
@@ -1096,7 +1125,6 @@ export function openLocalUnifiedIndex(indexFile, {
 } = {}) {
   let windowsSession = null;
   if (process.platform === "win32") {
-    if (staging) assertWindowsUnifiedIndexStagingUnavailable();
     windowsSession = qualifiedWindowsSqliteStateSession(
       windowsSqliteStateSession,
       indexFile,
@@ -2388,8 +2416,33 @@ export function createUnifiedIndexWriter(database, {
  * fsynced first, so a crash mid-publish leaves either the old index or the new
  * one, never a torn mixture.
  */
-export async function publishStagedUnifiedIndex(stageFile, indexFile) {
-  assertWindowsUnifiedIndexStagingUnavailable();
+export async function publishStagedUnifiedIndex(
+  stageFile,
+  indexFile,
+  {
+    windowsSqliteStateStaging = null,
+    expectedTargetIdentity = null,
+  } = {},
+) {
+  if (process.platform === "win32") {
+    assertWindowsUnifiedIndexStagingUnavailable({ windowsSqliteStateStaging });
+    const stageName = win32.basename(windowsPath(stageFile));
+    const targetName = win32.basename(windowsPath(indexFile));
+    try {
+      windowsSqliteStateStaging.publish(
+        stageName,
+        targetName,
+        expectedTargetIdentity,
+      );
+    } catch (error) {
+      if (error?.code?.startsWith("local_unified_index_")) throw error;
+      throw fixedError("local_unified_index_publication_failed");
+    }
+    return;
+  }
+  if (windowsSqliteStateStaging !== null) {
+    throw new TypeError("windowsSqliteStateStaging is only valid on Windows");
+  }
   await chmod(stageFile, 0o600);
   await syncFile(stageFile);
   await assertSafeLocalUnifiedIndexTarget(indexFile, { allowMissing: true });
@@ -2409,8 +2462,24 @@ export async function publishStagedUnifiedIndex(stageFile, indexFile) {
   }
 }
 
-export async function removeIfPresent(path) {
-  assertWindowsUnifiedIndexStagingUnavailable();
+export async function removeIfPresent(
+  path,
+  { windowsSqliteStateStaging = null } = {},
+) {
+  if (process.platform === "win32") {
+    assertWindowsUnifiedIndexStagingUnavailable({ windowsSqliteStateStaging });
+    try {
+      windowsSqliteStateStaging.discard(win32.basename(windowsPath(path)));
+    } catch (error) {
+      if (error?.code === "windows_sqlite_state_staging_database_missing") return;
+      if (error?.code?.startsWith("local_unified_index_")) throw error;
+      throw fixedError("local_unified_index_staging_cleanup_failed");
+    }
+    return;
+  }
+  if (windowsSqliteStateStaging !== null) {
+    throw new TypeError("windowsSqliteStateStaging is only valid on Windows");
+  }
   try {
     await unlink(path);
   } catch (error) {
