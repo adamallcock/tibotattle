@@ -438,8 +438,18 @@ test("desktop lifecycle composes secure window, tray, single instance, retry, an
   assert.deepEqual(windows[0].loaded, ["http://127.0.0.1:4001/"]);
   windows[0].emit("ready-to-show");
   assert.equal(windows[0].visible, true);
+  assert.equal(lifecycle.state.windowVisible, true);
+  trays[0].menu.template.find((item) => item.label === "Hide TiboTattle").click();
+  assert.equal(lifecycle.state.windowVisible, false);
+  trays[0].menu.template.find((item) => item.label === "Show TiboTattle").click();
+  assert.equal(lifecycle.state.windowVisible, true);
+  trays[0].emit("click");
+  assert.equal(lifecycle.state.windowVisible, false);
+  trays[0].emit("click");
+  assert.equal(lifecycle.state.windowVisible, true);
   windows[0].emit("close", { preventDefault() {} });
   assert.equal(windows[0].visible, false);
+  assert.equal(lifecycle.state.windowVisible, false);
   app.emit("second-instance");
   assert.equal(windows[0].visible, true);
   await lifecycle.retry();

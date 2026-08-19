@@ -69,6 +69,7 @@
     "container:portable:build": "docker build --file containers/portable/Dockerfile --tag tibotattle-portable:test .",
     "container:portable:test": "docker run --rm --init --network none --env USAGE_MONITOR_TEST_LANE_REPORTER=dot tibotattle-portable:test",
     "smoke:electron:linux": "node ./scripts/smoke-electron-linux.mjs",
+    "smoke:electron:windows": "node ./scripts/smoke-electron-windows.mjs",
     "container:electron-linux:build": "docker build --file containers/electron-linux/Dockerfile --tag tibotattle-electron-linux:test .",
     "container:electron-linux:test": "docker run --rm --init --cap-add=SYS_ADMIN --network none --env USAGE_MONITOR_TEST_LANE_REPORTER=dot tibotattle-electron-linux:test",
     "product:backend:test": "npm --prefix apps/worker test",
