@@ -398,7 +398,7 @@ enum TiboTattleLocalization {
             case .dialogMoveLocalDataToTrash:
                 "Move all local %@ data to Trash?"
             case .dialogMoveLocalDataToTrashDescription:
-                "App state: local indexes, cached analysis, prepared contributions, custom Codex settings, and local device-binding state move to Trash.\n\nKeychain: pseudonymous identity and device credentials remain.\n\nHosted service: sent community data and registered devices remain. Codex logs are never changed."
+                "App state: local indexes, cached analysis, prepared contributions, custom Codex settings, local device-binding state, and TiboTattle sign-in/session state are cleared. Files move to Trash.\n\nKeychain: pseudonymous identity and device credentials remain.\n\nHosted service: sent community data and registered devices remain. Codex logs are never changed."
             case .dialogResetCapabilities:
                 "Reset exactly two local Keychain capabilities now?"
             case .dialogResetCapabilitiesDescription:

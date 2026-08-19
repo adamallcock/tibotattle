@@ -145,7 +145,7 @@
 "dialog.manageLocalDataDescription" = "本地应用状态、本地钥匙串能力和托管数据彼此独立。请选择你要管理的确切层级。";
 "dialog.moveDataToTrash" = "将数据移到废纸篓";
 "dialog.moveLocalDataToTrash" = "要将所有 %@ 本地数据移到废纸篓吗？";
-"dialog.moveLocalDataToTrashDescription" = "应用状态：本地索引、缓存分析、准备的贡献、自定义 Codex 设置和本地设备绑定状态会移到废纸篓。\n\n钥匙串：假名身份和设备凭据会保留。\n\n托管服务：已发送的社区数据和已注册设备会保留。绝不会更改 Codex 日志。";
+"dialog.moveLocalDataToTrashDescription" = "应用状态：本地索引、缓存分析、准备的贡献、自定义 Codex 设置、本地设备绑定状态以及 TiboTattle 登录和会话状态都会被清除。文件会移到废纸篓。\n\n钥匙串：假名身份和设备凭据会保留。\n\n托管服务：已发送的社区数据和已注册设备会保留。绝不会更改 Codex 日志。";
 "dialog.resetCapabilities" = "现在重置恰好两项本地钥匙串能力吗？";
 "dialog.resetCapabilitiesDescription" = "%@ 将停止其前台伴随程序，从钥匙串中移除导出身份和已配对设备凭据，只移除它们的两个本地残留文件，然后重新启动。\n\n现有准备或托管数据不会被重写或删除。未来的贡献活动将使用新身份，并要求再次配对设备。";
 "dialog.resetFinishing" = "本地身份重置即将完成";

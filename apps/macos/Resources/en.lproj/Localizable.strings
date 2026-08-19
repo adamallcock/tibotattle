@@ -211,7 +211,7 @@
 "dialog.manageLocalDataDescription" = "Local app state, local Keychain capabilities, and hosted data are separate. Choose the exact layer you intend to manage.";
 "dialog.moveDataToTrash" = "Move Data to Trash";
 "dialog.moveLocalDataToTrash" = "Move all local %@ data to Trash?";
-"dialog.moveLocalDataToTrashDescription" = "App state: local indexes, cached analysis, prepared contributions, custom Codex settings, and local device-binding state move to Trash.\n\nKeychain: pseudonymous identity and device credentials remain.\n\nHosted service: sent community data and registered devices remain. Codex logs are never changed.";
+"dialog.moveLocalDataToTrashDescription" = "App state: local indexes, cached analysis, prepared contributions, custom Codex settings, local device-binding state, and TiboTattle sign-in/session state are cleared. Files move to Trash.\n\nKeychain: pseudonymous identity and device credentials remain.\n\nHosted service: sent community data and registered devices remain. Codex logs are never changed.";
 "dialog.resetCapabilities" = "Reset exactly two local Keychain capabilities now?";
 "dialog.resetCapabilitiesDescription" = "%@ will stop its foreground companion, remove its export identity and paired-device credential from Keychain, remove only their two local residue files, and then restart.\n\nExisting prepared or hosted data will not be rewritten or deleted. Future contribution activity will use a new identity and require device pairing again.";
 "dialog.resetFinishing" = "Local identity reset is finishing";

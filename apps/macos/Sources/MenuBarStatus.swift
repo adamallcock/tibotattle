@@ -1,4 +1,5 @@
 import AppKit
+import CoreFoundation
 import Foundation
 
 // The menu-bar surface is deliberately additive. It never becomes the only
@@ -47,6 +48,145 @@ struct LocalCompanionOverview: Equatable {
     let freshnessStatus: String
     let staleAfterSeconds: Double?
     let evidenceAvailable: Bool
+}
+
+struct LocalContributionDiagnosticReference: Equatable {
+    let reference: String
+    let recordedAt: String
+}
+
+/// The content-free contribution support projection exposed by the loopback
+/// companion. Decoding is deliberately fail-closed: a new field cannot make
+/// an unsafe payload acceptable, and every exclusion flag must remain false.
+struct LocalContributionDiagnostics: Equatable {
+    let journeyPhase: String
+    let previewState: String
+    let queueState: String
+    let consentApproved: Bool
+    let consentCurrent: Bool
+    let signedInObserved: Bool
+    let signedIn: Bool
+    let pairingObserved: Bool
+    let paired: Bool
+    let recentDiagnosticReferences: [LocalContributionDiagnosticReference]
+
+    private static let phases: Set<String> = [
+        "not_configured", "unavailable", "sign_in_required",
+        "preparing_review", "review_ready", "connecting",
+        "approved_connection_needed", "approved_paused",
+        "approved_syncing", "approved_idle",
+    ]
+    private static let queueStates: Set<String> = [
+        "unavailable", "empty", "ready", "retry_wait", "paused",
+    ]
+    private static let previewStates: Set<String> = queueStates.union([
+        "not_observed",
+    ])
+    private static let referencePattern = try! NSRegularExpression(
+        pattern: #"^TT-[0-9A-HJKMNP-TV-Z]{6}$"#
+    )
+    private static let instantPattern = try! NSRegularExpression(
+        pattern: #"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$"#
+    )
+
+    private static func exactBoolean(_ value: Any?) -> Bool? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) == CFBooleanGetTypeID()
+        else {
+            return nil
+        }
+        return number.boolValue
+    }
+
+    private static func hasExactKeys(
+        _ value: [String: Any],
+        _ keys: Set<String>
+    ) -> Bool {
+        Set(value.keys) == keys
+    }
+
+    private static func matches(
+        _ expression: NSRegularExpression,
+        _ value: String
+    ) -> Bool {
+        let range = NSRange(value.startIndex..<value.endIndex, in: value)
+        return expression.firstMatch(in: value, range: range)?.range == range
+    }
+
+    static func decode(_ data: Data) -> LocalContributionDiagnostics? {
+        guard let root = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+              hasExactKeys(root, [
+                "schemaVersion", "journeyPhase", "previewState",
+                "queueState", "consent", "signedIn", "pairing",
+                "recentDiagnosticReferences", "includesTokens",
+                "includesOauthState", "includesVerifiers",
+                "includesDeviceIdentifiers", "includesAccountIdentifiers",
+                "includesContent", "includesPaths",
+              ]),
+              root["schemaVersion"] as? String
+                == "local-contribution-diagnostics-v0.1",
+              let journeyPhase = root["journeyPhase"] as? String,
+              phases.contains(journeyPhase),
+              let previewState = root["previewState"] as? String,
+              previewStates.contains(previewState),
+              let queueState = root["queueState"] as? String,
+              queueStates.contains(queueState),
+              let consent = root["consent"] as? [String: Any],
+              hasExactKeys(consent, ["approved", "current"]),
+              let consentApproved = exactBoolean(consent["approved"]),
+              let consentCurrent = exactBoolean(consent["current"]),
+              let signedInValue = root["signedIn"] as? [String: Any],
+              hasExactKeys(signedInValue, ["observed", "value"]),
+              let signedInObserved = exactBoolean(signedInValue["observed"]),
+              let signedIn = exactBoolean(signedInValue["value"]),
+              let pairing = root["pairing"] as? [String: Any],
+              hasExactKeys(pairing, ["observed", "paired"]),
+              let pairingObserved = exactBoolean(pairing["observed"]),
+              let paired = exactBoolean(pairing["paired"]),
+              let rawReferences = root["recentDiagnosticReferences"]
+                as? [[String: Any]],
+              rawReferences.count <= 5,
+              exactBoolean(root["includesTokens"]) == false,
+              exactBoolean(root["includesOauthState"]) == false,
+              exactBoolean(root["includesVerifiers"]) == false,
+              exactBoolean(root["includesDeviceIdentifiers"]) == false,
+              exactBoolean(root["includesAccountIdentifiers"]) == false,
+              exactBoolean(root["includesContent"]) == false,
+              exactBoolean(root["includesPaths"]) == false
+        else {
+            return nil
+        }
+        var references: [LocalContributionDiagnosticReference] = []
+        for raw in rawReferences {
+            guard hasExactKeys(raw, ["reference", "recordedAt"]),
+                  let reference = raw["reference"] as? String,
+                  matches(referencePattern, reference),
+                  let recordedAt = raw["recordedAt"] as? String,
+                  matches(instantPattern, recordedAt)
+            else {
+                return nil
+            }
+            references.append(
+                LocalContributionDiagnosticReference(
+                    reference: reference,
+                    recordedAt: recordedAt
+                )
+            )
+        }
+        return LocalContributionDiagnostics(
+            journeyPhase: journeyPhase,
+            previewState: previewState,
+            queueState: queueState,
+            consentApproved: consentApproved,
+            consentCurrent: consentCurrent,
+            signedInObserved: signedInObserved,
+            signedIn: signedIn,
+            pairingObserved: pairingObserved,
+            paired: paired,
+            recentDiagnosticReferences: references
+        )
+    }
 }
 
 /// Whether an explicit local analysis pass is running, from whichever surface
@@ -570,6 +710,28 @@ final class LocalCompanionEvidenceReader {
             let activity = Self.acceptedPayload(data, response)
                 .flatMap { Self.decodeActivity($0) }
             DispatchQueue.main.async { completion(activity) }
+        }
+        task.resume()
+    }
+
+    func readContributionDiagnostics(
+        base: URL,
+        completion: @escaping (LocalContributionDiagnostics?) -> Void
+    ) {
+        guard let url = loopbackEndpoint(
+            base,
+            path: "/api/local/diagnostics/contribution"
+        )
+        else {
+            completion(nil)
+            return
+        }
+        let task = session.dataTask(with: request(url, method: "GET")) {
+            data, response, _ in
+            let diagnostics = Self.acceptedPayload(data, response).flatMap(
+                LocalContributionDiagnostics.decode
+            )
+            DispatchQueue.main.async { completion(diagnostics) }
         }
         task.resume()
     }
