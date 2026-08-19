@@ -3239,7 +3239,10 @@ test("signed updater replacement contract validates upgrade and rollback artifac
         ...previousManifest,
         source: {
           repository: "https://github.com/adamallcock/tibotattle",
-          tag: "v0.1.12",
+          // The fixture manifests stamp shortVersion from the live
+          // RELEASE_VERSION, so the matching tag must derive from it too or
+          // every version bump breaks this pair for a hardcoded reason.
+          tag: `v${RELEASE_VERSION}`,
           commit: "a".repeat(40),
         },
       },
@@ -3265,7 +3268,7 @@ test("signed updater replacement contract validates upgrade and rollback artifac
           ...previousManifest,
           source: {
             repository: "https://github.com/private/tibotattle",
-            tag: "v0.1.12",
+            tag: `v${RELEASE_VERSION}`,
             commit: "b".repeat(40),
           },
         },
