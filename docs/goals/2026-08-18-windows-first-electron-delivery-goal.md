@@ -102,9 +102,35 @@ or a Linux-support claim.
   No Windows runtime or launch claim has been made.
 - The network-isolated Linux portable container now passes from the current
   tree. Its Docker context was reduced from about 3.7 GB to about 34 MB by
-  excluding ignored release/repro caches and local reports. This proves the
-  portable shared core and companion lane on Debian; it does not qualify a
-  Linux Electron GUI, credentials, tray, autostart, package, or installation.
+  excluding ignored release/repro caches and local reports. A second pinned
+  Debian/Xvfb lane now launches the real Electron shell, reaches the loopback
+  dashboard, reloads it, invokes the same main-process shutdown path as tray
+  Quit, exits zero, and leaves no companion descendant. This proves the
+  portable shared core and source Electron GUI on Linux; it does not qualify a
+  Linux package, credentials, desktop-manager tray, autostart, updater, or
+  installation.
+- Contribution-device renewal state, automatic and incremental contribution
+  settings, Fast-mode preference, and the Codex speed-baseline ledger now have
+  explicit branded Windows protected-store routes. Their Windows branches
+  reject forged stores, path escapes, platform downgrade, ordinary storage
+  injection, and Node filesystem fallback. The companion-wide automatic-
+  contribution lifetime lock still fails closed on Windows until its native
+  kernel-backed lease is integrated.
+- Unified-index rebuild and incremental publication now have a repository-
+  owned native create/streaming-clone/atomic-publish boundary. The native
+  operations remain pinned to the protected root and expected file identities,
+  reject reparse points, hard links, unexpected SQLite sidecars, and root
+  replacement, and clean unpublished stages after failures. Rebuild and ingest
+  no longer select Node copy, rename, or unlink on Windows. The staging safety
+  flag remains false pending native Windows compilation and qualification.
+- Anthropic's documented Windows Claude Code defaults are now understood:
+  `%USERPROFILE%\\.claude\\settings.json` and
+  `%USERPROFILE%\\.claude\\projects\\`, with `CLAUDE_CONFIG_DIR` relocating
+  the complete Claude Code root. This does not establish a Windows equivalent
+  of the macOS-only Claude Desktop `plan-usage-history.json` source; that lane
+  must remain unavailable until a real Windows installation supplies path and
+  schema evidence. The existing `/bin/sh` status-line replay is also still a
+  separate Windows process-contract blocker.
 - Production readiness, authenticated binding provenance, production signing,
   installer/updater qualification, and the native Windows x64 warm-and-clean
   run remain gates. Windows support is not claimed, Linux compatibility is not
@@ -113,42 +139,38 @@ or a Linux-support claim.
 
 ### Immediate ordered work
 
-1. Run the native Windows qualification for the implemented protected-child,
-   credential-coordination, and SQLite lease/session primitives on the exact
-   revision. The SQLite test exercises real `DatabaseSync`, durable policy,
-   transactions, rollback, cross-process contention, abrupt termination,
-   hot-journal recovery, close/reopen, and sidecar cleanup. Exit with zero
-   skips and fixed aggregate evidence, or keep all readiness flags false and
-   name the exact failing primitive. This requires separate authorization to
-   push and dispatch the manual workflow.
-2. Route collector, unified-index, Claude quota, and contribution-queue state
-   through the qualified SQLite session. The unified-index staging/publication
-   path additionally needs a native handle-bound atomic publication contract.
-   Exit when Windows composition tests prove that none can fall back to
-   ordinary Node/SQLite state.
-3. Add an authenticated kernel-backed lease/age contract for crash recovery,
-   or document a bounded startup-recovery design that remains fail-closed.
-   Exit only after native contention, abandonment, stale-state, and exact
-   release tests pass.
-4. Finish contribution, renewal, and prepared-artifact wiring against the same
-   protected boundaries. Exit when state, leases, and metadata use one branded
-   composition without silently reverting to portable storage.
-5. Finish Claude production composition and replace the POSIX `/bin/sh`
+1. Finish the fixed Windows state composition: add a caller-unnameable native
+   companion lifetime mutex, pass the protected store into automatic,
+   incremental, Fast-mode, and speed-baseline controllers, and implement the
+   prepared-contribution artifact boundary. Exit when settings, locks,
+   artifacts, and cleanup use one branded composition without silently
+   reverting to portable storage.
+2. Finish the documented Claude Code root composition and replace the POSIX `/bin/sh`
    callback command path with a Windows-safe process contract. Exit with
    install, uninstall, interruption recovery, and no-fallback coverage.
-6. Compose readiness only from the authenticated binding, qualified native
+   Keep the undocumented Windows Claude Desktop quota source unavailable until
+   native installation evidence establishes its location and schema.
+3. Run native Windows qualification for the protected-child, credential,
+   SQLite lease/session/staging, and companion-mutex primitives on the exact
+   revision. Exit with zero skips and fixed aggregate evidence, or keep the
+   corresponding readiness flags false and name the exact failing primitive.
+   This requires separate authorization to push and dispatch the manual
+   workflow.
+4. Compose readiness only from the authenticated binding, qualified native
    store/session, and one shared branded capability set. Exit when negative
    forgery/copy tests and positive composition tests agree; do not mint
    readiness locally while native proof is absent.
-7. Dispatch the packaged Electron Windows x64 workflow on the exact revision
+5. Dispatch the packaged Electron Windows x64 workflow on the exact revision
    after the production persistence boundary is complete, and qualify
    warm and clean app launch, companion lifecycle, dashboard, and shutdown.
    Exit with zero unexplained skips and no orphan; no macOS or simulated
    `win32` run can substitute for this evidence.
-8. Qualify the Windows installer, upgrade, rollback, uninstall, and
+6. Qualify the Windows installer, upgrade, rollback, uninstall, and
    credential-retention behavior only after the native launch gate passes.
-9. Prepare Linux only after the shared shell/core boundary is stable, with an
-   explicit distro and GUI matrix; this does not claim Linux support.
+7. Extend the now-executable Linux GUI lane into an explicit distro,
+   credential, tray/autostart, packaging, and installed-app matrix only after
+   the Windows shared-shell contract is stable; this does not yet claim Linux
+   support.
 
 ## Delivery rules
 
