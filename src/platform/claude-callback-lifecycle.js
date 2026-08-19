@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, existsSync } from "node:fs";
 import {
   chmod,
   lstat,
@@ -18,6 +18,8 @@ import { assertWindowsProductionReadiness } from "./windows-production-readiness
 
 const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 const STATE_SCHEMA = "claude-callback-lifecycle-v1";
+const WINDOWS_RUNNER_SCHEMA = "claude-callback-runner-v1";
+const WINDOWS_RUNNER_KINDS = new Set(["git_bash", "powershell"]);
 const STATE_FILE = "lifecycle-state.json";
 const STATE_PENDING_FILE = ".lifecycle-state.pending";
 const LOCK_FILE = "operation.lock";
@@ -53,6 +55,18 @@ const ERROR_CODES = new Set([
   "not_uninstalled",
   "windows_state_unqualified",
 ]);
+
+const WINDOWS_SYSTEM_ROOT_DEFAULT = "C:\\Windows";
+const WINDOWS_GIT_BASH_RELATIVE_PATHS = Object.freeze([
+  ["ProgramFiles", "Git", "bin", "bash.exe"],
+  ["ProgramW6432", "Git", "bin", "bash.exe"],
+  ["LOCALAPPDATA", "Programs", "Git", "bin", "bash.exe"],
+  ["USERPROFILE", "scoop", "apps", "git", "current", "bin", "bash.exe"],
+]);
+
+function fixedRunnerError() {
+  fail("coexistence_unsupported");
+}
 
 export class ClaudeCallbackLifecycleError extends Error {
   constructor(code) {
@@ -115,6 +129,138 @@ function canonicalWindowsPath(path, code = "invalid_configuration") {
 
 function sameWindowsPath(left, right) {
   return canonicalWindowsPath(left).toLowerCase() === canonicalWindowsPath(right).toLowerCase();
+}
+
+function runnerRecord(value) {
+  try {
+    if (value === null || typeof value !== "object" || Array.isArray(value)
+        || isProxy(value)
+        || Object.keys(value).sort().join("\0") !== "executable\0kind\0schemaVersion"
+        || value.schemaVersion !== WINDOWS_RUNNER_SCHEMA
+        || !WINDOWS_RUNNER_KINDS.has(value.kind)) {
+      fixedRunnerError();
+    }
+    const executable = canonicalWindowsPath(value.executable);
+    if (/[\u0001-\u001f]/u.test(executable)) fixedRunnerError();
+    if (value.kind === "git_bash") {
+      const reviewedGitBashPath = /^(?:[a-z]:\\program files(?: \(x86\))?\\git\\bin\\bash\.exe|[a-z]:\\users\\[^\\]+\\appdata\\local\\programs\\git\\bin\\bash\.exe|[a-z]:\\users\\[^\\]+\\scoop\\apps\\git\\current\\bin\\bash\.exe)$/iu;
+      if (!reviewedGitBashPath.test(executable)) fixedRunnerError();
+    } else if (
+      !/^[a-z]:\\windows\\system32\\windowspowershell\\v1\.0\\powershell\.exe$/iu.test(executable)
+    ) {
+      fixedRunnerError();
+    }
+    return Object.freeze({
+      schemaVersion: WINDOWS_RUNNER_SCHEMA,
+      kind: value.kind,
+      executable,
+    });
+  } catch (error) {
+    // Preserve our closed lifecycle code, collapsing hostile getters/proxies
+    // and malformed runner records to the same content-free outcome.
+    if (error instanceof ClaudeCallbackLifecycleError) throw error;
+    fixedRunnerError();
+  }
+}
+
+function sameRunnerIdentity(left, right) {
+  try {
+    const first = runnerRecord(left);
+    const second = runnerRecord(right);
+    return first.kind === second.kind
+      && first.executable.toLowerCase() === second.executable.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+function windowsRunnerDescriptor(kind, executable) {
+  return runnerRecord({
+    schemaVersion: WINDOWS_RUNNER_SCHEMA,
+    kind,
+    executable,
+  });
+}
+
+function environmentString(environment, key) {
+  const value = environmentValue(environment, key);
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * Select the only two reviewed Windows command runners. Git Bash is preferred
+ * because it matches the POSIX command language Claude already documents; the
+ * inbox Windows PowerShell is the deterministic fallback. This is deliberately
+ * synchronous: installation must select and persist one runner before it can
+ * mutate Claude settings. Runtime replay uses the persisted descriptor and
+ * never re-selects a different shell.
+ */
+export function selectClaudeCallbackRunner({
+  platform = process.platform,
+  environment = process.env,
+  exists = existsSync,
+  runner = null,
+} = {}) {
+  if (platform !== "win32") return null;
+  if (typeof exists !== "function") fixedRunnerError();
+  if (runner !== null) return runnerRecord(runner);
+  if (!environment || typeof environment !== "object" || Array.isArray(environment)) {
+    fixedRunnerError();
+  }
+  for (const [rootKey, ...parts] of WINDOWS_GIT_BASH_RELATIVE_PATHS) {
+    const root = environmentString(environment, rootKey);
+    if (!root) continue;
+    let candidate;
+    try {
+      candidate = win32.join(canonicalWindowsPath(root), ...parts);
+    } catch {
+      continue;
+    }
+    try {
+      if (exists(candidate)) return windowsRunnerDescriptor("git_bash", candidate);
+    } catch {
+      // A hostile or inaccessible candidate is not a runner. Continue to the
+      // next fixed location and ultimately to the PowerShell fallback.
+    }
+  }
+  const systemRoot = environmentString(environment, "SystemRoot") ?? WINDOWS_SYSTEM_ROOT_DEFAULT;
+  let powershell;
+  try {
+    powershell = win32.join(canonicalWindowsPath(systemRoot),
+      "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  } catch {
+    fixedRunnerError();
+  }
+  try {
+    if (exists(powershell)) return windowsRunnerDescriptor("powershell", powershell);
+  } catch {
+    // Fall through to the fixed coexistence error without exposing the path.
+  }
+  fixedRunnerError();
+}
+
+export function validateClaudeCallbackRunner(value) {
+  return runnerRecord(value);
+}
+
+function runnerCommandArguments(runner, command) {
+  const selected = runnerRecord(runner);
+  if (selected.kind === "git_bash") {
+    return {
+      command: selected.executable,
+      args: ["--noprofile", "--norc", "-c", command],
+    };
+  }
+  return {
+    command: selected.executable,
+    args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+  };
+}
+
+export function buildClaudeCallbackRunnerInvocation(runner, command) {
+  if (typeof command !== "string" || command.length < 1 || command.length > 8192
+      || command.includes("\0")) fixedRunnerError();
+  return runnerCommandArguments(runner, command);
 }
 
 const WINDOWS_CLAUDE_INVALID_COMPONENT = /[<>:"|?*]/u;
@@ -469,10 +615,25 @@ function assertManagedStateMatches(state, installedStatusLine) {
   if (state && !equalValue(state.installedStatusLine, installedStatusLine)) fail("conflict");
 }
 
+function assertStateRunnerCompatibility(state, platform) {
+  if (platform !== "win32" || state === null || state.phase === "uninstalled") return;
+  if (state.previousStatusLine?.present
+      && (!Object.hasOwn(state, "previousRunner") || state.previousRunner === null)) {
+    // Do not rediscover a shell for a legacy state: doing so could replay the
+    // user's command under different semantics and would make recovery mutate
+    // settings before coexistence has been established.
+    fail("coexistence_unsupported");
+  }
+}
+
 function validateLifecycleState(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)
-      || Object.keys(value).sort().join("\0") !== "installedStatusLine\0operationId\0phase\0previousStatusLine\0schemaVersion"
-      || value.schemaVersion !== STATE_SCHEMA
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail("state_shape");
+  const keys = Object.keys(value).sort().join("\0");
+  if (keys !== "installedStatusLine\0operationId\0phase\0previousStatusLine\0schemaVersion"
+      && keys !== "installedStatusLine\0operationId\0phase\0previousRunner\0previousStatusLine\0schemaVersion") {
+    fail("state_shape");
+  }
+  if (value.schemaVersion !== STATE_SCHEMA
       || !["install_prepared", "installed", "uninstall_prepared", "uninstalled"].includes(value.phase)
       || (value.operationId !== null && (typeof value.operationId !== "string"
         || !/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(value.operationId)))) fail("state_shape");
@@ -482,6 +643,16 @@ function validateLifecycleState(value) {
   } else {
     validateStatusLineBackup(value.previousStatusLine);
     if (value.operationId === null) fail("state_shape");
+  }
+  if (Object.hasOwn(value, "previousRunner")) {
+    if (value.previousRunner !== null) validateClaudeCallbackRunner(value.previousRunner);
+    const priorPresent = value.previousStatusLine !== null
+      && value.previousStatusLine.present === true;
+    if (priorPresent !== (value.previousRunner !== null)) fail("state_shape");
+  } else if (value.previousStatusLine?.present && value.schemaVersion === STATE_SCHEMA
+      && value.phase !== "uninstalled") {
+    // Older POSIX states intentionally have no runner field. A Windows
+    // runtime will reject this legacy shape before it can execute the command.
   }
   return value;
 }
@@ -809,6 +980,34 @@ function shellQuote(value) {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
+function powershellQuote(value) {
+  if (typeof value !== "string" || value.length < 1 || value.length > 4096
+      || value.includes("\0") || /[\u0001-\u001f]/u.test(value)) {
+    fail("invalid_configuration");
+  }
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+function gitBashPath(value) {
+  const normalized = canonicalWindowsPath(value, "invalid_configuration");
+  const drive = normalized[0].toLowerCase();
+  return `/${drive}${normalized.slice(2).replaceAll("\\", "/")}`;
+}
+
+function buildWindowsManagedCommand({
+  runner,
+  nodeExecutable,
+  runtimeScript,
+}) {
+  const selected = runnerRecord(runner);
+  const executable = canonicalWindowsPath(nodeExecutable, "invalid_configuration");
+  const script = canonicalWindowsPath(runtimeScript, "invalid_configuration");
+  if (selected.kind === "git_bash") {
+    return `ELECTRON_RUN_AS_NODE=1 ${shellQuote(gitBashPath(executable))} ${shellQuote(gitBashPath(script))}`;
+  }
+  return `$env:ELECTRON_RUN_AS_NODE = '1'; & ${powershellQuote(executable)} ${powershellQuote(script)}`;
+}
+
 export function createClaudeCallbackLifecycleContext(configuration = {}) {
   let ClaudeCallbackCapabilityError;
   let ensureClaudeCallbackCapability;
@@ -887,7 +1086,25 @@ function defaultClaudeCallbackLifecycleDirectory(options = {}) {
 function buildManagedClaudeStatusLine({
   nodeExecutable = process.execPath,
   runtimeScript: selectedRuntimeScript = runtimeScript,
+  platform = process.platform,
+  windowsRunner = null,
+  environment = process.env,
 } = {}) {
+  if (platform === "win32") {
+    const runner = selectClaudeCallbackRunner({
+      platform,
+      environment,
+      runner: windowsRunner,
+    });
+    return Object.freeze({
+      type: "command",
+      command: buildWindowsManagedCommand({
+        runner,
+        nodeExecutable,
+        runtimeScript: selectedRuntimeScript,
+      }),
+    });
+  }
   return Object.freeze({
     type: "command",
     command: `${shellQuote(nodeExecutable)} ${shellQuote(selectedRuntimeScript)}`,
@@ -1133,7 +1350,15 @@ function uninstalledState(installedStatusLine) {
   };
 }
 
-async function recoverPreparedState({ directory, settingsFile, state, failpoint, storage = null }) {
+async function recoverPreparedState({
+  directory,
+  settingsFile,
+  state,
+  failpoint,
+  storage = null,
+  platform = null,
+}) {
+  assertStateRunnerCompatibility(state, platform);
   if (!state || !["install_prepared", "uninstall_prepared"].includes(state.phase)) return state;
   const settings = await readSettings(settingsFile, storage);
   const managed = managedBackup(state.installedStatusLine);
@@ -1158,8 +1383,15 @@ async function recoverPreparedState({ directory, settingsFile, state, failpoint,
   return committed;
 }
 
-async function inspectUnlocked({ directory, settingsFile, installedStatusLine, storage = null }) {
+async function inspectUnlocked({
+  directory,
+  settingsFile,
+  installedStatusLine,
+  storage = null,
+  platform = null,
+}) {
   const state = await readLifecycleState(directory, storage);
+  assertStateRunnerCompatibility(state, platform);
   assertManagedStateMatches(state, installedStatusLine);
   const settings = await readSettings(settingsFile, storage);
   const managed = managedBackup(installedStatusLine);
@@ -1181,15 +1413,23 @@ async function inspectUnlocked({ directory, settingsFile, installedStatusLine, s
 }
 
 async function inspectClaudeCallbackLifecycle(options = {}) {
-  const {
-    settingsFile = defaultClaudeSettingsFile(options),
-    lifecycleDirectory = defaultClaudeCallbackLifecycleDirectory(),
-    installedStatusLine = buildManagedClaudeStatusLine(),
-  } = options;
+  const platform = selectedPlatform(options);
+  const windowsRunner = platform === "win32"
+    ? selectClaudeCallbackRunner({
+      platform,
+      environment: options.environment,
+      runner: options.windowsRunner ?? null,
+    })
+    : null;
+  const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile(options);
+  const lifecycleDirectory = options.lifecycleDirectory
+    ?? defaultClaudeCallbackLifecycleDirectory(options);
+  const installedStatusLine = options.installedStatusLine
+    ?? buildManagedClaudeStatusLine({ platform, windowsRunner });
   const storage = assertWindowsLifecycleStateSupported(options, { settingsFile, lifecycleDirectory });
   validateManagedStatusLine(installedStatusLine);
   if (storage) {
-    const inspected = await inspectUnlocked({ directory: lifecycleDirectory, settingsFile, installedStatusLine, storage });
+    const inspected = await inspectUnlocked({ directory: lifecycleDirectory, settingsFile, installedStatusLine, storage, platform });
     return { status: inspected.status, targetBinding: inspected.targetBinding };
   }
   const directoryStats = await lstatIfExists(lifecycleDirectory);
@@ -1207,40 +1447,69 @@ async function inspectClaudeCallbackLifecycle(options = {}) {
     };
   }
   await assertCanonicalOwnedDirectory(lifecycleDirectory, "state_directory", { ownerOnly: true });
-  const inspected = await inspectUnlocked({ directory: lifecycleDirectory, settingsFile, installedStatusLine });
+  const inspected = await inspectUnlocked({ directory: lifecycleDirectory, settingsFile, installedStatusLine, platform });
   return { status: inspected.status, targetBinding: inspected.targetBinding };
 }
 
 async function recoverClaudeCallbackLifecycle(options = {}) {
+  const platform = selectedPlatform(options);
+  const windowsRunner = platform === "win32"
+    ? selectClaudeCallbackRunner({
+      platform,
+      environment: options.environment,
+      runner: options.windowsRunner ?? null,
+    })
+    : null;
   const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile(options);
-  const directory = options.lifecycleDirectory ?? defaultClaudeCallbackLifecycleDirectory();
-  const installedStatusLine = options.installedStatusLine ?? buildManagedClaudeStatusLine();
+  const directory = options.lifecycleDirectory
+    ?? defaultClaudeCallbackLifecycleDirectory(options);
+  const installedStatusLine = options.installedStatusLine
+    ?? buildManagedClaudeStatusLine({ platform, windowsRunner });
   const failpoint = options.failpoint ?? (async () => {});
   const storage = assertWindowsLifecycleStateSupported(options, { settingsFile, lifecycleDirectory: directory });
   return withLifecycleLock(directory, async () => {
     const state = await readLifecycleState(directory, storage);
     assertManagedStateMatches(state, installedStatusLine);
-    const recovered = await recoverPreparedState({ directory, settingsFile, state, failpoint, storage });
-    const inspected = await inspectUnlocked({ directory, settingsFile, installedStatusLine, storage });
+    const recovered = await recoverPreparedState({ directory, settingsFile, state, failpoint, storage, platform });
+    const inspected = await inspectUnlocked({ directory, settingsFile, installedStatusLine, storage, platform });
     return { status: inspected.status, recovered: recovered?.phase ?? "none" };
   }, options, storage);
 }
 
 async function installClaudeCallback(options = {}) {
+  const platform = selectedPlatform(options);
+  const windowsRunner = platform === "win32"
+    ? selectClaudeCallbackRunner({
+      platform,
+      environment: options.environment,
+      runner: options.windowsRunner ?? null,
+    })
+    : null;
   const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile(options);
-  const directory = options.lifecycleDirectory ?? defaultClaudeCallbackLifecycleDirectory();
-  const installedStatusLine = options.installedStatusLine ?? buildManagedClaudeStatusLine();
+  const directory = options.lifecycleDirectory
+    ?? defaultClaudeCallbackLifecycleDirectory(options);
+  const installedStatusLine = options.installedStatusLine
+    ?? buildManagedClaudeStatusLine({ platform, windowsRunner });
   const failpoint = options.failpoint ?? (async () => {});
   const storage = assertWindowsLifecycleStateSupported(options, { settingsFile, lifecycleDirectory: directory });
   validateManagedStatusLine(installedStatusLine);
   return withLifecycleLock(directory, async () => {
     let state = await readLifecycleState(directory, storage);
     assertManagedStateMatches(state, installedStatusLine);
-    state = await recoverPreparedState({ directory, settingsFile, state, failpoint, storage });
-    const inspected = await inspectUnlocked({ directory, settingsFile, installedStatusLine, storage });
+    state = await recoverPreparedState({ directory, settingsFile, state, failpoint, storage, platform });
+    const inspected = await inspectUnlocked({ directory, settingsFile, installedStatusLine, storage, platform });
     if (inspected.status === "conflict") fail("conflict");
     const settings = inspected.status === "installed" ? null : await readSettings(settingsFile, storage);
     if (settings) validateCoexistingStatusLine(backupFromSettings(settings.value));
+    const previousRunner = settings?.value?.statusLine
+      ? (platform === "win32"
+        ? selectClaudeCallbackRunner({
+          platform,
+          environment: options.environment,
+          runner: options.windowsRunner ?? windowsRunner,
+        })
+        : null)
+      : null;
     const capability = await ensureCapability({
       backend: options.backend,
       generateSecret: options.generateSecret,
@@ -1253,6 +1522,7 @@ async function installClaudeCallback(options = {}) {
       previousStatusLine: backupFromSettings(settings.value),
       installedStatusLine,
     };
+    if (previousRunner !== null) prepared.previousRunner = previousRunner;
     await writeLifecycleState(directory, prepared, storage);
     await failpoint("after_install_state_prepared");
     await writeSettings(settings, applyStatusLine(settings.value, managedBackup(installedStatusLine)), failpoint);
@@ -1264,16 +1534,26 @@ async function installClaudeCallback(options = {}) {
 }
 
 async function uninstallClaudeCallback(options = {}) {
+  const platform = selectedPlatform(options);
+  const windowsRunner = platform === "win32"
+    ? selectClaudeCallbackRunner({
+      platform,
+      environment: options.environment,
+      runner: options.windowsRunner ?? null,
+    })
+    : null;
   const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile(options);
-  const directory = options.lifecycleDirectory ?? defaultClaudeCallbackLifecycleDirectory();
-  const installedStatusLine = options.installedStatusLine ?? buildManagedClaudeStatusLine();
+  const directory = options.lifecycleDirectory
+    ?? defaultClaudeCallbackLifecycleDirectory(options);
+  const installedStatusLine = options.installedStatusLine
+    ?? buildManagedClaudeStatusLine({ platform, windowsRunner });
   const failpoint = options.failpoint ?? (async () => {});
   const storage = assertWindowsLifecycleStateSupported(options, { settingsFile, lifecycleDirectory: directory });
   return withLifecycleLock(directory, async () => {
     let state = await readLifecycleState(directory, storage);
     assertManagedStateMatches(state, installedStatusLine);
-    state = await recoverPreparedState({ directory, settingsFile, state, failpoint, storage });
-    const inspected = await inspectUnlocked({ directory, settingsFile, installedStatusLine, storage });
+    state = await recoverPreparedState({ directory, settingsFile, state, failpoint, storage, platform });
+    const inspected = await inspectUnlocked({ directory, settingsFile, installedStatusLine, storage, platform });
     if (inspected.status === "conflict") fail("conflict");
     if (inspected.status === "not_installed") return { status: "already_uninstalled", capabilityPreserved: true };
     const settings = await readSettings(settingsFile, storage);
@@ -1289,9 +1569,19 @@ async function uninstallClaudeCallback(options = {}) {
 }
 
 async function rotateManagedClaudeCallbackCapability(options = {}) {
+  const platform = selectedPlatform(options);
+  const windowsRunner = platform === "win32"
+    ? selectClaudeCallbackRunner({
+      platform,
+      environment: options.environment,
+      runner: options.windowsRunner ?? null,
+    })
+    : null;
   const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile(options);
-  const directory = options.lifecycleDirectory ?? defaultClaudeCallbackLifecycleDirectory();
-  const installedStatusLine = options.installedStatusLine ?? buildManagedClaudeStatusLine();
+  const directory = options.lifecycleDirectory
+    ?? defaultClaudeCallbackLifecycleDirectory(options);
+  const installedStatusLine = options.installedStatusLine
+    ?? buildManagedClaudeStatusLine({ platform, windowsRunner });
   const storage = assertWindowsLifecycleStateSupported(options, { settingsFile, lifecycleDirectory: directory });
   return withLifecycleLock(directory, async () => {
     const initial = await readLifecycleState(directory, storage);
@@ -1302,6 +1592,7 @@ async function rotateManagedClaudeCallbackCapability(options = {}) {
       state: initial,
       failpoint: options.failpoint ?? (async () => {}),
       storage,
+      platform,
     });
     void state;
     return rotateCapability({
@@ -1313,9 +1604,19 @@ async function rotateManagedClaudeCallbackCapability(options = {}) {
 }
 
 async function planManagedClaudeCallbackCapabilityRemoval(options = {}) {
+  const platform = selectedPlatform(options);
+  const windowsRunner = platform === "win32"
+    ? selectClaudeCallbackRunner({
+      platform,
+      environment: options.environment,
+      runner: options.windowsRunner ?? null,
+    })
+    : null;
   const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile(options);
-  const directory = options.lifecycleDirectory ?? defaultClaudeCallbackLifecycleDirectory();
-  const installedStatusLine = options.installedStatusLine ?? buildManagedClaudeStatusLine();
+  const directory = options.lifecycleDirectory
+    ?? defaultClaudeCallbackLifecycleDirectory(options);
+  const installedStatusLine = options.installedStatusLine
+    ?? buildManagedClaudeStatusLine({ platform, windowsRunner });
   const storage = assertWindowsLifecycleStateSupported(options, { settingsFile, lifecycleDirectory: directory });
   return withLifecycleLock(directory, async () => {
     const initial = await readLifecycleState(directory, storage);
@@ -1326,9 +1627,10 @@ async function planManagedClaudeCallbackCapabilityRemoval(options = {}) {
       state: initial,
       failpoint: options.failpoint ?? (async () => {}),
       storage,
+      platform,
     });
     void state;
-    const inspected = await inspectUnlocked({ directory, settingsFile, installedStatusLine, storage });
+    const inspected = await inspectUnlocked({ directory, settingsFile, installedStatusLine, storage, platform });
     if (inspected.status !== "not_installed") fail("not_uninstalled");
     return planCapabilityRemoval({
       backend: options.backend,
@@ -1338,9 +1640,19 @@ async function planManagedClaudeCallbackCapabilityRemoval(options = {}) {
 }
 
 async function removeManagedClaudeCallbackCapability(options = {}) {
+  const platform = selectedPlatform(options);
+  const windowsRunner = platform === "win32"
+    ? selectClaudeCallbackRunner({
+      platform,
+      environment: options.environment,
+      runner: options.windowsRunner ?? null,
+    })
+    : null;
   const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile(options);
-  const directory = options.lifecycleDirectory ?? defaultClaudeCallbackLifecycleDirectory();
-  const installedStatusLine = options.installedStatusLine ?? buildManagedClaudeStatusLine();
+  const directory = options.lifecycleDirectory
+    ?? defaultClaudeCallbackLifecycleDirectory(options);
+  const installedStatusLine = options.installedStatusLine
+    ?? buildManagedClaudeStatusLine({ platform, windowsRunner });
   const storage = assertWindowsLifecycleStateSupported(options, { settingsFile, lifecycleDirectory: directory });
   return withLifecycleLock(directory, async () => {
     const initial = await readLifecycleState(directory, storage);
@@ -1351,8 +1663,9 @@ async function removeManagedClaudeCallbackCapability(options = {}) {
       state: initial,
       failpoint: options.failpoint ?? (async () => {}),
       storage,
+      platform,
     });
-    const inspected = await inspectUnlocked({ directory, settingsFile, installedStatusLine, storage });
+    const inspected = await inspectUnlocked({ directory, settingsFile, installedStatusLine, storage, platform });
     if (inspected.status !== "not_installed") fail("not_uninstalled");
     return removeCapability({
       backend: options.backend,
@@ -1365,10 +1678,35 @@ async function removeManagedClaudeCallbackCapability(options = {}) {
 // Runtime-only accessor. It returns the command to the local callback process,
 // never to inspect/CLI output, and reads only the owner-only lifecycle state.
 async function readClaudeCallbackRuntimeConfiguration(options = {}) {
-  const {
-    lifecycleDirectory = defaultClaudeCallbackLifecycleDirectory(),
-    installedStatusLine = buildManagedClaudeStatusLine(),
-  } = options;
+  const platform = selectedPlatform(options);
+  const windowsRunner = platform === "win32"
+    ? selectClaudeCallbackRunner({
+      platform,
+      environment: options.environment,
+      runner: options.windowsRunner ?? null,
+    })
+    : null;
+  const lifecycleDirectory = options.lifecycleDirectory
+    ?? defaultClaudeCallbackLifecycleDirectory(options);
+  const installedStatusLine = options.installedStatusLine
+    ?? buildManagedClaudeStatusLine({ platform, windowsRunner });
+  const runtimeConfiguration = (state) => {
+    const previousCommand = validateCoexistingStatusLine(state.previousStatusLine);
+    if (platform !== "win32" || previousCommand === null) {
+      return { previousCommand };
+    }
+    if (!Object.hasOwn(state, "previousRunner") || state.previousRunner === null) {
+      // A legacy Windows state has no trustworthy shell identity. Do not
+      // rediscover a different shell or mutate the user's settings.
+      fail("coexistence_unsupported");
+    }
+    const previousRunner = validateClaudeCallbackRunner(state.previousRunner);
+    // The runner selected for this invocation is only an identity check. The
+    // persisted runner remains the one used for replay; a state edit that
+    // substitutes another allowlisted installation must fail closed.
+    if (!sameRunnerIdentity(previousRunner, windowsRunner)) fail("coexistence_unsupported");
+    return { previousCommand, previousRunner };
+  };
   const storage = assertWindowsLifecycleStateSupported(options, {
     settingsFile: options.settingsFile ?? defaultClaudeSettingsFile(options),
     lifecycleDirectory,
@@ -1379,7 +1717,7 @@ async function readClaudeCallbackRuntimeConfiguration(options = {}) {
       fail("runtime_state");
     }
     assertManagedStateMatches(state, installedStatusLine);
-    return { previousCommand: validateCoexistingStatusLine(state.previousStatusLine) };
+    return runtimeConfiguration(state);
   }
   await assertCanonicalOwnedDirectory(lifecycleDirectory, "runtime_state", { ownerOnly: true });
   const state = await readLifecycleState(lifecycleDirectory);
@@ -1387,7 +1725,7 @@ async function readClaudeCallbackRuntimeConfiguration(options = {}) {
     fail("runtime_state");
   }
   assertManagedStateMatches(state, installedStatusLine);
-  return { previousCommand: validateCoexistingStatusLine(state.previousStatusLine) };
+  return runtimeConfiguration(state);
 }
 
   return Object.freeze({

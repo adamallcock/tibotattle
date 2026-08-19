@@ -5,7 +5,10 @@ import {
 } from "./application/claude-callback-capability.js";
 import {
   ClaudeCallbackLifecycleError,
+  buildClaudeCallbackRunnerInvocation,
   createClaudeCallbackLifecycleContext,
+  selectClaudeCallbackRunner,
+  validateClaudeCallbackRunner,
 } from "./platform/claude-callback-lifecycle.js";
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
@@ -34,7 +37,10 @@ const CLAUDE_CALLBACK_LIFECYCLE =
   });
 
 export {
+  buildClaudeCallbackRunnerInvocation,
   ClaudeCallbackLifecycleError,
+  selectClaudeCallbackRunner,
+  validateClaudeCallbackRunner,
 };
 
 export const {
