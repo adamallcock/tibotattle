@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -12,7 +21,10 @@ import {
 import {
   createDesktopLifecycle,
 } from "../desktop-lifecycle.js";
-import { launchElectronShell } from "../main.js";
+import {
+  assertElectronQualificationLaunchOptions,
+  launchElectronShell,
+} from "../main.js";
 import {
   ELECTRON_ENTRY_FAILURE_DIAGNOSTIC,
   ElectronShellError,
@@ -20,6 +32,11 @@ import {
 import {
   assertElectronPlatformGate,
 } from "../platform-gate.js";
+import {
+  assertWindowsElectronQualificationContext,
+  createWindowsElectronQualificationContext,
+  runWindowsElectronQualificationCredentialCommandForTest,
+} from "../windows-qualification.js";
 import {
   createLoopbackNavigationPolicy,
   installLoopbackNavigationPolicy,
@@ -32,6 +49,156 @@ import {
 } from "../ready-line.js";
 
 const REPOSITORY_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
+const require = createRequire(import.meta.url);
+const WINDOWS_KEYTAR_PATH = require.resolve(
+  "@github/keytar/prebuilds/win32-x64/keytar.node",
+);
+
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+async function withWindowsQualificationFixture(run) {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-electron-qualification-"));
+  const appPath = join(root, "app");
+  const bindingPath = join(appPath, "native/windows-filesystem/build/Release/windows_filesystem.node");
+  const bindingManifestPath = `${bindingPath}.manifest.json`;
+  const keytarPath = join(appPath, "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node");
+  const binding = Buffer.from("synthetic Windows qualification binding\n");
+  const keytar = await readFile(WINDOWS_KEYTAR_PATH);
+  const bindingManifest = Buffer.from(`${JSON.stringify({
+    schemaVersion: "windows-filesystem-binding-manifest-v1",
+    bindingFile: "windows_filesystem.node",
+    platform: "win32",
+    architecture: "x64",
+    bytes: binding.byteLength,
+    sha256: sha256(binding),
+    contractVersion: "windows-filesystem-v1",
+    securityContractVersion: "windows-filesystem-security-v1",
+    bindingProvenance: {
+      contractVersion: "windows-binding-provenance-v1",
+      status: "unqualified",
+      source: "unsigned-development-binding",
+    },
+  })}\n`);
+  const runtimeSourcePaths = [
+    "apps/electron/companion-supervisor.js",
+    "apps/electron/desktop-lifecycle.js",
+    "apps/electron/errors.js",
+    "apps/electron/loopback-policy.js",
+    "apps/electron/main.js",
+    "apps/electron/platform-gate.js",
+    "apps/electron/preload.js",
+    "apps/electron/ready-line.js",
+    "apps/electron/windows-qualification.js",
+    "apps/local/server.js",
+    "apps/web/public/index.html",
+  ];
+  const runtimeFiles = [
+    ...runtimeSourcePaths.map((path) => {
+      const content = Buffer.from(path, "utf8");
+      return {
+        bytes: content.byteLength,
+        kind: path.startsWith("apps/web/")
+          ? "dashboard_asset"
+          : path === "apps/local/server.js"
+            ? "companion_source"
+            : "electron_shell",
+        path,
+        sha256: sha256(content),
+      };
+    }),
+    {
+      bytes: binding.byteLength,
+      kind: "windows_native_binding",
+      path: "native/windows-filesystem/build/Release/windows_filesystem.node",
+      sha256: sha256(binding),
+    },
+    {
+      bytes: bindingManifest.byteLength,
+      kind: "windows_native_binding",
+      path: "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
+      sha256: sha256(bindingManifest),
+    },
+    {
+      bytes: keytar.byteLength,
+      kind: "third_party_dependency",
+      path: "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node",
+      sha256: sha256(keytar),
+    },
+  ].sort((left, right) => Buffer.from(left.path).compare(Buffer.from(right.path)));
+  const payloadHash = createHash("sha256");
+  let payloadBytes = 0;
+  for (const row of runtimeFiles) {
+    payloadBytes += row.bytes;
+    payloadHash.update(`F\0${row.path}\0${row.bytes}\0${row.sha256}\0${row.kind}\0`);
+  }
+  const bindingRow = runtimeFiles.find((row) =>
+    row.path === "native/windows-filesystem/build/Release/windows_filesystem.node");
+  const runtimeManifest = {
+    schemaVersion: "usage-monitor-electron-runtime-v0.1",
+    target: "win32",
+    architecture: "x64",
+    releaseVersion: "0.1.0-dev",
+    entrypoint: "apps/electron/main.js",
+    dashboardRoot: "apps/web/public",
+    files: runtimeFiles,
+    payload: {
+      bytes: payloadBytes,
+      sha256: payloadHash.digest("hex"),
+    },
+    windowsBinding: {
+      binding: {
+        bytes: bindingRow.bytes,
+        path: bindingRow.path,
+        sha256: bindingRow.sha256,
+      },
+      included: true,
+      manifest: {
+        path: "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
+      },
+      status: "included_unverified",
+      verified: false,
+    },
+  };
+  await mkdir(join(appPath, "native/windows-filesystem/build/Release"), { recursive: true });
+  await mkdir(join(appPath, "node_modules/@github/keytar/prebuilds/win32-x64"), {
+    recursive: true,
+  });
+  await writeFile(bindingPath, binding);
+  await writeFile(bindingManifestPath, bindingManifest);
+  await writeFile(keytarPath, keytar);
+  for (const row of runtimeSourcePaths) {
+    const content = Buffer.from(row, "utf8");
+    const path = join(appPath, ...row.split("/"));
+    await mkdir(join(path, ".."), { recursive: true });
+    await writeFile(path, content);
+  }
+  await writeFile(
+    join(appPath, "electron-runtime-manifest.json"),
+    `${JSON.stringify(runtimeManifest)}\n`,
+  );
+  const app = {
+    isPackaged: true,
+    getAppPath: () => appPath,
+    getName: () => "TiboTattle Dev",
+  };
+  const environment = {
+    USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION: "windows-electron-v1",
+    USAGE_MONITOR_TEST_LANE: "windows-electron-smoke",
+  };
+  try {
+    const context = await createWindowsElectronQualificationContext({
+      app,
+      environment,
+      platform: "win32",
+      architecture: "x64",
+    });
+    return await run({ root, appPath, context, environment, runtimeManifest });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
 
 function errorCode(code) {
   return (error) => {
@@ -301,6 +468,10 @@ test("companion supervisor owns one child, injects a parent contract, and strips
       USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
       USAGE_MONITOR_DEVELOPMENT_ARTIFACT_FALLBACK: "1",
       USAGE_MONITOR_WINDOWS_FILESYSTEM_DEVELOPMENT: "1",
+      USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION: "windows-electron-v1",
+      USAGE_MONITOR_TEST_LANE: "windows-electron-smoke",
+      USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID:
+        "550e8400-e29b-41d4-a716-446655440000",
       ELECTRON_RUN_AS_NODE: "0",
     },
     parentPid: 4242,
@@ -325,6 +496,12 @@ test("companion supervisor owns one child, injects a parent contract, and strips
   assert.equal(spawnCalls[0].options.env.USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY, undefined);
   assert.equal(spawnCalls[0].options.env.USAGE_MONITOR_DEVELOPMENT_ARTIFACT_FALLBACK, undefined);
   assert.equal(spawnCalls[0].options.env.USAGE_MONITOR_WINDOWS_FILESYSTEM_DEVELOPMENT, undefined);
+  assert.equal(
+    spawnCalls[0].options.env.USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION,
+    "windows-electron-v1",
+  );
+  assert.equal(spawnCalls[0].options.env.USAGE_MONITOR_TEST_LANE, "windows-electron-smoke");
+  assert.equal(spawnCalls[0].options.env.USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID, undefined);
   assert.equal(spawnCalls[0].options.env.ELECTRON_RUN_AS_NODE, "1");
   assert.equal(spawnCalls[0].options.env.USAGE_MONITOR_PORT, "0");
   assert.equal(spawnCalls[0].options.env.USAGE_MONITOR_PARENT_PID, "4242");
@@ -384,6 +561,262 @@ test("platform gate leaves macOS/Linux available and refuses unqualified Windows
     () => assertElectronPlatformGate({ platform: "win32", architecture: "x64" }),
     errorCode("windows_readiness_unavailable"),
   );
+});
+
+test("Windows qualification context is branded, content-free, and accepted only for the smoke lane", async () => {
+  await withWindowsQualificationFixture(async ({ context }) => {
+    assert.equal(context.windowsProductionReady, false);
+    assert.equal(context.windowsQualificationOnly, true);
+    assert.deepEqual(
+      assertElectronPlatformGate({
+        platform: "win32",
+        architecture: "x64",
+        qualificationContext: context,
+      }),
+      {
+        platform: "win32",
+        architecture: "x64",
+        windowsProductionReady: false,
+        windowsQualificationOnly: true,
+      },
+    );
+    assert.equal(
+      assertWindowsElectronQualificationContext({
+        context,
+        platform: "win32",
+        architecture: "x64",
+      }),
+      context,
+    );
+    assert.throws(
+      () => assertWindowsElectronQualificationContext({
+        context: { ...context },
+        platform: "win32",
+        architecture: "x64",
+      }),
+      /Windows Electron qualification is unavailable/u,
+    );
+    assert.throws(
+      () => assertElectronPlatformGate({
+        platform: "win32",
+        architecture: "x64",
+        qualificationContext: { ...context },
+      }),
+      errorCode("windows_readiness_unavailable"),
+    );
+  });
+});
+
+test("Windows qualification forbids launch-path and supervisor overrides", async () => {
+  await withWindowsQualificationFixture(async ({ context }) => {
+    assert.doesNotThrow(() => assertElectronQualificationLaunchOptions({
+      qualificationContext: context,
+    }));
+    for (const options of [
+      { companionScript: "C:\\forged\\server.js" },
+      { resourceRoot: "C:\\forged\\resources" },
+      { resourcesPath: "C:\\forged\\resources" },
+      { supervisorOptions: { command: "forged.exe" } },
+      { lifecycleOptions: { appName: "Forged" } },
+    ]) {
+      assert.throws(
+        () => assertElectronQualificationLaunchOptions({
+          qualificationContext: context,
+          ...options,
+        }),
+        errorCode("windows_qualification_launch_override_forbidden"),
+      );
+    }
+  });
+});
+
+test("Windows qualification rejects a runtime/native manifest mismatch", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-electron-qualification-mismatch-"));
+  const appPath = join(root, "app");
+  const bindingPath = join(appPath, "native/windows-filesystem/build/Release/windows_filesystem.node");
+  const bindingManifestPath = `${bindingPath}.manifest.json`;
+  const keytarPath = join(appPath, "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node");
+  const binding = Buffer.from("binding\n");
+  const bindingSha256 = sha256(binding);
+  const bindingManifest = Buffer.from(`${JSON.stringify({
+    schemaVersion: "windows-filesystem-binding-manifest-v1",
+    bindingFile: "windows_filesystem.node",
+    platform: "win32",
+    architecture: "x64",
+    bytes: binding.byteLength,
+    sha256: bindingSha256,
+    contractVersion: "windows-filesystem-v1",
+    securityContractVersion: "windows-filesystem-security-v1",
+    bindingProvenance: {
+      contractVersion: "windows-binding-provenance-v1",
+      status: "unqualified",
+      source: "unsigned-development-binding",
+    },
+  })}\n`);
+  const keytar = await readFile(WINDOWS_KEYTAR_PATH);
+  const runtimeManifest = {
+    schemaVersion: "usage-monitor-electron-runtime-v0.1",
+    target: "win32",
+    architecture: "x64",
+    entrypoint: "apps/electron/main.js",
+    dashboardRoot: "apps/web/public",
+    files: [
+      {
+        bytes: binding.byteLength,
+        kind: "windows_native_binding",
+        path: "native/windows-filesystem/build/Release/windows_filesystem.node",
+        sha256: bindingSha256,
+      },
+      {
+        bytes: bindingManifest.byteLength,
+        kind: "windows_native_binding",
+        path: "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
+        sha256: sha256(bindingManifest),
+      },
+      {
+        bytes: keytar.byteLength,
+        kind: "third_party_dependency",
+        path: "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node",
+        sha256: sha256(keytar),
+      },
+    ],
+    windowsBinding: {
+      binding: {
+        bytes: binding.byteLength,
+        path: "native/windows-filesystem/build/Release/windows_filesystem.node",
+        sha256: "0".repeat(64),
+      },
+      included: true,
+      manifest: {
+        path: "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
+      },
+      status: "included_unverified",
+      verified: false,
+    },
+  };
+  await mkdir(join(appPath, "native/windows-filesystem/build/Release"), { recursive: true });
+  await mkdir(join(appPath, "node_modules/@github/keytar/prebuilds/win32-x64"), {
+    recursive: true,
+  });
+  await writeFile(bindingPath, binding);
+  await writeFile(bindingManifestPath, bindingManifest);
+  await writeFile(keytarPath, keytar);
+  await writeFile(join(appPath, "electron-runtime-manifest.json"), JSON.stringify(runtimeManifest));
+  try {
+    await assert.rejects(
+      createWindowsElectronQualificationContext({
+        app: {
+          isPackaged: true,
+          getAppPath: () => appPath,
+          getName: () => "TiboTattle Dev",
+        },
+        environment: {
+          USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION: "windows-electron-v1",
+          USAGE_MONITOR_TEST_LANE: "windows-electron-smoke",
+        },
+        platform: "win32",
+        architecture: "x64",
+      }),
+      /Windows Electron qualification is unavailable/u,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows qualification cannot inject a package reader authority", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-electron-reader-seam-"));
+  try {
+    await assert.rejects(
+      createWindowsElectronQualificationContext({
+        app: {
+          isPackaged: true,
+          getAppPath: () => root,
+          getName: () => "TiboTattle Dev",
+        },
+        environment: {
+          USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION: "windows-electron-v1",
+          USAGE_MONITOR_TEST_LANE: "windows-electron-smoke",
+        },
+        platform: "win32",
+        architecture: "x64",
+        readFileImpl: async () => Buffer.from("caller-controlled bytes"),
+      }),
+      (error) => error?.code
+        === "WINDOWS_ELECTRON_QUALIFICATION_RESOURCE_AUTHORITY_INVALID",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows qualification rejects a payload inventory byte mismatch", async () => {
+  await withWindowsQualificationFixture(async ({ appPath, environment }) => {
+    await writeFile(
+      join(appPath, "apps/electron/main.js"),
+      Buffer.from("tampered Electron entrypoint\n"),
+    );
+    await assert.rejects(
+      createWindowsElectronQualificationContext({
+        app: {
+          isPackaged: true,
+          getAppPath: () => appPath,
+          getName: () => "TiboTattle Dev",
+        },
+        environment,
+        platform: "win32",
+        architecture: "x64",
+      }),
+      (error) => error?.code
+        === "WINDOWS_ELECTRON_QUALIFICATION_RUNTIME_INVENTORY_MISMATCH",
+    );
+  });
+});
+
+test("qualification credential commands use a deterministic disposable tuple and confirm deletion", async () => {
+  await withWindowsQualificationFixture(async ({ context }) => {
+    const values = new Map();
+    const binding = {
+      async setPassword(service, account, secret) {
+        values.set(`${service}\0${account}`, secret);
+      },
+      async getPassword(service, account) {
+        return values.get(`${service}\0${account}`) ?? null;
+      },
+      async deletePassword(service, account) {
+        return values.delete(`${service}\0${account}`);
+      },
+    };
+    const runId = "550e8400-e29b-41d4-a716-446655440000";
+    assert.deepEqual(
+      await runWindowsElectronQualificationCredentialCommandForTest({
+        context,
+        command: "create-v1",
+        runId,
+        binding,
+      }),
+      { status: "passed", command: "create-v1", cleanup: "pending" },
+    );
+    assert.deepEqual(
+      await runWindowsElectronQualificationCredentialCommandForTest({
+        context,
+        command: "read-v1",
+        runId,
+        binding,
+      }),
+      { status: "passed", command: "read-v1", cleanup: "pending" },
+    );
+    assert.deepEqual(
+      await runWindowsElectronQualificationCredentialCommandForTest({
+        context,
+        command: "delete-v1",
+        runId,
+        binding,
+      }),
+      { status: "passed", command: "delete-v1", cleanup: "confirmed" },
+    );
+    assert.equal(values.size, 0);
+  });
 });
 
 test("desktop lifecycle composes secure window, tray, single instance, retry, and quit", async () => {
