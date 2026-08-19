@@ -42,11 +42,13 @@ export const AutomaticContributionController =
 function createAutomaticContributionStorage({
   platform = process.platform,
   windowsProtectedStateStore = null,
+  windowsCompanionInstanceLease = null,
 } = {}) {
   return createOwnerOnlyAutomaticContributionStorageContext({
     createError: (code) => new AutomaticContributionError(code),
     platform,
     windowsProtectedStateStore,
+    windowsCompanionInstanceLease,
   });
 }
 
@@ -59,19 +61,22 @@ export function createAutomaticContributionController(options = {}) {
     throw new TypeError("automatic contribution options must be an object");
   }
   const hasWindowsComposition = Object.hasOwn(options, "platform")
-    || Object.hasOwn(options, "windowsProtectedStateStore");
+    || Object.hasOwn(options, "windowsProtectedStateStore")
+    || Object.hasOwn(options, "windowsCompanionInstanceLease");
   if (!hasWindowsComposition) {
     return automaticContribution.createAutomaticContributionController(options);
   }
   const {
     platform = process.platform,
     windowsProtectedStateStore = null,
+    windowsCompanionInstanceLease = null,
     ...controllerOptions
   } = options;
   const context = createLocalAutomaticContributionContext({
     storage: createAutomaticContributionStorage({
       platform,
       windowsProtectedStateStore,
+      windowsCompanionInstanceLease,
     }),
     randomUuid: randomUUID,
     resolvePath: platform === "win32" ? win32.resolve : resolve,
@@ -84,12 +89,22 @@ export function acquireAutomaticContributionInstanceLock({
   pid,
   now,
   processIsAlive,
+  platform = process.platform,
+  windowsCompanionInstanceLease = null,
 } = {}) {
-  return storage.acquireInstanceLock({
+  const selectedStorage = platform === process.platform
+    && windowsCompanionInstanceLease === null
+    ? storage
+    : createAutomaticContributionStorage({
+      platform,
+      windowsCompanionInstanceLease,
+    });
+  return selectedStorage.acquireInstanceLock({
     lockFile,
     pid,
     now,
     processIsAlive,
+    windowsCompanionInstanceLease,
     maximumBytes: MAXIMUM_INSTANCE_LOCK_BYTES,
   });
 }

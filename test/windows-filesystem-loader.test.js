@@ -37,11 +37,13 @@ function manifest(overrides = {}) {
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
     sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
+    companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
     requiredMethods: [...WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS],
     nativeClaims: {
       productionSafe: false,
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
+      companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
       sqliteStateLeaseSafe: false,
     },
@@ -49,6 +51,7 @@ function manifest(overrides = {}) {
       productionSafe: false,
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
+      companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
       sqliteStateLeaseSafe: false,
     },
@@ -68,11 +71,13 @@ function binding(overrides = {}) {
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
     sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
+    companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
     credentialAuditFileGuardSafe: true,
     sqliteStateLeaseSafe: false,
+    companionInstanceMutexSafe: false,
     inspectPath: () => ({ identity: IDENTITY }),
     ensureDirectory: () => IDENTITY,
     readFile: () => ({ data: Buffer.from("data"), identity: IDENTITY }),
@@ -87,6 +92,8 @@ function binding(overrides = {}) {
     replaceProtectedChild: () => IDENTITY,
     acquireCredentialMutex: () => ({ lease: {}, abandoned: false }),
     releaseCredentialMutex: () => {},
+    acquireCompanionInstanceMutex: () => ({ lease: {}, abandoned: false }),
+    releaseCompanionInstanceMutex: () => {},
     acquireCredentialAuditFileGuard: () => ({ lease: {} }),
     releaseCredentialAuditFileGuard: () => {},
     acquireSqliteStateLease: () => ({
@@ -200,6 +207,34 @@ test("Windows native loader requires a sidecar manifest and exact binding digest
   );
 });
 
+test("Windows native loader rejects a stale sidecar before loading an older binding", () => {
+  const bindingPath = "C:\\checkout\\native\\windows-filesystem\\build\\Release\\windows_filesystem.node";
+  const staleManifest = manifest();
+  delete staleManifest.companionInstanceMutexContractVersion;
+  delete staleManifest.nativeClaims.companionInstanceMutexSafe;
+  delete staleManifest.approvedPolicy.companionInstanceMutexSafe;
+  let required = false;
+  assert.throws(
+    () => loadWindowsFilesystemBinding({
+      platform: "win32",
+      architecture: "x64",
+      bindingPath,
+      resolveBinding: (path) => path,
+      readManifest: () => JSON.stringify(staleManifest),
+      readBindingBytes: () => BINDING_BYTES,
+      requireBinding: () => {
+        required = true;
+        return binding({
+          acquireCompanionInstanceMutex: undefined,
+          releaseCompanionInstanceMutex: undefined,
+        });
+      },
+    }),
+    (error) => error.code === "WINDOWS_FILESYSTEM_INVALID_MANIFEST",
+  );
+  assert.equal(required, false);
+});
+
 test("Windows native loader rejects malformed binding provenance before loading", () => {
   const bindingPath = "C:\\checkout\\native\\windows-filesystem\\build\\Release\\windows_filesystem.node";
   let required = false;
@@ -242,6 +277,7 @@ test("manifest policy and native claims are cross-checked before loading", () =>
           productionSafe: true,
           pathWalkRaceSafe: true,
           credentialMutexSafe: true,
+          companionInstanceMutexSafe: false,
           credentialAuditFileGuardSafe: true,
           sqliteStateLeaseSafe: false,
         },
@@ -249,6 +285,7 @@ test("manifest policy and native claims are cross-checked before loading", () =>
           productionSafe: true,
           pathWalkRaceSafe: true,
           credentialMutexSafe: true,
+          companionInstanceMutexSafe: false,
           credentialAuditFileGuardSafe: true,
           sqliteStateLeaseSafe: false,
         },
@@ -299,6 +336,7 @@ test("manifest policy and native claims are cross-checked before loading", () =>
           productionSafe: false,
           pathWalkRaceSafe: false,
           credentialMutexSafe: false,
+          companionInstanceMutexSafe: false,
           credentialAuditFileGuardSafe: true,
           sqliteStateLeaseSafe: false,
         },
@@ -306,6 +344,7 @@ test("manifest policy and native claims are cross-checked before loading", () =>
           productionSafe: false,
           pathWalkRaceSafe: false,
           credentialMutexSafe: true,
+          companionInstanceMutexSafe: false,
           credentialAuditFileGuardSafe: true,
           sqliteStateLeaseSafe: false,
         },
@@ -344,6 +383,7 @@ test("production promotion remains blocked until a package verifier exists", () 
       productionSafe: true,
       pathWalkRaceSafe: true,
       credentialMutexSafe: true,
+      companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
       sqliteStateLeaseSafe: false,
     },
@@ -351,6 +391,7 @@ test("production promotion remains blocked until a package verifier exists", () 
       productionSafe: true,
       pathWalkRaceSafe: true,
       credentialMutexSafe: true,
+      companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
       sqliteStateLeaseSafe: false,
     },

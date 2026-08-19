@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url";
 import {
   WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION,
   WINDOWS_FILESYSTEM_BINDING_PROVENANCE_CONTRACT_VERSION,
+  WINDOWS_FILESYSTEM_COMPANION_INSTANCE_MUTEX_CONTRACT_VERSION,
   WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
 } from "../src/platform/windows-filesystem.js";
 
@@ -57,11 +58,14 @@ function assertBindingShape(binding) {
       && binding?.sqliteStateLeaseContractVersion
         === "windows-sqlite-state-lease-v1"
       && binding?.credentialMutexContractVersion === "windows-credential-mutex-v1"
+      && binding?.companionInstanceMutexContractVersion
+        === WINDOWS_FILESYSTEM_COMPANION_INSTANCE_MUTEX_CONTRACT_VERSION
       && typeof binding?.productionSafe === "boolean"
       && typeof binding?.pathWalkRaceSafe === "boolean"
       && binding?.credentialMutexSafe === true;
     valid = valid
       && binding?.credentialAuditFileGuardSafe === true
+      && binding?.companionInstanceMutexSafe === false
       && binding?.sqliteStateLeaseSafe === false;
   } catch {
     valid = false;
@@ -103,11 +107,14 @@ export function createWindowsFilesystemBindingManifest({ bytes, binding }) {
       native.credentialAuditFileGuardContractVersion,
     sqliteStateLeaseContractVersion: native.sqliteStateLeaseContractVersion,
     credentialMutexContractVersion: native.credentialMutexContractVersion,
+    companionInstanceMutexContractVersion:
+      native.companionInstanceMutexContractVersion,
     requiredMethods: [...WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS],
     nativeClaims: {
       productionSafe: native.productionSafe,
       pathWalkRaceSafe: native.pathWalkRaceSafe,
       credentialMutexSafe: native.credentialMutexSafe,
+      companionInstanceMutexSafe: native.companionInstanceMutexSafe,
       credentialAuditFileGuardSafe: native.credentialAuditFileGuardSafe,
       sqliteStateLeaseSafe: native.sqliteStateLeaseSafe,
     },
@@ -115,6 +122,7 @@ export function createWindowsFilesystemBindingManifest({ bytes, binding }) {
       productionSafe: false,
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
+      companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
       sqliteStateLeaseSafe: false,
     },

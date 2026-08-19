@@ -77,6 +77,7 @@ function bindingManifest(bytes) {
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
     sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
+    companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
     requiredMethods: [
       "inspectPath",
       "ensureDirectory",
@@ -96,11 +97,14 @@ function bindingManifest(bytes) {
       "releaseCredentialAuditFileGuard",
       "acquireCredentialMutex",
       "releaseCredentialMutex",
+      "acquireCompanionInstanceMutex",
+      "releaseCompanionInstanceMutex",
     ],
     nativeClaims: {
       productionSafe: false,
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
+      companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
       sqliteStateLeaseSafe: false,
     },
@@ -108,6 +112,7 @@ function bindingManifest(bytes) {
       productionSafe: false,
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
+      companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
       sqliteStateLeaseSafe: false,
     },
@@ -313,6 +318,12 @@ test("requires the exact versioned Windows sidecar schema and policy consistency
       label: "missing top-level schema field",
       mutate: (sidecar) => {
         delete sidecar.requiredMethods;
+      },
+    },
+    {
+      label: "missing companion mutex contract field",
+      mutate: (sidecar) => {
+        delete sidecar.companionInstanceMutexContractVersion;
       },
     },
     {

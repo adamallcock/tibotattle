@@ -97,6 +97,17 @@ step fails.
   non-inheritable handle. The native issued-token registry is protected against
   concurrent Node worker-thread calls. JavaScript retains an in-process guard
   because Win32 mutex acquisition is recursive on one thread.
+- `acquireCompanionInstanceMutex()` accepts no arguments. It derives one fixed
+  per-user `Local\` kernel-object name from the current SID, applies and
+  revalidates the protected owner-only DACL, and performs a non-blocking wait.
+  A live contender receives a fixed contention error. An abandoned owner is
+  transferred to the caller and surfaced only as `abandoned: true`; no stale
+  PID, path, label, or other content is returned. The native registry rejects
+  recursive same-process acquisition even though Win32 mutexes are recursive
+  on one thread. `releaseCompanionInstanceMutex(lease)` verifies the opaque
+  token, same-thread ownership, and active state before releasing exactly once.
+  The binding remains development-only until the native Windows qualification
+  proves child-process contention, crash recovery, and clean reacquisition.
 
 The protected DACL is deliberately strict: only the current user
 SID is an allow principal. Inherited SYSTEM/Administrators/user-group allows

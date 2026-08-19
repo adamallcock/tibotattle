@@ -16,6 +16,10 @@ import {
   isWindowsProtectedStateStore,
   isWindowsProtectedStateStoreError,
 } from "./windows-protected-state-store.js";
+import {
+  isWindowsCompanionInstanceLeaseContext,
+  isWindowsCompanionInstanceLeaseError,
+} from "./windows-companion-instance-lease.js";
 
 const INSTANCE_LOCK_SCHEMA_VERSION =
   "automatic-contribution-instance-lock-v0.1";
@@ -236,6 +240,7 @@ export function createOwnerOnlyAutomaticContributionStorageContext({
   defaultProcessLiveness = defaultProcessIsAlive,
   platform = process.platform,
   windowsProtectedStateStore = null,
+  windowsCompanionInstanceLease = null,
 } = {}) {
   const failures = failureContext(createError);
   const createUuid = requireFunction(uuid, "uuid");
@@ -244,6 +249,11 @@ export function createOwnerOnlyAutomaticContributionStorageContext({
       && windowsProtectedStateStore !== null
       && !isWindowsProtectedStateStore(windowsProtectedStateStore)) {
     throw new TypeError("windowsProtectedStateStore must be repository branded");
+  }
+  if (runtimePlatform === "win32"
+      && windowsCompanionInstanceLease !== null
+      && !isWindowsCompanionInstanceLeaseContext(windowsCompanionInstanceLease)) {
+    throw new TypeError("windowsCompanionInstanceLease must be repository branded");
   }
   const processIsAliveByDefault = requireFunction(
     defaultProcessLiveness,
@@ -571,13 +581,9 @@ export function createOwnerOnlyAutomaticContributionStorageContext({
     now = () => new Date(),
     processIsAlive = processIsAliveByDefault,
     maximumBytes,
+    windowsCompanionInstanceLease: requestedWindowsCompanionInstanceLease =
+      windowsCompanionInstanceLease,
   } = {}) {
-    // The JSON lock is not a valid Windows process-wide mutex.  Keep the
-    // existing fixed error until the kernel-backed lease is integrated; in
-    // particular, never fall back to O_EXCL and an unlink race on Windows.
-    if (runtimePlatform === "win32") {
-      failures.fail("instance_lock_unavailable");
-    }
     if (!Number.isSafeInteger(pid)
         || pid < 1
         || pid > 2_147_483_647
@@ -586,6 +592,49 @@ export function createOwnerOnlyAutomaticContributionStorageContext({
         || !Number.isSafeInteger(maximumBytes)
         || maximumBytes < 1) {
       failures.fail("configuration_invalid");
+    }
+    if (runtimePlatform === "win32") {
+      if (!isWindowsCompanionInstanceLeaseContext(requestedWindowsCompanionInstanceLease)) {
+        // The ordinary JSON lock is not a valid Windows process-wide mutex.
+        // Never fall back to O_EXCL and an unlink race on this platform.
+        failures.fail("instance_lock_unavailable");
+      }
+      const createdAt = timestamp(now(), failures);
+      let lease;
+      try {
+        lease = requestedWindowsCompanionInstanceLease.acquire();
+      } catch (error) {
+        if (isWindowsCompanionInstanceLeaseError(error)) {
+          if (error.code === "windows_companion_instance_lease_contended") {
+            failures.fail("instance_active");
+          }
+          failures.fail("instance_lock_unavailable");
+        }
+        failures.fail("instance_lock_unavailable");
+      }
+      const recovered = requestedWindowsCompanionInstanceLease.wasAbandoned(lease);
+      let releasePromise = null;
+      return Object.freeze({
+        schemaVersion: INSTANCE_LOCK_SCHEMA_VERSION,
+        pid,
+        createdAt,
+        recovered,
+        release() {
+          if (releasePromise === null) {
+            releasePromise = Promise.resolve().then(() => {
+              try {
+                requestedWindowsCompanionInstanceLease.release(lease);
+              } catch (error) {
+                if (isWindowsCompanionInstanceLeaseError(error)) {
+                  failures.fail("instance_lock_unavailable");
+                }
+                failures.fail("instance_lock_unavailable");
+              }
+            });
+          }
+          return releasePromise;
+        },
+      });
     }
     const target = await canonicalInstanceLockTarget(lockFile);
     for (let attempt = 0; attempt < 3; attempt += 1) {
