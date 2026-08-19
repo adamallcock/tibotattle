@@ -464,11 +464,13 @@ jobs:
           $requiredChecks = @(
             'artifact',
             'dashboardReady',
+            'credentialPersistence',
             'syntheticRefresh',
             'secondInstanceRejected',
             'showHideTrayLifecycle',
             'cleanQuit',
             'noOrphan',
+            'statePersistence',
             'relaunchPersistence'
           )
           if ($runtimeEvidence.status -ne 'passed' -or
@@ -494,6 +496,8 @@ jobs:
           "- Single-instance rejection: passed" >> $env:GITHUB_STEP_SUMMARY
           "- Clean quit and no orphan: passed" >> $env:GITHUB_STEP_SUMMARY
           "- Relaunch persistence: passed" >> $env:GITHUB_STEP_SUMMARY
+          "- Protected state persistence: passed" >> $env:GITHUB_STEP_SUMMARY
+          "- Disposable Credential Manager persistence and cleanup: passed" >> $env:GITHUB_STEP_SUMMARY
           "- Diagnostics: content-free" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Create content-free Windows Electron qualification receipt
@@ -525,6 +529,8 @@ jobs:
           if ($receipt.status -ne 'WINDOWS_ELECTRON_DEVELOPMENT_QUALIFICATION_PASSED' -or
               $receipt.schemaVersion -ne 'tibotattle-windows-electron-development-qualification-v1' -or
               $receipt.target -ne 'win32-x64' -or
+              $receipt.mode -ne 'qualification_only' -or
+              $receipt.productionReadiness -ne 'not_claimed' -or
               $receipt.revision -ne $env:TIBOTATTLE_QUALIFICATION_REVISION -or
               $receipt.cacheMode -ne $env:TIBOTATTLE_QUALIFICATION_CACHE_MODE -or
               $receiptJson -match '(?i)(?:[A-Za-z]:[\\/]|/Users/|/home/|\\Users\\|username|password|secret|token|pid|stdout|stderr|command|executable)') {
@@ -537,6 +543,7 @@ jobs:
           "- Revision: $($receipt.revision)" >> $env:GITHUB_STEP_SUMMARY
           "- Target: $($receipt.target)" >> $env:GITHUB_STEP_SUMMARY
           "- Cache mode: $($receipt.cacheMode)" >> $env:GITHUB_STEP_SUMMARY
+          "- Mode: qualification only; production readiness: not claimed" >> $env:GITHUB_STEP_SUMMARY
           "- Binding bytes: $($receipt.binding.bytes); SHA-256: $($receipt.binding.sha256)" >> $env:GITHUB_STEP_SUMMARY
           "- Runtime and package evidence: aggregate-only" >> $env:GITHUB_STEP_SUMMARY
 

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,6 +15,7 @@ import {
   qualificationReceiptMetadata,
   qualificationTestFiles,
   readVerifiedBindingManifest,
+  runNodeTests,
 } from "../scripts/windows-security-qualification.mjs";
 import {
   FIXED_STATUS as WINDOWS_RECEIPT_STATUS,
@@ -176,6 +179,24 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   );
   assert.match(qualificationScript, /--test-reporter=tap/u);
   assert.match(qualificationScript, /GITHUB_ACTIONS/u);
+  assert.match(qualificationScript, /QUALIFICATION_RUN_TIMEOUT_MS/u);
+  assert.match(qualificationScript, /QUALIFICATION_MAXIMUM_CAPTURE_BYTES/u);
+  assert.match(qualificationScript, /captureStopped = true/u);
+  assert.match(qualificationScript, /stdout = ""/u);
+  assert.match(qualificationScript, /child\.stdout\.pause\(\)/u);
+  assert.match(qualificationScript, /if \(terminationRequested\) return/u);
+  assert.match(qualificationScript, /FIXED_STATUS\.terminationFailed/u);
+  assert.match(
+    qualificationScript,
+    /if \(child\.exitCode !== null \|\| child\.signalCode !== null\) return false/u,
+  );
+  assert.match(
+    qualificationScript,
+    /Deliberately do not forward the test-only process injection seams/u,
+  );
+  assert.match(qualificationScript, /taskkill\.exe/u);
+  assert.match(qualificationScript, /"\/t"/u);
+  assert.match(qualificationScript, /"\/f"/u);
   assert.doesNotMatch(workflow, /npm exec --yes|pnpm dlx/u);
   assert.match(workflow, /git diff --quiet/u);
   assert.match(workflow, /git diff --cached --quiet/u);
@@ -203,6 +224,60 @@ test("qualification selection is fail-closed away from native Windows", async ()
     credentialFiles: [],
   });
   assert.equal(FIXED_STATUS.unsupported, "WINDOWS_SECURITY_QUALIFICATION_NATIVE_WINDOWS_REQUIRED");
+  assert.equal(FIXED_STATUS.timedOut, "WINDOWS_SECURITY_QUALIFICATION_TIMED_OUT");
+  assert.equal(
+    FIXED_STATUS.terminationFailed,
+    "WINDOWS_SECURITY_QUALIFICATION_TERMINATION_FAILED",
+  );
+});
+
+test("qualification child timeout settles with the fixed timeout status", async () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.exitCode = null;
+  child.signalCode = null;
+  child.pid = 4242;
+  child.kill = () => true;
+  let finishTermination;
+  const termination = new Promise((resolveTermination) => {
+    finishTermination = resolveTermination;
+  });
+  const run = runNodeTests(["synthetic.test.js"], {
+    cwd: REPOSITORY_ROOT,
+    timeoutMs: 5,
+    spawnProcess: () => child,
+    terminateProcessTree: async () => termination,
+  });
+  await new Promise((resolveWait) => setTimeout(resolveWait, 15));
+  child.emit("error", new Error("synthetic termination race"));
+  finishTermination(true);
+  await assert.rejects(
+    run,
+    (error) => error.code === FIXED_STATUS.timedOut,
+  );
+});
+
+test("qualification capture overflow stops buffering and fails content-free", async () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.exitCode = null;
+  child.signalCode = null;
+  child.pid = 4243;
+  child.kill = () => true;
+  const run = runNodeTests(["synthetic.test.js"], {
+    cwd: REPOSITORY_ROOT,
+    timeoutMs: 1_000,
+    maximumCaptureBytes: 16,
+    spawnProcess: () => child,
+    terminateProcessTree: async () => true,
+  });
+  child.stdout.write("x".repeat(17));
+  await assert.rejects(
+    run,
+    (error) => error.code === FIXED_STATUS.failed,
+  );
 });
 
 test("qualification selection is the exact reviewed Windows test set", async () => {
@@ -212,6 +287,7 @@ test("qualification selection is the exact reviewed Windows test set", async () 
   });
   assert.deepEqual(selected.files, WINDOWS_SECURITY_QUALIFICATION_TEST_FILES);
   assert.deepEqual(selected.files, [
+    "test/windows-qualification-mode.test.js",
     "test/windows-credential-manager-probe.test.js",
     "test/windows-credential-audit-file-guard.test.js",
     "test/windows-credential-manager.test.js",
@@ -227,6 +303,14 @@ test("qualification selection is the exact reviewed Windows test set", async () 
     "test/windows-filesystem-companion-instance-lease.test.js",
     "test/windows-filesystem-security.test.js",
     "test/windows-filesystem-prepared-artifact-native.test.js",
+    "test/windows-protected-state-store.test.js",
+    "test/windows-sqlite-state-session-contract.test.js",
+    "test/windows-fixed-state-storage.test.js",
+    "test/windows-prepared-artifact-storage.test.js",
+    "test/windows-review-pair-storage.test.js",
+    "test/windows-contribution-sync-queue-storage.test.js",
+    "test/windows-prepared-contribution.test.js",
+    "test/local-collector-state-session.test.js",
     "test/windows-security-consumer-composition.test.js",
     "test/windows-sqlite-state-session-native.test.js",
     "test/claude-callback-windows-native.test.js",
@@ -477,11 +561,13 @@ function windowsReceiptFixture({
       artifact: true,
       cleanQuit: true,
       contentFree: true,
+      credentialPersistence: true,
       dashboardReady: true,
       noOrphan: true,
       relaunchPersistence: true,
       secondInstanceRejected: true,
       showHideTrayLifecycle: true,
+      statePersistence: true,
       status: "passed",
       syntheticRefresh: true,
       target: "win32-x64",
@@ -498,6 +584,7 @@ test("Windows Electron qualification receipt is exact-revision and content-free"
       sha256: "b".repeat(64),
     },
     cacheMode: "warm",
+    mode: "qualification_only",
     packaged: {
       artifact: { bytes: 4567, count: 89, sha256: "c".repeat(64) },
       asar: { bytes: 4567, count: 89, sha256: "c".repeat(64) },
@@ -512,6 +599,7 @@ test("Windows Electron qualification receipt is exact-revision and content-free"
       target: "win32-x64",
       unpacked: { bytes: 4567, count: 89, sha256: "c".repeat(64) },
     },
+    productionReadiness: "not_claimed",
     qualification: {
       credentialTestFileCount: 8,
       filesystemTestFileCount: 10,
@@ -526,12 +614,14 @@ test("Windows Electron qualification receipt is exact-revision and content-free"
     runtime: {
       checks: {
         cleanQuit: true,
+        credentialPersistence: true,
         dashboardReady: true,
         diagnostics: "content-free",
         launched: true,
         noOrphanProcesses: true,
         relaunchPersistence: true,
         singleInstanceRejected: true,
+        statePersistence: true,
         syntheticRefresh: true,
         trayWindowLifecycle: true,
       },

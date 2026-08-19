@@ -58,29 +58,35 @@ const RUNTIME_KEYS = Object.freeze([
   "cleanQuit",
   "contentFree",
   "dashboardReady",
+  "credentialPersistence",
   "noOrphan",
   "relaunchPersistence",
   "secondInstanceRejected",
   "showHideTrayLifecycle",
+  "statePersistence",
   "status",
   "syntheticRefresh",
   "target",
 ]);
 const RUNTIME_CHECK_KEYS = Object.freeze([
   "cleanQuit",
+  "credentialPersistence",
   "dashboardReady",
   "diagnostics",
   "launched",
   "noOrphanProcesses",
   "relaunchPersistence",
   "singleInstanceRejected",
+  "statePersistence",
   "syntheticRefresh",
   "trayWindowLifecycle",
 ]);
 const RECEIPT_KEYS = Object.freeze([
   "binding",
   "cacheMode",
+  "mode",
   "packaged",
+  "productionReadiness",
   "qualification",
   "revision",
   "runtime",
@@ -283,12 +289,14 @@ export function validateRuntimeEvidence(value) {
   return Object.freeze({
     checks: Object.freeze({
       cleanQuit: true,
+      credentialPersistence: true,
       dashboardReady: true,
       diagnostics: "content-free",
       launched: true,
       noOrphanProcesses: true,
       relaunchPersistence: true,
       singleInstanceRejected: true,
+      statePersistence: true,
       syntheticRefresh: true,
       trayWindowLifecycle: true,
     }),
@@ -376,7 +384,9 @@ export function buildWindowsElectronQualificationReceipt(inputs) {
   return Object.freeze({
     binding: selected.binding,
     cacheMode: selected.cacheMode,
+    mode: "qualification_only",
     packaged: selected.packaged,
+    productionReadiness: "not_claimed",
     qualification: selected.qualification,
     revision: selected.revision,
     runtime: selected.runtime,
@@ -391,6 +401,8 @@ function assertReceiptShape(value) {
       || value.schemaVersion !== RECEIPT_SCHEMA
       || value.status !== RECEIPT_STATUS
       || value.target !== TARGET
+      || value.mode !== "qualification_only"
+      || value.productionReadiness !== "not_claimed"
       || (value.cacheMode !== "warm" && value.cacheMode !== "clean")) {
     fail(FIXED_STATUS.receiptInvalid);
   }
