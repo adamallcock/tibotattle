@@ -36,6 +36,19 @@ export {
   isWindowsFilesystemIdentity,
 } from "./windows-filesystem.js";
 export {
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_CONTRACT_VERSION,
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_ARTIFACT_BYTES,
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_CONTRIBUTION_BYTES,
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_DIRECTORY_ENTRIES,
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_PRODUCTION_SAFE,
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_READINESS,
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_SAFE,
+  WindowsPreparedArtifactStorageError,
+  createWindowsPreparedArtifactStorageContext,
+  isWindowsPreparedArtifactStorage,
+  isWindowsPreparedArtifactStorageError,
+} from "./windows-prepared-artifact-storage.js";
+export {
   WINDOWS_PROTECTED_STATE_STORE_CONTRACT_VERSION,
   WINDOWS_PROTECTED_STATE_STORE_DEFAULT_MAX_BYTES,
   WINDOWS_PROTECTED_STATE_STORE_LEASE_VERSION,
@@ -102,8 +115,11 @@ export {
   readExportCompatibilityArtifactSet,
 } from "./export-compatibility-artifacts.js";
 export {
+  buildClaudeCallbackRunnerInvocation,
   ClaudeCallbackLifecycleError,
   createClaudeCallbackLifecycleContext,
+  selectClaudeCallbackRunner,
+  validateClaudeCallbackRunner,
 } from "./claude-callback-lifecycle.js";
 export {
   createExportSetVerificationStorageContext,
