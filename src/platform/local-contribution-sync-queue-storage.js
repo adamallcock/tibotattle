@@ -23,6 +23,9 @@ import { DatabaseSync } from "node:sqlite";
 import { readBoundedDirectoryEntries } from "./bounded-directory-reader.js";
 import { syncDirectory } from "./owner-only-filesystem.js";
 import {
+  createWindowsContributionSyncQueuePreparedStoragePorts,
+} from "./windows-contribution-sync-queue-storage.js";
+import {
   WINDOWS_SQLITE_STATE_SESSION_CONTRACT_VERSION,
   isWindowsSqliteStateDatabase,
   isWindowsSqliteStateSession,
@@ -87,6 +90,7 @@ export function createLocalContributionSyncQueueStorageContext({
   uuid = randomUUID,
   platform = process.platform,
   windowsSqliteStateSessionFactory = null,
+  windowsPreparedArtifactStorage = null,
 } = {}) {
   const failures = failureContext(createError);
   const createUuid = requireFunction(uuid, "uuid");
@@ -104,10 +108,21 @@ export function createLocalContributionSyncQueueStorageContext({
       || platform.length > 32
       || (process.platform === "win32" && platform !== "win32")
       || (windowsSqliteStateSessionFactory !== null
-        && typeof windowsSqliteStateSessionFactory !== "function")) {
+        && typeof windowsSqliteStateSessionFactory !== "function")
+      || (windowsPreparedArtifactStorage !== null
+        && (typeof windowsPreparedArtifactStorage !== "object"
+          || Array.isArray(windowsPreparedArtifactStorage)))) {
     throw new TypeError("contribution queue storage configuration is invalid");
   }
   const states = Object.freeze([...jobStates]);
+  const windowsPreparedStoragePorts = platform === "win32"
+    && windowsPreparedArtifactStorage !== null
+    ? createWindowsContributionSyncQueuePreparedStoragePorts({
+      createError,
+      storage: windowsPreparedArtifactStorage,
+      maximumDirectoryEntries: 256,
+    })
+    : null;
 
   function nextUuid(code) {
     let value;
@@ -738,6 +753,12 @@ export function createLocalContributionSyncQueueStorageContext({
   }
 
   async function canonicalPreparedRoot(directory) {
+    if (platform === "win32") {
+      if (windowsPreparedStoragePorts === null) {
+        failures.fail("prepared_root_invalid");
+      }
+      return windowsPreparedStoragePorts.canonicalPreparedRoot(directory);
+    }
     if (typeof directory !== "string" || directory.length < 1) {
       failures.fail("configuration_invalid");
     }
@@ -760,6 +781,12 @@ export function createLocalContributionSyncQueueStorageContext({
   }
 
   async function manifestExists(directory, manifestName) {
+    if (platform === "win32") {
+      if (windowsPreparedStoragePorts === null) {
+        failures.fail("prepared_root_invalid");
+      }
+      return windowsPreparedStoragePorts.manifestExists(directory, manifestName);
+    }
     try {
       const stats = await lstat(join(directory, manifestName));
       return stats.isFile() && !stats.isSymbolicLink();
@@ -770,6 +797,16 @@ export function createLocalContributionSyncQueueStorageContext({
   }
 
   async function preparedSetDirectories({ root, maximumEntries, matches }) {
+    if (platform === "win32") {
+      if (windowsPreparedStoragePorts === null) {
+        failures.fail("prepared_root_invalid");
+      }
+      return windowsPreparedStoragePorts.preparedSetDirectories({
+        root,
+        maximumEntries,
+        matches,
+      });
+    }
     const match = requireFunction(matches, "matches");
     let names;
     try {
@@ -794,6 +831,12 @@ export function createLocalContributionSyncQueueStorageContext({
   }
 
   async function prepareRetentionRoot(directory) {
+    if (platform === "win32") {
+      if (windowsPreparedStoragePorts === null) {
+        failures.fail("retirement_invalid");
+      }
+      return windowsPreparedStoragePorts.prepareRetentionRoot(directory);
+    }
     if (typeof directory !== "string" || directory.length < 1) {
       failures.fail("configuration_invalid");
     }
@@ -828,6 +871,16 @@ export function createLocalContributionSyncQueueStorageContext({
   }
 
   async function retireFlatDirectory({ root, name, maximumEntries }) {
+    if (platform === "win32") {
+      if (windowsPreparedStoragePorts === null) {
+        failures.fail("retirement_invalid");
+      }
+      return windowsPreparedStoragePorts.retireFlatDirectory({
+        root,
+        name,
+        maximumEntries,
+      });
+    }
     if (basename(name) !== name || !integer(maximumEntries, 1, 256)) {
       failures.fail("retirement_invalid");
     }
