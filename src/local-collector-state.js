@@ -16,7 +16,11 @@ import {
   truncateDurably,
   unlinkDurably,
 } from "./storage.js";
-import { readBoundedUtf8LineEntries } from "./platform/index.js";
+import {
+  isLocalCollectorStateWindowsBoundaryActive,
+  openLocalCollectorStateSessionBoundary,
+  readBoundedUtf8LineEntries,
+} from "./platform/index.js";
 
 // This database is deliberately the one durable owner-controlled store for
 // local collector facts, cursors, quota observations and derived accounting.
@@ -220,6 +224,15 @@ function validateDatabase(database) {
 }
 
 async function assertSafeStateFile(path, { allowMissing = false } = {}) {
+  if (isLocalCollectorStateWindowsBoundaryActive()) {
+    // The native session owns the database and its sidecars.  Do not probe a
+    // Windows state file through Node's lstat path, which would reintroduce
+    // the race-prone fallback this boundary is intended to prevent.  The
+    // protected session will report an unavailable/missing child when it is
+    // opened below; callers that need a missing-state result use ensure first.
+    return { nativeBoundary: true };
+  }
+  if (process.platform === "win32") throw fixedError("local_collector_state_unavailable");
   let metadata;
   try {
     metadata = await lstat(path);
@@ -239,6 +252,10 @@ async function assertSafeStateFile(path, { allowMissing = false } = {}) {
 }
 
 async function prepareStateFile(stateFile) {
+  if (isLocalCollectorStateWindowsBoundaryActive()) {
+    return false;
+  }
+  if (process.platform === "win32") throw fixedError("local_collector_state_unavailable");
   await mkdir(dirname(stateFile), { recursive: true, mode: 0o700 });
   const existing = await assertSafeStateFile(stateFile, { allowMissing: true });
   return existing !== null;
@@ -406,6 +423,38 @@ async function withLocalCollectorMigrationLease(options, callback) {
 }
 
 function openDatabase(stateFile, { readOnly = false, create = false } = {}) {
+  if (isLocalCollectorStateWindowsBoundaryActive()) {
+    let session;
+    try {
+      session = openLocalCollectorStateSessionBoundary({
+        stateFile,
+        readOnly,
+        create,
+      });
+      const raw = session.database;
+      if (create) initializeSchema(raw);
+      validateDatabase(raw);
+      // The platform session has already configured and authorizer-locked the
+      // durable policy.  Expose only the same narrow DatabaseSync-like shape
+      // used by this module, with close tied to lease release.
+      return {
+        get isOpen() { return raw.isOpen !== false; },
+        get isTransaction() { return raw.isTransaction === true; },
+        exec(...args) { return raw.exec(...args); },
+        prepare(...args) { return raw.prepare(...args); },
+        close() { return session.close(); },
+      };
+    } catch (error) {
+      try {
+        session?.close?.();
+      } catch {
+        // Preserve the fixed local-state error below.
+      }
+      if (error?.code === "local_collector_state_unavailable") throw error;
+      throw fixedError("local_collector_state_unavailable");
+    }
+  }
+  if (process.platform === "win32") throw fixedError("local_collector_state_unavailable");
   let database;
   try {
     database = new DatabaseSync(stateFile, {
@@ -458,6 +507,8 @@ async function recoverPendingLocalCollectorRollbackJournal(stateFile) {
 }
 
 async function syncStateFile(stateFile) {
+  if (isLocalCollectorStateWindowsBoundaryActive()) return;
+  if (process.platform === "win32") throw fixedError("local_collector_state_unavailable");
   // Windows FlushFileBuffers rejects a read-only file handle with EPERM.
   // This state database is already opened read/write for every call site;
   // request the writable handle Windows requires while retaining the narrower
@@ -475,6 +526,19 @@ async function syncStateFile(stateFile) {
 }
 
 async function ensureDatabase(stateFile) {
+  if (isLocalCollectorStateWindowsBoundaryActive()) {
+    let database;
+    try {
+      // The protected session is the creation/open boundary on Windows.  It
+      // owns the database and journal identities; no Node mkdir/chmod/fsync
+      // or ordinary DatabaseSync(path) is permitted here.
+      database = openDatabase(stateFile, { readOnly: false, create: true });
+    } finally {
+      database?.close();
+    }
+    return;
+  }
+  if (process.platform === "win32") throw fixedError("local_collector_state_unavailable");
   const exists = await prepareStateFile(stateFile);
   let database;
   try {
@@ -482,6 +546,12 @@ async function ensureDatabase(stateFile) {
   } finally {
     database?.close();
   }
+  await finalizeStateFile(stateFile);
+}
+
+async function finalizeStateFile(stateFile) {
+  if (isLocalCollectorStateWindowsBoundaryActive()) return;
+  if (process.platform === "win32") throw fixedError("local_collector_state_unavailable");
   await chmod(stateFile, 0o600);
   await syncStateFile(stateFile);
 }
@@ -778,8 +848,7 @@ export async function recordLocalCollectorLegacyRefreshAttempt({
   } finally {
     database?.close();
   }
-  await chmod(stateFile, 0o600);
-  await syncStateFile(stateFile);
+  await finalizeStateFile(stateFile);
   return receipt;
 }
 
@@ -1252,8 +1321,7 @@ export async function commitLocalCollectorState({
   } finally {
     database?.close();
   }
-  await chmod(stateFile, 0o600);
-  await syncStateFile(stateFile);
+  await finalizeStateFile(stateFile);
   return result;
 }
 
@@ -1327,8 +1395,7 @@ export async function openLocalCollectorStateSession({
       } finally {
         database.close();
       }
-      await chmod(stateFile, 0o600);
-      await syncStateFile(stateFile);
+      await finalizeStateFile(stateFile);
       return { batches, inserted, verified };
     },
     async abort() {
@@ -1375,8 +1442,7 @@ export async function writeLocalCollectorAccountingCache({
   } finally {
     database?.close();
   }
-  await chmod(stateFile, 0o600);
-  await syncStateFile(stateFile);
+  await finalizeStateFile(stateFile);
 }
 
 export async function readLocalCollectorAccountingCache({
@@ -1800,8 +1866,7 @@ async function migrateLegacyLocalCollectorStateUnlocked({
   } finally {
     database?.close();
   }
-  await chmod(stateFile, 0o600);
-  await syncStateFile(stateFile);
+  await finalizeStateFile(stateFile);
 
   const migrated = await readLocalCollectorState({ stateFile, includeRecords: false });
   let verificationDatabase;
@@ -1872,6 +1937,15 @@ export async function prepareLocalCollectorState({
   if (typeof stateFile !== "string" || stateFile.length < 1 || typeof clock !== "function") {
     throw new TypeError("Local collector state preparation options are invalid");
   }
+  if (isLocalCollectorStateWindowsBoundaryActive()) {
+    // Legacy JSON migration and its Node lock/journal files are not a
+    // permitted Windows fallback.  A future qualified boundary can provide
+    // an explicit native migration; until then, only the protected SQLite
+    // session is allowed to initialize/validate state.
+    await ensureDatabase(stateFile);
+    return null;
+  }
+  if (process.platform === "win32") throw fixedError("local_collector_state_unavailable");
   const legacyPaths = legacyLocalCollectorStatePaths(stateFile);
   await recoverPendingLocalCollectorRollbackJournal(stateFile);
   // A settled installation should not fsync a lease file on every dashboard
@@ -1927,6 +2001,43 @@ export async function acquireLocalCollectorStateLock(
   if (typeof clock !== "function" || typeof processExists !== "function") {
     throw new TypeError("Local collector lock options are invalid");
   }
+  if (isLocalCollectorStateWindowsBoundaryActive()) {
+    await ensureDatabase(stateFile);
+    let database;
+    try {
+      database = openDatabase(stateFile, { readOnly: false });
+      transaction(database, () => {
+        const existing = database.prepare(
+          "SELECT pid FROM instance_locks WHERE name = 'collector'",
+        ).get();
+        if (existing && processExists(Number(existing.pid))) {
+          throw fixedError("local_collector_state_lock_held");
+        }
+        if (existing) database.prepare(
+          "DELETE FROM instance_locks WHERE name = 'collector'",
+        ).run();
+        database.prepare(`
+          INSERT INTO instance_locks(name, pid, acquired_at) VALUES (?, ?, ?)
+        `).run("collector", process.pid, new Date(clock()).toISOString());
+      });
+    } finally {
+      database?.close();
+    }
+    return async () => {
+      let releaseDatabase;
+      try {
+        releaseDatabase = openDatabase(stateFile, { readOnly: false });
+        transaction(releaseDatabase, () => {
+          releaseDatabase.prepare(
+            "DELETE FROM instance_locks WHERE name = 'collector' AND pid = ?",
+          ).run(process.pid);
+        });
+      } finally {
+        releaseDatabase?.close();
+      }
+    };
+  }
+  if (process.platform === "win32") throw fixedError("local_collector_state_unavailable");
   await ensureDatabase(stateFile);
   let database;
   try {
