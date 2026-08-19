@@ -1287,6 +1287,13 @@ export const WEB_PLURAL_MESSAGES = Object.freeze({
     one: ["{count} reset fit", "{count} 个重置拟合", "{count} ajuste de restablecimiento"],
     other: ["{count} reset fits", "{count} 个重置拟合", "{count} ajustes de restablecimiento"],
   }),
+  // The card's outlined marker, in words. A reader of the text transcript
+  // cannot see the plot, so the difference the image draws has to be stated
+  // rather than left to the picture.
+  "share.text.shortObservation": Object.freeze({
+    one: ["{count} of these is a short observation, drawn as an outlined marker.", "其中 {count} 个为短观测，以空心标记绘制。", "{count} de estos es una observación corta, dibujada como un marcador sin relleno."],
+    other: ["{count} of these are short observations, drawn as outlined markers.", "其中 {count} 个为短观测，以空心标记绘制。", "{count} de estos son observaciones cortas, dibujadas como marcadores sin relleno."],
+  }),
   // The community allowance caveat: the participant count backing every point
   // is visible copy, so "from 1 contributing account" reads plainly.
   "community.allowance.accountCount": Object.freeze({
