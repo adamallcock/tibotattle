@@ -17,6 +17,10 @@ import { normalizeClaudeTranscriptUsageCandidate } from "../src/export-safe-reco
 import {
   parseClaudeTranscriptRecord,
 } from "../src/application/export-sources/claude-transcript-record.js";
+import {
+  normalizeClaudeConfiguredPath,
+  resolveClaudeConfigRoot,
+} from "../src/application/export-sources/claude-config-root.js";
 
 const SECRET = Buffer.alloc(32, 71);
 const START_AT = "2026-07-24T12:00:00.000Z";
@@ -100,6 +104,78 @@ async function fixture() {
 function guard(overrides = {}) {
   return createExportResourceGuard({ scope: "export_set", limits: overrides });
 }
+
+test("Claude config-root contract uses Windows USERPROFILE and CLAUDE_CONFIG_DIR without POSIX fallback", () => {
+  const configured = resolveClaudeConfigRoot({
+    platform: "win32",
+    homeDirectory: "C:\\fallback",
+    environment: {
+      USERPROFILE: "C:\\Users\\tester",
+      CLAUDE_CONFIG_DIR: "D:/Claude/config",
+    },
+  });
+  assert.deepEqual(configured, {
+    platform: "win32",
+    homeDirectory: "C:\\Users\\tester",
+    configDirectory: "D:\\Claude\\config",
+    settingsFile: "D:\\Claude\\config\\settings.json",
+    projectsDirectory: "D:\\Claude\\config\\projects",
+  });
+  assert.equal(
+    resolveClaudeConfigRoot({
+      platform: "win32",
+      homeDirectory: "C:\\fallback",
+      environment: { USERPROFILE: "C:\\Users\\tester" },
+    }).projectsDirectory,
+    "C:\\Users\\tester\\.claude\\projects",
+  );
+  for (const path of ["relative", "/tmp/claude", "C:\\Users\\tester\\..\\other", "C:\\tmp\u0000private"]) {
+    assert.throws(
+      () => normalizeClaudeConfiguredPath(path, { platform: "win32" }),
+      (error) => error?.code === "claude_config_root_path",
+      path,
+    );
+  }
+  for (const component of [
+    "CON", "NUL.txt", "PRN", "AUX", "COM1", "LPT9",
+    "bad<name", "bad>name", 'bad"name', "bad|name", "bad?name", "bad*name",
+    "trailing.", "trailing ",
+  ]) {
+    const path = `C:\\Users\\tester\\${component}`;
+    assert.throws(
+      () => normalizeClaudeConfiguredPath(path, { platform: "win32" }),
+      (error) => error?.code === "claude_config_root_path",
+      component,
+    );
+  }
+  // Repeated separators are intentionally accepted and collapsed; Unicode and
+  // ordinary internal spaces remain valid Windows components.
+  assert.equal(
+    normalizeClaudeConfiguredPath("C:/Users//Zoë Smith///Claude config/", { platform: "win32" }),
+    "C:\\Users\\Zoë Smith\\Claude config",
+  );
+  assert.throws(
+    () => resolveClaudeConfigRoot({
+      platform: "win32",
+      homeDirectory: "C:\\fallback",
+      environment: { USERPROFILE: "C:\\Users\\tester", CLAUDE_CONFIG_DIR: "relative-config" },
+    }),
+    (error) => error?.code === "claude_config_root_path",
+  );
+});
+
+test("Claude transcript planning rejects relative roots before filesystem access", async () => {
+  await assert.rejects(
+    createClaudeTranscriptExportSourcePlan({
+      projectsDirectory: "relative-projects",
+      startAt: START_AT,
+      endAt: END_AT,
+      secret: SECRET,
+      resourceGuard: guard(),
+    }),
+    (error) => error?.code === "claude_transcript_export_configuration",
+  );
+});
 
 test("Claude selective row parsing validates all JSON while discarding private bodies", () => {
   const record = assistant("2026-07-24T12:10:00.000Z");

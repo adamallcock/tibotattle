@@ -463,6 +463,25 @@ test("platform ports snapshot only required environment data and retain no calle
   assert.equal(touched, 0);
 });
 
+test("Claude transcript defaults use the snapped Windows config root", () => {
+  const ports = platform.createLocalExportSourcePorts({
+    platform: "win32",
+    homeDirectory: "C:\\fallback",
+    environment: {
+      USERPROFILE: "C:\\Users\\tester",
+      CLAUDE_CONFIG_DIR: "D:/Claude/config",
+    },
+  });
+  const context = createPipeline(ports, {
+    workspace: workspaceRuntime(),
+    exportCompatibilityTuple: () => ({}),
+  });
+  assert.equal(
+    context.claudeTranscriptExport.defaultClaudeProjectsDirectory(),
+    "D:\\Claude\\config\\projects",
+  );
+});
+
 test("platform ports reject nested environment Proxies and accessors without canary execution", () => {
   let touched = 0;
   const proxy = new Proxy({}, {

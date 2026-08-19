@@ -20,6 +20,7 @@ import { join } from "node:path";
 import {
   ClaudeCallbackLifecycleError,
   buildManagedClaudeStatusLine,
+  defaultClaudeSettingsFile,
   inspectClaudeCallbackLifecycle,
   installClaudeCallback,
   planManagedClaudeCallbackCapabilityRemoval,
@@ -129,6 +130,60 @@ const WINDOWS_IDENTITY = Object.freeze({
   linkCount: 1,
 });
 
+test("Claude callback settings default follows Windows USERPROFILE and CLAUDE_CONFIG_DIR", () => {
+  assert.equal(
+    defaultClaudeSettingsFile({
+      platform: "win32",
+      environment: { USERPROFILE: "C:\\Users\\tester" },
+    }),
+    "C:\\Users\\tester\\.claude\\settings.json",
+  );
+  assert.equal(
+    defaultClaudeSettingsFile({
+      platform: "win32",
+      environment: {
+        USERPROFILE: "C:\\Users\\tester",
+        CLAUDE_CONFIG_DIR: "D:/Claude//config/",
+      },
+    }),
+    "D:\\Claude\\config\\settings.json",
+  );
+  assert.equal(
+    defaultClaudeSettingsFile({
+      platform: "win32",
+      environment: { USERPROFILE: "C:/Users//Zoë Smith" },
+    }),
+    "C:\\Users\\Zoë Smith\\.claude\\settings.json",
+  );
+  for (const value of ["relative-config", "/tmp/config", "C:\\Users\\tester\\..\\other", "C:\\tmp\u0000private"]) {
+    assert.throws(
+      () => defaultClaudeSettingsFile({
+        platform: "win32",
+        environment: { USERPROFILE: "C:\\Users\\tester", CLAUDE_CONFIG_DIR: value },
+      }),
+      (error) => error?.code === "claude_callback_lifecycle_invalid_configuration",
+      value,
+    );
+  }
+  for (const component of [
+    "CON", "NUL.txt", "PRN", "AUX", "COM1", "LPT9",
+    "bad<name", "bad>name", 'bad"name', "bad|name", "bad?name", "bad*name",
+    "trailing.", "trailing ",
+  ]) {
+    assert.throws(
+      () => defaultClaudeSettingsFile({
+        platform: "win32",
+        environment: {
+          USERPROFILE: "C:\\Users\\tester",
+          CLAUDE_CONFIG_DIR: `C:\\Users\\tester\\${component}`,
+        },
+      }),
+      (error) => error?.code === "claude_callback_lifecycle_invalid_configuration",
+      component,
+    );
+  }
+});
+
 function windowsStoreFixture(settings = {
   theme: "dark",
   statusLine: { type: "command", command: EXISTING_COMMAND },
@@ -173,9 +228,11 @@ function windowsStoreFixture(settings = {
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
     sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
+    companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
+    companionInstanceMutexSafe: false,
     credentialAuditFileGuardSafe: true,
     sqliteStateLeaseSafe: false,
     inspectPath(path) {
@@ -249,6 +306,8 @@ function windowsStoreFixture(settings = {
     releaseCredentialAuditFileGuard() {},
     acquireCredentialMutex() { return { lease: {}, abandoned: false }; },
     releaseCredentialMutex() {},
+    acquireCompanionInstanceMutex() { return { lease: {}, abandoned: false }; },
+    releaseCompanionInstanceMutex() {},
     acquireSqliteStateLease() {
       return {
         lease: {},

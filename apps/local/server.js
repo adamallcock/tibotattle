@@ -15,6 +15,9 @@ import {
   createLocalContributionSyncQueueContext,
 } from "../../src/application/index.js";
 import {
+  defaultClaudeSettingsFile,
+} from "../../src/claude-callback-lifecycle.js";
+import {
   resolveLocalLegacyReportReadPath,
 } from "../../src/local-legacy-report-storage.js";
 import {
@@ -2317,12 +2320,14 @@ function preparationErrorStatus(code) {
 }
 
 function configuredHomeDirectory(environment) {
-  const selected = process.platform === "win32"
-    ? environment.USERPROFILE
-    : environment.HOME;
-  if (typeof selected === "string" && selected.length > 0
-      && isAbsolute(selected) && resolve(selected) === selected) {
-    return selected;
+  const key = process.platform === "win32" ? "USERPROFILE" : "HOME";
+  const selected = environment[key];
+  if (selected !== undefined) {
+    if (typeof selected === "string" && selected.length > 0
+        && isAbsolute(selected) && resolve(selected) === selected) {
+      return selected;
+    }
+    throw new TypeError("Home directory is invalid");
   }
   const fallback = homedir();
   if (!isAbsolute(fallback) || resolve(fallback) !== fallback) {
@@ -2362,10 +2367,26 @@ export function resolveClaudeDesktopShadowConfiguration({
       : Object.hasOwn(environment, "CLAUDE_PROJECT_DIRECTORY")
         ? environment.CLAUDE_PROJECT_DIRECTORY
         : fallbackProjectDirectory;
+  const selectedPlatform = process.platform;
+  const shouldResolveConfig = selectedPlatform === "win32" || configCandidate !== undefined;
+  let resolvedConfigDirectory;
+  if (shouldResolveConfig) {
+    try {
+      resolvedConfigDirectory = dirname(defaultClaudeSettingsFile({
+        platform: selectedPlatform,
+        homeDirectory: configuredHomeDirectory(environment),
+        environment,
+        ...(configCandidate === undefined ? {} : { claudeConfigDirectory: configCandidate }),
+      }));
+    } catch (error) {
+      // Preserve the local composition error contract for malformed explicit
+      // provider paths while ensuring no fallback path is selected.
+      if (configCandidate !== undefined) assertLocalAbsolutePath(configCandidate);
+      throw error;
+    }
+  }
   return Object.freeze({
-    claudeConfigDirectory: configCandidate === undefined
-      ? undefined
-      : assertLocalAbsolutePath(configCandidate),
+    claudeConfigDirectory: resolvedConfigDirectory,
     claudeProjectDirectory: assertLocalAbsolutePath(projectCandidate),
   });
 }
