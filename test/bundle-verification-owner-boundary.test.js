@@ -42,6 +42,18 @@ const SCHEMA_EXPORTS = Object.freeze([
   "validateExportRecord",
 ]);
 
+function fakeReviewPairStorage({ reader }) {
+  return Object.freeze({
+    contractVersion: "windows-review-pair-storage-v1",
+    writeReviewPair: async () => ({ status: "published" }),
+    readReviewPair: reader,
+    recoverReviewPairTransactions: async () => ({ recovered: 0, transactionsFound: 0 }),
+    recoverOwnerOnlyPairTransactions: async () => ({ recovered: 0, transactionsFound: 0 }),
+    writeOwnerOnlyPairNoClobber: async () => ({ status: "published" }),
+    readOwnerOnlyLocalMetadataBundlePair: reader,
+  });
+}
+
 test("bundle verification owners expose exact APIs and legacy identities", () => {
   assert.deepEqual(
     Object.keys(verification).sort(),
@@ -105,6 +117,102 @@ test("application composition injects exact file and hash ports", async () => {
     typeof platform.readOwnerOnlyLocalMetadataBundlePair,
     "function",
   );
+});
+
+test("Windows bundle verification uses only the reviewed injected reader", async () => {
+  const calls = [];
+  const fallbackCalls = [];
+  const storage = fakeReviewPairStorage({
+    reader: async (options) => {
+      calls.push(options);
+      return {
+        bundleBytes: new Uint8Array([123]),
+        receiptBytes: new Uint8Array([123]),
+      };
+    },
+  });
+  const context = createLocalMetadataBundleVerificationContext({
+    platformName: () => "windows",
+    reviewPairStorage: storage,
+    reviewPairStorageValidator: (candidate) => candidate === storage,
+    readOwnerOnlyLocalMetadataBundlePair: async () => {
+      fallbackCalls.push(true);
+      throw new Error("POSIX fallback must not be called");
+    },
+    sha256Hex: () => "0".repeat(64),
+    compatibilityTuple: exportCompatibilityTuple,
+  });
+
+  await assert.rejects(
+    context.verifyLocalMetadataBundleFiles({
+      bundleFile: "C:\\reviews\\bundle.json",
+      receiptFile: "C:\\reviews\\receipt.json",
+    }),
+    (error) => error instanceof verification.BundleVerificationError
+      && error.code === "receipt_json",
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(fallbackCalls.length, 0);
+  assert.equal(calls[0].maximumBundleBytes, 32 * 1024 * 1024);
+  assert.equal(calls[0].maximumReceiptBytes, 1024 * 1024);
+});
+
+test("Windows bundle verification fails closed without a reviewed reader", async () => {
+  const fallbackCalls = [];
+  const context = createLocalMetadataBundleVerificationContext({
+    platformName: () => "windows",
+    readOwnerOnlyLocalMetadataBundlePair: async () => {
+      fallbackCalls.push(true);
+      throw new Error("POSIX fallback must not be called");
+    },
+    sha256Hex: () => "0".repeat(64),
+    compatibilityTuple: exportCompatibilityTuple,
+  });
+
+  await assert.rejects(
+    context.verifyLocalMetadataBundleFiles({
+      bundleFile: "C:\\reviews\\bundle.json",
+      receiptFile: "C:\\reviews\\receipt.json",
+    }),
+    (error) => error instanceof TypeError
+      && error.message === "Windows review pair storage reader is required",
+  );
+  assert.equal(fallbackCalls.length, 0);
+});
+
+test("macOS bundle verification retains the default reader when a Windows port is present", async () => {
+  const injectedCalls = [];
+  const fallbackCalls = [];
+  const storage = fakeReviewPairStorage({
+    reader: async () => {
+      injectedCalls.push(true);
+      return { bundleBytes: new Uint8Array([123]), receiptBytes: new Uint8Array([123]) };
+    },
+  });
+  const context = createLocalMetadataBundleVerificationContext({
+    platformName: () => "macos",
+    reviewPairStorage: storage,
+    readOwnerOnlyLocalMetadataBundlePair: async () => {
+      fallbackCalls.push(true);
+      return {
+        bundleBytes: new Uint8Array([123]),
+        receiptBytes: new Uint8Array([123]),
+      };
+    },
+    sha256Hex: () => "0".repeat(64),
+    compatibilityTuple: exportCompatibilityTuple,
+  });
+
+  await assert.rejects(
+    context.verifyLocalMetadataBundleFiles({
+      bundleFile: "/tmp/review.umx.json",
+      receiptFile: "/tmp/review.privacy-receipt.json",
+    }),
+    (error) => error instanceof verification.BundleVerificationError
+      && error.code === "receipt_json",
+  );
+  assert.equal(fallbackCalls.length, 1);
+  assert.equal(injectedCalls.length, 0);
 });
 
 test("verification composition requires a live compatibility tuple port", () => {
