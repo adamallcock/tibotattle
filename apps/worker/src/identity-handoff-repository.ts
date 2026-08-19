@@ -3,9 +3,9 @@ import { ApiError } from "./errors";
 /**
  * The Apple state row is deliberately kept behind a tiny repository surface.
  * Callers pass the state-row nonce digest, never the raw nonce or an ID token.
- * All callback/result operations retain the existing time-bounded and one-use
- * predicates so an expired or already claimed transaction cannot write an
- * identity link, proof, participant, session, or device.
+ * Callback operations remain single-claim and time-bounded. Result delivery is
+ * idempotent for the same state+verifier so a client can recover after a crash;
+ * enrollment remains the one-use sink that deletes the proof row.
  *
  * `expires_at` is phase-dependent and always holds the deadline of the phase
  * the row is in: while the row is empty it is the authorization deadline set
@@ -216,9 +216,9 @@ export async function completeAppleSignInHandoff(
 }
 
 /**
- * Delivers a proof exactly once. The caller must subsequently consume that
- * proof through the existing enrollment path; this row operation never writes
- * participant, session, or device state.
+ * Delivers a proof idempotently to the same state+verifier until the caller
+ * consumes it through the existing enrollment path or it expires. This row
+ * operation never writes participant, session, or device state.
  */
 export async function deliverAppleSignInHandoff(
   db: D1Database,
@@ -233,12 +233,11 @@ export async function deliverAppleSignInHandoff(
   assertBindingHash(bindingHash);
   const row = await db.prepare(
     `UPDATE apple_signin_handoffs
-        SET delivered_at = ?
+        SET delivered_at = COALESCE(delivered_at, ?)
       WHERE state = ?
         AND binding_hash = ?
         AND identity_link_key IS NOT NULL
         AND proof IS NOT NULL
-        AND delivered_at IS NULL
         AND expires_at > ?
       RETURNING proof`,
   ).bind(nowIso, state, bindingHash, nowIso).first<{ proof: string }>();

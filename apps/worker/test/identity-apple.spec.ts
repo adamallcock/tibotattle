@@ -196,7 +196,7 @@ afterEach(() => {
 });
 
 describe("web Sign in with Apple", () => {
-  it("keeps handoff storage digest-only and enforces callback/result one-use predicates", async () => {
+  it("keeps handoff storage digest-only and result delivery idempotent", async () => {
     const db = bindings().USAGE_MONITOR_DB;
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
@@ -289,15 +289,16 @@ describe("web Sign in with Apple", () => {
       nowIso,
       nowIso,
     )).rejects.toThrow();
-    // A wrong verifier digest neither delivers the proof nor marks the row
-    // consumed, so the correct binding can still collect it exactly once.
+    // A wrong verifier digest neither delivers the proof nor marks the row.
+    // The correct binding can collect the same proof until enrollment consumes
+    // it or the bounded delivery window expires.
     expect(
       await deliverAppleSignInHandoff(db, state, nowIso, "f".repeat(64)),
     ).toBeNull();
     expect(await deliverAppleSignInHandoff(db, state, nowIso, bindingHash))
       .toEqual({ proof });
     expect(await deliverAppleSignInHandoff(db, state, nowIso, bindingHash))
-      .toBeNull();
+      .toEqual({ proof });
 
     const stored = await db.prepare(
       "SELECT nonce_hash AS nonceHash, identity_link_key AS linkKey, proof FROM apple_signin_handoffs WHERE state = ?",
@@ -368,7 +369,7 @@ describe("web Sign in with Apple", () => {
     expect(aborted).toBe(true);
   });
 
-  it("carries a start, an Apple callback, and a single-use result end to end", async () => {
+  it("keeps a completed Apple result recoverable until enrollment consumes it", async () => {
     const started = await startSignIn();
     expect(started.state).toMatch(/^[A-Za-z0-9_-]{64}$/u);
     const authorize = new URL(started.authorizeUrl);
@@ -447,16 +448,15 @@ describe("web Sign in with Apple", () => {
     });
     expect(JSON.stringify(resultPayload)).not.toContain(APPLE_ID_TOKEN);
 
-    // Single use: the winning read consumed the row, so a replay is
-    // indistinguishable from an expired handoff.
+    // Collection is idempotent. If the app quits after this response but
+    // before enrollment, the persisted state+verifier can recover the same
+    // opaque proof after relaunch.
     const replay = await json("/api/v1/identity/apple/result", {
       state: started.state,
       verifier: started.verifier,
     });
-    expect(replay.status).toBe(401);
-    expect(await replay.json()).toMatchObject({
-      error: { code: "IDENTITY_TOKEN_INVALID" },
-    });
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toEqual(resultPayload);
 
     // Neither Apple's optional user payload, raw provider credential, nor raw
     // nonce is persisted anywhere. The short-lived row contains only the
