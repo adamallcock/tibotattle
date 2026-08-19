@@ -78,6 +78,7 @@ function bindingManifest(bytes) {
     sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
     companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
+    preparedArtifactContractVersion: "windows-prepared-artifact-v1",
     requiredMethods: [
       "inspectPath",
       "ensureDirectory",
@@ -99,6 +100,15 @@ function bindingManifest(bytes) {
       "releaseCredentialMutex",
       "acquireCompanionInstanceMutex",
       "releaseCompanionInstanceMutex",
+      "inspectPreparedChild",
+      "ensurePreparedDirectory",
+      "enumeratePreparedDirectory",
+      "removePreparedDirectory",
+      "renamePreparedDirectory",
+      "createPreparedFile",
+      "readPreparedFile",
+      "deletePreparedFile",
+      "publishPreparedFile",
     ],
     nativeClaims: {
       productionSafe: false,
@@ -107,6 +117,7 @@ function bindingManifest(bytes) {
       companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
       sqliteStateLeaseSafe: false,
+      preparedArtifactSafe: false,
     },
     approvedPolicy: {
       productionSafe: false,
@@ -115,6 +126,7 @@ function bindingManifest(bytes) {
       companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
       sqliteStateLeaseSafe: false,
+      preparedArtifactSafe: false,
     },
     bindingProvenance: {
       contractVersion: "windows-binding-provenance-v1",

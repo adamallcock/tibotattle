@@ -82,8 +82,8 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   assert.match(source, /NtCreateFile/u);
   assert.match(source, /RootDirectory/u);
   assert.match(source, /NtSetInformationFile/u);
-  assert.match(source, /napi_value values\[6\] = \{\}/u);
-  assert.match(source, /std::size_t count = 6;[\s\S]*?count != expected/u);
+  assert.match(source, /napi_value values\[8\] = \{\}/u);
+  assert.match(source, /std::size_t count = 8;[\s\S]*?count != expected/u);
   assert.match(source, /OpenProtectedRootAndChild\(/u);
   assert.match(source, /ParseExpectedIdentity\(env, arguments\[1\]/u);
   assert.match(source, /ValidateSecurity\(rootOpened\.final, true, failure, &observedRoot\)/u);
@@ -121,6 +121,15 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
     "createSqliteDatabase",
     "cloneSqliteDatabase",
     "publishSqliteDatabase",
+    "inspectPreparedChild",
+    "ensurePreparedDirectory",
+    "enumeratePreparedDirectory",
+    "removePreparedDirectory",
+    "renamePreparedDirectory",
+    "createPreparedFile",
+    "readPreparedFile",
+    "deletePreparedFile",
+    "publishPreparedFile",
     "acquireCompanionInstanceMutex",
     "releaseCompanionInstanceMutex",
   ]) {
@@ -130,7 +139,7 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   assert.match(source, /companionInstanceMutexSafe/u);
   assert.match(
     executableRenameBody,
-    /information->flags = kFileRenameReplaceIfExists \| kFileRenamePosixSemantics;/u,
+    /information->flags = kFileRenamePosixSemantics\s*\|\s*\(replaceIfExists \? kFileRenameReplaceIfExists : 0\);/u,
   );
   assert.match(
     executableRenameBody,
@@ -196,6 +205,16 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   assert.match(source, /CopyHandleToHandle\(/u);
   assert.match(source, /RequireSqliteSidecarsAbsent\(/u);
   assert.match(source, /windows-sqlite-state-staging-v1/u);
+  assert.match(source, /windows-prepared-artifact-v1/u);
+  assert.match(source, /preparedArtifactSafe/u);
+  assert.match(source, /kMaximumPreparedArtifactBytes/u);
+  assert.match(source, /kMaximumPreparedContributionBytes/u);
+  assert.match(source, /kPreparedChunkBytes/u);
+  assert.match(source, /FileIdBothDirectoryInfo/u);
+  assert.match(source, /PreparedDirectoryNotEmpty/u);
+  assert.match(source, /DeletePreparedFileCallback/u);
+  assert.match(source, /FlushPreparedDirectoryBoundary/u);
+  assert.match(source, /RenameHandleRelative\([\s\S]*?false\)/u);
   assert.match(source, /napi_get_boolean\(env, false, &sqliteStateStagingSafe\)/u);
   assert.match(source, /"windows-sqlite-state-lease-v1"/u);
   assert.match(source, /napi_get_boolean\(env, false, &sqliteStateLeaseSafe\)/u);
