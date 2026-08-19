@@ -191,12 +191,18 @@ export async function syncPreparedContributionEntryOnce({
   signal = undefined,
   fetchImpl = globalThis.fetch,
   cryptoImpl = globalThis.crypto,
-  loadContribution = loadVerifiedPreparedContribution,
+  platform = process.platform,
+  loadContribution = undefined,
   withDeviceSecret = withContributionDeviceSecret,
   createEnvelope = createTelemetryEnvelope,
 } = {}) {
+  const selectedLoadContribution = platform === "win32"
+    ? loadContribution
+    : loadContribution ?? loadVerifiedPreparedContribution;
   if (typeof directory !== "string" || !entry || typeof entry !== "object"
-      || typeof fetchImpl !== "function" || typeof loadContribution !== "function"
+      || typeof platform !== "string"
+      || typeof fetchImpl !== "function"
+      || typeof selectedLoadContribution !== "function"
       || typeof withDeviceSecret !== "function" || typeof createEnvelope !== "function"
       || !backend || typeof backend !== "object"
       || (signal !== undefined && !(signal instanceof AbortSignal))) {
@@ -204,7 +210,7 @@ export async function syncPreparedContributionEntryOnce({
   }
   const selectedOrigin = canonicalOrigin(origin);
 
-  const payload = await loadContribution({ directory, entry });
+  const payload = await selectedLoadContribution({ directory, entry });
   const envelopeKey = await requestJson(
     fetchImpl,
     new URL("/api/v1/envelope-key", selectedOrigin),
@@ -327,19 +333,27 @@ export async function syncPreparedContributionSetOnce({
   signal = undefined,
   fetchImpl = globalThis.fetch,
   cryptoImpl = globalThis.crypto,
-  verifySet = verifyPreparedContributionSet,
-  loadContribution = loadVerifiedPreparedContribution,
+  platform = process.platform,
+  verifySet = undefined,
+  loadContribution = undefined,
   withDeviceSecret = withContributionDeviceSecret,
   createEnvelope = createTelemetryEnvelope,
 } = {}) {
+  const selectedVerifySet = platform === "win32"
+    ? verifySet
+    : verifySet ?? verifyPreparedContributionSet;
+  const selectedLoadContribution = platform === "win32"
+    ? loadContribution
+    : loadContribution ?? loadVerifiedPreparedContribution;
   if (typeof directory !== "string" || typeof fetchImpl !== "function"
-      || typeof verifySet !== "function" || typeof loadContribution !== "function"
+      || typeof selectedVerifySet !== "function"
+      || typeof selectedLoadContribution !== "function"
       || typeof withDeviceSecret !== "function" || typeof createEnvelope !== "function"
       || !backend || typeof backend !== "object") {
     fail("invalid_configuration");
   }
   const selectedOrigin = canonicalOrigin(origin);
-  const manifest = await verifySet({
+  const manifest = await selectedVerifySet({
     directory,
     builderVersion: TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
   });
@@ -359,7 +373,8 @@ export async function syncPreparedContributionSetOnce({
       signal,
       fetchImpl,
       cryptoImpl,
-      loadContribution,
+      platform,
+      loadContribution: selectedLoadContribution,
       withDeviceSecret,
       createEnvelope,
     }));
