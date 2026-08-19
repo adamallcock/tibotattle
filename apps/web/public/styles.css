@@ -1980,6 +1980,8 @@ tbody tr:last-child td { border-bottom: 0; }
   .model-disclosure-caret { transition: none; }
 }
 .cache-switch-details { margin-top: 18px; }
+.cache-switch-details th,
+.cache-switch-details td { padding-inline: var(--space-2); }
 .cache-switch-details th:nth-child(n + 3),
 .cache-switch-details td:nth-child(n + 3) { text-align: end; }
 .cache-continuity-details .evidence-subheading {
