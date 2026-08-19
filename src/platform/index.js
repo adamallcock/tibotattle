@@ -115,6 +115,13 @@ export {
   createOwnerOnlyAutomaticContributionStorageContext,
 } from "./owner-only-automatic-contribution-storage.js";
 export {
+  WINDOWS_COMPANION_INSTANCE_MUTEX_CONTRACT_VERSION,
+  WindowsCompanionInstanceLeaseError,
+  createWindowsCompanionInstanceLeaseContext,
+  isWindowsCompanionInstanceLeaseContext,
+  isWindowsCompanionInstanceLeaseError,
+} from "./windows-companion-instance-lease.js";
+export {
   createOwnerOnlyExportDeletionStorage,
 } from "./owner-only-export-deletion-storage.js";
 export {

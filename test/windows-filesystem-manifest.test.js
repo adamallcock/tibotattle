@@ -28,9 +28,11 @@ function binding(overrides = {}) {
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
     sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
+    companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
+    companionInstanceMutexSafe: false,
     credentialAuditFileGuardSafe: true,
     sqliteStateLeaseSafe: false,
     inspectPath: () => ({ identity: IDENTITY }),
@@ -53,6 +55,8 @@ function binding(overrides = {}) {
     releaseSqliteStateLease: () => {},
     acquireCredentialMutex: () => ({ lease: {}, abandoned: false }),
     releaseCredentialMutex: () => {},
+    acquireCompanionInstanceMutex: () => ({ lease: {}, abandoned: false }),
+    releaseCompanionInstanceMutex: () => {},
     acquireCredentialAuditFileGuard: () => ({ lease: {} }),
     releaseCredentialAuditFileGuard: () => {},
     ...overrides,
@@ -76,6 +80,7 @@ test("binding manifest is deterministic, content-free, and policy-disabled", () 
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
     sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
+    companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
     requiredMethods: [
       "inspectPath",
       "ensureDirectory",
@@ -95,11 +100,14 @@ test("binding manifest is deterministic, content-free, and policy-disabled", () 
       "releaseCredentialAuditFileGuard",
       "acquireCredentialMutex",
       "releaseCredentialMutex",
+      "acquireCompanionInstanceMutex",
+      "releaseCompanionInstanceMutex",
     ],
     nativeClaims: {
       productionSafe: false,
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
+      companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
       sqliteStateLeaseSafe: false,
     },
@@ -107,6 +115,7 @@ test("binding manifest is deterministic, content-free, and policy-disabled", () 
       productionSafe: false,
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
+      companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
       sqliteStateLeaseSafe: false,
     },
@@ -126,6 +135,21 @@ test("manifest builder refuses an unreviewed native production claim", () => {
       binding: binding({ productionSafe: true }),
     }),
     (error) => error.code === "WINDOWS_FILESYSTEM_MANIFEST_NATIVE_CLAIM_UNREVIEWED",
+  );
+});
+
+test("manifest builder refuses a binding without the companion mutex contract", () => {
+  assert.throws(
+    () => createWindowsFilesystemBindingManifest({
+      bytes: BYTES,
+      binding: binding({
+        companionInstanceMutexContractVersion: undefined,
+        companionInstanceMutexSafe: undefined,
+        acquireCompanionInstanceMutex: undefined,
+        releaseCompanionInstanceMutex: undefined,
+      }),
+    }),
+    (error) => error.code === "WINDOWS_FILESYSTEM_MANIFEST_INVALID_BINDING",
   );
 });
 

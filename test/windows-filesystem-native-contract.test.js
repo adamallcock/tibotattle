@@ -121,9 +121,13 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
     "createSqliteDatabase",
     "cloneSqliteDatabase",
     "publishSqliteDatabase",
+    "acquireCompanionInstanceMutex",
+    "releaseCompanionInstanceMutex",
   ]) {
     assert.match(source, new RegExp(`DefineMethod[\\s\\S]+"${method}"`, "u"));
   }
+  assert.match(source, /companionInstanceMutexContractVersion/u);
+  assert.match(source, /companionInstanceMutexSafe/u);
   assert.match(
     executableRenameBody,
     /information->flags = kFileRenameReplaceIfExists \| kFileRenamePosixSemantics;/u,
@@ -278,6 +282,13 @@ test("qualification hooks are opt-in and cannot become the production artifact",
       "utf8",
     ),
     /ArmReplacementPauseCallback/u,
+  );
+  assert.match(
+    await readFile(
+      resolve(REPOSITORY_ROOT, "native/windows-filesystem/windows-filesystem.cc"),
+      "utf8",
+    ),
+    /AttemptCompanionInstanceMutexReleaseFromWorkerCallback/u,
   );
   assert.match(
     await readFile(
