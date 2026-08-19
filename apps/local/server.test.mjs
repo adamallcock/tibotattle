@@ -51,12 +51,18 @@ import {
   configuredAccountingSourceMode,
   createCentralOutboundFetch,
   createCompanionWindowsStateComposition,
+  createWindowsContributionMaterializer,
+  createPreparedLocalCompanionServer,
   createLocalCompanionServer,
   loadCompanionWindowsFilesystemAdapter,
   resolveClaudeDesktopShadowConfiguration,
   startLocalCompanionServer,
 } from "./server.js";
 import { createWindowsFilesystemAdapter } from "../../src/platform/windows-filesystem.js";
+import {
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_ARTIFACT_BYTES,
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_CONTRIBUTION_BYTES,
+} from "../../src/platform/index.js";
 
 const DEVELOPMENT_COVERAGE = Object.freeze({
   startAt: "2026-07-24T21:00:00.000Z",
@@ -65,7 +71,16 @@ const DEVELOPMENT_COVERAGE = Object.freeze({
 const REVIEW_JOB_ID = "11111111-1111-4111-8111-111111111111";
 const REVIEW_SHA256 = "a".repeat(64);
 
-function unqualifiedWindowsFilesystemAdapter() {
+function unqualifiedWindowsFilesystemAdapter({
+  readPreparedFile = () => ({
+    data: Buffer.from("data"),
+    identity: {
+      volumeSerialNumber: "0000000000000001",
+      fileId: "00112233445566778899aabbccddeeff",
+      linkCount: 1,
+    },
+  }),
+} = {}) {
   const identity = {
     volumeSerialNumber: "0000000000000001",
     fileId: "00112233445566778899aabbccddeeff",
@@ -135,7 +150,7 @@ function unqualifiedWindowsFilesystemAdapter() {
     removePreparedDirectory: () => ({ removed: true, identity }),
     renamePreparedDirectory: () => ({ renamed: true, identity }),
     createPreparedFile: () => identity,
-    readPreparedFile: () => ({ data: Buffer.from("data"), identity }),
+    readPreparedFile,
     deletePreparedFile: () => ({ deleted: true, identity }),
     publishPreparedFile: () => ({ published: true, identity }),
   };
@@ -364,10 +379,11 @@ test("companion composition owns one branded Windows adapter boundary", () => {
 
 test("Windows state composition shares one branded adapter and remains unqualified", () => {
   const adapter = unqualifiedWindowsFilesystemAdapter();
+  const stateRoot = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state";
   const composition = createCompanionWindowsStateComposition({
     platform: "win32",
     architecture: "x64",
-    stateRoot: "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state",
+    stateRoot,
     windowsFilesystemAdapter: adapter,
   });
   assert.equal(composition.protectedStateStore.productionSafe, false);
@@ -377,6 +393,63 @@ test("Windows state composition shares one branded adapter and remains unqualifi
   assert.equal(typeof composition.sqliteStateSessionForPath, "function");
   assert.equal(
     typeof composition.contributionSyncQueue.inspectContributionSyncQueue,
+    "function",
+  );
+  assert.equal(composition.windowsPreparedArtifactStorage,
+    composition.preparedArtifactStorage);
+  assert.equal(composition.windowsPreparedContributionContext,
+    composition.preparedContributionContext);
+  assert.equal(composition.windowsReviewPairStorage,
+    composition.reviewPairStorage);
+  assert.equal(
+    typeof composition.windowsReviewPairStorage.writeReviewPair,
+    "function",
+  );
+  assert.equal(
+    typeof composition.windowsReviewPairStorage.readReviewPair,
+    "function",
+  );
+  assert.equal(
+    typeof composition.windowsReviewPairStorage.recoverReviewPairTransactions,
+    "function",
+  );
+  assert.equal(
+    composition.windowsReviewPairStorage.maximumBundleBytes,
+    WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_ARTIFACT_BYTES,
+  );
+  assert.equal(composition.windowsReviewPairStorage.readiness, false);
+  assert.equal(composition.windowsReviewPairStorage.productionSafe, false);
+  assert.equal(
+    typeof composition.windowsMetadataExportContext.buildLocalMetadataBundle,
+    "function",
+  );
+  assert.equal(
+    typeof composition.windowsMetadataExportContext.writeLocalMetadataBundle,
+    "function",
+  );
+  assert.equal(
+    typeof composition.windowsMetadataBundleVerificationContext
+      .loadVerifiedLocalMetadataBundleFiles,
+    "function",
+  );
+  assert.equal(composition.preparedArtifactStorage.rootPath, stateRoot);
+  assert.equal(
+    composition.preparedArtifactStorage.maximumFileBytes,
+    WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_ARTIFACT_BYTES,
+  );
+  assert.ok(
+    composition.preparedArtifactStorage.maximumFileBytes
+      > WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_CONTRIBUTION_BYTES,
+  );
+  assert.equal(composition.preparedContributionContext.rootPath, stateRoot);
+  assert.equal(composition.preparedArtifactStorage.readiness, false);
+  assert.equal(composition.preparedContributionContext.productionSafe, false);
+  assert.equal(
+    typeof composition.preparedContributionContext.verifyPreparedContributionSet,
+    "function",
+  );
+  assert.equal(
+    typeof composition.preparedContributionContext.loadVerifiedPreparedContribution,
     "function",
   );
   assert.equal(composition.windowsCompanionInstanceLease.crossProcessSafe, true);
@@ -390,6 +463,215 @@ test("Windows state composition shares one branded adapter and remains unqualifi
     }),
     (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
   );
+});
+
+test("Windows materializer receives the composed metadata verifier", async () => {
+  let reviewedReads = 0;
+  const stateRoot = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state";
+  const composition = createCompanionWindowsStateComposition({
+    platform: "win32",
+    architecture: "x64",
+    stateRoot,
+    windowsFilesystemAdapter: unqualifiedWindowsFilesystemAdapter({
+      readPreparedFile() {
+        reviewedReads += 1;
+        return {
+          data: Buffer.from("not canonical JSON"),
+          identity: {
+            volumeSerialNumber: "0000000000000001",
+            fileId: "00112233445566778899aabbccddeeff",
+            linkCount: 1,
+          },
+        };
+      },
+    }),
+  });
+  const materialize = createWindowsContributionMaterializer({
+    preparedContributionContext: composition.preparedContributionContext,
+    windowsPreparedArtifactStorage: composition.preparedArtifactStorage,
+    windowsReviewPairStorage: composition.windowsReviewPairStorage,
+    windowsMetadataBundleVerificationContext:
+      composition.windowsMetadataBundleVerificationContext,
+  });
+  await assert.rejects(
+    materialize({
+      bundleFile: `${stateRoot}\\review-11111111-1111-4111-8111-111111111111\\review.umx.json`,
+      receiptFile: `${stateRoot}\\review-11111111-1111-4111-8111-111111111111\\review.umx.json.privacy-receipt.json`,
+      outputDirectory: `${stateRoot}\\prepared`,
+    }),
+    (error) => error instanceof Error,
+  );
+  assert.equal(reviewedReads, 2);
+  assert.throws(
+    () => createWindowsContributionMaterializer({
+      preparedContributionContext: composition.preparedContributionContext,
+      windowsPreparedArtifactStorage: composition.preparedArtifactStorage,
+      windowsReviewPairStorage: composition.windowsReviewPairStorage,
+      windowsMetadataBundleVerificationContext: {
+        ...composition.windowsMetadataBundleVerificationContext,
+      },
+    }),
+    (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+  );
+});
+
+test("Windows prepared contexts reject missing or forged roots before controllers", () => {
+  const adapter = unqualifiedWindowsFilesystemAdapter();
+  const stateRoot = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state";
+  const composition = createCompanionWindowsStateComposition({
+    platform: "win32",
+    architecture: "x64",
+    stateRoot,
+    windowsFilesystemAdapter: adapter,
+  });
+  const base = {
+    environment: {},
+    resourceRoot: "C:\\TiboTattle\\resources",
+    stateRoot,
+    statePaths: {},
+    staticRoot: "C:\\TiboTattle\\resources\\public",
+    codexHome: "C:\\Users\\tester\\.codex",
+    homeDirectory: "C:\\Users\\tester",
+    diagnosticsLogFile: `${stateRoot}\\diagnostics-v0.1.log`,
+    contributionQueueFile: `${stateRoot}\\contribution-queue.sqlite3`,
+    preparedContributionDirectory: `${stateRoot}\\prepared`,
+    windowsFilesystemAdapter: adapter,
+    windowsProtectedStateStore: composition.protectedStateStore,
+    windowsSqliteStateSessionFactory:
+      composition.sqliteStateSessionFactory,
+    windowsSqliteStateSessionForPath:
+      composition.sqliteStateSessionForPath,
+    windowsSqliteStateStaging: composition.sqliteStateStaging,
+    contributionSyncQueueContext: composition.contributionSyncQueue,
+    windowsCompanionInstanceLease: composition.windowsCompanionInstanceLease,
+  };
+  assert.throws(
+    () => createPreparedLocalCompanionServer(base),
+    (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+  );
+  assert.throws(
+    () => createPreparedLocalCompanionServer({
+      ...base,
+      windowsPreparedArtifactStorage: composition.preparedArtifactStorage,
+      windowsPreparedContributionContext: {},
+    }),
+    (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+  );
+  assert.throws(
+    () => createPreparedLocalCompanionServer({
+      ...base,
+      windowsPreparedArtifactStorage: { ...composition.preparedArtifactStorage },
+      windowsPreparedContributionContext:
+        composition.preparedContributionContext,
+    }),
+    (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+  );
+  const complete = {
+    ...base,
+    windowsPreparedArtifactStorage: composition.preparedArtifactStorage,
+    windowsPreparedContributionContext: composition.preparedContributionContext,
+    windowsReviewPairStorage: composition.windowsReviewPairStorage,
+    windowsMetadataExportContext: composition.windowsMetadataExportContext,
+    windowsMetadataBundleVerificationContext:
+      composition.windowsMetadataBundleVerificationContext,
+  };
+  const secondComposition = createCompanionWindowsStateComposition({
+    platform: "win32",
+    architecture: "x64",
+    // Keep every visible path identical: only exact object ownership should
+    // distinguish this composition from the one used by `complete`.
+    stateRoot,
+    windowsFilesystemAdapter: unqualifiedWindowsFilesystemAdapter(),
+  });
+  for (const [field, value] of [
+    ["windowsPreparedContributionContext",
+      secondComposition.preparedContributionContext],
+    ["windowsReviewPairStorage", secondComposition.windowsReviewPairStorage],
+    ["windowsMetadataExportContext",
+      secondComposition.windowsMetadataExportContext],
+    ["windowsMetadataBundleVerificationContext",
+      secondComposition.windowsMetadataBundleVerificationContext],
+  ]) {
+    assert.throws(
+      () => createPreparedLocalCompanionServer({
+        ...complete,
+        [field]: value,
+      }),
+      (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+      `cross-composition ${field} must be rejected`,
+    );
+  }
+  assert.throws(
+    () => createPreparedLocalCompanionServer({
+      ...complete,
+      windowsReviewPairStorage: { ...composition.windowsReviewPairStorage },
+    }),
+    (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+  );
+  assert.throws(
+    () => createPreparedLocalCompanionServer({
+      ...complete,
+      windowsMetadataExportContext: {
+        ...composition.windowsMetadataExportContext,
+      },
+    }),
+    (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+  );
+});
+
+test("Windows prepared server rejects caller-supplied preparation runners", () => {
+  const adapter = unqualifiedWindowsFilesystemAdapter();
+  const stateRoot = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state";
+  const composition = createCompanionWindowsStateComposition({
+    platform: "win32",
+    architecture: "x64",
+    stateRoot,
+    windowsFilesystemAdapter: adapter,
+  });
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", {
+    ...originalPlatform,
+    value: "win32",
+  });
+  try {
+    assert.throws(
+      () => createPreparedLocalCompanionServer({
+        environment: {},
+        resourceRoot: "C:\\TiboTattle\\resources",
+        stateRoot,
+        statePaths: {},
+        staticRoot: "C:\\TiboTattle\\resources\\public",
+        codexHome: "C:\\Users\\tester\\.codex",
+        homeDirectory: "C:\\Users\\tester",
+        diagnosticsLogFile: `${stateRoot}\\diagnostics-v0.1.log`,
+        contributionQueueFile: `${stateRoot}\\contribution-queue.sqlite3`,
+        preparedContributionDirectory: `${stateRoot}\\prepared`,
+        windowsFilesystemAdapter: adapter,
+        windowsProtectedStateStore: composition.protectedStateStore,
+        windowsSqliteStateSessionFactory:
+          composition.sqliteStateSessionFactory,
+        windowsSqliteStateSessionForPath:
+          composition.sqliteStateSessionForPath,
+        windowsSqliteStateStaging: composition.sqliteStateStaging,
+        contributionSyncQueueContext: composition.contributionSyncQueue,
+        windowsCompanionInstanceLease:
+          composition.windowsCompanionInstanceLease,
+        windowsPreparedArtifactStorage:
+          composition.preparedArtifactStorage,
+        windowsPreparedContributionContext:
+          composition.preparedContributionContext,
+        windowsReviewPairStorage: composition.windowsReviewPairStorage,
+        windowsMetadataExportContext:
+          composition.windowsMetadataExportContext,
+        windowsMetadataBundleVerificationContext:
+          composition.windowsMetadataBundleVerificationContext,
+        contributionPreparationRunner: async () => {},
+      }),
+      (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+    );
+  } finally {
+    Object.defineProperty(process, "platform", originalPlatform);
+  }
 });
 
 test("Windows root rejects the unqualified branded adapter before state creation", async () => {
