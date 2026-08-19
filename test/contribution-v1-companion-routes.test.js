@@ -110,6 +110,7 @@ function fakeStore() {
 function fakeIncrementalController() {
   const calls = {
     start: 0, stop: 0, approve: 0, resume: 0, inspect: 0, runDue: 0,
+    approveOptions: null,
   };
   let approved = false;
   const projection = () => ({
@@ -157,8 +158,9 @@ function fakeIncrementalController() {
       calls.inspect += 1;
       return projection();
     },
-    async approve() {
+    async approve(options) {
       calls.approve += 1;
+      calls.approveOptions = options ?? null;
       approved = true;
       return projection();
     },
@@ -660,6 +662,14 @@ test("approve-once requires the review token minted by an exact review, exactly 
       includesCredentials: false,
     });
     assert.equal(controller.calls.approve, 1);
+    // The ceremony's ordering fact travels with the approval (2026-08-19,
+    // observed live on two fresh Macs): no credential binding exists on this
+    // fresh state root, so the first pass belongs to the pairing step that
+    // follows in the same interaction — an attempt at this instant could
+    // only record a device_unavailable pause mid-ceremony.
+    assert.deepEqual(controller.calls.approveOptions, {
+      awaitingDevicePairing: true,
+    });
     // 2026-08-08 (owner-directed immediate first pass): the approval must
     // become a running sync pass in this process tick, not a pending timer —
     // the route fires the controller's own due-run right after it answers.
@@ -969,6 +979,119 @@ test("an unconfigured companion refuses the approval and a device pairing resume
     assert.equal(controller.calls.runDue >= 1, true);
   } finally {
     await paired.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("an approval on a Mac that already holds a device binding keeps the immediate first pass", async () => {
+  const files = await fixture();
+  // A paired Mac re-approving (a consent upgrade) has its binding file on
+  // disk; presence is probed without touching the Keychain, and the
+  // owner-directed immediate first pass (2026-08-08) stays in force.
+  await mkdir(files.stateRoot, { recursive: true, mode: 0o700 });
+  await writeFile(
+    join(files.stateRoot, "contribution-device-binding-v1.json"),
+    `${JSON.stringify({ schemaVersion: "contribution-device-binding-v1" })}\n`,
+    { mode: 0o600 },
+  );
+  const controller = fakeIncrementalController();
+  const reviewedPayload = exactReviewContribution();
+  const app = await startApp(files, {
+    incrementalContributionController: controller,
+    contributionSyncExactReviewProvider: async () => ({
+      schemaVersion: "contribution-sync-exact-review-v0.1",
+      state: "ready",
+      networkActivity: false,
+      discoveredSets: 1,
+      enqueued: 0,
+      payloadBytes: Buffer.byteLength(JSON.stringify(reviewedPayload), "utf8"),
+      payload: reviewedPayload,
+      reviewBinding: {
+        jobId: REVIEW_JOB_ID,
+        contributionSha256: REVIEW_SHA256,
+      },
+    }),
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const review = await fetch(
+      `${base}/api/local/contribution/sync-inspect-exact`,
+      { method: "POST", headers, body: "{}" },
+    ).then((response) => response.json());
+    const approve = await fetch(
+      `${base}/api/local/contribution/incremental-approve`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ reviewToken: review.reviewToken }),
+      },
+    );
+    assert.equal(approve.status, 200);
+    assert.equal(controller.calls.approve, 1);
+    assert.deepEqual(controller.calls.approveOptions, {
+      awaitingDevicePairing: false,
+    });
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a denied Keychain read at pairing answers with its dialog-specific recovery code", async () => {
+  // Deny (or cancel) in the macOS access dialog surfaces from the capability
+  // layer as contribution_device_credential_denied. The route must keep that
+  // one cause distinguishable — the dashboard tells the user which dialog to
+  // answer differently — while every other broken-credential state stays on
+  // the generic recovery code, and non-recovery failures stay 502.
+  const files = await fixture();
+  const failures = [
+    ["contribution_device_credential_denied", 409,
+      "contribution_device_keychain_access_denied"],
+    ["contribution_device_credential_locked", 409,
+      "contribution_device_recovery_required"],
+    ["contribution_device_credential_conflict", 409,
+      "contribution_device_recovery_required"],
+    ["contribution_device_client_pairing_rejected", 502,
+      "contribution_device_pairing_failed"],
+  ];
+  let thrownCode = null;
+  const app = await startApp(files, {
+    incrementalContributionController: fakeIncrementalController(),
+    contributionDevicePairingProvider: async () => {
+      const error = new Error("pairing failed");
+      error.code = thrownCode;
+      throw error;
+    },
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    for (const [capabilityCode, status, routeCode] of failures) {
+      thrownCode = capabilityCode;
+      const pairing = await fetch(
+        `${base}/api/local/contribution/device-pair`,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            pairingCode: `um_pair_${REVIEW_JOB_ID}.${"C".repeat(43)}`,
+          }),
+        },
+      );
+      assert.equal(pairing.status, status, capabilityCode);
+      assert.equal((await pairing.json()).error.code, routeCode, capabilityCode);
+    }
+  } finally {
+    await app.close();
     await rm(files.root, { recursive: true });
   }
 });

@@ -2794,6 +2794,29 @@ function createPreparedLocalCompanionServer({
     }
     return backend;
   };
+  // Keychain-free pairing evidence: the binding file is published the moment
+  // a credential is minted (at the legacy location until its lazy migration),
+  // so its presence answers "has this Mac ever paired" without touching the
+  // Keychain — this probe must never itself raise the macOS access prompt.
+  // Anything other than a clean absence counts as present, so approval keeps
+  // the immediate first attempt and the pass classifies the fault honestly.
+  const contributionDeviceBindingPresent = async () => {
+    const candidates = [
+      statePaths.contributionDeviceStateFile,
+      ...(legacyContributionDeviceStateFile === null
+        ? []
+        : [legacyContributionDeviceStateFile]),
+    ];
+    for (const candidate of candidates) {
+      try {
+        await lstat(candidate);
+        return true;
+      } catch (error) {
+        if (error?.code !== "ENOENT") return true;
+      }
+    }
+    return false;
+  };
   const pairContributionDevice = contributionDevicePairingProvider
     ?? (contributionServiceOrigin === null
       ? null
@@ -3964,7 +3987,17 @@ function createPreparedLocalCompanionServer({
         }
         let approved;
         try {
-          approved = await incrementalContribution.approve();
+          // The one-step ceremony records local consent BEFORE the hosted
+          // pairing mints this Mac's upload credential, so with no binding on
+          // disk an attempt scheduled at the approval instant could only die
+          // at credential_missing and record a device_unavailable pause
+          // mid-ceremony (observed live 2026-08-19 on two fresh Macs). The
+          // pairing that follows in the same interaction owns the first pass
+          // instead — the device-pair route below resumes and kicks it — and
+          // a Mac that already holds a binding keeps the immediate attempt.
+          approved = await incrementalContribution.approve({
+            awaitingDevicePairing: !await contributionDeviceBindingPresent(),
+          });
         } catch {
           sendError(response, 500, "incremental_consent_failed");
           return;
@@ -4185,11 +4218,20 @@ function createPreparedLocalCompanionServer({
         } catch (error) {
           const recoveryRequired =
             contributionDeviceRecoveryRequired(error);
+          // A denied Keychain read is the one recovery cause the user acted
+          // on directly — Deny (or cancel) in the macOS access dialog the
+          // mint's read-back raises — so it keeps its own code and the
+          // dashboard can say which dialog to answer differently. The reset
+          // ceremony is the cure for every recovery code either way.
+          const keychainAccessDenied =
+            error?.code === "contribution_device_credential_denied";
           sendError(
             response,
             recoveryRequired ? 409 : 502,
             recoveryRequired
-              ? "contribution_device_recovery_required"
+              ? keychainAccessDenied
+                ? "contribution_device_keychain_access_denied"
+                : "contribution_device_recovery_required"
               : "contribution_device_pairing_failed",
           );
         }

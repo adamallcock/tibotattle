@@ -2960,12 +2960,15 @@ test("stale contribution-device credentials return fixed recovery guidance witho
 // (claimContributionDevicePairing -> ensureContributionDeviceCapability ->
 // readContributionDeviceCapability) threw one of them, the route mapped it to a
 // generic 502 pairing_failed with no reset surface, and every retry re-hit the
-// same unreadable item — a silent forever-loop. Each must now reach the 409
-// recovery code that renders the local reset ceremony.
-for (const { label, thrown } of [
-  { label: "locked (re-sign broke the ACL)", thrown: { code: "export_identity_keychain_locked" } },
-  { label: "denied", thrown: { code: "export_identity_keychain_denied" } },
-  { label: "unavailable (unreadable/corrupt secret)", thrown: { code: "export_identity_keychain_wedged" } },
+// same unreadable item — a silent forever-loop. Each must now reach a 409
+// recovery code that renders the local reset ceremony. A denied read keeps its
+// own dialog-specific code (2026-08-19): the user caused it by answering Deny
+// in the macOS access dialog, and the dashboard says which dialog to answer
+// differently on the retry; the cure — the reset ceremony — is identical.
+for (const { label, thrown, routeCode } of [
+  { label: "locked (re-sign broke the ACL)", thrown: { code: "export_identity_keychain_locked" }, routeCode: "contribution_device_recovery_required" },
+  { label: "denied", thrown: { code: "export_identity_keychain_denied" }, routeCode: "contribution_device_keychain_access_denied" },
+  { label: "unavailable (unreadable/corrupt secret)", thrown: { code: "export_identity_keychain_wedged" }, routeCode: "contribution_device_recovery_required" },
 ]) {
   test(`an unreadable device credential (${label}) routes pairing to local recovery, not a dead-end 502`, async () => {
     const files = await fixture();
@@ -3027,8 +3030,7 @@ for (const { label, thrown } of [
       });
       await assert.rejects(
         client.pairContributionDevice(pairingCode),
-        (error) => error?.status === 409
-          && error?.code === "contribution_device_recovery_required",
+        (error) => error?.status === 409 && error?.code === routeCode,
       );
       const response = await fetch(
         `${base}/api/local/contribution/device-pair`,
@@ -3038,7 +3040,7 @@ for (const { label, thrown } of [
       const payload = await response.json();
       assert.deepEqual(payload, {
         schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
-        error: { code: "contribution_device_recovery_required" },
+        error: { code: routeCode },
       });
       // The broken secret is never read out, minted over, or leaked: recovery is
       // the sole outcome and it discloses nothing about the failed credential.
