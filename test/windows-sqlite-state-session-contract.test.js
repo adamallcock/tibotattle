@@ -55,6 +55,8 @@ function metadata(identity = IDENTITY, overrides = {}) {
 function createFixture({
   bindingOverrides = {},
   rootMetadata = metadata(),
+  databaseMetadata = metadata(IDENTITY, { isDirectory: false, isRegularFile: true }),
+  journalMetadata = metadata(IDENTITY, { isDirectory: false, isRegularFile: true }),
   releaseError = null,
 } = {}) {
   const calls = [];
@@ -93,7 +95,15 @@ function createFixture({
     replaceFile() {
       throw nativeError("OPERATION_FAILED");
     },
-    inspectProtectedChild() {
+    inspectProtectedChild(rootPath, rootIdentity, childPath) {
+      calls.push(["inspectProtectedChild", rootPath, rootIdentity, childPath]);
+      if (rootPath !== ROOT || !sameIdentity(rootIdentity, IDENTITY)) {
+        throw nativeError("IDENTITY_MISMATCH");
+      }
+      if (childPath.endsWith("-journal")) return journalMetadata;
+      if (childPath === DATABASE_NAME || childPath.endsWith(".sqlite")) {
+        return databaseMetadata;
+      }
       throw nativeError("NOT_FOUND");
     },
     readProtectedChild() {
@@ -282,10 +292,18 @@ test("the Windows SQLite session is branded, root-bound, and lease-first", () =>
   }
   assert.deepEqual(
     fixture.calls.map(([name]) => name),
-    ["inspectPath", "acquireSqliteStateLease", "databaseFactory"],
+    [
+      "inspectPath",
+      "acquireSqliteStateLease",
+      "databaseFactory",
+      "inspectProtectedChild",
+      "inspectProtectedChild",
+    ],
   );
   assert.equal(fixture.calls[1][3], DATABASE_NAME);
   assert.equal(fixture.calls[2][1], `${ROOT}\\${DATABASE_NAME}`);
+  assert.equal(fixture.calls[3][3], DATABASE_NAME);
+  assert.equal(fixture.calls[4][3], `${DATABASE_NAME}-journal`);
 
   session.close();
   assert.deepEqual(
@@ -358,6 +376,49 @@ test("policy refusal closes the database and releases the native lease", () => {
     assertSessionError("policy_refused"),
   );
   assert.deepEqual(calls.at(-1), ["close"]);
+  assert.equal(fixture.calls.at(-1)[0], "releaseSqliteStateLease");
+});
+
+test("post-open database and journal identities must match the native lease", () => {
+  const otherIdentity = Object.freeze({
+    volumeSerialNumber: "0000000000000002",
+    fileId: "ffeeddccbbaa99887766554433221100",
+    linkCount: 1,
+  });
+  const databaseFixture = createFixture({
+    databaseMetadata: metadata(otherIdentity, { isDirectory: false, isRegularFile: true }),
+  });
+  const database = createDatabase({ calls: [] });
+  assert.throws(
+    () => createWindowsSqliteStateSession(sessionOptions(databaseFixture, database)),
+    assertSessionError("identity_mismatch"),
+  );
+  assert.equal(databaseFixture.calls.at(-1)[0], "releaseSqliteStateLease");
+
+  const journalFixture = createFixture({
+    journalMetadata: metadata(otherIdentity, { isDirectory: false, isRegularFile: true }),
+  });
+  const journalDatabase = createDatabase({ calls: [] });
+  assert.throws(
+    () => createWindowsSqliteStateSession(sessionOptions(journalFixture, journalDatabase)),
+    assertSessionError("identity_mismatch"),
+  );
+  assert.equal(journalFixture.calls.at(-1)[0], "releaseSqliteStateLease");
+});
+
+test("post-open identity inspection rejects an unprotected child", () => {
+  const fixture = createFixture({
+    databaseMetadata: metadata(IDENTITY, {
+      isDirectory: false,
+      isRegularFile: true,
+      ownerMatches: false,
+    }),
+  });
+  const database = createDatabase({ calls: [] });
+  assert.throws(
+    () => createWindowsSqliteStateSession(sessionOptions(fixture, database)),
+    assertSessionError("identity_mismatch"),
+  );
   assert.equal(fixture.calls.at(-1)[0], "releaseSqliteStateLease");
 });
 
@@ -495,6 +556,12 @@ test("forged/copied adapters, downgraded platforms, weak roots, and unsafe archi
   assert.throws(
     () => createWindowsSqliteStateSession(sessionOptions(fixture, database, {
       databaseName: "CON",
+    })),
+    assertSessionError("invalid_database_name"),
+  );
+  assert.throws(
+    () => createWindowsSqliteStateSession(sessionOptions(fixture, database, {
+      databaseName: "state.sqlite-wal",
     })),
     assertSessionError("invalid_database_name"),
   );

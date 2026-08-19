@@ -189,11 +189,26 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   assert.match(source, /IsIssuedSqliteStateLease/u);
   assert.match(source, /SqliteStateLeaseContended/u);
   assert.match(source, /SqliteStateLeaseSidecarPresent/u);
+  assert.match(source, /ReserveSqliteSidecar/u);
+  assert.match(source, /kFileDeleteOnClose/u);
+  assert.match(source, /options\.shareMode = 0/u);
+  assert.match(source, /options\.disposition = kFileCreate/u);
+  assert.match(source, /options\.extraOptions = kFileDeleteOnClose/u);
+  assert.match(source, /kFileNonDirectory \| options\.extraOptions/u);
+  assert.match(source, /sidecarReservations/u);
+  assert.match(source, /AppendHandles\(&handles, std::move\(sidecarReservations\)\)/u);
   assert.match(source, /SqliteStateLeaseMutexName/u);
   assert.match(source, /CreateMutexExW/u);
   assert.match(source, /WaitForSingleObject\(mutex, 0\)/u);
-  assert.match(source, /waitResult == WAIT_ABANDONED_0[\s\S]*?ReleaseMutex\(mutex\)/u);
+  assert.match(
+    source,
+    /waitResult == WAIT_ABANDONED_0[\s\S]*?\*result = mutex;/u,
+  );
   assert.match(source, /ownerThreadId != GetCurrentThreadId\(\)/u);
+  assert.match(
+    source,
+    /ownerThreadId != GetCurrentThreadId\(\)[\s\S]*?return ThrowFailure\(env, SqliteStateLeaseForeign\(\)\);[\s\S]*?UnregisterSqliteStateLease\(lease\)/u,
+  );
   assert.match(source, /SqliteStateLeaseReleaseFailed/u);
   assert.match(source, /FILE_SHARE_READ \| FILE_SHARE_WRITE/u);
   assert.match(source, /EndsWithInsensitive\(supplied, L"-journal"\)/u);

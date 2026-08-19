@@ -113,13 +113,20 @@ the still-disabled Windows production selectors.
 
 `acquireSqliteStateLease(rootPath, expectedRootIdentity, databaseName)` is a
 purpose-limited protected SQLite boundary. It accepts one basename, derives
-the rollback journal, rejects pre-existing `-wal`/`-shm` sidecars, and returns
-validated database/journal identities plus an opaque lease. The lease holds
-the root/ancestor, database, and journal handles with read/write sharing but
-without delete sharing, and coordinates duplicate acquisition with a
-current-user owner-only named mutex derived from the validated root/database
-identities. `releaseSqliteStateLease` releases that mutex and every handle
-exactly once. The binding still advertises `sqliteStateLeaseSafe: false`:
-sidecar absence is a defensive preflight rather than a lifetime reservation,
-and native Windows qualification must prove the final SQLite integration
-before any production selector can rely on it.
+the rollback journal, and returns validated database/journal identities plus
+an opaque lease. After the identity mutex is acquired, the native boundary
+creates owner-only delete-on-close placeholders for the derived `-wal` and
+`-shm` names and holds exclusive handles to them for the complete lease
+lifetime. A SQLite writer therefore receives a sharing violation instead of
+creating either sidecar; the placeholders disappear when the last native
+handle closes, including after an abrupt process termination. The lease holds
+the root/ancestor, database, journal, and sidecar-reservation handles with
+read/write sharing but without delete sharing, and coordinates duplicate
+acquisition with a current-user owner-only named mutex derived from the
+validated root/database identities. An abandoned mutex is retained by the
+new owner so SQLite can perform bounded hot-journal recovery before the
+session is exposed. `releaseSqliteStateLease` releases that mutex and every
+handle exactly once. The binding still advertises `sqliteStateLeaseSafe:
+false`: native Windows qualification must prove the reservation,
+identity-binding, recovery, and supported filesystem matrix before any
+production selector can rely on it.

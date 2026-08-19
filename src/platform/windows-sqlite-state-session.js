@@ -189,6 +189,12 @@ function canonicalDatabaseName(databaseName) {
       || invalidWindowsComponent(databaseName)) {
     fail(DATABASE_NAME_ERROR);
   }
+  const lowerName = databaseName.toLowerCase();
+  if (lowerName.endsWith("-journal")
+      || lowerName.endsWith("-wal")
+      || lowerName.endsWith("-shm")) {
+    fail(DATABASE_NAME_ERROR);
+  }
   return databaseName;
 }
 
@@ -204,6 +210,10 @@ function databasePath(rootPath, databaseName) {
 }
 
 function exactIdentity(value) {
+  return exactIdentityWithError(value, "root_unavailable");
+}
+
+function exactIdentityWithError(value, errorCode) {
   let valid = false;
   try {
     valid = isWindowsFilesystemIdentity(value)
@@ -213,12 +223,18 @@ function exactIdentity(value) {
   } catch {
     valid = false;
   }
-  if (!valid) fail("root_unavailable");
+  if (!valid) fail(errorCode);
   return Object.freeze({
     volumeSerialNumber: value.volumeSerialNumber,
     fileId: value.fileId,
     linkCount: 1,
   });
+}
+
+function sameIdentity(left, right) {
+  return left?.volumeSerialNumber === right?.volumeSerialNumber
+    && left?.fileId === right?.fileId
+    && left?.linkCount === right?.linkCount;
 }
 
 function validateRootMetadata(metadata) {
@@ -259,6 +275,7 @@ function assertAdapter(adapter, { requireSqliteLeaseSafe }) {
   let valid = false;
   try {
     valid = typeof adapter.inspectPath === "function"
+      && typeof adapter.inspectProtectedChild === "function"
       && typeof adapter.acquireSqliteStateLease === "function"
       && typeof adapter.releaseSqliteStateLease === "function"
       && (!requireSqliteLeaseSafe || adapter.sqliteStateLeaseSafe === true);
@@ -267,6 +284,61 @@ function assertAdapter(adapter, { requireSqliteLeaseSafe }) {
   }
   if (!valid) fail("invalid_adapter");
   return adapter;
+}
+
+function validateDatabaseMetadata(metadata) {
+  let valid = false;
+  try {
+    valid = metadata !== null
+      && typeof metadata === "object"
+      && !Array.isArray(metadata)
+      && metadata.isDirectory === false
+      && metadata.isRegularFile === true
+      && metadata.isReparsePoint === false
+      && metadata.ownerMatches === true
+      && metadata.nullDacl === false
+      && metadata.daclProtected === true
+      && metadata.broadAccess === false
+      && metadata.nonOwnerAllow === false
+      && metadata.unrecognizedAce === false
+      && metadata.finalPathResolved === true;
+  } catch {
+    valid = false;
+  }
+  if (!valid) fail("identity_mismatch");
+  return exactIdentityWithError(metadata.identity, "identity_mismatch");
+}
+
+function revalidateLeaseIdentities(
+    adapter,
+    root,
+    rootIdentity,
+    databaseName,
+    lease) {
+  const databaseIdentity = exactIdentityWithError(
+    lease?.databaseIdentity,
+    "identity_mismatch",
+  );
+  const journalIdentity = exactIdentityWithError(
+    lease?.journalIdentity,
+    "identity_mismatch",
+  );
+  const journalName = `${databaseName}-journal`;
+  let databaseMetadata;
+  let journalMetadata;
+  try {
+    databaseMetadata = adapter.inspectProtectedChild(root, rootIdentity, databaseName);
+    journalMetadata = adapter.inspectProtectedChild(root, rootIdentity, journalName);
+  } catch {
+    fail("identity_mismatch");
+  }
+  const observedDatabaseIdentity = validateDatabaseMetadata(databaseMetadata);
+  const observedJournalIdentity = validateDatabaseMetadata(journalMetadata);
+  if (!sameIdentity(observedDatabaseIdentity, databaseIdentity)
+      || !sameIdentity(observedJournalIdentity, journalIdentity)) {
+    fail("identity_mismatch");
+  }
+  return Object.freeze({ databaseIdentity, journalIdentity });
 }
 
 function assertDatabase(database) {
@@ -528,6 +600,18 @@ export function createWindowsSqliteStateSession({
     assertDatabaseLocation(database, path, {
       required: process.platform === "win32",
     });
+    // DatabaseSync does not expose the native file identity.  Re-open both
+    // protected children through the branded root-relative adapter after the
+    // connection exists and compare them with the identities pinned by the
+    // native lease.  This binds the live connection to the exact files the
+    // lease secured, even if a path was redirected before DatabaseSync opened.
+    revalidateLeaseIdentities(
+      selectedAdapter,
+      root,
+      expectedRootIdentity,
+      name,
+      lease,
+    );
     configureDatabase(database);
     installAuthorizer(database, {
       requireAuthorizer: process.platform === "win32",
