@@ -10460,6 +10460,12 @@ const LOCAL_COMPANION_ERROR_COPY = {
     "TiboTattle refused to cancel the analysis because the request did not come from the local dashboard. The analysis is still running.",
   refresh_not_running:
     "There is no local analysis running to cancel. Nothing was changed.",
+  // A durable checkpoint that was present when the analysis started and is
+  // gone mid-run. A first-ever run without a checkpoint never reports this:
+  // it completes with a provider-quota diagnostic instead, so this code only
+  // names genuine loss of the stored analysis state.
+  app_record_checkpoint_unavailable:
+    "The analysis checkpoint stored on this Mac disappeared while the analysis was running, so TiboTattle stopped rather than continue without it. Existing results are unchanged; run the analysis again to start over safely.",
   diagnostic_note_not_authorized:
     "TiboTattle refused to write a diagnostic note because the request did not come from the local dashboard. The reference above is still quotable.",
   diagnostic_note_not_recorded:
