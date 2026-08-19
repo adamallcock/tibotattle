@@ -1092,6 +1092,55 @@
       "legacyPaths": []
     },
     {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/build-windows-electron-qualification-receipt.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The aggregate-only Windows Electron receipt is produced only by the manually dispatched qualification workflow.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/windows-portability.yml",
+        "test/windows-qualification-governance.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/smoke-electron-linux.mjs",
+      "stableAlias": "smoke:electron:linux",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.smoke:electron:linux",
+        "test/electron-linux-smoke-contract.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/smoke-electron-windows.mjs",
+      "stableAlias": "smoke:electron:windows",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/windows-portability.yml",
+        "package.json#scripts.smoke:electron:windows",
+        "test/electron-windows-smoke-contract.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
       "classification": "historical_research_report",
       "owner": "reporting",
       "canonicalPath": "src/build-monitoring-quality-report.js",
