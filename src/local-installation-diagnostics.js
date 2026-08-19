@@ -234,6 +234,15 @@ export function localCompanionStatePaths(stateRoot) {
       "private",
       "incremental-contribution-sync-v1.json",
     ),
+    // The temporary OAuth result read-back capability must survive the native
+    // companion's random loopback port changing across a relaunch. It contains
+    // no proof or account data and expires after fifteen minutes, but it is
+    // still kept beside the other owner-only contribution state.
+    hostedSignInHandoffFile: join(
+      selected,
+      "private",
+      "hosted-signin-handoff-v1.json",
+    ),
     fastModePreferenceFile: join(
       selected,
       "private",

@@ -194,6 +194,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/local-companion-refresh.js",
   "src/local-contribution-preparation.js",
   "src/local-installation-diagnostics.js",
+  "src/hosted-signin-handoff.js",
   "src/local-companion-usage-model.js",
   "src/local-legacy-report-storage.js",
   "src/local-unified-accounting-source.js",

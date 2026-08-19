@@ -688,6 +688,52 @@ test("retryable failures honor Retry-After before adding bounded client spread",
   assert.equal(result.queue.nextAttemptAt, "2026-07-26T12:01:07.500Z");
 });
 
+test("retry and pause survive a queue reopen without invalidating exact review", async () => {
+  const value = await fixture();
+  const now = () => new Date("2026-07-26T12:00:00.000Z");
+  const failed = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    now,
+    random: () => 0.5,
+    syncEntry: async () => {
+      throw new ContributionDeviceSyncError("service_unavailable", {
+        retryable: true,
+      });
+    },
+  });
+  assert.equal(failed.retryable, 1);
+
+  // Every queue API closes its SQLite connection before returning. These
+  // reads therefore model a companion/app restart against the same durable
+  // Application Support state rather than an in-memory continuation.
+  const retryReview = await inspectExactNextContributionSyncUpload({
+    directory: value.preparedRoot,
+    queueFile: value.queueFile,
+    now,
+  });
+  assert.equal(retryReview.state, "retry_wait");
+  assert.equal(retryReview.payload?.schemaVersion, "telemetry-contribution-v0.1");
+  assert.match(retryReview.reviewBinding?.jobId ?? "", /^[0-9a-f-]{36}$/u);
+  assert.match(retryReview.reviewBinding?.contributionSha256 ?? "", /^[0-9a-f]{64}$/u);
+
+  await setContributionSyncPaused({
+    paused: true,
+    queueFile: value.queueFile,
+    now,
+  });
+  const pausedReview = await inspectExactNextContributionSyncUpload({
+    directory: value.preparedRoot,
+    queueFile: value.queueFile,
+    now,
+  });
+  assert.equal(pausedReview.state, "paused");
+  assert.deepEqual(pausedReview.payload, retryReview.payload);
+  assert.deepEqual(pausedReview.reviewBinding, retryReview.reviewBinding);
+});
+
 test("an interruption cannot undercut a Retry-After floor", async () => {
   const value = await fixture();
   const abort = new AbortController();

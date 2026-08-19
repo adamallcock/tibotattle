@@ -1,6 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -198,6 +206,192 @@ async function startApp(files, overrides = {}) {
     ...overrides,
   });
 }
+
+async function findAvailableLoopbackPort() {
+  const server = createServer();
+  await new Promise((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", rejectListen);
+      resolveListen();
+    });
+  });
+  const address = server.address();
+  const port = address && typeof address === "object" ? address.port : null;
+  await new Promise((resolveClose, rejectClose) => {
+    server.close((error) => error ? rejectClose(error) : resolveClose());
+  });
+  if (!Number.isSafeInteger(port)) throw new Error("loopback port unavailable");
+  return port;
+}
+
+test("the hosted sign-in recovery handle survives a real companion restart on a new port", async () => {
+  const files = await fixture();
+  const state = "s".repeat(64);
+  const verifier = "v".repeat(64);
+  const startedAt = Date.parse("2026-08-19T12:00:00.000Z");
+  let app = await startApp(files, { clock: () => startedAt });
+  let firstPort;
+  let secondPort;
+  try {
+    firstPort = app.port;
+    const base = `http://127.0.0.1:${app.port}`;
+    const unauthorized = await fetch(
+      `${base}/api/local/identity/hosted-signin-handoff`,
+    );
+    assert.equal(unauthorized.status, 403);
+    const stored = await fetch(
+      `${base}/api/local/identity/hosted-signin-handoff`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1",
+          Origin: base,
+        },
+        body: JSON.stringify({
+          action: "store",
+          provider: "google",
+          state,
+          verifier,
+        }),
+      },
+    );
+    assert.equal(stored.status, 200);
+    assert.deepEqual(await stored.json(), {
+      schemaVersion: "local-hosted-signin-handoff-v1",
+      status: "pending",
+      provider: "google",
+      state,
+      verifier,
+      startedAt,
+      expiresAt: startedAt + 15 * 60 * 1_000,
+    });
+    if (process.platform !== "win32") {
+      assert.equal(
+        (await lstat(join(files.stateRoot, "private"))).mode & 0o777,
+        0o700,
+      );
+      assert.equal(
+        (await lstat(join(
+          files.stateRoot,
+          "private",
+          "hosted-signin-handoff-v1.json",
+        ))).mode & 0o777,
+        0o600,
+      );
+    }
+    secondPort = await findAvailableLoopbackPort();
+  } finally {
+    await app.close();
+  }
+
+  app = await startApp(files, {
+    clock: () => startedAt + 30_000,
+    port: secondPort,
+  });
+  try {
+    assert.notEqual(app.port, firstPort, "the restarted app receives a fresh loopback port");
+    const base = `http://127.0.0.1:${app.port}`;
+    const recovered = await fetch(
+      `${base}/api/local/identity/hosted-signin-handoff`,
+      {
+        headers: {
+          "X-Usage-Monitor-Local": "1",
+          Origin: base,
+        },
+      },
+    );
+    assert.equal(recovered.status, 200);
+    assert.deepEqual(await recovered.json(), {
+      schemaVersion: "local-hosted-signin-handoff-v1",
+      status: "pending",
+      provider: "google",
+      state,
+      verifier,
+      startedAt,
+      expiresAt: startedAt + 15 * 60 * 1_000,
+    });
+    const cleared = await fetch(
+      `${base}/api/local/identity/hosted-signin-handoff`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1",
+          Origin: base,
+        },
+        body: JSON.stringify({ action: "clear" }),
+      },
+    );
+    assert.deepEqual(await cleared.json(), {
+      schemaVersion: "local-hosted-signin-handoff-v1",
+      status: "absent",
+    });
+    const tombstone = await readFile(join(
+      files.stateRoot,
+      "private",
+      "hosted-signin-handoff-v1.json",
+    ), "utf8");
+    assert.equal(tombstone.includes(state), false);
+    assert.equal(tombstone.includes(verifier), false);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("an expired hosted sign-in handle is discarded without exposing its bound values", async () => {
+  const files = await fixture();
+  const startedAt = Date.parse("2026-08-19T12:00:00.000Z");
+  let now = startedAt;
+  const state = "s".repeat(64);
+  const verifier = "v".repeat(64);
+  const app = await startApp(files, { clock: () => now });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const stored = await fetch(
+      `${base}/api/local/identity/hosted-signin-handoff`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          action: "store",
+          provider: "apple",
+          state,
+          verifier,
+        }),
+      },
+    );
+    assert.equal(stored.status, 200);
+    now += 15 * 60 * 1_000;
+    const expired = await fetch(
+      `${base}/api/local/identity/hosted-signin-handoff`,
+      { headers },
+    );
+    assert.deepEqual(await expired.json(), {
+      schemaVersion: "local-hosted-signin-handoff-v1",
+      status: "expired",
+      provider: "apple",
+    });
+    const absent = await fetch(
+      `${base}/api/local/identity/hosted-signin-handoff`,
+      { headers },
+    );
+    assert.deepEqual(await absent.json(), {
+      schemaVersion: "local-hosted-signin-handoff-v1",
+      status: "absent",
+    });
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
 
 test("the capability advertises the v1.0 contract only when configured with an existing index", async () => {
   const files = await fixture();
@@ -432,6 +626,221 @@ test("approve-once requires the review token minted by an exact review, exactly 
     );
     assert.equal(replay.status, 409);
     assert.equal(controller.calls.approve, 1);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("an approval left open past ten minutes refreshes its local review authorization", async () => {
+  const files = await fixture();
+  const controller = fakeIncrementalController();
+  const reviewedPayload = exactReviewContribution();
+  let now = Date.parse("2026-08-03T12:00:00.000Z");
+  const app = await startApp(files, {
+    clock: () => now,
+    incrementalContributionController: controller,
+    contributionSyncExactReviewProvider: async () => ({
+      schemaVersion: "contribution-sync-exact-review-v0.1",
+      state: "ready",
+      networkActivity: false,
+      discoveredSets: 1,
+      enqueued: 0,
+      payloadBytes: Buffer.byteLength(JSON.stringify(reviewedPayload), "utf8"),
+      payload: reviewedPayload,
+      reviewBinding: {
+        jobId: REVIEW_JOB_ID,
+        contributionSha256: REVIEW_SHA256,
+      },
+    }),
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const exactReview = () => fetch(
+      `${base}/api/local/contribution/sync-inspect-exact`,
+      { method: "POST", headers, body: "{}" },
+    ).then((response) => response.json());
+    const approve = (reviewToken) => fetch(
+      `${base}/api/local/contribution/incremental-approve`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ reviewToken }),
+      },
+    );
+
+    const stale = await exactReview();
+    now += 10 * 60_000 + 1;
+    const expired = await approve(stale.reviewToken);
+    assert.equal(expired.status, 409);
+    assert.equal((await expired.json()).error.code, "review_expired_or_changed");
+    assert.equal(controller.calls.approve, 0, "expiry cannot mutate consent");
+
+    const fresh = await exactReview();
+    assert.notEqual(fresh.reviewToken, stale.reviewToken);
+    const accepted = await approve(fresh.reviewToken);
+    assert.equal(accepted.status, 200);
+    assert.equal(controller.calls.approve, 1);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("retry-wait and paused payloads still mint local review tokens", async () => {
+  for (const queueState of ["retry_wait", "paused"]) {
+    const files = await fixture();
+    const controller = fakeIncrementalController();
+    const reviewedPayload = exactReviewContribution();
+    const app = await startApp(files, {
+      incrementalContributionController: controller,
+      contributionSyncExactReviewProvider: async () => ({
+        schemaVersion: "contribution-sync-exact-review-v0.1",
+        state: queueState,
+        networkActivity: false,
+        discoveredSets: 1,
+        enqueued: 0,
+        payloadBytes: Buffer.byteLength(
+          JSON.stringify(reviewedPayload),
+          "utf8",
+        ),
+        payload: reviewedPayload,
+        reviewBinding: {
+          jobId: REVIEW_JOB_ID,
+          contributionSha256: REVIEW_SHA256,
+        },
+      }),
+    });
+    try {
+      const base = `http://127.0.0.1:${app.port}`;
+      const headers = {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1",
+        Origin: base,
+      };
+      const review = await fetch(
+        `${base}/api/local/contribution/sync-inspect-exact`,
+        { method: "POST", headers, body: "{}" },
+      ).then((response) => response.json());
+      assert.equal(review.status, "available", queueState);
+      assert.equal(review.state, queueState, queueState);
+      assert.match(
+        review.reviewToken,
+        /^[A-Za-z0-9_-]{43}$/u,
+        `${queueState} must not suppress a local-only review token`,
+      );
+
+      const approve = await fetch(
+        `${base}/api/local/contribution/incremental-approve`,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ reviewToken: review.reviewToken }),
+        },
+      );
+      assert.equal(approve.status, 200, queueState);
+      assert.equal(controller.calls.approve, 1, queueState);
+    } finally {
+      await app.close();
+      await rm(files.root, { recursive: true });
+    }
+  }
+});
+
+test("contribution diagnostics are bounded, content-free, and include recent support references", async () => {
+  const files = await fixture();
+  const controller = fakeIncrementalController();
+  await controller.approve();
+  const diagnosticsLogFile = join(files.stateRoot, "diagnostics-v0.1.log");
+  await mkdir(files.stateRoot, { recursive: true, mode: 0o700 });
+  const notes = [
+    {
+      schemaVersion: "local-diagnostic-note-v0.1",
+      recordedAt: "2026-08-19T13:00:00.000Z",
+      reference: "TT-7QF3K2",
+      surface: "contribution_connect",
+      code: "IDENTITY_TOKEN_INVALID",
+      requestId: "",
+    },
+    {
+      schemaVersion: "local-diagnostic-note-v0.1",
+      recordedAt: "2026-08-19T13:01:00.000Z",
+      reference: "TT-ABCDEF",
+      surface: "contribution_prepare",
+      code: "local_review_timed_out",
+      requestId: "",
+    },
+  ];
+  await writeFile(
+    diagnosticsLogFile,
+    `${notes.map((note) => JSON.stringify(note)).join("\n")}\n${PRIVATE_CANARY}\n`,
+    { mode: 0o600 },
+  );
+  const app = await startApp(files, {
+    diagnosticsLogFile,
+    incrementalContributionController: controller,
+    contributionSyncStatusProvider: async () => ({
+      schemaVersion: "contribution-sync-status-v0.1",
+      paused: false,
+      counts: {
+        pending: 0,
+        in_flight: 0,
+        accepted: 1,
+        retryable: 1,
+        rejected: 0,
+      },
+      dueNow: 0,
+      nextAttemptAt: "2026-08-19T13:05:00.000Z",
+      lastAcceptedAt: "2026-08-19T12:00:00.000Z",
+    }),
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    assert.equal(
+      (await fetch(`${base}/api/local/diagnostics/contribution`, {
+        method: "POST",
+      })).status,
+      405,
+    );
+    const response = await fetch(
+      `${base}/api/local/diagnostics/contribution`,
+    );
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.equal(text.includes(PRIVATE_CANARY), false);
+    assert.equal(text.includes("IDENTITY_TOKEN_INVALID"), false);
+    assert.equal(text.includes("local_review_timed_out"), false);
+    assert.deepEqual(JSON.parse(text), {
+      schemaVersion: "local-contribution-diagnostics-v0.1",
+      journeyPhase: "approved_connection_needed",
+      previewState: "not_observed",
+      queueState: "retry_wait",
+      consent: { approved: true, current: true },
+      signedIn: { observed: false, value: false },
+      pairing: { observed: true, paired: false },
+      recentDiagnosticReferences: [
+        {
+          reference: "TT-ABCDEF",
+          recordedAt: "2026-08-19T13:01:00.000Z",
+        },
+        {
+          reference: "TT-7QF3K2",
+          recordedAt: "2026-08-19T13:00:00.000Z",
+        },
+      ],
+      includesTokens: false,
+      includesOauthState: false,
+      includesVerifiers: false,
+      includesDeviceIdentifiers: false,
+      includesAccountIdentifiers: false,
+      includesContent: false,
+      includesPaths: false,
+    });
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
