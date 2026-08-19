@@ -688,6 +688,10 @@ export function createLocalContributionSyncQueueStorageContext({
       qualified = isWindowsSqliteStateSession(session)
         && session.contractVersion
           === WINDOWS_SQLITE_STATE_SESSION_CONTRACT_VERSION
+        && pathModule.normalize(session.rootPath).toLowerCase()
+          === pathModule.normalize(rootPath).toLowerCase()
+        && pathModule.normalize(session.databaseName).toLowerCase()
+          === pathModule.normalize(databaseName).toLowerCase()
         && session.productionSafe === true
         && session.sqliteStateLeaseSafe === true
         && isWindowsSqliteStateDatabase(session.database)
