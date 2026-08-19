@@ -11,6 +11,8 @@
  */
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
 import {
   mkdir,
   mkdtemp,
@@ -24,6 +26,12 @@ import { dirname, join, resolve } from "node:path";
 import { once } from "node:events";
 import { createServer } from "node:net";
 import { fileURLToPath } from "node:url";
+
+import {
+  loadAuditedWindowsCredentialBinding,
+} from "../src/platform/index.js";
+
+const require = createRequire(import.meta.url);
 
 const REPOSITORY_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const DEFAULT_ARTIFACT_ROOT = resolve(
@@ -50,6 +58,8 @@ const RESULT_KEYS = Object.freeze([
   "showHideTrayLifecycle",
   "cleanQuit",
   "noOrphan",
+  "statePersistence",
+  "credentialPersistence",
   "relaunchPersistence",
 ]);
 
@@ -194,6 +204,7 @@ async function createSyntheticFixture() {
     stateRoot,
     userData,
     runtimeDirectory,
+    qualificationRunId: randomUUID(),
   });
 }
 
@@ -232,6 +243,8 @@ function safeChildEnvironment(fixture) {
     USERPROFILE: fixture.home,
     USAGE_MONITOR_ACCOUNTING_SOURCE_MODE: "unified",
     USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "windows-v1",
+    USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION: "windows-electron-v1",
+    USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID: fixture.qualificationRunId,
     USAGE_MONITOR_STATE_ROOT: fixture.stateRoot,
     USAGE_MONITOR_TEST_LANE: "windows-electron-smoke",
     XDG_CONFIG_HOME: join(fixture.home, ".config"),
@@ -278,6 +291,7 @@ async function connectCdp(target) {
   }), MAX_OPERATION_MS, "CDP connection");
   let nextId = 1;
   const pending = new Map();
+  const eventWaiters = new Map();
   const onMessage = (event) => {
     let message;
     try {
@@ -285,12 +299,31 @@ async function connectCdp(target) {
     } catch {
       return;
     }
-    if (!Number.isInteger(message.id)) return;
-    const request = pending.get(message.id);
-    if (!request) return;
-    pending.delete(message.id);
-    if (message.error) request.reject(new Error("CDP request failed"));
-    else request.resolve(message.result ?? {});
+    if (Number.isInteger(message.id)) {
+      const request = pending.get(message.id);
+      if (!request) return;
+      pending.delete(message.id);
+      if (message.error) request.reject(new Error("CDP request failed"));
+      else request.resolve(message.result ?? {});
+      return;
+    }
+    if (typeof message.method !== "string") return;
+    const waiters = eventWaiters.get(message.method);
+    if (!waiters) return;
+    for (const waiter of [...waiters]) {
+      let matched = false;
+      try {
+        matched = waiter.predicate(message.params ?? {});
+      } catch {
+        waiter.reject(new Error("CDP event predicate failed"));
+        waiters.delete(waiter);
+        continue;
+      }
+      if (!matched) continue;
+      waiters.delete(waiter);
+      waiter.resolve(message.params ?? {});
+    }
+    if (waiters.size === 0) eventWaiters.delete(message.method);
   };
   socket.addEventListener("message", onMessage);
   const request = (method, params = {}) => {
@@ -310,13 +343,47 @@ async function connectCdp(target) {
     if (response.exceptionDetails) throw new Error("renderer evaluation failed");
     return response.result?.value;
   };
+  const waitForEvent = (method, predicate = () => true) => {
+    if (typeof method !== "string" || typeof predicate !== "function") {
+      throw new TypeError("CDP event waiter is invalid");
+    }
+    let timer = null;
+    let waiter;
+    const promise = new Promise((resolveEvent, rejectEvent) => {
+      waiter = {
+        predicate,
+        resolve(value) {
+          if (timer !== null) clearTimeout(timer);
+          resolveEvent(value);
+        },
+        reject(error) {
+          if (timer !== null) clearTimeout(timer);
+          rejectEvent(error);
+        },
+      };
+      const waiters = eventWaiters.get(method) ?? new Set();
+      waiters.add(waiter);
+      eventWaiters.set(method, waiters);
+      timer = setTimeout(() => {
+        waiters.delete(waiter);
+        if (waiters.size === 0) eventWaiters.delete(method);
+        rejectEvent(new Error(`CDP ${method} event timed out`));
+      }, MAX_STARTUP_MS);
+    });
+    return promise;
+  };
   return Object.freeze({
     request,
     evaluate,
+    waitForEvent,
     close() {
       socket.close();
       for (const { reject } of pending.values()) reject(new Error("CDP closed"));
       pending.clear();
+      for (const waiters of eventWaiters.values()) {
+        for (const waiter of waiters) waiter.reject(new Error("CDP closed"));
+      }
+      eventWaiters.clear();
     },
   });
 }
@@ -429,6 +496,33 @@ async function addCurrentDescendants(rootPid, descendants) {
   return descendants;
 }
 
+/**
+ * Union descendant snapshots while a root is shutting down. A single
+ * pre-exit or post-exit snapshot can miss a helper created during teardown;
+ * polling until the root exits closes that race while remaining bounded.
+ */
+async function monitorDescendantsUntilExit(child, descendants, label) {
+  if (!child?.pid || !(descendants instanceof Set)) {
+    fail("WINDOWS_ELECTRON_SMOKE_DESCENDANT_MONITOR_INVALID");
+  }
+  const started = Date.now();
+  await addCurrentDescendants(child.pid, descendants).catch((error) => {
+    if (!childExited(child)) throw error;
+  });
+  while (!childExited(child)) {
+    if (Date.now() - started >= MAX_SHUTDOWN_MS) {
+      fail("WINDOWS_ELECTRON_SMOKE_DESCENDANT_MONITOR_TIMEOUT");
+    }
+    await wait(50);
+    try {
+      await addCurrentDescendants(child.pid, descendants);
+    } catch (error) {
+      if (!childExited(child)) throw error;
+    }
+  }
+  return descendants;
+}
+
 async function waitForDescendantsGone(rootPid, descendants, label) {
   if (!(descendants instanceof Set) || descendants.size === 0) {
     fail("WINDOWS_ELECTRON_SMOKE_DESCENDANTS_MISSING");
@@ -464,7 +558,7 @@ function spawnPackagedElectron(executable, fixture, port, cwd) {
   return child;
 }
 
-function controlReader(child) {
+function controlReader(child, observeLine = null, retainLines = true) {
   const lines = [];
   let buffer = "";
   child.stdout?.on("data", (chunk) => {
@@ -472,7 +566,9 @@ function controlReader(child) {
     while (true) {
       const end = buffer.indexOf("\n");
       if (end < 0) break;
-      lines.push(buffer.slice(0, end).replace(/\r$/u, ""));
+      const line = buffer.slice(0, end).replace(/\r$/u, "");
+      if (retainLines) lines.push(line);
+      if (typeof observeLine === "function") observeLine(line);
       buffer = buffer.slice(end + 1);
     }
   });
@@ -497,6 +593,13 @@ function parseState(line) {
   });
 }
 
+function assertPrimaryShellState(state, code) {
+  if (!state.started || !state.primary || !state.window || !state.tray) {
+    fail(code);
+  }
+  return state;
+}
+
 async function command(child, nextLine, value) {
   if (!child.stdin?.write(`${value}\n`)) fail("WINDOWS_ELECTRON_SMOKE_CONTROL_UNAVAILABLE");
   const line = await nextLine(
@@ -504,6 +607,63 @@ async function command(child, nextLine, value) {
     `control ${value}`,
   );
   return parseState(line);
+}
+
+function credentialResponsePrefix(value) {
+  const commandName = value.startsWith("credential-") && value.endsWith("-v1")
+    ? value.slice("credential-".length, -3)
+    : null;
+  if (!commandName) fail("WINDOWS_ELECTRON_SMOKE_CREDENTIAL_COMMAND_INVALID");
+  return `TIBOTATTLE_ELECTRON_SMOKE_CREDENTIAL_${commandName.toUpperCase()}`;
+}
+
+/**
+ * Send one fixed credential control command and wait for its fixed result.
+ * Credential values, service names, and native diagnostics never cross this
+ * boundary; a failed response is converted to a stable smoke error.
+ */
+async function credentialCommand(child, nextLine, value) {
+  if (!child.stdin?.write(`${value}\n`)) {
+    fail("WINDOWS_ELECTRON_SMOKE_CREDENTIAL_CONTROL_UNAVAILABLE");
+  }
+  const prefix = credentialResponsePrefix(value);
+  const line = await nextLine(
+    (candidate) => candidate === `${prefix}_PASSED`
+      || candidate === `${prefix}_FAILED`,
+    `credential ${value}`,
+  );
+  if (line !== `${prefix}_PASSED`) {
+    fail("WINDOWS_ELECTRON_SMOKE_CREDENTIAL_OPERATION_FAILED");
+  }
+  return true;
+}
+
+/**
+ * A rejected second Electron invocation must not briefly expose its own
+ * debugging endpoint before the single-instance exit. Probe its private port
+ * for the whole bounded lifetime; any successful response is a shell-start
+ * failure even if the process later exits with code zero.
+ */
+async function assertSecondInstanceNeverReady(child, port) {
+  const started = Date.now();
+  while (true) {
+    const endpoint = await withTimeout(
+      fetch(`http://127.0.0.1:${port}/json/version`),
+      MAX_OPERATION_MS,
+      "second instance debugging endpoint",
+    ).catch(() => null);
+    if (endpoint?.ok === true) {
+      fail("WINDOWS_ELECTRON_SMOKE_SECOND_INSTANCE_STARTED");
+    }
+    if (typeof endpoint?.body?.cancel === "function") {
+      await endpoint.body.cancel().catch(() => {});
+    }
+    if (childExited(child)) return;
+    if (Date.now() - started >= MAX_SHUTDOWN_MS) {
+      fail("WINDOWS_ELECTRON_SMOKE_SECOND_INSTANCE_REJECTION_TIMEOUT");
+    }
+    await wait(50);
+  }
 }
 
 async function dashboardConnection(child, port) {
@@ -541,6 +701,40 @@ async function dashboardConnection(child, port) {
   return Object.freeze({ cdp, dashboardUrl, browser: version.Browser });
 }
 
+/**
+ * Reload through the CDP Page domain and require a main-frame navigation plus
+ * a changed performance time origin before accepting dashboard readiness. The
+ * navigation event and new-document timestamp prevent the old DOM from
+ * satisfying the post-refresh render proof.
+ */
+async function reloadDashboardDocument(connection) {
+  const before = await connection.cdp.evaluate(
+    "({ timeOrigin: performance.timeOrigin, url: location.href })",
+  );
+  if (!Number.isFinite(before?.timeOrigin) || typeof before?.url !== "string") {
+    fail("WINDOWS_ELECTRON_SMOKE_REFRESH_BOUNDARY_INVALID");
+  }
+  await connection.cdp.request("Page.enable");
+  const navigation = connection.cdp.waitForEvent(
+    "Page.frameNavigated",
+    (event) => event?.frame?.parentId === undefined
+      || event?.frame?.parentId === null,
+  );
+  await connection.cdp.request("Page.reload", { ignoreCache: false });
+  await navigation;
+  await waitFor(async () => {
+    const snapshot = await connection.cdp.evaluate(`(() => ({
+      ready: document.documentElement?.dataset?.localDashboardReady === "true",
+      timeOrigin: performance.timeOrigin,
+      url: location.href,
+    }))()`);
+    return snapshot.ready
+      && Number.isFinite(snapshot.timeOrigin)
+      && snapshot.timeOrigin !== before.timeOrigin
+      && snapshot.url === before.url;
+  }, MAX_STARTUP_MS, "dashboard fresh-document render");
+}
+
 async function runSyntheticRefresh(connection) {
   const { dashboardUrl } = connection;
   const response = await fetch(new URL("/api/local/refresh", dashboardUrl), {
@@ -563,12 +757,73 @@ async function runSyntheticRefresh(connection) {
   }, MAX_REFRESH_MS, "synthetic refresh");
   // A completed refresh must still be renderable by the dashboard after the
   // data pass, not merely accepted by the mutation endpoint.
-  await connection.cdp.evaluate("location.reload()");
-  await waitFor(
-    () => connection.cdp.evaluate("document.documentElement?.dataset?.localDashboardReady === 'true'"),
-    MAX_STARTUP_MS,
-    "dashboard refresh render",
+  await reloadDashboardDocument(connection);
+}
+
+async function writePersistentQualificationState(connection) {
+  const { dashboardUrl } = connection;
+  const response = await fetch(
+    new URL("/api/local/accounting/fast-mode-preference", dashboardUrl),
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1",
+        Origin: dashboardUrl.origin,
+      },
+      body: JSON.stringify({ mode: "fast" }),
+    },
   );
+  if (!response.ok) fail("WINDOWS_ELECTRON_SMOKE_STATE_WRITE_FAILED");
+  const value = await response.json();
+  if (value?.mode !== "fast" || value?.source !== "stated") {
+    fail("WINDOWS_ELECTRON_SMOKE_STATE_WRITE_FAILED");
+  }
+}
+
+async function verifyPersistentQualificationState(connection) {
+  const value = await jsonFetch(new URL(
+    "/api/local/accounting/fast-mode-preference",
+    connection.dashboardUrl,
+  ));
+  if (value?.mode !== "fast" || value?.source !== "stated") {
+    fail("WINDOWS_ELECTRON_SMOKE_STATE_RETENTION_FAILED");
+  }
+}
+
+/**
+ * Make one bounded cleanup attempt through the packaged, unpacked keytar
+ * binding if the Electron control pipe is unavailable. The audited loader
+ * authenticates the fixed native bytes and this helper performs delete plus
+ * readback; it returns only a boolean and never exposes credential content.
+ */
+async function directCredentialCleanup(fixture, artifactRoot) {
+  try {
+    const keytarPath = join(
+      artifactRoot,
+      "resources",
+      "app.asar.unpacked",
+      "node_modules",
+      "@github",
+      "keytar",
+      "prebuilds",
+      "win32-x64",
+      "keytar.node",
+    );
+    const binding = loadAuditedWindowsCredentialBinding({
+      platform: "win32",
+      architecture: "x64",
+      resolveBinding: () => keytarPath,
+      requireBinding: (path) => require(path),
+    });
+    const service = `app-usagemonitor.windows-qualification.${fixture.qualificationRunId}`;
+    const account = "disposable-probe";
+    await binding.deletePassword(service, account);
+    const remaining = await binding.getPassword(service, account);
+    return remaining === null;
+  } catch {
+    return false;
+  }
 }
 
 async function runSmoke() {
@@ -581,26 +836,66 @@ async function runSmoke() {
   const fixture = await createSyntheticFixture();
   let primary = null;
   let second = null;
+  let relaunch = null;
   let connection = null;
+  let nextPrimaryLine = null;
+  let nextRelaunchLine = null;
+  let primaryQuitRequested = false;
+  let relaunchQuitRequested = false;
+  let credentialMayExist = false;
+  let credentialDeleted = false;
   const result = {};
+  const cleanupCredential = async ({ allowLiveControl = true } = {}) => {
+    if (!credentialMayExist || credentialDeleted) return;
+    let liveAttempted = false;
+    if (allowLiveControl) {
+      for (const [child, nextLine, quitRequested] of [
+        [relaunch, nextRelaunchLine, relaunchQuitRequested],
+        [primary, nextPrimaryLine, primaryQuitRequested],
+      ]) {
+        if (quitRequested || child === null || childExited(child)
+            || typeof nextLine !== "function") continue;
+        liveAttempted = true;
+        try {
+          await credentialCommand(child, nextLine, "credential-delete-v1");
+          credentialDeleted = true;
+          credentialMayExist = false;
+          return;
+        } catch {
+          // Terminate the process before loading the direct fallback binding.
+        }
+      }
+    }
+    // Do not load a second copy of the native binding while a live Electron
+    // operation may still be pending. Retry only after process termination.
+    if (!liveAttempted && !allowLiveControl
+        && await directCredentialCleanup(fixture, artifactRoot)) {
+      credentialDeleted = true;
+      credentialMayExist = false;
+    }
+  };
   try {
     await assertWindowsExecutable(executable);
     result.artifact = true;
     const primaryPort = await freeTcpPort();
     primary = spawnPackagedElectron(executable, fixture, primaryPort, artifactRoot);
     if (!primary.pid) fail("WINDOWS_ELECTRON_SMOKE_PRIMARY_PID_MISSING");
-    const nextPrimaryLine = controlReader(primary);
+    nextPrimaryLine = controlReader(primary);
     const initialState = await waitFor(
       () => command(primary, nextPrimaryLine, "status-v1").catch(() => null),
       MAX_STARTUP_MS,
       "primary shell status",
     );
-    if (!initialState.started || !initialState.primary || !initialState.window || !initialState.tray) {
-      fail("WINDOWS_ELECTRON_SMOKE_PRIMARY_STATE_INVALID");
-    }
+    assertPrimaryShellState(initialState, "WINDOWS_ELECTRON_SMOKE_PRIMARY_STATE_INVALID");
     connection = await dashboardConnection(primary, primaryPort);
     const primaryDescendantPids = await captureDescendantPids(primary.pid);
     result.dashboardReady = true;
+
+    // Run the random-namespace probe first, then create the deterministic
+    // credential that must survive the first process exit and relaunch.
+    await credentialCommand(primary, nextPrimaryLine, "credential-probe-v1");
+    credentialMayExist = true;
+    await credentialCommand(primary, nextPrimaryLine, "credential-create-v1");
 
     const hidden = await command(primary, nextPrimaryLine, "tray-hide-v1");
     const shown = await command(primary, nextPrimaryLine, "tray-show-v1");
@@ -614,16 +909,46 @@ async function runSmoke() {
 
     await runSyntheticRefresh(connection);
     result.syntheticRefresh = true;
+    await writePersistentQualificationState(connection);
 
     const secondPort = await freeTcpPort();
     second = spawnPackagedElectron(executable, fixture, secondPort, artifactRoot);
-    await withTimeout(childExitPromise(second), MAX_SHUTDOWN_MS, "second instance rejection");
+    const secondObservedLines = [];
+    controlReader(second, (line) => {
+      if (secondObservedLines.length < 32) secondObservedLines.push(line);
+    }, false);
+    const secondDescendantPids = new Set();
+    const secondDescendantMonitor = monitorDescendantsUntilExit(
+      second,
+      secondDescendantPids,
+      "second instance descendant monitor",
+    );
+    const secondEndpointMonitor = assertSecondInstanceNeverReady(second, secondPort);
+    let primaryDuringSecond;
+    try {
+      primaryDuringSecond = await command(primary, nextPrimaryLine, "status-v1");
+      await withTimeout(childExitPromise(second), MAX_SHUTDOWN_MS, "second instance rejection");
+    } finally {
+      await terminateProcessTree(second);
+      await secondDescendantMonitor;
+      await secondEndpointMonitor;
+    }
+    assertPrimaryShellState(
+      primaryDuringSecond,
+      "WINDOWS_ELECTRON_SMOKE_PRIMARY_LOST_DURING_SECOND_INSTANCE",
+    );
     if (second.exitCode !== 0 || second.signalCode !== null) {
       fail("WINDOWS_ELECTRON_SMOKE_SECOND_INSTANCE_NOT_REJECTED");
     }
-    const secondDescendantPids = await captureDescendantPids(
-      second.pid,
-      { requireNonEmpty: false },
+    for (const line of secondObservedLines) {
+      if (!line.startsWith("TIBOTATTLE_ELECTRON_SMOKE_STATE ")) continue;
+      const state = parseState(line);
+      if (state.primary) fail("WINDOWS_ELECTRON_SMOKE_SECOND_INSTANCE_BECAME_PRIMARY");
+    }
+    const primaryAfterSecond = await command(primary, nextPrimaryLine, "status-v1");
+    assertPrimaryShellState(
+      primaryAfterSecond,
+      "WINDOWS_ELECTRON_SMOKE_PRIMARY_LOST_AFTER_SECOND_INSTANCE",
     );
     if (secondDescendantPids.size > 0) {
       await waitForDescendantsGone(
@@ -640,12 +965,23 @@ async function runSmoke() {
     // parent is the now-terminated primary process.
     await addCurrentDescendants(primary.pid, primaryDescendantPids);
 
-    if (!primary.stdin?.write("quit-v1\n")) fail("WINDOWS_ELECTRON_SMOKE_QUIT_UNAVAILABLE");
-    await nextPrimaryLine(
-      (line) => line === "TIBOTATTLE_ELECTRON_SMOKE_QUIT_ACCEPTED",
-      "primary clean quit acknowledgement",
+    const primaryDescendantMonitor = monitorDescendantsUntilExit(
+      primary,
+      primaryDescendantPids,
+      "primary descendant monitor",
     );
-    await withTimeout(childExitPromise(primary), MAX_SHUTDOWN_MS, "primary clean quit");
+    primaryQuitRequested = true;
+    try {
+      if (!primary.stdin?.write("quit-v1\n")) fail("WINDOWS_ELECTRON_SMOKE_QUIT_UNAVAILABLE");
+      await nextPrimaryLine(
+        (line) => line === "TIBOTATTLE_ELECTRON_SMOKE_QUIT_ACCEPTED",
+        "primary clean quit acknowledgement",
+      );
+      await withTimeout(childExitPromise(primary), MAX_SHUTDOWN_MS, "primary clean quit");
+    } finally {
+      await terminateProcessTree(primary);
+      await primaryDescendantMonitor;
+    }
     connection.cdp.close();
     connection = null;
     if (primary.exitCode !== 0 || primary.signalCode !== null) {
@@ -663,9 +999,9 @@ async function runSmoke() {
     // with it. A relaunch against the same profile proves that the old process
     // released its single-instance lock and did not leave a child holding it.
     const relaunchPort = await freeTcpPort();
-    const relaunch = spawnPackagedElectron(executable, fixture, relaunchPort, artifactRoot);
+    relaunch = spawnPackagedElectron(executable, fixture, relaunchPort, artifactRoot);
     if (!relaunch.pid) fail("WINDOWS_ELECTRON_SMOKE_RELAUNCH_PID_MISSING");
-    const nextRelaunchLine = controlReader(relaunch);
+    nextRelaunchLine = controlReader(relaunch);
     try {
       const state = await waitFor(
         () => command(relaunch, nextRelaunchLine, "status-v1").catch(() => null),
@@ -677,15 +1013,33 @@ async function runSmoke() {
       }
       const relaunched = await dashboardConnection(relaunch, relaunchPort);
       const relaunchDescendantPids = await captureDescendantPids(relaunch.pid);
+      await verifyPersistentQualificationState(relaunched);
+      result.statePersistence = true;
+      await credentialCommand(relaunch, nextRelaunchLine, "credential-read-v1");
       relaunched.cdp.close();
-      if (!relaunch.stdin?.write("quit-v1\n")) {
-        fail("WINDOWS_ELECTRON_SMOKE_RELAUNCH_QUIT_UNAVAILABLE");
-      }
-      await nextRelaunchLine(
-        (line) => line === "TIBOTATTLE_ELECTRON_SMOKE_QUIT_ACCEPTED",
-        "relaunch clean quit acknowledgement",
+      await credentialCommand(relaunch, nextRelaunchLine, "credential-delete-v1");
+      credentialDeleted = true;
+      credentialMayExist = false;
+      result.credentialPersistence = true;
+      const relaunchDescendantMonitor = monitorDescendantsUntilExit(
+        relaunch,
+        relaunchDescendantPids,
+        "relaunch descendant monitor",
       );
-      await withTimeout(childExitPromise(relaunch), MAX_SHUTDOWN_MS, "relaunch clean quit");
+      relaunchQuitRequested = true;
+      try {
+        if (!relaunch.stdin?.write("quit-v1\n")) {
+          fail("WINDOWS_ELECTRON_SMOKE_RELAUNCH_QUIT_UNAVAILABLE");
+        }
+        await nextRelaunchLine(
+          (line) => line === "TIBOTATTLE_ELECTRON_SMOKE_QUIT_ACCEPTED",
+          "relaunch clean quit acknowledgement",
+        );
+        await withTimeout(childExitPromise(relaunch), MAX_SHUTDOWN_MS, "relaunch clean quit");
+      } finally {
+        await terminateProcessTree(relaunch);
+        await relaunchDescendantMonitor;
+      }
       if (relaunch.exitCode !== 0 || relaunch.signalCode !== null) {
         fail("WINDOWS_ELECTRON_SMOKE_RELAUNCH_QUIT_FAILED");
       }
@@ -700,12 +1054,16 @@ async function runSmoke() {
     } finally {
       await terminateProcessTree(relaunch);
     }
-    result.relaunchPersistence = true;
+    result.relaunchPersistence = result.statePersistence === true
+      && result.credentialPersistence === true;
     printAggregate(aggregate("passed", result));
   } finally {
+    await cleanupCredential({ allowLiveControl: true });
     connection?.cdp.close();
     await terminateProcessTree(second);
     await terminateProcessTree(primary);
+    await terminateProcessTree(relaunch);
+    await cleanupCredential({ allowLiveControl: false });
     await rm(fixture.root, { recursive: true, force: true });
   }
 }

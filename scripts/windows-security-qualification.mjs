@@ -90,6 +90,7 @@ const WINDOWS_NATIVE_CLAIM_KEYS = Object.freeze([
 const FILESYSTEM_SECURITY_TEST_FILE = /^windows-(?:filesystem|security)(?:-[a-z0-9-]+)?\.test\.(?:js|mjs)$/u;
 const CREDENTIAL_TEST_FILE = /^windows-(?:credential|production-credential)(?:-[a-z0-9-]+)?\.test\.(?:js|mjs)$/u;
 const QUALIFICATION_TEST_FILES = Object.freeze([
+  "test/windows-qualification-mode.test.js",
   "test/windows-credential-manager-probe.test.js",
   "test/windows-credential-audit-file-guard.test.js",
   "test/windows-credential-manager.test.js",
@@ -105,6 +106,14 @@ const QUALIFICATION_TEST_FILES = Object.freeze([
   "test/windows-filesystem-companion-instance-lease.test.js",
   "test/windows-filesystem-security.test.js",
   "test/windows-filesystem-prepared-artifact-native.test.js",
+  "test/windows-protected-state-store.test.js",
+  "test/windows-sqlite-state-session-contract.test.js",
+  "test/windows-fixed-state-storage.test.js",
+  "test/windows-prepared-artifact-storage.test.js",
+  "test/windows-review-pair-storage.test.js",
+  "test/windows-contribution-sync-queue-storage.test.js",
+  "test/windows-prepared-contribution.test.js",
+  "test/local-collector-state-session.test.js",
   "test/windows-security-consumer-composition.test.js",
   "test/windows-sqlite-state-session-native.test.js",
   "test/claude-callback-windows-native.test.js",
@@ -117,6 +126,9 @@ export const WINDOWS_SECURITY_QUALIFICATION_TEST_FILES = QUALIFICATION_TEST_FILE
 const QUALIFICATION_ENVIRONMENT = "USAGE_MONITOR_WINDOWS_QUALIFICATION";
 const QUALIFICATION_REVISION_ENVIRONMENT = "TIBOTATTLE_QUALIFICATION_REVISION";
 const QUALIFICATION_CACHE_MODE_ENVIRONMENT = "TIBOTATTLE_QUALIFICATION_CACHE_MODE";
+const QUALIFICATION_RUN_TIMEOUT_MS = 30 * 60 * 1_000;
+const QUALIFICATION_TERMINATION_TIMEOUT_MS = 10_000;
+const QUALIFICATION_MAXIMUM_CAPTURE_BYTES = 5_000_000;
 
 export const FIXED_STATUS = Object.freeze({
   passed: "WINDOWS_SECURITY_QUALIFICATION_PASSED",
@@ -131,6 +143,8 @@ export const FIXED_STATUS = Object.freeze({
   environmentInvalid: "WINDOWS_SECURITY_QUALIFICATION_ENVIRONMENT_INVALID",
   resultInvalid: "WINDOWS_SECURITY_QUALIFICATION_RESULT_INVALID",
   unexpectedSkip: "WINDOWS_SECURITY_QUALIFICATION_UNEXPECTED_SKIP",
+  timedOut: "WINDOWS_SECURITY_QUALIFICATION_TIMED_OUT",
+  terminationFailed: "WINDOWS_SECURITY_QUALIFICATION_TERMINATION_FAILED",
 });
 
 function fixedError(status) {
@@ -301,12 +315,68 @@ export function parseTapSummary(output) {
   return result;
 }
 
-function runNodeTests(files, {
+async function terminateChildProcessTree(child) {
+  if (!child) return false;
+  if (process.platform !== "win32" || !Number.isSafeInteger(child.pid)) {
+    if (child.exitCode !== null || child.signalCode !== null) return true;
+    return child.kill("SIGKILL");
+  }
+  // Never invoke taskkill with a numeric PID after the owned root process has
+  // exited. Windows may already have reassigned that PID; fail closed instead
+  // of risking termination of an unrelated process. A future Job Object can
+  // provide the stronger descendant identity required to recover this case.
+  if (child.exitCode !== null || child.signalCode !== null) return false;
+  const taskkillSucceeded = await new Promise((resolveTermination) => {
+    let settled = false;
+    const settle = (succeeded) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolveTermination(succeeded);
+    };
+    const killer = spawn("taskkill.exe", [
+      "/pid",
+      String(child.pid),
+      "/t",
+      "/f",
+    ], {
+      shell: false,
+      windowsHide: true,
+      stdio: "ignore",
+    });
+    const timer = setTimeout(
+      () => settle(false),
+      QUALIFICATION_TERMINATION_TIMEOUT_MS,
+    );
+    killer.once("error", () => settle(false));
+    killer.once("close", (code) => settle(code === 0));
+  });
+  if (taskkillSucceeded) return true;
+  if (child.exitCode === null && child.signalCode === null) child.kill();
+  // A failed taskkill cannot prove that descendants were removed, even when
+  // the root process has already exited or a direct fallback kill succeeds.
+  return false;
+}
+
+export function runNodeTests(files, {
   environment = process.env,
   cwd = REPOSITORY_ROOT,
+  timeoutMs = QUALIFICATION_RUN_TIMEOUT_MS,
+  maximumCaptureBytes = QUALIFICATION_MAXIMUM_CAPTURE_BYTES,
+  spawnProcess = spawn,
+  terminateProcessTree = terminateChildProcessTree,
 } = {}) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1
+      || timeoutMs > QUALIFICATION_RUN_TIMEOUT_MS
+      || !Number.isSafeInteger(maximumCaptureBytes)
+      || maximumCaptureBytes < 1
+      || maximumCaptureBytes > QUALIFICATION_MAXIMUM_CAPTURE_BYTES
+      || typeof spawnProcess !== "function"
+      || typeof terminateProcessTree !== "function") {
+    return Promise.reject(fixedError(FIXED_STATUS.environmentInvalid));
+  }
   return new Promise((resolveRun, rejectRun) => {
-    const child = spawn(process.execPath, [
+    const child = spawnProcess(process.execPath, [
       "--test",
       "--test-concurrency=1",
       "--test-reporter=tap",
@@ -327,22 +397,53 @@ function runNodeTests(files, {
     // intended to be content-free. The fixed status below is the only output
     // this harness emits.
     let stdout = "";
+    let captureStopped = false;
+    let terminationRequested = false;
+    let settled = false;
+    const settle = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      callback(value);
+    };
+    const terminateWith = async (status) => {
+      if (terminationRequested) return;
+      terminationRequested = true;
+      const terminated = await terminateProcessTree(child).catch(() => false);
+      settle(
+        rejectRun,
+        fixedError(terminated ? status : FIXED_STATUS.terminationFailed),
+      );
+    };
+    const timeout = setTimeout(() => {
+      void terminateWith(FIXED_STATUS.timedOut);
+    }, timeoutMs);
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
+      if (captureStopped) return;
       stdout += chunk;
-      if (stdout.length > 5_000_000) child.kill();
+      if (Buffer.byteLength(stdout, "utf8") > maximumCaptureBytes) {
+        captureStopped = true;
+        stdout = "";
+        child.stdout.pause();
+        void terminateWith(FIXED_STATUS.failed);
+      }
     });
     child.stderr.resume();
-    child.once("error", () => rejectRun(fixedError(FIXED_STATUS.failed)));
+    child.once("error", () => {
+      if (terminationRequested) return;
+      settle(rejectRun, fixedError(FIXED_STATUS.failed));
+    });
     child.once("close", (code) => {
+      if (terminationRequested) return;
       if (code === 0) {
         try {
-          resolveRun(parseTapSummary(stdout));
+          settle(resolveRun, parseTapSummary(stdout));
         } catch (error) {
-          rejectRun(error);
+          settle(rejectRun, error);
         }
       } else {
-        rejectRun(fixedError(FIXED_STATUS.failed));
+        settle(rejectRun, fixedError(FIXED_STATUS.failed));
       }
     });
   });
@@ -357,7 +458,14 @@ export async function runWindowsSecurityQualification(options = {}) {
   const metadata = qualificationReceiptMetadata(environment);
   const manifest = await readVerifiedBindingManifest(options);
   const startedAt = Date.now();
-  const testResult = await runNodeTests(selected.files, options);
+  // Deliberately do not forward the test-only process injection seams exposed
+  // by runNodeTests. The receipt-producing entrypoint always owns the real
+  // Node child and real process-tree terminator.
+  const testResult = await runNodeTests(selected.files, {
+    environment,
+    cwd: options.cwd ?? REPOSITORY_ROOT,
+    timeoutMs: options.timeoutMs ?? QUALIFICATION_RUN_TIMEOUT_MS,
+  });
   const durationMs = Date.now() - startedAt;
   return Object.freeze({
     status: "passed",
