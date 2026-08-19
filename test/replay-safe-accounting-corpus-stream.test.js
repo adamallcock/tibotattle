@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildReplaySafeAccountingCache } from "../src/replay-safe-accounting-cache.js";
@@ -352,16 +353,55 @@ test("retention trim keeps the newest rows across timestamp ties, identically to
   }
 });
 
-test("a corpus far larger than one derivation batch completes in ONE pass under a scaled-down whole-process RSS budget", async (t) => {
+// Runs the streamed build in a child whose V8 old space is deliberately
+// small. The cap does two jobs the parent process cannot do deterministically:
+// it forces prompt garbage collection (so the whole-process RSS budget below
+// is meaningful under any machine load, where an unconstrained heap may defer
+// major GC past any tight margin), and it turns a regression back to
+// O(corpus) residency into a hard out-of-memory crash — a 300k-row corpus
+// materialized at the measured ~635 real bytes per compact row (~190 MiB,
+// before its stamped/sorted copies) cannot fit the cap at all, while the
+// streamed working set (one <=50k-row batch slice plus thin stamps) lives
+// comfortably inside it. Same pattern as test/export-checkpoint-heap.test.js.
+const BUDGET_CHILD_OLD_SPACE_MIB = 256;
+const BUDGET_CHILD_RSS_BUDGET_MIB = 512;
+const BUDGET_CHILD = String.raw`
+const { buildReplaySafeAccountingCache } = await import(
+  process.env.CORPUS_STREAM_MODULE
+);
+const baselineRss = process.memoryUsage().rss;
+const budgetBytes = Number(process.env.CORPUS_STREAM_BUDGET_BYTES);
+let peakRss = baselineRss;
+let rssReadings = 0;
+const cache = await buildReplaySafeAccountingCache({
+  now: () => Number(process.env.CORPUS_STREAM_NOW_MS),
+  unifiedIndexFile: process.env.CORPUS_STREAM_INDEX_FILE,
+  declaredSpeedBaselines: JSON.parse(process.env.CORPUS_STREAM_BASELINES),
+  scan: async () => ({ diagnostics: {} }),
+  rss: () => {
+    rssReadings += 1;
+    const current = process.memoryUsage().rss;
+    if (current > peakRss) peakRss = current;
+    return current;
+  },
+  maximumRssBytes: baselineRss + budgetBytes,
+});
+process.stdout.write(JSON.stringify({
+  source: cache.weeklyCalibrationInput.source,
+  retainedUsageEvents: cache.weeklyCalibrationInput.retainedUsageEvents,
+  weeklyTransitions: cache.weeklyCalibration.sourceCounts.weeklyTransitions,
+  rssReadings,
+  peakGrowthMiB: Number(((peakRss - baselineRss) / 1024 / 1024).toFixed(1)),
+}) + "\n");
+`;
+
+test("a corpus far larger than one derivation batch completes in ONE pass under a scaled-down RSS budget and a capped heap", { timeout: 180_000 }, async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-corpus-stream-budget-"));
   try {
-    // 300k usage rows across six reset windows. Under the pre-streaming
-    // reader this corpus materialized ~190 MiB of compact rows (measured
-    // ~635 real bytes per row) plus its stamped/sorted copies BEFORE any
-    // derivation ran — past the budget below on retention alone — and a
-    // deferred pass would have re-run the identical materialization forever.
-    // The streamed corpus holds at most one <=50k-row batch slice instead,
-    // so its peak stays batch-bounded no matter how large the history grows.
+    // 300k usage rows across six reset windows: six times the 50k single-call
+    // usage budget, so the derivation must run several on-demand slices. The
+    // pre-streaming reader materialized this whole corpus before deriving,
+    // and a deferred pass re-ran the identical materialization forever.
     const corpus = syntheticCorpus({
       resetStarts: Array.from(
         { length: 6 },
@@ -376,55 +416,47 @@ test("a corpus far larger than one derivation batch completes in ONE pass under 
     const indexFile = join(directory, "local-unified-index-v1.sqlite");
     await writeCorpusIndex(indexFile, corpus);
 
-    // The scaled-down budget: the real process RSS at test start plus a
-    // margin far below the old design's resident corpus. The guard runs
-    // against genuine process.memoryUsage().rss readings, so a regression
-    // back to O(corpus) residency trips accounting_transition_rss_limit_
-    // exceeded and rejects this build.
-    // Margin calibration (2026-08-19, measured): the streamed build peaked at
-    // ~354 MiB growth on a 200k corpus — batch working sets and GC lag, all
-    // corpus-size-independent — while the retired resident reader would add
-    // ~190 MiB of corpus retention on top for THIS corpus. 512 MiB therefore
-    // sits with real headroom above the streamed peak and below any design
-    // that holds the corpus resident again.
-    const baselineRss = process.memoryUsage().rss;
-    const budgetBytes = Number(process.env.CORPUS_STREAM_BUDGET_MIB ?? 512)
-      * 1024 * 1024;
-    let peakRss = baselineRss;
-    let rssReadings = 0;
-    const cache = await buildReplaySafeAccountingCache({
-      now: () => NOW,
-      unifiedIndexFile: indexFile,
-      declaredSpeedBaselines: DECLARED_SPEED_BASELINES,
-      scan: async () => ({ diagnostics: {} }),
-      rss: () => {
-        rssReadings += 1;
-        const current = process.memoryUsage().rss;
-        if (current > peakRss) peakRss = current;
-        return current;
+    const child = spawnSync(process.execPath, [
+      `--max-old-space-size=${BUDGET_CHILD_OLD_SPACE_MIB}`,
+      "--input-type=module",
+      "--eval",
+      BUDGET_CHILD,
+    ], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      timeout: 150_000,
+      env: {
+        ...process.env,
+        CORPUS_STREAM_MODULE:
+          new URL("../src/replay-safe-accounting-cache.js", import.meta.url).href,
+        CORPUS_STREAM_INDEX_FILE: indexFile,
+        CORPUS_STREAM_NOW_MS: String(NOW),
+        CORPUS_STREAM_BASELINES: JSON.stringify(DECLARED_SPEED_BASELINES),
+        CORPUS_STREAM_BUDGET_BYTES:
+          String(BUDGET_CHILD_RSS_BUDGET_MIB * 1024 * 1024),
       },
-      maximumRssBytes: baselineRss + budgetBytes,
     });
-
+    assert.equal(child.error, undefined, child.error?.message);
+    assert.equal(child.signal, null, child.stderr);
+    // A build that holds the corpus resident again dies here: either the
+    // capped heap refuses the materialization outright, or the genuine
+    // process-RSS guard inside the child trips
+    // accounting_transition_rss_limit_exceeded.
+    assert.equal(child.status, 0, child.stderr);
+    const outcome = JSON.parse(child.stdout);
     t.diagnostic(
-      `peak RSS growth ${((peakRss - baselineRss) / 1024 / 1024).toFixed(1)} MiB `
-        + `of the ${(budgetBytes / 1024 / 1024).toFixed(0)} MiB budget`,
+      `peak RSS growth ${outcome.peakGrowthMiB} MiB of the `
+        + `${BUDGET_CHILD_RSS_BUDGET_MIB} MiB budget under a `
+        + `${BUDGET_CHILD_OLD_SPACE_MIB} MiB old-space cap`,
     );
-    assert.ok(
-      rssReadings > 50,
-      `the RSS guard must meter the streamed corpus (saw ${rssReadings} readings)`,
-    );
-    assert.equal(cache.weeklyCalibrationInput.source, "unified_index");
-    assert.equal(cache.weeklyCalibrationInput.retainedUsageEvents, 300_000);
+    assert.equal(outcome.source, "unified_index");
+    assert.equal(outcome.retainedUsageEvents, 300_000);
     // 999 percent changes per reset window x 6 windows: the whole series was
     // derived, none of it discarded to fit the budget.
-    assert.equal(
-      cache.weeklyCalibration.sourceCounts.weeklyTransitions,
-      5_994,
-    );
+    assert.equal(outcome.weeklyTransitions, 5_994);
     assert.ok(
-      peakRss - baselineRss <= budgetBytes,
-      `peak RSS growth ${((peakRss - baselineRss) / 1024 / 1024).toFixed(1)} MiB exceeded the scaled budget`,
+      outcome.rssReadings > 50,
+      `the RSS guard must meter the streamed corpus (saw ${outcome.rssReadings} readings)`,
     );
   } finally {
     await rm(directory, { recursive: true, force: true });
