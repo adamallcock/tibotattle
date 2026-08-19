@@ -68,12 +68,14 @@ function createFixture({
     sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
     companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
+    preparedArtifactContractVersion: "windows-prepared-artifact-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
     companionInstanceMutexSafe: false,
     credentialAuditFileGuardSafe: true,
     sqliteStateLeaseSafe: false,
+    preparedArtifactSafe: false,
     inspectPath(path) {
       calls.push(["inspectPath", path]);
       if (path !== ROOT) throw nativeError("NOT_FOUND");
@@ -150,6 +152,15 @@ function createFixture({
       if (releaseError !== null) throw releaseError;
       if (!leases.delete(lease)) throw nativeError("IDENTITY_MISMATCH");
     },
+    inspectPreparedChild: () => ({ identity: IDENTITY }),
+    ensurePreparedDirectory: () => IDENTITY,
+    enumeratePreparedDirectory: () => [],
+    removePreparedDirectory: () => ({ removed: true, identity: IDENTITY }),
+    renamePreparedDirectory: () => ({ renamed: true, identity: IDENTITY }),
+    createPreparedFile: () => IDENTITY,
+    readPreparedFile: () => ({ data: Buffer.from("data"), identity: IDENTITY }),
+    deletePreparedFile: () => ({ deleted: true, identity: IDENTITY }),
+    publishPreparedFile: () => ({ published: true, identity: IDENTITY }),
     ...bindingOverrides,
   };
   const adapter = createWindowsFilesystemAdapter({
