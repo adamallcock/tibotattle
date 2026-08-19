@@ -1009,7 +1009,16 @@ test("cache-impact UI copy has three-locale parity and collapsed evidence tables
   assert.match(html, /id="cache-switch-pagination"/u);
   assert.match(html, /id="cache-switch-page-prev"/u);
   assert.match(html, /id="cache-switch-page-next"/u);
-  assert.match(html, /Estimated lost reuse/u);
+  assert.match(html, /Est\. lost reuse/u);
+  assert.match(html, /API equivalent/u);
+  assert.equal(
+    translate("accounting.cacheSwitch.column.lostTokens", {}, "en"),
+    "Est. lost reuse",
+  );
+  assert.equal(
+    translate("accounting.cacheSwitch.column.apiEquivalent", {}, "en"),
+    "API equivalent",
+  );
 
   const expectedContinuityLabels = [
     "Possible cache-continuity overhead",
