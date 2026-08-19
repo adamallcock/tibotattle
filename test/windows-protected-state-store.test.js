@@ -79,12 +79,14 @@ function createFixture({
     sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
     companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
+    preparedArtifactContractVersion: "windows-prepared-artifact-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
     companionInstanceMutexSafe: false,
     credentialAuditFileGuardSafe: true,
     sqliteStateLeaseSafe: false,
+    preparedArtifactSafe: false,
     inspectPath(path) {
       calls.push(["inspectPath", path]);
       const entry = entries.get(path);
@@ -232,6 +234,37 @@ function createFixture({
       entry.data = Buffer.from(data);
       entry.identity = identity;
       return identity;
+    },
+    // The protected-state tests do not exercise prepared-artifact storage,
+    // but the adapter contract requires these methods to be present. Keep
+    // them as deterministic, valid-shape test doubles so contract
+    // validation does not mask the assertions under test.
+    inspectPreparedChild() {
+      return { identity: IDENTITY };
+    },
+    ensurePreparedDirectory() {
+      return IDENTITY;
+    },
+    enumeratePreparedDirectory() {
+      return [];
+    },
+    removePreparedDirectory() {
+      return { removed: true, identity: IDENTITY };
+    },
+    renamePreparedDirectory() {
+      return { renamed: true, identity: IDENTITY };
+    },
+    createPreparedFile() {
+      return IDENTITY;
+    },
+    readPreparedFile() {
+      return { data: Buffer.from("data"), identity: IDENTITY };
+    },
+    deletePreparedFile() {
+      return { deleted: true, identity: IDENTITY };
+    },
+    publishPreparedFile() {
+      return { published: true, identity: IDENTITY };
     },
     acquireCredentialMutex() {
       return { lease: {}, abandoned: false };
