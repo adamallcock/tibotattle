@@ -667,6 +667,44 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /NSOpenPanel/u);
   assert.match(source, /launcher-settings-v1\.json/u);
   assert.match(source, /settingsCodexFolderDefaultLocation/u);
+  // A rejected Codex-home selection must answer as an alert at the
+  // frontmost Settings window: the main window's failure surface sits
+  // behind it, and the companion keeps running with the previous folder.
+  const codexHomeSelectionSource = source.slice(
+    source.indexOf("private func presentCodexHomeSelectionRejection"),
+    source.indexOf("private func restartCompanionAfterCodexHomeChange"),
+  );
+  assert.match(codexHomeSelectionSource, /NSOpenPanel\(\)/u);
+  assert.match(codexHomeSelectionSource, /launcherErrorInvalidCodexHome/u);
+  assert.match(
+    codexHomeSelectionSource,
+    /let alert = NSAlert\(\)[\s\S]*?\.launcherFailureDetails[\s\S]*?launcherError\.failureCode,\s*launcherError\.recoverySuggestion/u,
+  );
+  assert.match(
+    codexHomeSelectionSource,
+    /beginSheetModal\(for: settingsWindow\)/u,
+  );
+  assert.match(codexHomeSelectionSource, /alert\.runModal\(\)/u);
+  assert.match(
+    codexHomeSelectionSource,
+    /catch \{\s*presentCodexHomeSelectionRejection\(error\)\s*\}/u,
+  );
+  assert.doesNotMatch(codexHomeSelectionSource, /showFailure/u);
+  // The Settings summary names the selected folder, tilde-abbreviated;
+  // Data & Diagnostics keeps paths_included: false and never renders it.
+  assert.match(
+    source,
+    /\.settingsCodexFolderCustomSelectedPath,\s*\(configuration\.url\.path as NSString\)\.abbreviatingWithTildeInPath/u,
+  );
+  const lifecycleDiagnosticsSource = source.slice(
+    source.indexOf("private struct LifecycleDiagnostics"),
+    source.indexOf("private func regularFile"),
+  );
+  assert.match(lifecycleDiagnosticsSource, /codexHomeMode: CodexHomeMode/u);
+  assert.doesNotMatch(
+    lifecycleDiagnosticsSource,
+    /abbreviatingWithTildeInPath|url\.path/u,
+  );
   assert.match(
     source,
     /title: TiboTattleLocalization\.format\([\s\S]*?\.settingsAboutProduct[\s\S]*?BundledProduct\.displayName/u,
@@ -5844,6 +5882,41 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       repairedSettings.stderr || repairedSettings.stdout,
     );
     assert.equal((await stat(settingsFile)).mode & 0o777, 0o600);
+
+    // The ownership predicate itself: a root-owned directory passes every
+    // other validation step (canonical path, directory, world-readable), so
+    // this refusal proves the st_uid == getuid() branch fires — the same
+    // rejection the Settings-window alert reports for a dogfood pick.
+    if (typeof process.getuid === "function" && process.getuid() !== 0) {
+      const refusedForeignOwner = spawnSync(launcher, [
+        "--codex-home-settings-smoke-test",
+        "/usr/bin",
+      ], {
+        cwd: temporaryRoot,
+        encoding: "utf8",
+        timeout: 5_000,
+        env: {
+          HOME: settingsHome,
+          LANG: "en_US.UTF-8",
+          PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+          TMPDIR: tmpdir(),
+        },
+      });
+      assert.equal(refusedForeignOwner.status, 1);
+      assert.equal(
+        refusedForeignOwner.stderr,
+        "macOS Codex home settings smoke failed\n",
+      );
+      // A refused pick leaves the previously saved custom folder untouched;
+      // the visible Settings summary re-reads exactly this file.
+      assert.deepEqual(
+        JSON.parse(await readFile(settingsFile, "utf8")),
+        {
+          codexHome: customCodexHome,
+          schemaVersion: "usage-monitor-launcher-settings-v1",
+        },
+      );
+    }
 
     const firstRunHome = join(temporaryRoot, "first-run-home");
     await mkdir(firstRunHome, { mode: 0o700 });

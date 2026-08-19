@@ -250,7 +250,7 @@ enum TiboTattleLocalization {
         case settingsCheckForUpdates = "settings.checkForUpdates"
         case settingsChooseCodexFolder = "settings.chooseCodexFolder"
         case settingsCodexFolder = "settings.codexFolder"
-        case settingsCodexFolderCustomSelected = "settings.codexFolderCustomSelected"
+        case settingsCodexFolderCustomSelectedPath = "settings.codexFolderCustomSelectedPath"
         case settingsCodexFolderDefaultLocation = "settings.codexFolderDefaultLocation"
         case settingsCodexFolderSummary = "settings.codexFolderSummary"
         case settingsGeneral = "settings.general"
@@ -508,7 +508,7 @@ enum TiboTattleLocalization {
             case .launcherRecoveryCheckAccess:
                 "Check access to your home and Application Support folders, then retry."
             case .launcherRecoveryChooseCodexHome:
-                "Choose Codex Source and select a readable Codex home, or restore the default."
+                "Choose Codex Source and select a readable Codex home owned by your macOS user account, or restore the default."
             case .launcherRecoveryDashboardDownload:
                 "Check access to your Downloads folder, then save the file again."
             case .launcherRecoveryDashboardWebView:
@@ -705,8 +705,8 @@ enum TiboTattleLocalization {
                 "Choose Codex Folder…"
             case .settingsCodexFolder:
                 "Codex folder"
-            case .settingsCodexFolderCustomSelected:
-                "Custom folder selected"
+            case .settingsCodexFolderCustomSelectedPath:
+                "Custom folder: %@"
             case .settingsCodexFolderDefaultLocation:
                 "Default location (~/.codex)"
             case .settingsCodexFolderSummary:

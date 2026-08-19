@@ -190,7 +190,7 @@
 "launcher.errorKeychainReset" = "El restablecimiento de identidad y dispositivo locales no terminó.";
 "launcher.errorKeychainResetPartial" = "El restablecimiento de identidad y dispositivo locales terminó solo parcialmente.";
 "launcher.recoveryCheckAccess" = "Comprueba el acceso a tus carpetas de inicio y Application Support, y vuelve a intentarlo.";
-"launcher.recoveryChooseCodexHome" = "Elige Origen de Codex y selecciona una carpeta de inicio de Codex legible, o restaura el valor predeterminado.";
+"launcher.recoveryChooseCodexHome" = "Elige Origen de Codex y selecciona una carpeta de inicio de Codex legible que pertenezca a tu cuenta de usuario de macOS, o restaura el valor predeterminado.";
 "launcher.recoveryDashboardDownload" = "Comprueba el acceso a tu carpeta Descargas y vuelve a guardar el archivo.";
 "launcher.recoveryDashboardWebView" = "Elige Abrir panel para intentarlo de nuevo, o Abrir en el navegador para usar el mismo panel local en tu navegador.";
 "launcher.recoveryDataErase" = "Cierra otros procesos que usen datos de %@ y vuelve a intentar el borrado.";
@@ -204,7 +204,7 @@
 "nativeDashboard.currentEvidenceTooltip" = "El estado actual de la evidencia local.";
 "menuBar.analysisRequestRejected" = "El acompañante local no pudo aceptar una solicitud de análisis.";
 "menuBar.failureRecovery" = "No está en ejecución: %@. Abre la ventana para ver el paso de recuperación.";
-"settings.codexFolderCustomSelected" = "Carpeta personalizada seleccionada";
+"settings.codexFolderCustomSelectedPath" = "Carpeta personalizada: %@";
 "settings.codexFolderDefaultLocation" = "Ubicación predeterminada (~/.codex)";
 "settings.updateDisclosureAutomaticOff" = "Las actualizaciones de la app firmada están disponibles en Acerca de → Buscar actualizaciones. Las descargas automáticas están desactivadas; puedes activarlas en Configuración → Acerca de cuando estén disponibles.";
 "settings.updateDisclosureAutomaticOn" = "Las actualizaciones de la app firmada se comprueban automáticamente. De forma predeterminada, una actualización verificada se descarga en segundo plano y se instala al salir; puedes desactivarlo en Configuración → Acerca de.";

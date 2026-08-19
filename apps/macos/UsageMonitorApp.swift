@@ -5000,9 +5000,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func codexHomeSettingsSummary() -> String {
-        codexHomeConfiguration?.mode == .custom
-            ? TiboTattleLocalization.string(.settingsCodexFolderCustomSelected)
-            : TiboTattleLocalization.string(.settingsCodexFolderDefaultLocation)
+        guard let configuration = codexHomeConfiguration,
+              configuration.mode == .custom
+        else {
+            return TiboTattleLocalization.string(
+                .settingsCodexFolderDefaultLocation
+            )
+        }
+        // The Settings label may name the folder; Data & Diagnostics keeps
+        // its paths_included: false promise and never carries this value.
+        return TiboTattleLocalization.format(
+            .settingsCodexFolderCustomSelectedPath,
+            (configuration.url.path as NSString).abbreviatingWithTildeInPath
+        )
     }
 
     private func updateSettingsCodexHomeSummary() {
@@ -6232,6 +6242,32 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         }
     }
 
+    // A rejected folder change alters nothing: the companion keeps running
+    // with the previous configuration, so the main window's failure surface
+    // would be both invisible behind the frontmost Settings window and
+    // dishonest about the lifecycle. The rejection answers as an alert where
+    // the user is looking instead.
+    private func presentCodexHomeSelectionRejection(_ error: Error) {
+        let launcherError = error as? LauncherError
+            ?? LauncherError.invalidCodexHome
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = TiboTattleLocalization.string(.settingsCodexFolder)
+        alert.informativeText = TiboTattleLocalization.format(
+            .launcherFailureDetails,
+            launcherError.errorDescription
+                ?? TiboTattleLocalization.string(.launcherErrorInvalidCodexHome),
+            launcherError.failureCode,
+            launcherError.recoverySuggestion
+        )
+        alert.addButton(withTitle: TiboTattleLocalization.string(.commonOK))
+        if let settingsWindow, settingsWindow.isVisible {
+            alert.beginSheetModal(for: settingsWindow)
+        } else {
+            alert.runModal()
+        }
+    }
+
     private func chooseCustomCodexHome() {
         let panel = NSOpenPanel()
         panel.title = TiboTattleLocalization.string(.dialogChooseCodexHomeFolder)
@@ -6259,7 +6295,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             retryAllowed = true
             restartCompanionAfterCodexHomeChange()
         } catch {
-            showFailure(error)
+            presentCodexHomeSelectionRejection(error)
         }
     }
 
@@ -6272,7 +6308,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             retryAllowed = true
             restartCompanionAfterCodexHomeChange()
         } catch {
-            showFailure(error)
+            presentCodexHomeSelectionRejection(error)
         }
     }
 
