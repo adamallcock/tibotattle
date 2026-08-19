@@ -1393,6 +1393,36 @@ function recordAppServerError(checkpoint, error) {
   return code;
 }
 
+// A failed app-server refresh leaves the in-memory checkpoint speculatively
+// mutated: the append records the dedupe key and observation stamp before its
+// atomic commit, so keeping either after a failed commit would make the next
+// pass skip a snapshot that was never stored. Recovery therefore rewinds to
+// the durable checkpoint — or, on a first-ever run, to the pristine baseline
+// captured at creation, because the durable row is only written after this
+// very refresh: a machine whose first quota read fails must still complete
+// the pass and record the provider error, not fail every refresh forever.
+// Records and checkpoint commit in one transaction, so a null durable row
+// also proves no record from this pass was stored and the baseline loses
+// nothing. Only a checkpoint that was durably present when the run started
+// and is gone now is a store fault; that stays fatal, under a stable code
+// the refresh surface can name.
+async function rewindCheckpointAfterAppRecordFailure({
+  stateFile,
+  checkpoint,
+  pristineCheckpoint,
+}) {
+  const restored = await readLocalCollectorCheckpoint({ stateFile });
+  if (!restored && pristineCheckpoint === null) {
+    const failure = new Error(
+      "Collector app-record recovery completed without a durable checkpoint",
+    );
+    failure.code = "app_record_checkpoint_unavailable";
+    throw failure;
+  }
+  for (const key of Object.keys(checkpoint)) delete checkpoint[key];
+  Object.assign(checkpoint, restored ?? structuredClone(pristineCheckpoint));
+}
+
 export async function runCollectorOnce({
   codexHome,
   stateFile = defaultCollectorStateFile(),
@@ -1475,6 +1505,12 @@ export async function runCollectorOnce({
       backfillSinceAt: requestedBackfillStart,
       nowIso,
     });
+    // The exact rewind target for a failed app-server refresh on a run that
+    // started with no durable checkpoint. Non-null only then: a run that read
+    // a durable row must find one again, or fail as a store fault.
+    const pristineCheckpoint = existing === null
+      ? structuredClone(checkpoint)
+      : null;
 
     if (skipRolloutIngestion) {
       // The unified index owns usage facts. Keep the existing bounded
@@ -1520,10 +1556,11 @@ export async function runCollectorOnce({
             }
           }
         } catch (error) {
-          const restored = await readLocalCollectorCheckpoint({ stateFile });
-          if (!restored) throw new Error("Collector app-record recovery completed without a durable checkpoint");
-          for (const key of Object.keys(checkpoint)) delete checkpoint[key];
-          Object.assign(checkpoint, restored);
+          await rewindCheckpointAfterAppRecordFailure({
+            stateFile,
+            checkpoint,
+            pristineCheckpoint,
+          });
           if (!signal?.aborted) refresh.errorCode = recordAppServerError(checkpoint, error);
         } finally {
           signal?.removeEventListener("abort", abortClient);
@@ -1734,10 +1771,11 @@ export async function runCollectorOnce({
           }
         }
       } catch (error) {
-        const restored = await readLocalCollectorCheckpoint({ stateFile });
-        if (!restored) throw new Error("Collector app-record recovery completed without a durable checkpoint");
-        for (const key of Object.keys(checkpoint)) delete checkpoint[key];
-        Object.assign(checkpoint, restored);
+        await rewindCheckpointAfterAppRecordFailure({
+          stateFile,
+          checkpoint,
+          pristineCheckpoint,
+        });
         if (!signal?.aborted) refresh.errorCode = recordAppServerError(checkpoint, error);
       } finally {
         signal?.removeEventListener("abort", abortClient);

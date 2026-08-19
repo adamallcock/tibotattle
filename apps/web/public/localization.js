@@ -1878,6 +1878,10 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Update running; reconnecting…": ["更新正在运行；正在重新连接…", "Actualización en curso; reconectando…"],
   "Continuing local analysis…": ["正在继续本地分析…", "Continuando el análisis local…"],
   "Finalizing bounded pause…": ["正在完成有界暂停…", "Finalizando la pausa limitada…"],
+  // The refresh failure code app_record_checkpoint_unavailable: the durable
+  // analysis checkpoint vanished mid-run. The sentence must exist in every
+  // supported language alongside the English copy map in app.js.
+  "The analysis checkpoint stored on this Mac disappeared while the analysis was running, so TiboTattle stopped rather than continue without it. Existing results are unchanged; run the analysis again to start over safely.": ["分析运行期间，这台 Mac 上保存的分析检查点丢失，TiboTattle 因此停止而不是在缺少它的情况下继续。现有结果保持不变；再次运行分析即可安全地重新开始。", "El punto de control del análisis guardado en este Mac desapareció mientras el análisis se ejecutaba, así que TiboTattle se detuvo en lugar de continuar sin él. Los resultados existentes no cambian; ejecuta el análisis de nuevo para empezar de forma segura desde el principio."],
   "Loading saved results…": ["正在加载已保存结果…", "Cargando resultados guardados…"],
   "Loading updated evidence…": ["正在加载更新后的证据…", "Cargando evidencia actualizada…"],
   "Preparing locally…": ["正在本地准备…", "Preparando localmente…"],
