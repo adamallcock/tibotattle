@@ -1,6 +1,10 @@
 import { ExportResourceLimitError, stableJson } from "../../export/index.js";
 import { safeCount, validSha256 } from "./source-validation.js";
 import { parseClaudeTranscriptRecord } from "./claude-transcript-record.js";
+import {
+  normalizeClaudeConfiguredPath,
+  resolveClaudeConfigRoot,
+} from "./claude-config-root.js";
 
 export function createClaudeTranscriptExportContext(configuration) {
 const {
@@ -8,6 +12,7 @@ const {
   bufferByteLength,
   bufferFrom,
   bufferIsBuffer,
+  claudeConfigDirectory,
   createHash,
   createHmac,
   currentUid,
@@ -19,6 +24,7 @@ const {
   open,
   openDirectory: opendir,
   platform,
+  userProfile,
   readBoundedUtf8LineEntries,
   realpath,
   resolvePath: resolve,
@@ -78,8 +84,46 @@ function normalizeSecret(secret) {
   return copy;
 }
 
-function defaultClaudeProjectsDirectory({ homeDirectory = defaultHomeDirectory } = {}) {
-  return resolve(homeDirectory, ".claude", "projects");
+function defaultClaudeProjectsDirectory(options = {}) {
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("Claude transcript configuration is invalid");
+  }
+  const homeDirectory = Object.hasOwn(options, "homeDirectory")
+    && options.homeDirectory === null
+    ? null
+    : options.homeDirectory ?? defaultHomeDirectory;
+  const environment = options.environment;
+  const selectedUserProfile = Object.hasOwn(options, "userProfile")
+    ? options.userProfile
+    : environment === undefined ? userProfile : undefined;
+  const configDirectory = Object.hasOwn(options, "configDirectory")
+    ? options.configDirectory
+    : environment === undefined ? claudeConfigDirectory : undefined;
+  return resolveClaudeConfigRoot({
+    platform,
+    homeDirectory,
+    userProfile: selectedUserProfile,
+    claudeConfigDirectory: configDirectory,
+    environment,
+    joinPath: join,
+    resolvePath: resolve,
+  }).projectsDirectory;
+}
+
+function normalizeConfiguredPath(path) {
+  try {
+    return normalizeClaudeConfiguredPath(path, { platform, resolvePath: resolve });
+  } catch (error) {
+    if (error?.code?.startsWith("claude_config_root_")) fail("configuration");
+    throw error;
+  }
+}
+
+function pathWithinRoot(root, path) {
+  const comparisonRoot = platform === "win32" ? root.toLowerCase() : root;
+  const comparisonPath = platform === "win32" ? path.toLowerCase() : path;
+  const prefix = `${comparisonRoot}${platform === "win32" ? "\\" : "/"}`;
+  return comparisonPath === comparisonRoot || comparisonPath.startsWith(prefix);
 }
 
 function assertSafeDirectory(stats) {
@@ -177,7 +221,7 @@ function planDigest(sources) {
 
 async function verifyRootDirectory(rootDirectory) {
   try {
-    const root = resolve(rootDirectory);
+    const root = resolve(normalizeConfiguredPath(rootDirectory));
     const stats = await lstat(root);
     assertSafeDirectory(stats);
     return await realpath(root);
@@ -617,20 +661,33 @@ async function createClaudeTranscriptExportSourcePlan({
   resourceGuard.assertCoveredInterval(bounds.startMs, bounds.endMs);
   const key = normalizeSecret(secret);
   try {
+    // Validate the configured path before any lstat/realpath or directory
+    // traversal. A relative path must never silently fall back to cwd.
+    normalizeConfiguredPath(projectsDirectory);
+    let normalizedSelectedPaths;
+    if (selectedSourcePaths !== null) {
+      try {
+        normalizedSelectedPaths = selectedSourcePaths.map(normalizeConfiguredPath);
+      } catch (error) {
+        if (error instanceof ClaudeTranscriptExportSourceError) throw error;
+        fail("configuration");
+      }
+    }
     const root = await verifyRootDirectory(projectsDirectory);
     const discoveredPaths = await discoverJsonl(root, resourceGuard);
     let paths = discoveredPaths;
     if (selectedSourcePaths !== null) {
       let selectedRealPaths;
       try {
-        selectedRealPaths = await Promise.all(selectedSourcePaths.map((path) => realpath(resolve(path))));
+        selectedRealPaths = await Promise.all(normalizedSelectedPaths.map((path) => (
+          realpath(resolve(path))
+        )));
       } catch {
         fail("source_changed");
       }
       const selectedSet = new Set(selectedRealPaths);
-      const rootPrefix = `${root}${platform === "win32" ? "\\" : "/"}`;
       if (selectedSet.size !== selectedSourcePaths.length
-          || [...selectedSet].some((path) => path !== root && !path.startsWith(rootPrefix))) {
+          || [...selectedSet].some((path) => !pathWithinRoot(root, path))) {
         fail("configuration");
       }
       paths = discoveredPaths.filter((path) => selectedSet.has(path));
@@ -751,17 +808,26 @@ async function restoreClaudeTranscriptExportSourcePlan(checkpoint, {
       || checkpoint.sources.length !== selectedSourcePaths.length) fail("plan_invalid");
   const key = normalizeSecret(secret);
   try {
+    let normalizedSelectedPaths;
+    try {
+      normalizeConfiguredPath(projectsDirectory);
+      normalizedSelectedPaths = selectedSourcePaths.map(normalizeConfiguredPath);
+    } catch (error) {
+      if (error instanceof ClaudeTranscriptExportSourceError) throw error;
+      fail("configuration");
+    }
     const root = await verifyRootDirectory(projectsDirectory);
     let paths;
     try {
-      paths = await Promise.all(selectedSourcePaths.map((path) => realpath(resolve(path))));
+      paths = await Promise.all(normalizedSelectedPaths.map((path) => (
+        realpath(resolve(path))
+      )));
     } catch {
       fail("source_changed");
     }
     const unique = new Set(paths);
-    const rootPrefix = `${root}${platform === "win32" ? "\\" : "/"}`;
     if (unique.size !== paths.length || paths.some((path) => (
-      (path !== root && !path.startsWith(rootPrefix)) || !path.endsWith(".jsonl")
+      !pathWithinRoot(root, path) || !path.endsWith(".jsonl")
     ))) fail("configuration");
     const pathBySourceKey = new Map();
     for (const path of paths) {

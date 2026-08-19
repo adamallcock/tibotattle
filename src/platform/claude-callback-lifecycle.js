@@ -117,6 +117,100 @@ function sameWindowsPath(left, right) {
   return canonicalWindowsPath(left).toLowerCase() === canonicalWindowsPath(right).toLowerCase();
 }
 
+const WINDOWS_CLAUDE_INVALID_COMPONENT = /[<>:"|?*]/u;
+const WINDOWS_CLAUDE_DEVICE_STEM = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/iu;
+
+function isReservedClaudeWindowsComponent(component) {
+  const stem = component.split(".", 1)[0].replace(/[ .]+$/gu, "");
+  return WINDOWS_CLAUDE_DEVICE_STEM.test(stem);
+}
+
+function assertClaudeWindowsComponent(component) {
+  if (component === "") return;
+  if (component === "." || component === ".."
+      || WINDOWS_CLAUDE_INVALID_COMPONENT.test(component)
+      || /[. ]$/u.test(component)
+      || isReservedClaudeWindowsComponent(component)) {
+    fail("invalid_configuration");
+  }
+}
+
+function canonicalClaudeWindowsPath(path) {
+  if (typeof path !== "string" || path.length < 4 || path.length > 4096
+      || !/^[A-Za-z]:[\\/]/u.test(path) || path.includes("\0")
+      || /[\u0001-\u001f]/u.test(path)) {
+    fail("invalid_configuration");
+  }
+  const input = path.replaceAll("/", "\\");
+  const withoutDrive = input.slice(3);
+  // Repeated separators are intentionally accepted and canonicalized by the
+  // shared Win32 normalizer; every non-empty component remains policy-checked.
+  for (const component of withoutDrive.split("\\")) assertClaudeWindowsComponent(component);
+  return canonicalWindowsPath(path, "invalid_configuration");
+}
+
+function environmentValue(environment, key) {
+  if (!environment || typeof environment !== "object" || Array.isArray(environment) || isProxy(environment)) {
+    fail("invalid_configuration");
+  }
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(environment, key);
+    if (descriptor === undefined) return undefined;
+    if (!Object.hasOwn(descriptor, "value")) fail("invalid_configuration");
+    return descriptor.value;
+  } catch (error) {
+    if (error instanceof ClaudeCallbackLifecycleError) throw error;
+    fail("invalid_configuration");
+  }
+}
+
+function resolveClaudeConfigRoot(options = {}) {
+  if (!options || typeof options !== "object" || Array.isArray(options) || isProxy(options)) {
+    fail("invalid_configuration");
+  }
+  const platform = selectedPlatform(options);
+  const environment = Object.hasOwn(options, "environment")
+    ? options.environment
+    : process.env;
+  const configuredHome = Object.hasOwn(options, "homeDirectory")
+    ? options.homeDirectory
+    : platform === "win32"
+      ? environmentValue(environment, "USERPROFILE") ?? homedir()
+      : homedir();
+  const configCandidate = Object.hasOwn(options, "claudeConfigDirectory")
+    ? options.claudeConfigDirectory
+    : environmentValue(environment, "CLAUDE_CONFIG_DIR");
+  if (platform === "win32") {
+    const home = canonicalClaudeWindowsPath(configuredHome);
+    const configDirectory = configCandidate === undefined
+      ? win32.join(home, ".claude")
+      : canonicalClaudeWindowsPath(configCandidate);
+    return Object.freeze({
+      platform,
+      homeDirectory: home,
+      configDirectory,
+      settingsFile: win32.join(configDirectory, "settings.json"),
+    });
+  }
+  if (typeof configuredHome !== "string" || !isAbsolute(configuredHome)
+      || resolve(configuredHome) !== configuredHome) {
+    fail("invalid_configuration");
+  }
+  if (configCandidate !== undefined && (typeof configCandidate !== "string"
+      || !isAbsolute(configCandidate) || resolve(configCandidate) !== configCandidate)) {
+    fail("invalid_configuration");
+  }
+  const configDirectory = configCandidate === undefined
+    ? join(configuredHome, ".claude")
+    : configCandidate;
+  return Object.freeze({
+    platform,
+    homeDirectory: configuredHome,
+    configDirectory,
+    settingsFile: join(configDirectory, "settings.json"),
+  });
+}
+
 function assertWindowsProtectedStores(options, { lifecycleDirectory, settingsFile }) {
   if (selectedPlatform(options) !== "win32") return null;
   let lifecycleStore;
@@ -782,9 +876,8 @@ export function createClaudeCallbackLifecycleContext(configuration = {}) {
     fail("invalid_configuration");
   }
 
-function defaultClaudeSettingsFile({ homeDirectory = homedir() } = {}) {
-  if (typeof homeDirectory !== "string" || !isAbsolute(homeDirectory)) fail("invalid_configuration");
-  return join(homeDirectory, ".claude", "settings.json");
+function defaultClaudeSettingsFile(options = {}) {
+  return resolveClaudeConfigRoot(options).settingsFile;
 }
 
 function defaultClaudeCallbackLifecycleDirectory(options = {}) {
@@ -1089,7 +1182,7 @@ async function inspectUnlocked({ directory, settingsFile, installedStatusLine, s
 
 async function inspectClaudeCallbackLifecycle(options = {}) {
   const {
-    settingsFile = defaultClaudeSettingsFile(),
+    settingsFile = defaultClaudeSettingsFile(options),
     lifecycleDirectory = defaultClaudeCallbackLifecycleDirectory(),
     installedStatusLine = buildManagedClaudeStatusLine(),
   } = options;
@@ -1119,7 +1212,7 @@ async function inspectClaudeCallbackLifecycle(options = {}) {
 }
 
 async function recoverClaudeCallbackLifecycle(options = {}) {
-  const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile();
+  const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile(options);
   const directory = options.lifecycleDirectory ?? defaultClaudeCallbackLifecycleDirectory();
   const installedStatusLine = options.installedStatusLine ?? buildManagedClaudeStatusLine();
   const failpoint = options.failpoint ?? (async () => {});
@@ -1134,7 +1227,7 @@ async function recoverClaudeCallbackLifecycle(options = {}) {
 }
 
 async function installClaudeCallback(options = {}) {
-  const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile();
+  const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile(options);
   const directory = options.lifecycleDirectory ?? defaultClaudeCallbackLifecycleDirectory();
   const installedStatusLine = options.installedStatusLine ?? buildManagedClaudeStatusLine();
   const failpoint = options.failpoint ?? (async () => {});
@@ -1171,7 +1264,7 @@ async function installClaudeCallback(options = {}) {
 }
 
 async function uninstallClaudeCallback(options = {}) {
-  const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile();
+  const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile(options);
   const directory = options.lifecycleDirectory ?? defaultClaudeCallbackLifecycleDirectory();
   const installedStatusLine = options.installedStatusLine ?? buildManagedClaudeStatusLine();
   const failpoint = options.failpoint ?? (async () => {});
@@ -1196,7 +1289,7 @@ async function uninstallClaudeCallback(options = {}) {
 }
 
 async function rotateManagedClaudeCallbackCapability(options = {}) {
-  const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile();
+  const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile(options);
   const directory = options.lifecycleDirectory ?? defaultClaudeCallbackLifecycleDirectory();
   const installedStatusLine = options.installedStatusLine ?? buildManagedClaudeStatusLine();
   const storage = assertWindowsLifecycleStateSupported(options, { settingsFile, lifecycleDirectory: directory });
@@ -1220,7 +1313,7 @@ async function rotateManagedClaudeCallbackCapability(options = {}) {
 }
 
 async function planManagedClaudeCallbackCapabilityRemoval(options = {}) {
-  const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile();
+  const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile(options);
   const directory = options.lifecycleDirectory ?? defaultClaudeCallbackLifecycleDirectory();
   const installedStatusLine = options.installedStatusLine ?? buildManagedClaudeStatusLine();
   const storage = assertWindowsLifecycleStateSupported(options, { settingsFile, lifecycleDirectory: directory });
@@ -1245,7 +1338,7 @@ async function planManagedClaudeCallbackCapabilityRemoval(options = {}) {
 }
 
 async function removeManagedClaudeCallbackCapability(options = {}) {
-  const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile();
+  const settingsFile = options.settingsFile ?? defaultClaudeSettingsFile(options);
   const directory = options.lifecycleDirectory ?? defaultClaudeCallbackLifecycleDirectory();
   const installedStatusLine = options.installedStatusLine ?? buildManagedClaudeStatusLine();
   const storage = assertWindowsLifecycleStateSupported(options, { settingsFile, lifecycleDirectory: directory });
@@ -1277,7 +1370,7 @@ async function readClaudeCallbackRuntimeConfiguration(options = {}) {
     installedStatusLine = buildManagedClaudeStatusLine(),
   } = options;
   const storage = assertWindowsLifecycleStateSupported(options, {
-    settingsFile: options.settingsFile ?? defaultClaudeSettingsFile(),
+    settingsFile: options.settingsFile ?? defaultClaudeSettingsFile(options),
     lifecycleDirectory,
   });
   if (storage) {

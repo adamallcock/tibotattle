@@ -60,6 +60,8 @@ const SOURCE_PORT_FUNCTION_KEYS = Object.freeze([
 const SOURCE_PORT_DATA_KEYS = Object.freeze([
   "defaultHomeDirectory",
   "platform",
+  "claudeConfigDirectory",
+  "userProfile",
   "DEFAULT_CLAUDE_STATUS_MAX_LEDGER_BYTES",
   "DEFAULT_CLAUDE_STATUS_MAX_RECORDS",
   "MAX_CLAUDE_STATUS_RECORD_BYTES",
@@ -168,7 +170,12 @@ function snapshotSourcePorts(sourcePorts, isProxy) {
   if (typeof defaultHomeDirectory !== "string" || typeof platform !== "string") invalid();
   snapshot.defaultHomeDirectory = defaultHomeDirectory;
   snapshot.platform = platform;
-  for (const key of SOURCE_PORT_DATA_KEYS.slice(2)) {
+  for (const key of ["claudeConfigDirectory", "userProfile"]) {
+    const value = descriptors[key].value;
+    if (value !== undefined && typeof value !== "string") invalid();
+    snapshot[key] = value;
+  }
+  for (const key of SOURCE_PORT_DATA_KEYS.slice(4)) {
     const value = descriptors[key].value;
     if (!Number.isSafeInteger(value) || value < 0) invalid();
     snapshot[key] = value;
