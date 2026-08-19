@@ -205,6 +205,77 @@ test("an exhausted admission budget backs off to the service's next window", asy
   );
 });
 
+test("an approval awaiting the ceremony's device pairing defers the first attempt to the pairing cure (2026-08-19)", async () => {
+  // The one-step ceremony records local consent before the pairing mints the
+  // upload credential, so a pass at the approval instant can only die at
+  // credential_missing and record the device_unavailable pause the dashboard
+  // renders as "Last error: device unavailable" (observed live on two fresh
+  // Macs). The flagged approval waits one pending minute; the pairing that
+  // follows in the same interaction resumes the schedule immediately, and a
+  // ceremony that dies before pairing still reaches the honest pause.
+  const { controller, runs, nowIso } = harness();
+  await controller.start();
+  const approvedAt = nowIso();
+  const approved = await controller.approve({ awaitingDevicePairing: true });
+  assert.equal(approved.consent.approved, true);
+  assert.equal(
+    Date.parse(approved.nextAttemptAt) - Date.parse(approvedAt),
+    60_000,
+  );
+
+  // Nothing is due at the approval instant: the doomed pre-pairing pass
+  // never runs, so nothing can be recorded.
+  await controller.runDue();
+  assert.equal(runs.length, 0);
+
+  // The pairing cure owns the first pass and pulls it to the present.
+  const resumed = await controller.resume();
+  assert.equal(resumed.nextAttemptAt, nowIso());
+  await controller.runDue();
+  assert.equal(runs.length, 1);
+  const status = await controller.inspect();
+  assert.equal(status.lastOutcome.code, "synced");
+});
+
+test("the pairing cure clears the pause's own record along with the pause (2026-08-19)", async () => {
+  // resume() cures the condition a paused lastOutcome describes, so keeping
+  // that record would render "Last error: device unavailable" beside the
+  // healing first pass. Only pause records are cleared; failed and partial
+  // outcomes are real pass history and survive resume (covered by the
+  // mid-backoff re-pair test above).
+  const { controller } = harness({
+    outcomes: [
+      runOutcome({
+        status: "failed",
+        daysSynced: 0,
+        daysPending: 2,
+        chunksUploaded: 0,
+        failure: {
+          code: "device_unavailable",
+          retryable: false,
+          deviceUnavailable: true,
+          retryAfterMilliseconds: null,
+        },
+      }),
+      runOutcome(),
+    ],
+  });
+  await controller.start();
+  await controller.approve();
+  const paused = await controller.runDue();
+  assert.equal(paused.paused, true);
+  assert.equal(paused.lastOutcome.code, "device_unavailable");
+  assert.equal(paused.lastOutcome.status, "paused");
+
+  const resumed = await controller.resume();
+  assert.equal(resumed.paused, false);
+  assert.equal(resumed.lastOutcome, null);
+
+  await controller.runDue();
+  const healed = await controller.inspect();
+  assert.equal(healed.lastOutcome.code, "synced");
+});
+
 test("device_unavailable auto-pauses exactly like the v0.1 queue, until resumed", async () => {
   const { controller, runs, advance } = harness({
     outcomes: [runOutcome({
@@ -362,6 +433,8 @@ test("re-pairing mid retry-backoff pulls the next attempt to the present (2026-0
   // and the retry ladder starts over for the fresh authority.
   const resumed = await controller.resume();
   assert.equal(resumed.nextAttemptAt, nowIso());
+  // A failed outcome is real pass history: resume clears only pause records.
+  assert.equal(resumed.lastOutcome.code, "service_unavailable");
   await controller.runDue();
   assert.equal(runs.length, 2);
 });

@@ -531,8 +531,19 @@ class IncrementalContributionSyncController {
    * the moment of approval and starts the schedule immediately: after this,
    * sync passes run on cadence without any further user action, and only
    * identifier drift or a destination change re-prompts.
+   *
+   * `awaitingDevicePairing` carries the one-step ceremony's ordering fact:
+   * local consent lands BEFORE the hosted pairing mints this Mac's upload
+   * credential, so an attempt scheduled at the approval instant can only die
+   * at credential_missing and record the device_unavailable pause mid-ceremony
+   * (observed live 2026-08-19 on two fresh Macs). With the flag, the first
+   * attempt waits one pending minute: the pairing that follows in the same
+   * interaction resumes the schedule immediately (the device-pair cure), and
+   * a ceremony that dies before pairing still reaches the honest
+   * device_unavailable pause one minute later, so the repair path that keys
+   * on that pause never becomes unreachable.
    */
-  async approve() {
+  async approve({ awaitingDevicePairing = false } = {}) {
     if (!this.#initialized) await this.initialize();
     return this.#serialize(async () => {
       if (this.#destinationOrigin === null) fail("not_configured");
@@ -547,7 +558,13 @@ class IncrementalContributionSyncController {
       this.#settings.paused = false;
       this.#settings.pausedReason = null;
       this.#settings.retryCount = 0;
-      this.#settings.nextAttemptAt = this.#nowIso();
+      this.#settings.nextAttemptAt = awaitingDevicePairing === true
+        ? new Date(
+          Date.parse(this.#nowIso())
+            + PENDING_RETRY_MILLISECONDS
+            + this.#dither(MAXIMUM_PENDING_DITHER_MILLISECONDS),
+        ).toISOString()
+        : this.#nowIso();
       await this.#persist();
       this.#schedule();
       return this.#project();
@@ -582,6 +599,16 @@ class IncrementalContributionSyncController {
       }
       this.#settings.paused = false;
       this.#settings.pausedReason = null;
+      // The cure erases the pause's own record along with the pause. A
+      // lastOutcome with status "paused" is written only by the auto-pause
+      // settle, and once re-pairing removes the condition it described, the
+      // healed schedule must not keep rendering it as "Last error: …" beside
+      // the first cured pass (observed live 2026-08-19: the self-heal window
+      // showed "device unavailable" on two fresh Macs). Failed, partial and
+      // succeeded outcomes are real pass history and survive resume.
+      if (this.#settings.lastOutcome?.status === "paused") {
+        this.#settings.lastOutcome = null;
+      }
       this.#settings.retryCount = 0;
       this.#settings.nextAttemptAt = this.#nowIso();
       await this.#persist();
