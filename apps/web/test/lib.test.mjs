@@ -3142,9 +3142,9 @@ return {
       value.payload.coveredAt.startAt,
       value.payload.coveredAt.endAt,
       value.payloadBytes,
-      value.payload.recordCounts.usageEvents
-        + value.payload.recordCounts.quotaSnapshots
-        + value.payload.recordCounts.activityMarkers,
+      value.payload.usageEvents.length
+        + value.payload.quotaSnapshots.length
+        + value.payload.activityMarkers.length,
     ].join("|"),
   );
 
@@ -3166,11 +3166,11 @@ return {
           startAt: "2026-08-03T00:00:00.000Z",
           endAt: "2026-08-03T01:00:00.000Z",
         },
-        recordCounts: {
-          usageEvents: 1,
-          quotaSnapshots: 0,
-          activityMarkers: 0,
-        },
+        // The real document shape: record ARRAYS, never a recordCounts
+        // object (that summary exists only on the queue item).
+        usageEvents: [{}],
+        quotaSnapshots: [],
+        activityMarkers: [],
       },
     });
     assert.deepEqual(scope.review(), {

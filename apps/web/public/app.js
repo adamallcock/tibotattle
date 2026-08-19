@@ -8636,15 +8636,24 @@ function clearContributionSyncExactReview() {
 
 function exactReviewSummaryIdentity(value) {
   const payload = value?.payload;
-  const counts = payload?.recordCounts;
-  const total = counts?.usageEvents + counts?.quotaSnapshots
-    + counts?.activityMarkers;
+  // The telemetry-contribution-v0.1 document carries its records as ARRAYS
+  // (usageEvents, quotaSnapshots, activityMarkers); only the queue item
+  // summarizes them as a recordCounts object. Counting the arrays compares
+  // like with like against the preview card. Reading a payload-shaped
+  // recordCounts object here made this identity null on every real payload,
+  // so every first-time approval failed review_expired_or_changed (found by
+  // the first live first-time ceremony, 2026-08-19).
   if (typeof payload?.coveredAt?.startAt !== "string"
       || typeof payload?.coveredAt?.endAt !== "string"
-      || !Number.isSafeInteger(total)
+      || !Array.isArray(payload?.usageEvents)
+      || !Array.isArray(payload?.quotaSnapshots)
+      || !Array.isArray(payload?.activityMarkers)
       || !Number.isSafeInteger(value?.payloadBytes)) {
     return null;
   }
+  const total = payload.usageEvents.length
+    + payload.quotaSnapshots.length
+    + payload.activityMarkers.length;
   return [
     payload.coveredAt.startAt,
     payload.coveredAt.endAt,
