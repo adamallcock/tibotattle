@@ -1,5 +1,5 @@
 import { availableParallelism } from "node:os";
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, resolve, win32 } from "node:path";
 import { Worker } from "node:worker_threads";
 
 import {
@@ -524,11 +524,10 @@ export async function rebuildLocalUnifiedIndex({
   discoveryLimits = null,
   windowsProtectedStateStore = null,
   windowsSqliteStateSession = null,
+  windowsSqliteStateSessionFactory = null,
+  windowsSqliteStateStaging = null,
 } = {}) {
-  // Rebuild requires a native handle-bound stage and publication primitive on
-  // Windows. That primitive is not implemented yet; fail before discovery,
-  // secret access, temp naming, or any Node filesystem mutation.
-  assertWindowsUnifiedIndexStagingUnavailable();
+  assertWindowsUnifiedIndexStagingUnavailable({ windowsSqliteStateStaging });
   if (typeof codexHome !== "string" || codexHome.length < 1) {
     throw new TypeError("codexHome must be a non-empty string");
   }
@@ -544,9 +543,24 @@ export async function rebuildLocalUnifiedIndex({
   }
   const startedAt = performance.now();
   const resolvedIndexFile = resolve(indexFile);
-  await assertSafeLocalUnifiedIndexTarget(resolvedIndexFile, {
-    allowMissing: true,
-  });
+  let expectedTargetIdentity = null;
+  if (process.platform === "win32") {
+    // The native staging object owns the root-relative inspection on Windows.
+    // Do not fall back to assertSafeLocalUnifiedIndexTarget here: callers
+    // normally provide a staging context and session factory, not a pre-opened
+    // live target session.
+    const targetName = win32.basename(resolvedIndexFile.replaceAll("/", "\\"));
+    try {
+      expectedTargetIdentity = windowsSqliteStateStaging.inspect(targetName);
+    } catch (error) {
+      if (error?.code !== "windows_sqlite_state_staging_database_missing") throw error;
+    }
+  } else {
+    await assertSafeLocalUnifiedIndexTarget(resolvedIndexFile, {
+      allowMissing: true,
+      windowsSqliteStateSession,
+    });
+  }
   const deviceSalt = await readOrCreateDeviceSalt(
     secretFile ?? defaultLocalUnifiedIndexSecretPath(resolvedIndexFile),
     { windowsProtectedStateStore },
@@ -562,17 +576,38 @@ export async function rebuildLocalUnifiedIndex({
   const sourceBytes = infos.reduce((total, info) => total + Number(info.size ?? 0), 0);
 
   const stageFile = `${resolvedIndexFile}.building-${process.pid}-${Date.now().toString(36)}`;
-  await removeIfPresent(stageFile);
+  await removeIfPresent(stageFile, { windowsSqliteStateStaging });
   let database = null;
   let generation = null;
   let writer = null;
   let sink = null;
+  let stageSession = null;
   try {
+    if (process.platform === "win32") {
+      const stageName = win32.basename(stageFile.replaceAll("/", "\\"));
+      const targetName = win32.basename(resolvedIndexFile.replaceAll("/", "\\"));
+      try {
+        expectedTargetIdentity = windowsSqliteStateStaging.inspect(targetName);
+      } catch (error) {
+        if (error?.code !== "windows_sqlite_state_staging_database_missing") throw error;
+      }
+      windowsSqliteStateStaging.create(stageName);
+      if (typeof windowsSqliteStateSessionFactory !== "function") {
+        throw fixedError("local_unified_index_windows_state_unqualified");
+      }
+      stageSession = windowsSqliteStateSessionFactory({
+        rootPath: win32.dirname(stageFile.replaceAll("/", "\\")),
+        databaseName: stageName,
+        readOnly: false,
+        create: true,
+      });
+    }
     database = openLocalUnifiedIndex(stageFile, {
       readOnly: false,
       create: true,
       staging: true,
       deferSecondaryIndexes,
+      windowsSqliteStateSession: stageSession,
     });
     recoverUnifiedIndexGenerations(database);
     generation = beginUnifiedIndexGeneration(database, {
@@ -611,7 +646,7 @@ export async function rebuildLocalUnifiedIndex({
     } catch {
       // Preserve the setup failure; the incomplete stage is discarded below.
     }
-    await removeIfPresent(stageFile);
+    await removeIfPresent(stageFile, { windowsSqliteStateStaging });
     throw error;
   }
   const diagnostics = {
@@ -892,7 +927,10 @@ export async function rebuildLocalUnifiedIndex({
       generation.generationId,
     );
     const closed = await writer.close({ integrityCheck: true, fsyncPath: null });
-    await publishStagedUnifiedIndex(stageFile, resolvedIndexFile);
+    await publishStagedUnifiedIndex(stageFile, resolvedIndexFile, {
+      windowsSqliteStateStaging,
+      expectedTargetIdentity,
+    });
     return {
       status: "built",
       indexFile: resolvedIndexFile,
@@ -921,7 +959,7 @@ export async function rebuildLocalUnifiedIndex({
     } catch {
       // The connection may already be closed by the writer.
     }
-    await removeIfPresent(stageFile);
+    await removeIfPresent(stageFile, { windowsSqliteStateStaging });
     throw error;
   }
 }

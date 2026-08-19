@@ -53,6 +53,13 @@ export {
   isWindowsSqliteStateSession,
 } from "./windows-sqlite-state-session.js";
 export {
+  WINDOWS_SQLITE_STATE_STAGING_CONTRACT_VERSION,
+  WINDOWS_SQLITE_STATE_STAGING_SAFE,
+  WindowsSqliteStateStagingError,
+  createWindowsSqliteStateStaging,
+  isWindowsSqliteStateStaging,
+} from "./windows-sqlite-state-staging.js";
+export {
   LOCAL_COLLECTOR_STATE_SESSION_BOUNDARY_CONTRACT_VERSION,
   currentLocalCollectorStateSessionBoundary,
   isLocalCollectorStateWindowsBoundaryActive,

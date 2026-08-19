@@ -220,6 +220,9 @@ Failure SqliteStateLeaseForeign() { return {"SQLITE_STATE_LEASE_FOREIGN"}; }
 Failure SqliteStateLeaseReleaseFailed() {
   return {"SQLITE_STATE_LEASE_RELEASE_FAILED"};
 }
+Failure SqliteStateStagingUnavailable() {
+  return {"SQLITE_STATE_STAGING_UNAVAILABLE"};
+}
 #if defined(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK)
 Failure QualificationPauseAlreadyArmed() {
   return {"QUALIFICATION_PAUSE_ALREADY_ARMED"};
@@ -1269,6 +1272,48 @@ bool ParseSqliteDatabaseName(
   return true;
 }
 
+// A staged unified index is only safe when SQLite is in its rollback-journal
+// mode.  The qualified session reserves -wal and -shm for its entire
+// lifetime; this second, root-handle-bound check prevents a caller from
+// cloning or publishing through an unexpected sidecar that appeared after
+// that session was closed.
+bool RequireSqliteSidecarsAbsent(
+    HANDLE protectedRoot,
+    const std::wstring& databaseName,
+    Failure* failure) {
+  for (const wchar_t* suffix : {L"-wal", L"-shm"}) {
+    HANDLE sidecar = INVALID_HANDLE_VALUE;
+    ULONG_PTR information = 0;
+    const std::wstring sidecarName = databaseName + suffix;
+    if (OpenRelativeComponent(
+            protectedRoot,
+            sidecarName,
+            FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            kFileOpen,
+            kFileNonDirectory,
+            nullptr,
+            &sidecar,
+            &information,
+            failure)) {
+      CloseHandle(sidecar);
+      *failure = SqliteStateLeaseSidecarPresent();
+      return false;
+    }
+    if (failure->code != NotFound().code) return false;
+  }
+  return true;
+}
+
+bool ValidateSqliteStagingHandle(
+    HANDLE handle,
+    const ParsedPath& fullPath,
+    HandleIdentity* identity,
+    Failure* failure) {
+  return ValidateSecurity(handle, false, failure, identity)
+      && ResolveFinalPath(handle, &fullPath);
+}
+
 bool OpenSqliteChild(
     HANDLE protectedRoot,
     const ParsedPath& parsedRoot,
@@ -1646,12 +1691,13 @@ bool GetArguments(
     napi_callback_info info,
     std::vector<napi_value>* arguments,
     std::size_t expected) {
-  // Protected-child replacement is the widest callback surface (root path,
-  // expected root identity, child name, expected child identity, bytes).
+  // SQLite publication is the widest callback surface (root path, expected
+  // root identity, stage name, expected stage identity, target name, and
+  // optional expected target identity).
   // Keep the exact-count check below: this is capacity, not permission to
   // accept arbitrary trailing arguments.
-  napi_value values[5] = {};
-  std::size_t count = 5;
+  napi_value values[6] = {};
+  std::size_t count = 6;
   if (napi_get_cb_info(env, info, &count, values, nullptr, nullptr) != napi_ok
       || count != expected) {
     return false;
@@ -1780,6 +1826,63 @@ bool WriteAndFlushHandle(
     offset += written;
   }
   if (!FlushFileBuffers(handle)) {
+    *failure = FromLastError();
+    return false;
+  }
+  return true;
+}
+
+// Copy a SQLite database while both handles are already bound to the same
+// protected root.  The operation deliberately streams fixed-size chunks: a
+// unified index is not subject to the small bounded-read ceiling used by the
+// JSON/credential adapter, and a hostile or unexpectedly large database must
+// never force one allocation proportional to its size.
+bool CopyHandleToHandle(
+    HANDLE source,
+    HANDLE destination,
+    Failure* failure) {
+  LARGE_INTEGER sourceSize{};
+  if (!GetFileSizeEx(source, &sourceSize) || sourceSize.QuadPart < 0) {
+    *failure = OperationFailed();
+    return false;
+  }
+  LARGE_INTEGER beginning{};
+  if (SetFilePointerEx(source, beginning, nullptr, FILE_BEGIN) == FALSE
+      || SetFilePointerEx(destination, beginning, nullptr, FILE_BEGIN) == FALSE) {
+    *failure = FromLastError();
+    return false;
+  }
+  std::array<std::uint8_t, 1 << 20> buffer{};
+  LONGLONG remaining = sourceSize.QuadPart;
+  while (remaining > 0) {
+    const DWORD requested = static_cast<DWORD>(std::min<LONGLONG>(
+        remaining,
+        static_cast<LONGLONG>(buffer.size())));
+    DWORD read = 0;
+    if (!ReadFile(source, buffer.data(), requested, &read, nullptr)
+        || read == 0
+        || read > requested) {
+      *failure = FromLastError();
+      return false;
+    }
+    DWORD written = 0;
+    if (!WriteFile(destination, buffer.data(), read, &written, nullptr)
+        || written != read) {
+      *failure = FromLastError();
+      return false;
+    }
+    remaining -= static_cast<LONGLONG>(read);
+  }
+  LARGE_INTEGER finalSourceSize{};
+  LARGE_INTEGER finalDestinationSize{};
+  if (!GetFileSizeEx(source, &finalSourceSize)
+      || !GetFileSizeEx(destination, &finalDestinationSize)
+      || finalSourceSize.QuadPart != sourceSize.QuadPart
+      || finalDestinationSize.QuadPart != sourceSize.QuadPart) {
+    *failure = FileSizeChanged();
+    return false;
+  }
+  if (!FlushFileBuffers(destination)) {
     *failure = FromLastError();
     return false;
   }
@@ -2435,6 +2538,12 @@ napi_value ReplaceProtectedChildCallback(napi_env env, napi_callback_info info) 
   targetOptions.finalDirectoryKnown = true;
   targetOptions.finalDirectory = false;
   targetOptions.access = DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  // Do not grant FILE_SHARE_DELETE here.  FILE_RENAME_INFORMATION_EX with
+  // FILE_RENAME_POSIX_SEMANTICS is specifically defined to replace a target
+  // even while existing handles are open; omitting delete sharing keeps an
+  // ordinary same-user delete/rename from slipping between the identity check
+  // and this handle-bound publication.  The held target handle remains valid
+  // as the old object after replacement.
   targetOptions.shareMode = FILE_SHARE_READ;
   targetOptions.disposition = kFileOpen;
   targetOptions.protectAllAncestors = true;
@@ -2552,6 +2661,331 @@ napi_value ReplaceProtectedChildCallback(napi_env env, napi_callback_info info) 
   CloseHandle(replacement);
   if (!success) return ThrowFailure(env, failure);
   return IdentityValue(env, replacementIdentity);
+}
+
+bool ParseSqliteStagingNames(
+    napi_env env,
+    const std::vector<napi_value>& arguments,
+    std::wstring* rootPath,
+    HandleIdentity* expectedRoot,
+    std::wstring* stageName,
+    HandleIdentity* expectedStage,
+    std::wstring* targetName,
+    bool* targetExpectedPresent,
+    HandleIdentity* expectedTarget,
+    Failure* failure) {
+  if (!GetString(env, arguments[0], rootPath)
+      || !ParseExpectedIdentity(env, arguments[1], expectedRoot)
+      || !GetString(env, arguments[2], stageName)
+      || !ParseExpectedIdentity(env, arguments[3], expectedStage)
+      || !GetString(env, arguments[4], targetName)) {
+    *failure = InvalidConfiguration();
+    return false;
+  }
+  std::wstring normalizedStage;
+  std::wstring normalizedTarget;
+  if (!ParseSqliteDatabaseName(*stageName, &normalizedStage, failure)
+      || !ParseSqliteDatabaseName(*targetName, &normalizedTarget, failure)) {
+    return false;
+  }
+  if (EqualInsensitive(normalizedStage, normalizedTarget.c_str())) {
+    *failure = InvalidPath();
+    return false;
+  }
+  *stageName = std::move(normalizedStage);
+  *targetName = std::move(normalizedTarget);
+
+  napi_valuetype targetType = napi_undefined;
+  if (napi_typeof(env, arguments[5], &targetType) != napi_ok) {
+    *failure = InvalidConfiguration();
+    return false;
+  }
+  if (targetType == napi_null || targetType == napi_undefined) {
+    *targetExpectedPresent = false;
+    return true;
+  }
+  if (!ParseExpectedIdentity(env, arguments[5], expectedTarget)) {
+    *failure = InvalidConfiguration();
+    return false;
+  }
+  *targetExpectedPresent = true;
+  return true;
+}
+
+bool OpenSqliteStagingChild(
+    const std::wstring& rootPath,
+    const HandleIdentity& expectedRoot,
+    const std::wstring& childName,
+    bool createNew,
+    RelativeHandles* opened,
+    ParsedPath* fullPath,
+    HandleIdentity* identity,
+    Failure* failure) {
+  OpenRelativeOptions options;
+  options.finalDirectoryKnown = true;
+  options.finalDirectory = false;
+  options.access = createNew
+      ? GENERIC_READ | GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC
+          | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+      : GENERIC_READ | DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  // Hold the file against ordinary writes and deletes until the operation is
+  // complete.  Ancestors remain held by OpenProtectedRootAndChild as well.
+  options.shareMode = FILE_SHARE_READ;
+  options.disposition = createNew ? kFileCreate : kFileOpen;
+  options.ownerOnlyOnCreate = createNew;
+  options.protectAllAncestors = true;
+  std::vector<BYTE> ownerSid;
+  PACL acl = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  SECURITY_ATTRIBUTES attributes{};
+  if (createNew) {
+    if (!BuildOwnerOnlySecurity(&ownerSid, &acl, &descriptor, &attributes)) {
+      *failure = OperationFailed();
+      return false;
+    }
+    options.securityDescriptor = attributes.lpSecurityDescriptor;
+  }
+  bool finalMissing = false;
+  const bool openedOk = OpenProtectedRootAndChild(
+      rootPath,
+      expectedRoot,
+      childName,
+      options,
+      opened,
+      &finalMissing,
+      fullPath,
+      failure);
+  FreeOwnerOnlySecurity(acl, descriptor);
+  if (!openedOk || finalMissing || opened->final == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  const auto rejectCreated = [&]() {
+    if (createNew && opened->final != INVALID_HANDLE_VALUE) {
+      if (!MarkHandleForDeletion(opened->final)) *failure = OperationFailed();
+    }
+  };
+  if (createNew && !SetOwnerOnlyDacl(opened->final)) {
+    *failure = SecurityPolicy("dacl_update_failed");
+    rejectCreated();
+    return false;
+  }
+  if (!ValidateSqliteStagingHandle(opened->final, *fullPath, identity, failure)) {
+    rejectCreated();
+    return false;
+  }
+  return true;
+}
+
+napi_value CreateSqliteDatabaseCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 3)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring rootPath;
+  std::wstring databaseName;
+  HandleIdentity expectedRoot;
+  Failure failure = OperationFailed();
+  if (!GetString(env, arguments[0], &rootPath)
+      || !ParseExpectedIdentity(env, arguments[1], &expectedRoot)
+      || !GetString(env, arguments[2], &databaseName)
+      || !ParseSqliteDatabaseName(databaseName, &databaseName, &failure)) {
+    return ThrowFailure(env, failure.code == OperationFailed().code
+        ? InvalidConfiguration()
+        : failure);
+  }
+  RelativeHandles opened;
+  ParsedPath fullPath;
+  HandleIdentity identity;
+  if (!OpenSqliteStagingChild(
+          rootPath,
+          expectedRoot,
+          databaseName,
+          true,
+          &opened,
+          &fullPath,
+          &identity,
+          &failure)
+      || !RequireSqliteSidecarsAbsent(opened.parents.front(), databaseName, &failure)
+      || !FlushFileBuffers(opened.final)) {
+    if (failure.code == OperationFailed().code && GetLastError() != ERROR_SUCCESS) {
+      failure = FromLastError();
+    }
+    if (opened.final != INVALID_HANDLE_VALUE) MarkHandleForDeletion(opened.final);
+    return ThrowFailure(env, failure);
+  }
+  return IdentityValue(env, identity);
+}
+
+napi_value CloneSqliteDatabaseCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 4)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring rootPath;
+  std::wstring sourceName;
+  std::wstring stageName;
+  HandleIdentity expectedRoot;
+  Failure failure = OperationFailed();
+  if (!GetString(env, arguments[0], &rootPath)
+      || !ParseExpectedIdentity(env, arguments[1], &expectedRoot)
+      || !GetString(env, arguments[2], &sourceName)
+      || !GetString(env, arguments[3], &stageName)
+      || !ParseSqliteDatabaseName(sourceName, &sourceName, &failure)
+      || !ParseSqliteDatabaseName(stageName, &stageName, &failure)
+      || EqualInsensitive(sourceName, stageName.c_str())) {
+    if (failure.code == OperationFailed().code) failure = InvalidConfiguration();
+    if (failure.code == InvalidConfiguration().code) return ThrowFailure(env, failure);
+    return ThrowFailure(env, failure);
+  }
+  RelativeHandles source;
+  ParsedPath sourcePath;
+  HandleIdentity sourceIdentity;
+  if (!OpenSqliteStagingChild(
+          rootPath,
+          expectedRoot,
+          sourceName,
+          false,
+          &source,
+          &sourcePath,
+          &sourceIdentity,
+          &failure)
+      || !RequireSqliteSidecarsAbsent(source.parents.front(), sourceName, &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  RelativeHandles stage;
+  ParsedPath stagePath;
+  HandleIdentity stageIdentity;
+  if (!OpenSqliteStagingChild(
+          rootPath,
+          expectedRoot,
+          stageName,
+          true,
+          &stage,
+          &stagePath,
+          &stageIdentity,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  if (!CopyHandleToHandle(source.final, stage.final, &failure)
+      || !RequireSqliteSidecarsAbsent(stage.parents.front(), stageName, &failure)
+      || !ValidateSqliteStagingHandle(stage.final, stagePath, &stageIdentity, &failure)) {
+    if (stage.final != INVALID_HANDLE_VALUE) MarkHandleForDeletion(stage.final);
+    return ThrowFailure(env, failure);
+  }
+  napi_value result;
+  napi_create_object(env, &result);
+  napi_set_named_property(env, result, "sourceIdentity", IdentityValue(env, sourceIdentity));
+  napi_set_named_property(env, result, "stageIdentity", IdentityValue(env, stageIdentity));
+  return result;
+}
+
+napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 6)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring rootPath;
+  std::wstring stageName;
+  std::wstring targetName;
+  HandleIdentity expectedRoot;
+  HandleIdentity expectedStage;
+  HandleIdentity expectedTarget;
+  bool targetExpectedPresent = false;
+  Failure failure = OperationFailed();
+  if (!ParseSqliteStagingNames(
+          env,
+          arguments,
+          &rootPath,
+          &expectedRoot,
+          &stageName,
+          &expectedStage,
+          &targetName,
+          &targetExpectedPresent,
+          &expectedTarget,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+
+  RelativeHandles stage;
+  ParsedPath stagePath;
+  HandleIdentity stageIdentity;
+  if (!OpenSqliteStagingChild(
+          rootPath,
+          expectedRoot,
+          stageName,
+          false,
+          &stage,
+          &stagePath,
+          &stageIdentity,
+          &failure)
+      || !EqualIdentity(stageIdentity, expectedStage)
+      || !RequireSqliteSidecarsAbsent(stage.parents.front(), stageName, &failure)
+      || !FlushFileBuffers(stage.final)) {
+    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    return ThrowFailure(env, failure);
+  }
+
+  OpenRelativeOptions targetOptions;
+  targetOptions.finalDirectoryKnown = true;
+  targetOptions.finalDirectory = false;
+  targetOptions.access = DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  // Do not grant FILE_SHARE_DELETE here.  FILE_RENAME_INFORMATION_EX with
+  // FILE_RENAME_POSIX_SEMANTICS is specifically defined to replace a target
+  // even while existing handles are open; omitting delete sharing keeps an
+  // ordinary same-user delete/rename from slipping between the identity check
+  // and this handle-bound publication.  The held target handle remains valid
+  // as the old object after replacement.
+  targetOptions.shareMode = FILE_SHARE_READ;
+  targetOptions.protectedAncestorDepth = 1;
+  targetOptions.disposition = kFileOpen;
+  RelativeHandles target;
+  bool targetMissing = false;
+  ParsedPath targetPath;
+  if (!OpenProtectedRootAndChild(
+          rootPath,
+          expectedRoot,
+          targetName,
+          targetOptions,
+          &target,
+          &targetMissing,
+          &targetPath,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  if (targetMissing || target.final == INVALID_HANDLE_VALUE) {
+    if (targetExpectedPresent) return ThrowFailure(env, IdentityMismatch());
+  } else {
+    HandleIdentity targetIdentity;
+    if (!ValidateSqliteStagingHandle(target.final, targetPath, &targetIdentity, &failure)
+        || !targetExpectedPresent
+        || !EqualIdentity(targetIdentity, expectedTarget)
+        || !RequireSqliteSidecarsAbsent(target.parents.front(), targetName, &failure)) {
+      if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+      return ThrowFailure(env, failure);
+    }
+  }
+  if (stage.parents.empty()) return ThrowFailure(env, OperationFailed());
+  if (!RenameHandleRelative(
+          stage.final,
+          stage.parents.front(),
+          targetName,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  // The stage handle is now the published target.  Resolve and validate it
+  // before returning its identity; no path is reopened after the atomic
+  // rename, so this final check remains handle-bound.
+  targetPath.components.back() = targetName;
+  if (!ValidateSqliteStagingHandle(stage.final, targetPath, &stageIdentity, &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  napi_value result;
+  napi_value published;
+  napi_create_object(env, &result);
+  napi_get_boolean(env, true, &published);
+  napi_set_named_property(env, result, "published", published);
+  napi_set_named_property(env, result, "identity", IdentityValue(env, stageIdentity));
+  return result;
 }
 
 napi_value DeleteProtectedChildCallback(napi_env env, napi_callback_info info) {
@@ -3793,6 +4227,21 @@ NAPI_MODULE_INIT() {
       exports,
       "releaseSqliteStateLease",
       ReleaseSqliteStateLeaseCallback);
+  DefineMethod(
+      env,
+      exports,
+      "createSqliteDatabase",
+      CreateSqliteDatabaseCallback);
+  DefineMethod(
+      env,
+      exports,
+      "cloneSqliteDatabase",
+      CloneSqliteDatabaseCallback);
+  DefineMethod(
+      env,
+      exports,
+      "publishSqliteDatabase",
+      PublishSqliteDatabaseCallback);
 #if defined(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK)
   DefineMethod(
       env,
@@ -3865,6 +4314,8 @@ NAPI_MODULE_INIT() {
   napi_value pathWalkRaceSafe;
   napi_value credentialMutexSafe;
   napi_value sqliteStateLeaseSafe;
+  napi_value sqliteStateStagingContractVersion;
+  napi_value sqliteStateStagingSafe;
   napi_get_boolean(env, false, &productionSafe);
   napi_get_boolean(env, false, &pathWalkRaceSafe);
   napi_get_boolean(env, true, &credentialMutexSafe);
@@ -3873,6 +4324,22 @@ NAPI_MODULE_INIT() {
   napi_set_named_property(env, exports, "pathWalkRaceSafe", pathWalkRaceSafe);
   napi_set_named_property(env, exports, "credentialMutexSafe", credentialMutexSafe);
   napi_set_named_property(env, exports, "sqliteStateLeaseSafe", sqliteStateLeaseSafe);
+  napi_create_string_utf8(
+      env,
+      "windows-sqlite-state-staging-v1",
+      NAPI_AUTO_LENGTH,
+      &sqliteStateStagingContractVersion);
+  napi_set_named_property(
+      env,
+      exports,
+      "sqliteStateStagingContractVersion",
+      sqliteStateStagingContractVersion);
+  napi_get_boolean(env, false, &sqliteStateStagingSafe);
+  napi_set_named_property(
+      env,
+      exports,
+      "sqliteStateStagingSafe",
+      sqliteStateStagingSafe);
   napi_value credentialAuditFileGuardSafe;
   napi_get_boolean(env, true, &credentialAuditFileGuardSafe);
   napi_set_named_property(

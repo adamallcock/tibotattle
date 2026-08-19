@@ -121,8 +121,10 @@ import {
   createWindowsFilesystemAdapter,
   createWindowsProtectedStateStore,
   createWindowsSqliteStateSession,
+  createWindowsSqliteStateStaging,
   createLocalContributionSyncQueueStorageContext,
   isWindowsFilesystemAdapter,
+  isWindowsSqliteStateStaging,
   WINDOWS_SQLITE_STATE_SESSION_PRODUCTION_SAFE,
 } from "../../src/platform/index.js";
 import {
@@ -2134,6 +2136,7 @@ export function createCompanionWindowsStateComposition({
       protectedStateStore: null,
       sqliteStateSessionFactory: null,
       sqliteStateSessionForPath: null,
+      sqliteStateStaging: null,
       contributionSyncQueue: null,
     });
   }
@@ -2146,6 +2149,15 @@ export function createCompanionWindowsStateComposition({
   let protectedStateStore;
   try {
     protectedStateStore = createWindowsProtectedStateStore({
+      adapter: windowsFilesystemAdapter,
+      rootPath: stateRoot,
+    });
+  } catch {
+    throw windowsFilesystemConfigurationError();
+  }
+  let sqliteStateStaging;
+  try {
+    sqliteStateStaging = createWindowsSqliteStateStaging({
       adapter: windowsFilesystemAdapter,
       rootPath: stateRoot,
     });
@@ -2209,6 +2221,7 @@ export function createCompanionWindowsStateComposition({
     protectedStateStore,
     sqliteStateSessionFactory,
     sqliteStateSessionForPath,
+    sqliteStateStaging,
     contributionSyncQueue,
   });
 }
@@ -2464,6 +2477,7 @@ export function createLocalCompanionServer(options = {}) {
       windowsStateComposition.sqliteStateSessionFactory,
     windowsSqliteStateSessionForPath:
       windowsStateComposition.sqliteStateSessionForPath,
+    windowsSqliteStateStaging: windowsStateComposition.sqliteStateStaging,
     contributionSyncQueueContext: windowsStateComposition.contributionSyncQueue,
     parentWatchdogPid,
     homeDirectory,
@@ -2486,6 +2500,7 @@ function createPreparedLocalCompanionServer({
   windowsProtectedStateStore = null,
   windowsSqliteStateSessionFactory = null,
   windowsSqliteStateSessionForPath = null,
+  windowsSqliteStateStaging = null,
   contributionSyncQueueContext = null,
   parentWatchdogPid,
   // Explicit reversible authority switch. Unified is the normal authority;
@@ -2581,6 +2596,7 @@ function createPreparedLocalCompanionServer({
       statePaths.accountObservationLockFile,
     windowsFilesystemAdapter,
     windowsSqliteStateSessionFactory,
+    windowsSqliteStateStaging,
     refreshAccounting: refreshReplaySafeAccountingCache,
     refreshClaudeQuota: async ({ signal }) => {
       const secret = await readOrCreateClaudeDesktopQuotaSecret(
@@ -2698,6 +2714,7 @@ function createPreparedLocalCompanionServer({
       && (windowsProtectedStateStore !== null
         || windowsSqliteStateSessionFactory !== null
         || windowsSqliteStateSessionForPath !== null
+        || windowsSqliteStateStaging !== null
         || contributionSyncQueueContext !== null)) {
     throw windowsFilesystemConfigurationError();
   }
@@ -2705,6 +2722,7 @@ function createPreparedLocalCompanionServer({
       && (windowsProtectedStateStore === null
         || typeof windowsSqliteStateSessionFactory !== "function"
         || typeof windowsSqliteStateSessionForPath !== "function"
+        || !isWindowsSqliteStateStaging(windowsSqliteStateStaging)
         || contributionSyncQueueContext === null)) {
     throw windowsFilesystemConfigurationError();
   }

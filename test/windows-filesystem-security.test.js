@@ -681,6 +681,80 @@ test("native SQLite state lease rejects aliases and serializes duplicate leases"
   }
 }));
 
+test("native SQLite staging clones, rejects aliases, and publishes atomically", {
+  skip: NATIVE_SKIP,
+}, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "tibotattle-windows-sqlite-staging-"));
+  const root = join(parent, `private state Ω ${randomUUID()}`);
+  const movedRoot = `${root}-moved`;
+  const liveName = "local-unified-index-v1.sqlite";
+  const stageName = `${liveName}.building-qualification`;
+  const bytes = Buffer.from("sqlite-staging-qualification\n", "utf8");
+  const replacement = Buffer.from("sqlite-staging-replacement\n", "utf8");
+  const binding = loadQualificationBinding();
+  const adapter = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding,
+  });
+  try {
+    const rootIdentity = adapter.ensureDirectory(root);
+    const liveIdentity = adapter.createFile(join(root, liveName), bytes);
+    const cloned = adapter.cloneSqliteDatabase(
+      root,
+      rootIdentity,
+      liveName,
+      stageName,
+    );
+    assert.deepEqual(cloned.sourceIdentity, liveIdentity);
+    assert.deepEqual(adapter.readFile(join(root, stageName)).data, bytes);
+    assert.equal(adapter.sqliteStateStagingSafe, false);
+
+    const published = adapter.publishSqliteDatabase(
+      root,
+      rootIdentity,
+      stageName,
+      cloned.stageIdentity,
+      liveName,
+      liveIdentity,
+    );
+    assert.equal(published.published, true);
+    assert.deepEqual(adapter.readFile(join(root, liveName)).data, bytes);
+
+    const secondStage = `${liveName}.building-replacement`;
+    const second = adapter.createSqliteDatabase(root, rootIdentity, secondStage);
+    adapter.replaceFile(join(root, secondStage), second, replacement);
+    const current = adapter.inspectPath(join(root, liveName)).identity;
+    const republished = adapter.publishSqliteDatabase(
+      root,
+      rootIdentity,
+      secondStage,
+      adapter.inspectPath(join(root, secondStage)).identity,
+      liveName,
+      current,
+    );
+    assert.equal(republished.published, true);
+    assert.deepEqual(adapter.readFile(join(root, liveName)).data, replacement);
+
+    const alias = join(root, "local-unified-index-alias.sqlite");
+    await link(join(root, liveName), alias);
+    assert.throws(
+      () => adapter.cloneSqliteDatabase(root, rootIdentity, "local-unified-index-alias.sqlite", `${liveName}.building-alias`),
+      fixedNativeError("WINDOWS_FILESYSTEM_HARD_LINK"),
+    );
+    await rm(alias, { force: true });
+
+    await rename(root, movedRoot);
+    adapter.ensureDirectory(root);
+    assert.throws(
+      () => adapter.cloneSqliteDatabase(root, rootIdentity, liveName, `${liveName}.building-root-swap`),
+      fixedNativeError("WINDOWS_FILESYSTEM_IDENTITY_MISMATCH"),
+    );
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
 test("native SQLite state lease pins the root against rename until release", {
   skip: NATIVE_SKIP,
 }, async () => withSyntheticRoot(async ({ adapter, root }) => {
