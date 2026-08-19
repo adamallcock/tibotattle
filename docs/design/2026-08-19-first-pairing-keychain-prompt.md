@@ -1,8 +1,11 @@
 # Design note: the first-pairing Keychain prompt
 
-Date: 2026-08-19. Status: assessment — copy and ordering fixes shipped on
-`fix/first-pairing-keychain-ux`; every structural elimination option is
-assessed here and deliberately deferred.
+Date: 2026-08-19. Status: option 3 implemented — copy and ordering fixes
+shipped on `fix/first-pairing-keychain-ux`; the structural elimination
+(Swift-app credential minting over a spawn-time broker channel) is built on
+`feat/swift-keychain-broker` and documented in "Implementation" below. The
+fresh-account zero-dialog proof remains a release-gate observation (see the
+checklist at the end).
 
 ## What was observed
 
@@ -158,6 +161,129 @@ the structural fix when native effort is next scheduled, with option 4 as its
 follow-on once the Swift-side Keychain boundary exists. Options 2 and 5 are
 rejected. Until then, the one first-pairing dialog is a prepared, explained,
 recoverable moment instead of a raw OS interruption.
+
+## Implementation (feat/swift-keychain-broker)
+
+Option 3, with the boundary drawn slightly stricter than sketched above: the
+live companion never touches the Keychain for the new credential generation
+at all — not even reads. Every touch happens inside the signed app.
+
+### The broker channel
+
+At companion spawn, `CompanionProcess.launch` creates a
+`socketpair(AF_UNIX, SOCK_STREAM)` and hands the child end to the companion
+as its standard input (previously the unused null device); the environment
+carries only `USAGE_MONITOR_KEYCHAIN_BROKER_FD=0` — the descriptor number,
+which is not a secret. This shape was chosen over the alternatives because:
+
+- **No credential exists to leak.** The kernel-held socket end *is* the
+  authority: only the spawned child owns the peer. A loopback listener or a
+  companion HTTP route would need endpoint discovery plus a bearer token,
+  both new secrets with new lifetimes; the socketpair needs neither, and
+  nothing crosses argv, the environment, or the filesystem.
+- **It matches the existing process relationship.** The app already owns the
+  companion's stdio; the broker adds a fourth stream to an existing spawn
+  rather than a first-ever app-serves-node network surface.
+- **Single-purpose by construction.** The wire protocol
+  (`apps/macos/Sources/KeychainBroker.swift`,
+  `src/platform/contribution-device-keychain-broker.js`) is newline-framed
+  JSON with three operations (get/set/delete), bounded frames, strict
+  in-order ids, and no service/account addressing — the companion cannot
+  name any other Keychain item through it. Any protocol deviation fails the
+  channel closed on both sides.
+
+### Storage generations
+
+New credentials live under a new service,
+`app-usagemonitor.contribution-device.app.v1`
+(`EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp`), minted by
+the app via `SecItemAdd` into the login keychain. A different service
+string — not a marker attribute — separates the generations, so app-side
+code can never accidentally decrypt a `security`-CLI-minted `.v1` item;
+that read is exactly the partition prompt this work eliminates. Each item
+carries a `SecAccessCreate` object trusting the app and the bundled Node
+runtime by designated requirement (the `-T` semantics the durable mint
+already relied on): the app's own reads are silent as creator, and the
+one-shot Identity & Device Reset helper — a separate node process with no
+broker channel — keeps its silent keytar read + exact-delete over the new
+item. `kSecUseDataProtectionKeychain` was re-assessed and stays rejected
+for now: it requires provisioning-profile-backed entitlements the Developer
+ID app does not carry (option 4 remains the follow-on once it does).
+
+### Companion-side composition
+
+`createAppBrokeredContributionDeviceBackend`
+(src/contribution-device-capability.js) implements the existing backend
+contract: the broker binding is keytar-shaped, so the audited
+export-identity backend logic (compare-and-swap, read-back, zeroization,
+locked/denied classification) runs unchanged over the wire; the legacy
+generation keeps its exact keytar read/delete paths, loaded lazily so a
+fresh install never depends on the native binding for brokered operations.
+Reads prefer the app generation, then fall through to legacy.
+
+### Migration
+
+- **Fresh install (app-spawned):** the pairing mint goes straight to the
+  broker. No dialog at mint, none at read-back, none at upload auth or
+  rotation. Nothing is ever written to the legacy service.
+- **Existing install:** reads, uploads, disconnect, reset — all unchanged
+  against the legacy item. The migration point is the next silent ~25-day
+  rotation (`replaceExact` with the credential still legacy-resident): the
+  service-committed replacement is minted app-side, read back through the
+  broker, and the legacy item is then retired through the existing
+  attribute-addressed deletion path (never decrypted, never prompting). A
+  crash between the two steps leaves the valid new credential shadowing the
+  stale legacy item, which the next rotation, disconnect, or reset sweeps.
+- **Reset / disconnect:** the credential-reset route's attribute delete and
+  the Identity & Device Reset helper now clear both generations; disconnect
+  exact-deletes whichever generation holds the credential.
+- **Downgrade after migration:** an older build cannot see the app
+  generation, reads `credential_missing` against the still-present binding
+  file, and lands in the existing recovery ceremony — honest and curable by
+  re-pairing.
+- **Development / standalone companion:** no broker announcement means the
+  production keytar + durable-CLI mint path is byte-for-byte today's
+  behavior.
+
+### Failure semantics
+
+A broker that is announced but unusable — malformed announcement, dead
+socket, timeout, protocol violation — fails every credential operation with
+the coded `ExportIdentityKeychainError` family, which the capability layer
+reports as the same recoverable `contribution_device_credential_*` errors
+the pairing path uses today (`contribution_device_recovery_required` /
+`contribution_device_keychain_access_denied` at the route). It never falls
+back to a companion-side mint: that fallback would silently resurrect the
+dialog. Every broker await is timeout-bounded; there is no state that
+hangs. Broker *creation* failure at spawn (descriptor exhaustion) degrades
+to a broker-less companion where the shipped, explained pairing copy
+remains the net.
+
+## Release-gate checklist (fresh-account zero-dialog proof)
+
+The acceptance this worktree cannot run: on a **real fresh macOS account**
+(no prior TiboTattle Keychain items, no Always Allow grants) running a
+signed build that includes `feat/swift-keychain-broker`:
+
+1. Install, launch, sign in, and complete the Review-and-approve ceremony
+   end to end. **Zero Keychain dialogs** may appear at pairing, at first
+   sync, and across an app restart plus a second sync pass.
+2. `security find-generic-password -s app-usagemonitor.contribution-device.app.v1 -a installation`
+   shows the item; the `.v1` service has none.
+3. Identity & Device Reset on that account completes with status `reset`
+   and removes the `.app.v1` item (verify with the same probe), still with
+   zero dialogs.
+4. Migration leg, on a Mac holding a 0.1.10+ durable-mint `.v1` credential:
+   after the next credential rotation (or a forced renewal), the `.app.v1`
+   item exists, the `.v1` item is gone, and sync continues without a
+   dialog and without a re-pair.
+5. Update-durability leg (extends the sign-in-once acceptance): a signed
+   0.1.x → 0.1.y update over an `.app.v1` credential keeps uploading with
+   no dialog and no `device_unavailable` pause — the app's designated
+   requirement, not a code snapshot, must be what the ACL matched.
+6. Deny-hazard regression: on the fresh account, the pairing step's
+   in-ceremony guidance should now be unreachable (no dialog to answer);
+   confirm the ceremony copy still renders correctly for legacy installs.
 
 ## Shipped in this change (for reference)
 
