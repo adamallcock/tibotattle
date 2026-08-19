@@ -50,7 +50,8 @@ final class ContributionDeviceKeychainBroker {
     private let queue = DispatchQueue(
         label: "usage-monitor.contribution-device-keychain-broker"
     )
-    private var parentHandle: FileHandle?
+    private let parentDescriptor: Int32
+    private var readSource: DispatchSourceRead?
     private var childHandle: FileHandle?
     private var pendingInput = Data()
     private var closed = false
@@ -76,19 +77,30 @@ final class ContributionDeviceKeychainBroker {
                 socklen_t(MemoryLayout<Int32>.size)
             )
         }
-        let parent = FileHandle(
-            fileDescriptor: endpoints[0],
-            closeOnDealloc: true
-        )
+        parentDescriptor = endpoints[0]
+        _ = fcntl(parentDescriptor, F_SETFL, O_NONBLOCK)
         childHandle = FileHandle(
             fileDescriptor: endpoints[1],
             closeOnDealloc: true
         )
-        parentHandle = parent
-        parent.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            self?.queue.async { self?.consume(data) }
+        // A dispatch read source serialized on the broker queue: every read,
+        // Keychain operation, response write, and the teardown share one
+        // queue, and the cancellation handler is the only closer of the
+        // parent descriptor — after cancellation no event handler can still
+        // be in flight, so a read can never race the close.
+        let descriptor = parentDescriptor
+        let source = DispatchSource.makeReadSource(
+            fileDescriptor: descriptor,
+            queue: queue
+        )
+        source.setEventHandler { [weak self] in
+            self?.readAvailable()
         }
+        source.setCancelHandler {
+            close(descriptor)
+        }
+        readSource = source
+        source.resume()
     }
 
     /// The endpoint the spawn hands to the companion as standard input.
@@ -117,10 +129,10 @@ final class ContributionDeviceKeychainBroker {
         guard !closed else { return }
         closed = true
         pendingInput.removeAll()
-        if let parent = parentHandle {
-            parent.readabilityHandler = nil
-            parentHandle = nil
-            try? parent.close()
+        if let source = readSource {
+            readSource = nil
+            // The cancellation handler closes the parent descriptor.
+            source.cancel()
         }
         if let child = childHandle {
             childHandle = nil
@@ -128,13 +140,24 @@ final class ContributionDeviceKeychainBroker {
         }
     }
 
-    private func consume(_ data: Data) {
+    private func readAvailable() {
         guard !closed else { return }
-        // An empty read is end-of-file: the companion exited.
-        guard !data.isEmpty else {
+        var buffer = [UInt8](repeating: 0, count: Self.maximumFrameBytes)
+        let received = read(parentDescriptor, &buffer, buffer.count)
+        if received == 0 {
+            // End-of-file: the companion exited.
             teardown()
             return
         }
+        if received < 0 {
+            if errno == EINTR || errno == EAGAIN { return }
+            teardown()
+            return
+        }
+        consume(Data(bytes: buffer, count: received))
+    }
+
+    private func consume(_ data: Data) {
         pendingInput.append(data)
         guard pendingInput.count <= Self.maximumFrameBytes else {
             teardown()
@@ -210,14 +233,13 @@ final class ContributionDeviceKeychainBroker {
 
     private func respond(_ payload: [String: Any]) {
         guard !closed,
-              let parent = parentHandle,
               var data = try? JSONSerialization.data(withJSONObject: payload)
         else {
             teardown()
             return
         }
         data.append(0x0A)
-        let descriptor = parent.fileDescriptor
+        let descriptor = parentDescriptor
         let delivered = data.withUnsafeBytes {
             (buffer: UnsafeRawBufferPointer) -> Bool in
             guard let base = buffer.baseAddress else { return false }
@@ -230,6 +252,9 @@ final class ContributionDeviceKeychainBroker {
                 )
                 if written <= 0 {
                     if errno == EINTR { continue }
+                    // EAGAIN on a response this small means the companion
+                    // stopped draining entirely; failing the channel closed
+                    // is the honest outcome for that state too.
                     return false
                 }
                 offset += written

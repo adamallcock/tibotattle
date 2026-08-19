@@ -2267,6 +2267,17 @@ test("the app Keychain broker mints the contribution credential app-side over th
   assert.match(brokerSource, /SO_NOSIGPIPE/u);
   assert.match(brokerSource, /maximumFrameBytes = 4_096/u);
   assert.match(brokerSource, /storedSecretPattern = "\^\[A-Za-z0-9_-\]\{43\}\$"/u);
+  // Reads, Keychain operations, and teardown share one dispatch queue, and
+  // only the read source's cancellation handler closes the descriptor — a
+  // read can therefore never race the close.
+  assert.match(
+    brokerSource,
+    /DispatchSource\.makeReadSource\(\s*fileDescriptor: descriptor,\s*queue: queue\s*\)/u,
+  );
+  assert.match(
+    brokerSource,
+    /source\.setCancelHandler \{\s*close\(descriptor\)\s*\}/u,
+  );
 
   // Mint and read happen through SecItem in the login keychain; the
   // data-protection keychain is rejected until the app carries the
