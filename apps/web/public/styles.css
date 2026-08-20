@@ -1131,7 +1131,8 @@ h2 {
   font-size: .74rem;
   line-height: 1.5;
 }
-.evidence-warning.progress {
+.evidence-warning.progress,
+.evidence-warning.informational {
   border-inline-start-color: var(--blue);
   background: var(--blue-soft);
   color: #31536d;

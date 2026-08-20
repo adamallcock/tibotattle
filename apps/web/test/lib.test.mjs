@@ -8886,6 +8886,81 @@ test("a chart says so when its series does not reach back as far as its label", 
 });
 
 // ---------------------------------------------------------------------------
+// Degraded-state register (owner dogfood, 2026-08-19). A companion note whose
+// state resolves by itself — a load already in flight, tracking that simply
+// started fresh — is information, and must not wear the alert treatment that
+// belongs to genuine caveats on degraded figures. The classing is matched on
+// the companion's own vocabulary, so the published sentences and the matcher
+// are pinned together: rewording either alone fails here instead of silently
+// restyling the note. The withheld-cache sentences are deliberately not
+// pinned in either direction — serve-stale-while-recalculating replaces that
+// state wholesale, and its copy and rendering are owned there.
+// ---------------------------------------------------------------------------
+
+test("self-resolving degraded notes are classed informational and keep the quiet style", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  const companionSource = await readFile(
+    new URL("../../../src/local-companion-data.js", import.meta.url),
+    "utf8",
+  );
+
+  // The renderer consults the informational matcher and emits the class.
+  const matcherSource = appSource.match(
+    /const EVIDENCE_WARNING_INFORMATIONAL =\n  \/(.*)\/(\w+);/u,
+  );
+  assert.ok(matcherSource, "the informational matcher is available");
+  const informational = new RegExp(matcherSource[1], matcherSource[2]);
+  assert.match(
+    appSource,
+    /EVIDENCE_WARNING_INFORMATIONAL\.test\(message\)\s*\n\s*\? "evidence-warning informational"/u,
+  );
+  // The quiet treatment is the shared progress blue, not a third palette.
+  assert.match(
+    styles,
+    /\.evidence-warning\.progress,\n\.evidence-warning\.informational \{\n  border-inline-start-color: var\(--blue\);/u,
+  );
+
+  // The self-resolving sentences the companion actually publishes. Each must
+  // exist verbatim in the companion source and fall inside the matcher's
+  // vocabulary, so a reword cannot silently drop one back to the alert style.
+  const informationalSentences = [
+    "Quota tracking started fresh on this Mac, so its retained records begin"
+      + " on ${trackingStartDate}. Coverage of anything earlier is not claimed.",
+    "Full indexed history is loading. The latest replay-safe snapshot is shown"
+      + " meanwhile and will be replaced only by the completed full projection.",
+  ];
+  for (const sentence of informationalSentences) {
+    assert.ok(
+      companionSource.includes(sentence),
+      `the companion publishes: ${sentence}`,
+    );
+    assert.match(sentence, informational);
+  }
+
+  // Genuine caveats on the figures being shown (or genuinely missing) keep
+  // the alert treatment: none may drift into the informational vocabulary.
+  const alertSentences = [
+    "The newest retained collector evidence is more than"
+      + " ${Math.round(MAX_COLLECTOR_LIVE_AGE_MS / 60_000)} minutes old. This"
+      + " is expected after an idle stretch; any newer usage is counted on the"
+      + " next collector pass.",
+    "Recent cost figures come from the live collector projection until the"
+      + " replay-safe cache is refreshed. They may double-count usage that"
+      + " forked child sessions inherited.",
+    "Usage accounting is complete, but typed tool history is partial. Tool"
+      + " totals are withheld rather than reported as zero.",
+  ];
+  for (const sentence of alertSentences) {
+    assert.ok(
+      companionSource.includes(sentence),
+      `the companion publishes: ${sentence}`,
+    );
+    assert.doesNotMatch(sentence, informational);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Session-rejected repair fallback (owner-reported repair loop, 2026-08-08).
 // A stored session the service no longer recognizes must produce ONE sign-in
 // gate, never a repeated step-2 failure paragraph, and the ceremony must
