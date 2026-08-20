@@ -29,7 +29,14 @@ Known instance: the 2026-08-19 pace-fix PRs (#22–#24) landed workload-source
 changes without regeneration, leaving trunk red on these two tests until the
 community-onboarding merge regenerated the receipts.
 
-## Regeneration procedure (~2 minutes)
+## Regeneration procedure
+
+Runtime scales with the owner's real Codex corpus: the synthetic profiles
+take about a minute each, but the `real-local-history` pair benchmarks the
+real corpus (measured 2026-08-19 at ~4,880 rollouts / ~120 GiB: well over
+ten minutes total, and growing with the corpus). Budget 20–30+ minutes,
+run it in the background, and never put it under a foreground timeout — a
+killed run must then be recovered (below) before any retry.
 
 1. Receipts must be owner-only before `--replace` — a fresh checkout or
    `git worktree add` materializes them as `0644`, and the tamper guard then
@@ -78,5 +85,19 @@ community-onboarding merge regenerated the receipts.
 A branch-side regeneration certifies that branch's tree only. Merging with a
 mainline whose workload files differ produces a third tree — regenerate once
 more on the merge result before (or immediately after) it lands, or trunk goes
-red. Interrupted or crashed runs leave a journal; recover with
-`--destination generated --recover` rather than deleting control files.
+red.
+
+## Interrupted runs
+
+An interrupted or killed run leaves control files in the REPOSITORY ROOT
+(not `generated/`): `.r7-release-evidence-install-v1.json` and a
+`.r7-release-evidence-staging-<uuid>/` directory, both gitignored. A new run
+refuses to start while they exist. Recover with:
+
+```bash
+node scripts/regenerate-r7-release-evidence.js --destination generated --recover
+```
+
+It prints `discarded_incomplete_generation`, clears the control files, and
+leaves the committed receipts untouched. Do not delete the control files by
+hand.
