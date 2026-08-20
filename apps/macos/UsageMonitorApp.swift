@@ -91,8 +91,17 @@ private enum BundledNodeRuntimeMode: String {
         entrypoint: URL,
         trailing: [String] = []
     ) -> [String] {
+        // V8 defaults old-space to roughly 4 GiB, which sits BELOW the
+        // accounting rebuild's 6 GiB RSS target (MAX_ACCOUNTING_RSS_BYTES in
+        // src/replay-safe-accounting-cache.js). Without this the rebuild
+        // hard-OOMs the companion around 4 GiB instead of soft-failing into
+        // the retained cache, so the guard that exists to keep the dashboard
+        // alive never gets to run. Deliberately set AT the RSS target rather
+        // than below it: whole-process RSS always exceeds the JS heap, so the
+        // accounting ceiling still trips first and the soft-fail is preserved.
+        let heapArguments = ["--max-old-space-size=6144"]
         let runtimeArguments = self == .jitless ? ["--jitless"] : []
-        return runtimeArguments + [entrypoint.path] + trailing
+        return runtimeArguments + heapArguments + [entrypoint.path] + trailing
     }
 }
 
