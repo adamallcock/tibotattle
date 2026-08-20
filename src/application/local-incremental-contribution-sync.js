@@ -74,8 +74,17 @@ const OUTCOME_STATUSES = new Set(["succeeded", "partial", "failed", "paused"]);
 // and must never escalate the exponential ladder (observed live 2026-08-10:
 // one anonymous collision inflated the gap toward an hour).
 const COORDINATION_RETRY_CODES = new Set(["sync_in_progress", "index_busy"]);
-const PAUSED_REASONS = new Set([
+// The two reasons that mean "this Mac has no usable upload authority", which is
+// the state the dashboard re-opens the connect ceremony from. They are named
+// apart because only one of them is a fault on this Mac: `device_unavailable`
+// is this Mac failing to read its own credential, `device_authorization_lapsed`
+// is the service refusing a credential this Mac holds perfectly well.
+const DEVICE_PAUSED_REASONS = new Set([
   "device_unavailable",
+  "device_authorization_lapsed",
+]);
+const PAUSED_REASONS = new Set([
+  ...DEVICE_PAUSED_REASONS,
   "consent_rejected",
   "authorization_rejected",
   "upload_rejected",
@@ -769,10 +778,18 @@ class IncrementalContributionSyncController {
       } else if (runOutcome.failure !== null) {
         const failure = runOutcome.failure;
         if (failure.deviceUnavailable === true) {
-          settle("device_unavailable", "paused", null, {
-            pause: true,
-            pausedReason: "device_unavailable",
-          });
+          // The pause carries the failure's own reason when it is one of the
+          // device family, so a service refusal and an unreadable local
+          // credential stay distinguishable all the way to the dashboard. The
+          // membership test is deliberately against that family and not against
+          // every pause reason: the dashboard treats exactly these two as
+          // "authority lost, re-open the ceremony", so a flagged failure
+          // carrying some unrelated pause code must land back on the older
+          // reason rather than pause under a code no repair path recognises.
+          const reason = DEVICE_PAUSED_REASONS.has(failure.code)
+            ? failure.code
+            : "device_unavailable";
+          settle(reason, "paused", null, { pause: true, pausedReason: reason });
         } else if (failure.code === "consent_rejected") {
           settle("consent_rejected", "paused", null, {
             pause: true,

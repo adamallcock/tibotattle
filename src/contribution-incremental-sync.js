@@ -78,6 +78,13 @@ const ERROR_CODES = new Set([
 const FAILURE_CODES = new Set([
   "admission_exhausted",
   "device_unavailable",
+  // The service refused this Mac's upload authorization. Distinct from
+  // `device_unavailable`, which is this Mac failing to read its own credential:
+  // the two share a cure only by coincidence. A Mac that cannot read its
+  // credential has a local fault to repair, while a Mac the service refuses is
+  // locally intact and needs the account proved again. Both still set
+  // `deviceUnavailable`, which is what re-opens the connect ceremony.
+  "device_authorization_lapsed",
   "service_unavailable",
   "authorization_rejected",
   "upload_rejected",
@@ -191,9 +198,20 @@ async function readJson(response, {
   if (response.ok) return payload;
 
   const backendCode = payload?.error?.code;
+  // The service refusing this Mac's bearer is reported as its own condition.
+  // The service does not say WHY it refused — expiry, an idle sweep, a
+  // revocation from another device, and detected reuse of a superseded secret
+  // all arrive as the one neutral code, deliberately — but every one of them
+  // has the same cure and none of them is a fault on this Mac. Naming it apart
+  // from `device_unavailable` is what lets the dashboard stop telling an intact
+  // Mac that its own credential is broken.
   if (deviceAuthorized
-      && ["DEVICE_AUTH_INVALID", "PARTICIPANT_DELETING", "UPLOAD_AUTH_INVALID"]
-        .includes(backendCode)) {
+      && ["DEVICE_AUTH_INVALID", "UPLOAD_AUTH_INVALID"].includes(backendCode)) {
+    interrupt("device_authorization_lapsed", { deviceUnavailable: true });
+  }
+  // A participant being deleted keeps the older code: re-pairing cannot cure
+  // it, so it must not be told it is a lapsed authorization.
+  if (deviceAuthorized && backendCode === "PARTICIPANT_DELETING") {
     interrupt("device_unavailable", { deviceUnavailable: true });
   }
   // Both admission limits mean the same thing to the client: the service is

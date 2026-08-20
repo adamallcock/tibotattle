@@ -1050,6 +1050,18 @@ export const WEB_MESSAGES = Object.freeze({
     "请重新登录以完成这台 Mac 的连接。你的核准仍然有效，登录后连接会自动继续。未上传任何内容。",
     "Inicia sesión de nuevo para terminar de conectar este Mac. Tu aprobación sigue vigente y la conexión se reanuda automáticamente tras iniciar sesión. No se cargó nada.",
   ],
+  // The returning contributor's line. A Mac whose credential the service has
+  // stopped accepting did not fail at anything and is not misconfigured: it was
+  // away long enough for an authorization to run out. Saying only "sign in
+  // again to finish connecting" invites the reader to look for what they got
+  // wrong, so this states the cause, hedged where the service genuinely does
+  // not disclose it, and ends on the two facts that keep it calm — the approval
+  // stands and nothing was uploaded.
+  "consent.authorizationLapsedSignIn": [
+    "The service no longer accepts this Mac's upload authorization, usually because it went unused long enough to expire. Sign in once and it reconnects automatically. Your approval still stands. Nothing was uploaded.",
+    "服务不再接受这台 Mac 的上传授权，通常是因为长期未使用而过期。登录一次即可自动重新连接。你的核准仍然有效。未上传任何内容。",
+    "El servicio ya no acepta la autorización de subida de este Mac, normalmente porque estuvo sin usarse hasta caducar. Inicia sesión una vez y se reconecta automáticamente. Tu aprobación sigue vigente. No se cargó nada.",
+  ],
   "consent.preparingReview": [
     "Preparing one real instance of the covered data on this Mac for you to review. No network upload is performed.",
     "正在这台 Mac 上准备一份涵盖数据的真实实例供你审阅。不会执行任何网络上传。",

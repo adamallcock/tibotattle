@@ -11739,17 +11739,33 @@ function incrementalGrantRejected() {
 }
 
 /**
+ * The service refused this Mac's upload authorization: the credential it holds
+ * is no longer accepted, for a reason the service deliberately does not
+ * disclose (an expiry after a long spell closed, an idle sweep, a revocation
+ * from elsewhere, the twice-yearly account recheck, detected reuse). Nothing on
+ * this Mac is broken and nothing local can repair it — the cure is to prove the
+ * account again and re-pair, which the connect ceremony does by itself once a
+ * session exists.
+ */
+function incrementalAuthorizationLapsed() {
+  return incrementalSyncStatus?.status === "available"
+    && incrementalSyncStatus.pausedReason === "device_authorization_lapsed";
+}
+
+/**
  * Whether this Mac's upload authority is lost and only the connect ceremony
- * can restore it. Two paused reasons qualify: consent_rejected (the service
- * refused the grant) and device_unavailable (no readable device credential —
- * after a credential reset or a broken Keychain binding). Gating repair on
- * consent_rejected alone was a designed-in deadlock: with no credential,
- * every pass dies at device_unavailable before any upload can be refused,
- * so the only state that re-opened the ceremony was unreachable from the
- * state that needed it.
+ * can restore it. Three paused reasons qualify: consent_rejected (the service
+ * refused the grant), device_unavailable (no readable device credential — after
+ * a credential reset or a broken Keychain binding), and
+ * device_authorization_lapsed (the service refused the credential itself).
+ * Gating repair on consent_rejected alone was a designed-in deadlock: with no
+ * credential, every pass dies before any upload can be refused, so the only
+ * state that re-opened the ceremony was unreachable from the state that needed
+ * it.
  */
 function incrementalUploadAuthorityLost() {
   return incrementalGrantRejected()
+    || incrementalAuthorizationLapsed()
     || (incrementalSyncStatus?.status === "available"
       && incrementalSyncStatus.pausedReason === "device_unavailable");
 }
@@ -11840,9 +11856,18 @@ function renderIncrementalConsent() {
     // signed-out Mac that needs the transparent re-pair names the repair's
     // own next step (owner-reported repair loop, 2026-08-08): sign in again,
     // and connecting resumes by itself.
+    //
+    // A refused authorization gets its own line rather than the general repair
+    // line. The general one says "finish connecting this Mac", which reads as
+    // an unfinished setup; a Mac that has been contributing for months and came
+    // back to a refused credential did finish, and telling it otherwise invites
+    // the reader to hunt for what they got wrong. The one honest fact is that
+    // the authorization ran out, not that anything failed.
     setLocalizedText(gate, hostedSignInRequired()
       ? repairNeeded
-        ? "consent.signInAgainToFinish"
+        ? incrementalAuthorizationLapsed()
+          ? "consent.authorizationLapsedSignIn"
+          : "consent.signInAgainToFinish"
         : "consent.signInFirst"
       : reviewVerified
         ? "consent.readyToApprove"

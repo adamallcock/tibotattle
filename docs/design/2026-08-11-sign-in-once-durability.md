@@ -115,3 +115,32 @@ What did **not** change, and remains the binding constraint on
   any lapse discovered more than 30 minutes after the last sign-in requires a
   fresh hosted identity proof. No amount of credential lifetime removes that;
   it only makes it rarer.
+
+### Lapse recovery: it cannot be made invisible, so it is made one step
+
+A device whose credential the service has stopped accepting cannot re-establish
+itself. `/api/v1/device/credential/renew` authenticates the credential it is
+replacing, so an already-refused one cannot renew; the pairing mint is a guarded
+`INSERT…SELECT` joined to a live, personal, unexpired `web_sessions` row, so the
+only route to a new credential runs through a session; and the session is 30
+minutes absolute. The one durable capability that could mint a session without a
+provider proof — the participant recovery token — is hard-refused on
+`POST /api/v1/recover` whenever hosted identity is configured. There is no gap
+here to close, only a boundary: **a lapsed device genuinely must prove the
+account again.** Anything else would be a way to re-authorise uploads with no
+live proof of the account, which is the thing this design must not invent.
+
+So the deliverable is the experience, and it is one step:
+
+- When a session is still live, the dashboard re-establishes with no click —
+  `maybeRepairIncrementalAuthorization` runs the connect ceremony once per load
+  for an approved Mac whose authority is lost. After a lapse of any real length
+  that session is gone, so in practice this covers a same-sitting refusal.
+- Otherwise the one step is a sign-in, after which
+  `resumeContributionCeremonyAfterSignIn` finishes the re-pair without another
+  click. The local approve-once consent is keyed on destination and contract
+  versions, never on a device, so it survives untouched and is never re-asked.
+- The refusal is now its own state rather than sharing `device_unavailable` with
+  "this Mac cannot read its own credential". They have opposite cures — one is a
+  local repair, the other needs the account — and a returning contributor was
+  being told their intact Mac was broken.

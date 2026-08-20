@@ -311,6 +311,64 @@ test("device_unavailable auto-pauses exactly like the v0.1 queue, until resumed"
   assert.equal(runs.length, 2);
 });
 
+test("a refused authorization pauses under its own reason, and an unnamed one still pauses", async () => {
+  // The pause reason is what the dashboard reads to decide whether to describe
+  // a local fault or a refused credential, so it has to survive the controller
+  // rather than being flattened into one word on the way through.
+  const lapsed = harness({
+    outcomes: [runOutcome({
+      status: "failed",
+      daysSynced: 0,
+      daysPending: 2,
+      chunksUploaded: 0,
+      failure: {
+        code: "device_authorization_lapsed",
+        retryable: false,
+        deviceUnavailable: true,
+        retryAfterMilliseconds: null,
+      },
+    })],
+  });
+  await lapsed.controller.start();
+  await lapsed.controller.approve();
+  const paused = await lapsed.controller.runDue();
+  assert.equal(paused.paused, true);
+  assert.equal(paused.pausedReason, "device_authorization_lapsed");
+  assert.equal(paused.lastOutcome.code, "device_authorization_lapsed");
+  assert.equal(paused.nextAttemptAt, null);
+  // The same one cure: re-pairing resumes the schedule without re-asking.
+  const resumed = await lapsed.controller.resume();
+  assert.equal(resumed.paused, false);
+  assert.equal(resumed.consent.current, true);
+
+  // A flagged failure whose code is not one of the two device reasons still
+  // pauses under the older one. The dashboard treats exactly those two as
+  // "authority lost, re-open the ceremony", so pausing under anything else —
+  // even another valid pause reason — would strand the Mac in a state no
+  // repair path recognises.
+  for (const code of ["response_invalid", "service_unavailable"]) {
+    const unnamed = harness({
+      outcomes: [runOutcome({
+        status: "failed",
+        daysSynced: 0,
+        daysPending: 2,
+        chunksUploaded: 0,
+        failure: {
+          code,
+          retryable: false,
+          deviceUnavailable: true,
+          retryAfterMilliseconds: null,
+        },
+      })],
+    });
+    await unnamed.controller.start();
+    await unnamed.controller.approve();
+    const fallback = await unnamed.controller.runDue();
+    assert.equal(fallback.paused, true, code);
+    assert.equal(fallback.pausedReason, "device_unavailable", code);
+  }
+});
+
 test("a no-run device_unavailable outcome pauses without clobbering the last honest progress (2026-08-10)", async () => {
   // The wiring shapes a pre-engine capability failure (Keychain credential
   // unreadable after a Sparkle update) into the engine's own

@@ -6903,14 +6903,74 @@ test("the community journey states its stages and gates effort behind sign-in an
   // Re-pinned 2026-08-08 (repair fallback): a signed-out Mac that needs the
   // transparent re-pair names the repair's own next step on the gate line —
   // sign in again, and connecting resumes by itself — while a Mac that never
-  // approved keeps the plain sign-in-first sentence.
+  // approved keeps the plain sign-in-first sentence. Re-pinned again 2026-08-20:
+  // a refused authorization takes its own line, because "finish connecting"
+  // misdescribes a Mac that has been contributing for months.
   assert.match(
     appSource,
-    /\? repairNeeded\s*\n\s*\? "consent\.signInAgainToFinish"\s*\n\s*: "consent\.signInFirst"/u,
+    /\? repairNeeded\s*\n\s*\? incrementalAuthorizationLapsed\(\)\s*\n\s*\? "consent\.authorizationLapsedSignIn"\s*\n\s*: "consent\.signInAgainToFinish"\s*\n\s*: "consent\.signInFirst"/u,
   );
   assert.doesNotMatch(appSource, /consent\.connectFirst/u);
   assert.match(html, /id="incremental-consent-gate"/u);
   assert.match(styles, /\.journey-stage \{/u);
+});
+
+test("a refused upload authorization is a state of its own, and a held session repairs it without a click", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("function incrementalGrantRejected() {");
+  const end = appSource.indexOf("function renderIncrementalConsent() {");
+  assert.ok(start >= 0 && end > start, "the authority predicates are available");
+  const scope = Function(
+    "status",
+    `let incrementalSyncStatus = status;
+${appSource.slice(start, end)}
+return { incrementalAuthorizationLapsed, incrementalUploadAuthorityLost, incrementalGrantRejected };`,
+  );
+  const state = (pausedReason) => scope({
+    status: "available",
+    paused: pausedReason !== null,
+    pausedReason,
+  });
+
+  // The service refusing this Mac's credential is named apart from this Mac
+  // failing to read it. They stop uploads alike, but only one is a local fault,
+  // and the reader is owed the difference.
+  assert.equal(state("device_authorization_lapsed").incrementalAuthorizationLapsed(), true);
+  for (const other of ["device_unavailable", "consent_rejected", "upload_rejected", null]) {
+    assert.equal(
+      state(other).incrementalAuthorizationLapsed(),
+      false,
+      `${other} is not a refused authorization`,
+    );
+  }
+
+  // All three still re-open the one ceremony: whatever the cause, the cure is
+  // the same re-pair, and gating repair on a subset was the original deadlock.
+  for (const lost of [
+    "device_authorization_lapsed",
+    "device_unavailable",
+    "consent_rejected",
+  ]) {
+    assert.equal(state(lost).incrementalUploadAuthorityLost(), true, lost);
+  }
+  assert.equal(state(null).incrementalUploadAuthorityLost(), false);
+  assert.equal(state("upload_rejected").incrementalUploadAuthorityLost(), false);
+  // A projection the companion could not produce is not an authority loss.
+  assert.equal(
+    scope({ status: "unavailable", paused: true, pausedReason: "device_authorization_lapsed" })
+      .incrementalUploadAuthorityLost(),
+    false,
+  );
+
+  // The returning user's automatic path: a held session repairs the refusal by
+  // itself, with no button. The gate is exactly "approved, authority lost,
+  // session in hand" — nothing about WHY the authority was lost.
+  const repair = /function maybeRepairIncrementalAuthorization\(\) \{([\s\S]*?)\n\}/u
+    .exec(appSource)?.[1];
+  assert.ok(repair, "the silent repair is available");
+  assert.match(repair, /if \(!incrementalConsentApproved \|\| !incrementalUploadAuthorityLost\(\)\) return;/u);
+  assert.match(repair, /if \(!hasCommunitySession\(\)\) return;/u);
+  assert.match(repair, /void approveIncrementalContribution\(\);/u);
 });
 
 test("a prepared review instance verifies itself once and failure retries stay explicit", async () => {

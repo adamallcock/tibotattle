@@ -470,20 +470,37 @@ test("a revision conflict re-reads the cursor once and then succeeds", async () 
   });
 });
 
-test("a device the service no longer recognises surfaces as device_unavailable", async () => {
+test("a device the service no longer recognises is named apart from one this Mac cannot read", async () => {
+  // Both stop uploads and both re-open the connect ceremony, but only one of
+  // them is a fault on this Mac: telling an intact Mac that its own credential
+  // is broken sends the reader looking for local damage that is not there.
+  for (const backendCode of ["DEVICE_AUTH_INVALID", "UPLOAD_AUTH_INVALID"]) {
+    await withIndex(async (file) => {
+      const service = createFakeService({
+        stateStatus: () => response({ error: { code: backendCode } }, 401),
+      });
+      const outcome = await runIncrementalContributionSyncOnce(
+        engineOptions(file, service),
+      );
+      assert.equal(outcome.status, "failed");
+      assert.equal(outcome.failure.code, "device_authorization_lapsed", backendCode);
+      assert.equal(outcome.failure.deviceUnavailable, true, backendCode);
+      assert.equal(outcome.chunksUploaded, 0);
+    });
+  }
+  // A participant being deleted keeps the older code: re-pairing cannot cure
+  // it, so it must not be described as a lapsed authorization.
   await withIndex(async (file) => {
     const service = createFakeService({
       stateStatus: () => response({
-        error: { code: "DEVICE_AUTH_INVALID" },
+        error: { code: "PARTICIPANT_DELETING" },
       }, 401),
     });
     const outcome = await runIncrementalContributionSyncOnce(
       engineOptions(file, service),
     );
-    assert.equal(outcome.status, "failed");
     assert.equal(outcome.failure.code, "device_unavailable");
     assert.equal(outcome.failure.deviceUnavailable, true);
-    assert.equal(outcome.chunksUploaded, 0);
   });
 });
 
@@ -553,7 +570,7 @@ test("a server-refused device still reports its real network activity", async ()
     const outcome = await runIncrementalContributionSyncOnce(
       engineOptions(file, service),
     );
-    assert.equal(outcome.failure.code, "device_unavailable");
+    assert.equal(outcome.failure.code, "device_authorization_lapsed");
     // The server answered, so the controller may trust these counts; the
     // pending total stays honest because no upload plan was established.
     assert.equal(outcome.networkActivity, true);
