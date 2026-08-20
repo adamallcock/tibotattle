@@ -19,12 +19,14 @@ import {
   ExportIdentityKeychainError,
   createExportIdentityKeychainBackend,
   deleteExportIdentityKeychainItemByAttributes,
+  exportIdentityKeychainItemPresenceByAttributes,
 } from "./export-identity-keychain.js";
 import {
   assertWindowsProductionReadiness,
   createWindowsProductionCapabilityBackend,
 } from "./platform/index.js";
 import {
+  contributionDeviceKeychainBrokerConfiguration,
   createContributionDeviceKeychainBrokerBinding,
 } from "./contribution-device-keychain-broker.js";
 
@@ -433,6 +435,58 @@ export function createProductionContributionDeviceBackend({
 
 const APP_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp;
 
+export const CONTRIBUTION_DEVICE_KEYCHAIN_PROMPT_SURFACES = Object.freeze([
+  "pairing",
+  "rotation",
+  "none",
+]);
+
+/**
+ * Where — if anywhere — this install can still meet a macOS Keychain dialog.
+ *
+ * The shipped guidance is correctly conditional ("If macOS asks…") but renders
+ * to everyone and names `node`, a process a fresh brokered install will never
+ * see: the app mints and reads its own item, so no dialog is reachable. This
+ * is the signal that lets the dashboard show the guidance only where it can
+ * apply. Neither input can prompt — the announcement is an environment read,
+ * and the legacy probe is attribute-addressed, so it never decrypts.
+ *
+ * - `pairing`: no broker announcement (development, a standalone companion, or
+ *   an app that could not create the channel). The companion still mints
+ *   through the `security` CLI and reads it back, so today's copy is exact.
+ * - `rotation`: brokered, but the credential is still the legacy `.v1` item.
+ *   The dialog moved with the migration; it can only appear at the rotation
+ *   that retires that item, never at pairing.
+ * - `none`: brokered with no legacy item. No dialog exists to explain.
+ *
+ * An indeterminate probe answers `rotation`: conditional guidance that turns
+ * out to be unnecessary costs one sentence, while withholding it from an
+ * install that does raise a dialog is the harm this exists to prevent.
+ */
+export function contributionDeviceKeychainPromptSurface({
+  environment = process.env,
+  readBrokerConfiguration = contributionDeviceKeychainBrokerConfiguration,
+  probeLegacyCredential = () =>
+    exportIdentityKeychainItemPresenceByAttributes(CAPABILITY),
+} = {}) {
+  let announced = false;
+  try {
+    announced = readBrokerConfiguration(environment) !== null;
+  } catch {
+    // A malformed environment is the companion's own problem to report; for
+    // guidance purposes it is simply an install with no usable broker.
+    announced = false;
+  }
+  if (!announced) return "pairing";
+  let presence;
+  try {
+    presence = probeLegacyCredential();
+  } catch {
+    presence = "unknown";
+  }
+  return presence === "missing" ? "none" : "rotation";
+}
+
 function assertBackendSecret(value) {
   if (!Buffer.isBuffer(value) || value.byteLength !== SECRET_BYTES) {
     throw new ExportIdentityKeychainError("invalid_secret");
@@ -467,12 +521,20 @@ export function createAppBrokeredContributionDeviceBackend({
   // brokered mode never mints legacy items, so no durable-ACL configuration
   // is passed here.
   createLegacyBackend = () => createExportIdentityKeychainBackend(),
+  // The legacy fall-through is the only thing that would make a brokered
+  // install construct keytar, and constructing that native binding is what
+  // took sign-in down on 2026-08-10. An attribute-addressed probe answers
+  // "is there a legacy item at all" without decrypting anything, so it needs
+  // neither the binding nor the item's access control list and cannot prompt.
+  probeLegacyCredential = () =>
+    exportIdentityKeychainItemPresenceByAttributes(CAPABILITY),
   sweepLegacyCredential = () =>
     deleteExportIdentityKeychainItemByAttributes(CAPABILITY),
 } = {}) {
   if (typeof createBrokerBinding !== "function"
       || typeof createBackend !== "function"
       || typeof createLegacyBackend !== "function"
+      || typeof probeLegacyCredential !== "function"
       || typeof sweepLegacyCredential !== "function") {
     fail("invalid_configuration");
   }
@@ -507,6 +569,25 @@ export function createAppBrokeredContributionDeviceBackend({
     if (!valid) throw new ExportIdentityKeychainError("invalid_configuration");
     return built;
   }
+  // Only a definite "missing" skips the legacy generation. An indeterminate
+  // probe keeps the exact fall-through this backend had before it existed, so
+  // an install whose legacy item cannot be probed is never mistaken for a
+  // fresh one and silently pushed into a re-pair. Nothing in brokered mode
+  // ever writes a legacy item, so one answer holds for the process lifetime.
+  let legacyPresence = null;
+  function legacyBackendIfPresent() {
+    if (legacyPresence === null) {
+      try {
+        legacyPresence = probeLegacyCredential();
+      } catch {
+        legacyPresence = "unknown";
+      }
+      if (legacyPresence !== "present" && legacyPresence !== "missing") {
+        legacyPresence = "unknown";
+      }
+    }
+    return legacyPresence === "missing" ? null : legacyBackend();
+  }
   function assertContributionCapability(capability) {
     if (capability !== CAPABILITY) {
       throw new ExportIdentityKeychainError("invalid_capability");
@@ -536,16 +617,17 @@ export function createAppBrokeredContributionDeviceBackend({
     assertContributionCapability(capability);
     const modern = await modernBackend.read(APP_CAPABILITY);
     if (modern !== null) return modern;
-    return legacyBackend().read(CAPABILITY);
+    return legacyBackendIfPresent()?.read(CAPABILITY) ?? null;
   }
 
   async function createIfMissing(capability, generatedSecret) {
     assertContributionCapability(capability);
     assertBackendSecret(generatedSecret);
     if (await modernSecretPresent()) return "existing";
+    const legacyStore = legacyBackendIfPresent();
     let legacy = null;
     try {
-      legacy = await legacyBackend().read(CAPABILITY);
+      legacy = legacyStore === null ? null : await legacyStore.read(CAPABILITY);
       if (legacy !== null) return "existing";
     } finally {
       legacy?.fill(0);
@@ -575,10 +657,12 @@ export function createAppBrokeredContributionDeviceBackend({
     // Mint the replacement app-side first, then retire the legacy item, so a
     // crash between the two steps leaves the valid new credential readable
     // (reads prefer the app generation) rather than no credential at all.
+    const legacyStore = legacyBackendIfPresent();
+    if (legacyStore === null) return "missing";
     let legacy = null;
     let matches = false;
     try {
-      legacy = await legacyBackend().read(CAPABILITY);
+      legacy = await legacyStore.read(CAPABILITY);
       if (legacy === null) return "missing";
       matches = legacy.byteLength === expectedSecret.byteLength
         && timingSafeEqual(legacy, expectedSecret);
@@ -612,7 +696,9 @@ export function createAppBrokeredContributionDeviceBackend({
       if (outcome === "deleted") await retireLegacyItem();
       return outcome;
     }
-    return legacyBackend().deleteExact(CAPABILITY, expectedSecret);
+    const legacyStore = legacyBackendIfPresent();
+    if (legacyStore === null) return "missing";
+    return legacyStore.deleteExact(CAPABILITY, expectedSecret);
   }
 
   async function describe(capability) {

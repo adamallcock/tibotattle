@@ -43,6 +43,8 @@ export {
   createExportIdentityKeychainBackend,
   deleteExportIdentityKeychainItemByAttributes,
   exportIdentityKeychainAttributeDeleteArguments,
+  exportIdentityKeychainAttributeProbeArguments,
+  exportIdentityKeychainItemPresenceByAttributes,
   keytarSignedBindingRequirement,
   keytarSignedBindingVerificationArguments,
   loadExportIdentityKeychainBinding,

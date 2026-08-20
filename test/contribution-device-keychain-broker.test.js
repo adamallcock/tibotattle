@@ -17,9 +17,12 @@ import {
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
   createExportIdentityKeychainBackend,
+  exportIdentityKeychainAttributeProbeArguments,
+  exportIdentityKeychainItemPresenceByAttributes,
 } from "../src/export-identity-keychain.js";
 import {
   ContributionDeviceCapabilityError,
+  contributionDeviceKeychainPromptSurface,
   createAppBrokeredContributionDeviceBackend,
   ensureContributionDeviceCapability,
   readContributionDeviceCapability,
@@ -110,6 +113,17 @@ function brokeredBackend({
   transport = memoryBrokerTransport(),
   legacyStore = legacyStoreWith(null),
   sweeps = [],
+  legacyConstructions = [],
+  // The probe answers from the same store the legacy binding serves, exactly
+  // as the real attribute probe answers from the same Keychain. Injecting it
+  // also keeps every case here hermetic: the default probe shells out to
+  // /usr/bin/security, so a developer Mac that happens to hold a real `.v1`
+  // credential would otherwise decide these outcomes.
+  probeLegacyCredential = () => (
+    legacyStore.has(`${LEGACY_CAPABILITY.service}\0${LEGACY_CAPABILITY.account}`)
+      ? "present"
+      : "missing"
+  ),
   sweepLegacyCredential = async () => {
     sweeps.push("swept");
     legacyStore.delete(
@@ -120,12 +134,16 @@ function brokeredBackend({
 } = {}) {
   const backend = createAppBrokeredContributionDeviceBackend({
     transport,
-    createLegacyBackend: () => createExportIdentityKeychainBackend({
-      binding: memoryKeytarBinding(legacyStore),
-    }),
+    createLegacyBackend: () => {
+      legacyConstructions.push("built");
+      return createExportIdentityKeychainBackend({
+        binding: memoryKeytarBinding(legacyStore),
+      });
+    },
+    probeLegacyCredential,
     sweepLegacyCredential,
   });
-  return { backend, transport, legacyStore, sweeps };
+  return { backend, transport, legacyStore, sweeps, legacyConstructions };
 }
 
 class FakeChannel extends EventEmitter {
@@ -636,6 +654,7 @@ test("an unavailable broker answers with today's coded recoverable errors, never
       createLegacyBackend: () => createExportIdentityKeychainBackend({
         binding: memoryKeytarBinding(),
       }),
+      probeLegacyCredential: () => "missing",
       sweepLegacyCredential: async () => "missing",
     });
     await assert.rejects(
@@ -767,6 +786,7 @@ test("the wire protocol round-trips a real socket: mint, read, rotate", async ()
     createLegacyBackend: () => createExportIdentityKeychainBackend({
       binding: memoryKeytarBinding(),
     }),
+    probeLegacyCredential: () => "missing",
     sweepLegacyCredential: async () => "missing",
   });
   try {
@@ -943,4 +963,184 @@ test("an announced-but-unusable broker answers pairing with the recoverable code
     await service.close();
     await rm(files.root, { recursive: true, force: true });
   }
+});
+
+test("a fresh brokered install never constructs the legacy keytar backend", async () => {
+  // The native binding is the surface that took sign-in down on 2026-08-10,
+  // and the pre-pairing null read is exactly when the old fall-through built
+  // it. A definite "missing" from the promptless probe must stop that.
+  const { root, stateFile } = await temporaryStateFile();
+  try {
+    const { backend, legacyConstructions } = brokeredBackend();
+    assert.equal(await readContributionDeviceCapability({ backend, stateFile }), null);
+    const created = await ensureContributionDeviceCapability({
+      backend,
+      origin: ORIGIN,
+      stateFile,
+      generateDeviceId: () => DEVICE_ID,
+    });
+    assert.equal(created.status, "created");
+    assert.deepEqual(legacyConstructions, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+async function seededLegacyInstall(stateFile) {
+  const legacyStore = legacyStoreWith(null);
+  const seeded = await ensureContributionDeviceCapability({
+    backend: createExportIdentityKeychainBackend({
+      binding: memoryKeytarBinding(legacyStore),
+    }),
+    origin: ORIGIN,
+    stateFile,
+    generateDeviceId: () => DEVICE_ID,
+    generateSecret: () => Buffer.alloc(32, 0x61),
+    clock: () => Date.parse("2026-08-01T00:00:00.000Z"),
+  });
+  assert.equal(seeded.status, "created");
+  return legacyStore;
+}
+
+test("an indeterminate legacy probe keeps the fall-through rather than inventing a fresh install", async () => {
+  // An install that really does hold a legacy credential must never be
+  // mistaken for a fresh one and pushed into a re-pair just because the probe
+  // could not answer.
+  const { root, stateFile } = await temporaryStateFile();
+  try {
+    const legacyStore = await seededLegacyInstall(stateFile);
+    const { backend, legacyConstructions } = brokeredBackend({
+      legacyStore,
+      probeLegacyCredential: () => "unknown",
+    });
+    const read = await readContributionDeviceCapability({ backend, stateFile });
+    assert.equal(read.status, "available");
+    assert.equal(read.deviceId, DEVICE_ID);
+    assert.deepEqual(legacyConstructions, ["built"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a probe that throws is treated as indeterminate, never as an absent credential", async () => {
+  const { root, stateFile } = await temporaryStateFile();
+  try {
+    const legacyStore = await seededLegacyInstall(stateFile);
+    const { backend, legacyConstructions } = brokeredBackend({
+      legacyStore,
+      probeLegacyCredential: () => {
+        throw new Error("security is unavailable");
+      },
+    });
+    assert.equal(
+      (await readContributionDeviceCapability({ backend, stateFile })).status,
+      "available",
+    );
+    assert.deepEqual(legacyConstructions, ["built"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the legacy presence probe reads attributes only and never decrypts", () => {
+  // Without -w or -g the security tool reports attributes and leaves the item
+  // encrypted, which is what makes the probe incapable of raising a dialog.
+  assert.deepEqual(
+    [...exportIdentityKeychainAttributeProbeArguments(LEGACY_CAPABILITY)],
+    ["find-generic-password", "-s", LEGACY_CAPABILITY.service, "-a", "installation"],
+  );
+  const calls = [];
+  const probe = (status) => exportIdentityKeychainItemPresenceByAttributes(
+    LEGACY_CAPABILITY,
+    {
+      platform: "darwin",
+      runCommand: (command, commandArguments) => {
+        calls.push([command, ...commandArguments]);
+        return { status };
+      },
+    },
+  );
+  assert.equal(probe(0), "present");
+  assert.equal(probe(44), "missing");
+  assert.equal(probe(1), "unknown");
+  assert.equal(probe(undefined), "unknown");
+  assert.equal(
+    exportIdentityKeychainItemPresenceByAttributes(LEGACY_CAPABILITY, {
+      platform: "linux",
+      runCommand: () => {
+        throw new Error("never invoked off darwin");
+      },
+    }),
+    "unknown",
+  );
+  assert.equal(
+    exportIdentityKeychainItemPresenceByAttributes(LEGACY_CAPABILITY, {
+      platform: "darwin",
+      runCommand: () => {
+        throw new Error("spawn failed");
+      },
+    }),
+    "unknown",
+  );
+  assert.equal(calls.length, 4);
+  for (const call of calls) {
+    assert.equal(call[0], "/usr/bin/security");
+    assert.equal(call.includes("-w"), false);
+    assert.equal(call.includes("-g"), false);
+  }
+});
+
+test("the Keychain guidance surface names only where a dialog is reachable", () => {
+  const announced = { [CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_FD_ENV]: "0" };
+  // No announcement: the companion still mints and reads back itself, so the
+  // pairing step remains the moment a dialog can appear.
+  assert.equal(
+    contributionDeviceKeychainPromptSurface({
+      environment: {},
+      probeLegacyCredential: () => "missing",
+    }),
+    "pairing",
+  );
+  // Brokered with nothing to migrate: no dialog exists to explain.
+  assert.equal(
+    contributionDeviceKeychainPromptSurface({
+      environment: announced,
+      probeLegacyCredential: () => "missing",
+    }),
+    "none",
+  );
+  // Brokered over a legacy item: the dialog moved to the rotation that
+  // retires it, and an unreadable probe must land on the same guidance.
+  for (const presence of ["present", "unknown"]) {
+    assert.equal(
+      contributionDeviceKeychainPromptSurface({
+        environment: announced,
+        probeLegacyCredential: () => presence,
+      }),
+      "rotation",
+    );
+  }
+  assert.equal(
+    contributionDeviceKeychainPromptSurface({
+      environment: announced,
+      probeLegacyCredential: () => {
+        throw new Error("probe failed");
+      },
+    }),
+    "rotation",
+  );
+  // A malformed announcement is still an install with no usable broker, and
+  // the detection itself never reaches the Keychain in that case.
+  assert.equal(
+    contributionDeviceKeychainPromptSurface({
+      environment: {},
+      readBrokerConfiguration: () => {
+        throw new Error("malformed");
+      },
+      probeLegacyCredential: () => {
+        throw new Error("must not be probed");
+      },
+    }),
+    "pairing",
+  );
 });

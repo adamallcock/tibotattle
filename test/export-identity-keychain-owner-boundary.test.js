@@ -25,6 +25,8 @@ const EXPECTED_EXPORTS = Object.freeze([
   "createExportIdentityKeychainBackend",
   "deleteExportIdentityKeychainItemByAttributes",
   "exportIdentityKeychainAttributeDeleteArguments",
+  "exportIdentityKeychainAttributeProbeArguments",
+  "exportIdentityKeychainItemPresenceByAttributes",
   "keytarSignedBindingRequirement",
   "keytarSignedBindingVerificationArguments",
   "loadExportIdentityKeychainBinding",
