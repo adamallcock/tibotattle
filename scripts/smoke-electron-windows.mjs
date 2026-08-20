@@ -29,7 +29,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   loadAuditedWindowsCredentialBinding,
-} from "../src/platform/index.js";
+} from "../src/platform/windows-credential-manager-probe.js";
 
 const require = createRequire(import.meta.url);
 

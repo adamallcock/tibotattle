@@ -4,11 +4,13 @@ import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 
 import {
-  KEYTAR_WIN32_X64_SHA256,
   assertWindowsQualificationResourceAuthority,
+} from "../../src/platform/index.js";
+import {
+  KEYTAR_WIN32_X64_SHA256,
   loadAuditedWindowsCredentialBinding,
   runWindowsCredentialManagerProbe,
-} from "../../src/platform/index.js";
+} from "../../src/platform/windows-credential-manager-probe.js";
 
 export const WINDOWS_ELECTRON_QUALIFICATION_ENVIRONMENT_KEY =
   "USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION";

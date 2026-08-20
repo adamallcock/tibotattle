@@ -31,7 +31,9 @@ import {
 } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { KEYTAR_WIN32_X64_SHA256 } from "../src/platform/index.js";
+import {
+  KEYTAR_WIN32_X64_SHA256,
+} from "../src/platform/windows-credential-manager-probe.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const require = createRequire(import.meta.url);
