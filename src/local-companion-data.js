@@ -904,6 +904,68 @@ function projectAllowanceCapacity(container, preference) {
   };
 }
 
+/**
+ * The explicit staleness provenance every stale-served projection carries:
+ * the semantic version the artifact was computed under, when it was computed,
+ * and what span it covered. A consumer that renders a stale-served figure
+ * without this block cannot exist, because the block is the only channel the
+ * figures arrive on.
+ */
+function staleReplaySafeProvenance(staleCache) {
+  if (staleCache?.stale !== true
+      || typeof staleCache.schemaVersion !== "string"
+      || staleCache.schemaVersion.length === 0
+      || typeof staleCache.computedAt !== "string") {
+    return null;
+  }
+  return {
+    stale: true,
+    schemaVersion: staleCache.schemaVersion,
+    computedAt: staleCache.computedAt,
+    coveredAt: {
+      startAt: staleCache.coveredAt?.startAt ?? null,
+      endAt: staleCache.coveredAt?.endAt ?? null,
+    },
+  };
+}
+
+/**
+ * The bounded cost-view serve from a semantics-outdated prior cache: the
+ * per-period headline scalars every cache version since v0.4 has carried, and
+ * nothing else. The old artifact is never pushed through the current
+ * enrichment pipeline (its dimension/weighting shapes belong to the version
+ * that wrote it); the UI renders these labeled figures only while no current
+ * source exists, which is exactly the "$0.00 until the rebuild lands" window
+ * this replaces.
+ */
+function projectStaleAccountingServe(staleCache, provenance) {
+  if (provenance === null) return null;
+  const periods = Array.isArray(staleCache.cache?.periods)
+    ? staleCache.cache.periods.flatMap((period) => (
+      typeof period?.id === "string"
+        && ["24h", "7d", "30d", "all"].includes(period.id)
+        && typeof period.label === "string"
+        && period.label.length > 0
+        && Number.isSafeInteger(period.events)
+        && period.events >= 0
+        && Number.isSafeInteger(period.totalTokens)
+        && period.totalTokens >= 0
+        && Number.isFinite(period.apiPriceEquivalentUsd)
+        && period.apiPriceEquivalentUsd >= 0
+        ? [{
+          periodId: period.id,
+          periodLabel: period.label,
+          events: period.events,
+          totalTokens: period.totalTokens,
+          apiPriceEquivalentUsd: period.apiPriceEquivalentUsd,
+        }]
+        : []
+    ))
+    : [];
+  if (periods.length === 0) return null;
+  return { ...provenance, periods };
+}
+
 const CACHE_SWITCH_ALLOWANCE_INTERPRETATION =
   "conditional_historical_estimate_not_provider_allowance";
 
@@ -2438,15 +2500,65 @@ export async function buildLocalCompanionSnapshot({
     }),
     reportProjection(root),
   ]);
-  const allowanceWeekly = projectSelectedAllowanceWeeklyCalibration(
+  // Serve-stale-labeled (2026-08-19): when the prior cache was refused ONLY
+  // because the accounting semantics version changed — the state every
+  // updater enters — its projections are served explicitly marked stale
+  // instead of vanishing into "$0.00 / Insufficient evidence / Not
+  // comparable" until the local rebuild lands (hours at owner scale). Each
+  // stale-derived block carries staleReplaySafeProvenance; the current-cache
+  // channels stay null/unavailable, so nothing can mistake the serve for
+  // current. A fresh account with no prior cache has no stale channel and
+  // keeps today's honest empty states.
+  const staleReplaySafe =
+    replaySafeAccounting.errorCode === "cache_accounting_semantics_outdated"
+      && replaySafeAccounting.staleCache !== undefined
+      ? replaySafeAccounting.staleCache
+      : null;
+  const staleProvenance = staleReplaySafe === null
+    ? null
+    : staleReplaySafeProvenance(staleReplaySafe);
+  let allowanceWeekly = projectSelectedAllowanceWeeklyCalibration(
     replaySafeCache,
     selectedFastModePreference,
     replaySafeAccounting.errorCode,
   );
-  const allowanceCapacity = projectAllowanceCapacity(
+  let allowanceCapacity = projectAllowanceCapacity(
     replaySafeCache?.allowanceCapacityByScenario,
     selectedFastModePreference,
   );
+  if (staleProvenance !== null) {
+    // The stale artifact rides the SAME validating projections as a current
+    // cache: a block whose shape the current validators refuse projects
+    // "unavailable" and stays withheld exactly as today, so only structurally
+    // sound figures are ever stale-served. (The common updater step keeps the
+    // calibration/allowance shapes intact — the version bump names a change
+    // elsewhere in the artifact — which is what makes this serve useful.)
+    const staleWeekly = projectSelectedAllowanceWeeklyCalibration(
+      staleReplaySafe.cache,
+      selectedFastModePreference,
+      null,
+    );
+    if (staleWeekly.status !== "unavailable") {
+      allowanceWeekly = { ...staleWeekly, stale: staleProvenance };
+    }
+    const staleCapacity = projectAllowanceCapacity(
+      staleReplaySafe.cache?.allowanceCapacityByScenario,
+      selectedFastModePreference,
+    );
+    if (staleCapacity.status !== "unavailable") {
+      allowanceCapacity = { ...staleCapacity, stale: staleProvenance };
+    }
+  }
+  const staleAccountingServe = staleReplaySafe === null
+    ? null
+    : projectStaleAccountingServe(staleReplaySafe, staleProvenance);
+  // Whether anything is actually being stale-served: the quiet recalculating
+  // label then replaces the withheld-cache warning banner. If provenance
+  // exists but every extraction refused, the banner stays — a silent
+  // withhold would be worse than an alarming one.
+  const staleServeActive = staleAccountingServe !== null
+    || allowanceWeekly.stale !== undefined
+    || allowanceCapacity.stale !== undefined;
   // Retained report artifacts are Standard-priced. They remain available as
   // diagnostic reports, but cannot stand in for a quota-weighted allowance
   // capacity when the matching live scenario is unavailable.
@@ -2715,7 +2827,11 @@ export async function buildLocalCompanionSnapshot({
       "Official API prices changed. Cached price estimates are withheld until the next local replay rebuilds them with the current registry.",
     );
   }
-  if (replaySafeAccounting.errorCode === "cache_accounting_semantics_outdated") {
+  if (replaySafeAccounting.errorCode === "cache_accounting_semantics_outdated"
+      && !staleServeActive) {
+    // Only when nothing could be stale-served: with any stale serve active
+    // the quiet per-surface "computed by the previous version — recalculating"
+    // label carries this message instead of an alert-styled banner.
     warnings.push(
       "Historical event-time accounting changed. The prior cache is withheld until the next local replay rebuilds it.",
     );
@@ -2945,6 +3061,10 @@ export async function buildLocalCompanionSnapshot({
         reasoningEffortAvailable: false,
         accountingSource,
         accountingCacheStatus: accountingStatus,
+        // The labeled prior-version cost figures (or null). Rendered by the
+        // cost view only while no current source exists; its provenance block
+        // is what lets the UI say "computed by the previous version".
+        staleServe: staleAccountingServe,
         replayExclusionDiagnostics: replaySafeCache?.diagnostics ?? null,
         cacheSwitchImpact,
         cacheContinuityImpact,

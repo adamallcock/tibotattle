@@ -4917,6 +4917,7 @@ export async function readReplaySafeAccountingCache({
       ? "cache_missing"
       : "cache_unavailable";
   }
+  let staleCache = null;
   if (parsed !== null && !validCache(parsed)) {
     const registryOutdated = (
       parsed?.priceRegistryVersion !== undefined
@@ -4932,6 +4933,34 @@ export async function readReplaySafeAccountingCache({
         || parsed?.priceEpochBasis !== HISTORICAL_PRICE_EPOCH_BASIS
         ? "cache_accounting_semantics_outdated"
         : "cache_invalid";
+    // The one refusal every updater walks through: prices are current but the
+    // accounting semantics version changed, so the artifact fails the CURRENT
+    // validator by design. Withholding it entirely is what put every
+    // large-history user on a "$0.00 until the rebuild lands" surface — and
+    // the rebuild can take a while at scale. The prior artifact is therefore
+    // returned on a SEPARATE, explicitly stale channel: provenance names the
+    // semantic version it was computed under and when, the current-cache
+    // contract (`cache`) stays null so no caller can mistake it for current,
+    // and consumers that choose to serve it must label it. A registry-outdated
+    // cache stays fully withheld — its prices are wrong, not merely
+    // differently derived — as does a structurally invalid one.
+    if (unavailableErrorCode === "cache_accounting_semantics_outdated"
+        && typeof parsed.schemaVersion === "string"
+        && parsed.schemaVersion.length > 0
+        && canonicalInstant(parsed.generatedAt) !== null
+        && canonicalInstant(parsed.coveredAt?.startAt) !== null
+        && canonicalInstant(parsed.coveredAt?.endAt) !== null) {
+      staleCache = {
+        stale: true,
+        schemaVersion: parsed.schemaVersion,
+        computedAt: parsed.generatedAt,
+        coveredAt: {
+          startAt: parsed.coveredAt.startAt,
+          endAt: parsed.coveredAt.endAt,
+        },
+        cache: parsed,
+      };
+    }
     parsed = null;
   }
   if (parsed === null) {
@@ -4939,6 +4968,7 @@ export async function readReplaySafeAccountingCache({
       status: "unavailable",
       errorCode: unavailableErrorCode ?? "cache_unavailable",
       cache: null,
+      ...(staleCache === null ? {} : { staleCache }),
     };
   }
   const descriptor = parsed.sourceDescriptor;

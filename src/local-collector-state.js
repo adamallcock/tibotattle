@@ -1357,6 +1357,12 @@ export async function saveLocalCollectorCheckpoint({
   });
 }
 
+// Publication of a rebuilt accounting cache. The single-row transactional
+// replace is the retention/swap contract the stale-labeled serve relies on:
+// the prior artifact (including a semantics-outdated one being served stale)
+// remains readable until the new value COMMITS, the swap is atomic, and the
+// prior copy is gone only after that commit. A rebuild that fails never
+// reaches this call, so the stale-labeled serve stays in place untouched.
 export async function writeLocalCollectorAccountingCache({
   stateFile = defaultLocalCollectorStatePath(),
   cache,
