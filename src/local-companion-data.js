@@ -3326,6 +3326,26 @@ export async function buildLocalCompanionSnapshot({
   };
 }
 
+// The purposes the snapshot builder answers with a DEFERRED unified
+// projection. Kept as the same vocabulary the builder keys on, so the two
+// cannot disagree about which reloads arrive without their heavy datasets.
+const DEFERRED_PROJECTION_PURPOSES = new Set(["startup", "quick"]);
+
+// The projection-derived surfaces. A deferred build returns these as empty
+// arrays rather than omitting them, which is why replacing a full snapshot
+// with a quick one blanks the dashboard instead of leaving it alone.
+const PROJECTION_SURFACES = Object.freeze(["gradient", "weekly"]);
+
+function projectionRowCount(surface) {
+  const datasets = surface?.datasets;
+  if (!datasets || typeof datasets !== "object") return 0;
+  let rows = 0;
+  for (const value of Object.values(datasets)) {
+    if (Array.isArray(value)) rows += value.length;
+  }
+  return rows;
+}
+
 export class LocalCompanionDataStore {
   #builder;
   #snapshot = null;
@@ -3345,8 +3365,44 @@ export class LocalCompanionDataStore {
     if (!candidate || candidate.schemaVersion !== LOCAL_COMPANION_SCHEMA_VERSION) {
       throw fixedError("snapshot_invalid");
     }
-    this.#snapshot = structuredClone(candidate);
+    this.#snapshot = this.#withRetainedProjection(
+      structuredClone(candidate),
+      options,
+    );
     return this.getOverview();
+  }
+
+  // A quick reload exists to surface fast-moving figures (quota, pace) as soon
+  // as they are known, WITHOUT waiting for the full projection. It was doing
+  // that by publishing the deferred build wholesale — empty `gradient` and
+  // `weekly` datasets included — so every refresh cycle blanked the timeline
+  // and allowance-history charts at the quick_result phase and refilled them
+  // on completion. From the page that reads as data repeatedly vanishing:
+  // "No 3-hour series loaded", "No weekly estimates loaded", flickering.
+  //
+  // The refresh caller already treats a FAILED quick reload as "keep the
+  // previous good dashboard". A successful one should not be more destructive
+  // than a failure. So the fresh overview is taken as-is, and the two
+  // projection-derived surfaces are carried forward whenever the deferred
+  // build has nothing to put in their place.
+  //
+  // Scoped deliberately: only for the purposes that request a deferred
+  // projection, and only when the incoming surface is genuinely empty while
+  // the retained one is not. A full reload always replaces both, so a real
+  // transition to empty still lands on the next complete refresh and this can
+  // never pin stale figures beyond it.
+  #withRetainedProjection(next, options) {
+    const purpose = options?.purpose ?? "full";
+    if (!DEFERRED_PROJECTION_PURPOSES.has(purpose)) return next;
+    const retained = this.#snapshot;
+    if (retained === null) return next;
+    for (const surface of PROJECTION_SURFACES) {
+      if (projectionRowCount(next[surface]) === 0
+          && projectionRowCount(retained[surface]) > 0) {
+        next[surface] = structuredClone(retained[surface]);
+      }
+    }
+    return next;
   }
 
   #required() {

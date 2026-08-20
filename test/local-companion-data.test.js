@@ -1680,6 +1680,58 @@ test("data store retains its last good snapshot when a reload fails", async () =
   assert.equal(store.getOverview().marker, "last-good");
 });
 
+test("a deferred quick reload keeps the projection surfaces it cannot rebuild", async () => {
+  // A quick reload is answered with a DEFERRED unified projection, whose
+  // gradient/weekly datasets come back as empty arrays rather than absent.
+  // Publishing that wholesale blanked both charts on every refresh cycle and
+  // refilled them at completion, which reads as data repeatedly vanishing.
+  const snapshotFor = (purpose) => ({
+    schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+    mode: "real_local_evidence",
+    generatedAt: "2026-08-20T21:00:00.000Z",
+    overview: { marker: purpose },
+    gradient: {
+      datasets: ["startup", "quick"].includes(purpose)
+        ? { rolling: [], curve: [] }
+        : { rolling: [{ at: 1 }, { at: 2 }], curve: [{ at: 1 }] },
+    },
+    weekly: {
+      datasets: ["startup", "quick"].includes(purpose)
+        ? { weekly_values: [] }
+        : { weekly_values: [{ sequence: 1 }] },
+    },
+    quality: {},
+    reports: [],
+  });
+  const store = new LocalCompanionDataStore({
+    builder: async ({ purpose = "full" } = {}) => snapshotFor(purpose),
+  });
+
+  await store.reload({ purpose: "full" });
+  assert.equal(store.getGradient().datasets.rolling.length, 2);
+  assert.equal(store.getWeekly().datasets.weekly_values.length, 1);
+
+  // The quick pass publishes its fresh overview but must not blank the charts.
+  await store.reload({ purpose: "quick" });
+  assert.equal(store.getOverview().marker, "quick");
+  assert.equal(store.getGradient().datasets.rolling.length, 2);
+  assert.equal(store.getGradient().datasets.curve.length, 1);
+  assert.equal(store.getWeekly().datasets.weekly_values.length, 1);
+
+  // A FULL reload is still authoritative in both directions: a genuine
+  // transition to empty must land, or this would pin stale figures forever.
+  const emptying = new LocalCompanionDataStore({
+    builder: async ({ purpose = "full" } = {}) => ({
+      ...snapshotFor(purpose),
+      gradient: { datasets: { rolling: [], curve: [] } },
+      weekly: { datasets: { weekly_values: [] } },
+    }),
+  });
+  await emptying.reload({ purpose: "full" });
+  assert.equal(emptying.getGradient().datasets.rolling.length, 0);
+  assert.equal(emptying.getWeekly().datasets.weekly_values.length, 0);
+});
+
 test("the unified index removes the 31-day ceiling and keeps fork replay out of the headline", async () => {
   const root = await fixtureRoot();
   try {
