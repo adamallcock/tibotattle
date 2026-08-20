@@ -326,8 +326,23 @@ comm -23 \
 
 It must print nothing. Anything it prints is an evidence entry whose bytes are
 not published, which fails `release:evidence:validate` for every downloader.
-(The relation is `SHA256SUMS ⊆ assets`, not equality — `verify-release.md` is
-guidance, not evidence, so it is legitimately an asset with no digest row.)
+
+Run the converse too, because subset alone cannot see an asset published with
+**no** digest row — an unverifiable download, which is the worse direction:
+
+~~~bash
+comm -13 \
+  <(awk '{print $2}' "$SHA256SUMS" | sort) \
+  <(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' | sort) \
+  | grep -vxF -e verify-release.md -e SHA256SUMS
+~~~
+
+Also must print nothing. Exactly two assets legitimately carry no digest row:
+`verify-release.md`, which is guidance rather than evidence, and `SHA256SUMS`
+itself, which cannot contain its own digest. Keeping that allowlist explicit is
+the point — a future asset (a `.pkg`, a standalone binary) then forces a
+decision, digest it or allowlist it, instead of silently defaulting to
+unverifiable.
 
 This matters beyond the appcast, because `buildSha256Sums` adds rows for **five
 conditional subjects**, and only the updater one has ever been exercised:
