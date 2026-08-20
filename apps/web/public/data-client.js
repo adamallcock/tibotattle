@@ -40,9 +40,23 @@ const CENTRAL_ROOT = "/api/v1";
 // be mistaken for it.
 export const CODEX_PRIMARY_LIMIT_ID = "codex";
 export const CODEX_SPARK_LIMIT_ID = "codex_bengalfox";
+// The Spark allowance is reported as `codex_bengalfox` on the wire today;
+// `codex-spark` is the marketing token the companion reserves in case the
+// provider stabilizes on it later (mirrors SPARK_QUOTA_LIMIT_IDS in
+// src/local-companion-usage-model.js). Both identify the same separate Spark
+// limit; neither is ever rewritten into the other.
+export const CODEX_SPARK_RESERVED_LIMIT_ID = "codex-spark";
+export const CODEX_SPARK_LIMIT_IDS = Object.freeze([
+  CODEX_SPARK_LIMIT_ID,
+  CODEX_SPARK_RESERVED_LIMIT_ID
+]);
 export const CODEX_FIVE_HOUR_ALLOWANCE_MINUTES = 300;
 export const CODEX_WEEKLY_ALLOWANCE_MINUTES = 10_080;
 export const MAX_QUOTA_WINDOW_DURATION_MINUTES = 525_600;
+
+export function isSparkQuotaLimitId(value) {
+  return CODEX_SPARK_LIMIT_IDS.includes(value);
+}
 const BACKEND_LIFECYCLE_STATES = new Set([
   "never_run",
   "running",
@@ -263,7 +277,7 @@ function canonicalInstant(value) {
 
 function normalizeQuotaLimitId(value) {
   const candidate = text(value, "");
-  return candidate === CODEX_PRIMARY_LIMIT_ID || candidate === CODEX_SPARK_LIMIT_ID
+  return candidate === CODEX_PRIMARY_LIMIT_ID || isSparkQuotaLimitId(candidate)
     ? candidate
     : "unknown";
 }
@@ -317,21 +331,60 @@ export function formatQuotaWindowDuration(durationMinutes) {
   return `${duration}-minute`;
 }
 
+// Every window kind this product names, mapped from the provider's technical
+// identity (limitId, durationMinutes) alone — never from a provider label
+// string. The 5-hour Spark window ("Codex Spark") arrives on the wire as
+// limit_id "codex_bengalfox" with window_minutes 300 alongside the Spark
+// seven-day window (observed 2026-08-19, when the provider re-introduced it).
+// An unrecognized combination classifies as an honest generic kind rather
+// than borrowing the weekly or five-hour identity.
+export const QUOTA_WINDOW_KINDS = Object.freeze([
+  "codex_five_hour",
+  "codex_seven_day",
+  "codex_provider_reported",
+  "spark_five_hour",
+  "spark_seven_day",
+  "spark_other",
+  "other"
+]);
+
+export function classifyQuotaWindowKind(limitId, durationMinutes) {
+  const duration = finite(durationMinutes, null);
+  if (limitId === CODEX_PRIMARY_LIMIT_ID) {
+    if (duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) return "codex_five_hour";
+    if (duration === CODEX_WEEKLY_ALLOWANCE_MINUTES) return "codex_seven_day";
+    if (isValidQuotaWindowDuration(duration)) return "codex_provider_reported";
+    return "other";
+  }
+  if (isSparkQuotaLimitId(limitId)) {
+    if (duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) return "spark_five_hour";
+    if (duration === CODEX_WEEKLY_ALLOWANCE_MINUTES) return "spark_seven_day";
+    // The limit identity is certain even when the duration is novel or
+    // unparseable, so the window keeps the generic Spark name rather than
+    // being promoted to a named duration or demoted to "other".
+    return "spark_other";
+  }
+  return "other";
+}
+
 export function quotaWindowLabel(limitId, durationMinutes) {
   const duration = finite(durationMinutes, null);
-  if (limitId === CODEX_PRIMARY_LIMIT_ID
-      && duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) {
-    return "Five-hour allowance";
+  switch (classifyQuotaWindowKind(limitId, duration)) {
+    case "codex_five_hour":
+      return "Five-hour allowance";
+    case "codex_seven_day":
+      return "Seven-day allowance";
+    case "codex_provider_reported":
+      return `Provider-reported ${formatQuotaWindowDuration(duration)} window`;
+    case "spark_five_hour":
+      return "Spark five-hour allowance";
+    case "spark_seven_day":
+      return "Spark seven-day allowance";
+    case "spark_other":
+      return "Spark allowance";
+    default:
+      return "Other observed allowance";
   }
-  if (limitId === CODEX_PRIMARY_LIMIT_ID
-      && duration === CODEX_WEEKLY_ALLOWANCE_MINUTES) {
-    return "Seven-day allowance";
-  }
-  if (limitId === CODEX_PRIMARY_LIMIT_ID
-      && isValidQuotaWindowDuration(duration)) {
-    return `Provider-reported ${formatQuotaWindowDuration(duration)} window`;
-  }
-  return "Other observed allowance";
 }
 
 function count(value, fallback = null) {

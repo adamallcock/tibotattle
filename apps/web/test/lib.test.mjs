@@ -1992,7 +1992,10 @@ test("normal Codex allowance selection uses stable identifiers, not labels", () 
   });
   assert.equal(CODEX_PRIMARY_LIMIT_ID, "codex");
   assert.equal(result.quotaWindows[0].label, "Seven-day allowance");
-  assert.equal(result.quotaWindows[1].label, "Other observed allowance");
+  // The Spark limit's recognized durations now carry their own fixed names —
+  // still derived from (limitId, duration) alone, never from the provider's
+  // label string supplied above.
+  assert.equal(result.quotaWindows[1].label, "Spark seven-day allowance");
   assert.equal(result.quotaWindows[2].label, "Other observed allowance");
   assert.equal(result.quotaWindows[0].limitId, CODEX_PRIMARY_LIMIT_ID);
   assert.equal(result.quotaWindows[1].limitId, CODEX_SPARK_LIMIT_ID);
@@ -2270,10 +2273,14 @@ test("account-scoped normalization keeps generic and seven-day tracks separate",
 
 test("quota presentation keeps Spark separate and weekly surfaces exact", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  assert.match(appSource, /CODEX_SPARK_LIMIT_ID/u);
+  assert.match(appSource, /isSparkQuotaLimitId/u);
   assert.match(appSource, /const sparkWindows = data\.quotaWindows\.filter/u);
   assert.match(appSource, /quota-card-spark/u);
   assert.match(appSource, /dashboard\.quota\.windowSpark/u);
+  // The Spark limit's two recognized windows carry duration-named titles; the
+  // duration-blind windowSpark key stays as the honest generic fallback only.
+  assert.match(appSource, /dashboard\.quota\.windowSparkFiveHour/u);
+  assert.match(appSource, /dashboard\.quota\.windowSparkSevenDay/u);
   assert.match(appSource, /dashboard\.quota\.spark/u);
   assert.match(appSource, /const normalWindows = data\.quotaWindows\.filter\(isPrimaryCodexQuotaWindow\)/u);
   assert.match(appSource, /rows\.filter\(isPrimaryCodexWeeklyQuotaWindow\)/u);

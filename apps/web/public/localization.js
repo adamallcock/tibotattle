@@ -204,6 +204,12 @@ export const WEB_MESSAGES = Object.freeze({
   "dashboard.quota.windowFiveHour": ["Five-hour allowance", "五小时额度", "Asignación de cinco horas"],
   "dashboard.quota.windowSevenDay": ["Seven-day allowance", "七天额度", "Asignación de siete días"],
   "dashboard.quota.windowSpark": ["Spark allowance", "Spark 额度", "Asignación de Spark"],
+  // The provider's separate Spark limit now reports two windows at once (the
+  // re-introduced 5-hour "Codex Spark" window and its seven-day window), so
+  // each recognized duration carries its own title while windowSpark stays the
+  // honest generic name for any unfamiliar Spark duration.
+  "dashboard.quota.windowSparkFiveHour": ["Spark five-hour allowance", "Spark 五小时额度", "Asignación de Spark de cinco horas"],
+  "dashboard.quota.windowSparkSevenDay": ["Spark seven-day allowance", "Spark 七天额度", "Asignación de Spark de siete días"],
   "dashboard.quota.spark": ["Spark · separate limit", "Spark · 独立额度", "Spark · límite separado"],
   "dashboard.quota.windowProviderReported": ["Provider-reported {duration} window", "提供方报告的 {duration} 窗口", "Ventana de {duration} informada por el proveedor"],
   "dashboard.quota.windowOther": ["Other observed allowance", "其他观测到的额度", "Otra asignación observada"],
