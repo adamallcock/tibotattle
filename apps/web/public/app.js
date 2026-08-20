@@ -149,6 +149,15 @@ function paginateCacheImpactRows(rows, state, signature) {
     pageCount,
   };
 }
+// The companion's last health answer, or null when no answer has landed.
+// Health is not a constant of the page's lifetime and a single bootstrap read
+// cannot settle it. The companion derives
+// `capabilities.incrementalContributionSync` per request from two live facts —
+// a configured contribution service AND an existing unified index — so on a
+// fresh install the bootstrap read wins the race against first-run indexing
+// and gets a truthful `false` that stops being true minutes later, while a
+// read that loses the race lands as null. Both latch every capability gate
+// below into "this build has no v1.0 transport" for the life of the page.
 let localCompanionHealth = null;
 // The last refresh run's accounting-rebuild deferral, read from the local
 // refresh status alongside each dashboard load. A rebuild that keeps missing
@@ -9960,7 +9969,11 @@ async function loadLocalDashboard() {
       localClient.fastModePreference().catch(() => null),
       localClient.refreshStatus().catch(() => null)
     ]);
-    localCompanionHealth = localHealth;
+    // A read that did not land says nothing about the companion, so it may not
+    // replace one that did: the same rule the accounting-rebuild note above
+    // follows. Only the unavailable-state decision below reads THIS load's
+    // answer, because that is the one it is reporting on.
+    if (localHealth !== null) localCompanionHealth = localHealth;
     fastModePreference = speedPreference;
     if (refreshState !== null) {
       accountingRebuildDeferral =
@@ -9972,25 +9985,28 @@ async function loadLocalDashboard() {
     // disabled state bootstrap gave them when the capability was still unknown.
     renderHostedIdentity();
     renderContributionSyncStatus(sync.status);
+    // Before the consent read, because that read now also recovers whichever
+    // companion answers are still unsettled — and an onboarding verdict this
+    // load already holds is not one of them.
+    renderLocalOnboarding(onboarding);
     // Consent state is read from the companion before the queue renders, so
     // an already-approved Mac never re-prepares a review instance it no
     // longer needs.
     await loadIncrementalSyncStatus();
     renderContributionSyncPreview(sync.preview);
-    renderLocalOnboarding(onboarding);
     markLocalDashboardReady();
   } catch {
     const [localHealth, onboarding] = await Promise.all([
       localClient.health().catch(() => null),
       localClient.onboarding().catch(() => null),
     ]);
-    localCompanionHealth = localHealth;
+    if (localHealth !== null) localCompanionHealth = localHealth;
     dashboard = null;
     renderHostedIdentity();
     renderContributionSyncStatus(null);
+    renderLocalOnboarding(onboarding);
     await loadIncrementalSyncStatus();
     renderContributionSyncPreview(null);
-    renderLocalOnboarding(onboarding);
     renderDashboardUnavailableState(
       localHealth ? "dashboard-unavailable" : "companion-unavailable",
     );
@@ -11583,11 +11599,20 @@ function renderCommunityJourney() {
   // 2026-08-08: connecting is no longer a user-visible step — the ceremony
   // pairs this Mac itself). Once approval stands the line states the flow's
   // remaining truth: it syncs automatically.
-  if (localCompanionHealth === null) {
-    stage("community", "waiting", "journey.community.waitingCompanion");
+  if (localCompanionHealthUnknown()) {
+    // Never "waiting for the Mac app first": the Mac app is what serves this
+    // page, so its absence is not what a reader seeing this line is looking
+    // at. What is missing is its answer to a status check — and the line may
+    // promise another attempt only while the recovery poll still has one.
+    stage("community", "waiting", localCompanionRecoveryActive()
+      ? "journey.community.waitingHealth"
+      : "journey.community.noHealthAnswer");
   } else if (!contributionServiceConfigured()) {
     stage("community", "waiting", "journey.community.noService");
   } else if (!incrementalSyncCapabilityAdvertised()) {
+    // Here the index IS the blocker and the line may say so: the companion
+    // answered, reports a contribution service, and derives this flag from
+    // the unified index the first run has not written yet.
     // A build whose companion does not advertise the v1.0 transport has no
     // in-page ceremony; a Mac already holding upload authority still reads
     // as connected rather than pending.
@@ -11628,6 +11653,43 @@ const INCREMENTAL_SYNC_CONTRACT = "telemetry-contribution-v1.0";
 function incrementalSyncCapabilityAdvertised() {
   return localCompanionHealth?.capabilities?.incrementalContributionSync
     === INCREMENTAL_SYNC_CONTRACT;
+}
+
+/**
+ * Whether the companion has answered a health read at all. Every capability
+ * gate on this page reads a falsy answer out of a null payload, which makes an
+ * unheard companion indistinguishable from a build that carries no transport.
+ * Only surfaces that STATE a reason need the difference; the gates themselves
+ * stay closed either way, because a capability nobody confirmed may not be
+ * offered.
+ */
+function localCompanionHealthUnknown() {
+  return localCompanionHealth === null;
+}
+
+/**
+ * Whether the recovery poll still has a read left in its budget. Copy may
+ * promise another attempt only while this holds; once the budget is spent, a
+ * line that still says "checking again" is the same kind of untruth this
+ * recovery exists to remove.
+ */
+function localCompanionRecoveryActive() {
+  return incrementalSyncPollCount < INCREMENTAL_SYNC_POLL_LIMIT;
+}
+
+/**
+ * Whether the v1.0 transport's advertisement is one the page may treat as
+ * final. Three answers, not two: unknown (no read landed), advertised, and a
+ * `false` that the companion recomputes per request from the unified index the
+ * first run has not written yet. Only the last two are stable — and the third
+ * is stable only where the companion reports no contribution service at all,
+ * because `contributionDevicePairing` is fixed when the companion starts, so
+ * no amount of indexing can make the transport appear behind it.
+ */
+function incrementalSyncCapabilitySettled() {
+  if (localCompanionHealthUnknown()) return false;
+  return incrementalSyncCapabilityAdvertised()
+    || !contributionServiceConfigured();
 }
 
 /**
@@ -11938,6 +12000,11 @@ const INCREMENTAL_SYNC_POLL_INTERVAL_MS = 4_000;
 const INCREMENTAL_SYNC_POLL_LIMIT = 450;
 
 function incrementalSyncPollWorthwhile() {
+  // An unsettled companion read is itself movement worth waiting for, and it
+  // must be tested BEFORE the capability gate: the capability is exactly what
+  // an unsettled read cannot yet report, so gating recovery on it is the
+  // deadlock that left a fresh install stuck with no retry and no error.
+  if (localCompanionReadUnsettled()) return true;
   if (!incrementalSyncCapabilityAdvertised() || !incrementalConsentApproved) {
     return false;
   }
@@ -11948,6 +12015,29 @@ function incrementalSyncPollWorthwhile() {
   return status.progress.daysPending > 0;
 }
 
+/**
+ * Whether either companion read the page's gates depend on is still an answer
+ * it may not act on. Both are read once at bootstrap against a companion that
+ * is busy building its first index, and both fail closed onto a user-visible
+ * gate: the transport advertisement hides the whole approve ceremony, and the
+ * onboarding verdict disables the only analysis button on the page.
+ */
+function localCompanionReadUnsettled() {
+  return !incrementalSyncCapabilitySettled() || localOnboardingUnsettled();
+}
+
+/**
+ * Whether the onboarding verdict could be either of two different things. A
+ * failed read normalizes to the exact shape a companion with no readable Codex
+ * home reports, so `unavailable` alone cannot say which happened — and that
+ * shape disables Analyze/Update local usage. When the dashboard rendered from
+ * real evidence there is nothing else on screen to press, so re-reading is the
+ * only way out.
+ */
+function localOnboardingUnsettled() {
+  return localOnboarding === null || localOnboarding.state === "unavailable";
+}
+
 function scheduleIncrementalSyncStatusPoll({ reset = false } = {}) {
   if (reset) incrementalSyncPollCount = 0;
   if (incrementalSyncPollTimer !== null) return;
@@ -11956,8 +12046,59 @@ function scheduleIncrementalSyncStatusPoll({ reset = false } = {}) {
   incrementalSyncPollTimer = window.setTimeout(() => {
     incrementalSyncPollTimer = null;
     incrementalSyncPollCount += 1;
-    void loadIncrementalSyncStatus().catch(() => {});
+    // A failed pass may not end the chain. This poll is now the recovery path
+    // for a companion that has not been heard from, so a link that dies —
+    // on a render fault, on a torn-down node — leaves the page in exactly the
+    // stuck state the chain exists to clear. The budget and the worthwhile
+    // test still bound it.
+    void loadIncrementalSyncStatus().catch(() => {
+      scheduleIncrementalSyncStatusPoll();
+    });
   }, INCREMENTAL_SYNC_POLL_INTERVAL_MS);
+}
+
+/**
+ * Re-read the companion answers the page's gates gate on, while they are still
+ * answers it may not act on. Quiet by construction: it renders only when an
+ * answer CHANGES, so an unknown that stays unknown produces no churn, and it
+ * rides the incremental-sync poll's existing cadence and budget rather than a
+ * timer of its own. A failed re-read never downgrades an answer that already
+ * landed — a transient loopback failure must not un-advertise a transport the
+ * companion confirmed.
+ */
+async function recoverLocalCompanionReads() {
+  const [localHealth, onboarding] = await Promise.all([
+    incrementalSyncCapabilitySettled()
+      ? null
+      : localClient.health().catch(() => null),
+    localOnboardingUnsettled()
+      ? localClient.onboarding().catch(() => null)
+      : null,
+  ]);
+  let recovered = false;
+  if (localHealth !== null) {
+    const wasAdvertised = incrementalSyncCapabilityAdvertised();
+    const wasUnknown = localCompanionHealthUnknown();
+    localCompanionHealth = localHealth;
+    if (wasUnknown
+        || incrementalSyncCapabilityAdvertised() !== wasAdvertised) {
+      // The sign-in controls are gated on a capability this payload carries,
+      // and they hold whatever disabled state they were given while it was
+      // unknown until something re-renders them.
+      renderHostedIdentity();
+      recovered = true;
+    }
+    if (incrementalSyncCapabilityAdvertised() && !wasAdvertised) {
+      // The transport just landed, so the poll's real work starts now. Reads
+      // spent waiting for it must not come out of the live-progress budget.
+      incrementalSyncPollCount = 0;
+    }
+  }
+  if (onboarding !== null && onboarding.state !== localOnboarding?.state) {
+    renderLocalOnboarding(onboarding);
+    recovered = true;
+  }
+  if (recovered) renderContributionActionState();
 }
 
 /**
@@ -11966,10 +12107,15 @@ function scheduleIncrementalSyncStatusPoll({ reset = false } = {}) {
  * and the progress facts the status line prints.
  */
 async function loadIncrementalSyncStatus() {
+  await recoverLocalCompanionReads();
   if (!incrementalSyncCapabilityAdvertised()) {
     incrementalSyncStatus = null;
     incrementalConsentApproved = false;
     renderContributionActionState();
+    // An unadvertised transport is not necessarily an absent one, and this
+    // chained poll is the only thing that will notice when it lands. Leaving
+    // before scheduling it is what made the first read final.
+    scheduleIncrementalSyncStatusPoll();
     return;
   }
   // The same bounded GET the client performs, read raw once so the optional
