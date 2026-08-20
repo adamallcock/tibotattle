@@ -37,7 +37,9 @@ export const WEEKLY_CALIBRATION_MINIMUM_DISPLAYED_SPAN_PP = 5;
 // parameter of its own and is priced at the pooled remainder rate instead.
 // Same provenance rule as the two gates above - guarded by a source contract
 // test, because the per-model card states this threshold to the reader.
-export const COMPOSITION_MINIMUM_MODEL_COST_SHARE_PERCENT = 2;
+// Moved 2 -> 3 with the kernel on 2026-08-20; the contract test is what caught
+// the drift, which is exactly what it is for.
+export const COMPOSITION_MINIMUM_MODEL_COST_SHARE_PERCENT = 3;
 
 const RTL_LANGUAGES = new Set([
   "ar",

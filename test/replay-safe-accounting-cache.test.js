@@ -1540,6 +1540,7 @@ test("the streaming composition binning matches the per-event kernel path exactl
     r2: reference.fit.r2,
     singleConstantUsd: reference.fit.singleConstantUsd,
     singleConstantR2: reference.fit.singleConstantR2,
+    identification: reference.fit.identification ?? null,
     blendedRecentMixUsd: Number(reference.blendedRecentMixUsd.toFixed(2)),
     recentMixDays: 14,
   });
@@ -2912,6 +2913,9 @@ test("compact transition input ceilings fail closed without truncating or replac
 // 1.25 GiB self-growth delta, effective = min(absolute, baseline + delta).
 const ACCOUNTING_RSS_ABSOLUTE = 2 * 1024 * 1024 * 1024;
 const ACCOUNTING_RSS_DELTA = Math.floor(1.25 * 1024 * 1024 * 1024);
+// Mirrored from src/export/resource-policy.js: the shared export policy's own
+// RSS bound, which clamps the deep-scan guard independently of the above.
+const EXPORT_POLICY_MAX_RSS_BYTES = Math.floor(1.5 * 1024 * 1024 * 1024);
 
 test("an RSS ceiling miss during accounting is a soft target: the prior cache is retained and served", async () => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rss-bound-"));
@@ -3183,13 +3187,20 @@ test("the scan resource guard inherits the budget-relative RSS ceiling", async (
     },
   });
 
-  // The deep-scan guard polices the same pass, so it must carry the same
-  // effective ceiling (baseline + delta budget here, since that is below the
-  // absolute constant) rather than the absolute constant alone.
+  // The deep-scan guard polices the same pass and carries the LOWER of the
+  // accounting effective ceiling and the shared export policy's own RSS bound.
+  // Asserted as the explicit min() rather than assuming which side wins, so a
+  // future move in either constant fails here instead of silently loosening or
+  // tightening the scan phase.
   assert.equal(
     observedGuard?.limits.maximumRssBytes,
-    baseline + ACCOUNTING_RSS_DELTA,
+    Math.min(baseline + ACCOUNTING_RSS_DELTA, EXPORT_POLICY_MAX_RSS_BYTES),
   );
+  // At this modest baseline — the shape the rebuild child actually runs at —
+  // the budget-relative ceiling is the lower of the two, so the guard inherits
+  // it rather than the export policy's flat bound.
+  assert.equal(observedGuard?.limits.maximumRssBytes, baseline + ACCOUNTING_RSS_DELTA);
+  assert.ok(baseline + ACCOUNTING_RSS_DELTA < EXPORT_POLICY_MAX_RSS_BYTES);
 });
 
 test("deep log scanning receives hard resource bounds and preserves the last cache when they trip", async () => {

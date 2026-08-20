@@ -91,6 +91,19 @@ private enum BundledNodeRuntimeMode: String {
         entrypoint: URL,
         trailing: [String] = []
     ) -> [String] {
+        // Deliberately carries NO --max-old-space-size. This builder feeds only
+        // long-lived or trivial entrypoints — the resident companion
+        // (apps/local/server.js) and the keychain-reset helper — and neither
+        // performs an accounting rebuild: since the rebuild moved into a
+        // short-lived child, the companion only ever spawns it, and that child
+        // is launched by Node with its own explicit cap
+        // (ACCOUNTING_REBUILD_CHILD_OLD_SPACE_MIB in
+        // src/replay-safe-accounting-cache.js). A flag set here could not reach
+        // it in any case: the child is spawned, not forked, so it does not
+        // inherit execArgv, and its environment is stripped of NODE_OPTIONS by
+        // construction. Raising the companion's heap would only enlarge the
+        // resident menu-bar process, which is the opposite of what moving the
+        // rebuild out of it was for.
         let runtimeArguments = self == .jitless ? ["--jitless"] : []
         return runtimeArguments + [entrypoint.path] + trailing
     }

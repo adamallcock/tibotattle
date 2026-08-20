@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1032,6 +1032,300 @@ test("a rebuild completes in the child while the parent sits past the absolute R
       weeklyTransitions: SUBPROCESS_FIXTURE_TRANSITIONS,
       historyStatus: "available",
     });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Heap cap vs RSS ceiling (2026-08-20). Isolating the rebuild moved BOTH the
+// memory guard and the V8 old-space cap into the child, and the ORDER of those
+// two numbers decides which of two very different things the user gets when a
+// rebuild runs out of room:
+//
+//   cap AT OR ABOVE the ceiling -> the RSS guard reads first and throws the
+//     metered accounting_transition_rss_limit_exceeded; the parent defers with
+//     the prior cache retained and served, and the reason names the budget;
+//   cap BELOW the ceiling -> V8 aborts the child before the guard can ever
+//     read, the parent sees only a dead child, and the identical event is
+//     reported as the opaque accounting_rebuild_subprocess_failed.
+//
+// Both paths end in a deferral, so from outside the difference is invisible —
+// which is precisely how a proposed 6 GiB RSS target came to be paired with a
+// 1 GiB child heap, leaving a guard that could never fire. These tests pin the
+// order itself: once at production values, once causally.
+// ---------------------------------------------------------------------------
+
+test("the rebuild child is spawned with a heap cap at or above the RSS ceiling it is handed", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rebuild-cap-order-"));
+  try {
+    const fixture = await writeCompleteGenerationIndex(
+      join(directory, "local-unified-index-v1.sqlite"),
+      {
+        resetStarts: [Date.parse("2026-05-07T00:00:00.000Z")],
+        boundariesPerReset: 10,
+        usagePerBoundary: 2,
+      },
+    );
+    // A probe standing in for the real child: it records what the parent
+    // ACTUALLY launched it with, then dies. Both numbers are read from the real
+    // spawn rather than mirrored from the module, so this cannot drift out of
+    // agreement with the constants the way a copied literal would. The child's
+    // environment is stripped on the way in (no NODE_OPTIONS, no HOME), so the
+    // readback path is baked into the probe's source instead of passed through.
+    const probeFile = join(directory, "spawn-probe-v1.json");
+    const probeEntry = join(directory, "spawn-probe-child.mjs");
+    await writeFile(probeEntry, [
+      "import { readFileSync, writeFileSync } from \"node:fs\";",
+      `writeFileSync(${JSON.stringify(probeFile)}, JSON.stringify({`,
+      "  execArgv: process.execArgv,",
+      "  requestMaximumRssBytes:",
+      "    JSON.parse(readFileSync(process.argv[2], \"utf8\")).maximumRssBytes,",
+      "}));",
+      "process.exit(91);",
+      "",
+    ].join("\n"));
+    await refreshReplaySafeAccountingCache({
+      stateFile: join(directory, "local-collector-state-v1.sqlite"),
+      sourceMode: "unified",
+      expectedGeneration: fixture.expectedGeneration,
+      unifiedIndexFile: fixture.indexFile,
+      now: () => NOW,
+      declaredSpeedBaselines: DECLARED_SPEED_BASELINES,
+      rebuildSubprocessEntry: probeEntry,
+    });
+
+    const probe = JSON.parse(await readFile(probeFile, "utf8"));
+    const capPrefix = "--max-old-space-size=";
+    const capArgument = probe.execArgv.find(
+      (argument) => argument.startsWith(capPrefix),
+    );
+    assert.ok(
+      capArgument !== undefined,
+      "the rebuild child must carry an explicit old-space cap, since it inherits "
+        + `neither execArgv nor NODE_OPTIONS (saw ${JSON.stringify(probe.execArgv)})`,
+    );
+    const capBytes = Number(capArgument.slice(capPrefix.length)) * 1024 * 1024;
+    assert.ok(Number.isSafeInteger(capBytes) && capBytes > 0);
+    assert.ok(
+      Number.isSafeInteger(probe.requestMaximumRssBytes)
+        && probe.requestMaximumRssBytes > 0,
+      "the request must carry the absolute RSS target the child will enforce",
+    );
+    // THE INVARIANT. The child's effective ceiling is
+    // min(requestMaximumRssBytes, childBaseline + delta), which is at most
+    // requestMaximumRssBytes for EVERY baseline, and whole-process RSS always
+    // exceeds the JS heap. A cap at or above the absolute target therefore
+    // guarantees the guard can read before V8 aborts, at any baseline — which
+    // is what keeps the graceful deferral below reachable at all.
+    assert.ok(
+      capBytes >= probe.requestMaximumRssBytes,
+      `the child's V8 heap cap (${capBytes} bytes) must sit at or above the RSS `
+        + `ceiling it is handed (${probe.requestMaximumRssBytes} bytes); below it, `
+        + "V8 aborts the child before the guard can defer and the honest budget "
+        + "reason is replaced by accounting_rebuild_subprocess_failed",
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a child over its RSS ceiling defers with the metered reason, not a subprocess failure", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rebuild-honest-defer-"));
+  try {
+    const fixture = await writeCompleteGenerationIndex(
+      join(directory, "local-unified-index-v1.sqlite"),
+      SUBPROCESS_FIXTURE_SHAPE,
+    );
+    const stateFile = join(directory, "local-collector-state-v1.sqlite");
+    // A prior good cache on disk so the retention half of the soft-fail is
+    // observable, written through the in-process characterization path.
+    const prior = await refreshReplaySafeAccountingCache({
+      stateFile,
+      now: () => NOW,
+      scan: async ({ onUsage }) => {
+        onUsage({
+          timestamp: "2026-08-19T11:00:00.000Z",
+          model: "gpt-5.6-sol",
+          components: { input_uncached_tokens: 1_000 },
+        });
+        return { diagnostics: {} };
+      },
+    });
+    const shared = {
+      stateFile,
+      sourceMode: "unified",
+      expectedGeneration: fixture.expectedGeneration,
+      unifiedIndexFile: fixture.indexFile,
+      declaredSpeedBaselines: DECLARED_SPEED_BASELINES,
+    };
+    // The REAL production path — real spawn, real child entry, real guard —
+    // with only the ceiling lowered under what the child needs to load itself.
+    const deferredEvents = [];
+    const deferred = await refreshReplaySafeAccountingCache({
+      ...shared,
+      now: () => NOW + 1_000,
+      maximumRssBytes: 24 * 1024 * 1024,
+      onAccountingRebuildDeferred: (event) => {
+        deferredEvents.push(event);
+      },
+    });
+    assert.equal(deferred.status, "accounting_rebuild_deferred");
+    // The whole point of the cap ordering: a MEASURED budget miss crossed the
+    // process boundary as itself. A child killed by its own heap cap cannot
+    // report anything, so it arrives as the opaque subprocess code instead —
+    // same deferral, no recoverable reason.
+    assert.equal(deferred.reason, "accounting_transition_rss_limit_exceeded");
+    assert.notEqual(deferred.reason, "accounting_rebuild_subprocess_failed");
+    assert.equal(deferred.retained, true);
+    assert.equal(deferred.generatedAt, prior.generatedAt);
+    assert.deepEqual(deferredEvents, [{
+      reason: "accounting_transition_rss_limit_exceeded",
+      retained: true,
+    }]);
+    // The prior cache survived the miss untouched and is still what is served.
+    const held = await readReplaySafeAccountingCache({ stateFile });
+    assert.equal(held.status, "available");
+    assert.deepEqual(held.cache, prior);
+    // Control: the identical call at the shipped ceiling REBUILDS, so the
+    // deferral above was the ceiling's doing and not a child that cannot run.
+    const rebuilt = await refreshReplaySafeAccountingCache({
+      ...shared,
+      now: () => NOW + 2_000,
+    });
+    assert.equal(rebuilt.schemaVersion, REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION);
+    assert.equal(rebuilt.weeklyCalibrationInput.source, "unified_index");
+    assert.equal(
+      rebuilt.weeklyCalibration.sourceCounts.weeklyTransitions,
+      SUBPROCESS_FIXTURE_TRANSITIONS,
+    );
+    const served = await readReplaySafeAccountingCache({ stateFile });
+    assert.deepEqual(served.cache, rebuilt);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+// Both arms run the REAL streamed build against the SAME corpus and stop at the
+// same memory pressure. Only the order of the two numbers differs, so any
+// difference in outcome is attributable to the order alone.
+const CAP_ORDER_CHILD = String.raw`
+const { buildReplaySafeAccountingCache } = await import(
+  process.env.CAP_ORDER_MODULE
+);
+const baselineRss = process.memoryUsage().rss;
+let outcome;
+try {
+  await buildReplaySafeAccountingCache({
+    now: () => Number(process.env.CAP_ORDER_NOW_MS),
+    unifiedIndexFile: process.env.CAP_ORDER_INDEX_FILE,
+    declaredSpeedBaselines: JSON.parse(process.env.CAP_ORDER_BASELINES),
+    scan: async () => ({ diagnostics: {} }),
+    maximumRssBytes: baselineRss + Number(process.env.CAP_ORDER_BUDGET_BYTES),
+  });
+  outcome = { status: "completed", code: null };
+} catch (error) {
+  outcome = { status: "refused", code: error?.code ?? null };
+}
+process.stdout.write(JSON.stringify(outcome) + "\n");
+`;
+
+// The pressure point both arms stop at, chosen from this corpus's measured
+// shape: the streamed build holds ~104 MiB of live heap and grows ~150 MiB of
+// RSS here, and it still completes at a 96 MiB cap but aborts at 80 MiB and
+// below. 64 MiB therefore sits under BOTH with margin — small enough that a cap
+// of this size provably cannot hold the build (so arm 2 aborts rather than
+// finishing), large enough that the module loads and the build is well underway
+// first (so the abort is a real overflow, not a failure to start).
+const CAP_ORDER_PRESSURE_MIB = 64;
+// Comfortably above the pressure point, mirroring the shipped relationship
+// (cap >= ceiling) without needing the shipped corpus to reach it.
+const CAP_ORDER_ROOMY_CAP_MIB = 512;
+const CAP_ORDER_UNREACHABLE_BUDGET_MIB = 8_192;
+
+function runCapOrderArm({ oldSpaceMiB, budgetMiB, indexFile }) {
+  return spawnSync(process.execPath, [
+    `--max-old-space-size=${oldSpaceMiB}`,
+    "--input-type=module",
+    "--eval",
+    CAP_ORDER_CHILD,
+  ], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    timeout: 150_000,
+    env: {
+      ...process.env,
+      CAP_ORDER_MODULE:
+        new URL("../src/replay-safe-accounting-cache.js", import.meta.url).href,
+      CAP_ORDER_INDEX_FILE: indexFile,
+      CAP_ORDER_NOW_MS: String(NOW),
+      CAP_ORDER_BASELINES: JSON.stringify(DECLARED_SPEED_BASELINES),
+      CAP_ORDER_BUDGET_BYTES: String(budgetMiB * 1024 * 1024),
+    },
+  });
+}
+
+test("the same overflow is a typed budget miss above the cap and an untyped death below it", { timeout: 240_000 }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-cap-order-arms-"));
+  try {
+    const corpus = syntheticCorpus({
+      resetStarts: Array.from(
+        { length: 6 },
+        (_, week) => Date.parse("2026-04-02T00:00:00.000Z") + week * WEEK_MS,
+      ),
+      boundariesPerReset: 1_000,
+      usagePerBoundary: 50,
+      boundaryStepMs: 60_000,
+      percentFor: (boundary) => (boundary % 200) / 2,
+    });
+    assert.equal(corpus.usage.length, 300_000);
+    const indexFile = join(directory, "local-unified-index-v1.sqlite");
+    await writeCorpusIndex(indexFile, corpus);
+
+    // Arm 1 — cap AT OR ABOVE the ceiling, the shipped relationship. The RSS
+    // guard is what stops the pass, so the refusal is typed and the parent can
+    // report WHY it deferred.
+    const guarded = runCapOrderArm({
+      oldSpaceMiB: CAP_ORDER_ROOMY_CAP_MIB,
+      budgetMiB: CAP_ORDER_PRESSURE_MIB,
+      indexFile,
+    });
+    assert.equal(guarded.error, undefined, guarded.error?.message);
+    assert.equal(guarded.signal, null, guarded.stderr);
+    assert.equal(guarded.status, 0, guarded.stderr);
+    const guardedOutcome = JSON.parse(guarded.stdout);
+    assert.deepEqual(guardedOutcome, {
+      status: "refused",
+      code: "accounting_transition_rss_limit_exceeded",
+    });
+
+    // Arm 2 — cap BELOW the ceiling, the inversion. The ceiling is set out of
+    // reach so ONLY the cap can bite, and the same corpus at the same pressure
+    // now kills the process outright: no code, no envelope, nothing for the
+    // parent to classify beyond "the child died".
+    const starved = runCapOrderArm({
+      oldSpaceMiB: CAP_ORDER_PRESSURE_MIB,
+      budgetMiB: CAP_ORDER_UNREACHABLE_BUDGET_MIB,
+      indexFile,
+    });
+    assert.equal(starved.error, undefined, starved.error?.message);
+    assert.notEqual(
+      starved.status,
+      0,
+      "a cap below the ceiling must abort the child rather than let it refuse "
+        + `cleanly (stdout: ${starved.stdout})`,
+    );
+    assert.equal(
+      starved.stdout.trim(),
+      "",
+      "an aborted child cannot emit a typed refusal, which is exactly why the "
+        + "parent has to fall back to accounting_rebuild_subprocess_failed",
+    );
+    t.diagnostic(
+      `at ${CAP_ORDER_PRESSURE_MIB} MiB of pressure: cap above the ceiling `
+        + `refused with ${guardedOutcome.code}; cap below it died with `
+        + `status ${starved.status} / signal ${starved.signal}`,
+    );
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
