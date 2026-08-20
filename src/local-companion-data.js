@@ -2697,9 +2697,17 @@ export async function buildLocalCompanionSnapshot({
   const pricingCoveragePercent = (displayUsage?.events ?? 0) === 0
     ? null
     : Number(((pricedEvents / displayUsage.events) * 100).toFixed(3));
+  // Each warning is a finished sentence in the register the dashboard reserves
+  // for degraded states: what happened, what it means for the figures on
+  // screen, and when or how it resolves — the voice the allowance and trends
+  // panels already use (owner-directed, 2026-08-19). The two withheld-cache
+  // sentences below are deliberately untouched: the serve-stale-while-
+  // recalculating work replaces them wholesale.
   const warnings = [];
   if (collectorFreshnessStatus === "stale") {
-    warnings.push("The newest retained collector evidence is stale.");
+    warnings.push(
+      `The newest retained collector evidence is more than ${Math.round(MAX_COLLECTOR_LIVE_AGE_MS / 60_000)} minutes old. This is expected after an idle stretch; any newer usage is counted on the next collector pass.`,
+    );
   }
   // The "Replay-safe cost accounting is N minutes old and is shown as stale
   // until refreshed" banner is gone (owner-directed, 2026-08-10). Trace: it
@@ -2723,7 +2731,7 @@ export async function buildLocalCompanionSnapshot({
   if (replaySafeCache === null && !unifiedAvailable
       && (displayUsage?.events ?? 0) > 0) {
     warnings.push(
-      "Recent cost accounting is using the live collector projection. It may include inherited snapshots from forked child rollouts until the replay-safe cache is refreshed.",
+      "Recent cost figures come from the live collector projection until the replay-safe cache is refreshed. They may double-count usage that forked child sessions inherited.",
     );
   }
   if (unifiedAccountingWithheld) {
@@ -2765,7 +2773,17 @@ export async function buildLocalCompanionSnapshot({
     );
   }
   if (indexing.status === "prospective_only") {
-    warnings.push("The retained collector state began prospectively and does not prove recent-history coverage.");
+    // "Prospective" is the collector's own vocabulary; the reader needs the
+    // consequence: tracking began fresh rather than by indexing what came
+    // before, so the retained records start at a date — named when known —
+    // and nothing earlier is asserted. The disclosure itself must survive
+    // the plainer words.
+    const trackingStartDate = typeof indexing.coveredAt?.startAt === "string"
+      ? indexing.coveredAt.startAt.slice(0, 10)
+      : null;
+    warnings.push(trackingStartDate === null
+      ? "Quota tracking started fresh on this Mac, so its retained records begin when the collector first ran. Coverage of anything earlier is not claimed."
+      : `Quota tracking started fresh on this Mac, so its retained records begin on ${trackingStartDate}. Coverage of anything earlier is not claimed.`);
   }
   const displayUnknownModelEvents = displayUsage?.byModel
     ?.find((row) => row.model === "unknown")?.events ?? 0;
