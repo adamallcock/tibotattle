@@ -16,6 +16,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { setTimeout as sleepFor } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { PRODUCT_BRAND } from "../config/product-brand.js";
 import { CANONICAL_STABLE_APPCAST_POLICY } from "../config/sparkle-appcast-policy.js";
@@ -93,6 +94,23 @@ const ED25519_SPKI_PREFIX = Buffer.from(
 );
 const SAFE_RELEASE_OBJECT_FILE_NAME_PATTERN =
   /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(?:dmg|delta)$/u;
+// Wrangler's OAuth access token lives about an hour, and the first invocation
+// after it expires refreshes the token while its own API call is already in
+// flight. That race answered four consecutive dogfood publishes with
+// `401: Unauthorized; {"code":10000,"message":"Authentication error"}` on the
+// pre-publish read, which an immediate rerun never reproduced because the
+// refreshed token was on disk by then. Every Wrangler failure that is not an
+// explicitly reported missing object is therefore retried a bounded number of
+// times, so a publish aborts only on a fault that outlives the whole budget.
+const WRANGLER_ATTEMPTS = 3;
+const WRANGLER_RETRY_BASE_DELAY_MS = 750;
+// Wrangler emits a few hundred bytes per invocation; the cap only bounds a
+// runaway stream so the failure message stays readable.
+const WRANGLER_DIAGNOSTIC_STREAM_LIMIT = 2000;
+// Wrangler colours its output even when stdout and stderr are pipes, so the
+// missing-object classifier and the failure diagnostic both read the text
+// with the SGR escapes removed.
+const ANSI_ESCAPE_PATTERN = /\u001B\[[0-9;]*m/gu;
 
 function fail(message, code = "SPARKLE_UPDATE_PUBLICATION_INVALID") {
   const error = new Error(message);
@@ -1176,11 +1194,120 @@ function wranglerObjectPath(bucket, key) {
   return `${bucket}/${key}`;
 }
 
+function wranglerStreamText(value) {
+  return typeof value === "string"
+    ? value.replace(ANSI_ESCAPE_PATTERN, "")
+    : "";
+}
+
+/**
+ * Wrangler names a missing R2 object outright ("The specified key does not
+ * exist."). The classifier matches that sentence rather than any "not found"
+ * substring anywhere in the output, because a false missing-object verdict is
+ * the expensive direction: the caller then believes the object is absent,
+ * skips retained-object verification, and leaves the resume path unexercised.
+ * The loose form matched unrelated lines — the `.env file not found at ...`
+ * notice Wrangler prints at debug level, or a bucket that does not exist. A
+ * future wording change fails closed instead: the operation exhausts its retry
+ * budget and aborts with Wrangler's own output attached, which names the new
+ * wording on the first occurrence.
+ */
+const WRANGLER_MISSING_OBJECT_PATTERN =
+  /the specified key does not exist|no such key|nosuchkey|object not found/iu;
+
 function resultWasNotFound(result) {
   return result.status !== 0
-    && /(?:not found|does not exist|nosuchkey)/iu.test(
-      `${result.stdout ?? ""}\n${result.stderr ?? ""}`,
+    && WRANGLER_MISSING_OBJECT_PATTERN.test(
+      `${wranglerStreamText(result.stdout)}\n${wranglerStreamText(result.stderr)}`,
     );
+}
+
+// Wrangler answers an authentication failure by printing its whoami block:
+// the account email, the account id, the account-name/id table, and the full
+// token scope list. None of it diagnoses a publish failure — the error line,
+// the HTTP status, the API error body and the object key all arrive on stderr
+// or ahead of this block — and publish logs get pasted into issues, so the
+// block is dropped at its own marker and replaced by a visible note.
+const WRANGLER_IDENTITY_BLOCK_PATTERN =
+  /^.*Getting User settings\.\.\.[\s\S]*/mu;
+const WRANGLER_IDENTITY_BLOCK_REDACTION =
+  "[redacted: Wrangler account identity block]";
+const WRANGLER_EMAIL_PATTERN =
+  /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/gu;
+// A Cloudflare account id is exactly 32 hexadecimal characters, and one is
+// embedded in the `/accounts/<id>/…` path of every R2 error line. The
+// surrounding guards keep the 64-character content-addressed SHA-256 inside an
+// object key — which is load-bearing evidence and must survive — from being
+// mistaken for an account id. An R2 etag is also 32 hex characters and would
+// be redacted with it; no failure message quotes one.
+const WRANGLER_ACCOUNT_ID_PATTERN =
+  /(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])/giu;
+const WRANGLER_ACCOUNT_ID_REDACTION = "[redacted-account-id]";
+const WRANGLER_EMAIL_REDACTION = "[redacted-email]";
+
+/**
+ * Wrangler's status and both streams carry the entire diagnosis — a 401 auth
+ * race, a 5xx, a renamed bucket — and the parts that diagnose it are object
+ * keys and CLI text. Four masked publish failures produced no evidence at all,
+ * so every hard failure now quotes them. Everything that identifies the owner
+ * or the account is removed on the way out, each with a visible marker, so a
+ * publish log stays safe to share: the owner guard secret by value (it is also
+ * deleted from the environment before any Wrangler child is spawned, so no
+ * future call order can surface it), and the account identity by pattern.
+ */
+function describeWranglerResult(result) {
+  const guardToken = process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV];
+  const scrubbable = typeof guardToken === "string" && guardToken.length >= 32;
+  const present = (value) => {
+    const streamed = wranglerStreamText(value).replace(
+      WRANGLER_IDENTITY_BLOCK_PATTERN,
+      WRANGLER_IDENTITY_BLOCK_REDACTION,
+    );
+    const text = (scrubbable
+      ? streamed.split(guardToken).join("[redacted]")
+      : streamed)
+      .replace(WRANGLER_EMAIL_PATTERN, WRANGLER_EMAIL_REDACTION)
+      .replace(WRANGLER_ACCOUNT_ID_PATTERN, WRANGLER_ACCOUNT_ID_REDACTION);
+    const trimmed = text.trim();
+    if (trimmed.length === 0) return "(empty)";
+    return trimmed.length > WRANGLER_DIAGNOSTIC_STREAM_LIMIT
+      ? `${trimmed.slice(0, WRANGLER_DIAGNOSTIC_STREAM_LIMIT)} (truncated)`
+      : trimmed;
+  };
+  return `status ${result?.status ?? "unknown"}`
+    + `; stdout: ${present(result?.stdout)}`
+    + `; stderr: ${present(result?.stderr)}`;
+}
+
+/**
+ * Runs one Wrangler operation with a bounded retry. `isExpectedFailure` marks
+ * the outcomes that are answers rather than faults — a reported missing object
+ * for a read — so they return on the first attempt and never consume the
+ * budget. Everything else is retried with a linear backoff and announced on
+ * stderr, keeping stdout reserved for the publication receipt.
+ */
+async function runWranglerOperation({
+  arguments_,
+  attempts = WRANGLER_ATTEMPTS,
+  isExpectedFailure = () => false,
+  label,
+  runWrangler,
+  sleep = sleepFor,
+}) {
+  let result = {};
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    result = (await runWrangler(arguments_)) ?? {};
+    if (result.status === 0 || isExpectedFailure(result)) return result;
+    if (attempt === attempts) break;
+    const backoff = WRANGLER_RETRY_BASE_DELAY_MS * attempt;
+    console.warn(
+      `publish-sparkle-update: ${label} failed on Wrangler attempt `
+      + `${attempt} of ${attempts}; retrying in ${backoff}ms `
+      + `(${describeWranglerResult(result)})`,
+    );
+    await sleep(backoff);
+  }
+  return result;
 }
 
 function defaultRunWrangler(arguments_) {
@@ -1190,7 +1317,10 @@ function defaultRunWrangler(arguments_) {
     maxBuffer: 1024 * 1024,
   });
   if (result.error) {
-    fail("Pinned local Wrangler is unavailable", "SPARKLE_UPDATE_WRANGLER_FAILED");
+    fail(
+      `Pinned local Wrangler is unavailable: ${result.error.code ?? "unknown"}: ${result.error.message}`,
+      "SPARKLE_UPDATE_WRANGLER_FAILED",
+    );
   }
   return Object.freeze({
     status: result.status ?? 1,
@@ -1204,6 +1334,7 @@ async function readRemoteObject({
   key,
   maximumBytes = MAX_DMG_BYTES,
   runWrangler,
+  sleep,
   temporaryRoot,
 }) {
   const destination = join(
@@ -1211,19 +1342,27 @@ async function readRemoteObject({
     createHash("sha256").update(`read:${key}`).digest("hex"),
   );
   await rm(destination, { force: true });
-  const result = await runWrangler([
-    "r2",
-    "object",
-    "get",
-    wranglerObjectPath(bucket, key),
-    "--file",
-    destination,
-    "--remote",
-  ]);
-  if (result?.status !== 0) {
-    if (resultWasNotFound(result ?? {})) return null;
+  const result = await runWranglerOperation({
+    arguments_: [
+      "r2",
+      "object",
+      "get",
+      wranglerObjectPath(bucket, key),
+      "--file",
+      destination,
+      "--remote",
+    ],
+    // An absent object is the expected answer on a first publish, so it is
+    // returned immediately and never spends the retry budget.
+    isExpectedFailure: resultWasNotFound,
+    label: `reading R2 object ${key}`,
+    runWrangler,
+    sleep,
+  });
+  if (result.status !== 0) {
+    if (resultWasNotFound(result)) return null;
     fail(
-      `Unable to read R2 object ${key}`,
+      `Unable to read R2 object ${key} after ${WRANGLER_ATTEMPTS} Wrangler attempts: ${describeWranglerResult(result)}`,
       "SPARKLE_UPDATE_WRANGLER_FAILED",
     );
   }
@@ -1329,6 +1468,7 @@ async function validatePublishedEnclosureObjects({
   dmg,
   publishedObjectKeys = new Set(),
   runWrangler,
+  sleep,
   sparklePublicKey,
   temporaryRoot,
 }) {
@@ -1345,6 +1485,7 @@ async function validatePublishedEnclosureObjects({
           bucket,
           key: enclosure.objectKey,
           runWrangler,
+          sleep,
           temporaryRoot,
         }),
       );
@@ -1382,22 +1523,42 @@ async function validatePublishedEnclosureObjects({
   }
 }
 
-async function putObject({ bucket, key, path, contentType, cacheControl, runWrangler }) {
-  const result = await runWrangler([
-    "r2",
-    "object",
-    "put",
-    wranglerObjectPath(bucket, key),
-    "--file",
-    path,
-    "--content-type",
-    contentType,
-    "--cache-control",
-    cacheControl,
-    "--remote",
-  ]);
-  if (result?.status !== 0) {
-    fail("Wrangler could not publish the validated update object", "SPARKLE_UPDATE_WRANGLER_FAILED");
+async function putObject({
+  bucket,
+  key,
+  path,
+  contentType,
+  cacheControl,
+  runWrangler,
+  sleep,
+}) {
+  // The same expired-token race can answer an upload, and a spurious abort
+  // here strands a partial publication. Re-putting is safe to repeat: every
+  // key this function writes is content-addressed by the SHA-256 of the bytes
+  // being sent, so a retry can only rewrite identical content.
+  const result = await runWranglerOperation({
+    arguments_: [
+      "r2",
+      "object",
+      "put",
+      wranglerObjectPath(bucket, key),
+      "--file",
+      path,
+      "--content-type",
+      contentType,
+      "--cache-control",
+      cacheControl,
+      "--remote",
+    ],
+    label: `publishing R2 object ${key}`,
+    runWrangler,
+    sleep,
+  });
+  if (result.status !== 0) {
+    fail(
+      `Wrangler could not publish the validated update object ${key} after ${WRANGLER_ATTEMPTS} attempts: ${describeWranglerResult(result)}`,
+      "SPARKLE_UPDATE_WRANGLER_FAILED",
+    );
   }
 }
 
@@ -1700,6 +1861,9 @@ export async function publishSparkleUpdate({
   sparklePublicEdKey,
   stableBootstrap = false,
   runWrangler = defaultRunWrangler,
+  // Injectable like runWrangler so specs exercise the bounded retry without
+  // spending its backoff.
+  sleep = sleepFor,
   fetchPublic = defaultPublicFetch,
   fetchGuard = defaultPublicFetch,
   validateDMG = validateMacOSDMG,
@@ -1709,6 +1873,7 @@ export async function publishSparkleUpdate({
       || (previousStableManifestPath !== null
         && typeof previousStableManifestPath !== "string")
       || typeof runWrangler !== "function"
+      || typeof sleep !== "function"
       || typeof fetchPublic !== "function"
       || typeof fetchGuard !== "function"
       || typeof validateDMG !== "function"
@@ -1928,6 +2093,7 @@ export async function publishSparkleUpdate({
         key: immutableObject.object.key,
         maximumBytes: immutableObject.maximumBytes,
         runWrangler,
+        sleep,
         temporaryRoot,
       });
       if (remote !== null) {
@@ -1944,6 +2110,7 @@ export async function publishSparkleUpdate({
       key: publication.appcast.key,
       maximumBytes: MAX_APPCAST_BYTES,
       runWrangler,
+      sleep,
       temporaryRoot,
     });
     resumedPublication = assertExactCandidateAppcast({
@@ -2030,6 +2197,7 @@ export async function publishSparkleUpdate({
         publication.deltas.map((delta) => delta.key),
       ),
       runWrangler,
+      sleep,
       sparklePublicKey: normalizedSparklePublicKey,
       temporaryRoot,
     });
@@ -2043,6 +2211,7 @@ export async function publishSparkleUpdate({
           contentType: immutableObject.object.contentType,
           cacheControl: immutableObject.object.cacheControl,
           runWrangler,
+          sleep,
         });
       }
       const appcastBeforeWrite = await readRemoteObject({
@@ -2050,6 +2219,7 @@ export async function publishSparkleUpdate({
         key: publication.appcast.key,
         maximumBytes: MAX_APPCAST_BYTES,
         runWrangler,
+        sleep,
         temporaryRoot,
       });
       assertAppcastStateUnchanged(
