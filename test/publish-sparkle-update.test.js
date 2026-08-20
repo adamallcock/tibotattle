@@ -313,12 +313,44 @@ const WRANGLER_EXPIRED_TOKEN_STDOUT =
   ".env file not found at \"/repo/.env\". Continuing...\n"
   + " wrangler 4.114.0\nDownloading \"object\" from \"bucket\".\n";
 
-function wranglerExpiredTokenStderr(objectPath) {
+function wranglerExpiredTokenStderr(objectPath, accountId = "account") {
   return "\u001B[31m✘ \u001B[41;31m[\u001B[41;97mERROR\u001B[41;31m]\u001B[0m"
-    + ` \u001B[1mFailed to fetch /accounts/account/r2/buckets/${objectPath}`
+    + ` \u001B[1mFailed to fetch /accounts/${accountId}/r2/buckets/${objectPath}`
     + " - 401: Unauthorized;\u001B[0m\n\n"
     + "  {\"result\":null,\"success\":false,\"errors\":"
     + "[{\"code\":10000,\"message\":\"Authentication error\"}],\"messages\":[]}\n";
+}
+
+// Stand-ins for the owner identifiers the reproduced failure actually printed,
+// which are deliberately not committed: a Cloudflare account id is 32
+// hexadecimal characters, and the default account name is derived from the
+// account email.
+const FIXTURE_ACCOUNT_ID = "0123456789abcdef0123456789abcdef";
+const FIXTURE_ACCOUNT_EMAIL = "owner@example.com";
+
+/**
+ * The stdout of the reproduced cold 401, line for line minus the SGR escapes
+ * its siblings above already pin: Wrangler reacts to the authentication
+ * failure by printing its whoami block, so the account email, the account id,
+ * the account-name/id table and the token scope list all land in the publish
+ * log behind the object key.
+ */
+function wranglerColdAuthFailureStdout(objectPath) {
+  return "\n ⛅️ wrangler 4.114.0\n────────────────────\n"
+    + "Resource location: remote \n\n"
+    + `Downloading "${objectPath}" from "tibotattle-dogfood-updates".\n\n`
+    + "Getting User settings...\n"
+    + "👋 You are logged in with an OAuth Token, associated with the email"
+    + ` ${FIXTURE_ACCOUNT_EMAIL}.\n`
+    + "🔐 Credentials are stored in:"
+    + " /Users/owner/Library/Preferences/.wrangler/config/default.toml\n"
+    + "┌──────────────┬──────────────┐\n"
+    + "│ Account Name │ Account ID   │\n"
+    + "├──────────────┼──────────────┤\n"
+    + `│ ${FIXTURE_ACCOUNT_EMAIL}'s Account │ ${FIXTURE_ACCOUNT_ID} │\n`
+    + "└──────────────┴──────────────┘\n"
+    + "🔓 Token Permissions:\nScope (Access)\n- account (read)\n- user (read)\n"
+    + "- workers (write)\n- offline_access \n";
 }
 
 /**
@@ -1262,6 +1294,69 @@ test("retries a transient Wrangler upload failure and publishes", async () => {
     assert.deepEqual(
       runner.objects.get(manifestObjectPath),
       await readFile(fixture.releaseManifestPath),
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("quotes the cold 401 without the account identity Wrangler prints with it", async () => {
+  const fixture = await createReleaseFixture();
+  const digest = sha256(fixture.dmgBytes);
+  const artifactObjectPath = `${APPROVED_R2_BUCKET}/releases/1/${digest}/${RELEASE_MANIFEST.macOS.arm64DmgFileName}`;
+  const runner = statefulRemoteObjectRunner();
+  const coldAuthFailure = async (arguments_) => {
+    runner.calls.push(arguments_);
+    return {
+      status: 1,
+      stdout: wranglerColdAuthFailureStdout(arguments_.at(3)),
+      stderr: wranglerExpiredTokenStderr(arguments_.at(3), FIXTURE_ACCOUNT_ID),
+    };
+  };
+  coldAuthFailure.atomicAppcastGuard = runner.run.atomicAppcastGuard;
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        publish: true,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: coldAuthFailure,
+        validateDMG: async () => {},
+      }),
+      (error) => {
+        // Everything that diagnoses the failure survives.
+        assert.equal(error.code, "SPARKLE_UPDATE_WRANGLER_FAILED");
+        assert.match(error.message, /status 1/u);
+        assert.match(error.message, /Failed to fetch/u);
+        assert.match(error.message, /401: Unauthorized/u);
+        assert.match(
+          error.message,
+          /\{"code":10000,"message":"Authentication error"\}/u,
+        );
+        // The object key, including its content-addressed SHA-256, is not
+        // mistaken for an account id and survives whole.
+        assert.ok(error.message.includes(artifactObjectPath));
+        assert.ok(error.message.includes(digest));
+        // Nothing that identifies the owner or the account does. A publish log
+        // is pasted into issues; the whoami block Wrangler prints alongside an
+        // auth failure diagnoses nothing here.
+        assert.equal(error.message.includes(FIXTURE_ACCOUNT_EMAIL), false);
+        assert.equal(error.message.includes(FIXTURE_ACCOUNT_ID), false);
+        assert.equal(error.message.includes("Token Permissions"), false);
+        assert.equal(error.message.includes("Account Name"), false);
+        assert.equal(error.message.includes("/Users/owner"), false);
+        // Redacted, not silently truncated.
+        assert.match(error.message, /\[redacted-account-id\]/u);
+        assert.match(
+          error.message,
+          /\[redacted: Wrangler account identity block\]/u,
+        );
+        return true;
+      },
     );
   } finally {
     await fixture.cleanup();

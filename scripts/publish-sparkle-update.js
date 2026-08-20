@@ -1222,21 +1222,52 @@ function resultWasNotFound(result) {
     );
 }
 
+// Wrangler answers an authentication failure by printing its whoami block:
+// the account email, the account id, the account-name/id table, and the full
+// token scope list. None of it diagnoses a publish failure — the error line,
+// the HTTP status, the API error body and the object key all arrive on stderr
+// or ahead of this block — and publish logs get pasted into issues, so the
+// block is dropped at its own marker and replaced by a visible note.
+const WRANGLER_IDENTITY_BLOCK_PATTERN =
+  /^.*Getting User settings\.\.\.[\s\S]*/mu;
+const WRANGLER_IDENTITY_BLOCK_REDACTION =
+  "[redacted: Wrangler account identity block]";
+const WRANGLER_EMAIL_PATTERN =
+  /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/gu;
+// A Cloudflare account id is exactly 32 hexadecimal characters, and one is
+// embedded in the `/accounts/<id>/…` path of every R2 error line. The
+// surrounding guards keep the 64-character content-addressed SHA-256 inside an
+// object key — which is load-bearing evidence and must survive — from being
+// mistaken for an account id. An R2 etag is also 32 hex characters and would
+// be redacted with it; no failure message quotes one.
+const WRANGLER_ACCOUNT_ID_PATTERN =
+  /(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])/giu;
+const WRANGLER_ACCOUNT_ID_REDACTION = "[redacted-account-id]";
+const WRANGLER_EMAIL_REDACTION = "[redacted-email]";
+
 /**
  * Wrangler's status and both streams carry the entire diagnosis — a 401 auth
- * race, a 5xx, a renamed bucket — and they hold object keys and CLI text, not
- * secrets. Four masked publish failures produced no evidence at all, so every
- * hard failure now quotes them. The owner guard secret is deleted from the
- * environment before any Wrangler child is spawned; it is scrubbed by value
- * here as well so no future call order can surface it.
+ * race, a 5xx, a renamed bucket — and the parts that diagnose it are object
+ * keys and CLI text. Four masked publish failures produced no evidence at all,
+ * so every hard failure now quotes them. Everything that identifies the owner
+ * or the account is removed on the way out, each with a visible marker, so a
+ * publish log stays safe to share: the owner guard secret by value (it is also
+ * deleted from the environment before any Wrangler child is spawned, so no
+ * future call order can surface it), and the account identity by pattern.
  */
 function describeWranglerResult(result) {
   const guardToken = process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV];
   const scrubbable = typeof guardToken === "string" && guardToken.length >= 32;
   const present = (value) => {
-    const text = scrubbable
-      ? wranglerStreamText(value).split(guardToken).join("[redacted]")
-      : wranglerStreamText(value);
+    const streamed = wranglerStreamText(value).replace(
+      WRANGLER_IDENTITY_BLOCK_PATTERN,
+      WRANGLER_IDENTITY_BLOCK_REDACTION,
+    );
+    const text = (scrubbable
+      ? streamed.split(guardToken).join("[redacted]")
+      : streamed)
+      .replace(WRANGLER_EMAIL_PATTERN, WRANGLER_EMAIL_REDACTION)
+      .replace(WRANGLER_ACCOUNT_ID_PATTERN, WRANGLER_ACCOUNT_ID_REDACTION);
     const trimmed = text.trim();
     if (trimmed.length === 0) return "(empty)";
     return trimmed.length > WRANGLER_DIAGNOSTIC_STREAM_LIMIT
