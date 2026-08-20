@@ -1,6 +1,9 @@
-import { lstat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { scanCodexLogEvents } from "./codex-log-scan.js";
 import {
   defaultLocalUnifiedIndexPath,
@@ -235,6 +238,53 @@ const ACCOUNTING_READER_PASSTHROUGH_CODES = new Set([
   "accounting_unified_history_unavailable",
 ]);
 const ACCOUNTING_RSS_CHECK_INTERVAL = 2_048;
+// The production rebuild runs in a short-lived child process (2026-08-19).
+// The streaming corpus (#33) bounded per-batch residency, but two residuals
+// still starved the in-process rebuild at real scale: the derived transition
+// series legitimately accumulates across batches (~100-200 MB over multi-year
+// history), and the RSS guard measures the WHOLE process — a companion that
+// idles near 1.9 GiB after indexing an ~80 GB corpus reaches the 2 GiB
+// absolute target with no headroom for ANY rebuild growth, so every attempt
+// deferred and the cost surface stayed empty (dogfood 0.1.13, 2026-08-19:
+// accounting_rebuild_deferred at 23:21:26Z and 23:39:15Z on the streamed
+// code). A child starts from a clean ~60 MB baseline, the same guard polices
+// the CHILD's own RSS — which is the guard's actual purpose, keeping the
+// resident menu-bar app sane, now served even better because the parent never
+// grows at all — and exit returns every rebuild byte to the OS instead of
+// fossilizing the next attempt's baseline.
+const ACCOUNTING_REBUILD_ISOLATION_MODES = Object.freeze([
+  "auto",
+  "subprocess",
+  "in_process",
+]);
+const ACCOUNTING_REBUILD_CHILD_ENTRY = fileURLToPath(
+  new URL("./replay-safe-accounting-rebuild-child.js", import.meta.url),
+);
+// V8 old-space cap for the rebuild child. Prompt collection is what makes the
+// child's genuine RSS guard deterministic (an uncapped heap may lawfully defer
+// major GC past any tight margin — measured 147-354 MiB swing in #33), and the
+// cap turns a regression back to O(corpus) residency into a hard child failure
+// the parent converts to a deferral. 1 GiB is ~3x the multi-year working set
+// (thin stamps + one 50k-row batch slice + the accumulated transition series
+// + the fit's O(bins) sums) and sits below the child's effective RSS ceiling
+// (min(2 GiB, clean baseline + 1.25 GiB) ≈ 1.3 GiB), so V8 collects hard well
+// before the guard would trip.
+const ACCOUNTING_REBUILD_CHILD_OLD_SPACE_MIB = 1_024;
+// SIGTERM asks the child to unwind through its own abort checks (typed abort
+// envelope); a child that cannot unwind inside this grace is killed hard. The
+// value only bounds teardown after an abort — never the build itself.
+const ACCOUNTING_REBUILD_CHILD_KILL_GRACE_MS = 5_000;
+// The stdout envelope is one small JSON line. A child that prints more than
+// this is not speaking the protocol, and the read stops charging memory for
+// its output at this bound.
+const ACCOUNTING_REBUILD_ENVELOPE_LIMIT_BYTES = 64 * 1024;
+// Transport ceiling for the result payload read-back. The durable cache gate
+// stays MAX_CACHE_BYTES (enforced by the caller exactly as for an in-process
+// build); this larger bound only refuses a runaway result file before the
+// parent would buffer it.
+const ACCOUNTING_REBUILD_RESULT_LIMIT_BYTES = 64 * 1024 * 1024;
+export const REPLAY_SAFE_ACCOUNTING_REBUILD_REQUEST_VERSION =
+  "replay-safe-accounting-rebuild-request-v1";
 // This scanner runs inside the same process that immediately expands the
 // full-history calibration corpus. Four extraction workers preserve useful
 // parallelism without leaving ten V8 worker heaps resident for that second
@@ -3646,6 +3696,218 @@ export async function buildReplaySafeAccountingCache({
   };
 }
 
+// Everything the child may not say: an envelope whose error code fails the
+// bounded pattern is treated as no envelope at all, so arbitrary child text
+// can never become a refresh classification.
+const SUBPROCESS_FAILURE_CODE_PATTERN = /^[a-z0-9_]{1,64}$/u;
+const SUBPROCESS_SHA256_PATTERN = /^[a-f0-9]{64}$/u;
+
+// The child inherits almost nothing. TMPDIR is the one passthrough: inside the
+// sandboxed macOS app it names the container's writable temp root, which
+// SQLite may need for spill files. Deliberately absent: NODE_OPTIONS (nothing
+// may override the child's pinned old-space cap or preload code into the
+// rebuild), HOME (every path the child touches arrives resolved in the
+// request), and PATH (the child execs nothing).
+function minimalRebuildChildEnvironment() {
+  const environment = {};
+  if (typeof process.env.TMPDIR === "string" && process.env.TMPDIR.length > 0) {
+    environment.TMPDIR = process.env.TMPDIR;
+  }
+  return environment;
+}
+
+function parseRebuildChildEnvelope(stdoutText) {
+  const line = stdoutText.split("\n").filter((part) => part.length > 0).at(-1);
+  if (line === undefined) return null;
+  let value;
+  try {
+    value = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (value.status === "ok"
+      && Number.isSafeInteger(value.resultBytes)
+      && value.resultBytes >= 2
+      && value.resultBytes <= ACCOUNTING_REBUILD_RESULT_LIMIT_BYTES
+      && typeof value.resultSha256 === "string"
+      && SUBPROCESS_SHA256_PATTERN.test(value.resultSha256)) {
+    return { status: "ok", resultBytes: value.resultBytes, resultSha256: value.resultSha256 };
+  }
+  if (value.status === "error"
+      && typeof value.code === "string"
+      && SUBPROCESS_FAILURE_CODE_PATTERN.test(value.code)
+      && ["Error", "AbortError"].includes(value.name)) {
+    return { status: "error", code: value.code, name: value.name };
+  }
+  return null;
+}
+
+/**
+ * Runs one accounting rebuild in a short-lived child of the packaged Node
+ * runtime (process.execPath — the same binary serving the companion) and
+ * returns the parsed cache artifact. The request already carries every input
+ * resolved and serializable; the child re-verifies the unified generation and
+ * index file identity itself at corpus open and finish, exactly as the
+ * in-process build does, so the process boundary adds transport integrity
+ * (byte count + SHA-256 over the result file, then full artifact validation
+ * in the caller) rather than replacing any verification.
+ *
+ * Error surface, by construction:
+ * - a typed build failure inside the child crosses back as the SAME fixed
+ *   code the in-process build would have thrown, so the caller's existing
+ *   budget-miss/passthrough classification is untouched;
+ * - an abort — ours via SIGTERM on the caller's signal, or the child's own
+ *   graceful abort — is always the AbortError-shaped
+ *   accounting_refresh_aborted the in-process path throws;
+ * - a child that dies without a well-formed envelope (OOM kill, crash, spawn
+ *   failure, transport mismatch) becomes the single fixed code
+ *   accounting_rebuild_subprocess_failed, which the refresh wrapper defers
+ *   exactly like a memory-budget miss: the prior cache is retained and served,
+ *   and the scheduler's backoff prevents a crash loop.
+ */
+async function buildReplaySafeAccountingCacheInSubprocess({
+  request,
+  signal = null,
+  entry = ACCOUNTING_REBUILD_CHILD_ENTRY,
+}) {
+  throwIfAborted(signal);
+  const workDirectory = await mkdtemp(
+    join(tmpdir(), "usage-monitor-accounting-rebuild-"),
+  );
+  try {
+    const requestFile = join(workDirectory, "rebuild-request-v1.json");
+    const resultFile = join(workDirectory, "rebuild-result-v1.json");
+    await writeFile(requestFile, `${JSON.stringify(request)}\n`, {
+      mode: 0o600,
+      flag: "wx",
+    });
+    const closed = await new Promise((resolveClosed) => {
+      let settled = false;
+      const settle = (outcome) => {
+        if (settled) return;
+        settled = true;
+        resolveClosed(outcome);
+      };
+      let child;
+      try {
+        child = spawn(process.execPath, [
+          `--max-old-space-size=${ACCOUNTING_REBUILD_CHILD_OLD_SPACE_MIB}`,
+          entry,
+          requestFile,
+          resultFile,
+        ], {
+          cwd: workDirectory,
+          env: minimalRebuildChildEnvironment(),
+          // stdin stays piped and open for the child's whole life — its close
+          // is the child's parent-death watchdog. stderr is dropped: child
+          // failures classify by envelope and exit status only, so no crash
+          // text (which may embed paths) can reach a surface.
+          stdio: ["pipe", "pipe", "ignore"],
+        });
+      } catch {
+        settle({ code: null, killSignal: null, stdoutText: "", protocolBroken: true });
+        return;
+      }
+      let stdoutText = "";
+      let protocolBroken = false;
+      let killTimer = null;
+      const onAbort = () => {
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // Already exited; the close handler settles the outcome.
+        }
+        killTimer = setTimeout(() => {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            // Already exited.
+          }
+        }, ACCOUNTING_REBUILD_CHILD_KILL_GRACE_MS);
+        killTimer.unref?.();
+      };
+      if (signal !== null) {
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      }
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => {
+        if (protocolBroken) return;
+        stdoutText += chunk;
+        if (stdoutText.length > ACCOUNTING_REBUILD_ENVELOPE_LIMIT_BYTES) {
+          protocolBroken = true;
+          stdoutText = "";
+        }
+      });
+      child.once("error", () => {
+        // Spawn/kill failures may arrive without a later close event; settle
+        // as protocol breakage and let close (if it still fires) be ignored.
+        signal?.removeEventListener?.("abort", onAbort);
+        if (killTimer !== null) clearTimeout(killTimer);
+        settle({ code: null, killSignal: null, stdoutText: "", protocolBroken: true });
+      });
+      child.once("close", (code, killSignal) => {
+        signal?.removeEventListener?.("abort", onAbort);
+        if (killTimer !== null) clearTimeout(killTimer);
+        settle({ code, killSignal, stdoutText, protocolBroken });
+      });
+    });
+    const envelope = closed.protocolBroken
+      ? null
+      : parseRebuildChildEnvelope(closed.stdoutText);
+    if (envelope?.status === "ok"
+        && closed.code === 0
+        && closed.killSignal === null) {
+      let payload;
+      try {
+        payload = await readFile(resultFile);
+      } catch {
+        throw fixedError("accounting_rebuild_subprocess_failed");
+      }
+      if (payload.byteLength !== envelope.resultBytes
+          || createHash("sha256").update(payload).digest("hex")
+            !== envelope.resultSha256) {
+        throw fixedError("accounting_rebuild_subprocess_failed");
+      }
+      let cache;
+      try {
+        cache = JSON.parse(payload.toString("utf8"));
+      } catch {
+        throw fixedError("accounting_rebuild_subprocess_failed");
+      }
+      if (!cache || typeof cache !== "object" || Array.isArray(cache)) {
+        throw fixedError("accounting_rebuild_subprocess_failed");
+      }
+      // Mirror the in-process build's final abort gate: work that finished
+      // after an abort landed is still discarded before publication.
+      throwIfAborted(signal);
+      return cache;
+    }
+    if (envelope?.status === "error") {
+      if (envelope.name === "AbortError"
+          || envelope.code === "accounting_refresh_aborted") {
+        const aborted = fixedError("accounting_refresh_aborted");
+        aborted.name = "AbortError";
+        throw aborted;
+      }
+      throw fixedError(envelope.code);
+    }
+    // No usable envelope. If the caller aborted, the death is OURS (SIGTERM/
+    // SIGKILL) and the honest outcome is the abort; otherwise the child died
+    // on its own and the caller fails closed to the deferral path.
+    throwIfAborted(signal);
+    throw fixedError("accounting_rebuild_subprocess_failed");
+  } finally {
+    try {
+      await rm(workDirectory, { recursive: true, force: true });
+    } catch {
+      // Cleanup failure must never mask the rebuild outcome; the directory
+      // holds only this pass's private request/result pair.
+    }
+  }
+}
+
 export async function refreshReplaySafeAccountingCache({
   stateFile = null,
   // A JSON cache is no longer a supported durable target. Keeping this
@@ -3669,6 +3931,20 @@ export async function refreshReplaySafeAccountingCache({
   // this hook is a convenience for a caller that wants the signal inline
   // without inspecting the return shape.
   onAccountingRebuildDeferred = null,
+  // Where the rebuild executes. "auto" (the default) runs production-shaped
+  // calls — no injected scan, no injected rss meter — in a short-lived child
+  // process whose clean baseline restores the guard's headroom (see the
+  // isolation rationale on ACCOUNTING_REBUILD_ISOLATION_MODES above), and
+  // keeps every characterization call with injected function seams on the
+  // in-process build, since functions cannot cross a process boundary.
+  // "in_process" forces the old execution for a caller that must observe the
+  // build inside its own process; "subprocess" asserts isolation and refuses
+  // un-serializable seams instead of silently degrading.
+  rebuildIsolation = null,
+  // Characterization seam for the child entrypoint (crash/protocol tests
+  // substitute a misbehaving child). Production always uses the reviewed
+  // sibling module.
+  rebuildSubprocessEntry = null,
   ...options
 } = {}) {
   if (cacheFile !== undefined) {
@@ -3677,6 +3953,19 @@ export async function refreshReplaySafeAccountingCache({
   if (onAccountingRebuildDeferred !== null
       && typeof onAccountingRebuildDeferred !== "function") {
     throw new TypeError("onAccountingRebuildDeferred must be a function or null");
+  }
+  const selectedRebuildIsolation = rebuildIsolation ?? "auto";
+  if (!ACCOUNTING_REBUILD_ISOLATION_MODES.includes(selectedRebuildIsolation)) {
+    throw new TypeError(
+      "rebuildIsolation must be auto, subprocess, or in_process",
+    );
+  }
+  if (rebuildSubprocessEntry !== null
+      && (typeof rebuildSubprocessEntry !== "string"
+        || !isAbsolute(rebuildSubprocessEntry))) {
+    throw new TypeError(
+      "rebuildSubprocessEntry must be an absolute path or null",
+    );
   }
   const selectedStateFile = stateFile ?? defaultReplaySafeAccountingCachePath();
   const selectedSourceMode = normalizeAccountingSourceMode(
@@ -3727,24 +4016,125 @@ export async function refreshReplaySafeAccountingCache({
         ? {}
         : { chunkBytes: indexChunkBytes }),
     }));
+  // An injected scanner or rss meter is a function and cannot cross a process
+  // boundary; those characterization calls stay on the in-process build under
+  // "auto". Everything a production call carries is serializable, so the
+  // production paths (unified reader, legacy indexed scan) are reconstructed
+  // inside the child by value.
+  const subprocessEligible = scan === null && !Object.hasOwn(options, "rss");
+  if (selectedRebuildIsolation === "subprocess" && !subprocessEligible) {
+    throw new TypeError(
+      "rebuildIsolation subprocess cannot carry injected scan or rss seams",
+    );
+  }
+  const rebuildInSubprocess = selectedRebuildIsolation === "subprocess"
+    || (selectedRebuildIsolation === "auto" && subprocessEligible);
+  let subprocessRequest = null;
+  if (rebuildInSubprocess) {
+    // Resolve and validate the request the child will replay, mirroring the
+    // option validation the in-process build performs, so an invalid option
+    // stays a synchronous TypeError here rather than surfacing as a child
+    // failure. The clock is sampled exactly once — the same single call the
+    // in-process build makes for endMs — and crosses as a number.
+    const nowFunction = options.now ?? (() => Date.now());
+    const selectedWindowDays = options.windowDays ?? DEFAULT_WINDOW_DAYS;
+    const selectedCodexHome = options.codexHome ?? join(homedir(), ".codex");
+    const selectedMaximumRssBytes = options.maximumRssBytes
+      ?? MAX_ACCOUNTING_RSS_BYTES;
+    if (typeof nowFunction !== "function"
+        || !Number.isSafeInteger(selectedWindowDays)
+        || selectedWindowDays < MINIMUM_WINDOW_DAYS
+        || selectedWindowDays > MAXIMUM_WINDOW_DAYS
+        || typeof selectedCodexHome !== "string"
+        || selectedCodexHome.length < 1
+        || !validAbortSignal(options.signal ?? null)
+        || !Number.isSafeInteger(selectedMaximumRssBytes)
+        || selectedMaximumRssBytes < 1) {
+      throw new TypeError("Replay-safe accounting options are invalid");
+    }
+    const nowMs = nowFunction();
+    if (!Number.isFinite(nowMs)) {
+      throw new TypeError("Replay-safe accounting options are invalid");
+    }
+    if (selectedSourceMode === "legacy") {
+      const requestedWorkerCount = indexWorkerCount
+        ?? DEFAULT_ACCOUNTING_INDEX_WORKERS;
+      if (!Number.isSafeInteger(requestedWorkerCount)
+          || requestedWorkerCount < 1
+          || (indexChunkBytes !== undefined
+            && !Number.isSafeInteger(indexChunkBytes))) {
+        throw new TypeError("Replay-safe accounting options are invalid");
+      }
+    }
+    // Throws the same TypeErrors the in-process build would for a malformed
+    // limits object; the child then re-normalizes the identical value.
+    transitionResourceLimits(options.transitionResourceLimits ?? null);
+    subprocessRequest = {
+      version: REPLAY_SAFE_ACCOUNTING_REBUILD_REQUEST_VERSION,
+      nowMs,
+      windowDays: selectedWindowDays,
+      codexHome: selectedCodexHome,
+      sourceMode: selectedSourceMode,
+      contextBehavior: selectedContextBehavior,
+      expectedGeneration: expectedGeneration ?? null,
+      unifiedIndexFile: selectedSourceMode === "unified"
+        ? selectedUnifiedIndexFile
+        : unifiedIndexFile,
+      legacyIndexFile: selectedSourceMode === "legacy"
+        ? selectedIndexFile
+        : null,
+      legacyIndexSecretFile: selectedSourceMode === "legacy"
+        ? selectedIndexSecretFile
+        : null,
+      legacyIndexWorkerCount: selectedSourceMode === "legacy"
+        ? indexWorkerCount ?? DEFAULT_ACCOUNTING_INDEX_WORKERS
+        : null,
+      legacyIndexChunkBytes: selectedSourceMode === "legacy"
+          && indexChunkBytes !== undefined
+        ? indexChunkBytes
+        : null,
+      declaredSpeedBaselines: Array.isArray(options.declaredSpeedBaselines)
+        ? options.declaredSpeedBaselines
+        : [],
+      transitionResourceLimits: options.transitionResourceLimits ?? null,
+      maximumRssBytes: selectedMaximumRssBytes,
+    };
+  }
   // Converge legacy state before spending a potentially substantial raw-log
   // scan. A live old JSON collector or an unverified parity mismatch must
   // fail before we derive a cache that cannot be committed safely.
   await prepareLocalCollectorState({ stateFile: selectedStateFile });
   let cache;
   try {
-    cache = await buildReplaySafeAccountingCache({
-      ...options,
-      scan: effectiveScan,
-      sourceMode: selectedSourceMode,
-      contextBehavior: selectedContextBehavior,
-      expectedGeneration,
-      unifiedIndexFile: selectedSourceMode === "unified"
-        ? selectedUnifiedIndexFile
-        : unifiedIndexFile,
-    });
+    cache = rebuildInSubprocess
+      ? await buildReplaySafeAccountingCacheInSubprocess({
+        request: subprocessRequest,
+        signal: options.signal ?? null,
+        ...(rebuildSubprocessEntry === null
+          ? {}
+          : { entry: rebuildSubprocessEntry }),
+      })
+      : await buildReplaySafeAccountingCache({
+        ...options,
+        scan: effectiveScan,
+        sourceMode: selectedSourceMode,
+        contextBehavior: selectedContextBehavior,
+        expectedGeneration,
+        unifiedIndexFile: selectedSourceMode === "unified"
+          ? selectedUnifiedIndexFile
+          : unifiedIndexFile,
+      });
   } catch (error) {
-    if (!isAccountingBudgetMiss(error)) throw error;
+    // A child that died without a typed refusal joins the memory-budget
+    // misses on the deferral path: the failure is overwhelmingly a memory
+    // event (V8 heap-cap abort, OS OOM kill) and the deferral is the fail-
+    // closed behavior the incident taught — retain the prior cache, back
+    // off, surface the streak — never a crash loop and never a blanked
+    // dashboard.
+    if (!isAccountingBudgetMiss(error)
+        && error?.code !== "accounting_rebuild_subprocess_failed") {
+      throw error;
+    }
     // The rebuild missed its memory budget. Per owner directive the budget is
     // a TARGET, never a hard dashboard-blanker: the whole refresh must NOT
     // fail and the last good on-disk cache must survive untouched. Control
