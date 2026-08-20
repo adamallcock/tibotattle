@@ -125,7 +125,24 @@ export interface DeviceLifecyclePolicy {
 }
 
 export const DEFAULT_DEVICE_LIFECYCLE_POLICY: Readonly<DeviceLifecyclePolicy> = {
-  idleMilliseconds: 30 * 24 * 60 * 60 * 1000,
+  // Tied to DEVICE_CREDENTIAL_TTL_MILLISECONDS rather than chosen beside it.
+  // Both clocks run from the same last authenticated use — `authenticateDevice`
+  // slides `expires_at` to `now + TTL` while stamping `last_used_at = now` —
+  // so an idle window shorter than the TTL would reject, and then `purgeStale…`
+  // would revoke, a device whose credential the service itself still reports as
+  // unexpired. Equality is what keeps the two answers to "is this device still
+  // authorized" the same answer. A longer idle window would be the other
+  // incoherence: a device row surviving credentials it can no longer authorize.
+  //
+  // The knock-on is `activeDeviceLimit`, which only counts devices used inside
+  // this window: a wider window means a Mac dormant for two months still holds
+  // its slot, so pairing a further Mac retires the least recently used one via
+  // the superseded-credential self-heal instead of finding a slot already
+  // vacated by lapse. That is the honest ordering — a device is given up when
+  // the person adds another, not because they went away for a month.
+  idleMilliseconds: DEVICE_CREDENTIAL_TTL_MILLISECONDS,
+  // The absolute ceiling, unchanged by any renewal or rotation: whatever the
+  // credential TTL is, the account itself must be re-proved twice a year.
   socialRecheckMaxAgeMilliseconds: 180 * 24 * 60 * 60 * 1000,
   activeDeviceLimit: 3,
   pairingIssueWindowMilliseconds: 60 * 60 * 1000,

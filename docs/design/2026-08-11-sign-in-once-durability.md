@@ -81,3 +81,37 @@ Keychain-ACL history means #1 needs real verification, not a quick patch).
 - An interrupted sign-in (quit mid-flow) resumes on relaunch rather than
   restarting.
 - End state: one Google sign-in, then indefinite uploads with no re-login.
+
+## Amendment, 2026-08-20 (0.1.14): the inactive tail
+
+The three parts above all address a Mac that is *in use*. They leave the
+opposite case untouched: a Mac that is closed for longer than the renewal
+window never renews, lapses, and comes back needing a full re-pair. That is
+churn aimed at exactly the returning user you most want back.
+
+Two bounds changed, and the numbers above are superseded:
+
+- `DEVICE_CREDENTIAL_TTL_MILLISECONDS` is **90 days**, not 30, with
+  `DEFAULT_DEVICE_LIFECYCLE_POLICY.idleMilliseconds` tied to it rather than set
+  beside it. Both clocks run from the same last authenticated use, so they must
+  be equal or one retires a device the other still authorizes. The security
+  reasoning for the wider bound is recorded at the constant.
+- The companion renews at **half the credential's own observed lifetime**, not
+  at a fixed five-day lead. The tolerated open-to-open gap is therefore half
+  the TTL rather than five days, and the rule needs no mirrored copy of the
+  service TTL to stay correct.
+
+What did **not** change, and remains the binding constraint on
+"one sign-in, then indefinite uploads":
+
+- `socialRecheckMaxAgeMilliseconds` is 180 days and `social_verified_at` is
+  stamped once at pairing and never refreshed. Every device is retired half a
+  year after it was paired however heavily it is used, and no renewal or
+  rotation may cross that line. The acceptance line "indefinite uploads with no
+  re-login" is therefore false as written: the honest ceiling is two
+  re-authentications a year.
+- `SESSION_TTL_MILLISECONDS` is 30 minutes and absolute — `expires_at` is
+  written once and never extended. A re-pair needs a live personal session, so
+  any lapse discovered more than 30 minutes after the last sign-in requires a
+  fresh hosted identity proof. No amount of credential lifetime removes that;
+  it only makes it rarer.

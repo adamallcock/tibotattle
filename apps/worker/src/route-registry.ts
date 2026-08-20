@@ -65,8 +65,8 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
   },
   {
     // Silent auto-renewal: a valid, unexpired device bearer rotates its own
-    // secret in place (same device, no new slot, no browser sign-in), so the
-    // 30-day credential never lapses under active use.
+    // secret in place (same device, no new slot, no browser sign-in), so a
+    // credential never lapses under active use.
     pathname: "/api/v1/device/credential/renew",
     id: "device_credential_renew",
   },

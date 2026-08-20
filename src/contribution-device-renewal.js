@@ -35,7 +35,7 @@ const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
 // never used once a record carries its own issuance instant. Drift against the
 // deployed service costs at most one extra rotation, which then writes the real
 // instant and self-corrects.
-export const DEVICE_CREDENTIAL_TTL_MILLISECONDS = 30 * DAY_MILLISECONDS;
+export const DEVICE_CREDENTIAL_TTL_MILLISECONDS = 90 * DAY_MILLISECONDS;
 // Renew once half of the credential's own lifetime has elapsed.
 export const DEFAULT_RENEWAL_ELAPSED_FRACTION = 0.5;
 // A credential is never renewed twice inside this span. The elapsed-fraction

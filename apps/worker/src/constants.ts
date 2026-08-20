@@ -23,7 +23,41 @@ export const UPLOAD_CONSUME_LEASE_MILLISECONDS = 5 * 60 * 1000;
 // handlers re-check the live lease immediately before storage side effects.
 export const MAX_UPLOAD_INGRESS_LIFETIME_MILLISECONDS = 4 * 60 * 1000;
 export const DEVICE_PAIRING_TTL_MILLISECONDS = 10 * 60 * 1000;
-export const DEVICE_CREDENTIAL_TTL_MILLISECONDS = 30 * 24 * 60 * 60 * 1000;
+// How long a device credential keeps authorizing uploads without the person
+// proving their account again. It is a deliberate security bound, and what it
+// bounds is narrower than it looks: a leaked credential that is then left
+// DORMANT stops working after this long. It does not bound a leaked credential
+// in active use, because every successful authentication slides `expires_at`
+// forward (device-auth.ts `authenticateDevice`); an exercised credential is
+// bounded instead by the lifecycle policy's absolute social-recheck horizon,
+// which no authentication or rotation may cross. Ninety days moves the
+// dormant-copy window from one month to three; it leaves the active-abuse
+// window exactly where it was.
+//
+// The bound is set against the churn a short one causes on the other side. A
+// Mac that misses every renewal window while it is closed has to re-pair, and
+// re-pairing needs a hosted session, so the person is asked to sign in again at
+// precisely the moment they came back. A month puts that wall inside an
+// ordinary holiday; a quarter puts it beyond one.
+//
+// What holds the exposure down instead of a short window:
+//   - the secret is rotated at every renewal, and presenting a superseded
+//     secret revokes the entire device lineage, so a stolen copy is a tripwire
+//     rather than a spare key;
+//   - the credential's scope is upload registration. It mints one-use upload
+//     authorizations, reads a sync watermark, and can disconnect itself; it
+//     cannot read the account, alter consent, or delete anything;
+//   - the person revokes it immediately by disconnecting the device, and the
+//     social-recheck horizon retires every credential regardless of activity.
+// The accepted cost is a wider undetected-clone window: renewal rotates once
+// per half-life, so a copy taken just after a rotation stays current for about
+// forty-five days rather than twenty-five before it trips reuse detection.
+//
+// DEFAULT_DEVICE_LIFECYCLE_POLICY.idleMilliseconds must never be shorter than
+// this value. Both clocks run from the same last authenticated use, so a
+// shorter idle window would retire a device the service itself still reports as
+// unexpired.
+export const DEVICE_CREDENTIAL_TTL_MILLISECONDS = 90 * 24 * 60 * 60 * 1000;
 export const RECOVERY_RETRY_TTL_MILLISECONDS = 5 * 60 * 1000;
 export const RECOVERY_RETRY_LIMIT = 2;
 // Owner decision 2026-08-10: raw upload envelopes are retained indefinitely.

@@ -16,6 +16,7 @@ import {
   revokeParticipantDevice,
   rotateDeviceCredential,
 } from "../src/device-auth";
+import { DEVICE_CREDENTIAL_TTL_MILLISECONDS } from "../src/constants";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { createSessionMaterial, sessionInsert } from "../src/session";
 import { handleRequest, runScheduledMaintenance } from "../src/index";
@@ -239,30 +240,33 @@ describe("device lifecycle primitives", () => {
       policy: { socialRecheckMaxAgeMilliseconds: 1 },
     })).rejects.toMatchObject({ code: "DEVICE_AUTH_INVALID" });
 
+    // Stated as multiples of the credential TTL, not as a day count, so the
+    // property under test survives the TTL being repriced.
     const bounded = await pair({ nowEpoch: fixture.nowEpoch + 10_000 });
     const day = 24 * 60 * 60 * 1_000;
-    const policy = { socialRecheckMaxAgeMilliseconds: 90 * day };
+    const ttl = DEVICE_CREDENTIAL_TTL_MILLISECONDS;
+    const policy = { socialRecheckMaxAgeMilliseconds: 3 * ttl };
     const firstUse = await authenticateDevice(bounded.db, bounded.authorization, {
-      nowEpoch: bounded.nowEpoch + 29 * day,
+      nowEpoch: bounded.nowEpoch + ttl - day,
       policy,
     });
     expect(firstUse.expiresAt).toBe(
-      new Date(bounded.nowEpoch + 59 * day).toISOString(),
+      new Date(bounded.nowEpoch + 2 * ttl - day).toISOString(),
     );
     const secondUse = await authenticateDevice(bounded.db, bounded.authorization, {
-      nowEpoch: bounded.nowEpoch + 58 * day,
+      nowEpoch: bounded.nowEpoch + 2 * ttl - 2 * day,
       policy,
     });
     expect(secondUse.expiresAt).toBe(
-      new Date(bounded.nowEpoch + 88 * day).toISOString(),
+      new Date(bounded.nowEpoch + 3 * ttl - 2 * day).toISOString(),
     );
     const lastBoundedUse = await authenticateDevice(
       bounded.db,
       bounded.authorization,
-      { nowEpoch: bounded.nowEpoch + 87 * day, policy },
+      { nowEpoch: bounded.nowEpoch + 3 * ttl - 3 * day, policy },
     );
     expect(lastBoundedUse.expiresAt).toBe(
-      new Date(bounded.nowEpoch + 90 * day).toISOString(),
+      new Date(bounded.nowEpoch + 3 * ttl).toISOString(),
     );
     const nextSecret = crypto.getRandomValues(new Uint8Array(32));
     const rotated = await rotateDeviceCredential(
@@ -270,17 +274,52 @@ describe("device lifecycle primitives", () => {
       bounded.authorization,
       await deviceSecretHash(bounded.deviceId, nextSecret),
       crypto.randomUUID(),
-      { nowEpoch: bounded.nowEpoch + 87 * day, policy },
+      { nowEpoch: bounded.nowEpoch + 3 * ttl - 3 * day, policy },
     );
     expect(rotated.expiresAt).toBe(
-      new Date(bounded.nowEpoch + 90 * day).toISOString(),
+      new Date(bounded.nowEpoch + 3 * ttl).toISOString(),
     );
     const nextAuthorization =
       `Device um_device_${bounded.deviceId}.${encodeBase64Url(nextSecret)}`;
     await expect(authenticateDevice(bounded.db, nextAuthorization, {
-      nowEpoch: bounded.nowEpoch + 90 * day,
+      nowEpoch: bounded.nowEpoch + 3 * ttl,
       policy,
     })).rejects.toMatchObject({ code: "DEVICE_AUTH_INVALID" });
+  });
+
+  it("keeps the idle window and the credential TTL answering the same question", async () => {
+    // Both run from the same last authenticated use, so an idle window shorter
+    // than the TTL would reject — and then sweep away — a device whose own
+    // `expires_at` the service still reports as unexpired, and a longer one
+    // would keep a device row past the credentials it can authorize.
+    expect(DEFAULT_DEVICE_LIFECYCLE_POLICY.idleMilliseconds)
+      .toBe(DEVICE_CREDENTIAL_TTL_MILLISECONDS);
+    // No renewal may cross the absolute social-recheck horizon, so the TTL has
+    // to sit inside it or every credential is capped from the moment it is
+    // minted and the TTL stops meaning anything.
+    expect(DEVICE_CREDENTIAL_TTL_MILLISECONDS)
+      .toBeLessThan(DEFAULT_DEVICE_LIFECYCLE_POLICY.socialRecheckMaxAgeMilliseconds);
+
+    // The coherence, exercised rather than asserted: a device dormant for just
+    // under the TTL still authenticates, and the sweep leaves it alone.
+    const fixture = await pair();
+    const justInside = fixture.nowEpoch + DEVICE_CREDENTIAL_TTL_MILLISECONDS - 1;
+    await expect(purgeStaleDeviceLifecycleRows(fixture.db, {
+      nowEpoch: justInside,
+    })).resolves.toMatchObject({ devicesRevoked: 0 });
+    await expect(authenticateDevice(fixture.db, fixture.authorization, {
+      nowEpoch: justInside,
+    })).resolves.toMatchObject({ deviceId: fixture.deviceId });
+
+    // And one dormant past it is retired by both, in agreement.
+    const lapsed = await pair();
+    const justOutside = lapsed.nowEpoch + DEVICE_CREDENTIAL_TTL_MILLISECONDS;
+    await expect(authenticateDevice(lapsed.db, lapsed.authorization, {
+      nowEpoch: justOutside,
+    })).rejects.toMatchObject({ code: "DEVICE_AUTH_INVALID" });
+    await expect(purgeStaleDeviceLifecycleRows(lapsed.db, {
+      nowEpoch: justOutside,
+    })).resolves.toMatchObject({ devicesRevoked: 1 });
   });
 
   it("caps pairing issuance and claims without increasing contributor count", async () => {
