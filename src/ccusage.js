@@ -3,13 +3,29 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 
+// The app's Keychain broker announcement names a descriptor in *this* process,
+// and this child's descriptor 0 is /dev/null. No secret leaks — the child
+// cannot reach the socketpair — but an announcement that resolves to an
+// unrelated descriptor is a trap for anything downstream that trusts it, so
+// the key never crosses the spawn.
+const KEYCHAIN_BROKER_FD_ENV = "USAGE_MONITOR_KEYCHAIN_BROKER_FD";
+
+export function ccusageChildEnv(environment = process.env) {
+  const childEnvironment = { ...environment };
+  delete childEnvironment[KEYCHAIN_BROKER_FD_ENV];
+  return childEnvironment;
+}
+
 export function runCcusageCodexDaily({ since, until, timezone = "UTC", offline = false }) {
   const cli = require.resolve("ccusage/src/cli.js");
   const args = [cli, "codex", "daily", "--since", since, "--until", until, "--timezone", timezone, "--json"];
   if (offline) args.push("--offline");
 
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(process.execPath, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: ccusageChildEnv(),
+    });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => { stdout += chunk; });
