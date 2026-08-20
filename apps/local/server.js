@@ -498,6 +498,32 @@ function contributionDeviceRecoveryRequired(error) {
 }
 
 /**
+ * A locked login keychain, and nothing else.
+ *
+ * It shares the recovery family's 409 because uploads genuinely cannot
+ * proceed, but it is the one member where NOTHING on this Mac is broken: the
+ * credential and its binding are intact and become readable again the moment
+ * the keychain is unlocked. Collapsing it into the generic recovery code told
+ * the user their credential was leftover from an earlier install and offered a
+ * destructive clear — a wrong diagnosis whose suggested cure forces a needless
+ * re-pair. Keeping the cause distinguishable is what lets the dashboard say
+ * "uploads are paused until you unlock it" instead.
+ *
+ * With SecKeychainSetUserInteractionAllowed(false) around every app-side
+ * SecItem call, this is what a locked keychain reaches: errSecInteractionNotAllowed
+ * → "locked" → KEYCHAIN_LOCKED over the broker → credential_locked. It arrives
+ * promptly and rejects one broker request, so the channel is not poisoned and
+ * the next pass after an unlock simply succeeds.
+ */
+function contributionDeviceKeychainLocked(error) {
+  try {
+    return error?.code === "contribution_device_credential_locked";
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Append one bounded diagnostics line the user can quote to support.
  *
  * Every field was validated before this point and is either minted by the
@@ -4350,20 +4376,26 @@ function createPreparedLocalCompanionServer({
         } catch (error) {
           const recoveryRequired =
             contributionDeviceRecoveryRequired(error);
-          // A denied Keychain read is the one recovery cause the user acted
-          // on directly — Deny (or cancel) in the macOS access dialog the
-          // mint's read-back raises — so it keeps its own code and the
-          // dashboard can say which dialog to answer differently. The reset
-          // ceremony is the cure for every recovery code either way.
+          // Two recovery causes keep their own code because the reset
+          // ceremony is the wrong instruction for them. Denied is the one the
+          // user acted on directly — Deny (or cancel) in the macOS access
+          // dialog the mint's read-back raises — so the dashboard can say
+          // which dialog to answer differently. Locked is the one where
+          // nothing is broken at all: unlocking restores it, and offering a
+          // destructive clear instead would cost a needless re-pair. Every
+          // other recovery code still means the reset ceremony.
           const keychainAccessDenied =
             error?.code === "contribution_device_credential_denied";
+          const keychainLocked = contributionDeviceKeychainLocked(error);
           sendError(
             response,
             recoveryRequired ? 409 : 502,
             recoveryRequired
               ? keychainAccessDenied
                 ? "contribution_device_keychain_access_denied"
-                : "contribution_device_recovery_required"
+                : keychainLocked
+                  ? "contribution_device_keychain_locked"
+                  : "contribution_device_recovery_required"
               : "contribution_device_pairing_failed",
           );
         }
@@ -4547,13 +4579,18 @@ function createPreparedLocalCompanionServer({
         } catch (error) {
           // A leftover device credential is a precisely known local fault with
           // its own repair. Reporting it as a generic delivery failure would
-          // send the user looking at the service and the network instead.
+          // send the user looking at the service and the network instead. A
+          // locked keychain is the one member of that family that needs no
+          // repair — it is a paused upload, not a broken credential — so it
+          // keeps its own code here too.
           const recoveryRequired = contributionDeviceRecoveryRequired(error);
           sendError(
             response,
             recoveryRequired ? 409 : 502,
             recoveryRequired
-              ? "contribution_device_recovery_required"
+              ? contributionDeviceKeychainLocked(error)
+                ? "contribution_device_keychain_locked"
+                : "contribution_device_recovery_required"
               : "sync_failed",
           );
           return;

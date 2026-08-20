@@ -27,17 +27,22 @@ struct ContributionDeviceKeychainBrokerUnavailable: Error {}
 /// uncorrelatable identifier — fails the channel closed, and the companion
 /// surfaces the same coded, recoverable pairing errors it uses today.
 ///
-/// What this is NOT: a confidentiality boundary against a deliberate
-/// same-user attacker. Items are minted with `runtime/bin/node` in their
-/// trusted-application list (see `designatedReaderAccess()`), and that node is
-/// a world-executable general-purpose interpreter inside the bundle, so any
-/// process running as this user can satisfy the ACL's designated requirement
-/// and read the secret directly. This is not a regression — the `-T node`
-/// `security` mint it replaces had the identical property — and the socketpair
-/// still earns its place: it removes the dialog and narrows accidental
-/// exposure to one single-purpose channel. The true end state is moving upload
-/// signing into this app so node never needs the secret at all, after which
-/// the node ACL entry can be dropped.
+/// The trust boundary is the kernel-held channel itself. The item's ACL names
+/// this signed app and nothing else (see `designatedReaderAccess()`), so the
+/// secret is decryptable only by this app; every other same-user process — the
+/// companion included — can obtain it only by asking over a socketpair end it
+/// must already hold. Earlier revisions also trusted `runtime/bin/node`, which
+/// made the claim false: node is a world-executable general-purpose
+/// interpreter inside the bundle, so any same-user process could execute it,
+/// satisfy the designated requirement, and read the secret silently. That
+/// entry existed for the one-shot Identity & Device Reset helper, which now
+/// clears this generation by its fixed attributes instead — an
+/// attribute-addressed delete never decrypts the item, so it consults no ACL
+/// (verified live on a fresh account, 2026-08-20).
+///
+/// What this is still NOT: proof against an attacker who can modify the
+/// installed bundle or debug this process. A designated-requirement ACL binds
+/// to a code signature, not to a channel the OS enforces per-process.
 final class ContributionDeviceKeychainBroker {
     /// The app-managed storage generation. The legacy
     /// app-usagemonitor.contribution-device.v1 item (minted companion-side
@@ -58,7 +63,6 @@ final class ContributionDeviceKeychainBroker {
     // characters (32 bytes). Anything else is refused before Keychain I/O.
     private static let storedSecretPattern = "^[A-Za-z0-9_-]{43}$"
 
-    private let nodeRuntimePath: String
     private let queue = DispatchQueue(
         label: "usage-monitor.contribution-device-keychain-broker"
     )
@@ -68,8 +72,7 @@ final class ContributionDeviceKeychainBroker {
     private var pendingInput = Data()
     private var closed = false
 
-    init(nodeRuntimePath: String) throws {
-        self.nodeRuntimePath = nodeRuntimePath
+    init() throws {
         var endpoints: [Int32] = [-1, -1]
         guard socketpair(AF_UNIX, SOCK_STREAM, 0, &endpoints) == 0 else {
             throw ContributionDeviceKeychainBrokerUnavailable()
@@ -352,38 +355,38 @@ final class ContributionDeviceKeychainBroker {
         return .value(stored)
     }
 
-    /// The access object minted onto every fresh item: this app and the
-    /// bundled Node runtime, both matched by designated requirement (the
-    /// same stable team + identifier match the `-T` mint relied on), so a
-    /// re-signed same-team update keeps access. The Node entry exists for
-    /// the one-shot Identity & Device Reset helper — a separate node
-    /// process with no broker channel — whose read and exact-delete of this
-    /// item must stay silent; the live companion never reads this item
-    /// directly, it asks this broker.
+    /// The access object minted onto every fresh item: this app alone, matched
+    /// by designated requirement (the same stable team + identifier match the
+    /// `-T` mint relied on), so a re-signed same-team update keeps access.
     ///
-    /// The node entry is also the limit of what the broker can promise: node
-    /// is a general-purpose interpreter any same-user process can execute, so
-    /// its designated requirement is satisfiable at will and the ACL keeps no
-    /// secret from a deliberate same-user attacker. Dropping the entry
-    /// requires moving upload signing into this app first.
+    /// Exactly one entry, deliberately. `runtime/bin/node` was trusted here
+    /// until 2026-08-20, for the one-shot Identity & Device Reset helper's
+    /// keytar read; that entry was also the one thing that made the broker's
+    /// stated boundary untrue, because node is a world-executable
+    /// general-purpose interpreter any same-user process can run to satisfy
+    /// the requirement. The helper now clears this generation with
+    /// `security delete-generic-password -s … -a …`, which addresses the item
+    /// by attribute and never decrypts it, so no ACL is consulted and no
+    /// dialog is reachable (owner-verified live on a fresh account,
+    /// 2026-08-20 — release-gate item 8 had predicted the opposite). Nothing
+    /// else outside this app ever needs to decrypt the item: the live
+    /// companion asks this broker, and the reset and disconnect routes reach
+    /// the same broker through the running app.
+    ///
+    /// Adding a second trusted application here re-opens that hole. Anything
+    /// new that needs the secret must come through the broker instead.
     private func designatedReaderAccess() -> SecAccess? {
         var trustedSelf: SecTrustedApplication?
-        var trustedReader: SecTrustedApplication?
         guard SecTrustedApplicationCreateFromPath(nil, &trustedSelf)
             == errSecSuccess,
-            let appTrust = trustedSelf,
-            SecTrustedApplicationCreateFromPath(
-                nodeRuntimePath,
-                &trustedReader
-            ) == errSecSuccess,
-            let readerTrust = trustedReader
+            let appTrust = trustedSelf
         else {
             return nil
         }
         var access: SecAccess?
         guard SecAccessCreate(
             Self.service as CFString,
-            [appTrust, readerTrust] as CFArray,
+            [appTrust] as CFArray,
             &access
         ) == errSecSuccess else {
             return nil
@@ -393,9 +396,9 @@ final class ContributionDeviceKeychainBroker {
 
     private func storeSecret(_ stored: String) -> String? {
         let data = Data(stored.utf8)
-        // Never mint an item the reset helper could not later read: a
-        // missing access object fails the mint closed rather than shipping
-        // an item with narrower trust than the contract promises.
+        // Never mint an item whose trust this app cannot state: a missing
+        // access object fails the mint closed rather than letting the system
+        // pick a default ACL nobody reasoned about.
         guard let access = designatedReaderAccess() else {
             return "operation_failed"
         }
@@ -413,12 +416,12 @@ final class ContributionDeviceKeychainBroker {
             // hits errSecVerifyFailed by silently recreating the item through
             // _ReplaceKeychainItem → SecKeychainItemCreateFromContent with
             // initialAccess = NULL (OSX/libsecurity_keychain/lib/SecItem.cpp),
-            // which swaps the ACL for the default one and drops the node
-            // trusted-app entry the reset helper reads through. Adding
-            // kSecAttrAccess to the update dictionary does not reliably
-            // prevent it. Delete-then-add re-establishes the ACL on every
-            // write, and the silent ~25-day rotation takes this path every
-            // single time.
+            // which swaps this app-only ACL for the system default one — a
+            // silent widening nobody would observe, since this app keeps
+            // access either way. Adding kSecAttrAccess to the update
+            // dictionary does not reliably prevent it. Delete-then-add
+            // re-establishes the ACL on every write, and the silent ~25-day
+            // rotation takes this path every single time.
             //
             // Safe because this branch is only reachable behind a completed
             // compare-and-swap read: the companion decrypted this item

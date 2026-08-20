@@ -10480,6 +10480,14 @@ function hostedIdentityErrorCopy(error) {
 const CONTRIBUTION_DEVICE_CONFLICT_COPY =
   "This Mac still holds a contribution-device credential from an earlier install, and the local record that paired it is gone, so it cannot be used or replaced. Nothing was uploaded and nothing was changed. Clear the leftover credential below, then connect again.";
 
+// A locked login keychain reaches the same 409 family but is not the same
+// situation: nothing here is leftover, broken, or in need of clearing. The
+// sentence must say what is true (uploads are paused) and name the one action
+// that changes it (unlock), because the recovery copy above would send the
+// user to a destructive reset for a condition their login password fixes.
+const CONTRIBUTION_DEVICE_KEYCHAIN_LOCKED_COPY =
+  "Your Mac's login keychain is locked, so TiboTattle cannot reach this Mac's upload credential. Nothing is wrong with the credential and nothing was uploaded — uploads stay paused until you unlock it. Open Keychain Access, unlock the login keychain, then try again. Do not reset or delete the entry.";
+
 // Fixed contribution-service codes this page knows how to explain. The
 // service's own codes are never rendered; each one is answered with a sentence
 // written here, and anything unrecognized falls back to the caller's copy.
@@ -10624,6 +10632,10 @@ const LOCAL_COMPANION_ERROR_COPY = {
   contribution_device_credential_conflict: CONTRIBUTION_DEVICE_CONFLICT_COPY,
   contribution_device_keychain_access_denied:
     "macOS did not let TiboTattle read the upload credential it just stored for this Mac — this happens when Deny is chosen in the macOS keychain dialog. Nothing was uploaded. Clear the credential below, choose Review and approve again, and choose Always Allow when macOS asks.",
+  // Locked is NOT a defect and must never read like one: the credential and
+  // its local record are both intact and become readable the moment the
+  // keychain is unlocked. Uploads pause; nothing needs clearing or re-pairing.
+  contribution_device_keychain_locked: CONTRIBUTION_DEVICE_KEYCHAIN_LOCKED_COPY,
   unsupported_media_type:
     "The local companion rejected this request format. Nothing was uploaded; reload TiboTattle and try again.",
   request_too_large:
@@ -12391,7 +12403,8 @@ async function approveIncrementalContribution() {
       // rather than being silently discarded (owner-reported, 2026-08-10).
       await renderContributionSessionSignInGate(status, error);
     } else if (contributionConnectStepOf(error) !== null
-        || contributionDeviceRecoveryIsRequired(error)) {
+        || contributionDeviceRecoveryIsRequired(error)
+        || contributionDeviceKeychainIsLocked(error)) {
       await reportContributionConnectFailure(status, error, {
         enrollmentAttemptedWithHostedIdentity,
         enrollmentEstablished,
@@ -12556,6 +12569,24 @@ function contributionDeviceRecoveryIsRequired(error) {
   }
 }
 
+/**
+ * A locked login keychain — deliberately NOT part of the recovery family.
+ *
+ * The companion cannot reach the upload credential while the keychain is
+ * locked, but the credential and its local record are both intact, and both
+ * become readable again the moment the user unlocks it. Rendering the recovery
+ * surface here would tell them the credential is leftover from an earlier
+ * install and hand them a destructive clear — a wrong diagnosis whose cure
+ * costs a needless re-pair. Uploads pause; that is the whole of it.
+ */
+function contributionDeviceKeychainIsLocked(error) {
+  try {
+    return error?.code === "contribution_device_keychain_locked";
+  } catch {
+    return false;
+  }
+}
+
 // The service's three session-rejection codes: the stored browser session or
 // its CSRF confirmation was not recognized — a session that predates the last
 // service deploy, or one that expired server-side. Nothing about the user's
@@ -12713,6 +12744,51 @@ async function resetContributionDeviceCredential() {
   }
 }
 
+/**
+ * The locked-keychain surface: an honest pause, not a repair.
+ *
+ * Deliberately offers no reset button. The credential is fine; the keychain is
+ * locked. The only action that changes anything is unlocking it, so that is
+ * the only action named — offering the destructive clear here would cost a
+ * needless re-pair for a condition the user's login password fixes. Both
+ * sentences take the localized path: a reader in Chinese or Spanish is exactly
+ * as likely to meet a locked keychain as anyone else.
+ */
+async function renderContributionDeviceKeychainLocked(status, { error } = {}) {
+  const described = await describeFailure({
+    surface: "contribution_connect",
+    error,
+    fallback: CONTRIBUTION_DEVICE_KEYCHAIN_LOCKED_COPY
+  });
+  const guidance = node("p", "annotation", "");
+  setProductText(
+    guidance,
+    "Unlocking restores uploads by itself — there is nothing to reset and nothing to approve again. Anything not yet sent stays queued on this Mac.",
+  );
+  const action = node("a", "button button-secondary", "Open TiboTattle");
+  if (SEMANTIC_OPEN_TARGET) {
+    action.href = SEMANTIC_OPEN_TARGET;
+  } else {
+    action.hidden = true;
+  }
+  const actions = node("div", "contribution-cta-buttons");
+  actions.append(action);
+  const headline = node("strong", "", "");
+  setProductText(
+    headline,
+    "Uploads are paused: your Mac's login keychain is locked.",
+  );
+  status.hidden = false;
+  status.className = "participant-action-status error";
+  status.replaceChildren(
+    headline,
+    document.createTextNode(` ${described.text}`),
+    guidance,
+    actions
+  );
+  return described;
+}
+
 async function finishCommunityDevicePairing(pairing, status) {
   if (typeof pairing?.pairingCode !== "string") {
     const error = new Error("The service did not return a one-use pairing capability.");
@@ -12838,6 +12914,12 @@ async function reportContributionConnectFailure(status, error, {
   enrollmentAttemptedWithHostedIdentity,
   enrollmentEstablished,
 }) {
+  // Locked is checked first and separately: it is the one member of the 409
+  // family whose cure is not the reset ceremony.
+  if (contributionDeviceKeychainIsLocked(error)) {
+    await renderContributionDeviceKeychainLocked(status, { error });
+    return;
+  }
   if (contributionDeviceRecoveryIsRequired(error)) {
     await renderContributionDeviceRecovery(status, { error });
     return;

@@ -5,9 +5,19 @@ shipped on `fix/first-pairing-keychain-ux`; the structural elimination
 (Swift-app credential minting over a spawn-time broker channel) is built on
 `feat/swift-keychain-broker` and documented in "Implementation" below, with
 the red-team findings on PR #34 folded in. The fresh-account zero-dialog proof
-remains a release-gate observation (see the checklist at the end), and two of
-its items — the node ACL read and the `security` CLI delete — are open
-questions this worktree cannot settle.
+remains a release-gate observation (see the checklist at the end).
+
+**Updated 2026-08-20 (`fix/keychain-acl-app-only`).** Release-gate item 8 is
+settled, and it settled the opposite way to the prediction: the owner ran
+`security delete-generic-password -s app-usagemonitor.contribution-device.app.v1
+-a installation` live on a fresh account and it **succeeded with no prompt**. An
+attribute-addressed delete never decrypts the item, so no ACL or partition
+check occurs — the same property this repo already documented for the legacy
+retirement path ("never decrypted, never prompting"). The
+`apple-tool:`-partition worry does not apply to an operation that never asks
+for the item's data. With deletion proven ACL-free, `runtime/bin/node` has been
+removed from the app-minted item's trusted-application list (item 7 is retired
+with it), which makes the boundary claim below true rather than aspirational.
 
 ## What was observed
 
@@ -134,6 +144,11 @@ process is not in that path today. Clearly not contained in this change;
 **recommended direction** if the one-dialog experience is judged not good
 enough after this change's copy ships.
 
+*(As shipped, the boundary is drawn tighter than sketched here: the companion
+never reads the item at all — it asks the app over the broker — and since
+2026-08-20 the ACL trusts the app alone, with no node entry. See
+"Implementation" below.)*
+
 ### 4. `kSecUseDataProtectionKeychain` with proper entitlements
 
 The iOS-style keychain has no per-item ACL dialogs at all: access is decided
@@ -164,6 +179,9 @@ follow-on once the Swift-side Keychain boundary exists. Options 2 and 5 are
 rejected. Until then, the one first-pairing dialog is a prepared, explained,
 recoverable moment instead of a raw OS interruption.
 
+*(Option 3 shipped in PR #34; its ACL was narrowed to the app alone on
+2026-08-20. Option 4 is still the end state.)*
+
 ## Implementation (feat/swift-keychain-broker)
 
 Option 3, with the boundary drawn slightly stricter than sketched above: the
@@ -174,26 +192,49 @@ at all — not even reads. Every touch happens inside the signed app.
 
 Stated plainly, because an earlier draft of this note and of
 `KeychainBroker.swift` overclaimed it (corrected after the red-team review of
-PR #34):
+PR #34), and then the underlying cause was removed (2026-08-20).
 
-The broker **removes the dialog** and **narrows accidental exposure** — the
-companion can address exactly one Keychain item, through one single-purpose
-channel, and holds the secret only in memory. It is **not a confidentiality
-boundary against a deliberate same-user attacker.** Every item is minted with
+The app-minted item's ACL now names **the signed app and nothing else**. The
+secret is therefore decryptable only by TiboTattle.app; every other process
+running as this user — the companion included — can obtain it only by asking
+over a socketpair end it must already hold. The kernel-held channel is the
+trust boundary, and that sentence is now true.
+
+**What was wrong until 2026-08-20.** Every item was also minted with
 `runtime/bin/node` in its trusted-application list, because the one-shot
-Identity & Device Reset helper reads it through keytar, and that node is a
-world-executable general-purpose interpreter inside the bundle: any process
-running as this user can execute it and satisfy the ACL's designated
-requirement. This is not a regression — the `-T node` `security` mint it
-replaces had exactly the same property — but it is not the stronger claim
-either.
+Identity & Device Reset helper read it through keytar. That node is a
+world-executable general-purpose interpreter inside the bundle, so any process
+running as this user could execute it, satisfy the ACL's designated
+requirement, and read the credential silently. The ACL kept no secret from a
+deliberate same-user attacker. It was not a regression — the `-T node`
+`security` mint it replaced had exactly the same property — but the broker's
+stated claim did not hold while it was there.
 
-**The end state that would close it:** move upload signing into the Swift app,
-so the companion asks the app to sign rather than to hand over the secret and
-node never needs to read the item at all. The node ACL entry can then be
-dropped, at which point the item is readable only by the signed app and option
-4's data-protection keychain becomes the natural follow-on. That is the
-recommended next step for this workstream; it is not in this change.
+**What removed it.** Not the upload-signing move this note previously
+nominated. The reset helper never needed to *read* the app generation at all:
+a reset is an unconditional destructive clear, so it needs deletion, and
+deletion by attributes (`security delete-generic-password -s … -a …`) never
+decrypts the item and therefore consults no ACL. The owner verified this live
+on a fresh account (2026-08-20) against a real app-minted item: it succeeded
+with no prompt. The helper now clears the app generation that way — an
+attribute presence probe as its read-only preflight, an attribute delete as
+its removal — while the legacy `.v1` generation keeps its keytar read and
+exact-value delete unchanged, because that item's own `-T node` ACL grants the
+helper access and there is no reason to disturb a working path.
+
+Nothing else outside the app ever decrypts the item. The credential-reset route
+already cleared the app generation by attribute; disconnect and the live
+companion reach it through the broker in the running app. So one trusted
+application is sufficient, and adding a second re-opens the hole — the source
+contract test in `test/macos-app-bundle.test.js` fails if anyone does.
+
+**What this still is not.** Proof against an attacker who can modify the
+installed bundle or attach a debugger to the app. A designated-requirement ACL
+binds to a code signature, not to a per-process capability the kernel enforces.
+Option 4's data-protection keychain remains the better end state; moving upload
+signing into the app remains worthwhile on its own merits (the companion would
+never hold the secret in memory), but neither is required for the ACL claim
+above to hold.
 
 ### The broker channel
 
@@ -228,12 +269,12 @@ the app via `SecItemAdd` into the login keychain. A different service
 string — not a marker attribute — separates the generations, so app-side
 code can never accidentally decrypt a `security`-CLI-minted `.v1` item;
 that read is exactly the partition prompt this work eliminates. Each item
-carries a `SecAccessCreate` object trusting the app and the bundled Node
-runtime by designated requirement (the `-T` semantics the durable mint
-already relied on): the app's own reads are silent as creator, and the
-one-shot Identity & Device Reset helper — a separate node process with no
-broker channel — keeps its silent keytar read + exact-delete over the new
-item. `kSecUseDataProtectionKeychain` was re-assessed and stays rejected
+carries a `SecAccessCreate` object trusting **the app alone** by designated
+requirement (the `-T` semantics the durable mint already relied on, minus the
+node entry): the app's own reads are silent as creator, and nothing outside
+the app decrypts the item — the one-shot Identity & Device Reset helper, a
+separate node process with no broker channel, clears it by attribute instead.
+`kSecUseDataProtectionKeychain` was re-assessed and stays rejected
 for now: it requires provisioning-profile-backed entitlements the Developer
 ID app does not carry (option 4 remains the follow-on once it does).
 
@@ -257,6 +298,43 @@ Every SecItem call is therefore bracketed in
 dialogs" becomes a structural property of the broker rather than an
 expectation about which items macOS decides to challenge.
 
+### The locked keychain
+
+The owner's position is explicit: if the login keychain is locked, there are no
+uploads, and that is acceptable. The requirement is not to engineer around it
+but to make it truthful and non-wedging. Four properties, all now pinned by
+tests:
+
+- **No dialog.** `SecKeychainSetUserInteractionAllowed(false)` makes the
+  app-side SecItem call return `errSecInteractionNotAllowed` immediately
+  instead of raising a modal that would block the broker's single serialized
+  queue.
+- **An honest coded state.** That maps `locked` → `KEYCHAIN_LOCKED` →
+  `contribution_device_credential_locked`, and uploads pause
+  (`device_unavailable`) with whatever was queued still queued.
+- **No poisoning.** A `locked` wire rejection settles exactly one request; only
+  a timeout, a protocol violation, or a socket failure poisons the transport.
+  This matters because the transport deliberately never reconnects: a poisoned
+  channel is dead for the companion's whole lifetime, so a locked keychain that
+  poisoned it would leave the user who unlocks correctly with a still-broken
+  product. Verified end to end in
+  `test/contribution-device-keychain-broker.test.js` ("a locked keychain pauses
+  honestly and leaves the channel usable after the unlock"): the mint that
+  follows the unlock runs over the same channel with strictly increasing
+  identifiers.
+- **Copy that does not imply a defect.** Until 2026-08-20 `credential_locked`
+  was folded into `contribution_device_recovery_required`, so the dashboard
+  told the user their credential was left over from an earlier install, that
+  the record pairing it was gone, and offered a destructive "Reset this Mac's
+  device credential". All three claims are false for a locked keychain, and the
+  suggested cure would have forced a needless re-pair for something the user's
+  login password fixes. It now has its own route code
+  `contribution_device_keychain_locked` (pairing and sync routes, still 409,
+  still the same recovery family for pause purposes) and its own dashboard
+  surface with no reset button: "Uploads are paused: your Mac's login keychain
+  is locked", plus the unlock instruction — both on the localized path, in all
+  three shipped languages.
+
 The transport still does not reconnect after poisoning, and that is
 deliberate: `poison()` destroys the socket, which closes descriptor 0, and a
 "fresh" transport over that number would attach to whatever the process
@@ -277,9 +355,10 @@ that with `SecItemUpdate` is unsafe: in Apple's shipping implementation an
 update that hits `errSecVerifyFailed` falls into `_ReplaceKeychainItem` →
 `SecKeychainItemCreateFromContent` with `initialAccess = NULL`
 (`OSX/libsecurity_keychain/lib/SecItem.cpp`), recreating the item with a
-default ACL and dropping the node trusted-application entry — after which the
-reset helper starts prompting. Adding `kSecAttrAccess` to the update
-dictionary does not reliably prevent it.
+default ACL. Since 2026-08-20 that is a silent **widening** of the app-only
+ACL rather than a narrowing, which is worse for being unobservable: the app
+keeps access either way, so nothing in the product would report it. Adding
+`kSecAttrAccess` to the update dictionary does not reliably prevent it.
 
 The broker deletes and re-adds instead, so every write re-establishes the ACL
 deterministically. **Why that cannot lose the credential:** the branch is only
@@ -346,9 +425,14 @@ only on the `pairing` path.
   attribute-addressed deletion path (never decrypted, never prompting). A
   crash between the two steps leaves the valid new credential shadowing the
   stale legacy item, which the next rotation, disconnect, or reset sweeps.
-- **Reset / disconnect:** the credential-reset route's attribute delete and
-  the Identity & Device Reset helper now clear both generations; disconnect
-  exact-deletes whichever generation holds the credential.
+- **Reset / disconnect:** both clear both generations, and neither needs the
+  app generation's ACL. The credential-reset route deletes the app generation
+  by attribute (and reaches the legacy one through the backend, falling back to
+  an attribute delete when the read is the broken thing). The Identity &
+  Device Reset helper probes-and-deletes the app generation by attribute and
+  keeps its keytar read + exact delete for the legacy one. Disconnect runs
+  inside the live app, so its read and exact delete of the app generation go
+  over the broker; it exact-deletes whichever generation holds the credential.
 - **Downgrade after migration:** an older build cannot see the app
   generation, reads `credential_missing` against the still-present binding
   file, and lands in the existing recovery ceremony — honest and curable by
@@ -396,31 +480,33 @@ signed build that includes `feat/swift-keychain-broker`:
 6. Deny-hazard regression: on the fresh account, the pairing step's
    in-ceremony guidance should now be unreachable (no dialog to answer);
    confirm the ceremony copy still renders correctly for legacy installs.
-7. **ACL reachability, app-minted item.** `runtime/bin/node` inside the
-   installed bundle must be able to read the `.app.v1` item **silently** —
-   this is what the Identity & Device Reset helper depends on, and it is the
-   half of `SecAccessCreate` that no unit test can prove. Run the packaged
-   node against `keytar.getPassword` for
-   `app-usagemonitor.contribution-device.app.v1` / `installation` and confirm
-   a value with no dialog.
-8. **`security` CLI deletability of the app-minted item.**
+7. ~~**ACL reachability, app-minted item.**~~ **Retired 2026-08-20.** The
+   packaged `runtime/bin/node` is no longer in the item's ACL and is not
+   expected to read it. The inverse is now the check worth running: a keytar
+   read of `app-usagemonitor.contribution-device.app.v1` / `installation` from
+   the packaged node **should be refused**, and — because the reset helper
+   never attempts it — that refusal must be invisible in the product.
+8. **`security` CLI deletability of the app-minted item.** **Settled
+   2026-08-20 — it succeeds, with no prompt** (owner-run, fresh account,
+   against a real app-minted item). The prediction of failure was wrong for a
+   principled reason: an attribute-addressed delete never decrypts the item,
+   so no ACL or partition check occurs at all, and the `apple-tool:` partition
+   concern applies only to operations that ask for the item's data. This is
+   what the whole reset path and the app-only ACL now rest on, so re-confirm
+   it on any macOS major-version bump:
    `/usr/bin/security delete-generic-password -s
-   app-usagemonitor.contribution-device.app.v1 -a installation` must succeed
-   without a prompt. **Expect this to fail.** securityd assigns the CLI the
-   `apple-tool:` partition, which is not in the `teamid:` partition list an
-   app-created item carries, so the attribute-addressed repair path — the one
-   that worked on 2026-08-10 precisely because it needed neither the binding
-   nor the ACL — may not reach the app generation at all. If it fails, the
-   app-side `SecItemDelete` over the broker must own the reset path before
-   ship, and the credential-reset route's attribute delete must stop being
-   treated as a sufficient cure for `.app.v1`. Check `find-generic-password`
-   (the presence probe, no `-w`/`-g`) separately: it is a different operation
-   and the legacy-probe gate depends on it answering honestly.
+   app-usagemonitor.contribution-device.app.v1 -a installation`. Check
+   `find-generic-password` (the presence probe, no `-w`/`-g`) separately: it
+   is a different operation and both the reset preflight and the legacy-probe
+   gate depend on it answering honestly.
 9. Wedge regression: with the login keychain **locked**, run a credential
    operation and confirm the companion reports
    `contribution_device_credential_locked` promptly rather than hanging for
    ten seconds and poisoning the channel — the observable proof that
-   `SecKeychainSetUserInteractionAllowed(false)` is in force.
+   `SecKeychainSetUserInteractionAllowed(false)` is in force. The dashboard
+   must say uploads are **paused until the keychain is unlocked** and must NOT
+   offer the credential reset (see "The locked keychain" below); unlocking and
+   retrying must then succeed with no re-pair.
 
 ## Shipped in this change (for reference)
 
