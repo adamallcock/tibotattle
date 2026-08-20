@@ -330,6 +330,12 @@ export function createDeferredAccountingRebuildRecorder({
         requestId: "",
         step: "accounting",
         ...(detail === null ? {} : { detail }),
+        // The guard's own three quantities when it recorded them. The note
+        // writer re-validates and drops anything that is not the closed
+        // three-key MiB shape, so this can only ever add integers.
+        ...(outcome?.measurements == null
+          ? {}
+          : { measurements: outcome.measurements }),
       });
     } catch {
       // The diagnostics trail must never affect the refresh outcome.

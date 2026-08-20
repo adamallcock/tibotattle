@@ -540,6 +540,34 @@ function contributionDeviceKeychainLocked(error) {
  * the current file becomes the single previous generation and a fresh one
  * starts, so the log can never grow without limit.
  */
+// Server-minted resource measurements for a budget-miss note: a closed set of
+// three keys whose values are rounded whole MiB or null, and nothing else. A
+// coarse code such as accounting_transition_rss_limit_exceeded is useless to a
+// reader who cannot see how far over the bound it went or what the bound was —
+// the same reasoning that already admits `detail`. Bounded integers carry no
+// message, payload, path, or participant value, so the privacy contract above
+// is unchanged; anything not matching that exact shape is dropped rather than
+// written, so a caller can never widen this into a free-form channel.
+const NOTE_MEASUREMENT_KEYS = Object.freeze([
+  "baselineRssMib",
+  "observedRssMib",
+  "ceilingRssMib",
+]);
+
+function boundedNoteMeasurements(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const bounded = {};
+  for (const key of NOTE_MEASUREMENT_KEYS) {
+    const measurement = value[key];
+    bounded[key] = Number.isSafeInteger(measurement) && measurement >= 0
+      ? measurement
+      : null;
+  }
+  return bounded;
+}
+
 async function appendDiagnosticNote({
   file,
   note,
@@ -554,6 +582,9 @@ async function appendDiagnosticNote({
     requestId: note.requestId,
     ...(note.step === undefined ? {} : { step: note.step }),
     ...(note.detail === undefined ? {} : { detail: note.detail }),
+    ...(note.measurements === undefined
+      ? {}
+      : { measurements: boundedNoteMeasurements(note.measurements) }),
   })}\n`;
   const bytes = Buffer.byteLength(line, "utf8");
   let current = null;

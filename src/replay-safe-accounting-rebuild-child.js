@@ -53,6 +53,28 @@ const CHILD_MODULE_FILE = fileURLToPath(import.meta.url);
 // whose code cannot be safely restated collapses to the subprocess-failure
 // code rather than leaking arbitrary text across the boundary.
 const CHILD_FAILURE_CODE_PATTERN = /^[a-z0-9_]{1,64}$/u;
+// The closed measurement shape a budget miss may carry back. Three keys, whole
+// non-negative MiB or null, nothing else — the same shape the parent
+// re-validates, so neither side has to trust the other.
+const CHILD_MEASUREMENT_KEYS = Object.freeze([
+  "baselineRssMib",
+  "observedRssMib",
+  "ceilingRssMib",
+]);
+
+function boundedChildMeasurements(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const bounded = {};
+  for (const key of CHILD_MEASUREMENT_KEYS) {
+    const measurement = value[key];
+    bounded[key] = Number.isSafeInteger(measurement) && measurement >= 0
+      ? measurement
+      : null;
+  }
+  return bounded;
+}
 
 function requestPath(value, { allowNull = false } = {}) {
   if (allowNull && value === null) return null;
@@ -186,6 +208,13 @@ export async function runReplaySafeAccountingRebuildChild({
       resultSha256: createHash("sha256").update(payload).digest("hex"),
     };
   } catch (error) {
+    // A budget miss carries the three quantities its guard compared. Those
+    // must cross the boundary or the production path — which is the isolated
+    // child whenever isolation is eligible — records a deferral with no
+    // numbers, which is exactly the undiagnosable state the instrumentation
+    // exists to end. Rounded MiB integers only, re-validated on both sides,
+    // so this stays a fixed numeric shape and never a text channel.
+    const measurements = boundedChildMeasurements(error?.measurements);
     return {
       status: "error",
       code: typeof error?.code === "string"
@@ -193,6 +222,7 @@ export async function runReplaySafeAccountingRebuildChild({
         ? error.code
         : "accounting_rebuild_subprocess_failed",
       name: error?.name === "AbortError" ? "AbortError" : "Error",
+      ...(measurements === null ? {} : { measurements }),
     };
   }
 }

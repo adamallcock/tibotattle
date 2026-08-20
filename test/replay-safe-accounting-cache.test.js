@@ -3020,9 +3020,19 @@ test("an RSS ceiling miss during accounting is a soft target: the prior cache is
   assert.equal(outcome.retained, true);
   assert.equal(outcome.generatedAt, before.generatedAt);
   // The honest degraded note was produced — content-free reason + retained.
+  // The deferral now carries the three quantities the guard compared. Six days
+  // of these misses were undiagnosable because the note recorded only the code:
+  // a too-small ceiling, a bloated parent and an unbounded slice all stayed
+  // equally consistent with the evidence. Pinned so the payload can never
+  // silently narrow back to a bare reason.
   assert.deepEqual(deferredEvents, [{
     reason: "accounting_transition_rss_limit_exceeded",
     retained: true,
+    measurements: {
+      baselineRssMib: 0,
+      ceilingRssMib: 0,
+      observedRssMib: 0,
+    },
   }]);
   // The last good cache survives on disk untouched, at its owner-only mode...
   assert.deepEqual(await readTestCache(cacheFile), before);
@@ -3107,9 +3117,13 @@ test("a retained-byte budget miss is a soft target that retains the prior cache"
   assert.equal(outcome.status, "accounting_rebuild_deferred");
   assert.equal(outcome.reason, "accounting_transition_memory_budget_exceeded");
   assert.equal(outcome.retained, true);
+  // A retained-byte miss is a different guard and records no RSS quantities,
+  // so `measurements` is explicitly null rather than absent — a reader can tell
+  // "this guard does not meter RSS" from "the metering was lost".
   assert.deepEqual(deferredEvents, [{
     reason: "accounting_transition_memory_budget_exceeded",
     retained: true,
+    measurements: null,
   }]);
   assert.deepEqual(await readTestCache(cacheFile), before);
 });
@@ -3143,6 +3157,11 @@ test("a memory-budget miss with no prior cache degrades honestly without throwin
   assert.deepEqual(deferredEvents, [{
     reason: "accounting_transition_rss_limit_exceeded",
     retained: false,
+    measurements: {
+      baselineRssMib: 0,
+      ceilingRssMib: 0,
+      observedRssMib: 0,
+    },
   }]);
   assert.equal(await readTestCache(cacheFile), null);
   const served = await readReplaySafeAccountingCache({

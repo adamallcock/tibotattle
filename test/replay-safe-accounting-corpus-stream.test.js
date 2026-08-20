@@ -829,8 +829,19 @@ test("a dead or lying rebuild child fails closed to the deferral and retains the
     assert.equal(lied.reason, "accounting_rebuild_subprocess_failed");
     assert.equal(lied.retained, true);
     assert.deepEqual(deferredEvents, [
-      { reason: "accounting_rebuild_subprocess_failed", retained: true },
-      { reason: "accounting_rebuild_subprocess_failed", retained: true },
+      // A dead or lying child metered nothing, so measurements is explicitly
+      // null: "no numbers were reported" is itself a fact worth recording, and
+      // distinguishes a crashed child from a guard that measured and tripped.
+      {
+        reason: "accounting_rebuild_subprocess_failed",
+        retained: true,
+        measurements: null,
+      },
+      {
+        reason: "accounting_rebuild_subprocess_failed",
+        retained: true,
+        measurements: null,
+      },
     ]);
     // The prior cache survives both failures untouched and is still served.
     const served = await readReplaySafeAccountingCache({ stateFile });
@@ -989,6 +1000,10 @@ process.stdout.write(JSON.stringify({
     status: inProcess?.status ?? "rebuilt",
     reason: inProcess?.reason ?? null,
     retained: inProcess?.retained ?? null,
+    // Carried out of the harness so the assertion can check the guard's own
+    // quantities crossed intact; dropping it here would hide a regression in
+    // the very plumbing the deferral depends on.
+    measurements: inProcess?.measurements ?? null,
   },
   isolated: {
     schemaVersion: isolated?.schemaVersion ?? null,
@@ -1071,11 +1086,28 @@ test("a rebuild completes in the child while the parent sits past the RSS ceilin
     );
     // In-process: the incident, reproduced — the guard's first check defers
     // and no attempt could ever land (retained:false, nothing on disk yet).
-    assert.deepEqual(outcome.inProcess, {
-      status: "accounting_rebuild_deferred",
-      reason: "accounting_transition_rss_limit_exceeded",
-      retained: false,
-    });
+    assert.equal(outcome.inProcess.status, "accounting_rebuild_deferred");
+    assert.equal(
+      outcome.inProcess.reason,
+      "accounting_transition_rss_limit_exceeded",
+    );
+    assert.equal(outcome.inProcess.retained, false);
+    // The miss carries the quantities it compared, and they survive the
+    // process boundary. Asserted as a RELATION rather than fixed numbers:
+    // real RSS is not reproducible, but "observed exceeded the ceiling" is
+    // precisely why this deferred, so a run where that does not hold is not
+    // the incident this test claims to reproduce. Zeros or nulls fail here.
+    const missed = outcome.inProcess.measurements;
+    assert.deepEqual(
+      Object.keys(missed).sort(),
+      ["baselineRssMib", "ceilingRssMib", "observedRssMib"],
+    );
+    assert.ok(
+      missed.observedRssMib > missed.ceilingRssMib,
+      `observed ${missed.observedRssMib} MiB must exceed the ceiling `
+        + `${missed.ceilingRssMib} MiB that deferred it`,
+    );
+    assert.ok(missed.baselineRssMib > 0);
     // Isolated: the same rebuild against the same corpus COMPLETES, because
     // the budget now polices the child's own clean-baseline RSS.
     assert.deepEqual(outcome.isolated, {
@@ -1252,10 +1284,16 @@ test("a child over its RSS ceiling defers with the metered reason, not a subproc
     assert.notEqual(deferred.reason, "accounting_rebuild_subprocess_failed");
     assert.equal(deferred.retained, true);
     assert.equal(deferred.generatedAt, prior.generatedAt);
-    assert.deepEqual(deferredEvents, [{
-      reason: "accounting_transition_rss_limit_exceeded",
-      retained: true,
-    }]);
+    assert.equal(deferredEvents.length, 1);
+    assert.equal(
+      deferredEvents[0].reason,
+      "accounting_transition_rss_limit_exceeded",
+    );
+    assert.equal(deferredEvents[0].retained, true);
+    assert.ok(
+      deferredEvents[0].measurements.observedRssMib
+        > deferredEvents[0].measurements.ceilingRssMib,
+    );
     // The prior cache survived the miss untouched and is still what is served.
     const held = await readReplaySafeAccountingCache({ stateFile });
     assert.equal(held.status, "available");
