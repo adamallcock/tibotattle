@@ -135,6 +135,23 @@ the final arm64 DMG at:
 .release-build/macos-release/TiboTattle-X.Y.Z-macOS-arm64.dmg
 ~~~
 
+Read the minimum OS out of the bundle now, and use only this value afterwards:
+
+~~~bash
+/usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" \
+  .release-build/macos-production/TiboTattle.app/Contents/Info.plist
+~~~
+
+It is typed by hand in two places later — the "Requires macOS N or later" line
+in `release-notes/X.Y.Z.md`, and `--minimum-macos` in the release-site command
+of step 7 — and neither is checked against the bundle by any test. The 0.1.13
+notes shipped "macOS 13" against a bundle declaring 14.0 and were caught only
+because the evidence descriptor was filled from the artifact rather than from a
+previous release's template. Get this wrong in the low direction and a reader
+on an unsupported macOS downloads an app that cannot launch, then reports the
+app as broken rather than themselves as unsupported. Copy the number from the
+command above into both places; never carry it forward from a template.
+
 At this point the DMG is the final subject. Record its SHA-256 and freeze the
 bytes. Do not re-sign, repackage, compress, mount-and-edit, or otherwise mutate
 the DMG after this point. Any mutation requires restarting this section and all
@@ -293,6 +310,41 @@ identical command return `RELEASE_EVIDENCE_VALID`.
 Note that 0.1.11 and 0.1.12 published the DMG alone, so 0.1.13 is the first
 release to carry the evidence assets at all. Do not treat an older release's
 asset list as the reference.
+
+### Gate: never enumerate the asset list by hand again
+
+The defect above was not really a missing file. It was two lists that had to
+agree by hand — what `SHA256SUMS` carries digests for, and what actually gets
+uploaded — diverging silently until somebody walked the documented path. Run
+this against the draft instead of trusting the prose above:
+
+~~~bash
+comm -23 \
+  <(awk '{print $2}' "$SHA256SUMS" | sort) \
+  <(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' | sort)
+~~~
+
+It must print nothing. Anything it prints is an evidence entry whose bytes are
+not published, which fails `release:evidence:validate` for every downloader.
+(The relation is `SHA256SUMS ⊆ assets`, not equality — `verify-release.md` is
+guidance, not evidence, so it is legitimately an asset with no digest row.)
+
+This matters beyond the appcast, because `buildSha256Sums` adds rows for **five
+conditional subjects**, and only the updater one has ever been exercised:
+
+| Row | Condition |
+| --- | --- |
+| `release-manifest.json` | always |
+| the artifact itself | always |
+| `artifact.store.receipt` | `store !== null` |
+| `artifact.sbom` | `sbom !== null` |
+| `artifact.sbom.attestation` | `sbom.attestation !== null` |
+| `artifact.provenance` | `provenance !== null` |
+| `artifact.updater.metadata` | `updater.enabled` |
+
+Each conditional row is an independent chance to reintroduce exactly this bug
+the first time that path is taken. The `comm` gate catches all of them without
+anyone having to remember which flags are on.
 
 ~~~bash
 TAG="vX.Y.Z"
