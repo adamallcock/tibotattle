@@ -1413,6 +1413,15 @@ const EVIDENCE_WARNING_FALLBACK = "#evidence-warnings";
 // as it.
 const EVIDENCE_WARNING_PROGRESS =
   /\b(?:advance|advances|advancing|expand|expands|still)\b/iu;
+// A load already in flight, and tracking that simply started fresh, are
+// information, not faults: the sentence names its own resolution. These share
+// the quiet blue treatment, so the alert color is reserved for caveats on
+// figures that are actually degraded (owner-directed, 2026-08-19: degraded
+// notes read as errors in dogfood). Deliberately absent: the withheld-cache
+// sentences and their vocabulary — that state is being replaced wholesale by
+// serve-stale-while-recalculating, and its rendering is owned there.
+const EVIDENCE_WARNING_INFORMATIONAL =
+  /\b(?:loading|started fresh)\b/iu;
 
 function evidenceWarningTarget(message) {
   return EVIDENCE_WARNING_ROUTES
@@ -1439,7 +1448,9 @@ function renderEvidenceWarnings(data) {
     for (const message of messages) {
       const item = node("li", EVIDENCE_WARNING_PROGRESS.test(message)
         ? "evidence-warning progress"
-        : "evidence-warning");
+        : EVIDENCE_WARNING_INFORMATIONAL.test(message)
+          ? "evidence-warning informational"
+          : "evidence-warning");
       setRawText(item, message);
       list.append(item);
     }
