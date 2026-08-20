@@ -1621,9 +1621,7 @@ private final class CompanionProcess {
         // If the broker cannot be created (descriptor exhaustion), the
         // companion runs without one and its own explained pairing path
         // remains the net.
-        let broker = try? ContributionDeviceKeychainBroker(
-            nodeRuntimePath: resources.node.path
-        )
+        let broker = try? ContributionDeviceKeychainBroker()
         child.standardInput = broker?.childEndpoint ?? FileHandle.nullDevice
         child.standardOutput = standardOutput
         child.standardError = standardError

@@ -116,6 +116,8 @@ import {
 } from "../apps/macos/reset-local-keychain.js";
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+  exportIdentityKeychainAttributeDeleteArguments,
+  exportIdentityKeychainAttributeProbeArguments,
 } from "../src/export-identity-keychain.js";
 import {
   CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_FD_ENV,
@@ -2080,11 +2082,10 @@ test("targeted local Keychain reset removes only exact local capabilities and re
   const stored = new Map([
     // Both contribution-device storage generations: the app-minted broker
     // item and the companion-minted legacy item are one credential surface
-    // and the reset must clear whichever exist.
-    [
-      "app-usagemonitor.contribution-device.app.v1",
-      Buffer.alloc(32, 0x30),
-    ],
+    // and the reset must clear whichever exist. Only the legacy item is
+    // reachable through the decrypting backend — the app-minted item's ACL
+    // names the signed app alone, so this helper never reads it and the map
+    // below deliberately offers no way to.
     [
       "app-usagemonitor.contribution-device.v1",
       Buffer.alloc(32, 0x31),
@@ -2097,6 +2098,11 @@ test("targeted local Keychain reset removes only exact local capabilities and re
       "app-usagemonitor.account-observation.v1",
       Buffer.alloc(32, 0x33),
     ],
+  ]);
+  // The app-minted generation, addressed only by service and account. An
+  // attribute delete never decrypts, so nothing here is a secret.
+  const attributeItems = new Set([
+    "app-usagemonitor.contribution-device.app.v1",
   ]);
   const partialStored = new Map([
     [
@@ -2124,6 +2130,14 @@ test("targeted local Keychain reset removes only exact local capabilities and re
       return "deleted";
     },
   };
+  const attributeProbe = (capability) => {
+    calls.push(["attributeProbe", capability.service]);
+    return attributeItems.has(capability.service) ? "present" : "missing";
+  };
+  const attributeDelete = (capability) => {
+    calls.push(["attributeDelete", capability.service]);
+    return attributeItems.delete(capability.service) ? "deleted" : "missing";
+  };
   try {
     await mkdir(stateRoot, { mode: 0o700 });
     await mkdir(join(stateRoot, "private"), { mode: 0o700 });
@@ -2136,6 +2150,8 @@ test("targeted local Keychain reset removes only exact local capabilities and re
     const result = await resetLocalKeychainIdentityAndDevice({
       backend,
       stateRoot,
+      attributeProbe,
+      attributeDelete,
     });
     assert.deepEqual(result, {
       schemaVersion: "usage-monitor-local-keychain-reset-v1",
@@ -2156,14 +2172,41 @@ test("targeted local Keychain reset removes only exact local capabilities and re
         deviceRevoked: false,
       },
     });
+    // The app-minted generation is cleared by attribute and the legacy one by
+    // exact value. The helper must never decrypt the app generation: reading
+    // it would require the very node trusted-application entry that
+    // `designatedReaderAccess()` no longer mints, and a keytar read of an item
+    // this process is not trusted for is precisely what raises a dialog.
+    assert.deepEqual(
+      calls.filter(([method]) => method === "attributeDelete"),
+      [["attributeDelete", "app-usagemonitor.contribution-device.app.v1"]],
+    );
     assert.deepEqual(
       calls.filter(([method]) => method === "deleteExact"),
       [
-        ["deleteExact", "app-usagemonitor.contribution-device.app.v1"],
         ["deleteExact", "app-usagemonitor.contribution-device.v1"],
         ["deleteExact", "app-usagemonitor.export-identity.v1"],
       ],
     );
+    assert.equal(
+      calls.some(([method, service]) =>
+        method === "read"
+        && service === "app-usagemonitor.contribution-device.app.v1"),
+      false,
+      "the app-minted generation is never decrypted",
+    );
+    // Every attribute probe is a preflight: none may run after the first
+    // mutation, so the read-only phase stays complete before anything changes.
+    assert.equal(
+      calls.findLast(([method]) => method === "attributeProbe") !== undefined
+        && calls.indexOf(calls.findLast(([method]) =>
+          method === "attributeProbe"))
+          < calls.findIndex(([method]) =>
+            method === "attributeDelete" || method === "deleteExact"),
+      true,
+      "attribute probes complete before any deletion",
+    );
+    assert.equal(attributeItems.size, 0);
     assert.equal(
       stored.has("app-usagemonitor.account-observation.v1"),
       true,
@@ -2194,6 +2237,10 @@ test("targeted local Keychain reset removes only exact local capabilities and re
           throw error;
         },
       },
+      // This install predates the app generation: the attribute leg is a
+      // clean miss, and the locked legacy delete is what makes it partial.
+      attributeProbe: () => "missing",
+      attributeDelete: () => "missing",
     });
     assert.deepEqual(partial, {
       schemaVersion: "usage-monitor-local-keychain-reset-v1",
@@ -2224,7 +2271,12 @@ test("targeted local Keychain reset removes only exact local capabilities and re
     await writeFile(unsafeTarget, "outside", { mode: 0o600 });
     await symlink(unsafeTarget, deviceState);
     await assert.rejects(
-      resetLocalKeychainIdentityAndDevice({ backend, stateRoot }),
+      resetLocalKeychainIdentityAndDevice({
+        backend,
+        stateRoot,
+        attributeProbe,
+        attributeDelete,
+      }),
       { code: "UM_MACOS_KEYCHAIN_RESET_STATE_UNSAFE" },
     );
     assert.equal(await readFile(unsafeTarget, "utf8"), "outside");
@@ -2289,10 +2341,11 @@ test("the app Keychain broker mints the contribution credential app-side over th
   // Never SecItemUpdate: Apple's implementation answers an update that hits
   // errSecVerifyFailed by recreating the item with a DEFAULT access control
   // list (_ReplaceKeychainItem → SecKeychainItemCreateFromContent with
-  // initialAccess = NULL), silently dropping the node trusted-app entry the
-  // reset helper reads through. Every ~25-day rotation takes the duplicate
-  // path, so the replacement must be a delete followed by an add that carries
-  // the access object again.
+  // initialAccess = NULL), silently widening the app-only ACL to the system
+  // default — a change nothing would observe, because this app keeps access
+  // either way. Every ~25-day rotation takes the duplicate path, so the
+  // replacement must be a delete followed by an add that carries the access
+  // object again.
   assert.doesNotMatch(brokerSource, /SecItemUpdate\(/u);
   assert.match(
     brokerSource,
@@ -2333,18 +2386,40 @@ test("the app Keychain broker mints the contribution credential app-side over th
   // structurally unreachable from app-side code.
   assert.match(brokerSource, /kSecAttrService as String: Self\.service/u);
 
-  // Every fresh item trusts the app and the bundled Node runtime by
-  // designated requirement, so the one-shot reset helper keeps its silent
-  // read + exact-delete, and a mint without that access object fails closed.
+  // Every fresh item trusts THIS APP AND NOTHING ELSE by designated
+  // requirement, and a mint without that access object fails closed.
+  //
+  // This is the broker's whole confidentiality claim, so it is pinned
+  // exactly. `runtime/bin/node` was in this list until 2026-08-20 for the
+  // reset helper's keytar read, and while it was, the claim was false: node
+  // is a world-executable general-purpose interpreter inside the bundle, so
+  // ANY same-user process could run it, satisfy the designated requirement,
+  // and read the credential silently. The reset helper now clears the
+  // app-minted generation by attribute (never decrypting, so never consulting
+  // an ACL), which is what allows exactly one entry here.
   assert.match(
     brokerSource,
     /SecTrustedApplicationCreateFromPath\(nil, &trustedSelf\)/u,
   );
-  assert.match(
-    brokerSource,
-    /SecTrustedApplicationCreateFromPath\(\s*nodeRuntimePath,\s*&trustedReader\s*\)/u,
+  const accessSource = brokerSource.slice(
+    brokerSource.indexOf("private func designatedReaderAccess"),
+    brokerSource.indexOf("private func storeSecret"),
   );
-  assert.match(brokerSource, /SecAccessCreate\(/u);
+  assert.notEqual(accessSource, "");
+  // Exactly one trusted application is created, and the array handed to
+  // SecAccessCreate holds exactly that one.
+  assert.equal(
+    accessSource.match(/SecTrustedApplicationCreateFromPath\(/gu)?.length,
+    1,
+  );
+  assert.match(
+    accessSource,
+    /SecAccessCreate\(\s*Self\.service as CFString,\s*\[appTrust\] as CFArray,\s*&access\s*\)/u,
+  );
+  // Nothing in the broker may name a second reader: no node runtime path may
+  // reach the access object, by any route.
+  assert.doesNotMatch(brokerSource, /nodeRuntimePath/u);
+  assert.doesNotMatch(brokerSource, /trustedReader/u);
   assert.match(brokerSource, /kSecAttrAccess as String/u);
   assert.match(
     brokerSource,
@@ -2370,7 +2445,7 @@ test("the app Keychain broker mints the contribution credential app-side over th
   );
   assert.match(
     source,
-    /ContributionDeviceKeychainBroker\(\s*nodeRuntimePath: resources\.node\.path\s*\)/u,
+    /let broker = try\? ContributionDeviceKeychainBroker\(\)/u,
   );
   assert.match(
     source,
@@ -2396,6 +2471,98 @@ test("the app Keychain broker mints the contribution credential app-side over th
   assert.equal(
     resetHelperSource.includes(CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_FD_ENV),
     false,
+  );
+});
+
+test("the app-minted credential's only reader is the app, and the reset helper needs no ACL", async () => {
+  // The load-bearing pair, pinned together because either half alone is a
+  // trap. The app-only ACL is only safe while nothing outside the app needs
+  // to decrypt the item; the reset helper is the only such candidate, and it
+  // is a broker-less node process (pinned above: null stdin, no announcement).
+  // If someone re-adds the app generation to the helper's decrypting list, its
+  // keytar read would fail or prompt on every reset — so this test fails
+  // instead, naming the fix.
+  const [brokerSource, helperSource] = await Promise.all([
+    readFile(KEYCHAIN_BROKER_SOURCE, "utf8"),
+    readFile(
+      new URL("../apps/macos/reset-local-keychain.js", import.meta.url),
+      "utf8",
+    ),
+  ]);
+  const appService =
+    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp.service;
+  const legacyService =
+    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice.service;
+
+  // One trusted application on the app-minted item, and it is this app.
+  const accessSource = brokerSource.slice(
+    brokerSource.indexOf("private func designatedReaderAccess"),
+    brokerSource.indexOf("private func storeSecret"),
+  );
+  assert.equal(
+    accessSource.match(/SecTrustedApplicationCreateFromPath\(/gu)?.length,
+    1,
+  );
+  assert.match(
+    accessSource,
+    /SecTrustedApplicationCreateFromPath\(nil, &trustedSelf\)/u,
+  );
+  assert.match(accessSource, /\[appTrust\] as CFArray/u);
+
+  // The helper's target table: the app generation is attribute-addressed
+  // only, the legacy generation keeps its decrypting read + exact delete.
+  const targets = helperSource.match(
+    /const TARGETS = Object\.freeze\(\[([\s\S]*?)\n\]\);/u,
+  )?.[1];
+  assert.ok(targets, "the reset helper's target table is available");
+  const decrypting = targets.slice(
+    targets.indexOf("capabilities: Object.freeze(["),
+    targets.indexOf("attributeCapabilities: Object.freeze(["),
+  );
+  assert.equal(decrypting.includes("contributionDeviceApp"), false);
+  assert.equal(decrypting.includes("contributionDevice,"), true);
+  assert.match(
+    targets,
+    /attributeCapabilities: Object\.freeze\(\[\s*EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES\.contributionDeviceApp,\s*\]\)/u,
+  );
+  // The helper reaches the attribute-addressed platform operations, which are
+  // the ones that never decrypt.
+  assert.match(
+    helperSource,
+    /deleteExportIdentityKeychainItemByAttributes,\s*\n\s*exportIdentityKeychainItemPresenceByAttributes,/u,
+  );
+  assert.match(
+    helperSource,
+    /attributeProbe = exportIdentityKeychainItemPresenceByAttributes,\s*\n\s*attributeDelete = deleteExportIdentityKeychainItemByAttributes,/u,
+  );
+
+  // Those operations address the item by service and account and carry no
+  // -w/-g, which is what makes them decryption-free — the property the whole
+  // arrangement rests on (owner-verified live on a fresh account 2026-08-20:
+  // the attribute delete of an app-minted item succeeds with no prompt).
+  for (const [args, service] of [
+    [
+      exportIdentityKeychainAttributeDeleteArguments(
+        EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp,
+      ),
+      appService,
+    ],
+    [
+      exportIdentityKeychainAttributeProbeArguments(
+        EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp,
+      ),
+      appService,
+    ],
+  ]) {
+    assert.deepEqual(args.slice(1), ["-s", service, "-a", "installation"]);
+    assert.equal(args.includes("-w"), false);
+    assert.equal(args.includes("-g"), false);
+  }
+  assert.equal(
+    exportIdentityKeychainAttributeDeleteArguments(
+      EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice,
+    )[2],
+    legacyService,
   );
 });
 

@@ -111,6 +111,7 @@ import {
   WEB_MESSAGES,
   WEB_PLURAL_MESSAGES,
   translate,
+  translateLegacyText,
   translatePlural,
 } from "../public/localization.js";
 import {
@@ -6643,6 +6644,80 @@ test("stale local device conflicts name the leftover credential and offer the re
   );
 });
 
+test("a locked login keychain reads as a paused upload, never as a broken credential", async () => {
+  // The owner's position: a locked keychain means no uploads, and that is
+  // fine. What is not fine is telling the user their credential is leftover
+  // from an earlier install and handing them a destructive clear — the wrong
+  // diagnosis, whose suggested cure forces a needless re-pair for something
+  // their login password fixes. So `locked` leaves the recovery family at the
+  // route and gets its own surface here.
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const lockedMatch = appSource.match(
+    /async function renderContributionDeviceKeychainLocked\(status, \{ error \} = \{\}\) \{([\s\S]*?)\n\}\n/u,
+  );
+  assert.ok(lockedMatch, "the locked-keychain renderer is available");
+  const lockedSource = lockedMatch[1];
+  // No reset: the single reset button in this file belongs to the recovery
+  // renderer, and nothing in the locked surface may reach it.
+  assert.doesNotMatch(lockedSource, /reset-device-credential/u);
+  assert.doesNotMatch(lockedSource, /resetContributionDeviceCredential/u);
+  assert.doesNotMatch(lockedSource, /button-danger/u);
+  assert.doesNotMatch(lockedSource, /leftover/iu);
+  // It says the true thing: paused, unlockable, nothing lost.
+  assert.match(lockedSource, /Uploads are paused: your Mac's login keychain is locked\./u);
+  assert.match(lockedSource, /Unlocking restores uploads by itself/u);
+  assert.match(lockedSource, /stays queued on this Mac/u);
+  assert.match(lockedSource, /CONTRIBUTION_DEVICE_KEYCHAIN_LOCKED_COPY/u);
+  assert.match(
+    appSource,
+    /CONTRIBUTION_DEVICE_KEYCHAIN_LOCKED_COPY =\n\s*"Your Mac's login keychain is locked/u,
+  );
+  assert.match(
+    appSource,
+    /contribution_device_keychain_locked: CONTRIBUTION_DEVICE_KEYCHAIN_LOCKED_COPY,/u,
+  );
+  // The code is classified apart from the recovery family, and the ceremony's
+  // reporter checks it FIRST so the reset surface can never win the race.
+  const recoveryClassifier = appSource.match(
+    /function contributionDeviceRecoveryIsRequired\(error\) \{([\s\S]*?)\n\}\n/u,
+  )?.[1];
+  assert.ok(recoveryClassifier, "the recovery classifier is available");
+  assert.doesNotMatch(
+    recoveryClassifier,
+    /contribution_device_keychain_locked/u,
+  );
+  assert.match(
+    appSource,
+    /function contributionDeviceKeychainIsLocked\(error\) \{\s*\n\s*try \{\s*\n\s*return error\?\.code === "contribution_device_keychain_locked";/u,
+  );
+  assert.match(
+    appSource,
+    /if \(contributionDeviceKeychainIsLocked\(error\)\) \{\s*\n\s*await renderContributionDeviceKeychainLocked\(status, \{ error \}\);\s*\n\s*return;\s*\n\s*\}\s*\n\s*if \(contributionDeviceRecoveryIsRequired\(error\)\) \{/u,
+  );
+  // Both sentences are on the localized path, in all three shipped languages.
+  const localizationSource = await readFile(
+    new URL("../public/localization.js", import.meta.url),
+    "utf8",
+  );
+  for (const english of [
+    "Uploads are paused: your Mac's login keychain is locked.",
+    "Unlocking restores uploads by itself — there is nothing to reset and nothing to approve again. Anything not yet sent stays queued on this Mac.",
+  ]) {
+    for (const locale of SUPPORTED_LOCALES) {
+      const translated = translateLegacyText(english, locale);
+      assert.equal(typeof translated, "string");
+      assert.notEqual(translated.trim(), "");
+      if (locale === "en-US") continue;
+      assert.notEqual(
+        translated,
+        english,
+        `${english} is untranslated for ${locale}`,
+      );
+    }
+    assert.equal(localizationSource.includes(english), true);
+  }
+});
+
 test("the approve card shows one verified review instance before one explicit approval", async () => {
   // Re-pinned 2026-08-08 (owner-directed): the concise review moved onto the
   // approve-once card. The GATE is the contract and survives the removed
@@ -9045,7 +9120,7 @@ test("a session-rejected repair clears the dead session and renders one sign-in 
   // silent discard (owner-reported, 2026-08-10).
   assert.match(
     appSource,
-    /if \(contributionConnectStepOf\(error\) !== null\s*\n\s*&& contributionSessionWasRejected\(error\)\s*\n\s*&& !contributionSessionMintedWithinRaceWindow\(\)\) \{[\s\S]{0,900}?await renderContributionSessionSignInGate\(status, error\);\s*\n\s*\} else if \(contributionConnectStepOf\(error\) !== null\s*\n\s*\|\| contributionDeviceRecoveryIsRequired\(error\)\) \{/u,
+    /if \(contributionConnectStepOf\(error\) !== null\s*\n\s*&& contributionSessionWasRejected\(error\)\s*\n\s*&& !contributionSessionMintedWithinRaceWindow\(\)\) \{[\s\S]{0,900}?await renderContributionSessionSignInGate\(status, error\);\s*\n\s*\} else if \(contributionConnectStepOf\(error\) !== null\s*\n\s*\|\| contributionDeviceRecoveryIsRequired\(error\)\s*\n\s*\|\| contributionDeviceKeychainIsLocked\(error\)\) \{/u,
   );
 
   // The gate clears every piece of the dead authority — the identity proof,

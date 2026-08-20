@@ -2961,12 +2961,15 @@ test("stale contribution-device credentials return fixed recovery guidance witho
 // readContributionDeviceCapability) threw one of them, the route mapped it to a
 // generic 502 pairing_failed with no reset surface, and every retry re-hit the
 // same unreadable item — a silent forever-loop. Each must now reach a 409
-// recovery code that renders the local reset ceremony. A denied read keeps its
-// own dialog-specific code (2026-08-19): the user caused it by answering Deny
-// in the macOS access dialog, and the dashboard says which dialog to answer
-// differently on the retry; the cure — the reset ceremony — is identical.
+// recovery code that renders the local reset ceremony. Two keep their own code
+// because the reset ceremony is the wrong instruction for them. Denied
+// (2026-08-19): the user caused it by answering Deny in the macOS access
+// dialog, and the dashboard says which dialog to answer differently on the
+// retry; the cure — the reset ceremony — is identical. Locked (2026-08-20):
+// nothing on this Mac is broken, so the cure is unlocking the login keychain
+// and the reset ceremony would force a needless re-pair.
 for (const { label, thrown, routeCode } of [
-  { label: "locked (re-sign broke the ACL)", thrown: { code: "export_identity_keychain_locked" }, routeCode: "contribution_device_recovery_required" },
+  { label: "locked keychain", thrown: { code: "export_identity_keychain_locked" }, routeCode: "contribution_device_keychain_locked" },
   { label: "denied", thrown: { code: "export_identity_keychain_denied" }, routeCode: "contribution_device_keychain_access_denied" },
   { label: "unavailable (unreadable/corrupt secret)", thrown: { code: "export_identity_keychain_wedged" }, routeCode: "contribution_device_recovery_required" },
 ]) {

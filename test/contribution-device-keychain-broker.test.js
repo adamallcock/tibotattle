@@ -162,6 +162,10 @@ class FakeChannel extends EventEmitter {
 
   write(frame) {
     this.written.push(frame);
+    // Nothing in the transport listens for this; it exists so a test can drive
+    // the app side of the wire as frames actually arrive instead of guessing
+    // when they will.
+    this.emit("written", frame);
     return true;
   }
 
@@ -683,6 +687,96 @@ test("an unavailable broker answers with today's coded recoverable errors, never
         assertCapabilityError(expected),
       );
     }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a locked keychain pauses honestly and leaves the channel usable after the unlock", async () => {
+  // The owner's position on a locked login keychain is explicit: uploads stop,
+  // and that is acceptable. What is NOT acceptable is a locked keychain that
+  // wedges the product. Three properties make the difference, and all three
+  // are pinned here.
+  //
+  // 1. The app answers `locked` promptly instead of raising a modal dialog.
+  //    That is what SecKeychainSetUserInteractionAllowed(false) buys: the
+  //    Swift side returns errSecInteractionNotAllowed at once rather than
+  //    blocking the broker's single serialized queue.
+  // 2. A `locked` wire rejection settles ONE request. It must not take the
+  //    poison path, because the transport never reconnects — a poisoned
+  //    channel stays dead for the companion's whole lifetime, so the user who
+  //    unlocks correctly would find the product still broken.
+  // 3. The very next operation after the unlock succeeds, with no re-pair,
+  //    no reset, and no new credential.
+  const { root, stateFile } = await temporaryStateFile();
+  const channel = new FakeChannel();
+  // The app side of the wire, over the real transport: real framing, real
+  // identifiers, real poison rules. `locked` is what the Swift broker answers
+  // when SecItemCopyMatching returns errSecInteractionNotAllowed under
+  // SecKeychainSetUserInteractionAllowed(false).
+  const app = { stored: null, locked: true };
+  channel.on("written", (frame) => {
+    const request = JSON.parse(frame);
+    queueMicrotask(() => {
+      if (app.locked) {
+        channel.respond({ id: request.id, ok: false, code: "locked" });
+        return;
+      }
+      if (request.op === "get") {
+        channel.respond({ id: request.id, ok: true, secret: app.stored });
+        return;
+      }
+      if (request.op === "set") {
+        app.stored = request.secret;
+        channel.respond({ id: request.id, ok: true });
+        return;
+      }
+      app.stored = null;
+      channel.respond({ id: request.id, ok: true });
+    });
+  });
+  const transport = createContributionDeviceKeychainBrokerTransport({
+    fd: 3,
+    connect: () => channel,
+  });
+  try {
+    const backend = createAppBrokeredContributionDeviceBackend({
+      transport,
+      createLegacyBackend: () => createExportIdentityKeychainBackend({
+        binding: memoryKeytarBinding(),
+      }),
+      probeLegacyCredential: () => "missing",
+      sweepLegacyCredential: async () => "missing",
+    });
+    const pair = () => ensureContributionDeviceCapability({
+      backend,
+      origin: ORIGIN,
+      stateFile,
+      generateDeviceId: () => DEVICE_ID,
+      generateSecret: () => Buffer.alloc(32, 0x71),
+      clock: () => Date.parse("2026-08-20T00:00:00.000Z"),
+    });
+
+    // Locked: the coded, recoverable pause the companion already knows, and
+    // no credential written on the way through.
+    await assert.rejects(pair(), assertCapabilityError("credential_locked"));
+    assert.equal(app.stored, null);
+    assert.equal(channel.destroyed, false, "a locked answer never poisons");
+
+    // Unlocked: the same channel serves the whole mint. No reconnect exists,
+    // so this passing at all is the proof the locked answer left it alive.
+    app.locked = false;
+    const paired = await pair();
+    assert.equal(paired.status, "created");
+    assert.equal(app.stored, encodedSecret(0x71));
+    assert.equal(channel.destroyed, false);
+    // Strictly increasing identifiers across both phases: one channel, never
+    // re-established between them.
+    const identifiers = channel.written.map((frame) => JSON.parse(frame).id);
+    assert.deepEqual(
+      identifiers,
+      identifiers.map((_, index) => index + 1),
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

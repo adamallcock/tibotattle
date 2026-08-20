@@ -1047,16 +1047,18 @@ test("an approval on a Mac that already holds a device binding keeps the immedia
 
 test("a denied Keychain read at pairing answers with its dialog-specific recovery code", async () => {
   // Deny (or cancel) in the macOS access dialog surfaces from the capability
-  // layer as contribution_device_credential_denied. The route must keep that
-  // one cause distinguishable — the dashboard tells the user which dialog to
-  // answer differently — while every other broken-credential state stays on
-  // the generic recovery code, and non-recovery failures stay 502.
+  // layer as contribution_device_credential_denied, and a locked login
+  // keychain as contribution_device_credential_locked. The route must keep
+  // those two causes distinguishable — the dashboard tells the user which
+  // dialog to answer differently, or that uploads are only paused until they
+  // unlock — while every other broken-credential state stays on the generic
+  // recovery code, and non-recovery failures stay 502.
   const files = await fixture();
   const failures = [
     ["contribution_device_credential_denied", 409,
       "contribution_device_keychain_access_denied"],
     ["contribution_device_credential_locked", 409,
-      "contribution_device_recovery_required"],
+      "contribution_device_keychain_locked"],
     ["contribution_device_credential_conflict", 409,
       "contribution_device_recovery_required"],
     ["contribution_device_client_pairing_rejected", 502,
