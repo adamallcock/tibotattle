@@ -1112,7 +1112,16 @@ function renderQuotaCards(data) {
     : [primaryWindow, ...normalWindows.filter((window) => window !== primaryWindow)];
   // Spark is a separate provider limit. Keep it out of the normal allowance
   // selection so it cannot be mistaken for the five-hour or seven-day track.
-  const windows = [...normalOrderedWindows, ...sparkWindows];
+  // Owner-directed 2026-08-20 card order: the Spark cards lead, shortest
+  // window first, and the normal-Codex allowance follows. Ordering on the
+  // duration rather than trusting the provider's slot assignment holds that
+  // order even if Spark's slots move again, as they did when the five-hour
+  // window returned on 2026-08-19. The filter above already required a valid
+  // duration on every window here, so the comparison never sees a null.
+  const sparkOrderedWindows = [...sparkWindows].sort((left, right) => (
+    finite(left.durationMinutes) - finite(right.durationMinutes)
+  ));
+  const windows = [...sparkOrderedWindows, ...normalOrderedWindows];
   if (!windows.length) {
     const card = node("article", "metric-card insufficient");
     const header = node("div", "metric-card-header");
