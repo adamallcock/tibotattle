@@ -55,7 +55,34 @@ cd apps/worker && npx vitest run
 ~~~
 
 Known pre-existing non-blockers are recorded in release planning documents. Do
-not silently treat a new failure as one of those non-blockers.
+not silently treat a new failure as one of those non-blockers. If a failure is
+not on that list, it is a real failure — the 0.1.13 preflight found four that
+were not, and all four were genuine.
+
+**Read the summary line, never `$?` after a pipe.** `npm test`, and the R7
+regenerator, both report failure in their output and exit non-zero, but a
+trailing `| tail`, `| grep`, or `; tail` gives you the FORMATTER's status
+instead. This produced a false "exit 0" over a suite with `fail 4` during the
+0.1.13 preflight, and independently masked a `command not found` in another
+session the same afternoon. Capture it explicitly:
+
+~~~bash
+npm test > preflight.log 2>&1; ec=$?
+grep -E "^ℹ (tests|pass|fail)" preflight.log; echo "exit=$ec"
+~~~
+
+Expect `fail 0`. A green-looking terminal is not a green suite.
+
+**The failure class to expect after a batch of merges** is a *pin* that was
+never updated: a reviewed public-API list, a pinned action SHA, a byte-identity
+digest, a root-workspace allowlist, or an exact `deepEqual` on an exported
+policy object. These live far from whatever code changed — which is exactly why
+they pass review and why suites selected for proximity to the diff cannot catch
+them. Update each pin deliberately, recording in a comment which reviewed change
+it blesses, and check every module surface that shares the list before editing:
+in 0.1.13 the obvious one-line fix would have turned a red test green while
+breaking a passing one, because a legacy module deliberately did not re-export
+the new constant.
 
 ## 1. Exact source and protected tag
 
