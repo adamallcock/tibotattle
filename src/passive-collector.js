@@ -35,6 +35,7 @@ import {
   readLocalCollectorCheckpoint,
   saveLocalCollectorCheckpoint,
 } from "./local-collector-state.js";
+import { SPARK_QUOTA_LIMIT_IDS } from "./local-companion-usage-model.js";
 
 const CHECKPOINT_SCHEMA_VERSION = "0.3";
 const RECORD_SCHEMA_VERSION = "0.3";
@@ -1251,6 +1252,13 @@ export function appServerSnapshotRecord(payload, { source, receivedAt }) {
  * generic quota serializer: a missing continuity marker, unexpected schema,
  * stale timestamp, or unfamiliar quota window suppresses notifications.
  *
+ * The projection is evidence about the codex limit's windows alone.  The
+ * separate Spark allowance (`SPARK_QUOTA_LIMIT_IDS`) has ridden alongside
+ * them in every direct read since 2026-07-23, so a recognized Spark window
+ * is passed over rather than treated as the schema drift that suppresses
+ * the receipt; any other limit id still fails closed until it is
+ * deliberately modeled.
+ *
  * The continuity key is a second one-way digest of the existing local
  * account-scope HMAC.  It permits a local baseline to be partitioned without
  * exposing a provider account subject to the loopback client or notification
@@ -1281,8 +1289,14 @@ export function notificationEvidenceFromAppServerRecord(record) {
   const windows = [];
   for (const window of record.windows) {
     if (!window || typeof window !== "object"
-        || window.provider !== "openai_codex"
-        || window.limitId !== "codex"
+        || window.provider !== "openai_codex") return null;
+    // The Spark allowance is a recognized separate pool that this evidence
+    // says nothing about, not an unfamiliar window: its numeric fields are
+    // deliberately not held to the codex rules below (its live pre-2026-08-19
+    // shape was a 525,600-minute window with an unknown plan label, and its
+    // re-introduced 2026-08-19 shape mirrors the codex durations exactly).
+    if (SPARK_QUOTA_LIMIT_IDS.includes(window.limitId)) continue;
+    if (window.limitId !== "codex"
         || !["primary", "secondary"].includes(window.slot)
         || typeof window.planType !== "string"
         || window.planType.length === 0
@@ -1311,6 +1325,9 @@ export function notificationEvidenceFromAppServerRecord(record) {
       resetProofKind: "provider_reported_schedule_only",
     });
   }
+  // A snapshot whose only windows belong to the Spark pool carries no codex
+  // evidence at all; that is ineligibility, not an empty fresh observation.
+  if (windows.length === 0) return null;
   windows.sort((left, right) => left.lane.localeCompare(right.lane));
   return {
     schemaVersion: QUOTA_NOTIFICATION_EVIDENCE_SCHEMA,
