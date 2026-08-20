@@ -185,27 +185,37 @@ const MAX_RETAINED_TRANSITION_BYTES = 320 * 1024 * 1024;
 // the transition-mining pass tripped at ~1.6 GB whole-process RSS on a
 // companion whose baseline idles near ~800 MB, and the throw hard-failed the
 // entire refresh — blanking the dashboard and flip-flopping every 5 minutes
-// as the scheduler re-ran the doomed pass. This ceiling is now a TARGET, not a
-// hard blocker: a miss degrades to a retained-cache soft-fail rather than
-// failing the refresh (see refreshReplaySafeAccountingCache and
+// as the scheduler re-ran the doomed pass. Raised 2 -> 6 GiB on owner
+// directive (2026-08-20): the 2 GiB figure was a placeholder and the corpus
+// outgrew it. Every rebuild from 2026-08-18T19:28 onward deferred on
+// accounting_transition_rss_limit_exceeded, leaving allowanceCapacity and the
+// entire per-model composition fit unavailable while the dashboard still
+// reported freshness "live" — 572,089 all-time events, 128.5 GB indexed
+// across 4,880 sources at the time. This ceiling is a TARGET, not a hard
+// blocker: a miss degrades to a retained-cache soft-fail rather than failing
+// the refresh (see refreshReplaySafeAccountingCache and
 // ACCOUNTING_BUDGET_MISS_CODES). It remains the backstop that stops the pass
-// before it can OOM the process.
-const MAX_ACCOUNTING_RSS_BYTES = Math.floor(2 * 1024 * 1024 * 1024);
+// before it can OOM the process — which is only true because the bundled
+// runtime now launches with --max-old-space-size=6144
+// (apps/macos/UsageMonitorApp.swift): V8's ~4 GiB default old-space sits
+// BELOW this target, so without that flag the pass would hard-OOM before the
+// soft-fail could ever run.
+const MAX_ACCOUNTING_RSS_BYTES = Math.floor(6 * 1024 * 1024 * 1024);
 // What one accounting rebuild may itself ADD to process RSS over the baseline
 // captured at build start. The effective ceiling is
 // min(MAX_ACCOUNTING_RSS_BYTES, baselineRss + this delta), so the delta must
-// be large enough that a NORMAL baseline reaches the 2 GiB absolute target
-// rather than capping the pass below it. The old 512 MiB delta is exactly what
-// made the incident inevitable: with the ~800 MB live baseline it capped the
-// build at ~1.3 GB — BELOW the 1.6 GB the pass actually needed — so the miss
-// was structural, not a real leak. Raised to 1.25 GiB so a typical baseline
-// lands on the absolute target (min(2 GiB, 800 MB + 1.25 GiB = 2.05 GiB) =
-// 2 GiB): the pass's own metered climb measured ~330 MB on the real corpus and
-// the composition fit is an O(bins) streaming pass, so 1.25 GiB is that
-// measured climb with generous corpus-growth headroom, while
-// MAX_ACCOUNTING_RSS_BYTES stays the absolute backstop against a leaking
+// be large enough that a NORMAL baseline reaches the absolute target rather
+// than capping the pass below it. The old 512 MiB delta is exactly what made
+// the 2026-08-11 incident inevitable: with the ~800 MB live baseline it capped
+// the build at ~1.3 GB — BELOW the 1.6 GB the pass actually needed — so the
+// miss was structural, not a real leak. That same arithmetic is why raising
+// the absolute target ALONE is inert: at an ~800 MB baseline the 1.25 GiB
+// delta pinned the effective ceiling near 2.05 GiB however high the absolute
+// went. Raised 1.25 -> 5.25 GiB alongside the 6 GiB target so a typical
+// baseline lands on it (min(6 GiB, 800 MB + 5.25 GiB = 6.05 GiB) = 6 GiB),
+// while MAX_ACCOUNTING_RSS_BYTES stays the absolute backstop against a leaking
 // baseline.
-const ACCOUNTING_RSS_DELTA_BUDGET_BYTES = Math.floor(1.25 * 1024 * 1024 * 1024);
+const ACCOUNTING_RSS_DELTA_BUDGET_BYTES = Math.floor(5.25 * 1024 * 1024 * 1024);
 // A memory-budget miss — whole-process RSS over the effective ceiling, the
 // scan guard's own RSS trip, or the per-row retained-byte meter over budget —
 // is a soft TARGET miss, not a hard failure. refreshReplaySafeAccountingCache
@@ -2543,6 +2553,12 @@ async function fitCompositionFromCorpusStream({
     r2: fit.r2,
     singleConstantUsd: fit.singleConstantUsd,
     singleConstantR2: fit.singleConstantR2,
+    // Why a fit was ACCEPTED or REJECTED. Without this a fallback_blended
+    // reaches the dashboard with no recoverable reason, and recovering it costs
+    // a full re-run of the kernel against the corpus (2026-08-20). The gate at
+    // model-composition.js reads these exact fields, so persisting them is what
+    // makes the decision auditable after the fact.
+    identification: fit.identification ?? null,
     blendedRecentMixUsd: Number.isFinite(blendedRecentMixUsd)
       ? Number(blendedRecentMixUsd.toFixed(2))
       : null,
@@ -3192,12 +3208,15 @@ export async function buildReplaySafeAccountingCache({
   checkRuntimeMemory();
   // The deep-scan guard reuses the shared, frozen export resource policy, whose
   // compatibility-bound candidate ceiling caps maximumRssBytes at 1.5 GiB. The
-  // accounting build's authoritative ceiling is the 2 GiB effective target
+  // accounting build's authoritative ceiling is the 6 GiB effective target
   // above (checkRuntimeMemory), so pass the guard the LOWER of the two: it can
-  // only tighten the transition-path target, never contradict it. In practice
-  // the heavy growth is the post-scan transition mining that checkRuntimeMemory
-  // polices at the full 2 GiB, while the scan phase stays within the export
-  // policy's own bound. A scan-phase RSS trip is likewise a soft budget miss
+  // only tighten the transition-path target, never contradict it. Since the
+  // 2026-08-20 raise the export policy's 1.5 GiB is ALWAYS the lower of the
+  // two at any realistic baseline, so the scan phase is effectively pinned
+  // there. That is deliberate and was never the failing phase: the deferrals
+  // this raise addresses were accounting_transition_rss_limit_exceeded, the
+  // post-scan transition mining that checkRuntimeMemory polices at the full
+  // target. A scan-phase RSS trip is likewise a soft budget miss
   // (accounting_scan_rss_limit_exceeded), not a hard refresh failure.
   const scanResourceGuardMaximumRssBytes = Math.min(
     effectiveMaximumRssBytes,
