@@ -2613,11 +2613,18 @@ test("a v0.7 cache with the permanently empty spark series is withheld for rebui
     schemaVersion: "local-replay-safe-accounting-v0.7",
   });
 
-  assert.deepEqual(await readReplaySafeAccountingCache({ cacheFile }), {
-    status: "unavailable",
-    errorCode: "cache_accounting_semantics_outdated",
-    cache: null,
-  });
+  const read = await readReplaySafeAccountingCache({ cacheFile });
+  assert.equal(read.status, "unavailable");
+  assert.equal(read.errorCode, "cache_accounting_semantics_outdated");
+  // The CURRENT-cache contract stays withheld; the artifact additionally
+  // rides the explicit stale channel so the post-update recalculation can
+  // serve it labeled (see replay-safe-accounting-stale-serve.test.js).
+  assert.equal(read.cache, null);
+  assert.equal(
+    read.staleCache.schemaVersion,
+    "local-replay-safe-accounting-v0.7",
+  );
+  assert.equal(read.staleCache.stale, true);
 });
 
 test("exact retained quota points make an eligible comparison window testable", async () => {
@@ -2787,11 +2794,16 @@ test("a cache from the former current-price basis is withheld for deterministic 
     priceEpochBasis: "current_price_sensitivity_at_registry_observation",
   });
 
-  assert.deepEqual(await readReplaySafeAccountingCache({ cacheFile }), {
-    status: "unavailable",
-    errorCode: "cache_accounting_semantics_outdated",
-    cache: null,
-  });
+  const read = await readReplaySafeAccountingCache({ cacheFile });
+  assert.equal(read.status, "unavailable");
+  assert.equal(read.errorCode, "cache_accounting_semantics_outdated");
+  assert.equal(read.cache, null);
+  // The deterministic rebuild still happens; meanwhile the artifact rides the
+  // explicit stale channel with its outdated identity named.
+  assert.equal(
+    read.staleCache.schemaVersion,
+    "local-replay-safe-accounting-v0.1",
+  );
 });
 
 test("refresh forwards AbortSignal and never writes an aborted projection", async () => {

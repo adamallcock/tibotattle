@@ -1,14 +1,22 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildReplaySafeAccountingCache } from "../src/replay-safe-accounting-cache.js";
 import {
+  buildReplaySafeAccountingCache,
+  refreshReplaySafeAccountingCache,
+  readReplaySafeAccountingCache,
+  REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
+} from "../src/replay-safe-accounting-cache.js";
+import {
+  beginUnifiedIndexGeneration,
   createUnifiedIndexWriter,
   openLocalUnifiedIndex,
+  readUnifiedIndexGenerationDescriptor,
 } from "../src/local-unified-index.js";
+import { stableJson } from "../src/storage.js";
 
 // The streaming calibration corpus (2026-08-19). The pre-streaming reader
 // materialized every priced compact usage row before the fit and the
@@ -458,6 +466,572 @@ test("a corpus far larger than one derivation batch completes in ONE pass under 
       outcome.rssReadings > 50,
       `the RSS guard must meter the streamed corpus (saw ${outcome.rssReadings} readings)`,
     );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The isolated-subprocess rebuild (2026-08-19). Streaming the corpus (above)
+// was necessary but insufficient at owner scale: the derived transition series
+// still accumulates across batches, and the RSS guard measures the WHOLE
+// process — a companion that legitimately idles near 1.9 GiB after indexing an
+// ~80 GB corpus reaches the 2 GiB absolute target with no headroom for ANY
+// rebuild growth, so the streamed rebuild kept deferring (dogfood 0.1.13,
+// 2026-08-19, 23:21:26Z and 23:39:15Z). Production rebuilds therefore run in a
+// short-lived child with a clean baseline. These tests pin the boundary:
+//  1. the child's artifact is BYTE-identical to the in-process build;
+//  2. a rebuild completes while the parent sits past the absolute backstop —
+//     the exact state that deferred forever in-process;
+//  3. a child that dies fails closed to the deferral (never a crash loop,
+//     never a clobbered prior cache);
+//  4. the caller's abort is an abort, not a deferral.
+// ---------------------------------------------------------------------------
+
+// A unified index with a COMPLETE published generation, accepted by the
+// production unified reader (requireComplete: true) — unlike writeCorpusIndex
+// above, whose rows carry no generation provenance and satisfy only the
+// calibration-corpus reader. Modeled on the writer fixture the unified
+// accounting source's own tests use.
+async function writeCompleteGenerationIndex(indexFile, {
+  resetStarts,
+  boundariesPerReset,
+  usagePerBoundary,
+}) {
+  const receivedAtMs = resetStarts[0];
+  const database = openLocalUnifiedIndex(indexFile, { create: true });
+  const generation = beginUnifiedIndexGeneration(database, {
+    contractVersion: "usage-event-v0.2",
+    receivedAtMs,
+    discoveredSourceCount: 1,
+    discoveredSourceBytes: 4_096,
+  });
+  const writer = createUnifiedIndexWriter(database, {
+    contractVersion: "usage-event-v0.2",
+    receivedAtMs,
+    generationId: generation.generationId,
+    parserVersionId: generation.parserVersionId,
+    ingestRunId: generation.ingestRunId,
+  });
+  writer.writeMeta("contract_version", "usage-event-v0.2");
+  writer.writeMeta("status", "complete");
+  writer.writeMeta("generated_at", new Date(receivedAtMs).toISOString());
+  writer.writeMeta("source_count", 1);
+  writer.writeMeta("source_bytes", 4_096);
+  const sourceLocal = Buffer.alloc(32, 4);
+  const sessionLocal = Buffer.alloc(32, 7);
+  const accountScopeId = writer.internAccountScope({
+    status: "unavailable",
+    reason: "missing_account",
+    planType: null,
+    scopeLocal: null,
+  });
+  const modelIds = new Map(
+    [...MODELS, "not-a-recognized-model"].map((model) => [
+      model,
+      writer.internModel(model, "recognized"),
+    ]),
+  );
+  const tierIds = new Map(SPEEDS.map((speed) => [
+    speed,
+    writer.internTier({
+      apiServiceTier: "unknown",
+      billingSurface: "chatgpt_subscription",
+      codexSpeedMode: speed,
+      tierSource: speed === "unknown" ? "unknown" : "rollout_thread_settings",
+      providerTierRaw: null,
+    }),
+  ]));
+  const surfaceId = writer.internSurface({
+    agentScope: "root",
+    surface: "cli_exec",
+    threadSource: "user",
+    lineageDisposition: "standalone",
+  });
+  let sourceOffset = 0;
+  let usageRows = 0;
+  const eventKey = (ordinal) => {
+    const key = Buffer.alloc(32, 9);
+    key.writeUInt32BE(ordinal, 28);
+    return key;
+  };
+  for (const [resetIndex, resetStartMs] of resetStarts.entries()) {
+    // One server-side slot flip across the corpus, like the real history;
+    // window identity is slot-agnostic so the derivation must not care.
+    const slot = resetIndex * 2 < resetStarts.length ? "secondary" : "primary";
+    for (let boundary = 0; boundary < boundariesPerReset; boundary += 1) {
+      const observedAtMs = resetStartMs + boundary * 60 * 60_000;
+      const quotaObservationId = writer.internQuota({
+        observedAtMs,
+        limitId: "codex",
+        slot,
+        planType: "pro",
+        usedPercent: boundary,
+        resetsAtMs: resetStartMs + WEEK_MS,
+        durationMins: 10_080,
+      });
+      writer.writeQuotaOccurrence({
+        generationId: generation.generationId,
+        sourceLocal,
+        sourceOffset,
+        sourceOrdinal: 0,
+        surfaceId,
+        canonicalObservationId: quotaObservationId,
+        observedAtMs,
+        provider: "openai_codex",
+        planType: "pro",
+        limitId: "codex",
+        slot,
+        slotOrder: 0,
+        usedPercent: boundary,
+        resetsAtMs: resetStartMs + WEEK_MS,
+        durationMins: 10_080,
+        admission: "admitted",
+      });
+      sourceOffset += 1;
+      for (let step = 0; step < usagePerBoundary; step += 1) {
+        const row = corpusUsageRow(
+          usageRows,
+          observedAtMs + 10_000 + step * 5_000,
+        );
+        writer.writeUsageEvent({
+          eventKey: eventKey(usageRows),
+          observedAtMs: row.observedAtMs,
+          generationId: generation.generationId,
+          sourceLocal,
+          sourceOffset,
+          sourceOrdinal: 0,
+          tierObservedAtMs: row.observedAtMs - 1_000,
+          sessionLocal,
+          accountScopeId,
+          modelId: modelIds.get(row.model),
+          tierId: tierIds.get(row.speed),
+          surfaceId,
+          quotaObservationId,
+          reasoningEffort: 4,
+          outcome: 5,
+          tokensInUncached: row.tokensInUncached,
+          tokensInCacheRead: row.tokensInCacheRead,
+          tokensInCacheWrite: row.tokensInCacheWrite,
+          tokensInCacheWrite5m: null,
+          tokensInCacheWrite1h: null,
+          tokensOutText: row.tokensOutText,
+          tokensOutReasoning: row.tokensOutReasoning,
+          tokensOutCombined: row.tokensOutCombined,
+          totalInputContext: row.totalInputContext,
+          partial: false,
+        });
+        usageRows += 1;
+        sourceOffset += 1;
+      }
+    }
+  }
+  writer.writeSourceCursor({
+    sourceLocal,
+    sourceOrdinal: 0,
+    sessionLocal,
+    scannedBytes: 4_096,
+    sizeBytes: 4_096,
+    mtimeMs: receivedAtMs,
+    snapshotsPersisted: true,
+    turnContextSeen: true,
+    carryModel: MODELS[0],
+    carryEffort: "high",
+    carryTierRaw: null,
+    carryTierObservedAtMs: receivedAtMs,
+    carryTotals: null,
+  });
+  writer.writeGenerationSource({
+    generationId: generation.generationId,
+    sourceLocal,
+    sourceOrdinal: 0,
+    sessionLocal,
+    surfaceId,
+    status: "complete",
+    discoveredSizeBytes: 4_096,
+    scannedBytes: 4_096,
+    mtimeMs: receivedAtMs,
+    diagnosticsComplete: true,
+  });
+  writer.writeSourceDiagnostics(sourceLocal, {}, {
+    generationId: generation.generationId,
+  });
+  writer.finalizeGeneration({
+    status: "complete",
+    blockReason: null,
+    discoveredSourceCount: 1,
+    discoveredSourceBytes: 4_096,
+    indexedSourceCount: 1,
+    indexedSourceBytes: 4_096,
+    discoveryComplete: true,
+    diagnosticsComplete: true,
+  });
+  await writer.close({ integrityCheck: true, fsyncPath: indexFile });
+  const readback = openLocalUnifiedIndex(indexFile, { readOnly: true });
+  try {
+    const descriptor = readUnifiedIndexGenerationDescriptor(readback);
+    return {
+      indexFile,
+      usageRows,
+      expectedGeneration: {
+        id: descriptor.id,
+        fingerprint: descriptor.fingerprint,
+      },
+    };
+  } finally {
+    readback.close();
+  }
+}
+
+// 4 reset windows x 99 whole-point changes keeps the corpus estimator-worthy,
+// so the equivalence below compares real estimates, and 4x100x5 usage rows
+// keep the fixture fast while exercising pricing bands, the composition fit,
+// and the batched derivation on both sides of the process boundary.
+const SUBPROCESS_FIXTURE_SHAPE = Object.freeze({
+  resetStarts: Array.from(
+    { length: 4 },
+    (_, week) => Date.parse("2026-05-07T00:00:00.000Z") + week * WEEK_MS,
+  ),
+  boundariesPerReset: 100,
+  usagePerBoundary: 5,
+});
+const SUBPROCESS_FIXTURE_TRANSITIONS = 4 * 99;
+
+test("the default production rebuild is isolated in a child and byte-identical to the in-process build", { timeout: 120_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rebuild-subprocess-equivalence-"));
+  try {
+    const fixture = await writeCompleteGenerationIndex(
+      join(directory, "local-unified-index-v1.sqlite"),
+      SUBPROCESS_FIXTURE_SHAPE,
+    );
+    const stateFile = join(directory, "local-collector-state-v1.sqlite");
+    // Production-shaped call: unified authority, no injected function seams —
+    // this is exactly the shape "auto" isolates in a child (the crash test
+    // below proves the default path consults the child entry).
+    const viaSubprocess = await refreshReplaySafeAccountingCache({
+      stateFile,
+      sourceMode: "unified",
+      expectedGeneration: fixture.expectedGeneration,
+      unifiedIndexFile: fixture.indexFile,
+      now: () => NOW,
+      declaredSpeedBaselines: DECLARED_SPEED_BASELINES,
+    });
+    const inProcess = await buildReplaySafeAccountingCache({
+      sourceMode: "unified",
+      expectedGeneration: fixture.expectedGeneration,
+      unifiedIndexFile: fixture.indexFile,
+      now: () => NOW,
+      declaredSpeedBaselines: DECLARED_SPEED_BASELINES,
+    });
+    // Byte identity of the full serialized artifact — periods, history,
+    // timelines, calibration, allowance scenarios, provenance — across the
+    // process boundary, not merely calibration equality.
+    assert.equal(stableJson(viaSubprocess), stableJson(inProcess));
+    assert.equal(viaSubprocess.schemaVersion, REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION);
+    assert.equal(viaSubprocess.weeklyCalibrationInput.source, "unified_index");
+    assert.equal(
+      viaSubprocess.weeklyCalibrationInput.retainedUsageEvents,
+      fixture.usageRows,
+    );
+    assert.equal(viaSubprocess.history.status, "available");
+    // Real estimates were compared, not two empty summaries.
+    assert.equal(viaSubprocess.weeklyCalibration.status, "estimated");
+    assert.equal(
+      viaSubprocess.weeklyCalibration.sourceCounts.weeklyTransitions,
+      SUBPROCESS_FIXTURE_TRANSITIONS,
+    );
+    // The child's artifact was committed to the durable state file verbatim.
+    const written = await readReplaySafeAccountingCache({ stateFile });
+    assert.equal(written.status, "available");
+    assert.deepEqual(written.cache, viaSubprocess);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a dead or lying rebuild child fails closed to the deferral and retains the prior cache", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rebuild-subprocess-crash-"));
+  try {
+    const fixture = await writeCompleteGenerationIndex(
+      join(directory, "local-unified-index-v1.sqlite"),
+      {
+        resetStarts: [Date.parse("2026-05-07T00:00:00.000Z")],
+        boundariesPerReset: 10,
+        usagePerBoundary: 2,
+      },
+    );
+    const stateFile = join(directory, "local-collector-state-v1.sqlite");
+    // A prior good cache on disk, written through the in-process
+    // characterization path (injected scanner).
+    const prior = await refreshReplaySafeAccountingCache({
+      stateFile,
+      now: () => NOW,
+      scan: async ({ onUsage }) => {
+        onUsage({
+          timestamp: "2026-08-19T11:00:00.000Z",
+          model: "gpt-5.6-sol",
+          components: { input_uncached_tokens: 1_000 },
+        });
+        return { diagnostics: {} };
+      },
+    });
+    // A child that dies without an envelope: the default production path MUST
+    // consult the child entry for this substitution to matter, so this also
+    // proves "auto" isolation actually spawns.
+    const crashingEntry = join(directory, "crashing-child.mjs");
+    await writeFile(crashingEntry, "process.exit(86);\n");
+    const deferredEvents = [];
+    const crashed = await refreshReplaySafeAccountingCache({
+      stateFile,
+      sourceMode: "unified",
+      expectedGeneration: fixture.expectedGeneration,
+      unifiedIndexFile: fixture.indexFile,
+      now: () => NOW + 1_000,
+      declaredSpeedBaselines: DECLARED_SPEED_BASELINES,
+      rebuildSubprocessEntry: crashingEntry,
+      onAccountingRebuildDeferred: (event) => {
+        deferredEvents.push(event);
+      },
+    });
+    assert.equal(crashed.status, "accounting_rebuild_deferred");
+    assert.equal(crashed.reason, "accounting_rebuild_subprocess_failed");
+    assert.equal(crashed.retained, true);
+    assert.equal(crashed.generatedAt, prior.generatedAt);
+    // A child that lies about its result: ok envelope, wrong bytes. The
+    // transport integrity check refuses it identically.
+    const lyingEntry = join(directory, "lying-child.mjs");
+    await writeFile(lyingEntry, [
+      "import { writeFile } from \"node:fs/promises\";",
+      "const payload = \"{\\\"not\\\":\\\"the artifact\\\"}\\n\";",
+      "await writeFile(process.argv[3], payload, { mode: 0o600, flag: \"wx\" });",
+      "process.stdout.write(JSON.stringify({",
+      "  status: \"ok\",",
+      "  resultBytes: Buffer.byteLength(payload),",
+      "  resultSha256: \"0\".repeat(64),",
+      "}) + \"\\n\");",
+      "",
+    ].join("\n"));
+    const lied = await refreshReplaySafeAccountingCache({
+      stateFile,
+      sourceMode: "unified",
+      expectedGeneration: fixture.expectedGeneration,
+      unifiedIndexFile: fixture.indexFile,
+      now: () => NOW + 2_000,
+      declaredSpeedBaselines: DECLARED_SPEED_BASELINES,
+      rebuildSubprocessEntry: lyingEntry,
+      onAccountingRebuildDeferred: (event) => {
+        deferredEvents.push(event);
+      },
+    });
+    assert.equal(lied.status, "accounting_rebuild_deferred");
+    assert.equal(lied.reason, "accounting_rebuild_subprocess_failed");
+    assert.equal(lied.retained, true);
+    assert.deepEqual(deferredEvents, [
+      { reason: "accounting_rebuild_subprocess_failed", retained: true },
+      { reason: "accounting_rebuild_subprocess_failed", retained: true },
+    ]);
+    // The prior cache survives both failures untouched and is still served.
+    const served = await readReplaySafeAccountingCache({ stateFile });
+    assert.equal(served.status, "available");
+    assert.deepEqual(served.cache, prior);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("aborting the refresh kills the rebuild child and reports the abort, not a deferral", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rebuild-subprocess-abort-"));
+  try {
+    const fixture = await writeCompleteGenerationIndex(
+      join(directory, "local-unified-index-v1.sqlite"),
+      {
+        resetStarts: [Date.parse("2026-05-07T00:00:00.000Z")],
+        boundariesPerReset: 10,
+        usagePerBoundary: 2,
+      },
+    );
+    // A child that never speaks: only the parent's SIGTERM ends it, so a
+    // settled refresh proves the abort actually killed the child.
+    const hangingEntry = join(directory, "hanging-child.mjs");
+    await writeFile(hangingEntry, "setInterval(() => {}, 1_000);\n");
+    const controller = new AbortController();
+    const pending = refreshReplaySafeAccountingCache({
+      stateFile: join(directory, "local-collector-state-v1.sqlite"),
+      sourceMode: "unified",
+      expectedGeneration: fixture.expectedGeneration,
+      unifiedIndexFile: fixture.indexFile,
+      now: () => NOW,
+      declaredSpeedBaselines: DECLARED_SPEED_BASELINES,
+      rebuildSubprocessEntry: hangingEntry,
+      signal: controller.signal,
+    });
+    setTimeout(() => controller.abort(), 250);
+    await assert.rejects(pending, (error) => (
+      error?.name === "AbortError"
+        && error?.code === "accounting_refresh_aborted"
+    ));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("isolation options validate closed", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rebuild-isolation-options-"));
+  try {
+    const stateFile = join(directory, "local-collector-state-v1.sqlite");
+    await assert.rejects(
+      refreshReplaySafeAccountingCache({
+        stateFile,
+        now: () => NOW,
+        rebuildIsolation: "sidecar",
+      }),
+      /rebuildIsolation must be auto, subprocess, or in_process/u,
+    );
+    // Injected function seams cannot cross a process boundary; asserting
+    // isolation with one present must refuse rather than silently degrade.
+    await assert.rejects(
+      refreshReplaySafeAccountingCache({
+        stateFile,
+        now: () => NOW,
+        rebuildIsolation: "subprocess",
+        scan: async () => ({ diagnostics: {} }),
+      }),
+      /rebuildIsolation subprocess cannot carry injected scan or rss seams/u,
+    );
+    await assert.rejects(
+      refreshReplaySafeAccountingCache({
+        stateFile,
+        now: () => NOW,
+        rebuildSubprocessEntry: "relative/path.js",
+      }),
+      /rebuildSubprocessEntry must be an absolute path or null/u,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+// The decisive owner-scale regression. The parent process is inflated past the
+// 2 GiB absolute accounting backstop and RETAINS that ballast — the state a
+// large-history companion legitimately reaches after indexing — then runs the
+// same rebuild both ways. In-process the guard's very first check must defer
+// (that IS the 0.1.13 livelock: baseline past the target, zero headroom, every
+// attempt deferred). The default isolated rebuild must COMPLETE against the
+// same corpus while the parent stays inflated, because the guard now measures
+// the child's own clean-baseline RSS. Runs in a spawned parent so the 2 GiB
+// ballast never lives in the shared test-runner process.
+const INFLATED_PARENT = String.raw`
+const { refreshReplaySafeAccountingCache } = await import(
+  process.env.REBUILD_PARENT_MODULE
+);
+const CHUNK = 64 * 1024 * 1024;
+const ballast = Buffer.allocUnsafe(
+  Number(process.env.REBUILD_PARENT_BALLAST_BYTES),
+);
+// Touch every page with a nonzero byte so the ballast is genuinely resident.
+for (let offset = 0; offset < ballast.length; offset += CHUNK) {
+  ballast.fill(0xa5, offset, Math.min(offset + CHUNK, ballast.length));
+}
+const parentRssBytes = process.memoryUsage().rss;
+const nowMs = Number(process.env.REBUILD_PARENT_NOW_MS);
+const shared = {
+  stateFile: process.env.REBUILD_PARENT_STATE_FILE,
+  sourceMode: "unified",
+  expectedGeneration: JSON.parse(process.env.REBUILD_PARENT_EXPECTED_GENERATION),
+  unifiedIndexFile: process.env.REBUILD_PARENT_INDEX_FILE,
+  now: () => nowMs,
+  declaredSpeedBaselines: JSON.parse(process.env.REBUILD_PARENT_BASELINES),
+};
+const inProcess = await refreshReplaySafeAccountingCache({
+  ...shared,
+  rebuildIsolation: "in_process",
+});
+const isolated = await refreshReplaySafeAccountingCache({ ...shared });
+process.stdout.write(JSON.stringify({
+  parentRssBytes,
+  // Reading the ballast after both rebuilds keeps it retained throughout.
+  ballastByte: ballast[ballast.length - 1],
+  inProcess: {
+    status: inProcess?.status ?? "rebuilt",
+    reason: inProcess?.reason ?? null,
+    retained: inProcess?.retained ?? null,
+  },
+  isolated: {
+    schemaVersion: isolated?.schemaVersion ?? null,
+    source: isolated?.weeklyCalibrationInput?.source ?? null,
+    retainedUsageEvents:
+      isolated?.weeklyCalibrationInput?.retainedUsageEvents ?? null,
+    calibrationStatus: isolated?.weeklyCalibration?.status ?? null,
+    weeklyTransitions:
+      isolated?.weeklyCalibration?.sourceCounts?.weeklyTransitions ?? null,
+    historyStatus: isolated?.history?.status ?? null,
+  },
+}) + "\n");
+`;
+
+test("a rebuild completes in the child while the parent sits past the absolute RSS backstop", { timeout: 240_000 }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rebuild-inflated-parent-"));
+  try {
+    const fixture = await writeCompleteGenerationIndex(
+      join(directory, "local-unified-index-v1.sqlite"),
+      SUBPROCESS_FIXTURE_SHAPE,
+    );
+    // 2 GiB absolute target + 64 MiB: past the backstop, the way the owner's
+    // companion idles at 1.88 GiB and crosses during any in-process attempt.
+    const ballastBytes = (2 * 1024 + 64) * 1024 * 1024;
+    const child = spawnSync(process.execPath, [
+      "--input-type=module",
+      "--eval",
+      INFLATED_PARENT,
+    ], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      timeout: 210_000,
+      env: {
+        ...process.env,
+        REBUILD_PARENT_MODULE:
+          new URL("../src/replay-safe-accounting-cache.js", import.meta.url).href,
+        REBUILD_PARENT_STATE_FILE:
+          join(directory, "local-collector-state-v1.sqlite"),
+        REBUILD_PARENT_INDEX_FILE: fixture.indexFile,
+        REBUILD_PARENT_EXPECTED_GENERATION:
+          JSON.stringify(fixture.expectedGeneration),
+        REBUILD_PARENT_NOW_MS: String(NOW),
+        REBUILD_PARENT_BASELINES: JSON.stringify(DECLARED_SPEED_BASELINES),
+        REBUILD_PARENT_BALLAST_BYTES: String(ballastBytes),
+      },
+    });
+    assert.equal(child.error, undefined, child.error?.message);
+    assert.equal(child.signal, null, child.stderr);
+    assert.equal(child.status, 0, child.stderr);
+    const outcome = JSON.parse(child.stdout);
+    t.diagnostic(
+      `parent RSS ${(outcome.parentRssBytes / 1024 / 1024).toFixed(0)} MiB; `
+        + "in-process deferred, isolated child completed",
+    );
+    assert.equal(outcome.ballastByte, 0xa5);
+    // The parent genuinely sat past the 2 GiB absolute accounting target.
+    assert.ok(
+      outcome.parentRssBytes > 2 * 1024 * 1024 * 1024,
+      `parent RSS ${outcome.parentRssBytes} must exceed the absolute backstop`,
+    );
+    // In-process: the incident, reproduced — the guard's first check defers
+    // and no attempt could ever land (retained:false, nothing on disk yet).
+    assert.deepEqual(outcome.inProcess, {
+      status: "accounting_rebuild_deferred",
+      reason: "accounting_transition_rss_limit_exceeded",
+      retained: false,
+    });
+    // Isolated: the same rebuild against the same corpus COMPLETES, because
+    // the budget now polices the child's own clean-baseline RSS.
+    assert.deepEqual(outcome.isolated, {
+      schemaVersion: REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
+      source: "unified_index",
+      retainedUsageEvents: fixture.usageRows,
+      calibrationStatus: "estimated",
+      weeklyTransitions: SUBPROCESS_FIXTURE_TRANSITIONS,
+      historyStatus: "available",
+    });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

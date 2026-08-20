@@ -1489,6 +1489,13 @@ function matchedRollingPairs(data) {
 }
 
 function renderComparison(data) {
+  // The observed-versus-calculated comparison depends on the calibration
+  // capacity; when that capacity is served from the previous version's cache
+  // during a recalculation, the comparison says so, quietly.
+  renderStaleServeNote(
+    $("#comparison-stale-note"),
+    data?.timeline?.allowanceCapacity?.stale?.stale === true,
+  );
   const matchedPairs = matchedRollingPairs(data);
   const pair = matchedPairs.at(-1) ?? null;
   const summary = data.gradient.summary ?? {};
@@ -7113,6 +7120,12 @@ function renderWeeklyPaceForecast(data) {
 
 function renderWeekly(data) {
   renderWeeklyPaceForecast(data);
+  // A weekly estimate carried over from the previous app version while the
+  // recalculation runs announces itself here, quietly.
+  renderStaleServeNote(
+    $("#weekly-stale-note"),
+    data?.weekly?.stale?.stale === true,
+  );
   const summary = data.weekly.summary ?? {};
   const estimate = finite(summary.median_weekly_value_usd ?? summary.medianWeeklyValueUsd);
   const lower = finite(summary.lower_80_across_resets_usd ?? summary.lower80Usd);
@@ -8610,16 +8623,66 @@ function renderAccountingSideChatDetails(estimate) {
  * looking at an empty cost view with a cause the app knows and was not
  * saying (the 2026-08-19 livelock recurred hourly for a whole afternoon).
  */
-function renderAccountingRebuildDeferral(data) {
+/**
+ * True while the accounting rebuild has been deferred repeatedly — the state
+ * the stale-serve label upgrades to its "being retried" wording.
+ */
+function accountingRebuildRetrying() {
+  return Number.isSafeInteger(accountingRebuildDeferral?.consecutive)
+    && accountingRebuildDeferral.consecutive >= 2;
+}
+
+/**
+ * The prior-version period row backing the cost view while no current source
+ * exists, or null. The provenance-bearing block arrives only on the explicit
+ * stale channel, so a rendered row is labeled by construction.
+ */
+function staleAccountingServePeriod(data) {
+  const serve = data?.accounting?.staleServe;
+  if (serve?.stale !== true || !Array.isArray(serve.periods)) return null;
+  return serve.periods.find(
+    (period) => period.periodId === activeAccountingPeriod,
+  )
+    ?? serve.periods.find((period) => period.periodId === "all")
+    ?? null;
+}
+
+/**
+ * The quiet informational recalculating label over stale-served figures:
+ * "computed by the previous version", with the live rebuild state folded in
+ * ("recalculating now" while attempts proceed normally, "being retried" once
+ * the rebuild has deferred repeatedly). Deliberately an annotation, not an
+ * alert — the replaced red withheld-cache banner over-alarmed a routine
+ * update recalculation.
+ */
+function renderStaleServeNote(element, active) {
+  if (!element) return;
+  if (!active) {
+    element.hidden = true;
+    setRawText(element, "");
+    return;
+  }
+  element.hidden = false;
+  setLocalizedText(
+    element,
+    accountingRebuildRetrying()
+      ? "accounting.staleServe.retrying"
+      : "accounting.staleServe.recalculating",
+  );
+}
+
+function renderAccountingRebuildDeferral(data, { staleServeShown = false } = {}) {
   const element = $("#accounting-rebuild-deferred");
   if (!element) return;
   const deferral = accountingRebuildDeferral;
   const persistent = Number.isSafeInteger(deferral?.consecutive)
     && deferral.consecutive >= 2;
   // With a retained cache the figures still render; the honest-empty copy is
-  // for the state where no replay-safe cache exists at all.
+  // for the state where no replay-safe cache exists at all. A stale serve is
+  // likewise not an empty view — its own label already folds the retry state
+  // in — so the deferral banner stays down rather than doubling the message.
   const cacheMissing = data?.accounting?.accountingCacheStatus === "unavailable";
-  if (!persistent || !cacheMissing) {
+  if (!persistent || !cacheMissing || staleServeShown) {
     element.hidden = true;
     setRawText(element, "");
     return;
@@ -8632,8 +8695,20 @@ function renderAccountingRebuildDeferral(data) {
 
 function renderAccounting(data) {
   syncAccountingPeriodControls(data);
-  renderAccountingRebuildDeferral(data);
-  const accounting = accountingPeriod(data);
+  // The prior-version figures stand in only while the current channels are
+  // genuinely empty: no current cache AND no events from any live source for
+  // the selected period. The moment a current source serves (unified index or
+  // a fresh cache), it wins and the stale label leaves this section.
+  const livePeriod = accountingPeriod(data);
+  const staleRow = data?.accounting?.accountingCacheStatus === "unavailable"
+      && (livePeriod === null || livePeriod.events === 0)
+    ? staleAccountingServePeriod(data)
+    : null;
+  renderStaleServeNote($("#accounting-stale-serve"), staleRow !== null);
+  renderAccountingRebuildDeferral(data, {
+    staleServeShown: staleRow !== null,
+  });
+  const accounting = livePeriod;
   if (accounting === null) {
     clear($("#accounting-summary"));
     clear($("#accounting-component-counts"));
@@ -8653,22 +8728,41 @@ function renderAccounting(data) {
   // the rows that lack a price are the useful thing to be standing next to.
   const fastMode = accounting.fastMode;
   const weighted = accounting.quotaWeightedApiPriceEquivalentUsd;
-  for (const [label, explanation, value, note] of [
-    [
-      fastMode.metricShortLabel,
-      "A public API-price measuring stick for the usage observed locally. It is not a bill or a subscription limit.",
-      weighted === null ? "—" : formatApiMoney(weighted),
-      weighted === null
-        ? "No increment in this period could be weighted"
-        : `${formatApiMoney(accounting.apiPriceEquivalentUsd)} at Standard rates before Fast weighting`
-    ],
-    [
-      "Tokens",
-      "The tokens attached to those usage changes during the selected time period.",
-      compact(accounting.totalTokens),
-      accounting.periodLabel
+  // Stale substitution serves the version-stable Standard-price scalar and
+  // labels itself as previous-version output; quota weighting belongs to the
+  // current pipeline and is not reconstructed from an old artifact.
+  const headlineRows = staleRow !== null
+    ? [
+      [
+        t("accounting.staleServe.metricLabel"),
+        "A public API-price measuring stick for the usage observed locally. It is not a bill or a subscription limit.",
+        formatApiMoney(staleRow.apiPriceEquivalentUsd),
+        staleRow.periodLabel,
+      ],
+      [
+        "Tokens",
+        "The tokens attached to those usage changes during the selected time period.",
+        compact(staleRow.totalTokens),
+        staleRow.periodLabel,
+      ],
     ]
-  ]) {
+    : [
+      [
+        fastMode.metricShortLabel,
+        "A public API-price measuring stick for the usage observed locally. It is not a bill or a subscription limit.",
+        weighted === null ? "—" : formatApiMoney(weighted),
+        weighted === null
+          ? "No increment in this period could be weighted"
+          : `${formatApiMoney(accounting.apiPriceEquivalentUsd)} at Standard rates before Fast weighting`
+      ],
+      [
+        "Tokens",
+        "The tokens attached to those usage changes during the selected time period.",
+        compact(accounting.totalTokens),
+        accounting.periodLabel
+      ]
+    ];
+  for (const [label, explanation, value, note] of headlineRows) {
     const card = node("article", "metric-card compact-metric");
     const metricLabel = node("span", "metric-name");
     metricLabel.append(informationLabel(label, explanation));
