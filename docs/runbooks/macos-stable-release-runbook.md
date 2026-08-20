@@ -529,6 +529,40 @@ local paths, staging descriptors, or unrelated receipts to R2, GitHub, or the
 website. Verify the live appcast, Homebrew cask, website download, and installed
 older-client update path after each corresponding publication.
 
+### How to verify a published surface: fetch bytes, hash them
+
+Verify content by **downloading the bytes and hashing them**, not by reading a
+field that says what you expect:
+
+~~~bash
+curl -s -o /tmp/live.dmg "https://updates.tibotattle.com/releases/X.Y.Z/$SHA/TiboTattle-X.Y.Z-macOS-arm64.dmg"
+shasum -a 256 /tmp/live.dmg     # must equal $SHA
+gh release download "$TAG" --repo "$REPO" --dir /tmp/gh --pattern '*.dmg' --clobber
+shasum -a 256 /tmp/gh/*.dmg     # must equal $SHA
+~~~
+
+**A 200 from a hash-named R2 URL is evidence of publication, not of content.**
+The digest in that key is a naming convention; R2 serves whatever bytes live at
+the key and nothing checks they hash to the name. This is unlike a genuinely
+content-addressed store (git objects, IPFS), where the retrieving side verifies
+the digest against the address and a mismatch cannot return 200. Do not let the
+hash in the URL talk you out of the download.
+
+Two more traps on the reading side:
+
+- **Cached reads.** `raw.githubusercontent.com` served a pre-update Homebrew
+  cask for minutes after the tap workflow had already committed the new one.
+  Read the cask through `gh api repos/<owner>/homebrew-tap/contents/Casks/<c>.rb
+  --jq .content | base64 -d`, and cache-bust appcast/website reads with a query
+  parameter plus `Cache-Control: no-cache`.
+- **A cached negative announces itself; a cached positive does not.** A stale
+  read showing the *previous version* is obviously wrong and gets caught. A
+  stale read showing the right version number but a superseded build of that
+  same version is indistinguishable from success. This is a live risk whenever a
+  release is rebuilt mid-flight — 0.1.13 was, for the minimum-macOS fix, so two
+  distinct 0.1.13 DMGs existed. Hashing the delivered bytes is what separates
+  those two cases; nothing else does.
+
 ### Refresh the first-party Homebrew tap
 
 The public [`adamallcock/homebrew-tap`](https://github.com/adamallcock/homebrew-tap)
