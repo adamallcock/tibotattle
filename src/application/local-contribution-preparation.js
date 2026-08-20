@@ -4,7 +4,10 @@ import {
   TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
   preparedContributionSetId,
 } from "../contribution/index.js";
-import { DEFAULT_EXPORT_RESOURCE_LIMITS } from "../export/index.js";
+import {
+  DEFAULT_EXPORT_RESOURCE_LIMITS,
+  EXPORT_RESOURCE_FAILURE_CODES,
+} from "../export/index.js";
 
 export const LOCAL_CONTRIBUTION_PREPARATION_RESULT_VERSION =
   "local-contribution-preparation-result-v0.1";
@@ -17,6 +20,51 @@ export const LOCAL_CONTRIBUTION_PREPARATION_ALLOWED_LOOKBACK_HOURS =
   Object.freeze([1, 24, 7 * 24]);
 export const LOCAL_CONTRIBUTION_PREPARATION_MAX_WINDOW_MS =
   7 * 24 * 60 * 60 * 1_000;
+
+/**
+ * `export_too_large` is one friendly state covering a family of unrelated
+ * bounds: a covered interval, a line, a record count, a byte total, elapsed
+ * time, memory. Collapsing them all to one word tells a reader that something
+ * was too big but never what, so the same coarse code now travels with the
+ * exact bound that stopped the run.
+ *
+ * The vocabulary is closed and derived from the resource policy rather than
+ * restated, and every member is identifier-shaped. A detail is a code and two
+ * counts and nothing else — no message, path, source value, or identifier can
+ * reach it — which is what makes it safe to relay into a diagnostics receipt.
+ */
+export const LOCAL_CONTRIBUTION_PREPARATION_DETAIL_CODES = Object.freeze([
+  ...EXPORT_RESOURCE_FAILURE_CODES,
+  "batch_count_invalid",
+  "batch_too_large",
+].sort());
+
+const DETAIL_CODES = new Set(LOCAL_CONTRIBUTION_PREPARATION_DETAIL_CODES);
+const DETAIL_CODE_PATTERN = /^[a-z0-9_]{1,64}$/u;
+
+function detailCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/**
+ * Accept a detail only when its code is both a known member and identifier
+ * shaped. The pattern is redundant against the closed set on purpose: it is
+ * the property a reader of the receipt depends on, so it is asserted here
+ * rather than inferred from the set's contents.
+ */
+function preparationDetail(value) {
+  const code = value?.code;
+  if (typeof code !== "string"
+      || !DETAIL_CODES.has(code)
+      || !DETAIL_CODE_PATTERN.test(code)) {
+    return null;
+  }
+  return Object.freeze({
+    code,
+    observed: detailCount(value.observed),
+    limit: detailCount(value.limit),
+  });
+}
 
 const UUID_V4 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -34,13 +82,14 @@ const PUBLIC_ERROR_CODES = new Set([
 ]);
 
 export class LocalContributionPreparationError extends Error {
-  constructor(code) {
+  constructor(code, { detail = null } = {}) {
     if (!PUBLIC_ERROR_CODES.has(code)) {
       throw new TypeError("Unknown local contribution preparation error");
     }
     super("Local contribution preparation failed");
     this.name = "LocalContributionPreparationError";
     this.code = code;
+    this.detail = preparationDetail(detail);
   }
 }
 
@@ -316,7 +365,16 @@ function mappedError(error, stage, signal = null) {
   if (code.startsWith("export_resource_")
       || code === "batch_count_invalid"
       || code === "batch_too_large") {
-    return new LocalContributionPreparationError("export_too_large");
+    // The coarse classification is what the page's copy is keyed on and stays
+    // exactly as it was; the bound's own code rides alongside it so the
+    // failure names what actually failed.
+    return new LocalContributionPreparationError("export_too_large", {
+      detail: {
+        code,
+        observed: error?.observed,
+        limit: error?.limit,
+      },
+    });
   }
   if (code === "bundle_empty") {
     return new LocalContributionPreparationError("no_safe_records");
@@ -350,13 +408,17 @@ function throwIfPreparationAborted(signal) {
 }
 
 export function projectLocalContributionPreparationError(error) {
-  const code = error instanceof LocalContributionPreparationError
-    ? error.code
-    : "preparation_failed";
+  const known = error instanceof LocalContributionPreparationError;
+  const code = known ? error.code : "preparation_failed";
+  // Re-validated at the boundary even though the constructor already accepted
+  // it: this object leaves the process, and the projection is the last place
+  // that can be sure of what it carries.
+  const detail = known ? preparationDetail(error.detail) : null;
   return Object.freeze({
     schemaVersion: LOCAL_CONTRIBUTION_PREPARATION_ERROR_VERSION,
     status: "failed",
     errorCode: PUBLIC_ERROR_CODES.has(code) ? code : "preparation_failed",
+    ...(detail === null ? {} : { detail }),
     networkActivity: false,
     includesContent: false,
     includesPaths: false,

@@ -596,6 +596,64 @@ test("a pre-build resource rejection removes only empty unpublished attempt dire
   }
 });
 
+test("a resource-bounded failure names the bound that stopped it", async () => {
+  const files = await fixture();
+  try {
+    // Two different ceilings, both reported as export_too_large. The point of
+    // the detail is that these two are told apart, so both are asserted.
+    for (const [limits, expected] of [
+      [{ maximumSourceBytes: 1 }, "export_resource_source_bytes"],
+      [{ maximumOutputRecords: 1 }, "export_resource_output_records"],
+    ]) {
+      await assert.rejects(
+        runPreparation(files, UUID_ONE, {
+          createResourceGuard: () => createExportResourceGuard({ limits }),
+        }),
+        (error) => {
+          assert.equal(error.code, "export_too_large");
+          assert.equal(error.detail?.code, expected);
+          const projected = projectLocalContributionPreparationError(error);
+          assert.equal(projected.errorCode, "export_too_large");
+          assert.deepEqual(projected.detail, {
+            code: expected,
+            observed: error.detail.observed,
+            limit: error.detail.limit,
+          });
+          // Numbers, not prose: the detail stays quotable into a receipt.
+          assert.equal(Number.isSafeInteger(projected.detail.observed), true);
+          assert.equal(Number.isSafeInteger(projected.detail.limit), true);
+          assert.equal(projected.detail.observed > projected.detail.limit, true);
+          assert.equal(JSON.stringify(projected).includes(files.root), false);
+          return true;
+        },
+      );
+    }
+
+    // A detail is only ever a member of the closed vocabulary. Anything else,
+    // including a code carrying a real path, is dropped rather than relayed.
+    const forged = new LocalContributionPreparationError("export_too_large", {
+      detail: { code: `leaked_${files.root}`, observed: 2, limit: 1 },
+    });
+    assert.equal(forged.detail, null);
+    const forgedProjection = projectLocalContributionPreparationError(forged);
+    assert.equal(Object.hasOwn(forgedProjection, "detail"), false);
+    assert.equal(JSON.stringify(forgedProjection).includes(files.root), false);
+
+    // A failure with no bound behind it says nothing rather than guessing.
+    assert.equal(
+      Object.hasOwn(
+        projectLocalContributionPreparationError(
+          new LocalContributionPreparationError("no_safe_records"),
+        ),
+        "detail",
+      ),
+      false,
+    );
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
 test("identical latest evidence produces identical prepared manifests and queue identities", async () => {
   const files = await fixture();
   try {

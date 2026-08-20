@@ -246,6 +246,26 @@ const LOCAL_PREPARATION_ERROR_CODES = new Set([
   "consent_already_current"
 ]);
 
+/**
+ * A resource-bounded preparation failure carries the bound it stopped on: an
+ * identifier-shaped code and two counts, nothing else. It is read back under
+ * the same shape test the companion applies so nothing but a code and numbers
+ * can be shown to the reader or filed against a reference.
+ */
+function preparationDetail(value) {
+  if (typeof value?.code !== "string"
+      || !SAFE_ERROR_CODE_PATTERN.test(value.code)) {
+    return null;
+  }
+  const count = (candidate) =>
+    Number.isSafeInteger(candidate) && candidate >= 0 ? candidate : null;
+  return Object.freeze({
+    code: value.code,
+    observed: count(value.observed),
+    limit: count(value.limit)
+  });
+}
+
 function array(value) {
   if (Array.isArray(value)) return value;
   if (Array.isArray(value?.rows)) return value.rows;
@@ -5840,15 +5860,17 @@ export class LocalCompanionClient {
   /**
    * Record one user-visible failure in the local diagnostics log.
    *
-   * Only four bounded values travel: the reference this page minted, the
-   * fixed journey it happened in, the fixed error code, and the service
-   * request id when the service returned one. No message, payload, path, or
-   * participant value is ever sent, and the companion re-validates all four.
+   * Only bounded identifiers travel: the reference this page minted, the
+   * fixed journey it happened in, the fixed error code, the specific bound
+   * behind a coarse code when the failure named one, and the service request
+   * id when the service returned one. No message, payload, path, or
+   * participant value is ever sent, and the companion re-validates every one.
    */
   async recordDiagnosticNote({
     reference,
     surface,
     code = "",
+    detail = "",
     requestId = ""
   } = {}) {
     if (!DIAGNOSTIC_REFERENCE_PATTERN.test(reference ?? "")
@@ -5856,6 +5878,10 @@ export class LocalCompanionClient {
         || !SAFE_ERROR_CODE_PATTERN.test(surface)) {
       throw new TypeError("Diagnostic note inputs are invalid.");
     }
+    const detailCode = typeof detail === "string"
+        && SAFE_ERROR_CODE_PATTERN.test(detail)
+      ? detail
+      : null;
     const response = await this.fetchImpl(`${LOCAL_ROOT}/diagnostics/note`, {
       method: "POST",
       headers: {
@@ -5867,6 +5893,7 @@ export class LocalCompanionClient {
         reference,
         surface,
         code: SAFE_ERROR_CODE_PATTERN.test(code) ? code : "unknown",
+        ...(detailCode === null ? {} : { detail: detailCode }),
         requestId: SERVICE_REQUEST_ID_PATTERN.test(requestId) ? requestId : ""
       })
     });
@@ -5991,11 +6018,17 @@ export class LocalCompanionClient {
     if (!response.ok) {
       const error = new Error(`Request failed (${response.status}).`);
       error.status = response.status;
-      error.code = payload?.schemaVersion
-          === "local-contribution-preparation-error-v0.1"
+      const known = payload?.schemaVersion
+        === "local-contribution-preparation-error-v0.1";
+      error.code = known
         && LOCAL_PREPARATION_ERROR_CODES.has(payload?.errorCode)
         ? payload.errorCode
         : "preparation_failed";
+      // The coarse code names a family of bounds; the detail names the one
+      // that stopped this run. The companion already checked it against a
+      // closed vocabulary, so the shape test here is the only gate needed
+      // before it is shown and filed.
+      error.detail = known ? preparationDetail(payload?.detail) : null;
       throw error;
     }
     return normalizeLocalContributionPreparation(payload);

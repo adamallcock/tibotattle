@@ -2482,6 +2482,121 @@ test("contribution preparation failures expose only fixed safe projections", asy
   }
 });
 
+test("a resource-bounded preparation names its bound on the wire and in the log", async () => {
+  const files = await fixture();
+  const diagnosticsLogFile = join(files.stateRoot, "diagnostics-v0.1.log");
+  const privateCanary = "/Users/private/source/session.jsonl";
+  const boundCode = "export_resource_expanded_record_bytes";
+  let detail = { code: boundCode, observed: 33_554_645, limit: 33_554_432 };
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    diagnosticsLogFile,
+    clock: () => Date.parse("2026-08-20T07:56:00.000Z"),
+    contributionPreparationRunner: async () => {
+      const error = new LocalContributionPreparationError("export_too_large");
+      error.detail = detail;
+      error.privatePath = privateCanary;
+      throw error;
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const prepare = () => fetch(`${base}/api/local/contribution/prepare`, {
+      method: "POST",
+      headers,
+      body: "{}",
+    });
+
+    const bounded = await prepare();
+    assert.equal(bounded.status, 413);
+    const body = await bounded.json();
+    // The coarse classification the page's copy is keyed on is unchanged, and
+    // the bound that actually stopped the run rides alongside it.
+    assert.equal(body.errorCode, "export_too_large");
+    assert.deepEqual(body.detail, {
+      code: boundCode,
+      observed: 33_554_645,
+      limit: 33_554_432,
+    });
+    assert.equal(JSON.stringify(body).includes(privateCanary), false);
+
+    // Outside the closed vocabulary is outside the wire, however the value
+    // reached the error.
+    detail = { code: `leaked_${privateCanary}`, observed: 2, limit: 1 };
+    const forged = await prepare();
+    assert.equal(forged.status, 413);
+    const forgedBody = await forged.json();
+    assert.equal(Object.hasOwn(forgedBody, "detail"), false);
+    assert.equal(JSON.stringify(forgedBody).includes(privateCanary), false);
+
+    // The reference the reader copies is only worth quoting if looking it up
+    // answers which bound refused the preparation.
+    const recorded = await fetch(`${base}/api/local/diagnostics/note`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        reference: "TT-4HJ7M2",
+        surface: "contribution_prepare",
+        code: "export_too_large",
+        detail: boundCode,
+        requestId: "",
+      }),
+    });
+    assert.equal(recorded.status, 200);
+    assert.deepEqual(
+      (await readFile(diagnosticsLogFile, "utf8"))
+        .trimEnd()
+        .split("\n")
+        .map((line) => JSON.parse(line)),
+      [{
+        schemaVersion: "local-diagnostic-note-v0.1",
+        recordedAt: "2026-08-20T07:56:00.000Z",
+        reference: "TT-4HJ7M2",
+        surface: "contribution_prepare",
+        code: "export_too_large",
+        requestId: "",
+        detail: boundCode,
+      }],
+    );
+
+    // A caller may name a bound; it may not write a sentence, a path, or a
+    // label of its own choosing.
+    for (const invalid of [
+      "arbitrary_detail",
+      "Failed reading /Users/private/state.json",
+      "export_resource_not_a_bound",
+    ]) {
+      const rejected = await fetch(`${base}/api/local/diagnostics/note`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          reference: "TT-4HJ7M3",
+          surface: "contribution_prepare",
+          code: "export_too_large",
+          detail: invalid,
+          requestId: "",
+        }),
+      });
+      assert.equal(rejected.status, 400);
+      assert.equal((await rejected.json()).error.code, "invalid_request");
+    }
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
 test("contribution sync status exposes bounded queue counts only", async () => {
   const files = await fixture();
   const privatePath = "/Users/private/prepared-set";

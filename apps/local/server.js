@@ -104,6 +104,7 @@ import {
 import {
   LOCAL_CONTRIBUTION_PREPARATION_ALLOWED_LOOKBACK_HOURS,
   LOCAL_CONTRIBUTION_PREPARATION_DEFAULT_LOOKBACK_HOURS,
+  LOCAL_CONTRIBUTION_PREPARATION_DETAIL_CODES,
   LOCAL_CONTRIBUTION_PREPARATION_ERROR_VERSION,
   LOCAL_CONTRIBUTION_PREPARATION_MAX_WINDOW_MS,
   LOCAL_CONTRIBUTION_PREPARATION_RESULT_VERSION,
@@ -285,6 +286,14 @@ const DIAGNOSTIC_ERROR_CODE =
   /^(?:[A-Z][A-Z0-9_]{1,63}|[a-z][a-z0-9_]{1,63})$/u;
 const DIAGNOSTIC_SERVICE_REQUEST_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+// The bound that actually stopped a resource-limited preparation: the coarse
+// classification the page speaks is one word for a whole family of unrelated
+// ceilings. This closed vocabulary is the domain's, not this route's, so the
+// two cannot drift. It gates both the prepare response's detail and the only
+// detail a caller may attach to a diagnostics note.
+const PREPARATION_DETAIL_CODES = new Set(
+  LOCAL_CONTRIBUTION_PREPARATION_DETAIL_CODES,
+);
 const HOSTED_SIGNIN_HANDOFF_BOUND_VALUE = /^[A-Za-z0-9_-]{43,128}$/u;
 const HOSTED_SIGNIN_HANDOFF_PROVIDERS = new Set(["google", "apple"]);
 const MAX_RECENT_DIAGNOSTIC_REFERENCES = 5;
@@ -496,9 +505,12 @@ function contributionDeviceRecoveryRequired(error) {
  * surface, and for server-minted refresh-failure notes the step), fixed and
  * identifier-shaped (the code and the optional detail code), or the service's
  * own request id. No message, payload, path, or participant value is written.
- * The optional step/detail members exist only on server-minted terminal
- * refresh-failure notes; the POST route's exact-key validation keeps them
- * unreachable to callers. The file is capped: once it would exceed the bound,
+ * The optional step member exists only on server-minted terminal
+ * refresh-failure notes; the POST route's key validation keeps it unreachable
+ * to callers. The optional detail is either server-minted the same way or, for
+ * a caller, one member of a closed vocabulary of resource-bound codes — a
+ * coarse code such as export_too_large is useless to a reader who cannot see
+ * which bound it stood for. The file is capped: once it would exceed the bound,
  * the current file becomes the single previous generation and a fresh one
  * starts, so the log can never grow without limit.
  */
@@ -1133,10 +1145,17 @@ async function authorizeDiagnosticNote(request, response) {
     );
     return null;
   }
-  if (Object.keys(value).sort().join("\0") !== "code\0reference\0requestId\0surface"
+  // A caller may name the specific bound behind a coarse code, but only by
+  // choosing from a closed vocabulary the companion owns. That is strictly
+  // tighter than the shape test `code` itself passes, so widening the accepted
+  // keys does not widen what a caller can write into the log.
+  const keys = Object.keys(value).sort().join("\0");
+  const withDetail = keys === "code\0detail\0reference\0requestId\0surface";
+  if ((!withDetail && keys !== "code\0reference\0requestId\0surface")
       || !DIAGNOSTIC_REFERENCE.test(value.reference)
       || !DIAGNOSTIC_SURFACES.has(value.surface)
       || !DIAGNOSTIC_ERROR_CODE.test(value.code)
+      || (withDetail && !PREPARATION_DETAIL_CODES.has(value.detail))
       || typeof value.requestId !== "string"
       || (value.requestId !== ""
         && !DIAGNOSTIC_SERVICE_REQUEST_ID.test(value.requestId))) {
@@ -1148,6 +1167,7 @@ async function authorizeDiagnosticNote(request, response) {
     surface: value.surface,
     code: value.code,
     requestId: value.requestId,
+    ...(withDetail ? { detail: value.detail } : {}),
   });
 }
 
@@ -2170,16 +2190,35 @@ function preparationResultProjection(value) {
   };
 }
 
+function preparationDetailProjection(value) {
+  if (typeof value?.code !== "string"
+      || !PREPARATION_DETAIL_CODES.has(value.code)) {
+    return null;
+  }
+  return {
+    code: value.code,
+    observed: isNonNegativeInteger(value.observed) ? value.observed : null,
+    limit: isNonNegativeInteger(value.limit) ? value.limit : null,
+  };
+}
+
 function preparationErrorProjection(error, overrideCode = null) {
   const source = projectLocalContributionPreparationError(error);
   const candidate = overrideCode ?? source?.errorCode;
   const errorCode = PREPARATION_ERROR_CODES.has(candidate)
     ? candidate
     : "preparation_failed";
+  // An overriding code is this route's own verdict about the request, not the
+  // domain's, so it never inherits a detail the domain raised for some other
+  // failure.
+  const detail = overrideCode === null
+    ? preparationDetailProjection(source?.detail)
+    : null;
   return {
     schemaVersion: LOCAL_CONTRIBUTION_PREPARATION_ERROR_VERSION,
     status: "failed",
     errorCode,
+    ...(detail === null ? {} : { detail }),
     networkActivity: false,
     includesContent: false,
     includesPaths: false,

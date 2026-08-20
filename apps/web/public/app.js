@@ -197,6 +197,11 @@ let incrementalSyncRetryBusy = false;
 // data at most once per queue state, so a failing preparation cannot loop;
 // trying again is the explicit "Check again" action.
 let incrementalReviewPrepareAttempted = false;
+// The bootstrap narrows a too-large day to the latest hour by itself. That
+// changes what the reader is about to approve a review OF, so the approve
+// card says it happened rather than presenting an hour as if it were the day
+// that was asked for. Only a narrowing this page load can be claimed.
+let incrementalReviewNarrowedToLatestHour = false;
 // A missing/unusable queue preview used to strand the approve button without
 // producing either recovery UI or a diagnostics file. Record each distinct
 // unavailable state once per page load; an explicit Check again resets it.
@@ -9646,10 +9651,18 @@ async function prepareIncrementalReviewInstance() {
       // 24 hours. The lookback was only ever a size guard — never a consent
       // decision — so the bootstrap narrows to the latest hour by itself
       // instead of surfacing a window picker the owner removed.
+      //
+      // The latest hour is the only narrower window the request contract can
+      // express, not a window known to fit: measured against one heavy local
+      // day (2026-08-19, 42 rollout files) the busiest single hour alone was
+      // 83.0 MB of records against the 32 MiB reviewed-set bound, so this
+      // retry can fail for exactly the same reason. It is a second chance,
+      // and the failure below says which bound refused it.
       if (error?.code !== "export_too_large") throw error;
       prepared = await withContributionReviewDeadline(
         localClient.prepareContribution({ lookbackHours: 1 }),
       );
+      incrementalReviewNarrowedToLatestHour = true;
     }
     if (prepared.status !== "prepared") {
       const error = new Error("Preparation did not return a verified contribution.");
@@ -9693,7 +9706,7 @@ const INCREMENTAL_PREPARATION_ERROR_COPY = {
   no_safe_records:
     "No privacy-safe records were found in the recent local evidence. Analyze local usage again later. No upload occurred.",
   export_too_large:
-    "Even the latest hour exceeded a fixed reviewed-set safety bound. Nothing was truncated or uploaded.",
+    "Even the latest hour exceeded a fixed reviewed-set safety bound. Nothing was truncated or uploaded. The reference names which bound it was.",
   privacy_verification_failed:
     "Privacy verification rejected the prepared data, so it was not queued or uploaded.",
   preparation_in_progress:
@@ -9733,7 +9746,9 @@ async function reviewPreparedSummary({ refreshFirst = true } = {}) {
     if (!contributionReviewFence.isCurrent(generation)) return;
     renderContributionSyncExactReview(review);
     contributionSyncAutoReviewedKey = preparedSummaryIdentity();
-    showIncrementalReviewStatusKey("syncStatus.summaryVerified");
+    showIncrementalReviewStatusKey(incrementalReviewNarrowedToLatestHour
+      ? "syncStatus.summaryVerifiedNarrowed"
+      : "syncStatus.summaryVerified");
   } catch (error) {
     if (!contributionReviewFence.isCurrent(generation)) return;
     // A bare `catch {}` discarded the only evidence of what actually failed
@@ -10750,6 +10765,13 @@ async function describeFailure({ surface, error, messages = {}, fallback }) {
   const reference = createDiagnosticReference();
   const code = diagnosticErrorCode(error?.code);
   const requestId = serviceRequestId(error?.requestId);
+  // Some codes classify a family rather than a cause. When the failure knows
+  // which member it was, the reference must be able to say so, or looking it
+  // up later answers no more than the sentence already did. An absent or
+  // malformed detail stays empty and none is filed; the companion accepts only
+  // the closed vocabulary it owns, so one it does not recognise is refused
+  // aloud through the path below rather than written.
+  const detailCode = diagnosticErrorCode(error?.detail?.code);
   let writtenToLocalLog = false;
   // "recorded" | "refused" | "unreachable": a companion that answered without
   // confirming this exact reference refused the note, which is a contract
@@ -10761,6 +10783,7 @@ async function describeFailure({ surface, error, messages = {}, fallback }) {
       reference,
       surface: diagnosticSurface(surface),
       code,
+      detail: detailCode,
       requestId
     });
     writtenToLocalLog = recorded?.status === "recorded"

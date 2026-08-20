@@ -565,10 +565,29 @@ user actions.
 A dense seven-day selection can exceed the fixed single-reviewed-set resource
 ceiling, and a very active 24-hour interval can do the same. That attempt fails
 closed with `export_too_large`: it is not silently truncated and no partial set
-is queued. Select **24 hours** or **1 hour** and retry explicitly; the app never
-substitutes a shorter interval without the user's choice. Longer dense windows
-need a future locally aggregated contribution format rather than an unsafe
-increase to the raw-row review ceiling.
+is queued. The invisible review bootstrap then narrows once to the latest hour
+by itself and says so on the approve card, because the lookback was only ever a
+size guard and the window picker is gone.
+
+`export_too_large` is a classification, not a cause: it covers a covered
+interval, a line, a record count, a byte total, elapsed time, and memory. The
+failure therefore carries the specific bound alongside it — an
+`export_resource_*` code with the count and the ceiling — into the prepare
+response, the dashboard error, and the diagnostics note behind the `TT-`
+reference, so a support conversation starts from which bound stopped the run.
+
+Narrowing is a second chance, not a window known to fit. Measured against one
+heavy local day (2026-08-19, 42 rollout files, 986 MB): the full 24 hours
+produced 144,918 records totalling 149,817,316 bytes against the 32 MiB
+`maximumExpandedRecordBytes` ceiling — 4.5x over — and the busiest single hour
+alone was 83,000,821 bytes, still 2.5x over. Only 7 of those 24 hours held any
+records at all, so whether the narrowed attempt succeeds depends on which hour
+it lands in. The records themselves are small and uniform (median 799 bytes,
+largest 1,288), so this is genuine volume rather than any single oversized
+record: the 10,241,804-byte largest source line stayed well inside the 16 MiB
+line ceiling and never contributed. Longer dense windows need a future locally
+aggregated contribution format rather than an unsafe increase to the raw-row
+review ceiling.
 
 The production local identity is stored in the dedicated
 `app-usagemonitor.export-identity.v1` macOS Keychain item. If that item is

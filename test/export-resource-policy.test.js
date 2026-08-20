@@ -318,3 +318,52 @@ test("caller-owned positioned handles survive bounded-reader exceptions", async 
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("a resource limit failure carries the bound it crossed", () => {
+  const limits = DEFAULT_EXPORT_RESOURCE_LIMITS;
+  const guard = () => createExportResourceGuard({ clock: () => 0, rss: () => 1 });
+
+  // The code identifies the bound; the two counts prove the crossing. The
+  // observed value is the counter AT the crossing, not the total the run would
+  // have reached, so it is asserted as "past the limit" and nothing more.
+  assert.throws(
+    () => guard().observeCanonicalBundle(limits.maximumCanonicalBundleBytes + 1),
+    (error) => {
+      assert.equal(error.code, "export_resource_canonical_bundle_bytes");
+      assert.equal(error.resourceCode, "canonical_bundle_bytes");
+      assert.equal(error.observed, limits.maximumCanonicalBundleBytes + 1);
+      assert.equal(error.limit, limits.maximumCanonicalBundleBytes);
+      assert.equal(ExportResourceLimitError.isTrustedExact(error), true);
+      return true;
+    },
+  );
+
+  // An accumulating counter reports the total it had reached, not the last
+  // increment that pushed it over.
+  const accumulating = guard();
+  accumulating.observeOutputRecord(limits.maximumExpandedRecordBytes - 1);
+  assert.throws(
+    () => accumulating.observeOutputRecord(4),
+    (error) => error.code === "export_resource_expanded_record_bytes"
+      && error.observed === limits.maximumExpandedRecordBytes + 3
+      && error.limit === limits.maximumExpandedRecordBytes,
+  );
+
+  // A bound whose numbers are not representable still stops the run; it just
+  // says so without them rather than inventing a count.
+  assert.throws(
+    () => guard().assertCoveredInterval(0, Number.POSITIVE_INFINITY),
+    (error) => error.code === "export_resource_covered_duration"
+      && error.observed === null
+      && error.limit === null,
+  );
+
+  // Both counts are refused unless they are non-negative safe integers, so a
+  // detail can never carry anything but a number.
+  for (const bad of [-1, 1.5, "3", Number.NaN]) {
+    assert.throws(
+      () => new ExportResourceLimitError("rss", { observed: bad, limit: 1 }),
+      /must be a non-negative safe integer/u,
+    );
+  }
+});

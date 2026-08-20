@@ -1004,6 +1004,15 @@ export const WEB_MESSAGES = Object.freeze({
     "上方显示的涵盖数据已在这台 Mac 上完成校验。未经你的核准不会上传任何内容。",
     "Los datos cubiertos mostrados arriba están verificados en este Mac. No se sube nada sin tu aprobación.",
   ],
+  // A full day of very heavy local activity does not fit the fixed
+  // reviewed-set size bound, and the bootstrap narrows to the latest hour on
+  // its own. Approving is a decision about what this review shows, so the
+  // narrowing is stated rather than left for the reader to infer.
+  "syncStatus.summaryVerifiedNarrowed": [
+    "The covered data shown above is verified on this Mac. A full day exceeded a fixed reviewed-set size bound, so this review covers the latest hour instead. Nothing uploads without your approval.",
+    "上方显示的涵盖数据已在这台 Mac 上完成校验。整天的数据超出了固定的审阅集大小上限，因此本次审阅改为涵盖最近一小时。未经你的核准不会上传任何内容。",
+    "Los datos cubiertos mostrados arriba están verificados en este Mac. Un día completo superó un límite fijo de tamaño del conjunto de revisión, así que esta revisión cubre la última hora. No se sube nada sin tu aprobación.",
+  ],
   "consent.reviewFirst": [
     "TiboTattle is preparing and verifying one real instance of the covered data on this Mac for you to review. Nothing is uploaded.",
     "TiboTattle 正在这台 Mac 上准备并校验一份涵盖数据的真实实例供你审阅。不会上传任何内容。",

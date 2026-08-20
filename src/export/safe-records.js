@@ -605,7 +605,10 @@ function summarizeActivityMarkerPlan(secret, activityMarkers, bounds, {
   // Bound the caller-owned sequence before allocating the deduplication Map.
   // Out-of-window and duplicate markers do not excuse an unbounded input.
   if (activityMarkers.length > maximumRecords) {
-    throw new ExportResourceLimitError("output_records");
+    throw new ExportResourceLimitError("output_records", {
+      observed: activityMarkers.length,
+      limit: maximumRecords,
+    });
   }
   const recordsById = new Map();
   for (const marker of activityMarkers) {
@@ -670,7 +673,10 @@ async function scanCodexSafeRecords({
   const bounds = normalizeExportBounds(startAt, endAt);
   resourceGuard.assertCoveredInterval(bounds.startMs, bounds.endMs);
   if (activityMarkers.length > resourceGuard.limits.maximumOutputRecords) {
-    throw new ExportResourceLimitError("output_records");
+    throw new ExportResourceLimitError("output_records", {
+      observed: activityMarkers.length,
+      limit: resourceGuard.limits.maximumOutputRecords,
+    });
   }
 
   const toolCountsBySession = new Map();

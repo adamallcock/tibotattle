@@ -45,6 +45,7 @@ export {
 } from "./compatibility.js";
 export {
   DEFAULT_EXPORT_RESOURCE_LIMITS,
+  EXPORT_RESOURCE_FAILURE_CODES,
   EXPORT_RESOURCE_POLICY_VERSION,
   ExportResourceLimitError,
   createExportResourceGuard,
