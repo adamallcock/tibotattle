@@ -16,6 +16,7 @@ import {
   qualificationTestFiles,
   readVerifiedBindingManifest,
   runNodeTests,
+  extractTapTestIndex,
 } from "../scripts/windows-security-qualification.mjs";
 import {
   FIXED_STATUS as WINDOWS_RECEIPT_STATUS,
@@ -87,10 +88,12 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(diagnosticStep, /WINDOWS_FILESYSTEM_SECURITY_DIAGNOSTIC_PASSED/u);
   assert.match(diagnosticStep, /error\?\.code/u);
   assert.match(diagnosticStep, /Object\.values\(FIXED_STATUS\)\.includes\(error\.code\)/u);
-  assert.match(diagnosticStep, /console\.error\(status\)/u);
+  assert.match(diagnosticStep, /test_index=\$\{testIndex\}/u);
+  assert.match(diagnosticStep, /"unavailable"/u);
+  assert.match(diagnosticStep, /console\.error\(`\$\{status\} test_index=\$\{testIndex\}`\)/u);
   assert.match(diagnosticStep, /process\.exitCode = 1/u);
   assert.doesNotMatch(diagnosticStep, /continue-on-error/u);
-  assert.doesNotMatch(diagnosticStep, /Start-Process|taskkill|Get-Content|\/PID|process\.pid/u);
+  assert.doesNotMatch(diagnosticStep, /Start-Process|taskkill|Get-Content|\/PID|process\.pid|error\.message|stdout|stderr/u);
   assert.ok(diagnosticStep.length > 0, "the bounded diagnostic must precede the official lane");
   const portableStep = workflow.slice(
     workflow.indexOf("- name: Run portable Windows qualification"),
@@ -534,6 +537,82 @@ test("qualification TAP receipts reject skips and malformed summaries", () => {
   assert.throws(
     () => parseTapSummary("# tests 1\n# pass 1"),
     (error) => error.code === FIXED_STATUS.resultInvalid,
+  );
+});
+
+test("qualification failure indexing is top-level, numeric, and content-free", () => {
+  assert.equal(
+    extractTapTestIndex([
+      "    not ok 4 - indented secret=should-not-escape",
+      "not ok 7 - top-level secret=should-not-escape",
+    ].join("\n")),
+    7,
+  );
+  assert.equal(extractTapTestIndex("not ok malformed - secret=should-not-escape"), null);
+  assert.equal(extractTapTestIndex("not ok 0 - zero-is-not-an-ordinal"), null);
+  assert.equal(extractTapTestIndex("not ok 9007199254740992 - unsafe"), null);
+  assert.equal(extractTapTestIndex("not ok 8 -\r\n"), 8);
+  assert.equal(extractTapTestIndex(null), null);
+});
+
+test("qualification child failures attach only a safe index and never TAP content", async () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.exitCode = null;
+  child.signalCode = null;
+  child.pid = 4244;
+  child.kill = () => true;
+  const run = runNodeTests(["synthetic.test.js"], {
+    cwd: REPOSITORY_ROOT,
+    timeoutMs: 1_000,
+    spawnProcess: () => child,
+    terminateProcessTree: async () => true,
+  });
+  child.stdout.write([
+    "TAP version 13",
+    "    not ok 3 - indented secret=do-not-return",
+    "not ok 9 - top-level secret=do-not-return",
+  ].join("\n"));
+  child.emit("close", 1);
+  await assert.rejects(
+    run,
+    (error) => {
+      assert.equal(error.code, FIXED_STATUS.failed);
+      assert.equal(error.testIndex, 9);
+      assert.equal(error.message, FIXED_STATUS.failed);
+      assert.equal(Object.hasOwn(error, "stdout"), false);
+      assert.equal(Object.hasOwn(error, "testName"), false);
+      assert.doesNotMatch(error.message, /secret|top-level|indented/u);
+      return true;
+    },
+  );
+});
+
+test("qualification child failures use a null index when TAP has no safe top-level ordinal", async () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.exitCode = null;
+  child.signalCode = null;
+  child.pid = 4245;
+  child.kill = () => true;
+  const run = runNodeTests(["synthetic.test.js"], {
+    cwd: REPOSITORY_ROOT,
+    timeoutMs: 1_000,
+    spawnProcess: () => child,
+    terminateProcessTree: async () => true,
+  });
+  child.stdout.write("  not ok malformed secret=do-not-return\n");
+  child.emit("close", 1);
+  await assert.rejects(
+    run,
+    (error) => {
+      assert.equal(error.code, FIXED_STATUS.failed);
+      assert.equal(error.testIndex, null);
+      assert.equal(error.message, FIXED_STATUS.failed);
+      return true;
+    },
   );
 });
 

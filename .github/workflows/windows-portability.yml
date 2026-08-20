@@ -234,7 +234,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          node --input-type=module -e 'import { FIXED_STATUS, runNodeTests } from "./scripts/windows-security-qualification.mjs"; try { await runNodeTests(["test/windows-filesystem-security.test.js"], { timeoutMs: 120_000 }); console.log("WINDOWS_FILESYSTEM_SECURITY_DIAGNOSTIC_PASSED"); } catch (error) { const status = error?.code && Object.values(FIXED_STATUS).includes(error.code) ? error.code : FIXED_STATUS.failed; console.error(status); process.exitCode = 1; }'
+          node --input-type=module -e 'import { FIXED_STATUS, runNodeTests } from "./scripts/windows-security-qualification.mjs"; try { await runNodeTests(["test/windows-filesystem-security.test.js"], { timeoutMs: 120_000 }); console.log("WINDOWS_FILESYSTEM_SECURITY_DIAGNOSTIC_PASSED"); } catch (error) { const status = error?.code && Object.values(FIXED_STATUS).includes(error.code) ? error.code : FIXED_STATUS.failed; const testIndex = Number.isSafeInteger(error?.testIndex) && error.testIndex > 0 ? error.testIndex : "unavailable"; console.error(`${status} test_index=${testIndex}`); process.exitCode = 1; }'
 
       - name: Run portable Windows qualification
         shell: pwsh

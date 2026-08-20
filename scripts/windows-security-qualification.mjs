@@ -315,6 +315,29 @@ export function parseTapSummary(output) {
   return result;
 }
 
+function safeTapTestIndex(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+/**
+ * Extract only the ordinal from an unindented top-level TAP failure line.
+ *
+ * The captured output is untrusted test output. Keep the returned diagnostic
+ * deliberately numeric: never retain or expose a TAP name, body, or detail.
+ */
+export function extractTapTestIndex(output) {
+  if (typeof output !== "string") return null;
+  const match = /^not ok ([0-9]+) -(?:[ \t]|(?:\r?$))/mu.exec(output);
+  if (match === null) return null;
+  return safeTapTestIndex(Number.parseInt(match[1], 10));
+}
+
+function fixedFailureWithTapTestIndex(output) {
+  const error = fixedError(FIXED_STATUS.failed);
+  error.testIndex = extractTapTestIndex(output);
+  return error;
+}
+
 async function terminateChildProcessTree(child) {
   if (!child) return false;
   if (process.platform !== "win32" || !Number.isSafeInteger(child.pid)) {
@@ -443,7 +466,7 @@ export function runNodeTests(files, {
           settle(rejectRun, error);
         }
       } else {
-        settle(rejectRun, fixedError(FIXED_STATUS.failed));
+        settle(rejectRun, fixedFailureWithTapTestIndex(stdout));
       }
     });
   });
