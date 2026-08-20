@@ -739,10 +739,19 @@ const INCREMENTAL_SYNC_STATUS_SCHEMA_VERSION =
   "local-incremental-contribution-sync-v1.0";
 const INCREMENTAL_SYNC_CODE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/u;
 const INCREMENTAL_SYNC_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
+// Where a macOS Keychain dialog is still reachable for this install. An
+// unreadable or absent answer means "pairing" — today's guidance, shown to
+// everyone — so a companion that cannot say never silently withholds it.
+const INCREMENTAL_SYNC_KEYCHAIN_PROMPTS = ["pairing", "rotation", "none"];
 
 export function normalizeIncrementalContributionSyncStatus(payload) {
+  const keychainPrompt =
+    INCREMENTAL_SYNC_KEYCHAIN_PROMPTS.includes(payload?.keychainPrompt)
+      ? payload.keychainPrompt
+      : "pairing";
   const unavailable = Object.freeze({
     status: "unavailable",
+    keychainPrompt,
     consent: Object.freeze({ approved: false, current: false, consentedAt: "" }),
     paused: false,
     pausedReason: null,
@@ -810,6 +819,7 @@ export function normalizeIncrementalContributionSyncStatus(payload) {
   }
   return Object.freeze({
     status: "available",
+    keychainPrompt,
     consent: Object.freeze({
       approved: payload.consent.approved,
       current: payload.consent.current,

@@ -77,6 +77,8 @@ import {
   setContributionSyncPaused,
 } from "../../src/contribution-sync-queue.js";
 import {
+  CONTRIBUTION_DEVICE_KEYCHAIN_PROMPT_SURFACES,
+  contributionDeviceKeychainPromptSurface,
   createAppBrokeredContributionDeviceBackend,
   createProductionContributionDeviceBackend,
   migrateLegacyContributionDeviceCapability,
@@ -1905,8 +1907,21 @@ function deviceUnavailableIncrementalRunOutcome() {
  * The bounded status the dashboard's incremental surface reads: consent
  * state, cursor progress as day counts and the acknowledged watermark day,
  * pause reason as a fixed code. No path, no content, no identifier.
+ *
+ * `keychainPrompt` rides along because this is the projection the ceremony
+ * already polls: it names where a macOS Keychain dialog is still reachable
+ * ("pairing", "rotation", "none") so the dashboard can withhold guidance from
+ * the installs that can never see one. It is a fixed vocabulary, never a
+ * path, an identifier, or a credential fact.
  */
-function incrementalSyncStatusProjection(value, { configured = false } = {}) {
+function incrementalSyncStatusProjection(value, {
+  configured = false,
+  keychainPrompt = "pairing",
+} = {}) {
+  const promptSurface =
+    CONTRIBUTION_DEVICE_KEYCHAIN_PROMPT_SURFACES.includes(keychainPrompt)
+      ? keychainPrompt
+      : "pairing";
   const consent = value?.consent;
   const valid = value?.schemaVersion
       === "incremental-contribution-sync-status-v1.0"
@@ -1921,6 +1936,7 @@ function incrementalSyncStatusProjection(value, { configured = false } = {}) {
       ? "available"
       : configured ? "unavailable" : "not_configured",
     contractVersion: TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+    keychainPrompt: promptSurface,
     consent: { approved: false, current: false, consentedAt: null },
     paused: false,
     pausedReason: null,
@@ -2679,6 +2695,14 @@ function createPreparedLocalCompanionServer({
       });
     };
   })(),
+  // Where a Keychain dialog is still reachable, resolved once. The legacy leg
+  // of the answer shells out to an attribute probe, and the ceremony polls the
+  // carrying route every four seconds, so this must not be recomputed per
+  // request. Nothing in brokered mode ever creates a legacy item, so one
+  // answer holds for the process; the migration that removes one only makes a
+  // conditional sentence redundant, never wrong.
+  contributionDeviceKeychainPromptProvider = () =>
+    contributionDeviceKeychainPromptSurface({ environment }),
   contributionDevicePairingProvider = null,
   contributionDeviceCredentialResetRunner = null,
   contributionDeviceCredentialAttributeDelete = null,
@@ -3155,6 +3179,27 @@ function createPreparedLocalCompanionServer({
         || typeof incrementalContributionController.resume !== "function")) {
     throw new TypeError("incrementalContributionController is invalid");
   }
+  // Resolved on first use and then held: the provider's legacy leg spawns an
+  // attribute probe, and the route carrying this answer is polled every few
+  // seconds by the ceremony. An unusable provider reports the surface that
+  // keeps today's guidance on screen.
+  let resolvedKeychainPrompt = null;
+  function keychainPromptSurface() {
+    if (resolvedKeychainPrompt === null) {
+      let resolved;
+      try {
+        resolved = contributionDeviceKeychainPromptProvider();
+      } catch {
+        resolved = "pairing";
+      }
+      resolvedKeychainPrompt =
+        CONTRIBUTION_DEVICE_KEYCHAIN_PROMPT_SURFACES.includes(resolved)
+          ? resolved
+          : "pairing";
+    }
+    return resolvedKeychainPrompt;
+  }
+
   // The telemetry-contribution-v1.0 incremental sync, additive beside the
   // v0.1 prepared-set path. Configured only when a contribution service
   // origin exists; the health capability additionally requires the unified
@@ -3452,6 +3497,7 @@ function createPreparedLocalCompanionServer({
       queue: syncStatusProjection(queueValue),
       incremental: incrementalSyncStatusProjection(incrementalValue, {
         configured: incrementalContribution !== null,
+        keychainPrompt: keychainPromptSurface(),
       }),
       configured: incrementalContribution !== null,
       pairingObserved,
@@ -3989,6 +4035,7 @@ function createPreparedLocalCompanionServer({
         if (incrementalContribution === null) {
           send(response, 200, incrementalSyncStatusProjection(null, {
             configured: false,
+            keychainPrompt: keychainPromptSurface(),
           }));
           return;
         }
@@ -4000,6 +4047,7 @@ function createPreparedLocalCompanionServer({
         }
         send(response, 200, incrementalSyncStatusProjection(status, {
           configured: true,
+          keychainPrompt: keychainPromptSurface(),
         }));
         return;
       }
@@ -4116,6 +4164,7 @@ function createPreparedLocalCompanionServer({
         }
         send(response, 200, incrementalSyncStatusProjection(status, {
           configured: true,
+          keychainPrompt: keychainPromptSurface(),
         }));
         return;
       }

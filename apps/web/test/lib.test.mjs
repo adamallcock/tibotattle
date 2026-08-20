@@ -6902,6 +6902,9 @@ test("the foreground send and its pass formatter are retired; the sync status li
     }),
     {
       status: "available",
+      // Absent from the payload above, so the normalizer reports the surface
+      // that keeps today's guidance on screen.
+      keychainPrompt: "pairing",
       consent: { approved: true, current: true, consentedAt: "2026-08-08T10:00:00.000Z" },
       paused: true,
       pausedReason: "quota_exhausted",
@@ -7863,6 +7866,29 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
   assert.match(
     pairingStep,
     /Choose Always Allow so background uploads keep working/u,
+  );
+  // ...and only where a dialog is reachable. A brokered install mints inside
+  // the signed app, so the step must carry a second line that warns about
+  // nothing and never names a process the reader cannot see.
+  const brokeredProgress = pairingStep.match(
+    /brokeredProgress: "([^"]*)"/u,
+  )?.[1] ?? "";
+  assert.equal(brokeredProgress.length > 0, true);
+  assert.doesNotMatch(brokeredProgress, /node/u);
+  assert.doesNotMatch(brokeredProgress, /keychain|Keychain/u);
+  assert.doesNotMatch(brokeredProgress, /Always Allow/u);
+  assert.match(
+    appSource,
+    /setProductText\(status, keychainPromptSurface\(\) === "pairing"\s*\n\s*\? step\.progress\s*\n\s*: step\.brokeredProgress \?\? step\.progress\);/u,
+  );
+  // The surface is only ever narrowed on a positive statement from the
+  // companion: anything else must keep today's guidance on screen.
+  const promptSurface = appSource.match(
+    /function keychainPromptSurface\(\) \{([\s\S]*?)\n\}/u,
+  )?.[1] ?? "";
+  assert.match(
+    promptSurface,
+    /reported === "rotation" \|\| reported === "none" \? reported : "pairing"/u,
   );
   // Re-pinned 2026-08-08 (owner-directed, second round): queue_refresh left
   // with the separate connect flow — the merged ceremony's invisible
@@ -9879,6 +9905,7 @@ function incrementalUploadAuthorityLost() {
 }
 function hostedEnrollmentIsPaused() { return false; }
 function hostedSignInRequired() { return false; }
+function keychainPromptSurface() { return harness.keychainPrompt ?? "pairing"; }
 ${section}
 return {
   approveIncrementalContribution,
