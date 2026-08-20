@@ -26,7 +26,14 @@ export {
 } from "./providers/claude/statusline.js";
 
 export async function runClaudeStatusline({
-  stdin = process.stdin,
+  // No `process.stdin` default: this module is reachable from the companion's
+  // import graph, and the companion's descriptor 0 is the signed app's
+  // Keychain broker socketpair. Touching process.stdin there constructs a
+  // stream over that channel and breaks credential minting silently. The
+  // process that legitimately owns descriptor 0 — this file run as a CLI —
+  // passes it explicitly in main(), and every other caller already did.
+  // Pinned by test/companion-descriptor-zero-invariant.test.js.
+  stdin,
   stdout = process.stdout,
   env = process.env,
   platform = process.platform,
@@ -70,7 +77,7 @@ export async function runClaudeStatusline({
 }
 
 async function main() {
-  await runClaudeStatusline();
+  await runClaudeStatusline({ stdin: process.stdin });
 }
 
 if (

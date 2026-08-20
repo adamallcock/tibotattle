@@ -77,6 +77,9 @@ import {
   setContributionSyncPaused,
 } from "../../src/contribution-sync-queue.js";
 import {
+  CONTRIBUTION_DEVICE_KEYCHAIN_PROMPT_SURFACES,
+  contributionDeviceKeychainPromptSurface,
+  createAppBrokeredContributionDeviceBackend,
   createProductionContributionDeviceBackend,
   migrateLegacyContributionDeviceCapability,
   readContributionDeviceCapability,
@@ -86,6 +89,10 @@ import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
   deleteExportIdentityKeychainItemByAttributes,
 } from "../../src/platform/export-identity-keychain.js";
+import {
+  contributionDeviceKeychainBrokerConfiguration,
+  createContributionDeviceKeychainBrokerTransport,
+} from "../../src/contribution-device-keychain-broker.js";
 import {
   claimContributionDevicePairing,
   disconnectContributionDevice as disconnectContributionDeviceRemotely,
@@ -283,6 +290,8 @@ const HOSTED_SIGNIN_HANDOFF_PROVIDERS = new Set(["google", "apple"]);
 const MAX_RECENT_DIAGNOSTIC_REFERENCES = 5;
 const CONTRIBUTION_DEVICE_KEYCHAIN_CAPABILITY =
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice;
+const CONTRIBUTION_DEVICE_APP_KEYCHAIN_CAPABILITY =
+  EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp;
 const MAX_CONTRIBUTION_DEVICE_STATE_BYTES = 512;
 
 function developmentIdentityConfigurationError() {
@@ -624,9 +633,19 @@ async function resetContributionDeviceCredentialLocally({
   backend,
   stateFile,
   legacyStateFile = null,
-  attributeDelete = () => deleteExportIdentityKeychainItemByAttributes(
-    CONTRIBUTION_DEVICE_KEYCHAIN_CAPABILITY,
-  ),
+  // Both storage generations are addressed: the app-minted
+  // `.app.v1` item and the companion-minted `.v1` item. Attribute deletes
+  // never decrypt, so clearing the generation that does not exist is a free
+  // "missing" rather than a prompt or a failure.
+  attributeDelete = () => {
+    const app = deleteExportIdentityKeychainItemByAttributes(
+      CONTRIBUTION_DEVICE_APP_KEYCHAIN_CAPABILITY,
+    );
+    const legacy = deleteExportIdentityKeychainItemByAttributes(
+      CONTRIBUTION_DEVICE_KEYCHAIN_CAPABILITY,
+    );
+    return app === "deleted" || legacy === "deleted" ? "deleted" : "missing";
+  },
 }) {
   let stored = null;
   let expected = null;
@@ -1888,8 +1907,21 @@ function deviceUnavailableIncrementalRunOutcome() {
  * The bounded status the dashboard's incremental surface reads: consent
  * state, cursor progress as day counts and the acknowledged watermark day,
  * pause reason as a fixed code. No path, no content, no identifier.
+ *
+ * `keychainPrompt` rides along because this is the projection the ceremony
+ * already polls: it names where a macOS Keychain dialog is still reachable
+ * ("pairing", "rotation", "none") so the dashboard can withhold guidance from
+ * the installs that can never see one. It is a fixed vocabulary, never a
+ * path, an identifier, or a credential fact.
  */
-function incrementalSyncStatusProjection(value, { configured = false } = {}) {
+function incrementalSyncStatusProjection(value, {
+  configured = false,
+  keychainPrompt = "pairing",
+} = {}) {
+  const promptSurface =
+    CONTRIBUTION_DEVICE_KEYCHAIN_PROMPT_SURFACES.includes(keychainPrompt)
+      ? keychainPrompt
+      : "pairing";
   const consent = value?.consent;
   const valid = value?.schemaVersion
       === "incremental-contribution-sync-status-v1.0"
@@ -1904,6 +1936,7 @@ function incrementalSyncStatusProjection(value, { configured = false } = {}) {
       ? "available"
       : configured ? "unavailable" : "not_configured",
     contractVersion: TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+    keychainPrompt: promptSurface,
     consent: { approved: false, current: false, consentedAt: null },
     paused: false,
     pausedReason: null,
@@ -2633,8 +2666,43 @@ function createPreparedLocalCompanionServer({
   }),
   preparedContributionDirectory,
   contributionServiceOrigin = centralOrigin,
-  contributionDeviceBackendFactory =
-    createProductionContributionDeviceBackend,
+  // When the signed app spawned this companion it hands over a Keychain
+  // broker channel (a socketpair end on the named descriptor): fresh
+  // contribution-device credentials are then minted and read by the app —
+  // the structural fix for the first-pairing Keychain dialog — while legacy
+  // items keep their companion-side keytar path until the rotation-time
+  // migration. Without the announcement (development, tests, Windows) the
+  // production keytar backend stays authoritative, exactly as before. The
+  // transport is shared across backend constructions: the channel is one
+  // kernel socketpair whose lifetime is the app's.
+  contributionDeviceBackendFactory = (() => {
+    // A malformed environment is rejected by the body's own validation; the
+    // selection here must not preempt that error with a different one.
+    const brokerConfiguration = environment && typeof environment === "object"
+        && !Array.isArray(environment)
+      ? contributionDeviceKeychainBrokerConfiguration(environment)
+      : null;
+    if (brokerConfiguration === null) {
+      return createProductionContributionDeviceBackend;
+    }
+    let brokerTransport = null;
+    return () => {
+      brokerTransport ??= createContributionDeviceKeychainBrokerTransport(
+        brokerConfiguration,
+      );
+      return createAppBrokeredContributionDeviceBackend({
+        transport: brokerTransport,
+      });
+    };
+  })(),
+  // Where a Keychain dialog is still reachable, resolved once. The legacy leg
+  // of the answer shells out to an attribute probe, and the ceremony polls the
+  // carrying route every four seconds, so this must not be recomputed per
+  // request. Nothing in brokered mode ever creates a legacy item, so one
+  // answer holds for the process; the migration that removes one only makes a
+  // conditional sentence redundant, never wrong.
+  contributionDeviceKeychainPromptProvider = () =>
+    contributionDeviceKeychainPromptSurface({ environment }),
   contributionDevicePairingProvider = null,
   contributionDeviceCredentialResetRunner = null,
   contributionDeviceCredentialAttributeDelete = null,
@@ -3111,6 +3179,27 @@ function createPreparedLocalCompanionServer({
         || typeof incrementalContributionController.resume !== "function")) {
     throw new TypeError("incrementalContributionController is invalid");
   }
+  // Resolved on first use and then held: the provider's legacy leg spawns an
+  // attribute probe, and the route carrying this answer is polled every few
+  // seconds by the ceremony. An unusable provider reports the surface that
+  // keeps today's guidance on screen.
+  let resolvedKeychainPrompt = null;
+  function keychainPromptSurface() {
+    if (resolvedKeychainPrompt === null) {
+      let resolved;
+      try {
+        resolved = contributionDeviceKeychainPromptProvider();
+      } catch {
+        resolved = "pairing";
+      }
+      resolvedKeychainPrompt =
+        CONTRIBUTION_DEVICE_KEYCHAIN_PROMPT_SURFACES.includes(resolved)
+          ? resolved
+          : "pairing";
+    }
+    return resolvedKeychainPrompt;
+  }
+
   // The telemetry-contribution-v1.0 incremental sync, additive beside the
   // v0.1 prepared-set path. Configured only when a contribution service
   // origin exists; the health capability additionally requires the unified
@@ -3408,6 +3497,7 @@ function createPreparedLocalCompanionServer({
       queue: syncStatusProjection(queueValue),
       incremental: incrementalSyncStatusProjection(incrementalValue, {
         configured: incrementalContribution !== null,
+        keychainPrompt: keychainPromptSurface(),
       }),
       configured: incrementalContribution !== null,
       pairingObserved,
@@ -3945,6 +4035,7 @@ function createPreparedLocalCompanionServer({
         if (incrementalContribution === null) {
           send(response, 200, incrementalSyncStatusProjection(null, {
             configured: false,
+            keychainPrompt: keychainPromptSurface(),
           }));
           return;
         }
@@ -3956,6 +4047,7 @@ function createPreparedLocalCompanionServer({
         }
         send(response, 200, incrementalSyncStatusProjection(status, {
           configured: true,
+          keychainPrompt: keychainPromptSurface(),
         }));
         return;
       }
@@ -4072,6 +4164,7 @@ function createPreparedLocalCompanionServer({
         }
         send(response, 200, incrementalSyncStatusProjection(status, {
           configured: true,
+          keychainPrompt: keychainPromptSurface(),
         }));
         return;
       }

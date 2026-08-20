@@ -114,6 +114,12 @@ import {
 import {
   resetLocalKeychainIdentityAndDevice,
 } from "../apps/macos/reset-local-keychain.js";
+import {
+  EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+} from "../src/export-identity-keychain.js";
+import {
+  CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_FD_ENV,
+} from "../src/contribution-device-keychain-broker.js";
 
 const REPOSITORY_ROOT = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -138,6 +144,13 @@ const MENU_BAR_STATUS_SOURCE = join(
   "macos",
   "Sources",
   "MenuBarStatus.swift",
+);
+const KEYCHAIN_BROKER_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "KeychainBroker.swift",
 );
 const QUOTA_NOTIFICATIONS_SOURCE = join(
   REPOSITORY_ROOT,
@@ -2065,6 +2078,13 @@ test("targeted local Keychain reset removes only exact local capabilities and re
   );
   const exportResidue = join(stateRoot, "export-participant-secret");
   const stored = new Map([
+    // Both contribution-device storage generations: the app-minted broker
+    // item and the companion-minted legacy item are one credential surface
+    // and the reset must clear whichever exist.
+    [
+      "app-usagemonitor.contribution-device.app.v1",
+      Buffer.alloc(32, 0x30),
+    ],
     [
       "app-usagemonitor.contribution-device.v1",
       Buffer.alloc(32, 0x31),
@@ -2139,6 +2159,7 @@ test("targeted local Keychain reset removes only exact local capabilities and re
     assert.deepEqual(
       calls.filter(([method]) => method === "deleteExact"),
       [
+        ["deleteExact", "app-usagemonitor.contribution-device.app.v1"],
         ["deleteExact", "app-usagemonitor.contribution-device.v1"],
         ["deleteExact", "app-usagemonitor.export-identity.v1"],
       ],
@@ -2212,6 +2233,170 @@ test("targeted local Keychain reset removes only exact local capabilities and re
     for (const secret of partialStored.values()) secret.fill(0);
     await rm(temporaryRoot, { recursive: true, force: true });
   }
+});
+
+test("the app Keychain broker mints the contribution credential app-side over the spawn socketpair", async () => {
+  const [source, brokerSource] = await Promise.all([
+    readFile(SWIFT_SOURCE, "utf8"),
+    readFile(KEYCHAIN_BROKER_SOURCE, "utf8"),
+  ]);
+
+  // The Swift storage generation and channel announcement stay in lockstep
+  // with the companion-side broker client.
+  const appCapability = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp;
+  assert.equal(
+    brokerSource.includes(`static let service = "${appCapability.service}"`),
+    true,
+  );
+  assert.equal(
+    brokerSource.includes(`static let account = "${appCapability.account}"`),
+    true,
+  );
+  assert.equal(
+    brokerSource.includes(
+      `static let environmentVariable = "${CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_FD_ENV}"`,
+    ),
+    true,
+  );
+
+  // The channel is a kernel socketpair: close-on-exec on both raw ends, a
+  // dead peer surfaces as a write error rather than SIGPIPE, and frames are
+  // bounded so anything that is not this protocol fails the channel closed.
+  assert.match(brokerSource, /socketpair\(AF_UNIX, SOCK_STREAM, 0, &endpoints\)/u);
+  assert.match(brokerSource, /F_SETFD, FD_CLOEXEC/u);
+  assert.match(brokerSource, /SO_NOSIGPIPE/u);
+  assert.match(brokerSource, /maximumFrameBytes = 4_096/u);
+  assert.match(brokerSource, /storedSecretPattern = "\^\[A-Za-z0-9_-\]\{43\}\$"/u);
+  // Reads, Keychain operations, and teardown share one dispatch queue, and
+  // only the read source's cancellation handler closes the descriptor — a
+  // read can therefore never race the close.
+  assert.match(
+    brokerSource,
+    /DispatchSource\.makeReadSource\(\s*fileDescriptor: descriptor,\s*queue: queue\s*\)/u,
+  );
+  assert.match(
+    brokerSource,
+    /source\.setCancelHandler \{\s*close\(descriptor\)\s*\}/u,
+  );
+
+  // Mint and read happen through SecItem in the login keychain; the
+  // data-protection keychain is rejected until the app carries the
+  // provisioning-profile entitlement it requires.
+  assert.match(brokerSource, /SecItemAdd\(/u);
+  assert.match(brokerSource, /SecItemCopyMatching\(/u);
+  assert.match(brokerSource, /SecItemDelete\(/u);
+  assert.doesNotMatch(brokerSource, /kSecUseDataProtectionKeychain/u);
+  // Never SecItemUpdate: Apple's implementation answers an update that hits
+  // errSecVerifyFailed by recreating the item with a DEFAULT access control
+  // list (_ReplaceKeychainItem → SecKeychainItemCreateFromContent with
+  // initialAccess = NULL), silently dropping the node trusted-app entry the
+  // reset helper reads through. Every ~25-day rotation takes the duplicate
+  // path, so the replacement must be a delete followed by an add that carries
+  // the access object again.
+  assert.doesNotMatch(brokerSource, /SecItemUpdate\(/u);
+  assert.match(
+    brokerSource,
+    /guard status == errSecDuplicateItem else \{\s*return Self\.failureCode\(status\)\s*\}/u,
+  );
+  assert.match(
+    brokerSource,
+    /let removal = SecItemDelete\(baseQuery\(\) as CFDictionary\)[\s\S]*?let replacement = SecItemAdd\(attributes as CFDictionary, nil\)/u,
+  );
+
+  // No SecItem call may raise a dialog. This queue serializes reads, Keychain
+  // work, responses, and teardown, so a modal prompt would block the channel
+  // until the companion's timeout poisoned its transport permanently — the
+  // user answering correctly would find it already dead. Suppressed, those
+  // states return errSecInteractionNotAllowed and take the existing locked
+  // path instead.
+  assert.match(
+    brokerSource,
+    /SecKeychainSetUserInteractionAllowed\(false\)\s*\n\s*defer \{ SecKeychainSetUserInteractionAllowed\(true\) \}/u,
+  );
+  // Every SecItem call site sits after the withoutUserInteraction that opens
+  // its enclosing function, so none can be added outside the suppression.
+  for (const call of ["SecItemCopyMatching(", "SecItemAdd(", "SecItemDelete("]) {
+    let index = brokerSource.indexOf(call);
+    assert.notEqual(index, -1, call);
+    while (index !== -1) {
+      const preceding = brokerSource.slice(0, index);
+      assert.equal(
+        preceding.lastIndexOf("withoutUserInteraction")
+          > preceding.lastIndexOf("private func "),
+        true,
+        `${call} at ${index} is outside withoutUserInteraction`,
+      );
+      index = brokerSource.indexOf(call, index + call.length);
+    }
+  }
+  // Items address only the app-managed service; the legacy `.v1` item is
+  // structurally unreachable from app-side code.
+  assert.match(brokerSource, /kSecAttrService as String: Self\.service/u);
+
+  // Every fresh item trusts the app and the bundled Node runtime by
+  // designated requirement, so the one-shot reset helper keeps its silent
+  // read + exact-delete, and a mint without that access object fails closed.
+  assert.match(
+    brokerSource,
+    /SecTrustedApplicationCreateFromPath\(nil, &trustedSelf\)/u,
+  );
+  assert.match(
+    brokerSource,
+    /SecTrustedApplicationCreateFromPath\(\s*nodeRuntimePath,\s*&trustedReader\s*\)/u,
+  );
+  assert.match(brokerSource, /SecAccessCreate\(/u);
+  assert.match(brokerSource, /kSecAttrAccess as String/u);
+  assert.match(
+    brokerSource,
+    /guard let access = designatedReaderAccess\(\) else \{\s*return "operation_failed"/u,
+  );
+
+  // Failure classification keeps the companion's locked/denied identities.
+  assert.match(
+    brokerSource,
+    /case errSecInteractionNotAllowed:\s*return "locked"/u,
+  );
+  assert.match(
+    brokerSource,
+    /case errSecAuthFailed, errSecUserCanceled:\s*return "denied"/u,
+  );
+
+  // Spawn wiring: the companion's standard input is the broker endpoint, the
+  // environment names only the descriptor, the parent drops its copy of the
+  // child end after the spawn, and termination tears the broker down.
+  assert.match(
+    source,
+    /child\.standardInput = broker\?\.childEndpoint \?\? FileHandle\.nullDevice/u,
+  );
+  assert.match(
+    source,
+    /ContributionDeviceKeychainBroker\(\s*nodeRuntimePath: resources\.node\.path\s*\)/u,
+  );
+  assert.match(
+    source,
+    /if broker\?\.childEndpoint != nil \{\s*environment\[\s*ContributionDeviceKeychainBroker\.environmentVariable\s*\] = "0"/u,
+  );
+  assert.match(source, /broker\?\.closeChildEndpoint\(\)/u);
+  const terminationSource = source.slice(
+    source.indexOf("private func didTerminate"),
+    source.indexOf("func stop(completion:"),
+  );
+  assert.match(terminationSource, /broker\?\.shutdown\(\)/u);
+
+  // The one-shot reset helper runs without a broker: its standard input
+  // stays the null device and its environment never announces a channel.
+  const resetHelperSource = source.slice(
+    source.indexOf("private func launchLocalKeychainResetHelper"),
+    source.indexOf("private func finishLocalKeychainReset"),
+  );
+  assert.match(
+    resetHelperSource,
+    /child\.standardInput = FileHandle\.nullDevice/u,
+  );
+  assert.equal(
+    resetHelperSource.includes(CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_FD_ENV),
+    false,
+  );
 });
 
 test("reviewed dogfood is configured with shared service and isolated updates", () => {
@@ -4254,6 +4439,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     false,
   );
   assert.deepEqual(swiftSources.relativeFiles, [
+    "apps/macos/Sources/KeychainBroker.swift",
     "apps/macos/Sources/Localization.swift",
     "apps/macos/Sources/LoginItemManager.swift",
     "apps/macos/Sources/MenuBarStatus.swift",

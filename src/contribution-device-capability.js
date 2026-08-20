@@ -16,12 +16,19 @@ import { basename, dirname, join, resolve } from "node:path";
 import { defaultExportStateDirectory } from "./export-identity.js";
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+  ExportIdentityKeychainError,
   createExportIdentityKeychainBackend,
+  deleteExportIdentityKeychainItemByAttributes,
+  exportIdentityKeychainItemPresenceByAttributes,
 } from "./export-identity-keychain.js";
 import {
   assertWindowsProductionReadiness,
   createWindowsProductionCapabilityBackend,
 } from "./platform/index.js";
+import {
+  contributionDeviceKeychainBrokerConfiguration,
+  createContributionDeviceKeychainBrokerBinding,
+} from "./contribution-device-keychain-broker.js";
 
 const SECRET_BYTES = 32;
 const MAXIMUM_STATE_BYTES = 512;
@@ -424,6 +431,282 @@ export function createProductionContributionDeviceBackend({
     if (error instanceof ContributionDeviceCapabilityError) throw error;
     translateBackendFailure(error);
   }
+}
+
+const APP_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp;
+
+export const CONTRIBUTION_DEVICE_KEYCHAIN_PROMPT_SURFACES = Object.freeze([
+  "pairing",
+  "rotation",
+  "none",
+]);
+
+/**
+ * Where — if anywhere — this install can still meet a macOS Keychain dialog.
+ *
+ * The shipped guidance is correctly conditional ("If macOS asks…") but renders
+ * to everyone and names `node`, a process a fresh brokered install will never
+ * see: the app mints and reads its own item, so no dialog is reachable. This
+ * is the signal that lets the dashboard show the guidance only where it can
+ * apply. Neither input can prompt — the announcement is an environment read,
+ * and the legacy probe is attribute-addressed, so it never decrypts.
+ *
+ * - `pairing`: no broker announcement (development, a standalone companion, or
+ *   an app that could not create the channel). The companion still mints
+ *   through the `security` CLI and reads it back, so today's copy is exact.
+ * - `rotation`: brokered, but the credential is still the legacy `.v1` item.
+ *   The dialog moved with the migration; it can only appear at the rotation
+ *   that retires that item, never at pairing.
+ * - `none`: brokered with no legacy item. No dialog exists to explain.
+ *
+ * An indeterminate probe answers `rotation`: conditional guidance that turns
+ * out to be unnecessary costs one sentence, while withholding it from an
+ * install that does raise a dialog is the harm this exists to prevent.
+ */
+export function contributionDeviceKeychainPromptSurface({
+  environment = process.env,
+  readBrokerConfiguration = contributionDeviceKeychainBrokerConfiguration,
+  probeLegacyCredential = () =>
+    exportIdentityKeychainItemPresenceByAttributes(CAPABILITY),
+} = {}) {
+  let announced = false;
+  try {
+    announced = readBrokerConfiguration(environment) !== null;
+  } catch {
+    // A malformed environment is the companion's own problem to report; for
+    // guidance purposes it is simply an install with no usable broker.
+    announced = false;
+  }
+  if (!announced) return "pairing";
+  let presence;
+  try {
+    presence = probeLegacyCredential();
+  } catch {
+    presence = "unknown";
+  }
+  return presence === "missing" ? "none" : "rotation";
+}
+
+function assertBackendSecret(value) {
+  if (!Buffer.isBuffer(value) || value.byteLength !== SECRET_BYTES) {
+    throw new ExportIdentityKeychainError("invalid_secret");
+  }
+  return value;
+}
+
+/**
+ * The app-brokered contribution-device backend: the signed TiboTattle.app is
+ * the only process that touches the Keychain for the app-managed credential
+ * generation, over the private broker channel it handed the companion at
+ * spawn. The companion holds secrets in memory only. The legacy generation —
+ * items minted companion-side through the `security` CLI (or keytar) under
+ * the `.v1` service — keeps being read and exact-deleted through keytar
+ * exactly as today, so existing installs are untouched until their next
+ * credential rotation, which is the migration point: the replacement secret
+ * is minted app-side and the legacy item is retired through the existing
+ * attribute-addressed deletion path (never decrypted, never prompting).
+ *
+ * A broker that is configured but unreachable fails every operation with the
+ * coded ExportIdentityKeychainError family, which the capability layer
+ * reports as the same recoverable contribution_device_credential_* errors
+ * the pairing path uses today. It never falls back to a companion-side mint:
+ * that fallback would silently resurrect the first-pairing Keychain dialog.
+ */
+export function createAppBrokeredContributionDeviceBackend({
+  transport,
+  createBrokerBinding = createContributionDeviceKeychainBrokerBinding,
+  createBackend = createExportIdentityKeychainBackend,
+  // Legacy keytar access is built lazily: a fresh install whose reads are all
+  // answered by the broker must not depend on the native binding loading, and
+  // brokered mode never mints legacy items, so no durable-ACL configuration
+  // is passed here.
+  createLegacyBackend = () => createExportIdentityKeychainBackend(),
+  // The legacy fall-through is the only thing that would make a brokered
+  // install construct keytar, and constructing that native binding is what
+  // took sign-in down on 2026-08-10. An attribute-addressed probe answers
+  // "is there a legacy item at all" without decrypting anything, so it needs
+  // neither the binding nor the item's access control list and cannot prompt.
+  probeLegacyCredential = () =>
+    exportIdentityKeychainItemPresenceByAttributes(CAPABILITY),
+  sweepLegacyCredential = () =>
+    deleteExportIdentityKeychainItemByAttributes(CAPABILITY),
+} = {}) {
+  if (typeof createBrokerBinding !== "function"
+      || typeof createBackend !== "function"
+      || typeof createLegacyBackend !== "function"
+      || typeof probeLegacyCredential !== "function"
+      || typeof sweepLegacyCredential !== "function") {
+    fail("invalid_configuration");
+  }
+  let modernBackend;
+  try {
+    modernBackend = assertBackend(createBackend({
+      binding: createBrokerBinding({ transport }),
+    }));
+  } catch (error) {
+    if (error instanceof ContributionDeviceCapabilityError) throw error;
+    fail("invalid_configuration");
+  }
+  let legacyBackendInstance = null;
+  const legacyBackend = () => {
+    if (legacyBackendInstance === null) {
+      legacyBackendInstance = legacyBackendInstanceOf();
+    }
+    return legacyBackendInstance;
+  };
+  function legacyBackendInstanceOf() {
+    const built = createLegacyBackend();
+    let valid = false;
+    try {
+      valid = built !== null && typeof built === "object"
+        && typeof built.read === "function"
+        && typeof built.createIfMissing === "function"
+        && typeof built.replaceExact === "function"
+        && typeof built.deleteExact === "function";
+    } catch {
+      // Collapse hostile injected backends to one fixed configuration error.
+    }
+    if (!valid) throw new ExportIdentityKeychainError("invalid_configuration");
+    return built;
+  }
+  // Only a definite "missing" skips the legacy generation. An indeterminate
+  // probe keeps the exact fall-through this backend had before it existed, so
+  // an install whose legacy item cannot be probed is never mistaken for a
+  // fresh one and silently pushed into a re-pair. Nothing in brokered mode
+  // ever writes a legacy item, so one answer holds for the process lifetime.
+  let legacyPresence = null;
+  function legacyBackendIfPresent() {
+    if (legacyPresence === null) {
+      try {
+        legacyPresence = probeLegacyCredential();
+      } catch {
+        legacyPresence = "unknown";
+      }
+      if (legacyPresence !== "present" && legacyPresence !== "missing") {
+        legacyPresence = "unknown";
+      }
+    }
+    return legacyPresence === "missing" ? null : legacyBackend();
+  }
+  function assertContributionCapability(capability) {
+    if (capability !== CAPABILITY) {
+      throw new ExportIdentityKeychainError("invalid_capability");
+    }
+  }
+  async function modernSecretPresent() {
+    let stored = null;
+    try {
+      stored = await modernBackend.read(APP_CAPABILITY);
+      return stored !== null;
+    } finally {
+      stored?.fill(0);
+    }
+  }
+  async function retireLegacyItem() {
+    // Attribute-addressed and therefore promptless; a failure leaves a stale
+    // legacy item that every read already shadows, and the next rotation,
+    // disconnect, or credential reset retries the removal.
+    try {
+      await sweepLegacyCredential();
+    } catch {
+      // deliberately ignored
+    }
+  }
+
+  async function read(capability) {
+    assertContributionCapability(capability);
+    const modern = await modernBackend.read(APP_CAPABILITY);
+    if (modern !== null) return modern;
+    return legacyBackendIfPresent()?.read(CAPABILITY) ?? null;
+  }
+
+  async function createIfMissing(capability, generatedSecret) {
+    assertContributionCapability(capability);
+    assertBackendSecret(generatedSecret);
+    if (await modernSecretPresent()) return "existing";
+    const legacyStore = legacyBackendIfPresent();
+    let legacy = null;
+    try {
+      legacy = legacyStore === null ? null : await legacyStore.read(CAPABILITY);
+      if (legacy !== null) return "existing";
+    } finally {
+      legacy?.fill(0);
+    }
+    // Fresh credentials are minted exclusively by the app: SecItemAdd by the
+    // signed app raises no dialog at mint and none at read-back, because the
+    // creating app is the item's partition holder and ACL trustee.
+    return modernBackend.createIfMissing(APP_CAPABILITY, generatedSecret);
+  }
+
+  async function replaceExact(capability, expectedSecret, replacementSecret) {
+    assertContributionCapability(capability);
+    assertBackendSecret(expectedSecret);
+    assertBackendSecret(replacementSecret);
+    if (await modernSecretPresent()) {
+      const outcome = await modernBackend.replaceExact(
+        APP_CAPABILITY,
+        expectedSecret,
+        replacementSecret,
+      );
+      if (outcome === "replaced") await retireLegacyItem();
+      return outcome;
+    }
+    // Migration point (design note 2026-08-19, option 3): the credential
+    // still lives in the legacy generation, and the caller — the silent
+    // ~25-day rotation — already holds the service-committed replacement.
+    // Mint the replacement app-side first, then retire the legacy item, so a
+    // crash between the two steps leaves the valid new credential readable
+    // (reads prefer the app generation) rather than no credential at all.
+    const legacyStore = legacyBackendIfPresent();
+    if (legacyStore === null) return "missing";
+    let legacy = null;
+    let matches = false;
+    try {
+      legacy = await legacyStore.read(CAPABILITY);
+      if (legacy === null) return "missing";
+      matches = legacy.byteLength === expectedSecret.byteLength
+        && timingSafeEqual(legacy, expectedSecret);
+    } finally {
+      legacy?.fill(0);
+    }
+    if (!matches) return "conflict";
+    const created = await modernBackend.createIfMissing(
+      APP_CAPABILITY,
+      replacementSecret,
+    );
+    if (created !== "created") {
+      // A concurrent writer minted an app-generation credential between the
+      // presence probe and this mint; nothing can prove whose secret is
+      // stored, so fail closed instead of reporting a replace that may not
+      // have happened.
+      throw new ExportIdentityKeychainError("operation_failed");
+    }
+    await retireLegacyItem();
+    return "replaced";
+  }
+
+  async function deleteExact(capability, expectedSecret) {
+    assertContributionCapability(capability);
+    assertBackendSecret(expectedSecret);
+    if (await modernSecretPresent()) {
+      const outcome = await modernBackend.deleteExact(
+        APP_CAPABILITY,
+        expectedSecret,
+      );
+      if (outcome === "deleted") await retireLegacyItem();
+      return outcome;
+    }
+    const legacyStore = legacyBackendIfPresent();
+    if (legacyStore === null) return "missing";
+    return legacyStore.deleteExact(CAPABILITY, expectedSecret);
+  }
+
+  async function describe(capability) {
+    assertContributionCapability(capability);
+    return Object.freeze({ backend: "macos_keychain", status: "available" });
+  }
+
+  return Object.freeze({ read, createIfMissing, replaceExact, deleteExact, describe });
 }
 
 // The macOS product state root was renamed after the contribution credential

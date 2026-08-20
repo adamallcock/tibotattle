@@ -9,10 +9,17 @@ import { RELEASE_VERSION } from "../../../config/release-manifest.js";
 
 const DEFAULT_TIMEOUT_MS = 20_000;
 const ACCOUNT_HMAC_ENV = "APP_USAGEMONITOR_ACCOUNT_HMAC_KEY";
+// The app's Keychain broker announcement names a descriptor in *this*
+// process, and this child's descriptor 0 is a different file entirely. No
+// secret leaks — the child cannot reach the socketpair — but an announcement
+// that resolves to an unrelated descriptor is a trap for anything downstream
+// that trusts it, so the key never crosses the spawn.
+const KEYCHAIN_BROKER_FD_ENV = "USAGE_MONITOR_KEYCHAIN_BROKER_FD";
 
 export function codexAppServerChildEnv(environment = process.env) {
   const childEnvironment = { ...environment };
   delete childEnvironment[ACCOUNT_HMAC_ENV];
+  delete childEnvironment[KEYCHAIN_BROKER_FD_ENV];
   return childEnvironment;
 }
 

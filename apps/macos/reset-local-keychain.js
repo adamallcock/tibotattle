@@ -15,14 +15,25 @@ import {
 
 const CONFIRMATION_ARGUMENT = "--confirm-local-keychain-reset";
 const RESULT_SCHEMA = "usage-monitor-local-keychain-reset-v1";
+// The contribution-device credential exists in one of two storage
+// generations: the app-minted `.app.v1` item (created by the signed app via
+// SecItemAdd with this helper's runtime among the trusted readers) and the
+// companion-minted `.v1` item. Both are this device's upload credential, so
+// the reset addresses both under the one reported state; whichever
+// generation is absent reads as a clean miss and costs nothing.
 const TARGETS = Object.freeze([
   Object.freeze({
-    capability: EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice,
+    capabilities: Object.freeze([
+      EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp,
+      EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice,
+    ]),
     key: "contributionDevice",
     stateFile: "contribution-device-binding-v1.json",
   }),
   Object.freeze({
-    capability: EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity,
+    capabilities: Object.freeze([
+      EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity,
+    ]),
     key: "exportIdentity",
     stateFile: "export-participant-secret",
   }),
@@ -224,19 +235,25 @@ export async function resetLocalKeychainIdentityAndDevice({
         target.key,
         await inspectOptionalStateFile(selectedStateRoot, target.stateFile),
       );
-      let secret;
-      try {
-        secret = await selectedBackend.read(target.capability);
-      } catch (error) {
-        fail(fixedFailureCode(error));
+      const storedSecrets = [];
+      for (const capability of target.capabilities) {
+        let secret;
+        try {
+          secret = await selectedBackend.read(capability);
+        } catch (error) {
+          fail(fixedFailureCode(error));
+        }
+        if (secret !== null
+            && (!Buffer.isBuffer(secret) || secret.byteLength !== 32)) {
+          if (Buffer.isBuffer(secret)) secret.fill(0);
+          fail("UM_MACOS_KEYCHAIN_RESET_FAILED");
+        }
+        storedSecrets.push(Object.freeze({ capability, secret }));
       }
-      if (secret !== null
-          && (!Buffer.isBuffer(secret) || secret.byteLength !== 32)) {
-        if (Buffer.isBuffer(secret)) secret.fill(0);
-        fail("UM_MACOS_KEYCHAIN_RESET_FAILED");
+      secrets.set(target.key, storedSecrets);
+      if (storedSecrets.some(({ secret }) => secret !== null)) {
+        result.keychain[target.key] = "retained";
       }
-      secrets.set(target.key, secret);
-      if (secret !== null) result.keychain[target.key] = "retained";
       if (inspectedFiles.get(target.key) !== null) {
         if (target.key === "contributionDevice") {
           result.appState.contributionDeviceBinding = "retained";
@@ -266,28 +283,30 @@ export async function resetLocalKeychainIdentityAndDevice({
     }
 
     for (const target of TARGETS) {
-      const secret = secrets.get(target.key);
-      if (secret === null) continue;
-      let outcome;
-      try {
-        outcome = await selectedBackend.deleteExact(
-          target.capability,
-          secret,
-        );
-      } catch (error) {
-        result.status = "partial";
-        result.failureCode = fixedFailureCode(error);
-        result.keychain[target.key] = "unknown";
-        break;
+      const storedSecrets = secrets.get(target.key)
+        .filter(({ secret }) => secret !== null);
+      if (storedSecrets.length === 0) continue;
+      let anyDeleted = false;
+      for (const { capability, secret } of storedSecrets) {
+        let outcome;
+        try {
+          outcome = await selectedBackend.deleteExact(capability, secret);
+        } catch (error) {
+          result.status = "partial";
+          result.failureCode = fixedFailureCode(error);
+          result.keychain[target.key] = "unknown";
+          break;
+        }
+        if (outcome !== "deleted" && outcome !== "missing") {
+          result.status = "partial";
+          result.failureCode = "UM_MACOS_KEYCHAIN_RESET_PARTIAL";
+          result.keychain[target.key] = "unknown";
+          break;
+        }
+        if (outcome === "deleted") anyDeleted = true;
       }
-      if (outcome !== "deleted" && outcome !== "missing") {
-        result.status = "partial";
-        result.failureCode = "UM_MACOS_KEYCHAIN_RESET_PARTIAL";
-        result.keychain[target.key] = "unknown";
-        break;
-      }
-      result.keychain[target.key] =
-        outcome === "deleted" ? "removed" : "missing";
+      if (result.status === "partial") break;
+      result.keychain[target.key] = anyDeleted ? "removed" : "missing";
     }
 
     if (result.status === "partial" && !result.failureCode) {
@@ -295,8 +314,10 @@ export async function resetLocalKeychainIdentityAndDevice({
     }
     return Object.freeze(result);
   } finally {
-    for (const secret of secrets.values()) {
-      if (Buffer.isBuffer(secret)) secret.fill(0);
+    for (const storedSecrets of secrets.values()) {
+      for (const { secret } of storedSecrets) {
+        if (Buffer.isBuffer(secret)) secret.fill(0);
+      }
     }
   }
 }

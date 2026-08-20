@@ -10613,8 +10613,13 @@ const LOCAL_COMPANION_ERROR_COPY = {
   // looking at the network or at the contribution service.
   enrollment_response_invalid:
     "The contribution service replied in a shape TiboTattle does not accept, so no pseudonymous access was established. Nothing was uploaded; sign in again and retry.",
+  // "Quit and reopen", not "reopen": the app hands its companion a Keychain
+  // channel that lasts exactly one companion lifetime, and a channel that has
+  // failed closed stays closed until the app starts a new one. Reopening the
+  // window would leave the same wedged companion running (C1b, red-team
+  // review of PR #34).
   device_credential_reset_failed:
-    "The leftover device credential could not be cleared. Nothing was deleted on this Mac or in the service; try again, or reopen TiboTattle first.",
+    "The leftover device credential could not be cleared. Nothing was deleted on this Mac or in the service. Try again, or quit and reopen TiboTattle first.",
   device_credential_reset_not_authorized:
     "TiboTattle refused this reset because it did not come from the local dashboard. Nothing was deleted.",
   review_required_before_send:
@@ -11684,6 +11689,15 @@ function renderIncrementalConsent() {
     remove.hidden = !hasCommunitySession();
     remove.disabled = busy;
   }
+  // Keychain guidance is shown only where a dialog can be raised: at the
+  // connect step for an unbrokered companion, at the migrating credential's
+  // next renewal for a brokered one, and nowhere at all for a fresh brokered
+  // install (S3, red-team review of PR #34).
+  const keychainSurface = keychainPromptSurface();
+  const pairingNote = $("#incremental-keychain-pairing-note");
+  const rotationNote = $("#incremental-keychain-rotation-note");
+  if (pairingNote) pairingNote.hidden = keychainSurface !== "pairing";
+  if (rotationNote) rotationNote.hidden = keychainSurface !== "rotation";
   // The review the approve gate requires, on screen: the verified prepared
   // instance's own facts. They come from the same queue item the one-use
   // token was minted for, and they leave with approval — the card then
@@ -11819,6 +11833,22 @@ function boundedOutcomeDetailCode(payload) {
   return typeof code === "string" && INCREMENTAL_OUTCOME_CODE_PATTERN.test(code)
     ? code
     : null;
+}
+
+/**
+ * Where this install can still meet a macOS Keychain dialog, as the companion
+ * reports it: "pairing" (the companion mints its own credential, so the
+ * connect step can raise one), "rotation" (the app brokers the Keychain but a
+ * legacy credential still has to migrate, and that is when a dialog appears),
+ * or "none" (brokered with nothing to migrate — no dialog exists).
+ *
+ * "pairing" is the default before the first projection lands and whenever the
+ * companion cannot answer, so guidance is only ever withheld on a positive
+ * statement that it cannot apply.
+ */
+function keychainPromptSurface() {
+  const reported = incrementalSyncStatus?.keychainPrompt;
+  return reported === "rotation" || reported === "none" ? reported : "pairing";
 }
 
 /**
@@ -12441,6 +12471,16 @@ async function renderContributionDeviceRecovery(status, { error } = {}) {
   }
   const actions = node("div", "contribution-cta-buttons");
   actions.append(reset, action);
+  // The recovery instruction is ceremony guidance, so it takes the localized
+  // path the connect steps use rather than the English-only failure maps.
+  // "Quit and reopen" is load-bearing: a broker channel that has failed closed
+  // stays closed for the companion's whole lifetime, so a reset that re-enters
+  // it loops until the app itself is restarted (C1b, red-team review of #34).
+  const guidance = node("p", "annotation", "");
+  setProductText(
+    guidance,
+    "Resetting clears only that unusable credential and its local record. Then choose Review and approve again. If the reset fails too, quit and reopen TiboTattle first.",
+  );
   status.hidden = false;
   status.className = "participant-action-status error";
   status.replaceChildren(
@@ -12450,11 +12490,7 @@ async function renderContributionDeviceRecovery(status, { error } = {}) {
       "This Mac has a leftover contribution-device credential."
     ),
     document.createTextNode(` ${described.text}`),
-    node(
-      "p",
-      "annotation",
-      "Resetting clears only that unusable credential and its local record. Then choose Review and approve again."
-    ),
+    guidance,
     actions
   );
   return described;
@@ -12491,7 +12527,7 @@ async function resetContributionDeviceCredential() {
       surface: "device_credential_reset",
       error,
       fallback:
-        "The leftover device credential could not be cleared. Nothing was deleted on this Mac or in the service."
+        "The leftover device credential could not be cleared. Nothing was deleted on this Mac or in the service. Quit and reopen TiboTattle, then try again."
     });
   } finally {
     communityConnectBusy = false;
@@ -12557,6 +12593,13 @@ const CONTRIBUTION_CONNECT_STEPS = Object.freeze({
     // what asks, why, and that Always Allow is the answer that keeps
     // background passes running instead of re-prompting every six hours.
     progress: "Connecting this Mac as an upload-only device… macOS may ask for your login password to protect this Mac's upload credential; the request comes from TiboTattle's bundled helper, which macOS lists as node. Choose Always Allow so background uploads keep working.",
+    // The line above is for installs whose companion still mints the
+    // credential itself. When the signed app brokers the Keychain no dialog
+    // is reachable at this step at all, so naming a process the reader will
+    // never see would be a warning about nothing (S3, red-team review of
+    // PR #34). The remaining case — a legacy item migrating — meets its
+    // dialog at rotation, and the approve card's own annotation carries it.
+    brokeredProgress: "Connecting this Mac as an upload-only device…",
     stopped: "Connecting stopped at step 3 of 3, pairing this Mac as an upload-only device.",
     failure:
       "The pairing was not completed, so this Mac is not connected. Nothing was uploaded; retrying is safe.",
@@ -12577,7 +12620,12 @@ async function contributionConnectStep(stepId, status, run) {
   const step = CONTRIBUTION_CONNECT_STEPS[stepId];
   status.hidden = false;
   status.className = "participant-action-status";
-  setProductText(status, step.progress);
+  // A step keeps its dialog-preparing copy only where a dialog can actually
+  // be raised; "pairing" is the default the companion reports when it cannot
+  // tell, so an unanswering companion behaves exactly as before.
+  setProductText(status, keychainPromptSurface() === "pairing"
+    ? step.progress
+    : step.brokeredProgress ?? step.progress);
   try {
     return await run();
   } catch (error) {

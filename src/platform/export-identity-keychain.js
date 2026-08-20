@@ -61,6 +61,17 @@ export const EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES = Object.freeze({
     service: "app-usagemonitor.contribution-device.v1",
     account: "installation",
   }),
+  // The app-managed storage generation of the contribution-device credential:
+  // minted by the signed TiboTattle.app via SecItemAdd (an app-created item
+  // never raises the partition/ACL dialog for its creator) and served to the
+  // companion over the app's Keychain broker channel. A different service
+  // string, not a marker attribute, separates the generations so app-side
+  // code can never accidentally decrypt a `security`-CLI-minted `.v1` item —
+  // that read is exactly the partition prompt the broker exists to eliminate.
+  contributionDeviceApp: Object.freeze({
+    service: "app-usagemonitor.contribution-device.app.v1",
+    account: "installation",
+  }),
 });
 
 const ERROR_CODES = new Set([
@@ -315,6 +326,9 @@ function capabilityPair(capability) {
   }
   if (capability === EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice) {
     return EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice;
+  }
+  if (capability === EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp) {
+    return EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp;
   }
   fail("invalid_capability");
 }
@@ -581,6 +595,24 @@ export function exportIdentityKeychainAttributeDeleteArguments(capability) {
   ]);
 }
 
+/**
+ * The constructed security invocation for an attribute-addressed presence
+ * probe, exported so a test can pin the exact arguments. Without `-w` or `-g`
+ * the tool reports the item's attributes and never decrypts it, so — exactly
+ * like the attribute delete — it needs neither the native binding nor the
+ * item's access control list, and it cannot raise the partition/ACL dialog.
+ */
+export function exportIdentityKeychainAttributeProbeArguments(capability) {
+  const pair = capabilityPair(capability);
+  return Object.freeze([
+    "find-generic-password",
+    "-s",
+    pair.service,
+    "-a",
+    pair.account,
+  ]);
+}
+
 function defaultRunAttributeDeleteCommand(command, commandArguments) {
   // The security CLI prints the deleted item's attributes on success; they
   // are discarded unread so nothing about the item can enter an error, a
@@ -624,4 +656,42 @@ export function deleteExportIdentityKeychainItemByAttributes(
   if (status === 0) return "deleted";
   if (status === SECURITY_ITEM_NOT_FOUND_STATUS) return "missing";
   fail("operation_failed");
+}
+
+/**
+ * Answer whether a capability's Keychain item exists, without decrypting it
+ * and therefore without any possibility of a prompt or of loading the native
+ * binding. The third outcome is the load-bearing one: callers use this to
+ * decide whether a legacy item is worth reaching for, and "unknown" must keep
+ * them on the path they would have taken anyway, so an unreadable probe can
+ * never make an existing install look like a fresh one.
+ */
+export function exportIdentityKeychainItemPresenceByAttributes(
+  capability,
+  options = {},
+) {
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    fail("invalid_configuration");
+  }
+  const {
+    platform = process.platform,
+    runCommand = defaultRunAttributeDeleteCommand,
+  } = options;
+  const commandArguments =
+    exportIdentityKeychainAttributeProbeArguments(capability);
+  if (platform !== "darwin" || typeof runCommand !== "function") {
+    return "unknown";
+  }
+  let outcome;
+  try {
+    outcome = runCommand(SECURITY_PATH, commandArguments);
+  } catch {
+    return "unknown";
+  }
+  const status = outcome !== null && typeof outcome === "object"
+    ? outcome.status
+    : undefined;
+  if (status === 0) return "present";
+  if (status === SECURITY_ITEM_NOT_FOUND_STATUS) return "missing";
+  return "unknown";
 }

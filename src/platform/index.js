@@ -43,10 +43,20 @@ export {
   createExportIdentityKeychainBackend,
   deleteExportIdentityKeychainItemByAttributes,
   exportIdentityKeychainAttributeDeleteArguments,
+  exportIdentityKeychainAttributeProbeArguments,
+  exportIdentityKeychainItemPresenceByAttributes,
   keytarSignedBindingRequirement,
   keytarSignedBindingVerificationArguments,
   loadExportIdentityKeychainBinding,
 } from "./export-identity-keychain.js";
+// The contribution-device Keychain broker is deliberately absent: it lives at
+// src/contribution-device-keychain-broker.js with the other contribution
+// modules, not under this owner. This barrel is the reviewed platform-adapter
+// public API, and everything reachable through it is in the local-review
+// artifact's graph — which its source policy forbids any contribution-* module
+// from entering (scripts/build-local-review-artifact.js,
+// FORBIDDEN_SOURCE_BASENAMES). A platform-owned broker could only be reached
+// through here, so the owner boundary and the review boundary would fight.
 export {
   readOwnerOnlyLocalMetadataBundlePair,
   sha256Hex,

@@ -135,6 +135,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/codex-transition-miner.js",
   "src/contribution-device-capability.js",
   "src/contribution-device-client.js",
+  "src/contribution-device-keychain-broker.js",
   "src/contribution-device-renewal.js",
   "src/contribution-device-sync.js",
   "src/contribution-incremental-sync.js",

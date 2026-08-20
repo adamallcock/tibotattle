@@ -538,6 +538,9 @@ test("the status route reports bounded progress and never a path", async () => {
       schemaVersion: "local-incremental-contribution-sync-v1.0",
       status: "available",
       contractVersion: "telemetry-contribution-v1.0",
+      // No broker announcement in this fixture's environment, so the surface
+      // that can raise a Keychain dialog is still the pairing step.
+      keychainPrompt: "pairing",
       consent: {
         approved: true,
         current: true,

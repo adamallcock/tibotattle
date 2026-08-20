@@ -66,6 +66,8 @@ const PLATFORM_PUBLIC_EXPORTS = Object.freeze([
   "deriveSnapshotObservationId",
   "encodeParticipantSecret",
   "exportIdentityKeychainAttributeDeleteArguments",
+  "exportIdentityKeychainAttributeProbeArguments",
+  "exportIdentityKeychainItemPresenceByAttributes",
   "inspectParticipantSecret",
   "keytarSignedBindingRequirement",
   "keytarSignedBindingVerificationArguments",
