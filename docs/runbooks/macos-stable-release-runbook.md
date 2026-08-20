@@ -268,11 +268,31 @@ contain local paths and should remain staging input.
 
 Create a **draft** release and upload only public release assets. Every macOS
 direct subject includes the final DMG, `release-manifest.json`, `SHA256SUMS`,
-and `verify-release.md`. For the attested v1 profile/path, also upload the SPDX
-SBOM and both artifact-specific Sigstore bundles; for a native/checksum-only
-path, keep those manifest fields `null` and do not upload placeholder bundles.
-Do not upload the sanitized Sparkle receipt, local descriptor, credentials, or
-a staging directory as general GitHub evidence.
+`verify-release.md`, **and `appcast.xml`**. For the attested v1 profile/path,
+also upload the SPDX SBOM and both artifact-specific Sigstore bundles; for a
+native/checksum-only path, keep those manifest fields `null` and do not upload
+placeholder bundles. Do not upload the sanitized Sparkle receipt, local
+descriptor, credentials, or a staging directory as general GitHub evidence.
+
+`appcast.xml` is not optional here, and leaving it out is not a cosmetic
+omission. Whenever `updater.enabled` is true, the manifest records the appcast
+as the updater subject and `SHA256SUMS` carries its digest, so a release
+without it fails the verification this repository itself documents:
+
+~~~text
+RELEASE_EVIDENCE_FILE_UNAVAILABLE: ... updater metadata is missing ...
+~~~
+
+A plain `shasum -a 256 -c SHA256SUMS` also reports a FAILED line. This is the
+same bytes published to R2 in step 7 — publishing it here makes the GitHub
+release self-verifying rather than dependent on the feed host. Verified on
+0.1.13: with the four-asset set the documented `release:evidence:validate` run
+against a fresh `gh release download` exits 1; adding `appcast.xml` makes the
+identical command return `RELEASE_EVIDENCE_VALID`.
+
+Note that 0.1.11 and 0.1.12 published the DMG alone, so 0.1.13 is the first
+release to carry the evidence assets at all. Do not treat an older release's
+asset list as the reference.
 
 ~~~bash
 TAG="vX.Y.Z"
