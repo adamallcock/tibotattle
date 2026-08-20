@@ -3,9 +3,11 @@
 Date: 2026-08-19. Status: option 3 implemented — copy and ordering fixes
 shipped on `fix/first-pairing-keychain-ux`; the structural elimination
 (Swift-app credential minting over a spawn-time broker channel) is built on
-`feat/swift-keychain-broker` and documented in "Implementation" below. The
-fresh-account zero-dialog proof remains a release-gate observation (see the
-checklist at the end).
+`feat/swift-keychain-broker` and documented in "Implementation" below, with
+the red-team findings on PR #34 folded in. The fresh-account zero-dialog proof
+remains a release-gate observation (see the checklist at the end), and two of
+its items — the node ACL read and the `security` CLI delete — are open
+questions this worktree cannot settle.
 
 ## What was observed
 
@@ -168,6 +170,31 @@ Option 3, with the boundary drawn slightly stricter than sketched above: the
 live companion never touches the Keychain for the new credential generation
 at all — not even reads. Every touch happens inside the signed app.
 
+### What this is and is not a boundary against
+
+Stated plainly, because an earlier draft of this note and of
+`KeychainBroker.swift` overclaimed it (corrected after the red-team review of
+PR #34):
+
+The broker **removes the dialog** and **narrows accidental exposure** — the
+companion can address exactly one Keychain item, through one single-purpose
+channel, and holds the secret only in memory. It is **not a confidentiality
+boundary against a deliberate same-user attacker.** Every item is minted with
+`runtime/bin/node` in its trusted-application list, because the one-shot
+Identity & Device Reset helper reads it through keytar, and that node is a
+world-executable general-purpose interpreter inside the bundle: any process
+running as this user can execute it and satisfy the ACL's designated
+requirement. This is not a regression — the `-T node` `security` mint it
+replaces had exactly the same property — but it is not the stronger claim
+either.
+
+**The end state that would close it:** move upload signing into the Swift app,
+so the companion asks the app to sign rather than to hand over the secret and
+node never needs to read the item at all. The node ACL entry can then be
+dropped, at which point the item is readable only by the signed app and option
+4's data-protection keychain becomes the natural follow-on. That is the
+recommended next step for this workstream; it is not in this change.
+
 ### The broker channel
 
 At companion spawn, `CompanionProcess.launch` creates a
@@ -176,17 +203,17 @@ as its standard input (previously the unused null device); the environment
 carries only `USAGE_MONITOR_KEYCHAIN_BROKER_FD=0` — the descriptor number,
 which is not a secret. This shape was chosen over the alternatives because:
 
-- **No credential exists to leak.** The kernel-held socket end *is* the
-  authority: only the spawned child owns the peer. A loopback listener or a
-  companion HTTP route would need endpoint discovery plus a bearer token,
-  both new secrets with new lifetimes; the socketpair needs neither, and
-  nothing crosses argv, the environment, or the filesystem.
+- **No new credential is introduced.** The kernel-held socket end is the
+  channel's own authority: only the spawned child owns the peer. A loopback
+  listener or a companion HTTP route would need endpoint discovery plus a
+  bearer token, both new secrets with new lifetimes; the socketpair needs
+  neither, and nothing crosses argv, the environment, or the filesystem.
 - **It matches the existing process relationship.** The app already owns the
   companion's stdio; the broker adds a fourth stream to an existing spawn
   rather than a first-ever app-serves-node network surface.
 - **Single-purpose by construction.** The wire protocol
   (`apps/macos/Sources/KeychainBroker.swift`,
-  `src/platform/contribution-device-keychain-broker.js`) is newline-framed
+  `src/contribution-device-keychain-broker.js`) is newline-framed
   JSON with three operations (get/set/delete), bounded frames, strict
   in-order ids, and no service/account addressing — the companion cannot
   name any other Keychain item through it. Any protocol deviation fails the
@@ -210,6 +237,62 @@ item. `kSecUseDataProtectionKeychain` was re-assessed and stays rejected
 for now: it requires provisioning-profile-backed entitlements the Developer
 ID app does not carry (option 4 remains the follow-on once it does).
 
+### Why no SecItem call can ever block the broker
+
+The broker serializes socket reads, every Keychain call, response writes, and
+teardown on one queue, so a call that blocks blocks the channel. A locked
+login keychain or an ACL/partition mismatch would otherwise raise a modal
+dialog and block exactly there; the companion's ten-second per-request timeout
+would then poison its transport permanently — and the transport is deliberately
+unrecoverable, because the descriptor is a one-shot kernel channel whose
+lifetime is the companion's. The user who answered that dialog correctly would
+find the channel already dead, which is *worse* than the pre-broker behaviour,
+where a headless node got `errSecInteractionNotAllowed` immediately and
+surfaced an honest `contribution_device_credential_locked`.
+
+Every SecItem call is therefore bracketed in
+`SecKeychainSetUserInteractionAllowed(false)`. Those states now return
+`errSecInteractionNotAllowed` at once, which the existing mapping turns into
+`locked` → `KEYCHAIN_LOCKED` → `contribution_device_credential_locked`. "Zero
+dialogs" becomes a structural property of the broker rather than an
+expectation about which items macOS decides to challenge.
+
+The transport still does not reconnect after poisoning, and that is
+deliberate: `poison()` destroys the socket, which closes descriptor 0, and a
+"fresh" transport over that number would attach to whatever the process
+allocated next — a stale-descriptor bug strictly worse than the wedge it would
+try to cure. Restarting the app is the only honest recovery, so the recovery
+surfaces now say **quit and reopen**, not "reopen": the channel's lifetime is
+the companion's, and reopening the window leaves the same wedged companion
+running. The reset ceremony's own guidance line is the always-on-screen
+carrier and moved onto the localized ceremony path for it (trilingual, beside
+the connect-step copy); the two fixed failure-map entries carry the same
+sentence in the English-only register every entry in those maps uses.
+
+### Rotation must not silently drop the ACL
+
+`storeSecret` reaches `errSecDuplicateItem` on every ~25-day rotation, because
+the compare-and-swap has already established that the item exists. Answering
+that with `SecItemUpdate` is unsafe: in Apple's shipping implementation an
+update that hits `errSecVerifyFailed` falls into `_ReplaceKeychainItem` →
+`SecKeychainItemCreateFromContent` with `initialAccess = NULL`
+(`OSX/libsecurity_keychain/lib/SecItem.cpp`), recreating the item with a
+default ACL and dropping the node trusted-application entry — after which the
+reset helper starts prompting. Adding `kSecAttrAccess` to the update
+dictionary does not reliably prevent it.
+
+The broker deletes and re-adds instead, so every write re-establishes the ACL
+deterministically. **Why that cannot lose the credential:** the branch is only
+reachable behind a completed compare-and-swap read, so the keychain is
+demonstrably unlocked microseconds earlier on the same serialized queue; the
+access object is built *before* any mutation, so an unbuildable ACL fails the
+write before the delete; and `replaceExact`'s only production caller is the
+rotation, which has already received the service's commit for the replacement.
+The stored value at that moment is worthless either way. A delete that lands
+before a failing add therefore reaches the same recoverable end state as a
+failing update — no readable credential, `credential_missing`, and the
+existing re-pair ceremony — rather than a new class of loss.
+
 ### Companion-side composition
 
 `createAppBrokeredContributionDeviceBackend`
@@ -220,6 +303,35 @@ locked/denied classification) runs unchanged over the wire; the legacy
 generation keeps its exact keytar read/delete paths, loaded lazily so a
 fresh install never depends on the native binding for brokered operations.
 Reads prefer the app generation, then fall through to legacy.
+
+Lazy was not enough on its own: the fall-through fires whenever the modern
+result is null, which is precisely the fresh-install pre-pairing state, so a
+brokered fresh install still constructed keytar — the native binding whose
+failure took sign-in down on 2026-08-10. The fall-through is now gated on an
+attribute-addressed presence probe for the `.v1` item
+(`exportIdentityKeychainItemPresenceByAttributes`, `security
+find-generic-password` with neither `-w` nor `-g`, so it reports attributes
+without decrypting and cannot prompt). Only a definite `missing` skips the
+legacy backend; an indeterminate probe keeps the previous behaviour exactly,
+so an install that does hold a legacy credential can never be mistaken for a
+fresh one and pushed into a needless re-pair. The answer is resolved once per
+process, since brokered mode never creates a legacy item.
+
+### Guidance is shown only where a dialog is reachable
+
+The shipped pairing copy is correctly conditional ("If macOS asks…") but it
+rendered to everyone and named `node`, a process a fresh brokered install will
+never see. The companion now reports a `keychainPrompt` surface on the
+projection the ceremony already polls
+(`/api/local/contribution/incremental-status`): `pairing` when no broker was
+announced (development, standalone companion, or a broker the app could not
+create — today's copy, unchanged), `rotation` when brokered over a legacy item
+still to migrate, and `none` when brokered with nothing to migrate. Neither
+input can prompt: the announcement is an environment read and the legacy leg
+is the attribute probe above. `pairing` is the default before the first
+projection lands and whenever the companion cannot answer, so guidance is only
+ever withheld on a positive statement that it cannot apply. `node` survives
+only on the `pairing` path.
 
 ### Migration
 
@@ -284,6 +396,31 @@ signed build that includes `feat/swift-keychain-broker`:
 6. Deny-hazard regression: on the fresh account, the pairing step's
    in-ceremony guidance should now be unreachable (no dialog to answer);
    confirm the ceremony copy still renders correctly for legacy installs.
+7. **ACL reachability, app-minted item.** `runtime/bin/node` inside the
+   installed bundle must be able to read the `.app.v1` item **silently** —
+   this is what the Identity & Device Reset helper depends on, and it is the
+   half of `SecAccessCreate` that no unit test can prove. Run the packaged
+   node against `keytar.getPassword` for
+   `app-usagemonitor.contribution-device.app.v1` / `installation` and confirm
+   a value with no dialog.
+8. **`security` CLI deletability of the app-minted item.**
+   `/usr/bin/security delete-generic-password -s
+   app-usagemonitor.contribution-device.app.v1 -a installation` must succeed
+   without a prompt. **Expect this to fail.** securityd assigns the CLI the
+   `apple-tool:` partition, which is not in the `teamid:` partition list an
+   app-created item carries, so the attribute-addressed repair path — the one
+   that worked on 2026-08-10 precisely because it needed neither the binding
+   nor the ACL — may not reach the app generation at all. If it fails, the
+   app-side `SecItemDelete` over the broker must own the reset path before
+   ship, and the credential-reset route's attribute delete must stop being
+   treated as a sufficient cure for `.app.v1`. Check `find-generic-password`
+   (the presence probe, no `-w`/`-g`) separately: it is a different operation
+   and the legacy-probe gate depends on it answering honestly.
+9. Wedge regression: with the login keychain **locked**, run a credential
+   operation and confirm the companion reports
+   `contribution_device_credential_locked` promptly rather than hanging for
+   ten seconds and poisoning the channel — the observable proof that
+   `SecKeychainSetUserInteractionAllowed(false)` is in force.
 
 ## Shipped in this change (for reference)
 
