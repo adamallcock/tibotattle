@@ -2284,9 +2284,51 @@ test("the app Keychain broker mints the contribution credential app-side over th
   // provisioning-profile entitlement it requires.
   assert.match(brokerSource, /SecItemAdd\(/u);
   assert.match(brokerSource, /SecItemCopyMatching\(/u);
-  assert.match(brokerSource, /SecItemUpdate\(/u);
   assert.match(brokerSource, /SecItemDelete\(/u);
   assert.doesNotMatch(brokerSource, /kSecUseDataProtectionKeychain/u);
+  // Never SecItemUpdate: Apple's implementation answers an update that hits
+  // errSecVerifyFailed by recreating the item with a DEFAULT access control
+  // list (_ReplaceKeychainItem → SecKeychainItemCreateFromContent with
+  // initialAccess = NULL), silently dropping the node trusted-app entry the
+  // reset helper reads through. Every ~25-day rotation takes the duplicate
+  // path, so the replacement must be a delete followed by an add that carries
+  // the access object again.
+  assert.doesNotMatch(brokerSource, /SecItemUpdate\(/u);
+  assert.match(
+    brokerSource,
+    /guard status == errSecDuplicateItem else \{\s*return Self\.failureCode\(status\)\s*\}/u,
+  );
+  assert.match(
+    brokerSource,
+    /let removal = SecItemDelete\(baseQuery\(\) as CFDictionary\)[\s\S]*?let replacement = SecItemAdd\(attributes as CFDictionary, nil\)/u,
+  );
+
+  // No SecItem call may raise a dialog. This queue serializes reads, Keychain
+  // work, responses, and teardown, so a modal prompt would block the channel
+  // until the companion's timeout poisoned its transport permanently — the
+  // user answering correctly would find it already dead. Suppressed, those
+  // states return errSecInteractionNotAllowed and take the existing locked
+  // path instead.
+  assert.match(
+    brokerSource,
+    /SecKeychainSetUserInteractionAllowed\(false\)\s*\n\s*defer \{ SecKeychainSetUserInteractionAllowed\(true\) \}/u,
+  );
+  // Every SecItem call site sits after the withoutUserInteraction that opens
+  // its enclosing function, so none can be added outside the suppression.
+  for (const call of ["SecItemCopyMatching(", "SecItemAdd(", "SecItemDelete("]) {
+    let index = brokerSource.indexOf(call);
+    assert.notEqual(index, -1, call);
+    while (index !== -1) {
+      const preceding = brokerSource.slice(0, index);
+      assert.equal(
+        preceding.lastIndexOf("withoutUserInteraction")
+          > preceding.lastIndexOf("private func "),
+        true,
+        `${call} at ${index} is outside withoutUserInteraction`,
+      );
+      index = brokerSource.indexOf(call, index + call.length);
+    }
+  }
   // Items address only the app-managed service; the legacy `.v1` item is
   // structurally unreachable from app-side code.
   assert.match(brokerSource, /kSecAttrService as String: Self\.service/u);
