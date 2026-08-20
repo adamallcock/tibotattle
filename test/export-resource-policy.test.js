@@ -9,6 +9,7 @@ import {
   readBoundedUtf8Lines,
 } from "../src/bounded-jsonl.js";
 import {
+  DEFAULT_EXPORT_RESOURCE_LIMITS,
   ExportResourceLimitError,
   createExportResourceGuard,
   normalizeExportResourceLimits,
@@ -18,7 +19,51 @@ import {
 test("resource policy rejects unknown or invalid limits", () => {
   assert.throws(() => normalizeExportResourceLimits({ surprise: 1 }), /Unknown export resource limit/);
   assert.throws(() => normalizeExportResourceLimits({ maximumSourceFiles: 0 }), /positive safe integer/);
-  assert.throws(() => normalizeExportResourceLimits({ maximumSourceFiles: 5_001 }), /cannot exceed/);
+  assert.throws(() => normalizeExportResourceLimits({ maximumSourceFiles: 100_001 }), /cannot exceed/);
+  assert.throws(() => normalizeExportResourceLimits({ maximumDirectoryEntries: 100_001 }), /cannot exceed/);
+});
+
+test("the source-file ceiling admits a full local rollout corpus", () => {
+  // Raised 5_000 -> 100_000 on 2026-08-19: the owner's deduped Codex rollout
+  // corpus (active + archived, all of it inside the 365-day window) measured
+  // 4,880 files, i.e. 97.6% of the old ceiling. A source_files trip is a HARD
+  // accounting refresh failure -- accounting_scan_source_files_limit_exceeded
+  // is in neither ACCOUNTING_BUDGET_MISS_CODES nor the reader passthrough set
+  // -- so crossing it would have blanked the dashboard rather than degrading.
+  assert.equal(DEFAULT_EXPORT_RESOURCE_LIMITS.maximumSourceFiles, 100_000);
+
+  const guard = createExportResourceGuard({ clock: () => 0, rss: () => 0 });
+  guard.observeSourcePlan(4_880, 0);
+  assert.equal(guard.snapshot().counters.sourceFiles, 4_880);
+
+  const atCeiling = createExportResourceGuard({ clock: () => 0, rss: () => 0 });
+  atCeiling.observeSourcePlan(DEFAULT_EXPORT_RESOURCE_LIMITS.maximumSourceFiles, 0);
+  const above = createExportResourceGuard({ clock: () => 0, rss: () => 0 });
+  assert.throws(
+    () => above.observeSourcePlan(DEFAULT_EXPORT_RESOURCE_LIMITS.maximumSourceFiles + 1, 0),
+    (error) => error.code === "export_resource_source_files",
+  );
+});
+
+test("the directory-entry ceiling admits a full local rollout walk", () => {
+  // Raised 20_000 -> 100_000 alongside the source-file ceiling. Discovery
+  // charges EVERY entry of the walked tree, not just selected sources, so this
+  // is the bound that actually caps how large a corpus can be discovered: the
+  // owner's tree measured 4,984 entries against 4,880 selected rollouts.
+  assert.equal(DEFAULT_EXPORT_RESOURCE_LIMITS.maximumDirectoryEntries, 100_000);
+
+  const guard = createExportResourceGuard({ clock: () => 0, rss: () => 0 });
+  for (let index = 0; index < DEFAULT_EXPORT_RESOURCE_LIMITS.maximumDirectoryEntries; index += 1) {
+    guard.observeDirectoryEntry();
+  }
+  assert.equal(
+    guard.snapshot().counters.directoryEntries,
+    DEFAULT_EXPORT_RESOURCE_LIMITS.maximumDirectoryEntries,
+  );
+  assert.throws(
+    () => guard.observeDirectoryEntry(),
+    (error) => error.code === "export_resource_directory_entries",
+  );
 });
 
 test("resource guard enforces source, record, byte, elapsed, and RSS ceilings with safe codes", () => {

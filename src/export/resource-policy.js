@@ -2,8 +2,8 @@ export const EXPORT_RESOURCE_POLICY_VERSION = "g1-r3-candidate-0.5";
 
 export const DEFAULT_EXPORT_RESOURCE_LIMITS = Object.freeze({
   maximumCoveredDurationMs: 31 * 24 * 60 * 60 * 1_000,
-  maximumDirectoryEntries: 20_000,
-  maximumSourceFiles: 5_000,
+  maximumDirectoryEntries: 100_000,
+  maximumSourceFiles: 100_000,
   maximumSourceBytes: 32 * 1024 * 1024 * 1024,
   maximumLineBytes: 16 * 1024 * 1024,
   maximumOutputRecords: 100_000,

@@ -3226,6 +3226,45 @@ test("deep log scanning receives hard resource bounds and preserves the last cac
   assert.equal((await stat(cacheFile)).mode & 0o777, 0o600);
 });
 
+test("the deep-scan guard admits a full rollout corpus and still stops above the source-file ceiling", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-scan-files-"));
+  const cacheFile = join(directory, "accounting.json");
+
+  // The owner's deduped Codex rollout corpus measured 4,880 files; the ceiling
+  // was raised 5_000 -> 100_000 so a real corpus is admitted with headroom.
+  let admittedGuard = null;
+  await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
+    scan: async ({ resourceGuard }) => {
+      admittedGuard = resourceGuard;
+      resourceGuard.observeSourcePlan(4_880, 0);
+      return { diagnostics: {} };
+    },
+  });
+  assert.equal(admittedGuard?.counters.sourceFiles, 4_880);
+  const before = await readTestCache(cacheFile);
+
+  // Above the ceiling it still stops, and -- unlike the RSS soft miss -- a
+  // source_files trip is a hard failure that retains the prior cache intact.
+  await assert.rejects(
+    refreshReplaySafeAccountingCache({
+      cacheFile,
+      now: () => NOW + 1_000,
+      scan: async ({ resourceGuard }) => {
+        resourceGuard.observeSourcePlan(
+          resourceGuard.limits.maximumSourceFiles + 1,
+          0,
+        );
+        return { diagnostics: {} };
+      },
+    }),
+    (error) => error?.code === "accounting_scan_source_files_limit_exceeded",
+  );
+  assert.deepEqual(await readTestCache(cacheFile), before);
+  assert.equal((await stat(cacheFile)).mode & 0o777, 0o600);
+});
+
 test("an AbortSignal can interrupt cooperative derivation after a dense scan and preserves the last cache", async () => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-derive-abort-"));
   const cacheFile = join(directory, "accounting.json");
