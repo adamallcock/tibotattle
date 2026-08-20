@@ -6305,6 +6305,32 @@ test("live timeline couples quota-weighted usage to the matching allowance capac
     quotaCardsMatch[1],
     /data\.quotaWindows\.filter\(isPrimaryCodexQuotaWindow\)/u,
   );
+  // Owner-directed 2026-08-20: the Spark cards lead the row and the
+  // normal-Codex allowance follows. Pinned so the grouping is not quietly
+  // reverted to normal-first by a later edit.
+  assert.match(
+    quotaCardsMatch[1],
+    /const windows = \[\.\.\.sparkOrderedWindows, \.\.\.normalOrderedWindows\];/u,
+  );
+  // Within the Spark pair the order comes from the window duration, not from
+  // the provider's slot assignment, so five-hour precedes seven-day even if
+  // Spark's slots move again as they did on 2026-08-19.
+  const sparkSortMatch = quotaCardsMatch[1].match(
+    /const sparkOrderedWindows = \[\.\.\.sparkWindows\]\.sort\(([\s\S]*?)\);\n/u,
+  );
+  assert.ok(sparkSortMatch, "Spark card ordering is available for contract review");
+  const sparkComparator = new Function(
+    "finite",
+    `return ${sparkSortMatch[1]};`,
+  )(finite);
+  assert.deepEqual(
+    [
+      { durationMinutes: 10_080 },
+      { durationMinutes: 525_600 },
+      { durationMinutes: 300 },
+    ].sort(sparkComparator).map((window) => window.durationMinutes),
+    [300, 10_080, 525_600],
+  );
 });
 
 test("community UI stays focused on one reviewed destination", async () => {
