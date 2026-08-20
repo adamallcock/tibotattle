@@ -72,6 +72,35 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /Get-Content -LiteralPath \$productionBuildLog -Tail 200/u);
   assert.match(workflow, /Get-Content -LiteralPath \$qualificationBuildLog -Tail 200/u);
   assert.match(workflow, /Get-Content -LiteralPath \$portableLog -Tail 240/u);
+  const diagnosticStep = workflow.slice(
+    workflow.indexOf("- name: Run bounded Windows filesystem security diagnostic"),
+    workflow.indexOf("- name: Run portable Windows qualification"),
+  );
+  assert.match(
+    diagnosticStep,
+    /node --input-type=module -e/u,
+  );
+  assert.match(diagnosticStep, /runNodeTests/u);
+  assert.match(diagnosticStep, /test\/windows-filesystem-security\.test\.js/u);
+  assert.match(diagnosticStep, /timeoutMs: 120_000/u);
+  assert.match(diagnosticStep, /FIXED_STATUS/u);
+  assert.match(diagnosticStep, /WINDOWS_FILESYSTEM_SECURITY_DIAGNOSTIC_PASSED/u);
+  assert.match(diagnosticStep, /error\?\.code/u);
+  assert.match(diagnosticStep, /Object\.values\(FIXED_STATUS\)\.includes\(error\.code\)/u);
+  assert.match(diagnosticStep, /console\.error\(status\)/u);
+  assert.match(diagnosticStep, /process\.exitCode = 1/u);
+  assert.doesNotMatch(diagnosticStep, /continue-on-error/u);
+  assert.doesNotMatch(diagnosticStep, /Start-Process|taskkill|Get-Content|\/PID|process\.pid/u);
+  assert.ok(diagnosticStep.length > 0, "the bounded diagnostic must precede the official lane");
+  const portableStep = workflow.slice(
+    workflow.indexOf("- name: Run portable Windows qualification"),
+    workflow.indexOf("- name: Prepare disposable qualification state root"),
+  );
+  assert.match(portableStep, /pnpm test:portable/u);
+  assert.match(portableStep, /pnpm test:portable \*> \$portableLog/u);
+  assert.match(portableStep, /if \(\$LASTEXITCODE -ne 0\)/u);
+  assert.match(portableStep, /Get-Content -LiteralPath \$portableLog -Tail 240/u);
+  assert.doesNotMatch(portableStep, /Start-Process|taskkill|portableTimeout|USAGE_MONITOR_TEST_LANE_REPORTER=tap/u);
   assert.ok(
     workflow.indexOf("Run portable Windows qualification")
       < workflow.indexOf("Prepare disposable qualification state root"),
