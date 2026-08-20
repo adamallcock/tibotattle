@@ -34,12 +34,22 @@ test("provider fixtures retain exact named durations and admit a 30-day-like win
       ["codex", "secondary", "pro", 10_080],
       ["codex", "primary", "unknown", 43_200],
       ["codex_bengalfox", "primary", "unknown", 525_600],
+      // The Spark limit's re-introduced shape, exactly as observed on the
+      // wire 2026-08-19: the 5-hour window in the limit's primary slot with
+      // the Spark seven-day window alongside in secondary. Both durations
+      // survive normalization verbatim so display code can name them.
+      ["codex_bengalfox", "primary", "pro", 300],
+      ["codex_bengalfox", "secondary", "pro", 10_080],
     ],
   );
   assert.equal(Object.hasOwn(windows[2], "planVariant"), false);
   assert.equal(Object.hasOwn(windows[2], "multiplier"), false);
 
   const primary = selectPrimaryQuotaWindow(windows);
+  // The Spark limit's 300-minute window never joins the normal Codex
+  // allowance selection even from a primary slot: selection is bound to the
+  // "codex" limit id, not to slot names or durations.
+  assert.equal(primary?.limitId, "codex");
   assert.equal(primary?.windowDurationMins, 43_200);
   assert.equal(formatQuotaWindowDuration(primary.windowDurationMins), "30-day");
   assert.equal(
