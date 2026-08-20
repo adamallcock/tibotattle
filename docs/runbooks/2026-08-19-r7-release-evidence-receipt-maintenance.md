@@ -80,6 +80,107 @@ killed run must then be recovered (below) before any retry.
    `release_open` with every profile decision `unresolved` until the R7
    thresholds are formally resolved.
 
+## The workload binding is by content, not by execution
+
+This is the single most confusing property of these receipts, and it costs an
+hour every time somebody rediscovers it.
+
+`R7_RELEASE_EVIDENCE_WORKLOAD_SOURCE_SHA256` binds **342 files by content**:
+276 under `src/`, plus `packages/`, `scripts/`, `contracts/`, `schemas/`, two
+`generated/` artifacts, `package.json`, and the lockfiles. Editing any one of
+them invalidates every receipt — **whether or not the benchmark executes it**.
+
+The benchmark itself is narrow. All profiles run one worker,
+`scripts/r7-resource-benchmark-worker.js`, and its module graph is export-only:
+walking all 131 reachable modules turns up **no reference to
+`replay-safe-accounting-cache` or `local-archive-accounting-index`**. R7
+exercises source scan, export set materialize/verify, deletion, workspace
+discard, and Claude callback lifecycle. It does not exercise the accounting
+rebuild, the archive projection, or anything gated on
+`accountingSourceMode`.
+
+So "#48 turned R7 red" and "#48 changed an R7 number" are entirely different
+claims. The first is routine and expected — #48 edited
+`src/replay-safe-accounting-cache.js`, which is in the bound set. The second
+cannot happen, because no R7 profile runs that code. The same holds for #49.
+
+**Before attributing any metric shift to a commit, check that the benchmark
+actually reaches the changed code.** One command:
+
+```bash
+grep -rn "accounting" src/export-set-controller.js src/export-set-materializer.js \
+  src/export-set-verifier.js src/export-deletion.js src/export-source-plan.js
+```
+
+Silence means the export path never touches it, and the commit is not your
+explanation.
+
+## Peak RSS moves between regenerations without a code cause
+
+Regeneration `ce8267f` came in 10–21% higher on peak RSS in some
+`real-local-history` operations than its predecessor, while wall-clock and CPU
+went *down* and every determinism comparison matched. It is worth recording
+what that was **not**, because two independent readers first attributed it to
+#48's raised V8 old-space cap on the strength of a matching magnitude
+(a measured 128 MB against #48's documented ~123 MiB lazy-GC swing). That
+attribution was wrong: R7 never runs the code #48 changed, so the numeric
+agreement was a coincidence.
+
+It was also not corpus growth. Between the two runs `sourceFiles` moved 3020 →
+3025 and `sourceBytes` by **0.03%**, with `outputRecords` identical at 437,110.
+A 0.03% input change does not produce a 21% RSS change.
+
+No code cause exists, and that is verified rather than inferred. Intersecting
+the nine files changed between the two regenerations (`005c2b8..7e064f0`)
+against the 131 modules R7 actually executes gives an **empty set**: the changes
+were three workflow YAMLs, `scripts/publish-sparkle-update.js` and its test, and
+two accounting modules with their tests — none of them reachable from the
+benchmark worker. Reproduce with:
+
+```bash
+git diff --name-only <prev-regen> <this-regen>
+```
+
+and check each path against the worker's import graph before blaming any commit.
+
+What remains is environmental: ordinary run-to-run variance in a 26 GB streaming
+scan — GC timing and page-cache state — plausibly amplified by system memory
+pressure from other processes. Note that memory pressure genuinely *can* move
+peak RSS, which is exactly the axis on which concurrent load is worth
+suspecting; CPU contention is not (see below). The cheap discriminator, worth
+running before anyone sets thresholds but not before a release: re-run
+`real-local-history` alone on a quiet machine. If RSS returns to the earlier
+level it was pressure; if it stays high, something real is there to find.
+
+Practical consequence for whoever formally resolves the R7 thresholds: peak RSS
+carries real run-to-run spread that is not tied to any code change, so a
+threshold set flush against a single regeneration's numbers will be too tight.
+Set it against spread observed across several runs, not against one.
+
+## Interpreting a regeneration you did not run
+
+Compare a fresh receipt against its predecessor with
+`git show HEAD:generated/<file>` before assuming a run was contaminated:
+
+- **Wall-clock and `childCpuMs`** are the contention-sensitive fields. Real
+  contention skews them *consistently upward*. Deltas that scatter in both
+  directions — especially large negative ones — are ordinary run-to-run noise,
+  not another process stealing cycles.
+- **`determinism.comparisons`** and the `runProjectionSha256es` are
+  contention-independent: each profile runs the workload twice and compares
+  canonical projections. If those all say `matched`, the substantive content of
+  the receipt is intact whatever the machine was doing.
+- **Peak RSS** is the weakest signal of the three, and the easiest to
+  over-explain. It does not move because another process used CPU, but it does
+  move with GC timing, page-cache state, and system memory pressure, so it
+  carries real spread between runs with no code cause at all. If you reach for a
+  commit to explain an RSS step, first confirm the benchmark executes that
+  commit's code (see above) and that `sourceBytes`/`outputRecords` did not move.
+  A magnitude that happens to match a number in some commit message is not
+  evidence; that exact coincidence has already misled two readers once.
+- `materialized-boundaries` records all-zero metrics by design
+  (`not_run_profile`); it is not evidence of a failed run.
+
 ## Merge discipline
 
 A branch-side regeneration certifies that branch's tree only. Merging with a
