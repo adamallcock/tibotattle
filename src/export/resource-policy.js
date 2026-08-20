@@ -41,14 +41,38 @@ const SAFE_CODES = new Set([
   "rss",
 ]);
 
+/**
+ * The complete, closed vocabulary of `error.code` values this policy can raise.
+ * Downstream allowlists derive their membership test from this rather than
+ * restating it, so a new bound cannot be added here and silently fail to be
+ * relayable by the surfaces that report it.
+ */
+export const EXPORT_RESOURCE_FAILURE_CODES = Object.freeze(
+  [...SAFE_CODES].map((code) => `export_resource_${code}`).sort(),
+);
+
 const TRUSTED_RESOURCE_LIMIT_ERRORS = new WeakSet();
 
+function measurement(value, name) {
+  if (value === null || value === undefined) return null;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`Export resource ${name} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
 export class ExportResourceLimitError extends Error {
-  constructor(code) {
+  constructor(code, { observed = null, limit = null } = {}) {
     if (!SAFE_CODES.has(code)) throw new TypeError("Unknown export resource failure code");
     super(`Local export stopped at the ${code} resource limit`);
     this.name = "ExportResourceLimitError";
     this.code = `export_resource_${code}`;
+    // The bare code and the two counts are the whole of what this error knows.
+    // No path, no source content, and no identifier can reach them, so a
+    // caller may relay them into a diagnostics receipt verbatim.
+    this.resourceCode = code;
+    this.observed = measurement(observed, "observed value");
+    this.limit = measurement(limit, "limit");
     if (new.target === ExportResourceLimitError) TRUSTED_RESOURCE_LIMIT_ERRORS.add(this);
   }
 
@@ -63,6 +87,20 @@ Object.defineProperty(ExportResourceLimitError, "isTrustedExact", {
   writable: false,
   configurable: false,
 });
+
+/**
+ * Every bound in this module is a comparison of one count against one ceiling.
+ * Raising the failure through here keeps both numbers attached to the code.
+ *
+ * `observed` is the counter's value at the moment the bound was crossed, not
+ * the total the run would eventually have reached: an accumulating counter
+ * stops on its first increment past the ceiling, so the two numbers are
+ * normally close together however far over the whole selection would have gone.
+ * They identify the bound and prove the crossing; they do not size the overage.
+ */
+function exceeded(code, observed, limit) {
+  return new ExportResourceLimitError(code, { observed, limit });
+}
 
 function boundedInteger(value, name, { allowZero = false } = {}) {
   if (!Number.isSafeInteger(value) || value < (allowZero ? 0 : 1)) {
@@ -132,17 +170,29 @@ function normalizeInitialUsage(value, limits, scope) {
     throw new TypeError("Initial oversized irrelevant line count cannot exceed line count");
   }
   const { maximumRecords, maximumBytes } = outputLimitsForScope(limits, scope);
-  if (normalized.sourceFiles > limits.maximumSourceFiles) throw new ExportResourceLimitError("source_files");
-  if (normalized.sourceBytes > limits.maximumSourceBytes) throw new ExportResourceLimitError("source_bytes");
-  if (normalized.directoryEntries > limits.maximumDirectoryEntries) {
-    throw new ExportResourceLimitError("directory_entries");
+  if (normalized.sourceFiles > limits.maximumSourceFiles) {
+    throw exceeded("source_files", normalized.sourceFiles, limits.maximumSourceFiles);
   }
-  if (normalized.outputRecords > maximumRecords) throw new ExportResourceLimitError("output_records");
-  if (normalized.expandedRecordBytes > maximumBytes) throw new ExportResourceLimitError("expanded_record_bytes");
-  if (normalized.cumulativeElapsedMs > limits.maximumElapsedMs) throw new ExportResourceLimitError("elapsed_time");
-  if (normalized.peakRssBytes > limits.maximumRssBytes) throw new ExportResourceLimitError("rss");
+  if (normalized.sourceBytes > limits.maximumSourceBytes) {
+    throw exceeded("source_bytes", normalized.sourceBytes, limits.maximumSourceBytes);
+  }
+  if (normalized.directoryEntries > limits.maximumDirectoryEntries) {
+    throw exceeded("directory_entries", normalized.directoryEntries, limits.maximumDirectoryEntries);
+  }
+  if (normalized.outputRecords > maximumRecords) {
+    throw exceeded("output_records", normalized.outputRecords, maximumRecords);
+  }
+  if (normalized.expandedRecordBytes > maximumBytes) {
+    throw exceeded("expanded_record_bytes", normalized.expandedRecordBytes, maximumBytes);
+  }
+  if (normalized.cumulativeElapsedMs > limits.maximumElapsedMs) {
+    throw exceeded("elapsed_time", normalized.cumulativeElapsedMs, limits.maximumElapsedMs);
+  }
+  if (normalized.peakRssBytes > limits.maximumRssBytes) {
+    throw exceeded("rss", normalized.peakRssBytes, limits.maximumRssBytes);
+  }
   if (normalized.workspaceHighWaterBytes > limits.maximumWorkspaceBytes) {
-    throw new ExportResourceLimitError("workspace_bytes");
+    throw exceeded("workspace_bytes", normalized.workspaceHighWaterBytes, limits.maximumWorkspaceBytes);
   }
   return normalized;
 }
@@ -217,12 +267,18 @@ export function createExportResourceGuard({
   }
 
   function checkRuntime() {
-    if (cumulativeElapsedMs() > limits.maximumElapsedMs) {
-      throw new ExportResourceLimitError("elapsed_time");
+    const elapsed = cumulativeElapsedMs();
+    if (elapsed > limits.maximumElapsedMs) {
+      throw exceeded("elapsed_time", elapsed, limits.maximumElapsedMs);
     }
     const currentRss = rss();
-    if (!Number.isFinite(currentRss) || currentRss < 0 || currentRss > limits.maximumRssBytes) {
-      throw new ExportResourceLimitError("rss");
+    if (!Number.isFinite(currentRss) || currentRss < 0) throw new ExportResourceLimitError("rss");
+    if (currentRss > limits.maximumRssBytes) {
+      const observed = Math.ceil(currentRss);
+      // An unrepresentable reading still stops the run; it just cannot say how far over.
+      throw Number.isSafeInteger(observed)
+        ? exceeded("rss", observed, limits.maximumRssBytes)
+        : new ExportResourceLimitError("rss");
     }
     peakRssBytes = Math.max(peakRssBytes, Math.ceil(currentRss));
   }
@@ -230,8 +286,12 @@ export function createExportResourceGuard({
   function assertSourceSelection(fileCount, byteCount) {
     boundedInteger(fileCount, "source file count", { allowZero: true });
     boundedInteger(byteCount, "source byte count", { allowZero: true });
-    if (fileCount > limits.maximumSourceFiles) throw new ExportResourceLimitError("source_files");
-    if (byteCount > limits.maximumSourceBytes) throw new ExportResourceLimitError("source_bytes");
+    if (fileCount > limits.maximumSourceFiles) {
+      throw exceeded("source_files", fileCount, limits.maximumSourceFiles);
+    }
+    if (byteCount > limits.maximumSourceBytes) {
+      throw exceeded("source_bytes", byteCount, limits.maximumSourceBytes);
+    }
     checkRuntime();
   }
 
@@ -240,9 +300,14 @@ export function createExportResourceGuard({
     limits,
     counters,
     assertCoveredInterval(startMs, endMs) {
-      if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs
-          || endMs - startMs > limits.maximumCoveredDurationMs) {
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) {
         throw new ExportResourceLimitError("covered_duration");
+      }
+      const durationMs = endMs - startMs;
+      if (durationMs > limits.maximumCoveredDurationMs) {
+        throw Number.isSafeInteger(durationMs)
+          ? exceeded("covered_duration", durationMs, limits.maximumCoveredDurationMs)
+          : new ExportResourceLimitError("covered_duration");
       }
       checkRuntime();
     },
@@ -261,7 +326,7 @@ export function createExportResourceGuard({
     observeDirectoryEntry() {
       counters.directoryEntries += 1;
       if (counters.directoryEntries > limits.maximumDirectoryEntries) {
-        throw new ExportResourceLimitError("directory_entries");
+        throw exceeded("directory_entries", counters.directoryEntries, limits.maximumDirectoryEntries);
       }
       checkRuntime();
     },
@@ -276,14 +341,18 @@ export function createExportResourceGuard({
       }
       counters.sourceFiles += 1;
       counters.sourceBytes += byteCount;
-      if (counters.sourceFiles > limits.maximumSourceFiles) throw new ExportResourceLimitError("source_files");
-      if (counters.sourceBytes > limits.maximumSourceBytes) throw new ExportResourceLimitError("source_bytes");
+      if (counters.sourceFiles > limits.maximumSourceFiles) {
+        throw exceeded("source_files", counters.sourceFiles, limits.maximumSourceFiles);
+      }
+      if (counters.sourceBytes > limits.maximumSourceBytes) {
+        throw exceeded("source_bytes", counters.sourceBytes, limits.maximumSourceBytes);
+      }
       checkRuntime();
     },
     observeLine(byteCount, { oversizedIrrelevant = false } = {}) {
       boundedInteger(byteCount, "line byte count", { allowZero: true });
       if (byteCount > limits.maximumLineBytes && !oversizedIrrelevant) {
-        throw new ExportResourceLimitError("line_bytes");
+        throw exceeded("line_bytes", byteCount, limits.maximumLineBytes);
       }
       counters.lines += 1;
       if (oversizedIrrelevant) counters.oversizedIrrelevantLines += 1;
@@ -294,10 +363,10 @@ export function createExportResourceGuard({
       counters.outputRecords += 1;
       counters.expandedRecordBytes += byteCount;
       if (counters.outputRecords > outputLimits.maximumRecords) {
-        throw new ExportResourceLimitError("output_records");
+        throw exceeded("output_records", counters.outputRecords, outputLimits.maximumRecords);
       }
       if (counters.expandedRecordBytes > outputLimits.maximumBytes) {
-        throw new ExportResourceLimitError("expanded_record_bytes");
+        throw exceeded("expanded_record_bytes", counters.expandedRecordBytes, outputLimits.maximumBytes);
       }
       checkRuntime();
     },
@@ -309,15 +378,19 @@ export function createExportResourceGuard({
       }
       counters.outputRecords = recordCount;
       counters.expandedRecordBytes = byteCount;
-      if (recordCount > outputLimits.maximumRecords) throw new ExportResourceLimitError("output_records");
-      if (byteCount > outputLimits.maximumBytes) throw new ExportResourceLimitError("expanded_record_bytes");
+      if (recordCount > outputLimits.maximumRecords) {
+        throw exceeded("output_records", recordCount, outputLimits.maximumRecords);
+      }
+      if (byteCount > outputLimits.maximumBytes) {
+        throw exceeded("expanded_record_bytes", byteCount, outputLimits.maximumBytes);
+      }
       checkRuntime();
     },
     observeCanonicalBundle(byteCount) {
       boundedInteger(byteCount, "canonical bundle byte count");
       counters.canonicalBundleBytes = byteCount;
       if (byteCount > limits.maximumCanonicalBundleBytes) {
-        throw new ExportResourceLimitError("canonical_bundle_bytes");
+        throw exceeded("canonical_bundle_bytes", byteCount, limits.maximumCanonicalBundleBytes);
       }
       checkRuntime();
     },
@@ -325,7 +398,7 @@ export function createExportResourceGuard({
       boundedInteger(byteCount, "encoded artifact byte count");
       counters.encodedArtifactBytes = byteCount;
       if (byteCount > limits.maximumEncodedArtifactBytes) {
-        throw new ExportResourceLimitError("encoded_artifact_bytes");
+        throw exceeded("encoded_artifact_bytes", byteCount, limits.maximumEncodedArtifactBytes);
       }
       checkRuntime();
     },
@@ -335,10 +408,10 @@ export function createExportResourceGuard({
       counters.exportSetDecodedBytes = decodedByteCount;
       counters.exportSetEncodedBytes = encodedByteCount;
       if (decodedByteCount > limits.maximumExportSetDecodedBytes) {
-        throw new ExportResourceLimitError("export_set_decoded_bytes");
+        throw exceeded("export_set_decoded_bytes", decodedByteCount, limits.maximumExportSetDecodedBytes);
       }
       if (encodedByteCount > limits.maximumExportSetEncodedBytes) {
-        throw new ExportResourceLimitError("export_set_encoded_bytes");
+        throw exceeded("export_set_encoded_bytes", encodedByteCount, limits.maximumExportSetEncodedBytes);
       }
       checkRuntime();
     },
@@ -346,7 +419,9 @@ export function createExportResourceGuard({
       boundedInteger(byteCount, "workspace byte count", { allowZero: true });
       workspaceHighWaterBytes = Math.max(workspaceHighWaterBytes, byteCount);
       counters.workspaceBytes = workspaceHighWaterBytes;
-      if (workspaceHighWaterBytes > limits.maximumWorkspaceBytes) throw new ExportResourceLimitError("workspace_bytes");
+      if (workspaceHighWaterBytes > limits.maximumWorkspaceBytes) {
+        throw exceeded("workspace_bytes", workspaceHighWaterBytes, limits.maximumWorkspaceBytes);
+      }
       checkRuntime();
     },
     reserveRecovery(count = 1) {
@@ -360,12 +435,14 @@ export function createExportResourceGuard({
     observeManifest(byteCount) {
       boundedInteger(byteCount, "manifest byte count");
       counters.manifestBytes = byteCount;
-      if (byteCount > limits.maximumManifestBytes) throw new ExportResourceLimitError("manifest_bytes");
+      if (byteCount > limits.maximumManifestBytes) {
+        throw exceeded("manifest_bytes", byteCount, limits.maximumManifestBytes);
+      }
       checkRuntime();
     },
     observeChunkCount(count) {
       boundedInteger(count, "chunk count", { allowZero: true });
-      if (count > limits.maximumChunks) throw new ExportResourceLimitError("chunk_count");
+      if (count > limits.maximumChunks) throw exceeded("chunk_count", count, limits.maximumChunks);
       checkRuntime();
     },
     checkRuntime,

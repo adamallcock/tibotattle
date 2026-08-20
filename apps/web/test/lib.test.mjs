@@ -3514,8 +3514,48 @@ test("local contribution preparation exposes only verified bounded results", asy
     failureClient.prepareContribution(),
     (error) => error.code === "identity_unavailable"
       && error.message === "Request failed (503)."
+      && error.detail === null
       && !JSON.stringify(error).includes(privateCanary)
   );
+
+  // export_too_large classifies a whole family of ceilings. The bound the
+  // companion named must reach the reader's error, and nothing else may.
+  const boundedClient = (detail) => new LocalCompanionClient({
+    fetchImpl: async () => new Response(JSON.stringify({
+      schemaVersion: "local-contribution-preparation-error-v0.1",
+      status: "failed",
+      errorCode: "export_too_large",
+      detail,
+      privatePath: privateCanary
+    }), {
+      status: 413,
+      headers: { "Content-Type": "application/json" }
+    })
+  });
+  await assert.rejects(
+    boundedClient({
+      code: "export_resource_expanded_record_bytes",
+      observed: 33_554_645,
+      limit: 33_554_432
+    }).prepareContribution(),
+    (error) => error.code === "export_too_large"
+      && error.detail.code === "export_resource_expanded_record_bytes"
+      && error.detail.observed === 33_554_645
+      && error.detail.limit === 33_554_432
+      && !JSON.stringify(error).includes(privateCanary)
+  );
+  for (const hostile of [
+    { code: `Failed reading ${privateCanary}`, observed: 2, limit: 1 },
+    { code: 42 },
+    null
+  ]) {
+    await assert.rejects(
+      boundedClient(hostile).prepareContribution(),
+      (error) => error.code === "export_too_large"
+        && error.detail === null
+        && !JSON.stringify(error).includes(privateCanary)
+    );
+  }
 });
 
 test("community adapter separates cookie sessions from one-use upload authority", async () => {
@@ -6400,6 +6440,21 @@ test("the invisible review bootstrap keeps fixed lookbacks and fails dense days 
     appSource,
     /Even the latest hour exceeded a fixed reviewed-set safety bound\. Nothing was truncated or uploaded\./u,
   );
+  // The reader is told which bound refused it, not only that one did.
+  assert.match(appSource, /The reference names which bound it was\./u);
+  // Narrowing changes what is being approved a review OF. Measured against one
+  // heavy local day the busiest single hour alone was 83.0 MB of records
+  // against the 32 MiB bound, so the narrowed attempt is a second chance and
+  // not a window known to fit — either way the reader is told it happened.
+  assert.match(appSource, /incrementalReviewNarrowedToLatestHour = true;/u);
+  assert.match(
+    appSource,
+    /showIncrementalReviewStatusKey\(incrementalReviewNarrowedToLatestHour\s*\n\s*\? "syncStatus\.summaryVerifiedNarrowed"\s*\n\s*: "syncStatus\.summaryVerified"\)/u,
+  );
+  assert.match(
+    translate("syncStatus.summaryVerifiedNarrowed"),
+    /this review covers the latest hour instead/u,
+  );
 });
 
 test("return visits schedule one bounded checkpoint refresh after cached results render", async () => {
@@ -7137,6 +7192,38 @@ test("diagnostic notes are recorded through a fixed, bounded local route", async
     requestId: "",
   });
 
+  // A coarse code is worth little to whoever reads the reference later, so the
+  // specific bound behind it travels too — under the same shape test, and only
+  // when there is one to send.
+  await client.recordDiagnosticNote({
+    reference: "TT-4HJ7M2",
+    surface: "contribution_prepare",
+    code: "export_too_large",
+    detail: "export_resource_expanded_record_bytes",
+    requestId: "",
+  });
+  assert.deepEqual(JSON.parse(calls[2].options.body), {
+    reference: "TT-4HJ7M2",
+    surface: "contribution_prepare",
+    code: "export_too_large",
+    detail: "export_resource_expanded_record_bytes",
+    requestId: "",
+  });
+  for (const detail of ["", "Failed reading /Users/private/state.json", 42]) {
+    await client.recordDiagnosticNote({
+      reference: "TT-4HJ7M3",
+      surface: "contribution_prepare",
+      code: "export_too_large",
+      detail,
+      requestId: "",
+    });
+    assert.equal(
+      Object.hasOwn(JSON.parse(calls.at(-1).options.body), "detail"),
+      false,
+    );
+  }
+
+  const callsBeforeInvalid = calls.length;
   for (const invalid of [
     { reference: "nope", surface: "contribution_send" },
     { reference: "TT-7QF3K2", surface: "Not A Surface" },
@@ -7147,7 +7234,7 @@ test("diagnostic notes are recorded through a fixed, bounded local route", async
       /Diagnostic note inputs are invalid/u,
     );
   }
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, callsBeforeInvalid);
 
   assert.deepEqual(
     normalizeLocalDiagnosticNote({
@@ -7841,9 +7928,15 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
   assert.match(describe, /const reference = createDiagnosticReference\(\);/u);
   assert.match(describe, /const code = diagnosticErrorCode\(error\?\.code\);/u);
   assert.match(describe, /const requestId = serviceRequestId\(error\?\.requestId\);/u);
+  // A code that classifies a family of causes is filed with the specific one
+  // when the failure knew it, so the reference is worth looking up.
   assert.match(
     describe,
-    /localClient\.recordDiagnosticNote\(\{\s*\n\s*reference,\s*\n\s*surface: diagnosticSurface\(surface\),/u,
+    /const detailCode = diagnosticErrorCode\(error\?\.detail\?\.code\);/u,
+  );
+  assert.match(
+    describe,
+    /localClient\.recordDiagnosticNote\(\{\s*\n\s*reference,\s*\n\s*surface: diagnosticSurface\(surface\),\s*\n\s*code,\s*\n\s*detail: detailCode,/u,
   );
   assert.match(describe, /const recorded = await localClient\.recordDiagnosticNote/u);
   assert.match(describe, /writtenToLocalLog = recorded\?\.status === "recorded"/u);
