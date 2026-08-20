@@ -75,12 +75,14 @@ function simulatedWindowsStore({ mismatchedReadIdentity = false } = {}) {
     sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
     companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
+    preparedArtifactContractVersion: "windows-prepared-artifact-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
     companionInstanceMutexSafe: false,
     credentialAuditFileGuardSafe: true,
     sqliteStateLeaseSafe: false,
+    preparedArtifactSafe: false,
     inspectPath(path) {
       const entry = entries.get(path);
       if (!entry) throw windowsError("NOT_FOUND");
@@ -149,6 +151,18 @@ function simulatedWindowsStore({ mismatchedReadIdentity = false } = {}) {
       entry.identity = windowsIdentity(nextIdentity++);
       return entry.identity;
     },
+    // Prepared-artifact methods are outside this fixture's scope; provide
+    // valid contract doubles so adapter construction still exercises the
+    // branded native boundary used by the renewal tests.
+    inspectPreparedChild: () => ({ identity: WINDOWS_ROOT_IDENTITY }),
+    ensurePreparedDirectory: () => WINDOWS_ROOT_IDENTITY,
+    enumeratePreparedDirectory: () => [],
+    removePreparedDirectory: () => ({ removed: true, identity: WINDOWS_ROOT_IDENTITY }),
+    renamePreparedDirectory: () => ({ renamed: true, identity: WINDOWS_ROOT_IDENTITY }),
+    createPreparedFile: () => WINDOWS_ROOT_IDENTITY,
+    readPreparedFile: () => ({ data: Buffer.from("data"), identity: WINDOWS_ROOT_IDENTITY }),
+    deletePreparedFile: () => ({ deleted: true, identity: WINDOWS_ROOT_IDENTITY }),
+    publishPreparedFile: () => ({ published: true, identity: WINDOWS_ROOT_IDENTITY }),
     acquireSqliteStateLease() {
       return {
         lease: {},
