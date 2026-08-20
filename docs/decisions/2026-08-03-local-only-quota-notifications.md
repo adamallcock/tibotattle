@@ -115,6 +115,24 @@ notification-center adapters. Automated tests use fakes only and never submit a
 real macOS notification. Human release verification still needs one explicit
 macOS permission/Settings exercise with a controlled fresh provider refresh.
 
+## 2026-08-19 Spark coexistence amendment
+
+The eligible `account/rateLimits/read` receipt has carried the separate Spark
+allowance limit (`codex_bengalfox` on the wire, `codex-spark` reserved)
+alongside the codex limit in every live snapshot since 2026-07-23. The
+original projection treated any non-codex window as an unknown
+classification and suppressed the whole receipt, which silently disabled
+fresh-quota notifications for every affected account from the feature's
+first day.
+
+Notification evidence is now derived from the codex limit's windows alone. A
+recognized Spark window in the same receipt is passed over — it is a separate
+pool the notification says nothing about, and its fields are not held to the
+codex window rules — while a malformed entry or a limit id that is neither
+codex nor Spark still suppresses the receipt, and a receipt with no valid
+codex windows still yields no evidence. Threshold semantics, the continuity
+key, freshness rules, and the native contract are unchanged.
+
 ## 2026-08-04 hardening amendment
 
 Each local companion refresh now receives an opaque UUID run token. The native

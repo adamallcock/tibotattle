@@ -1297,6 +1297,121 @@ test("fresh direct app-server records expose a closed local notification project
   );
 });
 
+test("Spark windows in a fresh snapshot leave the codex notification evidence intact", () => {
+  const codexLimit = {
+    limitId: "codex",
+    planType: "pro",
+    primary: { usedPercent: 84, windowDurationMins: 300, resetsAt: 1784768400 },
+    secondary: { usedPercent: 21, windowDurationMins: 10080, resetsAt: 1785369600 },
+  };
+  // The Spark limit's re-introduced two-slot shape, exactly as observed on
+  // the wire 2026-08-19: the 5-hour window in the limit's primary slot with
+  // the Spark seven-day window alongside in secondary. Both durations mirror
+  // the codex ones, so only the limit id separates the pools.
+  const sparkLimit = {
+    limitId: "codex_bengalfox",
+    planType: "pro",
+    primary: { usedPercent: 0, windowDurationMins: 300, resetsAt: 1787201379 },
+    secondary: { usedPercent: 0, windowDurationMins: 10080, resetsAt: 1787788179 },
+  };
+  // The Spark shape live from 2026-07-23 to 2026-08-19: one 365-day window
+  // under a provider-private plan label that normalizes to "unknown". Every
+  // numeric and plan rule the codex windows must satisfy fails here, which is
+  // exactly why holding Spark windows to those rules suppressed evidence.
+  const earlySparkLimit = {
+    limitId: "codex_bengalfox",
+    planType: "provider-private-plan",
+    primary: { usedPercent: 40, windowDurationMins: 525600, resetsAt: 1817001960 },
+    secondary: null,
+  };
+  const recordWith = (byLimitId, canonical = codexLimit) => appServerSnapshotRecord({
+    accountScope: {
+      status: "available",
+      reason: null,
+      version: "openai-account-v1",
+      scopeId: `openai-account:v1:${"B".repeat(43)}`,
+      planType: "pro",
+    },
+    canonical,
+    byLimitId,
+  }, {
+    source: "app_server_read",
+    receivedAt: "2026-07-23T00:00:00.000Z",
+  });
+
+  const record = recordWith({ codex: codexLimit, codex_bengalfox: sparkLimit });
+  assert.equal(record.windows.length, 4);
+  const evidence = notificationEvidenceFromAppServerRecord(record);
+  assert.deepEqual(evidence, {
+    schemaVersion: "tibotattle-notification-evidence-v2",
+    status: "fresh_provider_observation",
+    provider: "openai_codex",
+    source: "app_server_read",
+    freshness: "fresh",
+    observedAt: "2026-07-23T00:00:00.000Z",
+    continuityKey: evidence.continuityKey,
+    windows: [{
+      lane: "primary",
+      usedPercent: 84,
+      durationMinutes: 300,
+      resetAt: new Date(1784768400 * 1_000).toISOString(),
+      resetProofKind: "provider_reported_schedule_only",
+    }, {
+      lane: "secondary",
+      usedPercent: 21,
+      durationMinutes: 10080,
+      resetAt: new Date(1785369600 * 1_000).toISOString(),
+      resetProofKind: "provider_reported_schedule_only",
+    }],
+  });
+  assert.equal(JSON.stringify(evidence).includes("bengalfox"), false);
+  assert.notEqual(
+    notificationEvidenceFromAppServerRecord(
+      recordWith({ codex: codexLimit, codex_bengalfox: earlySparkLimit }),
+    ),
+    null,
+  );
+  assert.notEqual(
+    notificationEvidenceFromAppServerRecord(
+      recordWith({ codex: codexLimit, "codex-spark": sparkLimit }),
+    ),
+    null,
+  );
+  // A Spark-only snapshot has no codex windows to be evidence about.
+  assert.equal(
+    notificationEvidenceFromAppServerRecord(
+      recordWith({ codex_bengalfox: sparkLimit }, sparkLimit),
+    ),
+    null,
+  );
+  // The fail-closed posture survives for genuinely unfamiliar limit ids and
+  // for corrupted entries; only the recognized Spark pool is passed over.
+  assert.equal(
+    notificationEvidenceFromAppServerRecord(
+      recordWith({ codex: codexLimit, codex_quokka: { ...sparkLimit, limitId: "codex_quokka" } }),
+    ),
+    null,
+  );
+  const sparkWindow = record.windows.find((window) => window.limitId === "codex_bengalfox");
+  assert.equal(
+    notificationEvidenceFromAppServerRecord({
+      ...record,
+      windows: [...record.windows, { ...sparkWindow, provider: "unknown" }],
+    }),
+    null,
+  );
+  // An invalid codex window still suppresses even with Spark alongside.
+  assert.equal(
+    notificationEvidenceFromAppServerRecord({
+      ...record,
+      windows: record.windows.map((window) => (window.limitId === "codex" && window.slot === "primary"
+        ? { ...window, windowDurationMins: 60 }
+        : window)),
+    }),
+    null,
+  );
+});
+
 test("a fresh app-server account marker provisionally scopes only new nearby rollout events", async () => {
   const fixture = await collectorFixture();
   const accountSecret = Buffer.alloc(32, 81);
@@ -1342,6 +1457,62 @@ test("a fresh app-server account marker provisionally scopes only new nearby rol
     assert.equal(JSON.stringify(records).includes("private.owner"), false);
     assert.equal(JSON.stringify(records).includes(accountSecret.toString("base64url")), false);
     assert.equal((await readFile(fixture.checkpointFile, "utf8")).includes(accountSecret.toString("base64url")), false);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("a refresh whose snapshot carries Spark windows still exposes notification evidence", async () => {
+  const fixture = await collectorFixture();
+  const accountSecret = Buffer.alloc(32, 82);
+  class SparkClient {
+    async start() {}
+    async readRateLimits() {
+      return {
+        rateLimits: {
+          limitId: "codex",
+          planType: "pro",
+          primary: { usedPercent: 61, windowDurationMins: 10080, resetsAt: 1784854800 },
+          secondary: null,
+        },
+        rateLimitsByLimitId: {
+          codex_bengalfox: {
+            limitId: "codex_bengalfox",
+            planType: "pro",
+            primary: { usedPercent: 0, windowDurationMins: 300, resetsAt: 1787201379 },
+            secondary: { usedPercent: 0, windowDurationMins: 10080, resetsAt: 1787788179 },
+          },
+        },
+      };
+    }
+    async readAccount() { return { account: { email: "spark.owner@example.test", planType: "pro" } }; }
+    async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+    close() {}
+  }
+  try {
+    const result = await runCollectorOnce({
+      ...fixture,
+      staleAfterMs: 0,
+      appServerFactory: () => new SparkClient(),
+      loadAccountObservationSecret: async () => Buffer.from(accountSecret),
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+    });
+    assert.equal(result.refresh.recordWritten, true);
+    assert.deepEqual(
+      result.refresh.notificationEvidence?.windows.map(
+        (window) => [window.lane, window.durationMinutes, window.usedPercent],
+      ),
+      [["primary", 10_080, 61]],
+    );
+    assert.equal(JSON.stringify(result.refresh.notificationEvidence).includes("bengalfox"), false);
+    // The evidence projection narrows; the committed record still archives
+    // the Spark windows themselves.
+    const records = await readLines(fixture.dataFile);
+    const snapshot = records.find((record) => record.kind === "codex_quota_snapshot");
+    assert.deepEqual(
+      snapshot.windows.map((window) => [window.limitId, window.slot]),
+      [["codex", "primary"], ["codex_bengalfox", "primary"], ["codex_bengalfox", "secondary"]],
+    );
   } finally {
     await rm(fixture.root, { recursive: true });
   }
