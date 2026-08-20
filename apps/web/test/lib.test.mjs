@@ -6738,8 +6738,10 @@ test("the community journey states its stages and gates effort behind sign-in an
   );
   // Re-pinned 2026-08-08 (one-step flow): journey.community.connectNext left
   // with the connect step; the signed-in state points straight at the single
-  // Review-and-approve action, and waitingIndex covers a companion that has
-  // not advertised the v1.0 transport yet.
+  // Review-and-approve action. Re-pinned 2026-08-20: waitingIndex now covers
+  // only a companion that ANSWERED and reports a service without the transport
+  // — an unanswered companion has its own two lines, held to the same bar by
+  // the unanswered-health test below.
   for (const locale of SUPPORTED_LOCALES) {
     for (const key of [
       "journey.index.complete",
@@ -11843,4 +11845,518 @@ test("first-sign-in mint reproduces AUTH_REQUIRED and the relay bridge closes it
       "a fresh process starts with no captured session",
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// A companion health answer is not a constant of the page's lifetime (launch
+// blocker, reproduced on a fresh macOS account 2026-08-20). The companion
+// derives `capabilities.incrementalContributionSync` per request from the
+// unified index, so a bootstrap read taken during first-run indexing answers a
+// truthful `false` — or, having lost the race outright, does not answer at all.
+// Read once and never again, either answer latched the approve ceremony out of
+// the document for the life of the page, with no error, no retry, and a
+// journey line blaming an index that had already finished.
+// ---------------------------------------------------------------------------
+
+const ADVERTISED_HEALTH = Object.freeze({
+  capabilities: Object.freeze({
+    contributionDevicePairing: true,
+    incrementalContributionSync: "telemetry-contribution-v1.0",
+  }),
+});
+// The same companion, answering mid-index: a service is configured, the upload
+// source is not written yet, so the transport is honestly absent for now.
+const INDEXING_HEALTH = Object.freeze({
+  capabilities: Object.freeze({
+    contributionDevicePairing: true,
+    incrementalContributionSync: false,
+  }),
+});
+
+async function loadCompanionHealthRecovery(harness) {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const slice = (startMarker, endMarker) => {
+    const start = appSource.indexOf(startMarker);
+    assert.ok(start >= 0, `the slice starting at ${startMarker} is available`);
+    const end = appSource.indexOf(endMarker, start + startMarker.length);
+    assert.ok(end > start, `the slice ending at ${endMarker} is available`);
+    return appSource.slice(start, end);
+  };
+  // The real gates, the real recovery, and the real poll scheduler — the whole
+  // point is that the capability predicate reads the payload the recovery
+  // stored, so a stub of either would prove nothing.
+  const section = [
+    slice(
+      "// Whether this build is paired with a hosted contribution service at all.",
+      "\n/**",
+    ),
+    slice(
+      "// The incremental full-history contribution contract this dashboard is ready",
+      "\n/**\n * Whether the service refused this Mac's uploads",
+    ),
+    slice(
+      "// The live-progress poll behind the first pass",
+      "\nasync function freshReviewTokenForApproval(",
+    ),
+  ].join("\n\n");
+  // The two surfaces the reader actually sees, taken from the same source
+  // rather than restated here: whether the approve ceremony is in the document
+  // at all, and which sentence step 2 of the journey prints. A test that only
+  // watched the re-fetch happen would pass while the page stayed broken.
+  const consentVisibility = slice(
+    '  const surface = $("#incremental-consent");',
+    '\n  const approve = $("#incremental-consent-approve");',
+  );
+  const journeyChain = slice(
+    "  if (localCompanionHealthUnknown()) {",
+    "\n}\n\n// The incremental full-history contribution contract",
+  );
+
+  harness.healthReads = 0;
+  harness.onboardingReads = 0;
+  harness.identityRenders = 0;
+  harness.actionRenders = 0;
+  harness.onboardingRenders = [];
+  const pending = [];
+  const windowRef = {
+    setTimeout(callback) {
+      pending.push(callback);
+      return pending.length;
+    },
+  };
+  // Deterministic time: the poll is a chained setTimeout, so the test advances
+  // it one link at a time and lets the async chain behind each link settle.
+  harness.runScheduledPoll = async () => {
+    const callback = pending.shift();
+    assert.ok(callback, "a recovery poll was scheduled");
+    callback();
+    for (let turn = 0; turn < 5; turn += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  };
+  harness.pollsPending = () => pending.length;
+
+  const localClient = {
+    async health() {
+      harness.healthReads += 1;
+      const answer = harness.healthAnswers.shift() ?? null;
+      if (answer === null) throw new Error("the companion did not answer");
+      return answer;
+    },
+    async onboarding() {
+      harness.onboardingReads += 1;
+      // The real client never rejects: a failed read normalizes to exactly the
+      // shape a companion with no readable Codex home reports.
+      return harness.onboardingAnswers.shift() ?? { state: "unavailable" };
+    },
+  };
+
+  // The approve ceremony ships hidden in the markup, so this is the state the
+  // reader is in before anything renders.
+  harness.consentSurface = { hidden: true };
+  harness.journeyKeys = [];
+
+  return Function(
+    "harness", "window", "localClient", "renderHostedIdentity", "fetch",
+    "normalizeIncrementalContributionSyncStatus", "boundedOutcomeDetailCode",
+    `let localCompanionHealth = harness.health;
+let localOnboarding = harness.onboarding;
+let incrementalSyncPollTimer = null;
+let incrementalSyncPollCount = 0;
+let incrementalSyncStatus = null;
+let incrementalConsentApproved = false;
+let incrementalSyncLastOutcomeDetailCode = null;
+function renderLocalOnboarding(value) {
+  localOnboarding = value;
+  harness.onboardingRenders.push(value?.state ?? null);
+}
+function $() { return harness.consentSurface; }
+function communityUploadAuthorityEvidence() { return false; }
+function incrementalUploadAuthorityLost() { return false; }
+function hostedEnrollmentIsPaused() { return false; }
+function hostedSignInRequired() { return harness.signInRequired === true; }
+function renderIncrementalConsentVisibility() {
+${consentVisibility}
+}
+function renderCommunityJourneyStage() {
+  const stage = (name, state, key) => { harness.journeyKeys.push(key); };
+${journeyChain}
+}
+// The real pair, in the real order: the ceremony's own visibility rule and the
+// journey's own stage chain.
+function renderContributionActionState() {
+  harness.actionRenders += 1;
+  if (harness.failNextRender) {
+    harness.failNextRender = false;
+    throw new Error("a render fault");
+  }
+  renderIncrementalConsentVisibility();
+  renderCommunityJourneyStage();
+}
+${section}
+return {
+  loadIncrementalSyncStatus,
+  scheduleIncrementalSyncStatusPoll,
+  incrementalSyncPollWorthwhile,
+  incrementalSyncCapabilityAdvertised,
+  incrementalSyncCapabilitySettled,
+  localCompanionHealthUnknown,
+  localCompanionRecoveryActive,
+  localOnboardingUnsettled,
+  exhaustRecoveryBudget() { incrementalSyncPollCount = INCREMENTAL_SYNC_POLL_LIMIT; },
+  state: () => ({
+    health: localCompanionHealth,
+    onboardingState: localOnboarding?.state ?? null,
+    pollScheduled: incrementalSyncPollTimer !== null,
+    pollCount: incrementalSyncPollCount,
+    // What the reader can see: is the approve ceremony in the document, and
+    // which sentence does journey step 2 currently print?
+    ceremonyVisible: harness.consentSurface.hidden === false,
+    journeyKey: harness.journeyKeys.at(-1) ?? null,
+  }),
+};`,
+  )(
+    harness,
+    windowRef,
+    localClient,
+    () => { harness.identityRenders += 1; },
+    async () => ({ ok: true, json: async () => ({}) }),
+    () => harness.normalizedStatus ?? null,
+    () => null,
+  );
+}
+
+test("the ceremony and the journey heal themselves from a health read that never landed", async () => {
+  const harness = {
+    // The launch-blocker state exactly: the FIRST read, at app launch against a
+    // companion busy building its first index, did not land at all.
+    health: null,
+    onboarding: { state: "ready" },
+    // The companion stays too busy to answer for one more read, then answers
+    // mid-index, then answers carrying the transport.
+    healthAnswers: [null, INDEXING_HEALTH, ADVERTISED_HEALTH],
+    onboardingAnswers: [],
+    normalizedStatus: {
+      status: "available",
+      paused: false,
+      running: false,
+      progress: null,
+      consent: { approved: false, current: false },
+    },
+  };
+  const scope = await loadCompanionHealthRecovery(harness);
+  assert.equal(scope.localCompanionHealthUnknown(), true);
+  assert.equal(scope.state().ceremonyVisible, false, "the markup ships it hidden");
+
+  // The bootstrap's own consent read is the entry point, and it is reached on
+  // both dashboard paths. It used to return at the capability gate WITHOUT
+  // re-reading and WITHOUT scheduling anything — the health-derived capability
+  // gated its own cure, so null health disabled recovery permanently.
+  await scope.loadIncrementalSyncStatus();
+  assert.equal(harness.healthReads, 1, "unknown health is re-read, not assumed absent");
+  assert.equal(
+    scope.incrementalSyncCapabilitySettled(),
+    false,
+    "a false the unified index has not settled yet is neither an advertisement nor an absence",
+  );
+  // The degraded first paint, stated honestly rather than blamed on the index.
+  assert.equal(scope.state().ceremonyVisible, false);
+  assert.equal(scope.state().journeyKey, "journey.community.waitingHealth");
+  assert.equal(scope.state().pollScheduled, true, "and the recovery poll is alive in this state");
+
+  // From here on NOTHING but the clock runs: no reload, no navigation, no click,
+  // no second loadLocalDashboard. Only the chained poll fires.
+  await harness.runScheduledPoll();
+  // The companion is heard for the first time, still mid-index. NOW the index
+  // is honestly what the reader is waiting on, and only now may the line say so.
+  assert.equal(scope.state().journeyKey, "journey.community.waitingIndex");
+  assert.equal(scope.state().ceremonyVisible, false);
+  assert.equal(scope.state().pollScheduled, true);
+
+  await harness.runScheduledPoll();
+
+  assert.equal(harness.healthReads, 3);
+  assert.equal(
+    scope.state().ceremonyVisible,
+    true,
+    "the approve ceremony enters the document by itself",
+  );
+  assert.equal(
+    scope.state().journeyKey,
+    "journey.community.approveNext",
+    "and step 2 points at the action that is now really available",
+  );
+  // The whole sequence in order: unheard companion, heard companion mid-index,
+  // approve. The index is never blamed while the companion was the unknown.
+  assert.equal(harness.journeyKeys[0], "journey.community.waitingHealth");
+  assert.equal(
+    harness.journeyKeys.indexOf("journey.community.waitingHealth")
+      < harness.journeyKeys.indexOf("journey.community.waitingIndex"),
+    true,
+  );
+  assert.equal(
+    harness.identityRenders,
+    2,
+    "the sign-in controls are re-rendered on both changes rather than left disabled",
+  );
+  // Recovery is over, so the cycle stops rather than polling an idle page, and
+  // the reads it spent waiting do not come out of the live-progress budget.
+  assert.equal(scope.state().pollCount, 0);
+  assert.equal(scope.state().pollScheduled, false);
+  assert.equal(harness.pollsPending(), 0);
+});
+
+test("the recovery poll is not gated on the capability it is recovering", async () => {
+  // The self-deadlock guard, stated as its own claim: with health unknown and
+  // the ceremony hidden, the poll that performs the re-read must still be
+  // worthwhile — otherwise the cure is disabled by the disease.
+  const harness = {
+    health: null,
+    onboarding: { state: "ready" },
+    healthAnswers: [],
+    onboardingAnswers: [],
+  };
+  const scope = await loadCompanionHealthRecovery(harness);
+  assert.equal(scope.incrementalSyncCapabilityAdvertised(), false);
+  assert.equal(
+    scope.incrementalSyncPollWorthwhile(),
+    true,
+    "an unsettled companion read is itself movement worth polling for",
+  );
+  // Approval is the other half of the old gate, and an unrecovered page can
+  // never have it: the poll must not require it either.
+  scope.scheduleIncrementalSyncStatusPoll();
+  assert.equal(scope.state().pollScheduled, true);
+
+  // The entry point the harness cannot reach: whichever way the dashboard load
+  // ends, it must start the chain, because a fresh install with an unheard
+  // companion takes the failing path and has no other way in.
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const loadLocalDashboard = appSource.slice(
+    appSource.indexOf("async function loadLocalDashboard() {"),
+    appSource.indexOf("\n// The \"preparation identity\" Keychain notice"),
+  );
+  assert.ok(loadLocalDashboard.length > 0, "the dashboard load is available");
+  assert.equal(
+    loadLocalDashboard.match(/await loadIncrementalSyncStatus\(\);/gu)?.length,
+    2,
+    "both the loaded and the companion-unavailable paths start the recovery chain",
+  );
+  // And the gate that returns early must schedule before it does, or the first
+  // pass is the last one.
+  assert.match(
+    appSource,
+    /if \(!incrementalSyncCapabilityAdvertised\(\)\) \{[\s\S]{0,600}?scheduleIncrementalSyncStatusPoll\(\);\s*\n\s*return;/u,
+  );
+});
+
+test("a poll link that throws re-arms the chain instead of stranding the page", async () => {
+  const harness = {
+    health: null,
+    onboarding: { state: "ready" },
+    healthAnswers: [null, null, ADVERTISED_HEALTH],
+    onboardingAnswers: [],
+    normalizedStatus: {
+      status: "available",
+      paused: false,
+      running: false,
+      progress: null,
+      consent: { approved: false, current: false },
+    },
+  };
+  const scope = await loadCompanionHealthRecovery(harness);
+  await scope.loadIncrementalSyncStatus();
+  assert.equal(scope.state().pollScheduled, true);
+
+  // One render fault on the way through — the kind a torn-down node produces.
+  // The chain must survive it, because it is the only thing that will ever
+  // re-read the health this page is stuck without.
+  harness.failNextRender = true;
+  await harness.runScheduledPoll();
+  assert.equal(
+    scope.state().pollScheduled,
+    true,
+    "the chain re-arms rather than dying on one bad link",
+  );
+
+  await harness.runScheduledPoll();
+  assert.equal(scope.state().ceremonyVisible, true, "and the page still heals");
+});
+
+test("health that stays unknown retries quietly and never downgrades an answer that landed", async () => {
+  const harness = {
+    health: null,
+    onboarding: { state: "ready" },
+    // Four consecutive unanswered reads, then the transport.
+    healthAnswers: [null, null, null, ADVERTISED_HEALTH],
+    onboardingAnswers: [],
+    normalizedStatus: {
+      status: "available",
+      paused: false,
+      running: false,
+      progress: null,
+      consent: { approved: false, current: false },
+    },
+  };
+  const scope = await loadCompanionHealthRecovery(harness);
+  await scope.loadIncrementalSyncStatus();
+  await harness.runScheduledPoll();
+  await harness.runScheduledPoll();
+  assert.equal(harness.healthReads, 3);
+  assert.equal(
+    harness.identityRenders,
+    0,
+    "an unknown that stays unknown produces no churn on screen",
+  );
+  assert.equal(harness.actionRenders, 3, "only the unchanged gate state is redrawn");
+  assert.equal(scope.state().pollScheduled, true, "and the page keeps asking");
+
+  await harness.runScheduledPoll();
+  assert.equal(scope.incrementalSyncCapabilityAdvertised(), true);
+
+  // A later transient failure may not un-advertise a transport the companion
+  // confirmed: the recovery only ever replaces an answer with a better one.
+  harness.healthAnswers.push(null);
+  await scope.loadIncrementalSyncStatus();
+  assert.equal(scope.incrementalSyncCapabilityAdvertised(), true);
+  assert.equal(scope.state().health, ADVERTISED_HEALTH);
+});
+
+test("the onboarding verdict latches the analysis button the same way and recovers the same way", async () => {
+  const harness = {
+    // Health is fine here; the read that failed is the one that decides whether
+    // Analyze/Update local usage is clickable at all.
+    health: ADVERTISED_HEALTH,
+    onboarding: { state: "unavailable" },
+    healthAnswers: [],
+    onboardingAnswers: [{ state: "unavailable" }, { state: "ready" }],
+    normalizedStatus: {
+      status: "available",
+      paused: false,
+      running: false,
+      progress: null,
+      consent: { approved: false, current: false },
+    },
+  };
+  const scope = await loadCompanionHealthRecovery(harness);
+  assert.equal(scope.localOnboardingUnsettled(), true);
+
+  await scope.loadIncrementalSyncStatus();
+  assert.equal(harness.healthReads, 0, "a settled health answer is not re-read");
+  assert.equal(harness.onboardingReads, 1);
+  assert.deepEqual(
+    harness.onboardingRenders,
+    [],
+    "an unavailable verdict that repeats is not redrawn",
+  );
+  assert.equal(scope.state().pollScheduled, true);
+
+  await harness.runScheduledPoll();
+  assert.equal(scope.state().onboardingState, "ready");
+  assert.deepEqual(harness.onboardingRenders, ["ready"]);
+  assert.equal(scope.localOnboardingUnsettled(), false);
+});
+
+// ---------------------------------------------------------------------------
+// The step-2 line under an unanswered companion. "Approval opens once the
+// local index is ready" was rendered live on 2026-08-20 with the index already
+// complete: the copy named the one thing that was NOT the blocker, and the
+// reader had no way to tell a build without the v1.0 transport from a health
+// read that never landed.
+// ---------------------------------------------------------------------------
+
+async function communityJourneyStageFor(facts) {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("  if (localCompanionHealthUnknown()) {");
+  const end = appSource.indexOf(
+    "\n}\n\n// The incremental full-history contribution contract",
+  );
+  assert.ok(start >= 0 && end > start, "the community journey stage chain is available");
+  const chain = appSource.slice(start, end);
+  const staged = [];
+  Function(
+    "facts", "stage",
+    `function localCompanionHealthUnknown() { return facts.healthUnknown; }
+function localCompanionRecoveryActive() { return facts.recoveryActive; }
+function contributionServiceConfigured() { return facts.serviceConfigured; }
+function incrementalSyncCapabilityAdvertised() { return facts.advertised; }
+function communityUploadAuthorityEvidence() { return facts.uploadAuthority === true; }
+function incrementalUploadAuthorityLost() { return false; }
+function hostedEnrollmentIsPaused() { return false; }
+function hostedSignInRequired() { return facts.signInRequired === true; }
+const incrementalConsentApproved = facts.approved === true;
+${chain}`,
+  )(facts, (name, state, key) => staged.push({ name, state, key }));
+  assert.equal(staged.length, 1, "the chain states exactly one community stage");
+  return staged[0];
+}
+
+test("the journey names the unanswered health, never an index that is not the blocker", async () => {
+  const retrying = await communityJourneyStageFor({
+    healthUnknown: true,
+    recoveryActive: true,
+    serviceConfigured: false,
+    advertised: false,
+  });
+  const givenUp = await communityJourneyStageFor({
+    healthUnknown: true,
+    recoveryActive: false,
+    serviceConfigured: false,
+    advertised: false,
+  });
+  // The companion answered, reports a service, and derives the transport flag
+  // from the unified index — the one branch where the index really is what the
+  // reader is waiting on.
+  const indexPending = await communityJourneyStageFor({
+    healthUnknown: false,
+    recoveryActive: true,
+    serviceConfigured: true,
+    advertised: false,
+  });
+
+  assert.equal(retrying.key, "journey.community.waitingHealth");
+  assert.equal(givenUp.key, "journey.community.noHealthAnswer");
+  assert.equal(indexPending.key, "journey.community.waitingIndex");
+  assert.equal(
+    new Set([retrying.key, givenUp.key, indexPending.key]).size,
+    3,
+    "unknown health, a spent retry budget, and a pending index are three states",
+  );
+  for (const stage of [retrying, givenUp, indexPending]) {
+    assert.equal(stage.state, "waiting");
+  }
+
+  // The word for "index" in each shipped language: the unknown-health lines may
+  // never contain it, and each must read differently from the index line.
+  const indexWord = { "en-US": /index/iu, "zh-Hans": /索引/u, es: /índice/iu };
+  for (const locale of SUPPORTED_LOCALES) {
+    const indexCopy = translate(indexPending.key, {}, locale);
+    assert.match(indexCopy, indexWord[locale], `${locale} index copy names the index`);
+    for (const key of [retrying.key, givenUp.key]) {
+      const copy = translate(key, {}, locale);
+      assert.ok(copy.length > 0 && copy.length <= 90, `${locale} ${key} stays short: ${copy}`);
+      assert.notEqual(copy, indexCopy, `${locale} ${key} is not the index sentence`);
+      assert.doesNotMatch(
+        copy,
+        indexWord[locale],
+        `${locale} ${key} must not blame the index`,
+      );
+    }
+    // Only the line backed by a budgeted retry may promise one.
+    assert.notEqual(
+      translate(retrying.key, {}, locale),
+      translate(givenUp.key, {}, locale),
+      `${locale} distinguishes a retry that is coming from one that is not`,
+    );
+  }
+
+  // The retired line claimed the Mac app itself was missing, on a page the Mac
+  // app is serving.
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const localizationSource = await readFile(
+    new URL("../public/localization.js", import.meta.url),
+    "utf8",
+  );
+  assert.doesNotMatch(appSource, /journey\.community\.waitingCompanion/u);
+  assert.doesNotMatch(localizationSource, /journey\.community\.waitingCompanion/u);
 });

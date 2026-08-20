@@ -941,10 +941,20 @@ export const WEB_MESSAGES = Object.freeze({
     "正在等待第一次本地分析。",
     "A la espera del primer análisis local.",
   ],
-  "journey.community.waitingCompanion": [
-    "Waiting for the Mac app first.",
-    "请先等待 Mac 应用。",
-    "Primero se espera la app para Mac.",
+  // The companion's health answer, not the companion itself: this page is
+  // served BY the Mac app, so a line about waiting for the Mac app describes
+  // something the reader can see is untrue. These two state the real fact —
+  // no answer to a status check yet — and differ on the one thing the reader
+  // can act on: whether another attempt is still coming.
+  "journey.community.waitingHealth": [
+    "The Mac app has not answered a status check yet. Checking again.",
+    "Mac 应用尚未响应状态检查。正在重新检查。",
+    "La app para Mac aún no responde a una comprobación de estado. Reintentando.",
+  ],
+  "journey.community.noHealthAnswer": [
+    "The Mac app has not answered a status check. Reload to try again.",
+    "Mac 应用未响应状态检查。请重新加载页面再试。",
+    "La app para Mac no respondió a una comprobación de estado. Recarga para reintentar.",
   ],
   "journey.community.noService": [
     "This build has no contribution service.",
