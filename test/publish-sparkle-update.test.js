@@ -35,6 +35,10 @@ const DOGFOOD_CHANNEL = getReleaseChannel("internal-dogfood");
 const TEST_PUBLIC_ED_KEY_SHA256 = sha256(
   Buffer.from(TEST_PUBLIC_ED_KEY, "base64"),
 );
+// The reviewed bound on the publisher's Wrangler retry. It is restated here
+// rather than imported so that widening the publisher's budget has to be
+// reviewed against these specs instead of silently relaxing them.
+const WRANGLER_ATTEMPT_BOUND = 3;
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -45,6 +49,9 @@ async function publishSparkleUpdate(options) {
     atomicAppcastGuard: options.atomicAppcastGuard
       ?? options.runWrangler?.atomicAppcastGuard
       ?? null,
+    // Specs assert the bounded Wrangler retry by attempt count, never by
+    // elapsed time, so the backoff is waived unless a spec records it.
+    sleep: async () => {},
     stableBootstrap: true,
     ...options,
   });
@@ -288,6 +295,71 @@ function statefulRemoteObjectRunner({
   const runner = { calls, objects: remoteObjects, run };
   run.atomicAppcastGuard = createTestAtomicAppcastGuard(runner);
   return runner;
+}
+
+// The literal stderr the pinned Wrangler emits for an absent R2 object: SGR
+// coloured even when stderr is a pipe, with one sentence as the whole missing
+// object signal.
+const WRANGLER_MISSING_OBJECT_STDERR =
+  "\u001B[31m✘ \u001B[41;31m[\u001B[41;97mERROR\u001B[41;31m]\u001B[0m"
+  + " \u001B[1mThe specified key does not exist.\u001B[0m\n";
+// The literal output of the expired-token race that hard-failed four
+// consecutive dogfood publishes: Wrangler refreshes its hour-long OAuth access
+// token while the R2 request it already issued is in flight, and that request
+// answers 401 before the refreshed token lands. The debug-level `.env file not
+// found` notice rides along in stdout whenever WRANGLER_LOG is raised, and is
+// the reason the missing-object classifier may not match a bare "not found".
+const WRANGLER_EXPIRED_TOKEN_STDOUT =
+  ".env file not found at \"/repo/.env\". Continuing...\n"
+  + " wrangler 4.114.0\nDownloading \"object\" from \"bucket\".\n";
+
+function wranglerExpiredTokenStderr(objectPath) {
+  return "\u001B[31m✘ \u001B[41;31m[\u001B[41;97mERROR\u001B[41;31m]\u001B[0m"
+    + ` \u001B[1mFailed to fetch /accounts/account/r2/buckets/${objectPath}`
+    + " - 401: Unauthorized;\u001B[0m\n\n"
+    + "  {\"result\":null,\"success\":false,\"errors\":"
+    + "[{\"code\":10000,\"message\":\"Authentication error\"}],\"messages\":[]}\n";
+}
+
+/**
+ * A stateful runner that answers reads the way the real Wrangler does: an
+ * absent object gets the coloured missing-object sentence, and the first
+ * `readFailures` reads of a key get the expired-token 401 instead.
+ */
+function wranglerFaultRunner({
+  objects = new Map(),
+  readFailures = new Map(),
+} = {}) {
+  const inner = statefulRemoteObjectRunner({ objects });
+  const remaining = new Map(readFailures);
+  const run = async (arguments_) => {
+    const objectPath = arguments_.at(3);
+    if (arguments_.at(2) === "get") {
+      const pending = remaining.get(objectPath) ?? 0;
+      if (pending > 0) {
+        remaining.set(objectPath, pending - 1);
+        inner.calls.push(arguments_);
+        return {
+          status: 1,
+          stdout: WRANGLER_EXPIRED_TOKEN_STDOUT,
+          stderr: wranglerExpiredTokenStderr(objectPath),
+        };
+      }
+      if (!inner.objects.has(objectPath)) {
+        inner.calls.push(arguments_);
+        return { status: 1, stdout: "", stderr: WRANGLER_MISSING_OBJECT_STDERR };
+      }
+    }
+    return inner.run(arguments_);
+  };
+  run.atomicAppcastGuard = inner.run.atomicAppcastGuard;
+  return { calls: inner.calls, objects: inner.objects, run };
+}
+
+function objectPathCallCount(runner, operation, objectPath) {
+  return runner.calls.filter(
+    (call) => call[2] === operation && call[3] === objectPath,
+  ).length;
 }
 
 function createTestAtomicAppcastGuard(runner, { beforeCompare = null } = {}) {
@@ -1041,14 +1113,217 @@ test("rejects a concurrent appcast change through the owner atomic guard", async
   }
 });
 
+test("retries a transient Wrangler read failure and publishes", async () => {
+  const fixture = await createReleaseFixture();
+  const digest = sha256(fixture.dmgBytes);
+  const artifactObjectPath = `${APPROVED_R2_BUCKET}/releases/1/${digest}/${RELEASE_MANIFEST.macOS.arm64DmgFileName}`;
+  const runner = wranglerFaultRunner({
+    readFailures: new Map([[artifactObjectPath, 1]]),
+  });
+  const publicReadback = publicReadbackFixture(fixture);
+  const delays = [];
+  try {
+    const publication = await publishSparkleUpdate({
+      appcastPath: fixture.appcastPath,
+      bucket: APPROVED_R2_BUCKET,
+      channel: "stable",
+      dmgPath: fixture.dmgPath,
+      publish: true,
+      releaseManifestPath: fixture.releaseManifestPath,
+      sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+      runWrangler: runner.run,
+      sleep: async (milliseconds) => { delays.push(milliseconds); },
+      fetchPublic: publicReadback.fetch,
+      validateDMG: async () => {},
+    });
+    assert.equal(publication.published, true);
+    assert.equal(publication.status, "published");
+    assert.equal(objectPathCallCount(runner, "get", artifactObjectPath), 2);
+    assert.equal(delays.length, 1);
+    assert.ok(delays[0] > 0);
+    assert.deepEqual(runner.objects.get(artifactObjectPath), fixture.dmgBytes);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("returns a reported missing object without spending a retry", async () => {
+  const fixture = await createReleaseFixture();
+  const digest = sha256(fixture.dmgBytes);
+  const artifactObjectPath = `${APPROVED_R2_BUCKET}/releases/1/${digest}/${RELEASE_MANIFEST.macOS.arm64DmgFileName}`;
+  const manifestObjectPath = `${APPROVED_R2_BUCKET}/releases/1/${digest}/release-manifest.json`;
+  const appcastObjectPath = `${APPROVED_R2_BUCKET}/appcast.xml`;
+  const runner = wranglerFaultRunner();
+  const publicReadback = publicReadbackFixture(fixture);
+  const delays = [];
+  try {
+    const publication = await publishSparkleUpdate({
+      appcastPath: fixture.appcastPath,
+      bucket: APPROVED_R2_BUCKET,
+      channel: "stable",
+      dmgPath: fixture.dmgPath,
+      publish: true,
+      releaseManifestPath: fixture.releaseManifestPath,
+      sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+      runWrangler: runner.run,
+      sleep: async (milliseconds) => { delays.push(milliseconds); },
+      fetchPublic: publicReadback.fetch,
+      validateDMG: async () => {},
+    });
+    assert.equal(publication.published, true);
+    // A first publish of a new version reads every object before it exists.
+    // Wrangler's coloured missing-object sentence is an answer, not a fault:
+    // each read resolves on its first attempt and never waits.
+    assert.equal(objectPathCallCount(runner, "get", artifactObjectPath), 1);
+    assert.equal(objectPathCallCount(runner, "get", manifestObjectPath), 1);
+    // The appcast is read once for the preflight state and once again
+    // immediately before the guarded write.
+    assert.equal(objectPathCallCount(runner, "get", appcastObjectPath), 2);
+    assert.deepEqual(delays, []);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("fails closed with Wrangler's own output after a bounded retry", async () => {
+  const fixture = await createReleaseFixture();
+  const digest = sha256(fixture.dmgBytes);
+  const artifactObjectPath = `${APPROVED_R2_BUCKET}/releases/1/${digest}/${RELEASE_MANIFEST.macOS.arm64DmgFileName}`;
+  const runner = wranglerFaultRunner({
+    readFailures: new Map([[artifactObjectPath, Number.MAX_SAFE_INTEGER]]),
+  });
+  const delays = [];
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        publish: true,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: runner.run,
+        sleep: async (milliseconds) => { delays.push(milliseconds); },
+        validateDMG: async () => {},
+      }),
+      (error) => {
+        assert.equal(error.code, "SPARKLE_UPDATE_WRANGLER_FAILED");
+        // The whole diagnosis, quoted: four masked occurrences of this exact
+        // fault produced no evidence at all.
+        assert.match(error.message, /status 1/u);
+        assert.match(error.message, /401: Unauthorized/u);
+        assert.match(error.message, /Authentication error/u);
+        assert.match(error.message, /\.env file not found/u);
+        assert.ok(error.message.includes(artifactObjectPath));
+        // Wrangler colours its output; the quoted text is readable.
+        assert.equal(error.message.includes("\u001B["), false);
+        return true;
+      },
+    );
+    // Bounded: the read stops after the reviewed budget, and the unrelated
+    // `.env file not found` line in Wrangler's stdout is never mistaken for a
+    // missing object, which would have let the publish upload over it.
+    assert.equal(
+      objectPathCallCount(runner, "get", artifactObjectPath),
+      WRANGLER_ATTEMPT_BOUND,
+    );
+    assert.equal(delays.length, WRANGLER_ATTEMPT_BOUND - 1);
+    assert.ok(delays[1] > delays[0]);
+    assert.equal(runner.calls.some((call) => call[2] === "put"), false);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("retries a transient Wrangler upload failure and publishes", async () => {
+  const fixture = await createReleaseFixture();
+  const digest = sha256(fixture.dmgBytes);
+  const manifestObjectPath = `${APPROVED_R2_BUCKET}/releases/1/${digest}/release-manifest.json`;
+  const runner = statefulRemoteObjectRunner({
+    failures: new Map([[manifestObjectPath, 1]]),
+  });
+  const publicReadback = publicReadbackFixture(fixture);
+  try {
+    const publication = await publishSparkleUpdate({
+      appcastPath: fixture.appcastPath,
+      bucket: APPROVED_R2_BUCKET,
+      channel: "stable",
+      dmgPath: fixture.dmgPath,
+      publish: true,
+      releaseManifestPath: fixture.releaseManifestPath,
+      sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+      runWrangler: runner.run,
+      fetchPublic: publicReadback.fetch,
+      validateDMG: async () => {},
+    });
+    assert.equal(publication.published, true);
+    assert.equal(objectPathCallCount(runner, "put", manifestObjectPath), 2);
+    assert.deepEqual(
+      runner.objects.get(manifestObjectPath),
+      await readFile(fixture.releaseManifestPath),
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("never quotes the owner guard secret in a Wrangler diagnostic", async () => {
+  const fixture = await createReleaseFixture();
+  const secret = "o".repeat(48);
+  const runner = statefulRemoteObjectRunner();
+  const leakingRunner = async (arguments_) => {
+    runner.calls.push(arguments_);
+    return {
+      status: 1,
+      stdout: "",
+      stderr: `wrangler echoed ${process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV]}`,
+    };
+  };
+  leakingRunner.atomicAppcastGuard = runner.run.atomicAppcastGuard;
+  const restore = process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV];
+  process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV] = secret;
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        publish: true,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: leakingRunner,
+        validateDMG: async () => {},
+      }),
+      (error) => {
+        assert.equal(error.code, "SPARKLE_UPDATE_WRANGLER_FAILED");
+        assert.equal(error.message.includes(secret), false);
+        assert.match(error.message, /\[redacted\]/u);
+        return true;
+      },
+    );
+  } finally {
+    if (restore === undefined) {
+      delete process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV];
+    } else {
+      process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV] = restore;
+    }
+    await fixture.cleanup();
+  }
+});
+
 test("retries after an artifact-only partial publication and resumes missing work", async () => {
   const fixture = await createReleaseFixture();
   const digest = sha256(fixture.dmgBytes);
   const artifactObjectPath = `${APPROVED_R2_BUCKET}/releases/1/${digest}/${RELEASE_MANIFEST.macOS.arm64DmgFileName}`;
   const manifestObjectPath = `${APPROVED_R2_BUCKET}/releases/1/${digest}/release-manifest.json`;
   const appcastObjectPath = `${APPROVED_R2_BUCKET}/appcast.xml`;
+  // The upload must fail on every attempt of the bounded Wrangler retry, or
+  // the publish would recover instead of stranding the partial publication
+  // this spec resumes from.
   const runner = statefulRemoteObjectRunner({
-    failures: new Map([[manifestObjectPath, 1]]),
+    failures: new Map([[manifestObjectPath, WRANGLER_ATTEMPT_BOUND]]),
   });
   const publicReadback = publicReadbackFixture(fixture);
   const options = {
@@ -1076,7 +1351,15 @@ test("retries after an artifact-only partial publication and resumes missing wor
     assert.equal(publication.status, "published");
     assert.deepEqual(
       runner.calls.filter((call) => call[2] === "put").map((call) => call[3]),
-      [artifactObjectPath, manifestObjectPath, manifestObjectPath, appcastObjectPath],
+      [
+        artifactObjectPath,
+        ...Array.from(
+          { length: WRANGLER_ATTEMPT_BOUND },
+          () => manifestObjectPath,
+        ),
+        manifestObjectPath,
+        appcastObjectPath,
+      ],
     );
   } finally {
     await fixture.cleanup();
