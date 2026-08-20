@@ -276,6 +276,28 @@ export const WEB_MESSAGES = Object.freeze({
     "更完整的成本核算重建已连续推迟 {count} 次，因为它会使应用超出内存上限。应用会自动重试；重启菜单栏应用可释放内存，通常能让下一次尝试完成。",
     "La reconstrucción más completa de la contabilidad de costes se ha pospuesto {count} veces seguidas porque llevaría la aplicación más allá de su límite de memoria. Se reintenta automáticamente; reiniciar la aplicación de la barra de menús libera memoria y normalmente permite completar el siguiente intento.",
   ],
+  // Quiet informational label on figures served from the previous app
+  // version's cache while the current version's local rebuild is still
+  // running. Deliberately not alert-styled: the numbers are the user's own
+  // history, merely computed by the prior semantics, and the recalculation is
+  // automatic. The "retrying" variant appears once the rebuild has deferred
+  // repeatedly, wiring the live rebuild state into the same label instead of
+  // adding a second banner.
+  "accounting.staleServe.recalculating": [
+    "Computed by the previous version — recalculating now.",
+    "由先前版本计算——正在重新计算。",
+    "Calculado por la versión anterior — recalculando ahora.",
+  ],
+  "accounting.staleServe.retrying": [
+    "Computed by the previous version — the recalculation is being retried.",
+    "由先前版本计算——正在重试重新计算。",
+    "Calculado por la versión anterior — se está reintentando el recálculo.",
+  ],
+  "accounting.staleServe.metricLabel": [
+    "API-price equivalent (previous version)",
+    "API 价格等值（先前版本）",
+    "Equivalente a precio de API (versión anterior)",
+  ],
  "accounting.pricing.partialCoverage": ["{percent} of usage changes have a reviewed price; coverage is partial.", "使用变化中有 {percent} 使用了经审核的价格；覆盖率不完整。", "El {percent} de los cambios de uso tiene un precio revisado; la cobertura es parcial."],
  "accounting.pricing.coverageReviewed": ["All usage changes in this period have reviewed pricing.", "此期间的所有使用变化都有经审核的价格。", "Todos los cambios de uso de este período tienen precios revisados."],
   "accounting.pricing.coverageShort": ["{percent} coverage", "{percent} 覆盖率", "{percent} de cobertura"],

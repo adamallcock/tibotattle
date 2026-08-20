@@ -3580,6 +3580,26 @@ function normalizeAllowanceCapacityScenario(value, scenario) {
   };
 }
 
+// Staleness provenance attached to projections served from the previous app
+// version's cache while the current rebuild runs. Normalized as a closed
+// shape (flag, semantic version, computed-at, covered span) or null; a block
+// missing its identity is dropped rather than shown as an unlabeled serve.
+function normalizeStaleProvenance(value) {
+  if (value?.stale !== true) return null;
+  const schemaVersion = text(value.schemaVersion, "");
+  const computedAt = text(value.computedAt, "");
+  if (schemaVersion === "" || computedAt === "") return null;
+  return {
+    stale: true,
+    schemaVersion,
+    computedAt,
+    coveredAt: {
+      startAt: text(value.coveredAt?.startAt, ""),
+      endAt: text(value.coveredAt?.endAt, "")
+    }
+  };
+}
+
 function normalizeAllowanceCapacity(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)
       || value.basisFamilyId !== ALLOWANCE_BASIS_FAMILY_ID
@@ -3618,6 +3638,7 @@ function normalizeAllowanceCapacity(value) {
     basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
     selectedScenario,
     scenarios,
+    stale: normalizeStaleProvenance(value.stale),
     accountAttribution: {
       status: "historical_unattributed",
       maySpanMultipleAccounts: true
@@ -4598,6 +4619,29 @@ function normalizeSideChatEstimates(value) {
   };
 }
 
+// The labeled prior-version cost figures served while no current accounting
+// source exists. Bounded to the per-period headline scalars plus the
+// staleness provenance; anything else the old artifact carried stays behind.
+function normalizeStaleAccountingServe(value) {
+  const provenance = normalizeStaleProvenance(value);
+  if (provenance === null) return null;
+  const periods = array(value.periods).flatMap((period) => (
+    ["24h", "7d", "30d", "all"].includes(period?.periodId)
+      && typeof period.periodLabel === "string"
+      && period.periodLabel.length > 0
+      ? [{
+        periodId: period.periodId,
+        periodLabel: period.periodLabel,
+        events: count(period.events, 0),
+        totalTokens: count(period.totalTokens, 0),
+        apiPriceEquivalentUsd: nonNegative(period.apiPriceEquivalentUsd, 0)
+      }]
+      : []
+  )).slice(0, 5);
+  if (periods.length === 0) return null;
+  return { ...provenance, periods };
+}
+
 function normalizeLocalAccounting(value = {}) {
   const models = normalizeLocalModelUsage(value.byModel);
   // Both allowance tracks in one list, each row stating which track it belongs
@@ -4693,6 +4737,7 @@ function normalizeLocalAccounting(value = {}) {
     reasoningEffortAvailable: value.reasoningEffortAvailable === true,
     accountingSource: text(value.accountingSource, "unknown"),
     accountingCacheStatus: text(value.accountingCacheStatus, "unknown"),
+    staleServe: normalizeStaleAccountingServe(value.staleServe),
     historyCoverage: normalizeHistoryCoverage(value.historyCoverage),
     replayExclusionDiagnostics: {
       filesScanned: count(value?.replayExclusionDiagnostics?.filesScanned, 0),
@@ -5114,6 +5159,7 @@ function normalizeWeekly(payload = {}) {
     errorConcentration: array(source.errorConcentration ?? source.error_concentration),
     providerEpochs: array(source.providerEpochs ?? source.provider_epochs),
     dataClass: text(envelope?.dataClass, ""),
+    stale: normalizeStaleProvenance(envelope?.stale),
     paceForecast: normalizeWeeklyPaceForecast(envelope?.paceForecast),
     accountAttribution: {
       status: text(envelope?.accountAttribution?.status, ""),

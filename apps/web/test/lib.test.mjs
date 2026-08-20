@@ -365,6 +365,9 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
     // renderWeekly owns the share-card re-render (owner-verified regression,
     // 2026-08-08), so the hero harness stubs it like the other renderers.
     "renderShareCard",
+    // The stale-serve recalculating note is rendered by the shared helper;
+    // the hero harness stubs it like the other side-effect renderers.
+    "renderStaleServeNote",
     "activeWeeklyRangeDays", "activeWeeklyMinimumObservedSpanPp",
     `${section}\nreturn renderWeekly;`,
   )(
@@ -394,6 +397,7 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
     () => ({ append() {}, textContent: "" }),
     (value) => new Date(value).toISOString().slice(0, 10),
     (value) => String(value),
+    () => {},
     () => {},
     () => {},
     rangeDays,
