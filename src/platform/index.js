@@ -36,11 +36,6 @@ export {
   isWindowsFilesystemIdentity,
 } from "./windows-filesystem.js";
 export {
-  KEYTAR_WIN32_X64_SHA256,
-  loadAuditedWindowsCredentialBinding,
-  runWindowsCredentialManagerProbe,
-} from "./windows-credential-manager-probe.js";
-export {
   WINDOWS_ELECTRON_QUALIFICATION_ENVIRONMENT_VALUE,
   WINDOWS_ELECTRON_QUALIFICATION_ENVIRONMENT_VARIABLE,
   WINDOWS_ELECTRON_QUALIFICATION_MODE_CONTRACT_VERSION,

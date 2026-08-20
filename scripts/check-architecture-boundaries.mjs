@@ -81,6 +81,7 @@ const REVIEWED_SOURCE_OWNER_PUBLIC_ENTRYPOINTS = new Set([
   "src/platform/owner-only-prepared-contribution-storage.js",
   "src/platform/telemetry-envelope.js",
   "src/platform/telemetry-v1-envelope.js",
+  "src/platform/windows-credential-manager-probe.js",
   "src/providers/claude/statusline.js",
   "src/providers/codex/account.js",
   "src/providers/codex/logs.js",
