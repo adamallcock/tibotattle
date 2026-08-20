@@ -984,6 +984,29 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     aboutUpdates,
     /automaticUpdatesHeader[\s\S]*aboutAutomaticUpdatesDetail[\s\S]*checkForUpdates/u,
   );
+  assert.match(
+    settingsSource,
+    /settingsControlRow\(\[chooseSource, useDefaultSource\]\)/u,
+  );
+  assert.match(settingsSource, /settingsControlRow\(\[openNotifications\]\)/u);
+  assert.match(settingsSource, /settingsControlRow\(\[checkForUpdates\]\)/u);
+  assert.match(
+    settingsSource,
+    /settingsControlColumn\(\[\s*openLoginItems,\s*refreshLoginItemStatus,\s*removePendingLoginItem,\s*\]\)/u,
+  );
+  for (const bare of [
+    "openLoginItems",
+    "refreshLoginItemStatus",
+    "removePendingLoginItem",
+    "openNotifications",
+    "checkForUpdates",
+  ]) {
+    assert.doesNotMatch(
+      settingsSource,
+      new RegExp(`\\n {16}${bare},\\n`, "u"),
+      `${bare} must reach its card through a row, not as a bare control`,
+    );
+  }
   assert.match(settingsSource, /symbolName: "globe"/u);
   assert.match(settingsSource, /symbolName: "folder"/u);
   assert.match(settingsSource, /symbolName: "clock"/u);
@@ -1092,12 +1115,61 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     /private enum NativeRefreshIntervalSelection[\s\S]*?setSeconds\(seconds, in: defaults\)[\s\S]*?guard dashboardAvailable, !refreshInFlight else \{ return true \}[\s\S]*?reschedule\(\)/u,
   );
   assert.match(source, /stack\.centerXAnchor\.constraint\(equalTo: document\.centerXAnchor\)/u);
-  assert.match(source, /stack\.widthAnchor\.constraint\(lessThanOrEqualToConstant: 680\)/u);
+  assert.match(source, /static let columnWidth: CGFloat = 680/u);
+  assert.match(
+    source,
+    /stack\.widthAnchor\.constraint\(\s*lessThanOrEqualToConstant: columnWidth\s*\)/u,
+  );
   assert.match(source, /contentStack\.alignment = \.leading/u);
   assert.match(source, /view\.widthAnchor\.constraint\(equalTo: contentStack\.widthAnchor\)/u);
   assert.match(source, /stack\.alignment = \.leading/u);
   assert.match(source, /view\.widthAnchor\.constraint\(equalTo: stack\.widthAnchor\)/u);
-  assert.match(source, /newWindow\.setContentSize\(NSSize\(width: 760, height: 620\)\)/u);
+  // Re-pinned 2026-08-20: the settings window used to be a literal
+  // 760x620, which was shorter than a four-group General page - so the page
+  // showed a scroller and clipped its last group, in every locale. The height
+  // is now whatever the page's own cards measure at the width they are laid
+  // out in, capped at the display, so a longer translation grows the window
+  // instead of clipping. A literal content size is the defect, not a detail.
+  assert.match(
+    source,
+    /controller\.preferredContentSize = contentSize\(for: stack\)/u,
+  );
+  assert.match(
+    source,
+    /static func contentSize\(for column: NSStackView\) -> NSSize[\s\S]*?naturalHeight\(\s*of: column,\s*at: columnWidth\s*\)[\s\S]*?maximumContentHeight/u,
+  );
+  assert.match(
+    source,
+    /static func naturalHeight\([\s\S]*?widthAnchor\.constraint\(equalToConstant: width\)[\s\S]*?layoutSubtreeIfNeeded\(\)[\s\S]*?fittingSize\.height/u,
+  );
+  assert.match(settingsSource, /newWindow\.setContentSize\(openingSize\)/u);
+  assert.doesNotMatch(settingsSource, /setContentSize\(NSSize\(width: \d/u);
+  // The pages are kept, not discarded, because a card's height moves with its
+  // live text: a chosen folder path wraps, the pending-login-item row appears.
+  // Every seam that writes into a card re-asks the window for its size.
+  assert.match(source, /private func refitSettingsWindowToContent\(\)/u);
+  for (const seam of [
+    "updateSettingsCodexHomeSummary",
+    "updateAutomaticUpdatesSettingsControl",
+    "updateStartAtLoginSettingsControl",
+    "updateQuotaNotificationSettingsControls",
+  ]) {
+    const seamSource = source.slice(
+      source.indexOf(`private func ${seam}()`),
+    ).split("\n    }\n")[0];
+    assert.match(
+      seamSource,
+      /refitSettingsWindowToContent\(\)/u,
+      `${seam} should refit the settings window to its content`,
+    );
+  }
+  // Re-pinned 2026-08-20: a card stretches every direct child to the card
+  // width so wrapping descriptions have a measure to wrap against, which turned
+  // "Open Login Items Settings" into a full-width banner. A row or a leading
+  // column is the seam that keeps the width for the card and the intrinsic size
+  // for the control; a bare NSButton in a card is the defect.
+  assert.match(source, /private func settingsControlRow\(/u);
+  assert.match(source, /private func settingsControlColumn\(/u);
   assert.match(source, /nativeStatusRefreshButton\?\.contentTintColor/u);
   assert.match(source, /nativeToolbarStatusColor\(isRefreshing:/u);
   // Deliberately re-pinned 2026-08-08: the status pill dropped the system
@@ -5595,6 +5667,25 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.match(
       refreshSettingsSmoke.stdout,
       /^USAGE_MONITOR_MACOS_REFRESH_SETTINGS_CONTRACT default=300 persisted=900 reloaded=900 picker_action=true picker_persisted=true scheduler=300->900 invalid_ignored=true$/mu,
+    );
+    // The settings window is sized from what its pages measure. Source text
+    // cannot show whether a page then fits, so this measures the real frames:
+    // zero overflow at the page's own height, a scroller when the window is
+    // deliberately shorter than the page, and controls at intrinsic width on
+    // the card's leading edge instead of stretched into full-width banners.
+    const settingsLayoutSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--native-settings-layout-smoke-test"],
+      { encoding: "utf8", timeout: 15_000 },
+    );
+    assert.equal(
+      settingsLayoutSmoke.status,
+      0,
+      settingsLayoutSmoke.stderr || settingsLayoutSmoke.stdout,
+    );
+    assert.match(
+      settingsLayoutSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_SETTINGS_LAYOUT cards=4 column_width=680 leading_spread=0 width_spread=0 full_width=true page_height=\d+ page_overflow=0 short_page_overflow=0 scroller_when_short=true control_stretch=0 control_leading_spread=0 short_column_height=\d+ widest_card_gap=12 worst_card_stretch=0 packed_to_top=true$/mu,
     );
     const nativeDashboardLayoutSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),
