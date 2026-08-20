@@ -18,14 +18,26 @@ struct ContributionDeviceKeychainBrokerUnavailable: Error {}
 /// creator — and the companion obtains the secret over a private socketpair
 /// it received as standard input at spawn, holding it in memory only.
 ///
-/// Trust is the kernel-held channel itself: only the spawned child owns the
-/// peer end. Nothing about the broker crosses argv, and the environment
-/// carries only the descriptor number. The wire protocol carries no service
-/// or account, so the companion cannot name any other Keychain item through
-/// it. One newline-terminated JSON frame per request or response, answered
-/// strictly in order; any deviation — an oversized or unparsable frame, an
+/// The channel is kernel-held: only the spawned child owns the peer end,
+/// nothing about the broker crosses argv, and the environment carries only
+/// the descriptor number. The wire protocol carries no service or account, so
+/// the companion cannot name any other Keychain item through it. One
+/// newline-terminated JSON frame per request or response, answered strictly
+/// in order; any deviation — an oversized or unparsable frame, an
 /// uncorrelatable identifier — fails the channel closed, and the companion
 /// surfaces the same coded, recoverable pairing errors it uses today.
+///
+/// What this is NOT: a confidentiality boundary against a deliberate
+/// same-user attacker. Items are minted with `runtime/bin/node` in their
+/// trusted-application list (see `designatedReaderAccess()`), and that node is
+/// a world-executable general-purpose interpreter inside the bundle, so any
+/// process running as this user can satisfy the ACL's designated requirement
+/// and read the secret directly. This is not a regression — the `-T node`
+/// `security` mint it replaces had the identical property — and the socketpair
+/// still earns its place: it removes the dialog and narrows accidental
+/// exposure to one single-purpose channel. The true end state is moving upload
+/// signing into this app so node never needs the secret at all, after which
+/// the node ACL entry can be dropped.
 final class ContributionDeviceKeychainBroker {
     /// The app-managed storage generation. The legacy
     /// app-usagemonitor.contribution-device.v1 item (minted companion-side
@@ -279,6 +291,27 @@ final class ContributionDeviceKeychainBroker {
         ]
     }
 
+    /// Every SecItem call runs with securityd's user interaction suppressed.
+    ///
+    /// This queue serializes socket reads, Keychain calls, responses, and
+    /// teardown, so a SecItem call that blocks blocks the whole broker. A
+    /// locked login keychain or an ACL/partition mismatch would otherwise put
+    /// up a modal dialog and block exactly there: the companion's per-request
+    /// timeout then poisons its transport permanently, and the user who
+    /// answers that dialog correctly still finds the channel dead. Suppressed,
+    /// those states return errSecInteractionNotAllowed at once, which maps to
+    /// "locked" → the companion's existing recoverable
+    /// contribution_device_credential_locked surface. This is what makes "zero
+    /// dialogs" a structural property rather than an expectation.
+    private func withoutUserInteraction<T>(_ body: () -> T) -> T {
+        // Deprecated since 10.10 with no replacement for the login keychain;
+        // the data-protection keychain, which needs entitlements this
+        // Developer ID app cannot carry, is the only API that supersedes it.
+        SecKeychainSetUserInteractionAllowed(false)
+        defer { SecKeychainSetUserInteractionAllowed(true) }
+        return body()
+    }
+
     private static func failureCode(_ status: OSStatus) -> String {
         switch status {
         case errSecInteractionNotAllowed:
@@ -300,7 +333,9 @@ final class ContributionDeviceKeychainBroker {
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         query[kSecReturnData as String] = true
         var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        let status = withoutUserInteraction {
+            SecItemCopyMatching(query as CFDictionary, &item)
+        }
         if status == errSecItemNotFound { return .value(nil) }
         guard status == errSecSuccess else {
             return .failure(Self.failureCode(status))
@@ -325,6 +360,12 @@ final class ContributionDeviceKeychainBroker {
     /// process with no broker channel — whose read and exact-delete of this
     /// item must stay silent; the live companion never reads this item
     /// directly, it asks this broker.
+    ///
+    /// The node entry is also the limit of what the broker can promise: node
+    /// is a general-purpose interpreter any same-user process can execute, so
+    /// its designated requirement is satisfiable at will and the ACL keeps no
+    /// secret from a deliberate same-user attacker. Dropping the entry
+    /// requires moving upload signing into this app first.
     private func designatedReaderAccess() -> SecAccess? {
         var trustedSelf: SecTrustedApplication?
         var trustedReader: SecTrustedApplication?
@@ -362,23 +403,48 @@ final class ContributionDeviceKeychainBroker {
         attributes[kSecAttrLabel as String] = Self.service
         attributes[kSecValueData as String] = data
         attributes[kSecAttrAccess as String] = access
-        let status = SecItemAdd(attributes as CFDictionary, nil)
-        if status == errSecSuccess { return nil }
-        if status == errSecDuplicateItem {
-            let update = [kSecValueData as String: data]
-            let updateStatus = SecItemUpdate(
-                baseQuery() as CFDictionary,
-                update as CFDictionary
-            )
-            return updateStatus == errSecSuccess
+        return withoutUserInteraction {
+            let status = SecItemAdd(attributes as CFDictionary, nil)
+            if status == errSecSuccess { return nil }
+            guard status == errSecDuplicateItem else {
+                return Self.failureCode(status)
+            }
+            // Not SecItemUpdate: Apple's implementation answers an update that
+            // hits errSecVerifyFailed by silently recreating the item through
+            // _ReplaceKeychainItem → SecKeychainItemCreateFromContent with
+            // initialAccess = NULL (OSX/libsecurity_keychain/lib/SecItem.cpp),
+            // which swaps the ACL for the default one and drops the node
+            // trusted-app entry the reset helper reads through. Adding
+            // kSecAttrAccess to the update dictionary does not reliably
+            // prevent it. Delete-then-add re-establishes the ACL on every
+            // write, and the silent ~25-day rotation takes this path every
+            // single time.
+            //
+            // Safe because this branch is only reachable behind a completed
+            // compare-and-swap read: the companion decrypted this item
+            // microseconds ago on this same serialized queue, so the keychain
+            // is demonstrably unlocked, and the rotation that drove the write
+            // already has the service's commit for the replacement — the
+            // stored value is worthless either way. A delete that lands before
+            // a failing add therefore reaches the same recoverable state as a
+            // failing update: no readable credential, credential_missing, and
+            // the existing re-pair ceremony.
+            let removal = SecItemDelete(baseQuery() as CFDictionary)
+            guard removal == errSecSuccess || removal == errSecItemNotFound
+            else {
+                return Self.failureCode(removal)
+            }
+            let replacement = SecItemAdd(attributes as CFDictionary, nil)
+            return replacement == errSecSuccess
                 ? nil
-                : Self.failureCode(updateStatus)
+                : Self.failureCode(replacement)
         }
-        return Self.failureCode(status)
     }
 
     private func deleteSecret() -> String? {
-        let status = SecItemDelete(baseQuery() as CFDictionary)
+        let status = withoutUserInteraction {
+            SecItemDelete(baseQuery() as CFDictionary)
+        }
         if status == errSecSuccess || status == errSecItemNotFound {
             return nil
         }
