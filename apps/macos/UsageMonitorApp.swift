@@ -3219,6 +3219,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private var menuBarStatus: MenuBarStatusController?
     private var settingsWindow: NSWindow?
     private var settingsTabs: NSTabViewController?
+    private var settingsPages: [SettingsPage] = []
     private weak var settingsCodexHomeLabel: NSTextField?
     private weak var settingsAutomaticUpdatesSwitch: NSSwitch?
     private weak var settingsAboutAutomaticUpdatesDetailLabel: NSTextField?
@@ -5013,6 +5014,31 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         )
     }
 
+    /// A button in a settings card is a button, not a banner. A card stretches
+    /// every direct child to the card width so wrapping descriptions have a
+    /// measure to wrap against, and a bare `NSButton` handed that width
+    /// centres its title across the whole card. A row is the seam that keeps
+    /// the width for the card and the intrinsic size for the control, on the
+    /// same leading edge as every other row.
+    private func settingsControlRow(_ views: [NSView]) -> NSStackView {
+        let row = NSStackView(views: views)
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        return row
+    }
+
+    /// The same seam for controls that stack instead of sitting side by side.
+    /// A vertical stack aligned `.leading` sizes each arranged view to its own
+    /// intrinsic width, which is exactly what a card's direct children lose.
+    private func settingsControlColumn(_ views: [NSView]) -> NSStackView {
+        let column = NSStackView(views: views)
+        column.orientation = .vertical
+        column.alignment = .leading
+        column.spacing = 8
+        return column
+    }
+
     @objc private func openExternalLink(_ sender: NSButton) {
         guard let address = sender.identifier?.rawValue,
               let url = URL(string: address),
@@ -5029,12 +5055,41 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         title: String,
         summary: String,
         views: [NSView]
-    ) -> NSViewController {
+    ) -> SettingsPage {
         NativeSettingsLayout.page(
             title: title,
             summary: summary,
             views: views
-        ).controller
+        )
+    }
+
+    /// The window is only as tall as the page it is showing, and a card's
+    /// height moves with its live text: a chosen folder path wraps to a second
+    /// line, the pending-login-item row appears, a notification status grows.
+    /// Every update seam that writes into a card re-asks the pages for their
+    /// size, so the window follows its content instead of keeping the height
+    /// it happened to open at.
+    private func refitSettingsWindowToContent() {
+        guard let settingsWindow, let settingsTabs, !settingsPages.isEmpty
+        else { return }
+        let sizes = settingsPages.map {
+            NativeSettingsLayout.contentSize(for: $0.column)
+        }
+        for (page, size) in zip(settingsPages, sizes) {
+            page.controller.preferredContentSize = size
+        }
+        let selected = min(
+            max(settingsTabs.selectedTabViewItemIndex, 0),
+            sizes.count - 1
+        )
+        settingsWindow.contentMinSize = NSSize(
+            width: NativeSettingsLayout.contentWidth,
+            height: sizes.map(\.height).min() ?? sizes[selected].height
+        )
+        guard let content = settingsWindow.contentView,
+              abs(content.frame.height - sizes[selected].height) > 0.5
+        else { return }
+        settingsWindow.setContentSize(sizes[selected])
     }
 
     private func codexHomeSettingsSummary() -> String {
@@ -5055,6 +5110,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func updateSettingsCodexHomeSummary() {
         settingsCodexHomeLabel?.stringValue = codexHomeSettingsSummary()
+        refitSettingsWindowToContent()
     }
 
     private func automaticUpdatesSettingsSummary() -> String {
@@ -5069,6 +5125,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             : .off
         settingsAboutAutomaticUpdatesDetailLabel?.stringValue =
             automaticUpdatesSettingsSummary()
+        refitSettingsWindowToContent()
     }
 
     private func updateUpdaterPresentation() {
@@ -5154,6 +5211,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             presentation.showsPendingRemoval && !loginItemOperationInFlight
         settingsStartAtLoginRefreshButton?.isEnabled =
             !loginItemOperationInFlight
+        refitSettingsWindowToContent()
     }
 
     private func updateRefreshIntervalSettingsControl() {
@@ -5495,6 +5553,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         settingsQuotaNotificationThresholds?.isEnabled = presentation.enabled
         settingsQuotaNotificationStatusLabel?.stringValue =
             quotaNotificationSettingsSummary()
+        refitSettingsWindowToContent()
     }
 
     @objc private func toggleQuotaNotifications(_ sender: NSSwitch) {
@@ -5591,6 +5650,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         settingsWindow?.close()
         settingsWindow = nil
         settingsTabs = nil
+        settingsPages = []
         settingsCodexHomeLabel = nil
         settingsAutomaticUpdatesSwitch = nil
         settingsAboutAutomaticUpdatesDetailLabel = nil
@@ -5635,6 +5695,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             updateStartAtLoginSettingsControl()
             quotaNotificationCoordinator?.refreshAuthorization()
             updateQuotaNotificationSettingsControls()
+            refitSettingsWindowToContent()
             settingsWindow.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -5656,9 +5717,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             target: self,
             action: #selector(useDefaultCodexHome)
         )
-        let sourceActions = NSStackView(views: [chooseSource, useDefaultSource])
-        sourceActions.orientation = .horizontal
-        sourceActions.spacing = 8
+        let sourceActions = settingsControlRow([chooseSource, useDefaultSource])
         let languagePicker = NSPopUpButton(
             frame: .zero,
             pullsDown: false
@@ -5853,9 +5912,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             views: [
                 startAtLoginHeader,
                 startAtLoginDetail,
-                openLoginItems,
-                refreshLoginItemStatus,
-                removePendingLoginItem,
+                // Stacked, not paired: the Spanish titles of these three each
+                // run wider than half the card, so a shared row would squeeze
+                // their titles. The column is leading-aligned so hiding the
+                // pending-removal button takes its own gap with it.
+                settingsControlColumn([
+                    openLoginItems,
+                    refreshLoginItemStatus,
+                    removePendingLoginItem,
+                ]),
             ]
         )
         let quotaNotificationsSwitch = NSSwitch()
@@ -5930,7 +5995,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             symbolName: "bell",
             views: [
                 quotaNotificationsHeader,
-                openNotifications,
+                settingsControlRow([openNotifications]),
                 quotaNotificationThresholdRow,
                 settingsLabel(
                     TiboTattleLocalization.string(
@@ -6028,7 +6093,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             views: [
                 automaticUpdatesHeader,
                 aboutAutomaticUpdatesDetail,
-                checkForUpdates,
+                settingsControlRow([checkForUpdates]),
             ]
         )
         let aboutProductSection = settingsGroup(
@@ -6049,20 +6114,30 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             ]
         )
 
-        for controller in [general, notifications, about] {
-            controller.title = TiboTattleLocalization.string(.settingsWindowTitle)
+        for page in [general, notifications, about] {
+            page.controller.title = TiboTattleLocalization.string(
+                .settingsWindowTitle
+            )
         }
 
         let tabs = NSTabViewController()
         tabs.tabStyle = .toolbar
         for (label, symbol, controller) in [
-            (TiboTattleLocalization.string(.settingsGeneral), "gearshape", general),
+            (
+                TiboTattleLocalization.string(.settingsGeneral),
+                "gearshape",
+                general.controller
+            ),
             (
                 TiboTattleLocalization.string(.settingsNotifications),
                 "bell",
-                notifications
+                notifications.controller
             ),
-            (TiboTattleLocalization.string(.settingsAboutTab), "info.circle", about),
+            (
+                TiboTattleLocalization.string(.settingsAboutTab),
+                "info.circle",
+                about.controller
+            ),
         ] {
             let item = NSTabViewItem(identifier: label)
             item.label = label
@@ -6077,11 +6152,25 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         let newWindow = NSWindow(contentViewController: tabs)
         newWindow.title = TiboTattleLocalization.string(.settingsWindowTitle)
         newWindow.styleMask = [.titled, .closable, .miniaturizable]
-        // A normal, centered settings form needs enough width for translated
-        // descriptions while keeping short pages compact. Each page scrolls
-        // vertically when General outgrows this frame.
-        newWindow.setContentSize(NSSize(width: 760, height: 620))
-        newWindow.contentMinSize = NSSize(width: 680, height: 520)
+        // The window is as tall as the page it is showing. A hard-coded height
+        // is what handed a four-group General page a scroller and clipped its
+        // last group, and any replacement number would only move the clip to
+        // whichever locale wraps one line further. Every page publishes its own
+        // measured height as `preferredContentSize`, which the tab controller
+        // resizes the window to on each switch; this opens the first tab at the
+        // same size instead of one frame at a stale one. The floor is the
+        // shortest page, so nothing can collapse the window below its content.
+        let pages = [general, notifications, about]
+        settingsPages = pages
+        let openingSize = pages[min(max(index, 0), pages.count - 1)]
+            .controller.preferredContentSize
+        newWindow.setContentSize(openingSize)
+        newWindow.contentMinSize = NSSize(
+            width: NativeSettingsLayout.contentWidth,
+            height: pages
+                .map(\.controller.preferredContentSize.height)
+                .min() ?? openingSize.height
+        )
         newWindow.isReleasedWhenClosed = false
         newWindow.center()
         settingsWindow = newWindow
@@ -7664,6 +7753,14 @@ private enum MenuBarContractSmokeTest {
     }
 }
 
+/// A settings page is its controller plus the column its cards live in. The
+/// column is kept because the window is sized from it, and a card's height
+/// changes with its live text long after the page was built.
+private typealias SettingsPage = (
+    controller: NSViewController,
+    column: NSStackView
+)
+
 /// The Settings window's card layout, kept out of `AppDelegate` so the
 /// rendered result can be measured by a contract smoke test instead of being
 /// asserted against source text. A vertical `NSStackView` aligned `.width`
@@ -7674,6 +7771,26 @@ private enum MenuBarContractSmokeTest {
 /// subview is what actually produces one full-width column.
 @MainActor
 private enum NativeSettingsLayout {
+    /// A card is capped at a readable measure rather than the window width, so
+    /// a translated description wraps to a line length the eye can track.
+    static let columnWidth: CGFloat = 680
+    static let columnInset = (horizontal: CGFloat(28), vertical: CGFloat(24))
+    /// The window is the column plus its gutters. This is also the width a
+    /// non-resizable window settles on by itself once the column has hit its
+    /// cap, so naming it keeps the measured height honest: the column really
+    /// is laid out at `columnWidth`.
+    static let contentWidth: CGFloat = columnWidth + columnInset.horizontal * 2
+    /// A settings window may grow to its content but never past the display it
+    /// opens on. Beyond this the page scrolls, which is the one case where a
+    /// scroller is the honest answer.
+    static var maximumContentHeight: CGFloat {
+        // Pages are measured before the settings window exists, so there is no
+        // key window to name a screen; `screens.first` is the fallback that
+        // still describes a real display instead of a guess.
+        let screen = NSScreen.main ?? NSScreen.screens.first
+        return max(420, (screen?.visibleFrame.height ?? 900) - 160)
+    }
+
     static func label(
         _ text: String,
         font: NSFont,
@@ -7805,7 +7922,7 @@ private enum NativeSettingsLayout {
         scroll.documentView = document
         let preferredWidth = stack.widthAnchor.constraint(
             equalTo: document.widthAnchor,
-            constant: -56
+            constant: -columnInset.horizontal * 2
         )
         preferredWidth.priority = .defaultHigh
         NSLayoutConstraint.activate([
@@ -7828,13 +7945,16 @@ private enum NativeSettingsLayout {
             stack.centerXAnchor.constraint(equalTo: document.centerXAnchor),
             stack.leadingAnchor.constraint(
                 greaterThanOrEqualTo: document.leadingAnchor,
-                constant: 28
+                constant: columnInset.horizontal
             ),
             stack.trailingAnchor.constraint(
                 lessThanOrEqualTo: document.trailingAnchor,
-                constant: -28
+                constant: -columnInset.horizontal
             ),
-            stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 24),
+            stack.topAnchor.constraint(
+                equalTo: document.topAnchor,
+                constant: columnInset.vertical
+            ),
             // `lessThanOrEqualTo`, not `equalTo`. The document is already held
             // to at least the viewport height, so pinning the column to both
             // edges stretched it to the full window whenever a page's cards
@@ -7847,27 +7967,85 @@ private enum NativeSettingsLayout {
             // scrolling a long page is unaffected.
             stack.bottomAnchor.constraint(
                 lessThanOrEqualTo: document.bottomAnchor,
-                constant: -24
+                constant: -columnInset.vertical
             ),
-            stack.widthAnchor.constraint(lessThanOrEqualToConstant: 680),
+            stack.widthAnchor.constraint(
+                lessThanOrEqualToConstant: columnWidth
+            ),
         ])
         preferredWidth.isActive = true
         let controller = NSViewController()
         controller.view = root
+        // The window is sized to the page, not the page to a fixed window.
+        // A four-card General page measures taller than any number worth
+        // hard-coding, and a longer translation measures taller again, so the
+        // height that keeps every locale unclipped is the one the cards
+        // themselves report at the width they will actually be laid out in.
+        controller.preferredContentSize = contentSize(for: stack)
         return (controller, stack)
+    }
+
+    /// The window content size a page column needs: its height-for-width plus
+    /// the column's own gutters, capped at the display. A card's height moves
+    /// with its live text - a chosen folder path, a login-item row that comes
+    /// and goes - so this is re-asked, not cached at construction.
+    static func contentSize(for column: NSStackView) -> NSSize {
+        NSSize(
+            width: contentWidth,
+            height: min(
+                naturalHeight(of: column, at: columnWidth)
+                    + columnInset.vertical * 2,
+                maximumContentHeight
+            )
+        )
+    }
+
+    /// Height-for-width of a page column. A wrapping label only knows its own
+    /// height once it knows its width, so the column is pinned to the width it
+    /// will really receive and laid out before it is measured; the second pass
+    /// is what lets the labels report their wrapped height rather than their
+    /// single-line one.
+    static func naturalHeight(
+        of column: NSStackView,
+        at width: CGFloat
+    ) -> CGFloat {
+        let pin = column.widthAnchor.constraint(equalToConstant: width)
+        pin.isActive = true
+        column.layoutSubtreeIfNeeded()
+        _ = column.fittingSize
+        column.layoutSubtreeIfNeeded()
+        let height = column.fittingSize.height
+        pin.isActive = false
+        return height
     }
 }
 
-/// Lays out a representative Settings page in a real window at the shipped
-/// settings size and measures the resulting card frames. This is the guard for
-/// the reported "Settings menu is still broken" defect: with a vertical stack
-/// aligned `.width` the cards float right at unequal widths, so this contract
-/// fails unless every card starts on the same leading edge and fills the
-/// column. Source-text assertions cannot catch that; measured frames can.
+/// Lays out representative Settings pages in real windows and measures the
+/// resulting frames. Source-text assertions cannot catch any of what this
+/// pins; measured frames can. It guards four reported defects at once:
+///
+/// 1. cards floating right at unequal widths, because a vertical stack aligned
+///    `.width` sizes each subview to its own intrinsic width;
+/// 2. a page taller than its window, which put a scroller on a four-group
+///    General page and clipped its last group - so a page opened at its own
+///    reported height must need no more room than the viewport gives it, and a
+///    window deliberately shorter than its page must still scroll;
+/// 3. a control stretched to the full card width, which read as a banner
+///    rather than a button;
+/// 4. a short page's cards spread through surplus window height.
 @MainActor
 private enum NativeSettingsLayoutSmokeTest {
-    private static let settingsContentWidth: CGFloat = 760
-    private static let settingsContentHeight: CGFloat = 620
+    private static let settingsContentWidth = NativeSettingsLayout.contentWidth
+
+    /// The scroller a page shows is the only honest report of whether the
+    /// window fits it, so it is read from the page's own scroll view.
+    private static func scrollView(in view: NSView) -> NSScrollView? {
+        if let scroll = view as? NSScrollView { return scroll }
+        for child in view.subviews {
+            if let found = scrollView(in: child) { return found }
+        }
+        return nil
+    }
 
     static func run() -> Int32 {
         // AppKit needs an application object before views are laid out, but
@@ -7900,6 +8078,23 @@ private enum NativeSettingsLayoutSmokeTest {
             return popUp
         }
 
+        func stackedColumn(_ views: [NSView]) -> NSStackView {
+            let stack = NSStackView(views: views)
+            stack.orientation = .vertical
+            stack.alignment = .leading
+            stack.spacing = 8
+            return stack
+        }
+
+        // Controls carried through the layout so their real frames can be
+        // measured. A bare `NSButton` handed to a card is stretched to the card
+        // width - the banner defect - so the shipped pages wrap theirs in a row
+        // or a leading column, and these are the ones that must stay intrinsic.
+        let chooseFolder = button("Choose Folder…")
+        let useDefault = button("Use Default")
+        let openLoginItems = button("Open Login Items Settings")
+        let refreshLoginItem = button("Refresh Login Item Status")
+
         // Deliberately mixed intrinsic widths. Under `.width` alignment these
         // four cards land on four different leading edges.
         let cards: [(String, NSView)] = [
@@ -7919,7 +8114,7 @@ private enum NativeSettingsLayoutSmokeTest {
                         "Using the default location for session and usage "
                             + "evidence."
                     ),
-                    row([button("Choose Folder…"), button("Use Default")]),
+                    row([chooseFolder, useDefault]),
                 ]
             )),
             ("refresh-interval", NativeSettingsLayout.group(
@@ -7936,7 +8131,7 @@ private enum NativeSettingsLayoutSmokeTest {
                 views: [
                     row([NSSwitch()]),
                     detail("Start at login is off."),
-                    row([button("Check Again")]),
+                    stackedColumn([openLoginItems, refreshLoginItem]),
                 ]
             )),
         ]
@@ -7946,24 +8141,18 @@ private enum NativeSettingsLayoutSmokeTest {
             summary: "Language, evidence folder, refresh cadence, login.",
             views: cards.map(\.1)
         )
+        // The window is opened at the size the page asked for, which is the
+        // whole point of the contract below: a page that reports its own
+        // height must then fit in it.
+        let generalSize = page.controller.preferredContentSize
         let window = NSWindow(
-            contentRect: NSRect(
-                x: 0,
-                y: 0,
-                width: settingsContentWidth,
-                height: settingsContentHeight
-            ),
+            contentRect: NSRect(origin: .zero, size: generalSize),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         window.contentViewController = page.controller
-        window.setContentSize(
-            NSSize(
-                width: settingsContentWidth,
-                height: settingsContentHeight
-            )
-        )
+        window.setContentSize(generalSize)
         window.layoutIfNeeded()
         page.controller.view.layoutSubtreeIfNeeded()
         window.displayIfNeeded()
@@ -7997,6 +8186,141 @@ private enum NativeSettingsLayoutSmokeTest {
             ))
             return 1
         }
+
+        // The reported defect: a General page with four groups showed a
+        // scroller and clipped its last group, because the window height was a
+        // literal and the content was taller than it. The window above is
+        // opened at the height the page itself reported, so the contract is
+        // that the document then needs no more room than the viewport gives
+        // it. `overflow` is the clip, measured.
+        guard let generalScroll = scrollView(in: page.controller.view) else {
+            FileHandle.standardError.write(
+                Data("macOS settings layout smoke found no scroll view\n".utf8)
+            )
+            return 1
+        }
+        let generalViewport = generalScroll.contentView.bounds.height
+        let generalDocument = generalScroll.documentView?.frame.height ?? 0
+        let generalOverflow = generalDocument - generalViewport
+        guard generalViewport >= 400, generalOverflow <= 0.5 else {
+            FileHandle.standardError.write(Data(
+                ("macOS settings vertical fit smoke failed "
+                    + "viewport=\(generalViewport) "
+                    + "document=\(generalDocument) "
+                    + "overflow=\(generalOverflow)\n").utf8
+            ))
+            return 1
+        }
+
+        // The same page in a window a third shorter must still scroll. Without
+        // this the fit contract above would also pass on a page that had
+        // simply lost its scroller, which is a different defect wearing the
+        // same result.
+        let clippedPage = NativeSettingsLayout.page(
+            title: "General",
+            summary: "Language, evidence folder, refresh cadence, login.",
+            views: [
+                NativeSettingsLayout.group(
+                    title: "Language",
+                    symbolName: "globe",
+                    views: [
+                        row([picker(["System language", "English"])]),
+                        detail("Changing the language reopens the dashboard."),
+                    ]
+                ),
+                NativeSettingsLayout.group(
+                    title: "Start at login",
+                    symbolName: "power",
+                    views: [
+                        row([NSSwitch()]),
+                        detail("Start at login is off."),
+                        stackedColumn([button("Open Login Items Settings")]),
+                    ]
+                ),
+            ]
+        )
+        // `preferredContentSize` is what a window sizes its content view
+        // controller to, so shortening the window means shortening that. This
+        // is the hard-coded-height case, reproduced deliberately.
+        let clippedHeight = (clippedPage.controller
+            .preferredContentSize.height * (2.0 / 3.0)).rounded()
+        clippedPage.controller.preferredContentSize = NSSize(
+            width: settingsContentWidth,
+            height: clippedHeight
+        )
+        let clippedWindow = NSWindow(
+            contentRect: NSRect(
+                x: 0,
+                y: 0,
+                width: settingsContentWidth,
+                height: clippedHeight
+            ),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        clippedWindow.contentViewController = clippedPage.controller
+        clippedWindow.setContentSize(
+            NSSize(width: settingsContentWidth, height: clippedHeight)
+        )
+        clippedWindow.layoutIfNeeded()
+        clippedPage.controller.view.layoutSubtreeIfNeeded()
+        clippedWindow.displayIfNeeded()
+        clippedPage.controller.view.layoutSubtreeIfNeeded()
+        let clippedScroll = scrollView(in: clippedPage.controller.view)
+        let clippedOverflow = (clippedScroll?.documentView?.frame.height ?? 0)
+            - (clippedScroll?.contentView.bounds.height ?? 0)
+        guard clippedOverflow > 0.5 else {
+            FileHandle.standardError.write(Data(
+                ("macOS settings scroller control smoke failed "
+                    + "overflow=\(clippedOverflow)\n").utf8
+            ))
+            return 1
+        }
+
+        // The second reported defect: "Open Login Items Settings" ran the whole
+        // group width and read as a banner. A card stretches its direct
+        // children to the card width, so a control only keeps its own size when
+        // a row or a leading column stands between it and the card. Every
+        // button below is placed the way the shipped pages place theirs, and
+        // must measure its intrinsic width on the card's leading edge.
+        let controls = [
+            chooseFolder,
+            useDefault,
+            openLoginItems,
+            refreshLoginItem,
+        ]
+        var widestControlStretch: CGFloat = 0
+        for control in controls {
+            widestControlStretch = max(
+                widestControlStretch,
+                control.frame.width - control.intrinsicContentSize.width
+            )
+        }
+        // Only the control that opens a row or column starts on the card's
+        // leading edge; `useDefault` sits after `chooseFolder` by design.
+        let controlLeadingEdges = [
+            chooseFolder,
+            openLoginItems,
+            refreshLoginItem,
+        ].map { column.convert($0.bounds, from: $0).minX }
+        let controlLeadingSpread = (controlLeadingEdges.max() ?? 0)
+            - (controlLeadingEdges.min() ?? 0)
+        let widestControl = controls.map(\.frame.width).max() ?? 0
+        guard widestControlStretch <= 0.5,
+              controlLeadingSpread <= 0.5,
+              widestControl <= columnWidth - 40
+        else {
+            FileHandle.standardError.write(Data(
+                ("macOS settings control width smoke failed "
+                    + "widest_stretch=\(widestControlStretch) "
+                    + "leading_spread=\(controlLeadingSpread) "
+                    + "widest_control=\(widestControl) "
+                    + "column=\(columnWidth)\n").utf8
+            ))
+            return 1
+        }
+
         // A page whose cards do not fill the window is the case that broke:
         // the column was pinned to both the document top and bottom while the
         // document was held to at least the viewport height, so a short page
@@ -8022,21 +8346,15 @@ private enum NativeSettingsLayoutSmokeTest {
             summary: "Optional local alerts.",
             views: shortCards
         )
+        let shortSize = shortPage.controller.preferredContentSize
         let shortWindow = NSWindow(
-            contentRect: NSRect(
-                x: 0,
-                y: 0,
-                width: settingsContentWidth,
-                height: settingsContentHeight
-            ),
+            contentRect: NSRect(origin: .zero, size: shortSize),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         shortWindow.contentViewController = shortPage.controller
-        shortWindow.setContentSize(
-            NSSize(width: settingsContentWidth, height: settingsContentHeight)
-        )
+        shortWindow.setContentSize(shortSize)
         shortWindow.layoutIfNeeded()
         shortPage.controller.view.layoutSubtreeIfNeeded()
         shortWindow.displayIfNeeded()
@@ -8062,16 +8380,21 @@ private enum NativeSettingsLayoutSmokeTest {
             let actual = card.frame.height
             worstStretch = max(worstStretch, actual - natural)
         }
+        let shortScroll = scrollView(in: shortPage.controller.view)
+        let shortOverflow = (shortScroll?.documentView?.frame.height ?? 0)
+            - (shortScroll?.contentView.bounds.height ?? 0)
         guard widestGap <= shortColumn.spacing + 0.5,
               worstStretch <= 1,
+              shortOverflow <= 0.5,
               !cardFrames.isEmpty
         else {
             FileHandle.standardError.write(Data(
                 ("macOS settings vertical layout smoke failed "
                     + "column_height=\(shortColumn.frame.height) "
-                    + "window_height=\(settingsContentHeight) "
+                    + "window_height=\(shortSize.height) "
                     + "widest_gap=\(widestGap) "
                     + "worst_card_stretch=\(worstStretch) "
+                    + "short_overflow=\(shortOverflow) "
                     + "spacing=\(shortColumn.spacing)\n").utf8
             ))
             return 1
@@ -8084,6 +8407,13 @@ private enum NativeSettingsLayoutSmokeTest {
                 + "leading_spread=\(Int(leadingSpread.rounded())) "
                 + "width_spread=\(Int(widthSpread.rounded())) "
                 + "full_width=true "
+                + "page_height=\(Int(generalSize.height.rounded())) "
+                + "page_overflow=\(Int(generalOverflow.rounded())) "
+                + "short_page_overflow=\(Int(shortOverflow.rounded())) "
+                + "scroller_when_short=true "
+                + "control_stretch=\(Int(widestControlStretch.rounded())) "
+                + "control_leading_spread="
+                + "\(Int(controlLeadingSpread.rounded())) "
                 + "short_column_height=\(Int(shortColumn.frame.height)) "
                 + "widest_card_gap=\(Int(widestGap.rounded())) "
                 + "worst_card_stretch=\(Int(worstStretch.rounded())) "
