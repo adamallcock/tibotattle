@@ -1333,6 +1333,27 @@ const MAX_COMPOSITION_MODELS = 24;
 // model instead of through one blended constant. The projection is defensive:
 // a malformed block degrades to null rather than poisoning the summary, and
 // a non-"fitted" status never carries a vector.
+// The identification block decides fitted vs fallback_blended, so it travels
+// with the fit rather than being recomputed. Bounded like every other wire
+// field: unknown shapes collapse to null, never to a partial object.
+function projectCompositionIdentification(identification) {
+  if (!identification || typeof identification !== "object"
+      || Array.isArray(identification)) {
+    return null;
+  }
+  return {
+    adjustedR2: finiteOrNull(identification.adjustedR2),
+    singleConstantAdjustedR2: finiteOrNull(
+      identification.singleConstantAdjustedR2,
+    ),
+    splitHalfIdentified: identification.splitHalfIdentified === true,
+    splitHalfMaxCapacityDriftFraction: finiteOrNull(
+      identification.splitHalfMaxCapacityDriftFraction,
+      { minimum: 0 },
+    ),
+  };
+}
+
 function projectComposition(composition) {
   if (!composition || typeof composition !== "object"
       || Array.isArray(composition)
@@ -1374,6 +1395,9 @@ function projectComposition(composition) {
       { minimum: 0 },
     ),
     singleConstantR2: finiteOrNull(composition.singleConstantR2),
+    identification: projectCompositionIdentification(
+      composition.identification,
+    ),
     blendedRecentMixUsd: finiteOrNull(
       composition.blendedRecentMixUsd,
       { minimum: 0 },

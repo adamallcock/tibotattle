@@ -37,8 +37,15 @@ export const MODEL_COMPOSITION_POLICY = Object.freeze({
   // voided.
   maxCrossingElapsedMs: 3 * 60 * 60 * 1_000,
   // Models below this share of corpus cost fold into one "other" column so a
-  // sliver of spend can never claim its own free parameter.
-  minimumModelCostShare: 0.02,
+  // sliver of spend can never claim its own free parameter. Raised 0.02 -> 0.03
+  // on 2026-08-20: at 0.02, `codex-auto-review` cleared the floor at 2.80% of
+  // post-2026-07-30 cost, claimed a column, and its capacity swung 23,263 vs
+  // 7,121 between interleaved halves (138% drift). That tripped the split-half
+  // gate below and forced the ENTIRE window to fallback_blended even though sol
+  // (6% share) and terra (3.5%) were stable at 0.07 drift. One marginal column
+  // was suppressing an otherwise healthy per-model fit, so the floor now sits
+  // above the largest observed unstable sliver.
+  minimumModelCostShare: 0.03,
   // Fewer observations than this cannot support a multi-model fit at all.
   minimumObservations: 24,
   // The label the folded remainder fits under.
