@@ -185,22 +185,30 @@ const MAX_RETAINED_TRANSITION_BYTES = 320 * 1024 * 1024;
 // the transition-mining pass tripped at ~1.6 GB whole-process RSS on a
 // companion whose baseline idles near ~800 MB, and the throw hard-failed the
 // entire refresh — blanking the dashboard and flip-flopping every 5 minutes
-// as the scheduler re-ran the doomed pass. Raised 2 -> 6 GiB on owner
-// directive (2026-08-20): the 2 GiB figure was a placeholder and the corpus
-// outgrew it. Every rebuild from 2026-08-18T19:28 onward deferred on
-// accounting_transition_rss_limit_exceeded, leaving allowanceCapacity and the
-// entire per-model composition fit unavailable while the dashboard still
-// reported freshness "live" — 572,089 all-time events, 128.5 GB indexed
-// across 4,880 sources at the time. This ceiling is a TARGET, not a hard
-// blocker: a miss degrades to a retained-cache soft-fail rather than failing
-// the refresh (see refreshReplaySafeAccountingCache and
+// as the scheduler re-ran the doomed pass. This ceiling is a TARGET, not a
+// hard blocker: a miss degrades to a retained-cache soft-fail rather than
+// failing the refresh (see refreshReplaySafeAccountingCache and
 // ACCOUNTING_BUDGET_MISS_CODES). It remains the backstop that stops the pass
-// before it can OOM the process — which is only true because the bundled
-// runtime now launches with --max-old-space-size=6144
-// (apps/macos/UsageMonitorApp.swift): V8's ~4 GiB default old-space sits
-// BELOW this target, so without that flag the pass would hard-OOM before the
-// soft-fail could ever run.
-const MAX_ACCOUNTING_RSS_BYTES = Math.floor(6 * 1024 * 1024 * 1024);
+// before it can OOM the process.
+//
+// HELD at 2 GiB on 2026-08-20, against a proposal to raise it to 6 GiB. The
+// evidence for that raise — 26 consecutive
+// accounting_transition_rss_limit_exceeded deferrals from 2026-08-18T19:28 on
+// a 572,089-event / 128.5 GB / 4,880-source corpus — predates the rebuild's
+// move into a short-lived child, and every one of those deferrals was the
+// COMPANION's own ~1.9 GiB post-indexing baseline eating the budget before the
+// pass began, not the pass outgrowing it. Isolation is what cures that (see
+// ACCOUNTING_REBUILD_ISOLATION_MODES); the ceiling was never the binding
+// constraint. Re-measured in the child against an owner-shaped corpus
+// (572,000 events / 25,870 transitions / 130 weekly windows), the rebuild
+// peaks at 485 MiB of RSS GROWTH over a clean baseline even with an
+// effectively unbounded heap, so the effective child ceiling
+// (min(this, baseline + ACCOUNTING_RSS_DELTA_BUDGET_BYTES) ~ 1.3 GiB) already
+// carries ~2.7x the measured need. Raising it further would only lift the
+// ceiling above the child's own V8 heap cap, which is exactly what converts an
+// honest deferral into a crash — see ACCOUNTING_REBUILD_CHILD_OLD_SPACE_MIB,
+// which is derived from this constant so the two cannot drift apart.
+const MAX_ACCOUNTING_RSS_BYTES = Math.floor(2 * 1024 * 1024 * 1024);
 // What one accounting rebuild may itself ADD to process RSS over the baseline
 // captured at build start. The effective ceiling is
 // min(MAX_ACCOUNTING_RSS_BYTES, baselineRss + this delta), so the delta must
@@ -208,14 +216,19 @@ const MAX_ACCOUNTING_RSS_BYTES = Math.floor(6 * 1024 * 1024 * 1024);
 // than capping the pass below it. The old 512 MiB delta is exactly what made
 // the 2026-08-11 incident inevitable: with the ~800 MB live baseline it capped
 // the build at ~1.3 GB — BELOW the 1.6 GB the pass actually needed — so the
-// miss was structural, not a real leak. That same arithmetic is why raising
-// the absolute target ALONE is inert: at an ~800 MB baseline the 1.25 GiB
-// delta pinned the effective ceiling near 2.05 GiB however high the absolute
-// went. Raised 1.25 -> 5.25 GiB alongside the 6 GiB target so a typical
-// baseline lands on it (min(6 GiB, 800 MB + 5.25 GiB = 6.05 GiB) = 6 GiB),
-// while MAX_ACCOUNTING_RSS_BYTES stays the absolute backstop against a leaking
-// baseline.
-const ACCOUNTING_RSS_DELTA_BUDGET_BYTES = Math.floor(5.25 * 1024 * 1024 * 1024);
+// miss was structural, not a real leak. Raised to 1.25 GiB so a typical
+// baseline lands on the absolute target (min(2 GiB, 800 MB + 1.25 GiB =
+// 2.05 GiB) = 2 GiB), while MAX_ACCOUNTING_RSS_BYTES stays the absolute
+// backstop against a leaking baseline.
+//
+// HELD at 1.25 GiB on 2026-08-20 alongside the absolute target. Since the
+// rebuild moved into a child this delta is what actually BINDS: off the
+// child's clean baseline the effective ceiling is baseline + 1.25 GiB ~
+// 1.3 GiB, below the 2 GiB absolute. Measured need in that child is 485 MiB of
+// growth at owner scale, so the delta is ~2.6x the measured climb — enough
+// that a real corpus never trips it, tight enough that a regression back to
+// O(corpus) residency still does.
+const ACCOUNTING_RSS_DELTA_BUDGET_BYTES = Math.floor(1.25 * 1024 * 1024 * 1024);
 // A memory-budget miss — whole-process RSS over the effective ceiling, the
 // scan guard's own RSS trip, or the per-row retained-byte meter over budget —
 // is a soft TARGET miss, not a hard failure. refreshReplaySafeAccountingCache
@@ -270,16 +283,37 @@ const ACCOUNTING_REBUILD_ISOLATION_MODES = Object.freeze([
 const ACCOUNTING_REBUILD_CHILD_ENTRY = fileURLToPath(
   new URL("./replay-safe-accounting-rebuild-child.js", import.meta.url),
 );
-// V8 old-space cap for the rebuild child. Prompt collection is what makes the
-// child's genuine RSS guard deterministic (an uncapped heap may lawfully defer
-// major GC past any tight margin — measured 147-354 MiB swing in #33), and the
-// cap turns a regression back to O(corpus) residency into a hard child failure
-// the parent converts to a deferral. 1 GiB is ~3x the multi-year working set
-// (thin stamps + one 50k-row batch slice + the accumulated transition series
-// + the fit's O(bins) sums) and sits below the child's effective RSS ceiling
-// (min(2 GiB, clean baseline + 1.25 GiB) ≈ 1.3 GiB), so V8 collects hard well
-// before the guard would trip.
-const ACCOUNTING_REBUILD_CHILD_OLD_SPACE_MIB = 1_024;
+// V8 old-space cap for the rebuild child, DERIVED from the absolute accounting
+// target so the two can never drift apart.
+//
+// The ordering is the whole point. The child's effective RSS ceiling is
+// min(MAX_ACCOUNTING_RSS_BYTES, childBaseline + ACCOUNTING_RSS_DELTA_BUDGET_BYTES),
+// which is <= MAX_ACCOUNTING_RSS_BYTES for ANY baseline; whole-process RSS in
+// turn always exceeds the JS heap. Pinning the cap AT the absolute target
+// therefore guarantees the RSS guard trips FIRST, and the guard's trip is a
+// soft budget miss (accounting_transition_rss_limit_exceeded) that
+// refreshReplaySafeAccountingCache defers with the prior cache retained and
+// served. A cap BELOW the effective ceiling inverts that: V8 aborts the child
+// before the guard can read, and the parent — which cannot distinguish a
+// heap-cap abort from any other death — reports the opaque
+// accounting_rebuild_subprocess_failed instead. Same deferral for the user,
+// but the honest reason is lost, and the fail-closed path is reached by crash
+// rather than by measurement. The earlier fixed 1 GiB cap sat below a ~1.3 GiB
+// effective ceiling and had exactly that inversion latent in it.
+//
+// This is a ceiling, not a reservation: V8 grows old space on demand, so a
+// larger cap costs nothing until the pass actually needs it. Measured at owner
+// scale (572,000 events / 25,870 transitions / 130 weekly windows), peak RSS
+// growth over a clean baseline is 362 MiB under a 512 MiB cap and 485 MiB with
+// the cap effectively unbounded — a ~123 MiB lazy-GC swing, consistent with
+// the 147-354 MiB swing measured in #33, and in both cases far below the
+// ~1.3 GiB effective ceiling. Prompt collection therefore does not depend on
+// pinning the cap under that ceiling, and a regression back to O(corpus)
+// residency still stops the pass — now as a metered deferral rather than an
+// out-of-memory abort.
+const ACCOUNTING_REBUILD_CHILD_OLD_SPACE_MIB = Math.ceil(
+  MAX_ACCOUNTING_RSS_BYTES / (1024 * 1024),
+);
 // SIGTERM asks the child to unwind through its own abort checks (typed abort
 // envelope); a child that cannot unwind inside this grace is killed hard. The
 // value only bounds teardown after an abort — never the build itself.
@@ -3208,16 +3242,17 @@ export async function buildReplaySafeAccountingCache({
   checkRuntimeMemory();
   // The deep-scan guard reuses the shared, frozen export resource policy, whose
   // compatibility-bound candidate ceiling caps maximumRssBytes at 1.5 GiB. The
-  // accounting build's authoritative ceiling is the 6 GiB effective target
+  // accounting build's authoritative ceiling is the effective target computed
   // above (checkRuntimeMemory), so pass the guard the LOWER of the two: it can
-  // only tighten the transition-path target, never contradict it. Since the
-  // 2026-08-20 raise the export policy's 1.5 GiB is ALWAYS the lower of the
-  // two at any realistic baseline, so the scan phase is effectively pinned
-  // there. That is deliberate and was never the failing phase: the deferrals
-  // this raise addresses were accounting_transition_rss_limit_exceeded, the
-  // post-scan transition mining that checkRuntimeMemory polices at the full
-  // target. A scan-phase RSS trip is likewise a soft budget miss
-  // (accounting_scan_rss_limit_exceeded), not a hard refresh failure.
+  // only tighten the transition-path target, never contradict it. Which side
+  // wins depends on the baseline and is deliberately not assumed: off the
+  // rebuild child's clean baseline the accounting effective ceiling (~1.3 GiB)
+  // is the lower one, while a fat in-process baseline pushes it up against the
+  // export policy's 1.5 GiB. In practice the heavy growth is the post-scan
+  // transition mining that checkRuntimeMemory polices at the full effective
+  // target, while the scan phase stays within either bound. A scan-phase RSS
+  // trip is likewise a soft budget miss (accounting_scan_rss_limit_exceeded),
+  // not a hard refresh failure.
   const scanResourceGuardMaximumRssBytes = Math.min(
     effectiveMaximumRssBytes,
     DEFAULT_EXPORT_RESOURCE_LIMITS.maximumRssBytes,
