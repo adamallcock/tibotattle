@@ -50,12 +50,14 @@ function binding(calls) {
     sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
     companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
+    preparedArtifactContractVersion: "windows-prepared-artifact-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
     companionInstanceMutexSafe: false,
     credentialAuditFileGuardSafe: true,
     sqliteStateLeaseSafe: false,
+    preparedArtifactSafe: false,
     inspectPath: () => metadata(ROOT_IDENTITY, true),
     ensureDirectory: () => ROOT_IDENTITY,
     readFile: () => ({ data: Buffer.from(""), identity: LIVE_IDENTITY }),
@@ -101,6 +103,17 @@ function binding(calls) {
       calls.push(["publish", stage, expectedStage, target, expectedTarget]);
       return { published: true, identity: STAGE_IDENTITY };
     },
+    // Prepared-artifact methods are outside this fixture's scope; provide
+    // valid contract doubles so adapter construction reaches staging logic.
+    inspectPreparedChild: () => ({ identity: ROOT_IDENTITY }),
+    ensurePreparedDirectory: () => ROOT_IDENTITY,
+    enumeratePreparedDirectory: () => [],
+    removePreparedDirectory: () => ({ removed: true, identity: ROOT_IDENTITY }),
+    renamePreparedDirectory: () => ({ renamed: true, identity: ROOT_IDENTITY }),
+    createPreparedFile: () => ROOT_IDENTITY,
+    readPreparedFile: () => ({ data: Buffer.from("data"), identity: ROOT_IDENTITY }),
+    deletePreparedFile: () => ({ deleted: true, identity: ROOT_IDENTITY }),
+    publishPreparedFile: () => ({ published: true, identity: ROOT_IDENTITY }),
   };
 }
 
