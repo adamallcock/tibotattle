@@ -80,7 +80,11 @@ const SOURCE_HASHES = Object.freeze({
   // moving in it) and the fallback gate became df-adjusted plus split-half
   // stability (raw nested R² could never reject a near-collinear fit).
   "model-composition.js":
-    "e7a56f8d66e60227cc509fa3d8166b94c7544af867f081e6a6953e5e984abbd5",
+    // Re-pinned for the sliver-fit correction: one unstable sliver was
+    // suppressing the whole per-model fit. The executable kernel changed in
+    // b8f43f0 (#45) while this byte-identity receipt stayed on the
+    // pre-correction digest.
+    "a948dbf22e813e7bb3042cd7715c8573ebe26934a17dfda54500df53d894b035",
 });
 
 test("quota analysis exposes one exact runtime-neutral package root", async () => {

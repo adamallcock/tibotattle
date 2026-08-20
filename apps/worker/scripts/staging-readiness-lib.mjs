@@ -68,6 +68,10 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     "0034_backfill_daily_allowance_revisions.sql",
     "0035_community_allowance_fit_cache.sql",
     "0036_v1_analysis_read_index.sql",
+    // Added with the owner-only distribution sync (#18): widens the
+    // admin_action_audit action vocabulary and adds the content-free GitHub
+    // release-asset snapshot tables. No participant, device, or upload data.
+    "0037_admin_distribution_history.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",

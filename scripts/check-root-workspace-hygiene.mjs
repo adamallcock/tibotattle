@@ -42,6 +42,10 @@ export const ROOT_WORKSPACE_POLICY = Object.freeze({
     "local-review",
     "native",
     "packages",
+    // Per-version release notes. The macOS stable release runbook requires a
+    // release-notes/X.Y.Z.md for every version, so this is deliberate project
+    // structure rather than a generated report.
+    "release-notes",
     "schemas",
     "scripts",
     "src",

@@ -59,7 +59,7 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
     );
     assert.match(
       osvWorkflow,
-      /google\/osv-scanner-action\/\.github\/workflows\/osv-scanner-reusable\.yml@9a498708959aeaef5ef730655706c5a1df1edbc2/u,
+      /google\/osv-scanner-action\/\.github\/workflows\/osv-scanner-reusable\.yml@8deb546fdb875b9996d27d4950be7312dac076a1/u,
     );
 
     // The pinned reusable workflow declares actions:read + contents:read +

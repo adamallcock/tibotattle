@@ -120,6 +120,14 @@ const LEGACY_RESOURCE_POLICY_EXPORTS = Object.freeze([
   ...RESOURCE_POLICY_EXPORTS,
   "readBoundedDirectoryEntries",
 ]);
+// EXPORT_RESOURCE_FAILURE_CODES names the resource bound behind
+// export_too_large (#43). It is carried by the reviewed src/export/ facade
+// only — src/export-resource-policy.js deliberately does not re-export it — so
+// it must stay out of RESOURCE_POLICY_EXPORTS, which LEGACY_… spreads.
+const REVIEWED_RESOURCE_POLICY_EXPORTS = Object.freeze([
+  ...RESOURCE_POLICY_EXPORTS,
+  "EXPORT_RESOURCE_FAILURE_CODES",
+]);
 const DELETION_OWNER_MODULES = Object.freeze([
   deletionContract,
   deletionSchema,
@@ -180,7 +188,7 @@ test("export compatibility metadata has one exact reviewed public API", () => {
     Object.keys(exportApi).sort(),
     [
       ...REGISTRY_EXPORTS,
-      ...RESOURCE_POLICY_EXPORTS,
+      ...REVIEWED_RESOURCE_POLICY_EXPORTS,
       ...VERSION_EXPORTS,
       ...OWNER_ONLY_VERSION_EXPORTS,
       ...CHECKPOINT_STATE_EXPORTS,
@@ -225,7 +233,7 @@ test("export compatibility metadata has one exact reviewed public API", () => {
   );
   assert.deepEqual(
     Object.keys(resourcePolicy).sort(),
-    [...RESOURCE_POLICY_EXPORTS].sort(),
+    [...REVIEWED_RESOURCE_POLICY_EXPORTS].sort(),
   );
   assert.equal(Object.hasOwn(exportApi, "scanCodexLogEvents"), false);
   assert.equal(Object.hasOwn(exportApi, "subscriptionSpeedSensitivity"), false);
