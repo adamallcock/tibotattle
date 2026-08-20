@@ -22,9 +22,11 @@ import {
 } from "./export-identity-keychain.js";
 import {
   assertWindowsProductionReadiness,
-  createContributionDeviceKeychainBrokerBinding,
   createWindowsProductionCapabilityBackend,
 } from "./platform/index.js";
+import {
+  createContributionDeviceKeychainBrokerBinding,
+} from "./contribution-device-keychain-broker.js";
 
 const SECRET_BYTES = 32;
 const MAXIMUM_STATE_BYTES = 512;

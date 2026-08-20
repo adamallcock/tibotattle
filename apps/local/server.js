@@ -90,7 +90,7 @@ import {
 import {
   contributionDeviceKeychainBrokerConfiguration,
   createContributionDeviceKeychainBrokerTransport,
-} from "../../src/platform/index.js";
+} from "../../src/contribution-device-keychain-broker.js";
 import {
   claimContributionDevicePairing,
   disconnectContributionDevice as disconnectContributionDeviceRemotely,

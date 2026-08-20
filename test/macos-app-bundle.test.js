@@ -119,7 +119,7 @@ import {
 } from "../src/export-identity-keychain.js";
 import {
   CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_FD_ENV,
-} from "../src/platform/contribution-device-keychain-broker.js";
+} from "../src/contribution-device-keychain-broker.js";
 
 const REPOSITORY_ROOT = resolve(
   dirname(fileURLToPath(import.meta.url)),

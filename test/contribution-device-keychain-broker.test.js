@@ -13,7 +13,7 @@ import {
   contributionDeviceKeychainBrokerConfiguration,
   createContributionDeviceKeychainBrokerBinding,
   createContributionDeviceKeychainBrokerTransport,
-} from "../src/platform/contribution-device-keychain-broker.js";
+} from "../src/contribution-device-keychain-broker.js";
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
   createExportIdentityKeychainBackend,
