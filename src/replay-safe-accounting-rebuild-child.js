@@ -17,13 +17,18 @@ import { stableJson } from "./export/canonical-json.js";
 // process that starts from a clean baseline and returns every byte to the OS
 // on exit. Running the build inside the resident menu-bar companion could not
 // achieve either: after real indexing on a large corpus the companion
-// legitimately idles near the 2 GiB absolute accounting target, so the
-// budget-relative guard had no headroom left for ANY rebuild growth, and the
-// rebuild deferred forever (live 0.1.13 incident, 2026-08-19: a 4,852-source /
-// ~80 GB companion sat at 1.88 GiB whole-process RSS after indexing and logged
+// legitimately idles at a residency comparable to the accounting target
+// itself, so the budget-relative guard had no headroom left for ANY rebuild
+// growth, and the rebuild deferred forever (live 0.1.13 incident, 2026-08-19:
+// a 4,852-source / ~80 GB companion sat at 1.88 GiB whole-process RSS after
+// indexing, against a 2 GiB target at the time, and logged
 // accounting_rebuild_deferred / accounting_transition_rss_limit_exceeded on
 // every attempt even after the streaming-corpus fix bounded per-batch
-// residency).
+// residency). The 2026-08-20 raise leaves that headroom argument less tight at
+// today's numbers, but the other two reasons are structural and do not depend
+// on the ceiling at all: growth here never enlarges the resident process, and
+// exit returns every rebuild byte to the OS instead of fossilizing the next
+// attempt's baseline.
 //
 // Contract (see buildReplaySafeAccountingCacheInSubprocess, the only caller):
 // argv carries exactly two file paths — a request file the parent wrote and a
