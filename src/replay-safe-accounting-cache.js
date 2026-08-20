@@ -825,6 +825,51 @@ function isAccountingBudgetMiss(error) {
     && ACCOUNTING_BUDGET_MISS_CODES.has(error.code);
 }
 
+// A budget miss that records nothing is unfalsifiable after the fact. Six days
+// of accounting_transition_rss_limit_exceeded deferrals were undiagnosable
+// because the note carried the CODE and not the three quantities the guard
+// actually compared, so every retrospective explanation — a too-small ceiling,
+// a leaking parent, an unbounded slice — stayed equally consistent with the
+// evidence and equally unprovable. Two such explanations were argued and both
+// were wrong.
+//
+// Rounded MiB integers only: content-free by construction, bounded in size,
+// and safe for the diagnostics trail and a pasted user report alike.
+// The parent's re-validation of whatever the rebuild child reported. Same
+// closed shape as the child's own bounding, applied again on receipt so the
+// boundary never has to trust the far side.
+function boundedSubprocessMeasurements(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const bounded = {};
+  for (const key of ["baselineRssMib", "observedRssMib", "ceilingRssMib"]) {
+    const measurement = value[key];
+    bounded[key] = Number.isSafeInteger(measurement) && measurement >= 0
+      ? measurement
+      : null;
+  }
+  return bounded;
+}
+
+function attachBudgetMissMeasurements(error, {
+  baselineRssBytes,
+  observedRssBytes,
+  ceilingRssBytes,
+}) {
+  const mib = (value) => (
+    Number.isSafeInteger(value) && value >= 0
+      ? Math.round(value / (1024 * 1024))
+      : null
+  );
+  error.measurements = Object.freeze({
+    baselineRssMib: mib(baselineRssBytes),
+    observedRssMib: mib(observedRssBytes),
+    ceilingRssMib: mib(ceilingRssBytes),
+  });
+  return error;
+}
+
 function accountingScanResourceError(error) {
   const code = error?.code;
   if (!(error instanceof ExportResourceLimitError)
@@ -2370,12 +2415,43 @@ async function deriveBoundedWeeklyCalibrationSeries({
     const resetsAt = Number(ordered[0]?.[7]);
     const windowStartMs = (resetsAt - durationMins * 60) * 1_000;
     group.transitions = transitions;
+    const firstMs = Number(ordered[0]?.[1] ?? 0);
+    // A group whose reset window cannot be computed must still be BOUNDED.
+    // This previously fell back to NEGATIVE_INFINITY, which the batch loop
+    // turned into `low = 0` — so one group with an unparseable duration or
+    // reset stamp took a usage slice running from the very first row of the
+    // corpus to its own last observation. On a large history that is the
+    // entire corpus in a single derivation, which defeats
+    // CALIBRATION_BATCH_USAGE_BUDGET completely and is why an isolated child
+    // with a multi-gigabyte ceiling still deferred with
+    // accounting_transition_rss_limit_exceeded: the working set was never
+    // bounded at all, so no ceiling could have been large enough.
+    //
+    // The honest bound is the group's own first observation less one window:
+    // a group's transitions cannot be attributed to usage older than the
+    // window containing its earliest snapshot. Prefer the group's declared
+    // duration, fall back to the weekly window this series derives.
+    const boundedDurationMins = Number.isFinite(durationMins) && durationMins > 0
+      ? durationMins
+      : WEEKLY_WINDOW_MINUTES;
+    const fallbackStartMs = Number.isFinite(firstMs)
+      ? firstMs - boundedDurationMins * 60_000
+      : Number.NEGATIVE_INFINITY;
     group.sliceStartMs = Number.isFinite(windowStartMs)
       ? windowStartMs
-      : Number.NEGATIVE_INFINITY;
-    group.firstMs = Number(ordered[0]?.[1] ?? 0);
+      : fallbackStartMs;
+    group.firstMs = firstMs;
     group.lastMs = Number(ordered.at(-1)?.[1] ?? 0);
     totalTransitions += transitions;
+    // `dedupe` and `deduped` exist only to derive the four scalars above. They
+    // are never read again, but without this they stay reachable for the whole
+    // pass — a Set of one interned key string per unique (observedAt, percent)
+    // plus a second array of row references, per group, held alongside the
+    // rows themselves and alongside the caller's `rateLimitSnapshots`. Release
+    // them at the point of last use so the batch loop runs against one copy of
+    // the snapshots rather than three views of them.
+    group.dedupe = null;
+    group.deduped = null;
   }
   throwIfAborted(signal);
   resourceCheck?.();
@@ -3300,7 +3376,14 @@ export async function buildReplaySafeAccountingCache({
       throw fixedError("accounting_transition_rss_measurement_invalid");
     }
     if (currentRss > effectiveMaximumRssBytes) {
-      throw fixedError("accounting_transition_rss_limit_exceeded");
+      throw attachBudgetMissMeasurements(
+        fixedError("accounting_transition_rss_limit_exceeded"),
+        {
+          baselineRssBytes: baselineRss,
+          observedRssBytes: currentRss,
+          ceilingRssBytes: effectiveMaximumRssBytes,
+        },
+      );
     }
   };
   checkRuntimeMemory();
@@ -3860,7 +3943,17 @@ function parseRebuildChildEnvelope(stdoutText) {
       && typeof value.code === "string"
       && SUBPROCESS_FAILURE_CODE_PATTERN.test(value.code)
       && ["Error", "AbortError"].includes(value.name)) {
-    return { status: "error", code: value.code, name: value.name };
+    // Re-validated here rather than trusted: the child's numbers are only
+    // admitted as the closed three-key MiB shape, and anything else becomes
+    // null. Without carrying these the isolated path — the production one —
+    // would report every budget miss with no quantities at all.
+    const measurements = boundedSubprocessMeasurements(value.measurements);
+    return {
+      status: "error",
+      code: value.code,
+      name: value.name,
+      measurements,
+    };
   }
   return null;
 }
@@ -4013,7 +4106,15 @@ async function buildReplaySafeAccountingCacheInSubprocess({
         aborted.name = "AbortError";
         throw aborted;
       }
-      throw fixedError(envelope.code);
+      // Restate the child's typed failure AND whatever quantities it metered,
+      // so an isolated miss is as diagnosable as an in-process one. Absent or
+      // malformed measurements were already normalized to null on receipt.
+      const restated = fixedError(envelope.code);
+      if (envelope.measurements !== null
+          && envelope.measurements !== undefined) {
+        restated.measurements = Object.freeze({ ...envelope.measurements });
+      }
+      throw restated;
     }
     // No usable envelope. If the caller aborted, the death is OURS (SIGTERM/
     // SIGKILL) and the honest outcome is the abort; otherwise the child died
@@ -4277,18 +4378,25 @@ export async function refreshReplaySafeAccountingCache({
       // and this read failure never turns the soft-fail back into a hard one.
       retainedCache = null;
     }
+    // Carry the guard's own numbers when it recorded them. Without these the
+    // deferral says only WHICH ceiling was crossed, never by how much or from
+    // what baseline — and a miss that reports no quantities cannot be told
+    // apart from any other explanation of itself.
+    const measurements = error?.measurements ?? null;
     const deferred = Object.freeze({
       status: "accounting_rebuild_deferred",
       reason: error.code,
       retained: retainedCache !== null,
       generatedAt: retainedCache?.generatedAt ?? null,
       coveredAt: retainedCache?.coveredAt ?? null,
+      measurements,
     });
     if (onAccountingRebuildDeferred !== null) {
       try {
         await onAccountingRebuildDeferred({
           reason: deferred.reason,
           retained: deferred.retained,
+          measurements,
         });
       } catch {
         // The degraded-event trail must never affect the refresh outcome.
