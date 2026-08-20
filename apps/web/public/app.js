@@ -2,9 +2,9 @@ import {
   CommunityClient,
   isPrimaryCodexQuotaWindow,
   isPrimaryCodexWeeklyQuotaWindow,
+  isSparkQuotaLimitId,
   LocalCompanionClient,
   CODEX_PRIMARY_LIMIT_ID,
-  CODEX_SPARK_LIMIT_ID,
   CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
   CODEX_WEEKLY_ALLOWANCE_MINUTES,
   demoDashboard,
@@ -1103,7 +1103,7 @@ function renderQuotaCards(data) {
   clear(container);
   const normalWindows = data.quotaWindows.filter(isPrimaryCodexQuotaWindow);
   const sparkWindows = data.quotaWindows.filter((window) => (
-    window?.limitId === CODEX_SPARK_LIMIT_ID
+    isSparkQuotaLimitId(window?.limitId)
       && isValidQuotaWindowDuration(finite(window?.durationMinutes))
   ));
   const primaryWindow = selectPrimaryCodexQuotaWindow(normalWindows);
@@ -1130,7 +1130,7 @@ function renderQuotaCards(data) {
   }
   for (const window of windows) {
     const remaining = finite(window.remainingPercent);
-    const spark = window.limitId === CODEX_SPARK_LIMIT_ID;
+    const spark = isSparkQuotaLimitId(window.limitId);
     const card = node("article", [
       "metric-card",
       window.status === "stale" ? "stale" : "",
@@ -1213,7 +1213,17 @@ function localizedQuotaWindowDuration(durationMinutes) {
 
 function localizedQuotaWindowLabel(window) {
   const duration = finite(window?.durationMinutes, null);
-  if (window?.limitId === CODEX_SPARK_LIMIT_ID) {
+  if (isSparkQuotaLimitId(window?.limitId)) {
+    // The provider re-introduced the 5-hour "Codex Spark" window on the Spark
+    // limit (wire: codex_bengalfox, window_minutes 300) alongside the Spark
+    // seven-day window, so the two Spark cards need distinct duration-named
+    // titles. An unfamiliar Spark duration keeps the honest generic name.
+    if (duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) {
+      return t("dashboard.quota.windowSparkFiveHour");
+    }
+    if (duration === CODEX_WEEKLY_ALLOWANCE_MINUTES) {
+      return t("dashboard.quota.windowSparkSevenDay");
+    }
     return t("dashboard.quota.windowSpark");
   }
   if (window?.limitId === CODEX_PRIMARY_LIMIT_ID

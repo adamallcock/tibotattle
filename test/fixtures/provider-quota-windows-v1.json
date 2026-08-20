@@ -33,6 +33,20 @@
         "window_minutes": 525600,
         "resets_at": 1817001960
       }
+    },
+    {
+      "limit_id": "codex_bengalfox",
+      "plan_type": "pro",
+      "primary": {
+        "used_percent": 0,
+        "window_minutes": 300,
+        "resets_at": 1787201379
+      },
+      "secondary": {
+        "used_percent": 0,
+        "window_minutes": 10080,
+        "resets_at": 1787788179
+      }
     }
   ],
   "invalidRateLimits": [
