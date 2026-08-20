@@ -3,6 +3,7 @@ import {
   appendFile,
   mkdtemp,
   mkdir,
+  open,
   readdir,
   readFile,
   rm,
@@ -185,30 +186,85 @@ test("legacy source symlinks are blocked instead of being migrated from outside 
   }
 });
 
-test("migration fails closed when a validated legacy source grows during its descriptor read", async () => {
+// The migration read pulls bytes through FileHandle#read, and FileHandle
+// instances share one prototype per process, so wrapping that method is a
+// deterministic seam: an append awaited inside a chosen read call is
+// guaranteed to interleave with the descriptor read. A timer racing the
+// inspection (the previous simulation) could miss the whole read window under
+// CPU load, because a page-cached 16 MiB read finishes in a few milliseconds
+// while the first 1 ms tick plus the append's threadpool round-trips can land
+// later. If a refactor stops routing the migration read through
+// FileHandle#read, the seam counts zero growths and the tests fail loudly.
+async function fileHandlePrototypeFor(path) {
+  const handle = await open(path, "r");
+  try {
+    return Object.getPrototypeOf(handle);
+  } finally {
+    await handle.close();
+  }
+}
+
+test("migration fails closed when a validated legacy source grows during its descriptor read", async (t) => {
   const root = await fixtureRoot();
   const source = join(root, "artifact.json");
   const maximumBytes = 16 * 1024 * 1024;
-  let growthTimer;
-  let growthWrites = Promise.resolve();
   try {
     await writeFile(source, Buffer.alloc(maximumBytes, 0x61), { mode: 0o600 });
-    growthTimer = setInterval(() => {
-      growthWrites = growthWrites.then(() => appendFile(source, Buffer.from("x")));
-    }, 1);
+    // Growing the file inside the first bounded read pins the append after
+    // the open-descriptor validation and before the overflow probe.
+    const fileHandlePrototype = await fileHandlePrototypeFor(source);
+    const realRead = fileHandlePrototype.read;
+    let growths = 0;
+    t.mock.method(fileHandlePrototype, "read", async function interceptedRead(...args) {
+      if (growths === 0) {
+        growths += 1;
+        await appendFile(source, Buffer.from("x"));
+      }
+      return realRead.apply(this, args);
+    });
     const result = await inspectLocalLegacyReportMigration({
       files: ["artifact.json"],
       root,
     });
-    clearInterval(growthTimer);
-    growthTimer = undefined;
-    await growthWrites;
-    assert.notEqual(result.entries[0].state, "migratable");
-    assert.ok(["source_changed", "source_too_large"].includes(result.entries[0].state));
+    assert.equal(growths, 1, "the growth seam never saw a descriptor read");
+    assert.equal(result.entries[0].state, "source_changed");
     assert.equal(result.status, "nothing_to_migrate");
     await assert.rejects(readFile(localLegacyReportPath(root, "artifact.json")));
   } finally {
-    if (growthTimer) clearInterval(growthTimer);
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("migration fails closed when a validated legacy source grows between the overflow probe and the descriptor recheck", async (t) => {
+  const root = await fixtureRoot();
+  const source = join(root, "artifact.json");
+  const maximumBytes = 16 * 1024 * 1024;
+  try {
+    await writeFile(source, Buffer.alloc(maximumBytes, 0x61), { mode: 0o600 });
+    // The overflow probe is the only read issued at the validated size, so an
+    // append awaited right after it lands in the last window a read can no
+    // longer see; only the closing descriptor recheck can refuse it.
+    const fileHandlePrototype = await fileHandlePrototypeFor(source);
+    const realRead = fileHandlePrototype.read;
+    let growths = 0;
+    t.mock.method(fileHandlePrototype, "read", async function interceptedRead(...args) {
+      const read = await realRead.apply(this, args);
+      const [, , length, position] = args;
+      if (growths === 0 && length === 1 && position === maximumBytes) {
+        growths += 1;
+        await appendFile(source, Buffer.from("x"));
+      }
+      return read;
+    });
+    const result = await inspectLocalLegacyReportMigration({
+      files: ["artifact.json"],
+      root,
+    });
+    assert.equal(growths, 1, "the growth seam never saw the overflow probe");
+    assert.equal(result.entries[0].state, "source_changed");
+    assert.equal(result.status, "nothing_to_migrate");
+    await assert.rejects(readFile(localLegacyReportPath(root, "artifact.json")));
+  } finally {
     await rm(root, { force: true, recursive: true });
   }
 });
