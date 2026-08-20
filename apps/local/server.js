@@ -2963,17 +2963,25 @@ function createPreparedLocalCompanionServer({
             stateFile: statePaths.contributionDeviceStateFile,
           },
         });
-        // Seed the auto-renewal due-tracker with the freshly issued expiry so a
-        // later normal sync pass can rotate the credential ~5 days before it
-        // lapses without any further user sign-in. Best-effort: the credential
-        // is fully paired regardless of whether this hint persists.
+        // Seed the auto-renewal due-tracker with the freshly issued credential
+        // so a later normal sync pass can rotate it partway through its life
+        // without any further user sign-in. The pair of instants is what makes
+        // the tracker self-calibrating: the interval between them is the
+        // lifetime this service granted, and the renewal point is a fraction of
+        // it rather than a constant the companion would have to keep in step
+        // with the deployed service. Best-effort: the credential is fully
+        // paired regardless of whether this hint persists.
         if (paired?.status === "paired"
             && typeof paired.deviceId === "string"
             && typeof paired.expiresAt === "string") {
           try {
             await writeContributionDeviceRenewalState(
               statePaths.contributionDeviceRenewalStateFile,
-              { deviceId: paired.deviceId, expiresAt: paired.expiresAt },
+              {
+                deviceId: paired.deviceId,
+                issuedAt: new Date().toISOString(),
+                expiresAt: paired.expiresAt,
+              },
             );
           } catch {
             // A missing due-tracker only defers the first silent renewal until
@@ -3287,10 +3295,11 @@ function createPreparedLocalCompanionServer({
           try {
             const backend = await createContributionDeviceBackend();
             // Silent auto-renewal (sign-in-once durability, part 2). Before the
-            // upload pass, rotate the 30-day credential in place if it is inside
-            // its renewal window, authenticated by the existing credential. This
-            // is strictly best-effort: it never throws into the pass, and a
-            // failure just leaves the still-valid credential for the next try.
+            // upload pass, rotate the credential in place if it is past the
+            // halfway point of its life, authenticated by the existing
+            // credential. This is strictly best-effort: it never throws into the
+            // pass, and a failure just leaves the still-valid credential for the
+            // next try.
             try {
               await renewContributionDeviceCredentialIfDue({
                 origin: contributionServiceOrigin,

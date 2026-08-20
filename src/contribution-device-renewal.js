@@ -6,22 +6,48 @@ import { defaultExportStateDirectory } from "./export-identity.js";
 import { renewContributionDeviceCredential } from "./contribution-device-client.js";
 
 // Companion half of the sign-in-once auto-renewal (section 2 of
-// docs/design/2026-08-11-sign-in-once-durability.md). The 30-day device
-// credential is rotated in place ~5 days before it would lapse, authenticated
-// by the existing credential, so a normal sync cadence keeps it alive forever
-// with no user sign-in. This orchestration only DECIDES and RECORDS; the actual
-// rotation is the injected client call, and every failure is non-fatal — the
-// old credential stays valid on the service until its real expiry, so a
-// skipped or failed renewal never blocks an upload.
+// docs/design/2026-08-11-sign-in-once-durability.md). The device credential is
+// rotated in place before it would lapse, authenticated by the existing
+// credential, so a normal sync cadence keeps it alive with no user sign-in.
+// This orchestration only DECIDES and RECORDS; the actual rotation is the
+// injected client call, and every failure is non-fatal — the old credential
+// stays valid on the service until its real expiry, so a skipped or failed
+// renewal never blocks an upload.
+//
+// The renewal point is a FRACTION of the credential's own observed lifetime,
+// not a fixed lead before expiry. The constraint is the inactive tail: whatever
+// the lead is, a Mac whose open-to-open gap exceeds it misses every renewal
+// window and lapses, and a fixed lead makes that tail as narrow as the lead
+// itself. Renewing at the halfway point makes the tolerated gap half the TTL
+// rather than a handful of days, which is the widest margin available without
+// rotating so often that the rotation history becomes the cost.
+//
+// The lifetime is read from the credential rather than from a mirrored copy of
+// the service TTL, because the two versions ship independently: a companion
+// whose mirror ran ahead of the deployed service would compute a lead longer
+// than the credential it is handed and re-trigger on every pass. Anchoring on
+// the recorded issuance instant makes a freshly issued credential provably not
+// due, whatever TTL the service is currently minting.
 
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
-// Mirror of the service's DEVICE_CREDENTIAL_TTL_MILLISECONDS (constants.ts:26);
-// used only to bound a persisted expiry, never as identity.
+// Mirror of the service's DEVICE_CREDENTIAL_TTL_MILLISECONDS (constants.ts).
+// Only a fallback: it dates a v1 record that predates issuance tracking, and is
+// never used once a record carries its own issuance instant. Drift against the
+// deployed service costs at most one extra rotation, which then writes the real
+// instant and self-corrects.
 export const DEVICE_CREDENTIAL_TTL_MILLISECONDS = 30 * DAY_MILLISECONDS;
-// Renew once inside the last 5 days of the TTL — i.e. at ~25 days — so a device
-// synced at least weekly always rotates well before lapse.
-export const DEFAULT_RENEWAL_LEAD_MILLISECONDS = 5 * DAY_MILLISECONDS;
-const RENEWAL_STATE_SCHEMA_VERSION = "contribution-device-renewal-v1";
+// Renew once half of the credential's own lifetime has elapsed.
+export const DEFAULT_RENEWAL_ELAPSED_FRACTION = 0.5;
+// A credential is never renewed twice inside this span. The elapsed-fraction
+// rule alone converges when the service caps an expiry below a full TTL (it
+// does so approaching the social-recheck deadline, which no rotation may
+// cross): each rotation then returns a shorter lifetime, and half of a
+// shrinking lifetime is a shrinking wait. The floor turns that geometric decay
+// into at most one rotation a day until the credential simply runs out, which
+// is the honest outcome — a deadline rotation cannot move.
+export const MINIMUM_RENEWAL_SPACING_MILLISECONDS = 1 * DAY_MILLISECONDS;
+const RENEWAL_STATE_SCHEMA_VERSION = "contribution-device-renewal-v2";
+const LEGACY_RENEWAL_STATE_SCHEMA_VERSION = "contribution-device-renewal-v1";
 const MAXIMUM_STATE_BYTES = 512;
 const DEVICE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
@@ -65,21 +91,30 @@ function validExpiry(value) {
   return Number.isFinite(epoch) && new Date(epoch).toISOString() === value;
 }
 
-function canonicalRenewalState({ deviceId, expiresAt }) {
+function canonicalRenewalState({ deviceId, issuedAt, expiresAt }) {
   return `${JSON.stringify({
     schemaVersion: RENEWAL_STATE_SCHEMA_VERSION,
     deviceId,
+    issuedAt,
     expiresAt,
   })}\n`;
 }
 
+const V2_KEYS = "deviceId\0expiresAt\0issuedAt\0schemaVersion";
+const V1_KEYS = "deviceId\0expiresAt\0schemaVersion";
+
 /**
  * The renewal-state file records only public-ish binding metadata — the device
- * id and the last-known expiry — never any secret; the durable secret lives in
- * the Keychain. It is therefore read tolerantly: any absence, malformed
- * content, or unexpected shape yields `null` (the caller then treats the
- * credential as unseeded and waits for the next pairing to seed it) rather than
- * an error that could stall a sync pass.
+ * id, when this Mac obtained the credential, and its last-known expiry — never
+ * any secret; the durable secret lives in the Keychain. It is therefore read
+ * tolerantly: any absence, malformed content, or unexpected shape yields `null`
+ * (the caller then treats the credential as unseeded and waits for the next
+ * pairing to seed it) rather than an error that could stall a sync pass.
+ *
+ * A v1 record predates issuance tracking and is read rather than discarded,
+ * because discarding it would report a paired Mac as unseeded and stop renewing
+ * it altogether. Its `issuedAt` is `null`; the due rule dates it from the
+ * mirrored TTL and the first renewal rewrites the record as v2.
  */
 export async function readContributionDeviceRenewalState(stateFile) {
   if (typeof stateFile !== "string" || stateFile.length < 1) fail("invalid_configuration");
@@ -104,22 +139,42 @@ export async function readContributionDeviceRenewalState(stateFile) {
     return null;
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
-      || Object.keys(parsed).sort().join("\0") !== "deviceId\0expiresAt\0schemaVersion"
-      || parsed.schemaVersion !== RENEWAL_STATE_SCHEMA_VERSION
       || typeof parsed.deviceId !== "string" || !DEVICE_ID_PATTERN.test(parsed.deviceId)
       || !validExpiry(parsed.expiresAt)) {
     return null;
   }
-  return Object.freeze({ deviceId: parsed.deviceId, expiresAt: parsed.expiresAt });
+  const keys = Object.keys(parsed).sort().join("\0");
+  if (keys === V2_KEYS
+      && parsed.schemaVersion === RENEWAL_STATE_SCHEMA_VERSION
+      && validExpiry(parsed.issuedAt)) {
+    return Object.freeze({
+      deviceId: parsed.deviceId,
+      issuedAt: parsed.issuedAt,
+      expiresAt: parsed.expiresAt,
+    });
+  }
+  if (keys === V1_KEYS
+      && parsed.schemaVersion === LEGACY_RENEWAL_STATE_SCHEMA_VERSION) {
+    return Object.freeze({
+      deviceId: parsed.deviceId,
+      issuedAt: null,
+      expiresAt: parsed.expiresAt,
+    });
+  }
+  return null;
 }
 
-export async function writeContributionDeviceRenewalState(stateFile, { deviceId, expiresAt } = {}) {
+export async function writeContributionDeviceRenewalState(
+  stateFile,
+  { deviceId, issuedAt, expiresAt } = {},
+) {
   if (typeof stateFile !== "string" || stateFile.length < 1
       || typeof deviceId !== "string" || !DEVICE_ID_PATTERN.test(deviceId)
+      || !validExpiry(issuedAt)
       || !validExpiry(expiresAt)) {
     fail("invalid_configuration");
   }
-  const content = canonicalRenewalState({ deviceId, expiresAt });
+  const content = canonicalRenewalState({ deviceId, issuedAt, expiresAt });
   const directory = dirname(stateFile);
   const temporary = join(directory, `.${basename(stateFile)}.${process.pid}.tmp`);
   let handle;
@@ -146,23 +201,53 @@ export async function writeContributionDeviceRenewalState(stateFile, { deviceId,
 }
 
 /**
- * Is the credential inside its renewal window? A credential whose last-known
- * expiry is at or within `leadMilliseconds` of `now` is due; an unknown or
- * unparseable expiry is deliberately NOT treated as due (the credential is
- * seeded with a real expiry at pairing, so "unknown" means "not yet seeded",
- * which must wait rather than churn a fresh credential).
+ * When this Mac obtained the credential, as an epoch. A v2 record states it; a
+ * v1 record (or one whose stated issuance is not before its expiry, which no
+ * service response can produce) is dated backwards from the mirrored TTL. A
+ * mirror longer than the credential the service actually issued dates the
+ * record too early and so reports it due at once — one rotation, after which
+ * the record carries a real instant and the mirror stops mattering.
+ */
+function credentialIssuedEpoch({ issuedAt, expiresAt }) {
+  const expiryEpoch = Date.parse(expiresAt);
+  if (validExpiry(issuedAt)) {
+    const issuedEpoch = Date.parse(issuedAt);
+    if (issuedEpoch < expiryEpoch) return issuedEpoch;
+  }
+  return expiryEpoch - DEVICE_CREDENTIAL_TTL_MILLISECONDS;
+}
+
+/**
+ * Is the credential inside its renewal window? Due once `elapsedFraction` of
+ * its own lifetime has passed AND it has been held for at least
+ * `minimumSpacingMilliseconds`. An unknown or unparseable expiry is
+ * deliberately NOT treated as due (the credential is seeded with a real expiry
+ * at pairing, so "unknown" means "not yet seeded", which must wait rather than
+ * churn a fresh credential).
+ *
+ * Both conditions are anchored on issuance, so a credential handed over a
+ * moment ago cannot be due whatever the service's TTL: renewing one is
+ * therefore always a step forward, never a loop.
  */
 export function contributionDeviceCredentialRenewalDue({
+  issuedAt = null,
   expiresAt,
   now,
-  leadMilliseconds = DEFAULT_RENEWAL_LEAD_MILLISECONDS,
+  elapsedFraction = DEFAULT_RENEWAL_ELAPSED_FRACTION,
+  minimumSpacingMilliseconds = MINIMUM_RENEWAL_SPACING_MILLISECONDS,
 } = {}) {
   if (!validExpiry(expiresAt)
       || !Number.isFinite(now)
-      || !Number.isSafeInteger(leadMilliseconds) || leadMilliseconds < 0) {
+      || !Number.isFinite(elapsedFraction)
+      || elapsedFraction <= 0 || elapsedFraction >= 1
+      || !Number.isSafeInteger(minimumSpacingMilliseconds)
+      || minimumSpacingMilliseconds < 0) {
     return false;
   }
-  return now >= Date.parse(expiresAt) - leadMilliseconds;
+  const issuedEpoch = credentialIssuedEpoch({ issuedAt, expiresAt });
+  const lifetime = Date.parse(expiresAt) - issuedEpoch;
+  if (now < issuedEpoch + minimumSpacingMilliseconds) return false;
+  return now >= issuedEpoch + lifetime * elapsedFraction;
 }
 
 /**
@@ -184,7 +269,8 @@ export async function renewContributionDeviceCredentialIfDue({
   origin,
   renewalStateFile = defaultContributionDeviceRenewalStateFile(),
   now = Date.now(),
-  leadMilliseconds = DEFAULT_RENEWAL_LEAD_MILLISECONDS,
+  elapsedFraction = DEFAULT_RENEWAL_ELAPSED_FRACTION,
+  minimumSpacingMilliseconds = MINIMUM_RENEWAL_SPACING_MILLISECONDS,
   capabilityOptions = {},
   renew = renewContributionDeviceCredential,
   readState = readContributionDeviceRenewalState,
@@ -192,7 +278,10 @@ export async function renewContributionDeviceCredentialIfDue({
 } = {}) {
   if (typeof renewalStateFile !== "string" || renewalStateFile.length < 1
       || !Number.isFinite(now)
-      || !Number.isSafeInteger(leadMilliseconds) || leadMilliseconds < 0
+      || !Number.isFinite(elapsedFraction)
+      || elapsedFraction <= 0 || elapsedFraction >= 1
+      || !Number.isSafeInteger(minimumSpacingMilliseconds)
+      || minimumSpacingMilliseconds < 0
       || typeof renew !== "function"
       || typeof readState !== "function"
       || typeof writeState !== "function"
@@ -203,9 +292,11 @@ export async function renewContributionDeviceCredentialIfDue({
   const state = await readState(renewalStateFile);
   if (state === null) return Object.freeze({ status: "unseeded" });
   if (!contributionDeviceCredentialRenewalDue({
+    issuedAt: state.issuedAt ?? null,
     expiresAt: state.expiresAt,
     now,
-    leadMilliseconds,
+    elapsedFraction,
+    minimumSpacingMilliseconds,
   })) {
     return Object.freeze({ status: "not_due", expiresAt: state.expiresAt });
   }
@@ -226,6 +317,10 @@ export async function renewContributionDeviceCredentialIfDue({
   try {
     await writeState(renewalStateFile, {
       deviceId: renewed.deviceId,
+      // The service states an expiry, not an issuance; this pass observed the
+      // handover, so `now` is the issuance instant and the interval between
+      // them is the lifetime the service actually granted.
+      issuedAt: new Date(now).toISOString(),
       expiresAt: renewed.expiresAt,
     });
   } catch {
