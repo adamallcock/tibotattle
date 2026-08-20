@@ -8,6 +8,7 @@ import {
   buildReplaySafeAccountingCache,
   refreshReplaySafeAccountingCache,
   readReplaySafeAccountingCache,
+  REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY,
   REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
 } from "../src/replay-safe-accounting-cache.js";
 import {
@@ -476,13 +477,14 @@ test("a corpus far larger than one derivation batch completes in ONE pass under 
 // was necessary but insufficient at owner scale: the derived transition series
 // still accumulates across batches, and the RSS guard measures the WHOLE
 // process — a companion that legitimately idles near 1.9 GiB after indexing an
-// ~80 GB corpus reaches the 2 GiB absolute target with no headroom for ANY
-// rebuild growth, so the streamed rebuild kept deferring (dogfood 0.1.13,
-// 2026-08-19, 23:21:26Z and 23:39:15Z). Production rebuilds therefore run in a
-// short-lived child with a clean baseline. These tests pin the boundary:
+// ~80 GB corpus reached the then-current 2 GiB absolute target with no headroom
+// for ANY rebuild growth, so the streamed rebuild kept deferring (dogfood
+// 0.1.13, 2026-08-19, 23:21:26Z and 23:39:15Z). Production rebuilds therefore
+// run in a short-lived child with a clean baseline. These tests pin the
+// boundary:
 //  1. the child's artifact is BYTE-identical to the in-process build;
-//  2. a rebuild completes while the parent sits past the absolute backstop —
-//     the exact state that deferred forever in-process;
+//  2. a rebuild completes while the parent sits past the ceiling both arms are
+//     handed — the exact state that deferred forever in-process;
 //  3. a child that dies fails closed to the deferral (never a crash loop,
 //     never a clobbered prior cache);
 //  4. the caller's abort is an abort, not a deferral.
@@ -912,14 +914,38 @@ test("isolation options validate closed", async () => {
 });
 
 // The decisive owner-scale regression. The parent process is inflated past the
-// 2 GiB absolute accounting backstop and RETAINS that ballast — the state a
-// large-history companion legitimately reaches after indexing — then runs the
-// same rebuild both ways. In-process the guard's very first check must defer
-// (that IS the 0.1.13 livelock: baseline past the target, zero headroom, every
-// attempt deferred). The default isolated rebuild must COMPLETE against the
-// same corpus while the parent stays inflated, because the guard now measures
-// the child's own clean-baseline RSS. Runs in a spawned parent so the 2 GiB
-// ballast never lives in the shared test-runner process.
+// RSS ceiling BOTH arms are handed, and RETAINS that ballast across the whole
+// run — the state a large-history companion legitimately reaches after
+// indexing — then runs the same rebuild both ways. In-process the guard's very
+// first check must defer (that IS the 0.1.13 livelock: baseline past the
+// ceiling, zero headroom, every attempt deferred). The default isolated
+// rebuild must COMPLETE against the same corpus while the parent stays
+// inflated, because the guard now measures the child's own clean-baseline RSS.
+// Runs in a spawned parent so the ballast never lives in the shared
+// test-runner process.
+//
+// The ceiling is PARAMETERISED rather than left at the shipped absolute, and
+// that is the substance of the 2026-08-20 rework. This test used to allocate
+// 2 GiB + 64 MiB of touched ballast to clear the then-shipped 2 GiB absolute;
+// against the raised 6 GiB absolute the same device would need more than 6 GiB
+// resident inside a test process, which is impractical and openly hostile on a
+// developer machine. What is under test is a RELATIONSHIP — a parent past the
+// ceiling, a child starting clean beneath it — and a relationship is
+// scale-free, so both arms are handed one small explicit ceiling instead. The
+// SHIPPED numbers, and the fact that the real spawn carries them, are pinned
+// separately: by the invariant test below, which reads the production child's
+// own execArgv and request, and by the policy tripwire in
+// test/replay-safe-accounting-cache.test.js.
+//
+// Both numbers below are measured rather than chosen. The real production
+// child completes this fixture under a 160 MiB whole-process ceiling and
+// defers under 128 MiB, so 384 MiB carries ~2.4x its measured need and the
+// isolated arm cannot flake; 768 MiB of touched ballast leaves the parent
+// near ~880 MiB, ~2.3x the same ceiling, so the in-process arm cannot flake
+// either. The ballast is roughly a third of what this test used to allocate,
+// and a ninth of what clearing the shipped absolute would now demand.
+const INFLATED_PARENT_CEILING_BYTES = 384 * 1024 * 1024;
+const INFLATED_PARENT_BALLAST_BYTES = 768 * 1024 * 1024;
 const INFLATED_PARENT = String.raw`
 const { refreshReplaySafeAccountingCache } = await import(
   process.env.REBUILD_PARENT_MODULE
@@ -941,14 +967,22 @@ const shared = {
   unifiedIndexFile: process.env.REBUILD_PARENT_INDEX_FILE,
   now: () => nowMs,
   declaredSpeedBaselines: JSON.parse(process.env.REBUILD_PARENT_BASELINES),
+  // ONE ceiling, handed identically to both arms, so the only thing that
+  // differs between them is which process the guard measures.
+  maximumRssBytes: Number(process.env.REBUILD_PARENT_CEILING_BYTES),
 };
 const inProcess = await refreshReplaySafeAccountingCache({
   ...shared,
   rebuildIsolation: "in_process",
 });
 const isolated = await refreshReplaySafeAccountingCache({ ...shared });
+// Sampled AFTER both rebuilds: proves the parent was still over the ceiling
+// while the isolated arm ran, rather than having quietly shed the ballast
+// somewhere between the two calls.
+const parentRssAfterBytes = process.memoryUsage().rss;
 process.stdout.write(JSON.stringify({
   parentRssBytes,
+  parentRssAfterBytes,
   // Reading the ballast after both rebuilds keeps it retained throughout.
   ballastByte: ballast[ballast.length - 1],
   inProcess: {
@@ -969,16 +1003,24 @@ process.stdout.write(JSON.stringify({
 }) + "\n");
 `;
 
-test("a rebuild completes in the child while the parent sits past the absolute RSS backstop", { timeout: 240_000 }, async (t) => {
+test("a rebuild completes in the child while the parent sits past the RSS ceiling both arms are handed", { timeout: 240_000 }, async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rebuild-inflated-parent-"));
   try {
     const fixture = await writeCompleteGenerationIndex(
       join(directory, "local-unified-index-v1.sqlite"),
       SUBPROCESS_FIXTURE_SHAPE,
     );
-    // 2 GiB absolute target + 64 MiB: past the backstop, the way the owner's
-    // companion idles at 1.88 GiB and crosses during any in-process attempt.
-    const ballastBytes = (2 * 1024 + 64) * 1024 * 1024;
+    // The scaled model of the shipped absolute: a parent resident twice its
+    // own ceiling, the way the owner's companion idles past the accounting
+    // target and crosses it during any in-process attempt. Asserted to BE a
+    // scaled model, so nobody later reads this ceiling as the product's.
+    assert.ok(
+      INFLATED_PARENT_CEILING_BYTES
+        < REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY.maximumRssBytes,
+      "the parameterised ceiling stands in for the shipped absolute and must "
+        + "stay below it; the shipped value is pinned by the policy tripwire",
+    );
+    const ballastBytes = INFLATED_PARENT_BALLAST_BYTES;
     const child = spawnSync(process.execPath, [
       "--input-type=module",
       "--eval",
@@ -999,21 +1041,33 @@ test("a rebuild completes in the child while the parent sits past the absolute R
         REBUILD_PARENT_NOW_MS: String(NOW),
         REBUILD_PARENT_BASELINES: JSON.stringify(DECLARED_SPEED_BASELINES),
         REBUILD_PARENT_BALLAST_BYTES: String(ballastBytes),
+        REBUILD_PARENT_CEILING_BYTES: String(INFLATED_PARENT_CEILING_BYTES),
       },
     });
     assert.equal(child.error, undefined, child.error?.message);
     assert.equal(child.signal, null, child.stderr);
     assert.equal(child.status, 0, child.stderr);
     const outcome = JSON.parse(child.stdout);
+    const asMiB = (bytes) => (bytes / 1024 / 1024).toFixed(0);
     t.diagnostic(
-      `parent RSS ${(outcome.parentRssBytes / 1024 / 1024).toFixed(0)} MiB; `
-        + "in-process deferred, isolated child completed",
+      `parent RSS ${asMiB(outcome.parentRssBytes)} MiB before and `
+        + `${asMiB(outcome.parentRssAfterBytes)} MiB after, against a `
+        + `${asMiB(INFLATED_PARENT_CEILING_BYTES)} MiB ceiling; in-process `
+        + "deferred, isolated child completed",
     );
     assert.equal(outcome.ballastByte, 0xa5);
-    // The parent genuinely sat past the 2 GiB absolute accounting target.
+    // The parent genuinely sat past the ceiling it handed both arms — before
+    // the first rebuild and still after the second, so the isolated arm did
+    // not succeed by the parent quietly shedding its residency in between.
     assert.ok(
-      outcome.parentRssBytes > 2 * 1024 * 1024 * 1024,
-      `parent RSS ${outcome.parentRssBytes} must exceed the absolute backstop`,
+      outcome.parentRssBytes > INFLATED_PARENT_CEILING_BYTES,
+      `parent RSS ${outcome.parentRssBytes} must exceed the ceiling `
+        + `${INFLATED_PARENT_CEILING_BYTES} before either rebuild`,
+    );
+    assert.ok(
+      outcome.parentRssAfterBytes > INFLATED_PARENT_CEILING_BYTES,
+      `parent RSS ${outcome.parentRssAfterBytes} must still exceed the ceiling `
+        + `${INFLATED_PARENT_CEILING_BYTES} after the isolated rebuild landed`,
     );
     // In-process: the incident, reproduced — the guard's first check defers
     // and no attempt could ever land (retained:false, nothing on disk yet).
@@ -1051,9 +1105,13 @@ test("a rebuild completes in the child while the parent sits past the absolute R
 //     reported as the opaque accounting_rebuild_subprocess_failed.
 //
 // Both paths end in a deferral, so from outside the difference is invisible —
-// which is precisely how a proposed 6 GiB RSS target came to be paired with a
-// 1 GiB child heap, leaving a guard that could never fire. These tests pin the
-// order itself: once at production values, once causally.
+// which is precisely how the first attempt at a 6 GiB RSS target came to be
+// paired with a 1 GiB child heap, leaving a guard that could never fire. That
+// target is now shipped, and deriving the cap from it is what makes the
+// pairing unrepresentable rather than merely discouraged. These tests pin the
+// order itself: once at production values, once causally. The causal pair runs
+// at its own small pressure point by design — the mechanism is scale-free, and
+// the SHIPPED numbers are the invariant test's job, not this one's.
 // ---------------------------------------------------------------------------
 
 test("the rebuild child is spawned with a heap cap at or above the RSS ceiling it is handed", async () => {
@@ -1124,6 +1182,21 @@ test("the rebuild child is spawned with a heap cap at or above the RSS ceiling i
         + `ceiling it is handed (${probe.requestMaximumRssBytes} bytes); below it, `
         + "V8 aborts the child before the guard can defer and the honest budget "
         + "reason is replaced by accounting_rebuild_subprocess_failed",
+    );
+    // ...and both sides of that inequality are the SHIPPED policy, not two
+    // small numbers that happen to be ordered. Without this pair the invariant
+    // above would hold just as well for a child launched with a toy ceiling
+    // and a toy cap, which is exactly the state a partial edit leaves behind.
+    assert.equal(
+      probe.requestMaximumRssBytes,
+      REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY.maximumRssBytes,
+      "the production spawn must hand the child the shipped absolute target",
+    );
+    assert.equal(
+      capBytes,
+      REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY.rebuildChildOldSpaceMib
+        * 1024 * 1024,
+      "the production spawn must carry the cap derived from that target",
     );
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -1242,6 +1315,17 @@ const CAP_ORDER_PRESSURE_MIB = 64;
 // (cap >= ceiling) without needing the shipped corpus to reach it.
 const CAP_ORDER_ROOMY_CAP_MIB = 512;
 const CAP_ORDER_UNREACHABLE_BUDGET_MIB = 8_192;
+// What arm 2's ceiling ACTUALLY resolves to. The build's effective ceiling is
+// min(the maximumRssBytes it is handed, baseline + the module's self-growth
+// delta), so asking for 8 GiB does not by itself put the ceiling out of reach —
+// the shipped delta is the other term and may well be the smaller one. Both
+// terms have to stay far above the pressure point, or "unreachable" quietly
+// becomes reachable, the guard fires in arm 2 as well, and the pair stops
+// isolating the cap as the only difference between the arms.
+const CAP_ORDER_ARM_TWO_EFFECTIVE_BUDGET_BYTES = Math.min(
+  CAP_ORDER_UNREACHABLE_BUDGET_MIB * 1024 * 1024,
+  REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY.rssDeltaBudgetBytes,
+);
 
 function runCapOrderArm({ oldSpaceMiB, budgetMiB, indexFile }) {
   return spawnSync(process.execPath, [
@@ -1303,6 +1387,13 @@ test("the same overflow is a typed budget miss above the cap and an untyped deat
     // reach so ONLY the cap can bite, and the same corpus at the same pressure
     // now kills the process outright: no code, no envelope, nothing for the
     // parent to classify beyond "the child died".
+    assert.ok(
+      CAP_ORDER_ARM_TWO_EFFECTIVE_BUDGET_BYTES
+        > 8 * CAP_ORDER_PRESSURE_MIB * 1024 * 1024,
+      "arm 2's ceiling must stay far out of reach of the pressure point, or "
+        + "the RSS guard fires here too and the arms stop differing only in "
+        + "the cap",
+    );
     const starved = runCapOrderArm({
       oldSpaceMiB: CAP_ORDER_PRESSURE_MIB,
       budgetMiB: CAP_ORDER_UNREACHABLE_BUDGET_MIB,

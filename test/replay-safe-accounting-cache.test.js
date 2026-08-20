@@ -4,6 +4,7 @@ import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY,
   REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
   assertReplaySafeAccountingCache,
   buildReplaySafeAccountingCache,
@@ -2909,13 +2910,72 @@ test("compact transition input ceilings fail closed without truncating or replac
   assert.equal((await stat(cacheFile)).mode & 0o777, 0o600);
 });
 
-// Effective-ceiling arithmetic mirrored from the module: absolute 2 GiB target,
-// 1.25 GiB self-growth delta, effective = min(absolute, baseline + delta).
-const ACCOUNTING_RSS_ABSOLUTE = 2 * 1024 * 1024 * 1024;
-const ACCOUNTING_RSS_DELTA = Math.floor(1.25 * 1024 * 1024 * 1024);
+// Effective-ceiling arithmetic READ FROM the module rather than mirrored:
+// effective = min(absolute, baseline + delta). The tests below pin that
+// RELATIONSHIP, so they keep testing the same property when the policy moves;
+// the shipped VALUES are pinned once, deliberately, by the tripwire directly
+// below. Mirrored literals here would have meant every ceiling test silently
+// encoding one particular number, which is how the 2026-08-20 raise found
+// three regressions asserting a ceiling the product no longer had.
+const ACCOUNTING_RSS_ABSOLUTE =
+  REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY.maximumRssBytes;
+const ACCOUNTING_RSS_DELTA =
+  REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY.rssDeltaBudgetBytes;
 // Mirrored from src/export/resource-policy.js: the shared export policy's own
 // RSS bound, which clamps the deep-scan guard independently of the above.
 const EXPORT_POLICY_MAX_RSS_BYTES = Math.floor(1.5 * 1024 * 1024 * 1024);
+// A realistic resting companion RSS after indexing a large history — the
+// baseline the in-process arm of the guard is actually shaped for.
+const REALISTIC_COMPANION_BASELINE = 800 * 1024 * 1024;
+
+test("the shipped accounting memory policy is the owner-set pair and a derived child cap", () => {
+  // THE TRIPWIRE, and the only place a literal ceiling lives. Everything else
+  // derives, so this is what a policy change has to come through — and the
+  // rationale for these numbers is in the constants themselves, not in a pull
+  // request that will not be read again.
+  assert.deepEqual(REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY, {
+    maximumRssBytes: 6 * 1024 * 1024 * 1024,
+    rssDeltaBudgetBytes: Math.floor(5.25 * 1024 * 1024 * 1024),
+    rebuildChildOldSpaceMib: 6_144,
+  });
+  // DERIVED, not coincident: the child's V8 old-space cap is the absolute
+  // target expressed in MiB. Because the effective ceiling is at most the
+  // absolute for every baseline, and whole-process RSS always exceeds the JS
+  // heap, this ordering is what guarantees the RSS guard reads before V8
+  // aborts — a typed accounting_transition_rss_limit_exceeded deferral rather
+  // than a SIGABRT the parent can only report as
+  // accounting_rebuild_subprocess_failed.
+  assert.equal(
+    REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY.rebuildChildOldSpaceMib * 1024 * 1024,
+    REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY.maximumRssBytes,
+  );
+  // Which arm binds where. Off the rebuild child's clean baseline the DELTA is
+  // the effective ceiling, so raising the absolute alone would have been inert
+  // there; the absolute only takes over above a fat in-process baseline. Both
+  // regimes are exercised by the two ceiling tests below, and pinning them
+  // here is what stops a future edit from moving a number until one of those
+  // tests is quietly testing the same arm twice.
+  const cleanChildBaseline = 60 * 1024 * 1024;
+  assert.ok(
+    cleanChildBaseline + ACCOUNTING_RSS_DELTA < ACCOUNTING_RSS_ABSOLUTE,
+    "off a clean child baseline the delta must be the binding ceiling",
+  );
+  assert.ok(
+    REALISTIC_COMPANION_BASELINE + ACCOUNTING_RSS_DELTA >= ACCOUNTING_RSS_ABSOLUTE,
+    "off a realistic companion baseline the absolute target must be the "
+      + "binding ceiling",
+  );
+  // The deep-scan phase is clamped by the shared export policy at any baseline
+  // below 1.5 GiB, the child's included. Asserted so the asymmetry stays a
+  // recorded decision (the observed deferrals were all on the transition path)
+  // rather than a surprise found in a later incident.
+  assert.ok(
+    EXPORT_POLICY_MAX_RSS_BYTES < cleanChildBaseline + ACCOUNTING_RSS_DELTA,
+    "the scan phase is expected to be clamped by the export policy rather "
+      + "than by the accounting delta; if that stops holding, the scan-guard "
+      + "regression below is asserting the wrong regime",
+  );
+});
 
 test("an RSS ceiling miss during accounting is a soft target: the prior cache is retained and served", async () => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rss-bound-"));
@@ -2987,9 +3047,17 @@ test("the RSS guard is budget-relative: a pass past the delta budget soft-fails 
   const before = await readTestCache(cacheFile);
   const baseline = 200 * 1024 * 1024;
   // Baseline capture and the start check see the companion's resting RSS; the
-  // post-scan check sees the pass one byte past its 1.25 GiB delta budget while
-  // still far UNDER the 2 GiB absolute ceiling — the delta arm binds, and it is
-  // a soft target: the prior cache is retained, the refresh does not fail.
+  // post-scan check sees the pass one byte past its delta budget while still
+  // UNDER the absolute ceiling — the delta arm binds, and it is a soft target:
+  // the prior cache is retained, the refresh does not fail. The premise is
+  // asserted rather than assumed, so a policy change that made the absolute
+  // the binding arm at this baseline fails here instead of leaving this test
+  // silently exercising the other arm.
+  assert.ok(
+    baseline + ACCOUNTING_RSS_DELTA < ACCOUNTING_RSS_ABSOLUTE,
+    "this test only exercises the delta arm while baseline + delta stays "
+      + "below the absolute ceiling",
+  );
   const samples = [baseline, baseline, baseline + ACCOUNTING_RSS_DELTA + 1];
 
   const outcome = await refreshReplaySafeAccountingCache({
@@ -3085,14 +3153,21 @@ test("a memory-budget miss with no prior cache degrades honestly without throwin
   assert.equal(served.cache, null);
 });
 
-test("a rebuild within the raised 2 GiB budget completes normally", async () => {
+test("the 2026-08-11 incident's own reading is in budget and rebuilds normally", async () => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rss-in-budget-"));
   const cacheFile = join(directory, "accounting.json");
-  const baseline = 800 * 1024 * 1024;
+  const baseline = REALISTIC_COMPANION_BASELINE;
   // The live-failure reading: ~800 MB baseline, the pass climbs to ~1.6 GB.
-  // Under the old 1.5 GiB ceiling / 512 MiB delta that hard-failed; under the
-  // raised 2 GiB target it is comfortably in budget and the cache builds.
+  // Under the then-current 1.5 GiB ceiling / 512 MiB delta that hard-failed
+  // and blanked the dashboard; every policy shipped since keeps it in budget,
+  // so the cache builds. Asserted against the live policy rather than a
+  // remembered ceiling, so this stays the incident's regression rather than a
+  // test of one particular number.
   const climbed = 1_600 * 1024 * 1024;
+  assert.ok(
+    climbed <= Math.min(ACCOUNTING_RSS_ABSOLUTE, baseline + ACCOUNTING_RSS_DELTA),
+    "the reading that caused the 2026-08-11 incident must stay in budget",
+  );
   let calls = 0;
   const cache = await refreshReplaySafeAccountingCache({
     cacheFile,
@@ -3113,8 +3188,8 @@ test("a rebuild within the raised 2 GiB budget completes normally", async () => 
   assert.equal(period(cache, "7d").events, 1);
 });
 
-test("the effective transition ceiling is the 2 GiB target for a realistic ~800 MB baseline", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rss-2gib-"));
+test("the absolute target is the effective transition ceiling for a realistic companion baseline", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rss-absolute-"));
   const cacheFile = join(directory, "accounting.json");
   await refreshReplaySafeAccountingCache({
     cacheFile,
@@ -3122,13 +3197,19 @@ test("the effective transition ceiling is the 2 GiB target for a realistic ~800 
     scan: scanner([]),
   });
   const before = await readTestCache(cacheFile);
-  const baseline = 800 * 1024 * 1024;
-  // Baseline capture + start check see the ~800 MB resting RSS; the post-scan
-  // transition-path check sees the pass one byte past the 2 GiB absolute
-  // target. min(2 GiB, 800 MB + 1.25 GiB = 2.05 GiB) = 2 GiB, so this is the
-  // exact boundary: paired with the "1.6 GB completes" test above it brackets
-  // the effective ceiling at ~2 GiB (the 1.6 GB the incident tripped at is now
-  // comfortably under budget), and crossing it is a soft target miss.
+  const baseline = REALISTIC_COMPANION_BASELINE;
+  // The other arm of the min(). Baseline capture + start check see the ~800 MB
+  // resting RSS; the post-scan transition-path check sees the pass one byte
+  // past the ABSOLUTE target, which at this baseline is the lower of the two
+  // and therefore the exact boundary. Paired with the "1.6 GB completes" test
+  // above this brackets the in-process effective ceiling (the 1.6 GB the
+  // 2026-08-11 incident tripped at is comfortably under budget at any shipped
+  // policy since), and crossing it is a soft target miss.
+  assert.ok(
+    baseline + ACCOUNTING_RSS_DELTA >= ACCOUNTING_RSS_ABSOLUTE,
+    "this test only exercises the absolute arm while a realistic baseline "
+      + "plus the delta reaches the absolute ceiling",
+  );
   const samples = [baseline, baseline, ACCOUNTING_RSS_ABSOLUTE + 1];
 
   const outcome = await refreshReplaySafeAccountingCache({
@@ -3197,10 +3278,16 @@ test("the scan resource guard inherits the budget-relative RSS ceiling", async (
     Math.min(baseline + ACCOUNTING_RSS_DELTA, EXPORT_POLICY_MAX_RSS_BYTES),
   );
   // At this modest baseline — the shape the rebuild child actually runs at —
-  // the budget-relative ceiling is the lower of the two, so the guard inherits
-  // it rather than the export policy's flat bound.
-  assert.equal(observedGuard?.limits.maximumRssBytes, baseline + ACCOUNTING_RSS_DELTA);
-  assert.ok(baseline + ACCOUNTING_RSS_DELTA < EXPORT_POLICY_MAX_RSS_BYTES);
+  // the export policy's flat bound is the lower of the two since the
+  // 2026-08-20 delta raise, so the scan phase is clamped by the export policy
+  // while the transition path runs at the full budget-relative ceiling. Pinned
+  // explicitly, because that split is a decision (the observed deferrals were
+  // all on the transition path) and not an accident of arithmetic.
+  assert.equal(
+    observedGuard?.limits.maximumRssBytes,
+    EXPORT_POLICY_MAX_RSS_BYTES,
+  );
+  assert.ok(EXPORT_POLICY_MAX_RSS_BYTES < baseline + ACCOUNTING_RSS_DELTA);
 });
 
 test("deep log scanning receives hard resource bounds and preserves the last cache when they trip", async () => {
