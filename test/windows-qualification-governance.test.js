@@ -46,6 +46,10 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
     resolve(REPOSITORY_ROOT, "scripts/windows-security-qualification.mjs"),
     "utf8",
   );
+  const portableDiagnosticScript = await readFile(
+    resolve(REPOSITORY_ROOT, "scripts/run-windows-portable-diagnostic.mjs"),
+    "utf8",
+  );
   assert.match(workflow, /^on:\n  workflow_dispatch:/mu);
   assert.doesNotMatch(workflow, /^\s+(?:push|pull_request):/mu);
   assert.match(workflow, /permissions:\n  contents: read\n/u);
@@ -54,7 +58,7 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /cache-mode:\n\s+- warm\n\s+- clean/u);
   assert.match(workflow, /matrix\.cache-mode == 'warm'/u);
   assert.doesNotMatch(workflow, /inputs\.clean-cache/u);
-  assert.match(workflow, /pnpm test:portable/u);
+  assert.match(workflow, /run-windows-portable-diagnostic\.mjs/u);
   assert.match(workflow, /windows-security-qualification\.mjs/u);
   assert.match(workflow, /\$nodeGypScript rebuild --directory native\/windows-filesystem/u);
   assert.match(
@@ -81,7 +85,7 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /Get-Content -LiteralPath \$portableLog -Tail 240/u);
   const diagnosticStep = workflow.slice(
     workflow.indexOf("- name: Run bounded Windows filesystem security diagnostic"),
-    workflow.indexOf("- name: Run portable Windows qualification"),
+    workflow.indexOf("- name: Run bounded per-file Windows portable diagnostic"),
   );
   assert.match(
     diagnosticStep,
@@ -125,6 +129,20 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.doesNotMatch(diagnosticStep, /continue-on-error/u);
   assert.doesNotMatch(diagnosticStep, /Start-Process|taskkill|Get-Content|\/PID|process\.pid|error\.message|stdout|stderr/u);
   assert.ok(diagnosticStep.length > 0, "the bounded diagnostic must precede the official lane");
+  const portableDiagnosticStep = workflow.slice(
+    workflow.indexOf("- name: Run bounded per-file Windows portable diagnostic"),
+    workflow.indexOf("- name: Run portable Windows qualification"),
+  );
+  assert.match(
+    portableDiagnosticStep,
+    /node \.\/scripts\/run-windows-portable-diagnostic\.mjs/u,
+  );
+  assert.match(portableDiagnosticStep, /if \(\$LASTEXITCODE -ne 0\)/u);
+  assert.doesNotMatch(
+    portableDiagnosticStep,
+    /Start-Process|taskkill|portableTimeout|USAGE_MONITOR_TEST_LANE_REPORTER=tap/u,
+  );
+  assert.ok(portableDiagnosticStep.length > 0);
   const portableStep = workflow.slice(
     workflow.indexOf("- name: Run portable Windows qualification"),
     workflow.indexOf("- name: Prepare disposable qualification state root"),
@@ -135,10 +153,26 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(portableStep, /Get-Content -LiteralPath \$portableLog -Tail 240/u);
   assert.doesNotMatch(portableStep, /Start-Process|taskkill|portableTimeout|USAGE_MONITOR_TEST_LANE_REPORTER=tap/u);
   assert.ok(
-    workflow.indexOf("Run portable Windows qualification")
+    workflow.indexOf("Run bounded per-file Windows portable diagnostic")
+      < workflow.indexOf("Run portable Windows qualification")
+      && workflow.indexOf("Run portable Windows qualification")
       < workflow.indexOf("Prepare disposable qualification state root"),
-    "the disposable CODEX_HOME must not affect the ordinary portable lane",
+    "the diagnostic and authoritative portable lanes must precede disposable qualification state",
   );
+  assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_TEST_FILES/u);
+  assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_TEST_TIMEOUT_MS = 60_000/u);
+  assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_SUITE_TIMEOUT_MS = 5 \* 60 \* 1_000/u);
+  assert.match(portableDiagnosticScript, /--test-concurrency=1/u);
+  assert.match(portableDiagnosticScript, /stdio: \["ignore", "ignore", "ignore"\]/u);
+  assert.match(portableDiagnosticScript, /taskkill\.exe/u);
+  assert.match(portableDiagnosticScript, /"\/pid"/u);
+  assert.match(portableDiagnosticScript, /"\/t"/u);
+  assert.match(portableDiagnosticScript, /"\/f"/u);
+  assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_DIAGNOSTIC_TEST_TIMED_OUT/u);
+  assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_DIAGNOSTIC_SUITE_TIMED_OUT/u);
+  assert.match(portableDiagnosticScript, /file=\$\{error\.file\}/u);
+  assert.match(portableDiagnosticScript, /ordinal=\$\{error\.ordinal\}/u);
+  assert.match(portableDiagnosticScript, /elapsed_ms=\$\{safeFailureElapsed\(error\)\}/u);
   assert.match(workflow, /pnpm install --frozen-lockfile --offline/u);
   assert.match(workflow, /--store-dir \$cleanStore/u);
   assert.match(workflow, /Canonical deferrals:/u);
