@@ -42,7 +42,7 @@ function metadata(identity, directory = false) {
   };
 }
 
-function binding(calls) {
+function binding(calls, publishError = null) {
   return {
     contractVersion: "windows-filesystem-v1",
     securityContractVersion: "windows-filesystem-security-v1",
@@ -101,6 +101,7 @@ function binding(calls) {
     },
     publishSqliteDatabase: (_root, _identity, stage, expectedStage, target, expectedTarget) => {
       calls.push(["publish", stage, expectedStage, target, expectedTarget]);
+      if (publishError !== null) throw publishError;
       return { published: true, identity: STAGE_IDENTITY };
     },
     // Prepared-artifact methods are outside this fixture's scope; provide
@@ -115,6 +116,13 @@ function binding(calls) {
     deletePreparedFile: () => ({ deleted: true, identity: ROOT_IDENTITY }),
     publishPreparedFile: () => ({ published: true, identity: ROOT_IDENTITY }),
   };
+}
+
+function nativePublishError(code, stage) {
+  const error = new Error("native diagnostic fixture");
+  error.code = code;
+  if (stage !== undefined) error.windowsFilesystemStage = stage;
+  return error;
 }
 
 test("Windows SQLite staging routes clone and publication through the native adapter", () => {
@@ -162,4 +170,96 @@ test("staging cleanup remains root-bound and identity-bound", () => {
     "local-unified-index-v1.sqlite.building-2",
     STAGE_IDENTITY,
   ]);
+});
+
+test("adapter preserves only allowlisted SQLite publish stages through ENOENT/EEXIST normalization", () => {
+  const publishStages = [
+    "publish_parse",
+    "publish_stage_open",
+    "publish_stage_preflight",
+    "publish_target_open",
+    "publish_target_preflight",
+    "publish_stage_revalidate",
+    "publish_target_revalidate",
+    "publish_rename",
+    "publish_stage_postvalidate",
+    "publish_target_postopen",
+    "publish_target_postvalidate",
+  ];
+  for (const [index, stage] of publishStages.entries()) {
+    const calls = [];
+    const adapter = createWindowsFilesystemAdapter({
+      platform: "win32",
+      architecture: "x64",
+      binding: binding(
+        calls,
+        nativePublishError(index % 2 === 0
+          ? "WINDOWS_FILESYSTEM_NOT_FOUND"
+          : "WINDOWS_FILESYSTEM_ALREADY_EXISTS", stage),
+      ),
+    });
+    assert.throws(
+      () => adapter.publishSqliteDatabase(
+        ROOT,
+        ROOT_IDENTITY,
+        "local-unified-index-v1.sqlite.building-1",
+        STAGE_IDENTITY,
+        "local-unified-index-v1.sqlite",
+        LIVE_IDENTITY,
+      ),
+      (error) => error.code === (index % 2 === 0 ? "ENOENT" : "EEXIST")
+        && error.windowsFilesystemStage === stage,
+    );
+  }
+});
+
+test("adapter drops unknown publish stages only on ENOENT/EEXIST conversion", () => {
+  for (const code of [
+    "WINDOWS_FILESYSTEM_NOT_FOUND",
+    "WINDOWS_FILESYSTEM_ALREADY_EXISTS",
+  ]) {
+    const calls = [];
+    const adapter = createWindowsFilesystemAdapter({
+      platform: "win32",
+      architecture: "x64",
+      binding: binding(calls, nativePublishError(code, "publish_not_allowlisted")),
+    });
+    assert.throws(
+      () => adapter.publishSqliteDatabase(
+        ROOT,
+        ROOT_IDENTITY,
+        "local-unified-index-v1.sqlite.building-1",
+        STAGE_IDENTITY,
+        "local-unified-index-v1.sqlite",
+        LIVE_IDENTITY,
+      ),
+      (error) => (error.code === (code.endsWith("NOT_FOUND") ? "ENOENT" : "EEXIST"))
+        && !Object.hasOwn(error, "windowsFilesystemStage"),
+    );
+  }
+});
+
+test("adapter preserves existing non-conversion native error behavior", () => {
+  const nativeError = nativePublishError(
+    "WINDOWS_FILESYSTEM_OPERATION_FAILED",
+    "publish_not_allowlisted",
+  );
+  const adapter = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding: binding([], nativeError),
+  });
+  assert.throws(
+    () => adapter.publishSqliteDatabase(
+      ROOT,
+      ROOT_IDENTITY,
+      "local-unified-index-v1.sqlite.building-1",
+      STAGE_IDENTITY,
+      "local-unified-index-v1.sqlite",
+      LIVE_IDENTITY,
+    ),
+    (error) => error === nativeError
+      && error.code === "WINDOWS_FILESYSTEM_OPERATION_FAILED"
+      && error.windowsFilesystemStage === "publish_not_allowlisted",
+  );
 });

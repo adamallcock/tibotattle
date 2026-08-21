@@ -318,3 +318,70 @@ test("qualification hooks are opt-in and cannot become the production artifact",
     /#if defined\(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK\)/u,
   );
 });
+
+test("SQLite publication diagnostics use the fixed ordered phase vocabulary", async () => {
+  const source = await readFile(
+    resolve(REPOSITORY_ROOT, "native/windows-filesystem/windows-filesystem.cc"),
+    "utf8",
+  );
+  const publishStart = source.indexOf("napi_value PublishSqliteDatabaseCallback(");
+  const publishEnd = source.indexOf("napi_value DeleteProtectedChildCallback(", publishStart);
+  assert.ok(publishStart >= 0 && publishEnd > publishStart);
+  const publishBody = source.slice(publishStart, publishEnd);
+  const stages = [
+    "publish_parse",
+    "publish_stage_open",
+    "publish_stage_preflight",
+    "publish_target_open",
+    "publish_target_preflight",
+    "publish_stage_revalidate",
+    "publish_target_revalidate",
+    "publish_rename",
+    "publish_stage_postvalidate",
+    "publish_target_postopen",
+    "publish_target_postvalidate",
+  ];
+  const stageAssignments = [
+    ...publishBody.matchAll(/failure\.stage = "(publish_[a-z_]+)";/gu),
+  ];
+  const failureBoundaries = [...publishBody.matchAll(/return ThrowFailure\(env,/gu)];
+  assert.equal(stageAssignments.length, failureBoundaries.length);
+  assert.deepEqual(
+    [...new Set(stageAssignments.map((match) => match[1]))],
+    stages,
+  );
+  assert.deepEqual(
+    stages.map((stage) => publishBody.indexOf(`failure.stage = "${stage}";`)),
+    [...stages]
+      .sort((left, right) => publishBody.indexOf(`failure.stage = "${left}";`)
+        - publishBody.indexOf(`failure.stage = "${right}";`))
+      .map((stage) => publishBody.indexOf(`failure.stage = "${stage}";`)),
+  );
+  assert.doesNotMatch(publishBody, /failure\.stage = "(?!publish_)[^"]+"/u);
+  const stageOpenBranchStart = publishBody.indexOf("if (!OpenSqliteStagingChild(");
+  const stageOpenBranchEnd = publishBody.indexOf("  if (!EqualIdentity", stageOpenBranchStart);
+  assert.ok(stageOpenBranchStart >= 0 && stageOpenBranchEnd > stageOpenBranchStart);
+  const stageOpenBranch = publishBody.slice(stageOpenBranchStart, stageOpenBranchEnd);
+  const stageOpenNormalizationOffset = stageOpenBranch.indexOf(
+    "if (failure.code == OperationFailed().code) failure = IdentityMismatch();",
+  );
+  const stageOpenAssignmentOffset = stageOpenBranch.indexOf(
+    'failure.stage = "publish_stage_open";',
+  );
+  const stageOpenThrowOffset = stageOpenBranch.indexOf(
+    "return ThrowFailure(env, failure);",
+  );
+  assert.ok(
+    stageOpenNormalizationOffset >= 0
+      && stageOpenNormalizationOffset < stageOpenAssignmentOffset
+      && stageOpenAssignmentOffset < stageOpenThrowOffset,
+  );
+  assert.match(
+    publishBody,
+    /RenameHandleRelative\([\s\S]*?\)\)\s*\{[\s\S]*?failure\.stage = "publish_rename";/u,
+  );
+  for (const match of failureBoundaries) {
+    const prefix = publishBody.slice(0, match.index);
+    assert.match(prefix, /failure\.stage = "publish_[a-z_]+";\s*$/u);
+  }
+});
