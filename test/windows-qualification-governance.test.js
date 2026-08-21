@@ -170,9 +170,19 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(portableDiagnosticScript, /"\/f"/u);
   assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_DIAGNOSTIC_TEST_TIMED_OUT/u);
   assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_DIAGNOSTIC_SUITE_TIMED_OUT/u);
-  assert.match(portableDiagnosticScript, /file=\$\{error\.file\}/u);
-  assert.match(portableDiagnosticScript, /ordinal=\$\{error\.ordinal\}/u);
+  assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_MAXIMUM_FAILURE_METADATA_ITEMS = 64/u);
+  assert.match(portableDiagnosticScript, /ORDINARY_TEST_FAILURE/u);
+  assert.match(portableDiagnosticScript, /error\?\.\[ORDINARY_TEST_FAILURE\] !== true/u);
+  assert.match(portableDiagnosticScript, /safeFailureLocation\(error\)/u);
+  assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_TEST_FILES\[error\.ordinal - 1\] !== error\.file/u);
+  assert.match(portableDiagnosticScript, /failure_count=\$\{aggregate\.failureCount\}/u);
+  assert.match(portableDiagnosticScript, /file=\$\{failure\.file\}/u);
+  assert.match(portableDiagnosticScript, /ordinal=\$\{failure\.ordinal\}/u);
   assert.match(portableDiagnosticScript, /elapsed_ms=\$\{safeFailureElapsed\(error\)\}/u);
+  assert.doesNotMatch(
+    portableDiagnosticScript,
+    /error\.message|child\.stdout|child\.stderr|pipe\(process\.(?:stdout|stderr)/u,
+  );
   assert.match(workflow, /pnpm install --frozen-lockfile --offline/u);
   assert.match(workflow, /--store-dir \$cleanStore/u);
   assert.match(workflow, /Canonical deferrals:/u);

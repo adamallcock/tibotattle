@@ -19,7 +19,9 @@ import { WINDOWS_PORTABLE_TEST_FILES } from "./portable-test-manifest.mjs";
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 export const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
 const MAXIMUM_TEST_FILES = 256;
+export const WINDOWS_PORTABLE_MAXIMUM_FAILURE_METADATA_ITEMS = 64;
 const TERMINATION_TIMEOUT_MS = 10_000;
+const ORDINARY_TEST_FAILURE = Symbol("ordinary-test-failure");
 
 export const WINDOWS_PORTABLE_TEST_TIMEOUT_MS = 60_000;
 // Keep the diagnostic pre-step bounded well below the workflow's 45-minute
@@ -54,6 +56,14 @@ function fixedError(code, metadata = {}) {
   if (typeof metadata.file === "string") error.file = metadata.file;
   if (Number.isSafeInteger(metadata.ordinal)) error.ordinal = metadata.ordinal;
   if (Number.isSafeInteger(metadata.elapsedMs)) error.elapsedMs = metadata.elapsedMs;
+  return error;
+}
+
+function markOrdinaryTestFailure(error) {
+  Object.defineProperty(error, ORDINARY_TEST_FAILURE, {
+    value: true,
+    enumerable: false,
+  });
   return error;
 }
 
@@ -138,6 +148,14 @@ function childIsRunning(child) {
     && child.signalCode === null;
 }
 
+function childIsClosed(child) {
+  return child !== null
+    && typeof child === "object"
+    && !childIsRunning(child)
+    && (Number.isSafeInteger(child.exitCode)
+      || typeof child.signalCode === "string");
+}
+
 /**
  * Kill only the process tree rooted at the child spawned by this runner.
  * Checking the live child before invoking taskkill avoids targeting a reused
@@ -156,23 +174,69 @@ export async function terminateWindowsPortableProcessTree(
     return typeof child.kill === "function" && child.kill("SIGKILL");
   }
   if (!Number.isSafeInteger(child.pid) || child.pid < 1
-      || typeof spawnProcess !== "function") {
+      || typeof spawnProcess !== "function"
+      || typeof child.once !== "function"
+      || typeof child.removeListener !== "function"
+      || !Number.isSafeInteger(timeoutMs)
+      || timeoutMs < 1) {
     return false;
   }
+  const targetPid = child.pid;
   return new Promise((resolveTermination) => {
     let settled = false;
+    let childClosed = false;
+    let killerSucceeded = false;
     let timer;
+    let killer;
+    const onChildClose = () => {
+      if (!childIsClosed(child)) {
+        finish(false);
+        return;
+      }
+      childClosed = true;
+      maybeFinish();
+    };
+    const onChildError = () => finish(false);
+    const onKillerError = () => finish(false);
+    const onKillerClose = (code) => {
+      if (code !== 0) {
+        finish(false);
+        return;
+      }
+      killerSucceeded = true;
+      maybeFinish();
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.removeListener("close", onChildClose);
+      child.removeListener("error", onChildError);
+      if (killer && typeof killer.removeListener === "function") {
+        killer.removeListener("error", onKillerError);
+        killer.removeListener("close", onKillerClose);
+      }
+    };
     const finish = (success) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      cleanup();
       resolveTermination(success);
     };
-    let killer;
+    const maybeFinish = () => {
+      if (killerSucceeded && childClosed) finish(true);
+    };
     try {
+      // Register the close proof before invoking taskkill so a fast child
+      // shutdown cannot be mistaken for a still-owned PID.
+      child.once("close", onChildClose);
+      child.once("error", onChildError);
+      if (settled || !childIsRunning(child)) {
+        finish(false);
+        return;
+      }
+      timer = setTimeout(() => finish(false), timeoutMs);
       killer = spawnProcess("taskkill.exe", [
         "/pid",
-        String(child.pid),
+        String(targetPid),
         "/t",
         "/f",
       ], {
@@ -180,17 +244,18 @@ export async function terminateWindowsPortableProcessTree(
         windowsHide: true,
         stdio: "ignore",
       });
-      if (!killer || typeof killer.once !== "function") {
+      if (!killer
+          || typeof killer.once !== "function"
+          || typeof killer.removeListener !== "function") {
         finish(false);
         return;
       }
+      killer.once("error", onKillerError);
+      killer.once("close", onKillerClose);
     } catch {
       finish(false);
       return;
     }
-    timer = setTimeout(() => finish(false), timeoutMs);
-    killer.once("error", () => finish(false));
-    killer.once("close", (code) => finish(code === 0));
   });
 }
 
@@ -240,14 +305,17 @@ function runPortableTestFile(
       clearTimeout(timeoutHandle);
       callback(value);
     };
-    const fail = (status) => settle(
-      rejectRun,
-      fixedError(status, {
+    const fail = (status, { ordinaryTestFailure = false } = {}) => {
+      const error = fixedError(status, {
         file,
         ordinal,
         elapsedMs: boundedElapsed(startedAt, timeoutMs),
-      }),
-    );
+      });
+      settle(
+        rejectRun,
+        ordinaryTestFailure ? markOrdinaryTestFailure(error) : error,
+      );
+    };
     const terminateWith = async (status) => {
       if (terminationRequested || settled) return;
       terminationRequested = true;
@@ -264,10 +332,16 @@ function runPortableTestFile(
     });
     child.once("close", (code) => {
       if (terminationRequested) return;
-      if (code === 0) {
+      if (code === 0 && child.signalCode === null) {
         settle(resolveRun, undefined);
         return;
       }
+      if (Number.isSafeInteger(code) && code > 0 && child.signalCode === null) {
+        fail(WINDOWS_PORTABLE_STATUS.failed, { ordinaryTestFailure: true });
+        return;
+      }
+      // A signal, malformed close result, or other child lifecycle failure is
+      // not an ordinary test assertion. Stop the diagnostic immediately.
       fail(WINDOWS_PORTABLE_STATUS.failed);
     });
   });
@@ -289,6 +363,7 @@ export async function runWindowsPortableTestFiles(
     globalTimeoutMs = WINDOWS_PORTABLE_SUITE_TIMEOUT_MS,
     spawnProcess = spawn,
     terminateProcessTree = terminateWindowsPortableProcessTree,
+    now = Date.now,
   } = {},
 ) {
   if (platform !== "win32" || architecture !== "x64") {
@@ -296,7 +371,8 @@ export async function runWindowsPortableTestFiles(
   }
   if (typeof cwd !== "string"
       || typeof spawnProcess !== "function"
-      || typeof terminateProcessTree !== "function") {
+      || typeof terminateProcessTree !== "function"
+      || typeof now !== "function") {
     throw fixedError(WINDOWS_PORTABLE_STATUS.invalid);
   }
   const selectedFiles = validateTestFiles(files, cwd);
@@ -309,9 +385,18 @@ export async function runWindowsPortableTestFiles(
       spawnProcess,
     })
     : terminateProcessTree;
-  const suiteStartedAt = Date.now();
+  const suiteStartedAt = now();
+  if (!Number.isSafeInteger(suiteStartedAt)) {
+    throw fixedError(WINDOWS_PORTABLE_STATUS.invalid);
+  }
+  let failureCount = 0;
+  const failures = [];
   for (let index = 0; index < selectedFiles.length; index += 1) {
-    const suiteElapsed = Date.now() - suiteStartedAt;
+    const suiteNow = now();
+    if (!Number.isSafeInteger(suiteNow)) {
+      throw fixedError(WINDOWS_PORTABLE_STATUS.invalid);
+    }
+    const suiteElapsed = suiteNow - suiteStartedAt;
     const remainingSuiteMs = selectedGlobalTimeoutMs - Math.max(0, suiteElapsed);
     if (remainingSuiteMs < 1) {
       throw fixedError(WINDOWS_PORTABLE_STATUS.suiteTimedOut, {
@@ -320,18 +405,37 @@ export async function runWindowsPortableTestFiles(
         elapsedMs: selectedGlobalTimeoutMs,
       });
     }
-    await runPortableTestFile(
-      selectedFiles[index],
-      index + 1,
-      {
-        cwd,
-        environment: childEnvironment,
-        timeoutMs: Math.min(selectedTimeoutMs, remainingSuiteMs),
-        platform,
-        spawnProcess,
-        terminateProcessTree: terminate,
-      },
-    );
+    try {
+      await runPortableTestFile(
+        selectedFiles[index],
+        index + 1,
+        {
+          cwd,
+          environment: childEnvironment,
+          timeoutMs: Math.min(selectedTimeoutMs, remainingSuiteMs),
+          platform,
+          spawnProcess,
+          terminateProcessTree: terminate,
+        },
+      );
+    } catch (error) {
+      if (error?.[ORDINARY_TEST_FAILURE] !== true) throw error;
+      failureCount += 1;
+      if (failures.length < WINDOWS_PORTABLE_MAXIMUM_FAILURE_METADATA_ITEMS) {
+        failures.push(Object.freeze({
+          file: selectedFiles[index],
+          ordinal: index + 1,
+          status: WINDOWS_PORTABLE_STATUS.failed,
+        }));
+      }
+    }
+  }
+  if (failureCount > 0) {
+    const aggregate = fixedError(WINDOWS_PORTABLE_STATUS.failed);
+    aggregate.failureCount = failureCount;
+    aggregate.failures = Object.freeze(failures);
+    aggregate.failuresTruncated = failureCount > failures.length;
+    throw Object.freeze(aggregate);
   }
   return Object.freeze({
     fileCount: selectedFiles.length,
@@ -356,23 +460,86 @@ function safeFailureElapsed(error) {
     : "unavailable";
 }
 
+function safeFailureLocation(error) {
+  if (typeof error?.file !== "string"
+      || !Number.isSafeInteger(error.ordinal)
+      || error.ordinal < 1
+      || error.ordinal > WINDOWS_PORTABLE_TEST_FILES.length
+      || WINDOWS_PORTABLE_TEST_FILES[error.ordinal - 1] !== error.file) {
+    return null;
+  }
+  return Object.freeze({ file: error.file, ordinal: error.ordinal });
+}
+
+function safeFailureMetadata(error) {
+  if (!Number.isSafeInteger(error?.failureCount)
+      || error.failureCount < 1
+      || error.failureCount > WINDOWS_PORTABLE_TEST_FILES.length
+      || !Array.isArray(error.failures)
+      || error.failures.length > WINDOWS_PORTABLE_MAXIMUM_FAILURE_METADATA_ITEMS
+      || error.failures.length
+        !== Math.min(error.failureCount, WINDOWS_PORTABLE_MAXIMUM_FAILURE_METADATA_ITEMS)
+      || typeof error.failuresTruncated !== "boolean"
+      || error.failuresTruncated !== (error.failureCount > error.failures.length)) {
+    return null;
+  }
+  const seenOrdinals = new Set();
+  const failures = [];
+  for (const failure of error.failures) {
+    if (failure === null
+        || typeof failure !== "object"
+        || typeof failure.file !== "string"
+        || !Number.isSafeInteger(failure.ordinal)
+        || failure.ordinal < 1
+        || failure.ordinal > WINDOWS_PORTABLE_TEST_FILES.length
+        || WINDOWS_PORTABLE_TEST_FILES[failure.ordinal - 1] !== failure.file
+        || failure.status !== WINDOWS_PORTABLE_STATUS.failed
+        || seenOrdinals.has(failure.ordinal)) {
+      return null;
+    }
+    seenOrdinals.add(failure.ordinal);
+    failures.push(Object.freeze({
+      file: failure.file,
+      ordinal: failure.ordinal,
+      status: WINDOWS_PORTABLE_STATUS.failed,
+    }));
+  }
+  return Object.freeze({
+    failureCount: error.failureCount,
+    failures: Object.freeze(failures),
+    failuresTruncated: error.failuresTruncated,
+  });
+}
+
+export function formatWindowsPortableDiagnosticFailure(error) {
+  const status = safeFailureStatus(error);
+  const aggregate = safeFailureMetadata(error);
+  if (aggregate !== null) {
+    return [
+      `${"WINDOWS_PORTABLE_DIAGNOSTIC_FAILED"}`
+        + ` failure_count=${aggregate.failureCount}`
+        + ` recorded_failures=${aggregate.failures.length}`
+        + ` truncated=${aggregate.failuresTruncated ? 1 : 0}`,
+      ...aggregate.failures.map((failure) =>
+        `WINDOWS_PORTABLE_DIAGNOSTIC_FAILURE file=${failure.file}`
+          + ` ordinal=${failure.ordinal} status=${failure.status}`),
+    ].join("\n");
+  }
+  const location = safeFailureLocation(error);
+  if (location !== null) {
+    return `WINDOWS_PORTABLE_DIAGNOSTIC_FAILED file=${location.file}`
+      + ` ordinal=${location.ordinal} status=${status}`
+      + ` elapsed_ms=${safeFailureElapsed(error)}`;
+  }
+  return status;
+}
+
 export async function main() {
   try {
     const result = await runWindowsPortableQualification();
     console.log(`${WINDOWS_PORTABLE_STATUS.passed} files=${result.fileCount}`);
   } catch (error) {
-    const status = safeFailureStatus(error);
-    if (typeof error?.file === "string"
-        && Number.isSafeInteger(error.ordinal)
-        && error.ordinal > 0) {
-      console.error(
-        `WINDOWS_PORTABLE_DIAGNOSTIC_FAILED file=${error.file}`
-          + ` ordinal=${error.ordinal} status=${status}`
-          + ` elapsed_ms=${safeFailureElapsed(error)}`,
-      );
-    } else {
-      console.error(status);
-    }
+    console.error(formatWindowsPortableDiagnosticFailure(error));
     process.exitCode = 1;
   }
 }
