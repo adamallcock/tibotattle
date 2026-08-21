@@ -928,8 +928,10 @@
       "callers": [
         "scripts/test-lanes.mjs",
         "test/test-lanes.test.js",
+        "test/windows-portable-diagnostic.test.js",
         "test/windows-skip-ledger.test.js",
         "test/windows-test-manifest.test.js",
+        "scripts/run-windows-portable-diagnostic.mjs",
         "docs/runbooks/2026-08-17-windows-portability-environments.md"
       ],
       "decision": "retain_as_internal_test_support",
@@ -1052,6 +1054,9 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/windows-portability.yml",
+        "test/windows-filesystem-prepared-artifact-native.test.js",
+        "test/windows-filesystem-security.test.js",
+        "test/windows-sqlite-state-session-native.test.js",
         "test/windows-qualification-governance.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
@@ -1115,6 +1120,7 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/windows-portability.yml",
+        "test/windows-finalizer-qualification-handoff.test.js",
         "test/windows-qualification-governance.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
@@ -1502,6 +1508,54 @@
       "decision": "retain_as_protected_release_sbom_support",
       "provenance": null,
       "provenanceReason": "The helper downloads and verifies the pinned Syft release, bounds SPDX output, and validates the final SBOM subject; focused SBOM action tests cover the boundary.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "export_test_infrastructure",
+      "canonicalPath": "scripts/run-windows-portable-diagnostic.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The diagnostic runner is invoked by the pinned Windows portability workflow, not as a supported npm command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/windows-portability.yml",
+        "test/windows-portable-diagnostic.test.js",
+        "test/windows-qualification-governance.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/verify-windows-finalizer-qualification-handoff.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The offline handoff verifier is a protected finalizer support entrypoint, not a supported npm command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/windows-finalizer-qualification-handoff.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/verify-windows-trusted-signing-preflight.mjs",
+      "stableAlias": "preflight:windows:trusted-signing",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.preflight:windows:trusted-signing",
+        "test/windows-trusted-signing-pin.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
+      "provenanceReason": null,
       "legacyPaths": []
     }
   ]

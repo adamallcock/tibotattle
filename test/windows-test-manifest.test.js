@@ -8,7 +8,7 @@ import {
 } from "../scripts/portable-test-manifest.mjs";
 
 test("Windows portable test deferrals are explicit, unique, and bounded", () => {
-  assert.equal(WINDOWS_DEFERRED_TESTS.length, 19);
+  assert.equal(WINDOWS_DEFERRED_TESTS.length, 28);
   const deferred = new Set();
   for (const entry of WINDOWS_DEFERRED_TESTS) {
     assert.deepEqual(Object.keys(entry).sort(), ["file", "reason"]);
@@ -25,10 +25,18 @@ test("Windows portable test deferrals are explicit, unique, and bounded", () => 
   );
   assert.deepEqual([...deferred].sort(), [
     "apps/local/server.test.mjs",
+    "test/claude-callback-lifecycle-owner-boundary.test.js",
+    "test/claude-callback-lifecycle.test.js",
+    "test/claude-callback-runtime.test.js",
+    "test/claude-desktop-quota-refresh.test.js",
     "test/codex-interleaved-usage-streams.test.js",
+    "test/contribution-device-capability.test.js",
+    "test/contribution-device-renewal.test.js",
     "test/contribution-sync-queue.test.js",
+    "test/electron-package-layout.test.js",
     "test/export-identity.test.js",
     "test/fast-mode-accounting.test.js",
+    "test/local-collector-state-session.test.js",
     "test/local-collector-state.test.js",
     "test/local-companion-data.test.js",
     "test/local-companion-refresh.test.js",
@@ -38,6 +46,7 @@ test("Windows portable test deferrals are explicit, unique, and bounded", () => 
     "test/quota-track-identity.test.js",
     "test/real-local-backend-acceptance.test.js",
     "test/telemetry-contribution-builder.test.js",
+    "test/tool-inventory.test.js",
     "test/weekly-pace-local-companion.test.js",
     "test/weekly-pace-refresh-integration.test.js",
     "test/windows-credential-operation-audit.test.js",
