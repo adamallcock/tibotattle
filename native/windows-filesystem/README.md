@@ -136,7 +136,8 @@ unbounded native allocation. File contents are flushed with
 `FlushFileBuffers` before create or publication completes. Windows has no
 portable directory-entry fsync equivalent: the binding attempts
 `FlushFileBuffers` on the held parent directory and treats the documented
-`ERROR_INVALID_HANDLE` result as the explicit metadata-durability boundary.
+unsupported-directory results (`ERROR_INVALID_HANDLE` or
+`ERROR_ACCESS_DENIED`) as the explicit metadata-durability boundary.
 Callers must retain and recover a staged directory if a process exits after a
 file deletion/rename but before the parent-directory metadata boundary can be
 observed.
