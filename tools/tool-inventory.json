@@ -505,6 +505,7 @@
         "test/codex-local-usage-analysis-boundary.test.js",
         "test/codex-provider-log-boundary.test.js",
         "test/contribution-owner-boundary.test.js",
+        "test/electron-app-package.test.js",
         "test/export-owner-boundary.test.js",
         "test/metadata-export-owner-boundary.test.js",
         "test/participant-identity-owner-boundary.test.js",
