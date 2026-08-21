@@ -112,7 +112,6 @@ const QUALIFICATION_TEST_FILES = Object.freeze([
   "test/windows-review-pair-storage.test.js",
   "test/windows-contribution-sync-queue-storage.test.js",
   "test/windows-prepared-contribution.test.js",
-  "test/local-collector-state-session.test.js",
   "test/windows-security-consumer-composition.test.js",
   "test/windows-sqlite-state-session-native.test.js",
   "test/claude-callback-windows-native.test.js",
@@ -122,6 +121,17 @@ const QUALIFICATION_TEST_FILES = Object.freeze([
   "test/windows-test-manifest.test.js",
 ]);
 export const WINDOWS_SECURITY_QUALIFICATION_TEST_FILES = QUALIFICATION_TEST_FILES;
+// Node's test runner executes multiple files in lexical order. Keep diagnostic
+// file coordinates numeric and stable without exposing filenames or paths.
+const QUALIFICATION_TAP_TEST_FILES = Object.freeze(
+  [...QUALIFICATION_TEST_FILES].sort(),
+);
+const QUALIFICATION_TAP_FILE_ORDINALS = new Map(
+  QUALIFICATION_TAP_TEST_FILES.map((file, index) => [
+    file.slice("test/".length),
+    index + 1,
+  ]),
+);
 // The native SQLite publication callback exposes only these fixed phase names.
 // Keep this list deliberately separate from the native binding so a malformed
 // TAP diagnostic cannot turn an arbitrary property value into CI output.
@@ -410,6 +420,40 @@ export function extractTapTestLocations(output) {
   return Object.freeze(locations);
 }
 
+/**
+ * Extract numeric file/line/column triples only for the exact qualification
+ * test set. The file ordinal is the one-based index in lexical execution
+ * order; no test filename or path crosses the content-free boundary.
+ */
+export function extractTapQualificationTestLocations(output) {
+  const locations = [];
+  if (typeof output !== "string") return Object.freeze(locations);
+  const seen = new Set();
+  const escapedFiles = [...QUALIFICATION_TAP_FILE_ORDINALS.keys()]
+    .map((file) => file.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"))
+    .join("|");
+  const pattern = new RegExp(
+    `(?:^|[\\s(])(?:(?:file:\\/\\/\\/|[A-Za-z]:[\\\\/]|[\\\\/])[^ \\t\\r\\n\"'()\\[\\]{}]*[\\\\/])?test[\\\\/](${escapedFiles}):(\\d+):(\\d+)(?=$|[^0-9])`,
+    "gu",
+  );
+  for (const line of output.split(/\r?\n/u)) {
+    for (const match of line.matchAll(pattern)) {
+      const fileOrdinal = QUALIFICATION_TAP_FILE_ORDINALS.get(match[1]) ?? null;
+      const sourceLine = safeTapTestIndex(Number.parseInt(match[2], 10));
+      const sourceColumn = safeTapTestIndex(Number.parseInt(match[3], 10));
+      if (fileOrdinal === null || sourceLine === null || sourceColumn === null) continue;
+      const key = `${fileOrdinal}:${sourceLine}:${sourceColumn}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      locations.push(Object.freeze([fileOrdinal, sourceLine, sourceColumn]));
+      if (locations.length === MAXIMUM_FAILURE_METADATA_ITEMS) {
+        return Object.freeze(locations);
+      }
+    }
+  }
+  return Object.freeze(locations);
+}
+
 function safeCapturedTapTestIndexes(value) {
   if (!Array.isArray(value) || value.length > MAXIMUM_FAILURE_METADATA_ITEMS) {
     return null;
@@ -444,6 +488,29 @@ function safeCapturedTapTestLocations(value) {
   return locations;
 }
 
+function safeCapturedTapQualificationTestLocations(value) {
+  if (!Array.isArray(value) || value.length > MAXIMUM_FAILURE_METADATA_ITEMS) {
+    return null;
+  }
+  const seen = new Set();
+  const locations = [];
+  for (const valueLocation of value) {
+    if (!Array.isArray(valueLocation) || valueLocation.length !== 3) return null;
+    const fileOrdinal = safeTapTestIndex(valueLocation[0]);
+    const line = safeTapTestIndex(valueLocation[1]);
+    const column = safeTapTestIndex(valueLocation[2]);
+    if (fileOrdinal === null
+        || fileOrdinal > QUALIFICATION_TAP_TEST_FILES.length
+        || line === null
+        || column === null) return null;
+    const key = `${fileOrdinal}:${line}:${column}`;
+    if (seen.has(key)) return null;
+    seen.add(key);
+    locations.push([fileOrdinal, line, column]);
+  }
+  return locations;
+}
+
 function safeQualificationFailureStatus(error) {
   return error?.code && Object.values(FIXED_STATUS).includes(error.code)
     ? error.code
@@ -462,12 +529,18 @@ export function formatWindowsSecurityQualificationFailure(error) {
   const testIndex = safeTapTestIndex(error?.testIndex) ?? "unavailable";
   const testIndexes = safeCapturedTapTestIndexes(error?.testIndexes);
   const testLocations = safeCapturedTapTestLocations(error?.testLocations);
+  const testFileLocations = safeCapturedTapQualificationTestLocations(
+    error?.testFileLocations,
+  );
   return `${status} test_index=${testIndex}`
     + ` test_indexes=${testIndexes !== null && testIndexes.length > 0
       ? testIndexes.join(",")
       : "unavailable"}`
     + ` test_locations=${testLocations !== null && testLocations.length > 0
       ? testLocations.map(([line, column]) => `${line}:${column}`).join(";")
+      : "unavailable"}`
+    + ` test_file_locations=${testFileLocations !== null && testFileLocations.length > 0
+      ? testFileLocations.map((location) => location.join(":")).join(";")
       : "unavailable"}`;
 }
 
@@ -523,6 +596,7 @@ function fixedFailureWithTapMetadata(output) {
   const error = fixedError(FIXED_STATUS.failed);
   error.testIndexes = extractTapTestIndexes(output);
   error.testLocations = extractTapTestLocations(output);
+  error.testFileLocations = extractTapQualificationTestLocations(output);
   error.testIndex = error.testIndexes[0] ?? null;
   error.publishStages = extractTapPublishStages(output);
   error.publishStage = error.publishStages[0] ?? null;
