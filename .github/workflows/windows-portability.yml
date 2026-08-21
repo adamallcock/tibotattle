@@ -425,21 +425,60 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $verificationLog = Join-Path $env:RUNNER_TEMP 'tibotattle-electron-verification.json'
+          $verificationFailureEvidencePath = Join-Path $env:RUNNER_TEMP 'tibotattle-electron-verification-failure.txt'
+          function Fail-ClosedVerifierArtifact {
+            param(
+              [Parameter(Mandatory = $true)][string]$StepStatus,
+              [Parameter(Mandatory = $true)][string]$MarkerStatus
+            )
+            try {
+              if (Test-Path -LiteralPath $verificationLog -PathType Leaf -ErrorAction Stop) {
+                Remove-Item -LiteralPath $verificationLog -Force -ErrorAction Stop
+              }
+              if (Test-Path -LiteralPath $verificationLog -ErrorAction Stop) {
+                throw 'verifier failure log remains'
+              }
+            } catch {
+              Write-Error 'WINDOWS_ELECTRON_VERIFICATION_LOG_DELETE_FAILED'
+              exit 1
+            }
+            [IO.File]::WriteAllText(
+              $verificationFailureEvidencePath,
+              "$MarkerStatus`n",
+              [Text.UTF8Encoding]::new($false)
+            )
+            "### Windows Electron development artifact verification" >> $env:GITHUB_STEP_SUMMARY
+            "- Status: blocked; fixed verifier status: $MarkerStatus" >> $env:GITHUB_STEP_SUMMARY
+            "- Executable retention: none; only the allowlisted status marker may be retained" >> $env:GITHUB_STEP_SUMMARY
+            Write-Error $StepStatus
+            exit 1
+          }
+          # Export the marker location, but do not create the marker until the
+          # raw verifier log has been deleted and its absence verified.
+          "TIBOTATTLE_ELECTRON_VERIFICATION_FAILURE_EVIDENCE_PATH=$verificationFailureEvidencePath" >> $env:GITHUB_ENV
           node ./scripts/verify-electron-development-artifact.mjs `
             --target win32-x64 `
             --app $env:TIBOTATTLE_ELECTRON_STAGED_APP_PATH `
             --asar $env:TIBOTATTLE_ELECTRON_ASAR_PATH `
             --unpacked $env:TIBOTATTLE_ELECTRON_UNPACKED_PATH *> $verificationLog
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error 'WINDOWS_ELECTRON_ARTIFACT_VERIFICATION_FAILED'
-            exit 1
+          $verificationExitCode = $LASTEXITCODE
+          if ($verificationExitCode -ne 0) {
+            $verificationStatus = node --input-type=module -e 'import { readFile } from "node:fs/promises"; import { parseFixedStatusOutput } from "./scripts/verify-electron-development-artifact.mjs"; const path = process.argv[1]; const output = await readFile(path, "utf8"); process.stdout.write(parseFixedStatusOutput(output));' -- $verificationLog
+            if ($LASTEXITCODE -ne 0 -or $null -eq $verificationStatus) {
+              $verificationStatus = 'ELECTRON_DEVELOPMENT_ARTIFACT_FAILED'
+            }
+            $verificationStatus = $verificationStatus.Trim()
+            Fail-ClosedVerifierArtifact `
+              -StepStatus 'WINDOWS_ELECTRON_ARTIFACT_VERIFICATION_FAILED' `
+              -MarkerStatus $verificationStatus
           }
           "TIBOTATTLE_ELECTRON_VERIFICATION_EVIDENCE_PATH=$verificationLog" >> $env:GITHUB_ENV
           try {
             $evidence = Get-Content -LiteralPath $verificationLog -Raw | ConvertFrom-Json
           } catch {
-            Write-Error 'WINDOWS_ELECTRON_ARTIFACT_EVIDENCE_INVALID'
-            exit 1
+            Fail-ClosedVerifierArtifact `
+              -StepStatus 'WINDOWS_ELECTRON_ARTIFACT_EVIDENCE_INVALID' `
+              -MarkerStatus 'ELECTRON_DEVELOPMENT_ARTIFACT_FAILED'
           }
           $evidenceJson = $evidence | ConvertTo-Json -Depth 10 -Compress
           if ($evidence.status -ne 'ELECTRON_DEVELOPMENT_ARTIFACT_VERIFIED' -or
@@ -449,8 +488,9 @@ jobs:
               $evidence.binding.bytes -ne [int64]$env:TIBOTATTLE_WINDOWS_BINDING_BYTES -or
               $evidence.binding.sha256 -ne $env:TIBOTATTLE_WINDOWS_BINDING_SHA256 -or
               $evidenceJson -match '(?i)(?:[A-Za-z]:[\\/]|/Users/|/home/|\\Users\\|password|secret|token|credential)') {
-            Write-Error 'WINDOWS_ELECTRON_ARTIFACT_EVIDENCE_NOT_CONTENT_FREE'
-            exit 1
+            Fail-ClosedVerifierArtifact `
+              -StepStatus 'WINDOWS_ELECTRON_ARTIFACT_EVIDENCE_NOT_CONTENT_FREE' `
+              -MarkerStatus 'ELECTRON_DEVELOPMENT_ARTIFACT_FAILED'
           }
           foreach ($name in @('staged', 'asar', 'unpacked', 'artifact')) {
             $inventory = $evidence.$name
@@ -460,8 +500,9 @@ jobs:
                 $inventory.count -lt 0 -or
                 $inventory.bytes -lt 0 -or
                 $inventory.sha256 -notmatch '^[0-9a-f]{64}$') {
-              Write-Error 'WINDOWS_ELECTRON_ARTIFACT_INVENTORY_INVALID'
-              exit 1
+              Fail-ClosedVerifierArtifact `
+                -StepStatus 'WINDOWS_ELECTRON_ARTIFACT_INVENTORY_INVALID' `
+                -MarkerStatus 'ELECTRON_DEVELOPMENT_ARTIFACT_FAILED'
             }
           }
           "### Windows Electron development artifact" >> $env:GITHUB_STEP_SUMMARY
@@ -480,19 +521,105 @@ jobs:
           "- Signing, notarization, installer, updater, and publication: not performed" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Run Windows Electron x64 runtime smoke
+        id: electron_runtime_smoke
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $runtimeRawPath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.raw'
           $runtimeEvidencePath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.json'
-          node ./scripts/smoke-electron-windows.mjs *> $runtimeEvidencePath
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_FAILED'
+          function Remove-VerifiedRuntimeRawOutput {
+            try {
+              if (Test-Path -LiteralPath $runtimeRawPath -PathType Leaf -ErrorAction Stop) {
+                Remove-Item -LiteralPath $runtimeRawPath -Force -ErrorAction Stop
+              }
+              if (Test-Path -LiteralPath $runtimeRawPath -ErrorAction Stop) {
+                throw 'runtime raw output remains'
+              }
+            } catch {
+              Write-Error 'WINDOWS_ELECTRON_RUNTIME_RAW_OUTPUT_DELETE_FAILED'
+              exit 1
+            }
+          }
+          # Retain only a closed aggregate. The smoke command's merged output
+          # is diagnostic input, never an upload candidate; it is normalized
+          # into this content-free shape below before the path is exported.
+          $defaultRuntimeEvidence = [ordered]@{
+            artifact = $false
+            dashboardReady = $false
+            syntheticRefresh = $false
+            secondInstanceRejected = $false
+            showHideTrayLifecycle = $false
+            cleanQuit = $false
+            noOrphan = $false
+            statePersistence = $false
+            credentialPersistence = $false
+            relaunchPersistence = $false
+            status = 'failed'
+            target = 'win32-x64'
+            contentFree = $true
+          }
+          [IO.File]::WriteAllText(
+            $runtimeEvidencePath,
+            "$($defaultRuntimeEvidence | ConvertTo-Json -Compress)`n",
+            [Text.UTF8Encoding]::new($false)
+          )
+          "TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH=$runtimeEvidencePath" >> $env:GITHUB_ENV
+          node ./scripts/smoke-electron-windows.mjs *> $runtimeRawPath
+          $runtimeExitCode = $LASTEXITCODE
+          $runtimeEvidence = $null
+          try {
+            $runtimeEvidence = Get-Content -LiteralPath $runtimeRawPath -Raw | ConvertFrom-Json
+            $expectedRuntimeKeys = @(
+              'artifact',
+              'dashboardReady',
+              'syntheticRefresh',
+              'secondInstanceRejected',
+              'showHideTrayLifecycle',
+              'cleanQuit',
+              'noOrphan',
+              'statePersistence',
+              'credentialPersistence',
+              'relaunchPersistence',
+              'status',
+              'target',
+              'contentFree'
+            ) | Sort-Object
+            $actualRuntimeKeys = @($runtimeEvidence.psobject.Properties.Name | Sort-Object)
+            if (($actualRuntimeKeys -join '|') -ne ($expectedRuntimeKeys -join '|')) {
+              throw 'runtime aggregate shape'
+            }
+            if ($runtimeEvidence.status -notin @('passed', 'failed') -or
+                $runtimeEvidence.target -ne 'win32-x64' -or
+                $runtimeEvidence.contentFree -isnot [bool] -or
+                $runtimeEvidence.contentFree -ne $true) {
+              throw 'runtime aggregate status'
+            }
+            foreach ($name in $expectedRuntimeKeys) {
+              if ($name -in @('status', 'target', 'contentFree')) { continue }
+              if ($runtimeEvidence.$name -isnot [bool]) {
+                throw 'runtime aggregate check'
+              }
+            }
+            $safeRuntimeEvidence = [ordered]@{}
+            foreach ($name in $expectedRuntimeKeys) {
+              $safeRuntimeEvidence[$name] = $runtimeEvidence.$name
+            }
+            [IO.File]::WriteAllText(
+              $runtimeEvidencePath,
+              "$($safeRuntimeEvidence | ConvertTo-Json -Compress)`n",
+              [Text.UTF8Encoding]::new($false)
+            )
+            $runtimeEvidence = $safeRuntimeEvidence | ConvertTo-Json -Compress | ConvertFrom-Json
+          } catch {
+            # Keep the pre-written all-false aggregate. No raw smoke output,
+            # path, command, process id, or exception text is retained.
+            Remove-VerifiedRuntimeRawOutput
+            Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_EVIDENCE_INVALID'
             exit 1
           }
-          try {
-            $runtimeEvidence = Get-Content -LiteralPath $runtimeEvidencePath -Raw | ConvertFrom-Json
-          } catch {
-            Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_EVIDENCE_INVALID'
+          Remove-VerifiedRuntimeRawOutput
+          if ($runtimeExitCode -ne 0) {
+            Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_FAILED'
             exit 1
           }
           $runtimeJson = $runtimeEvidence | ConvertTo-Json -Depth 10 -Compress
@@ -594,8 +721,26 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+      - name: Retain safe Windows Electron verifier failure evidence
+        if: ${{ always() && !cancelled() && steps.electron_artifact_verification.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tibotattle-windows-x64-electron-${{ github.sha }}-${{ matrix.cache-mode }}-verification-blocked
+          path: ${{ env.TIBOTATTLE_ELECTRON_VERIFICATION_FAILURE_EVIDENCE_PATH }}
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Retain safe Windows Electron runtime failure evidence
+        if: ${{ always() && !cancelled() && steps.electron_runtime_smoke.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tibotattle-windows-x64-electron-${{ github.sha }}-${{ matrix.cache-mode }}-runtime-blocked
+          path: ${{ env.TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH }}
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Retain blocked unsigned Windows x64 development artifact
-        if: ${{ always() && !cancelled() && steps.native_security_qualification.outcome == 'failure' && steps.electron_artifact_verification.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && steps.native_security_qualification.outcome == 'failure' && steps.electron_artifact_verification.outcome == 'success' && steps.electron_runtime_smoke.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tibotattle-windows-x64-electron-${{ github.sha }}-${{ matrix.cache-mode }}-blocked-development

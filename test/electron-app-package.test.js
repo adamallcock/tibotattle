@@ -106,7 +106,7 @@ test("Electron builder configuration is an unsigned macOS arm64 directory build"
       filter: ["**/*"],
     },
   ]);
-  assert.equal(BUILDER_CONFIG.asar, true);
+  assert.deepEqual(BUILDER_CONFIG.asar, { smartUnpack: false });
   assert.deepEqual(BUILDER_CONFIG.asarUnpack, [
     "node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
   ]);
@@ -130,6 +130,7 @@ test("Electron builder configuration exposes an unsigned Windows x64 directory t
     "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node",
     "native/windows-filesystem/build/Release/windows_filesystem.node",
   ]);
+  assert.deepEqual(config.asar, { smartUnpack: false });
   assert.deepEqual(config.win.target, [{ target: "dir", arch: ["x64"] }]);
   assert.equal(config.win.signAndEditExecutable, false);
   assert.equal(config.win.signExecutable, false);

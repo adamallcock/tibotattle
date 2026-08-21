@@ -13,6 +13,7 @@ import {
   createWindowsFilesystemAdapter,
   isWindowsFilesystemNotFound,
 } from "../src/platform/windows-filesystem.js";
+import { classifyWindowsSqliteError } from "../scripts/windows-security-qualification.mjs";
 
 const NATIVE_WINDOWS = process.platform === "win32" && process.arch === "x64";
 const NATIVE_SKIP = NATIVE_WINDOWS ? false : "native Windows x64 only";
@@ -152,6 +153,17 @@ function configureDurableDatabase(database) {
   assert.equal(Number(readPragma(database, "mmap_size")), 0);
 }
 
+function emitSqliteErrorDiagnostic(testContext, error) {
+  // This marker is emitted only by the Windows qualification child. The
+  // classifier reads Node's numeric errcode property and returns a fixed
+  // category; no SQLite message, SQL, path, filename, errno, or raw object is
+  // ever passed to the test diagnostic stream.
+  if (process.env.USAGE_MONITOR_WINDOWS_QUALIFICATION !== "1") return;
+  testContext.diagnostic(
+    `windowsSqliteErrorCategory: ${classifyWindowsSqliteError(error)}`,
+  );
+}
+
 function assertDatabaseLocation(database, expectedPath) {
   assert.equal(typeof database.location, "function");
   const actualPath = database.location("main");
@@ -271,7 +283,7 @@ async function withNativeRoot(run) {
 
 test("native Windows SQLite session qualifies durable recovery and lease contention", {
   skip: NATIVE_SKIP,
-}, async () => withNativeRoot(async ({ adapter, bindingPath, root, rootIdentity }) => {
+}, async (testContext) => withNativeRoot(async ({ adapter, bindingPath, root, rootIdentity }) => {
   // Same-process contention must be rejected before a second SQLite writer can
   // open the identity-bound database.
   const sameProcessLease = adapter.acquireSqliteStateLease(
@@ -326,7 +338,12 @@ test("native Windows SQLite session qualifies durable recovery and lease content
   });
   try {
     const { database } = first;
-    database.exec(`CREATE TABLE IF NOT EXISTS ${TABLE_NAME} (id INTEGER PRIMARY KEY, marker TEXT NOT NULL);`);
+    try {
+      database.exec(`CREATE TABLE IF NOT EXISTS ${TABLE_NAME} (id INTEGER PRIMARY KEY, marker TEXT NOT NULL);`);
+    } catch (error) {
+      emitSqliteErrorDiagnostic(testContext, error);
+      throw error;
+    }
     database.exec("BEGIN IMMEDIATE;");
     database.prepare(`INSERT INTO ${TABLE_NAME}(marker) VALUES ('committed-marker');`).run();
     database.exec("COMMIT;");
