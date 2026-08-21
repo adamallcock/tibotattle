@@ -164,6 +164,27 @@ export const FIXED_STATUS = Object.freeze({
 });
 
 const KNOWN_STATUSES = new Set(Object.values(FIXED_STATUS));
+const FAILURE_STATUSES = new Set(
+  Object.values(FIXED_STATUS).filter((status) => status !== FIXED_STATUS.verified),
+);
+
+/**
+ * Parse the verifier's failure stream without returning any caller-provided
+ * text.  The CLI deliberately emits one fixed status token on stderr when it
+ * rejects an artifact; callers which retain that stream must still treat it
+ * as untrusted until it has passed this allowlist.
+ */
+export function parseFixedStatusOutput(value) {
+  if (typeof value !== "string") return FIXED_STATUS.failed;
+  const lines = value
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length !== 1 || !FAILURE_STATUSES.has(lines[0])) {
+    return FIXED_STATUS.failed;
+  }
+  return lines[0];
+}
 
 function fixedError(status) {
   const error = new Error(status);

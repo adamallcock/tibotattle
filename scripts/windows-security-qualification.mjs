@@ -192,6 +192,72 @@ export const WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST = Object.freeze([
   "WINDOWS_FILESYSTEM_IDENTITY_MISMATCH",
   "WINDOWS_FILESYSTEM_OPERATION_FAILED",
 ]);
+
+// This is a qualification-only diagnostic for a narrow node:sqlite failure
+// seam.  Node's DatabaseSync native implementation publishes SQLite's
+// extended result code as the numeric `errcode` property; only the primary
+// low byte is used here.  Never inspect or forward `message`, `errstr`,
+// `code`, SQL, paths, or any other property from the thrown object.
+export const WINDOWS_SQLITE_ERROR_CATEGORY_ALLOWLIST = Object.freeze([
+  "BUSY_LOCKED",
+  "CANTOPEN_IOERR",
+  "READONLY",
+  "CORRUPT_NOTADB",
+  "OTHER",
+  "UNAVAILABLE",
+]);
+const SQLITE_PRIMARY_ERROR_CODES = Object.freeze({
+  busyLocked: Object.freeze([5, 6]),
+  cantopenIoerr: Object.freeze([10, 14]),
+  readonly: Object.freeze([8]),
+  corruptNotadb: Object.freeze([11, 26]),
+});
+const SQLITE_MAX_ERROR_CODE = 0x7fffffff;
+
+/**
+ * Map one numeric SQLite extended result code to a bounded diagnostic class.
+ * Invalid, missing, or non-numeric values remain explicitly unavailable.
+ */
+export function classifyWindowsSqliteErrorCode(errcode) {
+  if (!Number.isSafeInteger(errcode)
+      || errcode < 0
+      || errcode > SQLITE_MAX_ERROR_CODE) {
+    return "UNAVAILABLE";
+  }
+  const primaryCode = errcode % 256;
+  if (SQLITE_PRIMARY_ERROR_CODES.busyLocked.includes(primaryCode)) {
+    return "BUSY_LOCKED";
+  }
+  if (SQLITE_PRIMARY_ERROR_CODES.cantopenIoerr.includes(primaryCode)) {
+    return "CANTOPEN_IOERR";
+  }
+  if (SQLITE_PRIMARY_ERROR_CODES.readonly.includes(primaryCode)) {
+    return "READONLY";
+  }
+  if (SQLITE_PRIMARY_ERROR_CODES.corruptNotadb.includes(primaryCode)) {
+    return "CORRUPT_NOTADB";
+  }
+  return "OTHER";
+}
+
+/**
+ * Read only Node's documented/native numeric SQLite error field.  Requiring
+ * an own property keeps an arbitrary prototype value from being treated as a
+ * provenance-bearing Node SQLite result.  The returned value is always one
+ * of WINDOWS_SQLITE_ERROR_CATEGORY_ALLOWLIST.
+ */
+export function classifyWindowsSqliteError(error) {
+  try {
+    if (error === null
+        || (typeof error !== "object" && typeof error !== "function")
+        || !Object.hasOwn(error, "errcode")) {
+      return "UNAVAILABLE";
+    }
+    return classifyWindowsSqliteErrorCode(error.errcode);
+  } catch {
+    return "UNAVAILABLE";
+  }
+}
 const QUALIFICATION_ENVIRONMENT = "USAGE_MONITOR_WINDOWS_QUALIFICATION";
 const QUALIFICATION_REVISION_ENVIRONMENT = "TIBOTATTLE_QUALIFICATION_REVISION";
 const QUALIFICATION_CACHE_MODE_ENVIRONMENT = "TIBOTATTLE_QUALIFICATION_CACHE_MODE";
@@ -537,6 +603,27 @@ function safeCapturedTapQualificationTestLocations(value) {
   return locations;
 }
 
+function safeCapturedSqliteErrorCategories(value) {
+  if (!Array.isArray(value) || value.length > MAXIMUM_FAILURE_METADATA_ITEMS) {
+    return null;
+  }
+  const categories = [];
+  const seen = new Set();
+  try {
+    for (const category of value) {
+      if (!WINDOWS_SQLITE_ERROR_CATEGORY_ALLOWLIST.includes(category)
+          || seen.has(category)) {
+        return null;
+      }
+      seen.add(category);
+      categories.push(category);
+    }
+  } catch {
+    return null;
+  }
+  return Object.freeze(categories);
+}
+
 function safeQualificationFailureStatus(error) {
   return error?.code && Object.values(FIXED_STATUS).includes(error.code)
     ? error.code
@@ -566,6 +653,9 @@ export function formatWindowsSecurityQualificationFailure(error) {
     )
     ? error.nativeErrors
     : null;
+  const sqliteErrorCategories = safeCapturedSqliteErrorCategories(
+    error?.sqliteErrorCategories,
+  );
   const preparedStages = Array.isArray(error?.preparedStages)
     && error.preparedStages.length <= MAXIMUM_FAILURE_METADATA_ITEMS
     && error.preparedStages.every(
@@ -591,6 +681,10 @@ export function formatWindowsSecurityQualificationFailure(error) {
         ? preparedErrors.join(",")
         : "unavailable"}`
     : "";
+  const sqliteMetadata = sqliteErrorCategories !== null
+      && sqliteErrorCategories.length > 0
+    ? ` sqlite_error_categories=${sqliteErrorCategories.join(",")}`
+    : "";
   return `${status} test_index=${testIndex}`
     + ` test_indexes=${testIndexes !== null && testIndexes.length > 0
       ? testIndexes.join(",")
@@ -604,6 +698,7 @@ export function formatWindowsSecurityQualificationFailure(error) {
     + ` native_errors=${nativeErrors !== null && nativeErrors.length > 0
       ? nativeErrors.join(",")
       : "unavailable"}`
+    + sqliteMetadata
     + preparedMetadata;
 }
 
@@ -720,12 +815,42 @@ export function extractTapNativeErrors(output) {
   return Object.freeze(errors);
 }
 
+/**
+ * Extract only the fixed SQLite error category emitted by the one
+ * qualification-only diagnostic seam.  The line must be an exact TAP
+ * diagnostic with one allowlisted value; no surrounding text is accepted.
+ */
+export function extractTapSqliteErrorCategories(output) {
+  const categories = [];
+  if (typeof output !== "string") return Object.freeze(categories);
+  const seen = new Set();
+  const escapedCategories = WINDOWS_SQLITE_ERROR_CATEGORY_ALLOWLIST
+    .map((category) => category.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"))
+    .join("|");
+  const pattern = new RegExp(
+    `^\\s*#\\s+windowsSqliteErrorCategory\\s*:\\s*(${escapedCategories})\\s*$`,
+    "gmu",
+  );
+  for (const match of output.matchAll(pattern)) {
+    const category = match[1];
+    if (seen.has(category)) continue;
+    seen.add(category);
+    categories.push(category);
+    if (categories.length === MAXIMUM_FAILURE_METADATA_ITEMS) break;
+  }
+  return Object.freeze(categories);
+}
+
+export const extractTapWindowsSqliteErrorCategories = extractTapSqliteErrorCategories;
+
 function fixedFailureWithTapMetadata(output) {
   const error = fixedError(FIXED_STATUS.failed);
   error.testIndexes = extractTapTestIndexes(output);
   error.testLocations = extractTapTestLocations(output);
   error.testFileLocations = extractTapQualificationTestLocations(output);
   error.nativeErrors = extractTapNativeErrors(output);
+  error.sqliteErrorCategories = extractTapSqliteErrorCategories(output);
+  error.sqliteErrorCategory = error.sqliteErrorCategories[0] ?? null;
   error.testIndex = error.testIndexes[0] ?? null;
   error.publishStages = extractTapPublishStages(output);
   error.publishStage = error.publishStages[0] ?? null;

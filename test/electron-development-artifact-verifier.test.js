@@ -17,6 +17,7 @@ import test from "node:test";
 import {
   FIXED_STATUS,
   parseArguments,
+  parseFixedStatusOutput,
   verifyElectronDevelopmentArtifact,
 } from "../scripts/verify-electron-development-artifact.mjs";
 
@@ -581,4 +582,32 @@ test("requires explicit target and artifact paths", () => {
     () => parseArguments(["--target", "windows"]),
     (error) => error.code === FIXED_STATUS.inputInvalid,
   );
+});
+
+test("parses only one allowlisted content-free verifier status", () => {
+  assert.equal(
+    parseFixedStatusOutput(`${FIXED_STATUS.bindingInvalid}\r\n`),
+    FIXED_STATUS.bindingInvalid,
+  );
+  assert.equal(
+    parseFixedStatusOutput(`${FIXED_STATUS.inputMissing}\n`),
+    FIXED_STATUS.inputMissing,
+  );
+  assert.equal(
+    parseFixedStatusOutput(`${FIXED_STATUS.bindingInvalid}\nextra output\n`),
+    FIXED_STATUS.failed,
+  );
+  assert.equal(
+    parseFixedStatusOutput("ELECTRON_DEVELOPMENT_ARTIFACT_UNKNOWN\n"),
+    FIXED_STATUS.failed,
+  );
+  assert.equal(
+    parseFixedStatusOutput(`${FIXED_STATUS.verified}\n`),
+    FIXED_STATUS.failed,
+  );
+  assert.equal(
+    parseFixedStatusOutput(`${FIXED_STATUS.bindingInvalid} path=/private/secret\n`),
+    FIXED_STATUS.failed,
+  );
+  assert.equal(parseFixedStatusOutput(null), FIXED_STATUS.failed);
 });
