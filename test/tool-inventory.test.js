@@ -307,7 +307,7 @@ test("the checked-in inventory classifies every retained tool entry point and np
   // social-card generation (98fe9c9) but was never inventoried — the sixth
   // instance of the merged-change-with-stale-pin class this week.
   assert.equal(result.records, 78);
-  assert.equal(result.candidates.length, 79);
+  assert.equal(result.candidates.length, 80);
   assert.ok(result.aliases >= 25);
 });
 
