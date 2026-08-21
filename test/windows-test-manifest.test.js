@@ -8,7 +8,7 @@ import {
 } from "../scripts/portable-test-manifest.mjs";
 
 test("Windows portable test deferrals are explicit, unique, and bounded", () => {
-  assert.equal(WINDOWS_DEFERRED_TESTS.length, 2);
+  assert.equal(WINDOWS_DEFERRED_TESTS.length, 19);
   const deferred = new Set();
   for (const entry of WINDOWS_DEFERRED_TESTS) {
     assert.deepEqual(Object.keys(entry).sort(), ["file", "reason"]);
@@ -24,7 +24,24 @@ test("Windows portable test deferrals are explicit, unique, and bounded", () => 
     PORTABLE_TEST_FILES.filter((file) => !deferred.has(file)),
   );
   assert.deepEqual([...deferred].sort(), [
+    "apps/local/server.test.mjs",
+    "test/codex-interleaved-usage-streams.test.js",
+    "test/contribution-sync-queue.test.js",
     "test/export-identity.test.js",
     "test/fast-mode-accounting.test.js",
+    "test/local-collector-state.test.js",
+    "test/local-companion-data.test.js",
+    "test/local-companion-refresh.test.js",
+    "test/local-contribution-preparation.test.js",
+    "test/portable-local-companion-process.test.js",
+    "test/prospective-collector-cli.test.js",
+    "test/quota-track-identity.test.js",
+    "test/real-local-backend-acceptance.test.js",
+    "test/telemetry-contribution-builder.test.js",
+    "test/weekly-pace-local-companion.test.js",
+    "test/weekly-pace-refresh-integration.test.js",
+    "test/windows-credential-operation-audit.test.js",
+    "test/windows-filesystem-companion-instance-lease.test.js",
+    "test/windows-sqlite-state-session-contract.test.js",
   ]);
 });
