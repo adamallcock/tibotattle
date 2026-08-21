@@ -6,6 +6,7 @@ import {
   link,
   lstat,
   mkdtemp,
+  readFile,
   readdir,
   rename,
   rm,
@@ -14,7 +15,6 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve, win32 } from "node:path";
 import test from "node:test";
-import { once } from "node:events";
 import { Worker } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
 
@@ -37,6 +37,18 @@ const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const QUALIFICATION_BINDING_ENVIRONMENT =
   "TIBOTATTLE_WINDOWS_QUALIFICATION_BINDING_PATH";
 const QUALIFICATION_BINDING_FILE = "windows_filesystem_qualification.node";
+const SQLITE_LEASE_CHILD_FIXTURE = fileURLToPath(new URL(
+  "./fixtures/windows-sqlite-state-session-child.mjs",
+  import.meta.url,
+));
+const SQLITE_CHILD_READY_TIMEOUT_MS = 10_000;
+const SQLITE_CHILD_CLEANUP_TIMEOUT_MS = 5_000;
+const QUALIFICATION_CLEANUP_TIMEOUT_MS = 5_000;
+const QUALIFICATION_ATTACK_TIMEOUT_MS = 5_000;
+const FINAL_TARGET_MUTATION_FAILURE_CODES = new Set([
+  "WINDOWS_FILESYSTEM_IDENTITY_MISMATCH",
+  "WINDOWS_FILESYSTEM_INVALID_PATH",
+]);
 
 function qualificationBindingPath() {
   const configured = process.env[QUALIFICATION_BINDING_ENVIRONMENT];
@@ -63,64 +75,130 @@ function loadQualificationBinding(bindingPath = qualificationBindingPath()) {
   return requireNative(bindingPath);
 }
 
-async function startSqliteLeaseChild({ bindingPath, root, rootIdentity, databaseName }) {
+function awaitWithin(promise, timeoutMs, timeoutCode) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    let settled = false;
+    let timer;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      callback(value);
+    };
+    timer = setTimeout(() => {
+      finish(rejectPromise, new Error(timeoutCode));
+    }, timeoutMs);
+    Promise.resolve(promise).then(
+      (value) => finish(resolvePromise, value),
+      (error) => finish(rejectPromise, error),
+    );
+  });
+}
+
+function startSqliteLeaseChild({ bindingPath, root, rootIdentity, databaseName }) {
   const child = spawn(process.execPath, [
-    "-e",
-    `
-      const binding = require(process.argv[1]);
-      const root = process.argv[2];
-      const rootIdentity = JSON.parse(process.argv[3]);
-      const databaseName = process.argv[4];
-      try {
-        const lease = binding.acquireSqliteStateLease(root, rootIdentity, databaseName);
-        process.stdout.write("READY\\n");
-        process.stdin.once("data", () => {
-          binding.releaseSqliteStateLease(lease.lease);
-          process.exit(0);
-        });
-        process.stdin.resume();
-      } catch (error) {
-        process.stdout.write(\`ERROR:\${typeof error?.code === "string" ? error.code : "UNKNOWN"}\\n\`);
-        process.exit(2);
-      }
-    `,
+    SQLITE_LEASE_CHILD_FIXTURE,
+    "hold",
     bindingPath,
     root,
     JSON.stringify(rootIdentity),
     databaseName,
-  ], { stdio: ["pipe", "pipe", "ignore"] });
-  const ready = new Promise((resolveReady, rejectReady) => {
+  ], {
+    stdio: ["pipe", "pipe", "ignore"],
+    windowsHide: true,
+  });
+  let output = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    output += chunk;
+  });
+  child.stdin.on("error", () => {
+    // Cleanup can race a child that has already exited. The fixed child status
+    // and exit result remain authoritative; never expose the pipe error.
+  });
+  const exit = new Promise((resolveExit, rejectExit) => {
     let settled = false;
-    let output = "";
-    const timer = setTimeout(() => {
+    const finish = (callback, value) => {
       if (settled) return;
       settled = true;
-      void child.kill();
-      rejectReady(new Error("WINDOWS_FILESYSTEM_SQLITE_CHILD_TIMEOUT"));
-    }, 10_000);
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      if (settled) return;
-      output += chunk;
-      if (output.includes("READY\\n")) {
-        settled = true;
-        clearTimeout(timer);
-        resolveReady();
-      } else if (output.includes("ERROR:")) {
-        settled = true;
-        clearTimeout(timer);
-        rejectReady(new Error("WINDOWS_FILESYSTEM_SQLITE_CHILD_FAILED"));
-      }
-    });
-    child.once("error", (error) => {
+      callback(value);
+    };
+    child.once("error", () => finish(rejectExit,
+      new Error("WINDOWS_FILESYSTEM_SQLITE_CHILD_SPAWN_FAILED")));
+    child.once("exit", (code, signal) => finish(resolveExit, { code, signal }));
+  });
+  const marker = (expected) => new Promise((resolveMarker, rejectMarker) => {
+    let settled = false;
+    let timingOut = false;
+    const finish = (callback, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      rejectReady(error);
+      callback(value);
+    };
+    const check = () => {
+      if (output.includes(expected)) {
+        finish(resolveMarker, undefined);
+      } else if (output.includes("WINDOWS_SQLITE_STATE_CHILD_FAILED\n")) {
+        finish(rejectMarker, new Error("WINDOWS_FILESYSTEM_SQLITE_CHILD_FAILED"));
+      }
+    };
+    const timer = setTimeout(() => {
+      timingOut = true;
+      void (async () => {
+        if (child.exitCode === null) child.kill("SIGKILL");
+        try {
+          await awaitWithin(
+            exit,
+            SQLITE_CHILD_CLEANUP_TIMEOUT_MS,
+            "WINDOWS_FILESYSTEM_SQLITE_CHILD_CLEANUP_TIMEOUT",
+          );
+        } catch {
+          // The fixed timeout status remains authoritative.
+        }
+        finish(rejectMarker, new Error("WINDOWS_FILESYSTEM_SQLITE_CHILD_TIMEOUT"));
+      })();
+    }, SQLITE_CHILD_READY_TIMEOUT_MS);
+    child.stdout.on("data", check);
+    child.once("error", () => {
+      finish(rejectMarker, new Error("WINDOWS_FILESYSTEM_SQLITE_CHILD_SPAWN_FAILED"));
     });
+    child.once("exit", () => {
+      if (!timingOut) {
+        finish(rejectMarker, new Error("WINDOWS_FILESYSTEM_SQLITE_CHILD_EXITED_EARLY"));
+      }
+    });
+    check();
   });
-  await ready;
-  return child;
+  const release = async () => {
+    try {
+      if (child.exitCode === null && !child.stdin.destroyed) {
+        child.stdin.end("release\n");
+      }
+      const result = await awaitWithin(
+        exit,
+        SQLITE_CHILD_CLEANUP_TIMEOUT_MS,
+        "WINDOWS_FILESYSTEM_SQLITE_CHILD_CLEANUP_TIMEOUT",
+      );
+      if (result.code !== 0
+          || output !== "WINDOWS_SQLITE_STATE_CHILD_READY\nWINDOWS_SQLITE_STATE_CHILD_RELEASED\n") {
+        throw new Error("WINDOWS_FILESYSTEM_SQLITE_CHILD_RELEASE_FAILED");
+      }
+    } catch (error) {
+      if (child.exitCode === null) child.kill("SIGKILL");
+      try {
+        await awaitWithin(
+          exit,
+          SQLITE_CHILD_CLEANUP_TIMEOUT_MS,
+          "WINDOWS_FILESYSTEM_SQLITE_CHILD_CLEANUP_TIMEOUT",
+        );
+      } catch {
+        // Preserve the fixed release/timeout error above.
+      }
+      throw error;
+    }
+  };
+  return { child, exit, marker, output: () => output, release };
 }
 
 function runReplacementWorker({ bindingPath, path, expectedIdentity, bytes }) {
@@ -220,7 +298,7 @@ async function assertBoundedFilesystemRejection(operation, attackerPromises) {
         new Promise((_, reject) => {
           timer = setTimeout(
             () => reject(new Error("WINDOWS_FILESYSTEM_QUALIFICATION_RACE_TIMEOUT")),
-            5000,
+            QUALIFICATION_ATTACK_TIMEOUT_MS,
           );
         }),
       ]),
@@ -228,6 +306,27 @@ async function assertBoundedFilesystemRejection(operation, attackerPromises) {
     );
   } finally {
     clearTimeout(timer);
+  }
+}
+
+async function attemptBoundedFilesystemMutation(operation, attackerPromises) {
+  const attempt = Promise.resolve().then(operation);
+  attackerPromises.push(attempt);
+  try {
+    await awaitWithin(
+      attempt,
+      QUALIFICATION_ATTACK_TIMEOUT_MS,
+      "WINDOWS_FILESYSTEM_QUALIFICATION_RACE_TIMEOUT",
+    );
+    return true;
+  } catch (error) {
+    if (error?.message === "WINDOWS_FILESYSTEM_QUALIFICATION_RACE_TIMEOUT") {
+      throw error;
+    }
+    if (!REVIEWED_SHARING_OR_PERMISSION_CODES.has(error?.code)) {
+      throw error;
+    }
+    return false;
   }
 }
 
@@ -243,6 +342,7 @@ async function withPausedReplacement(run) {
   const binding = loadQualificationBinding(bindingPath);
   let operation;
   const attackerPromises = [];
+  let primaryError;
   try {
     binding.ensureDirectory(root);
     binding.ensureDirectory(ancestor);
@@ -275,19 +375,61 @@ async function withPausedReplacement(run) {
       attackerPromises,
       release: () => binding.releaseReplacementPause(),
     });
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
+    const cleanupErrors = [];
     if (operation !== undefined) {
-      binding.releaseReplacementPause();
-      await Promise.allSettled(attackerPromises);
-      await operation.result.catch(() => {});
-      await operation.worker.terminate();
+      try {
+        binding.releaseReplacementPause();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      try {
+        await awaitWithin(
+          Promise.allSettled(attackerPromises),
+          QUALIFICATION_CLEANUP_TIMEOUT_MS,
+          "WINDOWS_FILESYSTEM_QUALIFICATION_ATTACKER_CLEANUP_TIMEOUT",
+        );
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      try {
+        await awaitWithin(
+          operation.result.catch(() => {}),
+          QUALIFICATION_CLEANUP_TIMEOUT_MS,
+          "WINDOWS_FILESYSTEM_QUALIFICATION_WORKER_RESULT_TIMEOUT",
+        );
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      try {
+        await awaitWithin(
+          operation.worker.terminate(),
+          QUALIFICATION_CLEANUP_TIMEOUT_MS,
+          "WINDOWS_FILESYSTEM_QUALIFICATION_WORKER_CLEANUP_TIMEOUT",
+        );
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
     }
-    await rm(parent, { recursive: true, force: true });
+    try {
+      await awaitWithin(
+        rm(parent, { recursive: true, force: true }),
+        QUALIFICATION_CLEANUP_TIMEOUT_MS,
+        "WINDOWS_FILESYSTEM_QUALIFICATION_ROOT_CLEANUP_TIMEOUT",
+      );
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    if (primaryError === undefined && cleanupErrors.length > 0) {
+      throw cleanupErrors[0];
+    }
   }
 }
 
 async function assertOriginalReplacementPaths({
-  binding,
   path,
   ancestor,
   movedAncestor,
@@ -301,7 +443,11 @@ async function assertOriginalReplacementPaths({
   assert.equal(sourceStat.isFile(), true);
   assert.equal(sourceStat.isSymbolicLink(), false);
   assert.equal(sourceStat.size, originalBytes.byteLength);
-  assert.deepEqual(binding.readFile(path).data, originalBytes);
+  // The paused native replacement deliberately holds the destination with
+  // DELETE sharing. The binding read primitive requests an incompatible share
+  // mode while that handle is open, so use an ordinary Node read only for the
+  // paused byte check; the post-release assertions below retain native reads.
+  assert.deepEqual(await readFile(path), originalBytes);
   await assert.rejects(
     lstat(movedAncestor),
     (error) => error?.code === "ENOENT",
@@ -340,6 +486,14 @@ function fixedNativeError(code) {
   return (error) => {
     assert.equal(error?.code, code);
     assert.equal(error?.message, "Windows filesystem operation failed");
+    return true;
+  };
+}
+
+function fixedAdapterError(code) {
+  return (error) => {
+    assert.equal(error?.code, code);
+    assert.equal(error?.message, "Windows filesystem native adapter unavailable");
     return true;
   };
 }
@@ -633,7 +787,7 @@ test("native SQLite state lease rejects caller sidecars and non-canonical names"
   ]) {
     assert.throws(
       () => adapter.acquireSqliteStateLease(root, rootIdentity, name),
-      fixedNativeError("WINDOWS_FILESYSTEM_INVALID_PATH"),
+      fixedAdapterError("WINDOWS_FILESYSTEM_INVALID_SQLITE_DATABASE_NAME"),
       name,
     );
   }
@@ -771,21 +925,27 @@ test("native SQLite state lease contention crosses a process boundary", {
   skip: NATIVE_SKIP,
 }, async () => withSyntheticRoot(async ({ adapter, root }) => {
   const rootIdentity = adapter.ensureDirectory(root);
-  const child = await startSqliteLeaseChild({
+  const child = startSqliteLeaseChild({
     bindingPath: qualificationBindingPath(),
     root,
     rootIdentity,
     databaseName: "cross-process.sqlite",
   });
+  let primaryError;
   try {
+    await child.marker("WINDOWS_SQLITE_STATE_CHILD_READY\n");
     assert.throws(
       () => adapter.acquireSqliteStateLease(root, rootIdentity, "cross-process.sqlite"),
       fixedNativeError("WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_CONTENDED"),
     );
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
-    if (child.exitCode === null) {
-      child.stdin.write("release\\n");
-      await once(child, "exit");
+    try {
+      await child.release();
+    } catch (error) {
+      if (primaryError === undefined) throw error;
     }
   }
   const lease = adapter.acquireSqliteStateLease(
@@ -1181,7 +1341,6 @@ test("qualification hook blocks ancestor rename and recursive delete during repl
     attackerPromises,
   );
   await assertOriginalReplacementPaths({
-    binding,
     path,
     ancestor,
     movedAncestor,
@@ -1193,6 +1352,43 @@ test("qualification hook blocks ancestor rename and recursive delete during repl
   assert.deepEqual(binding.readFile(path).data, replacementBytes);
   await assert.rejects(
     lstat(movedAncestor),
+    (error) => error?.code === "ENOENT",
+  );
+}));
+
+test("qualification hook fails closed for a final-target rename during replacement", {
+  skip: NATIVE_SKIP,
+}, () => withPausedReplacement(async ({
+  binding,
+  operation,
+  path,
+  ancestor,
+  originalBytes,
+  replacementBytes,
+  release,
+  attackerPromises,
+}) => {
+  const movedPath = join(ancestor, "state-attacker.bin");
+  const attackerSucceeded = await attemptBoundedFilesystemMutation(
+    () => rename(path, movedPath),
+    attackerPromises,
+  );
+  release();
+  const result = await operation.result;
+  if (!attackerSucceeded) {
+    assert.deepEqual(result, { status: "ok" });
+    assert.deepEqual(binding.readFile(path).data, replacementBytes);
+    await assert.rejects(
+      lstat(movedPath),
+      (error) => error?.code === "ENOENT",
+    );
+    return;
+  }
+  assert.equal(result.status, "error");
+  assert.equal(FINAL_TARGET_MUTATION_FAILURE_CODES.has(result.code), true);
+  assert.deepEqual(binding.readFile(movedPath).data, originalBytes);
+  await assert.rejects(
+    lstat(path),
     (error) => error?.code === "ENOENT",
   );
 }));
@@ -1216,7 +1412,6 @@ test("qualification hook blocks hard-link creation during replacement", {
     attackerPromises,
   );
   await assertOriginalReplacementPaths({
-    binding,
     path,
     ancestor,
     movedAncestor,
