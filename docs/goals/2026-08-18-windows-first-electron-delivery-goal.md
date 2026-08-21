@@ -101,6 +101,13 @@ or a Linux-support claim.
   the private fixture's Windows listener ref persisted. The fixture is now
   explicitly non-owning via `unref()` while its close/error/listening
   assertions remain intact.
+- Exact Windows run `32464194975` on revision
+  `4a693cdc59968438bf9be55f604334b76a912d60` proved the server-file process
+  now exits naturally in warm and clean modes. With the timeout removed, the
+  runner exposed 18 ordinary failing files. Read-only Windows simulations
+  classify most as intentional fail-closed coverage of not-yet-qualified
+  unified-index staging, review/prepared-artifact storage, and protected SQLite
+  state/queue sessions rather than 18 independent regressions.
 - The dependent Windows Electron artifact/runtime, NSIS, and R7 receipt gates
   remain unaccepted. `productionSafe` remains false; no Windows or Linux
   support claim, version bump, release, publication, or signing action is
@@ -115,9 +122,9 @@ or a Linux-support claim.
 
 ### Ordered next steps from this checkpoint
 
-1. Re-run the exact warm-and-clean diagnostic with the private upstream fixture
-   explicitly non-owning. Require natural process exit; retain the explicit
-   close/error/listening assertions and do not alter production shutdown code.
+1. Use bounded dot-status ordinals to identify the exact failing tests inside
+   the 18 files. The runner may emit only capped numeric `X` positions; it must
+   not capture assertion messages, paths, values, stdout, or stderr.
 2. Pass the full local preflight and portable lanes, then dispatch one exact
    warm-and-clean run. Require the bounded diagnostic to exit normally in both
    cache modes instead of reporting a retained server ordinal.

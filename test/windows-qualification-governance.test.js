@@ -174,7 +174,8 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS = 1_024/u);
   assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS = 64/u);
   assert.match(portableDiagnosticScript, /TIBOTATTLE_WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC/u);
-  assert.match(portableDiagnosticScript, /countProgressUnits/u);
+  assert.match(portableDiagnosticScript, /observeProgressUnits/u);
+  assert.match(portableDiagnosticScript, /failureUnitOrdinals/u);
   assert.match(portableDiagnosticScript, /observeResourceDiagnostic/u);
   assert.match(portableDiagnosticScript, /stdout\.on\("data", onStdoutData\)/u);
   assert.match(portableDiagnosticScript, /stdout\.once\("error", onStdoutError\)/u);

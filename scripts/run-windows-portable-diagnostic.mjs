@@ -28,6 +28,7 @@ const SCRIPT_FILE = fileURLToPath(import.meta.url);
 export const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
 const MAXIMUM_TEST_FILES = 256;
 export const WINDOWS_PORTABLE_MAXIMUM_FAILURE_METADATA_ITEMS = 64;
+export const WINDOWS_PORTABLE_MAXIMUM_FAILURE_UNIT_METADATA_ITEMS = 64;
 export const WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS = 1_024;
 export const WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS = 64;
 export const WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_FILE =
@@ -74,6 +75,20 @@ function fixedError(code, metadata = {}) {
       && metadata.progressUnits >= 0
       && metadata.progressUnits <= WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS) {
     error.progressUnits = metadata.progressUnits;
+  }
+  if (Array.isArray(metadata.failureUnitOrdinals)
+      && metadata.failureUnitOrdinals.length
+        <= WINDOWS_PORTABLE_MAXIMUM_FAILURE_UNIT_METADATA_ITEMS
+      && metadata.failureUnitOrdinals.every((unit, index, units) =>
+        Number.isSafeInteger(unit)
+          && unit >= 1
+          && unit <= WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS
+          && (index === 0 || unit > units[index - 1]))
+      && typeof metadata.failureUnitsTruncated === "boolean") {
+    error.failureUnitOrdinals = Object.freeze([
+      ...metadata.failureUnitOrdinals,
+    ]);
+    error.failureUnitsTruncated = metadata.failureUnitsTruncated;
   }
   if (metadata.resourceUnits
       && Array.isArray(metadata.resourceUnits.counts)
@@ -192,29 +207,28 @@ function childIsClosed(child) {
       || typeof child.signalCode === "string");
 }
 
-function countProgressUnits(chunk, current) {
-  let count = current;
-  if (count >= WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS) {
-    return WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS;
-  }
+function observeProgressUnits(chunk, state) {
+  if (state.count >= WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS) return;
+  const visit = (code) => {
+    if (state.count >= WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS) return;
+    if (code !== 0x2e && code !== 0x58) return;
+    state.count += 1;
+    if (code !== 0x58) return;
+    if (state.failureUnitOrdinals.length
+        < WINDOWS_PORTABLE_MAXIMUM_FAILURE_UNIT_METADATA_ITEMS) {
+      state.failureUnitOrdinals.push(state.count);
+    } else {
+      state.failureUnitsTruncated = true;
+    }
+  };
   if (typeof chunk === "string") {
     for (let index = 0; index < chunk.length; index += 1) {
-      const code = chunk.charCodeAt(index);
-      if (code === 0x2e || code === 0x58) count += 1;
-      if (count >= WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS) {
-        return WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS;
-      }
+      visit(chunk.charCodeAt(index));
     }
-    return count;
+    return;
   }
-  if (!(chunk instanceof Uint8Array)) return count;
-  for (const byte of chunk) {
-    if (byte === 0x2e || byte === 0x58) count += 1;
-    if (count >= WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS) {
-      return WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS;
-    }
-  }
-  return count;
+  if (!(chunk instanceof Uint8Array)) return;
+  for (const byte of chunk) visit(byte);
 }
 
 function createResourceDiagnosticState() {
@@ -526,10 +540,14 @@ function runPortableTestFile(
 
     let settled = false;
     let terminationRequested = false;
-    let progressUnits = 0;
+    const progress = {
+      count: 0,
+      failureUnitOrdinals: [],
+      failureUnitsTruncated: false,
+    };
     let timeoutHandle;
     const onStdoutData = (chunk) => {
-      progressUnits = countProgressUnits(chunk, progressUnits);
+      observeProgressUnits(chunk, progress);
     };
     const settle = (callback, value) => {
       if (settled) return;
@@ -550,10 +568,15 @@ function runPortableTestFile(
       };
       if (status === WINDOWS_PORTABLE_STATUS.timedOut
           || status === WINDOWS_PORTABLE_STATUS.terminationFailed) {
-        metadata.progressUnits = progressUnits;
+        metadata.progressUnits = progress.count;
         metadata.resourceUnits = readResourceDiagnosticFile(
           resourceDiagnosticFile,
         );
+      }
+      if (ordinaryTestFailure) {
+        metadata.progressUnits = progress.count;
+        metadata.failureUnitOrdinals = progress.failureUnitOrdinals;
+        metadata.failureUnitsTruncated = progress.failureUnitsTruncated;
       }
       const error = fixedError(status, metadata);
       settle(
@@ -683,6 +706,10 @@ export async function runWindowsPortableTestFiles(
       if (failures.length < WINDOWS_PORTABLE_MAXIMUM_FAILURE_METADATA_ITEMS) {
         failures.push(Object.freeze({
           file: selectedFiles[index],
+          failureUnitOrdinals: Object.freeze([
+            ...(error.failureUnitOrdinals ?? []),
+          ]),
+          failureUnitsTruncated: error.failureUnitsTruncated === true,
           ordinal: index + 1,
           status: WINDOWS_PORTABLE_STATUS.failed,
         }));
@@ -789,12 +816,25 @@ function safeFailureMetadata(error) {
         || failure.ordinal > WINDOWS_PORTABLE_TEST_FILES.length
         || WINDOWS_PORTABLE_TEST_FILES[failure.ordinal - 1] !== failure.file
         || failure.status !== WINDOWS_PORTABLE_STATUS.failed
+        || !Array.isArray(failure.failureUnitOrdinals)
+        || failure.failureUnitOrdinals.length
+          > WINDOWS_PORTABLE_MAXIMUM_FAILURE_UNIT_METADATA_ITEMS
+        || failure.failureUnitOrdinals.some((unit, index, units) =>
+          !Number.isSafeInteger(unit)
+            || unit < 1
+            || unit > WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS
+            || (index > 0 && unit <= units[index - 1]))
+        || typeof failure.failureUnitsTruncated !== "boolean"
         || seenOrdinals.has(failure.ordinal)) {
       return null;
     }
     seenOrdinals.add(failure.ordinal);
     failures.push(Object.freeze({
       file: failure.file,
+      failureUnitOrdinals: Object.freeze([
+        ...failure.failureUnitOrdinals,
+      ]),
+      failureUnitsTruncated: failure.failureUnitsTruncated,
       ordinal: failure.ordinal,
       status: WINDOWS_PORTABLE_STATUS.failed,
     }));
@@ -817,7 +857,11 @@ export function formatWindowsPortableDiagnosticFailure(error) {
         + ` truncated=${aggregate.failuresTruncated ? 1 : 0}`,
       ...aggregate.failures.map((failure) =>
         `WINDOWS_PORTABLE_DIAGNOSTIC_FAILURE file=${failure.file}`
-          + ` ordinal=${failure.ordinal} status=${failure.status}`),
+          + ` ordinal=${failure.ordinal} status=${failure.status}`
+          + ` unit_ordinals=${failure.failureUnitOrdinals.length > 0
+            ? failure.failureUnitOrdinals.join(":")
+            : "unavailable"}`
+          + ` units_truncated=${failure.failureUnitsTruncated ? 1 : 0}`),
     ].join("\n");
   }
   const location = safeFailureLocation(error);
