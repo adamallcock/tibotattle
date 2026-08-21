@@ -129,6 +129,7 @@ const QUALIFICATION_CACHE_MODE_ENVIRONMENT = "TIBOTATTLE_QUALIFICATION_CACHE_MOD
 const QUALIFICATION_RUN_TIMEOUT_MS = 30 * 60 * 1_000;
 const QUALIFICATION_TERMINATION_TIMEOUT_MS = 10_000;
 const QUALIFICATION_MAXIMUM_CAPTURE_BYTES = 5_000_000;
+const MAXIMUM_FAILURE_METADATA_ITEMS = 64;
 
 export const FIXED_STATUS = Object.freeze({
   passed: "WINDOWS_SECURITY_QUALIFICATION_PASSED",
@@ -326,15 +327,61 @@ function safeTapTestIndex(value) {
  * deliberately numeric: never retain or expose a TAP name, body, or detail.
  */
 export function extractTapTestIndex(output) {
-  if (typeof output !== "string") return null;
-  const match = /^not ok ([0-9]+) -(?:[ \t]|(?:\r?$))/mu.exec(output);
-  if (match === null) return null;
-  return safeTapTestIndex(Number.parseInt(match[1], 10));
+  return extractTapTestIndexes(output)[0] ?? null;
 }
 
-function fixedFailureWithTapTestIndex(output) {
+export function extractTapTestIndexes(output) {
+  const indexes = [];
+  if (typeof output !== "string") return Object.freeze(indexes);
+  const seen = new Set();
+  const pattern = /^not ok ([0-9]+) -(?:[ \t]|(?:\r?$))/gmu;
+  for (const match of output.matchAll(pattern)) {
+    const index = safeTapTestIndex(Number.parseInt(match[1], 10));
+    if (index === null || seen.has(index)) continue;
+    seen.add(index);
+    indexes.push(index);
+    if (indexes.length === MAXIMUM_FAILURE_METADATA_ITEMS) break;
+  }
+  return Object.freeze(indexes);
+}
+
+function safeTapLocation(line, column) {
+  const safeLine = safeTapTestIndex(line);
+  const safeColumn = safeTapTestIndex(column);
+  return safeLine === null || safeColumn === null
+    ? null
+    : Object.freeze([safeLine, safeColumn]);
+}
+
+export function extractTapTestLocations(output) {
+  const locations = [];
+  if (typeof output !== "string") return Object.freeze(locations);
+  const seen = new Set();
+  const pattern = /(?:^|[\s("'`])(?:(?:file:\/\/\/|[A-Za-z]:[\\/]|[\\/])[^ \t\r\n"'`()\[\]{}]*[\\/])?test[\\/]windows-filesystem-security\.test\.js:(\d+):(\d+)(?=$|[^0-9])/gu;
+  for (const line of output.split(/\r?\n/u)) {
+    for (const match of line.matchAll(pattern)) {
+      const location = safeTapLocation(
+        Number.parseInt(match[1], 10),
+        Number.parseInt(match[2], 10),
+      );
+      if (location === null) continue;
+      const key = `${location[0]}:${location[1]}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      locations.push(location);
+      if (locations.length === MAXIMUM_FAILURE_METADATA_ITEMS) {
+        return Object.freeze(locations);
+      }
+    }
+  }
+  return Object.freeze(locations);
+}
+
+function fixedFailureWithTapMetadata(output) {
   const error = fixedError(FIXED_STATUS.failed);
-  error.testIndex = extractTapTestIndex(output);
+  error.testIndexes = extractTapTestIndexes(output);
+  error.testLocations = extractTapTestLocations(output);
+  error.testIndex = error.testIndexes[0] ?? null;
   return error;
 }
 
@@ -466,7 +513,7 @@ export function runNodeTests(files, {
           settle(rejectRun, error);
         }
       } else {
-        settle(rejectRun, fixedFailureWithTapTestIndex(stdout));
+        settle(rejectRun, fixedFailureWithTapMetadata(stdout));
       }
     });
   });
