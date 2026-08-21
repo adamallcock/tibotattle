@@ -174,7 +174,7 @@ test("Windows release config maps the frozen installer contract exactly", () => 
   assert.deepEqual(config.win.target, [{ target: "nsis", arch: ["x64"] }]);
   assert.equal(config.win.signAndEditExecutable, true);
   assert.equal(config.win.signExecutable, true);
-  assert.deepEqual(config.win.signExts, [".dll", ".node"]);
+  assert.deepEqual(config.win.signExts, [".dll", "!.node"]);
   assert.equal(config.win.requestedExecutionLevel, "asInvoker");
   assert.equal(config.win.verifyUpdateCodeSignature, true);
   assert.equal(config.win.signtoolOptions, undefined);
@@ -315,6 +315,27 @@ test("installed electron-builder 26.15.7 supports Azure signing and signs genera
   const nsisUtility = installedAppBuilderSource("out/targets/nsis/nsisUtil.js");
   assert.match(nsisUtility, /packElevateHelper = false/u);
   assert.match(nsisUtility, /target\.packager\.signIf\(outFile\)/u);
+});
+
+test("release config excludes pre-signed native modules using pinned app-builder semantics", () => {
+  const source = readFileSync(RELEASE_CONFIG_PATH, "utf8");
+  assert.match(source, /signExts:\s*\["\.dll",\s*"!\.node"\]/u);
+  const winPackager = installedAppBuilderSource("out/winPackager.js");
+  assert.match(
+    winPackager,
+    /signExts\.some\(ext => ext\.startsWith\("!"\) && file\.endsWith\(ext\.substring\(1\)\)\)/u,
+  );
+  assert.match(
+    winPackager,
+    /signExts\.some\(ext => file\.endsWith\(ext\)\)/u,
+  );
+  const positiveMatch = winPackager.indexOf(
+    "signExts.some(ext => file.endsWith(ext))",
+  );
+  const negativeMatch = winPackager.indexOf(
+    'signExts.some(ext => ext.startsWith("!") && file.endsWith(ext.substring(1)))',
+  );
+  assert.equal(positiveMatch >= 0 && negativeMatch > positiveMatch, true);
 });
 
 test("electron-builder embeds Windows ASAR integrity before fusing and signing", () => {

@@ -248,7 +248,10 @@ module.exports = {
     // production finalizer must pre-sign and hash both native modules, then
     // remove `.node` here before it may mint an authority manifest; otherwise
     // this pass would mutate those recorded bytes a second time.
-    signExts: [".dll", ".node"],
+    // Native .node files are signed by the finalizer's fixed pre-sign pass.
+    // electron-builder's negative extension rule keeps this packaging pass
+    // from mutating the bytes that the authority manifest records.
+    signExts: [".dll", "!.node"],
     requestedExecutionLevel: "asInvoker",
     verifyUpdateCodeSignature: true,
     azureSignOptions: {
