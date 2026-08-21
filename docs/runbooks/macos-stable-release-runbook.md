@@ -593,6 +593,22 @@ metadata. See [2026-08-17-web-only-release.md](./2026-08-17-web-only-release.md)
 only for an intentionally website-only change that reuses an already released
 artifact.
 
+Refresh the social share card first. It is the og:image/twitter:image for
+every link preview of the site, and its headline figure is a published estimate
+that moves daily, so it goes stale on its own between releases:
+
+~~~bash
+npm run product:social-preview -- \
+  --output "$PWD/.release-build/social-preview/social-preview.png" --replace
+~~~
+
+It renders the live homepage with headless Chrome and refuses to write a card
+whose allowance figure had not loaded, or whose page still advertises the
+download as unavailable. Pass the result as `--social-image` below. Skipping
+this step is what let a card reading "Public download coming soon" stay live for
+months after 0.1.13 shipped: `install-cta.js` hides that string at runtime, so
+visitors saw the right CTA and only link previews carried the wrong one.
+
 The current macOS release-site operation is:
 
 ~~~bash
