@@ -4317,8 +4317,11 @@ napi_value CloneSqliteDatabaseCallback(napi_env env, napi_callback_info info) {
 
 napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) {
   std::vector<napi_value> arguments;
+  Failure failure = OperationFailed();
   if (!GetArguments(env, info, &arguments, 6)) {
-    return ThrowFailure(env, InvalidConfiguration());
+    failure = InvalidConfiguration();
+    failure.stage = "publish_parse";
+    return ThrowFailure(env, failure);
   }
   std::wstring rootPath;
   std::wstring stageName;
@@ -4327,7 +4330,6 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
   HandleIdentity expectedStage;
   HandleIdentity expectedTarget;
   bool targetExpectedPresent = false;
-  Failure failure = OperationFailed();
   if (!ParseSqliteStagingNames(
           env,
           arguments,
@@ -4339,6 +4341,7 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
           &targetExpectedPresent,
           &expectedTarget,
           &failure)) {
+    failure.stage = "publish_parse";
     return ThrowFailure(env, failure);
   }
 
@@ -4353,11 +4356,16 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
           &stage,
           &stagePath,
           &stageIdentity,
-          &failure)
-      || !EqualIdentity(stageIdentity, expectedStage)
+          &failure)) {
+    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    failure.stage = "publish_stage_open";
+    return ThrowFailure(env, failure);
+  }
+  if (!EqualIdentity(stageIdentity, expectedStage)
       || !RequireSqliteSidecarsAbsent(stage.parents.front(), stageName, &failure)
       || !FlushFileBuffers(stage.final)) {
     if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    failure.stage = "publish_stage_preflight";
     return ThrowFailure(env, failure);
   }
 
@@ -4383,10 +4391,15 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
           &targetMissing,
           &targetPath,
           &failure)) {
+    failure.stage = "publish_target_open";
     return ThrowFailure(env, failure);
   }
   if (targetMissing || target.final == INVALID_HANDLE_VALUE) {
-    if (targetExpectedPresent) return ThrowFailure(env, IdentityMismatch());
+    if (targetExpectedPresent) {
+      failure = IdentityMismatch();
+      failure.stage = "publish_target_preflight";
+      return ThrowFailure(env, failure);
+    }
   } else {
     HandleIdentity targetIdentity;
     if (!ValidateSqliteStagingHandle(target.final, targetPath, &targetIdentity, &failure)
@@ -4394,10 +4407,15 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
         || !EqualIdentity(targetIdentity, expectedTarget)
         || !RequireSqliteSidecarsAbsent(target.parents.front(), targetName, &failure)) {
       if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+      failure.stage = "publish_target_preflight";
       return ThrowFailure(env, failure);
     }
   }
-  if (stage.parents.empty()) return ThrowFailure(env, OperationFailed());
+  if (stage.parents.empty()) {
+    failure = OperationFailed();
+    failure.stage = "publish_stage_revalidate";
+    return ThrowFailure(env, failure);
+  }
   // Revalidate the staged source after the target walk and immediately before
   // publication. This repeats the security, identity, canonical-path, and
   // sidecar checks at the final fallible point before the handle-relative
@@ -4406,6 +4424,7 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
       || !EqualIdentity(stageIdentity, expectedStage)
       || !RequireSqliteSidecarsAbsent(stage.parents.front(), stageName, &failure)) {
     if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    failure.stage = "publish_stage_revalidate";
     return ThrowFailure(env, failure);
   }
   if (!targetMissing && target.final != INVALID_HANDLE_VALUE) {
@@ -4415,6 +4434,7 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
         || !EqualIdentity(targetIdentity, expectedTarget)
         || !RequireSqliteSidecarsAbsent(target.parents.front(), targetName, &failure)) {
       if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+      failure.stage = "publish_target_revalidate";
       return ThrowFailure(env, failure);
     }
   }
@@ -4423,6 +4443,9 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
           stage.parents.front(),
           targetName,
           &failure)) {
+    // RenameHandleRelative reports its generic helper stage. Replace it here
+    // with the bounded publish vocabulary before crossing the N-API boundary.
+    failure.stage = "publish_rename";
     return ThrowFailure(env, failure);
   }
   // The stage handle is now the published target. Validate its security and
@@ -4434,6 +4457,7 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
   if (!ValidateSecurity(stage.final, false, &failure, &publishedIdentity)
       || !EqualIdentity(publishedIdentity, expectedStage)) {
     if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    failure.stage = "publish_stage_postvalidate";
     return ThrowFailure(env, failure);
   }
   HANDLE publishedTarget = INVALID_HANDLE_VALUE;
@@ -4442,6 +4466,7 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
           targetName,
           &publishedTarget,
           &failure)) {
+    failure.stage = "publish_target_postopen";
     return ThrowFailure(env, failure);
   }
   HandleIdentity targetIdentity;
@@ -4454,6 +4479,7 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
   if (!publishedTargetValid
       || !EqualIdentity(targetIdentity, publishedIdentity)) {
     if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    failure.stage = "publish_target_postvalidate";
     return ThrowFailure(env, failure);
   }
   stageIdentity = publishedIdentity;

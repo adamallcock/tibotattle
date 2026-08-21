@@ -123,6 +123,40 @@ const QUALIFICATION_TEST_FILES = Object.freeze([
   "test/windows-test-manifest.test.js",
 ]);
 export const WINDOWS_SECURITY_QUALIFICATION_TEST_FILES = QUALIFICATION_TEST_FILES;
+// The native SQLite publication callback exposes only these fixed phase names.
+// Keep this list deliberately separate from the native binding so a malformed
+// TAP diagnostic cannot turn an arbitrary property value into CI output.
+export const WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST = Object.freeze([
+  "publish_parse",
+  "publish_stage_open",
+  "publish_stage_preflight",
+  "publish_target_open",
+  "publish_target_preflight",
+  "publish_stage_revalidate",
+  "publish_target_revalidate",
+  "publish_rename",
+  "publish_stage_postvalidate",
+  "publish_target_postopen",
+  "publish_target_postvalidate",
+]);
+// These are the finite native Failure/FromLastError classes that can cross
+// the SQLite publication callback. The TAP diagnostic never accepts arbitrary
+// error-like strings or host/runtime exception names.
+export const WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST = Object.freeze([
+  "WINDOWS_FILESYSTEM_INVALID_CONFIGURATION",
+  "WINDOWS_FILESYSTEM_INVALID_PATH",
+  "WINDOWS_FILESYSTEM_NOT_FOUND",
+  "WINDOWS_FILESYSTEM_ALREADY_EXISTS",
+  "WINDOWS_FILESYSTEM_ACCESS_DENIED",
+  "WINDOWS_FILESYSTEM_REPARSE_POINT",
+  "WINDOWS_FILESYSTEM_HARD_LINK",
+  "WINDOWS_FILESYSTEM_SECURITY_POLICY",
+  "WINDOWS_FILESYSTEM_NOT_DIRECTORY",
+  "WINDOWS_FILESYSTEM_NOT_REGULAR_FILE",
+  "WINDOWS_FILESYSTEM_IDENTITY_MISMATCH",
+  "WINDOWS_FILESYSTEM_OPERATION_FAILED",
+  "WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_SIDECAR_PRESENT",
+]);
 const QUALIFICATION_ENVIRONMENT = "USAGE_MONITOR_WINDOWS_QUALIFICATION";
 const QUALIFICATION_REVISION_ENVIRONMENT = "TIBOTATTLE_QUALIFICATION_REVISION";
 const QUALIFICATION_CACHE_MODE_ENVIRONMENT = "TIBOTATTLE_QUALIFICATION_CACHE_MODE";
@@ -377,11 +411,63 @@ export function extractTapTestLocations(output) {
   return Object.freeze(locations);
 }
 
+/**
+ * Extract only the fixed SQLite publication phase from a TAP diagnostic
+ * property line. TAP output is untrusted test output: require the comment
+ * marker, exact property name, and an allowlisted value, and retain no other
+ * part of the line.
+ */
+export function extractTapPublishStages(output) {
+  const stages = [];
+  if (typeof output !== "string") return Object.freeze(stages);
+  const seen = new Set();
+  const allowlisted = new Set(WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST);
+  const pattern = /^\s*#\s+windowsFilesystemStage\s*:\s*(['"]?)([a-z_]+)\1\s*$/gmu;
+  for (const match of output.matchAll(pattern)) {
+    const stage = match[2];
+    if (!allowlisted.has(stage) || seen.has(stage)) continue;
+    seen.add(stage);
+    stages.push(stage);
+    if (stages.length === MAXIMUM_FAILURE_METADATA_ITEMS) break;
+  }
+  return Object.freeze(stages);
+}
+
+// Keep the longer name available to callers that describe the native
+// property rather than the SQLite operation; both names share one parser.
+export const extractTapWindowsFilesystemPublishStages = extractTapPublishStages;
+
+/**
+ * Extract only fixed native error classes from TAP diagnostic property lines.
+ * Do not parse TAP YAML, test names, stack frames, or arbitrary comments.
+ */
+export function extractTapPublishErrors(output) {
+  const errors = [];
+  if (typeof output !== "string") return Object.freeze(errors);
+  const seen = new Set();
+  const allowlisted = new Set(WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST);
+  const pattern = /^\s*#\s+windowsFilesystemError\s*:\s*(['"]?)(WINDOWS_FILESYSTEM_[A-Z0-9_]+)\1\s*$/gmu;
+  for (const match of output.matchAll(pattern)) {
+    const errorCode = match[2];
+    if (!allowlisted.has(errorCode) || seen.has(errorCode)) continue;
+    seen.add(errorCode);
+    errors.push(errorCode);
+    if (errors.length === MAXIMUM_FAILURE_METADATA_ITEMS) break;
+  }
+  return Object.freeze(errors);
+}
+
+export const extractTapWindowsFilesystemPublishErrors = extractTapPublishErrors;
+
 function fixedFailureWithTapMetadata(output) {
   const error = fixedError(FIXED_STATUS.failed);
   error.testIndexes = extractTapTestIndexes(output);
   error.testLocations = extractTapTestLocations(output);
   error.testIndex = error.testIndexes[0] ?? null;
+  error.publishStages = extractTapPublishStages(output);
+  error.publishStage = error.publishStages[0] ?? null;
+  error.publishErrors = extractTapPublishErrors(output);
+  error.publishError = error.publishErrors[0] ?? null;
   return error;
 }
 

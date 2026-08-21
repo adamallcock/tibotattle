@@ -10,7 +10,11 @@ import test from "node:test";
 
 import {
   FIXED_STATUS,
+  WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST,
   WINDOWS_SECURITY_QUALIFICATION_TEST_FILES,
+  WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST,
+  extractTapPublishErrors,
+  extractTapPublishStages,
   extractTapTestIndex,
   extractTapTestIndexes,
   extractTapTestLocations,
@@ -93,6 +97,22 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(diagnosticStep, /test_index=\$\{testIndex\}/u);
   assert.match(diagnosticStep, /test_indexes=\$\{testIndexes\.length/u);
   assert.match(diagnosticStep, /test_locations=\$\{testLocations\.length/u);
+  assert.match(diagnosticStep, /WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST/u);
+  assert.match(diagnosticStep, /WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST/u);
+  assert.match(diagnosticStep, /publishStages\.length <= 64/u);
+  assert.match(
+    diagnosticStep,
+    /publishStages\.every\(\(value\) => WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST\.includes\(value\)\)/u,
+  );
+  assert.match(diagnosticStep, /publish_stages=\$\{publishStages\.length/u);
+  assert.match(diagnosticStep, /publishStages\.join\(","\)/u);
+  assert.match(diagnosticStep, /publishErrors\.length <= 64/u);
+  assert.match(
+    diagnosticStep,
+    /publishErrors\.every\(\(value\) => WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST\.includes\(value\)\)/u,
+  );
+  assert.match(diagnosticStep, /publish_errors=\$\{publishErrors\.length/u);
+  assert.match(diagnosticStep, /publishErrors\.join\(","\)/u);
   assert.match(diagnosticStep, /Array\.isArray\(error\?\.testIndexes\)/u);
   assert.match(diagnosticStep, /Array\.isArray\(error\?\.testLocations\)/u);
   assert.match(diagnosticStep, /testIndexes\.length <= 64/u);
@@ -567,6 +587,117 @@ test("qualification failure indexing is top-level, numeric, and content-free", (
   assert.equal(extractTapTestIndex(null), null);
 });
 
+test("SQLite publish diagnostics use the exact frozen allowlist", () => {
+  assert.deepEqual(WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST, [
+    "publish_parse",
+    "publish_stage_open",
+    "publish_stage_preflight",
+    "publish_target_open",
+    "publish_target_preflight",
+    "publish_stage_revalidate",
+    "publish_target_revalidate",
+    "publish_rename",
+    "publish_stage_postvalidate",
+    "publish_target_postopen",
+    "publish_target_postvalidate",
+  ]);
+  assert.equal(WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST.length, 11);
+  assert.equal(Object.isFrozen(WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST), true);
+  assert.equal(
+    new Set(WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST).size,
+    WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST.length,
+  );
+});
+
+test("SQLite publish error diagnostics use the exact frozen native-code allowlist", () => {
+  assert.deepEqual(WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST, [
+    "WINDOWS_FILESYSTEM_INVALID_CONFIGURATION",
+    "WINDOWS_FILESYSTEM_INVALID_PATH",
+    "WINDOWS_FILESYSTEM_NOT_FOUND",
+    "WINDOWS_FILESYSTEM_ALREADY_EXISTS",
+    "WINDOWS_FILESYSTEM_ACCESS_DENIED",
+    "WINDOWS_FILESYSTEM_REPARSE_POINT",
+    "WINDOWS_FILESYSTEM_HARD_LINK",
+    "WINDOWS_FILESYSTEM_SECURITY_POLICY",
+    "WINDOWS_FILESYSTEM_NOT_DIRECTORY",
+    "WINDOWS_FILESYSTEM_NOT_REGULAR_FILE",
+    "WINDOWS_FILESYSTEM_IDENTITY_MISMATCH",
+    "WINDOWS_FILESYSTEM_OPERATION_FAILED",
+    "WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_SIDECAR_PRESENT",
+  ]);
+  assert.equal(Object.isFrozen(WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST), true);
+  assert.equal(
+    new Set(WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST).size,
+    WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST.length,
+  );
+});
+
+test("SQLite publish diagnostic parser is TAP-only, allowlisted, deduplicated, bounded, and frozen", () => {
+  const output = [
+    "windowsFilesystemStage: publish_parse",
+    "# windowsFilesystemStage: publish_stage_open",
+    "# windowsFilesystemStage: 'publish_rename'",
+    "# windowsFilesystemStage: publish_stage_open",
+    "# windowsFilesystemStage: publish_target_postvalidate",
+    "# windowsFilesystemStage: publish_not_allowlisted",
+    "# windowsFilesystemStage: secret=do-not-return",
+    "# otherProperty: publish_target_open",
+    "# windowsFilesystemStage: publish_rename secret=do-not-return",
+  ].join("\n");
+  const stages = extractTapPublishStages(output);
+  assert.deepEqual(stages, [
+    "publish_stage_open",
+    "publish_rename",
+    "publish_target_postvalidate",
+  ]);
+  assert.equal(Object.isFrozen(stages), true);
+  assert.equal(stages.length <= 64, true);
+  assert.doesNotMatch(stages.join(" "), /secret|allowlisted|otherProperty/u);
+
+  const repeated = extractTapPublishStages(
+    Array.from(
+      { length: 128 },
+      (_, index) => `# windowsFilesystemStage: ${WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST[index % 11]}`,
+    ).join("\n"),
+  );
+  assert.deepEqual(repeated, WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST);
+  assert.equal(Object.isFrozen(repeated), true);
+  assert.equal(repeated.length <= 64, true);
+});
+
+test("SQLite publish error parser is TAP-only, allowlisted, deduplicated, bounded, and frozen", () => {
+  const output = [
+    "windowsFilesystemError: WINDOWS_FILESYSTEM_ACCESS_DENIED",
+    "# windowsFilesystemError: WINDOWS_FILESYSTEM_ACCESS_DENIED",
+    "# windowsFilesystemError: 'WINDOWS_FILESYSTEM_OPERATION_FAILED'",
+    "# windowsFilesystemError: WINDOWS_FILESYSTEM_ACCESS_DENIED",
+    "# windowsFilesystemError: WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_SIDECAR_PRESENT",
+    "# windowsFilesystemError: WINDOWS_FILESYSTEM_NOT_ALLOWLISTED",
+    "# windowsFilesystemError: secret=do-not-return",
+    "# otherProperty: WINDOWS_FILESYSTEM_HARD_LINK",
+    "# windowsFilesystemError: WINDOWS_FILESYSTEM_ACCESS_DENIED secret=do-not-return",
+  ].join("\n");
+  const errors = extractTapPublishErrors(output);
+  assert.deepEqual(errors, [
+    "WINDOWS_FILESYSTEM_ACCESS_DENIED",
+    "WINDOWS_FILESYSTEM_OPERATION_FAILED",
+    "WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_SIDECAR_PRESENT",
+  ]);
+  assert.equal(Object.isFrozen(errors), true);
+  assert.equal(errors.length <= 64, true);
+  assert.doesNotMatch(errors.join(" "), /secret|allowlisted|otherProperty/u);
+
+  const repeated = extractTapPublishErrors(
+    Array.from(
+      { length: 128 },
+      (_, index) => `# windowsFilesystemError: ${WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST[index % WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST.length]}`,
+    ).join("\n"),
+  );
+  assert.deepEqual(repeated, WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST);
+  assert.equal(Object.isFrozen(repeated), true);
+  assert.equal(repeated.length <= 64, true);
+});
+
 test("qualification failure locations require the trusted test path and stay numeric", () => {
   const locations = extractTapTestLocations([
     "at (file:///C:/repo/test/windows-filesystem-security.test.js:770:5) secret=do-not-return",
@@ -619,6 +750,14 @@ test("qualification child failures attach only a safe index and never TAP conten
     "not ok 9 - top-level secret=do-not-return",
     "at (file:///C:/repo/test/windows-filesystem-security.test.js:12:5) secret=do-not-return",
     "at test\\windows-filesystem-security.test.js:20:10 name=do-not-return",
+    "# windowsFilesystemStage: publish_rename",
+    "# windowsFilesystemStage: publish_target_postvalidate",
+    "# windowsFilesystemStage: publish_rename",
+    "# windowsFilesystemStage: secret=do-not-return",
+    "# windowsFilesystemError: WINDOWS_FILESYSTEM_ACCESS_DENIED",
+    "# windowsFilesystemError: WINDOWS_FILESYSTEM_OPERATION_FAILED",
+    "# windowsFilesystemError: WINDOWS_FILESYSTEM_ACCESS_DENIED",
+    "# windowsFilesystemError: secret=do-not-return",
   ].join("\n"));
   child.emit("close", 1);
   await assert.rejects(
@@ -628,9 +767,21 @@ test("qualification child failures attach only a safe index and never TAP conten
       assert.equal(error.testIndex, 9);
       assert.deepEqual(error.testIndexes, [9]);
       assert.deepEqual(error.testLocations, [[12, 5], [20, 10]]);
+      assert.deepEqual(error.publishStages, [
+        "publish_rename",
+        "publish_target_postvalidate",
+      ]);
+      assert.equal(error.publishStage, "publish_rename");
+      assert.deepEqual(error.publishErrors, [
+        "WINDOWS_FILESYSTEM_ACCESS_DENIED",
+        "WINDOWS_FILESYSTEM_OPERATION_FAILED",
+      ]);
+      assert.equal(error.publishError, "WINDOWS_FILESYSTEM_ACCESS_DENIED");
       assert.equal(Object.isFrozen(error.testIndexes), true);
       assert.equal(Object.isFrozen(error.testLocations), true);
       assert.equal(Object.isFrozen(error.testLocations[0]), true);
+      assert.equal(Object.isFrozen(error.publishStages), true);
+      assert.equal(Object.isFrozen(error.publishErrors), true);
       assert.equal(error.message, FIXED_STATUS.failed);
       assert.equal(Object.hasOwn(error, "stdout"), false);
       assert.equal(Object.hasOwn(error, "testName"), false);
@@ -657,6 +808,8 @@ test("qualification child failures use a null index when TAP has no safe top-lev
   child.stdout.write([
     "  not ok malformed secret=do-not-return",
     "at test/windows-filesystem-security.test.js:20:10",
+    "# windowsFilesystemStage: publish_unknown secret=do-not-return",
+    "# windowsFilesystemError: WINDOWS_FILESYSTEM_UNKNOWN secret=do-not-return",
   ].join("\n"));
   child.emit("close", 1);
   await assert.rejects(
@@ -666,8 +819,14 @@ test("qualification child failures use a null index when TAP has no safe top-lev
       assert.equal(error.testIndex, null);
       assert.deepEqual(error.testIndexes, []);
       assert.deepEqual(error.testLocations, [[20, 10]]);
+      assert.deepEqual(error.publishStages, []);
+      assert.equal(error.publishStage, null);
+      assert.deepEqual(error.publishErrors, []);
+      assert.equal(error.publishError, null);
       assert.equal(Object.isFrozen(error.testIndexes), true);
       assert.equal(Object.isFrozen(error.testLocations), true);
+      assert.equal(Object.isFrozen(error.publishStages), true);
+      assert.equal(Object.isFrozen(error.publishErrors), true);
       assert.equal(error.message, FIXED_STATUS.failed);
       return true;
     },
