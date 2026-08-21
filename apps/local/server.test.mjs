@@ -2440,7 +2440,17 @@ test("participant relay never follows an upstream redirect", async () => {
     assert.deepEqual(upstreamRequests, ["/api/v1/session"]);
   } finally {
     await app.close();
-    await new Promise((resolveClose) => upstream.close(resolveClose));
+    await new Promise((resolveClose, rejectClose) => {
+      upstream.close((error) => {
+        if (error && error.code !== "ERR_SERVER_NOT_RUNNING") {
+          rejectClose(error);
+          return;
+        }
+        resolveClose();
+      });
+      upstream.closeAllConnections?.();
+    });
+    assert.equal(upstream.listening, false);
     await rm(files.root, { recursive: true });
   }
 });
