@@ -172,12 +172,11 @@ lease is exposed. A failed first-time acquisition can therefore leave only a
 validated, owner-only empty bootstrap file for a later retry; the binding does
 not delete by pathname after relinquishing the identity-bound creation handle.
 After the identity mutex is acquired, the native boundary
-creates owner-only placeholders for the derived `-wal` and `-shm` names,
-marks them delete-pending before exposing the lease, and holds exclusive
-handles to them for the complete lease lifetime. A SQLite writer therefore
-receives a sharing violation or delete-pending failure instead of creating
-either sidecar; the placeholders disappear when the last native handle
-closes, including after an abrupt process termination. The lease holds
+creates owner-only delete-on-close placeholders for the derived `-wal` and
+`-shm` names and holds exclusive handles to them for the complete lease
+lifetime. A SQLite writer therefore receives a sharing violation instead of
+creating either sidecar; the placeholders disappear when the last native
+handle closes, including after an abrupt process termination. The lease holds
 the root/ancestor, database, journal, and sidecar-reservation handles with
 read/write sharing but without delete sharing, and coordinates duplicate
 acquisition with a current-user owner-only named mutex derived from the

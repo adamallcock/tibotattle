@@ -116,6 +116,11 @@ constexpr ULONG kFileRenameInformation = 10;
 constexpr ULONG kFileRenameInformationEx = 65;
 constexpr ULONG kFileRenameReplaceIfExists = 0x00000001;
 constexpr ULONG kFileRenamePosixSemantics = 0x00000002;
+// FILE_DELETE_ON_CLOSE is intentionally kept local rather than relying on a
+// particular SDK header spelling.  SQLite sidecar reservations use this
+// create option so the reservation file cannot outlive the native lease after
+// every held handle has been closed.
+constexpr ULONG kFileDeleteOnClose = 0x00001000;
 static_assert(kFileRenameInformation == 10, "legacy rename class value");
 static_assert(kFileRenameInformationEx == 65, "extended rename class value");
 constexpr ULONG kFileOpen = 1;
@@ -2114,13 +2119,10 @@ bool OpenSqliteChild(
 // A missing sidecar cannot be protected by an existence check alone: another
 // process could create it immediately after that check.  Instead, create an
 // owner-only placeholder relative to the already-held root and keep an
-// exclusive handle open and mark it for deletion before exposing the lease. A
-// SQLite writer attempting to create or open the sidecar then receives a
-// sharing violation (or delete-pending error).  The file is removed after the
-// lease has closed every reservation handle, so a crash does not leave a
-// permanent sentinel behind. Marking the file before publishing the lease
-// also closes the race in which a filesystem filter opens the visible
-// placeholder before a deferred delete-on-close operation can take effect.
+// exclusive, delete-on-close handle open.  A SQLite writer attempting to
+// create or open the sidecar then receives a sharing violation.  The file is
+// removed automatically only after the lease has closed every reservation
+// handle, so a crash does not leave a permanent sentinel behind.
 bool ReserveSqliteSidecar(
     HANDLE protectedRoot,
     const ParsedPath& parsedRoot,
@@ -2146,6 +2148,7 @@ bool ReserveSqliteSidecar(
   // must be rejected while this handle remains live.
   options.shareMode = 0;
   options.disposition = kFileCreate;
+  options.extraOptions = kFileDeleteOnClose;
   options.ownerOnlyOnCreate = true;
   options.securityDescriptor = attributes.lpSecurityDescriptor;
   HANDLE handle = INVALID_HANDLE_VALUE;
@@ -2174,17 +2177,6 @@ bool ReserveSqliteSidecar(
   if (information != kFileCreated) {
     CloseHandle(handle);
     *failure = SqliteStateLeaseSidecarPresent();
-    return false;
-  }
-
-  // Do not defer the delete-pending transition until the handle closes. A
-  // filter or scanner can otherwise open the visible placeholder between
-  // NtCreateFile and lease release, keeping the basename present after the
-  // reservation handle is closed. DELETE was requested above, so marking the
-  // file now makes the namespace transition explicit and fail-closed.
-  if (!MarkHandleForDeletion(handle)) {
-    *failure = FromLastError();
-    CloseHandle(handle);
     return false;
   }
 
@@ -5336,7 +5328,7 @@ napi_value AcquireSqliteStateLeaseCallback(
   }
 
   // Reserve both names after the identity mutex has been acquired and before
-  // exposing a lease.  The delete-pending handles remain in the lease's
+  // exposing a lease.  The delete-on-close handles remain in the lease's
   // handle vector and are therefore held until after the SQLite connection
   // has closed.  This is the lifetime boundary that an existence preflight
   // cannot provide.  Acquiring the mutex first also makes a second contender
