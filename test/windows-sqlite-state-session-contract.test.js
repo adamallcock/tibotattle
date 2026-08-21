@@ -58,9 +58,13 @@ function createFixture({
   databaseMetadata = metadata(IDENTITY, { isDirectory: false, isRegularFile: true }),
   journalMetadata = metadata(IDENTITY, { isDirectory: false, isRegularFile: true }),
   releaseError = null,
+  releaseErrors = null,
 } = {}) {
   const calls = [];
   const leases = new Set();
+  const pendingReleaseErrors = Array.isArray(releaseErrors)
+    ? [...releaseErrors]
+    : null;
   const binding = {
     contractVersion: "windows-filesystem-v1",
     securityContractVersion: "windows-filesystem-security-v1",
@@ -149,6 +153,9 @@ function createFixture({
     },
     releaseSqliteStateLease(lease) {
       calls.push(["releaseSqliteStateLease", lease]);
+      if (pendingReleaseErrors !== null && pendingReleaseErrors.length > 0) {
+        throw pendingReleaseErrors.shift();
+      }
       if (releaseError !== null) throw releaseError;
       if (!leases.delete(lease)) throw nativeError("IDENTITY_MISMATCH");
     },
@@ -517,7 +524,7 @@ test("abort rolls back before close and release, and repeated abort/close are id
   assert.equal(fixture.calls.length, countAfterAbort);
 });
 
-test("close and release failures remain fixed and never release before closing", () => {
+test("close and release failures remain fixed, and release can be retried after closing", () => {
   const closeFixture = createFixture();
   const closeCalls = [];
   const closeDatabase = createDatabase({
@@ -532,7 +539,7 @@ test("close and release failures remain fixed and never release before closing",
   assert.equal(closeCalls.length + closeFixture.calls.length > closeCount, true);
 
   const releaseError = new Error("release path must not escape");
-  const releaseFixture = createFixture({ releaseError });
+  const releaseFixture = createFixture({ releaseErrors: [releaseError] });
   const releaseCalls = [];
   const releaseDatabase = createDatabase({ calls: releaseCalls });
   const releaseSession = createWindowsSqliteStateSession(sessionOptions(releaseFixture, releaseDatabase));
@@ -540,7 +547,11 @@ test("close and release failures remain fixed and never release before closing",
   assert.equal(releaseFixture.calls.filter(([name]) => name === "releaseSqliteStateLease").length, 1);
   assert.equal(releaseSession.database.isOpen, false);
   releaseSession.close();
-  assert.equal(releaseFixture.calls.filter(([name]) => name === "releaseSqliteStateLease").length, 1);
+  assert.equal(releaseFixture.calls.filter(([name]) => name === "releaseSqliteStateLease").length, 2);
+  assert.equal(releaseFixture.leases.size, 0);
+  assert.equal(isWindowsSqliteStateSession(releaseSession), true);
+  releaseSession.abort();
+  assert.equal(releaseFixture.calls.filter(([name]) => name === "releaseSqliteStateLease").length, 2);
 });
 
 test("forged/copied adapters, downgraded platforms, weak roots, and unsafe architectures fail closed", () => {

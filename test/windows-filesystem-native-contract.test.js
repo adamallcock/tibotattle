@@ -242,7 +242,17 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   assert.match(source, /kFileNonDirectoryFile \| options\.extraOptions/u);
   assert.doesNotMatch(source, /\bkFileNonDirectory\b/u);
   assert.match(source, /sidecarReservations/u);
-  assert.match(source, /AppendHandles\(&handles, std::move\(sidecarReservations\)\)/u);
+  assert.match(source, /lease->sidecarReservations = std::move\(sidecarReservations\)/u);
+  assert.doesNotMatch(
+    source,
+    /AppendHandles\(&handles,\s*std::move\(sidecarReservations\)\)/u,
+  );
+  assert.match(source, /protectedRootHandleIndex/u);
+  assert.match(source, /databaseName = databaseName/u);
+  assert.match(source, /MarkSqliteStateLeaseSidecarsForDeletion/u);
+  assert.match(source, /WaitForSqliteStateLeaseSidecarsAbsent/u);
+  assert.match(source, /GetTickCount64\(\)/u);
+  assert.match(source, /Sleep\(/u);
   assert.match(source, /SqliteStateLeaseMutexName/u);
   assert.match(source, /CreateMutexExW/u);
   assert.match(source, /WaitForSingleObject\(mutex, 0\)/u);
@@ -256,6 +266,24 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
     /ownerThreadId != GetCurrentThreadId\(\)[\s\S]*?return ThrowFailure\(env, SqliteStateLeaseForeign\(\)\);[\s\S]*?UnregisterSqliteStateLease\(lease\)/u,
   );
   assert.match(source, /SqliteStateLeaseReleaseFailed/u);
+  const sqliteReleaseStart = source.indexOf("napi_value ReleaseSqliteStateLeaseCallback(");
+  const credentialLeaseStart = source.indexOf("struct CredentialMutexLease", sqliteReleaseStart);
+  assert.ok(sqliteReleaseStart >= 0 && credentialLeaseStart > sqliteReleaseStart);
+  const sqliteReleaseBody = source.slice(sqliteReleaseStart, credentialLeaseStart);
+  const markSidecarsOffset = sqliteReleaseBody.indexOf("MarkSqliteStateLeaseSidecarsForDeletion(");
+  const closeSidecarsOffset = sqliteReleaseBody.indexOf("CloseSqliteStateLeaseSidecars(");
+  const absentProofOffset = sqliteReleaseBody.indexOf("WaitForSqliteStateLeaseSidecarsAbsent(");
+  const ordinaryCloseOffset = sqliteReleaseBody.indexOf("CloseSqliteStateLeaseHandleVector(");
+  const releaseMutexOffset = sqliteReleaseBody.indexOf("ReleaseMutex(lease->coordination)");
+  const unregisterOffset = sqliteReleaseBody.indexOf("UnregisterSqliteStateLease(lease)");
+  assert.ok(
+    markSidecarsOffset >= 0
+      && closeSidecarsOffset > markSidecarsOffset
+      && absentProofOffset > closeSidecarsOffset
+      && ordinaryCloseOffset > absentProofOffset
+      && releaseMutexOffset > ordinaryCloseOffset
+      && unregisterOffset > releaseMutexOffset,
+  );
   assert.match(source, /FILE_SHARE_READ \| FILE_SHARE_WRITE/u);
   assert.match(source, /EndsWithInsensitive\(supplied, L"-journal"\)/u);
   assert.match(source, /EndsWithInsensitive\(supplied, L"-wal"\)/u);
