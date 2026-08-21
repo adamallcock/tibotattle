@@ -1289,10 +1289,6 @@ bool OpenPreparedRootAndDirectory(
     Failure* failure) {
   ParsedPath parsedRoot;
   failure->stage = "prepared_root_open";
-  if (!ParseAndValidatePath(rootPath, false, &parsedRoot, failure)) {
-    failure->stage = "prepared_root_open";
-    return false;
-  }
   std::vector<std::wstring> childComponents;
   if (!ParseRelativeComponents(childPath, &childComponents)) {
     *failure = InvalidPath();
