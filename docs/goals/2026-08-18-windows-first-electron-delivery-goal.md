@@ -19,64 +19,69 @@ production signing, a public artifact, a GitHub release, an appcast change, a
 Homebrew update, a service deployment, replacement of the native macOS client,
 or a Linux-support claim.
 
-## Latest bounded outcome: 2026-08-21
+## Latest bounded outcome: 2026-08-21 (exact run `32477262214`)
 
 This checkpoint supersedes the earlier 2026-08-21 diagnostic log below.
 
 - The integration branch is based directly on `origin/main` at
   `49965f401131f938b188f6067164ff0ade6a56ff`, the source used for version
-  `0.1.15`. PR #49 is intentionally outside this work.
-- The local portable lane passes 1,222 tests: 1,179 passed, 43 expected
-  platform skips, and zero failures. Exact Windows run `32472143661` passed the
-  native build, binding manifest, environment record, bounded filesystem
-  security diagnostic, bounded per-file diagnostic, and authoritative portable
-  lane in both warm and clean jobs.
-- The credential-audit native failure is repaired. The remaining exact native
-  qualification failures are identical in warm and clean jobs: prepared
-  directory creation at test indexes 108 and 110, and SQLite sidecar/session
-  lifecycle at index 221. Consequently, Electron packaging and runtime smoke
-  correctly did not start.
-- Reapplying the owner-only DACL through the live prepared-directory handle is
-  retained as a fail-closed hardening step, but it did not resolve the prepared
-  failure. The current content-free harness cannot yet distinguish child
-  create/access failure from prepared-ancestor identity/path validation.
-- The SQLite experiment proved a two-phase Windows semantic boundary. Ordinary
-  exclusive delete-on-close placeholders allow SQLite to start but a WAL name
-  can remain observable after release. Explicitly marking those placeholders
-  delete-pending before exposing the lease prevents SQLite from starting. The
-  unsuccessful early-delete commits are reverted; `sqliteStateLeaseSafe`
-  remains false.
-- `productionSafe`, `preparedArtifactSafe`, and `sqliteStateLeaseSafe` remain
-  false. No version bump, release, signing, installer publication, production
-  selector, Windows-support claim, Linux-support claim, or native macOS client
-  change occurred.
+  `0.1.15`. The exact tested revision is
+  `3b5c098f8dddf9589558fd838744af66749498a0`. PR #49 is intentionally
+  outside this work.
+- The local portable lane is green. Exact Windows run `32477262214` passed, in
+  both warm and clean jobs, the native build, binding manifest and environment
+  checks, filesystem-security diagnostics, the bounded per-file diagnostic,
+  and the authoritative portable lane.
+- The only native qualification failure in either job is SQLite state-session
+  test 226. It fails at the first `CREATE TABLE` after a clean child lease
+  handoff. SQLite test 227 passes in both warm and clean jobs. This is a native
+  qualification failure, not a portable-lane failure.
+- Because the native qualification gate is fail-closed, the Electron packaging,
+  runtime-smoke, and development-artifact retention stages were skipped. No
+  Electron artifact or production/security receipt is accepted by this run.
+- The owner decision for this bounded stage is to stop further SQLite repair
+  loops here. Keep `sqliteStateLeaseSafe`, `preparedArtifactSafe`, and
+  `productionSafe` false, and do not enable any production selector. Advance a
+  separate fail-closed unsigned development-artifact lane that may package,
+  smoke, and retain content-free evidence, but must leave the overall workflow
+  red while native SQLite qualification fails and must not produce a qualified
+  production/security receipt.
+- The existing native macOS client and its release path remain unchanged. The
+  already-proven macOS Electron and Debian/Xvfb shared-shell development paths
+  remain development evidence only; neither substitutes for native Windows
+  proof. No version bump, release, signing, installer publication, Windows or
+  Linux support claim, or native macOS replacement occurred.
 
 ### Exit-bounded next steps
 
-1. Add a fixed, content-free prepared-directory stage/error vocabulary covering
-   root open, child open/create, DACL update, child validation, ancestor
-   validation, and final validation. Run it once in warm and clean mode. If it
-   proves child-create access denial, add only `FILE_ADD_SUBDIRECTORY` to the
-   retained parent handle; otherwise repair the exact reported lifecycle or
-   normalization boundary. Exit when prepared tests 1 and 3 pass in both modes,
-   or record the single reported native stage as the concrete blocker.
-2. Replace the undifferentiated SQLite handle vector with explicit sidecar
-   reservation handles. Keep placeholders ordinary and exclusive while SQLite
-   is live; after JavaScript closes SQLite, native release must mark each
-   sidecar delete-pending, close it, verify bounded absence, and fail closed in
-   a retryable fixed state when cleanup cannot be proven. Preserve crash/
-   abandoned-mutex recovery and delete-on-close fallback. Exit only when normal
-   close, contention, transaction recovery, crash/reopen, injected release
-   failure, and bounded WAL/SHM absence pass on native Windows.
-3. Rerun the unchanged exact native qualification set. Only after warm and
-   clean both pass may the workflow continue to the existing unsigned Windows
-   x64 Electron directory build, artifact verification, real runtime smoke,
-   content-free receipt, and retained development artifact.
-4. After that development artifact is accepted, add the separate unsigned NSIS
-   installer, upgrade/rollback, uninstall/data-retention, and signing/
-   provenance gates. Linux installed-app work remains next; the already-proven
-   macOS Electron and Debian/Xvfb shared-shell development paths do not replace
-   native Windows evidence.
+1. Add or enable the unsigned Windows x64 development-artifact lane behind an
+   explicit fail-closed boundary. It may build the reviewed Electron/native
+   directory artifact, run bounded launch/smoke checks, and retain a
+   content-free development receipt. Its exit criteria are an exact source
+   revision and artifact manifest, successful package verification, bounded
+   runtime smoke, no orphaned companion, and retained evidence. It must remain
+   visibly development-only and leave the overall workflow red whenever native
+   qualification is red.
+2. Do not use that lane to promote readiness. The development lane must not set
+   `sqliteStateLeaseSafe`, `preparedArtifactSafe`, or `productionSafe`, enable a
+   production selector, claim Windows support, or emit a qualified
+   production/security receipt. A failed or skipped native gate remains visible
+   in the top-level result.
+3. Close the current Stage 2 gate only in a later, separately bounded SQLite
+   repair pass: native test 226 must pass at the first `CREATE TABLE` after a
+   clean child lease handoff, test 227 must remain green, and the full native
+   qualification must pass in both warm and clean jobs on one exact revision
+   with zero unexplained skips and a clean checkout. If that pass fails, record
+   the precise native test and lifecycle boundary as the blocker rather than
+   starting another repair loop.
+4. Only after that native gate passes may the existing Windows Electron
+   artifact/runtime qualification become an accepted Stage 4 result. It must
+   prove launch, dashboard readiness and synthetic refresh, Credential Manager
+   and protected-state use, tray/window lifecycle, single-instance rejection,
+   clean quit, relaunch persistence, no orphan, and content-free diagnostics.
+   The separate NSIS installer, upgrade/rollback, uninstall/data-retention,
+   and signing/provenance gates follow afterward; Linux installed-app work
+   remains next and no Linux support claim is made now.
 
 ## Historical diagnostic log: 2026-08-21
 
