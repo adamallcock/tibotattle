@@ -25,6 +25,7 @@ const QUALIFICATION_BINDING_ENVIRONMENT =
 const QUALIFICATION_BINDING_FILE = "windows_filesystem_qualification.node";
 const DATABASE_NAME = "sqlite-state-session-native.sqlite";
 const SAME_PROCESS_DATABASE_NAME = "sqlite-state-session-native-same-process.sqlite";
+const RELEASE_FAILURE_DATABASE_NAME = "sqlite-state-session-native-release-failure.sqlite";
 const TABLE_NAME = "sqlite_state_fixture";
 const SIDECAR_BLOCKED_CODES = new Set(["EACCES", "EBUSY", "EEXIST", "EPERM"]);
 
@@ -52,6 +53,7 @@ function loadQualificationBinding(bindingPath) {
     "inspectProtectedChild",
     "acquireSqliteStateLease",
     "releaseSqliteStateLease",
+    "armSqliteStateLeaseReleaseFailure",
   ];
   if (binding === null
       || typeof binding !== "object"
@@ -399,6 +401,88 @@ test("native Windows SQLite session qualifies durable recovery and lease content
     adapter.releaseSqliteStateLease(recovered.lease);
   }
   await assertEventuallyNoWalOrSharedMemory(adapter, root, rootIdentity, DATABASE_NAME);
+}));
+
+test("native Windows SQLite release failure retains the opaque token for one retry", {
+  skip: NATIVE_SKIP,
+}, async () => withNativeRoot(async ({ adapter, binding, root, rootIdentity }) => {
+  const lease = adapter.acquireSqliteStateLease(
+    root,
+    rootIdentity,
+    RELEASE_FAILURE_DATABASE_NAME,
+  );
+  let database;
+  let released = false;
+  try {
+    const databasePath = join(root, RELEASE_FAILURE_DATABASE_NAME);
+    database = new DatabaseSync(databasePath, { timeout: 5_000 });
+    assertDatabaseLocation(database, databasePath);
+    configureDurableDatabase(database);
+    assertSidecarsReserved(root, RELEASE_FAILURE_DATABASE_NAME);
+
+    // The JS owner closes SQLite before asking native release to clean up its
+    // sidecar reservations. The qualification-only seam fails after native
+    // sidecar mark/close and absence proof, leaving the same adapter lease
+    // token valid for the retry below.
+    database.close();
+    database = null;
+    assert.equal(binding.armSqliteStateLeaseReleaseFailure(), true);
+    assert.throws(
+      () => adapter.releaseSqliteStateLease(lease),
+      nativeFailure("WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_RELEASE_FAILED"),
+    );
+    await assertEventuallyNoWalOrSharedMemory(
+      adapter,
+      root,
+      rootIdentity,
+      RELEASE_FAILURE_DATABASE_NAME,
+    );
+
+    // Passing the original opaque adapter lease proves the WeakMap entry was
+    // retained when native release failed. A fresh lease also proves the
+    // second release completed ordinary-handle/mutex cleanup and registry
+    // unregistration.
+    assert.doesNotThrow(() => adapter.releaseSqliteStateLease(lease));
+    released = true;
+    await assertEventuallyNoWalOrSharedMemory(
+      adapter,
+      root,
+      rootIdentity,
+      RELEASE_FAILURE_DATABASE_NAME,
+    );
+
+    const reopened = openLeasedDatabase({
+      adapter,
+      root,
+      rootIdentity,
+      databaseName: RELEASE_FAILURE_DATABASE_NAME,
+    });
+    try {
+      assertDatabaseLocation(reopened.database, databasePath);
+    } finally {
+      reopened.database.close();
+      adapter.releaseSqliteStateLease(reopened.lease);
+    }
+    await assertEventuallyNoWalOrSharedMemory(
+      adapter,
+      root,
+      rootIdentity,
+      RELEASE_FAILURE_DATABASE_NAME,
+    );
+  } finally {
+    try {
+      database?.close();
+    } catch {
+      // Preserve the primary native qualification assertion.
+    }
+    if (!released) {
+      try {
+        adapter.releaseSqliteStateLease(lease);
+      } catch {
+        // Preserve the primary native qualification assertion.
+      }
+    }
+  }
 }));
 
 test("native Windows SQLite qualification fails closed without its bound addon", {
