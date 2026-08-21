@@ -714,18 +714,102 @@ jobs:
         if: ${{ success() && steps.native_security_qualification.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: tibotattle-windows-x64-electron-${{ github.sha }}-${{ matrix.cache-mode }}
+          name: tibotattle-windows-x64-electron-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}-${{ matrix.cache-mode }}
           path: |
             ${{ env.TIBOTATTLE_ELECTRON_ARTIFACT_APP_PATH }}
             ${{ env.TIBOTATTLE_ELECTRON_QUALIFICATION_RECEIPT_PATH }}
           if-no-files-found: error
           retention-days: 3
 
+      - name: Prepare exact raw Windows x64 qualification receipt handoff
+        if: ${{ success() && steps.native_security_qualification.outcome == 'success' }}
+        shell: pwsh
+        env:
+          TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_BASENAME: tibotattle-windows-electron-qualification-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}-${{ matrix.cache-mode }}.json
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $receiptPath = $env:TIBOTATTLE_ELECTRON_QUALIFICATION_RECEIPT_PATH
+          $receiptBasename = $env:TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_BASENAME
+          $revision = ($env:TIBOTATTLE_QUALIFICATION_REVISION ?? '').Trim().ToLowerInvariant()
+          $cacheMode = ($env:TIBOTATTLE_QUALIFICATION_CACHE_MODE ?? '').Trim()
+          $runId = ($env:GITHUB_RUN_ID ?? '').Trim()
+          $runAttempt = ($env:GITHUB_RUN_ATTEMPT ?? '').Trim()
+          $expectedReceiptBasename = "tibotattle-windows-electron-qualification-$runId-$runAttempt-$revision-$cacheMode.json"
+          if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf) -or
+              $receiptBasename -notmatch '^tibotattle-windows-electron-qualification-[1-9][0-9]*-[1-9][0-9]*-[0-9a-f]{40}-(warm|clean)\.json$' -or
+              $receiptBasename -cne $expectedReceiptBasename) {
+            Write-Error 'WINDOWS_QUALIFICATION_RECEIPT_RAW_BASENAME_INVALID'
+            exit 1
+          }
+          $receiptRawPath = Join-Path $env:RUNNER_TEMP $receiptBasename
+          if (Test-Path -LiteralPath $receiptRawPath) {
+            Write-Error 'WINDOWS_QUALIFICATION_RECEIPT_RAW_DESTINATION_EXISTS'
+            exit 1
+          }
+          try {
+            Copy-Item -LiteralPath $receiptPath -Destination $receiptRawPath -Force:$false
+          } catch {
+            Write-Error 'WINDOWS_QUALIFICATION_RECEIPT_RAW_COPY_FAILED'
+            exit 1
+          }
+          if (-not (Test-Path -LiteralPath $receiptRawPath -PathType Leaf)) {
+            Write-Error 'WINDOWS_QUALIFICATION_RECEIPT_RAW_COPY_FAILED'
+            exit 1
+          }
+          "TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_PATH=$receiptRawPath" >> $env:GITHUB_ENV
+          "TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_BASENAME=$receiptBasename" >> $env:GITHUB_ENV
+
+      - name: Retain raw Windows x64 qualification receipt handoff
+        id: windows_qualification_receipt_raw_upload
+        if: ${{ success() && steps.native_security_qualification.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ env.TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_PATH }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Validate raw Windows x64 qualification receipt handoff
+        if: ${{ success() && steps.native_security_qualification.outcome == 'success' }}
+        shell: pwsh
+        env:
+          TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_PATH: ${{ env.TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_PATH }}
+          TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_BASENAME: ${{ env.TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_BASENAME }}
+          TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_ARTIFACT_ID: ${{ steps.windows_qualification_receipt_raw_upload.outputs['artifact-id'] }}
+          TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_ARTIFACT_DIGEST: ${{ steps.windows_qualification_receipt_raw_upload.outputs['artifact-digest'] }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifactId = $env:TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_ARTIFACT_ID
+          $artifactDigest = $env:TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_ARTIFACT_DIGEST
+          $receiptRawPath = $env:TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_PATH
+          if (-not (Test-Path -LiteralPath $receiptRawPath -PathType Leaf) -or
+              $env:TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_BASENAME -notmatch '^tibotattle-windows-electron-qualification-[1-9][0-9]*-[1-9][0-9]*-[0-9a-f]{40}-(warm|clean)\.json$' -or
+              $artifactId -cnotmatch '^[1-9][0-9]*$' -or
+              $artifactDigest -cnotmatch '^[0-9a-f]{64}$') {
+            Write-Error 'WINDOWS_QUALIFICATION_RECEIPT_ARTIFACT_OUTPUT_INVALID'
+            exit 1
+          }
+          try {
+            $localDigest = (Get-FileHash -LiteralPath $receiptRawPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          } catch {
+            Write-Error 'WINDOWS_QUALIFICATION_RECEIPT_RAW_HASH_FAILED'
+            exit 1
+          }
+          $expectedDigest = $localDigest
+          if ($artifactDigest -cne $expectedDigest) {
+            Write-Error 'WINDOWS_QUALIFICATION_RECEIPT_ARTIFACT_DIGEST_MISMATCH'
+            exit 1
+          }
+          "### Raw Windows qualification receipt handoff" >> $env:GITHUB_STEP_SUMMARY
+          "- Status: validated" >> $env:GITHUB_STEP_SUMMARY
+          "- Artifact output: positive decimal id and sha256 digest verified" >> $env:GITHUB_STEP_SUMMARY
+          "- Local SHA-256: matches the upload action digest" >> $env:GITHUB_STEP_SUMMARY
+
       - name: Retain safe Windows Electron verifier failure evidence
         if: ${{ always() && !cancelled() && steps.electron_artifact_verification.outcome == 'failure' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: tibotattle-windows-x64-electron-${{ github.sha }}-${{ matrix.cache-mode }}-verification-blocked
+          name: tibotattle-windows-x64-electron-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}-${{ matrix.cache-mode }}-verification-blocked
           path: ${{ env.TIBOTATTLE_ELECTRON_VERIFICATION_FAILURE_EVIDENCE_PATH }}
           if-no-files-found: error
           retention-days: 3
@@ -734,7 +818,7 @@ jobs:
         if: ${{ always() && !cancelled() && steps.electron_runtime_smoke.outcome == 'failure' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: tibotattle-windows-x64-electron-${{ github.sha }}-${{ matrix.cache-mode }}-runtime-blocked
+          name: tibotattle-windows-x64-electron-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}-${{ matrix.cache-mode }}-runtime-blocked
           path: ${{ env.TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH }}
           if-no-files-found: error
           retention-days: 3
@@ -743,7 +827,7 @@ jobs:
         if: ${{ always() && !cancelled() && steps.native_security_qualification.outcome == 'failure' && steps.electron_artifact_verification.outcome == 'success' && steps.electron_runtime_smoke.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: tibotattle-windows-x64-electron-${{ github.sha }}-${{ matrix.cache-mode }}-blocked-development
+          name: tibotattle-windows-x64-electron-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}-${{ matrix.cache-mode }}-blocked-development
           path: |
             ${{ env.TIBOTATTLE_ELECTRON_ARTIFACT_APP_PATH }}
             ${{ env.TIBOTATTLE_WINDOWS_SECURITY_QUALIFICATION_RESULT_PATH }}

@@ -271,6 +271,15 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   const uploadStep = workflow.indexOf(
     "- name: Retain exact Windows x64 development artifact and qualification receipt",
   );
+  const rawReceiptPreparationStep = workflow.indexOf(
+    "- name: Prepare exact raw Windows x64 qualification receipt handoff",
+  );
+  const rawReceiptUploadStep = workflow.indexOf(
+    "- name: Retain raw Windows x64 qualification receipt handoff",
+  );
+  const rawReceiptValidationStep = workflow.indexOf(
+    "- name: Validate raw Windows x64 qualification receipt handoff",
+  );
   const blockedUploadStep = workflow.indexOf(
     "- name: Retain blocked unsigned Windows x64 development artifact",
   );
@@ -292,6 +301,10 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
       && verificationStep < runtimeStep
       && runtimeStep < receiptStep
       && receiptStep < uploadStep
+      && uploadStep < rawReceiptPreparationStep
+      && rawReceiptPreparationStep < rawReceiptUploadStep
+      && rawReceiptUploadStep < rawReceiptValidationStep
+      && rawReceiptValidationStep < blockedUploadStep
       && uploadStep < blockedUploadStep
       && blockedUploadStep < cleanupStep
       && verificationStep < cleanupStep
@@ -375,7 +388,89 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
     /Create content-free Windows Electron qualification receipt\n\s+if: \$\{\{ success\(\) && steps\.native_security_qualification\.outcome == 'success' \}\}/u,
   );
   assert.match(workflow, /actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/u);
-  assert.match(workflow, /tibotattle-windows-x64-electron-\$\{\{ github\.sha \}\}-\$\{\{ matrix\.cache-mode \}\}/u);
+  assert.match(
+    workflow,
+    /tibotattle-windows-x64-electron-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}-\$\{\{ github\.sha \}\}-\$\{\{ matrix\.cache-mode \}\}/u,
+  );
+  assert.match(
+    workflow,
+    /tibotattle-windows-electron-qualification-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}-\$\{\{ github\.sha \}\}-\$\{\{ matrix\.cache-mode \}\}\.json/u,
+  );
+  assert.match(workflow, /TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_BASENAME/u);
+  assert.match(workflow, /GITHUB_RUN_ID/u);
+  assert.match(workflow, /GITHUB_RUN_ATTEMPT/u);
+  const currentBundleUpload = workflow.slice(uploadStep, rawReceiptPreparationStep);
+  assert.match(currentBundleUpload, /path: \|/u);
+  assert.match(currentBundleUpload, /TIBOTATTLE_ELECTRON_ARTIFACT_APP_PATH/u);
+  assert.match(currentBundleUpload, /TIBOTATTLE_ELECTRON_QUALIFICATION_RECEIPT_PATH/u);
+  assert.match(currentBundleUpload, /retention-days: 3/u);
+  assert.doesNotMatch(currentBundleUpload, /archive:\s*false/u);
+  assert.match(currentBundleUpload, /github\.run_id/u);
+  assert.match(currentBundleUpload, /github\.run_attempt/u);
+  const rawReceiptPreparation = workflow.slice(
+    rawReceiptPreparationStep,
+    rawReceiptUploadStep,
+  );
+  assert.match(
+    rawReceiptPreparation,
+    /if: \$\{\{ success\(\) && steps\.native_security_qualification\.outcome == 'success' \}\}/u,
+  );
+  assert.match(rawReceiptPreparation, /Copy-Item -LiteralPath \$receiptPath -Destination \$receiptRawPath/u);
+  assert.match(rawReceiptPreparation, /PathType Leaf/u);
+  assert.match(rawReceiptPreparation, /TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_PATH=/u);
+  assert.match(rawReceiptPreparation, /TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_BASENAME=/u);
+  assert.doesNotMatch(rawReceiptPreparation, /Write-Host|Write-Output/u);
+  const rawReceiptUpload = workflow.slice(rawReceiptUploadStep, rawReceiptValidationStep);
+  assert.match(rawReceiptUpload, /id: windows_qualification_receipt_raw_upload/u);
+  assert.match(rawReceiptUpload, /uses: actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/u);
+  assert.match(rawReceiptUpload, /path: \$\{\{ env\.TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_PATH \}\}/u);
+  assert.match(rawReceiptUpload, /archive: false/u);
+  assert.match(rawReceiptUpload, /if-no-files-found: error/u);
+  assert.match(rawReceiptUpload, /retention-days: 30/u);
+  assert.doesNotMatch(rawReceiptUpload, /path:\s*\|/u);
+  assert.doesNotMatch(rawReceiptUpload, /always\(\)|!cancelled\(\)/u);
+  const rawReceiptValidation = workflow.slice(
+    rawReceiptValidationStep,
+    blockedUploadStep,
+  );
+  assert.match(
+    rawReceiptValidation,
+    /if: \$\{\{ success\(\) && steps\.native_security_qualification\.outcome == 'success' \}\}/u,
+  );
+  assert.match(
+    rawReceiptValidation,
+    /steps\.windows_qualification_receipt_raw_upload\.outputs\['artifact-id'\]/u,
+  );
+  assert.match(
+    rawReceiptValidation,
+    /steps\.windows_qualification_receipt_raw_upload\.outputs\['artifact-digest'\]/u,
+  );
+  assert.match(rawReceiptValidation, /artifactId -cnotmatch '\^\[1-9\]\[0-9\]\*\$'/u);
+  assert.match(rawReceiptValidation, /artifactDigest -cnotmatch '\^\[0-9a-f\]\{64\}\$'/u);
+  assert.match(rawReceiptValidation, /Get-FileHash -LiteralPath \$receiptRawPath -Algorithm SHA256/u);
+  assert.match(rawReceiptValidation, /localDigest.*ToLowerInvariant\(\)/u);
+  assert.match(rawReceiptValidation, /expectedDigest = \$localDigest/u);
+  assert.match(rawReceiptValidation, /artifactDigest -cne \$expectedDigest/u);
+  assert.match(rawReceiptValidation, /WINDOWS_QUALIFICATION_RECEIPT_ARTIFACT_OUTPUT_INVALID/u);
+  assert.match(rawReceiptValidation, /WINDOWS_QUALIFICATION_RECEIPT_ARTIFACT_DIGEST_MISMATCH/u);
+  assert.doesNotMatch(rawReceiptValidation, /Write-Host|Write-Output/u);
+  const rawReceiptSummary = rawReceiptValidation.slice(
+    rawReceiptValidation.indexOf("### Raw Windows qualification receipt handoff"),
+  );
+  assert.doesNotMatch(rawReceiptSummary, /\$artifact(?:Id|Digest)|\$receiptRawPath|runner_temp|secret|token|password/iu);
+  for (const suffix of [
+    "verification-blocked",
+    "runtime-blocked",
+    "blocked-development",
+  ]) {
+    assert.match(
+      workflow,
+      new RegExp(
+        `tibotattle-windows-x64-electron-\\$\\{\\{ github\\.run_id \\}\\}-\\$\\{\\{ github\\.run_attempt \\}\\}-\\$\\{\\{ github\\.sha \\}\\}-\\$\\{\\{ matrix\\.cache-mode \\}\\}-${suffix}`,
+        "u",
+      ),
+    );
+  }
   assert.match(workflow, /Retain blocked unsigned Windows x64 development artifact/u);
   const verificationFailureUpload = workflow.slice(
     workflow.indexOf("- name: Retain safe Windows Electron verifier failure evidence"),
