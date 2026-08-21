@@ -261,7 +261,7 @@ async function withNativeRoot(run) {
   const root = join(parent, "private state Ω");
   try {
     const rootIdentity = adapter.ensureDirectory(root);
-    return await run({ adapter, bindingPath, root, rootIdentity });
+    return await run({ adapter, binding, bindingPath, root, rootIdentity });
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
