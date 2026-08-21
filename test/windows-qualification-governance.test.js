@@ -18,6 +18,7 @@ import {
   extractTapTestIndex,
   extractTapTestIndexes,
   extractTapTestLocations,
+  formatWindowsSecurityQualificationFailure,
   parseTapSummary,
   qualificationReceiptMetadata,
   qualificationTestFiles,
@@ -60,6 +61,14 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.doesNotMatch(workflow, /inputs\.clean-cache/u);
   assert.match(workflow, /run-windows-portable-diagnostic\.mjs/u);
   assert.match(workflow, /windows-security-qualification\.mjs/u);
+  assert.match(
+    qualificationScript,
+    /export function formatWindowsSecurityQualificationFailure/u,
+  );
+  assert.match(
+    qualificationScript,
+    /console\.error\(formatWindowsSecurityQualificationFailure\(error\)\)/u,
+  );
   assert.match(workflow, /\$nodeGypScript rebuild --directory native\/windows-filesystem/u);
   assert.match(
     workflow,
@@ -636,6 +645,49 @@ test("qualification failure indexing is top-level, numeric, and content-free", (
   assert.equal(extractTapTestIndex("not ok 9007199254740992 - unsafe"), null);
   assert.equal(extractTapTestIndex("not ok 8 -\r\n"), 8);
   assert.equal(extractTapTestIndex(null), null);
+});
+
+test("qualification CLI failure formatting is bounded, numeric, and content-free", () => {
+  const failure = new Error("private failure message");
+  failure.code = FIXED_STATUS.failed;
+  failure.testIndex = 7;
+  failure.testIndexes = Object.freeze([7, 12]);
+  failure.testLocations = Object.freeze([
+    Object.freeze([12, 5]),
+    Object.freeze([20, 10]),
+  ]);
+  assert.equal(
+    formatWindowsSecurityQualificationFailure(failure),
+    "WINDOWS_SECURITY_QUALIFICATION_FAILED test_index=7 "
+      + "test_indexes=7,12 test_locations=12:5;20:10",
+  );
+
+  const unsafe = new Error("secret message must not escape");
+  unsafe.code = "PRIVATE_STATUS";
+  unsafe.testIndex = Number.MAX_SAFE_INTEGER + 1;
+  unsafe.testIndexes = Array.from({ length: 65 }, (_, index) => index + 1);
+  unsafe.testLocations = [[1, 2], ["secret", 3]];
+  const formattedUnsafe = formatWindowsSecurityQualificationFailure(unsafe);
+  assert.equal(
+    formattedUnsafe,
+    "WINDOWS_SECURITY_QUALIFICATION_FAILED test_index=unavailable "
+      + "test_indexes=unavailable test_locations=unavailable",
+  );
+  assert.doesNotMatch(
+    formattedUnsafe,
+    /secret|private|message|windows-filesystem-security\.test\.js/iu,
+  );
+
+  const duplicate = new Error("duplicate metadata should not escape");
+  duplicate.code = FIXED_STATUS.failed;
+  duplicate.testIndex = 4;
+  duplicate.testIndexes = [4, 4];
+  duplicate.testLocations = [[8, 3], [8, 3]];
+  assert.equal(
+    formatWindowsSecurityQualificationFailure(duplicate),
+    "WINDOWS_SECURITY_QUALIFICATION_FAILED test_index=4 "
+      + "test_indexes=unavailable test_locations=unavailable",
+  );
 });
 
 test("SQLite publish diagnostics use the exact frozen allowlist", () => {
