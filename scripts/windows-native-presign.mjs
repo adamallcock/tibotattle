@@ -87,6 +87,38 @@ const AUTHENTICODE_KEYS = Object.freeze([
   "policy",
   "signtoolPaValid",
 ]);
+const RECEIPT_KEYS = Object.freeze([
+  "schemaVersion",
+  "status",
+  "target",
+  "revision",
+  "packageVersion",
+  "qualificationHandoffSha256",
+  "signingRequestPolicy",
+  "modules",
+]);
+const SIGNING_REQUEST_POLICY_KEYS = Object.freeze([
+  "trustedSigningModuleVersion",
+  "requestedFileDigest",
+  "timestampRfc3161",
+  "requestedTimestampDigest",
+]);
+const NATIVE_PRESIGN_MODULE_KEYS = Object.freeze([
+  "name",
+  "packagedPath",
+  "unsignedBytes",
+  "signedBytes",
+  "unsignedSha256",
+  "signedSha256",
+  "authenticode",
+]);
+const EXPECTED_RECEIPT_BINDING_KEYS = Object.freeze([
+  "revision",
+  "packageVersion",
+  "qualificationHandoffSha256",
+  "filesystemBinding",
+  "publisher",
+]);
 
 export const WINDOWS_NATIVE_PRESIGN_FIXED_STATUS = Object.freeze({
   inputInvalid: "WINDOWS_NATIVE_PRESIGN_INPUT_INVALID",
@@ -149,6 +181,60 @@ function readRecord(value, keys, code = WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inpu
       fail(code);
     }
     result[key] = descriptor.value;
+  }
+  return result;
+}
+
+function readArray(
+  value,
+  expectedLength,
+  code = WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid,
+) {
+  try {
+    if (isProxy(value)) fail(code);
+  } catch {
+    fail(code);
+  }
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    fail(code);
+  }
+  let ownKeys;
+  let descriptors;
+  try {
+    ownKeys = Reflect.ownKeys(value);
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    fail(code);
+  }
+  if (value.length !== expectedLength
+      || ownKeys.length !== expectedLength + 1
+      || ownKeys.some((key) => typeof key !== "string")) {
+    fail(code);
+  }
+  const lengthDescriptor = descriptors.length;
+  if (!lengthDescriptor
+      || !Object.hasOwn(lengthDescriptor, "value")
+      || lengthDescriptor.value !== expectedLength
+      || lengthDescriptor.enumerable !== false
+      || lengthDescriptor.get !== undefined
+      || lengthDescriptor.set !== undefined) {
+    fail(code);
+  }
+  const result = [];
+  for (let index = 0; index < expectedLength; index += 1) {
+    const key = String(index);
+    const descriptor = descriptors[key];
+    if (!descriptor
+        || !Object.hasOwn(descriptor, "value")
+        || descriptor.get !== undefined
+        || descriptor.set !== undefined
+        || descriptor.enumerable !== true) {
+      fail(code);
+    }
+    result.push(descriptor.value);
+  }
+  if (ownKeys.some((key) => key !== "length" && !/^(?:0|[1-9][0-9]*)$/u.test(key))) {
+    fail(code);
   }
   return result;
 }
@@ -460,8 +546,197 @@ function stableValue(value) {
   return value;
 }
 
+function validateReceiptPolicy(value) {
+  const policy = readRecord(value, SIGNING_REQUEST_POLICY_KEYS);
+  if (policy.trustedSigningModuleVersion
+      !== WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.trustedSigningModuleVersion
+      || policy.requestedFileDigest
+        !== WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.requestedFileDigest
+      || policy.timestampRfc3161
+        !== WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.timestampRfc3161
+      || policy.requestedTimestampDigest
+        !== WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.requestedTimestampDigest) {
+    fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid);
+  }
+  return Object.freeze({
+    trustedSigningModuleVersion: WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.trustedSigningModuleVersion,
+    requestedFileDigest: WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.requestedFileDigest,
+    timestampRfc3161: WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.timestampRfc3161,
+    requestedTimestampDigest: WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.requestedTimestampDigest,
+  });
+}
+
+function validateReceiptAuthenticode(value, expectedPublisher) {
+  const source = readRecord(
+    value,
+    AUTHENTICODE_KEYS,
+    WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.authenticodeInvalid,
+  );
+  if (source.status !== "Valid"
+      || source.timestampPresent !== true
+      || source.policy !== "authenticode-pa"
+      || source.signtoolPaValid !== true) {
+    fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.authenticodeInvalid);
+  }
+  let publisher;
+  try {
+    publisher = assertString(source.publisher, PUBLISHER_PATTERN, 256);
+  } catch {
+    fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.authenticodeInvalid);
+  }
+  if (expectedPublisher !== undefined && publisher !== expectedPublisher) {
+    fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid);
+  }
+  let signerThumbprint;
+  try {
+    signerThumbprint = assertString(source.signerThumbprint, THUMBPRINT_PATTERN, 40);
+  } catch {
+    fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.authenticodeInvalid);
+  }
+  const normalizedThumbprint = signerThumbprint.toLowerCase();
+  if (signerThumbprint !== normalizedThumbprint) {
+    fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.authenticodeInvalid);
+  }
+  return Object.freeze({
+    status: "Valid",
+    publisher,
+    signerThumbprint: normalizedThumbprint,
+    timestampPresent: true,
+    policy: "authenticode-pa",
+    signtoolPaValid: true,
+  });
+}
+
+function validateExpectedReceiptBinding(value) {
+  if (value === undefined) return undefined;
+  const expected = readRecord(value, EXPECTED_RECEIPT_BINDING_KEYS);
+  const filesystemBinding = readRecord(expected.filesystemBinding, BINDING_KEYS);
+  return Object.freeze({
+    revision: assertString(expected.revision, REVISION_PATTERN, 40),
+    packageVersion: assertString(expected.packageVersion, VERSION_PATTERN, 32),
+    qualificationHandoffSha256: assertString(
+      expected.qualificationHandoffSha256,
+      SHA256_PATTERN,
+      64,
+    ),
+    filesystemBinding: Object.freeze({
+      bytes: assertPositiveInteger(filesystemBinding.bytes),
+      sha256: assertString(filesystemBinding.sha256, SHA256_PATTERN, 64),
+    }),
+    publisher: assertString(expected.publisher, PUBLISHER_PATTERN, 256),
+  });
+}
+
+/**
+ * Validate one exact native pre-sign receipt and return a detached, deeply
+ * frozen snapshot.  The optional expected binding is itself a closed object;
+ * callers cannot smuggle a partial or diagnostic-rich expectation into this
+ * contract, and all mismatches use the fixed content-free error surface.
+ */
+export function validateWindowsNativePresignReceipt(value, expectedBinding) {
+  const expected = validateExpectedReceiptBinding(expectedBinding);
+  const source = readRecord(value, RECEIPT_KEYS);
+  if (source.schemaVersion !== WINDOWS_NATIVE_PRESIGN_SCHEMA
+      || source.status !== WINDOWS_NATIVE_PRESIGN_STATUS
+      || source.target !== WINDOWS_NATIVE_PRESIGN_TARGET) {
+    fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid);
+  }
+  const revision = assertString(source.revision, REVISION_PATTERN, 40);
+  const packageVersion = assertString(source.packageVersion, VERSION_PATTERN, 32);
+  const qualificationHandoffSha256 = assertString(
+    source.qualificationHandoffSha256,
+    SHA256_PATTERN,
+    64,
+  );
+  if (expected !== undefined
+      && (revision !== expected.revision
+        || packageVersion !== expected.packageVersion
+        || qualificationHandoffSha256 !== expected.qualificationHandoffSha256)) {
+    fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid);
+  }
+
+  const signingRequestPolicy = validateReceiptPolicy(source.signingRequestPolicy);
+  const sourceModules = readArray(source.modules, WINDOWS_NATIVE_PRESIGN_MODULES.length);
+  const modules = sourceModules.map((valueAtIndex, index) => {
+    const module = readRecord(valueAtIndex, NATIVE_PRESIGN_MODULE_KEYS);
+    const expectedModule = WINDOWS_NATIVE_PRESIGN_MODULES[index];
+    if (module.name !== expectedModule.name || module.packagedPath !== expectedModule.packagedPath) {
+      fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid);
+    }
+    const unsignedBytes = assertPositiveInteger(module.unsignedBytes);
+    const signedBytes = assertPositiveInteger(module.signedBytes);
+    const unsignedSha256 = assertString(module.unsignedSha256, SHA256_PATTERN, 64);
+    const signedSha256 = assertString(module.signedSha256, SHA256_PATTERN, 64);
+    if (unsignedSha256 === signedSha256) {
+      fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid);
+    }
+    if (index === 1 && unsignedSha256 !== WINDOWS_NATIVE_PRESIGN_KEYTAR_SHA256) {
+      fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid);
+    }
+    const authenticode = validateReceiptAuthenticode(
+      module.authenticode,
+      expected?.publisher,
+    );
+    return {
+      name: expectedModule.name,
+      packagedPath: expectedModule.packagedPath,
+      unsignedBytes,
+      signedBytes,
+      unsignedSha256,
+      signedSha256,
+      authenticode,
+    };
+  });
+
+  if (modules[0].authenticode.publisher !== modules[1].authenticode.publisher) {
+    fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.authenticodeInvalid);
+  }
+
+  if (expected !== undefined
+      && (modules[0].unsignedBytes !== expected.filesystemBinding.bytes
+        || modules[0].unsignedSha256 !== expected.filesystemBinding.sha256)) {
+    fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid);
+  }
+
+  return deepFreeze({
+    schemaVersion: WINDOWS_NATIVE_PRESIGN_SCHEMA,
+    status: WINDOWS_NATIVE_PRESIGN_STATUS,
+    target: WINDOWS_NATIVE_PRESIGN_TARGET,
+    revision,
+    packageVersion,
+    qualificationHandoffSha256,
+    signingRequestPolicy,
+    modules,
+  });
+}
+
 export function serializeWindowsNativePresignReceipt(value) {
-  return `${JSON.stringify(stableValue(value))}\n`;
+  const selected = validateWindowsNativePresignReceipt(value);
+  const serialized = `${JSON.stringify(stableValue(selected))}\n`;
+  if (Buffer.byteLength(serialized, "utf8") > MAXIMUM_INPUT_BYTES) {
+    fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid);
+  }
+  return serialized;
+}
+
+/** Parse only exact canonical JSON receipt bytes. */
+export function parseWindowsNativePresignReceipt(value, expectedBinding) {
+  if (typeof value !== "string"
+      || value.length === 0
+      || Buffer.byteLength(value, "utf8") > MAXIMUM_INPUT_BYTES) {
+    fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid);
+  }
+  const selected = validateWindowsNativePresignReceipt(parsed, expectedBinding);
+  if (value !== serializeWindowsNativePresignReceipt(selected)) {
+    fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid);
+  }
+  return selected;
 }
 
 export async function buildWindowsNativePresignReceipt(
@@ -629,14 +904,15 @@ export async function writeWindowsNativePresignReceipt(
     platform = process.platform,
   } = {},
 ) {
+  const selectedReceipt = validateWindowsNativePresignReceipt(receipt);
   const root = resolve(expectedReceiptRoot);
-  const expectedPath = join(root, `windows-native-presign-${receipt?.revision}.json`);
+  const expectedPath = join(root, `windows-native-presign-${selectedReceipt.revision}.json`);
   if (normalizedPathForComparison(path, platform)
       !== normalizedPathForComparison(expectedPath, platform)) {
     fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.outputInvalid);
   }
   await requireSafeReceiptRoot(root, platform);
-  const serialized = serializeWindowsNativePresignReceipt(receipt);
+  const serialized = serializeWindowsNativePresignReceipt(selectedReceipt);
   const temporaryPath = `${path}.tmp`;
   let handle;
   let temporaryCreated = false;

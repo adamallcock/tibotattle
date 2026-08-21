@@ -1,5 +1,5 @@
 /**
- * Closed, content-free v1 contract for the handoff from the Windows
+ * Closed, content-free v2 contract for the handoff from the Windows
  * qualification lane to a protected signed-package finalizer.
  *
  * This module deliberately does not read files, inspect Authenticode, call
@@ -26,15 +26,16 @@
  * that proof back to this manifest.
  *
  * The schema is intentionally small and closed.  The two native modules and
- * the runtime manifest are the only package subjects; the source qualification
- * and signed finalizer are the two provenance stages.  The finalizer can use
- * this contract without importing any diagnostic payload or user content.
+ * the runtime manifest are the only package subjects; source qualification,
+ * native pre-sign, and the signed finalizer are the three provenance stages.
+ * The finalizer can use this contract without importing any diagnostic
+ * payload or user content.
  */
 
 import { isProxy } from "node:util/types";
 
 export const WINDOWS_PRODUCTION_AUTHORITY_MANIFEST_SCHEMA =
-  "tibotattle-windows-production-authority-manifest-v1";
+  "tibotattle-windows-production-authority-manifest-v2";
 export const WINDOWS_PRODUCTION_AUTHORITY_MANIFEST_STATUS =
   "WINDOWS_PRODUCTION_AUTHORITY_MANIFEST_VALID";
 
@@ -52,6 +53,13 @@ export const WINDOWS_PRODUCTION_AUTHORITY_FINALIZER_EVENT = "workflow_dispatch";
 export const WINDOWS_PRODUCTION_AUTHORITY_PROTECTED_REF = "refs/heads/main";
 export const WINDOWS_PRODUCTION_AUTHORITY_HANDOFF_SCHEMA =
   "tibotattle-windows-finalizer-qualification-handoff-v2";
+export const WINDOWS_PRODUCTION_AUTHORITY_SOURCE_PACKAGE_PATH = "package.json";
+export const WINDOWS_PRODUCTION_AUTHORITY_SOURCE_PACKAGE_NAME = "app-usagemonitor";
+export const WINDOWS_PRODUCTION_AUTHORITY_NATIVE_PRESIGN_SCHEMA =
+  "tibotattle-windows-native-presign-v1";
+export const WINDOWS_PRODUCTION_AUTHORITY_NATIVE_PRESIGN_STATUS =
+  "WINDOWS_NATIVE_PRESIGN_PASSED";
+export const WINDOWS_PRODUCTION_AUTHORITY_NATIVE_PRESIGN_TARGET = "win32-x64";
 
 export const WINDOWS_PRODUCTION_AUTHORITY_RUNTIME_MANIFEST_PATH =
   "electron-runtime-manifest.json";
@@ -92,9 +100,11 @@ const TOP_LEVEL_KEYS = Object.freeze([
   "architecture",
   "repository",
   "sourceRevision",
+  "sourcePackage",
   "sourceQualification",
   "finalizer",
   "nativeModules",
+  "nativePresign",
   "runtimeManifest",
   "signerPolicy",
   "promotedCapabilities",
@@ -139,6 +149,23 @@ const NATIVE_MODULE_KEYS = Object.freeze([
   "unsignedSha256",
   "signedSha256",
 ]);
+const NATIVE_PRESIGN_KEYS = Object.freeze([
+  "receiptSha256",
+  "schemaVersion",
+  "status",
+  "target",
+  "revision",
+  "packageVersion",
+  "qualificationHandoffSha256",
+]);
+const SOURCE_PACKAGE_KEYS = Object.freeze([
+  "path",
+  "name",
+  "version",
+  "revision",
+  "bytes",
+  "sha256",
+]);
 const BINDING_KEYS = Object.freeze(["bytes", "sha256"]);
 const RUNTIME_MANIFEST_KEYS = Object.freeze([
   "packagedPath",
@@ -155,6 +182,7 @@ const REF_PATTERN = /^refs\/(?:heads|tags)\/[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za
 const WORKFLOW_PATTERN = /^\.github\/workflows\/[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*\.(?:yml|yaml)$/u;
 const PUBLISHER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 .,&()=+_-]{0,255}$/u;
 const MAXIMUM_JSON_BYTES = 512 * 1024;
+const MAXIMUM_SOURCE_PACKAGE_BYTES = 64 * 1024;
 const MAXIMUM_PATH_BYTES = 256;
 
 const NATIVE_MODULE_ORDER = Object.freeze(
@@ -566,6 +594,65 @@ function validateNativeModules(value, sourceBinding) {
   return result;
 }
 
+function validateNativePresign(value, sourceRevision, packageVersion, handoffSha256) {
+  const presign = readRecord(value, NATIVE_PRESIGN_KEYS);
+  if (presign.schemaVersion !== WINDOWS_PRODUCTION_AUTHORITY_NATIVE_PRESIGN_SCHEMA
+      || presign.status !== WINDOWS_PRODUCTION_AUTHORITY_NATIVE_PRESIGN_STATUS
+      || presign.target !== WINDOWS_PRODUCTION_AUTHORITY_NATIVE_PRESIGN_TARGET) {
+    fail("mismatch");
+  }
+  const receiptSha256 = assertSha256(presign.receiptSha256);
+  const revision = assertRevision(presign.revision);
+  const selectedPackageVersion = assertString(
+    presign.packageVersion,
+    VERSION_PATTERN,
+    "invalid",
+    32,
+  );
+  const qualificationHandoffSha256 = assertSha256(presign.qualificationHandoffSha256);
+  if (revision !== sourceRevision
+      || selectedPackageVersion !== packageVersion
+      || qualificationHandoffSha256 !== handoffSha256) {
+    fail("mismatch");
+  }
+  return {
+    receiptSha256,
+    schemaVersion: presign.schemaVersion,
+    status: presign.status,
+    target: presign.target,
+    revision,
+    packageVersion: selectedPackageVersion,
+    qualificationHandoffSha256,
+  };
+}
+
+function validateSourcePackage(value, sourceRevision, packageVersion) {
+  const sourcePackage = readRecord(value, SOURCE_PACKAGE_KEYS);
+  const path = assertRelativePath(
+    sourcePackage.path,
+    WINDOWS_PRODUCTION_AUTHORITY_SOURCE_PACKAGE_PATH,
+  );
+  if (sourcePackage.name !== WINDOWS_PRODUCTION_AUTHORITY_SOURCE_PACKAGE_NAME) {
+    fail("mismatch");
+  }
+  const version = assertString(sourcePackage.version, VERSION_PATTERN, "invalid", 32);
+  const revision = assertRevision(sourcePackage.revision);
+  const bytes = assertPositiveInteger(sourcePackage.bytes);
+  if (bytes > MAXIMUM_SOURCE_PACKAGE_BYTES) fail("invalid");
+  const sha256 = assertSha256(sourcePackage.sha256);
+  if (version !== packageVersion || revision !== sourceRevision) {
+    fail("mismatch");
+  }
+  return {
+    path,
+    name: WINDOWS_PRODUCTION_AUTHORITY_SOURCE_PACKAGE_NAME,
+    version,
+    revision,
+    bytes,
+    sha256,
+  };
+}
+
 function validateRuntimeManifest(value) {
   const runtime = readRecord(value, RUNTIME_MANIFEST_KEYS);
   return {
@@ -600,6 +687,11 @@ function snapshotValidated(value) {
 
   const packageVersion = assertString(source.packageVersion, VERSION_PATTERN, "invalid", 32);
   const sourceRevision = assertRevision(source.sourceRevision);
+  const sourcePackage = validateSourcePackage(
+    source.sourcePackage,
+    sourceRevision,
+    packageVersion,
+  );
   const sourceQualification = validateSourceQualification(
     source.sourceQualification,
     sourceRevision,
@@ -612,6 +704,12 @@ function snapshotValidated(value) {
   const nativeModules = validateNativeModules(
     source.nativeModules,
     sourceQualification.binding,
+  );
+  const nativePresign = validateNativePresign(
+    source.nativePresign,
+    sourceRevision,
+    packageVersion,
+    sourceQualification.handoff.sha256,
   );
   const runtimeManifest = validateRuntimeManifest(source.runtimeManifest);
   const signerPolicy = validateSignerPolicy(source.signerPolicy);
@@ -634,9 +732,11 @@ function snapshotValidated(value) {
     architecture: source.architecture,
     repository: source.repository,
     sourceRevision,
+    sourcePackage,
     sourceQualification,
     finalizer,
     nativeModules,
+    nativePresign,
     runtimeManifest,
     signerPolicy,
     promotedCapabilities,

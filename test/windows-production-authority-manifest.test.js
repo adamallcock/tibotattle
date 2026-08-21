@@ -12,6 +12,11 @@ import {
   WINDOWS_PRODUCTION_AUTHORITY_MANIFEST_STATUS,
   WINDOWS_PRODUCTION_AUTHORITY_MAXIMUM_OBJECT_GRAPH_DEPTH,
   WINDOWS_PRODUCTION_AUTHORITY_MAXIMUM_OBJECT_GRAPH_NODES,
+  WINDOWS_PRODUCTION_AUTHORITY_NATIVE_PRESIGN_SCHEMA,
+  WINDOWS_PRODUCTION_AUTHORITY_NATIVE_PRESIGN_STATUS,
+  WINDOWS_PRODUCTION_AUTHORITY_NATIVE_PRESIGN_TARGET,
+  WINDOWS_PRODUCTION_AUTHORITY_SOURCE_PACKAGE_NAME,
+  WINDOWS_PRODUCTION_AUTHORITY_SOURCE_PACKAGE_PATH,
   WINDOWS_PRODUCTION_AUTHORITY_PLATFORM,
   WINDOWS_PRODUCTION_AUTHORITY_PROTECTED_REF,
   WINDOWS_PRODUCTION_AUTHORITY_PRODUCT,
@@ -36,6 +41,9 @@ const WARM_ARTIFACT_DIGEST = `sha256:${WARM_RECEIPT_SHA}`;
 const CLEAN_ARTIFACT_DIGEST = `sha256:${CLEAN_RECEIPT_SHA}`;
 const BINDING_BYTES = 1234;
 const BINDING_SHA = "e".repeat(64);
+const NATIVE_PRESIGN_RECEIPT_SHA = "6".repeat(64);
+const SOURCE_PACKAGE_BYTES = 12949;
+const SOURCE_PACKAGE_SHA = "7".repeat(64);
 
 function fixture(overrides = {}) {
   const base = {
@@ -48,6 +56,14 @@ function fixture(overrides = {}) {
     architecture: WINDOWS_PRODUCTION_AUTHORITY_ARCHITECTURE,
     repository: WINDOWS_PRODUCTION_AUTHORITY_REPOSITORY,
     sourceRevision: REVISION,
+    sourcePackage: {
+      path: WINDOWS_PRODUCTION_AUTHORITY_SOURCE_PACKAGE_PATH,
+      name: WINDOWS_PRODUCTION_AUTHORITY_SOURCE_PACKAGE_NAME,
+      version: "0.1.15",
+      revision: REVISION,
+      bytes: SOURCE_PACKAGE_BYTES,
+      sha256: SOURCE_PACKAGE_SHA,
+    },
     sourceQualification: {
       workflow: WINDOWS_PRODUCTION_AUTHORITY_SOURCE_WORKFLOW,
       run: 123456789,
@@ -111,6 +127,15 @@ function fixture(overrides = {}) {
         signedSha256: "4".repeat(64),
       },
     ],
+    nativePresign: {
+      receiptSha256: NATIVE_PRESIGN_RECEIPT_SHA,
+      schemaVersion: WINDOWS_PRODUCTION_AUTHORITY_NATIVE_PRESIGN_SCHEMA,
+      status: WINDOWS_PRODUCTION_AUTHORITY_NATIVE_PRESIGN_STATUS,
+      target: WINDOWS_PRODUCTION_AUTHORITY_NATIVE_PRESIGN_TARGET,
+      revision: REVISION,
+      packageVersion: "0.1.15",
+      qualificationHandoffSha256: HANDOFF_SHA,
+    },
     runtimeManifest: {
       packagedPath: WINDOWS_PRODUCTION_AUTHORITY_RUNTIME_MANIFEST_PATH,
       bytes: 300003,
@@ -128,7 +153,7 @@ function fixture(overrides = {}) {
 
 function merge(base, overrides) {
   const result = { ...base, ...overrides };
-  for (const key of ["sourceQualification", "finalizer", "runtimeManifest", "signerPolicy"]) {
+  for (const key of ["sourceQualification", "sourcePackage", "finalizer", "runtimeManifest", "signerPolicy"]) {
     if (overrides[key]) result[key] = { ...base[key], ...overrides[key] };
   }
   if (overrides.sourceQualification?.handoff) {
@@ -147,6 +172,9 @@ function merge(base, overrides) {
     result.sourceQualification.receipts = overrides.sourceQualification.receipts;
   }
   if (overrides.nativeModules) result.nativeModules = overrides.nativeModules;
+  if (overrides.nativePresign) {
+    result.nativePresign = { ...base.nativePresign, ...overrides.nativePresign };
+  }
   return result;
 }
 
@@ -168,9 +196,19 @@ test("builds a frozen content-free Windows authority snapshot", () => {
   assert.equal(Object.isFrozen(manifest.sourceQualification), true);
   assert.equal(Object.isFrozen(manifest.sourceQualification.receipts), true);
   assert.equal(Object.isFrozen(manifest.nativeModules[0]), true);
+  assert.equal(Object.isFrozen(manifest.sourcePackage), true);
+  assert.equal(Object.isFrozen(manifest.nativePresign), true);
   assert.deepEqual(manifest.sourceQualification.binding, {
     bytes: BINDING_BYTES,
     sha256: BINDING_SHA,
+  });
+  assert.deepEqual(manifest.sourcePackage, {
+    path: WINDOWS_PRODUCTION_AUTHORITY_SOURCE_PACKAGE_PATH,
+    name: WINDOWS_PRODUCTION_AUTHORITY_SOURCE_PACKAGE_NAME,
+    version: "0.1.15",
+    revision: REVISION,
+    bytes: SOURCE_PACKAGE_BYTES,
+    sha256: SOURCE_PACKAGE_SHA,
   });
   assert.equal(manifest.nativeModules[0].unsignedBytes, BINDING_BYTES);
   assert.equal(Object.hasOwn(manifest.nativeModules[0], "bytes"), false);
@@ -182,6 +220,65 @@ test("builds a frozen content-free Windows authority snapshot", () => {
   assert.notEqual(manifest, source);
   assert.notEqual(manifest.nativeModules, source.nativeModules);
   assert.deepEqual(manifest, fixture());
+});
+
+test("binds source package identity and raw bytes to the authority revision", () => {
+  const manifest = createWindowsProductionAuthorityManifest(fixture());
+  assert.equal(manifest.sourcePackage.revision, manifest.sourceRevision);
+  assert.equal(manifest.sourcePackage.version, manifest.packageVersion);
+
+  for (const [field, value, code] of [
+    ["path", "other.json", "mismatch"],
+    ["name", "other-product", "mismatch"],
+    ["version", "0.1.16", "mismatch"],
+    ["revision", "f".repeat(40), "mismatch"],
+    ["bytes", 0, "invalid"],
+    ["bytes", 64 * 1024 + 1, "invalid"],
+    ["sha256", "z".repeat(64), "invalid"],
+  ]) {
+    invalid(fixture({ sourcePackage: { [field]: value } }), code);
+  }
+
+  const extra = fixture();
+  extra.sourcePackage.extra = "no";
+  invalid(extra, "invalid");
+
+  const missing = fixture();
+  delete missing.sourcePackage.sha256;
+  invalid(missing, "invalid");
+});
+
+test("binds the native presign receipt hash and provenance identity exactly", () => {
+  const manifest = createWindowsProductionAuthorityManifest(fixture());
+  assert.deepEqual(manifest.nativePresign, {
+    receiptSha256: NATIVE_PRESIGN_RECEIPT_SHA,
+    schemaVersion: WINDOWS_PRODUCTION_AUTHORITY_NATIVE_PRESIGN_SCHEMA,
+    status: WINDOWS_PRODUCTION_AUTHORITY_NATIVE_PRESIGN_STATUS,
+    target: WINDOWS_PRODUCTION_AUTHORITY_NATIVE_PRESIGN_TARGET,
+    revision: REVISION,
+    packageVersion: "0.1.15",
+    qualificationHandoffSha256: HANDOFF_SHA,
+  });
+
+  for (const [field, value, code] of [
+    ["receiptSha256", "z".repeat(64), "invalid"],
+    ["schemaVersion", "tibotattle-windows-native-presign-v2", "mismatch"],
+    ["status", "WINDOWS_NATIVE_PRESIGN_INPUT_INVALID", "mismatch"],
+    ["target", "linux-x64", "mismatch"],
+    ["revision", "f".repeat(40), "mismatch"],
+    ["packageVersion", "0.1.16", "mismatch"],
+    ["qualificationHandoffSha256", "f".repeat(64), "mismatch"],
+  ]) {
+    invalid(fixture({ nativePresign: { [field]: value } }), code);
+  }
+
+  const extra = fixture();
+  extra.nativePresign.extra = "no";
+  invalid(extra, "invalid");
+
+  const missing = fixture();
+  delete missing.nativePresign.receiptSha256;
+  invalid(missing, "invalid");
 });
 
 test("supports the explicit generator aliases without minting authority", () => {
