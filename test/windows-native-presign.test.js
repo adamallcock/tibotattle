@@ -28,9 +28,11 @@ import {
   WindowsNativePresignError,
   buildTrustedSigningPowerShellCommand,
   buildWindowsNativePresignReceipt,
+  parseWindowsNativePresignReceipt,
   runWindowsNativePresign,
   serializeWindowsNativePresignReceipt,
   validateAuthenticodeAggregate,
+  validateWindowsNativePresignReceipt,
   validateWindowsNativePresignOptions,
   writeWindowsNativePresignReceipt,
 } from "../scripts/windows-native-presign.mjs";
@@ -108,6 +110,16 @@ async function fixture() {
     async cleanup() {
       await rm(parent, { recursive: true, force: true });
     },
+  };
+}
+
+function expectedBinding(options) {
+  return {
+    revision: options.revision,
+    packageVersion: options.packageVersion,
+    qualificationHandoffSha256: options.qualificationHandoffSha256,
+    filesystemBinding: options.filesystemBinding,
+    publisher: PUBLISHER,
   };
 }
 
@@ -194,7 +206,153 @@ test("builds a frozen, fixed-path, content-free pre-sign receipt", async () => {
     assert.equal(calls[0].path, value.filesystemPath);
     assert.equal(calls[1].path, value.keytarPath);
     assert.equal(JSON.stringify(receipt).includes(value.parent), false);
-    assert.equal(serializeWindowsNativePresignReceipt(receipt).endsWith("\n"), true);
+    const binding = expectedBinding(value.options);
+    const validated = validateWindowsNativePresignReceipt(receipt, binding);
+    assert.equal(Object.isFrozen(validated), true);
+    assert.equal(Object.isFrozen(validated.modules[0]), true);
+    const serialized = serializeWindowsNativePresignReceipt(receipt);
+    assert.equal(serialized.endsWith("\n"), true);
+    assert.deepEqual(parseWindowsNativePresignReceipt(serialized, binding), validated);
+    assert.throws(
+      () => parseWindowsNativePresignReceipt(`${serialized} `, binding),
+      expectCode(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid),
+    );
+  } finally {
+    await value.cleanup();
+  }
+});
+
+test("validates the closed receipt contract and every expected binding", async () => {
+  const value = await fixture();
+  try {
+    const receipt = await buildWindowsNativePresignReceipt(value.options, {
+      platform: "darwin",
+      expectedStagingRoot: value.stagingRoot,
+      expectedReceiptRoot: value.receiptRoot,
+      signAndProbe: injectedSigner(),
+    });
+    const binding = expectedBinding(value.options);
+    const invalidReceipt = (mutate, code = WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid) => {
+      const candidate = JSON.parse(JSON.stringify(receipt));
+      mutate(candidate);
+      assert.throws(
+        () => validateWindowsNativePresignReceipt(candidate, binding),
+        expectCode(code),
+      );
+    };
+
+    for (const [field, replacement] of [
+      ["schemaVersion", "tibotattle-windows-native-presign-v2"],
+      ["status", "WINDOWS_NATIVE_PRESIGN_INPUT_INVALID"],
+      ["target", "linux-x64"],
+      ["revision", "f".repeat(40)],
+      ["packageVersion", "0.1.16"],
+      ["qualificationHandoffSha256", "f".repeat(64)],
+    ]) {
+      invalidReceipt((candidate) => { candidate[field] = replacement; });
+    }
+
+    invalidReceipt((candidate) => {
+      candidate.signingRequestPolicy.requestedFileDigest = "SHA1";
+    });
+    invalidReceipt((candidate) => {
+      candidate.modules.reverse();
+    });
+    invalidReceipt((candidate) => {
+      candidate.modules[0].packagedPath = candidate.modules[1].packagedPath;
+    });
+    invalidReceipt((candidate) => {
+      candidate.modules[1].unsignedSha256 = "0".repeat(64);
+    });
+    invalidReceipt((candidate) => {
+      candidate.modules[0].signedSha256 = candidate.modules[0].unsignedSha256;
+    });
+    invalidReceipt((candidate) => {
+      candidate.modules[0].authenticode.timestampPresent = false;
+    }, WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.authenticodeInvalid);
+    invalidReceipt((candidate) => {
+      candidate.modules[0].authenticode.signerThumbprint = THUMBPRINT.toUpperCase();
+    }, WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.authenticodeInvalid);
+    invalidReceipt((candidate) => {
+      candidate.modules[0].authenticode.extra = "no";
+    }, WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.authenticodeInvalid);
+    invalidReceipt((candidate) => {
+      candidate.extra = "no";
+    });
+
+    const accessor = JSON.parse(JSON.stringify(receipt));
+    Object.defineProperty(accessor, "revision", {
+      enumerable: true,
+      get: () => REVISION,
+    });
+    assert.throws(
+      () => validateWindowsNativePresignReceipt(accessor, binding),
+      expectCode(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid),
+    );
+
+    const symbolized = JSON.parse(JSON.stringify(receipt));
+    symbolized[Symbol("secret")] = "no";
+    assert.throws(
+      () => validateWindowsNativePresignReceipt(symbolized, binding),
+      expectCode(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid),
+    );
+
+    const proxied = new Proxy(JSON.parse(JSON.stringify(receipt)), {});
+    assert.throws(
+      () => validateWindowsNativePresignReceipt(proxied, binding),
+      expectCode(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid),
+    );
+
+    const divergentPublisher = JSON.parse(JSON.stringify(receipt));
+    divergentPublisher.modules[1].authenticode.publisher = "CN=Different Publisher";
+    assert.throws(
+      () => validateWindowsNativePresignReceipt(divergentPublisher),
+      expectCode(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.authenticodeInvalid),
+    );
+
+    const arrayExtra = JSON.parse(JSON.stringify(receipt));
+    arrayExtra.modules.extra = "no";
+    assert.throws(
+      () => validateWindowsNativePresignReceipt(arrayExtra, binding),
+      expectCode(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid),
+    );
+
+    for (const [field, replacement] of [
+      ["revision", "f".repeat(40)],
+      ["packageVersion", "0.1.16"],
+      ["qualificationHandoffSha256", "f".repeat(64)],
+      ["filesystemBinding", { bytes: binding.filesystemBinding.bytes + 1, sha256: binding.filesystemBinding.sha256 }],
+      ["publisher", "CN=Someone Else"],
+    ]) {
+      assert.throws(
+        () => validateWindowsNativePresignReceipt(receipt, {
+          ...binding,
+          [field]: replacement,
+        }),
+        expectCode(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid),
+      );
+    }
+    assert.throws(
+      () => validateWindowsNativePresignReceipt(receipt, { ...binding, extra: "no" }),
+      expectCode(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid),
+    );
+    const missingExpected = { ...binding };
+    delete missingExpected.publisher;
+    assert.throws(
+      () => validateWindowsNativePresignReceipt(receipt, missingExpected),
+      expectCode(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid),
+    );
+    assert.throws(
+      () => serializeWindowsNativePresignReceipt({
+        ...JSON.parse(JSON.stringify(receipt)),
+        extra: "no",
+      }),
+      expectCode(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid),
+    );
+    assert.throws(
+      () => parseWindowsNativePresignReceipt(`${"x".repeat(64 * 1024)}\n`, binding),
+      expectCode(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid),
+    );
   } finally {
     await value.cleanup();
   }
