@@ -36,6 +36,24 @@ or a Linux-support claim.
 - `productionSafe` and all production selectors remain false. No signing,
   release, version bump, or publication occurred.
 
+## Current implementation note: 2026-08-21 — content-free provenance join
+
+- The branch now contains a macOS-testable, fail-closed provenance join for a
+  future protected Windows finalizer. It hashes the raw qualification handoff,
+  raw native pre-sign receipt, and raw checked-out `package.json` bytes before
+  parsing them; independently revalidates the source GitHub workflow-run
+  metadata; and emits the closed authority-manifest v2 snapshot with explicit
+  `sourcePackage` and `nativePresign` bindings.
+- Native module rows are projected only from the validated pre-sign receipt;
+  callers cannot provide untrusted module rows directly to the authority
+  constructor. This remains a content-free contract and does not prove that a
+  protected checkout, GitHub REST response, Azure credential, or Windows
+  native artifact supplied the inputs.
+- The protected production finalizer workflow does not exist or run yet. No
+  Azure or native Windows proof, signing, selector enablement, version bump,
+  release, push, or Windows-support claim occurred. `productionSafe` and all
+  production selectors remain false.
+
 ## Latest bounded outcome: 2026-08-21 (exact run `32477262214`)
 
 This checkpoint supersedes the earlier 2026-08-21 diagnostic log below.

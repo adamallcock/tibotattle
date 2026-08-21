@@ -20,6 +20,8 @@ The handoff is verified by
 [`verify-windows-finalizer-qualification-handoff.mjs`](../../scripts/verify-windows-finalizer-qualification-handoff.mjs),
 the authority data contract is
 [`windows-production-authority-manifest.js`](../../src/platform/windows-production-authority-manifest.js),
+the content-free provenance join is
+[`build-windows-production-finalizer-authority.mjs`](../../scripts/build-windows-production-finalizer-authority.mjs),
 and the native pre-sign primitive is
 [`windows-native-presign.mjs`](../../scripts/windows-native-presign.mjs).
 
@@ -80,7 +82,11 @@ The finalizer must independently check that the raw receipt hash equals the
 artifact's recorded digest before trusting any receipt field. Keep the raw
 handoff and receipt hashes as protected, content-free evidence; never retain
 the workflow log, test output, source paths, or downloaded artifact contents
-in a public release descriptor.
+in a public release descriptor. It must also independently re-fetch and
+validate the source workflow run through the GitHub REST response, including
+the exact repository, workflow path, run id, attempt, ref, source SHA, event,
+status, and conclusion. Run and workflow values copied from the handoff are
+not sufficient on their own.
 
 ## 2. Lock the exact checkout and version
 
@@ -93,11 +99,16 @@ git rev-parse HEAD                                # exact handoff revision
 node -p "require('./package.json').version"      # exact selected version
 ~~~
 
-The finalizer must compare `HEAD`, the handoff revision, the selected package
-version, the Electron staging metadata, and the version passed to the release
-builder. A version mismatch, dirty tree, detached unreviewed commit, stale
-lockfile, or changed native binding requires a new qualification handoff; do
-not repair the checkout in place.
+The finalizer must compare `HEAD`, the handoff revision, the raw bytes and
+SHA-256 of the checked-out `package.json`, its parsed package name/version and
+module metadata, the Electron staging metadata, and the version passed to the
+release builder. A version or package-byte mismatch, dirty tree, detached
+unreviewed commit, stale lockfile, or changed native binding requires a new
+qualification handoff; do not repair the checkout in place. The raw
+`package.json` bytes are passed to the content-free provenance join, which
+hashes them before parsing and records the fixed `package.json` path, package
+name, version, source revision, byte count, and SHA-256 in the authority
+manifest's `sourcePackage` block.
 
 The planned authority contract uses the protected `main` ref and
 `workflow_dispatch` for the signed finalizer. That is a contract value, not a
@@ -213,26 +224,38 @@ operation.
 
 After the native receipt is complete and before electron-builder can mutate
 any other bytes, construct the closed
-`windows-production-authority-manifest-v1` snapshot with
-`createWindowsProductionAuthorityManifest`. Bind all of these values:
+`windows-production-authority-manifest-v2` snapshot through
+`build-windows-production-finalizer-authority.mjs`. Pass the join builder the
+raw v2 handoff bytes, raw native pre-sign receipt bytes, raw checkout
+`package.json` bytes, independently revalidated source workflow REST metadata,
+the reviewed publisher, runtime manifest, and finalizer invocation facts. Do
+not call `createWindowsProductionAuthorityManifest` with caller-supplied native
+module rows; the join builder must parse and validate the native receipt and
+project those rows itself. The builder hashes each raw subject before parsing,
+requires canonical handoff and pre-sign bytes, and then invokes the closed
+manifest contract. Bind all of these values:
 
 - product, app id, Windows x64 target, package version, repository, and exact
   source revision;
+- the fixed checkout `package.json` path and name, parsed version, source
+  revision, bounded byte count, and raw SHA-256;
 - the v2 handoff schema and raw handoff SHA-256;
 - both warm/clean qualification receipt hashes, artifact ids, artifact
   digests, source run ids, and attempts;
 - the qualified filesystem binding bytes and SHA-256;
 - both native modules' unsigned and pre-signed byte counts and SHA-256 values;
+- the native pre-sign receipt's raw SHA-256, schema, passed status, target,
+  source revision, package version, and qualification-handoff SHA-256;
 - the runtime manifest's fixed package path, bytes, and SHA-256;
 - the exact finalizer workflow/repository/ref/event invocation identity; and
 - the exact Authenticode publisher policy and the limited promoted/unavailable
   capability lists.
 
-Validate and serialize the manifest using the module's closed schema. This
-manifest is a content-free provenance snapshot, not an authority bit: it does
-not inspect files, call Azure, validate Authenticode, or assert that the
-finalizer run succeeded. The later finalizer receipt must bind its completed
-run identity and final artifact bytes back to this snapshot.
+Validate and serialize the returned manifest using the module's closed
+schema. This manifest is a content-free provenance snapshot, not an authority
+bit: it does not inspect files, call Azure, validate Authenticode, or assert
+that the finalizer run succeeded. The later finalizer receipt must bind its
+completed run identity and final artifact bytes back to this snapshot.
 
 ## 7. Package with electron-builder without a second `.node` signing
 
@@ -334,13 +357,18 @@ and mutually bound on one exact revision:
 
 - verified v2 warm-and-clean handoff with raw receipt hashes equal to the
   recorded workflow artifact digests;
+- independently revalidated source workflow REST metadata matching the handoff
+  repository, workflow path, run, attempt, ref, source SHA, event, status, and
+  conclusion;
 - clean protected checkout and exact package version;
+- raw checked-out `package.json` bytes bound by path, name, version, source
+  revision, byte count, and SHA-256 in `sourcePackage`;
 - fresh Windows x64 staging with no marker, reparse point, symlink, or stale
   output;
 - exact TrustedSigning 0.5.0 preflight pass;
 - passing native presign receipt for exactly the two fixed `.node` modules;
-- valid authority manifest matching handoff, binding, version, and native
-  signed bytes;
+- valid authority v2 manifest matching handoff, `sourcePackage`,
+  `nativePresign`, binding, version, and native signed bytes;
 - successful electron-builder packaging with `!.node` and zero second native
   signing operations;
 - independently verified unpacked, installer, and installed subject hashes;
@@ -359,8 +387,9 @@ Windows support claim.
 
 macOS can run the portable contract tests for closed input validation,
 deterministic serialization, injected signer behavior, digest binding,
-no-clobber receipt publication, and invalidation semantics. It can also check
-that the release configuration expresses `signExts: [".dll", "!.node"]`.
+no-clobber receipt publication, invalidation semantics, and the content-free
+handoff/package/presign provenance join. It can also check that the release
+configuration expresses `signExts: [".dll", "!.node"]`.
 
 macOS cannot prove Azure Trusted Signing credentials or endpoint authority,
 the installed TrustedSigning 0.5.0 module, Windows PE/AuthentiCode behavior,
