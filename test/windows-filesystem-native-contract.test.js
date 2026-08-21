@@ -79,6 +79,10 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   const protectedReplaceBody = source.slice(protectedReplaceStart, protectedDeleteStart);
   const executableProtectedDeleteBody = withoutCppComments(protectedDeleteBody);
   const executableProtectedReplaceBody = withoutCppComments(protectedReplaceBody);
+  const publishStart = source.indexOf("napi_value PublishSqliteDatabaseCallback(");
+  const publishEnd = source.indexOf("napi_value DeleteProtectedChildCallback(", publishStart);
+  assert.ok(publishStart >= 0 && publishEnd > publishStart);
+  const executablePublishBody = withoutCppComments(source.slice(publishStart, publishEnd));
   assert.match(source, /NtCreateFile/u);
   assert.match(source, /RootDirectory/u);
   assert.match(source, /NtSetInformationFile/u);
@@ -194,6 +198,30 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
     executableReplaceBody.slice(identityCheckOffset, renameCallOffset)
       .includes("opened.closeFinal()"),
     false,
+  );
+  const publishRenameOffset = executablePublishBody.indexOf("if (!RenameHandleRelative(");
+  const publishCloseParentsOffset = executablePublishBody.indexOf("target.closeParents()");
+  const publishFinalTargetValidationOffset = executablePublishBody.lastIndexOf(
+    "RequireSqliteSidecarsAbsent(target.parents.front(), targetName, &failure)",
+    publishRenameOffset,
+  );
+  const publishFinalTargetBlockOffset = executablePublishBody.lastIndexOf(
+    "if (!targetMissing && target.final != INVALID_HANDLE_VALUE)",
+    publishRenameOffset,
+  );
+  assert.ok(
+    publishFinalTargetBlockOffset >= 0
+      && publishFinalTargetValidationOffset > publishFinalTargetBlockOffset
+      && publishCloseParentsOffset > publishFinalTargetValidationOffset
+      && publishCloseParentsOffset < publishRenameOffset,
+  );
+  assert.doesNotMatch(
+    executablePublishBody.slice(publishFinalTargetBlockOffset, publishCloseParentsOffset),
+    /target\.(?:closeFinal|releaseFinal)\(\)/u,
+  );
+  assert.match(
+    executablePublishBody.slice(publishRenameOffset),
+    /RenameHandleRelative\(\s*stage\.final,\s*stage\.parents\.front\(\),\s*targetName/u,
   );
   assert.match(source, /FILE_READ_DATA \| GENERIC_WRITE \| DELETE \| READ_CONTROL \| WRITE_DAC/u);
   assert.match(source, /DefineMethod\(env, exports, "replaceFile",/u);
