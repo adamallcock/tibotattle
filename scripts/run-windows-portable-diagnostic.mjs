@@ -11,15 +11,7 @@
  */
 
 import { spawn } from "node:child_process";
-import {
-  closeSync,
-  mkdtempSync,
-  openSync,
-  readSync,
-  rmSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { WINDOWS_PORTABLE_TEST_FILES } from "./portable-test-manifest.mjs";
@@ -30,11 +22,6 @@ const MAXIMUM_TEST_FILES = 256;
 export const WINDOWS_PORTABLE_MAXIMUM_FAILURE_METADATA_ITEMS = 64;
 export const WINDOWS_PORTABLE_MAXIMUM_FAILURE_UNIT_METADATA_ITEMS = 64;
 export const WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS = 1_024;
-export const WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS = 64;
-export const WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_FILE =
-  "apps/local/server.test.mjs";
-export const WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_ENVIRONMENT_KEY =
-  "TIBOTATTLE_WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_FILE";
 const TERMINATION_TIMEOUT_MS = 10_000;
 const ORDINARY_TEST_FAILURE = Symbol("ordinary-test-failure");
 
@@ -89,23 +76,6 @@ function fixedError(code, metadata = {}) {
       ...metadata.failureUnitOrdinals,
     ]);
     error.failureUnitsTruncated = metadata.failureUnitsTruncated;
-  }
-  if (metadata.resourceUnits
-      && Array.isArray(metadata.resourceUnits.counts)
-      && metadata.resourceUnits.counts.length === 10
-      && metadata.resourceUnits.counts.every((count) =>
-        Number.isSafeInteger(count) && count >= 0)
-      && metadata.resourceUnits.counts.reduce((sum, count) => sum + count, 0)
-        <= WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS
-      && Number.isSafeInteger(metadata.resourceUnits.firstTcpOrdinal)
-      && metadata.resourceUnits.firstTcpOrdinal >= 0
-      && metadata.resourceUnits.firstTcpOrdinal <= 99
-      && typeof metadata.resourceUnits.truncated === "boolean") {
-    error.resourceUnits = Object.freeze({
-      counts: Object.freeze([...metadata.resourceUnits.counts]),
-      firstTcpOrdinal: metadata.resourceUnits.firstTcpOrdinal,
-      truncated: metadata.resourceUnits.truncated,
-    });
   }
   return error;
 }
@@ -231,97 +201,6 @@ function observeProgressUnits(chunk, state) {
   for (const byte of chunk) visit(byte);
 }
 
-function createResourceDiagnosticState() {
-  return {
-    counts: Array.from({ length: 10 }, () => 0),
-    markerState: 0,
-    present: false,
-    firstTcpOrdinal: 0,
-    tcpOrdinalTens: null,
-    total: 0,
-    truncated: false,
-  };
-}
-
-function observeResourceDiagnostic(chunk, state) {
-  const visit = (byte) => {
-    if (state.present) return;
-    if (state.markerState === 0) {
-      if (byte === 0x52) state.markerState = 1; // R
-      return;
-    }
-    if (state.markerState === 1 && byte === 0x51) { // Q
-      state.markerState = 2;
-      return;
-    }
-    if (state.markerState === 1 && byte >= 0x30 && byte <= 0x39) {
-      if (state.total < WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS) {
-        state.counts[byte - 0x30] += 1;
-        state.total += 1;
-      } else {
-        state.truncated = true;
-      }
-      return;
-    }
-    if (state.markerState === 2 && byte === 0x4f) { // O
-      state.markerState = 3;
-      return;
-    }
-    if (state.markerState === 3 && byte >= 0x30 && byte <= 0x39) {
-      state.tcpOrdinalTens = byte - 0x30;
-      state.markerState = 4;
-      return;
-    }
-    if (state.markerState === 4 && byte >= 0x30 && byte <= 0x39) {
-      state.firstTcpOrdinal = (state.tcpOrdinalTens * 10) + (byte - 0x30);
-      state.markerState = 5;
-      return;
-    }
-    if (state.markerState === 5 && byte === 0x5a) { // Z
-      state.present = true;
-      state.markerState = 6;
-      return;
-    }
-    state.markerState = byte === 0x52 ? 1 : 0;
-  };
-  if (typeof chunk === "string") {
-    for (let index = 0; index < chunk.length; index += 1) {
-      visit(chunk.charCodeAt(index));
-    }
-    return;
-  }
-  if (!(chunk instanceof Uint8Array)) return;
-  for (const byte of chunk) visit(byte);
-}
-
-function snapshotResourceDiagnostic(state) {
-  if (state.present !== true) return null;
-  return Object.freeze({
-    counts: Object.freeze([...state.counts]),
-    firstTcpOrdinal: state.firstTcpOrdinal,
-    truncated: state.truncated,
-  });
-}
-
-function readResourceDiagnosticFile(file) {
-  if (file === null) return null;
-  let descriptor;
-  try {
-    descriptor = openSync(file, "r");
-    const bytes = Buffer.alloc(WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS + 8);
-    const length = readSync(descriptor, bytes, 0, bytes.length, 0);
-    const state = createResourceDiagnosticState();
-    observeResourceDiagnostic(bytes.subarray(0, length), state);
-    return snapshotResourceDiagnostic(state);
-  } catch {
-    return null;
-  } finally {
-    if (descriptor !== undefined) {
-      try { closeSync(descriptor); } catch { /* Fixed unavailable result above. */ }
-    }
-  }
-}
-
 /**
  * Kill only the process tree rooted at the child spawned by this runner.
  * Checking the live child before invoking taskkill avoids targeting a reused
@@ -439,35 +318,6 @@ function runPortableTestFile(
 ) {
   const startedAt = Date.now();
   return new Promise((resolveRun, rejectRun) => {
-    let resourceDiagnosticDirectory = null;
-    let resourceDiagnosticFile = null;
-    if (file === WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_FILE) {
-      try {
-        resourceDiagnosticDirectory = mkdtempSync(join(
-          tmpdir(),
-          "tibotattle-windows-resource-diagnostic-",
-        ));
-        resourceDiagnosticFile = join(resourceDiagnosticDirectory, "categories");
-      } catch {
-        rejectRun(fixedError(WINDOWS_PORTABLE_STATUS.failed, {
-          file,
-          ordinal,
-          elapsedMs: boundedElapsed(startedAt, timeoutMs),
-        }));
-        return;
-      }
-    }
-    const cleanupResourceDiagnostic = () => {
-      if (resourceDiagnosticDirectory === null) return;
-      try {
-        rmSync(resourceDiagnosticDirectory, { recursive: true, force: true });
-      } catch {
-        // The diagnostic directory contains only fixed category bytes and is
-        // outside the checkout. Cleanup failure cannot widen child output.
-      }
-      resourceDiagnosticDirectory = null;
-      resourceDiagnosticFile = null;
-    };
     let child;
     try {
       const arguments_ = [
@@ -478,19 +328,12 @@ function runPortableTestFile(
       ];
       child = spawnProcess(process.execPath, arguments_, {
         cwd,
-        env: file === WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_FILE
-          ? {
-            ...environment,
-            [WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_ENVIRONMENT_KEY]:
-              resourceDiagnosticFile,
-          }
-          : environment,
+        env: environment,
         stdio: ["ignore", "pipe", "ignore"],
         windowsHide: true,
       });
       if (!child || typeof child.once !== "function") throw new Error("invalid child");
     } catch {
-      cleanupResourceDiagnostic();
       rejectRun(fixedError(WINDOWS_PORTABLE_STATUS.failed, {
         file,
         ordinal,
@@ -506,7 +349,6 @@ function runPortableTestFile(
       elapsedMs: boundedElapsed(startedAt, timeoutMs),
     };
     const failMalformedChild = (status) => {
-      cleanupResourceDiagnostic();
       rejectRun(fixedError(status, status === WINDOWS_PORTABLE_STATUS.terminationFailed
         ? { ...baseMetadata, progressUnits: 0 }
         : baseMetadata));
@@ -557,7 +399,6 @@ function runPortableTestFile(
       stdout.removeListener("error", onStdoutError);
       child.removeListener("error", onChildError);
       child.removeListener("close", onChildClose);
-      cleanupResourceDiagnostic();
       callback(value);
     };
     const fail = (status, { ordinaryTestFailure = false } = {}) => {
@@ -569,9 +410,6 @@ function runPortableTestFile(
       if (status === WINDOWS_PORTABLE_STATUS.timedOut
           || status === WINDOWS_PORTABLE_STATUS.terminationFailed) {
         metadata.progressUnits = progress.count;
-        metadata.resourceUnits = readResourceDiagnosticFile(
-          resourceDiagnosticFile,
-        );
       }
       if (ordinaryTestFailure) {
         metadata.progressUnits = progress.count;
@@ -758,30 +596,6 @@ function safeFailureProgress(error, status) {
     : "unavailable";
 }
 
-function safeFailureResources(error, status) {
-  if (status !== WINDOWS_PORTABLE_STATUS.timedOut
-      && status !== WINDOWS_PORTABLE_STATUS.terminationFailed) {
-    return null;
-  }
-  const resourceUnits = error?.resourceUnits;
-  if (!resourceUnits
-      || !Array.isArray(resourceUnits.counts)
-      || resourceUnits.counts.length !== 10
-      || resourceUnits.counts.some((count) =>
-        !Number.isSafeInteger(count) || count < 0)
-      || resourceUnits.counts.reduce((sum, count) => sum + count, 0)
-        > WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS
-      || !Number.isSafeInteger(resourceUnits.firstTcpOrdinal)
-      || resourceUnits.firstTcpOrdinal < 0
-      || resourceUnits.firstTcpOrdinal > 99
-      || typeof resourceUnits.truncated !== "boolean") {
-    return "unavailable";
-  }
-  return `${resourceUnits.counts.join(":")}`
-    + `/${resourceUnits.truncated ? 1 : 0}`
-    + `/${resourceUnits.firstTcpOrdinal}`;
-}
-
 function safeFailureLocation(error) {
   if (typeof error?.file !== "string"
       || !Number.isSafeInteger(error.ordinal)
@@ -870,14 +684,10 @@ export function formatWindowsPortableDiagnosticFailure(error) {
     const progressMetadata = progress === null
       ? ""
       : ` progress_units=${progress}`;
-    const resources = safeFailureResources(error, status);
-    const resourceMetadata = resources === null
-      ? ""
-      : ` resource_units=${resources}`;
     return `WINDOWS_PORTABLE_DIAGNOSTIC_FAILED file=${location.file}`
       + ` ordinal=${location.ordinal} status=${status}`
       + ` elapsed_ms=${safeFailureElapsed(error)}`
-      + `${progressMetadata}${resourceMetadata}`;
+      + `${progressMetadata}`;
   }
   return status;
 }
