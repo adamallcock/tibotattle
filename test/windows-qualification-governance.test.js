@@ -255,11 +255,17 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   const uploadStep = workflow.indexOf(
     "- name: Retain exact Windows x64 development artifact and qualification receipt",
   );
+  const blockedUploadStep = workflow.indexOf(
+    "- name: Retain blocked unsigned Windows x64 development artifact",
+  );
   const cleanupStep = workflow.indexOf(
     "- name: Remove generated Electron artifact tree before clean checkout gate",
   );
   const cleanCheckoutStep = workflow.indexOf(
     "- name: Confirm qualification and artifact work did not modify the checkout",
+  );
+  const failClosedStep = workflow.indexOf(
+    "- name: Fail closed after retaining blocked development artifact",
   );
   assert.ok(
     qualificationStep >= 0
@@ -270,12 +276,21 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
       && verificationStep < runtimeStep
       && runtimeStep < receiptStep
       && receiptStep < uploadStep
+      && uploadStep < blockedUploadStep
+      && blockedUploadStep < cleanupStep
       && verificationStep < cleanupStep
       && cleanupStep < cleanCheckoutStep,
     "Electron verification, runtime smoke, receipt, upload, cleanup, and final clean-checkout gate must remain ordered",
   );
   assert.match(workflow, /WINDOWS_ELECTRON_REVISION_MISMATCH/u);
   assert.match(workflow, /WINDOWS_QUALIFICATION_REVISION_MISMATCH/u);
+  assert.ok(cleanCheckoutStep < failClosedStep);
+  const nativeQualificationStep = workflow.slice(qualificationStep, revisionGate);
+  assert.match(nativeQualificationStep, /id: native_security_qualification/u);
+  assert.match(nativeQualificationStep, /continue-on-error: true/u);
+  assert.match(nativeQualificationStep, /TIBOTATTLE_WINDOWS_SECURITY_QUALIFICATION_STATUS=failed/u);
+  assert.match(nativeQualificationStep, /WINDOWS_SECURITY_QUALIFICATION_FAILED_DEVELOPMENT_CONTINUES/u);
+  assert.match(nativeQualificationStep, /Production promotion: blocked/u);
   assert.match(workflow, /\.release-build\/electron-dev\/windows-x64\/app/u);
   assert.match(workflow, /\.release-build\/electron-dev\/windows-x64\/artifacts/u);
   assert.match(workflow, /native\/windows-filesystem\/build\/Release\/windows_filesystem\.node/u);
@@ -299,6 +314,7 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /--asar \$env:TIBOTATTLE_ELECTRON_ASAR_PATH/u);
   assert.match(workflow, /--unpacked \$env:TIBOTATTLE_ELECTRON_UNPACKED_PATH/u);
   assert.match(workflow, /ELECTRON_DEVELOPMENT_ARTIFACT_VERIFIED/u);
+  assert.match(workflow, /id: electron_artifact_verification/u);
   assert.match(workflow, /ELECTRON_ARTIFACT_EVIDENCE_NOT_CONTENT_FREE/u);
   assert.match(workflow, /SHA-256:/u);
   assert.match(workflow, /Runtime qualification: deferred to the native Windows Electron smoke step/u);
@@ -307,8 +323,19 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /build-windows-electron-qualification-receipt\.mjs/u);
   assert.match(workflow, /TIBOTATTLE_ELECTRON_QUALIFICATION_RECEIPT_PATH/u);
   assert.match(workflow, /WINDOWS_ELECTRON_DEVELOPMENT_QUALIFICATION_PASSED/u);
+  assert.match(
+    workflow,
+    /Create content-free Windows Electron qualification receipt\n\s+if: \$\{\{ success\(\) && steps\.native_security_qualification\.outcome == 'success' \}\}/u,
+  );
   assert.match(workflow, /actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/u);
   assert.match(workflow, /tibotattle-windows-x64-electron-\$\{\{ github\.sha \}\}-\$\{\{ matrix\.cache-mode \}\}/u);
+  assert.match(workflow, /Retain blocked unsigned Windows x64 development artifact/u);
+  assert.match(
+    workflow,
+    /always\(\) && !cancelled\(\) && steps\.native_security_qualification\.outcome == 'failure' && steps\.electron_artifact_verification\.outcome == 'success'/u,
+  );
+  assert.match(workflow, /blocked-development/u);
+  assert.match(workflow, /WINDOWS_SECURITY_QUALIFICATION_FAILED_ARTIFACT_RETAINED/u);
   assert.match(workflow, /if-no-files-found: error/u);
   assert.match(workflow, /retention-days: 3/u);
   assert.match(workflow, /Windows production readiness: not claimed/u);
