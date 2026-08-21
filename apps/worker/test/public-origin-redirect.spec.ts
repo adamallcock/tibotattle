@@ -76,4 +76,28 @@ describe("public canonical-host routing", () => {
       )).toBeNull();
     }
   });
+
+  it("keeps a network-path pathname on the configured origin", () => {
+    const environment = publicOriginBindings("https://tibotattle.com");
+    // A `//host` or `/\host` pathname is a network-path reference to the URL
+    // constructor; the Location must never leave the canonical origin.
+    for (const attack of [
+      "https://www.tibotattle.com//attacker.example",
+      "https://www.tibotattle.com//attacker.example/path?q=1",
+      "https://www.tibotattle.com/\\attacker.example",
+      "https://www.tibotattle.com/\\/attacker.example",
+    ]) {
+      const location = canonicalPublicRedirectUrl(new URL(attack), environment);
+      expect(location).not.toBeNull();
+      // The one property that matters: the redirect authority is our origin,
+      // never the attacker host that the network-path prefix tried to name.
+      expect(new URL(location as string).origin).toBe("https://tibotattle.com");
+      expect(new URL(location as string).hostname).toBe("tibotattle.com");
+    }
+    // The leading slash run is collapsed so no confusing `//` Location survives.
+    expect(canonicalPublicRedirectUrl(
+      new URL("https://www.tibotattle.com//attacker.example"),
+      environment,
+    )).toBe("https://tibotattle.com/attacker.example");
+  });
 });
