@@ -2114,13 +2114,13 @@ bool OpenSqliteChild(
 // A missing sidecar cannot be protected by an existence check alone: another
 // process could create it immediately after that check.  Instead, create an
 // owner-only placeholder relative to the already-held root and keep an
-// exclusive handle open. All metadata, security, and canonical-path checks
-// complete while the placeholder is still ordinary; Windows can reject those
-// queries once a file is delete-pending. The final fallible step marks the
-// validated handle for deletion immediately before exposing the lease. A
+// exclusive handle open and mark it for deletion before exposing the lease. A
 // SQLite writer attempting to create or open the sidecar then receives a
-// sharing violation (or delete-pending error), and the file is removed after
-// the lease has closed every reservation handle, including after a crash.
+// sharing violation (or delete-pending error).  The file is removed after the
+// lease has closed every reservation handle, so a crash does not leave a
+// permanent sentinel behind. Marking the file before publishing the lease
+// also closes the race in which a filesystem filter opens the visible
+// placeholder before a deferred delete-on-close operation can take effect.
 bool ReserveSqliteSidecar(
     HANDLE protectedRoot,
     const ParsedPath& parsedRoot,
@@ -2177,6 +2177,17 @@ bool ReserveSqliteSidecar(
     return false;
   }
 
+  // Do not defer the delete-pending transition until the handle closes. A
+  // filter or scanner can otherwise open the visible placeholder between
+  // NtCreateFile and lease release, keeping the basename present after the
+  // reservation handle is closed. DELETE was requested above, so marking the
+  // file now makes the namespace transition explicit and fail-closed.
+  if (!MarkHandleForDeletion(handle)) {
+    *failure = FromLastError();
+    CloseHandle(handle);
+    return false;
+  }
+
   bool reparse = false;
   DWORD attributesValue = 0;
   HandleIdentity identity;
@@ -2196,18 +2207,6 @@ bool ReserveSqliteSidecar(
   if (!valid) {
     if (!MarkHandleForDeletion(handle)) *failure = OperationFailed();
     CloseHandle(handle);
-    return false;
-  }
-
-  // This must remain the final fallible operation before publishing the
-  // reservation handle. Marking earlier makes the handle delete-pending and
-  // can cause the validation above (especially final-path resolution) to
-  // fail. If marking fails, never expose the lease; close the handle and
-  // preserve the native failure unless cleanup itself also fails.
-  if (!MarkHandleForDeletion(handle)) {
-    const Failure deletionFailure = FromLastError();
-    if (!CloseHandle(handle)) *failure = OperationFailed();
-    else *failure = deletionFailure;
     return false;
   }
   *result = handle;
