@@ -159,6 +159,12 @@
       "followUp": "Run finalizer handoff input and reparse-point refusal on native Windows x64 before accepting a signed promotion."
     },
     {
+      "file": "test/windows-native-presign.test.js",
+      "win32BranchCount": 1,
+      "classification": "native-windows-qualification",
+      "followUp": "Run fixed Azure Trusted Signing, PE/AuthentiCode, and protected reparse-race qualification on native Windows x64."
+    },
+    {
       "file": "test/windows-path-contract.test.js",
       "win32BranchCount": 1,
       "classification": "native-windows-qualification",

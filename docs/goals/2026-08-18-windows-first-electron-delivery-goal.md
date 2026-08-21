@@ -19,6 +19,23 @@ production signing, a public artifact, a GitHub release, an appcast change, a
 Homebrew update, a service deployment, replacement of the native macOS client,
 or a Linux-support claim.
 
+## Current implementation note: 2026-08-21 — native pre-sign contract
+
+- The branch now contains a narrow, fail-closed pre-sign contract for the two
+  fixed Windows native modules. macOS tests use injected signing and synthetic
+  Authenticode results to cover fixed paths, digest bindings, receipt
+  publication, no-clobber behavior, and invalidation after partial signing.
+- This is a contract test only. It does not prove Azure Trusted Signing
+  credentials or endpoint access, PE/AuthentiCode validity, `signtool.exe`
+  behavior, Windows reparse-point/race safety, or a protected finalizer
+  workflow on native Windows.
+- The pre-sign test therefore remains an explicit Windows deferral. A future
+  protected native finalizer must run the exact Azure, PE/AuthentiCode, and
+  filesystem qualification on a clean Windows x64 runner before any
+  production receipt, selector, release, or support claim.
+- `productionSafe` and all production selectors remain false. No signing,
+  release, version bump, or publication occurred.
+
 ## Latest bounded outcome: 2026-08-21 (exact run `32477262214`)
 
 This checkpoint supersedes the earlier 2026-08-21 diagnostic log below.
