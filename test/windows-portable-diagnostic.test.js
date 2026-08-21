@@ -8,6 +8,7 @@ import test from "node:test";
 import {
   WINDOWS_PORTABLE_STATUS,
   WINDOWS_PORTABLE_MAXIMUM_FAILURE_METADATA_ITEMS,
+  WINDOWS_PORTABLE_MAXIMUM_FAILURE_UNIT_METADATA_ITEMS,
   WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS,
   WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS,
   WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_ENVIRONMENT_KEY,
@@ -132,6 +133,7 @@ test("Windows portable diagnostic continues ordinary nonzero test exits and aggr
     const code = calls.length === 0 ? 7 : 0;
     calls.push({ command, arguments_, options });
     queueMicrotask(() => {
+      if (code !== 0) child.stdout.write(".X.");
       child.exitCode = code;
       child.emit("close", code);
     });
@@ -157,6 +159,8 @@ test("Windows portable diagnostic continues ordinary nonzero test exits and aggr
       assert.equal(error.failureCount, 1);
       assert.deepEqual(error.failures, [{
         file: "test/test-lanes.test.js",
+        failureUnitOrdinals: [2],
+        failureUnitsTruncated: false,
         ordinal: 1,
         status: WINDOWS_PORTABLE_STATUS.failed,
       }]);
@@ -358,6 +362,45 @@ test("Windows portable diagnostic caps content-free progress metadata", async ()
       assert.match(
         formatWindowsPortableDiagnosticFailure(error),
         new RegExp(`progress_units=${WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS}\\b`, "u"),
+      );
+      return true;
+    },
+  );
+});
+
+test("Windows portable diagnostic caps content-free failing test ordinals", async () => {
+  const child = fakeChild(9016);
+  await assert.rejects(
+    runWindowsPortableTestFiles([WINDOWS_PORTABLE_TEST_FILES[0]], {
+      platform: "win32",
+      architecture: "x64",
+      cwd: REPOSITORY_ROOT,
+      spawnProcess: () => {
+        queueMicrotask(() => {
+          child.stdout.write("X".repeat(
+            WINDOWS_PORTABLE_MAXIMUM_FAILURE_UNIT_METADATA_ITEMS + 1,
+          ));
+          child.exitCode = 1;
+          child.emit("close", 1);
+        });
+        return child;
+      },
+    }),
+    (error) => {
+      const [failure] = error.failures;
+      assert.equal(
+        failure.failureUnitOrdinals.length,
+        WINDOWS_PORTABLE_MAXIMUM_FAILURE_UNIT_METADATA_ITEMS,
+      );
+      assert.deepEqual(failure.failureUnitOrdinals.slice(0, 3), [1, 2, 3]);
+      assert.equal(
+        failure.failureUnitOrdinals.at(-1),
+        WINDOWS_PORTABLE_MAXIMUM_FAILURE_UNIT_METADATA_ITEMS,
+      );
+      assert.equal(failure.failureUnitsTruncated, true);
+      assert.match(
+        formatWindowsPortableDiagnosticFailure(error),
+        /unit_ordinals=1:2:3:/u,
       );
       return true;
     },
@@ -628,6 +671,8 @@ test("Windows portable diagnostic formatting is fixed and content-free", () => {
   aggregate.failureCount = 1;
   aggregate.failures = [{
     file: WINDOWS_PORTABLE_TEST_FILES[0],
+    failureUnitOrdinals: [2, 5],
+    failureUnitsTruncated: false,
     ordinal: 1,
     status: WINDOWS_PORTABLE_STATUS.failed,
   }];
@@ -637,7 +682,7 @@ test("Windows portable diagnostic formatting is fixed and content-free", () => {
     formatted,
     "WINDOWS_PORTABLE_DIAGNOSTIC_FAILED failure_count=1 recorded_failures=1 truncated=0\n"
       + `WINDOWS_PORTABLE_DIAGNOSTIC_FAILURE file=${WINDOWS_PORTABLE_TEST_FILES[0]} ordinal=1 `
-      + "status=WINDOWS_PORTABLE_DIAGNOSTIC_TEST_FAILED",
+      + "status=WINDOWS_PORTABLE_DIAGNOSTIC_TEST_FAILED unit_ordinals=2:5 units_truncated=0",
   );
   assert.doesNotMatch(formatted, /do not emit|stdout|stderr|secret/iu);
 
