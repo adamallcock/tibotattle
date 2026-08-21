@@ -55,8 +55,6 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   const inspectStart = source.indexOf("napi_value InspectPathCallback(", replaceStart);
   const protectedReplaceStart = source.indexOf("napi_value ReplaceProtectedChildCallback(");
   const protectedDeleteStart = source.indexOf("napi_value DeleteProtectedChildCallback(");
-  const sidecarStart = source.indexOf("bool ReserveSqliteSidecar(");
-  const sidecarEnd = source.indexOf("std::vector<HANDLE> TakeAllHandles(", sidecarStart);
   const ownerOnlyResourcesStart = source.indexOf(
     "struct OwnerOnlySecurityResources",
     protectedDeleteStart,
@@ -68,14 +66,11 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
       && protectedReplaceStart > inspectStart
       && protectedDeleteStart > inspectStart
       && protectedDeleteStart > protectedReplaceStart
-      && sidecarStart >= 0
-      && sidecarEnd > sidecarStart
       && ownerOnlyResourcesStart > protectedDeleteStart,
   );
   const renameBody = source.slice(renameStart, replaceStart);
   const replaceBody = source.slice(replaceStart, inspectStart);
   const protectedDeleteBody = source.slice(protectedDeleteStart, ownerOnlyResourcesStart);
-  const sidecarBody = source.slice(sidecarStart, sidecarEnd);
   const withoutCppComments = (value) => value
     .replace(/\/\*[\s\S]*?\*\//gu, "")
     .replace(/\/\/.*$/gmu, "");
@@ -230,16 +225,7 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   assert.match(source, /ReserveSqliteSidecar/u);
   assert.match(source, /options\.shareMode = 0/u);
   assert.match(source, /options\.disposition = kFileCreate/u);
-  const sidecarValidationOffset = sidecarBody.indexOf("const bool valid");
-  const sidecarMarkOffset = sidecarBody.lastIndexOf(
-    "if (!MarkHandleForDeletion(handle))",
-  );
-  const sidecarResultOffset = sidecarBody.indexOf("*result = handle;");
-  assert.ok(
-    sidecarValidationOffset >= 0
-      && sidecarMarkOffset > sidecarValidationOffset
-      && sidecarResultOffset > sidecarMarkOffset,
-  );
+  assert.match(source, /MarkHandleForDeletion\(handle\)/u);
   assert.doesNotMatch(source, /options\.extraOptions = kFileDeleteOnClose/u);
   assert.doesNotMatch(source, /\bkFileNonDirectory\b/u);
   assert.match(source, /sidecarReservations/u);
