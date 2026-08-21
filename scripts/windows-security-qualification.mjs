@@ -532,6 +532,14 @@ export function formatWindowsSecurityQualificationFailure(error) {
   const testFileLocations = safeCapturedTapQualificationTestLocations(
     error?.testFileLocations,
   );
+  const nativeErrors = Array.isArray(error?.nativeErrors)
+    && error.nativeErrors.length <= MAXIMUM_FAILURE_METADATA_ITEMS
+    && error.nativeErrors.every(
+      (value, index, values) => WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST.includes(value)
+        && values.indexOf(value) === index,
+    )
+    ? error.nativeErrors
+    : null;
   return `${status} test_index=${testIndex}`
     + ` test_indexes=${testIndexes !== null && testIndexes.length > 0
       ? testIndexes.join(",")
@@ -541,6 +549,9 @@ export function formatWindowsSecurityQualificationFailure(error) {
       : "unavailable"}`
     + ` test_file_locations=${testFileLocations !== null && testFileLocations.length > 0
       ? testFileLocations.map((location) => location.join(":")).join(";")
+      : "unavailable"}`
+    + ` native_errors=${nativeErrors !== null && nativeErrors.length > 0
+      ? nativeErrors.join(",")
       : "unavailable"}`;
 }
 
@@ -592,11 +603,32 @@ export function extractTapPublishErrors(output) {
 
 export const extractTapWindowsFilesystemPublishErrors = extractTapPublishErrors;
 
+/**
+ * Extract only allowlisted native filesystem error codes from Node TAP error
+ * diagnostics. Messages, stacks, paths, and test names remain private.
+ */
+export function extractTapNativeErrors(output) {
+  const errors = [];
+  if (typeof output !== "string") return Object.freeze(errors);
+  const seen = new Set();
+  const allowlisted = new Set(WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST);
+  const pattern = /^\s*#\s+code:\s*(['"]?)(WINDOWS_FILESYSTEM_[A-Z0-9_]+)\1\s*$/gmu;
+  for (const match of output.matchAll(pattern)) {
+    const errorCode = match[2];
+    if (!allowlisted.has(errorCode) || seen.has(errorCode)) continue;
+    seen.add(errorCode);
+    errors.push(errorCode);
+    if (errors.length === MAXIMUM_FAILURE_METADATA_ITEMS) break;
+  }
+  return Object.freeze(errors);
+}
+
 function fixedFailureWithTapMetadata(output) {
   const error = fixedError(FIXED_STATUS.failed);
   error.testIndexes = extractTapTestIndexes(output);
   error.testLocations = extractTapTestLocations(output);
   error.testFileLocations = extractTapQualificationTestLocations(output);
+  error.nativeErrors = extractTapNativeErrors(output);
   error.testIndex = error.testIndexes[0] ?? null;
   error.publishStages = extractTapPublishStages(output);
   error.publishStage = error.publishStages[0] ?? null;
