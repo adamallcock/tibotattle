@@ -255,84 +255,6 @@ test.after(() => rmSync(WINDOWS_QUALIFICATION_RESOURCE_ROOT, {
   force: true,
 }));
 
-const WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_ENVIRONMENT_KEY =
-  "TIBOTATTLE_WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_FILE";
-const WINDOWS_PORTABLE_RESOURCE_TYPE_CODES = Object.freeze({
-  ChildProcess: "0",
-  ProcessWrap: "0",
-  FSReqCallback: "1",
-  FileHandleCloseReq: "1",
-  Immediate: "2",
-  MessagePort: "3",
-  PipeWrap: "4",
-  SignalWrap: "5",
-  TCPServerWrap: "6",
-  TCPSocketWrap: "7",
-  TCPWrap: "7",
-  Timeout: "8",
-});
-let completedTopLevelTestOrdinal = 0;
-let firstRetainedTcpServerOrdinal = 0;
-const WINDOWS_PORTABLE_UPSTREAM_SERVER_SENTINEL = 91;
-const WINDOWS_PORTABLE_COMPANION_SERVER_SENTINEL = 92;
-
-async function settledTcpServerCount() {
-  await new Promise((resolveTurn) => setImmediate(resolveTurn));
-  await new Promise((resolveTurn) => setImmediate(resolveTurn));
-  return process.getActiveResourcesInfo()
-    .filter((type) => type === "TCPServerWrap").length;
-}
-
-test.afterEach(async () => {
-  const diagnosticFile =
-    process.env[WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_ENVIRONMENT_KEY];
-  if (typeof diagnosticFile !== "string" || diagnosticFile.length < 1) {
-    return;
-  }
-  completedTopLevelTestOrdinal += 1;
-  if (typeof process.getActiveResourcesInfo !== "function") {
-    return;
-  }
-  // Give completed server.close() callbacks two event-loop turns to destroy
-  // their async resource before classifying a retained listener.
-  const retained = (await settledTcpServerCount()) > 0;
-  if (retained && firstRetainedTcpServerOrdinal === 0) {
-    firstRetainedTcpServerOrdinal = completedTopLevelTestOrdinal;
-  } else if (!retained) {
-    firstRetainedTcpServerOrdinal = 0;
-  }
-});
-
-test.after(() => {
-  const diagnosticFile =
-    process.env[WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_ENVIRONMENT_KEY];
-  if (typeof diagnosticFile !== "string"
-      || diagnosticFile.length < 1
-      || typeof process.getActiveResourcesInfo !== "function") {
-    return;
-  }
-  let resourceTypes;
-  try {
-    resourceTypes = process.getActiveResourcesInfo();
-  } catch {
-    resourceTypes = [];
-  }
-  const codes = resourceTypes.slice(0, 65).map((type) =>
-    WINDOWS_PORTABLE_RESOURCE_TYPE_CODES[type] ?? "9");
-  // R/Q/O/Z frame only fixed category digits. The parent reads at most 72 bytes
-  // from its own temporary file and never forwards child output.
-  try {
-    const tcpOrdinal = String(firstRetainedTcpServerOrdinal).padStart(2, "0");
-    writeFileSync(diagnosticFile, `R${codes.join("")}QO${tcpOrdinal}Z`, {
-      encoding: "ascii",
-      flag: "wx",
-      mode: 0o600,
-    });
-  } catch {
-    // Absence is reported as a fixed unavailable diagnostic by the parent.
-  }
-});
-
 function windowsElectronQualificationContext({ adapter, stateRoot, environment = {
   USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION: "windows-electron-v1",
   USAGE_MONITOR_TEST_LANE: "windows-electron-smoke",
@@ -2453,14 +2375,6 @@ test("participant relay never follows an upstream redirect", async () => {
     assert.deepEqual(upstreamRequests, ["/api/v1/session"]);
   } finally {
     await app.close();
-    const diagnosticFile = process.env[
-      WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_ENVIRONMENT_KEY
-    ];
-    const diagnosticEnabled = typeof diagnosticFile === "string"
-      && diagnosticFile.length > 0;
-    const tcpServersAfterAppClose = diagnosticEnabled
-      ? await settledTcpServerCount()
-      : 0;
     await new Promise((resolveClose, rejectClose) => {
       upstream.close((error) => {
         if (error && error.code !== "ERR_SERVER_NOT_RUNNING") {
@@ -2472,11 +2386,6 @@ test("participant relay never follows an upstream redirect", async () => {
       upstream.closeAllConnections?.();
     });
     assert.equal(upstream.listening, false);
-    if (diagnosticEnabled && (await settledTcpServerCount()) > 0) {
-      firstRetainedTcpServerOrdinal = tcpServersAfterAppClose <= 1
-        ? WINDOWS_PORTABLE_UPSTREAM_SERVER_SENTINEL
-        : WINDOWS_PORTABLE_COMPANION_SERVER_SENTINEL;
-    }
     await rm(files.root, { recursive: true });
   }
 });
