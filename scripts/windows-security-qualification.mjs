@@ -410,6 +410,67 @@ export function extractTapTestLocations(output) {
   return Object.freeze(locations);
 }
 
+function safeCapturedTapTestIndexes(value) {
+  if (!Array.isArray(value) || value.length > MAXIMUM_FAILURE_METADATA_ITEMS) {
+    return null;
+  }
+  const seen = new Set();
+  const indexes = [];
+  for (const valueIndex of value) {
+    const index = safeTapTestIndex(valueIndex);
+    if (index === null || seen.has(index)) return null;
+    seen.add(index);
+    indexes.push(index);
+  }
+  return indexes;
+}
+
+function safeCapturedTapTestLocations(value) {
+  if (!Array.isArray(value) || value.length > MAXIMUM_FAILURE_METADATA_ITEMS) {
+    return null;
+  }
+  const seen = new Set();
+  const locations = [];
+  for (const valueLocation of value) {
+    if (!Array.isArray(valueLocation) || valueLocation.length !== 2) return null;
+    const line = safeTapTestIndex(valueLocation[0]);
+    const column = safeTapTestIndex(valueLocation[1]);
+    if (line === null || column === null) return null;
+    const key = `${line}:${column}`;
+    if (seen.has(key)) return null;
+    seen.add(key);
+    locations.push([line, column]);
+  }
+  return locations;
+}
+
+function safeQualificationFailureStatus(error) {
+  return error?.code && Object.values(FIXED_STATUS).includes(error.code)
+    ? error.code
+    : FIXED_STATUS.failed;
+}
+
+/**
+ * Format a qualification failure without forwarding captured TAP content.
+ *
+ * The child process output is untrusted. Only the fixed status and validated,
+ * bounded numeric TAP metadata are allowed to reach the CLI. Test names,
+ * paths, messages, stacks, and arbitrary properties must remain private.
+ */
+export function formatWindowsSecurityQualificationFailure(error) {
+  const status = safeQualificationFailureStatus(error);
+  const testIndex = safeTapTestIndex(error?.testIndex) ?? "unavailable";
+  const testIndexes = safeCapturedTapTestIndexes(error?.testIndexes);
+  const testLocations = safeCapturedTapTestLocations(error?.testLocations);
+  return `${status} test_index=${testIndex}`
+    + ` test_indexes=${testIndexes !== null && testIndexes.length > 0
+      ? testIndexes.join(",")
+      : "unavailable"}`
+    + ` test_locations=${testLocations !== null && testLocations.length > 0
+      ? testLocations.map(([line, column]) => `${line}:${column}`).join(";")
+      : "unavailable"}`;
+}
+
 /**
  * Extract only the fixed SQLite publication phase from a TAP diagnostic
  * property line. TAP output is untrusted test output: require the comment
@@ -658,10 +719,7 @@ export async function main() {
       `duration_ms=${receipt.durationMs}`,
     ].join(" "));
   } catch (error) {
-    const status = error?.code && Object.values(FIXED_STATUS).includes(error.code)
-      ? error.code
-      : FIXED_STATUS.failed;
-    console.error(status);
+    console.error(formatWindowsSecurityQualificationFailure(error));
     process.exitCode = 1;
   }
 }
