@@ -777,6 +777,30 @@ std::wstring ExpectedPath(const ParsedPath& parsed) {
   return result;
 }
 
+bool IsLocalDrivePath(const std::wstring& path) {
+  return path.size() >= 3
+      && IsDriveLetter(path[0])
+      && path[1] == L':'
+      && path[2] == L'\\';
+}
+
+bool IsExtendedLocalDrivePath(const std::wstring& path) {
+  return path.size() >= 7
+      && path.rfind(L"\\\\?\\", 0) == 0
+      && IsDriveLetter(path[4])
+      && path[5] == L':'
+      && path[6] == L'\\';
+}
+
+std::wstring ExtendedLocalDrivePath(const std::wstring& path) {
+  if (IsExtendedLocalDrivePath(path)) return path;
+  if (IsLocalDrivePath(path)) return L"\\\\?\\" + path;
+  // Canonicalization must never turn a network or device path into an
+  // accepted state path. ParsePath currently rejects those forms too, but
+  // keep this helper closed over local drive paths as an independent guard.
+  return {};
+}
+
 std::wstring ComparablePath(std::wstring value) {
   std::replace(value.begin(), value.end(), L'/', L'\\');
   if (value.rfind(L"\\\\?\\", 0) == 0) value.erase(0, 4);
@@ -789,17 +813,22 @@ std::wstring ComparablePath(std::wstring value) {
 
 std::wstring CanonicalExpectedPath(const ParsedPath& parsed) {
   const std::wstring expected = ExpectedPath(parsed);
+  const std::wstring lookup = ExtendedLocalDrivePath(expected);
+  if (lookup.empty()) return {};
   DWORD size = MAX_PATH;
   for (int attempt = 0; attempt < 8; ++attempt) {
     std::vector<wchar_t> buffer(size, L'\0');
     const DWORD length = GetLongPathNameW(
-        expected.c_str(),
+        lookup.c_str(),
         buffer.data(),
         static_cast<DWORD>(buffer.size()));
     if (length == 0) return {};
     // GetLongPathNameW returns the required length when the supplied buffer
-    // is too small.  A spare element is retained for the NUL terminator.
-    if (length + 1 < buffer.size()) return std::wstring(buffer.data(), length);
+    // is too small. On success the returned length excludes the NUL and is
+    // therefore strictly below the supplied capacity. The extended local
+    // drive spelling keeps this valid for paths longer than MAX_PATH.
+    if (length < buffer.size()) return std::wstring(buffer.data(), length);
+    if (length == std::numeric_limits<DWORD>::max()) return {};
     size = length + 1;
   }
   return {};
@@ -2514,8 +2543,17 @@ bool RenameHandleRelative(
     return false;
   }
   const std::size_t bytes = target.size() * sizeof(wchar_t);
-  const std::size_t headerBytes = offsetof(NativeFileRenameInformationEx, fileName);
-  std::vector<BYTE> buffer(headerBytes + bytes, 0);
+  // FILE_RENAME_INFORMATION has a one-element trailing FileName field. The
+  // documented allocation is sizeof(the fixed struct) plus FileNameLength;
+  // using only offsetof(FileName) + FileNameLength can under-allocate the
+  // required fixed-size/padding area for short names.
+  if (bytes > std::numeric_limits<std::size_t>::max()
+      - sizeof(NativeFileRenameInformationEx)) {
+    *failure = InvalidPath();
+    return false;
+  }
+  const std::size_t bufferBytes = sizeof(NativeFileRenameInformationEx) + bytes;
+  std::vector<BYTE> buffer(bufferBytes, 0);
   auto* information = reinterpret_cast<NativeFileRenameInformationEx*>(buffer.data());
   information->flags = kFileRenamePosixSemantics
       | (replaceIfExists ? kFileRenameReplaceIfExists : 0);
@@ -2666,10 +2704,10 @@ napi_value ReplaceFileCallback(napi_env env, napi_callback_info info) {
   targetOptions.finalDirectoryKnown = true;
   targetOptions.finalDirectory = false;
   targetOptions.access = DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
-  // Keep the identity-bound destination handle open with write/delete sharing
-  // disabled.  A later same-user open capable of changing or removing the
-  // destination then fails the Windows sharing check before the rename call.
-  targetOptions.shareMode = FILE_SHARE_READ;
+  // POSIX replacement requires the existing destination handle to permit
+  // delete sharing. Ancestors remain protected without FILE_SHARE_DELETE
+  // below, so the handle-relative walk still pins the state-root boundary.
+  targetOptions.shareMode = FILE_SHARE_READ | FILE_SHARE_DELETE;
   // Keep every renameable ancestor from the state root through the
   // destination parent open without FILE_SHARE_DELETE for the complete
   // replacement transaction.  The drive root is opened separately as the OS
@@ -2734,12 +2772,11 @@ napi_value ReplaceFileCallback(napi_env env, napi_callback_info info) {
   }
   if (success) {
     // Revalidate the identity-bound destination immediately before the rename.
-    // The open handle and its no-delete-sharing mode provide the same-user
-    // race boundary; this second handle check also rejects a security or
-    // namespace change made through a pre-existing privileged handle before
-    // the atomic name replacement is requested. Windows' rename API has no
-    // expected-file-ID argument, so the native claim remains qualification-
-    // only until the supported Windows/filesystem matrix proves this boundary.
+    // This handle check rejects a security or namespace change made through
+    // a pre-existing privileged handle before the atomic name replacement is
+    // requested. Windows' rename API has no expected-file-ID argument, so the
+    // native claim remains qualification-only until the supported
+    // Windows/filesystem matrix proves this boundary.
     HandleIdentity latest;
     success = ValidateSecurity(opened.final, false, &failure, &latest)
         && EqualIdentity(latest, expected)
@@ -2750,12 +2787,35 @@ napi_value ReplaceFileCallback(napi_env env, napi_callback_info info) {
 #if defined(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK)
     PauseBeforeReplacementRename();
 #endif
+    // The qualification pause deliberately gives competing filesystem work a
+    // chance to run. Repeat both handle-bound security checks after it and
+    // immediately before the rename; the destination now allows delete
+    // sharing as required by POSIX replacement.
+    if (success) {
+      ParsedPath replacementPath = parsed;
+      replacementPath.components.back() = temporaryName;
+      HandleIdentity latestReplacement;
+      success = ValidateSecurity(replacement, false, &failure, &latestReplacement)
+          && EqualIdentity(latestReplacement, replacementIdentity)
+          && ResolveFinalPath(replacement, &replacementPath);
+      if (!success && failure.code == OperationFailed().code) failure = IdentityMismatch();
+    }
+    if (success) {
+      HandleIdentity latest;
+      success = ValidateSecurity(opened.final, false, &failure, &latest)
+          && EqualIdentity(latest, expected)
+          && ResolveFinalPath(opened.final, &parsed);
+      if (!success && failure.code == OperationFailed().code) failure = IdentityMismatch();
+    }
+  }
+  if (success) {
     // Legacy FileRenameInformation rejects replacement while the destination
-    // handle is open.  FileRenameInformationEx with FILE_RENAME_POSIX_SEMANTICS
-    // permits the replacement while that handle is open.  The old close path
+    // handle is open. FileRenameInformationEx with
+    // FILE_RENAME_POSIX_SEMANTICS permits the replacement while that handle
+    // is open when the destination allows delete sharing. The old close path
     // (`opened.closeFinal()`) would recreate the identity-check/rename race;
-    // this handle-bound operation prevents a same-user rename/delete between
-    // the identity check and the final kernel operation.
+    // this handle-bound operation preserves the identity check while the
+    // protected ancestors remain held without delete sharing.
     success = RenameHandleRelative(replacement, parent, parsed.components.back(), &failure);
     renamed = success;
   }
@@ -3829,13 +3889,10 @@ napi_value ReplaceProtectedChildCallback(napi_env env, napi_callback_info info) 
   targetOptions.finalDirectoryKnown = true;
   targetOptions.finalDirectory = false;
   targetOptions.access = DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
-  // Do not grant FILE_SHARE_DELETE here.  FILE_RENAME_INFORMATION_EX with
-  // FILE_RENAME_POSIX_SEMANTICS is specifically defined to replace a target
-  // even while existing handles are open; omitting delete sharing keeps an
-  // ordinary same-user delete/rename from slipping between the identity check
-  // and this handle-bound publication.  The held target handle remains valid
-  // as the old object after replacement.
-  targetOptions.shareMode = FILE_SHARE_READ;
+  // POSIX replacement requires the existing destination handle to permit
+  // delete sharing. The protected ancestor handles still use their default
+  // no-delete share mode, preserving the root-boundary protection.
+  targetOptions.shareMode = FILE_SHARE_READ | FILE_SHARE_DELETE;
   targetOptions.disposition = kFileOpen;
   targetOptions.protectAllAncestors = true;
   RelativeHandles opened;
@@ -3930,6 +3987,17 @@ napi_value ReplaceProtectedChildCallback(napi_env env, napi_callback_info info) 
       failure = IdentityMismatch();
       success = false;
     }
+  }
+  if (success) {
+    // Repeat the replacement-handle security and identity checks after the
+    // content readback and immediately before the target check/rename.
+    ParsedPath replacementPath = fullPath;
+    replacementPath.components.back() = temporaryName;
+    HandleIdentity latestReplacement;
+    success = ValidateSecurity(replacement, false, &failure, &latestReplacement)
+        && EqualIdentity(latestReplacement, replacementIdentity)
+        && ResolveFinalPath(replacement, &replacementPath);
+    if (!success && failure.code == OperationFailed().code) failure = IdentityMismatch();
   }
   if (success) {
     HandleIdentity latest;
@@ -4220,13 +4288,10 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
   targetOptions.finalDirectoryKnown = true;
   targetOptions.finalDirectory = false;
   targetOptions.access = DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
-  // Do not grant FILE_SHARE_DELETE here.  FILE_RENAME_INFORMATION_EX with
-  // FILE_RENAME_POSIX_SEMANTICS is specifically defined to replace a target
-  // even while existing handles are open; omitting delete sharing keeps an
-  // ordinary same-user delete/rename from slipping between the identity check
-  // and this handle-bound publication.  The held target handle remains valid
-  // as the old object after replacement.
-  targetOptions.shareMode = FILE_SHARE_READ;
+  // POSIX replacement requires the existing destination handle to permit
+  // delete sharing. The protected root handle remains held without delete
+  // sharing, preserving the root-boundary protection during publication.
+  targetOptions.shareMode = FILE_SHARE_READ | FILE_SHARE_DELETE;
   targetOptions.protectedAncestorDepth = 1;
   targetOptions.disposition = kFileOpen;
   RelativeHandles target;
@@ -4256,6 +4321,26 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
     }
   }
   if (stage.parents.empty()) return ThrowFailure(env, OperationFailed());
+  // Revalidate the staged source after the target walk and immediately before
+  // publication. This repeats the security, identity, canonical-path, and
+  // sidecar checks at the final fallible point before the handle-relative
+  // rename.
+  if (!ValidateSqliteStagingHandle(stage.final, stagePath, &stageIdentity, &failure)
+      || !EqualIdentity(stageIdentity, expectedStage)
+      || !RequireSqliteSidecarsAbsent(stage.parents.front(), stageName, &failure)) {
+    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    return ThrowFailure(env, failure);
+  }
+  if (!targetMissing && target.final != INVALID_HANDLE_VALUE) {
+    HandleIdentity targetIdentity;
+    if (!ValidateSqliteStagingHandle(target.final, targetPath, &targetIdentity, &failure)
+        || !targetExpectedPresent
+        || !EqualIdentity(targetIdentity, expectedTarget)
+        || !RequireSqliteSidecarsAbsent(target.parents.front(), targetName, &failure)) {
+      if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+      return ThrowFailure(env, failure);
+    }
+  }
   if (!RenameHandleRelative(
           stage.final,
           stage.parents.front(),
