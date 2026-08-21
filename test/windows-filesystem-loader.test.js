@@ -598,6 +598,17 @@ test("adapter exposes bounded and root-identity-bound state primitives", () => {
   assert.equal(calls.some(([method]) => method === "readProtectedChild"), true);
 });
 
+test("production adapter does not expose qualification-only SQLite release fault hooks", () => {
+  const adapter = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding: binding({
+      armSqliteStateLeaseReleaseFailure: () => true,
+    }),
+  });
+  assert.equal(Object.hasOwn(adapter, "armSqliteStateLeaseReleaseFailure"), false);
+});
+
 test("adapter rejects malformed native identities before use", () => {
   const malformed = createWindowsFilesystemAdapter({
     platform: "win32",

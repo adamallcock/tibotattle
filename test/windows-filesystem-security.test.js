@@ -35,6 +35,7 @@ const QUALIFICATION_HOOK_METHODS = Object.freeze([
   "armReplacementPause",
   "waitForReplacementPause",
   "releaseReplacementPause",
+  "armSqliteStateLeaseReleaseFailure",
 ]);
 const requireNative = createRequire(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");

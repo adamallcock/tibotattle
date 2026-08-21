@@ -315,6 +315,9 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   assert.match(source, /ArmReplacementPauseCallback/u);
   assert.match(source, /WaitForReplacementPauseCallback/u);
   assert.match(source, /ReleaseReplacementPauseCallback/u);
+  assert.match(source, /ArmSqliteStateLeaseReleaseFailureCallback/u);
+  assert.match(source, /ConsumeSqliteStateLeaseReleaseFailure/u);
+  assert.match(source, /QualificationSqliteStateLeaseReleaseFailureAlreadyArmed/u);
   assert.match(source, /QUALIFICATION_PAUSE_ALREADY_ARMED/u);
   assert.match(source, /CreateMutexExW/u);
   assert.match(source, /WaitForSingleObject\(handle, 0\)/u);
@@ -373,11 +376,25 @@ test("qualification hooks are opt-in and cannot become the production artifact",
     ),
     /AttemptCompanionInstanceMutexReleaseFromWorkerCallback/u,
   );
+  const source = await readFile(
+    resolve(REPOSITORY_ROOT, "native/windows-filesystem/windows-filesystem.cc"),
+    "utf8",
+  );
+  const sqliteFaultExportOffset = source.indexOf(
+    '"armSqliteStateLeaseReleaseFailure"',
+  );
+  const sqliteFaultGuardStart = source.lastIndexOf(
+    "#if defined(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK)",
+    sqliteFaultExportOffset,
+  );
+  const sqliteFaultGuardEnd = source.indexOf("#endif", sqliteFaultExportOffset);
+  assert.ok(
+    sqliteFaultExportOffset >= 0
+      && sqliteFaultGuardStart >= 0
+      && sqliteFaultGuardEnd > sqliteFaultExportOffset,
+  );
   assert.match(
-    await readFile(
-      resolve(REPOSITORY_ROOT, "native/windows-filesystem/windows-filesystem.cc"),
-      "utf8",
-    ),
+    source,
     /#if defined\(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK\)/u,
   );
 });

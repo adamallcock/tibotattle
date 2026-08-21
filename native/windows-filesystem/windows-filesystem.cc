@@ -256,6 +256,9 @@ Failure SqliteStateStagingUnavailable() {
 Failure QualificationPauseAlreadyArmed() {
   return {"QUALIFICATION_PAUSE_ALREADY_ARMED"};
 }
+Failure QualificationSqliteStateLeaseReleaseFailureAlreadyArmed() {
+  return {"QUALIFICATION_SQLITE_STATE_LEASE_RELEASE_FAILURE_ALREADY_ARMED"};
+}
 #endif
 
 bool IsNotFoundError(DWORD error) {
@@ -5157,6 +5160,47 @@ bool CloseSqliteStateLeaseSidecars(SqliteStateLease* lease) {
   return CloseSqliteStateLeaseHandleVector(&lease->sidecarReservations);
 }
 
+#if defined(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK)
+// Qualification-only fail-once seam. It is consumed after native release has
+// marked/closed both sidecars and proved their handle-relative absence, so the
+// first failure exercises the retryable ordinary-handle/mutex phase without
+// changing the production binding or its safety claims.
+struct SqliteStateLeaseReleaseFailureState {
+  std::mutex mutex;
+  bool armed = false;
+};
+
+SqliteStateLeaseReleaseFailureState gSqliteStateLeaseReleaseFailureState;
+
+bool ConsumeSqliteStateLeaseReleaseFailure() {
+  std::lock_guard<std::mutex> lock(gSqliteStateLeaseReleaseFailureState.mutex);
+  if (!gSqliteStateLeaseReleaseFailureState.armed) return false;
+  gSqliteStateLeaseReleaseFailureState.armed = false;
+  return true;
+}
+
+napi_value ArmSqliteStateLeaseReleaseFailureCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 0)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  {
+    std::lock_guard<std::mutex> lock(gSqliteStateLeaseReleaseFailureState.mutex);
+    if (gSqliteStateLeaseReleaseFailureState.armed) {
+      return ThrowFailure(
+          env,
+          QualificationSqliteStateLeaseReleaseFailureAlreadyArmed());
+    }
+    gSqliteStateLeaseReleaseFailureState.armed = true;
+  }
+  napi_value result;
+  napi_get_boolean(env, true, &result);
+  return result;
+}
+#endif
+
 bool WaitForSqliteStateLeaseSidecarsAbsent(
     SqliteStateLease* lease) {
   if (lease->protectedRootHandleIndex >= lease->handles.size()) return false;
@@ -5558,6 +5602,12 @@ napi_value ReleaseSqliteStateLeaseCallback(
     }
     lease->sidecarsAbsent = true;
   }
+
+#if defined(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK)
+  if (ConsumeSqliteStateLeaseReleaseFailure()) {
+    return ThrowFailure(env, SqliteStateLeaseReleaseFailed());
+  }
+#endif
 
   // Only after sidecar absence is proven may the ordinary root/database/
   // journal handles be closed.  Partial close failure is also retryable;
@@ -6216,6 +6266,11 @@ NAPI_MODULE_INIT() {
       exports,
       "releaseReplacementPause",
       ReleaseReplacementPauseCallback);
+  DefineMethod(
+      env,
+      exports,
+      "armSqliteStateLeaseReleaseFailure",
+      ArmSqliteStateLeaseReleaseFailureCallback);
   DefineMethod(
       env,
       exports,
