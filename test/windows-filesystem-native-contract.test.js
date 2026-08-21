@@ -223,10 +223,11 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   assert.match(source, /SqliteStateLeaseContended/u);
   assert.match(source, /SqliteStateLeaseSidecarPresent/u);
   assert.match(source, /ReserveSqliteSidecar/u);
+  assert.match(source, /kFileDeleteOnClose/u);
   assert.match(source, /options\.shareMode = 0/u);
   assert.match(source, /options\.disposition = kFileCreate/u);
-  assert.match(source, /MarkHandleForDeletion\(handle\)/u);
-  assert.doesNotMatch(source, /options\.extraOptions = kFileDeleteOnClose/u);
+  assert.match(source, /options\.extraOptions = kFileDeleteOnClose/u);
+  assert.match(source, /kFileNonDirectoryFile \| options\.extraOptions/u);
   assert.doesNotMatch(source, /\bkFileNonDirectory\b/u);
   assert.match(source, /sidecarReservations/u);
   assert.match(source, /AppendHandles\(&handles, std::move\(sidecarReservations\)\)/u);
