@@ -13,6 +13,7 @@ import {
   WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST,
   WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST,
   WINDOWS_SQLITE_ERROR_CATEGORY_ALLOWLIST,
+  WINDOWS_SQLITE_PRIMARY_ERROR_CATEGORY_BY_CODE,
   WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST,
   WINDOWS_SECURITY_QUALIFICATION_TEST_FILES,
   WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST,
@@ -870,43 +871,114 @@ test("qualification native errors are fixed, allowlisted, and content-free", () 
   );
 });
 
-test("SQLite qualification error categories use only numeric errcode and fixed TAP values", () => {
+test("SQLite qualification error categories use every documented primary code and fixed TAP values", () => {
+  const standardPrimaryCategories = new Map([
+    [0, "SQLITE_OK"],
+    [1, "SQLITE_ERROR"],
+    [2, "SQLITE_INTERNAL"],
+    [3, "SQLITE_PERM"],
+    [4, "SQLITE_ABORT"],
+    [5, "BUSY_LOCKED"],
+    [6, "BUSY_LOCKED"],
+    [7, "SQLITE_NOMEM"],
+    [8, "READONLY"],
+    [9, "SQLITE_INTERRUPT"],
+    [10, "CANTOPEN_IOERR"],
+    [11, "CORRUPT_NOTADB"],
+    [12, "SQLITE_NOTFOUND"],
+    [13, "SQLITE_FULL"],
+    [14, "CANTOPEN_IOERR"],
+    [15, "SQLITE_PROTOCOL"],
+    [16, "SQLITE_EMPTY"],
+    [17, "SQLITE_SCHEMA"],
+    [18, "SQLITE_TOOBIG"],
+    [19, "SQLITE_CONSTRAINT"],
+    [20, "SQLITE_MISMATCH"],
+    [21, "SQLITE_MISUSE"],
+    [22, "SQLITE_NOLFS"],
+    [23, "SQLITE_AUTH"],
+    [24, "SQLITE_FORMAT"],
+    [25, "SQLITE_RANGE"],
+    [26, "CORRUPT_NOTADB"],
+    [27, "SQLITE_NOTICE"],
+    [28, "SQLITE_WARNING"],
+    [100, "SQLITE_ROW"],
+    [101, "SQLITE_DONE"],
+  ]);
+  assert.deepEqual(
+    WINDOWS_SQLITE_PRIMARY_ERROR_CATEGORY_BY_CODE,
+    Object.fromEntries(standardPrimaryCategories),
+  );
+  assert.equal(Object.isFrozen(WINDOWS_SQLITE_PRIMARY_ERROR_CATEGORY_BY_CODE), true);
   assert.deepEqual(WINDOWS_SQLITE_ERROR_CATEGORY_ALLOWLIST, [
+    "SQLITE_OK",
+    "SQLITE_ERROR",
+    "SQLITE_INTERNAL",
+    "SQLITE_PERM",
+    "SQLITE_ABORT",
     "BUSY_LOCKED",
-    "CANTOPEN_IOERR",
+    "SQLITE_NOMEM",
     "READONLY",
+    "SQLITE_INTERRUPT",
+    "CANTOPEN_IOERR",
     "CORRUPT_NOTADB",
+    "SQLITE_NOTFOUND",
+    "SQLITE_FULL",
+    "SQLITE_PROTOCOL",
+    "SQLITE_EMPTY",
+    "SQLITE_SCHEMA",
+    "SQLITE_TOOBIG",
+    "SQLITE_CONSTRAINT",
+    "SQLITE_MISMATCH",
+    "SQLITE_MISUSE",
+    "SQLITE_NOLFS",
+    "SQLITE_AUTH",
+    "SQLITE_FORMAT",
+    "SQLITE_RANGE",
+    "SQLITE_NOTICE",
+    "SQLITE_WARNING",
+    "SQLITE_ROW",
+    "SQLITE_DONE",
     "OTHER",
     "UNAVAILABLE",
   ]);
   assert.equal(Object.isFrozen(WINDOWS_SQLITE_ERROR_CATEGORY_ALLOWLIST), true);
   assert.equal(
-    classifyWindowsSqliteErrorCode(5 + (3 * 256)),
-    "BUSY_LOCKED",
+    new Set(WINDOWS_SQLITE_ERROR_CATEGORY_ALLOWLIST).size,
+    WINDOWS_SQLITE_ERROR_CATEGORY_ALLOWLIST.length,
   );
-  assert.equal(
-    classifyWindowsSqliteErrorCode(6 + (1 * 256)),
-    "BUSY_LOCKED",
-  );
-  assert.equal(
-    classifyWindowsSqliteErrorCode(10 + (18 * 256)),
-    "CANTOPEN_IOERR",
-  );
-  assert.equal(
-    classifyWindowsSqliteErrorCode(14 + (2 * 256)),
-    "CANTOPEN_IOERR",
-  );
-  assert.equal(classifyWindowsSqliteErrorCode(8), "READONLY");
-  assert.equal(
-    classifyWindowsSqliteErrorCode(11 + (3 * 256)),
-    "CORRUPT_NOTADB",
-  );
-  assert.equal(classifyWindowsSqliteErrorCode(26), "CORRUPT_NOTADB");
-  assert.equal(classifyWindowsSqliteErrorCode(19), "OTHER");
-  assert.equal(classifyWindowsSqliteErrorCode("14"), "UNAVAILABLE");
-  assert.equal(classifyWindowsSqliteErrorCode(-1), "UNAVAILABLE");
-  assert.equal(classifyWindowsSqliteErrorCode(0x80000000), "UNAVAILABLE");
-  assert.equal(classifyWindowsSqliteErrorCode(null), "UNAVAILABLE");
+
+  for (const [primaryCode, expectedCategory] of standardPrimaryCategories) {
+    assert.equal(classifyWindowsSqliteErrorCode(primaryCode), expectedCategory);
+    assert.equal(
+      classifyWindowsSqliteErrorCode(primaryCode + (0x12345 * 256)),
+      expectedCategory,
+      `extended SQLite code must retain only primary code ${primaryCode}`,
+    );
+    assert.notEqual(expectedCategory, "OTHER");
+    assert.ok(WINDOWS_SQLITE_ERROR_CATEGORY_ALLOWLIST.includes(expectedCategory));
+  }
+
+  for (const unknownPrimaryCode of [29, 30, 42, 99, 102, 255]) {
+    assert.equal(classifyWindowsSqliteErrorCode(unknownPrimaryCode), "OTHER");
+    assert.equal(
+      classifyWindowsSqliteErrorCode(unknownPrimaryCode + (0x12345 * 256)),
+      "OTHER",
+    );
+  }
+  for (const unavailableCode of [
+    "14",
+    -1,
+    0x80000000,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    1.5,
+    14n,
+    undefined,
+    null,
+  ]) {
+    assert.equal(classifyWindowsSqliteErrorCode(unavailableCode), "UNAVAILABLE");
+  }
 
   const numericOnlyError = {
     errcode: 14,
@@ -924,6 +996,13 @@ test("SQLite qualification error categories use only numeric errcode and fixed T
     "UNAVAILABLE",
   );
   assert.equal(classifyWindowsSqliteError(null), "UNAVAILABLE");
+  const throwingErrcode = {};
+  Object.defineProperty(throwingErrcode, "errcode", {
+    get() {
+      throw new Error("C:\\private\\secret\\state.sqlite");
+    },
+  });
+  assert.equal(classifyWindowsSqliteError(throwingErrcode), "UNAVAILABLE");
 
   const output = [
     "windowsSqliteErrorCategory: BUSY_LOCKED",
@@ -933,6 +1012,7 @@ test("SQLite qualification error categories use only numeric errcode and fixed T
     "# windowsSqliteErrorCategory: READONLY path=C:\\private\\secret",
     "# windowsSqliteErrorCategory: CORRUPT_NOTADB secret=do-not-return",
     "# windowsSqliteErrorCategory: CORRUPT_NOTADB",
+    "# windowsSqliteErrorCategory: SQLITE_SCHEMA",
     "# windowsSqliteErrorCategory: NOT_ALLOWLISTED",
     "# otherProperty: READONLY",
     "# windowsSqliteErrorCategory: UNAVAILABLE",
@@ -942,6 +1022,7 @@ test("SQLite qualification error categories use only numeric errcode and fixed T
     "BUSY_LOCKED",
     "CANTOPEN_IOERR",
     "CORRUPT_NOTADB",
+    "SQLITE_SCHEMA",
     "UNAVAILABLE",
   ]);
   assert.equal(Object.isFrozen(categories), true);
@@ -953,7 +1034,7 @@ test("SQLite qualification error categories use only numeric errcode and fixed T
   const formatted = formatWindowsSecurityQualificationFailure(failure);
   assert.match(
     formatted,
-    /sqlite_error_categories=BUSY_LOCKED,CANTOPEN_IOERR,CORRUPT_NOTADB,UNAVAILABLE$/u,
+    /sqlite_error_categories=BUSY_LOCKED,CANTOPEN_IOERR,CORRUPT_NOTADB,SQLITE_SCHEMA,UNAVAILABLE$/u,
   );
   assert.doesNotMatch(formatted, /secret|private|state\.sqlite|SELECT|message/iu);
 
