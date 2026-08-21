@@ -185,6 +185,18 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   assert.match(source, /"securityPolicyReason"/u);
   assert.match(source, /"windowsFilesystemStage"/u);
   assert.match(source, /failure->stage = "rename"/u);
+  for (const stage of [
+    "prepared_root_open",
+    "prepared_root_validation",
+    "prepared_child_open",
+    "prepared_child_create",
+    "prepared_dacl_update",
+    "prepared_child_validation",
+    "prepared_ancestor_validation",
+    "prepared_final_validation",
+  ]) {
+    assert.match(source, new RegExp(`"${stage}"`, "u"));
+  }
   assert.match(source, /SecurityPolicy\("dacl_update_failed"\)/u);
   assert.doesNotMatch(executableReplaceBody, /opened\.closeFinal\(\)/u);
   const identityCheckOffset = executableReplaceBody.indexOf("ValidateSecurity(opened.final");
