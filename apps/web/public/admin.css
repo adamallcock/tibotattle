@@ -62,6 +62,14 @@
 .admin-form button { justify-self: start; margin-top: 5px; }
 .admin-result { min-height: 1.4em; margin-bottom: 0; }
 .admin-section > .admin-card + .admin-card { margin-top: 14px; }
+.admin-growth-card { display: flex; flex-direction: column; gap: 4px; }
+.admin-growth-card strong { margin-top: 4px; }
+.admin-sparkline { width: 100%; max-width: 150px; height: 28px; margin-top: 8px; }
+.admin-sparkline-line { stroke: var(--accent, #7a6a52); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+.admin-sparkline-endpoint { fill: var(--accent, #7a6a52); }
+.admin-delta { display: inline-block; padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px; font-size: .66rem; font-weight: 760; letter-spacing: .03em; color: var(--muted); background: var(--white); }
+.admin-delta-up { color: #2c5c37; border-color: #a9c4ae; background: #eef5ef; }
+.admin-growth-cohorts { display: block; margin-top: 6px; color: var(--muted); font-size: .66rem; }
 .admin-table-wrap { overflow-x: auto; }
 .admin-table-wrap table { width: 100%; border-collapse: collapse; font-size: .74rem; }
 .admin-table-wrap th { color: var(--muted); font-size: .65rem; letter-spacing: .04em; text-align: left; text-transform: uppercase; }

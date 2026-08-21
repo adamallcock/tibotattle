@@ -275,6 +275,10 @@ import {
   readPublishedCommunityDailyAggregates,
   rebuildPendingCommunityDailyAggregates,
 } from "./community-daily-aggregates";
+import {
+  captureAdminMetricSnapshot,
+  readAdminMetricsHistory,
+} from "./admin-metrics-history";
 import { canonicalJson } from "./canonical-json";
 import {
   insertTelemetryContributionV02,
@@ -2924,6 +2928,29 @@ async function adminSession(
   return { session, identityKey };
 }
 
+async function handleAdminMetricsHistory(
+  request: Request,
+  env: Env,
+  access?: { readonly identityKey: string },
+): Promise<Response> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  // Same two auth postures as the overview: access-mode was verified and
+  // owner-pinned at the admin-hostname chokepoint; dev-mode keeps the
+  // 503-before-auth ordering and the app-session gate. GETs are never
+  // origin-gated — same-origin GETs carry no Origin header.
+  if (access === undefined) {
+    if (!adminIdentityKeyConfigured(Reflect.get(env, "ADMIN_IDENTITY_LINK_KEY"))) {
+      throw new ApiError(503, "ADMIN_NOT_CONFIGURED");
+    }
+    await adminSession(request, env);
+  }
+  const history = await readAdminMetricsHistory(env.USAGE_MONITOR_DB, Date.now());
+  return jsonResponse(history, 200, {
+    "cache-control": "no-store",
+    vary: "Cookie",
+  });
+}
+
 async function handleAdminOverview(
   request: Request,
   env: Env,
@@ -3467,6 +3494,8 @@ async function routeApi(
       return handleLogout(request, env);
     case "admin_overview":
       return handleAdminOverview(request, env);
+    case "admin_metrics_history":
+      return handleAdminMetricsHistory(request, env);
     case "admin_action":
       return handleAdminAction(request, env);
     case "security_reset":
@@ -3549,12 +3578,19 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         if (route.kind === "exact" && route.id === "admin_overview") {
           return noStore(await handleAdminOverview(request, env, { identityKey }));
         }
+        if (route.kind === "exact" && route.id === "admin_metrics_history") {
+          return noStore(
+            await handleAdminMetricsHistory(request, env, { identityKey }),
+          );
+        }
         if (route.kind === "exact" && route.id === "admin_action") {
           return noStore(await handleAdminAction(request, env, { identityKey }));
         }
       } else if (isAdminSurfacePath(url.pathname)
         || (route.kind === "exact"
-          && (route.id === "admin_overview" || route.id === "admin_action"))) {
+          && (route.id === "admin_overview"
+            || route.id === "admin_metrics_history"
+            || route.id === "admin_action"))) {
         throw new ApiError(404, "NOT_FOUND");
       }
     }
@@ -3899,6 +3935,28 @@ export async function runScheduledMaintenance(
     } catch {
       // The regular maintenance work below remains authoritative. The next
       // overview will surface a snapshot-storage failure as source-unavailable.
+    }
+    // Hourly gauge snapshots for the owner metrics history. Same isolation
+    // contract as the distribution sync: an unavailable snapshot store (or an
+    // unapplied migration 0038) must never block retention, reconciliation,
+    // or publication. The capture self-throttles to hourly and never throws.
+    try {
+      const snapshot = await captureAdminMetricSnapshot(
+        env.USAGE_MONITOR_DB,
+        Date.now(),
+      );
+      if (snapshot.code === "SNAPSHOT_UNAVAILABLE") {
+        console.warn(JSON.stringify({
+          level: "warn",
+          event: "admin_metric_snapshot",
+          outcome: "failure",
+          code: snapshot.code,
+        }));
+      }
+    } catch {
+      // captureAdminMetricSnapshot reports rather than throws; this guard
+      // exists so no future edit can turn a metrics failure into a
+      // maintenance failure.
     }
     const handoffPurge = await purgeExpiredIdentityHandoffs(
       env.USAGE_MONITOR_DB,

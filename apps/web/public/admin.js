@@ -95,6 +95,16 @@ const INFO_HINTS = Object.freeze({
   "Latest daily publication": "When a daily community aggregate was most recently published.",
   "Last maintenance": "When the latest bounded retention, reconciliation, and publication maintenance pass ran.",
   "Failure code": "The latest lifecycle failure identifier. A dash means no failure was recorded.",
+  "New sign-ups": "Community accounts created, from the retained participant records: full day-by-day history.",
+  "Web sign-ins": "Completed sign-ins on the website, counted from issued web sessions. Sign-in attempts that never completed are not retained and are not counted.",
+  "Device pairings": "Pairing handshakes issued to Macs starting community upload setup.",
+  "Device credentials": "Upload credentials issued to Macs that completed pairing.",
+  "Upload consents": "Devices that recorded an explicit telemetry upload consent.",
+  "Chunks uploaded": "Incremental contribution chunks accepted into the corpus.",
+  "Records uploaded": "Usage records inside accepted chunks, summed per day.",
+  "People uploading": "Distinct accounts that uploaded at least one chunk that day.",
+  "DMG downloads": "Cumulative installer downloads across all GitHub releases, sampled by the distribution sync. The delta is movement since the prior day's last sample.",
+  "Published band cohort": "People inside the published community allowance band (the site's “from N people”), with every plan cohort growing toward publishability listed beneath.",
 });
 
 const AUDIT_ACTIONS = Object.freeze({
@@ -628,6 +638,203 @@ function renderMetricCards(selector, metrics) {
     card.append(name, number, caption);
     return card;
   }));
+}
+
+const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
+const GROWTH_SCHEMA_VERSION = "admin-metrics-history-v0.1";
+
+/**
+ * A day-by-day count series with calendar gaps filled: event tables have no
+ * row for a quiet day, but a sparkline that skips quiet days overstates the
+ * slope. `fill` is 0 for per-day counts and "carry" for cumulative counters.
+ * Exported for functional tests.
+ */
+export function calendarSeries(byDay, throughDay, fill) {
+  if (!Array.isArray(byDay) || byDay.length === 0) return [];
+  const counts = new Map(byDay.map((row) => [row.day, row.count]));
+  const values = [];
+  let cursor = byDay[0].day;
+  let previous = 0;
+  // Calendar walk in UTC, bounded to ~2 years of points as a corruption guard.
+  for (let step = 0; step < 800 && cursor <= throughDay; step += 1) {
+    const present = counts.get(cursor);
+    const value = present === undefined
+      ? (fill === "carry" ? previous : 0)
+      : present;
+    values.push(value);
+    previous = value;
+    const next = new Date(`${cursor}T00:00:00.000Z`);
+    next.setUTCDate(next.getUTCDate() + 1);
+    cursor = next.toISOString().slice(0, 10);
+  }
+  return values;
+}
+
+/**
+ * Pure sparkline geometry over a 120×28 viewBox: min-max normalized, flat
+ * series drawn mid-band rather than dividing by zero. Fewer than two points
+ * yields no geometry — a single sample is a number, not a shape. Exported for
+ * functional tests.
+ */
+export function sparklineGeometry(values) {
+  if (!Array.isArray(values) || values.length < 2) return null;
+  const pad = 2;
+  const max = Math.max(...values);
+  const min = Math.min(...values);
+  const span = max - min || 1;
+  const step = (120 - pad * 2) / (values.length - 1);
+  const points = values.map((value, index) => {
+    const x = pad + index * step;
+    const y = 28 - pad - ((value - min) / span) * (28 - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  const [endX, endY] = points[points.length - 1].split(",");
+  return { points: points.join(" "), endX, endY };
+}
+
+function sparkline(values, description) {
+  const svg = document.createElementNS(SVG_NAMESPACE, "svg");
+  svg.setAttribute("class", "admin-sparkline");
+  svg.setAttribute("viewBox", "0 0 120 28");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", description);
+  const geometry = sparklineGeometry(values);
+  if (geometry === null) return svg;
+  const line = document.createElementNS(SVG_NAMESPACE, "polyline");
+  line.setAttribute("class", "admin-sparkline-line");
+  line.setAttribute("points", geometry.points);
+  line.setAttribute("fill", "none");
+  const last = document.createElementNS(SVG_NAMESPACE, "circle");
+  last.setAttribute("class", "admin-sparkline-endpoint");
+  last.setAttribute("cx", geometry.endX);
+  last.setAttribute("cy", geometry.endY);
+  last.setAttribute("r", "2");
+  svg.append(line, last);
+  return svg;
+}
+
+function deltaChip(delta, caption) {
+  const chip = document.createElement("span");
+  chip.className = `admin-delta ${delta > 0 ? "admin-delta-up" : "admin-delta-flat"}`;
+  chip.textContent = `${delta > 0 ? "+" : ""}${count(delta)} last 24h`;
+  if (caption) chip.title = caption;
+  return chip;
+}
+
+function growthCard({ label, value, delta, deltaCaption, series, seriesLabel }) {
+  const card = document.createElement("div");
+  card.className = "admin-card admin-metric admin-growth-card";
+  const name = labelWithInfo(label);
+  const number = document.createElement("strong");
+  number.textContent = text(value);
+  const caption = document.createElement("small");
+  caption.replaceChildren(deltaChip(delta, deltaCaption));
+  card.append(name, number, caption, sparkline(series, seriesLabel));
+  return card;
+}
+
+function eventGrowthCard(label, series, throughDay) {
+  return growthCard({
+    label,
+    value: count(series.total),
+    delta: series.last24Hours,
+    deltaCaption: `${count(series.previous24Hours)} in the prior 24h`,
+    series: calendarSeries(series.byDay, throughDay, 0),
+    seriesLabel: `${label}, per day since ${series.byDay[0]?.day ?? "the first record"}`,
+  });
+}
+
+function renderGrowth(history) {
+  const container = $("#growth-cards");
+  const badge = $("#growth-status");
+  if (!container || !badge) return;
+  if (history === null) {
+    badge.className = "admin-source-badge admin-source-partial";
+    badge.textContent = "History unavailable";
+    return;
+  }
+  const throughDay = history.generatedAt.slice(0, 10);
+  const events = history.events;
+  const cards = [
+    eventGrowthCard("New sign-ups", events.participants, throughDay),
+    eventGrowthCard("Web sign-ins", events.webSessions, throughDay),
+    eventGrowthCard("Device pairings", events.devicePairings, throughDay),
+    eventGrowthCard("Device credentials", events.deviceCredentials, throughDay),
+    eventGrowthCard("Upload consents", events.deviceConsents, throughDay),
+    eventGrowthCard("Chunks uploaded", events.uploadedChunks, throughDay),
+    eventGrowthCard("Records uploaded", events.uploadedRecords, throughDay),
+    eventGrowthCard("People uploading", events.uploadingParticipants, throughDay),
+  ];
+  if (history.downloads.available && history.downloads.byDay.length > 0) {
+    const byDay = history.downloads.byDay.map((row) => ({
+      day: row.day,
+      count: row.cumulativeDmgDownloads,
+    }));
+    const series = calendarSeries(byDay, throughDay, "carry");
+    const latest = series[series.length - 1] ?? 0;
+    const prior = series.length > 1 ? series[series.length - 2] : latest;
+    cards.push(growthCard({
+      label: "DMG downloads",
+      value: count(latest),
+      delta: latest - prior,
+      deltaCaption: "movement since the prior day's last sample",
+      series,
+      seriesLabel: `Cumulative DMG downloads since ${byDay[0].day}`,
+    }));
+  }
+  const bandCard = growthBandCard(history.gauges.snapshots);
+  if (bandCard) cards.push(bandCard);
+  container.replaceChildren(...cards);
+  badge.className = "admin-source-badge admin-source-available";
+  badge.textContent = "History available";
+}
+
+function growthBandCard(snapshots) {
+  if (!Array.isArray(snapshots) || snapshots.length === 0) return null;
+  const latest = snapshots[snapshots.length - 1];
+  const published = latest.metrics.bandParticipantCount;
+  if (typeof published !== "number") return null;
+  const dayAgoEpoch = Date.parse(latest.capturedAt) - 24 * 60 * 60 * 1_000;
+  const reference = [...snapshots].reverse().find(
+    (snapshot) => Date.parse(snapshot.capturedAt) <= dayAgoEpoch,
+  );
+  const referenceCount = reference?.metrics.bandParticipantCount;
+  const cohorts = Object.entries(latest.metrics)
+    .filter(([key]) => key.startsWith("cohortParticipants_"))
+    .map(([key, value]) => `${key.slice("cohortParticipants_".length)} ${value}`)
+    .sort();
+  const card = growthCard({
+    label: "Published band cohort",
+    value: count(published),
+    delta: typeof referenceCount === "number" ? published - referenceCount : 0,
+    deltaCaption: typeof referenceCount === "number"
+      ? `${count(referenceCount)} a day earlier`
+      : "history starts after the first hourly snapshot",
+    series: snapshots
+      .map((snapshot) => snapshot.metrics.bandParticipantCount)
+      .filter((value) => typeof value === "number"),
+    seriesLabel: "Published band participant count by snapshot",
+  });
+  if (cohorts.length > 0) {
+    const detail = document.createElement("small");
+    detail.className = "admin-growth-cohorts";
+    detail.textContent = `plan cohorts: ${cohorts.join(" · ")}`;
+    card.append(detail);
+  }
+  return card;
+}
+
+async function loadGrowthHistory() {
+  if (!isAdminPage) return;
+  try {
+    const history = await request("/api/v1/admin/metrics/history");
+    if (history?.schemaVersion !== GROWTH_SCHEMA_VERSION) {
+      throw new Error("unexpected metrics-history schema");
+    }
+    renderGrowth(history);
+  } catch {
+    renderGrowth(null);
+  }
 }
 
 function renderCounts(overview) {
@@ -1462,6 +1669,7 @@ async function load() {
     state.retryDelayMilliseconds = 30_000;
     succeeded = true;
     void loadAdminCommunityAllowance();
+    void loadGrowthHistory();
   } catch (error) {
     showNotice(`Operations view unavailable: ${error.message}.`);
     state.retryDelayMilliseconds = Math.min(
