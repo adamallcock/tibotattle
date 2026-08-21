@@ -20,6 +20,7 @@ const SCRIPT_FILE = fileURLToPath(import.meta.url);
 export const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
 const MAXIMUM_TEST_FILES = 256;
 export const WINDOWS_PORTABLE_MAXIMUM_FAILURE_METADATA_ITEMS = 64;
+export const WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS = 1_024;
 const TERMINATION_TIMEOUT_MS = 10_000;
 const ORDINARY_TEST_FAILURE = Symbol("ordinary-test-failure");
 
@@ -56,6 +57,11 @@ function fixedError(code, metadata = {}) {
   if (typeof metadata.file === "string") error.file = metadata.file;
   if (Number.isSafeInteger(metadata.ordinal)) error.ordinal = metadata.ordinal;
   if (Number.isSafeInteger(metadata.elapsedMs)) error.elapsedMs = metadata.elapsedMs;
+  if (Number.isSafeInteger(metadata.progressUnits)
+      && metadata.progressUnits >= 0
+      && metadata.progressUnits <= WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS) {
+    error.progressUnits = metadata.progressUnits;
+  }
   return error;
 }
 
@@ -154,6 +160,31 @@ function childIsClosed(child) {
     && !childIsRunning(child)
     && (Number.isSafeInteger(child.exitCode)
       || typeof child.signalCode === "string");
+}
+
+function countProgressUnits(chunk, current) {
+  let count = current;
+  if (count >= WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS) {
+    return WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS;
+  }
+  if (typeof chunk === "string") {
+    for (let index = 0; index < chunk.length; index += 1) {
+      const code = chunk.charCodeAt(index);
+      if (code === 0x2e || code === 0x58) count += 1;
+      if (count >= WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS) {
+        return WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS;
+      }
+    }
+    return count;
+  }
+  if (!(chunk instanceof Uint8Array)) return count;
+  for (const byte of chunk) {
+    if (byte === 0x2e || byte === 0x58) count += 1;
+    if (count >= WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS) {
+      return WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS;
+    }
+  }
+  return count;
 }
 
 /**
@@ -283,7 +314,7 @@ function runPortableTestFile(
       ], {
         cwd,
         env: environment,
-        stdio: ["ignore", "ignore", "ignore"],
+        stdio: ["ignore", "pipe", "ignore"],
         windowsHide: true,
       });
       if (!child || typeof child.once !== "function") throw new Error("invalid child");
@@ -296,21 +327,72 @@ function runPortableTestFile(
       return;
     }
 
+    const stdout = child.stdout;
+    const baseMetadata = {
+      file,
+      ordinal,
+      elapsedMs: boundedElapsed(startedAt, timeoutMs),
+    };
+    const failMalformedChild = (status) => {
+      rejectRun(fixedError(status, status === WINDOWS_PORTABLE_STATUS.terminationFailed
+        ? { ...baseMetadata, progressUnits: 0 }
+        : baseMetadata));
+    };
+    if (!stdout
+        || typeof stdout.on !== "function"
+        || typeof stdout.once !== "function"
+        || typeof stdout.removeListener !== "function"
+        || typeof child.removeListener !== "function") {
+      if (!childIsRunning(child)) {
+        failMalformedChild(WINDOWS_PORTABLE_STATUS.failed);
+        return;
+      }
+      let termination;
+      try {
+        termination = Promise.resolve(terminateProcessTree(child, { platform }));
+      } catch {
+        failMalformedChild(WINDOWS_PORTABLE_STATUS.terminationFailed);
+        return;
+      }
+      void termination.then(
+        (terminated) => failMalformedChild(
+          terminated
+            ? WINDOWS_PORTABLE_STATUS.failed
+            : WINDOWS_PORTABLE_STATUS.terminationFailed,
+        ),
+        () => failMalformedChild(WINDOWS_PORTABLE_STATUS.terminationFailed),
+      );
+      return;
+    }
+
     let settled = false;
     let terminationRequested = false;
+    let progressUnits = 0;
     let timeoutHandle;
+    const onStdoutData = (chunk) => {
+      progressUnits = countProgressUnits(chunk, progressUnits);
+    };
     const settle = (callback, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeoutHandle);
+      stdout.removeListener("data", onStdoutData);
+      stdout.removeListener("error", onStdoutError);
+      child.removeListener("error", onChildError);
+      child.removeListener("close", onChildClose);
       callback(value);
     };
     const fail = (status, { ordinaryTestFailure = false } = {}) => {
-      const error = fixedError(status, {
+      const metadata = {
         file,
         ordinal,
         elapsedMs: boundedElapsed(startedAt, timeoutMs),
-      });
+      };
+      if (status === WINDOWS_PORTABLE_STATUS.timedOut
+          || status === WINDOWS_PORTABLE_STATUS.terminationFailed) {
+        metadata.progressUnits = progressUnits;
+      }
+      const error = fixedError(status, metadata);
       settle(
         rejectRun,
         ordinaryTestFailure ? markOrdinaryTestFailure(error) : error,
@@ -319,18 +401,24 @@ function runPortableTestFile(
     const terminateWith = async (status) => {
       if (terminationRequested || settled) return;
       terminationRequested = true;
-      const terminated = await terminateProcessTree(child, { platform }).catch(() => false);
+      let terminated = false;
+      try {
+        terminated = await Promise.resolve(
+          terminateProcessTree(child, { platform }),
+        );
+      } catch {
+        terminated = false;
+      }
       fail(terminated ? status : WINDOWS_PORTABLE_STATUS.terminationFailed);
     };
-    timeoutHandle = setTimeout(() => {
-      void terminateWith(WINDOWS_PORTABLE_STATUS.timedOut);
-    }, timeoutMs);
-
-    child.once("error", () => {
+    const onStdoutError = () => {
+      void terminateWith(WINDOWS_PORTABLE_STATUS.failed);
+    };
+    const onChildError = () => {
       if (terminationRequested) return;
       fail(WINDOWS_PORTABLE_STATUS.failed);
-    });
-    child.once("close", (code) => {
+    };
+    const onChildClose = (code) => {
       if (terminationRequested) return;
       if (code === 0 && child.signalCode === null) {
         settle(resolveRun, undefined);
@@ -343,7 +431,15 @@ function runPortableTestFile(
       // A signal, malformed close result, or other child lifecycle failure is
       // not an ordinary test assertion. Stop the diagnostic immediately.
       fail(WINDOWS_PORTABLE_STATUS.failed);
-    });
+    };
+    timeoutHandle = setTimeout(() => {
+      void terminateWith(WINDOWS_PORTABLE_STATUS.timedOut);
+    }, timeoutMs);
+
+    stdout.on("data", onStdoutData);
+    stdout.once("error", onStdoutError);
+    child.once("error", onChildError);
+    child.once("close", onChildClose);
   });
 }
 
@@ -460,6 +556,18 @@ function safeFailureElapsed(error) {
     : "unavailable";
 }
 
+function safeFailureProgress(error, status) {
+  if (status !== WINDOWS_PORTABLE_STATUS.timedOut
+      && status !== WINDOWS_PORTABLE_STATUS.terminationFailed) {
+    return null;
+  }
+  return Number.isSafeInteger(error?.progressUnits)
+      && error.progressUnits >= 0
+      && error.progressUnits <= WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS
+    ? error.progressUnits
+    : "unavailable";
+}
+
 function safeFailureLocation(error) {
   if (typeof error?.file !== "string"
       || !Number.isSafeInteger(error.ordinal)
@@ -527,9 +635,13 @@ export function formatWindowsPortableDiagnosticFailure(error) {
   }
   const location = safeFailureLocation(error);
   if (location !== null) {
+    const progress = safeFailureProgress(error, status);
+    const progressMetadata = progress === null
+      ? ""
+      : ` progress_units=${progress}`;
     return `WINDOWS_PORTABLE_DIAGNOSTIC_FAILED file=${location.file}`
       + ` ordinal=${location.ordinal} status=${status}`
-      + ` elapsed_ms=${safeFailureElapsed(error)}`;
+      + ` elapsed_ms=${safeFailureElapsed(error)}${progressMetadata}`;
   }
   return status;
 }

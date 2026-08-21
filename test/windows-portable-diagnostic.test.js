@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
   WINDOWS_PORTABLE_STATUS,
   WINDOWS_PORTABLE_MAXIMUM_FAILURE_METADATA_ITEMS,
+  WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS,
   WINDOWS_PORTABLE_SUITE_TIMEOUT_MS,
   WINDOWS_PORTABLE_TEST_TIMEOUT_MS,
   WINDOWS_PORTABLE_QUALIFICATION_ENVIRONMENT_KEYS,
@@ -23,6 +25,7 @@ function fakeChild(pid = 9001) {
   child.signalCode = null;
   child.pid = pid;
   child.kill = () => true;
+  child.stdout = new PassThrough();
   return child;
 }
 
@@ -90,7 +93,7 @@ test("Windows portable diagnostic preserves manifest order and strips qualificat
       "--test-reporter=dot",
       arguments_.at(-1),
     ]);
-    assert.deepEqual(options.stdio, ["ignore", "ignore", "ignore"]);
+    assert.deepEqual(options.stdio, ["ignore", "pipe", "ignore"]);
     assert.equal(options.windowsHide, true);
     assert.equal(options.env.SAFE_TEST_ENVIRONMENT, "1");
     assert.equal(
@@ -287,10 +290,167 @@ test("Windows portable diagnostic reports the file ordinal on a bounded timeout"
       assert.equal(error.ordinal, 1);
       assert.equal(Number.isSafeInteger(error.elapsedMs), true);
       assert.equal(error.elapsedMs <= 10, true);
+      assert.equal(error.progressUnits, 0);
       return true;
     },
   );
   assert.equal(terminated, true);
+});
+
+test("Windows portable diagnostic counts only fixed status bytes across chunks", async () => {
+  const child = fakeChild(9014);
+  const chunks = [".secret", Buffer.from("X\n."), "ignored"];
+  await assert.rejects(
+    runWindowsPortableTestFiles([WINDOWS_PORTABLE_TEST_FILES[0]], {
+      platform: "win32",
+      architecture: "x64",
+      cwd: REPOSITORY_ROOT,
+      timeoutMs: 10,
+      spawnProcess: () => {
+        queueMicrotask(() => {
+          for (const chunk of chunks) child.stdout.write(chunk);
+        });
+        return child;
+      },
+      terminateProcessTree: async () => true,
+    }),
+    (error) => {
+      assert.equal(error.code, WINDOWS_PORTABLE_STATUS.timedOut);
+      assert.equal(error.progressUnits, 3);
+      const formatted = formatWindowsPortableDiagnosticFailure(error);
+      assert.match(formatted, /progress_units=3/u);
+      assert.doesNotMatch(formatted, /secret|ignored/u);
+      return true;
+    },
+  );
+});
+
+test("Windows portable diagnostic caps content-free progress metadata", async () => {
+  const child = fakeChild(9015);
+  await assert.rejects(
+    runWindowsPortableTestFiles([WINDOWS_PORTABLE_TEST_FILES[0]], {
+      platform: "win32",
+      architecture: "x64",
+      cwd: REPOSITORY_ROOT,
+      timeoutMs: 10,
+      spawnProcess: () => {
+        queueMicrotask(() => {
+          child.stdout.write(".".repeat(WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS - 1));
+          child.stdout.write("X.".repeat(4));
+        });
+        return child;
+      },
+      terminateProcessTree: async () => true,
+    }),
+    (error) => {
+      assert.equal(error.code, WINDOWS_PORTABLE_STATUS.timedOut);
+      assert.equal(error.progressUnits, WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS);
+      assert.match(
+        formatWindowsPortableDiagnosticFailure(error),
+        new RegExp(`progress_units=${WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS}\\b`, "u"),
+      );
+      return true;
+    },
+  );
+});
+
+test("Windows portable diagnostic removes child and stdout listeners on settle", async () => {
+  const child = fakeChild(9016);
+  await runWindowsPortableTestFiles(["test/test-lanes.test.js"], {
+    platform: "win32",
+    architecture: "x64",
+    cwd: REPOSITORY_ROOT,
+    spawnProcess: () => {
+      queueMicrotask(() => {
+        child.exitCode = 0;
+        child.emit("close", 0);
+      });
+      return child;
+    },
+  });
+  assert.equal(child.stdout.listenerCount("data"), 0);
+  assert.equal(child.listenerCount("error"), 0);
+  assert.equal(child.listenerCount("close"), 0);
+});
+
+test("Windows portable diagnostic fails closed when child stdout is unavailable", async () => {
+  const child = fakeChild(9017);
+  child.stdout = null;
+  let terminationCalls = 0;
+  await assert.rejects(
+    runWindowsPortableTestFiles(["test/test-lanes.test.js"], {
+      platform: "win32",
+      architecture: "x64",
+      cwd: REPOSITORY_ROOT,
+      spawnProcess: () => child,
+      terminateProcessTree: async () => {
+        terminationCalls += 1;
+        return true;
+      },
+    }),
+    (error) => {
+      assert.equal(error.code, WINDOWS_PORTABLE_STATUS.failed);
+      assert.equal(Object.hasOwn(error, "progressUnits"), false);
+      return true;
+    },
+  );
+  assert.equal(terminationCalls, 1);
+});
+
+test("Windows portable diagnostic reports unproven cleanup for missing stdout", async () => {
+  const child = fakeChild(9018);
+  child.stdout = null;
+  await assert.rejects(
+    runWindowsPortableTestFiles([WINDOWS_PORTABLE_TEST_FILES[0]], {
+      platform: "win32",
+      architecture: "x64",
+      cwd: REPOSITORY_ROOT,
+      spawnProcess: () => child,
+      terminateProcessTree: async () => false,
+    }),
+    (error) => {
+      assert.equal(error.code, WINDOWS_PORTABLE_STATUS.terminationFailed);
+      assert.equal(error.progressUnits, 0);
+      assert.match(
+        formatWindowsPortableDiagnosticFailure(error),
+        /progress_units=0/u,
+      );
+      return true;
+    },
+  );
+});
+
+test("Windows portable diagnostic handles stdout errors without exposing content", async () => {
+  const child = fakeChild(9019);
+  let terminationCalls = 0;
+  await assert.rejects(
+    runWindowsPortableTestFiles([WINDOWS_PORTABLE_TEST_FILES[0]], {
+      platform: "win32",
+      architecture: "x64",
+      cwd: REPOSITORY_ROOT,
+      spawnProcess: () => {
+        queueMicrotask(() => {
+          child.stdout.emit("error", new Error("stdout-private-canary"));
+        });
+        return child;
+      },
+      terminateProcessTree: async () => {
+        terminationCalls += 1;
+        return true;
+      },
+    }),
+    (error) => {
+      assert.equal(error.code, WINDOWS_PORTABLE_STATUS.failed);
+      assert.doesNotMatch(
+        formatWindowsPortableDiagnosticFailure(error),
+        /stdout-private-canary/u,
+      );
+      return true;
+    },
+  );
+  assert.equal(terminationCalls, 1);
+  assert.equal(child.stdout.listenerCount("data"), 0);
+  assert.equal(child.stdout.listenerCount("error"), 0);
 });
 
 test("Windows portable diagnostic stops when timeout termination cannot be proven", async () => {
@@ -375,6 +535,27 @@ test("Windows portable diagnostic formatting is fixed and content-free", () => {
       + "status=WINDOWS_PORTABLE_DIAGNOSTIC_TEST_FAILED",
   );
   assert.doesNotMatch(formatted, /do not emit|stdout|stderr|secret/iu);
+
+  const timeout = new Error("do not emit this message either");
+  timeout.code = WINDOWS_PORTABLE_STATUS.timedOut;
+  timeout.file = WINDOWS_PORTABLE_TEST_FILES[0];
+  timeout.ordinal = 1;
+  timeout.elapsedMs = 60_000;
+  timeout.progressUnits = 7;
+  assert.match(
+    formatWindowsPortableDiagnosticFailure(timeout),
+    /status=WINDOWS_PORTABLE_DIAGNOSTIC_TEST_TIMED_OUT elapsed_ms=60000 progress_units=7/u,
+  );
+
+  const unsafeProgress = new Error("private message");
+  unsafeProgress.code = WINDOWS_PORTABLE_STATUS.terminationFailed;
+  unsafeProgress.file = WINDOWS_PORTABLE_TEST_FILES[0];
+  unsafeProgress.ordinal = 1;
+  unsafeProgress.progressUnits = WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS + 1;
+  assert.match(
+    formatWindowsPortableDiagnosticFailure(unsafeProgress),
+    /progress_units=unavailable/u,
+  );
 
   const unsafe = new Error("private message");
   unsafe.code = WINDOWS_PORTABLE_STATUS.failed;
