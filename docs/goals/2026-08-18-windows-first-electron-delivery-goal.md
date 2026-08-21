@@ -73,27 +73,34 @@ or a Linux-support claim.
   dispose their owned pipes and require the child `close` event; those
   assertions passed, yet warm and clean still timed out with all 57 progress
   units complete. This rules out the reviewed subprocess and pipe handles.
+- Exact Windows run `32461231700` used revision
+  `af50af5f49146a8dbb662780e260ea1f435f07e4`. Warm and clean returned the
+  identical fixed resource vector `0:0:0:0:2:0:1:0:0:1`: two expected runner
+  pipes, one retained TCP server listener, and one uncategorized resource. No
+  child, filesystem, immediate, message-port, signal, TCP-socket, or timeout
+  resource remained.
 - The dependent Windows Electron artifact/runtime, NSIS, and R7 receipt gates
   remain unaccepted. `productionSafe` remains false; no Windows or Linux
   support claim, version bump, release, publication, or signing action is
   authorized by this goal.
-- The concrete blocker is an as-yet-unclassified Windows resource retained by
+- The concrete blocker is one still-listening Windows HTTP server retained by
   `apps/local/server.test.mjs`. A local control completes its 57 tests in about
   five seconds, while both native Windows cache modes complete all 57 progress
-  units but retain an owned resource. Subprocess and pipe closure is now proven;
-  production shutdown code remains unchanged until one fixed-vocabulary active
-  resource category identifies the actual owner.
+  units but retain the same TCP server resource. Subprocess and pipe closure is
+  proven; production shutdown code remains unchanged until the first completed
+  top-level test after which the listener persists is reported as a fixed
+  ordinal.
 
 ### Ordered next steps from this checkpoint
 
-1. At the file's final test hook, map `process.getActiveResourcesInfo()` into
-   ten fixed category digits, cap the observation at 64 resources, and let the
-   parent read only the framed digits from its own bounded temporary file. No
-   resource names, paths, values, stacks, or raw child output may be emitted.
+1. After each top-level test, allow two event-loop turns for completed close
+   callbacks, then retain only the first ordinal that still has a TCP server.
+   Append that two-digit ordinal to the already bounded category frame; emit no
+   test name, address, port, path, value, stack, or raw child output.
 2. Pass the full local preflight and portable lanes, then dispatch one exact
-   warm-and-clean run. Use the matching fixed category counts to close the
-   actual owner; do not raise timeouts, force exit, weaken assertions, or run
-   another speculative subprocess repair.
+   warm-and-clean run. Use the matching fixed ordinal to close the actual test
+   owner and add a regression assertion; do not raise timeouts, force exit, or
+   weaken assertions.
 3. Accept the Windows native/security boundary only when warm and clean jobs
    pass the authoritative portable lane, content-free native qualification,
    cleanup, and clean-checkout gates on one exact revision.

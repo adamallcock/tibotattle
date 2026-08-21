@@ -82,9 +82,13 @@ function fixedError(code, metadata = {}) {
         Number.isSafeInteger(count) && count >= 0)
       && metadata.resourceUnits.counts.reduce((sum, count) => sum + count, 0)
         <= WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS
+      && Number.isSafeInteger(metadata.resourceUnits.firstTcpOrdinal)
+      && metadata.resourceUnits.firstTcpOrdinal >= 0
+      && metadata.resourceUnits.firstTcpOrdinal <= 99
       && typeof metadata.resourceUnits.truncated === "boolean") {
     error.resourceUnits = Object.freeze({
       counts: Object.freeze([...metadata.resourceUnits.counts]),
+      firstTcpOrdinal: metadata.resourceUnits.firstTcpOrdinal,
       truncated: metadata.resourceUnits.truncated,
     });
   }
@@ -218,6 +222,8 @@ function createResourceDiagnosticState() {
     counts: Array.from({ length: 10 }, () => 0),
     markerState: 0,
     present: false,
+    firstTcpOrdinal: 0,
+    tcpOrdinalTens: null,
     total: 0,
     truncated: false,
   };
@@ -230,18 +236,36 @@ function observeResourceDiagnostic(chunk, state) {
       if (byte === 0x52) state.markerState = 1; // R
       return;
     }
-    if (byte === 0x51) { // Q
-      state.present = true;
+    if (state.markerState === 1 && byte === 0x51) { // Q
       state.markerState = 2;
       return;
     }
-    if (byte >= 0x30 && byte <= 0x39) {
+    if (state.markerState === 1 && byte >= 0x30 && byte <= 0x39) {
       if (state.total < WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS) {
         state.counts[byte - 0x30] += 1;
         state.total += 1;
       } else {
         state.truncated = true;
       }
+      return;
+    }
+    if (state.markerState === 2 && byte === 0x4f) { // O
+      state.markerState = 3;
+      return;
+    }
+    if (state.markerState === 3 && byte >= 0x30 && byte <= 0x39) {
+      state.tcpOrdinalTens = byte - 0x30;
+      state.markerState = 4;
+      return;
+    }
+    if (state.markerState === 4 && byte >= 0x30 && byte <= 0x39) {
+      state.firstTcpOrdinal = (state.tcpOrdinalTens * 10) + (byte - 0x30);
+      state.markerState = 5;
+      return;
+    }
+    if (state.markerState === 5 && byte === 0x5a) { // Z
+      state.present = true;
+      state.markerState = 6;
       return;
     }
     state.markerState = byte === 0x52 ? 1 : 0;
@@ -260,6 +284,7 @@ function snapshotResourceDiagnostic(state) {
   if (state.present !== true) return null;
   return Object.freeze({
     counts: Object.freeze([...state.counts]),
+    firstTcpOrdinal: state.firstTcpOrdinal,
     truncated: state.truncated,
   });
 }
@@ -269,7 +294,7 @@ function readResourceDiagnosticFile(file) {
   let descriptor;
   try {
     descriptor = openSync(file, "r");
-    const bytes = Buffer.alloc(WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS + 3);
+    const bytes = Buffer.alloc(WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS + 8);
     const length = readSync(descriptor, bytes, 0, bytes.length, 0);
     const state = createResourceDiagnosticState();
     observeResourceDiagnostic(bytes.subarray(0, length), state);
@@ -719,11 +744,15 @@ function safeFailureResources(error, status) {
         !Number.isSafeInteger(count) || count < 0)
       || resourceUnits.counts.reduce((sum, count) => sum + count, 0)
         > WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS
+      || !Number.isSafeInteger(resourceUnits.firstTcpOrdinal)
+      || resourceUnits.firstTcpOrdinal < 0
+      || resourceUnits.firstTcpOrdinal > 99
       || typeof resourceUnits.truncated !== "boolean") {
     return "unavailable";
   }
   return `${resourceUnits.counts.join(":")}`
-    + `/${resourceUnits.truncated ? 1 : 0}`;
+    + `/${resourceUnits.truncated ? 1 : 0}`
+    + `/${resourceUnits.firstTcpOrdinal}`;
 }
 
 function safeFailureLocation(error) {
