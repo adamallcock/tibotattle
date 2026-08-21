@@ -123,6 +123,7 @@ export const PORTABLE_TEST_GROUPS = Object.freeze({
     "test/tool-inventory.test.js",
     "test/windows-electron-release-config.test.js",
     "test/windows-finalizer-qualification-handoff.test.js",
+    "test/windows-native-presign.test.js",
     "test/windows-local-unified-index-boundary.test.js",
     "test/windows-prepared-artifact-contract.test.js",
     "test/windows-sqlite-state-staging.test.js",
@@ -226,6 +227,10 @@ export const WINDOWS_DEFERRED_TESTS = Object.freeze([
   Object.freeze({
     file: "test/windows-sqlite-state-session-contract.test.js",
     reason: "Windows factory-injection contract simulation is non-native; native SQLite coverage uses the dedicated qualification suite",
+  }),
+  Object.freeze({
+    file: "test/windows-native-presign.test.js",
+    reason: "Windows Azure, PE, Authenticode, and reparse-race proof requires the protected native finalizer qualification",
   }),
   Object.freeze({
     file: "test/claude-callback-lifecycle-owner-boundary.test.js",

@@ -8,7 +8,7 @@ import {
 } from "../scripts/portable-test-manifest.mjs";
 
 test("Windows portable test deferrals are explicit, unique, and bounded", () => {
-  assert.equal(WINDOWS_DEFERRED_TESTS.length, 28);
+  assert.equal(WINDOWS_DEFERRED_TESTS.length, 29);
   const deferred = new Set();
   for (const entry of WINDOWS_DEFERRED_TESTS) {
     assert.deepEqual(Object.keys(entry).sort(), ["file", "reason"]);
@@ -51,6 +51,7 @@ test("Windows portable test deferrals are explicit, unique, and bounded", () => 
     "test/weekly-pace-refresh-integration.test.js",
     "test/windows-credential-operation-audit.test.js",
     "test/windows-filesystem-companion-instance-lease.test.js",
+    "test/windows-native-presign.test.js",
     "test/windows-sqlite-state-session-contract.test.js",
   ]);
 });

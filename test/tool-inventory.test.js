@@ -303,9 +303,9 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  assert.equal(result.records, 87);
-  assert.equal(result.candidates.length, 89);
-  assert.ok(result.aliases >= 25);
+  assert.equal(result.records, 88);
+  assert.equal(result.candidates.length, 90);
+  assert.equal(result.aliases, 63);
 });
 
 test("the inventory names every static ESM caller of a classified tool", async () => {
