@@ -759,10 +759,46 @@ async function validateStagedTree(appPath, target) {
   });
 }
 
-function archivePath(raw) {
-  if (typeof raw !== "string" || raw.length === 0) fail(FIXED_STATUS.archiveInvalid);
-  const withoutRoot = raw.startsWith("/") ? raw.slice(1) : raw;
-  return normalizeRelativePath(withoutRoot, FIXED_STATUS.archiveInvalid);
+/**
+ * Canonicalize one path returned by @electron/asar's listFiles implementation.
+ *
+ * listFiles starts at `/` and uses node:path.join for every child.  That means
+ * its rooted output uses `/` on POSIX and `\\` on Windows.  The verifier keeps
+ * inventory keys platform-neutral, but must not silently accept a path that
+ * the library itself could not have emitted for the selected platform.
+ */
+export function normalizeArchivePath(raw, platform = process.platform) {
+  const nativeSeparator = platform === "win32" ? "\\" : "/";
+  const foreignSeparator = nativeSeparator === "/" ? "\\" : "/";
+  if (typeof raw !== "string"
+      || raw.length <= 1
+      || raw.includes("\0")
+      || raw[0] !== nativeSeparator
+      || raw.includes(foreignSeparator)) {
+    fail(FIXED_STATUS.archiveInvalid);
+  }
+
+  const parts = raw.slice(1).split(nativeSeparator);
+  if (parts.some((part) => part.length === 0
+      || part === "."
+      || part === ".."
+      // A drive-relative or drive-absolute component is never an ASAR entry.
+      || /^[A-Za-z]:/u.test(part))) {
+    fail(FIXED_STATUS.archiveInvalid);
+  }
+
+  // Keep this explicit equality as a guard against accepting an alternate
+  // spelling that path normalization would otherwise collapse.
+  if (`${nativeSeparator}${parts.join(nativeSeparator)}` !== raw) {
+    fail(FIXED_STATUS.archiveInvalid);
+  }
+  return parts.join("/");
+}
+
+function archiveLookupPath(canonicalPath, platform = process.platform) {
+  return platform === "win32"
+    ? canonicalPath.replaceAll("/", "\\")
+    : canonicalPath;
 }
 
 function isArchiveDirectory(stat) {
@@ -785,11 +821,12 @@ async function readArchive(asarPath) {
   const markedUnpacked = new Set();
   const seen = new Set();
   for (const rawPath of listed) {
-    const path = archivePath(rawPath);
+    const path = normalizeArchivePath(rawPath);
+    const lookupPath = archiveLookupPath(path);
     if (seen.has(path)) fail(FIXED_STATUS.archiveInvalid);
     let stat;
     try {
-      stat = asar.statFile(asarPath, path);
+      stat = asar.statFile(asarPath, lookupPath);
     } catch {
       fail(FIXED_STATUS.archiveInvalid);
     }
@@ -810,7 +847,7 @@ async function readArchive(asarPath) {
     }
     let bytes;
     try {
-      bytes = asar.extractFile(asarPath, path);
+      bytes = asar.extractFile(asarPath, lookupPath);
     } catch {
       fail(FIXED_STATUS.archiveInvalid);
     }
