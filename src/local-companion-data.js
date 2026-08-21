@@ -3370,6 +3370,21 @@ function usagePeriodRows(surface) {
   return events;
 }
 
+// A status-object surface carries evidence iff it reports itself available.
+// This exists for `timeline.allowanceCapacity`, found the expensive way
+// (2026-08-21, live capture during a user-visible blank): a non-authoritative
+// build publishes it as {status:"unavailable", reason:
+// "allowance_capacity_cache_unavailable"}, and the dashboard's capacity
+// selector returns null on anything but "available" — which excludes EVERY
+// timeline window as "speed-adjusted allowance weighting unavailable" in one
+// stroke. The buckets, their weighting arrays, and the quota rows were all
+// present in that capture; this single object field blanked the chart. Row
+// counts cannot see that shape, which is exactly how it survived two rounds
+// of retention fixes that protected every array around it.
+function availableStatusRows(surface) {
+  return surface?.status === "available" ? 1 : 0;
+}
+
 // Every surface a deferred projection cannot rebuild, as a path into the
 // published snapshot. Registered centrally so the retention and the guard test
 // read the same list: test/local-companion-data.test.js drives the real builder
@@ -3384,6 +3399,15 @@ const PROJECTION_SURFACES = Object.freeze([
   {
     path: Object.freeze(["overview", "timeline", "calibrationUsage"]),
     rows: arrayRows,
+  },
+  // The one-field kill switch for the whole Trends chart: the dashboard's
+  // capacity selector nulls on any status but "available", which marks every
+  // window "speed-adjusted allowance weighting unavailable" at once. Captured
+  // live blanking the chart while all three bucket arrays above were fully
+  // populated and retained.
+  {
+    path: Object.freeze(["overview", "timeline", "allowanceCapacity"]),
+    rows: availableStatusRows,
   },
 ]);
 

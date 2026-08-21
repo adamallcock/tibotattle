@@ -2429,6 +2429,79 @@ test("a non-authoritative FULL build keeps the evidence it could not rebuild", a
     "legacy full reloads replace unconditionally");
 });
 
+test("a non-authoritative build keeps the allowance capacity the chart selects by", async () => {
+  // Captured live 2026-08-21 during a user-visible blank: buckets, weighting
+  // arrays, and quota rows all present and retained, while
+  // timeline.allowanceCapacity published as {status:"unavailable", reason:
+  // "allowance_capacity_cache_unavailable"}. The dashboard's capacity selector
+  // returns null on anything but "available", which excludes every window as
+  // "speed-adjusted allowance weighting unavailable" in one stroke — 0 of
+  // 1,482 matched. A row count cannot see a status object, which is how this
+  // field survived two rounds of retention fixes around it.
+  const capacityOf = (status) => ({
+    status,
+    ...(status === "available"
+      ? { selectedScenario: "unresolved_as_standard", scenarios: {} }
+      : { reason: "allowance_capacity_cache_unavailable", selectedScenario: null }),
+  });
+  const snapshot = ({ matched, capacity }) => ({
+    schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+    mode: "real_local_evidence",
+    generatedAt: "2026-08-21T15:30:00.000Z",
+    overview: {
+      accounting: { sourceMode: "unified", generationMatched: matched },
+      usage: [{ id: "7d", label: "Last 7 days", events: 12 }],
+      timeline: {
+        usage: [{ at: 1 }],
+        allowanceCapacity: capacityOf(capacity),
+      },
+    },
+    gradient: { datasets: { rolling: [{ at: 1 }] } },
+    weekly: { datasets: { weekly_values: [{ sequence: 1 }] } },
+    quality: {},
+    reports: [],
+  });
+  const storeWith = (sequence) => {
+    let call = 0;
+    return new LocalCompanionDataStore({
+      builder: async () => snapshot(sequence[Math.min(call++, sequence.length - 1)]),
+    });
+  };
+
+  // The captured incident: a non-authoritative full publish degrades capacity
+  // while everything else survives. The chart must keep selecting.
+  const degraded = storeWith([
+    { matched: true, capacity: "available" },
+    { matched: false, capacity: "unavailable" },
+  ]);
+  await degraded.reload({ purpose: "full" });
+  await degraded.reload({ purpose: "full" });
+  assert.equal(
+    degraded.getOverview().timeline.allowanceCapacity.status,
+    "available",
+    "a non-authoritative publish must not strip the capacity the chart keys on",
+  );
+
+  // The same protection on the quick pass, which publishes mid-refresh.
+  const quick = storeWith([
+    { matched: true, capacity: "available" },
+    { matched: false, capacity: "unavailable" },
+  ]);
+  await quick.reload({ purpose: "full" });
+  await quick.reload({ purpose: "quick" });
+  assert.equal(quick.getOverview().timeline.allowanceCapacity.status, "available");
+
+  // An AUTHORITATIVE build that genuinely cannot produce capacity lands: a
+  // matched cache with an insufficient fit is a true state, not a transient.
+  const genuine = storeWith([
+    { matched: true, capacity: "available" },
+    { matched: true, capacity: "unavailable" },
+  ]);
+  await genuine.reload({ purpose: "full" });
+  await genuine.reload({ purpose: "full" });
+  assert.equal(genuine.getOverview().timeline.allowanceCapacity.status, "unavailable");
+});
+
 test("every surface a withheld projection empties is registered for retention", async () => {
   // The completeness gate for this defect class. `unifiedAccountingWithheld`
   // is the single condition under which the builder substitutes evidence-free
@@ -2461,11 +2534,17 @@ test("every surface a withheld projection empties is registered for retention", 
   );
 
   assert.deepEqual(RETAINED_PROJECTION_SURFACE_PATHS, [
+    // allowanceCapacity: registered 2026-08-21 after a live capture showed a
+    // non-authoritative publish stripping it to status "unavailable" and
+    // blanking every Trends window at once, while every array surface here
+    // survived. It is a status OBJECT, so its evidence counter is
+    // availableStatusRows, not a row count.
     "gradient",
     "weekly",
     "overview.usage",
     "overview.timeline.usage",
     "overview.timeline.sparkUsage",
     "overview.timeline.calibrationUsage",
+    "overview.timeline.allowanceCapacity",
   ]);
 });
