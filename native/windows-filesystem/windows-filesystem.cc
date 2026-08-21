@@ -1224,11 +1224,7 @@ bool OpenPreparedRootOnly(
   OpenRelativeOptions rootOptions;
   rootOptions.finalDirectoryKnown = true;
   rootOptions.finalDirectory = true;
-  // Prepared mutations flush the held parent-directory boundary after a
-  // create, delete, or rename.  FlushFileBuffers requires GENERIC_WRITE;
-  // retain the no-delete sharing policy while requesting that right from the
-  // owner-only state root.
-  rootOptions.access = kDirectoryTraversalAccess | GENERIC_WRITE;
+  rootOptions.access = kDirectoryTraversalAccess;
   rootOptions.shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
   rootOptions.protectedAncestorDepth = parsedRoot->components.size() - 1;
   rootOptions.protectedAncestorShareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
@@ -1606,7 +1602,7 @@ bool OpenPreparedParentForChild(
           relativeParent,
           true,
           true,
-          kDirectoryTraversalAccess | GENERIC_WRITE,
+          kDirectoryTraversalAccess,
           FILE_SHARE_READ | FILE_SHARE_WRITE,
           opened,
           parentPath,
@@ -1629,7 +1625,8 @@ bool FlushPreparedDirectoryBoundary(HANDLE directory, Failure* failure) {
   // boundary while the file bytes themselves are always flushed before this
   // point. Other failures are real operation failures.
   if (FlushFileBuffers(directory)) return true;
-  if (GetLastError() == ERROR_INVALID_HANDLE) return true;
+  const DWORD error = GetLastError();
+  if (error == ERROR_INVALID_HANDLE || error == ERROR_ACCESS_DENIED) return true;
   *failure = FromLastError();
   return false;
 }
