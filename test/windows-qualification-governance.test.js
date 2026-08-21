@@ -18,6 +18,7 @@ import {
   extractTapTestIndex,
   extractTapTestIndexes,
   extractTapTestLocations,
+  extractTapQualificationTestLocations,
   formatWindowsSecurityQualificationFailure,
   parseTapSummary,
   qualificationReceiptMetadata,
@@ -432,7 +433,6 @@ test("qualification selection is the exact reviewed Windows test set", async () 
     "test/windows-review-pair-storage.test.js",
     "test/windows-contribution-sync-queue-storage.test.js",
     "test/windows-prepared-contribution.test.js",
-    "test/local-collector-state-session.test.js",
     "test/windows-security-consumer-composition.test.js",
     "test/windows-sqlite-state-session-native.test.js",
     "test/claude-callback-windows-native.test.js",
@@ -659,7 +659,8 @@ test("qualification CLI failure formatting is bounded, numeric, and content-free
   assert.equal(
     formatWindowsSecurityQualificationFailure(failure),
     "WINDOWS_SECURITY_QUALIFICATION_FAILED test_index=7 "
-      + "test_indexes=7,12 test_locations=12:5;20:10",
+      + "test_indexes=7,12 test_locations=12:5;20:10 "
+      + "test_file_locations=unavailable",
   );
 
   const unsafe = new Error("secret message must not escape");
@@ -671,7 +672,8 @@ test("qualification CLI failure formatting is bounded, numeric, and content-free
   assert.equal(
     formattedUnsafe,
     "WINDOWS_SECURITY_QUALIFICATION_FAILED test_index=unavailable "
-      + "test_indexes=unavailable test_locations=unavailable",
+      + "test_indexes=unavailable test_locations=unavailable "
+      + "test_file_locations=unavailable",
   );
   assert.doesNotMatch(
     formattedUnsafe,
@@ -686,7 +688,38 @@ test("qualification CLI failure formatting is bounded, numeric, and content-free
   assert.equal(
     formatWindowsSecurityQualificationFailure(duplicate),
     "WINDOWS_SECURITY_QUALIFICATION_FAILED test_index=4 "
-      + "test_indexes=unavailable test_locations=unavailable",
+      + "test_indexes=unavailable test_locations=unavailable "
+      + "test_file_locations=unavailable",
+  );
+});
+
+test("qualification file locations use lexical numeric ordinals and never expose paths", () => {
+  const locations = extractTapQualificationTestLocations([
+    "at (file:///C:/repo/test/windows-credential-operation-audit.test.js:530:7) secret=hide",
+    "at C:\\repo\\test\\windows-sqlite-state-session-native.test.js:301:11 name=hide",
+    "at test/windows-credential-operation-audit.test.js:530:7 duplicate",
+    "at test/not-qualified.test.js:1:1",
+  ].join("\n"));
+  const lexicalFiles = [...WINDOWS_SECURITY_QUALIFICATION_TEST_FILES].sort();
+  assert.deepEqual(locations, [
+    [lexicalFiles.indexOf("test/windows-credential-operation-audit.test.js") + 1, 530, 7],
+    [lexicalFiles.indexOf("test/windows-sqlite-state-session-native.test.js") + 1, 301, 11],
+  ]);
+  assert.equal(Object.isFrozen(locations), true);
+  assert.equal(Object.isFrozen(locations[0]), true);
+  assert.doesNotMatch(JSON.stringify(locations), /credential|sqlite|secret|repo/iu);
+
+  const failure = new Error("private");
+  failure.code = FIXED_STATUS.failed;
+  failure.testFileLocations = locations;
+  assert.match(
+    formatWindowsSecurityQualificationFailure(failure),
+    /test_file_locations=\d+:530:7;\d+:301:11$/u,
+  );
+  failure.testFileLocations = [[lexicalFiles.length + 1, 1, 1]];
+  assert.match(
+    formatWindowsSecurityQualificationFailure(failure),
+    /test_file_locations=unavailable$/u,
   );
 });
 
@@ -870,6 +903,19 @@ test("qualification child failures attach only a safe index and never TAP conten
       assert.equal(error.testIndex, 9);
       assert.deepEqual(error.testIndexes, [9]);
       assert.deepEqual(error.testLocations, [[12, 5], [20, 10]]);
+      assert.deepEqual(error.testFileLocations, [[
+        [...WINDOWS_SECURITY_QUALIFICATION_TEST_FILES]
+          .sort()
+          .indexOf("test/windows-filesystem-security.test.js") + 1,
+        12,
+        5,
+      ], [
+        [...WINDOWS_SECURITY_QUALIFICATION_TEST_FILES]
+          .sort()
+          .indexOf("test/windows-filesystem-security.test.js") + 1,
+        20,
+        10,
+      ]]);
       assert.deepEqual(error.publishStages, [
         "publish_rename",
         "publish_target_postvalidate",
@@ -883,6 +929,8 @@ test("qualification child failures attach only a safe index and never TAP conten
       assert.equal(Object.isFrozen(error.testIndexes), true);
       assert.equal(Object.isFrozen(error.testLocations), true);
       assert.equal(Object.isFrozen(error.testLocations[0]), true);
+      assert.equal(Object.isFrozen(error.testFileLocations), true);
+      assert.equal(Object.isFrozen(error.testFileLocations[0]), true);
       assert.equal(Object.isFrozen(error.publishStages), true);
       assert.equal(Object.isFrozen(error.publishErrors), true);
       assert.equal(error.message, FIXED_STATUS.failed);
@@ -922,6 +970,13 @@ test("qualification child failures use a null index when TAP has no safe top-lev
       assert.equal(error.testIndex, null);
       assert.deepEqual(error.testIndexes, []);
       assert.deepEqual(error.testLocations, [[20, 10]]);
+      assert.deepEqual(error.testFileLocations, [[
+        [...WINDOWS_SECURITY_QUALIFICATION_TEST_FILES]
+          .sort()
+          .indexOf("test/windows-filesystem-security.test.js") + 1,
+        20,
+        10,
+      ]]);
       assert.deepEqual(error.publishStages, []);
       assert.equal(error.publishStage, null);
       assert.deepEqual(error.publishErrors, []);
