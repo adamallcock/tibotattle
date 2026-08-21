@@ -46,7 +46,7 @@
     },
     {
       "file": "test/electron-development-artifact-verifier.test.js",
-      "win32BranchCount": 1,
+      "win32BranchCount": 2,
       "classification": "native-windows-qualification",
       "followUp": "Run the native ASAR list-path round trip on Windows x64 as part of unsigned Electron artifact qualification."
     },
