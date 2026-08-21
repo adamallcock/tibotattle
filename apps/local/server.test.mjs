@@ -273,6 +273,15 @@ const WINDOWS_PORTABLE_RESOURCE_TYPE_CODES = Object.freeze({
 });
 let completedTopLevelTestOrdinal = 0;
 let firstRetainedTcpServerOrdinal = 0;
+const WINDOWS_PORTABLE_UPSTREAM_SERVER_SENTINEL = 91;
+const WINDOWS_PORTABLE_COMPANION_SERVER_SENTINEL = 92;
+
+async function settledTcpServerCount() {
+  await new Promise((resolveTurn) => setImmediate(resolveTurn));
+  await new Promise((resolveTurn) => setImmediate(resolveTurn));
+  return process.getActiveResourcesInfo()
+    .filter((type) => type === "TCPServerWrap").length;
+}
 
 test.afterEach(async () => {
   const diagnosticFile =
@@ -286,9 +295,7 @@ test.afterEach(async () => {
   }
   // Give completed server.close() callbacks two event-loop turns to destroy
   // their async resource before classifying a retained listener.
-  await new Promise((resolveTurn) => setImmediate(resolveTurn));
-  await new Promise((resolveTurn) => setImmediate(resolveTurn));
-  const retained = process.getActiveResourcesInfo().includes("TCPServerWrap");
+  const retained = (await settledTcpServerCount()) > 0;
   if (retained && firstRetainedTcpServerOrdinal === 0) {
     firstRetainedTcpServerOrdinal = completedTopLevelTestOrdinal;
   } else if (!retained) {
@@ -2440,6 +2447,14 @@ test("participant relay never follows an upstream redirect", async () => {
     assert.deepEqual(upstreamRequests, ["/api/v1/session"]);
   } finally {
     await app.close();
+    const diagnosticFile = process.env[
+      WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_ENVIRONMENT_KEY
+    ];
+    const diagnosticEnabled = typeof diagnosticFile === "string"
+      && diagnosticFile.length > 0;
+    const tcpServersAfterAppClose = diagnosticEnabled
+      ? await settledTcpServerCount()
+      : 0;
     await new Promise((resolveClose, rejectClose) => {
       upstream.close((error) => {
         if (error && error.code !== "ERR_SERVER_NOT_RUNNING") {
@@ -2451,6 +2466,11 @@ test("participant relay never follows an upstream redirect", async () => {
       upstream.closeAllConnections?.();
     });
     assert.equal(upstream.listening, false);
+    if (diagnosticEnabled && (await settledTcpServerCount()) > 0) {
+      firstRetainedTcpServerOrdinal = tcpServersAfterAppClose <= 1
+        ? WINDOWS_PORTABLE_UPSTREAM_SERVER_SENTINEL
+        : WINDOWS_PORTABLE_COMPANION_SERVER_SENTINEL;
+    }
     await rm(files.root, { recursive: true });
   }
 });
