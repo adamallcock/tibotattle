@@ -957,6 +957,29 @@ async function waitFor(predicate, timeoutMs = 1_000) {
   throw new Error("condition was not reached");
 }
 
+async function waitForOwnedChildClose(closePromise, timeoutMs = 2_000) {
+  let timeout;
+  try {
+    return await Promise.race([
+      closePromise,
+      new Promise((_, rejectClose) => {
+        timeout = setTimeout(
+          () => rejectClose(new Error("owned child stdio did not close")),
+          timeoutMs,
+        );
+        timeout.unref?.();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function disposeOwnedChildOutput(child) {
+  child.stdout?.destroy();
+  child.stderr?.destroy();
+}
+
 function deferred() {
   let resolvePromise;
   let rejectPromise;
@@ -4259,6 +4282,7 @@ test("configured CLI exits after its declared parent disappears", async () => {
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
+  const parentClosed = once(parent, "close");
   let output = "";
   let errors = "";
   let childPid = null;
@@ -4285,13 +4309,18 @@ test("configured CLI exits after its declared parent disappears", async () => {
     await assert.rejects(fetch(url, {
       signal: AbortSignal.timeout(1_000),
     }));
+    disposeOwnedChildOutput(parent);
+    await waitForOwnedChildClose(parentClosed);
   } finally {
     if (parent.exitCode === null && parent.signalCode === null) {
       parent.kill("SIGKILL");
       await once(parent, "exit");
     }
+    disposeOwnedChildOutput(parent);
+    await waitForOwnedChildClose(parentClosed);
     if (Number.isSafeInteger(childPid) && processIsRunning(childPid)) {
       process.kill(childPid, "SIGKILL");
+      await waitFor(() => !processIsRunning(childPid), 5_000);
     }
     await rm(files.root, { recursive: true });
   }
@@ -4376,6 +4405,7 @@ test("CLI port zero prints its actual ready URL and honors explicit roots", asyn
     env: childEnvironment,
     stdio: ["ignore", "pipe", "pipe"],
   });
+  const childClosed = once(child, "close");
   let output = "";
   child.stdout.on("data", (chunk) => {
     output += chunk.toString("utf8");
@@ -4405,11 +4435,15 @@ test("CLI port zero prints its actual ready URL and honors explicit roots", asyn
       }),
     ]);
     assert.ok(code === 0 || signal === "SIGINT");
+    disposeOwnedChildOutput(child);
+    await waitForOwnedChildClose(childClosed);
   } finally {
     if (child.exitCode === null && child.signalCode === null) {
       child.kill("SIGKILL");
       await once(child, "exit");
     }
+    disposeOwnedChildOutput(child);
+    await waitForOwnedChildClose(childClosed);
     await rm(files.root, { recursive: true });
   }
 });
