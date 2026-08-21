@@ -59,7 +59,10 @@ module.exports = {
       filter: ["**/*"],
     },
   ],
-  asar: true,
+  // Smart unpacking would expand the entire @github/keytar package because
+  // it contains a native prebuild. The reviewed artifact contract unpacks
+  // only the exact target-specific native files listed below.
+  asar: { smartUnpack: false },
   // Only the reviewed, target-specific native runtime is unpacked. The
   // Electron shell and JavaScript companion remain in app.asar.
   asarUnpack: windowsTarget

@@ -12,14 +12,18 @@ import {
   FIXED_STATUS,
   WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST,
   WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST,
+  WINDOWS_SQLITE_ERROR_CATEGORY_ALLOWLIST,
   WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST,
   WINDOWS_SECURITY_QUALIFICATION_TEST_FILES,
   WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST,
+  classifyWindowsSqliteError,
+  classifyWindowsSqliteErrorCode,
   extractTapPublishErrors,
   extractTapPublishStages,
   extractTapNativeErrors,
   extractTapPreparedErrors,
   extractTapPreparedStages,
+  extractTapSqliteErrorCategories,
   extractTapTestIndex,
   extractTapTestIndexes,
   extractTapTestLocations,
@@ -53,6 +57,10 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
     resolve(REPOSITORY_ROOT, "scripts/windows-security-qualification.mjs"),
     "utf8",
   );
+  const sqliteQualificationTest = await readFile(
+    resolve(REPOSITORY_ROOT, "test/windows-sqlite-state-session-native.test.js"),
+    "utf8",
+  );
   const portableDiagnosticScript = await readFile(
     resolve(REPOSITORY_ROOT, "scripts/run-windows-portable-diagnostic.mjs"),
     "utf8",
@@ -75,6 +83,13 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
     qualificationScript,
     /console\.error\(formatWindowsSecurityQualificationFailure\(error\)\)/u,
   );
+  assert.match(qualificationScript, /WINDOWS_SQLITE_ERROR_CATEGORY_ALLOWLIST/u);
+  assert.match(qualificationScript, /classifyWindowsSqliteErrorCode/u);
+  assert.match(qualificationScript, /extractTapSqliteErrorCategories/u);
+  assert.match(qualificationScript, /sqlite_error_categories=/u);
+  assert.match(sqliteQualificationTest, /classifyWindowsSqliteError/u);
+  assert.match(sqliteQualificationTest, /windowsSqliteErrorCategory/u);
+  assert.match(sqliteQualificationTest, /USAGE_MONITOR_WINDOWS_QUALIFICATION/u);
   assert.match(workflow, /\$nodeGypScript rebuild --directory native\/windows-filesystem/u);
   assert.match(
     workflow,
@@ -313,12 +328,43 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /--app \$env:TIBOTATTLE_ELECTRON_STAGED_APP_PATH/u);
   assert.match(workflow, /--asar \$env:TIBOTATTLE_ELECTRON_ASAR_PATH/u);
   assert.match(workflow, /--unpacked \$env:TIBOTATTLE_ELECTRON_UNPACKED_PATH/u);
+  assert.match(workflow, /parseFixedStatusOutput/u);
+  assert.match(workflow, /TIBOTATTLE_ELECTRON_VERIFICATION_FAILURE_EVIDENCE_PATH/u);
+  assert.match(workflow, /Executable retention: none; only the allowlisted status marker may be retained/u);
   assert.match(workflow, /ELECTRON_DEVELOPMENT_ARTIFACT_VERIFIED/u);
   assert.match(workflow, /id: electron_artifact_verification/u);
   assert.match(workflow, /ELECTRON_ARTIFACT_EVIDENCE_NOT_CONTENT_FREE/u);
   assert.match(workflow, /SHA-256:/u);
   assert.match(workflow, /Runtime qualification: deferred to the native Windows Electron smoke step/u);
   assert.match(workflow, /smoke-electron-windows\.mjs/u);
+  assert.match(workflow, /id: electron_runtime_smoke/u);
+  assert.match(workflow, /tibotattle-windows-electron-runtime-smoke\.raw/u);
+  assert.match(workflow, /Remove-VerifiedRuntimeRawOutput/u);
+  assert.match(workflow, /WINDOWS_ELECTRON_RUNTIME_RAW_OUTPUT_DELETE_FAILED/u);
+  assert.match(workflow, /Test-Path -LiteralPath \$runtimeRawPath -ErrorAction Stop/u);
+  const electronVerifierBodyForDeletion = workflow.slice(verificationStep, runtimeStep);
+  assert.match(electronVerifierBodyForDeletion, /function Fail-ClosedVerifierArtifact/u);
+  assert.match(
+    electronVerifierBodyForDeletion,
+    /Remove-Item -LiteralPath \$verificationLog -Force -ErrorAction Stop/u,
+  );
+  assert.match(
+    electronVerifierBodyForDeletion,
+    /Test-Path -LiteralPath \$verificationLog -ErrorAction Stop/u,
+  );
+  assert.match(electronVerifierBodyForDeletion, /WINDOWS_ELECTRON_VERIFICATION_LOG_DELETE_FAILED/u);
+  assert.match(electronVerifierBodyForDeletion, /Fail-ClosedVerifierArtifact/u);
+  assert.match(electronVerifierBodyForDeletion, /ELECTRON_DEVELOPMENT_ARTIFACT_FAILED/u);
+  assert.match(electronVerifierBodyForDeletion, /WINDOWS_ELECTRON_ARTIFACT_EVIDENCE_INVALID/u);
+  assert.match(electronVerifierBodyForDeletion, /WINDOWS_ELECTRON_ARTIFACT_EVIDENCE_NOT_CONTENT_FREE/u);
+  assert.match(electronVerifierBodyForDeletion, /WINDOWS_ELECTRON_ARTIFACT_INVENTORY_INVALID/u);
+  assert.match(workflow, /runtime aggregate shape/u);
+  assert.match(workflow, /runtime aggregate status/u);
+  assert.match(workflow, /runtime aggregate check/u);
+  assert.match(workflow, /No raw smoke output,?/u);
+  assert.match(workflow, /TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH=\$runtimeEvidencePath/u);
+  assert.match(workflow, /WINDOWS_ELECTRON_VERIFICATION_LOG_DELETE_FAILED/u);
+  assert.match(workflow, /Test-Path -LiteralPath \$verificationLog -ErrorAction Stop/u);
   assert.match(workflow, /WINDOWS_ELECTRON_RUNTIME_SMOKE_EVIDENCE_NOT_CONTENT_FREE/u);
   assert.match(workflow, /build-windows-electron-qualification-receipt\.mjs/u);
   assert.match(workflow, /TIBOTATTLE_ELECTRON_QUALIFICATION_RECEIPT_PATH/u);
@@ -330,9 +376,32 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/u);
   assert.match(workflow, /tibotattle-windows-x64-electron-\$\{\{ github\.sha \}\}-\$\{\{ matrix\.cache-mode \}\}/u);
   assert.match(workflow, /Retain blocked unsigned Windows x64 development artifact/u);
+  const verificationFailureUpload = workflow.slice(
+    workflow.indexOf("- name: Retain safe Windows Electron verifier failure evidence"),
+    workflow.indexOf("- name: Retain blocked unsigned Windows x64 development artifact"),
+  );
+  assert.match(verificationFailureUpload, /steps\.electron_artifact_verification\.outcome == 'failure'/u);
+  assert.match(
+    verificationFailureUpload,
+    /path: \$\{\{ env\.TIBOTATTLE_ELECTRON_VERIFICATION_FAILURE_EVIDENCE_PATH \}\}/u,
+  );
+  assert.doesNotMatch(verificationFailureUpload, /TIBOTATTLE_ELECTRON_ARTIFACT_APP_PATH/u);
+  assert.doesNotMatch(verificationFailureUpload, /tibotattle-electron-verification\.json/u);
+  const runtimeFailureUpload = workflow.slice(
+    workflow.indexOf("- name: Retain safe Windows Electron runtime failure evidence"),
+    workflow.indexOf("- name: Retain blocked unsigned Windows x64 development artifact"),
+  );
+  assert.match(runtimeFailureUpload, /steps\.electron_runtime_smoke\.outcome == 'failure'/u);
+  assert.match(
+    runtimeFailureUpload,
+    /path: \$\{\{ env\.TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH \}\}/u,
+  );
+  assert.doesNotMatch(runtimeFailureUpload, /native_security_qualification/u);
+  assert.doesNotMatch(runtimeFailureUpload, /tibotattle-windows-electron-runtime-smoke\.raw/u);
+  assert.doesNotMatch(runtimeFailureUpload, /TIBOTATTLE_ELECTRON_ARTIFACT_APP_PATH/u);
   assert.match(
     workflow,
-    /always\(\) && !cancelled\(\) && steps\.native_security_qualification\.outcome == 'failure' && steps\.electron_artifact_verification\.outcome == 'success'/u,
+    /always\(\) && !cancelled\(\) && steps\.native_security_qualification\.outcome == 'failure' && steps\.electron_artifact_verification\.outcome == 'success' && steps\.electron_runtime_smoke\.outcome == 'success'/u,
   );
   assert.match(workflow, /blocked-development/u);
   assert.match(workflow, /WINDOWS_SECURITY_QUALIFICATION_FAILED_ARTIFACT_RETAINED/u);
@@ -801,6 +870,98 @@ test("qualification native errors are fixed, allowlisted, and content-free", () 
   );
 });
 
+test("SQLite qualification error categories use only numeric errcode and fixed TAP values", () => {
+  assert.deepEqual(WINDOWS_SQLITE_ERROR_CATEGORY_ALLOWLIST, [
+    "BUSY_LOCKED",
+    "CANTOPEN_IOERR",
+    "READONLY",
+    "CORRUPT_NOTADB",
+    "OTHER",
+    "UNAVAILABLE",
+  ]);
+  assert.equal(Object.isFrozen(WINDOWS_SQLITE_ERROR_CATEGORY_ALLOWLIST), true);
+  assert.equal(
+    classifyWindowsSqliteErrorCode(5 + (3 * 256)),
+    "BUSY_LOCKED",
+  );
+  assert.equal(
+    classifyWindowsSqliteErrorCode(6 + (1 * 256)),
+    "BUSY_LOCKED",
+  );
+  assert.equal(
+    classifyWindowsSqliteErrorCode(10 + (18 * 256)),
+    "CANTOPEN_IOERR",
+  );
+  assert.equal(
+    classifyWindowsSqliteErrorCode(14 + (2 * 256)),
+    "CANTOPEN_IOERR",
+  );
+  assert.equal(classifyWindowsSqliteErrorCode(8), "READONLY");
+  assert.equal(
+    classifyWindowsSqliteErrorCode(11 + (3 * 256)),
+    "CORRUPT_NOTADB",
+  );
+  assert.equal(classifyWindowsSqliteErrorCode(26), "CORRUPT_NOTADB");
+  assert.equal(classifyWindowsSqliteErrorCode(19), "OTHER");
+  assert.equal(classifyWindowsSqliteErrorCode("14"), "UNAVAILABLE");
+  assert.equal(classifyWindowsSqliteErrorCode(-1), "UNAVAILABLE");
+  assert.equal(classifyWindowsSqliteErrorCode(0x80000000), "UNAVAILABLE");
+  assert.equal(classifyWindowsSqliteErrorCode(null), "UNAVAILABLE");
+
+  const numericOnlyError = {
+    errcode: 14,
+    code: "ERR_SQLITE_ERROR",
+    errstr: "unable to open database file",
+    message: "C:\\private\\secret\\state.sqlite SQL=CREATE TABLE hidden",
+  };
+  assert.equal(classifyWindowsSqliteError(numericOnlyError), "CANTOPEN_IOERR");
+  assert.equal(
+    classifyWindowsSqliteError(Object.create({ errcode: 14 })),
+    "UNAVAILABLE",
+  );
+  assert.equal(
+    classifyWindowsSqliteError({ errcode: "14", message: "secret" }),
+    "UNAVAILABLE",
+  );
+  assert.equal(classifyWindowsSqliteError(null), "UNAVAILABLE");
+
+  const output = [
+    "windowsSqliteErrorCategory: BUSY_LOCKED",
+    "# windowsSqliteErrorCategory: BUSY_LOCKED",
+    "# windowsSqliteErrorCategory: CANTOPEN_IOERR",
+    "# windowsSqliteErrorCategory: 'READONLY'",
+    "# windowsSqliteErrorCategory: READONLY path=C:\\private\\secret",
+    "# windowsSqliteErrorCategory: CORRUPT_NOTADB secret=do-not-return",
+    "# windowsSqliteErrorCategory: CORRUPT_NOTADB",
+    "# windowsSqliteErrorCategory: NOT_ALLOWLISTED",
+    "# otherProperty: READONLY",
+    "# windowsSqliteErrorCategory: UNAVAILABLE",
+  ].join("\n");
+  const categories = extractTapSqliteErrorCategories(output);
+  assert.deepEqual(categories, [
+    "BUSY_LOCKED",
+    "CANTOPEN_IOERR",
+    "CORRUPT_NOTADB",
+    "UNAVAILABLE",
+  ]);
+  assert.equal(Object.isFrozen(categories), true);
+  assert.doesNotMatch(categories.join(" "), /secret|private|path|NOT_ALLOWLISTED/iu);
+
+  const failure = new Error("C:\\private\\secret\\state.sqlite SQL=SELECT hidden");
+  failure.code = FIXED_STATUS.failed;
+  failure.sqliteErrorCategories = categories;
+  const formatted = formatWindowsSecurityQualificationFailure(failure);
+  assert.match(
+    formatted,
+    /sqlite_error_categories=BUSY_LOCKED,CANTOPEN_IOERR,CORRUPT_NOTADB,UNAVAILABLE$/u,
+  );
+  assert.doesNotMatch(formatted, /secret|private|state\.sqlite|SELECT|message/iu);
+
+  failure.sqliteErrorCategories = ["BUSY_LOCKED", "secret=do-not-return"];
+  const unsafeFormatted = formatWindowsSecurityQualificationFailure(failure);
+  assert.doesNotMatch(unsafeFormatted, /sqlite_error_categories|secret|private|SELECT/iu);
+});
+
 test("prepared-directory diagnostics use the exact frozen stage allowlist", () => {
   assert.deepEqual(WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST, [
     "prepared_root_open",
@@ -1111,6 +1272,8 @@ test("qualification child failures attach only a safe index and never TAP conten
     "# windowsFilesystemError: WINDOWS_FILESYSTEM_OPERATION_FAILED",
     "# windowsFilesystemError: WINDOWS_FILESYSTEM_ACCESS_DENIED",
     "# windowsFilesystemError: secret=do-not-return",
+    "# windowsSqliteErrorCategory: CANTOPEN_IOERR",
+    "# windowsSqliteErrorCategory: CANTOPEN_IOERR secret=do-not-return",
   ].join("\n"));
   child.emit("close", 1);
   await assert.rejects(
@@ -1143,6 +1306,9 @@ test("qualification child failures attach only a safe index and never TAP conten
         "WINDOWS_FILESYSTEM_OPERATION_FAILED",
       ]);
       assert.equal(error.publishError, "WINDOWS_FILESYSTEM_ACCESS_DENIED");
+      assert.deepEqual(error.sqliteErrorCategories, ["CANTOPEN_IOERR"]);
+      assert.equal(error.sqliteErrorCategory, "CANTOPEN_IOERR");
+      assert.equal(Object.isFrozen(error.sqliteErrorCategories), true);
       assert.equal(Object.isFrozen(error.testIndexes), true);
       assert.equal(Object.isFrozen(error.testLocations), true);
       assert.equal(Object.isFrozen(error.testLocations[0]), true);
