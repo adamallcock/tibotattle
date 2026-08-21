@@ -882,18 +882,16 @@ struct RelativeHandles {
 
   ~RelativeHandles() {
     if (final != INVALID_HANDLE_VALUE) CloseHandle(final);
-    closeParents();
+    for (auto iterator = parents.rbegin(); iterator != parents.rend(); ++iterator) {
+      if (*iterator != INVALID_HANDLE_VALUE) CloseHandle(*iterator);
+    }
   }
 
-  void closeParents() {
+  HANDLE releaseFinal() {
     for (auto iterator = parents.rbegin(); iterator != parents.rend(); ++iterator) {
       if (*iterator != INVALID_HANDLE_VALUE) CloseHandle(*iterator);
     }
     parents.clear();
-  }
-
-  HANDLE releaseFinal() {
-    closeParents();
     const HANDLE result = final;
     final = INVALID_HANDLE_VALUE;
     return result;
@@ -4420,10 +4418,6 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
       return ThrowFailure(env, failure);
     }
   }
-  // The final target checks above are complete. Keep the target handle alive
-  // for the POSIX replacement, but release only its path-walk handles before
-  // the rename so the destination directory can be opened for replacement.
-  target.closeParents();
   if (!RenameHandleRelative(
           stage.final,
           stage.parents.front(),
