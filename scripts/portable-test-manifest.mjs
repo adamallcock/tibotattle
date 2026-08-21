@@ -124,12 +124,80 @@ export const PORTABLE_TEST_FILES = Object.freeze([
 // the corresponding Windows security implementation.
 export const WINDOWS_DEFERRED_TESTS = Object.freeze([
   Object.freeze({
+    file: "test/quota-track-identity.test.js",
+    reason: "Windows unified-index rebuild requires qualified protected staging and SQLite sessions; pure quota contracts remain covered portably",
+  }),
+  Object.freeze({
     file: "test/fast-mode-accounting.test.js",
     reason: "owner-only state fixtures require branded Windows protected storage; dedicated Windows state tests cover that path",
   }),
   Object.freeze({
+    file: "test/codex-interleaved-usage-streams.test.js",
+    reason: "Windows full-index rebuild requires qualified protected staging and SQLite sessions; parser contracts remain covered portably",
+  }),
+  Object.freeze({
+    file: "test/telemetry-contribution-builder.test.js",
+    reason: "Windows storage-backed builder fixtures require the qualified review-pair storage writer",
+  }),
+  Object.freeze({
+    file: "test/contribution-sync-queue.test.js",
+    reason: "Windows queue integration requires qualified prepared-artifact storage and protected SQLite queue sessions",
+  }),
+  Object.freeze({
     file: "test/export-identity.test.js",
     reason: "production file identity requires Windows owner ACL, reparse-point, and hard-link enforcement",
+  }),
+  Object.freeze({
+    file: "test/local-collector-state.test.js",
+    reason: "Windows collector state integration requires the qualified native SQLite session boundary",
+  }),
+  Object.freeze({
+    file: "test/local-companion-data.test.js",
+    reason: "Windows companion data integration requires qualified collector state and unified-index staging",
+  }),
+  Object.freeze({
+    file: "test/local-companion-refresh.test.js",
+    reason: "Windows refresh integration requires qualified filesystem, collector state, and SQLite session composition",
+  }),
+  Object.freeze({
+    file: "test/local-contribution-preparation.test.js",
+    reason: "Windows contribution preparation requires qualified prepared-artifact and review-pair storage",
+  }),
+  Object.freeze({
+    file: "test/portable-local-companion-process.test.js",
+    reason: "Windows companion process startup requires qualified native state and prepared-artifact composition",
+  }),
+  Object.freeze({
+    file: "test/prospective-collector-cli.test.js",
+    reason: "Windows prospective collector SQLite coverage requires the qualified native collector-state session",
+  }),
+  Object.freeze({
+    file: "test/real-local-backend-acceptance.test.js",
+    reason: "Windows backend acceptance preparation requires qualified prepared-artifact and review-pair storage",
+  }),
+  Object.freeze({
+    file: "test/weekly-pace-local-companion.test.js",
+    reason: "Windows weekly-pace companion integration requires the qualified native collector-state session",
+  }),
+  Object.freeze({
+    file: "test/weekly-pace-refresh-integration.test.js",
+    reason: "Windows weekly-pace refresh integration requires the qualified native collector-state session",
+  }),
+  Object.freeze({
+    file: "test/windows-credential-operation-audit.test.js",
+    reason: "Windows native audit guard coverage runs in the exact native security qualification lane",
+  }),
+  Object.freeze({
+    file: "test/windows-filesystem-companion-instance-lease.test.js",
+    reason: "Windows native companion mutex coverage runs in the exact native security qualification lane",
+  }),
+  Object.freeze({
+    file: "test/windows-sqlite-state-session-contract.test.js",
+    reason: "Windows factory-injection contract simulation is non-native; native SQLite coverage uses the dedicated qualification suite",
+  }),
+  Object.freeze({
+    file: "apps/local/server.test.mjs",
+    reason: "Windows companion server integration requires qualified native state and prepared-artifact composition",
   }),
 ]);
 
