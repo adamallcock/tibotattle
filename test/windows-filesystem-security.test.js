@@ -24,6 +24,10 @@ import {
 } from "../src/platform/windows-filesystem.js";
 import { createWindowsCredentialAuditFileGuardContext } from "../src/platform/windows-credential-audit-file-guard.js";
 import { createWindowsCredentialOperationAuditStore } from "../src/platform/windows-credential-operation-audit.js";
+import {
+  WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST,
+  WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST,
+} from "../scripts/windows-security-qualification.mjs";
 
 const NATIVE_WINDOWS = process.platform === "win32" && process.arch === "x64";
 const NATIVE_SKIP = NATIVE_WINDOWS ? false : "native Windows x64 only";
@@ -841,7 +845,7 @@ test("native SQLite state lease rejects aliases and serializes duplicate leases"
 
 test("native SQLite staging clones, rejects aliases, and publishes atomically", {
   skip: NATIVE_SKIP,
-}, async () => {
+}, async (t) => {
   const parent = await mkdtemp(join(tmpdir(), "tibotattle-windows-sqlite-staging-"));
   const root = join(parent, `private state Ω ${randomUUID()}`);
   const movedRoot = `${root}-moved`;
@@ -855,6 +859,25 @@ test("native SQLite staging clones, rejects aliases, and publishes atomically", 
     architecture: "x64",
     binding,
   });
+  const publishWithDiagnostic = (operation) => {
+    try {
+      return operation();
+    } catch (error) {
+      const stage = typeof error?.windowsFilesystemStage === "string"
+        && WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST.includes(
+          error.windowsFilesystemStage,
+        )
+        ? error.windowsFilesystemStage
+        : null;
+      const errorCode = typeof error?.code === "string"
+        && WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST.includes(error.code)
+        ? error.code
+        : null;
+      if (stage !== null) t.diagnostic(`windowsFilesystemStage: ${stage}`);
+      if (errorCode !== null) t.diagnostic(`windowsFilesystemError: ${errorCode}`);
+      throw error;
+    }
+  };
   try {
     const rootIdentity = adapter.ensureDirectory(root);
     const liveIdentity = adapter.createFile(join(root, liveName), bytes);
@@ -868,14 +891,14 @@ test("native SQLite staging clones, rejects aliases, and publishes atomically", 
     assert.deepEqual(adapter.readFile(join(root, stageName)).data, bytes);
     assert.equal(adapter.sqliteStateStagingSafe, false);
 
-    const published = adapter.publishSqliteDatabase(
+    const published = publishWithDiagnostic(() => adapter.publishSqliteDatabase(
       root,
       rootIdentity,
       stageName,
       cloned.stageIdentity,
       liveName,
       liveIdentity,
-    );
+    ));
     assert.equal(published.published, true);
     assert.deepEqual(adapter.readFile(join(root, liveName)).data, bytes);
 
@@ -883,14 +906,14 @@ test("native SQLite staging clones, rejects aliases, and publishes atomically", 
     const second = adapter.createSqliteDatabase(root, rootIdentity, secondStage);
     adapter.replaceFile(join(root, secondStage), second, replacement);
     const current = adapter.inspectPath(join(root, liveName)).identity;
-    const republished = adapter.publishSqliteDatabase(
+    const republished = publishWithDiagnostic(() => adapter.publishSqliteDatabase(
       root,
       rootIdentity,
       secondStage,
       adapter.inspectPath(join(root, secondStage)).identity,
       liveName,
       current,
-    );
+    ));
     assert.equal(republished.published, true);
     assert.deepEqual(adapter.readFile(join(root, liveName)).data, replacement);
 
