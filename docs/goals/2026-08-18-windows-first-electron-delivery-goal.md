@@ -108,6 +108,12 @@ or a Linux-support claim.
   classify most as intentional fail-closed coverage of not-yet-qualified
   unified-index staging, review/prepared-artifact storage, and protected SQLite
   state/queue sessions rather than 18 independent regressions.
+- Exact Windows run `32465264725` on revision
+  `f6242a5bfda84e006c9680aab62ac028756efd06` returned identical bounded
+  per-test failure ordinals in warm and clean modes. The ordinals confirm three
+  classes: broad intentional fail-closed storage suites, one mixed sync test
+  missing its Windows load callback, and native-only suites that belong in the
+  exact native qualification lane rather than the unqualified portable lane.
 - The dependent Windows Electron artifact/runtime, NSIS, and R7 receipt gates
   remain unaccepted. `productionSafe` remains false; no Windows or Linux
   support claim, version bump, release, publication, or signing action is
@@ -122,9 +128,11 @@ or a Linux-support claim.
 
 ### Ordered next steps from this checkpoint
 
-1. Use bounded dot-status ordinals to identify the exact failing tests inside
-   the 18 files. The runner may emit only capped numeric `X` positions; it must
-   not capture assertion messages, paths, values, stdout, or stderr.
+1. Keep platform-neutral portable tests in the Windows lane, fix the mixed sync
+   fixture, and explicitly defer only suites whose subject requires qualified
+   Windows state, prepared-artifact, review-pair, or native-mutex composition.
+   Retire the now-completed TCP resource probe while retaining bounded numeric
+   failure ordinals.
 2. Pass the full local preflight and portable lanes, then dispatch one exact
    warm-and-clean run. Require the bounded diagnostic to exit normally in both
    cache modes instead of reporting a retained server ordinal.
