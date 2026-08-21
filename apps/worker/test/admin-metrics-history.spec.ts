@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   ADMIN_METRICS_HISTORY_SCHEMA_VERSION,
   captureAdminMetricSnapshot,
+  computeCohortGauges,
   readAdminMetricsHistory,
 } from "../src/admin-metrics-history";
 
@@ -67,6 +68,54 @@ describe("admin metric snapshots", () => {
     for (const value of Object.values(metrics)) {
       expect(typeof value).toBe("number");
     }
+  });
+});
+
+describe("cohort gauges", () => {
+  const nowEpoch = Date.parse("2026-08-21T20:00:00.000Z");
+  const nano = (usd: number) => usd * 1e9;
+
+  it("attributes a plan-switcher to one cohort, not one per label", () => {
+    // The real 2026-08-21 shape: one account whose retained history carries
+    // plus, prolite, and unknown fits (plan evolution + unstamped records).
+    // Their most recent qualifying fit is prolite, so they are one prolite
+    // person — never counted three times.
+    const switcher = JSON.stringify([
+      { planType: "unknown", capacityNanousd: nano(150), lastObservedAt: "2026-07-31T00:00:00.000Z" },
+      { planType: "plus", capacityNanousd: nano(122), lastObservedAt: "2026-08-05T00:00:00.000Z" },
+      { planType: "prolite", capacityNanousd: nano(684), lastObservedAt: "2026-08-21T06:00:00.000Z" },
+    ]);
+    // A pure pro account (the owner).
+    const pro = JSON.stringify([
+      { planType: "pro", capacityNanousd: nano(2043), lastObservedAt: "2026-08-19T00:00:00.000Z" },
+    ]);
+    const gauges = computeCohortGauges([switcher, pro], nowEpoch);
+    // Two people, each under exactly one plan: prolite (current) and pro.
+    expect(gauges.cohortParticipants_prolite).toBe(1);
+    expect(gauges.cohortParticipants_pro).toBe(1);
+    expect(gauges.cohortParticipants_plus).toBeUndefined();
+    expect(gauges.cohortParticipants_unknown).toBeUndefined();
+    // Median capacity pools by label regardless of who is "on" the plan, so
+    // every era the switcher observed still reports its own window size.
+    expect(gauges.cohortMedianUsd_plus).toBe(122);
+    expect(gauges.cohortMedianUsd_prolite).toBe(684);
+    expect(gauges.cohortMedianUsd_unknown).toBe(150);
+    expect(gauges.cohortMedianUsd_pro).toBe(2043);
+  });
+
+  it("drops fits observed before the trailing window", () => {
+    const stale = JSON.stringify([
+      { planType: "pro", capacityNanousd: nano(2000), lastObservedAt: "2026-01-01T00:00:00.000Z" },
+    ]);
+    expect(computeCohortGauges([stale], nowEpoch)).toEqual({});
+  });
+
+  it("survives corrupt and empty rows", () => {
+    const good = JSON.stringify([
+      { planType: "pro", capacityNanousd: nano(2000), lastObservedAt: "2026-08-20T00:00:00.000Z" },
+    ]);
+    const gauges = computeCohortGauges(["not json", "[]", good], nowEpoch);
+    expect(gauges.cohortParticipants_pro).toBe(1);
   });
 });
 

@@ -349,52 +349,101 @@ async function readPublishedBandGauges(
     // Absent aggregate tables (fresh environment) leave the gauges out.
   }
   try {
-    // Cohort sizes across ALL plans, from the per-participant fit cache. The
-    // cache covers v1-source participants; a missing cache row (v0.2-only
-    // participant, cold cache) is simply not counted here — this gauge tracks
-    // growth direction, and the published aggregate above stays the truth for
-    // what the site shows. Only fits observed inside the published trailing
-    // window count, mirroring summarizeCommunityAllowanceDay.
-    const trailingSince = iso(nowEpoch - 30 * DAY_MILLISECONDS);
     const rows = await db.prepare(
       "SELECT fits_json FROM community_allowance_fit_cache",
     ).all<{ fits_json: string }>();
-    const planParticipants = new Map<string, number>();
-    for (const row of rows.results) {
-      try {
-        const fits = JSON.parse(row.fits_json) as {
-          planType?: unknown;
-          lastObservedAt?: unknown;
-        }[];
-        const plans = new Set<string>();
-        for (const fit of Array.isArray(fits) ? fits : []) {
-          if (typeof fit.planType !== "string" || fit.planType.length === 0) {
-            continue;
-          }
-          if (
-            typeof fit.lastObservedAt !== "string"
-            || fit.lastObservedAt < trailingSince
-          ) {
-            continue;
-          }
-          plans.add(fit.planType);
-        }
-        for (const plan of plans) {
-          planParticipants.set(plan, (planParticipants.get(plan) ?? 0) + 1);
-        }
-      } catch {
-        // A corrupt cache row is the fit collector's problem, not history's.
-      }
-    }
-    for (const [plan, count] of planParticipants) {
-      // Plan identifiers come from the Codex KnownPlan enum; guard the key
-      // shape anyway so a hostile value cannot smuggle an odd JSON key.
-      if (/^[a-z0-9_-]{1,32}$/.test(plan)) {
-        gauges[`cohortParticipants_${plan}`] = count;
-      }
-    }
+    Object.assign(
+      gauges,
+      computeCohortGauges(rows.results.map((row) => row.fits_json), nowEpoch),
+    );
   } catch {
     // Absent fit cache (migration 0035 missing) leaves cohort gauges out.
+  }
+  return gauges;
+}
+
+// Plan identifiers come from the Codex KnownPlan enum (lowercase, underscored,
+// e.g. "self_serve_business_prolite"); the guard keeps a hostile cache value
+// from smuggling an odd JSON key into the gauge object.
+const COHORT_PLAN_KEY = /^[a-z0-9_]{1,40}$/;
+
+/**
+ * Per-plan cohort view from the per-participant fit-cache rows, for two owner
+ * questions the published pro-only band cannot answer: how many DISTINCT people
+ * are on each plan, and what each plan's reset window measures.
+ *
+ * A single account legitimately carries fits under several plan labels — plan
+ * changes over time leave every era in the retained history, and records that
+ * never received a plan stamp surface as "unknown" alongside the account's real
+ * plan. So a participant is attributed to ONE cohort: the plan of their most
+ * recent qualifying fit (their current plan). Counting a person under every
+ * label they ever showed overcounts people and is exactly the bug this avoids.
+ * Per-plan median capacity, by contrast, pools every qualifying fit under its
+ * own label, so a plan's measured window is independent of who is "on" it.
+ * Only fits inside the published trailing window count, mirroring
+ * summarizeCommunityAllowanceDay.
+ *
+ * Exported for unit tests; the fit-cache FK makes D1 seeding impractical.
+ */
+export function computeCohortGauges(
+  fitsJsonRows: readonly string[],
+  nowEpoch: number,
+): Record<string, number> {
+  const trailingSince = iso(nowEpoch - 30 * DAY_MILLISECONDS);
+  const planParticipants = new Map<string, number>();
+  const planCapacitiesUsd = new Map<string, number[]>();
+  for (const fitsJson of fitsJsonRows) {
+    try {
+      const fits = JSON.parse(fitsJson) as {
+        planType?: unknown;
+        lastObservedAt?: unknown;
+        capacityNanousd?: unknown;
+      }[];
+      let currentPlan: string | null = null;
+      let currentObservedAt = "";
+      for (const fit of Array.isArray(fits) ? fits : []) {
+        if (typeof fit.planType !== "string" || fit.planType.length === 0) {
+          continue;
+        }
+        if (
+          typeof fit.lastObservedAt !== "string"
+          || fit.lastObservedAt < trailingSince
+        ) {
+          continue;
+        }
+        if (
+          typeof fit.capacityNanousd === "number"
+          && Number.isFinite(fit.capacityNanousd)
+          && fit.capacityNanousd > 0
+        ) {
+          const list = planCapacitiesUsd.get(fit.planType) ?? [];
+          list.push(fit.capacityNanousd / 1e9);
+          planCapacitiesUsd.set(fit.planType, list);
+        }
+        if (fit.lastObservedAt > currentObservedAt) {
+          currentObservedAt = fit.lastObservedAt;
+          currentPlan = fit.planType;
+        }
+      }
+      if (currentPlan !== null) {
+        planParticipants.set(
+          currentPlan,
+          (planParticipants.get(currentPlan) ?? 0) + 1,
+        );
+      }
+    } catch {
+      // A corrupt cache row is the fit collector's problem, not history's.
+    }
+  }
+  const gauges: Record<string, number> = {};
+  for (const [plan, count] of planParticipants) {
+    if (COHORT_PLAN_KEY.test(plan)) gauges[`cohortParticipants_${plan}`] = count;
+  }
+  for (const [plan, capacities] of planCapacitiesUsd) {
+    if (!COHORT_PLAN_KEY.test(plan) || capacities.length === 0) continue;
+    const sorted = capacities.sort((a, b) => a - b);
+    const median = sorted[Math.floor((sorted.length - 1) / 2)] ?? 0;
+    gauges[`cohortMedianUsd_${plan}`] = Math.round(median);
   }
   return gauges;
 }

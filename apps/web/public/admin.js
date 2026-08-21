@@ -799,9 +799,20 @@ function growthBandCard(snapshots) {
     (snapshot) => Date.parse(snapshot.capturedAt) <= dayAgoEpoch,
   );
   const referenceCount = reference?.metrics.bandParticipantCount;
+  // One line per plan: how many distinct people are currently on it, and what
+  // that plan's reset window measures in API-price-equivalent dollars. Each
+  // person is counted under their current plan only, so a plan-switcher is one
+  // person here, not one per label they have ever shown.
   const cohorts = Object.entries(latest.metrics)
     .filter(([key]) => key.startsWith("cohortParticipants_"))
-    .map(([key, value]) => `${key.slice("cohortParticipants_".length)} ${value}`)
+    .map(([key, value]) => {
+      const plan = key.slice("cohortParticipants_".length);
+      const median = latest.metrics[`cohortMedianUsd_${plan}`];
+      const people = `${plan} ${value}`;
+      return typeof median === "number"
+        ? `${people} (~$${count(median)}/window)`
+        : people;
+    })
     .sort();
   const card = growthCard({
     label: "Published band cohort",
