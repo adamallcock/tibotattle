@@ -94,6 +94,13 @@ or a Linux-support claim.
   `8159e90d378baf570fd3326f4efaf964a6eb6719` reproduced the same ordinal-22
   retained server in warm and clean modes. This rules out an established
   keep-alive connection as the missing cleanup operation.
+- Exact Windows run `32463599823` on revision
+  `639cf9dd629dee043f058ae1110b34936fb16e47` again returned ordinary ordinal
+  `22`, not ownership sentinel `91` or `92`, in both cache modes. Both close
+  phases observed no retained listener before the after-test hook, after which
+  the private fixture's Windows listener ref persisted. The fixture is now
+  explicitly non-owning via `unref()` while its close/error/listening
+  assertions remain intact.
 - The dependent Windows Electron artifact/runtime, NSIS, and R7 receipt gates
   remain unaccepted. `productionSafe` remains false; no Windows or Linux
   support claim, version bump, release, publication, or signing action is
@@ -108,9 +115,9 @@ or a Linux-support claim.
 
 ### Ordered next steps from this checkpoint
 
-1. Record one fixed ownership sentinel after ordinal 22's two close phases:
-   `91` if only the private upstream listener remains and `92` if the companion
-   listener remains. Emit no server address, port, path, stack, or raw output.
+1. Re-run the exact warm-and-clean diagnostic with the private upstream fixture
+   explicitly non-owning. Require natural process exit; retain the explicit
+   close/error/listening assertions and do not alter production shutdown code.
 2. Pass the full local preflight and portable lanes, then dispatch one exact
    warm-and-clean run. Require the bounded diagnostic to exit normally in both
    cache modes instead of reporting a retained server ordinal.
