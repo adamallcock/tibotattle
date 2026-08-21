@@ -271,23 +271,41 @@ jobs:
           "TIBOTATTLE_WINDOWS_QUALIFICATION_STATE_ROOT=$qualificationStateRoot" >> $env:GITHUB_ENV
 
       - name: Run content-free Windows security qualification
+        id: native_security_qualification
+        continue-on-error: true
         shell: pwsh
         env:
           USAGE_MONITOR_WINDOWS_QUALIFICATION: "1"
         run: |
           $ErrorActionPreference = 'Stop'
+          $qualificationResultPath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-security-qualification.txt'
+          "TIBOTATTLE_WINDOWS_SECURITY_QUALIFICATION_RESULT_PATH=$qualificationResultPath" >> $env:GITHUB_ENV
           $result = node ./scripts/windows-security-qualification.mjs
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error 'WINDOWS_SECURITY_QUALIFICATION_FAILED'
+          $qualificationExitCode = $LASTEXITCODE
+          if ($qualificationExitCode -ne 0) {
+            # Keep only a fixed, bound marker for the blocked-development
+            # artifact. The native diagnostic already emits content-free
+            # failure metadata; this marker intentionally records no test
+            # output, paths, identities, or exception text.
+            $failureResult = "WINDOWS_SECURITY_QUALIFICATION_FAILED revision=$env:TIBOTATTLE_QUALIFICATION_REVISION cache=$env:TIBOTATTLE_QUALIFICATION_CACHE_MODE binding_bytes=$env:TIBOTATTLE_WINDOWS_BINDING_BYTES binding_sha256=$env:TIBOTATTLE_WINDOWS_BINDING_SHA256"
+            [IO.File]::WriteAllText(
+              $qualificationResultPath,
+              "$failureResult`n",
+              [Text.UTF8Encoding]::new($false)
+            )
+            "TIBOTATTLE_WINDOWS_SECURITY_QUALIFICATION_STATUS=failed" >> $env:GITHUB_ENV
+            "### Content-free security result" >> $env:GITHUB_STEP_SUMMARY
+            "- Result: native qualification failed; unsigned development packaging may continue for evidence only" >> $env:GITHUB_STEP_SUMMARY
+            "- Production promotion: blocked" >> $env:GITHUB_STEP_SUMMARY
+            Write-Error 'WINDOWS_SECURITY_QUALIFICATION_FAILED_DEVELOPMENT_CONTINUES'
             exit 1
           }
-          $qualificationResultPath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-security-qualification.txt'
           [IO.File]::WriteAllText(
             $qualificationResultPath,
             "$result`n",
             [Text.UTF8Encoding]::new($false)
           )
-          "TIBOTATTLE_WINDOWS_SECURITY_QUALIFICATION_RESULT_PATH=$qualificationResultPath" >> $env:GITHUB_ENV
+          "TIBOTATTLE_WINDOWS_SECURITY_QUALIFICATION_STATUS=passed" >> $env:GITHUB_ENV
           "### Content-free security result" >> $env:GITHUB_STEP_SUMMARY
           "- Command: node ./scripts/windows-security-qualification.mjs" >> $env:GITHUB_STEP_SUMMARY
           "- Result: $result" >> $env:GITHUB_STEP_SUMMARY
@@ -402,6 +420,7 @@ jobs:
           "TIBOTATTLE_ELECTRON_UNPACKED_PATH=$unpackedPath" >> $env:GITHUB_ENV
 
       - name: Verify Windows Electron development artifact
+        id: electron_artifact_verification
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -517,6 +536,7 @@ jobs:
           "- Diagnostics: content-free" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Create content-free Windows Electron qualification receipt
+        if: ${{ success() && steps.native_security_qualification.outcome == 'success' }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -564,13 +584,26 @@ jobs:
           "- Runtime and package evidence: aggregate-only" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Retain exact Windows x64 development artifact and qualification receipt
-        if: ${{ success() }}
+        if: ${{ success() && steps.native_security_qualification.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tibotattle-windows-x64-electron-${{ github.sha }}-${{ matrix.cache-mode }}
           path: |
             ${{ env.TIBOTATTLE_ELECTRON_ARTIFACT_APP_PATH }}
             ${{ env.TIBOTATTLE_ELECTRON_QUALIFICATION_RECEIPT_PATH }}
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Retain blocked unsigned Windows x64 development artifact
+        if: ${{ always() && !cancelled() && steps.native_security_qualification.outcome == 'failure' && steps.electron_artifact_verification.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tibotattle-windows-x64-electron-${{ github.sha }}-${{ matrix.cache-mode }}-blocked-development
+          path: |
+            ${{ env.TIBOTATTLE_ELECTRON_ARTIFACT_APP_PATH }}
+            ${{ env.TIBOTATTLE_WINDOWS_SECURITY_QUALIFICATION_RESULT_PATH }}
+            ${{ env.TIBOTATTLE_ELECTRON_VERIFICATION_EVIDENCE_PATH }}
+            ${{ env.TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH }}
           if-no-files-found: error
           retention-days: 3
 
@@ -616,3 +649,11 @@ jobs:
             Write-Error 'WINDOWS_QUALIFICATION_UNTRACKED_OUTPUT'
             exit 1
           }
+
+      - name: Fail closed after retaining blocked development artifact
+        if: ${{ always() && !cancelled() && steps.native_security_qualification.outcome == 'failure' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Error 'WINDOWS_SECURITY_QUALIFICATION_FAILED_ARTIFACT_RETAINED'
+          exit 1
