@@ -45,10 +45,22 @@
       "followUp": "Replace the omitted lock-file mode assertion with an owner ACL assertion."
     },
     {
+      "file": "test/contribution-device-capability.test.js",
+      "win32BranchCount": 1,
+      "classification": "windows-equivalent-needed",
+      "followUp": "Replace mode and symlink fixtures with the branded Windows contribution-state adapter and owner ACL checks."
+    },
+    {
       "file": "test/electron-development-artifact-verifier.test.js",
       "win32BranchCount": 2,
       "classification": "native-windows-qualification",
       "followUp": "Run the native ASAR list-path round trip on Windows x64 as part of unsigned Electron artifact qualification."
+    },
+    {
+      "file": "test/electron-windows-smoke-contract.test.js",
+      "win32BranchCount": 1,
+      "classification": "native-windows-qualification",
+      "followUp": "Run the referenced Windows x64 Electron smoke workflow and retain only its content-free aggregate result."
     },
     {
       "file": "test/export-identity.test.js",
@@ -141,10 +153,22 @@
       "followUp": "Run child-process contention, crash abandonment, clean reacquisition, same-process recursive rejection, and worker-thread wrong-thread release rejection on native Windows x64."
     },
     {
+      "file": "test/windows-finalizer-qualification-handoff.test.js",
+      "win32BranchCount": 1,
+      "classification": "native-windows-qualification",
+      "followUp": "Run finalizer handoff input and reparse-point refusal on native Windows x64 before accepting a signed promotion."
+    },
+    {
       "file": "test/windows-path-contract.test.js",
       "win32BranchCount": 1,
       "classification": "native-windows-qualification",
       "followUp": "Run filesystem assertions on native Windows x64; cross-host path semantics remain separately tested."
+    },
+    {
+      "file": "test/windows-trusted-signing-pin.test.js",
+      "win32BranchCount": 1,
+      "classification": "native-windows-qualification",
+      "followUp": "Run the exact TrustedSigning 0.5.0 preflight and patched app-builder source check on native Windows x64."
     }
   ]
 }
