@@ -102,6 +102,7 @@
     "product:web-release:prepare": "node ./scripts/prepare-web-release.js",
     "product:web-release:test": "node --test test/web-release-lane.test.js",
     "product:worker:check": "npm --prefix apps/worker run check",
+    "preflight:windows:trusted-signing": "node ./scripts/verify-windows-trusted-signing-preflight.mjs",
     "quality": "node ./src/cli.js quality",
     "register-account": "node ./src/cli.js register-account",
     "release:evidence:generate": "node ./scripts/generate-release-evidence.js",
