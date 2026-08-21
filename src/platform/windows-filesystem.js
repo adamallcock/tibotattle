@@ -61,6 +61,19 @@ const AUTHENTICATED_BINDING_PROVENANCE_SOURCES = Object.freeze([
   "development-package",
   "audited-signed-native-binding",
 ]);
+const WINDOWS_FILESYSTEM_PUBLISH_STAGES = Object.freeze([
+  "publish_parse",
+  "publish_stage_open",
+  "publish_stage_preflight",
+  "publish_target_open",
+  "publish_target_preflight",
+  "publish_stage_revalidate",
+  "publish_target_revalidate",
+  "publish_rename",
+  "publish_stage_postvalidate",
+  "publish_target_postopen",
+  "publish_target_postvalidate",
+]);
 const REQUIRED_METHODS = Object.freeze([
   "inspectPath",
   "ensureDirectory",
@@ -478,17 +491,28 @@ export function loadWindowsFilesystemBinding(options = {}) {
   return loadVerifiedWindowsFilesystemBinding(options).binding;
 }
 
-function fixedOperationError(code) {
+function fixedOperationError(code, windowsFilesystemStage = null) {
   const error = new Error("Windows filesystem operation failed");
   error.code = code;
+  if (windowsFilesystemStage !== null) {
+    error.windowsFilesystemStage = windowsFilesystemStage;
+  }
   return error;
 }
 
 function normalizeNativeError(error) {
   const code = typeof error?.code === "string" ? error.code : "";
   if (code === "ENOENT" || code === "EEXIST") return error;
-  if (code === "WINDOWS_FILESYSTEM_NOT_FOUND") return fixedOperationError("ENOENT");
-  if (code === "WINDOWS_FILESYSTEM_ALREADY_EXISTS") return fixedOperationError("EEXIST");
+  const stage = typeof error?.windowsFilesystemStage === "string"
+    && WINDOWS_FILESYSTEM_PUBLISH_STAGES.includes(error.windowsFilesystemStage)
+    ? error.windowsFilesystemStage
+    : null;
+  if (code === "WINDOWS_FILESYSTEM_NOT_FOUND") {
+    return fixedOperationError("ENOENT", stage);
+  }
+  if (code === "WINDOWS_FILESYSTEM_ALREADY_EXISTS") {
+    return fixedOperationError("EEXIST", stage);
+  }
   return error?.code?.startsWith("WINDOWS_FILESYSTEM_")
     ? error
     : fixedOperationError("WINDOWS_FILESYSTEM_OPERATION_FAILED");
