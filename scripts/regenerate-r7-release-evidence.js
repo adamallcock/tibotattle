@@ -58,6 +58,72 @@ const RUNTIMES = Object.freeze({
 const INSTALL_JOURNAL_NAME = ".r7-release-evidence-install-v1.json";
 const INSTALL_JOURNAL_SCHEMA = "usage-monitor-r7-release-evidence-install-v1";
 const GENERATION_MARKER_NAME = ".r7-release-evidence-generation-v1.json";
+
+// ---------------------------------------------------------------------------
+// Progress reporting. A full regeneration is a 42-59 minute run that used to
+// produce NOTHING until its final summary line, which twice in one day let a
+// failure cost the whole window: a usage error that exited without running,
+// and a source_integrity failure with no indication of which phase died.
+//
+// This layer lives HERE deliberately: the regenerator is outside the R7
+// workload-source set, so progress can improve without invalidating the
+// receipts, while the benchmark internals (src/r7-*, the two workers) are
+// bound and must not carry it. Lines go to STDERR — stdout remains exactly
+// the final summary contract the runbook greps — and stay silent in the
+// --decision-child re-invocation, whose output the parent captures into a
+// bounded buffer.
+//
+// The weights are the observed fractions of total wall time across the three
+// completed regenerations (42m, 59m, 46m): the six synthetic/materialized
+// profile runs together are ~12%, the shared real-local-history pass is ~87%,
+// and the decision rebuilds are noise. ETAs are estimates from those runs and
+// say so.
+const REGENERATION_PHASE_WEIGHTS = [
+  0.010, 0.045, 0.005, 0.010, 0.045, 0.005, 0.870, 0.010,
+];
+
+function createRegenerationProgress() {
+  const silent = process.env.USAGE_MONITOR_R7_DECISION_CHILD === "1"
+    || process.argv.includes("--decision-child");
+  const startedAt = Date.now();
+  let completedWeight = 0;
+  let phaseIndex = 0;
+  let phaseStartedAt = 0;
+  let heartbeat = null;
+  const minutes = (ms) => `${(ms / 60_000).toFixed(1)}m`;
+  const stamp = () => new Date().toISOString().slice(11, 19);
+  const write = (message) => {
+    if (!silent) process.stderr.write(`r7-progress ${stamp()} ${message}\n`);
+  };
+  const eta = () => {
+    if (completedWeight < 0.02) return "";
+    const elapsed = Date.now() - startedAt;
+    const remaining = elapsed * (1 - completedWeight) / completedWeight;
+    return ` — eta ~${minutes(remaining)} (estimate from prior runs)`;
+  };
+  return {
+    plan() {
+      write(`plan: 6 profile runs, 1 shared real-history pass, 2 decision rebuilds; prior full runs took 42-59m`);
+    },
+    phaseBegin(label, { heartbeatEveryMs = null, typical = null } = {}) {
+      phaseIndex += 1;
+      phaseStartedAt = Date.now();
+      write(`[${phaseIndex}/8] ${label} started (total elapsed ${minutes(Date.now() - startedAt)})${eta()}`);
+      if (heartbeatEveryMs !== null) {
+        heartbeat = setInterval(() => {
+          write(`[${phaseIndex}/8] ${label} still running: ${minutes(Date.now() - phaseStartedAt)} in phase${typical === null ? "" : ` (typical ${typical})`}`);
+        }, heartbeatEveryMs);
+        // A crashed phase must not be kept alive by its own heartbeat.
+        heartbeat.unref?.();
+      }
+    },
+    phaseEnd() {
+      if (heartbeat !== null) { clearInterval(heartbeat); heartbeat = null; }
+      completedWeight += REGENERATION_PHASE_WEIGHTS[phaseIndex - 1] ?? 0;
+      write(`[${phaseIndex}/8] completed in ${minutes(Date.now() - phaseStartedAt)}${eta()}`);
+    },
+  };
+}
 const GENERATION_MARKER_SCHEMA = "usage-monitor-r7-release-evidence-generation-v1";
 const JOURNAL_CREATION_PREFIX = `${INSTALL_JOURNAL_NAME}.creating-`;
 const MAXIMUM_CONTROL_FILE_BYTES = 64 * 1024;
@@ -1520,15 +1586,23 @@ async function main() {
       stagingIdentity,
       creationDraft: null,
     });
+    const progress = createRegenerationProgress();
+    progress.plan();
     for (const [runtimeKey, executable] of Object.entries({ node24, node26 })) {
       for (const profile of Object.keys(PROFILE_FILES)) {
+        progress.phaseBegin(`${PROFILE_FILES[profile]} ${runtimeKey}`);
         await runProfile(
           executable,
           profile,
           join(staging, receiptFilename(profile, runtimeKey)),
         );
+        progress.phaseEnd();
       }
     }
+    progress.phaseBegin("real-local-history (both runtimes, one shared plan)", {
+      heartbeatEveryMs: 120_000,
+      typical: "35-50m",
+    });
     await writeRealHistoryReceipts({
       node24,
       node26,
@@ -1536,6 +1610,8 @@ async function main() {
       endAt: options.endat,
       staging,
     });
+    progress.phaseEnd();
+    progress.phaseBegin("decision rebuilds (both runtimes)");
     for (const [runtimeKey, executable] of Object.entries({ node24, node26 })) {
       await invokeRuntime(
         executable,
@@ -1561,6 +1637,7 @@ async function main() {
         },
       );
     }
+    progress.phaseEnd();
     await validateCompleteStaging(staging, stagingIdentity);
     await installReceipts(staging, destination);
     installed = true;

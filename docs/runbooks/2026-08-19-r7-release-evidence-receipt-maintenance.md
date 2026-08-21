@@ -202,3 +202,17 @@ node scripts/regenerate-r7-release-evidence.js --destination generated --recover
 It prints `discarded_incomplete_generation`, clears the control files, and
 leaves the committed receipts untouched. Do not delete the control files by
 hand.
+
+## Progress output
+
+The regenerator prints phase progress to STDERR (`r7-progress …`): an upfront
+plan line, `[n/8]` begin/end per phase with elapsed and an ETA extrapolated
+from completed weight, and a two-minute heartbeat through the long
+real-local-history pass. Stdout remains exactly the final summary line. A
+failure therefore names the phase it died in instead of costing the whole
+42-59 minute window to discover.
+
+The regenerator itself is OUTSIDE the workload-source set (only the two
+`scripts/r7-*-worker.js` files are bound), so its progress reporting can be
+improved without invalidating receipts — including receipts from a run already
+in flight, which holds its own copy of the code.
