@@ -148,6 +148,20 @@ export const WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST = Object.freeze([
   "publish_target_postopen",
   "publish_target_postvalidate",
 ]);
+// Prepared-directory diagnostics are intentionally separate from SQLite
+// publication diagnostics. Only these fixed native phases may cross the
+// qualification boundary; paths, names, SIDs, and native messages remain
+// private to the child process.
+export const WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST = Object.freeze([
+  "prepared_root_open",
+  "prepared_root_validation",
+  "prepared_child_open",
+  "prepared_child_create",
+  "prepared_dacl_update",
+  "prepared_child_validation",
+  "prepared_ancestor_validation",
+  "prepared_final_validation",
+]);
 // These are the finite native Failure/FromLastError classes that can cross
 // the SQLite publication callback. The TAP diagnostic never accepts arbitrary
 // error-like strings or host/runtime exception names.
@@ -165,6 +179,18 @@ export const WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST = Object.freeze([
   "WINDOWS_FILESYSTEM_IDENTITY_MISMATCH",
   "WINDOWS_FILESYSTEM_OPERATION_FAILED",
   "WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_SIDECAR_PRESENT",
+]);
+export const WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST = Object.freeze([
+  "WINDOWS_FILESYSTEM_INVALID_CONFIGURATION",
+  "WINDOWS_FILESYSTEM_INVALID_PATH",
+  "WINDOWS_FILESYSTEM_NOT_FOUND",
+  "WINDOWS_FILESYSTEM_ALREADY_EXISTS",
+  "WINDOWS_FILESYSTEM_ACCESS_DENIED",
+  "WINDOWS_FILESYSTEM_REPARSE_POINT",
+  "WINDOWS_FILESYSTEM_SECURITY_POLICY",
+  "WINDOWS_FILESYSTEM_NOT_DIRECTORY",
+  "WINDOWS_FILESYSTEM_IDENTITY_MISMATCH",
+  "WINDOWS_FILESYSTEM_OPERATION_FAILED",
 ]);
 const QUALIFICATION_ENVIRONMENT = "USAGE_MONITOR_WINDOWS_QUALIFICATION";
 const QUALIFICATION_REVISION_ENVIRONMENT = "TIBOTATTLE_QUALIFICATION_REVISION";
@@ -540,6 +566,31 @@ export function formatWindowsSecurityQualificationFailure(error) {
     )
     ? error.nativeErrors
     : null;
+  const preparedStages = Array.isArray(error?.preparedStages)
+    && error.preparedStages.length <= MAXIMUM_FAILURE_METADATA_ITEMS
+    && error.preparedStages.every(
+      (value, index, values) => WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST.includes(value)
+        && values.indexOf(value) === index,
+    )
+    ? error.preparedStages
+    : null;
+  const preparedErrors = Array.isArray(error?.preparedErrors)
+    && error.preparedErrors.length <= MAXIMUM_FAILURE_METADATA_ITEMS
+    && error.preparedErrors.every(
+      (value, index, values) => WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST.includes(value)
+        && values.indexOf(value) === index,
+    )
+    ? error.preparedErrors
+    : null;
+  const preparedMetadata = (preparedStages !== null && preparedStages.length > 0)
+    || (preparedErrors !== null && preparedErrors.length > 0)
+    ? ` prepared_stages=${preparedStages !== null && preparedStages.length > 0
+      ? preparedStages.join(",")
+      : "unavailable"}`
+      + ` prepared_errors=${preparedErrors !== null && preparedErrors.length > 0
+        ? preparedErrors.join(",")
+        : "unavailable"}`
+    : "";
   return `${status} test_index=${testIndex}`
     + ` test_indexes=${testIndexes !== null && testIndexes.length > 0
       ? testIndexes.join(",")
@@ -552,7 +603,8 @@ export function formatWindowsSecurityQualificationFailure(error) {
       : "unavailable"}`
     + ` native_errors=${nativeErrors !== null && nativeErrors.length > 0
       ? nativeErrors.join(",")
-      : "unavailable"}`;
+      : "unavailable"}`
+    + preparedMetadata;
 }
 
 /**
@@ -582,6 +634,29 @@ export function extractTapPublishStages(output) {
 export const extractTapWindowsFilesystemPublishStages = extractTapPublishStages;
 
 /**
+ * Extract only fixed prepared-directory phases from TAP diagnostics.
+ * Qualification output is untrusted; require an exact comment property and
+ * retain only the finite operation vocabulary above.
+ */
+export function extractTapPreparedStages(output) {
+  const stages = [];
+  if (typeof output !== "string") return Object.freeze(stages);
+  const seen = new Set();
+  const allowlisted = new Set(WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST);
+  const pattern = /^\s*#\s+windowsFilesystemStage\s*:\s*(['"]?)([a-z_]+)\1\s*$/gmu;
+  for (const match of output.matchAll(pattern)) {
+    const stage = match[2];
+    if (!allowlisted.has(stage) || seen.has(stage)) continue;
+    seen.add(stage);
+    stages.push(stage);
+    if (stages.length === MAXIMUM_FAILURE_METADATA_ITEMS) break;
+  }
+  return Object.freeze(stages);
+}
+
+export const extractTapWindowsPreparedDirectoryStages = extractTapPreparedStages;
+
+/**
  * Extract only fixed native error classes from TAP diagnostic property lines.
  * Do not parse TAP YAML, test names, stack frames, or arbitrary comments.
  */
@@ -602,6 +677,28 @@ export function extractTapPublishErrors(output) {
 }
 
 export const extractTapWindowsFilesystemPublishErrors = extractTapPublishErrors;
+
+/**
+ * Extract only fixed prepared-directory error classes from TAP diagnostics.
+ * Messages, stacks, paths, and test names are never parsed or returned.
+ */
+export function extractTapPreparedErrors(output) {
+  const errors = [];
+  if (typeof output !== "string") return Object.freeze(errors);
+  const seen = new Set();
+  const allowlisted = new Set(WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST);
+  const pattern = /^\s*#\s+windowsFilesystemError\s*:\s*(['"]?)(WINDOWS_FILESYSTEM_[A-Z0-9_]+)\1\s*$/gmu;
+  for (const match of output.matchAll(pattern)) {
+    const errorCode = match[2];
+    if (!allowlisted.has(errorCode) || seen.has(errorCode)) continue;
+    seen.add(errorCode);
+    errors.push(errorCode);
+    if (errors.length === MAXIMUM_FAILURE_METADATA_ITEMS) break;
+  }
+  return Object.freeze(errors);
+}
+
+export const extractTapWindowsPreparedDirectoryErrors = extractTapPreparedErrors;
 
 /**
  * Extract only allowlisted native filesystem error codes from Node TAP error
@@ -634,6 +731,10 @@ function fixedFailureWithTapMetadata(output) {
   error.publishStage = error.publishStages[0] ?? null;
   error.publishErrors = extractTapPublishErrors(output);
   error.publishError = error.publishErrors[0] ?? null;
+  error.preparedStages = extractTapPreparedStages(output);
+  error.preparedStage = error.preparedStages[0] ?? null;
+  error.preparedErrors = extractTapPreparedErrors(output);
+  error.preparedError = error.preparedErrors[0] ?? null;
   return error;
 }
 

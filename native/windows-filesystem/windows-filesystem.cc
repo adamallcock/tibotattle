@@ -1134,25 +1134,29 @@ bool ValidatePreparedAncestors(
     const RelativeHandles& opened,
     const ParsedPath& fullPath,
     std::size_t rootComponentCount,
-    Failure* failure) {
+  Failure* failure) {
   if (opened.parents.empty() || rootComponentCount > fullPath.components.size()) {
     *failure = InvalidPath();
+    failure->stage = "prepared_ancestor_validation";
     return false;
   }
   for (std::size_t index = 0; index < opened.parents.size(); ++index) {
     HandleIdentity identity;
     if (!ValidateSecurity(opened.parents[index], true, failure, &identity)) {
+      failure->stage = "prepared_ancestor_validation";
       return false;
     }
     ParsedPath prefix = fullPath;
     const std::size_t componentCount = rootComponentCount + index;
     if (componentCount > prefix.components.size()) {
       *failure = InvalidPath();
+      failure->stage = "prepared_ancestor_validation";
       return false;
     }
     prefix.components.resize(componentCount);
     if (!ResolveFinalPath(opened.parents[index], &prefix)) {
       *failure = IdentityMismatch();
+      failure->stage = "prepared_ancestor_validation";
       return false;
     }
   }
@@ -1220,7 +1224,11 @@ bool OpenPreparedRootOnly(
     RelativeHandles* opened,
     ParsedPath* parsedRoot,
     Failure* failure) {
-  if (!ParseAndValidatePath(rootPath, false, parsedRoot, failure)) return false;
+  failure->stage = "prepared_root_open";
+  if (!ParseAndValidatePath(rootPath, false, parsedRoot, failure)) {
+    failure->stage = "prepared_root_open";
+    return false;
+  }
   OpenRelativeOptions rootOptions;
   rootOptions.finalDirectoryKnown = true;
   rootOptions.finalDirectory = true;
@@ -1239,6 +1247,7 @@ bool OpenPreparedRootOnly(
           failure)
       || rootMissing
       || rootOpened.final == INVALID_HANDLE_VALUE) {
+    failure->stage = "prepared_root_open";
     return false;
   }
   HandleIdentity observedRoot;
@@ -1246,14 +1255,17 @@ bool OpenPreparedRootOnly(
       || !EqualIdentity(observedRoot, expectedRoot)
       || !ResolveFinalPath(rootOpened.final, parsedRoot)) {
     if (failure->code == OperationFailed().code) *failure = IdentityMismatch();
+    failure->stage = "prepared_root_validation";
     return false;
   }
   HANDLE protectedRoot = rootOpened.releaseFinal();
   if (protectedRoot == INVALID_HANDLE_VALUE) {
     *failure = OperationFailed();
+    failure->stage = "prepared_root_open";
     return false;
   }
   opened->parents.push_back(protectedRoot);
+  failure->stage = "prepared_ancestor_validation";
   return ValidatePreparedAncestors(
       *opened,
       *parsedRoot,
@@ -1270,10 +1282,15 @@ bool OpenPreparedRootAndDirectory(
     ParsedPath* fullPath,
     Failure* failure) {
   ParsedPath parsedRoot;
-  if (!ParseAndValidatePath(rootPath, false, &parsedRoot, failure)) return false;
+  failure->stage = "prepared_root_open";
+  if (!ParseAndValidatePath(rootPath, false, &parsedRoot, failure)) {
+    failure->stage = "prepared_root_open";
+    return false;
+  }
   std::vector<std::wstring> childComponents;
   if (!ParseRelativeComponents(childPath, &childComponents)) {
     *failure = InvalidPath();
+    failure->stage = "prepared_child_open";
     return false;
   }
 
@@ -1292,6 +1309,7 @@ bool OpenPreparedRootAndDirectory(
     HANDLE next = INVALID_HANDLE_VALUE;
     ULONG_PTR information = 0;
     Failure openFailure = OperationFailed();
+    failure->stage = "prepared_child_open";
     if (!OpenRelativeComponent(
             current,
             childComponents[index],
@@ -1305,8 +1323,10 @@ bool OpenPreparedRootAndDirectory(
             &openFailure)) {
       if (!createMissing || openFailure.code != NotFound().code) {
         *failure = openFailure;
+        failure->stage = "prepared_child_open";
         return false;
       }
+      failure->stage = "prepared_child_create";
       std::vector<BYTE> ownerSid;
       PACL acl = nullptr;
       PSECURITY_DESCRIPTOR descriptor = nullptr;
@@ -1317,6 +1337,7 @@ bool OpenPreparedRootAndDirectory(
               &descriptor,
               &attributes)) {
         *failure = OperationFailed();
+        failure->stage = "prepared_child_create";
         return false;
       }
       bool created = OpenRelativeComponent(
@@ -1351,10 +1372,12 @@ bool OpenPreparedRootAndDirectory(
       if (!created || (information != kFileCreated && information != kFileOpened)) {
         *failure = created ? AlreadyExists() : openFailure;
         if (next != INVALID_HANDLE_VALUE) CloseHandle(next);
+        failure->stage = "prepared_child_create";
         return false;
       }
     }
 
+    failure->stage = "prepared_child_validation";
     bool reparse = false;
     DWORD attributes = 0;
     if (!GetFileAttributesFromHandle(next, &attributes)
@@ -1362,18 +1385,21 @@ bool OpenPreparedRootAndDirectory(
       if (information == kFileCreated) MarkHandleForDeletion(next);
       CloseHandle(next);
       *failure = OperationFailed();
+      failure->stage = "prepared_child_validation";
       return false;
     }
     if (reparse || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
       if (information == kFileCreated) MarkHandleForDeletion(next);
       CloseHandle(next);
       *failure = reparse ? ReparsePoint() : NotDirectory();
+      failure->stage = "prepared_child_validation";
       return false;
     }
     if (information == kFileCreated && !SetOwnerOnlyDacl(next)) {
       *failure = SecurityPolicy("dacl_update_failed");
       if (!MarkHandleForDeletion(next)) *failure = OperationFailed();
       CloseHandle(next);
+      failure->stage = "prepared_dacl_update";
       return false;
     }
     fullPath->components.push_back(childComponents[index]);
@@ -1383,10 +1409,12 @@ bool OpenPreparedRootAndDirectory(
       if (information == kFileCreated) MarkHandleForDeletion(next);
       CloseHandle(next);
       if (failure->code == OperationFailed().code) *failure = IdentityMismatch();
+      failure->stage = "prepared_child_validation";
       return false;
     }
     if (final) {
       opened->final = next;
+      failure->stage = "prepared_ancestor_validation";
       return ValidatePreparedAncestors(
           *opened,
           *fullPath,
@@ -3055,11 +3083,13 @@ napi_value EnsurePreparedDirectoryCallback(
           &failure)) {
     return ThrowFailure(env, failure);
   }
+  failure.stage = "prepared_final_validation";
   HandleIdentity identity;
   if (!GetIdentity(opened.final, &identity)
       || !ValidateSecurity(opened.final, true, &failure, &identity)
       || !ResolveFinalPath(opened.final, &fullPath)) {
     if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    failure.stage = "prepared_final_validation";
     return ThrowFailure(env, failure);
   }
   return IdentityValue(env, identity);

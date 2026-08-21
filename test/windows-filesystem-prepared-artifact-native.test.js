@@ -8,6 +8,11 @@ import { dirname, join, resolve, win32 } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import {
+  WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST,
+  WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST,
+} from "../scripts/windows-security-qualification.mjs";
+
 const NATIVE_WINDOWS = process.platform === "win32" && process.arch === "x64";
 const NATIVE_SKIP = NATIVE_WINDOWS ? false : "native Windows x64 only";
 const requireNative = createRequire(import.meta.url);
@@ -67,6 +72,32 @@ function loadBinding() {
 function nativeFailure(code) {
   return (error) => error?.code === `WINDOWS_FILESYSTEM_${code}`
     && error?.message === "Windows filesystem operation failed";
+}
+
+function ensurePreparedDirectoryWithDiagnostic(
+  t,
+  binding,
+  root,
+  rootIdentity,
+  childPath,
+) {
+  try {
+    return binding.ensurePreparedDirectory(root, rootIdentity, childPath);
+  } catch (error) {
+    const stage = typeof error?.windowsFilesystemStage === "string"
+      && WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST.includes(
+        error.windowsFilesystemStage,
+      )
+      ? error.windowsFilesystemStage
+      : null;
+    const errorCode = typeof error?.code === "string"
+      && WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST.includes(error.code)
+      ? error.code
+      : null;
+    if (stage !== null) t.diagnostic(`windowsFilesystemStage: ${stage}`);
+    if (errorCode !== null) t.diagnostic(`windowsFilesystemError: ${errorCode}`);
+    throw error;
+  }
 }
 
 async function withPreparedRoot(run) {
@@ -182,9 +213,11 @@ function runPublishChild({ bindingPath, root, rootIdentity, stagePath, stageIden
 
 test("prepared native surface handles bounded contribution publication and cleanup", {
   skip: NATIVE_SKIP,
-}, async () => {
+}, async (t) => {
   await withPreparedRoot(async ({ binding, root, rootIdentity }) => {
-    const preparedIdentity = binding.ensurePreparedDirectory(
+    const preparedIdentity = ensurePreparedDirectoryWithDiagnostic(
+      t,
+      binding,
       root,
       rootIdentity,
       "prepared\\2026-08-18",
@@ -299,10 +332,16 @@ test("prepared native surface rejects unsafe names and size ceilings", {
 
 test("prepared native publication is recoverable after a child crash and no-clobber race", {
   skip: NATIVE_SKIP,
-}, async () => {
+}, async (t) => {
   await withPreparedRoot(async ({ binding, root, rootIdentity }) => {
     const bindingPath = qualificationBindingPath();
-    binding.ensurePreparedDirectory(root, rootIdentity, "prepared");
+    ensurePreparedDirectoryWithDiagnostic(
+      t,
+      binding,
+      root,
+      rootIdentity,
+      "prepared",
+    );
     const crashChild = startCrashChild({
       bindingPath,
       root,
@@ -320,7 +359,13 @@ test("prepared native publication is recoverable after a child crash and no-clob
       crashedIdentity,
     ).identity, crashedIdentity);
 
-    binding.ensurePreparedDirectory(root, rootIdentity, "race");
+    ensurePreparedDirectoryWithDiagnostic(
+      t,
+      binding,
+      root,
+      rootIdentity,
+      "race",
+    );
     const first = binding.createPreparedFile(
       root,
       rootIdentity,
