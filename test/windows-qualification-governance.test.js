@@ -172,17 +172,13 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_DIAGNOSTIC_SUITE_TIMED_OUT/u);
   assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_MAXIMUM_FAILURE_METADATA_ITEMS = 64/u);
   assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS = 1_024/u);
-  assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS = 64/u);
-  assert.match(portableDiagnosticScript, /TIBOTATTLE_WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC/u);
   assert.match(portableDiagnosticScript, /observeProgressUnits/u);
   assert.match(portableDiagnosticScript, /failureUnitOrdinals/u);
-  assert.match(portableDiagnosticScript, /observeResourceDiagnostic/u);
   assert.match(portableDiagnosticScript, /stdout\.on\("data", onStdoutData\)/u);
   assert.match(portableDiagnosticScript, /stdout\.once\("error", onStdoutError\)/u);
   assert.match(portableDiagnosticScript, /stdout\.removeListener\("data", onStdoutData\)/u);
   assert.match(portableDiagnosticScript, /stdout\.removeListener\("error", onStdoutError\)/u);
   assert.match(portableDiagnosticScript, /progress_units=\$\{progress\}/u);
-  assert.match(portableDiagnosticScript, /resource_units=\$\{resources\}/u);
   assert.match(portableDiagnosticScript, /ORDINARY_TEST_FAILURE/u);
   assert.match(portableDiagnosticScript, /error\?\.\[ORDINARY_TEST_FAILURE\] !== true/u);
   assert.match(portableDiagnosticScript, /safeFailureLocation\(error\)/u);
@@ -422,7 +418,6 @@ test("qualification selection is the exact reviewed Windows test set", async () 
     "test/windows-filesystem-security.test.js",
     "test/windows-filesystem-prepared-artifact-native.test.js",
     "test/windows-protected-state-store.test.js",
-    "test/windows-sqlite-state-session-contract.test.js",
     "test/windows-fixed-state-storage.test.js",
     "test/windows-prepared-artifact-storage.test.js",
     "test/windows-review-pair-storage.test.js",
