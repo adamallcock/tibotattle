@@ -19,7 +19,66 @@ production signing, a public artifact, a GitHub release, an appcast change, a
 Homebrew update, a service deployment, replacement of the native macOS client,
 or a Linux-support claim.
 
-## Progress checkpoint: 2026-08-21
+## Latest bounded outcome: 2026-08-21
+
+This checkpoint supersedes the earlier 2026-08-21 diagnostic log below.
+
+- The integration branch is based directly on `origin/main` at
+  `49965f401131f938b188f6067164ff0ade6a56ff`, the source used for version
+  `0.1.15`. PR #49 is intentionally outside this work.
+- The local portable lane passes 1,222 tests: 1,179 passed, 43 expected
+  platform skips, and zero failures. Exact Windows run `32472143661` passed the
+  native build, binding manifest, environment record, bounded filesystem
+  security diagnostic, bounded per-file diagnostic, and authoritative portable
+  lane in both warm and clean jobs.
+- The credential-audit native failure is repaired. The remaining exact native
+  qualification failures are identical in warm and clean jobs: prepared
+  directory creation at test indexes 108 and 110, and SQLite sidecar/session
+  lifecycle at index 221. Consequently, Electron packaging and runtime smoke
+  correctly did not start.
+- Reapplying the owner-only DACL through the live prepared-directory handle is
+  retained as a fail-closed hardening step, but it did not resolve the prepared
+  failure. The current content-free harness cannot yet distinguish child
+  create/access failure from prepared-ancestor identity/path validation.
+- The SQLite experiment proved a two-phase Windows semantic boundary. Ordinary
+  exclusive delete-on-close placeholders allow SQLite to start but a WAL name
+  can remain observable after release. Explicitly marking those placeholders
+  delete-pending before exposing the lease prevents SQLite from starting. The
+  unsuccessful early-delete commits are reverted; `sqliteStateLeaseSafe`
+  remains false.
+- `productionSafe`, `preparedArtifactSafe`, and `sqliteStateLeaseSafe` remain
+  false. No version bump, release, signing, installer publication, production
+  selector, Windows-support claim, Linux-support claim, or native macOS client
+  change occurred.
+
+### Exit-bounded next steps
+
+1. Add a fixed, content-free prepared-directory stage/error vocabulary covering
+   root open, child open/create, DACL update, child validation, ancestor
+   validation, and final validation. Run it once in warm and clean mode. If it
+   proves child-create access denial, add only `FILE_ADD_SUBDIRECTORY` to the
+   retained parent handle; otherwise repair the exact reported lifecycle or
+   normalization boundary. Exit when prepared tests 1 and 3 pass in both modes,
+   or record the single reported native stage as the concrete blocker.
+2. Replace the undifferentiated SQLite handle vector with explicit sidecar
+   reservation handles. Keep placeholders ordinary and exclusive while SQLite
+   is live; after JavaScript closes SQLite, native release must mark each
+   sidecar delete-pending, close it, verify bounded absence, and fail closed in
+   a retryable fixed state when cleanup cannot be proven. Preserve crash/
+   abandoned-mutex recovery and delete-on-close fallback. Exit only when normal
+   close, contention, transaction recovery, crash/reopen, injected release
+   failure, and bounded WAL/SHM absence pass on native Windows.
+3. Rerun the unchanged exact native qualification set. Only after warm and
+   clean both pass may the workflow continue to the existing unsigned Windows
+   x64 Electron directory build, artifact verification, real runtime smoke,
+   content-free receipt, and retained development artifact.
+4. After that development artifact is accepted, add the separate unsigned NSIS
+   installer, upgrade/rollback, uninstall/data-retention, and signing/
+   provenance gates. Linux installed-app work remains next; the already-proven
+   macOS Electron and Debian/Xvfb shared-shell development paths do not replace
+   native Windows evidence.
+
+## Historical diagnostic log: 2026-08-21
 
 - The integration branch has been rebased on `origin/main` at
   `49965f401131f938b188f6067164ff0ade6a56ff` (version `0.1.15`). The native
