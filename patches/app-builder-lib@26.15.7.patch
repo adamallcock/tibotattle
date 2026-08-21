@@ -1,0 +1,13 @@
+diff --git a/out/codeSign/windowsSignAzureManager.js b/out/codeSign/windowsSignAzureManager.js
+index 988ab7fd60c48aeae08884de09de94d120fe6bef..ff08697fdde4af01110e988daa959092d6e6839b 100644
+--- a/out/codeSign/windowsSignAzureManager.js
++++ b/out/codeSign/windowsSignAzureManager.js
+@@ -35,7 +35,7 @@ class WindowsSignAzureManager {
+             // Logging to debug just in case users run into this. If NuGet isn't present, Install-Module -Name TrustedSigning will fail, so we'll get the logs at that point
+             builder_util_1.log.debug({ message: error.message || error.stack }, "unable to install PackageProvider Nuget. Might be a false alarm though as some systems already have it installed");
+         }
+-        await vm.exec(ps, ["-NoProfile", "-NonInteractive", "-Command", "Install-Module -Name TrustedSigning -MinimumVersion 0.5.0 -Force -Repository PSGallery -Scope CurrentUser"]);
++        await vm.exec(ps, ["-NoProfile", "-NonInteractive", "-Command", "Install-Module -Name TrustedSigning -RequiredVersion 0.5.0 -Force -Repository PSGallery -Scope CurrentUser"]);
+         // If signing has been misconfigured it, the error from the TrustedSigning module should be descriptive enough to help them fix their configuration.
+         // Options: https://learn.microsoft.com/en-us/dotnet/api/azure.identity.environmentcredential?view=azure-dotnet#definition
+     }

@@ -4,6 +4,9 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  app-builder-lib@26.15.7: a35e50243977188b68d40fb2a3c0b2705d193071d704267972f3ed5126fbc3d3
+
 importers:
 
   .:
@@ -1366,7 +1369,7 @@ snapshots:
     dependencies:
       color-convert: 2.0.1
 
-  app-builder-lib@26.15.7(dmg-builder@26.15.7)(electron-builder-squirrel-windows@26.15.7):
+  app-builder-lib@26.15.7(patch_hash=a35e50243977188b68d40fb2a3c0b2705d193071d704267972f3ed5126fbc3d3)(dmg-builder@26.15.7)(electron-builder-squirrel-windows@26.15.7):
     dependencies:
       '@electron/asar': 3.4.1
       '@electron/fuses': 1.8.0
@@ -1601,7 +1604,7 @@ snapshots:
 
   dmg-builder@26.15.7(electron-builder-squirrel-windows@26.15.7):
     dependencies:
-      app-builder-lib: 26.15.7(dmg-builder@26.15.7)(electron-builder-squirrel-windows@26.15.7)
+      app-builder-lib: 26.15.7(patch_hash=a35e50243977188b68d40fb2a3c0b2705d193071d704267972f3ed5126fbc3d3)(dmg-builder@26.15.7)(electron-builder-squirrel-windows@26.15.7)
       builder-util: 26.15.3
       fs-extra: 10.1.0
       js-yaml: 4.3.1
@@ -1631,7 +1634,7 @@ snapshots:
 
   electron-builder-squirrel-windows@26.15.7(dmg-builder@26.15.7):
     dependencies:
-      app-builder-lib: 26.15.7(dmg-builder@26.15.7)(electron-builder-squirrel-windows@26.15.7)
+      app-builder-lib: 26.15.7(patch_hash=a35e50243977188b68d40fb2a3c0b2705d193071d704267972f3ed5126fbc3d3)(dmg-builder@26.15.7)(electron-builder-squirrel-windows@26.15.7)
       builder-util: 26.15.3
       electron-winstaller: 5.4.0
     transitivePeerDependencies:
@@ -1640,7 +1643,7 @@ snapshots:
 
   electron-builder@26.15.7(electron-builder-squirrel-windows@26.15.7):
     dependencies:
-      app-builder-lib: 26.15.7(dmg-builder@26.15.7)(electron-builder-squirrel-windows@26.15.7)
+      app-builder-lib: 26.15.7(patch_hash=a35e50243977188b68d40fb2a3c0b2705d193071d704267972f3ed5126fbc3d3)(dmg-builder@26.15.7)(electron-builder-squirrel-windows@26.15.7)
       builder-util: 26.15.3
       builder-util-runtime: 9.7.0
       chalk: 4.1.2
