@@ -22,6 +22,7 @@ export const PORTABLE_TEST_GROUPS = Object.freeze({
     "test/valid-abort-signal.test.js",
     "test/windows-installer-contract.test.js",
     "test/windows-production-authority-manifest.test.js",
+    "test/windows-production-finalizer-authority.test.js",
   ]),
   accountingAndAnalysis: Object.freeze([
     "test/activity-markers.test.js",
