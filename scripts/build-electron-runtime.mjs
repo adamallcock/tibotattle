@@ -76,6 +76,7 @@ export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
   "apps/electron/preload.js",
   "apps/electron/ready-line.js",
   "apps/electron/windows-qualification.js",
+  "src/platform/windows-credential-manager-probe.js",
 ]);
 // Existing outputs are authenticated against their own complete manifest and
 // payload before replacement. Keep this stable identity subset separate from
