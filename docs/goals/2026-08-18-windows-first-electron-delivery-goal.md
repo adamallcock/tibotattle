@@ -628,6 +628,10 @@ installer, create a release, or update a feed without separate authorization.
 - Reuse the proven shell/core boundary without weakening Windows or macOS
   contracts.
 
+See the [Linux Electron readiness and support plan](./2026-08-21-linux-electron-readiness-goal.md)
+for the declared distro matrix, staged implementation order, executable
+environment commands, evidence boundaries, and non-looping exit criteria.
+
 ### Exit criteria
 
 - Linux work has an ordered implementation plan, explicit distro/support

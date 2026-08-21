@@ -1,6 +1,12 @@
 # syntax=docker/dockerfile:1.7
 
-FROM node:26.2.0-bookworm-slim@sha256:e89172f5e6154ba212269866bf3fbadbca8eb7901e10c0eccf08f2147bfae505
+# This exact arm64 child digest from the reviewed Node 26.2.0 Bookworm OCI
+# index is the Apple-Silicon/Colima development lane. Native x86_64 evidence
+# requires its own reviewed image pin; local QEMU execution is not evidence.
+# Debian package indexes and the exact-version npm/Electron downloads below
+# remain mutable online build inputs. This is a bounded development smoke
+# environment, not a reproducible production artifact.
+FROM node:26.2.0-bookworm-slim@sha256:445b8cda0ec3563106c5a62b4663b3831314ecc81d2645a774b308f203f25cf0
 
 ENV CI=1 \
     ELECTRON_DISABLE_SANDBOX=0 \
@@ -47,11 +53,12 @@ RUN apt-get update \
   && npm install --global pnpm@11.9.0 \
   && pnpm --version
 
-# Copy lock/manifests first so the dependency layer is stable. The paired
+# Copy lock/manifests first so the dependency layer is cacheable. The paired
 # Dockerfile.dockerignore excludes the checkout's .git, node_modules, release
 # output, reports, and unrelated applications from the build context.
 COPY --chown=node:node package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY --chown=node:node packages ./packages
+COPY --chown=node:node patches ./patches
 RUN pnpm install --frozen-lockfile
 # `allowBuilds` intentionally blocks Electron's package install hook in the
 # repository. Fetch the exact locked Linux Electron artifact during the image
