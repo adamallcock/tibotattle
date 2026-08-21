@@ -10,12 +10,16 @@ import test from "node:test";
 
 import {
   FIXED_STATUS,
+  WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST,
+  WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST,
   WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST,
   WINDOWS_SECURITY_QUALIFICATION_TEST_FILES,
   WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST,
   extractTapPublishErrors,
   extractTapPublishStages,
   extractTapNativeErrors,
+  extractTapPreparedErrors,
+  extractTapPreparedStages,
   extractTapTestIndex,
   extractTapTestIndexes,
   extractTapTestLocations,
@@ -114,6 +118,8 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(diagnosticStep, /test_locations=\$\{testLocations\.length/u);
   assert.match(diagnosticStep, /WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST/u);
   assert.match(diagnosticStep, /WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST/u);
+  assert.match(diagnosticStep, /WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST/u);
+  assert.match(diagnosticStep, /WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST/u);
   assert.match(diagnosticStep, /publishStages\.length <= 64/u);
   assert.match(
     diagnosticStep,
@@ -128,6 +134,20 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   );
   assert.match(diagnosticStep, /publish_errors=\$\{publishErrors\.length/u);
   assert.match(diagnosticStep, /publishErrors\.join\(","\)/u);
+  assert.match(diagnosticStep, /preparedStages\.length <= 64/u);
+  assert.match(
+    diagnosticStep,
+    /preparedStages\.every\(\(value\) => WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST\.includes\(value\)\)/u,
+  );
+  assert.match(diagnosticStep, /prepared_stages=\$\{preparedStages\.length/u);
+  assert.match(diagnosticStep, /preparedStages\.join\(","\)/u);
+  assert.match(diagnosticStep, /preparedErrors\.length <= 64/u);
+  assert.match(
+    diagnosticStep,
+    /preparedErrors\.every\(\(value\) => WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST\.includes\(value\)\)/u,
+  );
+  assert.match(diagnosticStep, /prepared_errors=\$\{preparedErrors\.length/u);
+  assert.match(diagnosticStep, /preparedErrors\.join\(","\)/u);
   assert.match(diagnosticStep, /Array\.isArray\(error\?\.testIndexes\)/u);
   assert.match(diagnosticStep, /Array\.isArray\(error\?\.testLocations\)/u);
   assert.match(diagnosticStep, /testIndexes\.length <= 64/u);
@@ -751,6 +771,145 @@ test("qualification native errors are fixed, allowlisted, and content-free", () 
   assert.match(
     formatWindowsSecurityQualificationFailure(failure),
     /native_errors=unavailable$/u,
+  );
+});
+
+test("prepared-directory diagnostics use the exact frozen stage allowlist", () => {
+  assert.deepEqual(WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST, [
+    "prepared_root_open",
+    "prepared_root_validation",
+    "prepared_child_open",
+    "prepared_child_create",
+    "prepared_dacl_update",
+    "prepared_child_validation",
+    "prepared_ancestor_validation",
+    "prepared_final_validation",
+  ]);
+  assert.equal(Object.isFrozen(WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST), true);
+  assert.equal(
+    new Set(WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST).size,
+    WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST.length,
+  );
+});
+
+test("prepared-directory diagnostics use the exact frozen native-code allowlist", () => {
+  assert.deepEqual(WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST, [
+    "WINDOWS_FILESYSTEM_INVALID_CONFIGURATION",
+    "WINDOWS_FILESYSTEM_INVALID_PATH",
+    "WINDOWS_FILESYSTEM_NOT_FOUND",
+    "WINDOWS_FILESYSTEM_ALREADY_EXISTS",
+    "WINDOWS_FILESYSTEM_ACCESS_DENIED",
+    "WINDOWS_FILESYSTEM_REPARSE_POINT",
+    "WINDOWS_FILESYSTEM_SECURITY_POLICY",
+    "WINDOWS_FILESYSTEM_NOT_DIRECTORY",
+    "WINDOWS_FILESYSTEM_IDENTITY_MISMATCH",
+    "WINDOWS_FILESYSTEM_OPERATION_FAILED",
+  ]);
+  assert.equal(Object.isFrozen(WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST), true);
+  assert.equal(
+    new Set(WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST).size,
+    WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST.length,
+  );
+});
+
+test("prepared-directory diagnostic parsers are TAP-only, fixed, deduplicated, bounded, and frozen", () => {
+  const output = [
+    "windowsFilesystemStage: prepared_child_create",
+    "# windowsFilesystemStage: prepared_child_create",
+    "# windowsFilesystemStage: 'prepared_final_validation'",
+    "# windowsFilesystemStage: prepared_ancestor_validation",
+    "# windowsFilesystemStage: prepared_unknown secret=do-not-return",
+    "# windowsFilesystemStage: prepared_child_open secret=do-not-return",
+    "# otherProperty: prepared_child_open",
+    "# windowsFilesystemError: WINDOWS_FILESYSTEM_ACCESS_DENIED",
+    "# windowsFilesystemError: 'WINDOWS_FILESYSTEM_OPERATION_FAILED'",
+    "# windowsFilesystemError: WINDOWS_FILESYSTEM_ACCESS_DENIED",
+    "# windowsFilesystemError: WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_SIDECAR_PRESENT",
+    "# windowsFilesystemError: WINDOWS_FILESYSTEM_NOT_ALLOWLISTED",
+    "# windowsFilesystemError: WINDOWS_FILESYSTEM_SECURITY_POLICY secret=do-not-return",
+  ].join("\n");
+  assert.deepEqual(extractTapPreparedStages(output), [
+    "prepared_child_create",
+    "prepared_final_validation",
+    "prepared_ancestor_validation",
+  ]);
+  assert.deepEqual(extractTapPreparedErrors(output), [
+    "WINDOWS_FILESYSTEM_ACCESS_DENIED",
+    "WINDOWS_FILESYSTEM_OPERATION_FAILED",
+  ]);
+  assert.equal(Object.isFrozen(extractTapPreparedStages(output)), true);
+  assert.equal(Object.isFrozen(extractTapPreparedErrors(output)), true);
+  assert.doesNotMatch(
+    JSON.stringify({ stages: extractTapPreparedStages(output), errors: extractTapPreparedErrors(output) }),
+    /secret|unknown|allowlisted|otherProperty|sidecar/iu,
+  );
+  const repeatedStages = extractTapPreparedStages(
+    Array.from(
+      { length: 128 },
+      (_, index) => `# windowsFilesystemStage: ${WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST[index % 8]}`,
+    ).join("\n"),
+  );
+  assert.deepEqual(repeatedStages, WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST);
+  assert.equal(repeatedStages.length <= 64, true);
+  const repeatedErrors = extractTapPreparedErrors(
+    Array.from(
+      { length: 128 },
+      (_, index) => `# windowsFilesystemError: ${WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST[index % 10]}`,
+    ).join("\n"),
+  );
+  assert.deepEqual(repeatedErrors, WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST);
+  assert.equal(repeatedErrors.length <= 64, true);
+});
+
+test("prepared-directory metadata remains fixed and content-free in qualification failures", async () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.exitCode = null;
+  child.signalCode = null;
+  child.pid = 4246;
+  child.kill = () => true;
+  const run = runNodeTests(["synthetic.test.js"], {
+    cwd: REPOSITORY_ROOT,
+    timeoutMs: 1_000,
+    spawnProcess: () => child,
+    terminateProcessTree: async () => true,
+  });
+  child.stdout.write([
+    "TAP version 13",
+    "not ok 11 - private prepared failure",
+    "# windowsFilesystemStage: prepared_child_create",
+    "# windowsFilesystemStage: prepared_final_validation",
+    "# windowsFilesystemError: WINDOWS_FILESYSTEM_ACCESS_DENIED",
+    "# windowsFilesystemError: WINDOWS_FILESYSTEM_OPERATION_FAILED",
+    "# windowsFilesystemStage: prepared_private secret=hide",
+  ].join("\n"));
+  child.emit("close", 1);
+  await assert.rejects(
+    run,
+    (error) => {
+      assert.deepEqual(error.preparedStages, [
+        "prepared_child_create",
+        "prepared_final_validation",
+      ]);
+      assert.deepEqual(error.preparedErrors, [
+        "WINDOWS_FILESYSTEM_ACCESS_DENIED",
+        "WINDOWS_FILESYSTEM_OPERATION_FAILED",
+      ]);
+      assert.equal(error.preparedStage, "prepared_child_create");
+      assert.equal(error.preparedError, "WINDOWS_FILESYSTEM_ACCESS_DENIED");
+      assert.equal(Object.isFrozen(error.preparedStages), true);
+      assert.equal(Object.isFrozen(error.preparedErrors), true);
+      assert.match(
+        formatWindowsSecurityQualificationFailure(error),
+        /prepared_stages=prepared_child_create,prepared_final_validation prepared_errors=WINDOWS_FILESYSTEM_ACCESS_DENIED,WINDOWS_FILESYSTEM_OPERATION_FAILED$/u,
+      );
+      assert.doesNotMatch(
+        formatWindowsSecurityQualificationFailure(error),
+        /private|secret|hide/iu,
+      );
+      return true;
+    },
   );
 });
 
