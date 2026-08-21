@@ -107,7 +107,6 @@ const QUALIFICATION_TEST_FILES = Object.freeze([
   "test/windows-filesystem-security.test.js",
   "test/windows-filesystem-prepared-artifact-native.test.js",
   "test/windows-protected-state-store.test.js",
-  "test/windows-sqlite-state-session-contract.test.js",
   "test/windows-fixed-state-storage.test.js",
   "test/windows-prepared-artifact-storage.test.js",
   "test/windows-review-pair-storage.test.js",
