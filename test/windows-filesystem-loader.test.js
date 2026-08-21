@@ -546,6 +546,11 @@ test("adapter validates native identities and keeps operation errors fixed", () 
         error.code = "WINDOWS_FILESYSTEM_NOT_FOUND";
         throw error;
       },
+      inspectProtectedChild() {
+        const error = new Error("path must not appear");
+        error.code = "WINDOWS_FILESYSTEM_NOT_FOUND";
+        throw error;
+      },
     }),
   });
   assert.throws(() => missing.readFile("C:\\private\\secret"), (error) => {
@@ -553,6 +558,14 @@ test("adapter validates native identities and keeps operation errors fixed", () 
     assert.equal(error.message.includes("private"), false);
     return true;
   });
+  assert.throws(
+    () => missing.inspectProtectedChild("C:\\private", IDENTITY, "secret"),
+    (error) => {
+      assert.equal(error.code, "ENOENT");
+      assert.equal(error.message.includes("private"), false);
+      return true;
+    },
+  );
   assert.equal(isWindowsFilesystemNotFound({ code: "ENOENT" }), true);
   assert.equal(isWindowsFilesystemAlreadyExists({ code: "EEXIST" }), true);
 });
