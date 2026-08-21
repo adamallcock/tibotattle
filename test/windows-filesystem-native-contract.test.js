@@ -385,3 +385,73 @@ test("SQLite publication diagnostics use the fixed ordered phase vocabulary", as
     assert.match(prefix, /failure\.stage = "publish_[a-z_]+";\s*$/u);
   }
 });
+
+test("SQLite staging grants existing-stage write access only to publication", async () => {
+  const source = await readFile(
+    resolve(REPOSITORY_ROOT, "native/windows-filesystem/windows-filesystem.cc"),
+    "utf8",
+  );
+  const stagingStart = source.indexOf("bool OpenSqliteStagingChild(");
+  const createStart = source.indexOf("napi_value CreateSqliteDatabaseCallback(", stagingStart);
+  const cloneStart = source.indexOf("napi_value CloneSqliteDatabaseCallback(", createStart);
+  const publishStart = source.indexOf("napi_value PublishSqliteDatabaseCallback(", cloneStart);
+  const publishEnd = source.indexOf("napi_value DeleteProtectedChildCallback(", publishStart);
+  assert.ok(
+    stagingStart >= 0
+      && createStart > stagingStart
+      && cloneStart > createStart
+      && publishStart > cloneStart
+      && publishEnd > publishStart,
+  );
+  const stagingBody = source.slice(stagingStart, createStart);
+  const createBody = source.slice(createStart, cloneStart);
+  const cloneBody = source.slice(cloneStart, publishStart);
+  const publishBody = source.slice(publishStart, publishEnd);
+
+  assert.match(stagingBody, /bool existingWriteAccess,/u);
+  assert.match(
+    stagingBody,
+    /options\.access = GENERIC_READ \| DELETE \| READ_CONTROL \| FILE_READ_ATTRIBUTES \| SYNCHRONIZE;/u,
+  );
+  const existingWriteAccessMatch = stagingBody.match(
+    /if \(createNew \|\| existingWriteAccess\) \{([\s\S]*?)\}/u,
+  );
+  assert.ok(existingWriteAccessMatch);
+  assert.match(existingWriteAccessMatch[1], /GENERIC_WRITE/u);
+  assert.doesNotMatch(existingWriteAccessMatch[1], /WRITE_DAC/u);
+  assert.match(
+    stagingBody,
+    /if \(createNew\) \{\s*options\.access \|= WRITE_DAC;\s*\}/u,
+  );
+  assert.match(
+    createBody,
+    /OpenSqliteStagingChild\([\s\S]*?databaseName,\s*true,\s*false,\s*&opened/u,
+  );
+  assert.match(
+    cloneBody,
+    /OpenSqliteStagingChild\([\s\S]*?sourceName,\s*false,\s*false,\s*&source/u,
+  );
+  assert.match(
+    cloneBody,
+    /OpenSqliteStagingChild\([\s\S]*?stageName,\s*true,\s*false,\s*&stage/u,
+  );
+  assert.match(
+    publishBody,
+    /OpenSqliteStagingChild\([\s\S]*?stageName,\s*false,\s*true,\s*&stage/u,
+  );
+  assert.doesNotMatch(
+    cloneBody,
+    /OpenSqliteStagingChild\([\s\S]*?stageName,\s*false,\s*true,\s*&stage/u,
+  );
+
+  const flushStart = publishBody.indexOf("if (!FlushFileBuffers(stage.final))");
+  const flushEnd = publishBody.indexOf("return ThrowFailure(env, failure);", flushStart);
+  assert.ok(flushStart >= 0 && flushEnd > flushStart);
+  assert.match(
+    publishBody.slice(flushStart, flushEnd),
+    /failure = FromLastError\(\);\s*failure\.stage = "publish_stage_preflight";/u,
+  );
+  assert.match(source, /napi_get_boolean\(env, false, &sqliteStateLeaseSafe\)/u);
+  assert.match(source, /napi_get_boolean\(env, false, &sqliteStateStagingSafe\)/u);
+  assert.doesNotMatch(publishBody, /sqliteState(?:Lease|Staging)Safe/u);
+});
