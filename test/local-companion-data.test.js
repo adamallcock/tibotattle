@@ -2502,6 +2502,78 @@ test("a non-authoritative build keeps the allowance capacity the chart selects b
   assert.equal(genuine.getOverview().timeline.allowanceCapacity.status, "unavailable");
 });
 
+test("a mismatch window keeps the cost figures while the truth fields stay current", async () => {
+  // The Usage-and-costs page renders overview.accounting directly. Confirmed
+  // live on dogfood 1021 (2026-08-21): during each mismatch window the page
+  // zeroed — $0.00, 0 tokens, "No model usage in this period" — then refilled
+  // at $4,982.79 / 12.6B tokens the moment authority returned. The accounting
+  // node was the last unretained surface of the class.
+  //
+  // It cannot use the generic swap: the same object carries generationMatched
+  // and the cache status. Retaining those would republish yesterday's
+  // "matched: true" over a live mismatch — the app lying about its own state.
+  const accountingFor = ({ matched, zeroed }) => ({
+    sourceMode: "unified",
+    generationMatched: matched,
+    accountingCacheStatus: matched ? "available" : "unavailable",
+    generationFingerprint: matched ? "generation-v2-current" : "generation-v2-next",
+    events: zeroed ? 0 : 95636,
+    totalTokens: zeroed ? 0 : 12596645828,
+    apiPriceEquivalentUsd: zeroed ? 0 : 4982.785667,
+    byModel: zeroed ? [] : [{ model: "gpt-5.4", events: 90000 }],
+    periods: zeroed
+      ? [{ periodId: "7d", events: 0 }]
+      : [{ periodId: "7d", events: 95636 }],
+  });
+  const snapshot = (shape) => ({
+    schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+    mode: "real_local_evidence",
+    generatedAt: "2026-08-21T15:50:00.000Z",
+    overview: {
+      accounting: accountingFor(shape),
+      usage: [{ id: "7d", label: "Last 7 days", events: shape.zeroed ? 0 : 12 }],
+      timeline: { usage: [{ at: 1 }] },
+    },
+    gradient: { datasets: { rolling: [{ at: 1 }] } },
+    weekly: { datasets: { weekly_values: [{ sequence: 1 }] } },
+    quality: {},
+    reports: [],
+  });
+  const storeWith = (sequence) => {
+    let call = 0;
+    return new LocalCompanionDataStore({
+      builder: async () => snapshot(sequence[Math.min(call++, sequence.length - 1)]),
+    });
+  };
+
+  // The captured incident: figures retained, truth fields current.
+  const window = storeWith([
+    { matched: true, zeroed: false },
+    { matched: false, zeroed: true },
+  ]);
+  await window.reload({ purpose: "full" });
+  await window.reload({ purpose: "full" });
+  const held = window.getOverview().accounting;
+  assert.equal(held.events, 95636, "cost figures must survive the mismatch window");
+  assert.equal(held.apiPriceEquivalentUsd, 4982.785667);
+  assert.equal(held.byModel.length, 1);
+  // The truth fields must NOT be retained: the window is real and stays
+  // visible, which is what keeps the staleness labeled.
+  assert.equal(held.generationMatched, false);
+  assert.equal(held.accountingCacheStatus, "unavailable");
+  assert.equal(held.generationFingerprint, "generation-v2-next");
+
+  // An authoritative zero is a true state and lands.
+  const wiped = storeWith([
+    { matched: true, zeroed: false },
+    { matched: true, zeroed: true },
+  ]);
+  await wiped.reload({ purpose: "full" });
+  await wiped.reload({ purpose: "full" });
+  assert.equal(wiped.getOverview().accounting.events, 0,
+    "an authoritative empty accounting must land");
+});
+
 test("every surface a withheld projection empties is registered for retention", async () => {
   // The completeness gate for this defect class. `unifiedAccountingWithheld`
   // is the single condition under which the builder substitutes evidence-free

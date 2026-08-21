@@ -3385,6 +3385,46 @@ function availableStatusRows(surface) {
   return surface?.status === "available" ? 1 : 0;
 }
 
+// The accounting node's truth fields: state the CURRENT build must always
+// report about itself, never carried forward with retained figures. Everything
+// not named here is evidence — the priced periods, totals, and breakdowns the
+// Usage-and-costs page renders — and may be retained through a
+// non-authoritative window under the standard gate.
+const ACCOUNTING_TRUTH_FIELDS = Object.freeze([
+  "sourceMode",
+  "readerVersion",
+  "compatibilityBehavior",
+  "sourceCoverageStatus",
+  "generation",
+  "generationFingerprint",
+  "generationMatched",
+  "fallbackCount",
+  "diagnosticsAvailable",
+  "sourceCapabilities",
+  "accountingSource",
+  "accountingCacheStatus",
+  "staleServe",
+  "replayExclusionDiagnostics",
+]);
+
+// Evidence carried by the accounting node: priced events across the period
+// set plus the per-model breakdown. A non-authoritative build zeroes all of
+// it; an authoritative build with a genuinely empty history also reads 0 and
+// LANDS, because the full-authoritative path never reaches retention.
+function accountingEvidenceRows(accounting) {
+  let rows = 0;
+  const events = accounting?.events;
+  if (typeof events === "number" && Number.isFinite(events)) rows += events;
+  if (Array.isArray(accounting?.byModel)) rows += accounting.byModel.length;
+  if (Array.isArray(accounting?.periods)) {
+    for (const period of accounting.periods) {
+      const value = period?.events;
+      if (typeof value === "number" && Number.isFinite(value)) rows += value;
+    }
+  }
+  return rows;
+}
+
 // Every surface a deferred projection cannot rebuild, as a path into the
 // published snapshot. Registered centrally so the retention and the guard test
 // read the same list: test/local-companion-data.test.js drives the real builder
@@ -3529,7 +3569,35 @@ export class LocalCompanionDataStore {
         nextParent[key] = structuredClone(retainedParent[key]);
       }
     }
+    this.#retainAccountingEvidence(next, retained);
     return next;
+  }
+
+  // The cost-accounting node is the last surface of this class, and it cannot
+  // use the generic path swap: it carries the snapshot's TRUTH FIELDS —
+  // generationMatched, the cache status, the generation fingerprint — in the
+  // same object as the figures. Swapping it wholesale would republish
+  // yesterday's "matched: true" over a live mismatch, making the app lie about
+  // its own state (and blinding the very authority signal this method gates
+  // on). So the evidence fields are retained and the truth fields always come
+  // from the incoming build: the Usage-and-costs page keeps its figures
+  // through a mismatch window while the banners honestly say the history is
+  // recalculating — the owner's stale-with-label pattern, applied end to end.
+  #retainAccountingEvidence(next, retained) {
+    const incoming = next?.overview?.accounting;
+    const previous = retained?.overview?.accounting;
+    if (!incoming || typeof incoming !== "object") return;
+    if (!previous || typeof previous !== "object") return;
+    if (accountingEvidenceRows(incoming) > 0) return;
+    if (accountingEvidenceRows(previous) === 0) return;
+    const truth = {};
+    for (const field of ACCOUNTING_TRUTH_FIELDS) {
+      if (Object.hasOwn(incoming, field)) truth[field] = incoming[field];
+    }
+    next.overview.accounting = {
+      ...structuredClone(previous),
+      ...truth,
+    };
   }
 
   #required() {
