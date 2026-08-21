@@ -98,7 +98,7 @@ function awaitWithin(promise, timeoutMs, timeoutCode) {
 function startSqliteLeaseChild({ bindingPath, root, rootIdentity, databaseName }) {
   const child = spawn(process.execPath, [
     SQLITE_LEASE_CHILD_FIXTURE,
-    "hold",
+    "lease",
     bindingPath,
     root,
     JSON.stringify(rootIdentity),
@@ -783,7 +783,6 @@ test("native SQLite state lease rejects caller sidecars and non-canonical names"
     "state.sqlite-shm",
     "nested\\state.sqlite",
     "nested/state.sqlite",
-    "..",
   ]) {
     assert.throws(
       () => adapter.acquireSqliteStateLease(root, rootIdentity, name),
@@ -791,6 +790,11 @@ test("native SQLite state lease rejects caller sidecars and non-canonical names"
       name,
     );
   }
+  assert.throws(
+    () => adapter.acquireSqliteStateLease(root, rootIdentity, ".."),
+    fixedNativeError("WINDOWS_FILESYSTEM_INVALID_PATH"),
+    "..",
+  );
 }));
 
 test("native SQLite state lease rejects aliases and serializes duplicate leases", {
@@ -1393,7 +1397,7 @@ test("qualification hook fails closed for a final-target rename during replaceme
   );
 }));
 
-test("qualification hook blocks hard-link creation during replacement", {
+test("qualification hook handles hard-link creation during replacement", {
   skip: NATIVE_SKIP,
 }, () => withPausedReplacement(async ({
   binding,
@@ -1407,23 +1411,59 @@ test("qualification hook blocks hard-link creation during replacement", {
   attackerPromises,
 }) => {
   const alias = join(ancestor, "state-hard-link-alias.bin");
-  await assertBoundedFilesystemRejection(
+  const attackerSucceeded = await attemptBoundedFilesystemMutation(
     () => link(path, alias),
     attackerPromises,
   );
+  if (!attackerSucceeded) {
+    // The replacement is still paused: prove that a blocked attacker left the
+    // original path untouched before allowing the worker to continue.
+    await assertOriginalReplacementPaths({
+      path,
+      ancestor,
+      movedAncestor,
+      alias,
+      originalBytes,
+    });
+    release();
+    const result = await operation.result;
+    assert.deepEqual(result, { status: "ok" });
+    assert.deepEqual(binding.readFile(path).data, replacementBytes);
+    await assert.rejects(
+      lstat(alias),
+      (error) => error?.code === "ENOENT",
+    );
+    return;
+  }
+
+  // A permitted hard link must not be able to turn into a successful
+  // replacement. Check both names while the replacement remains paused.
   await assertOriginalReplacementPaths({
     path,
     ancestor,
     movedAncestor,
-    alias,
     originalBytes,
   });
+  assert.deepEqual(await readFile(alias), originalBytes);
   release();
   const result = await operation.result;
-  assert.deepEqual(result, { status: "ok" });
-  assert.deepEqual(binding.readFile(path).data, replacementBytes);
-  await assert.rejects(
-    lstat(alias),
-    (error) => error?.code === "ENOENT",
-  );
+  assert.deepEqual(result, {
+    status: "error",
+    code: "WINDOWS_FILESYSTEM_HARD_LINK",
+  });
+  await assertOriginalReplacementPaths({
+    path,
+    ancestor,
+    movedAncestor,
+    originalBytes,
+  });
+  const aliasStat = await lstat(alias);
+  assert.equal(aliasStat.isFile(), true);
+  assert.equal(aliasStat.isSymbolicLink(), false);
+  assert.equal(aliasStat.size, originalBytes.byteLength);
+  // The native read primitive deliberately rejects hard-linked files. Use
+  // ordinary Node reads for this fail-closed branch to prove both names kept
+  // the original bytes and never received the replacement.
+  assert.deepEqual(await readFile(path), originalBytes);
+  assert.deepEqual(await readFile(alias), originalBytes);
 }));

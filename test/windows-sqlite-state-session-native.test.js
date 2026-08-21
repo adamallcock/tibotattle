@@ -24,6 +24,7 @@ const QUALIFICATION_BINDING_ENVIRONMENT =
   "TIBOTATTLE_WINDOWS_QUALIFICATION_BINDING_PATH";
 const QUALIFICATION_BINDING_FILE = "windows_filesystem_qualification.node";
 const DATABASE_NAME = "sqlite-state-session-native.sqlite";
+const SAME_PROCESS_DATABASE_NAME = "sqlite-state-session-native-same-process.sqlite";
 const TABLE_NAME = "sqlite_state_fixture";
 const SIDECAR_BLOCKED_CODES = new Set(["EACCES", "EBUSY", "EEXIST", "EPERM"]);
 
@@ -253,17 +254,25 @@ test("native Windows SQLite session qualifies durable recovery and lease content
   const sameProcessLease = adapter.acquireSqliteStateLease(
     root,
     rootIdentity,
-    DATABASE_NAME,
+    SAME_PROCESS_DATABASE_NAME,
   );
   try {
     assert.throws(
-      () => adapter.acquireSqliteStateLease(root, rootIdentity, DATABASE_NAME),
+      () => adapter.acquireSqliteStateLease(
+        root,
+        rootIdentity,
+        SAME_PROCESS_DATABASE_NAME,
+      ),
       nativeFailure("WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_CONTENDED"),
     );
   } finally {
     adapter.releaseSqliteStateLease(sameProcessLease);
   }
 
+  // Keep the cross-process child on the untouched database name.  Its lease
+  // must create and then open the DB/journal from a genuinely fresh root;
+  // using the same name for the preceding same-process check would
+  // pre-materialize those files and mask fresh-file handle sharing.
   const holdingChild = startChild({
     mode: "hold",
     bindingPath,

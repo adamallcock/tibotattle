@@ -163,7 +163,14 @@ the still-disabled Windows production selectors.
 `acquireSqliteStateLease(rootPath, expectedRootIdentity, databaseName)` is a
 purpose-limited protected SQLite boundary. It accepts one basename, derives
 the rollback journal, and returns validated database/journal identities plus
-an opaque lease. After the identity mutex is acquired, the native boundary
+an opaque lease. A freshly created database or journal is first flushed and
+validated through its cleanup-capable handle, then reopened relative to the
+already-held protected root with SQLite-compatible sharing; the reopened
+security, canonical path, and exact file identity must still match before the
+lease is exposed. A failed first-time acquisition can therefore leave only a
+validated, owner-only empty bootstrap file for a later retry; the binding does
+not delete by pathname after relinquishing the identity-bound creation handle.
+After the identity mutex is acquired, the native boundary
 creates owner-only delete-on-close placeholders for the derived `-wal` and
 `-shm` names and holds exclusive handles to them for the complete lease
 lifetime. A SQLite writer therefore receives a sharing violation instead of

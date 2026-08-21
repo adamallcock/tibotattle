@@ -1942,6 +1942,45 @@ bool ValidateSqliteStagingHandle(
       && ResolveFinalPath(handle, &fullPath);
 }
 
+bool ValidateSqliteChildHandle(
+    HANDLE handle,
+    const ParsedPath& fullPath,
+    HandleIdentity* identity,
+    Failure* failure) {
+  bool reparse = false;
+  DWORD attributes = 0;
+  if (!GetFileAttributesFromHandle(handle, &attributes)
+      || !HasReparsePoint(handle, &reparse)) {
+    *failure = OperationFailed();
+    return false;
+  }
+  if (reparse) {
+    *failure = ReparsePoint();
+    return false;
+  }
+  if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+    *failure = NotRegularFile();
+    return false;
+  }
+
+  SecuritySnapshot security;
+  if (!ValidateSecurity(handle, false, failure, identity, &security)
+      || security.denyAce
+      || security.ownerAllowAceCount != 1
+      || security.ownerAllowMask != FILE_ALL_ACCESS
+      || !ResolveFinalPath(handle, &fullPath)) {
+    if (failure->code == OperationFailed().code) *failure = IdentityMismatch();
+    if (failure->code == IdentityMismatch().code
+        && (security.denyAce
+          || security.ownerAllowAceCount != 1
+          || security.ownerAllowMask != FILE_ALL_ACCESS)) {
+      *failure = SecurityPolicy("sqlite_state_lease_security");
+    }
+    return false;
+  }
+  return true;
+}
+
 bool OpenSqliteChild(
     HANDLE protectedRoot,
     const ParsedPath& parsedRoot,
@@ -1957,6 +1996,7 @@ bool OpenSqliteChild(
   options.disposition = kFileOpen;
   HANDLE handle = INVALID_HANDLE_VALUE;
   ULONG_PTR information = 0;
+  bool createdNew = false;
   if (!OpenRelativeComponent(
           protectedRoot,
           childName,
@@ -2001,6 +2041,7 @@ bool OpenSqliteChild(
       *failure = AlreadyExists();
       return false;
     }
+    createdNew = true;
     if (!FlushFileBuffers(handle)) {
       *failure = FromLastError();
       if (!MarkHandleForDeletion(handle)) *failure = OperationFailed();
@@ -2009,43 +2050,60 @@ bool OpenSqliteChild(
     }
   }
 
-  bool reparse = false;
-  DWORD attributes = 0;
-  if (!GetFileAttributesFromHandle(handle, &attributes)
-      || !HasReparsePoint(handle, &reparse)) {
+  ParsedPath fullPath = parsedRoot;
+  fullPath.components.push_back(childName);
+  if (!ValidateSqliteChildHandle(handle, fullPath, identity, failure)) {
     CloseHandle(handle);
-    *failure = OperationFailed();
-    return false;
-  }
-  if (reparse) {
-    CloseHandle(handle);
-    *failure = ReparsePoint();
-    return false;
-  }
-  if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-    CloseHandle(handle);
-    *failure = NotRegularFile();
     return false;
   }
 
-  ParsedPath fullPath = parsedRoot;
-  fullPath.components.push_back(childName);
-  SecuritySnapshot security;
-  if (!ValidateSecurity(handle, false, failure, identity, &security)
-      || security.denyAce
-      || security.ownerAllowAceCount != 1
-      || security.ownerAllowMask != FILE_ALL_ACCESS
-      || !ResolveFinalPath(handle, &fullPath)) {
-    if (failure->code == OperationFailed().code) *failure = IdentityMismatch();
-    if (failure->code == IdentityMismatch().code
-        && (security.denyAce
-          || security.ownerAllowAceCount != 1
-          || security.ownerAllowMask != FILE_ALL_ACCESS)) {
-      *failure = SecurityPolicy("sqlite_state_lease_security");
-    }
+  if (createdNew) {
+    const HandleIdentity createdIdentity = *identity;
     CloseHandle(handle);
-    return false;
+    handle = INVALID_HANDLE_VALUE;
+
+    // A newly created child was opened with DELETE access so a failed lease
+    // can clean it up.  Stock SQLite opens its database and journal without
+    // FILE_SHARE_DELETE, so do not retain that creation handle while SQLite
+    // opens the fresh files.  Reopen relative to the already-held protected
+    // root, then validate both the security boundary and the exact object
+    // identity before retaining the ordinary existing-file handle.
+    options.access = READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+    options.shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    options.disposition = kFileOpen;
+    options.ownerOnlyOnCreate = false;
+    options.securityDescriptor = nullptr;
+    ULONG_PTR reopenInformation = 0;
+    if (!OpenRelativeComponent(
+            protectedRoot,
+            childName,
+            options.access,
+            options.shareMode,
+            options.disposition,
+            kFileNonDirectoryFile,
+            nullptr,
+            &handle,
+            &reopenInformation,
+            failure)) {
+      return false;
+    }
+    if (reopenInformation != kFileOpened) {
+      CloseHandle(handle);
+      handle = INVALID_HANDLE_VALUE;
+      *failure = IdentityMismatch();
+      return false;
+    }
+    HandleIdentity reopenedIdentity;
+    if (!ValidateSqliteChildHandle(handle, fullPath, &reopenedIdentity, failure)
+        || !EqualIdentity(reopenedIdentity, createdIdentity)) {
+      if (failure->code == OperationFailed().code) *failure = IdentityMismatch();
+      CloseHandle(handle);
+      handle = INVALID_HANDLE_VALUE;
+      return false;
+    }
+    *identity = reopenedIdentity;
   }
+
   opened->final = handle;
   return true;
 }
@@ -2574,6 +2632,25 @@ bool RenameHandleRelative(
     return false;
   }
   return true;
+}
+
+bool OpenPublishedTargetForValidation(
+    HANDLE parent,
+    const std::wstring& target,
+    HANDLE* result,
+    Failure* failure) {
+  ULONG_PTR information = 0;
+  return OpenRelativeComponent(
+      parent,
+      target,
+      READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      kFileOpen,
+      kFileNonDirectoryFile,
+      nullptr,
+      result,
+      &information,
+      failure);
 }
 
 std::wstring TemporaryReplacementName() {
@@ -4348,13 +4425,38 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
           &failure)) {
     return ThrowFailure(env, failure);
   }
-  // The stage handle is now the published target.  Resolve and validate it
-  // before returning its identity; no path is reopened after the atomic
-  // rename, so this final check remains handle-bound.
+  // The stage handle is now the published target. Validate its security and
+  // identity without requiring a final-path lookup on the renamed source
+  // handle. The old destination handle remains open for the operation, so
+  // verify the new directory entry through a fresh handle-relative open.
   targetPath.components.back() = targetName;
-  if (!ValidateSqliteStagingHandle(stage.final, targetPath, &stageIdentity, &failure)) {
+  HandleIdentity publishedIdentity;
+  if (!ValidateSecurity(stage.final, false, &failure, &publishedIdentity)
+      || !EqualIdentity(publishedIdentity, expectedStage)) {
+    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
     return ThrowFailure(env, failure);
   }
+  HANDLE publishedTarget = INVALID_HANDLE_VALUE;
+  if (!OpenPublishedTargetForValidation(
+          stage.parents.front(),
+          targetName,
+          &publishedTarget,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  HandleIdentity targetIdentity;
+  const bool publishedTargetValid = ValidateSqliteStagingHandle(
+      publishedTarget,
+      targetPath,
+      &targetIdentity,
+      &failure);
+  CloseHandle(publishedTarget);
+  if (!publishedTargetValid
+      || !EqualIdentity(targetIdentity, publishedIdentity)) {
+    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    return ThrowFailure(env, failure);
+  }
+  stageIdentity = publishedIdentity;
   napi_value result;
   napi_value published;
   napi_create_object(env, &result);

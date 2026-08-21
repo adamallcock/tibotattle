@@ -19,7 +19,7 @@ function fixedExit(status, code = 1) {
 }
 
 function loadInputs() {
-  if ((mode !== "hold" && mode !== "crash")
+  if ((mode !== "hold" && mode !== "crash" && mode !== "lease")
       || typeof bindingPath !== "string"
       || typeof rootPath !== "string"
       || typeof rootIdentityJson !== "string"
@@ -51,6 +51,24 @@ function configureDatabase(database) {
 function run() {
   const { binding, rootIdentity } = loadInputs();
   const lease = binding.acquireSqliteStateLease(rootPath, rootIdentity, databaseName);
+
+  if (mode === "lease") {
+    process.stdout.write(STATUS.ready, () => {
+      process.stdin.once("data", () => {
+        try {
+          binding.releaseSqliteStateLease(lease.lease);
+          process.stdout.write(STATUS.released, () => {
+            process.exitCode = 0;
+          });
+        } catch {
+          fixedExit(STATUS.failed);
+        }
+      });
+      process.stdin.resume();
+    });
+    return;
+  }
+
   let database;
   try {
     database = new DatabaseSync(join(rootPath, databaseName));
