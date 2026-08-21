@@ -505,15 +505,13 @@ test("guarded audit close closes SQLite before releasing the native identity gua
   }
 });
 
-test("guarded audit close retains the guard when native release fails", {
+test("guarded audit close retains opaque guards when native release fails", {
   skip: NATIVE_SKIP,
 }, async () => {
   const { parent, root } = await nativeProtectedAuditRoot(
     "tibotattle-windows-audit-release-failure-",
   );
   const filePath = join(root, "private", "windows-credential-operation-audit-v1.sqlite");
-  const journalPath = `${filePath}-journal`;
-  const movedPath = `${filePath}.moved`;
   const native = loadWindowsFilesystemBinding();
   const capturedGuards = [];
   let releaseAttempts = 0;
@@ -542,8 +540,12 @@ test("guarded audit close retains the guard when native release fails", {
     assert.throws(() => store.close(), auditError("unavailable"));
     assert.equal(store.closed, false);
     assert.equal(releaseAttempts, 2);
-    await assert.rejects(rename(filePath, movedPath));
-    await assert.rejects(rename(journalPath, `${journalPath}.moved`));
+    assert.equal(capturedGuards.length, 2);
+    // A retained read/share handle is not a guaranteed path-rename barrier
+    // once SQLite has closed. The durable guarantee here is that the opaque
+    // native guards remain issued and the store stays permanently fail-closed;
+    // productionSafe remains false until a stronger post-close primitive is
+    // designed and qualified.
     assert.throws(() => store.close(), auditError("unavailable"));
   } finally {
     try {
