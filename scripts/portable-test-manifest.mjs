@@ -124,6 +124,10 @@ export const PORTABLE_TEST_FILES = Object.freeze([
 // the corresponding Windows security implementation.
 export const WINDOWS_DEFERRED_TESTS = Object.freeze([
   Object.freeze({
+    file: "test/fast-mode-accounting.test.js",
+    reason: "owner-only state fixtures require branded Windows protected storage; dedicated Windows state tests cover that path",
+  }),
+  Object.freeze({
     file: "test/export-identity.test.js",
     reason: "production file identity requires Windows owner ACL, reparse-point, and hard-link enforcement",
   }),

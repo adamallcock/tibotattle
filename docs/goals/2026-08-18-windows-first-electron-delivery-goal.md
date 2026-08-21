@@ -23,13 +23,14 @@ or a Linux-support claim.
 
 - The integration branch has been rebased on `origin/main` at
   `49965f401131f938b188f6067164ff0ade6a56ff` (version `0.1.15`). The native
-  publication repair is committed at `bb4dda4`.
+  publication repair is committed at `bb4dda4`, and the bounded diagnostic is
+  committed at `ccbda4e`.
 - A bounded phase diagnostic proved that Windows SQLite publication failed in
   `publish_stage_preflight`. The repair now opens the existing staging database
   with the `GENERIC_WRITE` access required by `FlushFileBuffers`, while keeping
   `WRITE_DAC` limited to create-new paths.
-- Local preflight passed. The current local portable lane passes 1,203 tests:
-  1,160 passed, 43 expected non-Windows skips, and 0 failures.
+- Local preflight passed. The current local portable lane passes 1,212 tests:
+  1,169 passed, 43 expected non-Windows skips, and 0 failures.
 - Exact Windows run `32450640613` passed the repaired native filesystem
   diagnostic in both warm and clean jobs, then deterministically failed to exit
   the monolithic portable lane before the 45-minute job guard. Cleanup and the
@@ -40,22 +41,39 @@ or a Linux-support claim.
   per-file limit, a five-minute total limit, fixed repository-relative failure
   metadata, and owned process-tree cleanup. Its own functional tests are part
   of the portable manifest.
+- Exact Windows run `32454949390` proved the diagnostic boundary in both warm
+  and clean jobs. Each job passed native build and the repaired filesystem
+  diagnostic, then reported the same ordinary failure at ordinal 18,
+  `test/fast-mode-accounting.test.js`, in less than 300 milliseconds. The job
+  cleanup and clean-checkout gates passed.
+- The ordinal-18 failure was a real mixed-fixture boundary: owner-only state
+  controller tests used the POSIX path-only fixture that production Windows
+  correctly rejects without a branded protected-state store. That file is now
+  an explicit Windows deferral; the dedicated native Windows protected-state
+  qualification remains in force.
+- The per-file diagnostic now continues after ordinary nonzero test exits and
+  reports at most 64 fixed manifest-derived failure records. Spawn, signal,
+  per-file timeout, unproven process-tree termination, and global timeout paths
+  still fail immediately. The current 101-file Windows manifest completes
+  locally through the simulated selection seam.
 - The dependent Windows Electron artifact/runtime, NSIS, and R7 receipt gates
   remain unaccepted. `productionSafe` remains false; no Windows or Linux
   support claim, version bump, release, publication, or signing action is
   authorized by this goal.
-- The concrete blocker is now a deterministic Windows-only portable-test
-  process that does not exit. No production repair should be attempted until
-  the per-file diagnostic identifies the exact test.
+- The concrete blocker is one more exact native Windows run to enumerate any
+  remaining ordinary portability failures or identify the original non-exiting
+  process. No production promotion should occur until that run advances to the
+  unchanged authoritative portable lane.
 
 ### Ordered next steps from this checkpoint
 
-1. Run one exact warm-and-clean Windows qualification with the per-file
-   diagnostic. Exit with either all files completing and the authoritative lane
-   advancing, or one fixed file/ordinal/status report within five minutes.
-2. If one file is identified, make one focused lifecycle repair that preserves
-   its assertions and add a regression timeout/cleanup contract. Require local
-   preflight and portable gates before another exact run.
+1. Commit and push the reviewed diagnostic aggregation and explicit mixed-file
+   deferral, then dispatch that exact revision to the warm-and-clean Windows
+   qualification workflow.
+2. Accept one bounded result: either the per-file diagnostic completes and the
+   authoritative lane advances, it returns the complete bounded set of ordinary
+   portability failures, or it stops at the first timeout/termination status.
+   Do not repeat one-file-at-a-time workflow runs.
 3. Accept the Windows native/security boundary only when warm and clean jobs
    pass the authoritative portable lane, content-free native qualification,
    cleanup, and clean-checkout gates on one exact revision.
