@@ -62,27 +62,33 @@ or a Linux-support claim.
   then stopped at the same 60-second timeout: ordinal 90,
   `apps/local/server.test.mjs`. Generated-artifact cleanup and the final clean
   checkout gate passed in both jobs.
+- Exact Windows run `32458579632` used revision
+  `091376ff62dd3ec4b1f035c6553d986045979710`. Warm and clean again passed the
+  native setup and filesystem-security diagnostics. Both then reported the
+  same ordinal-90 timeout with `progress_units=57`, proving that every test in
+  `apps/local/server.test.mjs` completed and that the remaining defect is
+  process/stdio lifecycle rather than test execution.
 - The dependent Windows Electron artifact/runtime, NSIS, and R7 receipt gates
   remain unaccepted. `productionSafe` remains false; no Windows or Linux
   support claim, version bump, release, publication, or signing action is
   authorized by this goal.
-- The concrete blocker is the Windows lifecycle of
+- The concrete blocker is the Windows subprocess lifecycle in
   `apps/local/server.test.mjs`. A local control completes its 57 tests in about
-  five seconds, so the Windows result is not accepted as ordinary slow runtime.
-  No production promotion should occur until the bounded diagnostic proves
-  whether an internal test stalls or all test progress completes with an owned
-  resource still open.
+  five seconds, while both native Windows cache modes complete all 57 progress
+  units but retain an owned resource. The two subprocess tests are being made
+  to dispose their piped output and prove the child `close` event within the
+  existing fixed budget; production shutdown code is unchanged.
 
 ### Ordered next steps from this checkpoint
 
-1. Add one content-free dot-reporter progress counter to the already bounded
-   per-file subprocess. Do not buffer or print child output, raise the timeout,
-   force process exit, or weaken the file's assertions.
-2. Dispatch one exact warm-and-clean run. If progress is incomplete, isolate
-   the last incomplete test group; if all expected progress completes, close
-   the owned server, child, timer, or socket handle. Require a regression
-   lifecycle test and the full local preflight/portable gates before rerunning.
-   Do not repeat one-file-at-a-time workflow runs.
+1. Require both subprocess tests in `apps/local/server.test.mjs` to observe
+   process exit, dispose only their owned stdout/stderr pipes, and prove the
+   child `close` event within the existing short lifecycle budget. Do not
+   raise a timeout, force the test process to exit, or weaken assertions.
+2. Pass the full local preflight and portable lanes, then dispatch one exact
+   warm-and-clean run. If ordinal 90 still retains a resource, add one bounded
+   fixed-vocabulary handle-category diagnostic before changing production
+   shutdown code; do not repeat speculative one-file workflow runs.
 3. Accept the Windows native/security boundary only when warm and clean jobs
    pass the authoritative portable lane, content-free native qualification,
    cleanup, and clean-checkout gates on one exact revision.
