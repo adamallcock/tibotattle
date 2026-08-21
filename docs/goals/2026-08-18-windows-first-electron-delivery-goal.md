@@ -29,8 +29,8 @@ or a Linux-support claim.
   `publish_stage_preflight`. The repair now opens the existing staging database
   with the `GENERIC_WRITE` access required by `FlushFileBuffers`, while keeping
   `WRITE_DAC` limited to create-new paths.
-- Local preflight passed. The current local portable lane passes 1,212 tests:
-  1,169 passed, 43 expected non-Windows skips, and 0 failures.
+- Local preflight passed. The current local portable lane passes 1,218 tests:
+  1,175 passed, 43 expected non-Windows skips, and 0 failures.
 - Exact Windows run `32450640613` passed the repaired native filesystem
   diagnostic in both warm and clean jobs, then deterministically failed to exit
   the monolithic portable lane before the 45-minute job guard. Cleanup and the
@@ -56,23 +56,32 @@ or a Linux-support claim.
   per-file timeout, unproven process-tree termination, and global timeout paths
   still fail immediately. The current 101-file Windows manifest completes
   locally through the simulated selection seam.
+- Exact Windows run `32456656339` used revision
+  `51ba71d84c26e46a7a9b04e6a01c9df39155b114`. Both warm and clean jobs passed
+  native build, manifest, environment, and filesystem-security diagnostics,
+  then stopped at the same 60-second timeout: ordinal 90,
+  `apps/local/server.test.mjs`. Generated-artifact cleanup and the final clean
+  checkout gate passed in both jobs.
 - The dependent Windows Electron artifact/runtime, NSIS, and R7 receipt gates
   remain unaccepted. `productionSafe` remains false; no Windows or Linux
   support claim, version bump, release, publication, or signing action is
   authorized by this goal.
-- The concrete blocker is one more exact native Windows run to enumerate any
-  remaining ordinary portability failures or identify the original non-exiting
-  process. No production promotion should occur until that run advances to the
-  unchanged authoritative portable lane.
+- The concrete blocker is the Windows lifecycle of
+  `apps/local/server.test.mjs`. A local control completes its 57 tests in about
+  five seconds, so the Windows result is not accepted as ordinary slow runtime.
+  No production promotion should occur until the bounded diagnostic proves
+  whether an internal test stalls or all test progress completes with an owned
+  resource still open.
 
 ### Ordered next steps from this checkpoint
 
-1. Commit and push the reviewed diagnostic aggregation and explicit mixed-file
-   deferral, then dispatch that exact revision to the warm-and-clean Windows
-   qualification workflow.
-2. Accept one bounded result: either the per-file diagnostic completes and the
-   authoritative lane advances, it returns the complete bounded set of ordinary
-   portability failures, or it stops at the first timeout/termination status.
+1. Add one content-free dot-reporter progress counter to the already bounded
+   per-file subprocess. Do not buffer or print child output, raise the timeout,
+   force process exit, or weaken the file's assertions.
+2. Dispatch one exact warm-and-clean run. If progress is incomplete, isolate
+   the last incomplete test group; if all expected progress completes, close
+   the owned server, child, timer, or socket handle. Require a regression
+   lifecycle test and the full local preflight/portable gates before rerunning.
    Do not repeat one-file-at-a-time workflow runs.
 3. Accept the Windows native/security boundary only when warm and clean jobs
    pass the authoritative portable lane, content-free native qualification,

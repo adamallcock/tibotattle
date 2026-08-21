@@ -163,7 +163,7 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_TEST_TIMEOUT_MS = 60_000/u);
   assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_SUITE_TIMEOUT_MS = 5 \* 60 \* 1_000/u);
   assert.match(portableDiagnosticScript, /--test-concurrency=1/u);
-  assert.match(portableDiagnosticScript, /stdio: \["ignore", "ignore", "ignore"\]/u);
+  assert.match(portableDiagnosticScript, /stdio: \["ignore", "pipe", "ignore"\]/u);
   assert.match(portableDiagnosticScript, /taskkill\.exe/u);
   assert.match(portableDiagnosticScript, /"\/pid"/u);
   assert.match(portableDiagnosticScript, /"\/t"/u);
@@ -171,6 +171,13 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_DIAGNOSTIC_TEST_TIMED_OUT/u);
   assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_DIAGNOSTIC_SUITE_TIMED_OUT/u);
   assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_MAXIMUM_FAILURE_METADATA_ITEMS = 64/u);
+  assert.match(portableDiagnosticScript, /WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS = 1_024/u);
+  assert.match(portableDiagnosticScript, /countProgressUnits/u);
+  assert.match(portableDiagnosticScript, /stdout\.on\("data", onStdoutData\)/u);
+  assert.match(portableDiagnosticScript, /stdout\.once\("error", onStdoutError\)/u);
+  assert.match(portableDiagnosticScript, /stdout\.removeListener\("data", onStdoutData\)/u);
+  assert.match(portableDiagnosticScript, /stdout\.removeListener\("error", onStdoutError\)/u);
+  assert.match(portableDiagnosticScript, /progress_units=\$\{progress\}/u);
   assert.match(portableDiagnosticScript, /ORDINARY_TEST_FAILURE/u);
   assert.match(portableDiagnosticScript, /error\?\.\[ORDINARY_TEST_FAILURE\] !== true/u);
   assert.match(portableDiagnosticScript, /safeFailureLocation\(error\)/u);
@@ -181,7 +188,7 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(portableDiagnosticScript, /elapsed_ms=\$\{safeFailureElapsed\(error\)\}/u);
   assert.doesNotMatch(
     portableDiagnosticScript,
-    /error\.message|child\.stdout|child\.stderr|pipe\(process\.(?:stdout|stderr)/u,
+    /error\.message|child\.stderr|child\.stdout\.(?:pipe|resume)|process\.(?:stdout|stderr)|Buffer\.concat|chunk\.toString/u,
   );
   assert.match(workflow, /pnpm install --frozen-lockfile --offline/u);
   assert.match(workflow, /--store-dir \$cleanStore/u);
