@@ -302,6 +302,7 @@ test("prepared native publication is recoverable after a child crash and no-clob
 }, async () => {
   await withPreparedRoot(async ({ binding, root, rootIdentity }) => {
     const bindingPath = qualificationBindingPath();
+    binding.ensurePreparedDirectory(root, rootIdentity, "prepared");
     const crashChild = startCrashChild({
       bindingPath,
       root,
