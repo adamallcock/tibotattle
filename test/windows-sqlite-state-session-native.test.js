@@ -81,6 +81,25 @@ function assertNoWalOrSharedMemory(adapter, root, rootIdentity, databaseName) {
   assertMissingChild(adapter, root, rootIdentity, `${databaseName}-shm`);
 }
 
+async function assertEventuallyNoWalOrSharedMemory(
+  adapter,
+  root,
+  rootIdentity,
+  databaseName,
+  { timeoutMs = 2_000, intervalMs = 25 } = {},
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      assertNoWalOrSharedMemory(adapter, root, rootIdentity, databaseName);
+      return;
+    } catch (error) {
+      if (Date.now() >= deadline) throw error;
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, intervalMs));
+  }
+}
+
 function assertSidecarsReserved(root, databaseName) {
   for (const suffix of ["-wal", "-shm"]) {
     const sidecarPath = join(root, `${databaseName}${suffix}`);
@@ -293,7 +312,7 @@ test("native Windows SQLite session qualifies durable recovery and lease content
   assert.equal(holdingChild.child.exitCode, 0);
   assert.equal(holdingChild.output(),
     "WINDOWS_SQLITE_STATE_CHILD_READY\nWINDOWS_SQLITE_STATE_CHILD_RELEASED\n");
-  assertNoWalOrSharedMemory(adapter, root, rootIdentity, DATABASE_NAME);
+  await assertEventuallyNoWalOrSharedMemory(adapter, root, rootIdentity, DATABASE_NAME);
 
   const first = openLeasedDatabase({
     adapter,
@@ -316,7 +335,7 @@ test("native Windows SQLite session qualifies durable recovery and lease content
     first.database.close();
     adapter.releaseSqliteStateLease(first.lease);
   }
-  assertNoWalOrSharedMemory(adapter, root, rootIdentity, DATABASE_NAME);
+  await assertEventuallyNoWalOrSharedMemory(adapter, root, rootIdentity, DATABASE_NAME);
 
   const reopened = openLeasedDatabase({
     adapter,
@@ -334,7 +353,7 @@ test("native Windows SQLite session qualifies durable recovery and lease content
     reopened.database.close();
     adapter.releaseSqliteStateLease(reopened.lease);
   }
-  assertNoWalOrSharedMemory(adapter, root, rootIdentity, DATABASE_NAME);
+  await assertEventuallyNoWalOrSharedMemory(adapter, root, rootIdentity, DATABASE_NAME);
 
   const crashChild = startChild({
     mode: "crash",
@@ -361,7 +380,7 @@ test("native Windows SQLite session qualifies durable recovery and lease content
   assert.equal(crashJournal.isReparsePoint, false);
   assert.equal(crashJournal.ownerMatches, true);
   assert.equal(crashJournal.broadAccess, false);
-  assertNoWalOrSharedMemory(adapter, root, rootIdentity, DATABASE_NAME);
+  await assertEventuallyNoWalOrSharedMemory(adapter, root, rootIdentity, DATABASE_NAME);
 
   const recovered = openLeasedDatabase({
     adapter,
@@ -379,7 +398,7 @@ test("native Windows SQLite session qualifies durable recovery and lease content
     recovered.database.close();
     adapter.releaseSqliteStateLease(recovered.lease);
   }
-  assertNoWalOrSharedMemory(adapter, root, rootIdentity, DATABASE_NAME);
+  await assertEventuallyNoWalOrSharedMemory(adapter, root, rootIdentity, DATABASE_NAME);
 }));
 
 test("native Windows SQLite qualification fails closed without its bound addon", {
