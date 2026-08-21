@@ -2348,6 +2348,87 @@ test("a deferred quick reload keeps the usage figures and both usage timelines",
   })();
 });
 
+test("a non-authoritative FULL build keeps the evidence it could not rebuild", async () => {
+  // Reproduced 2026-08-21 against the owner's real index (repro-blank.mjs):
+  // a full-mode snapshot built while the generation row is not ready — the
+  // exact row shape an in-flight ingest produces — publishes an empty-array
+  // timeline and zeroed usage placeholders even though the complete history is
+  // readable in the same file. Full reloads bypassed retention by design, so
+  // one full reload racing an ingest blanked the dashboard AND PINNED the
+  // blank until the next authoritative reload. Intermittent, persisting across
+  // refreshes: the exact behavior reported against 0.1.13 through 0.1.15.
+  //
+  // Authority is the snapshot's own accounting block: generationMatched can
+  // only be true once the generation passed the readiness gate and the cache
+  // was rebuilt against exactly that generation.
+  const period = (events) => ({ id: "7d", label: "Last 7 days", events });
+  const snapshot = ({ matched, empty, sourceMode = "unified" }) => ({
+    schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+    mode: "real_local_evidence",
+    generatedAt: "2026-08-21T14:30:00.000Z",
+    overview: {
+      marker: matched ? "authoritative" : "not-ready",
+      accounting: { sourceMode, generationMatched: matched },
+      usage: empty ? [period(0)] : [period(12)],
+      timeline: { usage: empty ? [] : [{ at: 1 }, { at: 2 }] },
+    },
+    gradient: { datasets: empty ? { rolling: [] } : { rolling: [{ at: 1 }] } },
+    weekly: { datasets: empty ? { weekly_values: [] } : { weekly_values: [{ sequence: 1 }] } },
+    quality: {},
+    reports: [],
+  });
+  const storeWith = (sequence) => {
+    let call = 0;
+    return new LocalCompanionDataStore({
+      builder: async () => snapshot(sequence[Math.min(call++, sequence.length - 1)]),
+    });
+  };
+
+  // M2/M3: a not-ready full build must not blank a populated dashboard.
+  const notReady = storeWith([
+    { matched: true, empty: false },
+    { matched: false, empty: true },
+  ]);
+  await notReady.reload({ purpose: "full" });
+  await notReady.reload({ purpose: "full" });
+  assert.equal(notReady.getOverview().timeline.usage.length, 2,
+    "a not-ready full build must not blank the timeline");
+  assert.equal(notReady.getOverview().usage[0].events, 12);
+  // The build's own status fields still publish — staleness stays labeled.
+  assert.equal(notReady.getOverview().marker, "not-ready");
+
+  // Authoritative empty: a ready, matched build with genuinely no data lands.
+  const wiped = storeWith([
+    { matched: true, empty: false },
+    { matched: true, empty: true },
+  ]);
+  await wiped.reload({ purpose: "full" });
+  await wiped.reload({ purpose: "full" });
+  assert.equal(wiped.getOverview().timeline.usage.length, 0,
+    "an authoritative empty build must land");
+
+  // M1: fresh evidence always wins — a mismatched build that still carries
+  // its buckets replaces, never resurrects older data over newer.
+  const mismatchOnly = storeWith([
+    { matched: true, empty: false },
+    { matched: false, empty: false },
+  ]);
+  await mismatchOnly.reload({ purpose: "full" });
+  await mismatchOnly.reload({ purpose: "full" });
+  assert.equal(mismatchOnly.getOverview().marker, "not-ready");
+  assert.equal(mismatchOnly.getOverview().timeline.usage.length, 2);
+
+  // Legacy rollback mode never had this gate and keeps full-replace semantics.
+  const legacy = storeWith([
+    { matched: true, empty: false, sourceMode: "legacy" },
+    { matched: false, empty: true, sourceMode: "legacy" },
+  ]);
+  await legacy.reload({ purpose: "full" });
+  await legacy.reload({ purpose: "full" });
+  assert.equal(legacy.getOverview().timeline.usage.length, 0,
+    "legacy full reloads replace unconditionally");
+});
+
 test("every surface a withheld projection empties is registered for retention", async () => {
   // The completeness gate for this defect class. `unifiedAccountingWithheld`
   // is the single condition under which the builder substitutes evidence-free

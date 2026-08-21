@@ -125,6 +125,21 @@
     {
       "classification": "build_release_operation",
       "owner": "public_site_release",
+      "canonicalPath": "scripts/generate-social-preview.js",
+      "stableAlias": "product:social-preview",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.product:social-preview"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": null,
+      "provenanceReason": "Added with the 0.1.15 social-card generation (98fe9c9); renders the deterministic 1200x630 share card the release-site build embeds. No dated provenance artifact yet.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "public_site_release",
       "canonicalPath": "scripts/build-public-release-site.js",
       "stableAlias": "product:release-site",
       "stableAliasReason": null,

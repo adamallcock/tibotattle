@@ -303,7 +303,10 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  assert.equal(result.records, 77);
+  // 78: scripts/generate-social-preview.js entered with the 0.1.15
+  // social-card generation (98fe9c9) but was never inventoried — the sixth
+  // instance of the merged-change-with-stale-pin class this week.
+  assert.equal(result.records, 78);
   assert.equal(result.candidates.length, 79);
   assert.ok(result.aliases >= 25);
 });

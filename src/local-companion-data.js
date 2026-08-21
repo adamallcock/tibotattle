@@ -3451,14 +3451,49 @@ export class LocalCompanionDataStore {
   // and the usage kept flickering. Surfaces are registered by path now, so
   // nesting is not what decides whether a surface is protected.
   //
-  // Scoped deliberately: only for the purposes that request a deferred
-  // projection, and only when the incoming surface carries no evidence while
-  // the retained one does. A full reload always replaces every surface, so a
-  // real transition to empty still lands on the next complete refresh and this
-  // can never pin stale figures beyond it.
+  // "A full reload always replaces every surface" was the 0.1.14/0.1.15 rule,
+  // and it is one clause too broad: a FULL build is not automatically an
+  // AUTHORITATIVE build. Reproduced deterministically against the owner's real
+  // 737 MB index (2026-08-21, repro-blank.mjs matrix) by mutating only the
+  // generation row of a copy:
+  //
+  //   CONTROL   ready generation                 -> 4,893 timeline buckets
+  //   M1        ready, accounting cache stale    -> 4,893 buckets (charts fine)
+  //   M2        unaccepted block_reason          -> 0 buckets, zeroed usage
+  //   M3        completeness flag dropped        -> 0 buckets, zeroed usage
+  //
+  // M3 is the exact shape the live generation row has WHILE AN INGEST PASS IS
+  // RUNNING, so any full reload racing an in-flight ingest publishes M3: an
+  // empty-array timeline and placeholder usage periods, wholesale-replacing a
+  // good snapshot. Nothing restores it until the next authoritative full
+  // reload — which is why the blank was intermittent yet PERSISTED ACROSS
+  // REFRESHES, and why deferred-purpose retention alone could not fix it.
+  //
+  // The authority signal is already on the snapshot: in unified mode,
+  // accounting.generationMatched can only be true once the generation passed
+  // the readiness gate AND the cache was rebuilt against exactly that
+  // generation (a not-ready generation forces the cache unavailable first).
+  // So the rule becomes: deferred builds always retain; a full build replaces
+  // unconditionally ONLY when it is authoritative. A genuine transition to
+  // empty still lands — the wipe mints a ready generation, its rebuild
+  // catches up, matched turns true, and the empty authoritative build
+  // publishes. Until then the previous figures stand behind the build's own
+  // "history indexing is still advancing" warning, which is the stale-labeled
+  // presentation the owner chose for exactly this state.
+  //
+  // M1 needs no special case: retention only ever fills surfaces whose
+  // incoming evidence is ZERO, and M1 carries its buckets.
+  //
+  // Scoped to unified mode: the legacy rollback path never had this gate and
+  // keeps its original purpose-only behavior.
   #withRetainedProjection(next, options) {
     const purpose = options?.purpose ?? "full";
-    if (!DEFERRED_PROJECTION_PURPOSES.has(purpose)) return next;
+    const accounting = next?.overview?.accounting;
+    const nonAuthoritativeFull = accounting?.sourceMode === "unified"
+      && accounting?.generationMatched !== true;
+    if (!DEFERRED_PROJECTION_PURPOSES.has(purpose) && !nonAuthoritativeFull) {
+      return next;
+    }
     const retained = this.#snapshot;
     if (retained === null) return next;
     for (const { path, rows } of PROJECTION_SURFACES) {
