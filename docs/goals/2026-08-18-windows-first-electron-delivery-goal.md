@@ -89,8 +89,11 @@ or a Linux-support claim.
   shutdown path.
 - The ordinal-22 fixture now closes its listener before force-closing any
   established HTTP connections, rejects close errors, and asserts that it is
-  no longer listening. The full local preflight and portable lanes pass; exact
-  warm-and-clean Windows proof is pending.
+  no longer listening. The full local preflight and portable lanes passed, but
+  exact Windows run `32462988567` on revision
+  `8159e90d378baf570fd3326f4efaf964a6eb6719` reproduced the same ordinal-22
+  retained server in warm and clean modes. This rules out an established
+  keep-alive connection as the missing cleanup operation.
 - The dependent Windows Electron artifact/runtime, NSIS, and R7 receipt gates
   remain unaccepted. `productionSafe` remains false; no Windows or Linux
   support claim, version bump, release, publication, or signing action is
@@ -105,9 +108,9 @@ or a Linux-support claim.
 
 ### Ordered next steps from this checkpoint
 
-1. Strengthen ordinal 22's private upstream-server cleanup and prove the owned
-   listener is released; do not raise timeouts, force exit, weaken assertions,
-   or alter the production companion shutdown path.
+1. Record one fixed ownership sentinel after ordinal 22's two close phases:
+   `91` if only the private upstream listener remains and `92` if the companion
+   listener remains. Emit no server address, port, path, stack, or raw output.
 2. Pass the full local preflight and portable lanes, then dispatch one exact
    warm-and-clean run. Require the bounded diagnostic to exit normally in both
    cache modes instead of reporting a retained server ordinal.
