@@ -380,7 +380,7 @@ test("Windows portable diagnostic reports only framed resource category counts",
         queueMicrotask(() => {
           writeFileSync(
             options.env[WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_ENVIRONMENT_KEY],
-            "R044789Q",
+            "R044789QO27Z",
           );
           child.stdout.write("private-canary-123."
             + "private-canary-987");
@@ -394,13 +394,14 @@ test("Windows portable diagnostic reports only framed resource category counts",
       assert.equal(error.progressUnits, 1);
       assert.deepEqual(error.resourceUnits, {
         counts: [1, 0, 0, 0, 2, 0, 0, 1, 1, 1],
+        firstTcpOrdinal: 27,
         truncated: false,
       });
       error.ordinal = WINDOWS_PORTABLE_TEST_FILES.indexOf(
         "apps/local/server.test.mjs",
       ) + 1;
       const formatted = formatWindowsPortableDiagnosticFailure(error);
-      assert.match(formatted, /resource_units=1:0:0:0:2:0:0:1:1:1\/0/u);
+      assert.match(formatted, /resource_units=1:0:0:0:2:0:0:1:1:1\/0\/27/u);
       assert.doesNotMatch(formatted, /private-canary|123|987/u);
       return true;
     },
@@ -430,7 +431,9 @@ test("Windows portable diagnostic caps framed resource category counts", async (
         queueMicrotask(() => {
           writeFileSync(
             diagnosticFile,
-            `R${"8".repeat(WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS + 1)}Q`,
+            `R${"8".repeat(
+              WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS + 1,
+            )}QO54Z`,
           );
         });
         return child;
@@ -443,12 +446,13 @@ test("Windows portable diagnostic caps framed resource category counts", async (
         WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS,
       );
       assert.equal(error.resourceUnits.truncated, true);
+      assert.equal(error.resourceUnits.firstTcpOrdinal, 54);
       error.ordinal = WINDOWS_PORTABLE_TEST_FILES.indexOf(
         "apps/local/server.test.mjs",
       ) + 1;
       assert.match(
         formatWindowsPortableDiagnosticFailure(error),
-        /resource_units=0:0:0:0:0:0:0:0:64:0\/1/u,
+        /resource_units=0:0:0:0:0:0:0:0:64:0\/1\/54/u,
       );
       return true;
     },
@@ -645,11 +649,12 @@ test("Windows portable diagnostic formatting is fixed and content-free", () => {
   timeout.progressUnits = 7;
   timeout.resourceUnits = {
     counts: [0, 0, 0, 0, 1, 0, 0, 0, 2, 0],
+    firstTcpOrdinal: 0,
     truncated: false,
   };
   assert.match(
     formatWindowsPortableDiagnosticFailure(timeout),
-    /status=WINDOWS_PORTABLE_DIAGNOSTIC_TEST_TIMED_OUT elapsed_ms=60000 progress_units=7 resource_units=0:0:0:0:1:0:0:0:2:0\/0/u,
+    /status=WINDOWS_PORTABLE_DIAGNOSTIC_TEST_TIMED_OUT elapsed_ms=60000 progress_units=7 resource_units=0:0:0:0:1:0:0:0:2:0\/0\/0/u,
   );
 
   const unsafeProgress = new Error("private message");

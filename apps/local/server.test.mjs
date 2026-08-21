@@ -271,6 +271,30 @@ const WINDOWS_PORTABLE_RESOURCE_TYPE_CODES = Object.freeze({
   TCPWrap: "7",
   Timeout: "8",
 });
+let completedTopLevelTestOrdinal = 0;
+let firstRetainedTcpServerOrdinal = 0;
+
+test.afterEach(async () => {
+  const diagnosticFile =
+    process.env[WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_ENVIRONMENT_KEY];
+  if (typeof diagnosticFile !== "string" || diagnosticFile.length < 1) {
+    return;
+  }
+  completedTopLevelTestOrdinal += 1;
+  if (typeof process.getActiveResourcesInfo !== "function") {
+    return;
+  }
+  // Give completed server.close() callbacks two event-loop turns to destroy
+  // their async resource before classifying a retained listener.
+  await new Promise((resolveTurn) => setImmediate(resolveTurn));
+  await new Promise((resolveTurn) => setImmediate(resolveTurn));
+  const retained = process.getActiveResourcesInfo().includes("TCPServerWrap");
+  if (retained && firstRetainedTcpServerOrdinal === 0) {
+    firstRetainedTcpServerOrdinal = completedTopLevelTestOrdinal;
+  } else if (!retained) {
+    firstRetainedTcpServerOrdinal = 0;
+  }
+});
 
 test.after(() => {
   const diagnosticFile =
@@ -288,10 +312,11 @@ test.after(() => {
   }
   const codes = resourceTypes.slice(0, 65).map((type) =>
     WINDOWS_PORTABLE_RESOURCE_TYPE_CODES[type] ?? "9");
-  // R/Q frame only fixed category digits. The parent reads at most 67 bytes
+  // R/Q/O/Z frame only fixed category digits. The parent reads at most 72 bytes
   // from its own temporary file and never forwards child output.
   try {
-    writeFileSync(diagnosticFile, `R${codes.join("")}Q`, {
+    const tcpOrdinal = String(firstRetainedTcpServerOrdinal).padStart(2, "0");
+    writeFileSync(diagnosticFile, `R${codes.join("")}QO${tcpOrdinal}Z`, {
       encoding: "ascii",
       flag: "wx",
       mode: 0o600,
