@@ -44,10 +44,44 @@ export const WINDOWS_NATIVE_PRESIGN_MODULES = Object.freeze([
     packagedPath: "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node",
   }),
 ]);
+// TrustedSigning 0.5.0 exposes ten DefaultAzureCredential exclusion
+// switches.  The protected OIDC finalizer deliberately enables every
+// exclusion except ExcludeAzureCliCredential: azure/login establishes the
+// approved service-principal session in the Azure CLI cache, while ambient
+// environment, workload, developer, and interactive credentials remain out.
+export const WINDOWS_NATIVE_PRESIGN_TRUSTEDSIGNING_EXCLUDED_CREDENTIALS =
+  Object.freeze([
+    "ExcludeEnvironmentCredential",
+    "ExcludeWorkloadIdentityCredential",
+    "ExcludeManagedIdentityCredential",
+    "ExcludeSharedTokenCacheCredential",
+    "ExcludeVisualStudioCredential",
+    "ExcludeVisualStudioCodeCredential",
+    "ExcludeAzurePowerShellCredential",
+    "ExcludeAzureDeveloperCliCredential",
+    "ExcludeInteractiveBrowserCredential",
+  ]);
+export const WINDOWS_NATIVE_PRESIGN_TRUSTEDSIGNING_CREDENTIAL_MODE =
+  "azure-cli-only";
+// These non-secret Azure resource values are fixed by the reviewed Artifact
+// Signing handoff.  Keep the native primitive closed as well as the release
+// config: a caller must not redirect a presign operation to another account,
+// profile, endpoint, or publisher merely by satisfying the syntax checks.
+export const WINDOWS_NATIVE_PRESIGN_AZURE_IDENTITY = Object.freeze({
+  endpoint: "https://eus.codesigning.azure.net/",
+  codeSigningAccountName: "tibotattlesigning",
+  certificateProfileName: "tibotattle-windows-public",
+  publisher: "Adam Allcock",
+  timestampRfc3161: "http://timestamp.acs.microsoft.com",
+});
 export const WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY = Object.freeze({
   trustedSigningModuleVersion: "0.5.0",
+  trustedSigningCredentialMode:
+    WINDOWS_NATIVE_PRESIGN_TRUSTEDSIGNING_CREDENTIAL_MODE,
+  excludedCredentials:
+    WINDOWS_NATIVE_PRESIGN_TRUSTEDSIGNING_EXCLUDED_CREDENTIALS,
   requestedFileDigest: "SHA256",
-  timestampRfc3161: "http://timestamp.acs.microsoft.com",
+  timestampRfc3161: WINDOWS_NATIVE_PRESIGN_AZURE_IDENTITY.timestampRfc3161,
   requestedTimestampDigest: "SHA256",
 });
 
@@ -99,6 +133,8 @@ const RECEIPT_KEYS = Object.freeze([
 ]);
 const SIGNING_REQUEST_POLICY_KEYS = Object.freeze([
   "trustedSigningModuleVersion",
+  "trustedSigningCredentialMode",
+  "excludedCredentials",
   "requestedFileDigest",
   "timestampRfc3161",
   "requestedTimestampDigest",
@@ -290,6 +326,37 @@ function assertEndpoint(value) {
   return value;
 }
 
+function assertExactAzureIdentity(azure) {
+  const endpoint = assertEndpoint(azure.endpoint);
+  const codeSigningAccountName = assertString(
+    azure.codeSigningAccountName,
+    RESOURCE_PATTERN,
+    128,
+  );
+  const certificateProfileName = assertString(
+    azure.certificateProfileName,
+    RESOURCE_PATTERN,
+    128,
+  );
+  const publisher = assertString(azure.publisher, PUBLISHER_PATTERN, 256);
+  if (endpoint !== WINDOWS_NATIVE_PRESIGN_AZURE_IDENTITY.endpoint
+      || codeSigningAccountName
+        !== WINDOWS_NATIVE_PRESIGN_AZURE_IDENTITY.codeSigningAccountName
+      || certificateProfileName
+        !== WINDOWS_NATIVE_PRESIGN_AZURE_IDENTITY.certificateProfileName
+      || publisher !== WINDOWS_NATIVE_PRESIGN_AZURE_IDENTITY.publisher) {
+    fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid);
+  }
+  return Object.freeze({
+    endpoint: WINDOWS_NATIVE_PRESIGN_AZURE_IDENTITY.endpoint,
+    codeSigningAccountName:
+      WINDOWS_NATIVE_PRESIGN_AZURE_IDENTITY.codeSigningAccountName,
+    certificateProfileName:
+      WINDOWS_NATIVE_PRESIGN_AZURE_IDENTITY.certificateProfileName,
+    publisher: WINDOWS_NATIVE_PRESIGN_AZURE_IDENTITY.publisher,
+  });
+}
+
 export function validateWindowsNativePresignOptions(
   value,
   {
@@ -331,20 +398,7 @@ export function validateWindowsNativePresignOptions(
       sha256: assertString(binding.sha256, SHA256_PATTERN, 64),
     }),
     keytarSha256,
-    azure: Object.freeze({
-      endpoint: assertEndpoint(azure.endpoint),
-      codeSigningAccountName: assertString(
-        azure.codeSigningAccountName,
-        RESOURCE_PATTERN,
-        128,
-      ),
-      certificateProfileName: assertString(
-        azure.certificateProfileName,
-        RESOURCE_PATTERN,
-        128,
-      ),
-      publisher: assertString(azure.publisher, PUBLISHER_PATTERN, 256),
-    }),
+    azure: assertExactAzureIdentity(azure),
   });
 }
 
@@ -424,11 +478,15 @@ function powershellLiteral(value) {
 
 export function buildTrustedSigningPowerShellCommand(path, azure) {
   const selected = readRecord(azure, AZURE_KEYS);
-  const endpoint = assertEndpoint(selected.endpoint);
-  const account = assertString(selected.codeSigningAccountName, RESOURCE_PATTERN, 128);
-  const profile = assertString(selected.certificateProfileName, RESOURCE_PATTERN, 128);
-  assertString(selected.publisher, PUBLISHER_PATTERN, 256);
+  const exactIdentity = assertExactAzureIdentity(selected);
+  const endpoint = exactIdentity.endpoint;
+  const account = exactIdentity.codeSigningAccountName;
+  const profile = exactIdentity.certificateProfileName;
   assertAbsolutePath(path);
+  const credentialExclusionSwitches =
+    WINDOWS_NATIVE_PRESIGN_TRUSTEDSIGNING_EXCLUDED_CREDENTIALS
+      .map((name) => `-${name}`)
+      .join(" ");
   return [
     "$ErrorActionPreference = 'Stop'",
     "Import-Module TrustedSigning -RequiredVersion 0.5.0 -Force",
@@ -437,22 +495,24 @@ export function buildTrustedSigningPowerShellCommand(path, azure) {
       `-Endpoint ${powershellLiteral(endpoint)}`,
       `-CertificateProfileName ${powershellLiteral(profile)}`,
       `-CodeSigningAccountName ${powershellLiteral(account)}`,
-      "-TimestampRfc3161 'http://timestamp.acs.microsoft.com'",
+      `-TimestampRfc3161 '${WINDOWS_NATIVE_PRESIGN_AZURE_IDENTITY.timestampRfc3161}'`,
       "-TimestampDigest 'SHA256'",
       "-FileDigest 'SHA256'",
+      credentialExclusionSwitches,
       `-Files ${powershellLiteral(path)}`,
     ].join(" "),
   ].join("; ");
 }
 
-function buildAuthenticodeProbeCommand(path) {
+export function buildAuthenticodeProbeCommand(path) {
   const literal = powershellLiteral(path);
   return [
     "$ErrorActionPreference = 'Stop'",
     `$signature = Get-AuthenticodeSignature -LiteralPath ${literal}`,
+    "$publisher = $signature.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)",
     `& signtool.exe verify /pa /all ${literal} *> $null`,
     "$signtoolValid = ($LASTEXITCODE -eq 0)",
-    "[ordered]@{ status = $signature.Status.ToString(); publisher = $signature.SignerCertificate.Subject; signerThumbprint = $signature.SignerCertificate.Thumbprint; timestampPresent = ($null -ne $signature.TimeStamperCertificate); policy = 'authenticode-pa'; signtoolPaValid = $signtoolValid } | ConvertTo-Json -Compress",
+    "[ordered]@{ status = $signature.Status.ToString(); publisher = $publisher; signerThumbprint = $signature.SignerCertificate.Thumbprint; timestampPresent = ($null -ne $signature.TimeStamperCertificate); policy = 'authenticode-pa'; signtoolPaValid = $signtoolValid } | ConvertTo-Json -Compress",
   ].join("; ");
 }
 
@@ -468,6 +528,9 @@ function parseAuthenticodeProbe(stdout) {
 }
 
 export function validateAuthenticodeAggregate(value, expectedPublisher) {
+  // `publisher` is the certificate SimpleName returned by GetNameInfo, not
+  // the full distinguished Subject. The latter is a separate activation fact
+  // and is intentionally absent from this caller-controlled receipt input.
   const source = readRecord(
     value,
     AUTHENTICODE_KEYS,
@@ -548,18 +611,29 @@ function stableValue(value) {
 
 function validateReceiptPolicy(value) {
   const policy = readRecord(value, SIGNING_REQUEST_POLICY_KEYS);
+  const excludedCredentials = readArray(
+    policy.excludedCredentials,
+    WINDOWS_NATIVE_PRESIGN_TRUSTEDSIGNING_EXCLUDED_CREDENTIALS.length,
+  );
   if (policy.trustedSigningModuleVersion
       !== WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.trustedSigningModuleVersion
+      || policy.trustedSigningCredentialMode
+        !== WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.trustedSigningCredentialMode
       || policy.requestedFileDigest
         !== WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.requestedFileDigest
       || policy.timestampRfc3161
         !== WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.timestampRfc3161
       || policy.requestedTimestampDigest
-        !== WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.requestedTimestampDigest) {
+        !== WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.requestedTimestampDigest
+      || excludedCredentials.some((name, index) =>
+        name !== WINDOWS_NATIVE_PRESIGN_TRUSTEDSIGNING_EXCLUDED_CREDENTIALS[index])) {
     fail(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid);
   }
   return Object.freeze({
     trustedSigningModuleVersion: WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.trustedSigningModuleVersion,
+    trustedSigningCredentialMode:
+      WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.trustedSigningCredentialMode,
+    excludedCredentials: Object.freeze([...excludedCredentials]),
     requestedFileDigest: WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.requestedFileDigest,
     timestampRfc3161: WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.timestampRfc3161,
     requestedTimestampDigest: WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.requestedTimestampDigest,
@@ -567,6 +641,8 @@ function validateReceiptPolicy(value) {
 }
 
 function validateReceiptAuthenticode(value, expectedPublisher) {
+  // Receipts bind the exact configured certificate SimpleName. A full Subject
+  // DN is never accepted as a substitute for that display-name comparison.
   const source = readRecord(
     value,
     AUTHENTICODE_KEYS,

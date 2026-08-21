@@ -1038,6 +1038,7 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/windows-portability.yml",
+        ".github/workflows/windows-production-finalizer.yml",
         "test/windows-filesystem-manifest.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
@@ -1072,6 +1073,8 @@
       "stableAliasReason": "Development-only Electron app staging has no supported product command while the Windows-first delivery goal is active.",
       "additionalAliases": [],
       "callers": [
+        ".github/workflows/windows-portability.yml",
+        ".github/workflows/windows-production-finalizer.yml",
         "test/electron-app-package.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
@@ -1530,14 +1533,38 @@
     {
       "classification": "build_release_operation",
       "owner": "electron_packaging",
+      "canonicalPath": "scripts/build-windows-production-finalizer-authority-input.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The offline authority-input join is an internal protected-finalizer support entrypoint, not a supported npm command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/windows-production-finalizer-signed.yml",
+        "test/windows-production-finalizer-authority-input.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
       "canonicalPath": "scripts/verify-windows-finalizer-qualification-handoff.mjs",
       "stableAlias": null,
       "stableAliasReason": "The offline handoff verifier is a protected finalizer support entrypoint, not a supported npm command.",
       "additionalAliases": [],
       "callers": [
+        ".github/workflows/windows-production-finalizer.yml",
         "test/windows-finalizer-qualification-handoff.test.js",
+        "test/windows-finalizer-source-evidence-selector.test.js",
+        "test/windows-native-presign-input-builder.test.js",
+        "test/windows-production-finalizer-authority-driver.test.js",
+        "scripts/build-windows-production-finalizer-authority-input.mjs",
         "scripts/build-windows-production-finalizer-authority.mjs",
-        "test/windows-production-finalizer-authority.test.js"
+        "scripts/build-windows-native-presign-input.mjs",
+        "scripts/run-windows-production-finalizer-authority.mjs",
+        "test/windows-production-finalizer-authority.test.js",
+        "test/windows-production-finalizer-authority-input.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
@@ -1552,8 +1579,136 @@
       "stableAliasReason": "The content-free authority join is an internal protected-finalizer support entrypoint, not a supported npm command.",
       "additionalAliases": [],
       "callers": [
+        "scripts/run-windows-production-finalizer-authority.mjs",
         "test/windows-production-finalizer-authority.test.js",
+        "test/windows-production-finalizer-authority-input.test.js",
         "docs/runbooks/2026-08-21-windows-signed-finalizer.md"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/run-windows-production-finalizer-authority.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The bounded authority-manifest CLI driver is an internal protected-finalizer support entrypoint, not a supported npm command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/windows-production-finalizer-signed.yml",
+        "test/windows-production-finalizer-authority-driver.test.js",
+        "test/windows-production-finalizer-authority-input.test.js",
+        "docs/runbooks/2026-08-21-windows-signed-finalizer.md"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/select-windows-finalizer-source-evidence.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The offline GitHub run and artifact evidence selector is an internal protected-finalizer support entrypoint, not a supported npm command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/build-windows-production-finalizer-authority-input.mjs",
+        ".github/workflows/windows-production-finalizer.yml",
+        "test/windows-finalizer-source-evidence-selector.test.js",
+        "test/windows-production-finalizer-authority-input.test.js",
+        "docs/runbooks/2026-08-21-windows-signed-finalizer.md"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/build-windows-native-presign-input.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The offline native-presign input join is an internal protected-finalizer support entrypoint, not a supported npm command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/windows-production-finalizer-signed.yml",
+        "test/windows-native-presign-input-builder.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/verify-windows-production-authenticode-inventory.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The bounded Windows Authenticode inventory verifier is an internal protected-finalizer support entrypoint, not a supported npm command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/verify-windows-production-installer.mjs",
+        "scripts/verify-windows-production-packaged-artifact.mjs",
+        "scripts/build-windows-production-finalizer-receipt.mjs",
+        "test/windows-production-authenticode-inventory.test.js",
+        "test/windows-production-finalizer-receipt.test.js",
+        "test/windows-production-installer.test.js",
+        "test/windows-production-packaged-artifact.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/verify-windows-production-installer.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The bounded Windows installer evidence verifier is an internal protected-finalizer support entrypoint, not a supported npm command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/build-windows-production-finalizer-receipt.mjs",
+        "test/windows-production-finalizer-receipt.test.js",
+        "test/windows-production-installer.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/verify-windows-production-packaged-artifact.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The post-builder Windows directory verifier is an internal protected-finalizer support entrypoint, not a supported npm command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/windows-production-packaged-artifact.test.js",
+        "test/windows-production-finalizer-receipt.test.js",
+        ".github/workflows/windows-production-finalizer-signed.yml",
+        "scripts/build-windows-production-finalizer-receipt.mjs",
+        "docs/runbooks/2026-08-21-windows-signed-finalizer.md"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/build-windows-production-finalizer-receipt.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The protected signed-candidate receipt join is an internal finalizer support entrypoint, not a supported npm command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/windows-production-finalizer-signed.yml",
+        "test/windows-production-finalizer-receipt.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
@@ -1568,6 +1723,8 @@
       "stableAliasReason": null,
       "additionalAliases": [],
       "callers": [
+        ".github/workflows/windows-production-finalizer.yml",
+        ".github/workflows/windows-production-finalizer-signed.yml",
         "package.json#scripts.preflight:windows:trusted-signing",
         "test/windows-trusted-signing-pin.test.js"
       ],
@@ -1584,10 +1741,22 @@
       "stableAliasReason": null,
       "additionalAliases": [],
       "callers": [
+        ".github/workflows/windows-production-finalizer-signed.yml",
         "package.json#scripts.presign:windows:native",
+        "scripts/build-windows-production-finalizer-receipt.mjs",
         "test/windows-native-presign.test.js",
+        "test/windows-native-presign-input-builder.test.js",
+        "test/windows-production-finalizer-workflow-contract.test.js",
+        "test/windows-production-finalizer-authority-driver.test.js",
+        "scripts/build-windows-production-finalizer-authority-input.mjs",
+        "scripts/build-windows-native-presign-input.mjs",
         "scripts/build-windows-production-finalizer-authority.mjs",
-        "test/windows-production-finalizer-authority.test.js"
+        "scripts/run-windows-production-finalizer-authority.mjs",
+        "scripts/verify-windows-production-authenticode-inventory.mjs",
+        "test/windows-production-finalizer-receipt.test.js",
+        "test/windows-production-finalizer-authority.test.js",
+        "test/windows-production-finalizer-authority-input.test.js",
+        "test/windows-production-finalizer-workflow.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",

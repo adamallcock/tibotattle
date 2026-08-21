@@ -12,6 +12,39 @@ const AZURE_PUBLISHER_ENV = "TIBOTATTLE_ELECTRON_AZURE_PUBLISHER_NAME";
 const AZURE_ENDPOINT_ENV = "TIBOTATTLE_ELECTRON_AZURE_ENDPOINT";
 const AZURE_ACCOUNT_ENV = "TIBOTATTLE_ELECTRON_AZURE_CODE_SIGNING_ACCOUNT_NAME";
 const AZURE_PROFILE_ENV = "TIBOTATTLE_ELECTRON_AZURE_CERTIFICATE_PROFILE_NAME";
+// These values are supplied by the reviewed Azure Artifact Signing handoff.
+// Keep them closed here: a syntactically valid but different resource must
+// never silently redirect a production-shaped build to another signer.
+const AZURE_EXPECTED_PUBLISHER = "Adam Allcock";
+const AZURE_EXPECTED_ENDPOINT = "https://eus.codesigning.azure.net/";
+const AZURE_EXPECTED_ACCOUNT = "tibotattlesigning";
+const AZURE_EXPECTED_PROFILE = "tibotattle-windows-public";
+const AZURE_EXPECTED_TIMESTAMP = "http://timestamp.acs.microsoft.com";
+const WINDOWS_SIGNING_OPERATION_EVIDENCE_ROOT = path.join(
+  REPOSITORY_ROOT,
+  ".release-build/electron-production/windows-x64/evidence",
+);
+const WINDOWS_SIGNING_OPERATION_LEDGER_LEAF = "windows-signing-operation-ledger.json";
+// TrustedSigning 0.5.0 uses DefaultAzureCredential.  Azure/login supplies
+// the approved service-principal session through the Azure CLI cache; every
+// other credential source is disabled explicitly.  ExcludeAzureCliCredential
+// is intentionally absent so the two signing paths share one credential mode.
+const TRUSTEDSIGNING_AZURE_CLI_ONLY_EXCLUSIONS = Object.freeze({
+  ExcludeEnvironmentCredential: true,
+  ExcludeWorkloadIdentityCredential: true,
+  ExcludeManagedIdentityCredential: true,
+  ExcludeSharedTokenCacheCredential: true,
+  ExcludeVisualStudioCredential: true,
+  ExcludeVisualStudioCodeCredential: true,
+  ExcludeAzurePowerShellCredential: true,
+  ExcludeAzureDeveloperCliCredential: true,
+  ExcludeInteractiveBrowserCredential: true,
+});
+// Keep this list in lockstep with the protected finalizer policy.  These
+// names must not be present in the builder process even when a developer or
+// runner has them in its ambient environment.  The four TIBOTATTLE_ELECTRON_*
+// resource variables below are the only Azure values intentionally passed to
+// electron-builder.
 const LEGACY_SIGNING_ENV_NAMES = new Set([
   "CSC_LINK",
   "WIN_CSC_LINK",
@@ -26,16 +59,34 @@ const LEGACY_SIGNING_ENV_NAMES = new Set([
   "WIN_CERTIFICATE_PASSWORD",
   "AZURE_CLIENT_ID",
   "AZURE_TENANT_ID",
+  "AZURE_SUBSCRIPTION_ID",
+  "AZURE_CREDENTIALS",
   "AZURE_CLIENT_SECRET",
   "AZURE_CLIENT_CERTIFICATE_PATH",
   "AZURE_CLIENT_CERTIFICATE_PASSWORD",
   "AZURE_USERNAME",
   "AZURE_PASSWORD",
   "AZURE_FEDERATED_TOKEN_FILE",
+  "AZURE_CODE_SIGNING_ACCOUNT_NAME",
+  "AZURE_CODE_SIGNING_PROFILE_NAME",
+  "AZURE_CODE_SIGNING_ENDPOINT",
+  "AZURE_CODE_SIGNING_PUBLISHER_NAME",
+  "AZURE_CODE_SIGNING_TIMESTAMP_URL",
   "ARM_CLIENT_ID",
   "ARM_TENANT_ID",
+  "ARM_SUBSCRIPTION_ID",
   "ARM_CLIENT_SECRET",
   "ARM_CLIENT_CERTIFICATE_PATH",
+  "ARM_CLIENT_CERTIFICATE_PASSWORD",
+  "ARM_USERNAME",
+  "ARM_PASSWORD",
+  "ARM_FEDERATED_TOKEN_FILE",
+  "TIBOTATTLE_WINDOWS_PFX_PATH",
+]);
+const FORBIDDEN_SIGNING_ENVIRONMENT_PATTERNS = Object.freeze([
+  /(?:^|_)(?:WIN_)?CSC(?:_|$)/u,
+  /(?:^|_)(?:PFX|P12)(?:_|$)/u,
+  /(?:^|_)(?:AZURE|ARM)_(?:CLIENT_SECRET|CLIENT_CERTIFICATE|FEDERATED_TOKEN)(?:_|$)/u,
 ]);
 const VERSION_PATTERN = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
 const RESOURCE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
@@ -62,9 +113,7 @@ function hasForbiddenSigningEnvironment() {
   return Object.keys(process.env).some((key) => {
     const upperKey = key.toUpperCase();
     if (LEGACY_SIGNING_ENV_NAMES.has(upperKey)) return true;
-    if (/(?:^|_)(?:WIN_)?CSC(?:_|$)/u.test(upperKey)) return true;
-    if (/(?:^|_)(?:PFX|P12)(?:_|$)/u.test(upperKey)) return true;
-    if (/(?:^|_)(?:AZURE|ARM)_(?:CLIENT_SECRET|CLIENT_CERTIFICATE|FEDERATED_TOKEN)(?:_|$)/u.test(upperKey)) {
+    if (FORBIDDEN_SIGNING_ENVIRONMENT_PATTERNS.some((pattern) => pattern.test(upperKey))) {
       return true;
     }
     return false;
@@ -132,6 +181,18 @@ function requireAzureEndpoint() {
   return value;
 }
 
+function requireExactAzureResource(name, expected, pattern) {
+  const value = requireSafeEnvironmentValue(name, pattern);
+  if (value !== expected) fail();
+  return value;
+}
+
+function requireExactAzureEndpoint() {
+  const value = requireAzureEndpoint();
+  if (value !== AZURE_EXPECTED_ENDPOINT) fail();
+  return value;
+}
+
 function readReleaseInputs() {
   if (hasForbiddenSigningEnvironment()) fail();
   requireExactEnvironmentValue(RELEASE_TARGET_ENV, "win32");
@@ -142,17 +203,20 @@ function readReleaseInputs() {
 
   return Object.freeze({
     packageVersion,
-    publisherName: requireSafeEnvironmentValue(
+    publisherName: requireExactAzureResource(
       AZURE_PUBLISHER_ENV,
+      AZURE_EXPECTED_PUBLISHER,
       PUBLISHER_NAME_PATTERN,
     ),
-    endpoint: requireAzureEndpoint(),
-    codeSigningAccountName: requireSafeEnvironmentValue(
+    endpoint: requireExactAzureEndpoint(),
+    codeSigningAccountName: requireExactAzureResource(
       AZURE_ACCOUNT_ENV,
+      AZURE_EXPECTED_ACCOUNT,
       RESOURCE_NAME_PATTERN,
     ),
-    certificateProfileName: requireSafeEnvironmentValue(
+    certificateProfileName: requireExactAzureResource(
       AZURE_PROFILE_ENV,
+      AZURE_EXPECTED_PROFILE,
       RESOURCE_NAME_PATTERN,
     ),
   });
@@ -254,14 +318,21 @@ module.exports = {
     signExts: [".dll", "!.node"],
     requestedExecutionLevel: "asInvoker",
     verifyUpdateCodeSignature: true,
+    // The pinned app-builder-lib patch emits one content-free, no-clobber
+    // operation ledger here after the complete packaging/signing pass. Its
+    // JSON contains only fixed extension classes and counts; the protected
+    // finalizer binds it to this exact production output before promotion.
+    windowsSigningOperationEvidenceRoot: WINDOWS_SIGNING_OPERATION_EVIDENCE_ROOT,
+    windowsSigningOperationLedgerLeaf: WINDOWS_SIGNING_OPERATION_LEDGER_LEAF,
     azureSignOptions: {
       publisherName: RELEASE_INPUTS.publisherName,
       endpoint: RELEASE_INPUTS.endpoint,
       certificateProfileName: RELEASE_INPUTS.certificateProfileName,
       codeSigningAccountName: RELEASE_INPUTS.codeSigningAccountName,
       fileDigest: "SHA256",
-      timestampRfc3161: "http://timestamp.acs.microsoft.com",
+      timestampRfc3161: AZURE_EXPECTED_TIMESTAMP,
       timestampDigest: "SHA256",
+      ...TRUSTEDSIGNING_AZURE_CLI_ONLY_EXCLUSIONS,
     },
   },
   nsis: {

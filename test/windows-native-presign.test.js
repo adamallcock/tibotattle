@@ -19,14 +19,18 @@ import test from "node:test";
 
 import {
   WINDOWS_NATIVE_PRESIGN_FIXED_STATUS,
+  WINDOWS_NATIVE_PRESIGN_AZURE_IDENTITY,
   WINDOWS_NATIVE_PRESIGN_KEYTAR_SHA256,
   WINDOWS_NATIVE_PRESIGN_MODULES,
   WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY,
   WINDOWS_NATIVE_PRESIGN_SCHEMA,
   WINDOWS_NATIVE_PRESIGN_STATUS,
   WINDOWS_NATIVE_PRESIGN_TARGET,
+  WINDOWS_NATIVE_PRESIGN_TRUSTEDSIGNING_CREDENTIAL_MODE,
+  WINDOWS_NATIVE_PRESIGN_TRUSTEDSIGNING_EXCLUDED_CREDENTIALS,
   WindowsNativePresignError,
   buildTrustedSigningPowerShellCommand,
+  buildAuthenticodeProbeCommand,
   buildWindowsNativePresignReceipt,
   parseWindowsNativePresignReceipt,
   runWindowsNativePresign,
@@ -39,7 +43,7 @@ import {
 
 const REVISION = "a".repeat(40);
 const HANDOFF_SHA = "b".repeat(64);
-const PUBLISHER = "CN=TiboTattle Test";
+const PUBLISHER = WINDOWS_NATIVE_PRESIGN_AZURE_IDENTITY.publisher;
 const THUMBPRINT = "c".repeat(40);
 const KEYTAR_SOURCE = resolve(
   "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node",
@@ -92,9 +96,11 @@ async function fixture() {
     },
     keytarSha256: WINDOWS_NATIVE_PRESIGN_KEYTAR_SHA256,
     azure: {
-      endpoint: "https://eus.codesigning.azure.net/",
-      codeSigningAccountName: "tibotattle-test",
-      certificateProfileName: "profile-test",
+      endpoint: WINDOWS_NATIVE_PRESIGN_AZURE_IDENTITY.endpoint,
+      codeSigningAccountName:
+        WINDOWS_NATIVE_PRESIGN_AZURE_IDENTITY.codeSigningAccountName,
+      certificateProfileName:
+        WINDOWS_NATIVE_PRESIGN_AZURE_IDENTITY.certificateProfileName,
       publisher: PUBLISHER,
     },
   };
@@ -256,6 +262,16 @@ test("validates the closed receipt contract and every expected binding", async (
       candidate.signingRequestPolicy.requestedFileDigest = "SHA1";
     });
     invalidReceipt((candidate) => {
+      candidate.signingRequestPolicy.trustedSigningCredentialMode = "ambient";
+    });
+    invalidReceipt((candidate) => {
+      candidate.signingRequestPolicy.excludedCredentials[0] =
+        "ExcludeAzureCliCredential";
+    });
+    invalidReceipt((candidate) => {
+      candidate.signingRequestPolicy.excludedCredentials.pop();
+    });
+    invalidReceipt((candidate) => {
       candidate.modules.reverse();
     });
     invalidReceipt((candidate) => {
@@ -394,6 +410,10 @@ test("accepts only the closed exact input and fixed production staging root", as
       { ...value.options, revision: "A".repeat(40) },
       { ...value.options, packageVersion: "0.1.15-beta" },
       { ...value.options, azure: { ...value.options.azure, endpoint: "https://evil.example/" } },
+      { ...value.options, azure: { ...value.options.azure, endpoint: "https://west.codesigning.azure.net/" } },
+      { ...value.options, azure: { ...value.options.azure, codeSigningAccountName: "another-account" } },
+      { ...value.options, azure: { ...value.options.azure, certificateProfileName: "another-profile" } },
+      { ...value.options, azure: { ...value.options.azure, publisher: "Another Publisher" } },
     ]) {
       assert.throws(
         () => validateWindowsNativePresignOptions(candidate, {
@@ -436,8 +456,45 @@ test("constructs the exact pinned Trusted Signing command without a credential",
     assert.match(command, /-TimestampRfc3161 'http:\/\/timestamp\.acs\.microsoft\.com'/u);
     assert.match(command, /-TimestampDigest 'SHA256'/u);
     assert.match(command, /-FileDigest 'SHA256'/u);
+    const expectedExclusionSwitches =
+      WINDOWS_NATIVE_PRESIGN_TRUSTEDSIGNING_EXCLUDED_CREDENTIALS
+        .map((name) => `-${name}`)
+        .join(" ");
+    assert.match(command, new RegExp(
+      `-FileDigest 'SHA256' ${expectedExclusionSwitches} -Files`,
+      "u",
+    ));
+    assert.equal(
+      WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.trustedSigningCredentialMode,
+      WINDOWS_NATIVE_PRESIGN_TRUSTEDSIGNING_CREDENTIAL_MODE,
+    );
+    assert.deepEqual(
+      WINDOWS_NATIVE_PRESIGN_REQUEST_POLICY.excludedCredentials,
+      WINDOWS_NATIVE_PRESIGN_TRUSTEDSIGNING_EXCLUDED_CREDENTIALS,
+    );
+    assert.doesNotMatch(command, /ExcludeAzureCliCredential/u);
     assert.match(command, /-Files '/u);
-    assert.doesNotMatch(command, /client.secret|password|token|pfx/iu);
+    assert.doesNotMatch(
+      command,
+      /client\.secret|password|pfx|AZURE_CLIENT_ID|AZURE_TENANT_ID|AZURE_CLIENT_SECRET|AZURE_FEDERATED_TOKEN_FILE/iu,
+    );
+    const probe = buildAuthenticodeProbeCommand(value.filesystemPath);
+    assert.match(
+      probe,
+      /SignerCertificate\.GetNameInfo\(\[System\.Security\.Cryptography\.X509Certificates\.X509NameType\]::SimpleName, \$false\)/u,
+    );
+    assert.doesNotMatch(probe, /SignerCertificate\.Subject/u);
+    for (const azure of [
+      { ...value.options.azure, endpoint: "https://west.codesigning.azure.net/" },
+      { ...value.options.azure, codeSigningAccountName: "another-account" },
+      { ...value.options.azure, certificateProfileName: "another-profile" },
+      { ...value.options.azure, publisher: "Another Publisher" },
+    ]) {
+      assert.throws(
+        () => buildTrustedSigningPowerShellCommand(value.filesystemPath, azure),
+        expectCode(WINDOWS_NATIVE_PRESIGN_FIXED_STATUS.inputInvalid),
+      );
+    }
   } finally {
     await value.cleanup();
   }
@@ -446,9 +503,17 @@ test("constructs the exact pinned Trusted Signing command without a credential",
 test("Authenticode aggregate is exact, publisher-bound, timestamped, and PA-verified", () => {
   const selected = validateAuthenticodeAggregate(authenticode(), PUBLISHER);
   assert.equal(selected.signerThumbprint, THUMBPRINT);
+  // The configured publisher is the certificate SimpleName. A valid full
+  // distinguished subject is not interchangeable with that display name.
+  assert.doesNotThrow(() => validateAuthenticodeAggregate(
+    authenticode({ publisher: "Adam Allcock" }),
+    "Adam Allcock",
+  ));
   for (const candidate of [
     authenticode({ status: "UnknownError" }),
     authenticode({ publisher: "CN=Someone Else" }),
+    authenticode({ publisher: "CN=Adam Allcock, O=Unverified Example" }),
+    authenticode({ publisher: "Adam Allcock\nCN=Injected" }),
     authenticode({ signerThumbprint: "z".repeat(40) }),
     authenticode({ timestampPresent: false }),
     authenticode({ policy: "authenticode" }),

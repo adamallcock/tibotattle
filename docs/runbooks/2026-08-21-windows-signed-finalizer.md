@@ -7,12 +7,17 @@ status: activation-gated
 
 # Windows signed finalizer runbook
 
-This is the planned, protected Windows x64 finalizer sequence for TiboTattle.
-It is an activation contract, not evidence that signing has run. It must only
-be executed by a future protected native Windows workflow after the exact
-qualification handoff, checkout, and credential authority have been verified.
-It does not add or enable that workflow, acquire credentials, publish an
-artifact, or turn on Windows production support.
+This runbook describes the protected Windows x64 signed-candidate sequence and
+its activation gates. The checked-in
+[`windows-production-finalizer.yml`](../../.github/workflows/windows-production-finalizer.yml)
+remains a manual provenance, build, and read-only TrustedSigning preflight.
+The separate
+[`windows-production-finalizer-signed.yml`](../../.github/workflows/windows-production-finalizer-signed.yml)
+now implements one protected, manually dispatched, single-job candidate flow.
+It has never run: no Azure session, OIDC token, native signing, release
+publication, upload, or signed-artifact retention has occurred. The candidate
+lane is deliberately unpublished and must remain separate from release
+acceptance.
 
 The source qualification boundary is described by the
 [Windows first Electron delivery goal](../goals/2026-08-18-windows-first-electron-delivery-goal.md).
@@ -22,8 +27,33 @@ the authority data contract is
 [`windows-production-authority-manifest.js`](../../src/platform/windows-production-authority-manifest.js),
 the content-free provenance join is
 [`build-windows-production-finalizer-authority.mjs`](../../scripts/build-windows-production-finalizer-authority.mjs),
+the source-run/artifact selector is
+[`select-windows-finalizer-source-evidence.mjs`](../../scripts/select-windows-finalizer-source-evidence.mjs),
+the runner-owned authority driver is
+[`run-windows-production-finalizer-authority.mjs`](../../scripts/run-windows-production-finalizer-authority.mjs),
+the offline authority-input producer is
+[`build-windows-production-finalizer-authority-input.mjs`](../../scripts/build-windows-production-finalizer-authority-input.mjs),
+the post-builder directory verifier is
+[`verify-windows-production-packaged-artifact.mjs`](../../scripts/verify-windows-production-packaged-artifact.mjs),
+the Authenticode inventory verifier is
+[`verify-windows-production-authenticode-inventory.mjs`](../../scripts/verify-windows-production-authenticode-inventory.mjs),
+the installer receipt verifier is
+[`verify-windows-production-installer.mjs`](../../scripts/verify-windows-production-installer.mjs),
+the final content-free receipt join is
+[`build-windows-production-finalizer-receipt.mjs`](../../scripts/build-windows-production-finalizer-receipt.mjs),
+and the signed-candidate workflow policy is
+[`windows-production-signed-finalizer-workflow-contract.js`](../../config/windows-production-signed-finalizer-workflow-contract.js),
+the closed installer/rollback policy is
+[`windows-installer-contract.js`](../../config/windows-installer-contract.js),
 and the native pre-sign primitive is
 [`windows-native-presign.mjs`](../../scripts/windows-native-presign.mjs).
+
+The selector and authority driver may write only inside a fresh, attempt-scoped
+evidence root owned by the protected runner. That root must be exclusively
+owned for the duration of each operation: no concurrent writer, symlink,
+hard-link alias, reparse point, or pre-existing output is permitted. The
+driver's identity checks detect replacement, but they are not a substitute for
+the native Windows qualification of the runner-owned root.
 
 ## Activation gates
 
@@ -35,18 +65,35 @@ Stop before this sequence if any of the following is true:
 - the current checkout is not the exact protected revision/version named by
   that handoff;
 - the finalizer workflow is not a protected, manually authorized Windows x64
-  workflow with pinned actions and content-free artifact retention;
+  workflow with pinned actions, content-free receipts, and no artifact upload
+  or signed-candidate retention;
 - `productionSafe` or a production selector is being used to make signing
   pass; or
 - the operator would need to place a credential, token, raw log, local path,
   user name, or provider response in the repository, receipt, artifact, or
-  workflow summary.
+  workflow summary;
+- the exact Azure identity, protected environment, or external OIDC/RBAC
+  governance supplied for this run has not been rechecked by the operator
+  immediately before the first signing attempt;
+- `AZURE_CODE_SIGNING_TIMESTAMP_URL` is not exactly
+  `http://timestamp.acs.microsoft.com`; or
+- any forbidden Azure, ARM, certificate, password, PFX/P12, or federated-token
+  environment variable is present in the builder process; or
+- the full Authenticode certificate distinguished subject has not been
+  recorded by a protected native preflight and explicitly owner-approved;
+  the current policy deliberately records that DN as not supplied and
+  unverified.
 
-As of 2026-08-21, these gates are not closed. The checked-in workflow set has
-the manual portability qualification but no enabled production finalizer;
-the current goal records a native SQLite qualification blocker; the presign
-test is explicitly deferred on Windows; and `productionSafe` plus every
-production selector remain false. No signed Windows artifact is accepted.
+As of 2026-08-21, the preflight lane remains
+`preflight_implemented_signing_inactive`, while the signed workflow policy is
+`signed_candidate_implemented_unpublished`. The signed workflow exists but has
+never run. Its one job can reach the late Azure CLI login only after protected
+environment approval and the offline provenance/evidence gates; no signing
+operation or release has occurred. The final candidate posture remains
+`production.ready: false`, `production.enabled: false`,
+`production.distribution: "unpublished"`, and every installed-lifecycle field
+is `not_run`. The current goal still records a native SQLite qualification
+blocker, and no signed Windows artifact is accepted as a production release.
 
 ## 1. Verify the qualification handoff and artifact digests
 
@@ -110,10 +157,11 @@ hashes them before parsing and records the fixed `package.json` path, package
 name, version, source revision, byte count, and SHA-256 in the authority
 manifest's `sourcePackage` block.
 
-The planned authority contract uses the protected `main` ref and
-`workflow_dispatch` for the signed finalizer. That is a contract value, not a
-claim that `.github/workflows/windows-production-finalizer.yml` currently
-exists. Do not create or dispatch it as part of this runbook.
+The checked-in preflight uses the protected `main` ref and `workflow_dispatch`
+for its manual provenance/build lane. Those values are not evidence of signed
+promotion. Do not treat a successful preflight as a signed release or add
+signing, OIDC, Azure login, or publication behavior to it without a separately
+reviewed promotion change.
 
 ## 3. Create fresh disposable Windows staging
 
@@ -124,6 +172,8 @@ reviewed release configuration fixes these roots:
 .release-build/electron-production/windows-x64/app
 .release-build/electron-production/windows-x64/evidence
 .release-build/electron-production/windows-x64/artifacts
+$RUNNER_TEMP/tibotattle-windows-production-finalizer-signed-<run>-<attempt>
+$RUNNER_TEMP/tibotattle-windows-production-finalizer-signed-<run>-<attempt>/azure-config
 ~~~
 
 The app and evidence roots must be newly materialized regular directories,
@@ -132,6 +182,15 @@ temporary receipt, invalidation marker, or unexpected file before any signing
 call. Do not recursively delete an unresolved path to make the check pass;
 discard the complete disposable attempt only after its exact root has been
 identified, then rebuild it from the verified unsigned source.
+
+If the native pre-sign input builder emits
+`WINDOWS_NATIVE_PRESIGN_INPUT_BUILDER_ATTEMPT_CLEANUP_REQUIRED` (or its library
+error exposes `requiresAttemptCleanup: true`), the evidence root changed after
+its temporary file was opened. A path-based helper cannot safely find that
+displaced file again. Treat the complete attempt workspace as tainted, remove
+only its already resolved attempt root in the outer workflow cleanup, and
+rebuild from verified unsigned source. Never reuse either the replacement root
+or the displaced root.
 
 The staged tree must contain exactly the reviewed native pair at the fixed
 paths:
@@ -146,7 +205,63 @@ filesystem module must match the qualified handoff binding. Keytar must match
 the pinned digest in the presign contract. No source path, user home, token,
 credential, or native diagnostic is permitted in a receipt.
 
-## 4. Run the read-only TrustedSigning preflight
+The finalizer evidence root is the place for its content-free receipts and
+transient input documents. The reviewed leaf names are:
+
+~~~text
+.release-build/electron-production/windows-x64/evidence/
+  windows-finalizer-handoff-v2.json
+  windows-native-presign-input.json
+  windows-native-presign-<revision>.json
+  selection-receipt.json
+  source-run.json
+  policy.json
+  finalizer.json
+  authority-input.json                 # transient driver-options document
+  authority.json                        # authority-manifest driver output
+  windows-signing-operation-ledger.json
+  packaged-artifact-receipt.json
+  installer-receipt.json
+  windows-production-finalizer-receipt.json
+~~~
+
+These names are relative to the fresh evidence root. They are not caller-
+controlled absolute paths, and an existing output, temporary output, symlink,
+hard link, or reparse-point alias is a hard stop. The `authority-input.json`
+file is an offline options document; it is not itself proof of authority or of
+a successful build. The signed workflow removes the fixed production, native
+build, source-evidence, download, handoff, Azure CLI, and attempt roots in its
+unconditional cleanup step; it does not upload or retain the signed candidate.
+
+## 4. Verify the supplied Azure identity and run the read-only TrustedSigning preflight
+
+The external setup handoff currently records the following non-secret values as
+supplied/configured: Artifact Signing account `tibotattlesigning`, profile
+`tibotattle-windows-public`, endpoint
+`https://eus.codesigning.azure.net/`, publisher `Adam Allcock`, timestamp URL
+`http://timestamp.acs.microsoft.com`, and protected GitHub environment
+`windows-production-signing`. It also records the expected Entra client,
+tenant, and subscription IDs, the GitHub OIDC issuer/audience/subject, the
+profile-scoped `Artifact Signing Certificate Profile Signer` role, and the
+environment reviewer settings in the checked-in policy contract. This is
+configuration supplied by the operator, not a live API or workflow
+verification. No repository workflow run has yet used OIDC, called
+`azure/login`, invoked TrustedSigning, or signed, uploaded, published, or
+retained a production artifact. No secret is required in the protected GitHub
+environment: the configured values are non-secret resource and identity
+variables, while the signing authority is intended to arrive through the
+protected OIDC/RBAC boundary. The signed workflow grants `id-token: write` at
+workflow and job scope after the protected environment review; target code in
+that approved job can mint an OIDC token. The late `azure/login` step controls
+when the Azure CLI session is established, not when OIDC token capability
+exists, so do not describe it as late token capability. Before the first
+signing attempt, recheck every value and stop if any differs; do not infer
+that a successful Azure login proves the complete external governance state.
+The policy's Authenticode subject status is also
+explicitly `not_supplied_unverified`: no exact distinguished name is
+hardcoded, accepted as caller input, or claimed here. A protected native
+preflight must record the bounded full subject and the owner must approve it
+before signing promotion can proceed.
 
 Run the exact preflight before loading or invoking the signing module:
 
@@ -156,9 +271,23 @@ npm run preflight:windows:trusted-signing
 
 Accept only `WINDOWS_TRUSTEDSIGNING_PREFLIGHT_PASSED`: exactly one installed
 `TrustedSigning` module at version `0.5.0`. `unsupported`, `unavailable`, or
-`invalid` is a hard stop. The preflight is read-only; it must not install a
-module, import a module, invoke signing, or print module paths or PowerShell
-diagnostics.
+`invalid` is a hard stop. Each checked-in Windows lane installs that exact
+module only to support its read-only verifier; installation is not signing.
+The preflight lane never imports or invokes a signer or prints module paths or
+PowerShell diagnostics. The signed candidate lane keeps the module check
+before its late Azure CLI login and native signing step.
+
+Before importing electron-builder or the release config, the protected
+workflow must perform two additional fail-closed checks. First, compare the
+`AZURE_CODE_SIGNING_TIMESTAMP_URL` variable byte-for-byte with
+`http://timestamp.acs.microsoft.com`. Second, enumerate the complete
+`forbiddenBuilderEnvironment` list and the policy's forbidden patterns; fail
+if any forbidden name is present, including any Azure/ARM client secret,
+certificate, password, federated-token, CSC, PFX, or P12 variable. These checks
+must run before the builder import so a contaminated process cannot cache or
+consume an ambient credential. The four `TIBOTATTLE_ELECTRON_AZURE_*` resource
+variables are then required to match the exact account, profile, endpoint, and
+publisher values above.
 
 The release builder must also receive only the reviewed target, signing mode,
 version, endpoint, account name, certificate profile name, and publisher
@@ -174,12 +303,28 @@ Build a closed input object for
 the exact staging root, source revision, package version, v2 handoff hash,
 qualified filesystem binding, pinned keytar SHA-256, and reviewed Azure
 resource names. The input contains no client secret, token, certificate, raw
-PowerShell output, or local diagnostic path. Invoke the fixed package alias
-only on native Windows:
+PowerShell output, or local diagnostic path. The signed candidate workflow
+places the verified canonical v2 handoff in the fresh fixed evidence root
+using no-clobber publication, invokes the offline input builder, and passes
+that generated file to the fixed package alias, only on native Windows:
 
 ~~~powershell
-npm run presign:windows:native -- --input "$env:RUNNER_TEMP\windows-native-presign-input.json"
+$evidenceRoot = Join-Path $PWD '.release-build\electron-production\windows-x64\evidence'
+$handoffName = 'windows-finalizer-handoff-v2.json'
+$inputName = 'windows-native-presign-input.json'
+
+node ./scripts/build-windows-native-presign-input.mjs `
+  --evidence-root $evidenceRoot `
+  --handoff $handoffName `
+  --output $inputName
+
+npm run presign:windows:native -- --input (Join-Path $evidenceRoot $inputName)
 ~~~
+
+The checked-in preflight-only workflow does not create this private evidence
+root or run either command. The signed-candidate workflow contains these
+steps, but it has never run and therefore has produced no native pre-sign
+receipt.
 
 The primitive signs exactly two fixed `.node` files, immediately re-hashes
 each one before its irreversible signing call, invokes TrustedSigning 0.5.0
@@ -190,7 +335,9 @@ passing receipt must show, for each fixed module:
 - unsigned and signed byte counts and SHA-256 values, with changed bytes;
 - the exact package path and module name;
 - `Authenticode` status `Valid`;
-- the exact configured publisher;
+- the exact configured publisher SimpleName (`Adam Allcock`), extracted from
+  the signing certificate with `X509Certificate2.GetNameInfo(SimpleName,
+  false)`;
 - a present timestamp; and
 - successful `signtool` `/pa` verification.
 
@@ -220,7 +367,45 @@ operation.
 - A later packaging failure after native signing follows the same rule. The
   signed staging tree is not reused or re-signed.
 
-## 6. Construct and validate the authority manifest
+## 6. Build the closed authority input and validate the authority manifest
+
+Once the canonical handoff and native pre-sign receipt exist, build the driver
+options with
+[`build-windows-production-finalizer-authority-input.mjs`](../../scripts/build-windows-production-finalizer-authority-input.mjs).
+This is an offline, content-free join. It re-captures the selected source
+evidence and staged runtime tree, validates that the evidence and staging
+roots are disjoint and exclusively owned, and derives the native facts from
+the validated pre-sign receipt. It does not call GitHub or Azure, import
+electron-builder, invoke TrustedSigning, sign, upload, or publish.
+
+The input producer reads these exact relative files from the evidence root and
+staging root:
+
+~~~text
+evidence/selection-receipt.json
+evidence/windows-finalizer-handoff-v2.json
+evidence/windows-native-presign-<revision>.json
+evidence/package.json
+evidence/source-run.json
+evidence/policy.json
+evidence/finalizer.json
+staging/electron-runtime-manifest.json
+staging/package.json
+staging/<closed native/runtime inventory>
+~~~
+
+The protected workflow supplies those names through the producer's closed
+options shape (`--evidence-root`, `--staging-root`, `--selection`,
+`--handoff`, `--native-presign`, `--checkout-package-json`,
+`--source-run-metadata`, `--policy`, `--finalizer-metadata`, and `--output`).
+The producer writes the transient `authority-input.json` through
+no-clobber, identity-checked publication. Its validated output must then be
+passed to
+[`run-windows-production-finalizer-authority.mjs`](../../scripts/run-windows-production-finalizer-authority.mjs),
+which writes the canonical `authority.json` manifest in the same evidence
+root. A changed source file, replaced root, link alias, duplicate, stale
+output, or noncanonical input invalidates the attempt; do not repair or reuse
+that attempt.
 
 After the native receipt is complete and before electron-builder can mutate
 any other bytes, construct the closed
@@ -283,48 +468,181 @@ three checks below:
    operations for either fixed `.node` path, while allowing the expected
    non-native PE signing operations.
 
+The summary is written only to the fixed evidence leaf
+`evidence/windows-signing-operation-ledger.json`. The pinned
+`app-builder-lib` 26.15.7 seam records one finalized ledger with the exact
+classes `exe`, `dll`, `node`, and `unexpected`; an accepted run requires
+`node: 0` and `unexpected: 0`. The receipt contains counts and fixed identity
+metadata only—no absolute paths, credentials, certificates, or raw signer
+diagnostics. The ledger is finalized after the builder's asynchronous work,
+including late NSIS installer/uninstaller targets; cancellation or any build
+failure must not publish a ledger that looks complete.
+
+The packaged-artifact verifier then consumes the raw ledger bytes and the
+fixed post-builder PE file set. Its canonical
+`evidence/packaged-artifact-receipt.json` binds the ledger byte count and
+SHA-256 under `ledger`, and independently computes the ten-file PE aggregate
+under `peInventory`: one main executable, six Electron DLLs, one NSIS
+installer, and the two pre-signed native modules. The aggregate records
+`count` and `signedCount` for that exact closure. It does not claim
+Authenticode validity; the later in-process native collector supplies that
+separate proof. Any ledger-byte drift or PE inventory mismatch taints the
+attempt.
+
 Any native hash drift, unexpected third native module, second `.node` signing
 operation, config drift, builder-version drift, or output mutation fails the
 attempt. Do not rerun the builder against that staging tree.
 
-## 8. Independently verify unpacked, installed, and installer subjects
+## 8. Verify the post-builder directory before installer/lifecycle work
 
-Freeze all final bytes before generating attestation. Produce separate,
-content-free inventories for:
+After electron-builder returns, freeze the `win-unpacked` application tree
+and run
+[`verify-windows-production-packaged-artifact.mjs`](../../scripts/verify-windows-production-packaged-artifact.mjs)
+with the raw, canonical v2 authority bytes, the exact pre-builder staging
+directory, `resources/app.asar`, and its adjacent `resources/app.asar.unpacked`
+directory. The verifier is read-only and emits only a fixed pass/fail status,
+aggregate counts, byte totals, and SHA-256 digests.
 
-1. the unpacked Windows application directory;
-2. the final NSIS installer; and
-3. the application after a clean install into a disposable Windows profile.
+It first validates the authority v2 manifest and takes the two expected native
+paths, unsigned hashes, and signed hashes from that validated snapshot. It then
+overlays the signed native rows over the unsigned runtime-manifest inventory.
+The resulting closure must match the signed staging directory. In the package,
+both `.node` files must be marked unpacked and must match the authority signed
+hashes in `app.asar.unpacked`; no native payload may remain in `app.asar`.
+The runtime manifest and Windows filesystem sidecar must remain in the ASAR
+closure and match their unsigned/staged hashes. Missing, extra, relocated, or
+case-colliding native paths, traversal spellings, symlinks/reparse-like links,
+sidecar disagreement, or archive/unpacked inventory drift is a hard stop.
 
-Each inventory must contain a canonical relative path, byte count, and
-SHA-256, plus one aggregate subject digest. The installed inventory must be
-read back from the actual install result; do not infer it from the unpacked
-directory. The installer subject is the final `.exe`, not an upload candidate.
+This gate proves only the content and layout of the post-builder directory. It
+does not inspect Authenticode, prove the signing publisher, inspect the NSIS
+installer, or replace the installed lifecycle checks below. A failure taints
+the attempt; discard the disposable staging/output roots and start fresh.
 
-For every signed PE in each subject, independently require:
+## 9. Aggregate native Authenticode, installer, and final receipts
 
-- `Get-AuthenticodeSignature` status `Valid`;
-- the exact configured publisher subject;
-- a present RFC-3161 timestamp; and
-- `signtool.exe verify /pa /all` exit success.
+The signed-candidate workflow has one aggregate receipt step:
 
-Re-check the two `.node` files separately against the pre-sign hashes and
-signature aggregates. The installed app must launch, reach the local
+~~~powershell
+node ./scripts/build-windows-production-finalizer-receipt.mjs
+~~~
+
+It does not run the Authenticode or installer verifiers as independent
+production CLI steps. The aggregate process first calls
+`collectWindowsProductionAuthenticodeInventoryForFinalizer()` on native
+Windows x64. That collector seals the fixed roots, validates the authority
+and native pre-sign binding, and probes every expected file with
+`Get-AuthenticodeSignature` plus `signtool.exe verify /pa /all`, checking file
+identity and digest before and after each probe:
+
+~~~text
+.release-build/electron-production/windows-x64/
+  artifacts/
+    win-unpacked/
+  evidence/
+~~~
+
+The closed pre-install subject set is exactly:
+
+- `artifacts/win-unpacked/TiboTattle.exe`;
+- the Electron 43.2.0 DLL allowlist:
+  `d3dcompiler_47.dll`, `ffmpeg.dll`, `libEGL.dll`, `libGLESv2.dll`,
+  `vk_swiftshader.dll`, and `vulkan-1.dll`;
+- `artifacts/win-unpacked/native/windows-filesystem/build/Release/windows_filesystem.node`;
+- `artifacts/win-unpacked/node_modules/@github/keytar/prebuilds/win32-x64/keytar.node`; and
+- `artifacts/TiboTattle-<version>-Windows-x64.exe`.
+
+This is the fixed ten-file PE closure: one main executable, six Electron DLLs,
+two native modules, and one installer.
+
+The standalone `Uninstall TiboTattle.exe` is intentionally not in this
+pre-install closure. Its Authenticode check remains deferred to the installed
+lifecycle, where the actual installer result supplies the subject. The native
+collector requires `probeMode: "native-windows"`; injected evidence is a
+portable test seam and cannot qualify a release.
+
+The collector returns an in-memory branded native receipt. The aggregate
+process calls `assertNativeWindowsProductionAuthenticodeInventoryReceipt()`
+and does not trust, read, or publish a serialized
+`evidence/authenticode-inventory.json` leaf. A JSON object claiming
+`probeMode: "native-windows"` is insufficient without that in-process brand.
+The signed workflow rejects a pre-existing serialized Authenticode leaf before
+this command and expects the native Authenticode projection to be embedded in
+the final content-free receipt instead.
+
+The aggregate then reads the canonical `authority.json`,
+`windows-native-presign-<revision>.json`,
+`windows-signing-operation-ledger.json`, and
+`packaged-artifact-receipt.json` leaves. It derives the installer receipt from
+the exact branded native inventory and authority bytes, verifies the exact
+`artifacts/TiboTattle-<version>-Windows-x64.exe`, and writes
+`evidence/installer-receipt.json` transactionally. Finally it joins the raw
+subject bytes and writes `evidence/windows-production-finalizer-receipt.json`.
+The aggregate receipt status is
+`WINDOWS_PRODUCTION_FINALIZER_RECEIPT_VERIFIED`; the installer sub-receipt
+status is `WINDOWS_PRODUCTION_INSTALLER_VERIFIED`.
+
+The final receipt's `packagedArtifact` field binds the raw packaged-artifact
+receipt, including its raw signing-ledger digest and fixed ten-file PE
+aggregate.
+
+The receipt must be read literally:
+
+- `identity.status` and `staticConfig.status` are
+  `policy_bound_not_inspected`; their product, app ID, upgrade GUID, and NSIS
+  values are contract bindings, not runtime observations;
+- every `staticConfig` value other than its status is `policy_only`;
+- `lifecycle.installed`, `lifecycle.registry`, `lifecycle.uninstaller`, and
+  `lifecycle.retention` are `not_run`;
+- `nativeProof.status` is `not_run`;
+- `retention.ordinaryUninstall` is `not_run`, while
+  `retention.explicitPurge` is `policy_only`; and
+- `signature.source` is `authenticode_inventory_native_windows`, which binds
+  the receipt to the native Authenticode inventory rather than proving an
+  installed lifecycle. The final receipt's `authenticode` field contains the
+  branded inventory projection and its raw-byte digest; there is no separate
+  production Authenticode leaf.
+
+The final receipt also requires `production.distribution` to be
+`"unpublished"`, `production.enabled` to be `false`, and `production.ready` to
+be `false`. The signed candidate is not uploaded or retained: the workflow's
+unconditional cleanup removes the fixed production, native-build, source,
+download, Azure CLI, and attempt roots after the receipt step. No GitHub
+release, update feed, Store submission, website publication, or support claim
+is performed by this workflow.
+
+The rollback policy is closed by
+[`windows-installer-contract.js`](../../config/windows-installer-contract.js):
+manual-only selection of an explicitly chosen previously signed artifact,
+exact publisher/Authenticode/SHA-256 verification, explicit user/operator
+confirmation, exact app ID and upgrade GUID matching, state backup before
+replacement with app-state retention, and a required native installed-
+lifecycle receipt. Automatic or silent downgrade, unsupported artifacts,
+unsigned artifacts, and cross-identity replacements fail closed. Ordinary
+uninstall preserves app state and Credential Manager entries; the separate
+explicit purge remains policy-only and requires explicit confirmation.
+
+Only a native Windows lifecycle run may replace the `not_run` fields. It must
+install into a disposable profile, launch the installed app, reach the local
 dashboard, perform a synthetic refresh, reject a second instance, preserve
-synthetic credential/state data across relaunch, close cleanly, and leave no
-companion descendant. Uninstall and data-retention results are separate
-receipt fields; do not report them as proven if not run.
+synthetic credential/state data across relaunch, close cleanly, verify registry
+and uninstaller behavior, and record uninstall/retention results. Do not count
+the static installer receipt as installed-app proof.
 
 The existing
 [`verify-electron-development-artifact.mjs`](../../scripts/verify-electron-development-artifact.mjs)
-and Windows Electron contract tests can support the structural checks, but a
-macOS or Linux run cannot substitute for these native installed/Authenticode
-checks.
+and the post-builder verifier above support portable structural checks, but a
+macOS or Linux run cannot substitute for native Windows Authenticode,
+installer, ACL, sharing, or installed-lifecycle evidence.
 
-## 9. Attest and retain the frozen result
+## 11. Attest and retain the frozen result
 
-Only after the unpacked, installed, and installer subjects are frozen and
-verified may the protected finalizer:
+The signed-candidate workflow ends after writing the content-free final
+receipt and completing unconditional cleanup. It does not generate an SBOM,
+invoke attestation, upload an artifact, retain a signed candidate, or publish
+a release. These remain separate, owner-authorized release gates. A future
+release finalizer may proceed only after the unpacked, installed, and installer
+subjects are frozen and verified, and may then:
 
 1. generate an SPDX SBOM whose subject is the final installer digest;
 2. invoke the repository's protected
@@ -332,10 +650,8 @@ verified may the protected finalizer:
    once for that exact subject and SBOM;
 3. bind the attestation bundle subjects to the final installer digest and
    authority manifest; and
-4. retain the signed-module receipt, v2 handoff, authority manifest, final
-   inventories, installer digest, Authenticode aggregate, no-second-`.node`
-   summary, SBOM, and artifact-specific attestation bundles in protected CI
-   storage.
+4. retain only the approved content-free evidence and artifact-specific
+   attestation bundles in protected CI storage.
 
 Retention must be content-free and must not include source trees, installed
 user data, raw logs, PowerShell output, account identifiers, tokens,
@@ -352,8 +668,11 @@ release gates described in the
 
 ## Exit criteria
 
-The signed-finalizer attempt is accepted only when every item below is present
-and mutually bound on one exact revision:
+The following are production-acceptance criteria, not a claim that the signed
+candidate workflow has met them. That workflow intentionally ends with an
+unpublished candidate, `production.ready: false`, and installed lifecycle
+`not_run`; a future owner-authorized release gate must close the remaining
+items on one exact revision:
 
 - verified v2 warm-and-clean handoff with raw receipt hashes equal to the
   recorded workflow artifact digests;
@@ -366,17 +685,42 @@ and mutually bound on one exact revision:
 - fresh Windows x64 staging with no marker, reparse point, symlink, or stale
   output;
 - exact TrustedSigning 0.5.0 preflight pass;
+- operator-rechecked exact Azure identity, OIDC, RBAC, and protected
+  environment governance, with no reliance on the supplied handoff as live
+  proof;
+- protected native preflight evidence for the full Authenticode distinguished
+  subject, plus explicit owner approval of that subject;
 - passing native presign receipt for exactly the two fixed `.node` modules;
+- a validated `authority-input.json` derived from the closed evidence/staging
+  roots, followed by the canonical `authority.json` manifest in that evidence
+  root;
 - valid authority v2 manifest matching handoff, `sourcePackage`,
   `nativePresign`, binding, version, and native signed bytes;
 - successful electron-builder packaging with `!.node` and zero second native
   signing operations;
+- `evidence/windows-signing-operation-ledger.json` with one finalized ledger,
+  zero `node` operations, and zero `unexpected` operations;
+- passing post-builder directory verification with the authority signed native
+  overlay, exact `app.asar`/`app.asar.unpacked` boundary, and unchanged
+  sidecar/runtime-manifest evidence;
+- packaged-artifact receipt binding the raw signing-ledger bytes and the exact
+  ten-file PE aggregate (`peInventory` count and `signedCount`);
+- branded native-Windows Authenticode collection with
+  `probeMode: "native-windows"`, the exact ten-file pre-install closure, and
+  the uninstaller deferred honestly to installed lifecycle;
+- passing `evidence/installer-receipt.json` and
+  `evidence/windows-production-finalizer-receipt.json`, with the installer
+  derived from the branded native collection, publication disabled, and all
+  installed-lifecycle fields marked `not_run` until a separate native
+  lifecycle receipt exists;
 - independently verified unpacked, installer, and installed subject hashes;
 - valid publisher, timestamp, and `signtool /pa` evidence for every signed
   PE and both native modules;
 - successful disposable installed-app smoke and no orphaned companion;
-- final SBOM and protected attestation bundles bound to the final installer;
-- content-free retained evidence with no secret or raw diagnostic; and
+- final SBOM and protected attestation bundles bound to the final installer
+  (a future release gate; not performed by the signed candidate workflow);
+- approved content-free retained evidence with no secret or raw diagnostic
+  (the signed candidate itself is not retained); and
 - unchanged `productionSafe: false` and production selectors unless a
   separate, explicitly authorized security-promotion goal closes them.
 
@@ -388,11 +732,14 @@ Windows support claim.
 macOS can run the portable contract tests for closed input validation,
 deterministic serialization, injected signer behavior, digest binding,
 no-clobber receipt publication, invalidation semantics, and the content-free
-handoff/package/presign provenance join. It can also check that the release
-configuration expresses `signExts: [".dll", "!.node"]`.
+handoff/package/presign provenance join. It can also run the authority-input,
+Authenticode-inventory fixture, installer-receipt, rollback-policy, and
+zero-`.node` signing-ledger contract tests, and check that the release
+configuration expresses `signExts: [".dll", "!.node"]`. These are portable
+contract checks only; injected evidence must never be promoted to native proof.
 
 macOS cannot prove Azure Trusted Signing credentials or endpoint authority,
-the installed TrustedSigning 0.5.0 module, Windows PE/AuthentiCode behavior,
+the installed TrustedSigning 0.5.0 module, Windows PE/Authenticode behavior,
 `signtool.exe /pa`, Windows reparse-point and sharing races, Windows ACLs,
 native Credential Manager behavior, actual Windows electron-builder signing,
 or the installed Windows lifecycle. Those claims require the protected native

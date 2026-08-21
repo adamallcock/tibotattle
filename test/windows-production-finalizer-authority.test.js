@@ -360,6 +360,10 @@ test("package provenance comes only from bounded raw checkout package.json bytes
 });
 
 test("source REST workflow provenance and run identity are independently cross-matched", () => {
+  const valid = buildWindowsProductionFinalizerAuthority(fixture());
+  assert.equal(valid.sourceQualification.workflow, WINDOWS_PRODUCTION_AUTHORITY_SOURCE_WORKFLOW);
+  assert.equal(valid.finalizer.workflow, WINDOWS_PRODUCTION_AUTHORITY_FINALIZER_WORKFLOW);
+
   const wrongWorkflow = fixture();
   wrongWorkflow.sourceRunMetadata = sourceRunMetadata({
     path: `.github/workflows/other.yml@${WINDOWS_PRODUCTION_AUTHORITY_PROTECTED_REF}`,
@@ -378,6 +382,19 @@ test("source REST workflow provenance and run identity are independently cross-m
     assert.throws(
       () => buildWindowsProductionFinalizerAuthority(value),
       expectCode(WINDOWS_PRODUCTION_FINALIZER_AUTHORITY_FIXED_STATUS.sourceRunMismatch),
+    );
+  }
+
+  for (const path of [
+    `.github/workflows/windows-production-finalizer.yml@${WINDOWS_PRODUCTION_AUTHORITY_PROTECTED_REF}`,
+    `.github/workflows/windows-production-finalizer-signed.yml@${WINDOWS_PRODUCTION_AUTHORITY_PROTECTED_REF}`,
+    ".github/workflows/windows-production-finalizer-signed.yml",
+  ]) {
+    const value = fixture();
+    value.sourceRunMetadata = sourceRunMetadata({ path });
+    assert.throws(
+      () => buildWindowsProductionFinalizerAuthority(value),
+      expectCode(WINDOWS_PRODUCTION_FINALIZER_AUTHORITY_FIXED_STATUS.sourceRunInvalid),
     );
   }
 });

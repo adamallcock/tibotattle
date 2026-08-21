@@ -492,18 +492,47 @@ test("binds warm and clean receipts to the exact source run and keeps all identi
 });
 
 test("enforces the production finalizer workflow, repository, and run binding", () => {
-  for (const [field, value] of [
-    ["workflow", WINDOWS_PRODUCTION_AUTHORITY_SOURCE_WORKFLOW],
-    ["repository", "someone-else/tibotattle"],
-    ["ref", "refs/heads/release"],
-    ["event", "push"],
-    ["headSha", "b".repeat(40)],
-    ["sourceRevision", "b".repeat(40)],
+  const valid = createWindowsProductionAuthorityManifest(fixture());
+  assert.equal(
+    valid.finalizer.workflow,
+    ".github/workflows/windows-production-finalizer-signed.yml",
+  );
+  assert.equal(valid.finalizer.event, "workflow_dispatch");
+  assert.equal(valid.finalizer.ref, "refs/heads/main");
+  assert.equal(valid.finalizer.repository, WINDOWS_PRODUCTION_AUTHORITY_REPOSITORY);
+  assert.equal(valid.finalizer.headSha, REVISION);
+
+  for (const [field, value, code] of [
+    ["workflow", WINDOWS_PRODUCTION_AUTHORITY_SOURCE_WORKFLOW, "mismatch"],
+    ["workflow", ".github/workflows/windows-production-finalizer.yml", "mismatch"],
+    ["workflow", `${WINDOWS_PRODUCTION_AUTHORITY_FINALIZER_WORKFLOW}@refs/heads/main`, "unsafe"],
+    ["repository", "someone-else/tibotattle", "mismatch"],
+    ["ref", "refs/heads/release", "mismatch"],
+    ["event", "push", "mismatch"],
+    ["headSha", "b".repeat(40), "mismatch"],
+    ["sourceRevision", "b".repeat(40), "mismatch"],
   ]) {
-    invalid(fixture({ finalizer: { [field]: value } }), "mismatch");
+    invalid(fixture({ finalizer: { [field]: value } }), code);
   }
   invalid(fixture({ finalizer: { status: "completed" } }), "invalid");
   invalid(fixture({ finalizer: { conclusion: "success" } }), "invalid");
+
+  const sameRun = fixture();
+  sameRun.finalizer.run = sameRun.sourceQualification.run;
+  invalid(sameRun, "mismatch");
+
+  const accessor = fixture();
+  Object.defineProperty(accessor.finalizer, "workflow", {
+    enumerable: true,
+    get() {
+      return WINDOWS_PRODUCTION_AUTHORITY_FINALIZER_WORKFLOW;
+    },
+  });
+  invalid(accessor, "unsafe");
+
+  const proxied = fixture();
+  proxied.finalizer = new Proxy(proxied.finalizer, {});
+  invalid(proxied, "unsafe");
 });
 
 test("does not promote capabilities outside the explicit local Windows surface", () => {

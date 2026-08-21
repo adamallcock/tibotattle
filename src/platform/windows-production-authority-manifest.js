@@ -48,7 +48,7 @@ export const WINDOWS_PRODUCTION_AUTHORITY_REPOSITORY =
 export const WINDOWS_PRODUCTION_AUTHORITY_SOURCE_WORKFLOW =
   ".github/workflows/windows-portability.yml";
 export const WINDOWS_PRODUCTION_AUTHORITY_FINALIZER_WORKFLOW =
-  ".github/workflows/windows-production-finalizer.yml";
+  ".github/workflows/windows-production-finalizer-signed.yml";
 export const WINDOWS_PRODUCTION_AUTHORITY_FINALIZER_EVENT = "workflow_dispatch";
 export const WINDOWS_PRODUCTION_AUTHORITY_PROTECTED_REF = "refs/heads/main";
 export const WINDOWS_PRODUCTION_AUTHORITY_HANDOFF_SCHEMA =

@@ -7,6 +7,7 @@ import {
   WINDOWS_INSTALLER_ARTIFACT_NAME_TEMPLATE,
   WINDOWS_INSTALLER_CONTRACT,
   WINDOWS_INSTALLER_CONTRACT_SCHEMA_VERSION,
+  WINDOWS_INSTALLER_ROLLBACK_POLICY,
   WindowsInstallerContractError,
   validateWindowsInstallerContract,
   windowsInstallerArtifactFileName,
@@ -83,6 +84,43 @@ test("canonical Windows installer contract is deeply frozen and exact", () => {
     mechanism: "none",
     metadata: null,
   });
+  assert.deepEqual(WINDOWS_INSTALLER_CONTRACT.rollback, {
+    mode: "manual_only",
+    automaticDowngrade: false,
+    silentDowngrade: false,
+    selection: {
+      required: true,
+      artifact: "explicitly_selected_previously_signed",
+    },
+    verification: {
+      publisher: "exact",
+      signature: "authenticode_valid",
+      digest: "sha256_exact",
+    },
+    confirmation: {
+      required: true,
+      actor: "user_or_operator",
+    },
+    identity: {
+      appId: "com.usagemonitor.local",
+      upgradeGuid: "FDA705D7-5644-50E8-8CD2-3005D51B98C5",
+      match: "exact",
+    },
+    state: {
+      backupBeforeReplacement: true,
+      retention: "preserve_app_state",
+    },
+    receipt: {
+      required: true,
+      type: "native_installed_lifecycle",
+    },
+    rejection: {
+      unsupported: "fail_closed",
+      unsigned: "fail_closed",
+      crossIdentity: "fail_closed",
+    },
+  });
+  assert.equal(WINDOWS_INSTALLER_ROLLBACK_POLICY, WINDOWS_INSTALLER_CONTRACT.rollback);
   assert.deepEqual(WINDOWS_INSTALLER_CONTRACT.publication, {
     enabled: false,
     distribution: "unpublished",
@@ -138,6 +176,74 @@ test("open, altered, and hostile installer contract shapes fail closed", () => {
   const updater = cloneContract();
   updater.updater.enabled = true;
   expectInvalid(updater);
+
+  const automaticDowngrade = cloneContract();
+  automaticDowngrade.rollback.automaticDowngrade = true;
+  expectInvalid(automaticDowngrade);
+
+  const silentDowngrade = cloneContract();
+  silentDowngrade.rollback.silentDowngrade = true;
+  expectInvalid(silentDowngrade);
+
+  const manualOnly = cloneContract();
+  manualOnly.rollback.mode = "automatic";
+  expectInvalid(manualOnly);
+
+  const selection = cloneContract();
+  selection.rollback.selection.artifact = "current_or_unverified_artifact";
+  expectInvalid(selection);
+
+  const publisher = cloneContract();
+  publisher.rollback.verification.publisher = "any";
+  expectInvalid(publisher);
+
+  const signature = cloneContract();
+  signature.rollback.verification.signature = "optional";
+  expectInvalid(signature);
+
+  const digest = cloneContract();
+  digest.rollback.verification.digest = "best_effort";
+  expectInvalid(digest);
+
+  const confirmation = cloneContract();
+  confirmation.rollback.confirmation.required = false;
+  expectInvalid(confirmation);
+
+  const identity = cloneContract();
+  identity.rollback.identity.upgradeGuid = "FDA705D7-5644-50E8-8CD2-3005D51B98C6";
+  expectInvalid(identity);
+
+  const state = cloneContract();
+  state.rollback.state.backupBeforeReplacement = false;
+  expectInvalid(state);
+
+  const receipt = cloneContract();
+  receipt.rollback.receipt.type = "build_only";
+  expectInvalid(receipt);
+
+  const unsupported = cloneContract();
+  unsupported.rollback.rejection.unsupported = "accept";
+  expectInvalid(unsupported);
+
+  const unsigned = cloneContract();
+  unsigned.rollback.rejection.unsigned = "accept";
+  expectInvalid(unsigned);
+
+  const crossIdentity = cloneContract();
+  crossIdentity.rollback.rejection.crossIdentity = "accept";
+  expectInvalid(crossIdentity);
+
+  const nestedRollbackOpen = cloneContract();
+  nestedRollbackOpen.rollback.verification.unexpected = true;
+  expectInvalid(nestedRollbackOpen);
+
+  const missingRollback = cloneContract();
+  delete missingRollback.rollback.rejection;
+  expectInvalid(missingRollback);
+
+  const topLevelRollbackOpen = cloneContract();
+  topLevelRollbackOpen.rollbackPolicy = "legacy";
+  expectInvalid(topLevelRollbackOpen);
 
   const publication = cloneContract();
   publication.publication.enabled = true;
