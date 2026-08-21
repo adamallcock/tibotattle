@@ -1370,6 +1370,12 @@ bool OpenPreparedRootAndDirectory(
       *failure = reparse ? ReparsePoint() : NotDirectory();
       return false;
     }
+    if (information == kFileCreated && !SetOwnerOnlyDacl(next)) {
+      *failure = SecurityPolicy("dacl_update_failed");
+      if (!MarkHandleForDeletion(next)) *failure = OperationFailed();
+      CloseHandle(next);
+      return false;
+    }
     fullPath->components.push_back(childComponents[index]);
     HandleIdentity identity;
     if (!ValidateSecurity(next, true, failure, &identity)
