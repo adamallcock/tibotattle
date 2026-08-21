@@ -1535,7 +1535,25 @@
       "stableAliasReason": "The offline handoff verifier is a protected finalizer support entrypoint, not a supported npm command.",
       "additionalAliases": [],
       "callers": [
-        "test/windows-finalizer-qualification-handoff.test.js"
+        "test/windows-finalizer-qualification-handoff.test.js",
+        "scripts/build-windows-production-finalizer-authority.mjs",
+        "test/windows-production-finalizer-authority.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/build-windows-production-finalizer-authority.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The content-free authority join is an internal protected-finalizer support entrypoint, not a supported npm command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/windows-production-finalizer-authority.test.js",
+        "docs/runbooks/2026-08-21-windows-signed-finalizer.md"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
@@ -1567,7 +1585,9 @@
       "additionalAliases": [],
       "callers": [
         "package.json#scripts.presign:windows:native",
-        "test/windows-native-presign.test.js"
+        "test/windows-native-presign.test.js",
+        "scripts/build-windows-production-finalizer-authority.mjs",
+        "test/windows-production-finalizer-authority.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
