@@ -4,6 +4,7 @@ import { renameSync } from "node:fs";
 import {
   mkdir,
   mkdtemp,
+  readFile,
   rm,
   stat,
   writeFile,
@@ -13,6 +14,7 @@ import { join } from "node:path";
 import {
   LOCAL_COMPANION_SCHEMA_VERSION,
   LocalCompanionDataStore,
+  RETAINED_PROJECTION_SURFACE_PATHS,
   buildLocalCompanionSnapshot,
 } from "../src/local-companion-data.js";
 import {
@@ -2256,4 +2258,133 @@ test("unified mode with no valid generation withholds the provisional collector 
   } finally {
     await rm(root, { recursive: true });
   }
+});
+
+test("a deferred quick reload keeps the usage figures and both usage timelines", () => {
+  // 0.1.14 protected gradient/weekly and left these three live, because they
+  // sit inside `overview` rather than at the top level. Reported against the
+  // shipped 0.1.14 build as usage still appearing and disappearing while the
+  // charts held still.
+  //
+  // The usage PERIODS matter most here: a deferred build does not empty them,
+  // it replaces them with four fully-formed zeroed placeholders, so any check
+  // based on array length reads them as present and lets zeroes overwrite real
+  // totals.
+  const period = (events) => ({ id: "7d", label: "Last 7 days", events });
+  const snapshotFor = (purpose) => {
+    const deferred = ["startup", "quick"].includes(purpose);
+    return {
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      mode: "real_local_evidence",
+      generatedAt: "2026-08-20T21:00:00.000Z",
+      overview: {
+        marker: purpose,
+        quota: { windows: [{ remainingPercent: purpose === "quick" ? 41 : 77 }] },
+        usage: deferred ? [period(0)] : [period(12)],
+        timeline: {
+          usage: deferred ? [] : [{ at: 1 }, { at: 2 }],
+          sparkUsage: deferred ? [] : [{ at: 1 }],
+          calibrationUsage: deferred ? [] : [{ at: 1 }],
+          quota: [{ at: 9 }],
+        },
+      },
+      gradient: { datasets: deferred ? { rolling: [] } : { rolling: [{ at: 1 }] } },
+      weekly: { datasets: deferred ? { weekly_values: [] } : { weekly_values: [{ sequence: 1 }] } },
+      quality: {},
+      reports: [],
+    };
+  };
+  const store = new LocalCompanionDataStore({
+    builder: async ({ purpose = "full" } = {}) => snapshotFor(purpose),
+  });
+
+  return (async () => {
+    await store.reload({ purpose: "full" });
+    await store.reload({ purpose: "quick" });
+    const overview = store.getOverview();
+
+    // Retained: the surfaces a deferred build could not rebuild.
+    assert.equal(overview.usage[0].events, 12, "usage totals must not drop to zero");
+    assert.equal(overview.timeline.usage.length, 2);
+    assert.equal(overview.timeline.sparkUsage.length, 1);
+    assert.equal(overview.timeline.calibrationUsage.length, 1);
+    assert.equal(store.getGradient().datasets.rolling.length, 1);
+    assert.equal(store.getWeekly().datasets.weekly_values.length, 1);
+
+    // Still fresh: the fast-moving figures the quick pass exists to deliver.
+    assert.equal(overview.marker, "quick");
+    assert.equal(overview.quota.windows[0].remainingPercent, 41);
+
+    // A surface the build omits entirely stays omitted rather than being
+    // conjured back: absence is a configuration choice, not emptiness.
+    const withoutCalibration = new LocalCompanionDataStore({
+      builder: async ({ purpose = "full" } = {}) => {
+        const next = snapshotFor(purpose);
+        if (["startup", "quick"].includes(purpose)) delete next.overview.timeline.calibrationUsage;
+        return next;
+      },
+    });
+    await withoutCalibration.reload({ purpose: "full" });
+    await withoutCalibration.reload({ purpose: "quick" });
+    assert.equal(
+      Object.hasOwn(withoutCalibration.getOverview().timeline, "calibrationUsage"),
+      false,
+    );
+
+    // A FULL reload stays authoritative in both directions, so a genuine
+    // transition to empty still lands and this can never pin stale figures.
+    const emptying = new LocalCompanionDataStore({
+      builder: async () => {
+        const next = snapshotFor("full");
+        next.overview.usage = [period(0)];
+        next.overview.timeline.usage = [];
+        return next;
+      },
+    });
+    await emptying.reload({ purpose: "full" });
+    await emptying.reload({ purpose: "full" });
+    assert.equal(emptying.getOverview().usage[0].events, 0);
+    assert.equal(emptying.getOverview().timeline.usage.length, 0);
+  })();
+});
+
+test("every surface a withheld projection empties is registered for retention", async () => {
+  // The completeness gate for this defect class. `unifiedAccountingWithheld`
+  // is the single condition under which the builder substitutes evidence-free
+  // values, so enumerating its substitution sites enumerates the class.
+  //
+  // Two of the eight sites yield real data surfaces as bare empty arrays and
+  // one yields the zeroed placeholder periods; the remaining five yield a
+  // coverage window or a source LABEL, which carry no rows and are meant to
+  // change on a deferred pass. If a new evidence-bearing substitution appears,
+  // this fails until it is registered in PROJECTION_SURFACES — which is the
+  // point, because reviewing the retention list is not something anyone
+  // remembers to do when adding a surface.
+  const source = await readFile(
+    new URL("../src/local-companion-data.js", import.meta.url),
+    "utf8",
+  );
+  const emptyArraySites = source.match(/unifiedAccountingWithheld\s+\?\s+\[\]/gu) ?? [];
+  const placeholderPeriodSites =
+    source.match(/unifiedAccountingWithheld\s+\?\s+insufficientEvidenceUsagePeriods\(\)/gu) ?? [];
+
+  assert.equal(
+    emptyArraySites.length,
+    2,
+    "new `unifiedAccountingWithheld ? []` surface — register it in PROJECTION_SURFACES",
+  );
+  assert.equal(
+    placeholderPeriodSites.length,
+    1,
+    "new placeholder-period substitution — register it in PROJECTION_SURFACES",
+  );
+
+  assert.deepEqual(RETAINED_PROJECTION_SURFACE_PATHS, [
+    "gradient",
+    "weekly",
+    "overview.usage",
+    "overview.timeline.usage",
+    "overview.timeline.sparkUsage",
+    "overview.timeline.calibrationUsage",
+  ]);
 });

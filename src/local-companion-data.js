@@ -3331,12 +3331,22 @@ export async function buildLocalCompanionSnapshot({
 // cannot disagree about which reloads arrive without their heavy datasets.
 const DEFERRED_PROJECTION_PURPOSES = new Set(["startup", "quick"]);
 
-// The projection-derived surfaces. A deferred build returns these as empty
-// arrays rather than omitting them, which is why replacing a full snapshot
-// with a quick one blanks the dashboard instead of leaving it alone.
-const PROJECTION_SURFACES = Object.freeze(["gradient", "weekly"]);
-
-function projectionRowCount(surface) {
+// How much evidence a surface is actually carrying. Zero means "a deferred
+// build could not rebuild this", which is the only condition under which the
+// previous value is carried forward.
+//
+// Three shapes, because the builder empties these surfaces three different
+// ways and a single row count silently misses two of them:
+//
+//   datasetRows      gradient/weekly, whose rows sit under `.datasets`
+//   arrayRows        the timelines, which come back as bare empty arrays
+//   usagePeriodRows  the usage periods, which come back FULLY POPULATED with
+//                    four zeroed placeholders from insufficientEvidenceUsagePeriods()
+//
+// That last one is why 0.1.14 fixed the charts but not the usage figures: the
+// placeholder periods have a positive length, so a length check reads them as
+// present and lets them overwrite real totals with zeroes.
+function datasetRows(surface) {
   const datasets = surface?.datasets;
   if (!datasets || typeof datasets !== "object") return 0;
   let rows = 0;
@@ -3345,6 +3355,55 @@ function projectionRowCount(surface) {
   }
   return rows;
 }
+
+function arrayRows(surface) {
+  return Array.isArray(surface) ? surface.length : 0;
+}
+
+function usagePeriodRows(surface) {
+  if (!Array.isArray(surface)) return 0;
+  let events = 0;
+  for (const period of surface) {
+    const value = period?.events;
+    if (typeof value === "number" && Number.isFinite(value)) events += value;
+  }
+  return events;
+}
+
+// Every surface a deferred projection cannot rebuild, as a path into the
+// published snapshot. Registered centrally so the retention and the guard test
+// read the same list: test/local-companion-data.test.js drives the real builder
+// in both modes and fails if any surface loses evidence without appearing here,
+// so a newly added projection surface cannot reintroduce this class silently.
+const PROJECTION_SURFACES = Object.freeze([
+  { path: Object.freeze(["gradient"]), rows: datasetRows },
+  { path: Object.freeze(["weekly"]), rows: datasetRows },
+  { path: Object.freeze(["overview", "usage"]), rows: usagePeriodRows },
+  { path: Object.freeze(["overview", "timeline", "usage"]), rows: arrayRows },
+  { path: Object.freeze(["overview", "timeline", "sparkUsage"]), rows: arrayRows },
+  {
+    path: Object.freeze(["overview", "timeline", "calibrationUsage"]),
+    rows: arrayRows,
+  },
+]);
+
+// Resolve a registered path, or null if any segment is absent. Absence is not
+// emptiness: `calibrationUsage` exists only under the opt-in side-chat estimate
+// flag, and a surface the build deliberately omits must stay omitted rather
+// than being conjured back from the previous snapshot.
+function surfaceParent(snapshot, path) {
+  let node = snapshot;
+  for (const key of path.slice(0, -1)) {
+    if (node === null || typeof node !== "object" || !(key in node)) return null;
+    node = node[key];
+  }
+  if (node === null || typeof node !== "object") return null;
+  return Object.hasOwn(node, path[path.length - 1]) ? node : null;
+}
+
+export const RETAINED_PROJECTION_SURFACE_PATHS = Object.freeze(
+  PROJECTION_SURFACES.map((surface) => surface.path.join(".")),
+);
 
 export class LocalCompanionDataStore {
   #builder;
@@ -3382,24 +3441,33 @@ export class LocalCompanionDataStore {
   //
   // The refresh caller already treats a FAILED quick reload as "keep the
   // previous good dashboard". A successful one should not be more destructive
-  // than a failure. So the fresh overview is taken as-is, and the two
-  // projection-derived surfaces are carried forward whenever the deferred
-  // build has nothing to put in their place.
+  // than a failure, so every projection-derived surface is carried forward
+  // whenever the deferred build has nothing to put in its place.
+  //
+  // 0.1.14 scoped this to the two TOP-LEVEL surfaces and took the fresh
+  // overview as-is. That left the same defect live in the usage figures and
+  // both usage timelines, which live inside `overview` and are emptied
+  // separately by `unifiedAccountingWithheld` — the charts stopped blanking
+  // and the usage kept flickering. Surfaces are registered by path now, so
+  // nesting is not what decides whether a surface is protected.
   //
   // Scoped deliberately: only for the purposes that request a deferred
-  // projection, and only when the incoming surface is genuinely empty while
-  // the retained one is not. A full reload always replaces both, so a real
-  // transition to empty still lands on the next complete refresh and this can
-  // never pin stale figures beyond it.
+  // projection, and only when the incoming surface carries no evidence while
+  // the retained one does. A full reload always replaces every surface, so a
+  // real transition to empty still lands on the next complete refresh and this
+  // can never pin stale figures beyond it.
   #withRetainedProjection(next, options) {
     const purpose = options?.purpose ?? "full";
     if (!DEFERRED_PROJECTION_PURPOSES.has(purpose)) return next;
     const retained = this.#snapshot;
     if (retained === null) return next;
-    for (const surface of PROJECTION_SURFACES) {
-      if (projectionRowCount(next[surface]) === 0
-          && projectionRowCount(retained[surface]) > 0) {
-        next[surface] = structuredClone(retained[surface]);
+    for (const { path, rows } of PROJECTION_SURFACES) {
+      const key = path[path.length - 1];
+      const nextParent = surfaceParent(next, path);
+      const retainedParent = surfaceParent(retained, path);
+      if (nextParent === null || retainedParent === null) continue;
+      if (rows(nextParent[key]) === 0 && rows(retainedParent[key]) > 0) {
+        nextParent[key] = structuredClone(retainedParent[key]);
       }
     }
     return next;
