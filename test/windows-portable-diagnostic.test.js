@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { writeFileSync } from "node:fs";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -10,8 +9,6 @@ import {
   WINDOWS_PORTABLE_MAXIMUM_FAILURE_METADATA_ITEMS,
   WINDOWS_PORTABLE_MAXIMUM_FAILURE_UNIT_METADATA_ITEMS,
   WINDOWS_PORTABLE_MAXIMUM_PROGRESS_UNITS,
-  WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS,
-  WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_ENVIRONMENT_KEY,
   WINDOWS_PORTABLE_SUITE_TIMEOUT_MS,
   WINDOWS_PORTABLE_TEST_TIMEOUT_MS,
   WINDOWS_PORTABLE_QUALIFICATION_ENVIRONMENT_KEYS,
@@ -114,13 +111,6 @@ test("Windows portable diagnostic preserves manifest order and strips qualificat
     assert.equal(
       options.env.TIBOTATTLE_WINDOWS_QUALIFICATION_BINDING_PATH,
       environment.TIBOTATTLE_WINDOWS_QUALIFICATION_BINDING_PATH,
-    );
-    assert.equal(
-      Object.hasOwn(
-        options.env,
-        WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_ENVIRONMENT_KEY,
-      ),
-      false,
     );
   }
 });
@@ -407,101 +397,6 @@ test("Windows portable diagnostic caps content-free failing test ordinals", asyn
   );
 });
 
-test("Windows portable diagnostic reports only framed resource category counts", async () => {
-  const child = fakeChild(9020);
-  let spawnedArguments;
-  let spawnedEnvironment;
-  await assert.rejects(
-    runWindowsPortableTestFiles(["apps/local/server.test.mjs"], {
-      platform: "win32",
-      architecture: "x64",
-      cwd: REPOSITORY_ROOT,
-      timeoutMs: 10,
-      spawnProcess: (_command, arguments_, options) => {
-        spawnedArguments = arguments_;
-        spawnedEnvironment = options.env;
-        queueMicrotask(() => {
-          writeFileSync(
-            options.env[WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_ENVIRONMENT_KEY],
-            "R044789QO27Z",
-          );
-          child.stdout.write("private-canary-123."
-            + "private-canary-987");
-        });
-        return child;
-      },
-      terminateProcessTree: async () => true,
-    }),
-    (error) => {
-      assert.equal(error.code, WINDOWS_PORTABLE_STATUS.timedOut);
-      assert.equal(error.progressUnits, 1);
-      assert.deepEqual(error.resourceUnits, {
-        counts: [1, 0, 0, 0, 2, 0, 0, 1, 1, 1],
-        firstTcpOrdinal: 27,
-        truncated: false,
-      });
-      error.ordinal = WINDOWS_PORTABLE_TEST_FILES.indexOf(
-        "apps/local/server.test.mjs",
-      ) + 1;
-      const formatted = formatWindowsPortableDiagnosticFailure(error);
-      assert.match(formatted, /resource_units=1:0:0:0:2:0:0:1:1:1\/0\/27/u);
-      assert.doesNotMatch(formatted, /private-canary|123|987/u);
-      return true;
-    },
-  );
-  assert.equal(
-    typeof spawnedEnvironment[
-      WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_ENVIRONMENT_KEY
-    ],
-    "string",
-  );
-  assert.equal(spawnedArguments.at(-1), "apps/local/server.test.mjs");
-  assert.equal(spawnedArguments.includes("--test-isolation=none"), false);
-});
-
-test("Windows portable diagnostic caps framed resource category counts", async () => {
-  const child = fakeChild(9021);
-  await assert.rejects(
-    runWindowsPortableTestFiles(["apps/local/server.test.mjs"], {
-      platform: "win32",
-      architecture: "x64",
-      cwd: REPOSITORY_ROOT,
-      timeoutMs: 10,
-      spawnProcess: (_command, _arguments, options) => {
-        const diagnosticFile = options.env[
-          WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_ENVIRONMENT_KEY
-        ];
-        queueMicrotask(() => {
-          writeFileSync(
-            diagnosticFile,
-            `R${"8".repeat(
-              WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS + 1,
-            )}QO54Z`,
-          );
-        });
-        return child;
-      },
-      terminateProcessTree: async () => true,
-    }),
-    (error) => {
-      assert.equal(
-        error.resourceUnits.counts[8],
-        WINDOWS_PORTABLE_MAXIMUM_RESOURCE_UNITS,
-      );
-      assert.equal(error.resourceUnits.truncated, true);
-      assert.equal(error.resourceUnits.firstTcpOrdinal, 54);
-      error.ordinal = WINDOWS_PORTABLE_TEST_FILES.indexOf(
-        "apps/local/server.test.mjs",
-      ) + 1;
-      assert.match(
-        formatWindowsPortableDiagnosticFailure(error),
-        /resource_units=0:0:0:0:0:0:0:0:64:0\/1\/54/u,
-      );
-      return true;
-    },
-  );
-});
-
 test("Windows portable diagnostic removes child and stdout listeners on settle", async () => {
   const child = fakeChild(9016);
   await runWindowsPortableTestFiles(["test/test-lanes.test.js"], {
@@ -692,14 +587,9 @@ test("Windows portable diagnostic formatting is fixed and content-free", () => {
   timeout.ordinal = 1;
   timeout.elapsedMs = 60_000;
   timeout.progressUnits = 7;
-  timeout.resourceUnits = {
-    counts: [0, 0, 0, 0, 1, 0, 0, 0, 2, 0],
-    firstTcpOrdinal: 0,
-    truncated: false,
-  };
   assert.match(
     formatWindowsPortableDiagnosticFailure(timeout),
-    /status=WINDOWS_PORTABLE_DIAGNOSTIC_TEST_TIMED_OUT elapsed_ms=60000 progress_units=7 resource_units=0:0:0:0:1:0:0:0:2:0\/0\/0/u,
+    /status=WINDOWS_PORTABLE_DIAGNOSTIC_TEST_TIMED_OUT elapsed_ms=60000 progress_units=7/u,
   );
 
   const unsafeProgress = new Error("private message");
