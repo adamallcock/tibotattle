@@ -15,6 +15,7 @@ import {
   WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST,
   extractTapPublishErrors,
   extractTapPublishStages,
+  extractTapNativeErrors,
   extractTapTestIndex,
   extractTapTestIndexes,
   extractTapTestLocations,
@@ -660,7 +661,7 @@ test("qualification CLI failure formatting is bounded, numeric, and content-free
     formatWindowsSecurityQualificationFailure(failure),
     "WINDOWS_SECURITY_QUALIFICATION_FAILED test_index=7 "
       + "test_indexes=7,12 test_locations=12:5;20:10 "
-      + "test_file_locations=unavailable",
+      + "test_file_locations=unavailable native_errors=unavailable",
   );
 
   const unsafe = new Error("secret message must not escape");
@@ -673,7 +674,7 @@ test("qualification CLI failure formatting is bounded, numeric, and content-free
     formattedUnsafe,
     "WINDOWS_SECURITY_QUALIFICATION_FAILED test_index=unavailable "
       + "test_indexes=unavailable test_locations=unavailable "
-      + "test_file_locations=unavailable",
+      + "test_file_locations=unavailable native_errors=unavailable",
   );
   assert.doesNotMatch(
     formattedUnsafe,
@@ -689,7 +690,7 @@ test("qualification CLI failure formatting is bounded, numeric, and content-free
     formatWindowsSecurityQualificationFailure(duplicate),
     "WINDOWS_SECURITY_QUALIFICATION_FAILED test_index=4 "
       + "test_indexes=unavailable test_locations=unavailable "
-      + "test_file_locations=unavailable",
+      + "test_file_locations=unavailable native_errors=unavailable",
   );
 });
 
@@ -714,12 +715,42 @@ test("qualification file locations use lexical numeric ordinals and never expose
   failure.testFileLocations = locations;
   assert.match(
     formatWindowsSecurityQualificationFailure(failure),
-    /test_file_locations=\d+:530:7;\d+:301:11$/u,
+    /test_file_locations=\d+:530:7;\d+:301:11 native_errors=unavailable$/u,
   );
   failure.testFileLocations = [[lexicalFiles.length + 1, 1, 1]];
   assert.match(
     formatWindowsSecurityQualificationFailure(failure),
-    /test_file_locations=unavailable$/u,
+    /test_file_locations=unavailable native_errors=unavailable$/u,
+  );
+});
+
+test("qualification native errors are fixed, allowlisted, and content-free", () => {
+  const errors = extractTapNativeErrors([
+    "#   code: 'WINDOWS_FILESYSTEM_ACCESS_DENIED'",
+    "# code: WINDOWS_FILESYSTEM_OPERATION_FAILED",
+    "# code: 'WINDOWS_FILESYSTEM_ACCESS_DENIED'",
+    "# code: 'WINDOWS_FILESYSTEM_NOT_ALLOWLISTED'",
+    "code: 'WINDOWS_FILESYSTEM_SECURITY_POLICY'",
+    "# code: 'WINDOWS_FILESYSTEM_SECURITY_POLICY' secret=hide",
+  ].join("\n"));
+  assert.deepEqual(errors, [
+    "WINDOWS_FILESYSTEM_ACCESS_DENIED",
+    "WINDOWS_FILESYSTEM_OPERATION_FAILED",
+  ]);
+  assert.equal(Object.isFrozen(errors), true);
+  assert.doesNotMatch(errors.join(" "), /secret|allowlisted|hide/iu);
+
+  const failure = new Error("private");
+  failure.code = FIXED_STATUS.failed;
+  failure.nativeErrors = errors;
+  assert.match(
+    formatWindowsSecurityQualificationFailure(failure),
+    /native_errors=WINDOWS_FILESYSTEM_ACCESS_DENIED,WINDOWS_FILESYSTEM_OPERATION_FAILED$/u,
+  );
+  failure.nativeErrors = ["WINDOWS_FILESYSTEM_ACCESS_DENIED", "private"];
+  assert.match(
+    formatWindowsSecurityQualificationFailure(failure),
+    /native_errors=unavailable$/u,
   );
 });
 
