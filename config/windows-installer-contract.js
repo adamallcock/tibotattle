@@ -34,6 +34,7 @@ const WINDOWS_INSTALLER_CONTRACT_KEYS = Object.freeze([
   "installer",
   "dataRetention",
   "updater",
+  "rollback",
   "publication",
 ]);
 const WINDOWS_INSTALLER_APPLICATION_KEYS = Object.freeze([
@@ -78,6 +79,49 @@ const WINDOWS_INSTALLER_UPDATER_KEYS = Object.freeze([
   "enabled",
   "mechanism",
   "metadata",
+]);
+const WINDOWS_INSTALLER_ROLLBACK_KEYS = Object.freeze([
+  "mode",
+  "automaticDowngrade",
+  "silentDowngrade",
+  "selection",
+  "verification",
+  "confirmation",
+  "identity",
+  "state",
+  "receipt",
+  "rejection",
+]);
+const WINDOWS_INSTALLER_ROLLBACK_SELECTION_KEYS = Object.freeze([
+  "required",
+  "artifact",
+]);
+const WINDOWS_INSTALLER_ROLLBACK_VERIFICATION_KEYS = Object.freeze([
+  "publisher",
+  "signature",
+  "digest",
+]);
+const WINDOWS_INSTALLER_ROLLBACK_CONFIRMATION_KEYS = Object.freeze([
+  "required",
+  "actor",
+]);
+const WINDOWS_INSTALLER_ROLLBACK_IDENTITY_KEYS = Object.freeze([
+  "appId",
+  "upgradeGuid",
+  "match",
+]);
+const WINDOWS_INSTALLER_ROLLBACK_STATE_KEYS = Object.freeze([
+  "backupBeforeReplacement",
+  "retention",
+]);
+const WINDOWS_INSTALLER_ROLLBACK_RECEIPT_KEYS = Object.freeze([
+  "required",
+  "type",
+]);
+const WINDOWS_INSTALLER_ROLLBACK_REJECTION_KEYS = Object.freeze([
+  "unsupported",
+  "unsigned",
+  "crossIdentity",
 ]);
 const WINDOWS_INSTALLER_PUBLICATION_KEYS = Object.freeze([
   "enabled",
@@ -192,6 +236,46 @@ function validateUpdater(value) {
   requireExactValue(value.metadata, null);
 }
 
+function validateRollback(value) {
+  if (!hasExactKeys(value, WINDOWS_INSTALLER_ROLLBACK_KEYS)
+      || !hasExactKeys(value.selection, WINDOWS_INSTALLER_ROLLBACK_SELECTION_KEYS)
+      || !hasExactKeys(value.verification, WINDOWS_INSTALLER_ROLLBACK_VERIFICATION_KEYS)
+      || !hasExactKeys(value.confirmation, WINDOWS_INSTALLER_ROLLBACK_CONFIRMATION_KEYS)
+      || !hasExactKeys(value.identity, WINDOWS_INSTALLER_ROLLBACK_IDENTITY_KEYS)
+      || !hasExactKeys(value.state, WINDOWS_INSTALLER_ROLLBACK_STATE_KEYS)
+      || !hasExactKeys(value.receipt, WINDOWS_INSTALLER_ROLLBACK_RECEIPT_KEYS)
+      || !hasExactKeys(value.rejection, WINDOWS_INSTALLER_ROLLBACK_REJECTION_KEYS)) {
+    fail();
+  }
+  requireExactValue(value.mode, "manual_only");
+  requireExactValue(value.automaticDowngrade, false);
+  requireExactValue(value.silentDowngrade, false);
+
+  requireExactValue(value.selection.required, true);
+  requireExactValue(value.selection.artifact, "explicitly_selected_previously_signed");
+
+  requireExactValue(value.verification.publisher, "exact");
+  requireExactValue(value.verification.signature, "authenticode_valid");
+  requireExactValue(value.verification.digest, "sha256_exact");
+
+  requireExactValue(value.confirmation.required, true);
+  requireExactValue(value.confirmation.actor, "user_or_operator");
+
+  requireExactValue(value.identity.appId, WINDOWS_INSTALLER_APP_ID);
+  requireExactValue(value.identity.upgradeGuid, WINDOWS_INSTALLER_UPGRADE_GUID);
+  requireExactValue(value.identity.match, "exact");
+
+  requireExactValue(value.state.backupBeforeReplacement, true);
+  requireExactValue(value.state.retention, "preserve_app_state");
+
+  requireExactValue(value.receipt.required, true);
+  requireExactValue(value.receipt.type, "native_installed_lifecycle");
+
+  requireExactValue(value.rejection.unsupported, "fail_closed");
+  requireExactValue(value.rejection.unsigned, "fail_closed");
+  requireExactValue(value.rejection.crossIdentity, "fail_closed");
+}
+
 function validatePublication(value) {
   if (!hasExactKeys(value, WINDOWS_INSTALLER_PUBLICATION_KEYS)) fail();
   requireExactValue(value.enabled, false);
@@ -207,6 +291,7 @@ function validateContractShape(value) {
   validateInstaller(value.installer);
   validateDataRetention(value.dataRetention);
   validateUpdater(value.updater);
+  validateRollback(value.rollback);
   validatePublication(value.publication);
   return value;
 }
@@ -264,11 +349,49 @@ export const WINDOWS_INSTALLER_CONTRACT = deepFreeze({
     mechanism: "none",
     metadata: null,
   },
+  rollback: {
+    mode: "manual_only",
+    automaticDowngrade: false,
+    silentDowngrade: false,
+    selection: {
+      required: true,
+      artifact: "explicitly_selected_previously_signed",
+    },
+    verification: {
+      publisher: "exact",
+      signature: "authenticode_valid",
+      digest: "sha256_exact",
+    },
+    confirmation: {
+      required: true,
+      actor: "user_or_operator",
+    },
+    identity: {
+      appId: WINDOWS_INSTALLER_APP_ID,
+      upgradeGuid: WINDOWS_INSTALLER_UPGRADE_GUID,
+      match: "exact",
+    },
+    state: {
+      backupBeforeReplacement: true,
+      retention: "preserve_app_state",
+    },
+    receipt: {
+      required: true,
+      type: "native_installed_lifecycle",
+    },
+    rejection: {
+      unsupported: "fail_closed",
+      unsigned: "fail_closed",
+      crossIdentity: "fail_closed",
+    },
+  },
   publication: {
     enabled: false,
     distribution: "unpublished",
   },
 });
+
+export const WINDOWS_INSTALLER_ROLLBACK_POLICY = WINDOWS_INSTALLER_CONTRACT.rollback;
 
 /**
  * Validate an exact Windows installer contract without echoing untrusted data.

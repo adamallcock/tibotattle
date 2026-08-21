@@ -26,17 +26,75 @@ const REQUIRED_ENV = Object.freeze({
   TIBOTATTLE_ELECTRON_TARGET: "win32",
   TIBOTATTLE_ELECTRON_SIGNING_MODE: SIGNING_MODE,
   TIBOTATTLE_ELECTRON_VERSION: PACKAGE_VERSION,
-  TIBOTATTLE_ELECTRON_AZURE_PUBLISHER_NAME: "CN=TiboTattle Test",
+  TIBOTATTLE_ELECTRON_AZURE_PUBLISHER_NAME: "Adam Allcock",
   TIBOTATTLE_ELECTRON_AZURE_ENDPOINT: "https://eus.codesigning.azure.net/",
-  TIBOTATTLE_ELECTRON_AZURE_CODE_SIGNING_ACCOUNT_NAME: "tibotattle-test",
-  TIBOTATTLE_ELECTRON_AZURE_CERTIFICATE_PROFILE_NAME: "profile-test",
+  TIBOTATTLE_ELECTRON_AZURE_CODE_SIGNING_ACCOUNT_NAME: "tibotattlesigning",
+  TIBOTATTLE_ELECTRON_AZURE_CERTIFICATE_PROFILE_NAME: "tibotattle-windows-public",
 });
-const FORBIDDEN_ENV_PATTERN = /(?:^|_)(?:WIN_)?CSC(?:_|$)|(?:^|_)(?:PFX|P12)(?:_|$)|(?:^|_)(?:AZURE|ARM)_(?:CLIENT_SECRET|CLIENT_CERTIFICATE|FEDERATED_TOKEN)(?:_|$)/u;
+const TRUSTEDSIGNING_AZURE_CLI_ONLY_EXCLUSIONS = Object.freeze({
+  ExcludeEnvironmentCredential: true,
+  ExcludeWorkloadIdentityCredential: true,
+  ExcludeManagedIdentityCredential: true,
+  ExcludeSharedTokenCacheCredential: true,
+  ExcludeVisualStudioCredential: true,
+  ExcludeVisualStudioCodeCredential: true,
+  ExcludeAzurePowerShellCredential: true,
+  ExcludeAzureDeveloperCliCredential: true,
+  ExcludeInteractiveBrowserCredential: true,
+});
+// Keep the child-process fixture independent from any developer or CI
+// signing context.  The explicit list covers every name rejected by the
+// release config, including ambient AZURE_CLIENT_ID/TENANT_ID and the Azure
+// subscription/profile variables that the future workflow must not pass to
+// electron-builder.  The token-pattern fallback also removes dynamically
+// prefixed CSC/PFX/P12 names before the required test values are assigned.
+const FORBIDDEN_ENVIRONMENT_NAMES = Object.freeze([
+  "CSC_LINK",
+  "WIN_CSC_LINK",
+  "CSC_KEY_PASSWORD",
+  "WIN_CSC_KEY_PASSWORD",
+  "CSC_NAME",
+  "CSC_IDENTITY_AUTO_DISCOVERY",
+  "CSC_FOR_PULL_REQUEST",
+  "CSC_CERTIFICATE_FILE",
+  "CSC_CERTIFICATE_PASSWORD",
+  "WIN_CERTIFICATE_FILE",
+  "WIN_CERTIFICATE_PASSWORD",
+  "TIBOTATTLE_WINDOWS_PFX_PATH",
+  "AZURE_CLIENT_ID",
+  "AZURE_TENANT_ID",
+  "AZURE_SUBSCRIPTION_ID",
+  "AZURE_CREDENTIALS",
+  "AZURE_CLIENT_SECRET",
+  "AZURE_CLIENT_CERTIFICATE_PATH",
+  "AZURE_CLIENT_CERTIFICATE_PASSWORD",
+  "AZURE_USERNAME",
+  "AZURE_PASSWORD",
+  "AZURE_FEDERATED_TOKEN_FILE",
+  "AZURE_CODE_SIGNING_ACCOUNT_NAME",
+  "AZURE_CODE_SIGNING_PROFILE_NAME",
+  "AZURE_CODE_SIGNING_ENDPOINT",
+  "AZURE_CODE_SIGNING_PUBLISHER_NAME",
+  "AZURE_CODE_SIGNING_TIMESTAMP_URL",
+  "ARM_CLIENT_ID",
+  "ARM_TENANT_ID",
+  "ARM_SUBSCRIPTION_ID",
+  "ARM_CLIENT_SECRET",
+  "ARM_CLIENT_CERTIFICATE_PATH",
+  "ARM_CLIENT_CERTIFICATE_PASSWORD",
+  "ARM_USERNAME",
+  "ARM_PASSWORD",
+  "ARM_FEDERATED_TOKEN_FILE",
+]);
+const FORBIDDEN_ENVIRONMENT_KEY_PATTERN = /(?:^|_)(?:WIN_)?CSC(?:_|$)|(?:^|_)(?:PFX|P12)(?:_|$)/u;
 
 function validEnvironment(overrides = {}) {
   const environment = { ...process.env };
+  for (const name of FORBIDDEN_ENVIRONMENT_NAMES) delete environment[name];
   for (const key of Object.keys(environment)) {
-    if (FORBIDDEN_ENV_PATTERN.test(key.toUpperCase())) delete environment[key];
+    if (FORBIDDEN_ENVIRONMENT_KEY_PATTERN.test(key.toUpperCase())) {
+      delete environment[key];
+    }
   }
   Object.assign(environment, REQUIRED_ENV);
   for (const [key, value] of Object.entries(overrides)) {
@@ -177,6 +235,14 @@ test("Windows release config maps the frozen installer contract exactly", () => 
   assert.deepEqual(config.win.signExts, [".dll", "!.node"]);
   assert.equal(config.win.requestedExecutionLevel, "asInvoker");
   assert.equal(config.win.verifyUpdateCodeSignature, true);
+  assert.match(
+    config.win.windowsSigningOperationEvidenceRoot,
+    /\.release-build[\\/]electron-production[\\/]windows-x64[\\/]evidence$/u,
+  );
+  assert.equal(
+    config.win.windowsSigningOperationLedgerLeaf,
+    "windows-signing-operation-ledger.json",
+  );
   assert.equal(config.win.signtoolOptions, undefined);
   assert.deepEqual(config.win.azureSignOptions, {
     publisherName: REQUIRED_ENV.TIBOTATTLE_ELECTRON_AZURE_PUBLISHER_NAME,
@@ -188,7 +254,12 @@ test("Windows release config maps the frozen installer contract exactly", () => 
     fileDigest: "SHA256",
     timestampRfc3161: "http://timestamp.acs.microsoft.com",
     timestampDigest: "SHA256",
+    ...TRUSTEDSIGNING_AZURE_CLI_ONLY_EXCLUSIONS,
   });
+  assert.equal(
+    Object.hasOwn(config.win.azureSignOptions, "ExcludeAzureCliCredential"),
+    false,
+  );
   assert.equal(config.forceCodeSigning, true);
   assert.deepEqual(config.electronFuses, {
     runAsNode: true,
@@ -259,6 +330,10 @@ test("release config rejects malformed endpoint, identifiers, and version", () =
   expectInvalid({ TIBOTATTLE_ELECTRON_AZURE_ENDPOINT: "https://eus.codesigning.azure.net/?secret=not-used" });
   expectInvalid({ TIBOTATTLE_ELECTRON_AZURE_CODE_SIGNING_ACCOUNT_NAME: "account/name" });
   expectInvalid({ TIBOTATTLE_ELECTRON_AZURE_CERTIFICATE_PROFILE_NAME: "profile\nname" });
+  expectInvalid({ TIBOTATTLE_ELECTRON_AZURE_ENDPOINT: "https://west.codesigning.azure.net/" });
+  expectInvalid({ TIBOTATTLE_ELECTRON_AZURE_CODE_SIGNING_ACCOUNT_NAME: "another-account" });
+  expectInvalid({ TIBOTATTLE_ELECTRON_AZURE_CERTIFICATE_PROFILE_NAME: "another-profile" });
+  expectInvalid({ TIBOTATTLE_ELECTRON_AZURE_PUBLISHER_NAME: "Another Publisher" });
   expectInvalid({ TIBOTATTLE_ELECTRON_VERSION: "0.1.15-beta.1" });
   expectInvalid({ TIBOTATTLE_ELECTRON_VERSION: "0.1.14" });
   const hostile = expectInvalid({
@@ -273,7 +348,14 @@ test("release config rejects legacy certificate, PFX, and client-secret environm
   expectInvalid({ TIBOTATTLE_WINDOWS_PFX_PATH: "/tmp/signing.pfx" });
   expectInvalid({ AZURE_CLIENT_SECRET: "secret" });
   expectInvalid({ AZURE_CLIENT_ID: "client-id" });
+  expectInvalid({ AZURE_TENANT_ID: "tenant-id" });
   expectInvalid({ ARM_CLIENT_SECRET: "secret" });
+});
+
+test("release config rejects every named ambient Azure or signing variable", () => {
+  for (const name of FORBIDDEN_ENVIRONMENT_NAMES) {
+    expectInvalid({ [name]: "ambient-value" });
+  }
 });
 
 test("installed electron-builder 26.15.7 supports Azure signing and signs generated uninstallers", () => {
@@ -294,6 +376,7 @@ test("installed electron-builder 26.15.7 supports Azure signing and signs genera
   assert.match(winOptions, /timestampRfc3161\?: string/u);
   assert.match(winOptions, /timestampDigest\?: string/u);
   assert.match(winOptions, /fileDigest\?: string/u);
+  assert.match(winOptions, /\[k: string\]: string \| boolean \| Nullish/u);
 
   const azureManager = installedAppBuilderSource(
     "out/codeSign/windowsSignAzureManager.js",
@@ -303,6 +386,8 @@ test("installed electron-builder 26.15.7 supports Azure signing and signs genera
   assert.match(azureManager, /CodeSigningAccountName/u);
   assert.match(azureManager, /TimestampRfc3161/u);
   assert.match(azureManager, /Files:/u);
+  assert.match(azureManager, /value !== false/u);
+  assert.match(azureManager, /value === true/u);
 
   const nsisTarget = installedAppBuilderSource("out/targets/nsis/NsisTarget.js");
   assert.match(nsisTarget, /await packager\.signIf\(uninstallerPath\)/u);

@@ -159,6 +159,18 @@
       "followUp": "Run finalizer handoff input and reparse-point refusal on native Windows x64 before accepting a signed promotion."
     },
     {
+      "file": "test/windows-finalizer-source-evidence-selector.test.js",
+      "win32BranchCount": 1,
+      "classification": "native-windows-qualification",
+      "followUp": "Run input-link refusal and transactional evidence publication against native Windows x64 reparse-point and hard-link semantics."
+    },
+    {
+      "file": "test/windows-native-presign-input-builder.test.js",
+      "win32BranchCount": 1,
+      "classification": "native-windows-qualification",
+      "followUp": "Run canonical Windows path, junction/reparse-point, hard-link, and runtime-manifest case-fold collision qualification on native Windows x64; actual NTFS case-distinct directory aliases remain unqualified."
+    },
+    {
       "file": "test/windows-native-presign.test.js",
       "win32BranchCount": 1,
       "classification": "native-windows-qualification",
@@ -169,6 +181,36 @@
       "win32BranchCount": 1,
       "classification": "native-windows-qualification",
       "followUp": "Run filesystem assertions on native Windows x64; cross-host path semantics remain separately tested."
+    },
+    {
+      "file": "test/windows-production-installer.test.js",
+      "win32BranchCount": 1,
+      "classification": "native-windows-qualification",
+      "followUp": "Run the native Windows installer artifact verifier against a real directory junction/reparse point and retain the content-free rejection receipt."
+    },
+    {
+      "file": "test/windows-production-authenticode-inventory.test.js",
+      "win32BranchCount": 3,
+      "classification": "native-windows-qualification",
+      "followUp": "Run native Authenticode collection and receipt publication on Windows x64, including the fail-closed native probe and protected artifact-root checks."
+    },
+    {
+      "file": "test/windows-production-finalizer-receipt.test.js",
+      "win32BranchCount": 1,
+      "classification": "native-windows-qualification",
+      "followUp": "Run the signed finalizer receipt join on native Windows x64 and confirm native Authenticode provenance cannot be replaced by serialized evidence."
+    },
+    {
+      "file": "test/windows-production-packaged-artifact.test.js",
+      "win32BranchCount": 4,
+      "classification": "native-windows-qualification",
+      "followUp": "Run ASAR path-separator, archive-link, and staged reparse-point refusal cases on native Windows x64."
+    },
+    {
+      "file": "test/windows-production-finalizer-authority-input.test.js",
+      "win32BranchCount": 1,
+      "classification": "native-windows-qualification",
+      "followUp": "Run authority-input junction/reparse-point refusal and temporary/output lifecycle qualification on native Windows x64."
     },
     {
       "file": "test/windows-trusted-signing-pin.test.js",

@@ -37,7 +37,10 @@ test("TrustedSigning preflight is read-only, exact-version, and content-free", a
   assert.match(command, /Get-Module -ListAvailable -Name TrustedSigning/u);
   assert.match(source, /REQUIRED_VERSION = "0\.5\.0"/u);
   assert.doesNotMatch(command, /Install-Module|Import-Module|Invoke-TrustedSigning/u);
-  assert.doesNotMatch(source, /process\.env|AZURE_CLIENT_SECRET|CSC_LINK|PFX|credential/u);
+  assert.doesNotMatch(
+    source,
+    /process\.env|AZURE_CLIENT_ID|AZURE_TENANT_ID|AZURE_CLIENT_SECRET|CSC_LINK|PFX/u,
+  );
   assert.match(source, /windowsHide: true/u);
   assert.match(source, /stdio: \["ignore", "pipe", "ignore"\]/u);
   assert.match(source, /WINDOWS_TRUSTEDSIGNING_PREFLIGHT_/u);
@@ -117,4 +120,7 @@ test("pnpm frozen install pins the exact app-builder-lib Azure module command", 
   );
   assert.match(azureManager, /Install-Module -Name TrustedSigning -RequiredVersion 0\.5\.0/u);
   assert.doesNotMatch(azureManager, /Install-Module -Name TrustedSigning -MinimumVersion/u);
+  assert.match(azureManager, /value !== false/u);
+  assert.match(azureManager, /value === true/u);
+  assert.match(azureManager, /return \[\.\.\.res, `-\$\{field\}`\]/u);
 });

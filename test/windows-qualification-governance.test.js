@@ -423,6 +423,10 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   const rawReceiptUpload = workflow.slice(rawReceiptUploadStep, rawReceiptValidationStep);
   assert.match(rawReceiptUpload, /id: windows_qualification_receipt_raw_upload/u);
   assert.match(rawReceiptUpload, /uses: actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/u);
+  assert.match(
+    rawReceiptUpload,
+    /name: \$\{\{ env\.TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_BASENAME \}\}/u,
+  );
   assert.match(rawReceiptUpload, /path: \$\{\{ env\.TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_PATH \}\}/u);
   assert.match(rawReceiptUpload, /archive: false/u);
   assert.match(rawReceiptUpload, /if-no-files-found: error/u);

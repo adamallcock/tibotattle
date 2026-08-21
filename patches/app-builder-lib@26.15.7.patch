@@ -1,5 +1,5 @@
 diff --git a/out/codeSign/windowsSignAzureManager.js b/out/codeSign/windowsSignAzureManager.js
-index 988ab7fd60c48aeae08884de09de94d120fe6bef..ff08697fdde4af01110e988daa959092d6e6839b 100644
+index 988ab7f..c6a451d 100644
 --- a/out/codeSign/windowsSignAzureManager.js
 +++ b/out/codeSign/windowsSignAzureManager.js
 @@ -35,7 +35,7 @@ class WindowsSignAzureManager {
@@ -11,3 +11,305 @@ index 988ab7fd60c48aeae08884de09de94d120fe6bef..ff08697fdde4af01110e988daa959092
          // If signing has been misconfigured it, the error from the TrustedSigning module should be descriptive enough to help them fix their configuration.
          // Options: https://learn.microsoft.com/en-us/dotnet/api/azure.identity.environmentcredential?view=azure-dotnet#definition
      }
+@@ -59,8 +59,11 @@ class WindowsSignAzureManager {
+             Files: vm.toVmFile(options.path),
+         };
+         const paramsString = Object.entries(params)
+-            .filter(([_, value]) => value != null)
++            .filter(([_, value]) => value != null && value !== false)
+             .reduce((res, [field, value]) => {
++            if (value === true) {
++                return [...res, `-${field}`];
++            }
+             const escapedValue = String(value).replace(/'/g, "''");
+             return [...res, `-${field}`, `'${escapedValue}'`];
+         }, [])
+diff --git a/out/options/winOptions.d.ts b/out/options/winOptions.d.ts
+index d891297..e4c9b73 100644
+--- a/out/options/winOptions.d.ts
++++ b/out/options/winOptions.d.ts
+@@ -160,5 +160,5 @@ export interface WindowsAzureSigningConfiguration {
+      * Allow other CLI parameters (verbatim case-sensitive) to `Invoke-TrustedSigning`
+      * Note: Key-Value pairs with `undefined`/`null` value are filtered out of the command.
+      */
+-    [k: string]: string | Nullish;
++    [k: string]: string | boolean | Nullish;
+ }
+diff --git a/out/platformPackager.js b/out/platformPackager.js
+index 8d50874..be3fb62 100644
+--- a/out/platformPackager.js
++++ b/out/platformPackager.js
+@@ -105,8 +105,21 @@ class PlatformPackager {
+         this.packageInDistributableFormat(appOutDir, arch, targets, taskManager);
+     }
+     packageInDistributableFormat(appOutDir, arch, targets, taskManager) {
++        const finalizeSigningOperationLedger = async () => {
++            if (this.info.cancellationToken.cancelled) {
++                return;
++            }
++            if (typeof this.writeWindowsSigningOperationLedger === "function") {
++                await this.writeWindowsSigningOperationLedger();
++            }
++        };
+         if (targets.find(it => !it.isAsyncSupported) == null) {
+-            PlatformPackager.buildAsyncTargets(targets, taskManager, appOutDir, arch);
++            const subTaskManager = new builder_util_1.AsyncTaskManager(this.info.cancellationToken);
++            PlatformPackager.buildAsyncTargets(targets, subTaskManager, appOutDir, arch);
++            taskManager.add(async () => {
++                await subTaskManager.awaitTasks();
++                await finalizeSigningOperationLedger();
++            });
+             return;
+         }
+         taskManager.add(async () => {
+@@ -119,6 +132,7 @@ class PlatformPackager {
+                     await target.build(appOutDir, arch);
+                 }
+             }
++            await finalizeSigningOperationLedger();
+         });
+     }
+     static buildAsyncTargets(targets, taskManager, appOutDir, arch) {
+@@ -711,4 +725,4 @@ function chooseNotNull(v1, v2) {
+ function capitalizeFirstLetter(text) {
+     return text.charAt(0).toUpperCase() + text.slice(1);
+ }
+-//# sourceMappingURL=platformPackager.js.map
+\ No newline at end of file
++//# sourceMappingURL=platformPackager.js.map
+diff --git a/out/winPackager.js b/out/winPackager.js
+index 2e68fb5..cc95076 100644
+--- a/out/winPackager.js
++++ b/out/winPackager.js
+@@ -1,6 +1,6 @@
+ "use strict";
+ Object.defineProperty(exports, "__esModule", { value: true });
+-exports.WinPackager = void 0;
++exports.WinPackager = exports.WINDOWS_SIGNING_OPERATION_LEDGER_CLASSES = exports.WINDOWS_SIGNING_OPERATION_LEDGER_STATUS = exports.WINDOWS_SIGNING_OPERATION_LEDGER_SCHEMA = void 0;
+ const builder_util_1 = require("builder-util");
+ const ci_info_1 = require("ci-info");
+ const crypto_1 = require("crypto");
+@@ -22,6 +22,137 @@ const flags_1 = require("./util/flags");
+ const resEdit_1 = require("./util/resEdit");
+ const timer_1 = require("./util/timer");
+ const vm_1 = require("./vm/vm");
++// This is deliberately a content-free seam for the protected finalizer. It
++// records only fixed extension classes and counts; it never serializes the
++// subject path, log fields, credentials, or signer diagnostics.
++const WINDOWS_SIGNING_OPERATION_LEDGER_SCHEMA = "tibotattle-windows-signing-operation-ledger-v1";
++exports.WINDOWS_SIGNING_OPERATION_LEDGER_SCHEMA = WINDOWS_SIGNING_OPERATION_LEDGER_SCHEMA;
++const WINDOWS_SIGNING_OPERATION_LEDGER_STATUS = "WINDOWS_SIGNING_OPERATION_LEDGER_RECORDED";
++exports.WINDOWS_SIGNING_OPERATION_LEDGER_STATUS = WINDOWS_SIGNING_OPERATION_LEDGER_STATUS;
++const WINDOWS_SIGNING_OPERATION_LEDGER_CLASSES = Object.freeze(["exe", "dll", "node", "unexpected"]);
++exports.WINDOWS_SIGNING_OPERATION_LEDGER_CLASSES = WINDOWS_SIGNING_OPERATION_LEDGER_CLASSES;
++const WINDOWS_SIGNING_OPERATION_LEDGER_LEAF = "windows-signing-operation-ledger.json";
++function classifyWindowsSigningOperation(file) {
++    const value = typeof file === "string" ? file.toLowerCase() : "";
++    if (value.endsWith(".exe"))
++        return "exe";
++    if (value.endsWith(".dll"))
++        return "dll";
++    if (value.endsWith(".node"))
++        return "node";
++    return "unexpected";
++}
++exports.classifyWindowsSigningOperation = classifyWindowsSigningOperation;
++function createWindowsSigningOperationCounts() {
++    return { exe: 0, dll: 0, node: 0, unexpected: 0 };
++}
++function createWindowsSigningOperationLedger(counts) {
++    const total = WINDOWS_SIGNING_OPERATION_LEDGER_CLASSES
++        .reduce((sum, key) => sum + counts[key], 0);
++    return {
++        schemaVersion: WINDOWS_SIGNING_OPERATION_LEDGER_SCHEMA,
++        status: WINDOWS_SIGNING_OPERATION_LEDGER_STATUS,
++        builder: "app-builder-lib",
++        builderVersion: "26.15.7",
++        ledgerCount: 1,
++        operationCount: total,
++        classes: {
++            exe: counts.exe,
++            dll: counts.dll,
++            node: counts.node,
++            unexpected: counts.unexpected,
++        },
++    };
++}
++exports.createWindowsSigningOperationLedger = createWindowsSigningOperationLedger;
++function windowsSigningOperationRootIdentity(metadata) {
++    return {
++        dev: metadata.dev,
++        ino: metadata.ino,
++        uid: metadata.uid,
++        mode: metadata.mode,
++        birthtimeNs: metadata.birthtimeNs
++            ?? BigInt(Math.round(metadata.birthtimeMs * 1e6)),
++    };
++}
++function sameWindowsSigningOperationRootIdentity(left, right) {
++    return left.dev === right.dev
++        && left.ino === right.ino
++        && left.uid === right.uid
++        && left.mode === right.mode
++        && left.birthtimeNs === right.birthtimeNs;
++}
++function assertWindowsSigningOperationEvidenceRootMetadata(metadata) {
++    // lstat rejects symlinks and Windows junctions; the captured identity
++    // detects a rename/replacement. Directory hardlinks are not a supported
++    // Windows primitive; the published ledger below separately requires a
++    // regular, single-link file.
++    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
++        throw new Error("invalid evidence root");
++    }
++}
++async function captureWindowsSigningOperationEvidenceRoot(root) {
++    try {
++        const metadata = await (0, promises_1.lstat)(root);
++        assertWindowsSigningOperationEvidenceRootMetadata(metadata);
++        const canonical = await (0, promises_1.realpath)(root);
++        const canonicalMetadata = await (0, promises_1.lstat)(canonical);
++        assertWindowsSigningOperationEvidenceRootMetadata(canonicalMetadata);
++        if (canonical !== root
++            || !sameWindowsSigningOperationRootIdentity(windowsSigningOperationRootIdentity(metadata), windowsSigningOperationRootIdentity(canonicalMetadata))) {
++            throw new Error("evidence root replacement");
++        }
++        return {
++            path: root,
++            canonicalPath: canonical,
++            identity: windowsSigningOperationRootIdentity(metadata),
++        };
++    }
++    catch {
++        throw new builder_util_1.InvalidConfigurationError("Windows signing operation ledger evidence root is invalid");
++    }
++}
++async function assertWindowsSigningOperationEvidenceRoot(state) {
++    try {
++        const metadata = await (0, promises_1.lstat)(state.path);
++        assertWindowsSigningOperationEvidenceRootMetadata(metadata);
++        if (!sameWindowsSigningOperationRootIdentity(state.identity, windowsSigningOperationRootIdentity(metadata))) {
++            throw new Error("evidence root replacement");
++        }
++        const canonical = await (0, promises_1.realpath)(state.path);
++        const canonicalMetadata = await (0, promises_1.lstat)(canonical);
++        assertWindowsSigningOperationEvidenceRootMetadata(canonicalMetadata);
++        if (canonical !== state.canonicalPath
++            || !sameWindowsSigningOperationRootIdentity(state.identity, windowsSigningOperationRootIdentity(canonicalMetadata))) {
++            throw new Error("evidence root replacement");
++        }
++    }
++    catch {
++        throw new builder_util_1.InvalidConfigurationError("Windows signing operation ledger evidence root is invalid");
++    }
++}
++function validateWindowsSigningOperationEvidenceRoot(value) {
++    if (typeof value !== "string" || value.length === 0 || value.length > 1024
++        || !path.isAbsolute(value) || path.resolve(value) !== value
++        || value.includes("\0") || value.includes("\r") || value.includes("\n")) {
++        throw new builder_util_1.InvalidConfigurationError("Windows signing operation ledger configuration is invalid");
++    }
++    return value;
++}
++function validateWindowsSigningOperationLedgerLeaf(value) {
++    if (value !== WINDOWS_SIGNING_OPERATION_LEDGER_LEAF) {
++        throw new builder_util_1.InvalidConfigurationError("Windows signing operation ledger configuration is invalid");
++    }
++    return value;
++}
++function deriveWindowsSigningOperationLedgerPath(root, leaf) {
++    const ledgerPath = path.resolve(root, leaf);
++    const relative = path.relative(root, ledgerPath);
++    if (relative !== leaf || path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`)) {
++        throw new builder_util_1.InvalidConfigurationError("Windows signing operation ledger configuration is invalid");
++    }
++    return ledgerPath;
++}
+ class WinPackager extends platformPackager_1.PlatformPackager {
+     get isForceCodeSigningVerification() {
+         return this.platformSpecificBuildOptions.verifyUpdateCodeSignature !== false;
+@@ -42,6 +173,23 @@ class WinPackager extends platformPackager_1.PlatformPackager {
+             return manager;
+         });
+         this.signingQueue = Promise.resolve(true);
++        this.windowsSigningOperationCounts = createWindowsSigningOperationCounts();
++        this.windowsSigningOperationLedgerWritten = false;
++        const evidenceRoot = this.platformSpecificBuildOptions.windowsSigningOperationEvidenceRoot;
++        const ledgerLeaf = this.platformSpecificBuildOptions.windowsSigningOperationLedgerLeaf;
++        if ((evidenceRoot == null) !== (ledgerLeaf == null)
++            || this.platformSpecificBuildOptions.windowsSigningOperationLedgerPath != null) {
++            throw new builder_util_1.InvalidConfigurationError("Windows signing operation ledger configuration is invalid");
++        }
++        this.windowsSigningOperationEvidenceRoot = evidenceRoot == null
++            ? null
++            : validateWindowsSigningOperationEvidenceRoot(evidenceRoot);
++        this.windowsSigningOperationLedgerLeaf = ledgerLeaf == null
++            ? null
++            : validateWindowsSigningOperationLedgerLeaf(ledgerLeaf);
++        this.windowsSigningOperationLedgerPath = this.windowsSigningOperationEvidenceRoot == null
++            ? null
++            : deriveWindowsSigningOperationLedgerPath(this.windowsSigningOperationEvidenceRoot, this.windowsSigningOperationLedgerLeaf);
+     }
+     get defaultTarget() {
+         return ["nsis"];
+@@ -121,6 +269,13 @@ class WinPackager extends platformPackager_1.PlatformPackager {
+         return promise;
+     }
+     async _sign(file) {
++        const operationClass = classifyWindowsSigningOperation(file);
++        if (operationClass === "node") {
++            throw new builder_util_1.InvalidConfigurationError("Windows signing operation ledger rejected a native .node signing attempt");
++        }
++        if (operationClass !== "exe" && operationClass !== "dll") {
++            throw new builder_util_1.InvalidConfigurationError("Windows signing operation ledger rejected an unexpected signing class");
++        }
+         const signOptions = {
+             path: file,
+             options: this.platformSpecificBuildOptions,
+@@ -129,6 +284,9 @@ class WinPackager extends platformPackager_1.PlatformPackager {
+         if (!didSignSuccessfully && this.forceCodeSigning) {
+             throw new builder_util_1.InvalidConfigurationError(`App is not signed and "forceCodeSigning" is set to true, please ensure that code signing configuration is correct, please see https://electron.build/code-signing`);
+         }
++        if (didSignSuccessfully) {
++            this.windowsSigningOperationCounts[operationClass] += 1;
++        }
+         return didSignSuccessfully;
+     }
+     async signAndEditResources(file, arch, outDir, internalName, requestedExecutionLevel) {
+@@ -266,6 +424,35 @@ class WinPackager extends platformPackager_1.PlatformPackager {
+     walkSignableFiles(baseDir, ...subpath) {
+         return (0, builder_util_1.walk)(path.join(baseDir, ...subpath), (file, stat) => stat.isDirectory() || this.shouldSignFile(file));
+     }
++    async writeWindowsSigningOperationLedger() {
++        if (this.windowsSigningOperationEvidenceRoot == null) {
++            return;
++        }
++        if (this.windowsSigningOperationLedgerWritten) {
++            throw new builder_util_1.InvalidConfigurationError("Windows signing operation ledger was emitted more than once");
++        }
++        const rootState = await captureWindowsSigningOperationEvidenceRoot(this.windowsSigningOperationEvidenceRoot);
++        await assertWindowsSigningOperationEvidenceRoot(rootState);
++        const ledgerPath = this.windowsSigningOperationLedgerPath;
++        const payload = `${JSON.stringify(createWindowsSigningOperationLedger(this.windowsSigningOperationCounts))}\n`;
++        let handle;
++        try {
++            handle = await (0, promises_1.open)(ledgerPath, "wx");
++            await handle.writeFile(payload, "utf8");
++            await handle.close();
++            handle = null;
++            await assertWindowsSigningOperationEvidenceRoot(rootState);
++            const metadata = await (0, promises_1.lstat)(ledgerPath);
++            if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1) {
++                throw new Error("invalid ledger file");
++            }
++        }
++        catch {
++            await (handle === null || handle === void 0 ? void 0 : handle.close()).catch(() => {});
++            throw new builder_util_1.InvalidConfigurationError("Windows signing operation ledger could not be emitted");
++        }
++        this.windowsSigningOperationLedgerWritten = true;
++    }
+ }
+ exports.WinPackager = WinPackager;
+-//# sourceMappingURL=winPackager.js.map
+\ No newline at end of file
++//# sourceMappingURL=winPackager.js.map
