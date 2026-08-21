@@ -9164,6 +9164,27 @@ test("self-resolving degraded notes are classed informational and keep the quiet
     assert.match(sentence, informational);
   }
 
+  // The retained-evidence relabel sentence (owner-reported, 2026-08-21): it
+  // replaces the loading/withheld claims whenever the data store serves
+  // retained figures, so it is on screen for part of every refresh cycle and
+  // must keep the quiet progress treatment. The renderer consults the
+  // progress matcher before the informational one, so "still" is what holds
+  // the style.
+  const progressMatcherSource = appSource.match(
+    /const EVIDENCE_WARNING_PROGRESS =\n  \/(.*)\/(\w+);/u,
+  );
+  assert.ok(progressMatcherSource, "the progress matcher is available");
+  const progress = new RegExp(progressMatcherSource[1], progressMatcherSource[2]);
+  const retainedRefreshSentence =
+    "The full history projection is still being recalculated in the"
+      + " background. The figures shown are the most recent completed"
+      + " projection and are replaced automatically when it finishes.";
+  assert.ok(
+    companionSource.includes(retainedRefreshSentence),
+    "the companion publishes the retained-evidence refresh sentence",
+  );
+  assert.match(retainedRefreshSentence, progress);
+
   // Genuine caveats on the figures being shown (or genuinely missing) keep
   // the alert treatment: none may drift into the informational vocabulary.
   const alertSentences = [
