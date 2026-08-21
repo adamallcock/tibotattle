@@ -67,6 +67,10 @@ function payloadDigest(rows) {
   return { bytes, sha256: hash.digest("hex") };
 }
 
+function archiveLookupPath(path) {
+  return process.platform === "win32" ? path.replaceAll("/", "\\") : path;
+}
+
 function bindingManifest(bytes) {
   return {
     schemaVersion: "windows-filesystem-binding-manifest-v1",
@@ -301,7 +305,10 @@ test("verifies a macOS arm64 archive/unpacked union with aggregate-only output",
     assert.equal(result.staged.count, result.artifact.count);
     assert.equal(result.staged.bytes > result.unpacked.bytes, true);
     assert.equal(result.staged.sha256, result.artifact.sha256);
-    assert.doesNotMatch(JSON.stringify(result), new RegExp(fixture.root, "u"));
+    // Compare against JSON's escaped representation so this remains a real
+    // leak check when the fixture root contains Windows backslashes.
+    const escapedFixtureRoot = JSON.stringify(fixture.root).slice(1, -1);
+    assert.equal(JSON.stringify(result).includes(escapedFixtureRoot), false);
     assert.deepEqual(Object.keys(result).sort(), [
       "asar", "artifact", "binding", "nativeFileCount", "staged", "status", "target", "unpacked",
     ].sort());
@@ -450,8 +457,14 @@ test("requires the exact versioned Windows sidecar schema and policy consistency
 
 test("keeps the Windows native sidecar in virtual ASAR beside an unpacked .node", async () => {
   await withFixture("win32-x64", {}, async (fixture) => {
-    const bindingStat = asar.statFile(fixture.asarPath, WINDOWS_BINDING);
-    const sidecarStat = asar.statFile(fixture.asarPath, WINDOWS_BINDING_MANIFEST);
+    const bindingStat = asar.statFile(
+      fixture.asarPath,
+      archiveLookupPath(WINDOWS_BINDING),
+    );
+    const sidecarStat = asar.statFile(
+      fixture.asarPath,
+      archiveLookupPath(WINDOWS_BINDING_MANIFEST),
+    );
     assert.equal(bindingStat.unpacked, true);
     assert.notEqual(sidecarStat.unpacked, true);
     assert.equal(
@@ -619,9 +632,19 @@ test("requires explicit target and artifact paths", () => {
 test("normalizes Windows-rooted ASAR list paths on macOS", async () => {
   await withFixture("darwin-arm64", {}, async (fixture) => {
     const listed = asar.listPackage(fixture.asarPath);
-    const posixPaths = listed.map((path) => normalizeArchivePath(path, "darwin"));
-    const windowsPaths = listed.map((path) => normalizeArchivePath(
-      path.replaceAll("/", "\\"),
+    // @electron/asar emits paths with the host platform's separator. Build
+    // both explicitly rooted representations from the canonical inventory so
+    // this contract remains meaningful on both POSIX and Windows hosts.
+    const canonicalPaths = listed.map((path) => normalizeArchivePath(
+      path,
+      process.platform,
+    ));
+    const posixPaths = canonicalPaths.map((path) => normalizeArchivePath(
+      `/${path}`,
+      "darwin",
+    ));
+    const windowsPaths = canonicalPaths.map((path) => normalizeArchivePath(
+      `\\${path.replaceAll("/", "\\")}`,
       "win32",
     ));
     assert.deepEqual(windowsPaths.sort(), posixPaths.sort());
