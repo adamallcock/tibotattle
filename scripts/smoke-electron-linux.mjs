@@ -17,10 +17,10 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { networkInterfaces, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { once } from "node:events";
-import { createServer } from "node:net";
+import { createServer, isIP } from "node:net";
 import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
@@ -29,6 +29,14 @@ const ELECTRON_MAIN = resolve(REPOSITORY_ROOT, "apps/electron/main.js");
 const MAX_STARTUP_MS = 30_000;
 const MAX_OPERATION_MS = 10_000;
 const MAX_SHUTDOWN_MS = 10_000;
+const MAX_NETWORK_EVIDENCE_URLS = 512;
+const MAX_NETWORK_EVIDENCE_URL_LENGTH = 2_048;
+const CLI_FAILURE_STATUS = "ELECTRON_LINUX_SMOKE_FAILED";
+const NETWORK_BOUNDARY = "network-none";
+const PLATFORM_ARCHITECTURES = Object.freeze({
+  "linux/arm64": "arm64",
+  "linux/amd64": "x64",
+});
 
 function fail(message) {
   throw new Error(`Electron Linux smoke failed: ${message}`);
@@ -36,6 +44,86 @@ function fail(message) {
 
 function wait(ms) {
   return new Promise((resolveWait) => setTimeout(resolveWait, ms));
+}
+
+function isLoopbackAddress(value) {
+  const address = String(value ?? "").toLowerCase();
+  const family = isIP(address);
+  return (family === 4 && address.startsWith("127."))
+    || (family === 6 && address === "::1");
+}
+
+/**
+ * Validate the runtime boundary independently of Docker's command line.
+ * `networkInterfacesImpl` is injectable so the contract can prove both the
+ * loopback-only and external-interface cases without depending on the host.
+ */
+export function assertContainerContract({
+  platform = process.platform,
+  architecture = process.arch,
+  imagePlatform = process.env.USAGE_MONITOR_LINUX_IMAGE_PLATFORM,
+  networkBoundary = process.env.USAGE_MONITOR_LINUX_NETWORK_BOUNDARY,
+  networkInterfacesImpl = networkInterfaces,
+} = {}) {
+  if (platform !== "linux") {
+    fail("Linux smoke must run in a Linux container");
+  }
+  if (!Object.hasOwn(PLATFORM_ARCHITECTURES, imagePlatform)
+      || PLATFORM_ARCHITECTURES[imagePlatform] !== architecture) {
+    fail("Linux image platform is missing or does not match the running architecture");
+  }
+  if (networkBoundary !== NETWORK_BOUNDARY) {
+    fail("Linux smoke requires the caller-enforced network-none runtime boundary");
+  }
+  let interfaces;
+  try {
+    interfaces = networkInterfacesImpl();
+  } catch {
+    fail("Linux smoke could not inspect network interfaces");
+  }
+  if (interfaces === null || typeof interfaces !== "object" || Array.isArray(interfaces)) {
+    fail("Linux smoke could not inspect network interfaces");
+  }
+  let loopbackAddressCount = 0;
+  for (const entries of Object.values(interfaces)) {
+    if (!Array.isArray(entries)) fail("Linux smoke network interface data is invalid");
+    for (const entry of entries) {
+      if (!entry || typeof entry !== "object" || !isLoopbackAddress(entry.address)) {
+        fail("Linux smoke requires loopback-only network interfaces");
+      }
+      loopbackAddressCount += 1;
+    }
+  }
+  if (loopbackAddressCount === 0) {
+    fail("Linux smoke could not prove a loopback-only network boundary");
+  }
+  return Object.freeze({
+    imagePlatform,
+    architecture,
+    networkBoundary,
+    networkBoundaryEvidence: "loopback-only",
+  });
+}
+
+export function fixedRuntimeFailureDiagnostics({
+  stdoutProduced = false,
+  stderrProduced = false,
+} = {}) {
+  const diagnostics = [];
+  if (stdoutProduced === true) diagnostics.push("Electron runtime stdout was produced.\n");
+  if (stderrProduced === true) diagnostics.push("Electron runtime stderr was produced.\n");
+  return Object.freeze(diagnostics);
+}
+
+export function isAllowedRendererNetworkURL(value, allowedOrigin) {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:"
+      && parsed.hostname === "127.0.0.1"
+      && parsed.origin === allowedOrigin;
+  } catch {
+    return false;
+  }
 }
 
 async function withTimeout(promise, timeoutMs, label) {
@@ -151,6 +239,7 @@ async function connectCdp(target) {
 
   let nextId = 1;
   const pending = new Map();
+  const eventHandlers = new Map();
   const onMessage = (event) => {
     let message;
     try {
@@ -158,7 +247,12 @@ async function connectCdp(target) {
     } catch {
       return;
     }
-    if (!Number.isInteger(message.id)) return;
+    if (!Number.isInteger(message.id)) {
+      const handlers = eventHandlers.get(message.method);
+      if (!handlers) return;
+      for (const handler of handlers) handler(message.params ?? {});
+      return;
+    }
     const request = pending.get(message.id);
     if (!request) return;
     pending.delete(message.id);
@@ -186,15 +280,32 @@ async function connectCdp(target) {
   return Object.freeze({
     request,
     evaluate,
+    on(method, handler) {
+      if (typeof method !== "string" || typeof handler !== "function") {
+        throw new TypeError("CDP event method and handler are required");
+      }
+      let handlers = eventHandlers.get(method);
+      if (!handlers) {
+        handlers = new Set();
+        eventHandlers.set(method, handlers);
+      }
+      handlers.add(handler);
+      return () => {
+        handlers.delete(handler);
+        if (handlers.size === 0) eventHandlers.delete(method);
+      };
+    },
     close() {
       socket.close();
       for (const { reject } of pending.values()) reject(new Error("CDP connection closed"));
       pending.clear();
+      eventHandlers.clear();
     },
   });
 }
 
 async function runSmoke() {
+  const containerContract = assertContainerContract();
   const fixture = await createSyntheticHome();
   const port = await freeTcpPort();
   const binary = electronBinary();
@@ -229,10 +340,10 @@ async function runSmoke() {
     env: Object.fromEntries(Object.entries(environment).filter(([, value]) => value !== undefined)),
     stdio: ["ignore", "pipe", "pipe"],
   });
-  let stdout = "";
-  let stderr = "";
-  child.stdout?.on("data", (chunk) => { stdout += chunk.toString("utf8"); });
-  child.stderr?.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+  let stdoutProduced = false;
+  let stderrProduced = false;
+  child.stdout?.on("data", () => { stdoutProduced = true; });
+  child.stderr?.on("data", () => { stderrProduced = true; });
   let cdp = null;
   let forcedShutdown = false;
   try {
@@ -244,11 +355,11 @@ async function runSmoke() {
     ).catch((error) => {
       // Electron's own stderr contains only bounded runtime diagnostics here;
       // the companion's output is intentionally discarded by its supervisor.
-      process.stderr.write(
-        `Electron endpoint diagnostics (port ${port}, pid ${child.pid}, `
-        + `exit ${child.exitCode ?? "running"}): ${error.message}\n`,
-      );
-      if (stderr.length > 0) process.stderr.write(`${stderr.slice(-4_000)}\n`);
+      // Never print Electron or companion output: a future renderer/runtime
+      // failure must remain content-free even if it includes a local path or
+      // a provider-derived value. The thrown error remains bounded and
+      // carries only this fixed smoke-stage label.
+      process.stderr.write("Electron Linux endpoint unavailable.\n");
       throw error;
     });
     const target = await waitFor(async () => {
@@ -256,6 +367,25 @@ async function runSmoke() {
       return targets.find((entry) => entry.type === "page" && entry.webSocketDebuggerUrl);
     }, MAX_STARTUP_MS, "Electron dashboard target");
     cdp = await connectCdp(target);
+    const observedNetworkUrls = [];
+    let networkEvidenceInvalid = false;
+    const observeNetworkURL = (url) => {
+      if (typeof url !== "string"
+          || url.length === 0
+          || url.length > MAX_NETWORK_EVIDENCE_URL_LENGTH
+          || observedNetworkUrls.length >= MAX_NETWORK_EVIDENCE_URLS) {
+        networkEvidenceInvalid = true;
+        return;
+      }
+      observedNetworkUrls.push(url);
+    };
+    cdp.on("Network.requestWillBeSent", ({ request } = {}) => {
+      observeNetworkURL(request?.url);
+    });
+    cdp.on("Network.webSocketCreated", ({ url } = {}) => {
+      observeNetworkURL(url);
+    });
+    await cdp.request("Network.enable");
     const ready = await waitFor(
       async () => {
         const snapshot = await cdp.evaluate(`(() => ({
@@ -299,6 +429,10 @@ async function runSmoke() {
       MAX_STARTUP_MS,
       "dashboard reload readiness",
     );
+    if (networkEvidenceInvalid
+        || observedNetworkUrls.some((url) => !isAllowedRendererNetworkURL(url, dashboardUrl.origin))) {
+      fail("renderer attempted a non-loopback network request");
+    }
 
     // CDP window bounds are the most deterministic lifecycle control available
     // in a headless desktop lane. A real desktop can additionally exercise the
@@ -352,7 +486,11 @@ async function runSmoke() {
       rendererReloaded: true,
       windowMinimizedAndRestored,
       cleanQuit: true,
-      networkBoundary: "caller-enforced-network-none",
+      networkBoundary: NETWORK_BOUNDARY,
+      networkBoundaryEvidence: containerContract.networkBoundaryEvidence,
+      imagePlatform: process.env.USAGE_MONITOR_LINUX_IMAGE_PLATFORM,
+      runtimeArchitecture: process.arch,
+      qualification: "development-only",
     }, null, 2)}\n`);
   } catch (error) {
     forcedShutdown = true;
@@ -365,12 +503,23 @@ async function runSmoke() {
     }
     await rm(fixture.root, { recursive: true, force: true });
     if (forcedShutdown) {
-      // Keep diagnostics bounded and content-free; the app itself owns all
-      // local state under the deleted fixture root.
-      if (stdout.length > 0) process.stderr.write("Electron stdout was produced before failure.\n");
-      if (stderr.length > 0) process.stderr.write("Electron stderr was produced before failure.\n");
+      // Keep diagnostics content-free; the app itself owns all local state
+      // under the deleted fixture root. Do not forward either captured stream.
+      for (const diagnostic of fixedRuntimeFailureDiagnostics({
+        stdoutProduced,
+        stderrProduced,
+      })) {
+        process.stderr.write(diagnostic);
+      }
     }
   }
 }
 
-await runSmoke();
+if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
+  try {
+    await runSmoke();
+  } catch {
+    process.stderr.write(`${CLI_FAILURE_STATUS}\n`);
+    process.exitCode = 1;
+  }
+}
