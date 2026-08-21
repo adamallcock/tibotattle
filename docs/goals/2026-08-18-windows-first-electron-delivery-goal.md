@@ -19,6 +19,52 @@ production signing, a public artifact, a GitHub release, an appcast change, a
 Homebrew update, a service deployment, replacement of the native macOS client,
 or a Linux-support claim.
 
+## Progress checkpoint: 2026-08-21
+
+- The integration branch has been rebased on `origin/main` at
+  `49965f401131f938b188f6067164ff0ade6a56ff` (version `0.1.15`). The
+  functional source head before the latest diagnostic attempt was `1948117`;
+  the duplicate-root experiment is currently reverted by `bd1c618`.
+- Local `pnpm test:preflight` passed. Local `pnpm test:portable` passed with
+  1,192 tests: 1,149 passed, 43 expected skips, and 0 failures.
+- Exact Windows qualification run `32447273129` reduced both warm and clean
+  jobs to one blocker: ordinal 10 at
+  `test/windows-filesystem-security.test.js:871:31`, the
+  `publishSqliteDatabase` call.
+- The focused duplicate-root correction at `9125c4a` passed its local gates,
+  but exact run `32447952797` reproduced the same ordinal and location in both
+  warm and clean jobs. It was therefore reverted by `bd1c618`.
+- The dependent Windows Electron artifact/runtime, NSIS, and R7 receipt gates
+  remain unaccepted. `productionSafe` remains false; no Windows or Linux
+  support claim, version bump, release, publication, or signing action is
+  authorized by this goal.
+- The concrete blocker is that the `publishSqliteDatabase` callback does not
+  yet surface which phase failed (pre-rename, rename, or post-rename
+  validation) or the fixed native error class. No further source repair should
+  be attempted until a bounded, content-free diagnostic distinguishes those
+  phases.
+
+### Ordered next steps from this checkpoint
+
+1. Add only a bounded diagnostic around the callback phases. Its exit
+   criterion is a local contract proving that it reports the phase, operation,
+   and fixed native error class without paths, names, bytes, or secrets and
+   without changing the operation's behavior.
+2. Run at most one exact warm-and-clean Windows qualification with that
+   diagnostic revision. Its exit criterion is either zero unexplained skips and
+   a green native result, or a content-free report naming the failing phase
+   and native error class. If the same blocker remains without an actionable
+   distinction, stop the repair loop and record it as an unresolved native
+   boundary.
+3. Permit one focused source repair only if the diagnostic identifies an
+   actionable phase and operation. Its exit criterion is passing local
+   preflight/portable gates plus the corresponding targeted native contract;
+   otherwise leave all readiness flags false and stop this dependent path.
+4. Keep the Windows Electron artifact/runtime, NSIS, and R7 receipt gates
+   pending until the native security gate is accepted on the exact revision;
+   then rerun them from that accepted revision. Preserve the native macOS app
+   unchanged while doing so.
+
 ## Progress checkpoint: 2026-08-19
 
 - The secure shared Electron shell, companion supervision, platform gate,
