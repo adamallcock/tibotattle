@@ -29,8 +29,8 @@ or a Linux-support claim.
   `publish_stage_preflight`. The repair now opens the existing staging database
   with the `GENERIC_WRITE` access required by `FlushFileBuffers`, while keeping
   `WRITE_DAC` limited to create-new paths.
-- Local preflight passed. The current local portable lane passes 1,218 tests:
-  1,175 passed, 43 expected non-Windows skips, and 0 failures.
+- Local preflight passed. The current local portable lane passes 1,220 tests:
+  1,177 passed, 43 expected non-Windows skips, and 0 failures.
 - Exact Windows run `32450640613` passed the repaired native filesystem
   diagnostic in both warm and clean jobs, then deterministically failed to exit
   the monolithic portable lane before the 45-minute job guard. Cleanup and the
@@ -68,27 +68,32 @@ or a Linux-support claim.
   same ordinal-90 timeout with `progress_units=57`, proving that every test in
   `apps/local/server.test.mjs` completed and that the remaining defect is
   process/stdio lifecycle rather than test execution.
+- Exact Windows run `32459968276` used revision
+  `511a4b5e30a62ba26f09521a309292e80f0f5b26`. The two subprocess tests now
+  dispose their owned pipes and require the child `close` event; those
+  assertions passed, yet warm and clean still timed out with all 57 progress
+  units complete. This rules out the reviewed subprocess and pipe handles.
 - The dependent Windows Electron artifact/runtime, NSIS, and R7 receipt gates
   remain unaccepted. `productionSafe` remains false; no Windows or Linux
   support claim, version bump, release, publication, or signing action is
   authorized by this goal.
-- The concrete blocker is the Windows subprocess lifecycle in
+- The concrete blocker is an as-yet-unclassified Windows resource retained by
   `apps/local/server.test.mjs`. A local control completes its 57 tests in about
   five seconds, while both native Windows cache modes complete all 57 progress
-  units but retain an owned resource. The two subprocess tests are being made
-  to dispose their piped output and prove the child `close` event within the
-  existing fixed budget; production shutdown code is unchanged.
+  units but retain an owned resource. Subprocess and pipe closure is now proven;
+  production shutdown code remains unchanged until one fixed-vocabulary active
+  resource category identifies the actual owner.
 
 ### Ordered next steps from this checkpoint
 
-1. Require both subprocess tests in `apps/local/server.test.mjs` to observe
-   process exit, dispose only their owned stdout/stderr pipes, and prove the
-   child `close` event within the existing short lifecycle budget. Do not
-   raise a timeout, force the test process to exit, or weaken assertions.
+1. At the file's final test hook, map `process.getActiveResourcesInfo()` into
+   ten fixed category digits, cap the observation at 64 resources, and let the
+   parent read only the framed digits from its own bounded temporary file. No
+   resource names, paths, values, stacks, or raw child output may be emitted.
 2. Pass the full local preflight and portable lanes, then dispatch one exact
-   warm-and-clean run. If ordinal 90 still retains a resource, add one bounded
-   fixed-vocabulary handle-category diagnostic before changing production
-   shutdown code; do not repeat speculative one-file workflow runs.
+   warm-and-clean run. Use the matching fixed category counts to close the
+   actual owner; do not raise timeouts, force exit, weaken assertions, or run
+   another speculative subprocess repair.
 3. Accept the Windows native/security boundary only when warm and clean jobs
    pass the authoritative portable lane, content-free native qualification,
    cleanup, and clean-checkout gates on one exact revision.

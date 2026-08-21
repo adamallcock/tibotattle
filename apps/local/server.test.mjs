@@ -255,6 +255,52 @@ test.after(() => rmSync(WINDOWS_QUALIFICATION_RESOURCE_ROOT, {
   force: true,
 }));
 
+const WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_ENVIRONMENT_KEY =
+  "TIBOTATTLE_WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_FILE";
+const WINDOWS_PORTABLE_RESOURCE_TYPE_CODES = Object.freeze({
+  ChildProcess: "0",
+  ProcessWrap: "0",
+  FSReqCallback: "1",
+  FileHandleCloseReq: "1",
+  Immediate: "2",
+  MessagePort: "3",
+  PipeWrap: "4",
+  SignalWrap: "5",
+  TCPServerWrap: "6",
+  TCPSocketWrap: "7",
+  TCPWrap: "7",
+  Timeout: "8",
+});
+
+test.after(() => {
+  const diagnosticFile =
+    process.env[WINDOWS_PORTABLE_RESOURCE_DIAGNOSTIC_ENVIRONMENT_KEY];
+  if (typeof diagnosticFile !== "string"
+      || diagnosticFile.length < 1
+      || typeof process.getActiveResourcesInfo !== "function") {
+    return;
+  }
+  let resourceTypes;
+  try {
+    resourceTypes = process.getActiveResourcesInfo();
+  } catch {
+    resourceTypes = [];
+  }
+  const codes = resourceTypes.slice(0, 65).map((type) =>
+    WINDOWS_PORTABLE_RESOURCE_TYPE_CODES[type] ?? "9");
+  // R/Q frame only fixed category digits. The parent reads at most 67 bytes
+  // from its own temporary file and never forwards child output.
+  try {
+    writeFileSync(diagnosticFile, `R${codes.join("")}Q`, {
+      encoding: "ascii",
+      flag: "wx",
+      mode: 0o600,
+    });
+  } catch {
+    // Absence is reported as a fixed unavailable diagnostic by the parent.
+  }
+});
+
 function windowsElectronQualificationContext({ adapter, stateRoot, environment = {
   USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION: "windows-electron-v1",
   USAGE_MONITOR_TEST_LANE: "windows-electron-smoke",
