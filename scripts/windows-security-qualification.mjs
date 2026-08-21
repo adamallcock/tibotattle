@@ -198,20 +198,50 @@ export const WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST = Object.freeze([
 // extended result code as the numeric `errcode` property; only the primary
 // low byte is used here.  Never inspect or forward `message`, `errstr`,
 // `code`, SQL, paths, or any other property from the thrown object.
+// SQLite's documented primary result codes are deliberately mapped one by
+// one.  A few existing aggregate names are retained because they are useful
+// for the qualification lane (for example, lock contention), but every
+// documented primary value has a named category and therefore cannot silently
+// collapse into OTHER.  The map is the only source of category values that
+// may cross the content-free qualification boundary.
+export const WINDOWS_SQLITE_PRIMARY_ERROR_CATEGORY_BY_CODE = Object.freeze({
+  0: "SQLITE_OK",
+  1: "SQLITE_ERROR",
+  2: "SQLITE_INTERNAL",
+  3: "SQLITE_PERM",
+  4: "SQLITE_ABORT",
+  5: "BUSY_LOCKED",
+  6: "BUSY_LOCKED",
+  7: "SQLITE_NOMEM",
+  8: "READONLY",
+  9: "SQLITE_INTERRUPT",
+  10: "CANTOPEN_IOERR",
+  11: "CORRUPT_NOTADB",
+  12: "SQLITE_NOTFOUND",
+  13: "SQLITE_FULL",
+  14: "CANTOPEN_IOERR",
+  15: "SQLITE_PROTOCOL",
+  16: "SQLITE_EMPTY",
+  17: "SQLITE_SCHEMA",
+  18: "SQLITE_TOOBIG",
+  19: "SQLITE_CONSTRAINT",
+  20: "SQLITE_MISMATCH",
+  21: "SQLITE_MISUSE",
+  22: "SQLITE_NOLFS",
+  23: "SQLITE_AUTH",
+  24: "SQLITE_FORMAT",
+  25: "SQLITE_RANGE",
+  26: "CORRUPT_NOTADB",
+  27: "SQLITE_NOTICE",
+  28: "SQLITE_WARNING",
+  100: "SQLITE_ROW",
+  101: "SQLITE_DONE",
+});
 export const WINDOWS_SQLITE_ERROR_CATEGORY_ALLOWLIST = Object.freeze([
-  "BUSY_LOCKED",
-  "CANTOPEN_IOERR",
-  "READONLY",
-  "CORRUPT_NOTADB",
+  ...new Set(Object.values(WINDOWS_SQLITE_PRIMARY_ERROR_CATEGORY_BY_CODE)),
   "OTHER",
   "UNAVAILABLE",
 ]);
-const SQLITE_PRIMARY_ERROR_CODES = Object.freeze({
-  busyLocked: Object.freeze([5, 6]),
-  cantopenIoerr: Object.freeze([10, 14]),
-  readonly: Object.freeze([8]),
-  corruptNotadb: Object.freeze([11, 26]),
-});
 const SQLITE_MAX_ERROR_CODE = 0x7fffffff;
 
 /**
@@ -225,19 +255,9 @@ export function classifyWindowsSqliteErrorCode(errcode) {
     return "UNAVAILABLE";
   }
   const primaryCode = errcode % 256;
-  if (SQLITE_PRIMARY_ERROR_CODES.busyLocked.includes(primaryCode)) {
-    return "BUSY_LOCKED";
-  }
-  if (SQLITE_PRIMARY_ERROR_CODES.cantopenIoerr.includes(primaryCode)) {
-    return "CANTOPEN_IOERR";
-  }
-  if (SQLITE_PRIMARY_ERROR_CODES.readonly.includes(primaryCode)) {
-    return "READONLY";
-  }
-  if (SQLITE_PRIMARY_ERROR_CODES.corruptNotadb.includes(primaryCode)) {
-    return "CORRUPT_NOTADB";
-  }
-  return "OTHER";
+  return Object.hasOwn(WINDOWS_SQLITE_PRIMARY_ERROR_CATEGORY_BY_CODE, primaryCode)
+    ? WINDOWS_SQLITE_PRIMARY_ERROR_CATEGORY_BY_CODE[primaryCode]
+    : "OTHER";
 }
 
 /**

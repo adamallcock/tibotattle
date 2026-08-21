@@ -95,6 +95,7 @@ export const PORTABLE_TEST_GROUPS = Object.freeze({
     "test/windows-path-contract.test.js",
     "test/windows-skip-ledger.test.js",
     "test/windows-test-manifest.test.js",
+    "test/electron-development-artifact-verifier.test.js",
     "apps/local/participant-relay-routes.test.mjs",
     "apps/local/participant-session-cookie-bridge.test.mjs",
     "apps/local/server.test.mjs",

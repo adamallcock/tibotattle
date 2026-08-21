@@ -16,6 +16,7 @@ import test from "node:test";
 
 import {
   FIXED_STATUS,
+  normalizeArchivePath,
   parseArguments,
   parseFixedStatusOutput,
   verifyElectronDevelopmentArtifact,
@@ -334,6 +335,37 @@ test("verifies Windows x64 binding and sidecar digests without promoting provena
   });
 });
 
+test("round-trips every Windows ASAR list entry through native lookups", {
+  skip: process.platform !== "win32",
+}, async () => {
+  await withFixture("win32-x64", {}, async (fixture) => {
+    // The full verifier exercises the production canonicalization and lookup
+    // path conversion before the explicit per-entry assertions below.
+    const result = await verify(fixture, "win32-x64");
+    assert.equal(result.status, FIXED_STATUS.verified);
+
+    const listed = asar.listPackage(fixture.asarPath);
+    assert.equal(listed.length > 0, true);
+    const canonical = listed.map((rawPath) => normalizeArchivePath(rawPath, "win32"));
+    assert.equal(new Set(canonical).size, listed.length);
+
+    for (const [index, rawPath] of listed.entries()) {
+      assert.match(rawPath, /^\\[^\\]/u);
+      assert.doesNotMatch(rawPath, /\//u);
+      assert.doesNotMatch(canonical[index], /\\/u);
+      const nativeLookupPath = canonical[index].replaceAll("/", "\\");
+      const stat = asar.statFile(fixture.asarPath, nativeLookupPath);
+      assert.equal(stat !== null && typeof stat === "object", true);
+      if (stat.files !== undefined || stat.link !== undefined || stat.unpacked === true) {
+        continue;
+      }
+      const bytes = asar.extractFile(fixture.asarPath, nativeLookupPath);
+      assert.equal(Buffer.isBuffer(bytes) || bytes instanceof Uint8Array, true);
+      assert.equal(bytes.byteLength, stat.size);
+    }
+  });
+});
+
 test("rejects a Windows keytar prebuild whose bytes do not match the pinned digest", async () => {
   await withFixture(
     "win32-x64",
@@ -582,6 +614,52 @@ test("requires explicit target and artifact paths", () => {
     () => parseArguments(["--target", "windows"]),
     (error) => error.code === FIXED_STATUS.inputInvalid,
   );
+});
+
+test("normalizes Windows-rooted ASAR list paths on macOS", async () => {
+  await withFixture("darwin-arm64", {}, async (fixture) => {
+    const listed = asar.listPackage(fixture.asarPath);
+    const posixPaths = listed.map((path) => normalizeArchivePath(path, "darwin"));
+    const windowsPaths = listed.map((path) => normalizeArchivePath(
+      path.replaceAll("/", "\\"),
+      "win32",
+    ));
+    assert.deepEqual(windowsPaths.sort(), posixPaths.sort());
+    assert.equal(
+      normalizeArchivePath(String.raw`\apps\electron\main.js`, "win32"),
+      "apps/electron/main.js",
+    );
+  });
+});
+
+test("rejects non-canonical ASAR list paths", () => {
+  const invalid = [
+    ["win32", "apps\\electron\\main.js"],
+    ["win32", "/apps/electron/main.js"],
+    ["win32", String.raw`\apps/electron/main.js`],
+    ["win32", String.raw`\apps\\electron\main.js`],
+    ["win32", String.raw`\\server\share\main.js`],
+    ["win32", String.raw`C:\apps\main.js`],
+    ["win32", String.raw`\C:\apps\main.js`],
+    ["win32", String.raw`\apps\.\main.js`],
+    ["win32", String.raw`\apps\..\main.js`],
+    ["win32", `\\apps\\main\0.js`],
+    ["darwin", "apps/electron/main.js"],
+    ["darwin", "//apps/electron/main.js"],
+    ["darwin", "/apps//electron/main.js"],
+    ["darwin", "/apps\\electron/main.js"],
+    ["darwin", "/C:/apps/main.js"],
+    ["darwin", "/apps/./main.js"],
+    ["darwin", "/apps/../main.js"],
+    ["darwin", "/apps/main\0.js"],
+  ];
+  for (const [platform, raw] of invalid) {
+    assert.throws(
+      () => normalizeArchivePath(raw, platform),
+      (error) => error.code === FIXED_STATUS.archiveInvalid,
+      `${platform}: ${JSON.stringify(raw)}`,
+    );
+  }
 });
 
 test("parses only one allowlisted content-free verifier status", () => {
