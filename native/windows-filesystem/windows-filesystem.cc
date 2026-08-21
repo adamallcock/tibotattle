@@ -4153,6 +4153,7 @@ bool OpenSqliteStagingChild(
     const HandleIdentity& expectedRoot,
     const std::wstring& childName,
     bool createNew,
+    bool existingWriteAccess,
     RelativeHandles* opened,
     ParsedPath* fullPath,
     HandleIdentity* identity,
@@ -4160,10 +4161,13 @@ bool OpenSqliteStagingChild(
   OpenRelativeOptions options;
   options.finalDirectoryKnown = true;
   options.finalDirectory = false;
-  options.access = createNew
-      ? GENERIC_READ | GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC
-          | FILE_READ_ATTRIBUTES | SYNCHRONIZE
-      : GENERIC_READ | DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  options.access = GENERIC_READ | DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  if (createNew || existingWriteAccess) {
+    options.access |= GENERIC_WRITE;
+  }
+  if (createNew) {
+    options.access |= WRITE_DAC;
+  }
   // Hold the file against ordinary writes and deletes until the operation is
   // complete.  Ancestors remain held by OpenProtectedRootAndChild as well.
   options.shareMode = FILE_SHARE_READ;
@@ -4237,6 +4241,7 @@ napi_value CreateSqliteDatabaseCallback(napi_env env, napi_callback_info info) {
           expectedRoot,
           databaseName,
           true,
+          false,
           &opened,
           &fullPath,
           &identity,
@@ -4281,6 +4286,7 @@ napi_value CloneSqliteDatabaseCallback(napi_env env, napi_callback_info info) {
           expectedRoot,
           sourceName,
           false,
+          false,
           &source,
           &sourcePath,
           &sourceIdentity,
@@ -4296,6 +4302,7 @@ napi_value CloneSqliteDatabaseCallback(napi_env env, napi_callback_info info) {
           expectedRoot,
           stageName,
           true,
+          false,
           &stage,
           &stagePath,
           &stageIdentity,
@@ -4353,6 +4360,7 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
           expectedRoot,
           stageName,
           false,
+          true,
           &stage,
           &stagePath,
           &stageIdentity,
@@ -4362,9 +4370,13 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
     return ThrowFailure(env, failure);
   }
   if (!EqualIdentity(stageIdentity, expectedStage)
-      || !RequireSqliteSidecarsAbsent(stage.parents.front(), stageName, &failure)
-      || !FlushFileBuffers(stage.final)) {
+      || !RequireSqliteSidecarsAbsent(stage.parents.front(), stageName, &failure)) {
     if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    failure.stage = "publish_stage_preflight";
+    return ThrowFailure(env, failure);
+  }
+  if (!FlushFileBuffers(stage.final)) {
+    failure = FromLastError();
     failure.stage = "publish_stage_preflight";
     return ThrowFailure(env, failure);
   }
