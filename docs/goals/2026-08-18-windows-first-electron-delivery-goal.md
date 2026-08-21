@@ -79,28 +79,38 @@ or a Linux-support claim.
   pipes, one retained TCP server listener, and one uncategorized resource. No
   child, filesystem, immediate, message-port, signal, TCP-socket, or timeout
   resource remained.
+- Exact Windows run `32462287800` used revision
+  `245d798627912189af3ac46c24a03a4dbcefef01`. Warm and clean again completed
+  all 57 tests and returned the identical fixed result
+  `0:0:0:0:2:0:1:0:0:0/0/22`: the retained TCP server first appears after
+  test ordinal 22, `participant relay never follows an upstream redirect`, and
+  persists to process shutdown. This localizes the defect to that test's
+  private upstream HTTP server lifecycle rather than the production companion
+  shutdown path.
+- The ordinal-22 fixture now closes its listener before force-closing any
+  established HTTP connections, rejects close errors, and asserts that it is
+  no longer listening. The full local preflight and portable lanes pass; exact
+  warm-and-clean Windows proof is pending.
 - The dependent Windows Electron artifact/runtime, NSIS, and R7 receipt gates
   remain unaccepted. `productionSafe` remains false; no Windows or Linux
   support claim, version bump, release, publication, or signing action is
   authorized by this goal.
-- The concrete blocker is one still-listening Windows HTTP server retained by
-  `apps/local/server.test.mjs`. A local control completes its 57 tests in about
-  five seconds, while both native Windows cache modes complete all 57 progress
-  units but retain the same TCP server resource. Subprocess and pipe closure is
-  proven; production shutdown code remains unchanged until the first completed
-  top-level test after which the listener persists is reported as a fixed
-  ordinal.
+- The concrete blocker is the test-owned upstream HTTP server in
+  `participant relay never follows an upstream redirect`. A local control
+  completes its 57 tests in about five seconds, while both native Windows cache
+  modes complete all assertions but retain that TCP server resource.
+  Subprocess and pipe closure is proven; production shutdown code remains
+  unchanged while the test fixture receives a bounded close-and-release
+  regression.
 
 ### Ordered next steps from this checkpoint
 
-1. After each top-level test, allow two event-loop turns for completed close
-   callbacks, then retain only the first ordinal that still has a TCP server.
-   Append that two-digit ordinal to the already bounded category frame; emit no
-   test name, address, port, path, value, stack, or raw child output.
+1. Strengthen ordinal 22's private upstream-server cleanup and prove the owned
+   listener is released; do not raise timeouts, force exit, weaken assertions,
+   or alter the production companion shutdown path.
 2. Pass the full local preflight and portable lanes, then dispatch one exact
-   warm-and-clean run. Use the matching fixed ordinal to close the actual test
-   owner and add a regression assertion; do not raise timeouts, force exit, or
-   weaken assertions.
+   warm-and-clean run. Require the bounded diagnostic to exit normally in both
+   cache modes instead of reporting a retained server ordinal.
 3. Accept the Windows native/security boundary only when warm and clean jobs
    pass the authoritative portable lane, content-free native qualification,
    cleanup, and clean-checkout gates on one exact revision.
