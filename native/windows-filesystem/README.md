@@ -176,14 +176,19 @@ creates owner-only delete-on-close placeholders for the derived `-wal` and
 `-shm` names and holds exclusive handles to them for the complete lease
 lifetime. A SQLite writer therefore receives a sharing violation instead of
 creating either sidecar; the placeholders disappear when the last native
-handle closes, including after an abrupt process termination. The lease holds
-the root/ancestor, database, journal, and sidecar-reservation handles with
-read/write sharing but without delete sharing, and coordinates duplicate
-acquisition with a current-user owner-only named mutex derived from the
-validated root/database identities. An abandoned mutex is retained by the
-new owner so SQLite can perform bounded hot-journal recovery before the
-session is exposed. `releaseSqliteStateLease` releases that mutex and every
-handle exactly once. The binding still advertises `sqliteStateLeaseSafe:
-false`: native Windows qualification must prove the reservation,
-identity-binding, recovery, and supported filesystem matrix before any
-production selector can rely on it.
+handle closes, including after an abrupt process termination. The lease keeps
+the sidecar-reservation handles separate from the ordinary root/ancestor,
+database, and journal handles. This lets release perform the required
+two-phase boundary: the JavaScript session closes SQLite first, native release
+marks each sidecar reservation delete-pending, closes those handles, and then
+performs a bounded handle-relative absence proof while the protected root is
+still held. Only after that proof succeeds does it close the remaining handles,
+release/close the current-user owner-only named mutex, and unregister the
+opaque lease. A failed release retains the token and every remaining native
+resource so a later close/abort can retry; the finalizer remains best-effort
+crash cleanup. An abandoned mutex is retained by the new owner so SQLite can
+perform bounded hot-journal recovery before the session is exposed. The
+binding still advertises `sqliteStateLeaseSafe: false`: native Windows
+qualification must prove the reservation, identity-binding, recovery, bounded
+release, and supported filesystem matrix before any production selector can
+rely on it.

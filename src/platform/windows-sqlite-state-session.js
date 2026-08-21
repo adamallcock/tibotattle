@@ -656,11 +656,9 @@ export function createWindowsSqliteStateSession({
 
   let state = "open";
   let leaseReleased = false;
-  let leaseReleaseAttempted = false;
 
   function release() {
-    if (leaseReleased || leaseReleaseAttempted) return null;
-    leaseReleaseAttempted = true;
+    if (leaseReleased) return null;
     try {
       selectedAdapter.releaseSqliteStateLease(lease);
       leaseReleased = true;
@@ -691,9 +689,13 @@ export function createWindowsSqliteStateSession({
     }
     const releaseFailure = release();
     if (releaseFailure !== null) {
-      // The DB is closed, but the native lease release contract does not
-      // guarantee that retrying is safe. Fail closed and make this context
-      // permanently settled rather than pretending a retry can recover it.
+      // The DB is closed, but native release may have retained a partially
+      // cleaned lease (for example while waiting for a delete-pending
+      // sidecar to disappear). Keep the session retryable; the adapter keeps
+      // the opaque lease token until native release returns successfully.
+      state = "release_pending";
+      if (firstFailure !== null) throw firstFailure;
+      throw releaseFailure;
     }
     state = "closed";
     if (firstFailure !== null) throw firstFailure;

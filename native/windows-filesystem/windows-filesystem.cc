@@ -127,6 +127,12 @@ constexpr ULONG kFileOpen = 1;
 constexpr ULONG kFileCreate = 2;
 constexpr ULONG_PTR kFileOpened = 1;
 constexpr ULONG_PTR kFileCreated = 2;
+// Native SQLite release keeps the protected root open while sidecars are
+// marked delete-pending and their handles are closed.  A short bounded proof
+// avoids publishing an unbounded wait to the JavaScript lifecycle while
+// allowing Windows/AV/indexer cleanup to settle before retryable failure.
+constexpr ULONGLONG kSqliteStateLeaseReleaseTimeoutMs = 2'000;
+constexpr DWORD kSqliteStateLeaseReleasePollMs = 25;
 constexpr DWORD kDirectoryTraversalAccess = FILE_LIST_DIRECTORY
     | FILE_TRAVERSE
     | FILE_READ_ATTRIBUTES
@@ -1936,10 +1942,11 @@ bool ParseSqliteDatabaseName(
 }
 
 // A staged unified index is only safe when SQLite is in its rollback-journal
-// mode.  The qualified session reserves -wal and -shm for its entire
-// lifetime; this second, root-handle-bound check prevents a caller from
-// cloning or publishing through an unexpected sidecar that appeared after
-// that session was closed.
+// mode. The qualified session reserves -wal and -shm for its entire lifetime;
+// this root-handle-bound check is also the bounded release proof after those
+// reservations have been marked delete-pending and closed. It prevents a
+// caller from cloning or publishing through an unexpected sidecar that
+// appeared before the protected lease boundary was fully released.
 bool RequireSqliteSidecarsAbsent(
     HANDLE protectedRoot,
     const std::wstring& databaseName,
@@ -5088,11 +5095,15 @@ napi_value ReleaseCredentialAuditFileGuardCallback(
 
 struct SqliteStateLease {
   std::vector<HANDLE> handles;
+  std::vector<HANDLE> sidecarReservations;
+  std::wstring databaseName;
+  std::size_t protectedRootHandleIndex = 0;
   HandleIdentity databaseIdentity;
   HandleIdentity journalIdentity;
   HANDLE coordination = nullptr;
   DWORD ownerThreadId = 0;
   bool coordinationHeld = false;
+  bool sidecarsAbsent = false;
   bool active = false;
 };
 
@@ -5126,12 +5137,60 @@ bool UnregisterSqliteStateLease(SqliteStateLease* lease) {
   return true;
 }
 
-void CloseSqliteStateLeaseHandles(SqliteStateLease* lease) {
-  for (auto iterator = lease->handles.rbegin();
-       iterator != lease->handles.rend();
-       ++iterator) {
-    if (*iterator != INVALID_HANDLE_VALUE) CloseHandle(*iterator);
+bool CloseSqliteStateLeaseHandleVector(std::vector<HANDLE>* handles) {
+  bool closed = true;
+  for (auto iterator = handles->rbegin(); iterator != handles->rend(); ++iterator) {
+    if (*iterator == INVALID_HANDLE_VALUE) continue;
+    if (!CloseHandle(*iterator)) {
+      closed = false;
+      continue;
+    }
+    *iterator = INVALID_HANDLE_VALUE;
   }
+  return closed;
+}
+
+bool MarkSqliteStateLeaseSidecarsForDeletion(SqliteStateLease* lease) {
+  for (HANDLE handle : lease->sidecarReservations) {
+    if (handle != INVALID_HANDLE_VALUE && !MarkHandleForDeletion(handle)) return false;
+  }
+  return true;
+}
+
+bool CloseSqliteStateLeaseSidecars(SqliteStateLease* lease) {
+  return CloseSqliteStateLeaseHandleVector(&lease->sidecarReservations);
+}
+
+bool WaitForSqliteStateLeaseSidecarsAbsent(
+    SqliteStateLease* lease) {
+  if (lease->protectedRootHandleIndex >= lease->handles.size()) return false;
+  const HANDLE protectedRoot = lease->handles[lease->protectedRootHandleIndex];
+  if (protectedRoot == INVALID_HANDLE_VALUE) return false;
+  const ULONGLONG deadline = GetTickCount64() + kSqliteStateLeaseReleaseTimeoutMs;
+  while (true) {
+    Failure failure = OperationFailed();
+    if (RequireSqliteSidecarsAbsent(protectedRoot, lease->databaseName, &failure)) {
+      return true;
+    }
+    if (failure.code != SqliteStateLeaseSidecarPresent().code
+        && failure.code != AccessDenied().code) {
+      return false;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (now >= deadline) return false;
+    const ULONGLONG remaining = deadline - now;
+    const DWORD delay = static_cast<DWORD>(std::min<ULONGLONG>(
+        kSqliteStateLeaseReleasePollMs,
+        remaining));
+    if (delay == 0) return false;
+    Sleep(delay);
+  }
+}
+
+void CloseSqliteStateLeaseHandles(SqliteStateLease* lease) {
+  CloseSqliteStateLeaseSidecars(lease);
+  CloseSqliteStateLeaseHandleVector(&lease->handles);
+  lease->sidecarReservations.clear();
   lease->handles.clear();
   if (lease->coordination != nullptr) {
     if (lease->coordinationHeld && lease->ownerThreadId == GetCurrentThreadId()) {
@@ -5141,6 +5200,7 @@ void CloseSqliteStateLeaseHandles(SqliteStateLease* lease) {
     lease->coordination = nullptr;
     lease->coordinationHeld = false;
   }
+  lease->sidecarsAbsent = false;
   lease->active = false;
 }
 
@@ -5358,12 +5418,14 @@ napi_value AcquireSqliteStateLeaseCallback(
   }
 
   // Reserve both names after the identity mutex has been acquired and before
-  // exposing a lease.  The delete-on-close handles remain in the lease's
-  // handle vector and are therefore held until after the SQLite connection
-  // has closed.  This is the lifetime boundary that an existence preflight
-  // cannot provide.  Acquiring the mutex first also makes a second contender
-  // report the stable lease-contended result instead of racing the sidecar
-  // placeholder and reporting a misleading sidecar-present result.
+  // exposing a lease.  The delete-on-close handles remain in a separate
+  // sidecar vector and are therefore held until after the SQLite connection
+  // has closed.  Keeping them separate lets release mark and close sidecars,
+  // prove their absence while the root remains open, and only then close the
+  // ordinary lease handles.  This is the lifetime boundary that an existence
+  // preflight cannot provide.  Acquiring the mutex first also makes a second
+  // contender report the stable lease-contended result instead of racing the
+  // sidecar placeholder and reporting a misleading sidecar-present result.
   std::vector<HANDLE> sidecarReservations;
   sidecarReservations.reserve(2);
   HANDLE walReservation = INVALID_HANDLE_VALUE;
@@ -5396,20 +5458,22 @@ napi_value AcquireSqliteStateLeaseCallback(
   }
   sidecarReservations.push_back(shmReservation);
 
+  const std::size_t protectedRootHandleIndex = rootOpened.parents.size();
   std::vector<HANDLE> handles = TakeAllHandles(&rootOpened);
   AppendHandles(&handles, TakeAllHandles(&databaseOpened));
   AppendHandles(&handles, TakeAllHandles(&journalOpened));
-  AppendHandles(&handles, std::move(sidecarReservations));
   auto* lease = new (std::nothrow) SqliteStateLease;
   if (lease == nullptr) {
-    for (auto iterator = handles.rbegin(); iterator != handles.rend(); ++iterator) {
-      if (*iterator != INVALID_HANDLE_VALUE) CloseHandle(*iterator);
-    }
+    CloseSqliteStateLeaseHandleVector(&sidecarReservations);
+    CloseSqliteStateLeaseHandleVector(&handles);
     ReleaseMutex(coordination);
     CloseHandle(coordination);
     return ThrowFailure(env, OperationFailed());
   }
   lease->handles = std::move(handles);
+  lease->sidecarReservations = std::move(sidecarReservations);
+  lease->databaseName = databaseName;
+  lease->protectedRootHandleIndex = protectedRootHandleIndex;
   lease->databaseIdentity = databaseIdentity;
   lease->journalIdentity = journalIdentity;
   lease->coordination = coordination;
@@ -5472,7 +5536,7 @@ napi_value ReleaseSqliteStateLeaseCallback(
   }
   auto* lease = static_cast<SqliteStateLease*>(data);
   const std::lock_guard<std::mutex> lock(gSqliteStateLeasesMutex);
-  if (!IsIssuedSqliteStateLease(lease) || !lease->active || lease->handles.empty()) {
+  if (!IsIssuedSqliteStateLease(lease) || !lease->active) {
     return ThrowFailure(env, SqliteStateLeaseForeign());
   }
   // A Win32 mutex can be released only by its owning thread. Reject before
@@ -5484,26 +5548,42 @@ napi_value ReleaseSqliteStateLeaseCallback(
       && lease->ownerThreadId != GetCurrentThreadId()) {
     return ThrowFailure(env, SqliteStateLeaseForeign());
   }
-  UnregisterSqliteStateLease(lease);
-  bool closed = true;
-  for (auto iterator = lease->handles.rbegin();
-       iterator != lease->handles.rend();
-       ++iterator) {
-    if (*iterator != INVALID_HANDLE_VALUE && !CloseHandle(*iterator)) closed = false;
+
+  // SQLite must already be closed by the JavaScript owner.  Sidecar handles
+  // are released first: mark them delete-pending, close them, and retain the
+  // ordinary root handle while proving both derived names absent.  Any
+  // failure leaves the issued token and all still-live resources in place so
+  // a later close/abort can retry this phase safely.
+  if (!lease->sidecarsAbsent) {
+    if (!MarkSqliteStateLeaseSidecarsForDeletion(lease)
+        || !CloseSqliteStateLeaseSidecars(lease)
+        || !WaitForSqliteStateLeaseSidecarsAbsent(lease)) {
+      return ThrowFailure(env, SqliteStateLeaseReleaseFailed());
+    }
+    lease->sidecarsAbsent = true;
   }
-  lease->handles.clear();
+
+  // Only after sidecar absence is proven may the ordinary root/database/
+  // journal handles be closed.  Partial close failure is also retryable;
+  // already-closed entries remain invalidated in the vector and live entries
+  // are retained for the next release attempt.
+  if (!CloseSqliteStateLeaseHandleVector(&lease->handles)) {
+    return ThrowFailure(env, SqliteStateLeaseReleaseFailed());
+  }
   if (lease->coordination != nullptr) {
     if (lease->coordinationHeld) {
       if (!ReleaseMutex(lease->coordination)) {
-        closed = false;
+        return ThrowFailure(env, SqliteStateLeaseReleaseFailed());
       }
+      lease->coordinationHeld = false;
     }
-    if (!CloseHandle(lease->coordination)) closed = false;
+    if (!CloseHandle(lease->coordination)) {
+      return ThrowFailure(env, SqliteStateLeaseReleaseFailed());
+    }
     lease->coordination = nullptr;
-    lease->coordinationHeld = false;
   }
   lease->active = false;
-  if (!closed) return ThrowFailure(env, SqliteStateLeaseReleaseFailed());
+  UnregisterSqliteStateLease(lease);
   napi_value undefined;
   napi_get_undefined(env, &undefined);
   return undefined;
