@@ -573,7 +573,10 @@ test("guarded corrupt-database cleanup retains the native guard when SQLite clos
   const movedPath = `${filePath}.moved`;
   const native = loadWindowsFilesystemBinding();
   native.ensureDirectory(privateRoot);
-  await writeFile(filePath, Buffer.from("DO-NOT-LEAK-corrupt-sqlite"));
+  // A Node-created child is not guaranteed to inherit the reviewed owner-only
+  // DACL from this non-inheriting directory. Create the corrupt fixture
+  // through the same native primitive that the audit guard validates.
+  native.createFile(filePath, Buffer.from("DO-NOT-LEAK-corrupt-sqlite"));
   const capturedGuards = [];
   let releaseAttempts = 0;
   const binding = {
