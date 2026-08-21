@@ -3630,7 +3630,17 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           incrementalContribution: {
             schemaVersion: "telemetry-contribution-v1.0",
             status: "implementation_ready",
-            externalParticipantsAuthorized: false,
+            // Owner decision 2026-08-21: external participants ARE authorized
+            // on the production deployment — enrollment was already open at
+            // the pairing layer, and this declaration now matches that
+            // reality instead of contradicting it. Env-driven rather than a
+            // literal so staging and synthetic keep declaring false and their
+            // containment checks (deploy-disabled-staging) stay meaningful.
+            // The v0.2 account-scoped declaration above stays false: that
+            // path is implementation_disabled and authorizes no one.
+            externalParticipantsAuthorized:
+              Reflect.get(env, "INCREMENTAL_EXTERNAL_PARTICIPANTS")
+                === "authorized",
           },
         },
         capabilities: {

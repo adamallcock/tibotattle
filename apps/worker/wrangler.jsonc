@@ -301,6 +301,12 @@
         // keeps the ceiling meaningful without gating real sign-ins.
         // Owner-raised 2026-08-10 for public launch.
         "SIGN_IN_START_MAX_PER_MINUTE": "300",
+        // Owner decision 2026-08-21: the health surface declares external
+        // participants authorized on the v1.0 incremental contract. Pairing
+        // was already open; the declaration now tells the truth. Absent on
+        // staging/synthetic deliberately — their containment checks assert a
+        // closed posture.
+        "INCREMENTAL_EXTERNAL_PARTICIPANTS": "authorized",
         // A non-secret immutable label paired with the keyed fingerprint in
         // D1. Changing either it or IDENTITY_LINK_SECRET fails closed until a
         // separately reviewed dual-key identity migration exists.

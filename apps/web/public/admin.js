@@ -45,10 +45,8 @@ const INFO_HINTS = Object.freeze({
   "Approved community accounts": "Approved identities that are currently active and allowed to contribute. This includes approved accounts that have not yet sent accepted data.",
   "Accounts with accepted data": "Distinct approved accounts with at least one accepted whole contribution or incremental chunk. The caption shows how many were active in the trailing 30 days.",
   "Approved last 24h": "Identities first approved during the trailing 24 hours. The caption gives the corresponding trailing seven-day count.",
-  "Telemetry contributions": "Accepted whole-contribution envelopes. Current app versions normally send incremental chunks, so this can be zero while uploads are healthy.",
   "Current incremental chunks": "Accepted incremental journal chunks that have not been superseded. The caption includes every retained chunk row, including older superseded rows.",
   "Accepted uploads last 24h": "Accepted whole contributions plus incremental chunks received during the trailing 24 hours. One account can send many uploads.",
-  "Stored telemetry records": "Content-free metadata rows retained by the earlier telemetry-record path. This is a row count, not a contributor count.",
   "Upload safety registrations": "Crash-safety markers created before uploaded objects are committed to the database. Recent markers are normal; older markers are reconciled.",
   "Recent registrations": "Upload safety markers still inside the one-hour grace period. They are expected and are not yet eligible for reconciliation.",
   "Due and referenced": "Markers older than the grace period whose uploaded objects are referenced by accepted database rows. The object is preserved and the temporary marker should clear.",
@@ -641,10 +639,8 @@ function renderCounts(overview) {
     ["Approved community accounts", count(counts.participants.active, counts.participants.bounded), `${count(counts.participants.total, counts.participants.bounded)} total identities`],
     ["Accounts with accepted data", count(contributors.total, contributors.bounded), `${count(contributors.acceptedLast30Days, contributors.bounded)} active in the last 30 days`],
     ["Approved last 24h", count(counts.participants.enrolledLast24Hours), `${count(counts.participants.enrolledLast7Days)} in the last 7 days`],
-    ["Telemetry contributions", count(counts.contributions.telemetry.accepted, counts.contributions.telemetry.bounded), `${count(counts.contributions.telemetry.total, counts.contributions.telemetry.bounded)} total`],
     ["Current incremental chunks", count(counts.contributions.incrementalChunks.current, counts.contributions.incrementalChunks.bounded), `${count(counts.contributions.incrementalChunks.total, counts.contributions.incrementalChunks.bounded)} journal rows`],
     ["Accepted uploads last 24h", count(counts.contributions.acceptedLast24Hours), `${count(counts.contributions.acceptedLast7Days)} in the last 7 days`],
-    ["Stored telemetry records", count(counts.contributions.storedTelemetryRecords, counts.contributions.storedTelemetryRecordsBounded), "content-free metadata rows"],
     ["Upload safety registrations", count(quarantine.pendingObjects, quarantine.pendingObjectsBounded), `${quarantine.withinGrace} recent · ${quarantineDue} due`],
   ];
   renderMetricCards("#counts", metrics);

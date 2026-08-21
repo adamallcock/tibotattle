@@ -2084,6 +2084,10 @@ describe("synthetic usage monitor service", () => {
         incrementalContribution: {
           schemaVersion: "telemetry-contribution-v1.0",
           status: "implementation_ready",
+          // False here because the spec env carries no
+          // INCREMENTAL_EXTERNAL_PARTICIPANTS var — the closed default every
+          // deployment gets unless its vars say "authorized", which only
+          // env.production does (owner decision 2026-08-21).
           externalParticipantsAuthorized: false,
         },
       },
