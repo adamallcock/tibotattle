@@ -2424,6 +2424,12 @@ test("participant relay never follows an upstream redirect", async () => {
     upstream.once("error", rejectListen);
     upstream.listen(0, "127.0.0.1", resolveListen);
   });
+  // This private fixture must never own the test runner's lifetime. Windows
+  // can retain the listener's ref after close even though `listening` is false;
+  // explicit unref keeps the fixture non-owning while the close assertions
+  // below still prove orderly shutdown.
+  upstream.unref();
+  assert.equal(upstream.listening, true);
   const address = upstream.address();
   assert.equal(typeof address, "object");
   const app = await startLocalCompanionServer({
