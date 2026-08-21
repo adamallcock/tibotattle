@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   createWindowsFilesystemAdapter,
+  isWindowsFilesystemNotFound,
 } from "../src/platform/windows-filesystem.js";
 
 const NATIVE_WINDOWS = process.platform === "win32" && process.arch === "x64";
@@ -74,7 +75,8 @@ function nativeFailure(code) {
 function assertMissingChild(adapter, root, rootIdentity, childName) {
   assert.throws(
     () => adapter.inspectProtectedChild(root, rootIdentity, childName),
-    nativeFailure("WINDOWS_FILESYSTEM_NOT_FOUND"),
+    (error) => error?.message === "Windows filesystem operation failed"
+      && isWindowsFilesystemNotFound(error),
   );
 }
 
