@@ -185,6 +185,29 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   assert.match(source, /"securityPolicyReason"/u);
   assert.match(source, /"windowsFilesystemStage"/u);
   assert.match(source, /failure->stage = "rename"/u);
+  const preparedDirectoryStart = source.indexOf(
+    "bool OpenPreparedRootAndDirectory(",
+  );
+  const preparedParentStart = source.indexOf(
+    "bool OpenPreparedParentForChild(",
+    preparedDirectoryStart,
+  );
+  assert.ok(preparedDirectoryStart >= 0 && preparedParentStart > preparedDirectoryStart);
+  const preparedDirectoryBody = withoutCppComments(
+    source.slice(preparedDirectoryStart, preparedParentStart),
+  );
+  const preparedRootCall = preparedDirectoryBody.indexOf(
+    "OpenPreparedRootOnly(",
+  );
+  assert.ok(preparedRootCall >= 0);
+  assert.equal(
+    preparedDirectoryBody.slice(0, preparedRootCall).includes("ParseAndValidatePath("),
+    false,
+  );
+  assert.match(
+    preparedDirectoryBody.slice(preparedRootCall),
+    /OpenPreparedRootOnly\([\s\S]*?&parsedRoot[\s\S]*?\)/u,
+  );
   for (const stage of [
     "prepared_root_open",
     "prepared_root_validation",
