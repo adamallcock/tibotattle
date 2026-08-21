@@ -33,6 +33,13 @@ const PAIR = WINDOWS_CREDENTIAL_OPERATION_AUDIT_CAPABILITY_PAIRS[0];
 const NATIVE_WINDOWS = process.platform === "win32" && process.arch === "x64";
 const NATIVE_SKIP = NATIVE_WINDOWS ? false : "native Windows x64 only";
 
+async function nativeProtectedAuditRoot(prefix) {
+  const parent = await mkdtemp(join(tmpdir(), prefix));
+  const root = join(parent, "protected-state");
+  loadWindowsFilesystemBinding().ensureDirectory(root);
+  return { parent, root };
+}
+
 function leaseId(index) {
   return `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
 }
@@ -469,7 +476,9 @@ test("audit store retains an open SQLite connection after close failure for a re
 test("guarded audit close closes SQLite before releasing the native identity guard", {
   skip: NATIVE_SKIP,
 }, async () => {
-  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-audit-guarded-"));
+  const { parent, root } = await nativeProtectedAuditRoot(
+    "tibotattle-windows-audit-guarded-",
+  );
   const filePath = join(root, "private", "windows-credential-operation-audit-v1.sqlite");
   const movedPath = `${filePath}.moved`;
   const guardContext = createWindowsCredentialAuditFileGuardContext();
@@ -492,14 +501,16 @@ test("guarded audit close closes SQLite before releasing the native identity gua
     await rename(movedPath, filePath);
   } finally {
     store.close();
-    await rm(root, { recursive: true, force: true });
+    await rm(parent, { recursive: true, force: true });
   }
 });
 
 test("guarded audit close retains the guard when native release fails", {
   skip: NATIVE_SKIP,
 }, async () => {
-  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-audit-release-failure-"));
+  const { parent, root } = await nativeProtectedAuditRoot(
+    "tibotattle-windows-audit-release-failure-",
+  );
   const filePath = join(root, "private", "windows-credential-operation-audit-v1.sqlite");
   const journalPath = `${filePath}-journal`;
   const movedPath = `${filePath}.moved`;
@@ -547,21 +558,22 @@ test("guarded audit close retains the guard when native release fails", {
         // A guard may have been released by a partially successful context.
       }
     }
-    await rm(root, { recursive: true, force: true });
+    await rm(parent, { recursive: true, force: true });
   }
 });
 
 test("guarded corrupt-database cleanup retains the native guard when SQLite close fails", {
   skip: NATIVE_SKIP,
 }, async () => {
-  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-audit-corrupt-"));
+  const { parent, root } = await nativeProtectedAuditRoot(
+    "tibotattle-windows-audit-corrupt-",
+  );
   const privateRoot = join(root, "private");
   const filePath = join(privateRoot, "windows-credential-operation-audit-v1.sqlite");
   const movedPath = `${filePath}.moved`;
-  await mkdir(privateRoot, { recursive: true });
-  await writeFile(filePath, Buffer.from("DO-NOT-LEAK-corrupt-sqlite"));
-
   const native = loadWindowsFilesystemBinding();
+  native.ensureDirectory(privateRoot);
+  await writeFile(filePath, Buffer.from("DO-NOT-LEAK-corrupt-sqlite"));
   const capturedGuards = [];
   let releaseAttempts = 0;
   const binding = {
@@ -613,6 +625,6 @@ test("guarded corrupt-database cleanup retains the native guard when SQLite clos
         // A guard may have been released by an earlier implementation.
       }
     }
-    await rm(root, { recursive: true, force: true });
+    await rm(parent, { recursive: true, force: true });
   }
 });
