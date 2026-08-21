@@ -96,6 +96,9 @@ test("disabled or uncommitted prepared sets cause zero network activity", async 
         error.code = "prepared_contribution_set_manifest_missing";
         throw error;
       },
+      loadContribution: async () => {
+        assert.fail("loadContribution must not run for an uncommitted set");
+      },
       fetchImpl: async () => {
         networkCalls += 1;
       },
