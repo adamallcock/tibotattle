@@ -11,12 +11,14 @@ import test from "node:test";
 import {
   FIXED_STATUS,
   WINDOWS_SECURITY_QUALIFICATION_TEST_FILES,
+  extractTapTestIndex,
+  extractTapTestIndexes,
+  extractTapTestLocations,
   parseTapSummary,
   qualificationReceiptMetadata,
   qualificationTestFiles,
   readVerifiedBindingManifest,
   runNodeTests,
-  extractTapTestIndex,
 } from "../scripts/windows-security-qualification.mjs";
 import {
   FIXED_STATUS as WINDOWS_RECEIPT_STATUS,
@@ -89,8 +91,16 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(diagnosticStep, /error\?\.code/u);
   assert.match(diagnosticStep, /Object\.values\(FIXED_STATUS\)\.includes\(error\.code\)/u);
   assert.match(diagnosticStep, /test_index=\$\{testIndex\}/u);
+  assert.match(diagnosticStep, /test_indexes=\$\{testIndexes\.length/u);
+  assert.match(diagnosticStep, /test_locations=\$\{testLocations\.length/u);
+  assert.match(diagnosticStep, /Array\.isArray\(error\?\.testIndexes\)/u);
+  assert.match(diagnosticStep, /Array\.isArray\(error\?\.testLocations\)/u);
+  assert.match(diagnosticStep, /testIndexes\.length <= 64/u);
+  assert.match(diagnosticStep, /testLocations\.length <= 64/u);
+  assert.match(diagnosticStep, /testIndexes\.join\(","\)/u);
+  assert.match(diagnosticStep, /testLocations\.map/u);
   assert.match(diagnosticStep, /"unavailable"/u);
-  assert.match(diagnosticStep, /console\.error\(`\$\{status\} test_index=\$\{testIndex\}`\)/u);
+  assert.match(diagnosticStep, /console\.error\(`\$\{status\} test_index=\$\{testIndex\} test_indexes=/u);
   assert.match(diagnosticStep, /process\.exitCode = 1/u);
   assert.doesNotMatch(diagnosticStep, /continue-on-error/u);
   assert.doesNotMatch(diagnosticStep, /Start-Process|taskkill|Get-Content|\/PID|process\.pid|error\.message|stdout|stderr/u);
@@ -541,18 +551,52 @@ test("qualification TAP receipts reject skips and malformed summaries", () => {
 });
 
 test("qualification failure indexing is top-level, numeric, and content-free", () => {
-  assert.equal(
-    extractTapTestIndex([
+  const output = [
       "    not ok 4 - indented secret=should-not-escape",
       "not ok 7 - top-level secret=should-not-escape",
-    ].join("\n")),
-    7,
-  );
+      "not ok 7 - duplicate secret=should-not-escape",
+    ].join("\n");
+  const indexes = extractTapTestIndexes(output);
+  assert.deepEqual(indexes, [7]);
+  assert.equal(Object.isFrozen(indexes), true);
+  assert.equal(extractTapTestIndex(output), 7);
   assert.equal(extractTapTestIndex("not ok malformed - secret=should-not-escape"), null);
   assert.equal(extractTapTestIndex("not ok 0 - zero-is-not-an-ordinal"), null);
   assert.equal(extractTapTestIndex("not ok 9007199254740992 - unsafe"), null);
   assert.equal(extractTapTestIndex("not ok 8 -\r\n"), 8);
   assert.equal(extractTapTestIndex(null), null);
+});
+
+test("qualification failure locations require the trusted test path and stay numeric", () => {
+  const locations = extractTapTestLocations([
+    "at (file:///C:/repo/test/windows-filesystem-security.test.js:770:5) secret=do-not-return",
+    "at (test\\windows-filesystem-security.test.js:1162:34) name=do-not-return",
+    "at (C:\\repo\\test\\windows-filesystem-security.test.js:30:40) path=do-not-return",
+    "at test/windows-filesystem-security.test.js:770:5 duplicate",
+    "secret=prefix/test/windows-filesystem-security.test.js:50:60",
+    "at test/other-windows-filesystem-security.test.js:10:20",
+    "at test/windows-filesystem-security.test.js:9007199254740992:4 unsafe",
+    "at test/windows-filesystem-security.test.js:12:0 invalid",
+  ].join("\n"));
+  assert.deepEqual(locations, [[770, 5], [1162, 34], [30, 40]]);
+  assert.equal(Object.isFrozen(locations), true);
+  assert.equal(Object.isFrozen(locations[0]), true);
+  assert.equal(locations.flat().every((value) => Number.isSafeInteger(value)), true);
+  const cappedIndexes = extractTapTestIndexes(
+    Array.from({ length: 70 }, (_, offset) => `not ok ${offset + 1} - secret=${offset}`).join("\n"),
+  );
+  const cappedLocations = extractTapTestLocations(
+    Array.from(
+      { length: 70 },
+      (_, offset) => `at test/windows-filesystem-security.test.js:${offset + 1}:1 secret=${offset}`,
+    ).join("\n"),
+  );
+  assert.equal(cappedIndexes.length, 64);
+  assert.equal(cappedIndexes.at(-1), 64);
+  assert.equal(Object.isFrozen(cappedIndexes), true);
+  assert.equal(cappedLocations.length, 64);
+  assert.deepEqual(cappedLocations.at(-1), [64, 1]);
+  assert.equal(Object.isFrozen(cappedLocations), true);
 });
 
 test("qualification child failures attach only a safe index and never TAP content", async () => {
@@ -573,6 +617,8 @@ test("qualification child failures attach only a safe index and never TAP conten
     "TAP version 13",
     "    not ok 3 - indented secret=do-not-return",
     "not ok 9 - top-level secret=do-not-return",
+    "at (file:///C:/repo/test/windows-filesystem-security.test.js:12:5) secret=do-not-return",
+    "at test\\windows-filesystem-security.test.js:20:10 name=do-not-return",
   ].join("\n"));
   child.emit("close", 1);
   await assert.rejects(
@@ -580,6 +626,11 @@ test("qualification child failures attach only a safe index and never TAP conten
     (error) => {
       assert.equal(error.code, FIXED_STATUS.failed);
       assert.equal(error.testIndex, 9);
+      assert.deepEqual(error.testIndexes, [9]);
+      assert.deepEqual(error.testLocations, [[12, 5], [20, 10]]);
+      assert.equal(Object.isFrozen(error.testIndexes), true);
+      assert.equal(Object.isFrozen(error.testLocations), true);
+      assert.equal(Object.isFrozen(error.testLocations[0]), true);
       assert.equal(error.message, FIXED_STATUS.failed);
       assert.equal(Object.hasOwn(error, "stdout"), false);
       assert.equal(Object.hasOwn(error, "testName"), false);
@@ -603,13 +654,20 @@ test("qualification child failures use a null index when TAP has no safe top-lev
     spawnProcess: () => child,
     terminateProcessTree: async () => true,
   });
-  child.stdout.write("  not ok malformed secret=do-not-return\n");
+  child.stdout.write([
+    "  not ok malformed secret=do-not-return",
+    "at test/windows-filesystem-security.test.js:20:10",
+  ].join("\n"));
   child.emit("close", 1);
   await assert.rejects(
     run,
     (error) => {
       assert.equal(error.code, FIXED_STATUS.failed);
       assert.equal(error.testIndex, null);
+      assert.deepEqual(error.testIndexes, []);
+      assert.deepEqual(error.testLocations, [[20, 10]]);
+      assert.equal(Object.isFrozen(error.testIndexes), true);
+      assert.equal(Object.isFrozen(error.testLocations), true);
       assert.equal(error.message, FIXED_STATUS.failed);
       return true;
     },
