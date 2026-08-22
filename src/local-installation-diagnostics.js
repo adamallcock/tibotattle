@@ -22,6 +22,7 @@ import {
   assertWindowsFilesystemProductionSafe,
   isWindowsFilesystemAdapter,
   isWindowsFilesystemIdentity,
+  isWindowsQualificationModeContextFor,
 } from "./platform/index.js";
 
 export const LOCAL_ONBOARDING_SCHEMA_VERSION = "local-onboarding-v0.2";
@@ -45,16 +46,51 @@ function configurationError() {
   return error;
 }
 
-function resolveWindowsFilesystemAdapter(adapter) {
+function resolveWindowsFilesystemAdapter(
+  adapter,
+  {
+    windowsQualificationModeContext = null,
+    stateRoot = null,
+    resourceRoot = null,
+  } = {},
+) {
   const selected = adapter ?? null;
   // Keep the existing Node filesystem path available for portable and
   // development Windows runs. A supplied adapter is a privileged native
   // boundary and cannot be a virtual or copied object.
-  if (selected === null) return null;
+  if (selected === null) {
+    if (windowsQualificationModeContext !== null) throw configurationError();
+    return null;
+  }
   if (process.platform !== "win32" || !isWindowsFilesystemAdapter(selected)) {
     throw configurationError();
   }
   try {
+    // The packaged Windows Electron smoke lane deliberately loads the real
+    // native adapter before it has production-safe claims.  Its child process
+    // receives no parent context object, so the local companion reconstructs
+    // this narrow capability from the exact, branded context created in this
+    // process.  The context's weak identity binding still authenticates the
+    // adapter and its resource manifest; copied or forged objects remain
+    // indistinguishable from an absent capability.
+    if (windowsQualificationModeContext !== null) {
+      // Never validate a capability against roots read back from the
+      // capability itself. Callers must provide the concrete roots for the
+      // operation being authorized, otherwise an omitted argument could turn
+      // this into a self-validating bearer object.
+      if (typeof stateRoot !== "string" || typeof resourceRoot !== "string") {
+        throw configurationError();
+      }
+      if (isWindowsQualificationModeContextFor({
+        context: windowsQualificationModeContext,
+        adapter: selected,
+        stateRoot,
+        resourceRoot,
+      }) !== true) {
+        throw configurationError();
+      }
+      return selected;
+    }
     return assertWindowsFilesystemProductionSafe(selected);
   } catch {
     throw configurationError();
@@ -89,9 +125,22 @@ function pathWithin(root, candidate, { allowRoot = false } = {}) {
 
 function assertDirectory(
   path,
-  { ownerOnly = false, windowsFilesystemAdapter = null } = {},
+  {
+    ownerOnly = false,
+    windowsFilesystemAdapter = null,
+    windowsQualificationModeContext = null,
+    windowsQualificationStateRoot = null,
+    windowsQualificationResourceRoot = null,
+  } = {},
 ) {
-  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(
+    windowsFilesystemAdapter,
+    {
+      windowsQualificationModeContext,
+      stateRoot: windowsQualificationStateRoot,
+      resourceRoot: windowsQualificationResourceRoot,
+    },
+  );
   if (windowsFilesystem) {
     let metadata;
     try {
@@ -328,11 +377,22 @@ export function localCompanionStatePaths(stateRoot) {
 export function assertLocalStatePath(
   stateRoot,
   value,
-  { windowsFilesystemAdapter = null } = {},
+  {
+    windowsFilesystemAdapter = null,
+    windowsQualificationModeContext = null,
+    windowsQualificationResourceRoot = null,
+  } = {},
 ) {
-  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
   const selectedRoot = normalizedAbsolutePath(stateRoot);
   const selected = normalizedAbsolutePath(value);
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(
+    windowsFilesystemAdapter,
+    {
+      windowsQualificationModeContext,
+      stateRoot: selectedRoot,
+      resourceRoot: windowsQualificationResourceRoot,
+    },
+  );
   if (!pathWithin(selectedRoot, selected)) throw configurationError();
   if (windowsFilesystem) {
     // The native adapter owns reparse-point, hard-link, DACL, and final-handle
@@ -341,6 +401,9 @@ export function assertLocalStatePath(
     assertDirectory(selectedRoot, {
       ownerOnly: true,
       windowsFilesystemAdapter: windowsFilesystem,
+      windowsQualificationModeContext,
+      windowsQualificationStateRoot: selectedRoot,
+      windowsQualificationResourceRoot,
     });
     return selected;
   }
@@ -390,10 +453,18 @@ export function prepareLocalInstallationRoots({
   resourceRoot,
   stateRoot,
   windowsFilesystemAdapter = null,
+  windowsQualificationModeContext = null,
 } = {}) {
-  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
   const selectedResourceRoot = normalizedAbsolutePath(resourceRoot);
   const selectedStateRoot = normalizedAbsolutePath(stateRoot);
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(
+    windowsFilesystemAdapter,
+    {
+      windowsQualificationModeContext,
+      stateRoot: selectedStateRoot,
+      resourceRoot: selectedResourceRoot,
+    },
+  );
   if (pathWithin(selectedResourceRoot, selectedStateRoot, { allowRoot: true })
       || pathWithin(selectedStateRoot, selectedResourceRoot, { allowRoot: true })) {
     throw configurationError();
@@ -425,6 +496,9 @@ export function prepareLocalInstallationRoots({
     assertDirectory(selectedStateRoot, {
       ownerOnly: true,
       windowsFilesystemAdapter: windowsFilesystem,
+      windowsQualificationModeContext,
+      windowsQualificationStateRoot: selectedStateRoot,
+      windowsQualificationResourceRoot: selectedResourceRoot,
     });
   } else {
     try {
@@ -460,6 +534,11 @@ export function prepareLocalInstallationRoots({
   for (const path of Object.values(paths)) {
     assertLocalStatePath(selectedStateRoot, path, {
       windowsFilesystemAdapter: windowsFilesystem,
+      windowsQualificationModeContext,
+      // The state path helper revalidates the exact state root for every
+      // derived path. Keep the qualification capability scoped to this
+      // installation rather than merely to the adapter object.
+      windowsQualificationResourceRoot: selectedResourceRoot,
     });
   }
   return Object.freeze({
@@ -518,8 +597,20 @@ async function countRolloutFiles(roots) {
   });
 }
 
-async function stateDirectoryWritable(stateRoot, windowsFilesystemAdapter = null) {
-  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
+async function stateDirectoryWritable(
+  stateRoot,
+  windowsFilesystemAdapter = null,
+  windowsQualificationModeContext = null,
+  windowsQualificationResourceRoot = null,
+) {
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(
+    windowsFilesystemAdapter,
+    {
+      windowsQualificationModeContext,
+      stateRoot,
+      resourceRoot: windowsQualificationResourceRoot,
+    },
+  );
   if (windowsFilesystem) {
     let probe = null;
     let identity = null;
@@ -527,6 +618,9 @@ async function stateDirectoryWritable(stateRoot, windowsFilesystemAdapter = null
       assertDirectory(stateRoot, {
         ownerOnly: true,
         windowsFilesystemAdapter: windowsFilesystem,
+        windowsQualificationModeContext,
+        windowsQualificationStateRoot: stateRoot,
+        windowsQualificationResourceRoot,
       });
       probe = join(stateRoot, `.onboarding-write-probe-${randomUUID()}`);
       identity = windowsFilesystem.createFile(
@@ -680,10 +774,19 @@ export async function inspectLocalOnboarding({
   explicitRefresh = true,
   customCodexHomeConfigured = false,
   windowsFilesystemAdapter = null,
+  windowsQualificationModeContext = null,
+  resourceRoot = null,
 } = {}) {
-  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
   const selectedCodexHome = normalizedAbsolutePath(codexHome);
   const selectedStateRoot = normalizedAbsolutePath(stateRoot);
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(
+    windowsFilesystemAdapter,
+    {
+      windowsQualificationModeContext,
+      stateRoot: selectedStateRoot,
+      resourceRoot,
+    },
+  );
   const sessions = join(selectedCodexHome, "sessions");
   const archivedSessions = join(selectedCodexHome, "archived_sessions");
   const [
@@ -696,7 +799,12 @@ export async function inspectLocalOnboarding({
       directoryStatus(selectedCodexHome),
       directoryStatus(sessions),
       directoryStatus(archivedSessions),
-      stateDirectoryWritable(selectedStateRoot, windowsFilesystem),
+      stateDirectoryWritable(
+        selectedStateRoot,
+        windowsFilesystem,
+        windowsQualificationModeContext,
+        resourceRoot,
+      ),
     ]);
   const sessionsReadable = sessionsStatus === "readable";
   const archivedSessionsReadable = archivedSessionsStatus === "readable";

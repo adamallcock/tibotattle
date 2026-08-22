@@ -3130,6 +3130,9 @@ export function createCompanionWindowsStateComposition({
   homeDirectory = homedir(),
 } = {}) {
   if (windowsFilesystemAdapter === null) {
+    if (windowsQualificationModeContext !== null) {
+      throw windowsFilesystemConfigurationError();
+    }
     return Object.freeze({
       protectedStateStore: null,
       sqliteStateSessionFactory: null,
@@ -3521,21 +3524,17 @@ export function createLocalCompanionServer(options = {}) {
     createAdapter: options.createWindowsFilesystemAdapter
       ?? createWindowsFilesystemAdapter,
   });
-  const installation = prepareLocalInstallationRoots({
-    resourceRoot,
-    stateRoot,
-    windowsFilesystemAdapter,
-  });
   const codexHome = assertLocalAbsolutePath(
     options.codexHome
       ?? environment.CODEX_HOME
       ?? join(homeDirectory, ".codex"),
   );
-  // This mode is deliberately opt-in and exact.  It is constructed only
-  // after the native adapter has been branded and installation has canonical-
-  // ized the state root, so the platform capability can bind itself to the
-  // actual roots the companion will use.  No equivalent is accepted through
-  // a production selector or the older filesystem-development flag.
+  // The packaged Electron parent cannot transfer its process-local
+  // qualification context over the child boundary. Recreate the exact
+  // child-local capability from the allowlisted marker/lane and the branded
+  // native adapter before installation root validation. The platform module
+  // binds it to the disposable roots, resource manifest and x64 Windows
+  // boundary; absent, copied, or mismatched contexts remain closed.
   const windowsQualificationModeContext =
     process.platform === "win32"
       && environment[WINDOWS_ELECTRON_QUALIFICATION_ENV]
@@ -3545,14 +3544,20 @@ export function createLocalCompanionServer(options = {}) {
         architecture: process.arch,
         environment,
         adapter: windowsFilesystemAdapter,
-        resourceRoot: installation.resourceRoot,
+        resourceRoot,
         codexHome,
         ...(Object.hasOwn(options, "claudeConfigDirectory")
           ? { claudeConfigDirectory: options.claudeConfigDirectory }
           : {}),
-        stateRoot: installation.stateRoot,
+        stateRoot,
       })
       : null;
+  const installation = prepareLocalInstallationRoots({
+    resourceRoot,
+    stateRoot,
+    windowsFilesystemAdapter,
+    windowsQualificationModeContext,
+  });
   const windowsStateComposition = createCompanionWindowsStateComposition({
     platform: process.platform,
     architecture: process.arch,
@@ -3573,13 +3578,21 @@ export function createLocalCompanionServer(options = {}) {
     options.contributionQueueFile
       ?? environment.USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE
       ?? installation.paths.contributionQueueFile,
-    { windowsFilesystemAdapter },
+    {
+      windowsFilesystemAdapter,
+      windowsQualificationModeContext,
+      windowsQualificationResourceRoot: installation.resourceRoot,
+    },
   );
   const diagnosticsLogFile = assertLocalStatePath(
     installation.stateRoot,
     options.diagnosticsLogFile
       ?? join(installation.stateRoot, DIAGNOSTICS_LOG_FILE_NAME),
-    { windowsFilesystemAdapter },
+    {
+      windowsFilesystemAdapter,
+      windowsQualificationModeContext,
+      windowsQualificationResourceRoot: installation.resourceRoot,
+    },
   );
   const legacyContributionDeviceStateCandidate = Object.hasOwn(
     options,
@@ -3612,6 +3625,8 @@ export function createLocalCompanionServer(options = {}) {
     ? null
     : assertLocalStatePath(installation.stateRoot, preparedCandidate, {
       windowsFilesystemAdapter,
+      windowsQualificationModeContext,
+      windowsQualificationResourceRoot: installation.resourceRoot,
     });
   const contributionPreparationOptions =
     options.contributionPreparationOptions ?? {};
@@ -3626,13 +3641,21 @@ export function createLocalCompanionServer(options = {}) {
       installation.stateRoot,
       contributionPreparationOptions.activityFile
         ?? installation.paths.activityMarkersFile,
-      { windowsFilesystemAdapter },
+      {
+        windowsFilesystemAdapter,
+        windowsQualificationModeContext,
+        windowsQualificationResourceRoot: installation.resourceRoot,
+      },
     ),
     reviewArchiveDirectory: assertLocalStatePath(
       installation.stateRoot,
       contributionPreparationOptions.reviewArchiveDirectory
         ?? installation.paths.reviewArchiveDirectory,
-      { windowsFilesystemAdapter },
+      {
+        windowsFilesystemAdapter,
+        windowsQualificationModeContext,
+        windowsQualificationResourceRoot: installation.resourceRoot,
+      },
     ),
   };
   return createPreparedLocalCompanionServer({
@@ -3649,6 +3672,7 @@ export function createLocalCompanionServer(options = {}) {
     preparedContributionDirectory,
     contributionPreparationOptions: selectedPreparationOptions,
     windowsFilesystemAdapter,
+    windowsQualificationModeContext,
     windowsProtectedStateStore: windowsStateComposition.protectedStateStore,
     windowsSqliteStateSessionFactory:
       windowsStateComposition.sqliteStateSessionFactory,
@@ -3686,6 +3710,7 @@ export function createPreparedLocalCompanionServer({
   claudeProjectDirectory,
   diagnosticsLogFile,
   windowsFilesystemAdapter = null,
+  windowsQualificationModeContext = null,
   windowsProtectedStateStore = null,
   windowsSqliteStateSessionFactory = null,
   windowsSqliteStateSessionForPath = null,
@@ -3742,11 +3767,13 @@ export function createPreparedLocalCompanionServer({
   onboardingProvider = () => inspectLocalOnboarding({
     codexHome,
     stateRoot,
+    resourceRoot,
     explicitRefresh: true,
     customCodexHomeConfigured:
       typeof environment.CODEX_HOME === "string"
       && environment.CODEX_HOME.length > 0,
     windowsFilesystemAdapter,
+    windowsQualificationModeContext,
   }),
   refreshTimeoutMs = 300_000,
   centralOrigin = environment.USAGE_MONITOR_CENTRAL_ORIGIN ?? null,

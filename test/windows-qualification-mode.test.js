@@ -257,6 +257,15 @@ test("creates an immutable, qualification-only context with exact bindings", () 
     false,
   );
   assert.equal(
+    isWindowsQualificationModeContextFor({
+      context,
+      adapter,
+      stateRoot: STATE_ROOT,
+      resourceRoot: `${RESOURCE_ROOT}\\other-resource`,
+    }),
+    false,
+  );
+  assert.equal(
     isWindowsQualificationModeContext({ ...context }),
     false,
   );
