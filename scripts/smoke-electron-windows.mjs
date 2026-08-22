@@ -30,6 +30,9 @@ import { fileURLToPath } from "node:url";
 import {
   loadAuditedWindowsCredentialBinding,
 } from "../src/platform/windows-credential-manager-probe.js";
+import {
+  createWindowsFilesystemAdapter,
+} from "../src/platform/windows-filesystem.js";
 
 const require = createRequire(import.meta.url);
 
@@ -267,8 +270,20 @@ async function freeTcpPort() {
   return port;
 }
 
-async function createSyntheticFixture() {
-  const root = await mkdtemp(join(tmpdir(), "tibotattle-electron-windows-"));
+/**
+ * Build the disposable fixture used by the native smoke lane.
+ *
+ * The state root is deliberately not created through Node's ordinary mkdir
+ * path.  The reviewed Windows adapter owns creation of that leaf so the
+ * native owner-only ACL is applied at the point of creation.  The injectable
+ * dependencies are a test seam only; production calls use the repository
+ * adapter and fs/promises mkdir above.
+ */
+async function populateSyntheticFixture({
+  root,
+  windowsFilesystemAdapterFactory,
+  makeDirectory,
+}) {
   const home = join(root, "profile");
   const codexHome = join(home, ".codex");
   const claudeHome = join(home, ".claude");
@@ -276,15 +291,23 @@ async function createSyntheticFixture() {
   const userData = join(root, "electron-user-data");
   const runtimeDirectory = join(root, "runtime");
   const sessions = join(codexHome, "sessions");
+  const windowsFilesystemAdapter = windowsFilesystemAdapterFactory({
+    platform: "win32",
+    architecture: "x64",
+  });
+  if (!windowsFilesystemAdapter
+      || typeof windowsFilesystemAdapter.ensureDirectory !== "function") {
+    throw fixedError("WINDOWS_ELECTRON_SMOKE_FILESYSTEM_ADAPTER_UNAVAILABLE");
+  }
+  await windowsFilesystemAdapter.ensureDirectory(stateRoot);
   await Promise.all([
-    mkdir(sessions, { recursive: true }),
-    mkdir(join(codexHome, "archived_sessions"), { recursive: true }),
-    mkdir(claudeHome, { recursive: true }),
-    mkdir(stateRoot, { recursive: true }),
-    mkdir(userData, { recursive: true }),
-    mkdir(runtimeDirectory, { recursive: true }),
-    mkdir(join(home, "AppData", "Roaming"), { recursive: true }),
-    mkdir(join(home, "AppData", "Local"), { recursive: true }),
+    makeDirectory(sessions, { recursive: true }),
+    makeDirectory(join(codexHome, "archived_sessions"), { recursive: true }),
+    makeDirectory(claudeHome, { recursive: true }),
+    makeDirectory(userData, { recursive: true }),
+    makeDirectory(runtimeDirectory, { recursive: true }),
+    makeDirectory(join(home, "AppData", "Roaming"), { recursive: true }),
+    makeDirectory(join(home, "AppData", "Local"), { recursive: true }),
   ]);
   const now = Date.now();
   const usage = {
@@ -343,6 +366,31 @@ async function createSyntheticFixture() {
     runtimeDirectory,
     qualificationRunId: randomUUID(),
   });
+}
+
+export async function createSyntheticFixture({
+  windowsFilesystemAdapterFactory = createWindowsFilesystemAdapter,
+  makeDirectory = mkdir,
+  removeDirectory = rm,
+} = {}) {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-electron-windows-"));
+  try {
+    return await populateSyntheticFixture({
+      root,
+      windowsFilesystemAdapterFactory,
+      makeDirectory,
+    });
+  } catch (error) {
+    // The outer smoke cleanup begins only after fixture construction returns.
+    // Make one bounded best-effort removal here so an adapter or mkdir failure
+    // cannot strand synthetic profiles or logs in runner temporary storage.
+    try {
+      await removeDirectory(root, { recursive: true, force: true });
+    } catch {
+      // Preserve the original fixed initialization failure.
+    }
+    throw error;
+  }
 }
 
 function safeChildEnvironment(fixture) {

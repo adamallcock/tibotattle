@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 
 import {
   aggregate,
   classifySmokeFailure,
+  createSyntheticFixture,
   WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST,
   WINDOWS_ELECTRON_SMOKE_FAILURE_STAGE_ALLOWLIST,
   waitFor,
@@ -45,6 +46,11 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /CLAUDE_CONFIG_DIR/u);
   assert.match(source, /CODEX_HOME/u);
   assert.match(source, /USAGE_MONITOR_STATE_ROOT/u);
+  assert.match(source, /createWindowsFilesystemAdapter/u);
+  assert.match(source, /platform: "win32"/u);
+  assert.match(source, /architecture: "x64"/u);
+  assert.match(source, /windowsFilesystemAdapter\.ensureDirectory\(stateRoot\)/u);
+  assert.doesNotMatch(source, /\b(?:mkdir|makeDirectory)\(stateRoot/u);
   assert.match(source, /localDashboardReady/u);
   assert.match(source, /\/api\/local\/refresh/u);
   assert.match(source, /X-Usage-Monitor-Local/u);
@@ -143,6 +149,63 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(qualification, /runWindowsElectronQualificationCredentialCommandForTest/u);
   assert.match(qualification, /windows-qualification/u);
   assert.doesNotMatch(qualification, /console\.(?:log|error|warn)/u);
+});
+
+test("Windows Electron smoke creates stateRoot through the native adapter only", async () => {
+  const ordinaryDirectories = [];
+  const adapterDirectories = [];
+  let adapterOptions = null;
+  const fixture = await createSyntheticFixture({
+    windowsFilesystemAdapterFactory(options) {
+      adapterOptions = options;
+      return {
+        ensureDirectory(path) {
+          adapterDirectories.push(path);
+          return {
+            volumeSerialNumber: "0000000000000001",
+            fileId: "00112233445566778899aabbccddeeff",
+            linkCount: 1,
+          };
+        },
+      };
+    },
+    makeDirectory(path, options) {
+      ordinaryDirectories.push(path);
+      return mkdir(path, options);
+    },
+  });
+  try {
+    assert.deepEqual(adapterOptions, { platform: "win32", architecture: "x64" });
+    assert.deepEqual(adapterDirectories, [fixture.stateRoot]);
+    assert.equal(ordinaryDirectories.includes(fixture.stateRoot), false);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("Windows Electron smoke removes its fixture when native state setup fails", async () => {
+  const removedRoots = [];
+  await assert.rejects(
+    createSyntheticFixture({
+      windowsFilesystemAdapterFactory() {
+        return {
+          ensureDirectory() {
+            throw Object.assign(new Error("fixed adapter failure"), {
+              code: "WINDOWS_FILESYSTEM_SECURITY_POLICY",
+            });
+          },
+        };
+      },
+      async removeDirectory(path, options) {
+        removedRoots.push({ path, options });
+        await rm(path, options);
+      },
+    }),
+    (error) => error?.code === "WINDOWS_FILESYSTEM_SECURITY_POLICY",
+  );
+  assert.equal(removedRoots.length, 1);
+  assert.deepEqual(removedRoots[0].options, { recursive: true, force: true });
+  await assert.rejects(readFile(removedRoots[0].path), { code: "ENOENT" });
 });
 
 test("failed Windows Electron smoke preserves completed closed-schema progress", () => {
