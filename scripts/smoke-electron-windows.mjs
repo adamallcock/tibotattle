@@ -649,9 +649,9 @@ async function terminateProcessTree(child) {
   ).catch(() => {});
 }
 
-async function queryWindowsProcessTable() {
+async function queryWindowsProcessTableWithSpawner(spawnProbe = spawn) {
   const query = WINDOWS_PROCESS_TABLE_QUERY;
-  const probe = spawn("powershell.exe", [
+  const probe = spawnProbe("powershell.exe", [
     "-NoProfile",
     "-NonInteractive",
     "-Command",
@@ -664,7 +664,9 @@ async function queryWindowsProcessTable() {
   let output = "";
   const completed = new Promise((resolveProbe, rejectProbe) => {
     probe.once("error", () => rejectProbe(new Error("process table probe failed")));
-    probe.once("exit", (code, signal) => {
+    // `exit` only means the process ended; piped stdout may still contain
+    // buffered bytes. Parse only after `close`, when stdio has drained.
+    probe.once("close", (code, signal) => {
       if (code !== 0 || signal !== null) {
         rejectProbe(new Error("process table probe failed"));
       } else {
@@ -710,6 +712,18 @@ async function queryWindowsProcessTable() {
     table.set(pid, parentPid);
   }
   return table;
+}
+
+async function queryWindowsProcessTable() {
+  return queryWindowsProcessTableWithSpawner(spawn);
+}
+
+/** Dependency-injected probe seam for plain-Node contract tests only. */
+export async function queryWindowsProcessTableForTest({ spawnProbe } = {}) {
+  if (typeof spawnProbe !== "function") {
+    throw new TypeError("Windows process-table test probe is required");
+  }
+  return queryWindowsProcessTableWithSpawner(spawnProbe);
 }
 
 async function captureDescendantPids(rootPid, { requireNonEmpty = true } = {}) {
