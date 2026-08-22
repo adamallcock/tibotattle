@@ -4095,22 +4095,28 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         else {
             return
         }
-        nativeDashboardChrome?.select(.overview)
+        nativeDashboardChrome?.select(.weekly)
         // This is a closed local navigation: it exposes the report's already
         // rendered, privacy-reviewed share card and does not generate a new
         // process, read path, or native-to-JavaScript capability.
         webView.evaluateJavaScript("""
-        if (window.location.hash !== '#overview') {
-          window.location.hash = '#overview';
-        } else {
-          window.dispatchEvent(new HashChangeEvent('hashchange'));
-        }
-        window.setTimeout(function () {
-          document.getElementById('share-panel')?.scrollIntoView({
-            behavior: 'smooth',
-            block: 'start'
-          });
-        }, 0);
+        (function () {
+          function focusShareCard() {
+            window.requestAnimationFrame(function () {
+              document.getElementById('share-panel')?.scrollIntoView({
+                behavior: 'smooth',
+                block: 'start'
+              });
+            });
+          }
+          if (window.location.hash !== '#weekly') {
+            window.addEventListener('hashchange', focusShareCard, { once: true });
+            window.location.hash = '#weekly';
+          } else {
+            window.dispatchEvent(new HashChangeEvent('hashchange'));
+            focusShareCard();
+          }
+        }());
         """)
     }
 
