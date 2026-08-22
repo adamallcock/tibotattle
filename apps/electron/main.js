@@ -20,6 +20,14 @@ const DEFAULT_RESOURCE_ROOT = resolve(MODULE_DIRECTORY, "../..");
 const DEFAULT_COMPANION_STATE_DIRECTORY = "companion-state";
 const ELECTRON_SMOKE_CONTROL = "quit-v1";
 const WINDOWS_ELECTRON_SMOKE_CONTROL = "windows-v1";
+const WINDOWS_ELECTRON_SMOKE_MESSAGE_TYPE = "windows-electron-smoke-v1";
+const WINDOWS_ELECTRON_SMOKE_COMMAND_MESSAGE = "command-v1";
+const WINDOWS_ELECTRON_SMOKE_STATE_MESSAGE = "state-v1";
+const WINDOWS_ELECTRON_SMOKE_CREDENTIAL_MESSAGE = "credential-v1";
+const WINDOWS_ELECTRON_SMOKE_QUIT_MESSAGE = "quit-v1";
+const WINDOWS_ELECTRON_SMOKE_ACCEPTED_STATUS = "accepted-v1";
+const WINDOWS_ELECTRON_SMOKE_PASSED_STATUS = "passed-v1";
+const WINDOWS_ELECTRON_SMOKE_FAILED_STATUS = "failed-v1";
 const WINDOWS_ELECTRON_SMOKE_COMMANDS = new Set([
   "status-v1",
   "tray-show-v1",
@@ -31,6 +39,12 @@ const WINDOWS_ELECTRON_SMOKE_COMMANDS = new Set([
   "credential-delete-v1",
   "quit-v1",
 ]);
+const WINDOWS_ELECTRON_SMOKE_CREDENTIAL_OPERATIONS = Object.freeze({
+  "credential-probe-v1": "probe-v1",
+  "credential-create-v1": "create-v1",
+  "credential-read-v1": "read-v1",
+  "credential-delete-v1": "delete-v1",
+});
 
 function isPackagedElectronApp(app) {
   return app?.isPackaged === true;
@@ -124,28 +138,47 @@ export function assertElectronQualificationLaunchOptions({
   }
 }
 
-function windowsSmokeStateLine(lifecycle) {
+function windowsSmokeStateMessage(lifecycle) {
   const state = lifecycle?.state ?? {};
-  return `TIBOTATTLE_ELECTRON_SMOKE_STATE started=${state.started === true ? 1 : 0}`
-    + ` primary=${state.primaryInstance === true ? 1 : 0}`
-    + ` window=${state.hasWindow === true ? 1 : 0}`
-    + ` visible=${state.windowVisible === true ? 1 : 0}`
-    + ` tray=${state.hasTray === true ? 1 : 0}\n`;
+  return Object.freeze({
+    type: WINDOWS_ELECTRON_SMOKE_MESSAGE_TYPE,
+    message: WINDOWS_ELECTRON_SMOKE_STATE_MESSAGE,
+    started: state.started === true,
+    primary: state.primaryInstance === true,
+    window: state.hasWindow === true,
+    visible: state.windowVisible === true,
+    tray: state.hasTray === true,
+  });
+}
+
+function windowsSmokeCredentialMessage(operation, status) {
+  return Object.freeze({
+    type: WINDOWS_ELECTRON_SMOKE_MESSAGE_TYPE,
+    message: WINDOWS_ELECTRON_SMOKE_CREDENTIAL_MESSAGE,
+    operation,
+    status,
+  });
 }
 
 /**
  * Install the packaged Windows smoke control only for the exact opt-in test
- * environment.  It is deliberately stdin-only: no renderer, preload, IPC,
- * loopback endpoint, or production readiness override is introduced. Unknown
- * commands are ignored and every accepted response is fixed/content-free.
+ * environment. It uses the Node child-process IPC channel because a packaged
+ * Windows GUI Electron process has no usable stdin/stdout stream. This is not
+ * renderer IPC, a loopback endpoint, or a production readiness override.
+ * Unknown or malformed messages are ignored and every response is fixed and
+ * content-free.
  */
-export function installWindowsSmokeControl(lifecycle, {
+function installWindowsSmokeControlWithRunners(lifecycle, {
   environment = process.env,
-  input = process.stdin,
-  output = process.stdout,
+  messageSource = process,
+  sendMessage = null,
+  platform = process.platform,
   qualificationContext = null,
+} = {}, {
+  credentialProbe,
+  credentialCommand,
 } = {}) {
-  if (process.platform !== "win32"
+  if (platform !== "win32"
       || environment.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL
         !== WINDOWS_ELECTRON_SMOKE_CONTROL
       || environment.USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION
@@ -153,9 +186,12 @@ export function installWindowsSmokeControl(lifecycle, {
       || environment.USAGE_MONITOR_TEST_LANE !== WINDOWS_ELECTRON_TEST_LANE
       || lifecycle?.state?.primaryInstance !== true
       || !qualificationContext
-      || typeof input?.on !== "function") {
+      || typeof messageSource?.on !== "function"
+      || messageSource?.connected === false) {
     return () => {};
   }
+  const sendControlMessage = sendMessage ?? messageSource.send;
+  if (typeof sendControlMessage !== "function") return () => {};
   try {
     assertWindowsElectronQualificationContext({
       context: qualificationContext,
@@ -165,63 +201,104 @@ export function installWindowsSmokeControl(lifecycle, {
   } catch {
     return () => {};
   }
-  let buffered = "";
   let active = true;
   let credentialOperation = Promise.resolve();
-  const write = (value) => {
+  const send = (value, acknowledged = null) => {
+    let callbackCalled = false;
+    const callback = (error) => {
+      if (callbackCalled) return;
+      callbackCalled = true;
+      // Node supplies asynchronous IPC errors here. Consume the value so a
+      // closed qualification child channel cannot create an unhandled error.
+      void error;
+      if (typeof acknowledged === "function") {
+        try {
+          acknowledged();
+        } catch {
+          // The test-only channel must never change normal shell shutdown.
+        }
+      }
+    };
     try {
-      output?.write?.(value);
+      sendControlMessage.call(
+        messageSource,
+        value,
+        callback,
+      );
     } catch {
-      // The smoke harness owns process lifetime; a closed control pipe must
+      // The smoke harness owns process lifetime; a closed IPC channel must
       // never change the shell's normal shutdown policy.
+      callback();
     }
   };
-  const handleCommand = (command) => {
-    if (!WINDOWS_ELECTRON_SMOKE_COMMANDS.has(command)) return;
+  let cleanup = () => {};
+  const handleCommand = (message) => {
+    if (!active
+        || message === null
+        || typeof message !== "object"
+        || Array.isArray(message)
+        || Object.keys(message).length !== 3
+        || message.type !== WINDOWS_ELECTRON_SMOKE_MESSAGE_TYPE
+        || message.message !== WINDOWS_ELECTRON_SMOKE_COMMAND_MESSAGE
+        || !WINDOWS_ELECTRON_SMOKE_COMMANDS.has(message.command)) {
+      return;
+    }
+    const command = message.command;
     if (command === "status-v1") {
-      write(windowsSmokeStateLine(lifecycle));
+      send(windowsSmokeStateMessage(lifecycle));
       return;
     }
     if (command === "tray-show-v1") {
       lifecycle.invokeTrayCommand?.("show");
-      write(windowsSmokeStateLine(lifecycle));
+      send(windowsSmokeStateMessage(lifecycle));
       return;
     }
     if (command === "tray-hide-v1") {
       lifecycle.invokeTrayCommand?.("hide");
-      write(windowsSmokeStateLine(lifecycle));
+      send(windowsSmokeStateMessage(lifecycle));
       return;
     }
     if (command === "tray-toggle-v1") {
       lifecycle.invokeTrayCommand?.("toggle");
-      write(windowsSmokeStateLine(lifecycle));
+      send(windowsSmokeStateMessage(lifecycle));
       return;
     }
     if (command === "credential-probe-v1") {
       credentialOperation = credentialOperation.then(async () => {
+        if (!active) return;
         try {
-          await runWindowsElectronQualificationCredentialProbe(qualificationContext);
-          write("TIBOTATTLE_ELECTRON_SMOKE_CREDENTIAL_PROBE_PASSED\n");
+          await credentialProbe(qualificationContext);
+          if (!active) return;
+          send(windowsSmokeCredentialMessage(
+            WINDOWS_ELECTRON_SMOKE_CREDENTIAL_OPERATIONS[command],
+            WINDOWS_ELECTRON_SMOKE_PASSED_STATUS,
+          ));
         } catch {
-          write("TIBOTATTLE_ELECTRON_SMOKE_CREDENTIAL_PROBE_FAILED\n");
+          if (!active) return;
+          send(windowsSmokeCredentialMessage(
+            WINDOWS_ELECTRON_SMOKE_CREDENTIAL_OPERATIONS[command],
+            WINDOWS_ELECTRON_SMOKE_FAILED_STATUS,
+          ));
         }
       });
       credentialOperation.catch(() => {});
       return;
     }
     if (command.startsWith("credential-") && command.endsWith("-v1")) {
+      const operation = WINDOWS_ELECTRON_SMOKE_CREDENTIAL_OPERATIONS[command];
       credentialOperation = credentialOperation.then(async () => {
+        if (!active) return;
         try {
-          await runWindowsElectronQualificationCredentialCommand({
+          await credentialCommand({
             context: qualificationContext,
-            command: command.slice("credential-".length),
+            command: operation,
             runId: environment.USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID,
           });
-          write(`TIBOTATTLE_ELECTRON_SMOKE_CREDENTIAL_${command
-            .slice("credential-".length, -3).toUpperCase()}_PASSED\n`);
+          if (!active) return;
+          send(windowsSmokeCredentialMessage(operation, WINDOWS_ELECTRON_SMOKE_PASSED_STATUS));
         } catch {
-          write(`TIBOTATTLE_ELECTRON_SMOKE_CREDENTIAL_${command
-            .slice("credential-".length, -3).toUpperCase()}_FAILED\n`);
+          if (!active) return;
+          send(windowsSmokeCredentialMessage(operation, WINDOWS_ELECTRON_SMOKE_FAILED_STATUS));
         }
       });
       credentialOperation.catch(() => {});
@@ -229,34 +306,51 @@ export function installWindowsSmokeControl(lifecycle, {
     }
     // Quit is acknowledged before the window/tray and child are torn down so
     // the harness can distinguish a requested clean quit from a forced kill.
-    write("TIBOTATTLE_ELECTRON_SMOKE_QUIT_ACCEPTED\n");
-    input.pause?.();
-    void Promise.resolve(lifecycle.requestQuit?.()).catch(() => {
-      process.exitCode = 1;
+    send(Object.freeze({
+      type: WINDOWS_ELECTRON_SMOKE_MESSAGE_TYPE,
+      message: WINDOWS_ELECTRON_SMOKE_QUIT_MESSAGE,
+      status: WINDOWS_ELECTRON_SMOKE_ACCEPTED_STATUS,
+    }), () => {
+      cleanup();
+      void Promise.resolve(lifecycle.requestQuit?.()).catch(() => {
+        process.exitCode = 1;
+      });
     });
   };
-  const onData = (chunk) => {
+  const onMessage = (message) => handleCommand(message);
+  const onDisconnect = () => cleanup();
+  cleanup = () => {
     if (!active) return;
-    buffered += String(chunk);
-    while (true) {
-      const lineEnd = buffered.indexOf("\n");
-      if (lineEnd < 0) break;
-      const line = buffered.slice(0, lineEnd).replace(/\r$/u, "");
-      buffered = buffered.slice(lineEnd + 1);
-      handleCommand(line);
-    }
-    // A control line is intentionally tiny. Drop an unbounded unterminated
-    // input rather than allowing a test pipe to become a memory sink.
-    if (buffered.length > 256) buffered = "";
-  };
-  input.setEncoding?.("utf8");
-  input.on("data", onData);
-  input.resume?.();
-  return () => {
     active = false;
-    input.off?.("data", onData);
-    input.pause?.();
+    messageSource.off?.("message", onMessage);
+    messageSource.off?.("disconnect", onDisconnect);
   };
+  messageSource.on("message", onMessage);
+  messageSource.on("disconnect", onDisconnect);
+  return cleanup;
+}
+
+export function installWindowsSmokeControl(lifecycle, options = {}) {
+  return installWindowsSmokeControlWithRunners(lifecycle, options, {
+    credentialProbe: runWindowsElectronQualificationCredentialProbe,
+    credentialCommand: runWindowsElectronQualificationCredentialCommand,
+  });
+}
+
+/** Dependency-injected seam for plain-Node IPC contract tests only. */
+export function installWindowsSmokeControlForTest(lifecycle, {
+  credentialProbe,
+  credentialCommand,
+  ...options
+} = {}) {
+  if (typeof credentialProbe !== "function"
+      || typeof credentialCommand !== "function") {
+    return () => {};
+  }
+  return installWindowsSmokeControlWithRunners(lifecycle, options, {
+    credentialProbe,
+    credentialCommand,
+  });
 }
 
 /**
