@@ -100,7 +100,12 @@ async function withTimeout(promise, timeoutMs, label) {
   }
 }
 
-async function waitFor(predicate, timeoutMs, label) {
+export function isTerminalSmokeError(error) {
+  return typeof error?.code === "string"
+    && error.code.startsWith("WINDOWS_ELECTRON_SMOKE_");
+}
+
+export async function waitFor(predicate, timeoutMs, label) {
   const started = Date.now();
   let lastError = null;
   while (Date.now() - started < timeoutMs) {
@@ -108,6 +113,10 @@ async function waitFor(predicate, timeoutMs, label) {
       const value = await predicate();
       if (value) return value;
     } catch (error) {
+      // Coded smoke failures are terminal evidence, not transient readiness
+      // misses. In particular, a child that has already exited must not be
+      // retried until the full startup timeout has elapsed.
+      if (isTerminalSmokeError(error)) throw error;
       lastError = error;
     }
     await wait(100);
@@ -682,6 +691,7 @@ async function dashboardConnection(child, port) {
   }, MAX_STARTUP_MS, "Electron dashboard target");
   const cdp = await connectCdp(target);
   const ready = await waitFor(async () => {
+    if (childExited(child)) fail("WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_READY");
     const snapshot = await cdp.evaluate(`(() => ({
       ready: document.documentElement?.dataset?.localDashboardReady === "true",
       title: document.title,
@@ -889,7 +899,7 @@ export async function runSmoke(progress) {
         if (childExited(primary)) {
           fail("WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_CONTROL");
         }
-        return command(primary, nextPrimaryLine, "status-v1").catch(() => null);
+        return command(primary, nextPrimaryLine, "status-v1");
       },
       MAX_STARTUP_MS,
       "primary shell status",
@@ -1012,7 +1022,12 @@ export async function runSmoke(progress) {
     nextRelaunchLine = controlReader(relaunch);
     try {
       const state = await waitFor(
-        () => command(relaunch, nextRelaunchLine, "status-v1").catch(() => null),
+        () => {
+          if (childExited(relaunch)) {
+            fail("WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_CONTROL");
+          }
+          return command(relaunch, nextRelaunchLine, "status-v1");
+        },
         MAX_STARTUP_MS,
         "relaunch shell status",
       );
