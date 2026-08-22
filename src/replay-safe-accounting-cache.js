@@ -196,6 +196,12 @@ const MAX_RETAINED_TRANSITION_BYTES = 320 * 1024 * 1024;
 // delta alone can never pass the absolute. Change them as a PAIR, and read
 // ACCOUNTING_REBUILD_CHILD_OLD_SPACE_MIB before changing either — the derived
 // cap is what keeps a miss an honest deferral rather than a SIGABRT.
+//
+// All three describe the REBUILD, which since #38 runs in a short-lived child.
+// The resident companion's archive projection is a separate process situation
+// and has a separate pair, MAX_ARCHIVE_ACCOUNTING_RSS_BYTES and
+// ARCHIVE_ACCOUNTING_RSS_DELTA_BUDGET_BYTES, further down. Nothing here is a
+// default for anything there; that inheritance is the bug they exist to close.
 // ---------------------------------------------------------------------------
 // Absolute whole-process RSS TARGET for one accounting rebuild. It is a
 // TARGET, not a hard blocker: a miss degrades to a retained-cache soft-fail
@@ -249,11 +255,14 @@ const MAX_RETAINED_TRANSITION_BYTES = 320 * 1024 * 1024;
 //     derived. That derivation is what keeps the RSS guard reading before V8
 //     aborts, so a miss arrives as a typed deferral instead of a SIGABRT the
 //     parent can only report as accounting_rebuild_subprocess_failed.
-//   - it is also the default ceiling for buildReplaySafeAccountingPeriod, so
-//     the archive projection that the resident companion runs (see
-//     src/local-archive-accounting-index.js) is loosened by the same amount.
-//     That path is bounded first by its own read budgets and chunking; this
-//     ceiling is its backstop, not its budget.
+//   - its reach STOPS at the rebuild. Until 2026-08-20 it was also the
+//     default ceiling for buildReplaySafeAccountingPeriod, so raising it
+//     here silently loosened the archive projection the RESIDENT companion
+//     runs by the same 4 GiB — the opposite of what #38 moved the rebuild
+//     into a child to achieve. That path now resolves its own ceiling from
+//     MAX_ARCHIVE_ACCOUNTING_RSS_BYTES below, and a regression pins that it
+//     does not follow this constant. Headroom is free in a process that
+//     exits; it is not free in one that stays.
 const MAX_ACCOUNTING_RSS_BYTES = Math.floor(6 * 1024 * 1024 * 1024);
 // What one accounting rebuild may itself ADD to process RSS over the baseline
 // captured at build start. The effective ceiling is
@@ -369,6 +378,70 @@ const ACCOUNTING_REBUILD_CHILD_ENTRY = fileURLToPath(
 const ACCOUNTING_REBUILD_CHILD_OLD_SPACE_MIB = Math.ceil(
   MAX_ACCOUNTING_RSS_BYTES / (1024 * 1024),
 );
+// ---------------------------------------------------------------------------
+// The ARCHIVE projection's own ceiling, deliberately NOT the rebuild's.
+//
+// buildReplaySafeAccountingPeriod has two callers with opposite memory
+// situations, and until 2026-08-20 they shared one number by inheritance
+// rather than by decision:
+//   - the rebuild calls it as a sub-build and NAMES its own ceiling (the
+//     effective target it already computed), so it is unaffected by anything
+//     here and must stay that way;
+//   - refreshLocalArchiveAccountingIndex (src/local-archive-accounting-index.js)
+//     names nothing, and runs inside the RESIDENT menu-bar companion.
+// A ceiling sized for a short-lived child that hands every page back to the OS
+// on exit is the wrong ceiling for a process the user leaves running all day.
+// The 2 -> 6 GiB rebuild raise reached this path only because the default was
+// never chosen; that is the defect these two constants close.
+//
+// The shape is baseline + delta rather than a bare absolute, and that is the
+// substance of the fix rather than a stylistic echo of the rebuild policy. A
+// whole-process absolute cannot work in the companion, because it charges the
+// pass for memory the pass did not allocate and cannot free. Measured on the
+// owner's own machine (dogfood 0.1.13 build 1020, 4,886 sources / 128.5 GB
+// indexed), the resident companion oscillates between 1,312 and 2,089 MiB
+// across a twenty-second window — it crosses 2 GiB on GC timing alone. Under
+// the pre-raise 2 GiB absolute this projection would therefore have deferred
+// or not deferred depending on when V8 last collected, which is the worst of
+// the available failure modes: not a bound, a coin flip. A delta measured off
+// THIS pass's own baseline is the only arm that attributes growth to the pass
+// that caused it.
+//
+// 512 MiB of delta is set against a measured need, not a guess. Streaming a
+// corpus the size of the owner's real one (572,089 events over two years,
+// with production dimension cardinality across model, speed, service tier,
+// surface, agent scope and lineage) through this builder peaks at 98.6 MiB of
+// RSS growth. Doubling and quadrupling that stream — 1.14M and 2.29M events —
+// peaks at 119.8 MiB and 113.9 MiB, i.e. FLAT. That is the constant-memory
+// contract in the builder's own doc comment holding up under measurement: the
+// aggregate is fixed-shape and retains no raw inputs, so its residency tracks
+// dimension cardinality and not corpus size. 512 MiB is roughly 4x the peak
+// at 4x the owner's corpus, which is headroom for cardinality drift and lazy
+// GC without being room for a regression to hide in. Note what this delta is
+// NOT: it is not the 512 MiB that made the 2026-08-11 incident inevitable.
+// That number was applied to the REBUILD, whose transition mining genuinely
+// needs gigabytes; applying it to a pass measured flat at ~100 MiB is a
+// different claim with different evidence behind it.
+const ARCHIVE_ACCOUNTING_RSS_DELTA_BUDGET_BYTES = Math.floor(
+  512 * 1024 * 1024,
+);
+// The absolute backstop over the delta, and the arm that stops the companion
+// being driven into swap by a projection off an already-enormous baseline.
+// 3 GiB is picked so that on real hardware the DELTA is what binds: at the
+// companion's observed 2,089 MiB peak the effective ceiling is
+// min(3 GiB, ~2.54 GiB) = ~2.54 GiB, leaving the pass its full 512 MiB
+// against a measured need near 100 MiB. The absolute takes over only above a
+// ~2.5 GiB baseline — a companion half again the size of the fattest yet
+// observed — and above that line refusing to add another half gigabyte is the
+// correct answer rather than a regrettable one. This is a real cliff and is
+// meant to be, and it is survivable in the exact way that matters: the trip
+// is caught and reported as archive_projection_unavailable, never a failed
+// refresh and never a lost index — the indexing pass has already committed by
+// the time the projection runs. The prior projection is left on disk and goes
+// on being served until the index advances past its coverage fingerprint,
+// after which the surface reads unavailable rather than stale. Past this line
+// the companion's size is the bug to fix, not the ceiling.
+const MAX_ARCHIVE_ACCOUNTING_RSS_BYTES = Math.floor(3 * 1024 * 1024 * 1024);
 // The memory policy as the tests and any future caller should read it: derived
 // from the constants above rather than mirrored, so a regression can pin the
 // RELATIONSHIPS (cap >= absolute >= effective ceiling) without going stale the
@@ -377,6 +450,12 @@ export const REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY = Object.freeze({
   maximumRssBytes: MAX_ACCOUNTING_RSS_BYTES,
   rssDeltaBudgetBytes: ACCOUNTING_RSS_DELTA_BUDGET_BYTES,
   rebuildChildOldSpaceMib: ACCOUNTING_REBUILD_CHILD_OLD_SPACE_MIB,
+  // The resident archive projection's ceiling, carried here so a regression
+  // can pin that it is SEPARATE from the rebuild's rather than trusting the
+  // two to stay apart by accident. Every field above describes a process that
+  // exits after one pass; these two describe one that does not.
+  archiveMaximumRssBytes: MAX_ARCHIVE_ACCOUNTING_RSS_BYTES,
+  archiveRssDeltaBudgetBytes: ARCHIVE_ACCOUNTING_RSS_DELTA_BUDGET_BYTES,
 });
 // SIGTERM asks the child to unwind through its own abort checks (typed abort
 // envelope); a child that cannot unwind inside this grace is killed hard. The
@@ -2114,7 +2193,11 @@ export async function buildReplaySafeAccountingPeriod({
   signal = null,
   declaredSpeedBaselines = [],
   rss = () => process.memoryUsage().rss,
-  maximumRssBytes = MAX_ACCOUNTING_RSS_BYTES,
+  // null is "the caller does not name a ceiling", which is the ARCHIVE case:
+  // resolve one off this pass's own baseline from the archive policy. The
+  // rebuild names its own and is unaffected. Inheriting the rebuild's number
+  // here is exactly the defect MAX_ARCHIVE_ACCOUNTING_RSS_BYTES documents.
+  maximumRssBytes = null,
 } = {}) {
   const canonicalStart = canonicalInstant(startAt);
   const canonicalEnd = canonicalInstant(endAt);
@@ -2129,8 +2212,8 @@ export async function buildReplaySafeAccountingPeriod({
       || typeof scan !== "function"
       || !validAbortSignal(signal)
       || typeof rss !== "function"
-      || !Number.isSafeInteger(maximumRssBytes)
-      || maximumRssBytes < 1) {
+      || (maximumRssBytes !== null
+        && (!Number.isSafeInteger(maximumRssBytes) || maximumRssBytes < 1))) {
     throw new TypeError("Replay-safe accounting period options are invalid");
   }
   const baselines = Array.isArray(declaredSpeedBaselines)
@@ -2141,12 +2224,26 @@ export async function buildReplaySafeAccountingPeriod({
   const period = newPeriod(id, label);
   const price = createAccountingPricer();
   let acceptedEvents = 0;
+  // A named ceiling is taken verbatim and costs no extra reading, so the
+  // rebuild's sub-build samples rss() exactly as often as it always has.
+  // Only the unnamed archive case measures a baseline and derives from it.
+  let effectiveMaximumRssBytes = maximumRssBytes;
+  if (effectiveMaximumRssBytes === null) {
+    const baselineRss = rss();
+    if (!Number.isSafeInteger(baselineRss) || baselineRss < 0) {
+      throw fixedError("accounting_archive_rss_measurement_invalid");
+    }
+    effectiveMaximumRssBytes = Math.min(
+      MAX_ARCHIVE_ACCOUNTING_RSS_BYTES,
+      baselineRss + ARCHIVE_ACCOUNTING_RSS_DELTA_BUDGET_BYTES,
+    );
+  }
   const checkRuntimeMemory = () => {
     const currentRss = rss();
     if (!Number.isSafeInteger(currentRss) || currentRss < 0) {
       throw fixedError("accounting_archive_rss_measurement_invalid");
     }
-    if (currentRss > maximumRssBytes) {
+    if (currentRss > effectiveMaximumRssBytes) {
       throw fixedError("accounting_archive_rss_limit_exceeded");
     }
   };
