@@ -10,9 +10,9 @@
     },
     {
       "file": "apps/local/server.test.mjs",
-      "win32BranchCount": 4,
-      "classification": "posix-only-assertion",
-      "followUp": "Replace omitted owner-mode and development identity assertions with Windows ACL contract tests."
+      "win32BranchCount": 5,
+      "classification": "native-windows-qualification",
+      "followUp": "Run the packaged Windows x64 companion with its branded qualification context to prove exact state/resource-root binding; separately replace omitted owner-mode and development identity assertions with Windows ACL contract tests."
     },
     {
       "file": "test/account-observation-secret.test.js",

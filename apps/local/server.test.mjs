@@ -64,6 +64,10 @@ import {
   resolveClaudeDesktopShadowConfiguration,
   startLocalCompanionServer,
 } from "./server.js";
+import {
+  assertLocalStatePath,
+  prepareLocalInstallationRoots,
+} from "../../src/local-installation-diagnostics.js";
 import { createWindowsFilesystemAdapter } from "../../src/platform/windows-filesystem.js";
 import {
   WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_ARTIFACT_BYTES,
@@ -614,6 +618,89 @@ test("Windows Electron qualification context enables only the bound native compo
     assert.equal(composition.protectedStateStore.nativeReadBounded, false);
     assert.equal(composition.preparedArtifactStorage.readiness, false);
     assert.equal(composition.preparedContributionContext.productionSafe, false);
+  });
+});
+
+test("Windows Electron qualification binds local installation roots to both roots", {
+  skip: process.platform === "win32"
+    ? false
+    : "native Windows path and adapter qualification contract",
+}, () => {
+  const adapter = unqualifiedWindowsFilesystemAdapter();
+  const stateRoot = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state";
+  const context = windowsElectronQualificationContext({ adapter, stateRoot });
+  withNativeWindowsPlatform(() => {
+    const installation = prepareLocalInstallationRoots({
+      resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+      stateRoot,
+      windowsFilesystemAdapter: adapter,
+      windowsQualificationModeContext: context,
+    });
+    assert.equal(installation.stateRoot, stateRoot);
+    assert.throws(
+      () => prepareLocalInstallationRoots({
+        resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+        stateRoot: `${stateRoot}\\other`,
+        windowsFilesystemAdapter: adapter,
+        windowsQualificationModeContext: context,
+      }),
+      (error) => error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID",
+    );
+    assert.throws(
+      () => assertLocalStatePath(
+        `${stateRoot}\\other`,
+        `${stateRoot}\\other\\queue.sqlite3`,
+        {
+          windowsFilesystemAdapter: adapter,
+          windowsQualificationModeContext: context,
+          windowsQualificationResourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+        },
+      ),
+      (error) => error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID",
+    );
+    assert.throws(
+      () => assertLocalStatePath(
+        stateRoot,
+        `${stateRoot}\\queue.sqlite3`,
+        {
+          windowsFilesystemAdapter: adapter,
+          windowsQualificationModeContext: context,
+        },
+      ),
+      (error) => error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID",
+    );
+    assert.throws(
+      () => prepareLocalInstallationRoots({
+        resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+        stateRoot,
+        windowsFilesystemAdapter: null,
+        windowsQualificationModeContext: context,
+      }),
+      (error) => error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID",
+    );
+    assert.throws(
+      () => assertLocalStatePath(
+        stateRoot,
+        `${stateRoot}\\queue.sqlite3`,
+        {
+          windowsFilesystemAdapter: null,
+          windowsQualificationModeContext: context,
+          windowsQualificationResourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+        },
+      ),
+      (error) => error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID",
+    );
+    assert.throws(
+      () => createCompanionWindowsStateComposition({
+        platform: "win32",
+        architecture: "x64",
+        resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+        stateRoot,
+        windowsFilesystemAdapter: null,
+        windowsQualificationModeContext: context,
+      }),
+      (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+    );
   });
 });
 
