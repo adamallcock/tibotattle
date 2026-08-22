@@ -160,4 +160,13 @@ test("the growth loader wiring stays pinned to the metrics-history contract", as
   for (const label of growthLabels) {
     assert.ok(hintKeys.has(label), `INFO_HINTS is missing: ${label}`);
   }
+
+  // The dedicated per-plan card is built directly (not via growthCard), so its
+  // label and hint are pinned explicitly.
+  assert.match(source, /function growthPlanCohortCard\(snapshots\)/u);
+  assert.match(source, /labelWithInfo\("Plan cohorts"\)/u);
+  assert.ok(hintKeys.has("Plan cohorts"), "INFO_HINTS is missing: Plan cohorts");
+  // It reads both gauge families and attributes each person once.
+  assert.match(source, /cohortParticipants_/u);
+  assert.match(source, /cohortMedianUsd_/u);
 });

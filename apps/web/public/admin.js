@@ -104,7 +104,8 @@ const INFO_HINTS = Object.freeze({
   "Records uploaded": "Usage records inside accepted chunks, summed per day.",
   "People uploading": "Distinct accounts that uploaded at least one chunk that day.",
   "DMG downloads": "Cumulative installer downloads across all GitHub releases, sampled by the distribution sync. The delta is movement since the prior day's last sample.",
-  "Published band cohort": "People inside the published community allowance band (the site's “from N people”), with every plan cohort growing toward publishability listed beneath.",
+  "Published band cohort": "People inside the published community allowance band (the site's “from N people”).",
+  "Plan cohorts": "Distinct contributors on each Codex plan (each counted under their current plan only), and that plan's measured allowance-window value in API-price-equivalent dollars. Ratios are measured from real fits, never assumed from the nominal plan multipliers.",
 });
 
 const AUDIT_ACTIONS = Object.freeze({
@@ -784,6 +785,8 @@ function renderGrowth(history) {
   }
   const bandCard = growthBandCard(history.gauges.snapshots);
   if (bandCard) cards.push(bandCard);
+  const cohortCard = growthPlanCohortCard(history.gauges.snapshots);
+  if (cohortCard) cards.push(cohortCard);
   container.replaceChildren(...cards);
   badge.className = "admin-source-badge admin-source-available";
   badge.textContent = "History available";
@@ -799,22 +802,7 @@ function growthBandCard(snapshots) {
     (snapshot) => Date.parse(snapshot.capturedAt) <= dayAgoEpoch,
   );
   const referenceCount = reference?.metrics.bandParticipantCount;
-  // One line per plan: how many distinct people are currently on it, and what
-  // that plan's reset window measures in API-price-equivalent dollars. Each
-  // person is counted under their current plan only, so a plan-switcher is one
-  // person here, not one per label they have ever shown.
-  const cohorts = Object.entries(latest.metrics)
-    .filter(([key]) => key.startsWith("cohortParticipants_"))
-    .map(([key, value]) => {
-      const plan = key.slice("cohortParticipants_".length);
-      const median = latest.metrics[`cohortMedianUsd_${plan}`];
-      const people = `${plan} ${value}`;
-      return typeof median === "number"
-        ? `${people} (~$${count(median)}/window)`
-        : people;
-    })
-    .sort();
-  const card = growthCard({
+  return growthCard({
     label: "Published band cohort",
     value: count(published),
     delta: typeof referenceCount === "number" ? published - referenceCount : 0,
@@ -826,12 +814,70 @@ function growthBandCard(snapshots) {
       .filter((value) => typeof value === "number"),
     seriesLabel: "Published band participant count by snapshot",
   });
-  if (cohorts.length > 0) {
-    const detail = document.createElement("small");
-    detail.className = "admin-growth-cohorts";
-    detail.textContent = `plan cohorts: ${cohorts.join(" · ")}`;
-    card.append(detail);
+}
+
+/**
+ * A dedicated per-plan card. One account legitimately spans several plan labels
+ * (plan changes over time, plus records that never carried a plan stamp), so
+ * each person is counted under their current plan only — never once per label.
+ * Median capacity pools every fit by its own label, so a plan's window size is
+ * shown even for a plan nobody is currently on. Capacity is the API-price-
+ * equivalent value of one 7-day allowance window; the ratios between plans are
+ * measured here, never assumed from the nominal multipliers.
+ */
+function growthPlanCohortCard(snapshots) {
+  if (!Array.isArray(snapshots) || snapshots.length === 0) return null;
+  const latest = snapshots[snapshots.length - 1].metrics;
+  const plans = new Set();
+  for (const key of Object.keys(latest)) {
+    if (key.startsWith("cohortParticipants_")) {
+      plans.add(key.slice("cohortParticipants_".length));
+    }
+    if (key.startsWith("cohortMedianUsd_")) {
+      plans.add(key.slice("cohortMedianUsd_".length));
+    }
   }
+  if (plans.size === 0) return null;
+  const rows = [...plans]
+    .map((plan) => ({
+      plan,
+      people: typeof latest[`cohortParticipants_${plan}`] === "number"
+        ? latest[`cohortParticipants_${plan}`]
+        : 0,
+      median: typeof latest[`cohortMedianUsd_${plan}`] === "number"
+        ? latest[`cohortMedianUsd_${plan}`]
+        : null,
+    }))
+    .sort((a, b) => (b.median ?? 0) - (a.median ?? 0));
+  const totalPeople = rows.reduce((sum, row) => sum + row.people, 0);
+
+  const card = document.createElement("div");
+  card.className = "admin-card admin-metric admin-growth-card";
+  card.append(labelWithInfo("Plan cohorts"));
+  const number = document.createElement("strong");
+  number.textContent = text(count(totalPeople));
+  const caption = document.createElement("small");
+  caption.textContent =
+    `${rows.length} plan${rows.length === 1 ? "" : "s"} seen · $ = API-price-equivalent per 7-day window`;
+  card.append(number, caption);
+
+  const list = document.createElement("ul");
+  list.className = "admin-plan-cohorts";
+  for (const row of rows) {
+    const item = document.createElement("li");
+    const name = document.createElement("span");
+    name.className = "admin-plan-name";
+    name.textContent = row.plan;
+    const stat = document.createElement("span");
+    stat.className = "admin-plan-stat";
+    const people = `${count(row.people)} on plan`;
+    stat.textContent = row.median !== null
+      ? `${people} · ~$${count(row.median)}/window`
+      : people;
+    item.append(name, stat);
+    list.append(item);
+  }
+  card.append(list);
   return card;
 }
 

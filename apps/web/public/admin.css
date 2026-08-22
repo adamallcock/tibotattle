@@ -69,7 +69,11 @@
 .admin-sparkline-endpoint { fill: var(--accent, #7a6a52); }
 .admin-delta { display: inline-block; padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px; font-size: .66rem; font-weight: 760; letter-spacing: .03em; color: var(--muted); background: var(--white); }
 .admin-delta-up { color: #2c5c37; border-color: #a9c4ae; background: #eef5ef; }
-.admin-growth-cohorts { display: block; margin-top: 6px; color: var(--muted); font-size: .66rem; }
+.admin-plan-cohorts { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
+.admin-plan-cohorts li { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: .74rem; border-top: 1px solid var(--line); padding-top: 5px; }
+.admin-plan-cohorts li:first-child { border-top: 0; padding-top: 0; }
+.admin-plan-name { font-weight: 640; letter-spacing: .01em; }
+.admin-plan-stat { color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; }
 .admin-table-wrap { overflow-x: auto; }
 .admin-table-wrap table { width: 100%; border-collapse: collapse; font-size: .74rem; }
 .admin-table-wrap th { color: var(--muted); font-size: .65rem; letter-spacing: .04em; text-align: left; text-transform: uppercase; }
