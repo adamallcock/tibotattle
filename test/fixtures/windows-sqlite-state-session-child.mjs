@@ -2,6 +2,10 @@ import { createRequire } from "node:module";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 
+import {
+  WINDOWS_SQLITE_STATE_FIXTURE_TABLE,
+} from "./windows-sqlite-state-session-values.mjs";
+
 const require = createRequire(import.meta.url);
 const [mode, bindingPath, rootPath, rootIdentityJson, databaseName] = process.argv.slice(2);
 
@@ -75,11 +79,11 @@ function run() {
     configureDatabase(database);
     if (mode === "crash") {
       database.exec(
-        "CREATE TABLE IF NOT EXISTS sqlite_state_fixture (id INTEGER PRIMARY KEY, marker TEXT NOT NULL);",
+        `CREATE TABLE IF NOT EXISTS ${WINDOWS_SQLITE_STATE_FIXTURE_TABLE} (id INTEGER PRIMARY KEY, marker TEXT NOT NULL);`,
       );
       database.exec("BEGIN IMMEDIATE;");
       database.prepare(
-        "INSERT INTO sqlite_state_fixture(marker) VALUES ('crash-marker');",
+        `INSERT INTO ${WINDOWS_SQLITE_STATE_FIXTURE_TABLE}(marker) VALUES ('crash-marker');`,
       ).run();
       process.stdout.write(STATUS.prepared, () => {
         // Abrupt process termination is intentional: the open transaction and
