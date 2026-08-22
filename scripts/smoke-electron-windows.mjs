@@ -63,7 +63,7 @@ const RESULT_KEYS = Object.freeze([
   "relaunchPersistence",
 ]);
 
-function aggregate(status, values = {}) {
+export function aggregate(status, values = {}) {
   return Object.freeze({
     status,
     target: "win32-x64",
@@ -826,10 +826,14 @@ async function directCredentialCleanup(fixture, artifactRoot) {
   }
 }
 
-async function runSmoke() {
+export async function runSmoke(progress) {
+  if (progress === null
+      || typeof progress !== "object"
+      || Array.isArray(progress)) {
+    throw new TypeError("Windows Electron smoke progress must be a plain object");
+  }
   if (process.platform !== "win32" || process.arch !== "x64") {
-    printAggregate(aggregate("unsupported"));
-    return;
+    return aggregate("unsupported");
   }
   const executable = resolve(process.env.TIBOTATTLE_ELECTRON_EXE ?? DEFAULT_EXECUTABLE);
   const artifactRoot = dirname(executable);
@@ -844,7 +848,6 @@ async function runSmoke() {
   let relaunchQuitRequested = false;
   let credentialMayExist = false;
   let credentialDeleted = false;
-  const result = {};
   const cleanupCredential = async ({ allowLiveControl = true } = {}) => {
     if (!credentialMayExist || credentialDeleted) return;
     let liveAttempted = false;
@@ -876,20 +879,25 @@ async function runSmoke() {
   };
   try {
     await assertWindowsExecutable(executable);
-    result.artifact = true;
+    progress.artifact = true;
     const primaryPort = await freeTcpPort();
     primary = spawnPackagedElectron(executable, fixture, primaryPort, artifactRoot);
     if (!primary.pid) fail("WINDOWS_ELECTRON_SMOKE_PRIMARY_PID_MISSING");
     nextPrimaryLine = controlReader(primary);
     const initialState = await waitFor(
-      () => command(primary, nextPrimaryLine, "status-v1").catch(() => null),
+      () => {
+        if (childExited(primary)) {
+          fail("WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_CONTROL");
+        }
+        return command(primary, nextPrimaryLine, "status-v1").catch(() => null);
+      },
       MAX_STARTUP_MS,
       "primary shell status",
     );
     assertPrimaryShellState(initialState, "WINDOWS_ELECTRON_SMOKE_PRIMARY_STATE_INVALID");
     connection = await dashboardConnection(primary, primaryPort);
     const primaryDescendantPids = await captureDescendantPids(primary.pid);
-    result.dashboardReady = true;
+    progress.dashboardReady = true;
 
     // Run the random-namespace probe first, then create the deterministic
     // credential that must survive the first process exit and relaunch.
@@ -905,10 +913,10 @@ async function runSmoke() {
         || toggledHidden.visible || !toggledShown.visible) {
       fail("WINDOWS_ELECTRON_SMOKE_WINDOW_TRAY_LIFECYCLE_FAILED");
     }
-    result.showHideTrayLifecycle = true;
+    progress.showHideTrayLifecycle = true;
 
     await runSyntheticRefresh(connection);
-    result.syntheticRefresh = true;
+    progress.syntheticRefresh = true;
     await writePersistentQualificationState(connection);
 
     const secondPort = await freeTcpPort();
@@ -957,7 +965,7 @@ async function runSmoke() {
         "second instance descendant cleanup",
       );
     }
-    result.secondInstanceRejected = true;
+    progress.secondInstanceRejected = true;
 
     // Capture once more after refresh and the second-instance attempt. This
     // includes helpers created after initial dashboard readiness. A final
@@ -994,7 +1002,7 @@ async function runSmoke() {
       "primary descendant cleanup",
     );
     const primaryNoOrphan = true;
-    result.cleanQuit = true;
+    progress.cleanQuit = true;
     // The companion is launched by the Electron process and should disappear
     // with it. A relaunch against the same profile proves that the old process
     // released its single-instance lock and did not leave a child holding it.
@@ -1014,13 +1022,13 @@ async function runSmoke() {
       const relaunched = await dashboardConnection(relaunch, relaunchPort);
       const relaunchDescendantPids = await captureDescendantPids(relaunch.pid);
       await verifyPersistentQualificationState(relaunched);
-      result.statePersistence = true;
+      progress.statePersistence = true;
       await credentialCommand(relaunch, nextRelaunchLine, "credential-read-v1");
       relaunched.cdp.close();
       await credentialCommand(relaunch, nextRelaunchLine, "credential-delete-v1");
       credentialDeleted = true;
       credentialMayExist = false;
-      result.credentialPersistence = true;
+      progress.credentialPersistence = true;
       const relaunchDescendantMonitor = monitorDescendantsUntilExit(
         relaunch,
         relaunchDescendantPids,
@@ -1050,13 +1058,13 @@ async function runSmoke() {
         "relaunch descendant cleanup",
       );
       const relaunchNoOrphan = true;
-      result.noOrphan = primaryNoOrphan && relaunchNoOrphan;
+      progress.noOrphan = primaryNoOrphan && relaunchNoOrphan;
     } finally {
       await terminateProcessTree(relaunch);
     }
-    result.relaunchPersistence = result.statePersistence === true
-      && result.credentialPersistence === true;
-    printAggregate(aggregate("passed", result));
+    progress.relaunchPersistence = progress.statePersistence === true
+      && progress.credentialPersistence === true;
+    return aggregate("passed", progress);
   } finally {
     await cleanupCredential({ allowLiveControl: true });
     connection?.cdp.close();
@@ -1068,11 +1076,20 @@ async function runSmoke() {
   }
 }
 
-try {
-  await runSmoke();
-} catch {
-  // Never expose executable paths, child diagnostics, account values, or
-  // filesystem contents. The aggregate is the only supported smoke output.
-  printAggregate(aggregate("failed"));
-  process.exitCode = 1;
+if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
+  // Keep progress outside the smoke promise so a startup, dashboard, or
+  // cleanup failure can retain only the already-completed closed-schema
+  // booleans. The caller owns this plain object; aggregate() projects only
+  // the allowlisted result keys and never forwards diagnostics.
+  const progress = {};
+  let output;
+  try {
+    output = await runSmoke(progress);
+  } catch {
+    // Never expose executable paths, child diagnostics, account values, or
+    // filesystem contents. The aggregate is the only supported smoke output.
+    output = aggregate("failed", progress);
+    process.exitCode = 1;
+  }
+  printAggregate(output);
 }
