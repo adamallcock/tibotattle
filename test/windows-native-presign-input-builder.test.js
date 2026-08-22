@@ -240,11 +240,12 @@ test("builds the closed input from canonical handoff, package, and staged runtim
         publisher: WINDOWS_NATIVE_PRESIGN_AZURE_IDENTITY.publisher,
       },
     });
-    assert.equal(JSON.stringify(result.input).includes(value.root), true);
     assert.equal(JSON.stringify(result.input).includes("AZURE_CLIENT_SECRET"), false);
     const serialized = serializeWindowsNativePresignInput(result.input, value.dependencies);
     assert.equal(serialized.endsWith("\n"), true);
-    assert.equal(JSON.parse(serialized).revision, REVISION);
+    const parsed = JSON.parse(serialized);
+    assert.equal(parsed.stagingRoot, value.stagingRoot);
+    assert.equal(parsed.revision, REVISION);
   } finally {
     await value.cleanup();
   }

@@ -235,6 +235,7 @@ const PROBE_MODES = new Set(["injected", "native-windows"]);
 const NATIVE_EVIDENCE = new WeakSet();
 const NATIVE_RECEIPTS = new WeakSet();
 const TEST_HOOK_KEYS = Object.freeze([
+  "beforeTemporaryCreate",
   "beforeOutputPublish",
   "afterOutputPublish",
 ]);
@@ -1188,6 +1189,10 @@ async function writeInventoryReceiptOnce(rootState, receipt, hooks) {
   let handle;
   let temporaryIdentity;
   try {
+    if (hooks.beforeTemporaryCreate !== undefined) {
+      await runTestHook(hooks, "beforeTemporaryCreate");
+      await revalidateDirectoryState(rootState);
+    }
     handle = await open(temporaryPath, "wx", 0o600);
     temporaryIdentity = await statForIdentity(handle);
     if (!temporaryIdentity.isFile() || temporaryIdentity.nlink !== 1) {

@@ -747,6 +747,26 @@ test("portable receipt publication is canonical, transactional, and no-clobber",
   }
 });
 
+test("portable receipt publication test hooks have a closed schema", async () => {
+  const fixture = await createFixture();
+  try {
+    const receipt = await buildFixtureReceipt(fixture);
+    await assert.rejects(
+      () => writeWindowsProductionAuthenticodeInventoryReceiptForTest(
+        fixture.evidenceRoot,
+        receipt,
+        {
+          beforeTemporaryCreate: async () => {},
+          unexpectedHook: async () => {},
+        },
+      ),
+      expectCode(STATUS.optionsInvalid),
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("portable receipt publication rejects hard-linked output and root replacement", async () => {
   const fixture = await createFixture();
   try {
@@ -771,7 +791,7 @@ test("portable receipt publication rejects hard-linked output and root replaceme
         fixture.evidenceRoot,
         receipt,
         {
-          beforeOutputPublish: async () => {
+          beforeTemporaryCreate: async () => {
             await rename(fixture.evidenceRoot, movedRoot);
             await mkdir(fixture.evidenceRoot);
           },
