@@ -59,6 +59,8 @@ const RUNTIME_KEYS = Object.freeze([
   "contentFree",
   "dashboardReady",
   "credentialPersistence",
+  "failureReason",
+  "failureStage",
   "noOrphan",
   "relaunchPersistence",
   "secondInstanceRejected",
@@ -281,8 +283,10 @@ export function validateRuntimeEvidence(value) {
       || value.status !== RUNTIME_AGGREGATE_STATUS
       || value.target !== TARGET
       || value.contentFree !== true
+      || value.failureStage !== "none"
+      || value.failureReason !== "none"
       || RUNTIME_KEYS
-        .filter((key) => !["status", "target", "contentFree"].includes(key))
+        .filter((key) => !["status", "target", "contentFree", "failureStage", "failureReason"].includes(key))
         .some((key) => value[key] !== true)) {
     fail(FIXED_STATUS.runtimeInvalid);
   }

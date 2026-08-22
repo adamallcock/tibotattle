@@ -63,11 +63,104 @@ const RESULT_KEYS = Object.freeze([
   "relaunchPersistence",
 ]);
 
+export const WINDOWS_ELECTRON_SMOKE_FAILURE_STAGE_ALLOWLIST = Object.freeze([
+  "none",
+  "unsupported",
+  "artifact",
+  "launch",
+  "control",
+  "dashboard",
+  "credential",
+  "lifecycle",
+  "refresh",
+  "persistence",
+  "instance",
+  "shutdown",
+  "relaunch",
+  "unknown",
+]);
+
+export const WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST = Object.freeze([
+  "none",
+  "unsupported",
+  "child_exit",
+  "timeout",
+  "protocol",
+  "assertion",
+  "operation",
+  "unknown",
+]);
+
+const FAILURE_STAGE_SET = new Set(WINDOWS_ELECTRON_SMOKE_FAILURE_STAGE_ALLOWLIST);
+const FAILURE_REASON_SET = new Set(WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST);
+const DEFAULT_SMOKE_TIMEOUT_CODE = "WINDOWS_ELECTRON_SMOKE_TIMEOUT";
+const SMOKE_TIMEOUT_CODES = new Set([
+  DEFAULT_SMOKE_TIMEOUT_CODE,
+  "WINDOWS_ELECTRON_SMOKE_CONTROL_TIMEOUT",
+  "WINDOWS_ELECTRON_SMOKE_CREDENTIAL_TIMEOUT",
+  "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT",
+  "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT",
+  "WINDOWS_ELECTRON_SMOKE_PERSISTENCE_TIMEOUT",
+  "WINDOWS_ELECTRON_SMOKE_INSTANCE_TIMEOUT",
+  "WINDOWS_ELECTRON_SMOKE_SHUTDOWN_TIMEOUT",
+  "WINDOWS_ELECTRON_SMOKE_RELAUNCH_TIMEOUT",
+  "WINDOWS_ELECTRON_SMOKE_DESCENDANT_MONITOR_TIMEOUT",
+  "WINDOWS_ELECTRON_SMOKE_SECOND_INSTANCE_REJECTION_TIMEOUT",
+]);
+const SMOKE_CHILD_EXIT_CODES = new Set([
+  "WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_CONTROL",
+  "WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_READY",
+]);
+const SMOKE_PROTOCOL_CODES = new Set([
+  "WINDOWS_ELECTRON_SMOKE_CONTROL_INVALID",
+  "WINDOWS_ELECTRON_SMOKE_CONTROL_UNAVAILABLE",
+  "WINDOWS_ELECTRON_SMOKE_CREDENTIAL_COMMAND_INVALID",
+  "WINDOWS_ELECTRON_SMOKE_CREDENTIAL_CONTROL_UNAVAILABLE",
+  "WINDOWS_ELECTRON_SMOKE_PROCESS_TABLE_INVALID",
+  "WINDOWS_ELECTRON_SMOKE_REFRESH_BOUNDARY_INVALID",
+]);
+const SMOKE_PHASE_STAGE = Object.freeze({
+  artifact: "artifact",
+  launch: "launch",
+  control: "control",
+  dashboard: "dashboard",
+  credential: "credential",
+  lifecycle: "lifecycle",
+  refresh: "refresh",
+  persistence: "persistence",
+  instance: "instance",
+  shutdown: "shutdown",
+  relaunch: "relaunch",
+});
+
+function fixedError(code) {
+  const error = new Error(code);
+  error.code = code;
+  return error;
+}
+
 export function aggregate(status, values = {}) {
+  const diagnostic = status === "passed"
+    ? { failureStage: "none", failureReason: "none" }
+    : status === "unsupported"
+      ? { failureStage: "unsupported", failureReason: "unsupported" }
+      : {
+        failureStage: typeof values.failureStage === "string"
+          && FAILURE_STAGE_SET.has(values.failureStage)
+          && !["none", "unsupported"].includes(values.failureStage)
+          ? values.failureStage
+          : "unknown",
+        failureReason: typeof values.failureReason === "string"
+          && FAILURE_REASON_SET.has(values.failureReason)
+          && !["none", "unsupported"].includes(values.failureReason)
+          ? values.failureReason
+          : "unknown",
+      };
   return Object.freeze({
     status,
     target: "win32-x64",
     contentFree: true,
+    ...diagnostic,
     ...Object.fromEntries(RESULT_KEYS.map((key) => [key, values[key] === true])),
   });
 }
@@ -77,22 +170,25 @@ function printAggregate(value) {
 }
 
 function fail(code) {
-  const error = new Error(code);
-  error.code = code;
-  throw error;
+  throw fixedError(code);
 }
 
 function wait(ms) {
   return new Promise((resolveWait) => setTimeout(resolveWait, ms));
 }
 
-async function withTimeout(promise, timeoutMs, label) {
+async function withTimeout(
+  promise,
+  timeoutMs,
+  _label,
+  timeoutCode = DEFAULT_SMOKE_TIMEOUT_CODE,
+) {
   let timer = null;
   try {
     return await Promise.race([
       promise,
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
+        timer = setTimeout(() => reject(fixedError(timeoutCode)), timeoutMs);
       }),
     ]);
   } finally {
@@ -101,11 +197,42 @@ async function withTimeout(promise, timeoutMs, label) {
 }
 
 export function isTerminalSmokeError(error) {
+  // A bounded operation timeout can be an inner probe inside the larger
+  // startup budget. Keep those markers retryable; child-exit and assertion
+  // markers remain terminal evidence.
   return typeof error?.code === "string"
-    && error.code.startsWith("WINDOWS_ELECTRON_SMOKE_");
+    && error.code.startsWith("WINDOWS_ELECTRON_SMOKE_")
+    && !SMOKE_TIMEOUT_CODES.has(error.code);
 }
 
-export async function waitFor(predicate, timeoutMs, label) {
+export function classifySmokeFailure(error, phase = "unknown") {
+  const code = typeof error?.code === "string" ? error.code : null;
+  if (code === null
+      || (!SMOKE_TIMEOUT_CODES.has(code) && !code.startsWith("WINDOWS_ELECTRON_SMOKE_"))) {
+    return Object.freeze({ failureStage: "unknown", failureReason: "unknown" });
+  }
+  const failureStage = FAILURE_STAGE_SET.has(SMOKE_PHASE_STAGE[phase])
+    ? SMOKE_PHASE_STAGE[phase]
+    : "unknown";
+  let failureReason = "unknown";
+  if (SMOKE_CHILD_EXIT_CODES.has(code)) {
+    failureReason = "child_exit";
+  } else if (SMOKE_TIMEOUT_CODES.has(code)) {
+    failureReason = "timeout";
+  } else if (SMOKE_PROTOCOL_CODES.has(code)) {
+    failureReason = "protocol";
+  } else if (isTerminalSmokeError(error)) {
+    failureReason = "assertion";
+  }
+  return Object.freeze({ failureStage, failureReason });
+}
+
+export async function waitFor(
+  predicate,
+  timeoutMs,
+  _label,
+  timeoutCode = DEFAULT_SMOKE_TIMEOUT_CODE,
+) {
   const started = Date.now();
   let lastError = null;
   while (Date.now() - started < timeoutMs) {
@@ -121,7 +248,8 @@ export async function waitFor(predicate, timeoutMs, label) {
     }
     await wait(100);
   }
-  throw new Error(`${label} timed out${lastError ? ` (${lastError.message})` : ""}`);
+  void lastError;
+  throw fixedError(timeoutCode);
 }
 
 async function freeTcpPort() {
@@ -286,8 +414,17 @@ async function assertWindowsExecutable(executable) {
   }
 }
 
-async function jsonFetch(url, options = undefined) {
-  const response = await fetch(url, options);
+async function jsonFetch(
+  url,
+  options = undefined,
+  timeoutCode = DEFAULT_SMOKE_TIMEOUT_CODE,
+) {
+  const response = await withTimeout(
+    fetch(url, options),
+    MAX_OPERATION_MS,
+    "JSON request",
+    timeoutCode,
+  );
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();
 }
@@ -297,7 +434,7 @@ async function connectCdp(target) {
   await withTimeout(new Promise((resolveOpen, rejectOpen) => {
     socket.addEventListener("open", resolveOpen, { once: true });
     socket.addEventListener("error", () => rejectOpen(new Error("CDP websocket error")), { once: true });
-  }), MAX_OPERATION_MS, "CDP connection");
+  }), MAX_OPERATION_MS, "CDP connection", "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT");
   let nextId = 1;
   const pending = new Map();
   const eventWaiters = new Map();
@@ -341,7 +478,12 @@ async function connectCdp(target) {
       pending.set(id, { resolve: resolveRequest, reject: rejectRequest });
     });
     socket.send(JSON.stringify({ id, method, params }));
-    return withTimeout(promise, MAX_OPERATION_MS, `CDP ${method}`);
+    return withTimeout(
+      promise,
+      MAX_OPERATION_MS,
+      `CDP ${method}`,
+      "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT",
+    );
   };
   const evaluate = async (expression) => {
     const response = await request("Runtime.evaluate", {
@@ -352,7 +494,11 @@ async function connectCdp(target) {
     if (response.exceptionDetails) throw new Error("renderer evaluation failed");
     return response.result?.value;
   };
-  const waitForEvent = (method, predicate = () => true) => {
+  const waitForEvent = (
+    method,
+    predicate = () => true,
+    timeoutCode = "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT",
+  ) => {
     if (typeof method !== "string" || typeof predicate !== "function") {
       throw new TypeError("CDP event waiter is invalid");
     }
@@ -376,7 +522,7 @@ async function connectCdp(target) {
       timer = setTimeout(() => {
         waiters.delete(waiter);
         if (waiters.size === 0) eventWaiters.delete(method);
-        rejectEvent(new Error(`CDP ${method} event timed out`));
+        rejectEvent(fixedError(timeoutCode));
       }, MAX_STARTUP_MS);
     });
     return promise;
@@ -414,11 +560,21 @@ async function terminateProcessTree(child) {
       windowsHide: true,
       stdio: "ignore",
     });
-    await withTimeout(childExitPromise(killer), MAX_OPERATION_MS, "taskkill").catch(() => {});
+    await withTimeout(
+      childExitPromise(killer),
+      MAX_OPERATION_MS,
+      "taskkill",
+      "WINDOWS_ELECTRON_SMOKE_SHUTDOWN_TIMEOUT",
+    ).catch(() => {});
   } else {
     child.kill();
   }
-  await withTimeout(childExitPromise(child), MAX_OPERATION_MS, "process termination").catch(() => {});
+  await withTimeout(
+    childExitPromise(child),
+    MAX_OPERATION_MS,
+    "process termination",
+    "WINDOWS_ELECTRON_SMOKE_SHUTDOWN_TIMEOUT",
+  ).catch(() => {});
 }
 
 async function queryWindowsProcessTable() {
@@ -452,10 +608,20 @@ async function queryWindowsProcessTable() {
     });
   });
   try {
-    await withTimeout(completed, MAX_OPERATION_MS, "process table probe");
+    await withTimeout(
+      completed,
+      MAX_OPERATION_MS,
+      "process table probe",
+      "WINDOWS_ELECTRON_SMOKE_SHUTDOWN_TIMEOUT",
+    );
   } catch (error) {
     probe.kill();
-    await withTimeout(childExitPromise(probe), MAX_OPERATION_MS, "process table probe termination")
+    await withTimeout(
+      childExitPromise(probe),
+      MAX_OPERATION_MS,
+      "process table probe termination",
+      "WINDOWS_ELECTRON_SMOKE_SHUTDOWN_TIMEOUT",
+    )
       .catch(() => {});
     throw error;
   }
@@ -546,7 +712,7 @@ async function waitForDescendantsGone(rootPid, descendants, label) {
     }
     void rootPid;
     return true;
-  }, MAX_SHUTDOWN_MS, label);
+  }, MAX_SHUTDOWN_MS, label, "WINDOWS_ELECTRON_SMOKE_SHUTDOWN_TIMEOUT");
 }
 
 function spawnPackagedElectron(executable, fixture, port, cwd) {
@@ -581,12 +747,16 @@ function controlReader(child, observeLine = null, retainLines = true) {
       buffer = buffer.slice(end + 1);
     }
   });
-  return async function nextLine(predicate, label) {
+  return async function nextLine(
+    predicate,
+    label,
+    timeoutCode = "WINDOWS_ELECTRON_SMOKE_CONTROL_TIMEOUT",
+  ) {
     return waitFor(() => {
       const index = lines.findIndex(predicate);
       if (index < 0) return null;
       return lines.splice(index, 1)[0];
-    }, MAX_OPERATION_MS, label);
+    }, MAX_OPERATION_MS, label, timeoutCode);
   };
 }
 
@@ -609,11 +779,17 @@ function assertPrimaryShellState(state, code) {
   return state;
 }
 
-async function command(child, nextLine, value) {
+async function command(
+  child,
+  nextLine,
+  value,
+  timeoutCode = "WINDOWS_ELECTRON_SMOKE_CONTROL_TIMEOUT",
+) {
   if (!child.stdin?.write(`${value}\n`)) fail("WINDOWS_ELECTRON_SMOKE_CONTROL_UNAVAILABLE");
   const line = await nextLine(
     (candidate) => candidate.startsWith("TIBOTATTLE_ELECTRON_SMOKE_STATE "),
     `control ${value}`,
+    timeoutCode,
   );
   return parseState(line);
 }
@@ -631,7 +807,12 @@ function credentialResponsePrefix(value) {
  * Credential values, service names, and native diagnostics never cross this
  * boundary; a failed response is converted to a stable smoke error.
  */
-async function credentialCommand(child, nextLine, value) {
+async function credentialCommand(
+  child,
+  nextLine,
+  value,
+  timeoutCode = "WINDOWS_ELECTRON_SMOKE_CREDENTIAL_TIMEOUT",
+) {
   if (!child.stdin?.write(`${value}\n`)) {
     fail("WINDOWS_ELECTRON_SMOKE_CREDENTIAL_CONTROL_UNAVAILABLE");
   }
@@ -640,6 +821,7 @@ async function credentialCommand(child, nextLine, value) {
     (candidate) => candidate === `${prefix}_PASSED`
       || candidate === `${prefix}_FAILED`,
     `credential ${value}`,
+    timeoutCode,
   );
   if (line !== `${prefix}_PASSED`) {
     fail("WINDOWS_ELECTRON_SMOKE_CREDENTIAL_OPERATION_FAILED");
@@ -660,6 +842,7 @@ async function assertSecondInstanceNeverReady(child, port) {
       fetch(`http://127.0.0.1:${port}/json/version`),
       MAX_OPERATION_MS,
       "second instance debugging endpoint",
+      "WINDOWS_ELECTRON_SMOKE_INSTANCE_TIMEOUT",
     ).catch(() => null);
     if (endpoint?.ok === true) {
       fail("WINDOWS_ELECTRON_SMOKE_SECOND_INSTANCE_STARTED");
@@ -679,16 +862,25 @@ async function dashboardConnection(child, port) {
   const version = await waitFor(
     () => {
       if (childExited(child)) fail("WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_READY");
-      return jsonFetch(`http://127.0.0.1:${port}/json/version`);
+      return jsonFetch(
+        `http://127.0.0.1:${port}/json/version`,
+        undefined,
+        "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT",
+      );
     },
     MAX_STARTUP_MS,
     "Electron debugging endpoint",
+    "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT",
   );
   const target = await waitFor(async () => {
     if (childExited(child)) fail("WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_READY");
-    const targets = await jsonFetch(`http://127.0.0.1:${port}/json`);
+    const targets = await jsonFetch(
+      `http://127.0.0.1:${port}/json`,
+      undefined,
+      "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT",
+    );
     return targets.find((entry) => entry.type === "page" && entry.webSocketDebuggerUrl);
-  }, MAX_STARTUP_MS, "Electron dashboard target");
+  }, MAX_STARTUP_MS, "Electron dashboard target", "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT");
   const cdp = await connectCdp(target);
   const ready = await waitFor(async () => {
     if (childExited(child)) fail("WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_READY");
@@ -701,12 +893,16 @@ async function dashboardConnection(child, port) {
     return snapshot.ready && snapshot.title === "TiboTattle" && snapshot.heading
       ? snapshot
       : null;
-  }, MAX_STARTUP_MS, "dashboard readiness");
+  }, MAX_STARTUP_MS, "dashboard readiness", "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT");
   const dashboardUrl = new URL(ready.location);
   if (dashboardUrl.protocol !== "http:" || dashboardUrl.hostname !== "127.0.0.1") {
     fail("WINDOWS_ELECTRON_SMOKE_LOOPBACK_REQUIRED");
   }
-  const health = await jsonFetch(new URL("/api/local/health", dashboardUrl));
+  const health = await jsonFetch(
+    new URL("/api/local/health", dashboardUrl),
+    undefined,
+    "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT",
+  );
   if (health.status !== "ready") fail("WINDOWS_ELECTRON_SMOKE_COMPANION_NOT_READY");
   return Object.freeze({ cdp, dashboardUrl, browser: version.Browser });
 }
@@ -729,6 +925,7 @@ async function reloadDashboardDocument(connection) {
     "Page.frameNavigated",
     (event) => event?.frame?.parentId === undefined
       || event?.frame?.parentId === null,
+    "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT",
   );
   await connection.cdp.request("Page.reload", { ignoreCache: false });
   await navigation;
@@ -742,29 +939,38 @@ async function reloadDashboardDocument(connection) {
       && Number.isFinite(snapshot.timeOrigin)
       && snapshot.timeOrigin !== before.timeOrigin
       && snapshot.url === before.url;
-  }, MAX_STARTUP_MS, "dashboard fresh-document render");
+  }, MAX_STARTUP_MS, "dashboard fresh-document render", "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT");
 }
 
 async function runSyntheticRefresh(connection) {
   const { dashboardUrl } = connection;
-  const response = await fetch(new URL("/api/local/refresh", dashboardUrl), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Usage-Monitor-Local": "1",
-    },
-    body: "{}",
-  });
+  const response = await withTimeout(
+    fetch(new URL("/api/local/refresh", dashboardUrl), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1",
+      },
+      body: "{}",
+    }),
+    MAX_OPERATION_MS,
+    "refresh request",
+    "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT",
+  );
   if (response.status !== 202) fail("WINDOWS_ELECTRON_SMOKE_REFRESH_NOT_ACCEPTED");
   await waitFor(async () => {
-    const status = await jsonFetch(new URL("/api/local/refresh", dashboardUrl));
+    const status = await jsonFetch(
+      new URL("/api/local/refresh", dashboardUrl),
+      undefined,
+      "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT",
+    );
     const value = status?.refresh?.status;
     if (value === "succeeded") return true;
     if (["failed", "cancelled"].includes(value)) {
       fail("WINDOWS_ELECTRON_SMOKE_REFRESH_FAILED");
     }
     return false;
-  }, MAX_REFRESH_MS, "synthetic refresh");
+  }, MAX_REFRESH_MS, "synthetic refresh", "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT");
   // A completed refresh must still be renderable by the dashboard after the
   // data pass, not merely accepted by the mutation endpoint.
   await reloadDashboardDocument(connection);
@@ -772,17 +978,22 @@ async function runSyntheticRefresh(connection) {
 
 async function writePersistentQualificationState(connection) {
   const { dashboardUrl } = connection;
-  const response = await fetch(
-    new URL("/api/local/accounting/fast-mode-preference", dashboardUrl),
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Usage-Monitor-Local": "1",
-        Origin: dashboardUrl.origin,
+  const response = await withTimeout(
+    fetch(
+      new URL("/api/local/accounting/fast-mode-preference", dashboardUrl),
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1",
+          Origin: dashboardUrl.origin,
+        },
+        body: JSON.stringify({ mode: "fast" }),
       },
-      body: JSON.stringify({ mode: "fast" }),
-    },
+    ),
+    MAX_OPERATION_MS,
+    "state persistence request",
+    "WINDOWS_ELECTRON_SMOKE_PERSISTENCE_TIMEOUT",
   );
   if (!response.ok) fail("WINDOWS_ELECTRON_SMOKE_STATE_WRITE_FAILED");
   const value = await response.json();
@@ -792,10 +1003,14 @@ async function writePersistentQualificationState(connection) {
 }
 
 async function verifyPersistentQualificationState(connection) {
-  const value = await jsonFetch(new URL(
-    "/api/local/accounting/fast-mode-preference",
-    connection.dashboardUrl,
-  ));
+  const value = await jsonFetch(
+    new URL(
+      "/api/local/accounting/fast-mode-preference",
+      connection.dashboardUrl,
+    ),
+    undefined,
+    "WINDOWS_ELECTRON_SMOKE_PERSISTENCE_TIMEOUT",
+  );
   if (value?.mode !== "fast" || value?.source !== "stated") {
     fail("WINDOWS_ELECTRON_SMOKE_STATE_RETENTION_FAILED");
   }
@@ -858,6 +1073,7 @@ export async function runSmoke(progress) {
   let relaunchQuitRequested = false;
   let credentialMayExist = false;
   let credentialDeleted = false;
+  let failurePhase = "artifact";
   const cleanupCredential = async ({ allowLiveControl = true } = {}) => {
     if (!credentialMayExist || credentialDeleted) return;
     let liveAttempted = false;
@@ -890,10 +1106,12 @@ export async function runSmoke(progress) {
   try {
     await assertWindowsExecutable(executable);
     progress.artifact = true;
+    failurePhase = "launch";
     const primaryPort = await freeTcpPort();
     primary = spawnPackagedElectron(executable, fixture, primaryPort, artifactRoot);
     if (!primary.pid) fail("WINDOWS_ELECTRON_SMOKE_PRIMARY_PID_MISSING");
     nextPrimaryLine = controlReader(primary);
+    failurePhase = "control";
     const initialState = await waitFor(
       () => {
         if (childExited(primary)) {
@@ -903,18 +1121,23 @@ export async function runSmoke(progress) {
       },
       MAX_STARTUP_MS,
       "primary shell status",
+      "WINDOWS_ELECTRON_SMOKE_CONTROL_TIMEOUT",
     );
     assertPrimaryShellState(initialState, "WINDOWS_ELECTRON_SMOKE_PRIMARY_STATE_INVALID");
+    failurePhase = "dashboard";
     connection = await dashboardConnection(primary, primaryPort);
+    failurePhase = "lifecycle";
     const primaryDescendantPids = await captureDescendantPids(primary.pid);
     progress.dashboardReady = true;
 
     // Run the random-namespace probe first, then create the deterministic
     // credential that must survive the first process exit and relaunch.
+    failurePhase = "credential";
     await credentialCommand(primary, nextPrimaryLine, "credential-probe-v1");
     credentialMayExist = true;
     await credentialCommand(primary, nextPrimaryLine, "credential-create-v1");
 
+    failurePhase = "lifecycle";
     const hidden = await command(primary, nextPrimaryLine, "tray-hide-v1");
     const shown = await command(primary, nextPrimaryLine, "tray-show-v1");
     const toggledHidden = await command(primary, nextPrimaryLine, "tray-toggle-v1");
@@ -925,10 +1148,13 @@ export async function runSmoke(progress) {
     }
     progress.showHideTrayLifecycle = true;
 
+    failurePhase = "refresh";
     await runSyntheticRefresh(connection);
     progress.syntheticRefresh = true;
+    failurePhase = "persistence";
     await writePersistentQualificationState(connection);
 
+    failurePhase = "instance";
     const secondPort = await freeTcpPort();
     second = spawnPackagedElectron(executable, fixture, secondPort, artifactRoot);
     const secondObservedLines = [];
@@ -944,8 +1170,18 @@ export async function runSmoke(progress) {
     const secondEndpointMonitor = assertSecondInstanceNeverReady(second, secondPort);
     let primaryDuringSecond;
     try {
-      primaryDuringSecond = await command(primary, nextPrimaryLine, "status-v1");
-      await withTimeout(childExitPromise(second), MAX_SHUTDOWN_MS, "second instance rejection");
+      primaryDuringSecond = await command(
+        primary,
+        nextPrimaryLine,
+        "status-v1",
+        "WINDOWS_ELECTRON_SMOKE_INSTANCE_TIMEOUT",
+      );
+      await withTimeout(
+        childExitPromise(second),
+        MAX_SHUTDOWN_MS,
+        "second instance rejection",
+        "WINDOWS_ELECTRON_SMOKE_INSTANCE_TIMEOUT",
+      );
     } finally {
       await terminateProcessTree(second);
       await secondDescendantMonitor;
@@ -963,7 +1199,12 @@ export async function runSmoke(progress) {
       const state = parseState(line);
       if (state.primary) fail("WINDOWS_ELECTRON_SMOKE_SECOND_INSTANCE_BECAME_PRIMARY");
     }
-    const primaryAfterSecond = await command(primary, nextPrimaryLine, "status-v1");
+    const primaryAfterSecond = await command(
+      primary,
+      nextPrimaryLine,
+      "status-v1",
+      "WINDOWS_ELECTRON_SMOKE_INSTANCE_TIMEOUT",
+    );
     assertPrimaryShellState(
       primaryAfterSecond,
       "WINDOWS_ELECTRON_SMOKE_PRIMARY_LOST_AFTER_SECOND_INSTANCE",
@@ -977,6 +1218,7 @@ export async function runSmoke(progress) {
     }
     progress.secondInstanceRejected = true;
 
+    failurePhase = "shutdown";
     // Capture once more after refresh and the second-instance attempt. This
     // includes helpers created after initial dashboard readiness. A final
     // post-exit capture below also catches any Windows child whose recorded
@@ -994,8 +1236,14 @@ export async function runSmoke(progress) {
       await nextPrimaryLine(
         (line) => line === "TIBOTATTLE_ELECTRON_SMOKE_QUIT_ACCEPTED",
         "primary clean quit acknowledgement",
+        "WINDOWS_ELECTRON_SMOKE_SHUTDOWN_TIMEOUT",
       );
-      await withTimeout(childExitPromise(primary), MAX_SHUTDOWN_MS, "primary clean quit");
+      await withTimeout(
+        childExitPromise(primary),
+        MAX_SHUTDOWN_MS,
+        "primary clean quit",
+        "WINDOWS_ELECTRON_SMOKE_SHUTDOWN_TIMEOUT",
+      );
     } finally {
       await terminateProcessTree(primary);
       await primaryDescendantMonitor;
@@ -1016,6 +1264,7 @@ export async function runSmoke(progress) {
     // The companion is launched by the Electron process and should disappear
     // with it. A relaunch against the same profile proves that the old process
     // released its single-instance lock and did not leave a child holding it.
+    failurePhase = "relaunch";
     const relaunchPort = await freeTcpPort();
     relaunch = spawnPackagedElectron(executable, fixture, relaunchPort, artifactRoot);
     if (!relaunch.pid) fail("WINDOWS_ELECTRON_SMOKE_RELAUNCH_PID_MISSING");
@@ -1030,6 +1279,7 @@ export async function runSmoke(progress) {
         },
         MAX_STARTUP_MS,
         "relaunch shell status",
+        "WINDOWS_ELECTRON_SMOKE_RELAUNCH_TIMEOUT",
       );
       if (!state.started || !state.primary || !state.tray) {
         fail("WINDOWS_ELECTRON_SMOKE_RELAUNCH_STATE_INVALID");
@@ -1057,8 +1307,14 @@ export async function runSmoke(progress) {
         await nextRelaunchLine(
           (line) => line === "TIBOTATTLE_ELECTRON_SMOKE_QUIT_ACCEPTED",
           "relaunch clean quit acknowledgement",
+          "WINDOWS_ELECTRON_SMOKE_RELAUNCH_TIMEOUT",
         );
-        await withTimeout(childExitPromise(relaunch), MAX_SHUTDOWN_MS, "relaunch clean quit");
+        await withTimeout(
+          childExitPromise(relaunch),
+          MAX_SHUTDOWN_MS,
+          "relaunch clean quit",
+          "WINDOWS_ELECTRON_SMOKE_RELAUNCH_TIMEOUT",
+        );
       } finally {
         await terminateProcessTree(relaunch);
         await relaunchDescendantMonitor;
@@ -1080,6 +1336,11 @@ export async function runSmoke(progress) {
     progress.relaunchPersistence = progress.statePersistence === true
       && progress.credentialPersistence === true;
     return aggregate("passed", progress);
+  } catch (error) {
+    const diagnostic = classifySmokeFailure(error, failurePhase);
+    progress.failureStage = diagnostic.failureStage;
+    progress.failureReason = diagnostic.failureReason;
+    throw error;
   } finally {
     await cleanupCredential({ allowLiveControl: true });
     connection?.cdp.close();
@@ -1094,8 +1355,8 @@ export async function runSmoke(progress) {
 if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
   // Keep progress outside the smoke promise so a startup, dashboard, or
   // cleanup failure can retain only the already-completed closed-schema
-  // booleans. The caller owns this plain object; aggregate() projects only
-  // the allowlisted result keys and never forwards diagnostics.
+  // booleans and fixed diagnostic enums. The caller owns this plain object;
+  // aggregate() projects only the allowlisted result keys and diagnostics.
   const progress = {};
   let output;
   try {

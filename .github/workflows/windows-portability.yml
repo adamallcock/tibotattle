@@ -543,6 +543,32 @@ jobs:
           # Retain only a closed aggregate. The smoke command's merged output
           # is diagnostic input, never an upload candidate; it is normalized
           # into this content-free shape below before the path is exported.
+          $runtimeFailureStages = @(
+            'none',
+            'unsupported',
+            'artifact',
+            'launch',
+            'control',
+            'dashboard',
+            'credential',
+            'lifecycle',
+            'refresh',
+            'persistence',
+            'instance',
+            'shutdown',
+            'relaunch',
+            'unknown'
+          )
+          $runtimeFailureReasons = @(
+            'none',
+            'unsupported',
+            'child_exit',
+            'timeout',
+            'protocol',
+            'assertion',
+            'operation',
+            'unknown'
+          )
           $defaultRuntimeEvidence = [ordered]@{
             artifact = $false
             dashboardReady = $false
@@ -554,6 +580,8 @@ jobs:
             statePersistence = $false
             credentialPersistence = $false
             relaunchPersistence = $false
+            failureStage = 'unknown'
+            failureReason = 'unknown'
             status = 'failed'
             target = 'win32-x64'
             contentFree = $true
@@ -580,6 +608,8 @@ jobs:
               'statePersistence',
               'credentialPersistence',
               'relaunchPersistence',
+              'failureStage',
+              'failureReason',
               'status',
               'target',
               'contentFree'
@@ -594,8 +624,14 @@ jobs:
                 $runtimeEvidence.contentFree -ne $true) {
               throw 'runtime aggregate status'
             }
+            if ($runtimeEvidence.failureStage -isnot [string] -or
+                $runtimeFailureStages -notcontains $runtimeEvidence.failureStage -or
+                $runtimeEvidence.failureReason -isnot [string] -or
+                $runtimeFailureReasons -notcontains $runtimeEvidence.failureReason) {
+              throw 'runtime aggregate diagnostics'
+            }
             foreach ($name in $expectedRuntimeKeys) {
-              if ($name -in @('status', 'target', 'contentFree')) { continue }
+              if ($name -in @('status', 'target', 'contentFree', 'failureStage', 'failureReason')) { continue }
               if ($runtimeEvidence.$name -isnot [bool]) {
                 throw 'runtime aggregate check'
               }
@@ -638,6 +674,8 @@ jobs:
           if ($runtimeEvidence.status -ne 'passed' -or
               $runtimeEvidence.target -ne 'win32-x64' -or
               $runtimeEvidence.contentFree -ne $true -or
+              $runtimeEvidence.failureStage -ne 'none' -or
+              $runtimeEvidence.failureReason -ne 'none' -or
               $runtimeJson -match '(?i)(?:[A-Za-z]:[\\/]|/Users/|/home/|\\Users\\|username|password|secret|token|pid|process|stdout|stderr|command|executable)') {
             Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_EVIDENCE_NOT_CONTENT_FREE'
             exit 1
@@ -652,6 +690,8 @@ jobs:
           "### Windows Electron runtime smoke" >> $env:GITHUB_STEP_SUMMARY
           "- Status: $($runtimeEvidence.status)" >> $env:GITHUB_STEP_SUMMARY
           "- Target: $($runtimeEvidence.target)" >> $env:GITHUB_STEP_SUMMARY
+          "- Failure stage: $($runtimeEvidence.failureStage)" >> $env:GITHUB_STEP_SUMMARY
+          "- Failure reason: $($runtimeEvidence.failureReason)" >> $env:GITHUB_STEP_SUMMARY
           "- Dashboard readiness: passed" >> $env:GITHUB_STEP_SUMMARY
           "- Synthetic refresh: passed" >> $env:GITHUB_STEP_SUMMARY
           "- Tray/window lifecycle: passed" >> $env:GITHUB_STEP_SUMMARY
@@ -825,7 +865,7 @@ jobs:
           retention-days: 3
 
       - name: Retain blocked unsigned Windows x64 development artifact
-        if: ${{ always() && !cancelled() && steps.native_security_qualification.outcome == 'failure' && steps.electron_artifact_verification.outcome == 'success' && steps.electron_runtime_smoke.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && steps.electron_artifact_verification.outcome == 'success' && ((steps.native_security_qualification.outcome == 'failure' && steps.electron_runtime_smoke.outcome == 'success') || (steps.native_security_qualification.outcome == 'success' && steps.electron_runtime_smoke.outcome == 'failure')) }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tibotattle-windows-x64-electron-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}-${{ matrix.cache-mode }}-blocked-development

@@ -5,6 +5,9 @@ import test from "node:test";
 
 import {
   aggregate,
+  classifySmokeFailure,
+  WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST,
+  WINDOWS_ELECTRON_SMOKE_FAILURE_STAGE_ALLOWLIST,
   waitFor,
 } from "../scripts/smoke-electron-windows.mjs";
 
@@ -23,6 +26,16 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /process\.arch !== "x64"/u);
   assert.match(source, /0x8664/u);
   assert.match(source, /WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_CONTROL/u);
+  assert.match(source, /WINDOWS_ELECTRON_SMOKE_FAILURE_STAGE_ALLOWLIST/u);
+  assert.match(source, /WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST/u);
+  assert.match(source, /failureStage/u);
+  assert.match(source, /failureReason/u);
+  assert.match(source, /classifySmokeFailure/u);
+  assert.match(source, /WINDOWS_ELECTRON_SMOKE_CONTROL_TIMEOUT/u);
+  assert.match(source, /WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT/u);
+  assert.match(source, /WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT/u);
+  assert.match(source, /WINDOWS_ELECTRON_SMOKE_RELAUNCH_TIMEOUT/u);
+  assert.doesNotMatch(source, /lastError\.message/u);
   assert.match(source, /isTerminalSmokeError/u);
   assert.match(source, /if \(isTerminalSmokeError\(error\)\) throw error/u);
   assert.doesNotMatch(source, /command\([^\n]+\)\.catch\(\(\) => null\)/u);
@@ -137,6 +150,8 @@ test("failed Windows Electron smoke preserves completed closed-schema progress",
     artifact: true,
     dashboardReady: true,
     syntheticRefresh: false,
+    failureStage: "control",
+    failureReason: "child_exit",
     credentialPersistence: false,
     secret: "must not cross the aggregate boundary",
   };
@@ -146,6 +161,8 @@ test("failed Windows Electron smoke preserves completed closed-schema progress",
     status: "failed",
     target: "win32-x64",
     contentFree: true,
+    failureStage: "control",
+    failureReason: "child_exit",
     artifact: true,
     dashboardReady: true,
     syntheticRefresh: false,
@@ -159,6 +176,90 @@ test("failed Windows Electron smoke preserves completed closed-schema progress",
   });
   assert.equal(Object.hasOwn(failed, "secret"), false);
   assert.equal(progress.artifact, true);
+});
+
+test("Windows Electron smoke diagnostics are fixed, phase-bound, and content-free", () => {
+  assert.deepEqual(WINDOWS_ELECTRON_SMOKE_FAILURE_STAGE_ALLOWLIST, [
+    "none",
+    "unsupported",
+    "artifact",
+    "launch",
+    "control",
+    "dashboard",
+    "credential",
+    "lifecycle",
+    "refresh",
+    "persistence",
+    "instance",
+    "shutdown",
+    "relaunch",
+    "unknown",
+  ]);
+  assert.deepEqual(WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST, [
+    "none",
+    "unsupported",
+    "child_exit",
+    "timeout",
+    "protocol",
+    "assertion",
+    "operation",
+    "unknown",
+  ]);
+  assert.deepEqual(
+    classifySmokeFailure(
+      { code: "WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_CONTROL" },
+      "control",
+    ),
+    { failureStage: "control", failureReason: "child_exit" },
+  );
+  assert.deepEqual(
+    classifySmokeFailure(
+      { code: "WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_READY" },
+      "dashboard",
+    ),
+    { failureStage: "dashboard", failureReason: "child_exit" },
+  );
+  assert.deepEqual(
+    classifySmokeFailure(
+      { code: "WINDOWS_ELECTRON_SMOKE_CONTROL_TIMEOUT" },
+      "control",
+    ),
+    { failureStage: "control", failureReason: "timeout" },
+  );
+  assert.deepEqual(
+    classifySmokeFailure(new Error("private path and process details"), "dashboard"),
+    { failureStage: "unknown", failureReason: "unknown" },
+  );
+  assert.deepEqual(
+    aggregate("passed", {
+      failureStage: "control",
+      failureReason: "child_exit",
+    }),
+    {
+      status: "passed",
+      target: "win32-x64",
+      contentFree: true,
+      failureStage: "none",
+      failureReason: "none",
+      artifact: false,
+      dashboardReady: false,
+      syntheticRefresh: false,
+      secondInstanceRejected: false,
+      showHideTrayLifecycle: false,
+      cleanQuit: false,
+      noOrphan: false,
+      statePersistence: false,
+      credentialPersistence: false,
+      relaunchPersistence: false,
+    },
+  );
+  const invalid = aggregate("failed", {
+    failureStage: "/private/path",
+    failureReason: "private message",
+  });
+  assert.equal(invalid.failureStage, "unknown");
+  assert.equal(invalid.failureReason, "unknown");
+  assert.doesNotMatch(JSON.stringify(invalid), /private|path|message/iu);
 });
 
 test("waitFor fails fast for terminal smoke errors and retries transient misses", async () => {
@@ -185,6 +286,19 @@ test("waitFor fails fast for terminal smoke errors and retries transient misses"
   }, 5_000, "transient smoke");
   assert.equal(recovered, "ready");
   assert.equal(transientCalls, 2);
+
+  let timeoutCalls = 0;
+  const recoveredAfterTimeout = await waitFor(() => {
+    timeoutCalls += 1;
+    if (timeoutCalls < 2) {
+      const error = new Error("bounded control timeout");
+      error.code = "WINDOWS_ELECTRON_SMOKE_CONTROL_TIMEOUT";
+      throw error;
+    }
+    return "ready";
+  }, 5_000, "timeout smoke", "WINDOWS_ELECTRON_SMOKE_CONTROL_TIMEOUT");
+  assert.equal(recoveredAfterTimeout, "ready");
+  assert.equal(timeoutCalls, 2);
 });
 
 test("non-Windows Electron smoke reports unsupported rather than success", () => {
@@ -200,6 +314,8 @@ test("non-Windows Electron smoke reports unsupported rather than success", () =>
     status: "unsupported",
     target: "win32-x64",
     contentFree: true,
+    failureStage: "unsupported",
+    failureReason: "unsupported",
     artifact: false,
     dashboardReady: false,
     syntheticRefresh: false,
