@@ -190,6 +190,8 @@ enum TiboTattleLocalization {
         case nativeDashboardStatus = "nativeDashboard.status"
         case nativeDashboardTrends = "nativeDashboard.trends"
         case nativeDashboardUpdating = "nativeDashboard.updating"
+        case nativeDashboardHideSidebar = "nativeDashboard.hideSidebar"
+        case nativeDashboardShowSidebar = "nativeDashboard.showSidebar"
         case menuAboutProduct = "menu.aboutProduct"
         case menuCopy = "menu.copy"
         case menuEdit = "menu.edit"
@@ -587,6 +589,10 @@ enum TiboTattleLocalization {
                 "Trends"
             case .nativeDashboardUpdating:
                 "Running…"
+            case .nativeDashboardHideSidebar:
+                "Hide Sidebar"
+            case .nativeDashboardShowSidebar:
+                "Show Sidebar"
             case .menuAboutProduct:
                 "About %@"
             case .menuCopy:
