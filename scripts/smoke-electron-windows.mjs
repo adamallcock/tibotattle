@@ -46,7 +46,31 @@ const MAX_STARTUP_MS = 45_000;
 const MAX_OPERATION_MS = 10_000;
 const MAX_REFRESH_MS = 45_000;
 const MAX_SHUTDOWN_MS = 15_000;
-const CONTROL_LINE_PATTERN = /^TIBOTATTLE_ELECTRON_SMOKE_STATE started=([01]) primary=([01]) window=([01]) visible=([01]) tray=([01])$/u;
+const WINDOWS_ELECTRON_SMOKE_MESSAGE_TYPE = "windows-electron-smoke-v1";
+const WINDOWS_ELECTRON_SMOKE_COMMAND_MESSAGE = "command-v1";
+const WINDOWS_ELECTRON_SMOKE_STATE_MESSAGE = "state-v1";
+const WINDOWS_ELECTRON_SMOKE_CREDENTIAL_MESSAGE = "credential-v1";
+const WINDOWS_ELECTRON_SMOKE_QUIT_MESSAGE = "quit-v1";
+const WINDOWS_ELECTRON_SMOKE_ACCEPTED_STATUS = "accepted-v1";
+const WINDOWS_ELECTRON_SMOKE_PASSED_STATUS = "passed-v1";
+const WINDOWS_ELECTRON_SMOKE_FAILED_STATUS = "failed-v1";
+const WINDOWS_ELECTRON_SMOKE_COMMANDS = new Set([
+  "status-v1",
+  "tray-show-v1",
+  "tray-hide-v1",
+  "tray-toggle-v1",
+  "credential-probe-v1",
+  "credential-create-v1",
+  "credential-read-v1",
+  "credential-delete-v1",
+  "quit-v1",
+]);
+const WINDOWS_ELECTRON_SMOKE_CREDENTIAL_OPERATIONS = Object.freeze({
+  "credential-probe-v1": "probe-v1",
+  "credential-create-v1": "create-v1",
+  "credential-read-v1": "read-v1",
+  "credential-delete-v1": "delete-v1",
+});
 const WINDOWS_PROCESS_TABLE_QUERY = [
   "$all = @(Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId)",
   "foreach ($row in $all) { Write-Output (([int]$row.ProcessId).ToString() + ':' + ([int]$row.ParentProcessId).ToString())",
@@ -775,48 +799,123 @@ function spawnPackagedElectron(executable, fixture, port, cwd) {
     env: safeChildEnvironment(fixture),
     shell: false,
     windowsHide: true,
-    stdio: ["pipe", "pipe", "ignore"],
+    // Electron's Windows GUI executable has no usable stdin/stdout. Use the
+    // Node child-process IPC channel instead; it is not renderer IPC and is
+    // available only to this explicitly spawned qualification process.
+    stdio: ["ignore", "ignore", "ignore", "ipc"],
   });
-  child.stdin?.setDefaultEncoding?.("utf8");
   return child;
 }
 
-function controlReader(child, observeLine = null, retainLines = true) {
-  const lines = [];
-  let buffer = "";
-  child.stdout?.on("data", (chunk) => {
-    buffer += String(chunk);
-    while (true) {
-      const end = buffer.indexOf("\n");
-      if (end < 0) break;
-      const line = buffer.slice(0, end).replace(/\r$/u, "");
-      if (retainLines) lines.push(line);
-      if (typeof observeLine === "function") observeLine(line);
-      buffer = buffer.slice(end + 1);
-    }
-  });
-  return async function nextLine(
+function exactKeys(value, keys) {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.keys(value).length === keys.length
+    && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function normalizeControlMessage(value) {
+  if (value === null
+      || typeof value !== "object"
+      || Array.isArray(value)
+      || value.type !== WINDOWS_ELECTRON_SMOKE_MESSAGE_TYPE) {
+    return null;
+  }
+  if (value.message === WINDOWS_ELECTRON_SMOKE_STATE_MESSAGE
+      && exactKeys(value, [
+        "type",
+        "message",
+        "started",
+        "primary",
+        "window",
+        "visible",
+        "tray",
+      ])
+      && ["started", "primary", "window", "visible", "tray"]
+        .every((key) => typeof value[key] === "boolean")) {
+    return Object.freeze({
+      type: WINDOWS_ELECTRON_SMOKE_MESSAGE_TYPE,
+      message: WINDOWS_ELECTRON_SMOKE_STATE_MESSAGE,
+      started: value.started,
+      primary: value.primary,
+      window: value.window,
+      visible: value.visible,
+      tray: value.tray,
+    });
+  }
+  if (value.message === WINDOWS_ELECTRON_SMOKE_CREDENTIAL_MESSAGE
+      && exactKeys(value, ["type", "message", "operation", "status"])
+      && Object.values(WINDOWS_ELECTRON_SMOKE_CREDENTIAL_OPERATIONS)
+        .includes(value.operation)
+      && [
+        WINDOWS_ELECTRON_SMOKE_PASSED_STATUS,
+        WINDOWS_ELECTRON_SMOKE_FAILED_STATUS,
+      ].includes(value.status)) {
+    return Object.freeze({
+      type: WINDOWS_ELECTRON_SMOKE_MESSAGE_TYPE,
+      message: WINDOWS_ELECTRON_SMOKE_CREDENTIAL_MESSAGE,
+      operation: value.operation,
+      status: value.status,
+    });
+  }
+  if (value.message === WINDOWS_ELECTRON_SMOKE_QUIT_MESSAGE
+      && exactKeys(value, ["type", "message", "status"])
+      && value.status === WINDOWS_ELECTRON_SMOKE_ACCEPTED_STATUS) {
+    return Object.freeze({
+      type: WINDOWS_ELECTRON_SMOKE_MESSAGE_TYPE,
+      message: WINDOWS_ELECTRON_SMOKE_QUIT_MESSAGE,
+      status: WINDOWS_ELECTRON_SMOKE_ACCEPTED_STATUS,
+    });
+  }
+  return null;
+}
+
+function controlReader(child, observeMessage = null, retainMessages = true) {
+  const messages = [];
+  let active = true;
+  const onMessage = (value) => {
+    if (!active) return;
+    const message = normalizeControlMessage(value);
+    if (message === null) return;
+    if (retainMessages) messages.push(message);
+    if (typeof observeMessage === "function") observeMessage(message);
+  };
+  const cleanup = () => {
+    if (!active) return;
+    active = false;
+    child.off?.("message", onMessage);
+    child.off?.("disconnect", onDisconnect);
+  };
+  const onDisconnect = () => cleanup();
+  child.on?.("message", onMessage);
+  child.on?.("disconnect", onDisconnect);
+  const nextMessage = async function nextMessage(
     predicate,
     label,
     timeoutCode = "WINDOWS_ELECTRON_SMOKE_CONTROL_TIMEOUT",
   ) {
     return waitFor(() => {
-      const index = lines.findIndex(predicate);
+      const index = messages.findIndex(predicate);
       if (index < 0) return null;
-      return lines.splice(index, 1)[0];
+      return messages.splice(index, 1)[0];
     }, MAX_OPERATION_MS, label, timeoutCode);
   };
+  nextMessage.close = cleanup;
+  return nextMessage;
 }
 
-function parseState(line) {
-  const match = CONTROL_LINE_PATTERN.exec(line);
-  if (!match) fail("WINDOWS_ELECTRON_SMOKE_CONTROL_INVALID");
+function parseState(message) {
+  if (message?.type !== WINDOWS_ELECTRON_SMOKE_MESSAGE_TYPE
+      || message.message !== WINDOWS_ELECTRON_SMOKE_STATE_MESSAGE) {
+    fail("WINDOWS_ELECTRON_SMOKE_CONTROL_INVALID");
+  }
   return Object.freeze({
-    started: match[1] === "1",
-    primary: match[2] === "1",
-    window: match[3] === "1",
-    visible: match[4] === "1",
-    tray: match[5] === "1",
+    started: message.started,
+    primary: message.primary,
+    window: message.window,
+    visible: message.visible,
+    tray: message.tray,
   });
 }
 
@@ -829,25 +928,49 @@ function assertPrimaryShellState(state, code) {
 
 async function command(
   child,
-  nextLine,
+  nextMessage,
   value,
   timeoutCode = "WINDOWS_ELECTRON_SMOKE_CONTROL_TIMEOUT",
 ) {
-  if (!child.stdin?.write(`${value}\n`)) fail("WINDOWS_ELECTRON_SMOKE_CONTROL_UNAVAILABLE");
-  const line = await nextLine(
-    (candidate) => candidate.startsWith("TIBOTATTLE_ELECTRON_SMOKE_STATE "),
+  if (!WINDOWS_ELECTRON_SMOKE_COMMANDS.has(value)) {
+    fail("WINDOWS_ELECTRON_SMOKE_CONTROL_INVALID");
+  }
+  await sendCommand(child, value, timeoutCode);
+  const message = await nextMessage(
+    (candidate) => candidate.message === WINDOWS_ELECTRON_SMOKE_STATE_MESSAGE,
     `control ${value}`,
     timeoutCode,
   );
-  return parseState(line);
+  return parseState(message);
 }
 
-function credentialResponsePrefix(value) {
-  const commandName = value.startsWith("credential-") && value.endsWith("-v1")
-    ? value.slice("credential-".length, -3)
-    : null;
-  if (!commandName) fail("WINDOWS_ELECTRON_SMOKE_CREDENTIAL_COMMAND_INVALID");
-  return `TIBOTATTLE_ELECTRON_SMOKE_CREDENTIAL_${commandName.toUpperCase()}`;
+async function sendCommand(
+  child,
+  value,
+  timeoutCode = "WINDOWS_ELECTRON_SMOKE_CONTROL_TIMEOUT",
+) {
+  if (typeof child.send !== "function" || child.connected === false) {
+    fail("WINDOWS_ELECTRON_SMOKE_CONTROL_UNAVAILABLE");
+  }
+  await withTimeout(
+    new Promise((resolveSend, rejectSend) => {
+      try {
+        child.send(Object.freeze({
+          type: WINDOWS_ELECTRON_SMOKE_MESSAGE_TYPE,
+          message: WINDOWS_ELECTRON_SMOKE_COMMAND_MESSAGE,
+          command: value,
+        }), (error) => {
+          if (error) rejectSend(fixedError("WINDOWS_ELECTRON_SMOKE_CONTROL_UNAVAILABLE"));
+          else resolveSend();
+        });
+      } catch {
+        rejectSend(fixedError("WINDOWS_ELECTRON_SMOKE_CONTROL_UNAVAILABLE"));
+      }
+    }),
+    MAX_OPERATION_MS,
+    "IPC command",
+    timeoutCode,
+  );
 }
 
 /**
@@ -857,24 +980,44 @@ function credentialResponsePrefix(value) {
  */
 async function credentialCommand(
   child,
-  nextLine,
+  nextMessage,
   value,
   timeoutCode = "WINDOWS_ELECTRON_SMOKE_CREDENTIAL_TIMEOUT",
 ) {
-  if (!child.stdin?.write(`${value}\n`)) {
-    fail("WINDOWS_ELECTRON_SMOKE_CREDENTIAL_CONTROL_UNAVAILABLE");
+  const operation = WINDOWS_ELECTRON_SMOKE_CREDENTIAL_OPERATIONS[value];
+  if (!operation) {
+    fail("WINDOWS_ELECTRON_SMOKE_CREDENTIAL_COMMAND_INVALID");
   }
-  const prefix = credentialResponsePrefix(value);
-  const line = await nextLine(
-    (candidate) => candidate === `${prefix}_PASSED`
-      || candidate === `${prefix}_FAILED`,
+  await sendCommand(child, value, timeoutCode).catch((error) => {
+    if (error?.code === "WINDOWS_ELECTRON_SMOKE_CONTROL_UNAVAILABLE") {
+      throw fixedError("WINDOWS_ELECTRON_SMOKE_CREDENTIAL_CONTROL_UNAVAILABLE");
+    }
+    throw error;
+  });
+  const message = await nextMessage(
+    (candidate) => candidate.message === WINDOWS_ELECTRON_SMOKE_CREDENTIAL_MESSAGE
+      && candidate.operation === operation,
     `credential ${value}`,
     timeoutCode,
   );
-  if (line !== `${prefix}_PASSED`) {
+  if (message.status !== WINDOWS_ELECTRON_SMOKE_PASSED_STATUS) {
     fail("WINDOWS_ELECTRON_SMOKE_CREDENTIAL_OPERATION_FAILED");
   }
   return true;
+}
+
+async function quitCommand(
+  child,
+  nextMessage,
+  timeoutCode = "WINDOWS_ELECTRON_SMOKE_SHUTDOWN_TIMEOUT",
+) {
+  await sendCommand(child, "quit-v1", timeoutCode);
+  await nextMessage(
+    (candidate) => candidate.message === WINDOWS_ELECTRON_SMOKE_QUIT_MESSAGE
+      && candidate.status === WINDOWS_ELECTRON_SMOKE_ACCEPTED_STATUS,
+    "clean quit acknowledgement",
+    timeoutCode,
+  );
 }
 
 /**
@@ -1115,8 +1258,9 @@ export async function runSmoke(progress) {
   let second = null;
   let relaunch = null;
   let connection = null;
-  let nextPrimaryLine = null;
-  let nextRelaunchLine = null;
+  let nextPrimaryMessage = null;
+  let nextRelaunchMessage = null;
+  let secondMessageReader = null;
   let primaryQuitRequested = false;
   let relaunchQuitRequested = false;
   let credentialMayExist = false;
@@ -1126,15 +1270,15 @@ export async function runSmoke(progress) {
     if (!credentialMayExist || credentialDeleted) return;
     let liveAttempted = false;
     if (allowLiveControl) {
-      for (const [child, nextLine, quitRequested] of [
-        [relaunch, nextRelaunchLine, relaunchQuitRequested],
-        [primary, nextPrimaryLine, primaryQuitRequested],
+      for (const [child, nextMessage, quitRequested] of [
+        [relaunch, nextRelaunchMessage, relaunchQuitRequested],
+        [primary, nextPrimaryMessage, primaryQuitRequested],
       ]) {
         if (quitRequested || child === null || childExited(child)
-            || typeof nextLine !== "function") continue;
+            || typeof nextMessage !== "function") continue;
         liveAttempted = true;
         try {
-          await credentialCommand(child, nextLine, "credential-delete-v1");
+          await credentialCommand(child, nextMessage, "credential-delete-v1");
           credentialDeleted = true;
           credentialMayExist = false;
           return;
@@ -1158,14 +1302,14 @@ export async function runSmoke(progress) {
     const primaryPort = await freeTcpPort();
     primary = spawnPackagedElectron(executable, fixture, primaryPort, artifactRoot);
     if (!primary.pid) fail("WINDOWS_ELECTRON_SMOKE_PRIMARY_PID_MISSING");
-    nextPrimaryLine = controlReader(primary);
+    nextPrimaryMessage = controlReader(primary);
     failurePhase = "control";
     const initialState = await waitFor(
       () => {
         if (childExited(primary)) {
           fail("WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_CONTROL");
         }
-        return command(primary, nextPrimaryLine, "status-v1");
+        return command(primary, nextPrimaryMessage, "status-v1");
       },
       MAX_STARTUP_MS,
       "primary shell status",
@@ -1181,15 +1325,15 @@ export async function runSmoke(progress) {
     // Run the random-namespace probe first, then create the deterministic
     // credential that must survive the first process exit and relaunch.
     failurePhase = "credential";
-    await credentialCommand(primary, nextPrimaryLine, "credential-probe-v1");
+    await credentialCommand(primary, nextPrimaryMessage, "credential-probe-v1");
     credentialMayExist = true;
-    await credentialCommand(primary, nextPrimaryLine, "credential-create-v1");
+    await credentialCommand(primary, nextPrimaryMessage, "credential-create-v1");
 
     failurePhase = "lifecycle";
-    const hidden = await command(primary, nextPrimaryLine, "tray-hide-v1");
-    const shown = await command(primary, nextPrimaryLine, "tray-show-v1");
-    const toggledHidden = await command(primary, nextPrimaryLine, "tray-toggle-v1");
-    const toggledShown = await command(primary, nextPrimaryLine, "tray-toggle-v1");
+    const hidden = await command(primary, nextPrimaryMessage, "tray-hide-v1");
+    const shown = await command(primary, nextPrimaryMessage, "tray-show-v1");
+    const toggledHidden = await command(primary, nextPrimaryMessage, "tray-toggle-v1");
+    const toggledShown = await command(primary, nextPrimaryMessage, "tray-toggle-v1");
     if (!hidden.tray || hidden.visible || !shown.visible || !toggledHidden.tray
         || toggledHidden.visible || !toggledShown.visible) {
       fail("WINDOWS_ELECTRON_SMOKE_WINDOW_TRAY_LIFECYCLE_FAILED");
@@ -1205,9 +1349,9 @@ export async function runSmoke(progress) {
     failurePhase = "instance";
     const secondPort = await freeTcpPort();
     second = spawnPackagedElectron(executable, fixture, secondPort, artifactRoot);
-    const secondObservedLines = [];
-    controlReader(second, (line) => {
-      if (secondObservedLines.length < 32) secondObservedLines.push(line);
+    const secondObservedMessages = [];
+    secondMessageReader = controlReader(second, (message) => {
+      if (secondObservedMessages.length < 32) secondObservedMessages.push(message);
     }, false);
     const secondDescendantPids = new Set();
     const secondDescendantMonitor = monitorDescendantsUntilExit(
@@ -1220,7 +1364,7 @@ export async function runSmoke(progress) {
     try {
       primaryDuringSecond = await command(
         primary,
-        nextPrimaryLine,
+        nextPrimaryMessage,
         "status-v1",
         "WINDOWS_ELECTRON_SMOKE_INSTANCE_TIMEOUT",
       );
@@ -1232,6 +1376,7 @@ export async function runSmoke(progress) {
       );
     } finally {
       await terminateProcessTree(second);
+      secondMessageReader?.close?.();
       await secondDescendantMonitor;
       await secondEndpointMonitor;
     }
@@ -1242,14 +1387,14 @@ export async function runSmoke(progress) {
     if (second.exitCode !== 0 || second.signalCode !== null) {
       fail("WINDOWS_ELECTRON_SMOKE_SECOND_INSTANCE_NOT_REJECTED");
     }
-    for (const line of secondObservedLines) {
-      if (!line.startsWith("TIBOTATTLE_ELECTRON_SMOKE_STATE ")) continue;
-      const state = parseState(line);
+    for (const message of secondObservedMessages) {
+      if (message.message !== WINDOWS_ELECTRON_SMOKE_STATE_MESSAGE) continue;
+      const state = parseState(message);
       if (state.primary) fail("WINDOWS_ELECTRON_SMOKE_SECOND_INSTANCE_BECAME_PRIMARY");
     }
     const primaryAfterSecond = await command(
       primary,
-      nextPrimaryLine,
+      nextPrimaryMessage,
       "status-v1",
       "WINDOWS_ELECTRON_SMOKE_INSTANCE_TIMEOUT",
     );
@@ -1280,10 +1425,9 @@ export async function runSmoke(progress) {
     );
     primaryQuitRequested = true;
     try {
-      if (!primary.stdin?.write("quit-v1\n")) fail("WINDOWS_ELECTRON_SMOKE_QUIT_UNAVAILABLE");
-      await nextPrimaryLine(
-        (line) => line === "TIBOTATTLE_ELECTRON_SMOKE_QUIT_ACCEPTED",
-        "primary clean quit acknowledgement",
+      await quitCommand(
+        primary,
+        nextPrimaryMessage,
         "WINDOWS_ELECTRON_SMOKE_SHUTDOWN_TIMEOUT",
       );
       await withTimeout(
@@ -1316,14 +1460,14 @@ export async function runSmoke(progress) {
     const relaunchPort = await freeTcpPort();
     relaunch = spawnPackagedElectron(executable, fixture, relaunchPort, artifactRoot);
     if (!relaunch.pid) fail("WINDOWS_ELECTRON_SMOKE_RELAUNCH_PID_MISSING");
-    nextRelaunchLine = controlReader(relaunch);
+    nextRelaunchMessage = controlReader(relaunch);
     try {
       const state = await waitFor(
         () => {
           if (childExited(relaunch)) {
             fail("WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_CONTROL");
           }
-          return command(relaunch, nextRelaunchLine, "status-v1");
+          return command(relaunch, nextRelaunchMessage, "status-v1");
         },
         MAX_STARTUP_MS,
         "relaunch shell status",
@@ -1336,9 +1480,9 @@ export async function runSmoke(progress) {
       const relaunchDescendantPids = await captureDescendantPids(relaunch.pid);
       await verifyPersistentQualificationState(relaunched);
       progress.statePersistence = true;
-      await credentialCommand(relaunch, nextRelaunchLine, "credential-read-v1");
+      await credentialCommand(relaunch, nextRelaunchMessage, "credential-read-v1");
       relaunched.cdp.close();
-      await credentialCommand(relaunch, nextRelaunchLine, "credential-delete-v1");
+      await credentialCommand(relaunch, nextRelaunchMessage, "credential-delete-v1");
       credentialDeleted = true;
       credentialMayExist = false;
       progress.credentialPersistence = true;
@@ -1349,12 +1493,9 @@ export async function runSmoke(progress) {
       );
       relaunchQuitRequested = true;
       try {
-        if (!relaunch.stdin?.write("quit-v1\n")) {
-          fail("WINDOWS_ELECTRON_SMOKE_RELAUNCH_QUIT_UNAVAILABLE");
-        }
-        await nextRelaunchLine(
-          (line) => line === "TIBOTATTLE_ELECTRON_SMOKE_QUIT_ACCEPTED",
-          "relaunch clean quit acknowledgement",
+        await quitCommand(
+          relaunch,
+          nextRelaunchMessage,
           "WINDOWS_ELECTRON_SMOKE_RELAUNCH_TIMEOUT",
         );
         await withTimeout(
@@ -1391,6 +1532,9 @@ export async function runSmoke(progress) {
     throw error;
   } finally {
     await cleanupCredential({ allowLiveControl: true });
+    nextPrimaryMessage?.close?.();
+    nextRelaunchMessage?.close?.();
+    secondMessageReader?.close?.();
     connection?.cdp.close();
     await terminateProcessTree(second);
     await terminateProcessTree(primary);

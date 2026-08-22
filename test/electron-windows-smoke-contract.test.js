@@ -42,6 +42,13 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.doesNotMatch(source, /command\([^\n]+\)\.catch\(\(\) => null\)/u);
   assert.match(source, /shell: false/u);
   assert.match(source, /windowsHide: true/u);
+  assert.match(source, /stdio:\s*\["ignore",\s*"ignore",\s*"ignore",\s*"ipc"\]/u);
+  assert.match(source, /child\.send/u);
+  assert.match(source, /child\.on\?\.\("message"/u);
+  assert.match(source, /normalizeControlMessage/u);
+  assert.match(source, /exactKeys/u);
+  assert.match(source, /nextMessage\.close/u);
+  assert.doesNotMatch(source, /(?:primary|relaunch|second)\.(?:stdin|stdout)/u);
   assert.match(source, /--user-data-dir=/u);
   assert.match(source, /CLAUDE_CONFIG_DIR/u);
   assert.match(source, /CODEX_HOME/u);
@@ -70,16 +77,16 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /tray-show-v1/u);
   assert.match(source, /tray-toggle-v1/u);
   const credentialProbe = source.indexOf(
-    'credentialCommand(primary, nextPrimaryLine, "credential-probe-v1")',
+    'credentialCommand(primary, nextPrimaryMessage, "credential-probe-v1")',
   );
   const credentialCreate = source.indexOf(
-    'credentialCommand(primary, nextPrimaryLine, "credential-create-v1")',
+    'credentialCommand(primary, nextPrimaryMessage, "credential-create-v1")',
   );
   const credentialRead = source.indexOf(
-    'credentialCommand(relaunch, nextRelaunchLine, "credential-read-v1")',
+    'credentialCommand(relaunch, nextRelaunchMessage, "credential-read-v1")',
   );
   const credentialDelete = source.indexOf(
-    'credentialCommand(relaunch, nextRelaunchLine, "credential-delete-v1")',
+    'credentialCommand(relaunch, nextRelaunchMessage, "credential-delete-v1")',
   );
   assert.ok(credentialProbe >= 0 && credentialCreate > credentialProbe);
   assert.ok(credentialRead > credentialCreate && credentialDelete > credentialRead);
@@ -96,9 +103,9 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   const secondMonitor = source.indexOf("const secondDescendantMonitor");
   const secondExit = source.indexOf("childExitPromise(second)");
   const primaryMonitor = source.indexOf("const primaryDescendantMonitor");
-  const primaryQuit = source.indexOf('primary.stdin?.write("quit-v1\\n")');
+  const primaryQuit = source.indexOf("await quitCommand(\n        primary,");
   const relaunchMonitor = source.indexOf("const relaunchDescendantMonitor");
-  const relaunchQuit = source.indexOf('relaunch.stdin?.write("quit-v1\\n")');
+  const relaunchQuit = source.indexOf("await quitCommand(\n          relaunch,");
   assert.ok(secondMonitor >= 0 && secondExit > secondMonitor);
   assert.ok(primaryMonitor >= 0 && primaryQuit > primaryMonitor);
   assert.ok(relaunchMonitor >= 0 && relaunchQuit > relaunchMonitor);
@@ -129,7 +136,14 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /aggregate\("unsupported"\)/u);
   assert.doesNotMatch(source, /windowsProductionReady\s*:\s*true/u);
   assert.match(entry, /WINDOWS_ELECTRON_SMOKE_CONTROL/u);
-  assert.match(entry, /stdin/u);
+  assert.match(entry, /messageSource\.on\("message"/u);
+  assert.match(entry, /sendControlMessage/u);
+  assert.match(entry, /sendControlMessage\.call\([\s\S]*callback/u);
+  assert.match(entry, /installWindowsSmokeControlForTest/u);
+  assert.match(entry, /credentialProbe/u);
+  assert.match(entry, /credentialCommand/u);
+  assert.match(entry, /disconnect/u);
+  assert.doesNotMatch(entry, /process\.(?:stdin|stdout)/u);
   assert.match(entry, /credential-probe-v1/u);
   assert.match(entry, /credential-create-v1/u);
   assert.match(entry, /credential-read-v1/u);

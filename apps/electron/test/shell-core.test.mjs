@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
@@ -23,6 +24,8 @@ import {
 } from "../desktop-lifecycle.js";
 import {
   assertElectronQualificationLaunchOptions,
+  installWindowsSmokeControl,
+  installWindowsSmokeControlForTest,
   launchElectronShell,
 } from "../main.js";
 import {
@@ -56,6 +59,24 @@ const WINDOWS_KEYTAR_PATH = require.resolve(
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function nextTick() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+async function withTestTimeout(promise, code) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(code)), 5_000);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 async function withWindowsQualificationFixture(run) {
@@ -614,6 +635,379 @@ test("Windows qualification context is branded, content-free, and accepted only 
       errorCode("windows_readiness_unavailable"),
     );
   });
+});
+
+test("Windows smoke control is qualification-only Node IPC with bounded cleanup", async () => {
+  await withWindowsQualificationFixture(async ({ context, environment }) => {
+    const source = new EventEmitter();
+    const sent = [];
+    let quitCalls = 0;
+    const lifecycle = {
+      state: {
+        started: true,
+        primaryInstance: true,
+        hasWindow: true,
+        windowVisible: false,
+        hasTray: true,
+      },
+      invokeTrayCommand(command) {
+        assert.equal(command, "show");
+        this.state.windowVisible = true;
+      },
+      requestQuit() {
+        quitCalls += 1;
+      },
+    };
+    const qualifiedEnvironment = {
+      ...environment,
+      USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "windows-v1",
+      USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID: "550e8400-e29b-41d4-a716-446655440000",
+    };
+    const cleanup = installWindowsSmokeControl(lifecycle, {
+      platform: "win32",
+      environment: qualifiedEnvironment,
+      messageSource: source,
+      sendMessage(message, callback) {
+        sent.push(message);
+        callback?.();
+      },
+      qualificationContext: context,
+    });
+    assert.equal(source.listenerCount("message"), 1);
+    assert.equal(source.listenerCount("disconnect"), 1);
+    source.emit("message", {
+      type: "windows-electron-smoke-v1",
+      message: "command-v1",
+      command: "status-v1",
+    });
+    source.emit("message", {
+      type: "windows-electron-smoke-v1",
+      message: "command-v1",
+      command: "tray-show-v1",
+    });
+    source.emit("message", {
+      type: "windows-electron-smoke-v1",
+      message: "command-v1",
+      command: "status-v1",
+      extra: "reject",
+    });
+    source.emit("message", {
+      type: "windows-electron-smoke-v1",
+      message: "command-v1",
+      command: "unknown-v1",
+    });
+    source.emit("message", "status-v1");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(sent.length, 2);
+    assert.equal(Object.isFrozen(sent[0]), true);
+    assert.deepEqual(sent[0], {
+      type: "windows-electron-smoke-v1",
+      message: "state-v1",
+      started: true,
+      primary: true,
+      window: true,
+      visible: false,
+      tray: true,
+    });
+    assert.deepEqual(sent[1], {
+      type: "windows-electron-smoke-v1",
+      message: "state-v1",
+      started: true,
+      primary: true,
+      window: true,
+      visible: true,
+      tray: true,
+    });
+    source.emit("message", {
+      type: "windows-electron-smoke-v1",
+      message: "command-v1",
+      command: "quit-v1",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(quitCalls, 1);
+    assert.equal(source.listenerCount("message"), 0);
+    assert.equal(source.listenerCount("disconnect"), 0);
+    source.emit("message", {
+      type: "windows-electron-smoke-v1",
+      message: "command-v1",
+      command: "status-v1",
+    });
+    assert.equal(sent.length, 3);
+    cleanup();
+
+    const unqualifiedSource = new EventEmitter();
+    const unqualifiedSent = [];
+    const unqualifiedCleanup = installWindowsSmokeControl(lifecycle, {
+      platform: "win32",
+      environment,
+      messageSource: unqualifiedSource,
+      sendMessage: (message) => unqualifiedSent.push(message),
+      qualificationContext: context,
+    });
+    assert.equal(unqualifiedSource.listenerCount("message"), 0);
+    unqualifiedSource.emit("message", {
+      type: "windows-electron-smoke-v1",
+      message: "command-v1",
+      command: "status-v1",
+    });
+    assert.deepEqual(unqualifiedSent, []);
+    unqualifiedCleanup();
+  });
+});
+
+test("Windows smoke IPC maps every credential operation to a fixed result", async () => {
+  await withWindowsQualificationFixture(async ({ context, environment }) => {
+    const source = new EventEmitter();
+    const sent = [];
+    const callbacks = [];
+    const operations = [];
+    const lifecycle = {
+      state: {
+        started: true,
+        primaryInstance: true,
+        hasWindow: true,
+        windowVisible: false,
+        hasTray: true,
+      },
+    };
+    const qualifiedEnvironment = {
+      ...environment,
+      USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "windows-v1",
+      USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID: "550e8400-e29b-41d4-a716-446655440000",
+    };
+    const cleanup = installWindowsSmokeControlForTest(lifecycle, {
+      platform: "win32",
+      environment: qualifiedEnvironment,
+      messageSource: source,
+      sendMessage(message, callback) {
+        sent.push(message);
+        callbacks.push(callback);
+        return false;
+      },
+      credentialProbe(receivedContext) {
+        assert.equal(receivedContext, context);
+        operations.push("probe-v1");
+      },
+      credentialCommand({ context: receivedContext, command, runId }) {
+        assert.equal(receivedContext, context);
+        assert.equal(runId, qualifiedEnvironment.USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID);
+        operations.push(command);
+      },
+      qualificationContext: context,
+    });
+    for (const [command, operation] of [
+      ["credential-probe-v1", "probe-v1"],
+      ["credential-create-v1", "create-v1"],
+      ["credential-read-v1", "read-v1"],
+      ["credential-delete-v1", "delete-v1"],
+    ]) {
+      source.emit("message", {
+        type: "windows-electron-smoke-v1",
+        message: "command-v1",
+        command,
+      });
+      await nextTick();
+      assert.equal(typeof callbacks.at(-1), "function");
+      assert.deepEqual(sent.at(-1), {
+        type: "windows-electron-smoke-v1",
+        message: "credential-v1",
+        operation,
+        status: "passed-v1",
+      });
+      // Simulate a sender reporting an asynchronous channel error after
+      // returning false for backpressure. The control handler must consume it.
+      callbacks.at(-1)(new Error("ERR_IPC_CHANNEL_CLOSED"));
+    }
+    assert.deepEqual(operations, ["probe-v1", "create-v1", "read-v1", "delete-v1"]);
+    cleanup();
+    assert.equal(source.listenerCount("message"), 0);
+    assert.equal(source.listenerCount("disconnect"), 0);
+  });
+});
+
+test("Windows smoke IPC drops in-flight credential replies after disconnect", async () => {
+  await withWindowsQualificationFixture(async ({ context, environment }) => {
+    const source = new EventEmitter();
+    const sent = [];
+    const qualifiedEnvironment = {
+      ...environment,
+      USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "windows-v1",
+      USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID: "550e8400-e29b-41d4-a716-446655440000",
+    };
+    let resolveCredential;
+    let credentialStarted;
+    const credentialStartedPromise = new Promise((resolve) => {
+      credentialStarted = resolve;
+    });
+    const credentialPending = new Promise((resolve) => {
+      resolveCredential = resolve;
+    });
+    const cleanup = installWindowsSmokeControlForTest({
+      state: {
+        started: true,
+        primaryInstance: true,
+        hasWindow: true,
+        windowVisible: false,
+        hasTray: true,
+      },
+    }, {
+      platform: "win32",
+      environment: qualifiedEnvironment,
+      messageSource: source,
+      sendMessage(message, callback) {
+        sent.push(message);
+        callback?.();
+      },
+      credentialProbe: async () => {},
+      async credentialCommand() {
+        credentialStarted();
+        await credentialPending;
+      },
+      qualificationContext: context,
+    });
+    source.emit("message", {
+      type: "windows-electron-smoke-v1",
+      message: "command-v1",
+      command: "credential-create-v1",
+    });
+    await credentialStartedPromise;
+    assert.equal(source.listenerCount("message"), 1);
+    source.emit("disconnect");
+    assert.equal(source.listenerCount("message"), 0);
+    assert.equal(source.listenerCount("disconnect"), 0);
+    resolveCredential();
+    await nextTick();
+    assert.deepEqual(sent, []);
+    cleanup();
+  });
+});
+
+test("Windows smoke IPC fails closed without a connected sender and orders quit after ack", async () => {
+  await withWindowsQualificationFixture(async ({ context, environment }) => {
+    const qualifiedEnvironment = {
+      ...environment,
+      USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "windows-v1",
+      USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID: "550e8400-e29b-41d4-a716-446655440000",
+    };
+    const makeLifecycle = () => ({
+      state: {
+        started: true,
+        primaryInstance: true,
+        hasWindow: true,
+        windowVisible: false,
+        hasTray: true,
+      },
+      quitCalls: 0,
+      requestQuit() {
+        this.quitCalls += 1;
+      },
+    });
+    const source = new EventEmitter();
+    const lifecycle = makeLifecycle();
+    const sent = [];
+    let quitAcknowledgement = null;
+    const cleanup = installWindowsSmokeControl(lifecycle, {
+      platform: "win32",
+      environment: qualifiedEnvironment,
+      messageSource: source,
+      sendMessage(message, callback) {
+        sent.push(message);
+        if (message.message === "quit-v1") quitAcknowledgement = callback;
+        else callback?.(new Error("ERR_IPC_CHANNEL_CLOSED"));
+        return false;
+      },
+      qualificationContext: context,
+    });
+    source.emit("message", {
+      type: "windows-electron-smoke-v1",
+      message: "command-v1",
+      command: "quit-v1",
+    });
+    await nextTick();
+    assert.equal(typeof quitAcknowledgement, "function");
+    assert.equal(lifecycle.quitCalls, 0);
+    assert.equal(source.listenerCount("message"), 1);
+    quitAcknowledgement();
+    await nextTick();
+    assert.equal(lifecycle.quitCalls, 1);
+    assert.equal(source.listenerCount("message"), 0);
+    assert.equal(source.listenerCount("disconnect"), 0);
+    assert.deepEqual(sent, [{
+      type: "windows-electron-smoke-v1",
+      message: "quit-v1",
+      status: "accepted-v1",
+    }]);
+    cleanup();
+
+    const disconnectedSource = new EventEmitter();
+    disconnectedSource.connected = false;
+    const disconnectedCleanup = installWindowsSmokeControl(lifecycle, {
+      platform: "win32",
+      environment: qualifiedEnvironment,
+      messageSource: disconnectedSource,
+      sendMessage() {
+        throw new Error("must not send");
+      },
+      qualificationContext: context,
+    });
+    assert.equal(disconnectedSource.listenerCount("message"), 0);
+    disconnectedCleanup();
+
+    const missingSenderSource = new EventEmitter();
+    const missingSenderCleanup = installWindowsSmokeControl(lifecycle, {
+      platform: "win32",
+      environment: qualifiedEnvironment,
+      messageSource: missingSenderSource,
+      qualificationContext: context,
+    });
+    assert.equal(missingSenderSource.listenerCount("message"), 0);
+    missingSenderCleanup();
+  });
+});
+
+test("Node child-process IPC roundtrip uses the portable ignored-stdio contract", async () => {
+  const childSource = [
+    "process.on('message', (message) => {",
+    "  if (message !== 'ping-v1') return;",
+    "  process.send?.('pong-v1', () => process.disconnect?.());",
+    "});",
+    "process.send?.('ready-v1');",
+  ].join("\n");
+  const child = spawn(process.execPath, ["-e", childSource], {
+    stdio: ["ignore", "ignore", "ignore", "ipc"],
+    windowsHide: true,
+  });
+  const messages = [];
+  let sendError = null;
+  let exit;
+  const exited = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      exit = { code, signal };
+      resolve();
+    });
+  });
+  const received = new Promise((resolve, reject) => {
+    child.on("message", (message) => {
+      messages.push(message);
+      if (message === "ready-v1") {
+        child.send("ping-v1", (error) => {
+          sendError = error ?? null;
+        });
+      }
+      if (message === "pong-v1") resolve();
+    });
+    child.once("error", reject);
+  });
+  try {
+    await withTestTimeout(received, "IPC roundtrip timeout");
+    await withTestTimeout(exited, "IPC child exit timeout");
+  } finally {
+    if (exit === undefined) child.kill();
+  }
+  assert.equal(sendError, null);
+  assert.deepEqual(messages, ["ready-v1", "pong-v1"]);
+  assert.deepEqual(exit, { code: 0, signal: null });
 });
 
 test("Windows qualification forbids launch-path and supervisor overrides", async () => {
