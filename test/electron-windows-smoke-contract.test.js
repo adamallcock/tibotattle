@@ -3,7 +3,10 @@ import { readFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 
-import { aggregate } from "../scripts/smoke-electron-windows.mjs";
+import {
+  aggregate,
+  waitFor,
+} from "../scripts/smoke-electron-windows.mjs";
 
 test("Windows Electron smoke is packaged, x64-only, and content-free", async () => {
   const source = await readFile("scripts/smoke-electron-windows.mjs", "utf8");
@@ -20,6 +23,9 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /process\.arch !== "x64"/u);
   assert.match(source, /0x8664/u);
   assert.match(source, /WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_CONTROL/u);
+  assert.match(source, /isTerminalSmokeError/u);
+  assert.match(source, /if \(isTerminalSmokeError\(error\)\) throw error/u);
+  assert.doesNotMatch(source, /command\([^\n]+\)\.catch\(\(\) => null\)/u);
   assert.match(source, /shell: false/u);
   assert.match(source, /windowsHide: true/u);
   assert.match(source, /--user-data-dir=/u);
@@ -153,6 +159,32 @@ test("failed Windows Electron smoke preserves completed closed-schema progress",
   });
   assert.equal(Object.hasOwn(failed, "secret"), false);
   assert.equal(progress.artifact, true);
+});
+
+test("waitFor fails fast for terminal smoke errors and retries transient misses", async () => {
+  let terminalCalls = 0;
+  await assert.rejects(
+    waitFor(() => {
+      terminalCalls += 1;
+      const error = new Error("closed child");
+      error.code = "WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_CONTROL";
+      throw error;
+    }, 5_000, "terminal smoke"),
+    (error) => {
+      assert.equal(error.code, "WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_CONTROL");
+      return true;
+    },
+  );
+  assert.equal(terminalCalls, 1);
+
+  let transientCalls = 0;
+  const recovered = await waitFor(() => {
+    transientCalls += 1;
+    if (transientCalls < 2) throw new Error("debugging endpoint not ready");
+    return "ready";
+  }, 5_000, "transient smoke");
+  assert.equal(recovered, "ready");
+  assert.equal(transientCalls, 2);
 });
 
 test("non-Windows Electron smoke reports unsupported rather than success", () => {
