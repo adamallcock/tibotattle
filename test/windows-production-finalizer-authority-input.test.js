@@ -23,6 +23,7 @@ import {
   buildWindowsProductionFinalizerAuthorityInput,
   parseWindowsProductionFinalizerAuthorityInputArguments,
   serializeWindowsProductionFinalizerAuthorityInput,
+  normalizeWindowsFinalizerStatIdentity,
   writeWindowsProductionFinalizerAuthorityInput,
 } from "../scripts/build-windows-production-finalizer-authority-input.mjs";
 import {
@@ -395,6 +396,19 @@ function expectCode(code) {
     return true;
   };
 }
+
+test("preserves adjacent Windows file identities above JavaScript safe integer range", () => {
+  const first = BigInt(Number.MAX_SAFE_INTEGER) + 2n;
+  const second = first + 1n;
+  assert.equal(normalizeWindowsFinalizerStatIdentity(first), first);
+  assert.equal(normalizeWindowsFinalizerStatIdentity(second), second);
+  assert.notEqual(
+    normalizeWindowsFinalizerStatIdentity(first),
+    normalizeWindowsFinalizerStatIdentity(second),
+  );
+  assert.equal(normalizeWindowsFinalizerStatIdentity(Number(first)), null);
+  assert.equal(normalizeWindowsFinalizerStatIdentity(-1n), null);
+});
 
 test("derives driver facts and matches the direct authority builder", async (t) => {
   const value = await fixture();
