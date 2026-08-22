@@ -3,6 +3,8 @@ import { readFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 
+import { aggregate } from "../scripts/smoke-electron-windows.mjs";
+
 test("Windows Electron smoke is packaged, x64-only, and content-free", async () => {
   const source = await readFile("scripts/smoke-electron-windows.mjs", "utf8");
   const entry = await readFile("apps/electron/main.js", "utf8");
@@ -17,6 +19,7 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /process\.platform !== "win32"/u);
   assert.match(source, /process\.arch !== "x64"/u);
   assert.match(source, /0x8664/u);
+  assert.match(source, /WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_CONTROL/u);
   assert.match(source, /shell: false/u);
   assert.match(source, /windowsHide: true/u);
   assert.match(source, /--user-data-dir=/u);
@@ -83,7 +86,7 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /second instance descendant cleanup/u);
   assert.match(source, /requireNonEmpty: false/u);
   assert.match(source, /table\.has\(pid\)/u);
-  assert.doesNotMatch(source, /result\.noOrphan\s*=\s*true/u);
+  assert.doesNotMatch(source, /progress\.noOrphan\s*=\s*true/u);
   const primaryOrphanCheck = source.indexOf(
     '"primary descendant cleanup"',
   );
@@ -91,7 +94,7 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
     '"relaunch descendant cleanup"',
   );
   const noOrphanAssignment = source.indexOf(
-    "result.noOrphan = primaryNoOrphan && relaunchNoOrphan",
+    "progress.noOrphan = primaryNoOrphan && relaunchNoOrphan",
   );
   assert.ok(primaryOrphanCheck >= 0 && relaunchOrphanCheck >= 0);
   assert.ok(noOrphanAssignment > primaryOrphanCheck);
@@ -121,6 +124,35 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(qualification, /runWindowsElectronQualificationCredentialCommandForTest/u);
   assert.match(qualification, /windows-qualification/u);
   assert.doesNotMatch(qualification, /console\.(?:log|error|warn)/u);
+});
+
+test("failed Windows Electron smoke preserves completed closed-schema progress", () => {
+  const progress = {
+    artifact: true,
+    dashboardReady: true,
+    syntheticRefresh: false,
+    credentialPersistence: false,
+    secret: "must not cross the aggregate boundary",
+  };
+  const failed = aggregate("failed", progress);
+
+  assert.deepEqual(failed, {
+    status: "failed",
+    target: "win32-x64",
+    contentFree: true,
+    artifact: true,
+    dashboardReady: true,
+    syntheticRefresh: false,
+    secondInstanceRejected: false,
+    showHideTrayLifecycle: false,
+    cleanQuit: false,
+    noOrphan: false,
+    statePersistence: false,
+    credentialPersistence: false,
+    relaunchPersistence: false,
+  });
+  assert.equal(Object.hasOwn(failed, "secret"), false);
+  assert.equal(progress.artifact, true);
 });
 
 test("non-Windows Electron smoke reports unsupported rather than success", () => {
