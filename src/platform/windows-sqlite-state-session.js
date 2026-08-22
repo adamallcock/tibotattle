@@ -5,6 +5,9 @@ import {
   isWindowsFilesystemAdapter,
   isWindowsFilesystemIdentity,
 } from "./windows-filesystem.js";
+import {
+  isWindowsQualificationModeContextFor,
+} from "./windows-qualification-mode.js";
 
 /**
  * A single protected SQLite connection for Windows-owned application state.
@@ -286,6 +289,54 @@ function assertAdapter(adapter, { requireSqliteLeaseSafe }) {
   return adapter;
 }
 
+function qualificationRootContains(rootPath, stateRoot) {
+  if (typeof rootPath !== "string" || typeof stateRoot !== "string") return false;
+  try {
+    const selectedRoot = win32.normalize(rootPath.replaceAll("/", "\\"));
+    const selectedStateRoot = win32.normalize(stateRoot.replaceAll("/", "\\"));
+    const prefix = selectedStateRoot.endsWith("\\")
+      ? selectedStateRoot
+      : `${selectedStateRoot}\\`;
+    return selectedRoot.toLowerCase() === selectedStateRoot.toLowerCase()
+      || selectedRoot.toLowerCase().startsWith(prefix.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+function assertQualificationBoundary({
+  context,
+  adapter,
+  rootPath,
+  resourceRoot,
+}) {
+  if (context === null
+      || !isWindowsQualificationModeContextFor({
+        context,
+        adapter,
+        // The branded context's state root is the exact root binding. The
+        // explicit resource root is supplied independently by the caller so
+        // a copied or self-validating context cannot authorize a session.
+        stateRoot: context?.stateRoot,
+        resourceRoot,
+      })
+      || context.qualificationOnly !== true
+      || context.productionSafe !== false
+      || !qualificationRootContains(rootPath, context.stateRoot)) {
+    fail("invalid_adapter");
+  }
+  try {
+    if (adapter.productionSafe !== false
+        || adapter.pathWalkRaceSafe !== false
+        || adapter.sqliteStateLeaseSafe !== false) {
+      fail("invalid_adapter");
+    }
+  } catch (error) {
+    if (isWindowsSqliteStateSessionError(error)) throw error;
+    fail("invalid_adapter");
+  }
+}
+
 function validateDatabaseMetadata(metadata) {
   let valid = false;
   try {
@@ -536,8 +587,8 @@ function databaseInTransaction(database) {
  *
  * `platform` and `architecture` are injectable only so macOS contract tests
  * can exercise the Windows composition.  A simulated win32 session never
- * reports productionSafe=true; real Windows additionally requires the
- * branded adapter's sqliteStateLeaseSafe qualification bit.
+ * reports productionSafe=true; a real Windows session requires either the
+ * production-qualified lease bit or the exact branded qualification context.
  */
 export function createWindowsSqliteStateSession({
   platform = process.platform,
@@ -546,6 +597,8 @@ export function createWindowsSqliteStateSession({
   rootPath,
   databaseName,
   databaseFactory = null,
+  windowsQualificationModeContext = null,
+  windowsQualificationResourceRoot = null,
 } = {}) {
   normalizedPlatform(platform);
   normalizedArchitecture(architecture);
@@ -563,14 +616,29 @@ export function createWindowsSqliteStateSession({
   if (process.platform === "win32" && databaseFactory !== null) {
     fail("invalid_configuration");
   }
+  const qualificationMode = windowsQualificationModeContext !== null;
   const selectedAdapter = assertAdapter(adapter, {
     // The macOS test loop may simulate win32 with the qualification-only
-    // adapter. A real Windows process cannot open a session until the native
-    // lease bit is positively qualified.
-    requireSqliteLeaseSafe: process.platform === "win32",
+    // adapter. A real Windows process cannot open an unqualified session
+    // unless the exact branded qualification context is present.
+    requireSqliteLeaseSafe: process.platform === "win32" && !qualificationMode,
   });
   const root = canonicalRoot(rootPath);
   const name = canonicalDatabaseName(databaseName);
+  if (qualificationMode) {
+    assertQualificationBoundary({
+      context: windowsQualificationModeContext,
+      adapter: selectedAdapter,
+      rootPath: root,
+      resourceRoot: windowsQualificationResourceRoot,
+    });
+    // Qualification mode is an explicit disposable test lane. It never
+    // changes the session's productionSafe/readiness result.
+    if (process.platform === "win32"
+        && (process.arch !== "x64" || architecture !== "x64")) {
+      fail("unsupported_architecture");
+    }
+  }
   const path = databasePath(root, name);
   const expectedRootIdentity = inspectRoot(selectedAdapter, root);
 

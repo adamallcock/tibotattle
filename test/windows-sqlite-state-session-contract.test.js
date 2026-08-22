@@ -597,6 +597,46 @@ test("forged/copied adapters, downgraded platforms, weak roots, and unsafe archi
   );
 });
 
+test("native-shaped qualification construction rejects absent or copied context", () => {
+  const fixture = createFixture();
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  const originalArchitecture = Object.getOwnPropertyDescriptor(process, "arch");
+  Object.defineProperty(process, "platform", {
+    ...originalPlatform,
+    value: "win32",
+  });
+  Object.defineProperty(process, "arch", {
+    ...originalArchitecture,
+    value: "x64",
+  });
+  try {
+    const nativeOptions = sessionOptions(fixture, null, {
+      databaseFactory: null,
+      windowsQualificationResourceRoot:
+        "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\resources",
+    });
+    assert.throws(
+      () => createWindowsSqliteStateSession(nativeOptions),
+      assertSessionError("invalid_adapter"),
+    );
+    assert.throws(
+      () => createWindowsSqliteStateSession({
+        ...nativeOptions,
+        windowsQualificationModeContext: Object.freeze({
+          contractVersion: "windows-qualification-mode-v1",
+          qualificationOnly: true,
+          productionSafe: false,
+          stateRoot: ROOT,
+        }),
+      }),
+      assertSessionError("invalid_adapter"),
+    );
+  } finally {
+    Object.defineProperty(process, "platform", originalPlatform);
+    Object.defineProperty(process, "arch", originalArchitecture);
+  }
+});
+
 test("simulated win32 can exercise injected qualification plumbing but never mints production safety", () => {
   const fixture = createFixture();
   const database = createDatabase({ calls: [] });

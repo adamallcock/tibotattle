@@ -18,6 +18,7 @@ import {
 import {
   assertWindowsFilesystemProductionSafe,
   isWindowsFilesystemAdapter,
+  isWindowsQualificationModeContextFor,
   withLocalCollectorStateSessionBoundary,
 } from "./platform/index.js";
 
@@ -387,7 +388,12 @@ function fixedWindowsCollectorStateUnavailable() {
   return error;
 }
 
-function assertWindowsCollectorFilesystemBoundary(adapter) {
+function assertWindowsCollectorFilesystemBoundary({
+  adapter,
+  windowsQualificationModeContext = null,
+  stateRoot = null,
+  resourceRoot = null,
+} = {}) {
   if (process.platform === "win32" && adapter === null) {
     throw fixedWindowsCollectorStateUnavailable();
   }
@@ -398,6 +404,25 @@ function assertWindowsCollectorFilesystemBoundary(adapter) {
   // state/JOURNAL/WAL sidecars are qualified.
   if (!isWindowsFilesystemAdapter(adapter)) {
     throw fixedWindowsCollectorStateUnavailable();
+  }
+  if (windowsQualificationModeContext !== null) {
+    let qualificationBinding = false;
+    try {
+      qualificationBinding = isWindowsQualificationModeContextFor({
+        context: windowsQualificationModeContext,
+        adapter,
+        stateRoot,
+        resourceRoot,
+      }) === true
+        && windowsQualificationModeContext.qualificationOnly === true
+        && windowsQualificationModeContext.productionSafe === false
+        && adapter.productionSafe === false
+        && adapter.sqliteStateLeaseSafe === false;
+    } catch {
+      qualificationBinding = false;
+    }
+    if (!qualificationBinding) throw fixedWindowsCollectorStateUnavailable();
+    return;
   }
   try {
     assertWindowsFilesystemProductionSafe(adapter);
@@ -882,6 +907,12 @@ export function createLocalCollectorRefreshRunner({
   // is qualification-only plumbing until sqliteStateLeaseSafe is true; the
   // current production refresh remains fail-closed on Windows.
   windowsSqliteStateSessionFactory = null,
+  // The qualification context is a capability, not a readiness override. It
+  // is independently checked against the adapter and roots before it enters
+  // the collector boundary; production continues through the assertion above.
+  windowsQualificationModeContext = null,
+  stateRoot = null,
+  resourceRoot = null,
   windowsSqliteStateStaging = null,
   selectAccountObservationSecret = selectProductionAccountObservationSecret,
   runCollector = runCollectorOnce,
@@ -1010,7 +1041,12 @@ export function createLocalCollectorRefreshRunner({
     // Validate the optional native boundary before recording a refresh receipt
     // or invoking the collector. The current SQLite state path still creates
     // journal/WAL/SHM sidecars that are not covered by the Windows adapter.
-    assertWindowsCollectorFilesystemBoundary(windowsFilesystemAdapter);
+    assertWindowsCollectorFilesystemBoundary({
+      adapter: windowsFilesystemAdapter,
+      windowsQualificationModeContext,
+      stateRoot,
+      resourceRoot,
+    });
     // A refresh failure that reaches the app collapses to one generic code,
     // and companion stderr is deliberately discarded. Stamp every escaping
     // error with the pipeline step it left from, so the refresh status can
@@ -1027,6 +1063,9 @@ export function createLocalCollectorRefreshRunner({
       return await withLocalCollectorStateSessionBoundary({
         windowsFilesystemAdapter,
         windowsSqliteStateSessionFactory,
+        windowsQualificationModeContext,
+        stateRoot,
+        resourceRoot,
       }, async () => {
     // Legacy is an explicit rollback authority, never an error fallback. Stamp
     // the attempted use before any collector/accounting work so a later
