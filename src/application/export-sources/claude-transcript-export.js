@@ -36,7 +36,15 @@ const CLAUDE_TRANSCRIPT_SOURCE_CURSOR_VERSION = "claude-transcript-export-cursor
 const CLAUDE_TRANSCRIPT_USAGE_CANDIDATE_VERSION = "claude-transcript-usage-candidate-v0.2";
 const CLAUDE_TRANSCRIPT_PLAN_CHECKPOINT_VERSION = "claude-transcript-plan-checkpoint-v0.1";
 
-const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
+// Windows file IDs are 64-bit values.  Node's ordinary Stats projection can
+// round those values when it exposes them as Numbers, so use the bigint
+// projection at every identity boundary on Windows.  O_NOFOLLOW is a POSIX
+// flag and is not a portable Windows open flag; Windows relies on the
+// descriptor/path identity checks below instead.
+const NOFOLLOW = platform === "win32" ? 0 : (constants.O_NOFOLLOW ?? 0);
+const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+const MAX_STAT_IDENTITY_BIGINT = (1n << 64n) - 1n;
+const DECIMAL_IDENTITY_PATTERN = /^(?:0|[1-9][0-9]*)$/u;
 const MAXIMUM_SESSION_ID_BYTES = 4096;
 const SAFE_CODES = new Set([
   "configuration", "root_unsafe", "source_unsafe", "source_changed", "source_prefix",
@@ -54,6 +62,91 @@ class ClaudeTranscriptExportSourceError extends Error {
 
 function fail(code) {
   throw new ClaudeTranscriptExportSourceError(code);
+}
+
+function normalizeStatCount(value, code = "source_changed") {
+  if (typeof value === "bigint") {
+    if (value < 0n || value > MAX_SAFE_INTEGER_BIGINT) fail(code);
+    return Number(value);
+  }
+  if (!Number.isSafeInteger(value) || value < 0) fail(code);
+  return value;
+}
+
+function normalizeStatMilliseconds(value, code = "source_changed") {
+  if (typeof value === "bigint") {
+    if (value < 0n || value > MAX_SAFE_INTEGER_BIGINT) fail(code);
+    return Number(value);
+  }
+  if (!Number.isFinite(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) fail(code);
+  return Math.trunc(value);
+}
+
+function normalizeStatIdentity(value, code = "source_changed") {
+  if (typeof value === "bigint") {
+    if (value < 0n || value > MAX_STAT_IDENTITY_BIGINT) fail(code);
+    return value <= MAX_SAFE_INTEGER_BIGINT ? Number(value) : value.toString(10);
+  }
+  // An unsafe Number has already lost bits and cannot be safely serialized or
+  // compared.  Callers must request the bigint Stats projection instead.
+  if (!Number.isSafeInteger(value) || value < 0) fail(code);
+  return value;
+}
+
+function canonicalStatIdentity(value) {
+  if (typeof value === "bigint") {
+    return value >= 0n && value <= MAX_STAT_IDENTITY_BIGINT ? value.toString(10) : null;
+  }
+  if (Number.isSafeInteger(value) && value >= 0
+      && BigInt(value) <= MAX_STAT_IDENTITY_BIGINT) return String(value);
+  if (typeof value === "string" && DECIMAL_IDENTITY_PATTERN.test(value)) {
+    try {
+      const parsed = BigInt(value);
+      return parsed <= MAX_STAT_IDENTITY_BIGINT ? parsed.toString(10) : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function validStatIdentity(value) {
+  return canonicalStatIdentity(value) !== null;
+}
+
+function normalizeStats(stats, code = "source_changed") {
+  if (!stats || typeof stats !== "object"
+      || typeof stats.isDirectory !== "function"
+      || typeof stats.isFile !== "function"
+      || typeof stats.isSymbolicLink !== "function") {
+    fail(code);
+  }
+  return {
+    dev: normalizeStatIdentity(stats.dev, code),
+    ino: normalizeStatIdentity(stats.ino, code),
+    birthtimeMs: normalizeStatMilliseconds(stats.birthtimeMs, code),
+    size: normalizeStatCount(stats.size, code),
+    mode: normalizeStatCount(stats.mode, code),
+    uid: normalizeStatCount(stats.uid, code),
+    nlink: normalizeStatCount(stats.nlink, code),
+    isDirectory: () => stats.isDirectory(),
+    isFile: () => stats.isFile(),
+    isSymbolicLink: () => stats.isSymbolicLink(),
+  };
+}
+
+async function statPath(path, code = "source_changed") {
+  const stats = platform === "win32"
+    ? await lstat(path, { bigint: true })
+    : await lstat(path);
+  return normalizeStats(stats, code);
+}
+
+async function statHandle(handle, code = "source_changed") {
+  const stats = platform === "win32"
+    ? await handle.stat({ bigint: true })
+    : await handle.stat();
+  return normalizeStats(stats, code);
 }
 
 function canonicalIso(value) {
@@ -139,7 +232,8 @@ function assertSafeFile(stats) {
 }
 
 function sameIdentity(stats, source) {
-  return stats.dev === source.device && stats.ino === source.inode
+  return canonicalStatIdentity(stats.dev) === canonicalStatIdentity(source.device)
+    && canonicalStatIdentity(stats.ino) === canonicalStatIdentity(source.inode)
     && Math.trunc(stats.birthtimeMs) === source.birthtimeMs;
 }
 
@@ -147,12 +241,16 @@ async function openSafeFile(path, expected = null) {
   let before;
   let handle;
   try {
-    before = await lstat(path);
+    before = await statPath(path);
     assertSafeFile(before);
     handle = await open(path, constants.O_RDONLY | NOFOLLOW);
-    const opened = await handle.stat();
+    const opened = await statHandle(handle);
     assertSafeFile(opened);
-    if (opened.dev !== before.dev || opened.ino !== before.ino
+    if (!sameIdentity(opened, {
+      device: before.dev,
+      inode: before.ino,
+      birthtimeMs: before.birthtimeMs,
+    })
         || (expected && !sameIdentity(opened, expected))) fail("source_changed");
     return { handle, stats: opened };
   } catch (error) {
@@ -222,7 +320,7 @@ function planDigest(sources) {
 async function verifyRootDirectory(rootDirectory) {
   try {
     const root = resolve(normalizeConfiguredPath(rootDirectory));
-    const stats = await lstat(root);
+    const stats = await statPath(root, "root_unsafe");
     assertSafeDirectory(stats);
     return await realpath(root);
   } catch (error) {
@@ -264,7 +362,8 @@ function assertPlan(plan, secret) {
   let total = 0;
   for (const [ordinal, source] of plan.sources.entries()) {
     if (!source || source.ordinal !== ordinal || typeof source.path !== "string"
-        || !validSha256(source.sourceKey) || !safeCount(source.device) || !safeCount(source.inode)
+        || !validSha256(source.sourceKey) || !validStatIdentity(source.device)
+        || !validStatIdentity(source.inode)
         || !safeCount(source.birthtimeMs) || !safeCount(source.prefixBytes)
         || !safeCount(source.prefixLineCount)
         || ((source.prefixBytes === 0) !== (source.prefixLineCount === 0))
@@ -998,7 +1097,7 @@ function classifyAssistantRecords(record, selection, secret) {
 }
 
 async function verifySourceBoundary(source, handle) {
-  const stats = await handle.stat();
+  const stats = await statHandle(handle);
   assertSafeFile(stats);
   if (!sameIdentity(stats, source) || stats.size < source.prefixBytes) fail("source_changed");
   if (source.prefixBytes > 0) {
@@ -1048,7 +1147,7 @@ async function verifyClaudeTranscriptExportSource(plan, sourceKeyValue, {
       } : supplied;
       if (verifiedLines !== next.nextLineOrdinal - 1) fail("cursor_invalid");
       await verifyCursorBoundary(handle, next);
-      const afterPath = await lstat(source.path).catch(() => fail("source_changed"));
+      const afterPath = await statPath(source.path).catch(() => fail("source_changed"));
       assertSafeFile(afterPath);
       if (!sameIdentity(afterPath, source)) fail("source_changed");
       return { cursor: next, complete: next.nextByte === source.prefixBytes && next.nextCostOrdinal === 0 };
@@ -1135,7 +1234,7 @@ async function scanClaudeTranscriptExportSource(plan, sourceKeyValue, {
       }
       if (verifyWholePrefix) await verifySource(source, handle, resourceGuard);
       else await verifySourceBoundary(source, handle);
-      const afterPath = await lstat(source.path).catch(() => fail("source_changed"));
+      const afterPath = await statPath(source.path).catch(() => fail("source_changed"));
       assertSafeFile(afterPath);
       if (!sameIdentity(afterPath, source)) fail("source_changed");
       return {

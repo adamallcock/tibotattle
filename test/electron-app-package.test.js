@@ -206,8 +206,8 @@ test("Electron builder configuration is an unsigned macOS arm64 directory build"
 
 test("Electron builder configuration exposes an unsigned Windows x64 directory target", () => {
   const config = loadBuilderConfigForTarget("win32");
-  assert.match(config.directories.app, /\.release-build\/electron-dev\/windows-x64\/app$/u);
-  assert.match(config.directories.output, /\.release-build\/electron-dev\/windows-x64\/artifacts$/u);
+  assert.match(config.directories.app, /\.release-build[\\/]electron-dev[\\/]windows-x64[\\/]app$/u);
+  assert.match(config.directories.output, /\.release-build[\\/]electron-dev[\\/]windows-x64[\\/]artifacts$/u);
   assert.deepEqual(config.asarUnpack, [
     "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node",
     "native/windows-filesystem/build/Release/windows_filesystem.node",
@@ -326,6 +326,6 @@ test("Electron app argument parsing selects macOS or Windows inputs explicitly",
 });
 
 test("Electron app staging default remains a disposable reviewed destination", () => {
-  assert.match(DEFAULT_ELECTRON_APP_OUTPUT, /\.release-build\/electron-dev\/mac-arm64\/app$/u);
+  assert.match(DEFAULT_ELECTRON_APP_OUTPUT, /\.release-build[\\/]electron-dev[\\/]mac-arm64[\\/]app$/u);
   assert.doesNotMatch(DEFAULT_ELECTRON_APP_OUTPUT, /(?:docs?|tests?)(?:\/|$)/iu);
 });

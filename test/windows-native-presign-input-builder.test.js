@@ -546,25 +546,28 @@ test("rejects proxies, accessors, open schemas, and unsafe roots without path di
 });
 
 test("parses only the closed fixed-path CLI shape", () => {
+  const evidenceRoot = join(tmpdir(), "evidence");
   assert.deepEqual(
     parseWindowsNativePresignInputBuilderArguments([
-      "--evidence-root", "/private/tmp/evidence",
+      "--evidence-root", evidenceRoot,
       "--handoff", "handoff.json",
       "--output", "native-input.json",
     ]),
     {
-      evidenceRoot: "/private/tmp/evidence",
+      evidenceRoot,
       handoff: "handoff.json",
       output: "native-input.json",
     },
   );
   assert.throws(
-    () => parseWindowsNativePresignInputBuilderArguments(["--options", "/tmp/options.json"]),
+    () => parseWindowsNativePresignInputBuilderArguments([
+      "--options", join(tmpdir(), "options.json"),
+    ]),
     expectCode(STATUS.inputInvalid),
   );
   assert.throws(
     () => validateWindowsNativePresignInputBuilderOptions({
-      evidenceRoot: "/tmp/evidence",
+      evidenceRoot,
       handoff: "handoff.json",
       output: "HANDOFF.JSON",
     }),

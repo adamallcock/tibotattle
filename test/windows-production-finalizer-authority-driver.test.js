@@ -287,7 +287,14 @@ test("builds, independently cross-checks, and writes one canonical authority sna
   assert.equal(result.status, WINDOWS_PRODUCTION_FINALIZER_AUTHORITY_DRIVER_STATUS);
   const output = await readFile(join(workspace.root, "authority.json"), "utf8");
   assert.equal(output, serializeWindowsProductionAuthorityManifest(result.authority));
-  assert.equal((await stat(join(workspace.root, "authority.json"))).mode & 0o777, 0o600);
+  const outputStat = await stat(join(workspace.root, "authority.json"));
+  assert.equal(outputStat.isFile(), true);
+  // Windows does not expose POSIX owner-mode bits.  The writer still opens
+  // the file with 0600, but only the POSIX lane can verify that permission
+  // representation through fs.Stats.
+  if (process.platform !== "win32") {
+    assert.equal(outputStat.mode & 0o777, 0o600);
+  }
   assert.equal(output.includes("signerThumbprint"), false);
   assert.equal(output.includes("private-actor-payload"), false);
 });
@@ -322,7 +329,7 @@ test("rejects unknown or duplicate flags, duplicate JSON keys, and open option s
   );
   assert.throws(
     () => parseWindowsProductionFinalizerAuthorityDriverArguments([
-      "--options", "/tmp/options.json", "--output", "x",
+      "--options", join(tmpdir(), "options.json"), "--output", "x",
     ]),
     expectCode(STATUS.inputInvalid),
   );
@@ -336,7 +343,7 @@ test("rejects unknown or duplicate flags, duplicate JSON keys, and open option s
     () => parseWindowsProductionFinalizerAuthorityDriverJson('{"a":1,"a":1}'),
     expectCode(STATUS.optionsInvalid),
   );
-  const root = "/tmp/tibotattle-authority-root";
+  const root = join(tmpdir(), "tibotattle-authority-root");
   const value = {
     evidenceRoot: root,
     output: "authority.json",
@@ -365,7 +372,7 @@ test("rejects unknown or duplicate flags, duplicate JSON keys, and open option s
 });
 
 test("uses strict direct-child portable filenames and rejects escaped path aliases", () => {
-  const root = "/tmp/tibotattle-authority-root";
+  const root = join(tmpdir(), "tibotattle-authority-root");
   const base = options(root, fixture().facts);
   for (const filename of [
     "../authority.json",
@@ -489,7 +496,7 @@ test("keeps qualification provenance on portability workflow and rejects signing
 });
 
 test("keeps finalizer facts closed against workflow extras, getters, and proxies", () => {
-  const base = options("/tmp/tibotattle-authority-root", fixture().facts);
+  const base = options(join(tmpdir(), "tibotattle-authority-root"), fixture().facts);
 
   const extra = structuredClone(base.facts);
   extra.finalizer.workflow = WINDOWS_PRODUCTION_AUTHORITY_FINALIZER_WORKFLOW;

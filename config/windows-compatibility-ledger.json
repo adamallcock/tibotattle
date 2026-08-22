@@ -3,6 +3,12 @@
   "scope": "portable-test-manifest",
   "entries": [
     {
+      "file": "apps/electron/test/shell-core.test.mjs",
+      "win32BranchCount": 2,
+      "classification": "native-windows-qualification",
+      "followUp": "Run the packaged Windows x64 smoke with the branded qualification context; the portable branches only prove unqualified composition fails closed while native supervisor launch remains covered by the smoke lane."
+    },
+    {
       "file": "apps/local/server.test.mjs",
       "win32BranchCount": 4,
       "classification": "posix-only-assertion",
@@ -67,6 +73,12 @@
       "win32BranchCount": 1,
       "classification": "windows-equivalent-needed",
       "followUp": "Cover reparse points, hard links, and owner ACLs before enabling file identity in production."
+    },
+    {
+      "file": "test/export-source-pipeline-owner-boundary.test.js",
+      "win32BranchCount": 1,
+      "classification": "native-windows-qualification",
+      "followUp": "Run the snapped Windows environment and path contract on native Windows x64; retain the injected Windows-config-root coverage and verify that caller-environment mutation cannot alter the captured paths."
     },
     {
       "file": "test/export-storage.test.js",
@@ -193,6 +205,12 @@
       "win32BranchCount": 3,
       "classification": "native-windows-qualification",
       "followUp": "Run native Authenticode collection and receipt publication on Windows x64, including the fail-closed native probe and protected artifact-root checks."
+    },
+    {
+      "file": "test/windows-production-finalizer-authority-driver.test.js",
+      "win32BranchCount": 1,
+      "classification": "posix-only-assertion",
+      "followUp": "Run the full authority-driver lifecycle on native Windows x64 and replace the omitted POSIX mode-bit assertion with an owner-DACL check before treating the finalizer evidence as production-qualified."
     },
     {
       "file": "test/windows-production-finalizer-receipt.test.js",

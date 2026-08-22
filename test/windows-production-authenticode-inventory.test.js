@@ -13,7 +13,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import test from "node:test";
 
 import {
@@ -460,9 +460,15 @@ test("derives relative subjects from sealed roots and rejects path forgery", asy
       },
     });
     assert.equal(observed.length, 20);
-    assert.equal(observed.every((path) => path.startsWith(`${fixture.productionRoot}/`)), true);
-    assert.equal(observed.some((path) => path.includes("..")), false);
-    assert.equal(observed.some((path) => path.includes("\\")), false);
+    const observedRelative = observed.map((path) => relative(fixture.productionRoot, path));
+    assert.equal(
+      observedRelative.every((path) => path.length > 0 && !isAbsolute(path)),
+      true,
+    );
+    assert.equal(
+      observedRelative.every((path) => !path.split(sep).includes("..")),
+      true,
+    );
     assert.equal(observed.some((path) => path === WINDOWS_PRODUCTION_AUTHENTICODE_ARTIFACTS_ROOT), false);
 
     await assert.rejects(
