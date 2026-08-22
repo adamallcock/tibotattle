@@ -33,6 +33,7 @@ import {
 import {
   ELECTRON_SHELL_RUNTIME_FILES,
 } from "../scripts/build-electron-runtime.mjs";
+import { RELEASE_VERSION } from "../config/release-manifest.js";
 
 const require = createRequire(import.meta.url);
 const BUILDER_CONFIG = require("../apps/electron/electron-builder.config.cjs");
@@ -251,6 +252,8 @@ test("Windows Electron staging includes the exact binding pair and shell", async
     const result = await buildElectronApp({
       output: join(root, "windows-app"),
       target: "windows",
+      packagingProfile: "windows-production",
+      packageVersion: RELEASE_VERSION,
       windowsBindingPath: bindingPath,
       windowsManifestPath: manifestPath,
     });
@@ -259,6 +262,8 @@ test("Windows Electron staging includes the exact binding pair and shell", async
     const paths = manifest.files.map(({ path }) => path);
 
     assert.equal(packageJson.main, "apps/electron/main.js");
+    assert.equal(packageJson.productName, "TiboTattle");
+    assert.equal(packageJson.version, RELEASE_VERSION);
     assert.equal(manifest.target, "win32");
     assert.equal(manifest.architecture, "x64");
     assert.equal(manifest.entrypoint, "apps/electron/main.js");
@@ -290,6 +295,17 @@ test("Electron app argument parsing selects macOS or Windows inputs explicitly",
     output: resolve(".release-build/electron-dev/windows-x64/app"),
     target: "win32",
     replace: false,
+  });
+  assert.deepEqual(parseElectronAppArguments([
+    "--target", "windows",
+    "--profile", "windows-production",
+    "--version", RELEASE_VERSION,
+  ]), {
+    output: resolve(".release-build/electron-dev/windows-x64/app"),
+    target: "win32",
+    replace: false,
+    packagingProfile: "windows-production",
+    packageVersion: RELEASE_VERSION,
   });
   assert.deepEqual(
     parseElectronAppArguments([
@@ -323,6 +339,37 @@ test("Electron app argument parsing selects macOS or Windows inputs explicitly",
     () => parseElectronAppArguments(["--target", "windows", "--windows-binding", "/tmp/binding.node"]),
     (error) => error.code === "ELECTRON_APP_WINDOWS_INPUT_PAIR",
   );
+  assert.throws(
+    () => parseElectronAppArguments(["--profile", "unknown"]),
+    (error) => error.code === "ELECTRON_APP_INVALID_PROFILE",
+  );
+});
+
+test("Electron app rejects production profile outside the Windows shell release boundary", async () => {
+  await withTemporaryDirectory(async (root) => {
+    await assert.rejects(
+      () => buildElectronApp({
+        output: join(root, "unknown-profile"),
+        packagingProfile: "unknown",
+      }),
+      (error) => error.code === "ELECTRON_APP_INVALID_PROFILE",
+    );
+    await assert.rejects(
+      () => buildElectronApp({
+        output: join(root, "mac-production-profile"),
+        packagingProfile: "windows-production",
+      }),
+      (error) => error.code === "ELECTRON_RUNTIME_PACKAGING_PROFILE_TARGET",
+    );
+    await assert.rejects(
+      () => buildElectronApp({
+        output: join(root, "wrong-version"),
+        packagingProfile: "development",
+        packageVersion: "9.9.9",
+      }),
+      (error) => error.code === "ELECTRON_RUNTIME_INVALID_PACKAGE_VERSION",
+    );
+  });
 });
 
 test("Electron app staging default remains a disposable reviewed destination", () => {

@@ -130,6 +130,7 @@ export const PORTABLE_TEST_GROUPS = Object.freeze({
     "test/windows-skip-ledger.test.js",
     "test/windows-test-manifest.test.js",
     "test/electron-development-artifact-verifier.test.js",
+    "test/electron-builder-package-json.test.js",
     "test/electron-app-package.test.js",
     "test/electron-package-layout.test.js",
     "test/export-source-pipeline-owner-boundary.test.js",

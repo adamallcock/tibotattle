@@ -107,10 +107,17 @@ test("toolchain, credential gates, Azure login, and signing order are explicit",
   ]) mustInclude(fragment);
   const envGate = stepOffset("Validate exact nonsecret signing environment before release config import");
   const forbiddenGate = stepOffset("Confirm forbidden credential environment is absent");
+  const versionGate = stepOffset("Verify exact package version before production staging");
   const release = stepOffset("Build signed NSIS x64 candidate with electron-builder 26.15.7");
   const login = stepOffset("Establish Azure CLI session late after offline gates");
   const native = stepOffset("Native pre-sign fixed Windows modules");
-  assert.ok(envGate < forbiddenGate && forbiddenGate < login && login < native && native < release);
+  assert.ok(envGate < forbiddenGate && forbiddenGate < versionGate
+    && versionGate < login && login < native && native < release);
+  const versionSection = stepSection("Verify exact package version before production staging");
+  assert.match(versionSection, /RELEASE_VERSION/u);
+  assert.match(versionSection, /TIBOTATTLE_PACKAGE_VERSION=/u);
+  assert.match(workflow, /--profile windows-production/u);
+  assert.match(workflow, /--version \$env:TIBOTATTLE_PACKAGE_VERSION/u);
   assert.ok(workflow.indexOf("electron-builder.release.config.cjs") > forbiddenGate);
   const envSection = stepSection("Validate exact nonsecret signing environment before release config import");
   for (const value of [

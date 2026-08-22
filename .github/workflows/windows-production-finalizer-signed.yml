@@ -254,6 +254,26 @@ jobs:
             }
           }
 
+      - name: Verify exact package version before production staging
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try {
+            $package = Get-Content -LiteralPath 'package.json' -Raw | ConvertFrom-Json
+            $releaseVersion = node --input-type=module -e 'import { RELEASE_VERSION } from "./config/release-manifest.js"; process.stdout.write(RELEASE_VERSION)' 2>$null
+          } catch {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_PACKAGE_METADATA_INVALID'
+            exit 1
+          }
+          if ($package.name -cne 'app-usagemonitor' -or
+              $package.type -cne 'module' -or
+              $package.version -cne $releaseVersion -or
+              $releaseVersion -cnotmatch '^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$') {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_PACKAGE_VERSION_INVALID'
+            exit 1
+          }
+          "TIBOTATTLE_PACKAGE_VERSION=$releaseVersion" >> $env:GITHUB_ENV
+
       - name: Create fresh fixed production and attempt roots
         shell: pwsh
         run: |
@@ -445,6 +465,8 @@ jobs:
           if (Test-Path -LiteralPath $env:TIBOTATTLE_APP_ROOT) { Write-Error 'WINDOWS_SIGNED_FINALIZER_APP_ROOT_EXISTS'; exit 1 }
           node ./scripts/build-electron-app.mjs `
             --target win32 `
+            --profile windows-production `
+            --version $env:TIBOTATTLE_PACKAGE_VERSION `
             --output $env:TIBOTATTLE_APP_ROOT `
             --windows-binding $env:TIBOTATTLE_WINDOWS_BINDING_PATH `
             --windows-manifest $env:TIBOTATTLE_WINDOWS_BINDING_MANIFEST_PATH

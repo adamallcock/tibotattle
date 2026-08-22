@@ -41,6 +41,9 @@ import {
   computeWindowsProductionAuthenticodeInventoryDigest,
 } from "./verify-windows-production-authenticode-inventory.mjs";
 import { windowsInstallerArtifactFileName } from "../config/windows-installer-contract.js";
+import {
+  transformElectronBuilderPackageJsonBytes,
+} from "./lib/electron-builder-package-json.mjs";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const moduleRequire = createModuleRequire(import.meta.url);
@@ -148,27 +151,6 @@ const PACKAGE_PE_INVENTORY_KEYS = Object.freeze([
 ]);
 const MAXIMUM_RECEIPT_BYTES = 64 * 1024;
 const RECEIPT_SHA256_PATTERN = /^[0-9a-f]{64}$/u;
-const ROOT_PACKAGE_METADATA = Object.freeze({
-  main: "apps/electron/main.js",
-  name: "app-usagemonitor",
-  productName: "TiboTattle",
-});
-// These are the exact defaults used by app-builder-lib 26.15.7's
-// fileTransformer.js for this release config (removePackageScripts and
-// removePackageKeywords are both omitted, so both default to true).
-const IGNORED_PACKAGE_METADATA_PROPERTIES = new Set([
-  "dist",
-  "gitHead",
-  "build",
-  "jspm",
-  "ava",
-  "xo",
-  "nyc",
-  "eslintConfig",
-  "contributors",
-  "bundleDependencies",
-  "tags",
-]);
 const VERIFICATION_OPTION_KEYS = Object.freeze([
   "authorityBytes",
   "signingLedgerBytes",
@@ -1146,44 +1128,6 @@ export async function readArchive(asarPath, archiveAdapter = null) {
   return { rows, markedUnpacked };
 }
 
-function cleanupPackageJsonValue(value, { isMain }) {
-  // Mirrors app-builder-lib 26.15.7's cleanupPackageJson exactly for the
-  // fixed release defaults. A dependency package with no removable metadata
-  // returns null there, which means electron-builder preserves source bytes.
-  let dependencies;
-  try {
-    dependencies = value?.dependencies;
-  } catch {
-    return null;
-  }
-  const isRemoveBabel = dependencies !== null
-    && typeof dependencies === "object"
-    && !Object.getOwnPropertyNames(dependencies).some((name) => name.startsWith("babel"));
-  let changed = false;
-  try {
-    for (const property of Object.getOwnPropertyNames(value)) {
-      if (property[0] === "_"
-          || IGNORED_PACKAGE_METADATA_PROPERTIES.has(property)
-          || property === "scripts"
-          || property === "keywords"
-          || (isMain && property === "devDependencies")
-          || (!isMain && property === "bugs")
-          || (isRemoveBabel && property === "babel")) {
-        delete value[property];
-        changed = true;
-      }
-    }
-  } catch {
-    return null;
-  }
-  return changed ? Buffer.from(JSON.stringify(value, null, 2)) : null;
-}
-
-function parsePackageJsonBytes(sourceBytes) {
-  const text = new TextDecoder("utf-8", { fatal: true }).decode(sourceBytes);
-  return JSON.parse(text);
-}
-
 /**
  * Reproduce the closed package-json transform from the pinned
  * app-builder-lib 26.15.7 implementation. The root package receives only
@@ -1199,27 +1143,11 @@ export function transformedPackageJsonBytes(sourceBytes, {
       || (isMain && (typeof packageVersion !== "string" || packageVersion.length === 0))) {
     fail(WINDOWS_PRODUCTION_PACKAGED_ARTIFACT_FIXED_STATUS.inventoryMismatch);
   }
-  let value;
-  try {
-    value = parsePackageJsonBytes(sourceBytes);
-  } catch {
-    fail(WINDOWS_PRODUCTION_PACKAGED_ARTIFACT_FIXED_STATUS.inventoryMismatch);
-  }
-  if (isMain) {
-    if (value === null || typeof value !== "object" || Array.isArray(value)) {
-      fail(WINDOWS_PRODUCTION_PACKAGED_ARTIFACT_FIXED_STATUS.inventoryMismatch);
-    }
-    for (const [property, metadata] of Object.entries({
-      ...ROOT_PACKAGE_METADATA,
-      version: packageVersion,
-    })) {
-      value[property] = metadata;
-    }
-    const cleaned = cleanupPackageJsonValue(value, { isMain: true });
-    return cleaned ?? Buffer.from(JSON.stringify(value, null, 2));
-  }
-  if (value === null || typeof value !== "object") return null;
-  return cleanupPackageJsonValue(value, { isMain: false });
+  return transformElectronBuilderPackageJsonBytes(
+    isMain ? PACKAGE_JSON_PATH : "node_modules/__dependency__/package.json",
+    sourceBytes,
+    { packageVersion, profile: "windows-production" },
+  );
 }
 
 function packageJsonTransformKind(path) {

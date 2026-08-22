@@ -325,6 +325,7 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /native\/windows-filesystem\/build\/Release\/windows_filesystem\.node/u);
   assert.match(workflow, /native\/windows-filesystem\/build\/Release\/windows_filesystem\.node\.manifest\.json/u);
   assert.match(workflow, /--target win32/u);
+  assert.match(workflow, /--profile development/u);
   assert.match(workflow, /--output \$stagedAppPath/u);
   assert.match(workflow, /--windows-binding \$windowsBindingPath/u);
   assert.match(workflow, /--windows-manifest \$windowsManifestPath/u);

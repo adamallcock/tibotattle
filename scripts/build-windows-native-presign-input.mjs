@@ -46,6 +46,9 @@ import {
   WINDOWS_FINALIZER_HANDOFF_SCHEMA,
   validateWindowsFinalizerQualificationHandoff,
 } from "./verify-windows-finalizer-qualification-handoff.mjs";
+import {
+  canonicalElectronBuilderPackageJsonBytes,
+} from "./lib/electron-builder-package-json.mjs";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
@@ -1009,11 +1012,15 @@ export async function buildWindowsNativePresignInput(value, dependencies = {}) {
   const stagedPackageRaw = await captureRegularFile(stagedPackagePath, MAXIMUM_PACKAGE_BYTES, STATUS.stagingInvalid);
   const stagedPackage = validatePackage(stagedPackageRaw.bytes, STATUS.stagingInvalid);
   if (stagedPackage.version !== packageInfo.version) fail(STATUS.stagingInvalid);
-  if (stableJson(parseJsonBytes(stagedPackageRaw.bytes, {
-    maximumBytes: MAXIMUM_PACKAGE_BYTES,
-    invalidCode: STATUS.stagingInvalid,
-    duplicateCode: STATUS.duplicateJsonKey,
-  })) !== stagedPackageRaw.bytes.toString("utf8")) fail(STATUS.stagingInvalid);
+  const expectedStagedPackage = canonicalElectronBuilderPackageJsonBytes(
+    "package.json",
+    stagedPackageRaw.bytes,
+    {
+      packageVersion: packageInfo.version,
+      profile: "windows-production",
+    },
+  );
+  if (!expectedStagedPackage.equals(stagedPackageRaw.bytes)) fail(STATUS.stagingInvalid);
   const runtime = validateRuntimeManifest(runtimeRaw.bytes, packageInfo.version);
   const actual = await inventoryStaging(roots.expectedStagingRoot);
   const actualMap = validateStagedInventory(runtime, actual);
