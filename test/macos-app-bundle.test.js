@@ -24,6 +24,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
 import {
   PRODUCT_BRAND,
   validateStateDirectoryName,
@@ -1650,6 +1651,130 @@ test("unified toolbar preserves the rich loopback report and single authority", 
     toolbar,
     /\b(?:CompanionProcess|Process|URLSession|NSSharingService)\b/u,
   );
+});
+
+test("toolbar Share opens the page that owns the share card before scrolling", async () => {
+  const [source, dashboardHTML] = await Promise.all([
+    readFile(SWIFT_SOURCE, "utf8"),
+    readFile(join(REPOSITORY_ROOT, "apps", "web", "public", "index.html"), "utf8"),
+  ]);
+  const sharePanelIndex = dashboardHTML.indexOf('id="share-panel"');
+  assert.notEqual(sharePanelIndex, -1, "the dashboard should contain the share panel");
+  const ownerPages = [
+    ...dashboardHTML.slice(0, sharePanelIndex).matchAll(
+      /data-dashboard-page="([^"]+)"/gu,
+    ),
+  ];
+  const ownerPage = ownerPages.at(-1)?.[1];
+  assert.ok(ownerPage, "the share panel should belong to a dashboard page");
+
+  const handler = source.match(
+    /@objc private func showShareCardFromToolbar\(\) \{([\s\S]*?)\n    \}\n\n    \/\/\/ Puts the native chrome/u,
+  )?.[1];
+  assert.ok(handler, "the toolbar Share handler should be present");
+  const selectedPage = handler.match(
+    /nativeDashboardChrome\?\.select\(\.(\w+)\)/u,
+  )?.[1];
+  assert.equal(
+    selectedPage,
+    ownerPage,
+    "the native sidebar should select the page that contains the share card",
+  );
+  const script = handler.match(
+    /webView\.evaluateJavaScript\("""\n([\s\S]*?)\n        """\)/u,
+  )?.[1];
+  assert.ok(script, "the toolbar Share navigation script should be present");
+
+  function exerciseShareNavigation(initialHash) {
+    let currentHash = initialHash;
+    let activePage = initialHash.slice(1);
+    const listeners = new Map();
+    const hashTasks = [];
+    const timerTasks = [];
+    const frameTasks = [];
+    const scrolls = [];
+    class FakeHashChangeEvent {
+      constructor(type) {
+        this.type = type;
+      }
+    }
+    const windowRef = {
+      addEventListener(type, callback, options = {}) {
+        const registered = listeners.get(type) ?? [];
+        registered.push({ callback, once: options.once === true });
+        listeners.set(type, registered);
+      },
+      dispatchEvent(event) {
+        const registered = [...(listeners.get(event.type) ?? [])];
+        for (const listener of registered) {
+          listener.callback(event);
+          if (listener.once) {
+            listeners.set(
+              event.type,
+              (listeners.get(event.type) ?? []).filter(
+                (candidate) => candidate !== listener,
+              ),
+            );
+          }
+        }
+      },
+      requestAnimationFrame(callback) {
+        frameTasks.push(callback);
+      },
+    };
+    const location = {};
+    Object.defineProperty(location, "hash", {
+      get() {
+        return currentHash;
+      },
+      set(value) {
+        currentHash = value;
+        hashTasks.push(() => {
+          windowRef.dispatchEvent(new FakeHashChangeEvent("hashchange"));
+        });
+      },
+    });
+    windowRef.location = location;
+    windowRef.addEventListener("hashchange", () => {
+      activePage = currentHash.slice(1);
+    });
+    const documentRef = {
+      getElementById(id) {
+        if (id !== "share-panel") return null;
+        return {
+          scrollIntoView(options) {
+            scrolls.push({ activePage, options });
+          },
+        };
+      },
+    };
+    runInNewContext(script, {
+      document: documentRef,
+      HashChangeEvent: FakeHashChangeEvent,
+      setTimeout(callback) {
+        timerTasks.push(callback);
+      },
+      window: windowRef,
+    });
+    for (const task of hashTasks) task();
+    for (const task of timerTasks) task();
+    for (const task of frameTasks) task();
+    return { activePage, currentHash, scrolls };
+  }
+
+  for (const initialHash of ["#overview", `#${ownerPage}`]) {
+    const result = exerciseShareNavigation(initialHash);
+    assert.equal(result.currentHash, `#${ownerPage}`);
+    assert.equal(result.activePage, ownerPage);
+    assert.equal(result.scrolls.length, 1);
+    assert.equal(
+      result.scrolls[0].activePage,
+      ownerPage,
+      "the card must be visible before the toolbar scrolls to it",
+    );
+    assert.equal(result.scrolls[0].options.behavior, "smooth");
+    assert.equal(result.scrolls[0].options.block, "start");
+  }
 });
 
 test("toolbar pill narrates the real index build and terminal refresh failure", async () => {
