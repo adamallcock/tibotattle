@@ -201,6 +201,10 @@ const MAXIMUM_FILENAME_BYTES = 255;
 const MAXIMUM_JSON_DEPTH = 64;
 const MAXIMUM_JSON_NODES = 4096;
 const READ_CHUNK_BYTES = 64 * 1024;
+// Windows file identifiers are not bounded by JavaScript's safe integer
+// range.  Request bigint stats on that platform and keep dev/ino exact for
+// every root and file identity comparison below.
+const MAX_SAFE_STAT_INTEGER = BigInt(Number.MAX_SAFE_INTEGER);
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const REVISION_PATTERN = /^[0-9a-f]{40}$/u;
 const VERSION_PATTERN = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
@@ -432,14 +436,84 @@ function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+function normalizeStatInteger(value) {
+  if (typeof value === "bigint") {
+    if (value < 0n || value > MAX_SAFE_STAT_INTEGER) return null;
+    return Number(value);
+  }
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function normalizeStatIdentity(value) {
+  if (typeof value === "bigint") return value >= 0n ? value : null;
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+// Keep the exact identity conversion as a small pure contract so tests can
+// exercise adjacent above-safe values without allocating a huge Windows
+// filesystem fixture.
+export function normalizeWindowsFinalizerStatIdentity(value) {
+  return normalizeStatIdentity(value);
+}
+
+function normalizeStats(stats) {
+  if (process.platform !== "win32") return stats;
+  return {
+    dev: normalizeStatIdentity(stats.dev),
+    ino: normalizeStatIdentity(stats.ino),
+    mode: normalizeStatInteger(stats.mode),
+    nlink: normalizeStatInteger(stats.nlink),
+    uid: stats.uid === undefined ? undefined : normalizeStatInteger(stats.uid),
+    size: normalizeStatInteger(stats.size),
+    birthtimeNs: stats.birthtimeNs,
+    mtimeNs: stats.mtimeNs,
+    ctimeNs: stats.ctimeNs,
+    birthtimeMs: stats.birthtimeMs,
+    mtimeMs: stats.mtimeMs,
+    ctimeMs: stats.ctimeMs,
+    isFile: () => stats.isFile(),
+    isDirectory: () => stats.isDirectory(),
+    isSymbolicLink: () => stats.isSymbolicLink(),
+  };
+}
+
+async function lstatForIdentity(path) {
+  return normalizeStats(await lstat(path, {
+    bigint: process.platform === "win32",
+  }));
+}
+
+async function statForIdentity(handle) {
+  return normalizeStats(await handle.stat({
+    bigint: process.platform === "win32",
+  }));
+}
+
+function statNanoseconds(metadata, field) {
+  const nanoseconds = metadata[`${field}Ns`];
+  if (typeof nanoseconds === "bigint") return nanoseconds;
+  const milliseconds = metadata[`${field}Ms`];
+  return Number.isFinite(milliseconds) && milliseconds >= 0
+    ? BigInt(Math.round(milliseconds * 1e6))
+    : null;
+}
+
 function samePath(left, right) {
   if (process.platform === "win32") return left.toLowerCase() === right.toLowerCase();
   return left === right;
 }
 
-function rootIdentity(metadata) {
+function rootIdentity(metadata, code) {
+  const birthtimeNs = statNanoseconds(metadata, "birthtime");
+  if (metadata.dev === null
+      || metadata.ino === null
+      || birthtimeNs === null
+      || metadata.mode === null
+      || (metadata.uid !== undefined && metadata.uid === null)) {
+    fail(code);
+  }
   return Object.freeze({
-    birthtimeNs: metadata.birthtimeNs ?? BigInt(Math.round(metadata.birthtimeMs * 1e6)),
+    birthtimeNs,
     dev: metadata.dev,
     ino: metadata.ino,
     mode: metadata.mode,
@@ -487,18 +561,18 @@ function assertOwnedDirectory(metadata, code) {
 
 async function captureOwnedRoot(path, code) {
   try {
-    const metadata = await lstat(path);
+    const metadata = await lstatForIdentity(path);
     assertOwnedDirectory(metadata, code);
     const canonical = await realpath(path);
-    const canonicalMetadata = await lstat(canonical);
+    const canonicalMetadata = await lstatForIdentity(canonical);
     assertOwnedDirectory(canonicalMetadata, code);
     if (!samePath(canonical, path)
-        || !sameRootIdentity(rootIdentity(metadata), rootIdentity(canonicalMetadata))) {
+        || !sameRootIdentity(rootIdentity(metadata, code), rootIdentity(canonicalMetadata, code))) {
       fail(code);
     }
     return Object.freeze({
       canonicalPath: canonical,
-      identity: rootIdentity(metadata),
+      identity: rootIdentity(metadata, code),
       path,
     });
   } catch (error) {
@@ -509,14 +583,14 @@ async function captureOwnedRoot(path, code) {
 
 async function assertOwnedRoot(state, code) {
   try {
-    const metadata = await lstat(state.path);
+    const metadata = await lstatForIdentity(state.path);
     assertOwnedDirectory(metadata, code);
-    if (!sameRootIdentity(state.identity, rootIdentity(metadata))) fail(code);
+    if (!sameRootIdentity(state.identity, rootIdentity(metadata, code))) fail(code);
     const canonical = await realpath(state.path);
     if (!samePath(canonical, state.canonicalPath)) fail(code);
-    const canonicalMetadata = await lstat(canonical);
+    const canonicalMetadata = await lstatForIdentity(canonical);
     assertOwnedDirectory(canonicalMetadata, code);
-    if (!sameRootIdentity(state.identity, rootIdentity(canonicalMetadata))) fail(code);
+    if (!sameRootIdentity(state.identity, rootIdentity(canonicalMetadata, code))) fail(code);
   } catch (error) {
     if (error instanceof WindowsProductionFinalizerAuthorityInputBuilderError) throw error;
     fail(code);
@@ -524,16 +598,26 @@ async function assertOwnedRoot(state, code) {
 }
 
 function sameFileIdentity(left, right) {
-  const birthLeft = left.birthtimeNs ?? BigInt(Math.round(left.birthtimeMs * 1e6));
-  const birthRight = right.birthtimeNs ?? BigInt(Math.round(right.birthtimeMs * 1e6));
-  const mtimeLeft = left.mtimeNs ?? BigInt(Math.round(left.mtimeMs * 1e6));
-  const mtimeRight = right.mtimeNs ?? BigInt(Math.round(right.mtimeMs * 1e6));
-  const ctimeLeft = left.ctimeNs ?? BigInt(Math.round(left.ctimeMs * 1e6));
-  const ctimeRight = right.ctimeNs ?? BigInt(Math.round(right.ctimeMs * 1e6));
+  const birthLeft = statNanoseconds(left, "birthtime");
+  const birthRight = statNanoseconds(right, "birthtime");
+  const mtimeLeft = statNanoseconds(left, "mtime");
+  const mtimeRight = statNanoseconds(right, "mtime");
+  const ctimeLeft = statNanoseconds(left, "ctime");
+  const ctimeRight = statNanoseconds(right, "ctime");
   return left.isFile()
     && right.isFile()
     && !left.isSymbolicLink()
     && !right.isSymbolicLink()
+    && left.dev !== null
+    && right.dev !== null
+    && left.ino !== null
+    && right.ino !== null
+    && birthLeft !== null
+    && birthRight !== null
+    && mtimeLeft !== null
+    && mtimeRight !== null
+    && ctimeLeft !== null
+    && ctimeRight !== null
     && left.dev === right.dev
     && left.ino === right.ino
     && left.size === right.size
@@ -543,12 +627,18 @@ function sameFileIdentity(left, right) {
 }
 
 function sameFileObjectIdentity(left, right) {
-  const birthLeft = left.birthtimeNs ?? BigInt(Math.round(left.birthtimeMs * 1e6));
-  const birthRight = right.birthtimeNs ?? BigInt(Math.round(right.birthtimeMs * 1e6));
+  const birthLeft = statNanoseconds(left, "birthtime");
+  const birthRight = statNanoseconds(right, "birthtime");
   return left.isFile()
     && right.isFile()
     && !left.isSymbolicLink()
     && !right.isSymbolicLink()
+    && left.dev !== null
+    && right.dev !== null
+    && left.ino !== null
+    && right.ino !== null
+    && birthLeft !== null
+    && birthRight !== null
     && left.dev === right.dev
     && left.ino === right.ino
     && birthLeft === birthRight;
@@ -566,16 +656,16 @@ async function captureRegularFile(path, maximumBytes, code, rootState = null) {
   let handle;
   try {
     if (rootState) await assertOwnedRoot(rootState, rootValidationCode(code));
-    const before = await lstat(path);
+    const before = await lstatForIdentity(path);
     if (!before.isFile()
         || before.isSymbolicLink()
         || before.nlink !== 1
         || before.size <= 0
         || before.size > maximumBytes) fail(code);
     handle = await open(path, READ_ONLY_FLAGS);
-    const opened = await handle.stat();
+    const opened = await statForIdentity(handle);
     if (!sameFileIdentity(before, opened) || opened.nlink !== 1) fail(code);
-    const afterOpen = await lstat(path);
+    const afterOpen = await lstatForIdentity(path);
     if (!sameFileIdentity(before, afterOpen) || afterOpen.nlink !== 1) fail(code);
     const hash = createHash("sha256");
     const chunks = [];
@@ -593,8 +683,8 @@ async function captureRegularFile(path, maximumBytes, code, rootState = null) {
       total += result.bytesRead;
       if (total > maximumBytes) fail(code);
     }
-    const finished = await handle.stat();
-    const afterRead = await lstat(path);
+    const finished = await statForIdentity(handle);
+    const afterRead = await lstatForIdentity(path);
     if (!sameFileObjectIdentity(opened, finished)
         || !sameFileIdentity(opened, afterRead)
         || finished.nlink !== 1
@@ -604,11 +694,11 @@ async function captureRegularFile(path, maximumBytes, code, rootState = null) {
     return Object.freeze({
       bytes: Buffer.concat(chunks, total),
       identity: Object.freeze({
-        birthtimeNs: finished.birthtimeNs ?? BigInt(Math.round(finished.birthtimeMs * 1e6)),
-        ctimeNs: finished.ctimeNs ?? BigInt(Math.round(finished.ctimeMs * 1e6)),
+        birthtimeNs: statNanoseconds(finished, "birthtime"),
+        ctimeNs: statNanoseconds(finished, "ctime"),
         dev: finished.dev,
         ino: finished.ino,
-        mtimeNs: finished.mtimeNs ?? BigInt(Math.round(finished.mtimeMs * 1e6)),
+        mtimeNs: statNanoseconds(finished, "mtime"),
         size: finished.size,
       }),
       path,
@@ -1368,7 +1458,7 @@ export async function buildWindowsProductionFinalizerAuthorityInput(value, depen
 async function assertOutputAbsent(path, rootState) {
   await assertOwnedRoot(rootState, STATUS.evidenceRootInvalid);
   try {
-    const metadata = await lstat(path);
+    const metadata = await lstatForIdentity(path);
     if (metadata.isSymbolicLink() || metadata.isFile() || metadata.isDirectory()) {
       fail(STATUS.outputExists);
     }
@@ -1383,7 +1473,7 @@ async function removeOwnedTemporaryFile(rootState, path, identity) {
   if (!identity) return;
   try {
     await assertOwnedRoot(rootState, STATUS.evidenceRootInvalid);
-    const current = await lstat(path);
+    const current = await lstatForIdentity(path);
     if (!sameFileObjectIdentity(current, identity)) return;
     await unlink(path);
     await assertOwnedRoot(rootState, STATUS.evidenceRootInvalid);
@@ -1533,12 +1623,12 @@ export async function writeWindowsProductionFinalizerAuthorityInput(value, depen
     await assertOutputAbsent(selected.outputPath, metadata.evidenceState);
     await assertOutputAbsent(temporaryPath, metadata.evidenceState);
     handle = await open(temporaryPath, "wx", 0o600);
-    const opened = await handle.stat();
+    const opened = await statForIdentity(handle);
     if (!opened.isFile() || opened.isSymbolicLink() || opened.nlink !== 1) fail(STATUS.outputInvalid);
     temporaryIdentity = opened;
     await handle.writeFile(serialized, "utf8");
     await handle.sync();
-    const finished = await handle.stat();
+    const finished = await statForIdentity(handle);
     if (!sameFileObjectIdentity(opened, finished)
         || finished.nlink !== 1
         || finished.size !== Buffer.byteLength(serialized, "utf8")) fail(STATUS.outputInvalid);
@@ -1555,7 +1645,7 @@ export async function writeWindowsProductionFinalizerAuthorityInput(value, depen
     if (roots.testOnlyFault === "replace-temp-before-cleanup") {
       await replaceTemporaryPathForTest(temporaryPath);
     }
-    const output = await lstat(selected.outputPath);
+    const output = await lstatForIdentity(selected.outputPath);
     if (!sameFileObjectIdentity(output, temporaryIdentity) || output.isSymbolicLink()) {
       fail(STATUS.outputInvalid);
     }
