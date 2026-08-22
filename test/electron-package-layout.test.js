@@ -17,6 +17,8 @@ import { fileURLToPath } from "node:url";
 
 import {
   buildElectronRuntime,
+  electronRuntimeStatFingerprintForTest,
+  electronRuntimeStatOptionsForTest,
   parseElectronRuntimeArguments,
   validateElectronRuntimeOutput,
 } from "../scripts/build-electron-runtime.mjs";
@@ -52,6 +54,29 @@ function payloadFor(rows) {
   }
   return { bytes, sha256: hash.digest("hex") };
 }
+
+test("Windows runtime capture requests BigInt stats and preserves above-safe identities", () => {
+  assert.deepEqual(electronRuntimeStatOptionsForTest("win32"), { bigint: true });
+  assert.equal(electronRuntimeStatOptionsForTest("darwin"), undefined);
+  const common = {
+    mode: 0o100644n,
+    size: 1n,
+    mtimeMs: 2n,
+    ctimeMs: 3n,
+  };
+  const first = electronRuntimeStatFingerprintForTest({
+    ...common,
+    dev: 2n ** 60n,
+    ino: (2n ** 60n) + 1n,
+  });
+  const second = electronRuntimeStatFingerprintForTest({
+    ...common,
+    dev: 2n ** 60n,
+    ino: (2n ** 60n) + 2n,
+  });
+  assert.notEqual(first, second);
+  assert.equal(first.startsWith("1152921504606846976\0"), true);
+});
 
 test("Electron runtime staging is deterministic and contains only the reviewed companion closure", async () => {
   await withTemporaryDirectory(async (root) => {

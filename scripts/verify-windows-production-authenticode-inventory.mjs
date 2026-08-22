@@ -164,6 +164,9 @@ const MAXIMUM_PROBE_BYTES = 8 * 1024;
 const MAXIMUM_RECEIPT_BYTES = 64 * 1024;
 const MAXIMUM_FILE_BYTES = 4 * 1024 * 1024 * 1024;
 const READ_CHUNK_BYTES = 1024 * 1024;
+// Windows file IDs can exceed JavaScript's safe integer range. Keep dev/ino
+// as BigInt while converting only bounded count fields used arithmetically.
+const MAX_SAFE_STAT_INTEGER = BigInt(Number.MAX_SAFE_INTEGER);
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const REVISION_PATTERN = /^[0-9a-f]{40}$/u;
 const VERSION_PATTERN = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
@@ -549,6 +552,50 @@ function normalizeRootPath(value, platform) {
   return platform === "win32" ? selected.toLowerCase() : selected;
 }
 
+function normalizeStatInteger(value) {
+  if (typeof value !== "bigint") return value;
+  if (value < 0n || value > MAX_SAFE_STAT_INTEGER) return null;
+  return Number(value);
+}
+
+function normalizeStats(stats) {
+  if (process.platform !== "win32") return stats;
+  return {
+    dev: stats.dev,
+    ino: stats.ino,
+    nlink: normalizeStatInteger(stats.nlink),
+    size: normalizeStatInteger(stats.size),
+    isFile: () => stats.isFile(),
+    isDirectory: () => stats.isDirectory(),
+    isSymbolicLink: () => stats.isSymbolicLink(),
+  };
+}
+
+async function lstatForIdentity(path) {
+  return normalizeStats(await lstat(path, {
+    bigint: process.platform === "win32",
+  }));
+}
+
+async function statForIdentity(handle) {
+  return normalizeStats(await handle.stat({
+    bigint: process.platform === "win32",
+  }));
+}
+
+function statIdentity(value) {
+  if (typeof value === "bigint") return value >= 0n ? value.toString() : null;
+  return Number.isSafeInteger(value) && value >= 0 ? String(value) : null;
+}
+
+function sameStatIdentity(left, right) {
+  const leftIdentity = statIdentity(left);
+  const rightIdentity = statIdentity(right);
+  return leftIdentity !== null
+    && rightIdentity !== null
+    && leftIdentity === rightIdentity;
+}
+
 function pathIsInside(parent, child, platform) {
   const selectedParent = normalizeRootPath(parent, platform);
   const selectedChild = normalizeRootPath(child, platform);
@@ -623,7 +670,7 @@ async function captureDirectoryState(path, platform, code = STATUS.rootsInvalid)
   const canonical = await sealDirectoryRoot(path, platform, code);
   let metadata;
   try {
-    metadata = await lstat(canonical);
+    metadata = await lstatForIdentity(canonical);
   } catch {
     fail(code);
   }
@@ -642,7 +689,7 @@ async function revalidateDirectoryState(state, code = STATUS.rootReplaced) {
   let metadata;
   let canonical;
   try {
-    metadata = await lstat(state.path);
+    metadata = await lstatForIdentity(state.path);
     canonical = await realpath(state.path);
   } catch {
     fail(code);
@@ -651,8 +698,8 @@ async function revalidateDirectoryState(state, code = STATUS.rootReplaced) {
       || metadata.isSymbolicLink()
       || normalizeRootPath(canonical, state.platform)
         !== normalizeRootPath(state.path, state.platform)
-      || metadata.dev !== state.dev
-      || metadata.ino !== state.ino) {
+      || !sameStatIdentity(metadata.dev, state.dev)
+      || !sameStatIdentity(metadata.ino, state.ino)) {
     fail(code);
   }
   return state;
@@ -692,10 +739,8 @@ function validateCapturedRootState(value, platform) {
   );
   if (source.platform !== platform
       || typeof source.path !== "string"
-      || !Number.isSafeInteger(source.dev)
-      || !Number.isSafeInteger(source.ino)
-      || source.dev < 0
-      || source.ino < 0) {
+      || statIdentity(source.dev) === null
+      || statIdentity(source.ino) === null) {
     fail(STATUS.rootsInvalid);
   }
   return Object.freeze({
@@ -1117,7 +1162,7 @@ export function parseWindowsProductionAuthenticodeInventoryReceipt(
 
 async function removeOwnedTemporary(path, identity) {
   try {
-    const metadata = await lstat(path);
+    const metadata = await lstatForIdentity(path);
     if (metadata.isFile()
         && (metadata.nlink === 1 || metadata.nlink === 2)
         && sameIdentity(metadata, identity)) {
@@ -1144,14 +1189,14 @@ async function writeInventoryReceiptOnce(rootState, receipt, hooks) {
   let temporaryIdentity;
   try {
     handle = await open(temporaryPath, "wx", 0o600);
-    temporaryIdentity = await handle.stat();
+    temporaryIdentity = await statForIdentity(handle);
     if (!temporaryIdentity.isFile() || temporaryIdentity.nlink !== 1) {
       fail(STATUS.outputInvalid);
     }
     await handle.writeFile(bytes);
     await handle.sync();
     await revalidateDirectoryState(rootState);
-    const existing = await lstat(outputPath).catch((error) => {
+    const existing = await lstatForIdentity(outputPath).catch((error) => {
       if (error?.code === "ENOENT") return null;
       fail(STATUS.outputInvalid);
     });
@@ -1169,7 +1214,7 @@ async function writeInventoryReceiptOnce(rootState, receipt, hooks) {
       if (error?.code === "EEXIST") fail(STATUS.outputExists);
       fail(STATUS.outputInvalid);
     }
-    const linked = await lstat(outputPath).catch(() => null);
+    const linked = await lstatForIdentity(outputPath).catch(() => null);
     if (!linked
         || !linked.isFile()
         || linked.isSymbolicLink()
@@ -1182,7 +1227,7 @@ async function writeInventoryReceiptOnce(rootState, receipt, hooks) {
     await revalidateDirectoryState(rootState);
     await unlink(temporaryPath);
     temporaryIdentity = null;
-    const final = await lstat(outputPath).catch(() => null);
+    const final = await lstatForIdentity(outputPath).catch(() => null);
     if (!final
         || !final.isFile()
         || final.isSymbolicLink()
@@ -1402,7 +1447,8 @@ export function runWindowsProductionAuthenticodeProbe(path, options = {}) {
 }
 
 function sameIdentity(left, right) {
-  return left.dev === right.dev && left.ino === right.ino;
+  return sameStatIdentity(left.dev, right.dev)
+    && sameStatIdentity(left.ino, right.ino);
 }
 
 function readOnlyFlags(platform) {
@@ -1443,7 +1489,7 @@ async function captureRegularFile(path, platform = process.platform) {
   await assertNoSymlinkPathComponents(path);
   let before;
   try {
-    before = await lstat(path);
+    before = await lstatForIdentity(path);
   } catch (error) {
     fail(error?.code === "ENOENT" ? STATUS.inputMissing : STATUS.probeInvalid);
   }
@@ -1454,7 +1500,7 @@ async function captureRegularFile(path, platform = process.platform) {
   let handle;
   try {
     handle = await open(path, readOnlyFlags(platform));
-    const opened = await handle.stat();
+    const opened = await statForIdentity(handle);
     if (!opened.isFile()
         || opened.nlink !== 1
         || opened.size !== before.size
@@ -1471,7 +1517,7 @@ async function captureRegularFile(path, platform = process.platform) {
       if (bytes > MAXIMUM_FILE_BYTES) fail(STATUS.probeInvalid);
       hash.update(chunk.subarray(0, bytesRead));
     }
-    const after = await handle.stat();
+    const after = await statForIdentity(handle);
     if (bytes !== opened.size
         || after.size !== opened.size
         || after.nlink !== 1
@@ -1517,7 +1563,7 @@ async function readBoundedRawFile(path, rootState, maximum, code) {
   await assertNoSymlinkPathComponents(path);
   let before;
   try {
-    before = await lstat(path);
+    before = await lstatForIdentity(path);
   } catch (error) {
     fail(error?.code === "ENOENT" ? STATUS.inputMissing : code);
   }
@@ -1528,7 +1574,7 @@ async function readBoundedRawFile(path, rootState, maximum, code) {
   let handle;
   try {
     handle = await open(path, readOnlyFlags(rootState.platform));
-    const opened = await handle.stat();
+    const opened = await statForIdentity(handle);
     if (!opened.isFile()
         || opened.nlink !== 1
         || opened.size !== before.size
@@ -1556,8 +1602,8 @@ async function readBoundedRawFile(path, rootState, maximum, code) {
       chunks.push(selected);
       hash.update(selected);
     }
-    const after = await handle.stat();
-    const finalPath = await lstat(path).catch(() => null);
+    const after = await statForIdentity(handle);
+    const finalPath = await lstatForIdentity(path).catch(() => null);
     if (bytesReadTotal !== opened.size
         || !after.isFile()
         || after.nlink !== 1

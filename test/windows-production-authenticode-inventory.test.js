@@ -556,7 +556,7 @@ test("captured collector roots are revalidated when a root swaps during collecti
   const fixture = await createFixture();
   try {
     const rootState = async (path) => {
-      const metadata = await lstat(path);
+      const metadata = await lstat(path, { bigint: true });
       return {
         dev: metadata.dev,
         ino: metadata.ino,
