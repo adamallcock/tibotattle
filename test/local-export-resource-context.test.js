@@ -100,6 +100,7 @@ const PLATFORM_PUBLIC_EXPORTS = Object.freeze([
   "createWindowsProductionReadinessAttestation",
   "createWindowsProtectedStateStore",
   "createWindowsQualificationModeContext",
+  "createWindowsQualificationStateSessionFactory",
   "createWindowsReviewPairStorageContext",
   "createWindowsSqliteStateSession",
   "createWindowsSqliteStateStaging",
