@@ -273,11 +273,11 @@ test("Windows release config maps the frozen installer contract exactly", () => 
   assert.equal(config.publish, "never");
   assert.match(
     config.directories.app,
-    /\.release-build\/electron-production\/windows-x64\/app$/u,
+    /\.release-build[\\/]electron-production[\\/]windows-x64[\\/]app$/u,
   );
   assert.match(
     config.directories.output,
-    /\.release-build\/electron-production\/windows-x64\/artifacts$/u,
+    /\.release-build[\\/]electron-production[\\/]windows-x64[\\/]artifacts$/u,
   );
   assert.equal(config.extraMetadata.version, PACKAGE_VERSION);
   assert.equal(config.beforeBuildResult, false);

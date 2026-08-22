@@ -24,6 +24,13 @@ function snapshotObject(value) {
 }
 function exactKeys(value, keys) { const safe = snapshotObject(value); return Object.keys(safe).length === keys.length && keys.every((key) => Object.hasOwn(safe, key)); }
 function safeCount(value) { return Number.isSafeInteger(value) && value >= 0; }
+const DECIMAL_IDENTITY_PATTERN = /^(?:0|[1-9][0-9]*)$/u;
+const MAX_IDENTITY_BIGINT = (1n << 64n) - 1n;
+function safeIdentity(value) {
+  if (safeCount(value)) return true;
+  if (typeof value !== "string" || !DECIMAL_IDENTITY_PATTERN.test(value)) return false;
+  try { return BigInt(value) <= MAX_IDENTITY_BIGINT; } catch { return false; }
+}
 function validSha256(value) { return typeof value === "string" && /^[a-f0-9]{64}$/.test(value); }
 function boundedCursorValue(value, state, depth = 0) {
   if (isProxy(value)) fail();
@@ -40,7 +47,7 @@ export function assertCanonicalSupplementalCursorJson(value) { if (typeof value 
 function normalizeBinding(value) {
   value = snapshotObject(value);
   if (!value || typeof value !== "object" || Array.isArray(value) || !BINDING_KINDS.has(value.kind)) fail();
-  if (value.kind === "file_prefix") { const keys = ["kind", "device", "inode", "birthtimeMs", "prefixBytes", "prefixSha256"]; if (!exactKeys(value, keys) || !safeCount(value.device) || !safeCount(value.inode) || !safeCount(value.birthtimeMs) || !safeCount(value.prefixBytes) || !validSha256(value.prefixSha256)) fail(); return { kind: "file_prefix", device: value.device, inode: value.inode, birthtimeMs: value.birthtimeMs, prefixBytes: value.prefixBytes, prefixSha256: value.prefixSha256 }; }
+  if (value.kind === "file_prefix") { const keys = ["kind", "device", "inode", "birthtimeMs", "prefixBytes", "prefixSha256"]; if (!exactKeys(value, keys) || !safeIdentity(value.device) || !safeIdentity(value.inode) || !safeCount(value.birthtimeMs) || !safeCount(value.prefixBytes) || !validSha256(value.prefixSha256)) fail(); return { kind: "file_prefix", device: value.device, inode: value.inode, birthtimeMs: value.birthtimeMs, prefixBytes: value.prefixBytes, prefixSha256: value.prefixSha256 }; }
   const keys = ["kind", "inventoryEntries", "inventoryBytes", "inventorySha256"]; if (!exactKeys(value, keys) || !safeCount(value.inventoryEntries) || !safeCount(value.inventoryBytes) || !validSha256(value.inventorySha256)) fail(); return { kind: "frozen_inventory", inventoryEntries: value.inventoryEntries, inventoryBytes: value.inventoryBytes, inventorySha256: value.inventorySha256 };
 }
 function normalizeSource(value, ordinal) { value = snapshotObject(value); const keys = ["ordinal", "sourceKey", "kind", "parserVersion", "binding", "initialCursorJson"]; if (!exactKeys(value, keys) || value.ordinal !== ordinal || !validSha256(value.sourceKey) || !SOURCE_KINDS.has(value.kind) || typeof value.parserVersion !== "string" || !/^[a-z][a-z0-9_.-]{0,63}$/.test(value.parserVersion)) fail(); const binding = normalizeBinding(value.binding); if ((value.kind === "codex_collector_ledger" && binding.kind !== "file_prefix") || (value.kind === "claude_status_snapshot" && binding.kind !== "frozen_inventory") || (value.kind === "claude_transcript_jsonl" && binding.kind !== "file_prefix")) fail(); return { ordinal, sourceKey: value.sourceKey, kind: value.kind, parserVersion: value.parserVersion, binding, initialCursorJson: assertCanonicalSupplementalCursorJson(value.initialCursorJson) }; }

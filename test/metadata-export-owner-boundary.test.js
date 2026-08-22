@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { isProxy } from "node:util/types";
@@ -82,6 +83,14 @@ function fakeReviewPairStorage({ writer, reader = async () => ({}) }) {
     writeOwnerOnlyPairNoClobber: writer,
     readOwnerOnlyLocalMetadataBundlePair: reader,
   });
+}
+
+function reviewPairPaths() {
+  const root = join(tmpdir(), "tibotattle-review-pair");
+  return {
+    outputFile: join(root, "review.umx.json"),
+    receiptFile: join(root, "review.privacy-receipt.json"),
+  };
 }
 
 test("metadata export owners expose only their reviewed factories and exact legacy APIs", () => {
@@ -173,13 +182,13 @@ test("Windows metadata export uses only the reviewed injected writer", async () 
     },
   }));
 
+  const paths = reviewPairPaths();
   const result = await context.writeLocalMetadataBundle({
     bundle: { schemaVersion: "test-bundle" },
     receipt: { schemaVersion: "test-receipt" },
-    outputFile: "/tmp/review.umx.json",
-    receiptFile: "/tmp/review.privacy-receipt.json",
+    ...paths,
   });
-  assert.equal(result.outputFile, "/tmp/review.umx.json");
+  assert.equal(result.outputFile, paths.outputFile);
   assert.equal(calls.length, 1);
   assert.equal(fallbackCalls.length, 0);
   assert.deepEqual(JSON.parse(calls[0].firstContent), { schemaVersion: "test-bundle" });
@@ -199,8 +208,7 @@ test("Windows metadata export fails closed without a reviewed writer", async () 
     context.writeLocalMetadataBundle({
       bundle: { schemaVersion: "test-bundle" },
       receipt: { schemaVersion: "test-receipt" },
-      outputFile: "/tmp/review.umx.json",
-      receiptFile: "/tmp/review.privacy-receipt.json",
+      ...reviewPairPaths(),
     }),
     (error) => error instanceof TypeError
       && error.message === "Windows review pair storage writer is required",
@@ -227,8 +235,7 @@ test("macOS metadata export retains the default writer when a Windows port is pr
   await context.writeLocalMetadataBundle({
     bundle: { schemaVersion: "test-bundle" },
     receipt: { schemaVersion: "test-receipt" },
-    outputFile: "/tmp/review.umx.json",
-    receiptFile: "/tmp/review.privacy-receipt.json",
+    ...reviewPairPaths(),
   });
   assert.equal(fallbackCalls.length, 1);
   assert.equal(injectedCalls.length, 0);
@@ -236,17 +243,18 @@ test("macOS metadata export retains the default writer when a Windows port is pr
 
 test("local Codex ports observe CODEX_HOME at each default-home call and reject hostile values", () => {
   const environment = {};
+  const fallbackCodexHome = join("/fallback-home", ".codex");
   const ports = createLocalCodexLogPorts({
     environment,
     homeDirectory: "/fallback-home",
   });
-  assert.equal(ports.filesystem.defaultCodexHome(), "/fallback-home/.codex");
+  assert.equal(ports.filesystem.defaultCodexHome(), fallbackCodexHome);
   environment.CODEX_HOME = "/first-codex-home";
   assert.equal(ports.filesystem.defaultCodexHome(), "/first-codex-home");
   environment.CODEX_HOME = "/second-codex-home";
   assert.equal(ports.filesystem.defaultCodexHome(), "/second-codex-home");
   delete environment.CODEX_HOME;
-  assert.equal(ports.filesystem.defaultCodexHome(), "/fallback-home/.codex");
+  assert.equal(ports.filesystem.defaultCodexHome(), fallbackCodexHome);
 
   Object.defineProperty(environment, "CODEX_HOME", {
     configurable: true,

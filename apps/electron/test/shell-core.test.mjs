@@ -209,6 +209,15 @@ function errorCode(code) {
   };
 }
 
+function electronEntryCompositionFailure(error) {
+  if (process.platform === "win32") {
+    return error instanceof ElectronShellError
+      && error.code === "electron_shell_windows_readiness_unavailable"
+      && error.message === "Electron shell operation failed";
+  }
+  return /BrowserWindow is required/u.test(error?.message ?? "");
+}
+
 class FakeChild extends EventEmitter {
   constructor() {
     super();
@@ -1010,7 +1019,7 @@ test("Electron entry quits explicitly when composition fails before lifecycle ow
         diagnostics.push(value);
       },
     }),
-    /BrowserWindow is required/u,
+    electronEntryCompositionFailure,
   );
   assert.deepEqual(diagnostics, [`${ELECTRON_ENTRY_FAILURE_DIAGNOSTIC}\n`]);
   assert.deepEqual(events, ["diagnostic", "quit"]);
@@ -1027,12 +1036,26 @@ test("Electron entry still quits when its fixed diagnostic cannot be written", a
         throw new Error("synthetic diagnostic failure");
       },
     }),
-    /BrowserWindow is required/u,
+    electronEntryCompositionFailure,
   );
   assert.equal(app.quitCalls, 1);
 });
 
 test("packaged Electron composition keeps the companion in app.asar and uses physical Resources as cwd", async () => {
+  if (process.platform === "win32") {
+    // The dependency-injected supervisor below is intentionally forbidden for
+    // a Windows launch. Keep this unit active on Windows by proving that an
+    // unqualified packaged composition fails closed before it can spawn a
+    // companion; the native smoke supplies the real qualification context.
+    const app = new FakeApp();
+    app.isPackaged = true;
+    await assert.rejects(
+      launchElectronShell({ electron: { app } }),
+      errorCode("windows_readiness_unavailable"),
+    );
+    assert.equal(app.quitCalls, 1);
+    return;
+  }
   const app = new FakeApp();
   app.isPackaged = true;
   app.getAppPath = () => "/private/TiboTattle.app/Contents/Resources/app.asar";
