@@ -32,16 +32,41 @@ navigate and no way back.
 The persisted geometry is a single user-defaults key. Deleting it discards the
 collapsed state; the next launch lays the sidebar out fresh.
 
+### Easiest option: update the app
+
+Updating to 0.1.17 or later fixes this by itself — that build reopens a
+stranded sidebar once on first launch, and from then on carries a toolbar
+button and a ⌃⌘S menu command. Anyone willing to wait for the update needs
+none of the steps below.
+
+### Manual rescue, step by step
+
+The commands run in **Terminal**, the app built into macOS. To open it: press
+⌘Space, type `Terminal`, press Return (or find it in Finder under
+Applications → Utilities → Terminal).
+
+**Order matters. Quit the app first.** A running TiboTattle holds its own copy
+of these settings and rewrites them when it quits, which would put the
+collapsed state straight back. So:
+
+1. **Quit TiboTattle completely** — ⌘Q, or right-click its Dock icon and
+   choose Quit. If the window is unusable, use Force Quit (⌥⌘Esc). Also quit
+   it from the menu-bar icon if it is running there.
+2. Open Terminal.
+3. Paste this line and press Return. It prints nothing when it works:
+
 ```bash
 defaults delete com.usagemonitor.local "NSSplitView Subview Frames com.usagemonitor.local.dashboard-split.v1"
 ```
 
-Then quit TiboTattle completely (⌘Q, or Force Quit if the window is unusable)
-and reopen it. The sidebar comes back.
+4. Reopen TiboTattle. The sidebar is back.
 
-Deleting only that key restores the sidebar at its minimum width (about 188pt)
-because the one-time width seeding has already run. To have it reopen at the
-designed 216pt instead, delete the seeding marker as well before relaunching:
+If step 3 prints `does not exist`, the setting was already cleared — carry on
+to step 4 anyway.
+
+That restores the sidebar at its minimum width (about 188pt), because the
+one-time width seeding has already run. To have it reopen at the designed
+216pt instead, run this as well, still before reopening the app:
 
 ```bash
 defaults delete com.usagemonitor.local "tibotattle.dashboard-split-seeded.v1"
