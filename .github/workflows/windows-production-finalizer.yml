@@ -524,6 +524,8 @@ jobs:
           }
           node ./scripts/build-electron-app.mjs `
             --target win32 `
+            --profile windows-production `
+            --version $env:TIBOTATTLE_PACKAGE_VERSION `
             --output $stagePath `
             --windows-binding $env:TIBOTATTLE_WINDOWS_BINDING_PATH `
             --windows-manifest $env:TIBOTATTLE_WINDOWS_BINDING_MANIFEST_PATH *> $null

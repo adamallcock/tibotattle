@@ -343,6 +343,7 @@ jobs:
           }
           node ./scripts/build-electron-app.mjs `
             --target win32 `
+            --profile development `
             --output $stagedAppPath `
             --replace `
             --windows-binding $windowsBindingPath `

@@ -23,6 +23,7 @@ import {
   parseElectronRuntimeArguments,
   validateElectronRuntimeOutput,
 } from "../scripts/build-electron-runtime.mjs";
+import { RELEASE_VERSION } from "../config/release-manifest.js";
 
 const REPOSITORY_ROOT = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -323,4 +324,67 @@ test("Electron runtime argument parsing requires an output and paired Windows in
     ]),
     (error) => error.code === "ELECTRON_RUNTIME_WINDOWS_BINDING_TARGET",
   );
+  assert.deepEqual(
+    parseElectronRuntimeArguments([
+      "--output", "/tmp/tibotattle-runtime",
+      "--target", "windows",
+      "--profile", "windows-production",
+      "--version", RELEASE_VERSION,
+    ]),
+    {
+      output: "/tmp/tibotattle-runtime",
+      target: "win32",
+      replace: false,
+      windowsBindingPath: null,
+      windowsManifestPath: null,
+      packagingProfile: "windows-production",
+      packageVersion: RELEASE_VERSION,
+    },
+  );
+  assert.throws(
+    () => parseElectronRuntimeArguments([
+      "--output", "/tmp/tibotattle-runtime",
+      "--profile", "unknown",
+    ]),
+    (error) => error.code === "ELECTRON_RUNTIME_INVALID_PACKAGING_PROFILE",
+  );
+});
+
+test("Windows production profile requires a Windows Electron shell and exact version", async () => {
+  await withTemporaryDirectory(async (root) => {
+    await assert.rejects(
+      () => buildElectronRuntime({
+        output: join(root, "unknown-profile"),
+        packagingProfile: "unknown",
+      }),
+      (error) => error.code === "ELECTRON_RUNTIME_INVALID_PACKAGING_PROFILE",
+    );
+    await assert.rejects(
+      () => buildElectronRuntime({
+        output: join(root, "companion-only"),
+        target: "win32",
+        packagingProfile: "windows-production",
+      }),
+      (error) => error.code === "ELECTRON_RUNTIME_PACKAGING_PROFILE_TARGET",
+    );
+    await assert.rejects(
+      () => buildElectronRuntime({
+        output: join(root, "mac-production"),
+        target: "darwin",
+        includeElectronShell: true,
+        packagingProfile: "windows-production",
+      }),
+      (error) => error.code === "ELECTRON_RUNTIME_PACKAGING_PROFILE_TARGET",
+    );
+    await assert.rejects(
+      () => buildElectronRuntime({
+        output: join(root, "wrong-version"),
+        target: "win32",
+        includeElectronShell: true,
+        packagingProfile: "development",
+        packageVersion: "9.9.9",
+      }),
+      (error) => error.code === "ELECTRON_RUNTIME_INVALID_PACKAGE_VERSION",
+    );
+  });
 });

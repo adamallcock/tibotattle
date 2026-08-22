@@ -52,6 +52,10 @@ import {
   collectMacOSWebModuleGraph,
   pinnedPackage,
 } from "./build-macos-app.js";
+import {
+  canonicalElectronBuilderPackageJsonBytes,
+  ELECTRON_BUILDER_PACKAGE_PROFILES,
+} from "./lib/electron-builder-package-json.mjs";
 import { RELEASE_VERSION } from "../config/release-manifest.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
@@ -61,6 +65,7 @@ const MANIFEST_SCHEMA = "usage-monitor-electron-runtime-v0.1";
 const MAXIMUM_BINDING_BYTES = 64 * 1024 * 1024;
 const MAXIMUM_MANIFEST_BYTES = 1 * 1024 * 1024;
 const DEFAULT_TARGET = "darwin";
+const DEFAULT_PACKAGING_PROFILE = "development";
 const WINDOWS_TARGET = "win32";
 const DARWIN_TARGET = "darwin";
 const WINDOWS_BINDING_RELATIVE_PATH =
@@ -204,6 +209,20 @@ function normalizeTarget(value = DEFAULT_TARGET) {
   if (value === "windows" || value === "win") return WINDOWS_TARGET;
   if (value === DARWIN_TARGET || value === WINDOWS_TARGET) return value;
   fail("INVALID_TARGET", `Unsupported Electron runtime target: ${value}`);
+}
+
+function normalizePackagingProfile(value = DEFAULT_PACKAGING_PROFILE) {
+  if (typeof value !== "string" || !Object.hasOwn(ELECTRON_BUILDER_PACKAGE_PROFILES, value)) {
+    fail("INVALID_PACKAGING_PROFILE", "Unsupported Electron packaging profile");
+  }
+  return value;
+}
+
+function normalizePackageVersion(value = RELEASE_VERSION) {
+  if (typeof value !== "string" || value !== RELEASE_VERSION) {
+    fail("INVALID_PACKAGE_VERSION", "Electron packaging version does not match the reviewed release");
+  }
+  return value;
 }
 
 function normalizeRelativePath(value, label) {
@@ -510,7 +529,7 @@ async function stageRepositoryFile({ repositoryRoot, stagingRoot, relativePath, 
   return { kind, path: selected };
 }
 
-async function stageCapturedWorkspacePackages({ stagingRoot, captures }) {
+async function stageCapturedWorkspacePackages({ stagingRoot, captures, packageJsonOptions }) {
   const staged = [];
   for (const capture of captures) {
     const expectedFiles = WORKSPACE_RUNTIME_PACKAGE_FILES[capture.name];
@@ -527,7 +546,14 @@ async function stageCapturedWorkspacePackages({ stagingRoot, captures }) {
         ...file.relativeFile.split("/"),
       ].join("/");
       const destination = outputPath(stagingRoot, relativePath);
-      await writeCapturedFile(destination, Buffer.from(file.sourceText, "utf8"));
+      await writeCapturedFile(
+        destination,
+        canonicalElectronBuilderPackageJsonBytes(
+          relativePath,
+          Buffer.from(file.sourceText, "utf8"),
+          packageJsonOptions,
+        ),
+      );
       staged.push({ kind: WORKSPACE_PACKAGE_KIND, path: relativePath });
     }
   }
@@ -552,7 +578,13 @@ function packageRuntimeFile(relativePath) {
   return true;
 }
 
-async function stagePackageFiles({ stagingRoot, name, packageRoot, include }) {
+async function stagePackageFiles({
+  stagingRoot,
+  name,
+  packageRoot,
+  include,
+  packageJsonOptions,
+}) {
   const sourceRoot = await realpath(packageRoot);
   const files = await walkFiles(sourceRoot, sourceRoot, {
     skipNestedNodeModules: true,
@@ -569,7 +601,11 @@ async function stagePackageFiles({ stagingRoot, name, packageRoot, include }) {
     const captured = await captureRegularFile(source, `dependency ${relativePath}`);
     await writeCapturedFile(
       outputPath(stagingRoot, relativePath),
-      captured.bytes,
+      canonicalElectronBuilderPackageJsonBytes(
+        relativePath,
+        captured.bytes,
+        packageJsonOptions,
+      ),
       /\.node$/u.test(relativeFile) ? 0o555 : 0o444,
     );
     staged.push({ kind: THIRD_PARTY_KIND, path: relativePath });
@@ -614,12 +650,13 @@ async function resolveThirdPartyPackages(repositoryRoot, target) {
   });
 }
 
-async function stageThirdPartyPackages({ stagingRoot, packages }) {
+async function stageThirdPartyPackages({ stagingRoot, packages, packageJsonOptions }) {
   const staged = [];
   staged.push(...await stagePackageFiles({
     stagingRoot,
     name: packages.ajv.name,
     packageRoot: packages.ajv.root,
+    packageJsonOptions,
     include: (path) => path === "package.json"
       || path === "LICENSE"
       || (path.startsWith("dist/") && (path.endsWith(".js") || path.endsWith(".json"))),
@@ -629,6 +666,7 @@ async function stageThirdPartyPackages({ stagingRoot, packages }) {
       stagingRoot,
       name: packageInfo.name,
       packageRoot: packageInfo.root,
+      packageJsonOptions,
       include: packageRuntimeFile,
     }));
   }
@@ -636,6 +674,7 @@ async function stageThirdPartyPackages({ stagingRoot, packages }) {
     stagingRoot,
     name: packages.runcost.name,
     packageRoot: packages.runcost.root,
+    packageJsonOptions,
     include: (path) => path === "browser.js" || path === "package.json",
   }));
   const keytarArchitecture = packages.keytar.keytarArchitecture;
@@ -643,6 +682,7 @@ async function stageThirdPartyPackages({ stagingRoot, packages }) {
     stagingRoot,
     name: packages.keytar.name,
     packageRoot: packages.keytar.root,
+    packageJsonOptions,
     include: (path) => path === "package.json"
       || path === "LICENSE.md"
       || path === `prebuilds/${keytarArchitecture}/keytar.node`,
@@ -1012,11 +1052,30 @@ export async function buildElectronRuntime({
   windowsBindingPath,
   windowsManifestPath,
   includeElectronShell = false,
+  packagingProfile = DEFAULT_PACKAGING_PROFILE,
+  packageVersion = RELEASE_VERSION,
 } = {}) {
   if (typeof includeElectronShell !== "boolean") {
     fail("INVALID_SHELL_MODE", "includeElectronShell must be a boolean");
   }
   const selectedTarget = normalizeTarget(target);
+  const selectedPackagingProfile = normalizePackagingProfile(packagingProfile);
+  // The production profile is paired with the protected Windows release
+  // config: it may never silently label a companion-only or macOS tree.
+  if (selectedPackagingProfile === "windows-production"
+      && (selectedTarget !== WINDOWS_TARGET || !includeElectronShell)) {
+    fail(
+      "PACKAGING_PROFILE_TARGET",
+      "The Windows production profile requires a Windows Electron shell build",
+    );
+  }
+  const selectedPackageVersion = normalizePackageVersion(packageVersion);
+  const packageJsonOptions = includeElectronShell
+    ? Object.freeze({
+      packageVersion: selectedPackageVersion,
+      profile: selectedPackagingProfile,
+    })
+    : undefined;
   if (selectedTarget !== WINDOWS_TARGET
       && (windowsBindingPath || windowsManifestPath)) {
     fail("WINDOWS_BINDING_TARGET", "Windows binding arguments require the Windows target");
@@ -1070,23 +1129,30 @@ export async function buildElectronRuntime({
     staged.push(...await stageCapturedWorkspacePackages({
       stagingRoot: temporaryRoot,
       captures,
+      packageJsonOptions,
     }));
     const packages = await resolveThirdPartyPackages(REPOSITORY_ROOT, selectedTarget);
     staged.push(...await stageThirdPartyPackages({
       stagingRoot: temporaryRoot,
       packages,
+      packageJsonOptions,
     }));
 
+    const rootPackageBytes = Buffer.from(stableJson({
+      engines: { node: ">=22.13.0" },
+      main: includeElectronShell ? "apps/electron/main.js" : "apps/local/server.js",
+      name: "app-usagemonitor",
+      private: true,
+      type: "module",
+      version: selectedPackageVersion,
+    }), "utf8");
     await writeRegularFile(
       outputPath(temporaryRoot, "package.json"),
-      stableJson({
-        engines: { node: ">=22.13.0" },
-        main: includeElectronShell ? "apps/electron/main.js" : "apps/local/server.js",
-        name: "app-usagemonitor",
-        private: true,
-        type: "module",
-        version: RELEASE_VERSION,
-      }),
+      canonicalElectronBuilderPackageJsonBytes(
+        "package.json",
+        rootPackageBytes,
+        packageJsonOptions,
+      ),
     );
 
     let windowsBinding;
@@ -1131,7 +1197,7 @@ export async function buildElectronRuntime({
       schemaVersion: MANIFEST_SCHEMA,
       target: selectedTarget,
       architecture: selectedTarget === WINDOWS_TARGET ? "x64" : "arm64",
-      releaseVersion: RELEASE_VERSION,
+      releaseVersion: selectedPackageVersion,
       entrypoint: includeElectronShell ? "apps/electron/main.js" : "apps/local/server.js",
       dashboardRoot: "apps/web/public",
       files: inventory,
@@ -1230,7 +1296,8 @@ export function parseElectronRuntimeArguments(argv) {
       parsed.replace = true;
       continue;
     }
-    if (!["--output", "--target", "--platform", "--windows-binding", "--windows-manifest"].includes(argument)) {
+    if (!["--output", "--target", "--platform", "--windows-binding", "--windows-manifest",
+      "--profile", "--version"].includes(argument)) {
       fail("INVALID_ARGUMENT", `Unknown Electron runtime argument: ${argument}`);
     }
     const value = argv[index + 1];
@@ -1241,6 +1308,8 @@ export function parseElectronRuntimeArguments(argv) {
     if (argument === "--output") parsed.output = value;
     else if (argument === "--target" || argument === "--platform") parsed.target = normalizeTarget(value);
     else if (argument === "--windows-binding") parsed.windowsBindingPath = value;
+    else if (argument === "--profile") parsed.packagingProfile = normalizePackagingProfile(value);
+    else if (argument === "--version") parsed.packageVersion = value;
     else parsed.windowsManifestPath = value;
   }
   if (!parsed.output) fail("INVALID_ARGUMENT", "--output /absolute/path is required");

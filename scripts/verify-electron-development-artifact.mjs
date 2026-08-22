@@ -34,13 +34,15 @@ import { fileURLToPath } from "node:url";
 import {
   KEYTAR_WIN32_X64_SHA256,
 } from "../src/platform/windows-credential-manager-probe.js";
+import {
+  transformElectronBuilderPackageJsonBytes,
+} from "./lib/electron-builder-package-json.mjs";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const require = createRequire(import.meta.url);
 
 const RUNTIME_MANIFEST_FILE = "electron-runtime-manifest.json";
 const RUNTIME_MANIFEST_SCHEMA = "usage-monitor-electron-runtime-v0.1";
-const ELECTRON_DEV_PRODUCT_NAME = "TiboTattle Dev";
 const WINDOWS_BINDING_PATH =
   "native/windows-filesystem/build/Release/windows_filesystem.node";
 const WINDOWS_BINDING_MANIFEST_PATH = `${WINDOWS_BINDING_PATH}.manifest.json`;
@@ -1003,57 +1005,6 @@ async function validateWindowsBinding({ appPath, staged }) {
   return Object.freeze({ bytes: bindingBytes.byteLength, sha256: sha256(bindingBytes) });
 }
 
-const ELECTRON_BUILDER_IGNORED_PACKAGE_PROPERTIES = new Set([
-  "dist",
-  "gitHead",
-  "build",
-  "jspm",
-  "ava",
-  "xo",
-  "nyc",
-  "eslintConfig",
-  "contributors",
-  "bundleDependencies",
-  "tags",
-]);
-
-function transformedPackageJsonBytes(path, sourceBytes) {
-  const isMain = path === "package.json";
-  const isDependency = path.startsWith("node_modules/") && path.endsWith("/package.json");
-  if (!isMain && !isDependency) return null;
-  let data;
-  try {
-    data = JSON.parse(sourceBytes.toString("utf8"));
-  } catch {
-    return null;
-  }
-  let changed = false;
-  if (isMain) {
-    // The pinned development builder config supplies this through
-    // extraMetadata. It also reserializes the main package without a final
-    // newline.
-    data.productName = ELECTRON_DEV_PRODUCT_NAME;
-    changed = true;
-  }
-  const dependencies = data.dependencies;
-  const removeBabel = dependencies !== null
-    && typeof dependencies === "object"
-    && !Object.getOwnPropertyNames(dependencies).some((name) => name.startsWith("babel"));
-  for (const property of Object.getOwnPropertyNames(data)) {
-    if (property[0] === "_"
-        || ELECTRON_BUILDER_IGNORED_PACKAGE_PROPERTIES.has(property)
-        || property === "scripts"
-        || property === "keywords"
-        || (isMain && property === "devDependencies")
-        || (isDependency && property === "bugs")
-        || (removeBabel && property === "babel")) {
-      delete data[property];
-      changed = true;
-    }
-  }
-  return changed ? Buffer.from(JSON.stringify(data, null, 2)) : null;
-}
-
 async function compareArtifactToStaged({ appPath, staged, archive, unpacked }) {
   const artifactRows = [...archive, ...unpacked];
   const artifactMap = rowsByPath(artifactRows);
@@ -1073,7 +1024,10 @@ async function compareArtifactToStaged({ appPath, staged, archive, unpacked }) {
       FIXED_STATUS.stagedInventoryInvalid,
       appPath,
     );
-    const transformed = transformedPackageJsonBytes(row.path, sourceBytes);
+    const transformed = transformElectronBuilderPackageJsonBytes(row.path, sourceBytes, {
+      packageVersion: staged.manifest.releaseVersion,
+      profile: "development",
+    });
     if (transformed === null
         || transformed.byteLength !== artifact.bytes
         || sha256(transformed) !== artifact.sha256) {

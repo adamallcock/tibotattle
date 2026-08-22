@@ -16,6 +16,9 @@ import { fileURLToPath } from "node:url";
 import {
   buildElectronRuntime,
 } from "./build-electron-runtime.mjs";
+import {
+  ELECTRON_BUILDER_PACKAGE_PROFILES,
+} from "./lib/electron-builder-package-json.mjs";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
@@ -43,6 +46,15 @@ function failure(code, message) {
 
 function fail(code, message) {
   throw failure(code, message);
+}
+
+function normalizePackagingProfile(value) {
+  if (value === undefined) return value;
+  if (typeof value !== "string"
+      || !Object.hasOwn(ELECTRON_BUILDER_PACKAGE_PROFILES, value)) {
+    fail("INVALID_PROFILE", "The Electron packaging profile is not supported");
+  }
+  return value;
 }
 
 function normalizeTarget(value = DARWIN_TARGET) {
@@ -88,8 +100,11 @@ export async function buildElectronApp({
   replace = false,
   windowsBindingPath,
   windowsManifestPath,
+  packagingProfile,
+  packageVersion,
 } = {}) {
   const selectedTarget = normalizeTarget(target);
+  const selectedPackagingProfile = normalizePackagingProfile(packagingProfile);
   const windowsInputs = selectedTarget === WINDOWS_TARGET
     ? await requireWindowsInputs({ windowsBindingPath, windowsManifestPath })
     : null;
@@ -103,6 +118,8 @@ export async function buildElectronApp({
     target: selectedTarget,
     replace,
     includeElectronShell: true,
+    packagingProfile: selectedPackagingProfile,
+    packageVersion,
     ...(windowsInputs ?? {}),
   });
 }
@@ -121,7 +138,8 @@ export function parseElectronAppArguments(argv) {
       continue;
     }
     if (argument !== "--output" && argument !== "--target" && argument !== "--platform"
-        && argument !== "--windows-binding" && argument !== "--windows-manifest") {
+        && argument !== "--windows-binding" && argument !== "--windows-manifest"
+        && argument !== "--profile" && argument !== "--version") {
       fail("INVALID_ARGUMENT", `Unknown Electron app argument: ${argument}`);
     }
     const value = argv[index + 1];
@@ -132,6 +150,8 @@ export function parseElectronAppArguments(argv) {
     if (argument === "--output") parsed.output = value;
     else if (argument === "--target" || argument === "--platform") parsed.target = normalizeTarget(value);
     else if (argument === "--windows-binding") parsed.windowsBindingPath = value;
+    else if (argument === "--profile") parsed.packagingProfile = normalizePackagingProfile(value);
+    else if (argument === "--version") parsed.packageVersion = value;
     else parsed.windowsManifestPath = value;
   }
   if ((parsed.windowsBindingPath && !parsed.windowsManifestPath)

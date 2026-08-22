@@ -30,6 +30,9 @@ import {
   WINDOWS_NATIVE_PRESIGN_KEYTAR_SHA256,
 } from "../scripts/windows-native-presign.mjs";
 import {
+  canonicalElectronBuilderPackageJsonBytes,
+} from "../scripts/lib/electron-builder-package-json.mjs";
+import {
   WINDOWS_FINALIZER_HANDOFF_SCHEMA,
   WINDOWS_FINALIZER_HANDOFF_STATUS,
   WINDOWS_FINALIZER_PRODUCTION_READINESS,
@@ -158,8 +161,13 @@ async function fixture() {
   await mkdir(stagingRoot, { recursive: true });
   await mkdir(evidenceRoot, { recursive: true });
   const keytar = await readFile(KEYTAR_SOURCE);
+  const stagedPackage = canonicalElectronBuilderPackageJsonBytes(
+    "package.json",
+    Buffer.from(stableJson(packageValue()), "utf8"),
+    { packageVersion: PACKAGE_VERSION, profile: "windows-production" },
+  );
   const rows = [
-    { bytes: Buffer.byteLength(stableJson(packageValue())), kind: "runtime_metadata", path: "package.json", sha256: sha256(Buffer.from(stableJson(packageValue()))) },
+    { bytes: stagedPackage.byteLength, kind: "runtime_metadata", path: "package.json", sha256: sha256(stagedPackage) },
     { bytes: BINDING.byteLength, kind: "windows_native_binding", path: BINDING_PATH, sha256: sha256(BINDING) },
     { bytes: SIDECAR.byteLength, kind: "windows_native_binding", path: SIDECAR_PATH, sha256: sha256(SIDECAR) },
     { bytes: keytar.byteLength, kind: "third_party_dependency", path: KEYTAR_PATH, sha256: sha256(keytar) },
@@ -182,7 +190,7 @@ async function fixture() {
     },
   };
   const files = new Map([
-    ["package.json", Buffer.from(stableJson(packageValue()), "utf8")],
+    ["package.json", stagedPackage],
     [BINDING_PATH, BINDING],
     [SIDECAR_PATH, SIDECAR],
     [KEYTAR_PATH, keytar],

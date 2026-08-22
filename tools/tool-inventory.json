@@ -520,6 +520,27 @@
     },
     {
       "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/lib/electron-builder-package-json.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Pinned electron-builder package-json canonicalization is an imported integrity helper, not a command entry point.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/build-electron-app.mjs",
+        "scripts/build-electron-runtime.mjs",
+        "scripts/build-windows-native-presign-input.mjs",
+        "scripts/verify-electron-development-artifact.mjs",
+        "scripts/verify-windows-production-packaged-artifact.mjs",
+        "test/electron-builder-package-json.test.js",
+        "test/windows-native-presign-input-builder.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
       "owner": "local_review_release",
       "canonicalPath": "scripts/lib/local-review-artifact-archive.mjs",
       "stableAlias": null,

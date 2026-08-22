@@ -259,6 +259,8 @@ test("handoff, production binding, and staging gates are explicit", () => {
   mustInclude(".release-build/electron-production/windows-x64/app");
   mustInclude("build-electron-app.mjs");
   mustInclude("--target win32");
+  mustInclude("--profile windows-production");
+  mustInclude("--version $env:TIBOTATTLE_PACKAGE_VERSION");
   mustInclude("--windows-binding $env:TIBOTATTLE_WINDOWS_BINDING_PATH");
   mustInclude("--windows-manifest $env:TIBOTATTLE_WINDOWS_BINDING_MANIFEST_PATH");
   mustInclude("$runtime.windowsBinding.binding.bytes -ne $native.bytes");
