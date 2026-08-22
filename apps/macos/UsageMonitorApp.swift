@@ -2963,11 +2963,15 @@ private final class NativeDashboardChrome: NSSplitViewController {
     /// and above the report item's default 250 so a window resize stretches
     /// the report rather than the sidebar.
     private static let sidebarHoldingPriority = NSLayoutConstraint.Priority(260)
-    private static let splitAutosaveName = "com.usagemonitor.local.dashboard-split.v1"
+    static let splitAutosaveName = "com.usagemonitor.local.dashboard-split.v1"
     /// One-time marker that the resting width has been seeded. After this,
     /// the autosaved divider position is the user's own and is never fought.
     private static let splitSeededDefaultsKey =
         "tibotattle.dashboard-split-seeded.v1"
+    /// One-time marker that a sidebar stranded by an older build has been
+    /// reopened. See `rescueStrandedSidebar(_:)`.
+    static let sidebarRescuedDefaultsKey =
+        "tibotattle.dashboard-sidebar-rescued.v1"
 
     private let sidebar = NSVisualEffectView()
     private let sidebarWash = NativeSidebarBrandWash()
@@ -3091,6 +3095,46 @@ private final class NativeDashboardChrome: NSSplitViewController {
         nil
     }
 
+    /// The sidebar pane's split item. The sidebar is added first, so it is the
+    /// leading item; reading it back through `splitViewItems` keeps a single
+    /// source of truth rather than a second stored reference that could drift.
+    private var sidebarItem: NSSplitViewItem? { splitViewItems.first }
+
+    /// Whether the sidebar is currently collapsed. The navigation rows live
+    /// only here — the web report hides its own sidebar in native mode — so a
+    /// collapsed sidebar is a window with no way to change page.
+    var sidebarIsCollapsed: Bool { sidebarItem?.isCollapsed ?? false }
+
+    /// Reopen the sidebar. Returns true when it actually reopened one, so a
+    /// caller (and the smoke test) can tell a rescue from a no-op.
+    @discardableResult
+    func revealSidebar() -> Bool {
+        guard let item = sidebarItem, item.isCollapsed else { return false }
+        item.isCollapsed = false
+        return true
+    }
+
+    /// Reopen a sidebar that an older build could strand shut.
+    ///
+    /// Dragging the divider to the leading edge collapses the sidebar, and the
+    /// split view's autosave persists that across relaunches — but builds
+    /// through 0.1.16 shipped no toolbar item, menu command, or key equivalent
+    /// that could reopen it, and a collapsed pane has no divider left to drag.
+    /// The result was a window with no navigation at all, permanently
+    /// (owner-reported, 2026-08-22).
+    ///
+    /// This build adds those affordances, so a collapse is now the user's
+    /// reversible choice and must be respected. The one exception is the
+    /// stranded state itself: reopen it exactly once, on the first launch that
+    /// can undo it, then record the marker and never reopen again.
+    private func rescueStrandedSidebar(_ defaults: UserDefaults) {
+        guard !defaults.bool(forKey: Self.sidebarRescuedDefaultsKey) else {
+            return
+        }
+        defaults.set(true, forKey: Self.sidebarRescuedDefaultsKey)
+        revealSidebar()
+    }
+
     /// The very first launch has no autosaved divider to restore, and plain
     /// constraint solving would rest the sidebar at its 180pt minimum. Seed
     /// the designed 216pt opening width exactly once; every later launch
@@ -3100,12 +3144,35 @@ private final class NativeDashboardChrome: NSSplitViewController {
         guard !restingWidthSeeded else { return }
         restingWidthSeeded = true
         let defaults = UserDefaults.standard
+        // Before the seeding gate below: every already-installed user has the
+        // seeded marker set, and a stranded sidebar is exactly the state those
+        // users are in, so a rescue behind that early return would never run.
+        rescueStrandedSidebar(defaults)
         guard !defaults.bool(forKey: Self.splitSeededDefaultsKey) else {
             return
         }
         defaults.set(true, forKey: Self.splitSeededDefaultsKey)
         view.layoutSubtreeIfNeeded()
         splitView.setPosition(Self.sidebarRestingThickness, ofDividerAt: 0)
+    }
+
+    /// Keep the sidebar command readable in the View menu: AppKit flips the
+    /// toolbar item's own label, but a menu item keeps whatever title it was
+    /// built with unless validation rewrites it.
+    override func validateUserInterfaceItem(
+        _ item: NSValidatedUserInterfaceItem
+    ) -> Bool {
+        if item.action == #selector(NSSplitViewController.toggleSidebar(_:)) {
+            if let menuItem = item as? NSMenuItem {
+                menuItem.title = TiboTattleLocalization.string(
+                    sidebarIsCollapsed
+                        ? .nativeDashboardShowSidebar
+                        : .nativeDashboardHideSidebar
+                )
+            }
+            return true
+        }
+        return super.validateUserInterfaceItem(item)
     }
 
     func select(_ destination: NativeDashboardDestination) {
@@ -3840,6 +3907,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         _ toolbar: NSToolbar
     ) -> [NSToolbarItem.Identifier] {
         [
+            .toggleSidebar,
             .flexibleSpace,
             Self.toolbarStatusRefreshIdentifier,
             Self.toolbarShareIdentifier,
@@ -3851,6 +3919,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         _ toolbar: NSToolbar
     ) -> [NSToolbarItem.Identifier] {
         [
+            // The system sidebar toggle, first and always present. The sidebar
+            // can be collapsed by dragging its divider, and a collapsed pane
+            // leaves no divider to drag back — so the only guaranteed way back
+            // must live outside the sidebar. AppKit supplies this item, keeps
+            // its icon and Hide/Show label in step with the pane, and routes
+            // it to `toggleSidebar(_:)` down the responder chain.
+            .toggleSidebar,
             Self.toolbarStatusRefreshIdentifier,
             .flexibleSpace,
             Self.toolbarShareIdentifier,
@@ -4655,6 +4730,21 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         )
         refresh.target = self
         viewMenu.addItem(refresh)
+        // The standard macOS sidebar command, on the standard key equivalent.
+        // A collapsed sidebar has no divider left to drag, so this and the
+        // toolbar item are the two ways back; the title is rewritten to
+        // Hide/Show by the chrome's validation. Target stays nil so the
+        // responder chain delivers it to whichever dashboard window is key,
+        // and the item disables itself when none is.
+        viewMenu.addItem(NSMenuItem.separator())
+        let toggleSidebar = NSMenuItem(
+            title: TiboTattleLocalization.string(.nativeDashboardHideSidebar),
+            action: #selector(NSSplitViewController.toggleSidebar(_:)),
+            keyEquivalent: "s"
+        )
+        toggleSidebar.keyEquivalentModifierMask = [.control, .command]
+        toggleSidebar.target = nil
+        viewMenu.addItem(toggleSidebar)
         viewItem.submenu = viewMenu
         mainMenu.addItem(viewItem)
         NSApp.mainMenu = mainMenu
@@ -8466,6 +8556,182 @@ private enum NativeDashboardLayoutSmokeTest {
     }
 }
 
+/// Proves a collapsed sidebar can always be reopened.
+///
+/// Source text can show that a toolbar item and a menu command exist; it cannot
+/// show that either one reaches a live target, nor that the pane actually comes
+/// back with usable width. This drives the real chrome: collapse it the way a
+/// divider drag leaves it, then reopen it through the same action the toolbar
+/// and menu send, and check the one-time rescue for sidebars that older builds
+/// stranded shut.
+@MainActor
+private enum NativeDashboardSidebarRecoverySmokeTest {
+    static func run() -> Int32 {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        let defaults = UserDefaults.standard
+        // This runs inside the shipped bundle's own defaults domain, so the
+        // markers it must forge are saved and put back before returning.
+        let rescueKey = NativeDashboardChrome.sidebarRescuedDefaultsKey
+        let priorRescue = defaults.object(forKey: rescueKey)
+        defer {
+            if let priorRescue {
+                defaults.set(priorRescue, forKey: rescueKey)
+            } else {
+                defaults.removeObject(forKey: rescueKey)
+            }
+            // Defaults writes are asynchronous and this process exits
+            // immediately after returning; without the flush the restore is
+            // lost and the smoke would silently consume the real one-time
+            // rescue belonging to whoever ran it.
+            defaults.synchronize()
+        }
+
+        func makeChrome() -> (NativeDashboardChrome, NSWindow) {
+            let host = DashboardWebHost(
+                onLoaded: {},
+                onFailure: { _ in },
+                onDownloadFailure: {},
+                openExternally: { _ in },
+                onNavigation: { _ in },
+                onLanguagePreferenceChange: { _ in }
+            )
+            let chrome = NativeDashboardChrome(webView: host.webView)
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 1_180, height: 860),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                backing: .buffered,
+                defer: false
+            )
+            window.contentViewController = chrome
+            window.setContentSize(NSSize(width: 1_180, height: 860))
+            window.displayIfNeeded()
+            chrome.view.layoutSubtreeIfNeeded()
+            return (chrome, window)
+        }
+
+        // A collapsed item keeps its own pane's width — AppKit hides the pane
+        // rather than zeroing it — so the width alone cannot tell the states
+        // apart. What the user actually sees is where the report begins: flush
+        // against the window's leading edge with the sidebar gone, or pushed
+        // right by the sidebar's full width when it is back.
+        func panes(
+            _ chrome: NativeDashboardChrome,
+            _ window: NSWindow
+        ) -> (sidebar: CGFloat, report: CGFloat, reportLeading: CGFloat) {
+            chrome.view.layoutSubtreeIfNeeded()
+            guard let reference = window.contentView else { return (0, 0, 0) }
+            let metrics = chrome.measure(in: reference)
+            return (
+                metrics.sidebarPane.width,
+                metrics.reportPane.width,
+                metrics.reportPane.minX
+            )
+        }
+
+        let (chrome, window) = makeChrome()
+
+        // 1. Collapse the way a divider dragged to the leading edge leaves it.
+        chrome.splitViewItems.first?.isCollapsed = true
+        let collapsed = chrome.sidebarIsCollapsed
+        let collapsedPanes = panes(chrome, window)
+        let collapsedWidth = collapsedPanes.sidebar
+
+        // 2. The action both affordances send must reach a live target.
+        let selector = #selector(NSSplitViewController.toggleSidebar(_:))
+        let responds = chrome.responds(to: selector)
+
+        // 3. Validation enables the command and names the state it will move
+        //    to, in both directions.
+        let probe = NSMenuItem(
+            title: "",
+            action: selector,
+            keyEquivalent: ""
+        )
+        let enabledWhileCollapsed = chrome.validateUserInterfaceItem(probe)
+        let showTitle = probe.title
+
+        // 4. Reopening restores a pane at or above the enforced minimum, and
+        //    the report gives back the width the sidebar now occupies.
+        let revealed = chrome.revealSidebar()
+        let revealedPanes = panes(chrome, window)
+        let revealedWidth = revealedPanes.sidebar
+        let reportYielded = collapsedPanes.report - revealedPanes.report
+        _ = chrome.validateUserInterfaceItem(probe)
+        let hideTitle = probe.title
+
+        // 5. A sidebar stranded by an older build reopens once on upgrade.
+        defaults.removeObject(forKey: rescueKey)
+        let (stranded, strandedWindow) = makeChrome()
+        _ = strandedWindow
+        stranded.splitViewItems.first?.isCollapsed = true
+        stranded.viewDidAppear()
+        let rescued = !stranded.sidebarIsCollapsed
+
+        // 6. After that one rescue a deliberate collapse is left alone: the
+        //    marker is set, and the user can reopen it themselves now.
+        let (afterRescue, afterWindow) = makeChrome()
+        _ = afterWindow
+        afterRescue.splitViewItems.first?.isCollapsed = true
+        afterRescue.viewDidAppear()
+        let respectsChoice = afterRescue.sidebarIsCollapsed
+
+        let minimum = NativeDashboardChrome.sidebarMinimumThickness
+        guard collapsed,
+              // Nothing between the window edge and the report.
+              collapsedPanes.reportLeading < 1,
+              // The sidebar is back in front of it, at its enforced width.
+              revealedPanes.reportLeading >= minimum,
+              responds,
+              enabledWhileCollapsed,
+              showTitle == TiboTattleLocalization.string(
+                  .nativeDashboardShowSidebar
+              ),
+              revealed,
+              revealedWidth >= minimum,
+              reportYielded >= minimum,
+              hideTitle == TiboTattleLocalization.string(
+                  .nativeDashboardHideSidebar
+              ),
+              rescued,
+              respectsChoice
+        else {
+            FileHandle.standardError.write(
+                Data(
+                    ("macOS sidebar recovery smoke failed "
+                        + "collapsed=\(collapsed) "
+                        + "collapsed_width=\(Int(collapsedWidth)) "
+                        + "collapsed_report_leading="
+                        + "\(Int(collapsedPanes.reportLeading)) "
+                        + "revealed_report_leading="
+                        + "\(Int(revealedPanes.reportLeading)) "
+                        + "responds=\(responds) "
+                        + "enabled=\(enabledWhileCollapsed) "
+                        + "show_title=\(showTitle) "
+                        + "revealed=\(revealed) "
+                        + "revealed_width=\(Int(revealedWidth)) "
+                        + "report_yielded=\(Int(reportYielded)) "
+                        + "hide_title=\(hideTitle) "
+                        + "rescued=\(rescued) "
+                        + "respects_choice=\(respectsChoice)\n").utf8
+                )
+            )
+            return 1
+        }
+        print(
+            "USAGE_MONITOR_MACOS_SIDEBAR_RECOVERY "
+                + "collapse=true "
+                + "responds=true "
+                + "menu_enabled=true "
+                + "reveal=true "
+                + "width=\(Int(revealedWidth)) "
+                + "rescue_once=true "
+                + "respects_choice=true"
+        )
+        return 0
+    }
+}
+
 /// Opens the shipped dashboard window and measures the chrome in it. This is
 /// the guard for the reported "the menu is not seamless, not rounded, and not
 /// even the right size" defect, and the three things it pins are the three
@@ -8872,6 +9138,11 @@ private struct UsageMonitorMain {
         if arguments.contains("--native-dashboard-layout-smoke-test") {
             exit(MainActor.assumeIsolated {
                 NativeDashboardLayoutSmokeTest.run()
+            })
+        }
+        if arguments.contains("--native-dashboard-sidebar-recovery-smoke-test") {
+            exit(MainActor.assumeIsolated {
+                NativeDashboardSidebarRecoverySmokeTest.run()
             })
         }
         let application = NSApplication.shared

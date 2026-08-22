@@ -1312,8 +1312,14 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.equal(
     source.match(/setActivationPolicy\(\.accessory\)/gu)?.length,
-    3,
+    4,
     "only isolated AppKit smoke modes may use accessory activation",
+  );
+  // The fourth is the sidebar-recovery smoke, which builds real chrome in a
+  // window it never brings forward.
+  assert.match(
+    source,
+    /private enum NativeDashboardSidebarRecoverySmokeTest \{[\s\S]*?application\.setActivationPolicy\(\.accessory\)/u,
   );
   for (const forbidden of [
     "LSUIElement",
@@ -1754,6 +1760,56 @@ test("dashboard sidebar resizes for real, wears the brand palette, and the title
   assert.match(
     source,
     /NativeDashboardChrome\.sidebarMinimumThickness - 1/u,
+  );
+  // 1b. A collapsed sidebar must always be reopenable. The sidebar can be
+  // collapsed by dragging its divider to the leading edge, the split view's
+  // autosave persists that across relaunches, and a collapsed pane leaves no
+  // divider to drag back — so builds through 0.1.16, which had neither a
+  // toolbar item nor a menu command for it, stranded the window with no
+  // navigation at all (owner-reported, 2026-08-22). Two independent ways back
+  // are pinned here because the sidebar is the only navigation the packaged
+  // app has: the web report hides its own sidebar in native mode.
+  assert.match(source, /sidebarItem\.canCollapse = true/u);
+  // The system toolbar toggle, in both the allowed and the default sets, so
+  // it is present on a fresh install and cannot be customized away without
+  // the menu command below still existing.
+  const toolbarDefaults = source.match(
+    /func toolbarDefaultItemIdentifiers\(\s*\n\s*_ toolbar: NSToolbar\s*\n\s*\) -> \[NSToolbarItem\.Identifier\] \{([\s\S]*?)\n    \}/u,
+  )?.[1];
+  assert.ok(toolbarDefaults, "the toolbar default identifiers are available");
+  assert.match(toolbarDefaults, /\.toggleSidebar/u);
+  const toolbarAllowed = source.match(
+    /func toolbarAllowedItemIdentifiers\(\s*\n\s*_ toolbar: NSToolbar\s*\n\s*\) -> \[NSToolbarItem\.Identifier\] \{([\s\S]*?)\n    \}/u,
+  )?.[1];
+  assert.ok(toolbarAllowed, "the toolbar allowed identifiers are available");
+  assert.match(toolbarAllowed, /\.toggleSidebar/u);
+  // The standard macOS command and key equivalent, on the responder chain so
+  // it reaches whichever dashboard window is key.
+  assert.match(
+    source,
+    /action: #selector\(NSSplitViewController\.toggleSidebar\(_:\)\),\s*\n\s*keyEquivalent: "s"/u,
+  );
+  assert.match(
+    source,
+    /toggleSidebar\.keyEquivalentModifierMask = \[\.control, \.command\]/u,
+  );
+  // The one-time rescue must run BEFORE the seeding gate returns: every
+  // already-installed user has the seeded marker set, and a stranded sidebar
+  // is exactly the state those users are in, so a rescue behind that early
+  // return would never execute for the people who need it.
+  const viewDidAppear = source.match(
+    /override func viewDidAppear\(\) \{([\s\S]*?)\n    \}/u,
+  )?.[1];
+  assert.ok(viewDidAppear, "the chrome's viewDidAppear is available");
+  assert.ok(
+    viewDidAppear.indexOf("rescueStrandedSidebar(defaults)")
+      < viewDidAppear.indexOf("guard !defaults.bool(forKey: Self.splitSeededDefaultsKey)"),
+    "the stranded-sidebar rescue must precede the seeding early return",
+  );
+  // The rescue fires once and then never fights a deliberate collapse.
+  assert.match(
+    source,
+    /private func rescueStrandedSidebar\(_ defaults: UserDefaults\) \{\s*\n\s*guard !defaults\.bool\(forKey: Self\.sidebarRescuedDefaultsKey\) else \{\s*\n\s*return\s*\n\s*\}\s*\n\s*defaults\.set\(true, forKey: Self\.sidebarRescuedDefaultsKey\)/u,
   );
   // 2. The sidebar carries the web report's warm-paper palette over the
   // system material, and the selected row uses the brand's deep green
@@ -5867,6 +5923,26 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.match(
       nativeDashboardLayoutSmoke.stdout,
       /^USAGE_MONITOR_MACOS_NATIVE_DASHBOARD_LAYOUT web_width=[6-9][0-9]{2,} web_height=[6-9][0-9]{2,}$/mu,
+    );
+    // A sidebar that cannot be reopened is a window with no navigation: the
+    // rows live only here, because the web report hides its own sidebar in
+    // native mode. Source text can show a toolbar item and a menu command
+    // exist; only this proves the action reaches a live target, that the pane
+    // returns at its enforced width, and that a sidebar stranded shut by an
+    // older build reopens exactly once on upgrade.
+    const sidebarRecoverySmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--native-dashboard-sidebar-recovery-smoke-test"],
+      { encoding: "utf8", timeout: 15_000 },
+    );
+    assert.equal(
+      sidebarRecoverySmoke.status,
+      0,
+      sidebarRecoverySmoke.stderr || sidebarRecoverySmoke.stdout,
+    );
+    assert.match(
+      sidebarRecoverySmoke.stdout,
+      /^USAGE_MONITOR_MACOS_SIDEBAR_RECOVERY collapse=true responds=true menu_enabled=true reveal=true width=[12][0-9]{2} rescue_once=true respects_choice=true$/mu,
     );
     const generatedFiles = bundleFiles
       .map(({ relativePath }) => relativePath)
