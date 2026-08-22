@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { constants as SQLITE_CONSTANTS } from "node:sqlite";
+import { DatabaseSync, constants as SQLITE_CONSTANTS } from "node:sqlite";
 import test from "node:test";
 
 import {
@@ -14,6 +14,9 @@ import {
   isWindowsSqliteStateSession,
   isWindowsSqliteStateSessionError,
 } from "../src/platform/windows-sqlite-state-session.js";
+import {
+  WINDOWS_SQLITE_STATE_FIXTURE_TABLE,
+} from "./fixtures/windows-sqlite-state-session-values.mjs";
 
 const ROOT = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state";
 const DATABASE_NAME = "local-collector-state-v1.sqlite";
@@ -21,6 +24,28 @@ const IDENTITY = Object.freeze({
   volumeSerialNumber: "0000000000000001",
   fileId: "00112233445566778899aabbccddeeff",
   linkCount: 1,
+});
+
+test("the native qualification fixture uses a legal portable SQLite schema", () => {
+  assert.match(WINDOWS_SQLITE_STATE_FIXTURE_TABLE, /^[a-z][a-z0-9_]*$/u);
+  assert.doesNotMatch(WINDOWS_SQLITE_STATE_FIXTURE_TABLE, /^sqlite_/iu);
+  const database = new DatabaseSync(":memory:");
+  try {
+    database.exec(
+      `CREATE TABLE IF NOT EXISTS ${WINDOWS_SQLITE_STATE_FIXTURE_TABLE} (id INTEGER PRIMARY KEY, marker TEXT NOT NULL);`,
+    );
+    database.prepare(
+      `INSERT INTO ${WINDOWS_SQLITE_STATE_FIXTURE_TABLE}(marker) VALUES ('portable-marker');`,
+    ).run();
+    assert.equal(
+      database.prepare(
+        `SELECT COUNT(*) AS count FROM ${WINDOWS_SQLITE_STATE_FIXTURE_TABLE};`,
+      ).get().count,
+      1,
+    );
+  } finally {
+    database.close();
+  }
 });
 
 function nativeError(code) {

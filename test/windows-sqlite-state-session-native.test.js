@@ -14,6 +14,9 @@ import {
   isWindowsFilesystemNotFound,
 } from "../src/platform/windows-filesystem.js";
 import { classifyWindowsSqliteError } from "../scripts/windows-security-qualification.mjs";
+import {
+  WINDOWS_SQLITE_STATE_FIXTURE_TABLE,
+} from "./fixtures/windows-sqlite-state-session-values.mjs";
 
 const NATIVE_WINDOWS = process.platform === "win32" && process.arch === "x64";
 const NATIVE_SKIP = NATIVE_WINDOWS ? false : "native Windows x64 only";
@@ -28,7 +31,7 @@ const QUALIFICATION_BINDING_FILE = "windows_filesystem_qualification.node";
 const DATABASE_NAME = "sqlite-state-session-native.sqlite";
 const SAME_PROCESS_DATABASE_NAME = "sqlite-state-session-native-same-process.sqlite";
 const RELEASE_FAILURE_DATABASE_NAME = "sqlite-state-session-native-release-failure.sqlite";
-const TABLE_NAME = "sqlite_state_fixture";
+const TABLE_NAME = WINDOWS_SQLITE_STATE_FIXTURE_TABLE;
 const SIDECAR_BLOCKED_CODES = new Set(["EACCES", "EBUSY", "EEXIST", "EPERM"]);
 
 function qualificationBindingPath() {
