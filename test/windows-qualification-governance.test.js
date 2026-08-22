@@ -384,6 +384,28 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /runtime aggregate check/u);
   assert.match(workflow, /No raw smoke output,?/u);
   assert.match(workflow, /TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH=\$runtimeEvidencePath/u);
+  const runtimeStepBody = workflow.slice(runtimeStep, receiptStep);
+  const normalizedRuntimeSummary = runtimeStepBody.slice(
+    runtimeStepBody.indexOf("function Write-NormalizedRuntimeSummary"),
+    runtimeStepBody.indexOf("[IO.File]::WriteAllText"),
+  );
+  assert.match(normalizedRuntimeSummary, /- Status: \$\(\$Evidence\.status\)/u);
+  assert.match(normalizedRuntimeSummary, /- Failure stage: \$\(\$Evidence\.failureStage\)/u);
+  assert.match(normalizedRuntimeSummary, /- Failure reason: \$\(\$Evidence\.failureReason\)/u);
+  assert.doesNotMatch(normalizedRuntimeSummary, /Target|Dashboard|path|command|process|stdout|stderr/iu);
+  assert.match(
+    runtimeStepBody,
+    /Write-NormalizedRuntimeSummary -Evidence \$defaultRuntimeEvidence\s+Remove-VerifiedRuntimeRawOutput/u,
+  );
+  assert.match(
+    runtimeStepBody,
+    /Write-NormalizedRuntimeSummary -Evidence \$runtimeEvidence\s+Remove-VerifiedRuntimeRawOutput/u,
+  );
+  assert.ok(
+    runtimeStepBody.indexOf("Write-NormalizedRuntimeSummary -Evidence $runtimeEvidence")
+      < runtimeStepBody.indexOf("Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_FAILED'"),
+    "normalized runtime status must be summarized before runtime failure exits",
+  );
   assert.match(workflow, /WINDOWS_ELECTRON_VERIFICATION_LOG_DELETE_FAILED/u);
   assert.match(workflow, /Test-Path -LiteralPath \$verificationLog -ErrorAction Stop/u);
   assert.match(workflow, /WINDOWS_ELECTRON_RUNTIME_SMOKE_EVIDENCE_NOT_CONTENT_FREE/u);
@@ -508,7 +530,34 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.doesNotMatch(runtimeFailureUpload, /TIBOTATTLE_ELECTRON_ARTIFACT_APP_PATH/u);
   assert.match(
     workflow,
-    /always\(\) && !cancelled\(\) && steps\.electron_artifact_verification\.outcome == 'success' && \(\(steps\.native_security_qualification\.outcome == 'failure' && steps\.electron_runtime_smoke\.outcome == 'success'\) \|\| \(steps\.native_security_qualification\.outcome == 'success' && steps\.electron_runtime_smoke\.outcome == 'failure'\)\)/u,
+    /always\(\) && !cancelled\(\) && steps\.electron_artifact_verification\.outcome == 'success' && \(steps\.native_security_qualification\.outcome == 'failure' \|\| steps\.electron_runtime_smoke\.outcome == 'failure'\)/u,
+  );
+  const retainsBlockedDevelopmentArtifact = ({ artifact, native, runtime }) =>
+    artifact === "success" && (native === "failure" || runtime === "failure");
+  assert.equal(
+    retainsBlockedDevelopmentArtifact({ artifact: "success", native: "failure", runtime: "failure" }),
+    true,
+    "both native and runtime failures must retain the verified development artifact",
+  );
+  assert.equal(
+    retainsBlockedDevelopmentArtifact({ artifact: "success", native: "failure", runtime: "success" }),
+    true,
+  );
+  assert.equal(
+    retainsBlockedDevelopmentArtifact({ artifact: "success", native: "success", runtime: "failure" }),
+    true,
+  );
+  assert.equal(
+    retainsBlockedDevelopmentArtifact({ artifact: "success", native: "success", runtime: "success" }),
+    false,
+  );
+  assert.equal(
+    retainsBlockedDevelopmentArtifact({ artifact: "failure", native: "failure", runtime: "failure" }),
+    false,
+  );
+  assert.doesNotMatch(
+    workflow,
+    /steps\.native_security_qualification\.outcome == 'failure' && steps\.electron_runtime_smoke\.outcome == 'success'\).*steps\.native_security_qualification\.outcome == 'success' && steps\.electron_runtime_smoke\.outcome == 'failure'/u,
   );
   const blockedUpload = workflow.slice(blockedUploadStep, cleanupStep);
   assert.match(blockedUpload, /TIBOTATTLE_ELECTRON_ARTIFACT_APP_PATH/u);
