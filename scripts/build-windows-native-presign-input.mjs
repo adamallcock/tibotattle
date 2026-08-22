@@ -113,6 +113,9 @@ const POSIX_NON_BLOCKING_FLAG = process.platform === "win32"
 const READ_ONLY_FLAGS = fsConstants.O_RDONLY
   | POSIX_NO_FOLLOW_FLAG
   | POSIX_NON_BLOCKING_FLAG;
+// Windows file IDs can exceed JavaScript's safe integer range. Keep dev/ino
+// as BigInt while converting only bounded count fields used arithmetically.
+const MAX_SAFE_STAT_INTEGER = BigInt(Number.MAX_SAFE_INTEGER);
 
 const BUILDER_OPTIONS_KEYS = Object.freeze(["evidenceRoot", "handoff", "output"]);
 const CLI_FLAGS = Object.freeze(new Map([
@@ -269,6 +272,47 @@ function stableValue(value) {
 
 function stableJson(value) {
   return `${JSON.stringify(stableValue(value), null, 2)}\n`;
+}
+
+function normalizeStatInteger(value) {
+  if (typeof value === "bigint") {
+    if (value < 0n || value > MAX_SAFE_STAT_INTEGER) return null;
+    return Number(value);
+  }
+  return value;
+}
+
+function normalizeStats(stats) {
+  if (process.platform !== "win32") return stats;
+  return {
+    dev: stats.dev,
+    ino: stats.ino,
+    mode: normalizeStatInteger(stats.mode),
+    nlink: normalizeStatInteger(stats.nlink),
+    uid: normalizeStatInteger(stats.uid),
+    size: normalizeStatInteger(stats.size),
+    birthtimeNs: stats.birthtimeNs,
+    mtimeNs: stats.mtimeNs,
+    ctimeNs: stats.ctimeNs,
+    birthtimeMs: stats.birthtimeMs,
+    mtimeMs: stats.mtimeMs,
+    ctimeMs: stats.ctimeMs,
+    isFile: () => stats.isFile(),
+    isDirectory: () => stats.isDirectory(),
+    isSymbolicLink: () => stats.isSymbolicLink(),
+  };
+}
+
+async function lstatForIdentity(path) {
+  return normalizeStats(await lstat(path, {
+    bigint: process.platform === "win32",
+  }));
+}
+
+async function statForIdentity(handle) {
+  return normalizeStats(await handle.stat({
+    bigint: process.platform === "win32",
+  }));
 }
 
 function sameIdentity(left, right) {
@@ -452,15 +496,15 @@ function parseJsonBytes(bytes, { maximumBytes, invalidCode, duplicateCode }) {
 async function captureRegularFile(path, maximumBytes, code) {
   let handle;
   try {
-    const before = await lstat(path);
+    const before = await lstatForIdentity(path);
     if (!before.isFile()
         || before.isSymbolicLink()
         || before.nlink !== 1
         || before.size <= 0
         || before.size > maximumBytes) fail(code);
     handle = await open(path, READ_ONLY_FLAGS);
-    const opened = await handle.stat();
-    const afterOpen = await lstat(path);
+    const opened = await statForIdentity(handle);
+    const afterOpen = await lstatForIdentity(path);
     if (!sameIdentity(before, opened) || !sameIdentity(before, afterOpen)) fail(code);
     const chunks = [];
     const hash = createHash("sha256");
@@ -478,8 +522,8 @@ async function captureRegularFile(path, maximumBytes, code) {
       total += result.bytesRead;
       if (total > maximumBytes) fail(code);
     }
-    const finished = await handle.stat();
-    const afterRead = await lstat(path);
+    const finished = await statForIdentity(handle);
+    const afterRead = await lstatForIdentity(path);
     if (!sameIdentity(opened, finished)
         || !sameIdentity(opened, afterRead)
         || total !== opened.size) fail(code);
@@ -525,10 +569,10 @@ function assertPrivateOwnedDirectory(metadata, code) {
 
 async function captureOwnedRoot(path, code) {
   try {
-    const metadata = await lstat(path);
+    const metadata = await lstatForIdentity(path);
     assertPrivateOwnedDirectory(metadata, code);
     const canonical = await realpath(path);
-    const canonicalMetadata = await lstat(canonical);
+    const canonicalMetadata = await lstatForIdentity(canonical);
     assertPrivateOwnedDirectory(canonicalMetadata, code);
     if (canonical !== path || !sameRootIdentity(rootIdentity(metadata), rootIdentity(canonicalMetadata))) {
       fail(code);
@@ -542,7 +586,7 @@ async function captureOwnedRoot(path, code) {
 
 async function assertOwnedRoot(state, code) {
   try {
-    const current = await lstat(state.path);
+    const current = await lstatForIdentity(state.path);
     assertPrivateOwnedDirectory(current, code);
     if (!sameRootIdentity(state.identity, rootIdentity(current))) fail(code);
     const canonical = await realpath(state.path);

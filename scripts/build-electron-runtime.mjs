@@ -16,7 +16,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { constants as fileSystemConstants } from "node:fs";
 import {
-  lstat,
+  lstat as fsLstat,
   mkdir,
   mkdtemp,
   open,
@@ -93,14 +93,31 @@ const ELECTRON_SHELL_IDENTITY_FILES = Object.freeze([
   "apps/electron/ready-line.js",
 ]);
 const READ_ONLY_FLAG = fileSystemConstants.O_RDONLY ?? 0;
-const NO_FOLLOW_FLAG = fileSystemConstants.O_NOFOLLOW ?? 0;
-const UNSUPPORTED_NO_FOLLOW_CODES = new Set([
-  "EINVAL",
-  "ENOTSUP",
-  "EOPNOTSUPP",
-  "UNKNOWN",
-]);
+// Windows has no portable O_NOFOLLOW open contract. Its capture path performs
+// an lstat/open/descriptor-and-path identity bracket instead; POSIX retains
+// the kernel no-follow flag.
+const NO_FOLLOW_FLAG = process.platform === "win32"
+  ? 0
+  : (fileSystemConstants.O_NOFOLLOW ?? 0);
+const WINDOWS_BIGINT_STAT_OPTIONS = Object.freeze({ bigint: true });
 
+function statOptionsForPlatform(platform) {
+  return platform === "win32" ? WINDOWS_BIGINT_STAT_OPTIONS : undefined;
+}
+
+function lstatForRuntime(path) {
+  const options = statOptionsForPlatform(process.platform);
+  return options === undefined ? fsLstat(path) : fsLstat(path, options);
+}
+
+function statForRuntime(handle) {
+  const options = statOptionsForPlatform(process.platform);
+  return options === undefined ? handle.stat() : handle.stat(options);
+}
+
+export function electronRuntimeStatOptionsForTest(platform = process.platform) {
+  return statOptionsForPlatform(platform);
+}
 const FORBIDDEN_PREFIXES = Object.freeze([
   ".git/",
   ".release-build/",
@@ -203,7 +220,7 @@ async function assertNoSymlinkPathComponents(path, label = "path") {
   while (true) {
     let metadata;
     try {
-      metadata = await lstat(current);
+      metadata = await lstatForRuntime(current);
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
       const parent = dirname(current);
@@ -278,16 +295,25 @@ function statFingerprint(metadata) {
   ].map((value) => String(value)).join("\0");
 }
 
-function isUnsupportedNoFollowError(error) {
-  return UNSUPPORTED_NO_FOLLOW_CODES.has(error?.code);
+function statSizeBigInt(metadata) {
+  if (typeof metadata?.size === "bigint") {
+    return metadata.size >= 0n ? metadata.size : null;
+  }
+  return Number.isSafeInteger(metadata?.size) && metadata.size >= 0
+    ? BigInt(metadata.size)
+    : null;
+}
+
+export function electronRuntimeStatFingerprintForTest(metadata) {
+  return statFingerprint(metadata);
 }
 
 /**
  * Read one regular file through an opened descriptor. The descriptor is
  * opened with O_NOFOLLOW where the host supports it, and every read is
- * bracketed by descriptor stat calls. Windows runtimes that reject that flag
- * use a lstat-before/lstat-after fallback plus the same descriptor identity
- * check; the fallback never trusts a path after bytes have been captured.
+ * bracketed by descriptor stat calls. Windows uses a lstat-before/lstat-after
+ * fallback plus the same descriptor identity check; the fallback never trusts
+ * a path after bytes have been captured.
  */
 async function captureRegularFile(path, label, { maximumBytes = null } = {}) {
   await assertNoSymlinkPathComponents(path, label);
@@ -295,25 +321,27 @@ async function captureRegularFile(path, label, { maximumBytes = null } = {}) {
   let usedWindowsFallback = false;
   let fallbackBeforeFingerprint = null;
   try {
-    try {
-      handle = await open(path, READ_ONLY_FLAG | NO_FOLLOW_FLAG);
-    } catch (error) {
-      if (!(process.platform === "win32" && (NO_FOLLOW_FLAG === 0
-          || isUnsupportedNoFollowError(error)))) {
-        if (error?.code === "ENOENT") fail("MISSING_INPUT", `${label} is missing`);
-        throw error;
-      }
-      const beforePath = await lstat(path);
+    if (process.platform === "win32") {
+      const beforePath = await lstatForRuntime(path);
       if (beforePath.isSymbolicLink() || !beforePath.isFile()) {
         fail("UNSAFE_INPUT", `${label} is not a regular file`);
       }
       fallbackBeforeFingerprint = statFingerprint(beforePath);
       handle = await open(path, READ_ONLY_FLAG);
       usedWindowsFallback = true;
+    } else {
+      try {
+        handle = await open(path, READ_ONLY_FLAG | NO_FOLLOW_FLAG);
+      } catch (error) {
+        if (error?.code === "ENOENT") fail("MISSING_INPUT", `${label} is missing`);
+        throw error;
+      }
     }
-    const before = await handle.stat();
+    const before = await statForRuntime(handle);
     if (!before.isFile()) fail("UNSAFE_INPUT", `${label} is not a regular file`);
-    if (maximumBytes !== null && before.size > maximumBytes) {
+    const beforeSize = statSizeBigInt(before);
+    if (beforeSize === null) fail("INPUT_CHANGED", `${label} has invalid size metadata`);
+    if (maximumBytes !== null && beforeSize > BigInt(maximumBytes)) {
       fail("INPUT_TOO_LARGE", `${label} exceeds the safe size limit`);
     }
     if (fallbackBeforeFingerprint !== null
@@ -321,16 +349,18 @@ async function captureRegularFile(path, label, { maximumBytes = null } = {}) {
       fail("INPUT_CHANGED", `${label} changed while it was captured`);
     }
     const bytes = await handle.readFile();
-    const after = await handle.stat();
-    if (maximumBytes !== null && after.size > maximumBytes) {
+    const after = await statForRuntime(handle);
+    const afterSize = statSizeBigInt(after);
+    if (afterSize === null) fail("INPUT_CHANGED", `${label} has invalid size metadata`);
+    if (maximumBytes !== null && afterSize > BigInt(maximumBytes)) {
       fail("INPUT_TOO_LARGE", `${label} exceeds the safe size limit`);
     }
     if (statFingerprint(before) !== statFingerprint(after)
-        || after.size !== bytes.byteLength) {
+        || afterSize !== BigInt(bytes.byteLength)) {
       fail("INPUT_CHANGED", `${label} changed while it was captured`);
     }
     if (usedWindowsFallback) {
-      const afterPath = await lstat(path);
+      const afterPath = await lstatForRuntime(path);
       if (afterPath.isSymbolicLink()
           || statFingerprint(afterPath) !== statFingerprint(after)) {
         fail("INPUT_CHANGED", `${label} changed while it was captured`);
@@ -405,7 +435,7 @@ async function validateOutputDestination(output, repositoryRoot, replace) {
   }
   let metadata;
   try {
-    metadata = await lstat(selected);
+    metadata = await lstatForRuntime(selected);
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
@@ -612,12 +642,12 @@ async function inspectWindowsBindingPair({
   let bindingMetadata = null;
   let manifestMetadata = null;
   try {
-    bindingMetadata = await lstat(bindingPath);
+    bindingMetadata = await lstatForRuntime(bindingPath);
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
   try {
-    manifestMetadata = await lstat(manifestPath);
+    manifestMetadata = await lstatForRuntime(manifestPath);
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
@@ -884,7 +914,7 @@ async function validateExistingRuntime(output) {
   await assertNoSymlinkPathComponents(output, "existing Electron runtime");
   let metadata;
   try {
-    metadata = await lstat(output);
+    metadata = await lstatForRuntime(output);
   } catch (error) {
     if (error?.code === "ENOENT") fail("EXISTING_OUTPUT_INVALID", "Runtime output is missing");
     throw error;
@@ -1116,7 +1146,7 @@ export async function buildElectronRuntime({
     else {
       let currentMetadata;
       try {
-        currentMetadata = await lstat(destination.output);
+        currentMetadata = await lstatForRuntime(destination.output);
       } catch (error) {
         if (error?.code !== "ENOENT") throw error;
       }
