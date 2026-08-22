@@ -10,7 +10,7 @@
     },
     {
       "file": "apps/local/server.test.mjs",
-      "win32BranchCount": 5,
+      "win32BranchCount": 6,
       "classification": "native-windows-qualification",
       "followUp": "Run the packaged Windows x64 companion with its branded qualification context to prove exact state/resource-root binding; separately replace omitted owner-mode and development identity assertions with Windows ACL contract tests."
     },
@@ -91,6 +91,12 @@
       "win32BranchCount": 2,
       "classification": "windows-equivalent-needed",
       "followUp": "Add a native Windows abrupt-process-termination SQLite recovery fixture."
+    },
+    {
+      "file": "test/local-companion-refresh.test.js",
+      "win32BranchCount": 1,
+      "classification": "native-windows-qualification",
+      "followUp": "Run the exact packaged Windows x64 synthetic refresh with the branded qualification context, adapter, session factory, and state/resource roots; the portable branches only exercise the closed platform seams."
     },
     {
       "file": "test/local-contribution-preparation.test.js",

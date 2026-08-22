@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -31,6 +32,22 @@ import {
 import {
   REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
 } from "../src/replay-safe-accounting-cache.js";
+import {
+  WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
+  createWindowsFilesystemAdapter,
+} from "../src/platform/windows-filesystem.js";
+import {
+  createWindowsQualificationModeContext,
+  WINDOWS_QUALIFICATION_MODE_ACCOUNTING_SOURCE_MODE,
+  WINDOWS_QUALIFICATION_MODE_ENVIRONMENT_VALUE,
+  WINDOWS_QUALIFICATION_MODE_ENVIRONMENT_VARIABLE,
+  WINDOWS_QUALIFICATION_MODE_TEST_LANE,
+  WINDOWS_QUALIFICATION_MODE_TEST_LANE_ENVIRONMENT_VARIABLE,
+} from "../src/platform/windows-qualification-mode.js";
+import {
+  createWindowsQualificationStateSessionFactory,
+  currentLocalCollectorStateSessionBoundary,
+} from "../src/platform/index.js";
 
 const COMPLETE_INDEX = Object.freeze({
   mode: "recent_7d",
@@ -116,6 +133,224 @@ const FRESH_NOTIFICATION_EVIDENCE = Object.freeze({
     resetProofKind: "provider_reported_schedule_only",
   })]),
 });
+
+const WINDOWS_REFRESH_QUALIFICATION_MANIFEST_PATHS = Object.freeze([
+  "apps/electron/companion-supervisor.js",
+  "apps/electron/desktop-lifecycle.js",
+  "apps/electron/errors.js",
+  "apps/electron/loopback-policy.js",
+  "apps/electron/main.js",
+  "apps/electron/platform-gate.js",
+  "apps/electron/preload.js",
+  "apps/electron/ready-line.js",
+  "apps/electron/windows-qualification.js",
+  "apps/local/server.js",
+  "apps/web/public/index.html",
+  "native/windows-filesystem/build/Release/windows_filesystem.node",
+  "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
+  "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node",
+].sort((left, right) => Buffer.from(left).compare(Buffer.from(right))));
+
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function windowsRefreshQualificationManifest() {
+  const files = WINDOWS_REFRESH_QUALIFICATION_MANIFEST_PATHS.map((path) => {
+    const value = Buffer.from(path, "utf8");
+    return {
+      bytes: value.byteLength,
+      kind: path.startsWith("apps/electron/")
+        ? "electron_shell"
+        : path.startsWith("apps/web/")
+          ? "dashboard_asset"
+          : path === "apps/local/server.js"
+            ? "companion_source"
+            : path.startsWith("native/")
+              ? "windows_native_binding"
+              : "third_party_dependency",
+      path,
+      sha256: sha256(value),
+    };
+  });
+  const payloadHash = createHash("sha256");
+  let payloadBytes = 0;
+  for (const row of files) {
+    payloadBytes += row.bytes;
+    payloadHash.update(`F\0${row.path}\0${row.bytes}\0${row.sha256}\0${row.kind}\0`);
+  }
+  const binding = files.find((row) => row.path.endsWith(
+    "native/windows-filesystem/build/Release/windows_filesystem.node",
+  ));
+  return {
+    architecture: "x64",
+    dashboardRoot: "apps/web/public",
+    entrypoint: "apps/electron/main.js",
+    files,
+    payload: {
+      bytes: payloadBytes,
+      sha256: payloadHash.digest("hex"),
+    },
+    releaseVersion: "0.1.0-test",
+    schemaVersion: "usage-monitor-electron-runtime-v0.1",
+    target: "win32",
+    windowsBinding: {
+      binding: {
+        bytes: binding.bytes,
+        path: binding.path,
+        sha256: binding.sha256,
+      },
+      included: true,
+      manifest: {
+        path: "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
+      },
+      status: "included_unverified",
+      verified: false,
+    },
+  };
+}
+
+function windowsRefreshQualificationBinding() {
+  const identity = {
+    volumeSerialNumber: "0000000000000001",
+    fileId: "00112233445566778899aabbccddeeff",
+    linkCount: 1,
+  };
+  return {
+    contractVersion: "windows-filesystem-v1",
+    securityContractVersion: "windows-filesystem-security-v1",
+    credentialAuditFileGuardContractVersion:
+      "windows-credential-audit-file-guard-v1",
+    sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
+    credentialMutexContractVersion: "windows-credential-mutex-v1",
+    companionInstanceMutexContractVersion:
+      "windows-companion-instance-mutex-v1",
+    preparedArtifactContractVersion: "windows-prepared-artifact-v1",
+    productionSafe: false,
+    pathWalkRaceSafe: false,
+    credentialMutexSafe: true,
+    companionInstanceMutexSafe: false,
+    credentialAuditFileGuardSafe: true,
+    sqliteStateLeaseSafe: false,
+    preparedArtifactSafe: false,
+    ...Object.fromEntries(
+      WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS.map((method) => [
+        method,
+        () => undefined,
+      ]),
+    ),
+    inspectPath: () => ({
+      identity,
+      isDirectory: true,
+      isRegularFile: false,
+      isReparsePoint: false,
+      finalPathResolved: true,
+    }),
+  };
+}
+
+async function createWindowsRefreshQualificationFixture() {
+  const root = await mkdtemp(join(tmpdir(), "local-refresh-windows-qualification-"));
+  const resourceRoot = join(root, "resources");
+  await mkdir(resourceRoot, { recursive: true });
+  await writeFile(
+    join(resourceRoot, "electron-runtime-manifest.json"),
+    `${JSON.stringify(windowsRefreshQualificationManifest())}\n`,
+  );
+  const temporaryRoot =
+    "C:\\Users\\runner\\AppData\\Local\\Temp\\tibotattle-refresh";
+  const stateRoot = `${temporaryRoot}\\state`;
+  const home = `${temporaryRoot}\\home`;
+  const environment = {
+    [WINDOWS_QUALIFICATION_MODE_ENVIRONMENT_VARIABLE]:
+      WINDOWS_QUALIFICATION_MODE_ENVIRONMENT_VALUE,
+    [WINDOWS_QUALIFICATION_MODE_TEST_LANE_ENVIRONMENT_VARIABLE]:
+      WINDOWS_QUALIFICATION_MODE_TEST_LANE,
+    USAGE_MONITOR_ACCOUNTING_SOURCE_MODE:
+      WINDOWS_QUALIFICATION_MODE_ACCOUNTING_SOURCE_MODE,
+    TEMP: temporaryRoot,
+    HOME: home,
+    USERPROFILE: home,
+    CODEX_HOME: `${home}\\.codex`,
+    CLAUDE_CONFIG_DIR: `${home}\\.claude`,
+    USAGE_MONITOR_RESOURCE_ROOT: resourceRoot,
+    USAGE_MONITOR_STATE_ROOT: stateRoot,
+  };
+  const adapter = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding: windowsRefreshQualificationBinding(),
+  });
+  const context = createWindowsQualificationModeContext({
+    platform: "win32",
+    architecture: "x64",
+    adapter,
+    environment,
+    resourceRoot,
+    stateRoot,
+  });
+  return {
+    root,
+    adapter,
+    context,
+    resourceRoot,
+    stateRoot,
+  };
+}
+
+async function withNativeWindowsX64(callback) {
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  const originalArchitecture = Object.getOwnPropertyDescriptor(process, "arch");
+  const changedPlatform = process.platform !== "win32";
+  const changedArchitecture = process.arch !== "x64";
+  if (changedPlatform) {
+    Object.defineProperty(process, "platform", {
+      ...originalPlatform,
+      value: "win32",
+    });
+  }
+  if (changedArchitecture) {
+    Object.defineProperty(process, "arch", {
+      ...originalArchitecture,
+      value: "x64",
+    });
+  }
+  try {
+    return await callback();
+  } finally {
+    if (changedPlatform) Object.defineProperty(process, "platform", originalPlatform);
+    if (changedArchitecture) Object.defineProperty(process, "arch", originalArchitecture);
+  }
+}
+
+async function withNonWindowsPlatform(callback) {
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  const changedPlatform = process.platform !== "darwin";
+  if (changedPlatform) {
+    Object.defineProperty(process, "platform", {
+      ...originalPlatform,
+      value: "darwin",
+    });
+  }
+  try {
+    return await callback();
+  } finally {
+    if (changedPlatform) Object.defineProperty(process, "platform", originalPlatform);
+  }
+}
+
+function qualificationRefreshResult() {
+  return {
+    rolloutRecordsWritten: 0,
+    filesDiscovered: 0,
+    refresh: {
+      attempted: false,
+      recordWritten: false,
+      errorCode: null,
+    },
+    indexing: COMPLETE_INDEX,
+  };
+}
 
 test("local refresh exposes only the closed fresh direct-provider notification receipt", async (t) => {
   const validRunner = createLocalCollectorRefreshRunner({
@@ -456,6 +691,121 @@ test("local refresh rejects forged and copied Windows adapters before runCollect
     Object.defineProperty(process, "platform", originalPlatform);
   }
   assert.equal(runCollectorCalls, 0);
+});
+
+test("win32 qualification refresh reaches runCollector only with the exact branded binding", async () => {
+  const fixture = await createWindowsRefreshQualificationFixture();
+  const qualificationSessionFactory = createWindowsQualificationStateSessionFactory({
+    platform: "win32",
+    architecture: "x64",
+    windowsFilesystemAdapter: fixture.adapter,
+    windowsQualificationModeContext: fixture.context,
+    stateRoot: fixture.stateRoot,
+    resourceRoot: fixture.resourceRoot,
+  });
+  let runCollectorCalls = 0;
+  try {
+    await withNativeWindowsX64(async () => {
+      const runner = createLocalCollectorRefreshRunner({
+        windowsFilesystemAdapter: fixture.adapter,
+        windowsSqliteStateSessionFactory: qualificationSessionFactory,
+        windowsQualificationModeContext: fixture.context,
+        stateRoot: fixture.stateRoot,
+        resourceRoot: fixture.resourceRoot,
+        selectAccountObservationSecret: () => ({
+          loadAccountObservationSecret: null,
+        }),
+        runCollector: async () => {
+          runCollectorCalls += 1;
+          const boundary = currentLocalCollectorStateSessionBoundary();
+          assert.equal(boundary?.windowsFilesystemAdapter, fixture.adapter);
+          assert.equal(boundary?.windowsQualificationModeContext, fixture.context);
+          assert.equal(boundary?.stateRoot, fixture.stateRoot);
+          assert.equal(boundary?.resourceRoot, fixture.resourceRoot);
+          return qualificationRefreshResult();
+        },
+      });
+      await runner();
+    });
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+  assert.equal(runCollectorCalls, 1);
+});
+
+test("win32 qualification refresh rejects absent, copied, and mismatched context while production stays gated", async () => {
+  const fixture = await createWindowsRefreshQualificationFixture();
+  const qualificationSessionFactory = createWindowsQualificationStateSessionFactory({
+    platform: "win32",
+    architecture: "x64",
+    windowsFilesystemAdapter: fixture.adapter,
+    windowsQualificationModeContext: fixture.context,
+    stateRoot: fixture.stateRoot,
+    resourceRoot: fixture.resourceRoot,
+  });
+  const candidates = [
+    ["production null context", {
+      windowsQualificationModeContext: null,
+    }],
+    ["copied context", {
+      windowsQualificationModeContext: Object.freeze({ ...fixture.context }),
+    }],
+    ["mismatched state root", {
+      windowsQualificationModeContext: fixture.context,
+      stateRoot: `${fixture.stateRoot}\\other`,
+    }],
+    ["mismatched resource root", {
+      windowsQualificationModeContext: fixture.context,
+      resourceRoot: `${fixture.resourceRoot}-other`,
+    }],
+  ];
+  try {
+    await withNativeWindowsX64(async () => {
+      for (const [label, overrides] of candidates) {
+        let runCollectorCalls = 0;
+        const runner = createLocalCollectorRefreshRunner({
+          windowsFilesystemAdapter: fixture.adapter,
+          windowsSqliteStateSessionFactory: qualificationSessionFactory,
+          windowsQualificationModeContext: fixture.context,
+          stateRoot: fixture.stateRoot,
+          resourceRoot: fixture.resourceRoot,
+          ...overrides,
+          selectAccountObservationSecret: () => ({
+            loadAccountObservationSecret: null,
+          }),
+          runCollector: async () => {
+            runCollectorCalls += 1;
+            return qualificationRefreshResult();
+          },
+        });
+        await assert.rejects(
+          runner(),
+          (error) => error?.code === "local_collector_state_unavailable",
+          label,
+        );
+        assert.equal(runCollectorCalls, 0, label);
+      }
+    });
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("macOS and Linux refresh retain the no-adapter collector path", async () => {
+  let runCollectorCalls = 0;
+  await withNonWindowsPlatform(async () => {
+    const runner = createLocalCollectorRefreshRunner({
+      selectAccountObservationSecret: () => ({
+        loadAccountObservationSecret: null,
+      }),
+      runCollector: async () => {
+        runCollectorCalls += 1;
+        return qualificationRefreshResult();
+      },
+    });
+    await runner();
+  });
+  assert.equal(runCollectorCalls, 1);
 });
 
 test("local refresh starts a bounded archive index only after the foreground result is safe", async () => {

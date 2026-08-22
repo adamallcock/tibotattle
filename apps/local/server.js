@@ -176,7 +176,9 @@ import {
   sha256Hex,
   WINDOWS_SQLITE_STATE_SESSION_PRODUCTION_SAFE,
   createWindowsQualificationModeContext,
+  createWindowsQualificationStateSessionFactory,
   isWindowsQualificationModeContextFor,
+  withLocalCollectorStateSessionBoundary,
 } from "../../src/platform/index.js";
 import {
   PRODUCT_BRAND,
@@ -3300,26 +3302,54 @@ export function createCompanionWindowsStateComposition({
       && !windowsQualificationModeActive) {
     throw windowsFilesystemConfigurationError();
   }
-  const sqliteStateSessionFactory = (options = {}) => {
-    if (!options || typeof options !== "object" || Array.isArray(options)) {
+  let sqliteStateSessionFactory;
+  if (authenticWindowsQualificationModeContext !== null) {
+    try {
+      sqliteStateSessionFactory = createWindowsQualificationStateSessionFactory({
+        platform,
+        architecture,
+        windowsFilesystemAdapter,
+        windowsQualificationModeContext: authenticWindowsQualificationModeContext,
+        stateRoot,
+        resourceRoot,
+      });
+    } catch {
       throw windowsFilesystemConfigurationError();
     }
-    const {
-      databaseFactory = null,
-      ...sessionOptions
-    } = options;
-    return createWindowsSqliteStateSession({
-      ...sessionOptions,
-      platform,
-      architecture,
-      adapter: windowsFilesystemAdapter,
-      windowsQualificationModeContext:
-        authenticWindowsQualificationModeContext,
-      ...(process.platform === "win32" || databaseFactory === null
-        ? {}
-        : { databaseFactory }),
-    });
-  };
+  } else {
+    // Production/null qualification context behavior remains unchanged. The
+    // native process cannot inject a DatabaseSync replacement; non-Windows
+    // contract tests may continue to supply their explicit test double.
+    sqliteStateSessionFactory = (options = {}) => {
+      if (!options || typeof options !== "object" || Array.isArray(options)) {
+        throw windowsFilesystemConfigurationError();
+      }
+      const {
+        databaseFactory = null,
+        windowsQualificationModeContext: requestedQualificationContext,
+        windowsQualificationResourceRoot: requestedQualificationResourceRoot,
+        ...sessionOptions
+      } = options;
+      if (requestedQualificationContext !== undefined
+          && requestedQualificationContext !== null) {
+        throw windowsFilesystemConfigurationError();
+      }
+      return createWindowsSqliteStateSession({
+        ...sessionOptions,
+        platform,
+        architecture,
+        adapter: windowsFilesystemAdapter,
+        windowsQualificationModeContext: null,
+        windowsQualificationResourceRoot:
+          requestedQualificationResourceRoot === undefined
+            ? resourceRoot
+            : requestedQualificationResourceRoot,
+        ...(process.platform === "win32" || databaseFactory === null
+          ? {}
+          : { databaseFactory }),
+      });
+    };
+  }
   const sqliteStateSessionForPath = (path) => {
     if (typeof path !== "string" || path.length < 1) {
       throw windowsFilesystemConfigurationError();
@@ -3328,6 +3358,8 @@ export function createCompanionWindowsStateComposition({
     return sqliteStateSessionFactory({
       rootPath: win32.dirname(selected),
       databaseName: win32.basename(selected),
+      windowsQualificationModeContext:
+        authenticWindowsQualificationModeContext,
     });
   };
   let contributionSyncQueue;
@@ -3957,39 +3989,49 @@ export function createPreparedLocalCompanionServer({
   }
   if (dataStore === undefined) {
     dataStore = new LocalCompanionDataStore({
-      builder: async ({ purpose = "full" } = {}) => buildLocalCompanionSnapshot({
-        root: resourceRoot,
-        collectorStateFile: statePaths.collectorStateFile,
-        archiveIndexFile: accountingSourceMode === "legacy"
-          ? statePaths.archiveAccountingIndexFile
-          : null,
-        unifiedIndexFile: statePaths.unifiedIndexFile,
-        codexHome,
-        accountingSourceMode,
-        unifiedProjectionMode: ["startup", "quick"].includes(purpose)
-          ? "deferred"
-          : "full",
-        allowDevelopmentArtifactFallback:
-          environment.USAGE_MONITOR_DEVELOPMENT_ARTIFACT_FALLBACK === "1",
-        includeDevelopmentSideChatEstimates:
-          environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_ESTIMATES === "1",
-        developmentSideChatHistoricalGapDate:
-          environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_DATE ?? null,
-        developmentSideChatHistoricalGapTimeZone:
-          environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_TIME_ZONE
-            ?? "America/New_York",
-        developmentSideChatHistoricalGapAssumedSpeed:
-          environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_SPEED
-            ?? "fast",
-        // The owner's stated Codex speed mode. It attributes only the turns
-        // that precede the first recorded tier change in their session; an
-        // observed tier always wins. A missing or unreadable statement
-        // degrades to the Standard default rather than inventing Fast.
-        fastModePreference: await fastModePreference.readMode(),
-        // Timestamped declared baselines fill only unobserved turns covered by
-        // a reading. An unreadable ledger is simply no coverage.
-        codexSpeedBaselines: await codexSpeedBaseline.readWindows(),
-      }),
+      builder: async ({ purpose = "full" } = {}) => (
+        withLocalCollectorStateSessionBoundary({
+          platform: process.platform,
+          architecture: process.arch,
+          windowsFilesystemAdapter,
+          windowsSqliteStateSessionFactory,
+          windowsQualificationModeContext,
+          stateRoot,
+          resourceRoot,
+        }, async () => buildLocalCompanionSnapshot({
+          root: resourceRoot,
+          collectorStateFile: statePaths.collectorStateFile,
+          archiveIndexFile: accountingSourceMode === "legacy"
+            ? statePaths.archiveAccountingIndexFile
+            : null,
+          unifiedIndexFile: statePaths.unifiedIndexFile,
+          codexHome,
+          accountingSourceMode,
+          unifiedProjectionMode: ["startup", "quick"].includes(purpose)
+            ? "deferred"
+            : "full",
+          allowDevelopmentArtifactFallback:
+            environment.USAGE_MONITOR_DEVELOPMENT_ARTIFACT_FALLBACK === "1",
+          includeDevelopmentSideChatEstimates:
+            environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_ESTIMATES === "1",
+          developmentSideChatHistoricalGapDate:
+            environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_DATE ?? null,
+          developmentSideChatHistoricalGapTimeZone:
+            environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_TIME_ZONE
+              ?? "America/New_York",
+          developmentSideChatHistoricalGapAssumedSpeed:
+            environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_SPEED
+              ?? "fast",
+          // The owner's stated Codex speed mode. It attributes only the turns
+          // that precede the first recorded tier change in their session; an
+          // observed tier always wins. A missing or unreadable statement
+          // degrades to the Standard default rather than inventing Fast.
+          fastModePreference: await fastModePreference.readMode(),
+          // Timestamped declared baselines fill only unobserved turns covered by
+          // a reading. An unreadable ledger is simply no coverage.
+          codexSpeedBaselines: await codexSpeedBaseline.readWindows(),
+        }))
+      ),
     });
   }
   if (refreshRunner === undefined) {
@@ -4000,6 +4042,9 @@ export function createPreparedLocalCompanionServer({
         statePaths.accountObservationLockFile,
       windowsFilesystemAdapter,
       windowsSqliteStateSessionFactory,
+      windowsQualificationModeContext,
+      stateRoot,
+      resourceRoot,
       windowsSqliteStateStaging,
       refreshAccounting: refreshReplaySafeAccountingCache,
       refreshClaudeQuota: async ({ signal }) => {
