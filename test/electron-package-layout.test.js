@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   buildElectronRuntime,
+  electronRuntimeOutputIsInsideRepositoryForTest,
   electronRuntimeStatFingerprintForTest,
   electronRuntimeStatOptionsForTest,
   parseElectronRuntimeArguments,
@@ -76,6 +77,28 @@ test("Windows runtime capture requests BigInt stats and preserves above-safe ide
   });
   assert.notEqual(first, second);
   assert.equal(first.startsWith("1152921504606846976\0"), true);
+});
+
+test("Electron output containment treats Windows cross-drive paths as outside", () => {
+  const repository = "D:\\checkouts\\tibotattle";
+  const reviewedOutput = "D:\\checkouts\\tibotattle\\.release-build\\electron-dev";
+  const foreignDriveOutput = "C:\\Users\\runner\\AppData\\Local\\Temp\\electron-dev";
+
+  assert.equal(electronRuntimeOutputIsInsideRepositoryForTest(
+    repository,
+    reviewedOutput,
+    "win32",
+  ), true);
+  assert.equal(electronRuntimeOutputIsInsideRepositoryForTest(
+    repository,
+    "d:\\CHECKOUTS\\TIBOTATTLE",
+    "win32",
+  ), false);
+  assert.equal(electronRuntimeOutputIsInsideRepositoryForTest(
+    repository,
+    foreignDriveOutput,
+    "win32",
+  ), false);
 });
 
 test("Electron runtime staging is deterministic and contains only the reviewed companion closure", async () => {

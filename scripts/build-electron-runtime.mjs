@@ -35,6 +35,7 @@ import {
   relative,
   resolve,
   sep,
+  win32,
 } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -66,6 +67,12 @@ const WINDOWS_BINDING_RELATIVE_PATH =
   "native/windows-filesystem/build/Release/windows_filesystem.node";
 const WINDOWS_MANIFEST_RELATIVE_PATH =
   `${WINDOWS_BINDING_RELATIVE_PATH}.manifest.json`;
+const NATIVE_PATH_MODULE = Object.freeze({
+  isAbsolute,
+  relative,
+  resolve,
+  sep,
+});
 export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
   "apps/electron/companion-supervisor.js",
   "apps/electron/desktop-lifecycle.js",
@@ -246,10 +253,38 @@ async function assertNoSymlinkPathComponents(path, label = "path") {
   }
 }
 
-function pathIsInside(parent, child) {
-  const suffix = relative(resolve(parent), resolve(child));
-  return suffix === "" || (suffix !== ".." && !suffix.startsWith(`..${sep}`)
-    && !isAbsolute(suffix));
+function pathIsInside(parent, child, pathModule = NATIVE_PATH_MODULE) {
+  const suffix = pathModule.relative(
+    pathModule.resolve(parent),
+    pathModule.resolve(child),
+  );
+  return suffix === "" || (suffix !== ".."
+    && !suffix.startsWith(`..${pathModule.sep}`)
+    && !pathModule.isAbsolute(suffix));
+}
+
+function isRepositoryOutputPathInside(
+  repository,
+  selected,
+  pathModule = NATIVE_PATH_MODULE,
+) {
+  const suffix = pathModule.relative(
+    pathModule.resolve(repository),
+    pathModule.resolve(selected),
+  );
+  return suffix !== "" && pathIsInside(repository, selected, pathModule);
+}
+
+export function electronRuntimeOutputIsInsideRepositoryForTest(
+  repository,
+  selected,
+  platform = process.platform,
+) {
+  return isRepositoryOutputPathInside(
+    repository,
+    selected,
+    platform === WINDOWS_TARGET ? win32 : NATIVE_PATH_MODULE,
+  );
 }
 
 function assertReviewedRuntimePath(relativePath, label = "runtime path") {
@@ -409,9 +444,7 @@ async function validateOutputDestination(output, repositoryRoot, replace) {
   const home = resolve(homedir());
   const repositoryRelativeOutput = relative(repository, selected)
     .split(sep).join("/");
-  const outputIsInsideRepository = repositoryRelativeOutput !== ""
-    && repositoryRelativeOutput !== ".."
-    && !repositoryRelativeOutput.startsWith("../");
+  const outputIsInsideRepository = isRepositoryOutputPathInside(repository, selected);
   const outputIsReviewedArtifact = repositoryRelativeOutput.startsWith(
     ".release-build/",
   ) || repositoryRelativeOutput.startsWith(".release-repro/");
