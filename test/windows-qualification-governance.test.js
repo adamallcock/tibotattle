@@ -374,6 +374,13 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(electronVerifierBodyForDeletion, /WINDOWS_ELECTRON_ARTIFACT_INVENTORY_INVALID/u);
   assert.match(workflow, /runtime aggregate shape/u);
   assert.match(workflow, /runtime aggregate status/u);
+  assert.match(workflow, /runtimeFailureStages/u);
+  assert.match(workflow, /runtimeFailureReasons/u);
+  assert.match(workflow, /runtime aggregate diagnostics/u);
+  assert.match(workflow, /failureStage = 'unknown'/u);
+  assert.match(workflow, /failureReason = 'unknown'/u);
+  assert.match(workflow, /failureStage -ne 'none'/u);
+  assert.match(workflow, /failureReason -ne 'none'/u);
   assert.match(workflow, /runtime aggregate check/u);
   assert.match(workflow, /No raw smoke output,?/u);
   assert.match(workflow, /TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH=\$runtimeEvidencePath/u);
@@ -501,8 +508,13 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.doesNotMatch(runtimeFailureUpload, /TIBOTATTLE_ELECTRON_ARTIFACT_APP_PATH/u);
   assert.match(
     workflow,
-    /always\(\) && !cancelled\(\) && steps\.native_security_qualification\.outcome == 'failure' && steps\.electron_artifact_verification\.outcome == 'success' && steps\.electron_runtime_smoke\.outcome == 'success'/u,
+    /always\(\) && !cancelled\(\) && steps\.electron_artifact_verification\.outcome == 'success' && \(\(steps\.native_security_qualification\.outcome == 'failure' && steps\.electron_runtime_smoke\.outcome == 'success'\) \|\| \(steps\.native_security_qualification\.outcome == 'success' && steps\.electron_runtime_smoke\.outcome == 'failure'\)\)/u,
   );
+  const blockedUpload = workflow.slice(blockedUploadStep, cleanupStep);
+  assert.match(blockedUpload, /TIBOTATTLE_ELECTRON_ARTIFACT_APP_PATH/u);
+  assert.match(blockedUpload, /TIBOTATTLE_WINDOWS_SECURITY_QUALIFICATION_RESULT_PATH/u);
+  assert.match(blockedUpload, /TIBOTATTLE_ELECTRON_VERIFICATION_EVIDENCE_PATH/u);
+  assert.match(blockedUpload, /TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH/u);
   assert.match(workflow, /blocked-development/u);
   assert.match(workflow, /WINDOWS_SECURITY_QUALIFICATION_FAILED_ARTIFACT_RETAINED/u);
   assert.match(workflow, /if-no-files-found: error/u);
@@ -1609,6 +1621,8 @@ function windowsReceiptFixture({
       contentFree: true,
       credentialPersistence: true,
       dashboardReady: true,
+      failureReason: "none",
+      failureStage: "none",
       noOrphan: true,
       relaunchPersistence: true,
       secondInstanceRejected: true,
@@ -1724,6 +1738,17 @@ test("Windows Electron qualification receipt rejects incomplete or mismatched ev
       runtimeEvidence: {
         ...fixture.runtimeEvidence,
         noOrphan: false,
+      },
+    }),
+    (error) => error.code === WINDOWS_RECEIPT_STATUS.runtimeInvalid,
+  );
+  assert.throws(
+    () => buildWindowsElectronQualificationReceipt({
+      ...fixture,
+      runtimeEvidence: {
+        ...fixture.runtimeEvidence,
+        failureReason: "child_exit",
+        failureStage: "control",
       },
     }),
     (error) => error.code === WINDOWS_RECEIPT_STATUS.runtimeInvalid,
