@@ -1,16 +1,30 @@
 import assert from "node:assert/strict";
 import { mkdir, readFile, rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import test from "node:test";
 
 import {
   aggregate,
   classifySmokeFailure,
   createSyntheticFixture,
+  queryWindowsProcessTableForTest,
   WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST,
   WINDOWS_ELECTRON_SMOKE_FAILURE_STAGE_ALLOWLIST,
   waitFor,
 } from "../scripts/smoke-electron-windows.mjs";
+
+function fakeProcessTableProbe() {
+  const probe = new EventEmitter();
+  probe.stdout = new EventEmitter();
+  probe.exitCode = null;
+  probe.signalCode = null;
+  probe.kill = () => {
+    probe.exitCode = -1;
+    return true;
+  };
+  return probe;
+}
 
 test("Windows Electron smoke is packaged, x64-only, and content-free", async () => {
   const source = await readFile("scripts/smoke-electron-windows.mjs", "utf8");
@@ -112,6 +126,13 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /relaunchPersistence/u);
   assert.match(source, /WINDOWS_PROCESS_TABLE_QUERY/u);
   assert.match(source, /Get-CimInstance -ClassName Win32_Process/u);
+  const processTableQuery = source.slice(
+    source.indexOf("async function queryWindowsProcessTableWithSpawner"),
+    source.indexOf("async function captureDescendantPids"),
+  );
+  assert.match(processTableQuery, /probe\.once\("close"/u);
+  assert.doesNotMatch(processTableQuery, /probe\.once\("exit"/u);
+  assert.match(source, /queryWindowsProcessTableForTest/u);
   assert.match(source, /captureDescendantPids/u);
   assert.match(source, /addCurrentDescendants/u);
   assert.match(source, /waitForDescendantsGone/u);
@@ -376,6 +397,58 @@ test("waitFor fails fast for terminal smoke errors and retries transient misses"
   }, 5_000, "timeout smoke", "WINDOWS_ELECTRON_SMOKE_CONTROL_TIMEOUT");
   assert.equal(recoveredAfterTimeout, "ready");
   assert.equal(timeoutCalls, 2);
+});
+
+test("Windows process-table probe waits for close and retains trailing drained rows", async () => {
+  const probe = fakeProcessTableProbe();
+  const calls = [];
+  const pending = queryWindowsProcessTableForTest({
+    spawnProbe(...args) {
+      calls.push(args);
+      return probe;
+    },
+  });
+  probe.stdout.emit("data", "100:1\n");
+  probe.exitCode = 0;
+  probe.emit("exit", 0, null);
+  probe.stdout.emit("data", "200:100\n");
+  let settled = false;
+  void pending.then(() => { settled = true; }, () => { settled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  probe.emit("close", 0, null);
+  const table = await pending;
+  assert.deepEqual([...table.entries()], [[100, 1], [200, 100]]);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0][0], "powershell.exe");
+  assert.deepEqual(calls[0][2], {
+    shell: false,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+});
+
+test("Windows process-table probe rejects nonzero close and drained malformed output", async () => {
+  const nonzeroProbe = fakeProcessTableProbe();
+  const nonzero = queryWindowsProcessTableForTest({
+    spawnProbe: () => nonzeroProbe,
+  });
+  nonzeroProbe.stdout.emit("data", "100:1\n");
+  nonzeroProbe.exitCode = 7;
+  nonzeroProbe.emit("close", 7, null);
+  await assert.rejects(nonzero, /process table probe failed/u);
+
+  const malformedProbe = fakeProcessTableProbe();
+  const malformed = queryWindowsProcessTableForTest({
+    spawnProbe: () => malformedProbe,
+  });
+  malformedProbe.stdout.emit("data", "100:1\nbad-row\n");
+  malformedProbe.exitCode = 0;
+  malformedProbe.emit("close", 0, null);
+  await assert.rejects(
+    malformed,
+    (error) => error?.code === "WINDOWS_ELECTRON_SMOKE_PROCESS_TABLE_INVALID",
+  );
 });
 
 test("non-Windows Electron smoke reports unsupported rather than success", () => {
