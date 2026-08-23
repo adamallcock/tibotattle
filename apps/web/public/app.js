@@ -10004,12 +10004,15 @@ async function loadLocalDashboard() {
     // companion answers are still unsettled — and an onboarding verdict this
     // load already holds is not one of them.
     renderLocalOnboarding(onboarding);
+    // The primary local result is now rendered. Do not keep the native
+    // readiness signal waiting on the secondary contribution-status read;
+    // its consent invariant still completes before the preview renders.
+    markLocalDashboardReady();
     // Consent state is read from the companion before the queue renders, so
     // an already-approved Mac never re-prepares a review instance it no
     // longer needs.
     await loadIncrementalSyncStatus();
     renderContributionSyncPreview(sync.preview);
-    markLocalDashboardReady();
   } catch {
     const [localHealth, onboarding] = await Promise.all([
       localClient.health().catch(() => null),
