@@ -14,8 +14,8 @@ receipt.
 ## Scope
 
 - Review base: current `origin/main` as fetched on 2026-08-23.
-- Branch delta: one Forest Ink feature commit and no unrelated local-main
-  commits.
+- Branch delta: one Forest Ink feature commit plus one focused manual-reload
+  correction, with no unrelated local-main commits.
 - Browser state: real `apps/web/public` modules in the native-dashboard shell,
   using the repository's built-in and visibly labelled `demoDashboard()`
   fixture.
@@ -54,9 +54,9 @@ readiness relay.
 ### Development build receipt
 
 - Payload SHA-256:
-  `260c2ee5299fc3a7a95f25623fc6426eb4370b83acc96a11286ef7a2d7656b47`
+  `2fb6ae8a24eaa30682db1321148501c429216f10c942f163097dfa7b1c65cde7`
 - Source SHA-256:
-  `82960c9b4c14f4ed73a85017426b3fe8cdc673ba8e18c047d63af4fd77d74cb3`
+  `44f6028260747f3eb5ea3d96bf8ef3d86f0a2172653b75548b287f1315bb2794`
 - Channel: development
 - Signing: ad hoc only
 - External distribution requested: false
@@ -72,6 +72,9 @@ readiness relay.
 - A missing theme-color element and an invalid live event are safe no-ops.
 - The open report receives a live event rather than reloading and losing page
   or chart state.
+- Every live appearance update also refreshes the bounded document-start
+  snapshot, so a later WebView context-menu Reload cannot replay the theme
+  that was current when the host was first constructed.
 - System appearance changes are relayed from the report pane while active and
   resynchronized when the app becomes active again.
 - Native report paper, sidebar wash, and accent use the same resolved palette
@@ -99,6 +102,13 @@ uses, without navigation or reload. Light changed `html[data-theme]`, computed
 values. An unsupported `sepia` value was ignored and left Light intact. Dark
 restored all four dark values while the `#weekly` route and in-memory document
 were preserved.
+
+After the owner reported that WebKit's context-menu Reload could replay a
+stale initial theme, the native host was corrected to refresh its
+document-start snapshot whenever the resolved appearance changes. The rebuilt
+source contract is covered by the native bundle suite. A separate full-page
+browser reload preserved `html[data-theme="dark"]`, computed dark color scheme,
+the `#weekly` route, the `#141A17` page background, and a clean console.
 
 The earlier route pass covered Overview, Allowance, Trends, Usage and costs,
 Community, and the information popover at 962, 700, and 390 CSS px. It found no
@@ -131,8 +141,11 @@ generated images or demo output in source control.
 ## Remaining release boundary
 
 The implementation is ready for team code and design review. A separately
-installed, signed app should still exercise System → Light → Dark → System on
-real user data before release. No installed app, stable artifact, notarized
-artifact, appcast, or public deployment was changed by this work.
+installed, signed app should still exercise System → Light → Dark → System and
+context-menu Reload after each choice on real user data before release. A
+local interactive attempt was excluded from the receipt because another
+development bundle owned the shared companion and an experimental future index
+schema was present; neither was changed. No installed app, stable artifact,
+notarized artifact, appcast, or public deployment was changed by this work.
 
 final result: passed

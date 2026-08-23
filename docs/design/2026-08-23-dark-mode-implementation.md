@@ -50,7 +50,10 @@ Selected visual reference:
 The native host owns `window.__TIBOTATTLE_APPEARANCE__` and
 `html[data-theme]`. Only `light` and `dark` are accepted resolved values. A
 live `tibotattle:appearance-override` event updates the open dashboard without
-reloading it or disturbing in-memory contribution and chart state.
+reloading it or disturbing in-memory contribution and chart state. The same
+update refreshes the native document-start snapshot so a later WebView
+context-menu Reload begins in the current resolved appearance rather than the
+appearance that was active when the host was constructed.
 
 Explicit Light and Dark choices resolve deterministically and do not depend on
 AppKit update timing. System alone reads `NSApp.effectiveAppearance`, maps it

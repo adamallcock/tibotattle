@@ -1490,7 +1490,7 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   assert.match(source, /theme !== 'light' && theme !== 'dark'/u);
   assert.match(
     source,
-    /func notifyAppearancePreferenceChange\([\s\S]*?tibotattle:appearance-override/u,
+    /func notifyAppearancePreferenceChange\([\s\S]*?refreshDocumentStartScripts\(\)[\s\S]*?tibotattle:appearance-override/u,
   );
   assert.match(
     source,

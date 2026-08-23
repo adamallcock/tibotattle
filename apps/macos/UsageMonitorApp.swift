@@ -2345,6 +2345,13 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         _ preference: NativeAppearancePreference
     ) {
         guard hasDashboardTarget else { return }
+        // The live event below updates the current document, but WebKit's
+        // context-menu Reload creates a new document without passing through
+        // loadWhenViewportIsReady(). Refresh the document-start snapshot now
+        // so that later manual reload starts in the same resolved appearance
+        // instead of replaying whichever theme was current when this host was
+        // first constructed.
+        refreshDocumentStartScripts()
         let payload: [String: Any] = [
             "schemaVersion": 1,
             "host": "native",
