@@ -162,6 +162,7 @@ import {
   createWindowsPreparedArtifactStorageContext,
   createWindowsReviewPairStorageContext,
   createWindowsProtectedStateStore,
+  createOwnerOnlyAutomaticContributionStorageContext,
   createWindowsSqliteStateSession,
   createWindowsSqliteStateStaging,
   createLocalContributionSyncQueueStorageContext,
@@ -3970,17 +3971,52 @@ export function createPreparedLocalCompanionServer({
       windowsProtectedStateStore,
     }
     : {};
+  // Several fixed-value companion records intentionally live below
+  // stateRoot/private, while secrets and renewal state remain direct children
+  // of stateRoot. Bind one additional store to that exact private directory
+  // and share it across every private-state controller. The store creates and
+  // validates the directory through the same native adapter; no ordinary
+  // filesystem fallback or cross-root child access is introduced.
+  let windowsPrivateFixedStateOptions = windowsFixedStateOptions;
+  let windowsPrivateProtectedStateStore = null;
+  if (process.platform === "win32" && windowsFilesystemAdapter !== null) {
+    const privateStateFiles = [
+      statePaths.fastModePreferenceFile,
+      statePaths.codexSpeedBaselineFile,
+      statePaths.automaticContributionSettingsFile,
+      statePaths.incrementalContributionSyncSettingsFile,
+      statePaths.hostedSignInHandoffFile,
+    ];
+    const privateStateRoot = win32.join(stateRoot, "private");
+    if (privateStateFiles.some((file) => typeof file !== "string"
+        || win32.dirname(file).toLowerCase()
+          !== privateStateRoot.toLowerCase())) {
+      throw windowsFilesystemConfigurationError();
+    }
+    try {
+      windowsPrivateProtectedStateStore = createWindowsProtectedStateStore({
+        adapter: windowsFilesystemAdapter,
+        rootPath: privateStateRoot,
+      });
+    } catch {
+      throw windowsFilesystemConfigurationError();
+    }
+    windowsPrivateFixedStateOptions = {
+      platform: process.platform,
+      windowsProtectedStateStore: windowsPrivateProtectedStateStore,
+    };
+  }
   if (fastModePreference === undefined) {
     fastModePreference = createFastModePreferenceController({
       settingsFile: statePaths.fastModePreferenceFile,
-      ...windowsFixedStateOptions,
+      ...windowsPrivateFixedStateOptions,
     });
   }
   if (codexSpeedBaseline === undefined) {
     codexSpeedBaseline = createCodexSpeedBaselineController({
       ledgerFile: statePaths.codexSpeedBaselineFile,
       configFile: join(codexHome, "config.toml"),
-      ...windowsFixedStateOptions,
+      ...windowsPrivateFixedStateOptions,
     });
   }
   if (claudeShadowController === undefined) {
@@ -4424,6 +4460,18 @@ export function createPreparedLocalCompanionServer({
   const hostedSignInHandoff = hostedSignInHandoffController
     ?? createHostedSignInHandoffController({
       handoffFile: statePaths.hostedSignInHandoffFile,
+      ...(process.platform === "win32"
+        ? {
+          storage: createOwnerOnlyAutomaticContributionStorageContext({
+            createError: () => new HostedSignInHandoffError(
+              "hosted_signin_handoff_unavailable",
+            ),
+            platform: process.platform,
+            windowsProtectedStateStore:
+              windowsPrivateProtectedStateStore,
+          }),
+        }
+        : {}),
       now: clock,
     });
   const reviewExactContribution = contributionSyncExactReviewProvider
@@ -4675,7 +4723,7 @@ export function createPreparedLocalCompanionServer({
   const automaticContribution = automaticContributionController
     ?? createAutomaticContributionController({
       ...automaticContributionOptions,
-      ...windowsFixedStateOptions,
+      ...windowsPrivateFixedStateOptions,
       ...(process.platform === "win32"
         ? { windowsCompanionInstanceLease }
         : {}),
@@ -4726,7 +4774,7 @@ export function createPreparedLocalCompanionServer({
     ?? (contributionServiceOrigin === null
       ? null
       : createIncrementalContributionSyncController({
-        ...windowsFixedStateOptions,
+        ...windowsPrivateFixedStateOptions,
         settingsFile: statePaths.incrementalContributionSyncSettingsFile,
         destinationOrigin: contributionServiceOrigin,
         runner: async ({ signal }) => {

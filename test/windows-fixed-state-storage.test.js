@@ -11,6 +11,7 @@ import {
   createFastModePreferenceController,
 } from "../src/fast-mode-preference.js";
 import { createIncrementalContributionSyncController } from "../src/incremental-contribution.js";
+import { createHostedSignInHandoffController } from "../src/hosted-signin-handoff.js";
 import {
   createWindowsFilesystemAdapter,
   createWindowsProtectedStateStore,
@@ -63,13 +64,13 @@ function operationError(code) {
   return error;
 }
 
-function createProtectedStoreFixture() {
+function createProtectedStoreFixture(rootPath = ROOT) {
   const entries = new Map([
-    [ROOT, { directory: true, identity: ROOT_IDENTITY }],
+    [rootPath, { directory: true, identity: ROOT_IDENTITY }],
   ]);
   const calls = [];
   let nextIdentity = 2;
-  const childPath = (name) => `${ROOT}\\${name}`;
+  const childPath = (name) => `${rootPath}\\${name}`;
   const entryAt = (path) => {
     const entry = entries.get(path);
     if (!entry) throw operationError("NOT_FOUND");
@@ -226,7 +227,7 @@ function createProtectedStoreFixture() {
   });
   const store = createWindowsProtectedStateStore({
     adapter,
-    rootPath: ROOT,
+    rootPath,
   });
   return { calls, entries, store };
 }
@@ -279,13 +280,36 @@ test("Windows fixed-state storage routes settings through the exact protected ch
   );
 });
 
-test("fast mode, baseline, automatic, and incremental controllers use the protected store", async () => {
-  const fixture = createProtectedStoreFixture();
+test("Windows fixed-state storage supports the private root without path fallback", async () => {
+  const privateRoot = `${ROOT}\\private`;
+  const fixture = createProtectedStoreFixture(privateRoot);
+  const fastMode = createFastModePreferenceController({
+    platform: "win32",
+    windowsProtectedStateStore: fixture.store,
+    settingsFile: `${privateRoot}\\fast-mode-preference-v0.1.json`,
+    now: () => new Date("2026-08-18T12:00:00.000Z"),
+  });
+
+  assert.equal((await fastMode.select("fast")).source, "stated");
+  assert.equal((await fastMode.inspect()).mode, "fast");
+  assert.equal(
+    fixture.calls.some(([name, root, child]) => name === "createProtectedChild"
+      && root === privateRoot
+      && child === "fast-mode-preference-v0.1.json"),
+    true,
+  );
+  assert.equal(fixture.calls.some(([name]) => name === "createFile"), false);
+  assert.equal(fixture.calls.some(([name]) => name === "readFile"), false);
+});
+
+test("private fixed-state controllers share one protected subtree", async () => {
+  const privateRoot = `${ROOT}\\private`;
+  const fixture = createProtectedStoreFixture(privateRoot);
   assert.equal(isWindowsProtectedStateStore(fixture.store), true);
   const fastMode = createFastModePreferenceController({
     platform: "win32",
     windowsProtectedStateStore: fixture.store,
-    settingsFile: `${ROOT}\\fast-mode-preference-v0.1.json`,
+    settingsFile: `${privateRoot}\\fast-mode-preference-v0.1.json`,
     now: () => new Date("2026-08-18T12:00:00.000Z"),
   });
   assert.equal((await fastMode.select("fast")).mode, "fast");
@@ -294,7 +318,7 @@ test("fast mode, baseline, automatic, and incremental controllers use the protec
   const baseline = createCodexSpeedBaselineController({
     platform: "win32",
     windowsProtectedStateStore: fixture.store,
-    ledgerFile: `${ROOT}\\codex-speed-baseline-v0.1.json`,
+    ledgerFile: `${privateRoot}\\codex-speed-baseline-v0.1.json`,
     configFile: `${ROOT}\\codex\\config.toml`,
     readServiceTier: async () => ({ status: "declared", serviceTier: "priority" }),
     now: () => new Date("2026-08-18T12:00:00.000Z"),
@@ -304,7 +328,7 @@ test("fast mode, baseline, automatic, and incremental controllers use the protec
   const automatic = createAutomaticContributionController({
     platform: "win32",
     windowsProtectedStateStore: fixture.store,
-    settingsFile: `${ROOT}\\automatic-contribution-v0.1.json`,
+    settingsFile: `${privateRoot}\\automatic-contribution-v0.1.json`,
     destinationOrigin: null,
     prepareRunner: async () => ({}),
     uploadRunner: async () => ({}),
@@ -315,7 +339,7 @@ test("fast mode, baseline, automatic, and incremental controllers use the protec
   const incremental = createIncrementalContributionSyncController({
     platform: "win32",
     windowsProtectedStateStore: fixture.store,
-    settingsFile: `${ROOT}\\incremental-contribution-v1.json`,
+    settingsFile: `${privateRoot}\\incremental-contribution-v1.json`,
     destinationOrigin: "http://127.0.0.1:8787",
     runner: async () => ({
       schemaVersion: "incremental-contribution-sync-run-v1.0",
@@ -330,8 +354,27 @@ test("fast mode, baseline, automatic, and incremental controllers use the protec
   await incremental.initialize();
   await incremental.approve();
 
+  const hostedSignIn = createHostedSignInHandoffController({
+    handoffFile: `${privateRoot}\\hosted-signin-handoff-v1.json`,
+    storage: createOwnerOnlyAutomaticContributionStorageContext({
+      createError: errorFactory,
+      platform: "win32",
+      windowsProtectedStateStore: fixture.store,
+    }),
+    now: () => 1_800_000_000_000,
+  });
+  await hostedSignIn.store({
+    provider: "google",
+    state: "s".repeat(43),
+    verifier: "v".repeat(43),
+  });
+  assert.equal((await hostedSignIn.inspect()).status, "pending");
+
   const protectedCalls = fixture.calls.filter(([name]) => name.endsWith("ProtectedChild"));
-  assert.ok(protectedCalls.length >= 8);
+  assert.ok(protectedCalls.length >= 10);
+  assert.equal(protectedCalls.every(([, root]) => root === privateRoot), true);
+  assert.equal(fixture.calls.some(([name]) => name === "createFile"), false);
+  assert.equal(fixture.calls.some(([name]) => name === "readFile"), false);
 });
 
 test("Windows fixed-state factories reject forged stores, path escapes, and ordinary storage injection", async () => {
