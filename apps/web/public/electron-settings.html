@@ -185,8 +185,8 @@
           <section class="settings-card" aria-labelledby="settings-notifications-title">
             <div class="settings-card-copy">
               <h3 id="settings-notifications-title" data-i18n="electron.settings.notifications.alertsTitle">Allowance alerts</h3>
-              <p id="settings-notifications-detail" data-i18n="electron.settings.notifications.status.unavailable">
-                Local allowance alerts are unavailable. No alerts will be sent.
+              <p id="settings-notifications-detail" data-i18n="electron.settings.notifications.status.checking">
+                Checking local alert capability…
               </p>
             </div>
             <label class="settings-switch" for="settings-notifications-enabled">
@@ -221,11 +221,11 @@
           <section class="settings-card" aria-labelledby="settings-notification-permission-title">
             <div class="settings-card-copy">
               <h3 id="settings-notification-permission-title" data-i18n="electron.settings.notifications.permissionTitle">Operating system permission</h3>
-              <p id="settings-notification-status" class="settings-status" role="status" aria-live="polite" data-i18n="electron.settings.notifications.status.unavailable">
-                Local allowance alerts are unavailable. No alerts will be sent.
+              <p id="settings-notification-status" class="settings-status" role="status" aria-live="polite" data-i18n="electron.settings.notifications.permission.unknown">
+                Operating-system notification permission has not been confirmed.
               </p>
             </div>
-            <button class="button button-secondary" id="settings-open-notification-settings" type="button">
+            <button class="button button-secondary" id="settings-open-notification-settings" type="button" disabled>
               <span data-i18n="electron.settings.notifications.openPermission">Open Notification Settings</span>
             </button>
           </section>

@@ -621,6 +621,7 @@ export function createDesktopLifecycle({
       show: false,
     };
     settingsWindow = new BrowserWindow(selectedOptions);
+    const candidate = settingsWindow;
     const webContents = settingsWindow.webContents;
     const session = webContents?.session;
     const policy = createNavigationPolicy({ origin: ready.origin });
@@ -637,7 +638,7 @@ export function createDesktopLifecycle({
     };
     settingsWindow.once?.("ready-to-show", onReadyToShow);
     settingsWindowReadyListenerCleanup = () => {
-      settingsWindow?.off?.("ready-to-show", onReadyToShow);
+      candidate?.off?.("ready-to-show", onReadyToShow);
     };
     const onWindowClose = (event) => {
       if (quitting || destroyingSettingsWindow) return;
@@ -645,7 +646,13 @@ export function createDesktopLifecycle({
       settingsWindow?.hide?.();
     };
     const onWindowClosed = () => {
-      if (settingsWindow?.webContents !== webContents) return;
+      // Electron may destroy the BrowserWindow before it emits `closed`.
+      // Reading `settingsWindow.webContents` at that point throws
+      // "Object has been destroyed" in the main process, which can make a
+      // transient Settings close look like the whole app disappeared. The
+      // captured object identity is sufficient to reject stale close events
+      // and remains safe after Electron invalidates the object.
+      if (settingsWindow !== candidate) return;
       settingsWindowReadyListenerCleanup?.();
       settingsWindowReadyListenerCleanup = null;
       settingsWindowListenerCleanup = null;
@@ -657,10 +664,9 @@ export function createDesktopLifecycle({
     settingsWindow.on("close", onWindowClose);
     settingsWindow.on("closed", onWindowClosed);
     settingsWindowListenerCleanup = () => {
-      settingsWindow?.off?.("close", onWindowClose);
-      settingsWindow?.off?.("closed", onWindowClosed);
+      candidate?.off?.("close", onWindowClose);
+      candidate?.off?.("closed", onWindowClosed);
     };
-    const candidate = settingsWindow;
     const loadResult = candidate.loadURL?.(url);
     settingsLoadedURL = url;
     loadResult?.catch?.(() => {

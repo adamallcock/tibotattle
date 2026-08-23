@@ -128,11 +128,20 @@ const LOGIN_ITEM_LABELS = Object.freeze({
   error: "The operating system did not confirm the current Login Item status. Review it before relying on start at login.",
 });
 
-const NOTIFICATION_PERMISSION_LABELS = Object.freeze({
-  authorized: "Operating-system permission is shown here; local alert capability is reported above.",
-  denied: "Operating-system permission is shown here; local alert capability is reported above.",
-  unknown: "Operating-system permission is shown here; local alert capability is reported above.",
-  unavailable: "Operating-system permission is shown here; local alert capability is reported above.",
+const NOTIFICATION_CAPABILITY_LABELS = Object.freeze({
+  ready: "Local allowance alerts are ready.",
+  not_packaged: "Local alerts are unavailable in this development build. Use a packaged build with a supported app identity.",
+  windows_identity_unavailable: "Local alerts are disabled until this Windows build has a verified app identity.",
+  unsupported: "This operating system does not provide the required local notification capability.",
+  capability_error: "The operating system could not confirm local alert delivery. Alerts remain disabled.",
+  unavailable: "Local allowance alerts are unavailable. No alerts will be sent.",
+});
+
+const NOTIFICATION_PERMISSION_MESSAGE_KEYS = Object.freeze({
+  authorized: "electron.settings.notifications.permission.authorized",
+  denied: "electron.settings.notifications.permission.denied",
+  unknown: "electron.settings.notifications.permission.unknown",
+  unavailable: "electron.settings.notifications.permission.unavailable",
 });
 
 const UPDATE_STATUS_LABELS = Object.freeze({
@@ -278,8 +287,9 @@ function normalizeSettingsState(raw) {
       detail: safeText(
         notifications.detail,
         notificationCanSet
-          ? "Local allowance alerts are ready."
-          : NOTIFICATION_PERMISSION_LABELS[notificationPermission],
+          ? NOTIFICATION_CAPABILITY_LABELS.ready
+          : NOTIFICATION_CAPABILITY_LABELS[notificationDelivery]
+            ?? NOTIFICATION_CAPABILITY_LABELS.unavailable,
       ),
     }),
     about: Object.freeze({
@@ -360,7 +370,7 @@ function setBridgeStatus(documentRef, messageKey, available, localizer) {
   element.classList?.toggle?.("is-unavailable", !available);
 }
 
-function notificationStatusMessageKey(notifications) {
+function notificationCapabilityMessageKey(notifications) {
   if (notifications.canSet === true
       && notifications.state === "ready"
       && notifications.delivery === "ready") {
@@ -381,6 +391,11 @@ function notificationStatusMessageKey(notifications) {
   }
 }
 
+function notificationPermissionMessageKey(notifications) {
+  return NOTIFICATION_PERMISSION_MESSAGE_KEYS[notifications.permission]
+    ?? NOTIFICATION_PERMISSION_MESSAGE_KEYS.unavailable;
+}
+
 function renderSettingsState(documentRef, state, bridgeAvailable, localizer) {
   const language = queryRequired(documentRef, "#settings-language");
   const folder = queryRequired(documentRef, "#settings-codex-folder-status");
@@ -388,10 +403,15 @@ function renderSettingsState(documentRef, state, bridgeAvailable, localizer) {
   const loginSwitch = queryRequired(documentRef, "#settings-start-at-login");
   const loginSummary = queryRequired(documentRef, "#settings-start-at-login-summary");
   const notificationsSwitch = queryRequired(documentRef, "#settings-notifications-enabled");
+  const notificationDetail = queryRequired(documentRef, "#settings-notifications-detail");
   const thresholdInputs = [...documentRef.querySelectorAll(
     "input[name=\"settings-notification-threshold\"]",
   )];
   const notificationStatus = queryRequired(documentRef, "#settings-notification-status");
+  const openNotificationSettings = queryRequired(
+    documentRef,
+    "#settings-open-notification-settings",
+  );
   const automaticSwitch = queryRequired(documentRef, "#settings-automatic-updates");
   const checkForUpdates = queryRequired(documentRef, "#settings-check-for-updates");
 
@@ -409,12 +429,19 @@ function renderSettingsState(documentRef, state, bridgeAvailable, localizer) {
   const notificationReady = bridgeAvailable && state.notifications.canSet === true;
   notificationsSwitch.checked = notificationReady && state.notifications.enabled === true;
   notificationsSwitch.disabled = !notificationReady;
+  notificationDetail.textContent = translateSettingsMessage(
+    localizer,
+    notificationCapabilityMessageKey(state.notifications),
+  );
   notificationStatus.textContent = translateSettingsMessage(
     localizer,
-    notificationStatusMessageKey(state.notifications),
+    notificationPermissionMessageKey(state.notifications),
   );
-  notificationStatus.classList?.toggle?.("is-ready", notificationReady);
-  notificationStatus.classList?.toggle?.("is-unavailable", !notificationReady);
+  const permissionAuthorized = bridgeAvailable
+    && state.notifications.permission === "authorized";
+  notificationStatus.classList?.toggle?.("is-ready", permissionAuthorized);
+  notificationStatus.classList?.toggle?.("is-unavailable", !permissionAuthorized);
+  openNotificationSettings.disabled = !notificationReady;
   for (const input of thresholdInputs) {
     input.checked = input.value === state.notifications.threshold;
     input.disabled = !notificationReady;

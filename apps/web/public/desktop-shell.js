@@ -18,8 +18,14 @@ const DESKTOP_LANGUAGE_BY_PICKER_VALUE = Object.freeze(
     Object.entries(LANGUAGE_PICKER_VALUES).map(([desktop, picker]) => [picker, desktop]),
   ),
 );
+const mountedDocuments = new WeakMap();
 
-function electronDashboard(documentRef) {
+function electronDashboard(documentRef, windowRef) {
+  // The sandboxed preload exposes this exact, frozen-versioned bridge
+  // synchronously. It is the strongest startup proof: the DOM marker can be
+  // delayed because preload and page DOM events run in isolated worlds.
+  const bridge = windowRef?.tibotattleDesktop;
+  if (bridge?.version === ELECTRON_API_VERSION) return true;
   return documentRef?.documentElement?.classList?.contains("electron-dashboard") === true
     || documentRef?.body?.classList?.contains("electron-dashboard") === true;
 }
@@ -50,12 +56,50 @@ function focusSharePanel(documentRef, windowRef) {
   return true;
 }
 
+function navigateToSharePanel(documentRef, windowRef) {
+  const location = windowRef?.location;
+  if (!location || location.hash === "#weekly") {
+    focusSharePanel(documentRef, windowRef);
+    return;
+  }
+
+  // The dashboard navigation listener also handles this hash change. Wait
+  // for that event before scheduling the panel focus so its page-heading
+  // focus and top-of-page scroll cannot overwrite Share's destination. This
+  // is one event listener plus one animation frame, rather than a timer or a
+  // polling loop; the browser guarantees a hashchange for this assignment.
+  if (typeof windowRef?.addEventListener !== "function") {
+    location.hash = "#weekly";
+    focusSharePanel(documentRef, windowRef);
+    return;
+  }
+  let handled = false;
+  const onHashChange = () => {
+    if (handled) return;
+    handled = true;
+    windowRef.removeEventListener?.("hashchange", onHashChange);
+    if (windowRef.location?.hash !== "#weekly") return;
+    focusSharePanel(documentRef, windowRef);
+  };
+  windowRef.addEventListener("hashchange", onHashChange);
+  location.hash = "#weekly";
+}
+
 function openSettings(windowRef) {
   const bridge = windowRef?.tibotattleDesktop;
   if (bridge?.version === ELECTRON_API_VERSION
       && typeof bridge.openSettings === "function") {
-    void bridge.openSettings();
+    try {
+      // Keep the renderer action fire-and-forget, but consume a rejected IPC
+      // promise. A closed/restarting shell must not turn a button click into
+      // an unhandled rejection that makes the control look dead.
+      void Promise.resolve(bridge.openSettings()).catch(() => {});
+      return true;
+    } catch {
+      return false;
+    }
   }
+  return false;
 }
 
 function readPersistedLanguage(bridge, applyLanguage) {
@@ -119,15 +163,19 @@ export function mountDesktopShell({
   documentRef = globalThis.document,
   windowRef = globalThis.window,
 } = {}) {
-  if (!electronDashboard(documentRef)) return Object.freeze({ teardown() {} });
+  if (!electronDashboard(documentRef, windowRef)) {
+    return Object.freeze({ teardown() {} });
+  }
+  const existing = mountedDocuments.get(documentRef);
+  if (existing) return existing;
   const shareButton = documentRef.querySelector?.("#electron-share-button");
   const settingsButton = documentRef.querySelector?.("#electron-settings-button");
   if (!shareButton || !settingsButton) return Object.freeze({ teardown() {} });
   const onShare = () => {
-    if (windowRef.location && windowRef.location.hash !== "#overview") {
-      windowRef.location.hash = "#overview";
-    }
-    focusSharePanel(documentRef, windowRef);
+    // The share card lives on the Allowance page. Navigating to Overview
+    // first leaves that page inert, so focus() can succeed in a unit fake yet
+    // the packaged Chromium window appears not to move at all.
+    navigateToSharePanel(documentRef, windowRef);
   };
   const onSettings = () => openSettings(windowRef);
   const bridge = windowRef?.tibotattleDesktop;
@@ -158,16 +206,42 @@ export function mountDesktopShell({
   picker?.addEventListener?.("change", onLanguageChange);
   readPersistedLanguage(bridge, applyLanguage);
   const unsubscribeCommand = installCommandBridge(documentRef, windowRef, applyLanguage);
-  return Object.freeze({
+  const mounted = Object.freeze({
     teardown() {
       shareButton.removeEventListener?.("click", onShare);
       settingsButton.removeEventListener?.("click", onSettings);
       picker?.removeEventListener?.("change", onLanguageChange);
       unsubscribeCommand();
+      mountedDocuments.delete(documentRef);
     },
   });
+  mountedDocuments.set(documentRef, mounted);
+  return mounted;
 }
 
-if (typeof document !== "undefined") {
-  mountDesktopShell();
+function autoMountDesktopShell() {
+  if (typeof document === "undefined") return;
+  const mount = () => {
+    // Electron's preload normally stamps the marker before this module runs.
+    // The DOM-ready retry covers the legitimate startup ordering where the
+    // marker is applied while the document body is still being constructed.
+    mountDesktopShell();
+  };
+  mount();
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", () => {
+      mount();
+      // The preload lives in Electron's isolated world. Its DOMContentLoaded
+      // listener is not ordered relative to this page-world listener, so a
+      // marker can land immediately after the callback above. One macrotask
+      // gives the remaining DOM-ready listeners a chance to stamp it; the
+      // idempotent mount then installs the controls without starting a poll.
+      const schedule = typeof globalThis.window?.setTimeout === "function"
+        ? globalThis.window.setTimeout.bind(globalThis.window)
+        : globalThis.setTimeout;
+      if (typeof schedule === "function") schedule(mount, 0);
+    }, { once: true });
+  }
 }
+
+autoMountDesktopShell();

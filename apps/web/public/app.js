@@ -284,6 +284,11 @@ let localRefreshCancelRequested = false;
 let archiveHistoryScanActive = false;
 let returnRefreshScheduled = false;
 let returnRefreshDeferrals = 0;
+// The native macOS shell starts one foreground refresh after the dashboard's
+// first real local render. Electron shares the dashboard renderer instead of
+// owning a WKWebView readiness callback, so this page-local fence supplies the
+// equivalent one-shot handoff without changing ordinary browser behavior.
+let electronStartupRefreshTriggered = false;
 let globalState = null;
 let visibleConnectionNotice = null;
 let dashboardUnavailableState = null;
@@ -10563,13 +10568,36 @@ async function reloadLocalEvidenceAfterNativeRefresh() {
   }
 }
 
+/**
+ * Start Electron's one launch-time foreground analysis after the initial
+ * dashboard read has settled. `ready-to-show` is too early: it can race the
+ * page's loopback reads, and a first-ever snapshot contains no prior evidence
+ * for the ordinary return-visit scheduler below. The existing request guards
+ * still prevent overlap with a refresh already accepted by the companion.
+ */
+function startElectronStartupRefresh() {
+  if (electronStartupRefreshTriggered
+      || !runsInsideElectronDashboard()
+      || !localAnalysisAllowed()) {
+    return false;
+  }
+  electronStartupRefreshTriggered = true;
+  void requestRefresh();
+  return true;
+}
+
 function scheduleReturningUserRefresh() {
-  // The native macOS shell owns the foreground cadence. Running both the web
-  // return-visit timer and the native timer races the same bounded companion
-  // request, which can surface a harmless 409 as a confusing dashboard error.
-  // What the shell owes in return is a signal when its refresh finished, which
-  // `tibotattle:local-evidence-updated` carries.
+  // The native macOS shell and Electron main process own the foreground
+  // cadence. Running both the web return-visit timer and an app-owned timer
+  // races the same bounded companion request, which can surface a harmless 409
+  // as a confusing dashboard error. The Electron launch pass is deliberately
+  // fenced for the whole document: a fast startup completion must not be
+  // followed by this scheduler's cached-results refresh. What the native
+  // shell owes in return is a signal when its refresh finished, which
+  // `tibotattle:local-evidence-updated` carries; Electron's controller has its
+  // own recurring timer for the next pass.
   if (runsInsideNativeDashboard()) return;
+  if (runsInsideElectronDashboard() && electronStartupRefreshTriggered) return;
   const priorEvidence = dashboard?.mode !== "demo"
     && Boolean(
       dashboard?.activity?.lastScanAt
@@ -13523,6 +13551,7 @@ async function bootstrapDashboard() {
   renderHostedIdentity();
   updateLocalActionButtons();
   await loadLocalDashboard();
+  startElectronStartupRefresh();
   if (
     localCompanionHealth === null
     || localCompanionHealth?.capabilities?.centralServiceProxy === true

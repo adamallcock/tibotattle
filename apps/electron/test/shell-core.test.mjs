@@ -1886,6 +1886,53 @@ test("desktop lifecycle owns a bounded Settings window and authorizes only its t
   assert.equal(app.quitCalls, 1);
 });
 
+test("desktop lifecycle clears a destroyed Settings window without reading invalidated Electron properties", async () => {
+  const app = new FakeApp();
+  const windows = [];
+  class DestroyedSettingsWindow extends FakeWindow {
+    get webContents() {
+      if (this.destroyed) throw new Error("Object has been destroyed");
+      return this._webContents;
+    }
+
+    set webContents(value) {
+      this._webContents = value;
+    }
+  }
+  const supervisor = {
+    setUnexpectedExitHandler() {},
+    async start() {
+      return { origin: "http://127.0.0.1:4711" };
+    },
+    async stop() {},
+  };
+  const lifecycle = createDesktopLifecycle({
+    app,
+    BrowserWindow: class extends DestroyedSettingsWindow {
+      constructor(options) {
+        super(options);
+        windows.push(this);
+      }
+    },
+    Tray: FakeTray,
+    Menu: { buildFromTemplate: (template) => ({ template }) },
+    icon: "empty-icon",
+    preloadPath: "/private/preload.cjs",
+    supervisor,
+  });
+
+  await lifecycle.start();
+  assert.equal(lifecycle.showSettingsWindow(), true);
+  const settings = windows.find((candidate) => (
+    candidate.loaded[0]?.includes("electron-settings.html")
+  ));
+  assert.notEqual(settings, undefined);
+  settings.destroyed = true;
+  assert.doesNotThrow(() => settings.emit("closed"));
+  assert.equal(lifecycle.state.hasSettingsWindow, false);
+  await lifecycle.dispose();
+});
+
 test("closing Settings retains the dashboard's shared-session loopback filtering", async () => {
   const app = new FakeApp();
   const windows = [];

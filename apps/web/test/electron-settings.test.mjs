@@ -89,6 +89,7 @@ class FakeElement {
     return this.dispatch(event.type, event);
   }
   click() {
+    if (this.disabled) return {};
     return this.dispatch("click");
   }
 }
@@ -107,6 +108,7 @@ function makeSettingsDocument({ electron = false } = {}) {
   make("settings-start-at-login");
   make("settings-start-at-login-summary");
   make("settings-notifications-enabled");
+  make("settings-notifications-detail");
   make("settings-notification-status");
   make("settings-automatic-updates");
   make("settings-check-for-updates");
@@ -260,6 +262,15 @@ test("settings assets expose the exact v1 bridge, finite values, and fixed links
   assert.match(html, /data-i18n-root/u);
   assert.match(html, /role="switch"[^>]*disabled/u);
   assert.match(html, /name="settings-notification-threshold"[^>]*disabled/u);
+  const openNotificationSettingsButton = html.match(
+    /<button[^>]*id="settings-open-notification-settings"[^>]*>/u,
+  )?.[0];
+  assert.ok(openNotificationSettingsButton, "settings ships the notification settings action");
+  assert.match(
+    openNotificationSettingsButton,
+    /\bdisabled\b/u,
+    "notification settings stays disabled until capability is confirmed",
+  );
   assert.match(html, /fresh provider-reported evidence/u);
   assert.doesNotMatch(html, /alert delivery is not implemented in this prototype/u);
   assert.match(css, /\.electron-settings-page/u);
@@ -300,6 +311,149 @@ test("Electron Settings catalog covers every semantic label in all supported loc
   for (const locale of SUPPORTED_LOCALES) {
     assert.doesNotMatch(translate("electron.settings.notifications.description", {}, locale), /not implemented|尚未实现|no está implementado/u);
     assert.match(translate("electron.settings.notifications.status.unavailable", {}, locale), /No alerts|不会发送|No se enviarán/u);
+  }
+});
+
+test("notification settings separate localized capability detail from OS permission", async () => {
+  const baseNotifications = settingsState().notifications;
+  const permissionCases = [
+    ["authorized", "electron.settings.notifications.permission.authorized"],
+    ["denied", "electron.settings.notifications.permission.denied"],
+    ["unknown", "electron.settings.notifications.permission.unknown"],
+    ["unavailable", "electron.settings.notifications.permission.unavailable"],
+  ];
+
+  for (const locale of SUPPORTED_LOCALES) {
+    const localizer = {
+      t: (key, values) => translate(key, values, locale),
+    };
+    for (const [permission, permissionKey] of permissionCases) {
+      const documentRef = makeSettingsDocument();
+      const bridge = bridgeFixture([], settingsState({
+        notifications: {
+          ...baseNotifications,
+          // A stale/raw detail must not overwrite the normalized capability
+          // status or make the permission card claim that capability is ready.
+          detail: "Local allowance alerts are unavailable. No alerts will be sent.",
+          permission,
+        },
+      }));
+
+      await mountSettingsPage({
+        documentRef,
+        windowRef: { tibotattleDesktop: bridge },
+        bridge,
+        localizer,
+      });
+
+      assert.equal(
+        documentRef.byId.get("settings-notifications-detail").textContent,
+        translate("electron.settings.notifications.status.ready", {}, locale),
+      );
+      assert.equal(
+        documentRef.byId.get("settings-notification-status").textContent,
+        translate(permissionKey, {}, locale),
+      );
+      assert.equal(documentRef.byId.get("settings-notifications-enabled").disabled, false);
+      assert.equal(documentRef.byId.get("settings-open-notification-settings").disabled, false);
+      assert.equal(documentRef.thresholds.every((input) => input.disabled), false);
+      assert.equal(
+        documentRef.byId.get("settings-notification-status").classList.contains("is-ready"),
+        permission === "authorized",
+      );
+    }
+
+    const unavailableDocument = makeSettingsDocument();
+    const unavailableBridge = bridgeFixture([], settingsState({
+      notifications: {
+        ...baseNotifications,
+        enabled: true,
+        threshold: "ninety",
+        canSet: true,
+        state: "future-state",
+        delivery: "future-delivery",
+        permission: "future-permission",
+        detail: "Local allowance alerts are ready.",
+      },
+    }));
+    await mountSettingsPage({
+      documentRef: unavailableDocument,
+      windowRef: { tibotattleDesktop: unavailableBridge },
+      bridge: unavailableBridge,
+      localizer,
+    });
+    assert.equal(
+      unavailableDocument.byId.get("settings-notifications-detail").textContent,
+      translate("electron.settings.notifications.status.unavailable", {}, locale),
+    );
+    assert.equal(
+      unavailableDocument.byId.get("settings-notification-status").textContent,
+      translate("electron.settings.notifications.permission.unavailable", {}, locale),
+    );
+    assert.equal(unavailableDocument.byId.get("settings-notifications-enabled").disabled, true);
+    assert.equal(unavailableDocument.byId.get("settings-open-notification-settings").disabled, true);
+    assert.equal(unavailableDocument.thresholds.every((input) => input.disabled), true);
+  }
+});
+
+test("notification settings opens the bounded OS action when delivery is ready, but stays disabled for unavailable delivery", async () => {
+  for (const locale of SUPPORTED_LOCALES) {
+    const localizer = {
+      t: (key, values) => translate(key, values, locale),
+    };
+    const deniedDocument = makeSettingsDocument();
+    const deniedCalls = [];
+    const deniedBridge = bridgeFixture(deniedCalls, settingsState({
+      notifications: {
+        ...settingsState().notifications,
+        permission: "denied",
+      },
+    }));
+
+    await mountSettingsPage({
+      documentRef: deniedDocument,
+      windowRef: { tibotattleDesktop: deniedBridge },
+      bridge: deniedBridge,
+      localizer,
+    });
+
+    const deniedButton = deniedDocument.byId.get("settings-open-notification-settings");
+    assert.equal(deniedButton.disabled, false);
+    deniedButton.click();
+    deniedButton.click();
+    await settle();
+    assert.deepEqual(deniedCalls, [["openSystemSettings", "notifications"]]);
+
+    const unavailableDocument = makeSettingsDocument();
+    const unavailableCalls = [];
+    const unavailableBridge = bridgeFixture(unavailableCalls, settingsState({
+      notifications: {
+        ...settingsState().notifications,
+        delivery: "windows_identity_unavailable",
+        permission: "denied",
+      },
+    }));
+
+    await mountSettingsPage({
+      documentRef: unavailableDocument,
+      windowRef: { tibotattleDesktop: unavailableBridge },
+      bridge: unavailableBridge,
+      localizer,
+    });
+
+    const unavailableButton = unavailableDocument.byId.get("settings-open-notification-settings");
+    assert.equal(unavailableButton.disabled, true);
+    assert.equal(
+      unavailableDocument.byId.get("settings-notifications-detail").textContent,
+      translate(
+        "electron.settings.notifications.status.windowsIdentityUnavailable",
+        {},
+        locale,
+      ),
+    );
+    unavailableButton.click();
+    await settle();
+    assert.deepEqual(unavailableCalls, []);
   }
 });
 
@@ -413,6 +567,7 @@ test("settings fail closed without the desktop bridge and reject unlisted values
   assert.match(absent.byId.get("settings-bridge-status").textContent, /unavailable/u);
   assert.equal(absent.byId.get("settings-start-at-login").disabled, true);
   assert.equal(absent.byId.get("settings-notifications-enabled").disabled, true);
+  assert.equal(absent.byId.get("settings-open-notification-settings").disabled, true);
   assert.equal(absent.byId.get("settings-check-for-updates").disabled, true);
   const absentLinkClick = absent.links[0].dispatch("click");
   assert.equal(absentLinkClick.prevented, true);
@@ -490,7 +645,7 @@ test("settings opens the bounded tab named by its hash and falls back to General
   assert.equal(fallbackDocument.byId.get("settings-panel-general").hidden, false);
 });
 
-test("Electron-only Share focuses the share panel, commands bridge to bounded controls, and Settings uses the enumerated action", async () => {
+test("Electron-only Share focuses the Allowance share panel, commands bridge to bounded controls, and Settings uses the enumerated action", async () => {
   const documentRef = makeSettingsDocument({ electron: true });
   const calls = [];
   let openedSettings = 0;
@@ -549,7 +704,7 @@ test("Electron-only Share focuses the share panel, commands bridge to bounded co
   await settle();
   assert.deepEqual(calls, [["setLanguage", "en"]]);
   documentRef.shareButton.dispatch("click");
-  assert.equal(windowRef.location.hash, "#overview");
+  assert.equal(windowRef.location.hash, "#weekly");
   assert.equal(documentRef.sharePanel.getAttribute("tabindex"), "-1");
   assert.equal(documentRef.sharePanel.focusCalls.length, 1);
   assert.equal(documentRef.sharePanel.scrollCalls.length, 1);
@@ -592,4 +747,173 @@ test("Electron Share honors the operating system reduced-motion preference", () 
     behavior: "auto",
   }]);
   mounted.teardown();
+});
+
+test("Electron Share refocuses the panel after deferred navigation focus settles", () => {
+  const documentRef = makeSettingsDocument({ electron: true });
+  const weeklyHeading = new FakeElement({ id: "weekly-title" });
+  const animationFrames = [];
+  const listeners = new Map();
+  const addListener = (type, listener) => {
+    const bucket = listeners.get(type) ?? [];
+    bucket.push(listener);
+    listeners.set(type, bucket);
+  };
+  const removeListener = (type, listener) => {
+    const bucket = listeners.get(type) ?? [];
+    listeners.set(type, bucket.filter((candidate) => candidate !== listener));
+  };
+  const emit = (type) => {
+    for (const listener of [...(listeners.get(type) ?? [])]) listener({ type });
+  };
+  documentRef.activeElement = null;
+  weeklyHeading.focus = () => {
+    documentRef.activeElement = weeklyHeading;
+  };
+  documentRef.sharePanel.focus = (options) => {
+    documentRef.sharePanel.focusCalls.push(options);
+    documentRef.activeElement = documentRef.sharePanel;
+  };
+  // Navigation is mounted before the Electron shell in index.html. This
+  // listener models its hashchange work: it focuses the page heading and
+  // scrolls to the top after the Share click has requested navigation.
+  const windowRef = {
+    location: { hash: "#community" },
+    addEventListener: addListener,
+    removeEventListener: removeListener,
+    requestAnimationFrame(callback) { animationFrames.push(callback); },
+    scrollTo() {},
+    tibotattleDesktop: Object.freeze({
+      version: DESKTOP_SETTINGS_API_VERSION,
+      getSettings: async () => ({ language: "system" }),
+      onCommand() { return () => {}; },
+      openSettings: async () => {},
+    }),
+  };
+  addListener("hashchange", () => {
+    weeklyHeading.focus();
+    windowRef.scrollTo({ top: 0, behavior: "instant" });
+  });
+
+  const mounted = mountDesktopShell({ documentRef, windowRef });
+  documentRef.shareButton.dispatch("click");
+  assert.equal(windowRef.location.hash, "#weekly");
+  assert.equal(animationFrames.length, 0, "Share waits for navigation before scheduling focus");
+
+  // Reproduce the browser ordering that exposed the bug: navigation's
+  // deferred hash work wins focus before Share's post-navigation frame.
+  emit("hashchange");
+  assert.equal(documentRef.activeElement, weeklyHeading);
+  assert.equal(animationFrames.length, 1);
+  for (const callback of animationFrames.splice(0)) callback();
+
+  assert.equal(documentRef.activeElement, documentRef.sharePanel);
+  assert.equal(documentRef.sharePanel.focusCalls.length, 1);
+  assert.equal(documentRef.sharePanel.scrollCalls.length, 1);
+  assert.equal(listeners.get("hashchange").length, 1, "navigation listener remains installed");
+  mounted.teardown();
+});
+
+test("Electron shell mounts from the synchronous v1 bridge before the marker exists", async () => {
+  const documentRef = makeSettingsDocument();
+  const readyCallbacks = [];
+  documentRef.documentElement = undefined;
+  documentRef.readyState = "loading";
+  documentRef.addEventListener = (type, callback) => {
+    if (type === "DOMContentLoaded") readyCallbacks.push(callback);
+  };
+  let openedSettings = 0;
+  const windowRef = {
+    location: { hash: "#overview", href: "" },
+    requestAnimationFrame(callback) { callback(); },
+    tibotattleDesktop: Object.freeze({
+      version: DESKTOP_SETTINGS_API_VERSION,
+      getSettings: async () => ({ language: "system" }),
+      setLanguage: async () => {},
+      onCommand() { return () => {}; },
+      openSettings: async () => { openedSettings += 1; },
+    }),
+  };
+  const priorDocument = globalThis.document;
+  const priorWindow = globalThis.window;
+  globalThis.document = documentRef;
+  globalThis.window = windowRef;
+  try {
+    const moduleURL = new URL(
+      "../public/desktop-shell.js?bridge-proof-v1",
+      import.meta.url,
+    );
+    const shell = await import(moduleURL.href);
+    assert.equal(readyCallbacks.length, 1);
+    assert.equal(documentRef.shareButton.listeners.has("click"), true);
+
+    documentRef.shareButton.dispatch("click");
+    assert.equal(windowRef.location.hash, "#weekly");
+    assert.equal(documentRef.sharePanel.focusCalls.length, 1);
+    documentRef.settingsButton.dispatch("click");
+    assert.equal(openedSettings, 1);
+
+    shell.mountDesktopShell({ documentRef, windowRef }).teardown();
+  } finally {
+    if (priorDocument === undefined) delete globalThis.document;
+    else globalThis.document = priorDocument;
+    if (priorWindow === undefined) delete globalThis.window;
+    else globalThis.window = priorWindow;
+  }
+});
+
+test("Electron shell mounts after a late preload marker at DOMContentLoaded", async () => {
+  const documentRef = makeSettingsDocument();
+  const readyCallbacks = [];
+  const timerCallbacks = [];
+  documentRef.documentElement = undefined;
+  documentRef.readyState = "loading";
+  documentRef.addEventListener = (type, callback) => {
+    if (type === "DOMContentLoaded") readyCallbacks.push(callback);
+  };
+  const windowRef = {
+    location: { hash: "#overview", href: "" },
+    Event: class {
+      constructor(type) { this.type = type; }
+    },
+    requestAnimationFrame(callback) { callback(); },
+    setTimeout(callback, delay) {
+      assert.equal(delay, 0);
+      timerCallbacks.push(callback);
+    },
+  };
+  const priorDocument = globalThis.document;
+  const priorWindow = globalThis.window;
+  globalThis.document = documentRef;
+  globalThis.window = windowRef;
+  try {
+    const moduleURL = new URL(
+      `../public/desktop-shell.js?late-marker=${Date.now()}`,
+      import.meta.url,
+    );
+    const shell = await import(moduleURL.href);
+    assert.equal(readyCallbacks.length, 1);
+    assert.equal(documentRef.shareButton.listeners.has("click"), false);
+
+    // Reproduce the isolated-world ordering: the page-world DOMContentLoaded
+    // callback runs before preload stamps the Electron marker.
+    for (const callback of readyCallbacks) callback();
+    assert.equal(timerCallbacks.length, 1);
+    documentRef.documentElement = { classList: new FakeClassList() };
+    documentRef.documentElement.classList.add("electron-dashboard");
+    documentRef.body.classList.add("electron-dashboard");
+    for (const callback of timerCallbacks) callback();
+    await settle();
+
+    documentRef.shareButton.dispatch("click");
+    assert.equal(windowRef.location.hash, "#weekly");
+    assert.equal(documentRef.sharePanel.focusCalls.length, 1);
+
+    shell.mountDesktopShell({ documentRef, windowRef }).teardown();
+  } finally {
+    if (priorDocument === undefined) delete globalThis.document;
+    else globalThis.document = priorDocument;
+    if (priorWindow === undefined) delete globalThis.window;
+    else globalThis.window = priorWindow;
+  }
 });

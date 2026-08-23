@@ -6564,6 +6564,22 @@ test("the invisible review bootstrap keeps fixed lookbacks and fails dense days 
 
 test("return visits schedule one bounded checkpoint refresh after cached results render", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  // Electron matches the native installed app by starting one foreground
+  // analysis only after its first real dashboard read. The page-local fence
+  // prevents duplicate startup calls, while native WebKit and normal browsers
+  // retain their existing owners.
+  assert.match(
+    appSource,
+    /let electronStartupRefreshTriggered = false;/u,
+  );
+  assert.match(
+    appSource,
+    /function startElectronStartupRefresh\(\) \{[\s\S]*?electronStartupRefreshTriggered[\s\S]*?!runsInsideElectronDashboard\(\)[\s\S]*?!localAnalysisAllowed\(\)[\s\S]*?electronStartupRefreshTriggered = true;[\s\S]*?void requestRefresh\(\);[\s\S]*?return true;/u,
+  );
+  assert.match(
+    appSource,
+    /await loadLocalDashboard\(\);\s*\n\s*startElectronStartupRefresh\(\);/u,
+  );
   assert.match(appSource, /function scheduleReturningUserRefresh\(\)/u);
   assert.match(appSource, /if \(runsInsideNativeDashboard\(\)\) return;/u);
   assert.match(appSource, /document\.documentElement\.classList\.contains\("native-dashboard"\)/u);
@@ -6576,6 +6592,115 @@ test("return visits schedule one bounded checkpoint refresh after cached results
   assert.match(
     appSource,
     /await loadCommunityResults\(\);[\s\S]{0,360}?void resumePendingHostedSignIn\(\);\s*\n\s*scheduleReturningUserRefresh\(\);/u,
+  );
+});
+
+test("Electron startup refresh is behaviorally gated and owns the document return pass", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  // app.js is a shipped browser boot script rather than an importable module.
+  // Execute the real gate, one-shot, and return-scheduler functions in a small
+  // browser-shaped VM so this test checks behavior instead of only matching
+  // their source text.
+  const stateStart = appSource.indexOf("let returnRefreshScheduled = false;");
+  const stateEnd = appSource.indexOf("let globalState = null;", stateStart);
+  const localAllowedStart = appSource.indexOf("function localAnalysisAllowed(value = localOnboarding)");
+  const localAllowedEnd = appSource.indexOf("\nfunction localAnalysisLabel", localAllowedStart);
+  const nativeStart = appSource.indexOf("function runsInsideNativeDashboard() {");
+  const nativeEnd = appSource.indexOf("\nfunction runsInsideElectronDashboard", nativeStart);
+  const electronStart = appSource.indexOf("function runsInsideElectronDashboard() {");
+  const electronEnd = appSource.indexOf("\nfunction hostedSignInBrowserHandoffError", electronStart);
+  const startupStart = appSource.indexOf("function startElectronStartupRefresh() {");
+  const startupEnd = appSource.indexOf("\nfunction scheduleReturningUserRefresh", startupStart);
+  const scheduleStart = appSource.indexOf("function scheduleReturningUserRefresh() {");
+  const scheduleEnd = appSource.indexOf("\nconst HOSTED_IDENTITY_ERROR_COPY", scheduleStart);
+  for (const [name, start, end] of [
+    ["state", stateStart, stateEnd],
+    ["local analysis gate", localAllowedStart, localAllowedEnd],
+    ["native marker helper", nativeStart, nativeEnd],
+    ["Electron marker helper", electronStart, electronEnd],
+    ["startup helper", startupStart, startupEnd],
+    ["return scheduler", scheduleStart, scheduleEnd],
+  ]) {
+    assert.ok(start >= 0 && end > start, `could not isolate ${name}`);
+  }
+
+  function createHarness({ classes, allowed }) {
+    const harness = {
+      calls: 0,
+      timers: [],
+      dashboard: {
+        mode: "real_local_evidence",
+        activity: { lastScanAt: "2026-08-23T00:00:00.000Z" },
+      },
+      localOnboarding: {
+        state: "ready",
+        sessionsReadable: allowed,
+        archivedSessionsReadable: false,
+        rolloutFilesPresent: allowed,
+        stateWritable: allowed,
+        explicitRefresh: allowed,
+      },
+      localActionBusy: false,
+      localRefreshInProgress: false,
+      document: {
+        documentElement: { classList: { contains: (name) => classes.has(name) } },
+        body: { classList: { contains: (name) => classes.has(name) } },
+      },
+      window: {
+        setTimeout: (callback) => {
+          harness.timers.push(callback);
+          return harness.timers.length;
+        },
+      },
+      showConnectionNotice() {},
+    };
+    harness.requestRefresh = () => { harness.calls += 1; };
+    vm.runInNewContext(`
+      ${appSource.slice(stateStart, stateEnd)}
+      ${appSource.slice(localAllowedStart, localAllowedEnd)}
+      ${appSource.slice(nativeStart, nativeEnd)}
+      ${appSource.slice(electronStart, electronEnd)}
+      ${appSource.slice(startupStart, startupEnd)}
+      ${appSource.slice(scheduleStart, scheduleEnd)}
+      globalThis.api = { startElectronStartupRefresh, scheduleReturningUserRefresh };
+    `, vm.createContext(harness));
+    return harness;
+  }
+
+  const browser = createHarness({ classes: new Set(), allowed: true });
+  assert.equal(browser.api.startElectronStartupRefresh(), false);
+  assert.equal(browser.calls, 0);
+  browser.api.scheduleReturningUserRefresh();
+  assert.equal(browser.timers.length, 1, "browser return visits retain their scheduler");
+
+  const native = createHarness({ classes: new Set(["native-dashboard"]), allowed: true });
+  assert.equal(native.api.startElectronStartupRefresh(), false);
+  assert.equal(native.calls, 0);
+  native.api.scheduleReturningUserRefresh();
+  assert.equal(native.timers.length, 0, "native cadence remains main-owned");
+
+  const electronBlocked = createHarness({
+    classes: new Set(["electron-dashboard"]),
+    allowed: false,
+  });
+  assert.equal(electronBlocked.api.startElectronStartupRefresh(), false);
+  assert.equal(electronBlocked.calls, 0);
+  electronBlocked.api.scheduleReturningUserRefresh();
+  assert.equal(electronBlocked.timers.length, 0, "Electron never refreshes before its preflight gate");
+
+  const electron = createHarness({
+    classes: new Set(["electron-dashboard"]),
+    allowed: true,
+  });
+  assert.equal(electron.api.startElectronStartupRefresh(), true);
+  assert.equal(electron.calls, 1);
+  assert.equal(electron.api.startElectronStartupRefresh(), false, "startup is one-shot per document");
+  assert.equal(electron.calls, 1);
+  electron.api.scheduleReturningUserRefresh();
+  assert.equal(
+    electron.timers.length,
+    0,
+    "a fast startup completion cannot schedule a second Electron return refresh",
   );
 });
 
