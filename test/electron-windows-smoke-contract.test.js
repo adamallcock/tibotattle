@@ -68,6 +68,7 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   const lifecycle = await readFile("apps/electron/desktop-lifecycle.js", "utf8");
   const gate = await readFile("apps/electron/platform-gate.js", "utf8");
   const qualification = await readFile("apps/electron/windows-qualification.js", "utf8");
+  const workflow = await readFile(".github/workflows/windows-portability.yml", "utf8");
   const packageJson = JSON.parse(await readFile("package.json", "utf8"));
 
   assert.equal(packageJson.scripts["smoke:electron:windows"], "node ./scripts/smoke-electron-windows.mjs");
@@ -82,6 +83,30 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /failureStage/u);
   assert.match(source, /failureReason/u);
   assert.match(source, /classifySmokeFailure/u);
+  for (const reason of [
+    "dash_loopback",
+    "dash_origin",
+    "dash_health",
+    "dash_topbar",
+    "dash_sidebar",
+    "dash_nav",
+    "dash_active_nav",
+    "dash_active_page",
+    "dash_refresh",
+    "dash_language",
+    "dash_trends_nav",
+    "dash_trends_page",
+    "dash_previous_page",
+    "dash_trends_count",
+    "dash_refresh_boundary",
+    "dash_startup_duplicate",
+    "dash_startup_receipt",
+    "dash_startup_changed",
+    "dash_startup_failed",
+    "dash_startup_cancelled",
+  ]) {
+    assert.match(workflow, new RegExp(`'${reason}'`, "u"));
+  }
   assert.match(source, /WINDOWS_ELECTRON_SMOKE_CONTROL_TIMEOUT/u);
   assert.match(source, /WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT/u);
   assert.match(source, /WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT/u);
@@ -567,8 +592,70 @@ test("Windows Electron smoke diagnostics are fixed, phase-bound, and content-fre
     "protocol",
     "assertion",
     "operation",
+    "dash_loopback",
+    "dash_origin",
+    "dash_health",
+    "dash_topbar",
+    "dash_sidebar",
+    "dash_nav",
+    "dash_active_nav",
+    "dash_active_page",
+    "dash_refresh",
+    "dash_language",
+    "dash_trends_nav",
+    "dash_trends_page",
+    "dash_previous_page",
+    "dash_trends_count",
+    "dash_refresh_boundary",
+    "dash_startup_duplicate",
+    "dash_startup_receipt",
+    "dash_startup_changed",
+    "dash_startup_failed",
+    "dash_startup_cancelled",
     "unknown",
   ]);
+  const dashboardFailureCases = [
+    ["WINDOWS_ELECTRON_SMOKE_LOOPBACK_REQUIRED", "dash_loopback", "assertion"],
+    ["WINDOWS_ELECTRON_SMOKE_LOOPBACK_ORIGIN_INVALID", "dash_origin", "assertion"],
+    ["WINDOWS_ELECTRON_SMOKE_COMPANION_NOT_READY", "dash_health", "assertion"],
+    ["WINDOWS_ELECTRON_SMOKE_SHELL_TOPBAR_MISSING", "dash_topbar", "assertion"],
+    ["WINDOWS_ELECTRON_SMOKE_SHELL_SIDEBAR_MISSING", "dash_sidebar", "assertion"],
+    ["WINDOWS_ELECTRON_SMOKE_SHELL_NAVIGATION_INVALID", "dash_nav", "assertion"],
+    ["WINDOWS_ELECTRON_SMOKE_SHELL_ACTIVE_NAV_INVALID", "dash_active_nav", "assertion"],
+    ["WINDOWS_ELECTRON_SMOKE_SHELL_ACTIVE_PAGE_INVALID", "dash_active_page", "assertion"],
+    ["WINDOWS_ELECTRON_SMOKE_SHELL_REFRESH_MISSING", "dash_refresh", "assertion"],
+    ["WINDOWS_ELECTRON_SMOKE_SHELL_LANGUAGE_MISSING", "dash_language", "assertion"],
+    ["WINDOWS_ELECTRON_SMOKE_SHELL_TRENDS_INACTIVE", "dash_trends_nav", "assertion"],
+    ["WINDOWS_ELECTRON_SMOKE_SHELL_TRENDS_PAGE_INACTIVE", "dash_trends_page", "assertion"],
+    ["WINDOWS_ELECTRON_SMOKE_SHELL_PREVIOUS_PAGE_ACTIVE", "dash_previous_page", "assertion"],
+    ["WINDOWS_ELECTRON_SMOKE_SHELL_TRENDS_COUNT_INVALID", "dash_trends_count", "assertion"],
+    ["WINDOWS_ELECTRON_SMOKE_REFRESH_BOUNDARY_INVALID", "dash_refresh_boundary", "protocol"],
+    ["WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_DUPLICATED", "dash_startup_duplicate", "assertion"],
+    ["WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_RECEIPT_INVALID", "dash_startup_receipt", "assertion"],
+    ["WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_RECEIPT_CHANGED", "dash_startup_changed", "assertion"],
+    ["WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_FAILED", "dash_startup_failed", "assertion"],
+    ["WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_CANCELLED", "dash_startup_cancelled", "assertion"],
+  ];
+  const dashboardReasons = dashboardFailureCases.map(([, reason]) => reason);
+  assert.equal(new Set(dashboardReasons).size, dashboardReasons.length);
+  assert.doesNotMatch(
+    JSON.stringify(dashboardReasons),
+    /(?:[A-Za-z]:[\\/]|\/Users\/|\/home\/|\\Users\\|username|password|secret|token|pid|process|stdout|stderr|command|executable)/iu,
+  );
+  for (const [code, reason, nonDashboardReason] of dashboardFailureCases) {
+    assert.deepEqual(
+      classifySmokeFailure({ code }, "dashboard"),
+      { failureStage: "dashboard", failureReason: reason },
+    );
+    assert.deepEqual(
+      classifySmokeFailure({ code }, "refresh"),
+      { failureStage: "refresh", failureReason: reason },
+    );
+    assert.deepEqual(
+      classifySmokeFailure({ code }, "control"),
+      { failureStage: "control", failureReason: nonDashboardReason },
+    );
+  }
   assert.deepEqual(
     classifySmokeFailure(
       { code: "WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_CONTROL" },

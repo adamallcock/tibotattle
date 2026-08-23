@@ -125,11 +125,54 @@ export const WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST = Object.freeze([
   "protocol",
   "assertion",
   "operation",
+  "dash_loopback",
+  "dash_origin",
+  "dash_health",
+  "dash_topbar",
+  "dash_sidebar",
+  "dash_nav",
+  "dash_active_nav",
+  "dash_active_page",
+  "dash_refresh",
+  "dash_language",
+  "dash_trends_nav",
+  "dash_trends_page",
+  "dash_previous_page",
+  "dash_trends_count",
+  "dash_refresh_boundary",
+  "dash_startup_duplicate",
+  "dash_startup_receipt",
+  "dash_startup_changed",
+  "dash_startup_failed",
+  "dash_startup_cancelled",
   "unknown",
 ]);
 
 const FAILURE_STAGE_SET = new Set(WINDOWS_ELECTRON_SMOKE_FAILURE_STAGE_ALLOWLIST);
 const FAILURE_REASON_SET = new Set(WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST);
+const DASHBOARD_FAILURE_REASON_BY_CODE = Object.freeze({
+  WINDOWS_ELECTRON_SMOKE_LOOPBACK_REQUIRED: "dash_loopback",
+  WINDOWS_ELECTRON_SMOKE_LOOPBACK_ORIGIN_INVALID: "dash_origin",
+  WINDOWS_ELECTRON_SMOKE_COMPANION_NOT_READY: "dash_health",
+  WINDOWS_ELECTRON_SMOKE_SHELL_TOPBAR_MISSING: "dash_topbar",
+  WINDOWS_ELECTRON_SMOKE_SHELL_SIDEBAR_MISSING: "dash_sidebar",
+  WINDOWS_ELECTRON_SMOKE_SHELL_NAVIGATION_INVALID: "dash_nav",
+  WINDOWS_ELECTRON_SMOKE_SHELL_ACTIVE_NAV_INVALID: "dash_active_nav",
+  WINDOWS_ELECTRON_SMOKE_SHELL_ACTIVE_PAGE_INVALID: "dash_active_page",
+  WINDOWS_ELECTRON_SMOKE_SHELL_REFRESH_MISSING: "dash_refresh",
+  WINDOWS_ELECTRON_SMOKE_SHELL_LANGUAGE_MISSING: "dash_language",
+  WINDOWS_ELECTRON_SMOKE_SHELL_TRENDS_INACTIVE: "dash_trends_nav",
+  WINDOWS_ELECTRON_SMOKE_SHELL_TRENDS_PAGE_INACTIVE: "dash_trends_page",
+  WINDOWS_ELECTRON_SMOKE_SHELL_PREVIOUS_PAGE_ACTIVE: "dash_previous_page",
+  WINDOWS_ELECTRON_SMOKE_SHELL_TRENDS_COUNT_INVALID: "dash_trends_count",
+  WINDOWS_ELECTRON_SMOKE_REFRESH_BOUNDARY_INVALID: "dash_refresh_boundary",
+  WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_DUPLICATED: "dash_startup_duplicate",
+  WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_RECEIPT_INVALID: "dash_startup_receipt",
+  WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_RECEIPT_CHANGED: "dash_startup_changed",
+  WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_FAILED: "dash_startup_failed",
+  WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_CANCELLED: "dash_startup_cancelled",
+});
+const DASHBOARD_FAILURE_PHASES = new Set(["dashboard", "refresh"]);
 const DEFAULT_SMOKE_TIMEOUT_CODE = "WINDOWS_ELECTRON_SMOKE_TIMEOUT";
 const SMOKE_TIMEOUT_CODES = new Set([
   DEFAULT_SMOKE_TIMEOUT_CODE,
@@ -333,7 +376,12 @@ export function classifySmokeFailure(error, phase = "unknown") {
     ? SMOKE_PHASE_STAGE[phase]
     : "unknown";
   let failureReason = "unknown";
-  if (SMOKE_CHILD_EXIT_CODES.has(code)) {
+  const dashboardFailureReason = DASHBOARD_FAILURE_PHASES.has(phase)
+    ? DASHBOARD_FAILURE_REASON_BY_CODE[code]
+    : undefined;
+  if (dashboardFailureReason !== undefined) {
+    failureReason = dashboardFailureReason;
+  } else if (SMOKE_CHILD_EXIT_CODES.has(code)) {
     failureReason = "child_exit";
   } else if (SMOKE_TIMEOUT_CODES.has(code)) {
     failureReason = "timeout";
