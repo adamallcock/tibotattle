@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  attachSmokeChildErrorBoundary,
   aggregate,
   classifyAutomaticStartupRefreshReceipt,
   classifySmokeFailure,
@@ -118,6 +119,22 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT/u);
   assert.match(source, /WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT/u);
   assert.match(source, /WINDOWS_ELECTRON_SMOKE_RELAUNCH_TIMEOUT/u);
+  const runSmokeStart = source.indexOf("export async function runSmoke");
+  const runSmokeTry = source.indexOf("  try {", runSmokeStart);
+  const fixtureSetup = source.indexOf(
+    "fixture = await createSyntheticFixture();",
+    runSmokeTry,
+  );
+  const runSmokeCatch = source.indexOf("\n  } catch (error) {", fixtureSetup);
+  assert.ok(
+    runSmokeStart >= 0
+      && runSmokeTry > runSmokeStart
+      && fixtureSetup > runSmokeTry
+      && runSmokeCatch > fixtureSetup,
+    "fixture setup must stay inside the classified smoke boundary",
+  );
+  assert.match(source, /WINDOWS_ELECTRON_SMOKE_FIXTURE_SETUP_FAILED/u);
+  assert.match(source, /if \(fixture !== null\) \{[\s\S]*?rm\(fixture\.root/u);
   assert.doesNotMatch(source, /lastError\.message/u);
   assert.match(source, /isTerminalSmokeError/u);
   assert.match(source, /if \(isTerminalSmokeError\(error\)\) throw error/u);
@@ -127,6 +144,7 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /stdio:\s*\["ignore",\s*"ignore",\s*"ignore",\s*"ipc"\]/u);
   assert.match(source, /child\.send/u);
   assert.match(source, /child\.on\?\.\("message"/u);
+  assert.match(source, /return attachSmokeChildErrorBoundary\(child\)/u);
   assert.match(source, /normalizeControlMessage/u);
   assert.match(source, /exactKeys/u);
   assert.match(source, /nextMessage\.close/u);
@@ -596,6 +614,31 @@ test("failed Windows Electron smoke preserves completed closed-schema progress",
   });
   assert.equal(Object.hasOwn(failed, "secret"), false);
   assert.equal(progress.artifact, true);
+});
+
+test("packaged child spawn errors stay inside the aggregate boundary", () => {
+  const child = new EventEmitter();
+  assert.doesNotThrow(() => attachSmokeChildErrorBoundary(child));
+  assert.doesNotThrow(() => {
+    child.emit("error", new Error("private launch details"));
+  });
+});
+
+test("fixture setup failures use the artifact assertion diagnostic", () => {
+  assert.deepEqual(
+    classifySmokeFailure(
+      { code: "WINDOWS_ELECTRON_SMOKE_FIXTURE_SETUP_FAILED" },
+      "artifact",
+    ),
+    { failureStage: "artifact", failureReason: "assertion" },
+  );
+  const failed = aggregate("failed", {
+    failureStage: "artifact",
+    failureReason: "assertion",
+  });
+  assert.equal(failed.contentFree, true);
+  assert.equal(failed.failureStage, "artifact");
+  assert.equal(failed.failureReason, "assertion");
 });
 
 test("Windows Electron smoke diagnostics are fixed, phase-bound, and content-free", () => {

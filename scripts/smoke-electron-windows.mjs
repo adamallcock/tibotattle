@@ -349,6 +349,23 @@ function printAggregate(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
 }
 
+/**
+ * A failed Windows CreateProcess emits ChildProcess "error". That event is
+ * fatal when it has no listener, so it can terminate this smoke runner before
+ * the outer runSmoke() catch has a chance to print its closed aggregate. The
+ * event intentionally carries no diagnostics across the boundary; the
+ * bounded control/exit checks below classify the failure with fixed codes.
+ */
+export function attachSmokeChildErrorBoundary(child) {
+  if (child === null
+      || typeof child !== "object"
+      || typeof child.on !== "function") {
+    throw new TypeError("Windows Electron smoke child is invalid");
+  }
+  child.on("error", () => {});
+  return child;
+}
+
 function fail(code) {
   throw fixedError(code);
 }
@@ -1050,7 +1067,7 @@ function spawnPackagedElectron(executable, fixture, port, cwd) {
     // available only to this explicitly spawned qualification process.
     stdio: ["ignore", "ignore", "ignore", "ipc"],
   });
-  return child;
+  return attachSmokeChildErrorBoundary(child);
 }
 
 function exactKeys(value, keys) {
@@ -1848,7 +1865,7 @@ export async function runSmoke(progress) {
   }
   const executable = resolve(process.env.TIBOTATTLE_ELECTRON_EXE ?? DEFAULT_EXECUTABLE);
   const artifactRoot = dirname(executable);
-  const fixture = await createSyntheticFixture();
+  let fixture = null;
   let primary = null;
   let second = null;
   let relaunch = null;
@@ -1891,6 +1908,14 @@ export async function runSmoke(progress) {
     }
   };
   try {
+    try {
+      fixture = await createSyntheticFixture();
+    } catch {
+      // Keep fixture construction inside the classified boundary. Its
+      // adapter, protected-store, or seed failure is represented only by the
+      // existing artifact/assertion aggregate fields.
+      fail("WINDOWS_ELECTRON_SMOKE_FIXTURE_SETUP_FAILED");
+    }
     await assertWindowsExecutable(executable);
     progress.artifact = true;
     failurePhase = "launch";
@@ -2138,7 +2163,9 @@ export async function runSmoke(progress) {
     await terminateProcessTree(primary);
     await terminateProcessTree(relaunch);
     await cleanupCredential({ allowLiveControl: false });
-    await rm(fixture.root, { recursive: true, force: true });
+    if (fixture !== null) {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
   }
 }
 
