@@ -126,14 +126,15 @@ test("desktop-status route is exact, fresh-only, and independent of dashboard pa
       notificationEvidence: null,
     });
 
-    assert.equal(
-      (await fetch(`${base}/api/local/desktop-status`, { method: "POST" })).status,
-      405,
+    const methodResponse = await fetch(
+      `${base}/api/local/desktop-status`,
+      { method: "POST" },
     );
-    assert.equal(
-      (await fetch(`${base}/api/local/desktop-status?private=1`)).status,
-      400,
-    );
+    await methodResponse.body?.cancel();
+    assert.equal(methodResponse.status, 405);
+    const queryResponse = await fetch(`${base}/api/local/desktop-status?private=1`);
+    await queryResponse.body?.cancel();
+    assert.equal(queryResponse.status, 400);
 
     assert.equal(route.app.refresh.start(), true);
     await waitForRefresh(route.app, "succeeded");

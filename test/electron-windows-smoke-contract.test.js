@@ -109,6 +109,12 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.doesNotMatch(source, /\b(?:mkdir|makeDirectory)\(stateRoot/u);
   assert.match(source, /localDashboardReady/u);
   assert.match(source, /\/api\/local\/refresh/u);
+  assert.match(source, /\/api\/local\/desktop-status/u);
+  assert.match(source, /validateDesktopShellStatus/u);
+  assert.match(source, /DESKTOP_STATUS_SCHEMA_INVALID/u);
+  assert.match(source, /DESKTOP_STATUS_ALLOWANCE_INVALID/u);
+  assert.match(source, /DESKTOP_STATUS_QUERY_ACCEPTED/u);
+  assert.match(source, /DESKTOP_STATUS_METHOD_ACCEPTED/u);
   assert.match(source, /X-Usage-Monitor-Local/u);
   assert.match(source, /Page\.getFrameTree/u);
   assert.match(source, /Network\.enable/u);
@@ -165,6 +171,17 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   const refreshSucceeded = source.indexOf('value === "succeeded"');
   const refreshBoundary = source.indexOf("await reloadDashboardDocument(connection)");
   assert.ok(refreshSucceeded >= 0 && refreshBoundary > refreshSucceeded);
+  const desktopStatusRoute = source.indexOf(
+    "await assertDesktopStatusRoute(connection)",
+  );
+  const syntheticRefreshReceipt = source.indexOf(
+    "progress.syntheticRefresh = true",
+  );
+  assert.ok(
+    desktopStatusRoute >= 0
+      && syntheticRefreshReceipt > desktopStatusRoute,
+    "synthetic refresh is not complete until the packaged desktop-status route is qualified",
+  );
   const automaticRefresh = source.indexOf("await assertAutomaticStartupRefresh({");
   const syntheticRefresh = source.indexOf("async function runSyntheticRefresh");
   assert.ok(

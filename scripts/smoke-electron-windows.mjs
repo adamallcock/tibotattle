@@ -33,6 +33,9 @@ import {
 import {
   createWindowsFilesystemAdapter,
 } from "../src/platform/windows-filesystem.js";
+import {
+  validateDesktopShellStatus,
+} from "../src/desktop-shell-status.js";
 
 const require = createRequire(import.meta.url);
 
@@ -1585,6 +1588,57 @@ async function runSyntheticRefresh(connection) {
   await assertRendererShell(connection.cdp);
 }
 
+/**
+ * Qualify the content-free status projection from the real packaged
+ * companion after its synthetic refresh. The existing syntheticRefresh
+ * milestone is not complete unless the shell can consume this closed
+ * contract.
+ */
+async function assertDesktopStatusRoute(connection) {
+  const { dashboardUrl } = connection;
+  const value = await jsonFetch(
+    new URL("/api/local/desktop-status", dashboardUrl),
+    undefined,
+    "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT",
+  );
+  let status;
+  try {
+    status = validateDesktopShellStatus(value);
+  } catch {
+    fail("WINDOWS_ELECTRON_SMOKE_DESKTOP_STATUS_SCHEMA_INVALID");
+  }
+  if (status.state !== "fresh"
+      || status.allowance?.source !== "direct"
+      || status.allowance?.window !== "seven_day"
+      || status.allowance?.remainingPercent !== 80) {
+    fail("WINDOWS_ELECTRON_SMOKE_DESKTOP_STATUS_ALLOWANCE_INVALID");
+  }
+
+  const queryResponse = await withTimeout(
+    fetch(new URL("/api/local/desktop-status?private=1", dashboardUrl)),
+    MAX_OPERATION_MS,
+    "desktop status query rejection",
+    "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT",
+  );
+  await queryResponse.body?.cancel?.().catch?.(() => {});
+  if (queryResponse.status !== 400) {
+    fail("WINDOWS_ELECTRON_SMOKE_DESKTOP_STATUS_QUERY_ACCEPTED");
+  }
+
+  const methodResponse = await withTimeout(
+    fetch(new URL("/api/local/desktop-status", dashboardUrl), {
+      method: "POST",
+    }),
+    MAX_OPERATION_MS,
+    "desktop status method rejection",
+    "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT",
+  );
+  await methodResponse.body?.cancel?.().catch?.(() => {});
+  if (methodResponse.status !== 405) {
+    fail("WINDOWS_ELECTRON_SMOKE_DESKTOP_STATUS_METHOD_ACCEPTED");
+  }
+}
+
 async function writePersistentQualificationState(connection) {
   const { dashboardUrl } = connection;
   const response = await withTimeout(
@@ -1760,6 +1814,7 @@ export async function runSmoke(progress) {
 
     failurePhase = "refresh";
     await runSyntheticRefresh(connection);
+    await assertDesktopStatusRoute(connection);
     progress.syntheticRefresh = true;
     failurePhase = "persistence";
     await writePersistentQualificationState(connection);

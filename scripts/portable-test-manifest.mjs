@@ -312,6 +312,13 @@ export const WINDOWS_DEFERRED_TESTS = Object.freeze([
     file: "test/tool-inventory.test.js",
     reason: "Inventory fixture coverage creates symbolic links; Windows hosted runners may not grant symlink privileges",
   }),
+  // The complete unavailable/stale/privacy/determinism HTTP integration stays
+  // active on macOS/Linux. Windows retains the pure fail-closed projection
+  // suite, while its real packaged smoke qualifies the supported fresh path.
+  Object.freeze({
+    file: "apps/local/desktop-status-route.test.mjs",
+    reason: "Full companion fixture requires qualified Windows filesystem and lease composition; packaged smoke proves fresh status plus query/method rejection",
+  }),
   Object.freeze({
     file: "apps/local/server.test.mjs",
     reason: "Windows companion server integration requires qualified native state and prepared-artifact composition",

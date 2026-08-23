@@ -8,7 +8,7 @@ import {
 } from "../scripts/portable-test-manifest.mjs";
 
 test("Windows portable test deferrals are explicit, unique, and bounded", () => {
-  assert.equal(WINDOWS_DEFERRED_TESTS.length, 29);
+  assert.equal(WINDOWS_DEFERRED_TESTS.length, 30);
   const deferred = new Set();
   for (const entry of WINDOWS_DEFERRED_TESTS) {
     assert.deepEqual(Object.keys(entry).sort(), ["file", "reason"]);
@@ -24,6 +24,7 @@ test("Windows portable test deferrals are explicit, unique, and bounded", () => 
     PORTABLE_TEST_FILES.filter((file) => !deferred.has(file)),
   );
   assert.deepEqual([...deferred].sort(), [
+    "apps/local/desktop-status-route.test.mjs",
     "apps/local/server.test.mjs",
     "test/claude-callback-lifecycle-owner-boundary.test.js",
     "test/claude-callback-lifecycle.test.js",
