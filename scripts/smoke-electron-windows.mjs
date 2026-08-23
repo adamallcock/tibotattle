@@ -110,6 +110,7 @@ export const WINDOWS_ELECTRON_SMOKE_FAILURE_STAGE_ALLOWLIST = Object.freeze([
   "credential",
   "lifecycle",
   "refresh",
+  "status",
   "persistence",
   "instance",
   "shutdown",
@@ -125,6 +126,12 @@ export const WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST = Object.freeze([
   "protocol",
   "assertion",
   "operation",
+  "refresh_not_accepted",
+  "refresh_terminal_failed",
+  "status_schema",
+  "status_state",
+  "status_query_accepted",
+  "status_method_accepted",
   "dash_loopback",
   "dash_origin",
   "dash_health",
@@ -150,6 +157,17 @@ export const WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST = Object.freeze([
 
 const FAILURE_STAGE_SET = new Set(WINDOWS_ELECTRON_SMOKE_FAILURE_STAGE_ALLOWLIST);
 const FAILURE_REASON_SET = new Set(WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST);
+// These fixed codes are the only status/refresh details that cross the
+// diagnostic boundary.  In particular, the status state is never serialized
+// with allowance, evidence, or any other response payload.
+const FIXED_FAILURE_REASON_BY_CODE = Object.freeze({
+  WINDOWS_ELECTRON_SMOKE_REFRESH_NOT_ACCEPTED: "refresh_not_accepted",
+  WINDOWS_ELECTRON_SMOKE_REFRESH_FAILED: "refresh_terminal_failed",
+  WINDOWS_ELECTRON_SMOKE_DESKTOP_STATUS_SCHEMA_INVALID: "status_schema",
+  WINDOWS_ELECTRON_SMOKE_DESKTOP_STATUS_FAIL_CLOSED_INVALID: "status_state",
+  WINDOWS_ELECTRON_SMOKE_DESKTOP_STATUS_QUERY_ACCEPTED: "status_query_accepted",
+  WINDOWS_ELECTRON_SMOKE_DESKTOP_STATUS_METHOD_ACCEPTED: "status_method_accepted",
+});
 const DASHBOARD_FAILURE_REASON_BY_CODE = Object.freeze({
   WINDOWS_ELECTRON_SMOKE_LOOPBACK_REQUIRED: "dash_loopback",
   WINDOWS_ELECTRON_SMOKE_LOOPBACK_ORIGIN_INVALID: "dash_origin",
@@ -207,6 +225,7 @@ const SMOKE_PHASE_STAGE = Object.freeze({
   credential: "credential",
   lifecycle: "lifecycle",
   refresh: "refresh",
+  status: "status",
   persistence: "persistence",
   instance: "instance",
   shutdown: "shutdown",
@@ -376,10 +395,13 @@ export function classifySmokeFailure(error, phase = "unknown") {
     ? SMOKE_PHASE_STAGE[phase]
     : "unknown";
   let failureReason = "unknown";
+  const fixedFailureReason = FIXED_FAILURE_REASON_BY_CODE[code];
   const dashboardFailureReason = DASHBOARD_FAILURE_PHASES.has(phase)
     ? DASHBOARD_FAILURE_REASON_BY_CODE[code]
     : undefined;
-  if (dashboardFailureReason !== undefined) {
+  if (fixedFailureReason !== undefined) {
+    failureReason = fixedFailureReason;
+  } else if (dashboardFailureReason !== undefined) {
     failureReason = dashboardFailureReason;
   } else if (SMOKE_CHILD_EXIT_CODES.has(code)) {
     failureReason = "child_exit";
@@ -1914,8 +1936,9 @@ export async function runSmoke(progress) {
 
     failurePhase = "refresh";
     await runSyntheticRefresh(connection);
-    await assertFailClosedDesktopStatusRoute(connection);
     progress.syntheticRefresh = true;
+    failurePhase = "status";
+    await assertFailClosedDesktopStatusRoute(connection);
     failurePhase = "persistence";
     await writePersistentQualificationState(connection);
 

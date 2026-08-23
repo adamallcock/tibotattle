@@ -80,10 +80,17 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_CONTROL/u);
   assert.match(source, /WINDOWS_ELECTRON_SMOKE_FAILURE_STAGE_ALLOWLIST/u);
   assert.match(source, /WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST/u);
+  assert.match(workflow, /'status'/u);
   assert.match(source, /failureStage/u);
   assert.match(source, /failureReason/u);
   assert.match(source, /classifySmokeFailure/u);
   for (const reason of [
+    "refresh_not_accepted",
+    "refresh_terminal_failed",
+    "status_schema",
+    "status_state",
+    "status_query_accepted",
+    "status_method_accepted",
     "dash_loopback",
     "dash_origin",
     "dash_health",
@@ -214,10 +221,14 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   const syntheticRefreshReceipt = source.indexOf(
     "progress.syntheticRefresh = true",
   );
+  const statusPhase = source.indexOf('failurePhase = "status";');
   assert.ok(
     desktopStatusRoute >= 0
-      && syntheticRefreshReceipt > desktopStatusRoute,
-    "synthetic refresh is not complete until the packaged desktop-status route is qualified",
+      && syntheticRefreshReceipt >= 0
+      && syntheticRefreshReceipt < desktopStatusRoute
+      && statusPhase > syntheticRefreshReceipt
+      && statusPhase < desktopStatusRoute,
+    "synthetic refresh must be receipted before the separate packaged desktop-status route is qualified",
   );
   const automaticRefresh = source.indexOf("await assertAutomaticStartupRefresh({");
   const syntheticRefresh = source.indexOf("async function runSyntheticRefresh");
@@ -584,6 +595,7 @@ test("Windows Electron smoke diagnostics are fixed, phase-bound, and content-fre
     "credential",
     "lifecycle",
     "refresh",
+    "status",
     "persistence",
     "instance",
     "shutdown",
@@ -598,6 +610,12 @@ test("Windows Electron smoke diagnostics are fixed, phase-bound, and content-fre
     "protocol",
     "assertion",
     "operation",
+    "refresh_not_accepted",
+    "refresh_terminal_failed",
+    "status_schema",
+    "status_state",
+    "status_query_accepted",
+    "status_method_accepted",
     "dash_loopback",
     "dash_origin",
     "dash_health",
@@ -662,6 +680,80 @@ test("Windows Electron smoke diagnostics are fixed, phase-bound, and content-fre
       { failureStage: "control", failureReason: nonDashboardReason },
     );
   }
+  const fixedFailureCases = [
+    [
+      "WINDOWS_ELECTRON_SMOKE_REFRESH_NOT_ACCEPTED",
+      "refresh_not_accepted",
+      "refresh",
+    ],
+    [
+      "WINDOWS_ELECTRON_SMOKE_REFRESH_FAILED",
+      "refresh_terminal_failed",
+      "refresh",
+    ],
+    [
+      "WINDOWS_ELECTRON_SMOKE_DESKTOP_STATUS_SCHEMA_INVALID",
+      "status_schema",
+      "status",
+    ],
+    [
+      "WINDOWS_ELECTRON_SMOKE_DESKTOP_STATUS_FAIL_CLOSED_INVALID",
+      "status_state",
+      "status",
+    ],
+    [
+      "WINDOWS_ELECTRON_SMOKE_DESKTOP_STATUS_QUERY_ACCEPTED",
+      "status_query_accepted",
+      "status",
+    ],
+    [
+      "WINDOWS_ELECTRON_SMOKE_DESKTOP_STATUS_METHOD_ACCEPTED",
+      "status_method_accepted",
+      "status",
+    ],
+  ];
+  for (const [code, reason, phase] of fixedFailureCases) {
+    assert.deepEqual(
+      classifySmokeFailure({
+        code,
+        state: "fresh",
+        allowance: { remainingPercent: 100 },
+        notificationEvidence: { secret: "must not cross the aggregate boundary" },
+      }, phase),
+      { failureStage: phase, failureReason: reason },
+    );
+    assert.deepEqual(
+      classifySmokeFailure({ code }, "control"),
+      { failureStage: "control", failureReason: reason },
+    );
+  }
+  const stateOnlyFailure = aggregate("failed", {
+    failureStage: "status",
+    failureReason: "status_state",
+    state: "fresh",
+    allowance: { remainingPercent: 100 },
+    notificationEvidence: { secret: "must not cross the aggregate boundary" },
+  });
+  assert.deepEqual(
+    stateOnlyFailure,
+    {
+      status: "failed",
+      target: "win32-x64",
+      contentFree: true,
+      failureStage: "status",
+      failureReason: "status_state",
+      artifact: false,
+      dashboardReady: false,
+      syntheticRefresh: false,
+      secondInstanceRejected: false,
+      showHideTrayLifecycle: false,
+      cleanQuit: false,
+      noOrphan: false,
+      statePersistence: false,
+      credentialPersistence: false,
+      relaunchPersistence: false,
+    },
+  );
   assert.deepEqual(
     classifySmokeFailure(
       { code: "WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_CONTROL" },
