@@ -3913,12 +3913,35 @@ const SUBPROCESS_SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 // may override the child's pinned old-space cap or preload code into the
 // rebuild), HOME (every path the child touches arrives resolved in the
 // request), and PATH (the child execs nothing).
-function minimalRebuildChildEnvironment() {
-  const environment = {};
-  if (typeof process.env.TMPDIR === "string" && process.env.TMPDIR.length > 0) {
-    environment.TMPDIR = process.env.TMPDIR;
+//
+// Electron's process.execPath is the Electron executable, not node. In a
+// packaged companion, omitting ELECTRON_RUN_AS_NODE makes the rebuild child
+// start a second GUI process instead of executing the worker entry point. Keep
+// the switch conditional so ordinary Node callers retain the previous exact
+// environment shape. `runtime` is injectable only to make that boundary
+// testable without requiring an Electron binary in the Node test lane.
+export function replaySafeAccountingChildEnvironment({
+  environment = process.env,
+  runtime = process,
+} = {}) {
+  if (environment === null
+      || typeof environment !== "object"
+      || Array.isArray(environment)) {
+    throw new TypeError("rebuild child environment must be an object");
   }
-  return environment;
+  if (runtime === null || typeof runtime !== "object") {
+    throw new TypeError("rebuild child runtime must be an object");
+  }
+
+  const selected = {};
+  if (typeof environment.TMPDIR === "string" && environment.TMPDIR.length > 0) {
+    selected.TMPDIR = environment.TMPDIR;
+  }
+  if (typeof runtime.versions?.electron === "string"
+      && runtime.versions.electron.length > 0) {
+    selected.ELECTRON_RUN_AS_NODE = "1";
+  }
+  return selected;
 }
 
 function parseRebuildChildEnvelope(stdoutText) {
@@ -4013,7 +4036,7 @@ async function buildReplaySafeAccountingCacheInSubprocess({
           resultFile,
         ], {
           cwd: workDirectory,
-          env: minimalRebuildChildEnvironment(),
+          env: replaySafeAccountingChildEnvironment(),
           // stdin stays piped and open for the child's whole life — its close
           // is the child's parent-death watchdog. stderr is dropped: child
           // failures classify by envelope and exit status only, so no crash
