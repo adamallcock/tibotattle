@@ -27,37 +27,45 @@ selector, or replacement of the native client.
 
 - The implementation starts from the exact Windows integration revision
   `5f188ac2195d3d9e79d4ed4110f8e3d8399721d9`.
-- That line currently diverges substantially from `origin/main`; it must not be
-  blindly rebased while parity implementation and qualification are in flight.
-  Integration onto current main is a separate, evidence-led branch operation.
+- The current application-source candidate is
+  `2e4385fc99c8a9bfbe41ad1750e35bfc1be5b63d`. It is based exactly on the
+  user-selected local `main` revision
+  `4cb5c48955c2a49861927ef51d6738eab0ef7763` (zero commits behind that local
+  base). After a fresh fetch, local `main` and `origin/main` remain deliberately
+  unresolved: local has seven unique commits and the remote has four. Neither
+  side is silently discarded by this plan.
 - The packaged Electron application already proves secure BrowserWindow
   defaults, companion startup, loopback-only navigation, close-to-tray,
   single-instance handling, clean shutdown, and dashboard rendering on macOS.
-- The visible dashboard regression has a specific cause: Electron stamps the
-  AppKit-only `native-dashboard` marker, so the web stylesheet hides the top
-  bar, sidebar, refresh controls, and setup UI even though Electron supplies no
-  native replacement.
+- The visible dashboard regression was caused by Electron stamping the
+  AppKit-only `native-dashboard` marker. Electron now uses its own marker and
+  mounts its frozen preload bridge independently of DOM-listener ordering.
 - The existing web renderer already implements the five dashboard destinations
   and real companion-backed refresh/data interactions. It is reused, not
   rewritten.
 
 ## Progress snapshot — 2026-08-23
 
-- P0.1 is source- and package-complete: Electron has its own visible dashboard
-  marker and restores the localized top bar, five-item sidebar, state controls,
-  and navigation without changing the native macOS layout. The final unsigned
-  arm64 bundle is packaged and byte-verified; hands-on visual acceptance remains
-  pending because the macOS host was locked when automation attempted to open
-  the exact handoff copy.
+- P0.1 is source-, package-, and physical-acceptance complete for this handoff.
+  Electron has its own visible dashboard marker and restores the localized top
+  bar, five-item sidebar, state controls, and navigation without changing the
+  native macOS layout. Direct packaged-app inspection confirmed all five routes,
+  exactly one active page, inert inactive pages, real rendered data, and no
+  renderer exceptions.
 - P0.2 is complete for the development shell: the renderer receives an exact
   frozen v1 bridge, main-process sender and frame checks, fixed actions,
   loopback-only navigation, sandboxing, and protected desktop settings. Codex
   source paths remain main-process-only; Settings receives only the closed
   semantic state `default` or `custom`.
 - P0.3 is functionally complete for the development build: General,
-  Notifications, and About are reachable from the dashboard, menu, and tray;
-  language, Codex source, cadence, and autostart round-trip; unavailable alert
-  delivery and updates are stated explicitly rather than simulated.
+  Notifications, and About are reachable from the dashboard and macOS
+  application menu; language, Codex source, cadence, and autostart round-trip;
+  unavailable alert delivery and updates are stated explicitly rather than
+  simulated. Physical inspection confirmed a persistent visible Settings
+  window, all three tabs, distinct notification capability and OS-permission
+  copy, close/reopen, and preservation of the selected section. The tray entry
+  remains source- and unit-qualified but has not yet been clicked through on the
+  exact handoff.
 - P0.4 source integration is complete. Companion startup has a visible bounded
   recovery surface with Retry, Settings, and Quit; stale origins are destroyed;
   explicit quit owns child shutdown; and the localized tray projects fixed
@@ -67,16 +75,41 @@ selector, or replacement of the native client.
   share-card download/reveal behavior are integrated. Downloads are
   single-flight and completion-gated; their renderer pending state has a fixed
   recovery deadline.
-- Final automated evidence is 231/231 Electron tests, 340/340 web UI tests, and
-  the full portable lane at 1,903 passed, 50 explicitly native-only skipped,
-  and zero failed. Architecture boundaries have zero approved debt, the tool
-  inventory is complete, documentation links are normalized, and
-  `git diff --check` is clean.
+- Electron now starts one guarded foreground refresh after the first dashboard
+  read. The return-visit scheduler stands down for that document while the main
+  process retains the recurring cadence. Physical inspection observed an
+  automatic refresh reach its deeper-accounting state and settle successfully
+  without a manual Analyze click. Windows and Linux smoke observers bind the
+  request and terminal receipt to the exact validated loopback origin and active
+  main-frame loader, reject stale or duplicate receipts, and fail closed across
+  reload boundaries.
+- Share now routes to the actual owning `#weekly` page, then focuses and scrolls
+  the real `#share-panel`. Direct Computer Use inspection recorded that panel as
+  the focused accessibility element and showed the complete image plus Save and
+  Copy controls in the viewport. Native Swift's historical `#overview` route is
+  not used as the Electron acceptance oracle.
+- Final focused automated evidence is 232/232 Electron tests, 346/346 web UI
+  tests, and 26/26 package plus Windows/Linux smoke-contract tests. Architecture
+  boundaries report 423 production files, 1,634 imports, and zero approved debt;
+  the tool inventory reports 98 records, 100 executable paths, and 63 aliases.
+  Worker tests pass 399/399, Cloud Run passes 15/15 after installing its locked
+  dependencies, and native macOS product tests pass 57/57 with the pinned
+  Sparkle 2.9.3 framework verified byte-for-byte.
+- The unrestricted repository test run is not globally green for two unrelated
+  retained R7 release-evidence receipts: 3,261 passed, 62 skipped, and 2 stale
+  receipt assertions failed out of 3,325 tests. The final local-review runtime
+  gate also exposes a pre-existing artifact-closure gap: the staged source graph
+  imports `@app-usagemonitor/telemetry-contract`, but the offline artifact does
+  not copy that package. Neither parity commit changes those pathways, and no
+  release or security gate was weakened to hide either failure.
 - The verified macOS payload digest is
-  `18d9e24081997eea10183e5a0a3e87581bb4468c8dd3284851c673fc8d409daf`.
-  The stable handoff contains the unsigned `.app` and an integrity-tested zip;
-  it remains a development artifact and carries no release, signing, updater,
-  or Windows-support claim.
+  `e57204145a3284322d6684687df9f90e913eb0345399e4412eacb5f7b6cd4780`
+  across 464 files and 8,127,203 bytes. The stable handoff is
+  `.release-build/electron-user-test/e57204145a32/`; its zip SHA-256 is
+  `6ba919d80d924d2c1ae13460141219aaa1ca01bcc13ba2fb6a993fadf206c139`.
+  Both the copied application and a fresh zip extraction passed the artifact
+  verifier. It remains an unsigned development artifact and carries no release,
+  signing, updater, or Windows-support claim.
 - Independent security review found no reportable finding. A same-user
   download-destination link race remains a defense-in-depth Windows-native
   qualification item, not a validated privilege or confidentiality boundary
@@ -91,6 +124,12 @@ selector, or replacement of the native client.
   signing, upgrade/uninstall policy, and clean lifecycle on one exact revision.
   Packaged Linux GUI qualification remains deferred until that shared boundary
   is stable.
+- Two physical M0 observations remain explicitly open rather than inferred:
+  a disposable fresh profile has not yet produced a durable, direct count of
+  exactly one startup POST, and the exact macOS status-item tray menu has not
+  been used to hide and restore the window. Application-menu Settings and the
+  automatic refresh are physically proven; source and contract coverage for the
+  two remaining paths is not presented as a substitute for those clicks.
 
 ## Definition of parity
 
@@ -260,6 +299,11 @@ clean lifecycle smoke, is visually inspected, and includes:
 That artifact is a product-feedback build, not release or Windows-support
 evidence.
 
+The current `e57204145a32` handoff satisfies items 1–3 and the application-menu
+portion of item 4. The status-item restore click and durable fresh-profile
+exactly-once startup receipt remain the two bounded physical follow-ups before
+calling all of M0 complete.
+
 ## Stop conditions
 
 - Stop a failing repair loop after one localized implementation attempt and one
@@ -267,7 +311,8 @@ evidence.
   changing architecture.
 - Do not weaken security, qualification, package-manifest, or release gates to
   make the prototype appear complete.
-- Do not rebase or rewrite the divergent integration history while other agents
-  or qualification runs depend on it. Reconcile it in a dedicated worktree
-  after the parity artifact is frozen.
+- Do not rewrite the local/remote divergent integration history while other
+  agents or qualification runs depend on it. Reconcile the seven local-only and
+  four remote-only commits in a dedicated branch-lifecycle operation after the
+  parity artifact is frozen.
 - Do not claim full Windows or Linux support from a macOS Electron build.
