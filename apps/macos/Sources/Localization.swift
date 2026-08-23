@@ -182,6 +182,15 @@ enum TiboTattleLocalization {
         case nativeDashboardLocalOnly = "nativeDashboard.localOnly"
         case nativeDashboardLocalOnlyTooltip = "nativeDashboard.localOnlyTooltip"
         case nativeDashboardOverview = "nativeDashboard.overview"
+        case nativeDashboardProgressAnalyzing = "nativeDashboard.progressAnalyzing"
+        case nativeDashboardProgressAnalyzingFiles = "nativeDashboard.progressAnalyzingFiles"
+        case nativeDashboardProgressArchiveIndex = "nativeDashboard.progressArchiveIndex"
+        case nativeDashboardProgressDiscovering = "nativeDashboard.progressDiscovering"
+        case nativeDashboardProgressFinishing = "nativeDashboard.progressFinishing"
+        case nativeDashboardProgressProspective = "nativeDashboard.progressProspective"
+        case nativeDashboardProgressQuickResult = "nativeDashboard.progressQuickResult"
+        case nativeDashboardProgressQuotaRefresh = "nativeDashboard.progressQuotaRefresh"
+        case nativeDashboardProgressSaving = "nativeDashboard.progressSaving"
         case nativeDashboardRefreshUsage = "nativeDashboard.refreshUsage"
         case nativeDashboardRefreshUsageTooltip = "nativeDashboard.refreshUsageTooltip"
         case nativeDashboardShare = "nativeDashboard.share"
@@ -573,6 +582,24 @@ enum TiboTattleLocalization {
                 "Analysis and cached results stay on this Mac. Community contribution is optional."
             case .nativeDashboardOverview:
                 "Overview"
+            case .nativeDashboardProgressAnalyzing:
+                "Analyzing local history…"
+            case .nativeDashboardProgressAnalyzingFiles:
+                "Analyzing %@ of %@ files…"
+            case .nativeDashboardProgressArchiveIndex:
+                "Updating older history…"
+            case .nativeDashboardProgressDiscovering:
+                "Finding local history…"
+            case .nativeDashboardProgressFinishing:
+                "Finishing analysis…"
+            case .nativeDashboardProgressProspective:
+                "Preparing ongoing tracking…"
+            case .nativeDashboardProgressQuickResult:
+                "Headline ready · finishing analysis…"
+            case .nativeDashboardProgressQuotaRefresh:
+                "Refreshing allowance…"
+            case .nativeDashboardProgressSaving:
+                "Saving analysis progress…"
             case .nativeDashboardRefreshUsage:
                 "Refresh"
             case .nativeDashboardRefreshUsageTooltip:
@@ -1056,6 +1083,11 @@ enum TiboTattleLocalization {
         return formatter.string(
             from: NSNumber(value: Double(value) / 100)
         ) ?? "\(value)%"
+    }
+
+    static func integerString(_ value: Int) -> String {
+        decimalNumberFormatter(maximumFractionDigits: 0)
+            .string(from: NSNumber(value: value)) ?? String(value)
     }
 
     static func dateFormatter(

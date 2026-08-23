@@ -189,12 +189,81 @@ struct LocalContributionDiagnostics: Equatable {
     }
 }
 
+/// Privacy-reviewed progress from the companion's existing refresh receipt.
+/// The phase is a closed vocabulary and the only counts retained are bounded
+/// file totals used by the native toolbar. No server-provided prose crosses
+/// this projection.
+struct LocalAnalysisProgress: Equatable {
+    enum Phase: String, Equatable {
+        case discovering
+        case rolloutIndex = "rollout_index"
+        case quotaRefresh = "quota_refresh"
+        case quickResult = "quick_result"
+        case complete
+        case paused
+        case prospective
+        case archiveIndex = "archive_index"
+    }
+
+    let phase: Phase
+    let filesSelected: Int?
+    let filesProcessed: Int?
+
+    var nativeToolbarTitle: String {
+        switch phase {
+        case .discovering:
+            return TiboTattleLocalization.string(
+                .nativeDashboardProgressDiscovering
+            )
+        case .rolloutIndex:
+            guard let filesSelected,
+                  let filesProcessed,
+                  filesSelected > 0,
+                  filesProcessed <= filesSelected
+            else {
+                return TiboTattleLocalization.string(
+                    .nativeDashboardProgressAnalyzing
+                )
+            }
+            return TiboTattleLocalization.format(
+                .nativeDashboardProgressAnalyzingFiles,
+                TiboTattleLocalization.integerString(filesProcessed),
+                TiboTattleLocalization.integerString(filesSelected)
+            )
+        case .quotaRefresh:
+            return TiboTattleLocalization.string(
+                .nativeDashboardProgressQuotaRefresh
+            )
+        case .quickResult:
+            return TiboTattleLocalization.string(
+                .nativeDashboardProgressQuickResult
+            )
+        case .complete:
+            return TiboTattleLocalization.string(
+                .nativeDashboardProgressFinishing
+            )
+        case .paused:
+            return TiboTattleLocalization.string(
+                .nativeDashboardProgressSaving
+            )
+        case .prospective:
+            return TiboTattleLocalization.string(
+                .nativeDashboardProgressProspective
+            )
+        case .archiveIndex:
+            return TiboTattleLocalization.string(
+                .nativeDashboardProgressArchiveIndex
+            )
+        }
+    }
+}
+
 /// Whether an explicit local analysis pass is running, from whichever surface
 /// started it. The dashboard and the menu bar share one controller in the
 /// companion, so the menu bar can never start a second concurrent pass.
 enum LocalAnalysisActivity: Equatable {
     case idle(refreshID: String?)
-    case running(refreshID: String?)
+    case running(refreshID: String?, progress: LocalAnalysisProgress?)
 }
 
 /// Result of asking the companion to start the existing refresh pass.
@@ -834,7 +903,7 @@ final class LocalCompanionEvidenceReader {
         return data
     }
 
-    private static func decodeActivity(_ data: Data) -> LocalAnalysisActivity? {
+    static func decodeActivity(_ data: Data) -> LocalAnalysisActivity? {
         guard let root = try? JSONSerialization.jsonObject(with: data)
             as? [String: Any],
             let refresh = root["refresh"] as? [String: Any],
@@ -844,8 +913,53 @@ final class LocalCompanionEvidenceReader {
         }
         let refreshID = decodeRefreshID(refresh)
         return ["running", "cancelling"].contains(status)
-            ? .running(refreshID: refreshID)
+            ? .running(
+                refreshID: refreshID,
+                progress: decodeProgress(refresh["progress"])
+            )
             : .idle(refreshID: refreshID)
+    }
+
+    private static func decodeProgress(_ value: Any?) -> LocalAnalysisProgress? {
+        guard let progress = value as? [String: Any] else { return nil }
+        if progress["kind"] as? String == "archive_index" {
+            guard progress["status"] as? String == "scanning" else {
+                return nil
+            }
+            return LocalAnalysisProgress(
+                phase: .archiveIndex,
+                filesSelected: nil,
+                filesProcessed: nil
+            )
+        }
+        guard let rawPhase = progress["phase"] as? String,
+              let phase = LocalAnalysisProgress.Phase(rawValue: rawPhase),
+              phase != .archiveIndex
+        else {
+            return nil
+        }
+        return LocalAnalysisProgress(
+            phase: phase,
+            filesSelected: decodeProgressCount(progress["filesSelected"]),
+            filesProcessed: decodeProgressCount(progress["filesProcessed"])
+        )
+    }
+
+    private static let maximumProgressCount = 1_000_000_000
+
+    private static func decodeProgressCount(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber, !(value is Bool) else {
+            return nil
+        }
+        let doubleValue = number.doubleValue
+        guard doubleValue.isFinite,
+              doubleValue.rounded(.towardZero) == doubleValue,
+              doubleValue >= 0,
+              doubleValue <= Double(maximumProgressCount)
+        else {
+            return nil
+        }
+        return Int(doubleValue)
     }
 
     private static func decodeRefreshID(_ data: Data) -> String? {

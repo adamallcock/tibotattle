@@ -124,6 +124,15 @@
 "nativeDashboard.localOnly" = "Local only";
 "nativeDashboard.localOnlyTooltip" = "Analysis and cached results stay on this Mac. Community contribution is optional.";
 "nativeDashboard.overview" = "Overview";
+"nativeDashboard.progressAnalyzing" = "Analyzing local history…";
+"nativeDashboard.progressAnalyzingFiles" = "Analyzing %@ of %@ files…";
+"nativeDashboard.progressArchiveIndex" = "Updating older history…";
+"nativeDashboard.progressDiscovering" = "Finding local history…";
+"nativeDashboard.progressFinishing" = "Finishing analysis…";
+"nativeDashboard.progressProspective" = "Preparing ongoing tracking…";
+"nativeDashboard.progressQuickResult" = "Headline ready · finishing analysis…";
+"nativeDashboard.progressQuotaRefresh" = "Refreshing allowance…";
+"nativeDashboard.progressSaving" = "Saving analysis progress…";
 "nativeDashboard.refreshUsage" = "Refresh";
 "nativeDashboard.refreshUsageTooltip" = "Update local usage now. This reads only the selected Codex folders on this Mac.";
 "nativeDashboard.share" = "Share";
