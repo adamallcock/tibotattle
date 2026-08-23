@@ -2598,6 +2598,61 @@ describe("synthetic usage monitor service", () => {
     }]);
   });
 
+  it("serves the owner-only allowance merge preview without publishing it", async () => {
+    const notConfigured = await api(
+      "/api/v1/admin/community/allowance-preview",
+    );
+    expect(notConfigured.status).toBe(503);
+    await expect(notConfigured.json()).resolves.toMatchObject({
+      error: { code: "ADMIN_NOT_CONFIGURED" },
+    });
+
+    const participant = await enrollTelemetry();
+    const adminIdentityKey = "a".repeat(64);
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      "UPDATE participants SET identity_link_key = ? WHERE id = ?",
+    ).bind(adminIdentityKey, participant.participantId).run();
+    const adminBindings = testBindings({
+      ADMIN_IDENTITY_LINK_KEY: adminIdentityKey,
+    });
+
+    const rejectedMethod = await api(
+      "/api/v1/admin/community/allowance-preview",
+      { method: "POST", headers: personalHeaders(participant, { csrf: true }) },
+      adminBindings,
+    );
+    expect(rejectedMethod.status).toBe(405);
+
+    const response = await api(
+      "/api/v1/admin/community/allowance-preview",
+      { headers: personalHeaders(participant) },
+      adminBindings,
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    const body = await response.json<{
+      schemaVersion: string;
+      basis: string;
+      plans: { planType: string; multiplier: number }[];
+      days: {
+        combined: { fitCount: number; centralUsd: number | null };
+      }[];
+    }>();
+    expect(body.schemaVersion).toBe("admin-community-allowance-preview-v0.1");
+    expect(body.basis).toBe(
+      "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview",
+    );
+    expect(body.plans).toMatchObject([
+      { planType: "pro", multiplier: 1 },
+      { planType: "prolite", multiplier: 4 },
+      { planType: "plus", multiplier: 20 },
+    ]);
+    expect(body.days).toHaveLength(70);
+    expect(body.days.every((day) => (
+      day.combined.fitCount === 0 && day.combined.centralUsd === null
+    ))).toBe(true);
+  });
+
   it("independently contains collection while preserving participant rights", async () => {
     const participant = await enrollTelemetry();
     const device = await pairDevice(participant);

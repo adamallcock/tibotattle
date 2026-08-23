@@ -1,11 +1,10 @@
 import {
   adminActionErrorMessage,
   adminResponseError,
+  projectAdminAllowancePreview,
   projectAdminAction,
   projectAdminOverview,
 } from "./admin-client.js";
-import { PublicCommunityClient } from "./community-data.js";
-import { renderCommunityAllowanceSection } from "./community-view.js";
 import { formatNumber, formatReportingTime } from "./ui-format.js";
 
 const state = {
@@ -17,8 +16,9 @@ const state = {
   nextRefreshAt: null,
   lastSuccessfulLoadAt: null,
   retryDelayMilliseconds: 30_000,
-  communityPayload: null,
-  communityRangeDays: null,
+  allowancePreview: null,
+  allowanceMode: "combined",
+  allowanceRangeDays: 30,
   notificationPreferences: null,
 };
 const $ = (selector) => document.querySelector(selector);
@@ -30,15 +30,6 @@ const AUTO_REFRESH_OPTIONS = new Set([0, 1, 5, 15]);
 const NOTIFICATION_REPEAT_OPTIONS = new Set([0, 5, 15, 60]);
 const ADMIN_TITLE = "TiboTattle operations";
 const isAdminPage = document.body?.classList?.contains(ADMIN_PAGE_CLASS) === true;
-const communityClient = new PublicCommunityClient({
-  fetchImpl(path, init = {}) {
-    return fetch(path, {
-      ...init,
-      credentials: "same-origin",
-      cache: "no-store",
-    });
-  },
-});
 let infoHintSequence = 0;
 
 const INFO_HINTS = Object.freeze({
@@ -1646,49 +1637,445 @@ function scheduleRefresh({ retry = false } = {}) {
   refreshStatusText();
 }
 
-function renderCommunityRangeControls() {
-  const controls = $("#admin-community-range-controls");
-  if (!controls) return;
-  for (const button of controls.querySelectorAll("button[data-range-days]")) {
-    const value = button.dataset.rangeDays;
-    const selected = value === "all"
-      ? state.communityRangeDays === null
-      : Number(value) === state.communityRangeDays;
+const ADMIN_ALLOWANCE_DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
+const ADMIN_ALLOWANCE_CHART_WIDTH = 960;
+const ADMIN_ALLOWANCE_CHART_HEIGHT = 300;
+const ADMIN_ALLOWANCE_PLAN_STYLES = Object.freeze({
+  pro: Object.freeze({ label: "Pro 20x", className: "pro" }),
+  prolite: Object.freeze({ label: "Pro 5x → 20x", className: "prolite" }),
+  plus: Object.freeze({ label: "Plus → 20x", className: "plus" }),
+});
+
+function adminAllowanceTickStep(span, target = 4) {
+  if (!Number.isFinite(span) || span <= 0) return 1;
+  const raw = span / Math.max(1, target);
+  const magnitude = 10 ** Math.floor(Math.log10(raw));
+  const normalized = raw / magnitude;
+  const factor = normalized <= 1 ? 1
+    : normalized <= 2 ? 2
+      : normalized <= 2.5 ? 2.5
+        : normalized <= 5 ? 5
+          : 10;
+  return factor * magnitude;
+}
+
+function adminAllowanceSegments(points) {
+  const segments = [];
+  let segment = [];
+  for (const point of points) {
+    const prior = segment[segment.length - 1];
+    if (prior && Math.round(
+      (Date.parse(`${point.day}T00:00:00.000Z`)
+        - Date.parse(`${prior.day}T00:00:00.000Z`))
+        / ADMIN_ALLOWANCE_DAY_MILLISECONDS,
+    ) > 1) {
+      segments.push(segment);
+      segment = [];
+    }
+    segment.push(point);
+  }
+  if (segment.length > 0) segments.push(segment);
+  return segments;
+}
+
+/**
+ * Pure geometry for the admin-only merge preview. Every line shares the same
+ * UTC date and Pro-20x-equivalent dollar axes, so switching views changes the
+ * evidence shown rather than the meaning of the scale.
+ */
+export function adminAllowanceChartModel(preview, {
+  mode = "combined",
+  rangeDays = 30,
+  width = ADMIN_ALLOWANCE_CHART_WIDTH,
+  height = ADMIN_ALLOWANCE_CHART_HEIGHT,
+} = {}) {
+  if (!preview || !Array.isArray(preview.days) || preview.days.length === 0
+      || (mode !== "combined" && mode !== "plans")) {
+    return null;
+  }
+  const anchor = preview.days.at(-1).day;
+  const cutoffMs = rangeDays === null
+    ? Number.NEGATIVE_INFINITY
+    : Date.parse(`${anchor}T00:00:00.000Z`)
+      - (rangeDays - 1) * ADMIN_ALLOWANCE_DAY_MILLISECONDS;
+  const days = preview.days.filter((day) => (
+    Date.parse(`${day.day}T00:00:00.000Z`) >= cutoffMs
+  ));
+  if (days.length === 0) return null;
+  const series = mode === "combined"
+    ? [{ key: "combined", label: "Combined", className: "combined" }]
+    : preview.plans.map((plan) => ({
+      key: plan.planType,
+      ...ADMIN_ALLOWANCE_PLAN_STYLES[plan.planType],
+    }));
+  const summaryFor = (day, key) => (
+    key === "combined" ? day.combined : day.byPlanType[key]
+  );
+  let visibleValueCount = 0;
+  const valueCandidates = [];
+  for (const day of days) {
+    for (const definition of series) {
+      const summary = summaryFor(day, definition.key);
+      if (summary?.centralUsd !== null && summary?.centralUsd !== undefined) {
+        visibleValueCount += 1;
+      }
+    }
+    // Keep the numerical y-axis fixed while the operator switches between
+    // Combined and By plan. Otherwise the same vertical movement could appear
+    // larger merely because a different series changed the automatic scale.
+    if (day.combined.centralUsd !== null) {
+      valueCandidates.push(day.combined.centralUsd);
+      if (day.combined.band80Usd !== null) {
+        valueCandidates.push(day.combined.band80Usd.upperUsd);
+      }
+    }
+    for (const plan of preview.plans) {
+      const central = day.byPlanType[plan.planType]?.centralUsd;
+      if (central !== null && central !== undefined) valueCandidates.push(central);
+    }
+  }
+  if (visibleValueCount === 0 || valueCandidates.length === 0) return null;
+  const margin = { top: 16, right: 24, bottom: 34, left: 64 };
+  const plot = {
+    top: margin.top,
+    right: width - margin.right,
+    bottom: height - margin.bottom,
+    left: margin.left,
+  };
+  const startMs = Date.parse(`${days[0].day}T00:00:00.000Z`);
+  const endMs = Date.parse(`${days.at(-1).day}T00:00:00.000Z`);
+  const x = (day) => {
+    const atMs = Date.parse(`${day}T00:00:00.000Z`);
+    return startMs === endMs
+      ? plot.left + (plot.right - plot.left) / 2
+      : plot.left + ((atMs - startMs) / (endMs - startMs))
+        * (plot.right - plot.left);
+  };
+  const step = adminAllowanceTickStep(Math.max(...valueCandidates));
+  const axisTop = Math.ceil(Math.max(...valueCandidates) / step) * step;
+  const y = (value) => plot.bottom
+    - (value / axisTop) * (plot.bottom - plot.top);
+  const dollarTicks = [];
+  for (let value = 0; value <= axisTop + step / 100; value += step) {
+    dollarTicks.push({ value, y: y(value) });
+  }
+  const modeledSeries = series.map((definition) => {
+    const points = days.flatMap((day) => {
+      const summary = summaryFor(day, definition.key);
+      if (!summary || summary.centralUsd === null) return [];
+      return [{
+        day: day.day,
+        value: summary.centralUsd,
+        fitCount: summary.fitCount,
+        participantCount: summary.participantCount,
+        x: x(day.day),
+        y: y(summary.centralUsd),
+      }];
+    });
+    return {
+      ...definition,
+      points,
+      segments: adminAllowanceSegments(points),
+      latest: points.at(-1) ?? null,
+    };
+  });
+  const bandPoints = mode === "combined" ? days.flatMap((day) => {
+    const band = day.combined.band80Usd;
+    return band === null ? [] : [{
+      day: day.day,
+      x: x(day.day),
+      upperY: y(band.upperUsd),
+      lowerY: y(band.lowerUsd),
+    }];
+  }) : [];
+  const bandSegments = adminAllowanceSegments(bandPoints);
+  const maximumTicks = 6;
+  const dayTicks = Array.from({ length: maximumTicks }, (_, index) => {
+    const atMs = startMs + Math.round(
+      ((endMs - startMs) * index) / (maximumTicks - 1)
+      / ADMIN_ALLOWANCE_DAY_MILLISECONDS,
+    ) * ADMIN_ALLOWANCE_DAY_MILLISECONDS;
+    const day = new Date(atMs).toISOString().slice(0, 10);
+    return { day, x: x(day) };
+  }).filter((tick, index, ticks) => index === 0 || tick.day !== ticks[index - 1].day);
+  return {
+    width,
+    height,
+    plot,
+    dollarTicks,
+    dayTicks,
+    tickLabelStyle: days.length > 45 ? "month" : "day",
+    series: modeledSeries,
+    bandSegments,
+  };
+}
+
+function adminAllowanceSvg(tag, className = "", attributes = {}) {
+  const element = document.createElementNS(SVG_NAMESPACE, tag);
+  if (className) element.setAttribute("class", className);
+  for (const [name, value] of Object.entries(attributes)) {
+    element.setAttribute(name, String(value));
+  }
+  return element;
+}
+
+function latestAllowanceSummary(preview, key) {
+  for (const day of [...preview.days].reverse()) {
+    const summary = key === "combined" ? day.combined : day.byPlanType[key];
+    if (summary.centralUsd !== null) return { day: day.day, summary };
+  }
+  return null;
+}
+
+function allowanceUsd(value) {
+  return new Intl.NumberFormat(undefined, {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 0,
+  }).format(value);
+}
+
+function appendAdminAllowanceLegend(figure, model) {
+  const legend = document.createElement("p");
+  legend.className = "admin-allowance-legend";
+  for (const series of model.series) {
+    const item = document.createElement("span");
+    const swatch = document.createElement("span");
+    swatch.className = `admin-allowance-swatch admin-allowance-swatch-${series.className}`;
+    swatch.setAttribute("aria-hidden", "true");
+    const label = document.createElement("span");
+    label.textContent = series.label;
+    item.append(swatch, label);
+    legend.append(item);
+  }
+  if (model.bandSegments.length > 0) {
+    const item = document.createElement("span");
+    const swatch = document.createElement("span");
+    swatch.className = "admin-allowance-swatch admin-allowance-swatch-band";
+    swatch.setAttribute("aria-hidden", "true");
+    const label = document.createElement("span");
+    label.textContent = "Middle 80% of fitted windows";
+    item.append(swatch, label);
+    legend.append(item);
+  }
+  figure.append(legend);
+}
+
+function appendAdminAllowanceChart(container, preview) {
+  const model = adminAllowanceChartModel(preview, {
+    mode: state.allowanceMode,
+    rangeDays: state.allowanceRangeDays,
+  });
+  if (model === null) {
+    const empty = document.createElement("p");
+    empty.className = "admin-allowance-empty";
+    empty.textContent = "No qualifying fits in this range.";
+    container.append(empty);
+    return;
+  }
+  const figure = document.createElement("div");
+  figure.className = "community-daily-chart community-allowance-chart";
+  appendAdminAllowanceLegend(figure, model);
+  const svg = adminAllowanceSvg("svg", "", {
+    viewBox: `0 0 ${model.width} ${model.height}`,
+    role: "img",
+    "aria-label": state.allowanceMode === "combined"
+      ? "Combined Pro 20x-equivalent community allowance by day"
+      : "Pro 20x-equivalent community allowance by plan and day",
+  });
+  for (const tick of model.dollarTicks) {
+    svg.append(adminAllowanceSvg("line", "chart-grid", {
+      x1: model.plot.left,
+      x2: model.plot.right,
+      y1: tick.y,
+      y2: tick.y,
+    }));
+    const label = adminAllowanceSvg("text", "chart-axis-label", {
+      x: model.plot.left - 8,
+      y: tick.y + 3,
+      "text-anchor": "end",
+    });
+    label.textContent = allowanceUsd(tick.value);
+    svg.append(label);
+  }
+  const tickFormatter = new Intl.DateTimeFormat(undefined, model.tickLabelStyle === "month"
+    ? { timeZone: "UTC", month: "short", year: "numeric" }
+    : { timeZone: "UTC", month: "short", day: "numeric" });
+  for (const tick of model.dayTicks) {
+    const label = adminAllowanceSvg("text", "chart-axis-label", {
+      x: tick.x,
+      y: model.height - 10,
+      "text-anchor": "middle",
+    });
+    label.textContent = tickFormatter.format(new Date(`${tick.day}T00:00:00.000Z`));
+    svg.append(label);
+  }
+  for (const band of model.bandSegments) {
+    if (band.length >= 2) {
+      const forward = band.map((point) => (
+        `${point.x.toFixed(1)},${point.upperY.toFixed(1)}`
+      ));
+      const backward = [...band].reverse().map((point) => (
+        `${point.x.toFixed(1)},${point.lowerY.toFixed(1)}`
+      ));
+      svg.append(adminAllowanceSvg("path", "admin-allowance-band-area", {
+        d: `M${[...forward, ...backward].join(" L")} Z`,
+      }));
+    } else {
+      svg.append(adminAllowanceSvg("line", "admin-allowance-band-mark", {
+        x1: band[0].x,
+        x2: band[0].x,
+        y1: band[0].upperY,
+        y2: band[0].lowerY,
+      }));
+    }
+  }
+  for (const series of model.series) {
+    for (const segment of series.segments) {
+      if (segment.length >= 2) {
+        svg.append(adminAllowanceSvg(
+          "polyline",
+          `admin-allowance-line admin-allowance-line-${series.className}`,
+          { points: segment.map((point) => (
+            `${point.x.toFixed(1)},${point.y.toFixed(1)}`
+          )).join(" ") },
+        ));
+      }
+    }
+    for (const point of series.points) {
+      const dot = adminAllowanceSvg(
+        "circle",
+        `admin-allowance-dot admin-allowance-dot-${series.className}`,
+        {
+          cx: point.x,
+          cy: point.y,
+          r: Math.min(6, 2.4 + Math.sqrt(point.fitCount)),
+          tabindex: 0,
+          "aria-label": `${series.label}, ${point.day}: ${allowanceUsd(point.value)}, ${point.participantCount} accounts, ${point.fitCount} fits`,
+        },
+      );
+      const title = adminAllowanceSvg("title");
+      title.textContent = `${series.label} · ${point.day} · ${allowanceUsd(point.value)} · ${point.participantCount} accounts · ${point.fitCount} fits`;
+      dot.append(title);
+      svg.append(dot);
+    }
+  }
+  figure.append(svg);
+  container.append(figure);
+}
+
+function appendCombinedAllowanceSummary(container, preview) {
+  const latest = latestAllowanceSummary(preview, "combined");
+  if (latest === null) return;
+  const summary = document.createElement("div");
+  summary.className = "admin-allowance-summary";
+  const value = document.createElement("p");
+  value.className = "admin-allowance-value";
+  value.textContent = allowanceUsd(latest.summary.centralUsd);
+  const unit = document.createElement("span");
+  unit.className = "admin-allowance-unit";
+  unit.textContent = "per 7 days, Pro 20x equivalent";
+  const meta = document.createElement("p");
+  meta.className = "admin-allowance-meta";
+  const evidence = document.createElement("span");
+  const accounts = document.createElement("strong");
+  accounts.textContent = String(latest.summary.participantCount);
+  const fits = document.createElement("strong");
+  fits.textContent = String(latest.summary.fitCount);
+  evidence.append(
+    accounts,
+    document.createTextNode(" accounts · "),
+    fits,
+    document.createTextNode(" fits"),
+  );
+  const date = document.createElement("span");
+  date.textContent = latest.day;
+  meta.append(evidence, date);
+  if (latest.summary.band80Usd !== null) {
+    const range = document.createElement("span");
+    range.textContent = `${allowanceUsd(latest.summary.band80Usd.lowerUsd)}–${allowanceUsd(latest.summary.band80Usd.upperUsd)} range`;
+    meta.append(range);
+  }
+  summary.append(value, unit, meta);
+  container.append(summary);
+}
+
+function appendPlanAllowanceSummaries(container, preview) {
+  const list = document.createElement("div");
+  list.className = "admin-allowance-plan-summaries";
+  for (const plan of preview.plans) {
+    const latest = latestAllowanceSummary(preview, plan.planType);
+    const style = ADMIN_ALLOWANCE_PLAN_STYLES[plan.planType];
+    const item = document.createElement("div");
+    item.className = "admin-allowance-plan-summary";
+    const label = document.createElement("span");
+    label.textContent = style.label;
+    const value = document.createElement("strong");
+    value.textContent = latest === null ? "—" : allowanceUsd(latest.summary.centralUsd);
+    const meta = document.createElement("small");
+    meta.textContent = latest === null
+      ? "No qualifying fits"
+      : `${latest.summary.participantCount} accounts · ${latest.summary.fitCount} fits`;
+    item.append(label, value, meta);
+    list.append(item);
+  }
+  container.append(list);
+}
+
+function renderAdminAllowanceControls() {
+  const modeControls = $("#admin-community-mode-controls");
+  for (const button of modeControls?.querySelectorAll("button[data-allowance-mode]") ?? []) {
+    const selected = button.dataset.allowanceMode === state.allowanceMode;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  }
+  const rangeControls = $("#admin-community-range-controls");
+  for (const button of rangeControls?.querySelectorAll("button[data-range-days]") ?? []) {
+    const selected = button.dataset.rangeDays === "all"
+      ? state.allowanceRangeDays === null
+      : Number(button.dataset.rangeDays) === state.allowanceRangeDays;
     button.classList.toggle("active", selected);
     button.setAttribute("aria-pressed", String(selected));
   }
 }
 
-function renderAdminCommunityAllowance(payload) {
+function renderAdminCommunityAllowance(preview) {
   if (!isAdminPage) return;
   const container = $("#admin-community-allowance-result");
-  const stateNode = $("#admin-community-allowance-state");
-  if (!container || !stateNode) return;
-  const result = renderCommunityAllowanceSection({
-    documentRef: document,
-    container,
-    stateNode,
-    payload,
-    rangeDays: state.communityRangeDays,
-  });
   const badge = $("#admin-community-status");
-  const available = result === "published";
-  badge.className = `admin-source-badge ${
-    available ? "admin-source-available" : "admin-source-partial"
-  }`;
-  badge.textContent = available ? "Public graph available" : "Public graph unavailable";
-  renderCommunityRangeControls();
+  if (!container || !badge) return;
+  container.replaceChildren();
+  if (preview === null) {
+    badge.className = "admin-source-badge admin-source-partial";
+    badge.textContent = "Preview unavailable";
+    const empty = document.createElement("p");
+    empty.className = "admin-allowance-empty";
+    empty.textContent = "The allowance preview could not be loaded.";
+    container.append(empty);
+    renderAdminAllowanceControls();
+    return;
+  }
+  badge.className = "admin-source-badge admin-source-available";
+  badge.textContent = "Admin preview available";
+  if (state.allowanceMode === "combined") {
+    appendCombinedAllowanceSummary(container, preview);
+  } else {
+    appendPlanAllowanceSummaries(container, preview);
+  }
+  appendAdminAllowanceChart(container, preview);
+  renderAdminAllowanceControls();
 }
 
 async function loadAdminCommunityAllowance() {
   if (!isAdminPage) return;
   try {
-    state.communityPayload = await communityClient.communityDaily();
-    renderAdminCommunityAllowance(state.communityPayload);
+    state.allowancePreview = projectAdminAllowancePreview(await request(
+      "/api/v1/admin/community/allowance-preview",
+    ));
   } catch {
-    state.communityPayload = null;
-    renderAdminCommunityAllowance(null);
+    state.allowancePreview = null;
   }
+  renderAdminCommunityAllowance(state.allowancePreview);
 }
 
 function render(overview) {
@@ -1857,13 +2244,19 @@ if (isAdminPage) {
       setNotificationStatus("The browser could not show a test alert.");
     }
   });
+  $("#admin-community-mode-controls").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-allowance-mode]");
+    if (!button) return;
+    state.allowanceMode = button.dataset.allowanceMode;
+    renderAdminCommunityAllowance(state.allowancePreview);
+  });
   $("#admin-community-range-controls").addEventListener("click", (event) => {
     const button = event.target.closest("button[data-range-days]");
     if (!button) return;
-    state.communityRangeDays = button.dataset.rangeDays === "all"
+    state.allowanceRangeDays = button.dataset.rangeDays === "all"
       ? null
       : Number(button.dataset.rangeDays);
-    renderAdminCommunityAllowance(state.communityPayload);
+    renderAdminCommunityAllowance(state.allowancePreview);
   });
   $("#sync-distribution").addEventListener("click", async () => {
     const button = $("#sync-distribution");

@@ -25,6 +25,10 @@ const EXACT_ROUTES = [
   ["/api/v1/logout", "logout"],
   ["/api/v1/admin/overview", "admin_overview"],
   ["/api/v1/admin/metrics/history", "admin_metrics_history"],
+  [
+    "/api/v1/admin/community/allowance-preview",
+    "admin_community_allowance_preview",
+  ],
   ["/api/v1/admin/action", "admin_action"],
   ["/api/v1/me/security-reset", "security_reset"],
   ["/api/v1/me/upload-authorizations", "upload_authorization"],
@@ -52,7 +56,7 @@ const EXACT_ROUTES = [
 
 describe("Worker route registry", () => {
   it("recognizes every exact route and preserves stable log classifications", () => {
-    expect(EXACT_ROUTES).toHaveLength(39);
+    expect(EXACT_ROUTES).toHaveLength(40);
     expect(WORKER_ROUTE_POLICY).toEqual(
       EXACT_ROUTES.map(([pathname, id]) => ({ pathname, id })),
     );

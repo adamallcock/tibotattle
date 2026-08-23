@@ -279,6 +279,7 @@ import {
   captureAdminMetricSnapshot,
   readAdminMetricsHistory,
 } from "./admin-metrics-history";
+import { readAdminCommunityAllowancePreview } from "./admin-community-allowance";
 import { canonicalJson } from "./canonical-json";
 import {
   insertTelemetryContributionV02,
@@ -2951,6 +2952,31 @@ async function handleAdminMetricsHistory(
   });
 }
 
+async function handleAdminCommunityAllowancePreview(
+  request: Request,
+  env: Env,
+  access?: { readonly identityKey: string },
+): Promise<Response> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  if (access === undefined) {
+    if (!adminIdentityKeyConfigured(Reflect.get(env, "ADMIN_IDENTITY_LINK_KEY"))) {
+      throw new ApiError(503, "ADMIN_NOT_CONFIGURED");
+    }
+    await adminSession(request, env);
+  }
+  const preview = await readAdminCommunityAllowancePreview(
+    env.USAGE_MONITOR_DB,
+    Date.now(),
+  );
+  if (preview === null) {
+    throw new ApiError(503, "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE");
+  }
+  return jsonResponse(preview, 200, {
+    "cache-control": "no-store",
+    vary: "Cookie",
+  });
+}
+
 async function handleAdminOverview(
   request: Request,
   env: Env,
@@ -3496,6 +3522,8 @@ async function routeApi(
       return handleAdminOverview(request, env);
     case "admin_metrics_history":
       return handleAdminMetricsHistory(request, env);
+    case "admin_community_allowance_preview":
+      return handleAdminCommunityAllowancePreview(request, env);
     case "admin_action":
       return handleAdminAction(request, env);
     case "security_reset":
@@ -3583,6 +3611,16 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
             await handleAdminMetricsHistory(request, env, { identityKey }),
           );
         }
+        if (route.kind === "exact"
+          && route.id === "admin_community_allowance_preview") {
+          return noStore(
+            await handleAdminCommunityAllowancePreview(
+              request,
+              env,
+              { identityKey },
+            ),
+          );
+        }
         if (route.kind === "exact" && route.id === "admin_action") {
           return noStore(await handleAdminAction(request, env, { identityKey }));
         }
@@ -3590,6 +3628,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         || (route.kind === "exact"
           && (route.id === "admin_overview"
             || route.id === "admin_metrics_history"
+            || route.id === "admin_community_allowance_preview"
             || route.id === "admin_action"))) {
         throw new ApiError(404, "NOT_FOUND");
       }
@@ -3723,6 +3762,22 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       console.log(JSON.stringify({
         level: "info",
         event: "request_pending",
+        requestId,
+        method: request.method,
+        routeClass: route.routeClass,
+        code: apiError.code,
+        status: apiError.status,
+      }));
+      return noStore(errorResponse(apiError, requestId));
+    }
+    if (apiError.code === "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE") {
+      // Expected fail-closed state for the read-only admin preview. The
+      // scheduled aggregate pass warms the fit cache; an interactive request
+      // never writes that cache, falls through to raw analysis, or persists a
+      // diagnostic row while waiting for it.
+      console.warn(JSON.stringify({
+        level: "warn",
+        event: "request_unavailable",
         requestId,
         method: request.method,
         routeClass: route.routeClass,

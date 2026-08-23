@@ -1227,7 +1227,11 @@ test("production public-surface recheck requires a public root and real 404s for
   assert.equal(calls[2].url, PUBLIC_SITEMAP_URL);
   assert.equal(calls[3].url, PUBLIC_WWW_ROOT_URL);
   assert.equal(calls[3].request.redirect, "manual");
-  assert.equal(calls.length, 12);
+  assert.equal(calls.length, 13);
+  assert.equal(calls.some(({ url }) => url === new URL(
+    "/api/v1/admin/community/allowance-preview",
+    PUBLIC_ROOT_URL,
+  ).href), true);
 });
 
 test("production public-surface recheck rejects dashboard markers at the root", async () => {

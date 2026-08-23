@@ -576,18 +576,19 @@ test("admin tables preserve row order, text rendering, and empty states", async 
   }
 });
 
-test("the owner dashboard imports the public community graph rather than copying it", async () => {
-  const source = await readFile(
-    new URL("../public/admin.js", import.meta.url),
-    "utf8",
-  );
+test("the owner dashboard keeps the merge trial private and separate from the public graph", async () => {
+  const [source, html] = await Promise.all([
+    readFile(new URL("../public/admin.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/admin.html", import.meta.url), "utf8"),
+  ]);
   assert.match(
     source,
-    /import \{ PublicCommunityClient \} from "\.\/community-data\.js";/u,
+    /request\(\n      "\/api\/v1\/admin\/community\/allowance-preview",/u,
   );
-  assert.match(
-    source,
-    /import \{ renderCommunityAllowanceSection \} from "\.\/community-view\.js";/u,
-  );
-  assert.doesNotMatch(source, /from "\.\/community\.js"/u);
+  assert.match(source, /projectAdminAllowancePreview/u);
+  assert.doesNotMatch(source, /PublicCommunityClient/u);
+  assert.doesNotMatch(source, /renderCommunityAllowanceSection/u);
+  assert.match(html, /data-allowance-mode="combined"[^>]*>Combined</u);
+  assert.match(html, /data-allowance-mode="plans"[^>]*>By plan</u);
+  assert.doesNotMatch(html, /same published community graph/u);
 });

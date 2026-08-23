@@ -1,5 +1,16 @@
 const ADMIN_OVERVIEW_SCHEMA_VERSION = "admin-overview-v0.3";
 const ADMIN_ACTION_SCHEMA_VERSION = "admin-action-v0.1";
+const ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION =
+  "admin-community-allowance-preview-v0.1";
+const ADMIN_ALLOWANCE_PREVIEW_BASIS =
+  "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview";
+const ADMIN_ALLOWANCE_PREVIEW_DAYS = 70;
+const ADMIN_ALLOWANCE_PREVIEW_PLANS = Object.freeze([
+  Object.freeze({ planType: "pro", label: "Pro 20x", multiplier: 1 }),
+  Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 4 }),
+  Object.freeze({ planType: "plus", label: "Plus", multiplier: 20 }),
+]);
+const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
 const ADMIN_ACTIONS = new Set([
   "set_collection_controls",
   "run_maintenance",
@@ -67,6 +78,13 @@ function positiveInteger(value, code) {
   return value;
 }
 
+function positiveNumber(value, code) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    invalid(code);
+  }
+  return value;
+}
+
 function array(value, code) {
   if (!Array.isArray(value)) invalid(code);
   return value;
@@ -75,6 +93,130 @@ function array(value, code) {
 function enumValue(value, values, code) {
   if (typeof value !== "string" || !values.has(value)) invalid(code);
   return value;
+}
+
+function calendarDay(value, code) {
+  if (typeof value !== "string" || !DAY_PATTERN.test(value)) invalid(code);
+  const epoch = Date.parse(`${value}T00:00:00.000Z`);
+  if (!Number.isFinite(epoch)
+      || new Date(epoch).toISOString().slice(0, 10) !== value) {
+    invalid(code);
+  }
+  return value;
+}
+
+function projectAllowancePreviewSummary(value) {
+  const code = "ADMIN_ALLOWANCE_PREVIEW_INVALID";
+  const summary = record(value, code);
+  const fitCount = count(summary.fitCount, code);
+  const participantCount = count(summary.participantCount, code);
+  if ((fitCount === 0) !== (participantCount === 0)
+      || participantCount > fitCount) {
+    invalid(code);
+  }
+  if (fitCount === 0) {
+    if (summary.centralUsd !== null || summary.band80Usd !== null) invalid(code);
+    return Object.freeze({
+      fitCount,
+      participantCount,
+      centralUsd: null,
+      band80Usd: null,
+    });
+  }
+  const centralUsd = positiveNumber(summary.centralUsd, code);
+  let band80Usd = null;
+  if (summary.band80Usd !== null) {
+    const band = record(summary.band80Usd, code);
+    const lowerUsd = positiveNumber(band.lowerUsd, code);
+    const upperUsd = positiveNumber(band.upperUsd, code);
+    if (upperUsd < lowerUsd
+        || centralUsd < lowerUsd
+        || centralUsd > upperUsd) {
+      invalid(code);
+    }
+    band80Usd = Object.freeze({ lowerUsd, upperUsd });
+  }
+  if ((fitCount >= 3) !== (band80Usd !== null)) invalid(code);
+  return Object.freeze({
+    fitCount,
+    participantCount,
+    centralUsd,
+    band80Usd,
+  });
+}
+
+/**
+ * Fail-closed projection for the owner-only merge trial. The public client does
+ * not understand this schema and remains pinned to the published Pro cohort.
+ */
+export function projectAdminAllowancePreview(value) {
+  const code = "ADMIN_ALLOWANCE_PREVIEW_INVALID";
+  const preview = record(value, code);
+  if (preview.schemaVersion !== ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION
+      || preview.basis !== ADMIN_ALLOWANCE_PREVIEW_BASIS
+      || preview.referencePlanType !== "pro"
+      || preview.trailingDays !== 30
+      || preview.qualification !== "shared_reset_fit_gates_40pp_span_floor"
+      || preview.spanFloorPp !== 40) {
+    invalid(code);
+  }
+  const from = calendarDay(preview.from, code);
+  const to = calendarDay(preview.to, code);
+  const plans = array(preview.plans, code).map((value, index) => {
+    const plan = record(value, code);
+    const expected = ADMIN_ALLOWANCE_PREVIEW_PLANS[index];
+    if (!expected
+        || plan.planType !== expected.planType
+        || plan.label !== expected.label
+        || plan.multiplier !== expected.multiplier) {
+      invalid(code);
+    }
+    return expected;
+  });
+  if (plans.length !== ADMIN_ALLOWANCE_PREVIEW_PLANS.length) invalid(code);
+  const expectedPlanKeys = ADMIN_ALLOWANCE_PREVIEW_PLANS
+    .map((plan) => plan.planType)
+    .sort();
+  const days = array(preview.days, code).map((value, index) => {
+    const day = record(value, code);
+    const dayValue = calendarDay(day.day, code);
+    const expectedDay = new Date(
+      Date.parse(`${from}T00:00:00.000Z`) + index * 24 * 60 * 60 * 1000,
+    ).toISOString().slice(0, 10);
+    if (dayValue !== expectedDay) invalid(code);
+    const byPlanType = record(day.byPlanType, code);
+    if (Object.keys(byPlanType).sort().join("|") !== expectedPlanKeys.join("|")) {
+      invalid(code);
+    }
+    return Object.freeze({
+      day: dayValue,
+      combined: projectAllowancePreviewSummary(day.combined),
+      byPlanType: Object.freeze(Object.fromEntries(
+        ADMIN_ALLOWANCE_PREVIEW_PLANS.map((plan) => [
+          plan.planType,
+          projectAllowancePreviewSummary(byPlanType[plan.planType]),
+        ]),
+      )),
+    });
+  });
+  if (days.length !== ADMIN_ALLOWANCE_PREVIEW_DAYS
+      || days[0]?.day !== from
+      || days.at(-1)?.day !== to) {
+    invalid(code);
+  }
+  return Object.freeze({
+    schemaVersion: ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION,
+    generatedAt: string(preview.generatedAt, code),
+    from,
+    to,
+    basis: ADMIN_ALLOWANCE_PREVIEW_BASIS,
+    referencePlanType: "pro",
+    trailingDays: 30,
+    qualification: preview.qualification,
+    spanFloorPp: 40,
+    plans: Object.freeze(plans),
+    days: Object.freeze(days),
+  });
 }
 
 function projectCollection(value, code = "ADMIN_OVERVIEW_INVALID") {

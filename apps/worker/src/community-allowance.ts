@@ -60,6 +60,27 @@ const NANOUSD_PER_USD = 1_000_000_000;
 // OpenAI context-sensitive pricer no longer refuses every reset.
 const FIT_ADAPTER_VERSION = "v1-fit-5";
 
+// One canonical source-selection CTE feeds both the scheduled collector and
+// the admin cache reader. A participant with both corpora is selected through
+// v0.2 exactly as before; keeping the selection text shared prevents the
+// read-only admin view from silently choosing a different corpus.
+const COMMUNITY_ALLOWANCE_PARTICIPANT_SOURCES_CTE = `participant_sources AS (
+  SELECT participant_id, MIN(source) AS source
+    FROM (
+      SELECT c.participant_id AS participant_id, 'v0.2' AS source
+        FROM telemetry_contributions c
+        JOIN participants p ON p.id = c.participant_id AND p.state = 'active'
+       WHERE c.status = 'accepted'
+         AND c.transport_schema_version = 'telemetry-contribution-v0.2'
+      UNION ALL
+      SELECT c2.participant_id, 'v1' AS source
+        FROM telemetry_v1_chunks c2
+        JOIN participants p2 ON p2.id = c2.participant_id AND p2.state = 'active'
+       WHERE c2.superseded_at IS NULL
+    )
+   GROUP BY participant_id
+)`;
+
 export interface CommunityAllowanceFit {
   participantId: string;
   // The Codex plan_type this fit was observed on (pro, prolite, plus, ...).
@@ -153,20 +174,9 @@ export async function collectCommunityAllowanceFits(
   nowMs: number = Date.now(),
 ): Promise<CommunityAllowanceFit[]> {
   const participants = await db.prepare(
-    `SELECT participant_id, MIN(source) AS source
-       FROM (
-         SELECT c.participant_id AS participant_id, 'v0.2' AS source
-           FROM telemetry_contributions c
-           JOIN participants p ON p.id = c.participant_id AND p.state = 'active'
-          WHERE c.status = 'accepted'
-            AND c.transport_schema_version = 'telemetry-contribution-v0.2'
-         UNION ALL
-         SELECT c2.participant_id, 'v1' AS source
-           FROM telemetry_v1_chunks c2
-           JOIN participants p2 ON p2.id = c2.participant_id AND p2.state = 'active'
-          WHERE c2.superseded_at IS NULL
-       )
-      GROUP BY participant_id
+    `WITH ${COMMUNITY_ALLOWANCE_PARTICIPANT_SOURCES_CTE}
+     SELECT participant_id, source
+       FROM participant_sources
       ORDER BY participant_id`,
   ).all<{ participant_id: string; source: "v0.2" | "v1" }>();
   const fits: CommunityAllowanceFit[] = [];
@@ -282,6 +292,121 @@ export async function collectCommunityAllowanceFits(
     for (const fit of participantFits) fits.push(fit);
   }
   // Deterministic order so identical sources canonicalize identically.
+  fits.sort((left, right) => (
+    left.lastObservedAt.localeCompare(right.lastObservedAt)
+    || left.capacityNanousd - right.capacityNanousd
+    || left.participantId.localeCompare(right.participantId)
+  ));
+  return fits;
+}
+
+interface CachedCommunityAllowanceFitRow {
+  participant_id: string;
+  source: "v0.2" | "v1";
+  expected_cache_key: string | null;
+  cache_key: string | null;
+  fits_json: string | null;
+}
+
+/**
+ * Read the fit corpus for an interactive admin request without ever invoking
+ * either raw-corpus analyzer or issuing a database mutation.
+ *
+ * The single SELECT verifies each active participant's cheap chunk epoch
+ * against the same registry + adapter cache key used by the scheduled
+ * collector. Missing/stale v1 rows and v0.2-selected participants fail closed:
+ * those sources require analysis and an admin page refresh must never perform
+ * that expensive work. The scheduled aggregate builder remains the sole cache
+ * warmer and keeps its existing best-effort INSERT behaviour.
+ */
+export async function readCachedCommunityAllowanceFits(
+  db: D1Database,
+): Promise<CommunityAllowanceFit[] | null> {
+  let rows: CachedCommunityAllowanceFitRow[];
+  try {
+    const result = await db.prepare(
+      `WITH ${COMMUNITY_ALLOWANCE_PARTICIPANT_SOURCES_CTE},
+       v1_epochs AS (
+         SELECT sources.participant_id,
+                CAST(COUNT(chunks.participant_id) AS TEXT)
+                  || ':' || COALESCE(MAX(chunks.created_at), '')
+                  || ':' || CAST(COALESCE(SUM(chunks.revision), 0) AS TEXT)
+                  || ':' || ? || ':' || ? AS expected_cache_key
+           FROM participant_sources sources
+           LEFT JOIN telemetry_v1_chunks chunks
+             ON chunks.participant_id = sources.participant_id
+            AND chunks.superseded_at IS NULL
+          WHERE sources.source = 'v1'
+          GROUP BY sources.participant_id
+       )
+       SELECT sources.participant_id,
+              sources.source,
+              epochs.expected_cache_key,
+              cache.cache_key,
+              cache.fits_json
+         FROM participant_sources sources
+         LEFT JOIN v1_epochs epochs
+           ON epochs.participant_id = sources.participant_id
+         LEFT JOIN community_allowance_fit_cache cache
+           ON cache.participant_id = sources.participant_id
+        ORDER BY sources.participant_id`,
+    ).bind(
+      APP_PRICE_REGISTRY_MANIFEST.sha256,
+      FIT_ADAPTER_VERSION,
+    ).all<CachedCommunityAllowanceFitRow>();
+    if (!Array.isArray(result.results)) return null;
+    rows = result.results;
+  } catch {
+    // A missing cache table or failed SELECT is an unavailable preview, never
+    // permission to fall through to raw analysis from an interactive request.
+    return null;
+  }
+
+  const participants = new Set<string>();
+  const fits: CommunityAllowanceFit[] = [];
+  for (const row of rows) {
+    if (typeof row.participant_id !== "string"
+        || row.participant_id.length === 0
+        || participants.has(row.participant_id)
+        || row.source !== "v1"
+        || typeof row.expected_cache_key !== "string"
+        || row.expected_cache_key.length === 0
+        || row.cache_key !== row.expected_cache_key
+        || typeof row.fits_json !== "string") {
+      return null;
+    }
+    participants.add(row.participant_id);
+    let cached: unknown;
+    try {
+      cached = JSON.parse(row.fits_json);
+    } catch {
+      return null;
+    }
+    if (!Array.isArray(cached)) return null;
+    for (const candidate of cached) {
+      if (typeof candidate !== "object" || candidate === null
+          || Array.isArray(candidate)) {
+        return null;
+      }
+      const value = candidate as Record<string, unknown>;
+      if (value.participantId !== row.participant_id
+          || typeof value.planType !== "string"
+          || value.planType.length === 0
+          || typeof value.capacityNanousd !== "number"
+          || !Number.isFinite(value.capacityNanousd)
+          || value.capacityNanousd <= 0
+          || typeof value.lastObservedAt !== "string"
+          || !Number.isFinite(Date.parse(value.lastObservedAt))) {
+        return null;
+      }
+      fits.push({
+        participantId: row.participant_id,
+        planType: value.planType,
+        capacityNanousd: value.capacityNanousd,
+        lastObservedAt: value.lastObservedAt,
+      });
+    }
+  }
   fits.sort((left, right) => (
     left.lastObservedAt.localeCompare(right.lastObservedAt)
     || left.capacityNanousd - right.capacityNanousd

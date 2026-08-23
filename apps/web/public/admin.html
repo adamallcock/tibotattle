@@ -197,28 +197,27 @@
       <section class="admin-section admin-community-view community-site" aria-labelledby="admin-community-title">
         <div class="section-heading">
           <div>
-            <p class="eyebrow">Public community evidence</p>
-            <h2 id="admin-community-title">Community allowance signal</h2>
+            <p class="eyebrow">Admin-only trial</p>
+            <h2 id="admin-community-title">Allowance merge preview</h2>
           </div>
-          <span class="admin-source-badge" id="admin-community-status">Loading public graph…</span>
+          <span class="admin-source-badge" id="admin-community-status">Loading preview…</span>
         </div>
-        <p class="admin-copy admin-distribution-copy">
-          This is the same published community graph and renderer used by the public dashboard. It reads the delayed, privacy-gated public aggregate only; no private contribution data is added here.
-        </p>
         <div class="community-window">
           <div class="community-window-content">
             <div class="community-allowance">
               <div class="activity-heading">
                 <div>
-                  <h3>Fitted seven-day allowance</h3>
-                  <p>Released estimates, plausible ranges, and per-day evidence from the public aggregate.</p>
+                  <h3>Pro 20x-equivalent allowance</h3>
+                  <p>Compare the proposed combined estimate with each eligible plan.</p>
                 </div>
-                <div class="allowance-controls">
-                  <span class="evidence-chip neutral" id="admin-community-allowance-state">Loading…</span>
+                <div class="admin-allowance-controls">
+                  <div class="segmented-control" id="admin-community-mode-controls" role="group" aria-label="Allowance preview view">
+                    <button type="button" data-allowance-mode="combined" aria-pressed="true" class="active">Combined</button>
+                    <button type="button" data-allowance-mode="plans" aria-pressed="false">By plan</button>
+                  </div>
                   <div class="segmented-control" id="admin-community-range-controls" role="group" aria-label="Community graph range">
-                    <button type="button" data-range-days="30">30d</button>
-                    <button type="button" data-range-days="90">90d</button>
-                    <button type="button" data-range-days="all" aria-pressed="true" class="active">All</button>
+                    <button type="button" data-range-days="30" aria-pressed="true" class="active">30d</button>
+                    <button type="button" data-range-days="all" aria-pressed="false">All</button>
                   </div>
                 </div>
               </div>

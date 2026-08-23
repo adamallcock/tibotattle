@@ -52,6 +52,7 @@ const PRODUCTION_PUBLIC_SURFACE_FORBIDDEN_PATHS = Object.freeze([
   "/admin.js",
   "/admin-client.js",
   "/admin.css",
+  "/api/v1/admin/community/allowance-preview",
 ]);
 const PRODUCTION_PUBLIC_ROOT_FORBIDDEN_MARKERS = Object.freeze([
   'src="./app.js"',
