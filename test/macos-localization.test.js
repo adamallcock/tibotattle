@@ -110,6 +110,14 @@ test("native catalogs have complete language parity and preserve placeholders", 
     english.get("settings.languageSummary"),
     "Uses your Mac language by default.",
   );
+  assert.equal(
+    english.get("settings.updateCheckUnavailableTitle"),
+    "Couldn't check for updates",
+  );
+  assert.equal(
+    english.get("settings.updateCheckUnavailableMessage"),
+    "TiboTattle couldn't complete the update check. Check your internet connection and try again.",
+  );
   assert.match(swiftSource, /LanguagePreference: String, CaseIterable/u);
   assert.match(swiftSource, /UserDefaults\.standard\.set/u);
   assert.match(swiftSource, /Locale\.preferredLanguages/u);

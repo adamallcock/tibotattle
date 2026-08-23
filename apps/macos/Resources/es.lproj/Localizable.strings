@@ -206,6 +206,8 @@
 "menuBar.failureRecovery" = "No está en ejecución: %@. Abre la ventana para ver el paso de recuperación.";
 "settings.codexFolderCustomSelectedPath" = "Carpeta personalizada: %@";
 "settings.codexFolderDefaultLocation" = "Ubicación predeterminada (~/.codex)";
+"settings.updateCheckUnavailableMessage" = "TiboTattle no pudo completar la búsqueda de actualizaciones. Comprueba tu conexión a Internet e inténtalo de nuevo.";
+"settings.updateCheckUnavailableTitle" = "No se pudo buscar actualizaciones";
 "settings.updateDisclosureAutomaticOff" = "Las actualizaciones de la app firmada están disponibles en Acerca de → Buscar actualizaciones. Las descargas automáticas están desactivadas; puedes activarlas en Configuración → Acerca de cuando estén disponibles.";
 "settings.updateDisclosureAutomaticOn" = "Las actualizaciones de la app firmada se comprueban automáticamente. De forma predeterminada, una actualización verificada se descarga en segundo plano y se instala al salir; puedes desactivarlo en Configuración → Acerca de.";
 "settings.updateDisclosureDevelopment" = "Esta compilación de desarrollo no incluye comprobaciones de actualización. Las versiones firmadas instaladas en Aplicaciones pueden buscar actualizaciones desde Acerca de.";

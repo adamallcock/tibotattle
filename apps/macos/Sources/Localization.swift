@@ -330,6 +330,8 @@ enum TiboTattleLocalization {
         case settingsRefreshIntervalFifteenMinutes = "settings.refreshIntervalFifteenMinutes"
         case settingsRefreshIntervalThirtyMinutes = "settings.refreshIntervalThirtyMinutes"
         case settingsUseDefault = "settings.useDefault"
+        case settingsUpdateCheckUnavailableMessage = "settings.updateCheckUnavailableMessage"
+        case settingsUpdateCheckUnavailableTitle = "settings.updateCheckUnavailableTitle"
         case settingsUpdateDisclosureAutomaticOff = "settings.updateDisclosureAutomaticOff"
         case settingsUpdateDisclosureAutomaticOn = "settings.updateDisclosureAutomaticOn"
         case settingsUpdateDisclosureDevelopment = "settings.updateDisclosureDevelopment"
@@ -865,6 +867,10 @@ enum TiboTattleLocalization {
                 "Every 30 minutes"
             case .settingsUseDefault:
                 "Use Default"
+            case .settingsUpdateCheckUnavailableMessage:
+                "TiboTattle couldn't complete the update check. Check your internet connection and try again."
+            case .settingsUpdateCheckUnavailableTitle:
+                "Couldn't check for updates"
             case .settingsUpdateDisclosureAutomaticOff:
                 "Signed app updates are available from About → Check for Updates. Automatic downloads are currently off; you can turn them on in Settings → General when available."
             case .settingsUpdateDisclosureAutomaticOn:
