@@ -287,6 +287,7 @@ class FakeApp extends EventEmitter {
   constructor() {
     super();
     this.quitCalls = 0;
+    this.showCalls = 0;
     this.lockCalls = 0;
     this.readyCalls = 0;
   }
@@ -302,6 +303,10 @@ class FakeApp extends EventEmitter {
 
   quit() {
     this.quitCalls += 1;
+  }
+
+  show() {
+    this.showCalls += 1;
   }
 }
 
@@ -1434,6 +1439,55 @@ test("desktop lifecycle composes secure window, tray, single instance, retry, an
   await lifecycle.requestQuit();
   assert.equal(supervisor.stops, 2);
   assert.equal(app.quitCalls, 1);
+});
+
+test("desktop lifecycle restores the macOS application before reopening a hidden dashboard", async () => {
+  const app = new FakeApp();
+  const windows = [];
+  const trays = [];
+  const supervisor = {
+    setUnexpectedExitHandler() {},
+    async start() {
+      return { origin: "http://127.0.0.1:4021" };
+    },
+    async stop() {},
+  };
+  const lifecycle = createDesktopLifecycle({
+    app,
+    platform: "darwin",
+    BrowserWindow: class extends FakeWindow {
+      constructor(options) {
+        super(options);
+        windows.push(this);
+      }
+    },
+    Tray: class extends FakeTray {
+      constructor(icon) {
+        super(icon);
+        trays.push(this);
+      }
+    },
+    Menu: { buildFromTemplate: (template) => ({ template }) },
+    icon: "empty-icon",
+    preloadPath: "/private/preload.cjs",
+    supervisor,
+  });
+
+  await lifecycle.start();
+  const dashboard = dashboardWindowsForTest(windows)[0];
+  dashboard.emit("ready-to-show");
+  dashboard.emit("close", { preventDefault() {} });
+  assert.equal(dashboard.visible, false);
+  assert.equal(app.showCalls, 1, "initial ready-to-show reveals the macOS app");
+
+  const openItem = trays[0].menu.template.find((item) => item.label === "Open TiboTattle");
+  assert.equal(typeof openItem?.click, "function");
+  openItem.click();
+  assert.equal(app.showCalls, 2, "tray reopen restores application-level hidden state");
+  assert.equal(dashboard.visible, true);
+  assert.equal(lifecycle.state.windowVisible, true);
+
+  await lifecycle.dispose();
 });
 
 test("desktop lifecycle installs one dashboard-owned download handler and removes stale origins", async () => {

@@ -252,13 +252,26 @@ export function createDesktopLifecycle({
     listeners.push(() => target.off?.(event, handler));
   }
 
+  function showApplicationWindow(target) {
+    if (!target || target.isDestroyed?.()) return false;
+    // macOS can hide the application as a whole when its last window is
+    // closed or when the status item is used.  BrowserWindow.show() alone
+    // does not undo that application-level hidden state; app.show() is the
+    // supported counterpart and is a no-op on the other desktop targets.
+    if (platform === "darwin") app.show?.();
+    target.show?.();
+    target.focus?.();
+    return true;
+  }
+
   function showWindow() {
     if (window && !window.isDestroyed?.()) {
-      window.show?.();
-      window.focus?.();
-      return true;
+      return showApplicationWindow(window);
     }
-    return recovery?.show?.() === true;
+    if (!recovery?.window || recovery.window.isDestroyed?.()) return false;
+    if (platform === "darwin") app.show?.();
+    recovery.show?.();
+    return true;
   }
 
   function hideWindow() {
@@ -632,8 +645,7 @@ export function createDesktopLifecycle({
     });
     const onReadyToShow = () => {
       if (isLiveBrowserWindow(settingsWindow)) {
-        settingsWindow.show?.();
-        settingsWindow.focus?.();
+        showApplicationWindow(settingsWindow);
       }
     };
     settingsWindow.once?.("ready-to-show", onReadyToShow);
@@ -691,8 +703,7 @@ export function createDesktopLifecycle({
     // A newly-created window waits for ready-to-show to avoid a blank flash;
     // an existing window is already safe to show and should be focused now.
     if (hadWindow) {
-      target.show?.();
-      target.focus?.();
+      showApplicationWindow(target);
     }
     return true;
   }
