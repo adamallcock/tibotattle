@@ -143,7 +143,13 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /\/api\/local\/desktop-status/u);
   assert.match(source, /validateDesktopShellStatus/u);
   assert.match(source, /DESKTOP_STATUS_SCHEMA_INVALID/u);
-  assert.match(source, /DESKTOP_STATUS_ALLOWANCE_INVALID/u);
+  assert.match(source, /DESKTOP_STATUS_FAIL_CLOSED_INVALID/u);
+  assert.doesNotMatch(source, /DESKTOP_STATUS_ALLOWANCE_INVALID/u);
+  assert.match(source, /assertFailClosedDesktopStatusRoute/u);
+  assert.match(source, /does not qualify direct provider evidence/u);
+  assert.match(source, /status\.state !== "stale"/u);
+  assert.match(source, /status\.allowance !== null/u);
+  assert.match(source, /status\.notificationEvidence !== null/u);
   assert.match(source, /DESKTOP_STATUS_QUERY_ACCEPTED/u);
   assert.match(source, /DESKTOP_STATUS_METHOD_ACCEPTED/u);
   assert.match(source, /X-Usage-Monitor-Local/u);
@@ -203,7 +209,7 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   const refreshBoundary = source.indexOf("await reloadDashboardDocument(connection)");
   assert.ok(refreshSucceeded >= 0 && refreshBoundary > refreshSucceeded);
   const desktopStatusRoute = source.indexOf(
-    "await assertDesktopStatusRoute(connection)",
+    "await assertFailClosedDesktopStatusRoute(connection)",
   );
   const syntheticRefreshReceipt = source.indexOf(
     "progress.syntheticRefresh = true",

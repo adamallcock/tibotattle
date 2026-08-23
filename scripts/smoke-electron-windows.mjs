@@ -1689,12 +1689,13 @@ async function runSyntheticRefresh(connection) {
 }
 
 /**
- * Qualify the content-free status projection from the real packaged
- * companion after its synthetic refresh. The existing syntheticRefresh
- * milestone is not complete unless the shell can consume this closed
- * contract.
+ * Qualify the fail-closed status projection from the real packaged companion
+ * after its synthetic refresh. This disposable lane has no CODEX_BIN or
+ * authenticated provider session, so it must remain `stale` with no
+ * allowance/evidence. It does not qualify direct provider evidence or a fresh
+ * allowance projection; those belong to an authenticated provider lane.
  */
-async function assertDesktopStatusRoute(connection) {
+async function assertFailClosedDesktopStatusRoute(connection) {
   const { dashboardUrl } = connection;
   const value = await jsonFetch(
     new URL("/api/local/desktop-status", dashboardUrl),
@@ -1707,11 +1708,10 @@ async function assertDesktopStatusRoute(connection) {
   } catch {
     fail("WINDOWS_ELECTRON_SMOKE_DESKTOP_STATUS_SCHEMA_INVALID");
   }
-  if (status.state !== "fresh"
-      || status.allowance?.source !== "direct"
-      || status.allowance?.window !== "seven_day"
-      || status.allowance?.remainingPercent !== 80) {
-    fail("WINDOWS_ELECTRON_SMOKE_DESKTOP_STATUS_ALLOWANCE_INVALID");
+  if (status.state !== "stale"
+      || status.allowance !== null
+      || status.notificationEvidence !== null) {
+    fail("WINDOWS_ELECTRON_SMOKE_DESKTOP_STATUS_FAIL_CLOSED_INVALID");
   }
 
   const queryResponse = await withTimeout(
@@ -1914,7 +1914,7 @@ export async function runSmoke(progress) {
 
     failurePhase = "refresh";
     await runSyntheticRefresh(connection);
-    await assertDesktopStatusRoute(connection);
+    await assertFailClosedDesktopStatusRoute(connection);
     progress.syntheticRefresh = true;
     failurePhase = "persistence";
     await writePersistentQualificationState(connection);
