@@ -109,6 +109,26 @@
       </aside>
       <div class="dashboard-content">
     <main id="main">
+      <section
+        class="dashboard-boot-state"
+        id="dashboard-boot-state"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        aria-busy="true"
+      >
+        <div class="dashboard-boot-card">
+          <span class="state-pill state-connecting">
+            <span class="state-dot" aria-hidden="true"></span>
+            Connecting
+          </span>
+          <strong class="dashboard-boot-title">Loading saved results…</strong>
+          <p class="dashboard-boot-copy">
+            Checking the summary on this Mac. Nothing is sent while you look at it.
+          </p>
+        </div>
+      </section>
+
       <div class="page-heading" data-dashboard-page="overview">
         <div>
           <p class="eyebrow">Local evidence dashboard</p>
