@@ -3252,6 +3252,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private var nativeRefreshPoll: DispatchWorkItem?
     private var nativeRefreshSchedule: DispatchWorkItem?
     private var nativeRefreshInFlight = false
+    private var nativeRefreshProgress: LocalAnalysisProgress?
     /// One launch-only refresh waits until the page has rendered its first
     /// local result. This prevents the heavy collector from winning the
     /// loopback race against the dashboard's own initial reads.
@@ -3937,11 +3938,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             nativeStatusPill = pill
             nativeStatusToolbarItem = item
             updateNativeToolbar(
-                title: nativeToolbarEvidenceTitle(
-                    fallback: TiboTattleLocalization.string(
-                        .launcherStartingLocally
-                    )
-                ),
+                title: nativeRefreshInFlight
+                    ? nativeRefreshProgress?.nativeToolbarTitle
+                        ?? TiboTattleLocalization.string(
+                            .nativeDashboardUpdating
+                        )
+                    : nativeToolbarEvidenceTitle(
+                        fallback: TiboTattleLocalization.string(
+                            .launcherStartingLocally
+                        )
+                    ),
                 isRefreshing: nativeRefreshInFlight,
                 refreshEnabled: dashboardURL != nil
             )
@@ -3987,18 +3993,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         refreshEnabled: Bool
     ) {
         let statusTitle = isRefreshing
-            ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+            ? title
             : nativeToolbarEvidenceTitle(fallback: title)
         nativeStatusRefreshButton?.title = statusTitle
         nativeStatusRefreshButton?.toolTip = isRefreshing
-            ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+            ? statusTitle
             : nativeRefreshToolbarTooltip()
         nativeStatusRefreshButton?.image = NSImage(
             systemSymbolName: isRefreshing
                 ? "arrow.triangle.2.circlepath.circle.fill"
                 : "arrow.clockwise",
             accessibilityDescription: isRefreshing
-                ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+                ? statusTitle
                 : TiboTattleLocalization.string(
                     .nativeDashboardRefreshUsage
                 )
@@ -4038,7 +4044,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func refreshNativeToolbarLocalization() {
         let statusTitle = nativeRefreshInFlight
-            ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+            ? nativeRefreshProgress?.nativeToolbarTitle
+                ?? TiboTattleLocalization.string(.nativeDashboardUpdating)
             : nativeToolbarEvidenceTitle(
                 fallback: TiboTattleLocalization.string(
                     .nativeDashboardStatus
@@ -4046,14 +4053,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             )
         nativeStatusRefreshButton?.title = statusTitle
         nativeStatusRefreshButton?.toolTip = nativeRefreshInFlight
-            ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+            ? statusTitle
             : nativeRefreshToolbarTooltip()
         nativeStatusRefreshButton?.image = NSImage(
             systemSymbolName: nativeRefreshInFlight
                 ? "arrow.triangle.2.circlepath.circle.fill"
                 : "arrow.clockwise",
             accessibilityDescription: nativeRefreshInFlight
-                ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+                ? statusTitle
                 : TiboTattleLocalization.string(
                     .nativeDashboardRefreshUsage
                 )
@@ -4226,7 +4233,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             TiboTattleLocalization.string(.launcherLoadingPrivateDashboard)
         updateNativeToolbar(
             title: nativeRefreshInFlight
-                ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+                ? nativeRefreshProgress?.nativeToolbarTitle
+                    ?? TiboTattleLocalization.string(
+                        .nativeDashboardUpdating
+                    )
                 : TiboTattleLocalization.string(.nativeDashboardStarting),
             isRefreshing: nativeRefreshInFlight,
             refreshEnabled: dashboardURL != nil
@@ -4255,7 +4265,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         openInBrowserButton.isEnabled = true
         updateNativeToolbar(
             title: nativeRefreshInFlight
-                ? "Updating local usage…"
+                ? nativeRefreshProgress?.nativeToolbarTitle
+                    ?? TiboTattleLocalization.string(
+                        .nativeDashboardUpdating
+                    )
                 : "Local report ready",
             isRefreshing: nativeRefreshInFlight,
             refreshEnabled: dashboardURL != nil
@@ -4312,6 +4325,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         cancelNativeRefreshSchedule()
         cancelNativeIndexingCoveragePoll()
         nativeRefreshInFlight = true
+        nativeRefreshProgress = nil
         updateNativeToolbar(
             title: automatic
                 ? TiboTattleLocalization.string(.launcherUpdatingAutomatically)
@@ -4366,8 +4380,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 }
                 let terminalRefreshID: String?
                 switch activity {
-                case .running:
+                case let .running(_, progress):
                     terminalRefreshID = nil
+                    self.nativeRefreshProgress = progress
+                    self.updateNativeToolbar(
+                        title: progress?.nativeToolbarTitle
+                            ?? TiboTattleLocalization.string(
+                                .nativeDashboardUpdating
+                            ),
+                        isRefreshing: true,
+                        refreshEnabled: false
+                    )
                     if remainingAttempts > 0 {
                         self.pollNativeRefresh(
                             base: base,
@@ -4444,6 +4467,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func finishNativeRefresh(title: String, refreshEnabled: Bool) {
         nativeRefreshInFlight = false
+        nativeRefreshProgress = nil
         nativeRefreshID = nil
         cancelNativeRefreshPoll()
         updateNativeToolbar(
@@ -4750,6 +4774,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         nativeHistoryIndexingCoverage = nil
         nativeRefreshFailure = nil
         nativeRefreshInFlight = false
+        nativeRefreshProgress = nil
         nativeRefreshID = nil
         dashboardWebHost?.stop()
         updateNativeToolbar(
@@ -7661,6 +7686,155 @@ private enum LoginItemContractSmokeTest {
     }
 }
 
+/// Exercises the closed refresh-progress projection without contacting the
+/// companion. This proves that only allowlisted phases and bounded counts can
+/// reach native presentation, while the existing idle/running contract remains
+/// intact for unknown or forged fields.
+private enum NativeAnalysisProgressContractSmokeTest {
+    private static let refreshID = "123e4567-e89b-42d3-a456-426614174000"
+
+    private static func decode(
+        progress: [String: Any],
+        status: String = "running"
+    ) -> LocalAnalysisActivity? {
+        guard let data = try? JSONSerialization.data(withJSONObject: [
+            "refresh": [
+                "status": status,
+                "refreshId": refreshID,
+                "progress": progress,
+            ],
+        ]) else {
+            return nil
+        }
+        return LocalCompanionEvidenceReader.decodeActivity(data)
+    }
+
+    static func run() -> Int32 {
+        let phases: [(String, LocalAnalysisProgress.Phase)] = [
+            ("discovering", .discovering),
+            ("rollout_index", .rolloutIndex),
+            ("quota_refresh", .quotaRefresh),
+            ("quick_result", .quickResult),
+            ("complete", .complete),
+            ("paused", .paused),
+            ("prospective", .prospective),
+        ]
+        for (rawPhase, expectedPhase) in phases {
+            guard case let .running(decodedRefreshID, progress) = decode(
+                progress: ["phase": rawPhase]
+            ),
+                decodedRefreshID == refreshID,
+                progress?.phase == expectedPhase,
+                progress?.nativeToolbarTitle.isEmpty == false
+            else {
+                return failure("phase \(rawPhase)")
+            }
+        }
+
+        let counted = decode(progress: [
+            "phase": "rollout_index",
+            "filesSelected": 180,
+            "filesProcessed": 42,
+            "message": "/Users/private/repository",
+        ])
+        let expectedCountedTitle = TiboTattleLocalization.format(
+            .nativeDashboardProgressAnalyzingFiles,
+            TiboTattleLocalization.integerString(42),
+            TiboTattleLocalization.integerString(180)
+        )
+        guard case let .running(_, countedProgress) = counted,
+              countedProgress == LocalAnalysisProgress(
+                phase: .rolloutIndex,
+                filesSelected: 180,
+                filesProcessed: 42
+              ),
+              countedProgress?.nativeToolbarTitle == expectedCountedTitle
+        else {
+            return failure("bounded counts")
+        }
+
+        let unsafe = decode(progress: [
+            "phase": "rollout_index",
+            "filesSelected": 1_000_000_001,
+            "filesProcessed": -1,
+        ])
+        guard case let .running(_, unsafeProgress) = unsafe,
+              unsafeProgress?.filesSelected == nil,
+              unsafeProgress?.filesProcessed == nil
+        else {
+            return failure("unsafe counts")
+        }
+
+        let malformed = decode(progress: [
+            "phase": "rollout_index",
+            "filesSelected": true,
+            "filesProcessed": 4.5,
+        ])
+        guard case let .running(_, malformedProgress) = malformed,
+              malformedProgress?.filesSelected == nil,
+              malformedProgress?.filesProcessed == nil
+        else {
+            return failure("malformed counts")
+        }
+
+        let contradictory = decode(progress: [
+            "phase": "rollout_index",
+            "filesSelected": 2,
+            "filesProcessed": 3,
+        ])
+        guard case let .running(_, contradictoryProgress) = contradictory,
+              contradictoryProgress?.nativeToolbarTitle
+                == TiboTattleLocalization.string(
+                    .nativeDashboardProgressAnalyzing
+                )
+        else {
+            return failure("contradictory counts")
+        }
+
+        let archive = decode(progress: [
+            "kind": "archive_index",
+            "status": "scanning",
+        ])
+        guard case let .running(_, archiveProgress) = archive,
+              archiveProgress?.phase == .archiveIndex
+        else {
+            return failure("archive phase")
+        }
+
+        let unknown = decode(progress: [
+            "phase": "server_supplied_unreviewed_phase",
+            "message": "server supplied prose",
+        ])
+        guard case let .running(_, unknownProgress) = unknown,
+              unknownProgress == nil
+        else {
+            return failure("unknown phase")
+        }
+
+        guard decode(
+            progress: ["phase": "discovering"],
+            status: "succeeded"
+        ) == .idle(refreshID: refreshID) else {
+            return failure("idle contract")
+        }
+
+        print(
+            "USAGE_MONITOR_MACOS_ANALYSIS_PROGRESS_CONTRACT "
+                + "phases=allowlisted archive=scanning counts=bounded "
+                + "contradictory=generic unknown=generic free_text=ignored "
+                + "idle=unchanged percent=false eta=false"
+        )
+        return 0
+    }
+
+    private static func failure(_ detail: String) -> Int32 {
+        FileHandle.standardError.write(
+            Data("macOS analysis progress contract failed: \(detail)\n".utf8)
+        )
+        return 1
+    }
+}
+
 /// Exercises the real AppKit status item without starting the local companion
 /// or reading any local evidence. This catches the class of regression where a
 /// custom menu view has no measured frame and leaves an apparently empty menu
@@ -8867,6 +9041,9 @@ private struct UsageMonitorMain {
         }
         if arguments.contains("--native-refresh-settings-contract-smoke-test") {
             exit(NativeRefreshSettingsContractSmokeTest.run())
+        }
+        if arguments.contains("--native-analysis-progress-contract-smoke-test") {
+            exit(NativeAnalysisProgressContractSmokeTest.run())
         }
         if arguments.contains("--menu-bar-contract-smoke-test") {
             exit(MainActor.assumeIsolated {

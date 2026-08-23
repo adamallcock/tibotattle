@@ -17,6 +17,15 @@
 "nativeDashboard.localOnly" = "Solo local";
 "nativeDashboard.localOnlyTooltip" = "El análisis y los resultados en caché permanecen en este Mac. La contribución a la comunidad es opcional.";
 "nativeDashboard.overview" = "Resumen";
+"nativeDashboard.progressAnalyzing" = "Analizando el historial local…";
+"nativeDashboard.progressAnalyzingFiles" = "Analizando %@ de %@ archivos…";
+"nativeDashboard.progressArchiveIndex" = "Actualizando el historial anterior…";
+"nativeDashboard.progressDiscovering" = "Buscando el historial local…";
+"nativeDashboard.progressFinishing" = "Finalizando el análisis…";
+"nativeDashboard.progressProspective" = "Preparando el seguimiento continuo…";
+"nativeDashboard.progressQuickResult" = "Resumen listo · finalizando el análisis…";
+"nativeDashboard.progressQuotaRefresh" = "Actualizando el límite…";
+"nativeDashboard.progressSaving" = "Guardando el progreso del análisis…";
 "nativeDashboard.refreshUsage" = "Actualizar";
 "nativeDashboard.refreshUsageTooltip" = "Actualiza ahora el uso local. Solo lee las carpetas de Codex seleccionadas en este Mac.";
 "nativeDashboard.share" = "Compartir";

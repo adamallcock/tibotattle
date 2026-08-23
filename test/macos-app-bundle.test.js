@@ -1619,6 +1619,40 @@ test("native app disables AppKit window tabbing before startup", async () => {
   );
 });
 
+test("native refresh progress stays fixed-vocabulary and count-bounded", async () => {
+  const [source, menuBarStatusSource] = await Promise.all([
+    readFile(SWIFT_SOURCE, "utf8"),
+    readFile(MENU_BAR_STATUS_SOURCE, "utf8"),
+  ]);
+  const progressProjection = menuBarStatusSource.match(
+    /struct LocalAnalysisProgress:[\s\S]*?(?=\n\/\/\/ Whether an explicit local analysis pass)/u,
+  )?.[0] ?? "";
+  const activityDecoder = menuBarStatusSource.match(
+    /static func decodeActivity\([\s\S]*?(?=\n    private static func decodeRefreshID)/u,
+  )?.[0] ?? "";
+  const refreshPoll = source.match(
+    /private func pollNativeRefresh\([\s\S]*?(?=\n    private func finishNativeRefresh)/u,
+  )?.[0] ?? "";
+
+  assert.ok(progressProjection, "native progress projection is present");
+  assert.match(progressProjection, /case discovering/u);
+  assert.match(progressProjection, /case rolloutIndex = "rollout_index"/u);
+  assert.match(progressProjection, /case quotaRefresh = "quota_refresh"/u);
+  assert.match(progressProjection, /case quickResult = "quick_result"/u);
+  assert.match(progressProjection, /case archiveIndex = "archive_index"/u);
+  assert.doesNotMatch(progressProjection, /\b(?:percentage|percent|eta)\b/iu);
+  assert.match(activityDecoder, /maximumProgressCount = 1_000_000_000/u);
+  assert.match(activityDecoder, /doubleValue\.rounded\(\.towardZero\)/u);
+  assert.match(activityDecoder, /progress\["phase"\]/u);
+  assert.match(activityDecoder, /progress\["kind"\][\s\S]*?"archive_index"/u);
+  assert.doesNotMatch(activityDecoder, /progress\["message"\]/u);
+  assert.match(
+    refreshPoll,
+    /case let \.running\(_, progress\):[\s\S]*?progress\?\.nativeToolbarTitle[\s\S]*?pollNativeRefresh/u,
+  );
+  assert.match(source, /--native-analysis-progress-contract-smoke-test/u);
+});
+
 test("unified toolbar preserves the rich loopback report and single authority", async () => {
   const source = await readFile(SWIFT_SOURCE, "utf8");
   assert.match(
@@ -5959,6 +5993,20 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.match(
       menuBarSmoke.stdout,
       /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT native_rows=true titles=true states=starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q dismissal=native,escape,same-app,deactivation weekly_position=fresh-only$/mu,
+    );
+    const analysisProgressSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--native-analysis-progress-contract-smoke-test"],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    assert.equal(
+      analysisProgressSmoke.status,
+      0,
+      analysisProgressSmoke.stderr || analysisProgressSmoke.stdout,
+    );
+    assert.match(
+      analysisProgressSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_ANALYSIS_PROGRESS_CONTRACT phases=allowlisted archive=scanning counts=bounded contradictory=generic unknown=generic free_text=ignored idle=unchanged percent=false eta=false$/mu,
     );
     const quotaNotificationSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),
