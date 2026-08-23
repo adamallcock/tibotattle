@@ -858,7 +858,15 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(
     source,
-    /guard Self\.feedResponseIsReachable\([\s\S]*showFeedFailureAlert/u,
+    /guard Self\.feedResponseIsReachable\([\s\S]*showUpdateFailureAlert\(\s*messageKey:\s*\.settingsUpdateCheckUnavailableTitle,\s*informativeTextKey:\s*\.settingsUpdateCheckUnavailableMessage/u,
+  );
+  assert.match(
+    source,
+    /guard let appcastURL = Self\.appcastURL else \{[\s\S]*showUpdateFailureAlert\(\s*messageKey:\s*\.launcherUpdateUnavailable,\s*informativeTextKey:\s*\.settingsAutomaticUpdatesUnavailable/u,
+  );
+  assert.match(
+    source,
+    /private func showUpdateFailureAlert\([\s\S]*?alert\.messageText = TiboTattleLocalization\.string\(messageKey\)[\s\S]*?alert\.informativeText = TiboTattleLocalization\.string\(informativeTextKey\)/u,
   );
   assert.match(source, /alert\.addButton\(withTitle: TiboTattleLocalization\.string\(\.launcherRetry\)\)/u);
   assert.match(source, /alert\.addButton\(withTitle: TiboTattleLocalization\.string\(\.commonCancel\)\)/u);

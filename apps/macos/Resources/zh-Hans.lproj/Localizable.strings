@@ -206,6 +206,8 @@
 "menuBar.failureRecovery" = "未在运行：%@。请打开窗口查看恢复步骤。";
 "settings.codexFolderCustomSelectedPath" = "自定义文件夹：%@";
 "settings.codexFolderDefaultLocation" = "默认位置（~/.codex）";
+"settings.updateCheckUnavailableMessage" = "TiboTattle 无法完成更新检查。请检查互联网连接后重试。";
+"settings.updateCheckUnavailableTitle" = "无法检查更新";
 "settings.updateDisclosureAutomaticOff" = "已签名应用更新可在“关于”→“检查更新”中获取。自动下载目前已关闭；可在“设置”→“关于”中开启（如可用）。";
 "settings.updateDisclosureAutomaticOn" = "会自动检查已签名应用更新。默认情况下，已验证的更新会在后台下载并在退出时安装；可在“设置”→“关于”中关闭此项。";
 "settings.updateDisclosureDevelopment" = "此开发构建不包含更新检查。安装在“应用程序”中的已签名版本可从“关于”中检查更新。";

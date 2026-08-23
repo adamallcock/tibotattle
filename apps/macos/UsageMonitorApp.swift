@@ -556,7 +556,10 @@ private final class AppUpdater: NSObject {
             feedIsReachable = false
             setState(.failed)
             if userInitiated {
-                showFeedFailureAlert()
+                showUpdateFailureAlert(
+                    messageKey: .launcherUpdateUnavailable,
+                    informativeTextKey: .settingsAutomaticUpdatesUnavailable
+                )
             }
             return
         }
@@ -580,7 +583,10 @@ private final class AppUpdater: NSObject {
                     self.feedIsReachable = false
                     self.setState(.failed)
                     if userInitiated {
-                        self.showFeedFailureAlert()
+                        self.showUpdateFailureAlert(
+                            messageKey: .settingsUpdateCheckUnavailableTitle,
+                            informativeTextKey: .settingsUpdateCheckUnavailableMessage
+                        )
                     }
                     return
                 }
@@ -590,15 +596,14 @@ private final class AppUpdater: NSObject {
         }.resume()
     }
 
-    private func showFeedFailureAlert() {
+    private func showUpdateFailureAlert(
+        messageKey: TiboTattleLocalization.Key,
+        informativeTextKey: TiboTattleLocalization.Key
+    ) {
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = TiboTattleLocalization.string(
-            .launcherUpdateUnavailable
-        )
-        alert.informativeText = TiboTattleLocalization.string(
-            .settingsAutomaticUpdatesUnavailable
-        )
+        alert.messageText = TiboTattleLocalization.string(messageKey)
+        alert.informativeText = TiboTattleLocalization.string(informativeTextKey)
         alert.addButton(withTitle: TiboTattleLocalization.string(.launcherRetry))
         alert.addButton(withTitle: TiboTattleLocalization.string(.commonCancel))
         if alert.runModal() == .alertFirstButtonReturn {
