@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdir, readFile, rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -103,6 +104,11 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /CODEX_HOME/u);
   assert.match(source, /USAGE_MONITOR_STATE_ROOT/u);
   assert.match(source, /createWindowsFilesystemAdapter/u);
+  assert.match(source, /createWindowsProtectedStateStore/u);
+  assert.match(source, /createDesktopFirstRunReceiptBackend/u);
+  assert.match(source, /DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION/u);
+  assert.match(source, /windowsProtectedStateStoreFactory/u);
+  assert.match(source, /firstRunReceiptBackendFactory/u);
   assert.match(source, /platform: "win32"/u);
   assert.match(source, /architecture: "x64"/u);
   assert.match(source, /windowsFilesystemAdapter\.ensureDirectory\(stateRoot\)/u);
@@ -397,10 +403,20 @@ test("Windows Electron smoke creates stateRoot through the native adapter only",
   const ordinaryDirectories = [];
   const adapterDirectories = [];
   let adapterOptions = null;
+  let protectedStoreOptions = null;
+  let receiptBackendOptions = null;
+  const protectedStore = Object.freeze({ name: "protected-store" });
+  const receiptSaves = [];
+  const receiptBackend = Object.freeze({
+    async save(value) {
+      receiptSaves.push(value);
+    },
+  });
+  let adapter;
   const fixture = await createSyntheticFixture({
     windowsFilesystemAdapterFactory(options) {
       adapterOptions = options;
-      return {
+      adapter = {
         ensureDirectory(path) {
           adapterDirectories.push(path);
           return {
@@ -410,6 +426,15 @@ test("Windows Electron smoke creates stateRoot through the native adapter only",
           };
         },
       };
+      return adapter;
+    },
+    windowsProtectedStateStoreFactory(options) {
+      protectedStoreOptions = options;
+      return protectedStore;
+    },
+    firstRunReceiptBackendFactory(options) {
+      receiptBackendOptions = options;
+      return receiptBackend;
     },
     makeDirectory(path, options) {
       ordinaryDirectories.push(path);
@@ -420,9 +445,43 @@ test("Windows Electron smoke creates stateRoot through the native adapter only",
     assert.deepEqual(adapterOptions, { platform: "win32", architecture: "x64" });
     assert.deepEqual(adapterDirectories, [fixture.stateRoot]);
     assert.equal(ordinaryDirectories.includes(fixture.stateRoot), false);
+    const settingsRoot = join(fixture.userData, "desktop-settings");
+    assert.equal(protectedStoreOptions.adapter, adapter);
+    assert.equal(protectedStoreOptions.rootPath, settingsRoot);
+    assert.equal(receiptBackendOptions.platform, "win32");
+    assert.equal(receiptBackendOptions.rootPath, settingsRoot);
+    assert.equal(receiptBackendOptions.windowsProtectedStateStore, protectedStore);
+    assert.deepEqual(receiptSaves, [{
+      schemaVersion: "tibotattle-desktop-first-run-v1",
+      acknowledged: true,
+    }]);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
+});
+
+test("Windows Electron smoke removes its fixture when first-run receipt seeding fails", async () => {
+  const removedRoots = [];
+  await assert.rejects(
+    createSyntheticFixture({
+      windowsFilesystemAdapterFactory() {
+        return { ensureDirectory() {} };
+      },
+      windowsProtectedStateStoreFactory() {
+        throw Object.assign(new Error("seed failed"), {
+          code: "WINDOWS_ELECTRON_SMOKE_FIRST_RUN_SEED_FAILED",
+        });
+      },
+      async removeDirectory(path, options) {
+        removedRoots.push({ path, options });
+        await rm(path, options);
+      },
+    }),
+    (error) => error?.code === "WINDOWS_ELECTRON_SMOKE_FIRST_RUN_SEED_FAILED",
+  );
+  assert.equal(removedRoots.length, 1);
+  assert.deepEqual(removedRoots[0].options, { recursive: true, force: true });
+  await assert.rejects(readFile(removedRoots[0].path), { code: "ENOENT" });
 });
 
 test("Windows Electron smoke removes its fixture when native state setup fails", async () => {

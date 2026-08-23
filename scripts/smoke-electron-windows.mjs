@@ -36,6 +36,13 @@ import {
 import {
   validateDesktopShellStatus,
 } from "../src/desktop-shell-status.js";
+import {
+  createDesktopFirstRunReceiptBackend,
+  DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
+} from "../apps/electron/desktop-first-run.js";
+import {
+  createWindowsProtectedStateStore,
+} from "../src/platform/windows-protected-state-store.js";
 
 const require = createRequire(import.meta.url);
 
@@ -385,12 +392,16 @@ async function freeTcpPort() {
  * path.  The reviewed Windows adapter owns creation of that leaf so the
  * native owner-only ACL is applied at the point of creation.  The injectable
  * dependencies are a test seam only; production calls use the repository
- * adapter and fs/promises mkdir above.
+ * adapter and fs/promises mkdir above.  The fixed receipt seeds a returning-
+ * user qualification profile; it does not bypass the production first-run
+ * acknowledgement path.
  */
 async function populateSyntheticFixture({
   root,
   windowsFilesystemAdapterFactory,
   makeDirectory,
+  windowsProtectedStateStoreFactory,
+  firstRunReceiptBackendFactory,
 }) {
   const home = join(root, "profile");
   const codexHome = join(home, ".codex");
@@ -417,6 +428,37 @@ async function populateSyntheticFixture({
     makeDirectory(join(home, "AppData", "Roaming"), { recursive: true }),
     makeDirectory(join(home, "AppData", "Local"), { recursive: true }),
   ]);
+  if (typeof windowsProtectedStateStoreFactory !== "function") {
+    throw fixedError("WINDOWS_ELECTRON_SMOKE_PROTECTED_STATE_STORE_FACTORY_UNAVAILABLE");
+  }
+  if (typeof firstRunReceiptBackendFactory !== "function") {
+    throw fixedError("WINDOWS_ELECTRON_SMOKE_FIRST_RUN_RECEIPT_BACKEND_FACTORY_UNAVAILABLE");
+  }
+  const settingsRoot = join(userData, "desktop-settings");
+  const protectedStateStore = windowsProtectedStateStoreFactory({
+    adapter: windowsFilesystemAdapter,
+    rootPath: settingsRoot,
+  });
+  if (protectedStateStore === null
+      || typeof protectedStateStore !== "object"
+      || Array.isArray(protectedStateStore)) {
+    throw fixedError("WINDOWS_ELECTRON_SMOKE_PROTECTED_STATE_STORE_UNAVAILABLE");
+  }
+  const receiptBackend = firstRunReceiptBackendFactory({
+    platform: "win32",
+    rootPath: settingsRoot,
+    windowsProtectedStateStore: protectedStateStore,
+  });
+  if (receiptBackend === null
+      || typeof receiptBackend !== "object"
+      || Array.isArray(receiptBackend)
+      || typeof receiptBackend.save !== "function") {
+    throw fixedError("WINDOWS_ELECTRON_SMOKE_FIRST_RUN_RECEIPT_BACKEND_UNAVAILABLE");
+  }
+  await receiptBackend.save({
+    schemaVersion: DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
+    acknowledged: true,
+  });
   const now = Date.now();
   const usage = {
     input_tokens: 100,
@@ -478,6 +520,8 @@ async function populateSyntheticFixture({
 
 export async function createSyntheticFixture({
   windowsFilesystemAdapterFactory = createWindowsFilesystemAdapter,
+  windowsProtectedStateStoreFactory = createWindowsProtectedStateStore,
+  firstRunReceiptBackendFactory = createDesktopFirstRunReceiptBackend,
   makeDirectory = mkdir,
   removeDirectory = rm,
 } = {}) {
@@ -486,6 +530,8 @@ export async function createSyntheticFixture({
     return await populateSyntheticFixture({
       root,
       windowsFilesystemAdapterFactory,
+      windowsProtectedStateStoreFactory,
+      firstRunReceiptBackendFactory,
       makeDirectory,
     });
   } catch (error) {
