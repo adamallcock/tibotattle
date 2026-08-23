@@ -8777,6 +8777,10 @@ private enum NativeDashboardChromeLayoutSmokeTest {
 @main
 private struct UsageMonitorMain {
     static func main() {
+        // TiboTattle has no document-style multi-window workflow. Opt out
+        // before AppKit creates the application or any windows so it does not
+        // expose a browser-style tab bar with no product meaning.
+        NSWindow.allowsAutomaticWindowTabbing = false
         let arguments = Array(CommandLine.arguments.dropFirst())
         // This isolated seam smoke intentionally runs before bundle branding
         // is resolved, so it can execute as a plain launcher binary without

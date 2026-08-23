@@ -1599,6 +1599,26 @@ test("native dashboard launch gates its first refresh on the rendered page", asy
   assert.match(companionExit, /startupAutomaticRefreshPending = false/u);
 });
 
+test("native app disables AppKit window tabbing before startup", async () => {
+  const source = await readFile(SWIFT_SOURCE, "utf8");
+  const mainStart = source.indexOf("static func main() {");
+  const tabbingOptOut = source.indexOf(
+    "NSWindow.allowsAutomaticWindowTabbing = false",
+    mainStart,
+  );
+  const argumentParsing = source.indexOf(
+    "let arguments = Array(CommandLine.arguments.dropFirst())",
+    mainStart,
+  );
+
+  assert.ok(mainStart >= 0, "the native app entry point is present");
+  assert.ok(tabbingOptOut > mainStart, "AppKit window tabbing is disabled");
+  assert.ok(
+    argumentParsing > tabbingOptOut,
+    "window tabbing is disabled before any startup or smoke-test path",
+  );
+});
+
 test("unified toolbar preserves the rich loopback report and single authority", async () => {
   const source = await readFile(SWIFT_SOURCE, "utf8");
   assert.match(
