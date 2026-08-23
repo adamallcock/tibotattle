@@ -76,7 +76,7 @@
     },
     {
       "file": "test/electron-windows-smoke-contract.test.js",
-      "win32BranchCount": 1,
+      "win32BranchCount": 2,
       "classification": "native-windows-qualification",
       "followUp": "Run the referenced Windows x64 Electron smoke workflow and retain only its content-free aggregate result."
     },
