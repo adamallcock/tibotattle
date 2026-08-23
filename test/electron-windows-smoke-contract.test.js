@@ -160,6 +160,20 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /DESKTOP_STATUS_QUERY_ACCEPTED/u);
   assert.match(source, /DESKTOP_STATUS_METHOD_ACCEPTED/u);
   assert.match(source, /X-Usage-Monitor-Local/u);
+  const syntheticRefreshBody = source.slice(
+    source.indexOf("async function runSyntheticRefresh"),
+    source.indexOf("async function assertFailClosedDesktopStatusRoute"),
+  );
+  assert.match(
+    syntheticRefreshBody,
+    /Origin:\s+dashboardUrl\.origin/u,
+    "synthetic refresh must stamp the validated dashboard origin",
+  );
+  assert.doesNotMatch(
+    syntheticRefreshBody,
+    /Origin:\s+(?:undefined|null|["'][^"']*["'])/u,
+    "synthetic refresh must not omit or hard-code the origin",
+  );
   assert.match(source, /Page\.getFrameTree/u);
   assert.match(source, /Network\.enable/u);
   assert.match(source, /observeLocalRefreshRequests/u);

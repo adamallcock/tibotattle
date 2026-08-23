@@ -1683,6 +1683,7 @@ async function runSyntheticRefresh(connection) {
       headers: {
         "Content-Type": "application/json",
         "X-Usage-Monitor-Local": "1",
+        Origin: dashboardUrl.origin,
       },
       body: "{}",
     }),
