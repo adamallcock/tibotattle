@@ -2002,13 +2002,21 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.match(source, /configure\(\s*aboutItem,/u);
   assert.match(source, /#selector\(showAbout\)/u);
 
-  // The compact title shows a number only for live evidence; stale, absent,
-  // starting, failed, and analyzing states all collapse to a placeholder.
+  // The compact title keeps a verified live number visible while a refresh is
+  // running. Analysis gets its own placeholder only when no live number is
+  // available; stale, absent, starting, and failed states remain non-numeric.
   assert.match(
     source,
-    /guard phase == \.ready, evidence == \.live, let lane = primaryLane else \{\s*return unknownPlaceholder/u,
+    /if companionReachable,\s*evidence == \.live,\s*let lane = primaryLane \{\s*return TiboTattleLocalization\.percentString\(\s*lane\.roundedRemainingPercent\s*\)/u,
   );
-  assert.match(source, /if phase == \.analyzing \{ return analyzingPlaceholder \}/u);
+  assert.match(
+    source,
+    /return phase == \.analyzing\s*\? analyzingPlaceholder\s*:\s*unknownPlaceholder/u,
+  );
+  assert.doesNotMatch(
+    source,
+    /if phase == \.analyzing \{ return analyzingPlaceholder \}/u,
+  );
   assert.match(source, /private let analyzingPlaceholder = "…"/u);
   assert.match(source, /private let unknownPlaceholder = "–"/u);
   assert.match(
@@ -5930,7 +5938,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       menuBarSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT native_rows=true titles=true states=starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q dismissal=native,escape,same-app,deactivation weekly_position=fresh-only$/mu,
+      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT native_rows=true titles=true states=starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q dismissal=native,escape,same-app,deactivation weekly_position=fresh-only analysis_title=live-fallback$/mu,
     );
     const quotaNotificationSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),

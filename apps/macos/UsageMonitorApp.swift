@@ -7696,7 +7696,14 @@ private enum MenuBarContractSmokeTest {
             weeklyLane,
             now: observedAt
         )
+        var analyzingLiveSnapshot = liveSnapshot
+        analyzingLiveSnapshot.phase = .analyzing
+        var analyzingWithoutLiveEvidence = MenuBarStatusSnapshot()
+        analyzingWithoutLiveEvidence.phase = .analyzing
+        var unavailableLiveSnapshot = liveSnapshot
+        unavailableLiveSnapshot.phase = .unavailable
         let reset = resetCountdown(resetAt, now: observedAt)
+        let expectedLiveTitle = TiboTattleLocalization.percentString(71)
         let expectedLiveSummary = reset.map {
             TiboTattleLocalization.format(
                 .menuBarQuotaWeeklyPositionResets,
@@ -7740,6 +7747,11 @@ private enum MenuBarContractSmokeTest {
                   elapsedPercent: 24,
                   usedPercent: 29
               ),
+              liveSnapshot.title == expectedLiveTitle,
+              analyzingLiveSnapshot.title == expectedLiveTitle,
+              analyzingWithoutLiveEvidence.title == "…",
+              staleSnapshot.title == "–",
+              unavailableLiveSnapshot.title == "–",
               liveSummary == expectedLiveSummary,
               staleSummary == expectedStaleSummary
         else {
@@ -7753,7 +7765,8 @@ private enum MenuBarContractSmokeTest {
                 + "native_rows=true titles=true states=starting,unavailable "
                 + "shortcuts=cmd-r,cmd-comma,cmd-q "
                 + "dismissal=native,escape,same-app,deactivation "
-                + "weekly_position=fresh-only"
+                + "weekly_position=fresh-only "
+                + "analysis_title=live-fallback"
         )
         return 0
     }
