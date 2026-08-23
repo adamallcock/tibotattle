@@ -8,7 +8,9 @@ import {
   classifyAutomaticStartupRefreshReceipt,
   ELECTRON_MACOS_SMOKE_FAILURE_REASONS,
   ELECTRON_MACOS_SMOKE_STARTUP_REFRESH_ERROR_CODES,
+  isMacDashboardTarget,
   observeLocalRefreshRequests,
+  selectMacDashboardTarget,
 } from "../scripts/smoke-electron-macos.mjs";
 
 class FakeCdp {
@@ -62,6 +64,7 @@ test("macOS Electron smoke is an explicit packaged arm64 lane", async () => {
   assert.match(source, /refreshObserver\.selectOrigin/u);
   assert.match(source, /refreshObserver\.selectLoader/u);
   assert.match(source, /refreshObserver\.seal/u);
+  assert.match(source, /selectMacDashboardTarget/u);
   assert.match(source, /#weekly/u);
   assert.match(source, /#share-panel/u);
   assert.match(source, /electron-settings/u);
@@ -99,6 +102,59 @@ test("macOS app contract rejects the wrong host, architecture, and bundle shape"
     { platform: "darwin", architecture: "arm64", appPath: "/tmp/TiboTattle Dev.app", executableArchitecture: "x64" },
   ]) {
     assert.throws(() => assertMacAppContract(options), TypeError);
+  }
+});
+
+test("macOS smoke selects only the exact ephemeral loopback dashboard target", () => {
+  const debugPort = 43123;
+  const dashboardPort = 49299;
+  const target = (url, overrides = {}) => ({
+    type: "page",
+    url,
+    webSocketDebuggerUrl: `ws://127.0.0.1:${debugPort}/devtools/page/1`,
+    ...overrides,
+  });
+  const valid = target(`http://127.0.0.1:${dashboardPort}/`);
+  assert.equal(isMacDashboardTarget(valid, debugPort), true);
+  assert.equal(
+    selectMacDashboardTarget([
+      target(`data:text/html,<h1>loading</h1>`),
+      target("file:///tmp/recovery.html"),
+      target(`https://127.0.0.1:${dashboardPort}/`),
+      target(`http://localhost:${dashboardPort}/`),
+      target(`http://127.0.0.1:${dashboardPort}/electron-settings.html`),
+      target(`http://127.0.0.1:${dashboardPort}/#weekly`),
+      target(`http://127.0.0.1:${dashboardPort}/?ready=1`),
+      target(`http://user:pass@127.0.0.1:${dashboardPort}/`),
+      target(`http://127.0.0.2:${dashboardPort}/`),
+      { ...valid, type: "other" },
+      {
+        ...valid,
+        webSocketDebuggerUrl: `ws://127.0.0.1:${debugPort + 1}/devtools/page/2`,
+      },
+      valid,
+    ],
+    debugPort,
+  ), valid);
+  for (const rejected of [
+    target(`data:text/html,<h1>loading</h1>`),
+    target("file:///tmp/recovery.html"),
+    target(`https://127.0.0.1:${dashboardPort}/`),
+    target(`http://localhost:${dashboardPort}/`),
+    target(`http://127.0.0.1:${dashboardPort}/electron-settings.html`),
+    target(`http://127.0.0.1:${dashboardPort}/#weekly`),
+    target(`http://127.0.0.1:${dashboardPort}/?ready=1`),
+    target(`http://user:pass@127.0.0.1:${dashboardPort}/`),
+    target("http://127.0.0.1/"),
+    target(`http://127.0.0.2:${dashboardPort}/`),
+    { ...valid, type: "other" },
+    { ...valid, webSocketDebuggerUrl: "" },
+    {
+      ...valid,
+      webSocketDebuggerUrl: `ws://127.0.0.1:${debugPort + 1}/devtools/page/2`,
+    },
+  ]) {
+    assert.equal(isMacDashboardTarget(rejected, debugPort), false);
   }
 });
 

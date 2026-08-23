@@ -781,6 +781,62 @@ async function assertDashboardData(cdp) {
   });
 }
 
+/**
+ * Select only the main dashboard page for this smoke's ephemeral server.
+ *
+ * Electron exposes loading, recovery, settings, and other renderer targets
+ * through the same /json endpoint.  A page target is not sufficient evidence
+ * of the dashboard: the URL must be the exact loopback root for this run, so
+ * a stale page cannot be mistaken for the document whose loader and network
+ * requests we qualify below.
+ */
+export function isMacDashboardTarget(target, debugPort) {
+  if (target === null
+      || typeof target !== "object"
+      || Array.isArray(target)
+      || target.type !== "page"
+      || typeof target.webSocketDebuggerUrl !== "string"
+      || target.webSocketDebuggerUrl.length === 0
+      || !Number.isInteger(debugPort)
+      || debugPort < 1
+      || debugPort > 65_535
+      || typeof target.url !== "string") {
+    return false;
+  }
+  let parsed;
+  let websocket;
+  try {
+    parsed = new URL(target.url);
+    websocket = new URL(target.webSocketDebuggerUrl);
+  } catch {
+    return false;
+  }
+  const dashboardPort = Number(parsed.port);
+  return parsed.protocol === "http:"
+    && parsed.hostname === "127.0.0.1"
+    && Number.isInteger(dashboardPort)
+    && dashboardPort >= 1
+    && dashboardPort <= 65_535
+    && parsed.pathname === "/"
+    && parsed.search === ""
+    && parsed.hash === ""
+    && parsed.username === ""
+    && parsed.password === ""
+    && websocket.protocol === "ws:"
+    && websocket.hostname === "127.0.0.1"
+    && websocket.port === String(debugPort)
+    && /^\/devtools\/page\//u.test(websocket.pathname)
+    && websocket.search === ""
+    && websocket.hash === ""
+    && websocket.username === ""
+    && websocket.password === "";
+}
+
+export function selectMacDashboardTarget(targets, debugPort) {
+  if (!Array.isArray(targets)) return undefined;
+  return targets.find((target) => isMacDashboardTarget(target, debugPort));
+}
+
 async function assertShareFlow(cdp) {
   const share = await waitFor(async () => {
     const snapshot = await cdp.evaluate(`(() => {
@@ -1089,7 +1145,7 @@ async function runSmoke(appPath, progress = {}) {
     try {
       target = await waitFor(async () => {
         const targets = await jsonFetch(`http://127.0.0.1:${port}/json`);
-        return targets.find((entry) => entry.type === "page" && entry.webSocketDebuggerUrl);
+        return selectMacDashboardTarget(targets, port);
       }, MAX_STARTUP_MS, "Electron dashboard target");
     } catch {
       fail("ELECTRON_MACOS_SMOKE_DASHBOARD_TARGET_UNAVAILABLE", "dashboard");
