@@ -379,9 +379,18 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /runtime aggregate status/u);
   assert.match(workflow, /runtimeFailureStages/u);
   assert.match(workflow, /runtimeFailureReasons/u);
+  assert.match(workflow, /runtimeFallbackReasons/u);
   assert.match(workflow, /runtime aggregate diagnostics/u);
-  assert.match(workflow, /failureStage = 'unknown'/u);
-  assert.match(workflow, /failureReason = 'unknown'/u);
+  assert.match(workflow, /failureStage = 'control'/u);
+  assert.match(workflow, /failureReason = 'output_read_failed'/u);
+  for (const reason of [
+    "stdout_missing",
+    "stdout_invalid",
+    "stderr_present",
+    "output_read_failed",
+  ]) {
+    assert.match(workflow, new RegExp(`'${reason}'`, "u"));
+  }
   assert.match(workflow, /failureStage -ne 'none'/u);
   assert.match(workflow, /failureReason -ne 'none'/u);
   assert.match(workflow, /runtime aggregate check/u);
@@ -414,11 +423,18 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
     /\*> \$runtime(?:Stdout|Stderr|Raw)Path/u,
     "runtime output must not be merged before parsing",
   );
-  const stderrGate = runtimeStepBody.indexOf("$stderrIsEmpty = Test-Path");
   const stdoutParse = runtimeStepBody.indexOf(
-    "Get-Content -LiteralPath $runtimeStdoutPath -Raw | ConvertFrom-Json",
+    "$runtimeEvidence = $runtimeStdout | ConvertFrom-Json",
   );
-  assert.ok(stderrGate >= 0 && stdoutParse > stderrGate, "stderr must gate parsing");
+  const stderrGate = runtimeStepBody.indexOf("$stderrPresent = $false");
+  assert.ok(stdoutParse >= 0 && stderrGate > stdoutParse, "stdout must be parsed before stderr classification");
+  const stdoutEmptyGate = runtimeStepBody.indexOf("[string]::IsNullOrEmpty($runtimeStdout)");
+  assert.ok(stdoutEmptyGate >= 0 && stdoutEmptyGate < stdoutParse, "empty stdout must be classified before JSON parsing");
+  assert.match(
+    runtimeStepBody,
+    /if \(\$stderrPresent -and \$runtimeEvidence\.status -eq 'passed'\)[\s\S]+?throw 'runtime stderr is present for passed output'/u,
+    "stderr must reject passed output but preserve a valid failed aggregate",
+  );
   assert.doesNotMatch(
     runtimeStepBody,
     /Get-Content -LiteralPath \$runtimeStderrPath/u,
@@ -1836,6 +1852,26 @@ test("Windows Electron qualification receipt rejects incomplete or mismatched ev
     }),
     (error) => error.code === WINDOWS_RECEIPT_STATUS.runtimeInvalid,
   );
+  for (const failureReason of [
+    "stdout_missing",
+    "stdout_invalid",
+    "stderr_present",
+    "output_read_failed",
+  ]) {
+    assert.throws(
+      () => buildWindowsElectronQualificationReceipt({
+        ...fixture,
+        runtimeEvidence: {
+          ...fixture.runtimeEvidence,
+          status: "failed",
+          failureReason,
+          failureStage: "control",
+        },
+      }),
+      (error) => error.code === WINDOWS_RECEIPT_STATUS.runtimeInvalid,
+      `fallback reason ${failureReason} must not satisfy the canonical receipt gate`,
+    );
+  }
   assert.throws(
     () => buildWindowsElectronQualificationReceipt({
       ...fixture,

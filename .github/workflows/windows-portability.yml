@@ -600,6 +600,12 @@ jobs:
             'dash_startup_cancelled',
             'unknown'
           )
+          $runtimeFallbackReasons = @(
+            'stdout_missing',
+            'stdout_invalid',
+            'stderr_present',
+            'output_read_failed'
+          )
           $defaultRuntimeEvidence = [ordered]@{
             artifact = $false
             dashboardReady = $false
@@ -611,12 +617,16 @@ jobs:
             statePersistence = $false
             credentialPersistence = $false
             relaunchPersistence = $false
-            failureStage = 'unknown'
-            failureReason = 'unknown'
+            failureStage = 'control'
+            failureReason = 'output_read_failed'
             status = 'failed'
             target = 'win32-x64'
             contentFree = $true
           }
+          # Keep this fallback reason fixed until the smoke output boundary
+          # has been classified. It is replaced only with one of the
+          # allowlisted, content-free evidence conditions below.
+          $runtimeEvidenceFailureReason = 'output_read_failed'
           function Write-NormalizedRuntimeSummary {
             param([object]$Evidence)
             "### Windows Electron runtime smoke" >> $env:GITHUB_STEP_SUMMARY
@@ -634,14 +644,32 @@ jobs:
           $runtimeExitCode = $LASTEXITCODE
           $runtimeEvidence = $null
           try {
-            $stderrIsEmpty = Test-Path -LiteralPath $runtimeStderrPath -PathType Leaf -ErrorAction Stop
-            if ($stderrIsEmpty) {
-              $stderrIsEmpty = (Get-Item -LiteralPath $runtimeStderrPath -ErrorAction Stop).Length -eq 0
+            $stdoutExists = Test-Path -LiteralPath $runtimeStdoutPath -PathType Leaf -ErrorAction Stop
+            if (-not $stdoutExists) {
+              $runtimeEvidenceFailureReason = 'stdout_missing'
+              throw 'runtime stdout is missing'
             }
-            if (-not $stderrIsEmpty) {
-              throw 'runtime stderr is not empty'
+            $runtimeStdout = $null
+            try {
+              $runtimeStdout = Get-Content -LiteralPath $runtimeStdoutPath -Raw -ErrorAction Stop
+            } catch {
+              $runtimeEvidenceFailureReason = 'output_read_failed'
+              throw
             }
-            $runtimeEvidence = Get-Content -LiteralPath $runtimeStdoutPath -Raw | ConvertFrom-Json
+            if ([string]::IsNullOrEmpty($runtimeStdout)) {
+              $runtimeEvidenceFailureReason = 'stdout_missing'
+              throw 'runtime stdout is empty'
+            }
+            try {
+              $runtimeEvidence = $runtimeStdout | ConvertFrom-Json
+            } catch {
+              $runtimeEvidenceFailureReason = 'stdout_invalid'
+              throw
+            }
+            # Any later shape/status/field failure is still a rejected stdout
+            # aggregate, not a product diagnostic. Keep the classification
+            # fixed and content-free if validation below throws.
+            $runtimeEvidenceFailureReason = 'stdout_invalid'
             $expectedRuntimeKeys = @(
               'artifact',
               'dashboardReady',
@@ -681,6 +709,24 @@ jobs:
                 throw 'runtime aggregate check'
               }
             }
+            $stderrPresent = $false
+            try {
+              $stderrExists = Test-Path -LiteralPath $runtimeStderrPath -PathType Leaf -ErrorAction Stop
+              if (-not $stderrExists) {
+                $runtimeEvidenceFailureReason = 'output_read_failed'
+                throw 'runtime stderr output is unavailable'
+              }
+              $stderrPresent = (Get-Item -LiteralPath $runtimeStderrPath -ErrorAction Stop).Length -gt 0
+            } catch {
+              if ($runtimeEvidenceFailureReason -ne 'output_read_failed') {
+                $runtimeEvidenceFailureReason = 'output_read_failed'
+              }
+              throw
+            }
+            if ($stderrPresent -and $runtimeEvidence.status -eq 'passed') {
+              $runtimeEvidenceFailureReason = 'stderr_present'
+              throw 'runtime stderr is present for passed output'
+            }
             $safeRuntimeEvidence = [ordered]@{}
             foreach ($name in $expectedRuntimeKeys) {
               $safeRuntimeEvidence[$name] = $runtimeEvidence.$name
@@ -692,8 +738,23 @@ jobs:
             )
             $runtimeEvidence = $safeRuntimeEvidence | ConvertTo-Json -Compress | ConvertFrom-Json
           } catch {
-            # Keep the pre-written all-false aggregate. No raw smoke output,
+            # Rewrite only the closed aggregate reason. No raw smoke output,
             # path, command, process id, or exception text is retained.
+            if ($runtimeFallbackReasons -notcontains $runtimeEvidenceFailureReason) {
+              $runtimeEvidenceFailureReason = 'output_read_failed'
+            }
+            $defaultRuntimeEvidence.failureStage = 'control'
+            $defaultRuntimeEvidence.failureReason = $runtimeEvidenceFailureReason
+            try {
+              [IO.File]::WriteAllText(
+                $runtimeEvidencePath,
+                "$($defaultRuntimeEvidence | ConvertTo-Json -Compress)`n",
+                [Text.UTF8Encoding]::new($false)
+              )
+            } catch {
+              # The original prewritten aggregate remains the only retained
+              # evidence if this bounded rewrite cannot be completed.
+            }
             Write-NormalizedRuntimeSummary -Evidence $defaultRuntimeEvidence
             Remove-VerifiedRuntimeTransientOutput
             Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_EVIDENCE_INVALID'
