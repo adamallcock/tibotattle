@@ -1934,6 +1934,17 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
       0,
     );
     assert.equal(
+      snapshot.overview.accounting.cacheContinuityImpact
+        .outcomeDisplayMaximumGapSeconds,
+      604_800,
+    );
+    assert.equal(
+      Object.keys(
+        snapshot.overview.accounting.cacheContinuityImpact.byOutcomeBucket,
+      ).length,
+      10,
+    );
+    assert.equal(
       snapshot.overview.accounting.cacheContinuityImpact.cacheReadDrops,
       0,
     );

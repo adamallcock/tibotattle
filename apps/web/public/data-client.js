@@ -2317,6 +2317,7 @@ const CACHE_SWITCH_RECENT_LIMIT = 20;
 const CACHE_SWITCH_PROXIMITY_CEILING_SECONDS = 300;
 const CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO = 0.5;
 const CACHE_CONTINUITY_MINIMUM_GAP_SECONDS = 0;
+const CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_SECONDS = 7 * 24 * 60 * 60;
 const CACHE_CONTINUITY_GAP_BANDS = Object.freeze({
   under_one_minute: [0, 60],
   one_to_five_minutes: [60, 300],
@@ -2329,6 +2330,37 @@ const CACHE_CONTINUITY_GAP_BANDS = Object.freeze({
 const CACHE_CONTINUITY_GAP_BAND_IDS = Object.freeze(
   Object.keys(CACHE_CONTINUITY_GAP_BANDS)
 );
+const CACHE_CONTINUITY_OUTCOME_BUCKETS = Object.freeze({
+  under_one_minute: [0, 60],
+  one_to_two_minutes: [60, 120],
+  two_to_five_minutes: [120, 300],
+  five_to_ten_minutes: [300, 600],
+  ten_to_thirty_minutes: [600, 1_800],
+  thirty_minutes_to_one_hour: [1_800, 3_600],
+  one_to_six_hours: [3_600, 21_600],
+  six_to_twenty_four_hours: [21_600, 86_400],
+  one_to_three_days: [86_400, 259_200],
+  over_three_days: [259_200, null]
+});
+const CACHE_CONTINUITY_OUTCOME_BUCKET_IDS = Object.freeze(
+  Object.keys(CACHE_CONTINUITY_OUTCOME_BUCKETS)
+);
+const CACHE_CONTINUITY_BREAKDOWN_FIELDS = Object.freeze([
+  "sameConfigurationReturns",
+  "comparableReturns",
+  "compactionConfoundedReturns",
+  "contextContractedReturns",
+  "insufficientEvidenceReturns",
+  "uncoveredReturns",
+  "reusedMoreThanHalfReturns",
+  "reusedHalfOrLessReturns",
+  "matchedOrExceededReturns",
+  "reusedBetweenHalfAndPreviousReturns",
+  "cacheReadDrops",
+  "lostCacheTokens",
+  "pricedDrops",
+  "unpricedDrops"
+]);
 const SIDE_CHAT_ESTIMATE_SCHEMA_VERSION =
   "development-side-chat-estimate-v0.4";
 const SIDE_CHAT_ESTIMATE_PARSER_VERSION =
@@ -2945,23 +2977,15 @@ function normalizeCacheSwitchImpact(value) {
 }
 
 function normalizeCacheContinuityBreakdown(value, includeOrderingCoverage = false) {
-  const fields = [
-    "sameConfigurationReturns",
-    "comparableReturns",
-    "compactionConfoundedReturns",
-    "contextContractedReturns",
-    "insufficientEvidenceReturns",
-    "uncoveredReturns",
-    "cacheReadDrops",
-    "lostCacheTokens",
-    "pricedDrops",
-    "unpricedDrops"
-  ];
-  const normalized = Object.fromEntries(fields.map((field) => [
-    field,
-    count(value?.[field], null)
-  ]));
-  if (fields.some((field) => normalized[field] === null)) return null;
+  const normalized = Object.fromEntries(
+    CACHE_CONTINUITY_BREAKDOWN_FIELDS.map((field) => [
+      field,
+      count(value?.[field], null)
+    ])
+  );
+  if (CACHE_CONTINUITY_BREAKDOWN_FIELDS.some(
+    (field) => normalized[field] === null
+  )) return null;
   const orderingCoverageGaps = includeOrderingCoverage
     ? count(value?.orderingCoverageGaps, 0)
     : 0;
@@ -2978,6 +3002,12 @@ function normalizeCacheContinuityBreakdown(value, includeOrderingCoverage = fals
   if (!new Set(["complete", "incomplete"]).has(coverageStatus)
       || partition !== normalized.sameConfigurationReturns
       || normalized.cacheReadDrops > normalized.comparableReturns
+      || normalized.reusedMoreThanHalfReturns
+        + normalized.reusedHalfOrLessReturns !== normalized.comparableReturns
+      || normalized.matchedOrExceededReturns
+        + normalized.reusedBetweenHalfAndPreviousReturns
+          !== normalized.reusedMoreThanHalfReturns
+      || normalized.cacheReadDrops !== normalized.reusedHalfOrLessReturns
       || normalized.pricedDrops + normalized.unpricedDrops
         !== normalized.cacheReadDrops
       || (normalized.cacheReadDrops === 0 && normalized.lostCacheTokens !== 0)
@@ -3065,18 +3095,7 @@ function normalizeCacheContinuitySummary(value) {
   ]);
   if (byGapBandRows.some(([, row]) => row === null)) return null;
   const byGapBand = Object.fromEntries(byGapBandRows);
-  for (const field of [
-    "sameConfigurationReturns",
-    "comparableReturns",
-    "compactionConfoundedReturns",
-    "contextContractedReturns",
-    "insufficientEvidenceReturns",
-    "uncoveredReturns",
-    "cacheReadDrops",
-    "lostCacheTokens",
-    "pricedDrops",
-    "unpricedDrops"
-  ]) {
+  for (const field of CACHE_CONTINUITY_BREAKDOWN_FIELDS) {
     if (CACHE_CONTINUITY_GAP_BAND_IDS.reduce(
       (sum, key) => sum + byGapBand[key][field],
       0
@@ -3085,6 +3104,34 @@ function normalizeCacheContinuitySummary(value) {
   if (totals.estimatedPremiumUsd !== null) {
     const premiumSum = CACHE_CONTINUITY_GAP_BAND_IDS.reduce(
       (sum, key) => sum + byGapBand[key].estimatedPremiumUsd,
+      0
+    );
+    if (Math.abs(premiumSum - totals.estimatedPremiumUsd) > 1e-9) return null;
+  }
+  const byOutcomeBucketRows = CACHE_CONTINUITY_OUTCOME_BUCKET_IDS.map((key) => {
+    const bounds = CACHE_CONTINUITY_OUTCOME_BUCKETS[key];
+    const valueBucket = value?.byOutcomeBucket?.[key];
+    const summary = normalizeCacheContinuityBreakdown(valueBucket);
+    const startSeconds = finite(valueBucket?.startSeconds, null);
+    const endSeconds = valueBucket?.endSeconds === null
+      ? null
+      : finite(valueBucket?.endSeconds, null);
+    if (summary === null
+        || startSeconds !== bounds[0]
+        || endSeconds !== bounds[1]) return [key, null];
+    return [key, { startSeconds, endSeconds, ...summary }];
+  });
+  if (byOutcomeBucketRows.some(([, row]) => row === null)) return null;
+  const byOutcomeBucket = Object.fromEntries(byOutcomeBucketRows);
+  for (const field of CACHE_CONTINUITY_BREAKDOWN_FIELDS) {
+    if (CACHE_CONTINUITY_OUTCOME_BUCKET_IDS.reduce(
+      (sum, key) => sum + byOutcomeBucket[key][field],
+      0
+    ) !== totals[field]) return null;
+  }
+  if (totals.estimatedPremiumUsd !== null) {
+    const premiumSum = CACHE_CONTINUITY_OUTCOME_BUCKET_IDS.reduce(
+      (sum, key) => sum + byOutcomeBucket[key].estimatedPremiumUsd,
       0
     );
     if (Math.abs(premiumSum - totals.estimatedPremiumUsd) > 1e-9) return null;
@@ -3104,6 +3151,7 @@ function normalizeCacheContinuitySummary(value) {
     postCompactionRequests,
     postCompactionCacheReadDrops,
     byGapBand,
+    byOutcomeBucket,
     recent: normalizeCacheContinuityRecent(value?.recent, totals.cacheReadDrops),
     allowanceImpact: normalizeCacheSwitchAllowanceImpact(value?.allowanceImpact)
   };
@@ -3123,6 +3171,10 @@ function unavailableCacheContinuityImpact(errorCode = null) {
     contextContractedReturns: 0,
     insufficientEvidenceReturns: 0,
     uncoveredReturns: 0,
+    reusedMoreThanHalfReturns: 0,
+    reusedHalfOrLessReturns: 0,
+    matchedOrExceededReturns: 0,
+    reusedBetweenHalfAndPreviousReturns: 0,
     orderingCoverageGaps: 0,
     coverageStatus: "incomplete",
     cacheReadDrops: 0,
@@ -3135,10 +3187,13 @@ function unavailableCacheContinuityImpact(errorCode = null) {
     postCompactionRequests: 0,
     postCompactionCacheReadDrops: 0,
     byGapBand: {},
+    byOutcomeBucket: {},
     recent: [],
     allowanceImpact: unavailableAllowanceImpact(),
     minimumGapSeconds: CACHE_CONTINUITY_MINIMUM_GAP_SECONDS,
     maximumRetainedCacheRatio: CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
+    outcomeDisplayMaximumGapSeconds:
+      CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_SECONDS,
     recentDetailLimit: CACHE_SWITCH_RECENT_LIMIT,
     periods: []
   };
@@ -3152,6 +3207,8 @@ function normalizeCacheContinuityImpact(value) {
       !== CACHE_CONTINUITY_MINIMUM_GAP_SECONDS
       || finite(value.maximumRetainedCacheRatio, null)
         !== CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO
+      || finite(value.outcomeDisplayMaximumGapSeconds, null)
+        !== CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_SECONDS
       || count(value.recentDetailLimit, null) !== CACHE_SWITCH_RECENT_LIMIT) {
     return unavailableCacheContinuityImpact("methodology_mismatch");
   }
@@ -3171,6 +3228,8 @@ function normalizeCacheContinuityImpact(value) {
           : unavailableAllowanceImpact("period_denominator_mismatch"),
         minimumGapSeconds: CACHE_CONTINUITY_MINIMUM_GAP_SECONDS,
         maximumRetainedCacheRatio: CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
+        outcomeDisplayMaximumGapSeconds:
+          CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_SECONDS,
         recentDetailLimit: CACHE_SWITCH_RECENT_LIMIT,
         periods: []
       }];
@@ -3193,6 +3252,8 @@ function normalizeCacheContinuityImpact(value) {
       : unavailableAllowanceImpact("period_denominator_mismatch"),
     minimumGapSeconds: CACHE_CONTINUITY_MINIMUM_GAP_SECONDS,
     maximumRetainedCacheRatio: CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
+    outcomeDisplayMaximumGapSeconds:
+      CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_SECONDS,
     recentDetailLimit: CACHE_SWITCH_RECENT_LIMIT,
     periods
   };
