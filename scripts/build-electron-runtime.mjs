@@ -80,14 +80,39 @@ const NATIVE_PATH_MODULE = Object.freeze({
 });
 export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
   "apps/electron/companion-supervisor.js",
+  "apps/electron/desktop-command.js",
+  "apps/electron/desktop-contract.js",
+  "apps/electron/desktop-deep-links.js",
+  "apps/electron/desktop-controller.js",
+  "apps/electron/desktop-copy.js",
+  "apps/electron/desktop-first-run.js",
+  "apps/electron/desktop-first-run-login.js",
+  "apps/electron/desktop-hosted-signin.js",
+  "apps/electron/desktop-recovery-settings.js",
+  "apps/electron/desktop-ipc.js",
+  "apps/electron/desktop-owned-downloads.js",
+  "apps/electron/desktop-menu.js",
   "apps/electron/desktop-lifecycle.js",
+  "apps/electron/desktop-notification-coordinator.js",
+  "apps/electron/desktop-notification-delivery.js",
+  "apps/electron/desktop-notification-policy.js",
+  "apps/electron/desktop-platform-services.js",
+  "apps/electron/desktop-runtime.js",
+  "apps/electron/desktop-settings-backends.js",
+  "apps/electron/desktop-settings-store.js",
+  "apps/electron/desktop-tray.js",
+  "apps/electron/desktop-status-monitor.js",
+  "apps/electron/desktop-tray-status.js",
   "apps/electron/errors.js",
   "apps/electron/loopback-policy.js",
   "apps/electron/main.js",
   "apps/electron/platform-gate.js",
-  "apps/electron/preload.js",
+  "apps/electron/preload.cjs",
+  "apps/electron/recovery-preload.cjs",
+  "apps/electron/recovery-window.js",
   "apps/electron/ready-line.js",
   "apps/electron/windows-qualification.js",
+  "src/desktop-shell-status.js",
   "src/platform/windows-credential-manager-probe.js",
 ]);
 // Existing outputs are authenticated against their own complete manifest and
@@ -101,7 +126,7 @@ const ELECTRON_SHELL_IDENTITY_FILES = Object.freeze([
   "apps/electron/loopback-policy.js",
   "apps/electron/main.js",
   "apps/electron/platform-gate.js",
-  "apps/electron/preload.js",
+  "apps/electron/preload.cjs",
   "apps/electron/ready-line.js",
 ]);
 const READ_ONLY_FLAG = fileSystemConstants.O_RDONLY ?? 0;
@@ -1091,14 +1116,26 @@ export async function buildElectronRuntime({
     const runtimeGraph = await collectMacOSRuntimeGraph();
     const webGraph = await collectMacOSWebModuleGraph();
     const staged = [];
+    const stagedRepositoryPaths = new Set();
+    const stageUniqueRepositoryFile = async (options) => {
+      const selected = normalizeRelativePath(options.relativePath, "staged path");
+      if (stagedRepositoryPaths.has(selected)) return null;
+      const result = await stageRepositoryFile({
+        ...options,
+        relativePath: selected,
+      });
+      stagedRepositoryPaths.add(selected);
+      return result;
+    };
     for (const relativePath of runtimeGraph.relativeFiles) {
       if (relativePath === "package.json") continue;
-      staged.push(await stageRepositoryFile({
+      const result = await stageUniqueRepositoryFile({
         repositoryRoot: REPOSITORY_ROOT,
         stagingRoot: temporaryRoot,
         relativePath,
         kind: SOURCE_FILE_KIND,
-      }));
+      });
+      if (result) staged.push(result);
     }
     const webFiles = new Set([
       ...webGraph.relativeFiles,
@@ -1106,22 +1143,24 @@ export async function buildElectronRuntime({
         `apps/web/public/${file}`),
     ]);
     for (const relativePath of [...webFiles].sort(comparePathBytes)) {
-      staged.push(await stageRepositoryFile({
+      const result = await stageUniqueRepositoryFile({
         repositoryRoot: REPOSITORY_ROOT,
         stagingRoot: temporaryRoot,
         relativePath,
         kind: WEB_FILE_KIND,
-      }));
+      });
+      if (result) staged.push(result);
     }
 
     if (includeElectronShell) {
       for (const relativePath of ELECTRON_SHELL_RUNTIME_FILES) {
-        staged.push(await stageRepositoryFile({
+        const result = await stageUniqueRepositoryFile({
           repositoryRoot: REPOSITORY_ROOT,
           stagingRoot: temporaryRoot,
           relativePath,
           kind: ELECTRON_SHELL_KIND,
-        }));
+        });
+        if (result) staged.push(result);
       }
     }
 

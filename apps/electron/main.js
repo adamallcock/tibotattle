@@ -1,8 +1,8 @@
-import { dirname, join, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { createCompanionSupervisor } from "./companion-supervisor.js";
-import { createDesktopLifecycle } from "./desktop-lifecycle.js";
+import { launchDesktopRuntime } from "./desktop-runtime.js";
+import { resolveDesktopTrayIcon } from "./desktop-tray.js";
 import { ELECTRON_ENTRY_FAILURE_DIAGNOSTIC, shellError } from "./errors.js";
 import { assertElectronPlatformGate } from "./platform-gate.js";
 import {
@@ -17,7 +17,6 @@ import {
 const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_COMPANION_SCRIPT = resolve(MODULE_DIRECTORY, "../local/server.js");
 const DEFAULT_RESOURCE_ROOT = resolve(MODULE_DIRECTORY, "../..");
-const DEFAULT_COMPANION_STATE_DIRECTORY = "companion-state";
 const ELECTRON_SMOKE_CONTROL = "quit-v1";
 const WINDOWS_ELECTRON_SMOKE_CONTROL = "windows-v1";
 const WINDOWS_ELECTRON_SMOKE_MESSAGE_TYPE = "windows-electron-smoke-v1";
@@ -65,15 +64,6 @@ function packagedResourcesPath(app, appPath, resourcesPath) {
   return appPath === null ? null : dirname(appPath);
 }
 
-function companionStateRoot(app, environment) {
-  if (Object.hasOwn(environment, "USAGE_MONITOR_STATE_ROOT")) {
-    return environment.USAGE_MONITOR_STATE_ROOT;
-  }
-  const userData = app?.getPath?.("userData");
-  if (typeof userData !== "string" || userData.length === 0) return undefined;
-  return join(resolve(userData), DEFAULT_COMPANION_STATE_DIRECTORY);
-}
-
 function resolveCompanionLaunchPaths({
   app,
   companionScript,
@@ -116,6 +106,9 @@ export function assertElectronQualificationLaunchOptions({
   resourcesPath,
   supervisorOptions = {},
   lifecycleOptions = {},
+  firstRunReceiptBackend,
+  ownedDownloadsRegistry,
+  notificationBackend,
 } = {}) {
   if (qualificationContext === null) return;
   assertWindowsElectronQualificationContext({
@@ -126,6 +119,9 @@ export function assertElectronQualificationLaunchOptions({
   if (companionScript !== undefined
       || resourceRoot !== undefined
       || resourcesPath !== undefined
+      || firstRunReceiptBackend !== undefined
+      || ownedDownloadsRegistry !== undefined
+      || notificationBackend !== undefined
       || supervisorOptions === null
       || typeof supervisorOptions !== "object"
       || Array.isArray(supervisorOptions)
@@ -366,6 +362,9 @@ export async function launchElectronShell({
   environment = process.env,
   supervisorOptions = {},
   lifecycleOptions = {},
+  firstRunReceiptBackend,
+  ownedDownloadsRegistry,
+  notificationBackend,
   emitFailureDiagnostic = false,
   writeDiagnostic,
 } = {}) {
@@ -386,6 +385,9 @@ export async function launchElectronShell({
       resourcesPath,
       supervisorOptions,
       lifecycleOptions,
+      firstRunReceiptBackend,
+      ownedDownloadsRegistry,
+      notificationBackend,
     });
     const paths = resolveCompanionLaunchPaths({
       app,
@@ -398,41 +400,41 @@ export async function launchElectronShell({
       architecture: process.arch,
       qualificationContext,
     });
-    const supervisor = createCompanionSupervisor({
-      command: process.execPath,
-      args: [paths.companionScript],
-      cwd: paths.companionCwd,
+    const desktop = await launchDesktopRuntime({
+      runtime: {
+        ...runtime,
+        icon: resolveDesktopTrayIcon({
+          nativeImage: runtime.nativeImage,
+          resourceRoot: paths.resourceRoot,
+          platform: process.platform,
+        }),
+      },
+      app,
+      paths: {
+        ...paths,
+        preloadPath: resolve(MODULE_DIRECTORY, "preload.cjs"),
+      },
       environment: {
         ...environment,
         USAGE_MONITOR_RESOURCE_ROOT: paths.resourceRoot,
-        ...(Object.hasOwn(environment, "USAGE_MONITOR_STATE_ROOT")
-          ? {}
-          : (() => {
-            const selectedStateRoot = companionStateRoot(app, environment);
-            return selectedStateRoot === undefined
-              ? {}
-              : { USAGE_MONITOR_STATE_ROOT: selectedStateRoot };
-          })()),
       },
-      ...supervisorOptions,
+      supervisorOptions,
+      lifecycleOptions: {
+        appName: isPackagedElectronApp(app) ? "TiboTattle Dev" : "TiboTattle",
+        ...lifecycleOptions,
+      },
+      firstRunReceiptBackend,
+      ownedDownloadsRegistry,
+      notificationBackend,
+      qualificationContext,
+      platform: process.platform,
+      architecture: process.arch,
     });
-    const lifecycle = createDesktopLifecycle({
-      app,
-      BrowserWindow: runtime.BrowserWindow,
-      Tray: runtime.Tray,
-      Menu: runtime.Menu,
-      icon: runtime.nativeImage?.createEmpty?.(),
-      preloadPath: resolve(MODULE_DIRECTORY, "preload.js"),
-      supervisor,
-      appName: isPackagedElectronApp(app) ? "TiboTattle Dev" : "TiboTattle",
-      ...lifecycleOptions,
-    });
-    await lifecycle.start();
-    installWindowsSmokeControl(lifecycle, {
+    installWindowsSmokeControl(desktop.lifecycle, {
       environment,
       qualificationContext,
     });
-    return lifecycle;
+    return desktop.lifecycle;
   } catch (error) {
     // This includes platform-gate and dependency/configuration failures that
     // occur before the lifecycle owns a shutdown path.
@@ -452,7 +454,8 @@ if (process.versions.electron) {
       // control test-only, opt-in, and out of the renderer/preload boundary.
       // SIGUSR2 is not installed on Windows, so this cannot become a Windows
       // production contract by accident.
-      if (process.platform !== "win32"
+      if (lifecycle !== null
+          && process.platform !== "win32"
           && process.env.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL === ELECTRON_SMOKE_CONTROL) {
         process.once("SIGUSR2", () => {
           void lifecycle.requestQuit().catch(() => {

@@ -304,6 +304,75 @@ async function connectCdp(target) {
   });
 }
 
+function assertRendererShellSnapshot(snapshot) {
+  if (snapshot?.topbar !== true) fail("Electron Linux top bar is not visible");
+  if (snapshot?.sidebar !== true) fail("Electron Linux sidebar is not visible");
+  if (snapshot?.navCount !== 5) fail("Electron Linux navigation count is invalid");
+  if (snapshot?.activeLinkCount !== 1) fail("Electron Linux active navigation is invalid");
+  if (snapshot?.activePageCount !== 1) fail("Electron Linux active page is invalid");
+  if (snapshot?.refresh !== true) fail("Electron Linux refresh control is missing");
+  if (snapshot?.language !== true) fail("Electron Linux language control is missing");
+}
+
+async function assertRendererShell(cdp) {
+  const snapshot = await cdp.evaluate(`(() => {
+    const visible = (element) => {
+      if (!element) return false;
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none"
+        && style.visibility !== "hidden"
+        && rect.width > 0
+        && rect.height > 0;
+    };
+    const navLinks = [...document.querySelectorAll("[data-nav]")];
+    return {
+      topbar: visible(document.querySelector(".topbar")),
+      sidebar: visible(document.querySelector(".dashboard-sidebar")),
+      navCount: navLinks.length,
+      activeLinkCount: navLinks.filter((link) =>
+        link.classList.contains("active")
+        && link.getAttribute("aria-current") === "page",
+      ).length,
+      activePageCount: document.querySelectorAll(
+        ".dashboard-section[data-dashboard-page]:not(.dashboard-page-inactive)",
+      ).length,
+      refresh: Boolean(document.querySelector("#refresh-button")),
+      language: Boolean(document.querySelector("[data-language-picker]")),
+    };
+  })()`);
+  assertRendererShellSnapshot(snapshot);
+
+  const trends = await cdp.evaluate(`(() => {
+    const trendsLink = document.querySelector('[data-nav="trends"]');
+    const trendsPage = document.querySelector(
+      '[data-dashboard-page="trends"].dashboard-section',
+    );
+    const overviewPage = document.querySelector(
+      '[data-dashboard-page="overview"].dashboard-section',
+    );
+    trendsLink?.click();
+    return {
+      activeLink: trendsLink?.classList.contains("active") === true
+        && trendsLink?.getAttribute("aria-current") === "page",
+      activePage: trendsPage?.classList.contains("dashboard-page-inactive") === false
+        && trendsPage?.inert === false
+        && trendsPage?.hasAttribute("aria-hidden") === false,
+      previousPageInactive: overviewPage?.classList.contains("dashboard-page-inactive") === true
+        && overviewPage?.inert === true
+        && overviewPage?.getAttribute("aria-hidden") === "true",
+      activePageCount: document.querySelectorAll(
+        ".dashboard-section[data-dashboard-page]:not(.dashboard-page-inactive)",
+      ).length,
+    };
+  })()`);
+  if (trends?.activeLink !== true) fail("Electron Linux Trends navigation is inactive");
+  if (trends?.activePage !== true) fail("Electron Linux Trends page is inactive");
+  if (trends?.previousPageInactive !== true) fail("Electron Linux previous page remains active");
+  if (trends?.activePageCount !== 1) fail("Electron Linux Trends page count is invalid");
+  await cdp.evaluate(`document.querySelector('[data-nav="overview"]')?.click()`);
+}
+
 async function runSmoke() {
   const containerContract = assertContainerContract();
   const fixture = await createSyntheticHome();
@@ -419,6 +488,7 @@ async function runSmoke() {
     if (remoteResources.some((resource) => new URL(resource).origin !== dashboardUrl.origin)) {
       fail("renderer requested a non-loopback resource");
     }
+    await assertRendererShell(cdp);
 
     const descendantsAtReady = descendantsOf(child.pid);
     if (descendantsAtReady.length < 1) fail("Electron had no companion descendant after readiness");
@@ -429,6 +499,7 @@ async function runSmoke() {
       MAX_STARTUP_MS,
       "dashboard reload readiness",
     );
+    await assertRendererShell(cdp);
     if (networkEvidenceInvalid
         || observedNetworkUrls.some((url) => !isAllowedRendererNetworkURL(url, dashboardUrl.origin))) {
       fail("renderer attempted a non-loopback network request");

@@ -23,6 +23,9 @@ import {
   createDesktopLifecycle,
 } from "../desktop-lifecycle.js";
 import {
+  DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
+} from "../desktop-first-run.js";
+import {
   assertElectronQualificationLaunchOptions,
   installWindowsSmokeControl,
   installWindowsSmokeControlForTest,
@@ -43,6 +46,7 @@ import {
 import {
   createLoopbackNavigationPolicy,
   installLoopbackNavigationPolicy,
+  isAllowedCompanionBlobDownload,
   isAllowedCompanionURL,
 } from "../loopback-policy.js";
 import {
@@ -104,14 +108,40 @@ async function withWindowsQualificationFixture(run) {
   })}\n`);
   const runtimeSourcePaths = [
     "apps/electron/companion-supervisor.js",
+    "apps/electron/desktop-command.js",
+    "apps/electron/desktop-contract.js",
+    "apps/electron/desktop-deep-links.js",
+    "apps/electron/desktop-controller.js",
+    "apps/electron/desktop-copy.js",
+    "apps/electron/desktop-first-run.js",
+    "apps/electron/desktop-first-run-login.js",
+    "apps/electron/desktop-hosted-signin.js",
+    "apps/electron/desktop-recovery-settings.js",
+    "apps/electron/desktop-ipc.js",
+    "apps/electron/desktop-owned-downloads.js",
     "apps/electron/desktop-lifecycle.js",
+    "apps/electron/desktop-notification-coordinator.js",
+    "apps/electron/desktop-notification-delivery.js",
+    "apps/electron/desktop-notification-policy.js",
+    "apps/electron/desktop-platform-services.js",
+    "apps/electron/desktop-runtime.js",
+    "apps/electron/desktop-settings-backends.js",
+    "apps/electron/desktop-settings-store.js",
+    "apps/electron/desktop-menu.js",
+    "apps/electron/desktop-tray.js",
+    "apps/electron/desktop-status-monitor.js",
+    "apps/electron/desktop-tray-status.js",
     "apps/electron/errors.js",
     "apps/electron/loopback-policy.js",
     "apps/electron/main.js",
     "apps/electron/platform-gate.js",
-    "apps/electron/preload.js",
+    "apps/electron/preload.cjs",
+    "apps/electron/recovery-preload.cjs",
+    "apps/electron/recovery-window.js",
     "apps/electron/ready-line.js",
     "apps/electron/windows-qualification.js",
+    "src/desktop-shell-status.js",
+    "src/platform/windows-credential-manager-probe.js",
     "apps/local/server.js",
     "apps/web/public/index.html",
   ];
@@ -278,6 +308,8 @@ class FakeApp extends EventEmitter {
 class FakeWebContents extends EventEmitter {
   constructor() {
     super();
+    this.mainFrame = { isMainFrame: true, parent: null };
+    this.sent = [];
     this.session = {
       setPermissionRequestHandler: (handler) => {
         this.permissionHandler = handler;
@@ -297,6 +329,10 @@ class FakeWebContents extends EventEmitter {
 
   setWindowOpenHandler(handler) {
     this.windowOpenHandler = handler;
+  }
+
+  send(channel, command) {
+    this.sent.push({ channel, command });
   }
 }
 
@@ -338,6 +374,42 @@ class FakeWindow extends EventEmitter {
   }
 }
 
+function downloadSession() {
+  const session = new EventEmitter();
+  session.setPermissionRequestHandler = () => {};
+  session.setPermissionCheckHandler = () => {};
+  session.webRequest = {
+    onBeforeRequest() {},
+  };
+  return session;
+}
+
+class DownloadSessionWindow extends FakeWindow {
+  constructor(options) {
+    super(options);
+    this.webContents.session = downloadSession();
+    this.webContents.getURL = () => this.loaded.at(-1) ?? "";
+  }
+}
+
+class LifecycleDownloadItem extends EventEmitter {
+  constructor() {
+    super();
+    this.url = "blob:http://127.0.0.1:4001/4a4e02e8-2cbf-4dfb-bb2a-4f6e4c0efb90";
+    this.mime = "image/png";
+    this.filename = "tibotattle-results-TT-012345.png";
+    this.savePath = null;
+    this.cancelled = false;
+  }
+
+  getURL() { return this.url; }
+  getMimeType() { return this.mime; }
+  getFilename() { return this.filename; }
+  setSavePath(value) { this.savePath = value; }
+  cancel() { this.cancelled = true; }
+  finish(state) { this.emit("done", {}, state); }
+}
+
 class FakeTray extends EventEmitter {
   constructor(icon) {
     super();
@@ -357,6 +429,12 @@ class FakeTray extends EventEmitter {
   destroy() {
     this.destroyed = true;
   }
+}
+
+function dashboardWindowsForTest(windows) {
+  return windows.filter((candidate) => (
+    candidate.options?.webPreferences?.preload === "/private/preload.cjs"
+  ));
 }
 
 test("ready-line parser accepts only the fixed loopback contract", () => {
@@ -474,6 +552,59 @@ test("loopback policy installs exact navigation handlers and removable listeners
   prevented = false;
   webContents.emit("will-navigate", { preventDefault() { prevented = true; } }, "https://example.test/");
   assert.equal(prevented, false);
+});
+
+test("loopback session admits only the dashboard same-origin Blob download", () => {
+  const origin = "http://127.0.0.1:3456";
+  const blob = `blob:${origin}/4a4e02e8-2cbf-4dfb-bb2a-4f6e4c0efb90`;
+  const session = {
+    setPermissionRequestHandler() {},
+    setPermissionCheckHandler() {},
+    webRequest: {
+      onBeforeRequest(filter, listener) {
+        this.filter = filter;
+        this.listener = listener;
+      },
+    },
+  };
+  const dashboard = new FakeWebContents();
+  dashboard.id = 41;
+  const settings = new FakeWebContents();
+  settings.id = 42;
+  const dashboardInstall = installLoopbackNavigationPolicy({
+    webContents: dashboard,
+    session,
+    policy: createLoopbackNavigationPolicy({ origin }),
+    allowBlobDownloads: true,
+  });
+  const settingsInstall = installLoopbackNavigationPolicy({
+    webContents: settings,
+    session,
+    policy: createLoopbackNavigationPolicy({ origin }),
+  });
+  const download = {
+    url: blob,
+    method: "GET",
+    resourceType: "other",
+    webContentsId: dashboard.id,
+  };
+  const decisions = [];
+  const request = (details) => session.webRequest.listener(details, (value) => decisions.push(value));
+  assert.equal(isAllowedCompanionBlobDownload(download, origin, dashboard.id), true);
+  request(download);
+  request({ ...download, webContentsId: settings.id });
+  request({ ...download, url: "blob:http://127.0.0.1:3457/id" });
+  request({ ...download, url: "blob:https://evil.example/id" });
+  request({ ...download, resourceType: "image" });
+  assert.deepEqual(decisions, [
+    { cancel: false },
+    { cancel: true },
+    { cancel: true },
+    { cancel: true },
+    { cancel: true },
+  ]);
+  settingsInstall.remove();
+  dashboardInstall.remove();
 });
 
 test("companion supervisor owns one child, injects a parent contract, and strips child output", async () => {
@@ -1019,6 +1150,8 @@ test("Windows qualification forbids launch-path and supervisor overrides", async
       { companionScript: "C:\\forged\\server.js" },
       { resourceRoot: "C:\\forged\\resources" },
       { resourcesPath: "C:\\forged\\resources" },
+      { ownedDownloadsRegistry: {} },
+      { notificationBackend: {} },
       { supervisorOptions: { command: "forged.exe" } },
       { lifecycleOptions: { appName: "Forged" } },
     ]) {
@@ -1257,45 +1390,217 @@ test("desktop lifecycle composes secure window, tray, single instance, retry, an
     },
     Menu: { buildFromTemplate: (template) => ({ template }) },
     icon: "empty-icon",
-    preloadPath: "/private/preload.js",
+    preloadPath: "/private/preload.cjs",
     supervisor,
   });
   const started = await lifecycle.start();
   assert.deepEqual(started, { status: "ready", origin: "http://127.0.0.1:4001" });
   assert.equal(app.lockCalls, 1);
   assert.equal(app.readyCalls, 1);
-  assert.equal(windows.length, 1);
+  assert.equal(windows.length, 2);
+  const dashboard = () => windows.find((candidate) => (
+    candidate.options.webPreferences.preload === "/private/preload.cjs"
+  ));
+  const firstDashboard = dashboard();
   assert.equal(trays.length, 1);
   assert.equal(trays[0].menu.template.some((item) => item.label === "Retry"), true);
-  assert.equal(windows[0].options.webPreferences.nodeIntegration, false);
-  assert.equal(windows[0].options.webPreferences.contextIsolation, true);
-  assert.equal(windows[0].options.webPreferences.sandbox, true);
-  assert.equal(windows[0].options.webPreferences.preload, "/private/preload.js");
-  assert.deepEqual(windows[0].loaded, ["http://127.0.0.1:4001/"]);
-  windows[0].emit("ready-to-show");
-  assert.equal(windows[0].visible, true);
+  assert.equal(firstDashboard.options.webPreferences.nodeIntegration, false);
+  assert.equal(firstDashboard.options.webPreferences.contextIsolation, true);
+  assert.equal(firstDashboard.options.webPreferences.sandbox, true);
+  assert.equal(firstDashboard.options.webPreferences.preload, "/private/preload.cjs");
+  assert.deepEqual(firstDashboard.loaded, ["http://127.0.0.1:4001/"]);
+  firstDashboard.emit("ready-to-show");
+  assert.equal(firstDashboard.visible, true);
   assert.equal(lifecycle.state.windowVisible, true);
-  trays[0].menu.template.find((item) => item.label === "Hide TiboTattle").click();
+  trays[0].emit("click");
   assert.equal(lifecycle.state.windowVisible, false);
-  trays[0].menu.template.find((item) => item.label === "Show TiboTattle").click();
+  trays[0].menu.template.find((item) => item.label === "Open TiboTattle").click();
   assert.equal(lifecycle.state.windowVisible, true);
   trays[0].emit("click");
   assert.equal(lifecycle.state.windowVisible, false);
   trays[0].emit("click");
   assert.equal(lifecycle.state.windowVisible, true);
-  windows[0].emit("close", { preventDefault() {} });
-  assert.equal(windows[0].visible, false);
+  firstDashboard.emit("close", { preventDefault() {} });
+  assert.equal(firstDashboard.visible, false);
   assert.equal(lifecycle.state.windowVisible, false);
   app.emit("second-instance");
-  assert.equal(windows[0].visible, true);
+  assert.equal(firstDashboard.visible, true);
   await lifecycle.retry();
   assert.equal(supervisor.starts, 2);
   assert.equal(supervisor.stops, 1);
-  assert.equal(windows.length, 2);
-  assert.deepEqual(windows[1].loaded, ["http://127.0.0.1:4002/"]);
+  assert.equal(windows.length, 4);
+  const secondDashboard = dashboardWindowsForTest(windows)[1];
+  assert.deepEqual(secondDashboard.loaded, ["http://127.0.0.1:4002/"]);
   await lifecycle.requestQuit();
   assert.equal(supervisor.stops, 2);
   assert.equal(app.quitCalls, 1);
+});
+
+test("desktop lifecycle installs one dashboard-owned download handler and removes stale origins", async () => {
+  const app = new FakeApp();
+  const windows = [];
+  const completed = [];
+  const failed = [];
+  let prepared = 0;
+  let revealed = 0;
+  let cleared = 0;
+  const ownedDownloadsRegistry = {
+    prepareDownload(value) {
+      assert.deepEqual(value, {
+        kind: "share_card",
+        mime: "image/png",
+        filename: "tibotattle-results-TT-012345.png",
+      });
+      prepared += 1;
+      return {
+        id: `00000000-0000-4000-8000-${String(prepared).padStart(12, "0")}`,
+        destination: `/Users/adam/Downloads/owned-${prepared}.png`,
+      };
+    },
+    async completeDownload(id) { completed.push(id); return true; },
+    async failDownload(id) { failed.push(id); return true; },
+    async revealLatest() { revealed += 1; return "revealed"; },
+    clear() { cleared += 1; },
+  };
+  const supervisor = {
+    starts: 0,
+    stops: 0,
+    setUnexpectedExitHandler() {},
+    async start() {
+      this.starts += 1;
+      return { origin: `http://127.0.0.1:${4000 + this.starts}` };
+    },
+    async stop() { this.stops += 1; },
+  };
+  const lifecycle = createDesktopLifecycle({
+    app,
+    BrowserWindow: class extends DownloadSessionWindow {
+      constructor(options) {
+        super(options);
+        windows.push(this);
+      }
+    },
+    Tray: FakeTray,
+    Menu: { buildFromTemplate: (template) => ({ template }) },
+    icon: "empty-icon",
+    preloadPath: "/private/preload.cjs",
+    supervisor,
+    ownedDownloadsRegistry,
+  });
+  await lifecycle.start();
+  const dashboard = windows.find((candidate) => candidate.loaded[0] === "http://127.0.0.1:4001/");
+  const dashboardSession = dashboard.webContents.session;
+  // A download may settle before the dashboard is ready to receive renderer
+  // commands. The registry records it, but lifecycle delivery stays silent.
+  const beforeReadyItem = new LifecycleDownloadItem();
+  dashboardSession.emit("will-download", { preventDefault() {} }, beforeReadyItem, dashboard.webContents);
+  assert.equal(beforeReadyItem.savePath, "/Users/adam/Downloads/owned-1.png");
+  beforeReadyItem.finish("completed");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(dashboard.webContents.sent, []);
+
+  dashboard.emit("ready-to-show");
+  const item = new LifecycleDownloadItem();
+  dashboardSession.emit("will-download", { preventDefault() {} }, item, dashboard.webContents);
+  assert.equal(item.savePath, "/Users/adam/Downloads/owned-2.png");
+  item.finish("completed");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(completed, [
+    "00000000-0000-4000-8000-000000000001",
+    "00000000-0000-4000-8000-000000000002",
+  ]);
+  assert.deepEqual(dashboard.webContents.sent, [{
+    channel: "tibotattle:desktop-command:v1",
+    command: { command: "shareCardDownloadCompleted" },
+  }]);
+  assert.equal(lifecycle.isAuthorizedDesktopDownloadContext(
+    dashboard.webContents,
+    dashboard.webContents.mainFrame,
+  ), true);
+  assert.equal(await lifecycle.revealLatestDownload(), "revealed");
+  assert.equal(revealed, 1);
+
+  const oldSession = dashboardSession;
+  const stalePending = new LifecycleDownloadItem();
+  oldSession.emit("will-download", { preventDefault() {} }, stalePending, dashboard.webContents);
+  assert.equal(stalePending.savePath, "/Users/adam/Downloads/owned-3.png");
+  await lifecycle.retry();
+  assert.equal(oldSession.listenerCount("will-download"), 0);
+  stalePending.finish("completed");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(dashboard.webContents.sent, [{
+    channel: "tibotattle:desktop-command:v1",
+    command: { command: "shareCardDownloadCompleted" },
+  }]);
+  const staleItem = new LifecycleDownloadItem();
+  oldSession.emit("will-download", { preventDefault() {} }, staleItem, dashboard.webContents);
+  assert.equal(staleItem.savePath, null);
+  assert.equal(lifecycle.isAuthorizedDesktopDownloadContext(
+    dashboard.webContents,
+    dashboard.webContents.mainFrame,
+  ), false);
+  await lifecycle.requestQuit();
+  assert.equal(cleared, 1);
+  assert.ok(failed.length >= 0);
+});
+
+test("desktop lifecycle keeps a visible recovery window after a startup exit", async () => {
+  const app = new FakeApp();
+  const windows = [];
+  const supervisor = {
+    stops: 0,
+    exitHandler: null,
+    setUnexpectedExitHandler(handler) {
+      this.exitHandler = handler;
+    },
+    async start() {
+      return { origin: "http://127.0.0.1:4051" };
+    },
+    async stop() {
+      this.stops += 1;
+    },
+  };
+  class StartupRaceWindow extends FakeWindow {
+    constructor(options) {
+      super(options);
+      windows.push(this);
+    }
+
+    loadURL(url) {
+      this.loaded.push(url);
+      // Exercise the real race: the ready-to-show event makes the window
+      // visible, then the child exits before lifecycle.start() publishes
+      // started=true.
+      this.emit("ready-to-show");
+      supervisor.exitHandler?.({ kind: "companion_exit" });
+      return Promise.resolve();
+    }
+  }
+  const lifecycle = createDesktopLifecycle({
+    app,
+    BrowserWindow: StartupRaceWindow,
+    Tray: FakeTray,
+    Menu: { buildFromTemplate: (template) => ({ template }) },
+    icon: "empty-icon",
+    preloadPath: "/private/preload.cjs",
+    supervisor,
+  });
+
+  const started = await lifecycle.start();
+  assert.deepEqual(started, {
+    status: "recovery",
+    origin: null,
+    failure: "companion_exit_before_ready",
+  });
+  assert.equal(windows.length, 2);
+  assert.equal(windows[0].visible, true);
+  assert.equal(windows[0].destroyed, false);
+  assert.equal(windows[1].destroyed, true);
+  assert.equal(lifecycle.state.started, false);
+  assert.equal(lifecycle.state.hasWindow, false);
+  assert.equal(supervisor.stops, 1);
+  assert.equal(lifecycle.state.recoveryWindowVisible, true);
+  assert.equal(app.quitCalls, 0);
 });
 
 test("desktop lifecycle invalidates a dead companion, auto-restarts once, then requires tray Retry", async () => {
@@ -1333,11 +1638,11 @@ test("desktop lifecycle invalidates a dead companion, auto-restarts once, then r
     },
     Menu: { buildFromTemplate: (template) => ({ template }) },
     icon: "empty-icon",
-    preloadPath: "/private/preload.js",
+    preloadPath: "/private/preload.cjs",
     supervisor,
   });
   await lifecycle.start();
-  const firstWindow = windows[0];
+  const firstWindow = dashboardWindowsForTest(windows)[0];
   supervisor.exitHandler({ kind: "companion_exit" });
   assert.equal(firstWindow.destroyed, true);
   assert.equal(lifecycle.state.origin, null);
@@ -1345,17 +1650,318 @@ test("desktop lifecycle invalidates a dead companion, auto-restarts once, then r
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(supervisor.starts, 2);
   assert.equal(supervisor.stops, 1);
-  assert.equal(windows.length, 2);
+  assert.equal(windows.length, 4);
 
   supervisor.exitHandler({ kind: "companion_exit" });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(supervisor.starts, 2);
-  assert.equal(windows[1].destroyed, true);
+  assert.equal(dashboardWindowsForTest(windows)[1].destroyed, true);
 
   const retryItem = trays[0].menu.template.find((item) => item.label === "Retry");
   const manualRetry = retryItem.click();
   await manualRetry;
   assert.equal(supervisor.starts, 3);
+});
+
+test("desktop lifecycle owns a bounded Settings window and authorizes only its top frame", async () => {
+  const app = new FakeApp();
+  const windows = [];
+  const trays = [];
+  const applicationMenus = [];
+  const supervisor = {
+    starts: 0,
+    stops: 0,
+    exitHandler: null,
+    setUnexpectedExitHandler(handler) {
+      this.exitHandler = handler;
+    },
+    async start() {
+      this.starts += 1;
+      return { origin: `http://127.0.0.1:${4700 + this.starts}` };
+    },
+    async stop() {
+      this.stops += 1;
+    },
+  };
+  const lifecycle = createDesktopLifecycle({
+    app,
+    BrowserWindow: class extends FakeWindow {
+      constructor(options) {
+        super(options);
+        windows.push(this);
+      }
+    },
+    Tray: class extends FakeTray {
+      constructor(icon) {
+        super(icon);
+        trays.push(this);
+      }
+    },
+    Menu: {
+      buildFromTemplate: (template) => ({ template }),
+      setApplicationMenu(menu) {
+        applicationMenus.push(menu);
+      },
+    },
+    platform: "darwin",
+    icon: "empty-icon",
+    preloadPath: "/private/preload.cjs",
+    supervisor,
+  });
+
+  await lifecycle.start();
+  assert.deepEqual(lifecycle.state, {
+    started: true,
+    quitting: false,
+    primaryInstance: true,
+    hasWindow: true,
+    dashboardReady: false,
+    windowVisible: false,
+    hasRecoveryWindow: false,
+    recoveryWindowVisible: false,
+    recoveryStatus: null,
+    active: true,
+    hasTray: true,
+    hasSettingsWindow: false,
+    settingsWindowVisible: false,
+    origin: "http://127.0.0.1:4701",
+  });
+
+  assert.equal(lifecycle.showSettingsWindow(), true);
+  assert.equal(windows.length, 3);
+  const settings = windows.find((candidate) => (
+    candidate.loaded[0]?.includes("electron-settings.html")
+  ));
+  assert.notEqual(settings, undefined);
+  assert.deepEqual(settings.loaded, [
+    "http://127.0.0.1:4701/electron-settings.html#general",
+  ]);
+  assert.equal(settings.options.webPreferences.nodeIntegration, false);
+  assert.equal(settings.options.webPreferences.contextIsolation, true);
+  assert.equal(settings.options.webPreferences.sandbox, true);
+  assert.equal(settings.options.webPreferences.preload, "/private/preload.cjs");
+  settings.emit("ready-to-show");
+  assert.equal(settings.visible, true);
+  assert.equal(lifecycle.state.hasSettingsWindow, true);
+  assert.equal(lifecycle.state.settingsWindowVisible, true);
+
+  assert.equal(lifecycle.showSettingsWindow("about"), true);
+  assert.equal(windows.length, 3);
+  assert.deepEqual(settings.loaded, [
+    "http://127.0.0.1:4701/electron-settings.html#general",
+    "http://127.0.0.1:4701/electron-settings.html#about",
+  ]);
+  assert.equal(settings.visible, true);
+  assert.throws(
+    () => lifecycle.showSettingsWindow("unsupported"),
+    /settings section is invalid/u,
+  );
+  assert.equal(windows.length, 3);
+
+  const aboutMenuItem = applicationMenus[0].template[0].submenu.find(
+    (item) => item.label === "About TiboTattle",
+  );
+  const settingsMenuItem = applicationMenus[0].template[0].submenu.find(
+    (item) => item.label === "Settings…",
+  );
+  assert.equal(typeof settingsMenuItem.click, "function");
+  settingsMenuItem.click();
+  assert.equal(settings.loaded.at(-1), "http://127.0.0.1:4701/electron-settings.html#general");
+  assert.equal(typeof aboutMenuItem.click, "function");
+  aboutMenuItem.click();
+  assert.equal(settings.loaded.at(-1), "http://127.0.0.1:4701/electron-settings.html#about");
+  const trayAboutItem = trays[0].menu.template.find(
+    (item) => item.label === "About TiboTattle",
+  );
+  const traySettingsItem = trays[0].menu.template.find(
+    (item) => item.label === "Settings…",
+  );
+  assert.equal(typeof traySettingsItem.click, "function");
+  traySettingsItem.click();
+  assert.equal(settings.loaded.at(-1), "http://127.0.0.1:4701/electron-settings.html#general");
+  assert.equal(typeof trayAboutItem.click, "function");
+  trayAboutItem.click();
+  assert.equal(settings.visible, true);
+
+  assert.equal(lifecycle.setDesktopLanguage("zh-Hans"), true);
+  const localizedApplicationMenu = applicationMenus.at(-1).template[0].submenu;
+  assert.ok(localizedApplicationMenu.some((item) => item.label === "关于 TiboTattle"));
+  assert.ok(trays[0].menu.template.some((item) => item.label === "打开 TiboTattle"));
+  assert.equal(lifecycle.setDesktopLanguage("es"), true);
+  assert.ok(applicationMenus.at(-1).template[0].submenu.some((item) => item.label === "Acerca de TiboTattle"));
+
+  const dashboardCommands = [];
+  const settingsCommands = [];
+  dashboardWindowsForTest(windows)[0].webContents.send = (channel, command) => {
+    dashboardCommands.push([channel, command]);
+  };
+  settings.webContents.send = (channel, command) => {
+    settingsCommands.push([channel, command]);
+  };
+  assert.equal(lifecycle.sendDashboardCommand({ command: "language", value: "zh-Hans" }), true);
+  assert.deepEqual(dashboardCommands.at(-1), [
+    "tibotattle:desktop-command:v1",
+    { command: "language", value: "zh-Hans" },
+  ]);
+  assert.deepEqual(settingsCommands.at(-1), [
+    "tibotattle:desktop-command:v1",
+    { command: "language", value: "zh-Hans" },
+  ]);
+  assert.equal(lifecycle.sendDashboardCommand({ command: "refresh" }), true);
+  assert.deepEqual(dashboardCommands.at(-1), [
+    "tibotattle:desktop-command:v1",
+    { command: "refresh" },
+  ]);
+  assert.equal(settingsCommands.length, 1, "refresh must remain dashboard-only");
+
+  let closePrevented = false;
+  settings.emit("close", {
+    preventDefault() {
+      closePrevented = true;
+    },
+  });
+  assert.equal(closePrevented, true);
+  assert.equal(settings.visible, false);
+  assert.equal(settings.destroyed, false);
+  assert.equal(app.quitCalls, 0);
+
+  const primaryContents = dashboardWindowsForTest(windows)[0].webContents;
+  const settingsContents = settings.webContents;
+  assert.equal(lifecycle.isAuthorizedDesktopSender(primaryContents), true);
+  assert.equal(lifecycle.isAuthorizedDesktopSender(settingsContents), true);
+  assert.equal(lifecycle.isAuthorizedDesktopSender({}), false);
+  assert.equal(
+    lifecycle.isAuthorizedDesktopFrame(
+      primaryContents.mainFrame,
+      { sender: primaryContents },
+    ),
+    true,
+  );
+  assert.equal(
+    lifecycle.isAuthorizedDesktopFrame(
+      settingsContents.mainFrame,
+      { sender: settingsContents },
+    ),
+    true,
+  );
+  assert.equal(
+    lifecycle.isAuthorizedDesktopFrame(
+      { isMainFrame: false, parent: primaryContents.mainFrame },
+      { sender: primaryContents },
+    ),
+    false,
+  );
+  assert.equal(
+    lifecycle.isAuthorizedDesktopFrame(
+      primaryContents.mainFrame,
+      { sender: settingsContents },
+    ),
+    false,
+  );
+  assert.equal(lifecycle.isAuthorizedDesktopFrame(primaryContents.mainFrame), false);
+
+  // Companion failure invalidates the separate settings origin before the
+  // bounded automatic restart is queued.
+  lifecycle.showSettingsWindow("notifications");
+  assert.equal(lifecycle.state.hasSettingsWindow, true);
+  supervisor.exitHandler({ kind: "companion_exit" });
+  assert.equal(settings.destroyed, true);
+  assert.equal(lifecycle.state.hasSettingsWindow, false);
+  assert.equal(lifecycle.isAuthorizedDesktopSender(settingsContents), false);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  lifecycle.showSettingsWindow();
+  const restartedSettings = windows.at(-1);
+  assert.notEqual(restartedSettings, settings);
+  restartedSettings.emit("ready-to-show");
+  await lifecycle.retry();
+  assert.equal(restartedSettings.destroyed, true);
+  assert.equal(lifecycle.state.hasSettingsWindow, false);
+
+  lifecycle.showSettingsWindow();
+  const finalSettings = windows.at(-1);
+  await lifecycle.requestQuit();
+  assert.equal(finalSettings.destroyed, true);
+  assert.equal(lifecycle.state.hasSettingsWindow, false);
+  assert.equal(app.quitCalls, 1);
+});
+
+test("closing Settings retains the dashboard's shared-session loopback filtering", async () => {
+  const app = new FakeApp();
+  const windows = [];
+  const sharedSession = {
+    setPermissionRequestHandler(handler) {
+      this.permissionHandler = handler;
+    },
+    setPermissionCheckHandler(handler) {
+      this.permissionCheckHandler = handler;
+    },
+    webRequest: {
+      onBeforeRequest(filter, listener) {
+        this.filter = filter;
+        this.listener = listener;
+      },
+    },
+  };
+  const supervisor = {
+    setUnexpectedExitHandler() {},
+    async start() {
+      return { origin: "http://127.0.0.1:4751" };
+    },
+    async stop() {},
+  };
+  class SharedSessionWindow extends FakeWindow {
+    constructor(options) {
+      super(options);
+      this.webContents.session = sharedSession;
+      windows.push(this);
+    }
+  }
+  const lifecycle = createDesktopLifecycle({
+    app,
+    BrowserWindow: SharedSessionWindow,
+    Tray: FakeTray,
+    Menu: { buildFromTemplate: (template) => ({ template }) },
+    icon: "empty-icon",
+    preloadPath: "/private/preload.cjs",
+    supervisor,
+  });
+
+  await lifecycle.start();
+  assert.equal(typeof sharedSession.webRequest.listener, "function");
+  const beforeSettingsClose = [];
+  sharedSession.webRequest.listener(
+    { url: "https://example.test/" },
+    (decision) => beforeSettingsClose.push(decision),
+  );
+  assert.deepEqual(beforeSettingsClose, [{ cancel: true }]);
+
+  assert.equal(lifecycle.showSettingsWindow(), true);
+  const settings = windows.find((candidate) => (
+    candidate.loaded[0]?.includes("electron-settings.html")
+  ));
+  assert.notEqual(settings, undefined);
+  settings.emit("closed");
+  assert.equal(lifecycle.state.hasSettingsWindow, false);
+
+  // The Settings release only drops its reference. The dashboard's
+  // session-level handler must continue to reject remote requests.
+  assert.equal(typeof sharedSession.webRequest.listener, "function");
+  const afterSettingsClose = [];
+  sharedSession.webRequest.listener(
+    { url: "https://example.test/" },
+    (decision) => afterSettingsClose.push(decision),
+  );
+  assert.deepEqual(afterSettingsClose, [{ cancel: true }]);
+  const dashboardRequest = [];
+  sharedSession.webRequest.listener(
+    { url: "http://127.0.0.1:4751/api/local/health" },
+    (decision) => dashboardRequest.push(decision),
+  );
+  assert.deepEqual(dashboardRequest, [{ cancel: false }]);
+
+  await lifecycle.dispose();
+  assert.equal(sharedSession.webRequest.listener, null);
 });
 
 test("desktop lifecycle cancels an in-flight retry before quit and serializes shutdown", async () => {
@@ -1381,7 +1987,7 @@ test("desktop lifecycle cancels an in-flight retry before quit and serializes sh
     Tray: FakeTray,
     Menu: { buildFromTemplate: (template) => ({ template }) },
     icon: "empty-icon",
-    preloadPath: "/private/preload.js",
+    preloadPath: "/private/preload.cjs",
     supervisor,
   });
   await lifecycle.start();
@@ -1462,12 +2068,35 @@ test("packaged Electron composition keeps the companion in app.asar and uses phy
   const launch = launchElectronShell({
     electron: {
       app,
+      dialog: {
+        showMessageBox: async () => ({ response: 0 }),
+        showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
+      },
       BrowserWindow: FakeWindow,
       Tray: FakeTray,
       Menu: { buildFromTemplate: (template) => ({ template }) },
-      nativeImage: { createEmpty: () => "empty-icon" },
+      nativeImage: {
+        createFromPath: () => ({
+          isEmpty: () => false,
+          resize: () => ({
+            isEmpty: () => false,
+            setTemplateImage() {},
+          }),
+        }),
+      },
     },
     resourcesPath: "/private/TiboTattle.app/Contents/Resources",
+    firstRunReceiptBackend: {
+      load: async () => ({
+        schemaVersion: DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
+        acknowledged: true,
+      }),
+      save: async () => {},
+    },
+    notificationBackend: {
+      load: async () => null,
+      save: async (value) => value,
+    },
     supervisorOptions: {
       spawnChild(command, args, options) {
         spawnCalls.push({ command, args, options });
@@ -1501,22 +2130,181 @@ test("packaged Electron composition keeps the companion in app.asar and uses phy
   await dispose;
 });
 
-test("preload is only a frozen marker and does not import filesystem or IPC APIs", async () => {
-  const source = await readFile(join(REPOSITORY_ROOT, "apps/electron/preload.js"), "utf8");
-  assert.doesNotMatch(source, /(?:fs|ipcRenderer|contextBridge|readFile|writeFile)/u);
-  const context = {};
-  vm.runInNewContext(source, context, { filename: "preload.js" });
+test("preload exposes only the exact frozen v1 desktop bridge allowlist", async () => {
+  const source = await readFile(join(REPOSITORY_ROOT, "apps/electron/preload.cjs"), "utf8");
+  assert.doesNotMatch(source, /\b(?:process|path|URL)\b/u);
+  assert.doesNotMatch(source, /(?:readFile|writeFile|send\s*\()/u);
+  const calls = [];
+  const commandListeners = new Map();
+  const exposed = {};
+  const contextBridge = {
+    exposeInMainWorld(name, bridge) {
+      exposed[name] = bridge;
+    },
+  };
+  const ipcRenderer = {
+    invoke(channel, request) {
+      calls.push({ channel, request });
+      return Promise.resolve(request);
+    },
+    on(channel, listener) {
+      commandListeners.set(channel, listener);
+    },
+    removeListener(channel, listener) {
+      if (commandListeners.get(channel) === listener) commandListeners.delete(channel);
+    },
+  };
+  const context = {
+    Promise,
+    contextBridge,
+    ipcRenderer,
+    require(specifier) {
+      assert.equal(specifier, "electron");
+      return { contextBridge, ipcRenderer };
+    },
+  };
+  vm.runInNewContext(source, context, { filename: "preload.cjs" });
   assert.deepEqual(JSON.parse(JSON.stringify(context.__TIBOTATTLE_PRELOAD_MARKER__)), {
     name: "tibotattle-electron-preload",
     version: "v1",
-    capabilities: { filesystem: false, ipc: false },
+    capabilities: { filesystem: false, ipc: true },
   });
   assert.equal(Object.isFrozen(context.__TIBOTATTLE_PRELOAD_MARKER__), true);
   assert.equal(Object.isFrozen(context.__TIBOTATTLE_PRELOAD_MARKER__.capabilities), true);
+  assert.deepEqual(Object.keys(exposed), ["tibotattleDesktop"]);
+  const bridge = exposed.tibotattleDesktop;
+  assert.equal(Object.isFrozen(bridge), true);
+  assert.deepEqual(Object.keys(bridge), [
+    "version",
+    "onCommand",
+    "getSettings",
+    "openSettings",
+    "chooseCodexHome",
+    "useDefaultCodexHome",
+    "setLanguage",
+    "setRefreshInterval",
+    "setStartAtLogin",
+    "setNotificationPreferences",
+    "openSystemSettings",
+    "openExternal",
+    "openHostedSignIn",
+    "checkForUpdates",
+    "revealLatestDownload",
+  ]);
+  assert.equal(bridge.version, "v1");
+  const commands = [];
+  const unsubscribe = bridge.onCommand((command) => commands.push(command));
+  assert.equal(typeof unsubscribe, "function");
+  const commandListener = commandListeners.get("tibotattle:desktop-command:v1");
+  assert.equal(typeof commandListener, "function");
+  commandListener({}, { command: "refresh" });
+  commandListener({}, { command: "language", value: "es" });
+  commandListener({}, { command: "hostedSignInReturn" });
+  commandListener({}, { command: "shareCardDownloadCompleted" });
+  commandListener({}, { command: "shareCardDownloadFailed" });
+  commandListener({}, {
+    command: "shareCardDownloadCompleted",
+    path: "/private/opaque-download.png",
+  });
+  commandListener({}, {
+    command: "shareCardDownloadFailed",
+    error: "private details",
+  });
+  commandListener({}, { command: "language", value: "fr" });
+  commandListener({}, { command: "refresh", selector: "#private" });
+  assert.deepEqual(JSON.parse(JSON.stringify(commands)), [
+    { command: "refresh" },
+    { command: "language", value: "es" },
+    { command: "hostedSignInReturn" },
+    { command: "shareCardDownloadCompleted" },
+    { command: "shareCardDownloadFailed" },
+  ]);
+  unsubscribe();
+  assert.equal(commandListeners.size, 0);
+  await bridge.getSettings();
+  await bridge.openSettings();
+  await bridge.chooseCodexHome();
+  await bridge.useDefaultCodexHome();
+  await bridge.setLanguage("en");
+  await bridge.setRefreshInterval(300);
+  await bridge.setStartAtLogin(true);
+  await bridge.setNotificationPreferences({
+    enabled: true,
+    threshold: "ninety",
+  });
+  await bridge.openSystemSettings("notifications");
+  await bridge.openExternal("github");
+  await bridge.openHostedSignIn(
+    "https://accounts.google.com/o/oauth2/v2/auth?client_id=test",
+  );
+  await bridge.checkForUpdates();
+  await bridge.revealLatestDownload();
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.map(({ channel, request }) => ({ channel, request })))), [
+    { channel: "tibotattle:desktop:v1", request: { action: "getSettings", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "openSettings", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "chooseCodexHome", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "useDefaultCodexHome", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "setLanguage", args: { value: "en" } } },
+    { channel: "tibotattle:desktop:v1", request: { action: "setRefreshInterval", args: { seconds: 300 } } },
+    { channel: "tibotattle:desktop:v1", request: { action: "setStartAtLogin", args: { enabled: true } } },
+    {
+      channel: "tibotattle:desktop:v1",
+      request: {
+        action: "setNotificationPreferences",
+        args: { enabled: true, threshold: "ninety" },
+      },
+    },
+    {
+      channel: "tibotattle:desktop:v1",
+      request: { action: "openSystemSettings", args: { target: "notifications" } },
+    },
+    {
+      channel: "tibotattle:desktop:v1",
+      request: { action: "openExternal", args: { target: "github" } },
+    },
+    {
+      channel: "tibotattle:desktop:v1",
+      request: {
+        action: "openHostedSignIn",
+        args: {
+          authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth?client_id=test",
+        },
+      },
+    },
+    { channel: "tibotattle:desktop:v1", request: { action: "checkForUpdates", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "revealLatestDownload", args: {} } },
+  ]);
+  await assert.rejects(
+    bridge.setNotificationPreferences({ enabled: true, threshold: "ninety", extra: true }),
+    (error) => error?.name === "TypeError",
+  );
+  for (const operation of [
+    () => bridge.onCommand(() => {}, "extra"),
+    () => bridge.setLanguage("en", "extra"),
+    () => bridge.setRefreshInterval(300, "extra"),
+    () => bridge.setStartAtLogin(true, "extra"),
+    () => bridge.setNotificationPreferences(
+      { enabled: true, threshold: "ninety" },
+      "extra",
+    ),
+    () => bridge.openSystemSettings("startup", "extra"),
+    () => bridge.openExternal("github", "extra"),
+    () => bridge.openHostedSignIn(
+      "https://accounts.google.com/o/oauth2/v2/auth?client_id=test",
+      "extra",
+    ),
+    () => bridge.revealLatestDownload("extra"),
+  ]) {
+    await assert.rejects(operation(), (error) => error?.name === "TypeError");
+  }
+  await assert.rejects(
+    bridge.openHostedSignIn("https://accounts.google.com.evil/?client_id=test"),
+    (error) => error?.name === "TypeError",
+  );
 });
 
-test("preload marks both document roots as native-dashboard across DOM readiness", async () => {
-  const source = await readFile(join(REPOSITORY_ROOT, "apps/electron/preload.js"), "utf8");
+test("preload marks both document roots as electron-dashboard across DOM readiness", async () => {
+  const source = await readFile(join(REPOSITORY_ROOT, "apps/electron/preload.cjs"), "utf8");
   function classList() {
     const values = new Set();
     return {
@@ -1533,11 +2321,24 @@ test("preload marks both document roots as native-dashboard across DOM readiness
       this.domReady = callback;
     },
   };
-  vm.runInNewContext(source, { document }, { filename: "preload.js" });
-  assert.equal(documentElement.classList.contains("native-dashboard"), true);
+  vm.runInNewContext(
+    source,
+    {
+      document,
+      require(specifier) {
+        assert.equal(specifier, "electron");
+        return { contextBridge: undefined, ipcRenderer: undefined };
+      },
+    },
+    { filename: "preload.cjs" },
+  );
+  assert.equal(documentElement.classList.contains("electron-dashboard"), true);
+  assert.equal(documentElement.classList.contains("native-dashboard"), false);
   assert.equal(document.body, null);
   document.body = { classList: classList() };
   document.domReady();
-  assert.equal(documentElement.classList.contains("native-dashboard"), true);
-  assert.equal(document.body.classList.contains("native-dashboard"), true);
+  assert.equal(documentElement.classList.contains("electron-dashboard"), true);
+  assert.equal(document.body.classList.contains("electron-dashboard"), true);
+  assert.equal(documentElement.classList.contains("native-dashboard"), false);
+  assert.equal(document.body.classList.contains("native-dashboard"), false);
 });

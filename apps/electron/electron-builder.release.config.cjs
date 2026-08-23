@@ -338,6 +338,11 @@ module.exports = {
   nsis: {
     guid: "FDA705D7-5644-50E8-8CD2-3005D51B98C5",
     artifactName: "TiboTattle-${version}-Windows-x64.${ext}",
+    // electron-builder's `protocols` metadata is macOS/AppX-oriented and is
+    // not consumed by its NSIS target. This supported include hook adds one
+    // exact per-install usagemonitor:// association while leaving the normal
+    // builder-generated installer and signed uninstaller path intact.
+    include: path.join(__dirname, "windows-protocol-registration.nsh"),
     warningsAsErrors: true,
     oneClick: true,
     perMachine: false,

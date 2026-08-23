@@ -158,7 +158,7 @@ test("Electron app staging includes the shell and keeps the companion manifest v
   });
 });
 
-test("Electron builder configuration is an unsigned macOS arm64 directory build", () => {
+test("Electron builder configuration is an unsigned macOS arm64 directory build", async () => {
   assert.equal(BUILDER_CONFIG.appId, "com.adamallcock.tibotattle.electron.dev");
   assert.equal(BUILDER_CONFIG.productName, "TiboTattle Dev");
   assert.equal(BUILDER_CONFIG.extraMetadata.name, "app-usagemonitor");
@@ -201,6 +201,11 @@ test("Electron builder configuration is an unsigned macOS arm64 directory build"
   assert.equal(BUILDER_CONFIG.buildDependenciesFromSource, false);
   assert.equal(BUILDER_CONFIG.nodeGypRebuild, false);
   assert.deepEqual(BUILDER_CONFIG.mac.target, [{ target: "dir", arch: ["arm64"] }]);
+  const expectedMacIcon = resolve("apps/macos/Assets/AppIcon.icns");
+  assert.equal(BUILDER_CONFIG.mac.icon, expectedMacIcon);
+  const macIconMetadata = await lstat(expectedMacIcon);
+  assert.ok(macIconMetadata.isFile());
+  assert.ok(!macIconMetadata.isSymbolicLink());
   assert.equal(BUILDER_CONFIG.mac.identity, null);
   assert.equal(BUILDER_CONFIG.mac.notarize, false);
 });

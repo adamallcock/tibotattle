@@ -1,5 +1,29 @@
+import { dirname, resolve } from "node:path";
+
 import { createLoopbackNavigationPolicy, installLoopbackNavigationPolicy } from "./loopback-policy.js";
 import { shellError } from "./errors.js";
+import { DESKTOP_COMMAND_CHANNEL, validateDesktopCommand } from "./desktop-command.js";
+import {
+  createDesktopActionInterface,
+  installDesktopApplicationMenu,
+} from "./desktop-menu.js";
+import { createDesktopTrayTemplate } from "./desktop-tray.js";
+import {
+  createRecoveryWindow,
+  RECOVERY_STATUSES,
+} from "./recovery-window.js";
+import {
+  installDesktopOwnedDownloadHandler,
+} from "./desktop-owned-downloads.js";
+import { createDesktopStatusMonitor } from "./desktop-status-monitor.js";
+import {
+  createDesktopTrayStatusReducer,
+  DESKTOP_TRAY_INITIAL_STATUS,
+} from "./desktop-tray-status.js";
+import {
+  DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
+  validateDesktopShellStatus,
+} from "../../src/desktop-shell-status.js";
 
 const DEFAULT_WINDOW_OPTIONS = Object.freeze({
   width: 1_180,
@@ -7,6 +31,19 @@ const DEFAULT_WINDOW_OPTIONS = Object.freeze({
   minWidth: 720,
   minHeight: 520,
 });
+
+const DEFAULT_SETTINGS_WINDOW_OPTIONS = Object.freeze({
+  width: 760,
+  height: 760,
+  minWidth: 620,
+  minHeight: 520,
+});
+
+const SETTINGS_SECTIONS = Object.freeze([
+  "general",
+  "notifications",
+  "about",
+]);
 
 function assertFunction(value, label) {
   if (typeof value !== "function") throw new TypeError(`${label} is required`);
@@ -30,6 +67,18 @@ export function createDesktopLifecycle({
   createNavigationPolicy = createLoopbackNavigationPolicy,
   installNavigationPolicy = installLoopbackNavigationPolicy,
   appName = "TiboTattle",
+  platform = process.platform,
+  desktopLocale = "system",
+  desktopSystemLocales,
+  desktopActions = {},
+  settingsWindowOptions = {},
+  recoveryWindowOptions = {},
+  recoveryPreloadPath,
+  ownedDownloadsRegistry = null,
+  singleInstanceLockAcquired = false,
+  onDashboardReady,
+  onDesktopStatus,
+  desktopStatusMonitorOptions = {},
 } = {}) {
   if (!app || typeof app.on !== "function") throw new TypeError("app is required");
   assertFunction(BrowserWindow, "BrowserWindow");
@@ -42,23 +91,161 @@ export function createDesktopLifecycle({
       || typeof installNavigationPolicy !== "function") {
     throw new TypeError("navigation policy factories are required");
   }
+  if (ownedDownloadsRegistry !== null) {
+    for (const method of ["prepareDownload", "completeDownload", "failDownload", "revealLatest"]) {
+      if (typeof ownedDownloadsRegistry[method] !== "function") {
+        throw new TypeError(`ownedDownloadsRegistry.${method} is required`);
+      }
+    }
+    if (typeof ownedDownloadsRegistry.clear !== "function") {
+      throw new TypeError("ownedDownloadsRegistry.clear is required");
+    }
+  }
+  if (onDesktopStatus !== undefined && typeof onDesktopStatus !== "function") {
+    throw new TypeError("onDesktopStatus must be a function");
+  }
+  if (desktopStatusMonitorOptions === null
+      || typeof desktopStatusMonitorOptions !== "object"
+      || Array.isArray(desktopStatusMonitorOptions)
+      || Object.hasOwn(desktopStatusMonitorOptions, "onStatus")) {
+    throw new TypeError("desktop status monitor options are invalid");
+  }
 
   let started = false;
   let quitting = false;
   let primaryInstance = false;
   let window = null;
+  let settingsWindow = null;
+  let recovery = null;
   let tray = null;
+  let applicationMenu = null;
+  let desktopActionInterface = null;
+  let activeDesktopLocale = desktopLocale;
+  let dashboardReady = false;
   let ready = null;
   let policyInstallation = null;
+  let downloadHandlerInstallation = null;
+  let settingsPolicyInstallation = null;
   let windowListenerCleanup = null;
   let windowReadyListenerCleanup = null;
+  let settingsWindowListenerCleanup = null;
+  let settingsWindowReadyListenerCleanup = null;
+  let recoveryWindowListenerCleanup = null;
+  let destroyingSettingsWindow = false;
+  let destroyingRecoveryWindow = false;
+  let settingsLoadedURL = null;
   let shutdownPromise = null;
   let retryPromise = null;
   let automaticRetryPromise = null;
   let automaticRetryUsed = false;
+  let startupInProgress = false;
+  let startupUnexpectedExit = false;
+  let startupFailureStatus = null;
+  let startupAttemptPromise = null;
+  let lifecycleActive = false;
+  let recoveryStatus = null;
   let lifecycleEpoch = 0;
   let lifecycleOperation = Promise.resolve();
+  let desktopStatusMonitorRunning = false;
+  let desktopStatusMonitorOrigin = null;
+  const desktopTrayStatusReducer = createDesktopTrayStatusReducer();
+  let desktopTrayStatus = DESKTOP_TRAY_INITIAL_STATUS;
   const listeners = [];
+
+  const unavailableDesktopStatus = Object.freeze({
+    schemaVersion: DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
+    state: "unavailable",
+    allowance: null,
+    notificationEvidence: null,
+  });
+
+  function notifyDesktopStatus(status) {
+    if (typeof onDesktopStatus !== "function") return;
+    try {
+      onDesktopStatus(status);
+    } catch {
+      // The observer is an internal convenience seam for notification/UI
+      // coordination. Its failure must never interrupt the shell lifecycle.
+    }
+  }
+
+  function sameAllowance(left, right) {
+    if (left === right) return true;
+    if (left === null || right === null) return false;
+    return left.source === right.source
+      && left.window === right.window
+      && left.remainingPercent === right.remainingPercent;
+  }
+
+  function sameTrayStatus(left, right) {
+    return left.status === right.status
+      && sameAllowance(left.allowance, right.allowance);
+  }
+
+  function dispatchDesktopTrayEvent(event) {
+    let next;
+    try {
+      next = desktopTrayStatusReducer.dispatch(event);
+    } catch {
+      // A malformed status must fail closed without surfacing any source
+      // payload or taking down the main process.
+      return false;
+    }
+    const changed = !sameTrayStatus(desktopTrayStatus, next);
+    desktopTrayStatus = next;
+    if (changed) refreshDesktopSurfaces();
+    return changed;
+  }
+
+  function handleDesktopStatus(status) {
+    let validated;
+    try {
+      validated = validateDesktopShellStatus(status);
+      const event = validated.state === "fresh"
+        ? { type: "fresh", allowance: validated.allowance }
+        : { type: validated.state };
+      dispatchDesktopTrayEvent(event);
+    } catch {
+      validated = unavailableDesktopStatus;
+      dispatchDesktopTrayEvent({ type: "unavailable" });
+    }
+    notifyDesktopStatus(validated);
+  }
+
+  function stopDesktopStatusMonitor({ notify = true } = {}) {
+    const wasRunning = desktopStatusMonitorRunning || desktopStatusMonitorOrigin !== null;
+    try {
+      desktopStatusMonitor?.stop?.();
+    } catch {
+      // Monitor cleanup is best-effort during recovery and shutdown.
+    }
+    desktopStatusMonitorRunning = false;
+    desktopStatusMonitorOrigin = null;
+    if (notify && wasRunning) handleDesktopStatus(unavailableDesktopStatus);
+  }
+
+  function startDesktopStatusMonitor(origin) {
+    if (desktopStatusMonitorRunning && desktopStatusMonitorOrigin === origin) return;
+    stopDesktopStatusMonitor({ notify: false });
+    // Mark ownership before start(): the monitor emits its fixed `starting`
+    // status synchronously, and an internal observer is allowed to request
+    // quit/recovery from that callback.
+    desktopStatusMonitorRunning = true;
+    desktopStatusMonitorOrigin = origin;
+    try {
+      desktopStatusMonitor.start(origin);
+      if (quitting) stopDesktopStatusMonitor();
+    } catch {
+      desktopStatusMonitorRunning = false;
+      desktopStatusMonitorOrigin = null;
+      handleDesktopStatus(unavailableDesktopStatus);
+    }
+  }
+
+  const desktopStatusMonitor = createDesktopStatusMonitor({
+    ...desktopStatusMonitorOptions,
+    onStatus: handleDesktopStatus,
+  });
 
   function listen(target, event, handler) {
     target.on(event, handler);
@@ -66,22 +253,201 @@ export function createDesktopLifecycle({
   }
 
   function showWindow() {
-    if (!window || window.isDestroyed?.()) return false;
-    window.show?.();
-    window.focus?.();
-    return true;
+    if (window && !window.isDestroyed?.()) {
+      window.show?.();
+      window.focus?.();
+      return true;
+    }
+    return recovery?.show?.() === true;
   }
 
   function hideWindow() {
-    if (!window || window.isDestroyed?.()) return false;
-    window.hide?.();
-    return true;
+    if (window && !window.isDestroyed?.()) {
+      window.hide?.();
+      return true;
+    }
+    return recovery?.hide?.() === true;
   }
 
   function toggleWindow() {
-    if (!window || window.isDestroyed?.()) return false;
-    if (window.isVisible?.()) return hideWindow();
+    const target = window && !window.isDestroyed?.() ? window : recovery?.window;
+    if (!target || target.isDestroyed?.()) return false;
+    if (target.isVisible?.()) return hideWindow();
     return showWindow();
+  }
+
+  function sendDashboardCommand(value) {
+    let command;
+    try {
+      command = validateDesktopCommand(value);
+    } catch {
+      return false;
+    }
+    let delivered = false;
+    if (isLiveBrowserWindow(window) && typeof window.webContents?.send === "function") {
+      window.webContents.send(DESKTOP_COMMAND_CHANNEL, command);
+      delivered = true;
+    }
+    // Refresh belongs only to the dashboard. Language is shared presentation
+    // state, so an already-open trusted Settings renderer receives that same
+    // validated command and no broader broadcast surface.
+    if (command.command === "language"
+        && isLiveBrowserWindow(settingsWindow)
+        && typeof settingsWindow.webContents?.send === "function") {
+      settingsWindow.webContents.send(DESKTOP_COMMAND_CHANNEL, command);
+      delivered = true;
+    }
+    return delivered;
+  }
+
+  function isLiveBrowserWindow(candidate) {
+    return candidate !== null && candidate !== undefined
+      && candidate.isDestroyed?.() !== true;
+  }
+
+  function isAuthorizedDesktopSender(sender) {
+    return (isLiveBrowserWindow(window) && sender === window.webContents)
+      || (isLiveBrowserWindow(settingsWindow) && sender === settingsWindow.webContents);
+  }
+
+  function isAuthorizedDesktopFrame(frame, event = undefined) {
+    if (!frame || typeof frame !== "object") return false;
+    const sender = event?.sender;
+    if (!isAuthorizedDesktopSender(sender)) return false;
+    const owner = sender === window?.webContents
+      ? window
+      : sender === settingsWindow?.webContents
+        ? settingsWindow
+        : null;
+    if (!isLiveBrowserWindow(owner)) return false;
+    // Electron's mainFrame identity is the authoritative top-frame check. The
+    // additional shape checks make the predicate fail closed in tests and in
+    // any future Electron object that does not expose the usual frame fields.
+    if (owner.webContents?.mainFrame !== frame) return false;
+    if (Object.hasOwn(frame, "isMainFrame") && frame.isMainFrame !== true) return false;
+    if (Object.hasOwn(frame, "parent") && frame.parent !== null) return false;
+    return true;
+  }
+
+  function isAuthorizedDesktopDownloadContext(sender, frame) {
+    if (!isLiveBrowserWindow(window)
+        || sender !== window.webContents
+        || !isAuthorizedDesktopFrame(frame, { sender })) {
+      return false;
+    }
+    const currentOrigin = ready?.origin;
+    if (typeof currentOrigin !== "string") return false;
+    const getURL = sender.getURL;
+    if (typeof getURL !== "function") return true;
+    let currentURL;
+    try {
+      currentURL = getURL.call(sender);
+      return typeof currentURL === "string"
+        && new URL(currentURL).origin === currentOrigin;
+    } catch {
+      return false;
+    }
+  }
+
+  function assertSettingsSection(section) {
+    if (!SETTINGS_SECTIONS.includes(section)) {
+      throw new TypeError("settings section is invalid");
+    }
+    return section;
+  }
+
+  function settingsURL(section) {
+    assertSettingsSection(section);
+    if (!ready?.origin) throw shellError("electron_configuration_invalid");
+    const url = new URL("/electron-settings.html", `${ready.origin}/`);
+    url.hash = section;
+    return url.href;
+  }
+
+  function recoveryStatusFor(error, fallback = "companion_spawn_failed") {
+    const candidate = typeof error?.code === "string"
+      ? error.code.replace(/^electron_shell_/u, "")
+      : fallback;
+    return RECOVERY_STATUSES.includes(candidate) && candidate !== "starting"
+      ? candidate
+      : fallback;
+  }
+
+  function handleRecoveryAction(action) {
+    if (action === "retry") {
+      void retry().catch(() => {});
+      return;
+    }
+    if (action === "settings") {
+      // The normal HTML Settings surface has no safe origin until the
+      // companion is ready. Runtime composition supplies a main-process-only
+      // recovery settings action (folder repair); the lifecycle never grants
+      // this data-URL renderer the normal desktop bridge.
+      try {
+        const recoverySettings = desktopActions !== null
+          && typeof desktopActions === "object"
+          && !Array.isArray(desktopActions)
+          ? desktopActions.recoverySettings
+          : null;
+        const result = typeof recoverySettings === "function"
+          ? recoverySettings()
+          : undefined;
+        result?.catch?.(() => {});
+      } catch {
+        // Recovery remains usable through Retry and Quit if the bounded native
+        // settings action itself is unavailable.
+      }
+      return;
+    }
+    if (action === "quit") void requestQuit().catch(() => {});
+  }
+
+  function destroyRecoveryWindow() {
+    recoveryWindowListenerCleanup?.();
+    recoveryWindowListenerCleanup = null;
+    const candidate = recovery;
+    recovery = null;
+    recoveryStatus = null;
+    if (!candidate) return;
+    destroyingRecoveryWindow = true;
+    try {
+      candidate.destroy?.();
+    } finally {
+      destroyingRecoveryWindow = false;
+    }
+  }
+
+  function showRecoveryWindow(status = "starting") {
+    if (quitting) return false;
+    if (!RECOVERY_STATUSES.includes(status)) status = "companion_spawn_failed";
+    if (!recovery || recovery.window?.isDestroyed?.()) {
+      const selectedPreloadPath = recoveryPreloadPath
+        ?? resolve(dirname(preloadPath), "recovery-preload.cjs");
+      recovery = createRecoveryWindow({
+        BrowserWindow,
+        preloadPath: selectedPreloadPath,
+        status,
+        windowOptions: recoveryWindowOptions,
+        onAction: handleRecoveryAction,
+        locale: activeDesktopLocale,
+        systemLocales: desktopSystemLocales,
+      });
+      const recoveryWindow = recovery.window;
+      const onWindowClose = (event) => {
+        if (quitting || destroyingRecoveryWindow) return;
+        event?.preventDefault?.();
+        recovery?.hide?.();
+      };
+      recoveryWindow.on?.("close", onWindowClose);
+      recoveryWindowListenerCleanup = () => {
+        recoveryWindow.off?.("close", onWindowClose);
+      };
+    } else if (recovery.status !== status) {
+      recovery.setStatus(status);
+    }
+    recoveryStatus = status;
+    recovery.show?.();
+    return true;
   }
 
   // Keep tray menu actions on the same bounded window operations used by the
@@ -94,6 +460,26 @@ export function createDesktopLifecycle({
     return false;
   }
 
+  function getDesktopActionInterface() {
+    if (desktopActionInterface !== null) return desktopActionInterface;
+    const suppliedActions = desktopActions === null
+      || typeof desktopActions !== "object"
+      || Array.isArray(desktopActions)
+      ? {}
+      : desktopActions;
+    desktopActionInterface = createDesktopActionInterface({
+      ...suppliedActions,
+      show: suppliedActions.show ?? showWindow,
+      focus: suppliedActions.focus ?? showWindow,
+      refresh: suppliedActions.refresh ?? (() => sendDashboardCommand({ command: "refresh" })),
+      retry: suppliedActions.retry ?? (() => retry()),
+      settings: suppliedActions.settings ?? (() => showSettingsWindow()),
+      about: suppliedActions.about ?? (() => showSettingsWindow("about")),
+      quit: suppliedActions.quit ?? (() => { void requestQuit(); }),
+    });
+    return desktopActionInterface;
+  }
+
   function enqueueExclusive(operation) {
     const previous = lifecycleOperation;
     const current = previous.catch(() => {}).then(operation);
@@ -102,6 +488,9 @@ export function createDesktopLifecycle({
   }
 
   function destroyWindow() {
+    dashboardReady = false;
+    downloadHandlerInstallation?.remove?.();
+    downloadHandlerInstallation = null;
     windowReadyListenerCleanup?.();
     windowReadyListenerCleanup = null;
     windowListenerCleanup?.();
@@ -110,6 +499,25 @@ export function createDesktopLifecycle({
     policyInstallation = null;
     if (window && !window.isDestroyed?.()) window.destroy?.();
     window = null;
+  }
+
+  function destroySettingsWindow() {
+    settingsWindowReadyListenerCleanup?.();
+    settingsWindowReadyListenerCleanup = null;
+    settingsWindowListenerCleanup?.();
+    settingsWindowListenerCleanup = null;
+    settingsPolicyInstallation?.remove?.();
+    settingsPolicyInstallation = null;
+    const candidate = settingsWindow;
+    settingsWindow = null;
+    settingsLoadedURL = null;
+    if (!candidate || candidate.isDestroyed?.()) return;
+    destroyingSettingsWindow = true;
+    try {
+      candidate.destroy?.();
+    } finally {
+      destroyingSettingsWindow = false;
+    }
   }
 
   function createWindow() {
@@ -130,6 +538,7 @@ export function createDesktopLifecycle({
       show: false,
     };
     window = new BrowserWindow(selectedOptions);
+    dashboardReady = false;
     const webContents = window.webContents;
     const session = webContents?.session;
     const policy = createNavigationPolicy({ origin: ready.origin });
@@ -137,8 +546,39 @@ export function createDesktopLifecycle({
       webContents,
       session,
       policy,
+      allowBlobDownloads: true,
     });
-    const onReadyToShow = () => showWindow();
+    if (ownedDownloadsRegistry !== null) {
+      downloadHandlerInstallation = installDesktopOwnedDownloadHandler({
+        session,
+        dashboardWebContents: webContents,
+        origin: ready.origin,
+        registry: ownedDownloadsRegistry,
+        onState: (command) => {
+          // The download handler can settle asynchronously, after a retry or
+          // shutdown has invalidated this BrowserWindow.  Only the current,
+          // already-visible dashboard may receive the fixed semantic state;
+          // no stale renderer gets a completion signal.
+          if (!dashboardReady
+              || window?.webContents !== webContents
+              || !isLiveBrowserWindow(window)) {
+            return;
+          }
+          sendDashboardCommand(command);
+        },
+      });
+    }
+    const onReadyToShow = () => {
+      if (dashboardReady) return;
+      dashboardReady = true;
+      showWindow();
+      try {
+        onDashboardReady?.();
+      } catch {
+        // A bounded deep-link wake callback is presentation-only. A callback
+        // failure must not tear down the trusted dashboard lifecycle.
+      }
+    };
     window.once?.("ready-to-show", onReadyToShow);
     windowReadyListenerCleanup = () => {
       window?.off?.("ready-to-show", onReadyToShow);
@@ -157,37 +597,241 @@ export function createDesktopLifecycle({
     return window;
   }
 
+  function createSettingsWindow(section) {
+    const url = settingsURL(section);
+    if (isLiveBrowserWindow(settingsWindow)) return settingsWindow;
+    if (!ready?.origin) throw shellError("electron_configuration_invalid");
+    const suppliedSettingsOptions = settingsWindowOptions === null
+      || typeof settingsWindowOptions !== "object"
+      || Array.isArray(settingsWindowOptions)
+      ? {}
+      : settingsWindowOptions;
+    const selectedOptions = {
+      ...DEFAULT_SETTINGS_WINDOW_OPTIONS,
+      ...suppliedSettingsOptions,
+      webPreferences: {
+        ...(suppliedSettingsOptions.webPreferences ?? {}),
+        preload: preloadPath,
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true,
+        webSecurity: true,
+        allowRunningInsecureContent: false,
+      },
+      show: false,
+    };
+    settingsWindow = new BrowserWindow(selectedOptions);
+    const webContents = settingsWindow.webContents;
+    const session = webContents?.session;
+    const policy = createNavigationPolicy({ origin: ready.origin });
+    settingsPolicyInstallation = installNavigationPolicy({
+      webContents,
+      session,
+      policy,
+    });
+    const onReadyToShow = () => {
+      if (isLiveBrowserWindow(settingsWindow)) {
+        settingsWindow.show?.();
+        settingsWindow.focus?.();
+      }
+    };
+    settingsWindow.once?.("ready-to-show", onReadyToShow);
+    settingsWindowReadyListenerCleanup = () => {
+      settingsWindow?.off?.("ready-to-show", onReadyToShow);
+    };
+    const onWindowClose = (event) => {
+      if (quitting || destroyingSettingsWindow) return;
+      event?.preventDefault?.();
+      settingsWindow?.hide?.();
+    };
+    const onWindowClosed = () => {
+      if (settingsWindow?.webContents !== webContents) return;
+      settingsWindowReadyListenerCleanup?.();
+      settingsWindowReadyListenerCleanup = null;
+      settingsWindowListenerCleanup = null;
+      settingsPolicyInstallation?.remove?.();
+      settingsPolicyInstallation = null;
+      settingsWindow = null;
+      settingsLoadedURL = null;
+    };
+    settingsWindow.on("close", onWindowClose);
+    settingsWindow.on("closed", onWindowClosed);
+    settingsWindowListenerCleanup = () => {
+      settingsWindow?.off?.("close", onWindowClose);
+      settingsWindow?.off?.("closed", onWindowClosed);
+    };
+    const candidate = settingsWindow;
+    const loadResult = candidate.loadURL?.(url);
+    settingsLoadedURL = url;
+    loadResult?.catch?.(() => {
+      if (settingsWindow === candidate) settingsLoadedURL = null;
+    });
+    return settingsWindow;
+  }
+
+  function showSettingsWindow(section = "general") {
+    const selectedSection = assertSettingsSection(section);
+    if (!started || quitting || !ready?.origin) return false;
+    const hadWindow = isLiveBrowserWindow(settingsWindow);
+    const target = createSettingsWindow(selectedSection);
+    const targetURL = settingsURL(selectedSection);
+    if (hadWindow && settingsLoadedURL !== targetURL) {
+      settingsLoadedURL = targetURL;
+      const loadResult = target.loadURL?.(targetURL);
+      loadResult?.catch?.(() => {
+        if (settingsWindow === target) settingsLoadedURL = null;
+      });
+    }
+    // A newly-created window waits for ready-to-show to avoid a blank flash;
+    // an existing window is already safe to show and should be focused now.
+    if (hadWindow) {
+      target.show?.();
+      target.focus?.();
+    }
+    return true;
+  }
+
   function createTray() {
     if (tray || typeof Tray !== "function") return tray;
     if (icon === undefined) throw shellError("electron_configuration_invalid");
     tray = new Tray(icon);
     tray.setToolTip?.(appName);
-    const template = [
-      { label: `Show ${appName}`, click: () => invokeTrayCommand("show") },
-      { label: `Hide ${appName}`, click: () => invokeTrayCommand("hide") },
-      { label: "Retry", click: () => retry() },
-      { type: "separator" },
-      { label: "Quit", click: () => { void requestQuit(); } },
-    ];
+    const template = createDesktopTrayTemplate({
+      appName,
+      actions: getDesktopActionInterface(),
+      trayStatus: desktopTrayStatus,
+      locale: activeDesktopLocale,
+      systemLocales: desktopSystemLocales,
+    });
     const menu = Menu?.buildFromTemplate?.(template);
     tray.setContextMenu?.(menu);
     tray.on?.("click", () => invokeTrayCommand("toggle"));
     return tray;
   }
 
+  function createApplicationMenu() {
+    if (applicationMenu !== null) return applicationMenu;
+    applicationMenu = installDesktopApplicationMenu({
+      Menu,
+      appName,
+      platform,
+      actions: getDesktopActionInterface(),
+      locale: activeDesktopLocale,
+      systemLocales: desktopSystemLocales,
+    });
+    return applicationMenu;
+  }
+
+  function refreshDesktopSurfaces() {
+    if (applicationMenu !== null) {
+      applicationMenu = installDesktopApplicationMenu({
+        Menu,
+        appName,
+        platform,
+        actions: getDesktopActionInterface(),
+        locale: activeDesktopLocale,
+        systemLocales: desktopSystemLocales,
+      });
+    }
+    if (tray && typeof Menu?.buildFromTemplate === "function") {
+      const template = createDesktopTrayTemplate({
+        appName,
+        actions: getDesktopActionInterface(),
+        trayStatus: desktopTrayStatus,
+        locale: activeDesktopLocale,
+        systemLocales: desktopSystemLocales,
+      });
+      tray.setContextMenu?.(Menu.buildFromTemplate(template));
+    }
+  }
+
+  function setDesktopLanguage(value) {
+    activeDesktopLocale = value;
+    if (!started || quitting) return false;
+    refreshDesktopSurfaces();
+    return true;
+  }
+
+  async function attemptStartup() {
+    if (startupAttemptPromise !== null) return startupAttemptPromise;
+    startupAttemptPromise = (async () => {
+      startupInProgress = true;
+      startupUnexpectedExit = false;
+      startupFailureStatus = null;
+      showRecoveryWindow("starting");
+      try {
+        ready = await supervisor.start();
+        if (startupUnexpectedExit) {
+          throw shellError("companion_exit_before_ready");
+        }
+        if (quitting) {
+          await supervisor.stop().catch(() => {});
+          throw shellError("companion_not_running");
+        }
+        createWindow();
+        if (startupUnexpectedExit) {
+          throw shellError("companion_exit_before_ready");
+        }
+        // The recovery surface owns the process until the validated dashboard
+        // origin has been loaded. It is destroyed before any dashboard
+        // renderer can become visible, so it cannot retain a stale origin.
+        destroyRecoveryWindow();
+        started = true;
+        lifecycleActive = true;
+        startDesktopStatusMonitor(ready.origin);
+        return Object.freeze({ status: "ready", origin: ready.origin });
+      } catch (error) {
+        const status = recoveryStatusFor(
+          error,
+          startupUnexpectedExit ? "companion_exit_before_ready" : "companion_spawn_failed",
+        );
+        stopDesktopStatusMonitor();
+        ready = null;
+        destroyWindow();
+        destroySettingsWindow();
+        await supervisor.stop().catch(() => {});
+        started = false;
+        startupFailureStatus = status;
+        if (quitting) throw error;
+        showRecoveryWindow(status);
+        // A companion failure is a recoverable application state. Keep the
+        // menu/tray and process alive so Retry and Quit remain available.
+        return Object.freeze({ status: "recovery", origin: null, failure: status });
+      } finally {
+        startupInProgress = false;
+        startupAttemptPromise = null;
+      }
+    })();
+    startupAttemptPromise.catch(() => {});
+    return startupAttemptPromise;
+  }
+
   async function start() {
     if (quitting) throw shellError("companion_not_running");
     if (started) return Object.freeze({ status: "ready", origin: ready?.origin ?? null });
-    if (typeof app.requestSingleInstanceLock === "function"
-        && !app.requestSingleInstanceLock()) {
-      app.quit?.();
-      return Object.freeze({ status: "secondary_instance", origin: null });
+    if (lifecycleActive) {
+      return Object.freeze({
+        status: "recovery",
+        origin: null,
+        failure: startupFailureStatus,
+      });
     }
-    primaryInstance = true;
+    if (singleInstanceLockAcquired) {
+      primaryInstance = true;
+    } else {
+      if (typeof app.requestSingleInstanceLock === "function"
+          && !app.requestSingleInstanceLock()) {
+        app.quit?.();
+        return Object.freeze({ status: "secondary_instance", origin: null });
+      }
+      primaryInstance = true;
+    }
+    lifecycleActive = true;
     listen(app, "second-instance", showWindow);
     listen(app, "activate", () => {
       if (window && !window.isDestroyed?.()) showWindow();
       else if (started) createWindow();
+      else showRecoveryWindow(startupFailureStatus ?? "starting");
     });
     listen(app, "before-quit", (event) => {
       if (quitting) return;
@@ -199,51 +843,80 @@ export function createDesktopLifecycle({
     try {
       await app.whenReady?.();
       if (quitting) throw shellError("companion_not_running");
-      ready = await supervisor.start();
-      if (quitting) {
-        await supervisor.stop().catch(() => {});
-        throw shellError("companion_not_running");
-      }
-      createWindow();
+      createApplicationMenu();
       createTray();
-      started = true;
-      return Object.freeze({ status: "ready", origin: ready.origin });
+      // Create a visible, isolated launcher before asking the companion to
+      // spawn. A timeout/early exit therefore leaves the user with a bounded
+      // recovery path instead of a disappearing app.
+      showRecoveryWindow("starting");
+      return await attemptStartup();
     } catch (error) {
       destroyWindow();
+      destroySettingsWindow();
+      destroyRecoveryWindow();
       tray?.destroy?.();
       tray = null;
       await supervisor.stop().catch(() => {});
-      app.quit?.();
+      lifecycleActive = false;
+      // Only a composition/configuration failure reaches this boundary. A
+      // companion startup failure is converted to a recovery result inside
+      // attemptStartup and never calls app.quit here.
+      if (quitting) app.quit?.();
       throw error instanceof Error && error.code?.startsWith("electron_shell_")
         ? error
         : shellError("companion_spawn_failed");
+    } finally {
+      startupInProgress = false;
     }
   }
 
   function performRetry({ epoch = lifecycleEpoch } = {}) {
-    if (!started || quitting) return Promise.reject(shellError("companion_not_running"));
+    if (!lifecycleActive || quitting) return Promise.reject(shellError("companion_not_running"));
     const operation = enqueueExclusive(async () => {
       if (quitting || epoch !== lifecycleEpoch) throw shellError("companion_busy");
+      stopDesktopStatusMonitor();
       destroyWindow();
+      destroySettingsWindow();
+      showRecoveryWindow("starting");
       ready = null;
-      await supervisor.stop();
-      if (quitting || epoch !== lifecycleEpoch) throw shellError("companion_busy");
-      ready = await supervisor.start();
-      if (quitting || epoch !== lifecycleEpoch) {
-        await supervisor.stop().catch(() => {});
+      started = false;
+      try {
+        await supervisor.stop();
+        if (quitting || epoch !== lifecycleEpoch) throw shellError("companion_busy");
+        ready = await supervisor.start();
+        if (quitting || epoch !== lifecycleEpoch) {
+          await supervisor.stop().catch(() => {});
+          ready = null;
+          throw shellError("companion_busy");
+        }
+        createWindow();
+        destroyRecoveryWindow();
+        started = true;
+        startupFailureStatus = null;
+        startDesktopStatusMonitor(ready.origin);
+        showWindow();
+        return Object.freeze({ status: "ready", origin: ready.origin });
+      } catch (error) {
+        if (quitting || epoch !== lifecycleEpoch) throw error;
+        const status = recoveryStatusFor(error);
+        stopDesktopStatusMonitor();
         ready = null;
-        throw shellError("companion_busy");
+        destroyWindow();
+        destroySettingsWindow();
+        await supervisor.stop().catch(() => {});
+        started = false;
+        startupFailureStatus = status;
+        showRecoveryWindow(status);
+        return Object.freeze({ status: "recovery", origin: null, failure: status });
       }
-      createWindow();
-      showWindow();
-      return Object.freeze({ status: "ready", origin: ready.origin });
     });
     operation.catch(() => {});
     return operation;
   }
 
   function retry() {
-    if (!started || quitting) return Promise.reject(shellError("companion_not_running"));
+    if (!lifecycleActive || quitting) return Promise.reject(shellError("companion_not_running"));
+    if (startupAttemptPromise !== null) return startupAttemptPromise;
     // A user-directed Retry is a new bounded recovery attempt. The automatic
     // lane itself remains capped at one restart per child failure sequence.
     automaticRetryUsed = false;
@@ -257,7 +930,7 @@ export function createDesktopLifecycle({
   }
 
   function scheduleAutomaticRetry() {
-    if (!started || quitting || automaticRetryUsed || automaticRetryPromise !== null) {
+    if (!lifecycleActive || quitting || automaticRetryUsed || automaticRetryPromise !== null) {
       return;
     }
     automaticRetryUsed = true;
@@ -266,6 +939,9 @@ export function createDesktopLifecycle({
     // Invalidate the old webview synchronously before queueing the restart, so
     // no stale origin remains usable while the child is being replaced.
     destroyWindow();
+    destroySettingsWindow();
+    started = false;
+    showRecoveryWindow("companion_exit_before_ready");
     automaticRetryPromise = performRetry({ epoch }).finally(() => {
       automaticRetryPromise = null;
     });
@@ -273,11 +949,28 @@ export function createDesktopLifecycle({
   }
 
   function handleUnexpectedCompanionExit() {
-    if (!started || quitting) return;
+    if (quitting) return;
+    if (!started) {
+      if (!startupInProgress) return;
+      // The supervisor can report a child exit after emitting its ready line
+      // but before start() has published the lifecycle as ready.  Invalidate
+      // and tear down any window created during that small startup window;
+      // otherwise a stale-origin BrowserWindow could survive a failed launch.
+      startupUnexpectedExit = true;
+      stopDesktopStatusMonitor();
+      ready = null;
+      startupFailureStatus = "companion_exit_before_ready";
+      showRecoveryWindow("companion_exit_before_ready");
+      return;
+    }
     // Even after the one automatic retry has been consumed, no dead child may
     // leave its old-origin window usable. Manual tray Retry is the next path.
+    stopDesktopStatusMonitor();
     ready = null;
     destroyWindow();
+    destroySettingsWindow();
+    started = false;
+    showRecoveryWindow("companion_exit_before_ready");
     scheduleAutomaticRetry();
   }
 
@@ -285,9 +978,19 @@ export function createDesktopLifecycle({
     if (shutdownPromise !== null) return shutdownPromise;
     quitting = true;
     ++lifecycleEpoch;
+    stopDesktopStatusMonitor();
+    const pendingStartup = startupAttemptPromise;
     shutdownPromise = enqueueExclusive(async () => {
       destroyWindow();
+      destroySettingsWindow();
+      destroyRecoveryWindow();
+      // The supervisor owns the child created during its bounded startup
+      // handshake. Wait for that handshake to settle before allowing Electron
+      // to exit; otherwise a child that has not emitted its ready line could
+      // outlive the GUI process.
+      await pendingStartup?.catch(() => {});
       await supervisor.stop().catch(() => {});
+      ownedDownloadsRegistry?.clear?.();
       tray?.destroy?.();
       tray = null;
       app.quit?.();
@@ -299,14 +1002,19 @@ export function createDesktopLifecycle({
   async function dispose() {
     quitting = true;
     ++lifecycleEpoch;
+    stopDesktopStatusMonitor();
     await enqueueExclusive(async () => {
       destroyWindow();
+      destroySettingsWindow();
+      destroyRecoveryWindow();
       tray?.destroy?.();
       tray = null;
       await supervisor.stop().catch(() => {});
+      ownedDownloadsRegistry?.clear?.();
       supervisor.setUnexpectedExitHandler?.(undefined);
       for (const remove of listeners.splice(0)) remove();
       started = false;
+      lifecycleActive = false;
       primaryInstance = false;
     });
   }
@@ -319,22 +1027,44 @@ export function createDesktopLifecycle({
     start,
     retry,
     showWindow,
+    showSettingsWindow,
     hideWindow,
     toggleWindow,
+    sendDashboardCommand,
+    setDesktopLanguage,
     invokeTrayCommand,
     requestQuit,
     dispose,
     createWindow,
+    isAuthorizedDesktopSender,
+    isAuthorizedDesktopFrame,
+    isAuthorizedDesktopDownloadContext,
+    revealLatestDownload() {
+      if (ownedDownloadsRegistry === null) return Promise.resolve("unavailable");
+      return ownedDownloadsRegistry.revealLatest();
+    },
     get state() {
       return Object.freeze({
         started,
         quitting,
         primaryInstance,
         hasWindow: window !== null && !window.isDestroyed?.(),
+        dashboardReady,
         windowVisible: window !== null
           && !window.isDestroyed?.()
           && window.isVisible?.() === true,
+        hasRecoveryWindow: recovery !== null
+          && !recovery.window?.isDestroyed?.(),
+        recoveryWindowVisible: recovery !== null
+          && !recovery.window?.isDestroyed?.()
+          && recovery.window?.isVisible?.() === true,
+        recoveryStatus,
+        active: lifecycleActive,
         hasTray: tray !== null,
+        hasSettingsWindow: settingsWindow !== null && !settingsWindow.isDestroyed?.(),
+        settingsWindowVisible: settingsWindow !== null
+          && !settingsWindow.isDestroyed?.()
+          && settingsWindow.isVisible?.() === true,
         origin: ready?.origin ?? null,
       });
     },

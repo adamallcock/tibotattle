@@ -1063,6 +1063,75 @@ async function assertSecondInstanceNeverReady(child, port) {
   }
 }
 
+function assertRendererShellSnapshot(snapshot) {
+  if (snapshot?.topbar !== true) fail("WINDOWS_ELECTRON_SMOKE_SHELL_TOPBAR_MISSING");
+  if (snapshot?.sidebar !== true) fail("WINDOWS_ELECTRON_SMOKE_SHELL_SIDEBAR_MISSING");
+  if (snapshot?.navCount !== 5) fail("WINDOWS_ELECTRON_SMOKE_SHELL_NAVIGATION_INVALID");
+  if (snapshot?.activeLinkCount !== 1) fail("WINDOWS_ELECTRON_SMOKE_SHELL_ACTIVE_NAV_INVALID");
+  if (snapshot?.activePageCount !== 1) fail("WINDOWS_ELECTRON_SMOKE_SHELL_ACTIVE_PAGE_INVALID");
+  if (snapshot?.refresh !== true) fail("WINDOWS_ELECTRON_SMOKE_SHELL_REFRESH_MISSING");
+  if (snapshot?.language !== true) fail("WINDOWS_ELECTRON_SMOKE_SHELL_LANGUAGE_MISSING");
+}
+
+async function assertRendererShell(cdp) {
+  const snapshot = await cdp.evaluate(`(() => {
+    const visible = (element) => {
+      if (!element) return false;
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none"
+        && style.visibility !== "hidden"
+        && rect.width > 0
+        && rect.height > 0;
+    };
+    const navLinks = [...document.querySelectorAll("[data-nav]")];
+    return {
+      topbar: visible(document.querySelector(".topbar")),
+      sidebar: visible(document.querySelector(".dashboard-sidebar")),
+      navCount: navLinks.length,
+      activeLinkCount: navLinks.filter((link) =>
+        link.classList.contains("active")
+        && link.getAttribute("aria-current") === "page",
+      ).length,
+      activePageCount: document.querySelectorAll(
+        ".dashboard-section[data-dashboard-page]:not(.dashboard-page-inactive)",
+      ).length,
+      refresh: Boolean(document.querySelector("#refresh-button")),
+      language: Boolean(document.querySelector("[data-language-picker]")),
+    };
+  })()`);
+  assertRendererShellSnapshot(snapshot);
+
+  const trends = await cdp.evaluate(`(() => {
+    const trendsLink = document.querySelector('[data-nav="trends"]');
+    const trendsPage = document.querySelector(
+      '[data-dashboard-page="trends"].dashboard-section',
+    );
+    const overviewPage = document.querySelector(
+      '[data-dashboard-page="overview"].dashboard-section',
+    );
+    trendsLink?.click();
+    return {
+      activeLink: trendsLink?.classList.contains("active") === true
+        && trendsLink?.getAttribute("aria-current") === "page",
+      activePage: trendsPage?.classList.contains("dashboard-page-inactive") === false
+        && trendsPage?.inert === false
+        && trendsPage?.hasAttribute("aria-hidden") === false,
+      previousPageInactive: overviewPage?.classList.contains("dashboard-page-inactive") === true
+        && overviewPage?.inert === true
+        && overviewPage?.getAttribute("aria-hidden") === "true",
+      activePageCount: document.querySelectorAll(
+        ".dashboard-section[data-dashboard-page]:not(.dashboard-page-inactive)",
+      ).length,
+    };
+  })()`);
+  if (trends?.activeLink !== true) fail("WINDOWS_ELECTRON_SMOKE_SHELL_TRENDS_INACTIVE");
+  if (trends?.activePage !== true) fail("WINDOWS_ELECTRON_SMOKE_SHELL_TRENDS_PAGE_INACTIVE");
+  if (trends?.previousPageInactive !== true) fail("WINDOWS_ELECTRON_SMOKE_SHELL_PREVIOUS_PAGE_ACTIVE");
+  if (trends?.activePageCount !== 1) fail("WINDOWS_ELECTRON_SMOKE_SHELL_TRENDS_COUNT_INVALID");
+  await cdp.evaluate(`document.querySelector('[data-nav="overview"]')?.click()`);
+}
+
 async function dashboardConnection(child, port) {
   const version = await waitFor(
     () => {
@@ -1109,6 +1178,7 @@ async function dashboardConnection(child, port) {
     "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT",
   );
   if (health.status !== "ready") fail("WINDOWS_ELECTRON_SMOKE_COMPANION_NOT_READY");
+  await assertRendererShell(cdp);
   return Object.freeze({ cdp, dashboardUrl, browser: version.Browser });
 }
 
@@ -1179,6 +1249,7 @@ async function runSyntheticRefresh(connection) {
   // A completed refresh must still be renderable by the dashboard after the
   // data pass, not merely accepted by the mutation endpoint.
   await reloadDashboardDocument(connection);
+  await assertRendererShell(connection.cdp);
 }
 
 async function writePersistentQualificationState(connection) {

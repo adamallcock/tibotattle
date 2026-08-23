@@ -310,6 +310,65 @@ test("literal generated browser text stays in the translation inventory", async 
   }
 });
 
+test("local analysis controls and bounded progress use semantic live-localized messages", async () => {
+  const source = await readFile(
+    new URL("../apps/web/public/app.js", import.meta.url),
+    "utf8",
+  );
+  const refreshStart = source.indexOf("async function requestRefresh(");
+  const refreshEnd = source.indexOf("async function cancelLocalAnalysis", refreshStart);
+  assert.ok(refreshStart >= 0 && refreshEnd > refreshStart, "refresh renderer is available");
+  const refreshSource = source.slice(refreshStart, refreshEnd);
+  for (const key of [
+    "localAnalysis.progress.starting",
+    "localAnalysis.progress.reconnecting",
+    "localAnalysis.progress.stopping",
+    "localAnalysis.progress.indexingArchive",
+    "localAnalysis.progress.headlineReady",
+    "localAnalysis.progress.calculating",
+    "localAnalysis.progress.analyzingFiles",
+    "localAnalysis.progress.analyzingEvidence",
+    "localAnalysis.progress.analyzingElapsed",
+    "localAnalysis.progress.continuing",
+    "localAnalysis.progress.finalizingPause",
+    "localAnalysis.progress.loadingSaved",
+    "localAnalysis.progress.loadingUpdated",
+    "localAnalysis.notice.cancelledTitle",
+    "localAnalysis.notice.resourceLimitedTitle",
+    "localAnalysis.notice.continuationLimitTitle",
+  ]) {
+    assert.match(refreshSource, new RegExp(key.replaceAll(".", "\\."), "u"), key);
+    assert.equal(Object.hasOwn(WEB_MESSAGES, key), true, `${key} is catalogued`);
+  }
+  assert.match(source, /setLocalizedText\(button, label\)/u);
+  assert.match(source, /localAnalysis\.action\.continue/u);
+  assert.match(source, /localAnalysis\.action\.update/u);
+  assert.match(source, /localAnalysis\.action\.analyze/u);
+  assert.match(source, /localRefreshCancelRequested \? "action\.cancelling" : "action\.cancel"/u);
+  assert.doesNotMatch(refreshSource, /button\.textContent\s*=\s*["'`]/u);
+
+  assert.equal(
+    translate("localAnalysis.action.analyze", {}, "zh-Hans"),
+    "分析本地使用情况",
+  );
+  assert.equal(
+    translate(
+      "localAnalysis.progress.analyzingFiles",
+      { processed: 12, selected: 40 },
+      "es",
+    ),
+    "Analizando 12/40 archivos…",
+  );
+  assert.equal(
+    translate(
+      "localAnalysis.setup.boundedSummary",
+      { processed: 3, selected: 10 },
+      "zh-Hans",
+    ),
+    "有界运行已安全完成：已分析最近发布文件中的 3/10 个。方便时可继续；现有结果仍可使用。",
+  );
+});
+
 test("browser override persists while native override is message-validated and does not reload", () => {
   const storage = memoryStorage();
   const browserWindow = fakeWindow({ languages: ["es-MX"], storage });

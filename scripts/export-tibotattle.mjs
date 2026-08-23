@@ -150,6 +150,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/contribution/telemetry-v01-projection.js",
   "src/contribution/telemetry-v02-projection.js",
   "src/contribution/telemetry-v1-chunks.js",
+  "src/desktop-shell-status.js",
   "src/export-contract.js",
   "src/export-identity-keychain.js",
   "src/export-identity-production.js",

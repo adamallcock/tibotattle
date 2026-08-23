@@ -484,11 +484,11 @@ function localAnalysisAllowed(value = localOnboarding) {
 
 function localAnalysisLabel() {
   if (dashboard?.collector?.indexing?.status === "bounded_pause") {
-    return "Continue local analysis";
+    return "localAnalysis.action.continue";
   }
   return dashboard?.activity?.lastScanAt || dashboard?.collector?.lastScanAt
-    ? "Update local usage"
-    : "Analyze local usage";
+    ? "localAnalysis.action.update"
+    : "localAnalysis.action.analyze";
 }
 
 function updateLocalActionButtons() {
@@ -497,7 +497,7 @@ function updateLocalActionButtons() {
   for (const selector of ["#refresh-button", "#setup-refresh"]) {
     const button = $(selector);
     button.disabled = localActionBusy || !allowed;
-    if (!localActionBusy) button.textContent = label;
+    if (!localActionBusy) setLocalizedText(button, label);
   }
   const setupCheck = $("#setup-check-again");
   if (setupCheck) setupCheck.disabled = localActionBusy;
@@ -508,7 +508,10 @@ function updateLocalActionButtons() {
   const cancel = $("#cancel-refresh");
   cancel.hidden = !localRefreshInProgress;
   cancel.disabled = localRefreshCancelRequested;
-  cancel.textContent = localRefreshCancelRequested ? "Cancelling…" : "Cancel";
+  setLocalizedText(
+    cancel,
+    localRefreshCancelRequested ? "action.cancelling" : "action.cancel",
+  );
 }
 
 function setCommunitySession(value) {
@@ -781,10 +784,10 @@ function renderHistoryIndexBadge(data) {
     return;
   }
   badge.hidden = false;
-  setRawText(badge, t("status.indexingHistory", {
+  setLocalizedText(badge, "status.indexingHistory", {
     indexed: compact(indexed),
     total: compact(total),
-  }));
+  });
 }
 
 function renderGlobalState() {
@@ -987,20 +990,30 @@ function renderLocalOnboarding(value) {
   card.hidden = false;
   card.removeAttribute("aria-hidden");
   card.classList.toggle("needs-attention", !ready);
-  $("#setup-title").textContent = boundedPause
-    ? "Continue your local analysis"
-    : ready
-      ? "This Mac is ready"
-      : value.stateStatus === "unwritable" && sourceReady
-        ? "Local app state needs attention"
-        : sourceGuidance.title;
-  $("#setup-summary").textContent = boundedPause
-    ? `A bounded pass completed safely: ${compact(indexing.filesProcessed)} of ${compact(indexing.filesSelected)} recent rollout files are analyzed. Continue when convenient; existing results remain usable.`
-    : ready
-      ? "Codex metadata and TiboTattle's private state are available. Raw logs remain inside the local companion."
-    : value.stateStatus === "unwritable" && sourceReady
-      ? "TiboTattle can read Codex metadata but cannot safely write its private app state. Quit and reopen the Mac app, then check again before attempting an analysis."
-      : sourceGuidance.summary;
+  if (boundedPause) {
+    setLocalizedText($("#setup-title"), "localAnalysis.setup.continueTitle");
+    setLocalizedText($("#setup-summary"), "localAnalysis.setup.boundedSummary", {
+      processed: compact(indexing.filesProcessed),
+      selected: compact(indexing.filesSelected),
+    });
+  } else {
+    setProductText(
+      $("#setup-title"),
+      ready
+        ? "This Mac is ready"
+        : value.stateStatus === "unwritable" && sourceReady
+          ? "Local app state needs attention"
+          : sourceGuidance.title,
+    );
+    setProductText(
+      $("#setup-summary"),
+      ready
+        ? "Codex metadata and TiboTattle's private state are available. Raw logs remain inside the local companion."
+        : value.stateStatus === "unwritable" && sourceReady
+          ? "TiboTattle can read Codex metadata but cannot safely write its private app state. Quit and reopen the Mac app, then check again before attempting an analysis."
+          : sourceGuidance.summary,
+    );
+  }
 
   const checks = $("#setup-checks");
   clear(checks);
@@ -1028,11 +1041,16 @@ function renderLocalOnboarding(value) {
     const row = node("li", item.ok ? "" : "missing", item.text);
     checks.append(row);
   }
-  $("#setup-note").textContent = ready
-    ? boundedPause
-      ? "Continue when convenient. A useful headline is already available; later bounded updates are normally faster. Existing results remain visible, and every additional pass stays on this Mac."
-      : "A useful headline often appears in seconds. The first deep pass can take a few minutes and later updates are normally faster. Work stops or checkpoints at a fixed bound; prompts, responses, commands, paths, and account identifiers never enter this page."
-      : "After completing the action above, choose Check again. Checking does not analyze logs or upload anything.";
+  if (ready && boundedPause) {
+    setLocalizedText($("#setup-note"), "localAnalysis.setup.boundedNote");
+  } else {
+    setProductText(
+      $("#setup-note"),
+      ready
+        ? "A useful headline often appears in seconds. The first deep pass can take a few minutes and later updates are normally faster. Work stops or checkpoints at a fixed bound; prompts, responses, commands, paths, and account identifiers never enter this page."
+        : "After completing the action above, choose Check again. Checking does not analyze logs or upload anything.",
+    );
+  }
   if (!ready) setGlobalState("setup", { companionReachable: true });
   setJourneyState(ready ? "local-ready" : "needs-local-setup");
   updateLocalActionButtons();
@@ -1908,6 +1926,12 @@ let shareCard = null;
 let shareCardReference = "";
 let shareCardSignature = "";
 let shareCardBusy = false;
+// Electron owns the actual download and reports only a fixed semantic result
+// after it has verified the completed file. Keep this state separate from
+// `shareCardBusy`: the PNG request can finish before the OS download does.
+let electronShareCardDownloadPending = false;
+let electronShareCardDownloadTimeout = null;
+const ELECTRON_SHARE_CARD_DOWNLOAD_TIMEOUT_MS = 15_000;
 // The posted image uses the same bundled mark as the dashboard and macOS app.
 // If it loads after a card has been drawn, repaint the existing card rather
 // than leaving an approximated logo in the image.
@@ -2933,8 +2957,92 @@ function showShareCardToast(text, { actionLabel = "", onAction = null } = {}) {
   }, SHARE_CARD_TOAST_HOLD_MS);
 }
 
+function electronShareCardBridge() {
+  return document.body?.classList?.contains("electron-dashboard")
+    ? window.tibotattleDesktop ?? null
+    : null;
+}
+
+function showElectronShareCardRevealFailure() {
+  const message = t("shareCard.revealFailed");
+  setShareCardStatus(message, { error: true });
+  showShareCardToast(message);
+}
+
+function revealElectronShareCard() {
+  const bridge = electronShareCardBridge();
+  if (typeof bridge?.revealLatestDownload !== "function") {
+    showElectronShareCardRevealFailure();
+    return;
+  }
+  try {
+    // The bridge is intentionally zero-argument. Consume both synchronous
+    // throws and rejected promises so clicking Reveal can never create an
+    // unhandled rejection or imply that the folder opened when it did not.
+    const result = bridge.revealLatestDownload();
+    void Promise.resolve(result).then((outcome) => {
+      if (outcome !== "revealed") showElectronShareCardRevealFailure();
+    }).catch(() => {
+      showElectronShareCardRevealFailure();
+    });
+  } catch {
+    showElectronShareCardRevealFailure();
+  }
+}
+
+function handleElectronShareCardDownloadCompleted() {
+  if (!electronShareCardDownloadPending) return;
+  if (electronShareCardDownloadTimeout !== null) {
+    clearTimeout(electronShareCardDownloadTimeout);
+    electronShareCardDownloadTimeout = null;
+  }
+  electronShareCardDownloadPending = false;
+  updateShareCardActions();
+  setShareCardStatus(t("shareCard.saved"));
+  const bridge = electronShareCardBridge();
+  showShareCardToast(
+    t("shareCard.saved"),
+    typeof bridge?.revealLatestDownload === "function"
+      ? {
+        actionLabel: t("shareCard.showInFolder"),
+        onAction: revealElectronShareCard,
+      }
+      : {},
+  );
+}
+
+function handleElectronShareCardDownloadFailed() {
+  if (!electronShareCardDownloadPending) return;
+  if (electronShareCardDownloadTimeout !== null) {
+    clearTimeout(electronShareCardDownloadTimeout);
+    electronShareCardDownloadTimeout = null;
+  }
+  electronShareCardDownloadPending = false;
+  updateShareCardActions();
+  const message = t("shareCard.saveFailed");
+  setShareCardStatus(message, { error: true });
+  showShareCardToast(message);
+}
+
+function beginElectronShareCardDownload() {
+  electronShareCardDownloadPending = true;
+  if (electronShareCardDownloadTimeout !== null) {
+    clearTimeout(electronShareCardDownloadTimeout);
+  }
+  electronShareCardDownloadTimeout = setTimeout(() => {
+    electronShareCardDownloadTimeout = null;
+    handleElectronShareCardDownloadFailed();
+  }, ELECTRON_SHARE_CARD_DOWNLOAD_TIMEOUT_MS);
+  updateShareCardActions();
+  const saving = t("shareCard.saving");
+  setShareCardStatus(saving);
+  showShareCardToast(saving);
+}
+
 function updateShareCardActions() {
-  const ready = shareCard !== null && !shareCardBusy;
+  const ready = shareCard !== null
+    && !shareCardBusy
+    && !electronShareCardDownloadPending;
   for (const id of [
     "share-card-download",
     "share-card-copy",
@@ -3084,21 +3192,47 @@ function downloadShareCard() {
     const link = document.createElement("a");
     link.href = url;
     link.download = shareCardFileName(card);
-    link.click();
-    URL.revokeObjectURL(url);
+    const electron = document.body?.classList?.contains("electron-dashboard") === true;
+    if (electron) {
+      // Electron's main process owns the destination and has not verified the
+      // file yet. Do not claim a filename, expose its opaque destination, or
+      // offer Reveal until the payload-free completion command arrives.
+      beginElectronShareCardDownload();
+    }
+    try {
+      link.click();
+    } catch {
+      if (electron) {
+        handleElectronShareCardDownloadFailed();
+        return;
+      }
+      throw new Error("download could not be started");
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+    if (electron) return;
     // The image no longer prints the reference (owner-directed, 2026-08-08),
     // so the claim moved with the fact: the file name carries it.
     const saved = `Saved as ${shareCardFileName(card)}. The file name carries reference ${card.reference}.`;
-    // Reveal is native-only: the shell tracks where the download landed and
-    // shows it in Finder itself, so the page never learns a filesystem path.
+    // Reveal is shell-owned: the native or Electron shell tracks where the
+    // download landed and shows it in the OS file manager, so the page never
+    // learns a filesystem path.
     // In a plain browser the button is absent rather than disabled.
-    const bridge = document.body.classList.contains("native-dashboard")
+    const nativeBridge = document.body.classList.contains("native-dashboard")
       ? window.webkit?.messageHandlers?.tibotattleDownloads
       : undefined;
-    showShareCardToast(saved, bridge ? {
-      actionLabel: t("shareCard.showInFinder"),
-      onAction: () => bridge.postMessage({ type: "reveal-latest-download" }),
-    } : {});
+    const electronBridge = document.body.classList.contains("electron-dashboard")
+      ? window.tibotattleDesktop
+      : undefined;
+    const reveal = nativeBridge
+      ? () => nativeBridge.postMessage({ type: "reveal-latest-download" })
+      : typeof electronBridge?.revealLatestDownload === "function"
+        ? () => electronBridge.revealLatestDownload()
+        : null;
+    showShareCardToast(saved, reveal === null ? {} : {
+      actionLabel: t("shareCard.showInFolder"),
+      onAction: reveal,
+    });
   });
 }
 
@@ -9954,7 +10088,7 @@ async function loadLocalDashboard() {
   const previousBusy = localActionBusy;
   localActionBusy = true;
   const button = $("#refresh-button");
-  button.textContent = "Connecting…";
+  setLocalizedText(button, "action.connecting");
   updateLocalActionButtons();
   try {
     const syncState = (async () => {
@@ -10125,8 +10259,8 @@ async function requestRefresh({ autoContinue = false } = {}) {
   if (!autoContinue) reindexAutoContinuations = 0;
   if (!localAnalysisAllowed()) {
     showConnectionNotice({
-      title: "Finish the local check before analyzing",
-      copy: "Open Codex and complete one response, then choose Check again. TiboTattle will not start an analysis while its local preflight is incomplete.",
+      titleKey: "localAnalysis.notice.preflightTitle",
+      copyKey: "localAnalysis.notice.preflightCopy",
       kind: "warning",
       showCheck: true,
       showDemo: !dashboard,
@@ -10143,7 +10277,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
   localRefreshInProgress = true;
   localRefreshCancelRequested = false;
   archiveHistoryScanActive = false;
-  button.textContent = "Starting local analysis…";
+  setLocalizedText(button, "localAnalysis.progress.starting");
   updateLocalActionButtons();
   setGlobalState("updating");
   try {
@@ -10168,7 +10302,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
         consecutiveStatusFailures = 0;
       } catch (error) {
         consecutiveStatusFailures += 1;
-        button.textContent = "Update running; reconnecting…";
+        setLocalizedText(button, "localAnalysis.progress.reconnecting");
         if (consecutiveStatusFailures >= 8) throw error;
         continue;
       }
@@ -10203,17 +10337,34 @@ async function requestRefresh({ autoContinue = false } = {}) {
         ? progress.filesProcessed : null;
       const selected = Number.isSafeInteger(progress?.filesSelected)
         ? progress.filesSelected : null;
-      button.textContent = outcome === "cancelling"
-        ? "Stopping safely…"
-        : archiveScanning
-          ? `Indexing archive history… ${elapsedLabel}`
-        : progress?.phase === "quick_result"
-          ? `Headline ready; finishing deeper accounting… ${elapsedLabel}`
-        : processed !== null && selected !== null
-        ? selected > 0 && processed >= selected
-          ? `Calculating usage and allowance… ${elapsedLabel}`
-          : `Analyzing ${processed}/${selected} files…`
-        : pollCount < 3 ? "Analyzing local evidence…" : `Analyzing… ${elapsedLabel}`;
+      if (outcome === "cancelling") {
+        setLocalizedText(button, "localAnalysis.progress.stopping");
+      } else if (archiveScanning) {
+        setLocalizedText(button, "localAnalysis.progress.indexingArchive", {
+          elapsed: elapsedLabel,
+        });
+      } else if (progress?.phase === "quick_result") {
+        setLocalizedText(button, "localAnalysis.progress.headlineReady", {
+          elapsed: elapsedLabel,
+        });
+      } else if (processed !== null && selected !== null) {
+        if (selected > 0 && processed >= selected) {
+          setLocalizedText(button, "localAnalysis.progress.calculating", {
+            elapsed: elapsedLabel,
+          });
+        } else {
+          setLocalizedText(button, "localAnalysis.progress.analyzingFiles", {
+            processed: formatNumber(processed),
+            selected: formatNumber(selected),
+          });
+        }
+      } else if (pollCount < 3) {
+        setLocalizedText(button, "localAnalysis.progress.analyzingEvidence");
+      } else {
+        setLocalizedText(button, "localAnalysis.progress.analyzingElapsed", {
+          elapsed: elapsedLabel,
+        });
+      }
       if (refreshNeedsContinuation({
         outcome,
         errorCode: refresh.errorCode,
@@ -10228,7 +10379,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
           pollingBudget.noteContinuation();
           activePassStartedMs = Date.now();
           timeoutSettlementNoted = false;
-          button.textContent = "Continuing local analysis…";
+          setLocalizedText(button, "localAnalysis.progress.continuing");
         } catch (error) {
           // A 409 means a timed-out pass is still finishing its durable
           // checkpoint. Keep polling until it becomes resumable.
@@ -10243,7 +10394,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
       }
       if (outcome === "failed"
           && refresh.errorCode === "refresh_timed_out") {
-        button.textContent = "Finalizing bounded pause…";
+        setLocalizedText(button, "localAnalysis.progress.finalizingPause");
         if (!timeoutSettlementNoted) {
           pollingBudget.noteSettling();
           timeoutSettlementNoted = true;
@@ -10253,22 +10404,22 @@ async function requestRefresh({ autoContinue = false } = {}) {
     }
     cancelled = outcome === "cancelled";
     if (cancelled) {
-      button.textContent = "Loading saved results…";
+      setLocalizedText(button, "localAnalysis.progress.loadingSaved");
       await loadLocalDashboard();
       showConnectionNotice({
-        title: "Local analysis cancelled",
-        copy: "TiboTattle stopped at a safe boundary. Verified existing results were kept, and the resumable checkpoint remains on this Mac.",
+        titleKey: "localAnalysis.notice.cancelledTitle",
+        copyKey: "localAnalysis.notice.cancelledCopy",
         kind: "info",
       });
       return;
     }
     if (outcome === "failed"
         && finalErrorCode === "refresh_resource_limited") {
-      button.textContent = "Loading saved results…";
+      setLocalizedText(button, "localAnalysis.progress.loadingSaved");
       await loadLocalDashboard();
       showConnectionNotice({
-        title: "This scan paused to protect your Mac",
-        copy: "Your last verified results are still shown. This unusually large history reached TiboTattle’s fixed local safety limit, so it paused before exceeding it. No partial result replaced your existing results, and nothing left this Mac.",
+        titleKey: "localAnalysis.notice.resourceLimitedTitle",
+        copyKey: "localAnalysis.notice.resourceLimitedCopy",
         kind: "warning",
       });
       return;
@@ -10287,7 +10438,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
       throw failure;
     }
     archiveHistoryScanActive = false;
-    button.textContent = "Loading updated evidence…";
+    setLocalizedText(button, "localAnalysis.progress.loadingUpdated");
     await loadLocalDashboard();
     scheduleReindexAutoContinuation();
   } catch (error) {
@@ -10317,11 +10468,11 @@ async function requestRefresh({ autoContinue = false } = {}) {
         : "The local companion may be offline, busy, or rejecting this request. Existing evidence has not been altered.",
     });
     showConnectionNotice({
-      title: continuationLimitReached
-        ? "Deep analysis paused after two bounded continuations"
+      titleKey: continuationLimitReached
+        ? "localAnalysis.notice.continuationLimitTitle"
         : refreshAccepted
-          ? "The local analysis did not finish"
-        : "Local analysis could not be started",
+          ? "localAnalysis.notice.notFinishedTitle"
+        : "localAnalysis.notice.couldNotStartTitle",
       copy: described.text,
       kind: continuationLimitReached ? "warning" : "error",
       showDemo: !dashboard
@@ -10344,15 +10495,15 @@ async function cancelLocalAnalysis() {
   try {
     await localClient.cancelRefresh();
     showConnectionNotice({
-      title: "Cancellation requested",
-      copy: "TiboTattle is stopping after its current atomic step and preserving a resumable local checkpoint.",
+      titleKey: "localAnalysis.notice.cancellationRequestedTitle",
+      copyKey: "localAnalysis.notice.cancellationRequestedCopy",
       kind: "info",
     });
   } catch {
     localRefreshCancelRequested = false;
     showConnectionNotice({
-      title: "Cancellation could not be requested",
-      copy: "The analysis may already have finished or the local companion may be reconnecting. Existing verified results are unchanged.",
+      titleKey: "localAnalysis.notice.cancellationFailedTitle",
+      copyKey: "localAnalysis.notice.cancellationFailedCopy",
       kind: "warning",
       showCheck: true,
     });
@@ -10369,16 +10520,16 @@ async function checkLocalSetup() {
     "#setup-check-again",
   ]) {
     const button = $(selector);
-    if (button) button.textContent = "Checking…";
+    if (button) setLocalizedText(button, "action.checking");
   }
   updateLocalActionButtons();
   try {
     await loadLocalDashboard();
   } finally {
     localActionBusy = false;
-    $("#connection-check").textContent = "Check again";
-    $("#companion-check").textContent = "Check this page again";
-    $("#setup-check-again").textContent = "Check again";
+    setLocalizedText($("#connection-check"), "action.checkAgain");
+    setLocalizedText($("#companion-check"), "action.checkThisPageAgain");
+    setLocalizedText($("#setup-check-again"), "action.checkAgain");
     updateLocalActionButtons();
   }
 }
@@ -11149,15 +11300,53 @@ function runsInsideNativeDashboard() {
     || document.body?.classList.contains("native-dashboard");
 }
 
-function openHostedSignInInBrowser(authorizeUrl) {
+function runsInsideElectronDashboard() {
+  return document.documentElement.classList.contains("electron-dashboard")
+    || document.body?.classList.contains("electron-dashboard");
+}
+
+function hostedSignInBrowserHandoffError(code) {
+  const error = new Error("TiboTattle could not open the sign-in browser.");
+  error.code = code;
+  return error;
+}
+
+async function openHostedSignInInBrowser(authorizeUrl) {
   if (runsInsideNativeDashboard()) {
     window.location.assign(authorizeUrl);
-    return;
+    return true;
+  }
+  if (runsInsideElectronDashboard()) {
+    if (typeof window.tibotattleDesktop?.openHostedSignIn !== "function") {
+      throw hostedSignInBrowserHandoffError("HOSTED_SIGNIN_BRIDGE_UNAVAILABLE");
+    }
+    try {
+      await window.tibotattleDesktop.openHostedSignIn(authorizeUrl);
+      return true;
+    } catch (error) {
+      // Do not let a renderer-visible error carry an authorization request or
+      // an arbitrary platform message. The main/preload boundaries already
+      // expose only fixed error codes; this final projection keeps that rule
+      // true if a future Electron API changes its rejection shape.
+      const safeCodes = new Set([
+        "desktop_hosted_signin_url_invalid",
+        "desktop_hosted_signin_open_failed",
+        "desktop_ipc_handler_failed",
+      ]);
+      const code = safeCodes.has(error?.code)
+        ? error.code
+        : "HOSTED_SIGNIN_BROWSER_OPEN_FAILED";
+      throw hostedSignInBrowserHandoffError(code);
+    }
   }
   // A regular browser needs to keep this dashboard alive so its bounded poll
   // can collect the one-time result. The callback page still offers the same
   // safe return link to the installed app.
-  window.open(authorizeUrl, "_blank", "noopener,noreferrer");
+  const opened = window.open(authorizeUrl, "_blank", "noopener,noreferrer");
+  if (opened === null) {
+    throw hostedSignInBrowserHandoffError("HOSTED_SIGNIN_BROWSER_BLOCKED");
+  }
+  return true;
 }
 
 function foregroundNativeDashboardAfterSignIn() {
@@ -11470,7 +11659,7 @@ async function beginHostedSignIn(providerId) {
       await clearPendingHostedSignIn().catch(() => {});
       return;
     }
-    openHostedSignInInBrowser(request.authorizeUrl);
+    await openHostedSignInInBrowser(request.authorizeUrl);
     status.textContent = flow.waiting;
     for (let poll = 0; poll < HOSTED_SIGNIN_POLL_ATTEMPTS; poll += 1) {
       if (attempt.cancelled || activeHostedSignIn !== attempt) return;
@@ -13293,6 +13482,14 @@ $("#accounting-period-controls").addEventListener("click", (event) => {
 });
 $("#share-card-download").addEventListener("click", downloadShareCard);
 $("#share-card-copy").addEventListener("click", copyShareCardImage);
+window.addEventListener(
+  "tibotattle:share-card-download-completed",
+  handleElectronShareCardDownloadCompleted,
+);
+window.addEventListener(
+  "tibotattle:share-card-download-failed",
+  handleElectronShareCardDownloadFailed,
+);
 document.addEventListener("click", (event) => {
   const current = activeInformationPopover;
   if (!current) return;

@@ -15,6 +15,10 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 
 import {
+  ELECTRON_SHELL_RUNTIME_FILES,
+} from "../scripts/build-electron-runtime.mjs";
+import {
+  ELECTRON_SHELL_FILES,
   FIXED_STATUS,
   normalizeArchivePath,
   parseArguments,
@@ -26,14 +30,40 @@ const require = createRequire(import.meta.url);
 const asar = createRequire(require.resolve("electron-builder"))("@electron/asar");
 const SHELL_FILES = [
   "apps/electron/companion-supervisor.js",
+  "apps/electron/desktop-command.js",
+  "apps/electron/desktop-contract.js",
+  "apps/electron/desktop-deep-links.js",
+  "apps/electron/desktop-controller.js",
+  "apps/electron/desktop-copy.js",
+  "apps/electron/desktop-first-run.js",
+  "apps/electron/desktop-first-run-login.js",
+  "apps/electron/desktop-hosted-signin.js",
+  "apps/electron/desktop-recovery-settings.js",
+  "apps/electron/desktop-ipc.js",
+  "apps/electron/desktop-owned-downloads.js",
+  "apps/electron/desktop-menu.js",
   "apps/electron/desktop-lifecycle.js",
+  "apps/electron/desktop-notification-coordinator.js",
+  "apps/electron/desktop-notification-delivery.js",
+  "apps/electron/desktop-notification-policy.js",
+  "apps/electron/desktop-platform-services.js",
+  "apps/electron/desktop-runtime.js",
+  "apps/electron/desktop-settings-backends.js",
+  "apps/electron/desktop-settings-store.js",
+  "apps/electron/desktop-tray.js",
+  "apps/electron/desktop-status-monitor.js",
+  "apps/electron/desktop-tray-status.js",
   "apps/electron/errors.js",
   "apps/electron/loopback-policy.js",
   "apps/electron/main.js",
   "apps/electron/platform-gate.js",
-  "apps/electron/preload.js",
+  "apps/electron/preload.cjs",
+  "apps/electron/recovery-preload.cjs",
+  "apps/electron/recovery-window.js",
   "apps/electron/ready-line.js",
   "apps/electron/windows-qualification.js",
+  "src/desktop-shell-status.js",
+  "src/platform/windows-credential-manager-probe.js",
 ];
 const KEYTAR = Object.freeze({
   "darwin-arm64": "node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
@@ -52,6 +82,17 @@ const REAL_MAC_ARTIFACT_AVAILABLE = [
   REAL_MAC_ASAR,
   REAL_MAC_UNPACKED,
 ].every((path) => existsSync(path));
+
+test("packager and verifier retain the exact same Electron shell closure", () => {
+  assert.deepEqual(
+    [...ELECTRON_SHELL_FILES].sort(),
+    [...ELECTRON_SHELL_RUNTIME_FILES].sort(),
+  );
+  assert.deepEqual(
+    [...new Set(SHELL_FILES)].sort(),
+    [...ELECTRON_SHELL_FILES].sort(),
+  );
+});
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");

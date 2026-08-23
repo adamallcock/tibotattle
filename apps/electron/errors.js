@@ -10,6 +10,7 @@ const SAFE_ERROR_CODES = new Set([
   "invalid_loopback_origin",
   "windows_readiness_unavailable",
   "windows_qualification_launch_override_forbidden",
+  "desktop_ipc_unavailable",
   "electron_configuration_invalid",
 ]);
 

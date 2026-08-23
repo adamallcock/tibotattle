@@ -68,6 +68,7 @@
     <title>TiboTattle</title>
     <link rel="stylesheet" href="./styles.css">
     <script type="module" src="./app.js"></script>
+    <script type="module" src="./desktop-shell.js"></script>
   </head>
   <body class="first-run" data-i18n-root>
     <a class="skip-link" href="#main" data-i18n-legacy-root>Skip to monitoring dashboard</a>
@@ -84,7 +85,14 @@
         </label>
         <p class="sr-only" data-language-announcement role="status" aria-live="polite" aria-atomic="true"></p>
         <span class="history-index-badge" id="history-index-badge" hidden></span>
-        <span class="state-pill state-connecting" id="global-state">
+        <span
+          class="state-pill state-connecting"
+          id="global-state"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          aria-relevant="text"
+        >
           <span class="state-dot" aria-hidden="true"></span>
           Connecting
         </span>
@@ -94,6 +102,18 @@
         <button class="button button-quiet compact" id="cancel-refresh" type="button" hidden>
           Cancel
         </button>
+        <button
+          class="button button-quiet compact electron-only-control"
+          id="electron-share-button"
+          type="button"
+          data-electron-only
+        data-i18n="electron.shell.share">Share</button>
+        <button
+          class="button button-quiet compact electron-only-control"
+          id="electron-settings-button"
+          type="button"
+          data-electron-only
+        data-i18n="electron.menu.settings">Settings…</button>
       </div>
     </header>
 
@@ -108,7 +128,7 @@
         </nav>
       </aside>
       <div class="dashboard-content">
-    <main id="main">
+    <main id="main" tabindex="-1">
       <div class="page-heading" data-dashboard-page="overview">
         <div>
           <p class="eyebrow">Local evidence dashboard</p>
@@ -444,11 +464,16 @@
           and nothing private is on it. The reference still travels in the
           saved file name only.
         -->
-        <article class="panel share-panel" id="share-panel">
+        <article
+          class="panel share-panel"
+          id="share-panel"
+          aria-labelledby="share-panel-title"
+          tabindex="-1"
+        >
           <div class="panel-heading">
             <div>
               <p class="panel-kicker">Share</p>
-              <h3>A results card you can post</h3>
+              <h3 id="share-panel-title">A results card you can post</h3>
             </div>
           </div>
           <p class="annotation">

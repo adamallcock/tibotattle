@@ -227,7 +227,10 @@ test("Windows release config maps the frozen installer contract exactly", () => 
   assert.equal(config.nsis.warningsAsErrors, true);
   assert.equal(config.nsis.buildUniversalInstaller, false);
   assert.equal(config.nsis.script, undefined);
-  assert.equal(config.nsis.include, undefined);
+  assert.match(
+    config.nsis.include,
+    /apps[\\/]electron[\\/]windows-protocol-registration\.nsh$/u,
+  );
 
   assert.deepEqual(config.win.target, [{ target: "nsis", arch: ["x64"] }]);
   assert.equal(config.win.signAndEditExecutable, true);

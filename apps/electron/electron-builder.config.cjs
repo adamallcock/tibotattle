@@ -1,6 +1,10 @@
 const path = require("node:path");
 
 const repositoryRoot = path.resolve(__dirname, "../..");
+const macDevelopmentIcon = path.join(
+  repositoryRoot,
+  "apps/macos/Assets/AppIcon.icns",
+);
 const requestedTarget = process.env.TIBOTATTLE_ELECTRON_TARGET ?? "darwin";
 if (!["darwin", "macos", "win32", "windows", "win"].includes(requestedTarget)) {
   throw new Error("TIBOTATTLE_ELECTRON_TARGET must be darwin or win32");
@@ -88,10 +92,19 @@ module.exports = {
   publish: "never",
   mac: {
     target: [{ target: "dir", arch: ["arm64"] }],
+    icon: macDevelopmentIcon,
     identity: null,
     hardenedRuntime: false,
     gatekeeperAssess: false,
     notarize: false,
+    // electron-builder writes this exact URL type to the packaged app's
+    // Info.plist. The runtime accepts only the canonical `usagemonitor://open`
+    // target; no OAuth or arbitrary URL is registered here.
+    protocols: [{
+      name: "com.usagemonitor.local.open",
+      schemes: ["usagemonitor"],
+      role: "Viewer",
+    }],
   },
   win: {
     target: [{ target: "dir", arch: ["x64"] }],

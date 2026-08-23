@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import vm from "node:vm";
 import {
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../../config/product-brand.js";
@@ -1624,6 +1625,110 @@ test("the cost card drops its metadata line while coverage honesty stays elsewhe
   assert.doesNotMatch(appSource, /cost-history-coverage/u);
   assert.doesNotMatch(appSource, /coverage-unpriced|unpricedTokens/u);
   assert.doesNotMatch(appSource, /pricedEventCoveragePercent[^\n]*priced/u);
+});
+
+test("Electron share-card saving is completion-gated and payload-free", async () => {
+  const [appSource, localizationSource] = await Promise.all([
+    readFile(new URL("../public/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/localization.js", import.meta.url), "utf8"),
+  ]);
+  const start = appSource.indexOf("function downloadShareCard() {");
+  const end = appSource.indexOf("\nfunction copyShareCardImage", start);
+  assert.ok(start >= 0 && end > start, "share-card download flow is present");
+  const source = appSource.slice(start, end);
+  const electronStart = source.indexOf("const electron =");
+  const electronEnd = source.indexOf("if (electron) return;", electronStart);
+  assert.ok(electronStart >= 0 && electronEnd > electronStart);
+  const electronFlow = source.slice(electronStart, electronEnd);
+  assert.match(appSource, /function beginElectronShareCardDownload\(\)[\s\S]*?shareCard\.saving/u);
+  assert.doesNotMatch(electronFlow, /shareCardFileName\(card\).*Saved as/uis);
+  assert.doesNotMatch(electronFlow, /showInFolder/u);
+  assert.match(appSource, /tibotattle:share-card-download-completed/u);
+  assert.match(appSource, /tibotattle:share-card-download-failed/u);
+  assert.match(appSource, /shareCard\.saved/u);
+  assert.match(appSource, /shareCard\.saveFailed/u);
+  assert.match(appSource, /revealLatestDownload\(\)/u);
+  assert.match(appSource, /Promise\.resolve\(result\)[\s\S]*?catch/u);
+  for (const key of [
+    "shareCard.showInFolder",
+    "shareCard.saving",
+    "shareCard.saved",
+    "shareCard.saveFailed",
+    "shareCard.revealFailed",
+  ]) {
+    assert.match(localizationSource, new RegExp(`"${key.replaceAll(".", "\\.")}":`, "u"));
+    for (const locale of SUPPORTED_LOCALES) {
+      const value = translate(key, {}, locale);
+      assert.notEqual(value, key);
+      assert.ok(value.trim().length > 0);
+    }
+  }
+});
+
+test("Electron share-card pending state fails closed after the bounded timeout", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const stateStart = appSource.indexOf("let electronShareCardDownloadPending = false;");
+  const stateEnd = appSource.indexOf("// The posted image", stateStart);
+  const beginStart = appSource.indexOf("function beginElectronShareCardDownload() {");
+  const beginEnd = appSource.indexOf("\nfunction updateShareCardActions", beginStart);
+  const completedStart = appSource.indexOf("function handleElectronShareCardDownloadCompleted() {");
+  const completedEnd = appSource.indexOf("\nfunction beginElectronShareCardDownload", completedStart);
+  const failedStart = appSource.indexOf("function handleElectronShareCardDownloadFailed() {");
+  const failedEnd = appSource.indexOf("\nfunction beginElectronShareCardDownload", failedStart);
+  const updateStart = appSource.indexOf("function updateShareCardActions() {");
+  const updateEnd = appSource.indexOf("\n/**\n * Render the shareable card", updateStart);
+  assert.ok(stateStart >= 0 && stateEnd > stateStart);
+  assert.ok(beginStart >= 0 && beginEnd > beginStart);
+  assert.ok(completedStart >= 0 && completedEnd > completedStart);
+  assert.ok(failedStart >= 0 && failedEnd > failedStart);
+  assert.ok(updateStart >= 0 && updateEnd > updateStart);
+
+  const timers = new Map();
+  let nextTimer = 1;
+  const context = {
+    clearTimeout(id) { timers.delete(id); },
+    setTimeout(callback) {
+      const id = nextTimer++;
+      timers.set(id, callback);
+      return id;
+    },
+    document: { body: { classList: { contains: () => true } } },
+    window: { tibotattleDesktop: null },
+    t: (key) => key,
+    setShareCardStatus() {},
+    showShareCardToast() {},
+    electronShareCardBridge() { return null; },
+    showElectronShareCardRevealFailure() {},
+    shareCard: {},
+    shareCardBusy: false,
+    $() { return { disabled: false }; },
+  };
+  vm.runInNewContext(`
+    ${appSource.slice(stateStart, stateEnd)}
+    ${appSource.slice(completedStart, completedEnd)}
+    ${appSource.slice(failedStart, failedEnd)}
+    ${appSource.slice(beginStart, beginEnd)}
+    ${appSource.slice(updateStart, updateEnd)}
+    globalThis.api = {
+      beginElectronShareCardDownload,
+      handleElectronShareCardDownloadCompleted,
+      handleElectronShareCardDownloadFailed,
+      pending: () => electronShareCardDownloadPending,
+    };
+  `, vm.createContext(context));
+  context.api.beginElectronShareCardDownload();
+  assert.equal(context.api.pending(), true);
+  assert.equal(timers.size, 1);
+  const [timeoutId, timeoutCallback] = timers.entries().next().value;
+  timers.delete(timeoutId);
+  timeoutCallback();
+  assert.equal(context.api.pending(), false);
+  assert.equal(timers.size, 0);
+  context.api.beginElectronShareCardDownload();
+  assert.equal(timers.size, 1);
+  context.api.handleElectronShareCardDownloadCompleted();
+  assert.equal(context.api.pending(), false);
+  assert.equal(timers.size, 0);
 });
 
 test("a model row carries its own components, and a row without them says so rather than reporting zeroes", () => {
@@ -5247,15 +5352,14 @@ test("local analysis exposes quick results and cancel-safe progress", async () =
   assert.match(appSource, /phase === "quick_result"/u);
   assert.match(appSource, /await loadQuickResultDashboard\(\)/u);
   assert.match(appSource, /renderDashboard\(data\)/u);
-  assert.match(appSource, /Headline ready; finishing deeper accounting/u);
-  assert.match(appSource, /finishing deeper accounting/u);
-  assert.match(appSource, /Local analysis cancelled/u);
-  assert.match(appSource, /Verified existing results were kept/u);
-  assert.match(appSource, /preserving a resumable local checkpoint/u);
+  assert.match(appSource, /localAnalysis\.progress\.headlineReady/u);
+  assert.match(appSource, /localAnalysis\.progress\.calculating/u);
+  assert.match(appSource, /localAnalysis\.notice\.cancelledTitle/u);
+  assert.match(appSource, /localAnalysis\.notice\.cancelledCopy/u);
   assert.match(appSource, /refresh_resource_limited/u);
-  assert.match(appSource, /This scan paused to protect your Mac/u);
-  assert.match(appSource, /No partial result replaced your existing results/u);
-  assert.match(appSource, /Deep analysis paused after two bounded continuations/u);
+  assert.match(appSource, /localAnalysis\.notice\.resourceLimitedTitle/u);
+  assert.match(appSource, /localAnalysis\.notice\.resourceLimitedCopy/u);
+  assert.match(appSource, /localAnalysis\.notice\.continuationLimitTitle/u);
 });
 
 test("timeline keeps time, uncertainty, and primary navigation explicit", async () => {
@@ -5316,7 +5420,7 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.match(appSource, /renderHistoryProgress\(data\)/u);
   assert.match(appSource, /chart\.status\.resetOrTrackChange/u);
   assert.match(appSource, /chart\.status\.backwardOrAmbiguous/u);
-  assert.match(appSource, /Calculating usage and allowance/);
+  assert.match(appSource, /localAnalysis\.progress\.calculating/u);
   assert.match(html, /id="calibration-range-controls"/);
   assert.match(html, /id="weekly-range-controls"/);
   assert.match(html, /id="weekly-partial-legend"/);
@@ -11128,7 +11232,31 @@ test("the handoff persists the moment the browser opens and every activation ret
   // initiator verifier alongside the state.
   assert.match(
     appSource,
-    /await persistPendingHostedSignIn\([\s\S]{0,140}?providerId,[\s\S]{0,80}?request\.state,[\s\S]{0,80}?request\.verifier,[\s\S]{0,80}?\);[\s\S]{0,300}?openHostedSignInInBrowser\(request\.authorizeUrl\);/u,
+    /await persistPendingHostedSignIn\([\s\S]{0,140}?providerId,[\s\S]{0,80}?request\.state,[\s\S]{0,80}?request\.verifier,[\s\S]{0,80}?\);[\s\S]{0,300}?await openHostedSignInInBrowser\(request\.authorizeUrl\);/u,
+  );
+  // Electron uses the one explicit, bounded bridge action. Native AppKit
+  // keeps its existing main-frame handoff, while an ordinary browser keeps
+  // its popup alive for result polling; no branch falls through accidentally.
+  assert.match(appSource, /async function openHostedSignInInBrowser\(authorizeUrl\)/u);
+  assert.match(
+    appSource,
+    /if \(runsInsideNativeDashboard\(\)\) \{[\s\S]{0,220}?window\.location\.assign\(authorizeUrl\);/u,
+  );
+  assert.match(
+    appSource,
+    /if \(runsInsideElectronDashboard\(\)\) \{[\s\S]{0,500}?await window\.tibotattleDesktop\.openHostedSignIn\(authorizeUrl\);/u,
+  );
+  assert.match(
+    appSource,
+    /const opened = window\.open\(authorizeUrl, "_blank", "noopener,noreferrer"\);/u,
+  );
+  assert.match(
+    appSource,
+    /hostedSignInBrowserHandoffError\("HOSTED_SIGNIN_BROWSER_BLOCKED"\)/u,
+  );
+  assert.doesNotMatch(
+    appSource,
+    /catch \(error\) \{[\s\S]{0,220}?error\.message[\s\S]{0,220}?throw error;/u,
   );
   // Collected on load and on every reactivation surface.
   assert.match(

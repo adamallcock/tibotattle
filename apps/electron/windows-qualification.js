@@ -58,7 +58,7 @@ const ELECTRON_SHELL_IDENTITY_FILES = Object.freeze([
   "apps/electron/loopback-policy.js",
   "apps/electron/main.js",
   "apps/electron/platform-gate.js",
-  "apps/electron/preload.js",
+  "apps/electron/preload.cjs",
   "apps/electron/ready-line.js",
 ]);
 

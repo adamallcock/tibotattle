@@ -1114,7 +1114,9 @@
       "callers": [
         "scripts/build-electron-app.mjs",
         "test/electron-app-package.test.js",
-        "test/electron-package-layout.test.js"
+        "test/electron-development-artifact-verifier.test.js",
+        "test/electron-package-layout.test.js",
+        "test/windows-qualification-mode.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/goals/2026-08-18-windows-first-electron-delivery-goal.md",

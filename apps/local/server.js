@@ -205,6 +205,9 @@ import {
   createParticipantSessionCookieBridge,
   participantRelayPathUsesSessionCookie,
 } from "./transport/participant-session-cookie-bridge.js";
+import {
+  projectDesktopShellStatus,
+} from "../../src/desktop-shell-status.js";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const LOCAL_COMPANION_MODULE_FILE = fileURLToPath(import.meta.url);
@@ -432,6 +435,7 @@ const REPORT_ROUTES = createLocalCompanionReportRoutes(
 );
 
 const API_ROUTES = new Set([
+  "/api/local/desktop-status",
   "/api/local/health",
   "/api/local/diagnostics/contribution",
   "/api/local/diagnostics/note",
@@ -470,6 +474,7 @@ const API_ROUTES = new Set([
 // snapshot is still being built (or even if it fails): readiness, diagnostics,
 // and the separately persisted native Claude quota projection.
 const SNAPSHOT_INDEPENDENT_API_ROUTES = new Set([
+  "/api/local/desktop-status",
   "/api/local/health",
   "/api/local/diagnostics/contribution",
   "/api/local/diagnostics/note",
@@ -4945,6 +4950,7 @@ export function createPreparedLocalCompanionServer({
     runner: refreshRunner,
     dataStore,
     timeoutMs: refreshTimeoutMs,
+    clock,
     // Five hours of refresh_resource_limited loops once left zero local
     // trail: the terminal classification lived only in this controller's
     // in-memory state. Every terminal refresh failure now files one bounded,
@@ -5202,6 +5208,23 @@ export function createPreparedLocalCompanionServer({
             remoteProxy: false,
           },
         });
+        return;
+      }
+      if (path === "/api/local/desktop-status") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        // This endpoint intentionally reads only the lifecycle receipt and the
+        // already closed direct-provider notification evidence. It stays
+        // independent of the dashboard snapshot so the shell can distinguish
+        // a still-starting companion from a ready one without receiving a
+        // partial dashboard payload.
+        send(response, 200, projectDesktopShellStatus({
+          snapshotStatus: snapshotState.status,
+          refresh: refresh.getStatus(),
+          now: clock(),
+        }));
         return;
       }
       if (path === "/api/local/diagnostics/contribution") {

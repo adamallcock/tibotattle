@@ -6,6 +6,9 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  ELECTRON_SHELL_RUNTIME_FILES,
+} from "../scripts/build-electron-runtime.mjs";
+import {
   createWindowsFilesystemAdapter,
   WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
 } from "../src/platform/windows-filesystem.js";
@@ -18,6 +21,7 @@ import {
   WINDOWS_QUALIFICATION_MODE_QUALIFICATION_ONLY,
   WINDOWS_QUALIFICATION_MODE_TEST_LANE,
   WINDOWS_QUALIFICATION_MODE_TEST_LANE_ENVIRONMENT_VARIABLE,
+  WINDOWS_QUALIFICATION_REQUIRED_RESOURCE_PATHS,
   WindowsQualificationModeError,
   createWindowsQualificationModeContext,
   isWindowsQualificationModeContext,
@@ -37,15 +41,41 @@ function sha256(value) {
 
 function buildResourceManifest() {
   const paths = [
-    "apps/electron/companion-supervisor.js",
-    "apps/electron/desktop-lifecycle.js",
+  "apps/electron/companion-supervisor.js",
+  "apps/electron/desktop-command.js",
+  "apps/electron/desktop-contract.js",
+  "apps/electron/desktop-deep-links.js",
+    "apps/electron/desktop-controller.js",
+    "apps/electron/desktop-copy.js",
+  "apps/electron/desktop-first-run.js",
+  "apps/electron/desktop-first-run-login.js",
+  "apps/electron/desktop-hosted-signin.js",
+  "apps/electron/desktop-recovery-settings.js",
+  "apps/electron/desktop-ipc.js",
+  "apps/electron/desktop-owned-downloads.js",
+  "apps/electron/desktop-lifecycle.js",
+  "apps/electron/desktop-notification-coordinator.js",
+  "apps/electron/desktop-notification-delivery.js",
+  "apps/electron/desktop-notification-policy.js",
+    "apps/electron/desktop-platform-services.js",
+    "apps/electron/desktop-runtime.js",
+    "apps/electron/desktop-settings-backends.js",
+    "apps/electron/desktop-settings-store.js",
+    "apps/electron/desktop-menu.js",
+    "apps/electron/desktop-tray.js",
+    "apps/electron/desktop-status-monitor.js",
+    "apps/electron/desktop-tray-status.js",
     "apps/electron/errors.js",
     "apps/electron/loopback-policy.js",
     "apps/electron/main.js",
     "apps/electron/platform-gate.js",
-    "apps/electron/preload.js",
+    "apps/electron/preload.cjs",
+    "apps/electron/recovery-preload.cjs",
+    "apps/electron/recovery-window.js",
     "apps/electron/ready-line.js",
-    "apps/electron/windows-qualification.js",
+  "apps/electron/windows-qualification.js",
+  "src/desktop-shell-status.js",
+  "src/platform/windows-credential-manager-probe.js",
     "apps/local/server.js",
     "apps/web/public/index.html",
     "native/windows-filesystem/build/Release/windows_filesystem.node",
@@ -57,6 +87,8 @@ function buildResourceManifest() {
     return {
       bytes: value.byteLength,
       kind: path.startsWith("apps/electron/")
+        || path === "src/desktop-shell-status.js"
+        || path === "src/platform/windows-credential-manager-probe.js"
         ? "electron_shell"
         : path.startsWith("apps/web/")
           ? "dashboard_asset"
@@ -110,6 +142,17 @@ writeFileSync(
   `${JSON.stringify(buildResourceManifest())}\n`,
 );
 test.after(() => rmSync(RESOURCE_ROOT, { recursive: true, force: true }));
+
+test("qualification resource authority tracks the complete packaged shell closure", () => {
+  assert.deepEqual(
+    [...WINDOWS_QUALIFICATION_REQUIRED_RESOURCE_PATHS].sort(),
+    [
+      ...ELECTRON_SHELL_RUNTIME_FILES,
+      "apps/local/server.js",
+      "apps/web/public/index.html",
+    ].sort(),
+  );
+});
 
 function bindingForTests() {
   const binding = {
