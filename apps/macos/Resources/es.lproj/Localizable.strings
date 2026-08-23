@@ -81,6 +81,12 @@
 "settings.aboutProduct" = "Acerca de %@";
 "settings.aboutTab" = "Acerca de";
 "settings.aboutSummary" = "Límite local de Codex, medido en tu Mac.";
+"settings.appearance" = "Apariencia";
+"settings.appearanceDark" = "Oscuro";
+"settings.appearanceLight" = "Claro";
+"settings.appearancePickerHint" = "Elige cómo se ve TiboTattle.";
+"settings.appearanceSummary" = "Usa la apariencia de tu Mac de forma predeterminada.";
+"settings.appearanceSystem" = "Sistema";
 "settings.automaticUpdates" = "Actualizaciones automáticas";
 "settings.automaticUpdatesOff" = "Las descargas automáticas están desactivadas.";
 "settings.automaticUpdatesOn" = "Las descargas automáticas están activadas.";

@@ -317,6 +317,65 @@ private enum NativeRefreshIntervalPreference {
     }
 }
 
+/// One persisted appearance choice owns both AppKit and the embedded report.
+/// `system` stores an explicit preference, but leaves `NSApp.appearance` nil so
+/// scheduled and user-driven macOS appearance changes continue to flow
+/// through without the app guessing at the system setting.
+private enum NativeAppearancePreference: String, CaseIterable {
+    case system
+    case light
+    case dark
+
+    static let defaultsKey = "tibotattle.appearance.v1"
+
+    static var current: NativeAppearancePreference {
+        current(in: .standard)
+    }
+
+    static func current(
+        in defaults: UserDefaults
+    ) -> NativeAppearancePreference {
+        guard let rawValue = defaults.string(forKey: defaultsKey),
+              let preference = NativeAppearancePreference(rawValue: rawValue)
+        else {
+            return .system
+        }
+        return preference
+    }
+
+    static func set(
+        _ preference: NativeAppearancePreference,
+        in defaults: UserDefaults = .standard
+    ) {
+        defaults.set(preference.rawValue, forKey: defaultsKey)
+    }
+
+    var applicationAppearance: NSAppearance? {
+        switch self {
+        case .system:
+            nil
+        case .light:
+            NSAppearance(named: .aqua)
+        case .dark:
+            NSAppearance(named: .darkAqua)
+        }
+    }
+
+    func resolvedTheme(for systemAppearance: NSAppearance) -> String {
+        switch self {
+        case .light:
+            return "light"
+        case .dark:
+            return "dark"
+        case .system:
+            return systemAppearance.bestMatch(from: [.darkAqua, .aqua])
+                == .darkAqua
+                ? "dark"
+                : "light"
+        }
+    }
+}
+
 private enum NativeRefreshIntervalSelection {
     @discardableResult
     static func apply(
@@ -2024,6 +2083,48 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         return "window.__TIBOTATTLE_LOCALIZATION__ = \(json);"
     }
 
+    /// Paint the report in the native appearance before its stylesheet gets a
+    /// first frame. The preference and its resolved light/dark value are both
+    /// handed over: the former is useful context, while the latter is the only
+    /// bounded value the page is permitted to render.
+    private static func appearanceHandoffScript() -> String {
+        let preference = NativeAppearancePreference.current
+        let resolvedTheme = preference.resolvedTheme(
+            for: NSApp.effectiveAppearance
+        )
+        let payload: [String: Any] = [
+            "schemaVersion": 1,
+            "host": "native",
+            "preference": preference.rawValue,
+            "resolvedTheme": resolvedTheme,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8)
+        else {
+            return "window.__TIBOTATTLE_APPEARANCE__ = null;"
+        }
+        return """
+        window.__TIBOTATTLE_APPEARANCE__ = \(json);
+        (function () {
+          function applyNativeAppearance() {
+            const handoff = window.__TIBOTATTLE_APPEARANCE__;
+            const theme = handoff?.resolvedTheme;
+            if (theme !== 'light' && theme !== 'dark') return;
+            if (document.documentElement) {
+              document.documentElement.dataset.theme = theme;
+              document.documentElement.style.colorScheme = theme;
+            }
+            const themeColor = document.querySelector?.('meta[name="theme-color"]');
+            if (themeColor) {
+              themeColor.content = theme === 'dark' ? '#141a17' : '#f5f1e8';
+            }
+          }
+          applyNativeAppearance();
+          document.addEventListener('DOMContentLoaded', applyNativeAppearance, { once: true });
+        })();
+        """
+    }
+
     /// The AppKit frame owns navigation and refresh in the installed app.
     /// Install this fixed marker before any dashboard script runs so the
     /// public-web header cannot flash, or remain visible if WebKit delays a
@@ -2048,6 +2149,13 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     private static func addDocumentStartScripts(
         to controller: WKUserContentController
     ) {
+        controller.addUserScript(
+            WKUserScript(
+                source: appearanceHandoffScript(),
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: true
+            )
+        )
         controller.addUserScript(
             WKUserScript(
                 source: localizationHandoffScript(),
@@ -2223,6 +2331,36 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         // other width-sensitive controls measure their translated labels
         // after that redraw has committed, without reloading the document or
         // interrupting the active hosted-sign-in attempt.
+        window.requestAnimationFrame?.(() => {
+          window.dispatchEvent(new Event('resize'));
+        });
+        """)
+    }
+
+    /// Change the live document without reloading it. The native shell has
+    /// already applied this appearance to AppKit; the resolved value makes the
+    /// report follow the same effective appearance when the stored choice is
+    /// `system`.
+    func notifyAppearancePreferenceChange(
+        _ preference: NativeAppearancePreference
+    ) {
+        guard hasDashboardTarget else { return }
+        let payload: [String: Any] = [
+            "schemaVersion": 1,
+            "host": "native",
+            "preference": preference.rawValue,
+            "resolvedTheme": preference.resolvedTheme(
+                for: NSApp.effectiveAppearance
+            ),
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8)
+        else { return }
+        webView.evaluateJavaScript("""
+        window.__TIBOTATTLE_APPEARANCE__ = \(json);
+        window.dispatchEvent(new CustomEvent('tibotattle:appearance-override', {
+          detail: window.__TIBOTATTLE_APPEARANCE__
+        }));
         window.requestAnimationFrame?.(() => {
           window.dispatchEvent(new Event('resize'));
         });
@@ -2624,24 +2762,16 @@ private enum NativeDashboardDestination: String, CaseIterable {
 /// that has, twice, resolved to zero before the window existed.
 @MainActor
 private final class NativeDashboardReportPane: NSView {
-    /// `--paper` from the dashboard stylesheet. The report document has no
-    /// dark variant, so a fixed value is the honest match. Painting it here
-    /// means no system grey is ever visible in the strip the title bar
-    /// reserves, or in the instant before WebKit has drawn.
-    private static let paper = NSColor(
-        srgbRed: 0xF5 / 255,
-        green: 0xF1 / 255,
-        blue: 0xE8 / 255,
-        alpha: 1
-    )
-
     private let webView: WKWebView
+    var onAppearanceChange: (() -> Void)?
+
+    override var wantsUpdateLayer: Bool { true }
 
     init(webView: WKWebView) {
         self.webView = webView
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.backgroundColor = Self.paper.cgColor
+        layer?.backgroundColor = NativeBrandPalette.reportPaper.cgColor
         webView.translatesAutoresizingMaskIntoConstraints = true
         // Deliberately no autoresizing mask.  The pane now insets WebKit by
         // its own safe area, and a mask would spring the view back to the full
@@ -2653,6 +2783,19 @@ private final class NativeDashboardReportPane: NSView {
 
     required init?(coder: NSCoder) {
         nil
+    }
+
+    /// Match the report's `--paper` token during the gap before WebKit paints
+    /// and in the titlebar safe-area strip. Dynamic colors must be re-resolved
+    /// here because a CALayer does not track appearance changes on its own.
+    override func updateLayer() {
+        layer?.backgroundColor = NativeBrandPalette.reportPaper.cgColor
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+        onAppearanceChange?()
     }
 
     override func layout() {
@@ -2741,13 +2884,13 @@ private struct NativeDashboardChromeMetrics {
 /// accent is lifted for contrast and the paper wash becomes a deep-green
 /// cast rather than a glaring cream sheet.
 private enum NativeBrandPalette {
-    /// Web accent #174f45, lifted for dark backgrounds.
+    /// Web accent #174f45 in light appearance and Forest Ink #76aa9c in dark.
     static let accent = NSColor(name: nil) { appearance in
         appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
             ? NSColor(
-                srgbRed: 122 / 255,
-                green: 184 / 255,
-                blue: 170 / 255,
+                srgbRed: 118 / 255,
+                green: 170 / 255,
+                blue: 156 / 255,
                 alpha: 1
             )
             : NSColor(
@@ -2758,14 +2901,32 @@ private enum NativeBrandPalette {
             )
     }
 
+    /// Exact web report paper in each appearance. Painting this behind
+    /// WKWebView prevents a mismatched system-grey flash at launch or reload.
+    static let reportPaper = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(
+                srgbRed: 20 / 255,
+                green: 26 / 255,
+                blue: 23 / 255,
+                alpha: 1
+            )
+            : NSColor(
+                srgbRed: 245 / 255,
+                green: 241 / 255,
+                blue: 232 / 255,
+                alpha: 1
+            )
+    }
+
     /// Web background #f5f1e8, washed over the system sidebar material so
     /// vibrancy still reads through it.
     static let sidebarWash = NSColor(name: nil) { appearance in
         appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
             ? NSColor(
-                srgbRed: 23 / 255,
-                green: 79 / 255,
-                blue: 69 / 255,
+                srgbRed: 45 / 255,
+                green: 116 / 255,
+                blue: 102 / 255,
                 alpha: 0.22
             )
             : NSColor(
@@ -3025,6 +3186,11 @@ private final class NativeDashboardChrome: NSSplitViewController {
     private var restingWidthSeeded = false
 
     var onNavigate: ((NativeDashboardDestination) -> Void)?
+    var onAppearanceChange: (() -> Void)? {
+        didSet {
+            reportPane.onAppearanceChange = onAppearanceChange
+        }
+    }
 
     init(webView: WKWebView) {
         reportPane = NativeDashboardReportPane(webView: webView)
@@ -3425,6 +3591,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private weak var settingsQuotaNotificationsSwitch: NSSwitch?
     private weak var settingsQuotaNotificationThresholds: NSSegmentedControl?
     private weak var settingsQuotaNotificationStatusLabel: NSTextField?
+    private weak var settingsAppearancePicker: NSPopUpButton?
     private weak var settingsRefreshIntervalPicker: NSPopUpButton?
     private let nativeEvidenceReader = LocalCompanionEvidenceReader()
     private var quotaNotificationCoordinator: QuotaNotificationCoordinator?
@@ -3546,6 +3713,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = umask(0o077)
+        applyAppearancePreference(notifyDashboard: false)
         installApplicationMenu()
         createWindow()
         // Installed before any early return below so a launch that fails still
@@ -3612,6 +3780,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         // Read-only resynchronization after a user changes notification
         // permission in System Settings. This path cannot prompt by itself.
         quotaNotificationCoordinator?.refreshAuthorization()
+        // System appearance can change while TiboTattle is inactive. AppKit
+        // already updates native dynamic colors; this keeps the live report's
+        // explicit document theme synchronized when the window returns.
+        synchronizeResolvedAppearance()
     }
 
     private func showFirstRunDisclosure() -> Bool {
@@ -4355,6 +4527,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         webView: WKWebView
     ) -> NativeDashboardChrome {
         let chrome = NativeDashboardChrome(webView: webView)
+        chrome.onAppearanceChange = { [weak self] in
+            self?.synchronizeResolvedAppearance()
+        }
         dashboardContentController?.addChild(chrome)
         let chromeView = chrome.view
         chromeView.translatesAutoresizingMaskIntoConstraints = false
@@ -5480,6 +5655,39 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         refitSettingsWindowToContent()
     }
 
+    private func updateAppearanceSettingsControl() {
+        guard let picker = settingsAppearancePicker else { return }
+        let preference = NativeAppearancePreference.current
+        if let index = picker.itemArray.firstIndex(where: {
+            ($0.representedObject as? String) == preference.rawValue
+        }) {
+            picker.selectItem(at: index)
+        }
+    }
+
+    private func applyAppearancePreference(
+        notifyDashboard: Bool = true
+    ) {
+        let preference = NativeAppearancePreference.current
+        NSApp.appearance = preference.applicationAppearance
+        updateAppearanceSettingsControl()
+        window?.contentView?.needsDisplay = true
+        if notifyDashboard {
+            dashboardWebHost?.notifyAppearancePreferenceChange(preference)
+        }
+    }
+
+    private func synchronizeResolvedAppearance() {
+        let preference = NativeAppearancePreference.current
+        updateAppearanceSettingsControl()
+        window?.contentView?.needsDisplay = true
+        // Explicit Light and Dark are intentionally insulated from later
+        // system changes. Only System follows the effective AppKit appearance;
+        // selecting any preference already sends its own immediate update.
+        guard preference == .system else { return }
+        dashboardWebHost?.notifyAppearancePreferenceChange(preference)
+    }
+
     private func updateRefreshIntervalSettingsControl() {
         guard let picker = settingsRefreshIntervalPicker else { return }
         let value = NativeRefreshIntervalPreference.seconds
@@ -5851,6 +6059,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         showSettings(selecting: 2)
     }
 
+    @objc private func selectAppearancePreference(
+        _ sender: NSPopUpButton
+    ) {
+        guard let rawPreference = sender.selectedItem?.representedObject
+            as? String,
+              let preference = NativeAppearancePreference(
+                  rawValue: rawPreference
+              )
+        else {
+            updateAppearanceSettingsControl()
+            return
+        }
+        NativeAppearancePreference.set(preference)
+        applyAppearancePreference()
+    }
+
     @objc private func selectLanguagePreference(_ sender: NSPopUpButton) {
         guard let rawPreference = sender.selectedItem?.representedObject
             as? String,
@@ -5922,6 +6146,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         settingsAutomaticUpdatesSwitch = nil
         settingsAboutAutomaticUpdatesDetailLabel = nil
         settingsCheckForUpdatesButton = nil
+        settingsAppearancePicker = nil
         settingsRefreshIntervalPicker = nil
         if shouldRestoreSettings {
             showSettings(selecting: selectedSettingsTab)
@@ -5958,6 +6183,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             settingsTabs.selectedTabViewItemIndex = index
             updateSettingsCodexHomeSummary()
             updateAutomaticUpdatesSettingsControl()
+            updateAppearanceSettingsControl()
             updateRefreshIntervalSettingsControl()
             updateStartAtLoginSettingsControl()
             quotaNotificationCoordinator?.refreshAuthorization()
@@ -5985,6 +6211,49 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             action: #selector(useDefaultCodexHome)
         )
         let sourceActions = settingsControlRow([chooseSource, useDefaultSource])
+        let appearancePicker = NSPopUpButton(
+            frame: .zero,
+            pullsDown: false
+        )
+        let appearanceChoices: [(
+            NativeAppearancePreference,
+            TiboTattleLocalization.Key
+        )] = [
+            (.system, .settingsAppearanceSystem),
+            (.light, .settingsAppearanceLight),
+            (.dark, .settingsAppearanceDark),
+        ]
+        for (preference, key) in appearanceChoices {
+            appearancePicker.addItem(
+                withTitle: TiboTattleLocalization.string(key)
+            )
+            appearancePicker.lastItem?.representedObject = preference.rawValue
+        }
+        appearancePicker.target = self
+        appearancePicker.action = #selector(selectAppearancePreference(_:))
+        appearancePicker.toolTip = TiboTattleLocalization.string(
+            .settingsAppearancePickerHint
+        )
+        appearancePicker.setAccessibilityLabel(
+            TiboTattleLocalization.string(.settingsAppearance)
+        )
+        settingsAppearancePicker = appearancePicker
+        updateAppearanceSettingsControl()
+        let appearanceRow = NSStackView(views: [appearancePicker])
+        appearanceRow.orientation = .horizontal
+        appearanceRow.alignment = .centerY
+        let appearanceSection = settingsGroup(
+            title: TiboTattleLocalization.string(.settingsAppearance),
+            symbolName: "circle.lefthalf.filled",
+            views: [
+                appearanceRow,
+                settingsLabel(
+                    TiboTattleLocalization.string(.settingsAppearanceSummary),
+                    font: .systemFont(ofSize: 12),
+                    color: .secondaryLabelColor
+                ),
+            ]
+        )
         let languagePicker = NSPopUpButton(
             frame: .zero,
             pullsDown: false
@@ -6278,6 +6547,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             title: TiboTattleLocalization.string(.settingsGeneral),
             summary: TiboTattleLocalization.string(.settingsGeneralSummary),
             views: [
+                appearanceSection,
                 languageSection,
                 sourceSection,
                 refreshIntervalSection,
@@ -7684,6 +7954,88 @@ private enum NativeRefreshSettingsContractSmokeTest {
                 + "picker_action=true picker_persisted=true "
                 + "scheduler=300->900 "
                 + "invalid_ignored=true"
+        )
+        return 0
+    }
+}
+
+/// Exercises the complete persisted appearance contract in an isolated
+/// defaults suite. This proves that explicit choices never depend on AppKit
+/// timing, while System follows both light and dark effective appearances.
+/// It does not mutate the developer's normal TiboTattle preference.
+private enum NativeAppearanceSettingsContractSmokeTest {
+    private static let suiteName =
+        "com.usagemonitor.local.native-appearance-settings-contract"
+
+    static func run() -> Int32 {
+        guard let defaults = UserDefaults(suiteName: suiteName),
+              let aqua = NSAppearance(named: .aqua),
+              let darkAqua = NSAppearance(named: .darkAqua)
+        else {
+            return 1
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        guard NativeAppearancePreference.current(in: defaults) == .system,
+              NativeAppearancePreference.system.applicationAppearance == nil,
+              NativeAppearancePreference.system.resolvedTheme(for: aqua)
+                == "light",
+              NativeAppearancePreference.system.resolvedTheme(for: darkAqua)
+                == "dark"
+        else {
+            return 1
+        }
+
+        NativeAppearancePreference.set(.light, in: defaults)
+        defaults.synchronize()
+        guard let reloaded = UserDefaults(suiteName: suiteName),
+              NativeAppearancePreference.current(in: reloaded) == .light,
+              NativeAppearancePreference.light.applicationAppearance?.name
+                == .aqua,
+              NativeAppearancePreference.light.resolvedTheme(for: darkAqua)
+                == "light"
+        else {
+            return 1
+        }
+
+        NativeAppearancePreference.set(.dark, in: reloaded)
+        reloaded.synchronize()
+        guard let darkReloaded = UserDefaults(suiteName: suiteName),
+              NativeAppearancePreference.current(in: darkReloaded) == .dark,
+              NativeAppearancePreference.dark.applicationAppearance?.name
+                == .darkAqua,
+              NativeAppearancePreference.dark.resolvedTheme(for: aqua)
+                == "dark"
+        else {
+            return 1
+        }
+
+        NativeAppearancePreference.set(.system, in: darkReloaded)
+        darkReloaded.synchronize()
+        guard let systemReloaded = UserDefaults(suiteName: suiteName),
+              NativeAppearancePreference.current(in: systemReloaded) == .system
+        else {
+            return 1
+        }
+
+        systemReloaded.set(
+            "unsupported",
+            forKey: NativeAppearancePreference.defaultsKey
+        )
+        guard NativeAppearancePreference.current(in: systemReloaded) == .system
+        else {
+            return 1
+        }
+
+        print(
+            "USAGE_MONITOR_MACOS_APPEARANCE_SETTINGS_CONTRACT "
+                + "default=system persisted=light,dark,system "
+                + "invalid=system system_resolution=light,dark "
+                + "explicit_resolution=light,dark "
+                + "appkit=system,aqua,darkAqua"
         )
         return 0
     }
@@ -9613,6 +9965,11 @@ private struct UsageMonitorMain {
         }
         if arguments.contains("--native-refresh-settings-contract-smoke-test") {
             exit(NativeRefreshSettingsContractSmokeTest.run())
+        }
+        if arguments.contains(
+            "--native-appearance-settings-contract-smoke-test"
+        ) {
+            exit(NativeAppearanceSettingsContractSmokeTest.run())
         }
         if arguments.contains("--native-analysis-progress-contract-smoke-test") {
             exit(NativeAnalysisProgressContractSmokeTest.run())

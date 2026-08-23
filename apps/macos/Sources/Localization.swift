@@ -252,6 +252,12 @@ enum TiboTattleLocalization {
         case settingsAboutProduct = "settings.aboutProduct"
         case settingsAboutTab = "settings.aboutTab"
         case settingsAboutSummary = "settings.aboutSummary"
+        case settingsAppearance = "settings.appearance"
+        case settingsAppearanceDark = "settings.appearanceDark"
+        case settingsAppearanceLight = "settings.appearanceLight"
+        case settingsAppearancePickerHint = "settings.appearancePickerHint"
+        case settingsAppearanceSummary = "settings.appearanceSummary"
+        case settingsAppearanceSystem = "settings.appearanceSystem"
         case settingsAutomaticUpdates = "settings.automaticUpdates"
         case settingsAutomaticUpdatesOff = "settings.automaticUpdatesOff"
         case settingsAutomaticUpdatesOn = "settings.automaticUpdatesOn"
@@ -722,6 +728,18 @@ enum TiboTattleLocalization {
                 "About"
             case .settingsAboutSummary:
                 "Local Codex allowance, measured on your Mac."
+            case .settingsAppearance:
+                "Appearance"
+            case .settingsAppearanceDark:
+                "Dark"
+            case .settingsAppearanceLight:
+                "Light"
+            case .settingsAppearancePickerHint:
+                "Choose how TiboTattle looks."
+            case .settingsAppearanceSummary:
+                "Uses your Mac appearance by default."
+            case .settingsAppearanceSystem:
+                "System"
             case .settingsAutomaticUpdates:
                 "Automatic updates"
             case .settingsAutomaticUpdatesOff:

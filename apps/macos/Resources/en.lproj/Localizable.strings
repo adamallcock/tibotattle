@@ -18,6 +18,12 @@
 "settings.aboutProduct" = "About %@";
 "settings.aboutTab" = "About";
 "settings.aboutSummary" = "Local Codex allowance, measured on your Mac.";
+"settings.appearance" = "Appearance";
+"settings.appearanceDark" = "Dark";
+"settings.appearanceLight" = "Light";
+"settings.appearancePickerHint" = "Choose how TiboTattle looks.";
+"settings.appearanceSummary" = "Uses your Mac appearance by default.";
+"settings.appearanceSystem" = "System";
 "settings.automaticUpdates" = "Automatic updates";
 "settings.automaticUpdatesOff" = "Automatic downloads are off.";
 "settings.automaticUpdatesOn" = "Automatic downloads are on.";

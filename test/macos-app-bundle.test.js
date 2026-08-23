@@ -947,6 +947,18 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(
     source,
+    /TiboTattleLocalization\.string\(\.settingsAppearance\)/u,
+  );
+  assert.match(
+    source,
+    /\(\.system, \.settingsAppearanceSystem\)/u,
+  );
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.settingsAppearanceSummary\)/u,
+  );
+  assert.match(
+    source,
     /settingsAboutAutomaticUpdatesDetailLabel\?\.stringValue\s*=\s*automaticUpdatesSettingsSummary\(\)/u,
   );
   assert.doesNotMatch(
@@ -966,7 +978,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.ok(generalSettings, "general settings page wiring should be present");
   assert.match(
     generalSettings,
-    /languageSection[\s\S]*sourceSection[\s\S]*refreshIntervalSection[\s\S]*startAtLoginSection/u,
+    /appearanceSection[\s\S]*languageSection[\s\S]*sourceSection[\s\S]*refreshIntervalSection[\s\S]*startAtLoginSection/u,
   );
   assert.doesNotMatch(generalSettings, /quotaNotificationsSection/u);
   assert.doesNotMatch(
@@ -1019,6 +1031,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     );
   }
   assert.match(settingsSource, /symbolName: "globe"/u);
+  assert.match(settingsSource, /symbolName: "circle\.lefthalf\.filled"/u);
   assert.match(settingsSource, /symbolName: "folder"/u);
   assert.match(settingsSource, /symbolName: "clock"/u);
   assert.match(source, /settingsOpenNotifications/u);
@@ -1035,6 +1048,38 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(
     localizationSource,
     /Start TiboTattle when you sign in\. Manage this in System Settings → Login Items\./iu,
+  );
+  assert.match(localizationSource, /Uses your Mac appearance by default\./iu);
+  assert.match(source, /static let defaultsKey = "tibotattle\.appearance\.v1"/u);
+  assert.match(source, /case system\s*\n\s*case light\s*\n\s*case dark/u);
+  assert.match(
+    source,
+    /guard let rawValue = defaults\.string\(forKey: defaultsKey\),[\s\S]*?else \{\s*\n\s*return \.system\s*\n\s*\}/u,
+  );
+  assert.match(
+    source,
+    /var applicationAppearance: NSAppearance\? \{[\s\S]*?case \.system:\s*\n\s*nil[\s\S]*?case \.light:\s*\n\s*NSAppearance\(named: \.aqua\)[\s\S]*?case \.dark:\s*\n\s*NSAppearance\(named: \.darkAqua\)/u,
+  );
+  assert.match(
+    source,
+    /func resolvedTheme\(for systemAppearance: NSAppearance\) -> String \{[\s\S]*?case \.light:\s*\n\s*return "light"[\s\S]*?case \.dark:\s*\n\s*return "dark"[\s\S]*?case \.system:[\s\S]*?systemAppearance\.bestMatch\(from: \[\.darkAqua, \.aqua\]\)[\s\S]*?\? "dark"\s*\n\s*: "light"/u,
+  );
+  assert.match(source, /NSApp\.appearance = preference\.applicationAppearance/u);
+  assert.match(
+    source,
+    /private func synchronizeResolvedAppearance\(\) \{[\s\S]*?let preference = NativeAppearancePreference\.current[\s\S]*?guard preference == \.system else \{ return \}[\s\S]*?notifyAppearancePreferenceChange\(preference\)/u,
+  );
+  assert.match(
+    source,
+    /func applicationDidBecomeActive\([\s\S]*?synchronizeResolvedAppearance\(\)/u,
+  );
+  assert.match(
+    source,
+    /chrome\.onAppearanceChange = \{ \[weak self\] in\s*\n\s*self\?\.synchronizeResolvedAppearance\(\)/u,
+  );
+  assert.match(
+    source,
+    /private func selectAppearancePreference\([\s\S]*?NativeAppearancePreference\.set\(preference\)[\s\S]*?applyAppearancePreference\(\)/u,
   );
   assert.match(source, /NSApp\.applicationIconImage/u);
   assert.doesNotMatch(source, /showAutomaticUpdateOptions/u);
@@ -1108,6 +1153,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /DispatchQueue\.main\.asyncAfter\(deadline: deadline, execute: work\)/u);
   assert.match(source, /setSeconds\(value, in: UserDefaults\.standard\)/u);
   assert.match(source, /--native-refresh-settings-contract-smoke-test/u);
+  assert.match(source, /--native-appearance-settings-contract-smoke-test/u);
   assert.doesNotMatch(source, /nativeRefreshIntervalSeconds/u);
   assert.match(source, /private func scheduleNativeRefresh\(\)/u);
   const refreshIntervalSelectionSource = source.match(
@@ -1436,6 +1482,16 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   );
   assert.match(source, /WKUserScript\([\s\S]*injectionTime: \.atDocumentStart/u);
   assert.match(source, /document\.documentElement\.classList\.add\('native-dashboard'\)/u);
+  assert.equal(
+    source.includes("window.__TIBOTATTLE_APPEARANCE__ = \\(json);"),
+    true,
+  );
+  assert.match(source, /document\.documentElement\.dataset\.theme = theme/u);
+  assert.match(source, /theme !== 'light' && theme !== 'dark'/u);
+  assert.match(
+    source,
+    /func notifyAppearancePreferenceChange\([\s\S]*?tibotattle:appearance-override/u,
+  );
   assert.match(
     source,
     /func notifyHostedSignInReturn\(\) \{[\s\S]*?window\.dispatchEvent\(new Event\('tibotattle:hosted-sign-in-return'\)\)/u,
@@ -2058,18 +2114,39 @@ test("dashboard sidebar resizes for real, wears the brand palette, and the title
     source,
     /private func rescueStrandedSidebar\(_ defaults: UserDefaults\) \{\s*\n\s*guard !defaults\.bool\(forKey: Self\.sidebarRescuedDefaultsKey\) else \{\s*\n\s*return\s*\n\s*\}\s*\n\s*defaults\.set\(true, forKey: Self\.sidebarRescuedDefaultsKey\)/u,
   );
-  // 2. The sidebar carries the web report's warm-paper palette over the
-  // system material, and the selected row uses the brand's deep green
-  // instead of the user's system accent. Both mirror the web tokens
-  // --paper #f5f1e8 and --green #174f45 and resolve per appearance.
-  assert.match(source, /private enum NativeBrandPalette/u);
+  // 2. The sidebar and report carry the exact light and Forest Ink tokens over
+  // native material instead of inheriting the user's unrelated system accent.
+  const nativeBrandPalette = source.match(
+    /private enum NativeBrandPalette \{[\s\S]*?\n\}/u,
+  )?.[0];
+  assert.ok(nativeBrandPalette, "native brand palette should be present");
   assert.match(
-    source,
-    /srgbRed: 245 \/ 255,\s*\n\s*green: 241 \/ 255,\s*\n\s*blue: 232 \/ 255/u,
+    nativeBrandPalette,
+    /static let accent = NSColor\(name: nil\)[\s\S]*?srgbRed: 118 \/ 255,[\s\S]*?green: 170 \/ 255,[\s\S]*?blue: 156 \/ 255/u,
+  );
+  assert.match(
+    nativeBrandPalette,
+    /static let accent = NSColor\(name: nil\)[\s\S]*?srgbRed: 23 \/ 255,[\s\S]*?green: 79 \/ 255,[\s\S]*?blue: 69 \/ 255/u,
+  );
+  assert.match(
+    nativeBrandPalette,
+    /static let reportPaper = NSColor\(name: nil\)[\s\S]*?srgbRed: 20 \/ 255,[\s\S]*?green: 26 \/ 255,[\s\S]*?blue: 23 \/ 255/u,
+  );
+  assert.match(
+    nativeBrandPalette,
+    /static let reportPaper = NSColor\(name: nil\)[\s\S]*?srgbRed: 245 \/ 255,[\s\S]*?green: 241 \/ 255,[\s\S]*?blue: 232 \/ 255/u,
+  );
+  assert.match(
+    nativeBrandPalette,
+    /static let sidebarWash = NSColor\(name: nil\)[\s\S]*?srgbRed: 45 \/ 255,[\s\S]*?green: 116 \/ 255,[\s\S]*?blue: 102 \/ 255,[\s\S]*?alpha: 0\.22/u,
   );
   assert.match(
     source,
-    /srgbRed: 23 \/ 255,\s*\n\s*green: 79 \/ 255,\s*\n\s*blue: 69 \/ 255/u,
+    /private final class NativeDashboardReportPane[\s\S]*?override var wantsUpdateLayer: Bool \{ true \}[\s\S]*?NativeBrandPalette\.reportPaper\.cgColor/u,
+  );
+  assert.match(
+    source,
+    /override func viewDidChangeEffectiveAppearance\(\)[\s\S]*?onAppearanceChange\?\(\)/u,
   );
   assert.match(source, /private final class NativeSidebarBrandWash: NSView/u);
   assert.match(source, /sidebar\.addSubview\(sidebarWash\)/u);
@@ -6159,6 +6236,20 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.match(
       refreshSettingsSmoke.stdout,
       /^USAGE_MONITOR_MACOS_REFRESH_SETTINGS_CONTRACT default=300 persisted=900 reloaded=900 picker_action=true picker_persisted=true scheduler=300->900 invalid_ignored=true$/mu,
+    );
+    const appearanceSettingsSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--native-appearance-settings-contract-smoke-test"],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    assert.equal(
+      appearanceSettingsSmoke.status,
+      0,
+      appearanceSettingsSmoke.stderr || appearanceSettingsSmoke.stdout,
+    );
+    assert.match(
+      appearanceSettingsSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_APPEARANCE_SETTINGS_CONTRACT default=system persisted=light,dark,system invalid=system system_resolution=light,dark explicit_resolution=light,dark appkit=system,aqua,darkAqua$/mu,
     );
     // The settings window is sized from what its pages measure. Source text
     // cannot show whether a page then fits, so this measures the real frames:
