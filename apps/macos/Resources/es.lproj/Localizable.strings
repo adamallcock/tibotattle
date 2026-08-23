@@ -174,6 +174,7 @@
 
 "launcher.codexFolderUpdated" = "Carpeta de Codex actualizada";
 "launcher.dashboardDidNotOpen" = "El panel no se abrió";
+"launcher.dashboardTakingLonger" = "El panel está tardando más de lo esperado";
 "launcher.localDataMovedToTrash" = "Los datos locales se movieron a la Papelera";
 "launcher.localDashboardCouldNotStart" = "No se pudo iniciar el panel local.";
 "launcher.localDataMovedToTrashDetail" = "Ahora se creará un nuevo almacén local disponible solo para el propietario. Los registros de Codex no se modificaron.";
@@ -190,7 +191,11 @@
 "launcher.errorCompanionLaunch" = "No se pudo iniciar el acompañante local.";
 "launcher.errorCompanionTimeout" = "El acompañante local no estuvo listo a tiempo.";
 "launcher.errorCodexHomeSettingsWrite" = "No se pudo guardar de forma privada la carpeta de Codex seleccionada.";
+"launcher.errorDashboardContentProcessTerminated" = "El proceso de contenido web de macOS se detuvo mientras se abría el panel local.";
 "launcher.errorDashboardDownloadFailed" = "El panel no pudo guardar ese archivo en tu carpeta Descargas.";
+"launcher.errorDashboardNavigationFailed" = "El panel integrado no pudo cargar su página local.";
+"launcher.errorDashboardReadinessTimeout" = "La página del panel local se cargó, pero no estuvo lista durante la espera inicial.";
+"launcher.errorDashboardViewportUnavailable" = "El panel integrado no recibió un tamaño de ventana utilizable.";
 "launcher.errorDashboardWebViewUnavailable" = "No se pudo mostrar la vista integrada del panel.";
 "launcher.errorDataErase" = "No se pudieron mover a la Papelera los datos locales de %@.";
 "launcher.errorFirstRunStateWrite" = "No se pudo guardar de forma privada la confirmación de primera ejecución.";
@@ -209,7 +214,7 @@
 "launcher.recoveryCheckAccess" = "Comprueba el acceso a tus carpetas de inicio y Application Support, y vuelve a intentarlo.";
 "launcher.recoveryChooseCodexHome" = "Elige Origen de Codex y selecciona una carpeta de inicio de Codex legible que pertenezca a tu cuenta de usuario de macOS, o restaura el valor predeterminado.";
 "launcher.recoveryDashboardDownload" = "Comprueba el acceso a tu carpeta Descargas y vuelve a guardar el archivo.";
-"launcher.recoveryDashboardWebView" = "Elige Abrir panel para intentarlo de nuevo, o Abrir en el navegador para usar el mismo panel local en tu navegador.";
+"launcher.recoveryDashboardWebView" = "Elige Abrir panel para volver a intentar la vista local. Si aún no se abre, elige Reintentar.";
 "launcher.recoveryDataErase" = "Cierra otros procesos que usen datos de %@ y vuelve a intentar el borrado.";
 "launcher.recoveryExistingWindow" = "Abre la ventana existente de %@ o ciérrala antes de iniciar otra copia.";
 "launcher.recoveryKeychainDenied" = "Vuelve a intentar el restablecimiento y aprueba el aviso del Llavero de macOS.";

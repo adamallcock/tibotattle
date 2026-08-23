@@ -110,13 +110,18 @@ enum TiboTattleLocalization {
         case launcherCodexFolderUpdated = "launcher.codexFolderUpdated"
         case launcherDataDiagnostics = "launcher.dataDiagnostics"
         case launcherDashboardDidNotOpen = "launcher.dashboardDidNotOpen"
+        case launcherDashboardTakingLonger = "launcher.dashboardTakingLonger"
         case launcherDetailPreparingLocalDashboard = "launcher.detailPreparingLocalDashboard"
         case launcherErrorCompanionAlreadyRunning = "launcher.errorCompanionAlreadyRunning"
         case launcherErrorCompanionExited = "launcher.errorCompanionExited"
         case launcherErrorCompanionLaunch = "launcher.errorCompanionLaunch"
         case launcherErrorCompanionTimeout = "launcher.errorCompanionTimeout"
         case launcherErrorCodexHomeSettingsWrite = "launcher.errorCodexHomeSettingsWrite"
+        case launcherErrorDashboardContentProcessTerminated = "launcher.errorDashboardContentProcessTerminated"
         case launcherErrorDashboardDownloadFailed = "launcher.errorDashboardDownloadFailed"
+        case launcherErrorDashboardNavigationFailed = "launcher.errorDashboardNavigationFailed"
+        case launcherErrorDashboardReadinessTimeout = "launcher.errorDashboardReadinessTimeout"
+        case launcherErrorDashboardViewportUnavailable = "launcher.errorDashboardViewportUnavailable"
         case launcherErrorDashboardWebViewUnavailable = "launcher.errorDashboardWebViewUnavailable"
         case launcherErrorDataErase = "launcher.errorDataErase"
         case launcherErrorFirstRunStateWrite = "launcher.errorFirstRunStateWrite"
@@ -444,6 +449,8 @@ enum TiboTattleLocalization {
                 "Data & Diagnostics…"
             case .launcherDashboardDidNotOpen:
                 "Dashboard didn’t open"
+            case .launcherDashboardTakingLonger:
+                "Dashboard is taking longer than expected"
             case .launcherDetailPreparingLocalDashboard:
                 "Preparing the private local dashboard and its bounded foreground update."
             case .launcherErrorCompanionAlreadyRunning:
@@ -456,8 +463,16 @@ enum TiboTattleLocalization {
                 "The local companion did not become ready in time."
             case .launcherErrorCodexHomeSettingsWrite:
                 "The selected Codex folder could not be saved privately."
+            case .launcherErrorDashboardContentProcessTerminated:
+                "The macOS web content process stopped while opening the local dashboard."
             case .launcherErrorDashboardDownloadFailed:
                 "The dashboard could not save that file to your Downloads folder."
+            case .launcherErrorDashboardNavigationFailed:
+                "The in-app dashboard could not load its local page."
+            case .launcherErrorDashboardReadinessTimeout:
+                "The local dashboard page loaded, but it did not become ready during the initial wait."
+            case .launcherErrorDashboardViewportUnavailable:
+                "The in-app dashboard did not receive a usable window size."
             case .launcherErrorDashboardWebViewUnavailable:
                 "The in-app dashboard view could not be displayed."
             case .launcherErrorDataErase:
@@ -531,7 +546,7 @@ enum TiboTattleLocalization {
             case .launcherRecoveryDashboardDownload:
                 "Check access to your Downloads folder, then save the file again."
             case .launcherRecoveryDashboardWebView:
-                "Choose Open Dashboard to try again, or Open in Browser to use the same local dashboard in your browser."
+                "Choose Open Dashboard to try the local view again. If it still does not open, choose Retry."
             case .launcherRecoveryDataErase:
                 "Quit other processes using %@ data, then try the erase again."
             case .launcherRecoveryExistingWindow:

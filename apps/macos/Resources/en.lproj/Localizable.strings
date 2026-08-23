@@ -240,6 +240,7 @@
 
 "launcher.codexFolderUpdated" = "Codex folder updated";
 "launcher.dashboardDidNotOpen" = "Dashboard didn’t open";
+"launcher.dashboardTakingLonger" = "Dashboard is taking longer than expected";
 "launcher.localDataMovedToTrash" = "Local data moved to Trash";
 "launcher.localDashboardCouldNotStart" = "The local dashboard could not be started.";
 "launcher.localDataMovedToTrashDetail" = "A fresh owner-only local store will be created now. Codex logs were not changed.";
@@ -256,7 +257,11 @@
 "launcher.errorCompanionLaunch" = "The local companion could not be started.";
 "launcher.errorCompanionTimeout" = "The local companion did not become ready in time.";
 "launcher.errorCodexHomeSettingsWrite" = "The selected Codex folder could not be saved privately.";
+"launcher.errorDashboardContentProcessTerminated" = "The macOS web content process stopped while opening the local dashboard.";
 "launcher.errorDashboardDownloadFailed" = "The dashboard could not save that file to your Downloads folder.";
+"launcher.errorDashboardNavigationFailed" = "The in-app dashboard could not load its local page.";
+"launcher.errorDashboardReadinessTimeout" = "The local dashboard page loaded, but it did not become ready during the initial wait.";
+"launcher.errorDashboardViewportUnavailable" = "The in-app dashboard did not receive a usable window size.";
 "launcher.errorDashboardWebViewUnavailable" = "The in-app dashboard view could not be displayed.";
 "launcher.errorDataErase" = "The local %@ data could not be moved to Trash.";
 "launcher.errorFirstRunStateWrite" = "The first-run acknowledgement could not be saved privately.";
@@ -275,7 +280,7 @@
 "launcher.recoveryCheckAccess" = "Check access to your home and Application Support folders, then retry.";
 "launcher.recoveryChooseCodexHome" = "Choose Codex Source and select a readable Codex home owned by your macOS user account, or restore the default.";
 "launcher.recoveryDashboardDownload" = "Check access to your Downloads folder, then save the file again.";
-"launcher.recoveryDashboardWebView" = "Choose Open Dashboard to try again, or Open in Browser to use the same local dashboard in your browser.";
+"launcher.recoveryDashboardWebView" = "Choose Open Dashboard to try the local view again. If it still does not open, choose Retry.";
 "launcher.recoveryDataErase" = "Quit other processes using %@ data, then try the erase again.";
 "launcher.recoveryExistingWindow" = "Open the existing %@ window, or quit it before starting another copy.";
 "launcher.recoveryKeychainDenied" = "Retry the reset and approve the macOS Keychain prompt.";
