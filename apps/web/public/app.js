@@ -144,7 +144,6 @@ const accountingModelsTablePagination = { page: 0, signature: "" };
 // background refresh redraws the table without collapsing a row mid-read.
 const accountingExpandedModels = new Set();
 const cacheSwitchTablePagination = { page: 0, signature: "" };
-const cacheContinuityGapTablePagination = { page: 0, signature: "" };
 const cacheContinuityTablePagination = { page: 0, signature: "" };
 const sideChatTablePagination = { page: 0, signature: "" };
 
@@ -7578,6 +7577,23 @@ function cacheSwitchMetricValue(impact) {
   return "—";
 }
 
+function cacheContinuityStandardMetricValue(impact) {
+  const standard = finite(impact?.standardApiPremiumUsd, null);
+  return standard === null ? "—" : formatApiMoney(standard);
+}
+
+function cacheContinuityMetricValue(impact) {
+  const weighted = cacheSwitchMetricValue(impact);
+  return weighted === "—"
+    ? cacheContinuityStandardMetricValue(impact)
+    : weighted;
+}
+
+function cacheContinuityUsesStandardFallback(impact) {
+  return cacheSwitchMetricValue(impact) === "—"
+    && finite(impact?.standardApiPremiumUsd, null) !== null;
+}
+
 function formatCacheSwitchPercentagePoints(value) {
   const number = finite(value, null);
   if (number === null) return "—";
@@ -7824,8 +7840,11 @@ function renderAccountingCacheSwitchDetails(impact) {
   }
 }
 
-function appendCacheContinuityAllowance(container, impact) {
-  if (finite(impact?.standardApiPremiumUsd, null) !== null) {
+function appendCacheContinuityAllowance(container, impact, {
+  includeStandardPremium = true,
+} = {}) {
+  if (includeStandardPremium
+      && finite(impact?.standardApiPremiumUsd, null) !== null) {
     container.append(
       document.createTextNode(" "),
       localizedNode(
@@ -7932,7 +7951,20 @@ function appendCacheContinuityMetricNote(container, impact) {
   }
   if (impact.coverageStatus === "complete"
       && finite(impact.unpricedDrops, 0) === 0) {
-    appendCacheContinuityAllowance(container, impact);
+    const standardFallback = cacheContinuityUsesStandardFallback(impact);
+    if (standardFallback) {
+      container.append(
+        document.createTextNode(" "),
+        localizedNode(
+          "span",
+          "",
+          "accounting.cacheContinuity.noteStandardFallback",
+        ),
+      );
+    }
+    appendCacheContinuityAllowance(container, impact, {
+      includeStandardPremium: !standardFallback,
+    });
   }
 }
 
@@ -7962,59 +7994,136 @@ function cacheContinuityConfigurationDescription(row) {
   });
 }
 
-const CACHE_CONTINUITY_GAP_BAND_UI = Object.freeze([
+const CACHE_REUSE_OUTCOME_BUCKET_UI = Object.freeze([
   Object.freeze({
     id: "under_one_minute",
-    labelKey: "accounting.cacheContinuity.gapBand.underOneMinute",
+    labelKey: "accounting.cacheContinuity.outcome.bucket.underOneMinute",
+    startSeconds: 0,
+    endSeconds: 60,
   }),
   Object.freeze({
-    id: "one_to_five_minutes",
-    labelKey: "accounting.cacheContinuity.gapBand.oneToFiveMinutes",
+    id: "one_to_two_minutes",
+    labelKey: "accounting.cacheContinuity.outcome.bucket.oneToTwoMinutes",
+    startSeconds: 60,
+    endSeconds: 120,
   }),
   Object.freeze({
-    id: "five_to_thirty_minutes",
-    labelKey: "accounting.cacheContinuity.gapBand.fiveToThirtyMinutes",
+    id: "two_to_five_minutes",
+    labelKey: "accounting.cacheContinuity.outcome.bucket.twoToFiveMinutes",
+    startSeconds: 120,
+    endSeconds: 300,
+  }),
+  Object.freeze({
+    id: "five_to_ten_minutes",
+    labelKey: "accounting.cacheContinuity.outcome.bucket.fiveToTenMinutes",
+    startSeconds: 300,
+    endSeconds: 600,
+  }),
+  Object.freeze({
+    id: "ten_to_thirty_minutes",
+    labelKey: "accounting.cacheContinuity.outcome.bucket.tenToThirtyMinutes",
+    startSeconds: 600,
+    endSeconds: 1_800,
   }),
   Object.freeze({
     id: "thirty_minutes_to_one_hour",
-    labelKey: "accounting.cacheContinuity.gapBand.thirtyMinutesToOneHour",
+    labelKey:
+      "accounting.cacheContinuity.outcome.bucket.thirtyMinutesToOneHour",
+    startSeconds: 1_800,
+    endSeconds: 3_600,
   }),
   Object.freeze({
     id: "one_to_six_hours",
-    labelKey: "accounting.cacheContinuity.gapBand.oneToSixHours",
+    labelKey: "accounting.cacheContinuity.outcome.bucket.oneToSixHours",
+    startSeconds: 3_600,
+    endSeconds: 21_600,
   }),
   Object.freeze({
     id: "six_to_twenty_four_hours",
-    labelKey: "accounting.cacheContinuity.gapBand.sixToTwentyFourHours",
+    labelKey:
+      "accounting.cacheContinuity.outcome.bucket.sixToTwentyFourHours",
+    startSeconds: 21_600,
+    endSeconds: 86_400,
   }),
   Object.freeze({
-    id: "over_twenty_four_hours",
-    labelKey: "accounting.cacheContinuity.gapBand.overTwentyFourHours",
+    id: "one_to_three_days",
+    labelKey: "accounting.cacheContinuity.outcome.bucket.oneToThreeDays",
+    startSeconds: 86_400,
+    endSeconds: 259_200,
+  }),
+  Object.freeze({
+    id: "over_three_days",
+    labelKey: "accounting.cacheContinuity.outcome.bucket.overThreeDays",
+    startSeconds: 259_200,
+    endSeconds: null,
   }),
 ]);
+const CACHE_REUSE_RASTER_HEIGHT = 376;
+const CACHE_REUSE_DEFAULT_BUCKET_INDEX = 2;
+const CACHE_REUSE_X_TICKS = Object.freeze([
+  60,
+  300,
+  1_800,
+  3_600,
+  21_600,
+  86_400,
+  604_800,
+]);
+let cacheReuseSelectedBucketIndex = CACHE_REUSE_DEFAULT_BUCKET_INDEX;
+let cacheReuseRenderedPeriodId = null;
+let cacheReuseCurrentImpact = null;
+let cacheReuseRasterLayout = null;
+let cacheReuseResizeObserver = null;
+let cacheReuseObservedWidth = 0;
+let cacheReuseReadoutVisible = false;
 
-function cacheContinuityGapBandSummaries(impact) {
+function cacheReuseOutcomeBuckets(impact) {
   if (impact?.status !== "available"
-      || (impact.coverageStatus !== "complete"
-        && impact.coverageStatus !== "incomplete")
-      || typeof impact.byGapBand !== "object"
-      || impact.byGapBand === null
-      || Array.isArray(impact.byGapBand)) return null;
+      || !Number.isSafeInteger(impact.comparableReturns)
+      || !Number.isSafeInteger(impact.reusedMoreThanHalfReturns)
+      || !Number.isSafeInteger(impact.reusedHalfOrLessReturns)
+      || !Number.isSafeInteger(impact.matchedOrExceededReturns)
+      || !Number.isSafeInteger(impact.reusedBetweenHalfAndPreviousReturns)
+      || impact.comparableReturns < 0
+      || impact.reusedMoreThanHalfReturns < 0
+      || impact.reusedHalfOrLessReturns < 0
+      || impact.matchedOrExceededReturns < 0
+      || impact.reusedBetweenHalfAndPreviousReturns < 0
+      || impact.reusedMoreThanHalfReturns + impact.reusedHalfOrLessReturns
+        !== impact.comparableReturns
+      || impact.matchedOrExceededReturns
+        + impact.reusedBetweenHalfAndPreviousReturns
+          !== impact.reusedMoreThanHalfReturns
+      || typeof impact.byOutcomeBucket !== "object"
+      || impact.byOutcomeBucket === null
+      || Array.isArray(impact.byOutcomeBucket)
+      || impact.outcomeDisplayMaximumGapSeconds !== 604_800) return null;
   const validCount = (value) => Number.isSafeInteger(value) && value >= 0;
-  const summaries = [];
-  for (const band of CACHE_CONTINUITY_GAP_BAND_UI) {
-    if (!Object.hasOwn(impact.byGapBand, band.id)) return null;
-    const summary = impact.byGapBand[band.id];
+  const buckets = [];
+  for (const definition of CACHE_REUSE_OUTCOME_BUCKET_UI) {
+    if (!Object.hasOwn(impact.byOutcomeBucket, definition.id)) return null;
+    const summary = impact.byOutcomeBucket[definition.id];
     const premium = summary?.estimatedPremiumUsd;
     if (typeof summary !== "object"
         || summary === null
         || Array.isArray(summary)
-        || !validCount(summary.cacheReadDrops)
+        || summary.startSeconds !== definition.startSeconds
+        || summary.endSeconds !== definition.endSeconds
         || !validCount(summary.comparableReturns)
+        || !validCount(summary.reusedMoreThanHalfReturns)
+        || !validCount(summary.reusedHalfOrLessReturns)
+        || !validCount(summary.matchedOrExceededReturns)
+        || !validCount(summary.reusedBetweenHalfAndPreviousReturns)
+        || !validCount(summary.cacheReadDrops)
         || !validCount(summary.lostCacheTokens)
         || !validCount(summary.pricedDrops)
         || !validCount(summary.unpricedDrops)
-        || summary.cacheReadDrops > summary.comparableReturns
+        || summary.reusedMoreThanHalfReturns
+          + summary.reusedHalfOrLessReturns !== summary.comparableReturns
+        || summary.matchedOrExceededReturns
+          + summary.reusedBetweenHalfAndPreviousReturns
+            !== summary.reusedMoreThanHalfReturns
+        || summary.cacheReadDrops !== summary.reusedHalfOrLessReturns
         || summary.pricedDrops + summary.unpricedDrops
           !== summary.cacheReadDrops
         || (summary.cacheReadDrops === 0 && summary.lostCacheTokens !== 0)
@@ -8034,93 +8143,553 @@ function cacheContinuityGapBandSummaries(impact) {
         || (premium !== null
           && (summary.coverageStatus !== "complete"
             || summary.unpricedDrops > 0))) return null;
-    summaries.push({ ...band, summary });
+    buckets.push({ ...definition, ...summary });
   }
-  return summaries;
+  for (const field of [
+    "comparableReturns",
+    "reusedMoreThanHalfReturns",
+    "reusedHalfOrLessReturns",
+    "matchedOrExceededReturns",
+    "reusedBetweenHalfAndPreviousReturns",
+    "cacheReadDrops",
+    "lostCacheTokens",
+    "pricedDrops",
+    "unpricedDrops",
+  ]) {
+    if (buckets.reduce((sum, bucket) => sum + bucket[field], 0)
+        !== impact[field]) return null;
+  }
+  return buckets;
 }
 
-function renderAccountingCacheContinuityGapRows(impact, rows) {
-  clear(rows);
-  const summaries = cacheContinuityGapBandSummaries(impact);
-  if (summaries === null) {
-    const page = paginateCacheImpactRows(
-      [],
-      cacheContinuityGapTablePagination,
-      cacheImpactTableSignature("continuity-gap-unavailable", impact, []),
+function cacheReusePercent(count, total) {
+  return formatPercent(total === 0 ? 0 : count / total * 100, 1);
+}
+
+function chooseCacheReuseMarkUnit(total) {
+  const raw = Math.max(1, total / 600);
+  const magnitude = 10 ** Math.floor(Math.log10(raw));
+  const scaled = raw / magnitude;
+  const nice = scaled <= 1 ? 1 : scaled <= 2 ? 2 : scaled <= 5 ? 5 : 10;
+  return Math.max(1, nice * magnitude);
+}
+
+function cacheReuseHexagonPath(context, x, y, radius) {
+  context.beginPath();
+  for (let point = 0; point < 6; point += 1) {
+    const angle = Math.PI / 3 * point;
+    const pointX = x + radius * Math.cos(angle);
+    const pointY = y + radius * Math.sin(angle);
+    if (point === 0) context.moveTo(pointX, pointY);
+    else context.lineTo(pointX, pointY);
+  }
+  context.closePath();
+}
+
+function drawCacheReuseHexagon(context, x, y, radius, color, fraction = 1) {
+  context.save();
+  cacheReuseHexagonPath(context, x, y, radius);
+  context.fillStyle = color;
+  context.globalAlpha = .1;
+  context.fill();
+  context.globalAlpha = .2;
+  context.lineWidth = .7;
+  context.strokeStyle = color;
+  context.stroke();
+  context.restore();
+
+  context.save();
+  cacheReuseHexagonPath(context, x, y, radius);
+  context.clip();
+  context.fillStyle = color;
+  context.globalAlpha = .8;
+  context.fillRect(
+    x - radius,
+    y - radius,
+    radius * 2 * Math.max(0, Math.min(1, fraction)),
+    radius * 2,
+  );
+  context.restore();
+}
+
+function drawCacheReuseBucketMarks(context, {
+  count,
+  unit,
+  x,
+  width,
+  centerY,
+  areaHeight,
+  color,
+}) {
+  if (count <= 0) return;
+  const fullMarks = Math.floor(count / unit);
+  const remainder = count % unit;
+  const markCount = fullMarks + (remainder > 0 ? 1 : 0);
+  const availableWidth = Math.max(8, width - 7);
+  let radius = 4.6;
+  let columns;
+  let rows;
+  do {
+    columns = Math.max(1, Math.floor(availableWidth / (radius * 1.75)));
+    rows = Math.ceil(markCount / columns);
+    if ((rows - 1) * radius * 1.55 + radius * 2 <= areaHeight
+        || radius <= 1.4) break;
+    radius -= .2;
+  } while (radius > 1.3);
+  const horizontalStep = columns === 1
+    ? 0
+    : Math.min(
+      radius * 1.75,
+      (availableWidth - radius * 2) / (columns - 1),
     );
-    renderCacheImpactPagination(
-      "cache-continuity-gap",
-      cacheContinuityGapTablePagination,
-      page,
+  const verticalStep = radius * 1.55;
+  const renderedRows = Math.ceil(markCount / columns);
+  const totalHeight = (renderedRows - 1) * verticalStep + radius * 2;
+  const startY = centerY - totalHeight / 2 + radius;
+  for (let mark = 0; mark < markCount; mark += 1) {
+    const row = Math.floor(mark / columns);
+    const column = mark % columns;
+    const rowCount = Math.min(columns, markCount - row * columns);
+    const rowWidth = (rowCount - 1) * horizontalStep;
+    const markX = x + width / 2 - rowWidth / 2 + column * horizontalStep;
+    const markY = startY + row * verticalStep
+      + (column % 2 ? radius * .12 : 0);
+    drawCacheReuseHexagon(
+      context,
+      markX,
+      markY,
+      radius,
+      color,
+      mark < fullMarks ? 1 : remainder / unit,
     );
-    const row = node("tr");
-    const cell = localizedNode(
-      "td",
-      "empty-cell",
-      "accounting.cacheContinuity.gapBreakdownUnavailable",
-    );
-    cell.colSpan = 4;
-    row.append(cell);
-    rows.append(row);
+  }
+}
+
+function cacheReuseWrappedLines(context, text, maximumWidth) {
+  const words = String(text).split(/\s+/u).filter(Boolean);
+  if (words.length <= 1 && context.measureText(text).width > maximumWidth) {
+    return [...String(text)].reduce((lines, character) => {
+      const last = lines.at(-1) ?? "";
+      if (last && context.measureText(last + character).width > maximumWidth) {
+        lines.push(character);
+      } else if (lines.length === 0) {
+        lines.push(character);
+      } else {
+        lines[lines.length - 1] = last + character;
+      }
+      return lines;
+    }, []);
+  }
+  return words.reduce((lines, word) => {
+    const last = lines.at(-1) ?? "";
+    const next = last ? `${last} ${word}` : word;
+    if (last && context.measureText(next).width > maximumWidth) {
+      lines.push(word);
+    } else if (lines.length === 0) {
+      lines.push(word);
+    } else {
+      lines[lines.length - 1] = next;
+    }
+    return lines;
+  }, []);
+}
+
+function drawCacheReuseLaneLabel(context, text, percentText, centerY, color,
+  maximumWidth) {
+  context.save();
+  context.fillStyle = color;
+  context.textAlign = "start";
+  context.textBaseline = "top";
+  context.font = `700 12px ${getComputedStyle(document.documentElement)
+    .getPropertyValue("--sans")}`;
+  const lines = cacheReuseWrappedLines(context, text, maximumWidth).slice(0, 3);
+  const startY = centerY - 34;
+  lines.forEach((line, index) => context.fillText(line, 4, startY + index * 14));
+  context.font = `600 11px ${getComputedStyle(document.documentElement)
+    .getPropertyValue("--sans")}`;
+  context.fillText(percentText, 4, centerY + 20);
+  context.restore();
+}
+
+function drawCacheReuseLegend(context, width, markUnit, color, muted, font) {
+  const text = t("accounting.cacheContinuity.outcome.legendInline", {
+    count: formatCount(markUnit),
+  });
+  context.save();
+  context.font = `500 10px ${font}`;
+  const textWidth = context.measureText(text).width;
+  const startX = Math.max(5, width - textWidth - 22);
+  drawCacheReuseHexagon(context, startX + 5, 15, 4.5, color);
+  context.fillStyle = muted;
+  context.textAlign = "start";
+  context.textBaseline = "middle";
+  context.fillText(text, startX + 14, 15);
+  context.restore();
+}
+
+function renderCacheReuseReadout(bucket, width, selectedRange,
+  completeCoverage) {
+  const total = bucket.comparableReturns;
+  const morePercent = cacheReusePercent(bucket.reusedMoreThanHalfReturns, total);
+  const lessPercent = cacheReusePercent(bucket.reusedHalfOrLessReturns, total);
+  setLocalizedText($("#cache-reuse-readout-bucket"), bucket.labelKey);
+  setLocalizedText(
+    $("#cache-reuse-readout-checked"),
+    "accounting.cacheContinuity.outcome.readoutChecked",
+    { count: formatCount(total) },
+  );
+  setLocalizedText(
+    $("#cache-reuse-readout-more"),
+    "accounting.cacheContinuity.outcome.readoutMore",
+    {
+      count: formatCount(bucket.reusedMoreThanHalfReturns),
+      percent: morePercent,
+    },
+  );
+  setLocalizedText(
+    $("#cache-reuse-readout-less"),
+    "accounting.cacheContinuity.outcome.readoutLess",
+    {
+      count: formatCount(bucket.reusedHalfOrLessReturns),
+      percent: lessPercent,
+    },
+  );
+  setLocalizedText(
+    $("#cache-reuse-readout-lost"),
+    "accounting.cacheContinuity.outcome.readoutLost",
+    { tokens: formatCount(bucket.lostCacheTokens) },
+  );
+  setLocalizedText(
+    $("#cache-reuse-readout-api"),
+    "accounting.cacheContinuity.outcome.readoutApi",
+    {
+      amount: !completeCoverage || bucket.estimatedPremiumUsd === null
+        ? t("accounting.cacheContinuity.premiumUnavailable")
+        : formatApiMoney(bucket.estimatedPremiumUsd),
+    },
+  );
+  const stage = $("#cache-reuse-raster-stage");
+  if (!stage) return;
+  const cardHalfWidth = Math.min(130, Math.max(90, (width - 16) / 2));
+  const selectedCenter = selectedRange.start
+    + (selectedRange.end - selectedRange.start) / 2;
+  const desiredCenter = selectedCenter <= width / 2
+    ? selectedRange.end + cardHalfWidth + 10
+    : selectedRange.start - cardHalfWidth - 10;
+  stage.style.setProperty(
+    "--cache-reuse-card-x",
+    `${Math.max(
+      cardHalfWidth + 8,
+      Math.min(width - cardHalfWidth - 8, desiredCenter),
+    )}px`,
+  );
+}
+
+function setCacheReuseReadoutVisible(visible) {
+  cacheReuseReadoutVisible = visible;
+  const rail = $("#cache-reuse-readout-rail");
+  if (rail) rail.hidden = !visible;
+}
+
+function drawCacheReuseRaster(impact, buckets, markUnit) {
+  const scroll = $("#cache-reuse-raster-scroll");
+  const stage = $("#cache-reuse-raster-stage");
+  const canvas = $("#cache-reuse-canvas");
+  if (!scroll || !stage || !canvas || typeof canvas.getContext !== "function") {
     return;
   }
-  const page = paginateCacheImpactRows(
-    summaries,
-    cacheContinuityGapTablePagination,
-    cacheImpactTableSignature("continuity-gap", impact, summaries),
+  const measuredWidth = Math.round(scroll.clientWidth || stage.clientWidth || 0);
+  const width = measuredWidth > 0 ? measuredWidth : 680;
+  cacheReuseObservedWidth = Math.round(scroll.clientWidth || 0);
+  stage.style.width = `${width}px`;
+  const pixelRatio = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  canvas.width = Math.round(width * pixelRatio);
+  canvas.height = Math.round(CACHE_REUSE_RASTER_HEIGHT * pixelRatio);
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${CACHE_REUSE_RASTER_HEIGHT}px`;
+  const context = canvas.getContext("2d");
+  if (!context) return;
+  context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+  context.clearRect(0, 0, width, CACHE_REUSE_RASTER_HEIGHT);
+  const styles = getComputedStyle(document.documentElement);
+  const color = (name, fallback) => styles.getPropertyValue(name).trim()
+    || fallback;
+  const green = color("--green", "#174f45");
+  const greenSoft = color("--chart-accent", "#3e8577");
+  const rust = color("--rust", "#97402a");
+  const rustSoft = "#c9826f";
+  const ink = color("--ink", "#17211e");
+  const muted = color("--muted", "#57625c");
+  const line = color("--line", "rgba(23,33,30,.14)");
+  const plotLeft = width < 520 ? 104 : width < 700 ? 118 : width < 860 ? 154 : 184;
+  const plotRight = width < 700 ? 12 : 22;
+  const plotWidth = width - plotLeft - plotRight;
+  const plotTop = 34;
+  const plotBottom = 307;
+  const axisY = 324;
+  const topCenter = 111;
+  const bottomCenter = 246;
+  const laneHeight = 92;
+  const displayMaximum = impact.outcomeDisplayMaximumGapSeconds;
+  const xPosition = (seconds) => plotLeft
+    + Math.log1p(Math.min(seconds, displayMaximum))
+      / Math.log1p(displayMaximum) * plotWidth;
+  const bucketRanges = buckets.map((bucket) => ({
+    start: xPosition(bucket.startSeconds),
+    end: xPosition(bucket.endSeconds ?? displayMaximum),
+  }));
+  cacheReuseSelectedBucketIndex = Math.max(
+    0,
+    Math.min(buckets.length - 1, cacheReuseSelectedBucketIndex),
   );
-  renderCacheImpactPagination(
-    "cache-continuity-gap",
-    cacheContinuityGapTablePagination,
-    page,
+  cacheReuseRasterLayout = { bucketRanges, plotLeft, plotWidth };
+  const selectedRange = bucketRanges[cacheReuseSelectedBucketIndex];
+  const selectedX = selectedRange.start;
+  const selectedWidth = selectedRange.end - selectedRange.start;
+  context.save();
+  context.globalAlpha = .62;
+  context.fillStyle = color("--green-soft", "#dfece6");
+  context.fillRect(
+    selectedX + 1,
+    plotTop,
+    Math.max(1, selectedWidth - 2),
+    plotBottom - plotTop,
   );
-  for (const { labelKey, summary } of page.rows) {
-    const row = node("tr");
-    row.append(
-      localizedNode("td", "", labelKey),
-      rawNode(
-        "td",
-        "numeric-cell",
-        `${formatCount(summary.cacheReadDrops)} / ${formatCount(summary.comparableReturns)}`,
-      ),
-      rawNode("td", "numeric-cell", formatCount(summary.lostCacheTokens)),
-      impact.coverageStatus !== "complete"
-        || summary.estimatedPremiumUsd === null
-        ? localizedNode(
-          "td",
-          "cache-continuity-premium-unavailable",
-          "accounting.cacheContinuity.premiumUnavailable",
-        )
-        : rawNode(
-          "td",
-          "model-api-equivalent",
-          formatApiMoney(summary.estimatedPremiumUsd),
-        ),
-    );
-    rows.append(row);
+  context.restore();
+  context.strokeStyle = green;
+  context.lineWidth = 1.2;
+  context.strokeRect(
+    selectedX + .5,
+    plotTop + .5,
+    Math.max(1, selectedWidth - 1),
+    plotBottom - plotTop - 1,
+  );
+  context.strokeStyle = line;
+  context.lineWidth = .8;
+  for (const range of bucketRanges.slice(0, -1)) {
+    context.beginPath();
+    context.moveTo(range.end, plotTop + 12);
+    context.lineTo(range.end, plotBottom);
+    context.stroke();
   }
+  context.save();
+  context.setLineDash([2, 3]);
+  context.strokeStyle = line;
+  context.lineWidth = 1;
+  context.textAlign = "center";
+  context.textBaseline = "top";
+  context.fillStyle = ink;
+  const tickFontSize = width < 700 ? 10 : 12;
+  context.font = `600 ${tickFontSize}px ${styles.getPropertyValue("--sans")}`;
+  CACHE_REUSE_X_TICKS.forEach((seconds, index) => {
+    const tickX = xPosition(seconds);
+    let labelX = tickX;
+    context.beginPath();
+    context.moveTo(tickX, plotTop + 12);
+    context.lineTo(tickX, plotBottom);
+    context.stroke();
+    if (width < 700 && seconds === 1_800) {
+      context.textAlign = "end";
+      labelX -= 4;
+    } else if (width < 700 && seconds === 3_600) {
+      context.textAlign = "start";
+      labelX += 4;
+    } else {
+      context.textAlign = index === CACHE_REUSE_X_TICKS.length - 1
+        ? "end"
+        : "center";
+    }
+    const tickLabel = seconds === displayMaximum
+      ? `${formatCacheContinuityGap(seconds)}+`
+      : formatCacheContinuityGap(seconds);
+    context.fillText(tickLabel, labelX, axisY);
+  });
+  context.restore();
+  drawCacheReuseLegend(
+    context,
+    width,
+    markUnit,
+    greenSoft,
+    muted,
+    styles.getPropertyValue("--sans"),
+  );
+  const total = impact.comparableReturns;
+  drawCacheReuseLaneLabel(
+    context,
+    t("accounting.cacheContinuity.outcome.laneMore"),
+    t("accounting.cacheContinuity.outcome.lanePercent", {
+      percent: cacheReusePercent(impact.reusedMoreThanHalfReturns, total),
+    }),
+    topCenter,
+    green,
+    plotLeft - 18,
+  );
+  drawCacheReuseLaneLabel(
+    context,
+    t("accounting.cacheContinuity.outcome.laneLess"),
+    t("accounting.cacheContinuity.outcome.lanePercent", {
+      percent: cacheReusePercent(impact.reusedHalfOrLessReturns, total),
+    }),
+    bottomCenter,
+    rust,
+    plotLeft - 18,
+  );
+  buckets.forEach((bucket, index) => {
+    const range = bucketRanges[index];
+    const isSelected = index === cacheReuseSelectedBucketIndex;
+    drawCacheReuseBucketMarks(context, {
+      count: bucket.reusedMoreThanHalfReturns,
+      unit: markUnit,
+      x: range.start,
+      width: Math.max(2, range.end - range.start),
+      centerY: topCenter,
+      areaHeight: laneHeight,
+      color: isSelected ? green : greenSoft,
+    });
+    drawCacheReuseBucketMarks(context, {
+      count: bucket.reusedHalfOrLessReturns,
+      unit: markUnit,
+      x: range.start,
+      width: Math.max(2, range.end - range.start),
+      centerY: bottomCenter,
+      areaHeight: laneHeight,
+      color: isSelected ? rust : rustSoft,
+    });
+  });
+  context.textAlign = "center";
+  context.textBaseline = "top";
+  context.fillStyle = muted;
+  context.font = `500 11px ${styles.getPropertyValue("--sans")}`;
+  context.fillText(
+    t("accounting.cacheContinuity.outcome.axisLabel"),
+    plotLeft + plotWidth / 2,
+    351,
+  );
+  canvas.setAttribute("role", "img");
+  canvas.setAttribute(
+    "aria-label",
+    t("accounting.cacheContinuity.outcome.canvasLabel", {
+      more: formatCount(impact.reusedMoreThanHalfReturns),
+      less: formatCount(impact.reusedHalfOrLessReturns),
+      unit: formatCount(markUnit),
+    }),
+  );
+  renderCacheReuseReadout(
+    buckets[cacheReuseSelectedBucketIndex],
+    width,
+    selectedRange,
+    impact.coverageStatus === "complete",
+  );
+  setCacheReuseReadoutVisible(cacheReuseReadoutVisible);
+}
+
+function ensureCacheReuseResizeObserver() {
+  const scroll = $("#cache-reuse-raster-scroll");
+  if (!scroll || cacheReuseResizeObserver !== null
+      || typeof ResizeObserver !== "function") return;
+  cacheReuseResizeObserver = new ResizeObserver((entries) => {
+    const width = Math.round(entries[0]?.contentRect?.width ?? 0);
+    if (width <= 0 || width === cacheReuseObservedWidth
+        || cacheReuseCurrentImpact === null) return;
+    renderAccountingCacheReuseOutcome(cacheReuseCurrentImpact);
+  });
+  cacheReuseResizeObserver.observe(scroll);
+}
+
+function renderAccountingCacheReuseOutcome(impact) {
+  const outcome = $("#cache-reuse-outcome");
+  const raster = $("#cache-reuse-raster");
+  const empty = $("#cache-reuse-empty");
+  if (!outcome || !raster || !empty) return;
+  const buckets = cacheReuseOutcomeBuckets(impact);
+  outcome.hidden = buckets === null;
+  if (buckets === null) {
+    cacheReuseCurrentImpact = null;
+    return;
+  }
+  cacheReuseCurrentImpact = impact;
+  if (cacheReuseRenderedPeriodId !== impact.periodId) {
+    cacheReuseRenderedPeriodId = impact.periodId;
+    cacheReuseSelectedBucketIndex = CACHE_REUSE_DEFAULT_BUCKET_INDEX;
+  }
+  const total = impact.comparableReturns;
+  const morePercent = cacheReusePercent(impact.reusedMoreThanHalfReturns, total);
+  const lessPercent = cacheReusePercent(impact.reusedHalfOrLessReturns, total);
+  setRawText($("#cache-reuse-more-percent"), morePercent);
+  setRawText($("#cache-reuse-less-percent"), lessPercent);
+  setRawText(
+    $("#cache-reuse-overhead"),
+    cacheContinuityStandardMetricValue(impact),
+  );
+  setLocalizedText(
+    $("#cache-reuse-more-count"),
+    "accounting.cacheContinuity.outcome.followUps",
+    { count: formatCount(impact.reusedMoreThanHalfReturns) },
+  );
+  setLocalizedText(
+    $("#cache-reuse-less-count"),
+    "accounting.cacheContinuity.outcome.followUps",
+    { count: formatCount(impact.reusedHalfOrLessReturns) },
+  );
+  setLocalizedText(
+    $("#cache-reuse-explanation"),
+    "accounting.cacheContinuity.outcome.howToRead",
+    {
+      percent: morePercent,
+      matched: formatCount(impact.matchedOrExceededReturns),
+      between: formatCount(impact.reusedBetweenHalfAndPreviousReturns),
+    },
+  );
+  empty.hidden = total !== 0;
+  raster.hidden = total === 0;
+  if (total === 0) return;
+  const markUnit = chooseCacheReuseMarkUnit(total);
+  drawCacheReuseRaster(impact, buckets, markUnit);
+  ensureCacheReuseResizeObserver();
+}
+
+function selectCacheReuseBucketFromPointer(event) {
+  if (event.type === "pointermove" && event.pointerType === "touch") return;
+  setCacheReuseReadoutVisible(true);
+  const canvas = $("#cache-reuse-canvas");
+  if (!canvas || cacheReuseRasterLayout === null
+      || cacheReuseCurrentImpact === null) return;
+  const bounds = canvas.getBoundingClientRect();
+  const pointerX = event.clientX - bounds.left;
+  const next = cacheReuseRasterLayout.bucketRanges.findIndex(
+    (range, index) => pointerX >= range.start
+      && (pointerX < range.end
+        || index === cacheReuseRasterLayout.bucketRanges.length - 1),
+  );
+  if (next < 0 || next === cacheReuseSelectedBucketIndex) return;
+  cacheReuseSelectedBucketIndex = next;
+  renderAccountingCacheReuseOutcome(cacheReuseCurrentImpact);
+}
+
+function moveCacheReuseBucketSelection(direction) {
+  if (cacheReuseCurrentImpact === null) return;
+  const next = Math.max(
+    0,
+    Math.min(
+      CACHE_REUSE_OUTCOME_BUCKET_UI.length - 1,
+      cacheReuseSelectedBucketIndex + direction,
+    ),
+  );
+  if (next === cacheReuseSelectedBucketIndex) return;
+  cacheReuseSelectedBucketIndex = next;
+  renderAccountingCacheReuseOutcome(cacheReuseCurrentImpact);
 }
 
 function renderAccountingCacheContinuityDetails(impact) {
   const disclosure = $("#cache-continuity-details");
-  const gapRows = $("#cache-continuity-gap-rows");
   const rows = $("#cache-continuity-rows");
-  if (!disclosure || !gapRows || !rows) return;
-  clear(gapRows);
+  if (!disclosure || !rows) return;
   clear(rows);
   const available = impact?.status === "available";
   disclosure.hidden = !available;
+  renderAccountingCacheReuseOutcome(available ? impact : null);
   if (!available) {
     disclosure.open = false;
-    renderCacheImpactPagination(
-      "cache-continuity-gap",
-      cacheContinuityGapTablePagination,
-      paginateCacheImpactRows(
-        [],
-        cacheContinuityGapTablePagination,
-        "continuity-gap:unavailable",
-      ),
-    );
     renderCacheImpactPagination(
       "cache-continuity",
       cacheContinuityTablePagination,
@@ -8132,7 +8701,6 @@ function renderAccountingCacheContinuityDetails(impact) {
     );
     return;
   }
-  renderAccountingCacheContinuityGapRows(impact, gapRows);
   const recent = Array.isArray(impact.recent) ? impact.recent : [];
   const page = paginateCacheImpactRows(
     recent,
@@ -8852,7 +9420,7 @@ function renderAccounting(data) {
     rawNode(
       "strong",
       "metric-value",
-      cacheSwitchMetricValue(cacheContinuityImpact),
+      cacheContinuityMetricValue(cacheContinuityImpact),
     ),
     cacheContinuityNote,
   );
@@ -13202,22 +13770,6 @@ $("#cache-switch-page-next").addEventListener("click", () => {
     dashboard === null ? null : accountingPeriod(dashboard)?.cacheSwitchImpact,
   );
 });
-$("#cache-continuity-gap-page-prev").addEventListener("click", () => {
-  cacheContinuityGapTablePagination.page -= 1;
-  renderAccountingCacheContinuityDetails(
-    dashboard === null
-      ? null
-      : accountingPeriod(dashboard)?.cacheContinuityImpact,
-  );
-});
-$("#cache-continuity-gap-page-next").addEventListener("click", () => {
-  cacheContinuityGapTablePagination.page += 1;
-  renderAccountingCacheContinuityDetails(
-    dashboard === null
-      ? null
-      : accountingPeriod(dashboard)?.cacheContinuityImpact,
-  );
-});
 $("#cache-continuity-page-prev").addEventListener("click", () => {
   cacheContinuityTablePagination.page -= 1;
   renderAccountingCacheContinuityDetails(
@@ -13233,6 +13785,29 @@ $("#cache-continuity-page-next").addEventListener("click", () => {
       ? null
       : accountingPeriod(dashboard)?.cacheContinuityImpact,
   );
+});
+const cacheReuseCanvas = $("#cache-reuse-canvas");
+cacheReuseCanvas?.addEventListener("pointermove", selectCacheReuseBucketFromPointer);
+cacheReuseCanvas?.addEventListener("click", selectCacheReuseBucketFromPointer);
+cacheReuseCanvas?.addEventListener("pointerleave", () => {
+  setCacheReuseReadoutVisible(false);
+});
+cacheReuseCanvas?.addEventListener("focus", () => {
+  setCacheReuseReadoutVisible(true);
+});
+cacheReuseCanvas?.addEventListener("blur", () => {
+  setCacheReuseReadoutVisible(false);
+});
+cacheReuseCanvas?.addEventListener("keydown", (event) => {
+  if (event.key === "ArrowLeft") {
+    event.preventDefault();
+    setCacheReuseReadoutVisible(true);
+    moveCacheReuseBucketSelection(-1);
+  } else if (event.key === "ArrowRight") {
+    event.preventDefault();
+    setCacheReuseReadoutVisible(true);
+    moveCacheReuseBucketSelection(1);
+  }
 });
 $("#side-chat-page-prev").addEventListener("click", () => {
   sideChatTablePagination.page -= 1;

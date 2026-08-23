@@ -1304,6 +1304,8 @@ function cacheContinuityImpactProjection(
   const methodology = {
     minimumGapSeconds: impact?.minimumGapSeconds ?? 0,
     maximumRetainedCacheRatio: impact?.maximumRetainedCacheRatio ?? 0.5,
+    outcomeDisplayMaximumGapSeconds:
+      impact?.outcomeDisplayMaximumGapSeconds ?? 7 * 24 * 60 * 60,
     recentDetailLimit: impact?.recentDetailLimit ?? 20,
   };
   if (impact?.status !== "available" || !Array.isArray(impact.periods)) {
@@ -1361,6 +1363,11 @@ function cacheContinuityImpactProjection(
     contextContractedReturns: selected.contextContractedReturns,
     insufficientEvidenceReturns: selected.insufficientEvidenceReturns,
     uncoveredReturns: selected.uncoveredReturns,
+    reusedMoreThanHalfReturns: selected.reusedMoreThanHalfReturns,
+    reusedHalfOrLessReturns: selected.reusedHalfOrLessReturns,
+    matchedOrExceededReturns: selected.matchedOrExceededReturns,
+    reusedBetweenHalfAndPreviousReturns:
+      selected.reusedBetweenHalfAndPreviousReturns,
     orderingCoverageGaps: selected.orderingCoverageGaps ?? 0,
     coverageStatus: selected.coverageStatus,
     cacheReadDrops: selected.cacheReadDrops,
@@ -1374,6 +1381,7 @@ function cacheContinuityImpactProjection(
     postCompactionRequests: selected.postCompactionRequests,
     postCompactionCacheReadDrops: selected.postCompactionCacheReadDrops,
     byGapBand: selected.byGapBand,
+    byOutcomeBucket: selected.byOutcomeBucket,
     recent: selected.recent,
     allowanceImpact: selected.allowanceImpact,
     periods,
