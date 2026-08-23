@@ -5082,7 +5082,11 @@ test("public interface is dashboard-first and never substitutes demo data automa
 });
 
 test("native dashboard readiness follows both first-render outcomes", async () => {
-  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const [html, appSource, styles] = await Promise.all([
+    readFile(new URL("../public/index.html", import.meta.url), "utf8"),
+    readFile(new URL("../public/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/styles.css", import.meta.url), "utf8"),
+  ]);
   const markerStart = appSource.indexOf("function markLocalDashboardReady() {");
   const markerEnd = appSource.indexOf(
     "\n}\n\nasync function loadLocalDashboard",
@@ -5098,6 +5102,30 @@ test("native dashboard readiness follows both first-render outcomes", async () =
 
   const marker = appSource.slice(markerStart, markerEnd);
   const loader = appSource.slice(loadStart, loadEnd);
+  const bootSurface = html.match(
+    /<section[\s\S]*?id="dashboard-boot-state"[\s\S]*?<\/section>/u,
+  )?.[0] ?? "";
+  assert.ok(bootSurface, "the native dashboard has a static boot surface");
+  assert.match(bootSurface, /role="status"/u);
+  assert.match(bootSurface, /aria-live="polite"/u);
+  assert.match(bootSurface, /aria-busy="true"/u);
+  assert.match(bootSurface, /Loading saved results…/u);
+  assert.match(
+    bootSurface,
+    /Checking the summary on this Mac\. Nothing is sent while you look at it\./u,
+  );
+  const bootOpeningTag = bootSurface.match(/^<section[\s\S]*?>/u)?.[0] ?? "";
+  assert.doesNotMatch(bootOpeningTag, /\shidden(?:\s|=|>)/u);
+  assert.doesNotMatch(bootSurface, /data-requires-evidence/u);
+  assert.match(styles, /\.dashboard-boot-state \{ display: none; \}/u);
+  assert.match(
+    styles,
+    /html\.native-dashboard:not\(\[data-local-dashboard-ready="true"\]\) \.dashboard-boot-state,[\s\S]*?display: grid;/u,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 520px\)[\s\S]*?\.dashboard-boot-card \.state-pill \{[\s\S]*?width: max-content;[\s\S]*?font-size: \.67rem;/u,
+  );
   assert.match(
     marker,
     /document\.documentElement\.dataset\.localDashboardReady = "true";/u,

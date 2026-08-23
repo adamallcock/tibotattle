@@ -227,6 +227,41 @@ body.native-dashboard .dashboard-shell {
   width: 100%;
   min-height: 0;
 }
+/* The AppKit shell marks this document before page scripts run. Give that
+   otherwise blank interval one static, truthful surface, then let the
+   existing first-result marker remove it. The normal browser keeps its
+   current dashboard-first rendering because this surface is native-only. */
+.dashboard-boot-state { display: none; }
+html.native-dashboard:not([data-local-dashboard-ready="true"]) .dashboard-boot-state,
+html:not([data-local-dashboard-ready="true"]) body.native-dashboard .dashboard-boot-state {
+  display: grid;
+  min-height: clamp(280px, 72vh, 560px);
+  padding: clamp(28px, 7vw, 72px) 0;
+  place-items: center;
+}
+.dashboard-boot-card {
+  display: grid;
+  gap: var(--space-4);
+  width: min(34rem, 100%);
+  padding: clamp(24px, 5vw, 40px);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-card);
+}
+.dashboard-boot-card .state-pill { margin-bottom: var(--space-1); }
+.dashboard-boot-title {
+  font-size: clamp(1.55rem, 3vw, 2.2rem);
+  font-weight: var(--weight-semibold);
+  letter-spacing: -.025em;
+  line-height: 1.1;
+}
+.dashboard-boot-copy {
+  max-width: 29rem;
+  margin-bottom: 0;
+  color: var(--muted);
+  font-size: .88rem;
+}
 html.native-dashboard main,
 html.native-dashboard footer,
 body.native-dashboard main,
@@ -2503,6 +2538,15 @@ footer p { margin: 0; }
     gap: 0;
     overflow: hidden;
     font-size: 0;
+  }
+  /* The toolbar saves space with a dot at this width. The boot card has the
+     room — and its whole purpose is to name the state — so keep its label. */
+  .dashboard-boot-card .state-pill {
+    width: max-content;
+    height: auto;
+    padding: .38rem .62rem;
+    gap: .45rem;
+    font-size: .67rem;
   }
   .primary-nav a {
     flex: 0 0 auto;
