@@ -769,7 +769,7 @@ test("Windows process-table probe waits for close and retains trailing drained r
       return probe;
     },
   });
-  probe.stdout.emit("data", "100:1\n");
+  probe.stdout.emit("data", "0:0\n100:1\n");
   probe.exitCode = 0;
   probe.emit("exit", 0, null);
   probe.stdout.emit("data", "200:100\n");
@@ -808,6 +808,18 @@ test("Windows process-table probe rejects nonzero close and drained malformed ou
   malformedProbe.emit("close", 0, null);
   await assert.rejects(
     malformed,
+    (error) => error?.code === "WINDOWS_ELECTRON_SMOKE_PROCESS_TABLE_INVALID",
+  );
+
+  const invalidIdleParentProbe = fakeProcessTableProbe();
+  const invalidIdleParent = queryWindowsProcessTableForTest({
+    spawnProbe: () => invalidIdleParentProbe,
+  });
+  invalidIdleParentProbe.stdout.emit("data", "0:9\n");
+  invalidIdleParentProbe.exitCode = 0;
+  invalidIdleParentProbe.emit("close", 0, null);
+  await assert.rejects(
+    invalidIdleParent,
     (error) => error?.code === "WINDOWS_ELECTRON_SMOKE_PROCESS_TABLE_INVALID",
   );
 });

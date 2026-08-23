@@ -909,10 +909,16 @@ async function queryWindowsProcessTableWithSpawner(spawnProbe = spawn) {
     if (!match) fail("WINDOWS_ELECTRON_SMOKE_PROCESS_TABLE_INVALID");
     const pid = Number(match[1]);
     const parentPid = Number(match[2]);
-    if (!Number.isSafeInteger(pid) || pid < 1
-        || !Number.isSafeInteger(parentPid) || parentPid < 0) {
+    // Win32_Process includes the System Idle Process as the legitimate
+    // root tuple 0:0. It is not a descendant of any Electron root, so accept
+    // and discard that one tuple while keeping every other PID malformedness
+    // check fail-closed (including pid 0 with a nonzero parent).
+    if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(parentPid)
+        || parentPid < 0
+        || (pid < 1 && !(pid === 0 && parentPid === 0))) {
       fail("WINDOWS_ELECTRON_SMOKE_PROCESS_TABLE_INVALID");
     }
+    if (pid === 0) continue;
     table.set(pid, parentPid);
   }
   return table;
