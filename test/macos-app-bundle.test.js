@@ -1321,14 +1321,18 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.equal(
     source.match(/setActivationPolicy\(\.accessory\)/gu)?.length,
-    4,
+    5,
     "only isolated AppKit smoke modes may use accessory activation",
   );
-  // The fourth is the sidebar-recovery smoke, which builds real chrome in a
-  // window it never brings forward.
+  // The sidebar-recovery and interaction-safety smokes build real AppKit or
+  // WebKit objects in windows they never bring forward.
   assert.match(
     source,
     /private enum NativeDashboardSidebarRecoverySmokeTest \{[\s\S]*?application\.setActivationPolicy\(\.accessory\)/u,
+  );
+  assert.match(
+    source,
+    /private enum NativeDashboardInteractionSafetySmokeTest \{[\s\S]*?application\.setActivationPolicy\(\.accessory\)/u,
   );
   for (const forbidden of [
     "LSUIElement",
@@ -1468,6 +1472,20 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   );
   assert.doesNotMatch(source, /Finish signing in in your browser/u);
   assert.match(source, /webView\.allowsBackForwardNavigationGestures = false/u);
+  assert.match(source, /webView = NativeDashboardWebView\(/u);
+  assert.match(source, /webView\.allowsLinkPreview = false/u);
+  const nativeWebView = source.match(
+    /private final class NativeDashboardWebView: WKWebView \{([\s\S]*?)\n\}\n\n\/\/\/ The dashboard is hosted/u,
+  )?.[1];
+  assert.ok(nativeWebView, "the native dashboard WKWebView subclass should be present");
+  for (const hiddenIdentifier of [
+    "WKMenuItemIdentifierGoBack",
+    "WKMenuItemIdentifierGoForward",
+    "WKMenuItemIdentifierDownloadLinkedFile",
+  ]) {
+    assert.match(nativeWebView, new RegExp(hiddenIdentifier, "u"));
+  }
+  assert.doesNotMatch(nativeWebView, /WKMenuItemIdentifierReload/u);
   for (const forbidden of [
     "allowsLinkPreview = true",
     "javaScriptCanOpenWindowsAutomatically",
@@ -1708,6 +1726,44 @@ test("unified toolbar preserves the rich loopback report and single authority", 
   assert.match(source, /case \.live:[\s\S]*?nativeDashboardFresh/u);
   assert.match(toolbar, /toolbarShareIdentifier/u);
   assert.match(toolbar, /toolbarSettingsIdentifier/u);
+  const immovableToolbarItems = [...source.matchAll(
+    /func toolbarImmovableItemIdentifiers\(\s*\n\s*_ toolbar: NSToolbar\s*\n\s*\) -> Set<NSToolbarItem\.Identifier> \{([\s\S]*?)\n    \}/gu,
+  )]
+    .map((match) => match[1])
+    .find((body) => body.includes("Self.mandatoryDashboardToolbarItemIdentifiers"));
+  assert.ok(
+    immovableToolbarItems,
+    "the dashboard's mandatory toolbar policy should be present",
+  );
+  assert.match(
+    immovableToolbarItems,
+    /Self\.mandatoryDashboardToolbarItemIdentifiers/u,
+  );
+  const mandatoryToolbarItems = source.match(
+    /static let mandatoryDashboardToolbarItemIdentifiers: Set<\s*\n\s*NSToolbarItem\.Identifier\s*\n\s*> = \[([\s\S]*?)\n    \]/u,
+  )?.[1];
+  assert.ok(mandatoryToolbarItems, "the mandatory toolbar identifiers should be declared");
+  for (const identifier of [
+    ".toggleSidebar",
+    "toolbarStatusRefreshIdentifier",
+    "toolbarShareIdentifier",
+    "toolbarSettingsIdentifier",
+  ]) {
+    assert.ok(mandatoryToolbarItems.includes(identifier), identifier);
+  }
+  assert.equal(mandatoryToolbarItems.includes(".flexibleSpace"), false);
+  assert.match(
+    source,
+    /private enum NativeSettingsToolbarPolicy \{[\s\S]*?static let mandatoryTabIdentifiers/u,
+  );
+  assert.match(
+    source,
+    /private final class NativeSettingsToolbarDelegate: NSObject,[\s\S]*?NSToolbarDelegate[\s\S]*?func toolbarImmovableItemIdentifiers\([\s\S]*?NativeSettingsToolbarPolicy\.mandatoryTabIdentifiers/u,
+  );
+  assert.match(source, /let tabs = NSTabViewController\(\)/u);
+  assert.match(source, /let item = NSTabViewItem\(identifier: identifier\)/u);
+  assert.match(source, /toolbar\.delegate = toolbarDelegate/u);
+  assert.match(source, /settingsToolbarDelegate = toolbarDelegate/u);
   assert.match(toolbar, /@objc private func refreshDashboardFromToolbar\(\) \{[\s\S]*?refreshLocalUsage\(automatic: false\)/u);
   assert.match(
     toolbar,
@@ -1960,14 +2016,18 @@ test("dashboard sidebar resizes for real, wears the brand palette, and the title
   // The system toolbar toggle, in both the allowed and the default sets, so
   // it is present on a fresh install and cannot be customized away without
   // the menu command below still existing.
-  const toolbarDefaults = source.match(
-    /func toolbarDefaultItemIdentifiers\(\s*\n\s*_ toolbar: NSToolbar\s*\n\s*\) -> \[NSToolbarItem\.Identifier\] \{([\s\S]*?)\n    \}/u,
-  )?.[1];
+  const toolbarDefaults = [...source.matchAll(
+    /func toolbarDefaultItemIdentifiers\(\s*\n\s*_ toolbar: NSToolbar\s*\n\s*\) -> \[NSToolbarItem\.Identifier\] \{([\s\S]*?)\n    \}/gu,
+  )]
+    .map((match) => match[1])
+    .find((body) => body.includes(".toggleSidebar"));
   assert.ok(toolbarDefaults, "the toolbar default identifiers are available");
   assert.match(toolbarDefaults, /\.toggleSidebar/u);
-  const toolbarAllowed = source.match(
-    /func toolbarAllowedItemIdentifiers\(\s*\n\s*_ toolbar: NSToolbar\s*\n\s*\) -> \[NSToolbarItem\.Identifier\] \{([\s\S]*?)\n    \}/u,
-  )?.[1];
+  const toolbarAllowed = [...source.matchAll(
+    /func toolbarAllowedItemIdentifiers\(\s*\n\s*_ toolbar: NSToolbar\s*\n\s*\) -> \[NSToolbarItem\.Identifier\] \{([\s\S]*?)\n    \}/gu,
+  )]
+    .map((match) => match[1])
+    .find((body) => body.includes(".toggleSidebar"));
   assert.ok(toolbarAllowed, "the toolbar allowed identifiers are available");
   assert.match(toolbarAllowed, /\.toggleSidebar/u);
   // The standard macOS command and key equivalent, on the responder chain so
@@ -6152,6 +6212,20 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.match(
       sidebarRecoverySmoke.stdout,
       /^USAGE_MONITOR_MACOS_SIDEBAR_RECOVERY collapse=true responds=true menu_enabled=true reveal=true width=[12][0-9]{2} rescue_once=true respects_choice=true$/mu,
+    );
+    const interactionSafetySmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--native-dashboard-interaction-safety-smoke-test"],
+      { encoding: "utf8", timeout: 15_000 },
+    );
+    assert.equal(
+      interactionSafetySmoke.status,
+      0,
+      interactionSafetySmoke.stderr || interactionSafetySmoke.stdout,
+    );
+    assert.match(
+      interactionSafetySmoke.stdout,
+      /^USAGE_MONITOR_MACOS_NATIVE_INTERACTION_SAFETY back=false forward=false reload=true download_link=false open_link=true link_preview=false toolbar_immovable=true settings_tabs_immovable=true settings_delegate=true$/mu,
     );
     const generatedFiles = bundleFiles
       .map(({ relativePath }) => relativePath)

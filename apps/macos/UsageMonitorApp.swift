@@ -1869,6 +1869,41 @@ private struct LocalKeychainResetResult: Decodable {
     }
 }
 
+/// Removes browser commands that do not belong in TiboTattle's single-page
+/// dashboard while preserving useful page commands such as Reload, Copy, and
+/// Open Link. WKWebView does not expose a public context-menu delegate on
+/// macOS, but it does identify the NSMenuItems it supplies. Filtering those
+/// identifiers here avoids localized-title matching and leaves the rest of
+/// WebKit's menu behavior intact.
+@MainActor
+private final class NativeDashboardWebView: WKWebView {
+    private static let unsupportedContextMenuIdentifiers: Set<
+        NSUserInterfaceItemIdentifier
+    > = [
+        NSUserInterfaceItemIdentifier("WKMenuItemIdentifierGoBack"),
+        NSUserInterfaceItemIdentifier("WKMenuItemIdentifierGoForward"),
+        NSUserInterfaceItemIdentifier(
+            "WKMenuItemIdentifierDownloadLinkedFile"
+        ),
+    ]
+
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        super.willOpenMenu(menu, with: event)
+        Self.stripUnsupportedContextMenuItems(from: menu)
+    }
+
+    static func stripUnsupportedContextMenuItems(from menu: NSMenu) {
+        for item in menu.items {
+            guard let identifier = item.identifier,
+                  unsupportedContextMenuIdentifiers.contains(identifier)
+            else {
+                continue
+            }
+            menu.removeItem(item)
+        }
+    }
+}
+
 /// The dashboard is hosted inside the app, so this web view is the product's
 /// primary surface. It is deliberately the narrowest possible browser: it may
 /// load exactly one origin — the loopback companion this launcher started —
@@ -1940,7 +1975,10 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         Self.addDocumentStartScripts(
             to: configuration.userContentController
         )
-        webView = WKWebView(frame: .zero, configuration: configuration)
+        webView = NativeDashboardWebView(
+            frame: .zero,
+            configuration: configuration
+        )
         super.init()
         configuration.userContentController.add(
             self,
@@ -1957,6 +1995,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = false
+        webView.allowsLinkPreview = false
         webView.setAccessibilityLabel(
             TiboTattleLocalization.string(.accessibilityLocalDashboard)
         )
@@ -3263,6 +3302,86 @@ private final class NativeDashboardChrome: NSSplitViewController {
     }
 }
 
+/// Stable, non-localized identifiers for the three Settings pages. A page is
+/// reachable only through its toolbar tab, so all three are mandatory.
+private enum NativeSettingsToolbarPolicy {
+    static let generalIdentifier = NSToolbarItem.Identifier(
+        "com.usagemonitor.local.settings-general"
+    )
+    static let notificationsIdentifier = NSToolbarItem.Identifier(
+        "com.usagemonitor.local.settings-notifications"
+    )
+    static let aboutIdentifier = NSToolbarItem.Identifier(
+        "com.usagemonitor.local.settings-about"
+    )
+    static let mandatoryTabIdentifiers: Set<NSToolbarItem.Identifier> = [
+        generalIdentifier,
+        notificationsIdentifier,
+        aboutIdentifier,
+    ]
+}
+
+/// NSTabViewController supplies the Settings toolbar items, while this proxy
+/// adds the removal policy AppKit's generated delegate does not expose. Every
+/// item-building and selection query still forwards to the tab controller, so
+/// tab behavior remains owned by AppKit.
+@MainActor
+private final class NativeSettingsToolbarDelegate: NSObject,
+    NSToolbarDelegate {
+    private weak var tabController: NSTabViewController?
+
+    init(tabController: NSTabViewController) {
+        self.tabController = tabController
+        super.init()
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        tabController?.toolbar(
+            toolbar,
+            itemForItemIdentifier: itemIdentifier,
+            willBeInsertedIntoToolbar: flag
+        )
+    }
+
+    func toolbarDefaultItemIdentifiers(
+        _ toolbar: NSToolbar
+    ) -> [NSToolbarItem.Identifier] {
+        tabController?.toolbarDefaultItemIdentifiers(toolbar) ?? []
+    }
+
+    func toolbarAllowedItemIdentifiers(
+        _ toolbar: NSToolbar
+    ) -> [NSToolbarItem.Identifier] {
+        tabController?.toolbarAllowedItemIdentifiers(toolbar) ?? []
+    }
+
+    func toolbarSelectableItemIdentifiers(
+        _ toolbar: NSToolbar
+    ) -> [NSToolbarItem.Identifier] {
+        tabController?.toolbarSelectableItemIdentifiers(toolbar) ?? []
+    }
+
+    func toolbarImmovableItemIdentifiers(
+        _ toolbar: NSToolbar
+    ) -> Set<NSToolbarItem.Identifier> {
+        NativeSettingsToolbarPolicy.mandatoryTabIdentifiers
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemIdentifier: NSToolbarItem.Identifier,
+        canBeInsertedAt index: Int
+    ) -> Bool {
+        index != NSNotFound
+            || !NativeSettingsToolbarPolicy.mandatoryTabIdentifiers
+                .contains(itemIdentifier)
+    }
+}
+
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate,
     NSWindowDelegate, NSToolbarDelegate {
@@ -3291,6 +3410,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private var menuBarStatus: MenuBarStatusController?
     private var settingsWindow: NSWindow?
     private var settingsTabs: NSTabViewController?
+    private var settingsToolbarDelegate: NativeSettingsToolbarDelegate?
     private var settingsPages: [SettingsPage] = []
     private weak var settingsCodexHomeLabel: NSTextField?
     private weak var settingsAutomaticUpdatesSwitch: NSSwitch?
@@ -3344,6 +3464,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     static let toolbarSettingsIdentifier = NSToolbarItem.Identifier(
         "com.usagemonitor.local.dashboard-settings"
     )
+    static let mandatoryDashboardToolbarItemIdentifiers: Set<
+        NSToolbarItem.Identifier
+    > = [
+        .toggleSidebar,
+        toolbarStatusRefreshIdentifier,
+        toolbarShareIdentifier,
+        toolbarSettingsIdentifier,
+    ]
     private let statusLabel = NSTextField(labelWithString:
         TiboTattleLocalization.string(.launcherStartingLocally))
     private let detailLabel = NSTextField(
@@ -3937,6 +4065,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             Self.toolbarShareIdentifier,
             Self.toolbarSettingsIdentifier,
         ]
+    }
+
+    /// These controls are the native shell's only routes to navigation,
+    /// refresh, sharing, and Settings. AppKit's accessibility actions can
+    /// otherwise offer "Remove from Toolbar" even though customization and
+    /// configuration persistence are disabled. Declaring the product controls
+    /// immovable prevents user-initiated dragging or removal while leaving the
+    /// flexible spacer free to do its normal layout work.
+    func toolbarImmovableItemIdentifiers(
+        _ toolbar: NSToolbar
+    ) -> Set<NSToolbarItem.Identifier> {
+        Self.mandatoryDashboardToolbarItemIdentifiers
     }
 
     func toolbar(
@@ -5776,6 +5916,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         settingsWindow?.close()
         settingsWindow = nil
         settingsTabs = nil
+        settingsToolbarDelegate = nil
         settingsPages = []
         settingsCodexHomeLabel = nil
         settingsAutomaticUpdatesSwitch = nil
@@ -6248,24 +6389,27 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
         let tabs = NSTabViewController()
         tabs.tabStyle = .toolbar
-        for (label, symbol, controller) in [
+        for (identifier, label, symbol, controller) in [
             (
+                NativeSettingsToolbarPolicy.generalIdentifier,
                 TiboTattleLocalization.string(.settingsGeneral),
                 "gearshape",
                 general.controller
             ),
             (
+                NativeSettingsToolbarPolicy.notificationsIdentifier,
                 TiboTattleLocalization.string(.settingsNotifications),
                 "bell",
                 notifications.controller
             ),
             (
+                NativeSettingsToolbarPolicy.aboutIdentifier,
                 TiboTattleLocalization.string(.settingsAboutTab),
                 "info.circle",
                 about.controller
             ),
         ] {
-            let item = NSTabViewItem(identifier: label)
+            let item = NSTabViewItem(identifier: identifier)
             item.label = label
             item.image = NSImage(
                 systemSymbolName: symbol,
@@ -6276,6 +6420,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         }
         tabs.selectedTabViewItemIndex = index
         let newWindow = NSWindow(contentViewController: tabs)
+        let toolbarDelegate = NativeSettingsToolbarDelegate(
+            tabController: tabs
+        )
+        if let toolbar = newWindow.toolbar {
+            toolbar.allowsUserCustomization = false
+            toolbar.autosavesConfiguration = false
+            toolbar.delegate = toolbarDelegate
+        }
         newWindow.title = TiboTattleLocalization.string(.settingsWindowTitle)
         newWindow.styleMask = [.titled, .closable, .miniaturizable]
         // The window is as tall as the page it is showing. A hard-coded height
@@ -6301,6 +6453,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         newWindow.center()
         settingsWindow = newWindow
         settingsTabs = tabs
+        settingsToolbarDelegate = toolbarDelegate
         updateQuotaNotificationSettingsControls()
         newWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -8930,6 +9083,146 @@ private enum NativeDashboardSidebarRecoverySmokeTest {
     }
 }
 
+/// Exercises the product-policy layer on top of WebKit and AppKit. The real
+/// framework objects matter here: source assertions alone cannot show that the
+/// context-menu filter operates on NSMenu identifiers or that link previews
+/// are disabled on the web view the dashboard actually constructs.
+@MainActor
+private enum NativeDashboardInteractionSafetySmokeTest {
+    private static let backIdentifier = NSUserInterfaceItemIdentifier(
+        "WKMenuItemIdentifierGoBack"
+    )
+    private static let forwardIdentifier = NSUserInterfaceItemIdentifier(
+        "WKMenuItemIdentifierGoForward"
+    )
+    private static let reloadIdentifier = NSUserInterfaceItemIdentifier(
+        "WKMenuItemIdentifierReload"
+    )
+    private static let downloadIdentifier = NSUserInterfaceItemIdentifier(
+        "WKMenuItemIdentifierDownloadLinkedFile"
+    )
+    private static let openLinkIdentifier = NSUserInterfaceItemIdentifier(
+        "WKMenuItemIdentifierOpenLink"
+    )
+
+    static func run() -> Int32 {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        let host = DashboardWebHost(
+            onLoaded: {},
+            onFailure: { _ in },
+            onDownloadFailure: {},
+            openExternally: { _ in },
+            onNavigation: { _ in },
+            onLanguagePreferenceChange: { _ in }
+        )
+        let menu = NSMenu(title: "dashboard-context-menu")
+        addItem(backIdentifier, to: menu)
+        addItem(forwardIdentifier, to: menu)
+        addItem(reloadIdentifier, to: menu)
+        addItem(downloadIdentifier, to: menu)
+        addItem(openLinkIdentifier, to: menu)
+
+        NativeDashboardWebView.stripUnsupportedContextMenuItems(from: menu)
+        let remaining = Set(menu.items.compactMap(\.identifier))
+        let mandatoryToolbarItems =
+            AppDelegate.mandatoryDashboardToolbarItemIdentifiers
+        let expectedToolbarItems: Set<NSToolbarItem.Identifier> = [
+            .toggleSidebar,
+            AppDelegate.toolbarStatusRefreshIdentifier,
+            AppDelegate.toolbarShareIdentifier,
+            AppDelegate.toolbarSettingsIdentifier,
+        ]
+
+        let backRemoved = !remaining.contains(backIdentifier)
+        let forwardRemoved = !remaining.contains(forwardIdentifier)
+        let reloadPreserved = remaining.contains(reloadIdentifier)
+        let downloadRemoved = !remaining.contains(downloadIdentifier)
+        let openLinkPreserved = remaining.contains(openLinkIdentifier)
+        let usesSubclass = host.webView is NativeDashboardWebView
+        let linkPreviewDisabled = !host.webView.allowsLinkPreview
+        let toolbarItemsImmovable = mandatoryToolbarItems
+            == expectedToolbarItems
+        let settingsTabs = NSTabViewController()
+        settingsTabs.tabStyle = .toolbar
+        for identifier in NativeSettingsToolbarPolicy
+            .mandatoryTabIdentifiers {
+            let item = NSTabViewItem(identifier: identifier)
+            item.label = identifier.rawValue
+            item.viewController = NSViewController()
+            settingsTabs.addTabViewItem(item)
+        }
+        let settingsWindow = NSWindow(
+            contentViewController: settingsTabs
+        )
+        guard let settingsToolbar = settingsWindow.toolbar else { return 1 }
+        let settingsDelegate = NativeSettingsToolbarDelegate(
+            tabController: settingsTabs
+        )
+        settingsToolbar.delegate = settingsDelegate
+        let expectedSettingsItems =
+            NativeSettingsToolbarPolicy.mandatoryTabIdentifiers
+        let settingsDelegateInstalled = settingsToolbar.delegate
+            === settingsDelegate
+        let settingsTabsImmovable = expectedSettingsItems.count == 3
+            && settingsDelegate.toolbarImmovableItemIdentifiers(settingsToolbar)
+                .isSuperset(of: expectedSettingsItems)
+            && Set(settingsDelegate.toolbarDefaultItemIdentifiers(
+                settingsToolbar
+            )) == expectedSettingsItems
+
+        guard backRemoved,
+              forwardRemoved,
+              reloadPreserved,
+              downloadRemoved,
+              openLinkPreserved,
+              usesSubclass,
+              linkPreviewDisabled,
+              toolbarItemsImmovable,
+              settingsTabsImmovable,
+              settingsDelegateInstalled
+        else {
+            FileHandle.standardError.write(Data(
+                ("macOS native interaction safety smoke failed "
+                    + "back_removed=\(backRemoved) "
+                    + "forward_removed=\(forwardRemoved) "
+                    + "reload_preserved=\(reloadPreserved) "
+                    + "download_removed=\(downloadRemoved) "
+                    + "open_link_preserved=\(openLinkPreserved) "
+                    + "subclass=\(usesSubclass) "
+                    + "link_preview_disabled=\(linkPreviewDisabled) "
+                    + "toolbar_immovable=\(toolbarItemsImmovable) "
+                    + "settings_tabs_immovable="
+                    + "\(settingsTabsImmovable) "
+                    + "settings_delegate="
+                    + "\(settingsDelegateInstalled)\n").utf8
+            ))
+            return 1
+        }
+        print(
+            "USAGE_MONITOR_MACOS_NATIVE_INTERACTION_SAFETY "
+                + "back=false forward=false reload=true "
+                + "download_link=false open_link=true "
+                + "link_preview=false toolbar_immovable=true "
+                + "settings_tabs_immovable=true settings_delegate=true"
+        )
+        return 0
+    }
+
+    private static func addItem(
+        _ identifier: NSUserInterfaceItemIdentifier,
+        to menu: NSMenu
+    ) {
+        let item = NSMenuItem(
+            title: identifier.rawValue,
+            action: nil,
+            keyEquivalent: ""
+        )
+        item.identifier = identifier
+        menu.addItem(item)
+    }
+}
+
 /// Opens the shipped dashboard window and measures the chrome in it. This is
 /// the guard for the reported "the menu is not seamless, not rounded, and not
 /// even the right size" defect, and the three things it pins are the three
@@ -9348,6 +9641,11 @@ private struct UsageMonitorMain {
         if arguments.contains("--native-dashboard-sidebar-recovery-smoke-test") {
             exit(MainActor.assumeIsolated {
                 NativeDashboardSidebarRecoverySmokeTest.run()
+            })
+        }
+        if arguments.contains("--native-dashboard-interaction-safety-smoke-test") {
+            exit(MainActor.assumeIsolated {
+                NativeDashboardInteractionSafetySmokeTest.run()
             })
         }
         let application = NSApplication.shared
