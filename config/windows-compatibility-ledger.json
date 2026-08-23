@@ -3,6 +3,18 @@
   "scope": "portable-test-manifest",
   "entries": [
     {
+      "file": "apps/electron/test/desktop-first-run.test.mjs",
+      "win32BranchCount": 1,
+      "classification": "native-windows-qualification",
+      "followUp": "Run first-run receipt persistence through the branded Windows protected-state store in the packaged Windows x64 smoke; the POSIX owner-mode backend remains covered only on macOS and Linux."
+    },
+    {
+      "file": "apps/electron/test/desktop-settings-backends.test.mjs",
+      "win32BranchCount": 1,
+      "classification": "native-windows-qualification",
+      "followUp": "Run settings persistence through the branded Windows protected-state store in the packaged Windows x64 smoke; the POSIX owner-mode, symlink, and hard-link backend remains covered only on macOS and Linux."
+    },
+    {
       "file": "apps/electron/test/shell-core.test.mjs",
       "win32BranchCount": 2,
       "classification": "native-windows-qualification",

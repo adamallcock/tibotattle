@@ -68,7 +68,16 @@ async function startRoute(refreshRunner) {
   await writeFile(join(staticRoot, "index.html"), "<!doctype html>", { mode: 0o600 });
   const app = await startLocalCompanionServer({
     port: 0,
-    environment: { HOME: homeDirectory },
+    // This fixture qualifies the HTTP projection, not the native Windows
+    // state boundary. Keep every derived path disposable and select the
+    // server's explicit no-adapter development path on native Windows; the
+    // packaged qualification lane covers the branded adapter separately.
+    environment: {
+      HOME: homeDirectory,
+      USERPROFILE: homeDirectory,
+      CODEX_HOME: codexHome,
+      USAGE_MONITOR_WINDOWS_FILESYSTEM_DEVELOPMENT: "1",
+    },
     resourceRoot,
     stateRoot,
     codexHome,

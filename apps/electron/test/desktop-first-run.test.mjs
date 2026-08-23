@@ -55,6 +55,10 @@ function fakeBackend({ value = null, loadError = null, saveError = null } = {}) 
   };
 }
 
+const POSIX_TEST_SKIP = process.platform === "win32"
+  ? "POSIX owner-mode backend coverage is not a Windows ACL test"
+  : false;
+
 test("first run shows native disclosure and persists only after Continue", async () => {
   const dialog = fakeDialog([{ response: 0, checkboxChecked: true }]);
   const backend = fakeBackend();
@@ -244,7 +248,9 @@ test("persistence failure fails closed and never allows a companion launch", asy
   assert.deepEqual(quitCalls, ["quit"]);
 });
 
-test("POSIX receipt backend uses the owner-only atomic sibling store", async () => {
+test("POSIX receipt backend uses the owner-only atomic sibling store", {
+  skip: POSIX_TEST_SKIP,
+}, async () => {
   const parent = await mkdtemp(join(tmpdir(), "tibotattle-first-run-"));
   try {
     const root = join(parent, "state");

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { join, resolve } from "node:path";
 import test from "node:test";
 
 import {
@@ -26,7 +27,7 @@ test("Codex home validation canonicalizes a readable owner directory and rejects
     realpathPath: async () => "/private/Users/adam/.codex",
     accessPath: async (path) => paths.push(path),
   });
-  assert.equal(valid, "/private/Users/adam/.codex");
+  assert.equal(valid, resolve("/private/Users/adam/.codex"));
   assert.deepEqual(paths, [
     "/Users/adam/.codex",
     "/private/Users/adam/.codex",
@@ -87,7 +88,7 @@ test("platform services use only native-picker paths and fixed open targets", as
       return "/private/Users/adam/custom-codex";
     },
   });
-  assert.equal(services.defaultCodexHome, "/Users/adam/.codex");
+  assert.equal(services.defaultCodexHome, resolve(join("/Users/adam", ".codex")));
   assert.equal(await services.chooseCodexHome(), "/private/Users/adam/custom-codex");
   assert.equal(dialogOptions.at(-1).title, "Choose Codex folder");
   assert.deepEqual(validated, ["/Users/adam/custom-codex"]);

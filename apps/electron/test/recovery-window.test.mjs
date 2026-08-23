@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { dirname, resolve } from "node:path";
 import test from "node:test";
 
 import {
@@ -11,6 +12,12 @@ import {
   recoveryStatusCopy,
 } from "../recovery-window.js";
 import { createDesktopLifecycle } from "../desktop-lifecycle.js";
+
+const DASHBOARD_PRELOAD_PATH = resolve("private", "preload.cjs");
+const RECOVERY_PRELOAD_PATH = resolve(
+  dirname(DASHBOARD_PRELOAD_PATH),
+  "recovery-preload.cjs",
+);
 
 class FakeApp extends EventEmitter {
   constructor() {
@@ -134,7 +141,7 @@ function makeLifecycle({
     Tray: FakeTray,
     Menu: { buildFromTemplate: (template) => ({ template }) },
     icon: "test-icon",
-    preloadPath: "/private/preload.cjs",
+    preloadPath: DASHBOARD_PRELOAD_PATH,
     supervisor,
     desktopLocale,
     desktopSystemLocales,
@@ -145,13 +152,13 @@ function makeLifecycle({
 
 function recoveryWindows(windows) {
   return windows.filter((candidate) => (
-    candidate.options.webPreferences.preload === "/private/recovery-preload.cjs"
+    candidate.options.webPreferences.preload === RECOVERY_PRELOAD_PATH
   ));
 }
 
 function dashboardWindows(windows) {
   return windows.filter((candidate) => (
-    candidate.options.webPreferences.preload === "/private/preload.cjs"
+    candidate.options.webPreferences.preload === DASHBOARD_PRELOAD_PATH
   ));
 }
 

@@ -32,6 +32,9 @@ import {
 
 const SETTINGS_FILE = DESKTOP_SETTINGS_FILE_NAME;
 const ROOT = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state";
+const POSIX_TEST_SKIP = process.platform === "win32"
+  ? "POSIX owner-mode backend coverage is not a Windows ACL test"
+  : false;
 const ROOT_IDENTITY = Object.freeze({
   volumeSerialNumber: "0000000000000001",
   fileId: "00112233445566778899aabbccddeeff",
@@ -258,7 +261,9 @@ function createWindowsStoreFixture() {
   return { calls, entries, store };
 }
 
-test("POSIX backend returns missing for a fresh root and persists valid snapshots", async () => {
+test("POSIX backend returns missing for a fresh root and persists valid snapshots", {
+  skip: POSIX_TEST_SKIP,
+}, async () => {
   await temporaryRoot(async (parent) => {
     const root = join(parent, "state");
     const backend = createPosixDesktopSettingsBackend({ rootPath: root });
@@ -272,7 +277,9 @@ test("POSIX backend returns missing for a fresh root and persists valid snapshot
   });
 });
 
-test("POSIX backend rejects unsafe roots, files, symlinks, and hard links", async () => {
+test("POSIX backend rejects unsafe roots, files, symlinks, and hard links", {
+  skip: POSIX_TEST_SKIP,
+}, async () => {
   await temporaryRoot(async (parent) => {
     const root = join(parent, "state");
     const backend = createPosixDesktopSettingsBackend({ rootPath: root });
@@ -309,7 +316,9 @@ test("POSIX backend rejects unsafe roots, files, symlinks, and hard links", asyn
   });
 });
 
-test("POSIX backend rejects corrupt and oversized content without repairing it", async () => {
+test("POSIX backend rejects corrupt and oversized content without repairing it", {
+  skip: POSIX_TEST_SKIP,
+}, async () => {
   await temporaryRoot(async (parent) => {
     const root = join(parent, "state");
     await fs.mkdir(root, { mode: 0o700 });
@@ -331,7 +340,9 @@ test("POSIX backend rejects corrupt and oversized content without repairing it",
   });
 });
 
-test("POSIX replacement failure retains the last committed bytes", async () => {
+test("POSIX replacement failure retains the last committed bytes", {
+  skip: POSIX_TEST_SKIP,
+}, async () => {
   await temporaryRoot(async (parent) => {
     const root = join(parent, "state");
     let failRename = false;
@@ -360,7 +371,9 @@ test("POSIX replacement failure retains the last committed bytes", async () => {
   });
 });
 
-test("POSIX post-rename failure reconciles to the published bytes", async () => {
+test("POSIX post-rename failure reconciles to the published bytes", {
+  skip: POSIX_TEST_SKIP,
+}, async () => {
   await temporaryRoot(async (parent) => {
     const root = join(parent, "state");
     let failSync = false;
@@ -383,7 +396,9 @@ test("POSIX post-rename failure reconciles to the published bytes", async () => 
   });
 });
 
-test("POSIX staging is no-clobber when a deterministic stage name already exists", async () => {
+test("POSIX staging is no-clobber when a deterministic stage name already exists", {
+  skip: POSIX_TEST_SKIP,
+}, async () => {
   await temporaryRoot(async (parent) => {
     const root = join(parent, "state");
     const backend = createPosixDesktopSettingsBackend({
@@ -445,6 +460,26 @@ test("Windows backend rejects unbranded stores before any filesystem fallback", 
       },
     }),
     (error) => error.code === "desktop_settings_backend_store_invalid",
+  );
+  assert.deepEqual(calls, []);
+});
+
+test("POSIX backend rejects win32 before touching a filesystem fallback", () => {
+  const calls = [];
+  assert.throws(
+    () => createPosixDesktopSettingsBackend({
+      platform: "win32",
+      rootPath: "/tmp/tibotattle-desktop-settings",
+      fs: {
+        chmod: () => calls.push("chmod"),
+        lstat: () => calls.push("lstat"),
+        mkdir: () => calls.push("mkdir"),
+        open: () => calls.push("open"),
+        rename: () => calls.push("rename"),
+        unlink: () => calls.push("unlink"),
+      },
+    }),
+    (error) => error.code === "desktop_settings_backend_unsupported_platform",
   );
   assert.deepEqual(calls, []);
 });
