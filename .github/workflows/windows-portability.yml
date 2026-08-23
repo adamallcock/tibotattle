@@ -526,24 +526,27 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $runtimeRawPath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.raw'
+          $runtimeStdoutPath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.stdout.raw'
+          $runtimeStderrPath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.stderr.raw'
           $runtimeEvidencePath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.json'
-          function Remove-VerifiedRuntimeRawOutput {
-            try {
-              if (Test-Path -LiteralPath $runtimeRawPath -PathType Leaf -ErrorAction Stop) {
-                Remove-Item -LiteralPath $runtimeRawPath -Force -ErrorAction Stop
+          function Remove-VerifiedRuntimeTransientOutput {
+            foreach ($path in @($runtimeStdoutPath, $runtimeStderrPath)) {
+              try {
+                if (Test-Path -LiteralPath $path -PathType Leaf -ErrorAction Stop) {
+                  Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+                }
+                if (Test-Path -LiteralPath $path -ErrorAction Stop) {
+                  throw 'runtime transient output remains'
+                }
+              } catch {
+                Write-Error 'WINDOWS_ELECTRON_RUNTIME_TRANSIENT_OUTPUT_DELETE_FAILED'
+                exit 1
               }
-              if (Test-Path -LiteralPath $runtimeRawPath -ErrorAction Stop) {
-                throw 'runtime raw output remains'
-              }
-            } catch {
-              Write-Error 'WINDOWS_ELECTRON_RUNTIME_RAW_OUTPUT_DELETE_FAILED'
-              exit 1
             }
           }
-          # Retain only a closed aggregate. The smoke command's merged output
-          # is diagnostic input, never an upload candidate; it is normalized
-          # into this content-free shape below before the path is exported.
+          # Retain only a closed aggregate. The smoke command's stdout and
+          # stderr are transient diagnostic inputs, never upload candidates;
+          # stdout is normalized into this content-free shape below.
           $runtimeFailureStages = @(
             'none',
             'unsupported',
@@ -627,11 +630,18 @@ jobs:
             [Text.UTF8Encoding]::new($false)
           )
           "TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH=$runtimeEvidencePath" >> $env:GITHUB_ENV
-          node ./scripts/smoke-electron-windows.mjs *> $runtimeRawPath
+          node ./scripts/smoke-electron-windows.mjs 1> $runtimeStdoutPath 2> $runtimeStderrPath
           $runtimeExitCode = $LASTEXITCODE
           $runtimeEvidence = $null
           try {
-            $runtimeEvidence = Get-Content -LiteralPath $runtimeRawPath -Raw | ConvertFrom-Json
+            $stderrIsEmpty = Test-Path -LiteralPath $runtimeStderrPath -PathType Leaf -ErrorAction Stop
+            if ($stderrIsEmpty) {
+              $stderrIsEmpty = (Get-Item -LiteralPath $runtimeStderrPath -ErrorAction Stop).Length -eq 0
+            }
+            if (-not $stderrIsEmpty) {
+              throw 'runtime stderr is not empty'
+            }
+            $runtimeEvidence = Get-Content -LiteralPath $runtimeStdoutPath -Raw | ConvertFrom-Json
             $expectedRuntimeKeys = @(
               'artifact',
               'dashboardReady',
@@ -685,12 +695,12 @@ jobs:
             # Keep the pre-written all-false aggregate. No raw smoke output,
             # path, command, process id, or exception text is retained.
             Write-NormalizedRuntimeSummary -Evidence $defaultRuntimeEvidence
-            Remove-VerifiedRuntimeRawOutput
+            Remove-VerifiedRuntimeTransientOutput
             Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_EVIDENCE_INVALID'
             exit 1
           }
           Write-NormalizedRuntimeSummary -Evidence $runtimeEvidence
-          Remove-VerifiedRuntimeRawOutput
+          Remove-VerifiedRuntimeTransientOutput
           if ($runtimeExitCode -ne 0) {
             Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_FAILED'
             exit 1

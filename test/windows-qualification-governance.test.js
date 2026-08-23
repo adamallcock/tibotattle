@@ -353,10 +353,12 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /Runtime qualification: deferred to the native Windows Electron smoke step/u);
   assert.match(workflow, /smoke-electron-windows\.mjs/u);
   assert.match(workflow, /id: electron_runtime_smoke/u);
-  assert.match(workflow, /tibotattle-windows-electron-runtime-smoke\.raw/u);
-  assert.match(workflow, /Remove-VerifiedRuntimeRawOutput/u);
-  assert.match(workflow, /WINDOWS_ELECTRON_RUNTIME_RAW_OUTPUT_DELETE_FAILED/u);
-  assert.match(workflow, /Test-Path -LiteralPath \$runtimeRawPath -ErrorAction Stop/u);
+  assert.match(workflow, /tibotattle-windows-electron-runtime-smoke\.stdout\.raw/u);
+  assert.match(workflow, /tibotattle-windows-electron-runtime-smoke\.stderr\.raw/u);
+  assert.match(workflow, /Remove-VerifiedRuntimeTransientOutput/u);
+  assert.match(workflow, /WINDOWS_ELECTRON_RUNTIME_TRANSIENT_OUTPUT_DELETE_FAILED/u);
+  assert.match(workflow, /foreach \(\$path in @\(\$runtimeStdoutPath, \$runtimeStderrPath\)\)/u);
+  assert.match(workflow, /Test-Path -LiteralPath \$path -ErrorAction Stop/u);
   const electronVerifierBodyForDeletion = workflow.slice(verificationStep, runtimeStep);
   assert.match(electronVerifierBodyForDeletion, /function Fail-ClosedVerifierArtifact/u);
   assert.match(
@@ -396,11 +398,42 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.doesNotMatch(normalizedRuntimeSummary, /Target|Dashboard|path|command|process|stdout|stderr/iu);
   assert.match(
     runtimeStepBody,
-    /Write-NormalizedRuntimeSummary -Evidence \$defaultRuntimeEvidence\s+Remove-VerifiedRuntimeRawOutput/u,
+    /Write-NormalizedRuntimeSummary -Evidence \$defaultRuntimeEvidence\s+Remove-VerifiedRuntimeTransientOutput/u,
   );
   assert.match(
     runtimeStepBody,
-    /Write-NormalizedRuntimeSummary -Evidence \$runtimeEvidence\s+Remove-VerifiedRuntimeRawOutput/u,
+    /Write-NormalizedRuntimeSummary -Evidence \$runtimeEvidence\s+Remove-VerifiedRuntimeTransientOutput/u,
+  );
+  assert.match(
+    runtimeStepBody,
+    /node \.\/scripts\/smoke-electron-windows\.mjs 1> \$runtimeStdoutPath 2> \$runtimeStderrPath/u,
+    "runtime stdout and stderr must be captured separately",
+  );
+  assert.doesNotMatch(
+    runtimeStepBody,
+    /\*> \$runtime(?:Stdout|Stderr|Raw)Path/u,
+    "runtime output must not be merged before parsing",
+  );
+  const stderrGate = runtimeStepBody.indexOf("$stderrIsEmpty = Test-Path");
+  const stdoutParse = runtimeStepBody.indexOf(
+    "Get-Content -LiteralPath $runtimeStdoutPath -Raw | ConvertFrom-Json",
+  );
+  assert.ok(stderrGate >= 0 && stdoutParse > stderrGate, "stderr must gate parsing");
+  assert.doesNotMatch(
+    runtimeStepBody,
+    /Get-Content -LiteralPath \$runtimeStderrPath/u,
+    "stderr must never be parsed or retained",
+  );
+  const normalizedRuntimeEvidence = runtimeStepBody.indexOf(
+    "$runtimeEvidence = $safeRuntimeEvidence | ConvertTo-Json -Compress | ConvertFrom-Json",
+  );
+  const cleanupAfterValidEvidence = runtimeStepBody.indexOf(
+    "Remove-VerifiedRuntimeTransientOutput",
+    normalizedRuntimeEvidence,
+  );
+  assert.ok(
+    normalizedRuntimeEvidence >= 0 && cleanupAfterValidEvidence > normalizedRuntimeEvidence,
+    "valid failed aggregates must be normalized before transient cleanup",
   );
   assert.ok(
     runtimeStepBody.indexOf("Write-NormalizedRuntimeSummary -Evidence $runtimeEvidence")
