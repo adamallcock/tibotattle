@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import test from "node:test";
 
 import {
@@ -85,6 +86,8 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /failureStage/u);
   assert.match(source, /failureReason/u);
   assert.match(source, /classifySmokeFailure/u);
+  assert.match(source, /TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_OUTPUT_PATH/u);
+  assert.match(source, /await writeFile\(outputPath, `\$\{JSON\.stringify\(output\)\}/u);
   for (const reason of [
     "refresh_not_accepted",
     "refresh_terminal_failed",
@@ -1005,4 +1008,29 @@ test("non-Windows Electron smoke reports unsupported rather than success", () =>
     credentialPersistence: false,
     relaunchPersistence: false,
   });
+});
+
+test("Windows Electron smoke can seal its aggregate through an explicit sidecar", async () => {
+  if (process.platform === "win32") return;
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-electron-windows-sidecar-"));
+  const outputPath = join(root, "aggregate.json");
+  try {
+    const result = spawnSync(
+      process.execPath,
+      ["scripts/smoke-electron-windows.mjs"],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_OUTPUT_PATH: outputPath,
+        },
+      },
+    );
+    assert.equal(result.status, 0);
+    const consoleAggregate = JSON.parse(result.stdout.trim());
+    const sidecarAggregate = JSON.parse(await readFile(outputPath, "utf8"));
+    assert.deepEqual(sidecarAggregate, consoleAggregate);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

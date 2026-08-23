@@ -357,7 +357,7 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /tibotattle-windows-electron-runtime-smoke\.stderr\.raw/u);
   assert.match(workflow, /Remove-VerifiedRuntimeTransientOutput/u);
   assert.match(workflow, /WINDOWS_ELECTRON_RUNTIME_TRANSIENT_OUTPUT_DELETE_FAILED/u);
-  assert.match(workflow, /foreach \(\$path in @\(\$runtimeStdoutPath, \$runtimeStderrPath\)\)/u);
+  assert.match(workflow, /foreach \(\$path in @\(\$runtimeStdoutPath, \$runtimeStderrPath, \$runtimeAggregatePath\)\)/u);
   assert.match(workflow, /Test-Path -LiteralPath \$path -ErrorAction Stop/u);
   const electronVerifierBodyForDeletion = workflow.slice(verificationStep, runtimeStep);
   assert.match(electronVerifierBodyForDeletion, /function Fail-ClosedVerifierArtifact/u);
@@ -384,8 +384,8 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /failureStage = 'control'/u);
   assert.match(workflow, /failureReason = 'output_read_failed'/u);
   for (const reason of [
-    "stdout_missing",
-    "stdout_invalid",
+    "aggregate_missing",
+    "aggregate_invalid",
     "stderr_present",
     "output_read_failed",
   ]) {
@@ -416,20 +416,36 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(
     runtimeStepBody,
     /node \.\/scripts\/smoke-electron-windows\.mjs 1> \$runtimeStdoutPath 2> \$runtimeStderrPath/u,
-    "runtime stdout and stderr must be captured separately",
+    "runtime console stdout and stderr must be captured separately",
+  );
+  assert.match(
+    runtimeStepBody,
+    /TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_OUTPUT_PATH = \$runtimeAggregatePath/u,
+    "runtime aggregate must use an explicit file protocol",
+  );
+  const runtimeInvocation = runtimeStepBody.indexOf(
+    "node ./scripts/smoke-electron-windows.mjs 1> $runtimeStdoutPath 2> $runtimeStderrPath",
+  );
+  const preflightCleanup = runtimeStepBody.lastIndexOf(
+    "Remove-VerifiedRuntimeTransientOutput",
+    runtimeInvocation,
+  );
+  assert.ok(
+    preflightCleanup >= 0 && preflightCleanup < runtimeInvocation,
+    "runtime transient outputs must be cleared before each smoke invocation",
   );
   assert.doesNotMatch(
     runtimeStepBody,
     /\*> \$runtime(?:Stdout|Stderr|Raw)Path/u,
     "runtime output must not be merged before parsing",
   );
-  const stdoutParse = runtimeStepBody.indexOf(
-    "$runtimeEvidence = $runtimeStdout | ConvertFrom-Json",
+  const aggregateParse = runtimeStepBody.indexOf(
+    "$runtimeEvidence = $runtimeAggregate | ConvertFrom-Json",
   );
   const stderrGate = runtimeStepBody.indexOf("$stderrPresent = $false");
-  assert.ok(stdoutParse >= 0 && stderrGate > stdoutParse, "stdout must be parsed before stderr classification");
-  const stdoutEmptyGate = runtimeStepBody.indexOf("[string]::IsNullOrEmpty($runtimeStdout)");
-  assert.ok(stdoutEmptyGate >= 0 && stdoutEmptyGate < stdoutParse, "empty stdout must be classified before JSON parsing");
+  assert.ok(aggregateParse >= 0 && stderrGate > aggregateParse, "aggregate must be parsed before stderr classification");
+  const aggregateEmptyGate = runtimeStepBody.indexOf("[string]::IsNullOrEmpty($runtimeAggregate)");
+  assert.ok(aggregateEmptyGate >= 0 && aggregateEmptyGate < aggregateParse, "empty aggregate must be classified before JSON parsing");
   assert.match(
     runtimeStepBody,
     /if \(\$stderrPresent -and \$runtimeEvidence\.status -eq 'passed'\)[\s\S]+?throw 'runtime stderr is present for passed output'/u,
@@ -1853,8 +1869,8 @@ test("Windows Electron qualification receipt rejects incomplete or mismatched ev
     (error) => error.code === WINDOWS_RECEIPT_STATUS.runtimeInvalid,
   );
   for (const failureReason of [
-    "stdout_missing",
-    "stdout_invalid",
+    "aggregate_missing",
+    "aggregate_invalid",
     "stderr_present",
     "output_read_failed",
   ]) {

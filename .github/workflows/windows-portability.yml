@@ -528,9 +528,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $runtimeStdoutPath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.stdout.raw'
           $runtimeStderrPath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.stderr.raw'
+          $runtimeAggregatePath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.aggregate.json'
           $runtimeEvidencePath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.json'
           function Remove-VerifiedRuntimeTransientOutput {
-            foreach ($path in @($runtimeStdoutPath, $runtimeStderrPath)) {
+            foreach ($path in @($runtimeStdoutPath, $runtimeStderrPath, $runtimeAggregatePath)) {
               try {
                 if (Test-Path -LiteralPath $path -PathType Leaf -ErrorAction Stop) {
                   Remove-Item -LiteralPath $path -Force -ErrorAction Stop
@@ -544,9 +545,13 @@ jobs:
               }
             }
           }
-          # Retain only a closed aggregate. The smoke command's stdout and
-          # stderr are transient diagnostic inputs, never upload candidates;
-          # stdout is normalized into this content-free shape below.
+          # A missing sidecar must describe this invocation, never stale data
+          # left by an earlier attempt on a reused runner workspace.
+          Remove-VerifiedRuntimeTransientOutput
+          # Retain only a closed aggregate. Console stdout, stderr, and the
+          # explicit aggregate sidecar are transient diagnostic inputs, never
+          # upload candidates; the sidecar is normalized into this
+          # content-free shape below.
           $runtimeFailureStages = @(
             'none',
             'unsupported',
@@ -601,8 +606,8 @@ jobs:
             'unknown'
           )
           $runtimeFallbackReasons = @(
-            'stdout_missing',
-            'stdout_invalid',
+            'aggregate_missing',
+            'aggregate_invalid',
             'stderr_present',
             'output_read_failed'
           )
@@ -640,36 +645,37 @@ jobs:
             [Text.UTF8Encoding]::new($false)
           )
           "TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH=$runtimeEvidencePath" >> $env:GITHUB_ENV
+          $env:TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_OUTPUT_PATH = $runtimeAggregatePath
           node ./scripts/smoke-electron-windows.mjs 1> $runtimeStdoutPath 2> $runtimeStderrPath
           $runtimeExitCode = $LASTEXITCODE
           $runtimeEvidence = $null
           try {
-            $stdoutExists = Test-Path -LiteralPath $runtimeStdoutPath -PathType Leaf -ErrorAction Stop
-            if (-not $stdoutExists) {
-              $runtimeEvidenceFailureReason = 'stdout_missing'
-              throw 'runtime stdout is missing'
+            $aggregateExists = Test-Path -LiteralPath $runtimeAggregatePath -PathType Leaf -ErrorAction Stop
+            if (-not $aggregateExists) {
+              $runtimeEvidenceFailureReason = 'aggregate_missing'
+              throw 'runtime aggregate is missing'
             }
-            $runtimeStdout = $null
+            $runtimeAggregate = $null
             try {
-              $runtimeStdout = Get-Content -LiteralPath $runtimeStdoutPath -Raw -ErrorAction Stop
+              $runtimeAggregate = Get-Content -LiteralPath $runtimeAggregatePath -Raw -ErrorAction Stop
             } catch {
               $runtimeEvidenceFailureReason = 'output_read_failed'
               throw
             }
-            if ([string]::IsNullOrEmpty($runtimeStdout)) {
-              $runtimeEvidenceFailureReason = 'stdout_missing'
-              throw 'runtime stdout is empty'
+            if ([string]::IsNullOrEmpty($runtimeAggregate)) {
+              $runtimeEvidenceFailureReason = 'aggregate_invalid'
+              throw 'runtime aggregate is empty'
             }
             try {
-              $runtimeEvidence = $runtimeStdout | ConvertFrom-Json
+              $runtimeEvidence = $runtimeAggregate | ConvertFrom-Json
             } catch {
-              $runtimeEvidenceFailureReason = 'stdout_invalid'
+              $runtimeEvidenceFailureReason = 'aggregate_invalid'
               throw
             }
-            # Any later shape/status/field failure is still a rejected stdout
+            # Any later shape/status/field failure is still a rejected
             # aggregate, not a product diagnostic. Keep the classification
             # fixed and content-free if validation below throws.
-            $runtimeEvidenceFailureReason = 'stdout_invalid'
+            $runtimeEvidenceFailureReason = 'aggregate_invalid'
             $expectedRuntimeKeys = @(
               'artifact',
               'dashboardReady',

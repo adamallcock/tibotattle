@@ -57,6 +57,8 @@ const MAX_OPERATION_MS = 10_000;
 const MAX_REFRESH_MS = 45_000;
 const MAX_SHUTDOWN_MS = 15_000;
 const WINDOWS_ELECTRON_SMOKE_MESSAGE_TYPE = "windows-electron-smoke-v1";
+const WINDOWS_ELECTRON_SMOKE_OUTPUT_PATH_ENV =
+  "TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_OUTPUT_PATH";
 const WINDOWS_ELECTRON_SMOKE_COMMAND_MESSAGE = "command-v1";
 const WINDOWS_ELECTRON_SMOKE_STATE_MESSAGE = "state-v1";
 const WINDOWS_ELECTRON_SMOKE_CREDENTIAL_MESSAGE = "credential-v1";
@@ -2183,6 +2185,20 @@ if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
     // filesystem contents. The aggregate is the only supported smoke output.
     output = aggregate("failed", progress);
     process.exitCode = 1;
+  }
+  const outputPath = process.env[WINDOWS_ELECTRON_SMOKE_OUTPUT_PATH_ENV];
+  if (typeof outputPath === "string" && outputPath.length > 0) {
+    try {
+      // The workflow consumes this explicit, awaited file as the canonical
+      // aggregate.  Console stdout remains a transient diagnostic stream;
+      // relying on its PowerShell redirection can lose the final write when a
+      // native Windows child exits during cleanup.
+      await writeFile(outputPath, `${JSON.stringify(output)}\n`, "utf8");
+    } catch {
+      // Keep the aggregate closed on stdout while forcing the workflow to
+      // reject the missing sidecar rather than infer a runtime result.
+      process.exitCode = 1;
+    }
   }
   printAggregate(output);
 }
