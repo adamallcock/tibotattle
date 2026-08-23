@@ -12,6 +12,7 @@
 "nativeDashboard.community" = "社区";
 "nativeDashboard.dataPrivacy" = "数据与隐私";
 "nativeDashboard.fresh" = "最新";
+"nativeDashboard.hideSidebar" = "隐藏边栏";
 "nativeDashboard.howItWorks" = "用量与成本";
 "nativeDashboard.needsRefresh" = "已过期";
 "nativeDashboard.localOnly" = "仅限本机";
@@ -29,6 +30,7 @@
 "nativeDashboard.refreshUsage" = "刷新";
 "nativeDashboard.refreshUsageTooltip" = "立即更新本地使用情况。只会读取这台 Mac 上选定的 Codex 文件夹。";
 "nativeDashboard.share" = "分享";
+"nativeDashboard.showSidebar" = "显示边栏";
 "nativeDashboard.shareTooltip" = "打开本地分享卡片。";
 "nativeDashboard.starting" = "正在启动…";
 "nativeDashboard.status" = "状态";

@@ -12,6 +12,7 @@
 "nativeDashboard.community" = "Comunidad";
 "nativeDashboard.dataPrivacy" = "Datos y privacidad";
 "nativeDashboard.fresh" = "Actualizado";
+"nativeDashboard.hideSidebar" = "Ocultar barra lateral";
 "nativeDashboard.howItWorks" = "Uso y costes";
 "nativeDashboard.needsRefresh" = "Desactualizado";
 "nativeDashboard.localOnly" = "Solo local";
@@ -29,6 +30,7 @@
 "nativeDashboard.refreshUsage" = "Actualizar";
 "nativeDashboard.refreshUsageTooltip" = "Actualiza ahora el uso local. Solo lee las carpetas de Codex seleccionadas en este Mac.";
 "nativeDashboard.share" = "Compartir";
+"nativeDashboard.showSidebar" = "Mostrar barra lateral";
 "nativeDashboard.shareTooltip" = "Abrir la tarjeta local para compartir.";
 "nativeDashboard.starting" = "Iniciando…";
 "nativeDashboard.status" = "Estado";

@@ -342,15 +342,22 @@ struct MenuBarStatusSnapshot: Equatable {
         phase == .ready || phase == .analyzing
     }
 
-    /// The compact menu-bar title. A number appears only for live evidence.
-    /// `…` means "an explicit pass is running", `–` means "no number can be
-    /// shown honestly right now" and the menu says which case applies.
+    /// The compact menu-bar title. A fresh verified number remains useful while
+    /// an explicit pass checks for newer evidence, so analysis state does not
+    /// replace it. `…` means "a pass is running without a live number"; `–`
+    /// means "no number can be shown honestly right now" and the menu explains
+    /// which case applies.
     var title: String {
-        if phase == .analyzing { return analyzingPlaceholder }
-        guard phase == .ready, evidence == .live, let lane = primaryLane else {
-            return unknownPlaceholder
+        if companionReachable,
+           evidence == .live,
+           let lane = primaryLane {
+            return TiboTattleLocalization.percentString(
+                lane.roundedRemainingPercent
+            )
         }
-        return TiboTattleLocalization.percentString(lane.roundedRemainingPercent)
+        return phase == .analyzing
+            ? analyzingPlaceholder
+            : unknownPlaceholder
     }
 
     /// Spoken by VoiceOver in place of the glyph and the terse title. The
