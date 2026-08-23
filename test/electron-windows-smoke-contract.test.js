@@ -6,13 +6,48 @@ import test from "node:test";
 
 import {
   aggregate,
+  classifyAutomaticStartupRefreshReceipt,
   classifySmokeFailure,
   createSyntheticFixture,
+  observeLocalRefreshRequests,
   queryWindowsProcessTableForTest,
+  WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES,
   WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST,
   WINDOWS_ELECTRON_SMOKE_FAILURE_STAGE_ALLOWLIST,
   waitFor,
 } from "../scripts/smoke-electron-windows.mjs";
+
+class FakeCdp {
+  constructor() {
+    this.listeners = new Map();
+  }
+
+  on(eventName, listener) {
+    const listeners = this.listeners.get(eventName) ?? new Set();
+    listeners.add(listener);
+    this.listeners.set(eventName, listeners);
+    return () => listeners.delete(listener);
+  }
+
+  emit(eventName, payload) {
+    for (const listener of this.listeners.get(eventName) ?? []) listener(payload);
+  }
+}
+
+function emitRefresh(cdp, {
+  origin,
+  requestId,
+  loaderId,
+}) {
+  cdp.emit("Network.requestWillBeSent", {
+    request: {
+      method: "POST",
+      url: `${origin}/api/local/refresh`,
+    },
+    requestId,
+    loaderId,
+  });
+}
 
 function fakeProcessTableProbe() {
   const probe = new EventEmitter();
@@ -75,6 +110,22 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /localDashboardReady/u);
   assert.match(source, /\/api\/local\/refresh/u);
   assert.match(source, /X-Usage-Monitor-Local/u);
+  assert.match(source, /Page\.getFrameTree/u);
+  assert.match(source, /Network\.enable/u);
+  assert.match(source, /observeLocalRefreshRequests/u);
+  assert.match(source, /refreshObserver\.selectOrigin/u);
+  assert.match(source, /assertAutomaticStartupRefresh/u);
+  assert.match(source, /refreshObserver\.selectLoader/u);
+  assert.match(source, /refreshObserver\.seal/u);
+  assert.match(source, /STARTUP_REFRESH_DUPLICATED/u);
+  assert.match(source, /previousRefreshId/u);
+  assert.match(source, /refreshObserver\.reset\(\)/u);
+  assert.match(
+    source,
+    /selectRequiredRefreshLoader\(refreshObserver, await waitFor\(\s+\(\) => mainFrameLoaderId\(cdp\)/u,
+    "initial loader acquisition must poll through a null result",
+  );
+  assert.doesNotMatch(source, /waitFor\(\s+\(\) => readRequiredRefreshLoader\(cdp\)/u);
   assert.match(source, /reloadDashboardDocument/u);
   assert.match(source, /Page\.enable/u);
   assert.match(source, /Page\.reload/u);
@@ -114,6 +165,18 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   const refreshSucceeded = source.indexOf('value === "succeeded"');
   const refreshBoundary = source.indexOf("await reloadDashboardDocument(connection)");
   assert.ok(refreshSucceeded >= 0 && refreshBoundary > refreshSucceeded);
+  const automaticRefresh = source.indexOf("await assertAutomaticStartupRefresh({");
+  const syntheticRefresh = source.indexOf("async function runSyntheticRefresh");
+  assert.ok(
+    automaticRefresh >= 0
+      && syntheticRefresh > automaticRefresh,
+    "the real startup refresh is qualified before the explicit synthetic refresh",
+  );
+  const readyWait = source.indexOf("const ready = await waitFor");
+  assert.ok(
+    readyWait >= 0 && automaticRefresh > readyWait,
+    "the startup refresh check is ordered after the readiness wait",
+  );
   const secondMonitor = source.indexOf("const secondDescendantMonitor");
   const secondExit = source.indexOf("childExitPromise(second)");
   const primaryMonitor = source.indexOf("const primaryDescendantMonitor");
@@ -184,6 +247,133 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(qualification, /runWindowsElectronQualificationCredentialCommandForTest/u);
   assert.match(qualification, /windows-qualification/u);
   assert.doesNotMatch(qualification, /console\.(?:log|error|warn)/u);
+});
+
+test("Windows startup refresh evidence requires the validated origin and active loader", () => {
+  const cdp = new FakeCdp();
+  const observer = observeLocalRefreshRequests(cdp);
+  const dashboardOrigin = "http://127.0.0.1:43123";
+  const otherLoopbackOrigin = "http://127.0.0.1:43124";
+
+  observer.selectLoader("loader-current");
+  emitRefresh(cdp, {
+    origin: dashboardOrigin,
+    requestId: "current-valid",
+    loaderId: "loader-current",
+  });
+  emitRefresh(cdp, {
+    origin: otherLoopbackOrigin,
+    requestId: "current-wrong-origin",
+    loaderId: "loader-current",
+  });
+  // Before the renderer location is validated, no request is acceptable
+  // evidence, even though both requests use loopback.
+  assert.deepEqual(observer.snapshot(), []);
+
+  assert.equal(observer.selectOrigin(dashboardOrigin), dashboardOrigin);
+  assert.deepEqual(observer.snapshot(), [{
+    requestId: "current-valid",
+    loaderId: "loader-current",
+    origin: dashboardOrigin,
+  }]);
+  emitRefresh(cdp, {
+    origin: dashboardOrigin,
+    requestId: "different-loader",
+    loaderId: "loader-old",
+  });
+  emitRefresh(cdp, {
+    origin: otherLoopbackOrigin,
+    requestId: "later-wrong-origin",
+    loaderId: "loader-current",
+  });
+  assert.equal(observer.snapshot().length, 1);
+
+  observer.reset();
+  observer.selectLoader("loader-fresh");
+  emitRefresh(cdp, {
+    origin: dashboardOrigin,
+    requestId: "fresh-valid",
+    loaderId: "loader-fresh",
+  });
+  assert.equal(observer.snapshot().length, 1);
+  observer.seal();
+  emitRefresh(cdp, {
+    origin: dashboardOrigin,
+    requestId: "sealed-request",
+    loaderId: "loader-fresh",
+  });
+  assert.equal(observer.snapshot().length, 1);
+  observer.reset();
+  assert.equal(observer.selectLoader(null), null);
+  emitRefresh(cdp, {
+    origin: dashboardOrigin,
+    requestId: "foreign-loader-after-invalid-selection",
+    loaderId: "loader-foreign",
+  });
+  assert.deepEqual(observer.snapshot(), []);
+  observer.dispose();
+});
+
+test("Windows startup refresh receipt semantics are stateful and content-free", () => {
+  const codes = WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES;
+  assert.deepEqual(
+    classifyAutomaticStartupRefreshReceipt({
+      phase: "completion",
+      requestCount: 1,
+      refresh: { status: "succeeded", refreshId: "refresh-new" },
+      expectedRefreshId: "refresh-new",
+    }),
+    { status: "completed", refreshId: "refresh-new" },
+  );
+  assert.deepEqual(
+    classifyAutomaticStartupRefreshReceipt({
+      phase: "acceptance",
+      requestCount: 1,
+      refresh: { status: "succeeded", refreshId: "refresh-old" },
+      previousRefreshId: "refresh-old",
+    }),
+    { status: "pending" },
+  );
+  assert.deepEqual(
+    classifyAutomaticStartupRefreshReceipt({
+      phase: "acceptance",
+      requestCount: 2,
+      refresh: { status: "running", refreshId: "refresh-new" },
+    }),
+    { status: "failed", errorCode: codes.duplicate },
+  );
+  for (const [status, errorCode] of [
+    ["failed", codes.failed],
+    ["cancelled", codes.cancelled],
+  ]) {
+    assert.deepEqual(
+      classifyAutomaticStartupRefreshReceipt({
+        phase: "completion",
+        requestCount: 1,
+        refresh: { status, refreshId: "refresh-new" },
+        expectedRefreshId: "refresh-new",
+      }),
+      { status: "failed", errorCode },
+    );
+  }
+  assert.deepEqual(
+    classifyAutomaticStartupRefreshReceipt({
+      phase: "completion",
+      requestCount: 1,
+      refresh: { status: "succeeded", refreshId: "refresh-other" },
+      expectedRefreshId: "refresh-new",
+    }),
+    { status: "failed", errorCode: codes.changedReceipt },
+  );
+  assert.deepEqual(
+    classifyAutomaticStartupRefreshReceipt({
+      phase: "acceptance",
+      requestCount: 1,
+      refresh: { status: "running" },
+      previousRefreshId: "refresh-old",
+    }),
+    { status: "failed", errorCode: codes.invalidReceipt },
+  );
 });
 
 test("Windows Electron smoke creates stateRoot through the native adapter only", async () => {
@@ -397,6 +587,14 @@ test("waitFor fails fast for terminal smoke errors and retries transient misses"
   }, 5_000, "timeout smoke", "WINDOWS_ELECTRON_SMOKE_CONTROL_TIMEOUT");
   assert.equal(recoveredAfterTimeout, "ready");
   assert.equal(timeoutCalls, 2);
+
+  let loaderReads = 0;
+  const initialLoader = await waitFor(() => {
+    loaderReads += 1;
+    return loaderReads === 1 ? null : "loader-initial";
+  }, 5_000, "initial dashboard loader");
+  assert.equal(initialLoader, "loader-initial");
+  assert.equal(loaderReads, 2);
 });
 
 test("Windows process-table probe waits for close and retains trailing drained rows", async () => {

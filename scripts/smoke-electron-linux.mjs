@@ -28,6 +28,7 @@ const REPOSITORY_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const ELECTRON_MAIN = resolve(REPOSITORY_ROOT, "apps/electron/main.js");
 const MAX_STARTUP_MS = 30_000;
 const MAX_OPERATION_MS = 10_000;
+const MAX_REFRESH_MS = 45_000;
 const MAX_SHUTDOWN_MS = 10_000;
 const MAX_NETWORK_EVIDENCE_URLS = 512;
 const MAX_NETWORK_EVIDENCE_URL_LENGTH = 2_048;
@@ -37,9 +38,96 @@ const PLATFORM_ARCHITECTURES = Object.freeze({
   "linux/arm64": "arm64",
   "linux/amd64": "x64",
 });
+export const ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES = Object.freeze({
+  duplicate: "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_DUPLICATED",
+  invalidReceipt: "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_RECEIPT_INVALID",
+  changedReceipt: "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_RECEIPT_CHANGED",
+  failed: "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_FAILED",
+  cancelled: "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_CANCELLED",
+  boundaryInvalid: "ELECTRON_LINUX_SMOKE_REFRESH_BOUNDARY_INVALID",
+});
+
+/**
+ * Classify one renderer startup-refresh observation without consulting the
+ * companion or exposing any response data.  Keeping this decision pure lets
+ * the contract lane exercise stale receipts, duplicate renderer requests,
+ * and terminal receipt transitions independently of a Linux runtime.
+ */
+export function classifyAutomaticStartupRefreshReceipt({
+  phase,
+  requestCount,
+  refresh,
+  previousRefreshId = null,
+  expectedRefreshId = null,
+} = {}) {
+  if (!Number.isInteger(requestCount) || requestCount < 0) {
+    return Object.freeze({
+      status: "failed",
+      errorCode: ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.duplicate,
+    });
+  }
+  if (requestCount > 1) {
+    return Object.freeze({
+      status: "failed",
+      errorCode: ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.duplicate,
+    });
+  }
+  if (requestCount === 0 && phase === "acceptance") {
+    return Object.freeze({ status: "pending" });
+  }
+  if (requestCount === 0) {
+    return Object.freeze({
+      status: "failed",
+      errorCode: ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.duplicate,
+    });
+  }
+  if (refresh?.status === "idle") {
+    return Object.freeze({ status: "pending" });
+  }
+  if (typeof refresh?.refreshId !== "string" || refresh.refreshId.length === 0) {
+    return Object.freeze({
+      status: "failed",
+      errorCode: ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.invalidReceipt,
+    });
+  }
+  if (phase === "acceptance") {
+    if (refresh.refreshId === previousRefreshId) {
+      return Object.freeze({ status: "pending" });
+    }
+    return Object.freeze({ status: "accepted", refreshId: refresh.refreshId });
+  }
+  if (phase !== "completion" || refresh.refreshId !== expectedRefreshId) {
+    return Object.freeze({
+      status: "failed",
+      errorCode: ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.changedReceipt,
+    });
+  }
+  if (refresh.status === "succeeded") {
+    return Object.freeze({ status: "completed", refreshId: refresh.refreshId });
+  }
+  if (refresh.status === "failed") {
+    return Object.freeze({
+      status: "failed",
+      errorCode: ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.failed,
+    });
+  }
+  if (refresh.status === "cancelled") {
+    return Object.freeze({
+      status: "failed",
+      errorCode: ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.cancelled,
+    });
+  }
+  return Object.freeze({ status: "pending", refreshId: refresh.refreshId });
+}
 
 function fail(message) {
   throw new Error(`Electron Linux smoke failed: ${message}`);
+}
+
+function failFixed(code) {
+  const error = new Error(code);
+  error.code = code;
+  throw error;
 }
 
 function wait(ms) {
@@ -155,7 +243,7 @@ async function freeTcpPort() {
   return port;
 }
 
-async function waitFor(predicate, timeoutMs, label) {
+export async function waitFor(predicate, timeoutMs, label) {
   const started = Date.now();
   let lastError = null;
   while (Date.now() - started < timeoutMs) {
@@ -163,6 +251,10 @@ async function waitFor(predicate, timeoutMs, label) {
       const value = await predicate();
       if (value) return value;
     } catch (error) {
+      if (typeof error?.code === "string"
+          && error.code.startsWith("ELECTRON_LINUX_SMOKE_")) {
+        throw error;
+      }
       lastError = error;
     }
     await wait(100);
@@ -373,6 +465,180 @@ async function assertRendererShell(cdp) {
   await cdp.evaluate(`document.querySelector('[data-nav="overview"]')?.click()`);
 }
 
+async function mainFrameLoaderId(cdp) {
+  const tree = await cdp.request("Page.getFrameTree");
+  const loaderId = tree?.frameTree?.frame?.loaderId;
+  return typeof loaderId === "string" && loaderId.length > 0 ? loaderId : null;
+}
+
+function selectRequiredRefreshLoader(refreshObserver, loaderId) {
+  if (typeof loaderId !== "string" || loaderId.length === 0
+      || refreshObserver.selectLoader(loaderId) !== loaderId) {
+    failFixed(ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.boundaryInvalid);
+  }
+}
+
+/**
+ * Observe first-party refresh mutations at the renderer boundary. This gives
+ * the Linux lane evidence of the Electron-only startup pass without adding a
+ * qualification route or changing the companion's production API. Requests
+ * are retained until the dashboard location is validated, then scoped to its
+ * exact loopback origin and active main-frame loader so another local port or
+ * prior page cannot satisfy a reload assertion.
+ */
+export function observeLocalRefreshRequests(cdp) {
+  const requests = [];
+  let activeLoaderId = null;
+  let activeOrigin = null;
+  let sealed = false;
+  const unsubscribe = cdp.on(
+    "Network.requestWillBeSent",
+    ({ request, requestId, loaderId } = {}) => {
+      if (sealed) return;
+      if (request?.method !== "POST" || typeof request.url !== "string") return;
+      let parsed;
+      try {
+        parsed = new URL(request.url);
+      } catch {
+        return;
+      }
+      if (parsed.protocol !== "http:"
+          || parsed.hostname !== "127.0.0.1"
+          || parsed.pathname !== "/api/local/refresh") return;
+      if (activeOrigin !== null && parsed.origin !== activeOrigin) return;
+      requests.push(Object.freeze({
+        requestId: typeof requestId === "string" ? requestId : null,
+        loaderId: typeof loaderId === "string" ? loaderId : null,
+        origin: parsed.origin,
+      }));
+    },
+  );
+  return Object.freeze({
+    reset() {
+      requests.length = 0;
+      activeLoaderId = null;
+      sealed = false;
+    },
+    selectOrigin(origin) {
+      try {
+        const parsed = new URL(origin);
+        activeOrigin = parsed.protocol === "http:"
+          && parsed.hostname === "127.0.0.1"
+          && parsed.origin === origin
+          ? parsed.origin
+          : null;
+      } catch {
+        activeOrigin = null;
+      }
+      if (activeOrigin !== null) {
+        const retained = requests.filter((entry) => entry.origin === activeOrigin);
+        requests.length = 0;
+        requests.push(...retained);
+      } else {
+        requests.length = 0;
+      }
+      return activeOrigin;
+    },
+    selectLoader(loaderId) {
+      activeLoaderId = typeof loaderId === "string" && loaderId.length > 0
+        ? loaderId
+        : null;
+      if (activeLoaderId === null) {
+        requests.length = 0;
+        return null;
+      }
+      const retained = requests.filter((entry) => entry.loaderId === activeLoaderId);
+      requests.length = 0;
+      requests.push(...retained);
+      return activeLoaderId;
+    },
+    seal() {
+      sealed = true;
+    },
+    snapshot() {
+      if (activeOrigin === null || activeLoaderId === null) return [];
+      return requests.filter((entry) => entry.origin === activeOrigin
+        && entry.loaderId === activeLoaderId);
+    },
+    dispose() {
+      unsubscribe?.();
+    },
+  });
+}
+
+/**
+ * Require one completed automatic startup pass for the current dashboard
+ * document. Linux has no separate synthetic-data lane today; this assertion
+ * only proves the real renderer startup request and its terminal receipt.
+ */
+async function assertAutomaticStartupRefresh({
+  child,
+  dashboardUrl,
+  refreshObserver,
+  previousRefreshId = null,
+}) {
+  const refreshUrl = new URL("/api/local/refresh", dashboardUrl);
+  let refreshId = null;
+  await waitFor(async () => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      fail("Electron exited before automatic startup refresh");
+    }
+    const requests = refreshObserver.snapshot();
+    if (requests.length === 0) return null;
+    const noReceiptDecision = classifyAutomaticStartupRefreshReceipt({
+      phase: "acceptance",
+      requestCount: requests.length,
+      refresh: { status: "idle" },
+      previousRefreshId,
+    });
+    if (noReceiptDecision.status === "failed") failFixed(noReceiptDecision.errorCode);
+    const status = await jsonFetch(refreshUrl);
+    const refresh = status?.refresh;
+    const decision = classifyAutomaticStartupRefreshReceipt({
+      phase: "acceptance",
+      requestCount: requests.length,
+      refresh,
+      previousRefreshId,
+    });
+    if (decision.status === "pending") return null;
+    if (decision.status === "failed") failFixed(decision.errorCode);
+    refreshId = decision.refreshId;
+    return true;
+  }, MAX_REFRESH_MS, "automatic startup refresh acceptance");
+
+  await waitFor(async () => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      fail("Electron exited before automatic startup refresh completed");
+    }
+    const requests = refreshObserver.snapshot();
+    if (requests.length !== 1) {
+      const requestDecision = classifyAutomaticStartupRefreshReceipt({
+        phase: "completion",
+        requestCount: requests.length,
+        expectedRefreshId: refreshId,
+      });
+      if (requestDecision.status === "failed") failFixed(requestDecision.errorCode);
+      return false;
+    }
+    const status = await jsonFetch(refreshUrl);
+    const refresh = status?.refresh;
+    const decision = classifyAutomaticStartupRefreshReceipt({
+      phase: "completion",
+      requestCount: requests.length,
+      refresh,
+      expectedRefreshId: refreshId,
+    });
+    if (decision.status === "pending") return false;
+    if (decision.status === "failed") failFixed(decision.errorCode);
+    return true;
+  }, MAX_REFRESH_MS, "automatic startup refresh completion");
+  // A completed pass may schedule an intentional bounded reindex continuation.
+  // It is a separate operation, not a second startup trigger; stop counting
+  // this document once the startup receipt has reached its terminal success.
+  refreshObserver.seal();
+  return refreshId;
+}
+
 async function runSmoke() {
   const containerContract = assertContainerContract();
   const fixture = await createSyntheticHome();
@@ -414,6 +680,7 @@ async function runSmoke() {
   child.stdout?.on("data", () => { stdoutProduced = true; });
   child.stderr?.on("data", () => { stderrProduced = true; });
   let cdp = null;
+  let refreshObserver = null;
   let forcedShutdown = false;
   try {
     if (!child.pid) fail("Electron did not provide a process id");
@@ -436,6 +703,10 @@ async function runSmoke() {
       return targets.find((entry) => entry.type === "page" && entry.webSocketDebuggerUrl);
     }, MAX_STARTUP_MS, "Electron dashboard target");
     cdp = await connectCdp(target);
+    refreshObserver = observeLocalRefreshRequests(cdp);
+    // Enable both domains immediately after attaching. The renderer's
+    // startup pass is launched by the dashboard bootstrap, so delaying these
+    // domains until after readiness can miss the only POST we are qualifying.
     const observedNetworkUrls = [];
     let networkEvidenceInvalid = false;
     const observeNetworkURL = (url) => {
@@ -454,7 +725,13 @@ async function runSmoke() {
     cdp.on("Network.webSocketCreated", ({ url } = {}) => {
       observeNetworkURL(url);
     });
+    await cdp.request("Page.enable");
     await cdp.request("Network.enable");
+    selectRequiredRefreshLoader(refreshObserver, await waitFor(
+      () => mainFrameLoaderId(cdp),
+      MAX_STARTUP_MS,
+      "Electron dashboard frame",
+    ));
     const ready = await waitFor(
       async () => {
         const snapshot = await cdp.evaluate(`(() => ({
@@ -471,9 +748,13 @@ async function runSmoke() {
       MAX_STARTUP_MS,
       "dashboard renderer readiness",
     );
+    selectRequiredRefreshLoader(refreshObserver, await mainFrameLoaderId(cdp));
     const dashboardUrl = new URL(ready.location);
     if (dashboardUrl.protocol !== "http:" || dashboardUrl.hostname !== "127.0.0.1") {
       fail("dashboard did not load from the companion loopback origin");
+    }
+    if (refreshObserver.selectOrigin(dashboardUrl.origin) !== dashboardUrl.origin) {
+      fail("dashboard origin was not accepted as the validated loopback origin");
     }
     const health = await jsonFetch(new URL("/api/local/health", dashboardUrl));
     if (health.status !== "ready") fail("companion health was not ready");
@@ -489,17 +770,54 @@ async function runSmoke() {
       fail("renderer requested a non-loopback resource");
     }
     await assertRendererShell(cdp);
+    await assertAutomaticStartupRefresh({
+      child,
+      dashboardUrl,
+      refreshObserver,
+    });
 
     const descendantsAtReady = descendantsOf(child.pid);
     if (descendantsAtReady.length < 1) fail("Electron had no companion descendant after readiness");
 
-    await cdp.request("Page.reload", { ignoreCache: false });
-    await waitFor(
-      () => cdp.evaluate("document.documentElement?.dataset?.localDashboardReady === 'true'"),
-      MAX_STARTUP_MS,
-      "dashboard reload readiness",
+    const previousStatus = await jsonFetch(new URL("/api/local/refresh", dashboardUrl));
+    const previousRefreshId = typeof previousStatus?.refresh?.refreshId === "string"
+      ? previousStatus.refresh.refreshId
+      : null;
+    const before = await cdp.evaluate(
+      "({ timeOrigin: performance.timeOrigin, url: location.href })",
     );
+    const beforeLoaderId = await mainFrameLoaderId(cdp);
+    refreshObserver.reset();
+    await cdp.request("Page.reload", { ignoreCache: false });
+    const fresh = await waitFor(
+      async () => {
+        const snapshot = await cdp.evaluate(`(() => ({
+          ready: document.documentElement?.dataset?.localDashboardReady === "true",
+          timeOrigin: performance.timeOrigin,
+          url: location.href,
+        }))()`);
+        const loaderId = await mainFrameLoaderId(cdp);
+        const loaderChanged = beforeLoaderId === null
+          || (loaderId !== null && loaderId !== beforeLoaderId);
+        return snapshot.ready
+          && Number.isFinite(snapshot.timeOrigin)
+          && snapshot.timeOrigin !== before.timeOrigin
+          && snapshot.url === before.url
+          && loaderChanged
+          ? { snapshot, loaderId }
+          : null;
+      },
+      MAX_STARTUP_MS,
+      "dashboard fresh-document render",
+    );
+    selectRequiredRefreshLoader(refreshObserver, fresh.loaderId);
     await assertRendererShell(cdp);
+    await assertAutomaticStartupRefresh({
+      child,
+      dashboardUrl,
+      refreshObserver,
+      previousRefreshId,
+    });
     if (networkEvidenceInvalid
         || observedNetworkUrls.some((url) => !isAllowedRendererNetworkURL(url, dashboardUrl.origin))) {
       fail("renderer attempted a non-loopback network request");
@@ -567,6 +885,7 @@ async function runSmoke() {
     forcedShutdown = true;
     throw error;
   } finally {
+    refreshObserver?.dispose?.();
     cdp?.close();
     if (child.exitCode === null && child.signalCode === null) {
       child.kill(forcedShutdown ? "SIGKILL" : "SIGTERM");

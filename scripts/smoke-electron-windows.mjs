@@ -160,6 +160,87 @@ const SMOKE_PHASE_STAGE = Object.freeze({
   relaunch: "relaunch",
 });
 
+export const WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES = Object.freeze({
+  duplicate: "WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_DUPLICATED",
+  invalidReceipt: "WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_RECEIPT_INVALID",
+  changedReceipt: "WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_RECEIPT_CHANGED",
+  failed: "WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_FAILED",
+  cancelled: "WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_CANCELLED",
+});
+
+/**
+ * Classify one renderer startup-refresh observation without consulting the
+ * companion or exposing any response data.  Keeping this decision pure lets
+ * the contract lane exercise stale receipts, duplicate renderer requests,
+ * and terminal receipt transitions independently of a Windows runtime.
+ */
+export function classifyAutomaticStartupRefreshReceipt({
+  phase,
+  requestCount,
+  refresh,
+  previousRefreshId = null,
+  expectedRefreshId = null,
+} = {}) {
+  if (!Number.isInteger(requestCount) || requestCount < 0) {
+    return Object.freeze({
+      status: "failed",
+      errorCode: WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES.duplicate,
+    });
+  }
+  if (requestCount > 1) {
+    return Object.freeze({
+      status: "failed",
+      errorCode: WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES.duplicate,
+    });
+  }
+  if (requestCount === 0 && phase === "acceptance") {
+    return Object.freeze({ status: "pending" });
+  }
+  if (requestCount === 0) {
+    return Object.freeze({
+      status: "failed",
+      errorCode: WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES.duplicate,
+    });
+  }
+  if (refresh?.status === "idle") {
+    return Object.freeze({ status: "pending" });
+  }
+  if (typeof refresh?.refreshId !== "string" || refresh.refreshId.length === 0) {
+    return Object.freeze({
+      status: "failed",
+      errorCode: WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES.invalidReceipt,
+    });
+  }
+  if (phase === "acceptance") {
+    if (refresh.refreshId === previousRefreshId) {
+      return Object.freeze({ status: "pending" });
+    }
+    return Object.freeze({ status: "accepted", refreshId: refresh.refreshId });
+  }
+  if (phase !== "completion" || refresh.refreshId !== expectedRefreshId) {
+    return Object.freeze({
+      status: "failed",
+      errorCode: WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES.changedReceipt,
+    });
+  }
+  if (refresh.status === "succeeded") {
+    return Object.freeze({ status: "completed", refreshId: refresh.refreshId });
+  }
+  if (refresh.status === "failed") {
+    return Object.freeze({
+      status: "failed",
+      errorCode: WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES.failed,
+    });
+  }
+  if (refresh.status === "cancelled") {
+    return Object.freeze({
+      status: "failed",
+      errorCode: WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES.cancelled,
+    });
+  }
+  return Object.freeze({ status: "pending", refreshId: refresh.refreshId });
+}
+
 function fixedError(code) {
   const error = new Error(code);
   error.code = code;
@@ -510,6 +591,7 @@ async function connectCdp(target) {
   let nextId = 1;
   const pending = new Map();
   const eventWaiters = new Map();
+  const eventHandlers = new Map();
   const onMessage = (event) => {
     let message;
     try {
@@ -526,6 +608,17 @@ async function connectCdp(target) {
       return;
     }
     if (typeof message.method !== "string") return;
+    const handlers = eventHandlers.get(message.method);
+    if (handlers) {
+      for (const handler of [...handlers]) {
+        try {
+          handler(message.params ?? {});
+        } catch {
+          // An observation hook must never break the CDP dispatch loop. The
+          // qualification reads its bounded evidence after the event arrives.
+        }
+      }
+    }
     const waiters = eventWaiters.get(message.method);
     if (!waiters) return;
     for (const waiter of [...waiters]) {
@@ -599,10 +692,23 @@ async function connectCdp(target) {
     });
     return promise;
   };
+  const on = (method, handler) => {
+    if (typeof method !== "string" || typeof handler !== "function") {
+      throw new TypeError("CDP event handler is invalid");
+    }
+    const handlers = eventHandlers.get(method) ?? new Set();
+    handlers.add(handler);
+    eventHandlers.set(method, handlers);
+    return () => {
+      handlers.delete(handler);
+      if (handlers.size === 0) eventHandlers.delete(method);
+    };
+  };
   return Object.freeze({
     request,
     evaluate,
     waitForEvent,
+    on,
     close() {
       socket.close();
       for (const { reject } of pending.values()) reject(new Error("CDP closed"));
@@ -611,6 +717,7 @@ async function connectCdp(target) {
         for (const waiter of waiters) waiter.reject(new Error("CDP closed"));
       }
       eventWaiters.clear();
+      eventHandlers.clear();
     },
   });
 }
@@ -1132,6 +1239,186 @@ async function assertRendererShell(cdp) {
   await cdp.evaluate(`document.querySelector('[data-nav="overview"]')?.click()`);
 }
 
+async function mainFrameLoaderId(cdp) {
+  const tree = await cdp.request("Page.getFrameTree");
+  const loaderId = tree?.frameTree?.frame?.loaderId;
+  return typeof loaderId === "string" && loaderId.length > 0 ? loaderId : null;
+}
+
+function selectRequiredRefreshLoader(refreshObserver, loaderId) {
+  if (typeof loaderId !== "string" || loaderId.length === 0
+      || refreshObserver.selectLoader(loaderId) !== loaderId) {
+    fail("WINDOWS_ELECTRON_SMOKE_REFRESH_BOUNDARY_INVALID");
+  }
+}
+
+/**
+ * Observe the renderer's first-party refresh mutation without asking the
+ * companion to expose an additional qualification-only counter. The
+ * automatic Electron startup pass is a real renderer POST, so CDP's network
+ * boundary is the narrowest evidence that it actually happened. Requests are
+ * scoped to the validated dashboard loopback origin and active main-frame
+ * loader so another local port or prior page cannot satisfy a reload
+ * assertion.
+ */
+export function observeLocalRefreshRequests(cdp) {
+  const requests = [];
+  let activeLoaderId = null;
+  let activeOrigin = null;
+  let sealed = false;
+  const unsubscribe = cdp.on(
+    "Network.requestWillBeSent",
+    ({ request, requestId, loaderId } = {}) => {
+      if (sealed) return;
+      if (request?.method !== "POST" || typeof request.url !== "string") return;
+      let parsed;
+      try {
+        parsed = new URL(request.url);
+      } catch {
+        return;
+      }
+      if (parsed.protocol !== "http:"
+          || parsed.hostname !== "127.0.0.1"
+          || parsed.pathname !== "/api/local/refresh") return;
+      if (activeOrigin !== null && parsed.origin !== activeOrigin) return;
+      requests.push(Object.freeze({
+        requestId: typeof requestId === "string" ? requestId : null,
+        loaderId: typeof loaderId === "string" ? loaderId : null,
+        origin: parsed.origin,
+      }));
+    },
+  );
+  return Object.freeze({
+    reset() {
+      requests.length = 0;
+      activeLoaderId = null;
+      sealed = false;
+    },
+    selectOrigin(origin) {
+      try {
+        const parsed = new URL(origin);
+        activeOrigin = parsed.protocol === "http:"
+          && parsed.hostname === "127.0.0.1"
+          && parsed.origin === origin
+          ? parsed.origin
+          : null;
+      } catch {
+        activeOrigin = null;
+      }
+      if (activeOrigin !== null) {
+        const retained = requests.filter((entry) => entry.origin === activeOrigin);
+        requests.length = 0;
+        requests.push(...retained);
+      } else {
+        requests.length = 0;
+      }
+      return activeOrigin;
+    },
+    selectLoader(loaderId) {
+      activeLoaderId = typeof loaderId === "string" && loaderId.length > 0
+        ? loaderId
+        : null;
+      if (activeLoaderId === null) {
+        requests.length = 0;
+        return null;
+      }
+      const retained = requests.filter((entry) => entry.loaderId === activeLoaderId);
+      requests.length = 0;
+      requests.push(...retained);
+      return activeLoaderId;
+    },
+    seal() {
+      sealed = true;
+    },
+    snapshot() {
+      if (activeOrigin === null || activeLoaderId === null) return [];
+      return requests.filter((entry) => entry.origin === activeOrigin
+        && entry.loaderId === activeLoaderId);
+    },
+    dispose() {
+      unsubscribe?.();
+    },
+  });
+}
+
+/**
+ * Require one completed automatic startup pass for the current dashboard
+ * document. This runs after the renderer's app-owned readiness marker and
+ * before the smoke's explicit synthetic refresh, so the latter remains a
+ * separate data/persistence qualification step.
+ */
+async function assertAutomaticStartupRefresh({
+  child,
+  dashboardUrl,
+  refreshObserver,
+  previousRefreshId = null,
+}) {
+  const refreshUrl = new URL("/api/local/refresh", dashboardUrl);
+  let refreshId = null;
+  await waitFor(async () => {
+    if (childExited(child)) fail("WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_READY");
+    const requests = refreshObserver.snapshot();
+    if (requests.length === 0) return null;
+    const noReceiptDecision = classifyAutomaticStartupRefreshReceipt({
+      phase: "acceptance",
+      requestCount: requests.length,
+      refresh: { status: "idle" },
+      previousRefreshId,
+    });
+    if (noReceiptDecision.status === "failed") fail(noReceiptDecision.errorCode);
+    const status = await jsonFetch(
+      refreshUrl,
+      undefined,
+      "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT",
+    );
+    const refresh = status?.refresh;
+    const decision = classifyAutomaticStartupRefreshReceipt({
+      phase: "acceptance",
+      requestCount: requests.length,
+      refresh,
+      previousRefreshId,
+    });
+    if (decision.status === "pending") return null;
+    if (decision.status === "failed") fail(decision.errorCode);
+    refreshId = decision.refreshId;
+    return true;
+  }, MAX_REFRESH_MS, "automatic startup refresh acceptance", "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT");
+
+  await waitFor(async () => {
+    if (childExited(child)) fail("WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_READY");
+    const requests = refreshObserver.snapshot();
+    if (requests.length !== 1) {
+      const requestDecision = classifyAutomaticStartupRefreshReceipt({
+        phase: "completion",
+        requestCount: requests.length,
+        expectedRefreshId: refreshId,
+      });
+      if (requestDecision.status === "failed") fail(requestDecision.errorCode);
+      return false;
+    }
+    const status = await jsonFetch(
+      refreshUrl,
+      undefined,
+      "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT",
+    );
+    const refresh = status?.refresh;
+    const decision = classifyAutomaticStartupRefreshReceipt({
+      phase: "completion",
+      requestCount: requests.length,
+      refresh,
+      expectedRefreshId: refreshId,
+    });
+    if (decision.status === "pending") return false;
+    if (decision.status === "failed") fail(decision.errorCode);
+    return true;
+  }, MAX_REFRESH_MS, "automatic startup refresh completion", "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT");
+  // A completed pass may schedule an intentional bounded reindex continuation.
+  // It is a separate operation, not a second startup trigger; stop counting
+  // this document once the startup receipt has reached its terminal success.
+  refreshObserver.seal();
+  return refreshId;
+}
+
 async function dashboardConnection(child, port) {
   const version = await waitFor(
     () => {
@@ -1156,6 +1443,18 @@ async function dashboardConnection(child, port) {
     return targets.find((entry) => entry.type === "page" && entry.webSocketDebuggerUrl);
   }, MAX_STARTUP_MS, "Electron dashboard target", "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT");
   const cdp = await connectCdp(target);
+  const refreshObserver = observeLocalRefreshRequests(cdp);
+  // Enable both domains immediately after attaching. The renderer's startup
+  // pass is launched by the dashboard bootstrap, so delaying these domains
+  // until after readiness can miss the only POST we are qualifying.
+  await cdp.request("Page.enable");
+  await cdp.request("Network.enable");
+  selectRequiredRefreshLoader(refreshObserver, await waitFor(
+    () => mainFrameLoaderId(cdp),
+    MAX_STARTUP_MS,
+    "Electron dashboard frame",
+    "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT",
+  ));
   const ready = await waitFor(async () => {
     if (childExited(child)) fail("WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_READY");
     const snapshot = await cdp.evaluate(`(() => ({
@@ -1168,9 +1467,13 @@ async function dashboardConnection(child, port) {
       ? snapshot
       : null;
   }, MAX_STARTUP_MS, "dashboard readiness", "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT");
+  selectRequiredRefreshLoader(refreshObserver, await mainFrameLoaderId(cdp));
   const dashboardUrl = new URL(ready.location);
   if (dashboardUrl.protocol !== "http:" || dashboardUrl.hostname !== "127.0.0.1") {
     fail("WINDOWS_ELECTRON_SMOKE_LOOPBACK_REQUIRED");
+  }
+  if (refreshObserver.selectOrigin(dashboardUrl.origin) !== dashboardUrl.origin) {
+    fail("WINDOWS_ELECTRON_SMOKE_LOOPBACK_ORIGIN_INVALID");
   }
   const health = await jsonFetch(
     new URL("/api/local/health", dashboardUrl),
@@ -1179,7 +1482,18 @@ async function dashboardConnection(child, port) {
   );
   if (health.status !== "ready") fail("WINDOWS_ELECTRON_SMOKE_COMPANION_NOT_READY");
   await assertRendererShell(cdp);
-  return Object.freeze({ cdp, dashboardUrl, browser: version.Browser });
+  await assertAutomaticStartupRefresh({
+    child,
+    dashboardUrl,
+    refreshObserver,
+  });
+  return Object.freeze({
+    cdp,
+    dashboardUrl,
+    browser: version.Browser,
+    refreshObserver,
+    child,
+  });
 }
 
 /**
@@ -1189,6 +1503,15 @@ async function dashboardConnection(child, port) {
  * satisfying the post-refresh render proof.
  */
 async function reloadDashboardDocument(connection) {
+  const previousStatus = await jsonFetch(
+    new URL("/api/local/refresh", connection.dashboardUrl),
+    undefined,
+    "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT",
+  );
+  const previousRefreshId = typeof previousStatus?.refresh?.refreshId === "string"
+    ? previousStatus.refresh.refreshId
+    : null;
+  connection.refreshObserver.reset();
   const before = await connection.cdp.evaluate(
     "({ timeOrigin: performance.timeOrigin, url: location.href })",
   );
@@ -1203,7 +1526,11 @@ async function reloadDashboardDocument(connection) {
     "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT",
   );
   await connection.cdp.request("Page.reload", { ignoreCache: false });
-  await navigation;
+  const navigated = await navigation;
+  selectRequiredRefreshLoader(
+    connection.refreshObserver,
+    navigated?.frame?.loaderId ?? null,
+  );
   await waitFor(async () => {
     const snapshot = await connection.cdp.evaluate(`(() => ({
       ready: document.documentElement?.dataset?.localDashboardReady === "true",
@@ -1215,6 +1542,12 @@ async function reloadDashboardDocument(connection) {
       && snapshot.timeOrigin !== before.timeOrigin
       && snapshot.url === before.url;
   }, MAX_STARTUP_MS, "dashboard fresh-document render", "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT");
+  await assertAutomaticStartupRefresh({
+    child: connection.child,
+    dashboardUrl: new URL(before.url),
+    refreshObserver: connection.refreshObserver,
+    previousRefreshId,
+  });
 }
 
 async function runSyntheticRefresh(connection) {
@@ -1620,6 +1953,7 @@ export async function runSmoke(progress) {
     nextPrimaryMessage?.close?.();
     nextRelaunchMessage?.close?.();
     secondMessageReader?.close?.();
+    connection?.refreshObserver?.dispose?.();
     connection?.cdp.close();
     await terminateProcessTree(second);
     await terminateProcessTree(primary);
