@@ -833,7 +833,11 @@ private enum LauncherError: LocalizedError {
     case companionLaunch(String)
     case companionTimeout
     case codexHomeSettingsWrite
+    case dashboardContentProcessTerminated
     case dashboardDownloadFailed
+    case dashboardNavigationFailed
+    case dashboardReadinessTimeout
+    case dashboardViewportUnavailable
     case dashboardWebViewUnavailable
     case dataErase
     case firstRunStateWrite
@@ -881,9 +885,25 @@ private enum LauncherError: LocalizedError {
             return TiboTattleLocalization.string(
                 .launcherErrorCodexHomeSettingsWrite
             )
+        case .dashboardContentProcessTerminated:
+            return TiboTattleLocalization.string(
+                .launcherErrorDashboardContentProcessTerminated
+            )
         case .dashboardDownloadFailed:
             return TiboTattleLocalization.string(
                 .launcherErrorDashboardDownloadFailed
+            )
+        case .dashboardNavigationFailed:
+            return TiboTattleLocalization.string(
+                .launcherErrorDashboardNavigationFailed
+            )
+        case .dashboardReadinessTimeout:
+            return TiboTattleLocalization.string(
+                .launcherErrorDashboardReadinessTimeout
+            )
+        case .dashboardViewportUnavailable:
+            return TiboTattleLocalization.string(
+                .launcherErrorDashboardViewportUnavailable
             )
         case .dashboardWebViewUnavailable:
             return TiboTattleLocalization.string(
@@ -937,8 +957,16 @@ private enum LauncherError: LocalizedError {
             return "UM_MACOS_COMPANION_START_TIMEOUT"
         case .codexHomeSettingsWrite:
             return "UM_MACOS_CODEX_HOME_SETTINGS_WRITE_FAILED"
+        case .dashboardContentProcessTerminated:
+            return "UM_MACOS_DASHBOARD_WEB_PROCESS_TERMINATED"
         case .dashboardDownloadFailed:
             return "UM_MACOS_DASHBOARD_DOWNLOAD_FAILED"
+        case .dashboardNavigationFailed:
+            return "UM_MACOS_DASHBOARD_NAVIGATION_FAILED"
+        case .dashboardReadinessTimeout:
+            return "UM_MACOS_DASHBOARD_READY_TIMEOUT"
+        case .dashboardViewportUnavailable:
+            return "UM_MACOS_DASHBOARD_VIEWPORT_UNAVAILABLE"
         case .dashboardWebViewUnavailable:
             return "UM_MACOS_DASHBOARD_VIEW_UNAVAILABLE"
         case .dataErase:
@@ -981,7 +1009,9 @@ private enum LauncherError: LocalizedError {
             return TiboTattleLocalization.string(
                 .launcherRecoveryDashboardDownload
             )
-        case .dashboardWebViewUnavailable:
+        case .dashboardContentProcessTerminated, .dashboardNavigationFailed,
+             .dashboardReadinessTimeout, .dashboardViewportUnavailable,
+             .dashboardWebViewUnavailable:
             return TiboTattleLocalization.string(
                 .launcherRecoveryDashboardWebView
             )
@@ -1915,7 +1945,7 @@ private final class NativeDashboardWebView: WKWebView {
 private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelegate,
     WKDownloadDelegate, WKScriptMessageHandler {
     private let onLoaded: () -> Void
-    private let onFailure: (String) -> Void
+    private let onFailure: (LauncherError) -> Void
     private let onDownloadFailure: () -> Void
     private let openExternally: (URL) -> Void
     private let onNavigation: (String) -> Void
@@ -1943,7 +1973,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
 
     init(
         onLoaded: @escaping () -> Void,
-        onFailure: @escaping (String) -> Void,
+        onFailure: @escaping (LauncherError) -> Void,
         onDownloadFailure: @escaping () -> Void,
         openExternally: @escaping (URL) -> Void,
         onNavigation: @escaping (String) -> Void,
@@ -2080,7 +2110,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
               url.host == loopbackHost,
               let port = url.port
         else {
-            onFailure(LauncherError.healthCheck.failureCode)
+            onFailure(.healthCheck)
             return
         }
         allowedPort = port
@@ -2103,7 +2133,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
             guard viewportPreparationAttempts < 20 else {
                 pendingDashboardURL = nil
                 hasDashboardTarget = false
-                onFailure(LauncherError.dashboardWebViewUnavailable.failureCode)
+                onFailure(.dashboardViewportUnavailable)
                 return
             }
             viewportPreparationAttempts += 1
@@ -2363,7 +2393,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
             }
             guard Date() < deadline else {
                 self.hasDashboardTarget = false
-                self.onFailure(LauncherError.dashboardWebViewUnavailable.failureCode)
+                self.onFailure(.dashboardReadinessTimeout)
                 return
             }
             DispatchQueue.main.asyncAfter(
@@ -2393,7 +2423,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         guard hasDashboardTarget else { return }
         hasDashboardTarget = false
-        onFailure(LauncherError.dashboardWebViewUnavailable.failureCode)
+        onFailure(.dashboardContentProcessTerminated)
     }
 
     private func reportNavigationFailure(_ error: Error) {
@@ -2406,7 +2436,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
             return
         }
         hasDashboardTarget = false
-        onFailure(LauncherError.dashboardWebViewUnavailable.failureCode)
+        onFailure(.dashboardNavigationFailed)
     }
 
     // MARK: - Window, dialog, and file affordances
@@ -4418,8 +4448,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         let host = dashboardWebHost ?? {
             let created = DashboardWebHost(
                 onLoaded: { [weak self] in self?.dashboardWebViewLoaded() },
-                onFailure: { [weak self] code in
-                    self?.dashboardWebViewFailed(code: code)
+                onFailure: { [weak self] failure in
+                    self?.dashboardWebViewFailed(failure)
                 },
                 onDownloadFailure: { [weak self] in
                     self?.reportDashboardDownloadFailure()
@@ -4943,7 +4973,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         alert.runModal()
     }
 
-    private func dashboardWebViewFailed(code: String) {
+    private func dashboardWebViewFailed(_ failure: LauncherError) {
         cancelNativeRefreshSchedule()
         startupAutomaticRefreshPending = false
         nativeEvidenceState = .readFailed
@@ -4951,13 +4981,27 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         dashboardContainer.isHidden = true
         statusStack.isHidden = false
         actionRow.isHidden = false
-        let failure = LauncherError.dashboardWebViewUnavailable
-        lastLifecycleStatus = "Dashboard unavailable"
+        let headline: TiboTattleLocalization.Key
+        switch failure {
+        case .dashboardContentProcessTerminated:
+            lastLifecycleStatus = "Dashboard web process terminated"
+            headline = .launcherDashboardDidNotOpen
+        case .dashboardNavigationFailed:
+            lastLifecycleStatus = "Dashboard navigation failed"
+            headline = .launcherDashboardDidNotOpen
+        case .dashboardReadinessTimeout:
+            lastLifecycleStatus = "Dashboard readiness timed out"
+            headline = .launcherDashboardTakingLonger
+        case .dashboardViewportUnavailable:
+            lastLifecycleStatus = "Dashboard viewport unavailable"
+            headline = .launcherDashboardDidNotOpen
+        default:
+            lastLifecycleStatus = "Dashboard unavailable"
+            headline = .launcherDashboardDidNotOpen
+        }
         lastFailureCode = failure.failureCode
         lastRecoverySuggestion = failure.recoverySuggestion
-        statusLabel.stringValue = TiboTattleLocalization.string(
-            .launcherDashboardDidNotOpen
-        )
+        statusLabel.stringValue = TiboTattleLocalization.string(headline)
         detailLabel.stringValue = TiboTattleLocalization.format(
             .launcherFailureDetails,
             failure.errorDescription ?? "",

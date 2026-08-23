@@ -168,6 +168,7 @@
 
 "launcher.codexFolderUpdated" = "Codex 文件夹已更新";
 "launcher.dashboardDidNotOpen" = "仪表板未能打开";
+"launcher.dashboardTakingLonger" = "仪表板所需时间比预期更长";
 "launcher.localDataMovedToTrash" = "本地数据已移到废纸篓";
 "launcher.localDashboardCouldNotStart" = "无法启动本地仪表板。";
 "launcher.localDataMovedToTrashDetail" = "现在将创建新的仅所有者可访问的本地存储。未更改 Codex 日志。";
@@ -184,7 +185,11 @@
 "launcher.errorCompanionLaunch" = "无法启动本地伴随程序。";
 "launcher.errorCompanionTimeout" = "本地伴随程序未能及时准备就绪。";
 "launcher.errorCodexHomeSettingsWrite" = "无法私密地保存所选 Codex 文件夹。";
+"launcher.errorDashboardContentProcessTerminated" = "打开本地仪表板时，macOS 网页内容进程已停止。";
 "launcher.errorDashboardDownloadFailed" = "仪表板无法将该文件保存到“下载”文件夹。";
+"launcher.errorDashboardNavigationFailed" = "应用内仪表板无法加载其本地页面。";
+"launcher.errorDashboardReadinessTimeout" = "本地仪表板页面已加载，但未能在初始等待期间准备就绪。";
+"launcher.errorDashboardViewportUnavailable" = "应用内仪表板未获得可用的窗口尺寸。";
 "launcher.errorDashboardWebViewUnavailable" = "无法显示应用内仪表板视图。";
 "launcher.errorDataErase" = "无法将 %@ 的本地数据移到废纸篓。";
 "launcher.errorFirstRunStateWrite" = "无法私密地保存首次运行确认。";
@@ -203,7 +208,7 @@
 "launcher.recoveryCheckAccess" = "请检查对主目录和 Application Support 文件夹的访问权限，然后重试。";
 "launcher.recoveryChooseCodexHome" = "请选择“Codex 来源”并选择可读取且归你的 macOS 用户帐户所有的 Codex 主文件夹，或恢复默认设置。";
 "launcher.recoveryDashboardDownload" = "请检查对“下载”文件夹的访问权限，然后再次保存该文件。";
-"launcher.recoveryDashboardWebView" = "请选择“打开仪表板”重试，或选择“在浏览器中打开”以在浏览器中使用同一份本地仪表板。";
+"launcher.recoveryDashboardWebView" = "请选择“打开仪表板”再次尝试本地视图。如果仍无法打开，请选择“重试”。";
 "launcher.recoveryDataErase" = "请退出正在使用 %@ 数据的其他进程，然后再次尝试抹掉。";
 "launcher.recoveryExistingWindow" = "请打开现有的 %@ 窗口，或先退出它再启动另一份副本。";
 "launcher.recoveryKeychainDenied" = "请重试重置并批准 macOS 钥匙串提示。";

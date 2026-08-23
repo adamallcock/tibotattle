@@ -1524,11 +1524,11 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   // stack and the native recovery controls return together.
   assert.match(
     source,
-    /private func dashboardWebViewFailed\(code: String\) \{[\s\S]*?dashboardContainer\.isHidden = true\s*\n\s*statusStack\.isHidden = false/u,
+    /private func dashboardWebViewFailed\(_ failure: LauncherError\) \{[\s\S]*?dashboardContainer\.isHidden = true\s*\n\s*statusStack\.isHidden = false/u,
   );
   assert.match(
     source,
-    /private func dashboardWebViewFailed\(code: String\) \{[\s\S]*?retryButton\.isEnabled = retryAllowed && firstRunAcknowledged/u,
+    /private func dashboardWebViewFailed\(_ failure: LauncherError\) \{[\s\S]*?retryButton\.isEnabled = retryAllowed && firstRunAcknowledged/u,
   );
   assert.match(
     source,
@@ -1544,12 +1544,47 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   );
   assert.match(
     source,
+    /for button in \[\s*retryButton,\s*openButton,\s*\] \{\s*actionRow\.addView\(button, in: \.trailing\)/u,
+  );
+  assert.doesNotMatch(
+    source,
+    /for button in \[\s*retryButton,\s*openButton,\s*openInBrowserButton,/u,
+  );
+  assert.match(
+    source,
     /@objc private func openDashboard\(\) \{[\s\S]*?showDashboardWebView\(dashboardURL\)/u,
   );
   assert.match(
     source,
     /@objc private func openDashboardInBrowser\(\) \{[\s\S]*?NSWorkspace\.shared\.open\(dashboardURL\)/u,
   );
+  // Recovery copy and diagnostics distinguish the host phase without adding
+  // another dashboard lifecycle or retry path.
+  assert.match(source, /private let onFailure: \(LauncherError\) -> Void/u);
+  assert.match(
+    source,
+    /guard viewportPreparationAttempts < 20 else \{[\s\S]*?onFailure\(\.dashboardViewportUnavailable\)/u,
+  );
+  assert.match(
+    source,
+    /guard Date\(\) < deadline else \{[\s\S]*?self\.onFailure\(\.dashboardReadinessTimeout\)/u,
+  );
+  assert.match(
+    source,
+    /func webViewWebContentProcessDidTerminate[\s\S]*?onFailure\(\.dashboardContentProcessTerminated\)/u,
+  );
+  assert.match(
+    source,
+    /private func reportNavigationFailure[\s\S]*?onFailure\(\.dashboardNavigationFailed\)/u,
+  );
+  assert.match(
+    source,
+    /private func dashboardWebViewFailed\(_ failure: LauncherError\) \{[\s\S]*?case \.dashboardReadinessTimeout:[\s\S]*?headline = \.launcherDashboardTakingLonger[\s\S]*?lastFailureCode = failure\.failureCode[\s\S]*?failure\.errorDescription[\s\S]*?failure\.failureCode[\s\S]*?failure\.recoverySuggestion/u,
+  );
+  assert.match(source, /UM_MACOS_DASHBOARD_VIEWPORT_UNAVAILABLE/u);
+  assert.match(source, /UM_MACOS_DASHBOARD_NAVIGATION_FAILED/u);
+  assert.match(source, /UM_MACOS_DASHBOARD_WEB_PROCESS_TERMINATED/u);
+  assert.match(source, /UM_MACOS_DASHBOARD_READY_TIMEOUT/u);
   assert.match(source, /UM_MACOS_DASHBOARD_VIEW_UNAVAILABLE/u);
   assert.match(source, /UM_MACOS_DASHBOARD_DOWNLOAD_FAILED/u);
 });
@@ -1572,7 +1607,7 @@ test("native dashboard launch gates its first refresh on the rendered page", asy
     "private func navigateNativeDashboard(",
   );
   const dashboardFailure = section(
-    "private func dashboardWebViewFailed(code: String)",
+    "private func dashboardWebViewFailed(_ failure: LauncherError)",
     "private func hideDashboardWebView()",
   );
   const dashboardTeardown = section(
